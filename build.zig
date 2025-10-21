@@ -58,6 +58,21 @@ pub fn build(b: *std.Build) void {
     //
     // どちらの場合にも該当しない場合は、不要な宣言を削除して、
     // すべてを1つのモジュールの下に置くことができます。
+
+    // C言語のmath.cをオブジェクトファイルとしてコンパイル
+    const math_obj = b.addObject(.{
+        .name = "math",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    // C言語ソースファイルをオブジェクトに追加
+    math_obj.root_module.addCSourceFile(.{
+        .file = b.path("src/math.c"),
+    });
+    math_obj.root_module.link_libc = true;
+
     const exe = b.addExecutable(.{
         .name = "video_proto",
         .root_module = b.createModule(.{
@@ -82,6 +97,13 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // C言語オブジェクトファイルを実行可能ファイルにリンク
+    exe.root_module.addObject(math_obj);
+    exe.root_module.link_libc = true;
+
+    // @cImport用に、srcディレクトリをインクルードパスに追加
+    exe.root_module.addIncludePath(b.path("src"));
 
     // これは`zig build`を実行する際(つまり、デフォルトステップを実行する際)に、
     // インストールプレフィックスに実行可能ファイルをインストールする意思を宣言します。

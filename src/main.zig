@@ -1,10 +1,23 @@
 const std = @import("std");
 const video_proto = @import("video_proto");
 
+// C関数をインポート
+const c = @cImport({
+    @cInclude("math.h");
+});
+
 pub fn main() !void {
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
     try video_proto.bufferedPrint();
+
+    // C言語の関数を呼び出す
+    const result_add = c.add(5, 3);
+    const result_mul = c.multiply(5, 3);
+
+    std.debug.print("\nC function calls:\n", .{});
+    std.debug.print("add(5, 3) = {d}\n", .{result_add});
+    std.debug.print("multiply(5, 3) = {d}\n", .{result_mul});
 }
 
 test "simple test" {
