@@ -4,6 +4,7 @@ const video_proto = @import("video_proto");
 // C関数をインポート
 const c = @cImport({
     @cInclude("math.h");
+    @cInclude("external.h");
 });
 
 pub fn main() !void {
@@ -11,13 +12,43 @@ pub fn main() !void {
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
     try video_proto.bufferedPrint();
 
-    // C言語の関数を呼び出す
+    // math.c の関数を呼び出す
     const result_add = c.add(5, 3);
     const result_mul = c.multiply(5, 3);
 
-    std.debug.print("\nC function calls:\n", .{});
+    std.debug.print("\nC function calls (math.c):\n", .{});
     std.debug.print("add(5, 3) = {d}\n", .{result_add});
     std.debug.print("multiply(5, 3) = {d}\n", .{result_mul});
+
+    // external.c の関数を呼び出す
+    const external_add_result = c.external_add(10, 7);
+    const external_mul_result = c.external_multiply(10, 7);
+    const external_div_result = c.external_divide(15, 3);
+
+    std.debug.print("\nC function calls (external.c):\n", .{});
+    std.debug.print("external_add(10, 7) = {d}\n", .{external_add_result});
+    std.debug.print("external_multiply(10, 7) = {d}\n", .{external_mul_result});
+    std.debug.print("external_divide(15, 3) = {d}\n", .{external_div_result});
+
+    // external.m (Objective-C) の関数を呼び出す
+    const external_add_objc_result = c.external_add_objc(20, 8);
+    const external_mul_objc_result = c.external_multiply_objc(20, 8);
+    const external_div_objc_result = c.external_divide_objc(20, 4);
+
+    std.debug.print("\nObjective-C function calls (external.m):\n", .{});
+    std.debug.print("external_add_objc(20, 8) = {d}\n", .{external_add_objc_result});
+    std.debug.print("external_multiply_objc(20, 8) = {d}\n", .{external_mul_objc_result});
+    std.debug.print("external_divide_objc(20, 4) = {d}\n", .{external_div_objc_result});
+
+    // external.swift (Swift) の関数を呼び出す
+    const external_add_swift_result = c.external_add_swift(12, 6);
+    const external_mul_swift_result = c.external_multiply_swift(12, 6);
+    const external_div_swift_result = c.external_divide_swift(30, 5);
+
+    std.debug.print("\nSwift function calls (external.swift):\n", .{});
+    std.debug.print("external_add_swift(12, 6) = {d}\n", .{external_add_swift_result});
+    std.debug.print("external_multiply_swift(12, 6) = {d}\n", .{external_mul_swift_result});
+    std.debug.print("external_divide_swift(30, 5) = {d}\n", .{external_div_swift_result});
 }
 
 test "simple test" {

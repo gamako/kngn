@@ -59,6 +59,30 @@ pub fn build(b: *std.Build) void {
     // どちらの場合にも該当しない場合は、不要な宣言を削除して、
     // すべてを1つのモジュールの下に置くことができます。
 
+    // 外部clangコマンドで external.c を .o ファイルにコンパイル
+    const compile_external_exe = b.addSystemCommand(&.{ "clang", "-c", "-o" });
+    const external_obj_path_exe = compile_external_exe.addOutputFileArg("external_exe.o");
+    compile_external_exe.addFileArg(b.path("src/external.c"));
+
+    // 外部clangコマンドで external.m (Objective-C) を .o ファイルにコンパイル
+    const compile_external_objc_exe = b.addSystemCommand(&.{ "clang", "-x", "objective-c", "-c", "-o" });
+    const external_objc_obj_path_exe = compile_external_objc_exe.addOutputFileArg("external_objc_exe.o");
+    compile_external_objc_exe.addFileArg(b.path("src/external.m"));
+
+    // 外部swiftcコマンドで external.swift を .o ファイルにコンパイル
+    const compile_external_swift_exe = b.addSystemCommand(&.{
+        "swiftc",
+        "-parse-as-library",
+        "-Osize",
+        "-disable-autolinking-runtime-compatibility",
+        "-disable-autolinking-runtime-compatibility-concurrency",
+        "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+        "-c",
+        "-o"
+    });
+    const external_swift_obj_path_exe = compile_external_swift_exe.addOutputFileArg("external_swift_exe.o");
+    compile_external_swift_exe.addFileArg(b.path("src/external.swift"));
+
     // C言語のmath.cをオブジェクトファイルとしてコンパイル
     const math_obj = b.addObject(.{
         .name = "math",
@@ -100,10 +124,21 @@ pub fn build(b: *std.Build) void {
 
     // C言語オブジェクトファイルを実行可能ファイルにリンク
     exe.root_module.addObject(math_obj);
+    // 外部生成した.oファイルをリンク
+    exe.root_module.addObjectFile(external_obj_path_exe);
+    // Objective-C外部生成した.oファイルをリンク
+    exe.root_module.addObjectFile(external_objc_obj_path_exe);
+    // Swift外部生成した.oファイルをリンク
+    exe.root_module.addObjectFile(external_swift_obj_path_exe);
     exe.root_module.link_libc = true;
 
     // @cImport用に、srcディレクトリをインクルードパスに追加
     exe.root_module.addIncludePath(b.path("src"));
+
+    // 実行可能ファイルを外部コンパイルステップに依存させる
+    exe.step.dependOn(&compile_external_exe.step);
+    exe.step.dependOn(&compile_external_objc_exe.step);
+    exe.step.dependOn(&compile_external_swift_exe.step);
 
     // これは`zig build`を実行する際(つまり、デフォルトステップを実行する際)に、
     // インストールプレフィックスに実行可能ファイルをインストールする意思を宣言します。
@@ -161,12 +196,105 @@ pub fn build(b: *std.Build) void {
     // 2番目のテスト実行可能ファイルを実行するRunステップ。
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // ========================================
+    // 外部clangで生成した .o ファイルをリンクするテスト
+    // ========================================
+
+    // 外部clangコマンドで external.c を .o ファイルにコンパイル
+    const compile_external = b.addSystemCommand(&.{ "clang", "-c", "-o" });
+    const external_obj_path = compile_external.addOutputFileArg("external.o");
+    compile_external.addFileArg(b.path("src/external.c"));
+
+    // 外部.oファイルをリンクするテスト実行可能ファイルを作成
+    const external_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_external_link.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // 外部生成した.oファイルをテストにリンク
+    external_link_tests.root_module.addObjectFile(external_obj_path);
+    external_link_tests.root_module.link_libc = true;
+
+    // テスト実行ステップを作成し、clangコンパイルステップに依存させる
+    const run_external_link_tests = b.addRunArtifact(external_link_tests);
+    run_external_link_tests.step.dependOn(&compile_external.step);
+
+    // ========================================
+    // Objective-C外部関数をリンクするテスト
+    // ========================================
+
+    // 外部clangコマンドで external.m (Objective-C) を .o ファイルにコンパイル
+    const compile_external_objc = b.addSystemCommand(&.{ "clang", "-x", "objective-c", "-c", "-o" });
+    const external_objc_obj_path = compile_external_objc.addOutputFileArg("external_objc.o");
+    compile_external_objc.addFileArg(b.path("src/external.m"));
+
+    // Objective-C .oファイルをリンクするテスト実行可能ファイルを作成
+    const external_objc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_external_objc.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // 外部生成したObjective-C .oファイルをテストにリンク
+    external_objc_tests.root_module.addObjectFile(external_objc_obj_path);
+    external_objc_tests.root_module.link_libc = true;
+
+    // テスト実行ステップを作成し、clangコンパイルステップに依存させる
+    const run_external_objc_tests = b.addRunArtifact(external_objc_tests);
+    run_external_objc_tests.step.dependOn(&compile_external_objc.step);
+
+    // ========================================
+    // Swift外部関数をリンクするテスト
+    // ========================================
+
+    // 外部swiftcコマンドで external.swift を .o ファイルにコンパイル
+    // -parse-as-library: main 関数の自動生成を抑制
+    // -Osize: 最適化を有効にしてSwiftランタイム依存を最小化
+    // -disable-autolinking-runtime-compatibility*: ランタイム互換性ライブラリの自動リンクを無効化
+    const compile_external_swift = b.addSystemCommand(&.{
+        "swiftc",
+        "-parse-as-library",
+        "-Osize",
+        "-disable-autolinking-runtime-compatibility",
+        "-disable-autolinking-runtime-compatibility-concurrency",
+        "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+        "-c",
+        "-o"
+    });
+    const external_swift_obj_path = compile_external_swift.addOutputFileArg("external_swift.o");
+    compile_external_swift.addFileArg(b.path("src/external.swift"));
+
+    // Swift .oファイルをリンクするテスト実行可能ファイルを作成
+    const external_swift_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_external_swift.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // 外部生成したSwift .oファイルをテストにリンク
+    external_swift_tests.root_module.addObjectFile(external_swift_obj_path);
+    external_swift_tests.root_module.link_libc = true;
+
+    // テスト実行ステップを作成し、swiftcコンパイルステップに依存させる
+    const run_external_swift_tests = b.addRunArtifact(external_swift_tests);
+    run_external_swift_tests.step.dependOn(&compile_external_swift.step);
+
     // すべてのテストを実行するためのトップレベルステップ。dependOnは複数回
-    // 呼び出でき、2つのrunステップが互いに依存しないため、
-    // この2つが並列に実行されます。
+    // 呼び出でき、複数のrunステップが互いに依存しないため、
+    // これらが並列に実行されます。
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_external_link_tests.step);
+    test_step.dependOn(&run_external_objc_tests.step);
+    test_step.dependOn(&run_external_swift_tests.step);
 
     // フラグと同じように、トップレベルステップも`--help`メニューに表示されます。
     //
