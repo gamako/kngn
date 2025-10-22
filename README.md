@@ -84,13 +84,13 @@ zig build -Dplatform=metal \
 
 **オプション説明:**
 
-| オプション | 型 | 説明 | デフォルト |
-|-----------|-----|------|----------|
-| `-Dplatform=[enum]` | `objc`\|`swift` | プラットフォーム層の実装を選択 | `objc` |
-| `-Dswift-toolchain-path=[string]` | パス | Xcodeツールチェーンパス | 自動検出 |
-| `-Dswift-sdk-path=[string]` | パス | macOS SDKパス | 自動検出 |
-| `-Dinstall-all=[bool]` | - | ObjC版とSwift版の両方をビルド | `false` |
-| `--release[=mode]` | - | リリースモード（`fast`, `safe`, `small` 指定可） | デバッグ |
+| オプション                        | 型                | 説明                                             | デフォルト |
+| --------------------------------- | ----------------- | ------------------------------------------------ | ---------- |
+| `-Dplatform=[enum]`               | `objc`\|`swift`\|`metal` | プラットフォーム層の実装を選択            | `objc`     |
+| `-Dswift-toolchain-path=[string]` | パス              | Xcodeツールチェーンパス                          | 自動検出   |
+| `-Dswift-sdk-path=[string]`       | パス              | macOS SDKパス                                    | 自動検出   |
+| `-Dinstall-all=[bool]`            | -                 | platformすべてをビルド                           | `false`    |
+| `--release[=mode]`                | -                 | リリースモード（`fast`, `safe`, `small` 指定可） | デバッグ   |
 
 ### 5. その他のビルドコマンド
 
@@ -107,70 +107,13 @@ rm -rf .zig-cache zig-out
 
 ## 実行方法
 
-### Objective-C版を実行
-
 ```bash
-zig build run-objc
+zig build run-objc # Objective-C版を実行
+zig build run-swift # Swift版を実行
+zig build run-metal # Metal版を実行
+zig build run       # デフォルト版を実行（Objective-C版）
+
 ```
-
-またはビルド後：
-
-```bash
-./zig-out/bin/video_proto
-```
-
-### Swift版を実行
-
-```bash
-zig build run-swift
-```
-
-またはビルド後：
-
-```bash
-./zig-out/bin/video_proto_swift
-```
-
-### Metal版を実行
-
-```bash
-zig build run-metal
-```
-
-またはビルド後：
-
-```bash
-./zig-out/bin/video_proto_metal
-```
-
-### 汎用実行（プラットフォームオプション従う）
-
-```bash
-zig build run
-```
-
-デフォルトではObjective-C版が実行されます。Metal版を実行したい場合：
-
-```bash
-zig build run -Dplatform=metal
-```
-
-## プラットフォーム実装比較
-
-| 特性 | Objective-C版 | Swift版 | Metal版 |
-|------|----------------|---------|---------|
-| **フレームワーク** | Cocoa, QuartzCore | Cocoa, QuartzCore | Metal, MetalKit |
-| **描画方式** | CALayer | CALayer | MTKView + Metal API |
-| **ピクセル更新** | CGImage再生成 | CGImage再生成 | テクスチャ転送 |
-| **GPU利用** | ✗ (CPU描画) | ✗ (CPU描画) | ✓ (GPU描画) |
-| **パフォーマンス** | ⭐⭐ | ⭐⭐ | ⭐⭐⭐ |
-| **実装言語** | Objective-C | Swift | Swift |
-| **Swiftランタイム** | ✗ | ✓ | ✓ |
-
-**推奨される用途:**
-- **Objective-C版**: 軽量で依存性が少ない実装が必要な場合
-- **Swift版**: Swiftの型安全性が必要な場合、CALayerの標準機能で十分な場合
-- **Metal版**: 高パフォーマンスが必要、大解像度での描画が必要な場合
 
 ## パス自動検出の仕組み
 
