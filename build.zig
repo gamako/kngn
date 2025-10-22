@@ -37,8 +37,7 @@ fn compilePlatformLayer(
                 "clang",
                 "-x", "objective-c",
                 "-I", "platform",
-                "-framework", "Cocoa",
-                "-framework", "QuartzCore",
+                "-fobjc-arc",
                 switch (optimize) {
                     .Debug => "-O0",
                     .ReleaseSafe => "-O2",
