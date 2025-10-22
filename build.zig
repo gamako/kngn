@@ -83,6 +83,22 @@ pub fn build(b: *std.Build) void {
     const external_swift_obj_path_exe = compile_external_swift_exe.addOutputFileArg("external_swift_exe.o");
     compile_external_swift_exe.addFileArg(b.path("src/external.swift"));
 
+    // Swift版プラットフォーム層をswiftcで platform/macos-swift/platform_macos.swift をオブジェクトファイルにコンパイル
+    const compile_platform_swift_exe = b.addSystemCommand(&.{
+        "swiftc",
+        "-parse-as-library",
+        "-Osize",
+        "-disable-autolinking-runtime-compatibility",
+        "-disable-autolinking-runtime-compatibility-concurrency",
+        "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+        "-framework", "Cocoa",
+        "-framework", "QuartzCore",
+        "-c",
+        "-o"
+    });
+    const platform_swift_obj_path_exe = compile_platform_swift_exe.addOutputFileArg("platform_macos_swift_exe.o");
+    compile_platform_swift_exe.addFileArg(b.path("platform/macos-swift/platform_macos.swift"));
+
     // C言語のmath.cをオブジェクトファイルとしてコンパイル
     const math_obj = b.addObject(.{
         .name = "math",
@@ -117,6 +133,19 @@ pub fn build(b: *std.Build) void {
                 // インポートする際に使用する名前です(例：`@import("video_proto")`)。
                 // 異なるパッケージから複数のモジュールをインポートする場合に発生する可能性がある
                 // 衝突の場合に非常に役立つため、インポート名を変更することが許可されています。
+                .{ .name = "video_proto", .module = mod },
+            },
+        }),
+    });
+
+    // Swift版実行ファイル
+    const exe_swift = b.addExecutable(.{
+        .name = "video_proto_swift",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
                 .{ .name = "video_proto", .module = mod },
             },
         }),
@@ -161,11 +190,65 @@ pub fn build(b: *std.Build) void {
     exe.step.dependOn(&compile_external_swift_exe.step);
     exe.step.dependOn(&compile_platform_objc_exe.step);
 
+    // ========================================
+    // Swift版実行ファイルのリンク設定
+    // ========================================
+    // C言語オブジェクトファイルをSwift版実行可能ファイルにリンク
+    exe_swift.root_module.addObject(math_obj);
+    // 外部生成した.oファイルをリンク
+    exe_swift.root_module.addObjectFile(external_obj_path_exe);
+    // Objective-C外部生成した.oファイルをリンク
+    exe_swift.root_module.addObjectFile(external_objc_obj_path_exe);
+    // Swift外部生成した.oファイルをリンク
+    exe_swift.root_module.addObjectFile(external_swift_obj_path_exe);
+    // Swift版プラットフォーム層の.oファイルをリンク
+    exe_swift.root_module.addObjectFile(platform_swift_obj_path_exe);
+    exe_swift.root_module.link_libc = true;
+
+    // macOSフレームワークをリンク
+    exe_swift.root_module.linkFramework("Cocoa", .{});
+    exe_swift.root_module.linkFramework("QuartzCore", .{});
+
+    // Swiftランタイムライブラリのサーチパスを追加
+    exe_swift.root_module.addLibraryPath(.{
+        .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx",
+    });
+    exe_swift.root_module.addLibraryPath(.{
+        .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.0.sdk/usr/lib/swift",
+    });
+
+    // Swiftランタイムライブラリをリンク
+    exe_swift.root_module.linkSystemLibrary("swiftCore", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftCoreFoundation", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftDispatch", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftObjectiveC", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftQuartzCore", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftCoreImage", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftIOKit", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftMetal", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftOSLog", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftUniformTypeIdentifiers", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftXPC", .{});
+    exe_swift.root_module.linkSystemLibrary("swift_Builtin_float", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftos", .{});
+    exe_swift.root_module.linkSystemLibrary("swiftsimd", .{});
+
+    // @cImport用に、srcディレクトリとplatformディレクトリをインクルードパスに追加
+    exe_swift.root_module.addIncludePath(b.path("src"));
+    exe_swift.root_module.addIncludePath(b.path("platform"));
+
+    // Swift版実行可能ファイルを外部コンパイルステップに依存させる
+    exe_swift.step.dependOn(&compile_external_exe.step);
+    exe_swift.step.dependOn(&compile_external_objc_exe.step);
+    exe_swift.step.dependOn(&compile_external_swift_exe.step);
+    exe_swift.step.dependOn(&compile_platform_swift_exe.step);
+
     // これは`zig build`を実行する際(つまり、デフォルトステップを実行する際)に、
     // インストールプレフィックスに実行可能ファイルをインストールする意思を宣言します。
     // デフォルトではインストールプレフィックスは`zig-out/`ですが、
     // `--prefix`または`-p`を渡すことでオーバーライドできます。
     b.installArtifact(exe);
+    b.installArtifact(exe_swift);
 
     // これはトップレベルステップを作成します。トップレベルステップには名前があり、
     // `zig build`を実行する際に名前で呼び出すことができます(例：`zig build run`)。
