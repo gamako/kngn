@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // プラットフォーム層をclangコマンドで external.m (Objective-C) を .o ファイルにコンパイル
+    // プラットフォーム層（Objective-C版）をclangでコンパイル
     const compile_platform_objc_exe = b.addSystemCommand(&.{
         "clang",
         "-x", "objective-c",
