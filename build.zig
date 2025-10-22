@@ -9,6 +9,7 @@ const APP_NAME = "video_proto";
 const PlatformType = enum {
     objc,
     swift,
+    metal,
 };
 
 // ========================================
@@ -72,6 +73,28 @@ fn compilePlatformLayer(
             compile_cmd.addFileArg(b.path("platform/macos-swift/platform_macos.swift"));
             break :blk PlatformCompileResult{ .compile_step = compile_cmd, .obj_file = obj_path };
         },
+        .metal => blk: {
+            const compile_cmd = b.addSystemCommand(&.{
+                "swiftc",
+                "-parse-as-library",
+                switch (optimize) {
+                    .Debug => "-Onone",
+                    .ReleaseSafe, .ReleaseFast => "-O",
+                    .ReleaseSmall => "-Osize",
+                },
+                "-disable-autolinking-runtime-compatibility",
+                "-disable-autolinking-runtime-compatibility-concurrency",
+                "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+                "-framework", "Cocoa",
+                "-framework", "Metal",
+                "-framework", "MetalKit",
+                "-c",
+                "-o",
+            });
+            const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");
+            compile_cmd.addFileArg(b.path("platform/macos-metal/platform_macos_metal.swift"));
+            break :blk PlatformCompileResult{ .compile_step = compile_cmd, .obj_file = obj_path };
+        },
     };
 
     return result;
@@ -83,6 +106,7 @@ fn linkSwiftRuntime(
     exe: *std.Build.Step.Compile,
     toolchain_path: ?[]const u8,
     sdk_path: ?[]const u8,
+    extra_libs: []const []const u8,
 ) void {
     const allocator = b.allocator;
 
@@ -130,6 +154,11 @@ fn linkSwiftRuntime(
 
     // Swiftランタイムライブラリをリンク
     for (runtime_libs) |lib| {
+        exe.root_module.linkSystemLibrary(lib, .{});
+    }
+
+    // 追加ライブラリをリンク
+    for (extra_libs) |lib| {
         exe.root_module.linkSystemLibrary(lib, .{});
     }
 }
@@ -219,22 +248,51 @@ pub fn build(b: *std.Build) void {
 
     // macOSフレームワークとSwiftランタイムをリンク
     linkMacOSFrameworks(exe_swift);
-    linkSwiftRuntime(b, exe_swift, swift_toolchain_path, swift_sdk_path);
+    linkSwiftRuntime(b, exe_swift, swift_toolchain_path, swift_sdk_path, &.{});
+
+    // ========================================
+    // Metal版実行ファイルのビルド
+    // ========================================
+    const exe_metal = b.addExecutable(.{
+        .name = APP_NAME ++ "_metal",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Metal版プラットフォーム層をコンパイル
+    const metal_platform = compilePlatformLayer(b, .metal, optimize);
+    exe_metal.root_module.addObjectFile(metal_platform.obj_file);
+    exe_metal.root_module.link_libc = true;
+    exe_metal.root_module.addIncludePath(b.path("platform"));
+    exe_metal.step.dependOn(&metal_platform.compile_step.step);
+
+    // macOSフレームワークとSwiftランタイムをリンク
+    linkMacOSFrameworks(exe_metal);
+    exe_metal.root_module.linkFramework("Metal", .{});
+    exe_metal.root_module.linkFramework("MetalKit", .{});
+    linkSwiftRuntime(b, exe_metal, swift_toolchain_path, swift_sdk_path, &.{
+        "swiftMetalKit",
+        "swiftModelIO",
+    });
 
     // ========================================
     // インストールステップの設定
     // ========================================
     // プラットフォームオプションに応じてデフォルトでインストールする実行ファイルを選択
-    if (platform_option == .objc) {
-        b.installArtifact(exe_objc);
-    } else {
-        b.installArtifact(exe_swift);
+    switch (platform_option) {
+        .objc => b.installArtifact(exe_objc),
+        .swift => b.installArtifact(exe_swift),
+        .metal => b.installArtifact(exe_metal),
     }
 
-    // 両方のバージョンをインストールするオプション
-    if (b.option(bool, "install-all", "Install both ObjC and Swift versions") orelse false) {
+    // 複数バージョンをインストールするオプション
+    if (b.option(bool, "install-all", "Install all platform versions") orelse false) {
         b.installArtifact(exe_objc);
         b.installArtifact(exe_swift);
+        b.installArtifact(exe_metal);
     }
 
     // ========================================
@@ -242,7 +300,11 @@ pub fn build(b: *std.Build) void {
     // ========================================
     // デフォルトの`run`コマンド（プラットフォームオプションに従う）
     const run_step = b.step("run", "Run the app (uses -Dplatform option)");
-    const exe_to_run = if (platform_option == .objc) exe_objc else exe_swift;
+    const exe_to_run = switch (platform_option) {
+        .objc => exe_objc,
+        .swift => exe_swift,
+        .metal => exe_metal,
+    };
     const run_cmd = b.addRunArtifact(exe_to_run);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -259,11 +321,18 @@ pub fn build(b: *std.Build) void {
     run_swift_step.dependOn(&run_swift_cmd.step);
     run_swift_cmd.step.dependOn(b.getInstallStep());
 
+    // Metal版を明示的に実行
+    const run_metal_step = b.step("run-metal", "Run the Metal version");
+    const run_metal_cmd = b.addRunArtifact(exe_metal);
+    run_metal_step.dependOn(&run_metal_cmd.step);
+    run_metal_cmd.step.dependOn(b.getInstallStep());
+
     // コマンドライン引数をサポート
     if (b.args) |args| {
         run_cmd.addArgs(args);
         run_objc_cmd.addArgs(args);
         run_swift_cmd.addArgs(args);
+        run_metal_cmd.addArgs(args);
     }
 
     // フラグと同じように、トップレベルステップも`--help`メニューに表示されます。

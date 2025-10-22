@@ -11,8 +11,10 @@ Zig + C/Swiftを組み合わせた、macOSでのクロスプラットフォー�
 ├── platform/
 │   ├── macos/
 │   │   └── platform_macos.m  # macOS実装（Objective-C版）
-│   └── macos-swift/
-│       └── platform_macos.swift  # macOS実装（Swift版）
+│   ├── macos-swift/
+│   │   └── platform_macos.swift  # macOS実装（Swift版）
+│   └── macos-metal/
+│       └── platform_macos_metal.swift  # macOS実装（Metal版）
 ├── build.zig                 # ビルド設定
 └── README.md                 # このファイル
 ```
@@ -47,12 +49,35 @@ Swift版を明示的に選択してビルドします。生成物は `zig-out/bi
 - `xcode-select`と`xcrun`コマンドを使用して環境から動的にパスを取得
 - CI環境など特殊な環境では、パスを明示的に指定可能です
 
-### 3. カスタムパス指定（CI環境用）
+### 3. Metal版のビルド
+
+```bash
+zig build -Dplatform=metal
+```
+
+Metal版を明示的に選択してビルドします。生成物は `zig-out/bin/video_proto_metal` に配置されます。
+
+#### 特徴
+
+- GPU直結のレンダリング（MTKView + Metal API）
+- Metalシェーダーを使った高速描画
+- Metal Compute Shaderではなくテクスチャ転送方式（CPU→GPU）
+- 既存のobj-c版・swift版と同じAPI
+
+### 4. カスタムパス指定（CI環境用）
 
 SwiftツールチェーンパスとSDKパスを明示的に指定できます：
 
 ```bash
 zig build -Dplatform=swift \
+  -Dswift-toolchain-path=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain \
+  -Dswift-sdk-path=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+```
+
+同様にMetal版も指定可能です：
+
+```bash
+zig build -Dplatform=metal \
   -Dswift-toolchain-path=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain \
   -Dswift-sdk-path=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
 ```
@@ -67,10 +92,10 @@ zig build -Dplatform=swift \
 | `-Dinstall-all=[bool]` | - | ObjC版とSwift版の両方をビルド | `false` |
 | `--release[=mode]` | - | リリースモード（`fast`, `safe`, `small` 指定可） | デバッグ |
 
-### 4. その他のビルドコマンド
+### 5. その他のビルドコマンド
 
 ```bash
-# 両方のバージョンをビルド・インストール
+# すべてのバージョンをビルド・インストール
 zig build -Dinstall-all=true
 
 # リリースビルド（最適化）
@@ -106,15 +131,50 @@ zig build run-swift
 ./zig-out/bin/video_proto_swift
 ```
 
+### Metal版を実行
+
+```bash
+zig build run-metal
+```
+
+またはビルド後：
+
+```bash
+./zig-out/bin/video_proto_metal
+```
+
 ### 汎用実行（プラットフォームオプション従う）
 
 ```bash
 zig build run
 ```
 
+デフォルトではObjective-C版が実行されます。Metal版を実行したい場合：
+
+```bash
+zig build run -Dplatform=metal
+```
+
+## プラットフォーム実装比較
+
+| 特性 | Objective-C版 | Swift版 | Metal版 |
+|------|----------------|---------|---------|
+| **フレームワーク** | Cocoa, QuartzCore | Cocoa, QuartzCore | Metal, MetalKit |
+| **描画方式** | CALayer | CALayer | MTKView + Metal API |
+| **ピクセル更新** | CGImage再生成 | CGImage再生成 | テクスチャ転送 |
+| **GPU利用** | ✗ (CPU描画) | ✗ (CPU描画) | ✓ (GPU描画) |
+| **パフォーマンス** | ⭐⭐ | ⭐⭐ | ⭐⭐⭐ |
+| **実装言語** | Objective-C | Swift | Swift |
+| **Swiftランタイム** | ✗ | ✓ | ✓ |
+
+**推奨される用途:**
+- **Objective-C版**: 軽量で依存性が少ない実装が必要な場合
+- **Swift版**: Swiftの型安全性が必要な場合、CALayerの標準機能で十分な場合
+- **Metal版**: 高パフォーマンスが必要、大解像度での描画が必要な場合
+
 ## パス自動検出の仕組み
 
-Swift版をビルドする際、以下のコマンドで環境から動的にパスを取得しています：
+Swift版・Metal版をビルドする際、以下のコマンドで環境から動的にパスを取得しています：
 
 ```bash
 # ツールチェーンパス取得
