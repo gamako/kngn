@@ -1,5 +1,132 @@
 const std = @import("std");
 
+// ========================================
+// ビルド設定定数
+// ========================================
+const APP_NAME = "video_proto";
+
+// プラットフォーム層の種類
+const PlatformType = enum {
+    objc,
+    swift,
+};
+
+// ========================================
+// 型定義
+// ========================================
+
+/// プラットフォーム層のコンパイル結果
+const PlatformCompileResult = struct {
+    compile_step: *std.Build.Step.Run,
+    obj_file: std.Build.LazyPath,
+};
+
+// ========================================
+// ヘルパー関数
+// ========================================
+
+/// プラットフォーム層をコンパイルして.oファイルを生成
+fn compilePlatformLayer(
+    b: *std.Build,
+    platform_type: PlatformType,
+    optimize: std.builtin.OptimizeMode,
+) PlatformCompileResult {
+    const result = switch (platform_type) {
+        .objc => blk: {
+            const compile_cmd = b.addSystemCommand(&.{
+                "clang",
+                "-x", "objective-c",
+                "-I", "platform",
+                "-framework", "Cocoa",
+                "-framework", "QuartzCore",
+                switch (optimize) {
+                    .Debug => "-O0",
+                    .ReleaseSafe => "-O2",
+                    .ReleaseFast => "-O3",
+                    .ReleaseSmall => "-Os",
+                },
+                "-c",
+                "-o",
+            });
+            const obj_path = compile_cmd.addOutputFileArg("platform_macos_objc.o");
+            compile_cmd.addFileArg(b.path("platform/macos/platform_macos.m"));
+            break :blk PlatformCompileResult{ .compile_step = compile_cmd, .obj_file = obj_path };
+        },
+        .swift => blk: {
+            const compile_cmd = b.addSystemCommand(&.{
+                "swiftc",
+                "-parse-as-library",
+                switch (optimize) {
+                    .Debug => "-Onone",
+                    .ReleaseSafe, .ReleaseFast => "-O",
+                    .ReleaseSmall => "-Osize",
+                },
+                "-disable-autolinking-runtime-compatibility",
+                "-disable-autolinking-runtime-compatibility-concurrency",
+                "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+                "-framework", "Cocoa",
+                "-framework", "QuartzCore",
+                "-c",
+                "-o",
+            });
+            const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
+            compile_cmd.addFileArg(b.path("platform/macos-swift/platform_macos.swift"));
+            break :blk PlatformCompileResult{ .compile_step = compile_cmd, .obj_file = obj_path };
+        },
+    };
+
+    return result;
+}
+
+/// Swiftランタイムライブラリをリンク
+fn linkSwiftRuntime(exe: *std.Build.Step.Compile) void {
+    // Swiftランタイムライブラリのパス
+    const lib_paths = [_][]const u8{
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.0.sdk/usr/lib/swift",
+    };
+
+    // 必要なSwiftランタイムライブラリ
+    const runtime_libs = [_][]const u8{
+        "swiftCore",
+        "swiftCoreFoundation",
+        "swiftDispatch",
+        "swiftObjectiveC",
+        "swiftQuartzCore",
+        "swiftCoreImage",
+        "swiftIOKit",
+        "swiftMetal",
+        "swiftOSLog",
+        "swiftUniformTypeIdentifiers",
+        "swiftXPC",
+        "swift_Builtin_float",
+        "swiftos",
+        "swiftsimd",
+    };
+
+    // Swiftライブラリのパスを追加
+    for (lib_paths) |path| {
+        exe.root_module.addLibraryPath(.{ .cwd_relative = path });
+    }
+
+    // Swiftランタイムライブラリをリンク
+    for (runtime_libs) |lib| {
+        exe.root_module.linkSystemLibrary(lib, .{});
+    }
+}
+
+/// macOSフレームワークをリンク
+fn linkMacOSFrameworks(exe: *std.Build.Step.Compile) void {
+    const frameworks = [_][]const u8{
+        "Cocoa",
+        "QuartzCore",
+    };
+
+    for (frameworks) |framework| {
+        exe.root_module.linkFramework(framework, .{});
+    }
+}
+
 // この関数は命令形に見えますが、ビルドを直接実行せず、代わりに
 // 外部ランナーによって実行されるビルドグラフ(`b`)を変更します。
 // `std.Build`の関数はビルドステップを定義するDSLを実装し、
@@ -7,39 +134,20 @@ const std = @import("std");
 // ビルドを自動的に並列化でき、キャッシュシステムが
 // ステップを再実行する必要があるかどうかを知ることができます。
 pub fn build(b: *std.Build) void {
-    // 標準ターゲットオプションを使用して、`zig build`を実行する人が
-    // ビルド対象のターゲットを選択できます。ここではデフォルトをオーバーライドしないため、
-    // すべてのターゲットが許可され、デフォルトはネイティブです。
-    // サポートされるターゲットセットを制限するための他のオプションも利用可能です。
+    // ========================================
+    // ビルドオプション
+    // ========================================
     const target = b.standardTargetOptions(.{});
-    // 標準最適化オプションを使用して、`zig build`を実行する人は
-    // Debug、ReleaseSafe、ReleaseFast、ReleaseSmallの中から選択できます。
-    // ここではデフォルトの優先リリースモードを設定しないため、ユーザーは
-    // 最適化方法を決定できます。
     const optimize = b.standardOptimizeOption(.{});
-    // また、`b.option()`を使用してこのビルドスクリプトのオプション機能を
-    // 切り替えるためのカスタムフラグを定義することも可能です。
-    // 定義されたすべてのフラグ(ターゲットと最適化オプションを含む)は、
-    // このディレクトリで`zig build --help`を実行する際に表示されます。
 
-    // Swift版プラットフォーム層をswiftcで platform/macos-swift/platform_macos.swift をオブジェクトファイルにコンパイル
-    const compile_platform_swift_exe = b.addSystemCommand(&.{
-        "swiftc",
-        "-parse-as-library",
-        "-Osize",
-        "-disable-autolinking-runtime-compatibility",
-        "-disable-autolinking-runtime-compatibility-concurrency",
-        "-disable-autolinking-runtime-compatibility-dynamic-replacements",
-        "-framework", "Cocoa",
-        "-framework", "QuartzCore",
-        "-c",
-        "-o"
-    });
-    const platform_swift_obj_path_exe = compile_platform_swift_exe.addOutputFileArg("platform_macos_swift_exe.o");
-    compile_platform_swift_exe.addFileArg(b.path("platform/macos-swift/platform_macos.swift"));
+    // プラットフォーム層の選択オプション
+    const platform_option = b.option(PlatformType, "platform", "Platform layer to use") orelse .objc;
 
-    const exe = b.addExecutable(.{
-        .name = "video_proto",
+    // ========================================
+    // Objective-C版実行ファイルのビルド
+    // ========================================
+    const exe_objc = b.addExecutable(.{
+        .name = APP_NAME,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -47,9 +155,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Swift版実行ファイル
+    // Objective-C版プラットフォーム層をコンパイル
+    const objc_platform = compilePlatformLayer(b, .objc, optimize);
+    exe_objc.root_module.addObjectFile(objc_platform.obj_file);
+    exe_objc.root_module.link_libc = true;
+    exe_objc.root_module.addIncludePath(b.path("platform"));
+    exe_objc.step.dependOn(&objc_platform.compile_step.step);
+
+    // macOSフレームワークをリンク
+    linkMacOSFrameworks(exe_objc);
+
+    // ========================================
+    // Swift版実行ファイルのビルド
+    // ========================================
     const exe_swift = b.addExecutable(.{
-        .name = "video_proto_swift",
+        .name = APP_NAME ++ "_swift",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -57,108 +177,60 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // プラットフォーム層（Objective-C版）をclangでコンパイル
-    const compile_platform_objc_exe = b.addSystemCommand(&.{
-        "clang",
-        "-x", "objective-c",
-        "-I", "platform",
-        "-framework", "Cocoa",
-        "-framework", "QuartzCore",
-        "-c",
-        "-o"
-    });
-    const platform_objc_obj_path_exe = compile_platform_objc_exe.addOutputFileArg("platform_macos_exe.o");
-    compile_platform_objc_exe.addFileArg(b.path("platform/macos/platform_macos.m"));
-
-    // プラットフォーム層の.oファイルをリンク
-    exe.root_module.addObjectFile(platform_objc_obj_path_exe);
-    exe.root_module.link_libc = true;
-
-    // macOSフレームワークをリンク
-    exe.root_module.linkFramework("Cocoa", .{});
-    exe.root_module.linkFramework("QuartzCore", .{});
-
-    // @cImport用に、platformディレクトリをインクルードパスに追加
-    exe.root_module.addIncludePath(b.path("platform"));
-
-    // 実行可能ファイルをプラットフォーム層のコンパイルステップに依存させる
-    exe.step.dependOn(&compile_platform_objc_exe.step);
-
-    // ========================================
-    // Swift版実行ファイルのリンク設定
-    // ========================================
-    // Swift版プラットフォーム層の.oファイルをリンク
-    exe_swift.root_module.addObjectFile(platform_swift_obj_path_exe);
+    // Swift版プラットフォーム層をコンパイル
+    const swift_platform = compilePlatformLayer(b, .swift, optimize);
+    exe_swift.root_module.addObjectFile(swift_platform.obj_file);
     exe_swift.root_module.link_libc = true;
-
-    // macOSフレームワークをリンク
-    exe_swift.root_module.linkFramework("Cocoa", .{});
-    exe_swift.root_module.linkFramework("QuartzCore", .{});
-
-    // Swiftランタイムライブラリのサーチパスを追加
-    exe_swift.root_module.addLibraryPath(.{
-        .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx",
-    });
-    exe_swift.root_module.addLibraryPath(.{
-        .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.0.sdk/usr/lib/swift",
-    });
-
-    // Swiftランタイムライブラリをリンク
-    exe_swift.root_module.linkSystemLibrary("swiftCore", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftCoreFoundation", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftDispatch", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftObjectiveC", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftQuartzCore", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftCoreImage", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftIOKit", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftMetal", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftOSLog", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftUniformTypeIdentifiers", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftXPC", .{});
-    exe_swift.root_module.linkSystemLibrary("swift_Builtin_float", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftos", .{});
-    exe_swift.root_module.linkSystemLibrary("swiftsimd", .{});
-
-    // @cImport用に、platformディレクトリをインクルードパスに追加
     exe_swift.root_module.addIncludePath(b.path("platform"));
+    exe_swift.step.dependOn(&swift_platform.compile_step.step);
 
-    // Swift版実行可能ファイルをプラットフォーム層のコンパイルステップに依存させる
-    exe_swift.step.dependOn(&compile_platform_swift_exe.step);
+    // macOSフレームワークとSwiftランタイムをリンク
+    linkMacOSFrameworks(exe_swift);
+    linkSwiftRuntime(exe_swift);
 
-    // これは`zig build`を実行する際(つまり、デフォルトステップを実行する際)に、
-    // インストールプレフィックスに実行可能ファイルをインストールする意思を宣言します。
-    // デフォルトではインストールプレフィックスは`zig-out/`ですが、
-    // `--prefix`または`-p`を渡すことでオーバーライドできます。
-    b.installArtifact(exe);
-    b.installArtifact(exe_swift);
+    // ========================================
+    // インストールステップの設定
+    // ========================================
+    // プラットフォームオプションに応じてデフォルトでインストールする実行ファイルを選択
+    if (platform_option == .objc) {
+        b.installArtifact(exe_objc);
+    } else {
+        b.installArtifact(exe_swift);
+    }
 
-    // これはトップレベルステップを作成します。トップレベルステップには名前があり、
-    // `zig build`を実行する際に名前で呼び出すことができます(例：`zig build run`)。
-    // これは、デフォルトステップではなく、`run`ステップを評価します。
-    // トップレベルステップが実際に何かをするためには、
-    // 他のステップに依存する必要があります(例：Runステップ。すぐに確認します)。
-    const run_step = b.step("run", "Run the app");
+    // 両方のバージョンをインストールするオプション
+    if (b.option(bool, "install-all", "Install both ObjC and Swift versions") orelse false) {
+        b.installArtifact(exe_objc);
+        b.installArtifact(exe_swift);
+    }
 
-    // これはビルドグラフにRunArtifactステップを作成します。RunArtifactステップは、
-    // Zigによってコンパイルされた実行可能ファイルを呼び出します。
-    // ステップは、ユーザーによって直接呼び出された場合(トップレベルステップの場合)
-    // または別のステップがそれに依存する場合にのみ、ランナーによって実行されます。
-    // つまり、このRunステップをいつどのように実行するかを定義するのはあなた次第です。
-    // この場合、ユーザーが`zig build run`を実行する際に実行したいため、
-    // 依存関係リンクを作成します。
-    const run_cmd = b.addRunArtifact(exe);
+    // ========================================
+    // 実行ステップの設定
+    // ========================================
+    // デフォルトの`run`コマンド（プラットフォームオプションに従う）
+    const run_step = b.step("run", "Run the app (uses -Dplatform option)");
+    const exe_to_run = if (platform_option == .objc) exe_objc else exe_swift;
+    const run_cmd = b.addRunArtifact(exe_to_run);
     run_step.dependOn(&run_cmd.step);
-
-    // runステップをデフォルトステップに依存させることで、
-    // キャッシュディレクトリ内から直接ではなく、
-    // インストールディレクトリから実行されます。
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // これにより、ユーザーはビルドコマンド自体で
-    // アプリケーションに引数を渡すことができます。
-    // 例：`zig build run -- arg1 arg2 etc`
+    // Objective-C版を明示的に実行
+    const run_objc_step = b.step("run-objc", "Run the ObjC version");
+    const run_objc_cmd = b.addRunArtifact(exe_objc);
+    run_objc_step.dependOn(&run_objc_cmd.step);
+    run_objc_cmd.step.dependOn(b.getInstallStep());
+
+    // Swift版を明示的に実行
+    const run_swift_step = b.step("run-swift", "Run the Swift version");
+    const run_swift_cmd = b.addRunArtifact(exe_swift);
+    run_swift_step.dependOn(&run_swift_cmd.step);
+    run_swift_cmd.step.dependOn(b.getInstallStep());
+
+    // コマンドライン引数をサポート
     if (b.args) |args| {
         run_cmd.addArgs(args);
+        run_objc_cmd.addArgs(args);
+        run_swift_cmd.addArgs(args);
     }
 
     // フラグと同じように、トップレベルステップも`--help`メニューに表示されます。
