@@ -1,10 +1,7 @@
 const std = @import("std");
-const video_proto = @import("video_proto");
 
 // C関数をインポート
 const c = @cImport({
-    @cInclude("math.h");
-    @cInclude("external.h");
     @cInclude("platform.h");
 });
 
