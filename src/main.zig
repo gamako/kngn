@@ -5,12 +5,18 @@ const video_proto = @import("video_proto");
 const c = @cImport({
     @cInclude("math.h");
     @cInclude("external.h");
+    @cInclude("platform.h");
 });
 
 pub fn main() !void {
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
     try video_proto.bufferedPrint();
+
+    // プラットフォーム初期化
+    std.debug.print("\nInitializing platform...\n", .{});
+    const platform_initialized = c.platform_init();
+    std.debug.print("Platform initialized: {}\n", .{platform_initialized});
 
     // math.c の関数を呼び出す
     const result_add = c.add(5, 3);

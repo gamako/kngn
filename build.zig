@@ -122,6 +122,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // プラットフォーム層をclangコマンドで external.m (Objective-C) を .o ファイルにコンパイル
+    const compile_platform_objc_exe = b.addSystemCommand(&.{
+        "clang",
+        "-x", "objective-c",
+        "-I", "platform",
+        "-framework", "Cocoa",
+        "-framework", "QuartzCore",
+        "-c",
+        "-o"
+    });
+    const platform_objc_obj_path_exe = compile_platform_objc_exe.addOutputFileArg("platform_macos_exe.o");
+    compile_platform_objc_exe.addFileArg(b.path("platform/macos/platform_macos.m"));
+
     // C言語オブジェクトファイルを実行可能ファイルにリンク
     exe.root_module.addObject(math_obj);
     // 外部生成した.oファイルをリンク
@@ -130,15 +143,23 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addObjectFile(external_objc_obj_path_exe);
     // Swift外部生成した.oファイルをリンク
     exe.root_module.addObjectFile(external_swift_obj_path_exe);
+    // プラットフォーム層の.oファイルをリンク
+    exe.root_module.addObjectFile(platform_objc_obj_path_exe);
     exe.root_module.link_libc = true;
 
-    // @cImport用に、srcディレクトリをインクルードパスに追加
+    // macOSフレームワークをリンク
+    exe.root_module.linkFramework("Cocoa", .{});
+    exe.root_module.linkFramework("QuartzCore", .{});
+
+    // @cImport用に、srcディレクトリとplatformディレクトリをインクルードパスに追加
     exe.root_module.addIncludePath(b.path("src"));
+    exe.root_module.addIncludePath(b.path("platform"));
 
     // 実行可能ファイルを外部コンパイルステップに依存させる
     exe.step.dependOn(&compile_external_exe.step);
     exe.step.dependOn(&compile_external_objc_exe.step);
     exe.step.dependOn(&compile_external_swift_exe.step);
+    exe.step.dependOn(&compile_platform_objc_exe.step);
 
     // これは`zig build`を実行する際(つまり、デフォルトステップを実行する際)に、
     // インストールプレフィックスに実行可能ファイルをインストールする意思を宣言します。
