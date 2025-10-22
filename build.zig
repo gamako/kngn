@@ -79,12 +79,37 @@ fn compilePlatformLayer(
 }
 
 /// Swiftランタイムライブラリをリンク
-fn linkSwiftRuntime(exe: *std.Build.Step.Compile) void {
-    // Swiftランタイムライブラリのパス
-    const lib_paths = [_][]const u8{
-        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx",
-        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.0.sdk/usr/lib/swift",
+fn linkSwiftRuntime(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    toolchain_path: ?[]const u8,
+    sdk_path: ?[]const u8,
+) void {
+    const allocator = b.allocator;
+
+    // ツールチェーンパスを取得（キャッシュのため指定値を優先）
+    const actual_toolchain_path = if (toolchain_path) |path|
+        path
+    else blk: {
+        const developer_path = std.mem.trim(u8, b.run(&.{ "xcode-select", "-p" }), " \n\r");
+        break :blk std.fmt.allocPrint(allocator, "{s}/Toolchains/XcodeDefault.xctoolchain", .{developer_path}) catch unreachable;
     };
+
+    // SDKパスを取得（キャッシュのため指定値を優先）
+    const actual_sdk_path = if (sdk_path) |path|
+        path
+    else blk: {
+        const output = b.run(&.{ "xcrun", "--show-sdk-path" });
+        break :blk std.mem.trim(u8, output, " \n\r");
+    };
+
+    // Swiftランタイムライブラリのパスを構築
+    const toolchain_swift_lib_path = std.fmt.allocPrint(allocator, "{s}/usr/lib/swift/macosx", .{actual_toolchain_path}) catch unreachable;
+    const sdk_swift_lib_path = std.fmt.allocPrint(allocator, "{s}/usr/lib/swift", .{actual_sdk_path}) catch unreachable;
+
+    // パスを追加
+    exe.root_module.addLibraryPath(.{ .cwd_relative = toolchain_swift_lib_path });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_swift_lib_path });
 
     // 必要なSwiftランタイムライブラリ
     const runtime_libs = [_][]const u8{
@@ -103,11 +128,6 @@ fn linkSwiftRuntime(exe: *std.Build.Step.Compile) void {
         "swiftos",
         "swiftsimd",
     };
-
-    // Swiftライブラリのパスを追加
-    for (lib_paths) |path| {
-        exe.root_module.addLibraryPath(.{ .cwd_relative = path });
-    }
 
     // Swiftランタイムライブラリをリンク
     for (runtime_libs) |lib| {
@@ -142,6 +162,20 @@ pub fn build(b: *std.Build) void {
 
     // プラットフォーム層の選択オプション
     const platform_option = b.option(PlatformType, "platform", "Platform layer to use") orelse .objc;
+
+    // Swiftツールチェーンパスオプション（指定されない場合は自動検出）
+    const swift_toolchain_path = b.option(
+        []const u8,
+        "swift-toolchain-path",
+        "Path to Swift toolchain (e.g., /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain)",
+    );
+
+    // Swift SDKパスオプション（指定されない場合は自動検出）
+    const swift_sdk_path = b.option(
+        []const u8,
+        "swift-sdk-path",
+        "Path to macOS SDK (e.g., /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk)",
+    );
 
     // ========================================
     // Objective-C版実行ファイルのビルド
@@ -186,7 +220,7 @@ pub fn build(b: *std.Build) void {
 
     // macOSフレームワークとSwiftランタイムをリンク
     linkMacOSFrameworks(exe_swift);
-    linkSwiftRuntime(exe_swift);
+    linkSwiftRuntime(b, exe_swift, swift_toolchain_path, swift_sdk_path);
 
     // ========================================
     // インストールステップの設定
