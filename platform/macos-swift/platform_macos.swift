@@ -174,6 +174,50 @@ class FramebufferView: NSView {
         }
     }
 
+    // 手動描画用のヘルパーメソッド
+    func getWidth() -> Int {
+        return width
+    }
+
+    func getHeight() -> Int {
+        return height
+    }
+
+    func getCurrentBuffer() -> UnsafeMutablePointer<UInt32> {
+        return currentBuffer
+    }
+
+    func presentManual() {
+        // バッファをスワップ（ゼロコピー）
+        let temp = currentBuffer
+        currentBuffer = displayBuffer
+        displayBuffer = temp
+
+        // 表示するバッファに対応する新しいCGDataProviderを作成
+        let providerData = CFDataCreate(nil, displayBuffer, width * height * MemoryLayout<UInt32>.size)!
+        let provider = CGDataProvider(data: providerData)!
+
+        // CGImageを作成
+        let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
+
+        // レイヤーのcontentsに設定
+        if let cgImage = cgImage {
+            contentLayer.contents = cgImage
+        }
+    }
+
     override var isOpaque: Bool {
         return true
     }
@@ -268,4 +312,68 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
 @_cdecl("platform_shutdown")
 func platform_shutdown() -> Void {
     // macOSでは特にクリーンアップ不要
+}
+
+// ========================================
+// 手動描画用API実装
+// ========================================
+
+@_cdecl("platform_poll_events")
+func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
+    guard let platformWindow = platformWindow else { return false }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let app = NSApplication.shared
+
+    // イベントをポーリング（ブロックしない）
+    while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
+        app.sendEvent(event)
+        app.updateWindows()
+    }
+
+    // ウィンドウが閉じられているか確認
+    return handle.window.isVisible
+}
+
+// 高精度モノトニック時刻を取得（調整なし）
+@_cdecl("platform_get_time")
+func platform_get_time() -> Double {
+    let ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    return Double(ns) / 1e9
+}
+
+@_cdecl("platform_lock_framebuffer")
+func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_width: UnsafeMutablePointer<Int32>?, out_height: UnsafeMutablePointer<Int32>?) -> UnsafeMutablePointer<UInt32>? {
+    guard let platformWindow = platformWindow else { return nil }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let view = handle.view
+
+    // サイズを返す
+    if let out_width = out_width {
+        out_width.pointee = Int32(view.getWidth())
+    }
+    if let out_height = out_height {
+        out_height.pointee = Int32(view.getHeight())
+    }
+
+    // currentBufferを返す
+    return view.getCurrentBuffer()
+}
+
+@_cdecl("platform_unlock_framebuffer")
+func platform_unlock_framebuffer(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    // このAPIでは特に何もする必要なし
+    // バッファのスワップはplatform_present()で行う
+}
+
+@_cdecl("platform_present")
+func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    guard let platformWindow = platformWindow else { return }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let view = handle.view
+
+    // バッファをスワップして画面に表示
+    view.presentManual()
 }

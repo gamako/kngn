@@ -3,6 +3,7 @@
 #include "platform.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // CALayer最適化版の実装
 #define IMPLEMENTATION_TYPE "CALayer Optimized"
@@ -47,6 +48,13 @@
 - (void)stopDisplayLink;
 - (void)displayLinkFired:(CADisplayLink*)link;
 - (void)dealloc;
+
+// 手動描画用のアクセサメソッド
+- (int)getWidth;
+- (int)getHeight;
+- (uint32_t*)getCurrentBuffer;
+- (void)presentManual;
+
 @end
 
 @implementation FramebufferView
@@ -196,6 +204,50 @@
     if (buffer1) free(buffer1);
 }
 
+// 手動描画用のアクセサメソッド実装
+- (int)getWidth {
+    return width;
+}
+
+- (int)getHeight {
+    return height;
+}
+
+- (uint32_t*)getCurrentBuffer {
+    return currentBuffer;
+}
+
+- (void)presentManual {
+    // バッファをスワップ（ゼロコピー）
+    uint32_t* temp = currentBuffer;
+    currentBuffer = displayBuffer;
+    displayBuffer = temp;
+
+    // 表示するバッファに対応するCGDataProviderを選択
+    CGDataProviderRef provider = (displayBuffer == buffer0) ? provider0 : provider1;
+
+    // CGImageを作成
+    CGImageRef image = CGImageCreate(
+        width,
+        height,
+        8,
+        32,
+        width * 4,
+        colorSpace,
+        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big,
+        provider,
+        NULL,
+        false,
+        kCGRenderingIntentDefault
+    );
+
+    // レイヤーのcontentsに設定
+    contentLayer.contents = (__bridge id)image;
+
+    // CGImageを解放
+    CGImageRelease(image);
+}
+
 - (BOOL)isOpaque {
     return YES;
 }
@@ -279,4 +331,73 @@ void platform_destroy_window(PlatformWindow* platformWindow) {
 // プラットフォームシャットダウン
 void platform_shutdown(void) {
     // macOSでは特にクリーンアップ不要
+}
+
+// ========================================
+// 手動描画用API実装
+// ========================================
+
+// イベントをポーリング（ノンブロッキング）
+bool platform_poll_events(PlatformWindow* platformWindow) {
+    if (!platformWindow) return false;
+
+    @autoreleasepool {
+        NSApplication* app = [NSApplication sharedApplication];
+
+        // イベントをポーリング（ブロックしない）
+        NSEvent* event;
+        while ((event = [app nextEventMatchingMask:NSEventMaskAny
+                                         untilDate:[NSDate distantPast]
+                                            inMode:NSDefaultRunLoopMode
+                                           dequeue:YES])) {
+            [app sendEvent:event];
+            [app updateWindows];
+        }
+
+        // ウィンドウが閉じられているか確認
+        return [platformWindow->window isVisible];
+    }
+}
+
+// 高精度モノトニック時刻を取得（調整なし）
+double platform_get_time(void) {
+    uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    return (double)ns / 1e9;
+}
+
+// フレームバッファへのアクセスを開始
+uint32_t* platform_lock_framebuffer(PlatformWindow* platformWindow, int* out_width, int* out_height) {
+    if (!platformWindow) return NULL;
+
+    FramebufferView* view = platformWindow->view;
+
+    // アクセサメソッドを使用してバッファにアクセス
+    if (out_width) *out_width = [view getWidth];
+    if (out_height) *out_height = [view getHeight];
+
+    // currentBufferを返す（ユーザーが書き込むバッファ）
+    return [view getCurrentBuffer];
+}
+
+// フレームバッファへのアクセスを終了
+void platform_unlock_framebuffer(PlatformWindow* platformWindow) {
+    // このAPIでは特に何もする必要なし
+    // バッファのスワップはplatform_present()で行う
+    (void)platformWindow;
+}
+
+// 画面を更新
+void platform_present(PlatformWindow* platformWindow) {
+    if (!platformWindow) return;
+
+    @autoreleasepool {
+        FramebufferView* view = platformWindow->view;
+
+        // アクセサメソッドを使用して手動描画
+        [view presentManual];
+
+        // macOSでは、ここでvsyncを待つ方法がないため、
+        // 呼び出し側で適切にフレームレートを制御する必要がある
+        // または、CADisplayLinkを使ってvsync同期する
+    }
 }

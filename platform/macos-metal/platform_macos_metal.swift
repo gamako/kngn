@@ -240,6 +240,65 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         buffer1.deinitialize(count: bufferSize)
         buffer1.deallocate()
     }
+
+    // 手動描画用のヘルパーメソッド
+    func getWidth() -> Int {
+        return width
+    }
+
+    func getHeight() -> Int {
+        return height
+    }
+
+    func getCurrentBuffer() -> UnsafeMutablePointer<UInt32> {
+        return currentBuffer
+    }
+
+    func presentManual(view: MTKView) {
+        guard let drawable = view.currentDrawable,
+              let renderPassDescriptor = view.currentRenderPassDescriptor,
+              let pipelineState = self.pipelineState,
+              let commandQueue = self.commandQueue else {
+            return
+        }
+
+        // バッファをスワップ
+        let temp = currentBuffer
+        currentBuffer = displayBuffer
+        displayBuffer = temp
+
+        // テクスチャを選択
+        let texture = (displayBuffer == buffer0) ? texture0 : texture1
+
+        // 表示するバッファをテクスチャに転送
+        if let texture = texture {
+            let region = MTLRegionMake2D(0, 0, width, height)
+            let bytesPerRow = width * MemoryLayout<UInt32>.size
+            texture.replace(region: region, mipmapLevel: 0, withBytes: displayBuffer, bytesPerRow: bytesPerRow)
+        }
+
+        // コマンドバッファを作成
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+
+        // レンダーコマンドエンコーダを作成
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
+
+        // パイプラインを設定
+        renderEncoder.setRenderPipelineState(pipelineState)
+
+        // テクスチャを設定
+        if let texture = texture {
+            renderEncoder.setFragmentTexture(texture, index: 0)
+        }
+
+        // ドローコール（4頂点で全画面クワッドを描画）
+        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        renderEncoder.endEncoding()
+
+        // レンダリング完了後にpresentと実行をスケジュール
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
 }
 
 // カスタムMTKView
@@ -261,6 +320,10 @@ class MetalFramebufferView: MTKView {
         guard let device = self.device else { return }
         metalRenderer = MetalRenderer(device: device, width: width, height: height, callback: callback, userdata: userdata)
         self.delegate = metalRenderer
+    }
+
+    func getRenderer() -> MetalRenderer? {
+        return metalRenderer
     }
 }
 
@@ -343,4 +406,72 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
 @_cdecl("platform_shutdown")
 func platform_shutdown() -> Void {
     // macOSでは特にクリーンアップ不要
+}
+
+// ========================================
+// 手動描画用API実装
+// ========================================
+
+@_cdecl("platform_poll_events")
+func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
+    guard let platformWindow = platformWindow else { return false }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let app = NSApplication.shared
+
+    // イベントをポーリング（ブロックしない）
+    while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
+        app.sendEvent(event)
+        app.updateWindows()
+    }
+
+    // ウィンドウが閉じられているか確認
+    return handle.window.isVisible
+}
+
+// 高精度モノトニック時刻を取得（調整なし）
+@_cdecl("platform_get_time")
+func platform_get_time() -> Double {
+    let ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    return Double(ns) / 1e9
+}
+
+@_cdecl("platform_lock_framebuffer")
+func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_width: UnsafeMutablePointer<Int32>?, out_height: UnsafeMutablePointer<Int32>?) -> UnsafeMutablePointer<UInt32>? {
+    guard let platformWindow = platformWindow else { return nil }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+
+    // MetalFramebufferViewのrendererにアクセス
+    guard let renderer = handle.metalView.getRenderer() else { return nil }
+
+    // サイズを返す
+    if let out_width = out_width {
+        out_width.pointee = Int32(renderer.getWidth())
+    }
+    if let out_height = out_height {
+        out_height.pointee = Int32(renderer.getHeight())
+    }
+
+    // currentBufferを返す
+    return renderer.getCurrentBuffer()
+}
+
+@_cdecl("platform_unlock_framebuffer")
+func platform_unlock_framebuffer(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    // このAPIでは特に何もする必要なし
+    // バッファのスワップはplatform_present()で行う
+}
+
+@_cdecl("platform_present")
+func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    guard let platformWindow = platformWindow else { return }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+
+    // MetalFramebufferViewのrendererにアクセス
+    guard let renderer = handle.metalView.getRenderer() else { return }
+
+    // 手動で描画
+    renderer.presentManual(view: handle.metalView)
 }
