@@ -395,9 +395,5 @@ void platform_present(PlatformWindow* platformWindow) {
 
         // アクセサメソッドを使用して手動描画
         [view presentManual];
-
-        // macOSでは、ここでvsyncを待つ方法がないため、
-        // 呼び出し側で適切にフレームレートを制御する必要がある
-        // または、CADisplayLinkを使ってvsync同期する
     }
 }

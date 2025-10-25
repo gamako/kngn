@@ -104,8 +104,9 @@ pub fn main() !void {
             c.platform_present(window);
         }
 
-        // フレームレート制御（約60FPS）
-        // 注意: platform_present()がvsync同期しない場合、ここで制御が必要
+        // ゲームループのレート制御（約60FPS）
+        // platform_present()は即座にリターンするため、
+        // 固定時間waitすることでループの実行回数を制限
         std.Thread.sleep(16_666_666); // 16.67ms (1/60秒)
     }
 

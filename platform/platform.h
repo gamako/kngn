@@ -84,9 +84,17 @@ uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int*
 // platform_lock_framebuffer()とペアで使用
 void platform_unlock_framebuffer(PlatformWindow* window);
 
-// 画面を更新（vsync同期）
+// 画面を更新
 // platform_lock_framebuffer()で書き込んだ内容を画面に表示
-// この関数はvsyncで待機する
+//
+// 動作:
+// - この関数は即座にリターンする（ブロッキングしない）
+// - レンダリングシステム（WindowServer/GPU）が内部的に次のVBLANKで画面をスワップする
+// - 書き込みバッファと表示バッファを分離しているため、いつ呼び出してもティアリングは発生しない
+//
+// 注意:
+// - ゲームループのレート制御（何回呼ぶか）は呼び出し側の責任
+// - フレームレート制限が必要な場合、platform_get_time()とsleep()を使用すること
 void platform_present(PlatformWindow* window);
 
 #endif // PLATFORM_H
