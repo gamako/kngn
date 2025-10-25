@@ -97,7 +97,7 @@ pub fn main() !void {
 
         if (pixels != null) {
             // 全ピクセルを塗りつぶし
-            const pixel_count = @as(usize, @intCast(width * height));
+            const pixel_count = @as(usize, @intCast(width)) * @as(usize, @intCast(height));
             @memset(pixels[0..pixel_count], color);
 
             // 画面を更新
