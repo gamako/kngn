@@ -97,4 +97,109 @@ void platform_unlock_framebuffer(PlatformWindow* window);
 // - フレームレート制限が必要な場合、platform_get_time()とsleep()を使用すること
 void platform_present(PlatformWindow* window);
 
+// ========================================
+// イベント処理API
+// ========================================
+
+// イベントタイプ
+typedef enum {
+    PLATFORM_EVENT_NONE = 0,
+    PLATFORM_EVENT_QUIT,
+    PLATFORM_EVENT_KEY_DOWN,
+    PLATFORM_EVENT_KEY_UP,
+} PlatformEventType;
+
+// キーコード（GLFWと互換）
+typedef enum {
+    PLATFORM_KEY_UNKNOWN = -1,
+
+    // 印字可能文字（ASCII互換）
+    PLATFORM_KEY_SPACE = 32,
+    PLATFORM_KEY_0 = 48,
+    PLATFORM_KEY_1 = 49,
+    PLATFORM_KEY_2 = 50,
+    PLATFORM_KEY_3 = 51,
+    PLATFORM_KEY_4 = 52,
+    PLATFORM_KEY_5 = 53,
+    PLATFORM_KEY_6 = 54,
+    PLATFORM_KEY_7 = 55,
+    PLATFORM_KEY_8 = 56,
+    PLATFORM_KEY_9 = 57,
+    PLATFORM_KEY_A = 65,
+    PLATFORM_KEY_B = 66,
+    PLATFORM_KEY_C = 67,
+    PLATFORM_KEY_D = 68,
+    PLATFORM_KEY_E = 69,
+    PLATFORM_KEY_F = 70,
+    PLATFORM_KEY_G = 71,
+    PLATFORM_KEY_H = 72,
+    PLATFORM_KEY_I = 73,
+    PLATFORM_KEY_J = 74,
+    PLATFORM_KEY_K = 75,
+    PLATFORM_KEY_L = 76,
+    PLATFORM_KEY_M = 77,
+    PLATFORM_KEY_N = 78,
+    PLATFORM_KEY_O = 79,
+    PLATFORM_KEY_P = 80,
+    PLATFORM_KEY_Q = 81,
+    PLATFORM_KEY_R = 82,
+    PLATFORM_KEY_S = 83,
+    PLATFORM_KEY_T = 84,
+    PLATFORM_KEY_U = 85,
+    PLATFORM_KEY_V = 86,
+    PLATFORM_KEY_W = 87,
+    PLATFORM_KEY_X = 88,
+    PLATFORM_KEY_Y = 89,
+    PLATFORM_KEY_Z = 90,
+
+    // 特殊キー
+    PLATFORM_KEY_ESCAPE = 256,
+    PLATFORM_KEY_ENTER = 257,
+    PLATFORM_KEY_LEFT = 263,
+    PLATFORM_KEY_RIGHT = 264,
+    PLATFORM_KEY_UP = 265,
+    PLATFORM_KEY_DOWN = 266,
+} PlatformKeyCode;
+
+// モディファイアキー
+typedef enum {
+    PLATFORM_MOD_SHIFT = 0x01,
+    PLATFORM_MOD_CTRL = 0x02,
+    PLATFORM_MOD_ALT = 0x04,
+    PLATFORM_MOD_CMD = 0x08,  // macOS Command, Windows Super
+} PlatformModifierFlags;
+
+// イベント構造体
+typedef struct PlatformEvent {
+    PlatformEventType type;
+
+    union {
+        struct {
+            PlatformKeyCode key;
+            bool is_repeat;
+            uint32_t modifiers;
+        } keyboard;
+        // 将来的にマウス、タッチなど追加
+    };
+} PlatformEvent;
+
+// イベント取得API（1つずつ）
+// ウィンドウのイベントキューから1つイベントを取得する
+// イベントがあればtrue、ないならfalseを返す
+bool platform_get_event(PlatformWindow* window, PlatformEvent* event);
+
+// イベント情報取得ヘルパー関数
+// イベント構造体からキーボード情報を安全に抽出
+static inline PlatformKeyCode platform_event_get_key(const PlatformEvent* event) {
+    return event->keyboard.key;
+}
+
+static inline bool platform_event_get_repeat(const PlatformEvent* event) {
+    return event->keyboard.is_repeat;
+}
+
+static inline uint32_t platform_event_get_modifiers(const PlatformEvent* event) {
+    return event->keyboard.modifiers;
+}
+
 #endif // PLATFORM_H

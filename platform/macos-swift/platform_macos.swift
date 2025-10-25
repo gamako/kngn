@@ -7,14 +7,163 @@ let IMPLEMENTATION_TYPE = "CALayer Optimized (Swift)"
 // フレームコールバック型定義（C互換）
 typealias FrameCallback = @convention(c) (UnsafeMutablePointer<UInt32>, Int32, Int32, UnsafeMutableRawPointer?) -> Void
 
+// ========================================
+// イベント処理用定義
+// ========================================
+
+let EVENT_QUEUE_SIZE = 256
+
+// PlatformEvent構造体（C互換）
+struct PlatformEvent {
+    var type: UInt32
+    var keyboard: KeyboardEvent
+}
+
+struct KeyboardEvent {
+    var key: Int32
+    var is_repeat: Bool
+    var modifiers: UInt32
+}
+
+// イベントタイプ定義
+let PLATFORM_EVENT_NONE: UInt32 = 0
+let PLATFORM_EVENT_QUIT: UInt32 = 1
+let PLATFORM_EVENT_KEY_DOWN: UInt32 = 2
+let PLATFORM_EVENT_KEY_UP: UInt32 = 3
+
+// キーコード定義（選択）
+let PLATFORM_KEY_UNKNOWN: Int32 = -1
+let PLATFORM_KEY_SPACE: Int32 = 32
+let PLATFORM_KEY_0: Int32 = 48
+let PLATFORM_KEY_1: Int32 = 49
+let PLATFORM_KEY_2: Int32 = 50
+let PLATFORM_KEY_3: Int32 = 51
+let PLATFORM_KEY_4: Int32 = 52
+let PLATFORM_KEY_5: Int32 = 53
+let PLATFORM_KEY_6: Int32 = 54
+let PLATFORM_KEY_7: Int32 = 55
+let PLATFORM_KEY_8: Int32 = 56
+let PLATFORM_KEY_9: Int32 = 57
+let PLATFORM_KEY_A: Int32 = 65
+let PLATFORM_KEY_B: Int32 = 66
+let PLATFORM_KEY_C: Int32 = 67
+let PLATFORM_KEY_D: Int32 = 68
+let PLATFORM_KEY_E: Int32 = 69
+let PLATFORM_KEY_F: Int32 = 70
+let PLATFORM_KEY_G: Int32 = 71
+let PLATFORM_KEY_H: Int32 = 72
+let PLATFORM_KEY_I: Int32 = 73
+let PLATFORM_KEY_J: Int32 = 74
+let PLATFORM_KEY_K: Int32 = 75
+let PLATFORM_KEY_L: Int32 = 76
+let PLATFORM_KEY_M: Int32 = 77
+let PLATFORM_KEY_N: Int32 = 78
+let PLATFORM_KEY_O: Int32 = 79
+let PLATFORM_KEY_P: Int32 = 80
+let PLATFORM_KEY_Q: Int32 = 81
+let PLATFORM_KEY_R: Int32 = 82
+let PLATFORM_KEY_S: Int32 = 83
+let PLATFORM_KEY_T: Int32 = 84
+let PLATFORM_KEY_U: Int32 = 85
+let PLATFORM_KEY_V: Int32 = 86
+let PLATFORM_KEY_W: Int32 = 87
+let PLATFORM_KEY_X: Int32 = 88
+let PLATFORM_KEY_Y: Int32 = 89
+let PLATFORM_KEY_Z: Int32 = 90
+let PLATFORM_KEY_ESCAPE: Int32 = 256
+let PLATFORM_KEY_ENTER: Int32 = 257
+let PLATFORM_KEY_LEFT: Int32 = 263
+let PLATFORM_KEY_RIGHT: Int32 = 264
+let PLATFORM_KEY_UP: Int32 = 265
+let PLATFORM_KEY_DOWN: Int32 = 266
+let PLATFORM_KEY_CMD: Int32 = 256 + 8
+
+// モディファイアキー定義
+let PLATFORM_MOD_SHIFT: UInt32 = 0x01
+let PLATFORM_MOD_CTRL: UInt32 = 0x02
+let PLATFORM_MOD_ALT: UInt32 = 0x04
+let PLATFORM_MOD_CMD: UInt32 = 0x08
+
+// イベントキュー構造体
+struct EventQueue {
+    var events: [PlatformEvent]
+    var head: Int = 0  // 次に書き込む位置
+    var tail: Int = 0  // 次に読む位置
+
+    init() {
+        var events = [PlatformEvent]()
+        for _ in 0..<EVENT_QUEUE_SIZE {
+            var event = PlatformEvent(type: PLATFORM_EVENT_NONE, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
+            events.append(event)
+        }
+        self.events = events
+    }
+}
+
+// macOSのキーコードをPlatformKeyCodeに変換
+func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
+    switch keyCode {
+        case 0x00: return PLATFORM_KEY_A
+        case 0x01: return PLATFORM_KEY_S
+        case 0x02: return PLATFORM_KEY_D
+        case 0x03: return PLATFORM_KEY_F
+        case 0x04: return PLATFORM_KEY_H
+        case 0x05: return PLATFORM_KEY_G
+        case 0x06: return PLATFORM_KEY_Z
+        case 0x07: return PLATFORM_KEY_X
+        case 0x08: return PLATFORM_KEY_C
+        case 0x09: return PLATFORM_KEY_V
+        case 0x0B: return PLATFORM_KEY_B
+        case 0x0C: return PLATFORM_KEY_Q
+        case 0x0D: return PLATFORM_KEY_W
+        case 0x0E: return PLATFORM_KEY_E
+        case 0x0F: return PLATFORM_KEY_R
+        case 0x10: return PLATFORM_KEY_Y
+        case 0x11: return PLATFORM_KEY_T
+        case 0x12: return PLATFORM_KEY_1
+        case 0x13: return PLATFORM_KEY_2
+        case 0x14: return PLATFORM_KEY_3
+        case 0x15: return PLATFORM_KEY_4
+        case 0x16: return PLATFORM_KEY_6
+        case 0x17: return PLATFORM_KEY_5
+        case 0x1A: return PLATFORM_KEY_9
+        case 0x1B: return PLATFORM_KEY_0
+        case 0x1C: return PLATFORM_KEY_U
+        case 0x1D: return PLATFORM_KEY_O
+        case 0x1E: return PLATFORM_KEY_I
+        case 0x1F: return PLATFORM_KEY_P
+        case 0x31: return PLATFORM_KEY_SPACE
+        case 0x35: return PLATFORM_KEY_ESCAPE
+        case 0x7B: return PLATFORM_KEY_LEFT
+        case 0x7C: return PLATFORM_KEY_RIGHT
+        case 0x7D: return PLATFORM_KEY_DOWN
+        case 0x7E: return PLATFORM_KEY_UP
+        case 0x24: return PLATFORM_KEY_ENTER
+        case 0x4C: return PLATFORM_KEY_ENTER
+        default: return PLATFORM_KEY_UNKNOWN
+    }
+}
+
+// モディファイアキーを抽出
+func extractModifiers(_ nsModifiers: NSEvent.ModifierFlags) -> UInt32 {
+    var mods: UInt32 = 0
+    if nsModifiers.contains(.shift)   { mods |= PLATFORM_MOD_SHIFT }
+    if nsModifiers.contains(.control) { mods |= PLATFORM_MOD_CTRL }
+    if nsModifiers.contains(.option)  { mods |= PLATFORM_MOD_ALT }
+    if nsModifiers.contains(.command) { mods |= PLATFORM_MOD_CMD }
+    return mods
+}
+
 // PlatformWindowの不透明型として NSObject を継承（参照カウントのため）
 class PlatformWindowHandle: NSObject {
     var window: NSWindow
     var view: FramebufferView
+    var event_queue: EventQueue
 
     init(window: NSWindow, view: FramebufferView) {
         self.window = window
         self.view = view
+        self.event_queue = EventQueue()
         super.init()
     }
 }
@@ -327,12 +476,44 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
 
     // イベントをポーリング（ブロックしない）
     while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
+        // キーボードイベントをイベントキューに追加
+        if event.type == .keyDown || event.type == .keyUp {
+            var queue = handle.event_queue
+            let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
+
+            // キューがいっぱいでない場合のみ追加
+            if next_head != queue.tail {
+                var platform_event = PlatformEvent(type: PLATFORM_EVENT_NONE, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
+                platform_event.type = (event.type == .keyDown) ? PLATFORM_EVENT_KEY_DOWN : PLATFORM_EVENT_KEY_UP
+                platform_event.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
+                platform_event.keyboard.is_repeat = event.isARepeat
+                platform_event.keyboard.modifiers = extractModifiers(event.modifierFlags)
+
+                queue.events[queue.head] = platform_event
+                queue.head = next_head
+                handle.event_queue = queue
+            }
+        }
+
         app.sendEvent(event)
         app.updateWindows()
     }
 
     // ウィンドウが閉じられているか確認
-    return handle.window.isVisible
+    if !handle.window.isVisible {
+        // QUITイベントをキューに追加
+        var queue = handle.event_queue
+        let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
+        if next_head != queue.tail {
+            var quit_event = PlatformEvent(type: PLATFORM_EVENT_QUIT, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
+            queue.events[queue.head] = quit_event
+            queue.head = next_head
+            handle.event_queue = queue
+        }
+        return false
+    }
+
+    return true
 }
 
 // 高精度モノトニック時刻を取得（調整なし）
@@ -376,4 +557,26 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
 
     // バッファをスワップして画面に表示
     view.presentManual()
+}
+
+// イベント取得API
+@_cdecl("platform_get_event")
+func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRawPointer?) -> Bool {
+    guard let window = window, let event = event else { return false }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(window).takeUnretainedValue()
+    var queue = handle.event_queue
+
+    // キューが空の場合
+    if queue.head == queue.tail {
+        return false
+    }
+
+    // キューから次のイベントを取得（メモリコピー）
+    memcpy(event, &queue.events[queue.tail], MemoryLayout<PlatformEvent>.size)
+
+    queue.tail = (queue.tail + 1) % EVENT_QUEUE_SIZE
+    handle.event_queue = queue
+
+    return true
 }

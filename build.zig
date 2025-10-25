@@ -335,6 +335,99 @@ pub fn build(b: *std.Build) void {
         run_metal_cmd.addArgs(args);
     }
 
+    // ========================================
+    // サンプルプログラム用のビルド設定
+    // ========================================
+
+    // サンプルプログラムをビルド・実行するヘルパー関数
+    inline for (.{
+        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig" },
+        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig" },
+    }) |example| {
+        // サンプル用Objective-C版
+        const example_exe_objc = b.addExecutable(.{
+            .name = example.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example.path),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+
+        const example_objc_platform = compilePlatformLayer(b, .objc, optimize);
+        example_exe_objc.root_module.addObjectFile(example_objc_platform.obj_file);
+        example_exe_objc.root_module.link_libc = true;
+        example_exe_objc.root_module.addIncludePath(b.path("platform"));
+        example_exe_objc.step.dependOn(&example_objc_platform.compile_step.step);
+        linkMacOSFrameworks(example_exe_objc);
+
+        // サンプル用Swift版
+        const example_exe_swift = b.addExecutable(.{
+            .name = example.name ++ "_swift",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example.path),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+
+        const example_swift_platform = compilePlatformLayer(b, .swift, optimize);
+        example_exe_swift.root_module.addObjectFile(example_swift_platform.obj_file);
+        example_exe_swift.root_module.link_libc = true;
+        example_exe_swift.root_module.addIncludePath(b.path("platform"));
+        example_exe_swift.step.dependOn(&example_swift_platform.compile_step.step);
+        linkMacOSFrameworks(example_exe_swift);
+        linkSwiftRuntime(b, example_exe_swift, swift_toolchain_path, swift_sdk_path, &.{});
+
+        // サンプル用Metal版
+        const example_exe_metal = b.addExecutable(.{
+            .name = example.name ++ "_metal",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example.path),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+
+        const example_metal_platform = compilePlatformLayer(b, .metal, optimize);
+        example_exe_metal.root_module.addObjectFile(example_metal_platform.obj_file);
+        example_exe_metal.root_module.link_libc = true;
+        example_exe_metal.root_module.addIncludePath(b.path("platform"));
+        example_exe_metal.step.dependOn(&example_metal_platform.compile_step.step);
+        linkMacOSFrameworks(example_exe_metal);
+        example_exe_metal.root_module.linkFramework("Metal", .{});
+        example_exe_metal.root_module.linkFramework("MetalKit", .{});
+        linkSwiftRuntime(b, example_exe_metal, swift_toolchain_path, swift_sdk_path, &.{
+            "swiftMetalKit",
+            "swiftModelIO",
+        });
+
+        // インストール
+        b.installArtifact(example_exe_objc);
+        b.installArtifact(example_exe_swift);
+        b.installArtifact(example_exe_metal);
+
+        // 実行ステップ
+        const example_run_step = b.step(
+            b.fmt("run-{s}", .{example.name}),
+            b.fmt("Run {s} example (uses -Dplatform option)", .{example.name}),
+        );
+
+        const example_exe_to_run = switch (platform_option) {
+            .objc => example_exe_objc,
+            .swift => example_exe_swift,
+            .metal => example_exe_metal,
+        };
+
+        const example_run_cmd = b.addRunArtifact(example_exe_to_run);
+        example_run_step.dependOn(&example_run_cmd.step);
+        example_run_cmd.step.dependOn(b.getInstallStep());
+
+        if (b.args) |args| {
+            example_run_cmd.addArgs(args);
+        }
+    }
+
     // フラグと同じように、トップレベルステップも`--help`メニューに表示されます。
     //
     // Zigビルドシステムはユーザーランドに完全に実装されています。
