@@ -1,4 +1,4 @@
-実装プランは doc/PLAN.md に記述
+実装プランは docs/PLAN.md に記述
 
 # version management
 バージョン管理はjjを使用します。gitとは異なる管理概念です。その他の作業はユーザーに相談すること。
