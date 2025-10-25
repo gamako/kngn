@@ -32,7 +32,7 @@ fn interpolateColor(color1: u32, color2: u32, t: f64) u32 {
 
 pub fn main() !void {
     std.debug.print("Starting timed window example...\n", .{});
-    std.debug.print("Window will display for 5 seconds with color transition: Green -> Yellow -> Red\n", .{});
+    std.debug.print("Window will display for 2 seconds with color transition: Green -> Yellow -> Red\n", .{});
 
     // プラットフォーム初期化
     if (!c.platform_init()) {
@@ -57,20 +57,20 @@ pub fn main() !void {
     }
     defer c.platform_destroy_window(window);
 
-    std.debug.print("Window created. Starting 5 second timer...\n", .{});
+    std.debug.print("Window created. Starting 2 second timer...\n", .{});
 
     // 開始時刻を記録
     const start_time = c.platform_get_time();
-    const duration: f64 = 5.0; // 5秒間
+    const duration: f64 = 2.0; // 2秒間
 
     // メインループ
     while (c.platform_poll_events(window)) {
         const current_time = c.platform_get_time();
         const elapsed = current_time - start_time;
 
-        // 5秒経過したら終了
+        // 2秒経過したら終了
         if (elapsed >= duration) {
-            std.debug.print("5 seconds elapsed. Closing window...\n", .{});
+            std.debug.print("2 seconds elapsed. Closing window...\n", .{});
             break;
         }
 
