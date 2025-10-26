@@ -78,6 +78,72 @@ let PLATFORM_KEY_UP: Int32 = 265
 let PLATFORM_KEY_DOWN: Int32 = 266
 let PLATFORM_KEY_CMD: Int32 = 256 + 8
 
+// 編集キー
+let PLATFORM_KEY_TAB: Int32 = 258
+let PLATFORM_KEY_BACKSPACE: Int32 = 259
+let PLATFORM_KEY_INSERT: Int32 = 260
+let PLATFORM_KEY_DELETE: Int32 = 261
+let PLATFORM_KEY_PAGE_UP: Int32 = 267
+let PLATFORM_KEY_PAGE_DOWN: Int32 = 268
+let PLATFORM_KEY_HOME: Int32 = 269
+let PLATFORM_KEY_END: Int32 = 270
+
+// ファンクションキー（F1-F20）
+let PLATFORM_KEY_F1: Int32 = 290
+let PLATFORM_KEY_F2: Int32 = 291
+let PLATFORM_KEY_F3: Int32 = 292
+let PLATFORM_KEY_F4: Int32 = 293
+let PLATFORM_KEY_F5: Int32 = 294
+let PLATFORM_KEY_F6: Int32 = 295
+let PLATFORM_KEY_F7: Int32 = 296
+let PLATFORM_KEY_F8: Int32 = 297
+let PLATFORM_KEY_F9: Int32 = 298
+let PLATFORM_KEY_F10: Int32 = 299
+let PLATFORM_KEY_F11: Int32 = 300
+let PLATFORM_KEY_F12: Int32 = 301
+let PLATFORM_KEY_F13: Int32 = 302
+let PLATFORM_KEY_F14: Int32 = 303
+let PLATFORM_KEY_F15: Int32 = 304
+let PLATFORM_KEY_F16: Int32 = 305
+let PLATFORM_KEY_F17: Int32 = 306
+let PLATFORM_KEY_F18: Int32 = 307
+let PLATFORM_KEY_F19: Int32 = 308
+let PLATFORM_KEY_F20: Int32 = 309
+
+// テンキー（numeric keypad）
+let PLATFORM_KEY_KP_0: Int32 = 320
+let PLATFORM_KEY_KP_1: Int32 = 321
+let PLATFORM_KEY_KP_2: Int32 = 322
+let PLATFORM_KEY_KP_3: Int32 = 323
+let PLATFORM_KEY_KP_4: Int32 = 324
+let PLATFORM_KEY_KP_5: Int32 = 325
+let PLATFORM_KEY_KP_6: Int32 = 326
+let PLATFORM_KEY_KP_7: Int32 = 327
+let PLATFORM_KEY_KP_8: Int32 = 328
+let PLATFORM_KEY_KP_9: Int32 = 329
+let PLATFORM_KEY_KP_DECIMAL: Int32 = 330
+let PLATFORM_KEY_KP_DIVIDE: Int32 = 331
+let PLATFORM_KEY_KP_MULTIPLY: Int32 = 332
+let PLATFORM_KEY_KP_SUBTRACT: Int32 = 333
+let PLATFORM_KEY_KP_ADD: Int32 = 334
+let PLATFORM_KEY_KP_ENTER: Int32 = 335
+let PLATFORM_KEY_KP_EQUAL: Int32 = 336
+
+// モディファイアキー（単独入力用）
+let PLATFORM_KEY_LEFT_SHIFT: Int32 = 340
+let PLATFORM_KEY_LEFT_CONTROL: Int32 = 341
+let PLATFORM_KEY_LEFT_ALT: Int32 = 342
+let PLATFORM_KEY_LEFT_SUPER: Int32 = 343        // Command (macOS)
+let PLATFORM_KEY_RIGHT_SHIFT: Int32 = 344
+let PLATFORM_KEY_RIGHT_CONTROL: Int32 = 345
+let PLATFORM_KEY_RIGHT_ALT: Int32 = 346
+let PLATFORM_KEY_RIGHT_SUPER: Int32 = 347       // Command (macOS)
+
+// その他のキー
+let PLATFORM_KEY_CAPS_LOCK: Int32 = 280
+let PLATFORM_KEY_PRINT_SCREEN: Int32 = 283
+let PLATFORM_KEY_PAUSE: Int32 = 284
+
 // モディファイアキー定義
 let PLATFORM_MOD_SHIFT: UInt32 = 0x01
 let PLATFORM_MOD_CTRL: UInt32 = 0x02
@@ -104,6 +170,7 @@ struct EventQueue {
 // 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
 func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
     switch keyCode {
+        // 文字キー（ANSI配列）
         case 0x00: return PLATFORM_KEY_A
         case 0x01: return PLATFORM_KEY_S
         case 0x02: return PLATFORM_KEY_D
@@ -139,7 +206,6 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
         case 0x21: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_LeftBracket ([)
         case 0x22: return PLATFORM_KEY_I
         case 0x23: return PLATFORM_KEY_P
-        case 0x24: return PLATFORM_KEY_ENTER
         case 0x25: return PLATFORM_KEY_L       // kVK_ANSI_L
         case 0x26: return PLATFORM_KEY_J       // kVK_ANSI_J
         case 0x27: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Quote (')
@@ -151,13 +217,85 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
         case 0x2D: return PLATFORM_KEY_N       // kVK_ANSI_N
         case 0x2E: return PLATFORM_KEY_M       // kVK_ANSI_M
         case 0x2F: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Period (.)
-        case 0x31: return PLATFORM_KEY_SPACE
-        case 0x35: return PLATFORM_KEY_ESCAPE
-        case 0x4C: return PLATFORM_KEY_ENTER    // kVK_ANSI_KeypadEnter
-        case 0x7B: return PLATFORM_KEY_LEFT
-        case 0x7C: return PLATFORM_KEY_RIGHT
-        case 0x7D: return PLATFORM_KEY_DOWN
-        case 0x7E: return PLATFORM_KEY_UP
+        case 0x30: return PLATFORM_KEY_TAB     // kVK_Tab
+        case 0x31: return PLATFORM_KEY_SPACE   // kVK_Space
+        case 0x32: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Grave (`)
+        case 0x33: return PLATFORM_KEY_BACKSPACE // kVK_Delete
+
+        // Return/Enter
+        case 0x24: return PLATFORM_KEY_ENTER   // kVK_Return
+
+        // Escape
+        case 0x35: return PLATFORM_KEY_ESCAPE  // kVK_Escape
+
+        // モディファイアキー（左）
+        case 0x38: return PLATFORM_KEY_LEFT_SHIFT      // kVK_Shift
+        case 0x3A: return PLATFORM_KEY_LEFT_ALT        // kVK_Option
+        case 0x3B: return PLATFORM_KEY_LEFT_CONTROL    // kVK_Control
+        case 0x37: return PLATFORM_KEY_LEFT_SUPER      // kVK_Command
+        case 0x39: return PLATFORM_KEY_CAPS_LOCK       // kVK_CapsLock
+
+        // モディファイアキー（右）
+        case 0x3C: return PLATFORM_KEY_RIGHT_SHIFT     // kVK_RightShift
+        case 0x3D: return PLATFORM_KEY_RIGHT_ALT       // kVK_RightOption
+        case 0x3E: return PLATFORM_KEY_RIGHT_CONTROL   // kVK_RightControl
+        case 0x36: return PLATFORM_KEY_RIGHT_SUPER     // kVK_RightCommand
+
+        // ファンクションキー
+        case 0x7A: return PLATFORM_KEY_F1              // kVK_F1
+        case 0x78: return PLATFORM_KEY_F2              // kVK_F2
+        case 0x63: return PLATFORM_KEY_F3              // kVK_F3
+        case 0x76: return PLATFORM_KEY_F4              // kVK_F4
+        case 0x60: return PLATFORM_KEY_F5              // kVK_F5
+        case 0x61: return PLATFORM_KEY_F6              // kVK_F6
+        case 0x62: return PLATFORM_KEY_F7              // kVK_F7
+        case 0x64: return PLATFORM_KEY_F8              // kVK_F8
+        case 0x65: return PLATFORM_KEY_F9              // kVK_F9
+        case 0x6D: return PLATFORM_KEY_F10             // kVK_F10
+        case 0x67: return PLATFORM_KEY_F11             // kVK_F11
+        case 0x6F: return PLATFORM_KEY_F12             // kVK_F12
+        case 0x69: return PLATFORM_KEY_F13             // kVK_F13
+        case 0x6B: return PLATFORM_KEY_F14             // kVK_F14
+        case 0x71: return PLATFORM_KEY_F15             // kVK_F15
+        case 0x6A: return PLATFORM_KEY_F16             // kVK_F16
+        case 0x40: return PLATFORM_KEY_F17             // kVK_F17
+        case 0x4F: return PLATFORM_KEY_F18             // kVK_F18
+        case 0x50: return PLATFORM_KEY_F19             // kVK_F19
+        case 0x5A: return PLATFORM_KEY_F20             // kVK_F20
+
+        // 編集キー
+        case 0x72: return PLATFORM_KEY_INSERT          // kVK_Help
+        case 0x73: return PLATFORM_KEY_HOME            // kVK_Home
+        case 0x74: return PLATFORM_KEY_PAGE_UP         // kVK_PageUp
+        case 0x75: return PLATFORM_KEY_DELETE          // kVK_ForwardDelete
+        case 0x77: return PLATFORM_KEY_END             // kVK_End
+        case 0x79: return PLATFORM_KEY_PAGE_DOWN       // kVK_PageDown
+
+        // 矢印キー
+        case 0x7B: return PLATFORM_KEY_LEFT            // kVK_LeftArrow
+        case 0x7C: return PLATFORM_KEY_RIGHT           // kVK_RightArrow
+        case 0x7D: return PLATFORM_KEY_DOWN            // kVK_DownArrow
+        case 0x7E: return PLATFORM_KEY_UP              // kVK_UpArrow
+
+        // テンキー
+        case 0x52: return PLATFORM_KEY_KP_0            // kVK_ANSI_Keypad0
+        case 0x53: return PLATFORM_KEY_KP_1            // kVK_ANSI_Keypad1
+        case 0x54: return PLATFORM_KEY_KP_2            // kVK_ANSI_Keypad2
+        case 0x55: return PLATFORM_KEY_KP_3            // kVK_ANSI_Keypad3
+        case 0x56: return PLATFORM_KEY_KP_4            // kVK_ANSI_Keypad4
+        case 0x57: return PLATFORM_KEY_KP_5            // kVK_ANSI_Keypad5
+        case 0x58: return PLATFORM_KEY_KP_6            // kVK_ANSI_Keypad6
+        case 0x59: return PLATFORM_KEY_KP_7            // kVK_ANSI_Keypad7
+        case 0x5B: return PLATFORM_KEY_KP_8            // kVK_ANSI_Keypad8
+        case 0x5C: return PLATFORM_KEY_KP_9            // kVK_ANSI_Keypad9
+        case 0x41: return PLATFORM_KEY_KP_DECIMAL      // kVK_ANSI_KeypadDecimal
+        case 0x4B: return PLATFORM_KEY_KP_DIVIDE       // kVK_ANSI_KeypadDivide
+        case 0x43: return PLATFORM_KEY_KP_MULTIPLY     // kVK_ANSI_KeypadMultiply
+        case 0x4E: return PLATFORM_KEY_KP_SUBTRACT     // kVK_ANSI_KeypadMinus
+        case 0x45: return PLATFORM_KEY_KP_ADD          // kVK_ANSI_KeypadPlus
+        case 0x4C: return PLATFORM_KEY_KP_ENTER        // kVK_ANSI_KeypadEnter
+        case 0x51: return PLATFORM_KEY_KP_EQUAL        // kVK_ANSI_KeypadEquals
+
         default: return PLATFORM_KEY_UNKNOWN
     }
 }
