@@ -180,26 +180,12 @@ typedef struct PlatformEvent {
             uint32_t modifiers;
         } keyboard;
         // 将来的にマウス、タッチなど追加
-    };
+    } payload;
 } PlatformEvent;
 
 // イベント取得API（1つずつ）
 // ウィンドウのイベントキューから1つイベントを取得する
 // イベントがあればtrue、ないならfalseを返す
 bool platform_get_event(PlatformWindow* window, PlatformEvent* event);
-
-// イベント情報取得ヘルパー関数
-// イベント構造体からキーボード情報を安全に抽出
-static inline PlatformKeyCode platform_event_get_key(const PlatformEvent* event) {
-    return event->keyboard.key;
-}
-
-static inline bool platform_event_get_repeat(const PlatformEvent* event) {
-    return event->keyboard.is_repeat;
-}
-
-static inline uint32_t platform_event_get_modifiers(const PlatformEvent* event) {
-    return event->keyboard.modifiers;
-}
 
 #endif // PLATFORM_H

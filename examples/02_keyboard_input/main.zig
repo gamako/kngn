@@ -22,21 +22,35 @@ fn hsvToRGB(h: f32, s: f32, v: f32) u32 {
     var b: f32 = 0.0;
 
     if (h_normalized < 1.0) {
-        r = chroma; g = x; b = 0.0;
+        r = chroma;
+        g = x;
+        b = 0.0;
     } else if (h_normalized < 2.0) {
-        r = x; g = chroma; b = 0.0;
+        r = x;
+        g = chroma;
+        b = 0.0;
     } else if (h_normalized < 3.0) {
-        r = 0.0; g = chroma; b = x;
+        r = 0.0;
+        g = chroma;
+        b = x;
     } else if (h_normalized < 4.0) {
-        r = 0.0; g = x; b = chroma;
+        r = 0.0;
+        g = x;
+        b = chroma;
     } else if (h_normalized < 5.0) {
-        r = x; g = 0.0; b = chroma;
+        r = x;
+        g = 0.0;
+        b = chroma;
     } else {
-        r = chroma; g = 0.0; b = x;
+        r = chroma;
+        g = 0.0;
+        b = x;
     }
 
     const m = v - chroma;
-    r += m; g += m; b += m;
+    r += m;
+    g += m;
+    b += m;
 
     const ri = @as(u32, @intFromFloat(r * 255.0));
     const gi = @as(u32, @intFromFloat(g * 255.0));
@@ -108,8 +122,8 @@ pub fn main() !void {
                 std.debug.print("Quit event received\n", .{});
                 return;
             } else if (event.type == c.PLATFORM_EVENT_KEY_DOWN) {
-                // ヘルパー関数を使用してキー情報を安全に取得
-                const key = c.platform_event_get_key(&event);
+                // unionのメンバーに直接アクセス
+                const key = event.payload.keyboard.key;
 
                 // ESC または Q: 終了
                 if (key == c.PLATFORM_KEY_ESCAPE or key == c.PLATFORM_KEY_Q) {
