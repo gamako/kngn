@@ -339,6 +339,11 @@ pub fn build(b: *std.Build) void {
     // サンプルプログラム用のビルド設定
     // ========================================
 
+    // キーボード入力モジュール
+    const keyboard_module = b.createModule(.{
+        .root_source_file = b.path("src/keyboard.zig"),
+    });
+
     // サンプルプログラムをビルド・実行するヘルパー関数
     inline for (.{
         .{ .name = "example_01", .path = "examples/01_timed_window/main.zig" },
@@ -353,6 +358,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+
+        // キーボードモジュールを追加
+        example_exe_objc.root_module.addImport("keyboard", keyboard_module);
 
         const example_objc_platform = compilePlatformLayer(b, .objc, optimize);
         example_exe_objc.root_module.addObjectFile(example_objc_platform.obj_file);
@@ -371,6 +379,9 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
+        // キーボードモジュールを追加
+        example_exe_swift.root_module.addImport("keyboard", keyboard_module);
+
         const example_swift_platform = compilePlatformLayer(b, .swift, optimize);
         example_exe_swift.root_module.addObjectFile(example_swift_platform.obj_file);
         example_exe_swift.root_module.link_libc = true;
@@ -388,6 +399,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+
+        // キーボードモジュールを追加
+        example_exe_metal.root_module.addImport("keyboard", keyboard_module);
 
         const example_metal_platform = compilePlatformLayer(b, .metal, optimize);
         example_exe_metal.root_module.addObjectFile(example_metal_platform.obj_file);

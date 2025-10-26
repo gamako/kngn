@@ -1,95 +1,10 @@
 const std = @import("std");
+const keyboard = @import("keyboard");
 
 // C関数をインポート
 const c = @cImport({
     @cInclude("platform.h");
 });
-
-// キーコードを文字列に変換
-fn getKeyName(key: i32) []const u8 {
-    return switch (key) {
-        // 文字キー
-        c.PLATFORM_KEY_A...c.PLATFORM_KEY_Z => blk: {
-            const offset = key - c.PLATFORM_KEY_A;
-            const char_code = @as(u8, @intCast(offset + @as(i32, 'A')));
-            _ = char_code;
-            break :blk "LETTER";
-        },
-        c.PLATFORM_KEY_0...c.PLATFORM_KEY_9 => blk: {
-            const offset = key - c.PLATFORM_KEY_0;
-            const char_code = @as(u8, @intCast(offset + @as(i32, '0')));
-            _ = char_code;
-            break :blk "DIGIT";
-        },
-        // 特殊キー
-        c.PLATFORM_KEY_SPACE => "SPACE",
-        c.PLATFORM_KEY_TAB => "TAB",
-        c.PLATFORM_KEY_BACKSPACE => "BACKSPACE",
-        c.PLATFORM_KEY_ESCAPE => "ESCAPE",
-        c.PLATFORM_KEY_ENTER => "ENTER",
-        c.PLATFORM_KEY_INSERT => "INSERT",
-        c.PLATFORM_KEY_DELETE => "DELETE",
-        c.PLATFORM_KEY_HOME => "HOME",
-        c.PLATFORM_KEY_END => "END",
-        c.PLATFORM_KEY_PAGE_UP => "PAGE_UP",
-        c.PLATFORM_KEY_PAGE_DOWN => "PAGE_DOWN",
-        // 矢印キー
-        c.PLATFORM_KEY_LEFT => "LEFT",
-        c.PLATFORM_KEY_RIGHT => "RIGHT",
-        c.PLATFORM_KEY_UP => "UP",
-        c.PLATFORM_KEY_DOWN => "DOWN",
-        // ファンクションキー
-        c.PLATFORM_KEY_F1 => "F1",
-        c.PLATFORM_KEY_F2 => "F2",
-        c.PLATFORM_KEY_F3 => "F3",
-        c.PLATFORM_KEY_F4 => "F4",
-        c.PLATFORM_KEY_F5 => "F5",
-        c.PLATFORM_KEY_F6 => "F6",
-        c.PLATFORM_KEY_F7 => "F7",
-        c.PLATFORM_KEY_F8 => "F8",
-        c.PLATFORM_KEY_F9 => "F9",
-        c.PLATFORM_KEY_F10 => "F10",
-        c.PLATFORM_KEY_F11 => "F11",
-        c.PLATFORM_KEY_F12 => "F12",
-        c.PLATFORM_KEY_F13 => "F13",
-        c.PLATFORM_KEY_F14 => "F14",
-        c.PLATFORM_KEY_F15 => "F15",
-        c.PLATFORM_KEY_F16 => "F16",
-        c.PLATFORM_KEY_F17 => "F17",
-        c.PLATFORM_KEY_F18 => "F18",
-        c.PLATFORM_KEY_F19 => "F19",
-        c.PLATFORM_KEY_F20 => "F20",
-        // テンキー
-        c.PLATFORM_KEY_KP_0 => "KP_0",
-        c.PLATFORM_KEY_KP_1 => "KP_1",
-        c.PLATFORM_KEY_KP_2 => "KP_2",
-        c.PLATFORM_KEY_KP_3 => "KP_3",
-        c.PLATFORM_KEY_KP_4 => "KP_4",
-        c.PLATFORM_KEY_KP_5 => "KP_5",
-        c.PLATFORM_KEY_KP_6 => "KP_6",
-        c.PLATFORM_KEY_KP_7 => "KP_7",
-        c.PLATFORM_KEY_KP_8 => "KP_8",
-        c.PLATFORM_KEY_KP_9 => "KP_9",
-        c.PLATFORM_KEY_KP_DECIMAL => "KP_.",
-        c.PLATFORM_KEY_KP_DIVIDE => "KP_/",
-        c.PLATFORM_KEY_KP_MULTIPLY => "KP_*",
-        c.PLATFORM_KEY_KP_SUBTRACT => "KP_-",
-        c.PLATFORM_KEY_KP_ADD => "KP_+",
-        c.PLATFORM_KEY_KP_ENTER => "KP_ENTER",
-        c.PLATFORM_KEY_KP_EQUAL => "KP_=",
-        // モディファイアキー
-        c.PLATFORM_KEY_LEFT_SHIFT => "L_SHIFT",
-        c.PLATFORM_KEY_RIGHT_SHIFT => "R_SHIFT",
-        c.PLATFORM_KEY_LEFT_CONTROL => "L_CTRL",
-        c.PLATFORM_KEY_RIGHT_CONTROL => "R_CTRL",
-        c.PLATFORM_KEY_LEFT_ALT => "L_ALT",
-        c.PLATFORM_KEY_RIGHT_ALT => "R_ALT",
-        c.PLATFORM_KEY_LEFT_SUPER => "L_CMD",
-        c.PLATFORM_KEY_RIGHT_SUPER => "R_CMD",
-        c.PLATFORM_KEY_CAPS_LOCK => "CAPS_LOCK",
-        else => "UNKNOWN",
-    };
-}
 
 // HSV色空間から RGB へ変換
 fn hsvToRGB(h: f32, s: f32, v: f32) u32 {
@@ -233,7 +148,7 @@ pub fn main() !void {
                     mod_pos += 4;
                 }
                 const mod_slice = mod_str[0..mod_pos];
-                const key_name = getKeyName(key);
+                const key_name = keyboard.getKeyName(key);
                 std.debug.print("[KEY_DOWN] {s}{s} (code={d}){s}\n", .{
                     mod_slice,
                     key_name,
@@ -242,44 +157,44 @@ pub fn main() !void {
                 });
 
                 // ESC または Q: 終了
-                if (key == c.PLATFORM_KEY_ESCAPE or key == c.PLATFORM_KEY_Q) {
+                if (key == keyboard.Key.ESCAPE or key == keyboard.Key.Q) {
                     std.debug.print("Quit key pressed\n", .{});
                     return;
                 }
                 // A-Z: 26色
-                else if (key >= c.PLATFORM_KEY_A and key <= c.PLATFORM_KEY_Z) {
-                    const offset = @as(f32, @floatFromInt(key - c.PLATFORM_KEY_A));
+                else if (key >= keyboard.Key.A and key <= keyboard.Key.Z) {
+                    const offset = @as(f32, @floatFromInt(key - keyboard.Key.A));
                     hue = (offset / 26.0) * 360.0;
                     saturation = 0.8;
                     brightness = 0.8;
                     current_color = hsvToRGB(hue, saturation, brightness);
                 }
                 // 0-9: グレースケール
-                else if (key >= c.PLATFORM_KEY_0 and key <= c.PLATFORM_KEY_9) {
-                    const step = @as(f32, @floatFromInt(key - c.PLATFORM_KEY_0));
+                else if (key >= keyboard.Key.@"0" and key <= keyboard.Key.@"9") {
+                    const step = @as(f32, @floatFromInt(key - keyboard.Key.@"0"));
                     brightness = 0.1 + (step / 9.0) * 0.9;
                     current_color = hsvToRGB(hue, 0.0, brightness);
                 }
                 // 矢印キー: 色相・明度調整
-                else if (key == c.PLATFORM_KEY_LEFT) {
+                else if (key == keyboard.Key.LEFT) {
                     hue = @mod(hue - 10.0, 360.0);
                     current_color = hsvToRGB(hue, saturation, brightness);
-                } else if (key == c.PLATFORM_KEY_RIGHT) {
+                } else if (key == keyboard.Key.RIGHT) {
                     hue = @mod(hue + 10.0, 360.0);
                     current_color = hsvToRGB(hue, saturation, brightness);
-                } else if (key == c.PLATFORM_KEY_DOWN) {
+                } else if (key == keyboard.Key.DOWN) {
                     brightness = @max(0.0, brightness - 0.05);
                     current_color = hsvToRGB(hue, saturation, brightness);
-                } else if (key == c.PLATFORM_KEY_UP) {
+                } else if (key == keyboard.Key.UP) {
                     brightness = @min(1.0, brightness + 0.05);
                     current_color = hsvToRGB(hue, saturation, brightness);
                 }
                 // Space: ランダムカラー
-                else if (key == c.PLATFORM_KEY_SPACE) {
+                else if (key == keyboard.Key.SPACE) {
                     current_color = getRandomColor(&prng);
                 }
                 // R: リセット
-                else if (key == c.PLATFORM_KEY_R) {
+                else if (key == keyboard.Key.R) {
                     hue = 0.0;
                     saturation = 0.8;
                     brightness = 0.8;
