@@ -261,6 +261,7 @@
 #define EVENT_QUEUE_SIZE 256
 
 // macOSのキーコードをPlatformKeyCodeに変換
+// 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
 static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
     // macOSのキーコード（ANSI配列）から標準キーコードへの変換
     switch (keyCode) {
@@ -287,64 +288,74 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
         case 0x15: return PLATFORM_KEY_4;
         case 0x16: return PLATFORM_KEY_6;
         case 0x17: return PLATFORM_KEY_5;
-        case 0x1A: return PLATFORM_KEY_9;
-        case 0x1B: return PLATFORM_KEY_0;
-        case 0x1C: return PLATFORM_KEY_U;
-        case 0x1D: return PLATFORM_KEY_O;
-        case 0x1E: return PLATFORM_KEY_I;
-        case 0x1F: return PLATFORM_KEY_P;
-        case 0x20: return PLATFORM_KEY_UNKNOWN;  // [
-        case 0x21: return PLATFORM_KEY_UNKNOWN;  // ]
-        case 0x23: return PLATFORM_KEY_UNKNOWN;  // keypad .
-        case 0x24: return PLATFORM_KEY_UNKNOWN;  // keypad 0
-        case 0x25: return PLATFORM_KEY_UNKNOWN;  // keypad 1
-        case 0x26: return PLATFORM_KEY_UNKNOWN;  // keypad 2
-        case 0x27: return PLATFORM_KEY_UNKNOWN;  // keypad 3
-        case 0x28: return PLATFORM_KEY_UNKNOWN;  // keypad 4
-        case 0x29: return PLATFORM_KEY_UNKNOWN;  // keypad 5
-        case 0x2A: return PLATFORM_KEY_UNKNOWN;  // keypad 6
-        case 0x2B: return PLATFORM_KEY_UNKNOWN;  // keypad ,
-        case 0x2C: return PLATFORM_KEY_UNKNOWN;  // keypad 7
-        case 0x2D: return PLATFORM_KEY_UNKNOWN;  // keypad 8
-        case 0x2E: return PLATFORM_KEY_UNKNOWN;  // keypad 9
-        case 0x2F: return PLATFORM_KEY_UNKNOWN;  // keypad .
-        case 0x31: return PLATFORM_KEY_SPACE;
-        case 0x33: return PLATFORM_KEY_UNKNOWN;  // Delete/Backspace
-        case 0x35: return PLATFORM_KEY_ESCAPE;
-        case 0x37: return PLATFORM_KEY_UNKNOWN;  // Command (左)
-        case 0x38: return PLATFORM_KEY_UNKNOWN;  // Shift (左)
-        case 0x39: return PLATFORM_KEY_UNKNOWN;  // Caps Lock
-        case 0x3A: return PLATFORM_KEY_UNKNOWN;  // Alt (左)
-        case 0x3B: return PLATFORM_KEY_UNKNOWN;  // Control (左)
-        case 0x3C: return PLATFORM_KEY_UNKNOWN;  // Shift (右)
-        case 0x3D: return PLATFORM_KEY_UNKNOWN;  // Alt (右)
-        case 0x3E: return PLATFORM_KEY_UNKNOWN;  // Control (右)
-        case 0x3F: return PLATFORM_KEY_UNKNOWN;  // Fn
-        case 0x7A: return PLATFORM_KEY_UNKNOWN;  // F1
-        case 0x78: return PLATFORM_KEY_UNKNOWN;  // F2
-        case 0x63: return PLATFORM_KEY_UNKNOWN;  // F3
-        case 0x76: return PLATFORM_KEY_UNKNOWN;  // F4
-        case 0x60: return PLATFORM_KEY_UNKNOWN;  // F5
-        case 0x61: return PLATFORM_KEY_UNKNOWN;  // F6
-        case 0x62: return PLATFORM_KEY_UNKNOWN;  // F7
-        case 0x64: return PLATFORM_KEY_UNKNOWN;  // F8
-        case 0x65: return PLATFORM_KEY_UNKNOWN;  // F9
-        case 0x6D: return PLATFORM_KEY_UNKNOWN;  // F10
-        case 0x67: return PLATFORM_KEY_UNKNOWN;  // F11
-        case 0x6F: return PLATFORM_KEY_UNKNOWN;  // F12
-        case 0x69: return PLATFORM_KEY_UNKNOWN;  // F13
-        case 0x6B: return PLATFORM_KEY_UNKNOWN;  // F14
-        case 0x71: return PLATFORM_KEY_UNKNOWN;  // F15
-        case 0x6A: return PLATFORM_KEY_UNKNOWN;  // F16
-        case 0x40: return PLATFORM_KEY_UNKNOWN;  // F17
-        case 0x4F: return PLATFORM_KEY_UNKNOWN;  // F18
-        case 0x50: return PLATFORM_KEY_UNKNOWN;  // F19
-        case 0x5A: return PLATFORM_KEY_UNKNOWN;  // F20
-        case 0x7D: return PLATFORM_KEY_DOWN;
-        case 0x7E: return PLATFORM_KEY_UP;
-        case 0x7B: return PLATFORM_KEY_LEFT;
-        case 0x7C: return PLATFORM_KEY_RIGHT;
-        case 0x4C: return PLATFORM_KEY_ENTER;    // keypad Enter
+        case 0x18: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Equal (=)
+        case 0x19: return PLATFORM_KEY_9;
+        case 0x1A: return PLATFORM_KEY_7;
+        case 0x1B: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Minus (-)
+        case 0x1C: return PLATFORM_KEY_8;
+        case 0x1D: return PLATFORM_KEY_0;
+        case 0x1E: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_RightBracket (])
+        case 0x1F: return PLATFORM_KEY_O;
+        case 0x20: return PLATFORM_KEY_U;
+        case 0x21: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_LeftBracket ([)
+        case 0x22: return PLATFORM_KEY_I;
+        case 0x23: return PLATFORM_KEY_P;
+        case 0x24: return PLATFORM_KEY_ENTER;    // kVK_Return
+        case 0x25: return PLATFORM_KEY_L;       // kVK_ANSI_L
+        case 0x26: return PLATFORM_KEY_J;       // kVK_ANSI_J
+        case 0x27: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Quote (')
+        case 0x28: return PLATFORM_KEY_K;       // kVK_ANSI_K
+        case 0x29: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Semicolon (;)
+        case 0x2A: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Backslash (\)
+        case 0x2B: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Comma (,)
+        case 0x2C: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Slash (/)
+        case 0x2D: return PLATFORM_KEY_N;       // kVK_ANSI_N
+        case 0x2E: return PLATFORM_KEY_M;       // kVK_ANSI_M
+        case 0x2F: return PLATFORM_KEY_UNKNOWN;  // kVK_ANSI_Period (.)
+        case 0x31: return PLATFORM_KEY_SPACE;   // kVK_Space
+        case 0x33: return PLATFORM_KEY_UNKNOWN;  // kVK_Delete (Delete/Backspace)
+        case 0x35: return PLATFORM_KEY_ESCAPE;  // kVK_Escape
+        case 0x37: return PLATFORM_KEY_UNKNOWN;  // kVK_Command (左)
+        case 0x38: return PLATFORM_KEY_UNKNOWN;  // kVK_Shift (左)
+        case 0x39: return PLATFORM_KEY_UNKNOWN;  // kVK_CapsLock
+        case 0x3A: return PLATFORM_KEY_UNKNOWN;  // kVK_Option (左)
+        case 0x3B: return PLATFORM_KEY_UNKNOWN;  // kVK_Control (左)
+        case 0x3C: return PLATFORM_KEY_UNKNOWN;  // kVK_RightShift
+        case 0x3D: return PLATFORM_KEY_UNKNOWN;  // kVK_RightOption
+        case 0x3E: return PLATFORM_KEY_UNKNOWN;  // kVK_RightControl
+        case 0x3F: return PLATFORM_KEY_UNKNOWN;  // kVK_Function
+        case 0x40: return PLATFORM_KEY_UNKNOWN;  // kVK_F17
+        case 0x4F: return PLATFORM_KEY_UNKNOWN;  // kVK_F18
+        case 0x50: return PLATFORM_KEY_UNKNOWN;  // kVK_F19
+        case 0x5A: return PLATFORM_KEY_UNKNOWN;  // kVK_F20
+        case 0x60: return PLATFORM_KEY_UNKNOWN;  // kVK_F5
+        case 0x61: return PLATFORM_KEY_UNKNOWN;  // kVK_F6
+        case 0x62: return PLATFORM_KEY_UNKNOWN;  // kVK_F7
+        case 0x63: return PLATFORM_KEY_UNKNOWN;  // kVK_F3
+        case 0x64: return PLATFORM_KEY_UNKNOWN;  // kVK_F8
+        case 0x65: return PLATFORM_KEY_UNKNOWN;  // kVK_F9
+        case 0x67: return PLATFORM_KEY_UNKNOWN;  // kVK_F11
+        case 0x69: return PLATFORM_KEY_UNKNOWN;  // kVK_F13
+        case 0x6A: return PLATFORM_KEY_UNKNOWN;  // kVK_F16
+        case 0x6B: return PLATFORM_KEY_UNKNOWN;  // kVK_F14
+        case 0x6D: return PLATFORM_KEY_UNKNOWN;  // kVK_F10
+        case 0x6E: return PLATFORM_KEY_UNKNOWN;  // kVK_ContextualMenu
+        case 0x6F: return PLATFORM_KEY_UNKNOWN;  // kVK_F12
+        case 0x71: return PLATFORM_KEY_UNKNOWN;  // kVK_F15
+        case 0x72: return PLATFORM_KEY_UNKNOWN;  // kVK_Help
+        case 0x73: return PLATFORM_KEY_UNKNOWN;  // kVK_Home
+        case 0x74: return PLATFORM_KEY_UNKNOWN;  // kVK_PageUp
+        case 0x75: return PLATFORM_KEY_UNKNOWN;  // kVK_ForwardDelete
+        case 0x76: return PLATFORM_KEY_UNKNOWN;  // kVK_F4
+        case 0x77: return PLATFORM_KEY_UNKNOWN;  // kVK_End
+        case 0x78: return PLATFORM_KEY_UNKNOWN;  // kVK_F2
+        case 0x79: return PLATFORM_KEY_UNKNOWN;  // kVK_PageDown
+        case 0x7A: return PLATFORM_KEY_UNKNOWN;  // kVK_F1
+        case 0x7B: return PLATFORM_KEY_LEFT;    // kVK_LeftArrow
+        case 0x7C: return PLATFORM_KEY_RIGHT;   // kVK_RightArrow
+        case 0x7D: return PLATFORM_KEY_DOWN;    // kVK_DownArrow
+        case 0x7E: return PLATFORM_KEY_UP;      // kVK_UpArrow
+        case 0x4C: return PLATFORM_KEY_ENTER;   // kVK_ANSI_KeypadEnter
         default: return PLATFORM_KEY_UNKNOWN;
     }
 }
@@ -477,9 +488,9 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                     platform_event.type = (event.type == NSEventTypeKeyDown)
                         ? PLATFORM_EVENT_KEY_DOWN
                         : PLATFORM_EVENT_KEY_UP;
-                    platform_event.keyboard.key = mapKeyCodeToPlatform(event.keyCode);
-                    platform_event.keyboard.is_repeat = event.isARepeat;
-                    platform_event.keyboard.modifiers = extractModifiers(event.modifierFlags);
+                    platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode);
+                    platform_event.payload.keyboard.is_repeat = event.isARepeat;
+                    platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags);
 
                     queue->events[queue->head] = platform_event;
                     queue->head = next_head;

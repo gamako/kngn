@@ -101,6 +101,7 @@ struct EventQueue {
 }
 
 // macOSのキーコードをPlatformKeyCodeに変換
+// 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
 func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
     switch keyCode {
         case 0x00: return PLATFORM_KEY_A
@@ -126,20 +127,37 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
         case 0x15: return PLATFORM_KEY_4
         case 0x16: return PLATFORM_KEY_6
         case 0x17: return PLATFORM_KEY_5
-        case 0x1A: return PLATFORM_KEY_9
-        case 0x1B: return PLATFORM_KEY_0
-        case 0x1C: return PLATFORM_KEY_U
-        case 0x1D: return PLATFORM_KEY_O
-        case 0x1E: return PLATFORM_KEY_I
-        case 0x1F: return PLATFORM_KEY_P
+        case 0x18: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Equal (=)
+        case 0x19: return PLATFORM_KEY_9
+        case 0x1A: return PLATFORM_KEY_7
+        case 0x1B: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Minus (-)
+        case 0x1C: return PLATFORM_KEY_8
+        case 0x1D: return PLATFORM_KEY_0
+        case 0x1E: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_RightBracket (])
+        case 0x1F: return PLATFORM_KEY_O
+        case 0x20: return PLATFORM_KEY_U
+        case 0x21: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_LeftBracket ([)
+        case 0x22: return PLATFORM_KEY_I
+        case 0x23: return PLATFORM_KEY_P
+        case 0x24: return PLATFORM_KEY_ENTER
+        case 0x25: return PLATFORM_KEY_L       // kVK_ANSI_L
+        case 0x26: return PLATFORM_KEY_J       // kVK_ANSI_J
+        case 0x27: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Quote (')
+        case 0x28: return PLATFORM_KEY_K       // kVK_ANSI_K
+        case 0x29: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Semicolon (;)
+        case 0x2A: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Backslash (\)
+        case 0x2B: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Comma (,)
+        case 0x2C: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Slash (/)
+        case 0x2D: return PLATFORM_KEY_N       // kVK_ANSI_N
+        case 0x2E: return PLATFORM_KEY_M       // kVK_ANSI_M
+        case 0x2F: return PLATFORM_KEY_UNKNOWN  // kVK_ANSI_Period (.)
         case 0x31: return PLATFORM_KEY_SPACE
         case 0x35: return PLATFORM_KEY_ESCAPE
+        case 0x4C: return PLATFORM_KEY_ENTER    // kVK_ANSI_KeypadEnter
         case 0x7B: return PLATFORM_KEY_LEFT
         case 0x7C: return PLATFORM_KEY_RIGHT
         case 0x7D: return PLATFORM_KEY_DOWN
         case 0x7E: return PLATFORM_KEY_UP
-        case 0x24: return PLATFORM_KEY_ENTER
-        case 0x4C: return PLATFORM_KEY_ENTER
         default: return PLATFORM_KEY_UNKNOWN
     }
 }
