@@ -151,17 +151,36 @@ pub const Modifier = struct {
 
 /// キーコードを人間が読める文字列に変換します
 ///
+/// 文字キー（A-Z）と数字キー（0-9）は実際の文字を返します。
+///
 /// Usage:
 /// ```zig
-/// const name = keyboard.getKeyName(Key.A);  // "A"
-/// const name = keyboard.getKeyName(Key.F1); // "F1"
+/// const name = keyboard.getKeyName(Key.A);      // "A"
+/// const name = keyboard.getKeyName(Key.@"0");   // "0"
+/// const name = keyboard.getKeyName(Key.F1);     // "F1"
 /// ```
 pub fn getKeyName(key: i32) []const u8 {
-    return switch (key) {
-        // 文字キー
-        Key.A...Key.Z => "LETTER",
-        Key.@"0"...Key.@"9" => "DIGIT",
+    // 文字キー (A-Z)
+    if (isLetterKey(key)) {
+        const letter_names = [_][]const u8{
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+            "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+            "U", "V", "W", "X", "Y", "Z",
+        };
+        const idx = @as(usize, @intCast(key - Key.A));
+        return letter_names[idx];
+    }
 
+    // 数字キー (0-9)
+    if (isDigitKey(key)) {
+        const digit_names = [_][]const u8{
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        };
+        const idx = @as(usize, @intCast(key - Key.@"0"));
+        return digit_names[idx];
+    }
+
+    return switch (key) {
         // 特殊キー
         Key.SPACE => "SPACE",
         Key.ESCAPE => "ESCAPE",
