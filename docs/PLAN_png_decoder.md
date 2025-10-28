@@ -36,13 +36,17 @@ PNG読み込みにはDEFLATE圧縮解凍が必須です。以下を比較検討�
 | Zigネイティブライブラリ | zlibリンク | 低 | ❌ 依存性あり |
 | **Zig標準ライブラリ** | **なし** | **中** | **✅ 採用** |
 
-**決定**: Zig 0.16.0 の `std.compress.deflate` を使用
+**決定**: Zig 0.16.0 の `std.compress.flate` を使用（zlib形式）
+
+**重要**: PNG IDAT チャンクは **zlib形式**（RFC 1950）で圧縮されています。
+- DEFLATE圧縮データにzlibヘッダー（2バイト）とAdler-32チェックサム（4バイト）が付加
+- `std.compress.flate.Decompress` を `.zlib` コンテナで初期化することで自動処理される
 
 **理由:**
-- DEFLATE解凍が標準ライブラリに組み込まれている
+- zlib形式の解凍が標準ライブラリ（std.compress.flate）に組み込まれている
 - 外部依存がゼロ
 - 完全にZigのみで実装可能
-- DEFLATE実装を自作する必要がない
+- ヘッダー・フッター処理が自動で行われる
 
 ---
 
@@ -196,7 +200,7 @@ libs/png-decoder/
 ├── src/
 │   ├── lib.zig               # 公開API エントリーポイント
 │   ├── png_parser.zig        # PNG署名・チャンク解析
-│   ├── deflate.zig           # std.compress.deflateラッパー
+│   ├── flate.zig             # std.compress.flate (zlib形式) ラッパー
 │   ├── filter.zig            # フィルタリング解除
 │   ├── format.zig            # ピクセルフォーマット変換
 │   ├── test.zig              # テストコード
@@ -248,9 +252,10 @@ pub fn decodePNGFile(allocator, path: []const u8) !PNGImage
 - チャンク構造解析（IHDR、IDAT、IEND等）
 - チャンク順序検証
 
-**deflate.zig:**
-- `std.compress.deflate` ラッパー
-- 複数のIDATチャンクを連結して解凍
+**flate.zig:**
+- `std.compress.flate.Decompress` ラッパー（zlib形式対応）
+- 複数のIDATチャンクを連結してzlib形式で解凍
+- RFC 1950 zlib フォーマットのヘッダー・フッター自動処理
 
 **filter.zig:**
 - スキャンラインごとのフィルタ種類を判定
@@ -520,11 +525,12 @@ src/png_parser.zig に実装：
 テストで署名確認をテスト
 ```
 
-### ステップ6: DEFLATE解凍
+### ステップ6: zlib形式DEFLATE解凍
 ```
-src/deflate.zig に実装：
-  - std.compress.deflate ラッパー
+src/flate.zig に実装：
+  - std.compress.flate.Decompress ラッパー（zlib形式対応）
   - IDAT連結処理
+  - .zlib コンテナで初期化（RFC 1950形式）
 テストで解凍されたデータサイズを検証
 ```
 
@@ -664,7 +670,7 @@ PNGの「インターレース」機能により、段階的に画像を表示�
 ### 参考資料
 
 - [PNG仕様（RFC 2083）](https://tools.ietf.org/html/rfc2083)
-- [Zig std.compress.deflate](https://ziglang.org/documentation/master/std/#std.compress.deflate)
+- [Zig std.compress.flate](https://ziglang.org/documentation/master/std/#std.compress.flate) - PNG IDAT はzlib形式なので `.zlib` container を使用
 - [LodePNG（GitHub）](https://github.com/lvandeve/lodepng) - テストデータ生成用
 - [テストPNG（色、フィルタパターン別）](test-data/)
 
