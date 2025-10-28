@@ -108,15 +108,21 @@ Phase 1で80%以上のPNG画像に対応可能です。Average と Paeth はテ�
 
 #### テストPNG生成方式
 
-**Python スクリプト（tools/generate_test_png.py）:**
-- PIL（Python Imaging Library）でテストPNGを生成
-- パラメータで色パターンを指定可能（単色、チェッカーボード、グラデーション等）
-- 再実行で常に同じ画像を生成（再現性保証）
+**C言語プログラム（tools/generate_test_data.c）+ LodePNG:**
+- LodePNG ライブラリを使用してテストPNGを生成
+- **フィルタタイプをスキャンラインごとに完全指定可能**（0=None, 1=Sub, 2=Up, 3=Average, 4=Paeth）
+- 色形式も指定可能（Grayscale、RGB、RGBA）
+- 単一プログラムでPNG生成と期待値出力（Zigコード）の両方を実施
+
+**特徴:**
+- 再現性: 常に同じバイナリ出力で比較可能
+- 完全制御: フィルタタイプごとに異なるテストPNGを生成
+- シンプル: C言語のみ、外部依存なし
 
 **保存方式:**
 - 生成されたPNGファイルを `libs/png-decoder/test-data/` に配置
 - ファイルサイズが小さい（通常 1-5KB）ため、直接 jj でコミット可能
-- スクリプトも保存し、画像の出所を明確に
+- プログラムも保存し、生成方法を明確に
 
 #### テスト期待値の定義
 
@@ -137,11 +143,21 @@ Phase 1で80%以上のPNG画像に対応可能です。Average と Paeth はテ�
 #### テスト実行フロー
 
 ```
-1. Python スクリプトでテストPNG生成
-2. Zigコードで期待値を定義
-3. Zig test で `zig test src/test.zig`実行
-4. 実装が期待値と一致するかを自動検証
-5. 次のPhaseに進む前に全テスト合格を確認
+1. C言語プログラム（generate_test_data.c）でテストPNG生成
+   - Makefile で自動ビルド: make generate
+   - png-decoder/test-data/ 配下にPNGを出力
+
+2. 同時に期待値をZigコード形式で出力
+   - generate_expected_values() 関数で自動生成
+   - 標準出力 → test_cases_generated.zig.txt にリダイレクト
+
+3. 期待値コードを test_cases.zig に手動コピー
+
+4. Zig test で `zig test src/test.zig` 実行
+
+5. 実装が期待値と一致するかを自動検証
+
+6. 次のPhaseに進む前に全テスト合格を確認
 ```
 
 ### 3. エラー型の詳細度（Level 3）
@@ -186,11 +202,20 @@ libs/png-decoder/
 │   ├── test.zig              # テストコード
 │   └── test_cases.zig        # テストケース定義・期待値
 │
-└── test-data/                # テストPNG画像
-    ├── 1x1_red.png
-    ├── 8x8_checkerboard.png
-    ├── 16x16_gradient.png
-    ├── 32x32_grayscale.png
+├── tools/
+│   ├── lodepng/              # LodePNGライブラリ（組み込み）
+│   │   ├── lodepng.c         # LodePNG実装
+│   │   ├── lodepng.h         # LodePNGヘッダー
+│   │   ├── LICENSE           # zlibライセンス
+│   │   └── README.md         # 出所とバージョン情報
+│   ├── generate_test_data.c  # テストPNG生成プログラム
+│   └── Makefile              # ビルド・実行スクリプト
+│
+└── test-data/                # 生成されたテストPNG画像
+    ├── 8x8_gray_none.png
+    ├── 8x8_gray_sub.png
+    ├── 8x8_gray_up.png
+    ├── 8x8_checkerboard_rgb.png
     └── ...
 ```
 
@@ -372,6 +397,76 @@ zig test src/test.zig
 
 ---
 
+## LodePNGライブラリについて
+
+### 概要
+
+LodePNG は Lode Vandevenne が開発したオープンソースの PNG エンコーダー・デコーダーライブラリです。
+
+**プロジェクトでの用途:**
+- テストPNG画像の生成用
+- **フィルタタイプをスキャンラインごとに指定可能**（重要）
+- C言語のシンプルなAPI
+
+**特徴:**
+- ✅ ヘッダーファイル（lodepng.h）とC実装（lodepng.c）の2ファイルのみ
+- ✅ 外部依存なし（標準C機能のみ使用）
+- ✅ クロスプラットフォーム対応
+- ✅ シンプルなAPI（エンコード・デコード両対応）
+
+### ライセンス
+
+**License: zlib License**
+
+LodePNG は zlib License で公開されています。
+
+**制約:**
+- ✅ 商用利用可能
+- ✅ 改変・再配布可能
+- ✅ 制約が少ない
+
+**必須要件:**
+- 著作権表示を保持すること
+- ライセンス文を含めること
+
+### プロジェクトへの組み込み
+
+**方針: ソースコードを直接配置**
+
+理由：
+1. ネットワーク接続不要（オフラインビルド可能）
+2. バージョン固定（再現性確保）
+3. jj（バージョン管理）と相性良い
+4. サブモジュール不要
+
+**配置場所:**
+```
+libs/png-decoder/tools/lodepng/
+├── lodepng.c          # LodePNG実装（約18KB）
+├── lodepng.h          # LodePNGヘッダー（約2KB）
+├── LICENSE            # zlibライセンス全文
+└── README.md          # 出所・バージョン情報
+```
+
+### ライセンス準拠
+
+**コミット時の記載例:**
+```
+feat: LodePNGライブラリを追加
+
+テストPNG画像生成用にLodePNGを組み込み。
+- Version: [GitHub commit hash or version]
+- License: zlib License
+- Source: https://github.com/lvandeve/lodepng
+- Purpose: フィルタタイプ指定可能なテストPNG生成
+
+ライセンス準拠:
+- lodepng/LICENSE ファイルを同梱
+- 著作権表示を lodepng/README.md に記載
+```
+
+---
+
 ## エラー処理の方針
 
 ### エラー型の役割
@@ -401,19 +496,42 @@ libs/png-decoder/ ディレクトリ構造を作成
 各 .zig ファイルのスケルトン作成
 ```
 
-### ステップ2: テストPNG生成スクリプト実装
+### ステップ2: LodePNGライブラリ組み込み
 ```
-tools/generate_test_png.py を実装
-テストPNGを生成
+1. tools/lodepng/ ディレクトリ作成
+2. LodePNG ソースをダウンロード
+   - lodepng.c, lodepng.h を配置
+   - LICENSE ファイルを配置
+   - README.md に出所・バージョン情報を記載
+
+3. tools/generate_test_data.c を実装
+   - LodePNG使用
+   - PNG生成関数（フィルタタイプ指定可能）
+   - 期待値出力関数（Zigコード形式）
+
+4. tools/Makefile を作成
+   - ビルド自動化
+   - make generate で実行
 ```
 
-### ステップ3: テストケース定義
+### ステップ3: テストPNG生成 + 期待値出力
+```
+cd libs/png-decoder/tools
+make generate
+
+出力:
+  - ../test-data/*.png （生成されたテストPNG）
+  - 標準出力 （Zigコード形式の期待値）
+```
+
+### ステップ4: テストケース定義
 ```
 src/test_cases.zig に期待値を定義
+ステップ3の出力をコピー＆ペースト
 各テストケースの詳細情報を記述
 ```
 
-### ステップ4: 基本的なPNG解析
+### ステップ5: 基本的なPNG解析
 ```
 src/png_parser.zig に実装：
   - PNG署名確認
@@ -422,7 +540,7 @@ src/png_parser.zig に実装：
 テストで署名確認をテスト
 ```
 
-### ステップ5: DEFLATE解凍
+### ステップ6: DEFLATE解凍
 ```
 src/deflate.zig に実装：
   - std.compress.deflate ラッパー
@@ -430,22 +548,22 @@ src/deflate.zig に実装：
 テストで解凍されたデータサイズを検証
 ```
 
-### ステップ6: フィルタリング解除
+### ステップ7: フィルタリング解除
 ```
 src/filter.zig に実装：
   - フィルタ種類判定
   - None, Sub, Up アルゴリズム
-テストでチェッカーボード画像が正しく復元される
+テストでグレースケール画像が正しく復元される
 ```
 
-### ステップ7: ピクセルフォーマット変換
+### ステップ8: ピクセルフォーマット変換
 ```
 src/format.zig に実装：
-  - RGB/RGBA/Grayscale → RGBA8888 変換
+  - Grayscale/RGB/RGBA → RGBA8888 変換
 テストで色値が正確か検証
 ```
 
-### ステップ8: 公開API作成
+### ステップ9: 公開API作成
 ```
 src/lib.zig に実装：
   - PNGImage構造体
@@ -453,20 +571,20 @@ src/lib.zig に実装：
   - 全エラー型
 ```
 
-### ステップ9: build.zig設定
+### ステップ10: build.zig設定
 ```
 libs/png-decoder/build.zig を記述：
   - テストターゲット定義
   - モジュール定義
 ```
 
-### ステップ10: メインプロジェクト統合
+### ステップ11: メインプロジェクト統合
 ```
 ルート build.zig で png_decoder モジュールを登録
 examples/03_sprite_display/main.zig で使用
 ```
 
-### ステップ11: Phase 2へ進む
+### ステップ12: Phase 2へ進む
 ```
 同じサイクルで Average, Paeth フィルタを実装
 RGB色形式対応
@@ -567,6 +685,7 @@ PNGの「インターレース」機能により、段階的に画像を表示�
 
 - [PNG仕様（RFC 2083）](https://tools.ietf.org/html/rfc2083)
 - [Zig std.compress.deflate](https://ziglang.org/documentation/master/std/#std.compress.deflate)
+- [LodePNG（GitHub）](https://github.com/lvandeve/lodepng) - テストデータ生成用
 - [テストPNG（色、フィルタパターン別）](test-data/)
 
 ### コミットのポイント
