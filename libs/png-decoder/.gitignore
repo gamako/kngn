@@ -1,0 +1,7 @@
+# Build artifacts
+tools/generate_test_data
+zig-out/
+.zig-cache/
+
+# macOS
+.DS_Store
