@@ -270,8 +270,10 @@ pub fn decodePNGFile(allocator, path: []const u8) !PNGImage
 各Phaseは以下のループで実装：
 
 ```
-1. テストPNG画像を生成（Python）
+1. テストPNG画像を生成（C言語/LodePNG）
+   - make generate でビルド・実行
 2. 期待値をZigコードで定義
+   - 標準出力をコピー＆ペースト
 3. テストコードを記述（失敗を確認）
 4. 機能を実装（テスト合格を確認）
 5. jj でコミット
@@ -339,28 +341,6 @@ pub fn decodePNGFile(allocator, path: []const u8) !PNGImage
 ---
 
 ## テスト戦略の詳細
-
-### テストPNG生成スクリプト（tools/generate_test_png.py）
-
-**役割:**
-- PIL（Pillow）を使ってテスト用PNG画像を生成
-- パラメータでパターンを指定
-- 再実行で同じ画像を再生成（再現性保証）
-
-**実装内容:**
-- `solid_red`: 1色で塗りつぶし
-- `checkerboard`: 黒白チェッカーボード
-- `gradient`: グラデーション
-- `grayscale`: グレースケール段階
-
-**用途:**
-初期セットアップ時に実行：
-```bash
-cd libs/png-decoder
-python3 tools/generate_test_png.py
-```
-
-既に生成されたPNGは コミット済みなので、以降は再実行不要ですが、画像の出所（Pythonコード）を保持することで透明性を確保。
 
 ### テストケース定義（src/test_cases.zig）
 
