@@ -13,6 +13,41 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 
 ---
 
+## 実装進捗
+
+### 完了項目
+
+#### 2025-10-28: PNG署名確認機能（ステップ1）
+- ✅ LodePNGライブラリ組み込み（Version: 20250506, zlib License）
+- ✅ テストPNG生成ツール作成（tools/generate_test_data.c + Makefile）
+- ✅ 1x1グレースケールPNG生成成功（77バイト）
+- ✅ PNG署名確認機能実装（src/png_parser.zig）
+- ✅ 基本的な公開API定義（src/lib.zig）
+- ✅ テスト実行環境構築（src/test.zig）
+- ✅ テスト全合格（4/4）
+  - 1x1グレースケールPNG署名確認
+  - 不正データの拒否確認
+  - PNG parser単体テスト
+  - API exports確認
+- ✅ .gitignore追加（ビルド成果物除外）
+
+**コミット:** c185cb86
+
+### 次のステップ
+
+#### ステップ2候補: チャンク構造の基本的な読み取り
+- [ ] チャンクのlength, type, data, CRCを読み取る関数
+- [ ] IHDRチャンク解析（画像幅・高さ・色タイプ読み取り）
+- [ ] ChunkIterator実装
+
+#### その後のステップ（Phase 1完了まで）
+- [ ] IDAT解凍（std.compress.flate使用、zlib形式）
+- [ ] フィルタリング解除（None, Sub, Up）
+- [ ] Grayscale→RGBA8888変換
+- [ ] Phase 1完全テスト（8x8, 16x16グレースケール）
+
+---
+
 ## 背景と課題
 
 ### 現状
