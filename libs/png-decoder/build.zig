@@ -5,11 +5,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Create the png-decoder library
-    const lib = b.addStaticLibrary(.{
+    const lib = b.addLibrary(.{
         .name = "png-decoder",
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     // Install the library
@@ -17,9 +19,11 @@ pub fn build(b: *std.Build) void {
 
     // Create test executable
     const test_exe = b.addTest(.{
-        .root_source_file = b.path("src/test.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     // Create run test step
