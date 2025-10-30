@@ -7,6 +7,9 @@ pub const png_parser = @import("png_parser.zig");
 /// Error types for PNG decoding
 pub const DecodingError = error{
     InvalidPNGSignature,
+    MissingIHDR,
+    InvalidChunkSize,
+    InvalidDimensions,
 };
 
 /// PNG image data in RGBA8888 format
