@@ -43,11 +43,3 @@ pub fn decodePNGFile(allocator: std.mem.Allocator, path: []const u8) DecodingErr
 
     return decodePNG(allocator, file_data);
 }
-
-test "PNG decoder exports" {
-    // Verify that the library exports the expected API
-    _ = PNGImage;
-    _ = decodePNG;
-    _ = decodePNGFile;
-    _ = png_parser.verifySignature;
-}

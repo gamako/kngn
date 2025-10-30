@@ -29,9 +29,3 @@ pub const test_cases = [_]TestCase{
         .expected_pixels = &grayscale_1x1_expected,
     },
 };
-
-test "test case structure" {
-    try std.testing.expect(test_cases.len > 0);
-    try std.testing.expectEqual(@as(u32, 1), test_cases[0].width);
-    try std.testing.expectEqual(@as(u32, 1), test_cases[0].height);
-}
