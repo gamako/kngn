@@ -35,6 +35,25 @@ test "All test cases - IHDR verification" {
         const ihdr = try lib.png_parser.parseIHDR(chunk);
         try std.testing.expectEqual(tc.width, ihdr.width);
         try std.testing.expectEqual(tc.height, ihdr.height);
+
+        // パターンに応じて期待値を取得（検証用）
+        const expected_pixels = switch (tc.pattern) {
+            .hardcoded => |pixels| pixels,
+            .gradient => |g| try test_cases.generateGradientExpected(
+                allocator,
+                tc.width,
+                tc.height,
+                g.step,
+            ),
+        };
+        defer {
+            if (tc.pattern == .gradient) {
+                allocator.free(expected_pixels);
+            }
+        }
+
+        // テストケースが有効（ここでは期待値の存在確認）
+        try std.testing.expect(expected_pixels.len == tc.width * tc.height);
     }
 }
 
