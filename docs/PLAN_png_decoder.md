@@ -49,19 +49,65 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 
 **コミット:** uonolppl (c68680fb)
 
+#### 2025-11-01: ChunkIterator と IDAT チャンク収集機能実装（ステップ3）
+- ✅ ChunkIterator 構造体実装
+  - PNG署名をスキップして初期化
+  - next() メソッドで次のチャンク取得
+  - EOF で null を返す
+- ✅ collectIDATChunks() 関数実装
+  - 複数 IDAT チャンク自動連結
+  - ChunkIterator を使用した効率的な実装
+- ✅ Zig 0.16.0 の ArrayList API 対応
+  - .empty で初期化
+  - allocator 引数を明示的に渡す
+- ✅ テスト全合格（4/4）
+  - All test cases - IHDR verification
+  - **ChunkIterator - iterate all chunks** ← 新規
+  - **Collect IDAT chunks** ← 新規
+  - PNG signature verification
+
+**コミット:** wxvzmpqo (fc996bed)
+
 ### 次のステップ
 
-#### ステップ3候補: ChunkIterator実装
-- [ ] ChunkIterator 型定義
-- [ ] PNG全体をチャンク単位でループ走査
-- [ ] チャンク順序検証（IHDR → IDAT → IEND）
-- [ ] 複数IDAT チャンク収集に備える
+#### ステップ4: 8x8/16x16 グレースケール PNG テストデータ生成
+- [ ] generate_test_data.c の拡張
+  - フィルタタイプ指定機能実装（LodePNGState使用）
+  - 8x8 グレースケール生成（フィルタ None/Sub/Up）
+  - 16x16 グレースケール生成
+- [ ] test_cases.zig にテストケース追加
+  - 期待値（ピクセルデータ）を定義
+  - 複数テストケースでカバー
+
+#### ステップ5: IDAT解凍（zlib形式対応）
+- [ ] flate.zig モジュール作成
+  - std.compress.flate.Decompress ラッパー実装
+  - .zlib コンテナで zlib形式対応（RFC 1950）
+  - IDAT連結→解凍フロー
+- [ ] テスト実装
+  - 解凍後データサイズ検証
+
+#### ステップ6: フィルタリング解除（None/Sub/Up）
+- [ ] filter.zig モジュール作成
+  - None フィルタ実装
+  - Sub フィルタ実装
+  - Up フィルタ実装
+- [ ] テスト実装
+  - 各フィルタタイプでグレースケール復元検証
+
+#### ステップ7: ピクセルフォーマット変換
+- [ ] format.zig モジュール作成
+  - Grayscale → RGBA8888 変換
+  - Gray値を全チャンネル（R/G/B）にコピー
+  - アルファチャンネルを 255 で設定
+- [ ] テスト実装
+  - 色値変換の正確性検証
 
 #### その後のステップ（Phase 1完了まで）
-- [ ] IDAT解凍（std.compress.flate使用、zlib形式）
-- [ ] フィルタリング解除（None, Sub, Up）
-- [ ] Grayscale→RGBA8888変換
-- [ ] Phase 1完全テスト（8x8, 16x16グレースケール）
+- [ ] lib.zig を完成（decodePNG 実装）
+- [ ] Phase 1 統合テスト（8x8, 16x16 グレースケール）
+- [ ] メモリリークなし検証
+- [ ] Phase 2 へ進む（RGB形式対応）
 
 ---
 
