@@ -83,7 +83,7 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 - [ ] flate.zig モジュール作成
   - std.compress.flate.Decompress ラッパー実装
   - .zlib コンテナで zlib形式対応（RFC 1950）
-  - IDAT連結→解凍フロー
+  - collectIDATChunks() は既に実装済み（ステップ3）
 - [ ] テスト実装
   - 解凍後データサイズ検証
 
@@ -108,6 +108,112 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 - [ ] Phase 1 統合テスト（8x8, 16x16 グレースケール）
 - [ ] メモリリークなし検証
 - [ ] Phase 2 へ進む（RGB形式対応）
+
+---
+
+## テストデータ生成の詳細（ステップ4）
+
+### LodePNG によるフィルタタイプ指定
+
+LodePNGは完全なフィルタ制御機能を提供しています。
+
+**フィルタ戦略の列挙型:**
+```c
+typedef enum LodePNGFilterStrategy {
+  LFS_ZERO = 0,      // Filter None (0) のみを全スキャンラインで使用
+  LFS_ONE = 1,       // Filter Sub (1) のみを全スキャンラインで使用
+  LFS_TWO = 2,       // Filter Up (2) のみを全スキャンラインで使用
+  LFS_THREE = 3,     // Filter Average (3) のみを全スキャンラインで使用
+  LFS_FOUR = 4,      // Filter Paeth (4) のみを全スキャンラインで使用
+  LFS_PREDEFINED     // スキャンライン毎に個別指定
+} LodePNGFilterStrategy;
+```
+
+**実装方法:**
+```c
+#include "lodepng.h"
+
+// フィルタ指定してPNGエンコード
+unsigned encode_png_with_filter(
+    const char* filename,
+    const unsigned char* image,
+    unsigned width,
+    unsigned height,
+    LodePNGFilterStrategy filter_strategy)
+{
+    LodePNGState state;
+    lodepng_state_init(&state);
+
+    // 重要: グレースケール画像でもフィルタ戦略を確実に適用
+    state.encoder.filter_palette_zero = 0;
+    state.encoder.filter_strategy = filter_strategy;
+
+    unsigned char* png_data = NULL;
+    size_t png_size = 0;
+    unsigned error = lodepng_encode(&png_data, &png_size,
+                                     image, width, height, &state);
+
+    if(!error) {
+        error = lodepng_save_file(png_data, png_size, filename);
+    }
+
+    lodepng_free(png_data);
+    lodepng_state_cleanup(&state);
+    return error;
+}
+```
+
+**重要な注意点:**
+1. `lodepng_encode()` を使用（簡易API lodepng_encode_file では制御不可）
+2. `LodePNGState` 構造体を使用して設定
+3. `filter_palette_zero = 0` の設定が必須（グレースケール画像でもフィルタが確実に適用される）
+
+### Phase 1 のテストデータ生成計画
+
+**生成するPNG ファイル:**
+```
+test-data/
+├── 1x1_grayscale.png              (既存, Filter自動選択)
+├── 8x8_gray_filter_none.png       (Filter 0 のみ)
+├── 8x8_gray_filter_sub.png        (Filter 1 のみ)
+├── 8x8_gray_filter_up.png         (Filter 2 のみ)
+├── 16x16_gray_filter_none.png     (Filter 0 のみ, より大きい)
+├── 16x16_gray_filter_sub.png      (Filter 1 のみ, より大きい)
+└── 16x16_gray_filter_up.png       (Filter 2 のみ, より大きい)
+```
+
+**ピクセルパターン:**
+- **8x8 グレースケール**: シンプルなグラデーション
+  - 行ごとに異なるグレー値（0, 32, 64, 96, 128, 160, 192, 224）
+  - 各フィルタの動作を明確に検証可能
+
+- **16x16 グレースケール**: より細かいグラデーション
+  - 行ごとに異なるグレー値（0-240を16段階）
+  - エッジケース検証（コーナーピクセル等）
+
+**期待値生成:**
+- Phase 1では手動コピー方式を維持
+- generate_test_data.c が Zigコード形式で標準出力
+- 出力を test_cases.zig に手動で追加
+- テストケース数が少ないうちは十分
+
+---
+
+## 実装者へのメモ
+
+### Zig 0.16.0 API の確認方針
+
+Zig 0.16.0 は開発版のため、標準ライブラリAPIが頻繁に変更されます。
+
+**実装前の確認プロセス:**
+1. 使用予定のAPIについて、標準ライブラリのソースコードを直接確認
+2. 関数シグネチャ、構造体フィールド、初期化方法を最新仕様で確認
+3. テストコード内の使用例を参考にする
+
+**参照先:**
+- `std.ArrayList`: `/Users/gamako/zig/0.16.0-dev.747+493ad58ff/files/lib/std/array_list.zig`
+- `std.compress.flate`: `/Users/gamako/zig/0.16.0-dev.747+493ad58ff/files/lib/std/compress/flate.zig`
+- その他: `/Users/gamako/zig/0.16.0-dev.747+493ad58ff/files/lib/std/`
 
 ---
 
