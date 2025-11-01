@@ -33,12 +33,29 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 
 **コミット:** c185cb86
 
+#### 2025-11-01: チャンク構造の基本的な読み取り（ステップ2）
+- ✅ readChunk() 関数実装（Length/Type/Data/CRC構造を解析）
+- ✅ parseIHDR() 関数実装（幅・高さ・ビット深度・色タイプを抽出）
+- ✅ Chunk 構造体定義（chunk_type, data）
+- ✅ IHDRInfo 構造体定義（width, height, bit_depth, color_type 等）
+- ✅ エラー型拡張（InvalidChunkSize, InvalidDimensions）
+- ✅ テスト追加：1x1 grayscale PNG の IHDR 解析テスト
+- ✅ テスト全合格（5/5）
+  - 1x1 grayscale PNG signature verification
+  - Invalid PNG data rejection
+  - **IHDR chunk parsing from 1x1 grayscale PNG** ← 新規
+  - PNG decoder exports
+  - PNG signature verification
+
+**コミット:** uonolppl (c68680fb)
+
 ### 次のステップ
 
-#### ステップ2候補: チャンク構造の基本的な読み取り
-- [ ] チャンクのlength, type, data, CRCを読み取る関数
-- [ ] IHDRチャンク解析（画像幅・高さ・色タイプ読み取り）
-- [ ] ChunkIterator実装
+#### ステップ3候補: ChunkIterator実装
+- [ ] ChunkIterator 型定義
+- [ ] PNG全体をチャンク単位でループ走査
+- [ ] チャンク順序検証（IHDR → IDAT → IEND）
+- [ ] 複数IDAT チャンク収集に備える
 
 #### その後のステップ（Phase 1完了まで）
 - [ ] IDAT解凍（std.compress.flate使用、zlib形式）
