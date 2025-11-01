@@ -37,3 +37,68 @@ test "All test cases - IHDR verification" {
         try std.testing.expectEqual(tc.height, ihdr.height);
     }
 }
+
+test "ChunkIterator - iterate all chunks" {
+    const allocator = std.testing.allocator;
+
+    // 1x1_grayscale.png を読み込み
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/1x1_grayscale.png",
+        allocator,
+        .unlimited
+    );
+    defer allocator.free(file_data);
+
+    // PNG署名を確認
+    try std.testing.expect(lib.png_parser.verifySignature(file_data));
+
+    // チャンクイテレータを初期化
+    var iter = lib.png_parser.ChunkIterator.init(file_data);
+
+    // チャンク列を読み取り
+    var chunks: std.ArrayList([4]u8) = .empty;
+    defer chunks.deinit(allocator);
+
+    while (try iter.next()) |chunk| {
+        try chunks.append(allocator, chunk.chunk_type);
+    }
+
+    // チャンクの順序を検証
+    try std.testing.expect(chunks.items.len >= 3); // IHDR, IDAT, IEND
+
+    // 最初のチャンクがIHDR
+    try std.testing.expectEqualSlices(u8, "IHDR", chunks.items[0][0..]);
+
+    // 最後のチャンクがIEND
+    const last_chunk = chunks.items[chunks.items.len - 1];
+    try std.testing.expectEqualSlices(u8, "IEND", last_chunk[0..]);
+
+    // IHDR と IEND の間に IDAT が存在
+    var found_idat = false;
+    for (chunks.items[1 .. chunks.items.len - 1]) |chunk| {
+        if (std.mem.eql(u8, chunk[0..], "IDAT")) {
+            found_idat = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_idat);
+}
+
+test "Collect IDAT chunks" {
+    const allocator = std.testing.allocator;
+
+    // 1x1_grayscale.png を読み込み
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/1x1_grayscale.png",
+        allocator,
+        .unlimited
+    );
+    defer allocator.free(file_data);
+
+    // IDAT チャンクを収集
+    const idat_data = try lib.png_parser.collectIDATChunks(allocator, file_data);
+    defer allocator.free(idat_data);
+
+    // IDAT データが存在することを確認
+    try std.testing.expect(idat_data.len > 0);
+}

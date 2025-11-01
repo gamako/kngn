@@ -23,6 +23,41 @@ pub const IHDRInfo = struct {
     interlace: u8,
 };
 
+/// ChunkIterator: iterate through PNG chunks
+pub const ChunkIterator = struct {
+    data: []const u8,
+    offset: usize,
+
+    /// Initialize the chunk iterator
+    /// Starts after the PNG signature (8 bytes)
+    pub fn init(data: []const u8) ChunkIterator {
+        return .{
+            .data = data,
+            .offset = PNG_SIGNATURE.len, // Skip PNG signature
+        };
+    }
+
+    /// Get the next chunk
+    /// Returns null if EOF (no more chunks)
+    /// Returns error if chunk structure is invalid
+    pub fn next(self: *ChunkIterator) !?Chunk {
+        // Check if we've reached EOF
+        if (self.offset >= self.data.len) {
+            return null;
+        }
+
+        // Read the chunk
+        const chunk = try readChunk(self.data, self.offset);
+
+        // Calculate offset for next chunk
+        // Format: length(4) + type(4) + data(length) + CRC(4) = 12 + length
+        const chunk_length = std.mem.readVarInt(u32, self.data[self.offset..][0..4], .big);
+        self.offset += 12 + chunk_length;
+
+        return chunk;
+    }
+};
+
 /// Verify PNG signature
 pub fn verifySignature(data: []const u8) bool {
     if (data.len < PNG_SIGNATURE.len) {
@@ -63,6 +98,21 @@ pub fn parseIHDR(chunk: Chunk) !IHDRInfo {
         .filter = chunk.data[11],
         .interlace = chunk.data[12],
     };
+}
+
+/// Collect all IDAT chunks and concatenate their data
+/// Returns a newly allocated slice containing concatenated IDAT data
+pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+    var idat_buffer: std.ArrayList(u8) = .empty;
+
+    var iter = ChunkIterator.init(data);
+    while (try iter.next()) |chunk| {
+        if (std.mem.eql(u8, &chunk.chunk_type, "IDAT")) {
+            try idat_buffer.appendSlice(allocator, chunk.data);
+        }
+    }
+
+    return idat_buffer.toOwnedSlice(allocator);
 }
 
 test "PNG signature verification" {
