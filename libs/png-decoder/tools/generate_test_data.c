@@ -57,11 +57,6 @@ void generate_1x1_grayscale(void) {
     }
 
     printf("Generated: %s\n", filename);
-
-    printf("\n// Expected value for 1x1_grayscale.png\n");
-    printf("pub const grayscale_1x1_expected = [_]u32{\n");
-    printf("    0x808080FF,  // gray=128 -> RGBA8888\n");
-    printf("};\n");
 }
 
 /* Generate 8x8 grayscale gradient with specified filter */
@@ -95,20 +90,6 @@ void generate_8x8_grayscale(LodePNGFilterStrategy filter_strategy, const char* f
     }
 
     printf("Generated: %s\n", filename);
-
-    /* Output expected values in Zig format */
-    printf("\n// Expected values for %s\n", filename);
-    printf("pub const grayscale_8x8_filter_%s_expected = [_]u32{\n", filter_name);
-    for (unsigned y = 0; y < height; y++) {
-        unsigned char gray_value = (unsigned char)(y * 32);
-        printf("    ");
-        for (unsigned x = 0; x < width; x++) {
-            printf("0x%02X%02X%02XFF,", gray_value, gray_value, gray_value);
-            if (x < width - 1) printf(" ");
-        }
-        printf("\n");
-    }
-    printf("};\n");
 }
 
 /* Generate 16x16 grayscale gradient with specified filter */
@@ -142,20 +123,6 @@ void generate_16x16_grayscale(LodePNGFilterStrategy filter_strategy, const char*
     }
 
     printf("Generated: %s\n", filename);
-
-    /* Output expected values in Zig format */
-    printf("\n// Expected values for %s\n", filename);
-    printf("pub const grayscale_16x16_filter_%s_expected = [_]u32{\n", filter_name);
-    for (unsigned y = 0; y < height; y++) {
-        unsigned char gray_value = (unsigned char)(y * 16);
-        printf("    ");
-        for (unsigned x = 0; x < width; x++) {
-            printf("0x%02X%02X%02XFF,", gray_value, gray_value, gray_value);
-            if (x < width - 1) printf(" ");
-        }
-        printf("\n");
-    }
-    printf("};\n");
 }
 
 int main(void) {
