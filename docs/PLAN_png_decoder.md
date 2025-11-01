@@ -68,16 +68,49 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 
 **コミット:** wxvzmpqo (fc996bed)
 
-### 次のステップ
-
-#### ステップ4: 8x8/16x16 グレースケール PNG テストデータ生成
-- [ ] generate_test_data.c の拡張
-  - フィルタタイプ指定機能実装（LodePNGState使用）
+#### 2025-11-01: テストデータ生成とテストケース最適化（ステップ4）
+- ✅ generate_test_data.c の拡張
+  - `encode_png_with_filter()` 関数実装（LodePNGState 使用）
   - 8x8 グレースケール生成（フィルタ None/Sub/Up）
-  - 16x16 グレースケール生成
-- [ ] test_cases.zig にテストケース追加
-  - 期待値（ピクセルデータ）を定義
-  - 複数テストケースでカバー
+  - 16x16 グレースケール生成（フィルタ None/Sub/Up）
+  - filter_palette_zero = 0 設定でグレースケール画像にもフィルタを適用
+  - C compilation error 修正（`lodepng_free()` → `free()`）
+- ✅ test_cases.zig の大幅リファクタリング
+  - `generateGradientExpected()` 関数実装（動的生成）
+    - width, height, step を指定してグラデーション期待値を生成
+    - u32 配列（RGBA8888形式）で返却
+  - `PatternType` union型実装
+    - `.hardcoded`: 固定値配列（複雑なパターン用）
+    - `.gradient`: グラデーション（step値のみ指定）
+  - テストケース定義を 168行 → 60行に削減（64%削減）
+  - 期待値の自動生成で保守性向上
+- ✅ test.zig の更新
+  - "All test cases - IHDR verification" テストでパターンタイプ対応
+  - switch 文で pattern タイプを判定し、動的に期待値を生成
+  - 勾配パターンのメモリ管理を適切に処理
+- ✅ テスト全合格（4/4）
+  - All test cases - IHDR verification
+  - ChunkIterator - iterate all chunks
+  - Collect IDAT chunks
+  - PNG signature verification
+
+**生成されたテストPNG:**
+```
+test-data/
+├── 1x1_grayscale.png
+├── 8x8_gray_filter_none.png    (Filter 0)
+├── 8x8_gray_filter_sub.png     (Filter 1)
+├── 8x8_gray_filter_up.png      (Filter 2)
+├── 16x16_gray_filter_none.png  (Filter 0)
+├── 16x16_gray_filter_sub.png   (Filter 1)
+└── 16x16_gray_filter_up.png    (Filter 2)
+```
+
+**コミット:**
+- `refactor: test_cases.zig を手動コピーから動的生成方式に変更`
+- `refactor: generate_test_data.c から期待値出力を削除`
+
+### 次のステップ
 
 #### ステップ5: IDAT解凍（zlib形式対応）
 - [ ] flate.zig モジュール作成
@@ -191,11 +224,13 @@ test-data/
   - 行ごとに異なるグレー値（0-240を16段階）
   - エッジケース検証（コーナーピクセル等）
 
-**期待値生成:**
-- Phase 1では手動コピー方式を維持
-- generate_test_data.c が Zigコード形式で標準出力
-- 出力を test_cases.zig に手動で追加
-- テストケース数が少ないうちは十分
+**期待値生成（改善版）:**
+- generate_test_data.c は PNG生成に特化（Zigコード出力は不要）
+- test_cases.zig で `PatternType` union を使用
+  - `.hardcoded`: 固定パターン（複雑な画像用）
+  - `.gradient`: グラデーション（step値から動的生成）
+- `generateGradientExpected()` 関数でテスト時に動的生成
+- メリット: テストケース定義が簡潔（168行 → 60行に削減）
 
 ---
 
@@ -348,25 +383,30 @@ Phase 1で80%以上のPNG画像に対応可能です。Average と Paeth はテ�
 - 画像ファイルと期待値の同期が取りやすい
 - テスト失敗時の差分が明確
 
-#### テスト実行フロー
+#### テスト実行フロー（改善版）
 
 ```
 1. C言語プログラム（generate_test_data.c）でテストPNG生成
    - Makefile で自動ビルド: make generate
    - png-decoder/test-data/ 配下にPNGを出力
 
-2. 同時に期待値をZigコード形式で出力
-   - generate_expected_values() 関数で自動生成
-   - 標準出力 → test_cases_generated.zig.txt にリダイレクト
+2. test_cases.zig でテストケース定義
+   - PatternType union で pattern タイプを指定
+   - グラデーションパターンは step値のみ指定
 
-3. 期待値コードを test_cases.zig に手動コピー
+3. Zig test で `zig test src/test.zig` 実行
+   - test.zig で期待値を動的に生成
+   - generateGradientExpected() でグラデーション値を計算
+   - 実装が期待値と一致するかを自動検証
 
-4. Zig test で `zig test src/test.zig` 実行
-
-5. 実装が期待値と一致するかを自動検証
-
-6. 次のPhaseに進む前に全テスト合格を確認
+4. 次のPhaseに進む前に全テスト合格を確認
 ```
+
+**メリット:**
+- Zigコード出力の手動管理が不要
+- テストケース定義が簡潔（マトリクス形式）
+- 期待値計算の再利用性向上
+- コードの保守性が向上
 
 ### 3. エラー型の詳細度（Level 3）
 
