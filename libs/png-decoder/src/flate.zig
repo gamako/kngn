@@ -103,19 +103,33 @@ test "Decompress zlib data - 8x8 grayscale PNG (Filter None)" {
     const decompressed = try decompressZlib(allocator, idat_data);
     defer allocator.free(decompressed);
 
-    // For 8x8 grayscale image:
-    // - 8 scanlines, each with 1 filter byte + 8 pixels
-    // - Minimum expected: 8 * (1 + 8) = 72 bytes
+    // For 8x8 grayscale image (Filter None):
+    // - 8 scanlines, each with filter byte + 8 pixels per line
+    // - Scanline structure: [filter] [pixel0] [pixel1] ... [pixel7]
+    // - Each scanline = 9 bytes total
     try std.testing.expect(decompressed.len > 0);
     try std.testing.expect(decompressed.len >= 72);
 
-    // Basic structure verification:
-    // The decompressed data contains scanlines with filter bytes
-    // We verify the basic structure without assuming specific filter values
-    // (those will be validated in the next phase when implementing filter removal)
+    // Verify filter bytes and pixel values
+    // Test pattern: gradient with step=32 (row 0: all 0, row 1: all 32, ...)
+    const expected_gray_values = [_]u8{ 0, 32, 64, 96, 128, 160, 192, 224 };
 
-    // Verify we have at least data for 8 scanlines
-    try std.testing.expect(decompressed.len >= 8 * 9);
+    for (0..8) |row| {
+        const scanline_start = row * 9;
+
+        // Byte 0 of each scanline: Filter type = 0 (None)
+        try std.testing.expectEqual(0x00, decompressed[scanline_start]);
+
+        // Bytes 1-8: Pixel values (all same value for this row in gradient pattern)
+        const expected_gray = expected_gray_values[row];
+        for (0..8) |col| {
+            const pixel_offset = scanline_start + 1 + col;
+            try std.testing.expectEqual(
+                expected_gray,
+                decompressed[pixel_offset],
+            );
+        }
+    }
 }
 
 test "Decompress zlib data - 16x16 grayscale PNG (Filter None)" {
@@ -135,17 +149,29 @@ test "Decompress zlib data - 16x16 grayscale PNG (Filter None)" {
     const decompressed = try decompressZlib(allocator, idat_data);
     defer allocator.free(decompressed);
 
-    // For 16x16 grayscale image:
-    // - 16 scanlines, each with 1 filter byte + 16 pixels
-    // - Minimum expected: 16 * (1 + 16) = 272 bytes
+    // For 16x16 grayscale image (Filter None):
+    // - 16 scanlines, each with filter byte + 16 pixels per line
+    // - Scanline structure: [filter] [pixel0] [pixel1] ... [pixel15]
+    // - Each scanline = 17 bytes total
     try std.testing.expect(decompressed.len > 0);
     try std.testing.expect(decompressed.len >= 272);
 
-    // Basic structure verification:
-    // The decompressed data contains scanlines with filter bytes
-    // We verify the basic structure without assuming specific filter values
-    // (those will be validated in the next phase when implementing filter removal)
+    // Verify filter bytes and pixel values
+    // Test pattern: gradient with step=16 (row 0: all 0, row 1: all 16, ...)
+    for (0..16) |row| {
+        const scanline_start = row * 17;
+        const expected_gray = @as(u8, @intCast(row * 16));
 
-    // Verify we have at least data for 16 scanlines
-    try std.testing.expect(decompressed.len >= 16 * 17);
+        // Byte 0 of each scanline: Filter type = 0 (None)
+        try std.testing.expectEqual(0x00, decompressed[scanline_start]);
+
+        // Bytes 1-16: Pixel values (all same value for this row in gradient pattern)
+        for (0..16) |col| {
+            const pixel_offset = scanline_start + 1 + col;
+            try std.testing.expectEqual(
+                expected_gray,
+                decompressed[pixel_offset],
+            );
+        }
+    }
 }

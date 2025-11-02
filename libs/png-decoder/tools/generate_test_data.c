@@ -19,6 +19,14 @@ unsigned encode_png_with_filter(
     LodePNGState state;
     lodepng_state_init(&state);
 
+    /* CRITICAL: Disable auto_convert and explicitly set color type to grayscale */
+    /* Otherwise, LodePNG will automatically choose RGBA or Palette */
+    state.encoder.auto_convert = 0;
+    state.info_raw.colortype = LCT_GREY;
+    state.info_raw.bitdepth = 8;
+    state.info_png.color.colortype = LCT_GREY;
+    state.info_png.color.bitdepth = 8;
+
     /* Ensure filter strategy is applied even for grayscale images */
     state.encoder.filter_palette_zero = 0;
     state.encoder.filter_strategy = filter_strategy;
