@@ -75,6 +75,15 @@ test "Decompress zlib data - 1x1 grayscale PNG" {
     // - Format: [filter_byte] [pixel_value]
     // - Expected size: 1 (filter) + 1 (pixel) = 2 bytes
     try std.testing.expectEqual(2, decompressed.len);
+
+    // Verify decompressed content:
+    // Byte 0: Filter type (value depends on PNG encoder)
+    // This old test PNG may have any filter type
+    const filter_type = decompressed[0];
+    try std.testing.expect(filter_type <= 4); // Valid filter types are 0-4
+
+    // Byte 1: Pixel value = 128 (0x80, middle gray)
+    try std.testing.expectEqual(0x80, decompressed[1]);
 }
 
 test "Decompress zlib data - 8x8 grayscale PNG (Filter None)" {
@@ -95,14 +104,18 @@ test "Decompress zlib data - 8x8 grayscale PNG (Filter None)" {
     defer allocator.free(decompressed);
 
     // For 8x8 grayscale image:
-    // - 8 scanlines, each with filter byte + 8 pixels per line
-    // - Actual size depends on PNG encoder implementation
-    // Verify that decompression succeeded and returned data
+    // - 8 scanlines, each with 1 filter byte + 8 pixels
+    // - Minimum expected: 8 * (1 + 8) = 72 bytes
     try std.testing.expect(decompressed.len > 0);
-
-    // Each scanline should have at least 1 filter byte + 8 pixels = 9 bytes
-    // So minimum expected size is 8 * 9 = 72 bytes
     try std.testing.expect(decompressed.len >= 72);
+
+    // Basic structure verification:
+    // The decompressed data contains scanlines with filter bytes
+    // We verify the basic structure without assuming specific filter values
+    // (those will be validated in the next phase when implementing filter removal)
+
+    // Verify we have at least data for 8 scanlines
+    try std.testing.expect(decompressed.len >= 8 * 9);
 }
 
 test "Decompress zlib data - 16x16 grayscale PNG (Filter None)" {
@@ -123,8 +136,16 @@ test "Decompress zlib data - 16x16 grayscale PNG (Filter None)" {
     defer allocator.free(decompressed);
 
     // For 16x16 grayscale image:
-    // - 16 scanlines, each with filter byte + 16 pixels per line
-    // - Minimum expected size: 16 * 17 = 272 bytes
+    // - 16 scanlines, each with 1 filter byte + 16 pixels
+    // - Minimum expected: 16 * (1 + 16) = 272 bytes
     try std.testing.expect(decompressed.len > 0);
     try std.testing.expect(decompressed.len >= 272);
+
+    // Basic structure verification:
+    // The decompressed data contains scanlines with filter bytes
+    // We verify the basic structure without assuming specific filter values
+    // (those will be validated in the next phase when implementing filter removal)
+
+    // Verify we have at least data for 16 scanlines
+    try std.testing.expect(decompressed.len >= 16 * 17);
 }
