@@ -131,6 +131,50 @@ test-data/
 **コミット:**
 - `feat: PNG デコーダー ステップ5 - IDAT解凍（zlib形式対応）`
 
+#### 2025-11-02: テスト品質改善とPNG生成修正（ステップ5追加）
+- ✅ PNG生成の問題を発見・修正
+  - **問題**: LodePNGの `auto_convert` がデフォルト有効
+    - 8x8 グレースケール → RGBA（色タイプ6）で生成
+    - 16x16 グレースケール → パレット（色タイプ3）で生成
+    - スキャンラインサイズが期待値と異なる（9/17 → 33/不明）
+  - **原因**: `encode_png_with_filter()` が色タイプを明示していない
+  - **修正**: `generate_test_data.c` に以下を追加
+    ```c
+    state.encoder.auto_convert = 0;
+    state.info_raw.colortype = LCT_GREY;
+    state.info_raw.bitdepth = 8;
+    state.info_png.color.colortype = LCT_GREY;
+    state.info_png.color.bitdepth = 8;
+    ```
+  - **結果**: 全テストPNGが正しくグレースケール（色タイプ0）で生成
+
+- ✅ flate.zig テスト強化
+  - 簡略化していたテストを詳細な検証版に復元
+  - **1x1 grayscale**: ピクセル値 128 を検証
+  - **8x8 grayscale**: 8行のグラデーション（0, 32, 64, 96, 128, 160, 192, 224）を検証
+  - **16x16 grayscale**: 16行のグラデーション（0-240 by 16）を検証
+  - 各テストで以下を確認:
+    - スキャンラインサイズが正しい（8行×9バイト、16行×17バイト）
+    - フィルタバイトが 0x00 (Filter None)
+    - ピクセル値がグラデーションパターンと一致
+
+**コミット:**
+- `fix: PNG生成でグレースケール色タイプを明示的に指定` (a10760e4)
+- `test: flate.zig テストを詳細なピクセル値検証版に復元` (6f38ba8f)
+
+**重要な学び:**
+1. **テストは「長さ」だけでなく「内容」も検証すべき**
+   - 長さチェックのみでは、データ構造の問題を検出できない
+   - ピクセル値まで検証することで、解凍の正確性が保証される
+
+2. **外部ライブラリの自動機能は無効化が必須**
+   - LodePNGの `auto_convert` は便利だが、テスト用途では危険
+   - 色タイプは明示的に指定する必要がある
+
+3. **PNG生成側の問題がテスト失敗の原因になりうる**
+   - テスト失敗時は、入力データ側も疑う
+   - 単にテストコードを簡略化するのではなく、原因を究明する
+
 ### 次のステップ
 
 #### ステップ6: フィルタリング解除（None/Sub/Up）
@@ -175,7 +219,7 @@ typedef enum LodePNGFilterStrategy {
 } LodePNGFilterStrategy;
 ```
 
-**実装方法:**
+**実装方法（修正済み）:**
 ```c
 #include "lodepng.h"
 
@@ -190,7 +234,15 @@ unsigned encode_png_with_filter(
     LodePNGState state;
     lodepng_state_init(&state);
 
-    // 重要: グレースケール画像でもフィルタ戦略を確実に適用
+    /* CRITICAL: Disable auto_convert and explicitly set color type to grayscale */
+    /* Otherwise, LodePNG will automatically choose RGBA or Palette */
+    state.encoder.auto_convert = 0;
+    state.info_raw.colortype = LCT_GREY;
+    state.info_raw.bitdepth = 8;
+    state.info_png.color.colortype = LCT_GREY;
+    state.info_png.color.bitdepth = 8;
+
+    /* Ensure filter strategy is applied even for grayscale images */
     state.encoder.filter_palette_zero = 0;
     state.encoder.filter_strategy = filter_strategy;
 
@@ -203,7 +255,7 @@ unsigned encode_png_with_filter(
         error = lodepng_save_file(png_data, png_size, filename);
     }
 
-    lodepng_free(png_data);
+    free(png_data);
     lodepng_state_cleanup(&state);
     return error;
 }
@@ -212,7 +264,14 @@ unsigned encode_png_with_filter(
 **重要な注意点:**
 1. `lodepng_encode()` を使用（簡易API lodepng_encode_file では制御不可）
 2. `LodePNGState` 構造体を使用して設定
-3. `filter_palette_zero = 0` の設定が必須（グレースケール画像でもフィルタが確実に適用される）
+3. **NEW:** `auto_convert = 0` で自動色変換を無効化（重要！）
+4. **NEW:** `info_raw.colortype` と `info_png.color.colortype` を LCT_GREY に明示
+5. `filter_palette_zero = 0` の設定が必須（グレースケール画像でもフィルタが確実に適用される）
+
+**修正の背景:**
+- LodePNGのデフォルト動作では `auto_convert` が有効
+- 色タイプを明示しないと、意図しない色形式（RGBA、パレット）で生成される可能性
+- テスト用途では、色タイプは必ず明示的に指定すること
 
 ### Phase 1 のテストデータ生成計画
 
