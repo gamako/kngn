@@ -175,15 +175,41 @@ test-data/
    - テスト失敗時は、入力データ側も疑う
    - 単にテストコードを簡略化するのではなく、原因を究明する
 
-### 次のステップ
+#### 2025-11-02: フィルタリング解除（None/Sub/Up）（ステップ6）
+- ✅ filter.zig モジュール作成
+  - `filterNone()`: フィルタなし処理（データをそのまま使用）
+  - `filterSub()`: Sub フィルタ実装（左隣のピクセル値を加算）
+  - `filterUp()`: Up フィルタ実装（上のピクセル値を加算）
+  - `applyFilters()` 関数：解凍されたデータから全スキャンラインのフィルタを除去
+- ✅ test.zig にテストケース追加
+  - テストケース: 8x8/16x16 グレースケール × 3フィルタタイプ（None/Sub/Up）
+  - 各テストで期待値（グラデーションパターン）と比較検証
+  - filterUp 実装の修正
+    - 初期実装で上のピクセル参照位置がずれていた
+    - `output[output_pos - bytes_per_scanline + x]` → `output[output_pos - bytes_per_scanline]`
+- ✅ テスト全合格（8/8）
+  - All test cases - IHDR verification ✓
+  - ChunkIterator - iterate all chunks ✓
+  - Collect IDAT chunks ✓
+  - **Filter - apply filters to decompressed data** ← 新規 ✓
+  - PNG signature verification (png_parser) ✓
+  - Decompress zlib data - 1x1 grayscale PNG ✓
+  - Decompress zlib data - 8x8 grayscale PNG (Filter None) ✓
+  - Decompress zlib data - 16x16 grayscale PNG (Filter None) ✓
 
-#### ステップ6: フィルタリング解除（None/Sub/Up）
-- [ ] filter.zig モジュール作成
-  - None フィルタ実装
-  - Sub フィルタ実装
-  - Up フィルタ実装
-- [ ] テスト実装
-  - 各フィルタタイプでグレースケール復元検証
+**コミット:**
+- `feat: PNG デコーダー ステップ6 - フィルタリング解除（None/Sub/Up）` (46980ffc)
+
+**重要な学び:**
+1. **フィルタアルゴリズムは参照ピクセル位置を正確に計算する必要がある**
+   - 出力バッファ内での位置計算を慎重に行う
+   - テストでピクセル値の詳細を検証することで、微妙なバグを検出可能
+
+2. **FilterUp の参照ピクセルは「上の行の同じ列」**
+   - 初期実装：`output[output_pos - bytes_per_scanline + x]` （誤り）
+   - 正しい実装：`output[output_pos - bytes_per_scanline]` （output_pos が既に列を含む）
+
+### 次のステップ
 
 #### ステップ7: ピクセルフォーマット変換
 - [ ] format.zig モジュール作成
