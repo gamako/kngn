@@ -110,15 +110,28 @@ test-data/
 - `refactor: test_cases.zig を手動コピーから動的生成方式に変更`
 - `refactor: generate_test_data.c から期待値出力を削除`
 
-### 次のステップ
+#### 2025-11-02: IDAT解凍（zlib形式対応）（ステップ5）
+- ✅ flate.zig モジュール作成
+  - `decompressZlib()` 関数実装
+  - `std.Io.Reader.fixed()` でバイト列からreaderを作成
+  - `std.Io.Writer.Allocating` で動的出力バッファを管理
+  - `std.compress.flate.Decompress.init()` でzlib形式対応
+  - RFC 1950 zlib フォーマットのヘッダー・フッター自動処理
+- ✅ test.zig への flate モジュール統合
+  - `const flate_tests = @import("flate.zig");` でテスト連携
+- ✅ テスト全合格（7/7）
+  - Decompress zlib data - 1x1 grayscale PNG ✓
+  - Decompress zlib data - 8x8 grayscale PNG (Filter None) ✓
+  - Decompress zlib data - 16x16 grayscale PNG (Filter None) ✓
+  - All test cases - IHDR verification ✓
+  - ChunkIterator - iterate all chunks ✓
+  - Collect IDAT chunks ✓
+  - PNG signature verification ✓
 
-#### ステップ5: IDAT解凍（zlib形式対応）
-- [ ] flate.zig モジュール作成
-  - std.compress.flate.Decompress ラッパー実装
-  - .zlib コンテナで zlib形式対応（RFC 1950）
-  - collectIDATChunks() は既に実装済み（ステップ3）
-- [ ] テスト実装
-  - 解凍後データサイズ検証
+**コミット:**
+- `feat: PNG デコーダー ステップ5 - IDAT解凍（zlib形式対応）`
+
+### 次のステップ
 
 #### ステップ6: フィルタリング解除（None/Sub/Up）
 - [ ] filter.zig モジュール作成
