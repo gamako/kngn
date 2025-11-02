@@ -5,6 +5,7 @@ const std = @import("std");
 const lib = @import("lib.zig");
 const test_cases = @import("test_cases.zig");
 const flate_tests = @import("flate.zig");
+const filter = @import("filter.zig");
 
 test "All test cases - IHDR verification" {
     const allocator = std.testing.allocator;
@@ -121,4 +122,108 @@ test "Collect IDAT chunks" {
 
     // IDAT データが存在することを確認
     try std.testing.expect(idat_data.len > 0);
+}
+
+test "Filter - apply filters to decompressed data" {
+    const allocator = std.testing.allocator;
+
+    // Process all test cases that have grayscale filter patterns
+    const filter_test_cases = [_]struct {
+        file_path: []const u8,
+        width: u32,
+        height: u32,
+        step: u8,
+    }{
+        .{
+            .file_path = "test-data/8x8_gray_filter_none.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/8x8_gray_filter_sub.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/8x8_gray_filter_up.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_none.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_sub.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_up.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+    };
+
+    for (filter_test_cases) |tc| {
+        // Read PNG file
+        const file_data = try std.fs.cwd().readFileAlloc(
+            tc.file_path,
+            allocator,
+            .unlimited,
+        );
+        defer allocator.free(file_data);
+
+        // Verify signature
+        try std.testing.expect(lib.png_parser.verifySignature(file_data));
+
+        // Collect IDAT chunks
+        const idat_data = try lib.png_parser.collectIDATChunks(allocator, file_data);
+        defer allocator.free(idat_data);
+
+        // Decompress IDAT data
+        const decompressed = try flate_tests.decompressZlib(allocator, idat_data);
+        defer allocator.free(decompressed);
+
+        // Apply filters (1 byte per pixel for grayscale)
+        const filtered = try filter.applyFilters(
+            allocator,
+            decompressed,
+            tc.width,
+            tc.height,
+            1, // bytes per pixel for grayscale
+        );
+        defer allocator.free(filtered);
+
+        // Generate expected gradient pattern
+        const expected = try test_cases.generateGradientExpected(
+            allocator,
+            tc.width,
+            tc.height,
+            tc.step,
+        );
+        defer allocator.free(expected);
+
+        // Verify filtered data matches expected gradient pattern
+        // Each pixel value should be a grayscale value (0-255)
+        for (0..tc.height) |y| {
+            for (0..tc.width) |x| {
+                const idx = y * tc.width + x;
+                const gray_value = filtered[idx];
+                const expected_gray = @as(u8, @intCast((y * tc.step) & 0xFF));
+
+                try std.testing.expectEqual(
+                    expected_gray,
+                    gray_value,
+                );
+            }
+        }
+    }
 }
