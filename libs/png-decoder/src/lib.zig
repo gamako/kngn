@@ -3,6 +3,7 @@
 
 const std = @import("std");
 pub const png_parser = @import("png_parser.zig");
+pub const flate = @import("flate.zig");
 
 /// Error types for PNG decoding
 pub const DecodingError = error{

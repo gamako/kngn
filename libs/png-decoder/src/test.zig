@@ -4,6 +4,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const test_cases = @import("test_cases.zig");
+const flate_tests = @import("flate.zig");
 
 test "All test cases - IHDR verification" {
     const allocator = std.testing.allocator;
