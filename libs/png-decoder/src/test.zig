@@ -6,6 +6,7 @@ const lib = @import("lib.zig");
 const test_cases = @import("test_cases.zig");
 const flate_tests = @import("flate.zig");
 const filter = @import("filter.zig");
+const format = @import("format.zig");
 
 test "All test cases - IHDR verification" {
     const allocator = std.testing.allocator;
@@ -222,6 +223,111 @@ test "Filter - apply filters to decompressed data" {
                 try std.testing.expectEqual(
                     expected_gray,
                     gray_value,
+                );
+            }
+        }
+    }
+}
+
+test "Format conversion - grayscale to RGBA8888" {
+    const allocator = std.testing.allocator;
+
+    // Process all test cases for format conversion
+    const format_test_cases = [_]struct {
+        file_path: []const u8,
+        width: u32,
+        height: u32,
+        step: u8,
+    }{
+        .{
+            .file_path = "test-data/8x8_gray_filter_none.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/8x8_gray_filter_sub.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/8x8_gray_filter_up.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_none.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_sub.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_up.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+    };
+
+    for (format_test_cases) |tc| {
+        // Read PNG file
+        const file_data = try std.fs.cwd().readFileAlloc(
+            tc.file_path,
+            allocator,
+            .unlimited,
+        );
+        defer allocator.free(file_data);
+
+        // Verify signature
+        try std.testing.expect(lib.png_parser.verifySignature(file_data));
+
+        // Collect IDAT chunks
+        const idat_data = try lib.png_parser.collectIDATChunks(allocator, file_data);
+        defer allocator.free(idat_data);
+
+        // Decompress IDAT data
+        const decompressed = try flate_tests.decompressZlib(allocator, idat_data);
+        defer allocator.free(decompressed);
+
+        // Apply filters (1 byte per pixel for grayscale)
+        const filtered = try filter.applyFilters(
+            allocator,
+            decompressed,
+            tc.width,
+            tc.height,
+            1, // bytes per pixel for grayscale
+        );
+        defer allocator.free(filtered);
+
+        // Convert grayscale to RGBA8888
+        const rgba_data = try format.grayscaleToRGBA8888(allocator, filtered);
+        defer allocator.free(rgba_data);
+
+        // Verify conversion result
+        try std.testing.expectEqual(tc.width * tc.height, rgba_data.len);
+
+        // Verify each pixel value
+        for (0..tc.height) |y| {
+            for (0..tc.width) |x| {
+                const idx = y * tc.width + x;
+                const gray_value = filtered[idx];
+
+                // Expected RGBA8888 format: 0xRRGGBBAA
+                const expected_rgba = (@as(u32, gray_value) << 24) |
+                                     (@as(u32, gray_value) << 16) |
+                                     (@as(u32, gray_value) << 8) | 0xFF;
+
+                try std.testing.expectEqual(
+                    expected_rgba,
+                    rgba_data[idx],
                 );
             }
         }

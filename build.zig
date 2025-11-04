@@ -336,6 +336,21 @@ pub fn build(b: *std.Build) void {
     }
 
     // ========================================
+    // PNGデコーダー format.zig テストの設定
+    // ========================================
+    const png_format_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("libs/png-decoder/src/format.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_png_format_test = b.addRunArtifact(png_format_test);
+    const test_png_format_step = b.step("test-png-format", "Run PNG format conversion tests");
+    test_png_format_step.dependOn(&run_png_format_test.step);
+
+    // ========================================
     // サンプルプログラム用のビルド設定
     // ========================================
 
