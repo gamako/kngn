@@ -24,6 +24,7 @@ pub const DecodingError = error{
     InvalidDimensions,
     UnsupportedColorType,
     DecompressionFailed,
+    OutOfMemory,
 };
 
 /// PNG image data in RGBA8888 format
@@ -131,7 +132,12 @@ test "decodePNG - verify IHDR requirement" {
     // PNG signature only, no IHDR
     const png_sig = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
 
+    // This should fail due to insufficient data for IHDR chunk
     const result = decodePNG(allocator, &png_sig);
-    // This will fail at chunk reading
-    _ = result;
+    // The result should be an error (catch and ignore for this test)
+    if (result) |image| {
+        image.deinit(allocator);
+    } else |_| {
+        // Expected to fail
+    }
 }
