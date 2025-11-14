@@ -27,6 +27,8 @@ pub const DecodingError = error{
     OutOfMemory,
     WriteFailed,
     ReadFailed,
+    InvalidData,
+    UnsupportedFilterType,
 };
 
 /// PNG image data in RGBA8888 format
