@@ -68,7 +68,7 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
 
     // Determine bytes per pixel based on color type
     const color_type: ColorType = @enumFromInt(ihdr.color_type);
-    const bytes_per_pixel: usize = switch (color_type) {
+    const bytes_per_pixel: u32 = switch (color_type) {
         .grayscale => 1,
         .rgb => 3,
         .grayscale_alpha => 2,
