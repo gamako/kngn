@@ -333,3 +333,61 @@ test "Format conversion - grayscale to RGBA8888" {
         }
     }
 }
+
+test "Phase 1 - end-to-end decodePNG test (8x8 grayscale)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/8x8_gray_filter_none.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 8), png_image.width);
+    try std.testing.expectEqual(@as(u32, 8), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 64), png_image.pixels.len);
+
+    // Verify RGBA values (all pixels should have A=255)
+    for (png_image.pixels) |pixel| {
+        const alpha = pixel & 0xFF;
+        try std.testing.expectEqual(@as(u32, 0xFF), alpha);
+    }
+}
+
+test "Phase 1 - end-to-end decodePNG test (16x16 grayscale)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/16x16_gray_filter_none.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 16), png_image.width);
+    try std.testing.expectEqual(@as(u32, 16), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 256), png_image.pixels.len);
+
+    // Verify RGBA values (all pixels should have A=255)
+    for (png_image.pixels) |pixel| {
+        const alpha = pixel & 0xFF;
+        try std.testing.expectEqual(@as(u32, 0xFF), alpha);
+    }
+}
