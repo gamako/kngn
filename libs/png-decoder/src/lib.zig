@@ -29,6 +29,7 @@ pub const DecodingError = error{
     ReadFailed,
     InvalidData,
     UnsupportedFilterType,
+    InvalidCRC,
 };
 
 /// PNG image data in RGBA8888 format
@@ -49,11 +50,15 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
         return error.InvalidPNGSignature;
     }
 
-    // Skip PNG signature (8 bytes)
-    const after_signature = file_data[8..];
+    // Create chunk iterator and read first chunk (IHDR)
+    var chunk_iter = png_parser.ChunkIterator.init(file_data);
 
     // Read IHDR chunk (first chunk after signature)
-    const ihdr_chunk = try png_parser.readChunk(after_signature, 0);
+    const ihdr_chunk_opt = try chunk_iter.next();
+    if (ihdr_chunk_opt == null) {
+        return error.MissingIHDR;
+    }
+    const ihdr_chunk = ihdr_chunk_opt.?;
 
     // Verify IHDR chunk type
     if (!std.mem.eql(u8, "IHDR", &ihdr_chunk.chunk_type)) {
