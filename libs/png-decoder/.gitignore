@@ -1,5 +1,6 @@
 # Build artifacts
 tools/generate_test_data
+test-data/
 zig-out/
 .zig-cache/
 
