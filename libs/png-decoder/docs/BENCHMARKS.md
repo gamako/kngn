@@ -154,7 +154,7 @@
 ## Phase X.Y - [改善名]
 
 **計測日:** YYYY-MM-DD
-**コミット:** [git commit hash]
+**コミット:** [jj log -n2 で確認できるID]
 
 ### 改善内容
 [簡潔な説明]

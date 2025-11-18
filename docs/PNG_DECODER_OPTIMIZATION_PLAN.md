@@ -66,30 +66,84 @@
 
 **テスト画像生成:**
 
-現在の `tools/generate_test_data.c` に以下の大サイズ画像生成を追加：
+現在の `tools/generate_test_data.c` に以下の機能を追加する必要があります：
 
-```c
-/* ノイズ生成（固定シード、再現性確保）*/
-void generate_noise_image(unsigned char* image,
-                         unsigned width, unsigned height,
-                         unsigned channels, uint32_t seed) {
-    uint64_t rng_state = seed;
-    for (unsigned i = 0; i < width * height * channels; i++) {
-        image[i] = pcg32_random_r(&rng_state) & 0xFF;
-    }
-}
+#### 1. PCG32 PRNG実装の追加
+
+**必要性:**
+- 固定シード値から確定的（再現可能）なノイズを生成
+- ベンチマーク間での一貫性確保（同じシード → 同じ画像）
+- 高品質な疑似乱数（LCGより統計特性が優れている）
+
+**実装内容:**
+- PCG32状態型: `uint64_t`（内部状態管理）
+- PCG32生成関数: `pcg32_random_r(state)` → `uint32_t` 戻り値
+- 初期化関数: `pcg32_srandom_r(state, seed)` で固定シード設定
+- パラメータ: multiplier = 6364136223846793005, increment = 3877204661
+
+**使用方法:**
+```
+pcg32_state_t rng_state;
+pcg32_srandom_r(&rng_state, seed_value);
+uint32_t random_value = pcg32_random_r(&rng_state);
+```
+
+#### 2. パターン生成ヘルパー関数の追加
+
+**グラデーション生成:**
+- RGB/RGBA対応
+- X軸でR値増加、Y軸でG値増加、B固定
+- 全ピクセルに適用
+
+**チェッカーボード生成:**
+- ブロックサイズ32x32
+- RGB/RGBA対応
+- 交互に黒/白を配置
+
+**ノイズ生成:**
+- PCG32で各ピクセル値を生成
+- 固定シード（12345, 54321など）で再現性確保
+- RGB/RGBA対応
+
+#### 3. 大サイズ画像生成関数の追加
+
+各関数は、以下のパターンで実装：
+1. `malloc()` で画像バッファ確保
+2. パターン生成ヘルパー関数を呼び出し
+3. `encode_*_png_with_filter()` で指定フィルタで PNG出力
+4. `free()` でバッファ解放
+
+実装関数：
+- `generate_256x256_rgb_gradient()` - グラデーション + filter:none
+- `generate_256x256_rgba_noise()` - PCG32ノイズ + filter:paeth
+- `generate_512x512_rgb_checkerboard()` - チェッカーボード + filter:sub
+- `generate_512x512_rgba_noise()` - PCG32ノイズ + filter:average
+- `generate_1024x1024_rgb_gradient()` - グラデーション + filter:sub
+- `generate_1920x1080_rgba_gradient()` - グラデーション + filter:average
+
+#### 4. main() への統合
+
+既存の小サイズ画像生成後に、以下を追加：
+```
+printf("\n=== Large Images for Benchmarking ===\n");
+generate_256x256_rgb_gradient();
+generate_256x256_rgba_noise();
+generate_512x512_rgb_checkerboard();
+generate_512x512_rgba_noise();
+generate_1024x1024_rgb_gradient();
+generate_1920x1080_rgba_gradient();
 ```
 
 **生成する画像:**
 
-| サイズ | 色形式 | パターン | フィルタ | 目的 |
-|--------|--------|---------|---------|------|
-| 256x256 | RGB | グラデーション | None, Sub, Up | 中規模テスト |
-| 256x256 | RGBA | ノイズ（シード固定） | Paeth | ノイズ耐性評価 |
-| 512x512 | RGB | チェッカーボード | Average | 高周波パターン |
-| 512x512 | RGBA | ノイズ | Paeth | 圧縮効率評価 |
-| 1024x1024 | RGB | グラデーション | Sub | 大規模画像 |
-| 1920x1080 | RGBA | グラデーション | Average | **ベンチマーク主力** |
+| サイズ | 色形式 | パターン | フィルタ | 用途 | シード値 |
+|--------|--------|---------|---------|------|----------|
+| 256x256 | RGB | グラデーション | None | 中規模テスト | - |
+| 256x256 | RGBA | ノイズ | Paeth | ノイズ耐性評価 | 12345 |
+| 512x512 | RGB | チェッカーボード | Sub | 高周波パターン | - |
+| 512x512 | RGBA | ノイズ | Average | 圧縮効率評価 | 54321 |
+| 1024x1024 | RGB | グラデーション | Sub | 大規模画像 | - |
+| 1920x1080 | RGBA | グラデーション | Average | **ベンチマーク主力** | - |
 
 **メモリ計測の詳細:**
 
