@@ -16,9 +16,14 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 ## 実装進捗
 
 ### 現在の状況
-**Phase 1 (Grayscale)**: ✅ 9/9完了 - 実装完全完了！
+**Phase 2 (RGB)**: ✅ 完全完了！
+
+- **Phase 1 (Grayscale)**: ✅ 9/9完了 - PNG署名確認、チャンク解析、zlib解凍、フィルタ（None/Sub/Up）対応
+- **Phase 2 (RGB)**: ✅ 完全完了 - RGB色形式対応、Average/Paethフィルタ実装、16個のRGBテストケース
 
 ### 完了項目
+
+#### Phase 1 完了項目
 - ✅ ステップ1: PNG署名確認
 - ✅ ステップ2: チャンク構造の読み取り
 - ✅ ステップ3: ChunkIteratorとIDAT収集
@@ -29,20 +34,23 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 - ✅ ステップ8: lib.zig統合実装（decodePNG関数）
 - ✅ ステップ9: Phase 1統合テスト（8x8, 16x16グレースケール）
 
-最新コミット: 6d7c82b0 (Phase 1統合テスト実装)
+#### Phase 2 完了項目
+- ✅ Average フィルタ（タイプ3）実装
+- ✅ Paeth フィルタ（タイプ4）実装
+- ✅ Paeth予測アルゴリズム修正（png spec準拠）
+- ✅ RGB形式テストPNG生成（checkerboard & gradient各5フィルタ）
+- ✅ test_cases.zig に RGB テストケース 10個追加
+- ✅ format.zig の rgbToRGBA8888関数確認・動作確認
+- ✅ Phase 2統合テスト実装（Average/Paethフィルタ、RGB形式）
+- ✅ 全23テスト合格
 
 ### 次のステップ
 
-#### Phase 2: RGB形式対応（未実装）
-- [ ] RGB色形式対応（Color Type = 2）
-- [ ] Average/Paethフィルタ実装
-- [ ] test_cases.zig に RGB テストケース追加
-- [ ] format.zigにrgbToRGBA8888関数確認
-- [ ] Phase 2統合テスト実装
-
 #### Phase 3: RGBA形式対応（未実装）
-- [ ] RGBA色形式対応（Color Type = 6）
-- [ ] format.zigにrgbaToRGBA8888関数確認
+- [ ] RGBA色形式対応（Color Type = 6, 8bit）
+- [ ] format.zigのrgbaToRGBA8888関数確認
+- [ ] RGBAテストPNG生成（各フィルタ対応）
+- [ ] test_cases.zig に RGBA テストケース追加
 - [ ] Phase 3統合テスト実装
 - [ ] フォント/スプライト用途で使用可能に
 
