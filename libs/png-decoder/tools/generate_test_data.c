@@ -24,7 +24,8 @@ uint32_t pcg32_random_r(pcg32_state_t *state) {
     *state = oldstate * PCG32_MULTIPLIER + PCG32_INCREMENT;
     uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
     uint32_t rot = (uint32_t)(oldstate >> 59u);
-    return (xorshifted >> rot) | (xorshifted << (32u - rot));
+    /* Proper rotation handling: avoid undefined behavior when rot == 0 */
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
 }
 
 /* Encode PNG with filter type specification */
@@ -431,6 +432,11 @@ void generate_256x256_rgb_gradient(void) {
     unsigned width = 256, height = 256;
     unsigned char *image_data = (unsigned char *)malloc(width * height * 3);
 
+    if (image_data == NULL) {
+        printf("Error: Failed to allocate memory for 256x256 RGB gradient\n");
+        return;
+    }
+
     fill_gradient_rgb(image_data, width, height);
 
     char filename[256];
@@ -456,6 +462,11 @@ void generate_256x256_rgb_gradient(void) {
 void generate_256x256_rgba_noise(void) {
     unsigned width = 256, height = 256;
     unsigned char *image_data = (unsigned char *)malloc(width * height * 4);
+
+    if (image_data == NULL) {
+        fprintf(stderr, "Memory allocation failed for 256x256 RGBA noise image\n");
+        return;
+    }
 
     fill_noise_rgba(image_data, width, height, 12345);
 
@@ -483,6 +494,11 @@ void generate_512x512_rgb_checkerboard(void) {
     unsigned width = 512, height = 512;
     unsigned char *image_data = (unsigned char *)malloc(width * height * 3);
 
+    if (image_data == NULL) {
+        fprintf(stderr, "Memory allocation failed for 512x512 RGB checkerboard image\n");
+        return;
+    }
+
     fill_checkerboard_rgb(image_data, width, height, 32);
 
     char filename[256];
@@ -508,6 +524,11 @@ void generate_512x512_rgb_checkerboard(void) {
 void generate_512x512_rgba_noise(void) {
     unsigned width = 512, height = 512;
     unsigned char *image_data = (unsigned char *)malloc(width * height * 4);
+
+    if (image_data == NULL) {
+        fprintf(stderr, "Memory allocation failed for 512x512 RGBA noise image\n");
+        return;
+    }
 
     fill_noise_rgba(image_data, width, height, 54321);
 
@@ -535,6 +556,11 @@ void generate_1024x1024_rgb_gradient(void) {
     unsigned width = 1024, height = 1024;
     unsigned char *image_data = (unsigned char *)malloc(width * height * 3);
 
+    if (image_data == NULL) {
+        fprintf(stderr, "Memory allocation failed for 1024x1024 RGB gradient image\n");
+        return;
+    }
+
     fill_gradient_rgb(image_data, width, height);
 
     char filename[256];
@@ -560,6 +586,11 @@ void generate_1024x1024_rgb_gradient(void) {
 void generate_1920x1080_rgba_gradient(void) {
     unsigned width = 1920, height = 1080;
     unsigned char *image_data = (unsigned char *)malloc(width * height * 4);
+
+    if (image_data == NULL) {
+        fprintf(stderr, "Memory allocation failed for 1920x1080 RGBA gradient image\n");
+        return;
+    }
 
     /* X軸でR増加、Y軸でG増加、B固定、AはXと同じ */
     for (unsigned y = 0; y < height; y++) {

@@ -24,7 +24,7 @@ const test_images = [_]TestImage{
 const ITERATIONS = 100;
 
 pub fn main() !void {
-    // Use GeneralPurposeAllocator for actual allocation
+    // Use GeneralPurposeAllocator for allocation
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51,6 +51,7 @@ pub fn main() !void {
 }
 
 fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
+
     // Try to read the image file
     var file = std.fs.cwd().openFile(test_image.path, .{}) catch {
         std.debug.print("{s:<35} File not found\n", .{test_image.name});
@@ -73,7 +74,7 @@ fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
         defer image.deinit(allocator);
     }
 
-    // Benchmark runs with memory tracking
+    // Benchmark runs
     var timer = try std.time.Timer.start();
 
     for (0..ITERATIONS) |_| {
@@ -91,7 +92,7 @@ fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
 
     const total_pixels = first_image.width * first_image.height;
     const megapixels = @as(f64, @floatFromInt(total_pixels)) / 1_000_000.0;
-    const seconds = @as(f64, @floatFromInt(elapsed_us)) / 1_000_000.0;
+    const seconds = @as(f64, @floatFromInt(avg_us)) / 1_000_000.0;
     const throughput = megapixels / seconds;
 
     // Format and print results

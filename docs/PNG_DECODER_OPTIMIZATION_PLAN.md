@@ -151,15 +151,25 @@ std.heap.GeneralPurposeAllocator は全体統計を提供しますが、行バ�
 
 ```zig
 // ProfiledAllocator による詳細追跡
-const ProfilingAllocator = std.heap.ProfiledAllocator(std.heap.GeneralPurposeAllocator(.{}));
+var profiled_allocator = std.heap.ProfiledAllocator(std.heap.GeneralPurposeAllocator(.{})){
+    .backing_allocator = undefined,
+};
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+defer _ = gpa.deinit();
+profiled_allocator.backing_allocator = gpa.allocator();
 
-var gpa = ProfilingAllocator.init(backing_allocator);
-defer gpa.deinit();
-const allocator = gpa.allocator();
+const allocator = profiled_allocator.allocator();
 
-// デコード処理後に統計を確認
-const stats = gpa.profiling_allocator.stats;
-std.debug.print("Peak bytes: {}\n", .{stats.peak_bytes});
+// ベンチマーク前にリセット
+profiled_allocator.reset();
+
+// デコード処理
+var image = try lib.decodePNG(allocator, file_data);
+defer image.deinit(allocator);
+
+// 統計を確認
+const peak_bytes = profiled_allocator.stats.peak_allocated_bytes;
+std.debug.print("Peak bytes: {}\n", .{peak_bytes});
 ```
 
 **出力:**
