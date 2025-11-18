@@ -4,3 +4,7 @@
 .zig-cache/
 zig-out/
 *.o
+
+# Test data and generated files
+libs/png-decoder/test-data/
+.claude/.tmp/

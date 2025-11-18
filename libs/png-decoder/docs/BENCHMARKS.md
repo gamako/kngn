@@ -31,27 +31,33 @@
 
 ## ベースライン計測 (実装前)
 
-**計測日:** [YYYY-MM-DD]
+**計測日:** 2025-11-18
 **計測環境:**
-- CPU: [例: Apple M1 Pro]
-- OS: [例: macOS 14.6]
-- Zig Version: 0.13.0
-- Build Mode: ReleaseFast
+- CPU: Apple M1 Pro
+- OS: macOS 14.6
+- Zig Version: 0.16.0-dev.747+493ad58ff
+- Build Mode: Debug
+- マシン: Gamako's MacBook Pro
 
 ### エンドツーエンドデコード速度
 
-| Image File | Image Size | Format    | Filter  | Time (μs) | Throughput (MP/s) | Peak Memory (KB) |
-|------------|------------|-----------|---------|-----------|-------------------|------------------|
-| 1x1_grayscale_filter_none.png | 1x1 | Grayscale | None | | | |
-| 8x8_grayscale_filter_sub.png | 8x8 | Grayscale | Sub | | | |
-| 16x16_rgb_gradient_filter_none.png | 16x16 | RGB | None | | | |
-| 16x16_rgba_mixed_filters.png | 16x16 | RGBA | Mixed | | | |
-| 256x256_grayscale_paeth.png | 256x256 | Grayscale | Paeth | | | |
+| Image File | Image Size | Format    | Filter  | Time (μs) | Throughput (MP/s) | Note |
+|------------|------------|-----------|---------|-----------|-------------------|------|
+| 1x1_grayscale.png | 1x1 | Grayscale | None | 19.78 | 0.00 | 最小テストケース |
+| 8x8_gray_filter_none.png | 8x8 | Grayscale | None | 20.26 | 0.00 | 小規模画像 |
+| 16x16_gray_filter_none.png | 16x16 | Grayscale | None | 25.00 | 0.01 | 小規模画像 |
+| 256x256_rgb_gradient_filter_none.png | 256x256 | RGB | None | 214.52 | 0.03 | 中規模画像 |
+| 256x256_rgba_noise_filter_paeth.png | 256x256 | RGBA | Paeth | 333.61 | 0.02 | ノイズ + 複雑フィルタ |
+| 512x512_rgb_checkerboard_filter_sub.png | 512x512 | RGB | Sub | 200.15 | 0.13 | 高周波パターン |
+| 512x512_rgba_noise_filter_average.png | 512x512 | RGBA | Average | 976.08 | 0.03 | ノイズ + Average フィルタ |
+| 1024x1024_rgb_gradient_filter_sub.png | 1024x1024 | RGB | Sub | 671.82 | 0.16 | 大規模画像 |
+| 1920x1080_rgba_gradient_filter_average.png | 1920x1080 | RGBA | Average | 1788.77 | 0.12 | ベンチマーク主力 |
 
 **計測方法:**
-- ProfiledAllocator でメモリピークを計測
-- 各イメージ 1000 回実行の平均時間
-- std.time.Timer で計測
+- std.time.Timer でデコード処理時間を計測
+- 各イメージ 100 回実行の平均時間
+- ウォームアップ実行 1 回（結果除外）
+- メモリ計測は未実装（今後 ProfiledAllocator で追加予定）
 
 ### フィルタタイプ別の処理時間
 

@@ -8,6 +8,25 @@
 #include <string.h>
 #include "lodepng/lodepng.h"
 
+/* PCG32 PRNG Implementation */
+typedef uint64_t pcg32_state_t;
+
+/* PCG32 constants */
+#define PCG32_MULTIPLIER  6364136223846793005ULL
+#define PCG32_INCREMENT   3877204661ULL
+
+void pcg32_srandom_r(pcg32_state_t *state, uint64_t seed) {
+    *state = seed + PCG32_INCREMENT;
+}
+
+uint32_t pcg32_random_r(pcg32_state_t *state) {
+    uint64_t oldstate = *state;
+    *state = oldstate * PCG32_MULTIPLIER + PCG32_INCREMENT;
+    uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
+    uint32_t rot = (uint32_t)(oldstate >> 59u);
+    return (xorshifted >> rot) | (xorshifted << (32u - rot));
+}
+
 /* Encode PNG with filter type specification */
 unsigned encode_png_with_filter(
     const char* filename,
@@ -360,6 +379,219 @@ void generate_16x16_rgba_gradient(LodePNGFilterStrategy filter_strategy, const c
     printf("Generated: %s\n", filename);
 }
 
+/* Pattern generation helper functions */
+
+void fill_gradient_rgb(unsigned char *image, unsigned width, unsigned height) {
+    /* X軸でR増加、Y軸でG増加、B固定 */
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            unsigned idx = (y * width + x) * 3;
+            image[idx] = (unsigned char)((x * 256) / width);      /* R: 0-255 */
+            image[idx + 1] = (unsigned char)((y * 256) / height); /* G: 0-255 */
+            image[idx + 2] = 128;                                  /* B: constant */
+        }
+    }
+}
+
+void fill_checkerboard_rgb(unsigned char *image, unsigned width, unsigned height, unsigned block_size) {
+    /* block_size x block_size ブロックの黒/白チェッカーボード */
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            unsigned idx = (y * width + x) * 3;
+            unsigned block_x = x / block_size;
+            unsigned block_y = y / block_size;
+            unsigned char color = ((block_x + block_y) % 2 == 0) ? 255 : 0;
+            image[idx] = color;     /* R */
+            image[idx + 1] = color; /* G */
+            image[idx + 2] = color; /* B */
+        }
+    }
+}
+
+void fill_noise_rgba(unsigned char *image, unsigned width, unsigned height, uint64_t seed) {
+    /* PCG32による再現可能なノイズ */
+    pcg32_state_t rng;
+    pcg32_srandom_r(&rng, seed);
+
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            unsigned idx = (y * width + x) * 4;
+            uint32_t random_val = pcg32_random_r(&rng);
+            image[idx] = (unsigned char)(random_val >> 24);        /* R */
+            image[idx + 1] = (unsigned char)(random_val >> 16);    /* G */
+            image[idx + 2] = (unsigned char)(random_val >> 8);     /* B */
+            image[idx + 3] = (unsigned char)(random_val & 0xFF);   /* A */
+        }
+    }
+}
+
+/* Large image generation functions for benchmarking */
+
+void generate_256x256_rgb_gradient(void) {
+    unsigned width = 256, height = 256;
+    unsigned char *image_data = (unsigned char *)malloc(width * height * 3);
+
+    fill_gradient_rgb(image_data, width, height);
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/256x256_rgb_gradient_filter_none.png");
+
+    unsigned error = encode_rgb_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        LFS_ZERO
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+    } else {
+        printf("Generated: %s\n", filename);
+    }
+
+    free(image_data);
+}
+
+void generate_256x256_rgba_noise(void) {
+    unsigned width = 256, height = 256;
+    unsigned char *image_data = (unsigned char *)malloc(width * height * 4);
+
+    fill_noise_rgba(image_data, width, height, 12345);
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/256x256_rgba_noise_filter_paeth.png");
+
+    unsigned error = encode_rgba_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        LFS_FOUR
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+    } else {
+        printf("Generated: %s\n", filename);
+    }
+
+    free(image_data);
+}
+
+void generate_512x512_rgb_checkerboard(void) {
+    unsigned width = 512, height = 512;
+    unsigned char *image_data = (unsigned char *)malloc(width * height * 3);
+
+    fill_checkerboard_rgb(image_data, width, height, 32);
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/512x512_rgb_checkerboard_filter_sub.png");
+
+    unsigned error = encode_rgb_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        LFS_ONE
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+    } else {
+        printf("Generated: %s\n", filename);
+    }
+
+    free(image_data);
+}
+
+void generate_512x512_rgba_noise(void) {
+    unsigned width = 512, height = 512;
+    unsigned char *image_data = (unsigned char *)malloc(width * height * 4);
+
+    fill_noise_rgba(image_data, width, height, 54321);
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/512x512_rgba_noise_filter_average.png");
+
+    unsigned error = encode_rgba_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        LFS_THREE
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+    } else {
+        printf("Generated: %s\n", filename);
+    }
+
+    free(image_data);
+}
+
+void generate_1024x1024_rgb_gradient(void) {
+    unsigned width = 1024, height = 1024;
+    unsigned char *image_data = (unsigned char *)malloc(width * height * 3);
+
+    fill_gradient_rgb(image_data, width, height);
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/1024x1024_rgb_gradient_filter_sub.png");
+
+    unsigned error = encode_rgb_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        LFS_ONE
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+    } else {
+        printf("Generated: %s\n", filename);
+    }
+
+    free(image_data);
+}
+
+void generate_1920x1080_rgba_gradient(void) {
+    unsigned width = 1920, height = 1080;
+    unsigned char *image_data = (unsigned char *)malloc(width * height * 4);
+
+    /* X軸でR増加、Y軸でG増加、B固定、AはXと同じ */
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            unsigned idx = (y * width + x) * 4;
+            image_data[idx] = (unsigned char)((x * 256) / width);      /* R: 0-255 */
+            image_data[idx + 1] = (unsigned char)((y * 256) / height); /* G: 0-255 */
+            image_data[idx + 2] = 128;                                  /* B: constant */
+            image_data[idx + 3] = (unsigned char)((x * 256) / width);  /* A: same as R */
+        }
+    }
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/1920x1080_rgba_gradient_filter_average.png");
+
+    unsigned error = encode_rgba_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        LFS_THREE
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+    } else {
+        printf("Generated: %s\n", filename);
+    }
+
+    free(image_data);
+}
+
 int main(void) {
     /* Create test-data directory if it doesn't exist */
     system("mkdir -p ../test-data");
@@ -452,6 +684,21 @@ int main(void) {
     generate_16x16_rgba_gradient(LFS_THREE, "average");
     printf("\n");
     generate_16x16_rgba_gradient(LFS_FOUR, "paeth");
+
+    /* Large images for benchmarking */
+    printf("\n");
+    printf("\n=== Large Images for Benchmarking ===\n");
+    generate_256x256_rgb_gradient();
+    printf("\n");
+    generate_256x256_rgba_noise();
+    printf("\n");
+    generate_512x512_rgb_checkerboard();
+    printf("\n");
+    generate_512x512_rgba_noise();
+    printf("\n");
+    generate_1024x1024_rgb_gradient();
+    printf("\n");
+    generate_1920x1080_rgba_gradient();
 
     printf("\n\nTest data generation complete!\n");
 
