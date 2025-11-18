@@ -29,10 +29,12 @@ pub fn applyFilters(
     bytes_per_pixel: u32,
 ) ![]u8 {
     // Calculate bytes_per_scanline safely (prevent u32 overflow)
-    const bytes_per_scanline = try std.math.mul(usize, @as(usize, width), @as(usize, bytes_per_pixel));
+    const bytes_per_scanline = std.math.mul(usize, @as(usize, width), @as(usize, bytes_per_pixel))
+        catch return error.InvalidData;
 
     // Calculate total_bytes safely (prevent overflow)
-    const total_bytes = try std.math.mul(usize, bytes_per_scanline, @as(usize, height));
+    const total_bytes = std.math.mul(usize, bytes_per_scanline, @as(usize, height))
+        catch return error.InvalidData;
 
     // Enforce reasonable size limit (e.g., 1GB)
     const max_size = 1024 * 1024 * 1024; // 1 GB

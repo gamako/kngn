@@ -113,7 +113,7 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
     const decompressed = try flate.decompressZlib(allocator, idat_data);
     defer allocator.free(decompressed);
 
-    // Apply filters
+    // Apply filters (map overflow from size checks to InvalidData for public API)
     const filtered = try filter.applyFilters(
         allocator,
         decompressed,
