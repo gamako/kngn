@@ -48,9 +48,19 @@ test "All test cases - IHDR verification" {
                 tc.height,
                 g.step,
             ),
+            .rgb_checkerboard => try test_cases.generateRGBCheckerboardExpected(
+                allocator,
+                tc.width,
+                tc.height,
+            ),
+            .rgb_gradient => try test_cases.generateRGBGradientExpected(
+                allocator,
+                tc.width,
+                tc.height,
+            ),
         };
         defer {
-            if (tc.pattern == .gradient) {
+            if (tc.pattern == .gradient or tc.pattern == .rgb_checkerboard or tc.pattern == .rgb_gradient) {
                 allocator.free(expected_pixels);
             }
         }
@@ -154,6 +164,18 @@ test "Filter - apply filters to decompressed data" {
             .step = 32,
         },
         .{
+            .file_path = "test-data/8x8_gray_filter_average.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/8x8_gray_filter_paeth.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
             .file_path = "test-data/16x16_gray_filter_none.png",
             .width = 16,
             .height = 16,
@@ -167,6 +189,18 @@ test "Filter - apply filters to decompressed data" {
         },
         .{
             .file_path = "test-data/16x16_gray_filter_up.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_average.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_paeth.png",
             .width = 16,
             .height = 16,
             .step = 16,
@@ -258,6 +292,18 @@ test "Format conversion - grayscale to RGBA8888" {
             .step = 32,
         },
         .{
+            .file_path = "test-data/8x8_gray_filter_average.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
+            .file_path = "test-data/8x8_gray_filter_paeth.png",
+            .width = 8,
+            .height = 8,
+            .step = 32,
+        },
+        .{
             .file_path = "test-data/16x16_gray_filter_none.png",
             .width = 16,
             .height = 16,
@@ -271,6 +317,18 @@ test "Format conversion - grayscale to RGBA8888" {
         },
         .{
             .file_path = "test-data/16x16_gray_filter_up.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_average.png",
+            .width = 16,
+            .height = 16,
+            .step = 16,
+        },
+        .{
+            .file_path = "test-data/16x16_gray_filter_paeth.png",
             .width = 16,
             .height = 16,
             .step = 16,
@@ -389,5 +447,125 @@ test "Phase 1 - end-to-end decodePNG test (16x16 grayscale)" {
     for (png_image.pixels) |pixel| {
         const alpha = pixel & 0xFF;
         try std.testing.expectEqual(@as(u32, 0xFF), alpha);
+    }
+}
+
+test "Phase 2 - end-to-end decodePNG test (Average filter)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file with Average filter
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/8x8_gray_filter_average.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 8), png_image.width);
+    try std.testing.expectEqual(@as(u32, 8), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 64), png_image.pixels.len);
+
+    // Verify RGBA values (all pixels should have A=255)
+    for (png_image.pixels) |pixel| {
+        const alpha = pixel & 0xFF;
+        try std.testing.expectEqual(@as(u32, 0xFF), alpha);
+    }
+}
+
+test "Phase 2 - end-to-end decodePNG test (Paeth filter)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file with Paeth filter
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/8x8_gray_filter_paeth.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 8), png_image.width);
+    try std.testing.expectEqual(@as(u32, 8), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 64), png_image.pixels.len);
+
+    // Verify RGBA values (all pixels should have A=255)
+    for (png_image.pixels) |pixel| {
+        const alpha = pixel & 0xFF;
+        try std.testing.expectEqual(@as(u32, 0xFF), alpha);
+    }
+}
+
+test "Phase 2 - end-to-end decodePNG test (RGB checkerboard)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file (RGB format)
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/8x8_rgb_checkerboard_filter_none.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 8), png_image.width);
+    try std.testing.expectEqual(@as(u32, 8), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 64), png_image.pixels.len);
+
+    // Verify RGBA values match checkerboard pattern
+    const expected = try test_cases.generateRGBCheckerboardExpected(allocator, 8, 8);
+    defer allocator.free(expected);
+
+    for (0..64) |i| {
+        try std.testing.expectEqual(expected[i], png_image.pixels[i]);
+    }
+}
+
+test "Phase 2 - end-to-end decodePNG test (RGB gradient)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file (RGB format)
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/16x16_rgb_gradient_filter_none.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 16), png_image.width);
+    try std.testing.expectEqual(@as(u32, 16), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 256), png_image.pixels.len);
+
+    // Verify RGBA values match gradient pattern
+    const expected = try test_cases.generateRGBGradientExpected(allocator, 16, 16);
+    defer allocator.free(expected);
+
+    for (0..256) |i| {
+        try std.testing.expectEqual(expected[i], png_image.pixels[i]);
     }
 }

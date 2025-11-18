@@ -62,6 +62,8 @@ pub fn applyFilters(
                 0 => try filterNone(filt),
                 1 => try filterSub(filt, output, x, bytes_per_pixel, current_scanline_start),
                 2 => try filterUp(filt, output, x, output_pos, bytes_per_scanline),
+                3 => try filterAverage(filt, output, x, output_pos, bytes_per_pixel, bytes_per_scanline),
+                4 => try filterPaeth(filt, output, x, output_pos, bytes_per_pixel, bytes_per_scanline),
                 else => return error.UnsupportedFilterType,
             };
 
@@ -113,4 +115,91 @@ fn filterUp(
         0;
 
     return @truncate(@as(u16, filt) +% above);
+}
+
+/// Filter Average: Recon(x) = Filt(x) + floor((Recon(x - bytes_per_pixel) + Recon(x - bytes_per_scanline)) / 2)
+/// Add the average of the left and above values
+fn filterAverage(
+    filt: u8,
+    output: []u8,
+    x: usize,
+    output_pos: usize,
+    bytes_per_pixel: u32,
+    bytes_per_scanline: usize,
+) !u8 {
+    const left: u8 = if (x >= bytes_per_pixel)
+        output[output_pos - bytes_per_pixel]
+    else
+        0;
+
+    const above: u8 = if (output_pos >= bytes_per_scanline)
+        output[output_pos - bytes_per_scanline]
+    else
+        0;
+
+    // Average: floor((left + above) / 2)
+    const avg = @as(u16, left) +% @as(u16, above);
+    const avg_floor: u8 = @truncate(avg >> 1); // divide by 2
+
+    return @truncate(@as(u16, filt) +% avg_floor);
+}
+
+/// Paeth predictor function
+/// Used by the Paeth filter
+/// Based on PNG spec: p = a + b - c; pa = abs(p - a); pb = abs(p - b); pc = abs(p - c)
+fn paethPredictor(a: u8, b: u8, c: u8) u8 {
+    const a_val: i32 = @as(i32, a);
+    const b_val: i32 = @as(i32, b);
+    const c_val: i32 = @as(i32, c);
+
+    const p = a_val + b_val - c_val;
+
+    // pa = abs(p - a)
+    const p_minus_a = p - a_val;
+    const pa = if (p_minus_a < 0) -p_minus_a else p_minus_a;
+
+    // pb = abs(p - b)
+    const p_minus_b = p - b_val;
+    const pb = if (p_minus_b < 0) -p_minus_b else p_minus_b;
+
+    // pc = abs(p - c)
+    const p_minus_c = p - c_val;
+    const pc = if (p_minus_c < 0) -p_minus_c else p_minus_c;
+
+    return if (pa <= pb and pa <= pc)
+        a
+    else if (pb <= pc)
+        b
+    else
+        c;
+}
+
+/// Filter Paeth: Recon(x) = Filt(x) + PaethPredictor(Recon(x - bytes_per_pixel), Recon(x - bytes_per_scanline), Recon(x - bytes_per_scanline - bytes_per_pixel))
+/// Add the Paeth predicted value
+fn filterPaeth(
+    filt: u8,
+    output: []u8,
+    x: usize,
+    output_pos: usize,
+    bytes_per_pixel: u32,
+    bytes_per_scanline: usize,
+) !u8 {
+    const left: u8 = if (x >= bytes_per_pixel)
+        output[output_pos - bytes_per_pixel]
+    else
+        0;
+
+    const above: u8 = if (output_pos >= bytes_per_scanline)
+        output[output_pos - bytes_per_scanline]
+    else
+        0;
+
+    const upper_left: u8 = if (output_pos >= bytes_per_scanline and x >= bytes_per_pixel)
+        output[output_pos - bytes_per_scanline - bytes_per_pixel]
+    else
+        0;
+
+    const pred = paethPredictor(left, above, upper_left);
+
+    return @truncate(@as(u16, filt) +% pred);
 }
