@@ -245,6 +245,121 @@ void generate_16x16_rgb_gradient(LodePNGFilterStrategy filter_strategy, const ch
     printf("Generated: %s\n", filename);
 }
 
+/* Encode PNG with filter type specification for RGBA color type */
+unsigned encode_rgba_png_with_filter(
+    const char* filename,
+    const unsigned char* image,
+    unsigned width,
+    unsigned height,
+    LodePNGFilterStrategy filter_strategy)
+{
+    LodePNGState state;
+    lodepng_state_init(&state);
+
+    /* Disable auto_convert and explicitly set color type to RGBA */
+    state.encoder.auto_convert = 0;
+    state.info_raw.colortype = LCT_RGBA;
+    state.info_raw.bitdepth = 8;
+    state.info_png.color.colortype = LCT_RGBA;
+    state.info_png.color.bitdepth = 8;
+
+    /* Ensure filter strategy is applied */
+    state.encoder.filter_palette_zero = 0;
+    state.encoder.filter_strategy = filter_strategy;
+
+    unsigned char* png_data = NULL;
+    size_t png_size = 0;
+    unsigned error = lodepng_encode(&png_data, &png_size,
+                                     image, width, height, &state);
+
+    if(!error) {
+        error = lodepng_save_file(png_data, png_size, filename);
+    }
+
+    free(png_data);
+    lodepng_state_cleanup(&state);
+    return error;
+}
+
+/* Generate 8x8 RGBA checkerboard pattern with specified filter */
+void generate_8x8_rgba_checkerboard(LodePNGFilterStrategy filter_strategy, const char* filter_name) {
+    unsigned width = 8, height = 8;
+    unsigned char image_data[8 * 8 * 4];  /* RGBA = 4 bytes per pixel */
+
+    /* Create checkerboard pattern: alternate red (opaque) and blue (semi-transparent) */
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            unsigned idx = (y * width + x) * 4;
+            if ((x + y) % 2 == 0) {
+                /* Red (fully opaque) */
+                image_data[idx] = 255;      /* R */
+                image_data[idx + 1] = 0;    /* G */
+                image_data[idx + 2] = 0;    /* B */
+                image_data[idx + 3] = 255;  /* A */
+            } else {
+                /* Blue (semi-transparent) */
+                image_data[idx] = 0;        /* R */
+                image_data[idx + 1] = 0;    /* G */
+                image_data[idx + 2] = 255;  /* B */
+                image_data[idx + 3] = 128;  /* A: 50% */
+            }
+        }
+    }
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/8x8_rgba_checkerboard_filter_%s.png", filter_name);
+
+    unsigned error = encode_rgba_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        filter_strategy
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+        return;
+    }
+
+    printf("Generated: %s\n", filename);
+}
+
+/* Generate 16x16 RGBA gradient with specified filter */
+void generate_16x16_rgba_gradient(LodePNGFilterStrategy filter_strategy, const char* filter_name) {
+    unsigned width = 16, height = 16;
+    unsigned char image_data[16 * 16 * 4];  /* RGBA = 4 bytes per pixel */
+
+    /* Create RGBA gradient: R increases horizontally, G increases vertically, B stays constant, A varies */
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            unsigned idx = (y * width + x) * 4;
+            image_data[idx] = (unsigned char)(x * 16);      /* R: 0-240 */
+            image_data[idx + 1] = (unsigned char)(y * 16);  /* G: 0-240 */
+            image_data[idx + 2] = 128;                       /* B: constant */
+            image_data[idx + 3] = (unsigned char)(x * 16);  /* A: 0-240 (varies with R) */
+        }
+    }
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "../test-data/16x16_rgba_gradient_filter_%s.png", filter_name);
+
+    unsigned error = encode_rgba_png_with_filter(
+        filename,
+        image_data,
+        width, height,
+        filter_strategy
+    );
+
+    if (error) {
+        printf("Error encoding %s: %u (%s)\n",
+               filename, error, lodepng_error_text(error));
+        return;
+    }
+
+    printf("Generated: %s\n", filename);
+}
+
 int main(void) {
     /* Create test-data directory if it doesn't exist */
     system("mkdir -p ../test-data");
@@ -309,6 +424,34 @@ int main(void) {
     generate_16x16_rgb_gradient(LFS_THREE, "average");
     printf("\n");
     generate_16x16_rgb_gradient(LFS_FOUR, "paeth");
+
+    printf("\n");
+
+    /* 8x8 RGBA checkerboard with different filters */
+    printf("\n=== 8x8 RGBA Checkerboard ===\n");
+    generate_8x8_rgba_checkerboard(LFS_ZERO, "none");
+    printf("\n");
+    generate_8x8_rgba_checkerboard(LFS_ONE, "sub");
+    printf("\n");
+    generate_8x8_rgba_checkerboard(LFS_TWO, "up");
+    printf("\n");
+    generate_8x8_rgba_checkerboard(LFS_THREE, "average");
+    printf("\n");
+    generate_8x8_rgba_checkerboard(LFS_FOUR, "paeth");
+
+    printf("\n");
+
+    /* 16x16 RGBA gradient with different filters */
+    printf("\n=== 16x16 RGBA Gradient ===\n");
+    generate_16x16_rgba_gradient(LFS_ZERO, "none");
+    printf("\n");
+    generate_16x16_rgba_gradient(LFS_ONE, "sub");
+    printf("\n");
+    generate_16x16_rgba_gradient(LFS_TWO, "up");
+    printf("\n");
+    generate_16x16_rgba_gradient(LFS_THREE, "average");
+    printf("\n");
+    generate_16x16_rgba_gradient(LFS_FOUR, "paeth");
 
     printf("\n\nTest data generation complete!\n");
 

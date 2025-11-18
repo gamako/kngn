@@ -78,12 +78,61 @@ pub fn generateRGBGradientExpected(
     return result.toOwnedSlice(allocator);
 }
 
+/// Generate RGBA checkerboard pattern (for testing RGBA format)
+/// Alternates between red (opaque) and blue (semi-transparent)
+pub fn generateRGBACheckerboardExpected(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+) ![]u32 {
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const rgba = if ((x + y) % 2 == 0)
+                @as(u32, 0xFF0000FF)  // Red (fully opaque)
+            else
+                @as(u32, 0x0000FF80); // Blue (semi-transparent, A=128)
+            try result.append(allocator, rgba);
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Generate RGBA gradient pattern (for testing RGBA format)
+/// R increases horizontally, G increases vertically, B stays constant, A varies with R
+pub fn generateRGBAGradientExpected(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+) ![]u32 {
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const r = @as(u32, @intCast(x * 16));
+            const g = @as(u32, @intCast(y * 16));
+            const b: u32 = 128;
+            const a: u32 = @as(u32, @intCast(x * 16)); // Alpha varies with R
+            const rgba = (r << 24) | (g << 16) | (b << 8) | a;
+            try result.append(allocator, rgba);
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
 /// Pattern type for test cases
 pub const PatternType = union(enum) {
     hardcoded: []const u32,                      // For fixed test cases
     gradient: struct { step: u8 },               // For grayscale gradient patterns
     rgb_checkerboard: void,                      // For RGB checkerboard pattern
     rgb_gradient: void,                          // For RGB gradient pattern
+    rgba_checkerboard: void,                     // For RGBA checkerboard pattern
+    rgba_gradient: void,                         // For RGBA gradient pattern
 };
 
 /// Test case metadata
@@ -244,5 +293,76 @@ pub const test_cases = [_]TestCase{
         .width = 16,
         .height = 16,
         .pattern = .{ .rgb_gradient = {} },
+    },
+    // Phase 3: RGBA format test cases
+    .{
+        .name = "8x8 RGBA Checkerboard (Filter None)",
+        .file_path = "test-data/8x8_rgba_checkerboard_filter_none.png",
+        .width = 8,
+        .height = 8,
+        .pattern = .{ .rgba_checkerboard = {} },
+    },
+    .{
+        .name = "8x8 RGBA Checkerboard (Filter Sub)",
+        .file_path = "test-data/8x8_rgba_checkerboard_filter_sub.png",
+        .width = 8,
+        .height = 8,
+        .pattern = .{ .rgba_checkerboard = {} },
+    },
+    .{
+        .name = "8x8 RGBA Checkerboard (Filter Up)",
+        .file_path = "test-data/8x8_rgba_checkerboard_filter_up.png",
+        .width = 8,
+        .height = 8,
+        .pattern = .{ .rgba_checkerboard = {} },
+    },
+    .{
+        .name = "8x8 RGBA Checkerboard (Filter Average)",
+        .file_path = "test-data/8x8_rgba_checkerboard_filter_average.png",
+        .width = 8,
+        .height = 8,
+        .pattern = .{ .rgba_checkerboard = {} },
+    },
+    .{
+        .name = "8x8 RGBA Checkerboard (Filter Paeth)",
+        .file_path = "test-data/8x8_rgba_checkerboard_filter_paeth.png",
+        .width = 8,
+        .height = 8,
+        .pattern = .{ .rgba_checkerboard = {} },
+    },
+    .{
+        .name = "16x16 RGBA Gradient (Filter None)",
+        .file_path = "test-data/16x16_rgba_gradient_filter_none.png",
+        .width = 16,
+        .height = 16,
+        .pattern = .{ .rgba_gradient = {} },
+    },
+    .{
+        .name = "16x16 RGBA Gradient (Filter Sub)",
+        .file_path = "test-data/16x16_rgba_gradient_filter_sub.png",
+        .width = 16,
+        .height = 16,
+        .pattern = .{ .rgba_gradient = {} },
+    },
+    .{
+        .name = "16x16 RGBA Gradient (Filter Up)",
+        .file_path = "test-data/16x16_rgba_gradient_filter_up.png",
+        .width = 16,
+        .height = 16,
+        .pattern = .{ .rgba_gradient = {} },
+    },
+    .{
+        .name = "16x16 RGBA Gradient (Filter Average)",
+        .file_path = "test-data/16x16_rgba_gradient_filter_average.png",
+        .width = 16,
+        .height = 16,
+        .pattern = .{ .rgba_gradient = {} },
+    },
+    .{
+        .name = "16x16 RGBA Gradient (Filter Paeth)",
+        .file_path = "test-data/16x16_rgba_gradient_filter_paeth.png",
+        .width = 16,
+        .height = 16,
+        .pattern = .{ .rgba_gradient = {} },
     },
 };

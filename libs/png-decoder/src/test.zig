@@ -58,9 +58,19 @@ test "All test cases - IHDR verification" {
                 tc.width,
                 tc.height,
             ),
+            .rgba_checkerboard => try test_cases.generateRGBACheckerboardExpected(
+                allocator,
+                tc.width,
+                tc.height,
+            ),
+            .rgba_gradient => try test_cases.generateRGBAGradientExpected(
+                allocator,
+                tc.width,
+                tc.height,
+            ),
         };
         defer {
-            if (tc.pattern == .gradient or tc.pattern == .rgb_checkerboard or tc.pattern == .rgb_gradient) {
+            if (tc.pattern == .gradient or tc.pattern == .rgb_checkerboard or tc.pattern == .rgb_gradient or tc.pattern == .rgba_checkerboard or tc.pattern == .rgba_gradient) {
                 allocator.free(expected_pixels);
             }
         }
@@ -563,6 +573,68 @@ test "Phase 2 - end-to-end decodePNG test (RGB gradient)" {
 
     // Verify RGBA values match gradient pattern
     const expected = try test_cases.generateRGBGradientExpected(allocator, 16, 16);
+    defer allocator.free(expected);
+
+    for (0..256) |i| {
+        try std.testing.expectEqual(expected[i], png_image.pixels[i]);
+    }
+}
+
+test "Phase 3 - end-to-end decodePNG test (RGBA checkerboard)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file (RGBA format)
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/8x8_rgba_checkerboard_filter_none.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 8), png_image.width);
+    try std.testing.expectEqual(@as(u32, 8), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 64), png_image.pixels.len);
+
+    // Verify RGBA values match checkerboard pattern (with transparency)
+    const expected = try test_cases.generateRGBACheckerboardExpected(allocator, 8, 8);
+    defer allocator.free(expected);
+
+    for (0..64) |i| {
+        try std.testing.expectEqual(expected[i], png_image.pixels[i]);
+    }
+}
+
+test "Phase 3 - end-to-end decodePNG test (RGBA gradient)" {
+    const allocator = std.testing.allocator;
+
+    // Read PNG file (RGBA format)
+    const file_data = try std.fs.cwd().readFileAlloc(
+        "test-data/16x16_rgba_gradient_filter_none.png",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(file_data);
+
+    // Decode PNG
+    var png_image = try lib.decodePNG(allocator, file_data);
+    defer png_image.deinit(allocator);
+
+    // Verify dimensions
+    try std.testing.expectEqual(@as(u32, 16), png_image.width);
+    try std.testing.expectEqual(@as(u32, 16), png_image.height);
+
+    // Verify pixel count
+    try std.testing.expectEqual(@as(usize, 256), png_image.pixels.len);
+
+    // Verify RGBA values match gradient pattern (with varying alpha)
+    const expected = try test_cases.generateRGBAGradientExpected(allocator, 16, 16);
     defer allocator.free(expected);
 
     for (0..256) |i| {
