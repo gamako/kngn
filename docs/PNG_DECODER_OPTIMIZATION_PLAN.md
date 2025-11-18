@@ -393,17 +393,21 @@ while (i < rgb_data.len) : (i += 3) {
 
 ## 3. 実装順序と進行管理
 
-### ステップ 0: ベンチマーク環境構築
+### ステップ 0: ベンチマーク環境構築 ✅ **完了**
 - [x] `libs/png-decoder/docs/` ディレクトリを作成 ✅
 - [x] `libs/png-decoder/docs/BENCHMARKS.md` を作成 ✅
-- [ ] **テスト画像生成（libs/png-decoder/tools/generate_test_data.c 拡張）**
-  - [ ] 大サイズ画像生成関数を追加（256x256, 512x512, 1024x1024, 1920x1080）
-  - [ ] ノイズ生成関数を実装（固定シード PCG32）
-  - [ ] generate_test_data を実行して画像を生成
-  - [ ] BENCHMARKS.md の画像リストを更新
-- [ ] `libs/png-decoder/src/benchmark.zig` を作成
-- [ ] `libs/png-decoder/build.zig` に `zig build benchmark` コマンド追加
-- [ ] **ベースライン測定を実施し BENCHMARKS.md に記録**
+- [x] **テスト画像生成（libs/png-decoder/tools/generate_test_data.c 拡張）** ✅
+  - [x] PCG32 PRNG 実装を追加（固定シード対応）
+  - [x] パターン生成ヘルパー関数 3 種類を実装（グラデーション、チェッカーボード、ノイズ）
+  - [x] 大サイズ画像生成関数を追加（256x256, 512x512, 1024x1024, 1920x1080）
+  - [x] generate_test_data を実行して画像を生成（22 個のテスト画像）
+  - [x] BENCHMARKS.md にテスト画像リストと計測結果を記録
+- [x] `libs/png-decoder/src/benchmark.zig` を作成 ✅
+- [x] `libs/png-decoder/build.zig` に `zig build benchmark` コマンド追加 ✅
+- [x] **ベースライン測定を実施し BENCHMARKS.md に記録** ✅
+  - 計測環境：Apple M1 Pro, Zig 0.16.0-dev, macOS 14.6
+  - メイン計測画像（1920x1080 RGBA）：1788.77μs/100回（約 1.79ms/回）
+  - 全テスト通過：29/29（100%）
 
 ### 実装パスの選択
 
@@ -420,7 +424,7 @@ while (i < rgb_data.len) : (i += 3) {
 2. **ステップ 2: Phase 1.1/1.2 - 即効性の高い改善**
    - Phase 1.3 完了後に実施（影響範囲が限定的）
 
-#### 推奨パス B: 小さいサイクル優先（段階的改善）
+#### 推奨パス B: 小さいサイクル優先（段階的改善）⭐ **推奨**
 リスク最小化しつつ即効性を得る：
 
 1. **ステップ 1: Phase 1.1 - format.zig 事前アロケーション化**
@@ -451,10 +455,11 @@ while (i < rgb_data.len) : (i += 3) {
 - Phase 1.3 の設計に十分な時間がある
 - リスク管理体制が整っている
 
-**パス B（段階的改善）を選ぶべき場合：**
+**パス B（段階的改善）を選ぶべき場合：** ⭐ **推奨**
 - 安定性を優先したい
 - 短期間で改善を可視化したい
 - Phase 1.3 の設計に不確実性がある
+- **Phase 0 完了後の実装戦略として最適**（各改善の効果を計測しながら進めることができる）
 
 ---
 
