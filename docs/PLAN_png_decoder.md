@@ -16,11 +16,12 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 ## 実装進捗
 
 ### 現在の状況
-**Phase 3 (RGBA)**: ✅ 完全完了！
+**Phase 3 (RGBA) + CRC検証**: ✅ 完全完了！
 
 - **Phase 1 (Grayscale)**: ✅ 9/9完了 - PNG署名確認、チャンク解析、zlib解凍、フィルタ（None/Sub/Up）対応
 - **Phase 2 (RGB)**: ✅ 完全完了 - RGB色形式対応、Average/Paethフィルタ実装、16個のRGBテストケース
 - **Phase 3 (RGBA)**: ✅ 完全完了 - RGBA色形式対応、アルファチャンネル処理、10個のRGBAテストケース、全25テスト合格
+- **CRC検証機能**: ✅ 完全完了 - PNG仕様準拠のCRC-32 ISO HDLC検証、全29テスト合格
 
 ### 完了項目
 
@@ -57,6 +58,18 @@ PNG画像ファイルをデコードし、ピクセルデータ（RGBA8888形式
 - ✅ Phase 3統合テスト実装（2個のエンドツーエンドテスト）
 - ✅ 全25テスト合格（Phase 1-3 全テスト）
 - ✅ フォント/スプライト用途で使用可能に
+
+#### CRC検証機能 完了項目
+- ✅ std.hash.crc.Crc32IsoHdlc を使用した CRC-32 実装
+- ✅ calculateChunkCRC() 関数実装
+- ✅ verifyChunkCRC() 関数実装
+- ✅ ChunkIterator.next() に自動CRC検証統合
+- ✅ lib.zig の decodePNG() を修正（ChunkIterator経由でIHDR読込）
+- ✅ DecodingError に InvalidCRC エラー型追加
+- ✅ CRC計算・検証テストケース 5個追加
+- ✅ 既存テスト 24個の後退がない
+- ✅ **全29テスト合格**（Phase 1-3 + CRC検証）
+- ✅ 破損PNG ファイル検出機能完成
 
 ### 次のステップ
 
@@ -767,15 +780,12 @@ RGB色形式対応
 
 PNGの各チャンクは CRC（循環冗長符号）でデータ整合性を検証できます。
 
-**選択肢1: Phase 1では実装しない**
-- テストが成功するまで最小限に保つ
-- Phase 2で `error.InvalidCRC` を実装
-
-**選択肢2: Phase 1で実装**
-- 腐ったPNGを早期に検出
-- 実装コスト追加
-
-**推奨: Phase 1では実装しない** （テスト駆動の優先）
+**実装結果: ✅ Phase 3完了後に実装**
+- std.hash.crc.Crc32IsoHdlc を使用した PNG仕様準拠のCRC-32検証
+- ChunkIterator.next() に自動統合
+- 全チャンク（IHDR、IDAT等）の破損を自動検出
+- 5個のテストケース追加で動作確認完了
+- 既存テスト 24個の後退なし、全29テスト合格
 
 ### 最大画像サイズの制限
 
