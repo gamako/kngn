@@ -23,6 +23,7 @@ pub const DecodingError = error{
     InvalidChunkSize,
     InvalidDimensions,
     UnsupportedColorType,
+    UnsupportedFormat,
     DecompressionFailed,
     OutOfMemory,
     WriteFailed,
@@ -71,6 +72,27 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
     // Validate dimensions
     if (ihdr.width == 0 or ihdr.height == 0) {
         return error.InvalidDimensions;
+    }
+
+    // Validate IHDR format fields (must match PNG specification)
+    // Only support 8-bit depth
+    if (ihdr.bit_depth != 8) {
+        return error.UnsupportedFormat;
+    }
+
+    // Only support compression method 0 (deflate)
+    if (ihdr.compression != 0) {
+        return error.UnsupportedFormat;
+    }
+
+    // Only support filter method 0 (adaptive filtering)
+    if (ihdr.filter != 0) {
+        return error.UnsupportedFormat;
+    }
+
+    // Only support non-interlaced images (interlace = 0)
+    if (ihdr.interlace != 0) {
+        return error.UnsupportedFormat;
     }
 
     // Determine bytes per pixel based on color type

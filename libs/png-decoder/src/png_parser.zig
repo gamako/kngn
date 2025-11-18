@@ -120,6 +120,7 @@ pub fn parseIHDR(chunk: Chunk) !IHDRInfo {
 /// Returns a newly allocated slice containing concatenated IDAT data
 pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     var idat_buffer: std.ArrayList(u8) = .empty;
+    errdefer idat_buffer.deinit(allocator);
 
     var iter = ChunkIterator.init(data);
     while (try iter.next()) |chunk| {
