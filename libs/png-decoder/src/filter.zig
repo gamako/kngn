@@ -231,3 +231,84 @@ fn filterPaeth(
 
     return @truncate(@as(u16, filt) +% pred);
 }
+
+// ============================================================================
+// Phase 1.3 optimization: Direct filter functions for scanline-based processing
+// These functions apply filters without allocating an intermediate buffer,
+// working directly on a scanline buffer for in-place filtering.
+// ============================================================================
+
+/// Direct Filter Sub: works on scanline buffer
+/// Reconstructed(x) = Filtered(x) + Reconstructed(x - bytes_per_pixel)
+pub fn filterSubDirect(
+    filt: u8,
+    scanline: []u8,
+    x: usize,
+    bytes_per_pixel: u32,
+) u8 {
+    const left: u8 = if (x >= bytes_per_pixel)
+        scanline[x - bytes_per_pixel]
+    else
+        0;
+
+    return @truncate(@as(u16, filt) +% left);
+}
+
+/// Direct Filter Up: works with previous scanline buffer
+/// Reconstructed(x) = Filtered(x) + Reconstructed(x - bytes_per_scanline)
+pub fn filterUpDirect(
+    filt: u8,
+    previous_scanline: []const u8,
+    x: usize,
+) u8 {
+    const above: u8 = previous_scanline[x];
+    return @truncate(@as(u16, filt) +% above);
+}
+
+/// Direct Filter Average: works with previous scanline and current scanline
+/// Reconstructed(x) = Filtered(x) + floor((Reconstructed(x - bytes_per_pixel) + Reconstructed(x - bytes_per_scanline)) / 2)
+pub fn filterAverageDirect(
+    filt: u8,
+    current_scanline: []u8,
+    previous_scanline: []const u8,
+    x: usize,
+    bytes_per_pixel: u32,
+) u8 {
+    const left: u8 = if (x >= bytes_per_pixel)
+        current_scanline[x - bytes_per_pixel]
+    else
+        0;
+
+    const above: u8 = previous_scanline[x];
+
+    const avg = @as(u16, left) +% @as(u16, above);
+    const avg_floor: u8 = @truncate(avg >> 1);
+
+    return @truncate(@as(u16, filt) +% avg_floor);
+}
+
+/// Direct Filter Paeth: works with previous scanline and current scanline
+/// Reconstructed(x) = Filtered(x) + PaethPredictor(Reconstructed(x - bytes_per_pixel), Reconstructed(x - bytes_per_scanline), Reconstructed(x - bytes_per_scanline - bytes_per_pixel))
+pub fn filterPaethDirect(
+    filt: u8,
+    current_scanline: []u8,
+    previous_scanline: []const u8,
+    x: usize,
+    bytes_per_pixel: u32,
+) u8 {
+    const left: u8 = if (x >= bytes_per_pixel)
+        current_scanline[x - bytes_per_pixel]
+    else
+        0;
+
+    const above: u8 = previous_scanline[x];
+
+    const upper_left: u8 = if (x >= bytes_per_pixel)
+        previous_scanline[x - bytes_per_pixel]
+    else
+        0;
+
+    const pred = paethPredictor(left, above, upper_left);
+
+    return @truncate(@as(u16, filt) +% pred);
+}
