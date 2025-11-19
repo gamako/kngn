@@ -13,18 +13,19 @@ pub fn grayscaleToRGBA8888(
     allocator: std.mem.Allocator,
     grayscale_data: []const u8,
 ) ![]u32 {
-    var result: std.ArrayList(u32) = .empty;
-    defer result.deinit(allocator);
+    // Pre-allocate exact output size to avoid dynamic reallocation
+    const result = try allocator.alloc(u32, grayscale_data.len);
+    errdefer allocator.free(result);
 
-    for (grayscale_data) |gray| {
+    for (grayscale_data, 0..) |gray, i| {
         // Gray value replicated to R, G, B
         // Format: 0xRRGGBBAA
         const rgba = (@as(u32, gray) << 24) | (@as(u32, gray) << 16) |
                      (@as(u32, gray) << 8) | 0xFF;
-        try result.append(allocator, rgba);
+        result[i] = rgba;
     }
 
-    return result.toOwnedSlice(allocator);
+    return result;
 }
 
 /// Convert RGB (8-bit, 3 bytes per pixel) to RGBA8888
@@ -38,10 +39,13 @@ pub fn rgbToRGBA8888(
 ) ![]u32 {
     std.debug.assert(rgb_data.len % 3 == 0);
 
-    var result: std.ArrayList(u32) = .empty;
-    defer result.deinit(allocator);
+    // Pre-allocate exact output size to avoid dynamic reallocation
+    const output_size = rgb_data.len / 3;
+    const result = try allocator.alloc(u32, output_size);
+    errdefer allocator.free(result);
 
     var i: usize = 0;
+    var out_idx: usize = 0;
     while (i < rgb_data.len) : (i += 3) {
         const r = rgb_data[i];
         const g = rgb_data[i + 1];
@@ -50,10 +54,11 @@ pub fn rgbToRGBA8888(
         // Format: 0xRRGGBBAA
         const rgba = (@as(u32, r) << 24) | (@as(u32, g) << 16) |
                      (@as(u32, b) << 8) | 0xFF;
-        try result.append(allocator, rgba);
+        result[out_idx] = rgba;
+        out_idx += 1;
     }
 
-    return result.toOwnedSlice(allocator);
+    return result;
 }
 
 /// Convert RGBA (8-bit, 4 bytes per pixel) to RGBA8888
@@ -67,10 +72,13 @@ pub fn rgbaToRGBA8888(
 ) ![]u32 {
     std.debug.assert(rgba_data.len % 4 == 0);
 
-    var result: std.ArrayList(u32) = .empty;
-    defer result.deinit(allocator);
+    // Pre-allocate exact output size to avoid dynamic reallocation
+    const output_size = rgba_data.len / 4;
+    const result = try allocator.alloc(u32, output_size);
+    errdefer allocator.free(result);
 
     var i: usize = 0;
+    var out_idx: usize = 0;
     while (i < rgba_data.len) : (i += 4) {
         const r = rgba_data[i];
         const g = rgba_data[i + 1];
@@ -80,10 +88,11 @@ pub fn rgbaToRGBA8888(
         // Format: 0xRRGGBBAA
         const rgba = (@as(u32, r) << 24) | (@as(u32, g) << 16) |
                      (@as(u32, b) << 8) | @as(u32, a);
-        try result.append(allocator, rgba);
+        result[out_idx] = rgba;
+        out_idx += 1;
     }
 
-    return result.toOwnedSlice(allocator);
+    return result;
 }
 
 // Unit tests
