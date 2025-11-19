@@ -3,6 +3,10 @@ const Allocator = std.mem.Allocator;
 
 /// ProfiledAllocator はメモリ割り当てを追跡し、統計情報を提供するアロケータラッパーです。
 /// ピークメモリ使用量、現在のメモリ使用量、割り当て回数を追跡します。
+///
+/// **注意**: このアロケータは単一スレッド専用です。
+/// 複数スレッドから同時にアクセスするとデータ競合が発生し、未定義動作となります。
+/// マルチスレッド環境では、各スレッドで独立した ProfiledAllocator インスタンスを使用してください。
 pub const ProfiledAllocator = struct {
     child_allocator: Allocator,
     current_bytes: usize,
@@ -41,8 +45,11 @@ pub const ProfiledAllocator = struct {
 
     /// 統計情報の構造体
     pub const Stats = struct {
+        /// 現在のメモリ使用量（バイト単位）
         current_bytes: usize,
+        /// ピークメモリ使用量（バイト単位）- reset() 以降の最大値
         peak_bytes: usize,
+        /// 累積割り当て成功回数 - 解放時には減らない
         allocation_count: usize,
     };
 
@@ -73,7 +80,7 @@ pub const ProfiledAllocator = struct {
         // 統計を更新（長さ 0 の割り当ては無視）
         if (len > 0) {
             self.current_bytes += len;
-            self.allocation_count += 1;
+            self.allocation_count += 1; // 累積カウント（解放時に減らさない）
             if (self.current_bytes > self.peak_bytes) {
                 self.peak_bytes = self.current_bytes;
             }
@@ -101,7 +108,9 @@ pub const ProfiledAllocator = struct {
                     self.peak_bytes = self.current_bytes;
                 }
             } else {
-                self.current_bytes -= (old_len - new_len);
+                const delta = old_len - new_len;
+                std.debug.assert(self.current_bytes >= delta); // アンダーフロー検出
+                self.current_bytes -= delta;
             }
         }
         return success;
@@ -126,7 +135,9 @@ pub const ProfiledAllocator = struct {
                 self.peak_bytes = self.current_bytes;
             }
         } else {
-            self.current_bytes -= (old_len - new_len);
+            const delta = old_len - new_len;
+            std.debug.assert(self.current_bytes >= delta); // アンダーフロー検出
+            self.current_bytes -= delta;
         }
 
         return result;
@@ -142,6 +153,7 @@ pub const ProfiledAllocator = struct {
 
         // 統計を更新（長さ 0 の解放は無視）
         if (buf.len > 0) {
+            std.debug.assert(self.current_bytes >= buf.len); // アンダーフロー検出
             self.current_bytes -= buf.len;
         }
 
