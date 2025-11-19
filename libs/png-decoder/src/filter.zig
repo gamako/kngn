@@ -60,26 +60,43 @@ pub fn applyFilters(
         // Get the current scanline (for filters that reference previous scanline)
         const current_scanline_start = output_pos;
 
-        // Process each byte in this scanline based on filter type
-        for (0..bytes_per_scanline) |x| {
-            if (input_pos >= decompressed.len) {
+        // Optimization: For filter type 0 (None), use memcpy instead of byte-by-byte loop
+        if (filter_type == 0) {
+            // Verify sufficient data available
+            if (input_pos + bytes_per_scanline > decompressed.len) {
                 return error.InvalidData;
             }
 
-            const filt = decompressed[input_pos];
-            input_pos += 1;
+            // Copy entire scanline at once
+            @memcpy(
+                output[output_pos..output_pos + bytes_per_scanline],
+                decompressed[input_pos..input_pos + bytes_per_scanline],
+            );
 
-            const recon = switch (filter_type) {
-                0 => try filterNone(filt),
-                1 => try filterSub(filt, output, x, bytes_per_pixel, current_scanline_start),
-                2 => try filterUp(filt, output, x, output_pos, bytes_per_scanline),
-                3 => try filterAverage(filt, output, x, output_pos, bytes_per_pixel, bytes_per_scanline),
-                4 => try filterPaeth(filt, output, x, output_pos, bytes_per_pixel, bytes_per_scanline),
-                else => return error.UnsupportedFilterType,
-            };
+            input_pos += bytes_per_scanline;
+            output_pos += bytes_per_scanline;
+        } else {
+            // Process each byte in this scanline based on filter type (types 1-4)
+            for (0..bytes_per_scanline) |x| {
+                if (input_pos >= decompressed.len) {
+                    return error.InvalidData;
+                }
 
-            output[output_pos] = recon;
-            output_pos += 1;
+                const filt = decompressed[input_pos];
+                input_pos += 1;
+
+                const recon = switch (filter_type) {
+                    0 => unreachable, // Handled above
+                    1 => try filterSub(filt, output, x, bytes_per_pixel, current_scanline_start),
+                    2 => try filterUp(filt, output, x, output_pos, bytes_per_scanline),
+                    3 => try filterAverage(filt, output, x, output_pos, bytes_per_pixel, bytes_per_scanline),
+                    4 => try filterPaeth(filt, output, x, output_pos, bytes_per_pixel, bytes_per_scanline),
+                    else => return error.UnsupportedFilterType,
+                };
+
+                output[output_pos] = recon;
+                output_pos += 1;
+            }
         }
     }
 
