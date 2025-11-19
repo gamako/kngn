@@ -147,33 +147,35 @@ generate_1920x1080_rgba_gradient();
 
 **メモリ計測の詳細:**
 
-std.heap.GeneralPurposeAllocator は全体統計を提供しますが、行バッファ再利用時のピーク値を正確に捉えるため、以下の方法を推奨：
+Zig 0.16.0-dev には std.heap.ProfiledAllocator が未実装のため、カスタム実装を使用：
 
 ```zig
-// ProfiledAllocator による詳細追跡
-var profiled_allocator = std.heap.ProfiledAllocator(std.heap.GeneralPurposeAllocator(.{})){
-    .backing_allocator = undefined,
-};
+// カスタム ProfiledAllocator を使用（libs/png-decoder/src/profiled_allocator.zig）
+const ProfiledAllocator = @import("profiled_allocator.zig").ProfiledAllocator;
+
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 defer _ = gpa.deinit();
-profiled_allocator.backing_allocator = gpa.allocator();
 
-const allocator = profiled_allocator.allocator();
+var profiled = ProfiledAllocator.init(gpa.allocator());
 
 // ベンチマーク前にリセット
-profiled_allocator.reset();
+profiled.reset();
 
 // デコード処理
+const allocator = profiled.allocator();
 var image = try lib.decodePNG(allocator, file_data);
 defer image.deinit(allocator);
 
 // 統計を確認
-const peak_bytes = profiled_allocator.stats.peak_allocated_bytes;
-std.debug.print("Peak bytes: {}\n", .{peak_bytes});
+const stats = profiled.getStats();
+std.debug.print("Peak bytes: {}\n", .{stats.peak_bytes});
+std.debug.print("Allocations: {}\n", .{stats.allocation_count});
 ```
 
+**実装済み:** ProfiledAllocator は `libs/png-decoder/src/profiled_allocator.zig` に実装済み。
+
 **出力:**
-- ベースライン測定結果を BENCHMARKS.md に記録
+- ベースライン測定結果を BENCHMARKS.md に記録（メモリ計測値含む）
 - 各Phase後の改善率を比較可能に
 
 ---

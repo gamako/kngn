@@ -41,23 +41,23 @@
 
 ### エンドツーエンドデコード速度
 
-| Image File | Image Size | Format    | Filter  | Time (μs) | Throughput (MP/s) | Note |
-|------------|------------|-----------|---------|-----------|-------------------|------|
-| 1x1_grayscale.png | 1x1 | Grayscale | None | 1998.00 | 0.00 | 最小テストケース |
-| 8x8_gray_filter_none.png | 8x8 | Grayscale | None | 2020.00 | 0.03 | 小規模画像 |
-| 16x16_gray_filter_none.png | 16x16 | Grayscale | None | 2442.00 | 0.10 | 小規模画像 |
-| 256x256_rgb_gradient_filter_none.png | 256x256 | RGB | None | 21880.00 | 3.00 | 中規模画像 |
-| 256x256_rgba_noise_filter_paeth.png | 256x256 | RGBA | Paeth | 33415.00 | 1.96 | ノイズ + 複雑フィルタ |
-| 512x512_rgb_checkerboard_filter_sub.png | 512x512 | RGB | Sub | 20540.00 | 12.76 | 高周波パターン |
-| 512x512_rgba_noise_filter_average.png | 512x512 | RGBA | Average | 98535.00 | 2.66 | ノイズ + Average フィルタ |
-| 1024x1024_rgb_gradient_filter_sub.png | 1024x1024 | RGB | Sub | 67559.00 | 15.52 | 大規模画像 |
-| 1920x1080_rgba_gradient_filter_average.png | 1920x1080 | RGBA | Average | 181022.00 | 11.45 | ベンチマーク主力 |
+| Image File | Image Size | Format    | Filter  | Time (μs) | Throughput (MP/s) | Memory (KB) | Note |
+|------------|------------|-----------|---------|-----------|-------------------|-------------|------|
+| 1x1_grayscale.png | 1x1 | Grayscale | None | 2145.00 | 0.00 | 64 | 最小テストケース |
+| 8x8_gray_filter_none.png | 8x8 | Grayscale | None | 2174.00 | 0.03 | 64 | 小規模画像 |
+| 16x16_gray_filter_none.png | 16x16 | Grayscale | None | 2667.00 | 0.10 | 65 | 小規模画像 |
+| 256x256_rgb_gradient_filter_none.png | 256x256 | RGB | None | 21804.00 | 3.01 | 1168 | 中規模画像 |
+| 256x256_rgba_noise_filter_paeth.png | 256x256 | RGBA | Paeth | 33790.00 | 1.94 | 1407 | ノイズ + 複雑フィルタ |
+| 512x512_rgb_checkerboard_filter_sub.png | 512x512 | RGB | Sub | 20371.00 | 12.87 | 3696 | 高周波パターン |
+| 512x512_rgba_noise_filter_average.png | 512x512 | RGBA | Average | 99500.00 | 2.63 | 5228 | ノイズ + Average フィルタ |
+| 1024x1024_rgb_gradient_filter_sub.png | 1024x1024 | RGB | Sub | 67335.00 | 15.57 | 13430 | 大規模画像 |
+| 1920x1080_rgba_gradient_filter_average.png | 1920x1080 | RGBA | Average | 178777.00 | 11.60 | 32604 | ベンチマーク主力 |
 
 **計測方法:**
 - std.time.Timer でデコード処理時間を計測
 - 各イメージ 100 回実行の平均時間
 - ウォームアップ実行 1 回（結果除外）
-- メモリ計測は未実装（今後 ProfiledAllocator で追加予定）
+- カスタム ProfiledAllocator でピークメモリ使用量を計測
 
 ### フィルタタイプ別の処理時間
 

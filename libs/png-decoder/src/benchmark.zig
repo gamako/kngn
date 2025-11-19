@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const lib = @import("lib.zig");
+const ProfiledAllocator = @import("profiled_allocator.zig").ProfiledAllocator;
 
 const TestImage = struct {
     path: []const u8,
@@ -24,10 +25,11 @@ const test_images = [_]TestImage{
 const ITERATIONS = 100;
 
 pub fn main() !void {
-    // Use GeneralPurposeAllocator for allocation
+    // Use GeneralPurposeAllocator with ProfiledAllocator wrapper for memory tracking
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+
+    var profiled = ProfiledAllocator.init(gpa.allocator());
 
     // Print header
     std.debug.print("\n=== PNG Decoder Benchmark ===\n", .{});
@@ -41,7 +43,7 @@ pub fn main() !void {
 
     // Benchmark each test image
     for (test_images) |test_image| {
-        benchmarkImage(allocator, test_image) catch {
+        benchmarkImage(&profiled, test_image) catch {
             std.debug.print("{s:<35} Benchmark failed\n", .{test_image.name});
             continue;
         };
@@ -50,7 +52,11 @@ pub fn main() !void {
     std.debug.print("\n", .{});
 }
 
-fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
+fn benchmarkImage(profiled: *ProfiledAllocator, test_image: TestImage) !void {
+    // Use child allocator for file I/O (not tracked)
+    const file_allocator = profiled.child_allocator;
+    // Use profiled allocator for PNG decoding (tracked)
+    const allocator = profiled.allocator();
 
     // Try to read the image file
     var file = std.fs.cwd().openFile(test_image.path, .{}) catch {
@@ -60,8 +66,8 @@ fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
     defer file.close();
 
     const file_size = try file.getEndPos();
-    const file_data = try allocator.alloc(u8, file_size);
-    defer allocator.free(file_data);
+    const file_data = try file_allocator.alloc(u8, file_size);
+    defer file_allocator.free(file_data);
 
     _ = try file.readAll(file_data);
 
@@ -73,6 +79,9 @@ fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
         };
         defer image.deinit(allocator);
     }
+
+    // Reset profiler stats before main benchmark
+    profiled.reset();
 
     // Benchmark runs
     var timer = try std.time.Timer.start();
@@ -95,11 +104,15 @@ fn benchmarkImage(allocator: std.mem.Allocator, test_image: TestImage) !void {
     const seconds = @as(f64, @floatFromInt(avg_us)) / 1_000_000.0;
     const throughput = megapixels / seconds;
 
+    // Get profiler statistics
+    const stats = profiled.getStats();
+    const peak_kb = stats.peak_bytes / 1024;
+
     // Format and print results
     const size_str = formatSize(first_image.width, first_image.height);
 
-    std.debug.print("{s:<35} {s:>12} {d:>15.2} {d:>15.2} {s:>12}\n",
-        .{ test_image.name, size_str, @as(f64, @floatFromInt(avg_us)), throughput, "N/A" });
+    std.debug.print("{s:<35} {s:>12} {d:>15.2} {d:>15.2} {d:>12}\n",
+        .{ test_image.name, size_str, @as(f64, @floatFromInt(avg_us)), throughput, peak_kb });
 }
 
 fn formatSize(width: u32, height: u32) [20]u8 {
