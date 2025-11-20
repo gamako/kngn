@@ -53,8 +53,8 @@ pub fn decompressZlib(
 /// Uses Decompress to read PNG scanlines without buffering full decompressed data
 /// This eliminates the 8.3MB decompressed buffer for large images
 pub const ScanlineDecoder = struct {
-    idat_data: []const u8,  // Concatenated IDAT data
-    idat_reader: std.Io.Reader,  // Reader for IDAT data
+    idat_data: []const u8, // Concatenated IDAT data
+    idat_reader: std.Io.Reader, // Reader for IDAT data
 
     decompressor: std.compress.flate.Decompress,
     window_buffer: []u8,
@@ -153,7 +153,7 @@ pub const ScanlineDecoder = struct {
 
         self.scanlines_read += 1;
 
-        return self.previous_scanline;  // Return the filtered data (now in previous buffer)
+        return self.previous_scanline; // Return the filtered data (now in previous buffer)
     }
 
     /// Apply PNG filter in-place to current_scanline

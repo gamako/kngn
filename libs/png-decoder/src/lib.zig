@@ -104,7 +104,8 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
         .grayscale => 1,
         .rgb => 3,
         .rgba => 4,
-        // .grayscale_alpha (2) is not yet fully supported; would need .grayscale_alpha branch
+        // Grayscale+Alpha (color type 4) is intentionally unsupported
+        // Future implementation would require: grayscaleAlphaToRGBA8888Row() in format.zig
         else => return error.UnsupportedColorType,
     };
 
@@ -120,7 +121,7 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
     defer scanline_decoder.deinit(allocator);
 
     // Allocate output buffer for RGBA8888 pixels
-    const total_pixels = ihdr.width * ihdr.height;
+    const total_pixels = std.math.mul(usize, @as(usize, ihdr.width), @as(usize, ihdr.height)) catch return error.InvalidDimensions;
     const rgba_pixels = try allocator.alloc(u32, total_pixels);
     errdefer allocator.free(rgba_pixels);
 
