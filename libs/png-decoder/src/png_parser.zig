@@ -132,6 +132,71 @@ pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]cons
     return idat_buffer.toOwnedSlice(allocator);
 }
 
+/// Phase 1.3 optimization: Streaming IDAT reader
+/// Streams IDAT chunks without concatenating them into a single buffer
+/// This eliminates the 2-3MB IDAT concatenation buffer
+pub const IDATReader = struct {
+    png_data: []const u8,
+    chunk_iter: ChunkIterator,
+    current_chunk: ?[]const u8,
+    chunk_offset: usize,
+
+    /// Initialize the IDATReader from PNG file data
+    /// Starts with an empty current chunk; first call to read() will fetch the first IDAT
+    pub fn init(png_data: []const u8) IDATReader {
+        return .{
+            .png_data = png_data,
+            .chunk_iter = ChunkIterator.init(png_data),
+            .current_chunk = null,
+            .chunk_offset = 0,
+        };
+    }
+
+    /// Read data from IDAT chunks (std.Io.Reader compatible)
+    /// Returns the number of bytes read (may be less than buffer.len)
+    pub fn read(self: *IDATReader, buffer: []u8) std.Io.Reader.Error!usize {
+        var total_read: usize = 0;
+
+        while (total_read < buffer.len) {
+            // If we have a current chunk with remaining data, read from it
+            if (self.current_chunk) |chunk| {
+                const remaining = chunk.len - self.chunk_offset;
+                if (remaining > 0) {
+                    const n = @min(buffer.len - total_read, remaining);
+                    @memcpy(
+                        buffer[total_read..][0..n],
+                        chunk[self.chunk_offset..][0..n],
+                    );
+                    self.chunk_offset += n;
+                    total_read += n;
+                    continue;
+                } else {
+                    // Current chunk exhausted, fetch next IDAT
+                    self.current_chunk = null;
+                }
+            }
+
+            // Fetch next IDAT chunk
+            if (self.chunk_iter.next() catch {
+                return error.ReadFailed;
+            }) |chunk| {
+                if (std.mem.eql(u8, &chunk.chunk_type, "IDAT")) {
+                    self.current_chunk = chunk.data;
+                    self.chunk_offset = 0;
+                } else {
+                    // Skip non-IDAT chunks and continue looking
+                    continue;
+                }
+            } else {
+                // No more chunks
+                break;
+            }
+        }
+
+        return total_read;
+    }
+};
+
 /// Calculate CRC-32 (ISO HDLC) for PNG chunk validation
 /// CRC is computed over chunk type (4 bytes) + data (length bytes)
 pub fn calculateChunkCRC(chunk_type: [4]u8, chunk_data: []const u8) u32 {

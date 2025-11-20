@@ -3,6 +3,8 @@
 // PNG IDAT chunks are compressed using zlib format (DEFLATE + header/footer)
 
 const std = @import("std");
+const png_parser = @import("png_parser.zig");
+const filter = @import("filter.zig");
 
 /// Decompress zlib-format data (RFC 1950)
 /// PNG IDAT chunks are stored in zlib format with:
@@ -46,6 +48,169 @@ pub fn decompressZlib(
     // Return the decompressed data (takes ownership of the buffer)
     return out_writer.toOwnedSlice();
 }
+
+/// Phase 1.3 optimization: Streaming scanline decoder
+/// Uses Decompress to read PNG scanlines without buffering full decompressed data
+/// This eliminates the 8.3MB decompressed buffer for large images
+pub const ScanlineDecoder = struct {
+    idat_data: []const u8,  // Concatenated IDAT data
+    idat_reader: std.Io.Reader,  // Reader for IDAT data
+
+    decompressor: std.compress.flate.Decompress,
+    window_buffer: []u8,
+
+    current_scanline: []u8,
+    previous_scanline: []u8,
+
+    scanlines_read: u32,
+    total_scanlines: u32,
+    bytes_per_pixel: u32,
+    bytes_per_scanline: usize,
+
+    /// Initialize a streaming scanline decoder
+    pub fn init(
+        allocator: std.mem.Allocator,
+        png_data: []const u8,
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+    ) !ScanlineDecoder {
+        const bytes_per_scanline = std.math.mul(usize, width, bytes_per_pixel) catch return error.InvalidData;
+
+        // Collect all IDAT chunks into a single buffer
+        const idat_data = try png_parser.collectIDATChunks(allocator, png_data);
+        errdefer allocator.free(idat_data);
+
+        // Allocate window buffer for DEFLATE decompressor
+        const window_buffer = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        errdefer allocator.free(window_buffer);
+
+        // Create a reader from the IDAT data
+        var idat_reader: std.Io.Reader = .fixed(idat_data);
+
+        // Create decompressor with zlib container
+        const decompressor = std.compress.flate.Decompress.init(&idat_reader, .zlib, window_buffer);
+
+        // Allocate scanline buffers
+        const current_scanline = try allocator.alloc(u8, bytes_per_scanline);
+        errdefer allocator.free(current_scanline);
+
+        const previous_scanline = try allocator.alloc(u8, bytes_per_scanline);
+        errdefer allocator.free(previous_scanline);
+
+        // Initialize previous_scanline to zeros (for filter Up/Average/Paeth on first row)
+        @memset(previous_scanline, 0);
+
+        return .{
+            .idat_data = idat_data,
+            .idat_reader = idat_reader,
+            .decompressor = decompressor,
+            .window_buffer = window_buffer,
+            .current_scanline = current_scanline,
+            .previous_scanline = previous_scanline,
+            .scanlines_read = 0,
+            .total_scanlines = height,
+            .bytes_per_pixel = bytes_per_pixel,
+            .bytes_per_scanline = bytes_per_scanline,
+        };
+    }
+
+    /// Deallocate decoder resources
+    pub fn deinit(self: *ScanlineDecoder, allocator: std.mem.Allocator) void {
+        allocator.free(self.idat_data);
+        allocator.free(self.window_buffer);
+        allocator.free(self.current_scanline);
+        allocator.free(self.previous_scanline);
+    }
+
+    /// Read next scanline with filter applied
+    /// Returns pointer to filtered scanline data, or null if EOF
+    /// Returns error on decompression or data validation errors
+    pub fn readScanline(self: *ScanlineDecoder) !?[]u8 {
+        if (self.scanlines_read >= self.total_scanlines) {
+            return null;
+        }
+
+        // Read filter type (1 byte)
+        var filter_type_buf: [1]u8 = undefined;
+        self.decompressor.reader.readSliceAll(&filter_type_buf) catch {
+            return error.DecompressionFailed;
+        };
+        const filter_type = filter_type_buf[0];
+
+        // Read scanline data
+        self.decompressor.reader.readSliceAll(self.current_scanline) catch {
+            return error.DecompressionFailed;
+        };
+
+        // Apply filter (in-place)
+        try self.applyFilterInPlace(filter_type);
+
+        // Swap buffers for next iteration (previous becomes current, current becomes previous)
+        const temp = self.previous_scanline;
+        self.previous_scanline = self.current_scanline;
+        self.current_scanline = temp;
+
+        self.scanlines_read += 1;
+
+        return self.previous_scanline;  // Return the filtered data (now in previous buffer)
+    }
+
+    /// Apply PNG filter in-place to current_scanline
+    fn applyFilterInPlace(self: *ScanlineDecoder, filter_type: u8) !void {
+        switch (filter_type) {
+            0 => {
+                // None: No filtering
+            },
+            1 => {
+                // Sub: Recon(x) = Filt(x) + Recon(x - bytes_per_pixel)
+                for (0..self.bytes_per_scanline) |x| {
+                    self.current_scanline[x] = filter.filterSubDirect(
+                        self.current_scanline[x],
+                        self.current_scanline,
+                        x,
+                        self.bytes_per_pixel,
+                    );
+                }
+            },
+            2 => {
+                // Up: Recon(x) = Filt(x) + Recon(x - bytes_per_scanline)
+                for (0..self.bytes_per_scanline) |x| {
+                    self.current_scanline[x] = filter.filterUpDirect(
+                        self.current_scanline[x],
+                        self.previous_scanline,
+                        x,
+                    );
+                }
+            },
+            3 => {
+                // Average: Recon(x) = Filt(x) + floor((Recon(x - bytes_per_pixel) + Recon(x - bytes_per_scanline)) / 2)
+                for (0..self.bytes_per_scanline) |x| {
+                    self.current_scanline[x] = filter.filterAverageDirect(
+                        self.current_scanline[x],
+                        self.current_scanline,
+                        self.previous_scanline,
+                        x,
+                        self.bytes_per_pixel,
+                    );
+                }
+            },
+            4 => {
+                // Paeth
+                for (0..self.bytes_per_scanline) |x| {
+                    self.current_scanline[x] = filter.filterPaethDirect(
+                        self.current_scanline[x],
+                        self.current_scanline,
+                        self.previous_scanline,
+                        x,
+                        self.bytes_per_pixel,
+                    );
+                }
+            },
+            else => return error.UnsupportedFilterType,
+        }
+    }
+};
 
 test "Decompress zlib data - 1x1 grayscale PNG" {
     const allocator = std.testing.allocator;

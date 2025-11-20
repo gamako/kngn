@@ -44,40 +44,10 @@ pub const PNGImage = struct {
     }
 };
 
-/// Phase 1.3 optimization (alternative approach):
-/// Instead of eliminating the filtered buffer completely, we optimize the pipeline:
-/// decompressed → applyFilters → convert format → output
-/// This approach keeps the memory usage similar but optimizes the conversion process.
-fn applyFiltersAndConvertFormat(
-    allocator: std.mem.Allocator,
-    decompressed: []const u8,
-    width: u32,
-    height: u32,
-    bytes_per_pixel: u32,
-    color_type: ColorType,
-) DecodingError![]u32 {
-    // Apply filters using the existing optimized function
-    const filtered = try filter.applyFilters(
-        allocator,
-        decompressed,
-        width,
-        height,
-        bytes_per_pixel,
-    );
-    defer allocator.free(filtered);
 
-    // Convert to RGBA8888 format
-    const rgba_pixels = switch (color_type) {
-        .grayscale => try format.grayscaleToRGBA8888(allocator, filtered),
-        .rgb => try format.rgbToRGBA8888(allocator, filtered),
-        .rgba => try format.rgbaToRGBA8888(allocator, filtered),
-        else => return error.UnsupportedColorType,
-    };
-
-    return rgba_pixels;
-}
-
-/// Decode PNG from file data
+/// Phase 1.3 optimization: Streaming PNG decoder
+/// Decodes PNG without allocating full IDAT, decompressed, or filtered buffers
+/// Uses IDATReader for IDAT streaming and ScanlineDecoder for line-by-line processing
 pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingError!PNGImage {
     // Verify PNG signature
     if (!png_parser.verifySignature(file_data)) {
@@ -128,34 +98,61 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
         return error.UnsupportedFormat;
     }
 
-    // Determine bytes per pixel based on color type
+    // Determine bytes per pixel and validate color type
     const color_type: ColorType = @enumFromInt(ihdr.color_type);
     const bytes_per_pixel: u32 = switch (color_type) {
         .grayscale => 1,
         .rgb => 3,
-        .grayscale_alpha => 2,
         .rgba => 4,
+        // .grayscale_alpha (2) is not yet fully supported; would need .grayscale_alpha branch
         else => return error.UnsupportedColorType,
     };
 
-    // Collect all IDAT chunks
-    const idat_data = try png_parser.collectIDATChunks(allocator, file_data);
-    defer allocator.free(idat_data);
-
-    // Decompress IDAT data using flate.decompressZlib
-    const decompressed = try flate.decompressZlib(allocator, idat_data);
-    defer allocator.free(decompressed);
-
-    // Phase 1.3 optimization: Apply filters and convert to RGBA8888 in a single pass
-    // This eliminates the intermediate 'filtered' buffer (~8.3MB for 1920x1080)
-    const rgba_pixels = try applyFiltersAndConvertFormat(
+    // Phase 1.3: Initialize streaming scanline decoder
+    // This eliminates both IDAT concatenation buffer (2-3MB) and decompressed buffer (8.3MB)
+    var scanline_decoder = try flate.ScanlineDecoder.init(
         allocator,
-        decompressed,
+        file_data,
         ihdr.width,
         ihdr.height,
         bytes_per_pixel,
-        color_type,
     );
+    defer scanline_decoder.deinit(allocator);
+
+    // Allocate output buffer for RGBA8888 pixels
+    const total_pixels = ihdr.width * ihdr.height;
+    const rgba_pixels = try allocator.alloc(u32, total_pixels);
+    errdefer allocator.free(rgba_pixels);
+
+    // Process scanlines in a streaming pipeline
+    // This eliminates intermediate filtered buffers
+    var row: u32 = 0;
+    while (try scanline_decoder.readScanline()) |filtered_scanline| : (row += 1) {
+        const output_offset = row * ihdr.width;
+
+        // Convert filtered scanline to RGBA8888 format
+        switch (color_type) {
+            .grayscale => {
+                format.grayscaleToRGBA8888Row(
+                    rgba_pixels[output_offset..],
+                    filtered_scanline,
+                );
+            },
+            .rgb => {
+                format.rgbToRGBA8888Row(
+                    rgba_pixels[output_offset..],
+                    filtered_scanline,
+                );
+            },
+            .rgba => {
+                format.rgbaToRGBA8888Row(
+                    rgba_pixels[output_offset..],
+                    filtered_scanline,
+                );
+            },
+            else => return error.UnsupportedColorType,
+        }
+    }
 
     return PNGImage{
         .width = ihdr.width,

@@ -95,6 +95,75 @@ pub fn rgbaToRGBA8888(
     return result;
 }
 
+// ============================================================================
+// Phase 1.3 optimization: Row-based format conversion functions
+// These functions convert a single scanline of pixel data to RGBA8888 format
+// and write directly to the output buffer, enabling streaming processing
+// ============================================================================
+
+/// Convert a single scanline of Grayscale (8-bit) to RGBA8888
+/// Gray value is replicated across R, G, B channels
+/// Alpha channel is set to 255 (fully opaque)
+///
+/// Input:  Grayscale scanline data [g0, g1, g2, ...] (width pixels)
+/// Output: Pre-allocated RGBA8888 buffer (must be at least width u32s)
+pub fn grayscaleToRGBA8888Row(output: []u32, grayscale_row: []const u8) void {
+    std.debug.assert(output.len >= grayscale_row.len);
+
+    for (grayscale_row, 0..) |gray, i| {
+        // Gray value replicated to R, G, B
+        // Format: 0xRRGGBBAA
+        const rgba = (@as(u32, gray) << 24) | (@as(u32, gray) << 16) |
+                     (@as(u32, gray) << 8) | 0xFF;
+        output[i] = rgba;
+    }
+}
+
+/// Convert a single scanline of RGB (8-bit, 3 bytes per pixel) to RGBA8888
+/// Alpha channel is set to 255 (fully opaque)
+///
+/// Input:  RGB scanline data [r0, g0, b0, r1, g1, b1, ...] (width*3 bytes)
+/// Output: Pre-allocated RGBA8888 buffer (must be at least width u32s)
+pub fn rgbToRGBA8888Row(output: []u32, rgb_row: []const u8) void {
+    var i: usize = 0;
+    var out_idx: usize = 0;
+
+    while (i < rgb_row.len) : (i += 3) {
+        const r = rgb_row[i];
+        const g = rgb_row[i + 1];
+        const b = rgb_row[i + 2];
+
+        // Format: 0xRRGGBBAA
+        const rgba = (@as(u32, r) << 24) | (@as(u32, g) << 16) |
+                     (@as(u32, b) << 8) | 0xFF;
+        output[out_idx] = rgba;
+        out_idx += 1;
+    }
+}
+
+/// Convert a single scanline of RGBA (8-bit, 4 bytes per pixel) to RGBA8888
+/// Direct conversion (values copied as-is)
+///
+/// Input:  RGBA scanline data [r0, g0, b0, a0, r1, g1, b1, a1, ...] (width*4 bytes)
+/// Output: Pre-allocated RGBA8888 buffer (must be at least width u32s)
+pub fn rgbaToRGBA8888Row(output: []u32, rgba_row: []const u8) void {
+    var i: usize = 0;
+    var out_idx: usize = 0;
+
+    while (i < rgba_row.len) : (i += 4) {
+        const r = rgba_row[i];
+        const g = rgba_row[i + 1];
+        const b = rgba_row[i + 2];
+        const a = rgba_row[i + 3];
+
+        // Format: 0xRRGGBBAA
+        const rgba = (@as(u32, r) << 24) | (@as(u32, g) << 16) |
+                     (@as(u32, b) << 8) | @as(u32, a);
+        output[out_idx] = rgba;
+        out_idx += 1;
+    }
+}
+
 // Unit tests
 test "Grayscale to RGBA8888 - single pixel" {
     const allocator = std.testing.allocator;
