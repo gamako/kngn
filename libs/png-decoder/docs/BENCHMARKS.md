@@ -16,14 +16,14 @@
 
 計測に使用するイメージを以下に記載（再現性の確保）：
 
-| ファイル名 | 解像度 | 色形式 | フィルタ | ファイルサイズ | 用途 |
-|-----------|--------|--------|---------|--------------|------|
-| 1x1_grayscale_filter_none.png | 1x1 | Grayscale | None | - | 最小ケース |
-| 8x8_grayscale_filter_sub.png | 8x8 | Grayscale | Sub | - | 小画像 |
-| 16x16_rgb_gradient_filter_none.png | 16x16 | RGB | None | - | 典型的 RGB |
-| 16x16_rgba_mixed_filters.png | 16x16 | RGBA | Mixed | - | 複合フィルタ |
-| 256x256_grayscale_paeth.png | 256x256 | Grayscale | Paeth | - | 中規模 |
-| [実際の画像をリスト化] | | | | | |
+| ファイル名                         | 解像度  | 色形式    | フィルタ | ファイルサイズ | 用途         |
+| ---------------------------------- | ------- | --------- | -------- | -------------- | ------------ |
+| 1x1_grayscale_filter_none.png      | 1x1     | Grayscale | None     | -              | 最小ケース   |
+| 8x8_grayscale_filter_sub.png       | 8x8     | Grayscale | Sub      | -              | 小画像       |
+| 16x16_rgb_gradient_filter_none.png | 16x16   | RGB       | None     | -              | 典型的 RGB   |
+| 16x16_rgba_mixed_filters.png       | 16x16   | RGBA      | Mixed    | -              | 複合フィルタ |
+| 256x256_grayscale_paeth.png        | 256x256 | Grayscale | Paeth    | -              | 中規模       |
+| [実際の画像をリスト化]             |         |           |          |                |              |
 
 **注:** test-data/ に存在するイメージファイルから選定
 
@@ -41,17 +41,17 @@
 
 ### エンドツーエンドデコード速度
 
-| Image File | Image Size | Format    | Filter  | Time (μs) | Throughput (MP/s) | Memory (KB) | Note |
-|------------|------------|-----------|---------|-----------|-------------------|-------------|------|
-| 1x1_grayscale.png | 1x1 | Grayscale | None | 2145.00 | 0.00 | 64 | 最小テストケース |
-| 8x8_gray_filter_none.png | 8x8 | Grayscale | None | 2174.00 | 0.03 | 64 | 小規模画像 |
-| 16x16_gray_filter_none.png | 16x16 | Grayscale | None | 2667.00 | 0.10 | 65 | 小規模画像 |
-| 256x256_rgb_gradient_filter_none.png | 256x256 | RGB | None | 21804.00 | 3.01 | 1168 | 中規模画像 |
-| 256x256_rgba_noise_filter_paeth.png | 256x256 | RGBA | Paeth | 33790.00 | 1.94 | 1407 | ノイズ + 複雑フィルタ |
-| 512x512_rgb_checkerboard_filter_sub.png | 512x512 | RGB | Sub | 20371.00 | 12.87 | 3696 | 高周波パターン |
-| 512x512_rgba_noise_filter_average.png | 512x512 | RGBA | Average | 99500.00 | 2.63 | 5228 | ノイズ + Average フィルタ |
-| 1024x1024_rgb_gradient_filter_sub.png | 1024x1024 | RGB | Sub | 67335.00 | 15.57 | 13430 | 大規模画像 |
-| 1920x1080_rgba_gradient_filter_average.png | 1920x1080 | RGBA | Average | 178777.00 | 11.60 | 32604 | ベンチマーク主力 |
+| Image File                                 | Image Size | Format    | Filter  | Time (μs) | Throughput (MP/s) | Memory (KB) | Note                      |
+| ------------------------------------------ | ---------- | --------- | ------- | --------- | ----------------- | ----------- | ------------------------- |
+| 1x1_grayscale.png                          | 1x1        | Grayscale | None    | 2145.00   | 0.00              | 64          | 最小テストケース          |
+| 8x8_gray_filter_none.png                   | 8x8        | Grayscale | None    | 2174.00   | 0.03              | 64          | 小規模画像                |
+| 16x16_gray_filter_none.png                 | 16x16      | Grayscale | None    | 2667.00   | 0.10              | 65          | 小規模画像                |
+| 256x256_rgb_gradient_filter_none.png       | 256x256    | RGB       | None    | 21804.00  | 3.01              | 1168        | 中規模画像                |
+| 256x256_rgba_noise_filter_paeth.png        | 256x256    | RGBA      | Paeth   | 33790.00  | 1.94              | 1407        | ノイズ + 複雑フィルタ     |
+| 512x512_rgb_checkerboard_filter_sub.png    | 512x512    | RGB       | Sub     | 20371.00  | 12.87             | 3696        | 高周波パターン            |
+| 512x512_rgba_noise_filter_average.png      | 512x512    | RGBA      | Average | 99500.00  | 2.63              | 5228        | ノイズ + Average フィルタ |
+| 1024x1024_rgb_gradient_filter_sub.png      | 1024x1024  | RGB       | Sub     | 67335.00  | 15.57             | 13430       | 大規模画像                |
+| 1920x1080_rgba_gradient_filter_average.png | 1920x1080  | RGBA      | Average | 178777.00 | 11.60             | 32604       | ベンチマーク主力          |
 
 **計測方法:**
 - **重要: 必ず ReleaseFast ビルドで計測すること**
@@ -65,21 +65,21 @@
 
 ### フィルタタイプ別の処理時間
 
-| Filter Type | Time (ns) | Relative | 使用イメージ |
-|-------------|-----------|----------|-----------|
+| Filter Type | Time (ns) | Relative | 使用イメージ                       |
+| ----------- | --------- | -------- | ---------------------------------- |
 | None (0)    |           | baseline | 16x16_rgb_gradient_filter_none.png |
-| Sub (1)     |           |          | 8x8_grayscale_filter_sub.png |
-| Up (2)      |           |          | [該当イメージ] |
-| Average (3) |           |          | [該当イメージ] |
-| Paeth (4)   |           |          | 256x256_grayscale_paeth.png |
+| Sub (1)     |           |          | 8x8_grayscale_filter_sub.png       |
+| Up (2)      |           |          | [該当イメージ]                     |
+| Average (3) |           |          | [該当イメージ]                     |
+| Paeth (4)   |           |          | 256x256_grayscale_paeth.png        |
 
 ### メモリ使用量詳細
 
-| Image | Peak Memory (KB) | GPA Stats | ProfiledAllocator Peak (KB) | Allocations |
-|-------|-----------------|-----------|---------------------------|-------------|
-| 1x1 grayscale | | | | |
-| 256x256 RGBA | | | | |
-| Mixed filters | | | | |
+| Image         | Peak Memory (KB) | GPA Stats | ProfiledAllocator Peak (KB) | Allocations |
+| ------------- | ---------------- | --------- | --------------------------- | ----------- |
+| 1x1 grayscale |                  |           |                             |             |
+| 256x256 RGBA  |                  |           |                             |             |
+| Mixed filters |                  |           |                             |             |
 
 ---
 
@@ -109,17 +109,17 @@
 
 **計測結果（ストリーミング実装）:**
 
-| Image File | Time (μs) | Throughput (MP/s) | Memory (KB) | Filter Type |
-|------------|-----------|-------------------|------------|------------|
-| 1x1 Grayscale | 1,709.00 | 0.00 | 64 | None |
-| 8x8 Grayscale (None) | 1,505.00 | 0.04 | 64 | None |
-| 16x16 Grayscale (None) | 1,512.00 | 0.17 | 65 | None |
-| 256x256 RGB (None) | 17,249.00 | 3.80 | 467 | None |
-| 256x256 RGBA (Paeth) | 29,369.00 | 2.23 | 578 | Paeth (4) |
-| 512x512 RGB (Sub) | 10,901.00 | 24.05 | 1,095 | Sub (1) |
-| 512x512 RGBA (Average) | 87,559.00 | 2.99 | 2,117 | Average (3) |
-| 1024x1024 RGB (Sub) | 37,633.00 | 27.86 | 4,176 | Sub (1) |
-| **1920x1080 RGBA (Average)** | **117,119.00** | **17.71** | **8,212** | **Average (3)** |
+| Image File                   | Time (μs)      | Throughput (MP/s) | Memory (KB) | Filter Type     |
+| ---------------------------- | -------------- | ----------------- | ----------- | --------------- |
+| 1x1 Grayscale                | 1,709.00       | 0.00              | 64          | None            |
+| 8x8 Grayscale (None)         | 1,505.00       | 0.04              | 64          | None            |
+| 16x16 Grayscale (None)       | 1,512.00       | 0.17              | 65          | None            |
+| 256x256 RGB (None)           | 17,249.00      | 3.80              | 467         | None            |
+| 256x256 RGBA (Paeth)         | 29,369.00      | 2.23              | 578         | Paeth (4)       |
+| 512x512 RGB (Sub)            | 10,901.00      | 24.05             | 1,095       | Sub (1)         |
+| 512x512 RGBA (Average)       | 87,559.00      | 2.99              | 2,117       | Average (3)     |
+| 1024x1024 RGB (Sub)          | 37,633.00      | 27.86             | 4,176       | Sub (1)         |
+| **1920x1080 RGBA (Average)** | **117,119.00** | **17.71**         | **8,212**   | **Average (3)** |
 
 **メモリ削減の詳細:**
 - ベースライン（従来実装）: ~10.3 MB (file + idat + decompressed + filtered + rgba)
@@ -179,25 +179,25 @@
 
 **計測結果（修正後・ReleaseFast）:**
 
-| Image File | Time (μs) | Throughput (MP/s) | Memory (KB) | Filter Type |
-|------------|-----------|-------------------|------------|------------|
-| 1x1 Grayscale | 52.00 | 0.02 | 74 | None |
-| 8x8 Grayscale (None) | 47.00 | 1.36 | 75 | None |
-| 16x16 Grayscale (None) | 45.00 | 5.69 | 75 | None |
-| 256x256 RGB (None) | 2,568.00 | 25.52 | 332 | None |
-| 256x256 RGBA (Paeth) | 3,788.00 | 17.30 | 332 | Paeth (4) |
-| 512x512 RGB (Sub) | 1,477.00 | 177.48 | 1,101 | Sub (1) |
-| 512x512 RGBA (Average) | 14,298.00 | 18.33 | 1,102 | Average (3) |
-| 1024x1024 RGB (Sub) | 7,064.00 | 148.44 | 4,176 | Sub (1) |
-| **1920x1080 RGBA (Average)** | **19,628.00** | **105.64** | **8,189** | **Average (3)** |
+| Image File                   | Time (μs)     | Throughput (MP/s) | Memory (KB) | Filter Type     |
+| ---------------------------- | ------------- | ----------------- | ----------- | --------------- |
+| 1x1 Grayscale                | 52.00         | 0.02              | 74          | None            |
+| 8x8 Grayscale (None)         | 47.00         | 1.36              | 75          | None            |
+| 16x16 Grayscale (None)       | 45.00         | 5.69              | 75          | None            |
+| 256x256 RGB (None)           | 2,568.00      | 25.52             | 332         | None            |
+| 256x256 RGBA (Paeth)         | 3,788.00      | 17.30             | 332         | Paeth (4)       |
+| 512x512 RGB (Sub)            | 1,477.00      | 177.48            | 1,101       | Sub (1)         |
+| 512x512 RGBA (Average)       | 14,298.00     | 18.33             | 1,102       | Average (3)     |
+| 1024x1024 RGB (Sub)          | 7,064.00      | 148.44            | 4,176       | Sub (1)         |
+| **1920x1080 RGBA (Average)** | **19,628.00** | **105.64**        | **8,189**   | **Average (3)** |
 
 **性能比較（Phase 1.3 修正前 vs 修正後）:**
 
-| Image | 修正前 (μs) | 修正後 (μs) | 改善率 |
-|-------|-------------|-------------|--------|
-| 1920x1080 RGBA | 117,119.00 | 19,628.00 | **83.2% 高速化** |
-| 1024x1024 RGB | 37,633.00 | 7,064.00 | 81.2% 高速化 |
-| 512x512 RGBA | 87,559.00 | 14,298.00 | 83.7% 高速化 |
+| Image          | 修正前 (μs) | 修正後 (μs) | 改善率           |
+| -------------- | ----------- | ----------- | ---------------- |
+| 1920x1080 RGBA | 117,119.00  | 19,628.00   | **83.2% 高速化** |
+| 1024x1024 RGB  | 37,633.00   | 7,064.00    | 81.2% 高速化     |
+| 512x512 RGBA   | 87,559.00   | 14,298.00   | 83.7% 高速化     |
 
 **分析:**
 - 大幅な性能向上（80%以上）はIDATストリーミング化によるもの
@@ -236,17 +236,17 @@ Phase 1.3 完全実装が完了しました。次の改善候補：
 
 **計測結果:**
 
-| Image File | Before (μs) | After (μs) | Improvement | Memory Before (KB) | Memory After (KB) |
-|------------|------------|-----------|------------|------------------|-----------------|
-| 1x1 Grayscale | 1956.00 | 1830.00 | 6.4% | 64 | 64 |
-| 8x8 Grayscale (None) | 2192.00 | 1689.00 | 22.9% | 64 | 64 |
-| 16x16 Grayscale (None) | 2729.00 | 1700.00 | 37.7% | 65 | 65 |
-| 256x256 RGB (None) | 21691.00 | 18317.00 | 15.5% | 1168 | 786 |
-| 256x256 RGBA (Paeth) | 33557.00 | 30164.00 | 10.1% | 1407 | 1024 |
-| 512x512 RGB (Sub) | 20318.00 | 14631.00 | 28.1% | 3696 | 2564 |
-| 512x512 RGBA (Average) | 101103.00 | 92415.00 | 8.6% | 5228 | 4097 |
-| 1024x1024 RGB (Sub) | 67368.00 | 53437.00 | 20.7% | 13430 | 10251 |
-| **1920x1080 RGBA (Average)** | **178203.00** | **158311.00** | **11.15%** | **32604** | **24334** |
+| Image File                   | Before (μs)   | After (μs)    | Improvement | Memory Before (KB) | Memory After (KB) |
+| ---------------------------- | ------------- | ------------- | ----------- | ------------------ | ----------------- |
+| 1x1 Grayscale                | 1956.00       | 1830.00       | 6.4%        | 64                 | 64                |
+| 8x8 Grayscale (None)         | 2192.00       | 1689.00       | 22.9%       | 64                 | 64                |
+| 16x16 Grayscale (None)       | 2729.00       | 1700.00       | 37.7%       | 65                 | 65                |
+| 256x256 RGB (None)           | 21691.00      | 18317.00      | 15.5%       | 1168               | 786               |
+| 256x256 RGBA (Paeth)         | 33557.00      | 30164.00      | 10.1%       | 1407               | 1024              |
+| 512x512 RGB (Sub)            | 20318.00      | 14631.00      | 28.1%       | 3696               | 2564              |
+| 512x512 RGBA (Average)       | 101103.00     | 92415.00      | 8.6%        | 5228               | 4097              |
+| 1024x1024 RGB (Sub)          | 67368.00      | 53437.00      | 20.7%       | 13430              | 10251             |
+| **1920x1080 RGBA (Average)** | **178203.00** | **158311.00** | **11.15%**  | **32604**          | **24334**         |
 
 **改善率サマリー:**
 - 主要計測画像（1920x1080 RGBA）: **11.15% 高速化**
@@ -300,17 +300,17 @@ Phase 1.2 の実施を推奨：フィルタタイプ0の memcpy 化により、�
 
 **計測結果:**
 
-| Image File | Phase 1.1 (μs) | Phase 1.2 (μs) | Improvement | Filter Type |
-|------------|------------|-----------|------------|------------|
-| 1x1 Grayscale | 1830.00 | 1851.00 | -1.15% | None |
-| 8x8 Grayscale (None) | 1689.00 | 1677.00 | 0.71% | None |
-| 16x16 Grayscale (None) | 1700.00 | 1690.00 | 0.59% | None |
-| 256x256 RGB (None) | 18317.00 | 17428.00 | 4.86% | None |
-| 256x256 RGBA (Paeth) | 30164.00 | 29936.00 | 0.76% | Paeth (4) |
-| 512x512 RGB (Sub) | 14631.00 | 15160.00 | -3.61% | Sub (1) |
-| 512x512 RGBA (Average) | 92415.00 | 92301.00 | 0.12% | Average (3) |
-| 1024x1024 RGB (Sub) | 53437.00 | 54165.00 | -1.36% | Sub (1) |
-| **1920x1080 RGBA (Average)** | **158311.00** | **154749.00** | **2.25%** | **Average (3)** |
+| Image File                   | Phase 1.1 (μs) | Phase 1.2 (μs) | Improvement | Filter Type     |
+| ---------------------------- | -------------- | -------------- | ----------- | --------------- |
+| 1x1 Grayscale                | 1830.00        | 1851.00        | -1.15%      | None            |
+| 8x8 Grayscale (None)         | 1689.00        | 1677.00        | 0.71%       | None            |
+| 16x16 Grayscale (None)       | 1700.00        | 1690.00        | 0.59%       | None            |
+| 256x256 RGB (None)           | 18317.00       | 17428.00       | 4.86%       | None            |
+| 256x256 RGBA (Paeth)         | 30164.00       | 29936.00       | 0.76%       | Paeth (4)       |
+| 512x512 RGB (Sub)            | 14631.00       | 15160.00       | -3.61%      | Sub (1)         |
+| 512x512 RGBA (Average)       | 92415.00       | 92301.00       | 0.12%       | Average (3)     |
+| 1024x1024 RGB (Sub)          | 53437.00       | 54165.00       | -1.36%      | Sub (1)         |
+| **1920x1080 RGBA (Average)** | **158311.00**  | **154749.00**  | **2.25%**   | **Average (3)** |
 
 **改善率サマリー:**
 - フィルタタイプ0（None）での改善: 最大 4.86%（256x256 RGB）
@@ -379,10 +379,10 @@ Phase 1.2 の実施を推奨：フィルタタイプ0の memcpy 化により、�
 
 ## 最終結果サマリー
 
-| 指標 | ベースライン | 最適化後 | 改善率 |
-|------|------------|--------|--------|
-| ピークメモリ | 29MB | __ MB | __ % |
-| 処理速度 | __ μs | __ μs | __ % |
+| 指標         | ベースライン | 最適化後 | 改善率 |
+| ------------ | ------------ | -------- | ------ |
+| ピークメモリ | 29MB         | __ MB    | __ %   |
+| 処理速度     | __ μs        | __ μs    | __ %   |
 
 ---
 
