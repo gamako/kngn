@@ -227,10 +227,13 @@ pub const IDATReaderWrapper = struct {
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *IDATReaderWrapper = @fieldParentPtr("interface", r);
 
+        // std.Io.Reader contract: 0-byte request should return 0, not EOF
+        const max = limit.minInt(4096);
+        if (max == 0) return 0;
+
         // Temporary buffer for reading from IDATReader
         var temp_buffer: [4096]u8 = undefined;
 
-        const max = limit.minInt(temp_buffer.len);
         const n = self.idat_reader.read(temp_buffer[0..max]) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
             error.EndOfStream => return error.EndOfStream,

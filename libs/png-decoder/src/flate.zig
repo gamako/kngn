@@ -130,7 +130,16 @@ pub const ScanlineDecoder = struct {
     /// Returns error on decompression or data validation errors
     pub fn readScanline(self: *ScanlineDecoder) !?[]u8 {
         if (self.scanlines_read >= self.total_scanlines) {
-            return null;
+            // Verify DEFLATE stream has reached EOF
+            // Try to read one more byte - should fail with EndOfStream
+            var extra_byte: [1]u8 = undefined;
+            if (self.decompressor.reader.readSliceAll(&extra_byte)) |_| {
+                // Successfully read extra data - PNG has more scanlines than IHDR.height
+                return error.InvalidData;
+            } else |err| switch (err) {
+                error.EndOfStream => return null, // Expected EOF
+                else => return error.DecompressionFailed,
+            }
         }
 
         // Read filter type (1 byte)
