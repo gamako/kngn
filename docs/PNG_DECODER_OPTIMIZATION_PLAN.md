@@ -621,12 +621,20 @@ zig test libs/png-decoder/src/test.zig --filter test_name
 ```
 
 ### ベンチマーク実行方法
-```bash
-# ベースラインベンチマーク（初回）
-zig build benchmark
 
-# 最適化後のベンチマーク
-zig build benchmark -Drelease=true
+**⚠️ 重要: 必ず ReleaseFast ビルドで計測すること**
+- Debugビルドは最適化が無効で、性能が数倍〜数十倍遅くなります
+- 改善率の測定には必ず同一ビルドモード間での比較が必須です
+
+```bash
+# ベースラインベンチマーク（ReleaseFast）
+zig build benchmark -Doptimize=ReleaseFast
+
+# 最適化後のベンチマーク（ReleaseFast）
+zig build benchmark -Doptimize=ReleaseFast
+
+# 参考: Debugビルド（性能計測には不適切）
+zig build benchmark  # 最適化なし、デバッグ情報あり
 ```
 
 ### BENCHMARKS.md での記録テンプレート
