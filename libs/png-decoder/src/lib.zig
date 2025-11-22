@@ -111,7 +111,7 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
 
     // Phase 1.3: Initialize streaming scanline decoder
     // This eliminates both IDAT concatenation buffer (2-3MB) and decompressed buffer (8.3MB)
-    var scanline_decoder = try flate.ScanlineDecoder.init(
+    const scanline_decoder = try flate.ScanlineDecoder.init(
         allocator,
         file_data,
         ihdr.width,

@@ -52,10 +52,9 @@ pub fn decompressZlib(
 /// Phase 1.3 optimization: Streaming scanline decoder
 /// Uses Decompress to read PNG scanlines without buffering full decompressed data
 /// This eliminates the 8.3MB decompressed buffer for large images
+/// Now also eliminates the 2-3MB IDAT concatenation buffer by using IDATReaderWrapper
 pub const ScanlineDecoder = struct {
-    idat_data: []const u8, // Concatenated IDAT data
-    idat_reader: std.Io.Reader, // Reader for IDAT data
-
+    idat_wrapper: png_parser.IDATReaderWrapper, // Streaming IDAT reader
     decompressor: std.compress.flate.Decompress,
     window_buffer: []u8,
 
@@ -68,59 +67,62 @@ pub const ScanlineDecoder = struct {
     bytes_per_scanline: usize,
 
     /// Initialize a streaming scanline decoder
+    /// Returns a heap-allocated decoder to avoid dangling pointer issues
     pub fn init(
         allocator: std.mem.Allocator,
         png_data: []const u8,
         width: u32,
         height: u32,
         bytes_per_pixel: u32,
-    ) !ScanlineDecoder {
+    ) !*ScanlineDecoder {
         const bytes_per_scanline = std.math.mul(usize, width, bytes_per_pixel) catch return error.InvalidData;
 
-        // Collect all IDAT chunks into a single buffer
-        const idat_data = try png_parser.collectIDATChunks(allocator, png_data);
-        errdefer allocator.free(idat_data);
+        // Allocate the decoder on the heap to ensure stable addresses
+        const self = try allocator.create(ScanlineDecoder);
+        errdefer allocator.destroy(self);
 
         // Allocate window buffer for DEFLATE decompressor
-        const window_buffer = try allocator.alloc(u8, std.compress.flate.max_window_len);
-        errdefer allocator.free(window_buffer);
+        self.window_buffer = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        errdefer allocator.free(self.window_buffer);
 
-        // Create a reader from the IDAT data
-        var idat_reader: std.Io.Reader = .fixed(idat_data);
+        // Initialize IDAT streaming reader (no concatenation buffer)
+        self.idat_wrapper = png_parser.IDATReaderWrapper.init(png_data);
+
+        // Set buffer pointer after initialization (must be done after wrapper is in stable location)
+        self.idat_wrapper.interface.buffer = &self.idat_wrapper.buffer;
 
         // Create decompressor with zlib container
-        const decompressor = std.compress.flate.Decompress.init(&idat_reader, .zlib, window_buffer);
+        // Use stable address of self.idat_wrapper.interface
+        self.decompressor = std.compress.flate.Decompress.init(
+            &self.idat_wrapper.interface,
+            .zlib,
+            self.window_buffer,
+        );
 
         // Allocate scanline buffers
-        const current_scanline = try allocator.alloc(u8, bytes_per_scanline);
-        errdefer allocator.free(current_scanline);
+        self.current_scanline = try allocator.alloc(u8, bytes_per_scanline);
+        errdefer allocator.free(self.current_scanline);
 
-        const previous_scanline = try allocator.alloc(u8, bytes_per_scanline);
-        errdefer allocator.free(previous_scanline);
+        self.previous_scanline = try allocator.alloc(u8, bytes_per_scanline);
+        errdefer allocator.free(self.previous_scanline);
 
         // Initialize previous_scanline to zeros (for filter Up/Average/Paeth on first row)
-        @memset(previous_scanline, 0);
+        @memset(self.previous_scanline, 0);
 
-        return .{
-            .idat_data = idat_data,
-            .idat_reader = idat_reader,
-            .decompressor = decompressor,
-            .window_buffer = window_buffer,
-            .current_scanline = current_scanline,
-            .previous_scanline = previous_scanline,
-            .scanlines_read = 0,
-            .total_scanlines = height,
-            .bytes_per_pixel = bytes_per_pixel,
-            .bytes_per_scanline = bytes_per_scanline,
-        };
+        self.scanlines_read = 0;
+        self.total_scanlines = height;
+        self.bytes_per_pixel = bytes_per_pixel;
+        self.bytes_per_scanline = bytes_per_scanline;
+
+        return self;
     }
 
     /// Deallocate decoder resources
     pub fn deinit(self: *ScanlineDecoder, allocator: std.mem.Allocator) void {
-        allocator.free(self.idat_data);
         allocator.free(self.window_buffer);
         allocator.free(self.current_scanline);
         allocator.free(self.previous_scanline);
+        allocator.destroy(self);  // Free the heap-allocated decoder
     }
 
     /// Read next scanline with filter applied

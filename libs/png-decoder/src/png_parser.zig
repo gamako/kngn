@@ -197,6 +197,82 @@ pub const IDATReader = struct {
     }
 };
 
+/// Phase 1.3 optimization: std.Io.Reader-compatible IDAT reader wrapper
+/// Wraps IDATReader to provide std.Io.Reader interface
+/// Uses @fieldParentPtr pattern (similar to std.Io.Reader.Limited)
+pub const IDATReaderWrapper = struct {
+    idat_reader: IDATReader,
+    interface: std.Io.Reader,
+    buffer: [64]u8,  // Small internal buffer for Reader operations
+
+    const vtable: std.Io.Reader.VTable = .{
+        .stream = stream,
+        .discard = discard,
+        // readVec and rebase use default implementations
+    };
+
+    pub fn init(png_data: []const u8) IDATReaderWrapper {
+        return .{
+            .idat_reader = IDATReader.init(png_data),
+            .buffer = undefined,
+            .interface = .{
+                .vtable = &vtable,
+                .buffer = undefined,  // Will be set by caller after init
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *IDATReaderWrapper = @fieldParentPtr("interface", r);
+
+        // Temporary buffer for reading from IDATReader
+        var temp_buffer: [4096]u8 = undefined;
+
+        const max = limit.minInt(temp_buffer.len);
+        const n = self.idat_reader.read(temp_buffer[0..max]) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+            error.EndOfStream => return error.EndOfStream,
+        };
+
+        if (n == 0) return error.EndOfStream;
+
+        // Write to output Writer
+        _ = try w.write(temp_buffer[0..n]);
+
+        return n;
+    }
+
+    fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+        const self: *IDATReaderWrapper = @fieldParentPtr("interface", r);
+
+        var total: usize = 0;
+        var temp_buffer: [4096]u8 = undefined;
+
+        const max = limit.toInt() orelse std.math.maxInt(usize);
+
+        while (total < max) {
+            const remaining = max - total;
+            const read_size = @min(remaining, temp_buffer.len);
+
+            const n = self.idat_reader.read(temp_buffer[0..read_size]) catch |err| switch (err) {
+                error.ReadFailed => return error.ReadFailed,
+                error.EndOfStream => return error.EndOfStream,
+            };
+
+            if (n == 0) {
+                if (total == 0) return error.EndOfStream;
+                break;
+            }
+
+            total += n;
+        }
+
+        return total;
+    }
+};
+
 /// Calculate CRC-32 (ISO HDLC) for PNG chunk validation
 /// CRC is computed over chunk type (4 bytes) + data (length bytes)
 pub fn calculateChunkCRC(chunk_type: [4]u8, chunk_data: []const u8) u32 {
