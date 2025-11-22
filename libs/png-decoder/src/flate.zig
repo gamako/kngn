@@ -169,24 +169,28 @@ pub const ScanlineDecoder = struct {
 
     /// Apply PNG filter in-place to current_scanline
     fn applyFilterInPlace(self: *ScanlineDecoder, filter_type: u8) !void {
+        // Cache frequently accessed fields in local variables for better cache efficiency
+        const bpp = self.bytes_per_pixel;
+        const scanline_len = self.bytes_per_scanline;
+
         switch (filter_type) {
             0 => {
                 // None: No filtering
             },
             1 => {
                 // Sub: Recon(x) = Filt(x) + Recon(x - bytes_per_pixel)
-                for (0..self.bytes_per_scanline) |x| {
+                for (0..scanline_len) |x| {
                     self.current_scanline[x] = filter.filterSubDirect(
                         self.current_scanline[x],
                         self.current_scanline,
                         x,
-                        self.bytes_per_pixel,
+                        bpp,
                     );
                 }
             },
             2 => {
                 // Up: Recon(x) = Filt(x) + Recon(x - bytes_per_scanline)
-                for (0..self.bytes_per_scanline) |x| {
+                for (0..scanline_len) |x| {
                     self.current_scanline[x] = filter.filterUpDirect(
                         self.current_scanline[x],
                         self.previous_scanline,
@@ -196,25 +200,25 @@ pub const ScanlineDecoder = struct {
             },
             3 => {
                 // Average: Recon(x) = Filt(x) + floor((Recon(x - bytes_per_pixel) + Recon(x - bytes_per_scanline)) / 2)
-                for (0..self.bytes_per_scanline) |x| {
+                for (0..scanline_len) |x| {
                     self.current_scanline[x] = filter.filterAverageDirect(
                         self.current_scanline[x],
                         self.current_scanline,
                         self.previous_scanline,
                         x,
-                        self.bytes_per_pixel,
+                        bpp,
                     );
                 }
             },
             4 => {
                 // Paeth
-                for (0..self.bytes_per_scanline) |x| {
+                for (0..scanline_len) |x| {
                     self.current_scanline[x] = filter.filterPaethDirect(
                         self.current_scanline[x],
                         self.current_scanline,
                         self.previous_scanline,
                         x,
-                        self.bytes_per_pixel,
+                        bpp,
                     );
                 }
             },
