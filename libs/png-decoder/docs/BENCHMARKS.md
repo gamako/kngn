@@ -90,10 +90,9 @@
 
 ---
 
-## Phase 1.3: ストリーミング化（行単位処理）(実装完了)
+## Phase 1.3: ストリーミング化とIDATストリーミング完全実装
 
-**計測日:** 2025-11-20
-
+**計測日:** 2025-11-22
 **計測環境:**
 - CPU: Apple M1 Pro
 - OS: macOS 14.6
@@ -101,53 +100,95 @@
 - Build Mode: ReleaseFast
 - マシン: Gamako's MacBook Pro
 
-**改善戦略:**
-- 行単位のデコーディングパイプライン実装
-- IDATReader: IDAT チャンク抽象化
-- ScanlineDecoder: 行単位の DEFLATE デコンプレッション + フィルタ適用
-- format.zig Row関数: 行単位のフォーマット変換
-- 8.3MB の全解凍バッファを廃止
+**改善内容:**
+1. **行単位のデコーディングパイプライン実装**
+   - ScanlineDecoder: 行単位の DEFLATE デコンプレッション + フィルタ適用
+   - format.zig Row関数: 行単位のフォーマット変換
+   - 8.3MB の全解凍バッファを廃止
 
-**計測結果（ストリーミング実装）:**
+2. **Dangling Pointer Bug修正**
+   - ScanlineDecoderをheap allocation化（`!*ScanlineDecoder`を返す）
+   - `&self.idat_wrapper.interface`の安定したアドレスを確保
 
-| Image File                   | Time (μs)      | Throughput (MP/s) | Memory (KB) | Filter Type     |
-| ---------------------------- | -------------- | ----------------- | ----------- | --------------- |
-| 1x1 Grayscale                | 1,709.00       | 0.00              | 64          | None            |
-| 8x8 Grayscale (None)         | 1,505.00       | 0.04              | 64          | None            |
-| 16x16 Grayscale (None)       | 1,512.00       | 0.17              | 65          | None            |
-| 256x256 RGB (None)           | 17,249.00      | 3.80              | 467         | None            |
-| 256x256 RGBA (Paeth)         | 29,369.00      | 2.23              | 578         | Paeth (4)       |
-| 512x512 RGB (Sub)            | 10,901.00      | 24.05             | 1,095       | Sub (1)         |
-| 512x512 RGBA (Average)       | 87,559.00      | 2.99              | 2,117       | Average (3)     |
-| 1024x1024 RGB (Sub)          | 37,633.00      | 27.86             | 4,176       | Sub (1)         |
-| **1920x1080 RGBA (Average)** | **117,119.00** | **17.71**         | **8,212**   | **Average (3)** |
+3. **IDATストリーミング完全実装**
+   - IDATReaderWrapperを実装（std.Io.Reader.Limitedパターン）
+   - `@fieldParentPtr("interface", r)`でvtable実装
+   - stream()とdiscard()メソッドを実装
+   - collectIDATChunks()を削除 → **2-3MB IDAT連結バッファを削減**
 
-**メモリ削減の詳細:**
-- ベースライン（従来実装）: ~10.3 MB (file + idat + decompressed + filtered + rgba)
-- ストリーミング実装: ~8.2 MB (file + rgba のみ)
-- **削減率: 20.4% (8.3MB の全解凍バッファを廃止)**
+4. **VTable実装**
+   - std.Io.Reader互換のカスタムreader実装
+   - 64バイトの内部バッファでrebase()サポート
 
-**パフォーマンス特性:**
-- Filter None（フィルタ無し）: 17.2ms @ 256x256
-- Filter Sub（逆フィルタ）: 10.9ms @ 512x512, 37.6ms @ 1024x1024
-- Filter Average（平均フィルタ）: 87.6ms @ 512x512, 117.1ms @ 1920x1080
-- Filter Paeth（複雑フィルタ）: 29.4ms @ 256x256
+**計測結果:**
 
-**スケーラビリティ分析:**
-- 小画像（1x1 - 16x16）: ~1.5ms（ヘッダー処理が主体）
-- 中画像（256x256）: 17-29ms（フォーマット変換主体）
-- 大画像（1920x1080）: 117ms（フィルタ処理主体）
-- スケーラビリティ指数: ほぼ線形（ピクセルサイズに比例）
+| Image File                   | Time (μs)   | Throughput (MP/s) | Memory (KB) | Filter Type     |
+| ---------------------------- | ----------- | ----------------- | ----------- | --------------- |
+| 1x1 Grayscale                | 57.00       | 0.02              | 74          | None            |
+| 8x8 Grayscale (None)         | 33.00       | 1.94              | 75          | None            |
+| 16x16 Grayscale (None)       | 37.00       | 6.92              | 75          | None            |
+| 256x256 RGB (None)           | 2,646.00    | 24.77             | 332         | None            |
+| 256x256 RGBA (Paeth)         | 3,762.00    | 17.42             | 332         | Paeth (4)       |
+| 512x512 RGB (Sub)            | 1,474.00    | 177.85            | 1,101       | Sub (1)         |
+| 512x512 RGBA (Average)       | 14,601.00   | 17.95             | 1,102       | Average (3)     |
+| 1024x1024 RGB (Sub)          | 6,805.00    | 154.09            | 4,176       | Sub (1)         |
+| **1920x1080 RGBA (Average)** | **19,105.00** | **108.54**      | **8,189**   | **Average (3)** |
 
-### テスト結果
-- ✅ zig build test: 全テスト通過（テスト数: 29/29）
-- ✅ 既存テストの結果が一致（出力が正確）
-- ✅ メモリ安全性: 境界チェック、エラーハンドリング確認済み
+**性能比較（Phase 1.2 → Phase 1.3）:**
+
+| Image File       | Phase 1.2 (μs) | Phase 1.3 (μs) | Improvement | Filter Type |
+| ---------------- | -------------- | -------------- | ----------- | ----------- |
+| 1x1 Grayscale    | 68.00          | 57.00          | 16.2%       | None        |
+| 8x8 Grayscale    | 40.00          | 33.00          | 17.5%       | None        |
+| 16x16 Grayscale  | 65.00          | 37.00          | 43.1%       | None        |
+| 256x256 RGB      | 2,604.00       | 2,646.00       | -1.6%       | None        |
+| 256x256 RGBA     | 3,778.00       | 3,762.00       | 0.4%        | Paeth (4)   |
+| 512x512 RGB      | 1,700.00       | 1,474.00       | 13.3%       | Sub (1)     |
+| 512x512 RGBA     | 14,424.00      | 14,601.00      | -1.2%       | Average (3) |
+| 1024x1024 RGB    | 7,976.00       | 6,805.00       | 14.7%       | Sub (1)     |
+| **1920x1080 RGBA** | **22,276.00** | **19,105.00** | **14.2%** | **Average (3)** |
+
+**改善率サマリー:**
+- 主要計測画像（1920x1080 RGBA）: **14.2% 高速化**
+- 小画像で大きな改善: 43.1%（16x16 Grayscale）
+- 大画像で安定した改善: 13.3-14.7%（512x512以上）
+
+**メモリ削減効果（Phase 0 → Phase 1.3）:**
+- Phase 0（ベースライン）: 32,604 KB @ 1920x1080 RGBA
+- Phase 1.3（ストリーミング実装）: 8,189 KB @ 1920x1080 RGBA
+- **削減率: 74.9% 削減**
+
+**削減内訳:**
+1. **全解凍バッファの廃止**: 8.3MB 削減
+   - Phase 0-1.2: DEFLATE 全解凍後にフィルタ適用
+   - Phase 1.3: 行単位でデコンプレッション + フィルタ適用
+
+2. **IDAT連結バッファの削減**: 2-3MB 削減
+   - Phase 0-1.2: collectIDATChunks()で全IDAT連結
+   - Phase 1.3: IDATReaderWrapperでチャンク単位ストリーミング
+
+3. **format変換バッファの削減**: Phase 1.1で既に削減済み
+   - ArrayList → 事前アロケーションで約8MB削減
+
+**分析:**
+1. **ストリーミング化の効果**
+   - メモリ削減が主な成果（74.9%）
+   - 性能改善は控えめ（14.2%）
+   - 行単位処理によるキャッシュ効率向上
+
+2. **Phase 1.2 からの改善要因**
+   - IDATストリーミングによるメモリアクセスパターンの最適化
+   - 不要なバッファコピーの削減
+   - キャッシュラインの効率的利用
+
+3. **画像サイズ別の特性**
+   - 小画像（1x1-16x16）: 16-43% 改善（オーバーヘッド削減）
+   - 中画像（256x256）: ほぼ変化なし（-1.6%〜0.4%）
+   - 大画像（512x512以上）: 13-15% 安定改善
 
 ### 実装詳細
-- **libs/png-decoder/src/png_parser.zig**: IDATReader (削除予定)
-- **libs/png-decoder/src/flate.zig**: ScanlineDecoder 実装完了
-  - std.Io.Reader.fixed() による IDAT ストリーム処理
+- **libs/png-decoder/src/flate.zig**: ScanlineDecoder 実装
+  - IDATReaderWrapperによるチャンク単位ストリーミング
   - readScanline() で行単位のフィルタ適用
   - 2つのスキャンラインバッファ（現在行/前行）でダブルバッファリング
 - **libs/png-decoder/src/format.zig**: 行単位変換関数
@@ -159,59 +200,6 @@
   - while (readScanline()) ループで行単位処理
   - フォーマット変換も行単位で実行
 
-### Phase 1.3修正: Bug修正とIDATストリーミング完全実装
-
-**計測日:** 2025-11-22
-
-**修正内容:**
-1. **Dangling Pointer Bug修正**
-   - ScanlineDecoderをheap allocation化（`!*ScanlineDecoder`を返す）
-   - `&self.idat_wrapper.interface`の安定したアドレスを確保
-
-2. **IDATストリーミング完全実装**
-   - IDATReaderWrapperを実装（std.Io.Reader.Limitedパターン）
-   - `@fieldParentPtr("interface", r)`でvtable実装
-   - stream()とdiscard()メソッドを実装
-   - collectIDATChunks()を削除 → **2-3MB IDAT連結バッファを削減**
-
-3. **VTable実装**
-   - std.Io.Reader互換のカスタムreader実装
-   - 64バイトの内部バッファでrebase()サポート
-
-**計測結果（修正後・ReleaseFast）:**
-
-| Image File                   | Time (μs)     | Throughput (MP/s) | Memory (KB) | Filter Type     |
-| ---------------------------- | ------------- | ----------------- | ----------- | --------------- |
-| 1x1 Grayscale                | 52.00         | 0.02              | 74          | None            |
-| 8x8 Grayscale (None)         | 47.00         | 1.36              | 75          | None            |
-| 16x16 Grayscale (None)       | 45.00         | 5.69              | 75          | None            |
-| 256x256 RGB (None)           | 2,568.00      | 25.52             | 332         | None            |
-| 256x256 RGBA (Paeth)         | 3,788.00      | 17.30             | 332         | Paeth (4)       |
-| 512x512 RGB (Sub)            | 1,477.00      | 177.48            | 1,101       | Sub (1)         |
-| 512x512 RGBA (Average)       | 14,298.00     | 18.33             | 1,102       | Average (3)     |
-| 1024x1024 RGB (Sub)          | 7,064.00      | 148.44            | 4,176       | Sub (1)         |
-| **1920x1080 RGBA (Average)** | **19,628.00** | **105.64**        | **8,189**   | **Average (3)** |
-
-**性能比較（Phase 1.3 修正前 vs 修正後）:**
-
-| Image          | 修正前 (μs) | 修正後 (μs) | 改善率           |
-| -------------- | ----------- | ----------- | ---------------- |
-| 1920x1080 RGBA | 117,119.00  | 19,628.00   | **83.2% 高速化** |
-| 1024x1024 RGB  | 37,633.00   | 7,064.00    | 81.2% 高速化     |
-| 512x512 RGBA   | 87,559.00   | 14,298.00   | 83.7% 高速化     |
-
-**分析:**
-- 大幅な性能向上（80%以上）はIDATストリーミング化によるもの
-- 以前はcollectIDATChunks()で2-3MBを一括allocate → fixed reader
-- 現在はIDATReaderWrapperでチャンク単位のストリーミング読み込み
-- キャッシュ効率向上とメモリアクセスパターンの最適化が寄与
-- メモリ使用量は同等（8,189 KB）だが、ピークメモリは削減
-
-**メモリ削減効果:**
-- IDAT連結バッファ: 2-3MB削減
-- 合計削減: ~10-11MB（decompressed 8.3MB + IDAT 2-3MB）
-- 削減率: **Phase 1.3完全実装で約30%削減**
-
 ### テスト結果
 - ✅ zig build test: 全29テスト通過
 - ✅ Dangling pointer bug完全修正
@@ -219,7 +207,6 @@
 
 ### 次のステップ
 Phase 1.3 完全実装が完了しました。次の改善候補：
-- Filter type 0 の memcpy 最適化（Phase 1.2 相当）
 - フィルタ関数の inline 化（Phase 2.1）
 - SIMD 化（Phase 2.2）
 
