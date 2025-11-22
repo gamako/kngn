@@ -444,26 +444,31 @@ while (i < rgb_data.len) : (i += 3) {
    - [x] rgbToRGBA8888 を修正
    - [x] rgbaToRGBA8888 を修正
    - [x] テスト実行して動作確認 (全29テスト通過)
-   - [x] **ベンチマーク実行し改善率を記録** (11.15%向上 + 25.3%メモリ削減を達成)
+   - [x] **ベンチマーク実行し改善率を記録** (19.2% 高速化 + 25.3% メモリ削減を達成)
+   - **結果:** 1920x1080 RGBA: 27,571 → 22,269 μs (19.2% 改善)
+   - **メモリ:** 32,604 → 24,334 KB (25.3% 削減)
 
 2. **ステップ 2: Phase 1.2 - filter type 0 memcpy 化** ✅ **完了**
    - [x] applyFilters 内でフィルタタイプ0を特別処理 ✅
    - [x] スキャンライン単位の最適化ループを整理 ✅
    - [x] テスト実行して動作確認 (全テスト通過) ✅
-   - [x] **ベンチマーク実行し改善率を記録** (4.86% filter type 0 改善、2.25% 全体向上を達成) ✅
-
-3. **ステップ 3: Phase 1.3 - パイプラインアーキテクチャの最適化** ✅ **完了**
-   - [x] applyFiltersAndConvertFormat() 関数の実装
-   - [x] filterSubDirect, filterUpDirect, filterAverageDirect, filterPaethDirect の実装
-   - [x] テスト実行して動作確認 (全29テスト通過)
-   - [x] **ベンチマーク実行し改善率を記録** (85.1% 高速化、25.3% メモリ削減を達成) ✅
-   - **結果:** 1920x1080 RGBA: 154,749 → 23,129 μs (85.1% 改善)
+   - [x] **ベンチマーク実行し改善率を記録** (-0.03% (ほぼ変化なし、実質的な改善なし)) ✅
+   - **結果:** 1920x1080 RGBA: 22,269 → 22,276 μs (-0.03%)
    - **メモリ:** 24,334 KB (Phase 1.1 と同等)
+
+3. **ステップ 3: Phase 1.3 - ストリーミング化とIDATストリーミング完全実装** ✅ **完了**
+   - [x] 行単位のデコーディングパイプライン実装
+   - [x] IDATReaderWrapper によるチャンク単位ストリーミング
+   - [x] Dangling Pointer Bug修正
+   - [x] テスト実行して動作確認 (全29テスト通過)
+   - [x] **ベンチマーク実行し改善率を記録** (14.2% 高速化 (Phase 1.2 から)、74.9% メモリ削減 (Phase 0 から)) ✅
+   - **結果:** 1920x1080 RGBA: 22,276 → 19,105 μs (14.2% 改善)
+   - **メモリ:** 8,189 KB (Phase 0 の 32,604 KB から 74.9% 削減)
 
 4. **ステップ 4: 次のフェーズに向けた検討** 🚀 **次の優先タスク**
    - [ ] Phase 2.1 - フィルタ関数 inline 化の検討
    - [ ] Phase 2.2 - SIMD化（RGB→RGBA変換）の検討
-   - **現状:** Phase 1 でのパフォーマンス目標を達成（85%以上の改善）
+   - **現状:** Phase 1 でのパフォーマンス目標を達成（Phase 0 から累積で 30.7% 高速化、74.9% メモリ削減）
 
 #### パス選択の判断基準
 
@@ -527,20 +532,20 @@ while (i < rgb_data.len) : (i += 3) {
 - ✅ BENCHMARKS.md にエンドツーエンド速度、フィルタ別速度、メモリ使用量を記録
 - ✅ 測定環境（CPU, Zig version, Build mode）を明記
 
-#### Phase 1.3: ストリーミング化（行単位処理）✅ **完了**
+#### Phase 1.3: ストリーミング化とIDATストリーミング完全実装 ✅ **完了**
 - ✅ すべてのテストが通る（29/29テスト）
 - ✅ 行単位デコーディングパイプライン実装完了
-  - IDATReader: IDAT チャンク抽象化（削除予定）
   - ScanlineDecoder: 行単位の DEFLATE デコンプレッション + フィルタ適用
+  - IDATReaderWrapper: チャンク単位ストリーミング (collectIDATChunks 削除)
   - format.zig Row関数: 行単位のフォーマット変換（grayscaleToRGBA8888Row など）
-- ✅ ピークメモリ削減: 8.3MB（全解凍バッファ）を廃止
-  - 1920x1080 RGBA: ~8.2MB のみ（フォーマット変換用中間バッファはなし）
-  - 従来: 約10.3MB (file + idat + decompressed + filtered + rgba)
-  - 改善後: 約8.2MB (file + rgba のみ)
-- ✅ 処理速度: ベースライン比で実用的な性能
-  - 1920x1080 RGBA (Average filter): 117.1ms per decode
-  - 256x256 RGB (None filter): 17.2ms per decode
-  - 512x512 RGB (Sub filter): 10.9ms per decode (24.05 MP/s)
+- ✅ ピークメモリ削減: 74.9% 削減達成
+  - 1920x1080 RGBA: 8.2 MB (Phase 0 の 32.6 MB から 74.9% 削減)
+  - 全解凍バッファ (8.3MB) を廃止
+  - IDAT連結バッファ (2-3MB) を廃止
+- ✅ 処理速度: Phase 0 比で 30.7% 高速化
+  - 1920x1080 RGBA (Average filter): 19.1ms per decode (108.54 MP/s)
+  - 256x256 RGB (None filter): 2.6ms per decode (24.77 MP/s)
+  - 512x512 RGB (Sub filter): 1.5ms per decode (177.85 MP/s)
 
 #### Phase 1.1: format.zig 事前アロケーション化
 - ✅ すべてのテストが通る
@@ -549,8 +554,9 @@ while (i < rgb_data.len) : (i += 3) {
 
 #### Phase 1.2: filter type 0 memcpy 化
 - ✅ すべてのテストが通る
-- ✅ フィルタタイプ0使用画像で 50-70%向上
+- ⚠️ 実質的な性能改善なし（-0.03%、ほぼ変化なし）
 - ✅ 他フィルタタイプへの影響なし
+- **結論:** filter type 0 の memcpy 最適化は、エンドツーエンドでは効果が見られない
 
 #### Phase 2.1: フィルタ関数 inline 化
 - ✅ すべてのテストが通る
