@@ -231,8 +231,7 @@ pub const IDATChunkStreamAdapter = struct {
 
     const vtable: std.Io.Reader.VTable = .{
         .stream = stream,
-        .discard = discard,
-        // readVec and rebase use default implementations
+        // discard, readVec, and rebase use default implementations
     };
 
     pub fn init(png_data: []const u8) IDATChunkStreamAdapter {
@@ -271,33 +270,6 @@ pub const IDATChunkStreamAdapter = struct {
         return n;
     }
 
-    fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const self: *IDATChunkStreamAdapter = @fieldParentPtr("interface", r);
-
-        var total: usize = 0;
-        var temp_buffer: [4096]u8 = undefined;
-
-        const max = limit.toInt() orelse std.math.maxInt(usize);
-
-        while (total < max) {
-            const remaining = max - total;
-            const read_size = @min(remaining, temp_buffer.len);
-
-            const n = self.chunk_stream.read(temp_buffer[0..read_size]) catch |err| switch (err) {
-                error.ReadFailed => return error.ReadFailed,
-                error.EndOfStream => return error.EndOfStream,
-            };
-
-            if (n == 0) {
-                if (total == 0) return error.EndOfStream;
-                break;
-            }
-
-            total += n;
-        }
-
-        return total;
-    }
 };
 
 /// Calculate CRC-32 (ISO HDLC) for PNG chunk validation
