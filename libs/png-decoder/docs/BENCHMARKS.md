@@ -108,10 +108,10 @@
 
 2. **Dangling Pointer Bug修正**
    - ScanlineDecoderをheap allocation化（`!*ScanlineDecoder`を返す）
-   - `&self.idat_wrapper.interface`の安定したアドレスを確保
+   - `&self.chunk_stream_adapter.interface`の安定したアドレスを確保
 
 3. **IDATストリーミング完全実装**
-   - IDATReaderWrapperを実装（std.Io.Reader.Limitedパターン）
+   - IDATChunkStreamAdapterを実装（std.Io.Reader.Limitedパターン）
    - `@fieldParentPtr("interface", r)`でvtable実装
    - stream()とdiscard()メソッドを実装
    - collectIDATChunks()を削除 → **2-3MB IDAT連結バッファを削減**
@@ -165,7 +165,7 @@
 
 2. **IDAT連結バッファの削減**: 2-3MB 削減
    - Phase 0-1.2: collectIDATChunks()で全IDAT連結
-   - Phase 1.3: IDATReaderWrapperでチャンク単位ストリーミング
+   - Phase 1.3: IDATChunkStreamAdapterでチャンク単位ストリーミング
 
 3. **format変換バッファの削減**: Phase 1.1で既に削減済み
    - ArrayList → 事前アロケーションで約8MB削減
@@ -188,7 +188,7 @@
 
 ### 実装詳細
 - **libs/png-decoder/src/flate.zig**: ScanlineDecoder 実装
-  - IDATReaderWrapperによるチャンク単位ストリーミング
+  - IDATChunkStreamAdapterによるチャンク単位ストリーミング
   - readScanline() で行単位のフィルタ適用
   - 2つのスキャンラインバッファ（現在行/前行）でダブルバッファリング
 - **libs/png-decoder/src/format.zig**: 行単位変換関数

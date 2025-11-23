@@ -131,7 +131,7 @@ pub fn parseIHDR(chunk: Chunk) !IHDRInfo {
 /// Specification: https://www.w3.org/TR/png/#11IDAT
 ///
 /// NOTE: This function is for TESTING ONLY. It allocates a large buffer (2-3MB for typical images).
-/// Production code should use IDATReader for streaming IDAT data without memory overhead.
+/// Production code should use IDATChunkStream for streaming IDAT data without memory overhead.
 ///
 /// Returns a newly allocated slice containing concatenated IDAT data
 pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
@@ -156,15 +156,15 @@ pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]cons
 ///
 /// IDAT chunks contain the compressed image data. Multiple IDAT chunks are allowed
 /// and their data is treated as a continuous compressed stream.
-pub const IDATReader = struct {
+pub const IDATChunkStream = struct {
     png_data: []const u8,
     chunk_iter: ChunkIterator,
     current_chunk: ?[]const u8,
     chunk_offset: usize,
 
-    /// Initialize the IDATReader from PNG file data
+    /// Initialize the IDATChunkStream from PNG file data
     /// Starts with an empty current chunk; first call to read() will fetch the first IDAT
-    pub fn init(png_data: []const u8) IDATReader {
+    pub fn init(png_data: []const u8) IDATChunkStream {
         return .{
             .png_data = png_data,
             .chunk_iter = ChunkIterator.init(png_data),
@@ -175,7 +175,7 @@ pub const IDATReader = struct {
 
     /// Read data from IDAT chunks (std.Io.Reader compatible)
     /// Returns the number of bytes read (may be less than buffer.len)
-    pub fn read(self: *IDATReader, buffer: []u8) std.Io.Reader.Error!usize {
+    pub fn read(self: *IDATChunkStream, buffer: []u8) std.Io.Reader.Error!usize {
         var total_read: usize = 0;
 
         while (total_read < buffer.len) {
@@ -221,11 +221,11 @@ pub const IDATReader = struct {
 /// std.Io.Reader-compatible IDAT reader wrapper
 /// Specification: https://www.w3.org/TR/png/#11IDAT
 ///
-/// Wraps IDATReader to provide std.Io.Reader interface for compatibility
+/// Wraps IDATChunkStream to provide std.Io.Reader interface for compatibility
 /// with standard Zig I/O operations (e.g., decompression streams).
 /// Uses @fieldParentPtr pattern (similar to std.Io.Reader.Limited).
-pub const IDATReaderWrapper = struct {
-    idat_reader: IDATReader,
+pub const IDATChunkStreamAdapter = struct {
+    chunk_stream: IDATChunkStream,
     interface: std.Io.Reader,
     buffer: [64]u8,  // Small internal buffer for Reader operations
 
@@ -235,9 +235,9 @@ pub const IDATReaderWrapper = struct {
         // readVec and rebase use default implementations
     };
 
-    pub fn init(png_data: []const u8) IDATReaderWrapper {
+    pub fn init(png_data: []const u8) IDATChunkStreamAdapter {
         return .{
-            .idat_reader = IDATReader.init(png_data),
+            .chunk_stream = IDATChunkStream.init(png_data),
             .buffer = undefined,
             .interface = .{
                 .vtable = &vtable,
@@ -249,16 +249,16 @@ pub const IDATReaderWrapper = struct {
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *IDATReaderWrapper = @fieldParentPtr("interface", r);
+        const self: *IDATChunkStreamAdapter = @fieldParentPtr("interface", r);
 
         // std.Io.Reader contract: 0-byte request should return 0, not EOF
         const max = limit.minInt(4096);
         if (max == 0) return 0;
 
-        // Temporary buffer for reading from IDATReader
+        // Temporary buffer for reading from IDATChunkStream
         var temp_buffer: [4096]u8 = undefined;
 
-        const n = self.idat_reader.read(temp_buffer[0..max]) catch |err| switch (err) {
+        const n = self.chunk_stream.read(temp_buffer[0..max]) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
             error.EndOfStream => return error.EndOfStream,
         };
@@ -272,7 +272,7 @@ pub const IDATReaderWrapper = struct {
     }
 
     fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const self: *IDATReaderWrapper = @fieldParentPtr("interface", r);
+        const self: *IDATChunkStreamAdapter = @fieldParentPtr("interface", r);
 
         var total: usize = 0;
         var temp_buffer: [4096]u8 = undefined;
@@ -283,7 +283,7 @@ pub const IDATReaderWrapper = struct {
             const remaining = max - total;
             const read_size = @min(remaining, temp_buffer.len);
 
-            const n = self.idat_reader.read(temp_buffer[0..read_size]) catch |err| switch (err) {
+            const n = self.chunk_stream.read(temp_buffer[0..read_size]) catch |err| switch (err) {
                 error.ReadFailed => return error.ReadFailed,
                 error.EndOfStream => return error.EndOfStream,
             };

@@ -58,11 +58,11 @@ pub fn decompressZlib(
 /// Streaming scanline decoder
 ///
 /// Reads PNG scanlines directly from compressed IDAT chunks without buffering:
-/// - Streams IDAT chunks using IDATReaderWrapper (no concatenation buffer)
+/// - Streams IDAT chunks using IDATChunkStreamAdapter (no concatenation buffer)
 /// - Decompresses data incrementally (no full decompression buffer)
 /// - Processes scanlines one at a time
 pub const ScanlineDecoder = struct {
-    idat_wrapper: png_parser.IDATReaderWrapper, // Streaming IDAT reader
+    chunk_stream_adapter: png_parser.IDATChunkStreamAdapter, // Streaming IDAT reader
     decompressor: std.compress.flate.Decompress,
     window_buffer: []u8,
 
@@ -94,15 +94,15 @@ pub const ScanlineDecoder = struct {
         errdefer allocator.free(self.window_buffer);
 
         // Initialize IDAT streaming reader (no concatenation buffer)
-        self.idat_wrapper = png_parser.IDATReaderWrapper.init(png_data);
+        self.chunk_stream_adapter = png_parser.IDATChunkStreamAdapter.init(png_data);
 
         // Set buffer pointer after initialization (must be done after wrapper is in stable location)
-        self.idat_wrapper.interface.buffer = &self.idat_wrapper.buffer;
+        self.chunk_stream_adapter.interface.buffer = &self.chunk_stream_adapter.buffer;
 
         // Create decompressor with zlib container
-        // Use stable address of self.idat_wrapper.interface
+        // Use stable address of self.chunk_stream_adapter.interface
         self.decompressor = std.compress.flate.Decompress.init(
-            &self.idat_wrapper.interface,
+            &self.chunk_stream_adapter.interface,
             .zlib,
             self.window_buffer,
         );
