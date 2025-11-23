@@ -234,6 +234,11 @@ pub const IDATChunkStreamAdapter = struct {
         // discard, readVec, and rebase use default implementations
     };
 
+    /// Initialize IDAT chunk stream adapter
+    ///
+    /// IMPORTANT: Caller must set `interface.buffer` before use!
+    /// Example:
+    ///   adapter.interface.buffer = &adapter.buffer;
     pub fn init(png_data: []const u8) IDATChunkStreamAdapter {
         return .{
             .chunk_stream = IDATChunkStream.init(png_data),
