@@ -250,6 +250,9 @@ pub const IDATChunkStreamAdapter = struct {
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *IDATChunkStreamAdapter = @fieldParentPtr("interface", r);
 
+        // Verify buffer is correctly set (debug builds only)
+        std.debug.assert(@intFromPtr(r.buffer.ptr) == @intFromPtr(&self.buffer));
+
         // std.Io.Reader contract: 0-byte request should return 0, not EOF
         const max = limit.minInt(4096);
         if (max == 0) return 0;
