@@ -1,5 +1,8 @@
 // PNG Decoder Pixel Format Conversion
-// Converts raw pixel data to RGBA8888 format
+// Specification: https://www.w3.org/TR/png/#6Colour-values
+//
+// Converts PNG pixel data to RGBA8888 format (u32 per pixel, 0xRRGGBBAA).
+// Supports: Grayscale, RGB, RGBA (8-bit per channel)
 
 const std = @import("std");
 
@@ -96,7 +99,7 @@ pub fn rgbaToRGBA8888(
 }
 
 // ============================================================================
-// Phase 1.3 optimization: Row-based format conversion functions
+// Row-based format conversion functions
 // These functions convert a single scanline of pixel data to RGBA8888 format
 // and write directly to the output buffer, enabling streaming processing
 // ============================================================================

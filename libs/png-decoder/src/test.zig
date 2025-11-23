@@ -8,6 +8,24 @@ const flate_tests = @import("flate.zig");
 const filter = @import("filter.zig");
 const format = @import("format.zig");
 
+/// Test helper: Read a PNG chunk from data at the specified offset
+/// Returns the chunk structure with type and data
+fn readChunk(data: []const u8, offset: usize) !lib.png_parser.Chunk {
+    if (offset + 8 > data.len) return error.InvalidChunkSize;
+
+    const length = std.mem.readInt(u32, data[offset..][0..4], .big);
+    const chunk_type = data[offset + 4 .. offset + 8][0..4].*;
+
+    if (offset + 8 + length > data.len) return error.InvalidChunkSize;
+
+    const chunk_data = data[offset + 8 .. offset + 8 + length];
+
+    return lib.png_parser.Chunk{
+        .chunk_type = chunk_type,
+        .data = chunk_data,
+    };
+}
+
 test "All test cases - IHDR verification" {
     const allocator = std.testing.allocator;
 
@@ -28,7 +46,7 @@ test "All test cases - IHDR verification" {
         const after_signature = file_data[8..];
 
         // 最初のチャンクを読み取り（IHDR）
-        const chunk = try lib.png_parser.readChunk(after_signature, 0);
+        const chunk = try readChunk(after_signature, 0);
 
         // IHDRチャンクであることを確認
         try std.testing.expectEqualSlices(u8, "IHDR", &chunk.chunk_type);

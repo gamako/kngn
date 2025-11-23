@@ -1,7 +1,13 @@
 // PNG Filter Removal Module
-// Implements PNG filterning algorithms (RFC 2083)
-// Each scanline is prefixed with a filter type (0-4)
-// This module removes the filter to restore original pixel data
+// Specification: https://www.w3.org/TR/png/#9Filters
+//
+// PNG uses adaptive filtering to improve compression.
+// Each scanline is prefixed with a filter type byte (0-4):
+// - 0: None (no filtering)
+// - 1: Sub (difference from previous pixel)
+// - 2: Up (difference from pixel above)
+// - 3: Average (average of left and above)
+// - 4: Paeth (Paeth predictor)
 
 const std = @import("std");
 
@@ -233,7 +239,7 @@ fn filterPaeth(
 }
 
 // ============================================================================
-// Phase 1.3 optimization: Direct filter functions for scanline-based processing
+// Direct filter functions for scanline-based processing
 // These functions apply filters without allocating an intermediate buffer,
 // working directly on a scanline buffer for in-place filtering.
 // ============================================================================

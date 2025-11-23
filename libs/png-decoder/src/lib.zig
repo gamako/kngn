@@ -1,5 +1,12 @@
 // PNG Decoder Library for Zig
-// Phase 1: Grayscale PNG support
+// Specification: https://www.w3.org/TR/png/
+//
+// Supports decoding PNG images with the following color types:
+// - Grayscale (8-bit)
+// - RGB (8-bit per channel)
+// - RGBA (8-bit per channel)
+//
+// Output format: RGBA8888 (u32 per pixel)
 
 const std = @import("std");
 pub const png_parser = @import("png_parser.zig");
@@ -45,9 +52,14 @@ pub const PNGImage = struct {
 };
 
 
-/// Phase 1.3 optimization: Streaming PNG decoder
-/// Decodes PNG without allocating full IDAT, decompressed, or filtered buffers
-/// Uses IDATReader for IDAT streaming and ScanlineDecoder for line-by-line processing
+/// Decode PNG image data to RGBA8888 format
+///
+/// Streaming implementation that minimizes memory allocation:
+/// - Streams IDAT chunks without concatenation buffer
+/// - Processes scanlines incrementally without buffering full decompressed data
+///
+/// Supported formats: Grayscale, RGB, RGBA (8-bit per channel)
+/// Output: RGBA8888 pixels (u32 per pixel)
 pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingError!PNGImage {
     // Verify PNG signature
     if (!png_parser.verifySignature(file_data)) {
@@ -109,8 +121,8 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
         else => return error.UnsupportedColorType,
     };
 
-    // Phase 1.3: Initialize streaming scanline decoder
-    // This eliminates both IDAT concatenation buffer (2-3MB) and decompressed buffer (8.3MB)
+    // Initialize streaming scanline decoder
+    // Eliminates intermediate buffers (IDAT concatenation and full decompression)
     const scanline_decoder = try flate.ScanlineDecoder.init(
         allocator,
         file_data,

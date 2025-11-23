@@ -1,5 +1,18 @@
 // PNG Parser Module
 // PNG file parsing: signature verification, chunk reading, IHDR parsing
+//
+// PNG Specification: https://www.w3.org/TR/png/
+// Chunk Layout: https://www.w3.org/TR/png/#5Chunk-layout
+//
+// PNG file structure:
+//   1. Signature (8 bytes): PNG_SIGNATURE [137, 80, 78, 71, 13, 10, 26, 10]
+//   2. Chunks (repeating): IHDR (required, first) -> ... -> IDAT (data) -> ... -> IEND (required, last)
+//
+// Chunk structure (12 + data_length bytes):
+//   - Length (4 bytes, big-endian u32): Length of Data field
+//   - Type   (4 bytes, ASCII):          Chunk type (e.g., "IHDR", "IDAT", "IEND")
+//   - Data   (Length bytes):            Chunk payload data
+//   - CRC    (4 bytes, big-endian u32): CRC-32 checksum of Type + Data fields
 
 const std = @import("std");
 const crc = std.hash.crc;
@@ -7,24 +20,38 @@ const crc = std.hash.crc;
 /// PNG file signature (8 bytes)
 pub const PNG_SIGNATURE = [_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
 
-/// PNG Chunk structure
+/// PNG Chunk structure (parsed representation)
+/// Note: This structure holds only Type and Data fields.
+/// Length and CRC are validated during parsing but not stored.
 pub const Chunk = struct {
-    chunk_type: [4]u8,
-    data: []const u8,
+    chunk_type: [4]u8,      // Chunk Type (4-byte ASCII, e.g., "IHDR")
+    data: []const u8,       // Chunk Data (length varies)
 };
 
 /// IHDR (Image Header) chunk information
+/// Specification: https://www.w3.org/TR/png/#11IHDR
+///
+/// The IHDR chunk must appear first and contains critical image metadata.
 pub const IHDRInfo = struct {
-    width: u32,
-    height: u32,
-    bit_depth: u8,
-    color_type: u8,
-    compression: u8,
-    filter: u8,
-    interlace: u8,
+    width: u32,         // Image width in pixels (1-2^31-1)
+    height: u32,        // Image height in pixels (1-2^31-1)
+    bit_depth: u8,      // Bits per sample (1, 2, 4, 8, 16)
+    color_type: u8,     // Color type: 0=grayscale, 2=RGB, 3=indexed, 4=grayscale+alpha, 6=RGBA
+    compression: u8,    // Compression method (0=deflate/inflate)
+    filter: u8,         // Filter method (0=adaptive filtering with 5 basic filter types)
+    interlace: u8,      // Interlace method (0=no interlace, 1=Adam7 interlace)
 };
 
 /// ChunkIterator: iterate through PNG chunks
+///
+/// Iterates over all chunks in a PNG file, automatically skipping the 8-byte signature.
+/// Each chunk is validated (CRC check) before being returned.
+///
+/// Usage:
+///   var iter = ChunkIterator.init(png_data);
+///   while (try iter.next()) |chunk| {
+///       // Process chunk
+///   }
 pub const ChunkIterator = struct {
     data: []const u8,
     offset: usize,
@@ -82,26 +109,10 @@ pub fn verifySignature(data: []const u8) bool {
     return std.mem.eql(u8, data[0..PNG_SIGNATURE.len], &PNG_SIGNATURE);
 }
 
-/// Read a PNG chunk from data at the specified offset
-/// Returns the chunk structure with type and data
-pub fn readChunk(data: []const u8, offset: usize) !Chunk {
-    if (offset + 8 > data.len) return error.InvalidChunkSize;
-
-    const length = std.mem.readVarInt(u32, data[offset..][0..4], .big);
-    const chunk_type = data[offset + 4 .. offset + 8][0..4].*;
-
-    if (offset + 8 + length > data.len) return error.InvalidChunkSize;
-
-    const chunk_data = data[offset + 8 .. offset + 8 + length];
-
-    return Chunk{
-        .chunk_type = chunk_type,
-        .data = chunk_data,
-    };
-}
-
 /// Parse IHDR (Image Header) chunk
-/// IHDR must be exactly 13 bytes
+/// Specification: https://www.w3.org/TR/png/#11IHDR
+///
+/// IHDR must be exactly 13 bytes and appear as the first chunk in a PNG file.
 pub fn parseIHDR(chunk: Chunk) !IHDRInfo {
     if (chunk.data.len != 13) return error.InvalidChunkSize;
 
@@ -117,6 +128,11 @@ pub fn parseIHDR(chunk: Chunk) !IHDRInfo {
 }
 
 /// Collect all IDAT chunks and concatenate their data
+/// Specification: https://www.w3.org/TR/png/#11IDAT
+///
+/// NOTE: This function is for TESTING ONLY. It allocates a large buffer (2-3MB for typical images).
+/// Production code should use IDATReader for streaming IDAT data without memory overhead.
+///
 /// Returns a newly allocated slice containing concatenated IDAT data
 pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     var idat_buffer: std.ArrayList(u8) = .empty;
@@ -132,9 +148,14 @@ pub fn collectIDATChunks(allocator: std.mem.Allocator, data: []const u8) ![]cons
     return idat_buffer.toOwnedSlice(allocator);
 }
 
-/// Phase 1.3 optimization: Streaming IDAT reader
-/// Streams IDAT chunks without concatenating them into a single buffer
-/// This eliminates the 2-3MB IDAT concatenation buffer
+/// Streaming IDAT chunk reader
+/// Specification: https://www.w3.org/TR/png/#11IDAT
+///
+/// Streams IDAT chunks without concatenating them into a single buffer.
+/// This eliminates the 2-3MB IDAT concatenation buffer required by collectIDATChunks.
+///
+/// IDAT chunks contain the compressed image data. Multiple IDAT chunks are allowed
+/// and their data is treated as a continuous compressed stream.
 pub const IDATReader = struct {
     png_data: []const u8,
     chunk_iter: ChunkIterator,
@@ -197,9 +218,12 @@ pub const IDATReader = struct {
     }
 };
 
-/// Phase 1.3 optimization: std.Io.Reader-compatible IDAT reader wrapper
-/// Wraps IDATReader to provide std.Io.Reader interface
-/// Uses @fieldParentPtr pattern (similar to std.Io.Reader.Limited)
+/// std.Io.Reader-compatible IDAT reader wrapper
+/// Specification: https://www.w3.org/TR/png/#11IDAT
+///
+/// Wraps IDATReader to provide std.Io.Reader interface for compatibility
+/// with standard Zig I/O operations (e.g., decompression streams).
+/// Uses @fieldParentPtr pattern (similar to std.Io.Reader.Limited).
 pub const IDATReaderWrapper = struct {
     idat_reader: IDATReader,
     interface: std.Io.Reader,
@@ -277,7 +301,10 @@ pub const IDATReaderWrapper = struct {
 };
 
 /// Calculate CRC-32 (ISO HDLC) for PNG chunk validation
-/// CRC is computed over chunk type (4 bytes) + data (length bytes)
+/// Specification: https://www.w3.org/TR/png/#5CRC-algorithm
+///
+/// CRC is computed over chunk type (4 bytes) + data (length bytes).
+/// The CRC-32 algorithm used is defined in ISO 3309 / ITU-T V.42 (polynomial 0xedb88320).
 pub fn calculateChunkCRC(chunk_type: [4]u8, chunk_data: []const u8) u32 {
     var crc_calc = crc.Crc32IsoHdlc.init();
     crc_calc.update(&chunk_type);
@@ -286,7 +313,10 @@ pub fn calculateChunkCRC(chunk_type: [4]u8, chunk_data: []const u8) u32 {
 }
 
 /// Verify chunk CRC
-/// Returns true if the stored CRC matches the calculated CRC
+/// Specification: https://www.w3.org/TR/png/#5CRC-algorithm
+///
+/// Returns true if the stored CRC matches the calculated CRC.
+/// Used internally by ChunkIterator to validate chunk integrity.
 pub fn verifyChunkCRC(chunk_type: [4]u8, chunk_data: []const u8, stored_crc: u32) bool {
     const calculated_crc = calculateChunkCRC(chunk_type, chunk_data);
     return calculated_crc == stored_crc;

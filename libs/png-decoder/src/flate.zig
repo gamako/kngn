@@ -1,6 +1,12 @@
 // FLATE (DEFLATE) Decompression Module
-// Wrapper around std.compress.flate.Decompress for zlib format (RFC 1950)
-// PNG IDAT chunks are compressed using zlib format (DEFLATE + header/footer)
+// Specification: https://www.w3.org/TR/png/#10Compression
+// IDAT chunks: https://www.w3.org/TR/png/#11IDAT
+// Zlib format: RFC 1950 (https://www.rfc-editor.org/rfc/rfc1950)
+//
+// PNG IDAT chunks are compressed using zlib format:
+// - 2-byte zlib header
+// - DEFLATE-compressed data (RFC 1951)
+// - 4-byte Adler-32 checksum
 
 const std = @import("std");
 const png_parser = @import("png_parser.zig");
@@ -49,10 +55,12 @@ pub fn decompressZlib(
     return out_writer.toOwnedSlice();
 }
 
-/// Phase 1.3 optimization: Streaming scanline decoder
-/// Uses Decompress to read PNG scanlines without buffering full decompressed data
-/// This eliminates the 8.3MB decompressed buffer for large images
-/// Now also eliminates the 2-3MB IDAT concatenation buffer by using IDATReaderWrapper
+/// Streaming scanline decoder
+///
+/// Reads PNG scanlines directly from compressed IDAT chunks without buffering:
+/// - Streams IDAT chunks using IDATReaderWrapper (no concatenation buffer)
+/// - Decompresses data incrementally (no full decompression buffer)
+/// - Processes scanlines one at a time
 pub const ScanlineDecoder = struct {
     idat_wrapper: png_parser.IDATReaderWrapper, // Streaming IDAT reader
     decompressor: std.compress.flate.Decompress,
