@@ -176,7 +176,10 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
 
 /// Decode PNG from file path
 pub fn decodePNGFile(allocator: std.mem.Allocator, path: []const u8) DecodingError!PNGImage {
-    const file_data = try std.fs.cwd().readFileAlloc(path, allocator, std.math.maxInt(usize));
+    const file_data = std.fs.cwd().readFileAlloc(path, allocator, .unlimited) catch |err| {
+        std.debug.print("Failed to read file: {s}, error: {}\n", .{ path, err });
+        return DecodingError.ReadFailed;
+    };
     defer allocator.free(file_data);
 
     return decodePNG(allocator, file_data);

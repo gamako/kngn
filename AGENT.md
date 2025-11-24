@@ -17,10 +17,14 @@ video-proto/
 │   └── macos-metal/   # Metal実装
 ├── src/               # Zigコード
 │   ├── main.zig       # メインプログラム（虹色グラデーション）
-│   └── keyboard.zig   # キーボード定義モジュール
+│   ├── keyboard.zig   # キーボード定義モジュール
+│   └── sprite.zig     # スプライトシステム（Phase 2ヘルパー）
 ├── examples/          # サンプルプログラム
 │   ├── 01_timed_window/       # タイマー制御ウィンドウ
-│   └── 02_keyboard_input/     # キーボード入力
+│   ├── 02_keyboard_input/     # キーボード入力
+│   ├── 03_sprite_rendering/   # スプライト表示
+│   └── image/
+│       └── usako.png          # スプライト画像
 ├── libs/              # サブプロジェクト
 │   └── png-decoder/   # PNG デコーダー
 └── docs/              # ドキュメント
@@ -54,6 +58,10 @@ zig build run
 # 02_keyboard_input: インタラクティブなカラーパレット
 cd examples/02_keyboard_input
 zig build run
+
+# 03_sprite_rendering: スプライト表示と移動
+cd examples/03_sprite_rendering
+zig build run
 ```
 
 ## 開発フェーズの状態
@@ -62,9 +70,10 @@ zig build run
   - イベント処理API
   - 手動描画API
   - 時刻取得API
-- ✅ **サンプル**: 01_timed_window, 02_keyboard_input
-- ⚠️ **フェーズ2（ヘルパー関数群）**: 未着手
-  - FPSCounter, FixedTimeStep, DoubleBuffer等
+- ✅ **サンプル**: 01_timed_window, 02_keyboard_input, 03_sprite_rendering
+- 🚧 **フェーズ2（ヘルパー関数群）**: 進行中
+  - ✅ sprite.zig - スプライト描画（Phase 1: クリッピングのみ）
+  - ⚠️ FPSCounter, FixedTimeStep, DoubleBuffer等 - 未着手
 - ⚠️ **フェーズ3（テンプレート）**: 未着手
   - SimpleApp, GameLoop, SnapshotRenderer等
 
@@ -109,6 +118,7 @@ zig build test-png-format
 # 特定のサンプルを実行（ルートから）
 zig build run-example_01        # 01_timed_window
 zig build run-example_02        # 02_keyboard_input
+zig build run-example_03        # 03_sprite_rendering
 ```
 
 ---

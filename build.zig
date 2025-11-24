@@ -359,10 +359,22 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/keyboard.zig"),
     });
 
+    // PNG decoderモジュール
+    const png_decoder_module = b.createModule(.{
+        .root_source_file = b.path("libs/png-decoder/src/lib.zig"),
+    });
+
+    // スプライトモジュール
+    const sprite_module = b.createModule(.{
+        .root_source_file = b.path("src/sprite.zig"),
+    });
+    sprite_module.addImport("png-decoder", png_decoder_module);
+
     // サンプルプログラムをビルド・実行するヘルパー関数
     inline for (.{
         .{ .name = "example_01", .path = "examples/01_timed_window/main.zig" },
         .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig" },
+        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig" },
     }) |example| {
         // サンプル用Objective-C版
         const example_exe_objc = b.addExecutable(.{
@@ -376,6 +388,11 @@ pub fn build(b: *std.Build) void {
 
         // キーボードモジュールを追加
         example_exe_objc.root_module.addImport("keyboard", keyboard_module);
+
+        // example_03の場合はspriteモジュールも追加
+        if (std.mem.eql(u8, example.name, "example_03")) {
+            example_exe_objc.root_module.addImport("sprite", sprite_module);
+        }
 
         const example_objc_platform = compilePlatformLayer(b, .objc, optimize);
         example_exe_objc.root_module.addObjectFile(example_objc_platform.obj_file);
@@ -397,6 +414,11 @@ pub fn build(b: *std.Build) void {
         // キーボードモジュールを追加
         example_exe_swift.root_module.addImport("keyboard", keyboard_module);
 
+        // example_03の場合はspriteモジュールも追加
+        if (std.mem.eql(u8, example.name, "example_03")) {
+            example_exe_swift.root_module.addImport("sprite", sprite_module);
+        }
+
         const example_swift_platform = compilePlatformLayer(b, .swift, optimize);
         example_exe_swift.root_module.addObjectFile(example_swift_platform.obj_file);
         example_exe_swift.root_module.link_libc = true;
@@ -417,6 +439,11 @@ pub fn build(b: *std.Build) void {
 
         // キーボードモジュールを追加
         example_exe_metal.root_module.addImport("keyboard", keyboard_module);
+
+        // example_03の場合はspriteモジュールも追加
+        if (std.mem.eql(u8, example.name, "example_03")) {
+            example_exe_metal.root_module.addImport("sprite", sprite_module);
+        }
 
         const example_metal_platform = compilePlatformLayer(b, .metal, optimize);
         example_exe_metal.root_module.addObjectFile(example_metal_platform.obj_file);
