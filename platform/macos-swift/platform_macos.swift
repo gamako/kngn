@@ -150,19 +150,35 @@ let PLATFORM_MOD_CTRL: UInt32 = 0x02
 let PLATFORM_MOD_ALT: UInt32 = 0x04
 let PLATFORM_MOD_CMD: UInt32 = 0x08
 
-// イベントキュー構造体
-struct EventQueue {
-    var events: [PlatformEvent]
+// イベントキュー構造体（固定サイズ配列を使用）
+class EventQueue {
+    private var events: UnsafeMutablePointer<PlatformEvent>
     var head: Int = 0  // 次に書き込む位置
     var tail: Int = 0  // 次に読む位置
 
     init() {
-        var events = [PlatformEvent]()
-        for _ in 0..<EVENT_QUEUE_SIZE {
-            var event = PlatformEvent(type: PLATFORM_EVENT_NONE, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
-            events.append(event)
+        // 固定サイズのメモリバッファを確保
+        events = UnsafeMutablePointer<PlatformEvent>.allocate(capacity: EVENT_QUEUE_SIZE)
+        // すべてのイベントをNONEで初期化
+        let emptyEvent = PlatformEvent(
+            type: PLATFORM_EVENT_NONE,
+            keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0)
+        )
+        events.initialize(repeating: emptyEvent, count: EVENT_QUEUE_SIZE)
+    }
+
+    subscript(index: Int) -> PlatformEvent {
+        get {
+            return events[index]
         }
-        self.events = events
+        set {
+            events[index] = newValue
+        }
+    }
+
+    deinit {
+        events.deinitialize(count: EVENT_QUEUE_SIZE)
+        events.deallocate()
     }
 }
 
@@ -634,7 +650,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
         // キーボードイベントをイベントキューに追加
         if event.type == .keyDown || event.type == .keyUp {
-            var queue = handle.event_queue
+            let queue = handle.event_queue
             let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
 
             // キューがいっぱいでない場合のみ追加
@@ -645,9 +661,8 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
                 platform_event.keyboard.is_repeat = event.isARepeat
                 platform_event.keyboard.modifiers = extractModifiers(event.modifierFlags)
 
-                queue.events[queue.head] = platform_event
+                queue[queue.head] = platform_event
                 queue.head = next_head
-                handle.event_queue = queue
             }
         }
 
@@ -658,13 +673,12 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     // ウィンドウが閉じられているか確認
     if !handle.window.isVisible {
         // QUITイベントをキューに追加
-        var queue = handle.event_queue
+        let queue = handle.event_queue
         let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
         if next_head != queue.tail {
-            var quit_event = PlatformEvent(type: PLATFORM_EVENT_QUIT, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
-            queue.events[queue.head] = quit_event
+            let quit_event = PlatformEvent(type: PLATFORM_EVENT_QUIT, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
+            queue[queue.head] = quit_event
             queue.head = next_head
-            handle.event_queue = queue
         }
         return false
     }
@@ -721,7 +735,7 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
     guard let window = window, let event = event else { return false }
 
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(window).takeUnretainedValue()
-    var queue = handle.event_queue
+    let queue = handle.event_queue
 
     // キューが空の場合
     if queue.head == queue.tail {
@@ -729,10 +743,10 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
     }
 
     // キューから次のイベントを取得（メモリコピー）
-    memcpy(event, &queue.events[queue.tail], MemoryLayout<PlatformEvent>.size)
+    let eventPtr = event.bindMemory(to: PlatformEvent.self, capacity: 1)
+    eventPtr.pointee = queue[queue.tail]
 
     queue.tail = (queue.tail + 1) % EVENT_QUEUE_SIZE
-    handle.event_queue = queue
 
     return true
 }
