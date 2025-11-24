@@ -77,7 +77,8 @@ pub fn main() !void {
             const fb = pixels[0..pixel_count];
 
             // 背景クリア（黒）
-            @memset(fb, 0x000000FF);
+            // Byte order [R=0, G=0, B=0, A=255] in memory
+            @memset(fb, 0xFF000000);
 
             // スプライト描画
             sprite.drawSprite(

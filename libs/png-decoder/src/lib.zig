@@ -7,6 +7,7 @@
 // - RGBA (8-bit per channel)
 //
 // Output format: RGBA8888 (u32 per pixel)
+// Memory layout: Byte order [R, G, B, A] regardless of system endianness
 
 const std = @import("std");
 pub const png_parser = @import("png_parser.zig");
@@ -44,7 +45,7 @@ pub const DecodingError = error{
 pub const PNGImage = struct {
     width: u32,
     height: u32,
-    pixels: []u32,  // RGBA8888 format
+    pixels: []u32,  // RGBA8888 format with byte order [R, G, B, A] in memory
 
     pub fn deinit(self: *PNGImage, allocator: std.mem.Allocator) void {
         allocator.free(self.pixels);
@@ -59,7 +60,7 @@ pub const PNGImage = struct {
 /// - Processes scanlines incrementally without buffering full decompressed data
 ///
 /// Supported formats: Grayscale, RGB, RGBA (8-bit per channel)
-/// Output: RGBA8888 pixels (u32 per pixel)
+/// Output: RGBA8888 pixels (u32 per pixel) with byte order [R, G, B, A] in memory
 pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingError!PNGImage {
     // Verify PNG signature
     if (!png_parser.verifySignature(file_data)) {
