@@ -530,6 +530,9 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                     queue->events[queue->head] = platform_event;
                     queue->head = next_head;
                 }
+
+                // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
+                continue;
             }
 
             [app sendEvent:event];

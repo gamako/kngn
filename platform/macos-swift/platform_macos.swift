@@ -664,6 +664,9 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
                 queue[queue.head] = platform_event
                 queue.head = next_head
             }
+
+            // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
+            continue
         }
 
         app.sendEvent(event)
