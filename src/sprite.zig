@@ -53,10 +53,41 @@ pub const Sprite = struct {
     }
 };
 
+/// アルファブレンディング
+/// ピクセルフォーマット: u32 = 0xAABBGGRR（リトルエンディアン、メモリ上[R,G,B,A]順）
+fn blendPixel(dst: u32, src: u32) u32 {
+    const src_a = (src >> 24) & 0xFF;
+
+    // 早期リターン: 完全透明（出力アルファは常に0xFFに強制）
+    if (src_a == 0) return dst | 0xFF000000;
+
+    // 早期リターン: 完全不透明
+    if (src_a == 255) return src | 0xFF000000;
+
+    // アルファブレンディング
+    const src_r = src & 0xFF;
+    const src_g = (src >> 8) & 0xFF;
+    const src_b = (src >> 16) & 0xFF;
+
+    const dst_r = dst & 0xFF;
+    const dst_g = (dst >> 8) & 0xFF;
+    const dst_b = (dst >> 16) & 0xFF;
+
+    // out = src * src_a + dst * (255 - src_a) / 255
+    const inv_a = 255 - src_a;
+    const out_r = (src_r * src_a + dst_r * inv_a) / 255;
+    const out_g = (src_g * src_a + dst_g * inv_a) / 255;
+    const out_b = (src_b * src_a + dst_b * inv_a) / 255;
+
+    // 出力アルファは常に0xFF（ウィンドウは常に不透明）
+    return out_r | (out_g << 8) | (out_b << 16) | 0xFF000000;
+}
+
 /// フレームバッファにスプライトを描画（クリッピング処理付き）
 ///
-/// Phase 1実装: 単純コピー（アルファブレンディングなし）
-/// 透明部分も上書きされます。
+/// アルファブレンディング対応:
+/// - 透明ピクセル（alpha=0）は背景を透過
+/// - 半透明ピクセルは背景とブレンド
 ///
 /// - framebuffer: フレームバッファ（RGBA8888形式）
 /// - fb_width: フレームバッファの幅
@@ -113,7 +144,7 @@ pub fn drawSprite(
             const src_idx = src_y * sprite_width + src_x;
             const dst_idx = dst_y * fb_width + dst_x;
 
-            framebuffer[dst_idx] = sprite.image.pixels[src_idx];
+            framebuffer[dst_idx] = blendPixel(framebuffer[dst_idx], sprite.image.pixels[src_idx]);
         }
     }
 }
