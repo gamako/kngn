@@ -53,17 +53,46 @@ pub const Sprite = struct {
     }
 };
 
-/// x / 255 の高速近似計算
-/// 0 <= x <= 65025 の範囲で正確
-inline fn div255(x: u32) u32 {
-    return (x + 1 + (x >> 8)) >> 8;
+// SIMD用の型エイリアス
+const Vec4u16 = @Vector(4, u16);
+
+/// x / 255 の高速近似計算（ベクトル版）
+/// 各要素に対して 0 <= x <= 65025 の範囲で正確
+inline fn div255Vec(x: Vec4u16) Vec4u16 {
+    const one: Vec4u16 = @splat(1);
+    const eight: @Vector(4, u4) = @splat(8);
+    return (x + one + (x >> eight)) >> eight;
 }
 
-/// Premultiplied Alpha形式のアルファブレンディング
+/// u32ピクセルからVec4u16への変換
+/// ピクセルフォーマット: 0xAABBGGRR → [R, G, B, A] としてu16ベクトル化
+inline fn pixelToVec(pixel: u32) Vec4u16 {
+    const bytes: [4]u8 = @bitCast(pixel);
+    return .{
+        @as(u16, bytes[0]),
+        @as(u16, bytes[1]),
+        @as(u16, bytes[2]),
+        @as(u16, bytes[3]),
+    };
+}
+
+/// Vec4u16からu32ピクセルへの変換
+/// アルファチャンネルは0xFFに強制
+inline fn vecToPixel(vec: Vec4u16) u32 {
+    const result_bytes: [4]u8 = .{
+        @truncate(vec[0]),
+        @truncate(vec[1]),
+        @truncate(vec[2]),
+        0xFF,
+    };
+    return @bitCast(result_bytes);
+}
+
+/// Premultiplied Alpha形式のアルファブレンディング（SIMD版）
 /// out = src_pre + dst * (1 - src_a)
 /// ピクセルフォーマット: u32 = 0xAABBGGRR（リトルエンディアン、メモリ上[R,G,B,A]順）
 fn blendPixel(dst: u32, src_pre: u32) u32 {
-    const src_a = (src_pre >> 24) & 0xFF;
+    const src_a: u8 = @truncate(src_pre >> 24);
 
     // 早期リターン: 完全透明（出力アルファは常に0xFFに強制）
     if (src_a == 0) return dst | 0xFF000000;
@@ -71,22 +100,15 @@ fn blendPixel(dst: u32, src_pre: u32) u32 {
     // 早期リターン: 完全不透明
     if (src_a == 255) return src_pre | 0xFF000000;
 
+    // SIMD計算: 4チャンネル同時にブレンディング
+    const src_vec = pixelToVec(src_pre);
+    const dst_vec = pixelToVec(dst);
+    const inv_a: Vec4u16 = @splat(@as(u16, 255 - src_a));
+
     // Premultiplied alpha blending: out = src_pre + dst * (255 - src_a) / 255
-    const src_r_pre = src_pre & 0xFF;
-    const src_g_pre = (src_pre >> 8) & 0xFF;
-    const src_b_pre = (src_pre >> 16) & 0xFF;
+    const blended = src_vec + div255Vec(dst_vec * inv_a);
 
-    const dst_r = dst & 0xFF;
-    const dst_g = (dst >> 8) & 0xFF;
-    const dst_b = (dst >> 16) & 0xFF;
-
-    const inv_a = 255 - src_a;
-    const out_r = src_r_pre + div255(dst_r * inv_a);
-    const out_g = src_g_pre + div255(dst_g * inv_a);
-    const out_b = src_b_pre + div255(dst_b * inv_a);
-
-    // 出力アルファは常に0xFF（ウィンドウは常に不透明）
-    return out_r | (out_g << 8) | (out_b << 16) | 0xFF000000;
+    return vecToPixel(blended);
 }
 
 /// フレームバッファにスプライトを描画（クリッピング処理付き）
