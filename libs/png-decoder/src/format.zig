@@ -170,6 +170,51 @@ pub fn rgbaToRGBA8888Row(output: []u32, rgba_row: []const u8) void {
     }
 }
 
+// ============================================================================
+// Premultiplied Alpha format conversion functions
+// These functions convert pixel data to Premultiplied RGBA8888 format
+// where RGB channels are pre-multiplied by alpha: R_pre = R * A / 255
+// ============================================================================
+
+/// Convert a single scanline of RGBA (8-bit) to Premultiplied RGBA8888
+/// RGB channels are pre-multiplied by alpha: R_pre = R * A / 255
+///
+/// Input:  RGBA scanline data [r0, g0, b0, a0, r1, g1, b1, a1, ...] (width*4 bytes)
+/// Output: Pre-allocated Premultiplied RGBA8888 buffer (must be at least width u32s)
+/// Memory layout: Byte order [R_pre, G_pre, B_pre, A] regardless of system endianness
+pub fn rgbaToPremultipliedRGBA8888Row(output: []u32, rgba_row: []const u8) void {
+    var i: usize = 0;
+    var out_idx: usize = 0;
+
+    while (i < rgba_row.len) : (i += 4) {
+        const r = rgba_row[i];
+        const g = rgba_row[i + 1];
+        const b = rgba_row[i + 2];
+        const a = rgba_row[i + 3];
+
+        // Premultiply: channel_pre = channel * alpha / 255
+        const r_pre: u8 = @truncate((@as(u32, r) * @as(u32, a)) / 255);
+        const g_pre: u8 = @truncate((@as(u32, g) * @as(u32, a)) / 255);
+        const b_pre: u8 = @truncate((@as(u32, b) * @as(u32, a)) / 255);
+
+        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
+        const rgba = (@as(u32, a) << 24) | (@as(u32, b_pre) << 16) |
+            (@as(u32, g_pre) << 8) | @as(u32, r_pre);
+        output[out_idx] = rgba;
+        out_idx += 1;
+    }
+}
+
+/// Convert a single scanline of Grayscale (8-bit) to Premultiplied RGBA8888
+/// Since alpha is always 255 (fully opaque), no premultiplication is needed
+/// This is an alias for grayscaleToRGBA8888Row
+pub const grayscaleToPremultipliedRGBA8888Row = grayscaleToRGBA8888Row;
+
+/// Convert a single scanline of RGB (8-bit) to Premultiplied RGBA8888
+/// Since alpha is always 255 (fully opaque), no premultiplication is needed
+/// This is an alias for rgbToRGBA8888Row
+pub const rgbToPremultipliedRGBA8888Row = rgbToRGBA8888Row;
+
 // Unit tests
 test "Grayscale to RGBA8888 - single pixel" {
     const allocator = std.testing.allocator;
@@ -351,4 +396,78 @@ test "grayscaleToRGBA8888Row - byte order verification" {
     try std.testing.expectEqual(@as(u8, 0x7F), bytes[1]); // G at byte 1
     try std.testing.expectEqual(@as(u8, 0x7F), bytes[2]); // B at byte 2
     try std.testing.expectEqual(@as(u8, 0xFF), bytes[3]); // A at byte 3 (fully opaque)
+}
+
+// ============================================================================
+// Premultiplied Alpha format conversion tests
+// ============================================================================
+
+test "rgbaToPremultipliedRGBA8888Row - semi-transparent pixel" {
+    // Input: R=100, G=200, B=50, A=128 (50% transparent)
+    const input = [_]u8{ 100, 200, 50, 128 };
+    var output: [1]u32 = undefined;
+
+    rgbaToPremultipliedRGBA8888Row(&output, &input);
+
+    // Expected: R_pre = 100*128/255 ≈ 50, G_pre = 200*128/255 ≈ 100, B_pre = 50*128/255 ≈ 25
+    const bytes = @as([*]const u8, @ptrCast(&output[0]));
+    try std.testing.expectEqual(@as(u8, 50), bytes[0]); // R_pre
+    try std.testing.expectEqual(@as(u8, 100), bytes[1]); // G_pre
+    try std.testing.expectEqual(@as(u8, 25), bytes[2]); // B_pre
+    try std.testing.expectEqual(@as(u8, 128), bytes[3]); // A (unchanged)
+}
+
+test "rgbaToPremultipliedRGBA8888Row - fully opaque pixel" {
+    // Input: R=255, G=128, B=64, A=255 (fully opaque)
+    // When A=255, premultiplied values equal original values
+    const input = [_]u8{ 255, 128, 64, 255 };
+    var output: [1]u32 = undefined;
+
+    rgbaToPremultipliedRGBA8888Row(&output, &input);
+
+    const bytes = @as([*]const u8, @ptrCast(&output[0]));
+    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R_pre = R
+    try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G_pre = G
+    try std.testing.expectEqual(@as(u8, 64), bytes[2]); // B_pre = B
+    try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
+}
+
+test "rgbaToPremultipliedRGBA8888Row - fully transparent pixel" {
+    // Input: R=255, G=128, B=64, A=0 (fully transparent)
+    // When A=0, all premultiplied values become 0
+    const input = [_]u8{ 255, 128, 64, 0 };
+    var output: [1]u32 = undefined;
+
+    rgbaToPremultipliedRGBA8888Row(&output, &input);
+
+    const bytes = @as([*]const u8, @ptrCast(&output[0]));
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // R_pre = 0
+    try std.testing.expectEqual(@as(u8, 0), bytes[1]); // G_pre = 0
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B_pre = 0
+    try std.testing.expectEqual(@as(u8, 0), bytes[3]); // A = 0
+}
+
+test "rgbaToPremultipliedRGBA8888Row - multiple pixels" {
+    // Input: two RGBA pixels
+    const input = [_]u8{
+        255, 0,   0,   255, // Red (fully opaque)
+        0,   255, 0,   128, // Green (semi-transparent)
+    };
+    var output: [2]u32 = undefined;
+
+    rgbaToPremultipliedRGBA8888Row(&output, &input);
+
+    // Pixel 0: fully opaque red
+    var bytes = @as([*]const u8, @ptrCast(&output[0]));
+    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R_pre
+    try std.testing.expectEqual(@as(u8, 0), bytes[1]); // G_pre
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B_pre
+    try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
+
+    // Pixel 1: semi-transparent green, G_pre = 255*128/255 = 128
+    bytes = @as([*]const u8, @ptrCast(&output[1]));
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // R_pre
+    try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G_pre
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B_pre
+    try std.testing.expectEqual(@as(u8, 128), bytes[3]); // A
 }

@@ -52,6 +52,18 @@ pub const PNGImage = struct {
     }
 };
 
+/// PNG image data in Premultiplied RGBA8888 format
+/// RGB channels are pre-multiplied by alpha: R_pre = R * A / 255
+/// This format enables faster alpha blending by eliminating per-pixel multiplication
+pub const PremultipliedImage = struct {
+    width: u32,
+    height: u32,
+    pixels: []u32,  // Premultiplied RGBA8888: byte order [R_pre, G_pre, B_pre, A] in memory
+
+    pub fn deinit(self: *PremultipliedImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.pixels);
+    }
+};
 
 /// Decode PNG image data to RGBA8888 format
 ///
@@ -184,6 +196,130 @@ pub fn decodePNGFile(allocator: std.mem.Allocator, path: []const u8) DecodingErr
     defer allocator.free(file_data);
 
     return decodePNG(allocator, file_data);
+}
+
+/// Decode PNG image data to Premultiplied RGBA8888 format
+///
+/// Same as decodePNG but outputs Premultiplied alpha format where
+/// RGB channels are pre-multiplied by alpha: R_pre = R * A / 255
+///
+/// This format enables faster alpha blending:
+/// - Standard: out = src * src_a + dst * (1 - src_a)  (requires 3 multiplications)
+/// - Premultiplied: out = src_pre + dst * (1 - src_a) (no source multiplication)
+pub fn decodePNGPremultiplied(allocator: std.mem.Allocator, file_data: []const u8) DecodingError!PremultipliedImage {
+    // Verify PNG signature
+    if (!png_parser.verifySignature(file_data)) {
+        return error.InvalidPNGSignature;
+    }
+
+    // Create chunk iterator and read first chunk (IHDR)
+    var chunk_iter = png_parser.ChunkIterator.init(file_data);
+
+    // Read IHDR chunk (first chunk after signature)
+    const ihdr_chunk_opt = try chunk_iter.next();
+    if (ihdr_chunk_opt == null) {
+        return error.MissingIHDR;
+    }
+    const ihdr_chunk = ihdr_chunk_opt.?;
+
+    // Verify IHDR chunk type
+    if (!std.mem.eql(u8, "IHDR", &ihdr_chunk.chunk_type)) {
+        return error.MissingIHDR;
+    }
+
+    // Parse IHDR data
+    const ihdr = try png_parser.parseIHDR(ihdr_chunk);
+
+    // Validate dimensions
+    if (ihdr.width == 0 or ihdr.height == 0) {
+        return error.InvalidDimensions;
+    }
+
+    // Validate IHDR format fields (must match PNG specification)
+    if (ihdr.bit_depth != 8) {
+        return error.UnsupportedFormat;
+    }
+    if (ihdr.compression != 0) {
+        return error.UnsupportedFormat;
+    }
+    if (ihdr.filter != 0) {
+        return error.UnsupportedFormat;
+    }
+    if (ihdr.interlace != 0) {
+        return error.UnsupportedFormat;
+    }
+
+    // Determine bytes per pixel and validate color type
+    const color_type: ColorType = @enumFromInt(ihdr.color_type);
+    const bytes_per_pixel: u32 = switch (color_type) {
+        .grayscale => 1,
+        .rgb => 3,
+        .rgba => 4,
+        else => return error.UnsupportedColorType,
+    };
+
+    // Initialize streaming scanline decoder
+    const scanline_decoder = try flate.ScanlineDecoder.init(
+        allocator,
+        file_data,
+        ihdr.width,
+        ihdr.height,
+        bytes_per_pixel,
+    );
+    defer scanline_decoder.deinit(allocator);
+
+    // Allocate output buffer for Premultiplied RGBA8888 pixels
+    const total_pixels = std.math.mul(usize, @as(usize, ihdr.width), @as(usize, ihdr.height)) catch return error.InvalidDimensions;
+    const rgba_pixels = try allocator.alloc(u32, total_pixels);
+    errdefer allocator.free(rgba_pixels);
+
+    // Process scanlines with premultiplied conversion
+    var row: u32 = 0;
+    while (try scanline_decoder.readScanline()) |filtered_scanline| : (row += 1) {
+        const output_offset = row * ihdr.width;
+
+        // Convert filtered scanline to Premultiplied RGBA8888 format
+        switch (color_type) {
+            .grayscale => {
+                // A=255, so premultiplied = straight
+                format.grayscaleToPremultipliedRGBA8888Row(
+                    rgba_pixels[output_offset..],
+                    filtered_scanline,
+                );
+            },
+            .rgb => {
+                // A=255, so premultiplied = straight
+                format.rgbToPremultipliedRGBA8888Row(
+                    rgba_pixels[output_offset..],
+                    filtered_scanline,
+                );
+            },
+            .rgba => {
+                format.rgbaToPremultipliedRGBA8888Row(
+                    rgba_pixels[output_offset..],
+                    filtered_scanline,
+                );
+            },
+            else => return error.UnsupportedColorType,
+        }
+    }
+
+    return PremultipliedImage{
+        .width = ihdr.width,
+        .height = ihdr.height,
+        .pixels = rgba_pixels,
+    };
+}
+
+/// Decode PNG from file path to Premultiplied RGBA8888 format
+pub fn decodePNGFilePremultiplied(allocator: std.mem.Allocator, path: []const u8) DecodingError!PremultipliedImage {
+    const file_data = std.fs.cwd().readFileAlloc(path, allocator, .unlimited) catch |err| {
+        std.debug.print("Failed to read file: {s}, error: {}\n", .{ path, err });
+        return DecodingError.ReadFailed;
+    };
+    defer allocator.free(file_data);
+
+    return decodePNGPremultiplied(allocator, file_data);
 }
 
 // Unit tests for decodePNG

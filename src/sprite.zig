@@ -1,12 +1,12 @@
 const std = @import("std");
 const png_decoder = @import("png-decoder");
 
-const PNGImage = png_decoder.PNGImage;
+const PremultipliedImage = png_decoder.PremultipliedImage;
 
 /// スプライト構造体
-/// PNG画像データと画面座標を保持
+/// Premultiplied Alpha形式のPNG画像データと画面座標を保持
 pub const Sprite = struct {
-    image: PNGImage,
+    image: PremultipliedImage,
     x: i32,
     y: i32,
 
@@ -16,7 +16,7 @@ pub const Sprite = struct {
     /// - x: 初期X座標
     /// - y: 初期Y座標
     pub fn init(allocator: std.mem.Allocator, path: []const u8, x: i32, y: i32) !Sprite {
-        const image = try png_decoder.decodePNGFile(allocator, path);
+        const image = try png_decoder.decodePNGFilePremultiplied(allocator, path);
         return Sprite{
             .image = image,
             .x = x,
@@ -31,7 +31,7 @@ pub const Sprite = struct {
     /// - x: 初期X座標
     /// - y: 初期Y座標
     pub fn initFromData(allocator: std.mem.Allocator, png_data: []const u8, x: i32, y: i32) !Sprite {
-        const image = try png_decoder.decodePNG(allocator, png_data);
+        const image = try png_decoder.decodePNGPremultiplied(allocator, png_data);
         return Sprite{
             .image = image,
             .x = x,
@@ -53,31 +53,31 @@ pub const Sprite = struct {
     }
 };
 
-/// アルファブレンディング
+/// Premultiplied Alpha形式のアルファブレンディング
+/// out = src_pre + dst * (1 - src_a)
 /// ピクセルフォーマット: u32 = 0xAABBGGRR（リトルエンディアン、メモリ上[R,G,B,A]順）
-fn blendPixel(dst: u32, src: u32) u32 {
-    const src_a = (src >> 24) & 0xFF;
+fn blendPixel(dst: u32, src_pre: u32) u32 {
+    const src_a = (src_pre >> 24) & 0xFF;
 
     // 早期リターン: 完全透明（出力アルファは常に0xFFに強制）
     if (src_a == 0) return dst | 0xFF000000;
 
     // 早期リターン: 完全不透明
-    if (src_a == 255) return src | 0xFF000000;
+    if (src_a == 255) return src_pre | 0xFF000000;
 
-    // アルファブレンディング
-    const src_r = src & 0xFF;
-    const src_g = (src >> 8) & 0xFF;
-    const src_b = (src >> 16) & 0xFF;
+    // Premultiplied alpha blending: out = src_pre + dst * (255 - src_a) / 255
+    const src_r_pre = src_pre & 0xFF;
+    const src_g_pre = (src_pre >> 8) & 0xFF;
+    const src_b_pre = (src_pre >> 16) & 0xFF;
 
     const dst_r = dst & 0xFF;
     const dst_g = (dst >> 8) & 0xFF;
     const dst_b = (dst >> 16) & 0xFF;
 
-    // out = src * src_a + dst * (255 - src_a) / 255
     const inv_a = 255 - src_a;
-    const out_r = (src_r * src_a + dst_r * inv_a) / 255;
-    const out_g = (src_g * src_a + dst_g * inv_a) / 255;
-    const out_b = (src_b * src_a + dst_b * inv_a) / 255;
+    const out_r = src_r_pre + (dst_r * inv_a) / 255;
+    const out_g = src_g_pre + (dst_g * inv_a) / 255;
+    const out_b = src_b_pre + (dst_b * inv_a) / 255;
 
     // 出力アルファは常に0xFF（ウィンドウは常に不透明）
     return out_r | (out_g << 8) | (out_b << 16) | 0xFF000000;
@@ -85,7 +85,7 @@ fn blendPixel(dst: u32, src: u32) u32 {
 
 /// フレームバッファにスプライトを描画（クリッピング処理付き）
 ///
-/// アルファブレンディング対応:
+/// Premultiplied Alpha形式のアルファブレンディング対応:
 /// - 透明ピクセル（alpha=0）は背景を透過
 /// - 半透明ピクセルは背景とブレンド
 ///
@@ -130,7 +130,7 @@ pub fn drawSprite(
         fb_height - dst_y_start,
     );
 
-    // ピクセルコピー（クリップされた範囲のみ）
+    // ピクセルブレンド（クリップされた範囲のみ）
     var y: u32 = 0;
     while (y < visible_height) : (y += 1) {
         const src_y = src_y_start + y;
