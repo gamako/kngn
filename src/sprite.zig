@@ -53,6 +53,12 @@ pub const Sprite = struct {
     }
 };
 
+/// x / 255 の高速近似計算
+/// 0 <= x <= 65025 の範囲で正確
+inline fn div255(x: u32) u32 {
+    return (x + 1 + (x >> 8)) >> 8;
+}
+
 /// Premultiplied Alpha形式のアルファブレンディング
 /// out = src_pre + dst * (1 - src_a)
 /// ピクセルフォーマット: u32 = 0xAABBGGRR（リトルエンディアン、メモリ上[R,G,B,A]順）
@@ -75,9 +81,9 @@ fn blendPixel(dst: u32, src_pre: u32) u32 {
     const dst_b = (dst >> 16) & 0xFF;
 
     const inv_a = 255 - src_a;
-    const out_r = src_r_pre + (dst_r * inv_a) / 255;
-    const out_g = src_g_pre + (dst_g * inv_a) / 255;
-    const out_b = src_b_pre + (dst_b * inv_a) / 255;
+    const out_r = src_r_pre + div255(dst_r * inv_a);
+    const out_g = src_g_pre + div255(dst_g * inv_a);
+    const out_b = src_b_pre + div255(dst_b * inv_a);
 
     // 出力アルファは常に0xFF（ウィンドウは常に不透明）
     return out_r | (out_g << 8) | (out_b << 16) | 0xFF000000;
