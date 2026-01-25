@@ -107,7 +107,9 @@ pub fn main() !void {
         // ゲームループのレート制御（約60FPS）
         // platform_present()は即座にリターンするため、
         // 固定時間waitすることでループの実行回数を制限
-        std.Thread.sleep(16_666_666); // 16.67ms (1/60秒)
+        // 16.67ms (1/60秒)
+        var req = std.c.timespec{ .sec = 0, .nsec = 16_666_666 };
+        _ = std.c.nanosleep(&req, null);
     }
 
     std.debug.print("Application terminated.\n", .{});

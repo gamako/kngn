@@ -370,11 +370,22 @@ pub fn build(b: *std.Build) void {
     });
     sprite_module.addImport("png-decoder", png_decoder_module);
 
+    // 固定タイムステップモジュール
+    const fixed_timestep_module = b.createModule(.{
+        .root_source_file = b.path("src/fixed_timestep.zig"),
+    });
+
+    // FPSカウンターモジュール
+    const fps_counter_module = b.createModule(.{
+        .root_source_file = b.path("src/fps_counter.zig"),
+    });
+
     // サンプルプログラムをビルド・実行するヘルパー関数
     inline for (.{
         .{ .name = "example_01", .path = "examples/01_timed_window/main.zig" },
         .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig" },
         .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig" },
+        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig" },
     }) |example| {
         // サンプル用Objective-C版
         const example_exe_objc = b.addExecutable(.{
@@ -392,6 +403,12 @@ pub fn build(b: *std.Build) void {
         // example_03の場合はspriteモジュールも追加
         if (std.mem.eql(u8, example.name, "example_03")) {
             example_exe_objc.root_module.addImport("sprite", sprite_module);
+        }
+
+        // example_04の場合はfixed_timestepとfps_counterモジュールも追加
+        if (std.mem.eql(u8, example.name, "example_04")) {
+            example_exe_objc.root_module.addImport("fixed_timestep", fixed_timestep_module);
+            example_exe_objc.root_module.addImport("fps_counter", fps_counter_module);
         }
 
         const example_objc_platform = compilePlatformLayer(b, .objc, optimize);
@@ -419,6 +436,12 @@ pub fn build(b: *std.Build) void {
             example_exe_swift.root_module.addImport("sprite", sprite_module);
         }
 
+        // example_04の場合はfixed_timestepとfps_counterモジュールも追加
+        if (std.mem.eql(u8, example.name, "example_04")) {
+            example_exe_swift.root_module.addImport("fixed_timestep", fixed_timestep_module);
+            example_exe_swift.root_module.addImport("fps_counter", fps_counter_module);
+        }
+
         const example_swift_platform = compilePlatformLayer(b, .swift, optimize);
         example_exe_swift.root_module.addObjectFile(example_swift_platform.obj_file);
         example_exe_swift.root_module.link_libc = true;
@@ -443,6 +466,12 @@ pub fn build(b: *std.Build) void {
         // example_03の場合はspriteモジュールも追加
         if (std.mem.eql(u8, example.name, "example_03")) {
             example_exe_metal.root_module.addImport("sprite", sprite_module);
+        }
+
+        // example_04の場合はfixed_timestepとfps_counterモジュールも追加
+        if (std.mem.eql(u8, example.name, "example_04")) {
+            example_exe_metal.root_module.addImport("fixed_timestep", fixed_timestep_module);
+            example_exe_metal.root_module.addImport("fps_counter", fps_counter_module);
         }
 
         const example_metal_platform = compilePlatformLayer(b, .metal, optimize);

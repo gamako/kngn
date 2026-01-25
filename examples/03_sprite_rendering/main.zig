@@ -92,6 +92,7 @@ pub fn main() !void {
         }
 
         // フレームレート制御（約60FPS）
-        std.Thread.sleep(16_666_666);
+        var req = std.c.timespec{ .sec = 0, .nsec = 16_666_666 };
+        _ = std.c.nanosleep(&req, null);
     }
 }

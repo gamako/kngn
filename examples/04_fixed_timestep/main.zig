@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const FixedTimeStep = @import("fixed_timestep").FixedTimeStep;
+const FpsCounter = @import("fps_counter").FpsCounter;
 
 const c = @cImport({
     @cInclude("platform.h");
@@ -135,8 +136,7 @@ pub fn main() !void {
     var ball = Ball.init(400.0, 100.0, 200.0, 0.0, 20.0);
 
     var last_time = c.platform_get_time();
-    var frame_count: u32 = 0;
-    var fps_timer: f64 = 0.0;
+    var fps_counter = FpsCounter.init(1.0);
     var update_count: u32 = 0;
 
     while (c.platform_poll_events(window)) {
@@ -145,13 +145,9 @@ pub fn main() !void {
         last_time = current_time;
 
         // FPS計測
-        fps_timer += frame_time;
-        frame_count += 1;
-        if (fps_timer >= 1.0) {
-            std.debug.print("FPS: {d}, Updates/sec: {d}\n", .{ frame_count, update_count });
-            frame_count = 0;
+        if (fps_counter.update(frame_time)) {
+            std.debug.print("FPS: {d}, Updates/sec: {d}\n", .{ fps_counter.getFps(), update_count });
             update_count = 0;
-            fps_timer -= 1.0;
         }
 
         // 固定タイムステップで論理更新
@@ -191,7 +187,10 @@ pub fn main() !void {
         const sleep_time = target_frame_time - process_time;
         if (sleep_time > 0) {
             const sleep_ns = @as(u64, @intFromFloat(sleep_time * 1_000_000_000.0));
-            std.Thread.sleep(sleep_ns);
+            const sec = @as(isize, @intCast(sleep_ns / 1_000_000_000));
+            const nsec = @as(isize, @intCast(sleep_ns % 1_000_000_000));
+            var req = std.c.timespec{ .sec = sec, .nsec = nsec };
+            _ = std.c.nanosleep(&req, null);
         }
     }
 
