@@ -110,8 +110,9 @@ pub fn main() !void {
     var current_color: u32 = hsvToRGB(hue, saturation, brightness);
 
     // ランダムジェネレータ初期化
-    var seed: u64 = undefined;
-    try std.posix.getrandom(std.mem.asBytes(&seed));
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    const seed = @as(u64, @intCast(ts.sec)) *% 1_000_000_000 +% @as(u64, @intCast(ts.nsec));
     var prng = std.Random.DefaultPrng.init(seed);
 
     // メインループ
@@ -219,7 +220,9 @@ pub fn main() !void {
         }
 
         // フレームレート制御（約60FPS）
-        std.Thread.sleep(16_666_666); // 16.67ms (1/60秒)
+        // 16.67ms (1/60秒)
+        var req = std.c.timespec{ .sec = 0, .nsec = 16_666_666 };
+        _ = std.c.nanosleep(&req, null);
     }
 
     std.debug.print("Application terminated.\n", .{});
