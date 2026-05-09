@@ -83,6 +83,11 @@ cd examples/03_sprite_rendering
 zig build run
 ```
 
+各 example ディレクトリには `build_helpers` というシンボリックリンク（`../../build_helpers` を指す）が
+含まれている。これは Zig 0.16 の build root 外 `@import` 制約に対する workaround で、
+build helper（`build_helpers/platform.zig` 等）を独立ビルドからも参照可能にしている。
+clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../build_helpers build_helpers` で再作成する。
+
 ## 開発フェーズの状態
 
 - ✅ **フェーズ1（プリミティブAPI）**: 完成
