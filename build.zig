@@ -91,16 +91,32 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const example_modules = ExampleModules.init(b);
 
+    // 各 example が必要とするモジュールを宣言的に指定する。
+    // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
+    // 揃えること（inline for で型不一致を避けるため）。
     inline for (.{
-        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig" },
-        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig" },
-        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig" },
-        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig" },
-        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig" },
+        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig",
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig",
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig",
+           .needs_sprite = true,  .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig",
+           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = true,  .needs_text = false },
+        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig",
+           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = true },
+        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig",
+           .needs_sprite = true,  .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = false },
     }) |example| {
-        const ex_objc = addExampleExe(b, target, optimize, platform_root, sdk_paths, .objc, example.name, example.path, &example_modules);
-        const ex_swift = addExampleExe(b, target, optimize, platform_root, sdk_paths, .swift, example.name ++ "_swift", example.path, &example_modules);
-        const ex_metal = addExampleExe(b, target, optimize, platform_root, sdk_paths, .metal, example.name ++ "_metal", example.path, &example_modules);
+        const needs: ExampleNeeds = .{
+            .needs_sprite = example.needs_sprite,
+            .needs_fps_counter = example.needs_fps_counter,
+            .needs_fixed_timestep = example.needs_fixed_timestep,
+            .needs_text = example.needs_text,
+        };
+        const ex_objc = addExampleExe(b, target, optimize, platform_root, sdk_paths, .objc, example.name, example.path, &example_modules, needs);
+        const ex_swift = addExampleExe(b, target, optimize, platform_root, sdk_paths, .swift, example.name ++ "_swift", example.path, &example_modules, needs);
+        const ex_metal = addExampleExe(b, target, optimize, platform_root, sdk_paths, .metal, example.name ++ "_metal", example.path, &example_modules, needs);
 
         b.installArtifact(ex_objc);
         b.installArtifact(ex_swift);
@@ -182,6 +198,13 @@ const ExampleModules = struct {
     }
 };
 
+const ExampleNeeds = struct {
+    needs_sprite: bool,
+    needs_fps_counter: bool,
+    needs_fixed_timestep: bool,
+    needs_text: bool,
+};
+
 fn addExampleExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -192,6 +215,7 @@ fn addExampleExe(
     name: []const u8,
     source_path: []const u8,
     modules: *const ExampleModules,
+    needs: ExampleNeeds,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = name,
@@ -203,20 +227,20 @@ fn addExampleExe(
     });
     // 全 example が keyboard を使う
     exe.root_module.addImport("keyboard", modules.keyboard);
-    // example_03 のみ sprite を使う
-    if (std.mem.indexOf(u8, name, "example_03") != null) {
-        exe.root_module.addImport("sprite", modules.sprite);
-    }
-    // example_04 のみ fixed_timestep / fps_counter を使う
-    if (std.mem.indexOf(u8, name, "example_04") != null) {
-        exe.root_module.addImport("fixed_timestep", modules.fixed_timestep);
-        exe.root_module.addImport("fps_counter", modules.fps_counter);
-    }
-    // example_05 のみ text / fps_counter を使う
-    if (std.mem.indexOf(u8, name, "example_05") != null) {
-        exe.root_module.addImport("text", modules.text);
-        exe.root_module.addImport("fps_counter", modules.fps_counter);
-    }
+    if (needs.needs_sprite) exe.root_module.addImport("sprite", modules.sprite);
+    if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", modules.fps_counter);
+    if (needs.needs_fixed_timestep) exe.root_module.addImport("fixed_timestep", modules.fixed_timestep);
+    if (needs.needs_text) exe.root_module.addImport("text", modules.text);
+
+    // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
+    // 任意の example が `@import("build_options").platform_name` で参照可能。
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "platform_name", switch (platform_type) {
+        .objc => "objc",
+        .swift => "swift",
+        .metal => "metal",
+    });
+    exe.root_module.addOptions("build_options", opts);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
