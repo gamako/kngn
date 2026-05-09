@@ -33,6 +33,25 @@ video-proto/
 
 ## クイックスタート
 
+### 前提環境
+
+| 項目 | 用途 |
+|------|------|
+| macOS（Apple Silicon）+ Xcode | SDK / framework / `swiftc` の提供（必須）。`flake.nix` は `aarch64-darwin` のみ対応 |
+| nix（flake 対応） | `flake.nix` 経由で zig 0.16.0 + zls を提供 |
+| direnv | プロジェクトディレクトリに入ると自動で nix devShell を有効化（推奨） |
+
+### セットアップ
+
+`flake.nix` で zig 0.16.0 と zls を pin している。`direnv allow` 一回でディレクトリに入れば自動で zig が PATH に通る。
+
+```bash
+direnv allow                     # 初回のみ（.envrc を許可）
+zig version                      # → 0.16.0 が返ること
+```
+
+direnv を使わない場合は `nix develop` でシェルに入るか、各コマンドを `nix develop --command zig build` のように呼ぶ。
+
 ### メインプログラムのビルド・実行
 
 ```bash

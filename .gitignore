@@ -7,6 +7,9 @@
 zig-out/
 *.o
 
+# direnv
+.direnv/
+
 # Test data and generated files
 libs/png-decoder/test-data/
 .claude/.tmp/
