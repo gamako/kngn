@@ -100,35 +100,63 @@ fn compilePlatformLayer(
     return result;
 }
 
-/// Swiftランタイムライブラリをリンク
-fn linkSwiftRuntime(
+/// macOS SDK パスを保持する構造体
+const MacOSSDKPaths = struct {
+    sdk_path: []const u8,
+    toolchain_path: []const u8,
+};
+
+/// macOS SDK / Toolchain のパスを取得
+fn resolveMacOSSDKPaths(
     b: *std.Build,
-    exe: *std.Build.Step.Compile,
-    toolchain_path: ?[]const u8,
-    sdk_path: ?[]const u8,
-    extra_libs: []const []const u8,
-) void {
+    toolchain_override: ?[]const u8,
+    sdk_override: ?[]const u8,
+) MacOSSDKPaths {
     const allocator = b.allocator;
 
-    // ツールチェーンパスを取得（キャッシュのため指定値を優先）
-    const actual_toolchain_path = if (toolchain_path) |path|
+    const toolchain_path = if (toolchain_override) |path|
         path
     else blk: {
         const developer_path = std.mem.trim(u8, b.run(&.{ "xcode-select", "-p" }), " \n\r");
         break :blk std.fmt.allocPrint(allocator, "{s}/Toolchains/XcodeDefault.xctoolchain", .{developer_path}) catch unreachable;
     };
 
-    // SDKパスを取得（キャッシュのため指定値を優先）
-    const actual_sdk_path = if (sdk_path) |path|
+    const sdk_path = if (sdk_override) |path|
         path
     else blk: {
         const output = b.run(&.{ "xcrun", "--show-sdk-path" });
         break :blk std.mem.trim(u8, output, " \n\r");
     };
 
+    return .{ .sdk_path = sdk_path, .toolchain_path = toolchain_path };
+}
+
+/// macOS SDK の framework / library 検索パスを exe に追加
+/// nix の zig 0.16 は SDK を自動検出しないため、明示的に渡す必要がある
+fn addMacOSSDKSearchPaths(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    sdk_paths: MacOSSDKPaths,
+) void {
+    const frameworks_path = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path});
+    const usr_lib_path = b.fmt("{s}/usr/lib", .{sdk_paths.sdk_path});
+
+    exe.root_module.addSystemFrameworkPath(.{ .cwd_relative = frameworks_path });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = usr_lib_path });
+}
+
+/// Swiftランタイムライブラリをリンク
+fn linkSwiftRuntime(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    sdk_paths: MacOSSDKPaths,
+    extra_libs: []const []const u8,
+) void {
+    const allocator = b.allocator;
+
     // Swiftランタイムライブラリのパスを構築
-    const toolchain_swift_lib_path = std.fmt.allocPrint(allocator, "{s}/usr/lib/swift/macosx", .{actual_toolchain_path}) catch unreachable;
-    const sdk_swift_lib_path = std.fmt.allocPrint(allocator, "{s}/usr/lib/swift", .{actual_sdk_path}) catch unreachable;
+    const toolchain_swift_lib_path = std.fmt.allocPrint(allocator, "{s}/usr/lib/swift/macosx", .{sdk_paths.toolchain_path}) catch unreachable;
+    const sdk_swift_lib_path = std.fmt.allocPrint(allocator, "{s}/usr/lib/swift", .{sdk_paths.sdk_path}) catch unreachable;
 
     // パスを追加
     exe.root_module.addLibraryPath(.{ .cwd_relative = toolchain_swift_lib_path });
@@ -157,14 +185,41 @@ fn linkSwiftRuntime(
         exe.root_module.linkSystemLibrary(lib, .{});
     }
 
+    // SDK に存在する場合のみリンクする optional な Swift ランタイム
+    // (新しい macOS SDK では swiftc が暗黙的にこれらへの FORCE_LOAD を生成する)
+    const optional_libs = [_][]const u8{
+        "swiftSpatial",
+    };
+    for (optional_libs) |lib| {
+        if (swiftRuntimeLibExists(b, sdk_paths.sdk_path, lib)) {
+            exe.root_module.linkSystemLibrary(lib, .{});
+        }
+    }
+
     // 追加ライブラリをリンク
     for (extra_libs) |lib| {
         exe.root_module.linkSystemLibrary(lib, .{});
     }
 }
 
+/// SDK の usr/lib/swift/ 配下に lib<name>.tbd が存在するかを確認
+fn swiftRuntimeLibExists(b: *std.Build, sdk_path: []const u8, lib_name: []const u8) bool {
+    const tbd_path = b.fmt("{s}/usr/lib/swift/lib{s}.tbd", .{ sdk_path, lib_name });
+    var exit_code: u8 = 0;
+    const stdout = b.runAllowFail(&.{ "test", "-e", tbd_path }, &exit_code, .ignore) catch return false;
+    b.allocator.free(stdout);
+    return exit_code == 0;
+}
+
 /// macOSフレームワークをリンク
-fn linkMacOSFrameworks(exe: *std.Build.Step.Compile) void {
+/// SDK 検索パスを明示的に追加してから framework をリンクする
+fn linkMacOSFrameworks(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    sdk_paths: MacOSSDKPaths,
+) void {
+    addMacOSSDKSearchPaths(b, exe, sdk_paths);
+
     const frameworks = [_][]const u8{
         "Cocoa",
         "QuartzCore",
@@ -205,6 +260,9 @@ pub fn build(b: *std.Build) void {
         "Path to macOS SDK (e.g., /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk)",
     );
 
+    // macOS SDK パスを一度だけ解決
+    const sdk_paths = resolveMacOSSDKPaths(b, swift_toolchain_path, swift_sdk_path);
+
     // ========================================
     // Objective-C版実行ファイルのビルド
     // ========================================
@@ -225,7 +283,7 @@ pub fn build(b: *std.Build) void {
     exe_objc.step.dependOn(&objc_platform.compile_step.step);
 
     // macOSフレームワークをリンク
-    linkMacOSFrameworks(exe_objc);
+    linkMacOSFrameworks(b, exe_objc, sdk_paths);
 
     // ========================================
     // Swift版実行ファイルのビルド
@@ -247,8 +305,8 @@ pub fn build(b: *std.Build) void {
     exe_swift.step.dependOn(&swift_platform.compile_step.step);
 
     // macOSフレームワークとSwiftランタイムをリンク
-    linkMacOSFrameworks(exe_swift);
-    linkSwiftRuntime(b, exe_swift, swift_toolchain_path, swift_sdk_path, &.{});
+    linkMacOSFrameworks(b, exe_swift, sdk_paths);
+    linkSwiftRuntime(b, exe_swift, sdk_paths, &.{});
 
     // ========================================
     // Metal版実行ファイルのビルド
@@ -270,10 +328,10 @@ pub fn build(b: *std.Build) void {
     exe_metal.step.dependOn(&metal_platform.compile_step.step);
 
     // macOSフレームワークとSwiftランタイムをリンク
-    linkMacOSFrameworks(exe_metal);
+    linkMacOSFrameworks(b, exe_metal, sdk_paths);
     exe_metal.root_module.linkFramework("Metal", .{});
     exe_metal.root_module.linkFramework("MetalKit", .{});
-    linkSwiftRuntime(b, exe_metal, swift_toolchain_path, swift_sdk_path, &.{
+    linkSwiftRuntime(b, exe_metal, sdk_paths, &.{
         "swiftMetalKit",
         "swiftModelIO",
     });
@@ -416,7 +474,7 @@ pub fn build(b: *std.Build) void {
         example_exe_objc.root_module.link_libc = true;
         example_exe_objc.root_module.addIncludePath(b.path("platform"));
         example_exe_objc.step.dependOn(&example_objc_platform.compile_step.step);
-        linkMacOSFrameworks(example_exe_objc);
+        linkMacOSFrameworks(b, example_exe_objc, sdk_paths);
 
         // サンプル用Swift版
         const example_exe_swift = b.addExecutable(.{
@@ -447,8 +505,8 @@ pub fn build(b: *std.Build) void {
         example_exe_swift.root_module.link_libc = true;
         example_exe_swift.root_module.addIncludePath(b.path("platform"));
         example_exe_swift.step.dependOn(&example_swift_platform.compile_step.step);
-        linkMacOSFrameworks(example_exe_swift);
-        linkSwiftRuntime(b, example_exe_swift, swift_toolchain_path, swift_sdk_path, &.{});
+        linkMacOSFrameworks(b, example_exe_swift, sdk_paths);
+        linkSwiftRuntime(b, example_exe_swift, sdk_paths, &.{});
 
         // サンプル用Metal版
         const example_exe_metal = b.addExecutable(.{
@@ -479,10 +537,10 @@ pub fn build(b: *std.Build) void {
         example_exe_metal.root_module.link_libc = true;
         example_exe_metal.root_module.addIncludePath(b.path("platform"));
         example_exe_metal.step.dependOn(&example_metal_platform.compile_step.step);
-        linkMacOSFrameworks(example_exe_metal);
+        linkMacOSFrameworks(b, example_exe_metal, sdk_paths);
         example_exe_metal.root_module.linkFramework("Metal", .{});
         example_exe_metal.root_module.linkFramework("MetalKit", .{});
-        linkSwiftRuntime(b, example_exe_metal, swift_toolchain_path, swift_sdk_path, &.{
+        linkSwiftRuntime(b, example_exe_metal, sdk_paths, &.{
             "swiftMetalKit",
             "swiftModelIO",
         });
