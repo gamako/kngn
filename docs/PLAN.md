@@ -1,5 +1,11 @@
 # 実装計画 - video-proto プラットフォーム層
 
+> **NOTE (2026-05-12)**: 本ファイルはフェーズ1（C プリミティブ API）導入時の歴史的計画書。
+> task-11 で Zig 高レベル interface 層 (`src/platform.zig`) を上に被せた。
+> caller (`src/main.zig`, `examples/`) は `@import("platform")` で Zig API のみを利用する。
+> C ABI (`platform.h`) は内部実装で、バックエンド (`src/platform_macos.zig`) のみが直接利用する。
+> 新 API の実装計画は `../docs/plans/task-11-woolly-zephyr.md` を参照。
+
 ## アーキテクチャ設計
 
 ### 提案する3層構造

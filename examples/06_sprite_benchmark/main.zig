@@ -18,14 +18,10 @@
 // - `present_call_ms` は CPU 側の `platform_present` 呼び出し時間であり、GPU 完了時間ではない。
 
 const std = @import("std");
+const platform = @import("platform");
 const sprite = @import("sprite");
 const FpsCounter = @import("fps_counter").FpsCounter;
-const keyboard = @import("keyboard");
 const build_options = @import("build_options");
-
-const c = @cImport({
-    @cInclude("platform.h");
-});
 
 const usako_png = @embedFile("image/usako.png");
 
@@ -146,17 +142,11 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     );
 
     // -------- プラットフォーム初期化 --------
-    if (!c.platform_init()) return error.PlatformInitFailed;
-    defer c.platform_shutdown();
+    try platform.init();
+    defer platform.shutdown();
 
-    const window = c.platform_create_window(
-        WINDOW_W,
-        WINDOW_H,
-        "06: Sprite Benchmark",
-        null,
-        null,
-    ) orelse return error.WindowCreationFailed;
-    defer c.platform_destroy_window(window);
+    var window = try platform.Window.create(@intCast(WINDOW_W), @intCast(WINDOW_H), "06: Sprite Benchmark");
+    defer window.destroy();
 
     // -------- スプライト準備 --------
     var template = try sprite.Sprite.initFromData(allocator, usako_png, 0, 0);
@@ -230,19 +220,17 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     var sample_overflow: bool = false;
 
     // -------- メインループ --------
-    var last_time = c.platform_get_time();
+    var last_time = platform.getTime();
 
-    main_loop: while (c.platform_poll_events(window)) {
+    main_loop: while (window.pollEvents()) {
         // ESC 終了処理
-        var event: c.PlatformEvent = undefined;
-        while (c.platform_get_event(window, &event)) {
-            if (event.type == c.PLATFORM_EVENT_QUIT) break :main_loop;
-            if (event.type == c.PLATFORM_EVENT_KEY_DOWN and event.payload.keyboard.key == keyboard.Key.ESCAPE) {
-                break :main_loop;
-            }
-        }
+        while (window.nextEvent()) |ev| switch (ev) {
+            .quit => break :main_loop,
+            .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
+            .key_up => {},
+        };
 
-        const now = c.platform_get_time();
+        const now = platform.getTime();
         const frame_time = now - last_time;
         last_time = now;
 
@@ -278,38 +266,35 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         }
 
         // フレームバッファロック
-        var fb_w: i32 = 0;
-        var fb_h: i32 = 0;
-        const pixels = c.platform_lock_framebuffer(window, &fb_w, &fb_h);
-        if (pixels == null) {
+        var fb = window.lockFramebuffer() orelse {
             if (state == .measuring) dropped_frames += 1;
             continue;
-        }
+        };
 
-        const pixel_count = @as(usize, @intCast(fb_w)) * @as(usize, @intCast(fb_h));
-        const fb = pixels[0..pixel_count];
+        const fb_w_u32 = fb.width;
+        const fb_h_u32 = fb.height;
 
         // 背景クリア
-        @memset(fb, 0xFF000000);
+        @memset(fb.pixels, 0xFF000000);
 
         // スプライト描画（draw_ms 計測対象）
-        const t0 = c.platform_get_time();
+        const t0 = platform.getTime();
         for (instances) |inst| {
             const s = sprite.Sprite{
                 .image = shared_image,
                 .x = @intFromFloat(@floor(inst.x)),
                 .y = @intFromFloat(@floor(inst.y)),
             };
-            sprite.drawSprite(fb, @intCast(fb_w), @intCast(fb_h), &s);
+            sprite.drawSprite(fb.pixels, fb_w_u32, fb_h_u32, &s);
         }
-        const draw_dt = c.platform_get_time() - t0;
+        const draw_dt = platform.getTime() - t0;
 
         // present
-        const tp0 = c.platform_get_time();
-        c.platform_present(window);
-        const present_dt = c.platform_get_time() - tp0;
+        const tp0 = platform.getTime();
+        window.present();
+        const present_dt = platform.getTime() - tp0;
 
-        c.platform_unlock_framebuffer(window);
+        fb.unlock();
 
         // measuring 中のみ累積
         if (state == .measuring) {

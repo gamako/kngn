@@ -26,6 +26,12 @@ pub fn build(b: *std.Build) void {
     const platform_root = b.path(PROJECT_ROOT ++ "/platform");
 
     // 親プロジェクト由来のモジュール
+    const platform_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .link_libc = true,
+    });
+    platform_module.addIncludePath(.{ .cwd_relative = PROJECT_ROOT ++ "/platform" });
+
     const png_decoder_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png-decoder/src/lib.zig" },
     });
@@ -39,13 +45,14 @@ pub fn build(b: *std.Build) void {
     const keyboard_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },
     });
+    keyboard_module.addImport("platform", platform_module);
 
     // ========================================
     // 一般的な実行ファイルのビルド設定
     // ========================================
-    const exe_objc = addExe(b, target, optimize, platform_root, sdk_paths, .objc, "example_06_sprite_benchmark", sprite_module, fps_counter_module, keyboard_module);
-    const exe_swift = addExe(b, target, optimize, platform_root, sdk_paths, .swift, "example_06_sprite_benchmark_swift", sprite_module, fps_counter_module, keyboard_module);
-    const exe_metal = addExe(b, target, optimize, platform_root, sdk_paths, .metal, "example_06_sprite_benchmark_metal", sprite_module, fps_counter_module, keyboard_module);
+    const exe_objc = addExe(b, target, optimize, platform_root, sdk_paths, .objc, "example_06_sprite_benchmark", platform_module, sprite_module, fps_counter_module, keyboard_module);
+    const exe_swift = addExe(b, target, optimize, platform_root, sdk_paths, .swift, "example_06_sprite_benchmark_swift", platform_module, sprite_module, fps_counter_module, keyboard_module);
+    const exe_metal = addExe(b, target, optimize, platform_root, sdk_paths, .metal, "example_06_sprite_benchmark_metal", platform_module, sprite_module, fps_counter_module, keyboard_module);
 
     // インストール / 実行ステップ
     const exe_default = switch (platform_option) {
@@ -69,6 +76,7 @@ fn addExe(
     sdk_paths: macos.MacOSSDKPaths,
     platform_type: platform.PlatformType,
     name: []const u8,
+    platform_module: *std.Build.Module,
     sprite_module: *std.Build.Module,
     fps_counter_module: *std.Build.Module,
     keyboard_module: *std.Build.Module,
@@ -80,6 +88,7 @@ fn addExe(
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "sprite", .module = sprite_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
                 .{ .name = "keyboard", .module = keyboard_module },

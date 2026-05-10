@@ -119,22 +119,27 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 
 ## 主要なプラットフォームAPI
 
+caller は `@import("platform")` で Zig 高レベル API (`src/platform.zig`) にアクセスする。
+C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/platform_macos.zig`) のみが直接利用する。
+
 ### コアプリミティブ
-- `platform_init()` / `platform_shutdown()` - 初期化/終了
-- `platform_create_window()` / `platform_destroy_window()` - ウィンドウ管理
+- `platform.init()` / `platform.shutdown()` - 初期化/終了 (`Error!void`)
+- `platform.Window.create(w, h, title) Error!Window` / `window.destroy()` - ウィンドウ管理
 
 ### イベント処理
-- `platform_poll_events()` - イベントポーリング（ノンブロッキング）
-- `platform_get_event()` - イベント取得（1つずつ）
-- `PlatformEvent` - イベント構造体（QUIT, KEY_DOWN, KEY_UP）
+- `window.pollEvents()` - イベントポーリング（ノンブロッキング, bool）
+- `window.nextEvent()` - イベント取得（`?platform.Event` tagged union）
+- `platform.Event` - `quit` / `key_down: KeyEvent` / `key_up: KeyEvent` の union(enum)
+- `platform.KeyCode` - non-exhaustive `enum(c_int)` で物理キーを表現
+- `platform.ModifierFlags` - `packed struct(u32) { shift, ctrl, alt, cmd, _reserved }`
 
 ### 手動描画
-- `platform_lock_framebuffer()` - フレームバッファアクセス開始
-- `platform_unlock_framebuffer()` - フレームバッファアクセス終了
-- `platform_present()` - 画面更新（vsync待ちなし）
+- `window.lockFramebuffer()` - フレームバッファアクセス開始 (`?Framebuffer`)
+- `fb.unlock()` - フレームバッファアクセス終了
+- `window.present()` - 画面更新（vsync待ちなし）
 
 ### ユーティリティ
-- `platform_get_time()` - 高精度モノトニック時刻取得
+- `platform.getTime()` - 高精度モノトニック時刻取得
 
 ## よく使うコマンド
 

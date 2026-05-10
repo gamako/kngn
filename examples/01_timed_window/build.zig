@@ -25,6 +25,13 @@ pub fn build(b: *std.Build) void {
     const sdk_paths = macos.resolveMacOSSDKPaths(b, null, null);
     const platform_root = b.path(PROJECT_ROOT ++ "/platform");
 
+    // 親プロジェクト由来のモジュール
+    const platform_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .link_libc = true,
+    });
+    platform_module.addIncludePath(.{ .cwd_relative = PROJECT_ROOT ++ "/platform" });
+
     // ========================================
     // 一般的な実行ファイルのビルド設定
     // ========================================
@@ -34,6 +41,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "platform", .module = platform_module },
+            },
         }),
     });
     platform.setupExecutableForPlatform(b, exe_objc, .objc, optimize, platform_root, sdk_paths);
@@ -44,6 +54,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "platform", .module = platform_module },
+            },
         }),
     });
     platform.setupExecutableForPlatform(b, exe_swift, .swift, optimize, platform_root, sdk_paths);
@@ -54,6 +67,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "platform", .module = platform_module },
+            },
         }),
     });
     platform.setupExecutableForPlatform(b, exe_metal, .metal, optimize, platform_root, sdk_paths);

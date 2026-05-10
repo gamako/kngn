@@ -6,12 +6,12 @@
 
 このサンプルは、手動描画APIの基本的な使用方法を示しています：
 
-- `platform_create_window()` - ウィンドウ作成（コールバックなし）
-- `platform_poll_events()` - イベントポーリング（ノンブロッキング）
-- `platform_get_time()` - 高精度時刻取得
-- `platform_lock_framebuffer()` - フレームバッファへのアクセス開始
-- `platform_unlock_framebuffer()` - フレームバッファへのアクセス終了
-- `platform_present()` - 画面更新
+- `platform.Window.create()` - ウィンドウ作成
+- `window.pollEvents()` - イベントポーリング（ノンブロッキング）
+- `platform.getTime()` - 高精度時刻取得
+- `window.lockFramebuffer()` - フレームバッファへのアクセス開始
+- `fb.unlock()` - フレームバッファへのアクセス終了
+- `window.present()` - 画面更新
 
 ## 動作
 
@@ -62,24 +62,33 @@ zig build run
 ### 1. 手動描画のフロー
 
 ```zig
-while (platform_poll_events(window)) {
+const platform = @import("platform");
+
+try platform.init();
+defer platform.shutdown();
+
+var window = try platform.Window.create(800, 600, "title");
+defer window.destroy();
+
+while (window.pollEvents()) {
     // 1. フレームバッファをロック
-    const pixels = platform_lock_framebuffer(window, &width, &height);
-    defer platform_unlock_framebuffer(window);
+    if (window.lockFramebuffer()) |fb| {
+        defer fb.unlock();
 
-    // 2. ピクセルデータを書き込み
-    @memset(pixels[0..pixel_count], color);
+        // 2. ピクセルデータを書き込み
+        @memset(fb.pixels, color);
 
-    // 3. 画面を更新
-    platform_present(window);
+        // 3. 画面を更新
+        window.present();
+    }
 }
 ```
 
 ### 2. 時刻の取得とタイミング制御
 
 ```zig
-const start_time = platform_get_time();
-const elapsed = current_time - start_time;
+const start_time = platform.getTime();
+const elapsed = platform.getTime() - start_time;
 
 if (elapsed >= duration) {
     break; // 終了
@@ -99,4 +108,4 @@ if (elapsed >= duration) {
 ## 注意事項
 
 - このサンプルでは `std.time.sleep()` を使用してフレームレートを制御していますが、本格的なアプリケーションではvsync同期やより高度なタイミング制御が推奨されます。
-- `platform_present()` は現在の実装ではvsync同期を行わないため、画面のティアリング（ずれ）が発生する可能性があります。
+- `window.present()` は現在の実装ではvsync同期を行わないため、画面のティアリング（ずれ）が発生する可能性があります。

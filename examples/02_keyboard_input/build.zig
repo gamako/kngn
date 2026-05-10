@@ -26,9 +26,16 @@ pub fn build(b: *std.Build) void {
     const platform_root = b.path(PROJECT_ROOT ++ "/platform");
 
     // 親プロジェクト由来のモジュール
+    const platform_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .link_libc = true,
+    });
+    platform_module.addIncludePath(.{ .cwd_relative = PROJECT_ROOT ++ "/platform" });
+
     const keyboard_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },
     });
+    keyboard_module.addImport("platform", platform_module);
 
     // ========================================
     // 一般的な実行ファイルのビルド設定
@@ -40,6 +47,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "keyboard", .module = keyboard_module },
             },
         }),
@@ -53,6 +61,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "keyboard", .module = keyboard_module },
             },
         }),
@@ -66,6 +75,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "keyboard", .module = keyboard_module },
             },
         }),

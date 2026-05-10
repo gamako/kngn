@@ -1,21 +1,10 @@
 const std = @import("std");
+const platform = @import("platform");
 
-// C関数をインポート
-const c = @cImport({
-    @cInclude("platform.h");
-});
-
-// sin関数のdeclaration
 extern fn sin(x: f64) f64;
-
-// アニメーション用の状態
-const AppState = struct {
-    time: f64,
-};
 
 // 高速HSV→RGB変換（整数演算版）
 fn hsvToRgbFast(h: i32, s: i32, v: i32) u32 {
-    // h: 0-359, s: 0-255, v: 0-255
     if (s == 0) {
         return (@as(u32, @intCast(v)) << 24) | (@as(u32, @intCast(v)) << 16) | (@as(u32, @intCast(v)) << 8) | 255;
     }
@@ -43,74 +32,67 @@ fn hsvToRgbFast(h: i32, s: i32, v: i32) u32 {
     return (r << 24) | (g << 16) | (b << 8) | 255;
 }
 
-// フレーム描画コールバック（60fps で呼ばれる）
-export fn render_frame(pixels: [*c]u32, width: i32, height: i32, userdata: ?*anyopaque) callconv(.c) void {
-    const state: *AppState = @ptrCast(@alignCast(userdata.?));
-
-    // 定数を事前計算
-    const time_offset = state.time * 60.0;
+fn renderFrame(pixels: []u32, width: u32, height: u32, time: f64) void {
+    const time_offset = time * 60.0;
     const y_scale = 3.14159 / @as(f64, @floatFromInt(height));
-    const y_offset = state.time * 2.0;
-    const saturation: i32 = 204; // 0.8 * 255
+    const y_offset = time * 2.0;
+    const saturation: i32 = 204;
 
-    // 虹色グラデーションアニメーション
+    const w_i32: i32 = @intCast(width);
+    const h_i32: i32 = @intCast(height);
+
     var y: i32 = 0;
-    while (y < height) : (y += 1) {
-        // Y方向の値を行ごとに計算（sin計算を削減）
+    while (y < h_i32) : (y += 1) {
         const sin_val = sin(@as(f64, @floatFromInt(y)) * y_scale + y_offset);
-        const value = @as(i32, @intFromFloat(127.5 + 127.5 * sin_val)); // 0-255
+        const value: i32 = @intFromFloat(127.5 + 127.5 * sin_val);
 
         var x: i32 = 0;
-        while (x < width) : (x += 1) {
-            // 色相を整数演算で計算
-            const hue = @mod(@divTrunc(@as(i32, @intCast(x)) * 360, @as(i32, @intCast(width))) + @as(i32, @intFromFloat(time_offset)), 360);
-
-            // 高速HSV→RGB変換
-            pixels[@as(usize, @intCast(y * width + x))] = hsvToRgbFast(hue, saturation, value);
+        while (x < w_i32) : (x += 1) {
+            const hue = @mod(@divTrunc(x * 360, w_i32) + @as(i32, @intFromFloat(time_offset)), 360);
+            pixels[@intCast(y * w_i32 + x)] = hsvToRgbFast(hue, saturation, value);
         }
     }
-
-    // 時間を進める（60fps想定なので 1/60 秒）
-    state.time += 1.0 / 60.0;
 }
 
 pub fn main() !void {
     std.debug.print("Starting cross-platform framebuffer application...\n", .{});
 
-    // プラットフォーム初期化
-    if (!c.platform_init()) {
-        std.debug.print("Failed to initialize platform\n", .{});
-        return;
-    }
+    try platform.init();
+    defer platform.shutdown();
 
-    // アプリケーション状態を初期化
-    var state: AppState = .{ .time = 0.0 };
-
-    // ウィンドウを作成（1024x768）
-    const window = c.platform_create_window(
+    var window = platform.Window.create(
         1024,
         768,
         "Cross-Platform Framebuffer - 60fps Animation",
-        render_frame,
-        @ptrCast(&state),
-    );
-
-    if (window == null) {
-        std.debug.print("Failed to create window\n", .{});
-        c.platform_shutdown();
+    ) catch |err| {
+        std.debug.print("Failed to create window: {s}\n", .{@errorName(err)});
         return;
-    }
+    };
+    defer window.destroy();
 
     std.debug.print("Window created. Running main loop...\n", .{});
 
-    // メインループ（ブロッキング）
-    c.platform_run(window);
+    var time: f64 = 0.0;
+    main_loop: while (window.pollEvents()) {
+        while (window.nextEvent()) |ev| switch (ev) {
+            .quit => {
+                std.debug.print("Quit event received\n", .{});
+                break :main_loop;
+            },
+            else => {},
+        };
 
-    std.debug.print("Main loop ended. Cleaning up...\n", .{});
+        if (window.lockFramebuffer()) |fb| {
+            defer fb.unlock();
+            renderFrame(fb.pixels, fb.width, fb.height, time);
+            window.present();
+        }
 
-    // クリーンアップ
-    c.platform_destroy_window(window);
-    c.platform_shutdown();
+        time += 1.0 / 60.0;
+
+        var req = std.c.timespec{ .sec = 0, .nsec = 16_666_666 };
+        _ = std.c.nanosleep(&req, null);
+    }
 
     std.debug.print("Application terminated.\n", .{});
 }

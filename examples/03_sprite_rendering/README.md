@@ -41,14 +41,13 @@ zig build run -Dplatform=metal    # Metal版
 
 ## 使用技術
 
-- **プリミティブAPI**:
-  - `platform_lock_framebuffer()` - フレームバッファアクセス
-  - `platform_unlock_framebuffer()` - アクセス終了
-  - `platform_present()` - 画面更新
-  - `platform_poll_events()` - イベントポーリング
+- **Zig 高レベル API** (`@import("platform")`):
+  - `window.lockFramebuffer()` / `fb.unlock()` - フレームバッファアクセス
+  - `window.present()` - 画面更新
+  - `window.pollEvents()` / `window.nextEvent()` - イベント処理（tagged union）
 
 - **ヘルパーモジュール**:
-  - `keyboard.zig` - キーボード定義
+  - `keyboard.zig` - KeyCode utility（任意、本例では未使用）
   - `sprite.zig` - スプライト描画システム（Phase 2ヘルパー）
 
 - **サブプロジェクト**:

@@ -9,12 +9,9 @@
 // 遅延を避けたい場合は、補間を使わず最新の論理位置をそのまま描画することも可能。
 
 const std = @import("std");
+const platform = @import("platform");
 const FixedTimeStep = @import("fixed_timestep").FixedTimeStep;
 const FpsCounter = @import("fps_counter").FpsCounter;
-
-const c = @cImport({
-    @cInclude("platform.h");
-});
 
 // ボールの物理状態
 const Ball = struct {
@@ -82,7 +79,7 @@ const Ball = struct {
 };
 
 // 円を描画
-fn drawCircle(pixels: [*]u32, width: usize, height: usize, cx: i32, cy: i32, radius: i32, color: u32) void {
+fn drawCircle(pixels: []u32, width: usize, height: usize, cx: i32, cy: i32, radius: i32, color: u32) void {
     const r2 = radius * radius;
     var y: i32 = -radius;
     while (y <= radius) : (y += 1) {
@@ -106,25 +103,18 @@ pub fn main() !void {
     std.debug.print("描画目標: 60FPS\n", .{});
     std.debug.print("ボールが安定した物理動作で跳ねます\n\n", .{});
 
-    if (!c.platform_init()) {
-        std.debug.print("Failed to initialize platform\n", .{});
-        return;
-    }
-    defer c.platform_shutdown();
+    try platform.init();
+    defer platform.shutdown();
 
-    const window = c.platform_create_window(
+    var window = platform.Window.create(
         800,
         600,
         "04: Fixed TimeStep Demo - Ball Physics",
-        null,
-        null,
-    );
-
-    if (window == null) {
-        std.debug.print("Failed to create window\n", .{});
+    ) catch |err| {
+        std.debug.print("Failed to create window: {s}\n", .{@errorName(err)});
         return;
-    }
-    defer c.platform_destroy_window(window);
+    };
+    defer window.destroy();
 
     // 論理更新: 60Hz固定（物理シミュレーション用）
     var timestep = FixedTimeStep.init(60.0);
@@ -135,12 +125,18 @@ pub fn main() !void {
     // ボールの初期化
     var ball = Ball.init(400.0, 100.0, 200.0, 0.0, 20.0);
 
-    var last_time = c.platform_get_time();
+    var last_time = platform.getTime();
     var fps_counter = FpsCounter.init(1.0);
     var update_count: u32 = 0;
 
-    while (c.platform_poll_events(window)) {
-        const current_time = c.platform_get_time();
+    main_loop: while (window.pollEvents()) {
+        while (window.nextEvent()) |ev| switch (ev) {
+            .quit => break :main_loop,
+            .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
+            .key_up => {},
+        };
+
+        const current_time = platform.getTime();
         const frame_time = current_time - last_time;
         last_time = current_time;
 
@@ -158,32 +154,24 @@ pub fn main() !void {
             update_count += 1;
         }
 
-        // 補間係数を取得
         const alpha = timestep.alpha();
 
-        // 描画
-        var width: i32 = 0;
-        var height: i32 = 0;
-        const pixels = c.platform_lock_framebuffer(window, &width, &height);
-        defer c.platform_unlock_framebuffer(window);
+        if (window.lockFramebuffer()) |fb| {
+            defer fb.unlock();
+            const w: usize = fb.width;
+            const h: usize = fb.height;
 
-        if (pixels != null) {
-            const w = @as(usize, @intCast(width));
-            const h = @as(usize, @intCast(height));
+            @memset(fb.pixels, 0x1A1A2EFF);
 
-            // 背景クリア（濃い青）
-            @memset(pixels[0 .. w * h], 0x1A1A2EFF);
-
-            // ボールを補間位置で描画
             const draw_x = @as(i32, @intFromFloat(ball.interpolatedX(alpha)));
             const draw_y = @as(i32, @intFromFloat(ball.interpolatedY(alpha)));
-            drawCircle(pixels, w, h, draw_x, draw_y, 20, 0xFF6B6BFF);
+            drawCircle(fb.pixels, w, h, draw_x, draw_y, 20, 0xFF6B6BFF);
 
-            c.platform_present(window);
+            window.present();
         }
 
         // フレームレート制御（処理時間を考慮したスリープ）
-        const process_time = c.platform_get_time() - current_time;
+        const process_time = platform.getTime() - current_time;
         const sleep_time = target_frame_time - process_time;
         if (sleep_time > 0) {
             const sleep_ns = @as(u64, @intFromFloat(sleep_time * 1_000_000_000.0));

@@ -35,11 +35,16 @@ pub fn build(b: *std.Build) void {
     const install_all = b.option(bool, "install-all", "Install all platform versions") orelse false;
 
     // ========================================
+    // 共通モジュール (main + examples で共有)
+    // ========================================
+    const example_modules = ExampleModules.init(b);
+
+    // ========================================
     // メインアプリケーション (objc/swift/metal)
     // ========================================
-    const exe_objc = addMainExe(b, target, optimize, platform_root, sdk_paths, .objc, APP_NAME);
-    const exe_swift = addMainExe(b, target, optimize, platform_root, sdk_paths, .swift, APP_NAME ++ "_swift");
-    const exe_metal = addMainExe(b, target, optimize, platform_root, sdk_paths, .metal, APP_NAME ++ "_metal");
+    const exe_objc = addMainExe(b, target, optimize, platform_root, sdk_paths, .objc, APP_NAME, &example_modules);
+    const exe_swift = addMainExe(b, target, optimize, platform_root, sdk_paths, .swift, APP_NAME ++ "_swift", &example_modules);
+    const exe_metal = addMainExe(b, target, optimize, platform_root, sdk_paths, .metal, APP_NAME ++ "_metal", &example_modules);
 
     const main_default = switch (platform_option) {
         .objc => exe_objc,
@@ -89,7 +94,6 @@ pub fn build(b: *std.Build) void {
     // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
     // ========================================
-    const example_modules = ExampleModules.init(b);
 
     // 各 example が必要とするモジュールを宣言的に指定する。
     // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
@@ -148,6 +152,7 @@ fn addMainExe(
     sdk_paths: macos.MacOSSDKPaths,
     platform_type: platform.PlatformType,
     name: []const u8,
+    modules: *const ExampleModules,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = name,
@@ -157,6 +162,7 @@ fn addMainExe(
             .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("platform", modules.platform);
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
 }
@@ -165,6 +171,7 @@ fn addMainExe(
 // ヘルパー: example の exe を 1 プラットフォーム分セットアップ
 // ============================================================
 const ExampleModules = struct {
+    platform: *std.Build.Module,
     keyboard: *std.Build.Module,
     sprite: *std.Build.Module,
     fixed_timestep: *std.Build.Module,
@@ -172,6 +179,20 @@ const ExampleModules = struct {
     text: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
+        // platform モジュール: @cImport で platform.h を取り込むため、
+        // include path と link_libc を per-module に設定する。
+        const platform_mod = b.createModule(.{
+            .root_source_file = b.path("src/platform.zig"),
+            .link_libc = true,
+        });
+        platform_mod.addIncludePath(b.path("platform"));
+
+        // keyboard は KeyCode 型定義を platform から借りる
+        const keyboard_mod = b.createModule(.{
+            .root_source_file = b.path("src/keyboard.zig"),
+        });
+        keyboard_mod.addImport("platform", platform_mod);
+
         const png_decoder = b.createModule(.{
             .root_source_file = b.path("libs/png-decoder/src/lib.zig"),
         });
@@ -181,9 +202,8 @@ const ExampleModules = struct {
         sprite.addImport("png-decoder", png_decoder);
 
         return .{
-            .keyboard = b.createModule(.{
-                .root_source_file = b.path("src/keyboard.zig"),
-            }),
+            .platform = platform_mod,
+            .keyboard = keyboard_mod,
             .sprite = sprite,
             .fixed_timestep = b.createModule(.{
                 .root_source_file = b.path("src/fixed_timestep.zig"),
@@ -225,7 +245,8 @@ fn addExampleExe(
             .optimize = optimize,
         }),
     });
-    // 全 example が keyboard を使う
+    // 全 example が platform / keyboard を使う
+    exe.root_module.addImport("platform", modules.platform);
     exe.root_module.addImport("keyboard", modules.keyboard);
     if (needs.needs_sprite) exe.root_module.addImport("sprite", modules.sprite);
     if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", modules.fps_counter);

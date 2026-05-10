@@ -26,6 +26,12 @@ pub fn build(b: *std.Build) void {
     const platform_root = b.path(PROJECT_ROOT ++ "/platform");
 
     // 親プロジェクト由来のモジュール
+    const platform_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .link_libc = true,
+    });
+    platform_module.addIncludePath(.{ .cwd_relative = PROJECT_ROOT ++ "/platform" });
+
     const fixed_timestep_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fixed_timestep.zig" },
     });
@@ -43,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "fixed_timestep", .module = fixed_timestep_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
             },
@@ -57,6 +64,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "fixed_timestep", .module = fixed_timestep_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
             },
@@ -71,6 +79,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "fixed_timestep", .module = fixed_timestep_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
             },

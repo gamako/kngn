@@ -26,12 +26,19 @@ pub fn build(b: *std.Build) void {
     const platform_root = b.path(PROJECT_ROOT ++ "/platform");
 
     // 親プロジェクト由来のモジュール
+    const platform_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .link_libc = true,
+    });
+    platform_module.addIncludePath(.{ .cwd_relative = PROJECT_ROOT ++ "/platform" });
+
     const text_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/text.zig" },
     });
     const keyboard_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },
     });
+    keyboard_module.addImport("platform", platform_module);
     const fps_counter_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fps_counter.zig" },
     });
@@ -46,6 +53,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "text", .module = text_module },
                 .{ .name = "keyboard", .module = keyboard_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
@@ -61,6 +69,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "text", .module = text_module },
                 .{ .name = "keyboard", .module = keyboard_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
@@ -76,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "platform", .module = platform_module },
                 .{ .name = "text", .module = text_module },
                 .{ .name = "keyboard", .module = keyboard_module },
                 .{ .name = "fps_counter", .module = fps_counter_module },
