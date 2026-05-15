@@ -130,7 +130,7 @@ pub const ScanlineDecoder = struct {
         allocator.free(self.window_buffer);
         allocator.free(self.current_scanline);
         allocator.free(self.previous_scanline);
-        allocator.destroy(self);  // Free the heap-allocated decoder
+        allocator.destroy(self); // Free the heap-allocated decoder
     }
 
     /// Read next scanline with filter applied
@@ -239,7 +239,8 @@ test "Decompress zlib data - 1x1 grayscale PNG" {
     const allocator = std.testing.allocator;
 
     // Read the 1x1 grayscale PNG file
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/1x1_grayscale.png",
         allocator,
         .unlimited,
@@ -277,7 +278,8 @@ test "Decompress zlib data - 1x1 grayscale PNG" {
 test "Decompress zlib data - 8x8 grayscale PNG (Filter None)" {
     const allocator = std.testing.allocator;
 
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/8x8_gray_filter_none.png",
         allocator,
         .unlimited,
@@ -323,7 +325,8 @@ test "Decompress zlib data - 8x8 grayscale PNG (Filter None)" {
 test "Decompress zlib data - 16x16 grayscale PNG (Filter None)" {
     const allocator = std.testing.allocator;
 
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/16x16_gray_filter_none.png",
         allocator,
         .unlimited,

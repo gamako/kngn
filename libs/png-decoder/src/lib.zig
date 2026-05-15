@@ -45,7 +45,7 @@ pub const DecodingError = error{
 pub const PNGImage = struct {
     width: u32,
     height: u32,
-    pixels: []u32,  // RGBA8888 format with byte order [R, G, B, A] in memory
+    pixels: []u32, // RGBA8888 format with byte order [R, G, B, A] in memory
 
     pub fn deinit(self: *PNGImage, allocator: std.mem.Allocator) void {
         allocator.free(self.pixels);
@@ -58,7 +58,7 @@ pub const PNGImage = struct {
 pub const PremultipliedImage = struct {
     width: u32,
     height: u32,
-    pixels: []u32,  // Premultiplied RGBA8888: byte order [R_pre, G_pre, B_pre, A] in memory
+    pixels: []u32, // Premultiplied RGBA8888: byte order [R_pre, G_pre, B_pre, A] in memory
 
     pub fn deinit(self: *PremultipliedImage, allocator: std.mem.Allocator) void {
         allocator.free(self.pixels);
@@ -188,8 +188,11 @@ pub fn decodePNG(allocator: std.mem.Allocator, file_data: []const u8) DecodingEr
 }
 
 /// Decode PNG from file path
-pub fn decodePNGFile(allocator: std.mem.Allocator, path: []const u8) DecodingError!PNGImage {
-    const file_data = std.fs.cwd().readFileAlloc(path, allocator, .unlimited) catch |err| {
+/// - io: I/O implementation (e.g. `init.io` in main, `std.testing.io` in tests)
+/// - allocator: memory allocator for the decoded image and intermediate buffers
+/// - path: PNG file path (resolved against cwd)
+pub fn decodePNGFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) DecodingError!PNGImage {
+    const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| {
         std.debug.print("Failed to read file: {s}, error: {}\n", .{ path, err });
         return DecodingError.ReadFailed;
     };
@@ -312,8 +315,11 @@ pub fn decodePNGPremultiplied(allocator: std.mem.Allocator, file_data: []const u
 }
 
 /// Decode PNG from file path to Premultiplied RGBA8888 format
-pub fn decodePNGFilePremultiplied(allocator: std.mem.Allocator, path: []const u8) DecodingError!PremultipliedImage {
-    const file_data = std.fs.cwd().readFileAlloc(path, allocator, .unlimited) catch |err| {
+/// - io: I/O implementation (e.g. `init.io` in main, `std.testing.io` in tests)
+/// - allocator: memory allocator for the decoded image and intermediate buffers
+/// - path: PNG file path (resolved against cwd)
+pub fn decodePNGFilePremultiplied(io: std.Io, allocator: std.mem.Allocator, path: []const u8) DecodingError!PremultipliedImage {
+    const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| {
         std.debug.print("Failed to read file: {s}, error: {}\n", .{ path, err });
         return DecodingError.ReadFailed;
     };

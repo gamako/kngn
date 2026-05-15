@@ -32,11 +32,7 @@ test "All test cases - IHDR verification" {
     // test_cases の全テストケースについて検証
     for (test_cases.test_cases) |tc| {
         // ファイルを読み込み
-        const file_data = try std.fs.cwd().readFileAlloc(
-            tc.file_path,
-            allocator,
-            .unlimited
-        );
+        const file_data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tc.file_path, allocator, .unlimited);
         defer allocator.free(file_data);
 
         // PNG署名を確認
@@ -102,11 +98,7 @@ test "ChunkIterator - iterate all chunks" {
     const allocator = std.testing.allocator;
 
     // 1x1_grayscale.png を読み込み
-    const file_data = try std.fs.cwd().readFileAlloc(
-        "test-data/1x1_grayscale.png",
-        allocator,
-        .unlimited
-    );
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test-data/1x1_grayscale.png", allocator, .unlimited);
     defer allocator.free(file_data);
 
     // PNG署名を確認
@@ -148,11 +140,7 @@ test "Collect IDAT chunks" {
     const allocator = std.testing.allocator;
 
     // 1x1_grayscale.png を読み込み
-    const file_data = try std.fs.cwd().readFileAlloc(
-        "test-data/1x1_grayscale.png",
-        allocator,
-        .unlimited
-    );
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test-data/1x1_grayscale.png", allocator, .unlimited);
     defer allocator.free(file_data);
 
     // IDAT チャンクを収集
@@ -237,7 +225,8 @@ test "Filter - apply filters to decompressed data" {
 
     for (filter_test_cases) |tc| {
         // Read PNG file
-        const file_data = try std.fs.cwd().readFileAlloc(
+        const file_data = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
             tc.file_path,
             allocator,
             .unlimited,
@@ -365,7 +354,8 @@ test "Format conversion - grayscale to RGBA8888" {
 
     for (format_test_cases) |tc| {
         // Read PNG file
-        const file_data = try std.fs.cwd().readFileAlloc(
+        const file_data = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
             tc.file_path,
             allocator,
             .unlimited,
@@ -408,8 +398,8 @@ test "Format conversion - grayscale to RGBA8888" {
 
                 // Expected RGBA8888 format: 0xRRGGBBAA
                 const expected_rgba = (@as(u32, gray_value) << 24) |
-                                     (@as(u32, gray_value) << 16) |
-                                     (@as(u32, gray_value) << 8) | 0xFF;
+                    (@as(u32, gray_value) << 16) |
+                    (@as(u32, gray_value) << 8) | 0xFF;
 
                 try std.testing.expectEqual(
                     expected_rgba,
@@ -424,7 +414,8 @@ test "Phase 1 - end-to-end decodePNG test (8x8 grayscale)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/8x8_gray_filter_none.png",
         allocator,
         .unlimited,
@@ -453,7 +444,8 @@ test "Phase 1 - end-to-end decodePNG test (16x16 grayscale)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/16x16_gray_filter_none.png",
         allocator,
         .unlimited,
@@ -482,7 +474,8 @@ test "Phase 2 - end-to-end decodePNG test (Average filter)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file with Average filter
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/8x8_gray_filter_average.png",
         allocator,
         .unlimited,
@@ -511,7 +504,8 @@ test "Phase 2 - end-to-end decodePNG test (Paeth filter)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file with Paeth filter
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/8x8_gray_filter_paeth.png",
         allocator,
         .unlimited,
@@ -540,7 +534,8 @@ test "Phase 2 - end-to-end decodePNG test (RGB checkerboard)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file (RGB format)
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/8x8_rgb_checkerboard_filter_none.png",
         allocator,
         .unlimited,
@@ -571,7 +566,8 @@ test "Phase 2 - end-to-end decodePNG test (RGB gradient)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file (RGB format)
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/16x16_rgb_gradient_filter_none.png",
         allocator,
         .unlimited,
@@ -602,7 +598,8 @@ test "Phase 3 - end-to-end decodePNG test (RGBA checkerboard)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file (RGBA format)
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/8x8_rgba_checkerboard_filter_none.png",
         allocator,
         .unlimited,
@@ -633,7 +630,8 @@ test "Phase 3 - end-to-end decodePNG test (RGBA gradient)" {
     const allocator = std.testing.allocator;
 
     // Read PNG file (RGBA format)
-    const file_data = try std.fs.cwd().readFileAlloc(
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
         "test-data/16x16_rgba_gradient_filter_none.png",
         allocator,
         .unlimited,

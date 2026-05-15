@@ -11,12 +11,13 @@ pub const Sprite = struct {
     y: i32,
 
     /// PNGファイルからスプライトを作成
+    /// - io: I/O 実装（main では `init.io`、テストでは `std.testing.io`）
     /// - allocator: メモリアロケータ
     /// - path: PNGファイルのパス
     /// - x: 初期X座標
     /// - y: 初期Y座標
-    pub fn init(allocator: std.mem.Allocator, path: []const u8, x: i32, y: i32) !Sprite {
-        const image = try png_decoder.decodePNGFilePremultiplied(allocator, path);
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8, x: i32, y: i32) !Sprite {
+        const image = try png_decoder.decodePNGFilePremultiplied(io, allocator, path);
         return Sprite{
             .image = image,
             .x = x,
