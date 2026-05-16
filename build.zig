@@ -92,6 +92,27 @@ pub fn build(b: *std.Build) void {
     test_text_step.dependOn(&run_text_test.step);
 
     // ========================================
+    // sprite.zig テスト (blend4Pixels / drawSprite)
+    // ========================================
+    const sprite_test_png_decoder = b.createModule(.{
+        .root_source_file = b.path("libs/png-decoder/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sprite_test_module = b.createModule(.{
+        .root_source_file = b.path("src/sprite.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sprite_test_module.addImport("png-decoder", sprite_test_png_decoder);
+    const sprite_test = b.addTest(.{
+        .root_module = sprite_test_module,
+    });
+    const run_sprite_test = b.addRunArtifact(sprite_test);
+    const test_sprite_step = b.step("test-sprite", "Run sprite blending and drawing tests");
+    test_sprite_step.dependOn(&run_sprite_test.step);
+
+    // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
     // ========================================
 
