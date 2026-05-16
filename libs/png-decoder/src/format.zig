@@ -1,7 +1,8 @@
 // PNG Decoder Pixel Format Conversion
 // Specification: https://www.w3.org/TR/png/#6Colour-values
 //
-// Converts PNG pixel data to RGBA8888 format (u32 per pixel, 0xRRGGBBAA).
+// Converts PNG pixel data to RGBA8888 format (u32 per pixel).
+// Memory byte order is [R, G, B, A]; on little-endian systems this is u32 0xAABBGGRR.
 // Supports: Grayscale, RGB, RGBA (8-bit per channel)
 
 const std = @import("std");

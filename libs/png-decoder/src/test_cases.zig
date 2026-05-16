@@ -3,9 +3,15 @@
 
 const std = @import("std");
 
+/// Pack RGBA bytes into a u32 matching the decoder's memory layout
+/// (byte order [R, G, B, A]; on little-endian this is 0xAABBGGRR).
+pub fn packRGBA(r: u8, g: u8, b: u8, a: u8) u32 {
+    return (@as(u32, a) << 24) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | @as(u32, r);
+}
+
 /// 1x1 hardcoded expected pixels (gray=128)
 pub const grayscale_1x1_expected = [_]u32{
-    0x808080FF,
+    0xFF808080,
 };
 
 /// Generate grayscale gradient pattern (for testing)
@@ -21,8 +27,7 @@ pub fn generateGradientExpected(
 
     for (0..height) |y| {
         const gray = @as(u8, @intCast(y * step));
-        const rgba = (@as(u32, gray) << 24) | (@as(u32, gray) << 16) |
-                     (@as(u32, gray) << 8) | 0xFF;
+        const rgba = packRGBA(gray, gray, gray, 0xFF);
         for (0..width) |_| {
             try result.append(allocator, rgba);
         }
@@ -44,9 +49,9 @@ pub fn generateRGBCheckerboardExpected(
     for (0..height) |y| {
         for (0..width) |x| {
             const rgba = if ((x + y) % 2 == 0)
-                @as(u32, 0xFF0000FF)  // Red
+                packRGBA(255, 0, 0, 0xFF) // Red
             else
-                @as(u32, 0x0000FFFF); // Blue
+                packRGBA(0, 0, 255, 0xFF); // Blue
             try result.append(allocator, rgba);
         }
     }
@@ -66,11 +71,9 @@ pub fn generateRGBGradientExpected(
 
     for (0..height) |y| {
         for (0..width) |x| {
-            const r = @as(u32, @intCast(x * 16));
-            const g = @as(u32, @intCast(y * 16));
-            const b: u32 = 128;
-            const a: u32 = 0xFF;
-            const rgba = (r << 24) | (g << 16) | (b << 8) | a;
+            const r = @as(u8, @intCast(x * 16));
+            const g = @as(u8, @intCast(y * 16));
+            const rgba = packRGBA(r, g, 128, 0xFF);
             try result.append(allocator, rgba);
         }
     }
@@ -91,9 +94,9 @@ pub fn generateRGBACheckerboardExpected(
     for (0..height) |y| {
         for (0..width) |x| {
             const rgba = if ((x + y) % 2 == 0)
-                @as(u32, 0xFF0000FF)  // Red (fully opaque)
+                packRGBA(255, 0, 0, 0xFF) // Red (fully opaque)
             else
-                @as(u32, 0x0000FF80); // Blue (semi-transparent, A=128)
+                packRGBA(0, 0, 255, 128); // Blue (semi-transparent, A=128)
             try result.append(allocator, rgba);
         }
     }
@@ -113,11 +116,10 @@ pub fn generateRGBAGradientExpected(
 
     for (0..height) |y| {
         for (0..width) |x| {
-            const r = @as(u32, @intCast(x * 16));
-            const g = @as(u32, @intCast(y * 16));
-            const b: u32 = 128;
-            const a: u32 = @as(u32, @intCast(x * 16)); // Alpha varies with R
-            const rgba = (r << 24) | (g << 16) | (b << 8) | a;
+            const r = @as(u8, @intCast(x * 16));
+            const g = @as(u8, @intCast(y * 16));
+            const a = @as(u8, @intCast(x * 16)); // Alpha varies with R
+            const rgba = packRGBA(r, g, 128, a);
             try result.append(allocator, rgba);
         }
     }

@@ -396,10 +396,8 @@ test "Format conversion - grayscale to RGBA8888" {
                 const idx = y * tc.width + x;
                 const gray_value = filtered[idx];
 
-                // Expected RGBA8888 format: 0xRRGGBBAA
-                const expected_rgba = (@as(u32, gray_value) << 24) |
-                    (@as(u32, gray_value) << 16) |
-                    (@as(u32, gray_value) << 8) | 0xFF;
+                // Expected RGBA8888: byte order [R, G, B, A] (u32 = 0xAABBGGRR on little-endian)
+                const expected_rgba = test_cases.packRGBA(gray_value, gray_value, gray_value, 0xFF);
 
                 try std.testing.expectEqual(
                     expected_rgba,
@@ -435,7 +433,7 @@ test "Phase 1 - end-to-end decodePNG test (8x8 grayscale)" {
 
     // Verify RGBA values (all pixels should have A=255)
     for (png_image.pixels) |pixel| {
-        const alpha = pixel & 0xFF;
+        const alpha = pixel >> 24;
         try std.testing.expectEqual(@as(u32, 0xFF), alpha);
     }
 }
@@ -465,7 +463,7 @@ test "Phase 1 - end-to-end decodePNG test (16x16 grayscale)" {
 
     // Verify RGBA values (all pixels should have A=255)
     for (png_image.pixels) |pixel| {
-        const alpha = pixel & 0xFF;
+        const alpha = pixel >> 24;
         try std.testing.expectEqual(@as(u32, 0xFF), alpha);
     }
 }
@@ -495,7 +493,7 @@ test "Phase 2 - end-to-end decodePNG test (Average filter)" {
 
     // Verify RGBA values (all pixels should have A=255)
     for (png_image.pixels) |pixel| {
-        const alpha = pixel & 0xFF;
+        const alpha = pixel >> 24;
         try std.testing.expectEqual(@as(u32, 0xFF), alpha);
     }
 }
@@ -525,7 +523,7 @@ test "Phase 2 - end-to-end decodePNG test (Paeth filter)" {
 
     // Verify RGBA values (all pixels should have A=255)
     for (png_image.pixels) |pixel| {
-        const alpha = pixel & 0xFF;
+        const alpha = pixel >> 24;
         try std.testing.expectEqual(@as(u32, 0xFF), alpha);
     }
 }
