@@ -179,13 +179,11 @@ const ExampleModules = struct {
     text: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
-        // platform モジュール: @cImport で platform.h を取り込むため、
-        // include path と link_libc を per-module に設定する。
-        const platform_mod = b.createModule(.{
-            .root_source_file = b.path("src/platform.zig"),
-            .link_libc = true,
-        });
-        platform_mod.addIncludePath(b.path("platform"));
+        const platform_mod = platform.createPlatformModule(
+            b,
+            b.path("src/platform.zig"),
+            b.path("platform"),
+        );
 
         // keyboard は KeyCode 型定義を platform から借りる
         const keyboard_mod = b.createModule(.{

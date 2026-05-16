@@ -26,11 +26,11 @@ pub fn build(b: *std.Build) void {
     const platform_root = b.path(PROJECT_ROOT ++ "/platform");
 
     // 親プロジェクト由来のモジュール
-    const platform_module = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
-        .link_libc = true,
-    });
-    platform_module.addIncludePath(.{ .cwd_relative = PROJECT_ROOT ++ "/platform" });
+    const platform_module = platform.createPlatformModule(
+        b,
+        .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
+    );
 
     const keyboard_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },

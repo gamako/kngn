@@ -13,6 +13,27 @@ pub const PlatformType = enum {
     metal,
 };
 
+/// platform モジュール (`src/platform.zig`) を作成する。
+///
+/// `@cImport` で `platform.h` を取り込むため、`link_libc = true` と
+/// platform/ include path 追加をワンセットで行う。
+///
+/// path の解決方法 (`b.path` / `cwd_relative`) は callsite に委ねる。
+/// 親 build.zig からは `b.path(...)`、standalone からは
+/// `.{ .cwd_relative = PROJECT_ROOT ++ ... }` を渡すこと。
+pub fn createPlatformModule(
+    b: *std.Build,
+    platform_source: std.Build.LazyPath,
+    platform_include_root: std.Build.LazyPath,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = platform_source,
+        .link_libc = true,
+    });
+    mod.addIncludePath(platform_include_root);
+    return mod;
+}
+
 /// 実行ファイルにプラットフォーム層をセットアップする。
 ///
 /// プラットフォーム層 (.o) のコンパイル、framework / Swift ランタイムリンク、
