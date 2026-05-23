@@ -139,9 +139,10 @@ fn buildSwift(
         "Cocoa",
         "-framework",
         "QuartzCore",
-        "-c",
-        "-o",
+        "-import-objc-header",
     });
+    compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
+    compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
     compile_cmd.addFileArg(platform_root.path(b, "macos-swift/platform_macos.swift"));
     return .{ .compile_step = compile_cmd, .obj_file = obj_path };
@@ -169,9 +170,10 @@ fn buildMetal(
         "Metal",
         "-framework",
         "MetalKit",
-        "-c",
-        "-o",
+        "-import-objc-header",
     });
+    compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
+    compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");
     compile_cmd.addFileArg(platform_root.path(b, "macos-metal/platform_macos_metal.swift"));
     return .{ .compile_step = compile_cmd, .obj_file = obj_path };

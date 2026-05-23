@@ -2,153 +2,16 @@ import Cocoa
 import QuartzCore
 
 // CALayer最適化版の実装（Swift）
+// 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
+//        FrameCallback typealias など) は bridging header (-import-objc-header
+//        platform/platform.h) 経由で C ヘッダから自動取得する。
 let IMPLEMENTATION_TYPE = "CALayer Optimized (Swift)"
 
-// フレームコールバック型定義（C互換）
-typealias FrameCallback = @convention(c) (UnsafeMutablePointer<UInt32>, Int32, Int32, UnsafeMutableRawPointer?) -> Void
-
 // ========================================
-// イベント処理用定義
+// イベント処理用定義 (Swift 側ローカル)
 // ========================================
 
 let EVENT_QUEUE_SIZE = 256
-
-// PlatformEvent構造体（C互換）
-struct PlatformEvent {
-    var type: UInt32
-    var keyboard: KeyboardEvent
-}
-
-struct KeyboardEvent {
-    var key: Int32
-    var is_repeat: Bool
-    var modifiers: UInt32
-}
-
-// イベントタイプ定義
-let PLATFORM_EVENT_NONE: UInt32 = 0
-let PLATFORM_EVENT_QUIT: UInt32 = 1
-let PLATFORM_EVENT_KEY_DOWN: UInt32 = 2
-let PLATFORM_EVENT_KEY_UP: UInt32 = 3
-
-// キーコード定義（選択）
-let PLATFORM_KEY_UNKNOWN: Int32 = -1
-let PLATFORM_KEY_SPACE: Int32 = 32
-let PLATFORM_KEY_0: Int32 = 48
-let PLATFORM_KEY_1: Int32 = 49
-let PLATFORM_KEY_2: Int32 = 50
-let PLATFORM_KEY_3: Int32 = 51
-let PLATFORM_KEY_4: Int32 = 52
-let PLATFORM_KEY_5: Int32 = 53
-let PLATFORM_KEY_6: Int32 = 54
-let PLATFORM_KEY_7: Int32 = 55
-let PLATFORM_KEY_8: Int32 = 56
-let PLATFORM_KEY_9: Int32 = 57
-let PLATFORM_KEY_A: Int32 = 65
-let PLATFORM_KEY_B: Int32 = 66
-let PLATFORM_KEY_C: Int32 = 67
-let PLATFORM_KEY_D: Int32 = 68
-let PLATFORM_KEY_E: Int32 = 69
-let PLATFORM_KEY_F: Int32 = 70
-let PLATFORM_KEY_G: Int32 = 71
-let PLATFORM_KEY_H: Int32 = 72
-let PLATFORM_KEY_I: Int32 = 73
-let PLATFORM_KEY_J: Int32 = 74
-let PLATFORM_KEY_K: Int32 = 75
-let PLATFORM_KEY_L: Int32 = 76
-let PLATFORM_KEY_M: Int32 = 77
-let PLATFORM_KEY_N: Int32 = 78
-let PLATFORM_KEY_O: Int32 = 79
-let PLATFORM_KEY_P: Int32 = 80
-let PLATFORM_KEY_Q: Int32 = 81
-let PLATFORM_KEY_R: Int32 = 82
-let PLATFORM_KEY_S: Int32 = 83
-let PLATFORM_KEY_T: Int32 = 84
-let PLATFORM_KEY_U: Int32 = 85
-let PLATFORM_KEY_V: Int32 = 86
-let PLATFORM_KEY_W: Int32 = 87
-let PLATFORM_KEY_X: Int32 = 88
-let PLATFORM_KEY_Y: Int32 = 89
-let PLATFORM_KEY_Z: Int32 = 90
-let PLATFORM_KEY_ESCAPE: Int32 = 256
-let PLATFORM_KEY_ENTER: Int32 = 257
-let PLATFORM_KEY_LEFT: Int32 = 263
-let PLATFORM_KEY_RIGHT: Int32 = 264
-let PLATFORM_KEY_UP: Int32 = 265
-let PLATFORM_KEY_DOWN: Int32 = 266
-let PLATFORM_KEY_CMD: Int32 = 256 + 8
-
-// 編集キー
-let PLATFORM_KEY_TAB: Int32 = 258
-let PLATFORM_KEY_BACKSPACE: Int32 = 259
-let PLATFORM_KEY_INSERT: Int32 = 260
-let PLATFORM_KEY_DELETE: Int32 = 261
-let PLATFORM_KEY_PAGE_UP: Int32 = 267
-let PLATFORM_KEY_PAGE_DOWN: Int32 = 268
-let PLATFORM_KEY_HOME: Int32 = 269
-let PLATFORM_KEY_END: Int32 = 270
-
-// ファンクションキー（F1-F20）
-let PLATFORM_KEY_F1: Int32 = 290
-let PLATFORM_KEY_F2: Int32 = 291
-let PLATFORM_KEY_F3: Int32 = 292
-let PLATFORM_KEY_F4: Int32 = 293
-let PLATFORM_KEY_F5: Int32 = 294
-let PLATFORM_KEY_F6: Int32 = 295
-let PLATFORM_KEY_F7: Int32 = 296
-let PLATFORM_KEY_F8: Int32 = 297
-let PLATFORM_KEY_F9: Int32 = 298
-let PLATFORM_KEY_F10: Int32 = 299
-let PLATFORM_KEY_F11: Int32 = 300
-let PLATFORM_KEY_F12: Int32 = 301
-let PLATFORM_KEY_F13: Int32 = 302
-let PLATFORM_KEY_F14: Int32 = 303
-let PLATFORM_KEY_F15: Int32 = 304
-let PLATFORM_KEY_F16: Int32 = 305
-let PLATFORM_KEY_F17: Int32 = 306
-let PLATFORM_KEY_F18: Int32 = 307
-let PLATFORM_KEY_F19: Int32 = 308
-let PLATFORM_KEY_F20: Int32 = 309
-
-// テンキー（numeric keypad）
-let PLATFORM_KEY_KP_0: Int32 = 320
-let PLATFORM_KEY_KP_1: Int32 = 321
-let PLATFORM_KEY_KP_2: Int32 = 322
-let PLATFORM_KEY_KP_3: Int32 = 323
-let PLATFORM_KEY_KP_4: Int32 = 324
-let PLATFORM_KEY_KP_5: Int32 = 325
-let PLATFORM_KEY_KP_6: Int32 = 326
-let PLATFORM_KEY_KP_7: Int32 = 327
-let PLATFORM_KEY_KP_8: Int32 = 328
-let PLATFORM_KEY_KP_9: Int32 = 329
-let PLATFORM_KEY_KP_DECIMAL: Int32 = 330
-let PLATFORM_KEY_KP_DIVIDE: Int32 = 331
-let PLATFORM_KEY_KP_MULTIPLY: Int32 = 332
-let PLATFORM_KEY_KP_SUBTRACT: Int32 = 333
-let PLATFORM_KEY_KP_ADD: Int32 = 334
-let PLATFORM_KEY_KP_ENTER: Int32 = 335
-let PLATFORM_KEY_KP_EQUAL: Int32 = 336
-
-// モディファイアキー（単独入力用）
-let PLATFORM_KEY_LEFT_SHIFT: Int32 = 340
-let PLATFORM_KEY_LEFT_CONTROL: Int32 = 341
-let PLATFORM_KEY_LEFT_ALT: Int32 = 342
-let PLATFORM_KEY_LEFT_SUPER: Int32 = 343        // Command (macOS)
-let PLATFORM_KEY_RIGHT_SHIFT: Int32 = 344
-let PLATFORM_KEY_RIGHT_CONTROL: Int32 = 345
-let PLATFORM_KEY_RIGHT_ALT: Int32 = 346
-let PLATFORM_KEY_RIGHT_SUPER: Int32 = 347       // Command (macOS)
-
-// その他のキー
-let PLATFORM_KEY_CAPS_LOCK: Int32 = 280
-let PLATFORM_KEY_PRINT_SCREEN: Int32 = 283
-let PLATFORM_KEY_PAUSE: Int32 = 284
-
-// モディファイアキー定義
-let PLATFORM_MOD_SHIFT: UInt32 = 0x01
-let PLATFORM_MOD_CTRL: UInt32 = 0x02
-let PLATFORM_MOD_ALT: UInt32 = 0x04
-let PLATFORM_MOD_CMD: UInt32 = 0x08
 
 // イベントキュー構造体（固定サイズ配列を使用）
 class EventQueue {
@@ -159,12 +22,8 @@ class EventQueue {
     init() {
         // 固定サイズのメモリバッファを確保
         events = UnsafeMutablePointer<PlatformEvent>.allocate(capacity: EVENT_QUEUE_SIZE)
-        // すべてのイベントをNONEで初期化
-        let emptyEvent = PlatformEvent(
-            type: PLATFORM_EVENT_NONE,
-            keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0)
-        )
-        events.initialize(repeating: emptyEvent, count: EVENT_QUEUE_SIZE)
+        // すべてのイベントを 0 初期化 (type = PLATFORM_EVENT_NONE)
+        events.initialize(repeating: PlatformEvent(), count: EVENT_QUEUE_SIZE)
     }
 
     subscript(index: Int) -> PlatformEvent {
@@ -184,7 +43,7 @@ class EventQueue {
 
 // macOSのキーコードをPlatformKeyCodeに変換
 // 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
-func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
+func mapKeyCodeToPlatform(_ keyCode: UInt16) -> PlatformKeyCode {
     switch keyCode {
         // 文字キー（ANSI配列）
         case 0x00: return PLATFORM_KEY_A
@@ -319,10 +178,10 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> Int32 {
 // モディファイアキーを抽出
 func extractModifiers(_ nsModifiers: NSEvent.ModifierFlags) -> UInt32 {
     var mods: UInt32 = 0
-    if nsModifiers.contains(.shift)   { mods |= PLATFORM_MOD_SHIFT }
-    if nsModifiers.contains(.control) { mods |= PLATFORM_MOD_CTRL }
-    if nsModifiers.contains(.option)  { mods |= PLATFORM_MOD_ALT }
-    if nsModifiers.contains(.command) { mods |= PLATFORM_MOD_CMD }
+    if nsModifiers.contains(.shift)   { mods |= UInt32(PLATFORM_MOD_SHIFT.rawValue) }
+    if nsModifiers.contains(.control) { mods |= UInt32(PLATFORM_MOD_CTRL.rawValue) }
+    if nsModifiers.contains(.option)  { mods |= UInt32(PLATFORM_MOD_ALT.rawValue) }
+    if nsModifiers.contains(.command) { mods |= UInt32(PLATFORM_MOD_CMD.rawValue) }
     return mods
 }
 
@@ -655,11 +514,11 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
 
             // キューがいっぱいでない場合のみ追加
             if next_head != queue.tail {
-                var platform_event = PlatformEvent(type: PLATFORM_EVENT_NONE, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
+                var platform_event = PlatformEvent()
                 platform_event.type = (event.type == .keyDown) ? PLATFORM_EVENT_KEY_DOWN : PLATFORM_EVENT_KEY_UP
-                platform_event.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
-                platform_event.keyboard.is_repeat = event.isARepeat
-                platform_event.keyboard.modifiers = extractModifiers(event.modifierFlags)
+                platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
+                platform_event.payload.keyboard.is_repeat = event.isARepeat
+                platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags)
 
                 queue[queue.head] = platform_event
                 queue.head = next_head
@@ -679,7 +538,8 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
         let queue = handle.event_queue
         let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
         if next_head != queue.tail {
-            let quit_event = PlatformEvent(type: PLATFORM_EVENT_QUIT, keyboard: KeyboardEvent(key: 0, is_repeat: false, modifiers: 0))
+            var quit_event = PlatformEvent()
+            quit_event.type = PLATFORM_EVENT_QUIT
             queue[queue.head] = quit_event
             queue.head = next_head
         }
