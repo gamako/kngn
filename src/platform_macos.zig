@@ -134,6 +134,48 @@ comptime {
 }
 
 // ============================================================================
+// MouseButton (物理ボタン基準、C 側 PlatformMouseButton と同じ int 幅)
+// ============================================================================
+
+pub const MouseButton = enum(c_int) {
+    left = 0,
+    right = 1,
+    middle = 2,
+    none = 0xFF,
+    _,
+};
+
+inline fn buttonFromC(raw: c.PlatformMouseButton) MouseButton {
+    return @enumFromInt(@as(c_int, @intCast(raw)));
+}
+
+// ============================================================================
+// MouseButtons (packed struct, LSB-first で C の bit-mask と一致)
+// ============================================================================
+
+pub const MouseButtons = packed struct(u8) {
+    left: bool = false,
+    right: bool = false,
+    middle: bool = false,
+    _reserved: u5 = 0,
+
+    pub inline fn fromC(raw: u8) MouseButtons {
+        return @bitCast(raw);
+    }
+
+    pub inline fn toC(self: MouseButtons) u8 {
+        return @bitCast(self);
+    }
+};
+
+comptime {
+    // C 側 LEFT=0x01, RIGHT=0x02, MIDDLE=0x04 と packed struct のビット並びが一致することを保証
+    std.debug.assert(@as(u8, @bitCast(MouseButtons{ .left = true })) == 0x01);
+    std.debug.assert(@as(u8, @bitCast(MouseButtons{ .right = true })) == 0x02);
+    std.debug.assert(@as(u8, @bitCast(MouseButtons{ .middle = true })) == 0x04);
+}
+
+// ============================================================================
 // Event
 // ============================================================================
 
@@ -143,10 +185,42 @@ pub const KeyEvent = struct {
     modifiers: ModifierFlags,
 };
 
+/// マウスイベント。座標は window 座標 (window contentRect 左上原点・logical 単位)。
+/// framebuffer / canvas への変換は caller の責任。
+pub const MouseEvent = struct {
+    x: i32,
+    y: i32,
+    button: MouseButton,    // mouse_move では .none、mouse_down/up でのみ left/right/middle
+    buttons: MouseButtons,  // 現在押下中のボタン集合 (post-state)
+    modifiers: ModifierFlags,
+};
+
+/// スクロールイベント。dx, dy の単位は window 座標と同じ。
+pub const ScrollEvent = struct {
+    x: i32,
+    y: i32,
+    dx: f32,
+    dy: f32,
+    is_precise: bool,
+    buttons: MouseButtons,
+    modifiers: ModifierFlags,
+};
+
 pub const Event = union(enum) {
     quit,
     key_down: KeyEvent,
     key_up: KeyEvent,
+    mouse_move: MouseEvent,
+    mouse_down: MouseEvent,
+    mouse_up: MouseEvent,
+    mouse_scroll: ScrollEvent,
+};
+
+/// イベントキューの観測カウンタ (累積値の snapshot)
+pub const EventStats = struct {
+    mouse_move_merge_count: u64,
+    mouse_scroll_merge_count: u64,
+    event_drop_count: u64,
 };
 
 inline fn makeKeyEvent(ev: c.PlatformEvent) KeyEvent {
@@ -154,6 +228,28 @@ inline fn makeKeyEvent(ev: c.PlatformEvent) KeyEvent {
         .key = keyFromC(ev.payload.keyboard.key),
         .is_repeat = ev.payload.keyboard.is_repeat,
         .modifiers = ModifierFlags.fromC(ev.payload.keyboard.modifiers),
+    };
+}
+
+inline fn makeMouseEvent(ev: c.PlatformEvent) MouseEvent {
+    return .{
+        .x = ev.payload.mouse.x,
+        .y = ev.payload.mouse.y,
+        .button = buttonFromC(ev.payload.mouse.button),
+        .buttons = MouseButtons.fromC(ev.payload.mouse.buttons_mask),
+        .modifiers = ModifierFlags.fromC(ev.payload.mouse.modifiers),
+    };
+}
+
+inline fn makeScrollEvent(ev: c.PlatformEvent) ScrollEvent {
+    return .{
+        .x = ev.payload.scroll.x,
+        .y = ev.payload.scroll.y,
+        .dx = ev.payload.scroll.dx,
+        .dy = ev.payload.scroll.dy,
+        .is_precise = ev.payload.scroll.is_precise,
+        .buttons = MouseButtons.fromC(ev.payload.scroll.buttons_mask),
+        .modifiers = ModifierFlags.fromC(ev.payload.scroll.modifiers),
     };
 }
 
@@ -191,9 +287,23 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_QUIT => .quit,
                 c.PLATFORM_EVENT_KEY_DOWN => Event{ .key_down = makeKeyEvent(ev) },
                 c.PLATFORM_EVENT_KEY_UP => Event{ .key_up = makeKeyEvent(ev) },
+                c.PLATFORM_EVENT_MOUSE_MOVE => Event{ .mouse_move = makeMouseEvent(ev) },
+                c.PLATFORM_EVENT_MOUSE_DOWN => Event{ .mouse_down = makeMouseEvent(ev) },
+                c.PLATFORM_EVENT_MOUSE_UP => Event{ .mouse_up = makeMouseEvent(ev) },
+                c.PLATFORM_EVENT_MOUSE_SCROLL => Event{ .mouse_scroll = makeScrollEvent(ev) },
                 else => continue,
             };
         }
+    }
+
+    pub fn getEventStats(self: Window) EventStats {
+        var s: c.PlatformEventStats = undefined;
+        c.platform_get_event_stats(self.handle, &s);
+        return .{
+            .mouse_move_merge_count = s.mouse_move_merge_count,
+            .mouse_scroll_merge_count = s.mouse_scroll_merge_count,
+            .event_drop_count = s.event_drop_count,
+        };
     }
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {

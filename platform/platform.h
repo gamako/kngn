@@ -107,7 +107,27 @@ typedef enum {
     PLATFORM_EVENT_QUIT,
     PLATFORM_EVENT_KEY_DOWN,
     PLATFORM_EVENT_KEY_UP,
+    PLATFORM_EVENT_MOUSE_MOVE,
+    PLATFORM_EVENT_MOUSE_DOWN,
+    PLATFORM_EVENT_MOUSE_UP,
+    PLATFORM_EVENT_MOUSE_SCROLL,
 } PlatformEventType;
+
+// マウスボタン (物理ボタン基準: NSEvent.buttonNumber と一致)
+// C enum はストレージ型未指定 = int 幅。Zig 側は enum(c_int) で受ける。
+typedef enum {
+    PLATFORM_MOUSE_BUTTON_NONE = 0xFF,    // MOUSE_MOVE で button フィールドが意味を持たない時
+    PLATFORM_MOUSE_BUTTON_LEFT = 0,
+    PLATFORM_MOUSE_BUTTON_RIGHT = 1,
+    PLATFORM_MOUSE_BUTTON_MIDDLE = 2,
+} PlatformMouseButton;
+
+// PlatformMouseButton の bit-mask 版 (LSB-first: 0x01=left, 0x02=right, 0x04=middle)
+typedef enum {
+    PLATFORM_MOUSE_BUTTON_FLAG_LEFT   = 0x01,
+    PLATFORM_MOUSE_BUTTON_FLAG_RIGHT  = 0x02,
+    PLATFORM_MOUSE_BUTTON_FLAG_MIDDLE = 0x04,
+} PlatformMouseButtonFlags;
 
 // キーコード
 // 物理キーボードの位置に基づいた仮想キーコード
@@ -246,7 +266,22 @@ typedef struct PlatformEvent {
             bool is_repeat;
             uint32_t modifiers;
         } keyboard;
-        // 将来的にマウス、タッチなど追加
+        struct {
+            // x, y: window contentRect 左上原点・window logical 単位 (view.bounds と同単位)
+            // floor 整数化済み。framebuffer/canvas 変換は caller 責任。
+            // ボタン押下中はウィンドウ外でも座標を clamp せず負値もそのまま渡す。
+            int32_t x, y;
+            PlatformMouseButton button;   // MOUSE_DOWN / MOUSE_UP のみ valid、MOUSE_MOVE では PLATFORM_MOUSE_BUTTON_NONE
+            uint8_t buttons_mask;         // 現在押されているボタンの bitmask (post-state, & 0x07 でマスク済み)
+            uint32_t modifiers;
+        } mouse;
+        struct {
+            int32_t x, y;                 // window 座標 (mouse と同じ単位)
+            float dx, dy;                 // 単位は window 座標と同じ (line 単位の場合は scrollerLineHeight 倍済み)
+            bool is_precise;              // true: トラックパッド (連続値), false: ホイール (line→window-units 変換済み)
+            uint8_t buttons_mask;         // post-state
+            uint32_t modifiers;
+        } scroll;
     } payload;
 } PlatformEvent;
 
@@ -254,5 +289,16 @@ typedef struct PlatformEvent {
 // ウィンドウのイベントキューから1つイベントを取得する
 // イベントがあればtrue、ないならfalseを返す
 bool platform_get_event(PlatformWindow* window, PlatformEvent* event);
+
+// イベントキューの観測カウンタ (累積値、snapshot 取得)
+// example での合体動作・溢れ検知に使う。
+typedef struct PlatformEventStats {
+    uint64_t mouse_move_merge_count;    // mouse_move を末尾合体した累積回数
+    uint64_t mouse_scroll_merge_count;  // mouse_scroll を末尾合体した累積回数
+    uint64_t event_drop_count;          // キュー満杯で捨てた累積回数
+} PlatformEventStats;
+
+// イベントキューのカウンタ snapshot を取得
+void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
 
 #endif // PLATFORM_H

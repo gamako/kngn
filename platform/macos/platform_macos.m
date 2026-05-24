@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #include "platform.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -10,6 +11,118 @@
 
 // 前方宣言
 @class FramebufferView;
+
+// ========================================
+// イベントキュー / PlatformWindow 定義 (FramebufferView の @implementation から参照される)
+// ========================================
+
+#define EVENT_QUEUE_SIZE 256
+
+// モディファイアキーを抽出
+static uint32_t extractModifiers(NSEventModifierFlags nsModifiers) {
+    uint32_t mods = 0;
+    if (nsModifiers & NSEventModifierFlagShift)   mods |= PLATFORM_MOD_SHIFT;
+    if (nsModifiers & NSEventModifierFlagControl) mods |= PLATFORM_MOD_CTRL;
+    if (nsModifiers & NSEventModifierFlagOption)  mods |= PLATFORM_MOD_ALT;
+    if (nsModifiers & NSEventModifierFlagCommand) mods |= PLATFORM_MOD_CMD;
+    return mods;
+}
+
+// イベントキュー構造体
+typedef struct {
+    PlatformEvent events[EVENT_QUEUE_SIZE];
+    int head;  // 次に書き込む位置
+    int tail;  // 次に読む位置
+    // 観測カウンタ (累積値、example で差分監視に使う)
+    uint64_t mouse_move_merge_count;
+    uint64_t mouse_scroll_merge_count;
+    uint64_t event_drop_count;
+} EventQueue;
+
+// プラットフォームウィンドウ構造体
+struct PlatformWindow {
+    NSWindow* window;
+    FramebufferView* view;
+    EventQueue event_queue;
+};
+
+// ========================================
+// マウス入力ヘルパー (TASK-21.1)
+// ========================================
+
+// non-precise scroll の line→points 変換係数 (経験則)
+// example_07 でログ確認しつつ調整可能。
+static const float SCROLL_LINE_TO_POINTS = 16.0f;
+
+// キュー末尾の最新イベントへのポインタ。空なら NULL。
+static PlatformEvent* queue_peek_tail(EventQueue* q) {
+    if (q->head == q->tail) return NULL;
+    int prev = (q->head - 1 + EVENT_QUEUE_SIZE) % EVENT_QUEUE_SIZE;
+    return &q->events[prev];
+}
+
+// mouse_move の末尾合体 (buttons_mask + modifiers 同一の時のみ)。合体時 true。
+static bool try_merge_mouse_move(EventQueue* q, const PlatformEvent* ev) {
+    PlatformEvent* tail = queue_peek_tail(q);
+    if (!tail || tail->type != PLATFORM_EVENT_MOUSE_MOVE) return false;
+    if (tail->payload.mouse.buttons_mask != ev->payload.mouse.buttons_mask) return false;
+    if (tail->payload.mouse.modifiers != ev->payload.mouse.modifiers) return false;
+    tail->payload.mouse.x = ev->payload.mouse.x;
+    tail->payload.mouse.y = ev->payload.mouse.y;
+    q->mouse_move_merge_count++;
+    return true;
+}
+
+// mouse_scroll の末尾合体 (is_precise + buttons_mask + modifiers 同一)。合体時 true。
+static bool try_merge_mouse_scroll(EventQueue* q, const PlatformEvent* ev) {
+    PlatformEvent* tail = queue_peek_tail(q);
+    if (!tail || tail->type != PLATFORM_EVENT_MOUSE_SCROLL) return false;
+    if (tail->payload.scroll.is_precise != ev->payload.scroll.is_precise) return false;
+    if (tail->payload.scroll.buttons_mask != ev->payload.scroll.buttons_mask) return false;
+    if (tail->payload.scroll.modifiers != ev->payload.scroll.modifiers) return false;
+    tail->payload.scroll.x = ev->payload.scroll.x;
+    tail->payload.scroll.y = ev->payload.scroll.y;
+    tail->payload.scroll.dx += ev->payload.scroll.dx;
+    tail->payload.scroll.dy += ev->payload.scroll.dy;
+    q->mouse_scroll_merge_count++;
+    return true;
+}
+
+// キューに push (満杯なら drop カウンタを増やして捨てる)
+static void queue_push(EventQueue* q, const PlatformEvent* ev) {
+    int next_head = (q->head + 1) % EVENT_QUEUE_SIZE;
+    if (next_head == q->tail) {
+        q->event_drop_count++;
+        return;
+    }
+    q->events[q->head] = *ev;
+    q->head = next_head;
+}
+
+// NSEvent の locationInWindow を view 内の左上原点座標へ変換 (floor 整数化)。
+static void event_location_to_platform_coords(NSEvent* event, NSView* view, int32_t* out_x, int32_t* out_y) {
+    NSPoint windowPt = event.locationInWindow;
+    NSPoint viewPt = [view convertPoint:windowPt fromView:nil];
+    CGFloat viewHeight = view.bounds.size.height;
+    *out_x = (int32_t)floor(viewPt.x);
+    *out_y = (int32_t)floor(viewHeight - viewPt.y);  // Y フリップ
+}
+
+// 現在押下中のボタン bitmask (& 0x07 で X1/X2 を除外)。
+static uint8_t pressed_buttons_mask(void) {
+    return (uint8_t)([NSEvent pressedMouseButtons] & 0x07);
+}
+
+// NSEvent.buttonNumber から PlatformMouseButton へ (物理ボタン基準)。
+// Control+左クリックも buttonNumber=0 のままなので button=LEFT。
+static PlatformMouseButton button_from_event(NSEvent* event) {
+    switch (event.buttonNumber) {
+        case 0: return PLATFORM_MOUSE_BUTTON_LEFT;
+        case 1: return PLATFORM_MOUSE_BUTTON_RIGHT;
+        case 2: return PLATFORM_MOUSE_BUTTON_MIDDLE;
+        default: return PLATFORM_MOUSE_BUTTON_NONE;
+    }
+}
 
 // ========================================
 // CALayer最適化版の実装
@@ -41,9 +154,14 @@
     CFAbsoluteTime lastFrameTime;
     int frameCount;
     double totalFrameTime;
+
+    // マウスイベント用 (TASK-21.1)
+    PlatformWindow* platformWindow;  // 非所有の生ポインタ。destroy 時に NULL 化される
+    NSTrackingArea* trackingArea;
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
-           callback:(FrameCallback)cb userdata:(void*)ud;
+           callback:(FrameCallback)cb userdata:(void*)ud
+     platformWindow:(PlatformWindow*)pw;
 - (void)startDisplayLink;
 - (void)stopDisplayLink;
 - (void)displayLinkFired:(CADisplayLink*)link;
@@ -55,18 +173,24 @@
 - (uint32_t*)getCurrentBuffer;
 - (void)presentManual;
 
+// destroy 時に呼ぶ。view の back-reference を無効化する。
+- (void)clearPlatformWindow;
+
 @end
 
 @implementation FramebufferView
 
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
-           callback:(FrameCallback)cb userdata:(void*)ud {
+           callback:(FrameCallback)cb userdata:(void*)ud
+     platformWindow:(PlatformWindow*)pw {
     self = [super initWithFrame:frame];
     if (self) {
         width = w;
         height = h;
         callback = cb;
         userdata = ud;
+        platformWindow = pw;
+        trackingArea = nil;
 
         // ダブルバッファを確保（ページアラインメント推奨）
         buffer0 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
@@ -252,13 +376,131 @@
     return YES;
 }
 
+// ========================================
+// マウスイベント関連 (TASK-21.1)
+// ========================================
+
+- (void)clearPlatformWindow {
+    platformWindow = NULL;
+}
+
+// 非アクティブ window への最初のクリックでも mouseDown: を受け取る
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    (void)event;
+    return YES;
+}
+
+// NSTrackingArea を view サイズに合わせて再構築
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (trackingArea) {
+        [self removeTrackingArea:trackingArea];
+        trackingArea = nil;
+    }
+    NSTrackingAreaOptions opts = NSTrackingMouseMoved
+                                | NSTrackingActiveInKeyWindow
+                                | NSTrackingInVisibleRect;
+    trackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                options:opts
+                                                  owner:self
+                                               userInfo:nil];
+    [self addTrackingArea:trackingArea];
+}
+
+// 共通: mouse_down / mouse_up / mouse_move (button 押下中含む) を enqueue
+- (void)enqueueMouseEvent:(PlatformEventType)type withButton:(PlatformMouseButton)btn from:(NSEvent*)event {
+    if (!platformWindow) return;
+    int32_t x, y;
+    event_location_to_platform_coords(event, self, &x, &y);
+    PlatformEvent ev;
+    ev.type = type;
+    ev.payload.mouse.x = x;
+    ev.payload.mouse.y = y;
+    ev.payload.mouse.button = btn;
+    ev.payload.mouse.buttons_mask = pressed_buttons_mask();
+    ev.payload.mouse.modifiers = extractModifiers(event.modifierFlags);
+
+    EventQueue* q = &platformWindow->event_queue;
+    if (type == PLATFORM_EVENT_MOUSE_MOVE && try_merge_mouse_move(q, &ev)) return;
+    queue_push(q, &ev);
+}
+
+// scrollWheel: は別 payload なので個別実装
+- (void)scrollWheel:(NSEvent *)event {
+    if (!platformWindow) return;
+    int32_t x, y;
+    event_location_to_platform_coords(event, self, &x, &y);
+
+    BOOL is_precise = event.hasPreciseScrollingDeltas;
+    float dx = (float)event.scrollingDeltaX;
+    float dy = (float)event.scrollingDeltaY;
+    if (!is_precise) {
+        dx *= SCROLL_LINE_TO_POINTS;
+        dy *= SCROLL_LINE_TO_POINTS;
+    }
+
+    PlatformEvent ev;
+    ev.type = PLATFORM_EVENT_MOUSE_SCROLL;
+    ev.payload.scroll.x = x;
+    ev.payload.scroll.y = y;
+    ev.payload.scroll.dx = dx;
+    ev.payload.scroll.dy = dy;
+    ev.payload.scroll.is_precise = is_precise;
+    ev.payload.scroll.buttons_mask = pressed_buttons_mask();
+    ev.payload.scroll.modifiers = extractModifiers(event.modifierFlags);
+
+    EventQueue* q = &platformWindow->event_queue;
+    if (try_merge_mouse_scroll(q, &ev)) return;
+    queue_push(q, &ev);
+}
+
+// mouseDown / mouseUp / mouseDragged: 左ボタン
+- (void)mouseDown:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:button_from_event(event) from:event];
+}
+- (void)mouseUp:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_UP withButton:button_from_event(event) from:event];
+}
+- (void)mouseDragged:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
+}
+
+// rightMouseDown / rightMouseUp / rightMouseDragged
+// Control+左クリックもここに流れるが、buttonNumber=0 のままなので button=LEFT として扱う
+- (void)rightMouseDown:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:button_from_event(event) from:event];
+}
+- (void)rightMouseUp:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_UP withButton:button_from_event(event) from:event];
+}
+- (void)rightMouseDragged:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
+}
+
+// otherMouseDown / otherMouseUp / otherMouseDragged: middle (buttonNumber=2) のみ受ける、X1/X2 は無視
+- (void)otherMouseDown:(NSEvent *)event {
+    if (event.buttonNumber != 2) return;
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:PLATFORM_MOUSE_BUTTON_MIDDLE from:event];
+}
+- (void)otherMouseUp:(NSEvent *)event {
+    if (event.buttonNumber != 2) return;
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_UP withButton:PLATFORM_MOUSE_BUTTON_MIDDLE from:event];
+}
+- (void)otherMouseDragged:(NSEvent *)event {
+    if (event.buttonNumber != 2) return;
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
+}
+
+// hover (ボタン未押下時) の移動。NSWindow.acceptsMouseMovedEvents = YES + NSTrackingArea が必要
+- (void)mouseMoved:(NSEvent *)event {
+    [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
+}
+
 @end
 
 // ========================================
-// イベント処理用定義
+// キーコード変換
 // ========================================
-
-#define EVENT_QUEUE_SIZE 256
 
 // macOSのキーコードをPlatformKeyCodeに変換
 // 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
@@ -395,30 +637,6 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
     }
 }
 
-// モディファイアキーを抽出
-static uint32_t extractModifiers(NSEventModifierFlags nsModifiers) {
-    uint32_t mods = 0;
-    if (nsModifiers & NSEventModifierFlagShift)   mods |= PLATFORM_MOD_SHIFT;
-    if (nsModifiers & NSEventModifierFlagControl) mods |= PLATFORM_MOD_CTRL;
-    if (nsModifiers & NSEventModifierFlagOption)  mods |= PLATFORM_MOD_ALT;
-    if (nsModifiers & NSEventModifierFlagCommand) mods |= PLATFORM_MOD_CMD;
-    return mods;
-}
-
-// イベントキュー構造体
-typedef struct {
-    PlatformEvent events[EVENT_QUEUE_SIZE];
-    int head;  // 次に書き込む位置
-    int tail;  // 次に読む位置
-} EventQueue;
-
-// プラットフォームウィンドウ構造体
-struct PlatformWindow {
-    NSWindow* window;
-    FramebufferView* view;
-    EventQueue event_queue;
-};
-
 // プラットフォーム初期化
 bool platform_init(void) {
     // macOSでは特に初期化不要
@@ -452,13 +670,19 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
 
         [platformWindow->window setTitle:[NSString stringWithUTF8String:title]];
 
+        // hover の mouseMoved: を受け取るために必須 (TASK-21.1)
+        [platformWindow->window setAcceptsMouseMovedEvents:YES];
+
         // カスタムビューを作成して設定
         platformWindow->view = [[FramebufferView alloc] initWithFrame:frame
                                                                width:width
                                                               height:height
                                                             callback:callback
-                                                            userdata:userdata];
+                                                            userdata:userdata
+                                                     platformWindow:platformWindow];
         [platformWindow->window setContentView:platformWindow->view];
+        // setContentView 後に updateTrackingAreas を呼ぶ (view の bounds が確定したタイミングで TrackingArea を構築)
+        [platformWindow->view updateTrackingAreas];
 
         // ウィンドウを表示
         [platformWindow->window center];
@@ -486,7 +710,18 @@ void platform_run(PlatformWindow* platformWindow) {
 void platform_destroy_window(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
 
-    // ビューのdeallocでCADisplayLinkは自動的に停止される
+    @autoreleasepool {
+        // 1. view の back-reference を無効化 (以降の mouseDown: 等は早期 return)
+        [platformWindow->view clearPlatformWindow];
+
+        // 2. CADisplayLink を停止 (callback から view への参照を断つ)
+        [platformWindow->view stopDisplayLink];
+
+        // 3. window を閉じる → NSWindow が contentView (view) を release
+        [platformWindow->window close];
+    }
+
+    // 4. PlatformWindow 自体を解放
     free(platformWindow);
 }
 
@@ -514,22 +749,14 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                                            dequeue:YES])) {
             // キーボードイベントをイベントキューに追加
             if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
-                EventQueue* queue = &platformWindow->event_queue;
-                int next_head = (queue->head + 1) % EVENT_QUEUE_SIZE;
-
-                // キューがいっぱいでない場合のみ追加
-                if (next_head != queue->tail) {
-                    PlatformEvent platform_event;
-                    platform_event.type = (event.type == NSEventTypeKeyDown)
-                        ? PLATFORM_EVENT_KEY_DOWN
-                        : PLATFORM_EVENT_KEY_UP;
-                    platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode);
-                    platform_event.payload.keyboard.is_repeat = event.isARepeat;
-                    platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags);
-
-                    queue->events[queue->head] = platform_event;
-                    queue->head = next_head;
-                }
+                PlatformEvent platform_event;
+                platform_event.type = (event.type == NSEventTypeKeyDown)
+                    ? PLATFORM_EVENT_KEY_DOWN
+                    : PLATFORM_EVENT_KEY_UP;
+                platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode);
+                platform_event.payload.keyboard.is_repeat = event.isARepeat;
+                platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags);
+                queue_push(&platformWindow->event_queue, &platform_event);
 
                 // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
                 continue;
@@ -542,14 +769,9 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
         // ウィンドウが閉じられているか確認
         if (![platformWindow->window isVisible]) {
             // QUITイベントをキューに追加
-            EventQueue* queue = &platformWindow->event_queue;
-            int next_head = (queue->head + 1) % EVENT_QUEUE_SIZE;
-            if (next_head != queue->tail) {
-                PlatformEvent quit_event;
-                quit_event.type = PLATFORM_EVENT_QUIT;
-                queue->events[queue->head] = quit_event;
-                queue->head = next_head;
-            }
+            PlatformEvent quit_event;
+            quit_event.type = PLATFORM_EVENT_QUIT;
+            queue_push(&platformWindow->event_queue, &quit_event);
             return false;
         }
 
@@ -594,6 +816,15 @@ void platform_present(PlatformWindow* platformWindow) {
         // アクセサメソッドを使用して手動描画
         [view presentManual];
     }
+}
+
+// イベントキューカウンタの snapshot 取得 (TASK-21.1)
+void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out) {
+    if (!window || !out) return;
+    EventQueue* q = &window->event_queue;
+    out->mouse_move_merge_count = q->mouse_move_merge_count;
+    out->mouse_scroll_merge_count = q->mouse_scroll_merge_count;
+    out->event_drop_count = q->event_drop_count;
 }
 
 // イベント取得API

@@ -18,6 +18,10 @@ class EventQueue {
     private var events: UnsafeMutablePointer<PlatformEvent>
     var head: Int = 0  // 次に書き込む位置
     var tail: Int = 0  // 次に読む位置
+    // 観測カウンタ (累積値、example で差分監視に使う)
+    var mouseMoveMergeCount: UInt64 = 0
+    var mouseScrollMergeCount: UInt64 = 0
+    var eventDropCount: UInt64 = 0
 
     init() {
         // 固定サイズのメモリバッファを確保
@@ -35,9 +39,78 @@ class EventQueue {
         }
     }
 
+    func peekTail() -> UnsafeMutablePointer<PlatformEvent>? {
+        if head == tail { return nil }
+        let prev = (head - 1 + EVENT_QUEUE_SIZE) % EVENT_QUEUE_SIZE
+        return events.advanced(by: prev)
+    }
+
+    func tryMergeMouseMove(_ ev: PlatformEvent) -> Bool {
+        guard let tail = peekTail() else { return false }
+        if tail.pointee.type != PLATFORM_EVENT_MOUSE_MOVE { return false }
+        if tail.pointee.payload.mouse.buttons_mask != ev.payload.mouse.buttons_mask { return false }
+        if tail.pointee.payload.mouse.modifiers != ev.payload.mouse.modifiers { return false }
+        tail.pointee.payload.mouse.x = ev.payload.mouse.x
+        tail.pointee.payload.mouse.y = ev.payload.mouse.y
+        mouseMoveMergeCount += 1
+        return true
+    }
+
+    func tryMergeMouseScroll(_ ev: PlatformEvent) -> Bool {
+        guard let tail = peekTail() else { return false }
+        if tail.pointee.type != PLATFORM_EVENT_MOUSE_SCROLL { return false }
+        if tail.pointee.payload.scroll.is_precise != ev.payload.scroll.is_precise { return false }
+        if tail.pointee.payload.scroll.buttons_mask != ev.payload.scroll.buttons_mask { return false }
+        if tail.pointee.payload.scroll.modifiers != ev.payload.scroll.modifiers { return false }
+        tail.pointee.payload.scroll.x = ev.payload.scroll.x
+        tail.pointee.payload.scroll.y = ev.payload.scroll.y
+        tail.pointee.payload.scroll.dx += ev.payload.scroll.dx
+        tail.pointee.payload.scroll.dy += ev.payload.scroll.dy
+        mouseScrollMergeCount += 1
+        return true
+    }
+
+    func push(_ ev: PlatformEvent) {
+        let next_head = (head + 1) % EVENT_QUEUE_SIZE
+        if next_head == tail {
+            eventDropCount += 1
+            return
+        }
+        events[head] = ev
+        head = next_head
+    }
+
     deinit {
         events.deinitialize(count: EVENT_QUEUE_SIZE)
         events.deallocate()
+    }
+}
+
+// ========================================
+// マウス入力ヘルパー (TASK-21.1)
+// ========================================
+
+let SCROLL_LINE_TO_POINTS: Float = 16.0
+
+func eventLocationToPlatformCoords(_ event: NSEvent, _ view: NSView) -> (Int32, Int32) {
+    let windowPt = event.locationInWindow
+    let viewPt = view.convert(windowPt, from: nil)
+    let viewHeight = view.bounds.size.height
+    let x = Int32(floor(viewPt.x))
+    let y = Int32(floor(viewHeight - viewPt.y))
+    return (x, y)
+}
+
+func pressedButtonsMask() -> UInt8 {
+    return UInt8(NSEvent.pressedMouseButtons & 0x07)
+}
+
+func buttonFromEvent(_ event: NSEvent) -> PlatformMouseButton {
+    switch event.buttonNumber {
+        case 0: return PLATFORM_MOUSE_BUTTON_LEFT
+        case 1: return PLATFORM_MOUSE_BUTTON_RIGHT
+        case 2: return PLATFORM_MOUSE_BUTTON_MIDDLE
+        default: return PLATFORM_MOUSE_BUTTON_NONE
     }
 }
 
@@ -485,6 +558,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 class MetalFramebufferView: MTKView {
     private var metalRenderer: MetalRenderer?
 
+    // マウスイベント用 (TASK-21.1)
+    weak var platformWindow: PlatformWindowHandle?
+    private var customTrackingArea: NSTrackingArea?
+
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frame, device: metalDevice)
@@ -504,6 +581,97 @@ class MetalFramebufferView: MTKView {
 
     func getRenderer() -> MetalRenderer? {
         return metalRenderer
+    }
+
+    // ========================================
+    // マウスイベント関連 (TASK-21.1)
+    // ========================================
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = customTrackingArea {
+            self.removeTrackingArea(ta)
+            customTrackingArea = nil
+        }
+        let opts: NSTrackingArea.Options = [.mouseMoved, .activeInKeyWindow, .inVisibleRect]
+        let ta = NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil)
+        self.addTrackingArea(ta)
+        customTrackingArea = ta
+    }
+
+    private func enqueueMouseEvent(type: PlatformEventType, button: PlatformMouseButton, from event: NSEvent) {
+        guard let handle = platformWindow else { return }
+        let (x, y) = eventLocationToPlatformCoords(event, self)
+        var ev = PlatformEvent()
+        ev.type = type
+        ev.payload.mouse.x = x
+        ev.payload.mouse.y = y
+        ev.payload.mouse.button = button
+        ev.payload.mouse.buttons_mask = pressedButtonsMask()
+        ev.payload.mouse.modifiers = extractModifiers(event.modifierFlags)
+        if type == PLATFORM_EVENT_MOUSE_MOVE && handle.event_queue.tryMergeMouseMove(ev) { return }
+        handle.event_queue.push(ev)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let handle = platformWindow else { return }
+        let (x, y) = eventLocationToPlatformCoords(event, self)
+        let isPrecise = event.hasPreciseScrollingDeltas
+        var dx = Float(event.scrollingDeltaX)
+        var dy = Float(event.scrollingDeltaY)
+        if !isPrecise {
+            dx *= SCROLL_LINE_TO_POINTS
+            dy *= SCROLL_LINE_TO_POINTS
+        }
+        var ev = PlatformEvent()
+        ev.type = PLATFORM_EVENT_MOUSE_SCROLL
+        ev.payload.scroll.x = x
+        ev.payload.scroll.y = y
+        ev.payload.scroll.dx = dx
+        ev.payload.scroll.dy = dy
+        ev.payload.scroll.is_precise = isPrecise
+        ev.payload.scroll.buttons_mask = pressedButtonsMask()
+        ev.payload.scroll.modifiers = extractModifiers(event.modifierFlags)
+        if handle.event_queue.tryMergeMouseScroll(ev) { return }
+        handle.event_queue.push(ev)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
+    }
+    override func mouseUp(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
+    }
+    override func mouseDragged(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
+    }
+    override func rightMouseDown(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
+    }
+    override func rightMouseUp(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
+    }
+    override func rightMouseDragged(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
+    }
+    override func otherMouseDown(with event: NSEvent) {
+        if event.buttonNumber != 2 { return }
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: PLATFORM_MOUSE_BUTTON_MIDDLE, from: event)
+    }
+    override func otherMouseUp(with event: NSEvent) {
+        if event.buttonNumber != 2 { return }
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: PLATFORM_MOUSE_BUTTON_MIDDLE, from: event)
+    }
+    override func otherMouseDragged(with event: NSEvent) {
+        if event.buttonNumber != 2 { return }
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
+    }
+    override func mouseMoved(with event: NSEvent) {
+        enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
     }
 }
 
@@ -535,6 +703,9 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     // タイトルを設定
     window.title = String(cString: title)
 
+    // hover の mouseMoved を受け取るために必須 (TASK-21.1)
+    window.acceptsMouseMovedEvents = true
+
     // Metal用ビューを作成
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
         NSLog("[\(IMPLEMENTATION_TYPE)] Failed to create Metal device")
@@ -550,13 +721,18 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
 
     window.contentView = metalView
 
+    // PlatformWindowハンドルを作成
+    let platformWindow = PlatformWindowHandle(window: window, metalView: metalView)
+    // view → handle の back-reference を設定 (TASK-21.1)
+    metalView.platformWindow = platformWindow
+    // setContentView 後に NSTrackingArea を構築
+    metalView.updateTrackingAreas()
+
     // ウィンドウを表示
     window.center()
     window.makeKeyAndOrderFront(nil)
     app.activate(ignoringOtherApps: true)
 
-    // PlatformWindowハンドルを作成
-    let platformWindow = PlatformWindowHandle(window: window, metalView: metalView)
     let handle = UnsafeMutableRawPointer(Unmanaged.passRetained(platformWindow).toOpaque())
 
     return handle
@@ -579,7 +755,11 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
 
     // ハンドルからPlatformWindowHandleを復元してリリース
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeRetainedValue()
+    // delegate を解除 (callback から view への参照を断つ)
     handle.metalView.delegate = nil
+    // window を閉じる
+    handle.window.close()
+    // weak var platformWindow は自動で nil 化される
     // handleはここで自動的にdeallocされる
 }
 
@@ -603,20 +783,12 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
         // キーボードイベントをイベントキューに追加
         if event.type == .keyDown || event.type == .keyUp {
-            let queue = handle.event_queue
-            let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
-
-            // キューがいっぱいでない場合のみ追加
-            if next_head != queue.tail {
-                var platform_event = PlatformEvent()
-                platform_event.type = (event.type == .keyDown) ? PLATFORM_EVENT_KEY_DOWN : PLATFORM_EVENT_KEY_UP
-                platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
-                platform_event.payload.keyboard.is_repeat = event.isARepeat
-                platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags)
-
-                queue[queue.head] = platform_event
-                queue.head = next_head
-            }
+            var platform_event = PlatformEvent()
+            platform_event.type = (event.type == .keyDown) ? PLATFORM_EVENT_KEY_DOWN : PLATFORM_EVENT_KEY_UP
+            platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
+            platform_event.payload.keyboard.is_repeat = event.isARepeat
+            platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags)
+            handle.event_queue.push(platform_event)
 
             // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
             continue
@@ -629,18 +801,24 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     // ウィンドウが閉じられているか確認
     if !handle.window.isVisible {
         // QUITイベントをキューに追加
-        let queue = handle.event_queue
-        let next_head = (queue.head + 1) % EVENT_QUEUE_SIZE
-        if next_head != queue.tail {
-            var quit_event = PlatformEvent()
-            quit_event.type = PLATFORM_EVENT_QUIT
-            queue[queue.head] = quit_event
-            queue.head = next_head
-        }
+        var quit_event = PlatformEvent()
+        quit_event.type = PLATFORM_EVENT_QUIT
+        handle.event_queue.push(quit_event)
         return false
     }
 
     return true
+}
+
+// イベントキューカウンタの snapshot 取得 (TASK-21.1)
+@_cdecl("platform_get_event_stats")
+func platform_get_event_stats(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformEventStats>?) -> Void {
+    guard let platformWindow = platformWindow, let out = out else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let q = handle.event_queue
+    out.pointee.mouse_move_merge_count = q.mouseMoveMergeCount
+    out.pointee.mouse_scroll_merge_count = q.mouseScrollMergeCount
+    out.pointee.event_drop_count = q.eventDropCount
 }
 
 // 高精度モノトニック時刻を取得（調整なし）

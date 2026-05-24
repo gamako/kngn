@@ -132,6 +132,8 @@ pub fn build(b: *std.Build) void {
            .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = true },
         .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig",
            .needs_sprite = true,  .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = false },
+        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig",
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,

@@ -46,6 +46,7 @@ pub fn main() !void {
                 else => {},
             },
             .key_up => {},
+            else => {},
         };
 
         if (window.lockFramebuffer()) |fb| {

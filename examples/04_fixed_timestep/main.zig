@@ -134,6 +134,7 @@ pub fn main() !void {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
             .key_up => {},
+            else => {},
         };
 
         const current_time = platform.getTime();

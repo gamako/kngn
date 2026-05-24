@@ -228,6 +228,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
             .key_up => {},
+            else => {},
         };
 
         const now = platform.getTime();

@@ -12,7 +12,12 @@ pub const Error = macos.Error;
 pub const KeyCode = macos.KeyCode;
 pub const ModifierFlags = macos.ModifierFlags;
 pub const KeyEvent = macos.KeyEvent;
+pub const MouseButton = macos.MouseButton;
+pub const MouseButtons = macos.MouseButtons;
+pub const MouseEvent = macos.MouseEvent;
+pub const ScrollEvent = macos.ScrollEvent;
 pub const Event = macos.Event;
+pub const EventStats = macos.EventStats;
 pub const Window = macos.Window;
 pub const Framebuffer = macos.Framebuffer;
 
