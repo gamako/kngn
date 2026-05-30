@@ -64,6 +64,45 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, "run-metal", "Run the Metal version", exe_metal, b.args);
 
     // ========================================
+    // Pixie エディタ (apps/editor/apps/pixie)
+    // ========================================
+    const pixie_objc = addPixieExe(b, target, optimize, platform_root, sdk_paths, .objc, "pixie", &example_modules);
+    const pixie_swift = addPixieExe(b, target, optimize, platform_root, sdk_paths, .swift, "pixie_swift", &example_modules);
+    const pixie_metal = addPixieExe(b, target, optimize, platform_root, sdk_paths, .metal, "pixie_metal", &example_modules);
+    const pixie_default = switch (platform_option) {
+        .objc => pixie_objc,
+        .swift => pixie_swift,
+        .metal => pixie_metal,
+    };
+    addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", pixie_default, b.args);
+    addRunStep(b, "run-pixie-objc", "Run Pixie editor (ObjC)", pixie_objc, b.args);
+    addRunStep(b, "run-pixie-swift", "Run Pixie editor (Swift)", pixie_swift, b.args);
+    addRunStep(b, "run-pixie-metal", "Run Pixie editor (Metal)", pixie_metal, b.args);
+
+    // PNG round-trip テスト (io_png.zig のテスト + png-decoder で検証)
+    const io_png_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/io_png.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    io_png_mod.addImport("png-decoder", example_modules.png_decoder);
+    const png_roundtrip_test = b.addTest(.{ .root_module = io_png_mod });
+    const run_png_roundtrip_test = b.addRunArtifact(png_roundtrip_test);
+    const test_png_roundtrip_step = b.step("test-png-roundtrip", "Run PNG encode/decode round-trip tests");
+    test_png_roundtrip_step.dependOn(&run_png_roundtrip_test.step);
+
+    // canvas.zig 単体テスト
+    const canvas_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/core/canvas.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_canvas_test = b.addRunArtifact(canvas_test);
+    test_png_roundtrip_step.dependOn(&run_canvas_test.step);
+
+    // ========================================
     // PNG デコーダー format.zig テスト
     // ========================================
     const png_format_test = b.addTest(.{
@@ -200,6 +239,7 @@ const ExampleModules = struct {
     fixed_timestep: *std.Build.Module,
     fps_counter: *std.Build.Module,
     text: *std.Build.Module,
+    png_decoder: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         const platform_mod = platform.createPlatformModule(
@@ -235,6 +275,7 @@ const ExampleModules = struct {
             .text = b.createModule(.{
                 .root_source_file = b.path("src/text.zig"),
             }),
+            .png_decoder = png_decoder,
         };
     }
 };
@@ -283,6 +324,38 @@ fn addExampleExe(
         .metal => "metal",
     });
     exe.root_module.addOptions("build_options", opts);
+
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    return exe;
+}
+
+// ============================================================
+// ヘルパー: pixie exe を 1 プラットフォーム分セットアップ
+// ============================================================
+fn addPixieExe(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+    sdk_paths: macos.MacOSSDKPaths,
+    platform_type: platform.PlatformType,
+    name: []const u8,
+    modules: *const ExampleModules,
+) *std.Build.Step.Compile {
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+    });
+
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/apps/pixie/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("platform", modules.platform);
+    exe.root_module.addImport("core", core_mod);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
