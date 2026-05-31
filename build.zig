@@ -160,25 +160,29 @@ pub fn build(b: *std.Build) void {
     // 揃えること（inline for で型不一致を避けるため）。
     inline for (.{
         .{ .name = "example_01", .path = "examples/01_timed_window/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig",
-           .needs_sprite = true,  .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+           .needs_sprite = true,  .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig",
-           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = true,  .needs_text = false },
+           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = true,  .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig",
-           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = true },
+           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = true,  .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig",
-           .needs_sprite = true,  .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = false },
+           .needs_sprite = true,  .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false },
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig",
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = true },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,
             .needs_fps_counter = example.needs_fps_counter,
             .needs_fixed_timestep = example.needs_fixed_timestep,
             .needs_text = example.needs_text,
+            .needs_gui = example.needs_gui,
+            .needs_png_decoder = example.needs_png_decoder,
         };
         const ex_objc = addExampleExe(b, target, optimize, platform_root, sdk_paths, .objc, example.name, example.path, &example_modules, needs);
         const ex_swift = addExampleExe(b, target, optimize, platform_root, sdk_paths, .swift, example.name ++ "_swift", example.path, &example_modules, needs);
@@ -240,6 +244,7 @@ const ExampleModules = struct {
     fps_counter: *std.Build.Module,
     text: *std.Build.Module,
     png_decoder: *std.Build.Module,
+    gui: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         const platform_mod = platform.createPlatformModule(
@@ -262,6 +267,10 @@ const ExampleModules = struct {
         });
         sprite.addImport("png-decoder", png_decoder);
 
+        const gui = b.createModule(.{
+            .root_source_file = b.path("libs/gui/src/gui.zig"),
+        });
+
         return .{
             .platform = platform_mod,
             .keyboard = keyboard_mod,
@@ -276,6 +285,7 @@ const ExampleModules = struct {
                 .root_source_file = b.path("src/text.zig"),
             }),
             .png_decoder = png_decoder,
+            .gui = gui,
         };
     }
 };
@@ -285,6 +295,8 @@ const ExampleNeeds = struct {
     needs_fps_counter: bool,
     needs_fixed_timestep: bool,
     needs_text: bool,
+    needs_gui: bool,
+    needs_png_decoder: bool,
 };
 
 fn addExampleExe(
@@ -314,6 +326,8 @@ fn addExampleExe(
     if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", modules.fps_counter);
     if (needs.needs_fixed_timestep) exe.root_module.addImport("fixed_timestep", modules.fixed_timestep);
     if (needs.needs_text) exe.root_module.addImport("text", modules.text);
+    if (needs.needs_gui) exe.root_module.addImport("gui", modules.gui);
+    if (needs.needs_png_decoder) exe.root_module.addImport("png-decoder", modules.png_decoder);
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。
