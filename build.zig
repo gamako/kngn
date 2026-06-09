@@ -152,6 +152,22 @@ pub fn build(b: *std.Build) void {
     test_sprite_step.dependOn(&run_sprite_test.step);
 
     // ========================================
+    // libs/gui テスト (geom / color / draw / font + input / id / state / context)
+    // gui.zig を root にすると参照する全ファイルの test がまとめて回る。
+    // ExampleModules.gui は import 用なので、test 用に専用 module を作る。
+    // ========================================
+    const gui_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("libs/gui/src/gui.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_gui_test = b.addRunArtifact(gui_test);
+    const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
+    test_gui_step.dependOn(&run_gui_test.step);
+
+    // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
     // ========================================
 
@@ -175,6 +191,8 @@ pub fn build(b: *std.Build) void {
            .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
         .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig",
            .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = true },
+        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig",
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = false },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,
