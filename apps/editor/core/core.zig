@@ -6,5 +6,6 @@ pub const Layer = canvas.Layer;
 pub const Vec2 = canvas.Vec2;
 pub const Rect = canvas.Rect;
 pub const screenToCanvas = canvas.screenToCanvas;
+pub const screenToCanvasRaw = canvas.screenToCanvasRaw;
 pub const encodePNG = io_png.encodePNG;
 pub const savePNG = io_png.savePNG;

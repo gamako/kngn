@@ -102,6 +102,22 @@ pub fn build(b: *std.Build) void {
     const run_canvas_test = b.addRunArtifact(canvas_test);
     test_png_roundtrip_step.dependOn(&run_canvas_test.step);
 
+    // pixie PaintEngine テスト (stroke / undo / redo / PNG round-trip)
+    const pixie_paint_core = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+    });
+    const pixie_paint_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/paint.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pixie_paint_mod.addImport("core", pixie_paint_core);
+    pixie_paint_mod.addImport("png-decoder", example_modules.png_decoder);
+    const pixie_test = b.addTest(.{ .root_module = pixie_paint_mod });
+    const run_pixie_test = b.addRunArtifact(pixie_test);
+    const test_pixie_step = b.step("test-pixie", "Run pixie PaintEngine tests");
+    test_pixie_step.dependOn(&run_pixie_test.step);
+
     // ========================================
     // PNG デコーダー format.zig テスト
     // ========================================
@@ -392,6 +408,7 @@ fn addPixieExe(
     });
     exe.root_module.addImport("platform", modules.platform);
     exe.root_module.addImport("core", core_mod);
+    exe.root_module.addImport("gui", modules.gui);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;

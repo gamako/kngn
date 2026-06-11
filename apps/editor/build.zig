@@ -34,9 +34,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("core/core.zig"),
     });
 
-    const exe_objc = addPixieExe(b, target, optimize, platform_root, sdk_paths, .objc, "pixie", platform_module, core_module);
-    const exe_swift = addPixieExe(b, target, optimize, platform_root, sdk_paths, .swift, "pixie_swift", platform_module, core_module);
-    const exe_metal = addPixieExe(b, target, optimize, platform_root, sdk_paths, .metal, "pixie_metal", platform_module, core_module);
+    const gui_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
+    });
+
+    const exe_objc = addPixieExe(b, target, optimize, platform_root, sdk_paths, .objc, "pixie", platform_module, core_module, gui_module);
+    const exe_swift = addPixieExe(b, target, optimize, platform_root, sdk_paths, .swift, "pixie_swift", platform_module, core_module, gui_module);
+    const exe_metal = addPixieExe(b, target, optimize, platform_root, sdk_paths, .metal, "pixie_metal", platform_module, core_module, gui_module);
 
     const exe_default = switch (platform_option) {
         .objc => exe_objc,
@@ -61,6 +65,7 @@ fn addPixieExe(
     name: []const u8,
     platform_module: *std.Build.Module,
     core_module: *std.Build.Module,
+    gui_module: *std.Build.Module,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = name,
@@ -71,6 +76,7 @@ fn addPixieExe(
             .imports = &.{
                 .{ .name = "platform", .module = platform_module },
                 .{ .name = "core", .module = core_module },
+                .{ .name = "gui", .module = gui_module },
             },
         }),
     });

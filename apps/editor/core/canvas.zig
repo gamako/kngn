@@ -114,6 +114,15 @@ pub fn screenToCanvas(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) ?Vec2 {
     return .{ .x = cx, .y = cy };
 }
 
+/// window 座標 → canvas 座標の生変換（境界 clamp なし）。canvas 外でも線形に変換する。
+/// stroke の capture 継続（canvas 外へのドラッグ）用。範囲 clip は描画側で行う。
+pub fn screenToCanvasRaw(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) Vec2 {
+    return .{
+        .x = @divFloor(screen_pos.x - canvas_rect.x, zoom),
+        .y = @divFloor(screen_pos.y - canvas_rect.y, zoom),
+    };
+}
+
 test "Canvas init/deinit" {
     const allocator = std.testing.allocator;
     var canvas = try Canvas.init(allocator, 4, 4);
@@ -151,4 +160,15 @@ test "screenToCanvas" {
     try std.testing.expectEqual(Vec2{ .x = 1, .y = 0 }, screenToCanvas(.{ .x = 66, .y = 32 }, rect, zoom).?);
     try std.testing.expect(screenToCanvas(.{ .x = 63, .y = 32 }, rect, zoom) == null);
     try std.testing.expect(screenToCanvas(.{ .x = 64 + 512, .y = 32 }, rect, zoom) == null);
+}
+
+test "screenToCanvasRaw: 境界外でも線形に変換する（clamp なし）" {
+    const rect = Rect{ .x = 64, .y = 32, .w = 256, .h = 256 };
+    const zoom: i32 = 2;
+    // 領域内は screenToCanvas と一致
+    try std.testing.expectEqual(Vec2{ .x = 1, .y = 0 }, screenToCanvasRaw(.{ .x = 66, .y = 32 }, rect, zoom));
+    // 左上の外: 負座標になる（@divFloor で -1 方向に丸め）
+    try std.testing.expectEqual(Vec2{ .x = -1, .y = -1 }, screenToCanvasRaw(.{ .x = 63, .y = 31 }, rect, zoom));
+    // 右下の外: 幅を超える座標になる
+    try std.testing.expectEqual(Vec2{ .x = 256, .y = 0 }, screenToCanvasRaw(.{ .x = 64 + 512, .y = 32 }, rect, zoom));
 }
