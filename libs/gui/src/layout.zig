@@ -36,6 +36,10 @@ pub const Sizing = union(enum) {
 
 pub const Align = enum { start, center, end };
 
+/// box の枠線（TASK-21.5）。発行順は bg → 子 → border（枠が子の上に乗る）。
+/// 枠は rect の内側に描かれ、レイアウト計算には影響しない。
+pub const Border = struct { color: Color, thickness: u32 };
+
 pub const BoxConfig = struct {
     /// 0 = エンジンが自動採番（外部参照不可・rect キャッシュ非登録）。
     /// 非 0 = 明示 ID（IdStack 等で caller が生成して渡す）。getNodeRect / hit-test
@@ -49,6 +53,8 @@ pub const BoxConfig = struct {
     gap: i32 = 0,
     align_cross: Align = .start,
     bg: ?Color = null,
+    /// 枠線（null なら無し）。bg → 子 → border の順で発行される
+    border: ?Border = null,
     /// true なら子の draw cmd に自 rect 由来の clip を焼き込む（レイアウト計算には影響しない）
     clip_children: bool = false,
 };

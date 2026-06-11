@@ -28,6 +28,10 @@ const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const state_mod = @import("state.zig");
 const layout = @import("layout.zig");
+const style_mod = @import("style.zig");
+// widgets.zig とは相互 import（widgets は *Context を取る。Zig の import 循環は合法）。
+// Context 構造体内の decl alias で `ctx.button(...)` メソッド構文を提供する。
+const widgets = @import("widgets.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -40,12 +44,11 @@ pub const InteractionState = state_mod.InteractionState;
 pub const DrawList = draw.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
 pub const BoxConfig = layout.BoxConfig;
+pub const Style = style_mod.Style;
 
 /// rect キャッシュのエントリ。clip は祖先の clip_children を intersect 済みの有効クリップで、
 /// buttonBehavior(ctx, id, rect, clip) にそのまま渡せる（21.5 の widget hit-test 用）。
 pub const CachedRect = struct { rect: Rect, clip: Rect };
-
-const default_text_color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
 
 pub const Context = struct {
     gpa: Allocator,
@@ -65,7 +68,16 @@ pub const Context = struct {
     /// 明示 ID（cfg.id != 0）ノードの id → {rect, clip}。gpa 所有でフレームを跨いで生存し、
     /// endFrame でのみ更新される（フレーム前半は前フレーム値 = 同期 hit-test 契約）。
     rect_cache: std.AutoHashMapUnmanaged(Id, CachedRect) = .empty,
-    // style は 21.5 で追加
+    /// widget 共通スタイル（TASK-21.5）。caller が直接書き換えてよい（push/pop なし）。
+    style: Style,
+
+    // ── widget 層（TASK-21.5）。実装は widgets.zig（メソッド構文用の alias） ──
+    pub const button = widgets.button;
+    pub const buttonEx = widgets.buttonEx;
+    pub const buttonId = widgets.buttonId;
+    pub const colorSwatch = widgets.colorSwatch;
+    pub const colorSwatchEx = widgets.colorSwatchEx;
+    pub const colorSwatchId = widgets.colorSwatchId;
 
     pub fn init(gpa: Allocator, font: BitmapFont) Context {
         return .{
@@ -75,6 +87,7 @@ pub const Context = struct {
             .id_stack = IdStack.init(gpa),
             .draw_list = DrawList.init(gpa),
             .font = font,
+            .style = style_mod.defaultStyle(),
         };
     }
 
@@ -179,9 +192,10 @@ pub const Context = struct {
         self.layout_current = cur.parent;
     }
 
-    /// text leaf（白文字）。str は arena に複製されるので caller バッファの寿命に依存しない。
+    /// text leaf（既定色 = style.text）。str は arena に複製されるので caller バッファの
+    /// 寿命に依存しない。
     pub fn label(self: *Context, str: []const u8) void {
-        self.labelEx(str, default_text_color);
+        self.labelEx(str, self.style.text);
     }
 
     pub fn labelEx(self: *Context, str: []const u8, col: Color) void {
@@ -231,7 +245,9 @@ pub const Context = struct {
         while (it) |c| : (it = c.next_sibling) self.updateRectCache(c, child_clip);
     }
 
-    /// draw cmd 発行（行きがけ DFS）: bg → (clip_children なら pushClip) → 子 / leaf → popClip。
+    /// draw cmd 発行（行きがけ DFS）: bg → (clip_children なら pushClip) → 子 / leaf →
+    /// popClip → border。border は枠が子の上に乗るよう最後に発行する（自ノードの
+    /// clip_children は子にのみ効くため、border は popClip 後 = 祖先 clip で発行）。
     fn emitNode(self: *Context, node: *const layout.Node) void {
         if (node.leaf) |leaf| {
             switch (leaf) {
@@ -253,6 +269,10 @@ pub const Context = struct {
         var it = node.first_child;
         while (it) |c| : (it = c.next_sibling) self.emitNode(c);
         if (node.cfg.clip_children) self.draw_list.popClip();
+        if (node.cfg.border) |b| {
+            self.draw_list.rectOutline(node.rect, b.color, b.thickness) catch
+                @panic("Context.endFrame: OOM");
+        }
     }
 };
 
@@ -659,4 +679,46 @@ test "layout: custom leaf が最終 rect 付きで endFrame 中に呼ばれる" 
     try std.testing.expectEqual(@as(u32, 64), cap.rect.w);
     try std.testing.expectEqual(@as(u32, 32), cap.rect.h);
     try std.testing.expectEqual(@as(usize, 1), ctx.draw_list.cmds.items.len);
+}
+
+// ──────────────────────────────────────────────
+// widget 層の Context 側変更（TASK-21.5）
+// ──────────────────────────────────────────────
+
+test "layout: border は bg → 子 → border の順で発行される" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 40 },
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+        .border = .{ .color = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF), .thickness = 2 },
+    });
+    ctx.label("x");
+    ctx.endBox();
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 3), ctx.draw_list.cmds.items.len);
+    try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
+    try std.testing.expect(ctx.draw_list.cmds.items[1] == .text);
+    const outline = ctx.draw_list.cmds.items[2].rect_outline;
+    try std.testing.expectEqual(@as(u32, 2), outline.thickness);
+    try std.testing.expectEqual(@as(u32, 100), outline.rect.w);
+}
+
+test "label: 既定色が style.text に追従する" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const red = Color.rgba(0xFF, 0x00, 0x00, 0xFF);
+    ctx.style.text = red;
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{});
+    ctx.label("hello");
+    ctx.endBox();
+    ctx.endFrame();
+
+    try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].text.color);
 }

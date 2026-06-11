@@ -48,7 +48,15 @@ pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
 pub const BoxConfig = @import("layout.zig").BoxConfig;
+pub const Border = @import("layout.zig").Border;
 pub const CustomDrawFn = @import("layout.zig").CustomDrawFn;
+
+// widget 層（TASK-21.5）。widget 本体（button / colorSwatch 等）は Context の
+// メソッドとして呼ぶ（ctx.button("Save") 等。実装は widgets.zig）。
+pub const Style = @import("style.zig").Style;
+pub const defaultStyle = @import("style.zig").defaultStyle;
+pub const ButtonOpts = @import("widgets.zig").ButtonOpts;
+pub const SwatchOpts = @import("widgets.zig").SwatchOpts;
 
 // test-gui 用に各ファイルの test を収集する。
 // `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
@@ -64,4 +72,6 @@ test {
     _ = @import("state.zig");
     _ = @import("context.zig");
     _ = @import("layout.zig");
+    _ = @import("style.zig");
+    _ = @import("widgets.zig");
 }

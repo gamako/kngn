@@ -84,6 +84,12 @@ pub const IdStack = struct {
         return hashStr(self.currentSeed(), label);
     }
 
+    /// 整数値から widget ID を作る（stack には積まない）。
+    /// ColorSwatch の色値などラベル文字列を持たない widget の自動 ID 用。
+    pub fn makeInt(self: *const IdStack, v: u64) Id {
+        return hashInt(self.currentSeed(), v);
+    }
+
     /// 整数・文字列の両方を seed に取れる内部ヘルパ（push 用）。
     /// 整数でも文字列でもない型は coerce で compile error になる（型安全）。
     fn makeRaw(self: *const IdStack, seed: anytype) Id {
@@ -172,6 +178,22 @@ test "IdStack: 階層境界が保たれる（'ab'+'c' と 'abc' は別 Id）" {
     const split = s2.make("c");
 
     try std.testing.expect(concat != split);
+}
+
+test "IdStack: makeInt は同値で安定・異値/異スコープで別 Id" {
+    var s = IdStack.init(std.testing.allocator);
+    defer s.deinit();
+
+    const a = s.makeInt(0xFF332211);
+    const b = s.makeInt(0xFF332211);
+    const c = s.makeInt(0xFF332212);
+    try std.testing.expectEqual(a, b);
+    try std.testing.expect(a != c);
+
+    s.push(@as(u32, 1));
+    const scoped = s.makeInt(0xFF332211);
+    s.pop();
+    try std.testing.expect(a != scoped);
 }
 
 test "IdStack: 文字列 seed と整数 seed は別 Id" {
