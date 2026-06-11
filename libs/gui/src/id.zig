@@ -36,7 +36,8 @@ fn hashStr(seed: u64, label: []const u8) Id {
     return fnv1a(h, label);
 }
 
-fn hashInt(seed: u64, v: u64) Id {
+/// 整数から子 ID を合成する（layout の自動採番でも使用）。
+pub fn hashInt(seed: u64, v: u64) Id {
     const h = fnv1a(seed, &[_]u8{tag_int});
     return fnv1a(h, std.mem.asBytes(&v));
 }

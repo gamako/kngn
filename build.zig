@@ -193,6 +193,8 @@ pub fn build(b: *std.Build) void {
            .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = true },
         .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig",
            .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = false },
+        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig",
+           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = false },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,

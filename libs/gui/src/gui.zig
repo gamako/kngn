@@ -1,6 +1,12 @@
 // libs/gui 公開 API root
 //
-// 使い方（毎フレーム）:
+// 使い方（毎フレーム、Context + レイアウト）:
+//   ctx.beginFrame(fb_w, fb_h);
+//   // pushEvent → widget（前フレーム rect で同期 hit-test）→ beginBox/label/endBox
+//   ctx.endFrame(); // layout 確定 + draw cmd 発行 + rect キャッシュ更新
+//   gui.render(target, &ctx.draw_list, ctx.font);
+//
+// DrawList 単体（レイアウトなし）の低レベル利用も可:
 //   var dl = gui.DrawList.init(gpa);
 //   dl.reset(fb_w, fb_h);
 //   try dl.rectFilled(...);
@@ -35,6 +41,14 @@ pub const InteractionState = @import("state.zig").InteractionState;
 pub const Context = @import("context.zig").Context;
 pub const ButtonResult = @import("context.zig").ButtonResult;
 pub const buttonBehavior = @import("context.zig").buttonBehavior;
+pub const CachedRect = @import("context.zig").CachedRect;
+
+// Flex レイアウトエンジン（TASK-21.4）
+pub const Direction = @import("layout.zig").Direction;
+pub const Sizing = @import("layout.zig").Sizing;
+pub const Align = @import("layout.zig").Align;
+pub const BoxConfig = @import("layout.zig").BoxConfig;
+pub const CustomDrawFn = @import("layout.zig").CustomDrawFn;
 
 // test-gui 用に各ファイルの test を収集する。
 // `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
@@ -49,4 +63,5 @@ test {
     _ = @import("id.zig");
     _ = @import("state.zig");
     _ = @import("context.zig");
+    _ = @import("layout.zig");
 }
