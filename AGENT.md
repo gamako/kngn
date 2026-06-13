@@ -28,8 +28,13 @@ video-proto/
 │   ├── 03_sprite_rendering/   # スプライト表示
 │   ├── 04_fixed_timestep/     # 固定タイムステップ + 物理シミュレーション
 │   └── 05_text_rendering/     # ビットマップフォントによるテキスト描画
-├── libs/              # サブプロジェクト
-│   └── png-decoder/   # PNG デコーダー
+├── libs/              # 再利用ライブラリ
+│   ├── png-decoder/   # PNG デコーダー
+│   └── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
+├── apps/              # アプリケーション
+│   └── editor/        # グラフィックエディタ群（TASK-21 ファミリー）
+│       ├── core/      # 再利用コア: Canvas / Tool(Pen/Eraser) / UndoStack / StrokeRecorder / PNG I/O
+│       └── apps/pixie/ # ドット絵エディタ MVP（Pen/Eraser/DB16 パレット/Undo/PNG 保存）
 └── docs/              # ドキュメント
     └── PLAN.md        # 実装計画（詳細）
 ```
@@ -141,19 +146,44 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 ### ユーティリティ
 - `platform.getTime()` - 高精度モノトニック時刻取得
 
+## エディタ（apps/editor + libs/gui）
+
+`apps/editor/` はグラフィックエディタ群（TASK-21 ファミリー）。共通基盤の上に複数の小アプリ
+（現状は pixie。将来 paintly / tilex / animix）を載せる構成。
+
+- **libs/gui**: 即時モード GUI。入力管理（hot/active + ID stack）/ Flex レイアウト / 描画プリミティブ /
+  ウィジェット（Button / Label / ColorSwatch / Slider）。`@import("gui")` で使う。
+- **apps/editor/core**: アプリ非依存の再利用コア（platform / GUI を import しない）。
+  `Canvas`（レイヤ・合成・座標変換）/ `Tool`(vtable, Pen/Eraser) / `UndoStack` / `StrokeRecorder` /
+  PNG I/O。使い方は **`apps/editor/core/README.md`** を参照。
+  - 不変条件: 表示は `composite()`（白背景合成）、**PNG 保存は raw layer pixels**（透明保持）。
+- **apps/editor/apps/pixie**: ドット絵エディタ MVP。`canvas_input.zig`（入力状態機械）が
+  press 起点 capture → Tool 経由で stroke を駆動する。
+
+> 注: エディタのタスク管理はトップ階層（`video-proto/`）の Backlog.md CLI で行う（上位 AGENTS.md 参照）。
+> Zig 0.16 のイディオムは `zig-best-practices` スキルを参照。
+
 ## よく使うコマンド
 
 ```bash
-# すべてのプラットフォーム版をビルド
+# すべてのプラットフォーム版をビルド（example / platform のビルド回帰確認にも使う）
 zig build -Dinstall-all=true
 
-# PNG デコーダーのテスト
-zig build test-png-format
+# すべてのテストを実行（集約。全 test-* を束ねる）
+zig build test
 
-# テキスト描画 (BDF) のテスト
-zig build test-text
+# 個別テスト
+zig build test-core             # editor/core（undo + tool）+ pixie 入力状態機械
+zig build test-gui              # libs/gui
+zig build test-png-roundtrip    # PNG encode/decode round-trip（+ canvas 単体）
+zig build test-png-format       # PNG format 変換
+zig build test-text             # BDF パーサ + テキスト描画
+zig build test-sprite           # sprite ブレンド / 描画
 
-# 特定のサンプルを実行（ルートから）
+# Pixie エディタの実行（-Dplatform で objc/swift/metal 切替）
+zig build run-pixie
+
+# 特定のサンプルを実行（ルートから。run-example_01 〜 _NN）
 zig build run-example_01        # 01_timed_window
 zig build run-example_02        # 02_keyboard_input
 zig build run-example_03        # 03_sprite_rendering
