@@ -102,21 +102,42 @@ pub fn build(b: *std.Build) void {
     const run_canvas_test = b.addRunArtifact(canvas_test);
     test_png_roundtrip_step.dependOn(&run_canvas_test.step);
 
-    // pixie PaintEngine テスト (stroke / undo / redo / PNG round-trip)
-    const pixie_paint_core = b.createModule(.{
-        .root_source_file = b.path("apps/editor/core/core.zig"),
-    });
-    const pixie_paint_mod = b.createModule(.{
-        .root_source_file = b.path("apps/editor/apps/pixie/paint.zig"),
+    // editor/core テスト (undo: stroke 記録 + undo/redo + PNG round-trip, tool: Tool ゴールデン)
+    // + pixie canvas_input (入力状態機械: capture / 外 release / 外継続 / stroke 中無視)
+    const core_undo_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/undo.zig"),
         .target = target,
         .optimize = optimize,
     });
-    pixie_paint_mod.addImport("core", pixie_paint_core);
-    pixie_paint_mod.addImport("png-decoder", example_modules.png_decoder);
-    const pixie_test = b.addTest(.{ .root_module = pixie_paint_mod });
-    const run_pixie_test = b.addRunArtifact(pixie_test);
-    const test_pixie_step = b.step("test-pixie", "Run pixie PaintEngine tests");
-    test_pixie_step.dependOn(&run_pixie_test.step);
+    core_undo_mod.addImport("png-decoder", example_modules.png_decoder);
+    const core_undo_test = b.addTest(.{ .root_module = core_undo_mod });
+    const run_core_undo_test = b.addRunArtifact(core_undo_test);
+
+    const core_tool_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/tool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_tool_mod.addImport("png-decoder", example_modules.png_decoder);
+    const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
+    const run_core_tool_test = b.addRunArtifact(core_tool_test);
+
+    const canvas_input_core = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+    });
+    const canvas_input_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/canvas_input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    canvas_input_mod.addImport("core", canvas_input_core);
+    const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
+    const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
+
+    const test_core_step = b.step("test-core", "Run editor/core (undo + tool) and pixie input tests");
+    test_core_step.dependOn(&run_core_undo_test.step);
+    test_core_step.dependOn(&run_core_tool_test.step);
+    test_core_step.dependOn(&run_canvas_input_test.step);
 
     // ========================================
     // PNG デコーダー format.zig テスト
@@ -184,6 +205,18 @@ pub fn build(b: *std.Build) void {
     test_gui_step.dependOn(&run_gui_test.step);
 
     // ========================================
+    // 集約 test ステップ (全 test-* を束ねる)
+    // 注: テスト実行のみ。example の build 回帰は `zig build -Dinstall-all=true` で別途確認する。
+    // ========================================
+    const test_step = b.step("test", "Run all unit/integration tests");
+    test_step.dependOn(test_png_roundtrip_step);
+    test_step.dependOn(test_core_step);
+    test_step.dependOn(test_png_format_step);
+    test_step.dependOn(test_text_step);
+    test_step.dependOn(test_sprite_step);
+    test_step.dependOn(test_gui_step);
+
+    // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
     // ========================================
 
@@ -191,28 +224,17 @@ pub fn build(b: *std.Build) void {
     // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
     // 揃えること（inline for で型不一致を避けるため）。
     inline for (.{
-        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig",
-           .needs_sprite = true,  .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig",
-           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = true,  .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig",
-           .needs_sprite = false, .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = true,  .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig",
-           .needs_sprite = true,  .needs_fps_counter = true,  .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = true },
-        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = false },
-        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = false },
-        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig",
-           .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true,  .needs_png_decoder = false },
+        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
+        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true },
+        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false },
+        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false },
+        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,

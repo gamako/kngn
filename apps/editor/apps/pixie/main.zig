@@ -1,10 +1,10 @@
-//! Pixie MVP (TASK-21.8): libs/gui UI + Pen/Eraser/DB16 パレット/Undo/PNG 保存
+//! Pixie MVP: libs/gui UI + Pen/Eraser/DB16 パレット/Undo/PNG 保存
 //!
 //! - レイアウト: menu bar / row(canvas, right pane) / timeline placeholder / status bar
 //!   の 4 段 Flex（毎フレーム fb サイズから再フロー。リサイズ対応自体は TASK-23）
-//! - canvas 入力: press 起点（mouse_pressed_pos）capture。stroke 中は GUI 上に
+//! - canvas 入力: press 起点 capture（canvas_input.zig の状態機械）。stroke 中は GUI 上に
 //!   逸れても継続（座標は clamp なし変換 + ピクセル側 clip）
-//! - Undo / Redo: stroke 単位（paint.zig の PaintEngine）
+//! - Tool / Undo: core の Tool(Pen/Eraser) / StrokeRecorder / UndoStack（TASK-21.7 で core 化）
 //! - キー: B=Pen / E=Eraser / C=全消去 / Cmd+S=保存 / Cmd+Z=Undo / Cmd+Shift+Z=Redo
 //!         ESC・Cmd+Q=終了（ウィンドウクローズ含め running=false の単一経路）
 
@@ -12,7 +12,7 @@ const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 const core = @import("core");
-const paint = @import("paint.zig");
+const canvas_input = @import("canvas_input.zig");
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -26,7 +26,6 @@ const SAVE_MSG_DURATION: f64 = 3.0;
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
 
 const COLOR_WINDOW_BG: u32 = 0xFF_20_20_24;
-const COLOR_ERASER: u32 = 0x00000000;
 
 /// DawnBringer 16 パレット（0xRRGGBB）
 const db16 = [16]u32{
@@ -47,11 +46,12 @@ fn db16Canvas(i: usize) u32 {
     return @bitCast(db16Color(i));
 }
 
-const Tool = enum {
+/// 現在の描画ツール種別（UI 表示・選択ハイライト用。dispatch は core.Tool が担う）
+const ToolKind = enum {
     pen,
     eraser,
 
-    fn name(self: Tool) []const u8 {
+    fn name(self: ToolKind) []const u8 {
         return switch (self) {
             .pen => "Pen",
             .eraser => "Eraser",
@@ -95,19 +95,24 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    engine: paint.PaintEngine,
-    tool: Tool = .pen,
+    canvas: core.Canvas,
+    recorder: core.StrokeRecorder,
+    undo: core.UndoStack = .{},
+    pen: core.Pen,
+    eraser: core.Eraser = .{},
+    input: canvas_input.CanvasInput = .{},
+    active_kind: ToolKind = .pen,
     color_idx: usize = 0, // DB16[0] = 黒
-    capturing: bool = false,
     running: bool = true,
     save_msg_buf: [128]u8 = undefined,
     save_msg_len: usize = 0,
     save_msg_until: f64 = 0,
 
-    fn drawColor(self: *const App) u32 {
-        return switch (self.tool) {
-            .pen => db16Canvas(self.color_idx),
-            .eraser => COLOR_ERASER,
+    /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
+    fn activeTool(self: *App) core.Tool {
+        return switch (self.active_kind) {
+            .pen => self.pen.tool(),
+            .eraser => self.eraser.tool(),
         };
     }
 
@@ -125,8 +130,8 @@ const App = struct {
     fn doSave(self: *App) void {
         // 表示は composite だが、保存は raw layer pixels（21.6 の不変条件:
         // composite を保存すると消しゴムの透明が白に潰れて round-trip が壊れる）
-        const layer = self.engine.canvas.layers.items[0];
-        core.savePNG(self.io, SAVE_PATH, layer.pixels, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+        const raw = self.canvas.layerPixels(0);
+        core.savePNG(self.io, SAVE_PATH, raw, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             return;
         };
@@ -135,18 +140,18 @@ const App = struct {
 
     /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）
     fn doUndo(self: *App) void {
-        if (self.capturing) return;
-        self.engine.undo();
+        if (self.input.capturing) return;
+        self.undo.undoOne(self.gpa, &self.canvas);
     }
 
     fn doRedo(self: *App) void {
-        if (self.capturing) return;
-        self.engine.redo();
+        if (self.input.capturing) return;
+        self.undo.redoOne(self.gpa, &self.canvas);
     }
 
     fn doClear(self: *App) void {
-        if (self.capturing) return;
-        self.engine.clearAll();
+        if (self.input.capturing) return;
+        self.undo.pushClear(self.gpa, &self.canvas, 0);
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
@@ -161,9 +166,9 @@ const App = struct {
         } else if (k.key == .Z and k.modifiers.cmd) {
             self.doUndo();
         } else if (k.key == .B) {
-            self.tool = .pen;
+            self.active_kind = .pen;
         } else if (k.key == .E) {
-            self.tool = .eraser;
+            self.active_kind = .eraser;
         } else if (k.key == .C) {
             self.doClear();
         }
@@ -183,12 +188,6 @@ fn canvasBlitRect(ctx: *const gui.Context) ?core.Rect {
         .w = @intCast(CANVAS_W),
         .h = @intCast(CANVAS_H),
     };
-}
-
-/// window 座標が canvas 表示領域（ZOOM 倍後）内か
-fn blitRectContains(rect: core.Rect, x: i32, y: i32) bool {
-    return x >= rect.x and y >= rect.y and
-        x < rect.x + rect.w * ZOOM and y < rect.y + rect.h * ZOOM;
 }
 
 /// canvas composite を canvas rect へ ZOOM 倍 nearest-neighbor で転送（fb 境界 clip）
@@ -276,7 +275,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
                 .size = 24,
             }).clicked) {
                 app.color_idx = idx;
-                app.tool = .pen; // 色を選んだらペンに戻す
+                app.pen.color = db16Canvas(idx);
+                app.active_kind = .pen; // 色を選んだらペンに戻す
             }
             idx += 1;
         }
@@ -284,8 +284,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     }
     ctx.label("Tool");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonEx("Pen", .{ .selected = app.tool == .pen, .min_w = 64 }).clicked) app.tool = .pen;
-    if (ctx.buttonEx("Eraser", .{ .selected = app.tool == .eraser, .min_w = 64 }).clicked) app.tool = .eraser;
+    if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 64 }).clicked) app.active_kind = .pen;
+    if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 64 }).clicked) app.active_kind = .eraser;
     ctx.endBox();
     ctx.endBox(); // right pane
 
@@ -323,7 +323,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         ctx.style.text_subtle,
     );
     ctx.labelEx(
-        try std.fmt.allocPrint(arena, "tool: {s}", .{app.tool.name()}),
+        try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
         ctx.style.text_subtle,
     );
     if (app.saveMsg()) |msg| ctx.label(msg);
@@ -347,9 +347,15 @@ pub fn main(init: std.process.Init) !void {
     var app: App = .{
         .io = init.io,
         .gpa = gpa,
-        .engine = try paint.PaintEngine.init(gpa, CANVAS_W, CANVAS_H),
+        .canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
+        .recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
+        .pen = .{ .color = db16Canvas(0) },
     };
-    defer app.engine.deinit();
+    defer {
+        app.undo.deinit(gpa);
+        app.recorder.deinit(gpa);
+        app.canvas.deinit();
+    }
 
     main_loop: while (app.running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
@@ -372,40 +378,26 @@ pub fn main(init: std.process.Init) !void {
         try buildUi(&ctx, &app, canvas_rect);
         ctx.endFrame();
 
-        // ── canvas 入力（press 起点 capture。GUI と canvas は重ならない前提） ──
-        if (canvas_rect) |rect| {
+        // ── canvas 入力（press 起点 capture。状態機械は canvas_input.zig） ──
+        {
             const in = &ctx.input;
-            if (!app.capturing and in.mouse_pressed.left and
-                blitRectContains(rect, in.mouse_pressed_pos.x, in.mouse_pressed_pos.y))
-            {
-                app.capturing = true;
-                // stroke の始点は press 起点（mouse_prev は前フレーム最終位置なので使わない）
-                const cp = core.screenToCanvasRaw(
-                    .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                    rect,
-                    ZOOM,
-                );
-                app.engine.beginStroke(cp.x, cp.y, app.drawColor());
-            }
-            if (app.capturing) {
-                // clamp なし変換（canvas 外は PaintEngine 側で clip）→ GUI 上でも stroke 継続
-                const cp = core.screenToCanvasRaw(
-                    .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                    rect,
-                    ZOOM,
-                );
-                app.engine.strokeTo(cp.x, cp.y);
-                if (in.mouse_released.left) {
-                    app.engine.endStroke();
-                    app.capturing = false;
-                }
+            const frame: canvas_input.CanvasInput.Frame = .{
+                .canvas_rect = canvas_rect,
+                .zoom = ZOOM,
+                .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                .pressed_left = in.mouse_pressed.left,
+                .released_left = in.mouse_released.left,
+            };
+            if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
+                app.undo.push(gpa, cmd);
             }
         }
 
         // ── 描画: bg → canvas blit → GUI（上に重ねる） ──
         @memset(fb.pixels, COLOR_WINDOW_BG);
         if (canvas_rect) |rect| {
-            blitCanvasZoom(fb.pixels, fb.width, fb.height, app.engine.canvas.composite(), rect);
+            blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.composite(), rect);
         }
         gui.render(
             .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },

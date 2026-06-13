@@ -1,5 +1,7 @@
 pub const canvas = @import("canvas.zig");
 pub const io_png = @import("io_png.zig");
+pub const undo = @import("undo.zig");
+pub const tool = @import("tool.zig");
 
 pub const Canvas = canvas.Canvas;
 pub const Layer = canvas.Layer;
@@ -9,3 +11,16 @@ pub const screenToCanvas = canvas.screenToCanvas;
 pub const screenToCanvasRaw = canvas.screenToCanvasRaw;
 pub const encodePNG = io_png.encodePNG;
 pub const savePNG = io_png.savePNG;
+
+// Undo / stroke 記録（TASK-21.7）
+pub const PixelDiff = undo.PixelDiff;
+pub const UndoCmd = undo.UndoCmd;
+pub const UndoStack = undo.UndoStack;
+pub const StrokeRecorder = undo.StrokeRecorder;
+
+// Tool 抽象（TASK-21.7）
+pub const Tool = tool.Tool;
+pub const ToolEvent = tool.ToolEvent;
+pub const ToolPoint = tool.ToolPoint;
+pub const Pen = tool.Pen;
+pub const Eraser = tool.Eraser;

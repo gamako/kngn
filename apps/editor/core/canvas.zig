@@ -69,6 +69,12 @@ pub const Canvas = struct {
         }
     }
 
+    /// レイヤのピクセル配列への直接アクセス（read/write プリミティブ）。
+    /// stroke 記録（before 観測）や PNG 保存（raw 取得）はここを使う。
+    pub fn layerPixels(self: *Canvas, layer_idx: usize) []u32 {
+        return self.layers.items[layer_idx].pixels;
+    }
+
     pub fn drawPixel(self: *Canvas, layer_idx: usize, x: i32, y: i32, color: u32) void {
         if (layer_idx >= self.layers.items.len) return;
         if (x < 0 or y < 0) return;
@@ -76,30 +82,6 @@ pub const Canvas = struct {
         const uy: u32 = @intCast(y);
         if (ux >= self.width or uy >= self.height) return;
         self.layers.items[layer_idx].pixels[uy * self.width + ux] = color;
-    }
-
-    /// Bresenham 線分補間で (x0,y0)-(x1,y1) を color で描く
-    pub fn drawLine(self: *Canvas, layer_idx: usize, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) void {
-        var x = x0;
-        var y = y0;
-        const dx: u32 = @abs(x1 - x0);
-        const dy: u32 = @abs(y1 - y0);
-        const sx: i32 = if (x0 < x1) 1 else -1;
-        const sy: i32 = if (y0 < y1) 1 else -1;
-        var err: i32 = @as(i32, @intCast(dx)) - @as(i32, @intCast(dy));
-        while (true) {
-            self.drawPixel(layer_idx, x, y, color);
-            if (x == x1 and y == y1) break;
-            const e2 = 2 * err;
-            if (e2 > -@as(i32, @intCast(dy))) {
-                err -= @as(i32, @intCast(dy));
-                x += sx;
-            }
-            if (e2 < @as(i32, @intCast(dx))) {
-                err += @as(i32, @intCast(dx));
-                y += sy;
-            }
-        }
     }
 };
 
@@ -139,7 +121,7 @@ test "Canvas drawPixel bounds check" {
     canvas.drawPixel(0, 0, 0, 0xFF000000);
     try std.testing.expectEqual(@as(u32, 0xFF000000), canvas.layers.items[0].pixels[0]);
     canvas.drawPixel(0, -1, 0, 0xFF0000FF); // out of bounds, no crash
-    canvas.drawPixel(0, 4, 0, 0xFF0000FF);  // out of bounds, no crash
+    canvas.drawPixel(0, 4, 0, 0xFF0000FF); // out of bounds, no crash
 }
 
 test "Canvas clear" {
