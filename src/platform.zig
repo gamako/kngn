@@ -20,7 +20,11 @@ pub const Event = macos.Event;
 pub const EventStats = macos.EventStats;
 pub const Window = macos.Window;
 pub const Framebuffer = macos.Framebuffer;
+pub const SaveDialogOptions = macos.SaveDialogOptions;
+pub const OpenDialogOptions = macos.OpenDialogOptions;
 
 pub const init = macos.init;
 pub const shutdown = macos.shutdown;
 pub const getTime = macos.getTime;
+pub const saveFileDialog = macos.saveFileDialog;
+pub const openFileDialog = macos.openFileDialog;

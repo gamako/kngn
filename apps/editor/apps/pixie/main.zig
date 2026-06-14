@@ -5,13 +5,17 @@
 //! - canvas 入力: press 起点 capture（canvas_input.zig の状態機械）。stroke 中は GUI 上に
 //!   逸れても継続（座標は clamp なし変換 + ピクセル側 clip）
 //! - Tool / Undo: core の Tool(Pen/Eraser) / StrokeRecorder / UndoStack（TASK-21.7 で core 化）
-//! - キー: B=Pen / E=Eraser / C=全消去 / Cmd+S=保存 / Cmd+Z=Undo / Cmd+Shift+Z=Redo
+//! - ファイル I/O: Cmd+S=保存(記憶パス) / Cmd+Shift+S=名前を付けて保存 / Cmd+O=開く（TASK-24）。
+//!   ファイルダイアログは framebuffer lock 中に呼べない（再入の危険）ため、handleKey/ボタンは
+//!   pending_file_op をセットするだけにし、フレーム末の安全点 runPendingFileOp() で実行する。
+//! - キー: B=Pen / E=Eraser / C=全消去 / Cmd+Z=Undo / Cmd+Shift+Z=Redo
 //!         ESC・Cmd+Q=終了（ウィンドウクローズ含め running=false の単一経路）
 
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 const core = @import("core");
+const png_decoder = @import("png-decoder");
 const canvas_input = @import("canvas_input.zig");
 
 const WINDOW_W: u32 = 780;
@@ -19,8 +23,11 @@ const WINDOW_H: u32 = 600;
 const CANVAS_W: u32 = 256;
 const CANVAS_H: u32 = 256;
 const ZOOM: i32 = 2;
-const SAVE_PATH = "output.png";
 const SAVE_MSG_DURATION: f64 = 3.0;
+
+/// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
+/// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
+const FileOp = enum { save, save_as, open };
 
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
@@ -104,6 +111,10 @@ const App = struct {
     active_kind: ToolKind = .pen,
     color_idx: usize = 0, // DB16[0] = 黒
     running: bool = true,
+    /// 現在の保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
+    current_path: ?[]u8 = null,
+    /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
+    pending_file_op: ?FileOp = null,
     save_msg_buf: [128]u8 = undefined,
     save_msg_len: usize = 0,
     save_msg_until: f64 = 0,
@@ -127,15 +138,87 @@ const App = struct {
         return self.save_msg_buf[0..self.save_msg_len];
     }
 
+    /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
+    /// 冒頭で one-shot 消費するので、capturing 等による早期 return でも要求は残らない。
+    fn runPendingFileOp(self: *App) void {
+        const op = self.pending_file_op orelse return;
+        self.pending_file_op = null;
+        switch (op) {
+            .save => self.doSave(),
+            .save_as => self.doSaveAs(),
+            .open => self.doOpen(),
+        }
+    }
+
+    /// 記憶している保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
     fn doSave(self: *App) void {
+        const path = self.current_path orelse return self.doSaveAs();
         // 表示は composite だが、保存は raw layer pixels（21.6 の不変条件:
         // composite を保存すると消しゴムの透明が白に潰れて round-trip が壊れる）
         const raw = self.canvas.layerPixels(0);
-        core.savePNG(self.io, SAVE_PATH, raw, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+        core.savePNG(self.io, path, raw, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+            // current_path は永続パスなので失敗しても保持（free しない）
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             return;
         };
-        self.setSaveMsg("Saved: " ++ SAVE_PATH, .{});
+        self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// ダイアログで保存先を選んで保存。成功時にダイアログ戻り値を current_path へ移譲する。
+    fn doSaveAs(self: *App) void {
+        const maybe = platform.saveFileDialog(self.gpa, .{
+            .default_name = "untitled.png",
+            .allowed_ext = "png",
+        }) catch |err| {
+            self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return; // キャンセル: サイレント no-op
+        const raw = self.canvas.layerPixels(0);
+        core.savePNG(self.io, path, raw, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+            self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
+            self.gpa.free(path); // 失敗時はダイアログ戻り値を解放・旧 current_path は触らない
+            return;
+        };
+        if (self.current_path) |old| self.gpa.free(old);
+        self.current_path = path; // 移譲（再 dupe しない）
+        self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
+    /// 進行中 stroke 中は破棄。undo/redo はクリアし、current_path を開いたファイルに更新。
+    fn doOpen(self: *App) void {
+        if (self.input.capturing) return;
+        const maybe = platform.openFileDialog(self.gpa, .{ .allowed_ext = "png" }) catch |err| {
+            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return; // キャンセル: サイレント no-op
+        var img = png_decoder.decodePNGFile(self.io, self.gpa, path) catch |err| {
+            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return;
+        };
+        defer img.deinit(self.gpa);
+
+        // 左上クロップ/パディング: layer0 を透明クリアし、収まる範囲を行ごとに memcpy。
+        // png_decoder の出力は 0xAABBGGRR で canvas と同一レイアウトなので変換不要。
+        const layer0 = self.canvas.layerPixels(0);
+        @memset(layer0, 0);
+        const iw: usize = img.width;
+        const rows = @min(@as(usize, img.height), @as(usize, CANVAS_H));
+        const cols = @min(iw, @as(usize, CANVAS_W));
+        for (0..rows) |y| {
+            @memcpy(layer0[y * CANVAS_W ..][0..cols], img.pixels[y * iw ..][0..cols]);
+        }
+
+        // load はドキュメント差し替えなので undo/redo 履歴を破棄（recorder は stroke 非進行中）
+        self.undo.deinit(self.gpa);
+        self.undo = .{};
+
+        if (self.current_path) |old| self.gpa.free(old);
+        self.current_path = path; // 移譲
+        self.setSaveMsg("Loaded: {s}", .{std.fs.path.basename(path)});
     }
 
     /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）
@@ -159,8 +242,12 @@ const App = struct {
             self.running = false;
         } else if (k.key == .Q and k.modifiers.cmd) {
             self.running = false;
+        } else if (k.key == .S and k.modifiers.cmd and k.modifiers.shift) {
+            self.pending_file_op = .save_as;
         } else if (k.key == .S and k.modifiers.cmd) {
-            self.doSave();
+            self.pending_file_op = .save;
+        } else if (k.key == .O and k.modifiers.cmd) {
+            self.pending_file_op = .open;
         } else if (k.key == .Z and k.modifiers.cmd and k.modifiers.shift) {
             self.doRedo();
         } else if (k.key == .Z and k.modifiers.cmd) {
@@ -230,7 +317,9 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         .gap = 8,
         .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
     });
-    if (ctx.button("Save")) app.doSave();
+    if (ctx.button("Open")) app.pending_file_op = .open;
+    if (ctx.button("Save")) app.pending_file_op = .save;
+    if (ctx.button("Save As")) app.pending_file_op = .save_as;
     if (ctx.button("Undo")) app.doUndo();
     if (ctx.button("Redo")) app.doRedo();
     ctx.endBox();
@@ -352,58 +441,68 @@ pub fn main(init: std.process.Init) !void {
         .pen = .{ .color = db16Canvas(0) },
     };
     defer {
+        if (app.current_path) |p| gpa.free(p);
         app.undo.deinit(gpa);
         app.recorder.deinit(gpa);
         app.canvas.deinit();
     }
 
     main_loop: while (app.running and window.pollEvents()) {
-        const fb = window.lockFramebuffer() orelse continue :main_loop;
-        defer fb.unlock();
-
-        ctx.beginFrame(fb.width, fb.height);
-
-        while (window.nextEvent()) |ev| {
-            switch (ev) {
-                .quit => app.running = false, // ウィンドウクローズも同一経路
-                .key_down => |k| app.handleKey(k),
-                else => {},
-            }
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
-        }
-
-        // canvas rect は前フレームの layout 結果（初回フレームは null）
-        const canvas_rect = canvasBlitRect(&ctx);
-
-        try buildUi(&ctx, &app, canvas_rect);
-        ctx.endFrame();
-
-        // ── canvas 入力（press 起点 capture。状態機械は canvas_input.zig） ──
+        // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。
+        // ファイルダイアログ（モーダル）は lock 中に呼ぶと再入で危険なので、ここでは pending を
+        // セットするだけにし、unlock 後の安全点（下の runPendingFileOp）で実行する。
         {
-            const in = &ctx.input;
-            const frame: canvas_input.CanvasInput.Frame = .{
-                .canvas_rect = canvas_rect,
-                .zoom = ZOOM,
-                .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                .pressed_left = in.mouse_pressed.left,
-                .released_left = in.mouse_released.left,
-            };
-            if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
-                app.undo.push(gpa, cmd);
-            }
-        }
+            const fb = window.lockFramebuffer() orelse continue :main_loop;
+            defer fb.unlock();
 
-        // ── 描画: bg → canvas blit → GUI（上に重ねる） ──
-        @memset(fb.pixels, COLOR_WINDOW_BG);
-        if (canvas_rect) |rect| {
-            blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.composite(), rect);
-        }
-        gui.render(
-            .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
-            &ctx.draw_list,
-            ctx.font,
-        );
-        window.present();
+            ctx.beginFrame(fb.width, fb.height);
+
+            while (window.nextEvent()) |ev| {
+                switch (ev) {
+                    .quit => app.running = false, // ウィンドウクローズも同一経路
+                    .key_down => |k| app.handleKey(k),
+                    else => {},
+                }
+                if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+            }
+
+            // canvas rect は前フレームの layout 結果（初回フレームは null）
+            const canvas_rect = canvasBlitRect(&ctx);
+
+            try buildUi(&ctx, &app, canvas_rect);
+            ctx.endFrame();
+
+            // ── canvas 入力（press 起点 capture。状態機械は canvas_input.zig） ──
+            {
+                const in = &ctx.input;
+                const frame: canvas_input.CanvasInput.Frame = .{
+                    .canvas_rect = canvas_rect,
+                    .zoom = ZOOM,
+                    .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                    .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                    .pressed_left = in.mouse_pressed.left,
+                    .released_left = in.mouse_released.left,
+                };
+                if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
+                    app.undo.push(gpa, cmd);
+                }
+            }
+
+            // ── 描画: bg → canvas blit → GUI（上に重ねる） ──
+            @memset(fb.pixels, COLOR_WINDOW_BG);
+            if (canvas_rect) |rect| {
+                blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.composite(), rect);
+            }
+            gui.render(
+                .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
+                &ctx.draw_list,
+                ctx.font,
+            );
+            window.present();
+        } // ← ここで framebuffer unlock
+
+        // 安全点: framebuffer unlock 済み・当フレームの入力更新も完了。ここでモーダルを開く。
+        // 終了要求と同フレームで保存/読込が pending でも、終了中はダイアログを開かない。
+        if (app.running) app.runPendingFileOp();
     }
 }

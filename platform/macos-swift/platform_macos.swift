@@ -799,3 +799,49 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
 
     return true
 }
+
+// ========================================
+// ファイル選択ダイアログ (TASK-24)
+// ========================================
+// 拡張子フィルタは allowedFileTypes を使う（macOS 12 で deprecated だが全 macOS で
+// 動作し、UniformTypeIdentifiers のリンク追加が不要）。
+// withUnsafeFileSystemRepresentation の ptr は Optional。non-null を確認してから strdup する。
+
+@_cdecl("platform_save_file_dialog")
+func platform_save_file_dialog(opts: UnsafePointer<PlatformSaveDialogOptions>?) -> UnsafeMutablePointer<CChar>? {
+    let panel = NSSavePanel()
+    if let opts = opts {
+        if let ext = opts.pointee.allowed_ext {
+            panel.allowedFileTypes = [String(cString: ext)]
+        }
+        if let name = opts.pointee.default_name {
+            panel.nameFieldStringValue = String(cString: name)
+        }
+    }
+    guard panel.runModal() == .OK, let url = panel.url else { return nil }
+    return url.withUnsafeFileSystemRepresentation { ptr in
+        guard let ptr = ptr else { return nil }
+        return strdup(ptr)
+    }
+}
+
+@_cdecl("platform_open_file_dialog")
+func platform_open_file_dialog(opts: UnsafePointer<PlatformOpenDialogOptions>?) -> UnsafeMutablePointer<CChar>? {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    if let opts = opts, let ext = opts.pointee.allowed_ext {
+        panel.allowedFileTypes = [String(cString: ext)]
+    }
+    guard panel.runModal() == .OK, let url = panel.url else { return nil }
+    return url.withUnsafeFileSystemRepresentation { ptr in
+        guard let ptr = ptr else { return nil }
+        return strdup(ptr)
+    }
+}
+
+@_cdecl("platform_free_path")
+func platform_free_path(path: UnsafeMutablePointer<CChar>?) -> Void {
+    if let path = path { free(path) }
+}

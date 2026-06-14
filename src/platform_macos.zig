@@ -337,6 +337,49 @@ pub const Framebuffer = struct {
     }
 };
 
+// ============================================================================
+// ファイル選択ダイアログ (TASK-24)
+// ============================================================================
+//
+// 同期モーダル（app-modal）。**framebuffer lock 中には呼ばないこと**（caller 責任）。
+// 戻り値は gpa 所有スライス（caller が gpa.free すること）。キャンセル時は null、
+// メモリ確保失敗時は error.OutOfMemory。
+
+pub const SaveDialogOptions = struct {
+    default_name: ?[:0]const u8 = null,
+    allowed_ext: ?[:0]const u8 = null,
+};
+
+pub const OpenDialogOptions = struct {
+    allowed_ext: ?[:0]const u8 = null,
+};
+
+/// 保存先をユーザーに選ばせる。
+pub fn saveFileDialog(gpa: std.mem.Allocator, opts: SaveDialogOptions) std.mem.Allocator.Error!?[]u8 {
+    var c_opts: c.PlatformSaveDialogOptions = .{
+        .default_name = if (opts.default_name) |s| s.ptr else null,
+        .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,
+    };
+    const p = c.platform_save_file_dialog(&c_opts) orelse return null;
+    return try dupePathAndFree(gpa, p);
+}
+
+/// 開くファイルをユーザーに選ばせる（単一選択・ファイルのみ）。
+pub fn openFileDialog(gpa: std.mem.Allocator, opts: OpenDialogOptions) std.mem.Allocator.Error!?[]u8 {
+    var c_opts: c.PlatformOpenDialogOptions = .{
+        .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,
+    };
+    const p = c.platform_open_file_dialog(&c_opts) orelse return null;
+    return try dupePathAndFree(gpa, p);
+}
+
+/// C 側が確保したパス文字列を gpa 所有スライスへ複製し、C 側を必ず解放する。
+/// dupe が OOM でも defer で platform_free_path を呼ぶので C 側はリークしない。
+fn dupePathAndFree(gpa: std.mem.Allocator, p: [*c]u8) std.mem.Allocator.Error![]u8 {
+    defer c.platform_free_path(p);
+    return try gpa.dupe(u8, std.mem.span(p));
+}
+
 test "ModifierFlags round trip via @bitCast" {
     const m = ModifierFlags{ .shift = true, .cmd = true };
     const raw = m.toC();

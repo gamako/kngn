@@ -301,4 +301,36 @@ typedef struct PlatformEventStats {
 // イベントキューのカウンタ snapshot を取得
 void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
 
+// ========================================
+// ファイル選択ダイアログ (TASK-24)
+// ========================================
+//
+// ネイティブのファイル選択ダイアログを同期モーダルで表示する（app-modal、
+// ウィンドウ非依存）。呼び出しスレッド（メインスレッド）をブロックし、ユーザーが
+// ダイアログを閉じるまで戻らない。フレームバッファ lock 中には呼ばないこと。
+
+// 保存ダイアログのオプション
+typedef struct PlatformSaveDialogOptions {
+    const char* default_name;  // 初期ファイル名 (NULL 可)
+    const char* allowed_ext;   // 拡張子フィルタ 例 "png" (NULL = 任意)
+} PlatformSaveDialogOptions;
+
+// 読み込みダイアログのオプション
+typedef struct PlatformOpenDialogOptions {
+    const char* allowed_ext;   // 拡張子フィルタ 例 "png" (NULL = 任意)
+} PlatformOpenDialogOptions;
+
+// 保存先をユーザーに選ばせる。
+// 戻り値: 選択された絶対パス（NUL 終端、malloc 済み）。caller は platform_free_path() で解放。
+//         キャンセル / エラー時は NULL。
+char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts);
+
+// 開くファイルをユーザーに選ばせる（単一選択・ファイルのみ）。
+// 戻り値: 選択された絶対パス（NUL 終端、malloc 済み）。caller は platform_free_path() で解放。
+//         キャンセル / エラー時は NULL。
+char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts);
+
+// platform_*_file_dialog() が返したパス文字列を解放する。NULL 安全。
+void platform_free_path(char* path);
+
 #endif // PLATFORM_H

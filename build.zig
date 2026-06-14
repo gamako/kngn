@@ -78,6 +78,12 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, "run-pixie-objc", "Run Pixie editor (ObjC)", pixie_objc, b.args);
     addRunStep(b, "run-pixie-swift", "Run Pixie editor (Swift)", pixie_swift, b.args);
     addRunStep(b, "run-pixie-metal", "Run Pixie editor (Metal)", pixie_metal, b.args);
+    // install-all で pixie 3 実装もビルド回帰対象にする（非対話のコンパイル検証手段）
+    if (install_all) {
+        b.installArtifact(pixie_objc);
+        b.installArtifact(pixie_swift);
+        b.installArtifact(pixie_metal);
+    }
 
     // PNG round-trip テスト (io_png.zig のテスト + png-decoder で検証)
     const io_png_mod = b.createModule(.{
@@ -431,6 +437,7 @@ fn addPixieExe(
     exe.root_module.addImport("platform", modules.platform);
     exe.root_module.addImport("core", core_mod);
     exe.root_module.addImport("gui", modules.gui);
+    exe.root_module.addImport("png-decoder", modules.png_decoder); // PNG 読み込み (TASK-24)
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;

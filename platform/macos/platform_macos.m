@@ -844,3 +844,52 @@ bool platform_get_event(PlatformWindow* window, PlatformEvent* event) {
 
     return true;
 }
+
+// ========================================
+// ファイル選択ダイアログ (TASK-24)
+// ========================================
+// 拡張子フィルタは allowedFileTypes を使う（macOS 12 で deprecated だが全 macOS で
+// 動作し、UniformTypeIdentifiers フレームワークのリンク追加が不要）。
+// fileSystemRepresentation は autorelease プール生存中のみ有効なので、その場で strdup する。
+
+char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts) {
+    @autoreleasepool {
+        NSSavePanel* panel = [NSSavePanel savePanel];
+        if (opts) {
+            if (opts->allowed_ext) {
+                panel.allowedFileTypes = @[ [NSString stringWithUTF8String:opts->allowed_ext] ];
+            }
+            if (opts->default_name) {
+                panel.nameFieldStringValue = [NSString stringWithUTF8String:opts->default_name];
+            }
+        }
+        if ([panel runModal] != NSModalResponseOK) return NULL;
+        NSURL* url = [panel URL];
+        if (!url) return NULL;
+        const char* path = [url fileSystemRepresentation];
+        if (!path) return NULL;
+        return strdup(path);
+    }
+}
+
+char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts) {
+    @autoreleasepool {
+        NSOpenPanel* panel = [NSOpenPanel openPanel];
+        panel.canChooseFiles = YES;
+        panel.canChooseDirectories = NO;
+        panel.allowsMultipleSelection = NO;
+        if (opts && opts->allowed_ext) {
+            panel.allowedFileTypes = @[ [NSString stringWithUTF8String:opts->allowed_ext] ];
+        }
+        if ([panel runModal] != NSModalResponseOK) return NULL;
+        NSURL* url = [panel URL];
+        if (!url) return NULL;
+        const char* path = [url fileSystemRepresentation];
+        if (!path) return NULL;
+        return strdup(path);
+    }
+}
+
+void platform_free_path(char* path) {
+    if (path) free(path);
+}
