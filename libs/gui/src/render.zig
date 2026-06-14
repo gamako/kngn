@@ -10,15 +10,17 @@ pub const RenderTarget = geom.RenderTarget;
 pub const Color = color_mod.Color;
 pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
+pub const Font = font_mod.Font;
 
-pub fn render(target: RenderTarget, draw_list: *const DrawList, font: BitmapFont) void {
+/// font = 既定フォント。各 text cmd が font override を持てばそちらを優先する。
+pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font) void {
     std.debug.assert(target.pixels.len == @as(usize, target.width) * @as(usize, target.height));
     for (draw_list.cmds.items) |cmd| {
         switch (cmd) {
             .rect_filled => |c| if (!c.clip.isEmpty()) drawRectFilled(target, c.rect, c.color, c.clip),
             .rect_outline => |c| if (!c.clip.isEmpty()) drawRectOutline(target, c.rect, c.color, c.thickness, c.clip),
             .line => |c| if (!c.clip.isEmpty()) drawLine(target, c.p0, c.p1, c.color, c.clip),
-            .text => |c| if (!c.clip.isEmpty()) font.drawTo(target, c.pos, c.text, c.color, c.clip),
+            .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip),
             .image => |c| if (!c.clip.isEmpty()) drawImage(target, c.rect, c.pixels, c.src_w, c.clip),
         }
     }

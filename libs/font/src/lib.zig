@@ -1,0 +1,55 @@
+// libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義。
+// gui や将来の OutlineFont/BMFont はこのモジュール（`@import("font")`）を使う。
+
+pub const geom = @import("geom.zig");
+pub const color = @import("color.zig");
+pub const font = @import("font.zig");
+pub const byte_reader = @import("byte_reader.zig");
+pub const sfnt = @import("sfnt.zig");
+pub const cmap = @import("cmap.zig");
+pub const outline = @import("outline.zig");
+pub const glyf = @import("glyf.zig");
+pub const raster = @import("raster.zig");
+pub const charstring = @import("charstring.zig");
+pub const cff = @import("cff.zig");
+pub const outline_font = @import("outline_font.zig");
+pub const bmfont = @import("bmfont.zig");
+
+// pixel/geom プリミティブ（gui が再エクスポートする正準定義）
+pub const Rect = geom.Rect;
+pub const Vec2 = geom.Vec2;
+pub const RenderTarget = geom.RenderTarget;
+pub const Color = color.Color;
+
+// 共通フォント抽象
+pub const Metrics = font.Metrics;
+pub const Font = font.Font;
+pub const plotCoverage = font.plotCoverage;
+pub const blitCoverage = font.blitCoverage;
+
+// sfnt(TrueType/OpenType) コンテナ + cmap + glyf アウトライン
+pub const SfntFile = sfnt.SfntFile;
+pub const Cmap = cmap.Cmap;
+pub const Outline = outline.Outline;
+pub const Glyf = glyf.Glyf;
+pub const rasterize = raster.rasterize;
+pub const Bitmap = raster.Bitmap;
+pub const FontFace = outline_font.FontFace;
+pub const OutlineFont = outline_font.OutlineFont;
+pub const BMFont = bmfont.BMFont;
+
+test {
+    _ = geom;
+    _ = color;
+    _ = font;
+    _ = byte_reader;
+    _ = sfnt;
+    _ = cmap;
+    _ = outline;
+    _ = glyf;
+    _ = raster;
+    _ = charstring;
+    _ = cff;
+    _ = outline_font;
+    _ = bmfont;
+}

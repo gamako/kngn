@@ -162,13 +162,13 @@ pub fn build(b: *std.Build) void {
     // ========================================
     // text.zig テスト (BDF パーサ + 描画)
     // ========================================
-    const text_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/text.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const text_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/text.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    text_test_mod.addImport("font", example_modules.font); // text.zig が共通 Font IF を利用
+    const text_test = b.addTest(.{ .root_module = text_test_mod });
     const run_text_test = b.addRunArtifact(text_test);
     const test_text_step = b.step("test-text", "Run BDF parser and text rendering tests");
     test_text_step.dependOn(&run_text_test.step);
@@ -199,16 +199,28 @@ pub fn build(b: *std.Build) void {
     // gui.zig を root にすると参照する全ファイルの test がまとめて回る。
     // ExampleModules.gui は import 用なので、test 用に専用 module を作る。
     // ========================================
-    const gui_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("libs/gui/src/gui.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const gui_test_root = b.createModule(.{
+        .root_source_file = b.path("libs/gui/src/gui.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    gui_test_root.addImport("font", example_modules.font);
+    const gui_test = b.addTest(.{ .root_module = gui_test_root });
     const run_gui_test = b.addRunArtifact(gui_test);
     const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
     test_gui_step.dependOn(&run_gui_test.step);
+
+    // libs/font テスト (geom / color / Font インターフェース + カバレッジ描画路 + BMFont)
+    const font_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/font/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    font_test_mod.addImport("png-decoder", example_modules.png_decoder); // bmfont.zig が利用
+    const font_test = b.addTest(.{ .root_module = font_test_mod });
+    const run_font_test = b.addRunArtifact(font_test);
+    const test_font_step = b.step("test-font", "Run libs/font unit tests");
+    test_font_step.dependOn(&run_font_test.step);
 
     // ========================================
     // 集約 test ステップ (全 test-* を束ねる)
@@ -220,6 +232,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_png_format_step);
     test_step.dependOn(test_text_step);
     test_step.dependOn(test_sprite_step);
+    test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
 
     // ========================================
@@ -230,17 +243,18 @@ pub fn build(b: *std.Build) void {
     // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
     // 揃えること（inline for で型不一致を避けるため）。
     inline for (.{
-        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false },
-        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true },
-        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false },
-        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false },
-        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false },
+        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false, .needs_font = true },
+        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true, .needs_font = false },
+        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = true },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,
@@ -249,6 +263,7 @@ pub fn build(b: *std.Build) void {
             .needs_text = example.needs_text,
             .needs_gui = example.needs_gui,
             .needs_png_decoder = example.needs_png_decoder,
+            .needs_font = example.needs_font,
         };
         const ex_objc = addExampleExe(b, target, optimize, platform_root, sdk_paths, .objc, example.name, example.path, &example_modules, needs);
         const ex_swift = addExampleExe(b, target, optimize, platform_root, sdk_paths, .swift, example.name ++ "_swift", example.path, &example_modules, needs);
@@ -310,6 +325,7 @@ const ExampleModules = struct {
     fps_counter: *std.Build.Module,
     text: *std.Build.Module,
     png_decoder: *std.Build.Module,
+    font: *std.Build.Module,
     gui: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
@@ -333,9 +349,23 @@ const ExampleModules = struct {
         });
         sprite.addImport("png-decoder", png_decoder);
 
+        // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
+        // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png-decoder に依存。
+        const font_mod = b.createModule(.{
+            .root_source_file = b.path("libs/font/src/lib.zig"),
+        });
+        font_mod.addImport("png-decoder", png_decoder);
+
+        // src/text.zig は共通 Font IF（libs/font）の実装を提供するため font に依存（TASK-25.14）。
+        const text_mod = b.createModule(.{
+            .root_source_file = b.path("src/text.zig"),
+        });
+        text_mod.addImport("font", font_mod);
+
         const gui = b.createModule(.{
             .root_source_file = b.path("libs/gui/src/gui.zig"),
         });
+        gui.addImport("font", font_mod);
 
         return .{
             .platform = platform_mod,
@@ -347,10 +377,9 @@ const ExampleModules = struct {
             .fps_counter = b.createModule(.{
                 .root_source_file = b.path("src/fps_counter.zig"),
             }),
-            .text = b.createModule(.{
-                .root_source_file = b.path("src/text.zig"),
-            }),
+            .text = text_mod,
             .png_decoder = png_decoder,
+            .font = font_mod,
             .gui = gui,
         };
     }
@@ -363,6 +392,7 @@ const ExampleNeeds = struct {
     needs_text: bool,
     needs_gui: bool,
     needs_png_decoder: bool,
+    needs_font: bool,
 };
 
 fn addExampleExe(
@@ -394,6 +424,7 @@ fn addExampleExe(
     if (needs.needs_text) exe.root_module.addImport("text", modules.text);
     if (needs.needs_gui) exe.root_module.addImport("gui", modules.gui);
     if (needs.needs_png_decoder) exe.root_module.addImport("png-decoder", modules.png_decoder);
+    if (needs.needs_font) exe.root_module.addImport("font", modules.font);
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。

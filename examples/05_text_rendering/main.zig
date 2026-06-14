@@ -9,6 +9,7 @@ const std = @import("std");
 const platform = @import("platform");
 const keyboard = @import("keyboard");
 const text = @import("text");
+const fontmod = @import("font");
 const FpsCounter = @import("fps_counter").FpsCounter;
 
 const font_bdf = @embedFile("assets/font.bdf");
@@ -69,57 +70,45 @@ pub fn main() !void {
             const fbh: u32 = fb.height;
             const fbw_i32: i32 = @intCast(fbw);
             const fbh_i32: i32 = @intCast(fbh);
-            const lh: i32 = @intCast(font.line_height);
 
-            // 左上: FPS / dt (シアン) — bufPrint で文字列化してから drawText
+            // 共通 Font インターフェース経由で描画（TASK-25.14）。RenderTarget + clip + Color。
+            const f = font.asFont();
+            const target = fontmod.RenderTarget{ .pixels = fb.pixels, .width = fbw, .height = fbh };
+            const clip = fontmod.Rect{ .x = 0, .y = 0, .w = fbw, .h = fbh };
+            const lh: i32 = @intCast(f.metrics().line_height);
+            // 旧 raw u32 色を @bitCast で保持（見た目を不変に）。
+            const cyan: fontmod.Color = @bitCast(@as(u32, 0xFF00FFFF));
+            const white: fontmod.Color = @bitCast(@as(u32, 0xFFFFFFFF));
+            const orange: fontmod.Color = @bitCast(@as(u32, 0xFFFFCCAA));
+            const gray: fontmod.Color = @bitCast(@as(u32, 0xFFCCCCCC));
+            const green: fontmod.Color = @bitCast(@as(u32, 0xFF66FF66));
+
+            // 左上: FPS / dt (シアン)
             var fps_buf: [32]u8 = undefined;
             const fps_str = std.fmt.bufPrint(&fps_buf, "FPS: {d}", .{fps_cached}) catch "FPS: ?";
-            text.drawText(fb.pixels, fbw, fbh, &font, fps_str, 8, 8, 0xFF00FFFF);
+            f.drawTo(target, .{ .x = 8, .y = 8 }, fps_str, cyan, clip);
 
             var ms_buf: [32]u8 = undefined;
             const ms_str = std.fmt.bufPrint(&ms_buf, "MS:  {d:.2}", .{dt * 1000.0}) catch "MS:  ?";
-            text.drawText(fb.pixels, fbw, fbh, &font, ms_str, 8, 8 + lh, 0xFF00FFFF);
+            f.drawTo(target, .{ .x = 8, .y = 8 + lh }, ms_str, cyan, clip);
 
             // 中央: Hello, World! (白)
             const greeting = "Hello, World!";
-            const tw_i32: i32 = @intCast(text.measureWidth(&font, greeting));
+            const tw_i32: i32 = @intCast(f.measure(greeting));
             const cx: i32 = @divFloor(fbw_i32 - tw_i32, 2);
             const cy: i32 = @divFloor(fbh_i32 - lh, 2);
-            text.drawText(fb.pixels, fbw, fbh, &font, greeting, cx, cy, 0xFFFFFFFF);
+            f.drawTo(target, .{ .x = cx, .y = cy }, greeting, white, clip);
 
-            // 改行デモ (薄いオレンジ)
-            text.drawText(
-                fb.pixels,
-                fbw,
-                fbh,
-                &font,
-                "Multi-line\ndemo line 2\nline 3",
-                8,
-                80,
-                0xFFFFCCAA,
-            );
+            // 改行デモ (薄いオレンジ): drawTo は 1 行ランなので呼び出し側で \n 分割（行レイアウトは上位責務）。
+            var line_y: i32 = 80;
+            var lines = std.mem.splitScalar(u8, "Multi-line\ndemo line 2\nline 3", '\n');
+            while (lines.next()) |line| : (line_y += lh) {
+                f.drawTo(target, .{ .x = 8, .y = line_y }, line, orange, clip);
+            }
 
             // 下部: 入力エコー (getCharFromKey の対応範囲は A-Z / 0-9)
-            text.drawText(
-                fb.pixels,
-                fbw,
-                fbh,
-                &font,
-                "Type letters/digits (BACKSPACE delete, ESC quit):",
-                8,
-                fbh_i32 - 40,
-                0xFFCCCCCC,
-            );
-            text.drawText(
-                fb.pixels,
-                fbw,
-                fbh,
-                &font,
-                input_buf[0..input_len],
-                8,
-                fbh_i32 - 20,
-                0xFF66FF66,
-            );
+            f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 40 }, "Type letters/digits (BACKSPACE delete, ESC quit):", gray, clip);
+            f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 20 }, input_buf[0..input_len], green, clip);
 
             window.present();
         }

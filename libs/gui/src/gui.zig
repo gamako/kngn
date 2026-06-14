@@ -21,7 +21,11 @@ pub const Color = @import("color.zig").Color;
 pub const DrawCmd = @import("draw.zig").DrawCmd;
 pub const DrawList = @import("draw.zig").DrawList;
 
+pub const Font = @import("font.zig").Font;
+pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;
+pub const default_bitmap_font = @import("font.zig").default_bitmap_font;
+/// 既定フォント（共通 Font インターフェース値）。Context.init / render に渡す。
 pub const default_font = @import("font.zig").default_font;
 
 pub const render = @import("render.zig").render;

@@ -43,6 +43,7 @@ pub const InputEvent = input_mod.InputEvent;
 pub const InteractionState = state_mod.InteractionState;
 pub const DrawList = draw.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
+pub const Font = font_mod.Font;
 pub const BoxConfig = layout.BoxConfig;
 pub const Style = style_mod.Style;
 
@@ -57,7 +58,7 @@ pub const Context = struct {
     id_stack: IdStack,
     state: InteractionState = .{},
     draw_list: DrawList,
-    font: BitmapFont,
+    font: Font,
     screen_w: u32 = 0,
     screen_h: u32 = 0,
     frame_active: bool = false,
@@ -79,7 +80,7 @@ pub const Context = struct {
     pub const colorSwatchEx = widgets.colorSwatchEx;
     pub const colorSwatchId = widgets.colorSwatchId;
 
-    pub fn init(gpa: Allocator, font: BitmapFont) Context {
+    pub fn init(gpa: Allocator, font: Font) Context {
         return .{
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
@@ -133,7 +134,7 @@ pub const Context = struct {
         // レイアウト API 未使用フレーム（root が空）は layout / 発行 / キャッシュ更新を
         // 全てスキップ: 手動 DrawList 運用（example 08/09）と互換。rect_cache は前回値のまま。
         if (root.first_child != null) {
-            layout.measure(root, &self.font);
+            layout.measure(root, self.font);
             const screen_rect = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
             layout.place(root, screen_rect);
             self.rect_cache.clearRetainingCapacity();
@@ -251,10 +252,11 @@ pub const Context = struct {
     fn emitNode(self: *Context, node: *const layout.Node) void {
         if (node.leaf) |leaf| {
             switch (leaf) {
-                .text => |t| self.draw_list.text(
+                .text => |t| self.draw_list.textEx(
                     .{ .x = node.rect.x, .y = node.rect.y },
                     t.str,
                     t.color,
+                    t.font,
                 ) catch @panic("Context.endFrame: OOM"),
                 .custom => |c| c.draw_fn(c.ctx, &self.draw_list, node.rect),
             }

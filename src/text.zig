@@ -11,9 +11,19 @@
 //   - PROPERTIES ブロックは丸ごとスキップ (FONT_ASCENT 等は読まない)
 //   - ascent は FONTBOUNDINGBOX から導出: ascent = bbox_height + bbox_y_offset
 //   - 不透明色のみ (fg_color の alpha はそのまま使われる前提)
-//   - drawText は ASCII-only。codepoint は u32 で持つので将来 UTF-8 拡張可能
+//   - 描画は共通 Font インターフェース（libs/font）の drawTo/measure/metrics 経由（TASK-25.14）。
+//     立ちビットをカバレッジ 255 として plotCoverage に流し、col で tint・clip する。
+//     1 行ラン専用（\n/\t 非対応＝行レイアウトは呼び出し側責務）。
 
 const std = @import("std");
+const fontmod = @import("font");
+const Font = fontmod.Font;
+const Metrics = fontmod.Metrics;
+const RenderTarget = fontmod.RenderTarget;
+const Rect = fontmod.Rect;
+const Vec2 = fontmod.Vec2;
+const Color = fontmod.Color;
+const plotCoverage = fontmod.plotCoverage;
 
 pub const Glyph = struct {
     width: u32,
@@ -43,7 +53,96 @@ pub const BitmapFont = struct {
     pub fn lookup(self: *const BitmapFont, codepoint: u32) ?Glyph {
         return self.glyphs.get(codepoint);
     }
+
+    // ── 共通 Font インターフェース（TASK-25.14） ──
+    const vtable: Font.VTable = .{ .measure = measureImpl, .drawTo = drawToImpl, .metrics = metricsImpl };
+
+    /// mutable でなくてよい（borrowed view）。BitmapFont は size-baked＝FontFace/SizedFont 一体。
+    pub fn asFont(self: *const BitmapFont) Font {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn measureImpl(ptr: *const anyopaque, text_str: []const u8) u32 {
+        const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
+        return self.measure(text_str);
+    }
+    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect) void {
+        const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
+        self.drawTo(target, pos, text_str, col, clip);
+    }
+    fn metricsImpl(ptr: *const anyopaque) Metrics {
+        const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
+        return self.metrics();
+    }
+
+    pub fn metrics(self: BitmapFont) Metrics {
+        // ascent は不変条件（0<=ascent<=line_height）のため clamp。実 BDF は ascent<=line_height で無効。
+        const a: i32 = @intCast(@min(self.ascent, self.line_height));
+        const descent: u32 = self.line_height - @as(u32, @intCast(a));
+        return .{ .line_height = self.line_height, .ascent = a, .descent = @intCast(descent) };
+    }
+
+    /// 欠落グリフの既定送り幅: space の advance、無ければ line_height/2。measure/drawTo で同一規約。
+    fn defaultAdvance(self: BitmapFont) u32 {
+        if (self.lookup(' ')) |sp| return sp.advance;
+        return self.line_height / 2;
+    }
+
+    /// logical advance 幅の合計（saturating）。1 行ラン（\n/\t も通常 codepoint 扱い＝欠落 advance）。
+    pub fn measure(self: BitmapFont, text_str: []const u8) u32 {
+        const def = self.defaultAdvance();
+        var total: u32 = 0;
+        if (std.unicode.Utf8View.init(text_str)) |view| {
+            var it = view.iterator();
+            while (it.nextCodepoint()) |cp| {
+                total +|= if (self.lookup(cp)) |g| g.advance else def;
+            }
+        } else |_| {
+            for (text_str) |b| total +|= if (self.lookup(b)) |g| g.advance else def;
+        }
+        return total;
+    }
+
+    pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect) void {
+        const def = self.defaultAdvance();
+        const ascent: i32 = @intCast(@min(self.ascent, self.line_height));
+        var cx = pos.x;
+        if (std.unicode.Utf8View.init(text_str)) |view| {
+            var it = view.iterator();
+            while (it.nextCodepoint()) |cp| cx = self.drawCodepoint(target, cp, cx, pos.y, ascent, col, clip, def);
+        } else |_| {
+            for (text_str) |b| cx = self.drawCodepoint(target, b, cx, pos.y, ascent, col, clip, def);
+        }
+    }
+
+    /// 1 codepoint を描画し次の pen_x（飽和加算）を返す。欠落グリフは描画 skip・advance=def。
+    fn drawCodepoint(self: BitmapFont, target: RenderTarget, cp: u32, cx: i32, pos_y: i32, ascent: i32, col: Color, clip: Rect, def: u32) i32 {
+        const g = self.lookup(cp) orelse return cx +| advI32(def);
+        if (g.width == 0 or g.height == 0) return cx +| advI32(g.advance);
+        // baseline = pos.y + ascent、glyph top = baseline - (height + y_offset)（旧 drawGlyph と同式）
+        const baseline: i32 = pos_y +| ascent;
+        const dst_x0: i32 = cx +| g.x_offset;
+        const dst_y0: i32 = baseline -| @as(i32, @intCast(g.height)) -| g.y_offset;
+        const row_bytes: u32 = (g.width + 7) / 8;
+        var py: u32 = 0;
+        while (py < g.height) : (py += 1) {
+            const row_start: usize = @as(usize, py) * row_bytes;
+            var px: u32 = 0;
+            while (px < g.width) : (px += 1) {
+                const byte_idx: usize = px / 8;
+                const bit_idx: u3 = @intCast(7 - (px % 8));
+                if ((g.bitmap[row_start + byte_idx] >> bit_idx) & 1 == 0) continue;
+                plotCoverage(target, dst_x0 +| @as(i32, @intCast(px)), dst_y0 +| @as(i32, @intCast(py)), col, 255, clip);
+            }
+        }
+        return cx +| advI32(g.advance);
+    }
 };
+
+/// u32 advance を i32 へ（飽和加算の右辺用に maxInt(i32) へ clamp）。
+fn advI32(a: u32) i32 {
+    return @intCast(@min(a, @as(u32, std.math.maxInt(i32))));
+}
 
 pub const LoadError = error{ InvalidBdf, OutOfMemory };
 
@@ -293,125 +392,6 @@ fn parseTokenU32(it: *std.mem.TokenIterator(u8, .any)) !u32 {
 fn parseTokenI32(it: *std.mem.TokenIterator(u8, .any)) !i32 {
     const tok = it.next() orelse return error.InvalidCharacter;
     return try std.fmt.parseInt(i32, tok, 10);
-}
-
-// =====================================================================
-// Drawing
-// =====================================================================
-
-/// 1 グリフ描画。codepoint がフォントに無ければサイレントスキップ。
-/// 描画基準点 (x, y) は行の左上 (top-left of line box)。
-/// fg_color は不透明 (alpha=0xFF) を前提とし、立っている bit にそのまま書き込む。
-pub fn drawGlyph(
-    framebuffer: []u32,
-    fb_w: u32,
-    fb_h: u32,
-    font: *const BitmapFont,
-    codepoint: u32,
-    x: i32,
-    y: i32,
-    fg_color: u32,
-) void {
-    const g = font.lookup(codepoint) orelse return;
-    if (g.width == 0 or g.height == 0) return;
-
-    // dst_y0 = y + ascent - height - y_offset
-    // ascent: u32, height/y_offset: i32 の混在による underflow を避けるため明示キャスト
-    const ascent_i32: i32 = @intCast(font.ascent);
-    const height_i32: i32 = @intCast(g.height);
-    const dst_x0: i32 = x + g.x_offset;
-    const dst_y0: i32 = y + ascent_i32 - height_i32 - g.y_offset;
-
-    const fb_w_i32: i32 = @intCast(fb_w);
-    const fb_h_i32: i32 = @intCast(fb_h);
-    const row_bytes: u32 = (g.width + 7) / 8;
-
-    var py: u32 = 0;
-    while (py < g.height) : (py += 1) {
-        const dy = dst_y0 + @as(i32, @intCast(py));
-        if (dy < 0 or dy >= fb_h_i32) continue;
-        const row_start: usize = @as(usize, py) * row_bytes;
-
-        var px: u32 = 0;
-        while (px < g.width) : (px += 1) {
-            const byte_idx: usize = px / 8;
-            const bit_idx: u3 = @intCast(7 - (px % 8));
-            const bit_set = (g.bitmap[row_start + byte_idx] >> bit_idx) & 1 != 0;
-            if (!bit_set) continue;
-
-            const dx = dst_x0 + @as(i32, @intCast(px));
-            if (dx < 0 or dx >= fb_w_i32) continue;
-
-            const fb_idx: usize = @as(usize, @intCast(dy)) * @as(usize, fb_w) + @as(usize, @intCast(dx));
-            framebuffer[fb_idx] = fg_color;
-        }
-    }
-}
-
-/// ASCII 文字列を描画 (現状 ASCII-only。将来は別 API drawTextUtf8 を追加予定)
-///   '\n'   -> y を line_height 進めて x を初期値にリセット
-///   '\t'   -> x を tab_advance×4 進める。tab_advance はスペース glyph の advance、
-///            無ければ font.line_height を fallback として使用
-///   その他非印字 ASCII / 非 ASCII バイト -> スキップ (advance しない)
-pub fn drawText(
-    framebuffer: []u32,
-    fb_w: u32,
-    fb_h: u32,
-    font: *const BitmapFont,
-    text_str: []const u8,
-    x: i32,
-    y: i32,
-    fg_color: u32,
-) void {
-    const tab_advance: u32 = if (font.lookup(' ')) |sp| sp.advance else font.line_height;
-    var cx = x;
-    var cy = y;
-    for (text_str) |ch| {
-        switch (ch) {
-            '\n' => {
-                cx = x;
-                cy += @intCast(font.line_height);
-            },
-            '\t' => {
-                cx += @intCast(tab_advance * 4);
-            },
-            0x20...0x7E => {
-                drawGlyph(framebuffer, fb_w, fb_h, font, ch, cx, cy, fg_color);
-                if (font.lookup(ch)) |g| {
-                    cx += @intCast(g.advance);
-                } else {
-                    cx += @intCast(font.line_height / 2);
-                }
-            },
-            else => {}, // 非印字 ASCII / 非 ASCII バイト: スキップ
-        }
-    }
-}
-
-/// '\n' でリセットして、最長行の advance 合計を返す (ASCII-only)
-pub fn measureWidth(font: *const BitmapFont, text_str: []const u8) u32 {
-    const tab_advance: u32 = if (font.lookup(' ')) |sp| sp.advance else font.line_height;
-    var cur: u32 = 0;
-    var max: u32 = 0;
-    for (text_str) |ch| {
-        switch (ch) {
-            '\n' => {
-                if (cur > max) max = cur;
-                cur = 0;
-            },
-            '\t' => cur += tab_advance * 4,
-            0x20...0x7E => {
-                if (font.lookup(ch)) |g| {
-                    cur += g.advance;
-                } else {
-                    cur += font.line_height / 2;
-                }
-            },
-            else => {},
-        }
-    }
-    if (cur > max) max = cur;
-    return max;
 }
 
 // =====================================================================
@@ -842,7 +822,7 @@ test "loadBdf: invalid BBX returns InvalidBdf and does not leak" {
     try std.testing.expectError(error.InvalidBdf, BitmapFont.initFromBdf(allocator, data));
 }
 
-test "drawGlyph: pixel placement & clipping (left/top corner)" {
+test "drawTo: pixel placement & clipping (left/top corner)" {
     const allocator = std.testing.allocator;
     const data =
         \\STARTFONT 2.1
@@ -863,37 +843,36 @@ test "drawGlyph: pixel placement & clipping (left/top corner)" {
     ;
     var font = try BitmapFont.initFromBdf(allocator, data);
     defer font.deinit(allocator);
+    const white = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // @bitCast → 0xFFFFFFFF
+    const clip = Rect{ .x = 0, .y = 0, .w = 4, .h = 4 };
 
+    // ascent=4(=bbox 4 + yoff 0), height=4, yoff=0 → baseline=0+4, glyph top=4-4=0。4x4 全塗り。
     var fb: [16]u32 = @splat(0);
-    drawGlyph(&fb, 4, 4, &font, 'A', 0, 0, 0xFFFFFFFF);
-    // 4x4 全部塗られる
+    font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A", white, clip);
     for (fb) |p| try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), p);
 
-    // クリッピング: dst を (-2, -2) に置くと、glyph の右下 2x2 が fb の左上 2x2 に描画される
+    // pos(-2,-2): glyph は fb 座標 x,y ∈ [-2,1] を占める → 左上 2x2 のみ in-bounds。
     var fb2: [16]u32 = @splat(0);
-    drawGlyph(&fb2, 4, 4, &font, 'A', -2, -2, 0xFFFFFFFF);
-    // 左上 2x2 だけ塗られる
+    font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = -2, .y = -2 }, "A", white, clip);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0 * 4 + 0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0 * 4 + 1]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[1 * 4 + 0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[1 * 4 + 1]);
-    // 右下は塗られていない
-    try std.testing.expectEqual(@as(u32, 0), fb2[3 * 4 + 3]);
+    try std.testing.expectEqual(@as(u32, 0), fb2[3 * 4 + 3]); // 右下は範囲外
 
     // 完全画面外: クラッシュしない
     var fb3: [16]u32 = @splat(0);
-    drawGlyph(&fb3, 4, 4, &font, 'A', 100, 100, 0xFFFFFFFF);
-    drawGlyph(&fb3, 4, 4, &font, 'A', -100, -100, 0xFFFFFFFF);
+    font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = 100, .y = 100 }, "A", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = -100, .y = -100 }, "A", white, clip);
     for (fb3) |p| try std.testing.expectEqual(@as(u32, 0), p);
 
-    // 右下 partial offscreen: クラッシュしない
+    // 右下 partial offscreen: (3,3) のみ
     var fb4: [16]u32 = @splat(0);
-    drawGlyph(&fb4, 4, 4, &font, 'A', 3, 3, 0xFFFFFFFF);
-    // 左上 (3,3) のピクセルだけ塗られる
+    font.asFont().drawTo(.{ .pixels = &fb4, .width = 4, .height = 4 }, .{ .x = 3, .y = 3 }, "A", white, clip);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb4[3 * 4 + 3]);
 }
 
-test "drawText: handles newline" {
+test "drawTo: 1 行ラン（\\n は改行せず通常 codepoint 扱い）" {
     const allocator = std.testing.allocator;
     const data =
         \\STARTFONT 2.1
@@ -911,26 +890,43 @@ test "drawText: handles newline" {
     ;
     var font = try BitmapFont.initFromBdf(allocator, data);
     defer font.deinit(allocator);
+    const white = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    const clip = Rect{ .x = 0, .y = 0, .w = 4, .h = 4 };
 
+    // "AA": 同一行に 2 dot（baseline=0+1, top=1-1=0 → row 0）。2 行目には行かない。
     var fb: [16]u32 = @splat(0);
-    drawText(&fb, 4, 4, &font, "AA\nAA", 0, 0, 0xFFFFFFFF);
+    font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "AA", white, clip);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[1]);
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[4]);
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[5]);
+    try std.testing.expectEqual(@as(u32, 0), fb[4]); // 2 行目は空（単一行ラン）
+    try std.testing.expectEqual(@as(u32, 0), fb[5]);
+
+    // "A\nA": \n は欠落 glyph 扱い（改行しない）。両 dot とも row 0。
+    var fb2: [16]u32 = @splat(0);
+    font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A\nA", white, clip);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0]); // row 0 に描かれる
+    try std.testing.expectEqual(@as(u32, 0), fb2[4]); // 2 行目には行かない
 }
 
-test "measureWidth: max line width across newlines" {
+test "measure / metrics: 単一行 advance 合計とメトリクス" {
     const allocator = std.testing.allocator;
     const data =
         \\STARTFONT 2.1
-        \\FONTBOUNDINGBOX 8 8 0 0
+        \\FONTBOUNDINGBOX 8 16 0 -4
         \\CHARS 1
         \\STARTCHAR A
         \\ENCODING 65
         \\DWIDTH 8 0
-        \\BBX 8 8 0 0
+        \\BBX 8 16 0 -4
         \\BITMAP
+        \\00
+        \\00
+        \\00
+        \\00
+        \\00
+        \\00
+        \\00
+        \\00
         \\00
         \\00
         \\00
@@ -946,7 +942,13 @@ test "measureWidth: max line width across newlines" {
     var font = try BitmapFont.initFromBdf(allocator, data);
     defer font.deinit(allocator);
 
-    try std.testing.expectEqual(@as(u32, 24), measureWidth(&font, "AAA"));
-    try std.testing.expectEqual(@as(u32, 24), measureWidth(&font, "AAA\nAA"));
-    try std.testing.expectEqual(@as(u32, 32), measureWidth(&font, "AA\nAAAA\nA"));
+    // measure は単一行の advance 合計（\n 跨ぎの max ではない）
+    try std.testing.expectEqual(@as(u32, 24), font.measure("AAA"));
+    try std.testing.expectEqual(@as(u32, 8), font.measure("A"));
+
+    // metrics: line_height=16, ascent=16+(-4)=12, descent=16-12=4
+    const m = font.metrics();
+    try std.testing.expectEqual(@as(u32, 16), m.line_height);
+    try std.testing.expectEqual(@as(i32, 12), m.ascent);
+    try std.testing.expectEqual(@as(i32, 4), m.descent);
 }

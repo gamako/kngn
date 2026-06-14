@@ -2,17 +2,20 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
+const font_mod = @import("font.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Color = color_mod.Color;
+pub const Font = font_mod.Font;
 
 pub const DrawCmd = union(enum) {
     rect_filled: struct { rect: Rect, color: Color, clip: Rect },
     rect_outline: struct { rect: Rect, color: Color, thickness: u32, clip: Rect },
     line: struct { p0: Vec2, p1: Vec2, color: Color, thickness: u32, clip: Rect },
-    /// text は DrawList より長く生かした arena 上の slice を指すこと（caller 責任）
-    text: struct { pos: Vec2, text: []const u8, color: Color, clip: Rect },
+    /// text は DrawList より長く生かした arena 上の slice を指すこと（caller 責任）。
+    /// font が null なら render() に渡した既定フォントで描画する（override 用）。
+    text: struct { pos: Vec2, text: []const u8, color: Color, clip: Rect, font: ?Font = null },
     /// pixels は DrawList より長く生かした caller 所有の slice を指すこと（caller 責任）
     image: struct { rect: Rect, pixels: []const u32, src_w: u32, src_h: u32, clip: Rect },
 };
@@ -73,13 +76,20 @@ pub const DrawList = struct {
         } });
     }
 
-    /// str は DrawList より長く生かした arena 上の文字列を指すこと
+    /// str は DrawList より長く生かした arena 上の文字列を指すこと。
+    /// 描画フォントは render() に渡した既定フォント。
     pub fn text(self: *DrawList, pos: Vec2, str: []const u8, col: Color) Allocator.Error!void {
+        try self.textEx(pos, str, col, null);
+    }
+
+    /// font override 付き text。font が null なら既定フォントで描画する。
+    pub fn textEx(self: *DrawList, pos: Vec2, str: []const u8, col: Color, font: ?Font) Allocator.Error!void {
         try self.cmds.append(self.alloc, .{ .text = .{
             .pos = pos,
             .text = str,
             .color = col,
             .clip = self.currentClip(),
+            .font = font,
         } });
     }
 

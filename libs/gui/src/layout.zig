@@ -23,6 +23,7 @@ pub const Vec2 = geom.Vec2;
 pub const Color = color_mod.Color;
 pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
+pub const Font = font_mod.Font;
 pub const Id = id_mod.Id;
 
 pub const Direction = enum { row, column };
@@ -64,9 +65,9 @@ pub const BoxConfig = struct {
 pub const CustomDrawFn = *const fn (ctx: *anyopaque, dl: *DrawList, rect: Rect) void;
 
 pub const LeafKind = union(enum) {
-    /// font は measure 用の override のみ（null なら Context の font）。
-    /// 描画は render() に渡したフォントで行われる点に注意。
-    text: struct { str: []const u8, color: Color, font: ?*const BitmapFont },
+    /// font は override（null なら Context の font）。measure と draw（draw cmd の font）の
+    /// 両方に効く（emitNode が draw cmd へ font を運ぶ）。
+    text: struct { str: []const u8, color: Color, font: ?Font },
     custom: struct { measured: Vec2, draw_fn: CustomDrawFn, ctx: *anyopaque },
 };
 
@@ -153,13 +154,13 @@ fn percentOf(content: i32, f: f32) i32 {
 
 /// 測定パス（帰りがけ DFS）。leaf は内容サイズ、box は fixed / fit を解決。
 /// grow / percent はこの段階では 0（親が fit のときは 0 として畳まれる）。
-pub fn measure(node: *Node, default_font: *const BitmapFont) void {
+pub fn measure(node: *Node, default_font: Font) void {
     if (node.leaf) |leaf| {
         switch (leaf) {
             .text => |t| {
                 const f = t.font orelse default_font;
                 node.measured_w = @intCast(f.measure(t.str));
-                node.measured_h = f.glyph_h;
+                node.measured_h = @intCast(f.metrics().line_height);
             },
             .custom => |c| {
                 node.measured_w = @max(0, c.measured.x);
@@ -278,7 +279,26 @@ pub fn place(node: *Node, rect: Rect) void {
 // Tests
 // ============================================================
 
-const test_font = &font_mod.default_font;
+const test_font = font_mod.default_font;
+
+// width/height ともに既定と異なる override 用テストフォント（advance=16, line_height=24）。
+const override_dummy: u8 = 0;
+const override_vt: Font.VTable = .{
+    .measure = struct {
+        fn f(_: *const anyopaque, text: []const u8) u32 {
+            return 16 * @as(u32, @intCast(text.len)); // ASCII テスト前提
+        }
+    }.f,
+    .drawTo = struct {
+        fn f(_: *const anyopaque, _: geom.RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect) void {}
+    }.f,
+    .metrics = struct {
+        fn f(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 24, .ascent = 20, .descent = 4 };
+        }
+    }.f,
+};
+const override_font: Font = .{ .ptr = &override_dummy, .vtable = &override_vt };
 
 test "measure: row の fit（gap + padding 込み）" {
     var root: Node = .{ .cfg = .{ .direction = .row, .padding = .{ 2, 3, 4, 5 }, .gap = 7 } };
@@ -341,6 +361,17 @@ test "measure: text leaf は font 由来（8×len, glyph_h）" {
     measure(&t, test_font);
     try std.testing.expectEqual(@as(i32, 40), t.measured_w);
     try std.testing.expectEqual(@as(i32, 16), t.measured_h);
+}
+
+test "measure: leaf override font が width/height 両方に効く" {
+    var t: Node = .{ .leaf = .{ .text = .{
+        .str = "ab",
+        .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+        .font = override_font, // advance=16, line_height=24
+    } } };
+    measure(&t, test_font);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_w); // 16 * 2（override の advance）
+    try std.testing.expectEqual(@as(i32, 24), t.measured_h); // override の line_height
 }
 
 test "place: fixed + percent + grow(1:2) の混合配分" {
