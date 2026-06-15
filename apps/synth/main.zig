@@ -22,14 +22,14 @@ const NOTE_LOW = 60; // C4
 const NOTE_HIGH = 72; // C5
 const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
-// レイアウト
-const WIN_W = 560;
-const WIN_H = 380;
+// レイアウト（コントロールパネルは 2 カラム。パネル下にスペクトログラム、最下部に鍵盤）
+const WIN_W = 640;
+const WIN_H = 440;
 const SPEC_X0 = 20;
-const SPEC_Y0 = 210;
-const SPEC_W = 520;
-const SPEC_H = 100;
-const PIANO_Y0 = 320;
+const SPEC_Y0 = 250;
+const SPEC_W = 600;
+const SPEC_H = 120;
+const PIANO_Y0 = 380;
 const PIANO_H = 55;
 
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
@@ -62,10 +62,15 @@ fn pianoHitTest(x: i32, y: i32) ?u8 {
     return @intCast(NOTE_LOW + idx);
 }
 
+/// framebuffer のピクセル u32 packing（gui.Color と同じ: メモリ R,G,B,A = u32 0xAABBGGRR）。
+fn rgba(r: u8, g: u8, b: u8, a: u8) u32 {
+    return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16) | (@as(u32, a) << 24);
+}
+
 fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool) void {
     const w: usize = fb.width;
     const h: usize = fb.height;
-    @memset(fb.pixels, 0xFF_10_10_18); // RGBA: 0x101018FF をリトルエンディアン u32 で
+    @memset(fb.pixels, rgba(0x10, 0x10, 0x18, 0xFF)); // 暗い背景
 
     // 画面鍵盤（下部）。白鍵/黒鍵を区別し、押下中はハイライト。
     var note: usize = NOTE_LOW;
@@ -75,8 +80,8 @@ fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool
         const x1 = (idx + 1) * w / NOTE_COUNT;
         const semitone = note % 12;
         const is_black = (semitone == 1 or semitone == 3 or semitone == 6 or semitone == 8 or semitone == 10);
-        const base: u32 = if (is_black) 0xFF_30_30_38 else 0xFF_C8_C8_D0;
-        const lit: u32 = 0xFF_FF_C0_40; // 押下中
+        const base: u32 = if (is_black) rgba(0x30, 0x30, 0x38, 0xFF) else rgba(0xC8, 0xC8, 0xD0, 0xFF);
+        const lit: u32 = rgba(0xFF, 0xC0, 0x40, 0xFF); // 押下中(アンバー)
         const col = if (pressed[note]) lit else base;
         var y: usize = PIANO_Y0;
         while (y < @min(PIANO_Y0 + PIANO_H, h)) : (y += 1) {
@@ -222,26 +227,34 @@ pub fn main() !void {
             spec.feed(mono[0..frames]);
         }
 
-        // GUI コントロールパネル（上部）を構築
+        // GUI コントロールパネル（上部）を構築。スライダは 2 カラムでパネルを低く保つ。
         ctx.beginBox(.{
             .direction = .column,
-            .padding = .{ 12, 12, 12, 12 },
+            .padding = .{ 10, 10, 10, 10 },
             .gap = 6,
             .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
         });
         ctx.label("Synth controls (drag knobs):");
+        ctx.beginBox(.{ .direction = .row, .gap = 18 });
+        // 左カラム: オシレータ/アンプ + キートラック
+        ctx.beginBox(.{ .direction = .column, .gap = 4 });
         _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &params.cutoff, .{ .min = 100, .max = 18000, .step = 10 });
         _ = ctx.sliderF32Id(0x6002, "Resonance", &params.resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
         _ = ctx.sliderF32Id(0x6003, "Gain     ", &params.gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6004, "Attack   ", &params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6005, "Release  ", &params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
+        ctx.endBox();
+        // 右カラム: フィルタ env + LFO
+        ctx.beginBox(.{ .direction = .column, .gap = 4 });
         _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
         _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6009, "FEnvDec  ", &params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x600A, "LFO Rate ", &params.lfo_rate, .{ .min = 0.1, .max = 20, .step = 0.1 });
         _ = ctx.sliderF32Id(0x600B, "Vibrato  ", &params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
         _ = ctx.sliderF32Id(0x600C, "Tremolo  ", &params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
+        ctx.endBox();
+        ctx.endBox();
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
         const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
         if (ctx.button(wlabel)) params.wave_idx = (params.wave_idx + 1) % WAVE_NAMES.len;

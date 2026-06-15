@@ -88,11 +88,11 @@ fn magToIntensity(mag: f32) u8 {
 }
 
 fn intensityColor(v: u8) u32 {
-    // 黒→青→シアン→白 のヒート風ランプ（RGBA8888 = 0xRRGGBBAA）
+    // 黒→青→シアン→白 のヒート風ランプ。framebuffer 形式 0xAABBGGRR（u32 = r|g<<8|b<<16|a<<24）。
     const r: u32 = if (v > 128) @as(u32, (v - 128)) * 2 else 0;
     const g: u32 = v;
     const b: u32 = @min(255, 64 + @as(u32, v) * 2);
-    return (r << 24) | (g << 16) | (b << 8) | 0xFF;
+    return r | (g << 8) | (b << 16) | (@as(u32, 0xFF) << 24);
 }
 
 // ============================================================================
