@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const blend = @import("blend.zig");
+const bezier = @import("bezier.zig");
 
 pub const Vec2 = struct { x: i32, y: i32 };
 pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
@@ -103,6 +104,15 @@ pub fn screenToCanvasRaw(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) Vec2 {
     return .{
         .x = @divFloor(screen_pos.x - canvas_rect.x, zoom),
         .y = @divFloor(screen_pos.y - canvas_rect.y, zoom),
+    };
+}
+
+/// window 座標 → canvas 論理座標（f32, clamp なし）。ベジェ等の連続座標編集用。
+pub fn screenToCanvasF(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) bezier.Vec2f {
+    const z: f32 = @floatFromInt(zoom);
+    return .{
+        .x = @as(f32, @floatFromInt(screen_pos.x - canvas_rect.x)) / z,
+        .y = @as(f32, @floatFromInt(screen_pos.y - canvas_rect.y)) / z,
     };
 }
 

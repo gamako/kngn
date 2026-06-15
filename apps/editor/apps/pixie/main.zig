@@ -18,6 +18,8 @@ const core = @import("core");
 const png_decoder = @import("png-decoder");
 const canvas_input = @import("canvas_input.zig");
 const palette_mod = @import("palette.zig");
+const bezier_input = @import("bezier_input.zig");
+const bezier_overlay = @import("bezier_overlay.zig");
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -45,12 +47,14 @@ const ToolKind = enum {
     pen,
     eraser,
     brush,
+    bezier,
 
     fn name(self: ToolKind) []const u8 {
         return switch (self) {
             .pen => "Pen",
             .eraser => "Eraser",
             .brush => "Brush",
+            .bezier => "Bezier",
         };
     }
 };
@@ -93,11 +97,17 @@ const App = struct {
     gpa: std.mem.Allocator,
     canvas: core.Canvas,
     recorder: core.StrokeRecorder,
+    /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
+    preview_canvas: core.Canvas,
+    preview_rec: core.StrokeRecorder,
     undo: core.UndoStack = .{},
     pen: core.Pen,
     eraser: core.Eraser = .{},
     brush: core.Brush,
     input: canvas_input.CanvasInput = .{},
+    /// ベジェ(ペン)ツール（独立経路。TASK-21.13）。状態機械 + マウス入力アダプタ。
+    bezier_editor: core.PathEditor = .{},
+    bez_in: bezier_input.BezierInput = .{},
     active_kind: ToolKind = .pen,
     /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
     brush_size_i32: i32 = 8,
@@ -128,7 +138,18 @@ const App = struct {
             .pen => self.pen.tool(),
             .eraser => self.eraser.tool(),
             .brush => self.brush.tool(),
+            .bezier => self.pen.tool(), // bezier は独立経路で canvas_input を経由しない（到達しないフォールバック）
         };
+    }
+
+    /// ツール切替を一元化（active_kind への代入は全てここ経由）。
+    /// capture 中は切替しない（既存 stroke を宙ぶらりんにしない）。.bezier から出る時は未確定パスを cancel。
+    fn setActiveKind(self: *App, next: ToolKind) void {
+        if (self.input.capturing) return;
+        if (self.active_kind == .bezier and next != .bezier) {
+            self.bezier_editor.update(self.gpa, .cancel);
+        }
+        self.active_kind = next;
     }
 
     fn setSaveMsg(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -264,7 +285,7 @@ const App = struct {
     /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
     /// 進行中 stroke 中は破棄。undo/redo はクリアし、current_path を開いたファイルに更新。
     fn doOpen(self: *App) void {
-        if (self.input.capturing) return;
+        if (self.input.capturing or self.bezier_editor.isEditing()) return;
         const maybe = platform.openFileDialog(self.gpa, .{ .allowed_ext = "png" }) catch |err| {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
             return;
@@ -299,21 +320,34 @@ const App = struct {
 
     /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）
     fn doUndo(self: *App) void {
-        if (self.input.capturing) return;
+        if (self.input.capturing or self.bezier_editor.isEditing()) return;
         self.undo.undoOne(self.gpa, &self.canvas);
     }
 
     fn doRedo(self: *App) void {
-        if (self.input.capturing) return;
+        if (self.input.capturing or self.bezier_editor.isEditing()) return;
         self.undo.redoOne(self.gpa, &self.canvas);
     }
 
     fn doClear(self: *App) void {
-        if (self.input.capturing) return;
+        if (self.input.capturing or self.bezier_editor.isEditing()) return;
         self.undo.pushClear(self.gpa, &self.canvas, 0);
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
+        // ベジェ編集中はツール固有キーを横取り（Enter=確定 / Esc=キャンセル / Delete・Backspace=点削除）
+        if (self.active_kind == .bezier and self.bezier_editor.isEditing()) {
+            if (k.key == .ENTER or k.key == .KP_ENTER) {
+                self.commitBezier();
+                return;
+            } else if (k.key == .ESCAPE) {
+                self.bezier_editor.update(self.gpa, .cancel);
+                return;
+            } else if (k.key == .DELETE or k.key == .BACKSPACE) {
+                self.bezier_editor.update(self.gpa, .delete);
+                return;
+            }
+        }
         if (k.key == .ESCAPE) {
             self.running = false;
         } else if (k.key == .Q and k.modifiers.cmd) {
@@ -329,11 +363,21 @@ const App = struct {
         } else if (k.key == .Z and k.modifiers.cmd) {
             self.doUndo();
         } else if (k.key == .B) {
-            self.active_kind = .pen;
+            self.setActiveKind(.pen);
         } else if (k.key == .E) {
-            self.active_kind = .eraser;
+            self.setActiveKind(.eraser);
+        } else if (k.key == .P) {
+            self.setActiveKind(.bezier);
         } else if (k.key == .C) {
             self.doClear();
+        }
+    }
+
+    /// ベジェ確定（現在ブラシ footprint + color/opacity で rasterize → UndoStack へ push）。
+    fn commitBezier(self: *App) void {
+        const dab = self.brush.footprint();
+        if (self.bezier_editor.rasterizeCommit(&self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |cmd| {
+            self.undo.push(self.gpa, cmd);
         }
     }
 };
@@ -457,7 +501,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
                     .size = 22,
                 }).clicked) {
                     app.palette.select(idx); // HSV は次フレームで再同期
-                    if (app.active_kind == .eraser) app.active_kind = .pen; // 色は pen 用
+                    if (app.active_kind == .eraser) app.setActiveKind(.pen); // 色は pen 用（brush/bezier は維持）
                 }
                 idx += 1;
             }
@@ -478,13 +522,17 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     ctx.endBox();
 
     ctx.label("Tool");
+    // 4 ツールは右ペイン幅に収めるため 2 行に折り返す
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.active_kind = .pen;
-    if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.active_kind = .eraser;
-    if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.active_kind = .brush;
+    if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.setActiveKind(.pen);
+    if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.setActiveKind(.eraser);
     ctx.endBox();
-    // Brush 選択時のみ Size/Opacity/Hardness の Slider を表示
-    if (app.active_kind == .brush) {
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.setActiveKind(.brush);
+    if (ctx.buttonEx("Bezier", .{ .selected = app.active_kind == .bezier, .min_w = 56 }).clicked) app.setActiveKind(.bezier);
+    ctx.endBox();
+    // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
+    if (app.active_kind == .brush or app.active_kind == .bezier) {
         _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
         _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
         _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
@@ -538,11 +586,17 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
         ctx.style.text_subtle,
     );
-    if (app.active_kind == .brush) {
+    if (app.active_kind == .brush or app.active_kind == .bezier) {
         ctx.labelEx(
             try std.fmt.allocPrint(arena, "brush: sz={d} op={d} hard={d:.2}", .{
                 app.brush.size, app.brush.opacity, app.brush_hardness_f32,
             }),
+            ctx.style.text_subtle,
+        );
+    }
+    if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
+        ctx.labelEx(
+            try std.fmt.allocPrint(arena, "anchors: {d}", .{app.bezier_editor.path.anchors.items.len}),
             ctx.style.text_subtle,
         );
     }
@@ -569,6 +623,8 @@ pub fn main(init: std.process.Init) !void {
         .gpa = gpa,
         .canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
         .recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
+        .preview_canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
+        .preview_rec = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
         .palette = try palette_mod.Palette.initDb16(gpa),
         .pen = .{ .color = 0 },
         .brush = .{ .color = 0 },
@@ -578,6 +634,9 @@ pub fn main(init: std.process.Init) !void {
     defer {
         if (app.current_path) |p| gpa.free(p);
         if (app.palette_path) |p| gpa.free(p);
+        app.bezier_editor.deinit(gpa);
+        app.preview_rec.deinit(gpa);
+        app.preview_canvas.deinit();
         app.palette.deinit(gpa);
         app.undo.deinit(gpa);
         app.recorder.deinit(gpa);
@@ -609,26 +668,54 @@ pub fn main(init: std.process.Init) !void {
             try buildUi(&ctx, &app, canvas_rect);
             ctx.endFrame();
 
-            // ── canvas 入力（press 起点 capture。状態機械は canvas_input.zig） ──
+            // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
             {
                 const in = &ctx.input;
-                const frame: canvas_input.CanvasInput.Frame = .{
-                    .canvas_rect = canvas_rect,
-                    .zoom = ZOOM,
-                    .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                    .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                    .pressed_left = in.mouse_pressed.left,
-                    .released_left = in.mouse_released.left,
-                };
-                if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
-                    app.undo.push(gpa, cmd);
+                if (app.active_kind == .bezier and !app.input.capturing) {
+                    const frame: bezier_input.BezierInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = ZOOM,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .pressed_left = in.mouse_pressed.left,
+                        .released_left = in.mouse_released.left,
+                        .time = platform.getTime(),
+                    };
+                    const dab = app.brush.footprint();
+                    if (app.bez_in.update(frame, &app.bezier_editor, &app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |cmd| {
+                        app.undo.push(gpa, cmd);
+                    }
+                } else {
+                    const frame: canvas_input.CanvasInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = ZOOM,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .pressed_left = in.mouse_pressed.left,
+                        .released_left = in.mouse_released.left,
+                    };
+                    if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
+                        app.undo.push(gpa, cmd);
+                    }
                 }
             }
 
             // ── 描画: bg → canvas blit → GUI（上に重ねる） ──
             @memset(fb.pixels, COLOR_WINDOW_BG);
             if (canvas_rect) |rect| {
-                blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.composite(), rect);
+                if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
+                    // 確定前ブラシプレビュー: 本 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
+                    @memcpy(app.preview_canvas.layerPixels(0), app.canvas.layerPixels(0));
+                    const dab = app.brush.footprint();
+                    app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
+                    blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.composite(), rect);
+                } else {
+                    blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.composite(), rect);
+                }
+            }
+            // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる）
+            if (app.active_kind == .bezier) {
+                if (canvas_rect) |rect| bezier_overlay.draw(&ctx, &app.bezier_editor, rect, ZOOM);
             }
             gui.render(
                 .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },

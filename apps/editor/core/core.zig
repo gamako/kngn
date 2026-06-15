@@ -10,6 +10,7 @@ pub const Vec2 = canvas.Vec2;
 pub const Rect = canvas.Rect;
 pub const screenToCanvas = canvas.screenToCanvas;
 pub const screenToCanvasRaw = canvas.screenToCanvasRaw;
+pub const screenToCanvasF = canvas.screenToCanvasF;
 pub const encodePNG = io_png.encodePNG;
 pub const savePNG = io_png.savePNG;
 
@@ -28,3 +29,14 @@ pub const ToolPoint = tool.ToolPoint;
 pub const Pen = tool.Pen;
 pub const Eraser = tool.Eraser;
 pub const Brush = tool.Brush;
+
+// ベジェ / ベクターパス（TASK-21.13）
+pub const bezier = @import("bezier.zig");
+pub const Vec2f = bezier.Vec2f;
+pub const Cubic = bezier.Cubic;
+pub const path = @import("path.zig");
+pub const Path = path.Path;
+pub const PathHit = path.Hit;
+pub const path_editor = @import("path_editor.zig");
+pub const PathEditor = path_editor.PathEditor;
+pub const PathInput = path_editor.Input;

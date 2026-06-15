@@ -9,8 +9,11 @@
 |---|---|
 | `canvas.zig` | `Canvas`（レイヤ配列・合成・座標変換）、`Layer` / `Vec2` / `Rect` |
 | `undo.zig` | `StrokeRecorder`（stroke 記録機械）、`UndoStack` / `UndoCmd` / `PixelDiff` |
-| `tool.zig` | `Tool`（vtable 抽象）、`ToolEvent` / `ToolPoint`、`Pen` / `Eraser` |
+| `tool.zig` | `Tool`（vtable 抽象）、`ToolEvent` / `ToolPoint`、`Pen` / `Eraser` / `Brush` |
 | `io_png.zig` | `encodePNG` / `savePNG`（PNG 出力） |
+| `bezier.zig` | 3次ベジェ `Cubic` の評価・適応平坦化、`Vec2f`（TASK-21.13） |
+| `path.zig` | `Path`（アンカー + in/out ハンドル）・`hitTest`・`rasterize`（TASK-21.13） |
+| `path_editor.zig` | `PathEditor`（ベジェ編集状態機械。pixie が駆動）（TASK-21.13） |
 
 ## 不変条件：表示=composite / 保存=raw
 
@@ -75,6 +78,19 @@ undo.undoOne(gpa, &canvas); // 取り消し
 `Tool.VTable`（`onEvent` / `reset`）を実装した struct を作り、`tool()` で `Tool` を返す。
 `onEvent` 内で `StrokeRecorder` を駆動し、`.up` で `finish` の戻り値（`?UndoCmd`）を返す。
 `Pen` / `Eraser` が最小の実装例（`tool.zig`）。OOM は `@panic`（error union を返さない契約）。
+
+## ベジェ/ベクターパス（TASK-21.13）
+
+`Path` は **ブラシ非依存の独立値**（アンカー + in/out ハンドルの列）。`PathEditor` が編集状態機械
+（配置 / ハンドルドラッグ / 後編集 / 点削除 / cancel）を担い、確定（`rasterizeCommit`）で flatten 点列を
+`StrokeRecorder` の **brush 経路**（21.11/21.12 の Dab スタンプ）へ流して AA ラスタライズする。
+描画色・ブラシ形状（footprint）・不透明度は呼び出し側が渡す（`Path`/`PathEditor` は Brush ツールに依存しない）。
+
+- 出力は破壊的ラスタライズで、確定後 `Path` は破棄する（MVP）。
+- **将来の拡張点**: `Path` がブラシ非依存の独立値なので、レイヤ機能導入時に
+  `VectorLayer { paths: []Path }` として保持でき、**再描画・ブラシ後切替・確定後の再編集**へ拡張できる。
+- pixie 側のプレビュー描画（`bezier_overlay.zig`）と入力アダプタ（`bezier_input.zig`）は GUI/platform 依存
+  のため core には置かない（core は数学・データ・状態機械・rasterize のみ）。
 
 ## 注意・メモリ所有
 

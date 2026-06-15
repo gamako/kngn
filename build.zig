@@ -139,6 +139,34 @@ pub fn build(b: *std.Build) void {
     const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
     const run_core_tool_test = b.addRunArtifact(core_tool_test);
 
+    // ベジェ/ベクターパス（TASK-21.13）。bezier=pure。path/path_editor は相対 import 先（undo/path の test）が
+    // png-decoder を使うため import 要（Zig は同一モジュール内 @import 先の test もコンパイルする）。
+    const core_bezier_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/bezier.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const core_bezier_test = b.addTest(.{ .root_module = core_bezier_mod });
+    const run_core_bezier_test = b.addRunArtifact(core_bezier_test);
+
+    const core_path_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/path.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_path_mod.addImport("png-decoder", example_modules.png_decoder);
+    const core_path_test = b.addTest(.{ .root_module = core_path_mod });
+    const run_core_path_test = b.addRunArtifact(core_path_test);
+
+    const core_path_editor_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/path_editor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_path_editor_mod.addImport("png-decoder", example_modules.png_decoder);
+    const core_path_editor_test = b.addTest(.{ .root_module = core_path_editor_mod });
+    const run_core_path_editor_test = b.addRunArtifact(core_path_editor_test);
+
     const canvas_input_core = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/core.zig"),
     });
@@ -150,6 +178,19 @@ pub fn build(b: *std.Build) void {
     canvas_input_mod.addImport("core", canvas_input_core);
     const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
     const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
+
+    // ベジェ入力アダプタ（TASK-21.13）。core を名前付き import（canvas_input と同型）
+    const bezier_input_core = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+    });
+    const bezier_input_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/bezier_input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bezier_input_mod.addImport("core", bezier_input_core);
+    const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
+    const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
 
     // pixie palette（モデル + GIMP .gpl）。pure（std のみ・import 不要）。
     const palette_test = b.addTest(.{
@@ -164,7 +205,11 @@ pub fn build(b: *std.Build) void {
     const test_core_step = b.step("test-core", "Run editor/core (undo + tool) and pixie input tests");
     test_core_step.dependOn(&run_core_undo_test.step);
     test_core_step.dependOn(&run_core_tool_test.step);
+    test_core_step.dependOn(&run_core_bezier_test.step);
+    test_core_step.dependOn(&run_core_path_test.step);
+    test_core_step.dependOn(&run_core_path_editor_test.step);
     test_core_step.dependOn(&run_canvas_input_test.step);
+    test_core_step.dependOn(&run_bezier_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
 
     // ========================================

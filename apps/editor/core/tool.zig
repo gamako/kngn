@@ -131,6 +131,13 @@ pub const Brush = struct {
         return .{ .offsets = self.offsets_buf[0..self.dab_len] };
     }
 
+    /// 現在のパラメータで footprint を生成して返す公開アクセサ。
+    /// ベジェ(TASK-21.13)等が「現在ブラシ形状」で rasterize するために使う（buildDab/dabRef は private のまま）。
+    pub fn footprint(self: *Brush) undo_mod.Dab {
+        self.buildDab();
+        return self.dabRef();
+    }
+
     /// footprint を生成（down 時）。半径 r=size/2 の AA ディスク。
     /// 偶数 size も中心ピクセル基準の対称 AA ディスク（厳密な「太らない」は主張しない）。
     fn buildDab(self: *Brush) void {
