@@ -295,6 +295,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    synth_test_mod.addImport("dsp", example_modules.dsp);
     const synth_test = b.addTest(.{ .root_module = synth_test_mod });
     const run_synth_test = b.addRunArtifact(synth_test);
     const test_synth_step = b.step("test-synth", "Run libs/synth unit tests");
@@ -471,15 +472,16 @@ const ExampleModules = struct {
             .root_source_file = b.path("src/audio.zig"),
         });
 
-        // synth (L3): GUI⇔Audio 受け渡し機構ほか。platform / GUI 非依存の純 Zig。
-        const synth_mod = b.createModule(.{
-            .root_source_file = b.path("libs/synth/src/synth.zig"),
-        });
-
         // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
         const dsp_mod = b.createModule(.{
             .root_source_file = b.path("src/dsp/dsp.zig"),
         });
+
+        // synth (L3): Voice/VoicePool/Patch/Synth + GUI⇔Audio 受け渡し機構。dsp に依存。
+        const synth_mod = b.createModule(.{
+            .root_source_file = b.path("libs/synth/src/synth.zig"),
+        });
+        synth_mod.addImport("dsp", dsp_mod);
 
         return .{
             .platform = platform_mod,
