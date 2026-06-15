@@ -106,6 +106,16 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(synth_metal);
     }
 
+    // ========================================
+    // platform native object archive lib（外部パッケージ向け。TASK-29.1）
+    // facade module(addModule "platform") と責務分離。外部は dep.artifact("platform_native_<plat>")
+    // を linkLibrary する。.o の archive のみで、framework/Swift ランタイム/検索パスは
+    // consumer の exe 側で適用する（29.2 の C 方式）。
+    // ========================================
+    _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc");
+    _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift");
+    _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal");
+
     // PNG round-trip テスト (io_png.zig のテスト + png-decoder で検証)
     const io_png_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/io_png.zig"),
@@ -474,11 +484,13 @@ const ExampleModules = struct {
     dsp: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
-        const platform_mod = platform.createPlatformModule(
-            b,
-            b.path("src/platform.zig"),
-            b.path("platform"),
-        );
+        // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
+        // facade。@cImport("platform.h") のため link_libc + include path を内包。
+        const platform_mod = b.addModule("platform", .{
+            .root_source_file = b.path("src/platform.zig"),
+            .link_libc = true,
+        });
+        platform_mod.addIncludePath(b.path("platform"));
 
         // keyboard は KeyCode 型定義を platform から借りる
         const keyboard_mod = b.createModule(.{
@@ -486,7 +498,8 @@ const ExampleModules = struct {
         });
         keyboard_mod.addImport("platform", platform_mod);
 
-        const png_decoder = b.createModule(.{
+        // TASK-29.1: 外部公開 module。dep.module("png-decoder")。
+        const png_decoder = b.addModule("png-decoder", .{
             .root_source_file = b.path("libs/png-decoder/src/lib.zig"),
         });
         const sprite = b.createModule(.{
@@ -496,7 +509,8 @@ const ExampleModules = struct {
 
         // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
         // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png-decoder に依存。
-        const font_mod = b.createModule(.{
+        // TASK-29.1: 外部公開 module。dep.module("font")。png-decoder に依存。
+        const font_mod = b.addModule("font", .{
             .root_source_file = b.path("libs/font/src/lib.zig"),
         });
         font_mod.addImport("png-decoder", png_decoder);
@@ -507,7 +521,8 @@ const ExampleModules = struct {
         });
         text_mod.addImport("font", font_mod);
 
-        const gui = b.createModule(.{
+        // TASK-29.1: 外部公開 module。dep.module("gui")。font に依存。
+        const gui = b.addModule("gui", .{
             .root_source_file = b.path("libs/gui/src/gui.zig"),
         });
         gui.addImport("font", font_mod);
@@ -692,4 +707,48 @@ fn addRunStep(
     if (args) |a| run_cmd.addArgs(a);
     const run_step = b.step(name, description);
     run_step.dependOn(&run_cmd.step);
+}
+
+// ============================================================
+// ヘルパー: platform native 層を static lib (object archive) として公開 (TASK-29.1)
+//
+// 外部パッケージは `dep.artifact("platform_native_<plat>")` を linkLibrary する。
+// facade は `dep.module("platform")`。compilePlatformLayer の .o を最小 stub module に
+// addObjectFile して archive するだけに徹する。framework / Swift ランタイム / 検索パスは
+// static lib ビルド時に解決できず（検索パスは consumer へ伝播もしない）、consumer の exe 側で
+// 適用する（29.2 の C 方式: macos/swift build_helper を vendoring して exe に適用）。
+// ============================================================
+fn addPlatformNativeLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+    platform_type: platform.PlatformType,
+    name: []const u8,
+) *std.Build.Step.Compile {
+    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root);
+
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform_native_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lib_mod.addObjectFile(compiled.obj_file);
+    // framework / Swift ランタイム / framework・library 検索パスは static lib ビルド時に
+    // 解決できず（`unable to find framework` になる）、検索パスは consumer へ伝播もしない。
+    // よってここは .o を archive することに徹し、リンク設定は consumer の exe 側で適用する
+    // （29.2 の C 方式: macos.linkMacOSFrameworks / swift.linkSwiftRuntime を vendoring）。
+
+    const lib = b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = lib_mod,
+    });
+    lib.step.dependOn(&compiled.compile_step.step);
+    // consumer の @cImport("platform.h") 用に header を install（linkLibrary の
+    // installed-headers-include-tree 経路の健全性も確保）。
+    lib.installHeader(b.path("platform/platform.h"), "platform.h");
+    b.installArtifact(lib);
+    return lib;
 }

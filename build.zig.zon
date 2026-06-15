@@ -74,6 +74,13 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "platform",
+        "libs",
+        "build_helpers",
+        // build() が examples の artifact と apps/editor 系のテストを常に構成するため、
+        // package として自己完結させるには含める必要がある（TASK-29.1 codex レビュー指摘）。
+        "apps",
+        "examples",
         // For example...
         //"LICENSE",
         //"README.md",
