@@ -85,6 +85,27 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(pixie_metal);
     }
 
+    // ========================================
+    // Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)
+    // ========================================
+    const synth_objc = addSynthExe(b, target, optimize, platform_root, sdk_paths, .objc, "synth", &example_modules);
+    const synth_swift = addSynthExe(b, target, optimize, platform_root, sdk_paths, .swift, "synth_swift", &example_modules);
+    const synth_metal = addSynthExe(b, target, optimize, platform_root, sdk_paths, .metal, "synth_metal", &example_modules);
+    const synth_default = switch (platform_option) {
+        .objc => synth_objc,
+        .swift => synth_swift,
+        .metal => synth_metal,
+    };
+    addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", synth_default, b.args);
+    addRunStep(b, "run-synth-objc", "Run synth app (ObjC)", synth_objc, b.args);
+    addRunStep(b, "run-synth-swift", "Run synth app (Swift)", synth_swift, b.args);
+    addRunStep(b, "run-synth-metal", "Run synth app (Metal)", synth_metal, b.args);
+    if (install_all) {
+        b.installArtifact(synth_objc);
+        b.installArtifact(synth_swift);
+        b.installArtifact(synth_metal);
+    }
+
     // PNG round-trip テスト (io_png.zig のテスト + png-decoder で検証)
     const io_png_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/io_png.zig"),
@@ -594,6 +615,36 @@ fn addPixieExe(
     exe.root_module.addImport("core", core_mod);
     exe.root_module.addImport("gui", modules.gui);
     exe.root_module.addImport("png-decoder", modules.png_decoder); // PNG 読み込み (TASK-24)
+
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    return exe;
+}
+
+// ============================================================
+// ヘルパー: synth app exe を 1 プラットフォーム分セットアップ
+// ============================================================
+fn addSynthExe(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+    sdk_paths: macos.MacOSSDKPaths,
+    platform_type: platform.PlatformType,
+    name: []const u8,
+    modules: *const ExampleModules,
+) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/synth/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("platform", modules.platform);
+    exe.root_module.addImport("audio", modules.audio);
+    exe.root_module.addImport("synth", modules.synth);
+    exe.root_module.linkFramework("AudioToolbox", .{}); // L1 オーディオ出力
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
