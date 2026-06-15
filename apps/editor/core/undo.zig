@@ -12,9 +12,15 @@ const Allocator = std.mem.Allocator;
 const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
 const Vec2 = canvas_mod.Vec2;
+const blend = @import("blend.zig");
 
 /// 1 ピクセルの変更記録。idx は layer.pixels への平坦インデックス。
 pub const PixelDiff = struct { idx: u32, before: u32, after: u32 };
+
+/// ブラシのフットプリント。中心からのオフセットと coverage(0..255)。
+/// 形状（円・hardness）は Tool 側ポリシー（21.12 の Brush が生成）。recorder は形状非依存。
+pub const Offset = struct { dx: i16, dy: i16, cov: u8 };
+pub const Dab = struct { offsets: []const Offset };
 
 /// 1 操作 = 1 コマンド。diffs は gpa 所有の owned slice（pop / deinit で free）。
 pub const UndoCmd = union(enum) {
@@ -24,32 +30,52 @@ pub const UndoCmd = union(enum) {
     },
 };
 
-/// stroke 記録機械。canvas は所有せず、point/lineTo に都度渡す。
-/// stroke_seen は w*h の dedup ビットマップ（begin で reset）。
+/// stroke 記録機械。canvas は所有せず、point/lineTo/stamp に都度渡す。
+/// 2 つの記録経路を持つ:
+/// - replace（Pen/Eraser）: begin/point/lineTo/finish。色を単純置換し stroke_seen で dedup。
+/// - brush（ソフトブラシ）: brushBegin/stamp/stampLineTo/brushFinish。coverage の max を原本へ src-over
+///   再合成（均一不透明度・ビルドアップなし）。brush は stroke_seen を使わず coverage==0 を初回番兵にする。
+/// mode で経路を分離し、誤用（begin 後に stamp 等）を debug assert で検出する。
 pub const StrokeRecorder = struct {
-    stroke_seen: []bool,
+    stroke_seen: []bool, // replace 経路の dedup
+    coverage: []u8, // brush 経路の coverage（非 active 時は全 0 不変）
+    orig: []u32, // brush 経路の原本スナップショット（触れた idx のみ有効）
+    touched: std.ArrayList(u32) = .empty, // brush 経路で触れた idx
     diffs: std.ArrayList(PixelDiff) = .empty,
     color: u32 = 0,
+    opacity: u8 = 0, // brush の stroke 不透明度（brushBegin で latch）
     layer_idx: usize = 0,
     last: Vec2 = .{ .x = 0, .y = 0 },
-    active: bool = false,
+    mode: Mode = .none,
+
+    pub const Mode = enum { none, replace, brush };
 
     pub fn init(gpa: Allocator, w: u32, h: u32) !StrokeRecorder {
-        const seen = try gpa.alloc(bool, @as(usize, w) * h);
-        return .{ .stroke_seen = seen };
+        const n = @as(usize, w) * h;
+        const seen = try gpa.alloc(bool, n);
+        errdefer gpa.free(seen);
+        const coverage = try gpa.alloc(u8, n);
+        errdefer gpa.free(coverage);
+        @memset(coverage, 0);
+        const orig = try gpa.alloc(u32, n);
+        @memset(orig, 0);
+        return .{ .stroke_seen = seen, .coverage = coverage, .orig = orig };
     }
 
     pub fn deinit(self: *StrokeRecorder, gpa: Allocator) void {
         self.diffs.deinit(gpa);
+        self.touched.deinit(gpa);
         gpa.free(self.stroke_seen);
+        gpa.free(self.coverage);
+        gpa.free(self.orig);
     }
 
-    /// stroke を開始する。対象レイヤと色を latch し、dedup ビットマップを reset する。
+    /// replace stroke を開始する。対象レイヤと色を latch し、dedup ビットマップを reset する。
     /// 始点の描画は呼び出し側が直後に `point` で行う（onEvent(.down) の責務）。
     pub fn begin(self: *StrokeRecorder, layer_idx: usize, color: u32) void {
-        std.debug.assert(!self.active);
+        std.debug.assert(self.mode == .none);
         @memset(self.stroke_seen, false);
-        self.active = true;
+        self.mode = .replace;
         self.layer_idx = layer_idx;
         self.color = color;
     }
@@ -57,7 +83,7 @@ pub const StrokeRecorder = struct {
     /// 1px 塗り + diff 記録。canvas 外は無視（clip）。同一 stroke 内の再塗りは
     /// 最初の before のみ記録する（undo の正しさ）。記録後 `last` を更新。
     pub fn point(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
-        std.debug.assert(self.active);
+        std.debug.assert(self.mode == .replace);
         self.last = .{ .x = x, .y = y };
         if (x < 0 or y < 0) return;
         const ux: u32 = @intCast(x);
@@ -80,7 +106,7 @@ pub const StrokeRecorder = struct {
 
     /// `last` から (x,y) まで Bresenham 補間で塗る。座標は canvas 外でもよい（clip）。
     pub fn lineTo(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
-        std.debug.assert(self.active);
+        std.debug.assert(self.mode == .replace);
         const x0 = self.last.x;
         const y0 = self.last.y;
         var cx = x0;
@@ -110,10 +136,104 @@ pub const StrokeRecorder = struct {
     /// stroke を確定する。変更ピクセルが無ければ null（redo を保持するため）。
     /// 非 null の場合、diffs の所有権は返す UndoCmd へ移る。
     pub fn finish(self: *StrokeRecorder, gpa: Allocator) ?UndoCmd {
-        std.debug.assert(self.active);
-        self.active = false;
+        std.debug.assert(self.mode == .replace);
+        self.mode = .none;
         if (self.diffs.items.len == 0) return null;
         const owned = self.diffs.toOwnedSlice(gpa) catch @panic("StrokeRecorder.finish: OOM");
+        return .{ .paint = .{ .layer_idx = self.layer_idx, .diffs = owned } };
+    }
+
+    // ── brush 経路（ソフトブラシ・paint 専用。TASK-21.11）─────────────────
+    // coverage の max を原本(orig)へ src-over 再合成する。原本ベースなので idempotent で
+    // ビルドアップが起きず、ドラッグ中も layer に即時プレビューされる。確定は brushFinish。
+
+    /// brush stroke を開始する。layer/color/opacity を latch。touched は空前提（不変条件）。
+    pub fn brushBegin(self: *StrokeRecorder, layer_idx: usize, color: u32, opacity: u8) void {
+        std.debug.assert(self.mode == .none);
+        std.debug.assert(self.touched.items.len == 0);
+        self.mode = .brush;
+        self.layer_idx = layer_idx;
+        self.color = color;
+        self.opacity = opacity;
+    }
+
+    fn scaleU8(a: u8, b: u8) u8 {
+        return @intCast((@as(u32, a) * @as(u32, b) + 127) / 255);
+    }
+
+    /// 1 ピクセルに coverage を適用（原本ベース src-over 再合成）。canvas 外は無視。
+    fn applyCoverage(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32, c: u8) void {
+        if (c == 0) return;
+        if (x < 0 or y < 0) return;
+        const ux: u32 = @intCast(x);
+        const uy: u32 = @intCast(y);
+        if (ux >= canvas.width or uy >= canvas.height) return;
+        const idx: usize = uy * canvas.width + ux;
+        const pixels = canvas.layerPixels(self.layer_idx);
+        if (self.coverage[idx] == 0) { // 初回タッチ（番兵）: 原本を退避
+            self.orig[idx] = pixels[idx];
+            self.touched.append(gpa, @intCast(idx)) catch @panic("StrokeRecorder.applyCoverage: OOM");
+        }
+        const newcov = @max(self.coverage[idx], c);
+        if (newcov == self.coverage[idx]) return; // 変化なし
+        self.coverage[idx] = newcov;
+        const src = blend.scaleAlpha(self.color, scaleU8(newcov, self.opacity));
+        pixels[idx] = blend.srcOver(self.orig[idx], src); // 常に原本へ再合成
+    }
+
+    /// dab を中心 (cx,cy) に置く。last を (cx,cy) に更新。
+    pub fn stamp(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, cx: i32, cy: i32, dab: Dab) void {
+        std.debug.assert(self.mode == .brush);
+        for (dab.offsets) |o| {
+            self.applyCoverage(canvas, gpa, cx + o.dx, cy + o.dy, o.cov);
+        }
+        self.last = .{ .x = cx, .y = cy };
+    }
+
+    /// last から (x,y) まで Bresenham 経路の各中心点へ dab をスタンプ。座標は canvas 外でもよい。
+    pub fn stampLineTo(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32, dab: Dab) void {
+        std.debug.assert(self.mode == .brush);
+        const x0 = self.last.x;
+        const y0 = self.last.y;
+        var cx = x0;
+        var cy = y0;
+        const dx: u32 = @abs(x - x0);
+        const dy: u32 = @abs(y - y0);
+        const sx: i32 = if (x0 < x) 1 else -1;
+        const sy: i32 = if (y0 < y) 1 else -1;
+        var err: i32 = @as(i32, @intCast(dx)) - @as(i32, @intCast(dy));
+        while (true) {
+            for (dab.offsets) |o| self.applyCoverage(canvas, gpa, cx + o.dx, cy + o.dy, o.cov);
+            if (cx == x and cy == y) break;
+            const e2 = 2 * err;
+            if (e2 > -@as(i32, @intCast(dy))) {
+                err -= @as(i32, @intCast(dy));
+                cx += sx;
+            }
+            if (e2 < @as(i32, @intCast(dx))) {
+                err += @as(i32, @intCast(dx));
+                cy += sy;
+            }
+        }
+        self.last = .{ .x = x, .y = y };
+    }
+
+    /// brush stroke を確定する。canvas が必要（layer!=orig 判定）。変更なしは null。
+    /// diff 有無に関わらず touched の coverage を 0 へ戻し（不変条件維持）touched を空にする。
+    pub fn brushFinish(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) ?UndoCmd {
+        std.debug.assert(self.mode == .brush);
+        self.mode = .none;
+        const pixels = canvas.layerPixels(self.layer_idx);
+        for (self.touched.items) |idx| {
+            if (pixels[idx] != self.orig[idx]) {
+                self.diffs.append(gpa, .{ .idx = idx, .before = self.orig[idx], .after = pixels[idx] }) catch
+                    @panic("StrokeRecorder.brushFinish: OOM");
+            }
+            self.coverage[idx] = 0; // 非 active 時 coverage 全 0 不変条件
+        }
+        self.touched.clearRetainingCapacity();
+        if (self.diffs.items.len == 0) return null;
+        const owned = self.diffs.toOwnedSlice(gpa) catch @panic("StrokeRecorder.brushFinish: OOM");
         return .{ .paint = .{ .layer_idx = self.layer_idx, .diffs = owned } };
     }
 };
@@ -477,4 +597,93 @@ test "PNG round-trip: DB16 パターンを encode → decode でピクセル一�
     try std.testing.expectEqual(@as(u32, 16), loaded.width);
     try std.testing.expectEqual(@as(u32, 16), loaded.height);
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
+}
+
+// ── brush 経路テスト（TASK-21.11）─────────────────────────
+
+test "brush: 単一 dab で src-over、coverage max でビルドアップしない" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+
+    const dab: Dab = .{ .offsets = &[_]Offset{.{ .dx = 0, .dy = 0, .cov = 128 }} };
+    const idx = 2 * 8 + 2;
+    const px = c.layers.items[0].pixels;
+
+    rec.brushBegin(0, RED, 255); // 透明地に半被覆 → a≈128
+    rec.stamp(&c, gpa, 2, 2, dab);
+    const a1 = (px[idx] >> 24) & 0xFF;
+    try std.testing.expect(a1 >= 126 and a1 <= 130);
+
+    // 同じ点へ重ねて stamp/stampLineTo → coverage は max のまま、濃くならない
+    rec.stampLineTo(&c, gpa, 2, 2, dab);
+    rec.stamp(&c, gpa, 2, 2, dab);
+    try std.testing.expectEqual(a1, (px[idx] >> 24) & 0xFF); // 不変（ビルドアップなし）
+
+    const cmd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
+    defer gpa.free(cmd.paint.diffs);
+    try std.testing.expectEqual(@as(usize, 1), cmd.paint.diffs.len);
+}
+
+test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
+    const png_decoder = @import("png-decoder");
+    const io_png = @import("io_png.zig");
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 4, 4);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 4, 4);
+    defer rec.deinit(gpa);
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    const blank = try gpa.dupe(u32, c.layers.items[0].pixels);
+    defer gpa.free(blank);
+
+    const dab: Dab = .{ .offsets = &[_]Offset{.{ .dx = 0, .dy = 0, .cov = 200 }} };
+    rec.brushBegin(0, 0xFF00FF00, 180); // 緑, opacity 180
+    rec.stamp(&c, gpa, 1, 1, dab);
+    rec.stampLineTo(&c, gpa, 2, 2, dab);
+    if (rec.brushFinish(&c, gpa)) |cmd| undo_stack.push(gpa, cmd);
+
+    // PNG round-trip（保存=raw layer pixels。partial-alpha 込み一致）
+    const raw = c.layers.items[0].pixels;
+    const png_bytes = try io_png.encodePNG(raw, 4, 4, gpa);
+    defer gpa.free(png_bytes);
+    const loaded = try png_decoder.decodePNG(gpa, png_bytes);
+    defer {
+        var img = loaded;
+        img.deinit(gpa);
+    }
+    try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
+
+    // undo で空（原本）へ復元
+    undo_stack.undoOne(gpa, &c);
+    try std.testing.expectEqualSlices(u32, blank, c.layers.items[0].pixels);
+}
+
+test "brush: replace stroke の後に brush が正常（状態分離）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+
+    // replace（Pen 相当）で複数ピクセルを塗る
+    rec.begin(0, BLACK);
+    rec.point(&c, gpa, 0, 0);
+    rec.lineTo(&c, gpa, 3, 0);
+    if (rec.finish(gpa)) |cmd| gpa.free(cmd.paint.diffs);
+
+    // 続けて brush（別経路）。replace の塗りは保持され、brush も正しく塗れる
+    const dab: Dab = .{ .offsets = &[_]Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
+    rec.brushBegin(0, RED, 255);
+    rec.stamp(&c, gpa, 5, 5, dab);
+    const cmd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
+    defer gpa.free(cmd.paint.diffs);
+
+    const px = c.layers.items[0].pixels;
+    for (0..4) |x| try std.testing.expectEqual(BLACK, px[x]); // replace の (0,0)-(3,0) 保持
+    try std.testing.expectEqual(RED, px[5 * 8 + 5]); // brush は cov=255 で不透明 RED
 }

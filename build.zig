@@ -108,6 +108,17 @@ pub fn build(b: *std.Build) void {
     const run_canvas_test = b.addRunArtifact(canvas_test);
     test_png_roundtrip_step.dependOn(&run_canvas_test.step);
 
+    // blend.zig 単体テスト（straight-alpha src-over。pure・std のみ）
+    const blend_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/core/blend.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_blend_test = b.addRunArtifact(blend_test);
+    test_png_roundtrip_step.dependOn(&run_blend_test.step);
+
     // editor/core テスト (undo: stroke 記録 + undo/redo + PNG round-trip, tool: Tool ゴールデン)
     // + pixie canvas_input (入力状態機械: capture / 外 release / 外継続 / stroke 中無視)
     const core_undo_mod = b.createModule(.{
