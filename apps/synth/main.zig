@@ -1,9 +1,9 @@
-//! apps/synth — シンセ本体 (TASK-27.5 / 27.6 / 27.8)。
+//! apps/synth — シンセ本体 (TASK-27.5 / 27.6 / 27.8 / 27.13-27.16)。
 //!
 //! 入力: PC キーボード(A..K=C4..C5) と GUI 画面鍵盤(クリック)。
-//! 操作: GUI スライダで cutoff/resonance/gain/attack/release、ボタンで波形を変更（atomic/patch publish）。
-//! 表示: 出力タップ→mono downmix→FFT のスペクトログラム。
-//! 音は L1 audio の RT コールバックから Synth.render（GUI⇔Audio はロックフリー）。
+//! 操作: GUI スライダ/ボタンで音色(osc/filter/env/LFO/unison/osc2/noise)とマスター FX(delay/chorus/dist/reverb)を変更。
+//! 表示: 出力タップ→mono downmix→ スペクトログラム / オシロスコープ / ピーク・RMS レベルメータ。
+//! 音は L1 audio の RT コールバックから Synth.render→MasterEffects.process（GUI⇔Audio はロックフリー）。
 
 const std = @import("std");
 const platform = @import("platform");
@@ -12,6 +12,7 @@ const synthlib = @import("synth");
 const dsp = @import("dsp");
 const gui = @import("gui");
 const spectrogram = @import("spectrogram.zig");
+const scope = @import("scope.zig");
 
 const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);
@@ -25,16 +26,24 @@ const NOTE_HIGH = 72; // C5
 const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
 // レイアウト（コントロールパネルは 4 カラム。FX カラムが 11 行と高いので縦に余裕を持たせる）
+// 可視化帯(y 300〜420, h 120)を横に分割: スペクトログラム / オシロスコープ / レベルメータ。
 const WIN_W = 1080;
 const WIN_H = 520;
 const SPEC_X0 = 20;
 const SPEC_Y0 = 300;
-const SPEC_W = 1040;
+const SPEC_W = 680;
 const SPEC_H = 120;
+const SCOPE_X0 = 710;
+const SCOPE_W = 300;
+const METER_X0 = 1018;
+const METER_W = 52;
+const VIS_Y0 = 300; // 可視化帯の上端(SPEC/SCOPE/METER 共通)
+const VIS_H = 120;
 const PIANO_Y0 = 440;
 const PIANO_H = 55;
 
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
+const Scope = scope.Oscilloscope(SCOPE_W, VIS_H);
 
 const App = struct {
     synth: Synth,
@@ -145,6 +154,12 @@ pub fn main() !void {
     defer allocator.destroy(spec);
     spec.init();
 
+    // オシロスコープ(リング大なので heap 確保) + レベルメータ
+    const osc = try allocator.create(Scope);
+    defer allocator.destroy(osc);
+    osc.* = .{};
+    var meter = scope.LevelMeter{};
+
     try platform.init();
     defer platform.shutdown();
 
@@ -225,13 +240,15 @@ pub fn main() !void {
             if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
-        // 出力タップを drain → mono downmix → スペクトログラム
+        // 出力タップを drain → mono downmix → スペクトログラム / オシロスコープ / レベルメータ
         while (true) {
             const n = app.tap.read(&stereo);
             if (n < 2) break;
             const frames = n / 2;
             dsp.downmixStereoToMono(stereo[0 .. frames * 2], mono[0..frames]);
             spec.feed(mono[0..frames]);
+            osc.feed(mono[0..frames]);
+            meter.feed(mono[0..frames]);
         }
 
         // GUI コントロールパネル（上部）を構築。スライダは 2 カラムでパネルを低く保つ。
@@ -301,9 +318,11 @@ pub fn main() !void {
         app.synth.publishPatch(makePatch(params));
         app.fx.publishParams(makeFxParams(fxp));
 
-        // 手動描画（背景 + 鍵盤 + スペクトログラム）→ その上に GUI
+        // 手動描画（背景 + 鍵盤 + スペクトログラム + オシロ + メータ）→ その上に GUI
         drawSpectrogramBgAndPiano(fb, &pressed);
         spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
+        osc.draw(fb.pixels, fb.width, fb.height, SCOPE_X0, VIS_Y0);
+        meter.draw(fb.pixels, fb.width, fb.height, METER_X0, VIS_Y0, METER_W, VIS_H);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font);
 

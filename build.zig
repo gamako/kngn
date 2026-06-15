@@ -345,6 +345,17 @@ pub fn build(b: *std.Build) void {
     const test_spec_step = b.step("test-spectrogram", "Run apps/synth spectrogram tests");
     test_spec_step.dependOn(&run_spec_test.step);
 
+    // apps/synth オシロスコープ / レベルメータ解析テスト (TASK-27.16, dsp 非依存)
+    const scope_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/synth/scope.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const scope_test = b.addTest(.{ .root_module = scope_test_mod });
+    const run_scope_test = b.addRunArtifact(scope_test);
+    const test_scope_step = b.step("test-scope", "Run apps/synth oscilloscope/level-meter tests");
+    test_scope_step.dependOn(&run_scope_test.step);
+
     // ========================================
     // 集約 test ステップ (全 test-* を束ねる)
     // 注: テスト実行のみ。example の build 回帰は `zig build -Dinstall-all=true` で別途確認する。
@@ -360,6 +371,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_spec_step);
+    test_step.dependOn(test_scope_step);
 
     // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
