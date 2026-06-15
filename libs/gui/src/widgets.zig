@@ -45,6 +45,23 @@ pub const SwatchOpts = struct {
     size: ?i32 = null,
 };
 
+/// i32 スライダー設定。事前条件: max > min、step は null か > 0。
+pub const SliderI32Opts = struct {
+    min: i32,
+    max: i32,
+    step: ?i32 = null,
+    /// null なら style.slider_track_w
+    track_w: ?i32 = null,
+};
+
+/// f32 スライダー設定。事前条件: max > min、step は null か > 0。
+pub const SliderF32Opts = struct {
+    min: f32,
+    max: f32,
+    step: ?f32 = null,
+    track_w: ?i32 = null,
+};
+
 /// クリックされたら true（自動 ID: label hash + id_stack）。
 pub fn button(ctx: *Context, label: []const u8) bool {
     return buttonEx(ctx, label, .{}).clicked;
@@ -178,6 +195,172 @@ const SwatchDraw = struct {
         }
         // 色を blend で重ねる（render の rect_filled は straight alpha src-over）
         dl.rectFilled(rect, self.color) catch @panic("colorSwatch: OOM");
+    }
+};
+
+// ── Slider（TASK-21.9）─────────────────────────────────────
+// track を明示 ID box で登録 → 各フレーム value から knob 矩形を算出 → knob 矩形で
+// buttonBehavior を呼んで active を取得（press は knob 上のみ = track だけクリックでは飛ばない）。
+// active 中は mouse_pos.x を track 可動域へ写像して *value を更新。内部計算は f64。
+// レイアウトは [固定名ラベル] [track] [動的値テキスト] で、track の x は値の桁数に依存しない。
+
+/// i32 スライダー（自動 ID: label hash）。値が変われば true。
+pub fn sliderI32(ctx: *Context, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
+    return sliderI32Id(ctx, ctx.id_stack.make(label), label, value, opts);
+}
+
+/// 明示 ID 版。
+pub fn sliderI32Id(ctx: *Context, id: Id, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
+    const spec: SliderSpec = .{
+        .min = @floatFromInt(opts.min),
+        .max = @floatFromInt(opts.max),
+        .step = if (opts.step) |s| @floatFromInt(s) else null,
+        .track_w = opts.track_w orelse ctx.style.slider_track_w,
+        .is_float = false,
+    };
+    const old = value.*;
+    value.* = @intFromFloat(@round(sliderCore(ctx, id, label, @floatFromInt(old), spec)));
+    return value.* != old;
+}
+
+/// f32 スライダー（自動 ID: label hash）。値が変われば true。
+pub fn sliderF32(ctx: *Context, label: []const u8, value: *f32, opts: SliderF32Opts) bool {
+    return sliderF32Id(ctx, ctx.id_stack.make(label), label, value, opts);
+}
+
+/// 明示 ID 版。
+pub fn sliderF32Id(ctx: *Context, id: Id, label: []const u8, value: *f32, opts: SliderF32Opts) bool {
+    const spec: SliderSpec = .{
+        .min = opts.min,
+        .max = opts.max,
+        .step = if (opts.step) |s| @as(f64, s) else null,
+        .track_w = opts.track_w orelse ctx.style.slider_track_w,
+        .is_float = true,
+    };
+    const old = value.*;
+    value.* = @floatCast(sliderCore(ctx, id, label, old, spec));
+    return value.* != old;
+}
+
+const SliderSpec = struct {
+    min: f64,
+    max: f64,
+    step: ?f64,
+    track_w: i32,
+    is_float: bool,
+};
+
+/// knob 中心が動ける範囲 [lo, lo+span]（px、f64）。track の左右に knob_w/2 のマージン。
+const KnobRange = struct { lo: f64, span: f64 };
+fn knobRange(track: Rect, knob_w: i32) KnobRange {
+    const lo: f64 = @floatFromInt(track.x + @divTrunc(knob_w, 2));
+    const raw: f64 = @floatFromInt(@as(i32, @intCast(track.w)) - knob_w);
+    return .{ .lo = lo, .span = if (raw < 1) 1 else raw };
+}
+
+fn knobRectFor(track: Rect, knob_w: i32, knob_h: i32, frac: f64) Rect {
+    const range = knobRange(track, knob_w);
+    const cx: i32 = @intFromFloat(range.lo + frac * range.span);
+    const ty: i32 = track.y + @divTrunc(@as(i32, @intCast(track.h)) - knob_h, 2);
+    return .{
+        .x = cx - @divTrunc(knob_w, 2),
+        .y = ty,
+        .w = @intCast(knob_w),
+        .h = @intCast(knob_h),
+    };
+}
+
+fn clampAndStep(v: f64, spec: SliderSpec) f64 {
+    var x = std.math.clamp(v, spec.min, spec.max);
+    if (spec.step) |s| {
+        x = spec.min + @round((x - spec.min) / s) * s;
+        x = std.math.clamp(x, spec.min, spec.max);
+    }
+    return x;
+}
+
+/// 最終値（f64）を返す。読み取り時は clamp のみ（step スナップしない＝drift 回避）。
+/// step はドラッグ更新時のみ適用する。changed 判定は呼び出し側が「最終値 ≠ 旧値」で行う。
+fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSpec) f64 {
+    std.debug.assert(spec.max > spec.min);
+    if (spec.step) |s| std.debug.assert(s > 0);
+    const style = ctx.style;
+    const knob_w = style.slider_knob_w;
+    const knob_h = style.slider_knob_h;
+
+    // 表示/hit-test 用に範囲内へ clamp（clamp は exact なので毎フレーム呼んでも drift しない）。
+    var value = std.math.clamp(cur, spec.min, spec.max);
+
+    // hit-test / drag（前フレーム track rect の knob 矩形で active 取得）
+    if (ctx.rect_cache.get(id)) |cached| {
+        const track = cached.rect;
+        const range = knobRange(track, knob_w);
+        const frac = (value - spec.min) / (spec.max - spec.min);
+        const kr = knobRectFor(track, knob_w, knob_h, frac);
+        const res = context_mod.buttonBehavior(ctx, id, kr, cached.clip);
+        if (res.held) {
+            const mx: f64 = @floatFromInt(ctx.input.mouse_pos.x);
+            const t = std.math.clamp((mx - range.lo) / range.span, 0, 1);
+            value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // ドラッグ時のみ step 適用
+        }
+    }
+
+    // 構築/描画: [label] [track(id)] [value text]
+    ctx.beginBox(.{ .direction = .row, .gap = 6, .align_cross = .center });
+    ctx.label(label);
+
+    const data = ctx.allocator().create(SliderDraw) catch @panic("slider: OOM");
+    data.* = .{
+        .frac = (value - spec.min) / (spec.max - spec.min),
+        .knob_w = knob_w,
+        .knob_h = knob_h,
+        .track_h = style.slider_track_h,
+        .track_bg = style.slider_track_bg,
+        .knob_bg = if (ctx.state.active_id == id) style.slider_knob_active_bg else style.slider_knob_bg,
+        .border = style.border,
+    };
+    ctx.beginBox(.{
+        .id = id,
+        .width = .{ .fixed = spec.track_w },
+        .height = .{ .fixed = knob_h },
+    });
+    ctx.custom(.{ .x = spec.track_w, .y = knob_h }, SliderDraw.draw, data);
+    ctx.endBox();
+
+    var buf: [32]u8 = undefined;
+    const txt = if (spec.is_float)
+        std.fmt.bufPrint(&buf, "{d:.2}", .{value}) catch "?"
+    else
+        std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(@round(value)))}) catch "?";
+    ctx.label(txt); // labelEx が arena へ dupe するので stack buf で安全
+
+    ctx.endBox();
+
+    return value;
+}
+
+/// slider の track 帯 + knob を描く custom leaf データ（arena 上、endFrame 中に draw 呼出）。
+const SliderDraw = struct {
+    frac: f64,
+    knob_w: i32,
+    knob_h: i32,
+    track_h: i32,
+    track_bg: Color,
+    knob_bg: Color,
+    border: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const SliderDraw = @ptrCast(@alignCast(ctx_ptr));
+        // track 帯（縦中央・高さ track_h）
+        const track_y: i32 = rect.y + @divTrunc(@as(i32, @intCast(rect.h)) - self.track_h, 2);
+        dl.rectFilled(
+            .{ .x = rect.x, .y = track_y, .w = rect.w, .h = @intCast(self.track_h) },
+            self.track_bg,
+        ) catch @panic("slider: OOM");
+        // knob（rect = 最終 layout 後の track 外接矩形。hit-test と同じ knobRectFor で位置一致）
+        const kr = knobRectFor(rect, self.knob_w, self.knob_h, self.frac);
+        dl.rectFilled(kr, self.knob_bg) catch @panic("slider: OOM");
+        dl.rectOutline(kr, self.border, 1) catch @panic("slider: OOM");
     }
 };
 
@@ -513,4 +696,155 @@ test "widgets: 初回フレーム（キャッシュ未生成）は click が成�
     try std.testing.expect(!ctx.button("Btn"));
     try std.testing.expect(!ctx.wantsMouse());
     ctx.endFrame();
+}
+
+// ── Slider テスト（TASK-21.9）─────────────────────────────
+const SLIDER_ID: Id = 900;
+
+/// frame1 でキャッシュ生成し track rect を返す。
+fn sliderFrame1I32(ctx: *Context, value: *i32, opts: SliderI32Opts) Rect {
+    ctx.beginFrame(800, 600);
+    _ = ctx.sliderI32Id(SLIDER_ID, "S", value, opts);
+    ctx.endFrame();
+    return ctx.getNodeRect(SLIDER_ID).?;
+}
+
+fn trackCenterY(track: Rect) i32 {
+    return track.y + @divTrunc(@as(i32, @intCast(track.h)), 2);
+}
+
+test "slider: knobRectFor は frac=0/1 で中心が track 両端（可動域）" {
+    const track = Rect{ .x = 10, .y = 0, .w = 120, .h = 16 };
+    const k0 = knobRectFor(track, 10, 16, 0);
+    const k1 = knobRectFor(track, 10, 16, 1);
+    try std.testing.expectEqual(@as(i32, 10), k0.x); // 中心 15 = x+knob_w/2 → x=10
+    try std.testing.expectEqual(@as(i32, 120), k1.x); // 中心 125 = x+w-knob_w/2 → x=120
+}
+
+test "slider: ドラッグで *value が更新され [min,max] clamp（AC#2）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: i32 = 0;
+    const opts: SliderI32Opts = .{ .min = 0, .max = 100 };
+
+    const track = sliderFrame1I32(&ctx, &v, opts);
+    const kw = ctx.style.slider_knob_w;
+    const lo = track.x + @divTrunc(kw, 2); // v=0 の knob 中心
+    const yc = trackCenterY(track);
+
+    // frame2: knob を掴んで track 右端の外まで drag → max に clamp
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, lo, yc);
+    moveTo(&ctx, track.x + @as(i32, @intCast(track.w)) + 50, yc);
+    const changed = ctx.sliderI32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(i32, 100), v);
+}
+
+test "slider: step 指定で値が step 単位に丸められる（AC#3）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: i32 = 0;
+    const opts: SliderI32Opts = .{ .min = 0, .max = 10, .step = 2 };
+
+    const track = sliderFrame1I32(&ctx, &v, opts);
+    const kw = ctx.style.slider_knob_w;
+    const lo = track.x + @divTrunc(kw, 2);
+    const yc = trackCenterY(track);
+
+    // track の 35% 位置へ drag: span=110, x=lo+38 → t=0.3454 → raw≈3.45 → round(3.45/2)*2 = 4
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, lo, yc);
+    const span = @as(i32, @intCast(track.w)) - kw;
+    moveTo(&ctx, lo + @divTrunc(span * 35, 100), yc);
+    _ = ctx.sliderI32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(i32, 4), v); // step=2 単位に丸め（固定期待値）
+}
+
+test "slider: track 上だが knob 外の press では値が変わらない（AC#4）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: i32 = 0;
+    const opts: SliderI32Opts = .{ .min = 0, .max = 100 };
+
+    const track = sliderFrame1I32(&ctx, &v, opts);
+    const yc = trackCenterY(track);
+
+    // v=0 の knob は左端。track 右端付近（knob 外）を press して drag → active 取得されず不変
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, track.x + @as(i32, @intCast(track.w)) - 1, yc);
+    moveTo(&ctx, track.x + 5, yc);
+    const changed = ctx.sliderI32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(i32, 0), v);
+}
+
+test "slider: 値の桁数が変わっても track.x が動かない（High 回帰防止）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const opts: SliderI32Opts = .{ .min = 0, .max = 100 };
+
+    var v: i32 = 9;
+    const track9 = sliderFrame1I32(&ctx, &v, opts);
+    v = 10; // 桁数増加（値テキストは track の右なので track 位置に無影響のはず）
+    const track10 = sliderFrame1I32(&ctx, &v, opts);
+
+    try std.testing.expectEqual(track9.x, track10.x);
+    try std.testing.expectEqual(track9.w, track10.w);
+}
+
+test "sliderF32: clamp + step が効く" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: f32 = 0;
+    const opts: SliderF32Opts = .{ .min = 0, .max = 1, .step = 0.25 };
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.sliderF32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+    const track = ctx.getNodeRect(SLIDER_ID).?;
+    const kw = ctx.style.slider_knob_w;
+    const lo = track.x + @divTrunc(kw, 2);
+    const yc = trackCenterY(track);
+
+    // 右端外まで drag → 1.0 に clamp（0.25 の倍数）
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, lo, yc);
+    moveTo(&ctx, track.x + @as(i32, @intCast(track.w)) + 50, yc);
+    const changed = ctx.sliderF32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    try std.testing.expect(changed);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), v, 0.001);
+}
+
+test "sliderF32: 中間ドラッグで step 単位に丸まる（AC#3 の f32 回帰）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: f32 = 0;
+    const opts: SliderF32Opts = .{ .min = 0, .max = 1, .step = 0.25 };
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.sliderF32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+    const track = ctx.getNodeRect(SLIDER_ID).?;
+    const kw = ctx.style.slider_knob_w;
+    const lo = track.x + @divTrunc(kw, 2);
+    const yc = trackCenterY(track);
+
+    // 30% 位置へ drag: span=110, x=lo+33 → t=0.30 → raw=0.30 → round(0.30/0.25)*0.25 = 0.25
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, lo, yc);
+    const span = @as(i32, @intCast(track.w)) - kw;
+    moveTo(&ctx, lo + @divTrunc(span * 30, 100), yc);
+    _ = ctx.sliderF32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), v, 0.001); // step なしなら ≈0.30
 }

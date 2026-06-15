@@ -79,6 +79,11 @@ pub const Context = struct {
     pub const colorSwatch = widgets.colorSwatch;
     pub const colorSwatchEx = widgets.colorSwatchEx;
     pub const colorSwatchId = widgets.colorSwatchId;
+    // Slider（TASK-21.9）
+    pub const sliderI32 = widgets.sliderI32;
+    pub const sliderI32Id = widgets.sliderI32Id;
+    pub const sliderF32 = widgets.sliderF32;
+    pub const sliderF32Id = widgets.sliderF32Id;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{

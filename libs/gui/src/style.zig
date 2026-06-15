@@ -29,6 +29,14 @@ pub const Style = struct {
     button_padding: [4]i32 = .{ 4, 8, 4, 8 },
     button_border: i32 = 1,
     button_border_selected: i32 = 2,
+    // Slider（TASK-21.9）。サイズ系は i32、描画時に u32 へ cast。
+    slider_track_w: i32 = 120,
+    slider_track_h: i32 = 6,
+    slider_knob_w: i32 = 10,
+    slider_knob_h: i32 = 16,
+    slider_track_bg: Color = Color.rgba(0x30, 0x30, 0x38, 0xFF),
+    slider_knob_bg: Color = Color.rgba(0x90, 0x98, 0xA0, 0xFF),
+    slider_knob_active_bg: Color = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
 };
 
 /// 既存 example（09/10）系統のダークテーマ。text は白（21.4 までの label 既定色と同じ）。
