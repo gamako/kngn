@@ -15,6 +15,7 @@ pub const Oscillator = oscillator.Oscillator;
 pub const Envelope = envelope.Envelope;
 
 pub const Filter = filter.Filter;
+pub const FilterMode = filter.FilterMode;
 pub const flushDenormal = filter.flushDenormal;
 
 pub const applyGain = mixer.applyGain;

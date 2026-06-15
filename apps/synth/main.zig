@@ -123,15 +123,10 @@ pub fn main() !void {
     defer allocator.destroy(app);
 
     // スライダ用パラメータ（GUI が in-place 更新）
-    var cutoff: f32 = 6000;
-    var resonance: f32 = 1.2;
-    var gain: f32 = 0.2;
-    var attack: f32 = 0.01;
-    var release: f32 = 0.2;
-    var wave_idx: usize = 1; // saw
+    var params = Params{};
 
     app.* = .{
-        .synth = Synth.init(48000, makePatch(cutoff, resonance, gain, attack, release, wave_idx)),
+        .synth = Synth.init(48000, makePatch(params)),
         .tap = .{},
     };
 
@@ -235,20 +230,23 @@ pub fn main() !void {
             .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
         });
         ctx.label("Synth controls (drag knobs):");
-        _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &cutoff, .{ .min = 100, .max = 18000, .step = 10 });
-        _ = ctx.sliderF32Id(0x6002, "Resonance", &resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6003, "Gain     ", &gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6004, "Attack   ", &attack, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6005, "Release  ", &release, .{ .min = 0.01, .max = 2, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &params.cutoff, .{ .min = 100, .max = 18000, .step = 10 });
+        _ = ctx.sliderF32Id(0x6002, "Resonance", &params.resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6003, "Gain     ", &params.gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6004, "Attack   ", &params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6005, "Release  ", &params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
-        const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[wave_idx]}) catch "Wave";
-        if (ctx.button(wlabel)) wave_idx = (wave_idx + 1) % WAVE_NAMES.len;
+        const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
+        if (ctx.button(wlabel)) params.wave_idx = (params.wave_idx + 1) % WAVE_NAMES.len;
+        const flabel = std.fmt.allocPrint(ctx.allocator(), "Filter: {s}", .{FILTER_MODE_NAMES[params.filter_mode_idx]}) catch "Filter";
+        if (ctx.button(flabel)) params.filter_mode_idx = (params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
         ctx.endBox();
         ctx.endBox();
         ctx.endFrame();
 
         // パラメータを publish（atomic/patch publish 経由で audio スレッドへ。audio 側でスムージング）
-        app.synth.publishPatch(makePatch(cutoff, resonance, gain, attack, release, wave_idx));
+        app.synth.publishPatch(makePatch(params));
 
         // 手動描画（背景 + 鍵盤 + スペクトログラム）→ その上に GUI
         drawSpectrogramBgAndPiano(fb, &pressed);
@@ -263,15 +261,39 @@ pub fn main() !void {
     }
 }
 
-fn makePatch(cutoff: f32, resonance: f32, gain: f32, attack: f32, release: f32, wave_idx: usize) Patch {
+/// GUI スライダ/ボタンが in-place 更新するパラメータ束。
+const Params = struct {
+    cutoff: f32 = 6000,
+    resonance: f32 = 1.2,
+    gain: f32 = 0.2,
+    attack: f32 = 0.01,
+    release: f32 = 0.2,
+    wave_idx: usize = 1, // saw
+    filter_mode_idx: usize = 0, // lowpass
+    keytrack: f32 = 0.0,
+};
+
+const FILTER_MODE_NAMES = [_][]const u8{ "LP", "HP", "BP", "notch" };
+fn filterModeOf(idx: usize) dsp.FilterMode {
+    return switch (idx) {
+        0 => .lowpass,
+        1 => .highpass,
+        2 => .bandpass,
+        else => .notch,
+    };
+}
+
+fn makePatch(p: Params) Patch {
     return .{
-        .waveform = waveOf(wave_idx),
-        .attack = attack,
+        .waveform = waveOf(p.wave_idx),
+        .attack = p.attack,
         .decay = 0.15,
         .sustain = 0.6,
-        .release = release,
-        .cutoff = cutoff,
-        .resonance = resonance,
-        .gain = gain,
+        .release = p.release,
+        .cutoff = p.cutoff,
+        .resonance = p.resonance,
+        .gain = p.gain,
+        .filter_mode = filterModeOf(p.filter_mode_idx),
+        .keytrack = p.keytrack,
     };
 }

@@ -4,7 +4,7 @@
 const std = @import("std");
 const dsp = @import("dsp");
 
-/// 音色パラメータの集合。waveform / ADSR は noteOn で latch、cutoff/res/gain は毎ブロック反映。
+/// 音色パラメータの集合。waveform / ADSR は noteOn で latch、cutoff/res/gain/filter_mode/keytrack は毎ブロック反映。
 pub const Patch = struct {
     waveform: dsp.Waveform = .sine,
     attack: f32 = 0.01,
@@ -14,7 +14,16 @@ pub const Patch = struct {
     cutoff: f32 = 8000.0,
     resonance: f32 = 0.707,
     gain: f32 = 0.2,
+    filter_mode: dsp.FilterMode = .lowpass,
+    /// キートラッキング量(0=追従なし, 1=1オクターブ/オクターブ=完全追従)。基準ノートは C4(60)。
+    keytrack: f32 = 0.0,
 };
+
+/// キートラッキング適用後の実効 cutoff(Hz)。基準 C4(60) から半音ごとに keytrack 比率で追従。
+fn trackedCutoff(base_cutoff: f32, keytrack: f32, note: u8) f32 {
+    const semitones = (@as(f32, @floatFromInt(note)) - 60.0);
+    return base_cutoff * std.math.pow(f32, 2.0, keytrack * semitones / 12.0);
+}
 
 /// MIDI ノート番号 → 周波数(Hz)。A4(note 69)=440Hz。
 pub fn noteToFreq(note: u8) f32 {
@@ -49,16 +58,19 @@ pub const Voice = struct {
             .sample_rate = sample_rate,
         };
         self.env.noteOn();
-        self.filter = dsp.Filter.init(sample_rate, patch.cutoff, patch.resonance);
+        self.filter = dsp.Filter.init(sample_rate, trackedCutoff(patch.cutoff, patch.keytrack, note), patch.resonance);
+        self.filter.setMode(patch.filter_mode);
     }
 
     pub fn noteOff(self: *Voice) void {
         self.env.noteOff();
     }
 
-    /// ブロック先頭で cutoff/resonance を反映（毎サンプル tan を避ける）。
+    /// ブロック先頭で cutoff(キートラッキング込み)/resonance/種別を反映（毎サンプル tan を避ける）。
     pub fn prepareBlock(self: *Voice, patch: Patch) void {
-        if (self.active) self.filter.setParams(patch.cutoff, patch.resonance);
+        if (!self.active) return;
+        self.filter.setParams(trackedCutoff(patch.cutoff, patch.keytrack, self.note), patch.resonance);
+        self.filter.setMode(patch.filter_mode);
     }
 
     /// 1 サンプル合成。env が done になったら active=false（プールへ返る）。
@@ -152,6 +164,17 @@ const testing = std.testing;
 test "noteToFreq: A4=440, A5=880" {
     try testing.expectApproxEqAbs(@as(f32, 440.0), noteToFreq(69), 0.01);
     try testing.expectApproxEqAbs(@as(f32, 880.0), noteToFreq(81), 0.01);
+}
+
+test "trackedCutoff: keytrack=0 unchanged, keytrack=1 follows 1oct/oct, higher note->higher cutoff" {
+    // keytrack=0: 音程に関係なく base のまま
+    try testing.expectApproxEqAbs(@as(f32, 1000.0), trackedCutoff(1000, 0.0, 72), 0.01);
+    // keytrack=1: C4(60)基準。C5(72, +12半音)で 2 倍
+    try testing.expectApproxEqAbs(@as(f32, 2000.0), trackedCutoff(1000, 1.0, 72), 0.5);
+    // C3(48, -12半音)で半分
+    try testing.expectApproxEqAbs(@as(f32, 500.0), trackedCutoff(1000, 1.0, 48), 0.5);
+    // 高い音ほど cutoff が高い
+    try testing.expect(trackedCutoff(1000, 0.5, 80) > trackedCutoff(1000, 0.5, 60));
 }
 
 test "Voice: state machine idle -> attack -> ... -> release -> idle(done)" {
