@@ -15,6 +15,7 @@ pub const Envelope = struct {
 
     stage: Stage = .idle,
     level: f32 = 0.0,
+    release_level: f32 = 0.0, // release 開始時のレベル（ここから 0 へ release 秒で減衰）
 
     // 減衰末尾の denormal/極小値を 0 に丸める閾値。
     const done_eps: f32 = 1e-4;
@@ -24,7 +25,10 @@ pub const Envelope = struct {
     }
 
     pub fn noteOff(self: *Envelope) void {
-        if (self.stage != .idle) self.stage = .release;
+        if (self.stage != .idle) {
+            self.release_level = self.level; // 現在レベルを起点に release する
+            self.stage = .release;
+        }
     }
 
     /// release 後に 0 へ達し idle に戻ったか（ボイス回収判定に使う）。
@@ -52,7 +56,8 @@ pub const Envelope = struct {
             },
             .sustain => self.level = self.sustain,
             .release => {
-                self.level -= self.stepDown(self.release, self.sustain);
+                // release 開始レベルを起点に release 秒で 0 へ（sustain に依存しない）
+                self.level -= self.stepDown(self.release, self.release_level);
                 if (self.level <= done_eps) {
                     self.level = 0.0; // denormal 末尾を切る
                     self.stage = .idle;
@@ -108,6 +113,38 @@ test "Envelope: attack rises to 1, decays to sustain, releases to 0 (done)" {
     _ = env.next();
     try testing.expectEqual(@as(f32, 0.0), env.level);
     try testing.expect(!env.isActive());
+}
+
+test "Envelope: release decays to 0 even when sustain=0 (codex review fix)" {
+    var env = Envelope{
+        .attack = 0.0,
+        .decay = 0.0,
+        .sustain = 0.0, // sustain 0 でも release が効くこと
+        .release = 0.01,
+        .sample_rate = 1000, // release = 10 サンプル
+    };
+    env.noteOn();
+    // sustain=0 なので decay 後はほぼ 0 付近だが、attack 直後の高レベルから noteOff してみる
+    const top = env.next(); // attack 0 → 即 1.0 付近へ
+    try testing.expect(top > 0.5);
+    env.noteOff();
+    const start = env.level;
+    try testing.expect(start > 0.0);
+    // release で単調減少し、やがて 0(idle)
+    var prev = start;
+    var i: u32 = 0;
+    var reached_zero = false;
+    while (i < 50) : (i += 1) {
+        const v = env.next();
+        try testing.expect(v <= prev + 1e-6); // 単調減少
+        prev = v;
+        if (!env.isActive()) {
+            reached_zero = true;
+            break;
+        }
+    }
+    try testing.expect(reached_zero);
+    try testing.expectEqual(@as(f32, 0.0), env.level);
 }
 
 test "Envelope: zero attack jumps immediately" {

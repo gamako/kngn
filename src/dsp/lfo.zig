@@ -17,8 +17,7 @@ pub const Lfo = struct {
             .saw => 2.0 * self.phase - 1.0,
         };
         self.phase += rate_hz / sample_rate;
-        if (self.phase >= 1.0) self.phase -= 1.0;
-        if (self.phase < 0.0) self.phase += 1.0;
+        self.phase -= @floor(self.phase); // 任意 rate でも 0..1 に収める（負値・高 rate でも安全）
         return out;
     }
 };
@@ -53,4 +52,13 @@ test "Lfo: slow rate advances slowly (1Hz @ 1000sr → phase ~0.001/sample)" {
     var lfo = Lfo{ .waveform = .saw };
     _ = lfo.next(1.0, 1000);
     try testing.expectApproxEqAbs(@as(f32, 0.001), lfo.phase, 1e-5);
+}
+
+test "Lfo: phase stays in [0,1) even at very high rate (robust wrap)" {
+    var lfo = Lfo{ .waveform = .saw };
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        _ = lfo.next(120000, 1000); // rate >> sample_rate
+        try testing.expect(lfo.phase >= 0.0 and lfo.phase < 1.0);
+    }
 }

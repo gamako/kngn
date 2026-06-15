@@ -115,7 +115,7 @@ pub const Voice = struct {
         self.block_fenv_amount = patch.filter_env_amount;
         self.block_lfo_rate = patch.lfo_rate;
         self.block_vibrato = patch.vibrato_depth;
-        self.block_tremolo = patch.tremolo_depth;
+        self.block_tremolo = std.math.clamp(patch.tremolo_depth, 0.0, 1.0); // 範囲外で負ゲイン/増幅を防ぐ
         self.filter.setMode(patch.filter_mode);
         if (patch.filter_env_amount == 0.0) self.filter.setParams(self.block_cutoff, self.block_res);
     }
@@ -123,9 +123,14 @@ pub const Voice = struct {
     /// 1 サンプル合成。env が done になったら active=false（プールへ返る）。
     pub fn renderSample(self: *Voice, sample_rate: f32) f32 {
         if (!self.active) return 0.0;
-        const lfo_v = self.lfo.next(self.block_lfo_rate, sample_rate); // -1..1
-        // vibrato: pitch を半音単位でモジュレート
-        const freq = self.freq * std.math.pow(f32, 2.0, self.block_vibrato * lfo_v / 12.0);
+        // LFO は vibrato/tremolo のどちらかが有効なときだけ進める（不要な計算を避ける）。
+        const mod_on = self.block_vibrato != 0.0 or self.block_tremolo != 0.0;
+        const lfo_v = if (mod_on) self.lfo.next(self.block_lfo_rate, sample_rate) else 0.0; // -1..1
+        // vibrato: pitch を半音単位でモジュレート（depth=0 なら pow を省く）
+        const freq = if (self.block_vibrato != 0.0)
+            self.freq * std.math.pow(f32, 2.0, self.block_vibrato * lfo_v / 12.0)
+        else
+            self.freq;
         const o = self.osc.next(freq, sample_rate);
         const e = self.env.next();
         const fe = self.filter_env.next();
@@ -134,7 +139,7 @@ pub const Voice = struct {
             self.filter.setParams(modulatedCutoff(self.block_cutoff, self.block_fenv_amount, fe), self.block_res);
         }
         // tremolo: amp を 0..1 でモジュレート（lfo=+1→1.0、-1→1-depth）
-        const trem = 1.0 - self.block_tremolo * (0.5 - 0.5 * lfo_v);
+        const trem = if (self.block_tremolo != 0.0) 1.0 - self.block_tremolo * (0.5 - 0.5 * lfo_v) else 1.0;
         const out = self.filter.process(o * e * self.velocity * trem);
         if (!self.env.isActive()) self.active = false; // done 回収（振幅 env 基準）
         return out;
