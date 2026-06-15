@@ -12,6 +12,7 @@ const params = @import("params.zig");
 const tap = @import("tap.zig");
 const voice = @import("voice.zig");
 const synth_engine = @import("synth_engine.zig");
+const effects = @import("effects.zig");
 
 pub const SpscRing = ring.SpscRing;
 pub const NoteEvent = ring.NoteEvent;
@@ -27,6 +28,7 @@ pub const Voice = voice.Voice;
 pub const VoicePool = voice.VoicePool;
 pub const noteToFreq = voice.noteToFreq;
 pub const Synth = synth_engine.Synth;
+pub const MasterEffects = effects.MasterEffects;
 
 test {
     // 参照する全ファイルの test をまとめて回す。
@@ -35,4 +37,5 @@ test {
     _ = tap;
     _ = voice;
     _ = synth_engine;
+    _ = effects;
 }

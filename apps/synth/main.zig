@@ -17,17 +17,19 @@ const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);
 const Tap = synthlib.SampleTap(8192);
 const Patch = synthlib.Patch;
+// マスターエフェクト: delay ~1.36s(65536@48k) / chorus ~85ms(4096@48k, 96kHz でも余裕)。いずれも 2 の冪。
+const Fx = synthlib.MasterEffects(65536, 4096);
 
 const NOTE_LOW = 60; // C4
 const NOTE_HIGH = 72; // C5
 const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
-// レイアウト（コントロールパネルは 3 カラム。パネル下にスペクトログラム、最下部に鍵盤）
-const WIN_W = 860;
+// レイアウト（コントロールパネルは 4 カラム。パネル下にスペクトログラム、最下部に鍵盤）
+const WIN_W = 1080;
 const WIN_H = 440;
 const SPEC_X0 = 20;
 const SPEC_Y0 = 250;
-const SPEC_W = 820;
+const SPEC_W = 1040;
 const SPEC_H = 120;
 const PIANO_Y0 = 380;
 const PIANO_H = 55;
@@ -36,6 +38,7 @@ const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
 
 const App = struct {
     synth: Synth,
+    fx: Fx,
     tap: Tap,
 };
 
@@ -43,6 +46,7 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
     _ = sample_rate;
     const app: *App = @ptrCast(@alignCast(userdata.?));
     app.synth.render(buf, frames, channels);
+    app.fx.process(buf, frames, channels); // マスターエフェクト(出力タップの前)
     app.tap.write(buf);
 }
 
@@ -129,9 +133,11 @@ pub fn main() !void {
 
     // スライダ用パラメータ（GUI が in-place 更新）
     var params = Params{};
+    var fxp = FxParams{};
 
     app.* = .{
         .synth = Synth.init(48000, makePatch(params)),
+        .fx = Fx.init(48000, makeFxParams(fxp)),
         .tap = .{},
     };
 
@@ -161,6 +167,7 @@ pub fn main() !void {
     defer device.close();
 
     app.synth.sample_rate = @floatFromInt(device.config().sample_rate);
+    app.fx.sample_rate = @floatFromInt(device.config().sample_rate);
     try device.start();
     defer device.stop();
 
@@ -262,6 +269,17 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x6010, "Osc2 Det ", &params.osc2_detune, .{ .min = -24, .max = 24, .step = 1 });
         _ = ctx.sliderF32Id(0x6011, "Noise    ", &params.noise_amount, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
+        // FX カラム: マスターエフェクト (27.14)
+        ctx.beginBox(.{ .direction = .column, .gap = 4 });
+        _ = ctx.sliderF32Id(0x6012, "Dly Time ", &fxp.delay_time, .{ .min = 0.01, .max = 1.0, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6013, "Dly FB   ", &fxp.delay_fb, .{ .min = 0, .max = 0.95, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6014, "Dly Mix  ", &fxp.delay_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6015, "Cho Rate ", &fxp.chorus_rate, .{ .min = 0.1, .max = 8, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6016, "Cho Depth", &fxp.chorus_depth, .{ .min = 0.5, .max = 10, .step = 0.5 });
+        _ = ctx.sliderF32Id(0x6017, "Cho Mix  ", &fxp.chorus_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6018, "Dist Drv ", &fxp.dist_drive, .{ .min = 1, .max = 20, .step = 0.5 });
+        _ = ctx.sliderF32Id(0x6019, "Dist Mix ", &fxp.dist_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        ctx.endBox();
         ctx.endBox();
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
         const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
@@ -270,12 +288,15 @@ pub fn main() !void {
         if (ctx.button(flabel)) params.filter_mode_idx = (params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
         const o2label = std.fmt.allocPrint(ctx.allocator(), "Osc2: {s}", .{WAVE_NAMES[params.osc2_wave_idx]}) catch "Osc2";
         if (ctx.button(o2label)) params.osc2_wave_idx = (params.osc2_wave_idx + 1) % WAVE_NAMES.len;
+        const fxlabel = if (fxp.bypass) "FX: off" else "FX: on";
+        if (ctx.button(fxlabel)) fxp.bypass = !fxp.bypass;
         ctx.endBox();
         ctx.endBox();
         ctx.endFrame();
 
         // パラメータを publish（atomic/patch publish 経由で audio スレッドへ。audio 側でスムージング）
         app.synth.publishPatch(makePatch(params));
+        app.fx.publishParams(makeFxParams(fxp));
 
         // 手動描画（背景 + 鍵盤 + スペクトログラム）→ その上に GUI
         drawSpectrogramBgAndPiano(fb, &pressed);
@@ -351,5 +372,32 @@ fn makePatch(p: Params) Patch {
         .osc2_detune = p.osc2_detune,
         .osc2_mix = p.osc2_mix,
         .noise_amount = p.noise_amount,
+    };
+}
+
+/// マスターエフェクト用 GUI パラメータ束(in-place 更新)。
+const FxParams = struct {
+    bypass: bool = false,
+    delay_time: f32 = 0.25, // 秒
+    delay_fb: f32 = 0.3,
+    delay_mix: f32 = 0.0,
+    chorus_rate: f32 = 0.8, // Hz
+    chorus_depth: f32 = 3.0, // ms
+    chorus_mix: f32 = 0.0,
+    dist_drive: f32 = 1.0,
+    dist_mix: f32 = 0.0,
+};
+
+fn makeFxParams(p: FxParams) Fx.Params {
+    return .{
+        .bypass = p.bypass,
+        .delay_time_s = p.delay_time,
+        .delay_feedback = p.delay_fb,
+        .delay_mix = p.delay_mix,
+        .chorus_rate = p.chorus_rate,
+        .chorus_depth_ms = p.chorus_depth,
+        .chorus_mix = p.chorus_mix,
+        .dist_drive = p.dist_drive,
+        .dist_mix = p.dist_mix,
     };
 }
