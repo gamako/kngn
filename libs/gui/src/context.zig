@@ -84,6 +84,11 @@ pub const Context = struct {
     pub const sliderI32Id = widgets.sliderI32Id;
     pub const sliderF32 = widgets.sliderF32;
     pub const sliderF32Id = widgets.sliderF32Id;
+    // HSV カラーピッカー（TASK-21.14）
+    pub const svSquare = widgets.svSquare;
+    pub const svSquareId = widgets.svSquareId;
+    pub const hueBar = widgets.hueBar;
+    pub const hueBarId = widgets.hueBarId;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{

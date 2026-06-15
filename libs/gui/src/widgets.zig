@@ -364,6 +364,176 @@ const SliderDraw = struct {
     }
 };
 
+// ── HSV カラーピッカー（TASK-21.14）─────────────────────────
+// 既存 DrawCmd.image を再利用してグラデを描く。グラデバッファは widget 呼び出し時に arena へ
+// 確保し custom leaf で dl.image する（render まで生存）。固定 px（dl.image は rect.w==src_w を
+// assert するため grow/stretch 不可）。前フレーム rect_cache 契約は Slider と同じ。
+
+pub const SvSquareOpts = struct {
+    /// null なら style.picker_sv_size。最小 2。
+    size: ?i32 = null,
+};
+
+pub const HueBarOpts = struct {
+    /// null なら style.picker_hue_w / picker_sv_size。w>=1, h>=2。
+    w: ?i32 = null,
+    h: ?i32 = null,
+};
+
+/// SV スクエア（自動 ID: label hash）。指定 hue で saturation(x)/value(y) を編集。値が変われば true。
+pub fn svSquare(ctx: *Context, label: []const u8, hue: f32, s: *f32, v: *f32, opts: SvSquareOpts) bool {
+    return svSquareId(ctx, ctx.id_stack.make(label), hue, s, v, opts);
+}
+
+/// 明示 ID 版。
+pub fn svSquareId(ctx: *Context, id: Id, hue: f32, s: *f32, v: *f32, opts: SvSquareOpts) bool {
+    const size = opts.size orelse ctx.style.picker_sv_size;
+    std.debug.assert(size >= 2);
+    const old_s = s.*;
+    const old_v = v.*;
+    // 表示/hit-test 用に [0,1] clamp（clamp は exact なので drift しない）
+    s.* = std.math.clamp(s.*, 0, 1);
+    v.* = std.math.clamp(v.*, 0, 1);
+
+    // hit-test / drag（square 全体が drag 領域。Slider の knob 限定とは異なり「面」を掴む）
+    if (ctx.rect_cache.get(id)) |cached| {
+        const r = cached.rect;
+        const res = context_mod.buttonBehavior(ctx, id, r, cached.clip);
+        if (res.held) {
+            const w1: f32 = @floatFromInt(@as(i32, @intCast(r.w)) - 1);
+            const h1: f32 = @floatFromInt(@as(i32, @intCast(r.h)) - 1);
+            const mx: f32 = @floatFromInt(ctx.input.mouse_pos.x - r.x);
+            const my: f32 = @floatFromInt(ctx.input.mouse_pos.y - r.y);
+            s.* = std.math.clamp(mx / w1, 0, 1);
+            v.* = std.math.clamp(1 - my / h1, 0, 1); // 上=明
+        }
+    }
+
+    // グラデバッファ（arena, [size*size]u32）
+    const usz: usize = @intCast(size);
+    const buf = ctx.allocator().alloc(u32, usz * usz) catch @panic("svSquare: OOM");
+    const denom: f32 = @floatFromInt(size - 1);
+    var py: usize = 0;
+    while (py < usz) : (py += 1) {
+        const vy = 1 - @as(f32, @floatFromInt(py)) / denom;
+        var px: usize = 0;
+        while (px < usz) : (px += 1) {
+            const sx = @as(f32, @floatFromInt(px)) / denom;
+            buf[py * usz + px] = @bitCast(Color.fromHsv(hue, sx, vy));
+        }
+    }
+    const data = ctx.allocator().create(SvSquareDraw) catch @panic("svSquare: OOM");
+    data.* = .{
+        .buf = buf,
+        .size = size,
+        .s = s.*,
+        .v = v.*,
+        .marker_light = ctx.style.picker_marker_light,
+        .marker_dark = ctx.style.picker_marker_dark,
+    };
+    ctx.beginBox(.{ .id = id, .width = .{ .fixed = size }, .height = .{ .fixed = size } });
+    ctx.custom(.{ .x = size, .y = size }, SvSquareDraw.draw, data);
+    ctx.endBox();
+
+    return s.* != old_s or v.* != old_v;
+}
+
+const SvSquareDraw = struct {
+    buf: []const u32,
+    size: i32,
+    s: f32,
+    v: f32,
+    marker_light: Color,
+    marker_dark: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const SvSquareDraw = @ptrCast(@alignCast(ctx_ptr));
+        const w: u32 = @intCast(self.size);
+        dl.image(rect, self.buf, w, w) catch @panic("svSquare: OOM");
+        // マーカー: (s,v) 位置に明/暗 2 重枠（背景色に依らず視認）
+        const w1: f32 = @floatFromInt(self.size - 1);
+        const mx: i32 = rect.x + @as(i32, @intFromFloat(@round(self.s * w1)));
+        const my: i32 = rect.y + @as(i32, @intFromFloat(@round((1 - self.v) * w1)));
+        const half: i32 = 3;
+        const outer: Rect = .{ .x = mx - half, .y = my - half, .w = @intCast(2 * half + 1), .h = @intCast(2 * half + 1) };
+        dl.rectOutline(outer, self.marker_dark, 1) catch @panic("svSquare: OOM");
+        const inner: Rect = .{ .x = outer.x + 1, .y = outer.y + 1, .w = outer.w - 2, .h = outer.h - 2 };
+        dl.rectOutline(inner, self.marker_light, 1) catch @panic("svSquare: OOM");
+    }
+};
+
+/// Hue バー（自動 ID: label hash）。縦方向に hue を編集。hue は常に [0,360)。値が変われば true。
+pub fn hueBar(ctx: *Context, label: []const u8, h: *f32, opts: HueBarOpts) bool {
+    return hueBarId(ctx, ctx.id_stack.make(label), h, opts);
+}
+
+/// 明示 ID 版。
+pub fn hueBarId(ctx: *Context, id: Id, h: *f32, opts: HueBarOpts) bool {
+    const bw = opts.w orelse ctx.style.picker_hue_w;
+    const bh = opts.h orelse ctx.style.picker_sv_size;
+    std.debug.assert(bw >= 1 and bh >= 2);
+    const old = h.*;
+    h.* = std.math.clamp(h.*, 0, 360 - 1e-3); // [0,360)
+
+    if (ctx.rect_cache.get(id)) |cached| {
+        const r = cached.rect;
+        const res = context_mod.buttonBehavior(ctx, id, r, cached.clip);
+        if (res.held) {
+            const hh: f32 = @floatFromInt(r.h);
+            const my: f32 = @floatFromInt(ctx.input.mouse_pos.y - r.y);
+            const t = std.math.clamp(my / hh, 0, 1);
+            h.* = @min(t * 360, 360 - 1e-3);
+        }
+    }
+
+    const uw: usize = @intCast(bw);
+    const uh: usize = @intCast(bh);
+    const buf = ctx.allocator().alloc(u32, uw * uh) catch @panic("hueBar: OOM");
+    const fbh: f32 = @floatFromInt(bh);
+    var py: usize = 0;
+    while (py < uh) : (py += 1) {
+        const hue = (@as(f32, @floatFromInt(py)) / fbh) * 360; // /bh で 360 を出さない
+        const col: u32 = @bitCast(Color.fromHsv(hue, 1, 1));
+        var px: usize = 0;
+        while (px < uw) : (px += 1) buf[py * uw + px] = col;
+    }
+    const data = ctx.allocator().create(HueBarDraw) catch @panic("hueBar: OOM");
+    data.* = .{
+        .buf = buf,
+        .w = bw,
+        .h = bh,
+        .hue = h.*,
+        .marker_light = ctx.style.picker_marker_light,
+        .marker_dark = ctx.style.picker_marker_dark,
+    };
+    ctx.beginBox(.{ .id = id, .width = .{ .fixed = bw }, .height = .{ .fixed = bh } });
+    ctx.custom(.{ .x = bw, .y = bh }, HueBarDraw.draw, data);
+    ctx.endBox();
+
+    return h.* != old;
+}
+
+const HueBarDraw = struct {
+    buf: []const u32,
+    w: i32,
+    h: i32,
+    hue: f32,
+    marker_light: Color,
+    marker_dark: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const HueBarDraw = @ptrCast(@alignCast(ctx_ptr));
+        dl.image(rect, self.buf, @intCast(self.w), @intCast(self.h)) catch @panic("hueBar: OOM");
+        // マーカー（横帯）: row = clamp(floor(hue/360*h), 0, h-1)（fill の /h 規約と一致）
+        const fbh: f32 = @floatFromInt(self.h);
+        const rowf = @floor(self.hue / 360.0 * fbh);
+        const row: i32 = std.math.clamp(@as(i32, @intFromFloat(rowf)), 0, self.h - 1);
+        const my = rect.y + row;
+        dl.rectFilled(.{ .x = rect.x, .y = my - 1, .w = rect.w, .h = 3 }, self.marker_dark) catch @panic("hueBar: OOM");
+        dl.rectFilled(.{ .x = rect.x, .y = my, .w = rect.w, .h = 1 }, self.marker_light) catch @panic("hueBar: OOM");
+    }
+};
+
 // ============================================================
 // Tests
 // ============================================================
@@ -847,4 +1017,105 @@ test "sliderF32: 中間ドラッグで step 単位に丸まる（AC#3 の f32 �
     ctx.endFrame();
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), v, 0.001); // step なしなら ≈0.30
+}
+
+// ── HSV ピッカー テスト（TASK-21.14）─────────────────────
+const PICKER_ID: Id = 901;
+
+test "svSquare: 領域内ドラッグで s,v が更新され [0,1] clamp（AC#2）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var s: f32 = 0;
+    var v: f32 = 1;
+
+    // frame1: キャッシュ生成（size 固定 64 で検証）
+    ctx.beginFrame(800, 600);
+    _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+    const r = ctx.getNodeRect(PICKER_ID).?;
+
+    // frame2: 右下端の外まで drag → s=1, v=0（下=暗）。clamp 確認
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, r.x + 5, r.y + 5);
+    moveTo(&ctx, r.x + @as(i32, @intCast(r.w)) + 50, r.y + @as(i32, @intCast(r.h)) + 50);
+    const changed = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+
+    try std.testing.expect(changed);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), s, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), v, 0.001);
+}
+
+test "svSquare: 領域外 press では active を取得しない（hit-test 領域限定）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var s: f32 = 0.5;
+    var v: f32 = 0.5;
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+    const r = ctx.getNodeRect(PICKER_ID).?;
+
+    // square の外を press → drag。値は変わらない
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, r.x + @as(i32, @intCast(r.w)) + 30, r.y + 5);
+    moveTo(&ctx, r.x + 10, r.y + 10);
+    const changed = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(f32, 0.5), s);
+    try std.testing.expectEqual(@as(f32, 0.5), v);
+}
+
+test "svSquare: dl.image が発行される" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var s: f32 = 0.3;
+    var v: f32 = 0.7;
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 32 });
+    ctx.endFrame();
+
+    var has_image = false;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .image) {
+            has_image = true;
+            try std.testing.expectEqual(@as(u32, 32), cmd.image.src_w);
+            try std.testing.expectEqual(@as(u32, 32), cmd.image.src_h);
+        }
+    }
+    try std.testing.expect(has_image);
+}
+
+test "hueBar: ドラッグで h が [0,360) で更新される（AC#3）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var h: f32 = 0;
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
+    ctx.endFrame();
+    const r = ctx.getNodeRect(PICKER_ID).?;
+
+    // 下端の外まで drag → h は 360 未満の最大付近
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, r.x + 8, r.y + 2);
+    moveTo(&ctx, r.x + 8, r.y + @as(i32, @intCast(r.h)) + 50);
+    const changed = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
+    ctx.endFrame();
+
+    try std.testing.expect(changed);
+    try std.testing.expect(h >= 0 and h < 360);
+    try std.testing.expect(h > 300); // 下端付近は高い hue
+
+    // 中ほどへ drag → 約 180
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, r.x + 8, r.y + @as(i32, @intCast(r.h)) + 50); // active 継続のため一度離さず再 press 不要だが明示
+    moveTo(&ctx, r.x + 8, r.y + @as(i32, @intCast(@divTrunc(r.h, 2))));
+    _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
+    ctx.endFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 180), h, 20);
 }

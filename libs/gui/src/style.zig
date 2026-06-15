@@ -37,6 +37,11 @@ pub const Style = struct {
     slider_track_bg: Color = Color.rgba(0x30, 0x30, 0x38, 0xFF),
     slider_knob_bg: Color = Color.rgba(0x90, 0x98, 0xA0, 0xFF),
     slider_knob_active_bg: Color = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
+    // HSV カラーピッカー（TASK-21.14）。SV スクエア / Hue バーは固定 px（dl.image の制約）。
+    picker_sv_size: i32 = 128,
+    picker_hue_w: i32 = 16,
+    picker_marker_light: Color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+    picker_marker_dark: Color = Color.rgba(0x00, 0x00, 0x00, 0xFF),
 };
 
 /// 既存 example（09/10）系統のダークテーマ。text は白（21.4 までの label 既定色と同じ）。

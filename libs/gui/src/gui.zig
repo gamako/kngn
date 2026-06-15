@@ -63,6 +63,8 @@ pub const ButtonOpts = @import("widgets.zig").ButtonOpts;
 pub const SwatchOpts = @import("widgets.zig").SwatchOpts;
 pub const SliderI32Opts = @import("widgets.zig").SliderI32Opts;
 pub const SliderF32Opts = @import("widgets.zig").SliderF32Opts;
+pub const SvSquareOpts = @import("widgets.zig").SvSquareOpts;
+pub const HueBarOpts = @import("widgets.zig").HueBarOpts;
 
 // test-gui 用に各ファイルの test を収集する。
 // `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
