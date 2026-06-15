@@ -7,6 +7,7 @@ const oscillator = @import("oscillator.zig");
 const envelope = @import("envelope.zig");
 const filter = @import("filter.zig");
 const mixer = @import("mixer.zig");
+const fft_mod = @import("fft.zig");
 
 pub const Waveform = oscillator.Waveform;
 pub const Oscillator = oscillator.Oscillator;
@@ -20,10 +21,17 @@ pub const applyGain = mixer.applyGain;
 pub const mixAdd = mixer.mixAdd;
 pub const StereoGain = mixer.StereoGain;
 pub const equalPowerPan = mixer.equalPowerPan;
+pub const downmixStereoToMono = mixer.downmixStereoToMono;
+
+// FFT / 窓（スペクトログラム可視化用、メインスレッドで実行）
+pub const fft = fft_mod.fft;
+pub const applyHann = fft_mod.applyHann;
+pub const magnitudeSpectrum = fft_mod.magnitudeSpectrum;
 
 test {
     _ = oscillator;
     _ = envelope;
     _ = filter;
     _ = mixer;
+    _ = fft_mod;
 }

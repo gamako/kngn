@@ -13,6 +13,14 @@ pub fn mixAdd(dst: []f32, src: []const f32) void {
     for (dst, src) |*d, s| d.* += s;
 }
 
+/// interleaved stereo を mono にダウンミックス((L+R)/2)。`mono.len*2 <= interleaved.len`。
+/// スペクトログラム入力用（メインスレッドで実行）。
+pub fn downmixStereoToMono(interleaved: []const f32, mono: []f32) void {
+    for (mono, 0..) |*m, i| {
+        m.* = (interleaved[i * 2] + interleaved[i * 2 + 1]) * 0.5;
+    }
+}
+
 pub const StereoGain = struct { l: f32, r: f32 };
 
 /// 等パワーパン。pan は -1(左)..0(中央)..+1(右)。
@@ -39,6 +47,13 @@ test "mixAdd" {
     const src = [_]f32{ 0.5, -0.5, 2 };
     mixAdd(&dst, &src);
     try testing.expectEqualSlices(f32, &[_]f32{ 1.5, 0.5, 3 }, &dst);
+}
+
+test "downmixStereoToMono: averages L and R" {
+    const stereo = [_]f32{ 1.0, 0.0, 0.5, 0.5, -1.0, 1.0 };
+    var mono: [3]f32 = undefined;
+    downmixStereoToMono(&stereo, &mono);
+    try testing.expectEqualSlices(f32, &[_]f32{ 0.5, 0.5, 0.0 }, &mono);
 }
 
 test "equalPowerPan: center is equal, power sums to ~1" {

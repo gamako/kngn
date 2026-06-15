@@ -333,6 +333,18 @@ pub fn build(b: *std.Build) void {
     const test_dsp_step = b.step("test-dsp", "Run src/dsp unit tests");
     test_dsp_step.dependOn(&run_dsp_test.step);
 
+    // apps/synth スペクトログラム解析テスト (FFT 列ロジック)
+    const spec_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/synth/spectrogram.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spec_test_mod.addImport("dsp", example_modules.dsp);
+    const spec_test = b.addTest(.{ .root_module = spec_test_mod });
+    const run_spec_test = b.addRunArtifact(spec_test);
+    const test_spec_step = b.step("test-spectrogram", "Run apps/synth spectrogram tests");
+    test_spec_step.dependOn(&run_spec_test.step);
+
     // ========================================
     // 集約 test ステップ (全 test-* を束ねる)
     // 注: テスト実行のみ。example の build 回帰は `zig build -Dinstall-all=true` で別途確認する。
@@ -347,6 +359,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_dsp_step);
+    test_step.dependOn(test_spec_step);
 
     // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
@@ -644,6 +657,7 @@ fn addSynthExe(
     exe.root_module.addImport("platform", modules.platform);
     exe.root_module.addImport("audio", modules.audio);
     exe.root_module.addImport("synth", modules.synth);
+    exe.root_module.addImport("dsp", modules.dsp); // mono downmix + FFT(スペクトログラム)
     exe.root_module.linkFramework("AudioToolbox", .{}); // L1 オーディオ出力
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
