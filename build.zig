@@ -289,6 +289,17 @@ pub fn build(b: *std.Build) void {
     const test_font_step = b.step("test-font", "Run libs/font unit tests");
     test_font_step.dependOn(&run_font_test.step);
 
+    // libs/synth テスト (SPSC リング / NoteQueue / atomic パラメータ / 出力タップ)
+    const synth_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/synth/src/synth.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const synth_test = b.addTest(.{ .root_module = synth_test_mod });
+    const run_synth_test = b.addRunArtifact(synth_test);
+    const test_synth_step = b.step("test-synth", "Run libs/synth unit tests");
+    test_synth_step.dependOn(&run_synth_test.step);
+
     // ========================================
     // 集約 test ステップ (全 test-* を束ねる)
     // 注: テスト実行のみ。example の build 回帰は `zig build -Dinstall-all=true` で別途確認する。
@@ -301,6 +312,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_sprite_step);
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
+    test_step.dependOn(test_synth_step);
 
     // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
@@ -399,6 +411,7 @@ const ExampleModules = struct {
     font: *std.Build.Module,
     gui: *std.Build.Module,
     audio: *std.Build.Module,
+    synth: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         const platform_mod = platform.createPlatformModule(
@@ -445,6 +458,11 @@ const ExampleModules = struct {
             .root_source_file = b.path("src/audio.zig"),
         });
 
+        // synth (L3): GUI⇔Audio 受け渡し機構ほか。platform / GUI 非依存の純 Zig。
+        const synth_mod = b.createModule(.{
+            .root_source_file = b.path("libs/synth/src/synth.zig"),
+        });
+
         return .{
             .platform = platform_mod,
             .keyboard = keyboard_mod,
@@ -460,6 +478,7 @@ const ExampleModules = struct {
             .font = font_mod,
             .gui = gui,
             .audio = audio_mod,
+            .synth = synth_mod,
         };
     }
 };
