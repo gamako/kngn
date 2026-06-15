@@ -1,35 +1,39 @@
-//! apps/synth — PC キーボードで演奏する最小シンセ + スペクトログラム (TASK-27.5 / 27.8)。
+//! apps/synth — シンセ本体 (TASK-27.5 / 27.6 / 27.8)。
 //!
-//! A..K 列を C4..C5 にマップし、key_down/up を Synth(libs/synth) へ送る。音は L1 audio の
-//! RT コールバックから Synth.render で生成。出力は出力タップ(SampleTap)経由でメインスレッドへ渡し、
-//! mono downmix + FFT してスペクトログラムを描画する（GUI⇔Audio はロックフリー）。
+//! 入力: PC キーボード(A..K=C4..C5) と GUI 画面鍵盤(クリック)。
+//! 操作: GUI スライダで cutoff/resonance/gain/attack/release、ボタンで波形を変更（atomic/patch publish）。
+//! 表示: 出力タップ→mono downmix→FFT のスペクトログラム。
+//! 音は L1 audio の RT コールバックから Synth.render（GUI⇔Audio はロックフリー）。
 
 const std = @import("std");
 const platform = @import("platform");
 const audio = @import("audio");
 const synthlib = @import("synth");
 const dsp = @import("dsp");
+const gui = @import("gui");
 const spectrogram = @import("spectrogram.zig");
 
 const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);
-const Tap = synthlib.SampleTap(8192); // 出力タップ（interleaved stereo）
+const Tap = synthlib.SampleTap(8192);
+const Patch = synthlib.Patch;
 
 const NOTE_LOW = 60; // C4
 const NOTE_HIGH = 72; // C5
+const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
-// 画面レイアウト
+// レイアウト
 const WIN_W = 560;
-const WIN_H = 300;
-const KEYS_H = 110; // 上部: 押下ノートのバー
-const SPEC_W = 512;
-const SPEC_H = 160;
-const SPEC_X0 = 24;
-const SPEC_Y0 = 124;
+const WIN_H = 380;
+const SPEC_X0 = 20;
+const SPEC_Y0 = 210;
+const SPEC_W = 520;
+const SPEC_H = 100;
+const PIANO_Y0 = 320;
+const PIANO_H = 55;
 
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
 
-/// RT スレッドで呼ばれる。Synth.render → 出力タップへコピー（コピーのみ・満杯 drop）。
 const App = struct {
     synth: Synth,
     tap: Tap,
@@ -39,7 +43,7 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
     _ = sample_rate;
     const app: *App = @ptrCast(@alignCast(userdata.?));
     app.synth.render(buf, frames, channels);
-    app.tap.write(buf); // 出力タップ（RT はコピーのみ）
+    app.tap.write(buf);
 }
 
 fn keyToNote(key: platform.KeyCode) ?u8 {
@@ -50,48 +54,84 @@ fn keyToNote(key: platform.KeyCode) ?u8 {
     };
 }
 
-fn drawKeysAndBg(fb: platform.Framebuffer, pressed: *const [128]bool) void {
+/// 画面鍵盤の当たり判定。ピアノ領域内の x,y からノート番号を返す。
+fn pianoHitTest(x: i32, y: i32) ?u8 {
+    if (y < PIANO_Y0 or y >= PIANO_Y0 + PIANO_H) return null;
+    if (x < 0 or x >= WIN_W) return null;
+    const idx = @as(usize, @intCast(x)) * NOTE_COUNT / WIN_W;
+    return @intCast(NOTE_LOW + idx);
+}
+
+fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool) void {
     const w: usize = fb.width;
     const h: usize = fb.height;
-    const bg: u32 = 0x101018FF;
-    for (fb.pixels) |*p| p.* = bg;
+    @memset(fb.pixels, 0xFF_10_10_18); // RGBA: 0x101018FF をリトルエンディアン u32 で
 
-    // 上部 KEYS_H に押下ノートを縦バー表示
-    const keys_h = @min(@as(usize, KEYS_H), h);
-    const n: usize = NOTE_HIGH - NOTE_LOW + 1;
+    // 画面鍵盤（下部）。白鍵/黒鍵を区別し、押下中はハイライト。
     var note: usize = NOTE_LOW;
     while (note <= NOTE_HIGH) : (note += 1) {
-        if (!pressed[note]) continue;
         const idx = note - NOTE_LOW;
-        const x0 = idx * w / n;
-        const x1 = (idx + 1) * w / n;
-        const col: u32 = 0x40C0FFFF;
-        var y: usize = 0;
-        while (y < keys_h) : (y += 1) {
+        const x0 = idx * w / NOTE_COUNT;
+        const x1 = (idx + 1) * w / NOTE_COUNT;
+        const semitone = note % 12;
+        const is_black = (semitone == 1 or semitone == 3 or semitone == 6 or semitone == 8 or semitone == 10);
+        const base: u32 = if (is_black) 0xFF_30_30_38 else 0xFF_C8_C8_D0;
+        const lit: u32 = 0xFF_FF_C0_40; // 押下中
+        const col = if (pressed[note]) lit else base;
+        var y: usize = PIANO_Y0;
+        while (y < @min(PIANO_Y0 + PIANO_H, h)) : (y += 1) {
             var x = x0;
             while (x < x1) : (x += 1) fb.pixels[y * w + x] = col;
         }
     }
 }
 
+const WAVE_NAMES = [_][]const u8{ "sine", "saw", "square", "triangle" };
+fn waveOf(idx: usize) dsp.Waveform {
+    return switch (idx) {
+        0 => .sine,
+        1 => .saw,
+        2 => .square,
+        else => .triangle,
+    };
+}
+
+fn buttonToU8(b: platform.MouseButton) u8 {
+    return switch (b) {
+        .left => 0,
+        .right => 1,
+        .middle => 2,
+        else => 0xFF,
+    };
+}
+
+fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
+    return switch (ev) {
+        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
+        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
+        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
+        else => null,
+    };
+}
+
 pub fn main() !void {
-    std.debug.print("apps/synth: A..K = C4..C5, W/E/T/Y/U = 黒鍵, ESC で終了\n", .{});
+    std.debug.print("apps/synth: A..K=C4..C5 / 画面鍵盤クリック / スライダで音色変更 / ESC 終了\n", .{});
 
     const allocator = std.heap.c_allocator;
 
     var app = try allocator.create(App);
     defer allocator.destroy(app);
+
+    // スライダ用パラメータ（GUI が in-place 更新）
+    var cutoff: f32 = 6000;
+    var resonance: f32 = 1.2;
+    var gain: f32 = 0.2;
+    var attack: f32 = 0.01;
+    var release: f32 = 0.2;
+    var wave_idx: usize = 1; // saw
+
     app.* = .{
-        .synth = Synth.init(48000, .{
-            .waveform = .saw,
-            .attack = 0.01,
-            .decay = 0.15,
-            .sustain = 0.6,
-            .release = 0.2,
-            .cutoff = 6000,
-            .resonance = 1.2,
-            .gain = 0.2,
-        }),
+        .synth = Synth.init(48000, makePatch(cutoff, resonance, gain, attack, release, wave_idx)),
         .tap = .{},
     };
 
@@ -102,8 +142,11 @@ pub fn main() !void {
     try platform.init();
     defer platform.shutdown();
 
-    var window = try platform.Window.create(WIN_W, WIN_H, "synth - keyboard + spectrogram");
+    var window = try platform.Window.create(WIN_W, WIN_H, "synth - keyboard + sliders + spectrogram");
     defer window.destroy();
+
+    var ctx = gui.Context.init(allocator, gui.default_font);
+    defer ctx.deinit();
 
     const device = audio.open(allocator, .{
         .sample_rate = 48000,
@@ -117,41 +160,65 @@ pub fn main() !void {
     };
     defer device.close();
 
-    // 実効 SR を反映（start 前＝コールバック未発火なので安全）。
     app.synth.sample_rate = @floatFromInt(device.config().sample_rate);
     try device.start();
     defer device.stop();
 
     var pressed = [_]bool{false} ** 128;
+    var mouse_note: ?u8 = null; // マウスで押している鍵
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
     var running = true;
-    while (running) {
-        _ = window.pollEvents();
-        while (window.nextEvent()) |ev| switch (ev) {
-            .quit => running = false,
-            .key_down => |k| {
-                if (k.key == .ESCAPE) {
-                    running = false;
-                } else if (keyToNote(k.key)) |note| {
-                    if (!k.is_repeat and !pressed[note]) {
-                        pressed[note] = true;
-                        _ = app.synth.sendNoteOn(note, 1.0);
+
+    main_loop: while (running and window.pollEvents()) {
+        const fb = window.lockFramebuffer() orelse continue :main_loop;
+        defer fb.unlock();
+
+        ctx.beginFrame(fb.width, fb.height);
+
+        while (window.nextEvent()) |ev| {
+            switch (ev) {
+                .quit => running = false,
+                .key_down => |k| {
+                    if (k.key == .ESCAPE) {
+                        running = false;
+                    } else if (keyToNote(k.key)) |note| {
+                        if (!k.is_repeat and !pressed[note]) {
+                            pressed[note] = true;
+                            _ = app.synth.sendNoteOn(note, 1.0);
+                        }
                     }
-                }
-            },
-            .key_up => |k| {
-                if (keyToNote(k.key)) |note| {
-                    if (pressed[note]) {
+                },
+                .key_up => |k| {
+                    if (keyToNote(k.key)) |note| {
+                        if (pressed[note]) {
+                            pressed[note] = false;
+                            _ = app.synth.sendNoteOff(note);
+                        }
+                    }
+                },
+                .mouse_down => |m| {
+                    if (pianoHitTest(m.x, m.y)) |note| {
+                        mouse_note = note;
+                        if (!pressed[note]) {
+                            pressed[note] = true;
+                            _ = app.synth.sendNoteOn(note, 1.0);
+                        }
+                    }
+                },
+                .mouse_up => {
+                    if (mouse_note) |note| {
                         pressed[note] = false;
                         _ = app.synth.sendNoteOff(note);
+                        mouse_note = null;
                     }
-                }
-            },
-            else => {},
-        };
+                },
+                else => {},
+            }
+            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+        }
 
-        // 出力タップを drain → mono downmix → スペクトログラムへ
+        // 出力タップを drain → mono downmix → スペクトログラム
         while (true) {
             const n = app.tap.read(&stereo);
             if (n < 2) break;
@@ -160,14 +227,51 @@ pub fn main() !void {
             spec.feed(mono[0..frames]);
         }
 
-        if (window.lockFramebuffer()) |fb| {
-            drawKeysAndBg(fb, &pressed);
-            spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
-            fb.unlock();
-        }
+        // GUI コントロールパネル（上部）を構築
+        ctx.beginBox(.{
+            .direction = .column,
+            .padding = .{ 12, 12, 12, 12 },
+            .gap = 6,
+            .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+        });
+        ctx.label("Synth controls (drag knobs):");
+        _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &cutoff, .{ .min = 100, .max = 18000, .step = 10 });
+        _ = ctx.sliderF32Id(0x6002, "Resonance", &resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6003, "Gain     ", &gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6004, "Attack   ", &attack, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6005, "Release  ", &release, .{ .min = 0.01, .max = 2, .step = 0.01 });
+        ctx.beginBox(.{ .direction = .row, .gap = 8 });
+        const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[wave_idx]}) catch "Wave";
+        if (ctx.button(wlabel)) wave_idx = (wave_idx + 1) % WAVE_NAMES.len;
+        ctx.endBox();
+        ctx.endBox();
+        ctx.endFrame();
+
+        // パラメータを publish（atomic/patch publish 経由で audio スレッドへ。audio 側でスムージング）
+        app.synth.publishPatch(makePatch(cutoff, resonance, gain, attack, release, wave_idx));
+
+        // 手動描画（背景 + 鍵盤 + スペクトログラム）→ その上に GUI
+        drawSpectrogramBgAndPiano(fb, &pressed);
+        spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
+        const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
+        gui.render(target, &ctx.draw_list, ctx.font);
+
         window.present();
 
-        var req = std.c.timespec{ .sec = 0, .nsec = 16_000_000 }; // ~60fps
+        var req = std.c.timespec{ .sec = 0, .nsec = 16_000_000 };
         _ = std.c.nanosleep(&req, null);
     }
+}
+
+fn makePatch(cutoff: f32, resonance: f32, gain: f32, attack: f32, release: f32, wave_idx: usize) Patch {
+    return .{
+        .waveform = waveOf(wave_idx),
+        .attack = attack,
+        .decay = 0.15,
+        .sustain = 0.6,
+        .release = release,
+        .cutoff = cutoff,
+        .resonance = resonance,
+        .gain = gain,
+    };
 }

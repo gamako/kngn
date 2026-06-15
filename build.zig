@@ -658,6 +658,7 @@ fn addSynthExe(
     exe.root_module.addImport("audio", modules.audio);
     exe.root_module.addImport("synth", modules.synth);
     exe.root_module.addImport("dsp", modules.dsp); // mono downmix + FFT(スペクトログラム)
+    exe.root_module.addImport("gui", modules.gui); // スライダ / ボタン（演奏 UI）
     exe.root_module.linkFramework("AudioToolbox", .{}); // L1 オーディオ出力
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);

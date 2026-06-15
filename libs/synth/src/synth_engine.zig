@@ -21,11 +21,18 @@ pub fn Synth(comptime max_voices: usize) type {
         patch_db: params.DoubleBuffer(Patch),
         sample_rate: f32,
         panic_seen: u32 = 0,
+        // パラメータスムージング（急変クリック回避）: gain はブロック内線形ランプ、cutoff は一次平滑。
+        smoothed_gain: f32,
+        smoothed_cutoff: f32,
+
+        const cutoff_smooth: f32 = 0.3; // 一次平滑係数（0..1、大きいほど速く追従）
 
         pub fn init(sample_rate: f32, initial_patch: Patch) Self {
             return .{
                 .patch_db = params.DoubleBuffer(Patch).init(initial_patch),
                 .sample_rate = sample_rate,
+                .smoothed_gain = initial_patch.gain,
+                .smoothed_cutoff = initial_patch.cutoff,
             };
         }
 
@@ -59,19 +66,28 @@ pub fn Synth(comptime max_voices: usize) type {
             // 2. パニック（全ノートオフ）
             if (self.queue.takePanic(&self.panic_seen)) self.pool.allNotesOff();
 
-            // 3. patch を読み（整合的なスナップショット）、ブロック先頭で filter 反映
+            // 3. patch を読み（整合的なスナップショット）。cutoff は一次平滑してブロック先頭で filter 反映。
             const patch = self.currentPatch();
-            self.pool.prepareBlock(patch);
+            self.smoothed_cutoff += (patch.cutoff - self.smoothed_cutoff) * cutoff_smooth;
+            var block_patch = patch;
+            block_patch.cutoff = self.smoothed_cutoff;
+            self.pool.prepareBlock(block_patch);
 
-            // 4. フレームごとに合成して interleaved 書き込み
+            // 4. フレームごとに合成して interleaved 書き込み。gain はブロック内で線形ランプ（zipper 回避）。
+            const g0 = self.smoothed_gain;
+            const g1 = patch.gain;
+            const inv: f32 = if (frames > 0) 1.0 / @as(f32, @floatFromInt(frames)) else 0;
             var i: u32 = 0;
             while (i < frames) : (i += 1) {
-                const sample = self.pool.renderSample(self.sample_rate) * patch.gain;
+                const t: f32 = @as(f32, @floatFromInt(i)) * inv;
+                const gain = g0 + (g1 - g0) * t;
+                const sample = self.pool.renderSample(self.sample_rate) * gain;
                 var ch: u32 = 0;
                 while (ch < channels) : (ch += 1) {
                     buf[i * channels + ch] = sample;
                 }
             }
+            self.smoothed_gain = g1;
         }
 
         fn currentPatch(self: *Self) Patch {
@@ -135,6 +151,22 @@ test "Synth.render: panic (all notes off) silences active voices" {
     for (synth.pool.voices) |v| {
         if (v.active) try testing.expectEqual(dsp.Envelope.Stage.release, v.env.stage);
     }
+}
+
+test "Synth: cutoff/gain are smoothed (no instant jump on patch change)" {
+    var synth = Synth(4).init(48000, .{ .cutoff = 1000, .gain = 0.0, .sustain = 1.0, .attack = 0.0 });
+    // 目標を大きく変える
+    synth.publishPatch(.{ .cutoff = 5000, .gain = 1.0, .sustain = 1.0, .attack = 0.0 });
+    var buf: [64]f32 = undefined;
+    synth.render(&buf, 32, 2);
+    // cutoff は一次平滑で 1 ブロックでは目標へ到達しない（1000 と 5000 の中間）
+    try testing.expect(synth.smoothed_cutoff > 1000.0 and synth.smoothed_cutoff < 5000.0);
+    // gain も 1 ブロック後に目標へ（ランプ後）
+    try testing.expectApproxEqAbs(@as(f32, 1.0), synth.smoothed_gain, 1e-6);
+    // 数ブロックで cutoff は目標へ収束
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) synth.render(&buf, 32, 2);
+    try testing.expectApproxEqAbs(@as(f32, 5000.0), synth.smoothed_cutoff, 1.0);
 }
 
 test "Synth: publishPatch changes waveform used by subsequent notes" {
