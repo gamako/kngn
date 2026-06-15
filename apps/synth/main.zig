@@ -104,6 +104,54 @@ fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool
     }
 }
 
+fn putFb(fb: platform.Framebuffer, x: usize, y: usize, c: u32) void {
+    if (x >= fb.width or y >= fb.height) return;
+    fb.pixels[y * fb.width + x] = c;
+}
+
+const FreqLabel = struct { hz: f32, text: []const u8 };
+const FREQ_LABELS = [_]FreqLabel{
+    .{ .hz = 100, .text = "100Hz" },
+    .{ .hz = 1000, .text = "1kHz" },
+    .{ .hz = 10000, .text = "10kHz" },
+};
+
+/// スペクトログラムに対数周波数ラベル(左内側)と dB カラースケール凡例(帯の下のすき間)を重ね描き。
+fn drawSpecLabels(fb: platform.Framebuffer, spec: *const Spec) void {
+    const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
+    const clip: gui.Rect = .{ .x = 0, .y = 0, .w = @intCast(fb.width), .h = @intCast(fb.height) };
+    const label_col = gui.Color.rgba(0xE0, 0xE0, 0xE0, 0xFF);
+    const tick_col = rgba(0xFF, 0xFF, 0xFF, 0xFF);
+
+    // 周波数ラベル(対数軸位置)。tick は実位置、テキスト y は領域内に clamp。
+    const ty_min: i32 = SPEC_Y0;
+    const ty_max: i32 = SPEC_Y0 + SPEC_H - 16; // font 高 16 ぶん上端を確保
+    for (FREQ_LABELS) |fl| {
+        const off = spec.rowOffsetForFreq(fl.hz) orelse continue;
+        const tick_y = SPEC_Y0 + off;
+        var tx: usize = SPEC_X0;
+        while (tx < SPEC_X0 + 6) : (tx += 1) putFb(fb, tx, tick_y, tick_col);
+        const ty = std.math.clamp(@as(i32, @intCast(tick_y)) - 8, ty_min, ty_max);
+        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = ty }, fl.text, label_col, clip);
+    }
+
+    // dB カラースケール凡例(帯の下 y=420..440): "-60dB" [横グラデ] "0dB"
+    const leg_y = SPEC_Y0 + SPEC_H + 2; // 422
+    const bar_x0 = SPEC_X0 + 56; // "-60dB"(5文字=40px)の右
+    const bar_w: usize = 160;
+    const bar_y = leg_y + 2;
+    const bar_h: usize = 10;
+    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = leg_y }, "-60dB", label_col, clip);
+    var lx: usize = 0;
+    while (lx < bar_w) : (lx += 1) {
+        const v: u8 = @intCast(lx * 255 / (bar_w - 1));
+        const c = spectrogram.intensityColor(v);
+        var ly: usize = 0;
+        while (ly < bar_h) : (ly += 1) putFb(fb, bar_x0 + lx, bar_y + ly, c);
+    }
+    gui.default_bitmap_font.drawTo(target, .{ .x = bar_x0 + bar_w + 6, .y = leg_y }, "0dB", label_col, clip);
+}
+
 const WAVE_NAMES = [_][]const u8{ "sine", "saw", "square", "triangle" };
 fn waveOf(idx: usize) dsp.Waveform {
     return switch (idx) {
@@ -152,7 +200,7 @@ pub fn main() !void {
 
     const spec = try allocator.create(Spec);
     defer allocator.destroy(spec);
-    spec.init();
+    spec.init(48000); // 仮 sr。audio.open 後に setSampleRate で対数軸を再算出
 
     // オシロスコープ(リング大なので heap 確保) + レベルメータ
     const osc = try allocator.create(Scope);
@@ -183,6 +231,7 @@ pub fn main() !void {
 
     app.synth.sample_rate = @floatFromInt(device.config().sample_rate);
     app.fx.setSampleRate(@floatFromInt(device.config().sample_rate)); // reverb タップ再算出(start 前)
+    spec.setSampleRate(@floatFromInt(device.config().sample_rate)); // 対数周波数軸を実 sr で再算出
     try device.start();
     defer device.stop();
 
@@ -323,6 +372,7 @@ pub fn main() !void {
         spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
         osc.draw(fb.pixels, fb.width, fb.height, SCOPE_X0, VIS_Y0);
         meter.draw(fb.pixels, fb.width, fb.height, METER_X0, VIS_Y0, METER_W, VIS_H);
+        drawSpecLabels(fb, spec); // 周波数ラベル + カラースケール凡例
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font);
 
