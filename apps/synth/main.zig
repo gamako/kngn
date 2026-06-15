@@ -24,14 +24,14 @@ const NOTE_LOW = 60; // C4
 const NOTE_HIGH = 72; // C5
 const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
-// レイアウト（コントロールパネルは 4 カラム。パネル下にスペクトログラム、最下部に鍵盤）
+// レイアウト（コントロールパネルは 4 カラム。FX カラムが 11 行と高いので縦に余裕を持たせる）
 const WIN_W = 1080;
-const WIN_H = 440;
+const WIN_H = 520;
 const SPEC_X0 = 20;
-const SPEC_Y0 = 250;
+const SPEC_Y0 = 300;
 const SPEC_W = 1040;
 const SPEC_H = 120;
-const PIANO_Y0 = 380;
+const PIANO_Y0 = 440;
 const PIANO_H = 55;
 
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
@@ -167,7 +167,7 @@ pub fn main() !void {
     defer device.close();
 
     app.synth.sample_rate = @floatFromInt(device.config().sample_rate);
-    app.fx.sample_rate = @floatFromInt(device.config().sample_rate);
+    app.fx.setSampleRate(@floatFromInt(device.config().sample_rate)); // reverb タップ再算出(start 前)
     try device.start();
     defer device.stop();
 
@@ -279,6 +279,9 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x6017, "Cho Mix  ", &fxp.chorus_mix, .{ .min = 0, .max = 1, .step = 0.05 });
         _ = ctx.sliderF32Id(0x6018, "Dist Drv ", &fxp.dist_drive, .{ .min = 1, .max = 20, .step = 0.5 });
         _ = ctx.sliderF32Id(0x6019, "Dist Mix ", &fxp.dist_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x601A, "Rev Mix  ", &fxp.reverb_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x601B, "Rev Decay", &fxp.reverb_decay, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x601C, "Rev Damp ", &fxp.reverb_damping, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
         ctx.endBox();
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
@@ -386,6 +389,9 @@ const FxParams = struct {
     chorus_mix: f32 = 0.0,
     dist_drive: f32 = 1.0,
     dist_mix: f32 = 0.0,
+    reverb_mix: f32 = 0.0,
+    reverb_decay: f32 = 0.5,
+    reverb_damping: f32 = 0.3,
 };
 
 fn makeFxParams(p: FxParams) Fx.Params {
@@ -399,5 +405,8 @@ fn makeFxParams(p: FxParams) Fx.Params {
         .chorus_mix = p.chorus_mix,
         .dist_drive = p.dist_drive,
         .dist_mix = p.dist_mix,
+        .reverb_mix = p.reverb_mix,
+        .reverb_decay = p.reverb_decay,
+        .reverb_damping = p.reverb_damping,
     };
 }

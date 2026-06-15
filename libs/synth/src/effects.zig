@@ -1,14 +1,15 @@
-//! マスターエフェクトチェーン(TASK-27.14)。
+//! マスターエフェクトチェーン(TASK-27.14 / リバーブ追加 27.15)。
 //!
 //! `Synth.render` の後・出力タップの前で interleaved stereo(or mono) バッファを **in-place** 処理する。
-//! チェーン順: distortion → chorus → delay(feedback)。各段は mix=0 で実質無効(ただし内部状態は更新継続=
-//! 可聴バイパスであって凍結ではない)。完全な無効化は master `bypass`(buf 不変)。
+//! チェーン順: distortion → chorus → delay(feedback) → reverb。各段は mix=0 で実質無効(ただし内部状態は
+//! 更新継続=可聴バイパスであって凍結ではない)。完全な無効化は master `bypass`(buf 不変)。
 //!
 //! パラメータ受け渡しは Synth.patch_db と同じ `DoubleBuffer`(ロックフリー)。
 //! 前提: 単一 producer(GUI スレッド)、フレーム単位で publish、`Params` は小さい plain data、
-//! publish 後は当該バッファを mutation しない。
+//! publish 後は当該バッファを mutation しない。reverb はサンプルレート依存タップを持つため
+//! `setSampleRate` を起動時(device.start 前・RT 未稼働)に呼ぶ。
 //!
-//! RT 安全: ディレイ/コーラスのラインは comptime 固定長で構造体内包(起動時固定確保)。
+//! RT 安全: ディレイ/コーラス/リバーブのラインは comptime 固定長で構造体内包(起動時固定確保)。
 //! process() は確保/ロック/IO をしない。
 
 const std = @import("std");
@@ -33,6 +34,10 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
             // distortion
             dist_drive: f32 = 1.0, // >=1 で歪み増
             dist_mix: f32 = 0.0,
+            // reverb (27.15)
+            reverb_mix: f32 = 0.0,
+            reverb_decay: f32 = 0.5, // 0..1 → comb feedback 0.70..0.98
+            reverb_damping: f32 = 0.3, // 0..1(高域減衰)
         };
 
         params_db: params.DoubleBuffer(Params),
@@ -40,6 +45,7 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
         delay: [2]dsp.DelayLine(delay_cap) = .{ .{}, .{} }, // L/R
         chorus: [2]dsp.DelayLine(chorus_cap) = .{ .{}, .{} }, // L/R
         lfo: [2]dsp.Lfo = .{ .{}, .{ .phase = 0.25 } }, // R を 1/4 位相オフセット(ステレオ幅)
+        reverb: dsp.Reverb = undefined, // init / setSampleRate でタップ算出
 
         const chorus_base_ms: f32 = 12.0; // コーラスの基準ディレイ
 
@@ -47,12 +53,20 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
             return .{
                 .params_db = params.DoubleBuffer(Params).init(initial),
                 .sample_rate = sample_rate,
+                .reverb = dsp.Reverb.init(sample_rate),
             };
         }
 
         /// GUI スレッド: パラメータを公開。
         pub fn publishParams(self: *Self, p: Params) void {
             self.params_db.publish(p);
+        }
+
+        /// サンプルレートを設定(reverb のタップ長を再算出)。**起動時 device.start() の前**に呼ぶ
+        /// (RT コールバック未稼働。稼働中の SR 変更はスコープ外)。
+        pub fn setSampleRate(self: *Self, sr: f32) void {
+            self.sample_rate = sr;
+            self.reverb.setSampleRate(sr);
         }
 
         /// RT スレッド: buf を in-place 処理。確保/ロックなし。
@@ -69,6 +83,8 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
             const crate = @max(p.chorus_rate, 0.0);
             const cdepth_ms = @max(p.chorus_depth_ms, 0.0);
             const dtime_s = @max(p.delay_time_s, 0.0);
+            const rmix = std.math.clamp(p.reverb_mix, 0.0, 1.0);
+            self.reverb.setParams(p.reverb_decay, p.reverb_damping); // 内部で feedback/damp を clamp
 
             const sr = self.sample_rate;
             const delay_samples = std.math.clamp(dtime_s * sr, 1.0, @as(f32, @floatFromInt(delay_cap - 1)));
@@ -105,6 +121,11 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
                     const dly = self.delay[ch].readAt(delay_samples);
                     self.delay[ch].write(dsp.flushDenormal(x + dly * fb));
                     x = x * (1.0 - dmix) + dly * dmix;
+
+                    // 4) reverb(チェーン最後尾): wet を常に計算して状態更新し、出力のみ mix。
+                    //    mix=0 でも状態が進むため、後で mix を上げても無音 tail から始まらない。
+                    const rwet = self.reverb.processSample(ch, x);
+                    x = x * (1.0 - rmix) + rwet * rmix;
 
                     buf[idx] = x;
                 }
@@ -195,7 +216,26 @@ test "MasterEffects: distortion (mix=1) saturates large input into (-1,1)" {
     try testing.expect(peak > 0.8); // 飽和(殺してはいない)
 }
 
-test "MasterEffects: all stages on stays finite over many frames" {
+test "MasterEffects: reverb mix=0 keeps output dry but updates state; raising mix reveals tail" {
+    var fx = TestFx.init(48000, .{ .reverb_mix = 0.0, .reverb_decay = 0.8 });
+    // block1: mono インパルス、reverb_mix=0 → 出力はドライ(他段も mix=0)だが reverb 状態は更新される
+    var b1 = [_]f32{0} ** 64;
+    b1[0] = 1.0;
+    fx.process(&b1, 64, 1);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), b1[0], 1e-6); // dry 通過
+    try testing.expectApproxEqAbs(@as(f32, 0.0), b1[10], 1e-6); // reverb 寄与なし
+    // block2: 無音を流しつつ reverb_mix=1 → 先のインパルスの残響尾が現れる
+    // (comb 遅延 ~25ms ≈ 1200 サンプルのため十分長い窓を流す)
+    fx.publishParams(.{ .reverb_mix = 1.0, .reverb_decay = 0.8 });
+    var b2 = [_]f32{0} ** 4096;
+    fx.process(&b2, 4096, 1);
+    var e: f32 = 0;
+    for (b2) |s| e += s * s;
+    try testing.expect(e > 0.0); // 残響尾が出ている(状態が更新されていた証左)
+    for (b2) |s| try testing.expect(std.math.isFinite(s));
+}
+
+test "MasterEffects: all stages on (incl. reverb) stays finite over many frames" {
     var fx = TestFx.init(48000, .{
         .delay_time_s = 30.0 / 48000.0,
         .delay_feedback = 0.8,
@@ -205,6 +245,9 @@ test "MasterEffects: all stages on stays finite over many frames" {
         .chorus_mix = 0.5,
         .dist_drive = 5.0,
         .dist_mix = 0.5,
+        .reverb_mix = 0.5,
+        .reverb_decay = 0.9,
+        .reverb_damping = 0.3,
     });
     var buf: [256]f32 = undefined;
     var block: u32 = 0;

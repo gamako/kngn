@@ -12,6 +12,7 @@ const lfo_mod = @import("lfo.zig");
 const noise_mod = @import("noise.zig");
 const delay_mod = @import("delay.zig");
 const distortion_mod = @import("distortion.zig");
+const reverb_mod = @import("reverb.zig");
 
 pub const Waveform = oscillator.Waveform;
 pub const Oscillator = oscillator.Oscillator;
@@ -20,6 +21,7 @@ pub const Noise = noise_mod.Noise;
 
 pub const DelayLine = delay_mod.DelayLine;
 pub const softClip = distortion_mod.softClip;
+pub const Reverb = reverb_mod.Reverb;
 
 pub const Envelope = envelope.Envelope;
 
@@ -51,4 +53,5 @@ test {
     _ = noise_mod;
     _ = delay_mod;
     _ = distortion_mod;
+    _ = reverb_mod;
 }
