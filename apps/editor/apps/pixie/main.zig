@@ -44,11 +44,13 @@ fn guiColor(c: u32) gui.Color {
 const ToolKind = enum {
     pen,
     eraser,
+    brush,
 
     fn name(self: ToolKind) []const u8 {
         return switch (self) {
             .pen => "Pen",
             .eraser => "Eraser",
+            .brush => "Brush",
         };
     }
 };
@@ -94,8 +96,13 @@ const App = struct {
     undo: core.UndoStack = .{},
     pen: core.Pen,
     eraser: core.Eraser = .{},
+    brush: core.Brush,
     input: canvas_input.CanvasInput = .{},
     active_kind: ToolKind = .pen,
+    /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
+    brush_size_i32: i32 = 8,
+    brush_opacity_i32: i32 = 255,
+    brush_hardness_f32: f32 = 1.0,
     /// 編集可能パレット（colors.len>=1）。描画色 = palette.current()。
     palette: palette_mod.Palette,
     /// 編集中 HSV 状態。選択切替/load 後のみ RGB→HSV で再同期（s==0 でも hue を失わない）。
@@ -120,6 +127,7 @@ const App = struct {
         return switch (self.active_kind) {
             .pen => self.pen.tool(),
             .eraser => self.eraser.tool(),
+            .brush => self.brush.tool(),
         };
     }
 
@@ -154,6 +162,7 @@ const App = struct {
         const c: u32 = @bitCast(gui.Color.fromHsv(self.edit_h, self.edit_s, self.edit_v));
         self.palette.setSelectedColor(c);
         self.pen.color = c;
+        self.brush.color = c; // Brush の描画色もパレット編集色に追従
     }
 
     /// 選択（or load）が変わったフレームに編集中 HSV を現在色から再同期する。
@@ -470,9 +479,20 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
 
     ctx.label("Tool");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 64 }).clicked) app.active_kind = .pen;
-    if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 64 }).clicked) app.active_kind = .eraser;
+    if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.active_kind = .pen;
+    if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.active_kind = .eraser;
+    if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.active_kind = .brush;
     ctx.endBox();
+    // Brush 選択時のみ Size/Opacity/Hardness の Slider を表示
+    if (app.active_kind == .brush) {
+        _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
+        _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
+        _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
+    }
+    // UI 状態 → Brush（毎フレーム clamp/変換。型差吸収）
+    app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
+    app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
+    app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
     ctx.endBox(); // right pane
 
     ctx.endBox(); // 2 段目
@@ -518,6 +538,14 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
         ctx.style.text_subtle,
     );
+    if (app.active_kind == .brush) {
+        ctx.labelEx(
+            try std.fmt.allocPrint(arena, "brush: sz={d} op={d} hard={d:.2}", .{
+                app.brush.size, app.brush.opacity, app.brush_hardness_f32,
+            }),
+            ctx.style.text_subtle,
+        );
+    }
     if (app.saveMsg()) |msg| ctx.label(msg);
     ctx.endBox();
 
@@ -543,8 +571,10 @@ pub fn main(init: std.process.Init) !void {
         .recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
         .palette = try palette_mod.Palette.initDb16(gpa),
         .pen = .{ .color = 0 },
+        .brush = .{ .color = 0 },
     };
     app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
+    app.brush.color = app.palette.current();
     defer {
         if (app.current_path) |p| gpa.free(p);
         if (app.palette_path) |p| gpa.free(p);

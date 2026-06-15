@@ -27,3 +27,4 @@ pub const ToolEvent = tool.ToolEvent;
 pub const ToolPoint = tool.ToolPoint;
 pub const Pen = tool.Pen;
 pub const Eraser = tool.Eraser;
+pub const Brush = tool.Brush;
