@@ -239,6 +239,9 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
         _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6009, "FEnvDec  ", &params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x600A, "LFO Rate ", &params.lfo_rate, .{ .min = 0.1, .max = 20, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x600B, "Vibrato  ", &params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x600C, "Tremolo  ", &params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
         const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
         if (ctx.button(wlabel)) params.wave_idx = (params.wave_idx + 1) % WAVE_NAMES.len;
@@ -277,6 +280,9 @@ const Params = struct {
     filter_env_amount: f32 = 0.0, // フィルタ env 量(オクターブ)
     filter_attack: f32 = 0.01,
     filter_decay: f32 = 0.2,
+    lfo_rate: f32 = 5.0,
+    vibrato_depth: f32 = 0.0, // 半音
+    tremolo_depth: f32 = 0.0, // 0..1
 };
 
 const FILTER_MODE_NAMES = [_][]const u8{ "LP", "HP", "BP", "notch" };
@@ -306,5 +312,8 @@ fn makePatch(p: Params) Patch {
         .filter_sustain = 0.0,
         .filter_release = 0.2,
         .filter_env_amount = p.filter_env_amount,
+        .lfo_rate = p.lfo_rate,
+        .vibrato_depth = p.vibrato_depth,
+        .tremolo_depth = p.tremolo_depth,
     };
 }

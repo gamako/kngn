@@ -8,11 +8,15 @@ const envelope = @import("envelope.zig");
 const filter = @import("filter.zig");
 const mixer = @import("mixer.zig");
 const fft_mod = @import("fft.zig");
+const lfo_mod = @import("lfo.zig");
 
 pub const Waveform = oscillator.Waveform;
 pub const Oscillator = oscillator.Oscillator;
 
 pub const Envelope = envelope.Envelope;
+
+pub const Lfo = lfo_mod.Lfo;
+pub const LfoWaveform = lfo_mod.LfoWaveform;
 
 pub const Filter = filter.Filter;
 pub const FilterMode = filter.FilterMode;
@@ -35,4 +39,5 @@ test {
     _ = filter;
     _ = mixer;
     _ = fft_mod;
+    _ = lfo_mod;
 }

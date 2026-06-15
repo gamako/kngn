@@ -24,6 +24,13 @@ pub const Patch = struct {
     filter_release: f32 = 0.2,
     /// フィルタ env のモジュレーション量（オクターブ単位の±）。0 で無効（従来通り）。
     filter_env_amount: f32 = 0.0,
+    // LFO（vibrato/tremolo）
+    lfo_rate: f32 = 5.0, // Hz
+    lfo_waveform: dsp.LfoWaveform = .sine,
+    vibrato_depth: f32 = 0.0, // 半音単位（pitch モジュレーション）
+    tremolo_depth: f32 = 0.0, // 0..1（amp モジュレーション）
+    /// ベロシティ → cutoff（オクターブ単位）。0 で無効。
+    velocity_to_cutoff: f32 = 0.0,
 };
 
 /// キートラッキング適用後の実効 cutoff(Hz)。基準 C4(60) から半音ごとに keytrack 比率で追従。
@@ -49,16 +56,20 @@ pub const Voice = struct {
     osc: dsp.Oscillator = .{},
     env: dsp.Envelope = .{},
     filter_env: dsp.Envelope = .{}, // フィルタ用 2 本目 ADSR
+    lfo: dsp.Lfo = .{},
     filter: dsp.Filter = .{},
     note: u8 = 0,
     freq: f32 = 0,
     velocity: f32 = 0,
     active: bool = false,
     age: u64 = 0, // スチール判定用（小さいほど古い）
-    // ブロック先頭で確定するフィルタパラメータ（renderSample で env モジュレーションに使う）
+    // ブロック先頭で確定するパラメータ（renderSample のモジュレーションに使う）
     block_cutoff: f32 = 8000,
     block_res: f32 = 0.707,
     block_fenv_amount: f32 = 0.0,
+    block_lfo_rate: f32 = 5.0,
+    block_vibrato: f32 = 0.0,
+    block_tremolo: f32 = 0.0,
 
     pub fn noteOn(self: *Voice, note: u8, velocity: f32, patch: Patch, sample_rate: f32, age: u64) void {
         self.note = note;
@@ -83,6 +94,7 @@ pub const Voice = struct {
             .sample_rate = sample_rate,
         };
         self.filter_env.noteOn();
+        self.lfo = .{ .waveform = patch.lfo_waveform, .phase = 0 };
         self.filter = dsp.Filter.init(sample_rate, trackedCutoff(patch.cutoff, patch.keytrack, note), patch.resonance);
         self.filter.setMode(patch.filter_mode);
     }
@@ -92,13 +104,18 @@ pub const Voice = struct {
         self.filter_env.noteOff();
     }
 
-    /// ブロック先頭で cutoff(キートラッキング込み)/resonance/種別/フィルタenv量を確定。
+    /// ブロック先頭で cutoff(キートラッキング + ベロシティ→cutoff)/resonance/種別/モジュレーション量を確定。
     /// filter_env_amount=0 のときは毎サンプルの再計算を避けてここで一度だけ setParams。
     pub fn prepareBlock(self: *Voice, patch: Patch) void {
         if (!self.active) return;
-        self.block_cutoff = trackedCutoff(patch.cutoff, patch.keytrack, self.note);
+        // base cutoff = キートラッキング × ベロシティ→cutoff
+        const vel_oct = patch.velocity_to_cutoff * self.velocity;
+        self.block_cutoff = trackedCutoff(patch.cutoff, patch.keytrack, self.note) * std.math.pow(f32, 2.0, vel_oct);
         self.block_res = patch.resonance;
         self.block_fenv_amount = patch.filter_env_amount;
+        self.block_lfo_rate = patch.lfo_rate;
+        self.block_vibrato = patch.vibrato_depth;
+        self.block_tremolo = patch.tremolo_depth;
         self.filter.setMode(patch.filter_mode);
         if (patch.filter_env_amount == 0.0) self.filter.setParams(self.block_cutoff, self.block_res);
     }
@@ -106,14 +123,19 @@ pub const Voice = struct {
     /// 1 サンプル合成。env が done になったら active=false（プールへ返る）。
     pub fn renderSample(self: *Voice, sample_rate: f32) f32 {
         if (!self.active) return 0.0;
-        const o = self.osc.next(self.freq, sample_rate);
+        const lfo_v = self.lfo.next(self.block_lfo_rate, sample_rate); // -1..1
+        // vibrato: pitch を半音単位でモジュレート
+        const freq = self.freq * std.math.pow(f32, 2.0, self.block_vibrato * lfo_v / 12.0);
+        const o = self.osc.next(freq, sample_rate);
         const e = self.env.next();
         const fe = self.filter_env.next();
         // フィルタ env が有効なら cutoff を毎サンプルモジュレート（amount=0 なら prepareBlock の設定のまま）
         if (self.block_fenv_amount != 0.0) {
             self.filter.setParams(modulatedCutoff(self.block_cutoff, self.block_fenv_amount, fe), self.block_res);
         }
-        const out = self.filter.process(o * e * self.velocity);
+        // tremolo: amp を 0..1 でモジュレート（lfo=+1→1.0、-1→1-depth）
+        const trem = 1.0 - self.block_tremolo * (0.5 - 0.5 * lfo_v);
+        const out = self.filter.process(o * e * self.velocity * trem);
         if (!self.env.isActive()) self.active = false; // done 回収（振幅 env 基準）
         return out;
     }
@@ -243,6 +265,58 @@ test "Voice filter env: amount>0 で env が上昇→減衰し cutoff も追従�
     v2.noteOn(60, 1.0, p0, 1000, 1);
     v2.prepareBlock(p0);
     try testing.expectEqual(@as(f32, 0.0), v2.block_fenv_amount);
+}
+
+test "Voice LFO tremolo: amp varies over time when depth>0" {
+    var v = Voice{};
+    const patch = Patch{
+        .attack = 0.0,
+        .sustain = 1.0, // 一定振幅に保つ
+        .waveform = .sine,
+        .lfo_rate = 100, // 速い tremolo（短時間で変動）
+        .tremolo_depth = 1.0,
+        .filter_env_amount = 0.0,
+        .cutoff = 18000, // フィルタの影響を最小化
+    };
+    v.noteOn(60, 1.0, patch, 1000, 1);
+    v.prepareBlock(patch);
+    var min_abs: f32 = 1e9;
+    var max_abs: f32 = 0;
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        const s = @abs(v.renderSample(1000));
+        min_abs = @min(min_abs, s);
+        max_abs = @max(max_abs, s);
+    }
+    // tremolo により振幅に明確な変動がある
+    try testing.expect(max_abs - min_abs > 0.05);
+}
+
+test "Voice velocity->amp: lower velocity gives quieter output" {
+    const measure = struct {
+        fn peak(vel: f32) f32 {
+            var v = Voice{};
+            const patch = Patch{ .attack = 0.0, .sustain = 1.0, .cutoff = 18000, .filter_env_amount = 0 };
+            v.noteOn(60, vel, patch, 1000, 1);
+            v.prepareBlock(patch);
+            var mx: f32 = 0;
+            var i: u32 = 0;
+            while (i < 50) : (i += 1) mx = @max(mx, @abs(v.renderSample(1000)));
+            return mx;
+        }
+    };
+    try testing.expect(measure.peak(0.3) < measure.peak(1.0));
+}
+
+test "Voice velocity->cutoff: higher velocity raises block_cutoff when amount>0" {
+    var lo = Voice{};
+    var hi = Voice{};
+    const patch = Patch{ .cutoff = 1000, .velocity_to_cutoff = 2.0, .filter_env_amount = 0 };
+    lo.noteOn(60, 0.2, patch, 48000, 1);
+    hi.noteOn(60, 1.0, patch, 48000, 2);
+    lo.prepareBlock(patch);
+    hi.prepareBlock(patch);
+    try testing.expect(hi.block_cutoff > lo.block_cutoff);
 }
 
 test "trackedCutoff: keytrack=0 unchanged, keytrack=1 follows 1oct/oct, higher note->higher cutoff" {
