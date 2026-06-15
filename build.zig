@@ -300,6 +300,17 @@ pub fn build(b: *std.Build) void {
     const test_synth_step = b.step("test-synth", "Run libs/synth unit tests");
     test_synth_step.dependOn(&run_synth_test.step);
 
+    // src/dsp テスト (Oscillator / Envelope / Filter / Mixer)
+    const dsp_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/dsp/dsp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dsp_test = b.addTest(.{ .root_module = dsp_test_mod });
+    const run_dsp_test = b.addRunArtifact(dsp_test);
+    const test_dsp_step = b.step("test-dsp", "Run src/dsp unit tests");
+    test_dsp_step.dependOn(&run_dsp_test.step);
+
     // ========================================
     // 集約 test ステップ (全 test-* を束ねる)
     // 注: テスト実行のみ。example の build 回帰は `zig build -Dinstall-all=true` で別途確認する。
@@ -313,6 +324,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_synth_step);
+    test_step.dependOn(test_dsp_step);
 
     // ========================================
     // サンプルプログラムのビルド (親プロジェクト経由)
@@ -412,6 +424,7 @@ const ExampleModules = struct {
     gui: *std.Build.Module,
     audio: *std.Build.Module,
     synth: *std.Build.Module,
+    dsp: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         const platform_mod = platform.createPlatformModule(
@@ -463,6 +476,11 @@ const ExampleModules = struct {
             .root_source_file = b.path("libs/synth/src/synth.zig"),
         });
 
+        // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
+        const dsp_mod = b.createModule(.{
+            .root_source_file = b.path("src/dsp/dsp.zig"),
+        });
+
         return .{
             .platform = platform_mod,
             .keyboard = keyboard_mod,
@@ -479,6 +497,7 @@ const ExampleModules = struct {
             .gui = gui,
             .audio = audio_mod,
             .synth = synth_mod,
+            .dsp = dsp_mod,
         };
     }
 };
