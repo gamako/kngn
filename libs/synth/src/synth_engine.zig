@@ -181,6 +181,6 @@ test "Synth: publishPatch changes waveform used by subsequent notes" {
     try testing.expect(peak > 0.0);
     // 適用された waveform を確認
     for (synth.pool.voices) |v| {
-        if (v.active) try testing.expectEqual(dsp.Waveform.square, v.osc.waveform);
+        if (v.active) try testing.expectEqual(dsp.Waveform.square, v.oscs[0].waveform);
     }
 }

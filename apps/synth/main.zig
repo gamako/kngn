@@ -22,12 +22,12 @@ const NOTE_LOW = 60; // C4
 const NOTE_HIGH = 72; // C5
 const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
-// レイアウト（コントロールパネルは 2 カラム。パネル下にスペクトログラム、最下部に鍵盤）
-const WIN_W = 640;
+// レイアウト（コントロールパネルは 3 カラム。パネル下にスペクトログラム、最下部に鍵盤）
+const WIN_W = 860;
 const WIN_H = 440;
 const SPEC_X0 = 20;
 const SPEC_Y0 = 250;
-const SPEC_W = 600;
+const SPEC_W = 820;
 const SPEC_H = 120;
 const PIANO_Y0 = 380;
 const PIANO_H = 55;
@@ -245,7 +245,7 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x6005, "Release  ", &params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
-        // 右カラム: フィルタ env + LFO
+        // 中カラム: フィルタ env + LFO
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
         _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
         _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
@@ -254,12 +254,22 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x600B, "Vibrato  ", &params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
         _ = ctx.sliderF32Id(0x600C, "Tremolo  ", &params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
+        // 右カラム: ユニゾン / 2nd osc / ノイズ (27.13)
+        ctx.beginBox(.{ .direction = .column, .gap = 4 });
+        _ = ctx.sliderF32Id(0x600D, "Unison   ", &params.unison, .{ .min = 1, .max = 7, .step = 1 });
+        _ = ctx.sliderF32Id(0x600E, "Detune   ", &params.detune, .{ .min = 0, .max = 50, .step = 1 });
+        _ = ctx.sliderF32Id(0x600F, "Osc2 Mix ", &params.osc2_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6010, "Osc2 Det ", &params.osc2_detune, .{ .min = -24, .max = 24, .step = 1 });
+        _ = ctx.sliderF32Id(0x6011, "Noise    ", &params.noise_amount, .{ .min = 0, .max = 1, .step = 0.05 });
+        ctx.endBox();
         ctx.endBox();
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
         const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
         if (ctx.button(wlabel)) params.wave_idx = (params.wave_idx + 1) % WAVE_NAMES.len;
         const flabel = std.fmt.allocPrint(ctx.allocator(), "Filter: {s}", .{FILTER_MODE_NAMES[params.filter_mode_idx]}) catch "Filter";
         if (ctx.button(flabel)) params.filter_mode_idx = (params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
+        const o2label = std.fmt.allocPrint(ctx.allocator(), "Osc2: {s}", .{WAVE_NAMES[params.osc2_wave_idx]}) catch "Osc2";
+        if (ctx.button(o2label)) params.osc2_wave_idx = (params.osc2_wave_idx + 1) % WAVE_NAMES.len;
         ctx.endBox();
         ctx.endBox();
         ctx.endFrame();
@@ -296,6 +306,13 @@ const Params = struct {
     lfo_rate: f32 = 5.0,
     vibrato_depth: f32 = 0.0, // 半音
     tremolo_depth: f32 = 0.0, // 0..1
+    // オシレータ拡張(27.13)。unison はスライダ用に f32 で保持し makePatch で u8 へ。
+    unison: f32 = 1,
+    detune: f32 = 0.0, // cents
+    osc2_mix: f32 = 0.0, // 0..1
+    osc2_detune: f32 = 0.0, // 半音
+    osc2_wave_idx: usize = 0, // sine
+    noise_amount: f32 = 0.0, // 0..1
 };
 
 const FILTER_MODE_NAMES = [_][]const u8{ "LP", "HP", "BP", "notch" };
@@ -328,5 +345,11 @@ fn makePatch(p: Params) Patch {
         .lfo_rate = p.lfo_rate,
         .vibrato_depth = p.vibrato_depth,
         .tremolo_depth = p.tremolo_depth,
+        .unison = @intFromFloat(std.math.clamp(@round(p.unison), 1, 7)),
+        .detune = p.detune,
+        .osc2_waveform = waveOf(p.osc2_wave_idx),
+        .osc2_detune = p.osc2_detune,
+        .osc2_mix = p.osc2_mix,
+        .noise_amount = p.noise_amount,
     };
 }

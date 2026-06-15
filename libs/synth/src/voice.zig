@@ -4,6 +4,9 @@
 const std = @import("std");
 const dsp = @import("dsp");
 
+/// ユニゾン声部数の固定上限(奇数=中央1声)。Voice はこの数のオシレータを構造体に内包し RT で確保しない。
+pub const MAX_UNISON = 7;
+
 /// 音色パラメータの集合。waveform / ADSR は noteOn で latch、cutoff/res/gain/filter_mode/keytrack は毎ブロック反映。
 pub const Patch = struct {
     waveform: dsp.Waveform = .sine,
@@ -31,6 +34,13 @@ pub const Patch = struct {
     tremolo_depth: f32 = 0.0, // 0..1（amp モジュレーション）
     /// ベロシティ → cutoff（オクターブ単位）。0 で無効。
     velocity_to_cutoff: f32 = 0.0,
+    // オシレータ拡張(27.13): ユニゾン / 2nd osc / ノイズ源
+    unison: u8 = 1, // ユニゾン声部数(1..MAX_UNISON)
+    detune: f32 = 0.0, // ユニゾン detune 広がり(cents、±)
+    osc2_waveform: dsp.Waveform = .sine,
+    osc2_detune: f32 = 0.0, // 2nd osc 音程差(半音)
+    osc2_mix: f32 = 0.0, // osc1↔osc2 クロスフェード(0=osc1のみ, 1=osc2のみ)
+    noise_amount: f32 = 0.0, // 加算する白色ノイズ量(0..1)
 };
 
 /// キートラッキング適用後の実効 cutoff(Hz)。基準 C4(60) から半音ごとに keytrack 比率で追従。
@@ -50,10 +60,25 @@ pub fn noteToFreq(note: u8) f32 {
     return 440.0 * std.math.pow(f32, 2.0, (n - 69.0) / 12.0);
 }
 
+/// ユニゾン声部 i(0..MAX_UNISON-1) の初期位相。MAX_UNISON で等分散し全声部の同位相累積を防ぐ。
+fn phaseSpread(i: usize) f32 {
+    return @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(MAX_UNISON));
+}
+
+/// ユニゾン声部 i の detune 比。count 声部で `±detune_cents` を対称分散(count=1 は 1.0)。
+fn unisonRatio(i: usize, count: u8, detune_cents: f32) f32 {
+    if (count <= 1) return 1.0;
+    // 声部を -1..1 に対称配置(i=0 → -1, i=count-1 → +1)
+    const spread = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(count - 1)) * 2.0 - 1.0;
+    return std.math.pow(f32, 2.0, detune_cents * spread / 1200.0);
+}
+
 /// 1 音分のボイス。状態機械は Envelope の stage に従う
 /// (idle → attack/decay/sustain → release → done=idle)。
 pub const Voice = struct {
-    osc: dsp.Oscillator = .{},
+    oscs: [MAX_UNISON]dsp.Oscillator = [_]dsp.Oscillator{.{}} ** MAX_UNISON, // osc1 ユニゾン複製
+    osc2: dsp.Oscillator = .{}, // 2nd オシレータ
+    noise: dsp.Noise = .{}, // ノイズ源
     env: dsp.Envelope = .{},
     filter_env: dsp.Envelope = .{}, // フィルタ用 2 本目 ADSR
     lfo: dsp.Lfo = .{},
@@ -70,6 +95,13 @@ pub const Voice = struct {
     block_lfo_rate: f32 = 5.0,
     block_vibrato: f32 = 0.0,
     block_tremolo: f32 = 0.0,
+    // オシレータ段(27.13)のブロック確定パラメータ
+    block_unison: u8 = 1,
+    block_unison_norm: f32 = 1.0, // 1/sqrt(unison)
+    unison_ratio: [MAX_UNISON]f32 = [_]f32{1.0} ** MAX_UNISON,
+    block_osc2_ratio: f32 = 1.0,
+    block_osc2_mix: f32 = 0.0,
+    block_noise: f32 = 0.0,
 
     pub fn noteOn(self: *Voice, note: u8, velocity: f32, patch: Patch, sample_rate: f32, age: u64) void {
         self.note = note;
@@ -77,7 +109,14 @@ pub const Voice = struct {
         self.velocity = velocity;
         self.active = true;
         self.age = age;
-        self.osc = .{ .waveform = patch.waveform, .phase = 0 };
+        // ユニゾン: MAX_UNISON 全要素を初期化(古い再利用 Voice の残り位相/波形を拾わない)。
+        // 位相は phaseSpread で分散し同位相による単なる増幅を防ぐ(決定論的・RT 安全)。
+        for (&self.oscs, 0..) |*o, i| {
+            o.* = .{ .waveform = patch.waveform, .phase = phaseSpread(i) };
+        }
+        self.osc2 = .{ .waveform = patch.osc2_waveform, .phase = 0 };
+        // ノイズ seed: age(単調増加) からノート/ボイス毎に異なる非ゼロ u32 を作る(脱相関)。
+        self.noise.seed(@truncate((age +% 1) *% 0x9E3779B97F4A7C15));
         self.env = .{
             .attack = patch.attack,
             .decay = patch.decay,
@@ -118,6 +157,15 @@ pub const Voice = struct {
         self.block_tremolo = std.math.clamp(patch.tremolo_depth, 0.0, 1.0); // 範囲外で負ゲイン/増幅を防ぐ
         self.filter.setMode(patch.filter_mode);
         if (patch.filter_env_amount == 0.0) self.filter.setParams(self.block_cutoff, self.block_res);
+        // オシレータ段(27.13): ユニゾン数 / detune 比 / osc2 / ノイズ量を確定(pow は毎ブロックのみ)。
+        const uni = std.math.clamp(patch.unison, 1, MAX_UNISON);
+        self.block_unison = uni;
+        self.block_unison_norm = 1.0 / @sqrt(@as(f32, @floatFromInt(uni))); // 脱相関時の体感ラウドネス一定化
+        for (0..uni) |i| self.unison_ratio[i] = unisonRatio(i, uni, patch.detune);
+        self.block_osc2_ratio = std.math.pow(f32, 2.0, patch.osc2_detune / 12.0);
+        self.block_osc2_mix = std.math.clamp(patch.osc2_mix, 0.0, 1.0);
+        self.block_noise = std.math.clamp(patch.noise_amount, 0.0, 1.0);
+        self.osc2.waveform = patch.osc2_waveform; // ライブ変更可
     }
 
     /// 1 サンプル合成。env が done になったら active=false（プールへ返る）。
@@ -131,7 +179,16 @@ pub const Voice = struct {
             self.freq * std.math.pow(f32, 2.0, self.block_vibrato * lfo_v / 12.0)
         else
             self.freq;
-        const o = self.osc.next(freq, sample_rate);
+        // オシレータ段: ユニゾン(osc1 複製を detune して合算・正規化) + 2nd osc(クロスフェード) + ノイズ(加算)。
+        var osc1: f32 = 0;
+        for (self.oscs[0..self.block_unison], 0..) |*o1, i| {
+            osc1 += o1.next(freq * self.unison_ratio[i], sample_rate);
+        }
+        osc1 *= self.block_unison_norm;
+        // osc2 は mix=0 でも常に位相を進める(ライブで mix を上げた時のクリック回避)。
+        const o2 = self.osc2.next(freq * self.block_osc2_ratio, sample_rate);
+        var o = osc1 * (1.0 - self.block_osc2_mix) + o2 * self.block_osc2_mix;
+        if (self.block_noise > 0.0) o += self.noise.next() * self.block_noise;
         const e = self.env.next();
         const fe = self.filter_env.next();
         // フィルタ env が有効なら cutoff を毎サンプルモジュレート（amount=0 なら prepareBlock の設定のまま）
@@ -357,6 +414,147 @@ test "Voice: state machine idle -> attack -> ... -> release -> idle(done)" {
     while (i < 10 and v.active) : (i += 1) _ = v.renderSample(1000);
     try testing.expect(!v.active);
     try testing.expectEqual(dsp.Envelope.Stage.idle, v.stage());
+}
+
+// ---- ユニゾン / 2nd osc / ノイズ源 (TASK-27.13) ----
+
+test "unisonRatio: count=1 unchanged, symmetric spread, edges at ±detune" {
+    try testing.expectApproxEqAbs(@as(f32, 1.0), unisonRatio(0, 1, 50.0), 1e-6); // 1声=変化なし
+    // 3声: i=0 → -detune, i=1 → 0(中央), i=2 → +detune
+    try testing.expectApproxEqAbs(std.math.pow(f32, 2.0, -50.0 / 1200.0), unisonRatio(0, 3, 50.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), unisonRatio(1, 3, 50.0), 1e-6);
+    try testing.expectApproxEqAbs(std.math.pow(f32, 2.0, 50.0 / 1200.0), unisonRatio(2, 3, 50.0), 1e-6);
+}
+
+test "Voice unison: detuned voices beat (window-peak varies) vs steady single voice" {
+    // 振幅 env を一定に保ち、窓(256サンプル)ごとのピークの変動幅で「うねり」を測る。
+    // 単一正弦は各窓ピークが ~1.0 で一定、detune ユニゾンはビートで窓ピークが大きく変動する。
+    const measure = struct {
+        fn windowPeakSpread(unison: u8, detune: f32) f32 {
+            var v = Voice{};
+            const patch = Patch{
+                .attack = 0.0,
+                .sustain = 1.0,
+                .waveform = .sine,
+                .cutoff = 18000, // フィルタ影響を最小化
+                .filter_env_amount = 0,
+                .unison = unison,
+                .detune = detune,
+            };
+            v.noteOn(60, 1.0, patch, 48000, 1);
+            v.prepareBlock(patch);
+            var min_pk: f32 = 1e9;
+            var max_pk: f32 = 0;
+            var w: u32 = 0;
+            while (w < 64) : (w += 1) { // 64 窓 ≈ 340ms ⇒ 数 beat 周期をカバー
+                var pk: f32 = 0;
+                var i: u32 = 0;
+                while (i < 256) : (i += 1) pk = @max(pk, @abs(v.renderSample(48000)));
+                min_pk = @min(min_pk, pk);
+                max_pk = @max(max_pk, pk);
+            }
+            return max_pk - min_pk;
+        }
+    };
+    const single = measure.windowPeakSpread(1, 0.0); // 単一正弦 → 窓ピーク一定
+    const unison = measure.windowPeakSpread(7, 25.0); // 7声 detune → ビートで窓ピークが変動
+    try testing.expect(single < 0.05); // 単声は定常
+    try testing.expect(unison > 0.2); // detune ユニゾンは明確にうねる
+}
+
+test "Voice noise: noise_amount>0 mixes audible noise; =0 is deterministic" {
+    // noise=0: 2 回の render が完全一致(決定論)
+    const peakAndDet = struct {
+        fn run(noise_amount: f32) struct { peak: f32, det: bool } {
+            var a = Voice{};
+            var b = Voice{};
+            const patch = Patch{
+                .attack = 0.0,
+                .sustain = 1.0,
+                .gain = 1,
+                .cutoff = 18000,
+                .filter_env_amount = 0,
+                .waveform = .sine,
+                .noise_amount = noise_amount,
+            };
+            a.noteOn(60, 1.0, patch, 48000, 5);
+            b.noteOn(60, 1.0, patch, 48000, 5); // 同 age → 同 seed
+            a.prepareBlock(patch);
+            b.prepareBlock(patch);
+            var peak: f32 = 0;
+            var det = true;
+            var i: u32 = 0;
+            while (i < 256) : (i += 1) {
+                const sa = a.renderSample(48000);
+                const sb = b.renderSample(48000);
+                if (sa != sb) det = false;
+                peak = @max(peak, @abs(sa));
+            }
+            return .{ .peak = peak, .det = det };
+        }
+    };
+    const r0 = peakAndDet.run(0.0);
+    try testing.expect(r0.det); // noise=0 → 決定論(同 seed で完全一致)
+    const r1 = peakAndDet.run(0.8);
+    try testing.expect(r1.det); // 同 age=同 seed なので noise>0 でも 2 ボイスは一致(再現性)
+    try testing.expect(r1.peak > r0.peak); // ノイズ混入で振幅が増える(混ざっている)
+}
+
+test "Voice osc2: mix=0 makes osc2_detune irrelevant; mix>0 changes output" {
+    const firstSamples = struct {
+        fn render(osc2_mix: f32, osc2_detune: f32, out: []f32) void {
+            var v = Voice{};
+            const patch = Patch{
+                .attack = 0.0,
+                .sustain = 1.0,
+                .cutoff = 18000,
+                .filter_env_amount = 0,
+                .waveform = .sine,
+                .osc2_waveform = .saw,
+                .osc2_mix = osc2_mix,
+                .osc2_detune = osc2_detune,
+            };
+            v.noteOn(60, 1.0, patch, 48000, 1);
+            v.prepareBlock(patch);
+            for (out) |*s| s.* = v.renderSample(48000);
+        }
+    };
+    var a: [128]f32 = undefined;
+    var b: [128]f32 = undefined;
+    // mix=0: osc2_detune を変えても出力は完全一致(osc2 が寄与しない)
+    firstSamples.render(0.0, 0.0, &a);
+    firstSamples.render(0.0, 7.0, &b);
+    try testing.expectEqualSlices(f32, &a, &b);
+    // mix>0: osc2(saw, 1オクターブ上)を混ぜると出力が変わる
+    var c: [128]f32 = undefined;
+    firstSamples.render(0.6, 12.0, &c);
+    var differs = false;
+    for (a, c) |x, y| {
+        if (x != y) differs = true;
+    }
+    try testing.expect(differs);
+}
+
+test "Voice unison=MAX: renders finite output over many samples (fixed allocation, no alloc)" {
+    var v = Voice{};
+    const patch = Patch{
+        .attack = 0.01,
+        .sustain = 0.8,
+        .waveform = .saw,
+        .unison = MAX_UNISON,
+        .detune = 30.0,
+        .osc2_mix = 0.5,
+        .osc2_detune = -12,
+        .noise_amount = 0.3,
+        .cutoff = 8000,
+    };
+    v.noteOn(64, 1.0, patch, 48000, 1);
+    v.prepareBlock(patch);
+    var i: u32 = 0;
+    while (i < 4096) : (i += 1) {
+        const s = v.renderSample(48000);
+        try testing.expect(std.math.isFinite(s));
+    }
 }
 
 test "VoicePool: allocate free voices then steal oldest when full" {
