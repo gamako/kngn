@@ -310,20 +310,21 @@ pub fn build(b: *std.Build) void {
     // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
     // 揃えること（inline for で型不一致を避けるため）。
     inline for (.{
-        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false, .needs_font = true },
-        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true, .needs_font = false },
-        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = true },
-        .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
-        .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false },
+        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
+        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
+        .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+        .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = true },
     }) |example| {
         const needs: ExampleNeeds = .{
             .needs_sprite = example.needs_sprite,
@@ -333,6 +334,7 @@ pub fn build(b: *std.Build) void {
             .needs_gui = example.needs_gui,
             .needs_png_decoder = example.needs_png_decoder,
             .needs_font = example.needs_font,
+            .needs_audio = example.needs_audio,
         };
         const ex_objc = addExampleExe(b, target, optimize, platform_root, sdk_paths, .objc, example.name, example.path, &example_modules, needs);
         const ex_swift = addExampleExe(b, target, optimize, platform_root, sdk_paths, .swift, example.name ++ "_swift", example.path, &example_modules, needs);
@@ -396,6 +398,7 @@ const ExampleModules = struct {
     png_decoder: *std.Build.Module,
     font: *std.Build.Module,
     gui: *std.Build.Module,
+    audio: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         const platform_mod = platform.createPlatformModule(
@@ -436,6 +439,12 @@ const ExampleModules = struct {
         });
         gui.addImport("font", font_mod);
 
+        // audio (L1 オーディオ出力): platform バックエンド非依存。@cImport しないので
+        // 通常の createModule でよい（AudioToolbox は exe 側で linkFramework する）。
+        const audio_mod = b.createModule(.{
+            .root_source_file = b.path("src/audio.zig"),
+        });
+
         return .{
             .platform = platform_mod,
             .keyboard = keyboard_mod,
@@ -450,6 +459,7 @@ const ExampleModules = struct {
             .png_decoder = png_decoder,
             .font = font_mod,
             .gui = gui,
+            .audio = audio_mod,
         };
     }
 };
@@ -462,6 +472,7 @@ const ExampleNeeds = struct {
     needs_gui: bool,
     needs_png_decoder: bool,
     needs_font: bool,
+    needs_audio: bool,
 };
 
 fn addExampleExe(
@@ -494,6 +505,11 @@ fn addExampleExe(
     if (needs.needs_gui) exe.root_module.addImport("gui", modules.gui);
     if (needs.needs_png_decoder) exe.root_module.addImport("png-decoder", modules.png_decoder);
     if (needs.needs_font) exe.root_module.addImport("font", modules.font);
+    if (needs.needs_audio) {
+        exe.root_module.addImport("audio", modules.audio);
+        // L1 オーディオ出力に必要な framework（needs_audio の exe にのみ付与。既存は不変）。
+        exe.root_module.linkFramework("AudioToolbox", .{});
+    }
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。
