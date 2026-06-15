@@ -17,12 +17,24 @@ pub const Patch = struct {
     filter_mode: dsp.FilterMode = .lowpass,
     /// キートラッキング量(0=追従なし, 1=1オクターブ/オクターブ=完全追従)。基準ノートは C4(60)。
     keytrack: f32 = 0.0,
+    // フィルタエンベロープ（2本目 ADSR で cutoff をモジュレート）
+    filter_attack: f32 = 0.01,
+    filter_decay: f32 = 0.2,
+    filter_sustain: f32 = 0.0,
+    filter_release: f32 = 0.2,
+    /// フィルタ env のモジュレーション量（オクターブ単位の±）。0 で無効（従来通り）。
+    filter_env_amount: f32 = 0.0,
 };
 
 /// キートラッキング適用後の実効 cutoff(Hz)。基準 C4(60) から半音ごとに keytrack 比率で追従。
 fn trackedCutoff(base_cutoff: f32, keytrack: f32, note: u8) f32 {
     const semitones = (@as(f32, @floatFromInt(note)) - 60.0);
     return base_cutoff * std.math.pow(f32, 2.0, keytrack * semitones / 12.0);
+}
+
+/// フィルタ env による cutoff モジュレーション。amount(オクターブ) × env_level(0..1) を底2で適用。
+fn modulatedCutoff(base_cutoff: f32, amount: f32, env_level: f32) f32 {
+    return base_cutoff * std.math.pow(f32, 2.0, amount * env_level);
 }
 
 /// MIDI ノート番号 → 周波数(Hz)。A4(note 69)=440Hz。
@@ -36,12 +48,17 @@ pub fn noteToFreq(note: u8) f32 {
 pub const Voice = struct {
     osc: dsp.Oscillator = .{},
     env: dsp.Envelope = .{},
+    filter_env: dsp.Envelope = .{}, // フィルタ用 2 本目 ADSR
     filter: dsp.Filter = .{},
     note: u8 = 0,
     freq: f32 = 0,
     velocity: f32 = 0,
     active: bool = false,
     age: u64 = 0, // スチール判定用（小さいほど古い）
+    // ブロック先頭で確定するフィルタパラメータ（renderSample で env モジュレーションに使う）
+    block_cutoff: f32 = 8000,
+    block_res: f32 = 0.707,
+    block_fenv_amount: f32 = 0.0,
 
     pub fn noteOn(self: *Voice, note: u8, velocity: f32, patch: Patch, sample_rate: f32, age: u64) void {
         self.note = note;
@@ -58,19 +75,32 @@ pub const Voice = struct {
             .sample_rate = sample_rate,
         };
         self.env.noteOn();
+        self.filter_env = .{
+            .attack = patch.filter_attack,
+            .decay = patch.filter_decay,
+            .sustain = patch.filter_sustain,
+            .release = patch.filter_release,
+            .sample_rate = sample_rate,
+        };
+        self.filter_env.noteOn();
         self.filter = dsp.Filter.init(sample_rate, trackedCutoff(patch.cutoff, patch.keytrack, note), patch.resonance);
         self.filter.setMode(patch.filter_mode);
     }
 
     pub fn noteOff(self: *Voice) void {
         self.env.noteOff();
+        self.filter_env.noteOff();
     }
 
-    /// ブロック先頭で cutoff(キートラッキング込み)/resonance/種別を反映（毎サンプル tan を避ける）。
+    /// ブロック先頭で cutoff(キートラッキング込み)/resonance/種別/フィルタenv量を確定。
+    /// filter_env_amount=0 のときは毎サンプルの再計算を避けてここで一度だけ setParams。
     pub fn prepareBlock(self: *Voice, patch: Patch) void {
         if (!self.active) return;
-        self.filter.setParams(trackedCutoff(patch.cutoff, patch.keytrack, self.note), patch.resonance);
+        self.block_cutoff = trackedCutoff(patch.cutoff, patch.keytrack, self.note);
+        self.block_res = patch.resonance;
+        self.block_fenv_amount = patch.filter_env_amount;
         self.filter.setMode(patch.filter_mode);
+        if (patch.filter_env_amount == 0.0) self.filter.setParams(self.block_cutoff, self.block_res);
     }
 
     /// 1 サンプル合成。env が done になったら active=false（プールへ返る）。
@@ -78,8 +108,13 @@ pub const Voice = struct {
         if (!self.active) return 0.0;
         const o = self.osc.next(self.freq, sample_rate);
         const e = self.env.next();
+        const fe = self.filter_env.next();
+        // フィルタ env が有効なら cutoff を毎サンプルモジュレート（amount=0 なら prepareBlock の設定のまま）
+        if (self.block_fenv_amount != 0.0) {
+            self.filter.setParams(modulatedCutoff(self.block_cutoff, self.block_fenv_amount, fe), self.block_res);
+        }
         const out = self.filter.process(o * e * self.velocity);
-        if (!self.env.isActive()) self.active = false; // done 回収
+        if (!self.env.isActive()) self.active = false; // done 回収（振幅 env 基準）
         return out;
     }
 
@@ -164,6 +199,50 @@ const testing = std.testing;
 test "noteToFreq: A4=440, A5=880" {
     try testing.expectApproxEqAbs(@as(f32, 440.0), noteToFreq(69), 0.01);
     try testing.expectApproxEqAbs(@as(f32, 880.0), noteToFreq(81), 0.01);
+}
+
+test "modulatedCutoff: env_level=0 unchanged, amount/level applied in octaves" {
+    try testing.expectApproxEqAbs(@as(f32, 1000.0), modulatedCutoff(1000, 3.0, 0.0), 0.01); // level 0 → base
+    try testing.expectApproxEqAbs(@as(f32, 2000.0), modulatedCutoff(1000, 1.0, 1.0), 0.01); // +1oct
+    try testing.expectApproxEqAbs(@as(f32, 4000.0), modulatedCutoff(1000, 2.0, 1.0), 0.01); // +2oct
+}
+
+test "Voice filter env: amount>0 で env が上昇→減衰し cutoff も追従、amount=0 で無効" {
+    // amount>0: filter_env が attack で上昇 → release で減衰
+    var v = Voice{};
+    const patch = Patch{
+        .attack = 1.0, // 振幅 env は長く保つ（ボイスを生かす）
+        .sustain = 1.0,
+        .filter_attack = 0.002,
+        .filter_decay = 0.001,
+        .filter_sustain = 0.2,
+        .filter_release = 0.002,
+        .filter_env_amount = 2.0,
+        .cutoff = 1000,
+    };
+    v.noteOn(60, 1.0, patch, 1000, 1); // sr=1000
+    v.prepareBlock(patch);
+    // attack 中: filter_env.level が上がる
+    _ = v.renderSample(1000);
+    const lvl1 = v.filter_env.level;
+    _ = v.renderSample(1000);
+    const lvl2 = v.filter_env.level;
+    try testing.expect(lvl2 >= lvl1); // 上昇（attack/decay 中）
+    const peak_cutoff = modulatedCutoff(v.block_cutoff, v.block_fenv_amount, lvl2);
+    try testing.expect(peak_cutoff > 1000.0); // env により base より高い cutoff
+
+    // release で減衰
+    v.noteOff();
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) _ = v.renderSample(1000);
+    try testing.expect(v.filter_env.level < lvl2); // 減衰した
+
+    // amount=0: filter モジュレーション無効（block_fenv_amount=0）
+    var v2 = Voice{};
+    const p0 = Patch{ .attack = 1.0, .sustain = 1.0, .filter_env_amount = 0.0, .cutoff = 1000 };
+    v2.noteOn(60, 1.0, p0, 1000, 1);
+    v2.prepareBlock(p0);
+    try testing.expectEqual(@as(f32, 0.0), v2.block_fenv_amount);
 }
 
 test "trackedCutoff: keytrack=0 unchanged, keytrack=1 follows 1oct/oct, higher note->higher cutoff" {

@@ -236,6 +236,9 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x6004, "Attack   ", &params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6005, "Release  ", &params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6009, "FEnvDec  ", &params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
         const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
         if (ctx.button(wlabel)) params.wave_idx = (params.wave_idx + 1) % WAVE_NAMES.len;
@@ -271,6 +274,9 @@ const Params = struct {
     wave_idx: usize = 1, // saw
     filter_mode_idx: usize = 0, // lowpass
     keytrack: f32 = 0.0,
+    filter_env_amount: f32 = 0.0, // フィルタ env 量(オクターブ)
+    filter_attack: f32 = 0.01,
+    filter_decay: f32 = 0.2,
 };
 
 const FILTER_MODE_NAMES = [_][]const u8{ "LP", "HP", "BP", "notch" };
@@ -295,5 +301,10 @@ fn makePatch(p: Params) Patch {
         .gain = p.gain,
         .filter_mode = filterModeOf(p.filter_mode_idx),
         .keytrack = p.keytrack,
+        .filter_attack = p.filter_attack,
+        .filter_decay = p.filter_decay,
+        .filter_sustain = 0.0,
+        .filter_release = 0.2,
+        .filter_env_amount = p.filter_env_amount,
     };
 }
