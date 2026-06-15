@@ -163,6 +163,23 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 > 注: エディタのタスク管理はトップ階層（`video-proto/`）の Backlog.md CLI で行う（上位 AGENTS.md 参照）。
 > Zig 0.16 のイディオムは `zig-best-practices` スキルを参照。
 
+## オーディオ / シンセ層（TASK-27 ファミリー）
+
+グラフィックスと対称な 4 層構成でオーディオ（音）シンセサイザー基盤を構成する。設計の正は
+トップ階層の `docs/plans/synth-foundation-plan.md`。
+
+| 層 | 場所 | 内容 |
+|---|---|---|
+| **L1 platform** | `src/audio.zig`（facade）+ `src/audio_macos.zig`（実装） | オーディオ出力プリミティブ。AudioUnit (Default Output Unit) を **extern fn** で叩く（`@cImport` しない）。`open/start/stop/close/config`。`AudioToolbox` は audio を使う exe にのみ `linkFramework`（既存 exe は不変）。 |
+| **L2 helpers** | `src/dsp/`（`@import("dsp")`） | Oscillator / Envelope(ADSR) / Filter(TPT SVF) / Mixer + denormal 対策。純 Zig。 |
+| **L3 libs** | `libs/synth/`（`@import("synth")`） | Voice / 固定 VoicePool（スチール + done 回収）/ Patch / Synth。GUI⇔Audio のロックフリー受け渡し（SPSC `NoteQueue` / `AtomicF32` / `DoubleBuffer` / 出力タップ `SampleTap`）。dsp に依存。 |
+| **L4 apps** | `apps/synth/`（`run-synth`）+ `examples/15_audio_tone`（`run-example_15`） | PC キーボード演奏 MVP / サイン波最小サンプル。 |
+
+**最重要のスレッドモデル**: グラフィックスは CADisplayLink（メインスレッド）、オーディオは CoreAudio
+の **RT スレッド**でレンダーコールバックを呼ぶ。**RT スレッドでは malloc/lock/IO/panic 禁止**。
+メイン⇔RT のデータ交換は `libs/synth` のロックフリー機構（note は SPSC、連続パラメータは atomic、
+出力タップは drop 可）で行う。
+
 ## よく使うコマンド
 
 ```bash
@@ -179,9 +196,14 @@ zig build test-png-roundtrip    # PNG encode/decode round-trip（+ canvas 単体
 zig build test-png-format       # PNG format 変換
 zig build test-text             # BDF パーサ + テキスト描画
 zig build test-sprite           # sprite ブレンド / 描画
+zig build test-dsp              # src/dsp（Oscillator / ADSR / Filter / Mixer）
+zig build test-synth            # libs/synth（SPSC リング / atomic / Voice / VoicePool / Synth）
 
 # Pixie エディタの実行（-Dplatform で objc/swift/metal 切替）
 zig build run-pixie
+
+# Synth アプリの実行（PC キーボード演奏。A..K = C4..C5、ESC で終了）
+zig build run-synth
 
 # 特定のサンプルを実行（ルートから。run-example_01 〜 _NN）
 zig build run-example_01        # 01_timed_window
