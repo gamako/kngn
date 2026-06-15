@@ -17,6 +17,7 @@ const gui = @import("gui");
 const core = @import("core");
 const png_decoder = @import("png-decoder");
 const canvas_input = @import("canvas_input.zig");
+const palette_mod = @import("palette.zig");
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -27,30 +28,16 @@ const SAVE_MSG_DURATION: f64 = 3.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
-const FileOp = enum { save, save_as, open };
+const FileOp = enum { save, save_as, open, save_palette, load_palette };
 
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
 
 const COLOR_WINDOW_BG: u32 = 0xFF_20_20_24;
 
-/// DawnBringer 16 パレット（0xRRGGBB）
-const db16 = [16]u32{
-    0x000000, 0x442434, 0x30346D, 0x4E4A4E,
-    0x854C30, 0x346524, 0xD04648, 0x757161,
-    0x597DCE, 0xD27D2C, 0x8595A1, 0x6DAA2C,
-    0xD2AA99, 0x6DC2CA, 0xDAD45E, 0xDEEED6,
-};
-
-/// 0xRRGGBB → gui.Color（不透明）
-fn db16Color(i: usize) gui.Color {
-    const c = db16[i];
-    return gui.Color.rgba(@truncate(c >> 16), @truncate(c >> 8), @truncate(c), 0xFF);
-}
-
-/// 0xRRGGBB → canvas pixel（0xAABBGGRR、不透明）。gui.Color と同一ビットレイアウト
-fn db16Canvas(i: usize) u32 {
-    return @bitCast(db16Color(i));
+/// canvas pixel（0xAABBGGRR）→ gui.Color（同一ビットレイアウト）。スウォッチ/プレビュー描画用。
+fn guiColor(c: u32) gui.Color {
+    return @bitCast(c);
 }
 
 /// 現在の描画ツール種別（UI 表示・選択ハイライト用。dispatch は core.Tool が担う）
@@ -109,10 +96,19 @@ const App = struct {
     eraser: core.Eraser = .{},
     input: canvas_input.CanvasInput = .{},
     active_kind: ToolKind = .pen,
-    color_idx: usize = 0, // DB16[0] = 黒
+    /// 編集可能パレット（colors.len>=1）。描画色 = palette.current()。
+    palette: palette_mod.Palette,
+    /// 編集中 HSV 状態。選択切替/load 後のみ RGB→HSV で再同期（s==0 でも hue を失わない）。
+    edit_h: f32 = 0,
+    edit_s: f32 = 0,
+    edit_v: f32 = 0,
+    /// HSV を同期済みの selected。null/不一致なら再同期。
+    edit_synced_for: ?usize = null,
     running: bool = true,
     /// 現在の保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
     current_path: ?[]u8 = null,
+    /// パレットの .gpl 保存先（gpa 所有。PNG の current_path とは別管理）。
+    palette_path: ?[]u8 = null,
     /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
     pending_file_op: ?FileOp = null,
     save_msg_buf: [128]u8 = undefined,
@@ -147,7 +143,78 @@ const App = struct {
             .save => self.doSave(),
             .save_as => self.doSaveAs(),
             .open => self.doOpen(),
+            .save_palette => self.doSavePalette(),
+            .load_palette => self.doLoadPalette(),
         }
+    }
+
+    /// 選択スウォッチの色を編集中 HSV から決定し、palette と描画色（pen）へ反映する。
+    /// edit_synced_for と palette.selected が一致するフレームでだけ呼ぶ（選択切替フレームの上書き事故回避）。
+    fn applyEditColor(self: *App) void {
+        const c: u32 = @bitCast(gui.Color.fromHsv(self.edit_h, self.edit_s, self.edit_v));
+        self.palette.setSelectedColor(c);
+        self.pen.color = c;
+    }
+
+    /// 選択（or load）が変わったフレームに編集中 HSV を現在色から再同期する。
+    fn syncEditHsv(self: *App) void {
+        if (self.edit_synced_for == self.palette.selected) return;
+        const hsv = guiColor(self.palette.current()).toHsv();
+        self.edit_h = hsv.h;
+        self.edit_s = hsv.s;
+        self.edit_v = hsv.v;
+        self.edit_synced_for = self.palette.selected;
+    }
+
+    /// パレットを .gpl で保存（名前を付けて保存。成功でダイアログ戻り値を palette_path へ移譲）。
+    fn doSavePalette(self: *App) void {
+        const maybe = platform.saveFileDialog(self.gpa, .{
+            .default_name = "palette.gpl",
+            .allowed_ext = "gpl",
+        }) catch |err| {
+            self.setSaveMsg("Palette save failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return;
+        const bytes = palette_mod.encodeGpl(self.palette.colors.items, "pixie", self.gpa) catch |err| {
+            self.setSaveMsg("Palette save failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return;
+        };
+        defer self.gpa.free(bytes);
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes }) catch |err| {
+            self.setSaveMsg("Palette save failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return;
+        };
+        if (self.palette_path) |old| self.gpa.free(old);
+        self.palette_path = path;
+        self.setSaveMsg("Palette saved: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// .gpl を読み込んでパレットを差し替える（成功時のみ。失敗時は既存パレットを保持）。
+    fn doLoadPalette(self: *App) void {
+        const maybe = platform.openFileDialog(self.gpa, .{ .allowed_ext = "gpl" }) catch |err| {
+            self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return;
+        defer self.gpa.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .unlimited) catch |err| {
+            self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.gpa.free(bytes);
+        const colors = palette_mod.decodeGpl(self.gpa, bytes) catch |err| {
+            self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
+            return;
+        };
+        // 成功: 旧 colors を解放して差し替え、selected/HSV を初期化
+        self.palette.colors.deinit(self.gpa);
+        self.palette.colors = colors;
+        self.palette.selected = 0;
+        self.edit_synced_for = null; // 次フレームで HSV 再同期
+        self.setSaveMsg("Palette loaded: {s}", .{std.fs.path.basename(path)});
     }
 
     /// 記憶している保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
@@ -301,6 +368,8 @@ fn blitCanvasZoom(fb: []u32, fb_w: u32, fb_h: u32, composite: []const u32, rect:
 
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
+    // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
+    app.syncEditHsv();
     ctx.beginBox(.{
         .direction = .column,
         .width = .{ .grow = 1 },
@@ -322,6 +391,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     if (ctx.button("Save As")) app.pending_file_op = .save_as;
     if (ctx.button("Undo")) app.doUndo();
     if (ctx.button("Redo")) app.doRedo();
+    if (ctx.button("Pal Save")) app.pending_file_op = .save_palette;
+    if (ctx.button("Pal Load")) app.pending_file_op = .load_palette;
     ctx.endBox();
 
     // ── 2 段目: canvas area (grow) + right pane (fixed 200) ──
@@ -350,27 +421,53 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         .gap = 6,
         .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
     });
+    // ── カラーエディタ（HSV）。grid より前に write-back する（選択変更の上書き事故回避） ──
+    ctx.label("Color");
+    ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
+    _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 120 });
+    _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 120 });
+    ctx.endBox();
+    _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
+    _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+    _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+    app.edit_h = @min(app.edit_h, 360 - 1e-3); // hueBar と同じ [0,360) 契約
+    app.applyEditColor(); // 編集中 HSV → 選択スウォッチ色 + pen.color（grid クリックより前）
+
+    // ── 編集可能パレット（可変長スウォッチ + 追加/削除） ──
     ctx.label("Palette");
-    var idx: usize = 0;
-    var row: u32 = 0;
-    while (row < 4) : (row += 1) {
-        ctx.beginBox(.{ .direction = .row, .gap = 3 });
-        var col: u32 = 0;
-        while (col < 4) : (col += 1) {
-            const swatch_id: gui.Id = 0x1000 + @as(gui.Id, idx);
-            if (ctx.colorSwatchId(swatch_id, .{
-                .color = db16Color(idx),
-                .selected = idx == app.color_idx,
-                .size = 24,
-            }).clicked) {
-                app.color_idx = idx;
-                app.pen.color = db16Canvas(idx);
-                app.active_kind = .pen; // 色を選んだらペンに戻す
+    {
+        var idx: usize = 0;
+        while (idx < app.palette.colors.items.len) {
+            ctx.beginBox(.{ .direction = .row, .gap = 3 });
+            var col: u32 = 0;
+            while (col < 4 and idx < app.palette.colors.items.len) : (col += 1) {
+                const swatch_id: gui.Id = 0x1000 + @as(gui.Id, idx);
+                if (ctx.colorSwatchId(swatch_id, .{
+                    .color = guiColor(app.palette.colors.items[idx]),
+                    .selected = idx == app.palette.selected,
+                    .size = 22,
+                }).clicked) {
+                    app.palette.select(idx); // HSV は次フレームで再同期
+                    if (app.active_kind == .eraser) app.active_kind = .pen; // 色は pen 用
+                }
+                idx += 1;
             }
-            idx += 1;
+            ctx.endBox();
         }
-        ctx.endBox();
     }
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (ctx.buttonEx("+", .{ .min_w = 28 }).clicked) {
+        app.palette.addColor(app.gpa, app.palette.current()) catch {};
+    }
+    if (ctx.buttonEx("-", .{ .min_w = 28 }).clicked) {
+        app.palette.removeSelected();
+        // 非末尾削除で index が詰まると selected が同値のまま別色を指す。
+        // edit_synced_for を無効化し、次フレームで現 current 色から HSV 再同期する
+        // （さもないと applyEditColor が旧 HSV で新色を上書きする）。
+        app.edit_synced_for = null;
+    }
+    ctx.endBox();
+
     ctx.label("Tool");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
     if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 64 }).clicked) app.active_kind = .pen;
@@ -407,10 +504,16 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         break :blk "cursor: -";
     };
     ctx.labelEx(cursor_txt, ctx.style.text_subtle);
-    ctx.labelEx(
-        try std.fmt.allocPrint(arena, "color: #{X:0>6}", .{db16[app.color_idx]}),
-        ctx.style.text_subtle,
-    );
+    {
+        const c = app.palette.current();
+        const r: u8 = @truncate(c);
+        const g: u8 = @truncate(c >> 8);
+        const b: u8 = @truncate(c >> 16);
+        ctx.labelEx(
+            try std.fmt.allocPrint(arena, "color: #{X:0>2}{X:0>2}{X:0>2} ({d})", .{ r, g, b, app.palette.colors.items.len }),
+            ctx.style.text_subtle,
+        );
+    }
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
         ctx.style.text_subtle,
@@ -438,10 +541,14 @@ pub fn main(init: std.process.Init) !void {
         .gpa = gpa,
         .canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
         .recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
-        .pen = .{ .color = db16Canvas(0) },
+        .palette = try palette_mod.Palette.initDb16(gpa),
+        .pen = .{ .color = 0 },
     };
+    app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
     defer {
         if (app.current_path) |p| gpa.free(p);
+        if (app.palette_path) |p| gpa.free(p);
+        app.palette.deinit(gpa);
         app.undo.deinit(gpa);
         app.recorder.deinit(gpa);
         app.canvas.deinit();
