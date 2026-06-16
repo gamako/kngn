@@ -1,109 +1,29 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
-// Zig 0.16 の `@import` は build root 外のファイルを参照できないため、
-// シンボリックリンクで build root 内に共通 helper を見せている。
 const platform = @import("build_helpers/platform.zig");
-const macos = @import("build_helpers/macos.zig");
 
-// 親プロジェクトのルートパス（このディレクトリから見た相対）。
-// 全ての ../.. 参照はここを起点にする。
 const PROJECT_ROOT = "../..";
 
 pub fn build(b: *std.Build) void {
-    // ========================================
-    // プロジェクト特有のセットアップ
-    // ========================================
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const platform_option = b.option(
-        platform.PlatformType,
-        "platform",
-        "Platform layer to use",
-    ) orelse .objc;
 
-    const sdk_paths = macos.resolveMacOSSDKPaths(b, null, null);
-    const platform_root = b.path(PROJECT_ROOT ++ "/platform");
-
-    // 親プロジェクト由来のモジュール
-    const platform_module = platform.createPlatformModule(
-        b,
-        .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
-        .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
-    );
-
-    const fixed_timestep_module = b.createModule(.{
+    const fixed_timestep = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fixed_timestep.zig" },
     });
-    const fps_counter_module = b.createModule(.{
+    const fps_counter = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fps_counter.zig" },
     });
 
-    // ========================================
-    // 一般的な実行ファイルのビルド設定
-    // ========================================
-    const exe_objc = b.addExecutable(.{
-        .name = "example_04_fixed_timestep",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "platform", .module = platform_module },
-                .{ .name = "fixed_timestep", .module = fixed_timestep_module },
-                .{ .name = "fps_counter", .module = fps_counter_module },
-            },
-        }),
+    platform.buildStandalone(b, target, optimize, .{
+        .base_name = "example_04_fixed_timestep",
+        .main_source = b.path("main.zig"),
+        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
+        .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
+        .extra = &.{
+            .{ .name = "fixed_timestep", .module = fixed_timestep },
+            .{ .name = "fps_counter", .module = fps_counter },
+        },
     });
-    platform.setupExecutableForPlatform(b, exe_objc, .objc, optimize, platform_root, sdk_paths);
-
-    const exe_swift = b.addExecutable(.{
-        .name = "example_04_fixed_timestep_swift",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "platform", .module = platform_module },
-                .{ .name = "fixed_timestep", .module = fixed_timestep_module },
-                .{ .name = "fps_counter", .module = fps_counter_module },
-            },
-        }),
-    });
-    platform.setupExecutableForPlatform(b, exe_swift, .swift, optimize, platform_root, sdk_paths);
-
-    const exe_metal = b.addExecutable(.{
-        .name = "example_04_fixed_timestep_metal",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "platform", .module = platform_module },
-                .{ .name = "fixed_timestep", .module = fixed_timestep_module },
-                .{ .name = "fps_counter", .module = fps_counter_module },
-            },
-        }),
-    });
-    platform.setupExecutableForPlatform(b, exe_metal, .metal, optimize, platform_root, sdk_paths);
-
-    // インストール / 実行ステップ
-    const exe_default = switch (platform_option) {
-        .objc => exe_objc,
-        .swift => exe_swift,
-        .metal => exe_metal,
-    };
-    b.installArtifact(exe_default);
-
-    addRunStep(b, "run", "Run the example (uses -Dplatform option)", exe_default);
-    addRunStep(b, "run-objc", "Run the ObjC version", exe_objc);
-    addRunStep(b, "run-swift", "Run the Swift version", exe_swift);
-    addRunStep(b, "run-metal", "Run the Metal version", exe_metal);
-}
-
-fn addRunStep(b: *std.Build, name: []const u8, description: []const u8, exe: *std.Build.Step.Compile) void {
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    const run_step = b.step(name, description);
-    run_step.dependOn(&run_cmd.step);
 }

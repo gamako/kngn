@@ -23,6 +23,10 @@ const font_paths = [_][]const u8{
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
     "/Library/Fonts/Arial.ttf",
+    // Linux（Ubuntu / nix の system フォント）。macOS では FileNotFound で skip される。
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // 日本語（CJK, CID-keyed CFF）
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // ASCII フォールバック
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
 };
 
 const Loaded = struct { bytes: []u8, face: fontmod.FontFace };

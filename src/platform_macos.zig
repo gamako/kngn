@@ -2,17 +2,30 @@
 //!
 //! C API (`platform/platform.h`) を Zig の高レベル interface に変換するレイヤ。
 //! `@cImport` を内部に閉じ込め、caller には Zig native な型のみを公開する。
+//!
+//! 公開型（KeyCode / Event 等）は `platform_types.zig` を正準ソースとし、本ファイルは
+//! C 値からそれらを構築する変換層と、`Window`/`Framebuffer`・関数群を提供する。
 
 const std = @import("std");
+const types = @import("platform_types.zig");
 
 const c = @cImport({
     @cInclude("platform.h");
 });
 
-pub const Error = error{
-    InitFailed,
-    WindowCreationFailed,
-};
+// 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
+const Error = types.Error;
+const KeyCode = types.KeyCode;
+const ModifierFlags = types.ModifierFlags;
+const MouseButton = types.MouseButton;
+const MouseButtons = types.MouseButtons;
+const KeyEvent = types.KeyEvent;
+const MouseEvent = types.MouseEvent;
+const ScrollEvent = types.ScrollEvent;
+const Event = types.Event;
+const EventStats = types.EventStats;
+const SaveDialogOptions = types.SaveDialogOptions;
+const OpenDialogOptions = types.OpenDialogOptions;
 
 pub fn init() Error!void {
     if (!c.platform_init()) return error.InitFailed;
@@ -27,201 +40,16 @@ pub fn getTime() f64 {
 }
 
 // ============================================================================
-// KeyCode (non-exhaustive enum)
+// C 値 → 共有型 への変換
 // ============================================================================
-//
-// 物理キーボードの仮想キーコード。non-exhaustive (`_,`) にしているのは:
-//   - 未列挙の C 値が来ても `@enumFromInt` が panic しない
-//   - 将来別バックエンド (SDL 等) が独自キーを足したいときの拡張余地
-
-pub const KeyCode = enum(c_int) {
-    UNKNOWN = -1,
-
-    SPACE = 32,
-
-    @"0" = 48,
-    @"1" = 49,
-    @"2" = 50,
-    @"3" = 51,
-    @"4" = 52,
-    @"5" = 53,
-    @"6" = 54,
-    @"7" = 55,
-    @"8" = 56,
-    @"9" = 57,
-
-    A = 65, B = 66, C = 67, D = 68, E = 69, F = 70, G = 71, H = 72,
-    I = 73, J = 74, K = 75, L = 76, M = 77, N = 78, O = 79, P = 80,
-    Q = 81, R = 82, S = 83, T = 84, U = 85, V = 86, W = 87, X = 88,
-    Y = 89, Z = 90,
-
-    ESCAPE = 256,
-    ENTER = 257,
-    TAB = 258,
-    BACKSPACE = 259,
-    INSERT = 260,
-    DELETE = 261,
-    LEFT = 263,
-    RIGHT = 264,
-    UP = 265,
-    DOWN = 266,
-    PAGE_UP = 267,
-    PAGE_DOWN = 268,
-    HOME = 269,
-    END = 270,
-
-    CAPS_LOCK = 280,
-    PRINT_SCREEN = 283,
-    PAUSE = 284,
-
-    F1 = 290, F2 = 291, F3 = 292, F4 = 293, F5 = 294,
-    F6 = 295, F7 = 296, F8 = 297, F9 = 298, F10 = 299,
-    F11 = 300, F12 = 301, F13 = 302, F14 = 303, F15 = 304,
-    F16 = 305, F17 = 306, F18 = 307, F19 = 308, F20 = 309,
-
-    KP_0 = 320, KP_1 = 321, KP_2 = 322, KP_3 = 323, KP_4 = 324,
-    KP_5 = 325, KP_6 = 326, KP_7 = 327, KP_8 = 328, KP_9 = 329,
-    KP_DECIMAL = 330,
-    KP_DIVIDE = 331,
-    KP_MULTIPLY = 332,
-    KP_SUBTRACT = 333,
-    KP_ADD = 334,
-    KP_ENTER = 335,
-    KP_EQUAL = 336,
-
-    LEFT_SHIFT = 340,
-    LEFT_CONTROL = 341,
-    LEFT_ALT = 342,
-    LEFT_SUPER = 343,
-    RIGHT_SHIFT = 344,
-    RIGHT_CONTROL = 345,
-    RIGHT_ALT = 346,
-    RIGHT_SUPER = 347,
-
-    _,
-};
 
 inline fn keyFromC(raw: c.PlatformKeyCode) KeyCode {
     return @enumFromInt(@as(c_int, raw));
 }
 
-// ============================================================================
-// ModifierFlags (packed struct, LSB-first で C の bit-mask と一致)
-// ============================================================================
-
-pub const ModifierFlags = packed struct(u32) {
-    shift: bool = false,
-    ctrl: bool = false,
-    alt: bool = false,
-    cmd: bool = false,
-    _reserved: u28 = 0,
-
-    pub inline fn fromC(raw: u32) ModifierFlags {
-        return @bitCast(raw);
-    }
-
-    pub inline fn toC(self: ModifierFlags) u32 {
-        return @bitCast(self);
-    }
-};
-
-comptime {
-    // C の SHIFT=0x01, CTRL=0x02, ALT=0x04, CMD=0x08 と packed struct のビット並びが一致することを保証
-    std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .shift = true })) == 0x01);
-    std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .ctrl = true })) == 0x02);
-    std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .alt = true })) == 0x04);
-    std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .cmd = true })) == 0x08);
-}
-
-// ============================================================================
-// MouseButton (物理ボタン基準、C 側 PlatformMouseButton と同じ int 幅)
-// ============================================================================
-
-pub const MouseButton = enum(c_int) {
-    left = 0,
-    right = 1,
-    middle = 2,
-    none = 0xFF,
-    _,
-};
-
 inline fn buttonFromC(raw: c.PlatformMouseButton) MouseButton {
     return @enumFromInt(@as(c_int, @intCast(raw)));
 }
-
-// ============================================================================
-// MouseButtons (packed struct, LSB-first で C の bit-mask と一致)
-// ============================================================================
-
-pub const MouseButtons = packed struct(u8) {
-    left: bool = false,
-    right: bool = false,
-    middle: bool = false,
-    _reserved: u5 = 0,
-
-    pub inline fn fromC(raw: u8) MouseButtons {
-        return @bitCast(raw);
-    }
-
-    pub inline fn toC(self: MouseButtons) u8 {
-        return @bitCast(self);
-    }
-};
-
-comptime {
-    // C 側 LEFT=0x01, RIGHT=0x02, MIDDLE=0x04 と packed struct のビット並びが一致することを保証
-    std.debug.assert(@as(u8, @bitCast(MouseButtons{ .left = true })) == 0x01);
-    std.debug.assert(@as(u8, @bitCast(MouseButtons{ .right = true })) == 0x02);
-    std.debug.assert(@as(u8, @bitCast(MouseButtons{ .middle = true })) == 0x04);
-}
-
-// ============================================================================
-// Event
-// ============================================================================
-
-pub const KeyEvent = struct {
-    key: KeyCode,
-    is_repeat: bool,
-    modifiers: ModifierFlags,
-};
-
-/// マウスイベント。座標は window 座標 (window contentRect 左上原点・logical 単位)。
-/// framebuffer / canvas への変換は caller の責任。
-pub const MouseEvent = struct {
-    x: i32,
-    y: i32,
-    button: MouseButton,    // mouse_move では .none、mouse_down/up でのみ left/right/middle
-    buttons: MouseButtons,  // 現在押下中のボタン集合 (post-state)
-    modifiers: ModifierFlags,
-};
-
-/// スクロールイベント。dx, dy の単位は window 座標と同じ。
-pub const ScrollEvent = struct {
-    x: i32,
-    y: i32,
-    dx: f32,
-    dy: f32,
-    is_precise: bool,
-    buttons: MouseButtons,
-    modifiers: ModifierFlags,
-};
-
-pub const Event = union(enum) {
-    quit,
-    key_down: KeyEvent,
-    key_up: KeyEvent,
-    mouse_move: MouseEvent,
-    mouse_down: MouseEvent,
-    mouse_up: MouseEvent,
-    mouse_scroll: ScrollEvent,
-};
-
-/// イベントキューの観測カウンタ (累積値の snapshot)
-pub const EventStats = struct {
-    mouse_move_merge_count: u64,
-    mouse_scroll_merge_count: u64,
-    event_drop_count: u64,
-};
 
 inline fn makeKeyEvent(ev: c.PlatformEvent) KeyEvent {
     return .{
@@ -345,15 +173,6 @@ pub const Framebuffer = struct {
 // 戻り値は gpa 所有スライス（caller が gpa.free すること）。キャンセル時は null、
 // メモリ確保失敗時は error.OutOfMemory。
 
-pub const SaveDialogOptions = struct {
-    default_name: ?[:0]const u8 = null,
-    allowed_ext: ?[:0]const u8 = null,
-};
-
-pub const OpenDialogOptions = struct {
-    allowed_ext: ?[:0]const u8 = null,
-};
-
 /// 保存先をユーザーに選ばせる。
 pub fn saveFileDialog(gpa: std.mem.Allocator, opts: SaveDialogOptions) std.mem.Allocator.Error!?[]u8 {
     var c_opts: c.PlatformSaveDialogOptions = .{
@@ -379,15 +198,3 @@ fn dupePathAndFree(gpa: std.mem.Allocator, p: [*c]u8) std.mem.Allocator.Error![]
     defer c.platform_free_path(p);
     return try gpa.dupe(u8, std.mem.span(p));
 }
-
-test "ModifierFlags round trip via @bitCast" {
-    const m = ModifierFlags{ .shift = true, .cmd = true };
-    const raw = m.toC();
-    try std.testing.expectEqual(@as(u32, 0x09), raw);
-    const back = ModifierFlags.fromC(raw);
-    try std.testing.expect(back.shift);
-    try std.testing.expect(!back.ctrl);
-    try std.testing.expect(!back.alt);
-    try std.testing.expect(back.cmd);
-}
-

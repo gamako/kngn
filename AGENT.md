@@ -119,8 +119,44 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | **Objective-C** | `platform/macos/platform_macos.m`                 | CALayer       | ✅ 完全動作           |
 | **Swift**       | `platform/macos-swift/platform_macos.swift`       | CADisplayLink | ✅ 完全動作           |
 | **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ⚠️ 警告あり（動作）   |
+| **X11 (Linux)** | `src/platform_linux.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
 
 **Metal版の警告**: `CAMetalLayerDrawable`のライフサイクル問題。機能的には動作中。
+
+### backend の選び方（OS 依存）
+
+`src/platform.zig`（facade）が `builtin.os.tag` で backend を切り替え、`build_options.platform_backend`
+で具体実装を選ぶ。`-Dplatform` の有効値は OS で変わる:
+
+- **macOS**: `objc`（既定）/ `swift` / `metal`
+- **Linux**: `x11`（既定）。`wayland` は TASK-28.5 で追加予定（現状は build エラー）。
+
+不整合（例: Linux で `-Dplatform=objc`）は明確な build エラーになる。共有型（`KeyCode`/`Event` 等）は
+`src/platform_types.zig` が単一ソース。
+
+### Linux（x86_64）のビルド・検証
+
+`flake.nix` は `aarch64-darwin` と `x86_64-linux` の 2 system を提供する。Linux 側 devShell は
+zig 0.16 + zls + X11 dev lib（`libX11`/`libXext`）+ Xvfb（`xorgserver`）+ `xwd` + `ffmpeg` + `zenity` + `xdotool`（入力合成）を含む。
+
+入力（key/mouse/scroll/modifier）は `src/platform_linux.zig` が XEvent を変換する（TASK-28.3）。物理キーは evdev
+X keycode 表で `KeyCode` へ（layout 非依存・KeySym 不使用）。純粋な変換ロジックは `src/platform_linux_input.zig`
+（`@cImport` しない純 Zig）に分離し、`zig build test-platform-input` で **display 無しでも単体テストできる**（集約 `test` に含む）。
+
+```bash
+# devShell に入る（direnv 不在の環境では nix develop を使う）
+nix develop --command zig build -Dplatform=x11   # x11 backend をビルド
+
+# 入力変換の単体テスト（X server 不要・OS 非依存）
+nix develop --command zig build test-platform-input
+
+# ヘッドレス検証（GUI セッション無しの SSH 環境向け）: Xvfb 上で実行 → PNG 撮影
+nix develop --command bash scripts/xvfb-screenshot.sh out.png                 # root window を撮影（疎通確認）
+nix develop --command bash scripts/xvfb-screenshot.sh out.png -- zig-out/bin/video_proto  # アプリを撮影
+
+# 入力の合成（xdotool）: Xvfb 上のアプリへキー/マウス/ホイールを送って挙動を確認（TASK-28.3）
+#   DISPLAY=:99 xdotool key a / mousemove X Y / click 1 / click 4(=wheel up)
+```
 
 ## 主要なプラットフォームAPI
 

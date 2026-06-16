@@ -11,13 +11,19 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const target_os = target.result.os.tag;
+
+    // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11[/wayland]）。
+    // 省略時は OS のデフォルト。OS/backend 不整合・未実装は assertBackendForOs で build エラー。
     const platform_option = b.option(
         platform.PlatformType,
         "platform",
-        "Platform layer to use",
-    ) orelse .objc;
+        "Platform backend (macOS: objc/swift/metal, Linux: x11)",
+    ) orelse platform.defaultBackend(target_os);
+    platform.assertBackendForOs(platform_option, target_os);
 
-    // SDK / Toolchain パスはオプションで上書き可能（指定なしなら xcrun で自動検出）
+    // SDK / Toolchain パスは macOS backend のみ必要（Linux には xcrun が無いので解決しない）。
+    // 指定なしなら xcrun で自動検出。
     const swift_toolchain_path = b.option(
         []const u8,
         "swift-toolchain-path",
@@ -28,93 +34,140 @@ pub fn build(b: *std.Build) void {
         "swift-sdk-path",
         "Path to macOS SDK (e.g., /Applications/Xcode.app/.../MacOSX.sdk)",
     );
-    const sdk_paths = macos.resolveMacOSSDKPaths(b, swift_toolchain_path, swift_sdk_path);
+    const sdk_paths: ?macos.MacOSSDKPaths = if (target_os == .macos)
+        macos.resolveMacOSSDKPaths(b, swift_toolchain_path, swift_sdk_path)
+    else
+        null;
 
     const platform_root = b.path("platform");
 
-    const install_all = b.option(bool, "install-all", "Install all platform versions") orelse false;
+    const install_all = b.option(bool, "install-all", "Install all backends for the target OS") orelse false;
 
     // ========================================
-    // 共通モジュール (main + examples で共有)
+    // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
+    // 29.1 の外部公開 module（platform/png-decoder/font/gui）も内包する。
     // ========================================
     const example_modules = ExampleModules.init(b);
 
-    // ========================================
-    // メインアプリケーション (objc/swift/metal)
-    // ========================================
-    const exe_objc = addMainExe(b, target, optimize, platform_root, sdk_paths, .objc, APP_NAME, &example_modules);
-    const exe_swift = addMainExe(b, target, optimize, platform_root, sdk_paths, .swift, APP_NAME ++ "_swift", &example_modules);
-    const exe_metal = addMainExe(b, target, optimize, platform_root, sdk_paths, .metal, APP_NAME ++ "_metal", &example_modules);
+    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11）
+    const backends = platform.implementedBackends(target_os);
+    const default_be = platform.defaultBackend(target_os);
 
-    const main_default = switch (platform_option) {
-        .objc => exe_objc,
-        .swift => exe_swift,
-        .metal => exe_metal,
-    };
-    b.installArtifact(main_default);
-    if (install_all) {
-        b.installArtifact(exe_objc);
-        b.installArtifact(exe_swift);
-        b.installArtifact(exe_metal);
+    // ========================================
+    // main / pixie / synth / examples を backend ごとに生成
+    // （platform / keyboard は backend ごとに module graph を分ける = build_options.platform_backend を付与）
+    // audio を使う synth / example_15 と platform native lib は macOS のみ（AudioToolbox / Obj-C/Swift 実装が macOS 専用）。
+    // ========================================
+    var default_main: ?*std.Build.Step.Compile = null;
+    var default_pixie: ?*std.Build.Step.Compile = null;
+    var default_synth: ?*std.Build.Step.Compile = null;
+
+    for (backends) |be| {
+        const is_default = (be == platform_option);
+        const pm = makePlatformModules(b, target, be);
+
+        // ----- メインアプリケーション -----
+        const main_exe = addMainExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, APP_NAME, be, default_be), &pm);
+        if (is_default) default_main = main_exe;
+        if (install_all) b.installArtifact(main_exe);
+        addRunStep(b, b.fmt("run-{s}", .{platform.backendName(be)}), b.fmt("Run the {s} version", .{platform.backendName(be)}), main_exe, b.args);
+
+        // ----- Pixie エディタ (apps/editor/apps/pixie) -----
+        const pixie_exe = addPixieExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "pixie", be, default_be), &example_modules, &pm);
+        if (is_default) default_pixie = pixie_exe;
+        // install-all で pixie もビルド回帰対象にする（非対話のコンパイル検証手段）
+        if (install_all) b.installArtifact(pixie_exe);
+        addRunStep(b, b.fmt("run-pixie-{s}", .{platform.backendName(be)}), b.fmt("Run Pixie editor ({s})", .{platform.backendName(be)}), pixie_exe, b.args);
+
+        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS のみ -----
+        if (target_os == .macos) {
+            const synth_exe = addSynthExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "synth", be, default_be), &example_modules, &pm);
+            if (is_default) default_synth = synth_exe;
+            if (install_all) b.installArtifact(synth_exe);
+            addRunStep(b, b.fmt("run-synth-{s}", .{platform.backendName(be)}), b.fmt("Run synth app ({s})", .{platform.backendName(be)}), synth_exe, b.args);
+        }
+
+        // ----- サンプルプログラム -----
+        // 各 example が必要とするモジュールを宣言的に指定する。
+        // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
+        // 揃えること（inline for で型不一致を避けるため）。
+        inline for (.{
+            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
+            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
+            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = true },
+        }) |example| {
+            const needs: ExampleNeeds = .{
+                .needs_sprite = example.needs_sprite,
+                .needs_fps_counter = example.needs_fps_counter,
+                .needs_fixed_timestep = example.needs_fixed_timestep,
+                .needs_text = example.needs_text,
+                .needs_gui = example.needs_gui,
+                .needs_png_decoder = example.needs_png_decoder,
+                .needs_font = example.needs_font,
+                .needs_audio = example.needs_audio,
+            };
+            // audio example（AudioToolbox / audio backend）は macOS のみ。Linux ではスキップ。
+            if (!(example.needs_audio and target_os != .macos)) {
+                const ex_exe = addExampleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, example.name, be, default_be), example.path, &example_modules, &pm, needs);
+                // examples は install-all とは独立に常に全 backend を install する
+                // （platform 層 / example のビルド回帰を毎 `zig build` で検出する従来挙動を踏襲）。
+                b.installArtifact(ex_exe);
+                if (is_default) {
+                    addRunStep(
+                        b,
+                        b.fmt("run-{s}", .{example.name}),
+                        b.fmt("Run {s} example (uses -Dplatform option)", .{example.name}),
+                        ex_exe,
+                        b.args,
+                    );
+                }
+            }
+        }
     }
 
-    addRunStep(b, "run", "Run the app (uses -Dplatform option)", main_default, b.args);
-    addRunStep(b, "run-objc", "Run the ObjC version", exe_objc, b.args);
-    addRunStep(b, "run-swift", "Run the Swift version", exe_swift, b.args);
-    addRunStep(b, "run-metal", "Run the Metal version", exe_metal, b.args);
+    // デフォルト backend を `run` / 既定 install に紐づける。
+    // install-all のときは上のループで全 backend を install 済みなので二重 install しない。
+    if (!install_all) b.installArtifact(default_main.?);
+    addRunStep(b, "run", "Run the app (uses -Dplatform option)", default_main.?, b.args);
+    addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", default_pixie.?, b.args);
+    if (target_os == .macos) addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", default_synth.?, b.args);
 
     // ========================================
-    // Pixie エディタ (apps/editor/apps/pixie)
-    // ========================================
-    const pixie_objc = addPixieExe(b, target, optimize, platform_root, sdk_paths, .objc, "pixie", &example_modules);
-    const pixie_swift = addPixieExe(b, target, optimize, platform_root, sdk_paths, .swift, "pixie_swift", &example_modules);
-    const pixie_metal = addPixieExe(b, target, optimize, platform_root, sdk_paths, .metal, "pixie_metal", &example_modules);
-    const pixie_default = switch (platform_option) {
-        .objc => pixie_objc,
-        .swift => pixie_swift,
-        .metal => pixie_metal,
-    };
-    addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", pixie_default, b.args);
-    addRunStep(b, "run-pixie-objc", "Run Pixie editor (ObjC)", pixie_objc, b.args);
-    addRunStep(b, "run-pixie-swift", "Run Pixie editor (Swift)", pixie_swift, b.args);
-    addRunStep(b, "run-pixie-metal", "Run Pixie editor (Metal)", pixie_metal, b.args);
-    // install-all で pixie 3 実装もビルド回帰対象にする（非対話のコンパイル検証手段）
-    if (install_all) {
-        b.installArtifact(pixie_objc);
-        b.installArtifact(pixie_swift);
-        b.installArtifact(pixie_metal);
-    }
-
-    // ========================================
-    // Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)
-    // ========================================
-    const synth_objc = addSynthExe(b, target, optimize, platform_root, sdk_paths, .objc, "synth", &example_modules);
-    const synth_swift = addSynthExe(b, target, optimize, platform_root, sdk_paths, .swift, "synth_swift", &example_modules);
-    const synth_metal = addSynthExe(b, target, optimize, platform_root, sdk_paths, .metal, "synth_metal", &example_modules);
-    const synth_default = switch (platform_option) {
-        .objc => synth_objc,
-        .swift => synth_swift,
-        .metal => synth_metal,
-    };
-    addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", synth_default, b.args);
-    addRunStep(b, "run-synth-objc", "Run synth app (ObjC)", synth_objc, b.args);
-    addRunStep(b, "run-synth-swift", "Run synth app (Swift)", synth_swift, b.args);
-    addRunStep(b, "run-synth-metal", "Run synth app (Metal)", synth_metal, b.args);
-    if (install_all) {
-        b.installArtifact(synth_objc);
-        b.installArtifact(synth_swift);
-        b.installArtifact(synth_metal);
-    }
-
-    // ========================================
-    // platform native object archive lib（外部パッケージ向け。TASK-29.1）
+    // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
     // facade module(addModule "platform") と責務分離。外部は dep.artifact("platform_native_<plat>")
     // を linkLibrary する。.o の archive のみで、framework/Swift ランタイム/検索パスは
     // consumer の exe 側で適用する（29.2 の C 方式）。
+    //
+    // 既知の制限（Linux 外部消費は未対応）: 29.1 の公開モデル（facade module + native .o archive）は
+    // macOS backend(Obj-C/Swift を別コンパイル)前提の形。Linux で外部パッケージとして
+    // `dep.module("platform")` を使うと、(1) facade が platform_linux.zig を選び
+    // `@import("build_options")`(platform_backend) を要求するが公開 module には付いていない、
+    // (2) X11 の include / `linkSystemLibrary("X11"/"Xext")` が無い、(3) Linux backend は純 Zig で
+    // 別 .o archive 不要、のため成立しない。対応するなら公開 module を backend-aware にする
+    // （Linux 既定 x11 の build_options + X11 link を付与）必要がある。自プロジェクトの内部ビルドは
+    // per-backend module(makePlatformModules)を使うので無影響。需要が出たら 29.x で対応。
     // ========================================
-    _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc");
-    _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift");
-    _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal");
+    if (target_os == .macos) {
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc");
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift");
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal");
+    }
+
+    // ========================================
+    // テスト群（platform を import しない純テスト。OS/backend 非依存）
+    // ========================================
 
     // PNG round-trip テスト (io_png.zig のテスト + png-decoder で検証)
     const io_png_mod = b.createModule(.{
@@ -258,6 +311,21 @@ pub fn build(b: *std.Build) void {
     test_png_format_step.dependOn(&run_png_format_test.step);
 
     // ========================================
+    // platform_linux_input.zig テスト（X11 入力の純粋変換: keycode/modifier/EventQueue/KeyDownSet）
+    // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.3）
+    // ========================================
+    const platform_input_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform_linux_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_platform_input_test = b.addRunArtifact(platform_input_test);
+    const test_platform_input_step = b.step("test-platform-input", "Run X11 input mapping/queue unit tests");
+    test_platform_input_step.dependOn(&run_platform_input_test.step);
+
+    // ========================================
     // text.zig テスト (BDF パーサ + 描画)
     // ========================================
     const text_test_mod = b.createModule(.{
@@ -368,7 +436,8 @@ pub fn build(b: *std.Build) void {
 
     // ========================================
     // 集約 test ステップ (全 test-* を束ねる)
-    // 注: テスト実行のみ。example の build 回帰は `zig build -Dinstall-all=true` で別途確認する。
+    // 注: ここはテスト実行のみ。example の build 回帰は通常の `zig build`（examples は常に全 backend install）で
+    //     カバーされる。`-Dinstall-all=true` は main/pixie も全 backend install する用途。
     // ========================================
     const test_step = b.step("test", "Run all unit/integration tests");
     test_step.dependOn(test_png_roundtrip_step);
@@ -382,76 +451,54 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
-
-    // ========================================
-    // サンプルプログラムのビルド (親プロジェクト経由)
-    // ========================================
-
-    // 各 example が必要とするモジュールを宣言的に指定する。
-    // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
-    // 揃えること（inline for で型不一致を避けるため）。
-    inline for (.{
-        .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
-        .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
-        .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-        .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = true },
-    }) |example| {
-        const needs: ExampleNeeds = .{
-            .needs_sprite = example.needs_sprite,
-            .needs_fps_counter = example.needs_fps_counter,
-            .needs_fixed_timestep = example.needs_fixed_timestep,
-            .needs_text = example.needs_text,
-            .needs_gui = example.needs_gui,
-            .needs_png_decoder = example.needs_png_decoder,
-            .needs_font = example.needs_font,
-            .needs_audio = example.needs_audio,
-        };
-        const ex_objc = addExampleExe(b, target, optimize, platform_root, sdk_paths, .objc, example.name, example.path, &example_modules, needs);
-        const ex_swift = addExampleExe(b, target, optimize, platform_root, sdk_paths, .swift, example.name ++ "_swift", example.path, &example_modules, needs);
-        const ex_metal = addExampleExe(b, target, optimize, platform_root, sdk_paths, .metal, example.name ++ "_metal", example.path, &example_modules, needs);
-
-        b.installArtifact(ex_objc);
-        b.installArtifact(ex_swift);
-        b.installArtifact(ex_metal);
-
-        const ex_default = switch (platform_option) {
-            .objc => ex_objc,
-            .swift => ex_swift,
-            .metal => ex_metal,
-        };
-        addRunStep(
-            b,
-            b.fmt("run-{s}", .{example.name}),
-            b.fmt("Run {s} example (uses -Dplatform option)", .{example.name}),
-            ex_default,
-            b.args,
-        );
-    }
+    test_step.dependOn(test_platform_input_step);
 }
 
 // ============================================================
-// ヘルパー: メインアプリの exe を 1 プラットフォーム分セットアップ
+// exe / run-step 名: デフォルト backend は無印、他は "_<backend>" サフィックス
+// （macOS: objc=無印 / swift / metal, Linux: x11=無印）
+// ============================================================
+fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, default_be: platform.PlatformType) []const u8 {
+    return if (be == default_be) base else b.fmt("{s}_{s}", .{ base, platform.backendName(be) });
+}
+
+// ============================================================
+// backend ごとの platform / keyboard module を作る
+// （platform module には build_options.platform_backend が付与される）
+// ============================================================
+const PlatformModules = struct {
+    platform: *std.Build.Module,
+    keyboard: *std.Build.Module,
+};
+
+fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType) PlatformModules {
+    const platform_mod = platform.createPlatformModule(
+        b,
+        target,
+        b.path("src/platform.zig"),
+        b.path("platform"),
+        backend,
+    );
+    // keyboard は KeyCode 型定義を platform から借りる
+    const keyboard_mod = b.createModule(.{
+        .root_source_file = b.path("src/keyboard.zig"),
+    });
+    keyboard_mod.addImport("platform", platform_mod);
+    return .{ .platform = platform_mod, .keyboard = keyboard_mod };
+}
+
+// ============================================================
+// ヘルパー: メインアプリの exe を 1 backend 分セットアップ
 // ============================================================
 fn addMainExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
-    sdk_paths: macos.MacOSSDKPaths,
+    sdk_paths: ?macos.MacOSSDKPaths,
     platform_type: platform.PlatformType,
     name: []const u8,
-    modules: *const ExampleModules,
+    pm: *const PlatformModules,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = name,
@@ -461,13 +508,15 @@ fn addMainExe(
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("platform", modules.platform);
+    exe.root_module.addImport("platform", pm.platform);
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
 }
 
 // ============================================================
-// ヘルパー: example の exe を 1 プラットフォーム分セットアップ
+// 共有モジュール (OS/backend 非依存)。29.1 の外部公開 module（addModule）も内包。
+// 我々の exe / example は backend ごとの PlatformModules.platform を使うため、ここの platform/keyboard は
+// 主に外部公開（dep.module("platform")）と test 用。
 // ============================================================
 const ExampleModules = struct {
     platform: *std.Build.Module,
@@ -576,16 +625,21 @@ const ExampleNeeds = struct {
     needs_audio: bool,
 };
 
+// ============================================================
+// ヘルパー: example の exe を 1 backend 分セットアップ
+// platform / keyboard は backend ごとの pm から、その他の共有 module は common から取る。
+// ============================================================
 fn addExampleExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
-    sdk_paths: macos.MacOSSDKPaths,
+    sdk_paths: ?macos.MacOSSDKPaths,
     platform_type: platform.PlatformType,
     name: []const u8,
     source_path: []const u8,
-    modules: *const ExampleModules,
+    common: *const ExampleModules,
+    pm: *const PlatformModules,
     needs: ExampleNeeds,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
@@ -597,29 +651,26 @@ fn addExampleExe(
         }),
     });
     // 全 example が platform / keyboard を使う
-    exe.root_module.addImport("platform", modules.platform);
-    exe.root_module.addImport("keyboard", modules.keyboard);
-    if (needs.needs_sprite) exe.root_module.addImport("sprite", modules.sprite);
-    if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", modules.fps_counter);
-    if (needs.needs_fixed_timestep) exe.root_module.addImport("fixed_timestep", modules.fixed_timestep);
-    if (needs.needs_text) exe.root_module.addImport("text", modules.text);
-    if (needs.needs_gui) exe.root_module.addImport("gui", modules.gui);
-    if (needs.needs_png_decoder) exe.root_module.addImport("png-decoder", modules.png_decoder);
-    if (needs.needs_font) exe.root_module.addImport("font", modules.font);
+    exe.root_module.addImport("platform", pm.platform);
+    exe.root_module.addImport("keyboard", pm.keyboard);
+    if (needs.needs_sprite) exe.root_module.addImport("sprite", common.sprite);
+    if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", common.fps_counter);
+    if (needs.needs_fixed_timestep) exe.root_module.addImport("fixed_timestep", common.fixed_timestep);
+    if (needs.needs_text) exe.root_module.addImport("text", common.text);
+    if (needs.needs_gui) exe.root_module.addImport("gui", common.gui);
+    if (needs.needs_png_decoder) exe.root_module.addImport("png-decoder", common.png_decoder);
+    if (needs.needs_font) exe.root_module.addImport("font", common.font);
     if (needs.needs_audio) {
-        exe.root_module.addImport("audio", modules.audio);
-        // L1 オーディオ出力に必要な framework（needs_audio の exe にのみ付与。既存は不変）。
+        exe.root_module.addImport("audio", common.audio);
+        // L1 オーディオ出力に必要な framework（needs_audio の exe にのみ付与。macOS のみ到達）。
         exe.root_module.linkFramework("AudioToolbox", .{});
     }
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。
+    // （platform module 側の build_options.platform_backend とは別 module スコープ）
     const opts = b.addOptions();
-    opts.addOption([]const u8, "platform_name", switch (platform_type) {
-        .objc => "objc",
-        .swift => "swift",
-        .metal => "metal",
-    });
+    opts.addOption([]const u8, "platform_name", platform.backendName(platform_type));
     exe.root_module.addOptions("build_options", opts);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
@@ -627,17 +678,18 @@ fn addExampleExe(
 }
 
 // ============================================================
-// ヘルパー: pixie exe を 1 プラットフォーム分セットアップ
+// ヘルパー: pixie exe を 1 backend 分セットアップ
 // ============================================================
 fn addPixieExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
-    sdk_paths: macos.MacOSSDKPaths,
+    sdk_paths: ?macos.MacOSSDKPaths,
     platform_type: platform.PlatformType,
     name: []const u8,
-    modules: *const ExampleModules,
+    common: *const ExampleModules,
+    pm: *const PlatformModules,
 ) *std.Build.Step.Compile {
     const core_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/core.zig"),
@@ -651,27 +703,28 @@ fn addPixieExe(
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("platform", modules.platform);
+    exe.root_module.addImport("platform", pm.platform);
     exe.root_module.addImport("core", core_mod);
-    exe.root_module.addImport("gui", modules.gui);
-    exe.root_module.addImport("png-decoder", modules.png_decoder); // PNG 読み込み (TASK-24)
+    exe.root_module.addImport("gui", common.gui);
+    exe.root_module.addImport("png-decoder", common.png_decoder); // PNG 読み込み (TASK-24)
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
 }
 
 // ============================================================
-// ヘルパー: synth app exe を 1 プラットフォーム分セットアップ
+// ヘルパー: synth app exe を 1 backend 分セットアップ（macOS のみ。AudioToolbox を link）
 // ============================================================
 fn addSynthExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
-    sdk_paths: macos.MacOSSDKPaths,
+    sdk_paths: ?macos.MacOSSDKPaths,
     platform_type: platform.PlatformType,
     name: []const u8,
-    modules: *const ExampleModules,
+    common: *const ExampleModules,
+    pm: *const PlatformModules,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = name,
@@ -681,11 +734,11 @@ fn addSynthExe(
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("platform", modules.platform);
-    exe.root_module.addImport("audio", modules.audio);
-    exe.root_module.addImport("synth", modules.synth);
-    exe.root_module.addImport("dsp", modules.dsp); // mono downmix + FFT(スペクトログラム)
-    exe.root_module.addImport("gui", modules.gui); // スライダ / ボタン（演奏 UI）
+    exe.root_module.addImport("platform", pm.platform);
+    exe.root_module.addImport("audio", common.audio);
+    exe.root_module.addImport("synth", common.synth);
+    exe.root_module.addImport("dsp", common.dsp); // mono downmix + FFT(スペクトログラム)
+    exe.root_module.addImport("gui", common.gui); // スライダ / ボタン（演奏 UI）
     exe.root_module.linkFramework("AudioToolbox", .{}); // L1 オーディオ出力
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
