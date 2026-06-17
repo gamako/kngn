@@ -198,7 +198,7 @@ const App = struct {
 
     /// パレットを .gpl で保存（名前を付けて保存。成功でダイアログ戻り値を palette_path へ移譲）。
     fn doSavePalette(self: *App) void {
-        const maybe = platform.saveFileDialog(self.gpa, .{
+        const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "palette.gpl",
             .allowed_ext = "gpl",
         }) catch |err| {
@@ -224,7 +224,7 @@ const App = struct {
 
     /// .gpl を読み込んでパレットを差し替える（成功時のみ。失敗時は既存パレットを保持）。
     fn doLoadPalette(self: *App) void {
-        const maybe = platform.openFileDialog(self.gpa, .{ .allowed_ext = "gpl" }) catch |err| {
+        const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "gpl" }) catch |err| {
             self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
             return;
         };
@@ -263,7 +263,7 @@ const App = struct {
 
     /// ダイアログで保存先を選んで保存。成功時にダイアログ戻り値を current_path へ移譲する。
     fn doSaveAs(self: *App) void {
-        const maybe = platform.saveFileDialog(self.gpa, .{
+        const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "untitled.png",
             .allowed_ext = "png",
         }) catch |err| {
@@ -286,7 +286,7 @@ const App = struct {
     /// 進行中 stroke 中は破棄。undo/redo はクリアし、current_path を開いたファイルに更新。
     fn doOpen(self: *App) void {
         if (self.input.capturing or self.bezier_editor.isEditing()) return;
-        const maybe = platform.openFileDialog(self.gpa, .{ .allowed_ext = "png" }) catch |err| {
+        const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "png" }) catch |err| {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
             return;
         };
@@ -348,19 +348,23 @@ const App = struct {
                 return;
             }
         }
+        // 保存系などのアクセラレータ修飾: macOS=Cmd / Linux=Ctrl。
+        // Linux(GNOME 等)は Super(=cmd) を WM が予約してアプリに届かないため Ctrl も受ける
+        // （Ctrl+S 等は Linux の保存の慣習にも合致。macOS は従来どおり Cmd で、Ctrl も追加で効く）。
+        const accel = k.modifiers.cmd or k.modifiers.ctrl;
         if (k.key == .ESCAPE) {
             self.running = false;
-        } else if (k.key == .Q and k.modifiers.cmd) {
+        } else if (k.key == .Q and accel) {
             self.running = false;
-        } else if (k.key == .S and k.modifiers.cmd and k.modifiers.shift) {
+        } else if (k.key == .S and accel and k.modifiers.shift) {
             self.pending_file_op = .save_as;
-        } else if (k.key == .S and k.modifiers.cmd) {
+        } else if (k.key == .S and accel) {
             self.pending_file_op = .save;
-        } else if (k.key == .O and k.modifiers.cmd) {
+        } else if (k.key == .O and accel) {
             self.pending_file_op = .open;
-        } else if (k.key == .Z and k.modifiers.cmd and k.modifiers.shift) {
+        } else if (k.key == .Z and accel and k.modifiers.shift) {
             self.doRedo();
-        } else if (k.key == .Z and k.modifiers.cmd) {
+        } else if (k.key == .Z and accel) {
             self.doUndo();
         } else if (k.key == .B) {
             self.setActiveKind(.pen);

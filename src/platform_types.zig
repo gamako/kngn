@@ -250,8 +250,15 @@ pub const EventStats = struct {
 };
 
 // ============================================================================
-// ファイル選択ダイアログのオプション (TASK-24)
+// ファイル選択ダイアログ (TASK-24 / Linux: TASK-28.4)
 // ============================================================================
+
+/// ファイルダイアログのエラー（全 OS 共通の戻り値型に使う）。
+/// - DialogUnavailable: ダイアログ機構が使えない（Linux: zenity 不在）。
+///   macOS/Windows は通常返さない（型互換のため宣言に含める）。
+/// - DialogFailed: 予期せぬ失敗（異常終了 / signal / 環境不備等）。
+/// ユーザーキャンセルは error ではなく null で表す。OOM は Allocator.Error。
+pub const DialogError = error{ DialogUnavailable, DialogFailed };
 
 pub const SaveDialogOptions = struct {
     default_name: ?[:0]const u8 = null,

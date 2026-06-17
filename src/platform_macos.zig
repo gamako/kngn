@@ -26,6 +26,7 @@ const Event = types.Event;
 const EventStats = types.EventStats;
 const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;
+const DialogError = types.DialogError;
 
 pub fn init() Error!void {
     if (!c.platform_init()) return error.InitFailed;
@@ -174,7 +175,8 @@ pub const Framebuffer = struct {
 // メモリ確保失敗時は error.OutOfMemory。
 
 /// 保存先をユーザーに選ばせる。
-pub fn saveFileDialog(gpa: std.mem.Allocator, opts: SaveDialogOptions) std.mem.Allocator.Error!?[]u8 {
+pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    _ = io; // macOS は native panel（io 不要）。全 OS 共通シグネチャのため受け取る。
     var c_opts: c.PlatformSaveDialogOptions = .{
         .default_name = if (opts.default_name) |s| s.ptr else null,
         .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,
@@ -184,7 +186,8 @@ pub fn saveFileDialog(gpa: std.mem.Allocator, opts: SaveDialogOptions) std.mem.A
 }
 
 /// 開くファイルをユーザーに選ばせる（単一選択・ファイルのみ）。
-pub fn openFileDialog(gpa: std.mem.Allocator, opts: OpenDialogOptions) std.mem.Allocator.Error!?[]u8 {
+pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    _ = io; // macOS は native panel（io 不要）。全 OS 共通シグネチャのため受け取る。
     var c_opts: c.PlatformOpenDialogOptions = .{
         .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,
     };

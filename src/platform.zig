@@ -35,6 +35,7 @@ pub const MouseEvent = types.MouseEvent;
 pub const ScrollEvent = types.ScrollEvent;
 pub const Event = types.Event;
 pub const EventStats = types.EventStats;
+pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 
