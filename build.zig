@@ -326,6 +326,21 @@ pub fn build(b: *std.Build) void {
     test_platform_input_step.dependOn(&run_platform_input_test.step);
 
     // ========================================
+    // platform_linux_convert.zig テスト（X11 pixel 変換の純粋ロジック: packPixel/maskShift/classifyVisual）
+    // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.6 / AC#4）
+    // ========================================
+    const platform_convert_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform_linux_convert.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_platform_convert_test = b.addRunArtifact(platform_convert_test);
+    const test_platform_convert_step = b.step("test-platform-convert", "Run X11 pixel format conversion/visual classification unit tests");
+    test_platform_convert_step.dependOn(&run_platform_convert_test.step);
+
+    // ========================================
     // text.zig テスト (BDF パーサ + 描画)
     // ========================================
     const text_test_mod = b.createModule(.{
@@ -452,6 +467,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
     test_step.dependOn(test_platform_input_step);
+    test_step.dependOn(test_platform_convert_step);
 }
 
 // ============================================================

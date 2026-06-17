@@ -5,9 +5,9 @@
 
 const std = @import("std");
 
-// framebuffer のピクセル packing(gui.Color と同じ: メモリ R,G,B,A = u32 0xAABBGGRR)。
+// framebuffer のピクセル packing(gui.Color と同じ: メモリ B,G,R,A = u32 0xAARRGGBB)。
 inline fn rgba(r: u8, g: u8, b: u8, a: u8) u32 {
-    return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16) | (@as(u32, a) << 24);
+    return @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16) | (@as(u32, a) << 24);
 }
 
 const bg_color = rgba(0x08, 0x10, 0x10, 0xFF);

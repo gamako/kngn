@@ -121,7 +121,7 @@ test "plotCoverage: cov=255, opaque col replaces pixel" {
     var px = [_]u32{0xFF000000} ** (4 * 4);
     const t = RenderTarget{ .pixels = &px, .width = 4, .height = 4 };
     plotCoverage(t, 1, 1, Color.rgba(0xFF, 0x00, 0x00, 0xFF), 255, full_clip);
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), px[1 * 4 + 1]); // 赤・不透明
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), px[1 * 4 + 1]); // 赤・不透明
     try std.testing.expectEqual(@as(u32, 0xFF000000), px[0]); // 他は不変
 }
 

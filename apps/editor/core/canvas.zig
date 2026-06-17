@@ -7,7 +7,7 @@ pub const Vec2 = struct { x: i32, y: i32 };
 pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
 
 pub const Layer = struct {
-    pixels: []u32, // format: 0xAABBGGRR (bytes [R,G,B,A] on little-endian)
+    pixels: []u32, // format: canonical BGRA 0xAARRGGBB (bytes [B,G,R,A] on little-endian)
     visible: bool = true,
     opacity: u8 = 255,
 };
@@ -171,16 +171,16 @@ test "composite: a=255 元色 / a=0(RGB非ゼロ) 背景維持 / partial は白�
     var c = try Canvas.init(gpa, 3, 1);
     defer c.deinit();
     const px = c.layerPixels(0);
-    px[0] = 0xFF0000FF; // 不透明赤
+    px[0] = 0xFF0000FF; // 不透明青
     px[1] = 0x00FFFFFF; // a=0 だが RGB 非ゼロ → 背景(白)維持
-    px[2] = 0x800000FF; // 半透明赤（a=128）→ 白地に約半分
+    px[2] = 0x800000FF; // 半透明青（a=128）→ 白地に約半分
 
     const out = c.composite();
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]); // 元色
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), out[1]); // 白維持
     try std.testing.expectEqual(@as(u32, 0xFF), (out[2] >> 24) & 0xFF); // 不透明
-    // R は 255、G/B は白(255)と赤(0)の中間 ≈ 127
-    try std.testing.expectEqual(@as(u32, 0xFF), out[2] & 0xFF); // R=255
+    // B は 255、G/R は白(255)と青(0)の中間 ≈ 127
+    try std.testing.expectEqual(@as(u32, 0xFF), out[2] & 0xFF); // B=255
     const g = (out[2] >> 8) & 0xFF;
     try std.testing.expect(g > 120 and g < 135);
 }
@@ -189,14 +189,14 @@ test "composite: visible=false はスキップ / opacity が効く" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 1, 1);
     defer c.deinit();
-    c.layerPixels(0)[0] = 0xFF0000FF; // 不透明赤
+    c.layerPixels(0)[0] = 0xFF0000FF; // 不透明青
     c.layers.items[0].visible = false;
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), c.composite()[0]); // スキップ → 白
 
     c.layers.items[0].visible = true;
-    c.layers.items[0].opacity = 128; // 不透明赤 × opacity 128 → 白地に約半分
+    c.layers.items[0].opacity = 128; // 不透明青 × opacity 128 → 白地に約半分
     const out = c.composite()[0];
-    try std.testing.expectEqual(@as(u32, 0xFF), out & 0xFF); // R=255
+    try std.testing.expectEqual(@as(u32, 0xFF), out & 0xFF); // B=255
     const g = (out >> 8) & 0xFF;
     try std.testing.expect(g > 120 and g < 135);
 }
@@ -205,12 +205,12 @@ test "composite: 2 層 src-over（下層→上層順）" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 1, 1);
     defer c.deinit();
-    c.layerPixels(0)[0] = 0xFF0000FF; // 下層: 不透明赤
-    // 上層を追加（不透明青で覆う）
+    c.layerPixels(0)[0] = 0xFF0000FF; // 下層: 不透明青
+    // 上層を追加（不透明赤で覆う）
     const top = try gpa.alloc(u32, 1);
-    top[0] = 0xFFFF0000; // 0xAABBGGRR: a=FF, b=FF（青）
+    top[0] = 0xFFFF0000; // 0xAARRGGBB: a=FF, r=FF（赤）
     try c.layers.append(gpa, .{ .pixels = top });
 
     const out = c.composite()[0];
-    try std.testing.expectEqual(@as(u32, 0xFFFF0000), out); // 上層(青)が下層(赤)を覆う
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), out); // 上層(赤)が下層(青)を覆う
 }

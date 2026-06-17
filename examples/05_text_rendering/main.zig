@@ -76,12 +76,12 @@ pub fn main() !void {
             const target = fontmod.RenderTarget{ .pixels = fb.pixels, .width = fbw, .height = fbh };
             const clip = fontmod.Rect{ .x = 0, .y = 0, .w = fbw, .h = fbh };
             const lh: i32 = @intCast(f.metrics().line_height);
-            // 旧 raw u32 色を @bitCast で保持（見た目を不変に）。
-            const cyan: fontmod.Color = @bitCast(@as(u32, 0xFF00FFFF));
-            const white: fontmod.Color = @bitCast(@as(u32, 0xFFFFFFFF));
-            const orange: fontmod.Color = @bitCast(@as(u32, 0xFFFFCCAA));
-            const gray: fontmod.Color = @bitCast(@as(u32, 0xFFCCCCCC));
-            const green: fontmod.Color = @bitCast(@as(u32, 0xFF66FF66));
+            // 色は明示 API Color.rgba(r,g,b,a) で構築（canonical BGRA 境界変換を明示化）。
+            const cyan = fontmod.Color.rgba(0x00, 0xFF, 0xFF, 0xFF);
+            const white = fontmod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+            const orange = fontmod.Color.rgba(0xFF, 0xCC, 0xAA, 0xFF);
+            const gray = fontmod.Color.rgba(0xCC, 0xCC, 0xCC, 0xFF);
+            const green = fontmod.Color.rgba(0x66, 0xFF, 0x66, 0xFF);
 
             // 左上: FPS / dt (シアン)
             var fps_buf: [32]u8 = undefined;

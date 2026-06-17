@@ -1,12 +1,12 @@
 const std = @import("std");
 
-/// u32 = 0xAABBGGRR（little-endian、メモリ上[R,G,B,A]順）
+/// u32 = 0xAARRGGBB（little-endian、メモリ上[B,G,R,A]順）
 /// sprite.zig の blendPixel と同レイアウト。
 /// alpha 規約: straight alpha（非 premultiplied）。
 pub const Color = packed struct(u32) {
-    r: u8,
-    g: u8,
     b: u8,
+    g: u8,
+    r: u8,
     a: u8,
 
     pub fn rgba(r: u8, g: u8, b: u8, a: u8) Color {
@@ -111,9 +111,9 @@ pub const Color = packed struct(u32) {
     }
 };
 
-test "Color layout: rgba -> u32 is 0xAABBGGRR" {
+test "Color layout: rgba -> u32 is 0xAARRGGBB" {
     const c = Color.rgba(0x11, 0x22, 0x33, 0xFF);
-    try std.testing.expectEqual(@as(u32, 0xFF332211), @as(u32, @bitCast(c)));
+    try std.testing.expectEqual(@as(u32, 0xFF112233), @as(u32, @bitCast(c)));
 }
 
 test "Color.hex: 0xRRGGBBAA -> Color" {

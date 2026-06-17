@@ -20,7 +20,7 @@ const UndoCmd = undo_mod.UndoCmd;
 /// MVP は単一レイヤ。多レイヤ対応は後続タスク。
 const MVP_LAYER: usize = 0;
 
-/// Eraser の塗り色（透明）。0xAABBGGRR の a=0。
+/// Eraser の塗り色（透明）。canonical BGRA 0xAARRGGBB の a=0。
 pub const ERASER_COLOR: u32 = 0x00000000;
 
 pub const ToolPoint = struct { x: i32, y: i32 };
@@ -207,7 +207,7 @@ pub const Brush = struct {
 
 const UndoStack = undo_mod.UndoStack;
 const Offset = undo_mod.Offset;
-const RED: u32 = 0xFF0000FF; // 0xAABBGGRR
+const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
 
 // Tool 経路（onEvent down/move/up）でゴールデン: 描画 → undo → PNG round-trip 一致（AC#3）。
 test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip が一致する" {

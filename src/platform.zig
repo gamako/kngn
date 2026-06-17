@@ -7,6 +7,13 @@
 //! 公開型（KeyCode / Event 等）は `platform_types.zig` を単一ソースとして re-export し、
 //! `Window`/`Framebuffer` と関数群だけを各 backend から re-export する。
 //! （Zig 0.16 で `pub usingnamespace` が削除されたため、明示的に列挙する。）
+//!
+//! ## canonical pixel format（全 OS 共通・TASK-28.6）
+//!
+//! framebuffer のピクセルは **canonical BGRA**: u32 `0xAARRGGBB`（リトルエンディアンの
+//! メモリ上は `[B, G, R, A]`）。pack = `(a<<24)|(r<<16)|(g<<8)|b`。web 16進 `0xRRGGBB` が
+//! 低 24bit にそのまま一致する。Windows(GDI/DXGI)・X11 標準 visual・macOS(CGImage/Metal) が
+//! 共通して BGRA を native に扱えるため、中間変換層も実行時分岐も持たず全 OS で直書きできる。
 
 const builtin = @import("builtin");
 const types = @import("platform_types.zig");

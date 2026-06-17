@@ -144,7 +144,7 @@ fn lerpU8(a: u8, b: u8, t: f32) u8 {
     return @intFromFloat(@round(af + (bf - af) * t));
 }
 
-/// 強度 v(0..255) → framebuffer 形式 0xAABBGGRR(u32 = r|g<<8|b<<16|a<<24)。
+/// 強度 v(0..255) → framebuffer 形式 0xAARRGGBB(u32 = b|g<<8|r<<16|a<<24)。
 /// magma 風(黒→紫→赤→橙→黄白)。凡例描画でも同じ配色を使えるよう pub。
 pub fn intensityColor(v: u8) u32 {
     const n_seg = color_stops.len - 1; // 4 区間
@@ -157,7 +157,7 @@ pub fn intensityColor(v: u8) u32 {
     const r: u32 = lerpU8(a[0], b[0], t);
     const g: u32 = lerpU8(a[1], b[1], t);
     const bl: u32 = lerpU8(a[2], b[2], t);
-    return r | (g << 8) | (bl << 16) | (@as(u32, 0xFF) << 24);
+    return bl | (g << 8) | (r << 16) | (@as(u32, 0xFF) << 24);
 }
 
 // ============================================================================

@@ -396,7 +396,7 @@ test "Format conversion - grayscale to RGBA8888" {
                 const idx = y * tc.width + x;
                 const gray_value = filtered[idx];
 
-                // Expected RGBA8888: byte order [R, G, B, A] (u32 = 0xAABBGGRR on little-endian)
+                // Expected BGRA8888: byte order [B, G, R, A] (u32 = 0xAARRGGBB on little-endian)
                 const expected_rgba = test_cases.packRGBA(gray_value, gray_value, gray_value, 0xFF);
 
                 try std.testing.expectEqual(

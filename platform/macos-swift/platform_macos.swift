@@ -405,7 +405,7 @@ class FramebufferView: NSView {
                 bitsPerPixel: 32,
                 bytesPerRow: width * 4,
                 space: colorSpace,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
                 provider: provider,
                 decode: nil,
                 shouldInterpolate: false,
@@ -470,7 +470,7 @@ class FramebufferView: NSView {
             bitsPerPixel: 32,
             bytesPerRow: width * 4,
             space: colorSpace,
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
             provider: provider,
             decode: nil,
             shouldInterpolate: false,

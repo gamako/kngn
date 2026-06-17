@@ -75,7 +75,7 @@ inline fn div255Vec16(x: Vec16u16) Vec16u16 {
 }
 
 /// u32ピクセルからVec4u16への変換
-/// ピクセルフォーマット: 0xAABBGGRR → [R, G, B, A] としてu16ベクトル化
+/// ピクセルフォーマット: 0xAARRGGBB → [B, G, R, A] としてu16ベクトル化
 inline fn pixelToVec(pixel: u32) Vec4u16 {
     const bytes: [4]u8 = @bitCast(pixel);
     return .{
@@ -99,7 +99,7 @@ inline fn vecToPixel(vec: Vec4u16) u32 {
 }
 
 /// 4 ピクセル同時の Premultiplied blend (16-lane SIMD)
-/// 入出力レイアウト: メモリ上 [R0 G0 B0 A0 R1 G1 B1 A1 R2 G2 B2 A2 R3 G3 B3 A3]
+/// 入出力レイアウト: メモリ上 [B0 G0 R0 A0 B1 G1 R1 A1 B2 G2 R2 A2 B3 G3 R3 A3]
 /// 出力アルファは 0xFF 強制（ウィンドウ常に不透明）
 ///
 /// PRECONDITION: src_pre の各ピクセルは premultiplied 済みで R/G/B <= A を満たすこと。
@@ -135,7 +135,7 @@ inline fn blend4Pixels(dst: Vec16u8, src_pre: Vec16u8) Vec16u8 {
 
 /// Premultiplied Alpha形式のアルファブレンディング（SIMD版）
 /// out = src_pre + dst * (1 - src_a)
-/// ピクセルフォーマット: u32 = 0xAABBGGRR（リトルエンディアン、メモリ上[R,G,B,A]順）
+/// ピクセルフォーマット: u32 = 0xAARRGGBB（リトルエンディアン、メモリ上[B,G,R,A]順）
 ///
 /// PRECONDITION: src_pre は premultiplied 済みで R/G/B <= A を満たすこと。
 /// （`blend4Pixels` の SIMD narrow と同じ前提。スカラー版はオーバーフローしないが、
@@ -166,7 +166,7 @@ fn blendPixel(dst: u32, src_pre: u32) u32 {
 /// - 透明ピクセル（alpha=0）は背景を透過
 /// - 半透明ピクセルは背景とブレンド
 ///
-/// - framebuffer: フレームバッファ（RGBA8888形式）
+/// - framebuffer: フレームバッファ（canonical BGRA 0xAARRGGBB 形式）
 /// - fb_width: フレームバッファの幅
 /// - fb_height: フレームバッファの高さ
 /// - sprite: 描画するスプライト

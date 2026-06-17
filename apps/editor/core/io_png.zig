@@ -121,7 +121,7 @@ fn appendIDATChunk(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const
 }
 
 /// PNG バイト列を生成して返す（呼び出し元が gpa.free() すること）。
-/// pixels は raw layer pixels（0xAABBGGRR, bytes [R,G,B,A]）。
+/// pixels は raw layer pixels（canonical BGRA, u32 0xAARRGGBB, bytes [B,G,R,A]）。
 pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allocator) ![]u8 {
     const scan_size: usize = 1 + @as(usize, width) * 4;
     const raw_size: usize = @as(usize, height) * scan_size;
@@ -134,11 +134,11 @@ pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allo
         sl[0] = 0; // filter: None
         for (0..@as(usize, width)) |x| {
             const p = pixels[y * @as(usize, width) + x];
-            const bytes: [4]u8 = @bitCast(p); // [R,G,B,A] on little-endian
-            sl[1 + x * 4 + 0] = bytes[0]; // R
-            sl[1 + x * 4 + 1] = bytes[1]; // G
-            sl[1 + x * 4 + 2] = bytes[2]; // B
-            sl[1 + x * 4 + 3] = bytes[3]; // A
+            // canonical BGRA(0xAARRGGBB) から明示抽出して PNG RGBA バイト順へ詰める。
+            sl[1 + x * 4 + 0] = @truncate(p >> 16); // R
+            sl[1 + x * 4 + 1] = @truncate(p >> 8); // G
+            sl[1 + x * 4 + 2] = @truncate(p); // B
+            sl[1 + x * 4 + 3] = @truncate(p >> 24); // A
         }
     }
 
@@ -182,10 +182,10 @@ test "PNG round-trip: 4x4 テストパターン" {
     const w: u32 = 4;
     const h: u32 = 4;
     var pixels: [16]u32 = undefined;
-    pixels[0] = 0xFF000000; // 不透明黒 (A=FF,B=0,G=0,R=0)
+    pixels[0] = 0xFF000000; // 不透明黒 (A=FF,R=0,G=0,B=0)
     pixels[1] = 0x00000000; // 透明
-    pixels[2] = 0xFF0000FF; // 不透明赤 (A=FF,B=0,G=0,R=FF)
-    pixels[3] = 0xFF00FF00; // 不透明緑 (A=FF,B=0,G=FF,R=0)
+    pixels[2] = 0xFFFF0000; // 不透明赤 (A=FF,R=FF,G=0,B=0)
+    pixels[3] = 0xFF00FF00; // 不透明緑 (A=FF,R=0,G=FF,B=0)
     for (4..16) |i| pixels[i] = @as(u32, @intCast(i)) * 0x01010100 | 0xFF;
 
     const png_bytes = try encodePNG(&pixels, w, h, allocator);
@@ -202,6 +202,24 @@ test "PNG round-trip: 4x4 テストパターン" {
     for (pixels, loaded.pixels) |expected, got| {
         try std.testing.expectEqual(expected, got);
     }
+}
+
+test "encodePNG: 1px 赤 の生スキャンラインが PNG RGBA [R,G,B,A] 順 (decoder 非依存)" {
+    const allocator = std.testing.allocator;
+
+    // canonical BGRA 0xFFFF0000 = R=FF, G=00, B=00, A=FF（不透明赤）
+    const pixels = [_]u32{0xFFFF0000};
+    const png_bytes = try encodePNG(&pixels, 1, 1, allocator);
+    defer allocator.free(png_bytes);
+
+    // IDAT 内 zlib stored ブロックの生スキャンラインを取り出す。
+    // レイアウト: "IDAT" | 0x78 0x01(zlib hdr) | 0x01(BFINAL,stored) | LEN(2,LE) | NLEN(2,LE) | scanline
+    const idat = std.mem.indexOf(u8, png_bytes, "IDAT") orelse return error.MissingIDAT;
+    const scan = png_bytes[idat + 4 + 2 + 1 + 2 + 2 ..][0..5];
+
+    // filter None(00) + PNG RGBA バイト [R=FF, G=00, B=00, A=FF]。
+    // encode/decode 同時反転を見逃す round-trip と違い、encoder 単体の R/B 取り違えを直接検出する。
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0xFF, 0x00, 0x00, 0xFF }, scan);
 }
 
 test "PNG round-trip: 256x256 均一色" {

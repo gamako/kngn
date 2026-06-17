@@ -35,9 +35,9 @@ const FileOp = enum { save, save_as, open, save_palette, load_palette };
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
 
-const COLOR_WINDOW_BG: u32 = 0xFF_20_20_24;
+const COLOR_WINDOW_BG: u32 = 0xFF_24_20_20; // canonical BGRA: r=24,g=20,b=20（従来の見た目を維持）
 
-/// canvas pixel（0xAABBGGRR）→ gui.Color（同一ビットレイアウト）。スウォッチ/プレビュー描画用。
+/// canvas pixel（canonical BGRA 0xAARRGGBB）→ gui.Color（同一ビットレイアウト）。スウォッチ/プレビュー描画用。
 fn guiColor(c: u32) gui.Color {
     return @bitCast(c);
 }
@@ -299,7 +299,7 @@ const App = struct {
         defer img.deinit(self.gpa);
 
         // 左上クロップ/パディング: layer0 を透明クリアし、収まる範囲を行ごとに memcpy。
-        // png_decoder の出力は 0xAABBGGRR で canvas と同一レイアウトなので変換不要。
+        // png_decoder の出力は canonical BGRA 0xAARRGGBB で canvas と同一レイアウトなので変換不要。
         const layer0 = self.canvas.layerPixels(0);
         @memset(layer0, 0);
         const iw: usize = img.width;
@@ -574,9 +574,10 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     ctx.labelEx(cursor_txt, ctx.style.text_subtle);
     {
         const c = app.palette.current();
-        const r: u8 = @truncate(c);
+        // canonical BGRA(0xAARRGGBB) から #RRGGBB 用に明示抽出。
+        const r: u8 = @truncate(c >> 16);
         const g: u8 = @truncate(c >> 8);
-        const b: u8 = @truncate(c >> 16);
+        const b: u8 = @truncate(c);
         ctx.labelEx(
             try std.fmt.allocPrint(arena, "color: #{X:0>2}{X:0>2}{X:0>2} ({d})", .{ r, g, b, app.palette.colors.items.len }),
             ctx.style.text_subtle,

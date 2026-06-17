@@ -1,9 +1,17 @@
-//! Linux platform backend — X11/Xlib 実装（TASK-28.2）
+//! Linux platform backend — X11/Xlib 実装（TASK-28.2 / 28.6）
 //!
-//! ソフトウェアフレームバッファ方式。caller が書く canonical RGBA `[]u32`
-//! （pixel = (R<<24)|(G<<16)|(B<<8)|A）を、present 時に X visual の mask 配置へ変換して
-//! XShmPutImage（利用可なら）/ XPutImage で blit する。GPU 不要。
+//! ソフトウェアフレームバッファ方式。caller は canonical BGRA `[]u32`
+//! （u32 0xAARRGGBB / メモリ [B,G,R,A]）を書く。
 //!
+//! present 時の blit は visual 分類（`platform_linux_convert.classifyVisual`、TASK-28.6 / AC#4）で 2 経路に分かれる:
+//!   - **direct**: 32bpp & LSBFirst & rs16/gs8/bs0 & stride==width*4。canonical BGRA の低24bit が
+//!     標準 visual の 0x00RRGGBB に一致するため、XImage/shm バッファを caller に直接書かせ
+//!     （`lockFramebuffer` が image data を返す）、present は XShmPutImage/XPutImage のみ（**毎フレーム変換コピー無し**）。
+//!   - **fallback**: 32bpp & LSBFirst & RGB 各8bit連続だが（非標準 shift または stride padding）の visual。
+//!     別持ちの backing(BGRA) を present で `packPixel`（BGRA→visual mask）変換してから blit する。
+//!   - **fail**: 16/24bpp・565・非連続/重複 mask・MSBFirst は create を WindowCreationFailed にする（拡張しない）。
+//!
+//! direct/fallback の判定と変換は純粋ロジック（`platform_linux_convert.zig`）に分離し display 無しで単体テストする。
 //! 実装方針の詳細は docs/plans/28.2-plan.md / 28.3-plan.md を参照。入力（key/mouse）は本ファイル（TASK-28.3）、
 //! ファイルダイアログは TASK-28.4、Wayland は TASK-28.5。
 //!
@@ -13,6 +21,7 @@
 const std = @import("std");
 const types = @import("platform_types.zig");
 const input = @import("platform_linux_input.zig");
+const conv = @import("platform_linux_convert.zig");
 const build_options = @import("build_options");
 
 const c = @cImport({
@@ -117,7 +126,8 @@ const State = struct {
     height: u32,
     wm_delete: c.Atom,
 
-    // canonical RGBA backing（caller が書く。常にこれを返す）
+    // canonical BGRA framebuffer（caller が書く。lockFramebuffer が返す）。
+    // direct: image data を別名参照（別 alloc しない）。fallback: 別持ち alloc。
     backing: []u32,
 
     // blit
@@ -127,14 +137,16 @@ const State = struct {
     shminfo: c.XShmSegmentInfo,
     shmat_ok: bool,
     attached: bool,
-    // XPutImage fallback で Zig 所有の転送バッファ（shm 経路では未使用）
-    xfer: []u8,
+    // XPutImage 経路で Zig 所有の image data バッファ（shm 経路では未使用）。
+    // []u32 で確保し u32 alignment を保証する（image data を []u32 として直書き/変換するため）。
+    xfer: []u32,
 
-    // pixel 変換（visual mask から算出）
+    // 直書き可否（classifyVisual の結果）。true なら present は変換コピー無しで blit。
+    direct: bool,
+    // fallback 時の pixel 変換 shift（visual mask から算出。direct では未使用）
     r_shift: u5,
     g_shift: u5,
     b_shift: u5,
-    fast_path: bool,
 
     // events
     closing: bool,
@@ -214,7 +226,7 @@ pub const Window = struct {
             .width = width,
             .height = height,
             .wm_delete = wm_delete,
-            .backing = undefined,
+            .backing = &.{},
             .image = undefined,
             .bytes_per_line = 0,
             .use_shm = false,
@@ -222,10 +234,10 @@ pub const Window = struct {
             .shmat_ok = false,
             .attached = false,
             .xfer = &.{},
+            .direct = false,
             .r_shift = 0,
             .g_shift = 0,
             .b_shift = 0,
-            .fast_path = false,
             .closing = false,
             .quit_delivered = false,
             .queue = .{},
@@ -234,13 +246,8 @@ pub const Window = struct {
             .detectable_repeat = g_detectable_repeat,
         };
 
-        // canonical backing（caller が書く）
-        const px_count = std.math.mul(usize, width, height) catch return error.WindowCreationFailed;
-        st.backing = alloc.alloc(u32, px_count) catch return error.WindowCreationFailed;
-        errdefer alloc.free(st.backing);
-        @memset(st.backing, 0);
-
-        // blit セットアップ（XShm 可なら shm、不可/失敗なら XPutImage）
+        // blit セットアップ（XShm 可なら shm、不可/失敗なら XPutImage）。
+        // visual 分類で direct/fallback を決め、st.backing（caller が書く canonical BGRA）も確定する。
         try setupBlit(st, visual, depth, width, height);
 
         // blit 準備が成功してから map（失敗時に一瞬 map されるのを防ぐ）
@@ -255,7 +262,8 @@ pub const Window = struct {
 
         teardownBlit(st);
         _ = c.XDestroyWindow(dpy, st.window);
-        alloc.free(st.backing);
+        // fallback の backing は別 alloc。direct の backing は image data の別名なので teardownBlit が解放済み。
+        if (!st.direct) alloc.free(st.backing);
         alloc.destroy(st);
     }
 
@@ -321,7 +329,8 @@ pub const Window = struct {
     pub fn present(self: Window) void {
         const st = self.state;
         const dpy = st.display;
-        convert(st);
+        // direct は caller が image data を直接書いているので変換不要。fallback のみ backing→image data 変換。
+        if (!st.direct) convert(st);
         const w: c_uint = @intCast(st.width);
         const h: c_uint = @intCast(st.height);
         if (st.use_shm) {
@@ -333,7 +342,8 @@ pub const Window = struct {
     }
 };
 
-/// Locked framebuffer view（公開 contract は RGBA `[]u32`）。
+/// Locked framebuffer view（公開 contract は canonical BGRA `[]u32`、u32 0xAARRGGBB）。
+/// direct モードでは pixels が XImage/shm バッファを直接指す（present で変換コピーされない）。
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
@@ -457,13 +467,13 @@ fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: 
     const disable_shm = std.c.getenv("VIDEO_PROTO_DISABLE_XSHM") != null;
     if (!disable_shm and c.XShmQueryExtension(dpy) != 0) {
         if (trySetupShm(st, visual, depth, width, height)) {
-            try validateAndComputeShifts(st);
+            try classifyAndSetupBacking(st, width, height);
             return;
         }
         // 失敗 → fallback
     }
     try setupPutImage(st, visual, depth, width, height);
-    try validateAndComputeShifts(st);
+    try classifyAndSetupBacking(st, width, height);
 }
 
 /// XShm 経路。成功で true、失敗（fallback すべき）で false。
@@ -546,7 +556,10 @@ fn setupPutImage(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, heig
         return error.WindowCreationFailed;
     };
 
-    const buf = alloc.alloc(u8, size) catch {
+    // image data は []u32 として別名参照（direct）/ 変換書き込み（fallback）するため、
+    // u32 単位で確保して alignment を型で保証する。size を u32 個数へ切り上げ（>= size バイト）。
+    const u32_len = (size + 3) / 4;
+    const buf = alloc.alloc(u32, u32_len) catch {
         destroyImage(image);
         return error.WindowCreationFailed;
     };
@@ -559,34 +572,39 @@ fn setupPutImage(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, heig
     st.bytes_per_line = @intCast(bpl);
 }
 
-/// §2.1: bits_per_pixel==32 / mask 8bit 連続 を検証し、shift を算出。
-fn validateAndComputeShifts(st: *State) Error!void {
+/// XImage 作成後、visual を classifyVisual で分類し direct/fallback の backing を確定する（AC#4）。
+/// fail（非32bpp / MSBFirst / 非連続・重複 mask / 16・24bpp・565 等）は WindowCreationFailed。
+fn classifyAndSetupBacking(st: *State, width: u32, height: u32) Error!void {
     const img = st.image;
-    if (img.*.bits_per_pixel != 32) return failBlit(st);
+    const bpp: u32 = @intCast(img.*.bits_per_pixel);
+    const byte_order: conv.ByteOrder = if (img.*.byte_order == c.MSBFirst) .msb_first else .lsb_first;
+    const rm: u64 = img.*.red_mask;
+    const gm: u64 = img.*.green_mask;
+    const bm: u64 = img.*.blue_mask;
 
-    const rm: c_ulong = img.*.red_mask;
-    const gm: c_ulong = img.*.green_mask;
-    const bm: c_ulong = img.*.blue_mask;
-    if (rm == 0 or gm == 0 or bm == 0) return failBlit(st);
-    // mask が互いに重ならないこと（重なると変換結果が壊れる）
-    if ((rm & gm) != 0 or (rm & bm) != 0 or (gm & bm) != 0) return failBlit(st);
+    const px_count = std.math.mul(usize, width, height) catch return failBlit(st);
 
-    const rs = maskShift(rm) orelse return failBlit(st);
-    const gs = maskShift(gm) orelse return failBlit(st);
-    const bs = maskShift(bm) orelse return failBlit(st);
-
-    st.r_shift = rs;
-    st.g_shift = gs;
-    st.b_shift = bs;
-    st.fast_path = (rs == 16 and gs == 8 and bs == 0);
-}
-
-/// 8bit 連続マスクの shift 量（trailing zeros）。8bit 連続でなければ null。
-fn maskShift(mask: c_ulong) ?u5 {
-    const sh: u6 = @intCast(@ctz(mask));
-    if (sh > 31) return null;
-    if ((mask >> @intCast(sh)) != 0xFF) return null; // 8bit 連続でない
-    return @intCast(sh);
+    switch (conv.classifyVisual(bpp, byte_order, st.bytes_per_line, width, rm, gm, bm)) {
+        .fail => return failBlit(st),
+        .direct => {
+            // 標準 visual: 低24bit が 0x00RRGGBB に一致するので caller が image data を直接書く（変換コピー無し）。
+            // backing は image data の別名（別 alloc しない）。
+            st.direct = true;
+            const base: [*]u32 = @ptrCast(@alignCast(img.*.data));
+            st.backing = base[0..px_count];
+            @memset(st.backing, 0);
+        },
+        .fallback => {
+            // 非標準 shift / stride padding: backing(BGRA) を別持ちし present で packPixel 変換する。
+            st.direct = false;
+            st.r_shift = conv.maskShift(rm) orelse return failBlit(st);
+            st.g_shift = conv.maskShift(gm) orelse return failBlit(st);
+            st.b_shift = conv.maskShift(bm) orelse return failBlit(st);
+            const buf = alloc.alloc(u32, px_count) catch return failBlit(st);
+            @memset(buf, 0);
+            st.backing = buf;
+        },
+    }
 }
 
 /// blit リソース（XImage / XShm seg or Zig 所有転送バッファ）の解放。`destroy` と `failBlit` で共用。
@@ -597,7 +615,7 @@ fn teardownBlit(st: *State) void {
         destroyImage(st.image);
         if (st.shmat_ok) _ = c.shmdt(st.shminfo.shmaddr);
     } else {
-        // XPutImage fallback: data は Zig 所有。XDestroyImage に解放させない。
+        // XPutImage 経路: image data は Zig 所有（st.xfer）。XDestroyImage に解放させない。
         st.image.data = null;
         destroyImage(st.image);
         if (st.xfer.len != 0) alloc.free(st.xfer);
@@ -605,12 +623,14 @@ fn teardownBlit(st: *State) void {
 }
 
 fn failBlit(st: *State) Error {
-    // 検証失敗時は確保済みリソースを解放してから失敗を返す（create の errdefer が backing/State を解放）
+    // 検証失敗時は確保済み blit リソースを解放してから失敗を返す（backing は未確定なので解放不要、
+    // create の errdefer が window/State を解放）。
     teardownBlit(st);
     return error.WindowCreationFailed;
 }
 
-/// canonical RGBA(0xRRGGBBAA) → image.data（visual mask 配置）へ変換。
+/// fallback 経路: canonical BGRA(0xAARRGGBB) backing → image data（visual mask 配置）へ変換。
+/// stride padding は bytes_per_line を見ることで吸収する。direct 経路では呼ばれない。
 fn convert(st: *State) void {
     const w = st.width;
     const h = st.height;
@@ -621,18 +641,9 @@ fn convert(st: *State) void {
     while (y < h) : (y += 1) {
         const row: [*]u32 = @ptrCast(@alignCast(data + y * bpl));
         const src = st.backing[y * w ..][0..w];
-        if (st.fast_path) {
-            var x: usize = 0;
-            while (x < w) : (x += 1) row[x] = src[x] >> 8; // 0xRRGGBBAA → 0x00RRGGBB
-        } else {
-            var x: usize = 0;
-            while (x < w) : (x += 1) {
-                const p = src[x];
-                const r: u32 = (p >> 24) & 0xFF;
-                const g: u32 = (p >> 16) & 0xFF;
-                const b: u32 = (p >> 8) & 0xFF;
-                row[x] = (r << st.r_shift) | (g << st.g_shift) | (b << st.b_shift);
-            }
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            row[x] = conv.packPixel(src[x], st.r_shift, st.g_shift, st.b_shift);
         }
     }
 }

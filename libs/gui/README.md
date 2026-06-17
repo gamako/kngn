@@ -9,7 +9,7 @@ video-proto 用の immediate-mode GUI ライブラリ。platform 非依存の st
 |---|---|
 | `src/gui.zig` | 公開 API root |
 | `src/geom.zig` | Rect / Vec2 / RenderTarget |
-| `src/color.zig` | Color（straight alpha、0xAABBGGRR） |
+| `src/color.zig` | Color（straight alpha、canonical BGRA 0xAARRGGBB） |
 | `src/draw.zig` | DrawList（clip 焼き込み式 draw cmd） |
 | `src/font.zig` | BitmapFont（ASCII 固定幅、comptime BDF パーサ） |
 | `src/render.zig` | DrawList → ピクセルバッファのソフトウェアレンダラ |

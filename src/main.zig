@@ -6,7 +6,8 @@ extern fn sin(x: f64) f64;
 // 高速HSV→RGB変換（整数演算版）
 fn hsvToRgbFast(h: i32, s: i32, v: i32) u32 {
     if (s == 0) {
-        return (@as(u32, @intCast(v)) << 24) | (@as(u32, @intCast(v)) << 16) | (@as(u32, @intCast(v)) << 8) | 255;
+        // canonical BGRA(0xAARRGGBB): gray なので r=g=b=v、a=0xFF。
+        return 0xFF000000 | (@as(u32, @intCast(v)) << 16) | (@as(u32, @intCast(v)) << 8) | @as(u32, @intCast(v));
     }
 
     const region = @divTrunc(@mod(h, 360), 60);
@@ -29,7 +30,8 @@ fn hsvToRgbFast(h: i32, s: i32, v: i32) u32 {
     const g = @as(u32, @intCast(g_val));
     const b = @as(u32, @intCast(b_val));
 
-    return (r << 24) | (g << 16) | (b << 8) | 255;
+    // canonical BGRA(0xAARRGGBB): a=0xFF, r/g/b を各位置へ。
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
 }
 
 fn renderFrame(pixels: []u32, width: u32, height: u32, time: f64) void {

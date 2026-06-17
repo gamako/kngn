@@ -41,7 +41,7 @@ const Char = struct {
 
 pub const BMFont = struct {
     alloc: std.mem.Allocator,
-    atlas: []u32, // 所有する RGBA8888 コピー（byte order [R,G,B,A]）
+    atlas: []u32, // 所有する canonical BGRA コピー（u32 0xAARRGGBB, byte order [B,G,R,A]）
     atlas_w: u32,
     atlas_h: u32,
     chars: std.AutoHashMapUnmanaged(u32, Char) = .empty,

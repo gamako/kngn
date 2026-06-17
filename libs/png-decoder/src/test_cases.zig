@@ -4,9 +4,9 @@
 const std = @import("std");
 
 /// Pack RGBA bytes into a u32 matching the decoder's memory layout
-/// (byte order [R, G, B, A]; on little-endian this is 0xAABBGGRR).
+/// (byte order [B, G, R, A]; on little-endian this is 0xAARRGGBB).
 pub fn packRGBA(r: u8, g: u8, b: u8, a: u8) u32 {
-    return (@as(u32, a) << 24) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | @as(u32, r);
+    return (@as(u32, a) << 24) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
 }
 
 /// 1x1 hardcoded expected pixels (gray=128)

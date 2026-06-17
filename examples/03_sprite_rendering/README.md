@@ -74,8 +74,8 @@ zig build run -Dplatform=metal    # Metal版
 
 ### フレームバッファ形式
 
-- **フォーマット**: RGBA8888（32bit）
-- **バイトオーダー**: `0xRRGGBBAA`
+- **フォーマット**: canonical BGRA8888（32bit）
+- **バイトオーダー**: メモリ `[B, G, R, A]` / u32 `0xAARRGGBB`
 - PNG decoderの出力形式と完全互換
 
 ## スプライト画像

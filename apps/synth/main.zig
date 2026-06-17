@@ -75,9 +75,9 @@ fn pianoHitTest(x: i32, y: i32) ?u8 {
     return @intCast(NOTE_LOW + idx);
 }
 
-/// framebuffer のピクセル u32 packing（gui.Color と同じ: メモリ R,G,B,A = u32 0xAABBGGRR）。
+/// framebuffer のピクセル u32 packing（gui.Color と同じ: メモリ B,G,R,A = u32 0xAARRGGBB）。
 fn rgba(r: u8, g: u8, b: u8, a: u8) u32 {
-    return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16) | (@as(u32, a) << 24);
+    return @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16) | (@as(u32, a) << 24);
 }
 
 fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool) void {

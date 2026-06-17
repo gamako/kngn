@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var draw_list = gui.DrawList.init(gpa);
     defer draw_list.deinit();
 
-    // PNG をデコード（straight alpha RGBA8888 = 0xAABBGGRR、libs/gui の image と同フォーマット）
+    // PNG をデコード（straight alpha canonical BGRA = 0xAARRGGBB、libs/gui の image と同フォーマット）
     var sample_img = try png_decoder.decodePNG(gpa, sample_png);
     defer sample_img.deinit(gpa);
     const img_w = sample_img.width;

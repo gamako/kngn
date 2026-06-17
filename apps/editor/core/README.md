@@ -62,7 +62,7 @@ defer recorder.deinit(gpa);
 var undo: core.UndoStack = .{};
 defer undo.deinit(gpa);
 
-var pen: core.Pen = .{ .color = 0xFF0000FF }; // 0xAABBGGRR
+var pen: core.Pen = .{ .color = 0xFFFF0000 }; // canonical BGRA 0xAARRGGBB（赤）
 const tool = pen.tool();
 
 _ = tool.onEvent(&canvas, &recorder, gpa, .{ .down = .{ .x = 0, .y = 0 } });

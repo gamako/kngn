@@ -12,7 +12,7 @@ typedef struct PlatformWindow PlatformWindow;
 
 // フレームバッファのコールバック関数型
 // ユーザーコードが毎フレーム呼ばれ、ピクセルデータを更新する
-// pixels: RGBA形式の32bitピクセル配列 (width * height)
+// pixels: canonical BGRA 形式の32bitピクセル配列 (u32 0xAARRGGBB / メモリ [B,G,R,A], width * height)
 // width, height: フレームバッファのサイズ
 // userdata: プラットフォーム初期化時に渡したユーザーデータ
 typedef void (*FrameCallback)(uint32_t* pixels, int width, int height, void* userdata);
@@ -76,7 +76,7 @@ double platform_get_time(void);
 
 // フレームバッファへのアクセスを開始
 // out_width, out_height: フレームバッファのサイズが返される
-// 戻り値: ピクセルバッファへのポインタ（RGBA形式、32bit）
+// 戻り値: ピクセルバッファへのポインタ（canonical BGRA, u32 0xAARRGGBB, 32bit）
 // 注意: platform_unlock_framebuffer()を呼ぶまでバッファを保持
 uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int* out_height);
 

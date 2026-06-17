@@ -8,7 +8,8 @@ const KeyCode = platform.KeyCode;
 fn hsvToRGB(h: f32, s: f32, v: f32) u32 {
     if (s == 0.0) {
         const gray = @as(u32, @intFromFloat(v * 255.0));
-        return (gray << 24) | (gray << 16) | (gray << 8) | 0xFF;
+        // canonical BGRA(0xAARRGGBB): gray なので r=g=b、a=0xFF。
+        return 0xFF000000 | (gray << 16) | (gray << 8) | gray;
     }
 
     const h_normalized = h / 60.0;
@@ -54,7 +55,8 @@ fn hsvToRGB(h: f32, s: f32, v: f32) u32 {
     const gi = @as(u32, @intFromFloat(g * 255.0));
     const bi = @as(u32, @intFromFloat(b * 255.0));
 
-    return (ri << 24) | (gi << 16) | (bi << 8) | 0xFF;
+    // canonical BGRA(0xAARRGGBB): a=0xFF, r/g/b を各位置へ。
+    return 0xFF000000 | (ri << 16) | (gi << 8) | bi;
 }
 
 fn getRandomColor(prng: *std.Random.DefaultPrng) u32 {

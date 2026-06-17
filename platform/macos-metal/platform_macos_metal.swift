@@ -373,7 +373,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         // テクスチャを作成
         let descriptor = MTLTextureDescriptor()
-        descriptor.pixelFormat = .rgba8Unorm
+        descriptor.pixelFormat = .bgra8Unorm // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB（drawable と同形式）
         descriptor.width = width
         descriptor.height = height
         descriptor.usage = [.shaderRead, .renderTarget]

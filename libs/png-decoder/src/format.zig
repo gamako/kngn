@@ -1,8 +1,8 @@
 // PNG Decoder Pixel Format Conversion
 // Specification: https://www.w3.org/TR/png/#6Colour-values
 //
-// Converts PNG pixel data to RGBA8888 format (u32 per pixel).
-// Memory byte order is [R, G, B, A]; on little-endian systems this is u32 0xAABBGGRR.
+// Converts PNG pixel data to canonical BGRA8888 format (u32 per pixel).
+// Memory byte order is [B, G, R, A]; on little-endian systems this is u32 0xAARRGGBB.
 // Supports: Grayscale, RGB, RGBA (8-bit per channel)
 
 const std = @import("std");
@@ -12,7 +12,7 @@ const std = @import("std");
 /// Alpha channel is set to 255 (fully opaque)
 ///
 /// Input:  [g0, g1, g2, ...] (u8 slice)
-/// Output: u32 slice with byte order [R, G, B, A] in memory
+/// Output: u32 slice with byte order [B, G, R, A] in memory
 pub fn grayscaleToRGBA8888(
     allocator: std.mem.Allocator,
     grayscale_data: []const u8,
@@ -23,7 +23,7 @@ pub fn grayscaleToRGBA8888(
 
     for (grayscale_data, 0..) |gray, i| {
         // Gray value replicated to R, G, B
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, gray) << 16) |
                      (@as(u32, gray) << 8) | @as(u32, gray);
         result[i] = rgba;
@@ -36,7 +36,7 @@ pub fn grayscaleToRGBA8888(
 /// Alpha channel is set to 255 (fully opaque)
 ///
 /// Input:  [r0, g0, b0, r1, g1, b1, ...] (u8 slice)
-/// Output: u32 slice with byte order [R, G, B, A] in memory
+/// Output: u32 slice with byte order [B, G, R, A] in memory
 pub fn rgbToRGBA8888(
     allocator: std.mem.Allocator,
     rgb_data: []const u8,
@@ -55,9 +55,9 @@ pub fn rgbToRGBA8888(
         const g = rgb_data[i + 1];
         const b = rgb_data[i + 2];
 
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
-        const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, b) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, r);
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
+        const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, r) << 16) |
+                     (@as(u32, g) << 8) | @as(u32, b);
         result[out_idx] = rgba;
         out_idx += 1;
     }
@@ -69,7 +69,7 @@ pub fn rgbToRGBA8888(
 /// Direct conversion (values copied as-is)
 ///
 /// Input:  [r0, g0, b0, a0, r1, g1, b1, a1, ...] (u8 slice)
-/// Output: u32 slice with byte order [R, G, B, A] in memory
+/// Output: u32 slice with byte order [B, G, R, A] in memory
 pub fn rgbaToRGBA8888(
     allocator: std.mem.Allocator,
     rgba_data: []const u8,
@@ -89,9 +89,9 @@ pub fn rgbaToRGBA8888(
         const b = rgba_data[i + 2];
         const a = rgba_data[i + 3];
 
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
-        const rgba = (@as(u32, a) << 24) | (@as(u32, b) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, r);
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
+        const rgba = (@as(u32, a) << 24) | (@as(u32, r) << 16) |
+                     (@as(u32, g) << 8) | @as(u32, b);
         result[out_idx] = rgba;
         out_idx += 1;
     }
@@ -111,13 +111,13 @@ pub fn rgbaToRGBA8888(
 ///
 /// Input:  Grayscale scanline data [g0, g1, g2, ...] (width pixels)
 /// Output: Pre-allocated RGBA8888 buffer (must be at least width u32s)
-/// Memory layout: Byte order [R, G, B, A] regardless of system endianness
+/// Memory layout: Byte order [B, G, R, A] regardless of system endianness
 pub fn grayscaleToRGBA8888Row(output: []u32, grayscale_row: []const u8) void {
     std.debug.assert(output.len >= grayscale_row.len);
 
     for (grayscale_row, 0..) |gray, i| {
         // Gray value replicated to R, G, B
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, gray) << 16) |
                      (@as(u32, gray) << 8) | @as(u32, gray);
         output[i] = rgba;
@@ -129,7 +129,7 @@ pub fn grayscaleToRGBA8888Row(output: []u32, grayscale_row: []const u8) void {
 ///
 /// Input:  RGB scanline data [r0, g0, b0, r1, g1, b1, ...] (width*3 bytes)
 /// Output: Pre-allocated RGBA8888 buffer (must be at least width u32s)
-/// Memory layout: Byte order [R, G, B, A] regardless of system endianness
+/// Memory layout: Byte order [B, G, R, A] regardless of system endianness
 pub fn rgbToRGBA8888Row(output: []u32, rgb_row: []const u8) void {
     var i: usize = 0;
     var out_idx: usize = 0;
@@ -139,9 +139,9 @@ pub fn rgbToRGBA8888Row(output: []u32, rgb_row: []const u8) void {
         const g = rgb_row[i + 1];
         const b = rgb_row[i + 2];
 
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
-        const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, b) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, r);
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
+        const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, r) << 16) |
+                     (@as(u32, g) << 8) | @as(u32, b);
         output[out_idx] = rgba;
         out_idx += 1;
     }
@@ -152,7 +152,7 @@ pub fn rgbToRGBA8888Row(output: []u32, rgb_row: []const u8) void {
 ///
 /// Input:  RGBA scanline data [r0, g0, b0, a0, r1, g1, b1, a1, ...] (width*4 bytes)
 /// Output: Pre-allocated RGBA8888 buffer (must be at least width u32s)
-/// Memory layout: Byte order [R, G, B, A] regardless of system endianness
+/// Memory layout: Byte order [B, G, R, A] regardless of system endianness
 pub fn rgbaToRGBA8888Row(output: []u32, rgba_row: []const u8) void {
     var i: usize = 0;
     var out_idx: usize = 0;
@@ -163,9 +163,9 @@ pub fn rgbaToRGBA8888Row(output: []u32, rgba_row: []const u8) void {
         const b = rgba_row[i + 2];
         const a = rgba_row[i + 3];
 
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
-        const rgba = (@as(u32, a) << 24) | (@as(u32, b) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, r);
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
+        const rgba = (@as(u32, a) << 24) | (@as(u32, r) << 16) |
+                     (@as(u32, g) << 8) | @as(u32, b);
         output[out_idx] = rgba;
         out_idx += 1;
     }
@@ -182,7 +182,7 @@ pub fn rgbaToRGBA8888Row(output: []u32, rgba_row: []const u8) void {
 ///
 /// Input:  RGBA scanline data [r0, g0, b0, a0, r1, g1, b1, a1, ...] (width*4 bytes)
 /// Output: Pre-allocated Premultiplied RGBA8888 buffer (must be at least width u32s)
-/// Memory layout: Byte order [R_pre, G_pre, B_pre, A] regardless of system endianness
+/// Memory layout: Byte order [B_pre, G_pre, R_pre, A] regardless of system endianness
 pub fn rgbaToPremultipliedRGBA8888Row(output: []u32, rgba_row: []const u8) void {
     var i: usize = 0;
     var out_idx: usize = 0;
@@ -198,9 +198,9 @@ pub fn rgbaToPremultipliedRGBA8888Row(output: []u32, rgba_row: []const u8) void 
         const g_pre: u8 = @truncate((@as(u32, g) * @as(u32, a)) / 255);
         const b_pre: u8 = @truncate((@as(u32, b) * @as(u32, a)) / 255);
 
-        // Little-endian value 0xAABBGGRR produces byte order [R, G, B, A] in memory
-        const rgba = (@as(u32, a) << 24) | (@as(u32, b_pre) << 16) |
-            (@as(u32, g_pre) << 8) | @as(u32, r_pre);
+        // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
+        const rgba = (@as(u32, a) << 24) | (@as(u32, r_pre) << 16) |
+            (@as(u32, g_pre) << 8) | @as(u32, b_pre);
         output[out_idx] = rgba;
         out_idx += 1;
     }
@@ -226,11 +226,11 @@ test "Grayscale to RGBA8888 - single pixel" {
     const result = try grayscaleToRGBA8888(allocator, &grayscale);
     defer allocator.free(result);
 
-    // Verify byte order in memory: [R=128, G=128, B=128, A=255]
+    // Verify byte order in memory: [B=128, G=128, R=128, A=255]
     const bytes = @as([*]const u8, @ptrCast(&result[0]));
-    try std.testing.expectEqual(@as(u8, 128), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 128), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 128), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 128), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 }
 
@@ -245,12 +245,12 @@ test "Grayscale to RGBA8888 - multiple pixels" {
 
     try std.testing.expectEqual(@as(usize, 4), result.len);
 
-    // Verify each pixel has correct byte order [R, G, B, A]
+    // Verify each pixel has correct byte order [B, G, R, A]
     for (result, grayscale) |pixel, gray_val| {
         const bytes = @as([*]const u8, @ptrCast(&pixel));
-        try std.testing.expectEqual(gray_val, bytes[0]); // R
+        try std.testing.expectEqual(gray_val, bytes[0]); // B
         try std.testing.expectEqual(gray_val, bytes[1]); // G
-        try std.testing.expectEqual(gray_val, bytes[2]); // B
+        try std.testing.expectEqual(gray_val, bytes[2]); // R
         try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
     }
 }
@@ -264,11 +264,11 @@ test "RGB to RGBA8888 - single pixel" {
     const result = try rgbToRGBA8888(allocator, &rgb);
     defer allocator.free(result);
 
-    // Verify byte order in memory: [R=255, G=128, B=64, A=255]
+    // Verify byte order in memory: [B=64, G=128, R=255, A=255]
     const bytes = @as([*]const u8, @ptrCast(&result[0]));
-    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 64), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 64), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 255), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 }
 
@@ -286,18 +286,18 @@ test "RGB to RGBA8888 - multiple pixels" {
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
 
-    // Verify pixel 0 (Red): byte order [255, 0, 0, 255]
+    // Verify pixel 0 (Red): byte order [B=0, G=0, R=255, A=255]
     var bytes = @as([*]const u8, @ptrCast(&result[0]));
-    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 0), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 255), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 
-    // Verify pixel 1 (Green): byte order [0, 255, 0, 255]
+    // Verify pixel 1 (Green): byte order [B=0, G=255, R=0, A=255]
     bytes = @as([*]const u8, @ptrCast(&result[1]));
-    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 255), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 }
 
@@ -310,11 +310,11 @@ test "RGBA to RGBA8888 - single pixel" {
     const result = try rgbaToRGBA8888(allocator, &rgba);
     defer allocator.free(result);
 
-    // Verify byte order in memory: [R=255, G=128, B=64, A=128]
+    // Verify byte order in memory: [B=64, G=128, R=255, A=128]
     const bytes = @as([*]const u8, @ptrCast(&result[0]));
-    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 64), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 64), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 255), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 128), bytes[3]); // A
 }
 
@@ -332,40 +332,40 @@ test "RGBA to RGBA8888 - multiple pixels" {
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
 
-    // Verify pixel 0 (Red): byte order [255, 0, 0, 255]
+    // Verify pixel 0 (Red): byte order [B=0, G=0, R=255, A=255]
     var bytes = @as([*]const u8, @ptrCast(&result[0]));
-    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 0), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 255), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 
-    // Verify pixel 1 (Green): byte order [0, 255, 0, 128]
+    // Verify pixel 1 (Green): byte order [B=0, G=255, R=0, A=128]
     bytes = @as([*]const u8, @ptrCast(&result[1]));
-    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // R
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B
     try std.testing.expectEqual(@as(u8, 255), bytes[1]); // G
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // R
     try std.testing.expectEqual(@as(u8, 128), bytes[3]); // A
 }
 
 // ============================================================================
 // Byte order verification tests
 // These tests verify that the pixel data is stored in memory with the correct
-// byte order [R, G, B, A], regardless of the system's endianness
+// byte order [B, G, R, A], regardless of the system's endianness
 // ============================================================================
 
 test "rgbaToRGBA8888Row - byte order verification" {
-    // This test verifies that pixels are stored in memory as [R, G, B, A] byte order
+    // This test verifies that pixels are stored in memory as [B, G, R, A] byte order
     // Input: RGBA pixel (R=0xAA, G=0xBB, B=0xCC, A=0xDD)
     const input = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var output: [1]u32 = undefined;
 
     rgbaToRGBA8888Row(&output, &input);
 
-    // Verify byte order in memory: should be [0xAA, 0xBB, 0xCC, 0xDD]
+    // Verify byte order in memory: should be [0xCC, 0xBB, 0xAA, 0xDD]
     const bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 0xAA), bytes[0]); // R at byte 0
+    try std.testing.expectEqual(@as(u8, 0xCC), bytes[0]); // B at byte 0
     try std.testing.expectEqual(@as(u8, 0xBB), bytes[1]); // G at byte 1
-    try std.testing.expectEqual(@as(u8, 0xCC), bytes[2]); // B at byte 2
+    try std.testing.expectEqual(@as(u8, 0xAA), bytes[2]); // R at byte 2
     try std.testing.expectEqual(@as(u8, 0xDD), bytes[3]); // A at byte 3
 }
 
@@ -376,11 +376,11 @@ test "rgbToRGBA8888Row - byte order verification" {
 
     rgbToRGBA8888Row(&output, &input);
 
-    // Verify byte order in memory: should be [0xFF, 0x80, 0x40, 0xFF]
+    // Verify byte order in memory: should be [0x40, 0x80, 0xFF, 0xFF]
     const bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 0xFF), bytes[0]); // R at byte 0
+    try std.testing.expectEqual(@as(u8, 0x40), bytes[0]); // B at byte 0
     try std.testing.expectEqual(@as(u8, 0x80), bytes[1]); // G at byte 1
-    try std.testing.expectEqual(@as(u8, 0x40), bytes[2]); // B at byte 2
+    try std.testing.expectEqual(@as(u8, 0xFF), bytes[2]); // R at byte 2
     try std.testing.expectEqual(@as(u8, 0xFF), bytes[3]); // A at byte 3 (fully opaque)
 }
 
@@ -393,9 +393,9 @@ test "grayscaleToRGBA8888Row - byte order verification" {
 
     // Verify byte order in memory: should be [0x7F, 0x7F, 0x7F, 0xFF]
     const bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 0x7F), bytes[0]); // R at byte 0
+    try std.testing.expectEqual(@as(u8, 0x7F), bytes[0]); // B at byte 0
     try std.testing.expectEqual(@as(u8, 0x7F), bytes[1]); // G at byte 1
-    try std.testing.expectEqual(@as(u8, 0x7F), bytes[2]); // B at byte 2
+    try std.testing.expectEqual(@as(u8, 0x7F), bytes[2]); // R at byte 2
     try std.testing.expectEqual(@as(u8, 0xFF), bytes[3]); // A at byte 3 (fully opaque)
 }
 
@@ -412,9 +412,9 @@ test "rgbaToPremultipliedRGBA8888Row - semi-transparent pixel" {
 
     // Expected: R_pre = 100*128/255 ≈ 50, G_pre = 200*128/255 ≈ 100, B_pre = 50*128/255 ≈ 25
     const bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 50), bytes[0]); // R_pre
+    try std.testing.expectEqual(@as(u8, 25), bytes[0]); // B_pre
     try std.testing.expectEqual(@as(u8, 100), bytes[1]); // G_pre
-    try std.testing.expectEqual(@as(u8, 25), bytes[2]); // B_pre
+    try std.testing.expectEqual(@as(u8, 50), bytes[2]); // R_pre
     try std.testing.expectEqual(@as(u8, 128), bytes[3]); // A (unchanged)
 }
 
@@ -427,9 +427,9 @@ test "rgbaToPremultipliedRGBA8888Row - fully opaque pixel" {
     rgbaToPremultipliedRGBA8888Row(&output, &input);
 
     const bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R_pre = R
+    try std.testing.expectEqual(@as(u8, 64), bytes[0]); // B_pre = B
     try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G_pre = G
-    try std.testing.expectEqual(@as(u8, 64), bytes[2]); // B_pre = B
+    try std.testing.expectEqual(@as(u8, 255), bytes[2]); // R_pre = R
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 }
 
@@ -442,9 +442,9 @@ test "rgbaToPremultipliedRGBA8888Row - fully transparent pixel" {
     rgbaToPremultipliedRGBA8888Row(&output, &input);
 
     const bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // R_pre = 0
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B_pre = 0
     try std.testing.expectEqual(@as(u8, 0), bytes[1]); // G_pre = 0
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B_pre = 0
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // R_pre = 0
     try std.testing.expectEqual(@as(u8, 0), bytes[3]); // A = 0
 }
 
@@ -460,15 +460,15 @@ test "rgbaToPremultipliedRGBA8888Row - multiple pixels" {
 
     // Pixel 0: fully opaque red
     var bytes = @as([*]const u8, @ptrCast(&output[0]));
-    try std.testing.expectEqual(@as(u8, 255), bytes[0]); // R_pre
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B_pre
     try std.testing.expectEqual(@as(u8, 0), bytes[1]); // G_pre
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B_pre
+    try std.testing.expectEqual(@as(u8, 255), bytes[2]); // R_pre
     try std.testing.expectEqual(@as(u8, 255), bytes[3]); // A
 
     // Pixel 1: semi-transparent green, G_pre = 255*128/255 = 128
     bytes = @as([*]const u8, @ptrCast(&output[1]));
-    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // R_pre
+    try std.testing.expectEqual(@as(u8, 0), bytes[0]); // B_pre
     try std.testing.expectEqual(@as(u8, 128), bytes[1]); // G_pre
-    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // B_pre
+    try std.testing.expectEqual(@as(u8, 0), bytes[2]); // R_pre
     try std.testing.expectEqual(@as(u8, 128), bytes[3]); // A
 }

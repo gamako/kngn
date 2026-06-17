@@ -237,7 +237,7 @@ test "rasterizeCommit: 描画して path をクリア" {
     ed.update(gpa, .{ .pointer_up = .{ .x = 12, .y = 4 } });
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const RED: u32 = 0xFF0000FF;
+    const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
     const cmd = ed.rasterizeCommit(&canvas, &rec, gpa, dab, RED, 255) orelse return error.TestUnexpectedNull;
     defer gpa.free(cmd.paint.diffs);
 
@@ -261,7 +261,7 @@ test "rasterizePreview: preview_point を仮アンカーとして描画し path 
     ed.preview_point = .{ .x = 12, .y = 4 };
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const RED: u32 = 0xFF0000FF;
+    const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
     ed.rasterizePreview(&canvas, &rec, gpa, dab, RED, 255);
 
     // 仮点まで描かれる（y=4, x=2..12）

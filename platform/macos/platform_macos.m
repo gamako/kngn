@@ -279,7 +279,7 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
             32,
             width * 4,
             colorSpace,
-            kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big,
+            kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
             provider,
             NULL,
             false,
@@ -358,7 +358,7 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
         32,
         width * 4,
         colorSpace,
-        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big,
+        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
         provider,
         NULL,
         false,

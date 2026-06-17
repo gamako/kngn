@@ -158,7 +158,7 @@ test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round
     try path.anchors.append(gpa, anchorAt(13, 2));
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const RED: u32 = 0xFF0000FF;
+    const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
     if (path.rasterize(&canvas, &rec, gpa, dab, RED, 255)) |cmd| undo.push(gpa, cmd);
 
     // y=2 の x=2..13 が不透明 RED（cov=255・opacity=255 → 原本透明へ src-over で RED）
@@ -190,5 +190,5 @@ test "rasterize: アンカー 1 個は null（描けない）" {
     defer path.deinit(gpa);
     try path.anchors.append(gpa, anchorAt(4, 4));
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    try std.testing.expectEqual(@as(?UndoCmd, null), path.rasterize(&canvas, &rec, gpa, dab, 0xFF0000FF, 255));
+    try std.testing.expectEqual(@as(?UndoCmd, null), path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255));
 }

@@ -115,7 +115,7 @@ test "press 起点は canvas 外なら無視" {
     var bi: BezierInput = .{};
 
     // rect 外 (100,100) で press → アンカー追加されない
-    _ = bi.update(frameAt(100, 100, true, false, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFF0000FF, 255);
+    _ = bi.update(frameAt(100, 100, true, false, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expectEqual(@as(usize, 0), ed.path.anchors.items.len);
     try std.testing.expect(!bi.in_drag);
 }
@@ -131,13 +131,13 @@ test "クリックでアンカー追加、ダブルクリックで確定" {
     var bi: BezierInput = .{};
 
     // 1 点目: down + up（角）
-    _ = bi.update(frameAt(2, 2, true, true, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFF0000FF, 255);
+    _ = bi.update(frameAt(2, 2, true, true, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     // 2 点目: 離れた場所で down + up
-    _ = bi.update(frameAt(12, 2, true, true, 2.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFF0000FF, 255);
+    _ = bi.update(frameAt(12, 2, true, true, 2.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expectEqual(@as(usize, 2), ed.path.anchors.items.len);
 
     // 同じ場所を素早く再クリック（ダブルクリック）→ 確定して path クリア
-    const cmd = bi.update(frameAt(12, 2, true, true, 2.1), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFF0000FF, 255);
+    const cmd = bi.update(frameAt(12, 2, true, true, 2.1), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expect(cmd != null);
     if (cmd) |c| gpa.free(c.paint.diffs);
     try std.testing.expect(!ed.isEditing());

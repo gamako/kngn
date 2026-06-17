@@ -179,7 +179,7 @@ test "render: rectFilled fills pixels in clip" {
     render(target, &dl, font);
 
     // 中央 4x4 は赤
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), pixels[2 * 10 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), pixels[2 * 10 + 2]);
     // 外側はそのまま
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[0]);
 }
@@ -199,7 +199,7 @@ test "render: clip 矩形外は変更されない" {
     render(target, &dl, font_mod.default_font);
 
     // clip 内（5,5）は赤
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), pixels[5 * 20 + 5]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), pixels[5 * 20 + 5]);
     // clip 外（0,0）は黒のまま
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[0]);
     // clip 外（10,10）は黒のまま

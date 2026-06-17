@@ -329,7 +329,7 @@ pub const UndoStack = struct {
 // ============================================================
 
 const BLACK: u32 = 0xFF000000;
-const RED: u32 = 0xFF0000FF; // 0xAABBGGRR
+const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
 const ERASE: u32 = 0x00000000;
 
 /// テスト用の薄い配線（StrokeRecorder + UndoStack + Canvas）。
@@ -573,10 +573,9 @@ test "PNG round-trip: DB16 パターンを encode → decode でピクセル一�
     var e = try TestEditor.init(gpa, 16, 16);
     defer e.deinit();
 
-    // 各行を DB16 の 1 色で塗る（0xRRGGBB → 0xAABBGGRR）。1 行おきに消して透明も混ぜる
+    // 各行を DB16 の 1 色で塗る（0xRRGGBB → canonical BGRA は低24bit 一致で identity）。1 行おきに消して透明も混ぜる
     for (db16, 0..) |rgb, y| {
-        const color: u32 = 0xFF000000 |
-            ((rgb & 0x0000FF) << 16) | (rgb & 0x00FF00) | ((rgb & 0xFF0000) >> 16);
+        const color: u32 = 0xFF000000 | rgb;
         e.beginStroke(0, @intCast(y), color);
         e.strokeTo(15, @intCast(y));
         e.endStroke();

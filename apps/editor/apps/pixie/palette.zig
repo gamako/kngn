@@ -1,5 +1,5 @@
 //! pixie 編集可能パレット + GIMP .gpl I/O（TASK-21.15）。
-//! pure（platform / gui を import しない）。色は 0xAABBGGRR 不透明。
+//! pure（platform / gui を import しない）。色は canonical BGRA 0xAARRGGBB 不透明。
 //! 不変条件: colors.len >= 1（最後の1色は削除不可・decode は空を error にする）。
 
 const std = @import("std");
@@ -13,16 +13,16 @@ pub const db16 = [16]u32{
     0xD2AA99, 0x6DC2CA, 0xDAD45E, 0xDEEED6,
 };
 
-/// 0xRRGGBB → 0xAABBGGRR（不透明）
+/// 0xRRGGBB → canonical BGRA 0xAARRGGBB（不透明）。BGRA では低24bit が 0xRRGGBB に一致する。
 pub fn rgbToCanvas(rgb: u32) u32 {
     const r = rgb >> 16 & 0xFF;
     const g = rgb >> 8 & 0xFF;
     const b = rgb & 0xFF;
-    return 0xFF000000 | (b << 16) | (g << 8) | r;
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
 }
 
 pub const Palette = struct {
-    colors: std.ArrayList(u32) = .empty, // 0xAABBGGRR 不透明
+    colors: std.ArrayList(u32) = .empty, // canonical BGRA 0xAARRGGBB 不透明
     selected: usize = 0,
 
     pub fn initDb16(gpa: Allocator) !Palette {
@@ -74,9 +74,10 @@ pub fn encodeGpl(colors: []const u32, name: []const u8, gpa: Allocator) ![]u8 {
     try buf.appendSlice(gpa, name);
     try buf.appendSlice(gpa, "\nColumns: 0\n#\n");
     for (colors) |c| {
-        const r: u8 = @truncate(c);
+        // canonical BGRA(0xAARRGGBB) から明示抽出。
+        const r: u8 = @truncate(c >> 16);
         const g: u8 = @truncate(c >> 8);
-        const b: u8 = @truncate(c >> 16);
+        const b: u8 = @truncate(c);
         var line: [48]u8 = undefined;
         const s = try std.fmt.bufPrint(&line, "{d} {d} {d}\tUntitled\n", .{ r, g, b });
         try buf.appendSlice(gpa, s);
@@ -84,7 +85,7 @@ pub fn encodeGpl(colors: []const u32, name: []const u8, gpa: Allocator) ![]u8 {
     return try buf.toOwnedSlice(gpa);
 }
 
-/// .gpl テキストを解析して colors（0xAABBGGRR）を返す（owned）。
+/// .gpl テキストを解析して colors（canonical BGRA 0xAARRGGBB）を返す（owned）。
 /// ヘッダ欠落は InvalidGpl、有効色 0 件は EmptyPalette。範囲外/トークン不足行はスキップ（clamp しない）。
 pub fn decodeGpl(gpa: Allocator, bytes: []const u8) !std.ArrayList(u32) {
     var colors: std.ArrayList(u32) = .empty;
@@ -114,7 +115,7 @@ pub fn decodeGpl(gpa: Allocator, bytes: []const u8) !std.ArrayList(u32) {
         const r = std.fmt.parseInt(u8, rs, 10) catch continue; // 範囲外/負/非数字 → スキップ
         const g = std.fmt.parseInt(u8, gs, 10) catch continue;
         const b = std.fmt.parseInt(u8, bs, 10) catch continue;
-        const c = 0xFF000000 | (@as(u32, b) << 16) | (@as(u32, g) << 8) | @as(u32, r);
+        const c = 0xFF000000 | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
         try colors.append(gpa, c);
     }
     if (!header_ok) return GplError.InvalidGpl; // 空 / 全行空白
@@ -188,8 +189,8 @@ test "gpl: ヘッダ/コメント/空行/名前行を許容、不正行はスキ
     defer decoded.deinit(gpa);
     // 有効: (255,0,0), (10,20,30), (40,50,60)
     try std.testing.expectEqual(@as(usize, 3), decoded.items.len);
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), decoded.items[0]); // R=255 → 0xAABBGGRR=0xFF0000FF
-    try std.testing.expectEqual(@as(u32, 0xFF1E140A), decoded.items[1]); // (10,20,30)
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), decoded.items[0]); // R=255 → 0xAARRGGBB=0xFFFF0000
+    try std.testing.expectEqual(@as(u32, 0xFF0A141E), decoded.items[1]); // (10,20,30)
 }
 
 test "gpl: ヘッダ欠落は InvalidGpl" {

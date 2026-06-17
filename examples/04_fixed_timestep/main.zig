@@ -162,11 +162,11 @@ pub fn main() !void {
             const w: usize = fb.width;
             const h: usize = fb.height;
 
-            @memset(fb.pixels, 0x1A1A2EFF);
+            @memset(fb.pixels, 0xFF1A1A2E); // canonical BGRA: 濃紺背景 (r=1A,g=1A,b=2E)
 
             const draw_x = @as(i32, @intFromFloat(ball.interpolatedX(alpha)));
             const draw_y = @as(i32, @intFromFloat(ball.interpolatedY(alpha)));
-            drawCircle(fb.pixels, w, h, draw_x, draw_y, 20, 0xFF6B6BFF);
+            drawCircle(fb.pixels, w, h, draw_x, draw_y, 20, 0xFFFF6B6B); // canonical BGRA: コーラル (r=FF,g=6B,b=6B)
 
             window.present();
         }

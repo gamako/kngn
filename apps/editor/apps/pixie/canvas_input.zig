@@ -76,7 +76,7 @@ fn displayContains(rect: core.Rect, zoom: i32, p: core.Vec2) bool {
 // Tests
 // ============================================================
 
-const RED: u32 = 0xFF0000FF; // 0xAABBGGRR
+const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
 
 /// テスト用の最小セットアップ（Canvas + StrokeRecorder + Pen + CanvasInput）。
 const Harness = struct {
