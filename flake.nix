@@ -47,9 +47,23 @@
             pkgs.xdotool
             # ファイルダイアログ (TASK-28.4)
             pkgs.zenity
+            # L1 オーディオ出力 (TASK-28.7): ALSA (libasound) を audio exe にリンク
+            pkgs.alsa-lib
             # ネイティブライブラリ解決
             pkgs.pkg-config
           ];
+          # nix の libasound は ALSA プラグイン (pipewire/pulse 等) を自前の plugin dir
+          # からしか探さないため、PipeWire/Pulse 経由の `default` PCM を開くと
+          # libasound_module_pcm_pipewire.so が見つからず NoDevice になる (TASK-28.7)。
+          # system の ALSA プラグイン dir を ALSA_PLUGIN_DIR で補い、run-synth / run-example_15 が
+          # 標準の nix フローで発音できるようにする (dir が無い環境では何もしない＝無害)。
+          shellHook = ''
+            if [ -z "''${ALSA_PLUGIN_DIR:-}" ]; then
+              for d in /usr/lib/x86_64-linux-gnu/alsa-lib /usr/lib/alsa-lib /usr/lib64/alsa-lib; do
+                if [ -d "$d" ]; then export ALSA_PLUGIN_DIR="$d"; break; fi
+              done
+            fi
+          '';
         };
     };
 }

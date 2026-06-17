@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     // ========================================
     // main / pixie / synth / examples を backend ごとに生成
     // （platform / keyboard は backend ごとに module graph を分ける = build_options.platform_backend を付与）
-    // audio を使う synth / example_15 と platform native lib は macOS のみ（AudioToolbox / Obj-C/Swift 実装が macOS 専用）。
+    // audio を使う synth / example_15 は macOS/Linux（audio backend が OS 分岐）。platform native lib は macOS のみ。
     // ========================================
     var default_main: ?*std.Build.Step.Compile = null;
     var default_pixie: ?*std.Build.Step.Compile = null;
@@ -79,8 +79,8 @@ pub fn build(b: *std.Build) void {
         if (install_all) b.installArtifact(pixie_exe);
         addRunStep(b, b.fmt("run-pixie-{s}", .{platform.backendName(be)}), b.fmt("Run Pixie editor ({s})", .{platform.backendName(be)}), pixie_exe, b.args);
 
-        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS のみ -----
-        if (target_os == .macos) {
+        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux -----
+        {
             const synth_exe = addSynthExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "synth", be, default_be), &example_modules, &pm);
             if (is_default) default_synth = synth_exe;
             if (install_all) b.installArtifact(synth_exe);
@@ -118,8 +118,8 @@ pub fn build(b: *std.Build) void {
                 .needs_font = example.needs_font,
                 .needs_audio = example.needs_audio,
             };
-            // audio example（AudioToolbox / audio backend）は macOS のみ。Linux ではスキップ。
-            if (!(example.needs_audio and target_os != .macos)) {
+            // audio example も macOS/Linux 両対応（audio backend が OS 分岐するため）。
+            {
                 const ex_exe = addExampleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, example.name, be, default_be), example.path, &example_modules, &pm, needs);
                 // examples は install-all とは独立に常に全 backend を install する
                 // （platform 層 / example のビルド回帰を毎 `zig build` で検出する従来挙動を踏襲）。
@@ -142,7 +142,7 @@ pub fn build(b: *std.Build) void {
     if (!install_all) b.installArtifact(default_main.?);
     addRunStep(b, "run", "Run the app (uses -Dplatform option)", default_main.?, b.args);
     addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", default_pixie.?, b.args);
-    if (target_os == .macos) addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", default_synth.?, b.args);
+    addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", default_synth.?, b.args);
 
     // ========================================
     // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
@@ -593,7 +593,8 @@ const ExampleModules = struct {
         gui.addImport("font", font_mod);
 
         // audio (L1 オーディオ出力): platform バックエンド非依存。@cImport しないので
-        // 通常の createModule でよい（AudioToolbox は exe 側で linkFramework する）。
+        // 通常の createModule でよい（audio system lib は exe 側で OS 別にリンク:
+        // macOS=AudioToolbox / Linux=asound。linkAudioBackend 参照）。
         const audio_mod = b.createModule(.{
             .root_source_file = b.path("src/audio.zig"),
         });
@@ -678,8 +679,8 @@ fn addExampleExe(
     if (needs.needs_font) exe.root_module.addImport("font", common.font);
     if (needs.needs_audio) {
         exe.root_module.addImport("audio", common.audio);
-        // L1 オーディオ出力に必要な framework（needs_audio の exe にのみ付与。macOS のみ到達）。
-        exe.root_module.linkFramework("AudioToolbox", .{});
+        // L1 オーディオ出力の system ライブラリ（needs_audio の exe にのみ付与。OS 別）。
+        linkAudioBackend(exe, target.result.os.tag);
     }
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
@@ -729,7 +730,7 @@ fn addPixieExe(
 }
 
 // ============================================================
-// ヘルパー: synth app exe を 1 backend 分セットアップ（macOS のみ。AudioToolbox を link）
+// ヘルパー: synth app exe を 1 backend 分セットアップ（macOS/Linux。audio system lib を link）
 // ============================================================
 fn addSynthExe(
     b: *std.Build,
@@ -755,10 +756,27 @@ fn addSynthExe(
     exe.root_module.addImport("synth", common.synth);
     exe.root_module.addImport("dsp", common.dsp); // mono downmix + FFT(スペクトログラム)
     exe.root_module.addImport("gui", common.gui); // スライダ / ボタン（演奏 UI）
-    exe.root_module.linkFramework("AudioToolbox", .{}); // L1 オーディオ出力
+    linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound）
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
+}
+
+// ============================================================
+// ヘルパー: audio を使う exe に L1 出力の system ライブラリを OS 別にリンクする。
+// audio module は @cImport せず extern fn なので、リンクは exe 側で行う
+// （macOS=AudioToolbox framework / Linux=ALSA libasound）。libc は backend setup 側で有効化済み。
+//
+// Linux は pkg-config 名 "alsa"（.pc は alsa-lib-dev が提供）を渡す。これで pkg-config が
+// `-lasound` と lib パスの両方を解決する。ライブラリ名 "asound" を直接渡すと .pc が無く、
+// zig は既存の -L（X11 等）しか探さず libasound.so を見つけられない（shiso 実ビルドで確認）。
+// ============================================================
+fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
+    switch (target_os) {
+        .macos => exe.root_module.linkFramework("AudioToolbox", .{}),
+        .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
+        else => @panic("audio backend is only available on macOS / Linux"),
+    }
 }
 
 // ============================================================
