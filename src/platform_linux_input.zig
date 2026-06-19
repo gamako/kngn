@@ -185,7 +185,15 @@ fn modifierOf(keycode: u32) ?Mod {
 /// **この keycode が属する修飾の 1 ビットだけ**「左右いずれかが down なら true」で上書きする。
 /// 左右同時押し・最後の 1 個解放も正しい。event に無関係な修飾は state mask（focus 前の保持も拾える）を使う。
 pub fn keyEventModifiers(state: u32, keys: *const KeyDownSet, keycode: u32) ModifierFlags {
-    var m = stateToModifiers(state);
+    return overrideModifierBit(stateToModifiers(state), keys, keycode);
+}
+
+/// base modifier（X11 は state mask 由来、Wayland は xkb 由来）に対し、この keycode が修飾キーなら
+/// その 1 ビットだけ KeyDownSet（当該 event 反映後）の「左右いずれか down」で上書きする post-state 補正。
+/// 修飾キー自身の押下/解放イベントで modifier がイベント前後にズレる問題を吸収する（左右同時押し対応）。
+/// keycode は X keycode 系（Wayland は evdev+8）。
+pub fn overrideModifierBit(base: ModifierFlags, keys: *const KeyDownSet, keycode: u32) ModifierFlags {
+    var m = base;
     const which = modifierOf(keycode) orelse return m;
     switch (which) {
         .shift => m.shift = keys.isDown(KC_SHIFT_L) or keys.isDown(KC_SHIFT_R),

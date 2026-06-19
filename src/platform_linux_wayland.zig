@@ -23,6 +23,7 @@
 const std = @import("std");
 const types = @import("platform_types.zig");
 const input = @import("platform_linux_input.zig");
+const wlinput = @import("platform_wayland_input.zig");
 const common = @import("platform_linux_common.zig");
 const build_options = @import("build_options");
 
@@ -35,6 +36,9 @@ const c = @cImport({
 const Error = types.Error;
 const Event = types.Event;
 const EventStats = types.EventStats;
+const MouseButton = types.MouseButton;
+const MouseButtons = types.MouseButtons;
+const ModifierFlags = types.ModifierFlags;
 
 comptime {
     if (!std.mem.eql(u8, build_options.platform_backend, "wayland")) {
@@ -67,7 +71,12 @@ const MFD_CLOEXEC: c_uint = 0x0001;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x1;
+const MAP_PRIVATE: c_int = 0x2; // keymap fd の mmap 用（読み取り専用 private）
 const POLLIN: c_short = 0x001;
+
+// wl_seat capability bits / keymap format
+const WL_SEAT_CAP_POINTER: u32 = 1;
+const WL_SEAT_CAP_KEYBOARD: u32 = 2;
 const POLLERR: c_short = 0x008;
 const POLLHUP: c_short = 0x010;
 const MAP_FAILED_INT: usize = @bitCast(@as(isize, -1));
@@ -115,6 +124,23 @@ const State = struct {
     surface: ?*c.struct_wl_surface = null,
     xdg_surface: ?*c.struct_xdg_surface = null,
     toplevel: ?*c.struct_xdg_toplevel = null,
+
+    // 入力（TASK-28.5.3）
+    seat: ?*c.struct_wl_seat = null,
+    keyboard: ?*c.struct_wl_keyboard = null,
+    pointer: ?*c.struct_wl_pointer = null,
+    xkb_context: ?*c.struct_xkb_context = null,
+    xkb_keymap: ?*c.struct_xkb_keymap = null,
+    xkb_state: ?*c.struct_xkb_state = null,
+    keys: input.KeyDownSet = .{}, // keycode は X keycode 系（evdev+8）で揃える
+    buttons: MouseButtons = .{}, // post-state（押下中のボタン集合）
+    modifiers: ModifierFlags = .{}, // xkb modifier の現在値
+    pointer_x: i32 = 0,
+    pointer_y: i32 = 0,
+    repeat: wlinput.RepeatState = .{},
+    // wl_pointer.frame 内の axis 蓄積。discrete(notch) を優先し、無ければ continuous を fallback。
+    scroll_disc: wlinput.ScrollAccumulator = .{},
+    scroll_cont: wlinput.ScrollAccumulator = .{},
 
     width: u32,
     height: u32,
@@ -170,8 +196,13 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.struct_wl_registry, name: u32
     } else if (std.mem.eql(u8, ifn, "xdg_wm_base")) {
         st.wm_base = @ptrCast(c.wl_registry_bind(registry, name, &c.xdg_wm_base_interface, 1));
         if (st.wm_base) |wm| _ = c.xdg_wm_base_add_listener(wm, &wm_base_listener, st);
+    } else if (std.mem.eql(u8, ifn, "wl_seat")) {
+        // min(advertised, 5): keyboard は repeat_info(v4+)、pointer は frame+axis_discrete(v5) を持ち、
+        // value120(v8) は来ない（扱う event 集合を限定して null listener crash を避ける）。
+        const v = @min(version, 5);
+        st.seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, v));
+        if (st.seat) |seat| _ = c.wl_seat_add_listener(seat, &seat_listener, st);
     }
-    // wl_seat（入力）は TASK-28.5.3 で listener と共に bind する。
 }
 
 fn registryGlobalRemove(data: ?*anyopaque, registry: ?*c.struct_wl_registry, name: u32) callconv(.c) void {
@@ -226,6 +257,271 @@ fn frameDone(data: ?*anyopaque, cb: ?*c.struct_wl_callback, time: u32) callconv(
     st.frame_pending = false;
 }
 
+// ---- 入力（wl_seat / wl_keyboard / wl_pointer / xkbcommon。TASK-28.5.3） ----
+// libwayland は listener[opcode] を null チェックせず呼ぶため、bound version(seat≤5)が送りうる
+// 全 event に非 null handler を置く（未使用は no-op）。
+
+fn seatCapabilities(data: ?*anyopaque, seat: ?*c.struct_wl_seat, caps: u32) callconv(.c) void {
+    _ = seat;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    const has_kbd = (caps & WL_SEAT_CAP_KEYBOARD) != 0;
+    const has_ptr = (caps & WL_SEAT_CAP_POINTER) != 0;
+    if (has_kbd and st.keyboard == null) setupKeyboard(st);
+    if (!has_kbd and st.keyboard != null) releaseKeyboard(st);
+    if (has_ptr and st.pointer == null) setupPointer(st);
+    if (!has_ptr and st.pointer != null) releasePointer(st);
+}
+
+fn seatName(data: ?*anyopaque, seat: ?*c.struct_wl_seat, name: [*c]const u8) callconv(.c) void {
+    _ = data;
+    _ = seat;
+    _ = name; // no-op（送られても crash しないため非 null が必要）
+}
+
+fn setupKeyboard(st: *State) void {
+    const seat = st.seat orelse return;
+    st.keyboard = c.wl_seat_get_keyboard(seat);
+    if (st.keyboard) |kbd| _ = c.wl_keyboard_add_listener(kbd, &keyboard_listener, st);
+}
+
+fn releaseKeyboard(st: *State) void {
+    if (st.keyboard) |kbd| {
+        c.wl_keyboard_destroy(kbd);
+        st.keyboard = null;
+    }
+    // 押下状態・repeat・modifier・xkb を破棄（keyboard 喪失後に古い modifier が pointer event に残らないように）。
+    st.keys = .{};
+    st.repeat.key = null;
+    st.modifiers = .{};
+    if (st.xkb_state) |s| c.xkb_state_unref(s);
+    if (st.xkb_keymap) |k| c.xkb_keymap_unref(k);
+    st.xkb_state = null;
+    st.xkb_keymap = null;
+}
+
+fn setupPointer(st: *State) void {
+    const seat = st.seat orelse return;
+    st.pointer = c.wl_seat_get_pointer(seat);
+    if (st.pointer) |ptr| _ = c.wl_pointer_add_listener(ptr, &pointer_listener, st);
+}
+
+fn releasePointer(st: *State) void {
+    if (st.pointer) |ptr| {
+        c.wl_pointer_destroy(ptr);
+        st.pointer = null;
+    }
+    st.buttons = .{};
+}
+
+// ---- wl_keyboard ----
+
+fn kbKeymap(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, format: u32, fd: c_int, size: u32) callconv(.c) void {
+    _ = kbd;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // XKB_V1(=1) 以外は無視。fd は必ず閉じる。
+    if (format != 1) {
+        _ = close(fd);
+        return;
+    }
+    const raw = mmap(null, size, PROT_READ, MAP_PRIVATE, fd, 0) orelse {
+        _ = close(fd);
+        return;
+    };
+    if (@intFromPtr(raw) == MAP_FAILED_INT) {
+        _ = close(fd); // MAP_FAILED は munmap しない（不正アドレス）
+        return;
+    }
+    defer {
+        _ = munmap(raw, size);
+        _ = close(fd);
+    }
+
+    if (st.xkb_context == null) st.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
+    const ctx = st.xkb_context orelse return;
+    const keymap = c.xkb_keymap_new_from_string(
+        ctx,
+        @ptrCast(raw),
+        c.XKB_KEYMAP_FORMAT_TEXT_V1,
+        c.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return;
+    const state = c.xkb_state_new(keymap) orelse {
+        c.xkb_keymap_unref(keymap);
+        return;
+    };
+    if (st.xkb_state) |s| c.xkb_state_unref(s);
+    if (st.xkb_keymap) |k| c.xkb_keymap_unref(k);
+    st.xkb_keymap = keymap;
+    st.xkb_state = state;
+}
+
+fn kbEnter(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, serial: u32, surface: ?*c.struct_wl_surface, keys: ?*c.struct_wl_array) callconv(.c) void {
+    _ = data;
+    _ = kbd;
+    _ = serial;
+    _ = surface;
+    _ = keys; // focus 取得。MVP では押下中キーの再現はしない（no-op）。
+}
+
+fn kbLeave(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, serial: u32, surface: ?*c.struct_wl_surface) callconv(.c) void {
+    _ = kbd;
+    _ = serial;
+    _ = surface;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // focus 喪失: 押下状態と repeat をクリア（押しっぱなし誤検出を防ぐ）。
+    st.keys = .{};
+    st.repeat.key = null;
+}
+
+fn kbKey(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, serial: u32, time: u32, key: u32, state: u32) callconv(.c) void {
+    _ = kbd;
+    _ = serial;
+    _ = time;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    const x_keycode = key + 8; // xkb/X keycode = evdev + 8
+    const kc = wlinput.waylandKeyToKeyCode(key);
+    const pressed = state != 0; // WL_KEYBOARD_KEY_STATE_PRESSED=1, RELEASED=0
+    if (pressed) {
+        const was_down = st.keys.isDown(x_keycode);
+        st.keys.setDown(x_keycode, true); // 修飾 post-state 算出は反映後に行う
+        // 修飾キー自身の event は xkb modifiers(別 event)と順序がずれ得るため、KeyDownSet で post-state 補正（X11 と同じ）。
+        const mods = input.overrideModifierBit(st.modifiers, &st.keys, x_keycode);
+        st.queue.enqueue(.{ .key_down = .{ .key = kc, .is_repeat = was_down, .modifiers = mods } });
+        // repeat 対象か（modifier 等は対象外）を xkbcommon に判定させ、対象のみ repeat 開始。
+        if (st.xkb_keymap) |km| {
+            if (c.xkb_keymap_key_repeats(km, x_keycode) != 0) st.repeat.onKeyDown(x_keycode, common.getTime());
+        }
+    } else {
+        st.keys.setDown(x_keycode, false);
+        st.repeat.onKeyUp(x_keycode);
+        const mods = input.overrideModifierBit(st.modifiers, &st.keys, x_keycode);
+        st.queue.enqueue(.{ .key_up = .{ .key = kc, .is_repeat = false, .modifiers = mods } });
+    }
+}
+
+fn kbModifiers(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, serial: u32, mods_depressed: u32, mods_latched: u32, mods_locked: u32, group: u32) callconv(.c) void {
+    _ = kbd;
+    _ = serial;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    const state = st.xkb_state orelse return;
+    _ = c.xkb_state_update_mask(state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
+    const eff = c.XKB_STATE_MODS_EFFECTIVE;
+    st.modifiers = wlinput.modifiersFromActive(
+        c.xkb_state_mod_name_is_active(state, "Shift", eff) > 0,
+        c.xkb_state_mod_name_is_active(state, "Control", eff) > 0,
+        c.xkb_state_mod_name_is_active(state, "Mod1", eff) > 0, // alt
+        c.xkb_state_mod_name_is_active(state, "Mod4", eff) > 0, // super → cmd
+    );
+}
+
+fn kbRepeatInfo(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, rate: i32, delay: i32) callconv(.c) void {
+    _ = kbd;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    st.repeat.setInfo(rate, delay);
+}
+
+// ---- wl_pointer ----
+
+fn setButton(st: *State, mb: MouseButton, down: bool) void {
+    switch (mb) {
+        .left => st.buttons.left = down,
+        .right => st.buttons.right = down,
+        .middle => st.buttons.middle = down,
+        else => {},
+    }
+}
+
+/// MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は現在の xkb modifier。
+fn mouseEvent(st: *State, button: MouseButton) types.MouseEvent {
+    return .{
+        .x = st.pointer_x,
+        .y = st.pointer_y,
+        .button = button,
+        .buttons = st.buttons,
+        .modifiers = st.modifiers,
+    };
+}
+
+fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface: ?*c.struct_wl_surface, sx: c.wl_fixed_t, sy: c.wl_fixed_t) callconv(.c) void {
+    _ = ptr;
+    _ = serial;
+    _ = surface;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    st.pointer_x = wlinput.fixedToI32(sx);
+    st.pointer_y = wlinput.fixedToI32(sy);
+}
+
+fn ptrLeave(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface: ?*c.struct_wl_surface) callconv(.c) void {
+    _ = data;
+    _ = ptr;
+    _ = serial;
+    _ = surface; // no-op
+}
+
+fn ptrMotion(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, sx: c.wl_fixed_t, sy: c.wl_fixed_t) callconv(.c) void {
+    _ = ptr;
+    _ = time;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    st.pointer_x = wlinput.fixedToI32(sx);
+    st.pointer_y = wlinput.fixedToI32(sy);
+    st.queue.enqueue(.{ .mouse_move = mouseEvent(st, .none) });
+}
+
+fn ptrButton(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, time: u32, button: u32, state: u32) callconv(.c) void {
+    _ = ptr;
+    _ = serial;
+    _ = time;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    const mb = wlinput.evdevButtonToMouseButton(button) orelse return;
+    const pressed = state != 0; // WL_POINTER_BUTTON_STATE_PRESSED=1
+    setButton(st, mb, pressed); // post-state にしてから event を組む
+    const ev = mouseEvent(st, mb);
+    st.queue.enqueue(if (pressed) .{ .mouse_down = ev } else .{ .mouse_up = ev });
+}
+
+fn ptrAxis(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, axis: u32, value: c.wl_fixed_t) callconv(.c) void {
+    _ = ptr;
+    _ = time;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    st.scroll_cont.add(wlinput.continuousScroll(axis, value));
+}
+
+fn ptrAxisDiscrete(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, axis: u32, discrete: i32) callconv(.c) void {
+    _ = ptr;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    st.scroll_disc.add(wlinput.discreteScroll(axis, discrete));
+}
+
+fn ptrAxisSource(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, axis_source: u32) callconv(.c) void {
+    _ = data;
+    _ = ptr;
+    _ = axis_source; // no-op
+}
+
+fn ptrAxisStop(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, axis: u32) callconv(.c) void {
+    _ = data;
+    _ = ptr;
+    _ = time;
+    _ = axis; // no-op
+}
+
+fn ptrFrame(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer) callconv(.c) void {
+    _ = ptr;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // discrete(notch) を優先、無ければ continuous を fallback。frame ごとに 1 mouse_scroll。
+    const disc = st.scroll_disc.take();
+    const cont = st.scroll_cont.take();
+    const d = disc orelse cont orelse return;
+    st.queue.enqueue(.{ .mouse_scroll = .{
+        .x = st.pointer_x,
+        .y = st.pointer_y,
+        .dx = d.dx,
+        .dy = d.dy,
+        .is_precise = false,
+        .buttons = st.buttons,
+        .modifiers = st.modifiers,
+    } });
+}
+
 const registry_listener = std.mem.zeroInit(c.struct_wl_registry_listener, .{
     .global = &registryGlobal,
     .global_remove = &registryGlobalRemove,
@@ -239,6 +535,31 @@ const toplevel_listener = std.mem.zeroInit(c.struct_xdg_toplevel_listener, .{
 });
 const buffer_listener = std.mem.zeroInit(c.struct_wl_buffer_listener, .{ .release = &bufferRelease });
 const frame_listener = std.mem.zeroInit(c.struct_wl_callback_listener, .{ .done = &frameDone });
+
+// 入力 listener（zeroInit で未知 field を null 初期化しつつ、bound version が送りうる event は全て設定）。
+const seat_listener = std.mem.zeroInit(c.struct_wl_seat_listener, .{
+    .capabilities = &seatCapabilities,
+    .name = &seatName,
+});
+const keyboard_listener = std.mem.zeroInit(c.struct_wl_keyboard_listener, .{
+    .keymap = &kbKeymap,
+    .enter = &kbEnter,
+    .leave = &kbLeave,
+    .key = &kbKey,
+    .modifiers = &kbModifiers,
+    .repeat_info = &kbRepeatInfo,
+});
+const pointer_listener = std.mem.zeroInit(c.struct_wl_pointer_listener, .{
+    .enter = &ptrEnter,
+    .leave = &ptrLeave,
+    .motion = &ptrMotion,
+    .button = &ptrButton,
+    .axis = &ptrAxis,
+    .frame = &ptrFrame,
+    .axis_source = &ptrAxisSource,
+    .axis_stop = &ptrAxisStop,
+    .axis_discrete = &ptrAxisDiscrete,
+});
 
 // ============================================================================
 // Window / Framebuffer
@@ -338,6 +659,20 @@ pub const Window = struct {
             c.wl_display_cancel_read(dpy);
         }
         if (c.wl_display_dispatch_pending(dpy) < 0) return st.fail();
+
+        // keyboard repeat（repeat_info ベースに is_repeat=true を生成。AC#3）。
+        // repeat.key は X keycode 系(evdev+8)なので keycodeToKeyCode をそのまま使う。
+        const now = common.getTime();
+        if (st.repeat.due(now)) {
+            if (st.repeat.key) |xk| {
+                st.queue.enqueue(.{ .key_down = .{
+                    .key = input.keycodeToKeyCode(xk),
+                    .is_repeat = true,
+                    .modifiers = st.modifiers,
+                } });
+                st.repeat.advance(now);
+            }
+        }
 
         return !st.quit_delivered;
     }
@@ -495,6 +830,19 @@ fn teardown(st: *State) void {
         if (b.fd >= 0) _ = close(b.fd);
         b.* = .{};
     }
+    // 入力リソース（TASK-28.5.3）
+    if (st.keyboard) |k| c.wl_keyboard_destroy(k);
+    if (st.pointer) |p| c.wl_pointer_destroy(p);
+    if (st.seat) |s| c.wl_seat_destroy(s);
+    if (st.xkb_state) |s| c.xkb_state_unref(s);
+    if (st.xkb_keymap) |k| c.xkb_keymap_unref(k);
+    if (st.xkb_context) |ctx| c.xkb_context_unref(ctx);
+    st.keyboard = null;
+    st.pointer = null;
+    st.seat = null;
+    st.xkb_state = null;
+    st.xkb_keymap = null;
+    st.xkb_context = null;
     if (st.toplevel) |t| c.xdg_toplevel_destroy(t);
     if (st.xdg_surface) |x| c.xdg_surface_destroy(x);
     if (st.surface) |s| c.wl_surface_destroy(s);

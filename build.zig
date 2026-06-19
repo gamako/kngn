@@ -341,6 +341,21 @@ pub fn build(b: *std.Build) void {
     test_platform_convert_step.dependOn(&run_platform_convert_test.step);
 
     // ========================================
+    // platform_wayland_input.zig テスト（Wayland 入力の純粋変換: evdev+8/BTN_*/wl_fixed/xkb modifier/
+    // axis scroll/scroll coalesce/repeat timing）。純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.5.3）
+    // ========================================
+    const platform_wayland_input_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform_wayland_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_platform_wayland_input_test = b.addRunArtifact(platform_wayland_input_test);
+    const test_platform_wayland_input_step = b.step("test-platform-wayland-input", "Run Wayland input mapping/scroll/repeat unit tests");
+    test_platform_wayland_input_step.dependOn(&run_platform_wayland_input_test.step);
+
+    // ========================================
     // text.zig テスト (BDF パーサ + 描画)
     // ========================================
     const text_test_mod = b.createModule(.{
@@ -468,6 +483,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_scope_step);
     test_step.dependOn(test_platform_input_step);
     test_step.dependOn(test_platform_convert_step);
+    test_step.dependOn(test_platform_wayland_input_step);
 }
 
 // ============================================================
