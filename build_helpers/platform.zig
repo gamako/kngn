@@ -27,35 +27,32 @@ pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
 }
 
 /// 当該 OS で **このタスク時点で実装済み** の backend 一覧。
-/// （`install-all` や全 backend ビルドの対象。wayland は TASK-28.5 で追加予定なので未収録）
+/// （`install-all` や全 backend ビルドの対象。Linux は x11 / wayland の両方を常時ビルドして
+/// 回帰を検出するが、default は x11。wayland は TASK-28.5 で追加）
 pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     return switch (os) {
         .macos => &.{ .objc, .swift, .metal },
-        .linux => &.{.x11},
+        .linux => &.{ .x11, .wayland },
         else => &.{},
     };
 }
 
 /// `-Dplatform` で指定された backend が対象 OS に対して妥当か検証する。
-/// 不整合（macOS backend を Linux で等）・未実装（wayland）は build エラーにする。
+/// 不整合（macOS backend を Linux で等）は build エラーにする。
 /// （panic のスタックトレースを避け、1 行の明確なメッセージで停止する）
 pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
     for (implementedBackends(os)) |b| {
         if (b == backend) return;
     }
-    if (os == .linux and backend == .wayland) {
-        std.log.err("-Dplatform=wayland は未実装です（TASK-28.5）。現状の Linux backend は x11 のみ。", .{});
-    } else {
-        const valid = switch (os) {
-            .macos => "objc / swift / metal",
-            .linux => "x11",
-            else => "(なし)",
-        };
-        std.log.err(
-            "-Dplatform={s} は OS={s} では使えません。有効値: {s}",
-            .{ @tagName(backend), @tagName(os), valid },
-        );
-    }
+    const valid = switch (os) {
+        .macos => "objc / swift / metal",
+        .linux => "x11 / wayland",
+        else => "(なし)",
+    };
+    std.log.err(
+        "-Dplatform={s} は OS={s} では使えません。有効値: {s}",
+        .{ @tagName(backend), @tagName(os), valid },
+    );
     std.process.exit(1);
 }
 
@@ -97,15 +94,58 @@ pub fn createPlatformModule(
     opts.addOption([]const u8, "platform_backend", backendName(backend));
     mod.addOptions("build_options", opts);
 
-    // Linux x11 backend は platform_linux.zig が @cImport(<X11/Xlib.h>) / <X11/extensions/XShm.h> する。
+    // Linux x11 backend は platform_linux_x11.zig が @cImport(<X11/Xlib.h>) / <X11/extensions/XShm.h> する。
     // platform module に X11/Xext を linkSystemLibrary することで、(a) @cImport のヘッダ解決
     // （pkg-config の Cflags 経由）と (b) exe への lib リンク伝播 を両方行う。
     if (backend == .x11) {
         mod.linkSystemLibrary("X11", .{});
         mod.linkSystemLibrary("Xext", .{});
+    } else if (backend == .wayland) {
+        // Wayland backend は platform_linux_wayland.zig が
+        // @cImport(<wayland-client.h>, <xkbcommon/xkbcommon.h>, "xdg-shell-client-protocol.h") する。
+        // wayland-client/xkbcommon の link で (a) @cImport ヘッダ解決（pkg-config Cflags）と
+        // (b) exe への lib リンク伝播 を行う。xdg-shell-client-protocol.h は wayland-scanner 生成物
+        // なので、生成 header の dir を include path に追加する。
+        mod.linkSystemLibrary("wayland-client", .{});
+        mod.linkSystemLibrary("xkbcommon", .{});
+        mod.addIncludePath(generateXdgShellClientHeaderDir(b));
     }
 
     return mod;
+}
+
+// ============================================================================
+// xdg-shell protocol glue（TASK-28.5.1）
+//
+// Wayland の window 管理は xdg-shell プロトコルで行う。手書きせず標準経路の `wayland-scanner`
+// で client-header(.h) と private-code(.c) を build 時生成する。`xdg-shell.xml` は
+// `pkg-config --variable=pkgdatadir wayland-protocols` から引く（shiso/nix devShell 前提）。
+//
+// 生成は backend×exe ごとに走るが、macOS が setupExecutableForPlatform 内で platform_macos.m を
+// exe ごとに clang する既存スタイルと対称で、helper シグネチャを増やさずに済む（scanner は軽量）。
+// ============================================================================
+
+/// `xdg-shell-client-protocol.h` を生成し、その親ディレクトリ（include path 用）を返す。
+/// Wayland backend の `@cImport("xdg-shell-client-protocol.h")` 解決に使う。
+fn generateXdgShellClientHeaderDir(b: *std.Build) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        // $0=sh, $1=出力パス(addOutputFileArg)。pkg-config で xdg-shell.xml の場所を引く。
+        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"",
+        "sh",
+    });
+    return cmd.addOutputFileArg("xdg-shell-client-protocol.h").dirname();
+}
+
+/// `xdg-shell-protocol.c`（protocol marshalling 実体）を生成して LazyPath を返す。
+/// exe に C source として追加する（wl_proxy_* を参照するため wayland-client への link を担保する）。
+fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"",
+        "sh",
+    });
+    return cmd.addOutputFileArg("xdg-shell-protocol.c");
 }
 
 /// 実行ファイルにプラットフォーム層をセットアップする。
@@ -152,11 +192,20 @@ pub fn setupExecutableForPlatform(
         },
         .x11 => {
             // X11/Xlib backend（純 Zig）。.o コンパイルや framework は不要。
-            // TASK-28.1 は stub のため X11 シンボルを参照しないが、TASK-28.2 で Xlib を
-            // 呼ぶため libc を有効にしておく（`linkSystemLibrary("X11")` は 28.2 で追加）。
+            // Xlib シンボルは createPlatformModule の linkSystemLibrary("X11"/"Xext") から
+            // exe へ伝播するため、ここでは libc のみ有効にする。
             exe.root_module.link_libc = true;
         },
-        .wayland => @panic("wayland backend は未実装です（TASK-28.5）"),
+        .wayland => {
+            // Wayland backend（純 Zig）。生成 xdg-shell-protocol.c を exe ごとにコンパイルする
+            // （macOS が platform_macos.m を addObjectFile するのと対称。helper シグネチャは増やさない）。
+            // この .c は wl_proxy_* を参照するため wayland-client への link が成立する。
+            // wayland-client は exe 側でも linkSystemLibrary して .c の compile（ヘッダ解決）と
+            // symbol 解決を確実にする（module からの伝播に依存しない）。
+            exe.root_module.link_libc = true;
+            exe.root_module.linkSystemLibrary("wayland-client", .{});
+            exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
+        },
     }
 }
 
@@ -201,7 +250,7 @@ pub fn buildStandalone(
     const platform_option = b.option(
         PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11)",
+        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland)",
     ) orelse defaultBackend(target_os);
     assertBackendForOs(platform_option, target_os);
 

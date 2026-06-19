@@ -13,12 +13,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target_os = target.result.os.tag;
 
-    // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11[/wayland]）。
-    // 省略時は OS のデフォルト。OS/backend 不整合・未実装は assertBackendForOs で build エラー。
+    // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11/wayland）。
+    // 省略時は OS のデフォルト。OS/backend 不整合は assertBackendForOs で build エラー。
     const platform_option = b.option(
         platform.PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11)",
+        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland)",
     ) orelse platform.defaultBackend(target_os);
     platform.assertBackendForOs(platform_option, target_os);
 
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const example_modules = ExampleModules.init(b);
 
-    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11）
+    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland）
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
 

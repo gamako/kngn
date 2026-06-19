@@ -39,6 +39,14 @@
             # X11 backend (TASK-28.2): Xlib / Xext
             pkgs.xorg.libX11
             pkgs.xorg.libXext
+            # Wayland backend build 依存 (TASK-28.5.1): libwayland-client / xkbcommon /
+            # xdg-shell.xml(wayland-protocols) / wayland-scanner。
+            # 注: wayland-scanner の属性名は shiso で要確認（独立 pkgs.wayland-scanner か pkgs.wayland.bin か）。
+            # 検証用 compositor(weston/sway)・screenshot(grim)・入力(wtype) は TASK-28.5.5 で追加する。
+            pkgs.wayland
+            pkgs.wayland-protocols
+            pkgs.wayland-scanner
+            pkgs.libxkbcommon
             # ヘッドレス検証: Xvfb(xorgserver) → xwd → ffmpeg で PNG 撮影
             pkgs.xorg.xorgserver
             pkgs.xorg.xwd
