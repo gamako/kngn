@@ -143,7 +143,7 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 `flake.nix` は `aarch64-darwin` と `x86_64-linux` の 2 system を提供する。Linux 側 devShell は
 zig 0.16 + zls + X11 dev lib（`libX11`/`libXext`）+ Xvfb（`xorgserver`）+ `xwd` + `ffmpeg` + `zenity` + `xdotool`（入力合成）を含む。
 
-入力（key/mouse/scroll/modifier）は `src/platform_linux.zig` が XEvent を変換する（TASK-28.3）。物理キーは evdev
+入力（key/mouse/scroll/modifier）は `src/platform_linux_x11.zig` が XEvent を変換する（TASK-28.3。dispatcher 化で 28.5.1 にファイル移動）。物理キーは evdev
 X keycode 表で `KeyCode` へ（layout 非依存・KeySym 不使用）。純粋な変換ロジックは `src/platform_linux_input.zig`
 （`@cImport` しない純 Zig）に分離し、`zig build test-platform-input` で **display 無しでも単体テストできる**（集約 `test` に含む）。
 
@@ -161,6 +161,30 @@ nix develop --command bash scripts/xvfb-screenshot.sh out.png -- zig-out/bin/vid
 # 入力の合成（xdotool）: Xvfb 上のアプリへキー/マウス/ホイールを送って挙動を確認（TASK-28.3）
 #   DISPLAY=:99 xdotool key a / mousemove X Y / click 1 / click 4(=wheel up)
 ```
+
+#### Wayland backend（`-Dplatform=wayland`、TASK-28.5）
+
+Wayland backend（`src/platform_linux_wayland.zig`、wl_shm + xdg-shell + wl_keyboard/pointer + xkbcommon）は
+**実コンパイル/表示/入力に Linux + Wayland ライブラリと実セッションが必要**で、macOS では検証できない（shiso 等の Linux で確認）。
+純粋な入力変換は `src/platform_wayland_input.zig`（`@cImport` しない純 Zig）に分離し、`zig build test-platform-wayland-input` で
+**display 無しでも単体テストできる**（macOS/集約 `test` に含む）。物理キーは X11 と同じ evdev+8 表で `KeyCode` へ（layout 非依存）。
+
+```bash
+nix develop --command zig build -Dplatform=wayland          # wayland backend をビルド
+nix develop --command zig build run-pixie -Dplatform=wayland # pixie を Wayland で起動
+nix develop --command zig build test-platform-wayland-input  # 入力変換の単体テスト（compositor 不要・OS 非依存）
+```
+
+**zenity ファイルダイアログ（pixie の PNG open/save、TASK-28.5.4）の Wayland 表示条件**:
+`saveFileDialog`/`openFileDialog` は X11/Wayland 共通で `src/platform_linux_common.zig` の zenity サブプロセスを使う
+（backend 非依存）。zenity は GTK アプリのため、表示は session 環境に依存する:
+
+- 通常の Wayland desktop session（GNOME/KDE/Sway 等）では `WAYLAND_DISPLAY` 下で GTK/zenity が動き、file chooser が出る。
+- file chooser は環境により `xdg-desktop-portal`（+ backend service）の有無に影響される。
+- SSH / headless compositor / 最小 weston では portal や desktop integration が無く、**window 本体は出ても dialog が出ない**、
+  または GTK 初期化失敗（`error.DialogFailed`）になりうる。dialog 確認は通常のユーザー Wayland session 上で行う。
+- dialog が出ないときは AC 失敗と即断せず、`zenity` の有無 / `WAYLAND_DISPLAY` / `DISPLAY`(XWayland) /
+  `XDG_CURRENT_DESKTOP` / `xdg-desktop-portal` の起動状態を切り分ける。
 
 ## 主要なプラットフォームAPI
 
