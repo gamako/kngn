@@ -40,13 +40,20 @@
             pkgs.xorg.libX11
             pkgs.xorg.libXext
             # Wayland backend build 依存 (TASK-28.5.1): libwayland-client / xkbcommon /
-            # xdg-shell.xml(wayland-protocols) / wayland-scanner。
-            # 注: wayland-scanner の属性名は shiso で要確認（独立 pkgs.wayland-scanner か pkgs.wayland.bin か）。
-            # 検証用 compositor(weston/sway)・screenshot(grim)・入力(wtype) は TASK-28.5.5 で追加する。
+            # xdg-shell.xml(wayland-protocols) / wayland-scanner（独立属性であることを nix eval で確認済み）。
             pkgs.wayland
             pkgs.wayland-protocols
             pkgs.wayland-scanner
             pkgs.libxkbcommon
+            # Wayland headless 検証 (TASK-28.5.5): headless compositor + screenshot + keyboard 合成。
+            # sway(WLR_BACKENDS=headless)+grim を既定、weston(headless backend)+weston-screenshooter を代替に
+            # scripts/wayland-screenshot.sh が使う。keyboard 合成は wtype。属性名は nix eval で存在確認済みだが、
+            # headless 起動可否/screenshot/入力の実動作は shiso で確認する。mouse/scroll は ydotool(uinput 権限が
+            # 重い)を要するため devShell には入れず手動確認レンジとする（AGENT.md 参照）。
+            pkgs.sway
+            pkgs.grim
+            pkgs.wtype
+            pkgs.weston
             # ヘッドレス検証: Xvfb(xorgserver) → xwd → ffmpeg で PNG 撮影
             pkgs.xorg.xorgserver
             pkgs.xorg.xwd

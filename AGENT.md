@@ -175,6 +175,32 @@ nix develop --command zig build run-pixie -Dplatform=wayland # pixie を Wayland
 nix develop --command zig build test-platform-wayland-input  # 入力変換の単体テスト（compositor 不要・OS 非依存）
 ```
 
+**ヘッドレス検証（GUI セッション無しの SSH 環境向け、TASK-28.5.5）**: `scripts/wayland-screenshot.sh` が
+headless compositor 上でアプリを動かし PNG 撮影する（X11 の `xvfb-screenshot.sh` の Wayland 版）。既定は
+sway（`WLR_BACKENDS=headless`）+ `grim`、`WAYLAND_SHOT_COMPOSITOR=weston` で weston（headless backend）+
+`weston-screenshooter` に切替。
+
+```bash
+nix develop --command bash scripts/wayland-screenshot.sh out.png                                  # compositor 出力を撮影（疎通確認）
+nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/video_proto        # main を撮影（虹色表示の smoke）
+WAYLAND_SHOT_COMPOSITOR=weston nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/video_proto
+```
+
+> compositor の headless 起動法・出力名・screenshooter 権限は **実機（shiso）依存**で、最終調整は shiso で行う
+> （macOS では Wayland を実行できない。スクリプトは `bash -n` の構文確認のみ可能）。
+
+**入力合成の現実解と自動化範囲（TASK-28.5.5）**: X11 の `xdotool` のような統一手段は Wayland に無い。
+
+- **keyboard**: `wtype`（Wayland virtual-keyboard protocol）。compositor の対応に依存（headless sway/weston で
+  効くかは shiso 確認）。compositor の socket が専用 `XDG_RUNTIME_DIR` 配下にある場合はそれも渡す:
+  `XDG_RUNTIME_DIR=<dir> WAYLAND_DISPLAY=wayland-N wtype a`（実 session なら既存の環境変数のまま `wtype a`）。
+- **mouse / scroll**: compositor 固有手段か `ydotool`。`ydotool` は `/dev/uinput` の権限（root / `input` グループ /
+  systemd サービス）が要り CI 的自動化のリスクが大きいため、**devShell には含めず手動確認レンジ**とする。
+- **自動化できる範囲**: headless compositor 起動 + main の screenshot smoke +（compositor が対応すれば）`wtype` の
+  keyboard smoke。
+- **手動確認レンジ**: mouse move/click/scroll、pixie の canvas 描画・GUI hover/press/drag・undo、zenity dialog の
+  実 Wayland session 表示。これらは通常のユーザー Wayland session（GNOME/KDE/Sway 等）で目視確認する。
+
 **zenity ファイルダイアログ（pixie の PNG open/save、TASK-28.5.4）の Wayland 表示条件**:
 `saveFileDialog`/`openFileDialog` は X11/Wayland 共通で `src/platform_linux_common.zig` の zenity サブプロセスを使う
 （backend 非依存）。zenity は GTK アプリのため、表示は session 環境に依存する:
