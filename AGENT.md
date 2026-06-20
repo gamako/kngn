@@ -120,7 +120,7 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | **Swift**       | `platform/macos-swift/platform_macos.swift`       | CADisplayLink | ✅ 完全動作           |
 | **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ⚠️ 警告あり（動作）   |
 | **X11 (Linux)** | `src/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
-| **Wayland (Linux)** | `src/platform_linux_wayland.zig`（純 Zig / wl_shm 予定）  | wl_shm | 🚧 build skeleton のみ（TASK-28.5.1。表示/入力は 28.5.2〜） |
+| **Wayland (Linux)** | `src/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。shiso 実機検証済み） |
 
 **Metal版の警告**: `CAMetalLayerDrawable`のライフサイクル問題。機能的には動作中。
 
@@ -132,8 +132,8 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 `platform_linux_common.zig`）。`-Dplatform` の有効値は OS で変わる:
 
 - **macOS**: `objc`（既定）/ `swift` / `metal`
-- **Linux**: `x11`（既定）/ `wayland`。wayland は TASK-28.5.1 時点では build skeleton（compile/link は
-  通るが表示/入力は未実装。28.5.2〜で実装）。
+- **Linux**: `x11`（既定）/ `wayland`。wayland は TASK-28.5 で display/入力/pixie まで実装し shiso 実機で
+  検証済み（busy loop の present flood は frame callback(vsync)律速で対処）。
 
 不整合（例: Linux で `-Dplatform=objc`）は明確な build エラーになる。共有型（`KeyCode`/`Event` 等）は
 `src/platform_types.zig` が単一ソース。
