@@ -144,6 +144,12 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", default_pixie.?, b.args);
     addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", default_synth.?, b.args);
 
+    // ビルドのみ（実行しない）。当該 exe だけを install する step。
+    // `zig build`（引数なし）は全 installArtifact をビルドしてしまうので、単体ビルド用に分ける。
+    addBuildStep(b, "build-main", "Build the app only (uses -Dplatform option)", default_main.?);
+    addBuildStep(b, "build-pixie", "Build Pixie editor only (uses -Dplatform option)", default_pixie.?);
+    addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", default_synth.?);
+
     // ========================================
     // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
     // facade module(addModule "platform") と責務分離。外部は dep.artifact("platform_native_<plat>")
@@ -806,10 +812,28 @@ fn addRunStep(
     args: ?[]const []const u8,
 ) void {
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    // 注: あえて b.getInstallStep() に依存させない。getInstallStep は全 installArtifact
+    // （example 全 backend を含む）を束ねるため、依存させると run-* が全 example を
+    // 芋づる式にビルドしてしまう。run には当該 exe のコンパイルだけで十分なので、
+    // addRunArtifact が自動で張る exe ビルド依存に留める（cache から直接実行）。
     if (args) |a| run_cmd.addArgs(a);
     const run_step = b.step(name, description);
     run_step.dependOn(&run_cmd.step);
+}
+
+// ============================================================
+// ビルドのみ（実行しない）の step 追加ヘルパー
+// 当該 exe だけを install（= ビルド）する。getInstallStep には依存させないので
+// 他の exe / example を巻き込まない（run-* と同じ理由）。
+// ============================================================
+fn addBuildStep(
+    b: *std.Build,
+    name: []const u8,
+    description: []const u8,
+    exe: *std.Build.Step.Compile,
+) void {
+    const build_step = b.step(name, description);
+    build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
 
 // ============================================================
