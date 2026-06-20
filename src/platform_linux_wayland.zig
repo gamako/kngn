@@ -77,6 +77,11 @@ const POLLIN: c_short = 0x001;
 // wl_seat capability bits / keymap format
 const WL_SEAT_CAP_POINTER: u32 = 1;
 const WL_SEAT_CAP_KEYBOARD: u32 = 2;
+
+// frame callback 律速の floor 秒。直近 present の wl_surface.frame done が来るまで lockFramebuffer は
+// null を返して vsync に律速するが、callback を取りこぼしても固まらないようこの秒数で強制再開する
+// （= 最低描画レート ~1/frame_timeout_secs。sleep 無し busy loop の caller の commit flood を防ぐ）。
+const frame_timeout_secs: f64 = 0.1;
 const POLLERR: c_short = 0x008;
 const POLLHUP: c_short = 0x010;
 const MAP_FAILED_INT: usize = @bitCast(@as(isize, -1));
@@ -162,6 +167,7 @@ const State = struct {
 
     frame_callback: ?*c.struct_wl_callback = null,
     frame_pending: bool = false,
+    frame_deadline: f64 = 0, // frame callback 律速の floor（取りこぼし時もこの時刻で再開）
 
     fn enqueueQuit(self: *State) void {
         if (self.quit_enqueued) return;
@@ -697,6 +703,19 @@ pub const Window = struct {
         const st = self.state;
         if (!st.configured or st.closing or st.locked_index != null) return null;
 
+        // frame callback 律速（AC#6 改訂方針）: 直近 present の wl_surface.frame done が未到着なら
+        // この frame を skip して vsync に律速する。これで sleep の無い busy loop の caller
+        // （例: example_07）でも commit を撃ちまくらず compositor を飽和させない。frame done は
+        // pollEvents で dispatch され frame_pending が解除される。caller は null を「描画 skip」として扱う。
+        // ただし callback を取りこぼしても固まらないよう、frame_deadline 超過時は stale callback を
+        // 破棄して present を再開させる（最低 ~1/frame_timeout_secs のレートを保証）。
+        if (st.frame_pending) {
+            if (common.getTime() < st.frame_deadline) return null;
+            if (st.frame_callback) |cb| c.wl_callback_destroy(cb);
+            st.frame_callback = null;
+            st.frame_pending = false;
+        }
+
         if (freeBufferIndex(st)) |i| return lockAt(st, i);
 
         // 両 buffer busy: release を取りこぼしていないか軽く dispatch して再試行（ブロックしない）。
@@ -729,6 +748,7 @@ pub const Window = struct {
                 _ = c.wl_callback_add_listener(cb, &frame_listener, st);
                 st.frame_callback = cb;
                 st.frame_pending = true;
+                st.frame_deadline = common.getTime() + frame_timeout_secs;
             }
         }
 
