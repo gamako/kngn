@@ -143,6 +143,15 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 `flake.nix` は `aarch64-darwin` と `x86_64-linux` の 2 system を提供する。Linux 側 devShell は
 zig 0.16 + zls + X11 dev lib（`libX11`/`libXext`）+ Xvfb（`xorgserver`）+ `xwd` + `ffmpeg` + `zenity` + `xdotool`（入力合成）を含む。
 
+**ソース転送（jackjack / shiso は jj/git remote 無し）**: Mac から `scripts/sync-to.sh <host>` で
+`video-proto-main/` を `<host>:~/video-proto-main/` へ rsync ミラーしてから現地でネイティブビルドする。
+`.zig-cache`/`zig-out`/`.git`/`.jj`/`.DS_Store` は除外するので現地のビルドキャッシュは保持される。
+
+```bash
+bash scripts/sync-to.sh jackjack        # 転送（shiso も同様にホスト名を渡す）
+bash scripts/sync-to.sh -n jackjack     # dry-run（--delete の前に差分確認）
+```
+
 入力（key/mouse/scroll/modifier）は `src/platform_linux_x11.zig` が XEvent を変換する（TASK-28.3。dispatcher 化で 28.5.1 にファイル移動）。物理キーは evdev
 X keycode 表で `KeyCode` へ（layout 非依存・KeySym 不使用）。純粋な変換ロジックは `src/platform_linux_input.zig`
 （`@cImport` しない純 Zig）に分離し、`zig build test-platform-input` で **display 無しでも単体テストできる**（集約 `test` に含む）。
