@@ -3,6 +3,13 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    # alsa-lib のみ host(検証機 jackjack は nixos-unstable。version は NixOS 26.11 と表示)と同版に
+    # 揃えるための追加 pin (TASK-28.7.1)。host の pipewire ALSA プラグイン(/etc/alsa/conf.d が絶対パスで
+    # 指定、unstable の alsa-lib 1.2.15.3 でビルド)を dlopen するには、アプリがリンクする libasound が
+    # そのビルド版以上である必要がある。25.11 の 1.2.14 では古く plugin が開けず NoDevice になるため、
+    # alsa-lib の version/src だけこの input から取り、ビルドは 25.11 stdenv で行う（glibc は 25.11 のまま。詳細は alsaLibFor）。他パッケージは 25.11。
+    # ※ host が将来さらに新しい alsa に進むとこの pin が古くなり再発しうる（既知制約。pin を上げる）。
+    nixpkgs-audio.url = "github:NixOS/nixpkgs/nixos-unstable";
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zls = {
       url = "github:zigtools/zls/0.16.0";
@@ -10,7 +17,7 @@
     };
   };
 
-  outputs = { nixpkgs, zig-overlay, zls, ... }:
+  outputs = { nixpkgs, nixpkgs-audio, zig-overlay, zls, ... }:
     let
       # 対応 system を明示列挙（flake-utils 等の追加依存は持たない）。
       darwin = "aarch64-darwin";
@@ -18,6 +25,19 @@
       pkgsFor = system: nixpkgs.legacyPackages.${system};
       zigFor = system: zig-overlay.packages.${system}."0.16.0";
       zlsFor = system: zls.packages.${system}.default;
+      # alsa-lib は host(nixos-unstable) と同 version/src を使うが、ビルドは 25.11 の stdenv で行う
+      # （理由は nixpkgs-audio input のコメント参照）。unstable の alsa-lib を「丸ごと」使うと unstable の
+      # glibc(2.42)を引き込み、古い system glibc の distro(例: Ubuntu 24.04=shiso)で GLIBC_ABI_* 不一致で
+      # 実行不能になる。そこで 25.11 の alsa-lib derivation を base に version/src だけ newer に差し替え、
+      # glibc は 25.11 のまま（=従来 distro 互換）で alsa symbol だけ 1.2.15.3 に上げる。
+      alsaLibFor = system:
+        let
+          base = (pkgsFor system).alsa-lib; # 25.11 stdenv/glibc を維持
+          newer = nixpkgs-audio.legacyPackages.${system}.alsa-lib; # host と同 version/src（src tarball のみ参照）
+        in
+        base.overrideAttrs (_old: {
+          inherit (newer) version src;
+        });
     in {
       # macOS: 既存どおり（platform backend は objc/swift/metal、SDK は xcrun で解決）
       devShells.${darwin}.default = (pkgsFor darwin).mkShellNoCC {
@@ -62,8 +82,10 @@
             pkgs.xdotool
             # ファイルダイアログ (TASK-28.4)
             pkgs.zenity
-            # L1 オーディオ出力 (TASK-28.7): ALSA (libasound) を audio exe にリンク
-            pkgs.alsa-lib
+            # L1 オーディオ出力 (TASK-28.7 / 28.7.1): ALSA (libasound) を audio exe にリンク。
+            # host(nixos-unstable)の pipewire プラグイン版に合わせ alsa-lib だけ unstable から取得する
+            # （25.11 の 1.2.14 では plugin dlopen 失敗で NoDevice。詳細は nixpkgs-audio input のコメント）。
+            (alsaLibFor linux)
             # ネイティブライブラリ解決
             pkgs.pkg-config
           ];

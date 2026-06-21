@@ -279,6 +279,31 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 メイン⇔RT のデータ交換は `libs/synth` のロックフリー機構（note は SPSC、連続パラメータは atomic、
 出力タップは drop 可）で行う。
 
+### Linux で音を鳴らす前提条件（ALSA→PipeWire、TASK-28.7.1）
+
+Linux の音声は ALSA `default`→PipeWire ブリッジ（外部プラグイン `libasound_module_pcm_pipewire.so` を
+libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で発音するには次の条件が要る。
+
+1. **アプリの libasound 版 ≥ host の pipewire ALSA プラグインのビルド版**。古いと plugin が dlopen できず
+   `NoDevice` になる（プラグイン版が新しい NixOS unstable 等で顕在化）。flake は `alsa-lib` だけ host と同
+   version/src を使うが、**ビルドは 25.11 の stdenv で行う**（`flake.nix` の `alsaLibFor`）。unstable の
+   alsa-lib を丸ごと使うと unstable の glibc を引き込み、古い system glibc の distro（Ubuntu 24.04 等）で
+   `GLIBC_ABI_* not found` で実行不能になるため、glibc は 25.11 のまま alsa symbol だけ上げる。
+2. **PipeWire に sink がある状態**。sink は wireplumber が `/dev/snd/*` を開けて初めて生成される。
+   `/dev/snd/*` は `root:audio` なので、アクセスには次のいずれかが要る:
+   - **active な seat セッション**（VT/物理ログイン）。logind が動的 device ACL を付与する（**揮発的**:
+     セッションが idle/非アクティブになると剥がれ sink が消える）。
+   - **`audio` グループ**に user を追加（永続）。**graphical セッション無しの純 SSH / headless 検証**は
+     こちらが要る（`users.users.<user>.extraGroups = [ "audio" ];` → rebuild → relogin/reboot）。
+3. **確認コマンド**: `wpctl status`（Audio Sink が出ているか）、`ldd zig-out/bin/example_15 | grep asound`
+   と `LD_DEBUG=libs`（実行時にロードされる libasound が host plugin 要求版以上か）。
+4. backend 実装（`src/audio_linux.zig` の hw_params 折衝）は**変更不要**。当初 pipewire 1.6.5 で
+   `snd_pcm_hw_params` が失敗するのを hw_params の問題と疑ったが、実機調査で真因は sink 不在（ENOENT）と判明。
+   sink さえあれば現行 `period`/`buffer` の組合せがそのまま通る。
+
+> 検証機 jackjack は NixOS（version 表示は 26.11 だが実体は **nixos-unstable**。`nixos-26.11` ブランチは未存在）。
+> jackjack で Apple T2 は `apple-t2x4.conf` プロファイルで Speakers/Headphones sink を生成する。
+
 ## よく使うコマンド
 
 ```bash
