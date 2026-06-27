@@ -96,6 +96,14 @@ zig build run
 build helper（`build_helpers/platform.zig` 等）を独立ビルドからも参照可能にしている。
 clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../build_helpers build_helpers` で再作成する。
 
+> **Windows 制約（既知・未対応）**: Windows の git は既定（`core.symlinks=false` / 開発者モード OFF）では
+> シンボリックリンクを実体化せず、リンク先パスを書いた**テキストファイル**として展開する。このため
+> `examples/*/build_helpers`・`apps/editor/build_helpers` は Windows で壊れ、**sample 単体ビルド
+> （`cd examples/<NAME> && zig build`）は Windows では失敗する**。トップ階層からの `zig build`
+> （リポジトリ root）は build.zig が実パスを参照し symlink を経由しないため、Windows でも全 sample が動く。
+> Windows で sample 単体ビルドが必要なら、開発者モード ON + `core.symlinks=true` で再 checkout して
+> 本物の symlink を復元するか、build_helpers の symlink 依存を build.zig 側で外す改修が要る（現状は未対応）。
+
 ## 開発フェーズの状態
 
 - ✅ **フェーズ1（プリミティブAPI）**: 完成
