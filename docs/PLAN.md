@@ -29,9 +29,10 @@ bool platform_get_event(PlatformWindow* window, PlatformEvent* event);
 uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* width, int* height);
 void platform_unlock_framebuffer(PlatformWindow* window);
 
-// 画面更新（vsync制御可能）
-void platform_present(PlatformWindow* window);  // vsync待ち
-void platform_present_immediate(PlatformWindow* window);  // vsync待ちなし
+// 画面更新（present = 非ブロック submit / frame 確定点。vsync 待ち関数ではない）
+// frame pacing は frame availability（lockFramebuffer 成功）と将来の beginFrame/waitFrame で扱う。
+// present / frame pacing 契約の正は docs/adr/002（改訂）+ docs/adr/005（TASK-34）。
+void platform_present(PlatformWindow* window);
 
 // コールバック登録（オプション）
 void platform_set_event_callback(PlatformWindow* window, EventCallback callback, void* userdata);
@@ -449,19 +450,19 @@ while (platform_poll_events(window)) {
 
 これらの項目は、実際の使用例やレンダリング方式が確定するまで決定を保留しています。
 
-#### 1. **vsync同期の設計決定** ✅
-- **決定内容**: `platform_present()`は即座にリターン（ブロッキングしない）
+#### 1. **vsync同期の設計決定** ✅（TASK-34 で整理）
+- **決定内容**: `platform_present()`は非ブロックの submit / frame 確定点（即座にリターン）
 - **理由**:
   - クロスプラットフォームでの実装の容易さ
   - ユーザーが柔軟にフレームレート制御できる
   - シングルスレッド設計との整合性
-- **ティアリング対策**:
-  - レンダリングシステム（WindowServer/GPU）が内部的にVBLANKでスワップ
-  - 書き込みバッファと表示バッファの分離により安全性を保証
+- **ティアリング対策**（backend の support tier に依る）:
+  - 1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で display refresh に同期し tearing 回避を保証対象とする
+  - best-effort backend（CALayer objc/swift / X11 / GDI）は厳密な vsync / tearing 回避を保証しない
 - **ゲームループのレート制御**:
   - 呼び出し側の責任（platform_get_time()とsleep()を使用）
-  - 将来的に`FrameRateLimiter`ヘルパーを提供予定
-  - さらに将来的に`platform_present_sync()`の追加も検討可能
+  - ゲーム向け pacing 本体は将来の`beginFrame(wait)`/`waitFrame(timeout)`で扱う（実装は follow-up）
+- **契約の正**: present / frame availability / buffer ownership / support tier は `docs/adr/002`（改訂）と `docs/adr/005` を参照（TASK-34）
 
 #### 2. **描画タイミングの制御**
 - **理由**: 用途が確定していない（ゲーム vs ツール）

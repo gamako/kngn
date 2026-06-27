@@ -77,6 +77,10 @@ double platform_get_time(void);
 // フレームバッファへのアクセスを開始
 // out_width, out_height: フレームバッファのサイズが返される
 // 戻り値: ピクセルバッファへのポインタ（canonical BGRA, u32 0xAARRGGBB, 32bit）
+//   - NULL は「今は描画可能な frame slot が無い」retry 可能状態を表しうる（frame slot unavailable）。
+//     caller はそのフレームの描画を skip し、pollEvents 等を回して次の機会を待てる
+//     （macOS backend は現状 NULL を返さないが、Wayland 等の 1級 backend は frame callback / busy buffer 律速で NULL を返す）。
+//   - device lost / window 破棄などの fatal は NULL とは別経路で扱う方針（詳細は docs/adr/005）。
 // 注意: platform_unlock_framebuffer()を呼ぶまでバッファを保持
 uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int* out_height);
 
@@ -84,17 +88,21 @@ uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int*
 // platform_lock_framebuffer()とペアで使用
 void platform_unlock_framebuffer(PlatformWindow* window);
 
-// 画面を更新
-// platform_lock_framebuffer()で書き込んだ内容を画面に表示
+// 画面を更新（present = 直近 lock したフレームを表示キューへ submit する）
+// platform_lock_framebuffer()で書き込んだ内容を表示キューへ送る
 //
 // 動作:
-// - この関数は即座にリターンする（ブロッキングしない）
-// - レンダリングシステム（WindowServer/GPU）が内部的に次のVBLANKで画面をスワップする
-// - 書き込みバッファと表示バッファを分離しているため、いつ呼び出してもティアリングは発生しない
+// - この関数は非ブロックの submit であり、即座にリターンする（display refresh までは待たない）
+// - frame 確定点として扱う（TASK-32 harness はこの時点で frame を確定する）
+// - present 後の pixels は backend / WindowServer / GPU 所有となり、caller は次の lock まで触らない
+//
+// frame pacing / tearing（backend の support tier に依る・TASK-34）:
+// - 1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で display refresh に同期し tearing 回避を保証対象とする
+// - best-effort backend（macOS CALayer objc/swift / X11 / GDI）は厳密な vsync / tearing 回避を保証しない
 //
 // 注意:
-// - ゲームループのレート制御（何回呼ぶか）は呼び出し側の責任
-// - フレームレート制限が必要な場合、platform_get_time()とsleep()を使用すること
+// - ゲームループのレート制御は呼び出し側の責任（platform_get_time()とsleep()、または将来の beginFrame/waitFrame）
+// - present / lockFramebuffer / frame pacing 契約の正は docs/adr/002（改訂）と docs/adr/005
 void platform_present(PlatformWindow* window);
 
 // ========================================

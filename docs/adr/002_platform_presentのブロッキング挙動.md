@@ -1,6 +1,6 @@
 # ADR-002: platform_present()のブロッキング挙動の設計決定
 
-**Status:** 承認・実装完了
+**Status:** 承認・実装完了（2026-06-27 TASK-34 で改訂 — present の非ブロック方針は維持。frame pacing / buffer ownership / support tier の詳細契約は [ADR-005](005_platform_support_tierとframe_pacing契約.md) に委譲）
 **Date:** 2025-10-25
 **Category:** レンダリング・フレームレート制御
 
@@ -10,6 +10,16 @@ video-protoプロジェクトの`platform_present()` APIのブロッキング挙
 
 **決定内容：**
 `platform_present()`は即座にリターンする（ブロッキングしない）設計を正式採用する。レンダリングシステム（WindowServer/GPU）が内部的にVBLANKで画面をスワップし、ゲームループのレート制御は呼び出し側の責任とする。
+
+## TASK-34 改訂サマリ（2026-06-27）
+
+本 ADR の中核決定「`present()` は非ブロック（即リターン）」は **維持**する。ただしゲーム用途を見据えた frame pacing / vsync / buffer ownership の整理（TASK-34）に伴い、次の点を更新する。詳細契約と backend の support tier（1級 / best-effort）は **[ADR-005](005_platform_support_tierとframe_pacing契約.md)** に集約し、本 ADR はその上位前提（present = 非ブロック submit）として残す。
+
+- **present は「submit / frame 確定点」**として位置づける。display refresh までは待たない点は不変。TASK-32 harness もこの時点を frame 確定点（`frame_index` 進行・snapshot/digest 基準）として扱う。
+- **frame pacing は present の待機では表現しない**。描画可能性は `lockFramebuffer()` の成功（frame availability）で表し、ゲーム向けの待機は将来の `beginFrame(wait)` / `waitFrame(timeout)` で扱う（旧「将来拡張」の `platform_present_sync()` 案はこれに差し替え）。
+- **`lockFramebuffer() == null`** は「今は描画可能な frame slot が無い」retry 可能状態を表す（Wayland の frame callback / busy buffer 律速が実例）。device lost / window 破棄等の fatal は null と別経路で扱う方針（[ADR-005](005_platform_support_tierとframe_pacing契約.md)）。
+- **present 後の framebuffer pixels は backend 所有**となり、caller は次の lock まで触らない。
+- 旧記述の「いつ呼び出してもティアリングは発生しない」という無条件の断定は、**backend の support tier 依存**に弱める。1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で tearing 回避を保証対象とし、best-effort backend（CALayer objc/swift / X11 / GDI）は保証しない。
 
 ## 背景
 
@@ -147,7 +157,12 @@ video-protoはシングルスレッド設計を前提としているため、ノ
 
 ### ティアリング対策
 
-**結論**: ティアリングは発生しない
+> **TASK-34 改訂**: 当初は macOS backend（CALayer / Metal）のみを前提に「ティアリングは発生しない」と断定していたが、
+> その後 X11 / GDI（ノーガード blit・vblank 待ちなし）を追加したため、tearing 回避の可否は **backend の support tier に依る**。
+> 1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で tearing 回避を保証対象とし、best-effort backend
+> （CALayer objc/swift / X11 / GDI）は厳密な tearing 回避を保証しない。詳細は [ADR-005](005_platform_support_tierとframe_pacing契約.md)。
+
+**結論（当初・macOS 前提）**: 以下の macOS backend では VBLANK スワップによりティアリングは発生しない。
 
 **理由**:
 - レンダリングシステム（WindowServer/GPU）が内部的に次のVBLANKで画面をスワップ
@@ -161,6 +176,9 @@ video-protoはシングルスレッド設計を前提としているため、ノ
 | **macOS CALayer** | WindowServerがVBLANKでスワップ | ❌ なし |
 | **macOS Metal** | GPUドライバがVBLANKでスワップ | ❌ なし |
 | **DirectX (参考)** | FIFOモード（デフォルト） | ❌ なし |
+| **Linux X11** | XPutImage/XShmPutImage 即時 blit（vblank 待ちなし） | ⚠️ あり得る（best-effort。TASK-28.8 で低減予定） |
+| **Windows GDI** | StretchDIBits 即時 blit（vblank 待ちなし） | ⚠️ あり得る（best-effort） |
+| **Linux Wayland** | frame callback 律速（compositor が合成） | ❌ なし（compositor 依存） |
 
 ### ゲームループのレート制御
 
@@ -202,9 +220,13 @@ while (running) {
 
 ノンブロッキング設計を基本としつつ、将来的に以下の拡張が可能：
 
-1. **`platform_present_sync()`の追加**
+> **TASK-34 改訂**: 下記 1.（`platform_present_sync()` の追加）は **採用しない**。ブロッキング待機は present の別関数ではなく、
+> `beginFrame(wait)` / `waitFrame(timeout)`（[ADR-005](005_platform_support_tierとframe_pacing契約.md)）で扱う方針に差し替えた。
+> 2.（vsync 制御フラグ）は ADR-005 の `PresentMode`（fifo / immediate）として整理する。
+
+1. **`platform_present_sync()`の追加**（※ TASK-34 で不採用。`beginFrame`/`waitFrame` に差し替え）
    ```c
-   // ブロッキング版（将来追加するなら）
+   // ブロッキング版（旧案・未採用）
    void platform_present_sync(PlatformWindow* window);
    ```
 
@@ -230,7 +252,12 @@ while (running) {
 
 ### platform.h のAPI仕様
 
+> **TASK-34 改訂**: 下記は **当初（2025-10-25・macOS 前提）の platform.h コメント**である。現行の `platform/platform.h` は
+> tier-aware に更新済みで、「いつ呼び出してもティアリングは発生しない」という無条件の断定は外し、tearing 回避の可否は
+> backend の support tier に依る（best-effort backend では非保証）と記載している。詳細は [ADR-005](005_platform_support_tierとframe_pacing契約.md)。
+
 ```c
+// 当初の記載（2025-10-25・macOS 前提。現行コメントは tier-aware に更新済み）
 // 画面を更新
 // platform_lock_framebuffer()で書き込んだ内容を画面に表示
 //
@@ -349,6 +376,7 @@ func presentManual(view: MTKView) {
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2025-10-25 | 初版記録、ドキュメント修正完了 |
+| 1.1 | 2026-06-27 | TASK-34: present を submit / frame 確定点として整理。frame pacing / buffer ownership / support tier の詳細契約を [ADR-005](005_platform_support_tierとframe_pacing契約.md) に委譲。`lockFramebuffer()==null`（frame slot unavailable）と fatal の区別、tearing 無条件断定の tier 依存化を追記。 |
 
 ### 修正されたファイル
 

@@ -246,9 +246,10 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 - `platform.ModifierFlags` - `packed struct(u32) { shift, ctrl, alt, cmd, _reserved }`
 
 ### 手動描画
-- `window.lockFramebuffer()` - フレームバッファアクセス開始 (`?Framebuffer`)
+- `window.lockFramebuffer()` - 描画可能な frame slot があれば取得、なければ `null`（`?Framebuffer`）。`null` は retry 可能な frame slot unavailable で fatal ではない（Wayland の frame callback / busy buffer 律速が実例。macOS/X11/GDI は現状常に non-null）
 - `fb.unlock()` - フレームバッファアクセス終了
-- `window.present()` - 画面更新（vsync待ちなし）
+- `window.present()` - 描画済みフレームを表示キューへ submit（frame 確定点。vsync 待ち関数ではない）。present 後の pixels は backend 所有で caller は触らない
+- frame pacing / vsync / buffer ownership 契約と backend の support tier（**1級** = Metal / D3D11-DXGI / Wayland、**best-effort** = CALayer objc/swift / X11 / GDI）は `docs/adr/002`（改訂）と `docs/adr/005` を参照
 
 ### ユーティリティ
 - `platform.getTime()` - 高精度モノトニック時刻取得

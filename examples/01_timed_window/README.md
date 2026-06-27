@@ -107,5 +107,5 @@ if (elapsed >= duration) {
 
 ## 注意事項
 
-- このサンプルでは `std.time.sleep()` を使用してフレームレートを制御していますが、本格的なアプリケーションではvsync同期やより高度なタイミング制御が推奨されます。
-- `window.present()` は現在の実装ではvsync同期を行わないため、画面のティアリング（ずれ）が発生する可能性があります。
+- このサンプルでは `std.time.sleep()` を使用してフレームレートを制御していますが、本格的なアプリケーションでは 1級 backend の frame pacing（fifo）や将来の `beginFrame`/`waitFrame` によるタイミング制御が推奨されます（`present` は vsync 待ち関数ではない点に注意）。
+- `window.present()` は非ブロックの submit（frame 確定点）です。1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で tearing 回避を保証対象としますが、best-effort backend（CALayer objc/swift / X11 / GDI）では tearing や jitter が発生し得ます。詳細は `docs/adr/005` を参照。
