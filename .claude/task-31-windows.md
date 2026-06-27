@@ -211,4 +211,19 @@ Win32+GDI+入力 + build/examples 修正のみに絞った（`zig build -Dinstal
 - main(虹) を起動しスクショで描画回帰なしを確認。`examples/15_audio_tone/build.zig` は ast-check 緑（standalone 実行は
   build_helpers symlink が Windows で壊れるため不可。Mac 再レビューで確認）。
 - **macOS/Linux 退行確認は Mac 側で実施**（cross-compile は SDK/X11 lib が要るため Windows host では不可）。
+
+### codex 再レビュー round2 対応（`.claude/task-31-review-round2.md`）
+前回指摘（#1-#5,#7-#9）は Mac 再レビューで**全解消を確認**。残り 1 件（major）を修正:
+
+- **example_15 standalone build が Windows target で compileError**（`cd examples/15_audio_tone && zig build
+  -Dtarget=x86_64-windows`）。原因は `buildStandalone` が `implementedBackends` を無条件に回し、audio 必須 example でも
+  Windows backend exe を生成 → audio facade の compileError に落ちる。top-level の `audio_supported` gate が
+  standalone surface に無かった。
+- 修正: audio 対応判定を共有 helper `platform.audioSupported(os)`（macOS/Linux のみ）に集約し、top-level build.zig と
+  `buildStandalone` の両方で使用。`buildStandalone` は `spec.link_audio and !audioSupported(target_os)` のとき
+  exe/step を一切作らず早期 return（`-Dtarget`/`-Dplatform` は受理済みなので `zig build` は no-op で skip）。
+  → Windows target は skip、macOS/Linux standalone は従来どおりビルド。
+- cosmetic: `src/audio.zig` 等の「将来 WASAPI」コメントを TASK-31.1（windows-audio）参照に整理。
+- 検証: Windows host で `zig build -Dinstall-all` / `zig build test` 緑、`build_helpers/platform.zig` ast-check 緑
+  （standalone の Windows skip 実走は build_helpers symlink が Windows で壊れるため Mac 再レビューで確認）。
 <!-- SECTION:NOTES:END -->
