@@ -5,8 +5,8 @@
 //   2. FontFace（不変・借用 data）→ OutlineFont（px サイズ束縛・遅延キャッシュ）
 //   3. 共通 Font インターフェースの drawTo で各サイズのテキストを描画
 //
-// 注: フォント資産の vendoring（OFL）は follow-up。ここでは macOS の system .ttf を
-//     runtime 読込する（再配布でないのでライセンス問題なし・macOS 依存）。
+// 注: フォント資産の vendoring（OFL）は follow-up。ここでは OS の system .ttf を
+//     runtime 読込する（再配布でないのでライセンス問題なし。macOS/Windows/Linux の候補を順に試す）。
 
 const std = @import("std");
 const platform = @import("platform");
@@ -23,7 +23,14 @@ const font_paths = [_][]const u8{
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
     "/Library/Fonts/Arial.ttf",
-    // Linux（Ubuntu / nix の system フォント）。macOS では FileNotFound で skip される。
+    // Windows（system フォント。forward slash でも Win32 file API は解決する）。
+    "C:/Windows/Fonts/YuGothM.ttc", // 游ゴシック Medium（日本語, glyf TrueType）
+    "C:/Windows/Fonts/meiryo.ttc", // メイリオ（日本語, glyf TrueType）
+    "C:/Windows/Fonts/msgothic.ttc", // MS ゴシック（日本語）
+    "C:/Windows/Fonts/arial.ttf", // ASCII フォールバック
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/consola.ttf",
+    // Linux（Ubuntu / nix の system フォント）。他 OS では FileNotFound で skip される。
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // 日本語（CJK, CID-keyed CFF）
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // ASCII フォールバック
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -104,7 +111,6 @@ pub fn main(init: std.process.Init) !void {
             window.present();
         }
 
-        var req = std.c.timespec{ .sec = 0, .nsec = 16_666_666 };
-        _ = std.c.nanosleep(&req, null);
+        platform.sleep(16_666_666);
     }
 }
