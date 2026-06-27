@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const platform_option = b.option(
         platform.PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland)",
+        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows)",
     ) orelse platform.defaultBackend(target_os);
     platform.assertBackendForOs(platform_option, target_os);
 

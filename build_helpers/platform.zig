@@ -255,7 +255,20 @@ pub const StandaloneSpec = struct {
     keyboard_source: ?std.Build.LazyPath = null,
     /// OS/backend 非依存の追加 import（sprite / png-decoder / gui / core 等）。
     extra: []const Import = &.{},
+    /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
+    /// macOS=AudioToolbox / Linux=alsa。Windows は audio backend 未対応（facade が compileError）なので何もしない。
+    link_audio: bool = false,
 };
+
+/// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
+/// （top build.zig の linkAudioBackend と同方針。Windows は audio 未対応のため no-op = facade の compileError に委ねる）。
+fn linkAudioForStandalone(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
+    switch (target_os) {
+        .macos => exe.root_module.linkFramework("AudioToolbox", .{}),
+        .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
+        else => {}, // Windows 等: audio backend 未対応。リンクせず compile 時の facade compileError に任せる
+    }
+}
 
 /// 対象 OS の実装済み backend ごとに exe を 1 つ作り、install / `run-<backend>` /
 /// `run`(default) を生成する。SDK 解決は macOS backend のときだけ行う（Linux は xcrun 不要）。
@@ -269,7 +282,7 @@ pub fn buildStandalone(
     const platform_option = b.option(
         PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland)",
+        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows)",
     ) orelse defaultBackend(target_os);
     assertBackendForOs(platform_option, target_os);
 
@@ -310,6 +323,7 @@ pub fn buildStandalone(
         exe.root_module.addOptions("build_options", opts);
 
         setupExecutableForPlatform(b, exe, be, optimize, spec.platform_root, sdk_paths);
+        if (spec.link_audio) linkAudioForStandalone(exe, target_os);
 
         if (be == platform_option) default_exe = exe;
         addStandaloneRunStep(b, b.fmt("run-{s}", .{backendName(be)}), b.fmt("Run the {s} version", .{backendName(be)}), exe);
