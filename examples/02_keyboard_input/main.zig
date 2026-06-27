@@ -97,9 +97,8 @@ pub fn main() !void {
     var brightness: f32 = 0.8;
     var current_color: u32 = hsvToRGB(hue, saturation, brightness);
 
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    const seed = @as(u64, @intCast(ts.sec)) *% 1_000_000_000 +% @as(u64, @intCast(ts.nsec));
+    // PRNG シードはモノトニック時刻から（OS 非依存。platform.getTime は秒単位 f64）。
+    const seed = @as(u64, @intFromFloat(platform.getTime() * 1_000_000_000.0));
     var prng = std.Random.DefaultPrng.init(seed);
 
     main_loop: while (window.pollEvents()) {
@@ -178,8 +177,7 @@ pub fn main() !void {
             window.present();
         }
 
-        var req = std.c.timespec{ .sec = 0, .nsec = 16_666_666 };
-        _ = std.c.nanosleep(&req, null);
+        platform.sleep(16_666_666);
     }
 
     std.debug.print("Application terminated.\n", .{});

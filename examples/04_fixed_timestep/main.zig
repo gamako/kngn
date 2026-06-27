@@ -176,10 +176,7 @@ pub fn main() !void {
         const sleep_time = target_frame_time - process_time;
         if (sleep_time > 0) {
             const sleep_ns = @as(u64, @intFromFloat(sleep_time * 1_000_000_000.0));
-            const sec = @as(isize, @intCast(sleep_ns / 1_000_000_000));
-            const nsec = @as(isize, @intCast(sleep_ns % 1_000_000_000));
-            var req = std.c.timespec{ .sec = sec, .nsec = nsec };
-            _ = std.c.nanosleep(&req, null);
+            platform.sleep(sleep_ns);
         }
     }
 
