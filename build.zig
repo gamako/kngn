@@ -53,14 +53,14 @@ pub fn build(b: *std.Build) void {
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
 
-    // audio (L1 出力) backend は macOS(AudioToolbox) / Linux(ALSA) のみ。Windows(WASAPI) は TASK-31.1。
-    // synth アプリ / example_15(audio) を Windows では生成しない（判定は standalone と共有 helper に集約）。
+    // audio (L1 出力) backend: macOS(AudioToolbox) / Linux(ALSA) / Windows(WASAPI)。
+    // synth アプリ / example_15(audio) の生成可否（判定は standalone と共有 helper に集約）。
     const audio_supported = platform.audioSupported(target_os);
 
     // ========================================
     // main / pixie / synth / examples を backend ごとに生成
     // （platform / keyboard は backend ごとに module graph を分ける = build_options.platform_backend を付与）
-    // audio を使う synth / example_15 は macOS/Linux（audio backend が OS 分岐）。platform native lib は macOS のみ。
+    // audio を使う synth / example_15 は macOS/Linux/Windows（audio backend が OS 分岐）。platform native lib は macOS のみ。
     // ========================================
     var default_main: ?*std.Build.Step.Compile = null;
     var default_pixie: ?*std.Build.Step.Compile = null;
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
         if (install_all) b.installArtifact(pixie_exe);
         addRunStep(b, b.fmt("run-pixie-{s}", .{platform.backendName(be)}), b.fmt("Run Pixie editor ({s})", .{platform.backendName(be)}), pixie_exe, b.args);
 
-        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux のみ -----
+        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux/Windows -----
         if (audio_supported) {
             const synth_exe = addSynthExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "synth", be, default_be), &example_modules, &pm);
             if (is_default) default_synth = synth_exe;
@@ -122,12 +122,13 @@ pub fn build(b: *std.Build) void {
                 .needs_font = example.needs_font,
                 .needs_audio = example.needs_audio,
             };
-            // audio example は macOS/Linux のみ（Windows の WASAPI は別タスク。それ以外の example は全 OS）。
+            // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
                 const ex_exe = addExampleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, example.name, be, default_be), example.path, &example_modules, &pm, needs);
-                // example_06 はベンチ結果を stdout に出すツールなので Windows でも console subsystem を保つ
-                // （setupExecutableForPlatform が .windows で付与する GUI subsystem を上書き）。
-                if (target_os == .windows and comptime std.mem.eql(u8, example.name, "example_06")) ex_exe.subsystem = .Console;
+                // window を持たず stdout に出力するツール（example_06 ベンチ / example_15 音声トーン）は
+                // Windows でも console subsystem を保つ（setupExecutableForPlatform の GUI subsystem を上書き）。
+                if (target_os == .windows and comptime (std.mem.eql(u8, example.name, "example_06") or
+                    std.mem.eql(u8, example.name, "example_15"))) ex_exe.subsystem = .Console;
                 // examples は install-all とは独立に常に全 backend を install する
                 // （platform 層 / example のビルド回帰を毎 `zig build` で検出する従来挙動を踏襲）。
                 b.installArtifact(ex_exe);
@@ -155,7 +156,7 @@ pub fn build(b: *std.Build) void {
     addBuildStep(b, "build-main", "Build the app only (uses -Dplatform option)", default_main.?);
     addBuildStep(b, "build-pixie", "Build Pixie editor only (uses -Dplatform option)", default_pixie.?);
 
-    // synth は audio 対応 OS（macOS/Linux）のみ。Windows では生成されないため step も張らない。
+    // synth は audio 対応 OS（macOS/Linux/Windows）のみ生成。非対応 OS では default_synth=null で step を張らない。
     if (default_synth) |ds| {
         addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", ds, b.args);
         addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
@@ -643,7 +644,7 @@ const ExampleModules = struct {
 
         // audio (L1 オーディオ出力): platform バックエンド非依存。@cImport しないので
         // 通常の createModule でよい（audio system lib は exe 側で OS 別にリンク:
-        // macOS=AudioToolbox / Linux=asound。linkAudioBackend 参照）。
+        // macOS=AudioToolbox / Linux=asound / Windows=ole32(WASAPI)。linkAudioBackend 参照）。
         const audio_mod = b.createModule(.{
             .root_source_file = b.path("src/audio.zig"),
         });
@@ -779,7 +780,7 @@ fn addPixieExe(
 }
 
 // ============================================================
-// ヘルパー: synth app exe を 1 backend 分セットアップ（macOS/Linux。audio system lib を link）
+// ヘルパー: synth app exe を 1 backend 分セットアップ（macOS/Linux/Windows。audio system lib を link）
 // ============================================================
 fn addSynthExe(
     b: *std.Build,
@@ -805,7 +806,7 @@ fn addSynthExe(
     exe.root_module.addImport("synth", common.synth);
     exe.root_module.addImport("dsp", common.dsp); // mono downmix + FFT(スペクトログラム)
     exe.root_module.addImport("gui", common.gui); // スライダ / ボタン（演奏 UI）
-    linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound）
+    linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
@@ -824,7 +825,10 @@ fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) 
     switch (target_os) {
         .macos => exe.root_module.linkFramework("AudioToolbox", .{}),
         .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
-        else => @panic("audio backend is only available on macOS / Linux"),
+        // WASAPI は COM 経由。CoCreateInstance/CoInitializeEx/CoTaskMemFree が ole32 にある
+        // （IAudioClient 等は COM で取得するので直接リンク不要。Event API は kernel32=自動リンク）。
+        .windows => exe.root_module.linkSystemLibrary("ole32", .{}),
+        else => @panic("audio backend is only available on macOS / Linux / Windows"),
     }
 }
 

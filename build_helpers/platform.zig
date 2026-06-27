@@ -41,11 +41,11 @@ pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     };
 }
 
-/// L1 オーディオ出力 backend が当該 OS で実装済みか（macOS=AudioToolbox / Linux=ALSA）。
-/// Windows(WASAPI) は TASK-31.1（別ブランチ windows-audio）。top-level build.zig と standalone の両方で
-/// audio 必須ターゲット（synth / example_15）の gate に使う（判定を 1 箇所に集約する）。
+/// L1 オーディオ出力 backend が当該 OS で実装済みか（macOS=AudioToolbox / Linux=ALSA / Windows=WASAPI）。
+/// top-level build.zig と standalone の両方で audio 必須ターゲット（synth / example_15）の gate に使う
+/// （判定を 1 箇所に集約する）。
 pub fn audioSupported(os: std.Target.Os.Tag) bool {
-    return os == .macos or os == .linux;
+    return os == .macos or os == .linux or os == .windows;
 }
 
 /// `-Dplatform` で指定された backend が対象 OS に対して妥当か検証する。
@@ -263,17 +263,18 @@ pub const StandaloneSpec = struct {
     /// OS/backend 非依存の追加 import（sprite / png-decoder / gui / core 等）。
     extra: []const Import = &.{},
     /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
-    /// macOS=AudioToolbox / Linux=alsa。Windows は audio backend 未対応（facade が compileError）なので何もしない。
+    /// macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI/COM)。
     link_audio: bool = false,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
-/// （top build.zig の linkAudioBackend と同方針。Windows は audio 未対応のため no-op = facade の compileError に委ねる）。
+/// （top build.zig の linkAudioBackend と同方針）。
 fn linkAudioForStandalone(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {
         .macos => exe.root_module.linkFramework("AudioToolbox", .{}),
         .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
-        else => {}, // Windows 等: audio backend 未対応。リンクせず compile 時の facade compileError に任せる
+        .windows => exe.root_module.linkSystemLibrary("ole32", .{}), // WASAPI は COM 経由（CoCreateInstance 等が ole32）
+        else => {}, // それ以外: audio backend 未対応。リンクせず compile 時の facade compileError に任せる
     }
 }
 
@@ -294,10 +295,11 @@ pub fn buildStandalone(
     assertBackendForOs(platform_option, target_os);
 
     // audio 必須の standalone（example_15 等）は audio 非対応 OS では exe を生成しない
-    // （top-level build.zig の audio_supported gate と同じ。無いと Windows target で audio facade の
+    // （top-level build.zig の audio_supported gate と同じ。無いと未対応 OS で audio facade の
     // compileError に落ちる）。-Dtarget/-Dplatform は上で受理済みなので、ここで何も step を作らず早期 return。
+    // 現状 macOS/Linux/Windows は全て audio 対応なので、この skip は将来の未対応 OS 向け。
     if (spec.link_audio and !audioSupported(target_os)) {
-        std.log.info("standalone '{s}': audio 非対応 OS ({s}) のためスキップ（WASAPI は TASK-31.1 / windows-audio）", .{ spec.base_name, @tagName(target_os) });
+        std.log.info("standalone '{s}': audio 非対応 OS ({s}) のためスキップ", .{ spec.base_name, @tagName(target_os) });
         return;
     }
 

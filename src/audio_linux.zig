@@ -3,7 +3,7 @@
 //! ALSA (libasound) を C ABI で叩き、自前の再生スレッドから render callback を呼んで
 //! サンプルを供給する最小の出力デバイスを提供する。AudioToolbox backend と同様に
 //! `@cImport` は使わず、必要な ALSA シンボルだけを `extern "c"` 宣言する
-//! （audio 層の ABI 戦略を macOS/Linux/将来 Windows で extern fn に統一するため）。
+//! （audio 層の ABI 戦略を macOS/Linux/Windows で extern fn に統一するため）。
 //!
 //! スレッドモデル: CoreAudio は OS が RT スレッドで callback を pull するが、ALSA は push。
 //! 本 backend は `start()` で再生スレッド (`std.Thread`) を spawn し、`snd_pcm_writei` ループの

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const audio = @import("audio");
+const platform = @import("platform"); // platform.sleep（POSIX/Windows を comptime 分岐）
 
 const ToneState = struct {
     phase: f32 = 0.0,
@@ -59,8 +60,7 @@ pub fn main() !void {
 
     try device.start();
     std.debug.print("playing 440Hz sine for 3 seconds...\n", .{});
-    var req = std.c.timespec{ .sec = 3, .nsec = 0 };
-    _ = std.c.nanosleep(&req, null);
+    platform.sleep(3_000_000_000); // 3 秒
     device.stop();
     std.debug.print("done.\n", .{});
 }

@@ -378,8 +378,7 @@ pub fn main() !void {
 
         window.present();
 
-        var req = std.c.timespec{ .sec = 0, .nsec = 16_000_000 };
-        _ = std.c.nanosleep(&req, null);
+        platform.sleep(16_000_000); // ~16ms（約 60fps）
     }
 }
 
