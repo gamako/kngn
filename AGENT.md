@@ -318,7 +318,8 @@ AI がアプリの出力を手軽に確認するための仕組み。`src/platfo
 
 - **P1（TASK-32.1, 実装済み）**: file replay + 組み込み `fb` probe（framebuffer→PNG / 1行 digest）+ 仮想クロック。
 - **P2（TASK-32.2, 実装済み）**: live 制御（TCP loopback + driver CLI `scripts/drive`）/ 組み込み `audio`・`stats` probe / record→replay。
-- **P3 以降（未実装）**: custom probe レジストリの app 適用 / offscreen・Metal。
+- **P3（TASK-32.3, 実装済み）**: custom probe レジストリ。app が `platform.registerProbe(...)` で probe を opt-in 登録（pixie=`canvas`/`undo`/`tool`, synth=`voices`/`patch`）。詳細は下記「custom probe の足し方」。
+- **P4 以降（未実装）**: offscreen / 完全 display-less / Metal。
 
 ### コマンド言語（file replay と live で共通）
 
@@ -339,8 +340,9 @@ digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_co
 quit                       # 終了（EOF でも終了）
 ```
 
-- **probe**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `src/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
+- **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `src/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
   `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
+- **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(raw layer→PNG / `WxH layers=N crc=.. nonzero=..`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
 
 ### 使い方（replay = file トランスポート）
@@ -383,6 +385,28 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
 | `VP_HARNESS_OUT=<dir>` | snapshot 省略 path / port file の既定ディレクトリ |
 
 > SCRIPT と LIVE/PORT の同時指定はエラーで無効化（1プロセス1トランスポート）。env 未設定なら全フック即パススルー。
+
+### custom probe の足し方（TASK-32.3）
+
+app が内部状態を opt-in で probe として公開する。**framework（`src/harness.zig`）には probe 固有のコードを一切足さない**（中身非パースの不変条件）。手順:
+
+1. app（`@import("platform")` 済み）で probe の callback を書く:
+   - `digest: fn(ctx: *anyopaque, buf: []u8) []const u8` — 1行テキストを `buf`（最大 1024B）へ書いて返す（改行を含めない）。
+   - `snapshot: fn(ctx: *anyopaque, allocator) anyerror![]u8` — raw バイト列を `allocator` で確保して返す（harness が file へ書き、**同じ allocator で free**）。null 可。
+   - `ctx` は app 状態へのポインタ（例 `*App`）。callback 内で `@ptrCast(@alignCast(ctx))` で戻す。
+2. `platform.init()` 後・main loop 前に登録する:
+   ```zig
+   platform.registerProbe(.{ .name = "canvas", .ctx = &app, .ext = "png",
+       .snapshot = canvasSnapshot, .digest = canvasDigest });
+   ```
+3. これだけで `snapshot canvas [path]` / `digest canvas` が replay・live 両方で使える。
+
+規約・制約:
+- **snapshot=raw bytes / digest=1行 / 画像=PNG・構造化=JSON|text**（組み込みと同一規約）。
+- `fb` / `audio` / `stats` は予約名（登録拒否）。同名 custom は上書き。registry 上限は 16。
+- `registerProbe` は **harness 無効時（env 未設定）は no-op**なので、通常実行に影響しない（常に呼んでよい）。
+- audio RT スレッドが触る状態（synth `voices`/`patch` 等）の読み出しは torn し得る best-effort スナップショット。**RT 経路に同期/alloc/lock を足さない**。
+- 実装の手本: pixie の `canvas`/`undo`/`tool`（`apps/editor/apps/pixie/main.zig`）、synth の `voices`/`patch`（`apps/synth/main.zig`）。
 
 - **実行モデル**: 非 step（inject/snapshot/digest）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。

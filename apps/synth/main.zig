@@ -180,6 +180,56 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     };
 }
 
+// ============================================================================
+// ヘッドレス検証 harness の custom probe（TASK-32.3）
+//
+// `platform.registerProbe` で opt-in 登録。framework は中身非解釈で raw+digest をルートするだけ。
+// ctx は *App。voices/patch は audio RT スレッドが更新するため main スレッドからの読み出しは torn し得る
+// best-effort スナップショット（既存 audio probe と同じ debug 方針）。RT 経路には同期/alloc/lock を足さない。
+// ============================================================================
+
+/// VoicePool の占有状態を JSON 1行に整形（active voice の note/stage を列挙）。
+fn formatVoices(app: *App, buf: []u8) []const u8 {
+    var len: usize = 0;
+    len += (std.fmt.bufPrint(buf[len..], "{{\"active\":{d},\"capacity\":{d},\"voices\":[", .{
+        app.synth.pool.activeCount(), MAX_VOICES,
+    }) catch return buf[0..len]).len;
+    var first = true;
+    for (&app.synth.pool.voices) |*v| {
+        if (!v.active) continue;
+        const sep = if (first) "" else ",";
+        first = false;
+        len += (std.fmt.bufPrint(buf[len..], "{s}{{\"note\":{d},\"stage\":\"{s}\"}}", .{
+            sep, v.note, @tagName(v.stage()),
+        }) catch break).len;
+    }
+    len += (std.fmt.bufPrint(buf[len..], "]}}", .{}) catch return buf[0..len]).len;
+    return buf[0..len];
+}
+
+/// 公開中 patch を JSON 1行に整形。
+fn formatPatch(app: *App, buf: []u8) []const u8 {
+    const p = app.synth.patch_db.current();
+    return std.fmt.bufPrint(buf, "{{\"wave\":\"{s}\",\"filter\":\"{s}\",\"cutoff\":{d:.1},\"res\":{d:.2},\"gain\":{d:.3},\"attack\":{d:.3},\"release\":{d:.3},\"unison\":{d}}}", .{
+        @tagName(p.waveform), @tagName(p.filter_mode), p.cutoff, p.resonance, p.gain, p.attack, p.release, p.unison,
+    }) catch buf[0..0];
+}
+
+fn voicesDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    return formatVoices(@ptrCast(@alignCast(ctx)), buf);
+}
+fn voicesSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    var buf: [1024]u8 = undefined;
+    return allocator.dupe(u8, formatVoices(@ptrCast(@alignCast(ctx)), &buf));
+}
+fn patchDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    return formatPatch(@ptrCast(@alignCast(ctx)), buf);
+}
+fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    var buf: [512]u8 = undefined;
+    return allocator.dupe(u8, formatPatch(@ptrCast(@alignCast(ctx)), &buf));
+}
+
 pub fn main() !void {
     std.debug.print("apps/synth: A..K=C4..C5 / 画面鍵盤クリック / スライダで音色変更 / ESC 終了\n", .{});
 
@@ -234,6 +284,10 @@ pub fn main() !void {
     spec.setSampleRate(@floatFromInt(device.config().sample_rate)); // 対数周波数軸を実 sr で再算出
     try device.start();
     defer device.stop();
+
+    // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。app は heap 確保で寿命安定。
+    platform.registerProbe(.{ .name = "voices", .ctx = app, .ext = "json", .snapshot = voicesSnapshot, .digest = voicesDigest });
+    platform.registerProbe(.{ .name = "patch", .ctx = app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
 
     var pressed = [_]bool{false} ** 128;
     var mouse_note: ?u8 = null; // マウスで押している鍵

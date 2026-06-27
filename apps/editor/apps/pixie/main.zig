@@ -386,6 +386,64 @@ const App = struct {
     }
 };
 
+// ============================================================================
+// ヘッドレス検証 harness の custom probe（TASK-32.3）
+//
+// `platform.registerProbe` で opt-in 登録する。framework は中身を解釈せず、snapshot の raw bytes を
+// file へ書き / digest の1行を sink へ流すだけ。各 probe の意味づけは下の callback に閉じる。
+// ctx は *App。harness 無効時は登録自体が no-op なので通常実行に影響しない。
+// ============================================================================
+
+/// canvas digest: サイズ / layer 数 / raw layer pixels の crc / 非ゼロ画素数（描画変化を検出できる）。
+fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const raw = app.canvas.layerPixels(0);
+    const crc = png.crc32(std.mem.sliceAsBytes(raw));
+    var nonzero: usize = 0;
+    for (raw) |p| {
+        if (p != 0) nonzero += 1;
+    }
+    return std.fmt.bufPrint(buf, "{d}x{d} layers={d} crc={X:0>8} nonzero={d}", .{
+        CANVAS_W, CANVAS_H, app.canvas.layers.items.len, crc, nonzero,
+    }) catch buf[0..0];
+}
+
+/// canvas snapshot: raw layer pixels を PNG 化（表示 composite ではなく raw＝透明保持の不変条件）。
+fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return core.encodePNG(app.canvas.layerPixels(0), CANVAS_W, CANVAS_H, allocator);
+}
+
+/// undo digest/snapshot: undo/redo スタックの深さ（JSON 1行）。undo で depth が減る。
+fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return std.fmt.bufPrint(buf, "{{\"depth\":{d},\"redo\":{d}}}", .{
+        app.undo.undo.items.len, app.undo.redo.items.len,
+    }) catch buf[0..0];
+}
+fn undoSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return std.fmt.allocPrint(allocator, "{{\"depth\":{d},\"redo\":{d}}}", .{
+        app.undo.undo.items.len, app.undo.redo.items.len,
+    });
+}
+
+/// tool digest/snapshot: 現在ツール名 + 描画色 #RRGGBB。
+fn toolDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const c = app.palette.current();
+    const r: u8 = @truncate(c >> 16);
+    const g: u8 = @truncate(c >> 8);
+    const b: u8 = @truncate(c);
+    return std.fmt.bufPrint(buf, "tool={s} color=#{X:0>2}{X:0>2}{X:0>2}", .{
+        app.active_kind.name(), r, g, b,
+    }) catch buf[0..0];
+}
+fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    var buf: [128]u8 = undefined;
+    return allocator.dupe(u8, toolDigest(ctx, &buf));
+}
+
 /// canvas_area rect 内に表示領域（256*ZOOM 四方）を中央配置した canvas rect
 /// （core.Rect の w/h は canvas ピクセル数。screenToCanvas* がこの形を取る）。
 /// 初回フレームは rect キャッシュ未生成なので null（canvas 入力・blit をスキップ）。
@@ -647,6 +705,11 @@ pub fn main(init: std.process.Init) !void {
         app.recorder.deinit(gpa);
         app.canvas.deinit();
     }
+
+    // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
+    platform.registerProbe(.{ .name = "canvas", .ctx = &app, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
+    platform.registerProbe(.{ .name = "undo", .ctx = &app, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
+    platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
 
     main_loop: while (app.running and window.pollEvents()) {
         // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。

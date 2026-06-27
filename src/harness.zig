@@ -104,6 +104,13 @@ var have_frame = false;
 // 直近の EventStats（present で push される）
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
 
+// custom probe registry（app が opt-in 登録。framework は中身を解釈せず raw+digest をルートするだけ）
+// 単一プロセスの debug facility なので固定長 module-level 配列で十分（動的確保なし）。
+const MAX_PROBES = 16;
+const DIGEST_BUF_LEN = 1024; // custom digest callback に渡す共通バッファ長
+var probes: [MAX_PROBES]Probe = undefined;
+var probe_count: usize = 0;
+
 // io（0.16 は std.fs blocking API が無く std.Io 経由のみ）。file 読み書きと TCP の両方に使う。
 var threaded: std.Io.Threaded = undefined;
 var io_val: std.Io = undefined;
@@ -133,6 +140,57 @@ var audio_mono: [ANALYZE_FRAMES]f32 = undefined; // downmix scratch（メイン�
 
 pub fn isEnabled() bool {
     return mode != .disabled;
+}
+
+/// app が register する custom probe。**framework は中身を解釈しない**:
+/// snapshot が返す raw バイト列をそのまま file へ書き、digest が返す1行を既存 sink へ流すだけ。
+/// 各 probe の意味づけ（PNG 化 / JSON 整形 等）は全て app 側 callback に閉じる。
+pub const Probe = struct {
+    /// probe 名（snapshot/digest コマンドの引数。fb/audio/stats は予約名で登録不可）。
+    name: []const u8,
+    /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
+    ctx: *anyopaque,
+    /// path 省略時の既定拡張子（"png" / "json" / "txt" 等）。
+    ext: []const u8 = "bin",
+    /// raw バイト列を allocator で確保して返す。harness が file へ書き同じ allocator で free。
+    /// null なら snapshot 非対応。
+    snapshot: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
+    /// 1行テキストを buf（DIGEST_BUF_LEN バイト）に書いて返す。改行は含めない。null なら digest 非対応。
+    digest: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
+};
+
+/// custom probe を登録する。app は `platform.registerProbe(...)` 経由で `platform.init()` 後に呼ぶ。
+/// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
+/// - 同名は上書き。fb/audio/stats は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
+pub fn registerProbe(p: Probe) void {
+    if (!isEnabled()) return;
+    if (isReservedProbeName(p.name)) {
+        std.debug.print("[harness] registerProbe: 予約名 '{s}' は登録できません\n", .{p.name});
+        return;
+    }
+    for (probes[0..probe_count]) |*existing| {
+        if (std.mem.eql(u8, existing.name, p.name)) {
+            existing.* = p; // 同名上書き
+            return;
+        }
+    }
+    if (probe_count >= MAX_PROBES) {
+        std.debug.print("[harness] registerProbe: registry 満杯（{d}）。'{s}' をスキップ\n", .{ MAX_PROBES, p.name });
+        return;
+    }
+    probes[probe_count] = p;
+    probe_count += 1;
+}
+
+fn isReservedProbeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats");
+}
+
+fn findProbe(name: []const u8) ?*Probe {
+    for (probes[0..probe_count]) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    return null;
 }
 
 /// platform.init() から1度だけ呼ぶ。env を読み replay/live を有効化する。
@@ -488,9 +546,29 @@ fn handleSnapshot(it: *Tok) void {
             return;
         };
         emitSnapshot("stats", path, "json");
+    } else if (findProbe(probe)) |p| {
+        snapshotCustom(p, path_arg, &path_buf);
     } else {
-        warnLine("snapshot: 未知の probe（fb/audio/stats）");
+        warnLine("snapshot: 未知の probe");
     }
+}
+
+/// custom probe の snapshot をルートする（中身非解釈）: callback の raw bytes を file へ書き、同 allocator で free。
+fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
+    const snap = p.snapshot orelse return warnLine("snapshot: この probe は snapshot 非対応");
+    const bytes = snap(p.ctx, gpa) catch |err| {
+        std.debug.print("[harness] snapshot {s} 失敗: {s}\n", .{ p.name, @errorName(err) });
+        return;
+    };
+    defer gpa.free(bytes);
+    const path = path_arg orelse (std.fmt.bufPrint(path_buf, "{s}/{s}_{d}.{s}", .{ out_dir, p.name, frame_index, p.ext }) catch return warnLine("snapshot: path 生成失敗"));
+    std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = bytes }) catch |err| {
+        std.debug.print("[harness] snapshot {s} 失敗 {s}: {s}\n", .{ p.name, path, @errorName(err) });
+        return;
+    };
+    var info_buf: [32]u8 = undefined;
+    const info = std.fmt.bufPrint(&info_buf, "{d} bytes", .{bytes.len}) catch "?";
+    emitSnapshot(p.name, path, info);
 }
 
 fn handleDigest(it: *Tok) void {
@@ -505,9 +583,18 @@ fn handleDigest(it: *Tok) void {
     } else if (std.mem.eql(u8, probe, "stats")) {
         var buf: [512]u8 = undefined;
         emitDigest("stats", formatStatsPayload(&buf));
+    } else if (findProbe(probe)) |p| {
+        digestCustom(p);
     } else {
-        warnLine("digest: 未知の probe（fb/audio/stats）");
+        warnLine("digest: 未知の probe");
     }
+}
+
+/// custom probe の digest をルートする（中身非解釈）: callback が 1024B バッファへ書いた1行を emit するだけ。
+fn digestCustom(p: *const Probe) void {
+    const dg = p.digest orelse return warnLine("digest: この probe は digest 非対応");
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    emitDigest(p.name, dg(p.ctx, &buf));
 }
 
 // ============================================================================
@@ -825,6 +912,7 @@ fn resetForTest() void {
     audio_head = .init(0);
     audio_channels = .init(0);
     audio_rate = .init(0);
+    probe_count = 0;
 }
 
 test "parseKey: 名前→KeyCode（大小無視・数字）" {
@@ -1009,6 +1097,61 @@ test "stats payload: JSON 1行（frame/virtual_fps/EventStats）" {
         "{\"frame\":12,\"virtual_fps\":60.0,\"mouse_move_merge_count\":3,\"mouse_scroll_merge_count\":1,\"event_drop_count\":0}",
         json,
     );
+}
+
+const TestProbeCtx = struct { value: u32 };
+fn testProbeDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const c: *TestProbeCtx = @ptrCast(@alignCast(ctx));
+    return std.fmt.bufPrint(buf, "value={d}", .{c.value}) catch buf[0..0];
+}
+
+test "custom probe: register + digest routing（generic・framework 非パース・live framing）" {
+    resetForTest(); // mode=.replay（disabled 以外 → register 有効）
+    var c = TestProbeCtx{ .value = 42 };
+    registerProbe(.{ .name = "test", .ctx = &c, .ext = "bin", .digest = testProbeDigest });
+    try testing.expectEqual(@as(usize, 1), probe_count);
+
+    // live framing: prefix なし `test value=42\n`
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var it = std.mem.tokenizeAny(u8, "test", " \t");
+    handleDigest(&it);
+    try testing.expectEqualStrings("test value=42\n", resp_buf.items);
+    probe_count = 0;
+}
+
+test "custom probe: disabled 時 registerProbe は no-op（回帰ゼロ）" {
+    resetForTest();
+    mode = .disabled;
+    probe_count = 0;
+    var c = TestProbeCtx{ .value = 1 };
+    registerProbe(.{ .name = "x", .ctx = &c, .digest = testProbeDigest });
+    try testing.expectEqual(@as(usize, 0), probe_count);
+}
+
+test "custom probe: 同名は上書き / 予約名は拒否 / 満杯は skip" {
+    resetForTest();
+    probe_count = 0;
+    var c1 = TestProbeCtx{ .value = 1 };
+    var c2 = TestProbeCtx{ .value = 2 };
+    registerProbe(.{ .name = "p", .ctx = &c1, .digest = testProbeDigest });
+    registerProbe(.{ .name = "p", .ctx = &c2, .digest = testProbeDigest }); // 同名上書き
+    try testing.expectEqual(@as(usize, 1), probe_count);
+    const got: *TestProbeCtx = @ptrCast(@alignCast(findProbe("p").?.ctx));
+    try testing.expectEqual(@as(u32, 2), got.value);
+
+    // 予約名は登録されない
+    registerProbe(.{ .name = "fb", .ctx = &c1, .digest = testProbeDigest });
+    registerProbe(.{ .name = "audio", .ctx = &c1, .digest = testProbeDigest });
+    registerProbe(.{ .name = "stats", .ctx = &c1, .digest = testProbeDigest });
+    try testing.expectEqual(@as(usize, 1), probe_count);
+
+    // 満杯（MAX_PROBES 到達）まで詰め、超過分は skip される（既存 "p" + 新規ユニーク名で埋める）
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "q", "r" };
+    for (names) |nm| registerProbe(.{ .name = nm, .ctx = &c1, .digest = testProbeDigest });
+    try testing.expectEqual(@as(usize, MAX_PROBES), probe_count); // 16 で頭打ち（17 個目以降は skip）
+    probe_count = 0;
 }
 
 test "live framing: digest/snapshot が response buffer に prefix なしで積まれる" {

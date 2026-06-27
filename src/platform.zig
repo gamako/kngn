@@ -128,6 +128,16 @@ pub const saveFileDialog = backend.saveFileDialog;
 pub const openFileDialog = backend.openFileDialog;
 
 // ============================================================================
+// custom probe（ヘッドレス検証 harness・TASK-32.3）
+//
+// app が `platform.registerProbe(.{ .name, .ctx, .snapshot, .digest })` で probe を opt-in 登録する。
+// platform module は共有 harness module を既に import 済みなので re-export だけで露出でき、build.zig 変更は不要。
+// harness 無効時（env 未設定）は registerProbe が no-op。framework は probe の中身を解釈しない。
+// ============================================================================
+pub const Probe = harness.Probe;
+pub const registerProbe = harness.registerProbe;
+
+// ============================================================================
 // sleep（OS 非依存のフレームウェイト）
 //
 // zig 0.16 は std.time.sleep を廃し sleep が std.Io 経由になったため、main/examples が共通で使える
