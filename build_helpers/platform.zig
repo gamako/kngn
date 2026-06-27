@@ -15,6 +15,8 @@ pub const PlatformType = enum {
     // Linux backends（純 Zig。x11 は TASK-28.2〜、wayland は TASK-28.5）
     x11,
     wayland,
+    // Windows backend（純 Zig。Win32 + GDI。TASK-31）
+    windows,
 };
 
 /// 当該 OS のデフォルト backend（`-Dplatform` 省略時に使う）。
@@ -22,6 +24,7 @@ pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
     return switch (os) {
         .macos => .objc,
         .linux => .x11,
+        .windows => .windows,
         else => .objc, // 実際には build.zig 側の OS チェックで到達しない
     };
 }
@@ -33,6 +36,7 @@ pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     return switch (os) {
         .macos => &.{ .objc, .swift, .metal },
         .linux => &.{ .x11, .wayland },
+        .windows => &.{.windows},
         else => &.{},
     };
 }
@@ -47,6 +51,7 @@ pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
     const valid = switch (os) {
         .macos => "objc / swift / metal",
         .linux => "x11 / wayland",
+        .windows => "windows",
         else => "(なし)",
     };
     std.log.err(
@@ -206,6 +211,20 @@ pub fn setupExecutableForPlatform(
             exe.root_module.linkSystemLibrary("wayland-client", .{});
             exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
         },
+        .windows => {
+            // Windows backend（純 Zig）。platform_windows.zig が Win32 を extern fn で叩く
+            // （@cImport しない）。SDK/xcrun は不要で、zig 同梱の MinGW import lib が
+            // user32 / gdi32 / comdlg32 を解決する（kernel32 は zig が自動リンク）。
+            // libc は不要（std.os.windows と extern fn のみ）だが、他 OS と挙動を揃えるため有効化する。
+            exe.root_module.link_libc = true;
+            exe.root_module.linkSystemLibrary("user32", .{}); // CreateWindowExW / メッセージポンプ / 入力
+            exe.root_module.linkSystemLibrary("gdi32", .{}); // StretchDIBits / BITMAPINFO blit
+            exe.root_module.linkSystemLibrary("comdlg32", .{}); // GetSaveFileNameW / GetOpenFileNameW
+            // GUI アプリとして Windows subsystem にする（既定の console subsystem だと起動時に
+            // コンソール窓が出る）。コンソール出力が本体のツール（例: example_06 ベンチ）は
+            // caller 側で .Console に上書きする。std.debug.print はコンソール非接続時 no-op になる。
+            exe.subsystem = .Windows;
+        },
     }
 }
 
@@ -329,9 +348,9 @@ pub fn compilePlatformLayer(
         .objc => buildObjC(b, optimize, platform_root),
         .swift => buildSwift(b, optimize, platform_root),
         .metal => buildMetal(b, optimize, platform_root),
-        // Linux backend は純 Zig で .o コンパイル不要。setupExecutableForPlatform の
+        // Linux / Windows backend は純 Zig で .o コンパイル不要。setupExecutableForPlatform の
         // macOS 分岐からのみ呼ばれるため、ここには到達しない。
-        .x11, .wayland => unreachable,
+        .x11, .wayland, .windows => unreachable,
     };
 }
 

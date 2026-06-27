@@ -3,6 +3,7 @@
 //! 複数バックエンド対応の Zig interface 層。`builtin.os.tag` で backend を選ぶ。
 //!   - macOS → `platform_macos.zig`（C ABI `platform.h` 経由。objc/swift/metal は .o リンクの差のみで Zig 側は共通）
 //!   - Linux → `platform_linux.zig`（X11/Wayland。純 Zig で `@cImport(Xlib)` 等を直接呼ぶ。x11/wayland は build_options.platform_backend で選ぶ）
+//!   - Windows → `platform_windows.zig`（Win32 + GDI。純 Zig で Win32 API を extern fn で直接呼ぶ。TASK-31）
 //!
 //! 公開型（KeyCode / Event 等）は `platform_types.zig` を単一ソースとして re-export し、
 //! `Window`/`Framebuffer` と関数群だけを各 backend から re-export する。
@@ -15,12 +16,14 @@
 //! 低 24bit にそのまま一致する。Windows(GDI/DXGI)・X11 標準 visual・macOS(CGImage/Metal) が
 //! 共通して BGRA を native に扱えるため、中間変換層も実行時分岐も持たず全 OS で直書きできる。
 
+const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("platform_types.zig");
 
 const backend = switch (builtin.os.tag) {
     .macos => @import("platform_macos.zig"),
     .linux => @import("platform_linux.zig"),
+    .windows => @import("platform_windows.zig"),
     else => @compileError("video-proto: unsupported OS for platform backend: " ++ @tagName(builtin.os.tag)),
 };
 
@@ -48,3 +51,27 @@ pub const shutdown = backend.shutdown;
 pub const getTime = backend.getTime;
 pub const saveFileDialog = backend.saveFileDialog;
 pub const openFileDialog = backend.openFileDialog;
+
+// ============================================================================
+// sleep（OS 非依存のフレームウェイト）
+//
+// zig 0.16 は std.time.sleep を廃し sleep が std.Io 経由になったため、main/examples が共通で使える
+// 単純な遅延を facade に置く。backend を増やさず comptime OS 分岐で済む（POSIX=nanosleep, Windows=Sleep）。
+// unselected 分岐は comptime-known 条件のため解析されない（winapi extern が POSIX を壊さない）。
+// ============================================================================
+const win_sleep = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+} else struct {};
+
+/// 指定ナノ秒だけ最低限スリープする（精度は OS 依存）。
+pub fn sleep(nanoseconds: u64) void {
+    if (builtin.os.tag == .windows) {
+        win_sleep.Sleep(@intCast(nanoseconds / 1_000_000));
+    } else {
+        var req = std.c.timespec{
+            .sec = @intCast(nanoseconds / 1_000_000_000),
+            .nsec = @intCast(nanoseconds % 1_000_000_000),
+        };
+        _ = std.c.nanosleep(&req, null);
+    }
+}

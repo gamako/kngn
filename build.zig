@@ -49,9 +49,13 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const example_modules = ExampleModules.init(b);
 
-    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland）
+    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows）
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
+
+    // audio (L1 出力) backend は macOS(AudioToolbox) / Linux(ALSA) のみ。Windows(WASAPI) は別タスクなので
+    // synth アプリ / example_15(audio) を Windows では生成しない（linkAudioBackend が非対応 OS で panic する）。
+    const audio_supported = (target_os == .macos or target_os == .linux);
 
     // ========================================
     // main / pixie / synth / examples を backend ごとに生成
@@ -79,8 +83,8 @@ pub fn build(b: *std.Build) void {
         if (install_all) b.installArtifact(pixie_exe);
         addRunStep(b, b.fmt("run-pixie-{s}", .{platform.backendName(be)}), b.fmt("Run Pixie editor ({s})", .{platform.backendName(be)}), pixie_exe, b.args);
 
-        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux -----
-        {
+        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux のみ -----
+        if (audio_supported) {
             const synth_exe = addSynthExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "synth", be, default_be), &example_modules, &pm);
             if (is_default) default_synth = synth_exe;
             if (install_all) b.installArtifact(synth_exe);
@@ -118,9 +122,12 @@ pub fn build(b: *std.Build) void {
                 .needs_font = example.needs_font,
                 .needs_audio = example.needs_audio,
             };
-            // audio example も macOS/Linux 両対応（audio backend が OS 分岐するため）。
-            {
+            // audio example は macOS/Linux のみ（Windows の WASAPI は別タスク。それ以外の example は全 OS）。
+            if (!needs.needs_audio or audio_supported) {
                 const ex_exe = addExampleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, example.name, be, default_be), example.path, &example_modules, &pm, needs);
+                // example_06 はベンチ結果を stdout に出すツールなので Windows でも console subsystem を保つ
+                // （setupExecutableForPlatform が .windows で付与する GUI subsystem を上書き）。
+                if (target_os == .windows and comptime std.mem.eql(u8, example.name, "example_06")) ex_exe.subsystem = .Console;
                 // examples は install-all とは独立に常に全 backend を install する
                 // （platform 層 / example のビルド回帰を毎 `zig build` で検出する従来挙動を踏襲）。
                 b.installArtifact(ex_exe);
@@ -142,13 +149,17 @@ pub fn build(b: *std.Build) void {
     if (!install_all) b.installArtifact(default_main.?);
     addRunStep(b, "run", "Run the app (uses -Dplatform option)", default_main.?, b.args);
     addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", default_pixie.?, b.args);
-    addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", default_synth.?, b.args);
 
     // ビルドのみ（実行しない）。当該 exe だけを install する step。
     // `zig build`（引数なし）は全 installArtifact をビルドしてしまうので、単体ビルド用に分ける。
     addBuildStep(b, "build-main", "Build the app only (uses -Dplatform option)", default_main.?);
     addBuildStep(b, "build-pixie", "Build Pixie editor only (uses -Dplatform option)", default_pixie.?);
-    addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", default_synth.?);
+
+    // synth は audio 対応 OS（macOS/Linux）のみ。Windows では生成されないため step も張らない。
+    if (default_synth) |ds| {
+        addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", ds, b.args);
+        addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
+    }
 
     // ========================================
     // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
@@ -362,6 +373,21 @@ pub fn build(b: *std.Build) void {
     test_platform_wayland_input_step.dependOn(&run_platform_wayland_input_test.step);
 
     // ========================================
+    // platform_windows_input.zig テスト（Windows 入力の純粋変換: VK→KeyCode/modifier(post-state)/wheel 符号）
+    // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-31 / AC#3）
+    // ========================================
+    const platform_windows_input_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform_windows_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_platform_windows_input_test = b.addRunArtifact(platform_windows_input_test);
+    const test_platform_windows_input_step = b.step("test-platform-windows-input", "Run Windows input mapping/modifier/wheel unit tests");
+    test_platform_windows_input_step.dependOn(&run_platform_windows_input_test.step);
+
+    // ========================================
     // text.zig テスト (BDF パーサ + 描画)
     // ========================================
     const text_test_mod = b.createModule(.{
@@ -490,6 +516,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_input_step);
     test_step.dependOn(test_platform_convert_step);
     test_step.dependOn(test_platform_wayland_input_step);
+    test_step.dependOn(test_platform_windows_input_step);
 }
 
 // ============================================================
