@@ -211,7 +211,7 @@ const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
 
 // Tool 経路（onEvent down/move/up）でゴールデン: 描画 → undo → PNG round-trip 一致（AC#3）。
 test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip が一致する" {
-    const png_decoder = @import("png-decoder");
+    const png = @import("png");
     const io_png = @import("io_png.zig");
     const gpa = std.testing.allocator;
 
@@ -252,7 +252,7 @@ test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip 
     const raw = canvas.layerPixels(0);
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
-    const loaded = try png_decoder.decodePNG(gpa, png_bytes);
+    const loaded = try png.decodePNG(gpa, png_bytes);
     defer {
         var img = loaded;
         img.deinit(gpa);
@@ -358,7 +358,7 @@ test "Brush.buildDab: size=64 / size>64(clamp) で overflow しない" {
 }
 
 test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（partial alpha）" {
-    const png_decoder = @import("png-decoder");
+    const png = @import("png");
     const io_png = @import("io_png.zig");
     const gpa = std.testing.allocator;
 
@@ -389,7 +389,7 @@ test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（part
     const raw = canvas.layerPixels(0);
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
-    const loaded = try png_decoder.decodePNG(gpa, png_bytes);
+    const loaded = try png.decodePNG(gpa, png_bytes);
     defer {
         var img = loaded;
         img.deinit(gpa);

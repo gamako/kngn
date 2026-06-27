@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
 
     // ========================================
     // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
-    // 29.1 の外部公開 module（platform/png-decoder/font/gui）も内包する。
+    // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
     // ========================================
     const example_modules = ExampleModules.init(b);
 
@@ -96,21 +96,21 @@ pub fn build(b: *std.Build) void {
         // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
         // 揃えること（inline for で型不一致を避けるため）。
         inline for (.{
-            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
-            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = true, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = true, .needs_audio = false },
-            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png_decoder = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png_decoder = false, .needs_font = false, .needs_audio = true },
+            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false },
+            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = true, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false },
+            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
+            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -118,7 +118,7 @@ pub fn build(b: *std.Build) void {
                 .needs_fixed_timestep = example.needs_fixed_timestep,
                 .needs_text = example.needs_text,
                 .needs_gui = example.needs_gui,
-                .needs_png_decoder = example.needs_png_decoder,
+                .needs_png = example.needs_png,
                 .needs_font = example.needs_font,
                 .needs_audio = example.needs_audio,
             };
@@ -187,17 +187,26 @@ pub fn build(b: *std.Build) void {
     // テスト群（platform を import しない純テスト。OS/backend 非依存）
     // ========================================
 
-    // PNG round-trip テスト (io_png.zig のテスト + png-decoder で検証)
+    // PNG round-trip テスト (io_png.zig のテスト + png で検証)
     const io_png_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/io_png.zig"),
         .target = target,
         .optimize = optimize,
     });
-    io_png_mod.addImport("png-decoder", example_modules.png_decoder);
+    io_png_mod.addImport("png", example_modules.png);
     const png_roundtrip_test = b.addTest(.{ .root_module = io_png_mod });
     const run_png_roundtrip_test = b.addRunArtifact(png_roundtrip_test);
     const test_png_roundtrip_step = b.step("test-png-roundtrip", "Run PNG encode/decode round-trip tests");
     test_png_roundtrip_step.dependOn(&run_png_roundtrip_test.step);
+
+    // PNG エンコーダ単体テスト（golden byte 一致 + scanline 順。decoder 非依存。TASK-33）
+    const png_encode_mod = b.createModule(.{
+        .root_source_file = b.path("libs/png/src/encode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const png_encode_test = b.addTest(.{ .root_module = png_encode_mod });
+    test_png_roundtrip_step.dependOn(&b.addRunArtifact(png_encode_test).step);
 
     // canvas.zig 単体テスト
     const canvas_test = b.addTest(.{
@@ -228,7 +237,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    core_undo_mod.addImport("png-decoder", example_modules.png_decoder);
+    core_undo_mod.addImport("png", example_modules.png);
     const core_undo_test = b.addTest(.{ .root_module = core_undo_mod });
     const run_core_undo_test = b.addRunArtifact(core_undo_test);
 
@@ -237,12 +246,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    core_tool_mod.addImport("png-decoder", example_modules.png_decoder);
+    core_tool_mod.addImport("png", example_modules.png);
     const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
     const run_core_tool_test = b.addRunArtifact(core_tool_test);
 
     // ベジェ/ベクターパス（TASK-21.13）。bezier=pure。path/path_editor は相対 import 先（undo/path の test）が
-    // png-decoder を使うため import 要（Zig は同一モジュール内 @import 先の test もコンパイルする）。
+    // png を使うため import 要（Zig は同一モジュール内 @import 先の test もコンパイルする）。
     const core_bezier_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/bezier.zig"),
         .target = target,
@@ -256,7 +265,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    core_path_mod.addImport("png-decoder", example_modules.png_decoder);
+    core_path_mod.addImport("png", example_modules.png);
     const core_path_test = b.addTest(.{ .root_module = core_path_mod });
     const run_core_path_test = b.addRunArtifact(core_path_test);
 
@@ -265,7 +274,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    core_path_editor_mod.addImport("png-decoder", example_modules.png_decoder);
+    core_path_editor_mod.addImport("png", example_modules.png);
     const core_path_editor_test = b.addTest(.{ .root_module = core_path_editor_mod });
     const run_core_path_editor_test = b.addRunArtifact(core_path_editor_test);
 
@@ -319,7 +328,7 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const png_format_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("libs/png-decoder/src/format.zig"),
+            .root_source_file = b.path("libs/png/src/format.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -405,8 +414,8 @@ pub fn build(b: *std.Build) void {
     // ========================================
     // sprite.zig テスト (blend4Pixels / drawSprite)
     // ========================================
-    const sprite_test_png_decoder = b.createModule(.{
-        .root_source_file = b.path("libs/png-decoder/src/lib.zig"),
+    const sprite_test_png = b.createModule(.{
+        .root_source_file = b.path("libs/png/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -415,7 +424,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    sprite_test_module.addImport("png-decoder", sprite_test_png_decoder);
+    sprite_test_module.addImport("png", sprite_test_png);
     const sprite_test = b.addTest(.{
         .root_module = sprite_test_module,
     });
@@ -445,7 +454,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    font_test_mod.addImport("png-decoder", example_modules.png_decoder); // bmfont.zig が利用
+    font_test_mod.addImport("png", example_modules.png); // bmfont.zig が利用
     const font_test = b.addTest(.{ .root_module = font_test_mod });
     const run_font_test = b.addRunArtifact(font_test);
     const test_font_step = b.step("test-font", "Run libs/font unit tests");
@@ -591,7 +600,7 @@ const ExampleModules = struct {
     fixed_timestep: *std.Build.Module,
     fps_counter: *std.Build.Module,
     text: *std.Build.Module,
-    png_decoder: *std.Build.Module,
+    png: *std.Build.Module,
     font: *std.Build.Module,
     gui: *std.Build.Module,
     audio: *std.Build.Module,
@@ -613,22 +622,22 @@ const ExampleModules = struct {
         });
         keyboard_mod.addImport("platform", platform_mod);
 
-        // TASK-29.1: 外部公開 module。dep.module("png-decoder")。
-        const png_decoder = b.addModule("png-decoder", .{
-            .root_source_file = b.path("libs/png-decoder/src/lib.zig"),
+        // TASK-29.1: 外部公開 module。dep.module("png")。
+        const png = b.addModule("png", .{
+            .root_source_file = b.path("libs/png/src/lib.zig"),
         });
         const sprite = b.createModule(.{
             .root_source_file = b.path("src/sprite.zig"),
         });
-        sprite.addImport("png-decoder", png_decoder);
+        sprite.addImport("png", png);
 
         // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
-        // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png-decoder に依存。
-        // TASK-29.1: 外部公開 module。dep.module("font")。png-decoder に依存。
+        // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png に依存。
+        // TASK-29.1: 外部公開 module。dep.module("font")。png に依存。
         const font_mod = b.addModule("font", .{
             .root_source_file = b.path("libs/font/src/lib.zig"),
         });
-        font_mod.addImport("png-decoder", png_decoder);
+        font_mod.addImport("png", png);
 
         // src/text.zig は共通 Font IF（libs/font）の実装を提供するため font に依存（TASK-25.14）。
         const text_mod = b.createModule(.{
@@ -671,7 +680,7 @@ const ExampleModules = struct {
                 .root_source_file = b.path("src/fps_counter.zig"),
             }),
             .text = text_mod,
-            .png_decoder = png_decoder,
+            .png = png,
             .font = font_mod,
             .gui = gui,
             .audio = audio_mod,
@@ -687,7 +696,7 @@ const ExampleNeeds = struct {
     needs_fixed_timestep: bool,
     needs_text: bool,
     needs_gui: bool,
-    needs_png_decoder: bool,
+    needs_png: bool,
     needs_font: bool,
     needs_audio: bool,
 };
@@ -725,7 +734,7 @@ fn addExampleExe(
     if (needs.needs_fixed_timestep) exe.root_module.addImport("fixed_timestep", common.fixed_timestep);
     if (needs.needs_text) exe.root_module.addImport("text", common.text);
     if (needs.needs_gui) exe.root_module.addImport("gui", common.gui);
-    if (needs.needs_png_decoder) exe.root_module.addImport("png-decoder", common.png_decoder);
+    if (needs.needs_png) exe.root_module.addImport("png", common.png);
     if (needs.needs_font) exe.root_module.addImport("font", common.font);
     if (needs.needs_audio) {
         exe.root_module.addImport("audio", common.audio);
@@ -761,6 +770,7 @@ fn addPixieExe(
     const core_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/core.zig"),
     });
+    core_mod.addImport("png", common.png); // core/io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
 
     const exe = b.addExecutable(.{
         .name = name,
@@ -773,7 +783,7 @@ fn addPixieExe(
     exe.root_module.addImport("platform", pm.platform);
     exe.root_module.addImport("core", core_mod);
     exe.root_module.addImport("gui", common.gui);
-    exe.root_module.addImport("png-decoder", common.png_decoder); // PNG 読み込み (TASK-24)
+    exe.root_module.addImport("png", common.png); // PNG 読み込み (TASK-24)
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;

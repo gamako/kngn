@@ -138,7 +138,7 @@ test "flattenAll: 端点を含む（2 アンカー直線）" {
 }
 
 test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round-trip" {
-    const png_decoder = @import("png-decoder");
+    const png = @import("png");
     const io_png = @import("io_png.zig");
     const gpa = std.testing.allocator;
 
@@ -168,7 +168,7 @@ test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round
     const raw = canvas.layerPixels(0);
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
-    const loaded = try png_decoder.decodePNG(gpa, png_bytes);
+    const loaded = try png.decodePNG(gpa, png_bytes);
     defer {
         var img = loaded;
         img.deinit(gpa);

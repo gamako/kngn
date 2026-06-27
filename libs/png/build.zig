@@ -4,9 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create the png-decoder library
+    // Create the png library
     const lib = b.addLibrary(.{
-        .name = "png-decoder",
+        .name = "png",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lib.zig"),
             .target = target,
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     // Create benchmark executable
     const benchmark_exe = b.addExecutable(.{
-        .name = "png-decoder-benchmark",
+        .name = "png-benchmark",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/benchmark.zig"),
             .target = target,

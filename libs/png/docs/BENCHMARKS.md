@@ -187,15 +187,15 @@
    - 大画像（512x512以上）: 13-15% 安定改善
 
 ### 実装詳細
-- **libs/png-decoder/src/flate.zig**: ScanlineDecoder 実装
+- **libs/png/src/flate.zig**: ScanlineDecoder 実装
   - IDATChunkStreamAdapterによるチャンク単位ストリーミング
   - readScanline() で行単位のフィルタ適用
   - 2つのスキャンラインバッファ（現在行/前行）でダブルバッファリング
-- **libs/png-decoder/src/format.zig**: 行単位変換関数
+- **libs/png/src/format.zig**: 行単位変換関数
   - grayscaleToRGBA8888Row()
   - rgbToRGBA8888Row()
   - rgbaToRGBA8888Row()
-- **libs/png-decoder/src/lib.zig**: パイプライン化
+- **libs/png/src/lib.zig**: パイプライン化
   - ScanlineDecoder.init() でストリーミング初期化
   - while (readScanline()) ループで行単位処理
   - フォーマット変換も行単位で実行
@@ -436,7 +436,7 @@ Phase 1.2 の実施を推奨：フィルタタイプ0の memcpy 化により、�
 - **メモリ削減: 74.9% 削減**（32,604 KB → 8,189 KB）
 
 ### テスト結果
-- ✅ zig test libs/png-decoder/src/test.zig: 全29テスト通過
+- ✅ zig test libs/png/src/test.zig: 全29テスト通過
 - ✅ inline 追加版でも全テスト通過（機能的には問題なし）
 - ✅ inline 削除版でも全テスト通過
 
@@ -491,7 +491,7 @@ Phase 1.2 の実施を推奨：フィルタタイプ0の memcpy 化により、�
 [性能の変化について、特に予想と異なる場合は理由を記載]
 
 ### テスト結果
-- ✅ zig test libs/png-decoder/src/test.zig: PASS
+- ✅ zig test libs/png/src/test.zig: PASS
 - ✅ 全テストケース通過
 ```
 

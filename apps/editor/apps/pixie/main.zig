@@ -15,7 +15,7 @@ const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 const core = @import("core");
-const png_decoder = @import("png-decoder");
+const png = @import("png");
 const canvas_input = @import("canvas_input.zig");
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
@@ -291,7 +291,7 @@ const App = struct {
             return;
         };
         const path = maybe orelse return; // キャンセル: サイレント no-op
-        var img = png_decoder.decodePNGFile(self.io, self.gpa, path) catch |err| {
+        var img = png.decodePNGFile(self.io, self.gpa, path) catch |err| {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
             return;
@@ -299,7 +299,7 @@ const App = struct {
         defer img.deinit(self.gpa);
 
         // 左上クロップ/パディング: layer0 を透明クリアし、収まる範囲を行ごとに memcpy。
-        // png_decoder の出力は canonical BGRA 0xAARRGGBB で canvas と同一レイアウトなので変換不要。
+        // png の出力は canonical BGRA 0xAARRGGBB で canvas と同一レイアウトなので変換不要。
         const layer0 = self.canvas.layerPixels(0);
         @memset(layer0, 0);
         const iw: usize = img.width;

@@ -5,7 +5,7 @@
 //
 // 設計（TASK-25.9 計画）:
 //   - 中核 `parse(text, atlas, w, h)` は io/PNG 非依存（アトラス注入）でテスト容易。
-//   - `load(text, png_bytes)` は薄い helper（png-decoder で decode → parse）。
+//   - `load(text, png_bytes)` は薄い helper（png で decode → parse）。
 //   - グリフのカバレッジ = アトラス画素の A チャネル。`col` で tint（共通カバレッジ路に整合）。
 //   - 単一ページのみ（pages!=1 / page id!=0 / char page!=0 は reject）。
 //   - kerning はパースのみ・非適用（共通 API に kerning なし）。
@@ -15,7 +15,7 @@ const std = @import("std");
 const font = @import("font.zig");
 const geom = @import("geom.zig");
 const color = @import("color.zig");
-const pngdec = @import("png-decoder");
+const pngdec = @import("png");
 
 const Font = font.Font;
 const Metrics = font.Metrics;
@@ -526,7 +526,7 @@ const test_png = [_]u8{
     0x42, 0x60, 0x82,
 };
 
-test "BMFont.load: 埋め込み PNG を decode→parse（png-decoder 実経路・AC#2）" {
+test "BMFont.load: 埋め込み PNG を decode→parse（png 実経路・AC#2）" {
     const a = testing.allocator;
     const fnt =
         \\common lineHeight=4 base=3 pages=1

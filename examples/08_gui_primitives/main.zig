@@ -1,9 +1,9 @@
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
-const png_decoder = @import("png-decoder");
+const png = @import("png");
 
-// サンプル画像: 16x16 RGBA PNG を libs/png-decoder でデコードして image blit する
+// サンプル画像: 16x16 RGBA PNG を libs/png でデコードして image blit する
 const sample_png = @embedFile("sample.png");
 
 pub fn main(init: std.process.Init) !void {
@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
     defer draw_list.deinit();
 
     // PNG をデコード（straight alpha canonical BGRA = 0xAARRGGBB、libs/gui の image と同フォーマット）
-    var sample_img = try png_decoder.decodePNG(gpa, sample_png);
+    var sample_img = try png.decodePNG(gpa, sample_png);
     defer sample_img.deinit(gpa);
     const img_w = sample_img.width;
     const img_h = sample_img.height;

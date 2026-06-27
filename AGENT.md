@@ -29,7 +29,7 @@ video-proto/
 │   ├── 04_fixed_timestep/     # 固定タイムステップ + 物理シミュレーション
 │   └── 05_text_rendering/     # ビットマップフォントによるテキスト描画
 ├── libs/              # 再利用ライブラリ
-│   ├── png-decoder/   # PNG デコーダー
+│   ├── png/   # PNG codec（decode/encode）
 │   └── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
 ├── apps/              # アプリケーション
 │   └── editor/        # グラフィックエディタ群（TASK-21 ファミリー）

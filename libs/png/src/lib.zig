@@ -1,4 +1,4 @@
-// PNG Decoder Library for Zig
+// PNG codec Library for Zig (decode + encode)
 // Specification: https://www.w3.org/TR/png/
 //
 // Supports decoding PNG images with the following color types:
@@ -8,12 +8,21 @@
 //
 // Output format: canonical BGRA8888 (u32 per pixel)
 // Memory layout: Byte order [B, G, R, A] regardless of system endianness
+//
+// Encoding (TASK-33: apps/editor/core/io_png.zig から移設): RGBA8 / zlib stored blocks。
+// encodePNG / savePNG / crc32 を encode.zig から re-export する。
 
 const std = @import("std");
 pub const png_parser = @import("png_parser.zig");
 pub const flate = @import("flate.zig");
 pub const filter = @import("filter.zig");
 pub const format = @import("format.zig");
+
+// encode 側（PNG エンコーダ）。decode と合わせて PNG codec を構成する。
+pub const encode = @import("encode.zig");
+pub const encodePNG = encode.encodePNG;
+pub const savePNG = encode.savePNG;
+pub const crc32 = encode.crc32;
 
 /// PNG Color Type
 pub const ColorType = enum(u8) {

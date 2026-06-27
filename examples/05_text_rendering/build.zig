@@ -9,15 +9,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // text.zig は共通 Font IF（libs/font）に依存する（TASK-25.14）。
-    // font は PNG アトラスを decode するため png-decoder に依存。
+    // font は PNG アトラスを decode するため png に依存。
     // （standalone build に font 配線が無く壊れていた既存破損の付随修正）
-    const png_decoder = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png-decoder/src/lib.zig" },
+    const png = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
-    font.addImport("png-decoder", png_decoder);
+    font.addImport("png", png);
     const text = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/text.zig" },
     });

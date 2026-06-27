@@ -11,5 +11,5 @@ zig-out/
 .direnv/
 
 # Test data and generated files
-libs/png-decoder/test-data/
+libs/png/test-data/
 .claude/.tmp/

@@ -559,7 +559,7 @@ test "stroke: canvas 外への座標は clip され crash しない（capture �
 }
 
 test "PNG round-trip: DB16 パターンを encode → decode でピクセル一致" {
-    const png_decoder = @import("png-decoder");
+    const png = @import("png");
     const io_png = @import("io_png.zig");
     const gpa = std.testing.allocator;
 
@@ -588,7 +588,7 @@ test "PNG round-trip: DB16 パターンを encode → decode でピクセル一�
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
 
-    const loaded = try png_decoder.decodePNG(gpa, png_bytes);
+    const loaded = try png.decodePNG(gpa, png_bytes);
     defer {
         var img = loaded;
         img.deinit(gpa);
@@ -627,7 +627,7 @@ test "brush: 単一 dab で src-over、coverage max でビルドアップしな�
 }
 
 test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
-    const png_decoder = @import("png-decoder");
+    const png = @import("png");
     const io_png = @import("io_png.zig");
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 4, 4);
@@ -650,7 +650,7 @@ test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
     const raw = c.layers.items[0].pixels;
     const png_bytes = try io_png.encodePNG(raw, 4, 4, gpa);
     defer gpa.free(png_bytes);
-    const loaded = try png_decoder.decodePNG(gpa, png_bytes);
+    const loaded = try png.decodePNG(gpa, png_bytes);
     defer {
         var img = loaded;
         img.deinit(gpa);

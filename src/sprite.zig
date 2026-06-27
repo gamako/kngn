@@ -1,7 +1,7 @@
 const std = @import("std");
-const png_decoder = @import("png-decoder");
+const png = @import("png");
 
-const PremultipliedImage = png_decoder.PremultipliedImage;
+const PremultipliedImage = png.PremultipliedImage;
 
 /// スプライト構造体
 /// Premultiplied Alpha形式のPNG画像データと画面座標を保持
@@ -17,7 +17,7 @@ pub const Sprite = struct {
     /// - x: 初期X座標
     /// - y: 初期Y座標
     pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8, x: i32, y: i32) !Sprite {
-        const image = try png_decoder.decodePNGFilePremultiplied(io, allocator, path);
+        const image = try png.decodePNGFilePremultiplied(io, allocator, path);
         return Sprite{
             .image = image,
             .x = x,
@@ -32,7 +32,7 @@ pub const Sprite = struct {
     /// - x: 初期X座標
     /// - y: 初期Y座標
     pub fn initFromData(allocator: std.mem.Allocator, png_data: []const u8, x: i32, y: i32) !Sprite {
-        const image = try png_decoder.decodePNGPremultiplied(allocator, png_data);
+        const image = try png.decodePNGPremultiplied(allocator, png_data);
         return Sprite{
             .image = image,
             .x = x,

@@ -16,15 +16,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // pixie が import するモジュール（OS/backend 非依存）。
-    // gui は共通 Font IF に依存し、font は PNG アトラス decode のため png-decoder に依存。
+    // gui は共通 Font IF に依存し、font は PNG アトラス decode のため png に依存。
     // （standalone build に font 配線が無く壊れていた既存破損の付随修正）
-    const png_decoder = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png-decoder/src/lib.zig" },
+    const png = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
-    font.addImport("png-decoder", png_decoder);
+    font.addImport("png", png);
     const gui = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
     });
@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const core = b.createModule(.{
         .root_source_file = b.path("core/core.zig"),
     });
+    core.addImport("png", png); // core/io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",
@@ -42,7 +43,7 @@ pub fn build(b: *std.Build) void {
         .extra = &.{
             .{ .name = "core", .module = core },
             .{ .name = "gui", .module = gui },
-            .{ .name = "png-decoder", .module = png_decoder },
+            .{ .name = "png", .module = png },
         },
     });
 }

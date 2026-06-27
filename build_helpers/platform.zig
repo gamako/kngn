@@ -260,7 +260,7 @@ pub const StandaloneSpec = struct {
     platform_root: std.Build.LazyPath,
     /// keyboard.zig（不要なら null）。platform に依存するため backend ごとに作る。
     keyboard_source: ?std.Build.LazyPath = null,
-    /// OS/backend 非依存の追加 import（sprite / png-decoder / gui / core 等）。
+    /// OS/backend 非依存の追加 import（sprite / png / gui / core 等）。
     extra: []const Import = &.{},
     /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
     /// macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI/COM)。

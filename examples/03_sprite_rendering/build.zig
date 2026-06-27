@@ -9,13 +9,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // OS/backend 非依存モジュール（1 度だけ作成）
-    const png_decoder = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png-decoder/src/lib.zig" },
+    const png = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
     const sprite = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/sprite.zig" },
     });
-    sprite.addImport("png-decoder", png_decoder);
+    sprite.addImport("png", png);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_03_sprite_rendering",
