@@ -10,7 +10,7 @@
 //! repeat timing）のみ本ファイルが担う。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 const linux_input = @import("platform_linux_input.zig");
 
 const KeyCode = types.KeyCode;

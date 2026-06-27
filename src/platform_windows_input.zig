@@ -15,7 +15,7 @@
 //! EventQueue / wheel 係数は OS 非依存なので `platform_linux_input.zig` を再利用する。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 const linux_input = @import("platform_linux_input.zig");
 
 const KeyCode = types.KeyCode;

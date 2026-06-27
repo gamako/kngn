@@ -12,21 +12,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // audio は platform backend 非依存（@cImport しない）。通常の createModule でよい。
-    // L1 出力の system ライブラリ（AudioToolbox/alsa/ole32）は buildStandalone の link_audio で OS 別にリンクする。
-    const audio_module = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/audio.zig" },
-    });
-
     // 他 example と同じ OS 対応 standalone ビルド（macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows）。
     // audio backend は macOS(AudioToolbox)/Linux(ALSA)/Windows(WASAPI) 対応（link_audio=true）。
+    // link_audio=true のとき buildStandalone が audio facade module を生成し harness を配線する（TASK-32.2）。
+    // platform_types / harness / png も buildStandalone が platform_source から導出して共有する。
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_15_audio_tone",
         .main_source = b.path("main.zig"),
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .extra = &.{.{ .name = "audio", .module = audio_module }},
         .link_audio = true,
     });
 }

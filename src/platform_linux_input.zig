@@ -8,7 +8,7 @@
 //! 由来を `X11/X.h` / linux evdev (`input-event-codes.h`, `X keycode = evdev scancode + 8`) として明記する。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 
 const KeyCode = types.KeyCode;
 const ModifierFlags = types.ModifierFlags;

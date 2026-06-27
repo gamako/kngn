@@ -21,7 +21,7 @@
 //! Linux 専用 @cImport のため本ファイルはコンパイルされない）。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 const input = @import("platform_linux_input.zig");
 const wlinput = @import("platform_wayland_input.zig");
 const common = @import("platform_linux_common.zig");

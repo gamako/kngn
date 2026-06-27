@@ -92,6 +92,12 @@ pub fn createPlatformModule(
     platform_source: std.Build.LazyPath,
     platform_include_root: std.Build.LazyPath,
     backend: PlatformType,
+    /// 共有型 module（src/platform_types.zig）。platform.zig + 各 backend が `@import("platform_types")` で使う。
+    /// harness module と **同一インスタンス** を渡すこと（Event/EventStats の型同一性のため。TASK-32.2）。
+    types_mod: *std.Build.Module,
+    /// harness module（src/harness.zig）。platform.zig(facade) が `@import("harness")` で使う。
+    /// audio module と **同一インスタンス** を渡すことで module-level state（audio tap 等）を共有する (TASK-32.2)。
+    harness_mod: *std.Build.Module,
 ) *std.Build.Module {
     // linkSystemLibrary は target 既知の module を要求するため、明示的に target を設定する
     // （import module は通常 importer から target を継承するが、x11 のリンク呼び出しには事前に必要）。
@@ -101,6 +107,9 @@ pub fn createPlatformModule(
         .link_libc = true,
     });
     mod.addIncludePath(platform_include_root);
+    // platform.zig + backends は `@import("platform_types")`、facade は `@import("harness")` を使う。
+    mod.addImport("platform_types", types_mod);
+    mod.addImport("harness", harness_mod);
 
     const opts = b.addOptions();
     opts.addOption([]const u8, "platform_backend", backendName(backend));
@@ -265,6 +274,11 @@ pub const StandaloneSpec = struct {
     /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
     /// macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI/COM)。
     link_audio: bool = false,
+    /// png module（libs/png）。**呼び出し側が png を作って `extra` に png 依存モジュール（sprite/core 等）を
+    /// 渡す場合は、その同じ png をここにも渡すこと**。harness（platform→harness→png）と extra 側で png module が
+    /// 二重化すると「file exists in modules 'png' and 'png0'」になるため、同一インスタンスを共有する。
+    /// null なら buildStandalone が platform_source から導出して1つ作る (TASK-32.2)。
+    png_module: ?*std.Build.Module = null,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
@@ -311,8 +325,48 @@ pub fn buildStandalone(
     const default_be = defaultBackend(target_os);
     var default_exe: ?*std.Build.Step.Compile = null;
 
+    // platform module は harness(src/platform.zig→harness.zig) 経由で png codec(libs/png) に依存する。
+    // standalone の platform_source（.cwd_relative <ROOT>/src/platform.zig）から
+    // png lib（<ROOT>/libs/png/src/lib.zig）を導出し、png module を1つ作って各 backend で共有する。
+    const png_source: std.Build.LazyPath = switch (spec.platform_source) {
+        .cwd_relative => |s| blk: {
+            const root = std.fs.path.dirname(std.fs.path.dirname(s) orelse s) orelse ".";
+            break :blk .{ .cwd_relative = b.fmt("{s}/libs/png/src/lib.zig", .{root}) };
+        },
+        // standalone build は常に .cwd_relative の platform_source を渡す前提。
+        // それ以外だと png lib パスを導出できず @import("png") が壊れるため明示的に失敗させる。
+        else => @panic("buildStandalone: platform_source は .cwd_relative 前提です（png lib パス導出のため）"),
+    };
+    // 呼び出し側が extra 用に作った png があればそれを共有する（二重 png module 化を防ぐ）。
+    const png_mod = spec.png_module orelse b.createModule(.{ .root_source_file = png_source });
+
+    // 共有型 module（platform_types）と harness module も platform_source の dirname（<ROOT>/src）から
+    // 導出して1つずつ作り、全 backend で共有する。platform.zig(facade) は `@import("platform_types")` /
+    // `@import("harness")`、harness は `@import("png")` / `@import("platform_types")` する (TASK-32.2)。
+    const src_dir: []const u8 = switch (spec.platform_source) {
+        .cwd_relative => |s| std.fs.path.dirname(s) orelse ".",
+        else => @panic("buildStandalone: platform_source は .cwd_relative 前提です（types/harness パス導出のため）"),
+    };
+    const types_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/platform_types.zig", .{src_dir}) } });
+    const harness_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.fmt("{s}/harness.zig", .{src_dir}) },
+        .link_libc = true,
+    });
+    harness_mod.addImport("png", png_mod);
+    harness_mod.addImport("platform_types", types_mod);
+
+    // link_audio のとき audio facade module を **buildStandalone が生成**し、harness を配線する（TASK-32.2）。
+    // audio.zig は `@import("harness")` するので、platform module と **同一の harness_mod** を共有しないと
+    // file-in-two-modules になり audio probe も無音になる。caller が別途 audio module を作って extra で渡すと
+    // harness が二重化するため、audio は link_audio に集約する（example_15 等）。
+    const audio_mod: ?*std.Build.Module = if (spec.link_audio) blk: {
+        const am = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/audio.zig", .{src_dir}) } });
+        am.addImport("harness", harness_mod);
+        break :blk am;
+    } else null;
+
     for (implementedBackends(target_os)) |be| {
-        const platform_mod = createPlatformModule(b, target, spec.platform_source, spec.platform_include, be);
+        const platform_mod = createPlatformModule(b, target, spec.platform_source, spec.platform_include, be, types_mod, harness_mod);
 
         const root = b.createModule(.{
             .root_source_file = spec.main_source,
@@ -320,6 +374,7 @@ pub fn buildStandalone(
             .optimize = optimize,
         });
         root.addImport("platform", platform_mod);
+        if (audio_mod) |am| root.addImport("audio", am);
         if (spec.keyboard_source) |ks| {
             const kb = b.createModule(.{ .root_source_file = ks });
             kb.addImport("platform", platform_mod);

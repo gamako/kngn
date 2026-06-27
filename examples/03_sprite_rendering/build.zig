@@ -24,6 +24,8 @@ pub fn build(b: *std.Build) void {
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },
+        // harness(platform→harness→png) と sprite で png module を共有する（二重化回避。TASK-32.2）。
+        .png_module = png,
         .extra = &.{
             .{ .name = "sprite", .module = sprite },
         },

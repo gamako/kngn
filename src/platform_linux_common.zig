@@ -9,7 +9,7 @@
 //! から `pub const getTime = common.getTime;` 等で re-export する。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 
 const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;

@@ -312,6 +312,83 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
 > 検証機 jackjack は NixOS（version 表示は 26.11 だが実体は **nixos-unstable**。`nixos-26.11` ブランチは未存在）。
 > jackjack で Apple T2 は `apple-t2x4.conf` プロファイルで Speakers/Headphones sink を生成する。
 
+## ヘッドレス検証 harness（TASK-32 ファミリー）
+
+AI がアプリの出力を手軽に確認するための仕組み。`src/platform.zig`(facade) の 4 フック（`pollEvents`/`nextEvent`/`present`/`getTime`）に `src/harness.zig` を interpose し、**アプリ無改造**で「入力注入 + フレーム捕捉 + 仮想クロック」を行う。env 未設定なら全フック即パススルー（既存挙動と完全一致）。設計の正はトップ階層の `backlog/decisions/decision-1` と TASK-32 系タスク。
+
+- **P1（TASK-32.1, 実装済み）**: file replay + 組み込み `fb` probe（framebuffer→PNG / 1行 digest）+ 仮想クロック。
+- **P2（TASK-32.2, 実装済み）**: live 制御（TCP loopback + driver CLI `scripts/drive`）/ 組み込み `audio`・`stats` probe / record→replay。
+- **P3 以降（未実装）**: custom probe レジストリの app 適用 / offscreen・Metal。
+
+### コマンド言語（file replay と live で共通）
+
+1コマンド/行（区切りは改行 **または `;`**。`#` はコメント）。**file・live で同一文法**:
+
+```text
+inject key_down A          # key_down/key_up <KEY>（KeyCode 名。大小無視。例 A / SPACE / ESCAPE / LEFT / 0）
+inject mouse_move 100 120  # mouse_move <x> <y>
+inject mouse_down left     # mouse_down/up <left|right|middle>
+inject scroll 0 -3         # scroll <dx> <dy>
+step 5                     # 5 フレーム進める（省略時 1）
+snapshot fb  /tmp/out.png  # 直近 present フレームを PNG 保存（省略時 $VP_HARNESS_OUT/frame_<n>.png）
+snapshot audio /tmp/a.wav  # 直近の audio tap を PCM16 WAV 保存（省略時 audio_<n>.wav）
+snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
+digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
+digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n>（mono downmix・自己相関 f0）
+digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...}（JSON 1行）
+quit                       # 終了（EOF でも終了）
+```
+
+- **probe**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `src/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
+  `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
+- **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
+
+### 使い方（replay = file トランスポート）
+
+```bash
+cat > /tmp/script.txt <<'EOF'
+inject key_down A; step 2; digest fb; snapshot fb /tmp/out.png
+quit
+EOF
+VP_HARNESS_SCRIPT=/tmp/script.txt VP_HARNESS_OUT=/tmp zig build run            # main（example/synth 等も無改造で可）
+# → /tmp/*.png を Read で目視、digest を assert（同一スクリプト再実行で PNG は bit 一致＝決定論）
+
+zig build test-harness   # 単体テスト（parser/実行モデル/仮想クロック/audio 解析/WAV/stats。display 不要・backend 非依存）
+```
+
+### 使い方（live = TCP loopback + driver CLI）
+
+アプリを背景起動しておき、`scripts/drive` で1接続=1リクエスト=1レスポンスを叩く。状態はプロセスに残る。
+
+```bash
+zig build drive                                   # 一度だけ zig-out/bin/drive を生成（zig build でも入る）
+VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port VP_HARNESS_OUT=/tmp \
+  VP_HARNESS_RECORD=/tmp/live.txt zig build run-synth &        # 背景起動（ephemeral port を /tmp/vp.port に出力）
+# 固定 port は VP_HARNESS_PORT=<n>。ポートは stderr にも出る。
+scripts/drive --port-file /tmp/vp.port 'inject key_down A; step 5; digest fb'   # → fb ... を stdout に返す
+scripts/drive --port-file /tmp/vp.port 'digest audio'                          # → audio rms=.. f0=.. ..
+scripts/drive --port-file /tmp/vp.port 'snapshot fb /tmp/out.png'              # → /tmp/out.png
+scripts/drive --port-file /tmp/vp.port 'quit'                                  # アプリ終了
+# record→replay 対称: 上の VP_HARNESS_RECORD のログを replay すれば同じコマンド列を再現できる
+VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
+```
+
+| env | 役割 |
+|---|---|
+| `VP_HARNESS_SCRIPT=<file>` | **replay** 有効化（file トランスポート） |
+| `VP_HARNESS_LIVE=1` | **live** 有効化（ephemeral port で listen） |
+| `VP_HARNESS_PORT=<n>` | live を固定 port で有効化 |
+| `VP_HARNESS_PORT_FILE=<file>` | 選ばれた port の出力先（省略時 `$VP_HARNESS_OUT/harness.port`） |
+| `VP_HARNESS_RECORD=<file>` | live 受信コマンドを追記（→ `VP_HARNESS_SCRIPT` で replay 可能） |
+| `VP_HARNESS_OUT=<dir>` | snapshot 省略 path / port file の既定ディレクトリ |
+
+> SCRIPT と LIVE/PORT の同時指定はエラーで無効化（1プロセス1トランスポート）。env 未設定なら全フック即パススルー。
+
+- **実行モデル**: 非 step（inject/snapshot/digest）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
+- **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
+- **制約**: 実ウィンドウは生成する（display 必須。macOS は通常 OK、Linux は Xvfb/実セッション）。完全 display-less は P4。`audio` は RT スレッド実時間依存なので record→replay で digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論）。live の accept ブロック中は window pump が止まる。Metal backend の fb 捕捉は P4。
+- **driver は std.Io.net 1本実装**で mac/Linux 同一コード（Windows ポートは TASK-31 進捗次第）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
+
 ## よく使うコマンド
 
 ```bash

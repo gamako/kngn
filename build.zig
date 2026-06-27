@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
 
     for (backends) |be| {
         const is_default = (be == platform_option);
-        const pm = makePlatformModules(b, target, be);
+        const pm = makePlatformModules(b, target, be, example_modules.types, example_modules.harness);
 
         // ----- メインアプリケーション -----
         const main_exe = addMainExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, APP_NAME, be, default_be), &pm);
@@ -162,6 +162,20 @@ pub fn build(b: *std.Build) void {
         addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
     }
 
+    // ----- 検証 harness の live driver CLI（TASK-32.2）-----
+    // 純 std + std.Io.net の単独 exe（platform/audio 非依存）。常に install して compile 回帰も兼ねる。
+    // `scripts/drive` wrapper が `zig-out/bin/drive` を直接 exec する。
+    const drive_exe = b.addExecutable(.{
+        .name = "drive",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/drive.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(drive_exe);
+    addBuildStep(b, "drive", "Build the live harness driver CLI (zig-out/bin/drive)", drive_exe);
+
     // ========================================
     // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
     // facade module(addModule "platform") と責務分離。外部は dep.artifact("platform_native_<plat>")
@@ -207,6 +221,33 @@ pub fn build(b: *std.Build) void {
     });
     const png_encode_test = b.addTest(.{ .root_module = png_encode_mod });
     test_png_roundtrip_step.dependOn(&b.addRunArtifact(png_encode_test).step);
+
+    // harness 単体テスト（parser / 実行モデル / 仮想クロック。display 不要・backend 非依存。TASK-32.1）
+    const harness_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // harness.init() は libc getenv を使う（init を呼ぶテストでも通るように）
+    });
+    harness_test_mod.addImport("png", example_modules.png); // harness が encodePNG/crc32 を使う
+    harness_test_mod.addImport("platform_types", example_modules.types); // harness が Event/EventStats 等を使う
+    const harness_test = b.addTest(.{ .root_module = harness_test_mod });
+    const run_harness_test = b.addRunArtifact(harness_test);
+    const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
+    test_harness_step.dependOn(&run_harness_test.step);
+
+    // 共有型 module（platform_types）の単体テスト（ModifierFlags round-trip 等）。
+    // TASK-32.2 で platform_types を named module 化したため、source-include で拾われなくなった分を
+    // 独立 step として明示的にカバーする。
+    const platform_types_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform_types.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
+    test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
     // canvas.zig 単体テスト
     const canvas_test = b.addTest(.{
@@ -341,13 +382,13 @@ pub fn build(b: *std.Build) void {
     // platform_linux_input.zig テスト（X11 入力の純粋変換: keycode/modifier/EventQueue/KeyDownSet）
     // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.3）
     // ========================================
-    const platform_input_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/platform_linux_input.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const platform_input_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform_linux_input.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    platform_input_test_mod.addImport("platform_types", example_modules.types);
+    const platform_input_test = b.addTest(.{ .root_module = platform_input_test_mod });
     const run_platform_input_test = b.addRunArtifact(platform_input_test);
     const test_platform_input_step = b.step("test-platform-input", "Run X11 input mapping/queue unit tests");
     test_platform_input_step.dependOn(&run_platform_input_test.step);
@@ -371,13 +412,13 @@ pub fn build(b: *std.Build) void {
     // platform_wayland_input.zig テスト（Wayland 入力の純粋変換: evdev+8/BTN_*/wl_fixed/xkb modifier/
     // axis scroll/scroll coalesce/repeat timing）。純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.5.3）
     // ========================================
-    const platform_wayland_input_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/platform_wayland_input.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const platform_wayland_input_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform_wayland_input.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    platform_wayland_input_test_mod.addImport("platform_types", example_modules.types);
+    const platform_wayland_input_test = b.addTest(.{ .root_module = platform_wayland_input_test_mod });
     const run_platform_wayland_input_test = b.addRunArtifact(platform_wayland_input_test);
     const test_platform_wayland_input_step = b.step("test-platform-wayland-input", "Run Wayland input mapping/scroll/repeat unit tests");
     test_platform_wayland_input_step.dependOn(&run_platform_wayland_input_test.step);
@@ -386,13 +427,13 @@ pub fn build(b: *std.Build) void {
     // platform_windows_input.zig テスト（Windows 入力の純粋変換: VK→KeyCode/modifier(post-state)/wheel 符号）
     // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-31 / AC#3）
     // ========================================
-    const platform_windows_input_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/platform_windows_input.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const platform_windows_input_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform_windows_input.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    platform_windows_input_test_mod.addImport("platform_types", example_modules.types);
+    const platform_windows_input_test = b.addTest(.{ .root_module = platform_windows_input_test_mod });
     const run_platform_windows_input_test = b.addRunArtifact(platform_windows_input_test);
     const test_platform_windows_input_step = b.step("test-platform-windows-input", "Run Windows input mapping/modifier/wheel unit tests");
     test_platform_windows_input_step.dependOn(&run_platform_windows_input_test.step);
@@ -527,6 +568,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_convert_step);
     test_step.dependOn(test_platform_wayland_input_step);
     test_step.dependOn(test_platform_windows_input_step);
+    test_step.dependOn(test_harness_step);
+    test_step.dependOn(test_platform_types_step);
 }
 
 // ============================================================
@@ -546,13 +589,15 @@ const PlatformModules = struct {
     keyboard: *std.Build.Module,
 };
 
-fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType) PlatformModules {
+fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, types_mod: *std.Build.Module, harness_mod: *std.Build.Module) PlatformModules {
     const platform_mod = platform.createPlatformModule(
         b,
         target,
         b.path("src/platform.zig"),
         b.path("platform"),
         backend,
+        types_mod,
+        harness_mod,
     );
     // keyboard は KeyCode 型定義を platform から借りる
     const keyboard_mod = b.createModule(.{
@@ -606,6 +651,8 @@ const ExampleModules = struct {
     audio: *std.Build.Module,
     synth: *std.Build.Module,
     dsp: *std.Build.Module,
+    harness: *std.Build.Module,
+    types: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
@@ -626,6 +673,15 @@ const ExampleModules = struct {
         const png = b.addModule("png", .{
             .root_source_file = b.path("libs/png/src/lib.zig"),
         });
+
+        // 共有型 module（platform_types）: KeyCode/Event/EventStats 等の単一ソース。
+        // platform module(facade+backends) と harness module が **同一インスタンス** を import して
+        // 型同一性を保つ（Event/EventStats を harness↔platform 間で受け渡すため。TASK-32.2）。
+        const types_mod = b.createModule(.{
+            .root_source_file = b.path("src/platform_types.zig"),
+        });
+        // 公開 platform module は `@import("platform_types")`（+ harness）に依存（harness が png を持つ）。
+        platform_mod.addImport("platform_types", types_mod);
         const sprite = b.createModule(.{
             .root_source_file = b.path("src/sprite.zig"),
         });
@@ -658,6 +714,21 @@ const ExampleModules = struct {
             .root_source_file = b.path("src/audio.zig"),
         });
 
+        // harness（ヘッドレス検証）: platform facade と audio facade が共有する **単一インスタンス**。
+        // module-level state（audio tap 等）を1 exe 内で共有させるため、同じ harness_mod を
+        // platform module(per-backend, makePlatformModules→createPlatformModule) と audio module の
+        // 両方に注入する (TASK-32.2)。harness は png(encodePNG/crc32) に依存し getenv で link_libc。
+        const harness_mod = b.createModule(.{
+            .root_source_file = b.path("src/harness.zig"),
+            .link_libc = true,
+        });
+        harness_mod.addImport("png", png);
+        harness_mod.addImport("platform_types", types_mod);
+        // 公開 platform module（addModule "platform"）も harness 経由になるため伝播。
+        platform_mod.addImport("harness", harness_mod);
+        // audio facade（src/audio.zig）が `@import("harness")` で onAudioSamples を呼ぶ。
+        audio_mod.addImport("harness", harness_mod);
+
         // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
         const dsp_mod = b.createModule(.{
             .root_source_file = b.path("src/dsp/dsp.zig"),
@@ -686,6 +757,8 @@ const ExampleModules = struct {
             .audio = audio_mod,
             .synth = synth_mod,
             .dsp = dsp_mod,
+            .harness = harness_mod,
+            .types = types_mod,
         };
     }
 };

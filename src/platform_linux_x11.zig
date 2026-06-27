@@ -22,7 +22,7 @@
 //! `platform_linux_input.zig`（@cImport しない純 Zig）に分離し、本ファイルは XEvent から値を取り出して呼ぶだけ。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 const input = @import("platform_linux_input.zig");
 const conv = @import("platform_linux_convert.zig");
 const common = @import("platform_linux_common.zig");

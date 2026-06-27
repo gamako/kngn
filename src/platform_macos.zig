@@ -7,7 +7,7 @@
 //! C 値からそれらを構築する変換層と、`Window`/`Framebuffer`・関数群を提供する。
 
 const std = @import("std");
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 
 const c = @cImport({
     @cInclude("platform.h");

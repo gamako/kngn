@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const win = std.os.windows;
-const types = @import("platform_types.zig");
+const types = @import("platform_types");
 const input = @import("platform_windows_input.zig");
 
 const Error = types.Error;

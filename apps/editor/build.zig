@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
+        // harness(platform→harness→png) と core/png で png module を共有する（二重化回避。TASK-32.2）。
+        .png_module = png,
         .extra = &.{
             .{ .name = "core", .module = core },
             .{ .name = "gui", .module = gui },
