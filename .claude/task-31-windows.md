@@ -168,4 +168,47 @@ macOS(objc/swift/metal) / Linux(x11/wayland) に続く **Windows ネイティブ
   （`cd examples/XX && zig build`）は失敗する**。top-level の `zig build`（リポジトリ root）は実パスを使うため影響なし。
   恒久対策の候補: (a) `core.symlinks=true` + Developer Mode で再 checkout、(b) `.gitattributes` で symlink を
   Windows でも扱う運用、(c) 必要資産を実ファイル化。windows-port では未対応（top-level ビルドで全 sample が動くため）。
+
+---
+
+## codex レビュー対応（2026-06-27 / `.claude/task-31-codex-review.md`）
+
+Mac 側 codex レビューの指摘を windows-port 上で修正。**WASAPI audio は TASK-31 から分離**し、windows-port は
+Win32+GDI+入力 + build/examples 修正のみに絞った（`zig build -Dinstall-all` / `zig build test` が audio 無しで緑）。
+
+### WASAPI 分離（→ TASK-31.1 / ブランチ `windows-audio`）
+- WASAPI の 2 コミット（`28ea425` feat / `75f784a` docs）を `git branch windows-audio` で退避し、windows-port を
+  `809b7cf` に `reset --hard`。windows-port から `src/audio_windows.zig`・audio facade の windows 分岐・build.zig の
+  WASAPI 配線を除去（audio は再び macOS/Linux のみ gating）。WASAPI 本体は windows-audio で TASK-31.1 として継続。
+
+### blocker
+1,2. `examples/15_audio_tone/build.zig` が旧スタイル（`createPlatformModule` 旧シグネチャ / `PlatformType` 非網羅
+   switch）で TASK-28 以降ビルド不能だった → 他 example と同じ `buildStandalone`（OS 別 backend 自動）へ移行。
+   audio リンクは `buildStandalone` に `link_audio` オプションを追加（macOS=AudioToolbox / Linux=alsa、Windows は
+   audio 未対応で no-op = facade compileError に委ねる）。
+
+### major
+3. 物理キーを **scancode 主体**に変更（`scancodeToKeyCode`、lParam bits16-23 の PS/2 set1 make code + bit24 拡張）。
+   英字/数字/記号位置が layout 非依存になり X11/Wayland と意味論一致。scancode 表に無い特殊キー（Pause/PrintScreen/
+   F13+）のみ VK に fallback。VK 英字直マップは廃止。純ロジックは host テスト（`scancodeToKeyCode` ケース追加）。
+4. mouse/key の修飾を内部 KeyDownSet ではなく **`GetKeyState`** から読む（ウィンドウ外での修飾変化・focus 前押下・
+   key-up 取り逃しによる stale を解消）。KeyDownSet 依存を撤去。
+5. `WM_KILLFOCUS` / `WM_CAPTURECHANGED` を処理。押下中ボタンへ直近座標で synthetic mouse_up を流して締め、
+   capture も解放（pixie の stroke が focus/capture 喪失で宙ぶらりんにならない）。
+
+### minor
+7. `shutdown()` で `UnregisterClassW` し `g_class_registered=false`（init と対称）。
+8. `AdjustWindowRectEx` の戻り値を確認し失敗時 `error.WindowCreationFailed`。
+9. `-Dplatform` ヘルプ文に Windows を明記（build.zig / build_helpers/platform.zig）。
+
+### 見送り（軽微）
+- `platform.sleep` の POSIX nanosleep EINTR 再試行（frame pacing には不要のため未対応。レビューも「軽微」）。
+- WASAPI の RT スレッド/COM apartment 検証（#6）は TASK-31.1（windows-audio）で扱う。
+
+### 検証（windows-port）
+- `zig build test` / `zig build test-platform-windows-input`（scancode ケース含む）緑。
+- `zig build -Dinstall-all=true` で main+pixie+examples 01-14 の 16 exe を Windows ビルド成功（synth/example_15 は audio gating で非生成）。
+- main(虹) を起動しスクショで描画回帰なしを確認。`examples/15_audio_tone/build.zig` は ast-check 緑（standalone 実行は
+  build_helpers symlink が Windows で壊れるため不可。Mac 再レビューで確認）。
+- **macOS/Linux 退行確認は Mac 側で実施**（cross-compile は SDK/X11 lib が要るため Windows host では不可）。
 <!-- SECTION:NOTES:END -->
