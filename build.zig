@@ -53,9 +53,9 @@ pub fn build(b: *std.Build) void {
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
 
-    // audio (L1 出力) backend は macOS(AudioToolbox) / Linux(ALSA) のみ。Windows(WASAPI) は別タスクなので
-    // synth アプリ / example_15(audio) を Windows では生成しない（linkAudioBackend が非対応 OS で panic する）。
-    const audio_supported = (target_os == .macos or target_os == .linux);
+    // audio (L1 出力) backend は macOS(AudioToolbox) / Linux(ALSA) のみ。Windows(WASAPI) は TASK-31.1。
+    // synth アプリ / example_15(audio) を Windows では生成しない（判定は standalone と共有 helper に集約）。
+    const audio_supported = platform.audioSupported(target_os);
 
     // ========================================
     // main / pixie / synth / examples を backend ごとに生成

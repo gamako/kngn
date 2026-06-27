@@ -7,7 +7,7 @@
 //!   - Linux → `audio_linux.zig`（ALSA を extern fn で叩く）
 //!
 //! audio 層は `@cImport` せず必要な C ABI を extern fn で取り込む方針で統一している
-//! （build が単純・header search path 不要。将来 Windows WASAPI/COM も同方針）。
+//! （build が単純・header search path 不要）。Windows(WASAPI/COM) は TASK-31.1（ブランチ windows-audio）。
 
 const builtin = @import("builtin");
 

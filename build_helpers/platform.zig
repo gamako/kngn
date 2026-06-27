@@ -41,6 +41,13 @@ pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     };
 }
 
+/// L1 オーディオ出力 backend が当該 OS で実装済みか（macOS=AudioToolbox / Linux=ALSA）。
+/// Windows(WASAPI) は TASK-31.1（別ブランチ windows-audio）。top-level build.zig と standalone の両方で
+/// audio 必須ターゲット（synth / example_15）の gate に使う（判定を 1 箇所に集約する）。
+pub fn audioSupported(os: std.Target.Os.Tag) bool {
+    return os == .macos or os == .linux;
+}
+
 /// `-Dplatform` で指定された backend が対象 OS に対して妥当か検証する。
 /// 不整合（macOS backend を Linux で等）は build エラーにする。
 /// （panic のスタックトレースを避け、1 行の明確なメッセージで停止する）
@@ -285,6 +292,14 @@ pub fn buildStandalone(
         "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows)",
     ) orelse defaultBackend(target_os);
     assertBackendForOs(platform_option, target_os);
+
+    // audio 必須の standalone（example_15 等）は audio 非対応 OS では exe を生成しない
+    // （top-level build.zig の audio_supported gate と同じ。無いと Windows target で audio facade の
+    // compileError に落ちる）。-Dtarget/-Dplatform は上で受理済みなので、ここで何も step を作らず早期 return。
+    if (spec.link_audio and !audioSupported(target_os)) {
+        std.log.info("standalone '{s}': audio 非対応 OS ({s}) のためスキップ（WASAPI は TASK-31.1 / windows-audio）", .{ spec.base_name, @tagName(target_os) });
+        return;
+    }
 
     const sdk_paths: ?macos.MacOSSDKPaths = if (target_os == .macos)
         macos.resolveMacOSSDKPaths(b, null, null)
