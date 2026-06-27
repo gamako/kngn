@@ -24,6 +24,7 @@ const EventStats = types.EventStats;
 const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
 const MouseEvent = types.MouseEvent;
+const ModifierFlags = types.ModifierFlags;
 const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;
 const DialogError = types.DialogError;
@@ -77,6 +78,8 @@ const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_SYSKEYUP: UINT = 0x0105;
+const WM_KILLFOCUS: UINT = 0x0008; // フォーカス喪失 → 押下中ボタンを解放（取り逃し防止）
+const WM_CAPTURECHANGED: UINT = 0x0215; // capture 喪失 → 同上
 const WM_MOUSEMOVE: UINT = 0x0200;
 const WM_LBUTTONDOWN: UINT = 0x0201;
 const WM_LBUTTONUP: UINT = 0x0202;
@@ -89,10 +92,6 @@ const WM_MOUSEHWHEEL: UINT = 0x020E;
 
 const KF_REPEAT_BIT: usize = 0x40000000; // lParam bit30: 直前に押下されていた（リピート）
 const KF_EXTENDED_BIT: usize = 0x01000000; // lParam bit24: 拡張キー（右 Ctrl/Alt, テンキー Enter 等）
-const MAPVK_VSC_TO_VK_EX: UINT = 3;
-
-const VK_RETURN: u32 = 0x0D;
-const VK_SEPARATOR: u32 = 0x6C; // テンキー Enter を KP_ENTER に正規化する先
 
 // GDI
 const BI_RGB: DWORD = 0;
@@ -219,9 +218,10 @@ extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
 extern "user32" fn ScreenToClient(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
-extern "user32" fn MapVirtualKeyW(uCode: UINT, uMapType: UINT) callconv(.winapi) UINT;
+extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16; // 修飾の現在状態（高位ビット=押下）
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+extern "user32" fn UnregisterClassW(lpClassName: LPCWSTR, hInstance: ?HINSTANCE) callconv(.winapi) BOOL;
 
 extern "gdi32" fn StretchDIBits(
     hdc: HDC,
@@ -277,7 +277,11 @@ pub fn init() Error!void {
 }
 
 pub fn shutdown() void {
-    // ウィンドウクラスは登録したまま（プロセス終了で解放）。再 init は g_class_registered で冪等。
+    // init と対称にクラス登録を解除する（全 window が destroy 済み前提）。失敗（未登録/window 残存）は無視。
+    if (g_class_registered) {
+        _ = UnregisterClassW(class_name, g_hinstance);
+        g_class_registered = false;
+    }
 }
 
 pub fn getTime() f64 {
@@ -306,7 +310,8 @@ const State = struct {
 
     // 入力 post-state
     buttons: MouseButtons, // 現在押下中のマウスボタン集合
-    keys: input.KeyDownSet, // VK 押下集合（修飾 post-state 判定）
+    last_x: i32, // 直近のマウス client 座標（focus/capture 喪失時の synthetic mouse_up 用）
+    last_y: i32,
 
     fn enqueue(self: *State, ev: Event) void {
         self.queue.enqueue(ev);
@@ -330,9 +335,9 @@ pub const Window = struct {
         title_buf[tn] = 0;
         const title_ptr: LPCWSTR = @ptrCast(&title_buf);
 
-        // client area を width×height にするため outer 寸法を算出する。
+        // client area を width×height にするため outer 寸法を算出する。失敗時は寸法がズレるので中断。
         var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
-        _ = AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0);
+        if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
         const outer_w = rect.right - rect.left;
         const outer_h = rect.bottom - rect.top;
 
@@ -354,7 +359,8 @@ pub const Window = struct {
             .quit_delivered = false,
             .queue = .{},
             .buttons = .{},
-            .keys = .{},
+            .last_x = 0,
+            .last_y = 0,
         };
 
         const hwnd = CreateWindowExW(
@@ -498,7 +504,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_MOUSEMOVE => {
-            st.enqueue(.{ .mouse_move = mouseEvent(st, lparam, .none) });
+            handleMotion(st, lparam);
             return 0;
         },
         WM_LBUTTONDOWN => {
@@ -533,43 +539,55 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             handleWheel(st, hwnd, wparam, lparam, true);
             return 0;
         },
+        // focus / capture 喪失: 押下中ボタンは以後 up を取り逃すので synthetic mouse_up で締めて状態を clear。
+        // （ドラッグ中に Alt+Tab / 他ウィンドウへ capture が移った場合の stale 防止。修飾は GetKeyState を都度読むので別途 clear 不要）
+        WM_KILLFOCUS, WM_CAPTURECHANGED => {
+            releaseHeldButtons(st);
+            return 0;
+        },
         else => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-/// generic 修飾 VK（VK_SHIFT/CONTROL/MENU）を scancode / 拡張ビットで左右の VK へ解決する。
-/// テンキー Enter（VK_RETURN + 拡張）は VK_SEPARATOR に正規化し KP_ENTER として扱う。
-fn resolveVk(vk: u32, lparam: LPARAM) u32 {
-    const lp: usize = @bitCast(lparam);
-    const scancode: UINT = @intCast((lp >> 16) & 0xFF);
-    const extended = (lp & KF_EXTENDED_BIT) != 0;
-    return switch (vk) {
-        input.VK_SHIFT => MapVirtualKeyW(scancode, MAPVK_VSC_TO_VK_EX), // → VK_LSHIFT/VK_RSHIFT
-        input.VK_CONTROL => if (extended) input.VK_RCONTROL else input.VK_LCONTROL,
-        input.VK_MENU => if (extended) input.VK_RMENU else input.VK_LMENU,
-        VK_RETURN => if (extended) VK_SEPARATOR else VK_RETURN,
-        else => vk,
+/// 現在の修飾状態を GetKeyState（OS が message に同期して保持する状態）から読む。
+/// per-event の mask が無い Win32 で、key/mouse とも「今押されている修飾」を正しく得る
+/// （ウィンドウ外での修飾変化・focus 前の押下・key-up 取り逃しによる stale を避ける。レビュー major #4）。
+/// GetKeyState は SHORT を返し、押下中は高位ビットが立つ（= 値が負）。cmd は Windows キー（左右いずれか）。
+fn modifiersNow() ModifierFlags {
+    return .{
+        .shift = GetKeyState(@intCast(input.VK_SHIFT)) < 0,
+        .ctrl = GetKeyState(@intCast(input.VK_CONTROL)) < 0,
+        .alt = GetKeyState(@intCast(input.VK_MENU)) < 0,
+        .cmd = GetKeyState(@intCast(input.VK_LWIN)) < 0 or GetKeyState(@intCast(input.VK_RWIN)) < 0,
     };
 }
 
+/// WM_KEY* の lParam から物理キーを得る。**scancode（物理位置・layout 非依存）を主**にし、
+/// scancode 表に無い特殊キー（Pause / PrintScreen / F13+ 等）だけ wParam(virtual key) に fallback する
+/// （X11/Wayland の物理キー契約と揃える。レビュー major #3）。
+fn keyFromMessage(wparam: WPARAM, lparam: LPARAM) types.KeyCode {
+    const lp: usize = @bitCast(lparam);
+    const scancode: u32 = @intCast((lp >> 16) & 0xFF);
+    const extended = (lp & KF_EXTENDED_BIT) != 0;
+    const k = input.scancodeToKeyCode(scancode, extended);
+    if (k != .UNKNOWN) return k;
+    return input.vkToKeyCode(@intCast(wparam)); // scancode 表に無いキーを VK で補完
+}
+
 fn handleKeyDown(st: *State, wparam: WPARAM, lparam: LPARAM) void {
-    const vk = resolveVk(@intCast(wparam), lparam);
-    st.keys.setDown(vk, true); // 修飾 post-state を反映してから event を作る
     const lp: usize = @bitCast(lparam);
     st.enqueue(.{ .key_down = .{
-        .key = input.vkToKeyCode(vk),
+        .key = keyFromMessage(wparam, lparam),
         .is_repeat = (lp & KF_REPEAT_BIT) != 0,
-        .modifiers = input.modifiersFromKeys(&st.keys),
+        .modifiers = modifiersNow(),
     } });
 }
 
 fn handleKeyUp(st: *State, wparam: WPARAM, lparam: LPARAM) void {
-    const vk = resolveVk(@intCast(wparam), lparam);
-    st.keys.setDown(vk, false);
     st.enqueue(.{ .key_up = .{
-        .key = input.vkToKeyCode(vk),
+        .key = keyFromMessage(wparam, lparam),
         .is_repeat = false,
-        .modifiers = input.modifiersFromKeys(&st.keys),
+        .modifiers = modifiersNow(),
     } });
 }
 
@@ -596,28 +614,54 @@ fn hiShort(lparam: LPARAM) i32 {
     return @as(i16, @bitCast(@as(u16, @truncate(u >> 16))));
 }
 
-/// client 座標の MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は KeyDownSet 由来。
-fn mouseEvent(st: *State, lparam: LPARAM, button: MouseButton) MouseEvent {
+/// client 座標 (x,y) の MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は GetKeyState。
+/// 直近座標も更新する（focus/capture 喪失時の synthetic mouse_up が位置を引けるように）。
+fn mouseEventAt(st: *State, x: i32, y: i32, button: MouseButton) MouseEvent {
+    st.last_x = x;
+    st.last_y = y;
     return .{
-        .x = loShort(lparam),
-        .y = hiShort(lparam),
+        .x = x,
+        .y = y,
         .button = button,
         .buttons = st.buttons,
-        .modifiers = input.modifiersFromKeys(&st.keys),
+        .modifiers = modifiersNow(),
     };
+}
+
+fn handleMotion(st: *State, lparam: LPARAM) void {
+    st.enqueue(.{ .mouse_move = mouseEventAt(st, loShort(lparam), hiShort(lparam), .none) });
 }
 
 fn handleButton(st: *State, mb: MouseButton, down: bool, lparam: LPARAM) void {
     const had_any = anyButton(st.buttons);
     setButton(st, mb, down); // post-state にしてから event を作る
+    const x = loShort(lparam);
+    const y = hiShort(lparam);
     if (down) {
         // ドラッグがウィンドウ外へ出ても move を受け取れるよう capture（X11 と違い Win32 は明示）。
         if (!had_any) _ = SetCapture(st.hwnd);
-        st.enqueue(.{ .mouse_down = mouseEvent(st, lparam, mb) });
+        st.enqueue(.{ .mouse_down = mouseEventAt(st, x, y, mb) });
     } else {
-        st.enqueue(.{ .mouse_up = mouseEvent(st, lparam, mb) });
+        st.enqueue(.{ .mouse_up = mouseEventAt(st, x, y, mb) });
         if (!anyButton(st.buttons)) _ = ReleaseCapture();
     }
+}
+
+/// focus / capture 喪失時に、押下中の各ボタンへ直近座標で synthetic mouse_up を流して締める
+/// （以後 WM_*BUTTONUP を取り逃すため。pixie 等の stroke を確実に終端する。レビュー major #5）。
+fn releaseHeldButtons(st: *State) void {
+    for ([_]MouseButton{ .left, .right, .middle }) |mb| {
+        const held = switch (mb) {
+            .left => st.buttons.left,
+            .right => st.buttons.right,
+            .middle => st.buttons.middle,
+            else => false,
+        };
+        if (!held) continue;
+        setButton(st, mb, false); // post-state（解放）にしてから event を作る
+        st.enqueue(.{ .mouse_up = mouseEventAt(st, st.last_x, st.last_y, mb) });
+    }
+    _ = ReleaseCapture();
 }
 
 fn handleWheel(st: *State, hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizontal: bool) void {
@@ -626,6 +670,8 @@ fn handleWheel(st: *State, hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizonta
     // wheel の座標は screen 座標なので client へ変換する。
     var pt = POINT{ .x = loShort(lparam), .y = hiShort(lparam) };
     _ = ScreenToClient(hwnd, &pt);
+    st.last_x = pt.x;
+    st.last_y = pt.y;
     const d = input.wheelDelta(delta, horizontal);
     st.enqueue(.{ .mouse_scroll = .{
         .x = pt.x,
@@ -634,7 +680,7 @@ fn handleWheel(st: *State, hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizonta
         .dy = d.dy,
         .is_precise = false,
         .buttons = st.buttons,
-        .modifiers = input.modifiersFromKeys(&st.keys),
+        .modifiers = modifiersNow(),
     } });
 }
 
