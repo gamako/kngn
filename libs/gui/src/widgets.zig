@@ -535,6 +535,61 @@ const HueBarDraw = struct {
 };
 
 // ============================================================
+// Splitter（ペイン境界ドラッグ。TASK-41）
+// ============================================================
+
+pub const Orient = enum { vertical, horizontal };
+
+pub const SplitterOpts = struct {
+    /// 境界帯の太さ（主軸 px）
+    thickness: i32 = 6,
+    min: i32 = 0,
+    max: i32 = std.math.maxInt(i32),
+    /// pane が splitter の右/下にある場合 true: マウス正方向（右/下）ドラッグで pane size は「減る」ので
+    /// delta を反転する（`size += if (invert) -delta else delta`）。左/上 pane は false。
+    invert: bool = false,
+};
+
+/// orient 軸の生 delta（mouse_delta の該当成分）に invert を適用した符号付き delta。
+fn splitterDelta(orient: Orient, mouse_dx: i32, mouse_dy: i32, invert: bool) i32 {
+    const d = if (orient == .vertical) mouse_dx else mouse_dy;
+    return if (invert) -d else d;
+}
+
+/// 境界帯をドラッグして size を増減する（変化したら true）。
+/// 同期 hit-test 契約: 前フレーム rect で buttonBehavior、held 中に mouse_delta を size へ反映し min/max clamp。
+/// vertical=幅 thickness・高さ grow / horizontal=高さ thickness・幅 grow の明示 id box として配置する。
+pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: SplitterOpts) bool {
+    std.debug.assert(opts.thickness > 0);
+    const old = size.*;
+
+    // hit-test / drag（前フレーム rect の帯矩形で active 取得）
+    if (ctx.rect_cache.get(id)) |cached| {
+        const res = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+        if (res.held) {
+            const delta = splitterDelta(orient, ctx.input.mouse_delta.x, ctx.input.mouse_delta.y, opts.invert);
+            size.* = std.math.clamp(size.* + delta, opts.min, opts.max);
+        }
+    }
+
+    // 帯を明示 id box として配置。色は安定 hot_id/active_id（フレーム中不変）で選ぶ。
+    const style = ctx.style;
+    const col = if (ctx.state.active_id == id)
+        style.bg_active
+    else if (ctx.state.hot_id == id)
+        style.border_hover
+    else
+        style.border;
+    switch (orient) {
+        .vertical => ctx.beginBox(.{ .id = id, .width = .{ .fixed = opts.thickness }, .height = .{ .grow = 1 }, .bg = col }),
+        .horizontal => ctx.beginBox(.{ .id = id, .width = .{ .grow = 1 }, .height = .{ .fixed = opts.thickness }, .bg = col }),
+    }
+    ctx.endBox();
+
+    return size.* != old;
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -612,6 +667,74 @@ test "button: 同一フレーム press+release でも clicked（21.2 仕様の�
     clickAt(&ctx, c.x, c.y);
     try std.testing.expect(ctx.button("Btn"));
     ctx.endFrame();
+}
+
+test "splitterDelta: orient 軸選択と invert 符号" {
+    try std.testing.expectEqual(@as(i32, 30), splitterDelta(.vertical, 30, 5, false)); // vertical は x
+    try std.testing.expectEqual(@as(i32, -30), splitterDelta(.vertical, 30, 5, true)); // invert で反転
+    try std.testing.expectEqual(@as(i32, 7), splitterDelta(.horizontal, 30, 7, false)); // horizontal は y
+    try std.testing.expectEqual(@as(i32, -7), splitterDelta(.horizontal, 30, 7, true));
+}
+
+test "splitter: vertical drag が size を delta 分動かし max で clamp する" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var size: i32 = 200;
+    const ID: Id = 0x5117e1;
+    const opts: SplitterOpts = .{ .min = 100, .max = 400, .thickness = 6 };
+
+    // frame1: 登録（rect cache 生成）
+    ctx.beginFrame(800, 600);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(ID).?);
+
+    // frame2: press（active 取得。press までの移動 delta は size に影響しうるので値は assert しない）
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, c.x, c.y);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+
+    // frame3: +30 ドラッグ（mouse_delta.x = 30、invert=false）→ size += 30
+    const before = size;
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, c.x + 30, c.y);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+    try std.testing.expectEqual(before + 30, size);
+
+    // frame4: 大きく + ドラッグ → max=400 で clamp
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, c.x + 1000, c.y);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(i32, 400), size);
+}
+
+test "splitter: horizontal + invert で逆方向に動く" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var size: i32 = 200;
+    const ID: Id = 0x5117e2;
+    const opts: SplitterOpts = .{ .min = 100, .max = 400, .thickness = 6, .invert = true };
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.splitter(ID, .horizontal, &size, opts);
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(ID).?);
+
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, c.x, c.y);
+    _ = ctx.splitter(ID, .horizontal, &size, opts);
+    ctx.endFrame();
+
+    // +30 を y 方向にドラッグ → invert で size -= 30
+    const before = size;
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, c.x, c.y + 30);
+    _ = ctx.splitter(ID, .horizontal, &size, opts);
+    ctx.endFrame();
+    try std.testing.expectEqual(before - 30, size);
 }
 
 fn buildPalette(ctx: *Context, results: *[16]ButtonResult) void {

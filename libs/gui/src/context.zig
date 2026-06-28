@@ -89,6 +89,8 @@ pub const Context = struct {
     pub const svSquareId = widgets.svSquareId;
     pub const hueBar = widgets.hueBar;
     pub const hueBarId = widgets.hueBarId;
+    // Splitter（ペイン境界。TASK-41）
+    pub const splitter = widgets.splitter;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{
