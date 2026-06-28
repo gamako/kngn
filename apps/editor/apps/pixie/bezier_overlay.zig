@@ -15,7 +15,9 @@ const ANCHOR_COLOR = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // 白
 const SELECTED_COLOR = gui.Color.rgba(0xFF, 0xE0, 0x00, 0xFF); // 黄（選択中）
 
 /// 編集中パスのプレビューを描く（path 空なら何もしない）。
-pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core.Rect, zoom: i32) void {
+/// clip_area（canvas area rect）と canvas 表示矩形の交差で clip する。ズームで表示矩形が
+/// area を超えても、右ペイン/メニューへ overlay が侵食しない（TASK-39）。
+pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core.Rect, zoom: i32, clip_area: gui.Rect) void {
     const path = &editor.path;
     if (path.anchors.items.len == 0) return;
 
@@ -26,7 +28,7 @@ pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core
         .w = @intCast(canvas_rect.w * zoom),
         .h = @intCast(canvas_rect.h * zoom),
     };
-    dl.pushClip(disp) catch @panic("bezier_overlay: OOM");
+    dl.pushClip(disp.intersect(clip_area)) catch @panic("bezier_overlay: OOM");
     defer dl.popClip();
 
     // 曲線（flatten 点列を 1px 線で連結）

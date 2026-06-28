@@ -65,6 +65,20 @@ pub const Canvas = struct {
         return self.composite_cache;
     }
 
+    /// 表示用アルファ保持合成（透明背景に各 visible layer を実 src-over）。チェッカー背景への重ね描き用。
+    /// composite() と違い背景を白で埋めない（完全透明部は a=0 のまま残る）。保存には使わない（保存=raw layer pixels）。
+    /// 戻りは straight-alpha BGRA。blit 側で背景（チェッカー）へ src-over する前提。
+    pub fn compositeStraight(self: *Canvas) []const u32 {
+        @memset(self.composite_cache, 0x00000000); // transparent background
+        for (self.layers.items) |layer| {
+            if (!layer.visible) continue;
+            for (layer.pixels, self.composite_cache) |src, *dst| {
+                dst.* = blend.srcOver(dst.*, blend.scaleAlpha(src, layer.opacity));
+            }
+        }
+        return self.composite_cache;
+    }
+
     pub fn clear(self: *Canvas) void {
         for (self.layers.items) |layer| {
             @memset(layer.pixels, 0);
@@ -213,4 +227,40 @@ test "composite: 2 層 src-over（下層→上層順）" {
 
     const out = c.composite()[0];
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), out); // 上層(赤)が下層(青)を覆う
+}
+
+test "compositeStraight: 全透明は a=0 維持 / 不透明は元色 / 半透明は out_a を保持" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 3, 1);
+    defer c.deinit();
+    const px = c.layerPixels(0);
+    px[0] = 0xFF0000FF; // 不透明青
+    px[1] = 0x00000000; // 完全透明
+    px[2] = 0x800000FF; // 半透明青（a=128）
+
+    const out = c.compositeStraight();
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]); // 不透明は元色
+    try std.testing.expectEqual(@as(u32, 0x00000000), out[1]); // 透明は a=0 維持（白で埋めない）
+    try std.testing.expectEqual(@as(u32, 128), (out[2] >> 24) & 0xFF); // 半透明の out_a を保持
+    try std.testing.expectEqual(@as(u32, 0xFF), out[2] & 0xFF); // B=255
+}
+
+test "compositeStraight: visible=false スキップ / 2 層は上が下を src-over してアルファ保持" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 1, 1);
+    defer c.deinit();
+    c.layerPixels(0)[0] = 0xFF0000FF; // 下層: 不透明青
+    c.layers.items[0].visible = false;
+    try std.testing.expectEqual(@as(u32, 0x00000000), c.compositeStraight()[0]); // スキップ → 透明維持
+
+    c.layers.items[0].visible = true;
+    const top = try gpa.alloc(u32, 1);
+    top[0] = 0x80FF0000; // 上層: 半透明赤（a=128）
+    try c.layers.append(gpa, .{ .pixels = top });
+    const out = c.compositeStraight()[0];
+    try std.testing.expectEqual(@as(u32, 0xFF), (out >> 24) & 0xFF); // 下層不透明 → out_a=255
+    const r = (out >> 16) & 0xFF;
+    const b = out & 0xFF;
+    try std.testing.expect(r > 120 and r < 135); // 赤が約半分
+    try std.testing.expect(b > 120 and b < 135); // 青が約半分
 }

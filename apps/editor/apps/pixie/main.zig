@@ -25,7 +25,14 @@ const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
 const CANVAS_W: u32 = 256;
 const CANVAS_H: u32 = 256;
-const ZOOM: i32 = 2;
+// ビューポート（TASK-39）: ズームは整数倍のランタイム値。既定 2x で従来の見た目を維持。
+const ZOOM_MIN: i32 = 1;
+const ZOOM_MAX: i32 = 32;
+const ZOOM_DEFAULT: i32 = 2;
+// 透明背景チェッカー（screen 固定セル。canonical BGRA 0xAARRGGBB）
+const CHECKER_CELL: i32 = 8;
+const CHECKER_LIGHT: u32 = 0xFF_6A_6A_6A;
+const CHECKER_DARK: u32 = 0xFF_4E_4E_4E;
 const SAVE_MSG_DURATION: f64 = 3.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
@@ -109,6 +116,18 @@ const App = struct {
     bezier_editor: core.PathEditor = .{},
     bez_in: bezier_input.BezierInput = .{},
     active_kind: ToolKind = .pen,
+    /// ── ビューポート（TASK-39）。view_zoom は整数倍、pan は表示領域中央基準の screen px オフセット ──
+    view_zoom: i32 = ZOOM_DEFAULT,
+    pan_x: i32 = 0,
+    pan_y: i32 = 0,
+    /// 直近フレームの canvas area rect（Fit ズーム計算用。canvasBlitRect が毎フレーム更新）
+    last_area: ?core.Rect = null,
+    /// Space 押下継続（key_down/up で更新）。Space+左ドラッグでパン
+    space_down: bool = false,
+    /// パンドラッグ進行中。開始時に anchor を latch（描画 capture とは排他）
+    pan_active: bool = false,
+    pan_anchor_mouse: core.Vec2 = .{ .x = 0, .y = 0 },
+    pan_anchor_pan: core.Vec2 = .{ .x = 0, .y = 0 },
     /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
@@ -150,6 +169,21 @@ const App = struct {
             self.bezier_editor.update(self.gpa, .cancel);
         }
         self.active_kind = next;
+    }
+
+    /// ズーム倍率を [ZOOM_MIN, ZOOM_MAX] に clamp して設定（パンは canvasBlitRect が次フレームに再クランプ）。
+    fn zoomTo(self: *App, z: i32) void {
+        self.view_zoom = std.math.clamp(z, ZOOM_MIN, ZOOM_MAX);
+    }
+
+    /// canvas が表示領域に収まる最大整数倍へ（Fit）。pan は中央へリセット。last_area 未確定時は無処理。
+    fn fitZoom(self: *App) void {
+        const area = self.last_area orelse return;
+        const fz_x = @divFloor(area.w, @as(i32, @intCast(CANVAS_W)));
+        const fz_y = @divFloor(area.h, @as(i32, @intCast(CANVAS_H)));
+        self.zoomTo(@min(fz_x, fz_y));
+        self.pan_x = 0;
+        self.pan_y = 0;
     }
 
     fn setSaveMsg(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -335,6 +369,11 @@ const App = struct {
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
+        // Space はパン用 modifier（押下継続を追跡。解放は handleKeyUp）。他処理には回さない。
+        if (k.key == .SPACE) {
+            self.space_down = true;
+            return;
+        }
         // ベジェ編集中はツール固有キーを横取り（Enter=確定 / Esc=キャンセル / Delete・Backspace=点削除）
         if (self.active_kind == .bezier and self.bezier_editor.isEditing()) {
             if (k.key == .ENTER or k.key == .KP_ENTER) {
@@ -374,7 +413,22 @@ const App = struct {
             self.setActiveKind(.bezier);
         } else if (k.key == .C) {
             self.doClear();
+        } else if (k.key == .@"0") {
+            self.zoomTo(1); // 100% (1x)
+            self.pan_x = 0;
+            self.pan_y = 0;
+        } else if (k.key == .F) {
+            self.fitZoom();
+        } else if (k.key == .KP_ADD) {
+            self.zoomTo(self.view_zoom + 1);
+        } else if (k.key == .KP_SUBTRACT) {
+            self.zoomTo(self.view_zoom - 1);
         }
+    }
+
+    /// key_up 処理。現状は Space パン modifier の解放のみ。
+    fn handleKeyUp(self: *App, k: platform.KeyEvent) void {
+        if (k.key == .SPACE) self.space_down = false;
     }
 
     /// ベジェ確定（現在ブラシ footprint + color/opacity で rasterize → UndoStack へ push）。
@@ -444,41 +498,158 @@ fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, toolDigest(ctx, &buf));
 }
 
-/// canvas_area rect 内に表示領域（256*ZOOM 四方）を中央配置した canvas rect
-/// （core.Rect の w/h は canvas ピクセル数。screenToCanvas* がこの形を取る）。
-/// 初回フレームは rect キャッシュ未生成なので null（canvas 入力・blit をスキップ）。
-fn canvasBlitRect(ctx: *const gui.Context) ?core.Rect {
+/// canvas_area rect 内に表示領域（CANVAS*zoom 四方）を配置した canvas rect を返す。
+/// vw<=area.w 軸は中央固定（pan=0）、vw>area.w 軸は canvas が area を完全に覆う範囲へ pan を clamp し
+/// app.pan_x/y へ書き戻す。毎フレーム app.last_area も更新する（Fit ズーム計算用）。
+/// 返す core.Rect の w/h は canvas ピクセル数（screenToCanvas* の契約）。初回フレームは null。
+fn canvasBlitRect(ctx: *const gui.Context, app: *App) ?core.Rect {
     const area = ctx.getNodeRect(CANVAS_AREA_ID) orelse return null;
-    const vw: i32 = @as(i32, @intCast(CANVAS_W)) * ZOOM;
-    const vh: i32 = @as(i32, @intCast(CANVAS_H)) * ZOOM;
-    return .{
-        .x = area.x + @divFloor(@as(i32, @intCast(area.w)) - vw, 2),
-        .y = area.y + @divFloor(@as(i32, @intCast(area.h)) - vh, 2),
-        .w = @intCast(CANVAS_W),
-        .h = @intCast(CANVAS_H),
-    };
+    app.last_area = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+
+    const zoom = app.view_zoom;
+    const aw: i32 = @intCast(area.w);
+    const ah: i32 = @intCast(area.h);
+    const vw: i32 = @as(i32, @intCast(CANVAS_W)) * zoom;
+    const vh: i32 = @as(i32, @intCast(CANVAS_H)) * zoom;
+
+    const rx = axisPlace(area.x, aw, vw, &app.pan_x);
+    const ry = axisPlace(area.y, ah, vh, &app.pan_y);
+    return .{ .x = rx, .y = ry, .w = @intCast(CANVAS_W), .h = @intCast(CANVAS_H) };
 }
 
-/// canvas composite を canvas rect へ ZOOM 倍 nearest-neighbor で転送（fb 境界 clip）
-fn blitCanvasZoom(fb: []u32, fb_w: u32, fb_h: u32, composite: []const u32, rect: core.Rect) void {
+/// 1 軸の表示原点を決め、pan を clamp して書き戻す。
+/// vw<=aw: 中央固定（pan=0）。vw>aw: 原点 r ∈ [a + aw - vw, a]（canvas が area を隙間なく覆う）。
+/// off-by-one 回避のため r を clamp してから pan を逆算する。
+fn axisPlace(a: i32, aw: i32, vw: i32, pan: *i32) i32 {
+    const half = @divFloor(aw - vw, 2);
+    if (vw <= aw) {
+        pan.* = 0;
+        return a + half;
+    }
+    var r = a + half + pan.*;
+    const lo = a + aw - vw; // 右/下端を覆う最小原点
+    const hi = a; // 左/上端を覆う最大原点
+    if (r < lo) r = lo;
+    if (r > hi) r = hi;
+    pan.* = r - a - half; // 状態整合
+    return r;
+}
+
+/// canvas の straight-alpha composite を canvas rect へ zoom 倍 nearest で転送。
+/// fb 境界 + clip（canvas area）で intersection clip し、既存 fb 内容（チェッカー背景）へ src-over する。
+/// 不透明 src は置換 / 完全透明は背景維持 / partial はチェッカーへブレンド。
+fn blitCanvasZoom(fb: []u32, fb_w: u32, fb_h: u32, composite: []const u32, rect: core.Rect, zoom: i32, clip: core.Rect) void {
+    const zu: usize = @intCast(zoom);
     for (0..CANVAS_H) |cy| {
         for (0..CANVAS_W) |cx| {
-            const color = composite[cy * CANVAS_W + cx] | 0xFF000000;
-            const base_fx: i32 = rect.x + @as(i32, @intCast(cx)) * ZOOM;
-            const base_fy: i32 = rect.y + @as(i32, @intCast(cy)) * ZOOM;
-            for (0..@as(usize, @intCast(ZOOM))) |dy| {
-                for (0..@as(usize, @intCast(ZOOM))) |dx| {
+            const src = composite[cy * CANVAS_W + cx];
+            const base_fx: i32 = rect.x + @as(i32, @intCast(cx)) * zoom;
+            const base_fy: i32 = rect.y + @as(i32, @intCast(cy)) * zoom;
+            for (0..zu) |dy| {
+                for (0..zu) |dx| {
                     const fx: i32 = base_fx + @as(i32, @intCast(dx));
                     const fy: i32 = base_fy + @as(i32, @intCast(dy));
                     if (fx < 0 or fy < 0) continue;
+                    // canvas area clip（右ペイン/メニュー侵食防止）
+                    if (fx < clip.x or fy < clip.y or fx >= clip.x + clip.w or fy >= clip.y + clip.h) continue;
                     const ufx: u32 = @intCast(fx);
                     const ufy: u32 = @intCast(fy);
                     if (ufx >= fb_w or ufy >= fb_h) continue;
-                    fb[ufy * fb_w + ufx] = color;
+                    const idx = ufy * fb_w + ufx;
+                    fb[idx] = core.blend.srcOver(fb[idx], src);
                 }
             }
         }
     }
+}
+
+/// 透明背景チェッカーを screen_rect ∩ clip ∩ fb へ直接描く（screen 固定セル）。canvas blit の直前に呼ぶ。
+fn drawCheckerboard(fb: []u32, fb_w: u32, fb_h: u32, screen_rect: core.Rect, clip: core.Rect) void {
+    const x0 = @max(@max(screen_rect.x, clip.x), 0);
+    const y0 = @max(@max(screen_rect.y, clip.y), 0);
+    const x1 = @min(@min(screen_rect.x + screen_rect.w, clip.x + clip.w), @as(i32, @intCast(fb_w)));
+    const y1 = @min(@min(screen_rect.y + screen_rect.h, clip.y + clip.h), @as(i32, @intCast(fb_h)));
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const cell = @divFloor(x, CHECKER_CELL) + @divFloor(y, CHECKER_CELL);
+            const color: u32 = if (@mod(cell, 2) == 0) CHECKER_LIGHT else CHECKER_DARK;
+            fb[@as(usize, @intCast(y)) * fb_w + @as(usize, @intCast(x))] = color;
+        }
+    }
+}
+
+/// ビューポートのズーム/パン入力を処理する（endFrame 後・canvas 入力前に呼ぶ）。
+/// 戻り値: パン中なら true（呼び出し側は描画入力を抑止する）。zoom/pan の変更は app へ書き戻し、
+/// 実際の clamp は次フレームの canvasBlitRect が現 area に対して行う。
+fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) bool {
+    const in = &ctx.input;
+    const area = app.last_area;
+
+    // マウスが canvas area 内か（ズーム/パン開始の判定に使う）
+    const in_area = blk: {
+        if (area) |a| {
+            const p = in.mouse_pos;
+            break :blk (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h);
+        }
+        break :blk false;
+    };
+
+    // ── ホイールズーム（カーソル中心。area 内のみ）──
+    // scroll_delta.y > 0 = 上スクロール = ズームイン（backend により符号が逆なら調整）。
+    if (in_area and in.scroll_delta.y != 0) {
+        if (canvas_rect) |cr| if (area) |a| {
+            const old_zoom = app.view_zoom;
+            const step: i32 = if (in.scroll_delta.y > 0) 1 else -1;
+            const new_zoom = std.math.clamp(old_zoom + step, ZOOM_MIN, ZOOM_MAX);
+            if (new_zoom != old_zoom) {
+                const mx: f32 = @floatFromInt(in.mouse_pos.x);
+                const my: f32 = @floatFromInt(in.mouse_pos.y);
+                const oz: f32 = @floatFromInt(old_zoom);
+                const nz: f32 = @floatFromInt(new_zoom);
+                // zoom 前のカーソル下 canvas 位置（f32, セル内位置を保持）
+                const cfx = (mx - @as(f32, @floatFromInt(cr.x))) / oz;
+                const cfy = (my - @as(f32, @floatFromInt(cr.y))) / oz;
+                const vw_new: i32 = @as(i32, @intCast(CANVAS_W)) * new_zoom;
+                const vh_new: i32 = @as(i32, @intCast(CANVAS_H)) * new_zoom;
+                const half_x = @divFloor(a.w - vw_new, 2);
+                const half_y = @divFloor(a.h - vh_new, 2);
+                // 望ましい表示原点 = カーソル位置 - canvas位置*新zoom。pan = 原点 - (area原点 + half)
+                const new_rx = mx - cfx * nz;
+                const new_ry = my - cfy * nz;
+                app.pan_x = @intFromFloat(@round(new_rx - @as(f32, @floatFromInt(a.x + half_x))));
+                app.pan_y = @intFromFloat(@round(new_ry - @as(f32, @floatFromInt(a.y + half_y))));
+                app.view_zoom = new_zoom;
+            }
+        };
+    }
+
+    // ── パン（Space+左 or middle ドラッグ）。capturing / bezier 編集中は開始しない ──
+    const pan_held = (app.space_down and in.mouse_buttons.left) or in.mouse_buttons.middle;
+    if (!app.pan_active) {
+        const pan_press = (app.space_down and in.mouse_pressed.left) or in.mouse_pressed.middle;
+        const bezier_editing = app.active_kind == .bezier and app.bezier_editor.isEditing();
+        if (pan_press and !app.input.capturing and !bezier_editing) {
+            if (area) |a| {
+                const p = in.mouse_pressed_pos;
+                if (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h) {
+                    app.pan_active = true;
+                    app.pan_anchor_mouse = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y };
+                    app.pan_anchor_pan = .{ .x = app.pan_x, .y = app.pan_y };
+                }
+            }
+        }
+    }
+    if (app.pan_active) {
+        if (pan_held) {
+            app.pan_x = app.pan_anchor_pan.x + (in.mouse_pos.x - app.pan_anchor_mouse.x);
+            app.pan_y = app.pan_anchor_pan.y + (in.mouse_pos.y - app.pan_anchor_mouse.y);
+        } else {
+            app.pan_active = false;
+        }
+    }
+    return app.pan_active;
 }
 
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
@@ -626,7 +797,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
             if (core.screenToCanvas(
                 .{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y },
                 rect,
-                ZOOM,
+                app.view_zoom,
             )) |cp| {
                 break :blk try std.fmt.allocPrint(arena, "cursor: ({d}, {d})", .{ cp.x, cp.y });
             }
@@ -647,6 +818,10 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     }
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
+        ctx.style.text_subtle,
+    );
+    ctx.labelEx(
+        try std.fmt.allocPrint(arena, "zoom: {d}%", .{app.view_zoom * 100}),
         ctx.style.text_subtle,
     );
     if (app.active_kind == .brush or app.active_kind == .bezier) {
@@ -725,24 +900,33 @@ pub fn main(init: std.process.Init) !void {
                 switch (ev) {
                     .quit => app.running = false, // ウィンドウクローズも同一経路
                     .key_down => |k| app.handleKey(k),
+                    .key_up => |k| app.handleKeyUp(k),
                     else => {},
                 }
                 if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
             }
 
-            // canvas rect は前フレームの layout 結果（初回フレームは null）
-            const canvas_rect = canvasBlitRect(&ctx);
+            // canvas rect は前フレームの layout 結果（初回フレームは null）。
+            // canvasBlitRect は pan を現 area に clamp して app へ書き戻し、last_area も更新する。
+            var canvas_rect = canvasBlitRect(&ctx, &app);
 
             try buildUi(&ctx, &app, canvas_rect);
             ctx.endFrame();
 
+            // ── ビューポート: ホイールズーム（カーソル中心）/ パン（Space+左 or middle ドラッグ）──
+            // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。
+            const panning = updateViewport(&app, &ctx, canvas_rect);
+            // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
+            // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果）。
+            canvas_rect = canvasBlitRect(&ctx, &app);
+
             // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
-            {
+            if (!panning) {
                 const in = &ctx.input;
                 if (app.active_kind == .bezier and !app.input.capturing) {
                     const frame: bezier_input.BezierInput.Frame = .{
                         .canvas_rect = canvas_rect,
-                        .zoom = ZOOM,
+                        .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
                         .pressed_left = in.mouse_pressed.left,
@@ -756,7 +940,7 @@ pub fn main(init: std.process.Init) !void {
                 } else {
                     const frame: canvas_input.CanvasInput.Frame = .{
                         .canvas_rect = canvas_rect,
-                        .zoom = ZOOM,
+                        .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
                         .pressed_left = in.mouse_pressed.left,
@@ -768,22 +952,36 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
-            // ── 描画: bg → canvas blit → GUI（上に重ねる） ──
+            // ── 描画: bg → チェッカー背景 → canvas blit(α src-over) → GUI（上に重ねる） ──
             @memset(fb.pixels, COLOR_WINDOW_BG);
             if (canvas_rect) |rect| {
-                if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
-                    // 確定前ブラシプレビュー: 本 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
-                    @memcpy(app.preview_canvas.layerPixels(0), app.canvas.layerPixels(0));
-                    const dab = app.brush.footprint();
-                    app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
-                    blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.composite(), rect);
-                } else {
-                    blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.composite(), rect);
+                if (app.last_area) |area| {
+                    const zoom = app.view_zoom;
+                    // 表示矩形（screen px 実寸。canvasBlitRect の rect.w/h は canvas px なので zoom 倍）
+                    const screen_rect: core.Rect = .{
+                        .x = rect.x,
+                        .y = rect.y,
+                        .w = @as(i32, @intCast(CANVAS_W)) * zoom,
+                        .h = @as(i32, @intCast(CANVAS_H)) * zoom,
+                    };
+                    drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
+                    if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
+                        // 確定前ブラシプレビュー: 本 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
+                        @memcpy(app.preview_canvas.layerPixels(0), app.canvas.layerPixels(0));
+                        const dab = app.brush.footprint();
+                        app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
+                        blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), rect, zoom, area);
+                    } else {
+                        blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.compositeStraight(), rect, zoom, area);
+                    }
                 }
             }
-            // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる）
+            // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる。area で clip）
             if (app.active_kind == .bezier) {
-                if (canvas_rect) |rect| bezier_overlay.draw(&ctx, &app.bezier_editor, rect, ZOOM);
+                if (canvas_rect) |rect| if (app.last_area) |area| {
+                    const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                    bezier_overlay.draw(&ctx, &app.bezier_editor, rect, app.view_zoom, clip_area);
+                };
             }
             gui.render(
                 .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
