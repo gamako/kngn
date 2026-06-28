@@ -592,6 +592,18 @@ pub fn build(b: *std.Build) void {
     const test_synth_step = b.step("test-synth", "Run libs/synth unit tests");
     test_synth_step.dependOn(&run_synth_test.step);
 
+    // libs/modular テスト（グラフエンジン: topo / cycle 遅延辺 / 単一接続 / per-sample / 可変 frames / 長時間レンダー）
+    const modular_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/modular/src/modular.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    modular_test_mod.addImport("dsp", example_modules.dsp);
+    const modular_test = b.addTest(.{ .root_module = modular_test_mod });
+    const run_modular_test = b.addRunArtifact(modular_test);
+    const test_modular_step = b.step("test-modular", "Run libs/modular unit tests");
+    test_modular_step.dependOn(&run_modular_test.step);
+
     // src/dsp テスト (Oscillator / Envelope / Filter / Mixer)
     const dsp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/dsp/dsp.zig"),
@@ -640,6 +652,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_synth_step);
+    test_step.dependOn(test_modular_step);
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
@@ -836,6 +849,7 @@ const ExampleModules = struct {
     gui: *std.Build.Module,
     audio: *std.Build.Module,
     synth: *std.Build.Module,
+    modular: *std.Build.Module,
     dsp: *std.Build.Module,
     harness: *std.Build.Module,
     types: *std.Build.Module,
@@ -936,6 +950,13 @@ const ExampleModules = struct {
         });
         synth_mod.addImport("dsp", dsp_mod);
 
+        // modular (L3): モジュラー・グラフエンジン（TASK-40）。dsp のみに依存
+        // （lock-free 小物を使う際も libs/synth の Voice/SynthEngine/NoteQueue には依存しない）。
+        const modular_mod = b.createModule(.{
+            .root_source_file = b.path("libs/modular/src/modular.zig"),
+        });
+        modular_mod.addImport("dsp", dsp_mod);
+
         return .{
             .platform = platform_mod,
             .keyboard = keyboard_mod,
@@ -952,6 +973,7 @@ const ExampleModules = struct {
             .gui = gui,
             .audio = audio_mod,
             .synth = synth_mod,
+            .modular = modular_mod,
             .dsp = dsp_mod,
             .harness = harness_mod,
             .types = types_mod,
