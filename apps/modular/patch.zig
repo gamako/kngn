@@ -11,6 +11,77 @@
 
 const std = @import("std");
 const modular = @import("modular");
+const synth = @import("synth"); // AtomicF32（GUI→RT のロックフリー受け渡し）
+
+// ----------------------------------------------------------------------------
+// 既定値（= 構築時のパッチ値）。Controls の既定もこれに合わせ、無操作時は従来どおりにする。
+// ----------------------------------------------------------------------------
+const DEFAULT_BPM: f32 = 122.0;
+const DEFAULT_SIDECHAIN: f32 = 0.35;
+const MASTER_CUTOFF_MIN: f32 = 80.0;
+const MASTER_CUTOFF_MAX: f32 = 18000.0; // ≒オープン（既定でほぼ素通し）
+// 各トラックの基準 gain（slider は 0..約1.5 の倍率で掛ける。既定 1.0 で基準＝従来）。
+const KICK_BASE_GAIN: f32 = 0.8;
+const HAT_BASE_GAIN: f32 = 0.28;
+const CLAP_BASE_GAIN: f32 = 0.35;
+// density=1.0 で現行値一致となる基準 pulses（kick は four-on-floor 固定でアンカー）。
+const HAT_BASE_PULSES: u8 = 4;
+const CLAP_BASE_PULSES: u8 = 2;
+const BASS_BASE_PULSES: u8 = 3;
+
+/// GUI(メインスレッド)→ Audio(RT) のリアルタイム操作。GUI は store のみ、
+/// render() 冒頭の applyControls() が load→clamp/finite して各モジュール field へ適用する
+/// （field 書き込みは RT 単一スレッド・クロススレッド通信は atomic のみ。RT に lock/alloc/IO なし）。
+pub const Controls = struct {
+    tempo_bpm: synth.AtomicF32, // BPM
+    master_cutoff: synth.AtomicF32, // master LPF cutoff(Hz)。GUI 側で対数マップ済みの Hz を store
+    density: synth.AtomicF32, // 0..2。hat/clap/bass の Euclid pulses を写像（1.0=現行）
+    swing: synth.AtomicF32, // 0..1。裏 16 分の遅れ
+    sidechain_amount: synth.AtomicF32, // 0..1。kick によるダッキング量
+    kick_gain: synth.AtomicF32, // 各トラック gain 倍率（1.0=基準）
+    hat_gain: synth.AtomicF32,
+    clap_gain: synth.AtomicF32,
+    bass_gain: synth.AtomicF32,
+    kick_mute: std.atomic.Value(u32), // 0=on / 1=mute
+    hat_mute: std.atomic.Value(u32),
+    clap_mute: std.atomic.Value(u32),
+    bass_mute: std.atomic.Value(u32),
+
+    pub fn init() Controls {
+        return .{
+            .tempo_bpm = synth.AtomicF32.init(DEFAULT_BPM),
+            .master_cutoff = synth.AtomicF32.init(MASTER_CUTOFF_MAX),
+            .density = synth.AtomicF32.init(1.0),
+            .swing = synth.AtomicF32.init(0.0),
+            .sidechain_amount = synth.AtomicF32.init(DEFAULT_SIDECHAIN),
+            .kick_gain = synth.AtomicF32.init(1.0),
+            .hat_gain = synth.AtomicF32.init(1.0),
+            .clap_gain = synth.AtomicF32.init(1.0),
+            .bass_gain = synth.AtomicF32.init(1.0),
+            .kick_mute = std.atomic.Value(u32).init(0),
+            .hat_mute = std.atomic.Value(u32).init(0),
+            .clap_mute = std.atomic.Value(u32).init(0),
+            .bass_mute = std.atomic.Value(u32).init(0),
+        };
+    }
+};
+
+fn clampFinite(v: f32, lo: f32, hi: f32, fallback: f32) f32 {
+    if (!std.math.isFinite(v)) return fallback;
+    return std.math.clamp(v, lo, hi);
+}
+
+/// gain 倍率 × mute（mute なら 0）。非有限は 1.0 に丸める。
+fn trackGain(gain: *const synth.AtomicF32, mute: *const std.atomic.Value(u32)) f32 {
+    if (mute.load(.acquire) != 0) return 0.0;
+    return clampFinite(gain.load(), 0.0, 2.0, 1.0);
+}
+
+/// density で基準 pulses を写像。0..steps に clamp。density=1.0 で base に一致。
+fn scalePulses(base: u8, density: f32, steps: u8) u8 {
+    const scaled: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(base)) * density));
+    return @intCast(std.math.clamp(scaled, 0, @as(i32, steps)));
+}
 
 /// harness probe 用の生成状態スナップショット（best-effort・torn 可）。
 pub const PatchState = struct {
@@ -27,6 +98,18 @@ pub const PatchState = struct {
     kick_active: bool,
     hat_active: bool,
     clap_active: bool,
+    // chunk B: リアルタイム操作の反映状態（applyControls 適用後の実効値）
+    swing: f32,
+    sidechain_amount: f32,
+    master_cutoff: f32,
+    kick_gain: f32,
+    hat_gain: f32,
+    clap_gain: f32,
+    bass_gain: f32, // = bass_perc.peak（実効深度）
+    kick_muted: bool,
+    hat_muted: bool,
+    clap_muted: bool,
+    bass_muted: bool,
 };
 
 pub const LofiPatch = struct {
@@ -57,6 +140,7 @@ pub const LofiPatch = struct {
     nonkick_mixer: modular.Mixer,
     sidechain: modular.Sidechain,
     master_mixer: modular.Mixer,
+    master_vcf: modular.Vcf, // chunk B: マスター LPF（master cutoff スイープ用。既定はほぼ素通し）
     // lofi FX チェーン
     saturator: modular.Saturator,
     bitcrusher: modular.Bitcrusher,
@@ -65,6 +149,9 @@ pub const LofiPatch = struct {
     vinyl: modular.VinylNoiseFx,
     wow: modular.WowFlutterFx,
     output: modular.Output,
+
+    /// GUI→RT のリアルタイム操作（無操作時は既定値＝従来どおり）。
+    controls: Controls,
 
     /// ヒープに確保してパッチを構築する。返り値は安定アドレス（graph の ctx ポインタが指す先）。
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) !*LofiPatch {
@@ -75,12 +162,12 @@ pub const LofiPatch = struct {
             .allocator = allocator,
             .graph = undefined,
             // ~122 BPM, 16分音符 tick（ppqn=4）。まずタイトに（swing は chunk B のスライダで耳で詰める）
-            .clock = .{ .bpm = 122, .ppqn = 4, .swing = 0.0 },
+            .clock = .{ .bpm = DEFAULT_BPM, .ppqn = 4, .swing = 0.0 },
             .kick_eu = .{ .steps = 16, .pulses = 4, .rotation = 0 }, // 4 つ打ち（step 0,4,8,12）
-            .hat_eu = .{ .steps = 16, .pulses = 4, .rotation = 2 }, // 裏拍 8 分ハット（step 2,6,10,14＝キックの合間）
-            .clap_eu = .{ .steps = 16, .pulses = 2, .rotation = 4 }, // 2・4 拍寄りのクラップ（疎）
+            .hat_eu = .{ .steps = 16, .pulses = HAT_BASE_PULSES, .rotation = 2 }, // 裏拍 8 分ハット（step 2,6,10,14＝キックの合間）
+            .clap_eu = .{ .steps = 16, .pulses = CLAP_BASE_PULSES, .rotation = 4 }, // 2・4 拍寄りのクラップ（疎）
             .bass_div = .{ .div = 4 }, // 16分→4分
-            .bass_eu = .{ .steps = 4, .pulses = 3, .rotation = 0 }, // 1 小節に 3 音（疎）
+            .bass_eu = .{ .steps = 4, .pulses = BASS_BASE_PULSES, .rotation = 0 }, // 1 小節に 3 音（疎）
             .filter_div = .{ .div = 16 }, // 1 小節ごとに filter をランダム更新
             .kick = .{},
             .hat = .{},
@@ -93,8 +180,9 @@ pub const LofiPatch = struct {
             .vcf = .{ .cutoff = 600, .resonance = 0.9, .mode = .lowpass, .mod_octaves = 1.0 },
             .vca = .{ .gain = 0.7 },
             .nonkick_mixer = .{ .gain = 0.9 },
-            .sidechain = .{ .amount = 0.35, .release = 0.18 }, // キックで非kickをポンプ
+            .sidechain = .{ .amount = DEFAULT_SIDECHAIN, .release = 0.18 }, // キックで非kickをポンプ
             .master_mixer = .{ .gain = 0.9 },
+            .master_vcf = .{ .cutoff = MASTER_CUTOFF_MAX, .resonance = 0.707, .mode = .lowpass },
             .saturator = .{ .drive = 1.4, .post_gain = 1.0 },
             .bitcrusher = .{ .bc = .{ .bit_depth = 10, .hold_samples = 2, .wet = 0.6 } },
             .delay_fx = .{ .delay_ms = 333.0, .feedback = 0.32, .wet = 0.18 },
@@ -102,6 +190,7 @@ pub const LofiPatch = struct {
             .vinyl = .{},
             .wow = .{},
             .output = .{ .gain = 1.0, .pan = 0.0, .soft_clip = true },
+            .controls = Controls.init(),
         };
 
         self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 40, .max_ports = 64 });
@@ -138,6 +227,7 @@ pub const LofiPatch = struct {
         const n_nonkick = try g.addModule(self.nonkick_mixer.spec());
         const n_sidechain = try g.addModule(self.sidechain.spec());
         const n_master = try g.addModule(self.master_mixer.spec());
+        const n_master_vcf = try g.addModule(self.master_vcf.spec());
         const n_sat = try g.addModule(self.saturator.spec());
         const n_bit = try g.addModule(self.bitcrusher.spec());
         const n_delay = try g.addModule(self.delay_fx.spec());
@@ -175,8 +265,9 @@ pub const LofiPatch = struct {
         try g.connect(n_kick_eu, 0, n_sidechain, 1); // trigger = kick の Euclid（fan-out）
         try g.connect(n_kick, 0, n_master, 0);
         try g.connect(n_sidechain, 0, n_master, 1);
-        // lofi FX チェーン
-        try g.connect(n_master, 0, n_sat, 0);
+        // master LPF（master cutoff スイープ。cutoff_cv 未接続なので静的 cutoff を使う）→ FX チェーン
+        try g.connect(n_master, 0, n_master_vcf, 0);
+        try g.connect(n_master_vcf, 0, n_sat, 0);
         try g.connect(n_sat, 0, n_bit, 0);
         try g.connect(n_bit, 0, n_delay, 0);
         try g.connect(n_delay, 0, n_reverb, 0);
@@ -189,8 +280,31 @@ pub const LofiPatch = struct {
     }
 
     /// RT callback から呼ぶ（alloc/lock/IO/panic なし）。interleaved 出力へ書く。
+    /// 先頭で Controls(atomic) を各モジュール field へ適用してから processBlock する
+    /// （field 書き込みは RT 単一スレッド。processBlock 冒頭の updateParams が係数を拾う）。
     pub fn render(self: *LofiPatch, buf: []f32, frames: u32, channels: u32) void {
+        self.applyControls();
         self.graph.processBlock(buf, frames, channels);
+    }
+
+    /// GUI が store した Controls(atomic) を load→clamp/finite して各モジュール field へ反映する。
+    /// 既定値（無操作）では構築時の値と一致＝従来どおり（決定的）。RT 単一スレッドで呼ばれる。
+    fn applyControls(self: *LofiPatch) void {
+        const c = &self.controls;
+        self.clock.bpm = clampFinite(c.tempo_bpm.load(), 40.0, 220.0, DEFAULT_BPM);
+        self.clock.swing = clampFinite(c.swing.load(), 0.0, 1.0, 0.0);
+        self.sidechain.amount = clampFinite(c.sidechain_amount.load(), 0.0, 1.0, DEFAULT_SIDECHAIN);
+        self.master_vcf.cutoff = clampFinite(c.master_cutoff.load(), MASTER_CUTOFF_MIN, MASTER_CUTOFF_MAX, MASTER_CUTOFF_MAX);
+        // density → hat/clap/bass の Euclid pulses（kick は four-on-floor 固定でアンカー）。
+        const d = clampFinite(c.density.load(), 0.0, 2.0, 1.0);
+        self.hat_eu.pulses = scalePulses(HAT_BASE_PULSES, d, self.hat_eu.steps);
+        self.clap_eu.pulses = scalePulses(CLAP_BASE_PULSES, d, self.clap_eu.steps);
+        self.bass_eu.pulses = scalePulses(BASS_BASE_PULSES, d, self.bass_eu.steps);
+        // 各トラック gain × mute。bass は VCA の gain_cv(=PercEnv) 経由なので PercEnv.peak へ。
+        self.kick.gain = KICK_BASE_GAIN * trackGain(&c.kick_gain, &c.kick_mute);
+        self.hat.gain = HAT_BASE_GAIN * trackGain(&c.hat_gain, &c.hat_mute);
+        self.clap.gain = CLAP_BASE_GAIN * trackGain(&c.clap_gain, &c.clap_mute);
+        self.bass_perc.peak = trackGain(&c.bass_gain, &c.bass_mute);
     }
 
     /// harness probe 用の生成状態スナップショット（alloc/lock/IO なし・torn 可）。
@@ -212,6 +326,17 @@ pub const LofiPatch = struct {
             .kick_active = self.kick.active,
             .hat_active = self.hat.active,
             .clap_active = self.clap.active,
+            .swing = self.clock.swing,
+            .sidechain_amount = self.sidechain.amount,
+            .master_cutoff = self.master_vcf.cutoff,
+            .kick_gain = self.kick.gain,
+            .hat_gain = self.hat.gain,
+            .clap_gain = self.clap.gain,
+            .bass_gain = self.bass_perc.peak,
+            .kick_muted = self.controls.kick_mute.load(.acquire) != 0,
+            .hat_muted = self.controls.hat_mute.load(.acquire) != 0,
+            .clap_muted = self.controls.clap_mute.load(.acquire) != 0,
+            .bass_muted = self.controls.bass_mute.load(.acquire) != 0,
         };
     }
 
@@ -314,4 +439,98 @@ fn addDistinctU32(buf: []u32, n: *usize, v: u32) void {
         buf[n.*] = v;
         n.* += 1;
     }
+}
+
+/// render して finite/有界を検証しつつ peak/rms を返す（テスト用）。
+fn renderStats(patch: *LofiPatch, buf: []f32, frames: u32) !struct { peak: f32, rms: f64 } {
+    patch.render(buf, frames, 2);
+    var peak: f32 = 0;
+    var acc: f64 = 0;
+    for (buf[0 .. frames * 2]) |s| {
+        try testing.expect(std.math.isFinite(s));
+        try testing.expect(@abs(s) <= 1.0001); // softClip で有界
+        peak = @max(peak, @abs(s));
+        acc += @as(f64, s) * @as(f64, s);
+    }
+    return .{ .peak = peak, .rms = @sqrt(acc / @as(f64, @floatFromInt(frames * 2))) };
+}
+
+test "Controls: defaults match constructed patch values (no-op baseline)" {
+    // 無操作（既定 Controls）では applyControls 適用後も構築時の値と一致＝従来どおり。
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var buf: [64]f32 = undefined;
+    patch.render(&buf, 32, 2); // applyControls を一度走らせる
+    try testing.expectEqual(@as(f32, DEFAULT_BPM), patch.clock.bpm);
+    try testing.expectEqual(@as(f32, 0.0), patch.clock.swing);
+    try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), patch.sidechain.amount);
+    try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), patch.master_vcf.cutoff);
+    try testing.expectEqual(HAT_BASE_PULSES, patch.hat_eu.pulses);
+    try testing.expectEqual(CLAP_BASE_PULSES, patch.clap_eu.pulses);
+    try testing.expectEqual(BASS_BASE_PULSES, patch.bass_eu.pulses);
+    try testing.expectEqual(@as(f32, KICK_BASE_GAIN), patch.kick.gain);
+    try testing.expectEqual(@as(f32, 1.0), patch.bass_perc.peak);
+}
+
+test "Controls: swing/sidechain/density/cutoff change output (bounded & finite)" {
+    const frames: u32 = 24000; // 0.5s
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+
+    const base = try LofiPatch.create(testing.allocator, 48000);
+    defer base.destroy();
+    _ = try renderStats(base, buf, frames);
+    const crc_base = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
+
+    const mod = try LofiPatch.create(testing.allocator, 48000);
+    defer mod.destroy();
+    mod.controls.swing.store(0.5);
+    mod.controls.sidechain_amount.store(0.9);
+    mod.controls.density.store(1.5);
+    mod.controls.master_cutoff.store(800.0); // 暗めにスイープ
+    _ = try renderStats(mod, buf, frames);
+    const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
+
+    try testing.expect(crc_base != crc_mod); // 操作が出力に効く
+}
+
+test "Controls: muting all tracks lowers output level" {
+    const frames: u32 = 24000;
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+
+    const on = try LofiPatch.create(testing.allocator, 48000);
+    defer on.destroy();
+    const s_on = try renderStats(on, buf, frames);
+    try testing.expect(s_on.rms > 0.0);
+
+    const off = try LofiPatch.create(testing.allocator, 48000);
+    defer off.destroy();
+    off.controls.kick_mute.store(1, .release);
+    off.controls.hat_mute.store(1, .release);
+    off.controls.clap_mute.store(1, .release);
+    off.controls.bass_mute.store(1, .release);
+    const s_off = try renderStats(off, buf, frames);
+    // 全 mute でも vinyl/FX の残響/ヒスは残るため厳密無音にはしないが、明確に下がる。
+    try testing.expect(s_off.rms < s_on.rms);
+}
+
+test "Controls: non-finite values fall back to safe defaults (finite output)" {
+    const frames: u32 = 4800;
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    patch.controls.tempo_bpm.store(std.math.nan(f32));
+    patch.controls.master_cutoff.store(std.math.inf(f32));
+    patch.controls.density.store(std.math.nan(f32));
+    patch.controls.swing.store(std.math.inf(f32));
+    patch.controls.sidechain_amount.store(std.math.nan(f32));
+    patch.controls.bass_gain.store(std.math.nan(f32));
+    _ = try renderStats(patch, buf, frames); // 有界・finite を検証
+    // 不正値は安全な既定へフォールバック
+    try testing.expectEqual(@as(f32, DEFAULT_BPM), patch.clock.bpm);
+    try testing.expectEqual(@as(f32, 0.0), patch.clock.swing);
+    try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), patch.sidechain.amount);
+    try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), patch.master_vcf.cutoff);
 }

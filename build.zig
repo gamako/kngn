@@ -624,6 +624,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     modular_app_test_mod.addImport("modular", example_modules.modular);
+    modular_app_test_mod.addImport("synth", example_modules.synth); // patch が AtomicF32 を使う（chunk B）
     const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
     const run_modular_app_test = b.addRunArtifact(modular_app_test);
     const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");
@@ -1167,6 +1168,16 @@ fn addModularExe(
     exe.root_module.addImport("platform", pm.platform);
     exe.root_module.addImport("audio", common.audio);
     exe.root_module.addImport("modular", common.modular); // グラフエンジン（dsp 依存のみ）
+    // chunk B (TASK-40.3): 可視化 + GUI リアルタイム操作。
+    exe.root_module.addImport("synth", common.synth); // SampleTap / AtomicF32（ロックフリー受け渡し）
+    exe.root_module.addImport("dsp", common.dsp); // mono downmix + FFT（spectrogram）
+    exe.root_module.addImport("gui", common.gui); // スライダ / mute ボタン
+    // apps/synth の可視化を流用（build.zig で module 化）。spectrogram は FFT で dsp に依存。
+    const spec_mod = b.createModule(.{ .root_source_file = b.path("apps/synth/spectrogram.zig") });
+    spec_mod.addImport("dsp", common.dsp);
+    exe.root_module.addImport("spectrogram", spec_mod);
+    const scope_mod = b.createModule(.{ .root_source_file = b.path("apps/synth/scope.zig") });
+    exe.root_module.addImport("scope", scope_mod);
     linkAudioBackend(exe, target.result.os.tag);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);

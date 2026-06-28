@@ -542,6 +542,10 @@ pub const Hat = struct {
 // ----------------------------------------------------------------------------
 pub const PercEnv = struct {
     decay: f32 = 0.18,
+    /// 出力レベルの連続倍率（エンベロープ深度）。1.0 で従来どおり（level×1.0=level の bit 一致）。
+    /// 0 で無音（mute）。毎サンプル出力に掛かるので、発音中に変えても即時反映される（リアルタイム gain/mute）。
+    /// 非有限は 1.0 に、範囲は [0,4] に丸める。VCA の gain_cv へ繋ぐと「トラック音量」として使える。
+    peak: f32 = 1.0,
     prev_gate: bool = false,
     active: bool = false,
     level: f32 = 0.0,
@@ -579,7 +583,9 @@ pub const PercEnv = struct {
         const lvl = self.level;
         self.level *= self.k;
         if (self.level < done_eps) self.active = false;
-        io.outputs[0] = lvl;
+        // 出力に peak を掛ける（毎サンプルなので発音中の gain/mute 変更も即時反映）。
+        const p = if (std.math.isFinite(self.peak)) std.math.clamp(self.peak, 0.0, 4.0) else 1.0;
+        io.outputs[0] = lvl * p;
     }
 };
 
@@ -1195,6 +1201,29 @@ test "PercEnv: trigger -> 1.0 then exponential decay to ~0" {
         prev = out[0];
     }
     try testing.expect(out[0] < 0.01); // 減衰しきった
+}
+
+test "PercEnv: peak scales output continuously (0=silent, 0.5=half); non-finite -> 1.0" {
+    var out: [1]f32 = undefined;
+    // peak=0 → トリガしても無音
+    var mute = PercEnv{ .decay = 0.05, .peak = 0.0 };
+    PercEnv.updateParams(&mute, 48000);
+    drive(&PercEnv.vtable, &mute, &.{1.0}, &.{true}, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    // peak=0.5 → 出力レベル 0.5（トリガ時 level=1.0 × peak）
+    var half = PercEnv{ .decay = 0.05, .peak = 0.5 };
+    PercEnv.updateParams(&half, 48000);
+    drive(&PercEnv.vtable, &half, &.{1.0}, &.{true}, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6);
+    // 発音中に peak を変えると即時反映（連続倍率）。次サンプルは level(=k) × 新 peak。
+    half.peak = 0.0;
+    drive(&PercEnv.vtable, &half, &.{1.0}, &.{true}, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]); // 鳴っている途中でも即 mute
+    // 非有限 peak → 1.0 に丸める
+    var nan = PercEnv{ .decay = 0.05, .peak = std.math.nan(f32) };
+    PercEnv.updateParams(&nan, 48000);
+    drive(&PercEnv.vtable, &nan, &.{1.0}, &.{true}, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-6);
 }
 
 test "Random: S&H changes only on trigger; range 0..1; deterministic" {
