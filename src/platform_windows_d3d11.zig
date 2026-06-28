@@ -16,9 +16,13 @@
 //! （IUnknown の QueryInterface/AddRef/Release を先頭3つに固定）。zig 同梱 MinGW import lib（d3d11/dxgi）が
 //! `D3D11CreateDeviceAndSwapChain` を解決する。
 //!
+//! ## resize（TASK-23）
+//!   present 内で core 寸法と D3DState の寸法を比較し、差があれば `resizeSwapChain` で
+//!   `IDXGISwapChain.ResizeBuffers` + upload texture / backbuffer を作り直す（lazy）。
+//!
 //! ## 未対応（follow-up。本タスク範囲外）
-//!   - resize: swap chain / upload texture / backbuffer の再作成（現状は固定サイズ window）。
-//!   - device lost 復帰: `DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET` 検出後の再初期化。
+//!   - device lost 復帰: `DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET` 検出後の再初期化
+//!     （resizeSwapChain の GetBuffer 失敗時は back_buffer=null にして present を skip するに留める）。
 //!   - waitable swap chain（`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`）。
 //!   - ADR-005 の `beginFrame` / `waitFrame` と immediate present mode。
 //! present() の HRESULT 失敗は公開 API に error を足さず（contract 不変）、best-effort で無視する。
@@ -172,6 +176,8 @@ const IDXGISwapChain = extern struct {
         _pad3to7: [5]*const anyopaque, // [3..7]
         Present: *const fn (*IDXGISwapChain, UINT, UINT) callconv(.winapi) HRESULT, // [8]
         GetBuffer: *const fn (*IDXGISwapChain, UINT, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT, // [9]
+        _pad10to12: [3]*const anyopaque, // [10..12] SetFullscreenState/GetFullscreenState/GetDesc
+        ResizeBuffers: *const fn (*IDXGISwapChain, UINT, UINT, UINT, c_int, UINT) callconv(.winapi) HRESULT, // [13]
     };
 };
 
@@ -216,13 +222,23 @@ pub const openFileDialog = common.openFileDialog;
 // Window — common.Core + D3D11/DXGI presentation
 // ============================================================================
 
-pub const Window = struct {
-    core: *common.Core,
+// D3D11/DXGI の presentation 状態。present 内で lazy resize するため heap に置く（Window は値レシーバで
+// 自身のフィールドを永続更新できないので、可変リソース＝swap chain/texture は *D3DState 経由で共有する）。
+const D3DState = struct {
     device: *ID3D11Device,
     context: *ID3D11DeviceContext,
     swap_chain: *IDXGISwapChain,
     upload_tex: *ID3D11Texture2D, // CPU backing の転送先（DEFAULT。UpdateSubresource）
-    back_buffer: *ID3D11Texture2D, // swap chain backbuffer（CopyResource 先。固定サイズで create 時取得）
+    // swap chain backbuffer（CopyResource 先）。resizeSwapChain の Release 後 / GetBuffer 失敗時は null。
+    // 解放済みポインタを保持して二重 Release しないよう optional にする（TASK-23）。
+    back_buffer: ?*ID3D11Texture2D,
+    width: u32, // swap chain / upload_tex の現在サイズ（core 寸法と比較して resize を検出。TASK-23）
+    height: u32,
+};
+
+pub const Window = struct {
+    core: *common.Core,
+    d3d: *D3DState,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
         const core = try common.Core.create(width, height, title);
@@ -294,23 +310,28 @@ pub const Window = struct {
         // frame latency 管理（best-effort。失敗しても Present(1,0) の fifo 同期は効く）。
         setMaxFrameLatency(device);
 
-        return .{
-            .core = core,
+        const d3d = common.alloc.create(D3DState) catch return error.WindowCreationFailed;
+        d3d.* = .{
             .device = device,
             .context = context,
             .swap_chain = swap_chain,
             .upload_tex = upload_tex,
             .back_buffer = back_buffer,
+            .width = width,
+            .height = height,
         };
+        return .{ .core = core, .d3d = d3d };
     }
 
     pub fn destroy(self: Window) void {
+        const d3d = self.d3d;
         // COM resource を逆順に release してから window / backing を破棄する。
-        _ = self.upload_tex.lpVtbl.Release(self.upload_tex);
-        _ = self.back_buffer.lpVtbl.Release(self.back_buffer);
-        _ = self.swap_chain.lpVtbl.Release(self.swap_chain);
-        _ = self.context.lpVtbl.Release(self.context);
-        _ = self.device.lpVtbl.Release(self.device);
+        _ = d3d.upload_tex.lpVtbl.Release(d3d.upload_tex);
+        if (d3d.back_buffer) |bb| _ = bb.lpVtbl.Release(bb); // resize 失敗で null のことがある
+        _ = d3d.swap_chain.lpVtbl.Release(d3d.swap_chain);
+        _ = d3d.context.lpVtbl.Release(d3d.context);
+        _ = d3d.device.lpVtbl.Release(d3d.device);
+        common.alloc.destroy(d3d);
         self.core.destroy();
     }
 
@@ -340,15 +361,76 @@ pub const Window = struct {
     /// upload(DEFAULT texture) → CopyResource(backbuffer) → Present(1,0)=fifo。
     pub fn present(self: Window) void {
         const core = self.core;
+        const d3d = self.d3d;
+        // リサイズ追従（TASK-23）: swap chain/upload_tex を core 寸法へ lazy に合わせる。
+        // back_buffer==null（前回 resize の GetBuffer 失敗＝device lost 相当）も再試行条件に含め、
+        // 寸法が一致状態へ戻っても永久 skip にならないようにする。
+        if (d3d.back_buffer == null or d3d.width != core.width or d3d.height != core.height) {
+            resizeSwapChain(d3d, core.width, core.height);
+            // 失敗で不整合が残るなら、サイズ不一致/無効 upload を避けて frame skip（次 present で再試行）。
+            if (d3d.back_buffer == null or d3d.width != core.width or d3d.height != core.height) return;
+        }
+        const bb = d3d.back_buffer orelse return; // resize 失敗で null のことがある → frame skip
         const row_pitch: UINT = core.width * 4; // canonical BGRA = 4 bytes/px
         // UpdateSubresource: CPU backing 全面を upload texture へ（pDstBox=null = リソース全体）。
-        self.context.lpVtbl.UpdateSubresource(self.context, self.upload_tex, 0, null, core.backing.ptr, row_pitch, 0);
+        d3d.context.lpVtbl.UpdateSubresource(d3d.context, d3d.upload_tex, 0, null, core.backing.ptr, row_pitch, 0);
         // CopyResource: upload texture → swap chain backbuffer（同 format・同寸法）。
-        self.context.lpVtbl.CopyResource(self.context, self.back_buffer, self.upload_tex);
+        d3d.context.lpVtbl.CopyResource(d3d.context, bb, d3d.upload_tex);
         // Present(SyncInterval=1, Flags=0): fifo 相当（display refresh 同期）。HRESULT 失敗は best-effort 無視。
-        _ = self.swap_chain.lpVtbl.Present(self.swap_chain, 1, 0);
+        _ = d3d.swap_chain.lpVtbl.Present(d3d.swap_chain, 1, 0);
     }
 };
+
+/// swap chain backbuffer と upload texture を新サイズへ作り直す（TASK-23。present から lazy 呼び出し）。
+/// best-effort（present は HRESULT 失敗を無視する契約）。新 upload_tex を先に作り、OOM 時は何も壊さず戻る。
+/// 成功時のみ d3d.width/height を更新する（失敗時は据え置きで次 present が再試行）。
+/// device lost（GetBuffer 失敗）の復帰は本 backend の follow-up（ファイル冒頭の未対応リスト）。
+fn resizeSwapChain(d3d: *D3DState, w: u32, h: u32) void {
+    // 1) 新 upload texture を先に確保（失敗してもまだ既存リソースを壊していない）。
+    var tex_desc = std.mem.zeroes(D3D11_TEXTURE2D_DESC);
+    tex_desc.Width = w;
+    tex_desc.Height = h;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = 1;
+    tex_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    tex_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = 0;
+    tex_desc.CPUAccessFlags = 0;
+    tex_desc.MiscFlags = 0;
+    var new_tex_opt: ?*ID3D11Texture2D = null;
+    if (d3d.device.lpVtbl.CreateTexture2D(d3d.device, &tex_desc, null, &new_tex_opt) < 0) return;
+    const new_tex = new_tex_opt orelse return;
+
+    // 2) ResizeBuffers は backbuffer の参照を全て手放してから呼ぶ（outstanding 参照があると失敗する）。
+    //    解放後すぐ null にして、以降の失敗経路で解放済みポインタを保持しない（二重 Release 防止）。
+    if (d3d.back_buffer) |bb| _ = bb.lpVtbl.Release(bb);
+    d3d.back_buffer = null;
+    const hr_rb = d3d.swap_chain.lpVtbl.ResizeBuffers(d3d.swap_chain, 0, w, h, 0, 0); // 0 = BufferCount/Format 据え置き
+
+    // 3) backbuffer を取り直す（DISCARD swap effect なので index 0）。失敗時は back_buffer=null のまま。
+    var bb_opt: ?*ID3D11Texture2D = null;
+    _ = d3d.swap_chain.lpVtbl.GetBuffer(d3d.swap_chain, 0, &IID_ID3D11Texture2D, @ptrCast(&bb_opt));
+    d3d.back_buffer = bb_opt;
+    if (bb_opt == null) {
+        // 取り直し失敗（device lost 相当・極稀）。new_tex を捨て、寸法据え置きで次 present が再試行。
+        // back_buffer は null なので present は skip、destroy も二重 Release しない。
+        _ = new_tex.lpVtbl.Release(new_tex);
+        return;
+    }
+
+    if (hr_rb < 0) {
+        // ResizeBuffers 失敗（backbuffer は旧サイズで取り直し済み）。new_tex を捨て寸法据え置きで再試行。
+        _ = new_tex.lpVtbl.Release(new_tex);
+        return;
+    }
+
+    // 4) upload texture を入れ替えて寸法確定。
+    _ = d3d.upload_tex.lpVtbl.Release(d3d.upload_tex);
+    d3d.upload_tex = new_tex;
+    d3d.width = w;
+    d3d.height = h;
+}
 
 /// device → IDXGIDevice1 を QueryInterface し SetMaximumFrameLatency(1) を試みる（best-effort）。
 fn setMaxFrameLatency(device: *ID3D11Device) void {

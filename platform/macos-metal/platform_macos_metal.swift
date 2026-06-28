@@ -557,6 +557,57 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         manualPresentPending = true
         view.draw()
     }
+
+    // TASK-23: 新サイズへ slot buffers/textures を two-phase で再確保する。
+    // 単位は logical points（mouse 座標と同一。drawableSize=pixels ではない。texture は drawable へ
+    // upscale されるので Retina 挙動は従来どおり）。setFrameSize（イベントポンプ中）から呼ばれ、
+    // present(submitFrame) とは同一メインスレッドで直列なので非並行。
+    // - 旧 CPU buffer: submitFrame で texture.replace により同期コピー済み → GPU は非同期参照しない → 解放安全。
+    // - 旧 texture: inflight command buffer が ARC で完了まで保持 → 配列から外しても安全。
+    func resize(width w0: Int, height h0: Int) {
+        let w = max(1, w0)
+        let h = max(1, h0)
+        if w == width && h == height { return } // 変化なし
+        let newSize = w * h
+
+        // phase 1: 新リソースを確保
+        var newBuffers: [UnsafeMutablePointer<UInt32>] = []
+        for _ in 0..<slotCount {
+            let buf = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
+            buf.initialize(repeating: 0, count: newSize)
+            newBuffers.append(buf)
+        }
+        let descriptor = MTLTextureDescriptor()
+        descriptor.pixelFormat = .bgra8Unorm
+        descriptor.width = w
+        descriptor.height = h
+        descriptor.usage = [.shaderRead, .renderTarget]
+        descriptor.storageMode = .managed
+        var newTextures: [MTLTexture?] = []
+        for _ in 0..<slotCount {
+            newTextures.append(device.makeTexture(descriptor: descriptor))
+        }
+        // texture 確保失敗時は新 CPU buffer を解放して旧状態を維持する（two-phase: 全部揃った時だけ swap）
+        if newTextures.contains(where: { $0 == nil }) {
+            for buf in newBuffers {
+                buf.deinitialize(count: newSize)
+                buf.deallocate()
+            }
+            return
+        }
+
+        // phase 2: 旧 CPU buffer を解放して swap（texture は ARC に任せる）
+        let oldSize = width * height
+        for buf in slotBuffers {
+            buf.deinitialize(count: oldSize)
+            buf.deallocate()
+        }
+        slotBuffers = newBuffers
+        slotTextures = newTextures
+        width = w
+        height = h
+        currentSlotIndex = 0
+    }
 }
 
 // カスタムMTKView
@@ -586,6 +637,13 @@ class MetalFramebufferView: MTKView {
 
     func getRenderer() -> MetalRenderer? {
         return metalRenderer
+    }
+
+    // NSView がリサイズ時に呼ぶ。renderer の fb を新しい logical サイズへ再確保する（TASK-23）。
+    // MTKView の drawableSize は別途自動更新され、texture は drawable へ upscale される。
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        metalRenderer?.resize(width: Int(newSize.width), height: Int(newSize.height))
     }
 
     // ========================================
@@ -696,7 +754,7 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     let windowHeight = CGFloat(height)
     let frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
 
-    let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
+    let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable] // TASK-23: 自由リサイズ
 
     let window = NSWindow(
         contentRect: frame,

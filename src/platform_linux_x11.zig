@@ -117,6 +117,9 @@ const State = struct {
     width: u32,
     height: u32,
     wm_delete: c.Atom,
+    // resize（TASK-23）で setupBlit を再実行するため、作成時の visual/depth を保持する。
+    visual: ?*c.Visual,
+    depth: c_uint,
 
     // canonical BGRA framebuffer（caller が書く。lockFramebuffer が返す）。
     // direct: image data を別名参照（別 alloc しない）。fallback: 別持ち alloc。
@@ -197,13 +200,11 @@ pub const Window = struct {
         var wm_delete = c.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
         _ = c.XSetWMProtocols(dpy, win, &wm_delete, 1);
 
-        // 固定サイズを WM に要求（resize 抑止。実 resize 対応は TASK-23）。min=max にする。
+        // resizable（TASK-23）。最小サイズだけ与え、max は与えない（自由リサイズ）。
         var hints = std.mem.zeroes(c.XSizeHints);
-        hints.flags = c.PMinSize | c.PMaxSize;
-        hints.min_width = @intCast(width);
-        hints.max_width = @intCast(width);
-        hints.min_height = @intCast(height);
-        hints.max_height = @intCast(height);
+        hints.flags = c.PMinSize;
+        hints.min_width = 1;
+        hints.min_height = 1;
         _ = c.XSetWMNormalHints(dpy, win, &hints);
 
         const gc = c.XDefaultGC(dpy, screen);
@@ -218,6 +219,8 @@ pub const Window = struct {
             .width = width,
             .height = height,
             .wm_delete = wm_delete,
+            .visual = visual,
+            .depth = depth,
             .backing = &.{},
             .image = undefined,
             .bytes_per_line = 0,
@@ -277,8 +280,11 @@ pub const Window = struct {
                     }
                 },
                 c.ConfigureNotify => {
-                    // 固定サイズ運用（resize は TASK-23）。framebuffer 寸法 st.width/height は作成時のまま保持し、
-                    // ここでは更新しない（更新すると backing/XImage の範囲外アクセスになる）。WM ヒントで resize 抑止済み。
+                    // 自由リサイズ（TASK-23）。新サイズで blit を two-phase 再確保する。
+                    // pollEvents はフレーム境界（lock 外）で呼ばれるので再確保は安全。
+                    const cw: u32 = @intCast(ev.xconfigure.width);
+                    const ch: u32 = @intCast(ev.xconfigure.height);
+                    resizeBlit(st, cw, ch);
                 },
                 c.Expose => {}, // present は毎フレーム呼ばれるので no-op
                 c.KeyPress => handleKeyPress(st, &ev.xkey),
@@ -619,6 +625,89 @@ fn failBlit(st: *State) Error {
     // create の errdefer が window/State を解放）。
     teardownBlit(st);
     return error.WindowCreationFailed;
+}
+
+// ── リサイズ（TASK-23）。two-phase: 新 blit を確保成功後に旧 blit を解放する ──
+
+/// blit 関連フィールドの snapshot。resize の two-phase（新確保→旧解放 / 失敗時は旧復元）に使う。
+const BlitState = struct {
+    backing: []u32,
+    image: *c.XImage,
+    bytes_per_line: usize,
+    use_shm: bool,
+    shminfo: c.XShmSegmentInfo,
+    shmat_ok: bool,
+    attached: bool,
+    xfer: []u32,
+    direct: bool,
+    r_shift: u5,
+    g_shift: u5,
+    b_shift: u5,
+};
+
+fn captureBlit(st: *const State) BlitState {
+    return .{
+        .backing = st.backing,
+        .image = st.image,
+        .bytes_per_line = st.bytes_per_line,
+        .use_shm = st.use_shm,
+        .shminfo = st.shminfo,
+        .shmat_ok = st.shmat_ok,
+        .attached = st.attached,
+        .xfer = st.xfer,
+        .direct = st.direct,
+        .r_shift = st.r_shift,
+        .g_shift = st.g_shift,
+        .b_shift = st.b_shift,
+    };
+}
+
+fn restoreBlit(st: *State, b: BlitState) void {
+    st.backing = b.backing;
+    st.image = b.image;
+    st.bytes_per_line = b.bytes_per_line;
+    st.use_shm = b.use_shm;
+    st.shminfo = b.shminfo;
+    st.shmat_ok = b.shmat_ok;
+    st.attached = b.attached;
+    st.xfer = b.xfer;
+    st.direct = b.direct;
+    st.r_shift = b.r_shift;
+    st.g_shift = b.g_shift;
+    st.b_shift = b.b_shift;
+}
+
+/// BlitState（snapshot 値）のリソースを解放する。teardownBlit の value 版 + fallback backing 解放。
+fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
+    if (b.use_shm) {
+        if (b.attached) _ = c.XShmDetach(dpy, &b.shminfo);
+        destroyImage(b.image);
+        if (b.shmat_ok) _ = c.shmdt(b.shminfo.shmaddr);
+    } else {
+        b.image.data = null;
+        destroyImage(b.image);
+        if (b.xfer.len != 0) alloc.free(b.xfer);
+    }
+    // fallback backing は別 alloc。direct backing は image data の別名なので上で解放済み。
+    if (!b.direct and b.backing.len != 0) alloc.free(b.backing);
+}
+
+/// ConfigureNotify で呼ぶ。新サイズで setupBlit を試し、成功したら旧 blit を解放して
+/// st.width/height を更新する。失敗（OOM 等）時は旧 blit を復元して旧サイズを維持する（window を壊さない）。
+fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
+    if (new_w == 0 or new_h == 0) return; // 最小化/ゼロは無視
+    if (new_w == st.width and new_h == st.height) return;
+
+    var old = captureBlit(st);
+    // setupBlit は st の blit フィールドを新リソースで上書きする（失敗時は内部の failBlit が
+    // 新リソースを解放するが st のフィールドは dangling のまま残る → 下の catch で旧値へ復元する）。
+    setupBlit(st, st.visual, st.depth, new_w, new_h) catch {
+        restoreBlit(st, old);
+        return;
+    };
+    st.width = new_w;
+    st.height = new_h;
+    freeBlitState(st.display, &old);
 }
 
 /// fallback 経路: canonical BGRA(0xAARRGGBB) backing → image data（visual mask 配置）へ変換。

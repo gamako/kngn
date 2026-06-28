@@ -377,6 +377,64 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 }
 
 // ========================================
+// リサイズ (TASK-23)
+// ========================================
+
+// 新サイズへフレームバッファ/プロバイダを two-phase で再確保する。
+// 新リソースの確保に成功してから旧リソースを破棄する（失敗時は旧サイズを維持）。
+// 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
+- (BOOL)resizeBuffersTo:(int)w height:(int)h {
+    if (!buffer0 || !buffer1) return NO; // init 途中（super の setFrameSize）では何もしない
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w == width && h == height) return YES; // 変化なし
+
+    // phase 1: 新リソースを確保（成功するまで旧リソースには触れない）
+    uint32_t* nb0 = (uint32_t*)calloc((size_t)w * h, sizeof(uint32_t));
+    uint32_t* nb1 = (uint32_t*)calloc((size_t)w * h, sizeof(uint32_t));
+    if (!nb0 || !nb1) {
+        if (nb0) free(nb0);
+        if (nb1) free(nb1);
+        return NO; // OOM: 旧サイズ維持
+    }
+    CGDataProviderRef np0 = CGDataProviderCreateWithData(NULL, nb0, (size_t)w * h * sizeof(uint32_t), NULL);
+    CGDataProviderRef np1 = CGDataProviderCreateWithData(NULL, nb1, (size_t)w * h * sizeof(uint32_t), NULL);
+    if (!np0 || !np1) {
+        if (np0) CGDataProviderRelease(np0);
+        if (np1) CGDataProviderRelease(np1);
+        free(nb0);
+        free(nb1);
+        return NO; // 旧サイズ維持
+    }
+
+    // phase 2: 旧リソースを破棄して swap。
+    // layer.contents は旧 buffer を参照する CGImage を保持しているので、先に外して
+    // use-after-free を避ける（次の present で新 image を貼る）。
+    contentLayer.contents = nil;
+    CGDataProviderRelease(provider0);
+    CGDataProviderRelease(provider1);
+    free(buffer0);
+    free(buffer1);
+
+    buffer0 = nb0;
+    buffer1 = nb1;
+    provider0 = np0;
+    provider1 = np1;
+    currentBuffer = buffer0;
+    displayBuffer = buffer1;
+    width = w;
+    height = h;
+    contentLayer.frame = CGRectMake(0, 0, w, h);
+    return YES;
+}
+
+// NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    [self resizeBuffersTo:(int)newSize.width height:(int)newSize.height];
+}
+
+// ========================================
 // マウスイベント関連 (TASK-21.1)
 // ========================================
 
@@ -661,7 +719,8 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
         NSRect frame = NSMakeRect(0, 0, width, height);
         NSWindowStyleMask styleMask = NSWindowStyleMaskTitled |
                                        NSWindowStyleMaskClosable |
-                                       NSWindowStyleMaskMiniaturizable;
+                                       NSWindowStyleMaskMiniaturizable |
+                                       NSWindowStyleMaskResizable; // TASK-23: 自由リサイズ
 
         platformWindow->window = [[NSWindow alloc] initWithContentRect:frame
                                                              styleMask:styleMask

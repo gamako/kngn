@@ -578,6 +578,40 @@ class FramebufferView: NSView {
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
     }
 
+    // TASK-23: 新サイズへ two-phase でバッファを再確保する。present は毎フレーム CFDataCreate で
+    // コピーを作るため buffer の寿命は layer.contents と独立（use-after-free なし）。
+    // 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
+    func resizeBuffers(width w0: Int, height h0: Int) {
+        let w = max(1, w0)
+        let h = max(1, h0)
+        if w == width && h == height { return } // 変化なし
+        let newSize = w * h
+        // phase 1: 新バッファ確保（Swift の allocate は失敗時 trap）
+        let nb0 = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
+        let nb1 = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
+        nb0.initialize(repeating: 0, count: newSize)
+        nb1.initialize(repeating: 0, count: newSize)
+        // phase 2: 旧バッファを破棄して swap
+        let oldSize = width * height
+        buffer0.deinitialize(count: oldSize)
+        buffer0.deallocate()
+        buffer1.deinitialize(count: oldSize)
+        buffer1.deallocate()
+        buffer0 = nb0
+        buffer1 = nb1
+        currentBuffer = buffer0
+        displayBuffer = buffer1
+        width = w
+        height = h
+        contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+    }
+
+    // NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        resizeBuffers(width: Int(newSize.width), height: Int(newSize.height))
+    }
+
     deinit {
         stopDisplayLink()
 
@@ -607,7 +641,7 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     let windowHeight = CGFloat(height)
     let frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
 
-    let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
+    let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable] // TASK-23: 自由リサイズ
 
     let window = NSWindow(
         contentRect: frame,

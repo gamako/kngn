@@ -65,7 +65,9 @@ const CS_HREDRAW: UINT = 0x0002;
 const WS_CAPTION: DWORD = 0x00C00000;
 const WS_SYSMENU: DWORD = 0x00080000;
 const WS_MINIMIZEBOX: DWORD = 0x00020000;
-const WINDOW_STYLE: DWORD = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX; // 固定サイズ（resize 枠なし）
+const WS_THICKFRAME: DWORD = 0x00040000; // リサイズ枠（TASK-23）
+const WS_MAXIMIZEBOX: DWORD = 0x00010000;
+const WINDOW_STYLE: DWORD = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX; // 自由リサイズ
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 const SW_SHOW: c_int = 5;
 const PM_REMOVE: UINT = 0x0001;
@@ -74,6 +76,8 @@ const IDC_ARROW: usize = 32512;
 
 const WM_DESTROY: UINT = 0x0002;
 const WM_CLOSE: UINT = 0x0010;
+const WM_SIZE: UINT = 0x0005; // client area リサイズ（TASK-23）
+const SIZE_MINIMIZED: WPARAM = 1; // WM_SIZE wparam（最小化は無視）
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
 const WM_SYSKEYDOWN: UINT = 0x0104;
@@ -340,6 +344,22 @@ pub const Core = struct {
         return core;
     }
 
+    /// WM_SIZE で client area が変わった時に CPU backing を two-phase 再確保する（TASK-23）。
+    /// 新確保に成功してから旧を解放（OOM 時は旧サイズ維持）。最小化/ゼロ/同サイズは no-op。
+    /// presentation resource（swap chain / DIB 等）の追従は各 backend が present 時に core 寸法と
+    /// 比較して行う（GDI は StretchDIBits が stateless、D3D11 は present 内で lazy に ResizeBuffers）。
+    fn resizeBacking(self: *Core, w: u32, h: u32) void {
+        if (w == 0 or h == 0) return;
+        if (w == self.width and h == self.height) return;
+        const px_count = std.math.mul(usize, w, h) catch return;
+        const nb = alloc.alloc(u32, px_count) catch return; // 失敗 → 旧サイズ維持
+        @memset(nb, 0);
+        alloc.free(self.backing);
+        self.backing = nb;
+        self.width = w;
+        self.height = h;
+    }
+
     /// window を破棄し、backing と Core 自身を解放する。
     /// （presentation resource の解放は backend 側が core.destroy より前に行う。）
     pub fn destroy(self: *Core) void {
@@ -401,6 +421,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             if (!core.closing) {
                 core.closing = true;
                 core.enqueue(.quit);
+            }
+            return 0;
+        },
+        WM_SIZE => {
+            // 自由リサイズ（TASK-23）。最小化(SIZE_MINIMIZED)以外で client area の新寸法へ backing を再確保。
+            // lparam: LOWORD=client width, HIWORD=client height。pollEvents（lock 外）で処理されるので安全。
+            if (wparam != SIZE_MINIMIZED) {
+                const lw: u32 = @truncate(@as(usize, @bitCast(lparam)));
+                core.resizeBacking(lw & 0xFFFF, (lw >> 16) & 0xFFFF);
             }
             return 0;
         },

@@ -86,11 +86,10 @@ extern "gdi32" fn StretchDIBits(
 
 pub const Window = struct {
     core: *common.Core,
-    bmi: BITMAPINFO,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
         const core = try common.Core.create(width, height, title);
-        return .{ .core = core, .bmi = makeBitmapInfo(width, height) };
+        return .{ .core = core };
     }
 
     pub fn destroy(self: Window) void {
@@ -125,8 +124,10 @@ pub const Window = struct {
         defer _ = ReleaseDC(core.hwnd, hdc);
         const w: c_int = @intCast(core.width);
         const h: c_int = @intCast(core.height);
-        // biHeight 負（top-down）なので src(0,0)=左上。固定サイズ運用で dest==src 寸法（拡縮なし）。
-        _ = StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, core.backing.ptr, &self.bmi, DIB_RGB_COLORS, SRCCOPY);
+        // bmi は core 寸法から毎回構築する（リサイズ追従。StretchDIBits は stateless。TASK-23）。
+        // biHeight 負（top-down）なので src(0,0)=左上。dest==src 寸法（拡縮なし）。
+        const bmi = makeBitmapInfo(core.width, core.height);
+        _ = StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, core.backing.ptr, &bmi, DIB_RGB_COLORS, SRCCOPY);
     }
 };
 

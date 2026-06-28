@@ -118,6 +118,9 @@ const ShmBuffer = struct {
     buffer: ?*c.struct_wl_buffer = null,
     pixels: []u32 = &.{},
     busy: bool = false,
+    // この buffer 実体の割り当てサイズ（TASK-23 resize。st.width/height と不一致なら lock 時に再確保）。
+    bw: u32 = 0,
+    bh: u32 = 0,
 };
 
 const State = struct {
@@ -150,6 +153,13 @@ const State = struct {
     width: u32,
     height: u32,
     compositor_version: u32 = 1,
+
+    // resize（TASK-23）。toplevelConfigure が suggested を pending に記録し、xdgSurfaceConfigure(ack)
+    // で st.width/height へ適用する（0 は「サイズ指定なし」で無視）。buffer 実体は lockFramebuffer が
+    // free buffer を選んだ時に lazy 再確保する（busy buffer には触らない）。
+    pending_width: u32 = 0,
+    pending_height: u32 = 0,
+    pending_resize: bool = false,
 
     // shm format negotiation
     has_xrgb8888: bool = false,
@@ -233,14 +243,32 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
     const st: *State = @ptrCast(@alignCast(data.?));
     c.xdg_surface_ack_configure(xdg_surface, serial);
     st.configured = true;
+    // resize（TASK-23）: pending suggested size を ack 後に適用する。ただし初期 setupBuffers より前
+    // （buffers 未確保）は適用せず requested size を維持する（create 中は従来挙動）。
+    // buffer 実体は lockFramebuffer が free buffer を lazy 再確保する（busy buffer には触らない）。
+    if (st.pending_resize and st.buffers[0].buffer != null) {
+        st.pending_resize = false;
+        if (st.pending_width != 0 and st.pending_height != 0) {
+            st.width = st.pending_width;
+            st.height = st.pending_height;
+        }
+    }
 }
 
 fn toplevelConfigure(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel, width: i32, height: i32, states: ?*c.struct_wl_array) callconv(.c) void {
-    _ = data;
     _ = toplevel;
-    _ = width;
-    _ = height;
-    _ = states; // 固定サイズ運用（resize 非対応）。suggested size は無視する。
+    _ = states;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // xdg-shell の 0 は「サイズ指定なし（クライアント裁量）」であり最小化ではない。各 configure は
+    // latest-wins なので、両軸 >0 のときだけ pending に記録し、それ以外（0 を含む）は stale pending を
+    // 消す（前グループの値を引きずらない）。実適用は xdg_surface.configure(ack) 側で行う。
+    if (width > 0 and height > 0) {
+        st.pending_width = @intCast(width);
+        st.pending_height = @intCast(height);
+        st.pending_resize = true;
+    } else {
+        st.pending_resize = false;
+    }
 }
 
 fn toplevelClose(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel) callconv(.c) void {
@@ -619,6 +647,10 @@ pub const Window = struct {
 
         // configure 後に shm ダブルバッファを確保。
         try setupBuffers(st);
+        // 初期 configure が suggested size を pending に積んでいても、初期 buffer は requested size で
+        // 確保済みなので消費して破棄する（stale pending が次回 configure で誤適用されるのを防ぐ）。
+        // 以後 compositor が別サイズを要求すれば map 後の configure で再適用される。
+        st.pending_resize = false;
 
         return .{ .state = st };
     }
@@ -716,12 +748,19 @@ pub const Window = struct {
             st.frame_pending = false;
         }
 
-        if (freeBufferIndex(st)) |i| return lockAt(st, i);
+        // free buffer を選び、サイズが現在値と違えば lazy 再確保してから lock する（TASK-23）。
+        if (freeBufferIndex(st)) |i| {
+            if (ensureBufferSize(st, i)) return lockAt(st, i);
+            return null; // 再確保失敗（OOM 等）→ frame skip。次回 lock で再試行
+        }
 
         // 両 buffer busy: release を取りこぼしていないか軽く dispatch して再試行（ブロックしない）。
         _ = c.wl_display_dispatch_pending(st.display);
         _ = c.wl_display_flush(st.display);
-        if (freeBufferIndex(st)) |i| return lockAt(st, i);
+        if (freeBufferIndex(st)) |i| {
+            if (ensureBufferSize(st, i)) return lockAt(st, i);
+            return null;
+        }
         return null;
     }
 
@@ -794,32 +833,57 @@ fn lockAt(st: *State, i: usize) Framebuffer {
     };
 }
 
+/// shm buffer の寸法（overflow / wl_shm の int32 protocol 境界を検査済み）。
+/// 計算に失敗（overflow / i32 超過）したら null（caller は確保失敗扱い）。
+const ShmDims = struct {
+    size: usize,
+    pixel_count: usize,
+    w_i32: i32,
+    h_i32: i32,
+    stride_i32: i32,
+    size_i32: i32,
+};
+
+fn computeShmDims(w: u32, h: u32) ?ShmDims {
+    const stride = std.math.mul(usize, w, 4) catch return null;
+    const size = std.math.mul(usize, stride, h) catch return null;
+    const pixel_count = std.math.mul(usize, w, h) catch return null;
+    return .{
+        .size = size,
+        .pixel_count = pixel_count,
+        // wl_shm_create_pool / create_buffer は int32_t 系。巨大 resize で trap/不正値にしない。
+        .w_i32 = std.math.cast(i32, w) orelse return null,
+        .h_i32 = std.math.cast(i32, h) orelse return null,
+        .stride_i32 = std.math.cast(i32, stride) orelse return null,
+        .size_i32 = std.math.cast(i32, size) orelse return null,
+    };
+}
+
 /// shm ダブルバッファ確保。各 buffer は独立した memfd + mmap + pool（pool は buffer 作成後 destroy）。
 fn setupBuffers(st: *State) Error!void {
-    const stride = std.math.mul(usize, st.width, 4) catch return error.WindowCreationFailed;
-    const size = std.math.mul(usize, stride, st.height) catch return error.WindowCreationFailed;
+    const dims = computeShmDims(st.width, st.height) orelse return error.WindowCreationFailed;
     for (&st.buffers) |*b| {
-        try setupOneBuffer(st, b, stride, size);
+        try setupOneBuffer(st, b, dims);
     }
 }
 
-fn setupOneBuffer(st: *State, b: *ShmBuffer, stride: usize, size: usize) Error!void {
+fn setupOneBuffer(st: *State, b: *ShmBuffer, dims: ShmDims) Error!void {
     const fd = memfd_create("video-proto-wayland", MFD_CLOEXEC);
     if (fd < 0) return error.WindowCreationFailed;
     errdefer _ = close(fd);
-    if (ftruncate(fd, @intCast(size)) != 0) return error.WindowCreationFailed;
+    if (ftruncate(fd, @intCast(dims.size)) != 0) return error.WindowCreationFailed;
 
-    const raw = mmap(null, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) orelse return error.WindowCreationFailed;
+    const raw = mmap(null, dims.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) orelse return error.WindowCreationFailed;
     if (@intFromPtr(raw) == MAP_FAILED_INT) return error.WindowCreationFailed;
-    errdefer _ = munmap(raw, size);
+    errdefer _ = munmap(raw, dims.size);
 
-    const pool = c.wl_shm_create_pool(st.shm, fd, @intCast(size)) orelse return error.WindowCreationFailed;
+    const pool = c.wl_shm_create_pool(st.shm, fd, dims.size_i32) orelse return error.WindowCreationFailed;
     const wl_buf = c.wl_shm_pool_create_buffer(
         pool,
         0,
-        @intCast(st.width),
-        @intCast(st.height),
-        @intCast(stride),
+        dims.w_i32,
+        dims.h_i32,
+        dims.stride_i32,
         st.shm_format,
     ) orelse {
         c.wl_shm_pool_destroy(pool);
@@ -832,10 +896,74 @@ fn setupOneBuffer(st: *State, b: *ShmBuffer, stride: usize, size: usize) Error!v
     const px: [*]u32 = @ptrCast(@alignCast(raw));
     b.fd = fd;
     b.map_ptr = raw;
-    b.map_size = size;
+    b.map_size = dims.size;
     b.buffer = wl_buf;
-    b.pixels = px[0 .. st.width * st.height];
+    b.pixels = px[0..dims.pixel_count];
     b.busy = false;
+    b.bw = st.width;
+    b.bh = st.height;
+}
+
+/// free（非 busy）buffer のサイズを現在の st.width/height に合わせる。一致なら no-op。
+/// 不一致なら two-phase 再確保（新リソース確保成功後に旧を破棄）。成功で true。
+/// 呼び出し側（lockFramebuffer）が free buffer に対してのみ呼ぶこと（busy buffer には触らない）。
+fn ensureBufferSize(st: *State, i: usize) bool {
+    const b = &st.buffers[i];
+    if (b.buffer != null and b.bw == st.width and b.bh == st.height) return true;
+    return reallocBuffer(st, i);
+}
+
+/// free buffer slot を新サイズへ two-phase 再確保する。新リソースの確保に成功してから旧を破棄し、
+/// 新 wl_buffer のリスナは slot アドレス（&st.buffers[i]）に束ねる（listener data の安定性を保つ）。
+/// 失敗時は slot を旧のまま残す（次回 lock で再試行。OOM 時はフレーム skip）。
+fn reallocBuffer(st: *State, i: usize) bool {
+    const b = &st.buffers[i];
+    const dims = computeShmDims(st.width, st.height) orelse return false;
+
+    // phase 1: 新リソースを locals に確保
+    const fd = memfd_create("video-proto-wayland", MFD_CLOEXEC);
+    if (fd < 0) return false;
+    if (ftruncate(fd, @intCast(dims.size)) != 0) {
+        _ = close(fd);
+        return false;
+    }
+    const raw = mmap(null, dims.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) orelse {
+        _ = close(fd);
+        return false;
+    };
+    if (@intFromPtr(raw) == MAP_FAILED_INT) {
+        _ = close(fd);
+        return false;
+    }
+    const pool = c.wl_shm_create_pool(st.shm, fd, dims.size_i32) orelse {
+        _ = munmap(raw, dims.size);
+        _ = close(fd);
+        return false;
+    };
+    const wl_buf = c.wl_shm_pool_create_buffer(pool, 0, dims.w_i32, dims.h_i32, dims.stride_i32, st.shm_format) orelse {
+        c.wl_shm_pool_destroy(pool);
+        _ = munmap(raw, dims.size);
+        _ = close(fd);
+        return false;
+    };
+    c.wl_shm_pool_destroy(pool);
+
+    // phase 2: 旧リソース破棄（b は free なので安全）→ 新リソースを slot へ書き込み、listener を再束ね
+    if (b.buffer) |old_buf| c.wl_buffer_destroy(old_buf);
+    if (b.map_ptr) |p| _ = munmap(p, b.map_size);
+    if (b.fd >= 0) _ = close(b.fd);
+
+    const px: [*]u32 = @ptrCast(@alignCast(raw));
+    b.fd = fd;
+    b.map_ptr = raw;
+    b.map_size = dims.size;
+    b.buffer = wl_buf;
+    b.pixels = px[0..dims.pixel_count];
+    b.busy = false;
+    b.bw = st.width;
+    b.bh = st.height;
+    _ = c.wl_buffer_add_listener(wl_buf, &buffer_listener, b);
+    return true;
 }
 
 /// 確保済みリソースを null-check しつつ解放。create の errdefer と destroy で共用。
