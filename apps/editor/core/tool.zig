@@ -17,9 +17,6 @@ const undo_mod = @import("undo.zig");
 const StrokeRecorder = undo_mod.StrokeRecorder;
 const UndoCmd = undo_mod.UndoCmd;
 
-/// MVP は単一レイヤ。多レイヤ対応は後続タスク。
-const MVP_LAYER: usize = 0;
-
 /// Eraser の塗り色（透明）。canonical BGRA 0xAARRGGBB の a=0。
 pub const ERASER_COLOR: u32 = 0x00000000;
 
@@ -54,7 +51,7 @@ pub const Tool = struct {
 fn brushOnEvent(rec: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, color: u32, ev: ToolEvent) ?UndoCmd {
     switch (ev) {
         .down => |p| {
-            rec.begin(MVP_LAYER, color);
+            rec.begin(canvas.selected_layer, color);
             rec.point(canvas, gpa, p.x, p.y);
             return null;
         },
@@ -182,7 +179,7 @@ pub const Brush = struct {
         switch (ev) {
             .down => |p| {
                 self.buildDab();
-                rec.brushBegin(MVP_LAYER, self.color, self.opacity);
+                rec.brushBegin(canvas.selected_layer, self.color, self.opacity);
                 rec.stamp(canvas, gpa, p.x, p.y, self.dabRef());
                 return null;
             },
@@ -303,6 +300,27 @@ test "Tool: 空 stroke（変更なし）では onEvent(.up) が null を返す" 
     const et = eraser.tool();
     _ = et.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 2, .y = 2 } });
     try std.testing.expectEqual(@as(?UndoCmd, null), et.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 4, .y = 4 } }));
+}
+
+test "Tool: selected_layer に描画する" {
+    const gpa = std.testing.allocator;
+    var canvas = try Canvas.init(gpa, 4, 4);
+    defer canvas.deinit();
+    var rec = try StrokeRecorder.init(gpa, 4, 4);
+    defer rec.deinit(gpa);
+
+    _ = try canvas.addLayer(gpa);
+    try std.testing.expectEqual(@as(usize, 1), canvas.selected_layer);
+
+    var pen: Pen = .{ .color = RED };
+    const pt = pen.tool();
+    _ = pt.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
+    const cmd = pt.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 0, .y = 0 } }) orelse return error.TestUnexpectedNull;
+    defer gpa.free(cmd.paint.diffs);
+
+    try std.testing.expectEqual(@as(u32, 0), canvas.layerPixels(0)[0]);
+    try std.testing.expectEqual(RED, canvas.layerPixels(1)[0]);
+    try std.testing.expectEqual(@as(usize, 1), cmd.paint.layer_idx);
 }
 
 // ── Brush footprint / stroke テスト（TASK-21.12）─────────────

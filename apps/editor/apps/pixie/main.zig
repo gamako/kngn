@@ -53,6 +53,13 @@ const CONTENT_ROW_ID: gui.Id = 0xC0FFEE02;
 const MAIN_AREA_ID: gui.Id = 0xC0FFEE03;
 const SPLIT_RIGHT_ID: gui.Id = 0xC0FFEE04;
 const SPLIT_BOTTOM_ID: gui.Id = 0xC0FFEE05;
+const LAYER_PANEL_ID_BASE: gui.Id = 0xA430_0000;
+const LAYER_ROW_ID_BASE: gui.Id = 0xA430_1000;
+const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
+// レイヤーパネルのサムネイル（raw layer をチェッカー下地へ最近傍縮小・等倍 blit）
+const LAYER_THUMB_W: i32 = 24;
+const LAYER_THUMB_H: i32 = 24;
+const LAYER_THUMB_CELL: usize = 4; // サムネ内チェッカーのセル px
 
 const COLOR_WINDOW_BG: u32 = 0xFF_24_20_20; // canonical BGRA: r=24,g=20,b=20（従来の見た目を維持）
 
@@ -214,6 +221,10 @@ const App = struct {
         return self.save_msg_buf[0..self.save_msg_len];
     }
 
+    fn editingBlocked(self: *const App) bool {
+        return self.input.capturing or self.bezier_editor.isEditing();
+    }
+
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
     /// 冒頭で one-shot 消費するので、capturing 等による早期 return でも要求は残らない。
     fn runPendingFileOp(self: *App) void {
@@ -301,10 +312,8 @@ const App = struct {
     /// 記憶している保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
     fn doSave(self: *App) void {
         const path = self.current_path orelse return self.doSaveAs();
-        // 表示は composite だが、保存は raw layer pixels（21.6 の不変条件:
-        // composite を保存すると消しゴムの透明が白に潰れて round-trip が壊れる）
-        const raw = self.canvas.layerPixels(0);
-        core.savePNG(self.io, path, raw, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+        const flat = self.canvas.compositeStraight();
+        core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
             // current_path は永続パスなので失敗しても保持（free しない）
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             return;
@@ -322,8 +331,8 @@ const App = struct {
             return;
         };
         const path = maybe orelse return; // キャンセル: サイレント no-op
-        const raw = self.canvas.layerPixels(0);
-        core.savePNG(self.io, path, raw, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+        const flat = self.canvas.compositeStraight();
+        core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             self.gpa.free(path); // 失敗時はダイアログ戻り値を解放・旧 current_path は触らない
             return;
@@ -349,6 +358,9 @@ const App = struct {
         };
         defer img.deinit(self.gpa);
 
+        // PNG はフラット形式として読み込み、layer0 だけの新規ドキュメントへ置き換える。
+        self.resetCanvasToSingleLayer();
+
         // 左上クロップ/パディング: layer0 を透明クリアし、収まる範囲を行ごとに memcpy。
         // png の出力は canonical BGRA 0xAARRGGBB で canvas と同一レイアウトなので変換不要。
         const layer0 = self.canvas.layerPixels(0);
@@ -359,6 +371,7 @@ const App = struct {
         for (0..rows) |y| {
             @memcpy(layer0[y * CANVAS_W ..][0..cols], img.pixels[y * iw ..][0..cols]);
         }
+        self.syncPreviewCanvas();
 
         // load はドキュメント差し替えなので undo/redo 履歴を破棄（recorder は stroke 非進行中）
         self.undo.deinit(self.gpa);
@@ -371,18 +384,110 @@ const App = struct {
 
     /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）
     fn doUndo(self: *App) void {
-        if (self.input.capturing or self.bezier_editor.isEditing()) return;
+        if (self.editingBlocked()) return;
         self.undo.undoOne(self.gpa, &self.canvas);
     }
 
     fn doRedo(self: *App) void {
-        if (self.input.capturing or self.bezier_editor.isEditing()) return;
+        if (self.editingBlocked()) return;
         self.undo.redoOne(self.gpa, &self.canvas);
     }
 
     fn doClear(self: *App) void {
-        if (self.input.capturing or self.bezier_editor.isEditing()) return;
-        self.undo.pushClear(self.gpa, &self.canvas, 0);
+        if (self.editingBlocked()) return;
+        self.undo.pushClear(self.gpa, &self.canvas, self.canvas.selected_layer);
+    }
+
+    fn doAddLayer(self: *App) void {
+        if (self.editingBlocked()) return;
+        const selected_before = self.canvas.selected_layer;
+        const idx = self.canvas.addLayer(self.gpa) catch |err| {
+            self.setSaveMsg("Layer add failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.undo.push(self.gpa, .{ .layer_add = .{
+            .index = idx,
+            .selected_before = selected_before,
+            .selected_after = self.canvas.selected_layer,
+        } });
+    }
+
+    fn doDeleteLayer(self: *App) void {
+        if (self.editingBlocked()) return;
+        const idx = self.canvas.selected_layer;
+        const selected_before = self.canvas.selected_layer;
+        const removed = self.canvas.deleteLayer(idx) orelse return;
+        self.undo.push(self.gpa, .{ .layer_delete = .{
+            .index = idx,
+            .selected_before = selected_before,
+            .selected_after = self.canvas.selected_layer,
+            .layer = removed,
+        } });
+    }
+
+    fn doMoveLayer(self: *App, delta: i32) void {
+        if (self.editingBlocked()) return;
+        const from = self.canvas.selected_layer;
+        const to_i: i32 = @as(i32, @intCast(from)) + delta;
+        if (to_i < 0) return;
+        const to: usize = @intCast(to_i);
+        if (to >= self.canvas.layers.items.len or to == from) return;
+        const selected_before = self.canvas.selected_layer;
+        if (!self.canvas.moveLayer(from, to)) return;
+        self.undo.push(self.gpa, .{ .layer_reorder = .{
+            .from = from,
+            .to = to,
+            .selected_before = selected_before,
+            .selected_after = self.canvas.selected_layer,
+        } });
+    }
+
+    fn doToggleLayerVisible(self: *App, idx: usize) void {
+        if (self.editingBlocked() or idx >= self.canvas.layers.items.len) return;
+        const before = self.canvas.layers.items[idx].visible;
+        const after = !before;
+        _ = self.canvas.setLayerVisible(idx, after);
+        self.undo.push(self.gpa, .{ .layer_visible = .{ .index = idx, .before = before, .after = after } });
+    }
+
+    fn doSetLayerOpacity(self: *App, idx: usize, value: u8) void {
+        if (self.editingBlocked() or idx >= self.canvas.layers.items.len) return;
+        const before = self.canvas.layers.items[idx].opacity;
+        if (before == value) return;
+        _ = self.canvas.setLayerOpacity(idx, value);
+        self.undo.push(self.gpa, .{ .layer_opacity = .{ .index = idx, .before = before, .after = value } });
+    }
+
+    fn doSelectLayer(self: *App, idx: usize) void {
+        if (self.editingBlocked()) return;
+        _ = self.canvas.selectLayer(idx);
+    }
+
+    fn resetCanvasToSingleLayer(self: *App) void {
+        while (self.canvas.layers.items.len > 1) {
+            const removed = self.canvas.deleteLayer(self.canvas.layers.items.len - 1).?;
+            self.gpa.free(removed.pixels);
+        }
+        self.canvas.selected_layer = 0;
+        self.canvas.layers.items[0].visible = true;
+        self.canvas.layers.items[0].opacity = 255;
+        @memset(self.canvas.layerPixels(0), 0);
+    }
+
+    fn syncPreviewCanvas(self: *App) void {
+        while (self.preview_canvas.layers.items.len > self.canvas.layers.items.len) {
+            const removed = self.preview_canvas.deleteLayer(self.preview_canvas.layers.items.len - 1).?;
+            self.gpa.free(removed.pixels);
+        }
+        while (self.preview_canvas.layers.items.len < self.canvas.layers.items.len) {
+            _ = self.preview_canvas.addLayer(self.gpa) catch @panic("syncPreviewCanvas: OOM");
+        }
+        for (self.canvas.layers.items, self.preview_canvas.layers.items) |src, *dst| {
+            @memcpy(dst.pixels, src.pixels);
+            dst.visible = src.visible;
+            dst.opacity = src.opacity;
+        }
+        self.preview_canvas.selected_layer = self.canvas.selected_layer;
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
@@ -465,24 +570,39 @@ const App = struct {
 // ctx は *App。harness 無効時は登録自体が no-op なので通常実行に影響しない。
 // ============================================================================
 
-/// canvas digest: サイズ / layer 数 / raw layer pixels の crc / 非ゼロ画素数（描画変化を検出できる）。
+/// canvas digest: サイズ / layer 数 / selected / composite crc / layer metadata。
 fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    const raw = app.canvas.layerPixels(0);
-    const crc = png.crc32(std.mem.sliceAsBytes(raw));
-    var nonzero: usize = 0;
-    for (raw) |p| {
-        if (p != 0) nonzero += 1;
+    var len: usize = 0;
+    const head = std.fmt.bufPrint(buf[len..], "{d}x{d} layers={d} selected={d} comp={X:0>8}", .{
+        CANVAS_W,
+        CANVAS_H,
+        app.canvas.layers.items.len,
+        app.canvas.selected_layer,
+        png.crc32(std.mem.sliceAsBytes(app.canvas.compositeStraight())),
+    }) catch return buf[0..0];
+    len += head.len;
+    for (app.canvas.layers.items, 0..) |layer, idx| {
+        var nonzero: usize = 0;
+        for (layer.pixels) |p| {
+            if (p != 0) nonzero += 1;
+        }
+        const part = std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d}}}", .{
+            idx,
+            layer.visible,
+            layer.opacity,
+            png.crc32(std.mem.sliceAsBytes(layer.pixels)),
+            nonzero,
+        }) catch break;
+        len += part.len;
     }
-    return std.fmt.bufPrint(buf, "{d}x{d} layers={d} crc={X:0>8} nonzero={d}", .{
-        CANVAS_W, CANVAS_H, app.canvas.layers.items.len, crc, nonzero,
-    }) catch buf[0..0];
+    return buf[0..len];
 }
 
-/// canvas snapshot: raw layer pixels を PNG 化（表示 composite ではなく raw＝透明保持の不変条件）。
+/// canvas snapshot: visible layer を合成したフラット透明 PNG。
 fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    return core.encodePNG(app.canvas.layerPixels(0), CANVAS_W, CANVAS_H, allocator);
+    return core.encodePNG(app.canvas.compositeStraight(), CANVAS_W, CANVAS_H, allocator);
 }
 
 /// undo digest/snapshot: undo/redo スタックの深さ（JSON 1行）。undo で depth が減る。
@@ -669,6 +789,102 @@ fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) b
     return app.pan_active;
 }
 
+fn layerWidgetId(idx: usize, part: gui.Id) gui.Id {
+    return LAYER_ROW_ID_BASE + @as(gui.Id, idx) * LAYER_PANEL_ID_STRIDE + part;
+}
+
+/// raw layer pixels（CANVAS_W×CANVAS_H, straight BGRA 0xAARRGGBB）を THUMB へ縮小し、
+/// チェッカー下地へ src-over して不透明サムネを作る（透明部はチェッカーが見える）。
+/// 各サムネ画素は元領域の **alpha 重み付き平均（premultiplied 平均）** にして、1px の細線も
+/// 薄く残し内容が分かるようにする（最近傍だと細線が抜け落ちる）。opacity は反映しない（生の内容を表示）。
+/// buf.len == LAYER_THUMB_W * LAYER_THUMB_H 前提。
+fn fillLayerThumb(buf: []u32, layer_pixels: []const u32) void {
+    const tw: usize = @intCast(LAYER_THUMB_W);
+    const th: usize = @intCast(LAYER_THUMB_H);
+    const cw: usize = CANVAS_W;
+    const ch: usize = CANVAS_H;
+    var ty: usize = 0;
+    while (ty < th) : (ty += 1) {
+        const sy0 = ty * ch / th;
+        const sy1 = @max(sy0 + 1, (ty + 1) * ch / th); // 必ず 1 行以上
+        var tx: usize = 0;
+        while (tx < tw) : (tx += 1) {
+            const sx0 = tx * cw / tw;
+            const sx1 = @max(sx0 + 1, (tx + 1) * cw / tw);
+            // 元領域 [sx0,sx1)×[sy0,sy1) の premultiplied 平均で straight BGRA を作る
+            var sum_a: u64 = 0;
+            var sum_r: u64 = 0;
+            var sum_g: u64 = 0;
+            var sum_b: u64 = 0;
+            var n: u64 = 0;
+            var sy = sy0;
+            while (sy < sy1) : (sy += 1) {
+                var sx = sx0;
+                while (sx < sx1) : (sx += 1) {
+                    const px = layer_pixels[sy * cw + sx];
+                    const a: u64 = (px >> 24) & 0xFF;
+                    const r: u64 = (px >> 16) & 0xFF;
+                    const g: u64 = (px >> 8) & 0xFF;
+                    const b: u64 = px & 0xFF;
+                    sum_a += a;
+                    sum_r += r * a;
+                    sum_g += g * a;
+                    sum_b += b * a;
+                    n += 1;
+                }
+            }
+            const avg_a: u32 = @intCast(sum_a / n);
+            const avg_r: u32 = if (sum_a > 0) @intCast(sum_r / sum_a) else 0;
+            const avg_g: u32 = if (sum_a > 0) @intCast(sum_g / sum_a) else 0;
+            const avg_b: u32 = if (sum_a > 0) @intCast(sum_b / sum_a) else 0;
+            const src = (avg_a << 24) | (avg_r << 16) | (avg_g << 8) | avg_b;
+            const checker = (tx / LAYER_THUMB_CELL + ty / LAYER_THUMB_CELL) & 1;
+            const bg: u32 = if (checker == 0) CHECKER_LIGHT else CHECKER_DARK;
+            buf[ty * tw + tx] = core.blend.srcOver(bg, src);
+        }
+    }
+}
+
+fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
+    ctx.label("Layers");
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) app.doAddLayer();
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) app.doDeleteLayer();
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) app.doMoveLayer(1);
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) app.doMoveLayer(-1);
+    ctx.endBox();
+
+    var rev = app.canvas.layers.items.len;
+    while (rev > 0) {
+        rev -= 1;
+        const idx = rev;
+        const layer = app.canvas.layers.items[idx];
+        // 1 行 = [サムネイル][選択 L{d}][visible][opacity slider]。行高はサムネイル(24px)律速。
+        // 横一列で 200px 幅に収め、行を低く保って縦方向に多くの layer を見せる。
+        ctx.beginBox(.{ .direction = .row, .gap = 3, .align_cross = .center });
+
+        // サムネイル: raw layer をチェッカー下地へ縮小合成。選択中は枠を明色に。
+        const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("layer thumb: OOM");
+        fillLayerThumb(thumb, layer.pixels);
+        const thumb_border = if (idx == app.canvas.selected_layer) ctx.style.border_hover else ctx.style.border;
+        ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
+
+        const name = try std.fmt.allocPrint(ctx.allocator(), "L{d}", .{idx});
+        if (ctx.buttonId(layerWidgetId(idx, 0), name, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
+            app.doSelectLayer(idx);
+        }
+        const vis_label: []const u8 = if (layer.visible) "V" else "H";
+        if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
+            app.doToggleLayerVisible(idx);
+        }
+        var op_i32: i32 = layer.opacity;
+        if (ctx.sliderI32Id(layerWidgetId(idx, 2), "O", &op_i32, .{ .min = 0, .max = 255, .track_w = 40 })) {
+            app.doSetLayerOpacity(idx, @intCast(std.math.clamp(op_i32, 0, 255)));
+        }
+        ctx.endBox(); // row
+    }
+}
+
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
@@ -808,6 +1024,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
         app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
         app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
+
+        try buildLayerPanel(ctx, app);
         ctx.endBox(); // right pane
     } // right_visible
 
@@ -866,6 +1084,10 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     }
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
+        ctx.style.text_subtle,
+    );
+    ctx.labelEx(
+        try std.fmt.allocPrint(arena, "layer: {d}/{d}", .{ app.canvas.selected_layer + 1, app.canvas.layers.items.len }),
         ctx.style.text_subtle,
     );
     ctx.labelEx(
@@ -1027,8 +1249,8 @@ pub fn main(init: std.process.Init) !void {
                     };
                     drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
                     if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
-                        // 確定前ブラシプレビュー: 本 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
-                        @memcpy(app.preview_canvas.layerPixels(0), app.canvas.layerPixels(0));
+                        // 確定前ブラシプレビュー: 本 canvas 全 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
+                        app.syncPreviewCanvas();
                         const dab = app.brush.footprint();
                         app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
                         blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), rect, zoom, area);

@@ -11,6 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
+const Layer = canvas_mod.Layer;
 const Vec2 = canvas_mod.Vec2;
 const blend = @import("blend.zig");
 
@@ -27,6 +28,34 @@ pub const UndoCmd = union(enum) {
     paint: struct {
         layer_idx: usize,
         diffs: []PixelDiff,
+    },
+    layer_add: struct {
+        index: usize,
+        selected_before: usize,
+        selected_after: usize,
+        layer: ?Layer = null,
+    },
+    layer_delete: struct {
+        index: usize,
+        selected_before: usize,
+        selected_after: usize,
+        layer: ?Layer,
+    },
+    layer_reorder: struct {
+        from: usize,
+        to: usize,
+        selected_before: usize,
+        selected_after: usize,
+    },
+    layer_visible: struct {
+        index: usize,
+        before: bool,
+        after: bool,
+    },
+    layer_opacity: struct {
+        index: usize,
+        before: u8,
+        after: u8,
     },
 };
 
@@ -256,6 +285,9 @@ pub const UndoStack = struct {
     fn freeCmd(gpa: Allocator, cmd: UndoCmd) void {
         switch (cmd) {
             .paint => |p| gpa.free(p.diffs),
+            .layer_add => |op| if (op.layer) |layer| gpa.free(layer.pixels),
+            .layer_delete => |op| if (op.layer) |layer| gpa.free(layer.pixels),
+            .layer_reorder, .layer_visible, .layer_opacity => {},
         }
     }
 
@@ -273,32 +305,72 @@ pub const UndoStack = struct {
 
     /// 直近のコマンドを取り消す（before 適用）。空スタックでは何もしない。
     pub fn undoOne(self: *UndoStack, gpa: Allocator, canvas: *Canvas) void {
-        const cmd = self.undo.pop() orelse return;
-        applyBefore(canvas, cmd);
+        var cmd = self.undo.pop() orelse return;
+        applyBefore(canvas, &cmd);
         self.redo.append(gpa, cmd) catch @panic("UndoStack.undoOne: OOM");
     }
 
     /// 取り消したコマンドをやり直す（after 適用）。空スタックでは何もしない。
     pub fn redoOne(self: *UndoStack, gpa: Allocator, canvas: *Canvas) void {
-        const cmd = self.redo.pop() orelse return;
-        applyAfter(canvas, cmd);
+        var cmd = self.redo.pop() orelse return;
+        applyAfter(canvas, &cmd);
         self.undo.append(gpa, cmd) catch @panic("UndoStack.redoOne: OOM");
     }
 
-    fn applyBefore(canvas: *Canvas, cmd: UndoCmd) void {
-        switch (cmd) {
+    fn applyBefore(canvas: *Canvas, cmd: *UndoCmd) void {
+        switch (cmd.*) {
             .paint => |p| {
                 const pixels = canvas.layerPixels(p.layer_idx);
                 for (p.diffs) |d| pixels[d.idx] = d.before;
             },
+            .layer_add => |*op| {
+                op.layer = canvas.deleteLayer(op.index) orelse @panic("UndoStack.layer_add undo: missing layer");
+                _ = canvas.selectLayer(op.selected_before);
+            },
+            .layer_delete => |*op| {
+                const layer = op.layer orelse @panic("UndoStack.layer_delete undo: missing held layer");
+                op.layer = null;
+                canvas.insertLayer(canvas.allocator, op.index, layer) catch @panic("UndoStack.layer_delete undo: OOM");
+                _ = canvas.selectLayer(op.selected_before);
+            },
+            .layer_reorder => |op| {
+                if (!canvas.moveLayer(op.to, op.from)) @panic("UndoStack.layer_reorder undo: invalid layer");
+                _ = canvas.selectLayer(op.selected_before);
+            },
+            .layer_visible => |op| {
+                if (!canvas.setLayerVisible(op.index, op.before)) @panic("UndoStack.layer_visible undo: invalid layer");
+            },
+            .layer_opacity => |op| {
+                if (!canvas.setLayerOpacity(op.index, op.before)) @panic("UndoStack.layer_opacity undo: invalid layer");
+            },
         }
     }
 
-    fn applyAfter(canvas: *Canvas, cmd: UndoCmd) void {
-        switch (cmd) {
+    fn applyAfter(canvas: *Canvas, cmd: *UndoCmd) void {
+        switch (cmd.*) {
             .paint => |p| {
                 const pixels = canvas.layerPixels(p.layer_idx);
                 for (p.diffs) |d| pixels[d.idx] = d.after;
+            },
+            .layer_add => |*op| {
+                const layer = op.layer orelse @panic("UndoStack.layer_add redo: missing held layer");
+                op.layer = null;
+                canvas.insertLayer(canvas.allocator, op.index, layer) catch @panic("UndoStack.layer_add redo: OOM");
+                _ = canvas.selectLayer(op.selected_after);
+            },
+            .layer_delete => |*op| {
+                op.layer = canvas.deleteLayer(op.index) orelse @panic("UndoStack.layer_delete redo: missing layer");
+                _ = canvas.selectLayer(op.selected_after);
+            },
+            .layer_reorder => |op| {
+                if (!canvas.moveLayer(op.from, op.to)) @panic("UndoStack.layer_reorder redo: invalid layer");
+                _ = canvas.selectLayer(op.selected_after);
+            },
+            .layer_visible => |op| {
+                if (!canvas.setLayerVisible(op.index, op.after)) @panic("UndoStack.layer_visible redo: invalid layer");
+            },
+            .layer_opacity => |op| {
+                if (!canvas.setLayerOpacity(op.index, op.after)) @panic("UndoStack.layer_opacity redo: invalid layer");
             },
         }
     }
@@ -522,6 +594,113 @@ test "clearAll: 全消去して undo で復元できる" {
     e.undoOp(); // 空スタック
     e.clearAll();
     try std.testing.expectEqual(@as(usize, 0), e.undo.undo.items.len);
+}
+
+test "layer add: undo/redo keeps pixels and selected layer ownership consistent" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 2, 2);
+    defer c.deinit();
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    const selected_before = c.selected_layer;
+    const idx = try c.addLayer(gpa);
+    c.layerPixels(idx)[0] = RED;
+    undo_stack.push(gpa, .{ .layer_add = .{
+        .index = idx,
+        .selected_before = selected_before,
+        .selected_after = c.selected_layer,
+    } });
+
+    undo_stack.undoOne(gpa, &c);
+    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
+    try std.testing.expect(undo_stack.redo.items[0].layer_add.layer != null);
+
+    undo_stack.redoOne(gpa, &c);
+    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
+    try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
+    try std.testing.expect(undo_stack.undo.items[0].layer_add.layer == null);
+}
+
+test "layer delete: undo/redo restores pixels metadata and selected layer" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 2, 2);
+    defer c.deinit();
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    _ = try c.addLayer(gpa);
+    c.layerPixels(1)[0] = RED;
+    c.layers.items[1].visible = false;
+    c.layers.items[1].opacity = 123;
+    c.selected_layer = 1;
+
+    const selected_before = c.selected_layer;
+    const removed = c.deleteLayer(1) orelse return error.TestUnexpectedNull;
+    undo_stack.push(gpa, .{ .layer_delete = .{
+        .index = 1,
+        .selected_before = selected_before,
+        .selected_after = c.selected_layer,
+        .layer = removed,
+    } });
+
+    undo_stack.undoOne(gpa, &c);
+    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
+    try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
+    try std.testing.expect(!c.layers.items[1].visible);
+    try std.testing.expectEqual(@as(u8, 123), c.layers.items[1].opacity);
+    try std.testing.expect(undo_stack.redo.items[0].layer_delete.layer == null);
+
+    undo_stack.redoOne(gpa, &c);
+    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
+    try std.testing.expect(undo_stack.undo.items[0].layer_delete.layer != null);
+}
+
+test "layer reorder visible opacity: undo/redo restores structure and metadata" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 1, 1);
+    defer c.deinit();
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    _ = try c.addLayer(gpa);
+    c.layerPixels(0)[0] = BLACK;
+    c.layerPixels(1)[0] = RED;
+    c.selected_layer = 1;
+
+    undo_stack.push(gpa, .{ .layer_reorder = .{
+        .from = 1,
+        .to = 0,
+        .selected_before = 1,
+        .selected_after = 0,
+    } });
+    try std.testing.expect(c.moveLayer(1, 0));
+    undo_stack.undoOne(gpa, &c);
+    try std.testing.expectEqual(BLACK, c.layerPixels(0)[0]);
+    try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
+    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
+    undo_stack.redoOne(gpa, &c);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[0]);
+    try std.testing.expectEqual(BLACK, c.layerPixels(1)[0]);
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
+
+    undo_stack.push(gpa, .{ .layer_visible = .{ .index = 0, .before = true, .after = false } });
+    _ = c.setLayerVisible(0, false);
+    undo_stack.undoOne(gpa, &c);
+    try std.testing.expect(c.layers.items[0].visible);
+    undo_stack.redoOne(gpa, &c);
+    try std.testing.expect(!c.layers.items[0].visible);
+
+    undo_stack.push(gpa, .{ .layer_opacity = .{ .index = 0, .before = 255, .after = 77 } });
+    _ = c.setLayerOpacity(0, 77);
+    undo_stack.undoOne(gpa, &c);
+    try std.testing.expectEqual(@as(u8, 255), c.layers.items[0].opacity);
+    undo_stack.redoOne(gpa, &c);
+    try std.testing.expectEqual(@as(u8, 77), c.layers.items[0].opacity);
 }
 
 test "stroke 内の重複塗りは最初の before を保持する（undo の正しさ）" {

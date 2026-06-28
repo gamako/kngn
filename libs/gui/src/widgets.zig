@@ -534,6 +534,43 @@ const HueBarDraw = struct {
     }
 };
 
+// ── 画像ボックス（汎用・等倍 leaf。TASK-43）──────────────────
+// svSquare / hueBar と同じく DrawCmd.image を使う固定 px leaf。pixels は caller 所有で
+// render まで生存すること（frame arena 推奨）。dl.image が rect.w==src_w を assert するため
+// 縮小は呼び出し側で行い、ここでは等倍 blit のみ。非対話（hit-test しない）。
+
+pub const ImageBoxOpts = struct {
+    /// 枠線色（null なら枠なし）
+    border: ?Color = null,
+    border_thickness: u32 = 1,
+};
+
+/// 等倍画像ボックス（明示 ID）。w×h の pixels を同サイズ rect へ blit する。
+/// pixels.len == w*h、w>=1、h>=1。
+pub fn imageBox(ctx: *Context, id: Id, pixels: []const u32, w: i32, h: i32, opts: ImageBoxOpts) void {
+    std.debug.assert(w >= 1 and h >= 1);
+    std.debug.assert(pixels.len == @as(usize, @intCast(w)) * @as(usize, @intCast(h)));
+    const data = ctx.allocator().create(ImageBoxDraw) catch @panic("imageBox: OOM");
+    data.* = .{ .buf = pixels, .w = w, .h = h, .border = opts.border, .border_thickness = opts.border_thickness };
+    ctx.beginBox(.{ .id = id, .width = .{ .fixed = w }, .height = .{ .fixed = h } });
+    ctx.custom(.{ .x = w, .y = h }, ImageBoxDraw.draw, data);
+    ctx.endBox();
+}
+
+const ImageBoxDraw = struct {
+    buf: []const u32,
+    w: i32,
+    h: i32,
+    border: ?Color,
+    border_thickness: u32,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const ImageBoxDraw = @ptrCast(@alignCast(ctx_ptr));
+        dl.image(rect, self.buf, @intCast(self.w), @intCast(self.h)) catch @panic("imageBox: OOM");
+        if (self.border) |c| dl.rectOutline(rect, c, self.border_thickness) catch @panic("imageBox: OOM");
+    }
+};
+
 // ============================================================
 // Splitter（ペイン境界ドラッグ。TASK-41）
 // ============================================================
@@ -1241,4 +1278,37 @@ test "hueBar: ドラッグで h が [0,360) で更新される（AC#3）" {
     _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
     ctx.endFrame();
     try std.testing.expectApproxEqAbs(@as(f32, 180), h, 20);
+}
+
+test "imageBox: 固定 w×h の leaf を確保し等倍 image cmd を発行する" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const W: i32 = 24;
+    const H: i32 = 20;
+    var buf: [24 * 20]u32 = undefined;
+    @memset(buf[0..], 0xFF112233);
+
+    ctx.beginFrame(200, 200);
+    ctx.imageBox(0xBEEF, &buf, W, H, .{});
+    ctx.endFrame(); // endFrame が custom draw_fn を呼び dl.image(rect.w==src_w を assert) を実行
+
+    // 固定サイズの leaf が確保される（dl.image の等倍契約の前提）
+    const rect = ctx.getNodeRect(0xBEEF).?;
+    try std.testing.expectEqual(@as(u32, 24), rect.w);
+    try std.testing.expectEqual(@as(u32, 20), rect.h);
+
+    // image cmd が src_w/src_h・rect.w 一致で 1 つ発行されている
+    var found = false;
+    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+        .image => |im| {
+            try std.testing.expectEqual(@as(u32, 24), im.src_w);
+            try std.testing.expectEqual(@as(u32, 20), im.src_h);
+            try std.testing.expectEqual(@as(u32, 24), im.rect.w);
+            try std.testing.expectEqual(@as(u32, 20), im.rect.h);
+            found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
 }

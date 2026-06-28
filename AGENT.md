@@ -266,7 +266,7 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 - **apps/editor/core**: アプリ非依存の再利用コア（platform / GUI を import しない）。
   `Canvas`（レイヤ・合成・座標変換）/ `Tool`(vtable, Pen/Eraser) / `UndoStack` / `StrokeRecorder` /
   PNG I/O。使い方は **`apps/editor/core/README.md`** を参照。
-  - 不変条件: 表示は `composite()`（白背景合成）、**PNG 保存は raw layer pixels**（透明保持）。
+  - 不変条件: 表示は `composite()`（白背景合成）。**PNG 保存は `savePNG` に渡す pixels を用途で使い分け**（白背景 `composite()` は保存に使わない）: core の round-trip は raw layer pixels（`layerPixels(idx)`、透明保持）、pixie の通常保存（TASK-43 以降）は全 visible layer を合成した `compositeStraight()`（フラット透明 PNG。単層 opacity=255 で raw と恒等）。pixie の PNG open はフラット画像を layer0 へ読み込み layer 構造は保持しない。
 - **apps/editor/apps/pixie**: ドット絵エディタ MVP。`canvas_input.zig`（入力状態機械）が
   press 起点 capture → Tool 経由で stroke を駆動する。
 
@@ -345,7 +345,7 @@ quit                       # 終了（EOF でも終了）
 
 - **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `src/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
   `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
-- **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(raw layer→PNG / `WxH layers=N crc=.. nonzero=..`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
+- **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
 
 ### 使い方（replay = file トランスポート）

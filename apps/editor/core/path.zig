@@ -74,7 +74,7 @@ pub const Path = struct {
         defer pts.deinit(gpa);
         self.flattenAll(FLATTEN_TOL, &pts, gpa);
         if (pts.items.len == 0) return null;
-        rec.brushBegin(0, color, opacity);
+        rec.brushBegin(canvas.selected_layer, color, opacity);
         const first = roundVec(pts.items[0]);
         rec.stamp(canvas, gpa, first.x, first.y, dab);
         for (pts.items[1..]) |pt| {
@@ -191,4 +191,26 @@ test "rasterize: アンカー 1 個は null（描けない）" {
     try path.anchors.append(gpa, anchorAt(4, 4));
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
     try std.testing.expectEqual(@as(?UndoCmd, null), path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255));
+}
+
+test "rasterize: selected_layer に描画する" {
+    const gpa = std.testing.allocator;
+    var canvas = try Canvas.init(gpa, 8, 8);
+    defer canvas.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    _ = try canvas.addLayer(gpa);
+
+    var path: Path = .{};
+    defer path.deinit(gpa);
+    try path.anchors.append(gpa, anchorAt(1, 1));
+    try path.anchors.append(gpa, anchorAt(3, 1));
+
+    const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
+    const cmd = path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255) orelse return error.TestUnexpectedNull;
+    defer gpa.free(cmd.paint.diffs);
+
+    try std.testing.expectEqual(@as(u32, 0), canvas.layerPixels(0)[1 * 8 + 1]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), canvas.layerPixels(1)[1 * 8 + 1]);
+    try std.testing.expectEqual(@as(usize, 1), cmd.paint.layer_idx);
 }

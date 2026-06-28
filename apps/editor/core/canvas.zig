@@ -16,6 +16,7 @@ pub const Canvas = struct {
     layers: std.ArrayList(Layer),
     width: u32,
     height: u32,
+    selected_layer: usize = 0,
     composite_cache: []u32,
     allocator: Allocator,
 
@@ -51,7 +52,73 @@ pub const Canvas = struct {
         self.allocator.free(self.composite_cache);
     }
 
-    /// 表示用合成（白背景に各 visible layer を実 src-over）。保存には使わない（保存=raw layer pixels）。
+    fn layerPixelCount(self: *const Canvas) usize {
+        return @as(usize, self.width) * self.height;
+    }
+
+    pub fn allocBlankLayer(self: *const Canvas, gpa: Allocator) !Layer {
+        const pixels = try gpa.alloc(u32, self.layerPixelCount());
+        @memset(pixels, 0);
+        return .{ .pixels = pixels };
+    }
+
+    pub fn addLayer(self: *Canvas, gpa: Allocator) !usize {
+        const idx = self.layers.items.len;
+        const layer = try self.allocBlankLayer(gpa);
+        errdefer gpa.free(layer.pixels);
+        try self.insertLayer(gpa, idx, layer);
+        return idx;
+    }
+
+    pub fn insertLayer(self: *Canvas, gpa: Allocator, index: usize, layer: Layer) !void {
+        if (index > self.layers.items.len) return error.InvalidLayer;
+        if (layer.pixels.len != self.layerPixelCount()) return error.InvalidLayer;
+        try self.layers.insert(gpa, index, layer);
+        self.selected_layer = index;
+    }
+
+    pub fn deleteLayer(self: *Canvas, index: usize) ?Layer {
+        if (self.layers.items.len <= 1 or index >= self.layers.items.len) return null;
+        const removed = self.layers.orderedRemove(index);
+        if (self.selected_layer == index) {
+            self.selected_layer = @min(index, self.layers.items.len - 1);
+        } else if (self.selected_layer > index) {
+            self.selected_layer -= 1;
+        }
+        return removed;
+    }
+
+    pub fn moveLayer(self: *Canvas, from: usize, to: usize) bool {
+        if (from >= self.layers.items.len or to >= self.layers.items.len) return false;
+        if (from == to) {
+            self.selected_layer = to;
+            return true;
+        }
+        const moved = self.layers.orderedRemove(from);
+        self.layers.insert(self.allocator, to, moved) catch @panic("Canvas.moveLayer: OOM");
+        self.selected_layer = to;
+        return true;
+    }
+
+    pub fn selectLayer(self: *Canvas, index: usize) bool {
+        if (index >= self.layers.items.len) return false;
+        self.selected_layer = index;
+        return true;
+    }
+
+    pub fn setLayerVisible(self: *Canvas, index: usize, visible: bool) bool {
+        if (index >= self.layers.items.len) return false;
+        self.layers.items[index].visible = visible;
+        return true;
+    }
+
+    pub fn setLayerOpacity(self: *Canvas, index: usize, opacity: u8) bool {
+        if (index >= self.layers.items.len) return false;
+        self.layers.items[index].opacity = opacity;
+        return true;
+    }
+
+    /// 白背景に各 visible layer を実 src-over する合成。プレビューなど不透明背景向け。
     /// layer.opacity を src alpha に乗算してから合成。a=255 は元色・a=0 は背景維持（RGB 非ゼロでも）・
     /// visible=false はスキップ。partial-alpha（ソフトブラシ）は白地へ正しくブレンドされる。
     pub fn composite(self: *Canvas) []const u32 {
@@ -65,9 +132,9 @@ pub const Canvas = struct {
         return self.composite_cache;
     }
 
-    /// 表示用アルファ保持合成（透明背景に各 visible layer を実 src-over）。チェッカー背景への重ね描き用。
-    /// composite() と違い背景を白で埋めない（完全透明部は a=0 のまま残る）。保存には使わない（保存=raw layer pixels）。
-    /// 戻りは straight-alpha BGRA。blit 側で背景（チェッカー）へ src-over する前提。
+    /// アルファ保持合成（透明背景に各 visible layer を実 src-over）。チェッカー背景への重ね描きやフラット PNG 保存向け。
+    /// composite() と違い背景を白で埋めない（完全透明部は a=0 のまま残る）。
+    /// 戻りは straight-alpha BGRA。blit 側では背景（チェッカー）へ src-over する前提。
     pub fn compositeStraight(self: *Canvas) []const u32 {
         @memset(self.composite_cache, 0x00000000); // transparent background
         for (self.layers.items) |layer| {
@@ -137,6 +204,36 @@ test "Canvas init/deinit" {
     try std.testing.expectEqual(@as(u32, 4), canvas.width);
     try std.testing.expectEqual(@as(u32, 4), canvas.height);
     try std.testing.expectEqual(@as(usize, 1), canvas.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), canvas.selected_layer);
+}
+
+test "Canvas layer operations keep selected_layer in range" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 2, 2);
+    defer c.deinit();
+
+    const l1 = try c.addLayer(gpa);
+    try std.testing.expectEqual(@as(usize, 1), l1);
+    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
+
+    const l2 = try c.addLayer(gpa);
+    try std.testing.expectEqual(@as(usize, 2), l2);
+    c.layerPixels(2)[0] = 0xFFFF0000;
+    try std.testing.expect(c.moveLayer(2, 0));
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), c.layerPixels(0)[0]);
+
+    const removed = c.deleteLayer(0).?;
+    defer gpa.free(removed.pixels);
+    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
+
+    const removed2 = c.deleteLayer(1).?;
+    gpa.free(removed2.pixels);
+    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
+    try std.testing.expect(c.deleteLayer(0) == null);
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
 }
 
 test "Canvas drawPixel bounds check" {

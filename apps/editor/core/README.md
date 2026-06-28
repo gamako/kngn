@@ -15,17 +15,27 @@
 | `path.zig` | `Path`（アンカー + in/out ハンドル）・`hitTest`・`rasterize`（TASK-21.13） |
 | `path_editor.zig` | `PathEditor`（ベジェ編集状態機械。pixie が駆動）（TASK-21.13） |
 
-## 不変条件：表示=composite / 保存=raw
+## 不変条件：表示=composite / 保存は用途で使い分け
 
 `Canvas.composite()` は **表示専用**（白背景に不透明ピクセルを重ねた合成）。
-**PNG 保存には raw layer pixels を渡すこと**（`Canvas.layerPixels(idx)`）。
-composite を保存すると透明ピクセルが白に潰れ、round-trip 一致が壊れる（TASK-21.6 の学び）。
+**白背景の `composite()` を保存に使ってはいけない**（透明ピクセルが白に潰れ、round-trip 一致が壊れる。TASK-21.6 の学び）。
+
+core の `savePNG` は **渡された pixels をそのまま PNG 化するだけ**。何を渡すかは呼び出し側の用途で決める:
+
+- **単一 raw layer の round-trip**（透明保持）: `Canvas.layerPixels(idx)` を渡す。
+- **全 visible layer の合成フラット透明 PNG**（TASK-43 以降の pixie 通常保存）: `Canvas.compositeStraight()`
+  を渡す。透明背景に visible layer を opacity 込みで src-over するので透明が保持され、単層・opacity=255 では
+  raw と恒等になる（既存 round-trip も保たれる）。
+- **注意**: pixie の PNG open はフラット画像を layer0 へ読み込み他 layer を破棄する。**save/open で layer 構造は
+  保持されない**（レイヤー保持形式は非スコープ）。
 
 ```zig
-// 表示
+// 表示（白背景）
 blit(canvas.composite());
-// 保存
+// 単一 raw layer の保存（透明保持）
 try core.savePNG(io, "out.png", canvas.layerPixels(0), w, h, gpa);
+// 全 visible layer の合成フラット透明 PNG 保存（pixie 通常保存）
+try core.savePNG(io, "out.png", canvas.compositeStraight(), w, h, gpa);
 ```
 
 ## Tool / StrokeRecorder / UndoStack の協調

@@ -65,6 +65,7 @@ pub const SliderI32Opts = @import("widgets.zig").SliderI32Opts;
 pub const SliderF32Opts = @import("widgets.zig").SliderF32Opts;
 pub const SvSquareOpts = @import("widgets.zig").SvSquareOpts;
 pub const HueBarOpts = @import("widgets.zig").HueBarOpts;
+pub const ImageBoxOpts = @import("widgets.zig").ImageBoxOpts;
 pub const Orient = @import("widgets.zig").Orient;
 pub const SplitterOpts = @import("widgets.zig").SplitterOpts;
 pub const splitter = @import("widgets.zig").splitter;
