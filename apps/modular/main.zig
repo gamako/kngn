@@ -77,10 +77,19 @@ const Params = struct {
     hat_gain: f32 = 1.0,
     clap_gain: f32 = 1.0,
     bass_gain: f32 = 1.0,
+    pad_gain: f32 = 1.0,
     kick_mute: bool = false,
     hat_mute: bool = false,
     clap_mute: bool = false,
     bass_mute: bool = false,
+    pad_mute: bool = false,
+    // Ph4 音色マクロ（集約ノブ）。細かい個別パラメータは patch.zig のコード既定固定。
+    kick_punch: f32 = 1.0, // kick click 量（倍率）
+    hat_bright: f32 = 1.0, // hat 明るさ
+    hat_decay: f32 = 0.045, // hat 減衰(s)
+    pad_cutoff: f32 = 1400.0, // pad LP cutoff(Hz)
+    pad_warmth: f32 = 0.6, // pad 温かみ(0..1)
+    master_warmth: f32 = 0.5, // master saturation(0..1)
 };
 
 /// 0..1 の正規化値を対数で cutoff(Hz) へ。norm=1 → CUTOFF_MAX（ほぼ素通し）。
@@ -101,10 +110,19 @@ fn publishControls(patch: *LofiPatch, p: Params) void {
     c.hat_gain.store(p.hat_gain);
     c.clap_gain.store(p.clap_gain);
     c.bass_gain.store(p.bass_gain);
+    c.pad_gain.store(p.pad_gain);
     c.kick_mute.store(@intFromBool(p.kick_mute), .release);
     c.hat_mute.store(@intFromBool(p.hat_mute), .release);
     c.clap_mute.store(@intFromBool(p.clap_mute), .release);
     c.bass_mute.store(@intFromBool(p.bass_mute), .release);
+    c.pad_mute.store(@intFromBool(p.pad_mute), .release);
+    // Ph4 音色マクロ
+    c.kick_punch.store(p.kick_punch);
+    c.hat_bright.store(p.hat_bright);
+    c.hat_decay.store(p.hat_decay);
+    c.pad_cutoff.store(p.pad_cutoff);
+    c.pad_warmth.store(p.pad_warmth);
+    c.master_warmth.store(p.master_warmth);
 }
 
 fn buttonToU8(b: platform.MouseButton) u8 {
@@ -174,22 +192,30 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const p = app.patch orelse return std.fmt.bufPrint(buf, "{{\"playing\":false}}", .{}) catch buf[0..0];
     const st = p.snapshotState(); // best-effort（RT 更新中の torn 可）
-    return std.fmt.bufPrint(buf, "{{\"playing\":true,\"bpm\":{d:.0},\"clock_phase\":{d:.3},\"density\":{d:.3}," ++
+    // bufPrint は 1 呼び出し 32 引数上限のため 2 回に分けて同じ buf へ連結する（1 行 JSON）。
+    const a = std.fmt.bufPrint(buf, "{{\"playing\":true,\"bpm\":{d:.0},\"clock_phase\":{d:.3},\"density\":{d:.3}," ++
         "\"swing\":{d:.3},\"sidechain\":{d:.3},\"master_cutoff\":{d:.0}," ++
         "\"bass_pitch_cv\":{d:.4},\"turing_register\":{d},\"turing_cv\":{d:.4}," ++
         "\"steps\":{{\"kick\":{d},\"hat\":{d},\"clap\":{d},\"bass\":{d}}}," ++
-        "\"active\":{{\"kick\":{},\"hat\":{},\"clap\":{}}}," ++
-        "\"gains\":{{\"kick\":{d:.3},\"hat\":{d:.3},\"clap\":{d:.3},\"bass\":{d:.3}}}," ++
-        "\"muted\":{{\"kick\":{},\"hat\":{},\"clap\":{},\"bass\":{}}}," ++
-        "\"tracks\":[\"kick\",\"hat\",\"clap\",\"bass\"]}}", .{
-        st.bpm,           st.clock_phase,  st.density,
+        "\"active\":{{\"kick\":{},\"hat\":{},\"clap\":{},\"pad\":{}}}," ++
+        "\"gains\":{{\"kick\":{d:.3},\"hat\":{d:.3},\"clap\":{d:.3},\"bass\":{d:.3},\"pad\":{d:.3}}}," ++
+        "\"muted\":{{\"kick\":{},\"hat\":{},\"clap\":{},\"bass\":{},\"pad\":{}}},", .{
+        st.bpm,           st.clock_phase,      st.density,
         st.swing,         st.sidechain_amount, st.master_cutoff,
-        st.bass_pitch_cv, st.turing_register, st.turing_cv,
-        st.kick_step,     st.hat_step,     st.clap_step,    st.bass_step,
-        st.kick_active,   st.hat_active,   st.clap_active,
-        st.kick_gain,     st.hat_gain,     st.clap_gain,    st.bass_gain,
-        st.kick_muted,    st.hat_muted,    st.clap_muted,   st.bass_muted,
-    }) catch buf[0..0];
+        st.bass_pitch_cv, st.turing_register,  st.turing_cv,
+        st.kick_step,     st.hat_step,         st.clap_step,   st.bass_step,
+        st.kick_active,   st.hat_active,       st.clap_active, st.pad_active,
+        st.kick_gain,     st.hat_gain,         st.clap_gain,   st.bass_gain,  st.pad_gain,
+        st.kick_muted,    st.hat_muted,        st.clap_muted,  st.bass_muted, st.pad_muted,
+    }) catch return buf[0..0];
+    const b = std.fmt.bufPrint(buf[a.len..], "\"ph4\":{{\"kick_click\":{d:.3},\"hat_bright\":{d:.3}," ++
+        "\"pad_cutoff\":{d:.0},\"pad_warmth\":{d:.3},\"master_drive\":{d:.3}," ++
+        "\"pre_clip_peak\":{d:.3},\"clip_rate\":{d:.4}}}," ++
+        "\"tracks\":[\"kick\",\"hat\",\"clap\",\"bass\",\"pad\"]}}", .{
+        st.kick_click_gain, st.hat_brightness, st.pad_cutoff, st.pad_warmth,
+        st.master_drive,    st.pre_clip_peak,  st.clip_rate,
+    }) catch return buf[0..a.len];
+    return buf[0 .. a.len + b.len];
 }
 
 fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -291,7 +317,8 @@ pub fn main() !void {
             meter.feed(mono[0..frames]);
         }
 
-        // GUI コントロールパネル（上部）。2 カラムのスライダ + mute ボタン行。
+        // GUI コントロールパネル（上部）。3 カラム（Global / Levels / Tone）＋ mute ボタン行。
+        // Tone カラム＝Ph4 音色マクロ（集約ノブ）。細かい個別パラメータは出さない（過密回避）。
         ctx.beginBox(.{
             .direction = .column,
             .padding = .{ 10, 10, 10, 10 },
@@ -308,12 +335,22 @@ pub fn main() !void {
         _ = ctx.sliderF32Id(0x7004, "Swing    ", &params.swing, .{ .min = 0, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x7005, "Sidechain", &params.sidechain, .{ .min = 0, .max = 1, .step = 0.01 });
         ctx.endBox();
-        // 右カラム: 各トラック gain
+        // 中カラム: 各トラック level
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
         _ = ctx.sliderF32Id(0x7006, "Kick Gain", &params.kick_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
         _ = ctx.sliderF32Id(0x7007, "Hat Gain ", &params.hat_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
         _ = ctx.sliderF32Id(0x7008, "Clap Gain", &params.clap_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
         _ = ctx.sliderF32Id(0x7009, "Bass Gain", &params.bass_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x700A, "Pad Level", &params.pad_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        ctx.endBox();
+        // 右カラム: Ph4 音色マクロ（Tone）
+        ctx.beginBox(.{ .direction = .column, .gap = 4 });
+        _ = ctx.sliderF32Id(0x700B, "KickPunch", &params.kick_punch, .{ .min = 0, .max = 2, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x700C, "Hat Bright", &params.hat_bright, .{ .min = 0.3, .max = 2.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x700D, "Hat Decay", &params.hat_decay, .{ .min = 0.01, .max = 0.2, .step = 0.005 });
+        _ = ctx.sliderF32Id(0x700E, "Pad Cutoff", &params.pad_cutoff, .{ .min = 200, .max = 6000, .step = 50 });
+        _ = ctx.sliderF32Id(0x700F, "Pad Warm ", &params.pad_warmth, .{ .min = 0, .max = 1, .step = 0.02 });
+        _ = ctx.sliderF32Id(0x7010, "Mst Warm ", &params.master_warmth, .{ .min = 0, .max = 1, .step = 0.02 });
         ctx.endBox();
         ctx.endBox();
         // mute ボタン行
@@ -322,6 +359,7 @@ pub fn main() !void {
         if (ctx.button(if (params.hat_mute) "Hat: MUTE" else "Hat: on")) params.hat_mute = !params.hat_mute;
         if (ctx.button(if (params.clap_mute) "Clap: MUTE" else "Clap: on")) params.clap_mute = !params.clap_mute;
         if (ctx.button(if (params.bass_mute) "Bass: MUTE" else "Bass: on")) params.bass_mute = !params.bass_mute;
+        if (ctx.button(if (params.pad_mute) "Pad: MUTE" else "Pad: on")) params.pad_mute = !params.pad_mute;
         ctx.endBox();
         ctx.endBox();
         ctx.endFrame();

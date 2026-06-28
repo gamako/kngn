@@ -12,6 +12,7 @@
 const std = @import("std");
 const modular = @import("modular");
 const synth = @import("synth"); // AtomicF32（GUI→RT のロックフリー受け渡し）
+const dsp = @import("dsp"); // FFT（band energy 検証・テスト用）
 
 // ----------------------------------------------------------------------------
 // 既定値（= 構築時のパッチ値）。Controls の既定もこれに合わせ、無操作時は従来どおりにする。
@@ -23,11 +24,22 @@ const MASTER_CUTOFF_MAX: f32 = 18000.0; // ≒オープン（既定でほぼ素�
 // 各トラックの基準 gain（slider は 0..約1.5 の倍率で掛ける。既定 1.0 で基準＝従来）。
 const KICK_BASE_GAIN: f32 = 0.8;
 const HAT_BASE_GAIN: f32 = 0.28;
-const CLAP_BASE_GAIN: f32 = 0.35;
+const CLAP_BASE_GAIN: f32 = 0.42; // Ph4: クラップの存在感を少し上げる
 // density=1.0 で現行値一致となる基準 pulses（kick は four-on-floor 固定でアンカー）。
 const HAT_BASE_PULSES: u8 = 4;
 const CLAP_BASE_PULSES: u8 = 2;
 const BASS_BASE_PULSES: u8 = 3;
+// Ph4: 音色マクロの基準値（Controls 既定もこれに合わせ、無操作時は構築値と一致＝決定的）。
+const KICK_CLICK_BASE: f32 = 0.35; // kick click_gain の基準（GUI "Kick Punch" 倍率 1.0 で基準）
+const HAT_BASE_BRIGHT: f32 = 1.0; // hat brightness 既定
+const HAT_BASE_DECAY: f32 = 0.045; // hat decay 既定（s）
+const PAD_BASE_GAIN: f32 = 0.22; // pad 出力レベル基準（控えめ）
+const PAD_CUTOFF_MIN: f32 = 200.0;
+const PAD_CUTOFF_MAX: f32 = 6000.0;
+const PAD_CUTOFF_DEFAULT: f32 = 1400.0;
+const PAD_WARMTH_DEFAULT: f32 = 0.6;
+// master warmth 0..1 → saturator.drive = 1.0 + mw（既定 0.5 → drive 1.5）。
+const MASTER_WARMTH_DEFAULT: f32 = 0.5;
 
 /// GUI(メインスレッド)→ Audio(RT) のリアルタイム操作。GUI は store のみ、
 /// render() 冒頭の applyControls() が load→clamp/finite して各モジュール field へ適用する
@@ -46,6 +58,15 @@ pub const Controls = struct {
     hat_mute: std.atomic.Value(u32),
     clap_mute: std.atomic.Value(u32),
     bass_mute: std.atomic.Value(u32),
+    // Ph4: 音色マクロ（集約ノブ）。細かい個別パラメータはコード既定固定で、ここには出さない。
+    kick_punch: synth.AtomicF32, // kick click_gain 倍率（1.0=基準）
+    hat_bright: synth.AtomicF32, // hat brightness（cutoff スケール）
+    hat_decay: synth.AtomicF32, // hat decay(s)
+    pad_gain: synth.AtomicF32, // pad 出力レベル倍率（1.0=基準）
+    pad_cutoff: synth.AtomicF32, // pad LP cutoff(Hz)
+    pad_warmth: synth.AtomicF32, // pad warmth(0..1)
+    master_warmth: synth.AtomicF32, // master saturation 量(0..1)
+    pad_mute: std.atomic.Value(u32),
 
     pub fn init() Controls {
         return .{
@@ -62,6 +83,14 @@ pub const Controls = struct {
             .hat_mute = std.atomic.Value(u32).init(0),
             .clap_mute = std.atomic.Value(u32).init(0),
             .bass_mute = std.atomic.Value(u32).init(0),
+            .kick_punch = synth.AtomicF32.init(1.0),
+            .hat_bright = synth.AtomicF32.init(HAT_BASE_BRIGHT),
+            .hat_decay = synth.AtomicF32.init(HAT_BASE_DECAY),
+            .pad_gain = synth.AtomicF32.init(1.0),
+            .pad_cutoff = synth.AtomicF32.init(PAD_CUTOFF_DEFAULT),
+            .pad_warmth = synth.AtomicF32.init(PAD_WARMTH_DEFAULT),
+            .master_warmth = synth.AtomicF32.init(MASTER_WARMTH_DEFAULT),
+            .pad_mute = std.atomic.Value(u32).init(0),
         };
     }
 };
@@ -110,6 +139,17 @@ pub const PatchState = struct {
     hat_muted: bool,
     clap_muted: bool,
     bass_muted: bool,
+    // Ph4: 音色マクロの実効値・pad 状態・master headroom 指標
+    kick_click_gain: f32,
+    hat_brightness: f32,
+    pad_gain: f32,
+    pad_cutoff: f32,
+    pad_warmth: f32,
+    pad_active: bool,
+    pad_muted: bool,
+    master_drive: f32,
+    pre_clip_peak: f32, // softClip 前の master 累積ピーク
+    clip_rate: f32, // softClip 介入率（常時高止まり=潰れ）
 };
 
 pub const LofiPatch = struct {
@@ -128,6 +168,10 @@ pub const LofiPatch = struct {
     kick: modular.Kick,
     hat: modular.Hat,
     clap: modular.Clap,
+    // pad（Ph4: 固定 root の温かい和音。clock→pad_div→pad_eu で低密度に trigger）
+    pad_div: modular.ClockDivider,
+    pad_eu: modular.EuclideanSeq,
+    pad: modular.ChordPad,
     // bass（自己進化: Turing -> Quantizer -> VCO）
     bass_turing: modular.TuringMachine,
     bass_perc: modular.PercEnv,
@@ -169,9 +213,13 @@ pub const LofiPatch = struct {
             .bass_div = .{ .div = 4 }, // 16分→4分
             .bass_eu = .{ .steps = 4, .pulses = BASS_BASE_PULSES, .rotation = 0 }, // 1 小節に 3 音（疎）
             .filter_div = .{ .div = 16 }, // 1 小節ごとに filter をランダム更新
-            .kick = .{},
-            .hat = .{},
+            .kick = .{}, // Ph4: click 付き（既定 click_gain=0.35=KICK_CLICK_BASE）
+            .hat = .{}, // 既定 brightness=1.0 / decay=0.045
             .clap = .{},
+            // pad: 1 小節パルス(div=16)→2 小節周期(steps=2,pulses=1)で低密度に和音 trigger
+            .pad_div = .{ .div = 16 },
+            .pad_eu = .{ .steps = 2, .pulses = 1, .rotation = 0 },
+            .pad = .{ .gain = PAD_BASE_GAIN, .cutoff = PAD_CUTOFF_DEFAULT, .warmth = PAD_WARMTH_DEFAULT },
             .bass_turing = .{ .bits = 8, .lock = 0.92 }, // 同じだが少しずつ動く
             .bass_perc = .{ .decay = 0.18 },
             .quant = .{ .scale = .minor_pentatonic, .octaves = 1, .root_semitone = 0 },
@@ -183,10 +231,12 @@ pub const LofiPatch = struct {
             .sidechain = .{ .amount = DEFAULT_SIDECHAIN, .release = 0.18 }, // キックで非kickをポンプ
             .master_mixer = .{ .gain = 0.9 },
             .master_vcf = .{ .cutoff = MASTER_CUTOFF_MAX, .resonance = 0.707, .mode = .lowpass },
-            .saturator = .{ .drive = 1.4, .post_gain = 1.0 },
-            .bitcrusher = .{ .bc = .{ .bit_depth = 10, .hold_samples = 2, .wet = 0.6 } },
-            .delay_fx = .{ .delay_ms = 333.0, .feedback = 0.32, .wet = 0.18 },
-            .reverb_fx = .{ .decay = 0.6, .damping = 0.35, .wet = 0.12 },
+            // Ph4 warmth 再調整: saturation を少し増やし(=MASTER_WARMTH_DEFAULT 0.5→drive 1.5)、
+            // bitcrush wet を控えめにして輪郭を残す。delay/reverb は温かみ寄りに微増。
+            .saturator = .{ .drive = 1.5, .post_gain = 1.0 },
+            .bitcrusher = .{ .bc = .{ .bit_depth = 11, .hold_samples = 2, .wet = 0.5 } },
+            .delay_fx = .{ .delay_ms = 333.0, .feedback = 0.3, .wet = 0.16 },
+            .reverb_fx = .{ .decay = 0.62, .damping = 0.4, .wet = 0.14 },
             .vinyl = .{},
             .wow = .{},
             .output = .{ .gain = 1.0, .pan = 0.0, .soft_clip = true },
@@ -217,6 +267,9 @@ pub const LofiPatch = struct {
         const n_kick = try g.addModule(self.kick.spec());
         const n_hat = try g.addModule(self.hat.spec());
         const n_clap = try g.addModule(self.clap.spec());
+        const n_pad_div = try g.addModule(self.pad_div.spec());
+        const n_pad_eu = try g.addModule(self.pad_eu.spec());
+        const n_pad = try g.addModule(self.pad.spec());
         const n_turing = try g.addModule(self.bass_turing.spec());
         const n_bass_perc = try g.addModule(self.bass_perc.spec());
         const n_quant = try g.addModule(self.quant.spec());
@@ -242,11 +295,14 @@ pub const LofiPatch = struct {
         try g.connect(n_clock, 0, n_clap_eu, 0);
         try g.connect(n_clock, 0, n_bass_div, 0);
         try g.connect(n_clock, 0, n_filter_div, 0);
+        try g.connect(n_clock, 0, n_pad_div, 0); // pad は 1 小節パルスへ分周
         try g.connect(n_bass_div, 0, n_bass_eu, 0);
+        try g.connect(n_pad_div, 0, n_pad_eu, 0); // 2 小節周期で trigger
         // drums
         try g.connect(n_kick_eu, 0, n_kick, 0);
         try g.connect(n_hat_eu, 0, n_hat, 0);
         try g.connect(n_clap_eu, 0, n_clap, 0);
+        try g.connect(n_pad_eu, 0, n_pad, 0); // pad gate
         // bass: bass_eu を PercEnv と Turing の両方へ fan-out（音符ごとに旋律を進める）
         try g.connect(n_bass_eu, 0, n_bass_perc, 0);
         try g.connect(n_bass_eu, 0, n_turing, 0);
@@ -257,10 +313,11 @@ pub const LofiPatch = struct {
         try g.connect(n_filter_random, 0, n_vcf, 1); // VCF.cutoff_cv
         try g.connect(n_vcf, 0, n_vca, 0); // VCA.audio
         try g.connect(n_bass_perc, 0, n_vca, 1); // VCA.gain_cv
-        // mix: 非kick(hat/clap/bass)を Sidechain でダッキングし、kick は素通しで master に合流
+        // mix: 非kick(hat/clap/bass/pad)を Sidechain でダッキングし、kick は素通しで master に合流
         try g.connect(n_hat, 0, n_nonkick, 0);
         try g.connect(n_clap, 0, n_nonkick, 1);
         try g.connect(n_vca, 0, n_nonkick, 2);
+        try g.connect(n_pad, 0, n_nonkick, 3); // pad は nonkick_mixer の空き 4 本目へ（新規 mixer 不要）
         try g.connect(n_nonkick, 0, n_sidechain, 0); // audio
         try g.connect(n_kick_eu, 0, n_sidechain, 1); // trigger = kick の Euclid（fan-out）
         try g.connect(n_kick, 0, n_master, 0);
@@ -305,6 +362,15 @@ pub const LofiPatch = struct {
         self.hat.gain = HAT_BASE_GAIN * trackGain(&c.hat_gain, &c.hat_mute);
         self.clap.gain = CLAP_BASE_GAIN * trackGain(&c.clap_gain, &c.clap_mute);
         self.bass_perc.peak = trackGain(&c.bass_gain, &c.bass_mute);
+        // Ph4 音色マクロ（集約）。各 field の係数再計算は processBlock 冒頭の updateParams が dirty-gated で拾う。
+        self.kick.click_gain = KICK_CLICK_BASE * clampFinite(c.kick_punch.load(), 0.0, 2.0, 1.0);
+        self.hat.brightness = clampFinite(c.hat_bright.load(), 0.3, 2.5, HAT_BASE_BRIGHT);
+        self.hat.decay = clampFinite(c.hat_decay.load(), 0.01, 0.2, HAT_BASE_DECAY);
+        self.pad.gain = PAD_BASE_GAIN * trackGain(&c.pad_gain, &c.pad_mute);
+        self.pad.cutoff = clampFinite(c.pad_cutoff.load(), PAD_CUTOFF_MIN, PAD_CUTOFF_MAX, PAD_CUTOFF_DEFAULT);
+        self.pad.warmth = clampFinite(c.pad_warmth.load(), 0.0, 1.0, PAD_WARMTH_DEFAULT);
+        // master warmth → saturator.drive（1.0 + mw。既定 0.5 で 1.5＝構築値）。
+        self.saturator.drive = 1.0 + clampFinite(c.master_warmth.load(), 0.0, 1.0, MASTER_WARMTH_DEFAULT);
     }
 
     /// harness probe 用の生成状態スナップショット（alloc/lock/IO なし・torn 可）。
@@ -337,6 +403,16 @@ pub const LofiPatch = struct {
             .hat_muted = self.controls.hat_mute.load(.acquire) != 0,
             .clap_muted = self.controls.clap_mute.load(.acquire) != 0,
             .bass_muted = self.controls.bass_mute.load(.acquire) != 0,
+            .kick_click_gain = self.kick.click_gain,
+            .hat_brightness = self.hat.brightness,
+            .pad_gain = self.pad.gain,
+            .pad_cutoff = self.pad.cutoff,
+            .pad_warmth = self.pad.warmth,
+            .pad_active = self.pad.attacking or self.pad.env > 1e-3,
+            .pad_muted = self.controls.pad_mute.load(.acquire) != 0,
+            .master_drive = self.saturator.drive,
+            .pre_clip_peak = self.output.pre_clip_peak,
+            .clip_rate = self.output.clipRate(),
         };
     }
 
@@ -470,6 +546,14 @@ test "Controls: defaults match constructed patch values (no-op baseline)" {
     try testing.expectEqual(BASS_BASE_PULSES, patch.bass_eu.pulses);
     try testing.expectEqual(@as(f32, KICK_BASE_GAIN), patch.kick.gain);
     try testing.expectEqual(@as(f32, 1.0), patch.bass_perc.peak);
+    // Ph4 マクロ既定（無操作）が構築値に一致
+    try testing.expectEqual(@as(f32, KICK_CLICK_BASE), patch.kick.click_gain);
+    try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), patch.hat.brightness);
+    try testing.expectEqual(@as(f32, HAT_BASE_DECAY), patch.hat.decay);
+    try testing.expectEqual(@as(f32, PAD_BASE_GAIN), patch.pad.gain);
+    try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), patch.pad.cutoff);
+    try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), patch.pad.warmth);
+    try testing.expectEqual(@as(f32, 1.5), patch.saturator.drive); // 1.0 + MASTER_WARMTH_DEFAULT(0.5)
 }
 
 test "Controls: swing/sidechain/density/cutoff change output (bounded & finite)" {
@@ -527,10 +611,120 @@ test "Controls: non-finite values fall back to safe defaults (finite output)" {
     patch.controls.swing.store(std.math.inf(f32));
     patch.controls.sidechain_amount.store(std.math.nan(f32));
     patch.controls.bass_gain.store(std.math.nan(f32));
+    // Ph4 マクロも非有限を投入
+    patch.controls.kick_punch.store(std.math.nan(f32));
+    patch.controls.hat_bright.store(std.math.inf(f32));
+    patch.controls.hat_decay.store(std.math.nan(f32));
+    patch.controls.pad_gain.store(std.math.inf(f32));
+    patch.controls.pad_cutoff.store(std.math.nan(f32));
+    patch.controls.pad_warmth.store(std.math.nan(f32));
+    patch.controls.master_warmth.store(std.math.inf(f32));
     _ = try renderStats(patch, buf, frames); // 有界・finite を検証
     // 不正値は安全な既定へフォールバック
     try testing.expectEqual(@as(f32, DEFAULT_BPM), patch.clock.bpm);
     try testing.expectEqual(@as(f32, 0.0), patch.clock.swing);
     try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), patch.sidechain.amount);
     try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), patch.master_vcf.cutoff);
+    try testing.expectEqual(@as(f32, KICK_CLICK_BASE), patch.kick.click_gain);
+    try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), patch.hat.brightness);
+    try testing.expectEqual(@as(f32, HAT_BASE_DECAY), patch.hat.decay);
+    try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), patch.pad.cutoff);
+    try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), patch.pad.warmth);
+    try testing.expectEqual(@as(f32, 1.0 + MASTER_WARMTH_DEFAULT), patch.saturator.drive);
+}
+
+// ----------------------------------------------------------------------------
+// Ph4 検証: band energy（dsp FFT 流用）/ pad on-off / 音色マクロ / master headroom
+// ----------------------------------------------------------------------------
+
+/// mags 配列で [f_lo, f_hi) Hz に入るビンのパワー(mag^2)合計。
+fn bandEnergy(mags: []const f32, f_lo: f32, f_hi: f32, sr: f32, n: usize) f64 {
+    const bin_hz = sr / @as(f32, @floatFromInt(n));
+    var acc: f64 = 0;
+    for (mags, 0..) |m, k| {
+        const f = @as(f32, @floatFromInt(k)) * bin_hz;
+        if (f >= f_lo and f < f_hi) acc += @as(f64, m) * @as(f64, m);
+    }
+    return acc;
+}
+
+test "Ph4: default patch has low-band (kick body) energy and is not harsh-dominated" {
+    const N = 4096; // bin 幅 ~11.7Hz @48k
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var stereo: [N * 2]f32 = undefined;
+    patch.render(&stereo, N, 2); // 先頭窓: t=0 のキックを含む
+    var mono: [N]f32 = undefined;
+    dsp.downmixStereoToMono(&stereo, &mono);
+    var re: [N]f32 = undefined;
+    var im: [N]f32 = undefined;
+    var mags: [N / 2]f32 = undefined;
+    dsp.magnitudeSpectrum(&mono, &re, &im, &mags);
+    const total = bandEnergy(&mags, 20, 16000, 48000, N);
+    const sub = bandEnergy(&mags, 40, 120, 48000, N); // kick body / bass
+    const harsh = bandEnergy(&mags, 3000, 6000, 48000, N); // 痛い帯域
+    try testing.expect(total > 0.0); // 非無音
+    try testing.expect(sub / total > 0.05); // 低域の芯がある
+    try testing.expect(harsh / total < 0.6); // harsh に支配されていない（痛くない）
+}
+
+test "Ph4: pad on/off changes output (RMS/CRC) and stays non-silent" {
+    // pad は 2 小節周期（~2s で初発音）なので、pad が鳴る長さ（5s）でレンダーして比較する。
+    const frames: u32 = 48000 * 5;
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+
+    const on = try LofiPatch.create(testing.allocator, 48000);
+    defer on.destroy();
+    const s_on = try renderStats(on, buf, frames);
+    const crc_on = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
+    try testing.expect(on.snapshotState().pad_active); // pad が実際に発音した
+
+    const off = try LofiPatch.create(testing.allocator, 48000);
+    defer off.destroy();
+    off.controls.pad_mute.store(1, .release);
+    const s_off = try renderStats(off, buf, frames);
+    const crc_off = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
+
+    try testing.expect(crc_on != crc_off); // pad on/off が出力に効く
+    try testing.expect(s_on.rms > 0.0 and s_off.rms > 0.0); // どちらも鳴っている
+}
+
+test "Ph4: tone macros (kick punch / pad gain / master warmth / hat bright) change output" {
+    const frames: u32 = 24000;
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+    const base = try LofiPatch.create(testing.allocator, 48000);
+    defer base.destroy();
+    _ = try renderStats(base, buf, frames);
+    const crc_base = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
+
+    const mod = try LofiPatch.create(testing.allocator, 48000);
+    defer mod.destroy();
+    mod.controls.kick_punch.store(0.0); // クリックを消す
+    mod.controls.pad_gain.store(0.0); // pad レベル 0
+    mod.controls.master_warmth.store(1.0); // saturation を上げる
+    mod.controls.hat_bright.store(2.0); // 明るく
+    _ = try renderStats(mod, buf, frames);
+    const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
+    try testing.expect(crc_base != crc_mod);
+}
+
+test "Ph4: master headroom — softClip rarely intervenes over a long render" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    const chunk: u32 = 4800;
+    var buf: [chunk * 2]f32 = undefined;
+    var rendered: u64 = 0;
+    const target: u64 = 48000 * 8; // ~8s（60s 試聴の代理。決定的なので十分）
+    while (rendered < target) : (rendered += chunk) {
+        patch.render(&buf, chunk, 2);
+        for (buf) |s| {
+            try testing.expect(std.math.isFinite(s));
+            try testing.expect(@abs(s) <= 1.0001); // post softClip 有界
+        }
+    }
+    const st = patch.snapshotState();
+    try testing.expect(std.math.isFinite(st.pre_clip_peak));
+    try testing.expect(st.clip_rate < 0.1); // 常時 softClip に突っ込んでいない（潰れていない）
 }

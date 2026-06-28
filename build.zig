@@ -625,6 +625,7 @@ pub fn build(b: *std.Build) void {
     });
     modular_app_test_mod.addImport("modular", example_modules.modular);
     modular_app_test_mod.addImport("synth", example_modules.synth); // patch が AtomicF32 を使う（chunk B）
+    modular_app_test_mod.addImport("dsp", example_modules.dsp); // patch が FFT で band energy を検証（Ph4）
     const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
     const run_modular_app_test = b.addRunArtifact(modular_app_test);
     const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");

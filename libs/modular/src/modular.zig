@@ -32,6 +32,7 @@ pub const Quantizer = modules.Quantizer;
 pub const Kick = modules.Kick;
 pub const Hat = modules.Hat;
 pub const PercEnv = modules.PercEnv;
+pub const ChordPad = modules.ChordPad; // Ph4: 固定 root の温かい和音パッド
 
 // Ph2b: 自己進化 CV / Clap / lofi FX
 pub const Random = modules.Random;

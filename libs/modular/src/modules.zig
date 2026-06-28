@@ -200,6 +200,11 @@ pub const Output = struct {
     gain: f32 = 1.0,
     pan: f32 = 0.0,
     soft_clip: bool = true,
+    // ヘッドルーム計測（best-effort・RT 安全な算術のみ）。softClip 前の振幅を測り、
+    // 「常時 softClip に突っ込んでいない（=潰れていない）」を検証する素地（AC#4/#5）。
+    pre_clip_peak: f32 = 0.0, // softClip 前の L/R 最大振幅（累積 max）
+    clip_count: u64 = 0, // softClip 前振幅 > 1.0 のサンプル数（介入したサンプル）
+    sample_count: u64 = 0, // 計測したサンプル数
 
     const in_kinds = [_]PortKind{ .audio, .cv };
     const out_kinds = [_]PortKind{ .audio, .audio }; // L, R
@@ -209,6 +214,12 @@ pub const Output = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
+    /// softClip 介入率（0..1）。常時高止まりなら master が潰れている。
+    pub fn clipRate(self: *const Output) f32 {
+        if (self.sample_count == 0) return 0;
+        return @as(f32, @floatFromInt(self.clip_count)) / @as(f32, @floatFromInt(self.sample_count));
+    }
+
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Output = @ptrCast(@alignCast(ctx));
         const x = io.inputs[0] * self.gain;
@@ -216,6 +227,13 @@ pub const Output = struct {
         const sg = dsp.equalPowerPan(pan);
         var l = x * sg.l;
         var r = x * sg.r;
+        // softClip 前のヘッドルーム計測（soft_clip フラグに依らず測る。出力には影響しない）。
+        const mag = @max(@abs(l), @abs(r));
+        if (std.math.isFinite(mag)) {
+            if (mag > self.pre_clip_peak) self.pre_clip_peak = mag;
+            self.sample_count += 1;
+            if (mag > 1.0) self.clip_count += 1;
+        }
         if (self.soft_clip) {
             l = dsp.softClip(l);
             r = dsp.softClip(r);
@@ -423,18 +441,27 @@ fn decayCoef(decay: f32, sr: f32) f32 {
 // Kick: sine osc を速いピッチ env で叩き、振幅 env と softClip(drive) で胴鳴り感を出す。
 pub const Kick = struct {
     osc: dsp.Oscillator = .{ .waveform = .sine },
-    base_hz: f32 = 50.0,
-    start_hz: f32 = 130.0,
-    pitch_decay: f32 = 0.035,
-    amp_decay: f32 = 0.22,
-    drive: f32 = 1.8,
+    /// アタックのクリック用ノイズ。fixed seed（"KICK"）で決定的（Hat/Clap と同方針）。
+    click_noise: dsp.Noise = .{ .state = 0x4B49434B },
+    click_hp: dsp.Filter = .{}, // クリックを高域寄りにする HP（こもらせない）
+    base_hz: f32 = 50.0, // 胴の最終周波数（sub）
+    start_hz: f32 = 140.0, // ピッチ env の頂点（アタックの"芯"）
+    pitch_decay: f32 = 0.03,
+    amp_decay: f32 = 0.28,
+    body_gain: f32 = 1.0, // 胴の量
+    drive: f32 = 1.9, // softClip drive（太さ/歪み）
+    click_gain: f32 = 0.35, // アタックのクリック量（GUI "Kick Punch"）
+    click_decay: f32 = 0.005, // クリックは非常に短い
+    click_cutoff: f32 = 1400.0, // クリック HP cutoff
     gain: f32 = 0.8,
     prev_gate: bool = false,
     active: bool = false,
     amp: f32 = 0.0,
     pitch_env: f32 = 0.0,
+    click_amp: f32 = 0.0,
     amp_k: f32 = 0.0,
     pitch_k: f32 = 0.0,
+    click_k: f32 = 0.0,
     applied_sr: f32 = -1.0,
 
     const done_eps: f32 = 1e-4;
@@ -448,9 +475,13 @@ pub const Kick = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Kick = @ptrCast(@alignCast(ctx));
-        if (self.applied_sr == sr) return; // sr 不変なら @exp 再計算しない（decay は静的）
+        if (self.applied_sr == sr) return; // sr 不変なら係数(@exp/tan)再計算しない（decay/cutoff は静的）
         self.amp_k = decayCoef(self.amp_decay, sr);
         self.pitch_k = decayCoef(self.pitch_decay, sr);
+        self.click_k = decayCoef(self.click_decay, sr);
+        self.click_hp.sample_rate = sr;
+        self.click_hp.setMode(.highpass);
+        self.click_hp.setParams(self.click_cutoff, 0.707);
         self.applied_sr = sr;
     }
 
@@ -461,6 +492,7 @@ pub const Kick = struct {
             self.active = true;
             self.amp = 1.0;
             self.pitch_env = 1.0;
+            self.click_amp = 1.0;
         }
         self.prev_gate = g;
         if (!self.active) {
@@ -468,10 +500,13 @@ pub const Kick = struct {
             return;
         }
         const freq = self.base_hz + (self.start_hz - self.base_hz) * self.pitch_env;
-        var s = self.osc.next(freq, io.sample_rate) * self.amp;
-        s = dsp.softClip(s * self.drive) * self.gain;
+        const body = dsp.softClip(self.osc.next(freq, io.sample_rate) * self.amp * self.drive) * self.body_gain;
+        const click = self.click_hp.process(self.click_noise.next()) * self.click_amp * self.click_gain;
+        var s = (body + click) * self.gain;
+        if (!std.math.isFinite(s)) s = 0;
         self.amp *= self.amp_k;
         self.pitch_env *= self.pitch_k;
+        self.click_amp *= self.click_k;
         if (self.amp < done_eps) self.active = false;
         io.outputs[0] = s;
     }
@@ -483,6 +518,9 @@ pub const Hat = struct {
     hp: dsp.Filter = .{},
     bp: dsp.Filter = .{},
     decay: f32 = 0.045,
+    /// 明るさ。HP/BP cutoff を乗算でスケール（0.3..2.5 に clamp）。1.0 で基準（従来と bit 一致）。
+    /// GUI "Hat Bright"。耳に痛い帯域が出すぎないよう既定は控えめ（=1.0）。
+    brightness: f32 = 1.0,
     hp_cutoff: f32 = 7000.0,
     bp_cutoff: f32 = 9000.0,
     bp_q: f32 = 1.2,
@@ -492,6 +530,8 @@ pub const Hat = struct {
     amp: f32 = 0.0,
     amp_k: f32 = 0.0,
     coeffs_sr: f32 = -1.0, // フィルタ係数を計算した sr（変化時のみ再計算）
+    applied_bright: f32 = -1.0, // 反映済み brightness（runtime 変更検出）
+    applied_decay: f32 = -1.0, // 反映済み decay（runtime 変更検出）
 
     const done_eps: f32 = 1e-4;
     const in_kinds = [_]PortKind{.gate};
@@ -504,15 +544,19 @@ pub const Hat = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Hat = @ptrCast(@alignCast(ctx));
-        if (self.coeffs_sr == sr) return; // sr 不変なら係数(@exp/tan)を再計算しない
+        // sr/brightness/decay いずれか変化時のみ係数(@exp/tan)再計算（GUI からの runtime 変更を拾う）。
+        if (self.coeffs_sr == sr and self.applied_bright == self.brightness and self.applied_decay == self.decay) return;
         self.amp_k = decayCoef(self.decay, sr);
+        const b = if (std.math.isFinite(self.brightness)) std.math.clamp(self.brightness, 0.3, 2.5) else 1.0;
         self.hp.sample_rate = sr;
         self.hp.setMode(.highpass);
-        self.hp.setParams(self.hp_cutoff, 0.707);
+        self.hp.setParams(self.hp_cutoff * b, 0.707);
         self.bp.sample_rate = sr;
         self.bp.setMode(.bandpass);
-        self.bp.setParams(self.bp_cutoff, self.bp_q);
+        self.bp.setParams(self.bp_cutoff * b, self.bp_q);
         self.coeffs_sr = sr;
+        self.applied_bright = self.brightness;
+        self.applied_decay = self.decay;
     }
 
     fn process(ctx: *anyopaque, io: *Io) void {
@@ -696,6 +740,8 @@ pub const Clap = struct {
     tone_hz: f32 = 180.0,
     tone_gain: f32 = 0.06,
     decay: f32 = 0.12,
+    /// バースト間隔（ms）。手拍子の「パパッ」の詰まり具合。大で広がり、小で密集。
+    spread_ms: f32 = 10.0,
     hp_cutoff: f32 = 1200.0,
     bp_cutoff: f32 = 1800.0,
     bp_q: f32 = 1.0,
@@ -710,9 +756,10 @@ pub const Clap = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    /// 3 つの素早いバースト（線形立ち下がり）。手拍子の「パパッ」を作る。
-    fn burstShape(t_ms: f32) f32 {
-        const centers = [_]f32{ 0.0, 10.0, 20.0 };
+    /// 3 つの素早いバースト（線形立ち下がり）。手拍子の「パパッ」を作る。間隔は spread_ms。
+    fn burstShape(t_ms: f32, spread_ms: f32) f32 {
+        const sp = if (std.math.isFinite(spread_ms)) std.math.clamp(spread_ms, 1.0, 40.0) else 10.0;
+        const centers = [_]f32{ 0.0, sp, 2.0 * sp };
         const burst_len: f32 = 6.0; // ms
         var b: f32 = 0;
         for (centers) |c| {
@@ -749,7 +796,7 @@ pub const Clap = struct {
             return;
         }
         const t_ms = @as(f32, @floatFromInt(self.age)) / io.sample_rate * 1000.0;
-        const burst = burstShape(t_ms);
+        const burst = burstShape(t_ms, self.spread_ms);
         const n = self.bp.process(self.hp.process(self.noise.next()));
         const tn = self.tone.next(self.tone_hz, io.sample_rate) * self.tone_gain;
         const out = (n * burst + tn) * self.amp * self.gain;
@@ -757,6 +804,109 @@ pub const Clap = struct {
         self.age += 1;
         if (self.amp < done_eps) self.active = false;
         io.outputs[0] = out;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// ChordPad: gate/trigger(in0) -> audio(out0)。固定 root の温かい和音（root + 5th + minor 10th）を
+// slow attack + 長め release のエンベロープで鳴らす。3 oscillator を warmth で軽く detune し LP で丸める。
+// 乱数を使わない＝決定的（fixed seed すら不要）。bass(Turing) には追従せず固定和声で土台の温かみを足す
+// （patch では Sidechain 経路に入り kick に duck される）。設計: docs/plans/modular-synth-plan.md §4。
+// ----------------------------------------------------------------------------
+pub const ChordPad = struct {
+    osc: [3]dsp.Oscillator = .{
+        .{ .waveform = .triangle },
+        .{ .waveform = .triangle },
+        .{ .waveform = .saw },
+    },
+    lp: dsp.Filter = .{},
+    root_hz: f32 = 130.81, // C3（bass の C2 と 1 oct 違いで衝突しにくい中域）
+    /// 和音インターバル（半音）: root / perfect 5th / minor 10th(=oct + minor 3rd)。固定（旋律追従なし）。
+    intervals: [3]f32 = .{ 0.0, 7.0, 15.0 },
+    detune: f32 = 0.004, // warmth=1 時の最大デチューン比（±）
+    warmth: f32 = 0.6, // 0..1。detune 深さ＋わずかな drive を集約（GUI "Pad Warmth"）
+    cutoff: f32 = 1400.0, // LP cutoff（GUI "Pad Cutoff"）
+    attack: f32 = 0.35, // s（slow swell）
+    release: f32 = 1.4, // s（long fade）
+    gain: f32 = 0.22, // 出力レベル（GUI "Pad Level"・mute で 0）
+    prev_gate: bool = false,
+    attacking: bool = false,
+    env: f32 = 0.0,
+    atk_inc: f32 = 0.0,
+    rel_k: f32 = 0.0,
+    freqs: [3]f32 = .{ 0, 0, 0 }, // updateParams で算出した各 osc の Hz（@exp2 を毎サンプル避ける）
+    drive_mul: f32 = 1.0, // warmth 由来の軽い飽和係数（事前計算）
+    applied_sr: f32 = -1.0,
+    applied_cutoff: f32 = -1.0,
+    applied_attack: f32 = -1.0,
+    applied_release: f32 = -1.0,
+    applied_warmth: f32 = -1.0,
+
+    const done_eps: f32 = 1e-4;
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *ChordPad) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *ChordPad = @ptrCast(@alignCast(ctx));
+        // sr/cutoff/attack/release/warmth のいずれか変化時のみ係数(@exp2/tan)再計算（GUI runtime 変更を拾う）。
+        // process は毎サンプル軽量算術のみ（@exp2 等の transcendental はここに集約）。
+        if (self.applied_sr == sr and self.applied_cutoff == self.cutoff and
+            self.applied_attack == self.attack and self.applied_release == self.release and
+            self.applied_warmth == self.warmth) return;
+        const atk = @max(self.attack, 1e-3);
+        self.atk_inc = 1.0 / (atk * sr);
+        self.rel_k = decayCoef(self.release, sr);
+        var fc = if (std.math.isFinite(self.cutoff)) self.cutoff else 1400.0;
+        fc = std.math.clamp(fc, 50.0, @max(60.0, sr * 0.5 - 1.0));
+        self.lp.sample_rate = sr;
+        self.lp.setMode(.lowpass);
+        self.lp.setParams(fc, 0.7);
+        // 和音 Hz（固定 interval × warmth デチューン）と warmth 飽和係数を事前計算。
+        const w = if (std.math.isFinite(self.warmth)) std.math.clamp(self.warmth, 0.0, 1.0) else 0.6;
+        for (0..3) |i| {
+            const ci: f32 = @floatFromInt(@as(i32, @intCast(i)) - 1); // -1, 0, +1
+            const det = 1.0 + ci * self.detune * w;
+            self.freqs[i] = self.root_hz * @exp2(self.intervals[i] / 12.0) * det;
+        }
+        self.drive_mul = 1.0 + w * 0.4;
+        self.applied_sr = sr;
+        self.applied_cutoff = self.cutoff;
+        self.applied_attack = self.attack;
+        self.applied_release = self.release;
+        self.applied_warmth = self.warmth;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *ChordPad = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) self.attacking = true; // (再)トリガで swell
+        self.prev_gate = g;
+        if (self.attacking) {
+            self.env += self.atk_inc;
+            if (self.env >= 1.0) {
+                self.env = 1.0;
+                self.attacking = false;
+            }
+        } else {
+            self.env *= self.rel_k;
+        }
+        if (!self.attacking and self.env < done_eps) {
+            io.outputs[0] = 0;
+            return;
+        }
+        var sum: f32 = 0;
+        for (&self.osc, 0..) |*o, i| {
+            sum += o.next(self.freqs[i], io.sample_rate); // 事前計算済み Hz（@exp2 なし）
+        }
+        sum *= 1.0 / 3.0;
+        const driven = dsp.softClip(sum * self.drive_mul); // warmth で軽い飽和（係数は事前計算）
+        const y = self.lp.process(driven) * self.env * self.gain;
+        io.outputs[0] = if (std.math.isFinite(y)) y else 0;
     }
 };
 
@@ -1185,6 +1335,35 @@ test "Hat: trigger sounds then decays; finite and deterministic (fixed seed)" {
     }
     try testing.expect(peak > 0.001);
     try testing.expect(@abs(o1[0]) < peak * 0.1); // 大きく減衰
+}
+
+test "ChordPad: triggered chord is finite/deterministic, swells then fades, low DC" {
+    var p1 = ChordPad{};
+    var p2 = ChordPad{};
+    ChordPad.updateParams(&p1, 48000);
+    ChordPad.updateParams(&p2, 48000);
+    var o1: [1]f32 = undefined;
+    var o2: [1]f32 = undefined;
+    drive(&ChordPad.vtable, &p1, &.{1.0}, &.{true}, &o1, 48000); // trigger（1 サンプル）
+    drive(&ChordPad.vtable, &p2, &.{1.0}, &.{true}, &o2, 48000);
+    var peak: f32 = 0;
+    var acc: f64 = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    while (i < 48000 * 3) : (i += 1) { // 3s（attack 0.35 + release 1.4 を十分含む）
+        drive(&ChordPad.vtable, &p1, &.{0.0}, &.{true}, &o1, 48000); // gate low → release
+        drive(&ChordPad.vtable, &p2, &.{0.0}, &.{true}, &o2, 48000);
+        try testing.expect(std.math.isFinite(o1[0]));
+        try testing.expect(@abs(o1[0]) <= 1.0001); // 有界
+        try testing.expectEqual(o1[0], o2[0]); // 決定的
+        peak = @max(peak, @abs(o1[0]));
+        acc += o1[0];
+        n += 1;
+    }
+    try testing.expect(peak > 0.02); // 鳴った（swell）
+    try testing.expect(@abs(o1[0]) < peak * 0.2); // release で大きく減衰
+    const dc = @abs(acc / @as(f64, @floatFromInt(n)));
+    try testing.expect(dc < 0.05); // DC 偏りが小さい（長時間で偏らない）
 }
 
 test "PercEnv: trigger -> 1.0 then exponential decay to ~0" {
