@@ -33,6 +33,13 @@ const ZOOM_DEFAULT: i32 = 2;
 const CHECKER_CELL: i32 = 8;
 const CHECKER_LIGHT: u32 = 0xFF_6A_6A_6A;
 const CHECKER_DARK: u32 = 0xFF_4E_4E_4E;
+// ペイン分割（TASK-42）: 右/下ペインのリサイズ + 表示非表示。pane は fixed px・canvas は grow。
+const RIGHT_PANE_DEFAULT: i32 = 200;
+const RIGHT_PANE_MIN: i32 = 120;
+const BOTTOM_PANE_DEFAULT: i32 = 120;
+const BOTTOM_PANE_MIN: i32 = 80;
+const CANVAS_MIN: i32 = 120; // pane リサイズ時に canvas へ残す最小辺
+const SPLITTER_T: i32 = 6; // 境界帯の太さ
 const SAVE_MSG_DURATION: f64 = 3.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
@@ -41,6 +48,11 @@ const FileOp = enum { save, save_as, open, save_palette, load_palette };
 
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
+/// ペイン分割（TASK-42）の明示 ID。CONTENT_ROW=横分割の利用可能幅、MAIN_AREA=縦分割の利用可能高 の基準。
+const CONTENT_ROW_ID: gui.Id = 0xC0FFEE02;
+const MAIN_AREA_ID: gui.Id = 0xC0FFEE03;
+const SPLIT_RIGHT_ID: gui.Id = 0xC0FFEE04;
+const SPLIT_BOTTOM_ID: gui.Id = 0xC0FFEE05;
 
 const COLOR_WINDOW_BG: u32 = 0xFF_24_20_20; // canonical BGRA: r=24,g=20,b=20（従来の見た目を維持）
 
@@ -128,6 +140,11 @@ const App = struct {
     pan_active: bool = false,
     pan_anchor_mouse: core.Vec2 = .{ .x = 0, .y = 0 },
     pan_anchor_pan: core.Vec2 = .{ .x = 0, .y = 0 },
+    /// ── ペイン（TASK-42）。pane は fixed px・canvas は grow。幅/高さは毎フレーム利用可能領域へ clamp ──
+    right_pane_w: i32 = RIGHT_PANE_DEFAULT,
+    right_visible: bool = true,
+    bottom_pane_h: i32 = BOTTOM_PANE_DEFAULT,
+    bottom_visible: bool = false,
     /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
@@ -656,6 +673,25 @@ fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) b
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
     app.syncEditHsv();
+    // 右ペイン非表示時は HSV widget が無く applyEditColor がブロック内で呼ばれない（TASK-42）。
+    // Pal Load 等で current が変わっても pen/brush.color が旧色のままになるのを防ぐためここで同期する
+    // （visible 時は従来どおり HSV slider 更新後・palette grid より前のブロック内で呼ぶ）。
+    if (!app.right_visible) app.applyEditColor();
+
+    // ペイン幅/高さを前フレーム rect の「利用可能領域」へ clamp（TASK-42）。
+    // 基準は CONTENT_ROW（横分割の全幅）/ MAIN_AREA（縦分割の全高）。CANVAS_AREA は pane 差引後の
+    // 残りなので max 基準に使えない。max は splitter にも渡し、ウィンドウ縮小時も canvas を CANVAS_MIN 残す。
+    var right_max: i32 = RIGHT_PANE_DEFAULT;
+    if (ctx.getNodeRect(CONTENT_ROW_ID)) |row| {
+        right_max = @max(RIGHT_PANE_MIN, @as(i32, @intCast(row.w)) - SPLITTER_T - CANVAS_MIN);
+    }
+    app.right_pane_w = std.math.clamp(app.right_pane_w, RIGHT_PANE_MIN, right_max);
+    var bottom_max: i32 = BOTTOM_PANE_DEFAULT;
+    if (ctx.getNodeRect(MAIN_AREA_ID)) |m| {
+        bottom_max = @max(BOTTOM_PANE_MIN, @as(i32, @intCast(m.h)) - SPLITTER_T - CANVAS_MIN);
+    }
+    app.bottom_pane_h = std.math.clamp(app.bottom_pane_h, BOTTOM_PANE_MIN, bottom_max);
+
     ctx.beginBox(.{
         .direction = .column,
         .width = .{ .grow = 1 },
@@ -679,108 +715,120 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     if (ctx.button("Redo")) app.doRedo();
     if (ctx.button("Pal Save")) app.pending_file_op = .save_palette;
     if (ctx.button("Pal Load")) app.pending_file_op = .load_palette;
+    // ペイン表示トグル（TASK-42）
+    if (ctx.buttonEx("Panel", .{ .selected = app.right_visible }).clicked) app.right_visible = !app.right_visible;
+    if (ctx.buttonEx("Timeline", .{ .selected = app.bottom_visible }).clicked) app.bottom_visible = !app.bottom_visible;
     ctx.endBox();
 
-    // ── 2 段目: canvas area (grow) + right pane (fixed 200) ──
-    ctx.beginBox(.{
-        .direction = .row,
-        .width = .{ .grow = 1 },
-        .height = .{ .grow = 1 },
-        .gap = 8,
-    });
+    // ── main area: content row(canvas + 右ペイン) + 任意の下ペイン（TASK-42。縦分割の基準 ID） ──
+    ctx.beginBox(.{ .id = MAIN_AREA_ID, .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 0 });
 
-    // canvas area: 明示 ID・中身空（blit は endFrame 後に別パスで行う）。
-    // GUI render は canvas blit の後に重ねるため、bg を持たせると canvas を上塗り
-    // してしまう → bg なし（ウィンドウ背景がそのまま見える）
-    ctx.beginBox(.{
-        .id = CANVAS_AREA_ID,
-        .width = .{ .grow = 1 },
-        .height = .{ .grow = 1 },
-    });
+    // content row: canvas(grow) + [splitter + right pane]。gap=0 で splitter を境界帯にする（横分割の基準 ID）。
+    ctx.beginBox(.{ .id = CONTENT_ROW_ID, .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 0 });
+
+    // canvas area: 明示 ID・中身空（blit は endFrame 後に別パスで行う）。bg なし（canvas を上塗りしない）。
+    ctx.beginBox(.{ .id = CANVAS_AREA_ID, .width = .{ .grow = 1 }, .height = .{ .grow = 1 } });
     ctx.endBox();
 
-    // right pane: Palette + Tool
-    ctx.beginBox(.{
-        .width = .{ .fixed = 200 },
-        .height = .{ .grow = 1 },
-        .padding = .{ 8, 8, 8, 8 },
-        .gap = 6,
-        .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
-    });
-    // ── カラーエディタ（HSV）。grid より前に write-back する（選択変更の上書き事故回避） ──
-    ctx.label("Color");
-    ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
-    _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 120 });
-    _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 120 });
-    ctx.endBox();
-    _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
-    _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
-    _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
-    app.edit_h = @min(app.edit_h, 360 - 1e-3); // hueBar と同じ [0,360) 契約
-    app.applyEditColor(); // 編集中 HSV → 選択スウォッチ色 + pen.color（grid クリックより前）
+    if (app.right_visible) {
+        _ = ctx.splitter(SPLIT_RIGHT_ID, .vertical, &app.right_pane_w, .{ .thickness = SPLITTER_T, .min = RIGHT_PANE_MIN, .max = right_max, .invert = true });
+        // right pane: Color / Palette / Tool（clip_children で溢れ防止）
+        ctx.beginBox(.{
+            .width = .{ .fixed = app.right_pane_w },
+            .height = .{ .grow = 1 },
+            .padding = .{ 8, 8, 8, 8 },
+            .gap = 6,
+            .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+            .clip_children = true,
+        });
+        // ── カラーエディタ（HSV）。grid より前に write-back する（選択変更の上書き事故回避） ──
+        ctx.label("Color");
+        ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
+        _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 120 });
+        _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 120 });
+        ctx.endBox();
+        _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
+        _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+        _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+        app.edit_h = @min(app.edit_h, 360 - 1e-3); // hueBar と同じ [0,360) 契約
+        app.applyEditColor(); // 編集中 HSV → 選択スウォッチ色 + pen.color（grid クリックより前）
 
-    // ── 編集可能パレット（可変長スウォッチ + 追加/削除） ──
-    ctx.label("Palette");
-    {
-        var idx: usize = 0;
-        while (idx < app.palette.colors.items.len) {
-            ctx.beginBox(.{ .direction = .row, .gap = 3 });
-            var col: u32 = 0;
-            while (col < 4 and idx < app.palette.colors.items.len) : (col += 1) {
-                const swatch_id: gui.Id = 0x1000 + @as(gui.Id, idx);
-                if (ctx.colorSwatchId(swatch_id, .{
-                    .color = guiColor(app.palette.colors.items[idx]),
-                    .selected = idx == app.palette.selected,
-                    .size = 22,
-                }).clicked) {
-                    app.palette.select(idx); // HSV は次フレームで再同期
-                    if (app.active_kind == .eraser) app.setActiveKind(.pen); // 色は pen 用（brush/bezier は維持）
+        // ── 編集可能パレット（可変長スウォッチ + 追加/削除） ──
+        ctx.label("Palette");
+        {
+            var idx: usize = 0;
+            while (idx < app.palette.colors.items.len) {
+                ctx.beginBox(.{ .direction = .row, .gap = 3 });
+                var col: u32 = 0;
+                while (col < 4 and idx < app.palette.colors.items.len) : (col += 1) {
+                    const swatch_id: gui.Id = 0x1000 + @as(gui.Id, idx);
+                    if (ctx.colorSwatchId(swatch_id, .{
+                        .color = guiColor(app.palette.colors.items[idx]),
+                        .selected = idx == app.palette.selected,
+                        .size = 22,
+                    }).clicked) {
+                        app.palette.select(idx); // HSV は次フレームで再同期
+                        if (app.active_kind == .eraser) app.setActiveKind(.pen); // 色は pen 用（brush/bezier は維持）
+                    }
+                    idx += 1;
                 }
-                idx += 1;
+                ctx.endBox();
             }
-            ctx.endBox();
         }
-    }
-    ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonEx("+", .{ .min_w = 28 }).clicked) {
-        app.palette.addColor(app.gpa, app.palette.current()) catch {};
-    }
-    if (ctx.buttonEx("-", .{ .min_w = 28 }).clicked) {
-        app.palette.removeSelected();
-        // 非末尾削除で index が詰まると selected が同値のまま別色を指す。
-        // edit_synced_for を無効化し、次フレームで現 current 色から HSV 再同期する
-        // （さもないと applyEditColor が旧 HSV で新色を上書きする）。
-        app.edit_synced_for = null;
-    }
-    ctx.endBox();
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("+", .{ .min_w = 28 }).clicked) {
+            app.palette.addColor(app.gpa, app.palette.current()) catch {};
+        }
+        if (ctx.buttonEx("-", .{ .min_w = 28 }).clicked) {
+            app.palette.removeSelected();
+            // 非末尾削除で index が詰まると selected が同値のまま別色を指す。
+            // edit_synced_for を無効化し、次フレームで現 current 色から HSV 再同期する
+            // （さもないと applyEditColor が旧 HSV で新色を上書きする）。
+            app.edit_synced_for = null;
+        }
+        ctx.endBox();
 
-    ctx.label("Tool");
-    // 4 ツールは右ペイン幅に収めるため 2 行に折り返す
-    ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.setActiveKind(.pen);
-    if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.setActiveKind(.eraser);
-    ctx.endBox();
-    ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.setActiveKind(.brush);
-    if (ctx.buttonEx("Bezier", .{ .selected = app.active_kind == .bezier, .min_w = 56 }).clicked) app.setActiveKind(.bezier);
-    ctx.endBox();
-    // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
-    if (app.active_kind == .brush or app.active_kind == .bezier) {
-        _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
-        _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
-        _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
+        ctx.label("Tool");
+        // 4 ツールは右ペイン幅に収めるため 2 行に折り返す
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.setActiveKind(.pen);
+        if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.setActiveKind(.eraser);
+        ctx.endBox();
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.setActiveKind(.brush);
+        if (ctx.buttonEx("Bezier", .{ .selected = app.active_kind == .bezier, .min_w = 56 }).clicked) app.setActiveKind(.bezier);
+        ctx.endBox();
+        // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
+        if (app.active_kind == .brush or app.active_kind == .bezier) {
+            _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
+            _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
+            _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
+        }
+        // UI 状態 → Brush（毎フレーム clamp/変換。型差吸収）
+        app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
+        app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
+        app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
+        ctx.endBox(); // right pane
+    } // right_visible
+
+    ctx.endBox(); // content row
+
+    // ── 下ペイン（タイムライン枠。中身は Phase5。TASK-42 はリサイズ/トグル枠のみ） ──
+    if (app.bottom_visible) {
+        _ = ctx.splitter(SPLIT_BOTTOM_ID, .horizontal, &app.bottom_pane_h, .{ .thickness = SPLITTER_T, .min = BOTTOM_PANE_MIN, .max = bottom_max, .invert = true });
+        ctx.beginBox(.{
+            .direction = .row,
+            .width = .{ .grow = 1 },
+            .height = .{ .fixed = app.bottom_pane_h },
+            .padding = .{ 6, 8, 6, 8 },
+            .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+            .clip_children = true,
+        });
+        ctx.labelEx("Timeline (placeholder)", ctx.style.text_subtle);
+        ctx.endBox(); // bottom pane
     }
-    // UI 状態 → Brush（毎フレーム clamp/変換。型差吸収）
-    app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
-    app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
-    app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
-    ctx.endBox(); // right pane
 
-    ctx.endBox(); // 2 段目
-
-    // ── 3 段目: timeline placeholder（将来用、高さ 0） ──
-    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 0 } });
-    ctx.endBox();
+    ctx.endBox(); // main area
 
     // ── 4 段目: status bar ──
     ctx.beginBox(.{
@@ -923,13 +971,26 @@ pub fn main(init: std.process.Init) !void {
             // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
             if (!panning) {
                 const in = &ctx.input;
+                // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
+                // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
+                // pressed_left のみ落として update は通し、release を届けて完走させる（capturing 張り付き防止）。
+                const pressed_left_gated = in.mouse_pressed.left and gate: {
+                    const p = in.mouse_pressed_pos;
+                    const in_area = if (app.last_area) |a|
+                        (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h)
+                    else
+                        false;
+                    // active_id==0 = どの widget/splitter も press を取っていない（hover だけの wantsMouse は
+                    // 抑止しない＝canvas 内 press → 同一フレーム UI 上へ move でも stroke は開始できる）。
+                    break :gate in_area and ctx.state.active_id == 0;
+                };
                 if (app.active_kind == .bezier and !app.input.capturing) {
                     const frame: bezier_input.BezierInput.Frame = .{
                         .canvas_rect = canvas_rect,
                         .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                        .pressed_left = in.mouse_pressed.left,
+                        .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                         .time = platform.getTime(),
                     };
@@ -943,7 +1004,7 @@ pub fn main(init: std.process.Init) !void {
                         .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                        .pressed_left = in.mouse_pressed.left,
+                        .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
                     if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
