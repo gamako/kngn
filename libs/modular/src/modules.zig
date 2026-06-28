@@ -225,6 +225,344 @@ pub const Output = struct {
     }
 };
 
+// ----------------------------------------------------------------------------
+// Clock: 入力なし -> gate(out0)。BPM/PPQN で tick ごとに 1 サンプル trigger。
+// 位相は f64（f32 累積の drift を避け、長時間連続でも tick 間隔が崩れない）。
+// ----------------------------------------------------------------------------
+pub const Clock = struct {
+    bpm: f32 = 120.0,
+    ppqn: u32 = 4,
+    phase_samples: f64 = 0,
+    samples_per_tick: f64 = 0,
+    started: bool = false,
+
+    const out_kinds = [_]PortKind{.gate};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *Clock) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &[_]PortKind{}, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sample_rate: f32) void {
+        const self: *Clock = @ptrCast(@alignCast(ctx));
+        const ppqn: f64 = @floatFromInt(if (self.ppqn == 0) 1 else self.ppqn);
+        const bpm: f64 = std.math.clamp(self.bpm, 20.0, 300.0);
+        self.samples_per_tick = @as(f64, sample_rate) * 60.0 / (bpm * ppqn);
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Clock = @ptrCast(@alignCast(ctx));
+        if (self.samples_per_tick <= 0) { // updateParams 未実行の保険
+            io.outputs[0] = 0;
+            return;
+        }
+        var trig: f32 = 0;
+        if (!self.started) {
+            self.started = true;
+            self.phase_samples = 0;
+            trig = 1.0; // 初回 tick
+        } else {
+            self.phase_samples += 1.0;
+            if (self.phase_samples >= self.samples_per_tick) {
+                self.phase_samples -= self.samples_per_tick; // 端数を保持（fractional tick 対応）
+                trig = 1.0;
+            }
+        }
+        io.outputs[0] = trig;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// ClockDivider: gate(in0) -> gate(out0)。入力 rising edge を div 個ごとに 1 回通す。
+// ----------------------------------------------------------------------------
+pub const ClockDivider = struct {
+    div: u32 = 2,
+    count: u32 = 0,
+    prev_gate: bool = false,
+
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.gate};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *ClockDivider) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *ClockDivider = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        var trig: f32 = 0;
+        if (g and !self.prev_gate) { // rising edge
+            const d = if (self.div == 0) 1 else self.div;
+            self.count += 1;
+            if (self.count % d == 0) trig = 1.0;
+        }
+        self.prev_gate = g;
+        io.outputs[0] = trig;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// EuclideanSeq: gate(in0=clock) -> gate(out0)。入力 rising edge ごとに step を進め、
+// ユークリッドリズムの hit ステップだけ 1 サンプル trigger を出す（Bresenham 判定式・O(1)）。
+// ----------------------------------------------------------------------------
+pub const EuclideanSeq = struct {
+    steps: u8 = 8,
+    pulses: u8 = 4,
+    rotation: u8 = 0,
+    step: u8 = 0,
+    prev_gate: bool = false,
+
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.gate};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *EuclideanSeq) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    /// step s が hit か（rotation 適用）。E(pulses,steps) を Bresenham 判定で近似（標準的なユークリッド配置）。
+    pub fn hitAt(steps: u8, pulses: u8, rotation: u8, s: u8) bool {
+        if (steps == 0 or pulses == 0) return false;
+        const st: u32 = steps;
+        const pu: u32 = @min(@as(u32, pulses), st);
+        const rot: u32 = @as(u32, rotation) % st;
+        const idx = (@as(u32, s) + st - rot) % st;
+        return (idx * pu) % st < pu;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *EuclideanSeq = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        var trig: f32 = 0;
+        if (g and !self.prev_gate) {
+            const steps = if (self.steps == 0) 1 else self.steps;
+            if (hitAt(steps, self.pulses, self.rotation, self.step)) trig = 1.0;
+            self.step = (self.step + 1) % steps;
+        }
+        self.prev_gate = g;
+        io.outputs[0] = trig;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Quantizer: cv(in0, 0..1) -> cv(out0 = pitch_cv)。cv を scale 上の音度へスナップする。
+// Hz 変換は VCO 側（pitch_cv の境界はここと VCO に閉じる）。
+// ----------------------------------------------------------------------------
+pub const Quantizer = struct {
+    pub const Scale = enum { minor_pentatonic, minor, major };
+
+    scale: Scale = .minor_pentatonic,
+    root_semitone: i32 = 0,
+    octaves: u8 = 2,
+    /// 入力未接続時に使う固定 cv（最小 bass 用の一定音）。
+    input_cv: f32 = 0.0,
+
+    const in_kinds = [_]PortKind{.cv};
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *Quantizer) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn degrees(scale: Scale) []const i32 {
+        return switch (scale) {
+            .minor_pentatonic => &[_]i32{ 0, 3, 5, 7, 10 },
+            .minor => &[_]i32{ 0, 2, 3, 5, 7, 8, 10 },
+            .major => &[_]i32{ 0, 2, 4, 5, 7, 9, 11 },
+        };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Quantizer = @ptrCast(@alignCast(ctx));
+        const cv_raw = if (io.connected[0]) io.inputs[0] else self.input_cv;
+        // @intFromFloat 前に必ず finite かつ 0..1 に保証（NaN/Inf の CV で RT trap を防ぐ）。
+        const cv = if (std.math.isFinite(cv_raw)) std.math.clamp(cv_raw, 0.0, 1.0) else 0.0;
+        const ds = degrees(self.scale);
+        const len = ds.len;
+        const oct: usize = @max(1, self.octaves);
+        const total = len * oct;
+        const total_f: f32 = @floatFromInt(total);
+        const di = @min(total - 1, @as(usize, @intFromFloat(cv * total_f)));
+        const octave: i32 = @intCast(di / len);
+        const degree: i32 = ds[di % len];
+        const semitones: i32 = self.root_semitone + octave * 12 + degree;
+        io.outputs[0] = @as(f32, @floatFromInt(semitones)) / 12.0;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// 合成ドラム（サンプル不使用）。trigger(gate in0) で発火し audio(out0)。
+// 振幅/ピッチ envelope は乗算式の指数減衰（@exp は updateParams での係数計算のみ・毎サンプル避ける）。
+// ----------------------------------------------------------------------------
+fn decayCoef(decay: f32, sr: f32) f32 {
+    return @exp(-1.0 / (@max(decay, 1e-4) * sr));
+}
+
+// Kick: sine osc を速いピッチ env で叩き、振幅 env と softClip(drive) で胴鳴り感を出す。
+pub const Kick = struct {
+    osc: dsp.Oscillator = .{ .waveform = .sine },
+    base_hz: f32 = 50.0,
+    start_hz: f32 = 130.0,
+    pitch_decay: f32 = 0.035,
+    amp_decay: f32 = 0.22,
+    drive: f32 = 1.8,
+    gain: f32 = 0.8,
+    prev_gate: bool = false,
+    active: bool = false,
+    amp: f32 = 0.0,
+    pitch_env: f32 = 0.0,
+    amp_k: f32 = 0.0,
+    pitch_k: f32 = 0.0,
+    applied_sr: f32 = -1.0,
+
+    const done_eps: f32 = 1e-4;
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *Kick) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *Kick = @ptrCast(@alignCast(ctx));
+        if (self.applied_sr == sr) return; // sr 不変なら @exp 再計算しない（decay は静的）
+        self.amp_k = decayCoef(self.amp_decay, sr);
+        self.pitch_k = decayCoef(self.pitch_decay, sr);
+        self.applied_sr = sr;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Kick = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) {
+            self.active = true;
+            self.amp = 1.0;
+            self.pitch_env = 1.0;
+        }
+        self.prev_gate = g;
+        if (!self.active) {
+            io.outputs[0] = 0;
+            return;
+        }
+        const freq = self.base_hz + (self.start_hz - self.base_hz) * self.pitch_env;
+        var s = self.osc.next(freq, io.sample_rate) * self.amp;
+        s = dsp.softClip(s * self.drive) * self.gain;
+        self.amp *= self.amp_k;
+        self.pitch_env *= self.pitch_k;
+        if (self.amp < done_eps) self.active = false;
+        io.outputs[0] = s;
+    }
+};
+
+// Hat: noise を HP→BP で整え、短い振幅 env で叩く。fixed seed で決定的。
+pub const Hat = struct {
+    noise: dsp.Noise = .{ .state = 0x48415431 },
+    hp: dsp.Filter = .{},
+    bp: dsp.Filter = .{},
+    decay: f32 = 0.045,
+    hp_cutoff: f32 = 7000.0,
+    bp_cutoff: f32 = 9000.0,
+    bp_q: f32 = 1.2,
+    gain: f32 = 0.28,
+    prev_gate: bool = false,
+    active: bool = false,
+    amp: f32 = 0.0,
+    amp_k: f32 = 0.0,
+    coeffs_sr: f32 = -1.0, // フィルタ係数を計算した sr（変化時のみ再計算）
+
+    const done_eps: f32 = 1e-4;
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *Hat) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *Hat = @ptrCast(@alignCast(ctx));
+        if (self.coeffs_sr == sr) return; // sr 不変なら係数(@exp/tan)を再計算しない
+        self.amp_k = decayCoef(self.decay, sr);
+        self.hp.sample_rate = sr;
+        self.hp.setMode(.highpass);
+        self.hp.setParams(self.hp_cutoff, 0.707);
+        self.bp.sample_rate = sr;
+        self.bp.setMode(.bandpass);
+        self.bp.setParams(self.bp_cutoff, self.bp_q);
+        self.coeffs_sr = sr;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Hat = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) {
+            self.active = true;
+            self.amp = 1.0;
+        }
+        self.prev_gate = g;
+        if (!self.active) {
+            io.outputs[0] = 0;
+            return;
+        }
+        const x = self.noise.next();
+        const y = self.bp.process(self.hp.process(x));
+        const out = y * self.amp * self.gain;
+        self.amp *= self.amp_k;
+        if (self.amp < done_eps) self.active = false;
+        io.outputs[0] = out;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// PercEnv: gate(in0=trigger) -> cv(out0, 0..1)。1 サンプル trigger で発火する打楽器的
+// 指数減衰エンベロープ（VCA.gain_cv 等へ。trigger だと gate-sustained の EnvGen は鳴らないため）。
+// ----------------------------------------------------------------------------
+pub const PercEnv = struct {
+    decay: f32 = 0.18,
+    prev_gate: bool = false,
+    active: bool = false,
+    level: f32 = 0.0,
+    k: f32 = 0.0,
+    applied_sr: f32 = -1.0,
+
+    const done_eps: f32 = 1e-4;
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *PercEnv) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *PercEnv = @ptrCast(@alignCast(ctx));
+        if (self.applied_sr == sr) return; // sr 不変なら @exp 再計算しない
+        self.k = decayCoef(self.decay, sr);
+        self.applied_sr = sr;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *PercEnv = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) {
+            self.active = true;
+            self.level = 1.0;
+        }
+        self.prev_gate = g;
+        if (!self.active) {
+            io.outputs[0] = 0;
+            return;
+        }
+        const lvl = self.level;
+        self.level *= self.k;
+        if (self.level < done_eps) self.active = false;
+        io.outputs[0] = lvl;
+    }
+};
+
 // ============================================================================
 // module-level tests（Io を手組みして process を直接駆動。display/graph 不要）
 // ============================================================================
@@ -349,4 +687,157 @@ test "Output: center pan splits equal, soft clip bounds to <1" {
     o.soft_clip = true;
     drive(&Output.vtable, &o, &.{ 100.0, 0.0 }, &.{ true, false }, &out, 48000);
     try testing.expect(@abs(out[0]) < 1.0 and @abs(out[1]) < 1.0); // 飽和して有界
+}
+
+test "Clock: emits trigger at expected interval (bpm120 ppqn4 -> 6000 samples)" {
+    var clk = Clock{ .bpm = 120, .ppqn = 4 };
+    Clock.updateParams(&clk, 48000);
+    var out: [1]f32 = undefined;
+    var idx: [4]u32 = undefined;
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < 13000) : (i += 1) {
+        drive(&Clock.vtable, &clk, &[_]f32{}, &[_]bool{}, &out, 48000);
+        if (out[0] > 0.5) {
+            if (n < idx.len) idx[n] = i;
+            n += 1;
+        }
+    }
+    try testing.expect(n >= 3);
+    try testing.expectEqual(@as(u32, 0), idx[0]);
+    try testing.expectEqual(@as(u32, 6000), idx[1]);
+    try testing.expectEqual(@as(u32, 12000), idx[2]);
+}
+
+test "ClockDivider: passes every div-th input edge" {
+    var dv = ClockDivider{ .div = 4 };
+    var out: [1]f32 = undefined;
+    var passes: u32 = 0;
+    var e: u32 = 0;
+    while (e < 8) : (e += 1) {
+        drive(&ClockDivider.vtable, &dv, &.{1.0}, &.{true}, &out, 48000); // rising
+        if (out[0] > 0.5) passes += 1;
+        drive(&ClockDivider.vtable, &dv, &.{0.0}, &.{true}, &out, 48000); // falling
+    }
+    try testing.expectEqual(@as(u32, 2), passes); // 4th と 8th edge
+}
+
+test "EuclideanSeq: E(3,8) canonical placement, boundaries, rotation" {
+    var hits: u32 = 0;
+    var s: u8 = 0;
+    while (s < 8) : (s += 1) {
+        if (EuclideanSeq.hitAt(8, 3, 0, s)) hits += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), hits);
+    try testing.expect(EuclideanSeq.hitAt(8, 3, 0, 0));
+    try testing.expect(EuclideanSeq.hitAt(8, 3, 0, 3));
+    try testing.expect(EuclideanSeq.hitAt(8, 3, 0, 6));
+    try testing.expect(!EuclideanSeq.hitAt(8, 3, 0, 1));
+    // 境界: pulses=0 は無音、pulses=steps は全 hit
+    try testing.expect(!EuclideanSeq.hitAt(8, 0, 0, 0));
+    var all: u32 = 0;
+    s = 0;
+    while (s < 8) : (s += 1) {
+        if (EuclideanSeq.hitAt(8, 8, 0, s)) all += 1;
+    }
+    try testing.expectEqual(@as(u32, 8), all);
+    // rotation=1 でパターンが +1 ずれる
+    try testing.expect(EuclideanSeq.hitAt(8, 3, 1, 1));
+    try testing.expect(!EuclideanSeq.hitAt(8, 3, 1, 0));
+}
+
+test "EuclideanSeq: advances step on rising edge, 3 trigs over 8 clocks" {
+    var eu = EuclideanSeq{ .steps = 8, .pulses = 3, .rotation = 0 };
+    var out: [1]f32 = undefined;
+    var trigs: u32 = 0;
+    var e: u32 = 0;
+    while (e < 8) : (e += 1) {
+        drive(&EuclideanSeq.vtable, &eu, &.{1.0}, &.{true}, &out, 48000);
+        if (out[0] > 0.5) trigs += 1;
+        drive(&EuclideanSeq.vtable, &eu, &.{0.0}, &.{true}, &out, 48000);
+    }
+    try testing.expectEqual(@as(u32, 3), trigs);
+}
+
+test "Quantizer: snaps to minor pentatonic, cv=0 is root, unconnected uses input_cv" {
+    var q = Quantizer{ .scale = .minor_pentatonic, .root_semitone = 0, .octaves = 2 };
+    var out: [1]f32 = undefined;
+    drive(&Quantizer.vtable, &q, &.{0.0}, &.{true}, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6); // root
+    const allowed = [_]i32{ 0, 3, 5, 7, 10 };
+    var k: u32 = 0;
+    while (k <= 20) : (k += 1) {
+        const cv = @as(f32, @floatFromInt(k)) / 20.0;
+        drive(&Quantizer.vtable, &q, &.{cv}, &.{true}, &out, 48000);
+        const semis: i32 = @intFromFloat(@round(out[0] * 12.0));
+        const within = @mod(semis, 12);
+        var ok = false;
+        for (allowed) |a| {
+            if (within == a) ok = true;
+        }
+        try testing.expect(ok);
+    }
+    q.input_cv = 0.0;
+    drive(&Quantizer.vtable, &q, &.{0.9}, &.{false}, &out, 48000); // 未接続→input_cv=0→root
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
+}
+
+test "Kick: trigger sounds then decays; finite and deterministic" {
+    var k1 = Kick{};
+    var k2 = Kick{};
+    Kick.updateParams(&k1, 48000);
+    Kick.updateParams(&k2, 48000);
+    var o1: [1]f32 = undefined;
+    var o2: [1]f32 = undefined;
+    drive(&Kick.vtable, &k1, &.{1.0}, &.{true}, &o1, 48000); // trigger
+    drive(&Kick.vtable, &k2, &.{1.0}, &.{true}, &o2, 48000);
+    var peak: f32 = @abs(o1[0]);
+    var i: u32 = 0;
+    while (i < 96000) : (i += 1) { // 2s
+        drive(&Kick.vtable, &k1, &.{0.0}, &.{true}, &o1, 48000);
+        drive(&Kick.vtable, &k2, &.{0.0}, &.{true}, &o2, 48000);
+        try testing.expect(std.math.isFinite(o1[0]));
+        try testing.expectEqual(o1[0], o2[0]); // 決定性
+        peak = @max(peak, @abs(o1[0]));
+    }
+    try testing.expect(peak > 0.01); // 鳴った
+    try testing.expect(@abs(o1[0]) < 0.01); // 2s 後はほぼ無音
+}
+
+test "Hat: trigger sounds then decays; finite and deterministic (fixed seed)" {
+    var h1 = Hat{};
+    var h2 = Hat{};
+    Hat.updateParams(&h1, 48000);
+    Hat.updateParams(&h2, 48000);
+    var o1: [1]f32 = undefined;
+    var o2: [1]f32 = undefined;
+    drive(&Hat.vtable, &h1, &.{1.0}, &.{true}, &o1, 48000);
+    drive(&Hat.vtable, &h2, &.{1.0}, &.{true}, &o2, 48000);
+    var peak: f32 = @abs(o1[0]);
+    var i: u32 = 0;
+    while (i < 24000) : (i += 1) { // 0.5s
+        drive(&Hat.vtable, &h1, &.{0.0}, &.{true}, &o1, 48000);
+        drive(&Hat.vtable, &h2, &.{0.0}, &.{true}, &o2, 48000);
+        try testing.expect(std.math.isFinite(o1[0]));
+        try testing.expectEqual(o1[0], o2[0]); // 決定性
+        peak = @max(peak, @abs(o1[0]));
+    }
+    try testing.expect(peak > 0.001);
+    try testing.expect(@abs(o1[0]) < peak * 0.1); // 大きく減衰
+}
+
+test "PercEnv: trigger -> 1.0 then exponential decay to ~0" {
+    var pe = PercEnv{ .decay = 0.05 };
+    PercEnv.updateParams(&pe, 48000);
+    var out: [1]f32 = undefined;
+    drive(&PercEnv.vtable, &pe, &.{1.0}, &.{true}, &out, 48000); // trigger
+    try testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-6);
+    var prev: f32 = out[0];
+    var i: u32 = 0;
+    while (i < 12000) : (i += 1) { // 0.25s
+        drive(&PercEnv.vtable, &pe, &.{0.0}, &.{true}, &out, 48000);
+        try testing.expect(out[0] <= prev + 1e-6); // 単調減少
+        prev = out[0];
+    }
+    try testing.expect(out[0] < 0.01); // 減衰しきった
 }

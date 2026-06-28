@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
     var default_main: ?*std.Build.Step.Compile = null;
     var default_pixie: ?*std.Build.Step.Compile = null;
     var default_synth: ?*std.Build.Step.Compile = null;
+    var default_modular: ?*std.Build.Step.Compile = null;
 
     for (backends) |be| {
         const is_default = (be == platform_option);
@@ -89,6 +90,12 @@ pub fn build(b: *std.Build) void {
             if (is_default) default_synth = synth_exe;
             if (install_all) b.installArtifact(synth_exe);
             addRunStep(b, b.fmt("run-synth-{s}", .{platform.backendName(be)}), b.fmt("Run synth app ({s})", .{platform.backendName(be)}), synth_exe, b.args);
+
+            // ----- Modular アプリ (apps/modular) — lofi 生成パッチ MVP (TASK-40.2.1)。audio backend は macOS/Linux/Windows -----
+            const modular_exe = addModularExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "modular", be, default_be), &example_modules, &pm);
+            if (is_default) default_modular = modular_exe;
+            if (install_all) b.installArtifact(modular_exe);
+            addRunStep(b, b.fmt("run-modular-{s}", .{platform.backendName(be)}), b.fmt("Run modular app ({s})", .{platform.backendName(be)}), modular_exe, b.args);
         }
 
         // ----- サンプルプログラム -----
@@ -162,6 +169,12 @@ pub fn build(b: *std.Build) void {
     if (default_synth) |ds| {
         addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", ds, b.args);
         addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
+    }
+
+    // modular も audio 対応 OS のみ生成。
+    if (default_modular) |dm| {
+        addRunStep(b, "run-modular", "Run modular app (uses -Dplatform option)", dm, b.args);
+        addBuildStep(b, "build-modular", "Build modular app only (uses -Dplatform option)", dm);
     }
 
     // ----- 検証 harness の live driver CLI（TASK-32.2）-----
@@ -604,6 +617,18 @@ pub fn build(b: *std.Build) void {
     const test_modular_step = b.step("test-modular", "Run libs/modular unit tests");
     test_modular_step.dependOn(&run_modular_test.step);
 
+    // apps/modular パッチテスト（LofiPatch の offline render: 非無音/有限/決定的 CRC。display/audio 不要。TASK-40.2.1）
+    const modular_app_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/modular/patch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    modular_app_test_mod.addImport("modular", example_modules.modular);
+    const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
+    const run_modular_app_test = b.addRunArtifact(modular_app_test);
+    const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");
+    test_app_modular_step.dependOn(&run_modular_app_test.step);
+
     // src/dsp テスト (Oscillator / Envelope / Filter / Mixer)
     const dsp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/dsp/dsp.zig"),
@@ -653,6 +678,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_modular_step);
+    test_step.dependOn(test_app_modular_step);
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
@@ -1110,6 +1136,38 @@ fn addSynthExe(
     exe.root_module.addImport("dsp", common.dsp); // mono downmix + FFT(スペクトログラム)
     exe.root_module.addImport("gui", common.gui); // スライダ / ボタン（演奏 UI）
     linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
+
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    return exe;
+}
+
+// ============================================================================
+// ヘルパー: modular app exe を 1 backend 分セットアップ（apps/modular。TASK-40.2.1）
+// platform + audio + modular(グラフエンジン)。GUI は最小なので gui は import しない。
+// ============================================================================
+fn addModularExe(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+    sdk_paths: ?macos.MacOSSDKPaths,
+    platform_type: platform.PlatformType,
+    name: []const u8,
+    common: *const ExampleModules,
+    pm: *const PlatformModules,
+) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/modular/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("platform", pm.platform);
+    exe.root_module.addImport("audio", common.audio);
+    exe.root_module.addImport("modular", common.modular); // グラフエンジン（dsp 依存のみ）
+    linkAudioBackend(exe, target.result.os.tag);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;

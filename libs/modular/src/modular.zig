@@ -24,6 +24,15 @@ pub const Vcf = modules.Vcf;
 pub const Mixer = modules.Mixer;
 pub const Output = modules.Output;
 
+// Ph2a: 生成 CV + 合成ドラム
+pub const Clock = modules.Clock;
+pub const ClockDivider = modules.ClockDivider;
+pub const EuclideanSeq = modules.EuclideanSeq;
+pub const Quantizer = modules.Quantizer;
+pub const Kick = modules.Kick;
+pub const Hat = modules.Hat;
+pub const PercEnv = modules.PercEnv;
+
 test {
     // サブモジュールの単体テストを巻き込む。
     _ = signal;
@@ -261,6 +270,35 @@ test "graph: long render stays finite and bounded (NaN/Inf/peak; AC#10 proxy)" {
             try testing.expect(@abs(s) <= 1.0001); // softClip で有界
         }
     }
+}
+
+test "graph: Clock->Euclid->Kick->Output produces audible non-silent output" {
+    var clk = Clock{ .bpm = 120, .ppqn = 4 };
+    var eu = EuclideanSeq{ .steps = 4, .pulses = 4 }; // 毎 tick hit
+    var kick = Kick{};
+    var out = Output{ .gain = 1.0, .soft_clip = true };
+    var g = try Graph.init(testing.allocator, 48000, .{ .max_modules = 4, .max_ports = 8 });
+    defer g.deinit();
+    const nc = try g.addModule(clk.spec());
+    const ne = try g.addModule(eu.spec());
+    const nk = try g.addModule(kick.spec());
+    const no = try g.addModule(out.spec());
+    try g.connect(nc, 0, ne, 0); // Clock -> Euclid
+    try g.connect(ne, 0, nk, 0); // Euclid -> Kick(gate)
+    try g.connect(nk, 0, no, 0); // Kick -> Output
+    g.setOutputNode(no);
+    try g.finalize();
+
+    const frames: u32 = 24000; // 0.5s（複数 kick を含む）
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+    g.processBlock(buf, frames, 2);
+    var peak: f32 = 0;
+    for (buf) |s| {
+        try testing.expect(std.math.isFinite(s));
+        peak = @max(peak, @abs(s));
+    }
+    try testing.expect(peak > 0.05); // キックが鳴っている
 }
 
 test "graph: Mixer sums two sources via separate input ports (AC#2)" {

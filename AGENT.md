@@ -338,6 +338,43 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
 > 検証機 jackjack は NixOS（version 表示は 26.11 だが実体は **nixos-unstable**。`nixos-26.11` ブランチは未存在）。
 > jackjack で Apple T2 は `apple-t2x4.conf` プロファイルで Speakers/Headphones sink を生成する。
 
+## モジュラーシンセ層（TASK-40 ファミリー）
+
+`libs/modular`（`@import("modular")`）は **モジュラー音響グラフエンジン**。dsp プリミティブを vtable モジュール
+として包み、ノードグラフを per-sample で評価する。lofi ミニマルテクノを生成し続ける環境へ発展させる土台
+（最終ゴールはビジュアル・パッチング。設計の正はトップ階層 `docs/plans/modular-synth-plan.md`）。
+
+- **graph.zig**: `Graph`（固定確保 / topo sort / 入力単一接続=合算は Mixer / サイクル辺は 1 サンプル遅延 /
+  per-sample 処理 / 内部 mono→Output で stereo）。`processBlock(buf,frames,channels)` は **RT 安全**
+  （process 経路に alloc/lock/IO/panic なし。未 finalize/channels==0 はゼロ埋め）。係数更新（filter の tan、
+  ドラムの @exp）は `updateParams`（ブロック先頭・dirty-gated）に分離し毎サンプル走らせない。
+- **signal.zig**: 信号規約（audio≈-1..1 / cv 0..1 / gate threshold 0.5 / trigger=rising edge /
+  pitch_cv は VCO・Quantizer 境界で Hz 変換）。
+- **modules.zig**: VCO/VCA/EnvGen/VCF/Mixer/Output（Ph1）＋ Clock/ClockDivider/EuclideanSeq/Quantizer/
+  Kick/Hat/PercEnv（Ph2a、合成ドラムはサンプル不使用）。依存は dsp と `libs/synth` の lock-free 小物のみ
+  （Voice/SynthEngine/NoteQueue には依存しない）。
+- **apps/modular**（`run-modular`）: `patch.zig` の `LofiPatch`（固定の自己生成パッチを 1 回構築し RT で
+  `graph.processBlock`）＋ `main.zig`（window+audio+harness probe）。`LofiPatch` は graph が各モジュールへの
+  ctx ポインタを保持する自己参照のため**ヒープ確保しムーブしない**（`create`/`destroy`）。
+
+```bash
+zig build run-modular          # lofi 生成パッチを再生（ESC で終了。-Dplatform で backend 切替）
+zig build test-modular         # libs/modular（topo/cycle/単一接続/生成CV/合成ドラム。display/audio 不要）
+zig build test-app-modular     # apps/modular の LofiPatch（offline 非無音/有限/決定的 CRC）
+```
+
+ヘッドレス AC 確認（macOS 実機で発音、live で audio digest）:
+
+```bash
+VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-modular &   # 背景起動
+scripts/drive --port-file /tmp/vp.port 'digest audio'                        # → silent=0 / rms>0 を確認
+scripts/drive --port-file /tmp/vp.port 'quit'
+```
+
+> 決定性は `test-app-modular` の「2 回 render の CRC 一致」で担保（合成パラメータ変更で壊れる golden 定数は
+> 置かない）。Linux 発音は環境依存（[ALSA→PipeWire 前提条件](#linux-で音を鳴らす前提条件alsapipewiretask-2871)）で
+> `run-modular` は manual、`test-modular`/`test-app-modular` は OS 非依存で必須。
+
 ## ヘッドレス検証 harness（TASK-32 ファミリー）
 
 AI がアプリの出力を手軽に確認するための仕組み。`src/platform.zig`(facade) の 4 フック（`pollEvents`/`nextEvent`/`present`/`getTime`）に `src/harness.zig` を interpose し、**アプリ無改造**で「入力注入 + フレーム捕捉 + 仮想クロック」を行う。env 未設定なら全フック即パススルー（既存挙動と完全一致）。設計の正はトップ階層の `backlog/decisions/decision-1` と TASK-32 系タスク。

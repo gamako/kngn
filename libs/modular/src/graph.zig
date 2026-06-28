@@ -257,7 +257,10 @@ pub const Graph = struct {
     /// RT callback から呼べるよう panic/OOB を出さない: 未 finalize / channels==0 は no-op、
     /// frames は buf 容量に clamp する（不正は finalize で弾く前提＝非 RT 側で検証済み）。
     pub fn processBlock(self: *Graph, buf: []f32, frames: u32, channels: u32) void {
-        if (!self.finalized or channels == 0) return;
+        if (!self.finalized or channels == 0) {
+            @memset(buf, 0); // RT で stale バッファを鳴らさない
+            return;
+        }
         const ch: usize = channels;
         const cap: usize = buf.len / ch;
         const n: usize = @min(@as(usize, frames), cap);
