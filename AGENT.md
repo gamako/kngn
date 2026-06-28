@@ -351,11 +351,16 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
 - **signal.zig**: 信号規約（audio≈-1..1 / cv 0..1 / gate threshold 0.5 / trigger=rising edge /
   pitch_cv は VCO・Quantizer 境界で Hz 変換）。
 - **modules.zig**: VCO/VCA/EnvGen/VCF/Mixer/Output（Ph1）＋ Clock/ClockDivider/EuclideanSeq/Quantizer/
-  Kick/Hat/PercEnv（Ph2a、合成ドラムはサンプル不使用）。依存は dsp と `libs/synth` の lock-free 小物のみ
+  Kick/Hat/PercEnv（Ph2a）＋ Random/TuringMachine/Clap/Saturator/Bitcrusher/DelayFx/ReverbFx/VinylNoiseFx/
+  WowFlutterFx（Ph2b。合成ドラム・lofi FX はサンプル不使用）。依存は dsp と `libs/synth` の lock-free 小物のみ
   （Voice/SynthEngine/NoteQueue には依存しない）。
-- **apps/modular**（`run-modular`）: `patch.zig` の `LofiPatch`（固定の自己生成パッチを 1 回構築し RT で
+- **lofi FX dsp**（`src/dsp`）: Bitcrush（bit/SR 低減）/ VinylNoise（crackle+hiss）/ WowFlutter（可変 delay の
+  ピッチ揺れ）。既存 DelayLine/Reverb/softClip も FX wrapper module から利用。
+- **apps/modular**（`run-modular`）: `patch.zig` の `LofiPatch`（自己生成パッチを 1 回構築し RT で
   `graph.processBlock`）＋ `main.zig`（window+audio+harness probe）。`LofiPatch` は graph が各モジュールへの
   ctx ポインタを保持する自己参照のため**ヒープ確保しムーブしない**（`create`/`destroy`）。
+  自己進化は in-graph CV のみ（TuringMachine→Quantizer でベース旋律が lock しつつ稀に変異、Random→VCF cutoff）。
+  全 RNG fixed seed で決定的。harness `modular` probe が生成状態（bpm/density/turing_register/bass_pitch/active）を公開。
 
 ```bash
 zig build run-modular          # lofi 生成パッチを再生（ESC で終了。-Dplatform で backend 切替）

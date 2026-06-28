@@ -36,8 +36,17 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
 
 fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    const playing: []const u8 = if (app.patch != null) "true" else "false";
-    return std.fmt.bufPrint(buf, "{{\"playing\":{s},\"bpm\":122,\"tracks\":[\"kick\",\"hat\",\"bass\"]}}", .{playing}) catch buf[0..0];
+    const p = app.patch orelse return std.fmt.bufPrint(buf, "{{\"playing\":false}}", .{}) catch buf[0..0];
+    const st = p.snapshotState(); // best-effort（RT 更新中の torn 可）
+    return std.fmt.bufPrint(buf, "{{\"playing\":true,\"bpm\":{d:.0},\"clock_phase\":{d:.3},\"density\":{d:.3}," ++
+        "\"bass_pitch_cv\":{d:.4},\"turing_register\":{d},\"turing_cv\":{d:.4}," ++
+        "\"steps\":{{\"kick\":{d},\"hat\":{d},\"clap\":{d},\"bass\":{d}}}," ++
+        "\"active\":{{\"kick\":{},\"hat\":{},\"clap\":{}}}," ++
+        "\"tracks\":[\"kick\",\"hat\",\"clap\",\"bass\"]}}", .{
+        st.bpm, st.clock_phase, st.density, st.bass_pitch_cv, st.turing_register, st.turing_cv,
+        st.kick_step, st.hat_step, st.clap_step, st.bass_step,
+        st.kick_active, st.hat_active, st.clap_active,
+    }) catch buf[0..0];
 }
 
 fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

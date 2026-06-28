@@ -357,6 +357,8 @@ pub const Quantizer = struct {
     octaves: u8 = 2,
     /// 入力未接続時に使う固定 cv（最小 bass 用の一定音）。
     input_cv: f32 = 0.0,
+    /// 直近に出力した pitch_cv（harness introspection 用。best-effort）。
+    last_out: f32 = 0.0,
 
     const in_kinds = [_]PortKind{.cv};
     const out_kinds = [_]PortKind{.cv};
@@ -388,7 +390,9 @@ pub const Quantizer = struct {
         const octave: i32 = @intCast(di / len);
         const degree: i32 = ds[di % len];
         const semitones: i32 = self.root_semitone + octave * 12 + degree;
-        io.outputs[0] = @as(f32, @floatFromInt(semitones)) / 12.0;
+        const pitch_cv = @as(f32, @floatFromInt(semitones)) / 12.0;
+        self.last_out = pitch_cv;
+        io.outputs[0] = pitch_cv;
     }
 };
 
@@ -560,6 +564,301 @@ pub const PercEnv = struct {
         self.level *= self.k;
         if (self.level < done_eps) self.active = false;
         io.outputs[0] = lvl;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Random: gate(in0=trigger) -> cv(out0)。trigger ごとに乱数を S&H（fixed seed で決定的）。
+// ----------------------------------------------------------------------------
+pub const Random = struct {
+    noise: dsp.Noise = .{ .state = 0x52414E44 }, // "RAND"
+    prev_gate: bool = false,
+    held: f32 = 0.0,
+    min: f32 = 0.0,
+    max: f32 = 1.0,
+
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *Random) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Random = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) {
+            const u = (self.noise.next() + 1.0) * 0.5; // 0..1
+            var lo = if (std.math.isFinite(self.min)) self.min else 0.0;
+            var hi = if (std.math.isFinite(self.max)) self.max else 1.0;
+            if (hi < lo) {
+                const t = lo;
+                lo = hi;
+                hi = t;
+            }
+            self.held = lo + (hi - lo) * u;
+        }
+        self.prev_gate = g;
+        io.outputs[0] = self.held;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// TuringMachine: gate(in0=clock) -> cv(out0)。N ビットのシフトレジスタを回し、lock 確率で
+// 前パターンを loop、(1-lock) で新ビットを 1 個だけ注入する。「同じだが少しずつ変わる」生成核。
+// register 自体が anchor(ループ)で、稀に anchor_register へ復帰し迷子を防ぐ。fixed seed で決定的。
+// ----------------------------------------------------------------------------
+pub const TuringMachine = struct {
+    noise: dsp.Noise = .{ .state = 0x5455524E }, // "TURN"
+    bits: u8 = 8,
+    register: u32 = 0xB5, // 初期パターン（非ゼロ）
+    anchor_register: u32 = 0xB5,
+    lock: f32 = 0.93, // 0.85..0.98 に clamp。高いほど反復的
+    last_cv: f32 = 0.0,
+    prev_gate: bool = false,
+    edge_count: u32 = 0,
+    anchor_period: u32 = 64,
+    anchor_return_prob: f32 = 0.04,
+
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *TuringMachine) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *TuringMachine = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) {
+            const bits: u5 = @intCast(std.math.clamp(self.bits, 1, 16));
+            const mask: u32 = (@as(u32, 1) << bits) - 1;
+            const lock = std.math.clamp(self.lock, 0.85, 0.98);
+            const top: u32 = (self.register >> (bits - 1)) & 1; // 押し出されるビット
+            const r = (self.noise.next() + 1.0) * 0.5; // 0..1
+            // lock なら loop（top を再注入）、そうでなければ新ビットを 1 個注入
+            const new_bit: u32 = if (r < lock)
+                top
+            else if ((self.noise.next() + 1.0) * 0.5 < 0.5) @as(u32, 1) else 0;
+            self.register = ((self.register << 1) | new_bit) & mask;
+            self.edge_count += 1;
+            if (self.anchor_period != 0 and self.edge_count % self.anchor_period == 0) {
+                const ar = (self.noise.next() + 1.0) * 0.5;
+                if (ar < std.math.clamp(self.anchor_return_prob, 0.0, 1.0)) self.register = self.anchor_register & mask;
+            }
+            const denom: f32 = @floatFromInt(if (mask == 0) 1 else mask);
+            self.last_cv = @as(f32, @floatFromInt(self.register)) / denom;
+        }
+        self.prev_gate = g;
+        io.outputs[0] = self.last_cv;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Clap: gate(in0=trigger) -> audio(out0)。複数の短いノイズバースト + 軽い tone（サンプル不使用）。
+// バースト形状は線形（@exp を毎サンプル走らせない）、全体のテイルは乗算式減衰。fixed seed。
+// ----------------------------------------------------------------------------
+pub const Clap = struct {
+    noise: dsp.Noise = .{ .state = 0x434C4150 }, // "CLAP"
+    tone: dsp.Oscillator = .{ .waveform = .triangle },
+    hp: dsp.Filter = .{},
+    bp: dsp.Filter = .{},
+    prev_gate: bool = false,
+    active: bool = false,
+    age: u32 = 0,
+    amp: f32 = 0.0,
+    amp_k: f32 = 0.0,
+    gain: f32 = 0.35,
+    tone_hz: f32 = 180.0,
+    tone_gain: f32 = 0.06,
+    decay: f32 = 0.12,
+    hp_cutoff: f32 = 1200.0,
+    bp_cutoff: f32 = 1800.0,
+    bp_q: f32 = 1.0,
+    coeffs_sr: f32 = -1.0,
+
+    const done_eps: f32 = 1e-4;
+    const in_kinds = [_]PortKind{.gate};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *Clap) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    /// 3 つの素早いバースト（線形立ち下がり）。手拍子の「パパッ」を作る。
+    fn burstShape(t_ms: f32) f32 {
+        const centers = [_]f32{ 0.0, 10.0, 20.0 };
+        const burst_len: f32 = 6.0; // ms
+        var b: f32 = 0;
+        for (centers) |c| {
+            const d = t_ms - c;
+            if (d >= 0 and d < burst_len) b = @max(b, 1.0 - d / burst_len);
+        }
+        return b;
+    }
+
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *Clap = @ptrCast(@alignCast(ctx));
+        if (self.coeffs_sr == sr) return;
+        self.amp_k = decayCoef(self.decay, sr);
+        self.hp.sample_rate = sr;
+        self.hp.setMode(.highpass);
+        self.hp.setParams(self.hp_cutoff, 0.707);
+        self.bp.sample_rate = sr;
+        self.bp.setMode(.bandpass);
+        self.bp.setParams(self.bp_cutoff, self.bp_q);
+        self.coeffs_sr = sr;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Clap = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        if (g and !self.prev_gate) {
+            self.active = true;
+            self.amp = 1.0;
+            self.age = 0;
+        }
+        self.prev_gate = g;
+        if (!self.active) {
+            io.outputs[0] = 0;
+            return;
+        }
+        const t_ms = @as(f32, @floatFromInt(self.age)) / io.sample_rate * 1000.0;
+        const burst = burstShape(t_ms);
+        const n = self.bp.process(self.hp.process(self.noise.next()));
+        const tn = self.tone.next(self.tone_hz, io.sample_rate) * self.tone_gain;
+        const out = (n * burst + tn) * self.amp * self.gain;
+        self.amp *= self.amp_k;
+        self.age += 1;
+        if (self.amp < done_eps) self.active = false;
+        io.outputs[0] = out;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// lofi FX wrapper（audio in0 -> audio out0）。内部 dsp プリミティブを包む。
+// feedback/wet/drive は clamp し、process は finite ガード + 軽量算術のみ（重い係数は updateParams）。
+// ----------------------------------------------------------------------------
+pub const Saturator = struct {
+    drive: f32 = 1.4,
+    post_gain: f32 = 0.8,
+    const in_kinds = [_]PortKind{.audio};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+    pub fn spec(self: *Saturator) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Saturator = @ptrCast(@alignCast(ctx));
+        const x = io.inputs[0];
+        const out = dsp.softClip(x * self.drive) * self.post_gain;
+        io.outputs[0] = if (std.math.isFinite(out)) out else 0.0;
+    }
+};
+
+pub const Bitcrusher = struct {
+    bc: dsp.Bitcrush = .{},
+    const in_kinds = [_]PortKind{.audio};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+    pub fn spec(self: *Bitcrusher) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Bitcrusher = @ptrCast(@alignCast(ctx));
+        io.outputs[0] = self.bc.process(io.inputs[0]);
+    }
+};
+
+pub const DelayFx = struct {
+    line: dsp.DelayLine(65536) = .{}, // 最大 ~1.36s @48k
+    delay_ms: f32 = 375.0,
+    feedback: f32 = 0.35,
+    wet: f32 = 0.2,
+    const cap_f: f32 = 65536 - 1;
+    const in_kinds = [_]PortKind{.audio};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+    pub fn spec(self: *DelayFx) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *DelayFx = @ptrCast(@alignCast(ctx));
+        const x = if (std.math.isFinite(io.inputs[0])) io.inputs[0] else 0.0;
+        const ds = std.math.clamp(self.delay_ms * io.sample_rate / 1000.0, 1.0, cap_f);
+        const d = self.line.readAt(ds);
+        const fb = std.math.clamp(self.feedback, 0.0, 0.92);
+        self.line.write(x + d * fb);
+        const w = std.math.clamp(self.wet, 0.0, 0.8);
+        const out = x * (1.0 - w) + d * w;
+        io.outputs[0] = if (std.math.isFinite(out)) out else 0.0;
+    }
+};
+
+pub const ReverbFx = struct {
+    rev: dsp.Reverb = .{},
+    decay: f32 = 0.6,
+    damping: f32 = 0.3,
+    wet: f32 = 0.12,
+    coeffs_sr: f32 = -1.0,
+    ready: bool = false, // dsp.Reverb の tap 長は setSampleRate 前は undefined。未初期化なら dry を返す
+    const in_kinds = [_]PortKind{.audio};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+    pub fn spec(self: *ReverbFx) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *ReverbFx = @ptrCast(@alignCast(ctx));
+        if (self.coeffs_sr != sr) { // タップ長(sr 依存)は sr 変化時のみ
+            self.rev.setSampleRate(sr);
+            self.coeffs_sr = sr;
+            self.ready = true;
+        }
+        self.rev.setParams(self.decay, self.damping); // 軽量（tan なし）
+    }
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *ReverbFx = @ptrCast(@alignCast(ctx));
+        const x = if (std.math.isFinite(io.inputs[0])) io.inputs[0] else 0.0;
+        if (!self.ready) { // updateParams 前の direct process でも未定義 tap を読まない
+            io.outputs[0] = x;
+            return;
+        }
+        const wetv = self.rev.processSample(0, x);
+        const w = std.math.clamp(self.wet, 0.0, 0.8);
+        const out = x * (1.0 - w) + wetv * w;
+        io.outputs[0] = if (std.math.isFinite(out)) out else 0.0;
+    }
+};
+
+pub const VinylNoiseFx = struct {
+    vn: dsp.VinylNoise = .{},
+    const in_kinds = [_]PortKind{.audio};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+    pub fn spec(self: *VinylNoiseFx) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *VinylNoiseFx = @ptrCast(@alignCast(ctx));
+        io.outputs[0] = self.vn.process(io.inputs[0]);
+    }
+};
+
+pub const WowFlutterFx = struct {
+    wf: dsp.WowFlutter = .{},
+    const in_kinds = [_]PortKind{.audio};
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+    pub fn spec(self: *WowFlutterFx) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *WowFlutterFx = @ptrCast(@alignCast(ctx));
+        io.outputs[0] = self.wf.process(io.inputs[0], io.sample_rate);
     }
 };
 
@@ -840,4 +1139,109 @@ test "PercEnv: trigger -> 1.0 then exponential decay to ~0" {
         prev = out[0];
     }
     try testing.expect(out[0] < 0.01); // 減衰しきった
+}
+
+test "Random: S&H changes only on trigger; range 0..1; deterministic" {
+    var a = Random{};
+    var b = Random{};
+    var oa: [1]f32 = undefined;
+    var ob: [1]f32 = undefined;
+    drive(&Random.vtable, &a, &.{1.0}, &.{true}, &oa, 48000);
+    drive(&Random.vtable, &b, &.{1.0}, &.{true}, &ob, 48000);
+    try testing.expectEqual(oa[0], ob[0]); // 決定的
+    const first = oa[0];
+    try testing.expect(first >= 0.0 and first <= 1.0);
+    drive(&Random.vtable, &a, &.{0.0}, &.{true}, &oa, 48000); // gate low → hold
+    try testing.expectEqual(first, oa[0]);
+    var changed = false;
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        drive(&Random.vtable, &a, &.{0.0}, &.{true}, &oa, 48000);
+        drive(&Random.vtable, &a, &.{1.0}, &.{true}, &oa, 48000); // rising
+        if (oa[0] != first) changed = true;
+    }
+    try testing.expect(changed);
+}
+
+test "TuringMachine: evolves (not constant) yet bounded and deterministic" {
+    var a = TuringMachine{ .lock = 0.9 };
+    var b = TuringMachine{ .lock = 0.9 };
+    var oa: [1]f32 = undefined;
+    var ob: [1]f32 = undefined;
+    var seen: [128]f32 = undefined;
+    var nseen: usize = 0;
+    var i: u32 = 0;
+    while (i < 500) : (i += 1) {
+        drive(&TuringMachine.vtable, &a, &.{1.0}, &.{true}, &oa, 48000); // rising
+        drive(&TuringMachine.vtable, &b, &.{1.0}, &.{true}, &ob, 48000);
+        try testing.expect(oa[0] >= 0.0 and oa[0] <= 1.0); // 有界
+        try testing.expectEqual(oa[0], ob[0]); // 決定的
+        var found = false;
+        for (seen[0..nseen]) |v| {
+            if (v == oa[0]) found = true;
+        }
+        if (!found and nseen < seen.len) {
+            seen[nseen] = oa[0];
+            nseen += 1;
+        }
+        drive(&TuringMachine.vtable, &a, &.{0.0}, &.{true}, &oa, 48000); // falling
+        drive(&TuringMachine.vtable, &b, &.{0.0}, &.{true}, &ob, 48000);
+    }
+    try testing.expect(nseen >= 3); // 一定値に収束しない
+}
+
+test "Clap: trigger sounds then decays; finite; deterministic (fixed seed)" {
+    var a = Clap{};
+    var b = Clap{};
+    Clap.updateParams(&a, 48000);
+    Clap.updateParams(&b, 48000);
+    var oa: [1]f32 = undefined;
+    var ob: [1]f32 = undefined;
+    drive(&Clap.vtable, &a, &.{1.0}, &.{true}, &oa, 48000);
+    drive(&Clap.vtable, &b, &.{1.0}, &.{true}, &ob, 48000);
+    var peak: f32 = @abs(oa[0]);
+    var i: u32 = 0;
+    while (i < 24000) : (i += 1) {
+        drive(&Clap.vtable, &a, &.{0.0}, &.{true}, &oa, 48000);
+        drive(&Clap.vtable, &b, &.{0.0}, &.{true}, &ob, 48000);
+        try testing.expect(std.math.isFinite(oa[0]));
+        try testing.expectEqual(oa[0], ob[0]);
+        peak = @max(peak, @abs(oa[0]));
+    }
+    try testing.expect(peak > 0.001);
+    try testing.expect(@abs(oa[0]) < peak * 0.2);
+}
+
+test "FX wrappers: audio in/out stays finite (Saturator/Bitcrusher/Delay/Reverb/Vinyl/WowFlutter)" {
+    var sat = Saturator{};
+    var bit = Bitcrusher{};
+    var dl = DelayFx{};
+    var rv = ReverbFx{};
+    var vn = VinylNoiseFx{};
+    var wf = WowFlutterFx{};
+    ReverbFx.updateParams(&rv, 48000); // タップ初期化
+    var o: [1]f32 = undefined;
+    var i: u32 = 0;
+    while (i < 5000) : (i += 1) {
+        const x = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.8;
+        drive(&Saturator.vtable, &sat, &.{x}, &.{true}, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]) and @abs(o[0]) <= 1.0);
+        drive(&Bitcrusher.vtable, &bit, &.{x}, &.{true}, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+        drive(&DelayFx.vtable, &dl, &.{x}, &.{true}, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+        drive(&ReverbFx.vtable, &rv, &.{x}, &.{true}, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+        drive(&VinylNoiseFx.vtable, &vn, &.{x}, &.{true}, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+        drive(&WowFlutterFx.vtable, &wf, &.{x}, &.{true}, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+    }
+}
+
+test "ReverbFx: process before updateParams returns dry (no undefined tap read)" {
+    var rv = ReverbFx{}; // updateParams 未呼び出し → ready=false
+    var o: [1]f32 = undefined;
+    drive(&ReverbFx.vtable, &rv, &.{0.7}, &.{true}, &o, 48000);
+    try testing.expectEqual(@as(f32, 0.7), o[0]); // dry passthrough（未定義 tap を読まない）
 }

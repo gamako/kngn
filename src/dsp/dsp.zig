@@ -13,6 +13,9 @@ const noise_mod = @import("noise.zig");
 const delay_mod = @import("delay.zig");
 const distortion_mod = @import("distortion.zig");
 const reverb_mod = @import("reverb.zig");
+const bitcrush_mod = @import("bitcrush.zig");
+const vinyl_mod = @import("vinyl_noise.zig");
+const wow_flutter_mod = @import("wow_flutter.zig");
 
 pub const Waveform = oscillator.Waveform;
 pub const Oscillator = oscillator.Oscillator;
@@ -22,6 +25,11 @@ pub const Noise = noise_mod.Noise;
 pub const DelayLine = delay_mod.DelayLine;
 pub const softClip = distortion_mod.softClip;
 pub const Reverb = reverb_mod.Reverb;
+
+// lofi FX プリミティブ（TASK-40.2.2）
+pub const Bitcrush = bitcrush_mod.Bitcrush;
+pub const VinylNoise = vinyl_mod.VinylNoise;
+pub const WowFlutter = wow_flutter_mod.WowFlutter;
 
 pub const Envelope = envelope.Envelope;
 
@@ -54,4 +62,7 @@ test {
     _ = delay_mod;
     _ = distortion_mod;
     _ = reverb_mod;
+    _ = bitcrush_mod;
+    _ = vinyl_mod;
+    _ = wow_flutter_mod;
 }

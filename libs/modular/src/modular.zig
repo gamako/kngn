@@ -33,6 +33,17 @@ pub const Kick = modules.Kick;
 pub const Hat = modules.Hat;
 pub const PercEnv = modules.PercEnv;
 
+// Ph2b: 自己進化 CV / Clap / lofi FX
+pub const Random = modules.Random;
+pub const TuringMachine = modules.TuringMachine;
+pub const Clap = modules.Clap;
+pub const Saturator = modules.Saturator;
+pub const Bitcrusher = modules.Bitcrusher;
+pub const DelayFx = modules.DelayFx;
+pub const ReverbFx = modules.ReverbFx;
+pub const VinylNoiseFx = modules.VinylNoiseFx;
+pub const WowFlutterFx = modules.WowFlutterFx;
+
 test {
     // サブモジュールの単体テストを巻き込む。
     _ = signal;
