@@ -74,10 +74,10 @@ pub const LofiPatch = struct {
         self.* = .{
             .allocator = allocator,
             .graph = undefined,
-            // ~122 BPM, 16分音符 tick（ppqn=4）。swing で裏を少し遅らせてグルーヴを出す
-            .clock = .{ .bpm = 122, .ppqn = 4, .swing = 0.15 },
-            .kick_eu = .{ .steps = 16, .pulses = 4, .rotation = 0 }, // 4 つ打ち
-            .hat_eu = .{ .steps = 16, .pulses = 8, .rotation = 1 }, // 裏拍 8 分ハット
+            // ~122 BPM, 16分音符 tick（ppqn=4）。まずタイトに（swing は chunk B のスライダで耳で詰める）
+            .clock = .{ .bpm = 122, .ppqn = 4, .swing = 0.0 },
+            .kick_eu = .{ .steps = 16, .pulses = 4, .rotation = 0 }, // 4 つ打ち（step 0,4,8,12）
+            .hat_eu = .{ .steps = 16, .pulses = 4, .rotation = 2 }, // 裏拍 8 分ハット（step 2,6,10,14＝キックの合間）
             .clap_eu = .{ .steps = 16, .pulses = 2, .rotation = 4 }, // 2・4 拍寄りのクラップ（疎）
             .bass_div = .{ .div = 4 }, // 16分→4分
             .bass_eu = .{ .steps = 4, .pulses = 3, .rotation = 0 }, // 1 小節に 3 音（疎）
