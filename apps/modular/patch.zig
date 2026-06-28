@@ -53,8 +53,10 @@ pub const LofiPatch = struct {
     filter_random: modular.Random,
     vcf: modular.Vcf,
     vca: modular.Vca,
-    // mix
-    mixer: modular.Mixer,
+    // mix（kick は素通し / 非kick は sidechain でダッキング）
+    nonkick_mixer: modular.Mixer,
+    sidechain: modular.Sidechain,
+    master_mixer: modular.Mixer,
     // lofi FX チェーン
     saturator: modular.Saturator,
     bitcrusher: modular.Bitcrusher,
@@ -72,8 +74,8 @@ pub const LofiPatch = struct {
         self.* = .{
             .allocator = allocator,
             .graph = undefined,
-            // ~122 BPM, 16分音符 tick（ppqn=4）
-            .clock = .{ .bpm = 122, .ppqn = 4 },
+            // ~122 BPM, 16分音符 tick（ppqn=4）。swing で裏を少し遅らせてグルーヴを出す
+            .clock = .{ .bpm = 122, .ppqn = 4, .swing = 0.15 },
             .kick_eu = .{ .steps = 16, .pulses = 4, .rotation = 0 }, // 4 つ打ち
             .hat_eu = .{ .steps = 16, .pulses = 8, .rotation = 1 }, // 裏拍 8 分ハット
             .clap_eu = .{ .steps = 16, .pulses = 2, .rotation = 4 }, // 2・4 拍寄りのクラップ（疎）
@@ -90,7 +92,9 @@ pub const LofiPatch = struct {
             .filter_random = .{ .min = -0.5, .max = 0.5 }, // cutoff を ±0.5oct 揺らす
             .vcf = .{ .cutoff = 600, .resonance = 0.9, .mode = .lowpass, .mod_octaves = 1.0 },
             .vca = .{ .gain = 0.7 },
-            .mixer = .{ .gain = 0.9 },
+            .nonkick_mixer = .{ .gain = 0.9 },
+            .sidechain = .{ .amount = 0.35, .release = 0.18 }, // キックで非kickをポンプ
+            .master_mixer = .{ .gain = 0.9 },
             .saturator = .{ .drive = 1.4, .post_gain = 1.0 },
             .bitcrusher = .{ .bc = .{ .bit_depth = 10, .hold_samples = 2, .wet = 0.6 } },
             .delay_fx = .{ .delay_ms = 333.0, .feedback = 0.32, .wet = 0.18 },
@@ -100,7 +104,7 @@ pub const LofiPatch = struct {
             .output = .{ .gain = 1.0, .pan = 0.0, .soft_clip = true },
         };
 
-        self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 32, .max_ports = 48 });
+        self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 40, .max_ports = 64 });
         errdefer self.graph.deinit();
         try self.wire();
         return self;
@@ -131,7 +135,9 @@ pub const LofiPatch = struct {
         const n_filter_random = try g.addModule(self.filter_random.spec());
         const n_vcf = try g.addModule(self.vcf.spec());
         const n_vca = try g.addModule(self.vca.spec());
-        const n_mixer = try g.addModule(self.mixer.spec());
+        const n_nonkick = try g.addModule(self.nonkick_mixer.spec());
+        const n_sidechain = try g.addModule(self.sidechain.spec());
+        const n_master = try g.addModule(self.master_mixer.spec());
         const n_sat = try g.addModule(self.saturator.spec());
         const n_bit = try g.addModule(self.bitcrusher.spec());
         const n_delay = try g.addModule(self.delay_fx.spec());
@@ -161,13 +167,16 @@ pub const LofiPatch = struct {
         try g.connect(n_filter_random, 0, n_vcf, 1); // VCF.cutoff_cv
         try g.connect(n_vcf, 0, n_vca, 0); // VCA.audio
         try g.connect(n_bass_perc, 0, n_vca, 1); // VCA.gain_cv
-        // mix（kick/hat/clap/bass の 4 入力）
-        try g.connect(n_kick, 0, n_mixer, 0);
-        try g.connect(n_hat, 0, n_mixer, 1);
-        try g.connect(n_clap, 0, n_mixer, 2);
-        try g.connect(n_vca, 0, n_mixer, 3);
+        // mix: 非kick(hat/clap/bass)を Sidechain でダッキングし、kick は素通しで master に合流
+        try g.connect(n_hat, 0, n_nonkick, 0);
+        try g.connect(n_clap, 0, n_nonkick, 1);
+        try g.connect(n_vca, 0, n_nonkick, 2);
+        try g.connect(n_nonkick, 0, n_sidechain, 0); // audio
+        try g.connect(n_kick_eu, 0, n_sidechain, 1); // trigger = kick の Euclid（fan-out）
+        try g.connect(n_kick, 0, n_master, 0);
+        try g.connect(n_sidechain, 0, n_master, 1);
         // lofi FX チェーン
-        try g.connect(n_mixer, 0, n_sat, 0);
+        try g.connect(n_master, 0, n_sat, 0);
         try g.connect(n_sat, 0, n_bit, 0);
         try g.connect(n_bit, 0, n_delay, 0);
         try g.connect(n_delay, 0, n_reverb, 0);

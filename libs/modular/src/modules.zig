@@ -232,8 +232,12 @@ pub const Output = struct {
 pub const Clock = struct {
     bpm: f32 = 120.0,
     ppqn: u32 = 4,
+    /// スウィング量 0..1。裏(奇数 tick)を遅らせる。0 で従来と完全一致（bit 決定的）。
+    swing: f32 = 0.0,
     phase_samples: f64 = 0,
     samples_per_tick: f64 = 0,
+    cur_interval: f64 = 0, // 直近 tick から次 tick までの間隔（swing で交互に伸縮）
+    tick_index: u64 = 0,
     started: bool = false,
 
     const out_kinds = [_]PortKind{.gate};
@@ -250,6 +254,14 @@ pub const Clock = struct {
         self.samples_per_tick = @as(f64, sample_rate) * 60.0 / (bpm * ppqn);
     }
 
+    /// tick i を出した直後の「次 tick までの間隔」。偶数→奇数は伸ばし、奇数→偶数は縮める（小節長は保つ）。
+    /// swing=0 では delay=0.0 → 常に samples_per_tick（従来と完全一致）。
+    fn intervalAfter(self: *const Clock, i: u64) f64 {
+        const sw: f64 = if (std.math.isFinite(self.swing)) std.math.clamp(self.swing, 0.0, 1.0) else 0.0;
+        const delay = sw * self.samples_per_tick * 0.5;
+        return if (i & 1 == 0) self.samples_per_tick + delay else self.samples_per_tick - delay;
+    }
+
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Clock = @ptrCast(@alignCast(ctx));
         if (self.samples_per_tick <= 0) { // updateParams 未実行の保険
@@ -260,11 +272,15 @@ pub const Clock = struct {
         if (!self.started) {
             self.started = true;
             self.phase_samples = 0;
+            self.tick_index = 0;
+            self.cur_interval = self.intervalAfter(0);
             trig = 1.0; // 初回 tick
         } else {
             self.phase_samples += 1.0;
-            if (self.phase_samples >= self.samples_per_tick) {
-                self.phase_samples -= self.samples_per_tick; // 端数を保持（fractional tick 対応）
+            if (self.phase_samples >= self.cur_interval) {
+                self.phase_samples -= self.cur_interval; // 端数を保持
+                self.tick_index += 1;
+                self.cur_interval = self.intervalAfter(self.tick_index);
                 trig = 1.0;
             }
         }
@@ -862,6 +878,46 @@ pub const WowFlutterFx = struct {
     }
 };
 
+// ----------------------------------------------------------------------------
+// Sidechain: audio(in0) を gate(in1=トリガ)でダッキング（テクノの「ポンプ」）。
+// trigger で env=1、amount 深さで瞬間的に gain を下げ指数回復。amount=0 で恒等（passthrough）。
+// ----------------------------------------------------------------------------
+pub const Sidechain = struct {
+    amount: f32 = 0.0,
+    release: f32 = 0.18,
+    env: f32 = 0.0,
+    k: f32 = 0.0,
+    prev_gate: bool = false,
+    applied_sr: f32 = -1.0,
+
+    const in_kinds = [_]PortKind{ .audio, .gate };
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *Sidechain) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sr: f32) void {
+        const self: *Sidechain = @ptrCast(@alignCast(ctx));
+        if (self.applied_sr == sr) return;
+        self.k = decayCoef(self.release, sr);
+        self.applied_sr = sr;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Sidechain = @ptrCast(@alignCast(ctx));
+        const x = if (std.math.isFinite(io.inputs[0])) io.inputs[0] else 0.0;
+        const g = signal.gateHigh(io.inputs[1]);
+        if (g and !self.prev_gate) self.env = 1.0;
+        self.prev_gate = g;
+        const amt = if (std.math.isFinite(self.amount)) std.math.clamp(self.amount, 0.0, 1.0) else 0.0;
+        const duck = std.math.clamp(self.env * amt, 0.0, 0.95); // amt=0 → duck=0 → out=x（恒等）
+        io.outputs[0] = x * (1.0 - duck);
+        self.env *= self.k;
+    }
+};
+
 // ============================================================================
 // module-level tests（Io を手組みして process を直接駆動。display/graph 不要）
 // ============================================================================
@@ -1244,4 +1300,82 @@ test "ReverbFx: process before updateParams returns dry (no undefined tap read)"
     var o: [1]f32 = undefined;
     drive(&ReverbFx.vtable, &rv, &.{0.7}, &.{true}, &o, 48000);
     try testing.expectEqual(@as(f32, 0.7), o[0]); // dry passthrough（未定義 tap を読まない）
+}
+
+fn clockTrigIdx(clk: *Clock, comptime n: usize, span: u32) [n]u32 {
+    var idx: [n]u32 = [_]u32{0} ** n;
+    var got: usize = 0;
+    var out: [1]f32 = undefined;
+    var i: u32 = 0;
+    while (i < span and got < n) : (i += 1) {
+        drive(&Clock.vtable, clk, &[_]f32{}, &[_]bool{}, &out, 48000);
+        if (out[0] > 0.5) {
+            idx[got] = i;
+            got += 1;
+        }
+    }
+    return idx;
+}
+
+test "Clock: swing=0 keeps legacy tick positions (bit-identical)" {
+    var clk = Clock{ .bpm = 120, .ppqn = 4, .swing = 0 };
+    Clock.updateParams(&clk, 48000);
+    const idx = clockTrigIdx(&clk, 3, 13000);
+    try testing.expectEqual([_]u32{ 0, 6000, 12000 }, idx);
+}
+
+test "Clock: swing delays odd 16th while preserving pair duration" {
+    var clk = Clock{ .bpm = 120, .ppqn = 4, .swing = 0.5 };
+    Clock.updateParams(&clk, 48000); // spt=6000, delay=1500
+    const idx = clockTrigIdx(&clk, 4, 21000);
+    // 0, +7500(裏遅れ), +4500(=12000 ペア頭は元位置), +7500
+    try testing.expectEqual([_]u32{ 0, 7500, 12000, 19500 }, idx);
+}
+
+test "Clock: non-finite swing treated as 0" {
+    var clk = Clock{ .bpm = 120, .ppqn = 4, .swing = std.math.nan(f32) };
+    Clock.updateParams(&clk, 48000);
+    const idx = clockTrigIdx(&clk, 2, 8000);
+    try testing.expectEqual([_]u32{ 0, 6000 }, idx);
+}
+
+test "Sidechain: amount=0 passes through exactly" {
+    var sc = Sidechain{ .amount = 0.0 };
+    Sidechain.updateParams(&sc, 48000);
+    var o: [1]f32 = undefined;
+    drive(&Sidechain.vtable, &sc, &.{ 0.8, 1.0 }, &.{ true, true }, &o, 48000); // trigger でも恒等
+    try testing.expectEqual(@as(f32, 0.8), o[0]);
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        const x = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+        drive(&Sidechain.vtable, &sc, &.{ x, 0.0 }, &.{ true, true }, &o, 48000);
+        try testing.expectEqual(x, o[0]);
+    }
+}
+
+test "Sidechain: trigger ducks then recovers" {
+    var sc = Sidechain{ .amount = 0.8, .release = 0.05 };
+    Sidechain.updateParams(&sc, 48000);
+    var o: [1]f32 = undefined;
+    drive(&Sidechain.vtable, &sc, &.{ 1.0, 1.0 }, &.{ true, true }, &o, 48000); // rising → env=1
+    try testing.expect(o[0] < 0.5); // 1*(1-0.8)=0.2 へ大きく下がる
+    var last: f32 = o[0];
+    var i: u32 = 0;
+    while (i < 5000) : (i += 1) {
+        drive(&Sidechain.vtable, &sc, &.{ 1.0, 0.0 }, &.{ true, true }, &o, 48000);
+        last = o[0];
+    }
+    try testing.expect(last > 0.9); // 回復して ~1.0
+}
+
+test "Sidechain: finite under invalid amount/release" {
+    var sc = Sidechain{ .amount = std.math.nan(f32), .release = -1.0 };
+    Sidechain.updateParams(&sc, 48000);
+    var o: [1]f32 = undefined;
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        const trig: f32 = if (i % 10 == 0) 1.0 else 0.0;
+        drive(&Sidechain.vtable, &sc, &.{ 1.0, trig }, &.{ true, true }, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+    }
 }

@@ -43,6 +43,7 @@ pub const DelayFx = modules.DelayFx;
 pub const ReverbFx = modules.ReverbFx;
 pub const VinylNoiseFx = modules.VinylNoiseFx;
 pub const WowFlutterFx = modules.WowFlutterFx;
+pub const Sidechain = modules.Sidechain;
 
 test {
     // サブモジュールの単体テストを巻き込む。
