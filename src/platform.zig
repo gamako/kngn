@@ -3,7 +3,7 @@
 //! 複数バックエンド対応の Zig interface 層。`builtin.os.tag` で backend を選ぶ。
 //!   - macOS → `platform_macos.zig`（C ABI `platform.h` 経由。objc/swift/metal は .o リンクの差のみで Zig 側は共通）
 //!   - Linux → `platform_linux.zig`（X11/Wayland。純 Zig で `@cImport(Xlib)` 等を直接呼ぶ。x11/wayland は build_options.platform_backend で選ぶ）
-//!   - Windows → `platform_windows.zig`（Win32 + GDI。純 Zig で Win32 API を extern fn で直接呼ぶ。TASK-31）
+//!   - Windows → `platform_windows.zig`（dispatcher。純 Zig で Win32 API を extern fn で直接呼ぶ。gdi/d3d11 は build_options.platform_backend で選ぶ。TASK-31/35）
 //!
 //! 公開型（KeyCode / Event 等）は `platform_types.zig` を単一ソースとして re-export し、
 //! `Window`/`Framebuffer` と関数群だけを各 backend から re-export する。

@@ -13,12 +13,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target_os = target.result.os.tag;
 
-    // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11/wayland）。
+    // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）。
     // 省略時は OS のデフォルト。OS/backend 不整合は assertBackendForOs で build エラー。
     const platform_option = b.option(
         platform.PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows)",
+        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)",
     ) orelse platform.defaultBackend(target_os);
     platform.assertBackendForOs(platform_option, target_os);
 
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const example_modules = ExampleModules.init(b);
 
-    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows）
+    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
 
@@ -574,7 +574,7 @@ pub fn build(b: *std.Build) void {
 
 // ============================================================
 // exe / run-step 名: デフォルト backend は無印、他は "_<backend>" サフィックス
-// （macOS: objc=無印 / swift / metal, Linux: x11=無印）
+// （macOS: objc=無印 / swift / metal, Linux: x11=無印, Windows: gdi=無印 / d3d11）
 // ============================================================
 fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, default_be: platform.PlatformType) []const u8 {
     return if (be == default_be) base else b.fmt("{s}_{s}", .{ base, platform.backendName(be) });

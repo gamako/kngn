@@ -15,8 +15,9 @@ pub const PlatformType = enum {
     // Linux backends（純 Zig。x11 は TASK-28.2〜、wayland は TASK-28.5）
     x11,
     wayland,
-    // Windows backend（純 Zig。Win32 + GDI。TASK-31）
-    windows,
+    // Windows backends（純 Zig。gdi=GDI software blit/best-effort（TASK-31）、d3d11=D3D11-DXGI/1級（TASK-35））
+    gdi,
+    d3d11,
 };
 
 /// 当該 OS のデフォルト backend（`-Dplatform` 省略時に使う）。
@@ -24,7 +25,7 @@ pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
     return switch (os) {
         .macos => .objc,
         .linux => .x11,
-        .windows => .windows,
+        .windows => .gdi, // 当面 GDI 既定（d3d11 は opt-in。TASK-35）
         else => .objc, // 実際には build.zig 側の OS チェックで到達しない
     };
 }
@@ -36,7 +37,7 @@ pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     return switch (os) {
         .macos => &.{ .objc, .swift, .metal },
         .linux => &.{ .x11, .wayland },
-        .windows => &.{.windows},
+        .windows => &.{ .gdi, .d3d11 },
         else => &.{},
     };
 }
@@ -58,7 +59,7 @@ pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
     const valid = switch (os) {
         .macos => "objc / swift / metal",
         .linux => "x11 / wayland",
-        .windows => "windows",
+        .windows => "gdi / d3d11",
         else => "(なし)",
     };
     std.log.err(
@@ -227,15 +228,23 @@ pub fn setupExecutableForPlatform(
             exe.root_module.linkSystemLibrary("wayland-client", .{});
             exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
         },
-        .windows => {
-            // Windows backend（純 Zig）。platform_windows.zig が Win32 を extern fn で叩く
-            // （@cImport しない）。SDK/xcrun は不要で、zig 同梱の MinGW import lib が
-            // user32 / gdi32 / comdlg32 を解決する（kernel32 は zig が自動リンク）。
-            // libc は不要（std.os.windows と extern fn のみ）だが、他 OS と挙動を揃えるため有効化する。
+        .gdi, .d3d11 => {
+            // Windows backend（純 Zig）。platform_windows.zig（dispatcher）が Win32 を extern fn で叩く
+            // （@cImport しない）。SDK/xcrun は不要で、zig 同梱の MinGW import lib が link を解決する
+            // （kernel32 は zig が自動リンク）。libc は不要（std.os.windows と extern fn のみ）だが、
+            // 他 OS と挙動を揃えるため有効化する。共通の window/入力/dialog は user32 / comdlg32。
             exe.root_module.link_libc = true;
             exe.root_module.linkSystemLibrary("user32", .{}); // CreateWindowExW / メッセージポンプ / 入力
-            exe.root_module.linkSystemLibrary("gdi32", .{}); // StretchDIBits / BITMAPINFO blit
             exe.root_module.linkSystemLibrary("comdlg32", .{}); // GetSaveFileNameW / GetOpenFileNameW
+            switch (platform_type) {
+                // GDI: software blit（StretchDIBits / BITMAPINFO）。
+                .gdi => exe.root_module.linkSystemLibrary("gdi32", .{}),
+                // D3D11-DXGI: GPU upload path。named export は d3d11.dll の D3D11CreateDeviceAndSwapChain
+                // のみ（swap chain / DXGI は d3d11 が生成した COM の vtbl 経由でしか触らないので dxgi.dll の
+                // import は不要）。gdi32 も不要。
+                .d3d11 => exe.root_module.linkSystemLibrary("d3d11", .{}),
+                else => unreachable,
+            }
             // GUI アプリとして Windows subsystem にする（既定の console subsystem だと起動時に
             // コンソール窓が出る）。コンソール出力が本体のツール（例: example_06 ベンチ）は
             // caller 側で .Console に上書きする。std.debug.print はコンソール非接続時 no-op になる。
@@ -304,7 +313,7 @@ pub fn buildStandalone(
     const platform_option = b.option(
         PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows)",
+        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)",
     ) orelse defaultBackend(target_os);
     assertBackendForOs(platform_option, target_os);
 
@@ -436,7 +445,7 @@ pub fn compilePlatformLayer(
         .metal => buildMetal(b, optimize, platform_root),
         // Linux / Windows backend は純 Zig で .o コンパイル不要。setupExecutableForPlatform の
         // macOS 分岐からのみ呼ばれるため、ここには到達しない。
-        .x11, .wayland, .windows => unreachable,
+        .x11, .wayland, .gdi, .d3d11 => unreachable,
     };
 }
 
