@@ -62,7 +62,7 @@
 
 | tier | backend | tearing 回避 | frame pacing（fifo） | 低 jitter / frame latency 制御 | 備考 |
 |---|---|---|---|---|---|
-| **1級** | macOS Metal | 保証対象 | 保証対象 | 目標 | follow-up で 1級化（drawable/inflight） |
+| **1級** | macOS Metal | 保証対象 | 保証対象 | 目標 | TASK-36 で 1級化済み（triple slot + inflight semaphore） |
 | **1級** | Windows D3D11-DXGI | 保証対象 | 保証対象 | 目標 | 未実装。GDI から移行（follow-up） |
 | **1級** | Linux Wayland | compositor が保証 | frame callback 律速で実現済み | compositor 依存 | 既に frame availability を実装済み |
 | **best-effort** | macOS CALayer（objc/swift） | WindowServer 任せ（実質出ない） | 非保証 | 非保証 | CADisplayLink は裏で回るが明示契約なし |
@@ -151,18 +151,27 @@ vsync）律速で抑える実装で、**本 ADR の frame availability / frame s
 位置づける（`frame_timeout_secs` の fallback により callback 取りこぼし時も最低限復帰する）。Wayland は 1級 backend の
 fifo pacing を実質すでに満たしている。
 
-### Metal — 現状差分と 1級化の前提（AC#6 / AC#13）
+### Metal — 1級 frame pacing 契約への適合（AC#6 / AC#13。TASK-36 で実装済み）
 
-現状（`platform/macos-metal/platform_macos_metal.swift`）: `present()` で CPU framebuffer を texture へ転送し
-`commandBuffer.present(drawable)+commit` するが `waitUntilCompleted` せず、明示的な drawable / inflight buffer の
-pacing 契約がない。CAMetalLayerDrawable lifecycle 警告も残る（機能的には動作）。1級 backend にするには以下が前提
-（follow-up タスクで具体化）:
+旧状態（TASK-36 前）: `present()` で CPU framebuffer を texture へ転送し `commandBuffer.present(drawable)+commit`
+するが `waitUntilCompleted` せず、明示的な drawable / inflight buffer の pacing 契約がなく、`presentManual()` が
+`MTKView.draw(in:)` の外で `currentDrawable` を触るため CAMetalLayerDrawable lifecycle 警告が残っていた。
 
-- CAMetalLayerDrawable lifecycle 警告の解消。
-- drawable / command buffer / CPU framebuffer の **inflight ownership** の明確化（present 済み buffer を安全に
-  再利用する条件）。
-- fifo pacing（display sync / inflight semaphore 相当）の保証。
-- `lockFramebuffer() == null`（または将来の `beginFrame/waitFrame`）との対応付け。
+TASK-36 で `platform/macos-metal/platform_macos_metal.swift` を本契約へ適合させた:
+
+- **drawable lifecycle 警告の解消**: drawable / renderPassDescriptor の取得・present を MTKView の正規 draw
+  サイクル（`draw(in:)`）内だけに集約。手動描画は `present()`→`presentManual()` が `view.draw()` を起動して
+  `draw(in:)` を 1 回呼ぶ（manual mode は `isPaused = true`）。draw サイクル外で `currentDrawable` を触らない。
+- **inflight ownership の明確化**: CPU pixels + texture を **slotCount=3 の ring** で持ち、`DispatchSemaphore`
+  （value = slotCount-1 = 2）で最大 inflight を 2 に制限。present のたびに `wait()`、command buffer の
+  completion handler で `signal()`。present された slot は GPU 完了まで backend 所有。再利用安全は per-slot
+  フラグ無しで成立する（Metal 単一 command queue の in-order completion + semaphore による Apple 標準
+  triple-buffer idiom。詳細不変条件はソースのファイル冒頭コメント）。
+- **fifo pacing**: `commandBuffer.present(drawable)`（次 vsync 表示）+ `CAMetalLayer.displaySyncEnabled = true`
+  の明示 + 上記 inflight cap。busy loop でも display refresh（~60fps）に張り付く。
+- **`lockFramebuffer()` 対応**: non-null 互換を維持（slot は ring + semaphore で常に確保できる）。null による
+  frame availability gating / `beginFrame`・`waitFrame` / fatal 状態分離は本タスク対象外で、TASK-38 の
+  follow-up 方針（「Wait / Skip Policy」「Fatal State Policy」節）に委ねる。
 
 ### D3D11-DXGI — GDI からの移行先（AC#4 概要）
 
@@ -252,3 +261,4 @@ frame_index 進行条件」を変えないか、変えるなら harness の repl
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-27 | 初版（TASK-34）。support tier と frame pacing 契約を定義。ADR-004 を Supersede、ADR-002 を改訂。 |
+| 1.1 | 2026-06-28 | TASK-36。Metal backend を 1級 frame pacing 契約へ適合（triple slot + inflight semaphore / draw(in:) 集約で drawable 警告解消 / displaySyncEnabled 明示）。Support Tier 表と Metal 節を実装済みへ更新。 |

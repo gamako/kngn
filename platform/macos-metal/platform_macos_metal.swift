@@ -5,6 +5,35 @@ import MetalKit
 // 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
 //        FrameCallback typealias など) は bridging header (-import-objc-header
 //        platform/platform.h) 経由で C ヘッダから自動取得する。
+//
+// ========================================
+// 1級 frame pacing 契約（ADR-005 / TASK-36）
+// ========================================
+// この backend は ADR-005 の 1級 backend frame pacing 契約に適合する:
+//
+// - drawable lifecycle: drawable / renderPassDescriptor の取得・present は MTKView の正規 draw
+//   サイクル（draw(in:)）内だけで行う。手動描画は presentManual() が view.draw() を起動して
+//   draw(in:) を 1 回呼ぶ。draw サイクル外で currentDrawable を触らないので CAMetalLayerDrawable
+//   lifecycle 警告が出ない。
+//
+// - inflight ownership: CPU pixels + texture を slotCount(=3) の ring で持ち、DispatchSemaphore
+//   (value=slotCount-1=2) で最大 inflight を 2 に制限する。present のたびに wait()、command buffer
+//   の completion handler で signal()。present された slot は GPU 完了まで backend 所有。
+//
+// - 再利用安全の不変条件（per-slot フラグ無しで成立。Apple 標準 triple-buffer idiom）:
+//   API は「lockFramebuffer → caller が書込 → present(submit)」の順。slot k(=f%slotCount) の前回
+//   使用は f-slotCount。slot のテクスチャは present 内で texture.replace される直前に semaphore.wait()
+//   を通る。semaphore=slotCount-1 と Metal 単一 command queue の in-order completion により、wait()
+//   通過時には f-(slotCount-1) 以前が完了済み = slot k(前回使用 f-slotCount)は free。CPU バッファ自体は
+//   texture.replace が同期コピーなので present 後すぐ再利用可能。
+//   semaphore 値が slotCount-1 を超えると前回使用フレーム完了を保証できず hazard になる。
+//
+// - fifo pacing: commandBuffer.present(drawable)（次 vsync 表示）+ CAMetalLayer.displaySyncEnabled
+//   + 上記 inflight cap。busy loop でも ~60fps（display refresh）に張り付く。
+//
+// - lockFramebuffer() は non-null 互換を維持する（frame slot は ring + semaphore で常に確保できる）。
+//   null による frame availability gating / beginFrame・waitFrame / fatal 状態分離は本タスク対象外で、
+//   ADR-005 の follow-up 方針（TASK-38）に委ねる。
 let IMPLEMENTATION_TYPE = "Metal Optimized (Swift)"
 
 // ========================================
@@ -327,15 +356,23 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var callback: FrameCallback?
     private var userdata: UnsafeMutableRawPointer?
 
-    // ダブルバッファリング
-    private var buffer0: UnsafeMutablePointer<UInt32>
-    private var buffer1: UnsafeMutablePointer<UInt32>
-    private var currentBuffer: UnsafeMutablePointer<UInt32>
-    private var displayBuffer: UnsafeMutablePointer<UInt32>
+    // ========================================
+    // Triple-slot frame ring（ADR-005 1級 frame pacing / inflight ownership）
+    // ========================================
+    // 各 slot = CPU pixels バッファ + Metal texture。caller は currentSlotIndex の slot へ書き、
+    // present が submit して index を (idx+1)%slotCount へ前進させる。
+    // inflight ownership と再利用安全条件はファイル冒頭コメント参照。
+    private let slotCount = 3
+    private var slotBuffers: [UnsafeMutablePointer<UInt32>] = []
+    private var slotTextures: [MTLTexture?] = []
+    private var currentSlotIndex = 0
 
-    // Metal テクスチャ
-    private var texture0: MTLTexture?
-    private var texture1: MTLTexture?
+    // inflight 上限 = slotCount - 1（= 2）。display sync(fifo) の pacing を司る。
+    // present のたびに wait()、command buffer の completion handler で signal()。
+    private let inflightSemaphore = DispatchSemaphore(value: 2)
+
+    // manual present（present() → view.draw() 起点）であることを draw(in:) に伝えるフラグ。
+    private var manualPresentPending = false
 
     // パフォーマンス測定
     private var lastFrameTime: CFAbsoluteTime
@@ -349,18 +386,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         self.callback = callback
         self.userdata = userdata
 
-        // ダブルバッファを確保
-        let bufferSize = width * height
-        self.buffer0 = UnsafeMutablePointer<UInt32>.allocate(capacity: bufferSize)
-        self.buffer1 = UnsafeMutablePointer<UInt32>.allocate(capacity: bufferSize)
-
-        // バッファを初期化（ゼロで埋める）
-        self.buffer0.initialize(repeating: 0, count: bufferSize)
-        self.buffer1.initialize(repeating: 0, count: bufferSize)
-
-        self.currentBuffer = self.buffer0
-        self.displayBuffer = self.buffer1
-
         // パフォーマンス測定の初期化
         self.lastFrameTime = CFAbsoluteTimeGetCurrent()
         self.frameCount = 0
@@ -368,19 +393,27 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         super.init()
 
+        // slotCount 個の CPU バッファを確保（ゼロ初期化）
+        let bufferSize = width * height
+        for _ in 0..<slotCount {
+            let buf = UnsafeMutablePointer<UInt32>.allocate(capacity: bufferSize)
+            buf.initialize(repeating: 0, count: bufferSize)
+            slotBuffers.append(buf)
+        }
+
         // メタルコマンドキューを作成
         self.commandQueue = device.makeCommandQueue()
 
-        // テクスチャを作成
+        // slotCount 個のテクスチャを作成（各 slot に 1 枚。inflight 中の再利用を避ける）
         let descriptor = MTLTextureDescriptor()
         descriptor.pixelFormat = .bgra8Unorm // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB（drawable と同形式）
         descriptor.width = width
         descriptor.height = height
         descriptor.usage = [.shaderRead, .renderTarget]
         descriptor.storageMode = .managed
-
-        self.texture0 = device.makeTexture(descriptor: descriptor)
-        self.texture1 = device.makeTexture(descriptor: descriptor)
+        for _ in 0..<slotCount {
+            slotTextures.append(device.makeTexture(descriptor: descriptor))
+        }
 
         // パイプラインステートを作成
         setupRenderPipeline()
@@ -410,88 +443,99 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // 描画サイズ変更時の処理（特になし）
     }
 
+    // MTKView の正規 draw サイクル。drawable / renderPassDescriptor の取得・present は
+    // 必ずこの中だけで行う（draw サイクル外で currentDrawable を触ると CAMetalLayerDrawable
+    // lifecycle 警告が出るため）。manual present（view.draw() 起点）と callback/display-link
+    // 起点の双方から同じ submitFrame() helper へ流す。
     func draw(in view: MTKView) {
-        guard let drawable = view.currentDrawable,
-              let renderPassDescriptor = view.currentRenderPassDescriptor,
-              let pipelineState = self.pipelineState,
-              let commandQueue = self.commandQueue else {
-            return
+        let isManual = manualPresentPending
+        manualPresentPending = false
+
+        if isManual {
+            // manual mode: caller が lockFramebuffer() で得た現在 slot を既に書き込み済み。
+            if submitFrame(view: view, slotIndex: currentSlotIndex) {
+                currentSlotIndex = (currentSlotIndex + 1) % slotCount
+            }
+        } else if let callback = callback {
+            // callback/display-link 経路（Zig facade は callback=nil なので未使用。objc/swift 対称性のため維持）。
+            callback(slotBuffers[currentSlotIndex], Int32(width), Int32(height), userdata)
+            if submitFrame(view: view, slotIndex: currentSlotIndex) {
+                currentSlotIndex = (currentSlotIndex + 1) % slotCount
+            }
+        }
+        // 上記いずれでもない（callback=nil かつ manual でない起動）は何もしない。
+        // manual mode は isPaused=true なので display-link 由来の空 draw は来ない。
+    }
+
+    // 指定 slot を GPU へ submit する共通経路。manual / callback 双方から呼ぶ。
+    // 戻り値: 実際に submit したら true（呼び出し側が slot index を前進させる）。
+    @discardableResult
+    private func submitFrame(view: MTKView, slotIndex: Int) -> Bool {
+        guard let pipelineState = self.pipelineState,
+              let commandQueue = self.commandQueue,
+              let texture = slotTextures[slotIndex] else {
+            return false
         }
 
-        let frameStartTime = CFAbsoluteTimeGetCurrent()
+        // ① inflight 枠を確保。最大 inflight = slotCount-1 に制限し、display sync(fifo) の
+        //    pacing を成立させる（busy loop でも unbounded submit にならない）。
+        inflightSemaphore.wait()
 
-        // ユーザーのコールバックを呼び出してピクセルデータを生成
-        if let callback = callback {
-            let callbackStart = CFAbsoluteTimeGetCurrent()
-            callback(currentBuffer, Int32(width), Int32(height), userdata)
-            let callbackEnd = CFAbsoluteTimeGetCurrent()
+        // ② drawable / renderPassDescriptor は MTKView の draw サイクル内でのみ有効。
+        //    取れない場合は確保した inflight 枠を戻して skip する。
+        guard let drawable = view.currentDrawable,
+              let renderPassDescriptor = view.currentRenderPassDescriptor,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            inflightSemaphore.signal()
+            return false
+        }
 
-            // バッファをスワップ
-            let temp = currentBuffer
-            currentBuffer = displayBuffer
-            displayBuffer = temp
+        // ③ CPU pixels → texture へ転送（managed storage への同期コピー）。
+        //    この slot のテクスチャは前回使用(slotCount フレーム前)が完了済みなので再利用安全
+        //    （不変条件はファイル冒頭コメント参照）。
+        let region = MTLRegionMake2D(0, 0, width, height)
+        let bytesPerRow = width * MemoryLayout<UInt32>.size
+        texture.replace(region: region, mipmapLevel: 0, withBytes: slotBuffers[slotIndex], bytesPerRow: bytesPerRow)
 
-            // テクスチャを選択
-            let renderStart = CFAbsoluteTimeGetCurrent()
-            let texture = (displayBuffer == buffer0) ? texture0 : texture1
+        renderEncoder.setRenderPipelineState(pipelineState)
+        renderEncoder.setFragmentTexture(texture, index: 0)
+        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        renderEncoder.endEncoding()
 
-            // 表示するバッファをテクスチャに転送
-            if let texture = texture {
-                let region = MTLRegionMake2D(0, 0, width, height)
-                let bytesPerRow = width * MemoryLayout<UInt32>.size
-                texture.replace(region: region, mipmapLevel: 0, withBytes: displayBuffer, bytesPerRow: bytesPerRow)
-            }
+        // ④ present(drawable): 次の display refresh で表示（fifo）。
+        commandBuffer.present(drawable)
+        // ⑤ 完了時に inflight 枠を解放。self / slot を捕捉せず semaphore のみ（retain cycle 回避）。
+        commandBuffer.addCompletedHandler { [inflightSemaphore] _ in
+            inflightSemaphore.signal()
+        }
+        commandBuffer.commit()
 
-            // コマンドバッファを作成
-            guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        updatePerfStats()
+        return true
+    }
 
-            // レンダーコマンドエンコーダを作成
-            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
+    // 60 フレームごとに FPS をログ出力（fifo pacing の検証用に ~60fps 張り付きを観測できる）。
+    private func updatePerfStats() {
+        frameCount += 1
+        let now = CFAbsoluteTimeGetCurrent()
+        totalFrameTime += now - lastFrameTime
+        lastFrameTime = now
 
-            // パイプラインを設定
-            renderEncoder.setRenderPipelineState(pipelineState)
-
-            // テクスチャを設定
-            if let texture = texture {
-                renderEncoder.setFragmentTexture(texture, index: 0)
-            }
-
-            // ドローコール（4頂点で全画面クワッドを描画）
-            renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            renderEncoder.endEncoding()
-
-            // レンダリング完了後にpresentと実行をスケジュール
-            commandBuffer.present(drawable)
-            commandBuffer.commit()
-
-            let renderEnd = CFAbsoluteTimeGetCurrent()
-
-            // パフォーマンス測定
-            frameCount += 1
-            let frameTime = frameStartTime - lastFrameTime
-            totalFrameTime += frameTime
-            lastFrameTime = frameStartTime
-
-            // 60フレームごとに統計を出力
-            if frameCount % 60 == 0 {
-                let avgFrameTime = totalFrameTime / 60.0
-                let fps = 1.0 / avgFrameTime
-                let callbackTime = (callbackEnd - callbackStart) * 1000.0
-                let renderTime = (renderEnd - renderStart) * 1000.0
-
-                NSLog("[\(IMPLEMENTATION_TYPE)] FPS: \(String(format: "%.1f", fps)) | Avg Frame: \(String(format: "%.2f", avgFrameTime * 1000.0))ms | Callback: \(String(format: "%.2f", callbackTime))ms | Render: \(String(format: "%.2f", renderTime))ms")
-
-                totalFrameTime = 0.0
-            }
+        if frameCount % 60 == 0 {
+            let avgFrameTime = totalFrameTime / 60.0
+            let fps = avgFrameTime > 0 ? 1.0 / avgFrameTime : 0
+            NSLog("[\(IMPLEMENTATION_TYPE)] FPS: \(String(format: "%.1f", fps)) | Avg Frame: \(String(format: "%.2f", avgFrameTime * 1000.0))ms")
+            totalFrameTime = 0.0
         }
     }
 
     deinit {
         let bufferSize = width * height
-        buffer0.deinitialize(count: bufferSize)
-        buffer0.deallocate()
-        buffer1.deinitialize(count: bufferSize)
-        buffer1.deallocate()
+        for buf in slotBuffers {
+            buf.deinitialize(count: bufferSize)
+            buf.deallocate()
+        }
     }
 
     // 手動描画用のヘルパーメソッド
@@ -504,53 +548,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     func getCurrentBuffer() -> UnsafeMutablePointer<UInt32> {
-        return currentBuffer
+        return slotBuffers[currentSlotIndex]
     }
 
+    // 手動描画の present。drawable を直接触らず、MTKView の draw サイクルを起動するだけ。
+    // 実際の upload / encode / present は draw(in:) → submitFrame() 内で行う。
     func presentManual(view: MTKView) {
-        guard let drawable = view.currentDrawable,
-              let renderPassDescriptor = view.currentRenderPassDescriptor,
-              let pipelineState = self.pipelineState,
-              let commandQueue = self.commandQueue else {
-            return
-        }
-
-        // バッファをスワップ
-        let temp = currentBuffer
-        currentBuffer = displayBuffer
-        displayBuffer = temp
-
-        // テクスチャを選択
-        let texture = (displayBuffer == buffer0) ? texture0 : texture1
-
-        // 表示するバッファをテクスチャに転送
-        if let texture = texture {
-            let region = MTLRegionMake2D(0, 0, width, height)
-            let bytesPerRow = width * MemoryLayout<UInt32>.size
-            texture.replace(region: region, mipmapLevel: 0, withBytes: displayBuffer, bytesPerRow: bytesPerRow)
-        }
-
-        // コマンドバッファを作成
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
-
-        // レンダーコマンドエンコーダを作成
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
-
-        // パイプラインを設定
-        renderEncoder.setRenderPipelineState(pipelineState)
-
-        // テクスチャを設定
-        if let texture = texture {
-            renderEncoder.setFragmentTexture(texture, index: 0)
-        }
-
-        // ドローコール（4頂点で全画面クワッドを描画）
-        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        renderEncoder.endEncoding()
-
-        // レンダリング完了後にpresentと実行をスケジュール
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
+        manualPresentPending = true
+        view.draw()
     }
 }
 
@@ -715,6 +720,13 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     let metalView = MetalFramebufferView(frame: frame, device: metalDevice)
     metalView.framebufferOnly = false
     metalView.enableSetNeedsDisplay = false
+    // 手動描画経路（callback=nil。Zig facade の lockFramebuffer→present 経路）では display-link を止め、
+    // present() が view.draw() で 1 フレームずつ駆動する。callback 経路（objc/swift 対称・未使用）は
+    // 従来どおり display-link 駆動のため isPaused=false にする。
+    metalView.isPaused = (callback == nil)
+    // fifo（display refresh 同期）の意図をコード上で明示する。macOS では CAMetalLayer の既定が true
+    // なので必須の挙動変更ではないが、ADR-005 の 1級 backend 契約を明文化する。
+    (metalView.layer as? CAMetalLayer)?.displaySyncEnabled = true
 
     // レンダラーをセットアップ
     metalView.setupRenderer(width: Int(width), height: Int(height), callback: callback, userdata: userdata)
@@ -845,14 +857,14 @@ func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_wid
         out_height.pointee = Int32(renderer.getHeight())
     }
 
-    // currentBufferを返す
+    // 現在の slot の CPU バッファを返す（caller が書き込み、present で submit される）
     return renderer.getCurrentBuffer()
 }
 
 @_cdecl("platform_unlock_framebuffer")
 func platform_unlock_framebuffer(platformWindow: UnsafeMutableRawPointer?) -> Void {
     // このAPIでは特に何もする必要なし
-    // バッファのスワップはplatform_present()で行う
+    // texture への転送・submit・slot 前進は platform_present() で行う
 }
 
 @_cdecl("platform_present")

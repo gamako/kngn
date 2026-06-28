@@ -310,11 +310,11 @@ void platform_present(...);
 |----------------|--------|------|------|
 | **Objective-C** | ✅ 成功 | ✅ 成功 | 完全動作 |
 | **Swift** | ✅ 成功 | ✅ 成功 | 完全動作 |
-| **Metal** | ✅ 成功 | ⚠️ 警告あり | 動作（要改善）|
+| **Metal** | ✅ 成功 | ✅ 警告解消（TASK-36） | 1級 frame pacing 対応 |
 
 ### 重要な洞察
 
-**Metal版の警告について**: `CAMetalLayerDrawable`は1フレームに1回しか使えないため、毎フレーム新しい`drawable`を取得する必要があります。現在の実装では`MTKView.draw()`外で描画しているため警告が出ていますが、機能的には動作しています。
+**Metal版の警告（TASK-36 で解消済み）**: `CAMetalLayerDrawable`は1フレームに1回しか使えず、毎フレーム新しい`drawable`を`MTKView.draw(in:)`内で取得・present する必要がある。旧実装は`MTKView.draw()`外で`currentDrawable`を触っていたため lifecycle 警告が出ていた。TASK-36 で drawable 取得を`draw(in:)`内に集約し（手動描画は`present()`→`view.draw()`起点）、triple slot + inflight semaphore で inflight ownership と fifo pacing を実装して解消した。契約・実装の正は `docs/adr/005`。
 
 **アーキテクチャの成功**: 3つの異なる実装（Objective-C、Swift、Metal）で同じAPIを提供できたことは、抽象化レイヤーの設計が成功したことを示しています。
 
@@ -324,7 +324,7 @@ void platform_present(...);
 
 ## 次のステップ
 
-1. **Metal版の警告修正** - `drawable`の取得方法を改善
+1. ~~**Metal版の警告修正** - `drawable`の取得方法を改善~~（TASK-36 で完了）
 2. **02_keyboard_input** - キーボード入力のサンプル作成
 3. **既存のsrc/main.zigの検証** - 新しいAPIが既存コードに影響していないか確認
 

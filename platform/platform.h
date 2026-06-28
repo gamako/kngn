@@ -92,12 +92,15 @@ void platform_unlock_framebuffer(PlatformWindow* window);
 // platform_lock_framebuffer()で書き込んだ内容を表示キューへ送る
 //
 // 動作:
-// - この関数は非ブロックの submit であり、即座にリターンする（display refresh までは待たない）
+// - この関数は基本的に非ブロックの submit（display refresh までは待たない）。ただし resource pressure や
+//   inflight 枠の都合で短時間 block する可能性は許容する（下記 Metal を参照）
 // - frame 確定点として扱う（TASK-32 harness はこの時点で frame を確定する）
 // - present 後の pixels は backend / WindowServer / GPU 所有となり、caller は次の lock まで触らない
 //
 // frame pacing / tearing（backend の support tier に依る・TASK-34）:
 // - 1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で display refresh に同期し tearing 回避を保証対象とする
+//   * Metal は inflight 上限（triple slot + semaphore, TASK-36）に達すると、submit が次フレーム枠の空きまで
+//     短時間 block しうる（= fifo pacing。display refresh 律速）。lockFramebuffer は non-null 互換を維持する
 // - best-effort backend（macOS CALayer objc/swift / X11 / GDI）は厳密な vsync / tearing 回避を保証しない
 //
 // 注意:

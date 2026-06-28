@@ -126,11 +126,13 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | --------------- | ------------------------------------------------- | ------------- | --------------------- |
 | **Objective-C** | `platform/macos/platform_macos.m`                 | CALayer       | ✅ 完全動作           |
 | **Swift**       | `platform/macos-swift/platform_macos.swift`       | CADisplayLink | ✅ 完全動作           |
-| **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ⚠️ 警告あり（動作）   |
+| **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ✅ 1級 frame pacing 対応（TASK-36） |
 | **X11 (Linux)** | `src/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
 | **Wayland (Linux)** | `src/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。shiso 実機検証済み） |
 
-**Metal版の警告**: `CAMetalLayerDrawable`のライフサイクル問題。機能的には動作中。
+**Metal版（TASK-36）**: ADR-005 の 1級 frame pacing 契約に適合。triple slot + inflight semaphore で
+drawable/buffer の inflight ownership を管理し、`draw(in:)` 内に drawable 取得を集約して CAMetalLayerDrawable
+lifecycle 警告を解消。`displaySyncEnabled` 明示で fifo（display refresh 同期）。詳細は `docs/adr/005`。
 
 ### backend の選び方（OS 依存）
 
