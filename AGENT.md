@@ -322,7 +322,8 @@ AI がアプリの出力を手軽に確認するための仕組み。`src/platfo
 - **P1（TASK-32.1, 実装済み）**: file replay + 組み込み `fb` probe（framebuffer→PNG / 1行 digest）+ 仮想クロック。
 - **P2（TASK-32.2, 実装済み）**: live 制御（TCP loopback + driver CLI `scripts/drive`）/ 組み込み `audio`・`stats` probe / record→replay。
 - **P3（TASK-32.3, 実装済み）**: custom probe レジストリ。app が `platform.registerProbe(...)` で probe を opt-in 登録（pixie=`canvas`/`undo`/`tool`, synth=`voices`/`patch`）。詳細は下記「custom probe の足し方」。
-- **P4 以降（未実装）**: offscreen / 完全 display-less / Metal。
+- **P4 以降（未実装）**: offscreen / 完全 display-less / Metal の GPU drawable 読み戻し（描画後の合成サーフェスの readback）。
+  - 注: `fb` probe は**手動描画 API の CPU フレームバッファ**を捕捉する backend 非依存実装なので、**objc / swift / metal いずれでも `snapshot fb` は撮れる**（Metal も同じ CPU バッファを供給し、実測で objc と fb crc が bit 一致）。P4 の「Metal」は CPU バッファ経路ではなく GPU drawable の読み戻しを指す。
 
 ### コマンド言語（file replay と live で共通）
 
@@ -413,7 +414,7 @@ app が内部状態を opt-in で probe として公開する。**framework（`s
 
 - **実行モデル**: 非 step（inject/snapshot/digest）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
-- **制約**: 実ウィンドウは生成する（display 必須。macOS は通常 OK、Linux は Xvfb/実セッション）。完全 display-less は P4。`audio` は RT スレッド実時間依存なので record→replay で digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論）。live の accept ブロック中は window pump が止まる。Metal backend の fb 捕捉は P4。
+- **制約**: 実ウィンドウは生成する（display 必須。macOS は通常 OK、Linux は Xvfb/実セッション）。完全 display-less は P4。`audio` は RT スレッド実時間依存なので record→replay で digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論）。live の accept ブロック中は window pump が止まる。`fb` の捕捉は CPU フレームバッファ経路で **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。P4 なのは Metal の GPU drawable 読み戻しの方。
 - **driver は std.Io.net 1本実装**で mac/Linux 同一コード（Windows ポートは TASK-31 進捗次第）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
 
 ## よく使うコマンド
