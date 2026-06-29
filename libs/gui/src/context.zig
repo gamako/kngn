@@ -49,7 +49,25 @@ pub const Style = style_mod.Style;
 
 /// rect キャッシュのエントリ。clip は祖先の clip_children を intersect 済みの有効クリップで、
 /// buttonBehavior(ctx, id, rect, clip) にそのまま渡せる（21.5 の widget hit-test 用）。
-pub const CachedRect = struct { rect: Rect, clip: Rect };
+pub const CachedRect = struct { rect: Rect, clip: Rect, measured_w: i32 = 0, measured_h: i32 = 0 };
+
+/// scroll area の begin→end 間で持ち越す内部状態（TASK-46）。begin で前フレーム cache から
+/// 算出し scroll_stack に push、end で pop してスクロールバーを構築する。
+pub const ScrollState = struct {
+    bar_thickness: i32,
+    track_col: Color,
+    thumb_col: Color,
+    thumb_hot: Color,
+    thumb_active: Color,
+    need_v: bool,
+    need_h: bool,
+    v_off: i32,
+    v_len: i32,
+    h_off: i32,
+    h_len: i32,
+    vthumb_id: Id,
+    hthumb_id: Id,
+};
 
 pub const Context = struct {
     gpa: Allocator,
@@ -69,6 +87,8 @@ pub const Context = struct {
     /// 明示 ID（cfg.id != 0）ノードの id → {rect, clip}。gpa 所有でフレームを跨いで生存し、
     /// endFrame でのみ更新される（フレーム前半は前フレーム値 = 同期 hit-test 契約）。
     rect_cache: std.AutoHashMapUnmanaged(Id, CachedRect) = .empty,
+    /// scroll area の begin→end 間状態スタック（TASK-46。ネスト対応）。arena 不使用（フレーム内 push/pop）。
+    scroll_stack: std.ArrayList(ScrollState) = .empty,
     /// widget 共通スタイル（TASK-21.5）。caller が直接書き換えてよい（push/pop なし）。
     style: Style,
 
@@ -93,6 +113,9 @@ pub const Context = struct {
     pub const imageBox = widgets.imageBox;
     // Splitter（ペイン境界。TASK-41）
     pub const splitter = widgets.splitter;
+    // 縦横スクロール領域（TASK-46）
+    pub const beginScrollArea = widgets.beginScrollArea;
+    pub const endScrollArea = widgets.endScrollArea;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{
@@ -108,6 +131,7 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         self.rect_cache.deinit(self.gpa);
+        self.scroll_stack.deinit(self.gpa);
         self.draw_list.deinit();
         self.id_stack.deinit();
         self.input.deinit();
@@ -235,6 +259,14 @@ pub const Context = struct {
         return entry.rect;
     }
 
+    /// 明示 ID ノードの前フレーム measured サイズ（自然サイズ）。scroll 量の clamp に使う。
+    /// getNodeRect と同じく前フレーム値を返す（同期契約）。自動 ID・未知 ID・0 は null。
+    pub fn getNodeMeasured(self: *const Context, id: Id) ?Vec2 {
+        if (id == 0) return null;
+        const entry = self.rect_cache.get(id) orelse return null;
+        return .{ .x = entry.measured_w, .y = entry.measured_h };
+    }
+
     fn addLeaf(self: *Context, leaf: layout.LeafKind) void {
         const parent = self.layout_current.?;
         const node = self.allocator().create(layout.Node) catch @panic("Context.addLeaf: OOM");
@@ -253,7 +285,7 @@ pub const Context = struct {
                 @panic("Context.endFrame: OOM");
             // 同一フレーム内の明示 ID 重複は契約違反（最後勝ちで上書きされ hit-test が壊れる）
             std.debug.assert(!gop.found_existing);
-            gop.value_ptr.* = .{ .rect = node.rect, .clip = clip };
+            gop.value_ptr.* = .{ .rect = node.rect, .clip = clip, .measured_w = node.measured_w, .measured_h = node.measured_h };
         }
         const child_clip = if (node.cfg.clip_children) Rect.intersect(clip, node.rect) else clip;
         var it = node.first_child;

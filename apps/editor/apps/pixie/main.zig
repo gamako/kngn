@@ -53,6 +53,7 @@ const CONTENT_ROW_ID: gui.Id = 0xC0FFEE02;
 const MAIN_AREA_ID: gui.Id = 0xC0FFEE03;
 const SPLIT_RIGHT_ID: gui.Id = 0xC0FFEE04;
 const SPLIT_BOTTOM_ID: gui.Id = 0xC0FFEE05;
+const RIGHT_SCROLL_ID: gui.Id = 0xC0FFEE06; // 右ペイン縦スクロール領域（TASK-46）
 const LAYER_PANEL_ID_BASE: gui.Id = 0xA430_0000;
 const LAYER_ROW_ID_BASE: gui.Id = 0xA430_1000;
 const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
@@ -150,6 +151,8 @@ const App = struct {
     /// ── ペイン（TASK-42）。pane は fixed px・canvas は grow。幅/高さは毎フレーム利用可能領域へ clamp ──
     right_pane_w: i32 = RIGHT_PANE_DEFAULT,
     right_visible: bool = true,
+    /// 右ペインの縦スクロール量（TASK-46。横は content_width=grow で不要）
+    right_scroll: gui.Vec2f = .{},
     bottom_pane_h: i32 = BOTTOM_PANE_DEFAULT,
     bottom_visible: bool = false,
     /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
@@ -948,14 +951,15 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
 
     if (app.right_visible) {
         _ = ctx.splitter(SPLIT_RIGHT_ID, .vertical, &app.right_pane_w, .{ .thickness = SPLITTER_T, .min = RIGHT_PANE_MIN, .max = right_max, .invert = true });
-        // right pane: Color / Palette / Tool（clip_children で溢れ防止）
-        ctx.beginBox(.{
+        // right pane: Color / Palette / Tool / Layers を縦スクロール領域に入れる（TASK-46）。
+        // content_width=grow で content を viewport 幅いっぱい（横スクロール不要）、高さは fit で縦スクロール。
+        ctx.beginScrollArea(RIGHT_SCROLL_ID, &app.right_scroll, .{
             .width = .{ .fixed = app.right_pane_w },
             .height = .{ .grow = 1 },
             .padding = .{ 8, 8, 8, 8 },
             .gap = 6,
             .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
-            .clip_children = true,
+            .content_width = .{ .grow = 1 },
         });
         // ── カラーエディタ（HSV）。grid より前に write-back する（選択変更の上書き事故回避） ──
         ctx.label("Color");
@@ -1026,7 +1030,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
 
         try buildLayerPanel(ctx, app);
-        ctx.endBox(); // right pane
+        ctx.endScrollArea(); // right pane (縦スクロール)
     } // right_visible
 
     ctx.endBox(); // content row

@@ -58,6 +58,12 @@ pub const BoxConfig = struct {
     border: ?Border = null,
     /// true なら子の draw cmd に自 rect 由来の clip を焼き込む（レイアウト計算には影響しない）
     clip_children: bool = false,
+    /// スクロール用の子配置オフセット（px）。子（とその子孫）の最終 rect を x は左へ scroll_x、
+    /// y は上へ scroll_y ずらす。子サイズ・measured・cursor 計算には影響しない（純粋に配置のみ）。
+    /// clip_children と併用して viewport 外を切る前提。scroll_x/y は呼び出し側が
+    /// [0, content_natural - viewport] に clamp してから渡す。
+    scroll_x: i32 = 0,
+    scroll_y: i32 = 0,
 };
 
 /// custom leaf の描画コールバック。endFrame の layout 確定後に最終 rect 付きで呼ばれる。
@@ -259,14 +265,15 @@ pub fn place(node: *Node, rect: Rect) void {
             .center => @divFloor(content_cross - cross_size, 2),
             .end => content_cross - cross_size,
         };
+        // スクロールオフセット: 子の最終位置だけを左/上へずらす（cursor 計算は不変）。
         const child_rect: Rect = if (main == .w) .{
-            .x = cursor,
-            .y = cross_origin + cross_off,
+            .x = cursor - cfg.scroll_x,
+            .y = cross_origin + cross_off - cfg.scroll_y,
             .w = @intCast(@max(0, main_size)),
             .h = @intCast(@max(0, cross_size)),
         } else .{
-            .x = cross_origin + cross_off,
-            .y = cursor,
+            .x = cross_origin + cross_off - cfg.scroll_x,
+            .y = cursor - cfg.scroll_y,
             .w = @intCast(@max(0, cross_size)),
             .h = @intCast(@max(0, main_size)),
         };
@@ -530,4 +537,39 @@ test "place: 入れ子 box の padding / gap が正しく効く" {
     try std.testing.expectEqual(@as(i32, 39), b.rect.y);
     try std.testing.expectEqual(@as(u32, 72), b.rect.w); // 80 − 8
     try std.testing.expectEqual(@as(u32, 47), b.rect.h); // 55 − 8
+}
+
+test "place: scroll_y は子配置だけを上へずらす（自 rect / measured / サイズ不変）" {
+    var root: Node = .{ .cfg = .{ .direction = .column, .scroll_y = 20 } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 30 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 40 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 50 });
+    // 自 rect は与えた viewport のまま不変
+    try std.testing.expectEqual(@as(i32, 0), root.rect.y);
+    try std.testing.expectEqual(@as(u32, 50), root.rect.h);
+    // 子の y は scroll_y=20 分だけ上（絶対値: a=0−20=−20, b=30−20=10）。x は scroll_x=0 で不変。
+    try std.testing.expectEqual(@as(i32, -20), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    // 子サイズと measured は scroll に依存しない
+    try std.testing.expectEqual(@as(u32, 30), a.rect.h);
+    try std.testing.expectEqual(@as(i32, 70), root.measured_h); // 30+40
+}
+
+test "place: scroll_x は子配置だけを左へずらす（row）" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .scroll_x = 15 } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 50, .h = 20 });
+    // 子の x は scroll_x=15 分だけ左（a=0−15=−15, b=30−15=15）。y は不変。
+    try std.testing.expectEqual(@as(i32, -15), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 15), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), root.rect.x); // 自 rect 不変
 }

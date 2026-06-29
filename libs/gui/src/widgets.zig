@@ -20,6 +20,8 @@ const color_mod = @import("color.zig");
 const draw_mod = @import("draw.zig");
 const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
+const input_mod = @import("input.zig");
+pub const Vec2f = input_mod.Vec2f;
 
 pub const Context = context_mod.Context;
 pub const ButtonResult = context_mod.ButtonResult;
@@ -624,6 +626,190 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
     ctx.endBox();
 
     return size.* != old;
+}
+
+// ============================================================
+// ScrollArea（縦横スクロール領域 + スクロールバー。TASK-46）
+// ============================================================
+// 構造: outer(row) → [ leftCol(column) → [ viewport(clip,scroll) → content(fit) , hbar ] , vbar ]
+// viewport は前フレーム rect、content は前フレーム measured（自然サイズ）を rect_cache から参照し、
+// scroll 量の clamp・bar 表示要否・thumb 幾何を **前フレーム値**で決める（splitter と同じ同期契約。
+// content サイズや viewport サイズが変わったフレームは 1 フレームだけ過渡値になり、次フレームで自己補正）。
+// scroll 値は呼び出し側が *Vec2f で保持（trackpad の小数を保つ）。layout へは round した i32 を渡す。
+
+const SCROLL_MIN_THUMB: i32 = 16;
+
+pub const ScrollAreaOpts = struct {
+    /// outer（スクロール領域全体）の主軸/交差軸サイズ
+    width: layout.Sizing = .{ .grow = 1 },
+    height: layout.Sizing = .{ .grow = 1 },
+    /// inner content の方向・padding・gap・交差整列（caller の中身に効く）
+    direction: layout.Direction = .column,
+    padding: [4]i32 = .{ 0, 0, 0, 0 },
+    gap: i32 = 0,
+    align_cross: layout.Align = .start,
+    /// inner content のサイズ規則。既定 .fit（自然サイズ＝両軸スクロール可能）。
+    /// 横スクロール不要で content を viewport 幅いっぱいにしたい場合は content_width = .{ .grow = 1 }。
+    content_width: layout.Sizing = .fit,
+    content_height: layout.Sizing = .fit,
+    /// outer の背景・枠
+    bg: ?Color = null,
+    border: ?layout.Border = null,
+    /// ホイール 1 ノッチあたりの px
+    wheel_px: f32 = 32.0,
+    /// スクロールバー帯の厚み（px）
+    bar_thickness: i32 = 8,
+};
+
+fn scrollThumbLen(viewport_len: i32, content_len: i32) i32 {
+    if (content_len <= 0 or viewport_len <= 0) return @max(0, viewport_len);
+    // 下限は viewport 長を超えない（小さい viewport で clamp の min>max assert を避ける）。
+    const min_thumb = @min(SCROLL_MIN_THUMB, viewport_len);
+    // i64 で乗算して大きい viewport での i32 overflow を避ける。
+    const raw: i32 = @intCast(@divTrunc(@as(i64, viewport_len) * @as(i64, viewport_len), @as(i64, content_len)));
+    return std.math.clamp(raw, min_thumb, viewport_len);
+}
+
+fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Color {
+    return if (ctx.state.active_id == thumb_id)
+        st.thumb_active
+    else if (ctx.state.hot_id == thumb_id)
+        st.thumb_hot
+    else
+        st.thumb_col;
+}
+
+/// 縦横スクロール領域を開始する。`id` は viewport の明示 ID（getNodeRect(id)=viewport 矩形）。
+/// `scroll` は呼び出し側保持の f32 スクロール量（x/y）。begin 後に中身の widget を積み、endScrollArea で閉じる。
+pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOpts) void {
+    const content_id = id_mod.hashInt(id, 1);
+    const vthumb_id = id_mod.hashInt(id, 2);
+    const hthumb_id = id_mod.hashInt(id, 3);
+
+    // 前フレーム viewport rect / content 自然サイズ
+    const vp = ctx.getNodeRect(id);
+    const cm = ctx.getNodeMeasured(content_id);
+    const vp_w: i32 = if (vp) |r| @intCast(r.w) else 0;
+    const vp_h: i32 = if (vp) |r| @intCast(r.h) else 0;
+    const content_w: i32 = if (cm) |m| m.x else 0;
+    const content_h: i32 = if (cm) |m| m.y else 0;
+    const max_x: i32 = @max(0, content_w - vp_w);
+    const max_y: i32 = @max(0, content_h - vp_h);
+    const need_v = max_y > 0;
+    const need_h = max_x > 0;
+
+    // ホイール: mouse が前フレーム viewport 内のときだけ反映（canvas zoom 等との領域分離）
+    if (vp) |r| {
+        const mp = ctx.input.mouse_pos;
+        const inside = mp.x >= r.x and mp.x < r.x + @as(i32, @intCast(r.w)) and
+            mp.y >= r.y and mp.y < r.y + @as(i32, @intCast(r.h));
+        if (inside) {
+            scroll.x += -ctx.input.scroll_delta.x * opts.wheel_px;
+            scroll.y += -ctx.input.scroll_delta.y * opts.wheel_px;
+        }
+    }
+
+    // thumb ドラッグ（前フレーム thumb rect で buttonBehavior、held 中 mouse_delta を scroll へ写像）
+    if (need_v) {
+        if (ctx.rect_cache.get(vthumb_id)) |c| {
+            const res = context_mod.buttonBehavior(ctx, vthumb_id, c.rect, c.clip);
+            if (res.held) {
+                const travel = @max(1, vp_h - scrollThumbLen(vp_h, content_h));
+                scroll.y += @as(f32, @floatFromInt(ctx.input.mouse_delta.y)) *
+                    @as(f32, @floatFromInt(max_y)) / @as(f32, @floatFromInt(travel));
+            }
+        }
+    }
+    if (need_h) {
+        if (ctx.rect_cache.get(hthumb_id)) |c| {
+            const res = context_mod.buttonBehavior(ctx, hthumb_id, c.rect, c.clip);
+            if (res.held) {
+                const travel = @max(1, vp_w - scrollThumbLen(vp_w, content_w));
+                scroll.x += @as(f32, @floatFromInt(ctx.input.mouse_delta.x)) *
+                    @as(f32, @floatFromInt(max_x)) / @as(f32, @floatFromInt(travel));
+            }
+        }
+    }
+
+    // f32 のまま clamp
+    scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
+    scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
+
+    // thumb 幾何（px）を clamp 済み scroll から算出
+    var st: context_mod.ScrollState = .{
+        .bar_thickness = opts.bar_thickness,
+        .track_col = ctx.style.slider_track_bg,
+        .thumb_col = ctx.style.border_hover,
+        .thumb_hot = ctx.style.text_subtle,
+        .thumb_active = ctx.style.bg_active,
+        .need_v = need_v,
+        .need_h = need_h,
+        .v_off = 0,
+        .v_len = 0,
+        .h_off = 0,
+        .h_len = 0,
+        .vthumb_id = vthumb_id,
+        .hthumb_id = hthumb_id,
+    };
+    if (need_v) {
+        st.v_len = scrollThumbLen(vp_h, content_h);
+        const travel = vp_h - st.v_len;
+        st.v_off = if (max_y > 0)
+            @intFromFloat(@round(scroll.y / @as(f32, @floatFromInt(max_y)) * @as(f32, @floatFromInt(travel))))
+        else
+            0;
+    }
+    if (need_h) {
+        st.h_len = scrollThumbLen(vp_w, content_w);
+        const travel = vp_w - st.h_len;
+        st.h_off = if (max_x > 0)
+            @intFromFloat(@round(scroll.x / @as(f32, @floatFromInt(max_x)) * @as(f32, @floatFromInt(travel))))
+        else
+            0;
+    }
+    ctx.scroll_stack.append(ctx.gpa, st) catch @panic("beginScrollArea: OOM");
+
+    const sx: i32 = @intFromFloat(@round(scroll.x));
+    const sy: i32 = @intFromFloat(@round(scroll.y));
+
+    // outer(row) → leftCol(column) → viewport(clip,scroll) → inner content(fit)
+    ctx.beginBox(.{ .direction = .row, .width = opts.width, .height = opts.height, .bg = opts.bg, .border = opts.border });
+    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 } });
+    ctx.beginBox(.{ .id = id, .direction = opts.direction, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .clip_children = true, .scroll_x = sx, .scroll_y = sy });
+    ctx.beginBox(.{ .id = content_id, .direction = opts.direction, .width = opts.content_width, .height = opts.content_height, .padding = opts.padding, .gap = opts.gap, .align_cross = opts.align_cross });
+}
+
+/// scroll area を閉じてスクロールバーを構築する（begin と対で呼ぶ）。
+pub fn endScrollArea(ctx: *Context) void {
+    const st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: begin と不対応");
+    ctx.endBox(); // inner content
+    ctx.endBox(); // viewport
+
+    // 横スクロールバー（leftCol 内・viewport の下）
+    if (st.need_h) {
+        ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .fixed = st.bar_thickness }, .bg = st.track_col });
+        if (st.h_off > 0) {
+            ctx.beginBox(.{ .width = .{ .fixed = st.h_off }, .height = .{ .grow = 1 } });
+            ctx.endBox();
+        }
+        ctx.beginBox(.{ .id = st.hthumb_id, .width = .{ .fixed = st.h_len }, .height = .{ .grow = 1 }, .bg = scrollThumbColor(ctx, st, st.hthumb_id) });
+        ctx.endBox();
+        ctx.endBox(); // hbar
+    }
+    ctx.endBox(); // leftCol
+
+    // 縦スクロールバー（outer 内・leftCol の右）
+    if (st.need_v) {
+        ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = st.bar_thickness }, .height = .{ .grow = 1 }, .bg = st.track_col });
+        if (st.v_off > 0) {
+            ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = st.v_off } });
+            ctx.endBox();
+        }
+        ctx.beginBox(.{ .id = st.vthumb_id, .width = .{ .grow = 1 }, .height = .{ .fixed = st.v_len }, .bg = scrollThumbColor(ctx, st, st.vthumb_id) });
+        ctx.endBox();
+        ctx.endBox(); // vbar
+    }
+    ctx.endBox(); // outer
 }
 
 // ============================================================
@@ -1311,4 +1497,91 @@ test "imageBox: 固定 w×h の leaf を確保し等倍 image cmd を発行す�
         else => {},
     };
     try std.testing.expect(found);
+}
+
+fn buildFixedContent(ctx: *Context, child_id: Id, w: i32, h: i32) void {
+    ctx.beginBox(.{ .id = child_id, .width = .{ .fixed = w }, .height = .{ .fixed = h } });
+    ctx.endBox();
+}
+
+test "scrollArea: 前フレーム自然サイズで縦 scroll を clamp し content をオフセット・縦バーを出す" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0011;
+    const CHILD: Id = 0xC0FFEE11;
+    var scroll: Vec2f = .{};
+    const VP_W: i32 = 100;
+    const VP_H: i32 = 60;
+    const CONTENT_W: i32 = 80; // viewport より狭い → 横 scroll 不要
+    const CONTENT_H: i32 = 200; // viewport より高い → 縦 scroll 要
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = VP_W }, .height = .{ .fixed = VP_H } };
+
+    // frame1: scroll=0 で配置（前フレーム cache が無いので bar は未確定 → まだ出ない）
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, CONTENT_W, CONTENT_H);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    const vp = ctx.getNodeRect(SID).?;
+    try std.testing.expectEqual(@as(u32, @intCast(VP_W)), vp.w); // bar 未出なので全幅
+
+    // frame2: 過大 scroll を要求 → 前フレーム自然サイズで max_y=140 に clamp、縦バー出現、content が上へ
+    scroll.y = 1000;
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, CONTENT_W, CONTENT_H);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(CONTENT_H - VP_H)), scroll.y, 0.5); // 140 に clamp
+    const vthumb_id = id_mod.hashInt(SID, 2);
+    const hthumb_id = id_mod.hashInt(SID, 3);
+    try std.testing.expect(ctx.rect_cache.get(vthumb_id) != null); // 縦バー出現
+    try std.testing.expect(ctx.rect_cache.get(hthumb_id) == null); // 横バーは出ない
+    // content の子が scroll 分だけ上へ（絶対値: viewport.y - 140）。clip 外（viewport より上）に出る。
+    const child = ctx.getNodeRect(CHILD).?;
+    try std.testing.expectEqual(vp.y - (CONTENT_H - VP_H), child.y);
+    try std.testing.expect(child.y < vp.y);
+}
+
+test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラッグ）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0022;
+    const CHILD: Id = 0xC0FFEE22;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    // frame1/2: 配置して縦バー thumb の rect cache を生成（need_v は前フレーム判定なので 2 フレーム目で出る）
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    const vthumb_id = id_mod.hashInt(SID, 2);
+    const tc = center(ctx.getNodeRect(vthumb_id).?);
+
+    // frame3: thumb を press（active 取得）
+    ctx.beginFrame(300, 300);
+    pressAt(&ctx, tc.x, tc.y);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    // frame4: 下へドラッグ → held 中 mouse_delta.y>0 が scroll.y を増やす
+    const before = scroll.y;
+    ctx.beginFrame(300, 300);
+    moveTo(&ctx, tc.x, tc.y + 20);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    try std.testing.expect(scroll.y > before);
 }

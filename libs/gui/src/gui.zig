@@ -69,6 +69,7 @@ pub const ImageBoxOpts = @import("widgets.zig").ImageBoxOpts;
 pub const Orient = @import("widgets.zig").Orient;
 pub const SplitterOpts = @import("widgets.zig").SplitterOpts;
 pub const splitter = @import("widgets.zig").splitter;
+pub const ScrollAreaOpts = @import("widgets.zig").ScrollAreaOpts;
 
 // test-gui 用に各ファイルの test を収集する。
 // `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
