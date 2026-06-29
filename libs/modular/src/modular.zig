@@ -32,7 +32,15 @@ pub const Quantizer = modules.Quantizer;
 pub const Kick = modules.Kick;
 pub const Hat = modules.Hat;
 pub const PercEnv = modules.PercEnv;
-pub const ChordPad = modules.ChordPad; // Ph4: 固定 root の温かい和音パッド
+pub const ChordPad = modules.ChordPad; // Ph4: 温かい和音パッド（Ph5 で pitch/cutoff/level CV 入力対応）
+
+// Ph5: editable step シーケンサ + 連続 LFO + scale 共有ヘルパー
+pub const StepSeq = modules.StepSeq;
+pub const Lfo = modules.Lfo;
+pub const Scale = modules.Scale;
+pub const scaleDegrees = modules.scaleDegrees;
+pub const scaleDegreeCount = modules.scaleDegreeCount;
+pub const degreeIndexToPitchCv = modules.degreeIndexToPitchCv;
 
 // Ph2b: 自己進化 CV / Clap / lofi FX
 pub const Random = modules.Random;

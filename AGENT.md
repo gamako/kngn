@@ -352,15 +352,27 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
   pitch_cv は VCO・Quantizer 境界で Hz 変換）。
 - **modules.zig**: VCO/VCA/EnvGen/VCF/Mixer/Output（Ph1）＋ Clock/ClockDivider/EuclideanSeq/Quantizer/
   Kick/Hat/PercEnv（Ph2a）＋ Random/TuringMachine/Clap/Saturator/Bitcrusher/DelayFx/ReverbFx/VinylNoiseFx/
-  WowFlutterFx（Ph2b。合成ドラム・lofi FX はサンプル不使用）。依存は dsp と `libs/synth` の lock-free 小物のみ
-  （Voice/SynthEngine/NoteQueue には依存しない）。
+  WowFlutterFx（Ph2b）＋ ChordPad（Ph4。Ph5 で pitch_cv/cutoff/level の任意 CV 入力を追加。未接続は固定 root で後方互換）＋
+  **StepSeq / Lfo**（Ph5。合成ドラム・lofi FX はサンプル不使用）。`Scale`/`scaleDegreeCount`/`degreeIndexToPitchCv` を
+  module-level に共有し Quantizer/StepSeq/アンビエント生成が同じ scale 写像を使う。依存は dsp と `libs/synth` の
+  lock-free 小物のみ（Voice/SynthEngine/NoteQueue には依存しない）。
+  - **StepSeq**（Ph5 DrumMachine/BassMachine）: clock gate で 16 step を進める editable シーケンサ。
+    kind=.drum は gate 1 出力、kind=.bass は gate/pitch_cv/accent_cv の 3 出力（slide は内部 pitch glide。未配線出力は作らない）。
 - **lofi FX dsp**（`src/dsp`）: Bitcrush（bit/SR 低減）/ VinylNoise（crackle+hiss）/ WowFlutter（可変 delay の
   ピッチ揺れ）。既存 DelayLine/Reverb/softClip も FX wrapper module から利用。
 - **apps/modular**（`run-modular`）: `patch.zig` の `LofiPatch`（自己生成パッチを 1 回構築し RT で
-  `graph.processBlock`）＋ `main.zig`（window+audio+harness probe）。`LofiPatch` は graph が各モジュールへの
-  ctx ポインタを保持する自己参照のため**ヒープ確保しムーブしない**（`create`/`destroy`）。
-  自己進化は in-graph CV のみ（TuringMachine→Quantizer でベース旋律が lock しつつ稀に変異、Random→VCF cutoff）。
-  全 RNG fixed seed で決定的。harness `modular` probe が生成状態（bpm/density/turing_register/bass_pitch/active）を公開。
+  `graph.processBlock`）＋ `main.zig`（window+audio+harness probe + DrumMachine/BassMachine GUI）。`LofiPatch` は
+  graph が各モジュールへの ctx ポインタを保持する自己参照のため**ヒープ確保しムーブしない**（`create`/`destroy`）。
+  - **生成は 2 系統**（Ph5 方針 C）: ①前景 = editable StepSeq の grid/303 を **per-bar 離散変異**（evolve(全体トグル)/
+    track 単位 lock/density バンド/anchor 復帰の §4.7 境界内。GUI クリックで編集でき、evolve ON 時に lock 外 track だけが
+    小節ごと最大 1 パラメータ変異。evolve off で完全な手動シーケンサ）。
+    ②背景 = アンビエント連続生成（TuringMachine→Quantizer が ChordPad の和音 root を scale 内で遷移、Lfo が cutoff を
+    連続変調、Random が level を S&H）。無操作でも鳴り続け・流れ続ける。全 RNG fixed seed で決定的。
+  - **pattern 所有モデル**: RT(StepSeq) が grid/303 pattern の authoritative。GUI は毎フレーム snapshot を読んで
+    grid 表示し、編集時のみ `Controls.pattern_db`(DoubleBuffer) へ publish（RT が revision 変化時のみ取り込み、
+    その後また per-bar 変異）。RT 経路に alloc/lock/IO/panic を足さない。
+  - harness `modular` probe が生成状態を公開（digest=bpm/density/steps/active/gains/muted/ph4/ambient/pattern masks
+    hex/lock/evolve/rev/mut を 1024B 以内、snapshot=さらに bass_deg 配列）。
 
 ```bash
 zig build run-modular          # lofi 生成パッチを再生（ESC で終了。-Dplatform で backend 切替）

@@ -14,6 +14,43 @@ const PortKind = signal.PortKind;
 const NodeSpec = signal.NodeSpec;
 const VTable = signal.VTable;
 
+/// 任意接続の入力を読む。未接続 / 範囲外なら null を返す（standalone テストの短い Io でも安全に動く）。
+/// graph 経由では io.connected.len == n_in なので idx 判定は no-op に近い。
+inline fn optInput(io: *const Io, idx: usize) ?f32 {
+    if (idx < io.connected.len and io.connected[idx]) return io.inputs[idx];
+    return null;
+}
+
+// ----------------------------------------------------------------------------
+// 音階定義（Quantizer / StepSeq / アンビエント生成で共有。scale table を二重管理しない。Ph5）。
+// ----------------------------------------------------------------------------
+pub const Scale = enum { minor_pentatonic, minor, major };
+
+/// scale の音度（root からの半音オフセット）テーブル。
+pub fn scaleDegrees(scale: Scale) []const i32 {
+    return switch (scale) {
+        .minor_pentatonic => &[_]i32{ 0, 3, 5, 7, 10 },
+        .minor => &[_]i32{ 0, 2, 3, 5, 7, 8, 10 },
+        .major => &[_]i32{ 0, 2, 4, 5, 7, 9, 11 },
+    };
+}
+
+/// scale × octaves で表現できる音度の総数（>= 1）。
+pub fn scaleDegreeCount(scale: Scale, octaves: u8) usize {
+    return scaleDegrees(scale).len * @as(usize, @max(1, octaves));
+}
+
+/// 音度インデックス di（0..count-1、呼び出し側が clamp 済み前提）を pitch_cv(1.0/oct) へ。
+/// Hz 変換は VCO 境界に閉じる（pitch_cv をグラフに流す）。
+pub fn degreeIndexToPitchCv(scale: Scale, root_semitone: i32, di: usize) f32 {
+    const ds = scaleDegrees(scale);
+    const len = ds.len;
+    const octave: i32 = @intCast(di / len);
+    const degree: i32 = ds[di % len];
+    const semitones: i32 = root_semitone + octave * 12 + degree;
+    return @as(f32, @floatFromInt(semitones)) / 12.0;
+}
+
 // ----------------------------------------------------------------------------
 // VCO: pitch_cv(in0, cv bipolar oct) -> audio(out0)。Hz 変換をここに閉じ込める。
 // ----------------------------------------------------------------------------
@@ -384,9 +421,7 @@ pub const EuclideanSeq = struct {
 // Hz 変換は VCO 側（pitch_cv の境界はここと VCO に閉じる）。
 // ----------------------------------------------------------------------------
 pub const Quantizer = struct {
-    pub const Scale = enum { minor_pentatonic, minor, major };
-
-    scale: Scale = .minor_pentatonic,
+    scale: Scale = .minor_pentatonic, // module-level Scale を共有（StepSeq / アンビエント生成と同じ写像）
     root_semitone: i32 = 0,
     octaves: u8 = 2,
     /// 入力未接続時に使う固定 cv（最小 bass 用の一定音）。
@@ -402,31 +437,139 @@ pub const Quantizer = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    fn degrees(scale: Scale) []const i32 {
-        return switch (scale) {
-            .minor_pentatonic => &[_]i32{ 0, 3, 5, 7, 10 },
-            .minor => &[_]i32{ 0, 2, 3, 5, 7, 8, 10 },
-            .major => &[_]i32{ 0, 2, 4, 5, 7, 9, 11 },
-        };
-    }
-
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Quantizer = @ptrCast(@alignCast(ctx));
         const cv_raw = if (io.connected[0]) io.inputs[0] else self.input_cv;
         // @intFromFloat 前に必ず finite かつ 0..1 に保証（NaN/Inf の CV で RT trap を防ぐ）。
         const cv = if (std.math.isFinite(cv_raw)) std.math.clamp(cv_raw, 0.0, 1.0) else 0.0;
-        const ds = degrees(self.scale);
-        const len = ds.len;
-        const oct: usize = @max(1, self.octaves);
-        const total = len * oct;
+        const total = scaleDegreeCount(self.scale, self.octaves);
         const total_f: f32 = @floatFromInt(total);
         const di = @min(total - 1, @as(usize, @intFromFloat(cv * total_f)));
-        const octave: i32 = @intCast(di / len);
-        const degree: i32 = ds[di % len];
-        const semitones: i32 = self.root_semitone + octave * 12 + degree;
-        const pitch_cv = @as(f32, @floatFromInt(semitones)) / 12.0;
+        const pitch_cv = degreeIndexToPitchCv(self.scale, self.root_semitone, di);
         self.last_out = pitch_cv;
         io.outputs[0] = pitch_cv;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// StepSeq: clock gate(in0) で 16 step を進める editable シーケンサ（Ph5 DrumMachine/BassMachine）。
+//   - kind=.drum: output gate(out0) のみ。on_mask の hit step で 1 サンプル trigger。
+//   - kind=.bass: outputs gate(out0) / pitch_cv(out1) / accent_cv(out2)。pitch は scale degree、
+//     accent は step ごとに held 0/1（VCF cutoff_cv へ）、slide は step 内 pitch glide（tie/gate 抑制はしない）。
+// pattern(on/accent/slide mask + pitch_deg) は RT 所有・固定サイズ・乱数なし＝決定的。未配線の出力は宣言しない。
+// ----------------------------------------------------------------------------
+pub const StepSeq = struct {
+    pub const Kind = enum { drum, bass };
+    pub const STEPS: u8 = 16;
+
+    kind: Kind = .drum,
+    on_mask: u16 = 0,
+    accent_mask: u16 = 0,
+    slide_mask: u16 = 0,
+    pitch_deg: [16]i8 = [_]i8{0} ** 16, // bass: 各 step の scale degree index
+    // bass pitch マッピング（module-level scale helper を共有）
+    scale: Scale = .minor_pentatonic,
+    root_semitone: i32 = 0,
+    octaves: u8 = 2,
+    glide_rate: f32 = 6.0, // slide 中の pitch_cv 変化速度（oct/秒）
+
+    // runtime
+    step: u8 = 0,
+    prev_gate: bool = false,
+    cur_pitch: f32 = 0,
+    target_pitch: f32 = 0,
+    gliding: bool = false,
+    accent_held: f32 = 0,
+
+    const in_kinds = [_]PortKind{.gate};
+    const drum_out = [_]PortKind{.gate};
+    const bass_out = [_]PortKind{ .gate, .cv, .cv };
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *StepSeq) NodeSpec {
+        return .{
+            .vtable = &vtable,
+            .ctx = self,
+            .in_kinds = &in_kinds,
+            .out_kinds = switch (self.kind) {
+                .drum => &drum_out,
+                .bass => &bass_out,
+            },
+        };
+    }
+
+    inline fn bitSet(mask: u16, s: u8) bool {
+        return (mask >> @as(u4, @intCast(s & 15))) & 1 == 1;
+    }
+
+    /// step s の degree index を pitch_cv へ（範囲 clamp + scale 共有写像）。
+    fn pitchForStep(self: *const StepSeq, s: u8) f32 {
+        const total = scaleDegreeCount(self.scale, self.octaves);
+        const raw: i32 = self.pitch_deg[s & 15];
+        const di: usize = @intCast(std.math.clamp(raw, 0, @as(i32, @intCast(total)) - 1));
+        return degreeIndexToPitchCv(self.scale, self.root_semitone, di);
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *StepSeq = @ptrCast(@alignCast(ctx));
+        const g = signal.gateHigh(io.inputs[0]);
+        var gate_out: f32 = 0;
+        if (g and !self.prev_gate) { // clock rising edge → 現 step を評価して進める
+            const s = self.step;
+            if (bitSet(self.on_mask, s)) {
+                gate_out = 1.0;
+                if (self.kind == .bass) {
+                    self.target_pitch = self.pitchForStep(s);
+                    if (bitSet(self.slide_mask, s)) {
+                        self.gliding = true; // 現在 pitch から滑らせる（portamento）
+                    } else {
+                        self.cur_pitch = self.target_pitch; // 即時ジャンプ
+                        self.gliding = false;
+                    }
+                    self.accent_held = if (bitSet(self.accent_mask, s)) 1.0 else 0.0;
+                }
+            }
+            self.step = (s + 1) % STEPS;
+        }
+        self.prev_gate = g;
+        io.outputs[0] = gate_out;
+        if (self.kind == .bass) {
+            if (self.gliding) {
+                const rate = if (std.math.isFinite(self.glide_rate)) @abs(self.glide_rate) else 6.0;
+                const inc = rate / io.sample_rate;
+                if (self.cur_pitch < self.target_pitch) {
+                    self.cur_pitch = @min(self.cur_pitch + inc, self.target_pitch);
+                } else {
+                    self.cur_pitch = @max(self.cur_pitch - inc, self.target_pitch);
+                }
+                if (self.cur_pitch == self.target_pitch) self.gliding = false;
+            }
+            io.outputs[1] = self.cur_pitch; // bass spec のときのみ存在（drum は out0 のみ）
+            io.outputs[2] = self.accent_held;
+        }
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Lfo: 入力なし -> cv(out0, bipolar -1..1)。遅い連続モジュレーション源（アンビエント層の音色を流す。Ph5）。
+// 位相ベースで決定的（fixed phase 起点）。dsp.Lfo を包む。
+// ----------------------------------------------------------------------------
+pub const Lfo = struct {
+    lfo: dsp.Lfo = .{},
+    rate_hz: f32 = 0.1, // 既定: ~10 秒周期の遅い揺れ
+
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *Lfo) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &[_]PortKind{}, .out_kinds = &out_kinds };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Lfo = @ptrCast(@alignCast(ctx));
+        var r = if (std.math.isFinite(self.rate_hz)) self.rate_hz else 0.1;
+        r = std.math.clamp(r, 0.0, 100.0);
+        io.outputs[0] = self.lfo.next(r, io.sample_rate);
     }
 };
 
@@ -820,12 +963,15 @@ pub const ChordPad = struct {
         .{ .waveform = .saw },
     },
     lp: dsp.Filter = .{},
-    root_hz: f32 = 130.81, // C3（bass の C2 と 1 oct 違いで衝突しにくい中域）
+    base_hz: f32 = 130.81, // pitch_cv=0 のときの root（C3）。pitch_cv 接続で root_hz を駆動
+    root_hz: f32 = 130.81, // 実効 root（pitch_cv 接続時は base_hz * 2^pitch_cv）。Ph5 で連続生成が遷移させる
     /// 和音インターバル（半音）: root / perfect 5th / minor 10th(=oct + minor 3rd)。固定（旋律追従なし）。
     intervals: [3]f32 = .{ 0.0, 7.0, 15.0 },
     detune: f32 = 0.004, // warmth=1 時の最大デチューン比（±）
     warmth: f32 = 0.6, // 0..1。detune 深さ＋わずかな drive を集約（GUI "Pad Warmth"）
     cutoff: f32 = 1400.0, // LP cutoff（GUI "Pad Cutoff"）
+    cutoff_mod_oct: f32 = 0.6, // cutoff modulation 入力 1.0 あたりの幅（オクターブ。Ph5 アンビエント LFO）
+    level_mod_depth: f32 = 0.25, // level modulation 入力（aux）の深さ（Ph5 アンビエント S&H）
     attack: f32 = 0.35, // s（slow swell）
     release: f32 = 1.4, // s（long fade）
     gain: f32 = 0.22, // 出力レベル（GUI "Pad Level"・mute で 0）
@@ -834,16 +980,27 @@ pub const ChordPad = struct {
     env: f32 = 0.0,
     atk_inc: f32 = 0.0,
     rel_k: f32 = 0.0,
-    freqs: [3]f32 = .{ 0, 0, 0 }, // updateParams で算出した各 osc の Hz（@exp2 を毎サンプル避ける）
+    freqs: [3]f32 = .{ 0, 0, 0 }, // 算出した各 osc の Hz（@exp2 を毎サンプル避ける）
     drive_mul: f32 = 1.0, // warmth 由来の軽い飽和係数（事前計算）
+    base_fc: f32 = 1400.0, // updateParams が算出した clamp 済み base cutoff（modulation の基準）
+    fc_ctrl_counter: u32 = 0, // cutoff modulation を control-rate で間引くカウンタ
+    // updateParams 用 dirty-gate（knob 変化検知）
     applied_sr: f32 = -1.0,
     applied_cutoff: f32 = -1.0,
     applied_attack: f32 = -1.0,
     applied_release: f32 = -1.0,
     applied_warmth: f32 = -1.0,
+    // 実フィルタ係数 / pitch_cv root の dirty-gate（tan/@exp2 を変化時のみ）
+    applied_fc: f32 = -1.0,
+    applied_lp_sr: f32 = -1.0,
+    applied_root_cv: f32 = 0.0,
+    root_cv_init: bool = false,
 
     const done_eps: f32 = 1e-4;
-    const in_kinds = [_]PortKind{.gate};
+    const root_eps: f32 = 1e-4;
+    const fc_ctrl_period: u32 = 16;
+    // in: gate / pitch_cv(任意) / cutoff_mod(任意) / level_mod(任意)。任意入力は Io.connected[] で判定。
+    const in_kinds = [_]PortKind{ .gate, .cv, .cv, .cv };
     const out_kinds = [_]PortKind{.audio};
     const vtable = VTable{ .process = process, .updateParams = updateParams };
 
@@ -851,10 +1008,33 @@ pub const ChordPad = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
+    /// 実フィルタ係数（tan）を dirty-gated で更新。base cutoff と modulation の唯一の choke point。
+    fn applyLp(self: *ChordPad, sr: f32, fc_in: f32) void {
+        var fc = if (std.math.isFinite(fc_in)) fc_in else 1400.0;
+        fc = std.math.clamp(fc, 50.0, @max(60.0, sr * 0.5 - 1.0));
+        if (self.applied_fc == fc and self.applied_lp_sr == sr) return;
+        self.lp.sample_rate = sr;
+        self.lp.setMode(.lowpass);
+        self.lp.setParams(fc, 0.7);
+        self.applied_fc = fc;
+        self.applied_lp_sr = sr;
+    }
+
+    /// 和音 Hz（root × 固定 interval × warmth デチューン）と warmth 飽和係数を再計算（@exp2 はここだけ）。
+    fn recomputeFreqs(self: *ChordPad) void {
+        const w = if (std.math.isFinite(self.warmth)) std.math.clamp(self.warmth, 0.0, 1.0) else 0.6;
+        for (0..3) |i| {
+            const ci: f32 = @floatFromInt(@as(i32, @intCast(i)) - 1); // -1, 0, +1
+            const det = 1.0 + ci * self.detune * w;
+            self.freqs[i] = self.root_hz * @exp2(self.intervals[i] / 12.0) * det;
+        }
+        self.drive_mul = 1.0 + w * 0.4;
+    }
+
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *ChordPad = @ptrCast(@alignCast(ctx));
         // sr/cutoff/attack/release/warmth のいずれか変化時のみ係数(@exp2/tan)再計算（GUI runtime 変更を拾う）。
-        // process は毎サンプル軽量算術のみ（@exp2 等の transcendental はここに集約）。
+        // process は毎サンプル軽量算術のみ（重い transcendental はここ＝ブロックレートに集約）。
         if (self.applied_sr == sr and self.applied_cutoff == self.cutoff and
             self.applied_attack == self.attack and self.applied_release == self.release and
             self.applied_warmth == self.warmth) return;
@@ -863,17 +1043,9 @@ pub const ChordPad = struct {
         self.rel_k = decayCoef(self.release, sr);
         var fc = if (std.math.isFinite(self.cutoff)) self.cutoff else 1400.0;
         fc = std.math.clamp(fc, 50.0, @max(60.0, sr * 0.5 - 1.0));
-        self.lp.sample_rate = sr;
-        self.lp.setMode(.lowpass);
-        self.lp.setParams(fc, 0.7);
-        // 和音 Hz（固定 interval × warmth デチューン）と warmth 飽和係数を事前計算。
-        const w = if (std.math.isFinite(self.warmth)) std.math.clamp(self.warmth, 0.0, 1.0) else 0.6;
-        for (0..3) |i| {
-            const ci: f32 = @floatFromInt(@as(i32, @intCast(i)) - 1); // -1, 0, +1
-            const det = 1.0 + ci * self.detune * w;
-            self.freqs[i] = self.root_hz * @exp2(self.intervals[i] / 12.0) * det;
-        }
-        self.drive_mul = 1.0 + w * 0.4;
+        self.base_fc = fc;
+        self.applyLp(sr, fc); // base cutoff（cutoff modulation 未接続時はこれが効く）
+        self.recomputeFreqs();
         self.applied_sr = sr;
         self.applied_cutoff = self.cutoff;
         self.applied_attack = self.attack;
@@ -883,6 +1055,26 @@ pub const ChordPad = struct {
 
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *ChordPad = @ptrCast(@alignCast(ctx));
+        // pitch_cv(任意)で root を駆動（連続生成のアンビエント和声）。値変化時のみ @exp2 再計算（dirty-gate）。
+        // 信号規約上 pitch_cv=0 は基準音なので、未接続判定は値ではなく Io.connected[] で行う。
+        if (optInput(io, 1)) |pcv_raw| {
+            const pcv = if (std.math.isFinite(pcv_raw)) std.math.clamp(pcv_raw, -4.0, 4.0) else 0.0;
+            if (!self.root_cv_init or @abs(pcv - self.applied_root_cv) > root_eps) {
+                self.root_hz = self.base_hz * @exp2(pcv);
+                self.recomputeFreqs();
+                self.applied_root_cv = pcv;
+                self.root_cv_init = true;
+            }
+        }
+        // cutoff modulation(任意)を control-rate で評価（毎サンプル tan を避ける。VCF と同方針）。
+        if (optInput(io, 2)) |m_raw| {
+            self.fc_ctrl_counter += 1;
+            if (self.fc_ctrl_counter >= fc_ctrl_period) {
+                self.fc_ctrl_counter = 0;
+                const m = if (std.math.isFinite(m_raw)) std.math.clamp(m_raw, -1.0, 1.0) else 0.0;
+                self.applyLp(io.sample_rate, self.base_fc * @exp2(m * self.cutoff_mod_oct));
+            }
+        }
         const g = signal.gateHigh(io.inputs[0]);
         if (g and !self.prev_gate) self.attacking = true; // (再)トリガで swell
         self.prev_gate = g;
@@ -905,7 +1097,12 @@ pub const ChordPad = struct {
         }
         sum *= 1.0 / 3.0;
         const driven = dsp.softClip(sum * self.drive_mul); // warmth で軽い飽和（係数は事前計算）
-        const y = self.lp.process(driven) * self.env * self.gain;
+        var y = self.lp.process(driven) * self.env * self.gain;
+        // level modulation(任意・aux)。アンビエント S&H 由来の控えめな呼吸（毎サンプル軽量）。
+        if (optInput(io, 3)) |a_raw| {
+            const a = if (std.math.isFinite(a_raw)) a_raw else 0.0;
+            y *= std.math.clamp(1.0 + a * self.level_mod_depth, 0.0, 2.0);
+        }
         io.outputs[0] = if (std.math.isFinite(y)) y else 0;
     }
 };
@@ -1584,6 +1781,170 @@ test "Sidechain: finite under invalid amount/release" {
     while (i < 200) : (i += 1) {
         const trig: f32 = if (i % 10 == 0) 1.0 else 0.0;
         drive(&Sidechain.vtable, &sc, &.{ 1.0, trig }, &.{ true, true }, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+    }
+}
+
+// ============================================================================
+// Ph5 tests: StepSeq / Lfo / ChordPad CV 入力（絶対値 assert・後方互換・決定性）
+// ============================================================================
+
+/// clock の rising/falling を 1 組 drive し、その rising で出た gate を返す（StepSeq 駆動ヘルパー）。
+fn stepClock(seq: *StepSeq, outs: []f32) f32 {
+    drive(&StepSeq.vtable, seq, &.{1.0}, &.{true}, outs, 48000); // rising → step 評価
+    const g = outs[0];
+    drive(&StepSeq.vtable, seq, &.{0.0}, &.{true}, outs, 48000); // falling
+    return g;
+}
+
+test "StepSeq drum: gate fires exactly at on_mask step indices (絶対位置)" {
+    // step 0,4,8,12 を on（four-on-floor）。clock 16 edge で立つ step が正確にその位置だけ。
+    var seq = StepSeq{ .kind = .drum, .on_mask = 0b0001000100010001 };
+    var out: [1]f32 = undefined;
+    var s: u8 = 0;
+    while (s < 16) : (s += 1) {
+        const g = stepClock(&seq, &out);
+        const expect_on = (s % 4 == 0);
+        try testing.expectEqual(expect_on, g > 0.5);
+    }
+    // 1 周して再び step 0 で立つ（wrap）。
+    try testing.expect(stepClock(&seq, &out) > 0.5);
+}
+
+test "StepSeq drum: empty mask never fires; full mask always fires" {
+    var empty = StepSeq{ .kind = .drum, .on_mask = 0 };
+    var full = StepSeq{ .kind = .drum, .on_mask = 0xFFFF };
+    var out: [1]f32 = undefined;
+    var s: u8 = 0;
+    while (s < 16) : (s += 1) {
+        try testing.expect(stepClock(&empty, &out) < 0.5);
+        try testing.expect(stepClock(&full, &out) > 0.5);
+    }
+}
+
+test "StepSeq bass: pitch_cv matches shared scale helper at on steps (絶対値)" {
+    // step 0,8 を on、degree[0]=0, degree[8]=3。pitch_cv = degreeIndexToPitchCv で一致するはず。
+    var seq = StepSeq{ .kind = .bass, .on_mask = 0b0000000100000001, .scale = .minor_pentatonic, .octaves = 2 };
+    seq.pitch_deg[0] = 0;
+    seq.pitch_deg[8] = 3;
+    var out: [3]f32 = undefined; // bass は 3 出力
+    var s: u8 = 0;
+    while (s < 9) : (s += 1) {
+        drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000); // rising
+        if (s == 0) {
+            try testing.expect(out[0] > 0.5); // gate
+            try testing.expectApproxEqAbs(degreeIndexToPitchCv(.minor_pentatonic, 0, 0), out[1], 1e-6);
+        }
+        if (s == 8) {
+            try testing.expect(out[0] > 0.5);
+            // slide なしなので即時ジャンプ → degree 3 の pitch_cv に一致
+            try testing.expectApproxEqAbs(degreeIndexToPitchCv(.minor_pentatonic, 0, 3), out[1], 1e-6);
+        }
+        drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000); // falling
+    }
+}
+
+test "StepSeq bass: accent_held is 0/1 per step and persists between triggers" {
+    var seq = StepSeq{ .kind = .bass, .on_mask = 0b11, .accent_mask = 0b10 }; // step0 on no-accent, step1 on accent
+    seq.pitch_deg[0] = 0;
+    seq.pitch_deg[1] = 0;
+    var out: [3]f32 = undefined;
+    // step 0: on, no accent → accent_cv 0
+    drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[2]);
+    drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[2]); // 次 trigger まで保持
+    // step 1: on, accent → accent_cv 1
+    drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000);
+    try testing.expectEqual(@as(f32, 1.0), out[2]);
+}
+
+test "StepSeq bass: slide glides pitch toward target over time (not instant)" {
+    // step0 deg0(=cv0), step1 deg3 with slide → step1 で即ジャンプせず滑る。
+    var seq = StepSeq{ .kind = .bass, .on_mask = 0b11, .slide_mask = 0b10, .glide_rate = 1.0, .octaves = 2 };
+    seq.pitch_deg[0] = 0;
+    seq.pitch_deg[1] = 3;
+    var out: [3]f32 = undefined;
+    drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000); // step0 → cur=0
+    drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000);
+    const target = degreeIndexToPitchCv(.minor_pentatonic, 0, 3);
+    drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000); // step1 rising → start glide
+    try testing.expect(out[1] < target); // まだ到達していない（滑っている途中）
+    try testing.expect(out[1] >= 0.0);
+    // 多数サンプル進めれば target へ収束
+    var i: u32 = 0;
+    while (i < 48000) : (i += 1) drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000);
+    try testing.expectApproxEqAbs(target, out[1], 1e-4);
+}
+
+test "StepSeq: spec exposes 1 output (drum) / 3 outputs (bass) — no dead ports" {
+    var d = StepSeq{ .kind = .drum };
+    var b = StepSeq{ .kind = .bass };
+    try testing.expectEqual(@as(usize, 1), d.spec().out_kinds.len);
+    try testing.expectEqual(@as(usize, 3), b.spec().out_kinds.len);
+}
+
+test "Lfo: deterministic, bounded, advances by rate" {
+    var a = Lfo{ .rate_hz = 1.0 };
+    var b = Lfo{ .rate_hz = 1.0 };
+    var oa: [1]f32 = undefined;
+    var ob: [1]f32 = undefined;
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        drive(&Lfo.vtable, &a, &[_]f32{}, &[_]bool{}, &oa, 48000);
+        drive(&Lfo.vtable, &b, &[_]f32{}, &[_]bool{}, &ob, 48000);
+        try testing.expectEqual(oa[0], ob[0]); // 同 seed/phase → bit 一致
+        try testing.expect(oa[0] >= -1.0001 and oa[0] <= 1.0001); // 有界
+    }
+}
+
+test "ChordPad: optional pitch_cv unconnected keeps fixed C3 root (backward compat)" {
+    // 未接続(len-1 Io)では従来どおり固定 root。connected[] 判定なので壊れない。
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000); // gate のみ
+    try testing.expectApproxEqAbs(@as(f32, 130.81), p.root_hz, 1e-2); // root 不変
+    try testing.expect(!p.root_cv_init); // CV root を一度も使っていない
+}
+
+test "ChordPad: pitch_cv connected drives root; value 0 means base note (not 'unconnected')" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    // pitch_cv=0 を「接続」して与える → 未接続扱いせず base(C3) を出す（connected[] 判定の要）。
+    drive(&ChordPad.vtable, &p, &.{ 1.0, 0.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    try testing.expect(p.root_cv_init);
+    try testing.expectApproxEqAbs(@as(f32, 130.81), p.root_hz, 1e-2); // pitch_cv 0 → base
+    // pitch_cv=+1oct → root 2倍
+    drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 261.62), p.root_hz, 1e-1);
+}
+
+test "ChordPad: root recompute is dirty-gated (no per-sample @exp2 when pitch_cv constant)" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    drive(&ChordPad.vtable, &p, &.{ 1.0, 0.5, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    const f0 = p.freqs[0];
+    const applied = p.applied_root_cv;
+    var i: u32 = 0;
+    while (i < 500) : (i += 1) {
+        drive(&ChordPad.vtable, &p, &.{ 0.0, 0.5, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    }
+    try testing.expectEqual(applied, p.applied_root_cv); // 変化なし → 再計算していない
+    try testing.expectEqual(f0, p.freqs[0]);
+}
+
+test "ChordPad: finite under non-finite CV inputs" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    var i: u32 = 0;
+    while (i < 300) : (i += 1) {
+        drive(&ChordPad.vtable, &p, &.{ 1.0, nan, inf, nan }, &.{ true, true, true, true }, &o, 48000);
         try testing.expect(std.math.isFinite(o[0]));
     }
 }
