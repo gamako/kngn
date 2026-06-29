@@ -332,6 +332,29 @@ pub fn build(b: *std.Build) void {
     const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
     const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
 
+    // 範囲選択 core（TASK-44）。@import("undo.zig") 経由で undo の png 使用テストもコンパイルされるため png 要。
+    const core_selection_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/selection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_selection_mod.addImport("png", example_modules.png);
+    const core_selection_test = b.addTest(.{ .root_module = core_selection_mod });
+    const run_core_selection_test = b.addRunArtifact(core_selection_test);
+
+    // 範囲選択の入力アダプタ（TASK-44）。core を名前付き import（canvas_input と同型・png 不要）
+    const selection_input_core = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+    });
+    const selection_input_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/selection_input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    selection_input_mod.addImport("core", selection_input_core);
+    const selection_input_test = b.addTest(.{ .root_module = selection_input_mod });
+    const run_selection_input_test = b.addRunArtifact(selection_input_test);
+
     // ベジェ入力アダプタ（TASK-21.13）。core を名前付き import（canvas_input と同型）
     const bezier_input_core = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/core.zig"),
@@ -363,6 +386,8 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_path_editor_test.step);
     test_core_step.dependOn(&run_canvas_input_test.step);
     test_core_step.dependOn(&run_bezier_input_test.step);
+    test_core_step.dependOn(&run_core_selection_test.step);
+    test_core_step.dependOn(&run_selection_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
 
     // ========================================

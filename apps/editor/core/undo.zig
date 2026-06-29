@@ -118,6 +118,7 @@ pub const StrokeRecorder = struct {
         const ux: u32 = @intCast(x);
         const uy: u32 = @intCast(y);
         if (ux >= canvas.width or uy >= canvas.height) return;
+        if (canvas.selection) |sel| if (!sel.contains(x, y)) return; // 選択範囲外は描かない（null=制約なし。TASK-44）
         const idx: usize = uy * canvas.width + ux;
         const pixels = canvas.layerPixels(self.layer_idx);
         const before = pixels[idx];
@@ -197,6 +198,7 @@ pub const StrokeRecorder = struct {
         const ux: u32 = @intCast(x);
         const uy: u32 = @intCast(y);
         if (ux >= canvas.width or uy >= canvas.height) return;
+        if (canvas.selection) |sel| if (!sel.contains(x, y)) return; // 選択範囲外は塗らない（null=制約なし。TASK-44）
         const idx: usize = uy * canvas.width + ux;
         const pixels = canvas.layerPixels(self.layer_idx);
         if (self.coverage[idx] == 0) { // 初回タッチ（番兵）: 原本を退避
@@ -864,4 +866,63 @@ test "brush: replace stroke の後に brush が正常（状態分離）" {
     const px = c.layers.items[0].pixels;
     for (0..4) |x| try std.testing.expectEqual(BLACK, px[x]); // replace の (0,0)-(3,0) 保持
     try std.testing.expectEqual(RED, px[5 * 8 + 5]); // brush は cov=255 で不透明 RED
+}
+
+// ── selection 制約（TASK-44）─────────────────────────────────
+// 描画ホットパス（replace=point / brush=applyCoverage）が canvas.selection を尊重する。
+
+test "selection: replace stroke は選択範囲内のみ描画（範囲外は diff も write もしない）" {
+    const gpa = std.testing.allocator;
+    var e = try TestEditor.init(gpa, 8, 8);
+    defer e.deinit();
+    e.canvas.setSelection(.{ .x = 2, .y = 2, .w = 4, .h = 4 }); // [2,6)×[2,6)
+    // 水平線 y=2, x=0..7 → 選択内 x∈[2,6) の 4px だけ塗られる
+    e.beginStroke(0, 2, BLACK);
+    e.strokeTo(7, 2);
+    e.endStroke();
+    try std.testing.expectEqual(@as(usize, 4), countColored(&e, BLACK));
+    try std.testing.expectEqual(@as(u32, 0), e.pixels()[2 * 8 + 1]); // 範囲外
+    try std.testing.expectEqual(BLACK, e.pixels()[2 * 8 + 2]); // 範囲内左端
+    try std.testing.expectEqual(BLACK, e.pixels()[2 * 8 + 5]); // 範囲内右端
+    try std.testing.expectEqual(@as(u32, 0), e.pixels()[2 * 8 + 6]); // 範囲外
+    e.undoOp(); // 記録された diff のみ復元 → 空へ戻る
+    try std.testing.expectEqual(@as(usize, 0), countColored(&e, BLACK));
+}
+
+test "selection: null では stroke が全域に描ける（制約なし経路の等価性）" {
+    const gpa = std.testing.allocator;
+    var e = try TestEditor.init(gpa, 8, 8);
+    defer e.deinit();
+    e.beginStroke(0, 0, BLACK); // selection 既定 null
+    e.strokeTo(7, 0);
+    e.endStroke();
+    try std.testing.expectEqual(@as(usize, 8), countColored(&e, BLACK));
+}
+
+test "selection: brush dab も選択範囲外を塗らない" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    c.setSelection(.{ .x = 3, .y = 3, .w = 2, .h = 2 }); // [3,5)×[3,5)
+    // 3x3 dab を中心 (3,3) に → 選択内 (3,3),(4,3),(3,4),(4,4) の 4px のみ
+    const dab: Dab = .{ .offsets = &[_]Offset{
+        .{ .dx = -1, .dy = -1, .cov = 255 }, .{ .dx = 0, .dy = -1, .cov = 255 }, .{ .dx = 1, .dy = -1, .cov = 255 },
+        .{ .dx = -1, .dy = 0, .cov = 255 },  .{ .dx = 0, .dy = 0, .cov = 255 },  .{ .dx = 1, .dy = 0, .cov = 255 },
+        .{ .dx = -1, .dy = 1, .cov = 255 },  .{ .dx = 0, .dy = 1, .cov = 255 },  .{ .dx = 1, .dy = 1, .cov = 255 },
+    } };
+    rec.brushBegin(0, RED, 255);
+    rec.stamp(&c, gpa, 3, 3, dab);
+    const cmd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
+    defer gpa.free(cmd.paint.diffs);
+    const px = c.layers.items[0].pixels;
+    var n: usize = 0;
+    for (px) |p| {
+        if (p == RED) n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(RED, px[3 * 8 + 3]);
+    try std.testing.expectEqual(RED, px[4 * 8 + 4]);
+    try std.testing.expectEqual(@as(u32, 0), px[2 * 8 + 2]); // 範囲外
 }

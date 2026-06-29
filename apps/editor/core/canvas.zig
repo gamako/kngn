@@ -4,7 +4,17 @@ const blend = @import("blend.zig");
 const bezier = @import("bezier.zig");
 
 pub const Vec2 = struct { x: i32, y: i32 };
-pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+pub const Rect = struct {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+
+    /// 半開区間 [x, x+w) × [y, y+h) に (px,py) を含むか。
+    pub fn contains(self: Rect, px: i32, py: i32) bool {
+        return px >= self.x and py >= self.y and px < self.x + self.w and py < self.y + self.h;
+    }
+};
 
 pub const Layer = struct {
     pixels: []u32, // format: canonical BGRA 0xAARRGGBB (bytes [B,G,R,A] on little-endian)
@@ -19,6 +29,8 @@ pub const Canvas = struct {
     selected_layer: usize = 0,
     composite_cache: []u32,
     allocator: Allocator,
+    /// 範囲選択（矩形）。null=選択なし（描画は全域に許可）。canvas 内へ clip 済みの矩形のみ保持する（TASK-44）。
+    selection: ?Rect = null,
 
     pub fn init(gpa: Allocator, w: u32, h: u32) !Canvas {
         const size: usize = @as(usize, w) * h;
@@ -150,6 +162,17 @@ pub const Canvas = struct {
         for (self.layers.items) |layer| {
             @memset(layer.pixels, 0);
         }
+        self.selection = null;
+    }
+
+    /// 範囲選択を設定する（rect は呼び出し側が canvas 内へ clip 済みとする）。null で解除。
+    pub fn setSelection(self: *Canvas, rect: ?Rect) void {
+        self.selection = rect;
+    }
+
+    /// 範囲選択を解除する。
+    pub fn clearSelection(self: *Canvas) void {
+        self.selection = null;
     }
 
     /// レイヤのピクセル配列への直接アクセス（read/write プリミティブ）。
@@ -164,6 +187,7 @@ pub const Canvas = struct {
         const ux: u32 = @intCast(x);
         const uy: u32 = @intCast(y);
         if (ux >= self.width or uy >= self.height) return;
+        if (self.selection) |sel| if (!sel.contains(x, y)) return; // 選択範囲外は描かない（null=制約なし）
         self.layers.items[layer_idx].pixels[uy * self.width + ux] = color;
     }
 };
@@ -244,6 +268,39 @@ test "Canvas drawPixel bounds check" {
     try std.testing.expectEqual(@as(u32, 0xFF000000), canvas.layers.items[0].pixels[0]);
     canvas.drawPixel(0, -1, 0, 0xFF0000FF); // out of bounds, no crash
     canvas.drawPixel(0, 4, 0, 0xFF0000FF); // out of bounds, no crash
+}
+
+test "Canvas drawPixel respects selection (null=制約なし / 範囲外は描かない)" {
+    const gpa = std.testing.allocator;
+    var canvas = try Canvas.init(gpa, 4, 4);
+    defer canvas.deinit();
+    const RED: u32 = 0xFFFF0000;
+
+    // 選択 [1,3)×[1,3) を設定
+    canvas.setSelection(.{ .x = 1, .y = 1, .w = 2, .h = 2 });
+    canvas.drawPixel(0, 0, 0, RED); // 範囲外 → 無視
+    canvas.drawPixel(0, 1, 1, RED); // 範囲内 → 描画
+    canvas.drawPixel(0, 2, 2, RED); // 範囲内（右下端の直前）→ 描画
+    canvas.drawPixel(0, 3, 3, RED); // 範囲外（半開区間で 3 は外）→ 無視
+    const px = canvas.layerPixels(0);
+    try std.testing.expectEqual(@as(u32, 0), px[0 * 4 + 0]);
+    try std.testing.expectEqual(RED, px[1 * 4 + 1]);
+    try std.testing.expectEqual(RED, px[2 * 4 + 2]);
+    try std.testing.expectEqual(@as(u32, 0), px[3 * 4 + 3]);
+
+    // 解除すると全域に描ける
+    canvas.clearSelection();
+    canvas.drawPixel(0, 0, 0, RED);
+    try std.testing.expectEqual(RED, px[0]);
+}
+
+test "Rect.contains: 半開区間" {
+    const r = Rect{ .x = 2, .y = 3, .w = 4, .h = 5 };
+    try std.testing.expect(r.contains(2, 3));
+    try std.testing.expect(r.contains(5, 7)); // x+w-1, y+h-1
+    try std.testing.expect(!r.contains(6, 7)); // x+w は外
+    try std.testing.expect(!r.contains(5, 8)); // y+h は外
+    try std.testing.expect(!r.contains(1, 3));
 }
 
 test "Canvas clear" {

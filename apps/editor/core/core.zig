@@ -22,6 +22,10 @@ pub const StrokeRecorder = undo.StrokeRecorder;
 pub const Dab = undo.Dab;
 pub const Offset = undo.Offset;
 
+// 範囲選択（TASK-44）。selection は Canvas.selection: ?Rect、編集は selection.zig。
+pub const selection = @import("selection.zig");
+pub const PixelBlock = selection.PixelBlock;
+
 // Tool 抽象（TASK-21.7）
 pub const Tool = tool.Tool;
 pub const ToolEvent = tool.ToolEvent;

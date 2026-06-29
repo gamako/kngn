@@ -20,6 +20,8 @@ const canvas_input = @import("canvas_input.zig");
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
+const selection_input = @import("selection_input.zig");
+const selection_overlay = @import("selection_overlay.zig");
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -41,6 +43,9 @@ const BOTTOM_PANE_MIN: i32 = 80;
 const CANVAS_MIN: i32 = 120; // pane リサイズ時に canvas へ残す最小辺
 const SPLITTER_T: i32 = 6; // 境界帯の太さ
 const SAVE_MSG_DURATION: f64 = 3.0;
+// 範囲選択のマーチングアンツ（TASK-44）。phase 速度（units/sec）と周期（=2*DASH。selection_overlay の DASH=4）。
+const MARCH_SPEED: f64 = 12.0;
+const MARCH_PERIOD: f64 = 8.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
@@ -75,6 +80,7 @@ const ToolKind = enum {
     eraser,
     brush,
     bezier,
+    select,
 
     fn name(self: ToolKind) []const u8 {
         return switch (self) {
@@ -82,6 +88,7 @@ const ToolKind = enum {
             .eraser => "Eraser",
             .brush => "Brush",
             .bezier => "Bezier",
+            .select => "Select",
         };
     }
 };
@@ -135,6 +142,12 @@ const App = struct {
     /// ベジェ(ペン)ツール（独立経路。TASK-21.13）。状態機械 + マウス入力アダプタ。
     bezier_editor: core.PathEditor = .{},
     bez_in: bezier_input.BezierInput = .{},
+    /// 範囲選択ツール（独立経路。TASK-44）。マーキー作成 / 選択範囲移動の状態機械。
+    sel_in: selection_input.SelectionInput = .{},
+    /// clipboard（copy/cut で確保し paste で参照。gpa 所有・deinit で free）。
+    clipboard: ?core.PixelBlock = null,
+    /// paste/move のブロック配置方法（既定 over=透明を保持＝下の絵を残す）。右ペインのトグルで切替（TASK-44）。
+    blend_mode: core.selection.Blend = .over,
     active_kind: ToolKind = .pen,
     /// ── ビューポート（TASK-39）。view_zoom は整数倍、pan は表示領域中央基準の screen px オフセット ──
     view_zoom: i32 = ZOOM_DEFAULT,
@@ -185,16 +198,19 @@ const App = struct {
             .eraser => self.eraser.tool(),
             .brush => self.brush.tool(),
             .bezier => self.pen.tool(), // bezier は独立経路で canvas_input を経由しない（到達しないフォールバック）
+            .select => self.pen.tool(), // select も独立経路（到達しないフォールバック）
         };
     }
 
     /// ツール切替を一元化（active_kind への代入は全てここ経由）。
-    /// capture 中は切替しない（既存 stroke を宙ぶらりんにしない）。.bezier から出る時は未確定パスを cancel。
+    /// capture / 選択ドラッグ中は切替しない（進行中操作を宙ぶらりんにしない）。
+    /// .bezier から出る時は未確定パスを cancel。.select から出る時は進行中ドラッグを破棄（selection は保持）。
     fn setActiveKind(self: *App, next: ToolKind) void {
-        if (self.input.capturing) return;
+        if (self.input.capturing or self.sel_in.state != .idle) return;
         if (self.active_kind == .bezier and next != .bezier) {
             self.bezier_editor.update(self.gpa, .cancel);
         }
+        if (next != .select) self.sel_in.discardFloat(self.gpa); // 選択ツールを離れる → フロート破棄（canvas は最終形のまま）
         self.active_kind = next;
     }
 
@@ -225,7 +241,7 @@ const App = struct {
     }
 
     fn editingBlocked(self: *const App) bool {
-        return self.input.capturing or self.bezier_editor.isEditing();
+        return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle;
     }
 
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
@@ -401,6 +417,41 @@ const App = struct {
         self.undo.pushClear(self.gpa, &self.canvas, self.canvas.selected_layer);
     }
 
+    /// 選択範囲を clipboard へコピー（読み取りのみ・undo 不要）。selection 無しは no-op。
+    fn doCopy(self: *App) void {
+        if (self.editingBlocked()) return;
+        const sel = self.canvas.selection orelse return;
+        const block = core.selection.extract(self.gpa, &self.canvas, self.canvas.selected_layer, sel);
+        if (self.clipboard) |*old| old.deinit(self.gpa);
+        self.clipboard = block;
+    }
+
+    /// 選択範囲を clipboard へコピーし、選択内を透明化する（undo 可）。selection 無しは no-op。
+    fn doCut(self: *App) void {
+        if (self.editingBlocked()) return;
+        const sel = self.canvas.selection orelse return;
+        const block = core.selection.extract(self.gpa, &self.canvas, self.canvas.selected_layer, sel);
+        if (self.clipboard) |*old| old.deinit(self.gpa);
+        self.clipboard = block;
+        if (core.selection.clearRectCmd(self.gpa, &self.canvas, self.canvas.selected_layer, sel)) |cmd| {
+            self.undo.push(self.gpa, cmd);
+        }
+    }
+
+    /// clipboard を貼り付ける（undo 可）。貼付先は selection の左上（無ければ 0,0）。
+    /// selection を貼付矩形（canvas 内 clip）へ更新する。clipboard 無しは no-op。
+    fn doPaste(self: *App) void {
+        if (self.editingBlocked()) return;
+        const block = self.clipboard orelse return;
+        const dx: i32 = if (self.canvas.selection) |s| s.x else 0;
+        const dy: i32 = if (self.canvas.selection) |s| s.y else 0;
+        if (core.selection.pasteCmd(self.gpa, &self.canvas, self.canvas.selected_layer, block, dx, dy, self.blend_mode)) |cmd| {
+            self.undo.push(self.gpa, cmd);
+        }
+        const dest = core.Rect{ .x = dx, .y = dy, .w = @intCast(block.w), .h = @intCast(block.h) };
+        self.canvas.setSelection(core.selection.clipRect(dest, self.canvas.width, self.canvas.height));
+    }
+
     fn doAddLayer(self: *App) void {
         if (self.editingBlocked()) return;
         const selected_before = self.canvas.selected_layer;
@@ -475,6 +526,8 @@ const App = struct {
         self.canvas.layers.items[0].visible = true;
         self.canvas.layers.items[0].opacity = 255;
         @memset(self.canvas.layerPixels(0), 0);
+        self.canvas.clearSelection(); // ドキュメント差し替えで選択は解除（TASK-44）
+        self.sel_in.discardFloat(self.gpa); // フロートも破棄
     }
 
     fn syncPreviewCanvas(self: *App) void {
@@ -491,6 +544,8 @@ const App = struct {
             dst.opacity = src.opacity;
         }
         self.preview_canvas.selected_layer = self.canvas.selected_layer;
+        // selection も同期（bezier プレビューが描画制約を commit と一致させる。TASK-44）
+        self.preview_canvas.selection = self.canvas.selection;
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
@@ -517,7 +572,15 @@ const App = struct {
         // （Ctrl+S 等は Linux の保存の慣習にも合致。macOS は従来どおり Cmd で、Ctrl も追加で効く）。
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         if (k.key == .ESCAPE) {
-            self.running = false;
+            // 選択ドラッグ中なら破棄 → 選択(またはフロート)があれば解除 → それ以外は終了（TASK-44 で優先動作を追加）
+            if (self.sel_in.state != .idle) {
+                self.sel_in.cancel(self.gpa); // drag 中断（フロート破棄・実レイヤーは drag 中不変）
+            } else if (self.canvas.selection != null or self.sel_in.float != null) {
+                self.canvas.clearSelection();
+                self.sel_in.discardFloat(self.gpa);
+            } else {
+                self.running = false;
+            }
         } else if (k.key == .Q and accel) {
             self.running = false;
         } else if (k.key == .S and accel and k.modifiers.shift) {
@@ -530,12 +593,20 @@ const App = struct {
             self.doRedo();
         } else if (k.key == .Z and accel) {
             self.doUndo();
+        } else if (k.key == .C and accel) {
+            self.doCopy(); // accel+C は copy（bare C の clear より前に判定）
+        } else if (k.key == .X and accel) {
+            self.doCut();
+        } else if (k.key == .V and accel) {
+            self.doPaste();
         } else if (k.key == .B) {
             self.setActiveKind(.pen);
         } else if (k.key == .E) {
             self.setActiveKind(.eraser);
         } else if (k.key == .P) {
             self.setActiveKind(.bezier);
+        } else if (k.key == .M) {
+            self.setActiveKind(.select);
         } else if (k.key == .C) {
             self.doClear();
         } else if (k.key == .@"0") {
@@ -585,6 +656,11 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         png.crc32(std.mem.sliceAsBytes(app.canvas.compositeStraight())),
     }) catch return buf[0..0];
     len += head.len;
+    const sel_part = if (app.canvas.selection) |s|
+        std.fmt.bufPrint(buf[len..], " sel={d},{d},{d},{d}", .{ s.x, s.y, s.w, s.h }) catch return buf[0..len]
+    else
+        std.fmt.bufPrint(buf[len..], " sel=none", .{}) catch return buf[0..len];
+    len += sel_part.len;
     for (app.canvas.layers.items, 0..) |layer, idx| {
         var nonzero: usize = 0;
         for (layer.pixels) |p| {
@@ -1018,6 +1094,15 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.setActiveKind(.brush);
         if (ctx.buttonEx("Bezier", .{ .selected = app.active_kind == .bezier, .min_w = 56 }).clicked) app.setActiveKind(.bezier);
         ctx.endBox();
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Select", .{ .selected = app.active_kind == .select, .min_w = 56 }).clicked) app.setActiveKind(.select);
+        ctx.endBox();
+        // paste/move のブロック配置トグル（gui に checkbox/radio が無いため、ラベルで ON/OFF 状態を明示する）。
+        // ON=透明を保持(src-over・下の絵を残す) / OFF=上書き(replace)。
+        const blend_label: []const u8 = if (app.blend_mode == .over) "Keep Transp: ON" else "Keep Transp: OFF";
+        if (ctx.buttonEx(blend_label, .{ .selected = app.blend_mode == .over, .min_w = 130 }).clicked) {
+            app.blend_mode = if (app.blend_mode == .over) .replace else .over;
+        }
         // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
         if (app.active_kind == .brush or app.active_kind == .bezier) {
             _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
@@ -1146,6 +1231,8 @@ pub fn main(init: std.process.Init) !void {
     defer {
         if (app.current_path) |p| gpa.free(p);
         if (app.palette_path) |p| gpa.free(p);
+        if (app.clipboard) |*cb| cb.deinit(gpa);
+        app.sel_in.deinit(gpa);
         app.bezier_editor.deinit(gpa);
         app.preview_rec.deinit(gpa);
         app.preview_canvas.deinit();
@@ -1224,6 +1311,18 @@ pub fn main(init: std.process.Init) !void {
                     if (app.bez_in.update(frame, &app.bezier_editor, &app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |cmd| {
                         app.undo.push(gpa, cmd);
                     }
+                } else if (app.active_kind == .select and !app.input.capturing) {
+                    const frame: selection_input.SelectionInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = app.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                    };
+                    if (app.sel_in.update(frame, &app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |cmd| {
+                        app.undo.push(gpa, cmd);
+                    }
                 } else {
                     const frame: canvas_input.CanvasInput.Frame = .{
                         .canvas_rect = canvas_rect,
@@ -1258,6 +1357,12 @@ pub fn main(init: std.process.Init) !void {
                         const dab = app.brush.footprint();
                         app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
                         blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), rect, zoom, area);
+                    } else if (app.active_kind == .select and app.sel_in.state == .moving) {
+                        // フローティング move プレビュー: 実 canvas は不変のまま、preview_canvas の選択レイヤーへ
+                        // 「base+block@現在位置（blend_mode 合成）」を描いて表示する（確定は release）。
+                        app.syncPreviewCanvas();
+                        _ = app.sel_in.renderMovePreview(app.preview_canvas.layerPixels(app.canvas.selected_layer), CANVAS_W, CANVAS_H, app.blend_mode);
+                        blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), rect, zoom, area);
                     } else {
                         blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.compositeStraight(), rect, zoom, area);
                     }
@@ -1269,6 +1374,21 @@ pub fn main(init: std.process.Init) !void {
                     const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
                     bezier_overlay.draw(&ctx, &app.bezier_editor, rect, app.view_zoom, clip_area);
                 };
+            }
+            // 範囲選択のマーチングアンツ（選択があれば常時表示。select ツール時はドラッグ中の preview を優先）
+            {
+                const display_sel: ?core.Rect = if (app.active_kind == .select)
+                    (app.sel_in.previewRect(&app.canvas) orelse app.canvas.selection)
+                else
+                    app.canvas.selection;
+                if (display_sel != null) {
+                    if (canvas_rect) |rect| if (app.last_area) |area| {
+                        const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                        // phase は時間由来。MARCH_PERIOD(=2*DASH) で mod し i32 overflow を防ぐ（パターンは保存）。
+                        const phase: i32 = @intFromFloat(@mod(platform.getTime() * MARCH_SPEED, MARCH_PERIOD));
+                        selection_overlay.draw(&ctx, display_sel, rect, app.view_zoom, clip_area, phase);
+                    };
+                }
             }
             gui.render(
                 .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },

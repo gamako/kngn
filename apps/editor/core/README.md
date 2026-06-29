@@ -102,6 +102,37 @@ undo.undoOne(gpa, &canvas); // 取り消し
 - pixie 側のプレビュー描画（`bezier_overlay.zig`）と入力アダプタ（`bezier_input.zig`）は GUI/platform 依存
   のため core には置かない（core は数学・データ・状態機械・rasterize のみ）。
 
+## 範囲選択（TASK-44）
+
+矩形選択の MVP。selection は `Canvas.selection: ?Rect`（矩形のみ。投げ縄/ワンドは非スコープ）。
+`selection.zig` が矩形ユーティリティ（`rectFromPoints` / `clipRect`）・clipboard（`PixelBlock`）・
+cut/paste のピクセル編集・フロート移動用の純描画ヘルパ（`renderBlockOverBase` / `layerMatchesRender` /
+`diffCmd` / `clearRectInBuf`）を担う。
+
+- **描画制約**: `Canvas.selection` が非 null のとき、`StrokeRecorder.point` / `applyCoverage`（＝実描画
+  ホットパス）と `Canvas.drawPixel` は選択範囲外のピクセルを描かない。`selection == null` は 1 分岐で
+  素通り（オーバーヘッドゼロ・追加バッファ無し）。
+- **cut/paste は `canvas.layerPixels` へ直接書き込み**、selection ゲート付きの `StrokeRecorder` は
+  通さない（さもないと貼付先が選択範囲外だとゲートに握り潰される）。適用と同時に既存
+  `UndoCmd.paint`（before/after の PixelDiff 列）を生成して返すので可逆（`pushClear` と同じ形）。
+- **paste のブロック配置は `Blend{replace, over}` で切替**（`pasteCmd` 引数）: `replace`=そのまま上書き
+  （透明部も配置先を消す）、`over`=`blend.srcOver` 合成（透明部は配置先を残す）。pixie の既定は `over`
+  （透明を保持）で右ペインのトグルで切替。cut の元領域は透明（0）へ。
+- **move はフローティング（遅延確定）**: pixie 側 `selection_input` が **Float キャッシュ**（`base`=移動元を
+  0 クリアしたレイヤー / `block`=持ち上げた内容 / `rect` / `layer_idx` / `render_mode`）を持つ。canvas の
+  レイヤーは常に最終形（`base + block@rect`）に保たれるので、表示/保存/copy/probe/undo は普通にレイヤーを
+  読むだけでよく **確定トリガーは不要**。ドラッグ中は実レイヤーを変えず `preview_canvas` へ
+  `renderBlockOverBase` で表示し、release 時だけ実レイヤーへ焼いて `diffCmd` で 1 ドラッグ分の `UndoCmd.paint`
+  を作る。**release で確定せず Float を保持**するので、選択を作り直すまで何度でも再配置できる（再ドラッグは
+  Float を再利用＝再キャプチャしない）。移動開始時に「同一レイヤー / フロート矩形=現選択 / レイヤー内容=
+  `base+block@rect`」が崩れていれば（外部編集・選択変更等）`layerMatchesRender` 判定で re-lift する（単一地点
+  での無効化。copy/cut/paste/undo 等に破棄を散在させない）。
+- **selection 矩形そのものは undo 対象外**（編集アプリの慣習）。undo されるのはピクセル変更（cut/paste/move）
+  のみ。マーキー作成/解除/移動後の選択枠更新は undo に積まない（move を undo するとピクセルは戻るが選択枠は
+  移動先に残り得る＝既知の軽微な癖）。
+- pixie 側の入力（`selection_input.zig`）と overlay（`selection_overlay.zig`。マーチングアンツ）は
+  GUI/platform 依存のため core には置かない（bezier と同じ独立経路）。
+
 ## 注意・メモリ所有
 
 - `UndoCmd.paint.diffs` は gpa 所有の owned slice。`UndoStack` が pop / `deinit` で free する。
