@@ -39,6 +39,7 @@ const MouseEvent = types.MouseEvent;
 const ScrollEvent = types.ScrollEvent;
 const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
+const ModifierFlags = types.ModifierFlags;
 const EventStats = types.EventStats;
 
 const net = std.Io.net;
@@ -485,24 +486,30 @@ fn handleInject(it: *Tok) void {
             warnLine("inject key: 不明なキー");
             return;
         };
-        const ke = KeyEvent{ .key = kc, .is_repeat = false, .modifiers = .{} };
+        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        const ke = KeyEvent{ .key = kc, .is_repeat = false, .modifiers = mods };
         queue(if (std.mem.eql(u8, kind, "key_down")) Event{ .key_down = ke } else Event{ .key_up = ke });
     } else if (std.mem.eql(u8, kind, "mouse_move")) {
         const x = parseI32(it.next()) orelse return warnLine("inject mouse_move: 座標不正");
         const y = parseI32(it.next()) orelse return warnLine("inject mouse_move: 座標不正");
+        // modifiers を座標 state 更新より前に parse（未知 modifier で fail-fast する際に mouse_x/y を汚さない）
+        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
         mouse_x = x;
         mouse_y = y;
-        queue(Event{ .mouse_move = .{ .x = x, .y = y, .button = .none, .buttons = mouse_buttons, .modifiers = .{} } });
+        queue(Event{ .mouse_move = .{ .x = x, .y = y, .button = .none, .buttons = mouse_buttons, .modifiers = mods } });
     } else if (std.mem.eql(u8, kind, "mouse_down") or std.mem.eql(u8, kind, "mouse_up")) {
         const btn = parseButton(it.next()) orelse return warnLine("inject mouse: 不明なボタン");
         const down = std.mem.eql(u8, kind, "mouse_down");
+        // modifiers を setButton より前に parse（未知 modifier で fail-fast する際に mouse_buttons を汚さない）
+        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
         setButton(&mouse_buttons, btn, down);
-        const ev = MouseEvent{ .x = mouse_x, .y = mouse_y, .button = btn, .buttons = mouse_buttons, .modifiers = .{} };
+        const ev = MouseEvent{ .x = mouse_x, .y = mouse_y, .button = btn, .buttons = mouse_buttons, .modifiers = mods };
         queue(if (down) Event{ .mouse_down = ev } else Event{ .mouse_up = ev });
     } else if (std.mem.eql(u8, kind, "scroll")) {
         const dx = parseF32(it.next()) orelse return warnLine("inject scroll: 量不正");
         const dy = parseF32(it.next()) orelse return warnLine("inject scroll: 量不正");
-        queue(Event{ .mouse_scroll = .{ .x = mouse_x, .y = mouse_y, .dx = dx, .dy = dy, .is_precise = false, .buttons = mouse_buttons, .modifiers = .{} } });
+        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        queue(Event{ .mouse_scroll = .{ .x = mouse_x, .y = mouse_y, .dx = dx, .dy = dy, .is_precise = false, .buttons = mouse_buttons, .modifiers = mods } });
     } else {
         warnLine("inject: 不明な種別");
     }
@@ -856,6 +863,32 @@ fn parseButton(tok: ?[]const u8) ?MouseButton {
     return std.meta.stringToEnum(MouseButton, buf[0..name.len]);
 }
 
+/// 残りトークンを shift/ctrl/alt/cmd（大小無視）に照合してフラグを立てる。
+/// 未知トークンが 1 つでもあれば null を返す（caller が warn してそのイベントを捨てる = fail-fast。
+/// parseKey/parseButton と同じ「不正トークン→null、warn は caller」の慣習）。
+/// 残り 0 トークンなら空 ModifierFlags（非 null）。
+fn parseModifiers(it: *Tok) ?ModifierFlags {
+    var m = ModifierFlags{};
+    while (it.next()) |tok| {
+        var buf: [16]u8 = undefined;
+        if (tok.len == 0 or tok.len > buf.len) return null;
+        for (tok, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        const name = buf[0..tok.len];
+        if (std.mem.eql(u8, name, "shift")) {
+            m.shift = true;
+        } else if (std.mem.eql(u8, name, "ctrl")) {
+            m.ctrl = true;
+        } else if (std.mem.eql(u8, name, "alt")) {
+            m.alt = true;
+        } else if (std.mem.eql(u8, name, "cmd")) {
+            m.cmd = true;
+        } else {
+            return null;
+        }
+    }
+    return m;
+}
+
 fn parseUsize(tok: ?[]const u8) ?usize {
     return std.fmt.parseInt(usize, tok orelse return null, 10) catch null;
 }
@@ -929,6 +962,141 @@ test "parseButton: 名前→MouseButton" {
     try testing.expectEqual(MouseButton.right, parseButton("RIGHT").?);
     try testing.expectEqual(MouseButton.middle, parseButton("Middle").?);
     try testing.expectEqual(@as(?MouseButton, null), parseButton("x"));
+}
+
+test "parseModifiers: 0個=空 / 単一 / 複数（大小無視）/ 未知=null" {
+    {
+        var it = std.mem.tokenizeAny(u8, "", " \t");
+        const m = parseModifiers(&it).?;
+        try testing.expect(!m.shift and !m.ctrl and !m.alt and !m.cmd);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "cmd", " \t");
+        const m = parseModifiers(&it).?;
+        try testing.expect(m.cmd and !m.shift and !m.ctrl and !m.alt);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "Cmd SHIFT", " \t"); // 大小混在
+        const m = parseModifiers(&it).?;
+        try testing.expect(m.cmd and m.shift and !m.ctrl and !m.alt);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "shift ctrl alt cmd", " \t");
+        const m = parseModifiers(&it).?;
+        try testing.expect(m.shift and m.ctrl and m.alt and m.cmd);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "bogus", " \t");
+        try testing.expectEqual(@as(?ModifierFlags, null), parseModifiers(&it));
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "cmd bogus", " \t"); // 認識済みが先でも未知が混ざれば null
+        try testing.expectEqual(@as(?ModifierFlags, null), parseModifiers(&it));
+    }
+}
+
+test "inject modifiers: 全6経路で反映 / 無指定は空" {
+    resetForTest();
+    cmd_buf =
+        \\inject key_down S cmd
+        \\step 1
+        \\inject key_up A shift
+        \\step 1
+        \\inject key_down S cmd shift
+        \\step 1
+        \\inject mouse_move 10 20 ctrl
+        \\step 1
+        \\inject mouse_down left alt
+        \\step 1
+        \\inject mouse_up right cmd
+        \\step 1
+        \\inject scroll 0 -3 ctrl
+        \\step 1
+        \\inject key_down A
+        \\step 1
+        \\quit
+    ;
+
+    // key_down S cmd
+    try testing.expect(pollGate(true));
+    var e = nextInjectedEvent().?;
+    try testing.expect(e == .key_down and e.key_down.key == .S);
+    try testing.expect(e.key_down.modifiers.cmd and !e.key_down.modifiers.shift and !e.key_down.modifiers.ctrl and !e.key_down.modifiers.alt);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // key_up A shift（key_up 分岐）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .key_up and e.key_up.key == .A and e.key_up.modifiers.shift and !e.key_up.modifiers.cmd);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // key_down S cmd shift（複数）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .key_down and e.key_down.modifiers.cmd and e.key_down.modifiers.shift and !e.key_down.modifiers.ctrl);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // mouse_move 10 20 ctrl（mouse_move 分岐・座標維持）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .mouse_move and e.mouse_move.x == 10 and e.mouse_move.y == 20 and e.mouse_move.modifiers.ctrl);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // mouse_down left alt（button/buttons 維持）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .mouse_down and e.mouse_down.button == .left and e.mouse_down.buttons.left and e.mouse_down.modifiers.alt);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // mouse_up right cmd（mouse_up 分岐）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .mouse_up and e.mouse_up.button == .right and e.mouse_up.modifiers.cmd);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // scroll 0 -3 ctrl（dx/dy 維持）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .mouse_scroll and e.mouse_scroll.dx == 0 and e.mouse_scroll.dy == -3 and e.mouse_scroll.modifiers.ctrl);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    // key_down A（修飾子無し → 全 false）
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .key_down and e.key_down.key == .A);
+    const m = e.key_down.modifiers;
+    try testing.expect(!m.shift and !m.ctrl and !m.alt and !m.cmd);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    try testing.expect(!pollGate(true));
+}
+
+test "inject modifiers: 未知 modifier は fail-fast（注入されず state も汚さない）" {
+    resetForTest();
+    cmd_buf =
+        \\inject mouse_down left bogus
+        \\inject mouse_move 10 20 bogus
+        \\inject key_down S bogus
+        \\step 1
+        \\inject mouse_down left
+        \\step 1
+        \\quit
+    ;
+
+    // frame 1: 3 件とも fail-fast で queue されない
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    // mouse_down left bogus は setButton されない（button state 汚染なし）
+    try testing.expect(!mouse_buttons.left);
+
+    // frame 2: 正常な mouse_down left。座標は mouse_move 10 20 bogus で汚れず初期値(0,0)のまま
+    try testing.expect(pollGate(true));
+    const e = nextInjectedEvent().?;
+    try testing.expect(e == .mouse_down and e.mouse_down.button == .left and e.mouse_down.buttons.left);
+    try testing.expect(e.mouse_down.x == 0 and e.mouse_down.y == 0);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    try testing.expect(!pollGate(true));
 }
 
 test "実行モデル: inject→nextEvent FIFO / step がフレームを gate" {

@@ -330,10 +330,11 @@ AI がアプリの出力を手軽に確認するための仕組み。`src/platfo
 1コマンド/行（区切りは改行 **または `;`**。`#` はコメント）。**file・live で同一文法**:
 
 ```text
-inject key_down A          # key_down/key_up <KEY>（KeyCode 名。大小無視。例 A / SPACE / ESCAPE / LEFT / 0）
-inject mouse_move 100 120  # mouse_move <x> <y>
-inject mouse_down left     # mouse_down/up <left|right|middle>
-inject scroll 0 -3         # scroll <dx> <dy>
+inject key_down A          # key_down/key_up <KEY> [修飾子...]（KeyCode 名。大小無視。例 A / SPACE / ESCAPE / LEFT / 0）
+inject key_down S cmd shift # 末尾に shift/ctrl/alt/cmd を 0 個以上（順不同・大小無視）。例: Cmd+Shift+S
+inject mouse_move 100 120  # mouse_move <x> <y> [修飾子...]
+inject mouse_down left alt # mouse_down/up <left|right|middle> [修飾子...]
+inject scroll 0 -3 ctrl    # scroll <dx> <dy> [修飾子...]
 step 5                     # 5 フレーム進める（省略時 1）
 snapshot fb  /tmp/out.png  # 直近 present フレームを PNG 保存（省略時 $VP_HARNESS_OUT/frame_<n>.png）
 snapshot audio /tmp/a.wav  # 直近の audio tap を PCM16 WAV 保存（省略時 audio_<n>.wav）
@@ -348,6 +349,7 @@ quit                       # 終了（EOF でも終了）
   `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
+- **inject の修飾子トークン（TASK-32.5）**: `inject` の必須引数の後に `shift`/`ctrl`/`alt`/`cmd` を 0 個以上付けると、その KeyEvent/MouseEvent の `modifiers` に反映される（順不同・大小無視）。key_down/up・mouse_move/down/up・scroll の全経路で使える。例: `inject key_down S cmd`（Cmd+S）/ `inject key_down Z cmd`（undo）/ `inject mouse_down left alt`。**未知トークンが 1 つでもあれば警告を出し、そのイベントは注入されない（fail-fast。修飾子名の typo を握りつぶさない）**。修飾子無しは従来通り空 modifiers。
 
 ### 使い方（replay = file トランスポート）
 
