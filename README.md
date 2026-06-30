@@ -22,7 +22,7 @@ Zig + C/Swiftを組み合わせた、macOSでのクロスプラットフォー�
 ## 要件
 
 - **Zig**: 0.16.0-dev以上
-- **macOS**: 10.15以上
+- **macOS**: 11以上（Big Sur。ファイルダイアログの UTType / allowedContentTypes が macOS 11+）
 - **Xcode**: Command Line Tools
 
 ## ビルド方法

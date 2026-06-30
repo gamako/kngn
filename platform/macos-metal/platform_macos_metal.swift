@@ -1,5 +1,6 @@
 import Cocoa
 import MetalKit
+import UniformTypeIdentifiers
 
 // Metal最適化版の実装（Swift）
 // 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
@@ -963,16 +964,17 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
 // ========================================
 // ファイル選択ダイアログ (TASK-24)
 // ========================================
-// 拡張子フィルタは allowedFileTypes を使う（macOS 12 で deprecated だが全 macOS で
-// 動作し、UniformTypeIdentifiers のリンク追加が不要）。
+// 拡張子フィルタは allowedContentTypes (UTType) を使う（macOS 11+ 専用。allowedFileTypes は
+// macOS 12 で deprecated なため移行）。未知拡張子で UTType が nil の場合はフィルタ未設定（全許可）にフォールバック。
 // withUnsafeFileSystemRepresentation の ptr は Optional。non-null を確認してから strdup する。
 
 @_cdecl("platform_save_file_dialog")
 func platform_save_file_dialog(opts: UnsafePointer<PlatformSaveDialogOptions>?) -> UnsafeMutablePointer<CChar>? {
     let panel = NSSavePanel()
     if let opts = opts {
-        if let ext = opts.pointee.allowed_ext {
-            panel.allowedFileTypes = [String(cString: ext)]
+        if let ext = opts.pointee.allowed_ext,
+           let type = UTType(filenameExtension: String(cString: ext)) {
+            panel.allowedContentTypes = [type]
         }
         if let name = opts.pointee.default_name {
             panel.nameFieldStringValue = String(cString: name)
@@ -991,8 +993,9 @@ func platform_open_file_dialog(opts: UnsafePointer<PlatformOpenDialogOptions>?) 
     panel.canChooseFiles = true
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = false
-    if let opts = opts, let ext = opts.pointee.allowed_ext {
-        panel.allowedFileTypes = [String(cString: ext)]
+    if let opts = opts, let ext = opts.pointee.allowed_ext,
+       let type = UTType(filenameExtension: String(cString: ext)) {
+        panel.allowedContentTypes = [type]
     }
     guard panel.runModal() == .OK, let url = panel.url else { return nil }
     return url.withUnsafeFileSystemRepresentation { ptr in
