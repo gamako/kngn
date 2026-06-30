@@ -52,6 +52,9 @@ pub fn linkMacOSFrameworks(
     const frameworks = [_][]const u8{
         "Cocoa",
         "QuartzCore",
+        // ファイルダイアログの UTType (allowedContentTypes) 用。objc backend は明示リンク必須。
+        // swift/metal は swiftUniformTypeIdentifiers overlay 経由でも解決できるが共通化のため一律リンク。
+        "UniformTypeIdentifiers",
     };
     for (frameworks) |framework| {
         exe.root_module.linkFramework(framework, .{});

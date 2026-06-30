@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "platform.h"
 #include <math.h>
 #include <stdlib.h>
@@ -907,8 +908,9 @@ bool platform_get_event(PlatformWindow* window, PlatformEvent* event) {
 // ========================================
 // ファイル選択ダイアログ (TASK-24)
 // ========================================
-// 拡張子フィルタは allowedFileTypes を使う（macOS 12 で deprecated だが全 macOS で
-// 動作し、UniformTypeIdentifiers フレームワークのリンク追加が不要）。
+// 拡張子フィルタは allowedContentTypes (UTType) を使う（macOS 11+ 専用。allowedFileTypes は
+// macOS 12 で deprecated なため移行。UniformTypeIdentifiers framework をリンクする）。
+// 未知拡張子で UTType が nil の場合はフィルタ未設定（全許可）にフォールバックする。
 // fileSystemRepresentation は autorelease プール生存中のみ有効なので、その場で strdup する。
 
 char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts) {
@@ -916,7 +918,10 @@ char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts) {
         NSSavePanel* panel = [NSSavePanel savePanel];
         if (opts) {
             if (opts->allowed_ext) {
-                panel.allowedFileTypes = @[ [NSString stringWithUTF8String:opts->allowed_ext] ];
+                UTType* type = [UTType typeWithFilenameExtension:[NSString stringWithUTF8String:opts->allowed_ext]];
+                if (type) {
+                    panel.allowedContentTypes = @[ type ];
+                }
             }
             if (opts->default_name) {
                 panel.nameFieldStringValue = [NSString stringWithUTF8String:opts->default_name];
@@ -938,7 +943,10 @@ char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts) {
         panel.canChooseDirectories = NO;
         panel.allowsMultipleSelection = NO;
         if (opts && opts->allowed_ext) {
-            panel.allowedFileTypes = @[ [NSString stringWithUTF8String:opts->allowed_ext] ];
+            UTType* type = [UTType typeWithFilenameExtension:[NSString stringWithUTF8String:opts->allowed_ext]];
+            if (type) {
+                panel.allowedContentTypes = @[ type ];
+            }
         }
         if ([panel runModal] != NSModalResponseOK) return NULL;
         NSURL* url = [panel URL];
