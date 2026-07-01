@@ -7,7 +7,9 @@
 const std = @import("std");
 
 pub const signal = @import("signal.zig");
+pub const graph_core = @import("graph_core.zig");
 pub const graph = @import("graph.zig");
+pub const dyn = @import("dyn.zig");
 pub const modules = @import("modules.zig");
 
 pub const Graph = graph.Graph;
@@ -16,6 +18,11 @@ pub const PortKind = signal.PortKind;
 pub const Io = signal.Io;
 pub const VTable = signal.VTable;
 pub const NodeSpec = signal.NodeSpec;
+
+// TASK-40.6.1: 動的グラフエンジン（RT 安全ライブ再配線）。static Graph と graph_core を共有。
+pub const DynGraph = dyn.DynGraph;
+pub const ModuleKind = dyn.ModuleKind;
+pub const GraphView = dyn.GraphView;
 
 pub const Vco = modules.Vco;
 pub const Vca = modules.Vca;
@@ -57,7 +64,9 @@ pub const Sidechain = modules.Sidechain;
 test {
     // サブモジュールの単体テストを巻き込む。
     _ = signal;
+    _ = graph_core;
     _ = graph;
+    _ = dyn;
     _ = modules;
 }
 

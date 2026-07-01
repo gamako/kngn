@@ -8,9 +8,10 @@
 
 const std = @import("std");
 const signal = @import("signal.zig");
+const graph_core = @import("graph_core.zig");
 
 const PortKind = signal.PortKind;
-const Io = signal.Io;
+const ProcNode = graph_core.ProcNode;
 
 /// グラフの固定確保サイズ。
 pub const Caps = struct {
@@ -48,6 +49,10 @@ pub const Graph = struct {
     port_owner: []u32,
     /// finalize で決まる処理順（依存が先、長さ = node_count）。
     order: []usize,
+    /// finalize で order 順に焼く ProcNode 列（graph_core が回す共有形式。View を焼く相当）。
+    order_nodes: []ProcNode,
+    /// topo sort 用 DFS scratch（init で 1 回確保し finalize で使い回す＝per-finalize alloc をゼロに）。
+    colors: []Color,
 
     // signal バッファ ping-pong（cur = 今サンプル, prev = 前サンプル）。出力ポート単位。
     sig_a: []f32,
@@ -57,8 +62,6 @@ pub const Graph = struct {
     port_count: u32 = 0,
 
     output_node: ?usize = null,
-    out_l: f32 = 0,
-    out_r: f32 = 0,
     finalized: bool = false,
 
     pub const Error = error{
@@ -79,6 +82,10 @@ pub const Graph = struct {
         errdefer allocator.free(port_owner);
         const order = try allocator.alloc(usize, caps.max_modules);
         errdefer allocator.free(order);
+        const order_nodes = try allocator.alloc(ProcNode, caps.max_modules);
+        errdefer allocator.free(order_nodes);
+        const colors = try allocator.alloc(Color, caps.max_modules);
+        errdefer allocator.free(colors);
         const sig_a = try allocator.alloc(f32, caps.max_ports);
         errdefer allocator.free(sig_a);
         const sig_b = try allocator.alloc(f32, caps.max_ports);
@@ -91,6 +98,8 @@ pub const Graph = struct {
             .nodes = nodes,
             .port_owner = port_owner,
             .order = order,
+            .order_nodes = order_nodes,
+            .colors = colors,
             .sig_a = sig_a,
             .sig_b = sig_b,
             .cur = sig_a,
@@ -102,6 +111,8 @@ pub const Graph = struct {
         self.allocator.free(self.nodes);
         self.allocator.free(self.port_owner);
         self.allocator.free(self.order);
+        self.allocator.free(self.order_nodes);
+        self.allocator.free(self.colors);
         self.allocator.free(self.sig_a);
         self.allocator.free(self.sig_b);
         self.* = undefined;
@@ -154,9 +165,9 @@ pub const Graph = struct {
     }
 
     /// 処理順（topo）とサイクル遅延辺を確定する。process 前に1回呼ぶ。
+    /// per-finalize の alloc はしない（colors は init 済み field を使い回す＝RT ゼロアロケーション方針）。
     pub fn finalize(self: *Graph) Error!void {
-        const colors = try self.allocator.alloc(Color, self.node_count);
-        defer self.allocator.free(colors);
+        const colors = self.colors[0..self.node_count];
         @memset(colors, .unvisited);
         // 遅延辺フラグはやり直しに備えクリア（再 finalize 対応）。
         for (self.nodes[0..self.node_count]) |*n| n.in_delayed = [_]bool{false} ** signal.MAX_IN;
@@ -171,6 +182,20 @@ pub const Graph = struct {
         // master 出力ノードの妥当性を非 RT 側でここで検証（RT process では panic させない）。
         if (self.output_node) |on| {
             if (on >= self.node_count or self.nodes[on].n_out < 1) return Error.BadNodeIndex;
+        }
+
+        // order 順に ProcNode を焼く（graph_core が回す共有形式。in_delayed は dfs で確定済み）。
+        for (self.order[0..self.node_count], 0..) |ni, k| {
+            const nd = &self.nodes[ni];
+            self.order_nodes[k] = .{
+                .vtable = nd.vtable,
+                .ctx = nd.ctx,
+                .n_in = nd.n_in,
+                .n_out = nd.n_out,
+                .out_base = nd.out_base,
+                .in_src = nd.in_src,
+                .in_delayed = nd.in_delayed,
+            };
         }
 
         // signal バッファを初期化（遅延辺の初期値 0）。
@@ -205,79 +230,31 @@ pub const Graph = struct {
         order_len.* += 1;
     }
 
-    /// 1 サンプル評価。topo 順に各モジュールを process し、master 出力を捕捉して ping-pong を入れ替える。
-    fn processSample(self: *Graph) void {
-        var in_vals: [signal.MAX_IN]f32 = undefined;
-        var in_conn: [signal.MAX_IN]bool = undefined;
-        for (self.order[0..self.node_count]) |ni| {
-            const node = &self.nodes[ni];
-            var i: usize = 0;
-            while (i < node.n_in) : (i += 1) {
-                const s = node.in_src[i];
-                if (s < 0) {
-                    in_vals[i] = 0;
-                    in_conn[i] = false;
-                } else {
-                    const sp: usize = @intCast(s);
-                    in_conn[i] = true;
-                    in_vals[i] = if (node.in_delayed[i]) self.prev[sp] else self.cur[sp];
-                }
-            }
-            var io = Io{
-                .inputs = in_vals[0..node.n_in],
-                .connected = in_conn[0..node.n_in],
-                .outputs = self.cur[node.out_base..][0..node.n_out],
-                .sample_rate = self.sample_rate,
-            };
-            node.vtable.process(node.ctx, &io);
-        }
-
-        // master 出力を swap 前に捕捉（swap 後は prev 側に移るため）。
-        if (self.output_node) |on| {
-            const ob = self.nodes[on].out_base;
-            self.out_l = self.cur[ob];
-            self.out_r = if (self.nodes[on].n_out >= 2) self.cur[ob + 1] else self.cur[ob];
-        }
-
-        // ping-pong 入替: 次サンプルの prev = 今サンプルの cur（= 遅延辺が読む値）。
-        const tmp = self.cur;
-        self.cur = self.prev;
-        self.prev = tmp;
-    }
-
-    /// ブロック先頭で全モジュールの係数を更新（tan 等の重い計算はここ＝ブロックレート）。
-    fn updateAllParams(self: *Graph) void {
-        for (self.nodes[0..self.node_count]) |*node| {
-            node.vtable.updateParams(node.ctx, self.sample_rate);
-        }
-    }
-
     /// interleaved 出力へ `frames` サンプル書き込む。渡された frames/channels を正として処理する（AC#9）。
     /// channels==1 は (L+R)/2、>=2 は L/R を書き残りを 0。
-    /// RT callback から呼べるよう panic/OOB を出さない: 未 finalize / channels==0 は no-op、
+    /// RT callback から呼べるよう panic/OOB を出さない: 未 finalize / channels==0 は no-op（ゼロ埋め）、
     /// frames は buf 容量に clamp する（不正は finalize で弾く前提＝非 RT 側で検証済み）。
+    /// per-sample 評価は graph_core（静的/動的共有カーネル）へ委譲。
+    /// master 出力は self.output_node から毎 block ライブ解決する（finalize 後の setOutputNode も効く＝挙動不変）。
     pub fn processBlock(self: *Graph, buf: []f32, frames: u32, channels: u32) void {
         if (!self.finalized or channels == 0) {
             @memset(buf, 0); // RT で stale バッファを鳴らさない
             return;
         }
-        const ch: usize = channels;
-        const cap: usize = buf.len / ch;
-        const n: usize = @min(@as(usize, frames), cap);
-        self.updateAllParams();
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            self.processSample();
-            if (ch == 1) {
-                buf[i] = (self.out_l + self.out_r) * 0.5;
-            } else {
-                const base = i * ch;
-                buf[base] = self.out_l;
-                buf[base + 1] = self.out_r;
-                var c: usize = 2;
-                while (c < ch) : (c += 1) buf[base + c] = 0;
-            }
-        }
+        const out_sel: ?graph_core.OutputSel = if (self.output_node) |on|
+            .{ .out_base = self.nodes[on].out_base, .n_out = self.nodes[on].n_out }
+        else
+            null;
+        graph_core.processBlock(
+            self.order_nodes[0..self.node_count],
+            out_sel,
+            self.sample_rate,
+            &self.cur,
+            &self.prev,
+            buf,
+            frames,
+            channels,
+        );
     }
 
     // --- テスト用イントロスペクション ---
