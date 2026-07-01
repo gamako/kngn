@@ -1097,11 +1097,11 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         ctx.beginBox(.{ .direction = .row, .gap = 4 });
         if (ctx.buttonEx("Select", .{ .selected = app.active_kind == .select, .min_w = 56 }).clicked) app.setActiveKind(.select);
         ctx.endBox();
-        // paste/move のブロック配置トグル（gui に checkbox/radio が無いため、ラベルで ON/OFF 状態を明示する）。
+        // paste/move のブロック配置トグル（gui.toggle スイッチ。TASK-48）。
         // ON=透明を保持(src-over・下の絵を残す) / OFF=上書き(replace)。
-        const blend_label: []const u8 = if (app.blend_mode == .over) "Keep Transp: ON" else "Keep Transp: OFF";
-        if (ctx.buttonEx(blend_label, .{ .selected = app.blend_mode == .over, .min_w = 130 }).clicked) {
-            app.blend_mode = if (app.blend_mode == .over) .replace else .over;
+        var keep_transp = app.blend_mode == .over;
+        if (ctx.toggle("Keep Transp", &keep_transp)) {
+            app.blend_mode = if (keep_transp) .over else .replace;
         }
         // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
         if (app.active_kind == .brush or app.active_kind == .bezier) {

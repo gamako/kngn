@@ -28,6 +28,25 @@ ctx.endFrame(); // layout 確定 + draw cmd 発行 + rect キャッシュ更新
 gui.render(target, &ctx.draw_list, ctx.font);
 ```
 
+## ウィジェット（`src/widgets.zig`。`ctx.<name>(...)` で呼ぶ）
+
+Button / Label / ColorSwatch / Slider(i32,f32) / HSV ピッカー(svSquare,hueBar) / imageBox /
+Splitter / ScrollArea に加え、bool トグル系（TASK-48）:
+
+- `ctx.checkbox(label, *bool) bool` — □/■。クリックで反転し、変化したら true。
+- `ctx.toggle(label, *bool) bool` — トグルスイッチ（ノブが左右に動く）。戻り値は checkbox と同じ。
+- `ctx.radio(label, selected: bool) bool` — ○/◉。`selected` は表示専用、クリックされたら true（activated）。
+
+いずれも自動 ID（label hash + id_stack）。glyph + label の**箱全体がクリック域**（button と同じ）。
+radio group は選択状態を caller が管理する（IM 流。gui はグループ状態を持たない）:
+
+```zig
+if (ctx.radio("Pen", tool == .pen)) tool = .pen;
+if (ctx.radio("Eraser", tool == .eraser)) tool = .eraser;
+```
+
+同一スコープに同ラベルを並べると ID が衝突するので、`~Id` 版か `id_stack.push(i)` スコープで回避する。
+
 ## レイアウトエンジンの制限事項
 
 - wrap 非対応

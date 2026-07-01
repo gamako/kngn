@@ -42,6 +42,14 @@ pub const Style = struct {
     picker_hue_w: i32 = 16,
     picker_marker_light: Color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
     picker_marker_dark: Color = Color.rgba(0x00, 0x00, 0x00, 0xFF),
+    // Checkbox / Toggle(switch) / Radio（TASK-48）。寸法のみ。色は既存を再利用する:
+    // ON/accent = bg_active、box 内部 / track = slider_track_bg、knob = slider_knob_bg、枠 = border / border_hover。
+    checkbox_size: i32 = 16,
+    /// glyph ↔ label のギャップ（checkbox / toggle / radio 共通）
+    checkbox_gap: i32 = 6,
+    switch_w: i32 = 28,
+    switch_h: i32 = 16,
+    radio_size: i32 = 16,
 };
 
 /// 既存 example（09/10）系統のダークテーマ。text は白（21.4 までの label 既定色と同じ）。

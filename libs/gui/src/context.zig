@@ -111,6 +111,13 @@ pub const Context = struct {
     pub const hueBarId = widgets.hueBarId;
 
     pub const imageBox = widgets.imageBox;
+    // Checkbox / Toggle(switch) / Radio（bool トグル系。TASK-48）
+    pub const checkbox = widgets.checkbox;
+    pub const checkboxId = widgets.checkboxId;
+    pub const toggle = widgets.toggle;
+    pub const toggleId = widgets.toggleId;
+    pub const radio = widgets.radio;
+    pub const radioId = widgets.radioId;
     // Splitter（ペイン境界。TASK-41）
     pub const splitter = widgets.splitter;
     // 縦横スクロール領域（TASK-46）

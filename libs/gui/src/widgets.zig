@@ -574,6 +574,205 @@ const ImageBoxDraw = struct {
 };
 
 // ============================================================
+// Checkbox / Toggle(switch) / Radio（bool トグル系。TASK-48）
+// ============================================================
+// 既存 widget（button/colorSwatch/slider）と同じ同期 hit-test 契約:
+//   外側の row box が id を持ち、glyph + label 全体が hit 領域（button と同じ「箱全体がクリック域」）。
+//   behaviorFromCache(前フレーム rect_cache)で ButtonResult を取り、release の click で状態を反映する。
+//   hover 枠色は state.hot_id（フレーム中不変）を参照。glyph は custom leaf（SwatchDraw/SliderDraw と同型・
+//   arena に描画データを確保し、色/寸法は呼び出し時に解決して data へ格納する）。
+//
+// 戻り値の区別:
+//   checkbox / toggle は *bool を反転し changed(=clicked) を返す（1 クリックで 1 反転）。
+//   radio は selected(bool・入力/表示のみ) を取り clicked(activated) を返す（selected 済みの再クリックでも true）。
+//   選択状態は caller が管理する（IM 流。gui にグループ状態を持たせない）:
+//     if (ctx.radio("A", sel == .a)) sel = .a;
+//     if (ctx.radio("B", sel == .b)) sel = .b;
+//
+// 自動 ID は button/colorSwatch と同じく label hash + id_stack。同一スコープに同ラベルを並べると
+// ID が衝突するので、~Id 版か id_stack.push(i) のスコープで回避する。
+
+/// bool チェックボックス（自動 ID: label hash）。クリックで *value を反転し、変化したら true。
+pub fn checkbox(ctx: *Context, label: []const u8, value: *bool) bool {
+    return checkboxId(ctx, ctx.id_stack.make(label), label, value);
+}
+
+/// 明示 ID 版。同一スコープに同ラベルを並べる場合や rect を外部参照する場合に使う。
+pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
+    const result = behaviorFromCache(ctx, id);
+    if (result.clicked) value.* = !value.*;
+    const style = ctx.style;
+    const size = style.checkbox_size;
+    std.debug.assert(size > 0);
+    const hot = ctx.state.hot_id == id;
+
+    ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
+    const data = ctx.allocator().create(CheckGlyph) catch @panic("checkbox: OOM");
+    data.* = .{
+        .size = size,
+        .checked = value.*,
+        .border = if (hot) style.border_hover else style.border,
+        .bg = style.slider_track_bg,
+        .fill = style.bg_active,
+    };
+    ctx.custom(.{ .x = size, .y = size }, CheckGlyph.draw, data);
+    ctx.labelEx(label, style.text);
+    ctx.endBox();
+    return result.clicked;
+}
+
+const CheckGlyph = struct {
+    size: i32,
+    checked: bool,
+    border: Color,
+    bg: Color,
+    fill: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const CheckGlyph = @ptrCast(@alignCast(ctx_ptr));
+        dl.rectFilled(rect, self.bg) catch @panic("checkbox: OOM");
+        if (self.checked) {
+            const inset: i32 = @max(2, @divTrunc(self.size, 5));
+            const iw: i32 = @as(i32, @intCast(rect.w)) - 2 * inset;
+            const ih: i32 = @as(i32, @intCast(rect.h)) - 2 * inset;
+            if (iw > 0 and ih > 0) {
+                dl.rectFilled(.{
+                    .x = rect.x + inset,
+                    .y = rect.y + inset,
+                    .w = @intCast(iw),
+                    .h = @intCast(ih),
+                }, self.fill) catch @panic("checkbox: OOM");
+            }
+        }
+        dl.rectOutline(rect, self.border, 1) catch @panic("checkbox: OOM");
+    }
+};
+
+/// bool トグルスイッチ（自動 ID: label hash）。クリックで *value を反転し、変化したら true。
+/// `switch` は Zig の予約語なので `toggle` で命名する。
+pub fn toggle(ctx: *Context, label: []const u8, value: *bool) bool {
+    return toggleId(ctx, ctx.id_stack.make(label), label, value);
+}
+
+/// 明示 ID 版。
+pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
+    const result = behaviorFromCache(ctx, id);
+    if (result.clicked) value.* = !value.*;
+    const style = ctx.style;
+    const w = style.switch_w;
+    const h = style.switch_h;
+    std.debug.assert(w > 0 and h > 0 and w >= h); // knob が 0/負・track からはみ出るのを防ぐ
+    const hot = ctx.state.hot_id == id;
+
+    ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
+    const data = ctx.allocator().create(ToggleGlyph) catch @panic("toggle: OOM");
+    data.* = .{
+        .checked = value.*,
+        .border = if (hot) style.border_hover else style.border,
+        .track_off = style.slider_track_bg,
+        .track_on = style.bg_active,
+        .knob = style.slider_knob_bg,
+    };
+    ctx.custom(.{ .x = w, .y = h }, ToggleGlyph.draw, data);
+    ctx.labelEx(label, style.text);
+    ctx.endBox();
+    return result.clicked;
+}
+
+const ToggleGlyph = struct {
+    checked: bool,
+    border: Color,
+    track_off: Color,
+    track_on: Color,
+    knob: Color,
+
+    const margin: i32 = 2;
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const ToggleGlyph = @ptrCast(@alignCast(ctx_ptr));
+        dl.rectFilled(rect, if (self.checked) self.track_on else self.track_off) catch @panic("toggle: OOM");
+        const h: i32 = @intCast(rect.h);
+        const w: i32 = @intCast(rect.w);
+        const knob_side = @max(1, h - 2 * margin);
+        // OFF=左詰め / ON=右詰め（w>=h 前提で範囲内に収まる）
+        const kx = if (self.checked) rect.x + w - margin - knob_side else rect.x + margin;
+        dl.rectFilled(.{
+            .x = kx,
+            .y = rect.y + margin,
+            .w = @intCast(knob_side),
+            .h = @intCast(knob_side),
+        }, self.knob) catch @panic("toggle: OOM");
+        dl.rectOutline(rect, self.border, 1) catch @panic("toggle: OOM");
+    }
+};
+
+/// ラジオボタン（自動 ID: label hash）。`selected` は表示専用（現在この項目が選択中か）。
+/// クリックされたら true を返す（activated。changed ではない）。選択状態は caller が管理する。
+pub fn radio(ctx: *Context, label: []const u8, selected: bool) bool {
+    return radioId(ctx, ctx.id_stack.make(label), label, selected);
+}
+
+/// 明示 ID 版。同一スコープに同ラベルの radio を並べる場合はこちら（または id_stack.push）を使う。
+pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
+    const result = behaviorFromCache(ctx, id);
+    const style = ctx.style;
+    const size = style.radio_size;
+    std.debug.assert(size > 0);
+    const hot = ctx.state.hot_id == id;
+
+    ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
+    const data = ctx.allocator().create(RadioGlyph) catch @panic("radio: OOM");
+    data.* = .{
+        .size = size,
+        .selected = selected,
+        .ring = if (hot) style.border_hover else style.border,
+        .bg = style.slider_track_bg,
+        .dot = style.bg_active,
+    };
+    ctx.custom(.{ .x = size, .y = size }, RadioGlyph.draw, data);
+    ctx.labelEx(label, style.text);
+    ctx.endBox();
+    return result.clicked;
+}
+
+const RadioGlyph = struct {
+    size: i32,
+    selected: bool,
+    ring: Color,
+    bg: Color,
+    dot: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const RadioGlyph = @ptrCast(@alignCast(ctx_ptr));
+        const r: f32 = @as(f32, @floatFromInt(@min(rect.w, rect.h))) / 2.0;
+        const cx: f32 = @as(f32, @floatFromInt(rect.x)) + @as(f32, @floatFromInt(rect.w)) / 2.0;
+        const cy: f32 = @as(f32, @floatFromInt(rect.y)) + @as(f32, @floatFromInt(rect.h)) / 2.0;
+        fillDisc(dl, cx, cy, r, self.ring); // 外周リング
+        fillDisc(dl, cx, cy, r - 1.5, self.bg); // 中を刳り抜く（残ったリングが枠）
+        if (self.selected) fillDisc(dl, cx, cy, r * 0.45, self.dot); // 中心ドット
+    }
+};
+
+/// 中心(cx,cy)・半径 radius の塗り円をスキャンライン（各行 1px 高さの rectFilled 帯）で描く。
+/// render に円プリミティブが無いための局所ヘルパ。
+fn fillDisc(dl: *DrawList, cx: f32, cy: f32, radius: f32, col: Color) void {
+    if (radius < 0.5) return;
+    const y0: i32 = @intFromFloat(@floor(cy - radius));
+    const y1: i32 = @intFromFloat(@ceil(cy + radius));
+    var y: i32 = y0;
+    while (y < y1) : (y += 1) {
+        const dy = (@as(f32, @floatFromInt(y)) + 0.5) - cy; // 行の中心
+        const under = radius * radius - dy * dy;
+        if (under <= 0) continue;
+        const hw = @sqrt(under);
+        const xl: i32 = @intFromFloat(@round(cx - hw));
+        const xr: i32 = @intFromFloat(@round(cx + hw));
+        if (xr <= xl) continue;
+        dl.rectFilled(.{ .x = xl, .y = y, .w = @intCast(xr - xl), .h = 1 }, col) catch @panic("radio: OOM");
+    }
+}
+
+// ============================================================
 // Splitter（ペイン境界ドラッグ。TASK-41）
 // ============================================================
 
@@ -1584,4 +1783,219 @@ test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラ
     ctx.endScrollArea();
     ctx.endFrame();
     try std.testing.expect(scroll.y > before);
+}
+
+// ── Checkbox / Toggle / Radio テスト（TASK-48）────────────────
+
+test "checkbox: クリックで *bool を反転し changed(=clicked) を返す" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v = false;
+    const ID: Id = 0xCB01;
+
+    // frame1: キャッシュ生成（初回は非ヒット）
+    ctx.beginFrame(200, 40);
+    try std.testing.expect(!ctx.checkboxId(ID, "Enable", &v));
+    ctx.endFrame();
+    try std.testing.expect(!v);
+    const c = center(ctx.getNodeRect(ID).?);
+
+    // frame2: click → true・v=true
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, c.x, c.y);
+    try std.testing.expect(ctx.checkboxId(ID, "Enable", &v));
+    ctx.endFrame();
+    try std.testing.expect(v);
+
+    // frame3: 入力なし → false・v 不変（edge）
+    ctx.beginFrame(200, 40);
+    try std.testing.expect(!ctx.checkboxId(ID, "Enable", &v));
+    ctx.endFrame();
+    try std.testing.expect(v);
+
+    // frame4: 再 click → true・v=false（再反転）
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, c.x, c.y);
+    try std.testing.expect(ctx.checkboxId(ID, "Enable", &v));
+    ctx.endFrame();
+    try std.testing.expect(!v);
+}
+
+test "checkbox: hit 領域が glyph+label の箱全体（glyph 外の label 側 click で反応）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v = false;
+    const ID: Id = 0xCB02;
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.checkboxId(ID, "LongLabel", &v);
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(ID).?;
+
+    // 箱幅は glyph(size) より広い（label 分）＝箱全体が hit 域である前提
+    const size = ctx.style.checkbox_size;
+    try std.testing.expect(rect.w > @as(u32, @intCast(size)));
+
+    // glyph の右外＝label 側の座標を click → 反応する（glyph だけに id を付けた誤実装なら反応しない）
+    const lx = rect.x + size + ctx.style.checkbox_gap + 4;
+    const ly = rect.y + @as(i32, @intCast(rect.h / 2));
+    try std.testing.expect(lx > rect.x + size); // glyph より右
+    try std.testing.expect(lx < rect.x + @as(i32, @intCast(rect.w))); // まだ箱の中
+
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, lx, ly);
+    try std.testing.expect(ctx.checkboxId(ID, "LongLabel", &v));
+    ctx.endFrame();
+    try std.testing.expect(v);
+}
+
+test "checkbox: ON/OFF で glyph 内側中心のピクセルが変わる（AC）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v_on = true;
+    var v_off = false;
+
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    _ = ctx.checkboxId(0xA1, "A", &v_on);
+    _ = ctx.checkboxId(0xA2, "B", &v_off);
+    ctx.endBox();
+    ctx.endFrame();
+
+    var pixels: [200 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font);
+
+    const on = ctx.getNodeRect(0xA1).?;
+    const off = ctx.getNodeRect(0xA2).?;
+    const half: u32 = @intCast(@divTrunc(ctx.style.checkbox_size, 2));
+    // glyph は row box の左端・縦中央。glyph 中心 = (box.x + size/2, box.y + box.h/2)
+    const on_i = (@as(u32, @intCast(on.y)) + on.h / 2) * 200 + @as(u32, @intCast(on.x)) + half;
+    const off_i = (@as(u32, @intCast(off.y)) + off.h / 2) * 200 + @as(u32, @intCast(off.x)) + half;
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[on_i]); // ON=accent 塗り
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[off_i]); // OFF=box 内部
+}
+
+test "toggle: ON/OFF で knob 位置と track 色が変わる（AC）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v_on = true;
+    var v_off = false;
+
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    _ = ctx.toggleId(0x7001, "A", &v_on);
+    _ = ctx.toggleId(0x7002, "B", &v_off);
+    ctx.endBox();
+    ctx.endFrame();
+
+    var pixels: [200 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font);
+
+    const style = ctx.style;
+    const side = @max(1, style.switch_h - 2 * ToggleGlyph.margin);
+    const left_off: i32 = ToggleGlyph.margin + @divTrunc(side, 2); // OFF knob 中心 x（glyph 左端からの相対）
+    const right_off: i32 = style.switch_w - ToggleGlyph.margin - @divTrunc(side, 2); // ON knob 中心 x（同上）
+    const knob: u32 = @bitCast(style.slider_knob_bg);
+    const track_on: u32 = @bitCast(style.bg_active);
+    const track_off: u32 = @bitCast(style.slider_track_bg);
+
+    const on = ctx.getNodeRect(0x7001).?;
+    const off = ctx.getNodeRect(0x7002).?;
+    const on_y: u32 = @intCast(on.y + @as(i32, @intCast(on.h / 2)));
+    const off_y: u32 = @intCast(off.y + @as(i32, @intCast(off.h / 2)));
+
+    // ON: 右に knob / 左は track_on
+    try std.testing.expectEqual(knob, pixels[on_y * 200 + @as(u32, @intCast(on.x + right_off))]);
+    try std.testing.expectEqual(track_on, pixels[on_y * 200 + @as(u32, @intCast(on.x + left_off))]);
+    // OFF: 左に knob / 右は track_off
+    try std.testing.expectEqual(knob, pixels[off_y * 200 + @as(u32, @intCast(off.x + left_off))]);
+    try std.testing.expectEqual(track_off, pixels[off_y * 200 + @as(u32, @intCast(off.x + right_off))]);
+}
+
+test "radio: selected の中心ドットが accent・非 selected は box 内部色（AC）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    _ = ctx.radioId(0x4A01, "A", true);
+    _ = ctx.radioId(0x4A02, "B", false);
+    ctx.endBox();
+    ctx.endFrame();
+
+    var pixels: [200 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font);
+
+    const sel = ctx.getNodeRect(0x4A01).?;
+    const uns = ctx.getNodeRect(0x4A02).?;
+    const half: u32 = @intCast(@divTrunc(ctx.style.radio_size, 2));
+    const sel_i = (@as(u32, @intCast(sel.y)) + sel.h / 2) * 200 + @as(u32, @intCast(sel.x)) + half;
+    const uns_i = (@as(u32, @intCast(uns.y)) + uns.h / 2) * 200 + @as(u32, @intCast(uns.x)) + half;
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[sel_i]); // selected=中心ドット
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[uns_i]); // 非 selected=中空
+}
+
+test "radio: clicked を返す（selected 済みの再クリックでも activated）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ID: Id = 0x4A03;
+
+    // frame1: 非 selected で登録
+    ctx.beginFrame(200, 40);
+    _ = ctx.radioId(ID, "X", false);
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(ID).?);
+
+    // frame2: 非 selected を click → true（activated）
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, c.x, c.y);
+    try std.testing.expect(ctx.radioId(ID, "X", false));
+    ctx.endFrame();
+
+    // frame3: selected 済みを再 click → やはり true（changed ではなく activated）
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, c.x, c.y);
+    try std.testing.expect(ctx.radioId(ID, "X", true));
+    ctx.endFrame();
+}
+
+test "radio group: caller パターンで排他選択（clicked のみ true・選択が移る）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const Sel = enum { a, b };
+    var sel: Sel = .a;
+    var res: [2]bool = .{ false, false };
+
+    const build = struct {
+        fn f(c: *Context, s: *Sel, out: *[2]bool) void {
+            c.beginBox(.{ .direction = .row, .gap = 8 });
+            out[0] = c.radioId(0xE1, "A", s.* == .a);
+            out[1] = c.radioId(0xE2, "B", s.* == .b);
+            c.endBox();
+            if (out[0]) s.* = .a;
+            if (out[1]) s.* = .b;
+        }
+    }.f;
+
+    // frame1: 構築（初期 .a）
+    ctx.beginFrame(200, 40);
+    build(&ctx, &sel, &res);
+    ctx.endFrame();
+    try std.testing.expectEqual(Sel.a, sel);
+
+    // frame2: B を click → res[1] のみ true・sel が .b へ移る
+    const cb = center(ctx.getNodeRect(0xE2).?);
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, cb.x, cb.y);
+    build(&ctx, &sel, &res);
+    ctx.endFrame();
+    try std.testing.expect(!res[0]);
+    try std.testing.expect(res[1]);
+    try std.testing.expectEqual(Sel.b, sel);
 }
