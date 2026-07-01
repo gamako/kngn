@@ -549,6 +549,31 @@ pub const DynGraph = struct {
     pub fn isDelayed(self: *const DynGraph, h: Handle, in_port: usize) bool {
         return self.last_published.in_delayed[h][in_port];
     }
+
+    // --- 描画/probe 用の読み取り専用イントロスペクション（範囲外は null/0。無条件 index で落とさない）---
+    pub fn slotActive(self: *const DynGraph, h: Handle) bool {
+        return h < MAX_MODULES and self.slots[h].active;
+    }
+    pub fn kindOf(self: *const DynGraph, h: Handle) ?ModuleKind {
+        if (!self.slotActive(h)) return null;
+        return self.slots[h].kind;
+    }
+    pub fn nIn(self: *const DynGraph, h: Handle) u8 {
+        if (!self.slotActive(h)) return 0;
+        return self.instances[h].n_in;
+    }
+    pub fn nOut(self: *const DynGraph, h: Handle) u8 {
+        if (!self.slotActive(h)) return 0;
+        return self.instances[h].n_out;
+    }
+    pub fn inKindOf(self: *const DynGraph, h: Handle, i: usize) ?PortKind {
+        if (!self.slotActive(h) or i >= self.instances[h].n_in) return null;
+        return self.instances[h].in_kinds[i];
+    }
+    pub fn outKindOf(self: *const DynGraph, h: Handle, j: usize) ?PortKind {
+        if (!self.slotActive(h) or j >= self.instances[h].n_out) return null;
+        return self.instances[h].out_kinds[j];
+    }
 };
 
 /// union-to-largest の代理サイズ（全 kind の最大 @sizeOf × MAX_MODULES）。テスト（e）で比較。

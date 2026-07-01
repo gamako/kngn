@@ -1,0 +1,362 @@
+//! apps/patch: パッチキャンバスの純粋幾何/ヒットテストロジック（TASK-40.6.2）。
+//!
+//! platform / gui / modular を import しない純 Zig。camera 変換・ノード/ポート幾何・ヒットテスト・
+//! ビューポート内包判定（見切れ自動検出）を提供し、display/audio 無しで単体テストできる（test-patch）。
+//! 描画/入力（main.zig）はこのロジックの上に window・DrawList・イベントを載せるだけ。
+
+const std = @import("std");
+
+pub const Handle = u16;
+
+pub const Vec2f = struct {
+    x: f32,
+    y: f32,
+    pub fn add(a: Vec2f, b: Vec2f) Vec2f {
+        return .{ .x = a.x + b.x, .y = a.y + b.y };
+    }
+    pub fn sub(a: Vec2f, b: Vec2f) Vec2f {
+        return .{ .x = a.x - b.x, .y = a.y - b.y };
+    }
+    pub fn scale(a: Vec2f, s: f32) Vec2f {
+        return .{ .x = a.x * s, .y = a.y * s };
+    }
+};
+
+// --- レイアウト定数（world 単位） ---
+pub const NODE_W: f32 = 120;
+pub const TITLE_H: f32 = 22;
+pub const PORT_SPACING: f32 = 20;
+pub const BODY_PAD: f32 = 8; // ポート帯の下の余白
+pub const WORLD_PORT_R: f32 = 6;
+pub const PORT_R_MIN: f32 = 3;
+pub const PORT_R_MAX: f32 = 10;
+pub const ZOOM_MIN: f32 = 0.25;
+pub const ZOOM_MAX: f32 = 4.0;
+pub const CABLE_HIT_SLOP: f32 = 6; // world 単位のケーブル当たり判定しきい値
+
+/// 描画側が渡すノード幾何。pos は world 左上。
+pub const NodeGeom = struct {
+    handle: Handle,
+    pos: Vec2f,
+    n_in: u8,
+    n_out: u8,
+};
+
+/// 出力ポート src_out → 入力ポート dst_in の接続（単一接続なので dst で一意）。
+pub const Edge = struct {
+    src_handle: Handle,
+    src_out: u8,
+    dst_handle: Handle,
+    dst_in: u8,
+};
+
+pub const PortRef = struct {
+    handle: Handle,
+    is_input: bool,
+    index: u8,
+};
+
+pub const OffscreenCounts = struct {
+    node: u32 = 0,
+    port: u32 = 0,
+    cable: u32 = 0,
+};
+
+// ============================================================================
+// ノード/ポート幾何（world 座標）
+// ============================================================================
+
+/// ポート行数（入力/出力の多い方。最低 1）。
+fn rowCount(g: NodeGeom) f32 {
+    const rows = @max(g.n_in, g.n_out);
+    return @floatFromInt(@max(rows, 1));
+}
+
+/// ノードの world サイズ（幅固定・高さはポート数依存＝見切れ防止のため十分な高さ）。
+pub fn nodeSize(g: NodeGeom) Vec2f {
+    return .{ .x = NODE_W, .y = TITLE_H + PORT_SPACING * rowCount(g) + BODY_PAD };
+}
+
+/// 入力ポート i の world 中心（左辺）。
+pub fn inPortPos(g: NodeGeom, i: u8) Vec2f {
+    const fi: f32 = @floatFromInt(i);
+    return .{ .x = g.pos.x, .y = g.pos.y + TITLE_H + PORT_SPACING * (fi + 0.5) };
+}
+
+/// 出力ポート j の world 中心（右辺）。
+pub fn outPortPos(g: NodeGeom, j: u8) Vec2f {
+    const fj: f32 = @floatFromInt(j);
+    return .{ .x = g.pos.x + NODE_W, .y = g.pos.y + TITLE_H + PORT_SPACING * (fj + 0.5) };
+}
+
+fn portPos(g: NodeGeom, is_input: bool, index: u8) Vec2f {
+    return if (is_input) inPortPos(g, index) else outPortPos(g, index);
+}
+
+fn pointInRect(p: Vec2f, top_left: Vec2f, size: Vec2f) bool {
+    return p.x >= top_left.x and p.x <= top_left.x + size.x and
+        p.y >= top_left.y and p.y <= top_left.y + size.y;
+}
+
+fn findNode(nodes: []const NodeGeom, h: Handle) ?NodeGeom {
+    for (nodes) |n| {
+        if (n.handle == h) return n;
+    }
+    return null;
+}
+
+// ============================================================================
+// Camera（world <-> screen 変換）
+// ============================================================================
+pub const Camera = struct {
+    pan: Vec2f = .{ .x = 0, .y = 0 },
+    zoom: f32 = 1.0,
+
+    pub fn worldToScreen(c: Camera, w: Vec2f) Vec2f {
+        return .{ .x = w.x * c.zoom + c.pan.x, .y = w.y * c.zoom + c.pan.y };
+    }
+    pub fn screenToWorld(c: Camera, s: Vec2f) Vec2f {
+        return .{ .x = (s.x - c.pan.x) / c.zoom, .y = (s.y - c.pan.y) / c.zoom };
+    }
+
+    /// カーソル下の world 点を固定したまま zoom する（zoom は [ZOOM_MIN,ZOOM_MAX] に clamp）。
+    pub fn zoomAt(c: *Camera, cursor_screen: Vec2f, factor: f32) void {
+        const new_zoom = std.math.clamp(c.zoom * factor, ZOOM_MIN, ZOOM_MAX);
+        const eff = new_zoom / c.zoom; // clamp 後の実効倍率
+        c.pan = .{
+            .x = cursor_screen.x - (cursor_screen.x - c.pan.x) * eff,
+            .y = cursor_screen.y - (cursor_screen.y - c.pan.y) * eff,
+        };
+        c.zoom = new_zoom;
+    }
+
+    /// ポートの screen 描画半径（zoom 0.25 で消えず zoom 4 で肥大しないよう clamp）。
+    pub fn portScreenRadius(c: Camera) f32 {
+        return std.math.clamp(WORLD_PORT_R * c.zoom, PORT_R_MIN, PORT_R_MAX);
+    }
+};
+
+// ============================================================================
+// ヒットテスト（world 座標で判定。呼び出し側で screenToWorld してから渡す）
+// ============================================================================
+
+/// world 点を含む最前面ノード（描画順の逆＝末尾優先）。
+pub fn hitTestNode(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
+    var i: usize = nodes.len;
+    while (i > 0) {
+        i -= 1;
+        const g = nodes[i];
+        if (pointInRect(world_pt, g.pos, nodeSize(g))) return g.handle;
+    }
+    return null;
+}
+
+/// world 点近傍のポート（当たり半径 = WORLD_PORT_R。最前面優先）。
+pub fn hitTestPort(world_pt: Vec2f, nodes: []const NodeGeom) ?PortRef {
+    var i: usize = nodes.len;
+    while (i > 0) {
+        i -= 1;
+        const g = nodes[i];
+        var k: u8 = 0;
+        while (k < g.n_in) : (k += 1) {
+            if (dist(world_pt, inPortPos(g, k)) <= WORLD_PORT_R) return .{ .handle = g.handle, .is_input = true, .index = k };
+        }
+        k = 0;
+        while (k < g.n_out) : (k += 1) {
+            if (dist(world_pt, outPortPos(g, k)) <= WORLD_PORT_R) return .{ .handle = g.handle, .is_input = false, .index = k };
+        }
+    }
+    return null;
+}
+
+/// world 点近傍のケーブル（点と線分の距離 <= CABLE_HIT_SLOP）。edge index を返す。
+pub fn hitTestCable(world_pt: Vec2f, nodes: []const NodeGeom, edges: []const Edge) ?usize {
+    var idx: usize = edges.len;
+    while (idx > 0) {
+        idx -= 1;
+        const e = edges[idx];
+        const sg = findNode(nodes, e.src_handle) orelse continue;
+        const dg = findNode(nodes, e.dst_handle) orelse continue;
+        const a = outPortPos(sg, e.src_out);
+        const b = inPortPos(dg, e.dst_in);
+        if (distPointSegment(world_pt, a, b) <= CABLE_HIT_SLOP) return idx;
+    }
+    return null;
+}
+
+fn dist(a: Vec2f, b: Vec2f) f32 {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return @sqrt(dx * dx + dy * dy);
+}
+
+/// 点 p と線分 ab の距離。
+fn distPointSegment(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const len2 = abx * abx + aby * aby;
+    if (len2 <= 1e-9) return dist(p, a);
+    var t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2;
+    t = std.math.clamp(t, 0.0, 1.0);
+    const proj = Vec2f{ .x = a.x + abx * t, .y = a.y + aby * t };
+    return dist(p, proj);
+}
+
+// ============================================================================
+// ビューポート内包判定（見切れ自動検出。TASK-43 教訓）
+// ============================================================================
+
+fn pointInViewport(p: Vec2f, vw: f32, vh: f32) bool {
+    return p.x >= 0 and p.x <= vw and p.y >= 0 and p.y <= vh;
+}
+
+/// screen 空間で、全ノード矩形・全ポート円・全ケーブル端点が viewport [0,vw]x[0,vh] 内に収まるか。
+/// offscreen 件数を返す（0 = 見切れ無し）。初期／制御された代表配置での不変条件チェックに使う。
+pub fn viewportContains(cam: Camera, vw: f32, vh: f32, nodes: []const NodeGeom, edges: []const Edge) OffscreenCounts {
+    var out = OffscreenCounts{};
+    const r = cam.portScreenRadius();
+    for (nodes) |g| {
+        const tl = cam.worldToScreen(g.pos);
+        const sz = nodeSize(g).scale(cam.zoom);
+        const br = Vec2f{ .x = tl.x + sz.x, .y = tl.y + sz.y };
+        if (!pointInViewport(tl, vw, vh) or !pointInViewport(br, vw, vh)) out.node += 1;
+
+        var k: u8 = 0;
+        while (k < g.n_in) : (k += 1) {
+            if (!portCircleInside(cam.worldToScreen(inPortPos(g, k)), r, vw, vh)) out.port += 1;
+        }
+        k = 0;
+        while (k < g.n_out) : (k += 1) {
+            if (!portCircleInside(cam.worldToScreen(outPortPos(g, k)), r, vw, vh)) out.port += 1;
+        }
+    }
+    for (edges) |e| {
+        const sg = findNode(nodes, e.src_handle) orelse continue;
+        const dg = findNode(nodes, e.dst_handle) orelse continue;
+        const a = cam.worldToScreen(outPortPos(sg, e.src_out));
+        const b = cam.worldToScreen(inPortPos(dg, e.dst_in));
+        if (!pointInViewport(a, vw, vh) or !pointInViewport(b, vw, vh)) out.cable += 1;
+    }
+    return out;
+}
+
+fn portCircleInside(center: Vec2f, r: f32, vw: f32, vh: f32) bool {
+    return center.x - r >= 0 and center.x + r <= vw and center.y - r >= 0 and center.y + r <= vh;
+}
+
+// ============================================================================
+// tests（display/audio 不要。test-patch）
+// ============================================================================
+const testing = std.testing;
+
+fn expectApproxVec(a: Vec2f, b: Vec2f) !void {
+    try testing.expectApproxEqAbs(a.x, b.x, 1e-3);
+    try testing.expectApproxEqAbs(a.y, b.y, 1e-3);
+}
+
+test "canvas: worldToScreen/screenToWorld round-trip" {
+    const cams = [_]Camera{
+        .{ .pan = .{ .x = 0, .y = 0 }, .zoom = 1.0 },
+        .{ .pan = .{ .x = 30, .y = -12 }, .zoom = 2.0 },
+        .{ .pan = .{ .x = -100, .y = 50 }, .zoom = 0.25 },
+    };
+    for (cams) |c| {
+        const w = Vec2f{ .x = 123.5, .y = -7.25 };
+        try expectApproxVec(w, c.screenToWorld(c.worldToScreen(w)));
+    }
+}
+
+test "canvas: zoomAt keeps cursor world point fixed" {
+    var c = Camera{ .pan = .{ .x = 40, .y = 20 }, .zoom = 1.0 };
+    const cursor = Vec2f{ .x = 300, .y = 200 };
+    const w_before = c.screenToWorld(cursor);
+    c.zoomAt(cursor, 1.5);
+    const w_after = c.screenToWorld(cursor);
+    try expectApproxVec(w_before, w_after);
+    // clamp: 極端 zoom-in でも上限、zoom-out でも下限
+    c.zoomAt(cursor, 100.0);
+    try testing.expectApproxEqAbs(ZOOM_MAX, c.zoom, 1e-6);
+    c.zoomAt(cursor, 0.0001);
+    try testing.expectApproxEqAbs(ZOOM_MIN, c.zoom, 1e-6);
+    // clamp してもカーソル world 点は不変
+    const w2 = c.screenToWorld(cursor);
+    c.zoomAt(cursor, 2.0);
+    try expectApproxVec(w2, c.screenToWorld(cursor));
+}
+
+test "canvas: hitTestNode inside/outside and topmost on overlap" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 50, .y = 20 }, .n_in = 2, .n_out = 1 }, // 0 と重なる
+    };
+    // 重なり領域は末尾（handle 1）が最前面
+    try testing.expectEqual(@as(?Handle, 1), hitTestNode(.{ .x = 60, .y = 30 }, &nodes));
+    // node0 だけの領域
+    try testing.expectEqual(@as(?Handle, 0), hitTestNode(.{ .x = 10, .y = 10 }, &nodes));
+    // どのノードにも無い
+    try testing.expectEqual(@as(?Handle, null), hitTestNode(.{ .x = 500, .y = 500 }, &nodes));
+}
+
+test "canvas: port positions lie on node edges within node rect" {
+    const g = NodeGeom{ .handle = 3, .pos = .{ .x = 10, .y = 10 }, .n_in = 3, .n_out = 2 };
+    const sz = nodeSize(g);
+    var i: u8 = 0;
+    while (i < g.n_in) : (i += 1) {
+        const p = inPortPos(g, i);
+        try testing.expectApproxEqAbs(g.pos.x, p.x, 1e-4); // 左辺
+        try testing.expect(p.y > g.pos.y and p.y < g.pos.y + sz.y);
+    }
+    var j: u8 = 0;
+    while (j < g.n_out) : (j += 1) {
+        const p = outPortPos(g, j);
+        try testing.expectApproxEqAbs(g.pos.x + NODE_W, p.x, 1e-4); // 右辺
+        try testing.expect(p.y > g.pos.y and p.y < g.pos.y + sz.y);
+    }
+}
+
+test "canvas: hitTestPort / hitTestCable" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 200, .y = 0 }, .n_in = 1, .n_out = 0 },
+    };
+    const edges = [_]Edge{.{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 }};
+    // node0 の出力ポート近傍
+    const op = outPortPos(nodes[0], 0);
+    try testing.expect(hitTestPort(op, &nodes) != null);
+    const pr = hitTestPort(op, &nodes).?;
+    try testing.expectEqual(@as(Handle, 0), pr.handle);
+    try testing.expect(!pr.is_input);
+    // ケーブル中点近傍
+    const ip = inPortPos(nodes[1], 0);
+    const mid = Vec2f{ .x = (op.x + ip.x) / 2, .y = (op.y + ip.y) / 2 };
+    try testing.expectEqual(@as(?usize, 0), hitTestCable(mid, &nodes, &edges));
+    // ケーブルから離れた点は当たらない
+    try testing.expectEqual(@as(?usize, null), hitTestCable(.{ .x = mid.x, .y = mid.y + 100 }, &nodes, &edges));
+}
+
+test "canvas: viewportContains — fit layout has zero offscreen at representative zoom" {
+    // 3 ノードを画面内に収まるよう配置。
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 2, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 0 },
+    };
+    const edges = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 2, .dst_in = 0 },
+    };
+    const vw: f32 = 800;
+    const vh: f32 = 400;
+    // zoom=1（pan 0）で全て収まる
+    {
+        const oc = viewportContains(.{ .zoom = 1.0 }, vw, vh, &nodes, &edges);
+        try testing.expectEqual(@as(u32, 0), oc.node);
+        try testing.expectEqual(@as(u32, 0), oc.port);
+        try testing.expectEqual(@as(u32, 0), oc.cable);
+    }
+    // 見切れ検出: 大きく右へ pan するとノードが画面外へ → offscreen>0
+    {
+        const oc = viewportContains(.{ .pan = .{ .x = 700, .y = 0 }, .zoom = 1.0 }, vw, vh, &nodes, &edges);
+        try testing.expect(oc.node > 0 or oc.port > 0 or oc.cable > 0);
+    }
+}

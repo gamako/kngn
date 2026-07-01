@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
     var default_pixie: ?*std.Build.Step.Compile = null;
     var default_synth: ?*std.Build.Step.Compile = null;
     var default_modular: ?*std.Build.Step.Compile = null;
+    var default_patch: ?*std.Build.Step.Compile = null;
 
     for (backends) |be| {
         const is_default = (be == platform_option);
@@ -83,6 +84,12 @@ pub fn build(b: *std.Build) void {
         // install-all で pixie もビルド回帰対象にする（非対話のコンパイル検証手段）
         if (install_all) b.installArtifact(pixie_exe);
         addRunStep(b, b.fmt("run-pixie-{s}", .{platform.backendName(be)}), b.fmt("Run Pixie editor ({s})", .{platform.backendName(be)}), pixie_exe, b.args);
+
+        // ----- Patch アプリ (apps/patch) — パッチキャンバス UI (TASK-40.6.2)。audio 無し（全 backend/OS）-----
+        const patch_exe = addPatchExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "patch", be, default_be), &example_modules, &pm);
+        if (is_default) default_patch = patch_exe;
+        if (install_all) b.installArtifact(patch_exe);
+        addRunStep(b, b.fmt("run-patch-{s}", .{platform.backendName(be)}), b.fmt("Run patch canvas ({s})", .{platform.backendName(be)}), patch_exe, b.args);
 
         // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux/Windows -----
         if (audio_supported) {
@@ -164,6 +171,10 @@ pub fn build(b: *std.Build) void {
     // `zig build`（引数なし）は全 installArtifact をビルドしてしまうので、単体ビルド用に分ける。
     addBuildStep(b, "build-main", "Build the app only (uses -Dplatform option)", default_main.?);
     addBuildStep(b, "build-pixie", "Build Pixie editor only (uses -Dplatform option)", default_pixie.?);
+
+    // patch canvas（audio 不要なので全 backend/OS で生成）。
+    addRunStep(b, "run-patch", "Run patch canvas (uses -Dplatform option)", default_patch.?, b.args);
+    addBuildStep(b, "build-patch", "Build patch canvas only (uses -Dplatform option)", default_patch.?);
 
     // synth は audio 対応 OS（macOS/Linux/Windows）のみ生成。非対応 OS では default_synth=null で step を張らない。
     if (default_synth) |ds| {
@@ -631,6 +642,17 @@ pub fn build(b: *std.Build) void {
     const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");
     test_app_modular_step.dependOn(&run_modular_app_test.step);
 
+    // apps/patch キャンバス純ロジックテスト（camera 変換 / hit-test / 見切れ検出。display/audio 不要。TASK-40.6.2）
+    const patch_canvas_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/patch/canvas.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const patch_canvas_test = b.addTest(.{ .root_module = patch_canvas_test_mod });
+    const run_patch_canvas_test = b.addRunArtifact(patch_canvas_test);
+    const test_patch_step = b.step("test-patch", "Run apps/patch canvas logic tests");
+    test_patch_step.dependOn(&run_patch_canvas_test.step);
+
     // src/dsp テスト (Oscillator / Envelope / Filter / Mixer)
     const dsp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/dsp/dsp.zig"),
@@ -681,6 +703,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_modular_step);
     test_step.dependOn(test_app_modular_step);
+    test_step.dependOn(test_patch_step);
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
@@ -1105,6 +1128,39 @@ fn addPixieExe(
     exe.root_module.addImport("core", core_mod);
     exe.root_module.addImport("gui", common.gui);
     exe.root_module.addImport("png", common.png); // PNG 読み込み (TASK-24)
+
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    return exe;
+}
+
+// ============================================================
+// ヘルパー: patch app exe を 1 backend 分セットアップ（apps/patch。TASK-40.6.2）
+// platform + gui + modular（動的グラフエンジン）。audio 無し（可視化のみ。音は 40.6.3）。
+// ============================================================
+fn addPatchExe(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+    sdk_paths: ?macos.MacOSSDKPaths,
+    platform_type: platform.PlatformType,
+    name: []const u8,
+    common: *const ExampleModules,
+    pm: *const PlatformModules,
+) *std.Build.Step.Compile {
+    const canvas_mod = b.createModule(.{ .root_source_file = b.path("apps/patch/canvas.zig") });
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/patch/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("platform", pm.platform);
+    exe.root_module.addImport("gui", common.gui);
+    exe.root_module.addImport("modular", common.modular); // 動的グラフエンジン（dsp 依存のみ）
+    exe.root_module.addImport("canvas", canvas_mod);
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;
