@@ -546,6 +546,9 @@ const App = struct {
         self.preview_canvas.selected_layer = self.canvas.selected_layer;
         // selection も同期（bezier プレビューが描画制約を commit と一致させる。TASK-44）
         self.preview_canvas.selection = self.canvas.selection;
+        // 上の @memcpy / visible / opacity は Canvas API を通らない直接書きのため、
+        // composite_cache を明示的に無効化する（TASK-53 の dirty フラグ導入に伴う）
+        self.preview_canvas.markDirty();
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {

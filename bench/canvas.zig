@@ -70,6 +70,9 @@ fn benchScenario(io: std.Io, gpa: std.mem.Allocator, sc: Scenario, func: Func) !
     var acc: u32 = 0;
     var i: usize = 0;
     while (i < iters) : (i += 1) {
+        // TASK-53 の composite_cache（無変更なら再合成しない）を無効化し、
+        // 毎反復でフル再合成を計測する（cache hit を測っては意味がない）
+        canvas.markDirty();
         const start = std.Io.Clock.Timestamp.now(io, .awake);
         const out = runOnce(&canvas, func);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
