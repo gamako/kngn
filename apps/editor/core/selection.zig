@@ -5,8 +5,9 @@
 //! - **cut/paste/move は `canvas.layerPixels` へ直接書き込み**、selection ゲート付きの
 //!   `StrokeRecorder` は通さない（さもないと paste/move 先が選択範囲外だとゲートに握り潰される）。
 //!   既存 `UndoCmd.paint`（before/after の PixelDiff 列）を再利用して可逆にする。
-//! - **paste/move のピクセル配置は「上書き（replace）」**: block の透明ピクセルも含めてそのまま置く
-//!   （矩形ブロック転送のセマンティクス）。cut/move の元領域は透明（0）へ。
+//! - **paste のピクセル配置は `Blend{replace, over}` で切替**（`pasteCmd` 引数）: `replace`=block の
+//!   透明ピクセルも含めそのまま上書き、`over`=`blend.srcOver` 合成（透明部は配置先を残す）。pixie の既定は
+//!   `over`。move（フロート）の焼き込みも同様に render mode で切替。cut/move の元領域は透明（0）へ。
 //! - selection 矩形そのものの更新（移動後/貼付後の選択枠）は呼び出し側（pixie）が行う。
 //! - OOM は core 慣習に合わせて `@panic`。
 

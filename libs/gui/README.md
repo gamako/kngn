@@ -18,6 +18,8 @@ video-proto 用の immediate-mode GUI ライブラリ。platform 非依存の st
 | `src/state.zig` | hot / active / focused |
 | `src/context.zig` | Context（フレームライフサイクル + ツリー構築 + hit-test） |
 | `src/layout.zig` | Flex レイアウトエンジン（measure / place） |
+| `src/style.zig` | ウィジェット共通スタイル定義（色 / 寸法 / パディング等） |
+| `src/widgets.zig` | 基本ウィジェット実装（Button / Label / ColorSwatch / Slider / HSV ピッカー / ScrollArea / checkbox / toggle / radio） |
 
 ## フレームの流れ
 

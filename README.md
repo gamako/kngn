@@ -1,162 +1,82 @@
-# zigで画像表示を行うプロトタイプ
+# video-proto
 
-Zig + C/Swiftを組み合わせた、macOSでのクロスプラットフォーム映像表示システムのプロトタイプです。
+クロスプラットフォーム対応のビデオ/グラフィックスプロトタイピング環境。Zig で書いたアプリケーション層と、
+各 OS ネイティブの低レベル実装によるプラットフォーム層で構成されます。最小限のプリミティブ API
+（イベント / 手動描画 / 時刻）を土台に、GUI・エディタ・オーディオ/シンセ・ヘッドレス検証 harness までを載せています。
+
+> **詳細な技術ドキュメントは [`AGENT.md`](AGENT.md) を参照**（ディレクトリ構成・platform API・各 backend・
+> ビルド/テスト・ヘッドレス検証 harness・オーディオ層など）。本 README は概要とクイックスタートに絞ります。
+
+## 対応プラットフォーム
+
+| OS | backend（`-Dplatform`） | 実装 |
+|----|------------------------|------|
+| **macOS** | `objc`（既定）/ `swift` / `metal` | Objective-C(CALayer) / Swift(CADisplayLink) / Metal(GPU) |
+| **Linux** | `x11`（既定）/ `wayland` | 純 Zig（Xlib 直接 / wl_shm + xdg-shell 直接） |
+| **Windows** | `gdi`（既定）/ `d3d11` | 純 Zig（Win32/GDI 直接 / D3D11-DXGI COM 手書き） |
+
+`-Dplatform` の有効値は OS で決まる（macOS で `x11` を指定する等の不整合は build エラー）。frame pacing の
+support tier（1級 = Metal / D3D11-DXGI / Wayland、best-effort = CALayer / X11 / GDI）は `docs/adr/005` を参照。
 
 ## プロジェクト構成
 
 ```
 .
-├── src/
-│   └── main.zig              # メインプログラム（Zig）
-├── platform/
-│   ├── macos/
-│   │   └── platform_macos.m  # macOS実装（Objective-C版）
-│   ├── macos-swift/
-│   │   └── platform_macos.swift  # macOS実装（Swift版）
-│   └── macos-metal/
-│       └── platform_macos_metal.swift  # macOS実装（Metal版）
-├── build.zig                 # ビルド設定
-└── README.md                 # このファイル
+├── src/          # Zig コード（main / platform facade+各 backend / audio / dsp / harness / helpers）
+├── platform/     # macOS のネイティブ実装（C ABI。macos / macos-swift / macos-metal）
+├── examples/     # サンプル 01〜17（run-example_NN で実行）+ image/（共有アセット）
+├── libs/         # 再利用ライブラリ（png / gui / font / synth）
+├── apps/         # アプリ（editor/pixie: ドット絵エディタ、synth: PC キーボード演奏）
+└── docs/         # 設計ドキュメント（PLAN.md / PLAN_*.md / adr/）
 ```
 
-## 要件
+## 前提環境
 
-- **Zig**: 0.16.0-dev以上
-- **macOS**: 11以上（Big Sur。ファイルダイアログの UTType / allowedContentTypes が macOS 11+）
-- **Xcode**: Command Line Tools
-
-## ビルド方法
-
-### 1. デフォルトビルド（Objective-C版）
+| 項目 | 用途 |
+|------|------|
+| nix（flake 対応）+ direnv | `flake.nix`（`aarch64-darwin` / `x86_64-linux`）が zig 0.16.0 + zls + 各種依存を供給。推奨 |
+| macOS（Apple Silicon）+ Xcode | macOS backend の SDK / framework / `swiftc` 提供 |
+| Linux（x86_64） | X11/Wayland dev lib 等は flake の devShell が供給 |
+| Windows | zig 0.16.0 を現地導入しネイティブビルド（flake 非対応） |
 
 ```bash
-zig build
+direnv allow      # 初回のみ（.envrc を許可）。以降ディレクトリに入ると zig が PATH に通る
+zig version       # → 0.16.0
 ```
 
-自動的に環境から必要なパスを検出します。生成物は `zig-out/bin/video_proto` に配置されます。
+direnv を使わない場合は `nix develop --command zig build ...` のように呼ぶ。
 
-### 2. Swift版のビルド
-
-```bash
-zig build -Dplatform=swift
-```
-
-Swift版を明示的に選択してビルドします。生成物は `zig-out/bin/video_proto_swift` に配置されます。
-
-#### 特徴
-
-- Swiftランタイムライブラリパスは**自動検出**されます
-- `xcode-select`と`xcrun`コマンドを使用して環境から動的にパスを取得
-- CI環境など特殊な環境では、パスを明示的に指定可能です
-
-### 3. Metal版のビルド
+## ビルド・実行
 
 ```bash
-zig build -Dplatform=metal
-```
+# メインプログラム（HSV 虹色グラデーション）
+zig build run                 # 既定 backend（macOS=objc / Linux=x11 / Windows=gdi）
+zig build run-objc            # backend を明示（macOS: run-objc / run-swift / run-metal）
+zig build run -Dplatform=metal  # 既定 run の backend を切替（例: Metal）
 
-Metal版を明示的に選択してビルドします。生成物は `zig-out/bin/video_proto_metal` に配置されます。
+# アプリ
+zig build run-pixie           # ドット絵エディタ（-Dplatform で backend 切替）
+zig build run-synth           # シンセ（PC キーボード演奏。A..K = C4..C5、ESC 終了）
 
-#### 特徴
+# サンプル（ルートから。01〜17）
+zig build run-example_01      # 01_timed_window
+zig build run-example_15      # 15_audio_tone …（run-example_NN）
 
-- GPU直結のレンダリング（MTKView + Metal API）
-- Metalシェーダーを使った高速描画
-- Metal Compute Shaderではなくテクスチャ転送方式（CPU→GPU）
-- 既存のobj-c版・swift版と同じAPI
-
-### 4. カスタムパス指定（CI環境用）
-
-SwiftツールチェーンパスとSDKパスを明示的に指定できます：
-
-```bash
-zig build -Dplatform=swift \
-  -Dswift-toolchain-path=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain \
-  -Dswift-sdk-path=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
-```
-
-同様にMetal版も指定可能です：
-
-```bash
-zig build -Dplatform=metal \
-  -Dswift-toolchain-path=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain \
-  -Dswift-sdk-path=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
-```
-
-**オプション説明:**
-
-| オプション                        | 型                | 説明                                             | デフォルト |
-| --------------------------------- | ----------------- | ------------------------------------------------ | ---------- |
-| `-Dplatform=[enum]`               | `objc`\|`swift`\|`metal` | プラットフォーム層の実装を選択            | `objc`     |
-| `-Dswift-toolchain-path=[string]` | パス              | Xcodeツールチェーンパス                          | 自動検出   |
-| `-Dswift-sdk-path=[string]`       | パス              | macOS SDKパス                                    | 自動検出   |
-| `-Dinstall-all=[bool]`            | -                 | platformすべてをビルド                           | `false`    |
-| `--release[=mode]`                | -                 | リリースモード（`fast`, `safe`, `small` 指定可） | デバッグ   |
-
-### 5. その他のビルドコマンド
-
-```bash
-# すべてのバージョンをビルド・インストール
+# 全 backend / 全サンプルのビルド回帰
 zig build -Dinstall-all=true
 
-# リリースビルド（最適化）
+# リリースビルド
 zig build --release=fast
-
-# キャッシュをクリア
-rm -rf .zig-cache zig-out
 ```
 
-## 実行方法
+## テスト
 
 ```bash
-zig build run-objc # Objective-C版を実行
-zig build run-swift # Swift版を実行
-zig build run-metal # Metal版を実行
-zig build run       # デフォルト版を実行（Objective-C版）
-
+zig build test                # 全テスト集約（全 test-* を束ねる）
+zig build test-gui            # 個別（例: libs/gui）。他に test-core / test-png-roundtrip /
+                              # test-synth / test-dsp / test-font / test-harness など
 ```
 
-## パス自動検出の仕組み
-
-Swift版・Metal版をビルドする際、以下のコマンドで環境から動的にパスを取得しています：
-
-```bash
-# ツールチェーンパス取得
-xcode-select -p
-# → /Applications/Xcode.app/Contents/Developer
-
-# SDK パス取得
-xcrun --show-sdk-path
-# → /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
-```
-
-これにより、Xcode更新時も`build.zig`の修正が不要になります。
-
-## トラブルシューティング
-
-### エラー: "unable to open library directory"
-
-Swiftパスが正しく検出されていない可能性があります。以下を確認してください：
-
-```bash
-# パスが正しく取得されるか確認
-xcode-select -p
-xcrun --show-sdk-path
-
-# 明示的にパスを指定してビルド
-zig build -Dplatform=swift \
-  -Dswift-toolchain-path=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain \
-  -Dswift-sdk-path=$(xcrun --show-sdk-path)
-```
-
-### エラー: "Command Line Tools missing"
-
-Xcode Command Line Toolsが インストールされていない、または古い可能性があります：
-
-```bash
-# インストール
-xcode-select --install
-
-# 更新
-softwareupdate -i -a
-```
-
+macOS の Swift/Metal ビルドで使う SDK / Swift ツールチェーンのパスは `xcrun` / `xcode-select` から
+自動検出します（Xcode 更新時も `build.zig` の修正は不要）。CI 等で明示指定したい場合は
+`-Dswift-toolchain-path=` / `-Dswift-sdk-path=` を渡せます。

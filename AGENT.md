@@ -1,43 +1,52 @@
 # video-proto プロジェクト
 
-クロスプラットフォーム対応のビデオ/グラフィックスプロトタイピング環境。Zigで記述されたアプリケーション層と、各プラットフォーム固有の実装（Swift/Objective-C）による低レベルAPI層で構成されています。
+クロスプラットフォーム対応のビデオ/グラフィックスプロトタイピング環境。Zigで記述されたアプリケーション層と、各プラットフォーム固有の実装（macOS: Objective-C/Swift/Metal、Linux: X11/Wayland、Windows: GDI/D3D11）による低レベルAPI層で構成されています。
 
 **目的**: 最小限のプリミティブAPIを提供し、開発者が柔軟にグラフィックスアプリケーションを構築できる環境を提供する。
 
-**現在の対象**: macOS（3つの実装：Objective-C、Swift、Metal）
+**対応プラットフォーム**: macOS（Objective-C / Swift / Metal）・Linux（X11 / Wayland）・Windows（GDI / D3D11）
 
 ## ディレクトリ構造
 
 ```
-video-proto/
-├── platform/           # プラットフォーム層（C API）
-│   ├── platform.h     # プリミティブAPI定義
-│   ├── macos/         # Objective-C実装
-│   ├── macos-swift/   # Swift実装
-│   └── macos-metal/   # Metal実装
+video-proto-main/
+├── platform/           # macOS のネイティブ実装（C ABI。platform.h + 各実装）
+│   ├── platform.h     # プリミティブAPI定義（C ABI。内部実装用）
+│   ├── macos/         # Objective-C実装（CALayer）
+│   ├── macos-swift/   # Swift実装（CADisplayLink）
+│   └── macos-metal/   # Metal実装（GPU）
 ├── src/               # Zigコード
-│   ├── main.zig       # メインプログラム（虹色グラデーション）
-│   ├── keyboard.zig   # キーボード定義モジュール
-│   ├── sprite.zig     # スプライトシステム（Phase 2ヘルパー）
-│   ├── fixed_timestep.zig # 固定タイムステップヘルパー（Phase 2ヘルパー）
-│   ├── fps_counter.zig    # FPS 計測ヘルパー（Phase 2ヘルパー）
-│   └── text.zig       # BDF ビットマップフォント描画（Phase 2ヘルパー）
-├── examples/          # サンプルプログラム
-│   ├── 01_timed_window/       # タイマー制御ウィンドウ
-│   ├── 02_keyboard_input/     # キーボード入力
-│   ├── 03_sprite_rendering/   # スプライト表示
-│   ├── 04_fixed_timestep/     # 固定タイムステップ + 物理シミュレーション
-│   └── 05_text_rendering/     # ビットマップフォントによるテキスト描画
+│   ├── main.zig       # メインプログラム（HSV 虹色グラデーション）
+│   ├── platform.zig   # platform facade（builtin.os.tag で backend を分岐）
+│   ├── platform_types.zig      # 共有型（KeyCode / Event 等の単一ソース）
+│   ├── platform_macos.zig      # macOS backend（C ABI platform.h 経由。objc/swift/metal 共通）
+│   ├── platform_linux*.zig     # Linux backend（dispatcher + x11 / wayland + 入力変換。純 Zig）
+│   ├── platform_windows*.zig   # Windows backend（dispatcher + gdi / d3d11 + 入力変換。純 Zig）
+│   ├── audio.zig / audio_*.zig # オーディオ出力 facade + OS 別 backend（macOS/Linux/Windows）
+│   ├── dsp/           # DSP ヘルパー（Oscillator / Envelope / Filter / Mixer）
+│   ├── harness.zig    # ヘッドレス検証 harness（入力注入 + フレーム捕捉 + 仮想クロック）
+│   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群
+├── examples/          # サンプル 01〜17（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
+│   ├── 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering
+│   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone
+│   ├── 08〜11,13,14,16,17_gui_*  # GUI（primitives/interaction/layout/widgets/slider/color_picker/scroll/toggles）
+│   └── image/         # 共有アセット（実行 example ではない）
 ├── libs/              # 再利用ライブラリ
-│   ├── png/   # PNG codec（decode/encode）
-│   └── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
+│   ├── png/           # PNG codec（decode/encode）
+│   ├── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
+│   ├── font/          # フォント（TrueType/OpenType アウトライン sfnt/glyf/cff + bmfont。※ BDF は src/text.zig）
+│   └── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
 ├── apps/              # アプリケーション
-│   └── editor/        # グラフィックエディタ群（TASK-21 ファミリー）
-│       ├── core/      # 再利用コア: Canvas / Tool(Pen/Eraser) / UndoStack / StrokeRecorder / PNG I/O
-│       └── apps/pixie/ # ドット絵エディタ MVP（Pen/Eraser/DB16 パレット/Undo/PNG 保存）
+│   ├── editor/        # グラフィックエディタ群（TASK-21 ファミリー）
+│   │   ├── core/      # 再利用コア: Canvas(多レイヤ) / Tool(Pen/Eraser/Brush) / UndoStack / StrokeRecorder / Path / Selection / PNG I/O
+│   │   └── apps/pixie/ # ドット絵エディタ（Pen/Eraser/レイヤー/範囲選択/ベジェ/DB16 パレット/Undo/PNG）
+│   └── synth/         # PC キーボード演奏シンセ MVP（run-synth）
 └── docs/              # ドキュメント
-    └── PLAN.md        # 実装計画（詳細）
+    ├── PLAN.md        # 実装計画（原初の Phase 分け）
+    ├── PLAN_*.md      # 個別計画（example_02/03 / libs_gui / png_decoder 等）
+    └── adr/           # アーキテクチャ決定記録
 ```
+（タスク別の計画メモ `docs/plans/` はトップ階層 `video-proto/docs/plans/` 側。この配下ではない）
 
 ## クイックスタート
 
@@ -45,8 +54,10 @@ video-proto/
 
 | 項目 | 用途 |
 |------|------|
-| macOS（Apple Silicon）+ Xcode | SDK / framework / `swiftc` の提供（必須）。`flake.nix` は `aarch64-darwin` のみ対応 |
-| nix（flake 対応） | `flake.nix` 経由で zig 0.16.0 + zls を提供 |
+| nix（flake 対応） | `flake.nix`（`aarch64-darwin` / `x86_64-linux` の 2 system）が zig 0.16.0 + zls + 各種依存を提供 |
+| macOS（Apple Silicon）+ Xcode | macOS backend の SDK / framework / `swiftc` の提供 |
+| Linux（x86_64） | X11/Wayland dev lib・Xvfb・ffmpeg 等は Linux 側 devShell が供給（下記「Linux のビルド・検証」） |
+| Windows | zig 0.16.0 を現地導入しネイティブビルド（`flake.nix` は非対応。TASK-31/35） |
 | direnv | プロジェクトディレクトリに入ると自動で nix devShell を有効化（推奨） |
 
 ### セットアップ
@@ -62,17 +73,18 @@ direnv を使わない場合は `nix develop` でシェルに入るか、各コ�
 
 ### メインプログラムのビルド・実行
 
+以下は macOS の例。`-Dplatform` の有効値は OS 依存（macOS=objc/swift/metal、Linux=x11/wayland、
+Windows=gdi/d3d11。他 OS 向けは下記「backend の選び方」「Linux のビルド・検証」を参照）。
+
 ```bash
-# ビルド（3つのプラットフォーム実装から選択）
-zig build                        # Objective-C版（デフォルト）
+# ビルド（macOS の 3 実装から選択。既定=objc）
+zig build                        # Objective-C版（macOS 既定）
 zig build -Dplatform=swift       # Swift版
 zig build -Dplatform=metal       # Metal版
 
 # 実行
-zig build run                    # デフォルトプラットフォーム
-zig build run-objc               # Objective-C版
-zig build run-swift              # Swift版
-zig build run-metal              # Metal版
+zig build run                    # 既定 backend（macOS=objc / Linux=x11 / Windows=gdi）
+zig build run-objc               # Objective-C版（macOS。run-swift / run-metal も同様）
 ```
 
 ### サンプルプログラムの実行
@@ -104,21 +116,23 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 > Windows で sample 単体ビルドが必要なら、開発者モード ON + `core.symlinks=true` で再 checkout して
 > 本物の symlink を復元するか、build_helpers の symlink 依存を build.zig 側で外す改修が要る（現状は未対応）。
 
-## 開発フェーズの状態
+## 実装状況
 
-- ✅ **フェーズ1（プリミティブAPI）**: 完成
-  - イベント処理API
-  - 手動描画API
-  - 時刻取得API
-- ✅ **サンプル**: 01_timed_window, 02_keyboard_input, 03_sprite_rendering, 04_fixed_timestep, 05_text_rendering
-- 🚧 **フェーズ2（ヘルパー関数群）**: 進行中
-  - ✅ sprite.zig - スプライト描画（Phase 1: クリッピングのみ）
-  - ✅ fixed_timestep.zig - 固定タイムステップ
-  - ✅ fps_counter.zig - FPS 計測（コンソール出力版）
-  - ✅ text.zig - BDF ビットマップフォント描画
-  - ⚠️ DoubleBuffer 等 - 未着手
-- ⚠️ **フェーズ3（テンプレート）**: 未着手
-  - SimpleApp, GameLoop, SnapshotRenderer等
+プリミティブ API（イベント処理 / 手動描画 / 時刻取得）を土台に、以下が実装済み:
+
+- ✅ **プラットフォーム backend**: macOS（objc/swift/metal）・Linux（x11/wayland）・Windows（gdi/d3d11）。
+  frame pacing の support tier は下記「プラットフォーム層の種類」と `docs/adr/005`。
+- ✅ **サンプル**: `examples/01`〜`17`（基礎描画 / 入力 / スプライト / 固定ステップ / テキスト /
+  ベンチ / マウス / GUI 各種 / アウトラインフォント / オーディオ）。`examples/image/` は共有アセット（run step なし）。
+- ✅ **ヘルパー**: sprite / fixed_timestep / fps_counter / text（`src/`。Phase 2 由来）。
+- ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`。
+- ✅ **アプリ**: `apps/editor/apps/pixie`（ドット絵エディタ: レイヤー / 範囲選択 / ベジェ / Undo / PNG）・
+  `apps/synth`（PC キーボード演奏）。
+- ✅ **オーディオ / シンセ層**: `src/audio` + `src/dsp` + `libs/synth`（下記「オーディオ / シンセ層」節）。
+- ✅ **ヘッドレス検証 harness**: `src/harness.zig`（下記「ヘッドレス検証 harness」節）。
+
+> 原初の Phase 分け（プリミティブ / ヘルパー関数群 / テンプレート）は `docs/PLAN.md` に記録。
+> DoubleBuffer や SimpleApp / GameLoop / SnapshotRenderer 等のテンプレート群は未着手。
 
 ## プラットフォーム層の種類
 
@@ -129,6 +143,8 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ✅ 1級 frame pacing 対応（TASK-36） |
 | **X11 (Linux)** | `src/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
 | **Wayland (Linux)** | `src/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。shiso 実機検証済み） |
+| **GDI (Windows)** | `src/platform_windows_gdi.zig`（純 Zig / Win32 直接） | GDI `StretchDIBits`（software blit） | ✅ best-effort backend（TASK-31/35） |
+| **D3D11 (Windows)** | `src/platform_windows_d3d11.zig`（純 Zig / COM 手書き vtbl） | D3D11-DXGI swap chain（upload path） | ✅ 1級 frame pacing 対応（TASK-35） |
 
 **Metal版（TASK-36）**: ADR-005 の 1級 frame pacing 契約に適合。triple slot + inflight semaphore で
 drawable/buffer の inflight ownership を管理し、`draw(in:)` 内に drawable 取得を集約して CAMetalLayerDrawable
@@ -139,11 +155,15 @@ lifecycle 警告を解消。`displaySyncEnabled` 明示で fifo（display refres
 `src/platform.zig`（facade）が `builtin.os.tag` で backend を切り替え、`build_options.platform_backend`
 で具体実装を選ぶ。Linux では `src/platform_linux.zig`（dispatcher）が `platform_backend` で x11/wayland
 実装を選ぶ（`platform_linux_x11.zig` / `platform_linux_wayland.zig`、共通の `getTime`/dialog は
-`platform_linux_common.zig`）。`-Dplatform` の有効値は OS で変わる:
+`platform_linux_common.zig`）。Windows も同型で `src/platform_windows.zig`（dispatcher）が gdi/d3d11 を
+選ぶ（`platform_windows_gdi.zig` / `platform_windows_d3d11.zig`、共通の window/入力/dialog/getTime/CPU backing は
+`platform_windows_common.zig`）。`-Dplatform` の有効値は OS で変わる:
 
 - **macOS**: `objc`（既定）/ `swift` / `metal`
 - **Linux**: `x11`（既定）/ `wayland`。wayland は TASK-28.5 で display/入力/pixie まで実装し shiso 実機で
   検証済み（busy loop の present flood は frame callback(vsync)律速で対処）。
+- **Windows**: `gdi`（既定、best-effort）/ `d3d11`（1級 frame pacing）。純 Zig で Win32 API を extern fn /
+  COM 手書き vtbl で直接呼ぶ（TASK-31/35）。
 
 不整合（例: Linux で `-Dplatform=objc`）は明確な build エラーになる。共有型（`KeyCode`/`Event` 等）は
 `src/platform_types.zig` が単一ソース。
@@ -280,13 +300,15 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 
 | 層 | 場所 | 内容 |
 |---|---|---|
-| **L1 platform** | `src/audio.zig`（facade）+ `src/audio_macos.zig`（実装） | オーディオ出力プリミティブ。AudioUnit (Default Output Unit) を **extern fn** で叩く（`@cImport` しない）。`open/start/stop/close/config`。`AudioToolbox` は audio を使う exe にのみ `linkFramework`（既存 exe は不変）。 |
+| **L1 platform** | `src/audio.zig`（facade）+ `src/audio_{macos,linux,windows}.zig`（OS 別実装） | オーディオ出力プリミティブ（`open/start/stop/close/config`）。各 OS ネイティブ API を **extern fn / COM 手書き** で叩く（`@cImport` しない）: macOS=AudioUnit(AudioToolbox) / Linux=ALSA(`alsa`=libasound) / Windows=WASAPI(ole32)。audio backend は audio を使う exe にのみ link（既存 exe は不変）。 |
 | **L2 helpers** | `src/dsp/`（`@import("dsp")`） | Oscillator / Envelope(ADSR) / Filter(TPT SVF) / Mixer + denormal 対策。純 Zig。 |
 | **L3 libs** | `libs/synth/`（`@import("synth")`） | Voice / 固定 VoicePool（スチール + done 回収）/ Patch / Synth。GUI⇔Audio のロックフリー受け渡し（SPSC `NoteQueue` / `AtomicF32` / `DoubleBuffer` / 出力タップ `SampleTap`）。dsp に依存。 |
 | **L4 apps** | `apps/synth/`（`run-synth`）+ `examples/15_audio_tone`（`run-example_15`） | PC キーボード演奏 MVP / サイン波最小サンプル。 |
 
-**最重要のスレッドモデル**: グラフィックスは CADisplayLink（メインスレッド）、オーディオは CoreAudio
-の **RT スレッド**でレンダーコールバックを呼ぶ。**RT スレッドでは malloc/lock/IO/panic 禁止**。
+**最重要のスレッドモデル**: グラフィックスはメインスレッド（macOS=CADisplayLink 等）、オーディオは
+render callback で駆動される（macOS=CoreAudio が OS の RT スレッドで pull / Linux=ALSA・Windows=WASAPI は
+backend が自前の再生スレッド `std.Thread` を spawn して push）。**callback の実行区間では malloc/lock/IO/panic 禁止**
+（backend 非依存の RT 契約。callback 外の backend I/O はブロッキング可）。
 メイン⇔RT のデータ交換は `libs/synth` のロックフリー機構（note は SPSC、連続パラメータは atomic、
 出力タップは drop 可）で行う。
 
@@ -417,7 +439,7 @@ app が内部状態を opt-in で probe として公開する。**framework（`s
 - **実行モデル**: 非 step（inject/snapshot/digest）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
 - **制約**: 実ウィンドウは生成する（display 必須。macOS は通常 OK、Linux は Xvfb/実セッション）。完全 display-less は P4。`audio` は RT スレッド実時間依存なので record→replay で digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論）。live の accept ブロック中は window pump が止まる。`fb` の捕捉は CPU フレームバッファ経路で **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。P4 なのは Metal の GPU drawable 読み戻しの方。
-- **driver は std.Io.net 1本実装**で mac/Linux 同一コード（Windows ポートは TASK-31 進捗次第）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
+- **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
 
 ## よく使うコマンド
 
@@ -428,15 +450,20 @@ zig build -Dinstall-all=true
 # すべてのテストを実行（集約。全 test-* を束ねる）
 zig build test
 
-# 個別テスト
+# 個別テスト（集約 test に全て含まれる）
 zig build test-core             # editor/core（undo + tool）+ pixie 入力状態機械
 zig build test-gui              # libs/gui
 zig build test-png-roundtrip    # PNG encode/decode round-trip（+ canvas 単体）
 zig build test-png-format       # PNG format 変換
 zig build test-text             # BDF パーサ + テキスト描画
+zig build test-font             # libs/font（bmfont 等）
 zig build test-sprite           # sprite ブレンド / 描画
 zig build test-dsp              # src/dsp（Oscillator / ADSR / Filter / Mixer）
 zig build test-synth            # libs/synth（SPSC リング / atomic / Voice / VoicePool / Synth）
+zig build test-spectrogram      # apps/synth スペクトログラム（FFT 列ロジック）
+zig build test-scope            # apps/synth オシロスコープ / レベルメータ
+zig build test-harness          # harness（parser / 実行モデル / 仮想クロック）
+# 入力変換の単体テスト（display/compositor 不要）: test-platform-input / -wayland-input / -windows-input / -convert / test-platform-types
 
 # Pixie エディタの実行（-Dplatform で objc/swift/metal 切替）
 zig build run-pixie
@@ -444,12 +471,17 @@ zig build run-pixie
 # Synth アプリの実行（PC キーボード演奏。A..K = C4..C5、ESC で終了）
 zig build run-synth
 
-# 特定のサンプルを実行（ルートから。run-example_01 〜 _NN）
+# 特定のサンプルを実行（ルートから。run-example_01 〜 _17）
 zig build run-example_01        # 01_timed_window
-zig build run-example_02        # 02_keyboard_input
-zig build run-example_03        # 03_sprite_rendering
 zig build run-example_04        # 04_fixed_timestep
 zig build run-example_05        # 05_text_rendering
+zig build run-example_07        # 07_mouse_input
+zig build run-example_15        # 15_audio_tone
+zig build run-example_17        # 17_gui_toggles（checkbox/toggle/radio。TASK-48）
+# 一覧: 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering /
+#       06_sprite_benchmark / 07_mouse_input / 08_gui_primitives / 09_gui_interaction / 10_gui_layout /
+#       11_gui_widgets / 12_outline_font / 13_gui_slider / 14_gui_color_picker / 15_audio_tone /
+#       16_gui_scroll / 17_gui_toggles  （image/ は共有アセットで run step なし）
 ```
 
 ---

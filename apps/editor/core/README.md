@@ -7,13 +7,15 @@
 
 | ファイル | 役割 |
 |---|---|
-| `canvas.zig` | `Canvas`（レイヤ配列・合成・座標変換）、`Layer` / `Vec2` / `Rect` |
+| `canvas.zig` | `Canvas`（多レイヤ配列・合成・座標変換・レイヤ操作）、`Layer` / `Vec2` / `Rect` |
 | `undo.zig` | `StrokeRecorder`（stroke 記録機械）、`UndoStack` / `UndoCmd` / `PixelDiff` |
 | `tool.zig` | `Tool`（vtable 抽象）、`ToolEvent` / `ToolPoint`、`Pen` / `Eraser` / `Brush` |
+| `blend.zig` | ピクセル合成（`srcOver` 等）。canvas / selection / brush が利用 |
 | `io_png.zig` | `encodePNG` / `savePNG`（PNG 出力） |
 | `bezier.zig` | 3次ベジェ `Cubic` の評価・適応平坦化、`Vec2f`（TASK-21.13） |
 | `path.zig` | `Path`（アンカー + in/out ハンドル）・`hitTest`・`rasterize`（TASK-21.13） |
 | `path_editor.zig` | `PathEditor`（ベジェ編集状態機械。pixie が駆動）（TASK-21.13） |
+| `selection.zig` | 矩形選択の操作（clipboard `PixelBlock` / cut・paste・move のピクセル編集）（TASK-44） |
 
 ## 不変条件：表示=composite / 保存は用途で使い分け
 
@@ -138,4 +140,6 @@ cut/paste のピクセル編集・フロート移動用の純描画ヘルパ（`
 - `UndoCmd.paint.diffs` は gpa 所有の owned slice。`UndoStack` が pop / `deinit` で free する。
   自分で `onEvent` の戻り値を push せず捨てる場合は `gpa.free(cmd.paint.diffs)` すること。
 - `StrokeRecorder` / `Canvas` の幅・高さは一致させる（recorder の dedup ビットマップは w*h）。
-- 現状 MVP は単一レイヤ（`layer_idx = 0`）。多レイヤ・Fill・Picker・BlendMode は後続タスク。
+- 多レイヤは実装済み（TASK-43。`Canvas` の `layers` / `selected_layer` + `addLayer` / `insertLayer` /
+  `deleteLayer` / `moveLayer` / `selectLayer`、レイヤ opacity / visibility。描画は選択レイヤ対象）。
+  Fill / Picker / レイヤーブレンドモードは後続タスク。

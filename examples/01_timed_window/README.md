@@ -21,7 +21,10 @@
 
 ## ビルド方法
 
-### Objective-C版（デフォルト）
+`-Dplatform` の既定は OS 依存（macOS=objc / Linux=x11 / Windows=gdi）。以下の run-objc/swift/metal は
+macOS 向け。Linux/Windows では `zig build run`（既定 backend）や `-Dplatform=x11|wayland|gdi|d3d11` を使う。
+
+### Objective-C版（macOS 既定）
 ```bash
 cd examples/01_timed_window
 zig build
@@ -48,11 +51,11 @@ zig build run-metal
 ビルド後、以下のコマンドで実行できます：
 
 ```bash
-# デフォルト（Objective-C版）
+# 既定 backend（macOS=objc / Linux=x11 / Windows=gdi）
 zig build run
 
-# 個別実行
-./zig-out/bin/example_01_timed_window        # Objective-C版
+# 個別実行（macOS。無印 binary = 既定 backend）
+./zig-out/bin/example_01_timed_window        # 既定 backend（macOS=Objective-C版）
 ./zig-out/bin/example_01_timed_window_swift  # Swift版
 ./zig-out/bin/example_01_timed_window_metal  # Metal版
 ```
@@ -102,8 +105,9 @@ if (elapsed >= duration) {
 ## 次のステップ
 
 - `02_keyboard_input` - キーボード入力の処理
-- `03_mouse_input` - マウス入力の処理
-- `04_animation` - より複雑なアニメーション
+- `03_sprite_rendering` - スプライト表示
+- `04_fixed_timestep` - 固定タイムステップ + 物理シミュレーション
+- `07_mouse_input` - マウス入力の処理
 
 ## 注意事項
 
