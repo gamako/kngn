@@ -2,7 +2,7 @@
 //!
 //! 現状（TASK-27.2）: GUI(メインスレッド) ⇔ Audio(RTスレッド) のロックフリー受け渡し機構。
 //! - `NoteQueue` / `SpscRing`: GUI→Audio のノートイベント（note_off / パニックは落とさない）
-//! - `AtomicF32` / `DoubleBuffer`: GUI→Audio の連続パラメータ / patch
+//! - `AtomicF32` / `Mailbox`: GUI→Audio の連続パラメータ / patch（triple-buffer）
 //! - `SampleTap`: Audio→GUI の出力タップ（スペクトログラム用、drop 可）
 //!
 //! TASK-27.4: Voice / VoicePool / Patch / Synth.render（dsp に依存）。
@@ -19,7 +19,7 @@ pub const NoteEvent = ring.NoteEvent;
 pub const NoteQueue = ring.NoteQueue;
 
 pub const AtomicF32 = params.AtomicF32;
-pub const DoubleBuffer = params.DoubleBuffer;
+pub const Mailbox = params.Mailbox;
 
 pub const SampleTap = tap.SampleTap;
 

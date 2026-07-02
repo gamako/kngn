@@ -48,6 +48,9 @@ const Scope = scope.Oscilloscope(SCOPE_W, VIS_H);
 const App = struct {
     synth: Synth,
     fx: Fx,
+    /// GUI 側で最後に publish した patch のコピー（patch probe 用。TASK-56。
+    /// Mailbox の consumer 状態は RT 専有のため probe からは触らない）
+    last_patch: Patch = .{},
     tap: Tap,
 };
 
@@ -208,8 +211,10 @@ fn formatVoices(app: *App, buf: []u8) []const u8 {
 }
 
 /// 公開中 patch を JSON 1行に整形。
+/// Mailbox の consumer 状態（RT 専有）に触れないよう、GUI 側コピー（last_patch）を読む（TASK-56）。
+/// probe は GUI と同一スレッド（main）なので plain read で安全。
 fn formatPatch(app: *App, buf: []u8) []const u8 {
-    const p = app.synth.patch_db.current();
+    const p = app.last_patch;
     return std.fmt.bufPrint(buf, "{{\"wave\":\"{s}\",\"filter\":\"{s}\",\"cutoff\":{d:.1},\"res\":{d:.2},\"gain\":{d:.3},\"attack\":{d:.3},\"release\":{d:.3},\"unison\":{d}}}", .{
         @tagName(p.waveform), @tagName(p.filter_mode), p.cutoff, p.resonance, p.gain, p.attack, p.release, p.unison,
     }) catch buf[0..0];
@@ -242,9 +247,11 @@ pub fn main() !void {
     var params = Params{};
     var fxp = FxParams{};
 
+    const initial_patch = makePatch(params);
     app.* = .{
-        .synth = Synth.init(48000, makePatch(params)),
+        .synth = Synth.init(48000, initial_patch),
         .fx = Fx.init(48000, makeFxParams(fxp)),
+        .last_patch = initial_patch, // probe が初回 frame 前でも実際の初期 patch を返すように
         .tap = .{},
     };
 
@@ -418,7 +425,8 @@ pub fn main() !void {
         ctx.endFrame();
 
         // パラメータを publish（atomic/patch publish 経由で audio スレッドへ。audio 側でスムージング）
-        app.synth.publishPatch(makePatch(params));
+        app.last_patch = makePatch(params);
+        app.synth.publishPatch(app.last_patch);
         app.fx.publishParams(makeFxParams(fxp));
 
         // 手動描画（背景 + 鍵盤 + スペクトログラム + オシロ + メータ）→ その上に GUI

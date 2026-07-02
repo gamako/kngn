@@ -2,6 +2,7 @@
 //!
 //! producer(GUIスレッド): sendNoteOn/Off, panicAllNotesOff, publishPatch
 //! consumer(RTスレッド): render(buf, frames, channels) — note を反映しボイスを合成・ミックス。
+//! patch はブロック先頭で 1 回だけ latch する（Mailbox.acquire。ブロック内不整合の排除。TASK-56）。
 
 const std = @import("std");
 const dsp = @import("dsp");
@@ -18,7 +19,7 @@ pub fn Synth(comptime max_voices: usize) type {
 
         pool: voice.VoicePool(max_voices) = .{},
         queue: Queue = .{},
-        patch_db: params.DoubleBuffer(Patch),
+        patch_db: params.Mailbox(Patch),
         sample_rate: f32,
         panic_seen: u32 = 0,
         // パラメータスムージング（急変クリック回避）: gain はブロック内線形ランプ、cutoff は一次平滑。
@@ -31,7 +32,7 @@ pub fn Synth(comptime max_voices: usize) type {
 
         pub fn init(sample_rate: f32, initial_patch: Patch) Self {
             return .{
-                .patch_db = params.DoubleBuffer(Patch).init(initial_patch),
+                .patch_db = params.Mailbox(Patch).init(initial_patch),
                 .sample_rate = sample_rate,
                 .smoothed_gain = initial_patch.gain,
                 .smoothed_cutoff = initial_patch.cutoff,
@@ -58,18 +59,21 @@ pub fn Synth(comptime max_voices: usize) type {
         /// note イベント反映 → patch 読み出し → ボイス合成 → interleaved 出力へ書き込み。
         /// RT スレッドで呼ばれる。malloc/lock/IO しない。
         pub fn render(self: *Self, buf: []f32, frames: u32, channels: u32) void {
+            // 0. patch をブロック先頭で 1 回だけ latch（drain 中の note_on も含め
+            //    ブロック内は同一 patch を使う = ブロック内不整合の排除。TASK-56）
+            const patch = self.patch_db.acquire().*;
+
             // 1. note イベントを drain
             while (self.queue.pop()) |ev| {
                 switch (ev) {
-                    .note_on => |n| self.pool.noteOn(n.note, n.velocity, self.currentPatch(), self.sample_rate),
+                    .note_on => |n| self.pool.noteOn(n.note, n.velocity, patch, self.sample_rate),
                     .note_off => |n| self.pool.noteOff(n.note),
                 }
             }
             // 2. パニック（全ノートオフ）
             if (self.queue.takePanic(&self.panic_seen)) self.pool.allNotesOff();
 
-            // 3. patch を読み（整合的なスナップショット）。cutoff は一次平滑してブロック先頭で filter 反映。
-            const patch = self.currentPatch();
+            // 3. cutoff は一次平滑してブロック先頭で filter 反映。
             self.smoothed_cutoff += (patch.cutoff - self.smoothed_cutoff) * cutoff_smooth;
             var block_patch = patch;
             block_patch.cutoff = self.smoothed_cutoff;
@@ -103,9 +107,7 @@ pub fn Synth(comptime max_voices: usize) type {
             self.smoothed_gain = g1;
         }
 
-        fn currentPatch(self: *Self) Patch {
-            return self.patch_db.current();
-        }
+
     };
 }
 
@@ -242,14 +244,14 @@ test "Synth.render: voice-major は sample-major 参照と IEEE == で全サン�
 
 /// 旧 sample-major と同じ手順の参照実装（render と同一の drain/patch/gain 処理）。
 fn renderSampleMajorRef(self: *Synth(8), buf: []f32, frames: u32, channels: u32) void {
+    const patch = self.patch_db.acquire().*; // render と同じブロック先頭 latch（TASK-56）
     while (self.queue.pop()) |ev| {
         switch (ev) {
-            .note_on => |n| self.pool.noteOn(n.note, n.velocity, self.patch_db.current(), self.sample_rate),
+            .note_on => |n| self.pool.noteOn(n.note, n.velocity, patch, self.sample_rate),
             .note_off => |n| self.pool.noteOff(n.note),
         }
     }
     if (self.queue.takePanic(&self.panic_seen)) self.pool.allNotesOff();
-    const patch = self.patch_db.current();
     self.smoothed_cutoff += (patch.cutoff - self.smoothed_cutoff) * Synth(8).cutoff_smooth;
     var block_patch = patch;
     block_patch.cutoff = self.smoothed_cutoff;

@@ -4,7 +4,7 @@
 //! チェーン順: distortion → chorus → delay(feedback) → reverb。各段は mix=0 で実質無効(ただし内部状態は
 //! 更新継続=可聴バイパスであって凍結ではない)。完全な無効化は master `bypass`(buf 不変)。
 //!
-//! パラメータ受け渡しは Synth.patch_db と同じ `DoubleBuffer`(ロックフリー)。
+//! パラメータ受け渡しは Synth.patch_db と同じ `Mailbox`(triple-buffer・ロックフリー。TASK-56)。
 //! 前提: 単一 producer(GUI スレッド)、フレーム単位で publish、`Params` は小さい plain data、
 //! publish 後は当該バッファを mutation しない。reverb はサンプルレート依存タップを持つため
 //! `setSampleRate` を起動時(device.start 前・RT 未稼働)に呼ぶ。
@@ -40,7 +40,7 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
             reverb_damping: f32 = 0.3, // 0..1(高域減衰)
         };
 
-        params_db: params.DoubleBuffer(Params),
+        params_db: params.Mailbox(Params),
         sample_rate: f32,
         delay: [2]dsp.DelayLine(delay_cap) = .{ .{}, .{} }, // L/R
         chorus: [2]dsp.DelayLine(chorus_cap) = .{ .{}, .{} }, // L/R
@@ -51,7 +51,7 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
 
         pub fn init(sample_rate: f32, initial: Params) Self {
             return .{
-                .params_db = params.DoubleBuffer(Params).init(initial),
+                .params_db = params.Mailbox(Params).init(initial),
                 .sample_rate = sample_rate,
                 .reverb = dsp.Reverb.init(sample_rate),
             };
@@ -71,7 +71,7 @@ pub fn MasterEffects(comptime delay_cap: usize, comptime chorus_cap: usize) type
 
         /// RT スレッド: buf を in-place 処理。確保/ロックなし。
         pub fn process(self: *Self, buf: []f32, frames: u32, channels: u32) void {
-            const p = self.params_db.current();
+            const p = self.params_db.acquire().*;
             if (p.bypass) return; // master bypass: buf 不変
 
             // process 冒頭で全 Params を clamp(GUI 以外/将来コードからの publish にも頑健に)。

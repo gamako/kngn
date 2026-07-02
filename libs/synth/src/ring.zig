@@ -15,8 +15,9 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
         const mask = capacity - 1;
 
         buffer: [capacity]T = undefined,
-        head: AtomicUsize = AtomicUsize.init(0), // producer が進める
-        tail: AtomicUsize = AtomicUsize.init(0), // consumer が進める
+        // head(producer 書き) / tail(consumer 書き) は別キャッシュラインに分離（false sharing 回避。TASK-56）
+        head: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // producer が進める
+        tail: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // consumer が進める
 
         pub fn capacityCount() usize {
             return capacity;
@@ -67,7 +68,8 @@ pub fn NoteQueue(comptime capacity: usize, comptime off_reserve: usize) type {
         const Ring = SpscRing(NoteEvent, capacity);
 
         ring: Ring = .{},
-        panic_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        // ring.tail（consumer 書き）と同一ライン化しないよう分離（producer 書き・consumer 読み。TASK-56）
+        panic_gen: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
 
         // ---- producer (GUI / 入力) ----
 
@@ -161,4 +163,23 @@ test "NoteQueue: panic is never dropped even when ring is full" {
     q.panicAllNotesOff();
     try testing.expect(q.takePanic(&seen));
     try testing.expect(!q.takePanic(&seen)); // 二度は消費しない
+}
+
+test "SpscRing/NoteQueue: producer/consumer atomic が別キャッシュライン（レイアウト固定）" {
+    const cl = std.atomic.cache_line;
+    const Ring = SpscRing(u32, 8);
+    try testing.expect(@alignOf(Ring) >= cl);
+    try testing.expect(@offsetOf(Ring, "head") % cl == 0);
+    try testing.expect(@offsetOf(Ring, "tail") % cl == 0);
+    const dist = if (@offsetOf(Ring, "tail") > @offsetOf(Ring, "head"))
+        @offsetOf(Ring, "tail") - @offsetOf(Ring, "head")
+    else
+        @offsetOf(Ring, "head") - @offsetOf(Ring, "tail");
+    try testing.expect(dist >= cl);
+
+    const Q = NoteQueue(8, 2);
+    const tail_off = @offsetOf(Q, "ring") + @offsetOf(Q.Ring, "tail");
+    const panic_off = @offsetOf(Q, "panic_gen");
+    try testing.expect(panic_off % cl == 0);
+    try testing.expect(tail_off / cl != panic_off / cl); // 別ライン
 }

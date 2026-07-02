@@ -15,8 +15,9 @@ pub fn SampleTap(comptime capacity: usize) type {
         const mask = capacity - 1;
 
         buffer: [capacity]f32 = undefined,
-        head: AtomicUsize = AtomicUsize.init(0), // producer(RT)
-        tail: AtomicUsize = AtomicUsize.init(0), // consumer(GUI)
+        // head(RT 書き) / tail(GUI 書き) は別キャッシュラインに分離（false sharing 回避。TASK-56）
+        head: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // producer(RT)
+        tail: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // consumer(GUI)
 
         /// RT producer: `samples` をまとめて書く。空き不足なら丸ごと drop（ブロックしない）。
         pub fn write(self: *Self, samples: []const f32) void {
@@ -83,4 +84,17 @@ test "SampleTap: partial read and wrap-around" {
         try testing.expectEqual(@as(usize, 2), tap.read(&out));
         try testing.expectEqualSlices(f32, &in, &out);
     }
+}
+
+test "SampleTap: head/tail が別キャッシュライン（レイアウト固定）" {
+    const cl = std.atomic.cache_line;
+    const Tap = SampleTap(8);
+    try testing.expect(@alignOf(Tap) >= cl);
+    try testing.expect(@offsetOf(Tap, "head") % cl == 0);
+    try testing.expect(@offsetOf(Tap, "tail") % cl == 0);
+    const dist = if (@offsetOf(Tap, "tail") > @offsetOf(Tap, "head"))
+        @offsetOf(Tap, "tail") - @offsetOf(Tap, "head")
+    else
+        @offsetOf(Tap, "head") - @offsetOf(Tap, "tail");
+    try testing.expect(dist >= cl);
 }
