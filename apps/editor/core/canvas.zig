@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const blend = @import("blend.zig");
+const pixelops = @import("pixelops");
 const bezier = @import("bezier.zig");
 
 pub const Vec2 = struct { x: i32, y: i32 };
@@ -133,12 +133,30 @@ pub const Canvas = struct {
     /// 白背景に各 visible layer を実 src-over する合成。プレビューなど不透明背景向け。
     /// layer.opacity を src alpha に乗算してから合成。a=255 は元色・a=0 は背景維持（RGB 非ゼロでも）・
     /// visible=false はスキップ。partial-alpha（ソフトブラシ）は白地へ正しくブレンドされる。
+    ///
+    /// 毎フレーム全画素×レイヤ数を走るホットパス（pixie main loop / canvas probe）。
+    /// dst は白不透明で始まり srcOverOpaque が out_a=255 を維持するため常に不透明。
+    /// pixelops の整数 SIMD（scaleAlpha4 + srcOverOpaque4）で 4px 同時処理し、
+    /// 旧 scalar 実装（srcOver+scaleAlpha per-pixel）と bit 一致（テストで固定。TASK-52）。
     pub fn composite(self: *Canvas) []const u32 {
         @memset(self.composite_cache, 0xFFFFFFFF); // white opaque background
         for (self.layers.items) |layer| {
             if (!layer.visible) continue;
-            for (layer.pixels, self.composite_cache) |src, *dst| {
-                dst.* = blend.srcOver(dst.*, blend.scaleAlpha(src, layer.opacity));
+            const op = layer.opacity; // ループ外 latch
+            const n = self.composite_cache.len;
+            var i: usize = 0;
+            while (i + 4 <= n) : (i += 4) {
+                const src_chunk: *const [4]u32 = layer.pixels[i..][0..4];
+                const dst_chunk: *[4]u32 = self.composite_cache[i..][0..4];
+                var sv: pixelops.Vec16u8 = @bitCast(src_chunk.*);
+                if (op != 255) sv = pixelops.scaleAlpha4(sv, op); // scaleAlpha(c,255)==c なので省略可
+                const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
+                dst_chunk.* = @bitCast(pixelops.srcOverOpaque4(dv, sv));
+            }
+            // scalar tail（0..3 px）
+            while (i < n) : (i += 1) {
+                const s = if (op != 255) pixelops.scaleAlpha(layer.pixels[i], op) else layer.pixels[i];
+                self.composite_cache[i] = pixelops.srcOverOpaque(self.composite_cache[i], s);
             }
         }
         return self.composite_cache;
@@ -147,12 +165,30 @@ pub const Canvas = struct {
     /// アルファ保持合成（透明背景に各 visible layer を実 src-over）。チェッカー背景への重ね描きやフラット PNG 保存向け。
     /// composite() と違い背景を白で埋めない（完全透明部は a=0 のまま残る）。
     /// 戻りは straight-alpha BGRA。blit 側では背景（チェッカー）へ src-over する前提。
+    ///
+    /// 毎フレーム全画素×レイヤ数を走るホットパス（pixie main loop / canvas probe）。
+    /// dst alpha が可変なため pixelops の f32 SIMD（srcOverStraight4）で 4px 同時処理する
+    /// （丸めは旧整数式から僅かに変わりうる。scalar 参照との bit 一致はテストで固定。TASK-52）。
+    /// 不変条件: 単層 opacity=255 は raw pixels と恒等（a=0 ⇒ RGB=0 の cache 不変条件下）。
     pub fn compositeStraight(self: *Canvas) []const u32 {
         @memset(self.composite_cache, 0x00000000); // transparent background
         for (self.layers.items) |layer| {
             if (!layer.visible) continue;
-            for (layer.pixels, self.composite_cache) |src, *dst| {
-                dst.* = blend.srcOver(dst.*, blend.scaleAlpha(src, layer.opacity));
+            const op = layer.opacity; // ループ外 latch
+            const n = self.composite_cache.len;
+            var i: usize = 0;
+            while (i + 4 <= n) : (i += 4) {
+                const s4: [4]u32 = layer.pixels[i..][0..4].*;
+                // fast path: 4px 全て src a==0 → dst 不変（sa=0 → 結果=dst が正確なので bit 影響なし）
+                if ((s4[0] | s4[1] | s4[2] | s4[3]) & 0xFF000000 == 0) continue;
+                const dst_chunk: *[4]u32 = self.composite_cache[i..][0..4];
+                dst_chunk.* = @bitCast(pixelops.srcOverStraight4(@bitCast(dst_chunk.*), @bitCast(s4), op));
+            }
+            // scalar tail（0..3 px）
+            while (i < n) : (i += 1) {
+                const s = layer.pixels[i];
+                if (s & 0xFF000000 == 0) continue;
+                self.composite_cache[i] = pixelops.srcOverStraightScalar(self.composite_cache[i], s, op);
             }
         }
         return self.composite_cache;
@@ -397,6 +433,85 @@ test "compositeStraight: 全透明は a=0 維持 / 不透明は元色 / 半透�
     try std.testing.expectEqual(@as(u32, 0x00000000), out[1]); // 透明は a=0 維持（白で埋めない）
     try std.testing.expectEqual(@as(u32, 128), (out[2] >> 24) & 0xFF); // 半透明の out_a を保持
     try std.testing.expectEqual(@as(u32, 0xFF), out[2] & 0xFF); // B=255
+}
+
+/// テスト用: 乱数レイヤ内容を充填する（a=0 の画素は RGB=0 に正規化 = cache 不変条件と同じ）。
+fn fillRandomLayers(c: *Canvas, seed: u64, opacities: []const u8) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    for (c.layers.items, 0..) |layer, li| {
+        for (layer.pixels) |*p| {
+            const a = rng.int(u8);
+            p.* = if (a == 0) 0 else (@as(u32, a) << 24) | (rng.int(u32) & 0x00FFFFFF);
+        }
+        c.layers.items[li].opacity = opacities[li % opacities.len];
+    }
+}
+
+test "composite: SIMD 経路が旧 scalar 実装と bit 一致（乱数多層 + opacity 混在）" {
+    const gpa = std.testing.allocator;
+    // 7x5=35px（チャンク 8 個 + tail 3px）× 3 層。opacity は 255/200/128 を混在。
+    var c = try Canvas.init(gpa, 7, 5);
+    defer c.deinit();
+    _ = try c.addLayer(gpa);
+    _ = try c.addLayer(gpa);
+    fillRandomLayers(&c, 0xC0117051, &.{ 255, 200, 128 });
+    c.layers.items[1].visible = false; // visible スキップ経路も混ぜる
+
+    // 旧アルゴリズム（scalar srcOver + scaleAlpha per-pixel）の参照実装
+    const ref = try gpa.alloc(u32, 35);
+    defer gpa.free(ref);
+    @memset(ref, 0xFFFFFFFF);
+    const pix = @import("pixelops");
+    for (c.layers.items) |layer| {
+        if (!layer.visible) continue;
+        for (layer.pixels, ref) |src, *dst| {
+            dst.* = pix.srcOver(dst.*, pix.scaleAlpha(src, layer.opacity));
+        }
+    }
+
+    try std.testing.expectEqualSlices(u32, ref, c.composite());
+}
+
+test "compositeStraight: SIMD 経路が srcOverStraightScalar の参照ループと bit 一致（乱数多層）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 7, 5);
+    defer c.deinit();
+    _ = try c.addLayer(gpa);
+    _ = try c.addLayer(gpa);
+    fillRandomLayers(&c, 0x57A167A1, &.{ 200, 255, 128 });
+
+    const ref = try gpa.alloc(u32, 35);
+    defer gpa.free(ref);
+    @memset(ref, 0x00000000);
+    const pix = @import("pixelops");
+    for (c.layers.items) |layer| {
+        if (!layer.visible) continue;
+        for (layer.pixels, ref) |src, *dst| {
+            dst.* = pix.srcOverStraightScalar(dst.*, src, layer.opacity);
+        }
+    }
+
+    try std.testing.expectEqualSlices(u32, ref, c.compositeStraight());
+}
+
+test "compositeStraight: 単層 opacity=255 は raw pixels と恒等（AC3。a=0..255 全域 + tail）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 37, 7); // 259px（チャンク 64 + tail 3）
+    defer c.deinit();
+    // 先頭 256px に a=0..255 を明示的に 1 回ずつ（a=0 は RGB=0 の cache 不変条件に正規化）、
+    // 残り 3px（tail）は乱数
+    var prng = std.Random.DefaultPrng.init(0x1DE47177);
+    const rng = prng.random();
+    const px = c.layerPixels(0);
+    for (px[0..256], 0..) |*p, a| {
+        p.* = if (a == 0) 0 else (@as(u32, @intCast(a)) << 24) | (rng.int(u32) & 0x00FFFFFF);
+    }
+    for (px[256..]) |*p| {
+        const a = rng.intRangeAtMost(u8, 1, 255);
+        p.* = (@as(u32, a) << 24) | (rng.int(u32) & 0x00FFFFFF);
+    }
+    try std.testing.expectEqualSlices(u32, c.layerPixels(0), c.compositeStraight());
 }
 
 test "compositeStraight: visible=false スキップ / 2 層は上が下を src-over してアルファ保持" {

@@ -16,6 +16,7 @@ const std = @import("std");
 pub const Vec4u16 = @Vector(4, u16);
 pub const Vec16u8 = @Vector(16, u8);
 pub const Vec16u16 = @Vector(16, u16);
+pub const Vec16f32 = @Vector(16, f32);
 
 // ============================================================
 // div255: /255 の per-pixel 整数除算を置き換える高速近似
@@ -210,6 +211,83 @@ pub inline fn srcOverOpaque4(dst: Vec16u8, src: Vec16u8) Vec16u8 {
     const blended: Vec16u8 = @intCast(blended16);
 
     return @select(u8, alpha_mask, @as(Vec16u8, @splat(0xFF)), blended);
+}
+
+/// 4 ピクセル同時の scaleAlpha（16-lane）。`scaleAlpha` と bit 一致
+/// （a' = div255Round(a*cov) = (a*cov+127)/255、RGB 不変）。
+pub inline fn scaleAlpha4(c: Vec16u8, cov: u8) Vec16u8 {
+    const c16: Vec16u16 = @intCast(c);
+    const cov16: Vec16u16 = @splat(cov);
+    // 全 lane を一括スケールし（値域 ≤ 255*255 で u16 内）、alpha lane だけ採用する
+    const scaled: Vec16u8 = @intCast(div255RoundVec16(c16 * cov16));
+    return @select(u8, alpha_mask, scaled, c);
+}
+
+// ============================================================
+// straight 系・一般 SIMD（dst alpha 可変。TASK-52）
+//
+// 可変 out_a の除算は div255（除数 255 固定）で表現できないため f32 除算を使う。
+// 積・和の値域は ≤ 255*65025 = 16,581,375 < 2^24 で f32 に正確表現される
+// （u16 lane の積和は溢れるので禁止。必ず f32 へ widen してから積和する）。
+// 保証するのは srcOverStraightScalar ↔ srcOverStraight4 の bit 一致のみ
+// （整数版 `srcOver` とは丸めが僅かに異なりうる）。
+// ============================================================
+
+/// straight src-over + layer opacity 融合のスカラー参照実装（f32 演算）。
+/// `srcOverStraight4` と bit 一致（テストで固定）。out = srcOver(dst, scaleAlpha(src, opacity)) 相当。
+/// 不変条件: sa'==0 のとき dst alpha > 0 なら dst を bit そのまま返す。dst alpha == 0 なら
+/// 0x00000000 を返す（dst が「a=0 ⇒ RGB=0」を満たす前提＝canvas cache 不変条件下では
+/// dst の bit 保持と同値。呼び出し側の skip fast path はこの前提で等価になる）。
+pub fn srcOverStraightScalar(dst: u32, src: u32, opacity: u8) u32 {
+    const sa_scaled = div255Round(ch(src, 24) * opacity);
+    const da = ch(dst, 24);
+    const inv = 255 - sa_scaled;
+    const den_i = sa_scaled * 255 + da * inv; // ≤ 65025
+    if (den_i == 0) return 0; // 完全透明どうし（cache 不変条件で dst==0）
+    const den: f32 = @floatFromInt(den_i);
+    // 整数で組み立てた分子は ≤ 16.6M で u32 に収まり、f32 変換も正確（< 2^24）
+    const b = straightChannel(ch(src, 0), ch(dst, 0), sa_scaled, da, inv, den);
+    const g = straightChannel(ch(src, 8), ch(dst, 8), sa_scaled, da, inv, den);
+    const r = straightChannel(ch(src, 16), ch(dst, 16), sa_scaled, da, inv, den);
+    const out_a: u32 = @intFromFloat(@round(den / 255.0));
+    return (out_a << 24) | (r << 16) | (g << 8) | b;
+}
+
+inline fn straightChannel(sc: u32, dc: u32, sa: u32, da: u32, inv: u32, den: f32) u32 {
+    const num: f32 = @floatFromInt(sc * sa * 255 + dc * da * inv);
+    return @intFromFloat(@round(num / den));
+}
+
+/// 4 ピクセル同時の straight src-over + layer opacity 融合（16-lane、f32 除算）。
+/// `srcOverStraightScalar` と bit 一致。dst alpha 可変（compositeStraight 向け）。
+pub inline fn srcOverStraight4(dst: Vec16u8, src: Vec16u8, opacity: u8) Vec16u8 {
+    // sa' = div255Round(sa * opacity)（整数。u16 内）
+    const src_a = @shuffle(u8, src, undefined, alpha_idx);
+    const dst_a = @shuffle(u8, dst, undefined, alpha_idx);
+    const sa16: Vec16u16 = @intCast(src_a);
+    const op16: Vec16u16 = @splat(opacity);
+    const sa_scaled16 = div255RoundVec16(sa16 * op16);
+    const inv16 = @as(Vec16u16, @splat(255)) - sa_scaled16;
+
+    // f32 へ widen（u16 の積和は禁止: 分子 ≤ 16.6M）
+    const sa_f: Vec16f32 = @floatFromInt(sa_scaled16);
+    const inv_f: Vec16f32 = @floatFromInt(inv16);
+    const da_f: Vec16f32 = @floatFromInt(@as(Vec16u16, @intCast(dst_a)));
+    const src_f: Vec16f32 = @floatFromInt(@as(Vec16u16, @intCast(src)));
+    const dst_f: Vec16f32 = @floatFromInt(@as(Vec16u16, @intCast(dst)));
+
+    const c255: Vec16f32 = @splat(255.0);
+    const den = sa_f * c255 + da_f * inv_f; // per-pixel 値（alpha 複製で 4 lane 同値）
+    const num = src_f * sa_f * c255 + dst_f * da_f * inv_f;
+
+    const zero: Vec16f32 = @splat(0.0);
+    const den_is_zero = den == zero;
+    const safe_den = @select(f32, den_is_zero, @as(Vec16f32, @splat(1.0)), den);
+    const color = @select(f32, den_is_zero, zero, @round(num / safe_den));
+    const alpha = @round(den / c255); // den==0 なら 0
+    const out_f = @select(f32, alpha_mask, alpha, color);
+    const out16: Vec16u16 = @intFromFloat(out_f);
+    return @intCast(out16);
 }
 
 // ============================================================
@@ -409,6 +487,68 @@ test "srcOverOpaque == srcOver（dst 不透明時）: (sa, src, dst) per-channel
                 try testing.expectEqual(srcOver(dst, src), srcOverOpaque(dst, src));
             }
         }
+    }
+}
+
+test "scaleAlpha4 matches scalar scaleAlpha（境界 + 乱数）" {
+    var prng = std.Random.DefaultPrng.init(0x5CA1E);
+    const rng = prng.random();
+    const covs = [_]u8{ 0, 1, 127, 128, 254, 255, 200 };
+    for (covs) |cov| {
+        var trial: usize = 0;
+        while (trial < 500) : (trial += 1) {
+            var px: [4]u32 = undefined;
+            for (&px) |*p| p.* = rng.int(u32);
+            var expected: [4]u32 = undefined;
+            for (0..4) |i| expected[i] = scaleAlpha(px[i], cov);
+            const actual: [4]u32 = @bitCast(scaleAlpha4(@bitCast(px), cov));
+            try testing.expectEqualSlices(u32, &expected, &actual);
+        }
+    }
+}
+
+test "srcOverStraight4 matches scalar srcOverStraightScalar（境界 alpha 強制 + 乱数）" {
+    var prng = std.Random.DefaultPrng.init(0x57A1);
+    const rng = prng.random();
+    const forced_alphas = [_]u8{ 0, 1, 127, 128, 254, 255 };
+    const opacities = [_]u8{ 255, 200, 128, 1, 0 };
+    for (opacities) |op| {
+        var trial: usize = 0;
+        while (trial < 1000) : (trial += 1) {
+            var src: [4]u32 = undefined;
+            var dst: [4]u32 = undefined;
+            for (&src, &dst) |*s, *d| {
+                const sa: u8 = if (trial < forced_alphas.len) forced_alphas[trial] else rng.int(u8);
+                const da: u8 = if (trial < forced_alphas.len) forced_alphas[forced_alphas.len - 1 - trial] else rng.int(u8);
+                const sb: [4]u8 = .{ rng.int(u8), rng.int(u8), rng.int(u8), sa };
+                const db: [4]u8 = .{ rng.int(u8), rng.int(u8), rng.int(u8), da };
+                s.* = @bitCast(sb);
+                d.* = @bitCast(db);
+            }
+            var expected: [4]u32 = undefined;
+            for (0..4) |i| expected[i] = srcOverStraightScalar(dst[i], src[i], op);
+            const actual: [4]u32 = @bitCast(srcOverStraight4(@bitCast(dst), @bitCast(src), op));
+            try testing.expectEqualSlices(u32, &expected, &actual);
+        }
+    }
+}
+
+test "srcOverStraightScalar: 恒等性（dst=0・opacity=255・a>0 で src を bit 保持）と sa'==0 で dst 保持" {
+    var prng = std.Random.DefaultPrng.init(0x1DE2);
+    const rng = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        // a>0 の src は透明 dst 上で bit 保持（compositeStraight 単層恒等の基礎）
+        const a: u8 = rng.intRangeAtMost(u8, 1, 255);
+        const bytes: [4]u8 = .{ rng.int(u8), rng.int(u8), rng.int(u8), a };
+        const src: u32 = @bitCast(bytes);
+        try testing.expectEqual(src, srcOverStraightScalar(0x00000000, src, 255));
+
+        // sa'==0（src a=0）は dst を bit そのまま返す（skip fast path と等価）。
+        // 例外: dst も a=0 なら 0 を返す（cache 不変条件 a=0⇒RGB=0 の下では dst==0 と同値）
+        const dst = rng.int(u32);
+        const expected: u32 = if ((dst >> 24) == 0) 0x00000000 else dst;
+        try testing.expectEqual(expected, srcOverStraightScalar(dst, rng.int(u32) & 0x00FFFFFF, 255));
     }
 }
 
