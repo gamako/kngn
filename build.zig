@@ -597,6 +597,48 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_platform_types_step);
+
+    // ========================================
+    // マイクロベンチ（TASK-50）。純ロジック計測（display / audio デバイス不要・OS 非依存）。
+    // optimize は ReleaseFast 固定: -Doptimize には従わない（Debug 計測事故の防止。
+    // 前後比較の基準を常に同一最適化レベルに保つ）。
+    // ========================================
+    const bench_canvas_root = b.createModule(.{
+        .root_source_file = b.path("bench/canvas.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_canvas_root.addImport("editor_canvas", b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/canvas.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const bench_canvas_exe = b.addExecutable(.{ .name = "bench_canvas", .root_module = bench_canvas_root });
+    const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
+    bench_canvas_step.dependOn(&b.addRunArtifact(bench_canvas_exe).step);
+
+    // bench 用に dsp/synth を ReleaseFast で独立生成（example_modules の共有インスタンスは
+    // 通常ビルドの optimize を引き継ぐため使わない）
+    const bench_dsp_mod = b.createModule(.{
+        .root_source_file = b.path("src/dsp/dsp.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_synth_mod = b.createModule(.{
+        .root_source_file = b.path("libs/synth/src/synth.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_synth_mod.addImport("dsp", bench_dsp_mod);
+    const bench_synth_root = b.createModule(.{
+        .root_source_file = b.path("bench/synth.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_synth_root.addImport("synth", bench_synth_mod);
+    const bench_synth_exe = b.addExecutable(.{ .name = "bench_synth", .root_module = bench_synth_root });
+    const bench_synth_step = b.step("bench-synth", "Run Synth.render / MasterEffects.process micro-benchmark (ReleaseFast)");
+    bench_synth_step.dependOn(&b.addRunArtifact(bench_synth_exe).step);
 }
 
 // ============================================================

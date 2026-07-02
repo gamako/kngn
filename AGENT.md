@@ -523,6 +523,10 @@ zig build test-scope            # apps/synth オシロスコープ / レベル�
 zig build test-harness          # harness（parser / 実行モデル / 仮想クロック）
 # 入力変換の単体テスト（display/compositor 不要）: test-platform-input / -wayland-input / -windows-input / -convert / test-platform-types
 
+# マイクロベンチ（性能変更の前後比較。ReleaseFast 固定・display/audio デバイス不要・OS 非依存。TASK-50）
+zig build bench-canvas          # Canvas.composite / compositeStraight の ns/frame・Mpx/s
+zig build bench-synth           # Synth(16voice).render / MasterEffects.process の ns/block・×realtime
+
 # Pixie エディタの実行（-Dplatform で objc/swift/metal 切替）
 zig build run-pixie
 
