@@ -17,6 +17,7 @@ const gui = @import("gui");
 const core = @import("core");
 const png = @import("png");
 const canvas_input = @import("canvas_input.zig");
+const blit = @import("blit.zig");
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
@@ -32,9 +33,9 @@ const ZOOM_MIN: i32 = 1;
 const ZOOM_MAX: i32 = 32;
 const ZOOM_DEFAULT: i32 = 2;
 // 透明背景チェッカー（screen 固定セル。canonical BGRA 0xAARRGGBB）
-const CHECKER_CELL: i32 = 8;
-const CHECKER_LIGHT: u32 = 0xFF_6A_6A_6A;
-const CHECKER_DARK: u32 = 0xFF_4E_4E_4E;
+// チェッカー定数の単一ソースは blit.zig（TASK-54 で移動）
+const CHECKER_LIGHT = blit.CHECKER_LIGHT;
+const CHECKER_DARK = blit.CHECKER_DARK;
 // ペイン分割（TASK-42）: 右/下ペインのリサイズ + 表示非表示。pane は fixed px・canvas は grow。
 const RIGHT_PANE_DEFAULT: i32 = 200;
 const RIGHT_PANE_MIN: i32 = 120;
@@ -754,51 +755,6 @@ fn axisPlace(a: i32, aw: i32, vw: i32, pan: *i32) i32 {
     return r;
 }
 
-/// canvas の straight-alpha composite を canvas rect へ zoom 倍 nearest で転送。
-/// fb 境界 + clip（canvas area）で intersection clip し、既存 fb 内容（チェッカー背景）へ src-over する。
-/// 不透明 src は置換 / 完全透明は背景維持 / partial はチェッカーへブレンド。
-fn blitCanvasZoom(fb: []u32, fb_w: u32, fb_h: u32, composite: []const u32, rect: core.Rect, zoom: i32, clip: core.Rect) void {
-    const zu: usize = @intCast(zoom);
-    for (0..CANVAS_H) |cy| {
-        for (0..CANVAS_W) |cx| {
-            const src = composite[cy * CANVAS_W + cx];
-            const base_fx: i32 = rect.x + @as(i32, @intCast(cx)) * zoom;
-            const base_fy: i32 = rect.y + @as(i32, @intCast(cy)) * zoom;
-            for (0..zu) |dy| {
-                for (0..zu) |dx| {
-                    const fx: i32 = base_fx + @as(i32, @intCast(dx));
-                    const fy: i32 = base_fy + @as(i32, @intCast(dy));
-                    if (fx < 0 or fy < 0) continue;
-                    // canvas area clip（右ペイン/メニュー侵食防止）
-                    if (fx < clip.x or fy < clip.y or fx >= clip.x + clip.w or fy >= clip.y + clip.h) continue;
-                    const ufx: u32 = @intCast(fx);
-                    const ufy: u32 = @intCast(fy);
-                    if (ufx >= fb_w or ufy >= fb_h) continue;
-                    const idx = ufy * fb_w + ufx;
-                    fb[idx] = core.blend.srcOver(fb[idx], src);
-                }
-            }
-        }
-    }
-}
-
-/// 透明背景チェッカーを screen_rect ∩ clip ∩ fb へ直接描く（screen 固定セル）。canvas blit の直前に呼ぶ。
-fn drawCheckerboard(fb: []u32, fb_w: u32, fb_h: u32, screen_rect: core.Rect, clip: core.Rect) void {
-    const x0 = @max(@max(screen_rect.x, clip.x), 0);
-    const y0 = @max(@max(screen_rect.y, clip.y), 0);
-    const x1 = @min(@min(screen_rect.x + screen_rect.w, clip.x + clip.w), @as(i32, @intCast(fb_w)));
-    const y1 = @min(@min(screen_rect.y + screen_rect.h, clip.y + clip.h), @as(i32, @intCast(fb_h)));
-    var y = y0;
-    while (y < y1) : (y += 1) {
-        var x = x0;
-        while (x < x1) : (x += 1) {
-            const cell = @divFloor(x, CHECKER_CELL) + @divFloor(y, CHECKER_CELL);
-            const color: u32 = if (@mod(cell, 2) == 0) CHECKER_LIGHT else CHECKER_DARK;
-            fb[@as(usize, @intCast(y)) * fb_w + @as(usize, @intCast(x))] = color;
-        }
-    }
-}
-
 /// ビューポートのズーム/パン入力を処理する（endFrame 後・canvas 入力前に呼ぶ）。
 /// 戻り値: パン中なら true（呼び出し側は描画入力を抑止する）。zoom/pan の変更は app へ書き戻し、
 /// 実際の clamp は次フレームの canvasBlitRect が現 area に対して行う。
@@ -1353,21 +1309,21 @@ pub fn main(init: std.process.Init) !void {
                         .w = @as(i32, @intCast(CANVAS_W)) * zoom,
                         .h = @as(i32, @intCast(CANVAS_H)) * zoom,
                     };
-                    drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
+                    blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
                     if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
                         // 確定前ブラシプレビュー: 本 canvas 全 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
                         app.syncPreviewCanvas();
                         const dab = app.brush.footprint();
                         app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
-                        blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), rect, zoom, area);
+                        blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), CANVAS_W, CANVAS_H, rect, zoom, area);
                     } else if (app.active_kind == .select and app.sel_in.state == .moving) {
                         // フローティング move プレビュー: 実 canvas は不変のまま、preview_canvas の選択レイヤーへ
                         // 「base+block@現在位置（blend_mode 合成）」を描いて表示する（確定は release）。
                         app.syncPreviewCanvas();
                         _ = app.sel_in.renderMovePreview(app.preview_canvas.layerPixels(app.canvas.selected_layer), CANVAS_W, CANVAS_H, app.blend_mode);
-                        blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), rect, zoom, area);
+                        blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), CANVAS_W, CANVAS_H, rect, zoom, area);
                     } else {
-                        blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.compositeStraight(), rect, zoom, area);
+                        blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.compositeStraight(), CANVAS_W, CANVAS_H, rect, zoom, area);
                     }
                 }
             }

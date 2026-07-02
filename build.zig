@@ -389,6 +389,21 @@ pub fn build(b: *std.Build) void {
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
 
+    // pixie blit（canvas zoom 転送 + チェッカー。TASK-54）。core を名前付き import（canvas_input と同型）
+    const blit_core = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+    });
+    blit_core.addImport("png", example_modules.png);
+    blit_core.addImport("pixelops", example_modules.pixelops);
+    const blit_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    blit_test_mod.addImport("core", blit_core);
+    const blit_test = b.addTest(.{ .root_module = blit_test_mod });
+    const run_blit_test = b.addRunArtifact(blit_test);
+
     // pixie palette（モデル + GIMP .gpl）。pure（std のみ・import 不要）。
     const palette_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -410,6 +425,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_selection_test.step);
     test_core_step.dependOn(&run_selection_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
+    test_core_step.dependOn(&run_blit_test.step);
 
     // ========================================
     // PNG デコーダー format.zig テスト
@@ -701,6 +717,31 @@ pub fn build(b: *std.Build) void {
     const bench_gui_exe = b.addExecutable(.{ .name = "bench_gui", .root_module = bench_gui_root });
     const bench_gui_step = b.step("bench-gui", "Run GUI render (rect/image/text) micro-benchmark (ReleaseFast)");
     bench_gui_step.dependOn(&b.addRunArtifact(bench_gui_exe).step);
+
+    // bench-blit（TASK-54）: pixie の canvas zoom 転送 + チェッカー背景（新旧比較を同時計測）
+    const bench_blit_core = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/core.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_blit_core.addImport("png", bench_png_mod);
+    bench_blit_core.addImport("pixelops", bench_pixelops_mod);
+    const bench_blit_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_blit_mod.addImport("core", bench_blit_core);
+    const bench_blit_root = b.createModule(.{
+        .root_source_file = b.path("bench/blit.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_blit_root.addImport("blit", bench_blit_mod);
+    bench_blit_root.addImport("core", bench_blit_core);
+    const bench_blit_exe = b.addExecutable(.{ .name = "bench_blit", .root_module = bench_blit_root });
+    const bench_blit_step = b.step("bench-blit", "Run pixie canvas blit/checker micro-benchmark (ReleaseFast)");
+    bench_blit_step.dependOn(&b.addRunArtifact(bench_blit_exe).step);
 }
 
 // ============================================================

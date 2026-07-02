@@ -17,6 +17,10 @@ pub const overWhite = pixelops.overWhite;
 /// 色の alpha に coverage(0..255) を乗算（RGB 不変、a' = (a*cov+127)/255）。
 pub const scaleAlpha = pixelops.scaleAlpha;
 
+/// dst を不透明とみなす straight src-over（除算なし・out_a=255 固定）。
+/// dst 不透明のとき srcOver と bit 一致（pixelops 側の全数テストで固定。TASK-51/54）。
+pub const srcOverOpaque = pixelops.srcOverOpaque;
+
 // ============================================================
 // Tests（facade の再エクスポート疎通のみ。ブレンド自体のテストは pixelops 側）
 // ============================================================
