@@ -300,8 +300,10 @@ class FramebufferView: NSView {
 
     // CGオブジェクト（初期化時に作成して再利用）
     private var colorSpace: CGColorSpace
-    private var provider0: CGDataProvider
-    private var provider1: CGDataProvider
+    // no-copy provider（buffer0/1 を直接参照。TASK-55）。resize/deinit で buffer より先に
+    // 解放する必要があるため optional で寿命を明示管理する。
+    private var provider0: CGDataProvider?
+    private var provider1: CGDataProvider?
 
     // パフォーマンス測定
     private var lastFrameTime: CFAbsoluteTime
@@ -333,9 +335,10 @@ class FramebufferView: NSView {
         // CGオブジェクトを初期化
         self.colorSpace = CGColorSpaceCreateDeviceRGB()
 
-        // ダミープロバイダー（毎フレーム新しく作成するため）
-        self.provider0 = CGDataProvider(data: CFDataCreate(nil, self.buffer0, bufferSize * MemoryLayout<UInt32>.size)!)!
-        self.provider1 = CGDataProvider(data: CFDataCreate(nil, self.buffer1, bufferSize * MemoryLayout<UInt32>.size)!)!
+        // no-copy provider（objc 版 CGDataProviderCreateWithData と同型。TASK-55）。
+        // バッファは view が所有するため releaseData は no-op。
+        self.provider0 = Self.makeNoCopyProvider(buffer: self.buffer0, count: bufferSize)
+        self.provider1 = Self.makeNoCopyProvider(buffer: self.buffer1, count: bufferSize)
 
         // レイヤー
         self.contentLayer = CALayer()
@@ -378,6 +381,36 @@ class FramebufferView: NSView {
         displayLink = nil
     }
 
+    /// buffer を直接参照する no-copy CGDataProvider を作る（コピーなし。TASK-55）。
+    /// buffer の解放前に provider の参照（layer.contents 含む）を必ず切ること。
+    private static func makeNoCopyProvider(buffer: UnsafeMutablePointer<UInt32>, count: Int) -> CGDataProvider {
+        return CGDataProvider(
+            dataInfo: nil,
+            data: UnsafeRawPointer(buffer),
+            size: count * MemoryLayout<UInt32>.size,
+            releaseData: { _, _, _ in } // バッファは view 所有（no-op）
+        )!
+    }
+
+    /// 表示中バッファに対応する no-copy provider から CGImage を作る（ピクセルコピーなし）。
+    /// フレーム毎に呼ばれるが、生成されるのは参照オブジェクトのみ。
+    private func makeDisplayImage() -> CGImage? {
+        guard let provider = (displayBuffer == buffer0) ? provider0 : provider1 else { return nil }
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
+    }
+
     @objc
     func displayLinkFired(_ link: CADisplayLink) {
         let frameStartTime = CFAbsoluteTimeGetCurrent()
@@ -393,28 +426,9 @@ class FramebufferView: NSView {
             currentBuffer = displayBuffer
             displayBuffer = temp
 
-            // 表示するバッファに対応する新しいCGDataProviderを毎フレーム作成
+            // 表示バッファの no-copy provider から CGImage を作成（コピーなし。TASK-55）
             let renderStart = CFAbsoluteTimeGetCurrent()
-            let providerData = CFDataCreate(nil, displayBuffer, width * height * MemoryLayout<UInt32>.size)!
-            let provider = CGDataProvider(data: providerData)!
-
-            // CGImageを作成（毎フレーム必要）
-            let cgImage = CGImage(
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: width * 4,
-                space: colorSpace,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-            )
-
-            // レイヤーのcontentsに設定（変換なしで高速）
-            if let cgImage = cgImage {
+            if let cgImage = makeDisplayImage() {
                 contentLayer.contents = cgImage
             }
 
@@ -459,27 +473,8 @@ class FramebufferView: NSView {
         currentBuffer = displayBuffer
         displayBuffer = temp
 
-        // 表示するバッファに対応する新しいCGDataProviderを作成
-        let providerData = CFDataCreate(nil, displayBuffer, width * height * MemoryLayout<UInt32>.size)!
-        let provider = CGDataProvider(data: providerData)!
-
-        // CGImageを作成
-        let cgImage = CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: width * 4,
-            space: colorSpace,
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
-
-        // レイヤーのcontentsに設定
-        if let cgImage = cgImage {
+        // 表示バッファの no-copy provider から CGImage を作成（コピーなし。TASK-55）
+        if let cgImage = makeDisplayImage() {
             contentLayer.contents = cgImage
         }
     }
@@ -579,20 +574,27 @@ class FramebufferView: NSView {
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
     }
 
-    // TASK-23: 新サイズへ two-phase でバッファを再確保する。present は毎フレーム CFDataCreate で
-    // コピーを作るため buffer の寿命は layer.contents と独立（use-after-free なし）。
+    // TASK-23: 新サイズへ two-phase でバッファを再確保する。
+    // TASK-55 で provider が buffer を **no-copy 参照**するため、旧 buffer の解放前に
+    // 「layer.contents の参照を切る → 旧 provider を解放する」順序が必須（objc 版と同順序）。
     // 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
     func resizeBuffers(width w0: Int, height h0: Int) {
         let w = max(1, w0)
         let h = max(1, h0)
         if w == width && h == height { return } // 変化なし
         let newSize = w * h
-        // phase 1: 新バッファ確保（Swift の allocate は失敗時 trap）
+        // phase 1: 新バッファ + 新 no-copy provider を確保（Swift の allocate は失敗時 trap）
         let nb0 = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
         let nb1 = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
         nb0.initialize(repeating: 0, count: newSize)
         nb1.initialize(repeating: 0, count: newSize)
-        // phase 2: 旧バッファを破棄して swap
+        let np0 = Self.makeNoCopyProvider(buffer: nb0, count: newSize)
+        let np1 = Self.makeNoCopyProvider(buffer: nb1, count: newSize)
+        // phase 2: 旧 buffer への参照を先に全て切る（contents → provider の順）
+        contentLayer.contents = nil
+        provider0 = nil
+        provider1 = nil
+        // phase 3: 旧バッファを破棄して差し替え
         let oldSize = width * height
         buffer0.deinitialize(count: oldSize)
         buffer0.deallocate()
@@ -600,6 +602,8 @@ class FramebufferView: NSView {
         buffer1.deallocate()
         buffer0 = nb0
         buffer1 = nb1
+        provider0 = np0
+        provider1 = np1
         currentBuffer = buffer0
         displayBuffer = buffer1
         width = w
@@ -616,7 +620,12 @@ class FramebufferView: NSView {
     deinit {
         stopDisplayLink()
 
-        // バッファを解放
+        // no-copy provider が buffer を参照するため、解放順序は
+        // contents → provider → buffer（stored property の自動解放が buffer 解放後に
+        // 走って use-after-free する事故を防ぐ。TASK-55）
+        contentLayer.contents = nil
+        provider0 = nil
+        provider1 = nil
         let bufferSize = width * height
         buffer0.deinitialize(count: bufferSize)
         buffer0.deallocate()
