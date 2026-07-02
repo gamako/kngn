@@ -89,7 +89,7 @@ undo.undoOne(gpa, &canvas); // 取り消し
 
 `Tool.VTable`（`onEvent` / `reset`）を実装した struct を作り、`tool()` で `Tool` を返す。
 `onEvent` 内で `StrokeRecorder` を駆動し、`.up` で `finish` の戻り値（`?UndoCmd`）を返す。
-`Pen` / `Eraser` が最小の実装例（`tool.zig`）。OOM は `@panic`（error union を返さない契約）。
+`Pen` / `Eraser` が最小の実装例（`tool.zig`）。OOM は `@panic`（error union を返さない契約。core 全体のポリシー = [ADR-006](../../../docs/adr/006_editor_coreのOOMポリシー.md)。新規コードもこれに従う）。
 
 ## ベジェ/ベクターパス（TASK-21.13）
 

@@ -5,7 +5,7 @@
 //!   Bresenham 線補間を担う。`finish` で owned slice の `UndoCmd` を確定して返す。
 //! - `UndoStack`: `UndoCmd` を before/after 両持ちで保持し、undo/redo はスタック間の
 //!   移動 + 値適用だけで可逆。`pushClear` は全消去を 1 コマンドとして原子的に積む。
-//! - OOM は `@panic`（旧 PaintEngine と同一挙動。異常終了前提で error union は返さない）。
+//! - OOM は `@panic`（core 全体のポリシー。決定と理由は docs/adr/006_editor_coreのOOMポリシー.md）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
