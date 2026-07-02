@@ -1,4 +1,5 @@
 const std = @import("std");
+const pixelops = @import("pixelops");
 const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
 const draw_mod = @import("draw.zig");
@@ -53,6 +54,9 @@ fn clipRect(rect: Rect, clip: Rect, target: RenderTarget) Rect {
 
 // ── draw primitives ───────────────────────────────────────────────────────────
 
+/// 毎フレーム（GUI 全域再描画）走るホットパス。clip 交差はループ外（clipRect）。
+/// 不透明色（GUI 塗りの大半）は行ごとの @memset 一括書き込み（TASK-58。
+/// Color.blend(dst, a=255 src) == src なので blend 経路と bit 同値）。
 fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect) void {
     const bounds = clipRect(rect, clip, target);
     if (bounds.isEmpty()) return;
@@ -60,6 +64,14 @@ fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect) void
     const y0: u32 = @intCast(bounds.y);
     const x1: u32 = x0 + bounds.w;
     const y1: u32 = y0 + bounds.h;
+    if (col.a == 255) {
+        const value: u32 = @bitCast(col);
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            @memset(target.pixels[y * target.width + x0 .. y * target.width + x1], value);
+        }
+        return;
+    }
     var y = y0;
     while (y < y1) : (y += 1) {
         const row = target.pixels[y * target.width .. y * target.width + target.width];
@@ -152,14 +164,20 @@ fn drawImage(
     const src_x_off: u32 = @intCast(bounds.x - rect.x);
     const src_y_off: u32 = @intCast(bounds.y - rect.y);
 
+    // 毎フレーム走るホットパス。4px SIMD（pixelops.srcOverOpaque4 = Color.blend と
+    // bit 一致）+ scalar tail（TASK-58）。clip 交差はループ外（clipRect）。
     var dy: u32 = 0;
     while (dy < bounds.h) : (dy += 1) {
         const src_row = pixels[(src_y_off + dy) * src_w + src_x_off ..];
         const dst_row_base = (by0 + dy) * target.width + bx0;
         var dx: u32 = 0;
+        while (dx + 4 <= bounds.w) : (dx += 4) {
+            const src_chunk: *const [4]u32 = src_row[dx..][0..4];
+            const dst_chunk: *[4]u32 = target.pixels[dst_row_base + dx ..][0..4];
+            dst_chunk.* = @bitCast(pixelops.srcOverOpaque4(@bitCast(dst_chunk.*), @bitCast(src_chunk.*)));
+        }
         while (dx < bounds.w) : (dx += 1) {
-            const src_col: Color = @bitCast(src_row[dx]);
-            target.pixels[dst_row_base + dx] = blendPixel(target.pixels[dst_row_base + dx], src_col);
+            target.pixels[dst_row_base + dx] = pixelops.srcOverOpaque(target.pixels[dst_row_base + dx], src_row[dx]);
         }
     }
 }
@@ -224,4 +242,76 @@ test "render: image blit" {
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pixels[1 * 10 + 1]);
     // 外は黒
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[0]);
+}
+
+test "drawRectFilled: opaque 高速パスは blend 経路と bit 一致（部分 clip 込み）" {
+    // a=255 の blendPixel は dst に依らず src（a 強制 0xFF）を返すので、
+    // 高速パス（@memset）と blend 経路の結果は同一のはず。参照は per-pixel blendPixel。
+    var prng = std.Random.DefaultPrng.init(0x09A0);
+    _ = &prng;
+    var px_fast = [_]u32{0} ** (10 * 10);
+    var px_ref = [_]u32{0} ** (10 * 10);
+    for (&px_fast, &px_ref, 0..) |*a, *b, i| {
+        const v: u32 = 0xFF000000 | (@as(u32, @truncate(i)) *% 0x050301);
+        a.* = v;
+        b.* = v;
+    }
+    const t_fast = RenderTarget{ .pixels = &px_fast, .width = 10, .height = 10 };
+    const t_ref = RenderTarget{ .pixels = &px_ref, .width = 10, .height = 10 };
+    const col = Color.rgba(0x12, 0x34, 0x56, 0xFF);
+    const rect = Rect{ .x = -2, .y = 3, .w = 8, .h = 20 }; // はみ出し込み
+    const clip = Rect{ .x = 0, .y = 0, .w = 10, .h = 8 };
+
+    drawRectFilled(t_fast, rect, col, clip); // opaque → 高速パス
+    // 参照: clip 済み範囲を per-pixel blend
+    const bounds = clipRect(rect, clip, t_ref);
+    var y: u32 = @intCast(bounds.y);
+    while (y < @as(u32, @intCast(bounds.y)) + bounds.h) : (y += 1) {
+        var x: u32 = @intCast(bounds.x);
+        while (x < @as(u32, @intCast(bounds.x)) + bounds.w) : (x += 1) {
+            px_ref[y * 10 + x] = blendPixel(px_ref[y * 10 + x], col);
+        }
+    }
+    try std.testing.expectEqualSlices(u32, &px_ref, &px_fast);
+}
+
+test "drawImage: SIMD 経路が per-pixel 参照と bit 一致（全 alpha 域・部分 clip・tail 跨ぎ）" {
+    var prng = std.Random.DefaultPrng.init(0xD12A6E);
+    const rng = prng.random();
+    // 11x7 画像（行内で 4px チャンク 2 個 + tail 3）を (3,2) へ、clip を部分交差させる
+    var img: [11 * 7]u32 = undefined;
+    for (&img) |*p| p.* = rng.int(u32);
+    var px_simd: [16 * 12]u32 = undefined;
+    var px_ref: [16 * 12]u32 = undefined;
+    for (&px_simd, &px_ref) |*a, *b| {
+        const v = rng.int(u32) | 0xFF000000;
+        a.* = v;
+        b.* = v;
+    }
+    const t_simd = RenderTarget{ .pixels = &px_simd, .width = 16, .height = 12 };
+    const t_ref = RenderTarget{ .pixels = &px_ref, .width = 16, .height = 12 };
+    const rect = Rect{ .x = 3, .y = 2, .w = 11, .h = 7 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 12, .h = 8 }; // 右・下を切る
+
+    // 負座標（左・上はみ出し）ケースも同一手順で比較する
+    const rect_neg = Rect{ .x = -3, .y = -2, .w = 11, .h = 7 };
+
+    drawImage(t_simd, rect, &img, 11, clip);
+    drawImage(t_simd, rect_neg, &img, 11, clip);
+    // 参照: 旧実装相当（per-pixel blendPixel）
+    for ([_]Rect{ rect, rect_neg }) |r| {
+        const bounds = clipRect(r, clip, t_ref);
+        const sx: u32 = @intCast(bounds.x - r.x);
+        const sy: u32 = @intCast(bounds.y - r.y);
+        var dy: u32 = 0;
+        while (dy < bounds.h) : (dy += 1) {
+            var dx: u32 = 0;
+            while (dx < bounds.w) : (dx += 1) {
+                const si = (sy + dy) * 11 + sx + dx;
+                const di = (@as(u32, @intCast(bounds.y)) + dy) * 16 + @as(u32, @intCast(bounds.x)) + dx;
+                px_ref[di] = blendPixel(px_ref[di], @bitCast(img[si]));
+            }
+        }
+    }
+    try std.testing.expectEqualSlices(u32, &px_ref, &px_simd);
 }

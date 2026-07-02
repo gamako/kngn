@@ -532,6 +532,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     gui_test_root.addImport("font", example_modules.font);
+    gui_test_root.addImport("pixelops", example_modules.pixelops);
     const gui_test = b.addTest(.{ .root_module = gui_test_root });
     const run_gui_test = b.addRunArtifact(gui_test);
     const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
@@ -670,6 +671,36 @@ pub fn build(b: *std.Build) void {
     const bench_synth_exe = b.addExecutable(.{ .name = "bench_synth", .root_module = bench_synth_root });
     const bench_synth_step = b.step("bench-synth", "Run Synth.render / MasterEffects.process micro-benchmark (ReleaseFast)");
     bench_synth_step.dependOn(&b.addRunArtifact(bench_synth_exe).step);
+
+    // bench-gui（TASK-58）: rect_filled / image / text の描画を public API 経由で計測
+    const bench_png_mod = b.createModule(.{
+        .root_source_file = b.path("libs/png/src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_font_mod = b.createModule(.{
+        .root_source_file = b.path("libs/font/src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_font_mod.addImport("png", bench_png_mod);
+    bench_font_mod.addImport("pixelops", bench_pixelops_mod);
+    const bench_gui_mod = b.createModule(.{
+        .root_source_file = b.path("libs/gui/src/gui.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_gui_mod.addImport("font", bench_font_mod);
+    bench_gui_mod.addImport("pixelops", bench_pixelops_mod);
+    const bench_gui_root = b.createModule(.{
+        .root_source_file = b.path("bench/gui.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_gui_root.addImport("gui", bench_gui_mod);
+    const bench_gui_exe = b.addExecutable(.{ .name = "bench_gui", .root_module = bench_gui_root });
+    const bench_gui_step = b.step("bench-gui", "Run GUI render (rect/image/text) micro-benchmark (ReleaseFast)");
+    bench_gui_step.dependOn(&b.addRunArtifact(bench_gui_exe).step);
 }
 
 // ============================================================
@@ -815,6 +846,7 @@ const ExampleModules = struct {
             .root_source_file = b.path("libs/gui/src/gui.zig"),
         });
         gui.addImport("font", font_mod);
+        gui.addImport("pixelops", pixelops_mod); // render.zig の drawImage SIMD（TASK-58）
 
         // audio (L1 オーディオ出力): platform バックエンド非依存。@cImport しないので
         // 通常の createModule でよい（audio system lib は exe 側で OS 別にリンク:

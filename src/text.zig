@@ -12,7 +12,8 @@
 //   - ascent は FONTBOUNDINGBOX から導出: ascent = bbox_height + bbox_y_offset
 //   - 不透明色のみ (fg_color の alpha はそのまま使われる前提)
 //   - 描画は共通 Font インターフェース（libs/font）の drawTo/measure/metrics 経由（TASK-25.14）。
-//     立ちビットをカバレッジ 255 として plotCoverage に流し、col で tint・clip する。
+//     立ちビットをカバレッジ 255 として blend し、col で tint・clip する
+//     （clip はグリフ矩形単位で clipCoverage により 1 回ホイスト。TASK-58）。
 //     1 行ラン専用（\n/\t 非対応＝行レイアウトは呼び出し側責務）。
 
 const std = @import("std");
@@ -23,7 +24,6 @@ const RenderTarget = fontmod.RenderTarget;
 const Rect = fontmod.Rect;
 const Vec2 = fontmod.Vec2;
 const Color = fontmod.Color;
-const plotCoverage = fontmod.plotCoverage;
 
 pub const Glyph = struct {
     width: u32,
@@ -123,16 +123,27 @@ pub const BitmapFont = struct {
         const baseline: i32 = pos_y +| ascent;
         const dst_x0: i32 = cx +| g.x_offset;
         const dst_y0: i32 = baseline -| @as(i32, @intCast(g.height)) -| g.y_offset;
+        // 毎フレーム（テキスト描画）走るホットパス。グリフ矩形の clip はループ外 1 回
+        // （clipCoverage）、内側は無検査で立ちビットを blend（TASK-58）。
         const row_bytes: u32 = (g.width + 7) / 8;
-        var py: u32 = 0;
-        while (py < g.height) : (py += 1) {
+        const cc = fontmod.clipCoverage(target, dst_x0, dst_y0, g.width, g.height, clip) orelse
+            return cx +| advI32(g.advance);
+        var py = cc.cy0;
+        while (py < cc.cy1) : (py += 1) {
             const row_start: usize = @as(usize, py) * row_bytes;
-            var px: u32 = 0;
-            while (px < g.width) : (px += 1) {
+            // clipCoverage の保証により dst_y0+py / dst_x0+px は非負かつ target 内
+            const ty: u32 = @intCast(dst_y0 + @as(i32, @intCast(py)));
+            const dst_base = ty * target.width;
+            var px = cc.cx0;
+            while (px < cc.cx1) : (px += 1) {
                 const byte_idx: usize = px / 8;
                 const bit_idx: u3 = @intCast(7 - (px % 8));
                 if ((g.bitmap[row_start + byte_idx] >> bit_idx) & 1 == 0) continue;
-                plotCoverage(target, dst_x0 +| @as(i32, @intCast(px)), dst_y0 +| @as(i32, @intCast(py)), col, 255, clip);
+                const tx: u32 = @intCast(dst_x0 + @as(i32, @intCast(px)));
+                const idx = dst_base + tx;
+                // 立ちビット = カバレッジ 255（実効 α = col.a）
+                const dst: Color = @bitCast(target.pixels[idx]);
+                target.pixels[idx] = @bitCast(Color.blend(dst, col));
             }
         }
         return cx +| advI32(g.advance);

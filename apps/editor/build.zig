@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
     });
     gui.addImport("font", font);
+    gui.addImport("pixelops", pixelops);
     const core = b.createModule(.{
         .root_source_file = b.path("core/core.zig"),
     });

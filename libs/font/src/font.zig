@@ -81,8 +81,31 @@ pub fn plotCoverage(target: RenderTarget, x: i32, y: i32, col: Color, cov: u8, c
     target.pixels[idx] = @bitCast(Color.blend(dst, src));
 }
 
+/// coverage/グリフ blit の clip 交差をループ外で 1 回計算する（clip-hoist。TASK-58）。
+/// (dst_x,dst_y) 起点 w×h の blit のうち clip ∩ target 内に入る範囲を
+/// blit ローカル座標 [cx0,cx1)×[cy0,cy1) で返す。可視部分が無ければ null。
+/// 内部は i64 演算のため dst_x/dst_y が i32 端でもオーバーフローしない。
+/// null でなければ範囲内の全画素が無検査で書き込み可能（per-pixel clip 比較は不要）。
+pub const CovClip = struct { cx0: u32, cx1: u32, cy0: u32, cy1: u32 };
+
+pub fn clipCoverage(target: RenderTarget, dst_x: i32, dst_y: i32, w: u32, h: u32, clip: Rect) ?CovClip {
+    if (clip.isEmpty() or w == 0 or h == 0) return null;
+    const lo_x: i64 = @max(@as(i64, clip.x), 0);
+    const lo_y: i64 = @max(@as(i64, clip.y), 0);
+    const hi_x: i64 = @min(@as(i64, clip.x) + @as(i64, clip.w), @as(i64, target.width));
+    const hi_y: i64 = @min(@as(i64, clip.y) + @as(i64, clip.h), @as(i64, target.height));
+    const cx0 = std.math.clamp(lo_x - dst_x, 0, @as(i64, w));
+    const cx1 = std.math.clamp(hi_x - dst_x, 0, @as(i64, w));
+    const cy0 = std.math.clamp(lo_y - dst_y, 0, @as(i64, h));
+    const cy1 = std.math.clamp(hi_y - dst_y, 0, @as(i64, h));
+    if (cx0 >= cx1 or cy0 >= cy1) return null;
+    return .{ .cx0 = @intCast(cx0), .cx1 = @intCast(cx1), .cy0 = @intCast(cy0), .cy1 = @intCast(cy1) };
+}
+
 /// w×h のカバレッジバッファ（row-major, 0-255）を (dst_x,dst_y) 起点で α ブレンドする。
-/// 将来の OutlineFont / BMFont のグリフ描画用。ビットマップフォントは plotCoverage を直接使う。
+/// 将来の OutlineFont / BMFont のグリフ描画用。
+/// 毎フレーム（テキスト描画）走るホットパス: clip は clipCoverage でループ外 1 回、
+/// 内側は無検査ループ（TASK-58。plotCoverage の per-pixel clip 5 比較を排除）。
 pub fn blitCoverage(
     target: RenderTarget,
     dst_x: i32,
@@ -94,19 +117,22 @@ pub fn blitCoverage(
     clip: Rect,
 ) void {
     std.debug.assert(coverage.len == @as(usize, w) * @as(usize, h));
-    var row: u32 = 0;
-    while (row < h) : (row += 1) {
-        const base = row * w;
-        var cx: u32 = 0;
-        while (cx < w) : (cx += 1) {
-            plotCoverage(
-                target,
-                dst_x +| @as(i32, @intCast(cx)), // 飽和加算（極端な dst で i32 overflow せず、plotCoverage 側で clip）
-                dst_y +| @as(i32, @intCast(row)),
-                col,
-                coverage[base + cx],
-                clip,
-            );
+    const cc = clipCoverage(target, dst_x, dst_y, w, h, clip) orelse return;
+    var row = cc.cy0;
+    while (row < cc.cy1) : (row += 1) {
+        const cov_base = row * w;
+        // clipCoverage の保証により dst_y+row / dst_x+cx は非負かつ target 内
+        const py: u32 = @intCast(dst_y + @as(i32, @intCast(row)));
+        const dst_base = py * target.width + @as(u32, @intCast(dst_x + @as(i32, @intCast(cc.cx0))));
+        var cx = cc.cx0;
+        while (cx < cc.cx1) : (cx += 1) {
+            const cov = coverage[cov_base + cx];
+            if (cov == 0) continue;
+            const idx = dst_base + (cx - cc.cx0);
+            const eff_a: u8 = @intCast((@as(u32, col.a) * @as(u32, cov) + 127) / 255);
+            const src = Color{ .r = col.r, .g = col.g, .b = col.b, .a = eff_a };
+            const dst: Color = @bitCast(target.pixels[idx]);
+            target.pixels[idx] = @bitCast(Color.blend(dst, src));
         }
     }
 }
@@ -195,4 +221,57 @@ test "Font: vtable 経由で measure/metrics が呼べる" {
     };
     try std.testing.expectEqual(@as(u32, 3), Stub.font.measure("abc"));
     try std.testing.expectEqual(@as(u32, 10), Stub.font.metrics().line_height);
+}
+
+test "blitCoverage: hoist 版が per-pixel 参照（plotCoverage ループ）と bit 一致" {
+    var prng = std.Random.DefaultPrng.init(0xB117);
+    const rng = prng.random();
+    const w: u32 = 9;
+    const h: u32 = 6;
+    var cov: [9 * 6]u8 = undefined;
+    for (&cov) |*c| c.* = rng.int(u8);
+    const cases = [_]struct { x: i32, y: i32 }{
+        .{ .x = 2, .y = 3 }, // 全部内側
+        .{ .x = -4, .y = -2 }, // 左上はみ出し
+        .{ .x = 12, .y = 13 }, // 右下はみ出し
+        .{ .x = -100, .y = 0 }, // 完全外
+    };
+    const clip = Rect{ .x = 1, .y = 1, .w = 13, .h = 12 }; // 部分交差 clip
+    for (cases) |c| {
+        var px_hoist: [16 * 16]u32 = undefined;
+        var px_ref: [16 * 16]u32 = undefined;
+        for (&px_hoist, &px_ref) |*a, *b| {
+            const v = rng.int(u32) | 0xFF000000;
+            a.* = v;
+            b.* = v;
+        }
+        const t_hoist = RenderTarget{ .pixels = &px_hoist, .width = 16, .height = 16 };
+        const t_ref = RenderTarget{ .pixels = &px_ref, .width = 16, .height = 16 };
+        const col = Color.rgba(0xE0, 0x40, 0x20, 0xC0);
+
+        blitCoverage(t_hoist, c.x, c.y, &cov, w, h, col, clip);
+        // 参照: 旧実装相当（plotCoverage per-pixel、飽和加算）
+        var row: u32 = 0;
+        while (row < h) : (row += 1) {
+            var cx: u32 = 0;
+            while (cx < w) : (cx += 1) {
+                plotCoverage(t_ref, c.x +| @as(i32, @intCast(cx)), c.y +| @as(i32, @intCast(row)), col, cov[row * w + cx], clip);
+            }
+        }
+        try std.testing.expectEqualSlices(u32, &px_ref, &px_hoist);
+    }
+}
+
+test "clipCoverage: 完全外は null / 内側は全域 / 極端座標で overflow しない" {
+    var px = [_]u32{0} ** (8 * 8);
+    const t = RenderTarget{ .pixels = &px, .width = 8, .height = 8 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 8, .h = 8 };
+    try std.testing.expectEqual(@as(?CovClip, null), clipCoverage(t, 8, 0, 4, 4, clip)); // 右にちょうど外
+    try std.testing.expectEqual(@as(?CovClip, null), clipCoverage(t, -4, 0, 4, 4, clip)); // 左にちょうど外
+    try std.testing.expectEqual(@as(?CovClip, null), clipCoverage(t, std.math.maxInt(i32), std.math.maxInt(i32), 4, 4, clip));
+    try std.testing.expectEqual(@as(?CovClip, null), clipCoverage(t, std.math.minInt(i32), 0, 4, 4, clip));
+    const cc = clipCoverage(t, 2, 3, 4, 4, clip).?;
+    try std.testing.expectEqualDeep(CovClip{ .cx0 = 0, .cx1 = 4, .cy0 = 0, .cy1 = 4 }, cc);
+    const cc2 = clipCoverage(t, -1, 6, 4, 4, clip).?; // 左上/下はみ出し
+    try std.testing.expectEqualDeep(CovClip{ .cx0 = 1, .cx1 = 4, .cy0 = 0, .cy1 = 2 }, cc2);
 }

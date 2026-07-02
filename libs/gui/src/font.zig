@@ -98,17 +98,26 @@ fn countCodepoints(text: []const u8) u32 {
     }
 }
 
+/// 毎フレーム（テキスト描画）走るホットパス。グリフ矩形の clip はループ外 1 回
+/// （fnt.clipCoverage）、内側は無検査で立ちビットを blend（TASK-58）。
 fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i32, col: Color, clip: Rect) void {
+    const cc = fnt.clipCoverage(target, x, y, 8, font.glyph_h, clip) orelse return;
     const base = @as(usize, glyph_idx) * @as(usize, font.glyph_h);
-    for (0..font.glyph_h) |row| {
+    var row = cc.cy0;
+    while (row < cc.cy1) : (row += 1) {
         const row_bits = font.glyphs[base + row];
-        const py: i32 = y + @as(i32, @intCast(row));
-        for (0..8) |col_idx| {
-            const bit_pos: u3 = @intCast(7 - col_idx);
+        // clipCoverage の保証により y+row / x+cx は非負かつ target 内
+        const py: u32 = @intCast(y + @as(i32, @intCast(row)));
+        const dst_base = py * target.width;
+        var cx = cc.cx0;
+        while (cx < cc.cx1) : (cx += 1) {
+            const bit_pos: u3 = @intCast(7 - cx);
             if ((row_bits >> bit_pos) & 1 != 0) {
-                const px: i32 = x + @as(i32, @intCast(col_idx));
-                // 立ちビット = カバレッジ 255。共通描画路（α ブレンド + clip）を通す。
-                fnt.plotCoverage(target, px, py, col, 255, clip);
+                const px: u32 = @intCast(x + @as(i32, @intCast(cx)));
+                const idx = dst_base + px;
+                // 立ちビット = カバレッジ 255（実効 α = col.a）
+                const dst: Color = @bitCast(target.pixels[idx]);
+                target.pixels[idx] = @bitCast(Color.blend(dst, col));
             }
         }
     }

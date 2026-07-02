@@ -26,6 +26,8 @@ pub const Metrics = font.Metrics;
 pub const Font = font.Font;
 pub const plotCoverage = font.plotCoverage;
 pub const blitCoverage = font.blitCoverage;
+pub const clipCoverage = font.clipCoverage;
+pub const CovClip = font.CovClip;
 
 // sfnt(TrueType/OpenType) コンテナ + cmap + glyf アウトライン
 pub const SfntFile = sfnt.SfntFile;
