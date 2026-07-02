@@ -441,6 +441,64 @@ app が内部状態を opt-in で probe として公開する。**framework（`s
 - **制約**: 実ウィンドウは生成する（display 必須。macOS は通常 OK、Linux は Xvfb/実セッション）。完全 display-less は P4。`audio` は RT スレッド実時間依存なので record→replay で digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論）。live の accept ブロック中は window pump が止まる。`fb` の捕捉は CPU フレームバッファ経路で **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。P4 なのは Metal の GPU drawable 読み戻しの方。
 - **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
 
+## 性能規約（メモリI/O・キャッシュ最適化）
+
+2026-07 の全ホットパス監査に基づく規約。RT 契約（「オーディオ / シンセ層」節）が全 backend で
+守られているのと同じ強度で、以下も**新規実装・変更時の必須規約**として扱う。手本が既にコード内に
+あるものは車輪を再発明せず踏襲する。
+
+### ホットパス宣言（すべての新規ループに）
+
+コードを書く前に「このループはどの頻度で走るか」を判定し、**フレーム毎（全画素）/ RT（毎サンプル）
+の場合はファイル or 関数の doc comment に明記**する（例: `/// 毎フレーム全画素を走る`）。
+実装計画（backlog の plan 欄）にも同じ宣言を含める。頻度の判定を誤ると以下の規約の要否を誤る。
+
+### 全画素ループの3点セット（`src/sprite.zig` が手本）
+
+フレーム毎に全画素（またはそれに準ずる面積）を走るループは:
+
+1. **SIMD**: `@Vector(16, u8)` の 4px 同時ブレンド（`sprite.zig` の `blend4Pixels` 型）+ scalar tail。
+   **SIMD 版とスカラー参照版の bit 一致テストを必ず併設**する（`sprite.zig` 既存テストが手本）。
+2. **per-pixel 除算の禁止**: `/255` は `div255` 整数近似 `(x + 1 + (x >> 8)) >> 8` を使う。
+   浮動小数点も per-pixel では使わない（AA カバレッジ計算等、本質的に f32 な処理は除く）。
+3. **clip/bounds のループ外ホイスト**: clip 交差はループ**外**で1回計算し、内側は無検査の
+   行連続アクセスにする。per-pixel の clip 比較・bounds 再チェックは禁止。
+
+加えて: 不透明（`a==255`）で全面を塗る経路には `@memset` / 一括書き込みの高速パスを用意する。
+行優先（row-major）の連続アクセスを守り、行頭オフセットはループ外で計算する。
+
+### RT / スレッド間共有の追加規約
+
+- スレッド間で producer/consumer が別々に触る atomic ペア（SPSC の head/tail 等）は
+  `std.atomic.cache_line` で**別キャッシュラインに分離**する（false sharing 回避）。
+- 1 producer / 1 consumer の値受け渡しで consumer 読み取り中の上書きを許せないものは
+  **2枚バッファでなく3枚**（triple buffer。`libs/modular` の `Mailbox` が手本）。
+- ブロック内で複数回参照するパラメータはブロック先頭で**1回 latch** する。
+- 毎サンプルの超越関数（`pow`/`tan`/`exp`）は禁止。ブロックレート（`updateParams`/`prepareBlock`）
+  へ集約するか、dirty-gate + control-rate 間引き（`libs/modular` の VCF が手本）にする。
+
+### アロケーション
+
+- 出力サイズが概算できるループ内 append は `ensureTotalCapacity` で事前確保する。
+- 履歴・キューなど単調に増える構造には容量上限（trim / リング）を設計時に決める。
+- （既存規約の再掲）フレーム毎の一時メモリは GUI の per-frame arena、RT は comptime 固定長。
+
+### 性能の主張はテストで固定する
+
+「ゼロアロケーション」「係数再計算はブロックレート」「SIMD=スカラー一致」等の性能上の性質は、
+文章でなく**実行可能なテストで固定**する。手本（いずれも実装済み）:
+
+- RT ゼロアロケーション: `FailingAllocator` で実測（`libs/modular/src/dyn.zig` のテスト）
+- 係数再計算回数の上限 assert（`libs/modular/src/modules.zig` の VCF テスト）
+- SIMD vs スカラー参照の bit 一致（`src/sprite.zig`）
+
+### 測定（bench）
+
+性能目的の変更タスクは `zig build bench-*`（TASK-50 で整備）の**前後比較を notes に記録**する。
+測定なしの「速くなったはず」は不可。マイクロベンチが無い領域を最適化する場合は先にベンチを足す。
+
+> 監査の詳細（既知ギャップ一覧と根拠 file:line）は backlog TASK-50〜61 の description を参照。
+
 ## よく使うコマンド
 
 ```bash
