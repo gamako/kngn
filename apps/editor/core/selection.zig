@@ -91,6 +91,8 @@ pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rec
     const w: usize = @intCast(rect.w);
     const h: usize = @intCast(rect.h);
     var diffs: std.ArrayList(PixelDiff) = .empty;
+    // 上限 = 矩形全画素。事前確保してループ内の再確保を排除（TASK-59）
+    diffs.ensureTotalCapacity(gpa, w * h) catch @panic("selection.clearRectCmd: OOM");
     var row: usize = 0;
     while (row < h) : (row += 1) {
         const y: usize = @as(usize, @intCast(rect.y)) + row;
@@ -99,8 +101,7 @@ pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rec
             const idx = y * canvas.width + (@as(usize, @intCast(rect.x)) + col);
             const before = px[idx];
             if (before == 0) continue;
-            diffs.append(gpa, .{ .idx = @intCast(idx), .before = before, .after = 0 }) catch
-                @panic("selection.clearRectCmd: OOM");
+            diffs.appendAssumeCapacity(.{ .idx = @intCast(idx), .before = before, .after = 0 });
             px[idx] = 0;
         }
     }
@@ -115,6 +116,8 @@ pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelB
     const w_i: i32 = @intCast(canvas.width);
     const h_i: i32 = @intCast(canvas.height);
     var diffs: std.ArrayList(PixelDiff) = .empty;
+    // 上限 = block 全画素。事前確保してループ内の再確保を排除（TASK-59）
+    diffs.ensureTotalCapacity(gpa, @as(usize, block.w) * block.h) catch @panic("selection.pasteCmd: OOM");
     var row: u32 = 0;
     while (row < block.h) : (row += 1) {
         var col: u32 = 0;
@@ -130,8 +133,7 @@ pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelB
                 .over => blend.srcOver(before, src),
             };
             if (after == before) continue;
-            diffs.append(gpa, .{ .idx = @intCast(idx), .before = before, .after = after }) catch
-                @panic("selection.pasteCmd: OOM");
+            diffs.appendAssumeCapacity(.{ .idx = @intCast(idx), .before = before, .after = after });
             px[idx] = after;
         }
     }
@@ -207,9 +209,11 @@ pub fn layerMatchesRender(layer: []const u32, base: []const u32, block: PixelBlo
 pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_idx: usize) ?UndoCmd {
     std.debug.assert(before.len == after.len);
     var diffs: std.ArrayList(PixelDiff) = .empty;
+    // 上限 = 全画素。事前確保してループ内の再確保を排除（TASK-59）
+    diffs.ensureTotalCapacity(gpa, before.len) catch @panic("selection.diffCmd: OOM");
     for (before, after, 0..) |b, a, i| {
         if (a == b) continue;
-        diffs.append(gpa, .{ .idx = @intCast(i), .before = b, .after = a }) catch @panic("selection.diffCmd: OOM");
+        diffs.appendAssumeCapacity(.{ .idx = @intCast(i), .before = b, .after = a });
     }
     return finishDiffs(gpa, &diffs, layer_idx);
 }

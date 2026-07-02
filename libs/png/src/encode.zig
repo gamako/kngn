@@ -15,6 +15,17 @@ const PNG_SIG: [8]u8 = .{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
 /// stored block の最大サイズ（deflate 仕様: 65535 bytes）
 const BLOCK_MAX: u16 = 65535;
 
+/// encodePNG の出力バイト数（exact）。
+/// total = 8(sig) + 25(IHDR: 4len+4type+13data+4crc)
+///       + IDAT(4len + 4type + zlib_size + 4crc) + 12(IEND)
+/// zlib_size = 2(zlib header) + n_blocks*5(stored block header) + raw_len + 4(adler)
+/// n_blocks = ceil(raw_len / BLOCK_MAX)。raw_len==0 でも空 final block を 1 個書く。
+fn encodedSizeExact(raw_len: usize) usize {
+    const n_blocks: usize = if (raw_len == 0) 1 else (raw_len + BLOCK_MAX - 1) / BLOCK_MAX;
+    const zlib_size: usize = 2 + n_blocks * 5 + raw_len + 4;
+    return 8 + 25 + (4 + 4 + zlib_size + 4) + 12;
+}
+
 // CRC-32/ISO-HDLC ルックアップテーブル（poly 0xEDB88320）
 const crc_table: [256]u32 = blk: {
     @setEvalBranchQuota(10000);
@@ -153,6 +164,8 @@ pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allo
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
+    // 出力サイズは exact に計算できるため事前確保する（appendSlice 連発の再確保を排除。TASK-59）
+    try buf.ensureTotalCapacity(gpa, encodedSizeExact(raw_size));
 
     // PNG signature
     try buf.appendSlice(gpa, &PNG_SIG);
@@ -227,4 +240,24 @@ test "encodePNG: 1px 赤 の PNG 全バイトが現行 encoder の golden と一
         0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82, // IEND len=0 + "IEND" + CRC
     };
     try std.testing.expectEqualSlices(u8, &golden, png_bytes);
+}
+
+test "encodedSizeExact: encodePNG の実出力長と一致（境界含む）= 事前確保で再確保なし" {
+    const gpa = std.testing.allocator;
+    // width*height を変えて raw_len の境界（0 は仕様外なので 1px から、BLOCK_MAX 跨ぎ）を踏む
+    const cases = [_]struct { w: u32, h: u32 }{
+        .{ .w = 1, .h = 1 },
+        .{ .w = 16, .h = 16 },
+        .{ .w = 128, .h = 128 }, // raw = (1+512)*128 = 65,664 > BLOCK_MAX（2 ブロック）
+        .{ .w = 1, .h = 13107 }, // raw = (1+4)*13107 = 65,535 = BLOCK_MAX ちょうど（exact multiple 境界）
+    };
+    for (cases) |c| {
+        const pixels = try gpa.alloc(u32, @as(usize, c.w) * c.h);
+        defer gpa.free(pixels);
+        for (pixels, 0..) |*px, i| px.* = @truncate(i *% 0x01010101);
+        const out = try encodePNG(pixels, c.w, c.h, gpa);
+        defer gpa.free(out);
+        const raw_len = (1 + @as(usize, c.w) * 4) * c.h;
+        try std.testing.expectEqual(encodedSizeExact(raw_len), out.len);
+    }
 }

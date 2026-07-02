@@ -28,7 +28,8 @@ pub const Palette = struct {
     pub fn initDb16(gpa: Allocator) !Palette {
         var colors: std.ArrayList(u32) = .empty;
         errdefer colors.deinit(gpa);
-        for (db16) |rgb| try colors.append(gpa, rgbToCanvas(rgb));
+        try colors.ensureTotalCapacity(gpa, db16.len); // 固定 16 色（TASK-59）
+        for (db16) |rgb| colors.appendAssumeCapacity(rgbToCanvas(rgb));
         return .{ .colors = colors, .selected = 0 };
     }
 
@@ -70,6 +71,8 @@ pub const GplError = error{ InvalidGpl, EmptyPalette };
 pub fn encodeGpl(colors: []const u32, name: []const u8, gpa: Allocator) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
+    // 上限概算 = ヘッダ + 色行（"255 255 255\tUntitled\n" ≒ 21B < 32B）で事前確保（TASK-59）
+    try buf.ensureTotalCapacity(gpa, 32 + name.len + colors.len * 32);
     try buf.appendSlice(gpa, "GIMP Palette\nName: ");
     try buf.appendSlice(gpa, name);
     try buf.appendSlice(gpa, "\nColumns: 0\n#\n");
@@ -90,6 +93,8 @@ pub fn encodeGpl(colors: []const u32, name: []const u8, gpa: Allocator) ![]u8 {
 pub fn decodeGpl(gpa: Allocator, bytes: []const u8) !std.ArrayList(u32) {
     var colors: std.ArrayList(u32) = .empty;
     errdefer colors.deinit(gpa);
+    // 上限 = 行数（色行以外はスキップされる）。事前確保してループ内の再確保を排除（TASK-59）
+    try colors.ensureTotalCapacity(gpa, std.mem.count(u8, bytes, "\n") + 1);
 
     var header_ok = false;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -116,7 +121,7 @@ pub fn decodeGpl(gpa: Allocator, bytes: []const u8) !std.ArrayList(u32) {
         const g = std.fmt.parseInt(u8, gs, 10) catch continue;
         const b = std.fmt.parseInt(u8, bs, 10) catch continue;
         const c = 0xFF000000 | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
-        try colors.append(gpa, c);
+        colors.appendAssumeCapacity(c);
     }
     if (!header_ok) return GplError.InvalidGpl; // 空 / 全行空白
     if (colors.items.len == 0) return GplError.EmptyPalette;

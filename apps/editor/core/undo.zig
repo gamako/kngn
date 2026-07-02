@@ -169,7 +169,9 @@ pub const StrokeRecorder = struct {
         std.debug.assert(self.mode == .replace);
         self.mode = .none;
         if (self.diffs.items.len == 0) return null;
-        const owned = self.diffs.toOwnedSlice(gpa) catch @panic("StrokeRecorder.finish: OOM");
+        // toOwnedSlice でなく exact コピー + capacity 維持（次 stroke がゼロから再成長しない。TASK-59）
+        const owned = gpa.dupe(PixelDiff, self.diffs.items) catch @panic("StrokeRecorder.finish: OOM");
+        self.diffs.clearRetainingCapacity();
         return .{ .paint = .{ .layer_idx = self.layer_idx, .diffs = owned } };
     }
 
@@ -255,22 +257,29 @@ pub const StrokeRecorder = struct {
         std.debug.assert(self.mode == .brush);
         self.mode = .none;
         const pixels = canvas.layerPixels(self.layer_idx);
+        // 上限 = touched 数。事前確保してループ内の再確保を排除（TASK-59）
+        self.diffs.ensureTotalCapacity(gpa, self.touched.items.len) catch @panic("StrokeRecorder.brushFinish: OOM");
         for (self.touched.items) |idx| {
             if (pixels[idx] != self.orig[idx]) {
-                self.diffs.append(gpa, .{ .idx = idx, .before = self.orig[idx], .after = pixels[idx] }) catch
-                    @panic("StrokeRecorder.brushFinish: OOM");
+                self.diffs.appendAssumeCapacity(.{ .idx = idx, .before = self.orig[idx], .after = pixels[idx] });
             }
             self.coverage[idx] = 0; // 非 active 時 coverage 全 0 不変条件
         }
         self.touched.clearRetainingCapacity();
         if (self.diffs.items.len == 0) return null;
-        const owned = self.diffs.toOwnedSlice(gpa) catch @panic("StrokeRecorder.brushFinish: OOM");
+        // toOwnedSlice でなく exact コピー + capacity 維持（次 stroke がゼロから再成長しない。TASK-59）
+        const owned = gpa.dupe(PixelDiff, self.diffs.items) catch @panic("StrokeRecorder.brushFinish: OOM");
+        self.diffs.clearRetainingCapacity();
         return .{ .paint = .{ .layer_idx = self.layer_idx, .diffs = owned } };
     }
 };
 
 /// Undo/Redo スタック。各 UndoCmd の diffs は gpa 所有。
+/// 履歴は `max_history` 件で打ち止め（超過時は最古を解放して trim = 長時間編集でも単調増加しない。TASK-59）。
 pub const UndoStack = struct {
+    /// undo 履歴の上限件数。超過時に最古の cmd を解放して落とす。
+    pub const max_history: usize = 128;
+
     undo: std.ArrayList(UndoCmd) = .empty,
     redo: std.ArrayList(UndoCmd) = .empty,
 
@@ -302,6 +311,10 @@ pub const UndoStack = struct {
     /// `finish`/`pushClear` で no-op を吸収済み）。
     pub fn push(self: *UndoStack, gpa: Allocator, cmd: UndoCmd) void {
         self.clearRedo(gpa);
+        // 履歴上限: 最古を解放して trim（イベント時のみの O(n) ポインタシフトは許容。TASK-59）
+        if (self.undo.items.len >= max_history) {
+            freeCmd(gpa, self.undo.orderedRemove(0));
+        }
         self.undo.append(gpa, cmd) catch @panic("UndoStack.push: OOM");
     }
 
@@ -383,10 +396,11 @@ pub const UndoStack = struct {
     pub fn pushClear(self: *UndoStack, gpa: Allocator, canvas: *Canvas, layer_idx: usize) void {
         const pixels = canvas.layerPixels(layer_idx);
         var diffs: std.ArrayList(PixelDiff) = .empty;
+        // 上限 = 層の全画素。事前確保してループ内の再確保を排除（TASK-59）
+        diffs.ensureTotalCapacity(gpa, pixels.len) catch @panic("UndoStack.pushClear: OOM");
         for (pixels, 0..) |p, i| {
             if (p == 0) continue;
-            diffs.append(gpa, .{ .idx = @intCast(i), .before = p, .after = 0 }) catch
-                @panic("UndoStack.pushClear: OOM");
+            diffs.appendAssumeCapacity(.{ .idx = @intCast(i), .before = p, .after = 0 });
         }
         if (diffs.items.len == 0) {
             diffs.deinit(gpa);
@@ -925,4 +939,87 @@ test "selection: brush dab も選択範囲外を塗らない" {
     try std.testing.expectEqual(RED, px[3 * 8 + 3]);
     try std.testing.expectEqual(RED, px[4 * 8 + 4]);
     try std.testing.expectEqual(@as(u32, 0), px[2 * 8 + 2]); // 範囲外
+}
+
+test "UndoStack: 履歴上限で最古が解放される（paint + layer_delete 混在。リークは testing.allocator が検出）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 2, 2);
+    defer c.deinit();
+    var stack: UndoStack = .{};
+    defer stack.deinit(gpa);
+
+    // 最古（最初に trim される側）に held layer 持ちの layer_delete を積む
+    const held = try gpa.alloc(u32, 4);
+    @memset(held, 0xFF112233);
+    stack.push(gpa, .{ .layer_delete = .{ .index = 0, .layer = .{ .pixels = held }, .selected_before = 0, .selected_after = 0 } });
+
+    // 上限まで paint を積む（+1 で最古の layer_delete が trim → held が解放される）
+    var i: usize = 0;
+    while (i < UndoStack.max_history) : (i += 1) {
+        const diffs = try gpa.dupe(PixelDiff, &.{.{ .idx = 0, .before = 0, .after = 0xFF000000 }});
+        stack.push(gpa, .{ .paint = .{ .layer_idx = 0, .diffs = diffs } });
+    }
+    try std.testing.expectEqual(UndoStack.max_history, stack.undo.items.len);
+    // 先頭は paint（layer_delete は trim 済み）
+    try std.testing.expect(stack.undo.items[0] == .paint);
+
+    // さらに積んでも上限維持
+    const diffs2 = try gpa.dupe(PixelDiff, &.{.{ .idx = 1, .before = 0, .after = 0xFF0000FF }});
+    stack.push(gpa, .{ .paint = .{ .layer_idx = 0, .diffs = diffs2 } });
+    try std.testing.expectEqual(UndoStack.max_history, stack.undo.items.len);
+
+    // undo/redo は通常どおり動く
+    stack.undoOne(gpa, &c);
+    try std.testing.expectEqual(@as(usize, 1), stack.redo.items.len);
+    stack.redoOne(gpa, &c);
+    try std.testing.expectEqual(@as(usize, 0), stack.redo.items.len);
+}
+
+test "StrokeRecorder: stroke 間で diffs の capacity を再利用する（2 回目は再確保なし）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+
+    // 1 回目の stroke
+    rec.begin(0, 0xFF111111);
+    var x: i32 = 0;
+    while (x < 8) : (x += 1) rec.point(&c, gpa, x, 0);
+    const cmd1 = rec.finish(gpa).?;
+    defer gpa.free(cmd1.paint.diffs);
+    try std.testing.expect(rec.diffs.capacity >= 8); // capacity 維持
+    const ptr1 = rec.diffs.items.ptr;
+
+    // 同規模の 2 回目 → バッファ ptr 不変（再確保なし）
+    rec.begin(0, 0xFF222222);
+    x = 0;
+    while (x < 8) : (x += 1) rec.point(&c, gpa, x, 1);
+    const cmd2 = rec.finish(gpa).?;
+    defer gpa.free(cmd2.paint.diffs);
+    try std.testing.expectEqual(ptr1, rec.diffs.items.ptr);
+}
+
+test "StrokeRecorder(brush): diffs/touched の capacity を stroke 間で再利用する" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+
+    const dab = Dab{ .offsets = &.{ .{ .dx = 0, .dy = 0, .cov = 255 }, .{ .dx = 1, .dy = 0, .cov = 255 } } };
+    rec.brushBegin(0, 0xFF334455, 200);
+    rec.stamp(&c, gpa, 2, 2, dab);
+    const cmd1 = rec.brushFinish(&c, gpa);
+    if (cmd1) |cc| gpa.free(cc.paint.diffs);
+    const dptr = rec.diffs.items.ptr;
+    const tptr = rec.touched.items.ptr;
+    try std.testing.expect(rec.diffs.capacity > 0);
+
+    rec.brushBegin(0, 0xFF556677, 200);
+    rec.stamp(&c, gpa, 5, 5, dab);
+    const cmd2 = rec.brushFinish(&c, gpa);
+    if (cmd2) |cc| gpa.free(cc.paint.diffs);
+    try std.testing.expectEqual(dptr, rec.diffs.items.ptr);
+    try std.testing.expectEqual(tptr, rec.touched.items.ptr);
 }
