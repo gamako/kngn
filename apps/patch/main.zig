@@ -15,6 +15,7 @@ const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 const modular = @import("modular");
+const audio = @import("audio");
 const canvas = @import("canvas");
 
 const DynGraph = modular.DynGraph;
@@ -50,17 +51,43 @@ fn portColor(k: PortKind) gui.Color {
     };
 }
 
+const CableRef = canvas.CableRef;
+
 const Item = union(enum) {
     node: Handle,
     port: PortRef,
-    cable: usize, // edge index（そのフレームの edges 配列内）
+    cable: CableRef, // 安定 ID（dst_handle,dst_in）。フレーム内 edge index は使わない
 };
 
 const Drag = union(enum) {
     none,
     pan: struct { start_pan: Vec2f, start_mouse: Vec2f },
     node: struct { handle: Handle, grab_offset: Vec2f }, // node.pos = mouseWorld + grab_offset
+    // 接続 pending（origin ポートからカーソルへ仮ケーブル）。detach!=null は「接続済み入力から
+    // 拾い上げた drag-off」で、切断は commit（mouse_up）まで遅延する（1 操作=最大 1 publish・
+    // 失敗/無効ドロップで既存接続を壊さない）。
+    cable: struct { origin: PortRef, detach: ?CableRef = null },
 };
+
+// モジュールパレット（画面固定・pan/zoom 非依存）。クリックで add(kind, .{})。
+const PALETTE = [_]modular.ModuleKind{ .vco, .vcf, .lfo, .mixer, .clock, .euclid, .kick, .delay };
+const PAL_X0: f32 = 8;
+const PAL_Y: f32 = 6;
+const PAL_W: f32 = 100;
+const PAL_H: f32 = 22;
+const PAL_GAP: f32 = 4;
+const PAL_BG = gui.Color.rgba(0x2C, 0x32, 0x3C, 0xFF);
+const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
+const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
+
+fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
+    var btns: [PALETTE.len]canvas.PaletteButton = undefined;
+    for (0..PALETTE.len) |i| {
+        const fi: f32 = @floatFromInt(i);
+        btns[i] = .{ .kind_index = @intCast(i), .rect = .{ .x = PAL_X0 + fi * (PAL_W + PAL_GAP), .y = PAL_Y, .w = PAL_W, .h = PAL_H } };
+    }
+    return btns;
+}
 
 const App = struct {
     dyn: *DynGraph,
@@ -108,6 +135,16 @@ const App = struct {
         return n;
     }
 };
+
+// RT audio callback: dyn.processBlock のみ（同期/alloc/lock/IO/panic なし）。facade が自動 tap。
+fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
+    _ = sample_rate;
+    const app: *App = @ptrCast(@alignCast(userdata orelse {
+        @memset(buf, 0);
+        return;
+    }));
+    app.dyn.processBlock(buf, frames, channels);
+}
 
 // ============================================================================
 // 最小パッチ構築（全 3 ポート種別・全 3 ケーブル色を見せる）:
@@ -193,15 +230,13 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     const r = cam.portScreenRadius();
 
     // ケーブル（ノードの下）
-    for (edges, 0..) |e, idx| {
+    for (edges) |e| {
         const sg = findNode(nodes, e.src_handle) orelse continue;
         const dg = findNode(nodes, e.dst_handle) orelse continue;
         const a = cam.worldToScreen(canvas.outPortPos(sg, e.src_out));
         const b = cam.worldToScreen(canvas.inPortPos(dg, e.dst_in));
         const kind = app.dyn.outKindOf(e.src_handle, e.src_out) orelse .audio;
-        const sel = app.selected != null and app.selected.? == .cable and app.selected.?.cable == idx;
-        const hov = app.hover != null and app.hover.? == .cable and app.hover.?.cable == idx;
-        const thick: u32 = if (sel or hov) 3 else 2;
+        const thick: u32 = if (cableItemMatches(app.selected, e) or cableItemMatches(app.hover, e)) 3 else 2;
         dl.line(vec2i(a), vec2i(b), portColor(kind), thick) catch {};
     }
 
@@ -233,6 +268,38 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
             if (hoverPort(app, g.handle, false, i)) dl.rectOutline(portBox(p, r), HOVER_COL, 1) catch {};
         }
     }
+
+    // pending cable（接続 drag 中: origin ポート → カーソル）
+    if (app.drag == .cable) {
+        const origin = app.drag.cable.origin;
+        if (portScreenPos(app, nodes, origin)) |op| {
+            dl.line(vec2i(op), vec2i(app.mouse), PENDING_COL, 2) catch {};
+        }
+    }
+
+    // モジュールパレット（最前面・画面固定）
+    const buttons = paletteButtons();
+    for (buttons) |btn| {
+        const rect = gui.Rect{ .x = safeI32(btn.rect.x), .y = safeI32(btn.rect.y), .w = safeU32(btn.rect.w), .h = safeU32(btn.rect.h) };
+        const hov = canvas.hitTestPalette(app.mouse, &buttons) == btn.kind_index;
+        dl.rectFilled(rect, if (hov) PAL_BG_HOVER else PAL_BG) catch {};
+        dl.rectOutline(rect, BORDER_COL, 1) catch {};
+        dl.text(.{ .x = rect.x + 6, .y = rect.y + 5 }, @tagName(PALETTE[btn.kind_index]), TITLE_COL) catch {};
+    }
+}
+
+/// origin ポートの screen 位置（node が消えていれば null）。pending cable 描画用。
+fn portScreenPos(app: *const App, nodes: []const NodeGeom, p: PortRef) ?Vec2f {
+    const g = findNode(nodes, p.handle) orelse return null;
+    const wp = if (p.is_input) canvas.inPortPos(g, p.index) else canvas.outPortPos(g, p.index);
+    return app.camera.worldToScreen(wp);
+}
+
+fn cableItemMatches(item: ?Item, e: Edge) bool {
+    if (item) |it| {
+        if (it == .cable) return it.cable.dst_handle == e.dst_handle and it.cable.dst_in == e.dst_in;
+    }
+    return false;
 }
 
 fn portBox(center: Vec2f, r: f32) gui.Rect {
@@ -262,6 +329,15 @@ fn findNode(nodes: []const NodeGeom, h: Handle) ?NodeGeom {
 // ============================================================================
 // 入力
 // ============================================================================
+fn edgeForInput(app: *const App, dst: Handle, dst_in: u8) ?Edge {
+    var edge_buf: [MAX_EDGES]Edge = undefined;
+    const edges = edge_buf[0..app.buildEdges(&edge_buf)];
+    for (edges) |e| {
+        if (e.dst_handle == dst and e.dst_in == dst_in) return e;
+    }
+    return null;
+}
+
 fn updateHover(app: *App) void {
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     var edge_buf: [MAX_EDGES]Edge = undefined;
@@ -273,28 +349,120 @@ fn updateHover(app: *App) void {
     } else if (canvas.hitTestNode(mw, nodes)) |h| {
         app.hover = .{ .node = h };
     } else if (canvas.hitTestCable(mw, nodes, edges)) |ci| {
-        app.hover = .{ .cable = ci };
+        app.hover = .{ .cable = .{ .dst_handle = edges[ci].dst_handle, .dst_in = edges[ci].dst_in } };
     } else {
         app.hover = null;
     }
 }
 
 fn onMouseDown(app: *App) void {
+    // パレットは screen 座標で world hit より先に判定（追加。1 操作 1 publish は addByPaletteIndex 内）。
+    const buttons = paletteButtons();
+    if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
+        addByPaletteIndex(app, ki) catch {}; // PoolFull/TooManyModules は無視（追加せず）
+        return;
+    }
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     var edge_buf: [MAX_EDGES]Edge = undefined;
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
     const edges = edge_buf[0..app.buildEdges(&edge_buf)];
     const mw = app.camera.screenToWorld(app.mouse);
     if (canvas.hitTestPort(mw, nodes)) |pr| {
-        app.selected = .{ .port = pr }; // 40.6.2 は選択のみ（ケーブル接続は 40.6.3）
+        app.selected = .{ .port = pr };
+        if (pr.is_input) {
+            if (edgeForInput(app, pr.handle, pr.index)) |e| {
+                // 接続済み入力からの drag-off: その元出力から pending を張り、切断は commit(mouse_up)まで遅延。
+                app.drag = .{ .cable = .{
+                    .origin = .{ .handle = e.src_handle, .is_input = false, .index = e.src_out },
+                    .detach = .{ .dst_handle = pr.handle, .dst_in = pr.index },
+                } };
+                return;
+            }
+        }
+        app.drag = .{ .cable = .{ .origin = pr } }; // 出力 or 未接続入力から pending 開始
     } else if (canvas.hitTestNode(mw, nodes)) |h| {
         app.selected = .{ .node = h };
         const npos = app.layout[h];
         app.drag = .{ .node = .{ .handle = h, .grab_offset = npos.sub(mw) } };
     } else if (canvas.hitTestCable(mw, nodes, edges)) |ci| {
-        app.selected = .{ .cable = ci };
+        app.selected = .{ .cable = .{ .dst_handle = edges[ci].dst_handle, .dst_in = edges[ci].dst_in } };
     } else {
+        app.selected = null;
         app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.mouse } };
+    }
+}
+
+fn onMouseUp(app: *App) void {
+    if (app.drag == .cable) {
+        const pend = app.drag.cable;
+        var node_buf: [MAX_MODULES]NodeGeom = undefined;
+        const nodes = node_buf[0..app.buildNodes(&node_buf)];
+        const mw = app.camera.screenToWorld(app.mouse);
+        if (canvas.hitTestPort(mw, nodes)) |target| {
+            commitConnect(app, pend.origin, target, pend.detach);
+        } else if (pend.detach) |d| {
+            // 空きへドロップ = drag-off 切断（1 publish）。origin だけの pending は何もしない。
+            app.dyn.disconnect(d.dst_handle, d.dst_in);
+            app.dyn.publish() catch {};
+        }
+    }
+    app.drag = .none;
+}
+
+/// 接続を全事前検証してから 1 publish で確定する。drag-off の旧接続(detach)も同じ commit で処理し、
+/// 「1 操作=最大 1 publish」「無効/失敗時は既存接続を壊さない」を守る（切断を先行させない）。
+fn commitConnect(app: *App, a: PortRef, b: PortRef, detach: ?CableRef) void {
+    const rc = canvas.resolveConnection(a, b) orelse return; // 方向不正（out-out/in-in）→ 何もしない（旧接続維持）
+    const src = rc.src;
+    const dst = rc.dst;
+    // 事前検証: active / index 範囲 / 種別一致（dyn accessor は範囲外で null を返す）。落ちれば旧接続維持。
+    if (!app.dyn.slotActive(src.handle) or !app.dyn.slotActive(dst.handle)) return;
+    const sk = app.dyn.outKindOf(src.handle, src.index) orelse return;
+    const dk = app.dyn.inKindOf(dst.handle, dst.index) orelse return;
+    if (sk != dk) return; // 種別不一致は拒否（旧接続維持）
+    // 全 OK。ここから destructive: drag-off 元入力を外し（宛先と異なるとき）、宛先が既接続なら置換、connect、1 publish。
+    if (detach) |d| {
+        if (!(d.dst_handle == dst.handle and d.dst_in == dst.index)) app.dyn.disconnect(d.dst_handle, d.dst_in);
+    }
+    if (edgeForInput(app, dst.handle, dst.index) != null) app.dyn.disconnect(dst.handle, dst.index);
+    app.dyn.connect(src.handle, src.index, dst.handle, dst.index) catch {};
+    app.dyn.publish() catch {};
+}
+
+/// パレット index からモジュールを追加（comptime kind ディスパッチ）→ 画面中央付近にカスケード配置 → publish。
+fn addByPaletteIndex(app: *App, ki: u8) !void {
+    const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
+    const cx: f32 = @as(f32, @floatFromInt(app.fb_w)) * 0.45 + casc * 18;
+    const cy: f32 = @as(f32, @floatFromInt(app.fb_h)) * 0.4 + casc * 18;
+    const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
+    inline for (PALETTE, 0..) |kind, i| {
+        if (i == ki) {
+            const h = try app.dyn.add(kind, .{});
+            app.layout[h] = pos;
+            app.selected = .{ .node = h };
+            try app.dyn.publish();
+            return;
+        }
+    }
+}
+
+/// 選択中のノード/ケーブルを削除（Delete/Backspace）。
+fn deleteSelected(app: *App) void {
+    if (app.selected) |it| {
+        switch (it) {
+            .node => |h| {
+                app.dyn.removeModule(h);
+                app.dyn.publish() catch {};
+                app.selected = null;
+                app.hover = null;
+            },
+            .cable => |cr| {
+                app.dyn.disconnect(cr.dst_handle, cr.dst_in);
+                app.dyn.publish() catch {};
+                app.selected = null;
+            },
+            .port => {},
+        }
     }
 }
 
@@ -308,6 +476,7 @@ fn onMouseMove(app: *App) void {
             const mw = app.camera.screenToWorld(app.mouse);
             app.layout[nd.handle] = mw.add(nd.grab_offset);
         },
+        .cable => {}, // pending は app.mouse を使って毎フレーム描画（状態更新なし）
     }
 }
 
@@ -321,13 +490,29 @@ pub fn main() !void {
     var window = try platform.Window.create(WIN_W, WIN_H, "patch canvas (modular)");
     defer window.destroy();
 
-    const dyn = DynGraph.create(allocator, 48000) catch |err| {
+    // audio: open で sample rate を確定 → DynGraph 構築 → 初期 publish → その後 start（初手から発音）。
+    // RT callback は start 後にのみ発火するので、start 前に app.dyn を確定させれば安全（app は stack 固定・非ムーブ）。
+    var app: App = undefined;
+    const device = audio.open(allocator, .{
+        .sample_rate = 48000,
+        .buffer_frames = 512,
+        .channels = 2,
+        .render_callback = audioCallback,
+        .userdata = &app,
+    }) catch |err| {
+        std.debug.print("audio.open failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer device.close();
+
+    const sr: f32 = @floatFromInt(device.config().sample_rate);
+    const dyn = DynGraph.create(allocator, sr) catch |err| {
         std.debug.print("DynGraph.create failed: {s}\n", .{@errorName(err)});
         return;
     };
     defer dyn.destroy();
 
-    var app = App{ .dyn = dyn };
+    app = App{ .dyn = dyn }; // start 前に app を完全初期化（callback が app.dyn を触る前に確定）
     buildPatch(&app) catch |err| {
         std.debug.print("buildPatch failed: {s}\n", .{@errorName(err)}); // publish 失敗等は panic せず終了
         return;
@@ -337,6 +522,13 @@ pub fn main() !void {
     defer dl.deinit();
 
     platform.registerProbe(.{ .name = "patch", .ctx = &app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
+
+    device.start() catch |err| {
+        std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer device.stop();
+    std.debug.print("apps/patch: ドラッグでポート間を配線 / パレットで追加 / Delete で削除 / scroll=zoom。音が鳴ります。\n", .{});
 
     var running = true;
     main_loop: while (running and window.pollEvents()) {
@@ -349,7 +541,11 @@ pub fn main() !void {
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| {
-                    if (k.key == .ESCAPE) running = false;
+                    switch (k.key) {
+                        .ESCAPE => running = false,
+                        .DELETE, .BACKSPACE => deleteSelected(&app),
+                        else => {},
+                    }
                 },
                 .key_up => {},
                 .mouse_move => |m| {
@@ -363,7 +559,7 @@ pub fn main() !void {
                     }
                 },
                 .mouse_up => |m| {
-                    if (m.button == .left) app.drag = .none;
+                    if (m.button == .left) onMouseUp(&app);
                 },
                 .mouse_scroll => |s| {
                     app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };

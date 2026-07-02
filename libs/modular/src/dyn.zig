@@ -758,6 +758,55 @@ test "dyn(b): 決定的 — 同一操作列 2 回で出力・最終 GraphView �
     try testing.expectEqualSlices([MAX_IN]bool, &va.in_delayed, &vb.in_delayed);
 }
 
+test "dyn(b2): 長い操作列（connect/disconnect/remove/reuse 込み）を 2 回適用して決定的" {
+    // UI ライブ再配線を模した操作列: 構築→render→接続追加→render→切断→render→削除→publish→render→
+    // grace 後に再 add→render。固定 seed（モジュール既定）で 2 グラフに同一適用し出力・最終 View が一致。
+    const run = struct {
+        fn go(alloc: std.mem.Allocator, out_buf: []f32) !GraphView {
+            var g = try DynGraph.create(alloc, 48000);
+            defer g.destroy();
+            const v = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
+            const f = try g.add(.vcf, .{ .cutoff = 900, .resonance = 2.0, .mode = .lowpass });
+            const o = try g.add(.output, .{ .soft_clip = true });
+            try g.connect(v, 0, f, 0);
+            try g.connect(f, 0, o, 0);
+            g.setOutput(o);
+            try g.publish();
+            var tmp: [128 * 2]f32 = undefined;
+            g.processBlock(&tmp, 128, 2);
+            // LFO を足して cutoff を変調
+            const lfo = try g.add(.lfo, .{ .rate_hz = 1.0 });
+            try g.connect(lfo, 0, f, 1);
+            try g.publish();
+            g.processBlock(&tmp, 128, 2);
+            // 切断（LFO→cutoff を外す）
+            g.disconnect(f, 1);
+            try g.publish();
+            g.processBlock(&tmp, 128, 2);
+            // LFO を削除 → publish → render で grace 前進
+            g.removeModule(lfo);
+            try g.publish();
+            g.processBlock(&tmp, 128, 2);
+            // grace 済み slot を再利用（別モジュール）
+            const mix = try g.add(.mixer, .{ .gain = 0.5 });
+            try g.connect(v, 0, mix, 0);
+            try g.publish();
+            g.processBlock(out_buf, 128, 2);
+            return g.currentView();
+        }
+    };
+    var a: [128 * 2]f32 = undefined;
+    var b: [128 * 2]f32 = undefined;
+    const va = try run.go(testing.allocator, &a);
+    const vb = try run.go(testing.allocator, &b);
+    try testing.expectEqualSlices(f32, &a, &b);
+    try testing.expectEqual(va.node_count, vb.node_count);
+    try testing.expectEqual(va.output, vb.output);
+    try testing.expectEqualSlices(u16, va.order[0..va.node_count], vb.order[0..vb.node_count]);
+    try testing.expectEqualSlices([MAX_IN]i32, &va.in_src, &vb.in_src);
+    try testing.expectEqualSlices([MAX_IN]bool, &va.in_delayed, &vb.in_delayed);
+}
+
 test "dyn(f): 単一接続 / 種別一致 / サイクル遅延 / エラー区別" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();

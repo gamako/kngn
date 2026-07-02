@@ -56,6 +56,43 @@ pub const PortRef = struct {
     index: u8,
 };
 
+/// ケーブルの安定 ID（単一接続なので入力ポートで一意）。選択/削除に使う（フレーム内 edge index は
+/// add/remove/publish で別ケーブルを指し得るため使わない）。
+pub const CableRef = struct {
+    dst_handle: Handle,
+    dst_in: u8,
+};
+
+pub const ScreenRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
+/// モジュールパレットのボタン（screen 座標・pan/zoom 非依存）。
+pub const PaletteButton = struct {
+    kind_index: u8,
+    rect: ScreenRect,
+};
+
+/// 2 ポートからケーブルの src(出力)/dst(入力) を決める。一方が出力・他方が入力のときのみ有効。
+/// 同方向（out-out / in-in、同一 PortRef 含む）は null。同一ノードの out→in（別ポート＝self-loop）は許可
+/// （エンジンが遅延辺として扱う）。種別一致は呼び出し側（dyn.outKindOf/inKindOf）で事前検証する。
+pub fn resolveConnection(a: PortRef, b: PortRef) ?struct { src: PortRef, dst: PortRef } {
+    if (a.is_input == b.is_input) return null; // 同方向（同一 PortRef もここで弾かれる）
+    const src = if (!a.is_input) a else b;
+    const dst = if (a.is_input) a else b;
+    return .{ .src = src, .dst = dst };
+}
+
+fn pointInScreenRect(mx: f32, my: f32, r: ScreenRect) bool {
+    return mx >= r.x and mx <= r.x + r.w and my >= r.y and my <= r.y + r.h;
+}
+
+/// screen 座標のマウスがどのパレットボタン上か（world hit より先に判定する）。
+pub fn hitTestPalette(mouse: Vec2f, buttons: []const PaletteButton) ?u8 {
+    for (buttons) |btn| {
+        if (pointInScreenRect(mouse.x, mouse.y, btn.rect)) return btn.kind_index;
+    }
+    return null;
+}
+
 pub const OffscreenCounts = struct {
     node: u32 = 0,
     port: u32 = 0,
@@ -332,6 +369,45 @@ test "canvas: hitTestPort / hitTestCable" {
     try testing.expectEqual(@as(?usize, 0), hitTestCable(mid, &nodes, &edges));
     // ケーブルから離れた点は当たらない
     try testing.expectEqual(@as(?usize, null), hitTestCable(.{ .x = mid.x, .y = mid.y + 100 }, &nodes, &edges));
+}
+
+test "canvas: resolveConnection direction rules (self-loop allowed, same-dir rejected)" {
+    const out0 = PortRef{ .handle = 0, .is_input = false, .index = 0 };
+    const in0 = PortRef{ .handle = 1, .is_input = true, .index = 0 };
+    // out→in
+    {
+        const rc = resolveConnection(out0, in0).?;
+        try testing.expectEqual(@as(Handle, 0), rc.src.handle);
+        try testing.expectEqual(@as(Handle, 1), rc.dst.handle);
+        try testing.expect(!rc.src.is_input and rc.dst.is_input);
+    }
+    // in→out（順不同でも src=出力）
+    {
+        const rc = resolveConnection(in0, out0).?;
+        try testing.expectEqual(@as(Handle, 0), rc.src.handle);
+        try testing.expectEqual(@as(Handle, 1), rc.dst.handle);
+    }
+    // out-out / in-in は無効
+    try testing.expect(resolveConnection(out0, .{ .handle = 2, .is_input = false, .index = 0 }) == null);
+    try testing.expect(resolveConnection(in0, .{ .handle = 2, .is_input = true, .index = 1 }) == null);
+    // 同一ノードの out→in（別ポート = self-loop）は許可
+    {
+        const s_out = PortRef{ .handle = 5, .is_input = false, .index = 0 };
+        const s_in = PortRef{ .handle = 5, .is_input = true, .index = 1 };
+        const rc = resolveConnection(s_out, s_in).?;
+        try testing.expectEqual(@as(Handle, 5), rc.src.handle);
+        try testing.expectEqual(@as(Handle, 5), rc.dst.handle);
+    }
+}
+
+test "canvas: hitTestPalette inside/outside" {
+    const buttons = [_]PaletteButton{
+        .{ .kind_index = 0, .rect = .{ .x = 10, .y = 20, .w = 100, .h = 24 } },
+        .{ .kind_index = 1, .rect = .{ .x = 10, .y = 50, .w = 100, .h = 24 } },
+    };
+    try testing.expectEqual(@as(?u8, 0), hitTestPalette(.{ .x = 50, .y = 30 }, &buttons));
+    try testing.expectEqual(@as(?u8, 1), hitTestPalette(.{ .x = 50, .y = 60 }, &buttons));
+    try testing.expectEqual(@as(?u8, null), hitTestPalette(.{ .x = 500, .y = 30 }, &buttons));
 }
 
 test "canvas: viewportContains — fit layout has zero offscreen at representative zoom" {
