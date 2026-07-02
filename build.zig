@@ -252,26 +252,38 @@ pub fn build(b: *std.Build) void {
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
     // canvas.zig 単体テスト
-    const canvas_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/editor/core/canvas.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const canvas_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/canvas.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    canvas_test_mod.addImport("pixelops", example_modules.pixelops); // blend.zig facade 経由（TASK-51）
+    const canvas_test = b.addTest(.{ .root_module = canvas_test_mod });
     const run_canvas_test = b.addRunArtifact(canvas_test);
     test_png_roundtrip_step.dependOn(&run_canvas_test.step);
 
-    // blend.zig 単体テスト（straight-alpha src-over。pure・std のみ）
-    const blend_test = b.addTest(.{
+    // blend.zig 単体テスト（pixelops への facade 疎通。ブレンド本体のテストは test-pixelops）
+    const blend_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/core/blend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    blend_test_mod.addImport("pixelops", example_modules.pixelops);
+    const blend_test = b.addTest(.{ .root_module = blend_test_mod });
+    const run_blend_test = b.addRunArtifact(blend_test);
+    test_png_roundtrip_step.dependOn(&run_blend_test.step);
+
+    // libs/pixelops 単体テスト（premul/straight blend の SIMD vs scalar 一致・div255 恒等・clipBlit 境界）
+    const pixelops_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/editor/core/blend.zig"),
+            .root_source_file = b.path("libs/pixelops/src/lib.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_blend_test = b.addRunArtifact(blend_test);
-    test_png_roundtrip_step.dependOn(&run_blend_test.step);
+    const run_pixelops_test = b.addRunArtifact(pixelops_test);
+    const test_pixelops_step = b.step("test-pixelops", "Run libs/pixelops blend/div255/clip-hoist tests");
+    test_pixelops_step.dependOn(&run_pixelops_test.step);
 
     // editor/core テスト (undo: stroke 記録 + undo/redo + PNG round-trip, tool: Tool ゴールデン)
     // + pixie canvas_input (入力状態機械: capture / 外 release / 外継続 / stroke 中無視)
@@ -281,6 +293,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_undo_mod.addImport("png", example_modules.png);
+    core_undo_mod.addImport("pixelops", example_modules.pixelops);
     const core_undo_test = b.addTest(.{ .root_module = core_undo_mod });
     const run_core_undo_test = b.addRunArtifact(core_undo_test);
 
@@ -290,6 +303,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_tool_mod.addImport("png", example_modules.png);
+    core_tool_mod.addImport("pixelops", example_modules.pixelops);
     const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
     const run_core_tool_test = b.addRunArtifact(core_tool_test);
 
@@ -309,6 +323,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_path_mod.addImport("png", example_modules.png);
+    core_path_mod.addImport("pixelops", example_modules.pixelops);
     const core_path_test = b.addTest(.{ .root_module = core_path_mod });
     const run_core_path_test = b.addRunArtifact(core_path_test);
 
@@ -318,6 +333,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_path_editor_mod.addImport("png", example_modules.png);
+    core_path_editor_mod.addImport("pixelops", example_modules.pixelops);
     const core_path_editor_test = b.addTest(.{ .root_module = core_path_editor_mod });
     const run_core_path_editor_test = b.addRunArtifact(core_path_editor_test);
 
@@ -329,6 +345,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    canvas_input_core.addImport("pixelops", example_modules.pixelops);
     canvas_input_mod.addImport("core", canvas_input_core);
     const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
     const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
@@ -340,6 +357,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_selection_mod.addImport("png", example_modules.png);
+    core_selection_mod.addImport("pixelops", example_modules.pixelops);
     const core_selection_test = b.addTest(.{ .root_module = core_selection_mod });
     const run_core_selection_test = b.addRunArtifact(core_selection_test);
 
@@ -352,6 +370,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    selection_input_core.addImport("pixelops", example_modules.pixelops);
     selection_input_mod.addImport("core", selection_input_core);
     const selection_input_test = b.addTest(.{ .root_module = selection_input_mod });
     const run_selection_input_test = b.addRunArtifact(selection_input_test);
@@ -365,6 +384,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    bezier_input_core.addImport("pixelops", example_modules.pixelops);
     bezier_input_mod.addImport("core", bezier_input_core);
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
@@ -493,6 +513,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     sprite_test_module.addImport("png", sprite_test_png);
+    sprite_test_module.addImport("pixelops", example_modules.pixelops);
     const sprite_test = b.addTest(.{
         .root_module = sprite_test_module,
     });
@@ -523,6 +544,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     font_test_mod.addImport("png", example_modules.png); // bmfont.zig が利用
+    font_test_mod.addImport("pixelops", example_modules.pixelops); // color.zig が利用（TASK-51）
     const font_test = b.addTest(.{ .root_module = font_test_mod });
     const run_font_test = b.addRunArtifact(font_test);
     const test_font_step = b.step("test-font", "Run libs/font unit tests");
@@ -597,6 +619,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_platform_types_step);
+    test_step.dependOn(test_pixelops_step);
 
     // ========================================
     // マイクロベンチ（TASK-50）。純ロジック計測（display / audio デバイス不要・OS 非依存）。
@@ -608,11 +631,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_canvas_root.addImport("editor_canvas", b.createModule(.{
+    // bench 用 pixelops も ReleaseFast 固定で独立生成（共有インスタンスに引きずられない）
+    const bench_pixelops_mod = b.createModule(.{
+        .root_source_file = b.path("libs/pixelops/src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_canvas_core = b.createModule(.{
         .root_source_file = b.path("apps/editor/core/canvas.zig"),
         .target = target,
         .optimize = .ReleaseFast,
-    }));
+    });
+    bench_canvas_core.addImport("pixelops", bench_pixelops_mod);
+    bench_canvas_root.addImport("editor_canvas", bench_canvas_core);
     const bench_canvas_exe = b.addExecutable(.{ .name = "bench_canvas", .root_module = bench_canvas_root });
     const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
     bench_canvas_step.dependOn(&b.addRunArtifact(bench_canvas_exe).step);
@@ -722,6 +753,7 @@ const ExampleModules = struct {
     dsp: *std.Build.Module,
     harness: *std.Build.Module,
     types: *std.Build.Module,
+    pixelops: *std.Build.Module,
 
     fn init(b: *std.Build) ExampleModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
@@ -743,6 +775,12 @@ const ExampleModules = struct {
             .root_source_file = b.path("libs/png/src/lib.zig"),
         });
 
+        // libs/pixelops: ピクセルブレンド共有プリミティブ（premul/straight blend + div255 +
+        // clip-hoist。TASK-51）。sprite / editor core blend / font Color.blend が委譲する。
+        const pixelops_mod = b.createModule(.{
+            .root_source_file = b.path("libs/pixelops/src/lib.zig"),
+        });
+
         // 共有型 module（platform_types）: KeyCode/Event/EventStats 等の単一ソース。
         // platform module(facade+backends) と harness module が **同一インスタンス** を import して
         // 型同一性を保つ（Event/EventStats を harness↔platform 間で受け渡すため。TASK-32.2）。
@@ -755,6 +793,7 @@ const ExampleModules = struct {
             .root_source_file = b.path("src/sprite.zig"),
         });
         sprite.addImport("png", png);
+        sprite.addImport("pixelops", pixelops_mod);
 
         // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
         // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png に依存。
@@ -763,6 +802,7 @@ const ExampleModules = struct {
             .root_source_file = b.path("libs/font/src/lib.zig"),
         });
         font_mod.addImport("png", png);
+        font_mod.addImport("pixelops", pixelops_mod); // color.zig の Color.blend が委譲（TASK-51）
 
         // src/text.zig は共通 Font IF（libs/font）の実装を提供するため font に依存（TASK-25.14）。
         const text_mod = b.createModule(.{
@@ -828,6 +868,7 @@ const ExampleModules = struct {
             .dsp = dsp_mod,
             .harness = harness_mod,
             .types = types_mod,
+            .pixelops = pixelops_mod,
         };
     }
 };
@@ -913,6 +954,7 @@ fn addPixieExe(
         .root_source_file = b.path("apps/editor/core/core.zig"),
     });
     core_mod.addImport("png", common.png); // core/io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
+    core_mod.addImport("pixelops", common.pixelops); // core/blend.zig が委譲 (TASK-51)
 
     const exe = b.addExecutable(.{
         .name = name,

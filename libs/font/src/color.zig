@@ -1,4 +1,5 @@
 const std = @import("std");
+const pixelops = @import("pixelops");
 
 /// u32 = 0xAARRGGBB（little-endian、メモリ上[B,G,R,A]順）
 /// sprite.zig の blendPixel と同レイアウト。
@@ -24,17 +25,9 @@ pub const Color = packed struct(u32) {
     }
 
     /// straight alpha src-over。dst alpha は 0xFF 固定（不透明フレームバッファ前提）。
+    /// 実装は共有 pixelops.srcOverOpaque（TASK-51 で委譲。bit 挙動は従来と同一）。
     pub fn blend(dst: Color, src: Color) Color {
-        if (src.a == 0) return .{ .r = dst.r, .g = dst.g, .b = dst.b, .a = 0xFF };
-        if (src.a == 255) return .{ .r = src.r, .g = src.g, .b = src.b, .a = 0xFF };
-        const sa: u32 = src.a;
-        const inv: u32 = 255 - sa;
-        return .{
-            .r = @truncate((sa * src.r + inv * dst.r + 127) / 255),
-            .g = @truncate((sa * src.g + inv * dst.g + 127) / 255),
-            .b = @truncate((sa * src.b + inv * dst.b + 127) / 255),
-            .a = 0xFF,
-        };
+        return @bitCast(pixelops.srcOverOpaque(@bitCast(dst), @bitCast(src)));
     }
 
     /// HSV → RGB（不透明）。h は [0,360) へ wrap、s/v は [0,1] clamp。標準 6 セクタ。

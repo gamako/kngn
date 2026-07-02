@@ -12,10 +12,16 @@ pub fn build(b: *std.Build) void {
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
+
+    // sprite/blend の共有ブレンド実装（TASK-51）
+    const pixelops = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
+    });
     const sprite = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/sprite.zig" },
     });
     sprite.addImport("png", png);
+    sprite.addImport("pixelops", pixelops);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_03_sprite_rendering",

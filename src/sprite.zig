@@ -1,5 +1,6 @@
 const std = @import("std");
 const png = @import("png");
+const pixelops = @import("pixelops");
 
 const PremultipliedImage = png.PremultipliedImage;
 
@@ -54,112 +55,6 @@ pub const Sprite = struct {
     }
 };
 
-// SIMD用の型エイリアス
-const Vec4u16 = @Vector(4, u16);
-const Vec16u8 = @Vector(16, u8);
-const Vec16u16 = @Vector(16, u16);
-
-/// x / 255 の高速近似計算（ベクトル版）
-/// 各要素に対して 0 <= x <= 65025 の範囲で正確
-inline fn div255Vec(x: Vec4u16) Vec4u16 {
-    const one: Vec4u16 = @splat(1);
-    const eight: @Vector(4, u4) = @splat(8);
-    return (x + one + (x >> eight)) >> eight;
-}
-
-/// x / 255 の高速近似計算（16-lane 版）
-inline fn div255Vec16(x: Vec16u16) Vec16u16 {
-    const one: Vec16u16 = @splat(1);
-    const eight: @Vector(16, u4) = @splat(8);
-    return (x + one + (x >> eight)) >> eight;
-}
-
-/// u32ピクセルからVec4u16への変換
-/// ピクセルフォーマット: 0xAARRGGBB → [B, G, R, A] としてu16ベクトル化
-inline fn pixelToVec(pixel: u32) Vec4u16 {
-    const bytes: [4]u8 = @bitCast(pixel);
-    return .{
-        @as(u16, bytes[0]),
-        @as(u16, bytes[1]),
-        @as(u16, bytes[2]),
-        @as(u16, bytes[3]),
-    };
-}
-
-/// Vec4u16からu32ピクセルへの変換
-/// アルファチャンネルは0xFFに強制
-inline fn vecToPixel(vec: Vec4u16) u32 {
-    const result_bytes: [4]u8 = .{
-        @truncate(vec[0]),
-        @truncate(vec[1]),
-        @truncate(vec[2]),
-        0xFF,
-    };
-    return @bitCast(result_bytes);
-}
-
-/// 4 ピクセル同時の Premultiplied blend (16-lane SIMD)
-/// 入出力レイアウト: メモリ上 [B0 G0 R0 A0 B1 G1 R1 A1 B2 G2 R2 A2 B3 G3 R3 A3]
-/// 出力アルファは 0xFF 強制（ウィンドウ常に不透明）
-///
-/// PRECONDITION: src_pre の各ピクセルは premultiplied 済みで R/G/B <= A を満たすこと。
-/// この不変条件を破ると blended の値域が u8 範囲外となり、`@intCast(Vec16u16 -> Vec16u8)`
-/// で Debug 時 panic / ReleaseFast 時 UB を引き起こす。PNG デコード時に
-/// `decodePNGFilePremultiplied` / `decodePNGPremultiplied` を通せばこの不変は保たれる。
-inline fn blend4Pixels(dst: Vec16u8, src_pre: Vec16u8) Vec16u8 {
-    // 各ピクセルの A (memory index 3/7/11/15) を 4 lane ぶん複製。
-    // 後段の alpha_mask の true 位置 (3/7/11/15) と対応しており、
-    // 「ピクセル内 A レーン位置」という共通の解釈で揃えている。
-    const alpha_idx: @Vector(16, i32) = .{ 3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15 };
-    const src_a = @shuffle(u8, src_pre, undefined, alpha_idx);
-
-    // u8 -> u16 widening
-    const src16: Vec16u16 = @intCast(src_pre);
-    const dst16: Vec16u16 = @intCast(dst);
-    const src_a16: Vec16u16 = @intCast(src_a);
-    const inv_a: Vec16u16 = @as(Vec16u16, @splat(255)) - src_a16;
-
-    // out = src_pre + dst * (255 - src_a) / 255
-    const blended16 = src16 + div255Vec16(dst16 * inv_a);
-    const blended: Vec16u8 = @intCast(blended16);
-
-    // アルファレーンを 0xFF 強制
-    const alpha_mask: @Vector(16, bool) = .{
-        false, false, false, true,
-        false, false, false, true,
-        false, false, false, true,
-        false, false, false, true,
-    };
-    return @select(u8, alpha_mask, @as(Vec16u8, @splat(0xFF)), blended);
-}
-
-/// Premultiplied Alpha形式のアルファブレンディング（SIMD版）
-/// out = src_pre + dst * (1 - src_a)
-/// ピクセルフォーマット: u32 = 0xAARRGGBB（リトルエンディアン、メモリ上[B,G,R,A]順）
-///
-/// PRECONDITION: src_pre は premultiplied 済みで R/G/B <= A を満たすこと。
-/// （`blend4Pixels` の SIMD narrow と同じ前提。スカラー版はオーバーフローしないが、
-///  blend 結果の数学的整合性のために同じ不変を要求する）
-fn blendPixel(dst: u32, src_pre: u32) u32 {
-    const src_a: u8 = @truncate(src_pre >> 24);
-
-    // 早期リターン: 完全透明（出力アルファは常に0xFFに強制）
-    if (src_a == 0) return dst | 0xFF000000;
-
-    // 早期リターン: 完全不透明
-    if (src_a == 255) return src_pre | 0xFF000000;
-
-    // SIMD計算: 4チャンネル同時にブレンディング
-    const src_vec = pixelToVec(src_pre);
-    const dst_vec = pixelToVec(dst);
-    const inv_a: Vec4u16 = @splat(@as(u16, 255 - src_a));
-
-    // Premultiplied alpha blending: out = src_pre + dst * (255 - src_a) / 255
-    const blended = src_vec + div255Vec(dst_vec * inv_a);
-
-    return vecToPixel(blended);
-}
-
 /// フレームバッファにスプライトを描画（クリッピング処理付き）
 ///
 /// Premultiplied Alpha形式のアルファブレンディング対応:
@@ -170,69 +65,48 @@ fn blendPixel(dst: u32, src_pre: u32) u32 {
 /// - fb_width: フレームバッファの幅
 /// - fb_height: フレームバッファの高さ
 /// - sprite: 描画するスプライト
+/// 毎フレーム全画素相当を走るホットパス。ブレンド/clip は libs/pixelops の
+/// 共有実装（blendPremul4 / blendPremul / clipBlit。TASK-51 で移設）を使う。
 pub fn drawSprite(
     framebuffer: []u32,
     fb_width: u32,
     fb_height: u32,
     sprite: *const Sprite,
 ) void {
-    const sprite_width = sprite.image.width;
-    const sprite_height = sprite.image.height;
-
-    // 早期リターン: スプライトが完全に画面外の場合
-    if (sprite.x >= @as(i32, @intCast(fb_width)) or
-        sprite.y >= @as(i32, @intCast(fb_height)) or
-        sprite.x + @as(i32, @intCast(sprite_width)) <= 0 or
-        sprite.y + @as(i32, @intCast(sprite_height)) <= 0)
-    {
-        return;
-    }
-
-    // クリッピング範囲の計算
-    // ソース画像の描画開始位置
-    const src_x_start: u32 = if (sprite.x < 0) @intCast(-sprite.x) else 0;
-    const src_y_start: u32 = if (sprite.y < 0) @intCast(-sprite.y) else 0;
-
-    // フレームバッファの書き込み開始位置
-    const dst_x_start: u32 = if (sprite.x < 0) 0 else @intCast(sprite.x);
-    const dst_y_start: u32 = if (sprite.y < 0) 0 else @intCast(sprite.y);
-
-    // 実際に描画する幅と高さ
-    const visible_width = @min(
-        sprite_width - src_x_start,
-        fb_width - dst_x_start,
-    );
-    const visible_height = @min(
-        sprite_height - src_y_start,
-        fb_height - dst_y_start,
-    );
+    // clip 交差はループ外で 1 回計算（clip-hoist）。完全画面外は早期リターン。
+    const clip = pixelops.clipBlit(
+        fb_width,
+        fb_height,
+        sprite.image.width,
+        sprite.image.height,
+        sprite.x,
+        sprite.y,
+    ) orelse return;
 
     // ピクセルブレンド（クリップされた範囲のみ）
     // 各行を 4 ピクセル単位の SIMD パス + 残り (0..3 px) のスカラー tail で処理する
     var y: u32 = 0;
-    while (y < visible_height) : (y += 1) {
-        const src_y = src_y_start + y;
-        const dst_y = dst_y_start + y;
-        const src_row_base = src_y * sprite_width + src_x_start;
-        const dst_row_base = dst_y * fb_width + dst_x_start;
+    while (y < clip.h) : (y += 1) {
+        const src_row_base = (clip.src_y + y) * sprite.image.width + clip.src_x;
+        const dst_row_base = (clip.dst_y + y) * fb_width + clip.dst_x;
 
         var x: u32 = 0;
         // SIMD-4 パス
-        // ループ条件 x + 4 <= visible_width と visible_width <= sprite_width - src_x_start /
-        // fb_width - dst_x_start により、`src_row_base + x + 3 < (src_y+1)*sprite_width` と
+        // ループ条件 x + 4 <= clip.w と clip.w <= sprite_width - clip.src_x /
+        // fb_width - clip.dst_x により、`src_row_base + x + 3 < (src_y+1)*sprite_width` と
         // `dst_row_base + x + 3 < (dst_y+1)*fb_width` が成立し、行をまたぐアクセスは発生しない。
-        while (x + 4 <= visible_width) : (x += 4) {
+        while (x + 4 <= clip.w) : (x += 4) {
             const src_chunk: *const [4]u32 = sprite.image.pixels[src_row_base + x ..][0..4];
             const dst_chunk: *[4]u32 = framebuffer[dst_row_base + x ..][0..4];
-            const sv: Vec16u8 = @bitCast(src_chunk.*);
-            const dv: Vec16u8 = @bitCast(dst_chunk.*);
-            dst_chunk.* = @bitCast(blend4Pixels(dv, sv));
+            const sv: pixelops.Vec16u8 = @bitCast(src_chunk.*);
+            const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
+            dst_chunk.* = @bitCast(pixelops.blendPremul4(dv, sv));
         }
         // スカラー tail
-        while (x < visible_width) : (x += 1) {
+        while (x < clip.w) : (x += 1) {
             const src_idx = src_row_base + x;
             const dst_idx = dst_row_base + x;
-            framebuffer[dst_idx] = blendPixel(framebuffer[dst_idx], sprite.image.pixels[src_idx]);
+            framebuffer[dst_idx] = pixelops.blendPremul(framebuffer[dst_idx], sprite.image.pixels[src_idx]);
         }
     }
 }
@@ -249,87 +123,13 @@ const testing = std.testing;
 /// 注: これは **不変条件のみ** を満たし、厳密な premultiplied 値
 /// (R' = R * A / 255) を生成するわけではない。例: R=100, A=128 →
 /// 真の premultiplied は 50 だが、本関数は min(100, 128) = 100 を返す。
-/// blend4Pixels の `@intCast` narrow を安全に通すための簡易クランプとして使う。
+/// pixelops.blendPremul4 の `@intCast` narrow を安全に通すための簡易クランプとして使う。
 fn makePremulPixel(r: u8, g: u8, b: u8, a: u8) u32 {
     const rr = @min(r, a);
     const gg = @min(g, a);
     const bb = @min(b, a);
     const bytes: [4]u8 = .{ rr, gg, bb, a };
     return @bitCast(bytes);
-}
-
-// SIMD 4 ピクセルブレンド結果がスカラー版と完全一致することを保証する。
-test "blend4Pixels matches scalar blendPixel" {
-    const Case = struct { name: []const u8, src: [4]u32, dst: [4]u32 };
-    const cases = [_]Case{
-        .{
-            .name = "all alpha=0 (fully transparent)",
-            .src = .{
-                makePremulPixel(0, 0, 0, 0),
-                makePremulPixel(0, 0, 0, 0),
-                makePremulPixel(0, 0, 0, 0),
-                makePremulPixel(0, 0, 0, 0),
-            },
-            .dst = .{ 0xFF112233, 0xFF445566, 0xFF778899, 0xFFAABBCC },
-        },
-        .{
-            .name = "all alpha=255 (fully opaque)",
-            .src = .{
-                makePremulPixel(100, 150, 200, 255),
-                makePremulPixel(50, 60, 70, 255),
-                makePremulPixel(10, 20, 30, 255),
-                makePremulPixel(200, 100, 50, 255),
-            },
-            .dst = .{ 0xFFAAAAAA, 0xFFBBBBBB, 0xFFCCCCCC, 0xFFDDDDDD },
-        },
-        .{
-            .name = "all alpha=128 (mid translucent)",
-            .src = .{
-                makePremulPixel(40, 60, 80, 128),
-                makePremulPixel(20, 30, 40, 128),
-                makePremulPixel(100, 110, 120, 128),
-                makePremulPixel(0, 0, 0, 128),
-            },
-            .dst = .{ 0xFF101010, 0xFF202020, 0xFF303030, 0xFF404040 },
-        },
-        .{
-            .name = "mixed alphas (0/64/192/255)",
-            .src = .{
-                makePremulPixel(0, 0, 0, 0),
-                makePremulPixel(30, 40, 50, 64),
-                makePremulPixel(150, 160, 170, 192),
-                makePremulPixel(200, 210, 220, 255),
-            },
-            .dst = .{ 0xFF112233, 0xFF445566, 0xFF778899, 0xFFAABBCC },
-        },
-        .{
-            .name = "RGB extreme + premultiplied clamp",
-            .src = .{
-                // R/G/B が A を超える入力は makePremulPixel でクランプされる
-                makePremulPixel(255, 255, 255, 100),
-                makePremulPixel(0, 0, 255, 100),
-                makePremulPixel(255, 0, 0, 200),
-                makePremulPixel(128, 64, 32, 50),
-            },
-            .dst = .{ 0xFF000000, 0xFFFFFFFF, 0xFF808080, 0xFF7F3F1F },
-        },
-    };
-
-    for (cases) |c| {
-        // expected: scalar blendPixel を 4 回適用
-        var expected: [4]u32 = undefined;
-        for (0..4) |i| expected[i] = blendPixel(c.dst[i], c.src[i]);
-
-        // actual: blend4Pixels で 1 回
-        const sv: Vec16u8 = @bitCast(c.src);
-        const dv: Vec16u8 = @bitCast(c.dst);
-        const actual: [4]u32 = @bitCast(blend4Pixels(dv, sv));
-
-        testing.expectEqualSlices(u32, &expected, &actual) catch |err| {
-            std.debug.print("case '{s}' failed\n", .{c.name});
-            return err;
-        };
-    }
 }
 
 /// PremultipliedImage 風の最小データを作るテスト用ヘルパー。
@@ -386,7 +186,7 @@ fn drawSpriteScalarRef(
         while (x < vw) : (x += 1) {
             const si = (sys + y) * sw + (sxs + x);
             const di = (dys + y) * fb_width + (dxs + x);
-            framebuffer[di] = blendPixel(framebuffer[di], s.image.pixels[si]);
+            framebuffer[di] = pixelops.blendPremul(framebuffer[di], s.image.pixels[si]);
         }
     }
 }

@@ -14,10 +14,16 @@ pub fn build(b: *std.Build) void {
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
+
+    // font Color.blend の共有ブレンド実装（TASK-51）
+    const pixelops = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
+    });
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
     font.addImport("png", png);
+    font.addImport("pixelops", pixelops);
     const text = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/text.zig" },
     });

@@ -21,10 +21,16 @@ pub fn build(b: *std.Build) void {
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
+
+    // font/core blend の共有ブレンド実装（TASK-51）
+    const pixelops = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
+    });
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
     font.addImport("png", png);
+    font.addImport("pixelops", pixelops);
     const gui = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
     });
@@ -33,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("core/core.zig"),
     });
     core.addImport("png", png); // core/io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
+    core.addImport("pixelops", pixelops); // core/blend.zig が委譲 (TASK-51)
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",

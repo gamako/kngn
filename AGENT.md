@@ -33,6 +33,7 @@ video-proto-main/
 │   └── image/         # 共有アセット（実行 example ではない）
 ├── libs/              # 再利用ライブラリ
 │   ├── png/           # PNG codec（decode/encode）
+│   ├── pixelops/      # ピクセルブレンド共有プリミティブ（premul/straight blend + div255 + clip-hoist）
 │   ├── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
 │   ├── font/          # フォント（TrueType/OpenType アウトライン sfnt/glyf/cff + bmfont。※ BDF は src/text.zig）
 │   └── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
@@ -125,7 +126,7 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 - ✅ **サンプル**: `examples/01`〜`17`（基礎描画 / 入力 / スプライト / 固定ステップ / テキスト /
   ベンチ / マウス / GUI 各種 / アウトラインフォント / オーディオ）。`examples/image/` は共有アセット（run step なし）。
 - ✅ **ヘルパー**: sprite / fixed_timestep / fps_counter / text（`src/`。Phase 2 由来）。
-- ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`。
+- ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`・`libs/pixelops`（ブレンド共有プリミティブ）。
 - ✅ **アプリ**: `apps/editor/apps/pixie`（ドット絵エディタ: レイヤー / 範囲選択 / ベジェ / Undo / PNG）・
   `apps/synth`（PC キーボード演奏）。
 - ✅ **オーディオ / シンセ層**: `src/audio` + `src/dsp` + `libs/synth`（下記「オーディオ / シンセ層」節）。
@@ -453,12 +454,13 @@ app が内部状態を opt-in で probe として公開する。**framework（`s
 の場合はファイル or 関数の doc comment に明記**する（例: `/// 毎フレーム全画素を走る`）。
 実装計画（backlog の plan 欄）にも同じ宣言を含める。頻度の判定を誤ると以下の規約の要否を誤る。
 
-### 全画素ループの3点セット（`src/sprite.zig` が手本）
+### 全画素ループの3点セット（`libs/pixelops` が正準実装・`src/sprite.zig` が消費例）
 
 フレーム毎に全画素（またはそれに準ずる面積）を走るループは:
 
-1. **SIMD**: `@Vector(16, u8)` の 4px 同時ブレンド（`sprite.zig` の `blend4Pixels` 型）+ scalar tail。
-   **SIMD 版とスカラー参照版の bit 一致テストを必ず併設**する（`sprite.zig` 既存テストが手本）。
+1. **SIMD**: `@Vector(16, u8)` の 4px 同時ブレンド（`pixelops` の `blendPremul4` / `srcOverOpaque4` 型）+ scalar tail。
+   **SIMD 版とスカラー参照版の bit 一致テストを必ず併設**する（`libs/pixelops` 既存テストが手本）。
+   ブレンド/div255/clip-hoist は自作せず **`@import("pixelops")` の共有実装を使う**（TASK-51）。
 2. **per-pixel 除算の禁止**: `/255` は `div255` 整数近似 `(x + 1 + (x >> 8)) >> 8` を使う。
    浮動小数点も per-pixel では使わない（AA カバレッジ計算等、本質的に f32 な処理は除く）。
 3. **clip/bounds のループ外ホイスト**: clip 交差はループ**外**で1回計算し、内側は無検査の
@@ -490,7 +492,7 @@ app が内部状態を opt-in で probe として公開する。**framework（`s
 
 - RT ゼロアロケーション: `FailingAllocator` で実測（`libs/modular/src/dyn.zig` のテスト）
 - 係数再計算回数の上限 assert（`libs/modular/src/modules.zig` の VCF テスト）
-- SIMD vs スカラー参照の bit 一致（`src/sprite.zig`）
+- SIMD vs スカラー参照の bit 一致（`libs/pixelops`）
 
 ### 測定（bench）
 
@@ -516,6 +518,7 @@ zig build test-png-format       # PNG format 変換
 zig build test-text             # BDF パーサ + テキスト描画
 zig build test-font             # libs/font（bmfont 等）
 zig build test-sprite           # sprite ブレンド / 描画
+zig build test-pixelops         # libs/pixelops（SIMD vs scalar 一致 / div255 恒等 / clipBlit 境界）
 zig build test-dsp              # src/dsp（Oscillator / ADSR / Filter / Mixer）
 zig build test-synth            # libs/synth（SPSC リング / atomic / Voice / VoicePool / Synth）
 zig build test-spectrogram      # apps/synth スペクトログラム（FFT 列ロジック）

@@ -10,7 +10,7 @@
 | `canvas.zig` | `Canvas`（多レイヤ配列・合成・座標変換・レイヤ操作）、`Layer` / `Vec2` / `Rect` |
 | `undo.zig` | `StrokeRecorder`（stroke 記録機械）、`UndoStack` / `UndoCmd` / `PixelDiff` |
 | `tool.zig` | `Tool`（vtable 抽象）、`ToolEvent` / `ToolPoint`、`Pen` / `Eraser` / `Brush` |
-| `blend.zig` | ピクセル合成（`srcOver` 等）。canvas / selection / brush が利用 |
+| `blend.zig` | ピクセル合成（`srcOver` 等）。canvas / selection / brush が利用。実装は `libs/pixelops` への facade（TASK-51） |
 | `io_png.zig` | `encodePNG` / `savePNG`（PNG 出力） |
 | `bezier.zig` | 3次ベジェ `Cubic` の評価・適応平坦化、`Vec2f`（TASK-21.13） |
 | `path.zig` | `Path`（アンカー + in/out ハンドル）・`hitTest`・`rasterize`（TASK-21.13） |
