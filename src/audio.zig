@@ -15,6 +15,13 @@
 //! ユーザー callback を実行した後、出力サンプルを `harness.onAudioSamples()` へ push する（依存方向 audio→harness）。
 //! harness は組み込み `audio` probe（WAV + RMS/peak/f0/silent digest）でこのサンプルを使う。
 //! harness **無効時** は backend をそのまま使う（trampoline も追加 alloc も無し＝既存挙動と完全一致）。
+//!
+//! ## headless（実デバイス無し）駆動（TASK-32.4 P4）
+//!
+//! `VP_HARNESS_HEADLESS=1` 時は `backend`（実 OS デバイス）の代わりに `audio_null.zig` の
+//! null デバイスを開く（実デバイス無し・純 Zig・実時間 pull スレッド）。`AudioDevice.inner` を
+//! tagged union（`native`/`null_dev`）にして分岐するだけで、公開 `Error`/`Config`/`EffectiveConfig`/
+//! `RenderCallback` は一切変えない（`NullBackend(backend)` が backend の型をエイリアスするため）。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,6 +33,8 @@ const backend = switch (builtin.os.tag) {
     .windows => @import("audio_windows.zig"),
     else => @compileError("video-proto: unsupported OS for audio backend: " ++ @tagName(builtin.os.tag)),
 };
+
+const NullImpl = @import("audio_null.zig").NullBackend(backend);
 
 pub const Error = backend.Error;
 pub const Config = backend.Config;
@@ -48,31 +57,52 @@ fn renderTrampoline(buf: []f32, frames: u32, channels: u32, sample_rate: u32, us
     harness.onAudioSamples(buf, frames, channels, sample_rate);
 }
 
-/// facade デバイス。backend デバイスを内包する。harness 有効時のみ `wrapped`（trampoline 状態）を持ち、
-/// close で破棄する。harness 無効時は `wrapped=null`（backend を素通し＝既存挙動と完全一致）。
+/// facade デバイス。backend デバイス（native）か null デバイス（headless）を tagged union で内包する。
+/// harness 有効時のみ `wrapped`（trampoline 状態）を持ち、close で破棄する。
+/// harness 無効時は `wrapped=null`（backend を素通し＝既存挙動と完全一致）。
 pub const AudioDevice = struct {
-    inner: backend.AudioDevice,
+    inner: Inner,
     wrapped: ?*WrappedState,
 
+    const Inner = union(enum) {
+        native: backend.AudioDevice,
+        null_dev: NullImpl.AudioDevice,
+    };
+
     pub fn config(self: AudioDevice) EffectiveConfig {
-        return self.inner.config();
+        return switch (self.inner) {
+            .native => |d| d.config(),
+            .null_dev => |d| d.config(),
+        };
     }
 
     pub fn start(self: AudioDevice) Error!void {
-        return self.inner.start();
+        return switch (self.inner) {
+            .native => |d| d.start(),
+            .null_dev => |d| d.start(),
+        };
     }
 
     pub fn stop(self: AudioDevice) void {
-        self.inner.stop();
+        switch (self.inner) {
+            .native => |d| d.stop(),
+            .null_dev => |d| d.stop(),
+        }
     }
 
     pub fn close(self: AudioDevice) void {
         if (self.wrapped) |w| {
             const allocator = w.allocator;
-            self.inner.close();
+            switch (self.inner) {
+                .native => |d| d.close(),
+                .null_dev => |d| d.close(),
+            }
             allocator.destroy(w);
         } else {
-            self.inner.close();
+            switch (self.inner) {
+                .native => |d| d.close(),
+                .null_dev => |d| d.close(),
+            }
         }
     }
 };
@@ -80,10 +110,12 @@ pub const AudioDevice = struct {
 /// オーディオ出力を開く。
 /// - harness 無効時: backend をそのまま使う（trampoline も追加 alloc も無し＝既存挙動と完全一致）。
 /// - harness 有効時: ユーザーの render callback を harness trampoline で包み、出力を audio probe へ流す。
+///   - **headless 時（TASK-32.4 P4）**: 実 OS デバイスの代わりに null デバイス（`audio_null.zig`）を開く
+///     （実デバイス無し・実時間 pull スレッド）。
 pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     if (!harness.isEnabled()) {
         const inner = try backend.open(allocator, cfg);
-        return .{ .inner = inner, .wrapped = null };
+        return .{ .inner = .{ .native = inner }, .wrapped = null };
     }
 
     const wrapped = allocator.create(WrappedState) catch return error.OpenFailed;
@@ -98,6 +130,11 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     wrapped_cfg.render_callback = renderTrampoline;
     wrapped_cfg.userdata = wrapped;
 
+    if (harness.isHeadlessActive()) {
+        const inner = try NullImpl.open(allocator, wrapped_cfg);
+        return .{ .inner = .{ .null_dev = inner }, .wrapped = wrapped };
+    }
+
     const inner = try backend.open(allocator, wrapped_cfg);
-    return .{ .inner = inner, .wrapped = wrapped };
+    return .{ .inner = .{ .native = inner }, .wrapped = wrapped };
 }

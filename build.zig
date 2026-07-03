@@ -238,6 +238,19 @@ pub fn build(b: *std.Build) void {
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
     test_harness_step.dependOn(&run_harness_test.step);
 
+    // audio_null 単体テスト（headless の実デバイス無し出力。RT ゼロアロケーション / pull ループ。
+    // display・実オーディオデバイス不要・OS 非依存。TASK-32.4 P4）
+    const audio_null_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio_null.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // sleep ペーシングに std.c.nanosleep を使う（platform.sleep と同じ実装）
+    });
+    const audio_null_test = b.addTest(.{ .root_module = audio_null_test_mod });
+    const run_audio_null_test = b.addRunArtifact(audio_null_test);
+    const test_audio_null_step = b.step("test-audio-null", "Run audio_null (headless null device) unit tests");
+    test_audio_null_step.dependOn(&run_audio_null_test.step);
+
     // 共有型 module（platform_types）の単体テスト（ModifierFlags round-trip 等）。
     // TASK-32.2 で platform_types を named module 化したため、source-include で拾われなくなった分を
     // 独立 step として明示的にカバーする。
@@ -635,6 +648,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_wayland_input_step);
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
+    test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
     test_step.dependOn(test_pixelops_step);
 
