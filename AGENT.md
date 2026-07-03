@@ -448,8 +448,11 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
   `harness.parseConfig()` が走らないため `VP_HARNESS_HEADLESS` を解釈できない（headless 判定は
   `platform.init()` 起点）。もっとも harness 自体は frame loop（`window.pollEvents()`）駆動が前提であり、
   window を持たないアプリは元々 replay スクリプトで駆動できない（`step` 相当の同期点が無い）ため実害は無い。
-- Linux（純 SSH の x11/wayland ビルド）・Windows（gdi/d3d11 ビルド）での実機検証は本タスクでは未実施
-  （mac からは検証不可。要実機確認）。
+- 実機検証済み（2026-07-04）: **Linux は shiso**（Ubuntu・VPN 経由の純 SSH）で x11/wayland build 緑、
+  `DISPLAY`/`WAYLAND_DISPLAY` を unset した純 SSH で headless replay 動作（fb crc が mac と bit 一致）、
+  sink 不在でも `audio_null` が発音（`digest audio` f0≈262Hz・silent=0）。**Windows は walle-win** で
+  gdi/d3d11 の full build 緑、純 Zig の `test-harness`/`test-audio-null` も compile+pass（facade 型変更が
+  Windows backend で compile 確認。runtime headless は OS 非依存で mac/Linux 実証済み）。
 
 ### custom probe の足し方（TASK-32.3）
 
