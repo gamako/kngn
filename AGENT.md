@@ -303,7 +303,7 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 |---|---|---|
 | **L1 platform** | `src/audio.zig`（facade）+ `src/audio_{macos,linux,windows}.zig`（OS 別実装） | オーディオ出力プリミティブ（`open/start/stop/close/config`）。各 OS ネイティブ API を **extern fn / COM 手書き** で叩く（`@cImport` しない）: macOS=AudioUnit(AudioToolbox) / Linux=ALSA(`alsa`=libasound) / Windows=WASAPI(ole32)。audio backend は audio を使う exe にのみ link（既存 exe は不変）。 |
 | **L2 helpers** | `src/dsp/`（`@import("dsp")`） | Oscillator / Envelope(ADSR) / Filter(TPT SVF) / Mixer + denormal 対策。純 Zig。 |
-| **L3 libs** | `libs/synth/`（`@import("synth")`） | Voice / 固定 VoicePool（スチール + done 回収）/ Patch / Synth。GUI⇔Audio のロックフリー受け渡し（SPSC `NoteQueue` / `AtomicF32` / `DoubleBuffer` / 出力タップ `SampleTap`）。dsp に依存。 |
+| **L3 libs** | `libs/synth/`（`@import("synth")`） | Voice / 固定 VoicePool（スチール + done 回収）/ Patch / Synth。GUI⇔Audio のロックフリー受け渡し（SPSC `NoteQueue` / `AtomicF32` / `Mailbox`(triple-buffer) / 出力タップ `SampleTap`）。dsp に依存。 |
 | **L4 apps** | `apps/synth/`（`run-synth`）+ `examples/15_audio_tone`（`run-example_15`） | PC キーボード演奏 MVP / サイン波最小サンプル。 |
 
 **最重要のスレッドモデル**: グラフィックスはメインスレッド（macOS=CADisplayLink 等）、オーディオは
@@ -369,7 +369,7 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
     ②背景 = アンビエント連続生成（TuringMachine→Quantizer が ChordPad の和音 root を scale 内で遷移、Lfo が cutoff を
     連続変調、Random が level を S&H）。無操作でも鳴り続け・流れ続ける。全 RNG fixed seed で決定的。
   - **pattern 所有モデル**: RT(StepSeq) が grid/303 pattern の authoritative。GUI は毎フレーム snapshot を読んで
-    grid 表示し、編集時のみ `Controls.pattern_db`(DoubleBuffer) へ publish（RT が revision 変化時のみ取り込み、
+    grid 表示し、編集時のみ `Controls.pattern_db`(Mailbox) へ publish（RT が revision 変化時のみ取り込み、
     その後また per-bar 変異）。RT 経路に alloc/lock/IO/panic を足さない。
   - harness `modular` probe が生成状態を公開（digest=bpm/density/steps/active/gains/muted/ph4/ambient/pattern masks
     hex/lock/evolve/rev/mut を 1024B 以内、snapshot=さらに bass_deg 配列）。
