@@ -345,8 +345,16 @@ AI がアプリの出力を手軽に確認するための仕組み。`src/platfo
 - **P1（TASK-32.1, 実装済み）**: file replay + 組み込み `fb` probe（framebuffer→PNG / 1行 digest）+ 仮想クロック。
 - **P2（TASK-32.2, 実装済み）**: live 制御（TCP loopback + driver CLI `scripts/drive`）/ 組み込み `audio`・`stats` probe / record→replay。
 - **P3（TASK-32.3, 実装済み）**: custom probe レジストリ。app が `platform.registerProbe(...)` で probe を opt-in 登録（pixie=`canvas`/`undo`/`tool`, synth=`voices`/`patch`）。詳細は下記「custom probe の足し方」。
-- **P4 以降（未実装）**: offscreen / 完全 display-less / Metal の GPU drawable 読み戻し（描画後の合成サーフェスの readback）。
-  - 注: `fb` probe は**手動描画 API の CPU フレームバッファ**を捕捉する backend 非依存実装なので、**objc / swift / metal いずれでも `snapshot fb` は撮れる**（Metal も同じ CPU バッファを供給し、実測で objc と fb crc が bit 一致）。P4 の「Metal」は CPU バッファ経路ではなく GPU drawable の読み戻しを指す。
+- **P4（TASK-32.4, 実装済み）**: 完全 display-less。`VP_HARNESS_HEADLESS=1`（+ SCRIPT か LIVE 併用）で
+  `platform.init()` が `backend.init()` 自体を呼ばず、facade+harness 層の「null window」（backend 非依存の
+  CPU framebuffer）だけで動く。純 SSH（`DISPLAY`/`WAYLAND_DISPLAY` 無し）・macOS のウィンドウ点滅無しで
+  replay/live が回る。あわせて `audio_null.zig`（実デバイス無しの null 出力デバイス。実時間 pull スレッド）で
+  `audio` probe も実デバイス無しで駆動でき、`platform.frameDelay()`（harness 有効時 no-op）で main loop の
+  sleep による replay 速度律速も解消した。詳細は下記「完全 display-less（P4）」節。
+  - 注: `fb` probe は**手動描画 API の CPU フレームバッファ**を捕捉する backend 非依存実装なので、**objc / swift / metal いずれでも `snapshot fb` は撮れる**（Metal も同じ CPU バッファを供給し、実測で objc と fb crc が bit 一致）。
+- **P4 スコープ外**: Metal の GPU drawable 読み戻し（描画後の合成サーフェスの readback）。理由は上記の CPU
+  framebuffer 経由で既に `snapshot fb`/`digest fb` が metal ビルドでも成立しており（objc と crc bit 一致・
+  実測済み）、readback は harness の目的（アプリが描いた内容の検証）に寄与しないため見送った。
 
 ### コマンド言語（file replay と live で共通）
 
@@ -412,8 +420,36 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
 | `VP_HARNESS_PORT_FILE=<file>` | 選ばれた port の出力先（省略時 `$VP_HARNESS_OUT/harness.port`） |
 | `VP_HARNESS_RECORD=<file>` | live 受信コマンドを追記（→ `VP_HARNESS_SCRIPT` で replay 可能） |
 | `VP_HARNESS_OUT=<dir>` | snapshot 省略 path / port file の既定ディレクトリ |
+| `VP_HARNESS_HEADLESS=1` | **完全 display-less**（P4）。SCRIPT か LIVE/PORT との併用が必須（単独指定は warn して無視＝通常実行）。詳細は下記「完全 display-less（P4）」節 |
 
 > SCRIPT と LIVE/PORT の同時指定はエラーで無効化（1プロセス1トランスポート）。env 未設定なら全フック即パススルー。
+
+### 完全 display-less（P4, TASK-32.4）
+
+`VP_HARNESS_HEADLESS=1`（+ `VP_HARNESS_SCRIPT` か `VP_HARNESS_LIVE`/`PORT` の併用）で、`platform.init()` が
+`backend.init()` 自体を呼ばない（X11/Wayland の display 接続や macOS の WindowServer 接続を一切行わない）。
+`Window` は harness 所有の CPU framebuffer（`w*h` の `u32` バッファ）だけで動き、`lockFramebuffer`/`present`
+は既存の `fb` probe 捕捉フック（`onLock`/`onPresent`）をそのまま再利用する。**backend 別の offscreen 実装
+（X11 Pixmap 等）は採用していない**（facade+harness 層に閉じた「null window」方式。理由は「P4 スコープ外」
+節と同じく CPU framebuffer 捕捉モデルのため、backend を触っても得るものが無いこと）。
+
+- **純 SSH（`DISPLAY`/`WAYLAND_DISPLAY` 無し）で replay/live がそのまま回る**（display 接続が無いため）。
+- **audio も実デバイス無しで駆動できる**: `src/audio_null.zig`（純 Zig・OS 非依存の null 出力デバイス）が
+  `audio_linux`/`audio_windows` と同じ push-thread パターン（実時間 pull スレッド）で render callback を
+  駆動し、`harness.onAudioSamples()` へ流す。`audio` probe（`digest audio`/`snapshot audio`）が実 sink 不在
+  でも成立する。
+- **replay 速度律速の解消**: `platform.frameDelay(nanoseconds)`（harness 有効時は no-op、無効時は
+  `platform.sleep()` と同じ）を main loop の frame-wait に使う。仮想クロック + `pollGate` がフレーム進行を
+  決めるため、real-time sleep は待ち損でしかない。`src/main.zig` / `apps/synth/main.zig` /
+  examples `01,02,03,04,05,12` は置換済み（`examples/15_audio_tone` の 3 秒 sleep はアプリの寿命そのもの
+  なので対象外）。
+- **fb crc は headless でも非 headless と bit 一致**（実測確認済み。headless は描画内容を一切変えない）。
+- 既知の限界: `audio-only` で `platform.init()` を呼ばないアプリ（`examples/15_audio_tone` 等）は
+  `harness.parseConfig()` が走らないため `VP_HARNESS_HEADLESS` を解釈できない（headless 判定は
+  `platform.init()` 起点）。もっとも harness 自体は frame loop（`window.pollEvents()`）駆動が前提であり、
+  window を持たないアプリは元々 replay スクリプトで駆動できない（`step` 相当の同期点が無い）ため実害は無い。
+- Linux（純 SSH の x11/wayland ビルド）・Windows（gdi/d3d11 ビルド）での実機検証は本タスクでは未実施
+  （mac からは検証不可。要実機確認）。
 
 ### custom probe の足し方（TASK-32.3）
 
@@ -439,7 +475,14 @@ app が内部状態を opt-in で probe として公開する。**framework（`s
 
 - **実行モデル**: 非 step（inject/snapshot/digest）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
-- **制約**: 実ウィンドウは生成する（display 必須。macOS は通常 OK、Linux は Xvfb/実セッション）。完全 display-less は P4。`audio` は RT スレッド実時間依存なので record→replay で digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論）。live の accept ブロック中は window pump が止まる。`fb` の捕捉は CPU フレームバッファ経路で **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。P4 なのは Metal の GPU drawable 読み戻しの方。
+- **制約**: 実ウィンドウ生成は `VP_HARNESS_HEADLESS` 未指定時のみ必須（display 必須。macOS は通常 OK、
+  Linux は Xvfb/実セッション）。**`VP_HARNESS_HEADLESS=1` で完全 display-less**（P4, TASK-32.4 実装済み。
+  詳細は上記「完全 display-less（P4）」節）。`audio` は RT スレッド実時間依存なので record→replay で
+  digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論。headless でも同様に bit 決定論で、実測で
+  headless と非 headless の fb crc も bit 一致）。live の accept ブロック中は window pump が止まる
+  （headless 時は pump 自体が無いのでこの影響を受けない）。`fb` の捕捉は CPU フレームバッファ経路で
+  **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。Metal の GPU
+  drawable 読み戻しは P4 スコープ外（上記参照）。
 - **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
 
 ## 性能規約（メモリI/O・キャッシュ最適化）
