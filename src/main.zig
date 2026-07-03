@@ -92,7 +92,7 @@ pub fn main() !void {
 
         time += 1.0 / 60.0;
 
-        platform.sleep(16_666_666);
+        platform.frameDelay(16_666_666);
     }
 
     std.debug.print("Application terminated.\n", .{});

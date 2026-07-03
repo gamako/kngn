@@ -111,6 +111,6 @@ pub fn main(init: std.process.Init) !void {
             window.present();
         }
 
-        platform.sleep(16_666_666);
+        platform.frameDelay(16_666_666);
     }
 }

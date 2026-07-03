@@ -440,7 +440,7 @@ pub fn main() !void {
 
         window.present();
 
-        platform.sleep(16_000_000); // ~16ms（約 60fps）
+        platform.frameDelay(16_000_000); // ~16ms（約 60fps）
     }
 }
 
