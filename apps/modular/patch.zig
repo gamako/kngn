@@ -13,12 +13,12 @@
 //! ヒープに固定確保して**ムーブさせない**（create/destroy）。RT callback は render のみ呼ぶ。
 //!
 //! pattern 所有モデル: RT 側 StepSeq field が grid/303 pattern の唯一の authoritative。GUI は毎フレーム
-//! snapshot を読んで表示し、編集時のみ Controls.pattern_db(DoubleBuffer) へ publish する。RT は revision
+//! snapshot を読んで表示し、編集時のみ Controls.pattern_db(Mailbox) へ publish する。RT は revision
 //! 変化時のみ取り込み、その後また per-bar 変異を続ける（RT 経路に alloc/lock/IO/panic なし）。
 
 const std = @import("std");
 const modular = @import("modular");
-const synth = @import("synth"); // AtomicF32 / DoubleBuffer（GUI→RT のロックフリー受け渡し）
+const synth = @import("synth"); // AtomicF32 / Mailbox（GUI→RT のロックフリー受け渡し）
 const dsp = @import("dsp"); // FFT（band energy 検証・テスト用）/ Noise（変異 PRNG）
 
 // ----------------------------------------------------------------------------
@@ -67,7 +67,7 @@ const BASS_BAND = [2]u32{ 2, 8 };
 const STEPS_PER_BAR: u64 = 16;
 
 // ----------------------------------------------------------------------------
-// grid/303 pattern（GUI⇔RT 受け渡し。DoubleBuffer で整合的に publish）。
+// grid/303 pattern（GUI⇔RT 受け渡し。Mailbox で整合的に publish）。
 // ----------------------------------------------------------------------------
 pub const DrumTrack = struct {
     on: u16 = 0,
@@ -129,8 +129,8 @@ pub const Controls = struct {
     pad_mute: std.atomic.Value(u32),
     // Ph5: アンビエント連続生成の操作量（LFO rate + cutoff 深さに写像）
     ambient_move: synth.AtomicF32,
-    // Ph5: grid/303 pattern（整合的に差し替えるため DoubleBuffer。GUI=producer / RT=consumer）
-    pattern_db: synth.DoubleBuffer(PatternCommand),
+    // Ph5: grid/303 pattern（整合的に差し替えるため Mailbox(triple-buffer)。GUI=producer / RT=consumer）
+    pattern_db: synth.Mailbox(PatternCommand),
 
     pub fn init() Controls {
         return .{
@@ -155,7 +155,7 @@ pub const Controls = struct {
             .master_warmth = synth.AtomicF32.init(MASTER_WARMTH_DEFAULT),
             .pad_mute = std.atomic.Value(u32).init(0),
             .ambient_move = synth.AtomicF32.init(AMBIENT_MOVE_DEFAULT),
-            .pattern_db = synth.DoubleBuffer(PatternCommand).init(PatternCommand.default()),
+            .pattern_db = synth.Mailbox(PatternCommand).init(PatternCommand.default()),
         };
     }
 };
@@ -436,10 +436,10 @@ pub const LofiPatch = struct {
     fn applyControls(self: *LofiPatch) void {
         const c = &self.controls;
         // grid/303 pattern: revision 変化時のみ取り込む（GUI 編集を反映、StepSeq.step は保持）。
-        const cmd = c.pattern_db.current();
+        const cmd = c.pattern_db.acquire(); // Mailbox: 最新 publish を latch（*const、fresh 無しは現値維持）
         if (cmd.rev != self.applied_rev) {
             self.applied_rev = cmd.rev;
-            self.anchor = cmd; // 復帰先 = ユーザーの直近 intent
+            self.anchor = cmd.*; // 復帰先 = ユーザーの直近 intent
             self.kick_seq.on_mask = cmd.kick.on;
             self.hat_seq.on_mask = cmd.hat.on;
             self.clap_seq.on_mask = cmd.clap.on;

@@ -428,9 +428,9 @@ pub fn main() !void {
         ctx.endFrame();
 
         // scalar は毎フレーム publish。pattern は編集があったフレームだけ revision++ で publish。
-        // pattern_db(DoubleBuffer/SPSC) は 1 フレーム最大 1 publish（GUI は ~60fps の frame レート）。
-        // RT は毎ブロック(~10ms)で current() を読むため、consumer の 1 読み取り中に producer が 2 回
-        // publish することはなく（publish 間隔 ≥ block 間隔）、2-buffer で安全（既存 synth と同方針）。
+        // pattern_db(Mailbox/triple-buffer) は 1 フレーム最大 1 publish（GUI は ~60fps の frame レート）。
+        // RT は毎ブロック(~10ms)で acquire() で最新を latch する。triple-buffer なので consumer が
+        // 保持中の slot は後続 publish で書き換わらず torn read が起きない（既存 synth と同方針。TASK-56）。
         publishControls(patch, params);
         if (edited) {
             pattern_rev += 1;
