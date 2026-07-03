@@ -105,6 +105,17 @@ var have_frame = false;
 // 直近の EventStats（present で push される）
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
 
+// headless window state（TASK-32.4 P4: VP_HARNESS_HEADLESS=1 のとき facade が backend を
+// 一切呼ばず、この module-level buffer だけを Window として扱う。既存の単一 window 前提を踏襲）。
+var config_parsed = false;
+var pending_script_path: ?[]const u8 = null;
+var pending_live_requested = false;
+var headless_requested = false;
+var headless_active = false;
+var headless_pixels: []u32 = &.{};
+var headless_w: u32 = 0;
+var headless_h: u32 = 0;
+
 // custom probe registry（app が opt-in 登録。framework は中身を解釈せず raw+digest をルートするだけ）
 // 単一プロセスの debug facility なので固定長 module-level 配列で十分（動的確保なし）。
 const MAX_PROBES = 16;
@@ -194,20 +205,50 @@ fn findProbe(name: []const u8) ?*Probe {
     return null;
 }
 
-/// platform.init() から1度だけ呼ぶ。env を読み replay/live を有効化する。
-pub fn init() void {
+/// headless 判定の純粋ロジック（env I/O から分離。単体テスト用）。
+/// `VP_HARNESS_HEADLESS` 単独指定（script も live も無し）は無効（false = 通常実行）。
+fn decideHeadless(requested: bool, script_path: ?[]const u8, live_requested: bool) bool {
+    return requested and (script_path != null or live_requested);
+}
+
+/// platform.init() の最初に1度だけ呼ぶ。env を読むだけで I/O 副作用（script 読込・listen）は起こさない
+/// （TASK-32.4 P4: headless 判定を `backend.init()` の要否より前に確定させるため `startTransport()` と
+/// 二段階に分割した。詳細はタスク plan §3.1）。
+pub fn parseConfig() void {
+    if (config_parsed) return;
+    config_parsed = true;
+
+    pending_script_path = getEnv("VP_HARNESS_SCRIPT");
+    pending_live_requested = getEnv("VP_HARNESS_LIVE") != null or getEnv("VP_HARNESS_PORT") != null;
+    if (getEnv("VP_HARNESS_OUT")) |d| out_dir = d;
+
+    headless_requested = getEnv("VP_HARNESS_HEADLESS") != null;
+    headless_active = decideHeadless(headless_requested, pending_script_path, pending_live_requested);
+    if (headless_requested and !headless_active) {
+        std.debug.print("[harness] VP_HARNESS_HEADLESS は VP_HARNESS_SCRIPT か VP_HARNESS_LIVE/PORT と併用が必要です。無視します（通常実行）。\n", .{});
+    }
+}
+
+/// headless 判定（`parseConfig()` 後に確定。env 由来で transport の成否に依存しない）。
+/// facade が `backend.init()` を呼ぶか・Window を backend 実体にするかの分岐に使う。
+pub fn isHeadlessActive() bool {
+    return headless_active;
+}
+
+/// platform.init() が（非 headless 時は `backend.init()` の後に）1度だけ呼ぶ。
+/// script 読込 / live listen の実 I/O はここに閉じる（`parseConfig()` との分割は plan §3.1 参照）。
+pub fn startTransport() void {
     if (initialized) return;
     initialized = true;
 
-    const script_path = getEnv("VP_HARNESS_SCRIPT");
-    const live_requested = getEnv("VP_HARNESS_LIVE") != null or getEnv("VP_HARNESS_PORT") != null;
+    const script_path = pending_script_path;
+    const live_requested = pending_live_requested;
     if (script_path == null and !live_requested) return; // env 未設定 → 完全パススルー
 
     if (script_path != null and live_requested) {
         std.debug.print("[harness] VP_HARNESS_SCRIPT と live(VP_HARNESS_LIVE/PORT) は同時指定不可。harness を無効化します。\n", .{});
         return;
     }
-    if (getEnv("VP_HARNESS_OUT")) |d| out_dir = d;
 
     threaded = std.Io.Threaded.init(gpa, .{});
     io_val = threaded.io();
@@ -365,6 +406,43 @@ pub fn onAudioSamples(samples: []const f32, frames: u32, channels: u32, sample_r
         head +%= 1;
     }
     audio_head.store(head, .release);
+}
+
+// ============================================================================
+// headless window（TASK-32.4 P4: display 無しの facade window。backend を一切呼ばない）
+//
+/// ホットパス宣言: `createHeadlessWindow` は Window.create 時（初期化時のみ）に w*h の
+/// framebuffer を確保する。フレーム毎に走るのは呼び出し元（facade lockFramebuffer/present）の
+/// 既存 onLock/onPresent（@memcpy のみ・per-pixel 演算の新設なし）。
+// ============================================================================
+
+/// headless framebuffer の view（facade の Framebuffer が公開 pixels/width/height に詰め替える）。
+pub const HeadlessFramebufferView = struct { pixels: []u32, width: u32, height: u32 };
+
+/// facade の `Window.create` が headless 時に呼ぶ。単一 window 前提（既存の module-level 設計を踏襲）。
+/// w*h の CPU framebuffer を確保する（初回は alloc、以降はサイズ一致なら再利用・不一致なら再確保）。
+pub fn createHeadlessWindow(width: u32, height: u32) void {
+    const n = @as(usize, width) * @as(usize, height);
+    if (headless_pixels.len != n) {
+        if (headless_pixels.len > 0) gpa.free(headless_pixels);
+        headless_pixels = gpa.alloc(u32, n) catch @panic("harness: headless framebuffer alloc failed");
+    }
+    @memset(headless_pixels, 0);
+    headless_w = width;
+    headless_h = height;
+}
+
+/// headless framebuffer を lock する（native と異なり retry-able な null は無く常に成功）。
+pub fn headlessLock() HeadlessFramebufferView {
+    return .{ .pixels = headless_pixels, .width = headless_w, .height = headless_h };
+}
+
+/// facade の `Window.destroy()` が headless 時に呼ぶ（buffer 解放。テストの独立性にも使う）。
+pub fn destroyHeadlessWindow() void {
+    if (headless_pixels.len > 0) gpa.free(headless_pixels);
+    headless_pixels = &.{};
+    headless_w = 0;
+    headless_h = 0;
 }
 
 // ============================================================================
@@ -1341,4 +1419,41 @@ test "live framing: digest/snapshot が response buffer に prefix なしで積�
     try testing.expect(std.mem.endsWith(u8, resp_buf.items, "/tmp/a.wav\n"));
     try testing.expect(std.mem.indexOf(u8, resp_buf.items, "[harness]") == null);
     frame_pixels = &.{};
+}
+
+// ============================================================================
+// headless（TASK-32.4 P4）tests
+// ============================================================================
+
+test "decideHeadless: SCRIPT/LIVE 併用時のみ true、単独指定・未要求は false" {
+    try testing.expect(!decideHeadless(false, null, false)); // 何も無し
+    try testing.expect(!decideHeadless(true, null, false)); // HEADLESS 単独 → 無視
+    try testing.expect(decideHeadless(true, "script.txt", false)); // HEADLESS + SCRIPT
+    try testing.expect(decideHeadless(true, null, true)); // HEADLESS + LIVE
+    try testing.expect(decideHeadless(true, "script.txt", true)); // 両方（後段の矛盾判定は別）
+    try testing.expect(!decideHeadless(false, "script.txt", true)); // HEADLESS 未要求なら無関係
+}
+
+test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイズ変更で再確保" {
+    resetForTest();
+    defer destroyHeadlessWindow();
+
+    createHeadlessWindow(2, 2);
+    var view = headlessLock();
+    try testing.expectEqual(@as(u32, 2), view.width);
+    try testing.expectEqual(@as(u32, 2), view.height);
+    try testing.expectEqual(@as(usize, 4), view.pixels.len);
+
+    for (view.pixels) |*p| p.* = 0xFF112233;
+    onLock(view.pixels, view.width, view.height);
+    onPresent();
+    try testing.expect(have_frame);
+    try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[0]);
+    try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[3]);
+
+    // サイズ変更で再確保される（前回の内容を引きずらない: create 直後は 0 クリア）
+    createHeadlessWindow(3, 1);
+    view = headlessLock();
+    try testing.expectEqual(@as(usize, 3), view.pixels.len);
+    try testing.expectEqual(@as(u32, 0), view.pixels[0]);
 }

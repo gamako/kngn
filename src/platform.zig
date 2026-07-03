@@ -17,7 +17,14 @@
 //!   - `present`    = `fb` probe 捕捉（owned copy）
 //!   - `getTime`    = 仮想クロック
 //! env `VP_HARNESS_SCRIPT` 未設定なら全フックは即パススルー（既存挙動と完全一致）。
-//! `Framebuffer` は backend のものをそのまま re-export（caller の fb.pixels/.unlock() 互換を保つ）。
+//!
+//! ## 完全 display-less（TASK-32.4 P4）
+//!
+//! `VP_HARNESS_HEADLESS=1`（+ SCRIPT か LIVE 併用）のとき、`Window` は backend を一切呼ばず
+//! harness 所有の CPU framebuffer だけで動く（`platform.init()` も `backend.init()` をスキップする）。
+//! `Framebuffer` は facade 独自の struct（`pixels/width/height` + `unlock()`）で、内部に
+//! backend fb（native）か headless（harness buffer）かの tagged union を持つ。caller が使うのは
+//! `fb.pixels/.width/.height/.unlock()` のみなのでソース互換（apps/synth 等の既存コード無改造）。
 //!
 //! ## canonical pixel format（全 OS 共通・TASK-28.6）
 //!
@@ -55,29 +62,60 @@ pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 
-// Framebuffer は backend のものをそのまま re-export（wrap しない）。
-pub const Framebuffer = backend.Framebuffer;
+/// Locked framebuffer view（facade 独自型。TASK-32.4 P4）。
+/// caller が使うのは `pixels/width/height/unlock()` のみなので backend 直の型と source 互換。
+/// 内部は「native（backend 実体）」か「headless（harness 所有 buffer）」かの tagged union。
+pub const Framebuffer = struct {
+    pixels: []u32,
+    width: u32,
+    height: u32,
+    source: Source,
 
-/// Window facade。backend.Window を内包し、harness 有効時のみ 4 フックを差し込む。
-/// harness 無効時は全メソッドが backend への即パススルー。
+    const Source = union(enum) {
+        native: backend.Framebuffer,
+        headless: void,
+    };
+
+    pub fn unlock(self: Framebuffer) void {
+        switch (self.source) {
+            .native => |fb| fb.unlock(),
+            .headless => {}, // harness buffer は lock 概念が無い（present まで caller が直接触る）
+        }
+    }
+};
+
+/// Window facade。harness 有効時のみ 4 フックを差し込む。harness 無効時は backend への即パススルー。
+/// **headless 時（TASK-32.4 P4）**は `inner` を一切使わず（`undefined` のまま）、harness 所有の
+/// CPU framebuffer だけで動く（`backend.init()` 自体が呼ばれないため `inner` は触れない）。
 pub const Window = struct {
     inner: backend.Window,
+    headless: bool,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        return .{ .inner = try backend.Window.create(width, height, title) };
+        if (harness.isHeadlessActive()) {
+            harness.createHeadlessWindow(width, height);
+            return .{ .inner = undefined, .headless = true };
+        }
+        return .{ .inner = try backend.Window.create(width, height, title), .headless = false };
     }
 
     pub fn destroy(self: Window) void {
+        if (self.headless) {
+            harness.destroyHeadlessWindow();
+            return;
+        }
         self.inner.destroy();
     }
 
     pub fn pollEvents(self: Window) bool {
+        if (self.headless) return harness.pollGate(true); // native window closed 相当が無いので常に continue
         const native = self.inner.pollEvents();
         if (!harness.isEnabled()) return native;
         return harness.pollGate(native);
     }
 
     pub fn nextEvent(self: Window) ?Event {
+        if (self.headless) return harness.nextInjectedEvent(); // native pump が無いので注入イベントのみ
         if (!harness.isEnabled()) return self.inner.nextEvent();
         // 注入イベントを優先。尽きたら native を drain して quit のみ通す。
         if (harness.nextInjectedEvent()) |ev| return ev;
@@ -88,19 +126,35 @@ pub const Window = struct {
     }
 
     pub fn getEventStats(self: Window) EventStats {
+        if (self.headless) return .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
         return self.inner.getEventStats();
     }
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
+        if (self.headless) {
+            const view = harness.headlessLock();
+            harness.onLock(view.pixels, view.width, view.height);
+            return .{ .pixels = view.pixels, .width = view.width, .height = view.height, .source = .headless };
+        }
         const fb = self.inner.lockFramebuffer() orelse {
             if (harness.isEnabled()) harness.onLockMiss();
             return null;
         };
         if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height);
-        return fb;
+        return .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height, .source = .{ .native = fb } };
     }
 
     pub fn present(self: Window) void {
+        if (self.headless) {
+            // stats probe 用に EventStats(ゼロ値) を push してから fb 捕捉（onPresent で frame 確定）。
+            // headless は isHeadlessActive() 経由でのみ生成されるため実質常に harness 有効だが、
+            // native 経路と対称に isEnabled() ガードを揃えておく。
+            if (harness.isEnabled()) {
+                harness.onStats(self.getEventStats());
+                harness.onPresent();
+            }
+            return;
+        }
         if (harness.isEnabled()) {
             // stats probe 用に EventStats を push してから fb 捕捉（onPresent で frame 確定）。
             harness.onStats(self.inner.getEventStats());
@@ -111,11 +165,17 @@ pub const Window = struct {
 };
 
 pub fn init() Error!void {
-    try backend.init();
-    harness.init();
+    // headless 判定を先に確定させる（env 読取のみ・副作用無し）。headless なら backend.init() 自体を
+    // スキップする（display 接続を一切しない。TASK-32.4 P4）。非 headless は従来通り backend→transport の順を保つ。
+    harness.parseConfig();
+    if (!harness.isHeadlessActive()) {
+        try backend.init();
+    }
+    harness.startTransport();
 }
 
 pub fn shutdown() void {
+    if (harness.isHeadlessActive()) return; // backend.init() を呼んでいないので shutdown も呼ばない
     backend.shutdown();
 }
 
@@ -124,8 +184,18 @@ pub fn getTime() f64 {
     return backend.getTime();
 }
 
-pub const saveFileDialog = backend.saveFileDialog;
-pub const openFileDialog = backend.openFileDialog;
+/// ファイル保存ダイアログ。headless 時は backend が未初期化（native panel / zenity を呼べない）ため
+/// 即 `error.DialogFailed` を返す（TASK-32.4 P4）。
+pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    if (harness.isHeadlessActive()) return error.DialogFailed;
+    return backend.saveFileDialog(gpa, io, opts);
+}
+
+/// ファイルを開くダイアログ。headless 時は即 `error.DialogFailed`（`saveFileDialog` と同じ理由）。
+pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    if (harness.isHeadlessActive()) return error.DialogFailed;
+    return backend.openFileDialog(gpa, io, opts);
+}
 
 // ============================================================================
 // custom probe（ヘッドレス検証 harness・TASK-32.3）
@@ -159,4 +229,13 @@ pub fn sleep(nanoseconds: u64) void {
         };
         _ = std.c.nanosleep(&req, null);
     }
+}
+
+/// フレーム毎の main loop ウェイト（TASK-32.4 P4）。harness 有効時（headless に限らず replay/live とも）は
+/// **no-op**（フレーム進行は `pollGate` が gate し、時刻は仮想クロックなので実時間 sleep は純粋な待ち損＝
+/// replay 速度の律速要因）。harness 無効時は `sleep()` と同じ。main/examples の frame-wait 呼び出しは
+/// これに置き換える（`sleep()` 自体はフレームウェイト以外の用途向けに残す）。
+pub fn frameDelay(nanoseconds: u64) void {
+    if (harness.isEnabled()) return;
+    sleep(nanoseconds);
 }
