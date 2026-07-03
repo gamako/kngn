@@ -275,6 +275,13 @@ pub const DynGraph = struct {
     cur: []f32,
     prev: []f32,
 
+    // TASK-40.8 D: ポート別ミニ oscilloscope の per-port tap。
+    // cache_line 分離: GUI 書き領域（tap_mailbox）と RT 書き領域（tap: applied_seq/wpos/ring）を別ラインへ。
+    // false sharing の実害ペアは「GUI 書き × RT 書き」なので、この 2 ブロックを分ければ足りる
+    // （slot 間 wpos は単一 RT スレッドのみ書き・GUI は読みのみなので同居可）。
+    tap_mailbox: Mailbox(graph_core.TapConfig) align(std.atomic.cache_line),
+    tap: graph_core.TapState align(std.atomic.cache_line),
+
     /// heap 確保して初期化（自己参照ポインタのためムーブ禁止）。
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) Error!*DynGraph {
         const self = try allocator.create(DynGraph);
@@ -294,6 +301,8 @@ pub const DynGraph = struct {
             .sig_b = [_]f32{0} ** MAX_PORTS,
             .cur = undefined,
             .prev = undefined,
+            .tap_mailbox = Mailbox(graph_core.TapConfig).init(.{}),
+            .tap = .{},
         };
         self.cur = self.sig_a[0..];
         self.prev = self.sig_b[0..];
@@ -502,8 +511,13 @@ pub const DynGraph = struct {
     pub fn processBlock(self: *DynGraph, buf: []f32, frames: u32, channels: u32) void {
         const view = self.mailbox.acquire();
         self.consumed_gen.store(view.gen, .release);
+        // D: tap config を latch（block あたり 1 回）。差し替わった slot は local_wpos/wpos をリセットして
+        // 旧 port の残留サンプルを新 port の窓へ混ぜない。空/無チャンネル時も latch と applied_seq store は行う
+        // （GUI の描画 gate が止まらないように）。
+        const any_tap = self.latchTapConfig();
         if (view.node_count == 0 or channels == 0) {
             @memset(buf, 0);
+            self.tap.applied_seq.store(self.tap.latched_seq, .release);
             return;
         }
         var procs: [MAX_MODULES]ProcNode = undefined;
@@ -525,7 +539,38 @@ pub const DynGraph = struct {
             const oh: Handle = @intCast(view.output);
             break :blk .{ .out_base = self.instances[oh].out_base, .n_out = self.instances[oh].n_out };
         } else null;
-        graph_core.processBlock(procs[0..view.node_count], out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels);
+        // block 単位の分岐 1 回のみ: tap slot が 1 つでも active なら tapped 版、なければ従来版（機械語不変）。
+        if (any_tap) {
+            graph_core.processBlockTapped(procs[0..view.node_count], out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels, &self.tap);
+        } else {
+            graph_core.processBlock(procs[0..view.node_count], out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels);
+        }
+        // block 末尾に latch 済み config の seq を release store（1 store/block。GUI 描画 gate）。
+        self.tap.applied_seq.store(self.tap.latched_seq, .release);
+    }
+
+    /// tap config（GUI publish）を acquire して latch する。差し替わった slot は local_wpos=0 + wpos=0 に
+    /// リセット（旧 port の残留を「無し」扱い）。active な tap slot が 1 つでもあれば true。非 RT alloc/lock なし。
+    fn latchTapConfig(self: *DynGraph) bool {
+        const cfg = self.tap_mailbox.acquire();
+        self.tap.latched_seq = cfg.seq;
+        var any = false;
+        var s: usize = 0;
+        while (s < graph_core.TAP_SLOTS) : (s += 1) {
+            const p = cfg.ports[s];
+            if (p != self.tap.latched_ports[s]) {
+                self.tap.latched_ports[s] = p;
+                self.tap.local_wpos[s] = 0;
+                self.tap.cnt[s] = 0;
+                self.tap.acc[s] = 0;
+                self.tap.slots[s].wpos.store(0, .release); // GUI へ即「空」を見せる
+            }
+            // port の種別は固定なので decim/peak は port 不変なら変わらない（毎 block latch でコストは軽微）。
+            self.tap.latched_decim[s] = cfg.decim[s];
+            self.tap.latched_peak[s] = cfg.peak[s];
+            if (p >= 0 and @as(usize, @intCast(p)) < MAX_PORTS) any = true;
+        }
+        return any;
     }
 
     // --- テスト用イントロスペクション / 非 RT config / live atomic param ---
@@ -583,6 +628,49 @@ pub const DynGraph = struct {
     pub fn outKindOf(self: *const DynGraph, h: Handle, j: usize) ?PortKind {
         if (!self.slotActive(h) or j >= self.instances[h].n_out) return null;
         return self.instances[h].out_kinds[j];
+    }
+
+    // --- TASK-40.8 A: ポート活性度（RT 影響ゼロの best-effort torn read）---
+    /// 出力ポート (h, out) の現在の信号レベル ≒ max(|sig_a[p]|, |sig_b[p]|)。RT が書く f32 を非同期に読む
+    /// best-effort（ping-pong のどちらが最新かは不定だが活性度表示には十分。40.6.1 の「signal の GUI 読みは
+    /// torn 可」の範囲）。`.unordered` atomic load で torn を避けつつ RT 経路は不変（GUI 側のみ）。
+    /// 範囲外/非 active は 0（無条件 index で落とさない）。
+    pub fn sigLevel(self: *const DynGraph, h: Handle, out: usize) f32 {
+        if (h >= MAX_MODULES or out >= MAX_OUT or !self.slots[h].active) return 0;
+        const p = @as(usize, h) * MAX_OUT + out;
+        const a = @abs(@atomicLoad(f32, &self.sig_a[p], .unordered));
+        const b = @abs(@atomicLoad(f32, &self.sig_b[p], .unordered));
+        return @max(a, b);
+    }
+
+    // --- TASK-40.8 D: per-port tap（GUI 側 API）---
+    /// GUI→RT: tap 対象 port 割当を publish（triple-buffer・torn 無し・latest-wins・非ブロッキング）。
+    pub fn publishTapConfig(self: *DynGraph, cfg: graph_core.TapConfig) void {
+        self.tap_mailbox.publish(cfg);
+    }
+    /// RT が最後に latch・適用した config の seq（GUI の描画 gate）。
+    pub fn tapAppliedSeq(self: *const DynGraph) u32 {
+        return self.tap.applied_seq.load(.acquire);
+    }
+    /// slot の書き込み総サンプル数（acquire。これ以下の ring 書き込みは可視）。
+    pub fn tapWpos(self: *const DynGraph, slot: usize) u32 {
+        if (slot >= graph_core.TAP_SLOTS) return 0;
+        return self.tap.slots[slot].wpos.load(.acquire);
+    }
+    /// slot の直近窓（最大 out.len）を oldest→newest で out へコピーし、コピー数を返す。
+    /// wpos acquire までの ring 書き込みは可視。読み中に RT が上書きする tail の torn は表示グリッチのみ許容。
+    pub fn tapWindow(self: *const DynGraph, slot: usize, out: []f32) usize {
+        if (slot >= graph_core.TAP_SLOTS) return 0;
+        const w = self.tap.slots[slot].wpos.load(.acquire);
+        const avail = @min(@as(usize, w), graph_core.TAP_RING);
+        const count = @min(avail, out.len);
+        var k: usize = 0;
+        while (k < count) : (k += 1) {
+            const abs = @as(usize, w) - count + k; // count<=avail<=w なのでアンダーフロー無し
+            // RT の unordered store と対の unordered load（torn 無し・races OK・plain load と同一機械語）。
+            out[k] = @atomicLoad(f32, &self.tap.slots[slot].ring[abs % graph_core.TAP_RING], .unordered);
+        }
+        return count;
     }
 
     // --- main 専用の preflight accessor（read-only・RT 非関与。TASK-40.7.1 macro.zig の preflight 用）---
@@ -1022,4 +1110,159 @@ test "dyn(h4): RCU grace — grace 成立後は同 handle を再利用し、sign
     try g.publish();
     g.processBlock(&buf, 256, 2);
     for (buf) |s| try testing.expect(std.math.isFinite(s));
+}
+
+// ---- TASK-40.8 D: per-port tap（RT 性質。offline 単スレッド決定論）----
+
+/// slot0 に 1 ポートだけ載せた TapConfig を作る（テスト用ヘルパー）。
+fn tapCfg(seq: u32, port: i32) graph_core.TapConfig {
+    var c = graph_core.TapConfig{ .seq = seq };
+    c.ports[0] = port;
+    return c;
+}
+
+test "dyn(tap-a): tap 有効/無効で audio 出力が bit 一致（tap は非侵襲）" {
+    const build = struct {
+        fn go(alloc: std.mem.Allocator, out_buf: []f32, enable_tap: bool) !void {
+            var g = try DynGraph.create(alloc, 48000);
+            defer g.destroy();
+            const v = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
+            const o = try g.add(.output, .{ .soft_clip = true });
+            try g.connect(v, 0, o, 0);
+            g.setOutput(o);
+            try g.publish();
+            if (enable_tap) g.publishTapConfig(tapCfg(1, @intCast(@as(u32, v) * MAX_OUT)));
+            g.processBlock(out_buf, @intCast(out_buf.len / 2), 2);
+        }
+    };
+    var a: [512 * 2]f32 = undefined;
+    var b: [512 * 2]f32 = undefined;
+    try build.go(testing.allocator, &a, false);
+    try build.go(testing.allocator, &b, true);
+    try testing.expectEqualSlices(f32, &a, &b); // tap は buf に非侵襲
+}
+
+test "dyn(tap-b): tap リングは決定的・decimation rate 通り・発振源で非定数" {
+    const F: u32 = 512;
+    const build = struct {
+        fn go(alloc: std.mem.Allocator, ring_out: []f32) !u32 {
+            var g = try DynGraph.create(alloc, 48000);
+            defer g.destroy();
+            const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
+            const o = try g.add(.output, .{ .soft_clip = false });
+            try g.connect(v, 0, o, 0);
+            g.setOutput(o);
+            try g.publish();
+            g.publishTapConfig(tapCfg(1, @intCast(@as(u32, v) * MAX_OUT)));
+            var buf: [F * 2]f32 = undefined;
+            g.processBlock(&buf, F, 2);
+            _ = g.tapWindow(0, ring_out);
+            return g.tapWpos(0);
+        }
+    };
+    var r1: [graph_core.TAP_RING]f32 = undefined;
+    var r2: [graph_core.TAP_RING]f32 = undefined;
+    const w1 = try build.go(testing.allocator, &r1);
+    const w2 = try build.go(testing.allocator, &r2);
+    try testing.expectEqual(@as(u32, F / graph_core.TAP_DECIM), w1); // 間引きレート通り（wrap しない範囲）
+    try testing.expectEqual(w1, w2);
+    const n = @min(@as(usize, w1), graph_core.TAP_RING);
+    try testing.expectEqualSlices(f32, r1[0..n], r2[0..n]); // 決定的
+    var mn: f32 = 0;
+    var mx: f32 = 0;
+    for (r1[0..n]) |x| {
+        mn = @min(mn, x);
+        mx = @max(mx, x);
+    }
+    try testing.expect(mn < 0 and mx > 0); // 発振している（定数でない）
+}
+
+test "dyn(tap-c): tap 有効の processBlock + config publish がゼロアロケーション" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const v = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
+    const o = try g.add(.output, .{ .soft_clip = true });
+    try g.connect(v, 0, o, 0);
+    g.setOutput(o);
+    try g.publish();
+    const port: i32 = @intCast(@as(u32, v) * MAX_OUT);
+    g.publishTapConfig(tapCfg(1, port));
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    g.allocator = failing.allocator();
+    const chunk: u32 = 4096;
+    var buf: [chunk * 2]f32 = undefined;
+    var rendered: u64 = 0;
+    var seq: u32 = 2;
+    while (rendered < 96_000) : (rendered += chunk) {
+        g.publishTapConfig(tapCfg(seq, port)); // publish も alloc しない
+        seq += 1;
+        g.processBlock(&buf, chunk, 2);
+        for (buf) |s| try testing.expect(std.math.isFinite(s));
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    g.allocator = testing.allocator;
+}
+
+test "dyn(tap-d): config 差し替え・remove/reuse で finite・slot リセット（旧 port 混入なし）" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const v1 = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
+    const v2 = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 110 });
+    const o = try g.add(.output, .{ .soft_clip = false });
+    try g.connect(v1, 0, o, 0);
+    g.setOutput(o);
+    try g.publish();
+    var buf: [512 * 2]f32 = undefined;
+
+    // slot0 = v1 → 512 frame で 128 サンプル書かれる。
+    g.publishTapConfig(tapCfg(1, @intCast(@as(u32, v1) * MAX_OUT)));
+    g.processBlock(&buf, 512, 2);
+    try testing.expectEqual(@as(u32, 512 / graph_core.TAP_DECIM), g.tapWpos(0));
+    try testing.expectEqual(@as(u32, 1), g.tapAppliedSeq());
+
+    // slot0 を v2 へ差し替え → 次 block で wpos が 0 リセット後の新規カウントのみ（128 から増え続けない）。
+    g.publishTapConfig(tapCfg(2, @intCast(@as(u32, v2) * MAX_OUT)));
+    g.processBlock(&buf, 256, 2);
+    try testing.expectEqual(@as(u32, 256 / graph_core.TAP_DECIM), g.tapWpos(0)); // リセット済み
+    try testing.expectEqual(@as(u32, 2), g.tapAppliedSeq());
+
+    // remove + publish + reuse を挟んでも finite・クラッシュ無し。
+    g.removeModule(v1);
+    try g.publish();
+    g.processBlock(&buf, 256, 2);
+    for (buf) |s| try testing.expect(std.math.isFinite(s));
+}
+
+test "dyn(tap-e): gate は peak 間引きで 1 サンプル幅パルスを取りこぼさず捕捉する" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const clk = try g.add(.clock, .{ .bpm = 240, .ppqn = 8 }); // 高頻度 tick（1 サンプル幅トリガ）
+    const o = try g.add(.output, .{});
+    g.setOutput(o);
+    try g.publish(); // 未接続でも全 active ノードは order に入り毎サンプル評価される（clock.out0 が書かれる）
+    // slot0 = clock.out0、coarse decim + peak。plain 間引きなら 1/256 でしか当たらないパルスも max で拾う。
+    var cfg = graph_core.TapConfig{ .seq = 1 };
+    cfg.ports[0] = @intCast(@as(u32, clk) * MAX_OUT);
+    cfg.decim[0] = 256;
+    cfg.peak[0] = true;
+    g.publishTapConfig(cfg);
+    var buf: [4096 * 2]f32 = undefined;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) g.processBlock(&buf, 4096, 2); // ~1s（多数の tick を含む）
+    var win: [graph_core.TAP_RING]f32 = undefined;
+    const n = g.tapWindow(0, &win);
+    var mx: f32 = 0;
+    for (win[0..n]) |v| mx = @max(mx, v);
+    try testing.expect(mx > 0.5); // gate パルスが窓内 max として捕捉されている
+}
+
+test "dyn(tap-cacheline): GUI 書き領域(tap_mailbox) と RT 書き領域(tap) が別キャッシュライン" {
+    const cl = std.atomic.cache_line;
+    const mb = @offsetOf(DynGraph, "tap_mailbox");
+    const tp = @offsetOf(DynGraph, "tap");
+    try testing.expect(mb % cl == 0);
+    try testing.expect(tp % cl == 0);
+    const diff = if (tp > mb) tp - mb else mb - tp;
+    try testing.expect(diff >= cl); // 別ライン（false sharing の GUI×RT ペアを分離）
 }

@@ -24,6 +24,13 @@ pub const DynGraph = dyn.DynGraph;
 pub const ModuleKind = dyn.ModuleKind;
 pub const GraphView = dyn.GraphView;
 
+// TASK-40.8 D: per-port tap（ポート別ミニ oscilloscope）。
+pub const TapConfig = graph_core.TapConfig;
+pub const TapState = graph_core.TapState;
+pub const TAP_SLOTS = graph_core.TAP_SLOTS;
+pub const TAP_RING = graph_core.TAP_RING;
+pub const TAP_DECIM = graph_core.TAP_DECIM;
+
 pub const Vco = modules.Vco;
 pub const Vca = modules.Vca;
 pub const EnvGen = modules.EnvGen;

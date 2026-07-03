@@ -373,11 +373,27 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
     その後また per-bar 変異）。RT 経路に alloc/lock/IO/panic を足さない。
   - harness `modular` probe が生成状態を公開（digest=bpm/density/steps/active/gains/muted/ph4/ambient/pattern masks
     hex/lock/evolve/rev/mut を 1024B 以内、snapshot=さらに bass_deg 配列）。
+- **apps/patch**（`run-patch`）: 動的グラフエンジン（`DynGraph`, TASK-40.6.1）をビジュアルに編集する
+  パッチキャンバス（40.6.2〜）。ノード=矩形＋種別色ポート（audio 橙/cv 青/gate 緑）＋ケーブルで描画し、
+  pan/zoom/drag/ライブ再配線・パレット追加・DrumMachine/BassMachine マクロ（畳み/展開・TR/303 grid）ができる。
+  UI レイアウト状態は GUI 側が持ち publish には載せない（`group.Ledger`）。純幾何は `canvas.zig`（test-patch）。
+  - **信号可視化**（TASK-40.8）: 画面下端に可視化帯（C: master 出力を `SampleTap` で tap→spectrogram/
+    oscilloscope/level meter。apps/synth 流用）。各出力ポート丸を活性度で明滅（A: `dyn.sigLevel` の
+    best-effort torn read・RT 影響ゼロ）。表示中の出力ポート直下に per-port ミニ oscilloscope（D: RT 側
+    per-port リング tap。`graph_core.processBlockTapped` + `DynGraph.tap`。`.unordered` store/load・block 末尾
+    wpos release・`applied_seq` gate で旧 port 混入を防ぐ。tap 無し経路は comptime 分岐で機械語不変）。
+    ミニは **ポート種別ごとに表示を変える**: audio=細かい間引きの波形＋rising zero-crossing 位相ロック /
+    cv=粗い間引きでゆっくりした変調 / gate=粗い間引き＋窓内 max（peak）で 1 サンプル幅パルスを取りこぼさず
+    縦インパルスバーで時系列表示（per-slot `decim`/`peak` を `TapConfig` で GUI が種別に応じ設定）。
+    キャンバス有効高 = `fb_h - VIS_H`（見切れ判定/ヒットテスト/tap 対象選択に共通適用）。harness `viz` probe が
+    master rms/peak + tap 中 port/レベル/wpos を公開（`patch`/`group` probe と併用）。
 
 ```bash
 zig build run-modular          # lofi 生成パッチを再生（ESC で終了。-Dplatform で backend 切替）
-zig build test-modular         # libs/modular（topo/cycle/単一接続/生成CV/合成ドラム。display/audio 不要）
+zig build run-patch            # パッチキャンバス（drag=配線/move/pan・scroll=zoom・下帯=信号可視化）
+zig build test-modular         # libs/modular（topo/cycle/単一接続/生成CV/合成ドラム/per-port tap。display/audio 不要）
 zig build test-app-modular     # apps/modular の LofiPatch（offline 非無音/有限/決定的 CRC）
+zig build test-patch           # apps/patch 純幾何（camera/hit-test/見切れ/tap 選択/ミニスコープ幾何）+ group 台帳
 ```
 
 ヘッドレス AC 確認（macOS 実機で発音、live で audio digest）:

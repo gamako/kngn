@@ -326,6 +326,100 @@ fn distPointSegment(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
 }
 
 // ============================================================================
+// ミニ oscilloscope（TASK-40.8 D）: 出力ポート別の直近波形小窓の幾何 + tap 対象選択（純ロジック）。
+// 表示は 1 ノード 1 窓（out0 を代表）。ノード矩形の直下に screen 固定サイズで置き、ノード位置に追従する。
+// modular / dyn 非依存（global port id 解決は main.zig 側の責務）。
+// ============================================================================
+pub const MINI_W: f32 = 64; // screen 固定幅
+pub const MINI_H: f32 = 28; // screen 固定高
+pub const MINI_GAP: f32 = 4; // ノード下端との間隔
+pub const MINI_ZOOM_MIN: f32 = 0.5; // これ未満の zoom では非表示（視認不能な窓のため RT tap を払わない）
+
+/// ノード（screen 左上・screen サイズ）の直下に置くミニスコープ矩形（screen 座標）。
+pub fn miniScopeRect(node_tl_screen: Vec2f, node_size_screen: Vec2f) ScreenRect {
+    return .{
+        .x = node_tl_screen.x,
+        .y = node_tl_screen.y + node_size_screen.y + MINI_GAP,
+        .w = MINI_W,
+        .h = MINI_H,
+    };
+}
+
+/// ミニスコープの表示開始 index（立ち上がりゼロ交差トリガ）。oldest→newest 並びの `samples` から、末尾 `disp`
+/// 点を表示するとき、その表示窓を「最新の rising zero-crossing」に揃えて周期波形を静止させる。交差が無い
+/// （＝gate/単極 cv のようにゼロを跨がない）場合は最新窓（= 非ロック・流れる表示）へ自然降格する。
+/// 返す start は必ず start+disp<=samples.len（呼び出し側の slice が安全）。
+pub fn findTriggerStart(samples: []const f32, disp: usize) usize {
+    const n = samples.len;
+    if (disp >= n or disp < 2) return if (n > disp) n - disp else 0;
+    const newest = n - disp; // 非ロック時の開始（最新 disp 点）
+    var t = newest;
+    while (t > 0) : (t -= 1) {
+        if (samples[t - 1] < 0.0 and samples[t] >= 0.0) return t; // newest 以下で最も新しい rising 交差
+    }
+    return newest;
+}
+
+/// tap 候補か: 出力ポートを持ち、out0 が viewport 内、かつミニスコープ矩形が viewport 内に完全収容される
+/// （下帯や画面端に隠れる窓には RT tap を張らない＝表示されないのに tap cost を払わない。vh はキャンバス有効高）。
+fn isTapCandidate(cam: Camera, vw: f32, vh: f32, g: NodeGeom) bool {
+    if (g.n_out == 0) return false;
+    const p = cam.worldToScreen(outPortPos(g, 0));
+    if (!(p.x >= 0 and p.x <= vw and p.y >= 0 and p.y <= vh)) return false;
+    const tl = cam.worldToScreen(g.pos);
+    const sz = nodeSize(g).scale(cam.zoom);
+    const r = miniScopeRect(tl, sz);
+    return r.x >= 0 and r.x + r.w <= vw and r.y >= 0 and r.y + r.h <= vh;
+}
+
+fn containsHandle(list: []const Handle, h: Handle) bool {
+    for (list) |x| {
+        if (x == h) return true;
+    }
+    return false;
+}
+
+/// ミニスコープ表示対象（＝tap 対象）のノード handle を優先度順に out へ最大 out.len 個選ぶ。
+/// zoom<MINI_ZOOM_MIN は 0 本（tap を張らない）。優先順位: selected > hover > nodes の並び順。
+/// 返す handle は display node の handle（collapsed 箱＝合成 handle 可。global port id 解決は呼び出し側）。
+pub fn selectTapPorts(
+    cam: Camera,
+    vw: f32,
+    vh: f32,
+    nodes: []const NodeGeom,
+    selected: ?Handle,
+    hover: ?Handle,
+    out: []Handle,
+) usize {
+    if (cam.zoom < MINI_ZOOM_MIN or out.len == 0) return 0;
+    var n: usize = 0;
+    if (selected) |sh| {
+        if (findNode(nodes, sh)) |g| {
+            if (isTapCandidate(cam, vw, vh, g) and n < out.len) {
+                out[n] = sh;
+                n += 1;
+            }
+        }
+    }
+    if (hover) |hh| {
+        if (findNode(nodes, hh)) |g| {
+            if (isTapCandidate(cam, vw, vh, g) and !containsHandle(out[0..n], hh) and n < out.len) {
+                out[n] = hh;
+                n += 1;
+            }
+        }
+    }
+    for (nodes) |g| {
+        if (n >= out.len) break;
+        if (isTapCandidate(cam, vw, vh, g) and !containsHandle(out[0..n], g.handle)) {
+            out[n] = g.handle;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+// ============================================================================
 // ビューポート内包判定（見切れ自動検出。TASK-43 教訓）
 // ============================================================================
 
@@ -538,6 +632,80 @@ test "canvas: hitTestPalette inside/outside" {
     try testing.expectEqual(@as(?u8, 0), hitTestPalette(.{ .x = 50, .y = 30 }, &buttons));
     try testing.expectEqual(@as(?u8, 1), hitTestPalette(.{ .x = 50, .y = 60 }, &buttons));
     try testing.expectEqual(@as(?u8, null), hitTestPalette(.{ .x = 500, .y = 30 }, &buttons));
+}
+
+test "canvas: miniScopeRect sits directly below the node" {
+    const tl = Vec2f{ .x = 100, .y = 50 };
+    const sz = Vec2f{ .x = 120, .y = 60 };
+    const r = miniScopeRect(tl, sz);
+    try testing.expectApproxEqAbs(tl.x, r.x, 1e-4);
+    try testing.expectApproxEqAbs(tl.y + sz.y + MINI_GAP, r.y, 1e-4);
+    try testing.expectApproxEqAbs(MINI_W, r.w, 1e-4);
+    try testing.expectApproxEqAbs(MINI_H, r.h, 1e-4);
+}
+
+test "canvas: selectTapPorts — priority selected>hover>order, cap, zoom gate, n_out filter" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 0 }, // 出力なし → 非候補
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    const vw: f32 = 800;
+    const vh: f32 = 400;
+    var out: [8]Handle = undefined;
+    // selected=1, hover=0 → [1, 0, ...残り順]。handle 2 は n_out=0 で除外。
+    {
+        const n = selectTapPorts(cam, vw, vh, &nodes, 1, 0, &out);
+        try testing.expectEqual(@as(usize, 2), n);
+        try testing.expectEqual(@as(Handle, 1), out[0]); // selected 先頭
+        try testing.expectEqual(@as(Handle, 0), out[1]); // hover 次
+    }
+    // 選択/hover なし → node 並び順（handle 2 除外）。
+    {
+        const n = selectTapPorts(cam, vw, vh, &nodes, null, null, &out);
+        try testing.expectEqual(@as(usize, 2), n);
+        try testing.expectEqual(@as(Handle, 0), out[0]);
+        try testing.expectEqual(@as(Handle, 1), out[1]);
+    }
+    // zoom < MINI_ZOOM_MIN → 0 本。
+    {
+        const n = selectTapPorts(.{ .zoom = 0.3 }, vw, vh, &nodes, 1, 0, &out);
+        try testing.expectEqual(@as(usize, 0), n);
+    }
+    // cap: out 長 1 → 1 本（selected 優先）。
+    {
+        var one: [1]Handle = undefined;
+        const n = selectTapPorts(cam, vw, vh, &nodes, 1, 0, &one);
+        try testing.expectEqual(@as(usize, 1), n);
+        try testing.expectEqual(@as(Handle, 1), one[0]);
+    }
+}
+
+test "canvas: findTriggerStart locks periodic signal to a rising zero crossing; free-runs otherwise" {
+    // 1 周期 64 サンプルの正弦を 3 周期ぶん。disp=64 の表示窓は rising 交差に揃う。
+    var sine: [192]f32 = undefined;
+    for (&sine, 0..) |*s, i| s.* = @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / 64.0);
+    const start = findTriggerStart(&sine, 64);
+    try testing.expect(start + 64 <= sine.len); // slice 安全
+    try testing.expect(sine[start - 1] < 0.0 and sine[start] >= 0.0); // rising 交差に揃う
+    // 単極（ゼロを跨がない）は交差無し → 最新窓（非ロック）へ降格。
+    var uni: [192]f32 = undefined;
+    for (&uni, 0..) |*s, i| s.* = 0.5 + 0.4 * @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / 64.0);
+    try testing.expectEqual(uni.len - 64, findTriggerStart(&uni, 64));
+    // disp>=n はロック不能 → 0（全窓表示）。
+    try testing.expectEqual(@as(usize, 0), findTriggerStart(sine[0..32], 32));
+}
+
+test "canvas: selectTapPorts — offscreen node (out0 outside viewport) is not tapped" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 4000, .y = 60 }, .n_in = 0, .n_out = 1 }, // 画面外
+    };
+    var out: [8]Handle = undefined;
+    const n = selectTapPorts(.{ .zoom = 1.0 }, 800, 400, &nodes, null, null, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(Handle, 0), out[0]);
 }
 
 test "canvas: viewportContains — fit layout has zero offscreen at representative zoom" {

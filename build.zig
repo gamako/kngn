@@ -1179,6 +1179,14 @@ fn addPatchExe(
     exe.root_module.addImport("gui", common.gui);
     exe.root_module.addImport("modular", common.modular); // 動的グラフエンジン（dsp 依存のみ）
     exe.root_module.addImport("audio", common.audio); // L1 出力（RT callback で dyn.processBlock）
+    // TASK-40.8: 信号可視化（C: master scope/spectrogram/level meter）。run-modular と同型の配線。
+    exe.root_module.addImport("synth", common.synth); // SampleTap（Audio→GUI 出力タップ）
+    exe.root_module.addImport("dsp", common.dsp); // mono downmix + FFT（spectrogram）
+    const patch_spec_mod = b.createModule(.{ .root_source_file = b.path("apps/synth/spectrogram.zig") });
+    patch_spec_mod.addImport("dsp", common.dsp);
+    exe.root_module.addImport("spectrogram", patch_spec_mod);
+    const patch_scope_mod = b.createModule(.{ .root_source_file = b.path("apps/synth/scope.zig") });
+    exe.root_module.addImport("scope", patch_scope_mod);
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);

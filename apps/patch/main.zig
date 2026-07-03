@@ -24,6 +24,10 @@ const platform = @import("platform");
 const gui = @import("gui");
 const modular = @import("modular");
 const audio = @import("audio");
+const synth = @import("synth"); // SampleTap（Audio→GUI 出力タップ。C の master 可視化）
+const dsp = @import("dsp"); // mono downmix
+const spectrogram = @import("spectrogram");
+const scope = @import("scope");
 const canvas = @import("canvas.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
@@ -41,6 +45,9 @@ const MAX_MODULES = modular.dyn.MAX_MODULES;
 const MAX_OUT = modular.signal.MAX_OUT;
 const MAX_IN = modular.signal.MAX_IN;
 const MAX_EDGES = MAX_MODULES * MAX_IN;
+// TASK-40.8 D: per-port tap 定数（modular が単一ソース）。
+const TAP_SLOTS = modular.graph_core.TAP_SLOTS;
+const TAP_RING = modular.graph_core.TAP_RING;
 
 // group.zig は modular 非依存のため GROUP_HANDLE_BASE(=48) を定数複製している。数値の食い違い
 // （dyn.zig の MAX_MODULES 変更を group.zig 側へ反映し忘れる等）を compile time に検出する。
@@ -51,8 +58,25 @@ comptime {
 }
 
 const WIN_W = 960;
-const WIN_H = 600;
+// TASK-40.8: 下部に可視化帯（VIS_H）を足したぶん高くする（キャンバス有効高 = fb_h - VIS_H）。
+const WIN_H = 760;
 const BG: u32 = 0xFF12161B;
+
+// ---- 可視化帯（C: master scope/spectrogram/level meter）。画面下端の固定帯。----
+const VIS_H = 150; // 帯の高さ（キャンバス有効領域 = fb_h - VIS_H）
+const VIS_LABEL_H = 16; // 帯上端のラベル行
+const VIS_MARGIN = 6; // 帯内の下端余白
+const VIS_DRAW_H = VIS_H - VIS_LABEL_H - VIS_MARGIN; // spec/scope の描画高（comptime）
+const SPEC_X0 = 16;
+const SPEC_W = 500;
+const SCOPE_X0 = SPEC_X0 + SPEC_W + 12; // 528
+const SCOPE_W = 300;
+const METER_X0 = SCOPE_X0 + SCOPE_W + 12; // 840
+const METER_W = 48;
+const VIS_BG: u32 = 0xFF0A0E12; // 帯の下地
+const Spec = spectrogram.Spectrogram(SPEC_W, VIS_DRAW_H);
+const Scope = scope.Oscilloscope(SCOPE_W, VIS_DRAW_H);
+const Tap = synth.SampleTap(8192);
 
 const NODE_BG = gui.Color.rgba(0x24, 0x2A, 0x33, 0xFF);
 const BORDER_COL = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
@@ -67,6 +91,17 @@ fn portColor(k: PortKind) gui.Color {
         .cv => gui.Color.rgba(0x50, 0x90, 0xE0, 0xFF), // 青
         .gate => gui.Color.rgba(0x60, 0xC0, 0x70, 0xFF), // 緑
     };
+}
+
+/// A: ポート色を活性度 level(0..1+) で明滅させる。base を 0.30..1.0 の範囲で明度スケール（消灯でも視認可）。
+fn litColor(base: gui.Color, level: f32) gui.Color {
+    const t = 0.30 + 0.70 * std.math.clamp(level, 0.0, 1.0);
+    const sc = struct {
+        fn f(v: u8, k: f32) u8 {
+            return @intFromFloat(std.math.clamp(@as(f32, @floatFromInt(v)) * k, 0.0, 255.0));
+        }
+    }.f;
+    return gui.Color.rgba(sc(base.r, t), sc(base.g, t), sc(base.b, t), base.a);
 }
 
 const CableRef = canvas.CableRef;
@@ -150,6 +185,28 @@ const App = struct {
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
 
+    // TASK-40.8 C: master 出力タップ + 直近ブロックの rms/peak（viz probe 用。GUI スレッド更新）。
+    tap: Tap = .{},
+    master_rms: f32 = 0,
+    master_peak: f32 = 0,
+
+    // TASK-40.8 A: 出力ポート活性度の peak-hold（GUI ローカル・RT 影響ゼロ）。[handle][out]。
+    port_level: [MAX_MODULES][MAX_OUT]f32 = [_][MAX_OUT]f32{[_]f32{0} ** MAX_OUT} ** MAX_MODULES,
+
+    // TASK-40.8 D: per-port tap 状態（GUI 所有）。slot i は tap_display[i]（描画用 display handle）を
+    // tap_ports[i]（実 global port id・-1=空き）へ写す。tap_slot_seq[i] = その割当を publish した seq。
+    tap_display: [TAP_SLOTS]Handle = [_]Handle{0} ** TAP_SLOTS,
+    tap_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS,
+    tap_slot_seq: [TAP_SLOTS]u32 = [_]u32{0} ** TAP_SLOTS,
+    tap_count: usize = 0,
+    tap_seq: u32 = 0,
+
+    /// キャンバス有効高（画面下端の可視化帯を除いた領域）。見切れ判定・ヒットテスト・tap 対象選択で共通に使う。
+    fn canvasH(self: *const App) f32 {
+        const fh: f32 = @floatFromInt(self.fb_h);
+        return @max(0.0, fh - VIS_H);
+    }
+
     /// 実 handle の生ノード列（dyn 由来。合成 handle は含まない）。フレーム毎。
     fn buildRawNodes(self: *const App, out: []NodeGeom) usize {
         var n: usize = 0;
@@ -227,7 +284,8 @@ const App = struct {
     }
 };
 
-// RT audio callback: dyn.processBlock のみ（同期/alloc/lock/IO/panic なし）。facade が自動 tap。
+// RT audio callback: dyn.processBlock のみ（同期/alloc/lock/IO/panic なし）。facade が audio probe を自動 tap。
+// C 用の master 可視化タップ（SampleTap.write。空き不足は丸ごと drop・非ブロッキング。RT 実績パターン）。
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
     _ = sample_rate;
     const app: *App = @ptrCast(@alignCast(userdata orelse {
@@ -235,6 +293,7 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
         return;
     }));
     app.dyn.processBlock(buf, frames, channels);
+    if (channels == 2) app.tap.write(buf);
 }
 
 // ============================================================================
@@ -360,7 +419,11 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         while (i < g.n_out) : (i += 1) {
             const p = cam.worldToScreen(canvas.outPortPos(g, i));
             const kind = portKindOut(app, g.handle, i);
-            fillCircle(dl, p, r, portColor(kind));
+            // A: 出力ポート丸を活性度で明滅（peak-hold + decay。RT 影響ゼロ）。活性時は halo を先に、その上に明るい dot。
+            const lvl = outPortLevel(app, g.handle, i);
+            const base = portColor(kind);
+            if (lvl > 0.12) fillCircle(dl, p, r + 2, litColor(base, lvl * 0.5));
+            fillCircle(dl, p, r, litColor(base, lvl));
             if (hoverPort(app, g.handle, false, i)) dl.rectOutline(portBox(p, r), HOVER_COL, 1) catch {};
         }
     }
@@ -370,6 +433,9 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         if (!gr.active or gr.collapsed) continue;
         drawExpandedGroupFrame(app, dl, cam, nodes, @intCast(gi), gr);
     }
+
+    // D: tap 中ポートのミニ oscilloscope（ノード直下）。
+    drawMiniScopes(app, dl, nodes);
 
     // pending cable（接続 drag 中: origin ポート → カーソル）
     if (app.drag == .cable) {
@@ -694,6 +760,11 @@ fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const
 }
 
 fn updateHover(app: *App) void {
+    // 可視化帯の上ではキャンバスの hover を出さない。
+    if (app.mouse.y >= app.canvasH()) {
+        app.hover = null;
+        return;
+    }
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     var edge_buf: [MAX_EDGES]group.DisplayEdge = undefined;
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
@@ -716,6 +787,12 @@ fn onMouseDown(app: *App) void {
     const buttons = paletteButtons();
     if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
         addByPaletteIndex(app, ki) catch {}; // PoolFull/TooManyModules は無視（追加せず）
+        return;
+    }
+    // 下端の可視化帯上のクリックはキャンバス操作にしない（選択/pan/配線を開始しない）。
+    if (app.mouse.y >= app.canvasH()) {
+        app.selected = null;
+        app.drag = .none;
         return;
     }
     const mw = app.camera.screenToWorld(app.mouse);
@@ -1022,6 +1099,245 @@ fn onMouseMove(app: *App) void {
     }
 }
 
+// ============================================================================
+// TASK-40.8 A/D: ポート活性度の更新 + tap 対象の選択・publish。
+// ============================================================================
+const MINI_BG = gui.Color.rgba(0x0A, 0x0E, 0x12, 0xFF);
+// ミニスコープの表示サンプル数（間引き後）。トリガ探索の余地（残り窓）を残すため TAP_RING より小さくする。
+// 128 点(間引き後)≒10.6ms は 110Hz(周期 9ms)なら 1 周期以上を探索範囲に含みロックできる。
+const MINI_DISP: usize = 128;
+
+/// selected/hover の Item から tap 優先度に使う display handle を取り出す（node/group のみ）。
+fn itemHandle(item: ?Item) ?Handle {
+    if (item) |it| {
+        return switch (it) {
+            .node => |h| h,
+            .group => |gid| group.handleOfGroup(gid),
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// display handle（実 or 合成箱）を実 global 出力 port id（handle*MAX_OUT+out）へ解決。out0 を代表とする。
+/// 解決不能（出力なし/非 active/合成箱の expose なし）は -1。合成 handle を dyn へ渡さない規約を守る。
+fn resolveTapPort(app: *const App, dh: Handle) i32 {
+    if (group.groupIdFromHandle(dh)) |gid| {
+        const g = app.ledger.groups[gid];
+        if (g.n_out == 0) return -1;
+        const ref = g.exposed_out[0];
+        if (!app.dyn.slotActive(ref.member) or app.dyn.nOut(ref.member) <= ref.port) return -1;
+        return @intCast(@as(u32, ref.member) * MAX_OUT + ref.port);
+    }
+    if (!app.dyn.slotActive(dh) or app.dyn.nOut(dh) == 0) return -1;
+    return @intCast(@as(u32, dh) * MAX_OUT); // out0
+}
+
+/// display handle の出力ポート i の活性度（合成箱は exposed_out[i] の実メンバー活性度へ解決）。
+fn outPortLevel(app: *const App, dh: Handle, i: u8) f32 {
+    if (group.groupIdFromHandle(dh)) |gid| {
+        const g = app.ledger.groups[gid];
+        if (i >= g.n_out) return 0;
+        const ref = g.exposed_out[i];
+        if (ref.member >= MAX_MODULES or ref.port >= MAX_OUT) return 0;
+        return app.port_level[ref.member][ref.port];
+    }
+    if (dh >= MAX_MODULES or i >= MAX_OUT) return 0;
+    return app.port_level[dh][i];
+}
+
+/// フレーム毎: A（全出力ポート活性度の peak-hold 減衰）+ D（tap 対象選択・変化時のみ config publish）。
+fn updateViz(app: *App) void {
+    // A: 全 active ノードの出力ポート活性度を peak-hold + 減衰（RT 影響ゼロの sigLevel を読むだけ）。
+    const decay: f32 = 0.90;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) {
+            app.port_level[h] = [_]f32{0} ** MAX_OUT;
+            continue;
+        }
+        const no = app.dyn.nOut(h);
+        var o: u8 = 0;
+        while (o < MAX_OUT) : (o += 1) {
+            app.port_level[h][o] = if (o < no) @max(app.dyn.sigLevel(h, o), app.port_level[h][o] * decay) else 0;
+        }
+    }
+
+    // D: tap 対象選択（viewport 内・上限 TAP_SLOTS・優先度）→ port 割当が変わった時だけ publish。
+    var node_buf: [MAX_MODULES]NodeGeom = undefined;
+    const nodes = node_buf[0..app.buildNodes(&node_buf)];
+    var handles: [TAP_SLOTS]Handle = undefined;
+    const sel = itemHandle(app.selected);
+    const hov = itemHandle(app.hover);
+    const n = canvas.selectTapPorts(app.camera, @floatFromInt(app.fb_w), app.canvasH(), nodes, sel, hov, &handles);
+
+    var new_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS;
+    // ポート種別ごとに間引き率・reduce を決める（audio=細かい波形 / cv=粗い変調 / gate=粗い peak バー）。
+    var new_decim: [TAP_SLOTS]u32 = [_]u32{modular.graph_core.TAP_DECIM} ** TAP_SLOTS;
+    var new_peak: [TAP_SLOTS]bool = [_]bool{false} ** TAP_SLOTS;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        new_ports[i] = resolveTapPort(app, handles[i]);
+        if (new_ports[i] < 0) continue;
+        switch (portKindOut(app, handles[i], 0)) {
+            .audio => {
+                new_decim[i] = modular.graph_core.TAP_DECIM;
+                new_peak[i] = false;
+            },
+            .cv => {
+                new_decim[i] = modular.graph_core.TAP_DECIM_SLOW;
+                new_peak[i] = false;
+            },
+            .gate => {
+                new_decim[i] = modular.graph_core.TAP_DECIM_SLOW;
+                new_peak[i] = true;
+            },
+        }
+    }
+
+    // 変化検出は port 割当のみで足りる（decim/peak は port の種別に従属＝port 不変なら不変）。
+    var changed = false;
+    var s: usize = 0;
+    while (s < TAP_SLOTS) : (s += 1) {
+        if (new_ports[s] != app.tap_ports[s]) {
+            changed = true;
+            break;
+        }
+    }
+    if (changed) {
+        app.tap_seq += 1;
+        s = 0;
+        while (s < TAP_SLOTS) : (s += 1) {
+            if (new_ports[s] != app.tap_ports[s]) app.tap_slot_seq[s] = app.tap_seq;
+        }
+        app.tap_ports = new_ports;
+        app.dyn.publishTapConfig(.{ .seq = app.tap_seq, .ports = new_ports, .decim = new_decim, .peak = new_peak });
+    }
+    // 描画用 display handle と本数は毎フレーム更新（ノード drag に座標追従。publish とは独立）。
+    s = 0;
+    while (s < n) : (s += 1) app.tap_display[s] = handles[s];
+    app.tap_count = n;
+}
+
+/// tap 中の各ポートのミニ oscilloscope をノード直下に描く（フレーム毎・≤16 個 × 64×28px）。
+/// applied_seq gate: RT が当該 slot の port 割当を反映済みでなければトレースを描かない（旧 port 混入防止）。
+fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
+    const applied = app.dyn.tapAppliedSeq();
+    var win: [TAP_RING]f32 = undefined;
+    var slot: usize = 0;
+    while (slot < app.tap_count) : (slot += 1) {
+        if (app.tap_ports[slot] < 0) continue;
+        const dh = app.tap_display[slot];
+        const g = findNode(nodes, dh) orelse continue;
+        const tl = app.camera.worldToScreen(g.pos);
+        const sz = canvas.nodeSize(g).scale(app.camera.zoom);
+        const lr = canvas.miniScopeRect(tl, sz);
+        const rect = gui.Rect{ .x = safeI32(lr.x), .y = safeI32(lr.y), .w = safeU32(lr.w), .h = safeU32(lr.h) };
+        const kind = portKindOut(app, dh, 0);
+        const col = portColor(kind);
+        dl.rectFilled(rect, MINI_BG) catch {};
+        dl.rectOutline(rect, col, 1) catch {};
+        if (applied < app.tap_slot_seq[slot]) continue; // 未適用 slot は空窓（枠のみ）
+        const nsamp = app.dyn.tapWindow(slot, &win);
+        if (nsamp >= 2) {
+            // audio は rising zero-crossing トリガで波形を静止（形が読みやすい・探索の余地に MINI_DISP 窓）。
+            // cv/gate は非ロックで全窓を流す（gate=peak バーのタイミング、cv=ゆっくりした変調をなるべく長く見せる）。
+            const disp = if (kind == .audio) @min(nsamp, MINI_DISP) else nsamp;
+            const start = if (kind == .audio) canvas.findTriggerStart(win[0..nsamp], disp) else 0;
+            drawMiniTrace(dl, rect, kind, win[start .. start + disp], col);
+        }
+    }
+}
+
+/// ミニスコープのトレース。audio は中央線基準(-1..1)の polyline、cv は下基準(0..1)の polyline、
+/// gate は下基準のインパルス・バー（high の列を baseline から縦線で塗る＝疎なパルス列を見やすく）。
+fn drawMiniTrace(dl: *gui.DrawList, rect: gui.Rect, kind: PortKind, samples: []const f32, col: gui.Color) void {
+    const n = samples.len;
+    if (n < 2 or rect.w < 2) return;
+    const w: usize = rect.w;
+    const top: f32 = @floatFromInt(rect.y);
+    const hh: f32 = @floatFromInt(rect.h);
+    const bottom = top + hh - 1;
+    const mid = top + (hh - 1) * 0.5;
+    const by = safeI32(bottom);
+
+    if (kind == .gate) {
+        // 疎なパルス列は polyline だと 1px スパイクで見えにくい → high の列を baseline から縦バーで塗る。
+        // 列側から間引くと疎な high を取りこぼすので、全サンプルを走査して列へ写す（どの high も必ず 1 本になる）。
+        var si: usize = 0;
+        while (si < n) : (si += 1) {
+            const s = std.math.clamp(samples[si], 0.0, 1.0);
+            if (s > 0.05) {
+                const px = rect.x + @as(i32, @intCast(si * (w - 1) / (n - 1)));
+                dl.line(.{ .x = px, .y = by }, .{ .x = px, .y = safeI32(bottom - s * (hh - 1)) }, col, 1) catch {};
+            }
+        }
+        return;
+    }
+
+    var prev: ?gui.Vec2 = null;
+    var xc: usize = 0;
+    while (xc < w) : (xc += 1) {
+        const s = samples[xc * (n - 1) / (w - 1)];
+        const py: f32 = switch (kind) {
+            .audio => mid - std.math.clamp(s, -1.0, 1.0) * ((hh - 1) * 0.5),
+            .cv, .gate => bottom - std.math.clamp(s, 0.0, 1.0) * (hh - 1),
+        };
+        const pt = gui.Vec2{ .x = rect.x + @as(i32, @intCast(xc)), .y = safeI32(py) };
+        if (prev) |pp| dl.line(pp, pt, col, 1) catch {};
+        prev = pt;
+    }
+}
+
+// ============================================================================
+// C: master 出力の可視化帯（画面下端）。spectrogram / oscilloscope / level meter を直描き。
+// 帯下地は @memset の一括塗り（不透明・行連続＝新設の全画素ループを書かない。性能規約）。
+// spec/osc/meter.draw は apps/synth の既存実装の流用（新規全画素ループ無し）。フレーム毎。
+// ============================================================================
+const FreqLabel = struct { hz: f32, text: []const u8 };
+const FREQ_LABELS = [_]FreqLabel{
+    .{ .hz = 100, .text = "100Hz" },
+    .{ .hz = 1000, .text = "1kHz" },
+    .{ .hz = 10000, .text = "10kHz" },
+};
+
+fn drawVizBand(app: *const App, fb: platform.Framebuffer, spec: *const Spec, osc: *const Scope, meter: *const scope.LevelMeter) void {
+    const fb_w = fb.width;
+    const band_y0: usize = @intFromFloat(app.canvasH());
+    if (band_y0 >= fb.height) return;
+    // 帯下地: 行連続なので単一 @memset（全画素ループを書かない）。
+    const start = band_y0 * fb_w;
+    const end = fb.height * fb_w;
+    if (start < end and end <= fb.pixels.len) @memset(fb.pixels[start..end], VIS_BG);
+
+    const draw_y = band_y0 + VIS_LABEL_H;
+    spec.draw(fb.pixels, fb_w, fb.height, SPEC_X0, draw_y);
+    osc.draw(fb.pixels, fb_w, fb.height, SCOPE_X0, draw_y);
+    meter.draw(fb.pixels, fb_w, fb.height, METER_X0, draw_y, METER_W, VIS_DRAW_H);
+
+    // ラベル（帯上端の 16px 行）。
+    const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb_w, .height = fb.height };
+    const clip: gui.Rect = .{ .x = 0, .y = 0, .w = @intCast(fb_w), .h = @intCast(fb.height) };
+    const label_col = gui.Color.rgba(0xC8, 0xD0, 0xD8, 0xFF);
+    const ly: i32 = @intCast(band_y0 + 3);
+    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = ly }, "SPECTROGRAM", label_col, clip);
+    gui.default_bitmap_font.drawTo(target, .{ .x = SCOPE_X0, .y = ly }, "SCOPE (master)", label_col, clip);
+    gui.default_bitmap_font.drawTo(target, .{ .x = @intCast(METER_X0), .y = ly }, "LVL", label_col, clip);
+
+    // spectrogram の周波数目盛り。
+    const tick_col: u32 = 0xFFFFFFFF;
+    for (FREQ_LABELS) |fl| {
+        const off = spec.rowOffsetForFreq(fl.hz) orelse continue;
+        const tick_y = draw_y + off;
+        if (tick_y >= fb.height) continue;
+        var tx: usize = SPEC_X0;
+        while (tx < SPEC_X0 + 6) : (tx += 1) {
+            if (tx < fb_w) fb.pixels[tick_y * fb_w + tx] = tick_col;
+        }
+        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = @intCast(tick_y) }, fl.text, label_col, clip);
+    }
+}
+
 pub fn main() !void {
     std.debug.print("apps/patch: パッチキャンバス（drag=move/pan, scroll=zoom, ESC で終了）\n", .{});
     const allocator = std.heap.c_allocator;
@@ -1063,8 +1379,19 @@ pub fn main() !void {
     var dl = gui.DrawList.init(allocator);
     defer dl.deinit();
 
+    // C: master 可視化（spectrogram/oscilloscope/level meter）。comptime サイズが大きいので heap 確保。
+    const spec = try allocator.create(Spec);
+    defer allocator.destroy(spec);
+    spec.init(48000);
+    spec.setSampleRate(sr);
+    const osc = try allocator.create(Scope);
+    defer allocator.destroy(osc);
+    osc.* = .{};
+    var meter = scope.LevelMeter{};
+
     platform.registerProbe(.{ .name = "patch", .ctx = &app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
     platform.registerProbe(.{ .name = "group", .ctx = &app, .ext = "json", .snapshot = null, .digest = groupDigest });
+    platform.registerProbe(.{ .name = "viz", .ctx = &app, .ext = "json", .snapshot = vizSnapshot, .digest = vizDigest });
 
     device.start() catch |err| {
         std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
@@ -1073,12 +1400,37 @@ pub fn main() !void {
     defer device.stop();
     std.debug.print("apps/patch: ドラッグでポート間を配線 / パレットで追加 / Delete で削除 / scroll=zoom。音が鳴ります。\n", .{});
 
+    var stereo: [2048]f32 = undefined;
+    var mono: [1024]f32 = undefined;
     var running = true;
     main_loop: while (running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
         app.fb_w = fb.width;
         app.fb_h = fb.height;
+
+        // C: master タップを読み → mono downmix → spec/osc/meter へ供給。直近ブロックの rms/peak を latch。
+        var frame_sumsq: f64 = 0;
+        var frame_n: usize = 0;
+        var frame_peak: f32 = 0;
+        while (true) {
+            const n = app.tap.read(&stereo);
+            if (n < 2) break;
+            const frames = n / 2;
+            dsp.downmixStereoToMono(stereo[0 .. frames * 2], mono[0..frames]);
+            spec.feed(mono[0..frames]);
+            osc.feed(mono[0..frames]);
+            meter.feed(mono[0..frames]);
+            for (mono[0..frames]) |s| {
+                frame_sumsq += @as(f64, s) * @as(f64, s);
+                frame_peak = @max(frame_peak, @abs(s));
+            }
+            frame_n += frames;
+        }
+        if (frame_n > 0) {
+            app.master_rms = @floatCast(@sqrt(frame_sumsq / @as(f64, @floatFromInt(frame_n))));
+            app.master_peak = frame_peak;
+        }
 
         while (window.nextEvent()) |ev| {
             switch (ev) {
@@ -1113,14 +1465,19 @@ pub fn main() !void {
             }
         }
 
+        // A/D: 活性度更新 + tap 対象の選択・publish（描画の直前・イベント反映後）。
+        updateViz(&app);
+
         @memset(fb.pixels, BG);
         dl.reset(fb.width, fb.height);
         drawFrame(&app, &dl);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &dl, gui.default_font);
+        // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
+        drawVizBand(&app, fb, spec, osc, &meter);
 
         window.present();
-        platform.sleep(16_000_000);
+        platform.frameDelay(16_000_000);
     }
     std.debug.print("apps/patch: done.\n", .{});
 }
@@ -1136,7 +1493,8 @@ fn offscreenOf(app: *const App) canvas.OffscreenCounts {
     var edge_buf: [MAX_EDGES]Edge = undefined;
     const nodes = node_buf[0..app.buildRawNodes(&node_buf)];
     const edges = edge_buf[0..app.buildFlatEdges(&edge_buf)];
-    return canvas.viewportContains(app.camera, @floatFromInt(app.fb_w), @floatFromInt(app.fb_h), nodes, edges);
+    // 見切れ判定の有効領域はキャンバス高（下端の可視化帯を除く）。帯に隠れるノードも「見切れ」に数える。
+    return canvas.viewportContains(app.camera, @floatFromInt(app.fb_w), app.canvasH(), nodes, edges);
 }
 
 fn patchDigest(ctx: *anyopaque, buf: []u8) []const u8 {
@@ -1261,4 +1619,89 @@ fn groupDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const tail = std.fmt.bufPrint(buf[off..], "]}}", .{}) catch return errDigest(buf);
     off += tail.len;
     return buf[0..off];
+}
+
+// ============================================================================
+// harness custom probe（TASK-40.8）: `viz` — 信号可視化データ。
+//   C: master rms/peak（下帯 scope/spectrogram の実信号レベル）
+//   A: per-port レベル（ports[]。sigLevel 由来・RT 影響ゼロの torn read）
+//   D: tap 中の port と直近窓の状態（taps[]。wpos / applied 済みか）
+// digest は framework 固定 1024B 以内。snapshot は各 tap 窓の min/max/nz を追加。
+// ============================================================================
+fn vizDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    // 末尾 "]}" 用に 2B 予約して常に閉じた JSON を返す（overflow でも壊れた断片を返さない）。
+    // キーは短縮（h/o/k/w/ap/lv）。16 tap × 最悪 wpos 10 桁でも 1024B 内に収まる見積り。
+    if (buf.len < 8) return errDigest(buf);
+    const cap = buf.len - 2;
+    var off: usize = 0;
+    {
+        const head = std.fmt.bufPrint(buf[0..cap], "{{\"master\":{{\"rms\":{d:.4},\"peak\":{d:.4}}},\"taps\":[", .{ app.master_rms, app.master_peak }) catch return errDigest(buf);
+        off += head.len;
+    }
+    const applied = app.dyn.tapAppliedSeq();
+    var first = true;
+    for (0..modular.graph_core.TAP_SLOTS) |s| {
+        const gp = app.tap_ports[s];
+        if (gp < 0) continue;
+        const gpu: u32 = @intCast(gp);
+        const h: Handle = @intCast(gpu / MAX_OUT);
+        const out: u8 = @intCast(gpu % MAX_OUT);
+        const applied_ok = applied >= app.tap_slot_seq[s];
+        const wpos = app.dyn.tapWpos(s);
+        const lvl = app.dyn.sigLevel(h, out);
+        const kn = @tagName(portKindOfReal(app, h, out));
+        const sep: []const u8 = if (first) "" else ",";
+        const piece = std.fmt.bufPrint(buf[off..cap], "{s}{{\"h\":{d},\"o\":{d},\"k\":\"{s}\",\"w\":{d},\"ap\":{d},\"lv\":{d:.4}}}", .{
+            sep, h, out, kn, wpos, @as(u8, if (applied_ok) 1 else 0), lvl,
+        }) catch break; // 入り切らなければそこで打ち切り（tail で必ず閉じる）
+        off += piece.len;
+        first = false;
+    }
+    const tail = std.fmt.bufPrint(buf[off..], "]}}", .{}) catch return errDigest(buf); // 予約済みなので必ず成功
+    off += tail.len;
+    return buf[0..off];
+}
+
+/// 実 handle/out の信号種別（合成 handle は来ない＝tap_ports は実 global port id のみ）。
+fn portKindOfReal(app: *const App, h: Handle, out: u8) PortKind {
+    return app.dyn.outKindOf(h, out) orelse .audio;
+}
+
+fn vizSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    var dbuf: [1024]u8 = undefined;
+    const d = vizDigest(ctx, &dbuf);
+    const body = if (d.len > 0 and d[d.len - 1] == '}') d[0 .. d.len - 1] else d;
+    var out: [4096]u8 = undefined;
+    var off: usize = 0;
+    {
+        const piece = std.fmt.bufPrint(out[off..], "{s},\"windows\":[", .{body}) catch return allocator.dupe(u8, d);
+        off += piece.len;
+    }
+    var win: [modular.graph_core.TAP_RING]f32 = undefined;
+    var first = true;
+    for (0..modular.graph_core.TAP_SLOTS) |s| {
+        if (app.tap_ports[s] < 0) continue;
+        const n = app.dyn.tapWindow(s, &win);
+        var mn: f32 = 0;
+        var mx: f32 = 0;
+        var nz: usize = 0;
+        if (n > 0) {
+            mn = win[0];
+            mx = win[0];
+            for (win[0..n]) |v| {
+                mn = @min(mn, v);
+                mx = @max(mx, v);
+                if (v != 0) nz += 1;
+            }
+        }
+        const sep: []const u8 = if (first) "" else ",";
+        first = false;
+        const piece = std.fmt.bufPrint(out[off..], "{s}{{\"slot\":{d},\"n\":{d},\"min\":{d:.4},\"max\":{d:.4},\"nz\":{d}}}", .{ sep, s, n, mn, mx, nz }) catch break;
+        off += piece.len;
+    }
+    const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch "";
+    off += tail.len;
+    return allocator.dupe(u8, out[0..off]);
 }
