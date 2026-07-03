@@ -93,7 +93,7 @@ pub const Window = struct {
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
         if (harness.isHeadlessActive()) {
-            harness.createHeadlessWindow(width, height);
+            harness.createHeadlessWindow(width, height) catch return error.WindowCreationFailed;
             return .{ .inner = undefined, .headless = true };
         }
         return .{ .inner = try backend.Window.create(width, height, title), .headless = false };
@@ -180,7 +180,11 @@ pub fn shutdown() void {
 }
 
 pub fn getTime() f64 {
-    if (harness.isEnabled()) return harness.now();
+    // isHeadlessActive() も見るのは意図的: headless は backend.init() 自体をスキップしているため、
+    // script 読込失敗等で transport が最終的に `.disabled`（isEnabled()==false）になっても
+    // backend.getTime() を呼んではいけない（未初期化 backend 参照になる）。仮想クロックは
+    // backend に依存せず常に安全に呼べる。
+    if (harness.isEnabled() or harness.isHeadlessActive()) return harness.now();
     return backend.getTime();
 }
 
@@ -236,6 +240,9 @@ pub fn sleep(nanoseconds: u64) void {
 /// replay 速度の律速要因）。harness 無効時は `sleep()` と同じ。main/examples の frame-wait 呼び出しは
 /// これに置き換える（`sleep()` 自体はフレームウェイト以外の用途向けに残す）。
 pub fn frameDelay(nanoseconds: u64) void {
-    if (harness.isEnabled()) return;
+    // isHeadlessActive() も見る（getTime()/audio.open() と同じ理由）。headless 指定時に transport が
+    // 最終的に disabled でも実時間 sleep で main loop を止めない（pollGate が既に false を返し
+    // ループを終える構成なので実害は薄いが、判定を統一しておく）。
+    if (harness.isEnabled() or harness.isHeadlessActive()) return;
     sleep(nanoseconds);
 }

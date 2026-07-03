@@ -112,8 +112,14 @@ pub const AudioDevice = struct {
 /// - harness 有効時: ユーザーの render callback を harness trampoline で包み、出力を audio probe へ流す。
 ///   - **headless 時（TASK-32.4 P4）**: 実 OS デバイスの代わりに null デバイス（`audio_null.zig`）を開く
 ///     （実デバイス無し・実時間 pull スレッド）。
+///
+/// `isHeadlessActive()` を `isEnabled()` より先に判定するのは意図的: headless は
+/// `VP_HARNESS_HEADLESS` の env 存在だけで決まり、script 読込失敗等で transport が
+/// 最終的に `.disabled` になっても真になり得る（`platform.zig` の `backend.init()` 自体を
+/// スキップする判断と対）。ここで `isEnabled()` を先に見ると、その edge case で
+/// headless 指定なのに実オーディオデバイスを開いてしまう不整合が起きる。
 pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
-    if (!harness.isEnabled()) {
+    if (!harness.isEnabled() and !harness.isHeadlessActive()) {
         const inner = try backend.open(allocator, cfg);
         return .{ .inner = .{ .native = inner }, .wrapped = null };
     }

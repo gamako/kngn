@@ -421,11 +421,14 @@ pub const HeadlessFramebufferView = struct { pixels: []u32, width: u32, height: 
 
 /// facade の `Window.create` が headless 時に呼ぶ。単一 window 前提（既存の module-level 設計を踏襲）。
 /// w*h の CPU framebuffer を確保する（初回は alloc、以降はサイズ一致なら再利用・不一致なら再確保）。
-pub fn createHeadlessWindow(width: u32, height: u32) void {
+/// alloc 失敗時は `error.OutOfMemory`（native 経路の `Window.create` が `Error!Window` を返すのと
+/// 対称に、facade 側で `error.WindowCreationFailed` へ畳めるよう panic ではなく伝播する）。
+pub fn createHeadlessWindow(width: u32, height: u32) std.mem.Allocator.Error!void {
     const n = @as(usize, width) * @as(usize, height);
     if (headless_pixels.len != n) {
         if (headless_pixels.len > 0) gpa.free(headless_pixels);
-        headless_pixels = gpa.alloc(u32, n) catch @panic("harness: headless framebuffer alloc failed");
+        headless_pixels = &.{};
+        headless_pixels = try gpa.alloc(u32, n);
     }
     @memset(headless_pixels, 0);
     headless_w = width;
@@ -1438,7 +1441,7 @@ test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイ�
     resetForTest();
     defer destroyHeadlessWindow();
 
-    createHeadlessWindow(2, 2);
+    try createHeadlessWindow(2, 2);
     var view = headlessLock();
     try testing.expectEqual(@as(u32, 2), view.width);
     try testing.expectEqual(@as(u32, 2), view.height);
@@ -1452,7 +1455,7 @@ test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイ�
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[3]);
 
     // サイズ変更で再確保される（前回の内容を引きずらない: create 直後は 0 クリア）
-    createHeadlessWindow(3, 1);
+    try createHeadlessWindow(3, 1);
     view = headlessLock();
     try testing.expectEqual(@as(usize, 3), view.pixels.len);
     try testing.expectEqual(@as(u32, 0), view.pixels[0]);
