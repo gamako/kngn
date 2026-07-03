@@ -35,11 +35,14 @@ pub const ZOOM_MAX: f32 = 4.0;
 pub const CABLE_HIT_SLOP: f32 = 6; // world 単位のケーブル当たり判定しきい値
 
 /// 描画側が渡すノード幾何。pos は world 左上。
+/// grid_rows>0 は畳みマクロ箱（TASK-40.7.2）: 本体に TR/303 grid を描くため、ポート数由来の高さに加えて
+/// grid 行数ぶんの高さを nodeSize で確保する（ヒットテスト矩形も同じ高さになり整合）。0 は通常ノード。
 pub const NodeGeom = struct {
     handle: Handle,
     pos: Vec2f,
     n_in: u8,
     n_out: u8,
+    grid_rows: u8 = 0,
 };
 
 /// 出力ポート src_out → 入力ポート dst_in の接続（単一接続なので dst で一意）。
@@ -110,8 +113,12 @@ fn rowCount(g: NodeGeom) f32 {
 }
 
 /// ノードの world サイズ（幅固定・高さはポート数依存＝見切れ防止のため十分な高さ）。
+/// grid_rows>0（畳みマクロ箱）は grid が収まる高さと比べて大きい方を採る。
 pub fn nodeSize(g: NodeGeom) Vec2f {
-    return .{ .x = NODE_W, .y = TITLE_H + PORT_SPACING * rowCount(g) + BODY_PAD };
+    const port_h = TITLE_H + PORT_SPACING * rowCount(g) + BODY_PAD;
+    if (g.grid_rows == 0) return .{ .x = NODE_W, .y = port_h };
+    const grid_h = TITLE_H + gridBlockHeight(g.grid_rows) + BODY_PAD;
+    return .{ .x = NODE_W, .y = @max(port_h, grid_h) };
 }
 
 /// 入力ポート i の world 中心（左辺）。
@@ -230,6 +237,57 @@ pub fn hitTestToggle(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
         i -= 1;
         const g = nodes[i];
         if (pointInToggle(world_pt, g)) return g.handle;
+    }
+    return null;
+}
+
+// ----------------------------------------------------------------------------
+// 畳みマクロ箱の TR/303 grid 幾何（TASK-40.7.2）。box ローカル座標（箱左上を原点とする world 単位）だけを
+// 扱う純関数。platform/gui 非依存で test-patch から単体テストできる。描画側（main.zig）は各セル矩形を
+// box.pos + cellRect で world → screen 変換して塗る。クリックは box ローカル点で hitTestGridCell。
+// ----------------------------------------------------------------------------
+pub const GRID_STEPS: u8 = 16;
+pub const GRID_SIDE_PAD: f32 = 10; // 左右マージン（左右ポート dot を避ける）
+pub const GRID_TOP_PAD: f32 = 4; // タイトル下からグリッド先頭までの余白
+pub const GRID_CELL_H: f32 = 8; // セル高
+pub const GRID_ROW_GAP: f32 = 2; // 行間
+
+/// 1 step の水平ピッチ（cell 幅 + gap 込み）。16 step が箱内幅に収まる。
+pub fn gridStepWidth() f32 {
+    return (NODE_W - 2 * GRID_SIDE_PAD) / @as(f32, @floatFromInt(GRID_STEPS));
+}
+
+/// タイトル下端からグリッド下端までの高さ（rows 行）。nodeSize の箱高さ拡張に使う。
+pub fn gridBlockHeight(rows: u8) f32 {
+    const fr: f32 = @floatFromInt(rows);
+    return GRID_TOP_PAD + fr * (GRID_CELL_H + GRID_ROW_GAP);
+}
+
+/// (row, step) セルの box ローカル矩形（箱左上原点）。
+pub fn gridCellRect(row: u8, step: u8) ScreenRect {
+    const sw = gridStepWidth();
+    const fr: f32 = @floatFromInt(row);
+    return .{
+        .x = GRID_SIDE_PAD + @as(f32, @floatFromInt(step)) * sw,
+        .y = TITLE_H + GRID_TOP_PAD + fr * (GRID_CELL_H + GRID_ROW_GAP),
+        .w = sw - 1.5, // セル間の見た目 gap
+        .h = GRID_CELL_H,
+    };
+}
+
+pub const GridCell = struct { row: u8, step: u8 };
+
+/// box ローカル点がどの (row, step) セルに当たるか（rows 行 × 16 step のうち）。gap は null。
+pub fn hitTestGridCell(local: Vec2f, rows: u8) ?GridCell {
+    var r: u8 = 0;
+    while (r < rows) : (r += 1) {
+        var s: u8 = 0;
+        while (s < GRID_STEPS) : (s += 1) {
+            const cr = gridCellRect(r, s);
+            if (local.x >= cr.x and local.x <= cr.x + cr.w and local.y >= cr.y and local.y <= cr.y + cr.h) {
+                return .{ .row = r, .step = s };
+            }
+        }
     }
     return null;
 }
@@ -411,6 +469,36 @@ test "canvas: hitTestToggle hits the toggle box and misses node body / outside" 
     try testing.expectEqual(@as(?Handle, null), hitTestToggle(node_body, &nodes));
     // ノード外。
     try testing.expectEqual(@as(?Handle, null), hitTestToggle(.{ .x = 900, .y = 900 }, &nodes));
+}
+
+test "canvas: nodeSize grows for grid box (grid_rows>0) and matches gridBlockHeight" {
+    const plain = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 };
+    const box = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1, .grid_rows = 2 };
+    try testing.expect(nodeSize(box).y > nodeSize(plain).y); // grid 行ぶん拡張
+    // 明示式と一致（port 高さより grid 高さが大きいケース）。
+    const expect_h = TITLE_H + gridBlockHeight(2) + BODY_PAD;
+    try testing.expectApproxEqAbs(expect_h, nodeSize(box).y, 1e-4);
+}
+
+test "canvas: gridCellRect / hitTestGridCell round-trip (box-local)" {
+    // 各セルの中心が自分自身に hit する。gap（セル間）は null。
+    const rows: u8 = 3;
+    var r: u8 = 0;
+    while (r < rows) : (r += 1) {
+        var s: u8 = 0;
+        while (s < GRID_STEPS) : (s += 1) {
+            const cr = gridCellRect(r, s);
+            const center = Vec2f{ .x = cr.x + cr.w / 2, .y = cr.y + cr.h / 2 };
+            const hit = hitTestGridCell(center, rows).?;
+            try testing.expectEqual(r, hit.row);
+            try testing.expectEqual(s, hit.step);
+        }
+    }
+    // グリッド外（タイトル内）は null。
+    try testing.expectEqual(@as(?GridCell, null), hitTestGridCell(.{ .x = 5, .y = 2 }, rows));
+    // rows を超える行は当たらない（row=3 の中心を rows=3 で引くと範囲外）。
+    const beyond = gridCellRect(rows, 0);
+    try testing.expectEqual(@as(?GridCell, null), hitTestGridCell(.{ .x = beyond.x + beyond.w / 2, .y = beyond.y + beyond.h / 2 }, rows));
 }
 
 test "canvas: resolveConnection direction rules (self-loop allowed, same-dir rejected)" {

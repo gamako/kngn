@@ -502,6 +502,57 @@ pub const StepSeq = struct {
         return (mask >> @as(u4, @intCast(s & 15))) & 1 == 1;
     }
 
+    // --- pattern mask / playhead step の atomic アクセサ（TASK-40.7.2）---
+    // 動的 patch アプリ（apps/patch）は畳み箱の grid/303 を稼働中に編集する（GUI store）/ playhead を毎フレーム
+    // 読む（GUI load）。RT の process は mask を rising edge 時に load・step を rising edge 時に load/store する。
+    // GUI⇔RT で cross-thread に触れる mask(u16×3) と step(u8) だけを `@atomicLoad`/`@atomicStore(.monotonic)` で
+    // アクセスする（field 定義・init 構文は不変＝プレーンのまま。std.atomic.Value 化しない）。
+    //
+    // 頻度: mask load = clock rising edge 時のみ（120BPM 16 分で約 8 回/秒。毎サンプルの atomic 読みは足さない）/
+    //       step store = rising edge 時のみ（≈8 回/秒）/ GUI の mask store = 人間クリック時のみ・step load = frame 毎（60/秒・読みのみ）。
+    // monotonic は単一スレッド実行ではプレーンアクセスと完全に値等価（静的版 LofiPatch/run-modular は RT 単一
+    // スレッドのまま＝挙動不変＝test-modular/test-app-modular が回帰ガード）。
+    //
+    // false sharing 分離不要の判断: これらの atomic は step/prev_gate/cur_pitch 等の RT 更新 field と同一 cache
+    // line に載り得るが、双方向とも恒常的な cross-core 書き込み競合ではない（GUI store はイベント時のみ、RT store
+    // は rising edge 時のみ ≈8 回/秒、GUI の frame 毎 load は読みのみで line 所有権を奪わない）。性能規約の
+    // cache_line 分離が対象とする「producer/consumer が恒常的に別々に触る atomic ペア(SPSC head/tail 型)」に
+    // 該当しないので分離不要（許容）。
+    pub inline fn loadOnMask(self: *const StepSeq) u16 {
+        return @atomicLoad(u16, &self.on_mask, .monotonic);
+    }
+    pub inline fn loadAccentMask(self: *const StepSeq) u16 {
+        return @atomicLoad(u16, &self.accent_mask, .monotonic);
+    }
+    pub inline fn loadSlideMask(self: *const StepSeq) u16 {
+        return @atomicLoad(u16, &self.slide_mask, .monotonic);
+    }
+    pub inline fn storeOnMask(self: *StepSeq, v: u16) void {
+        @atomicStore(u16, &self.on_mask, v, .monotonic);
+    }
+    pub inline fn storeAccentMask(self: *StepSeq, v: u16) void {
+        @atomicStore(u16, &self.accent_mask, v, .monotonic);
+    }
+    pub inline fn storeSlideMask(self: *StepSeq, v: u16) void {
+        @atomicStore(u16, &self.slide_mask, v, .monotonic);
+    }
+    /// step ビット s（0..15）をトグルして store（GUI クリック編集・イベント時のみ）。
+    pub inline fn toggleOnBit(self: *StepSeq, s: u8) void {
+        self.storeOnMask(self.loadOnMask() ^ (@as(u16, 1) << @intCast(s & 15)));
+    }
+    pub inline fn toggleAccentBit(self: *StepSeq, s: u8) void {
+        self.storeAccentMask(self.loadAccentMask() ^ (@as(u16, 1) << @intCast(s & 15)));
+    }
+    pub inline fn toggleSlideBit(self: *StepSeq, s: u8) void {
+        self.storeSlideMask(self.loadSlideMask() ^ (@as(u16, 1) << @intCast(s & 15)));
+    }
+    pub inline fn loadStep(self: *const StepSeq) u8 {
+        return @atomicLoad(u8, &self.step, .monotonic);
+    }
+    pub inline fn storeStep(self: *StepSeq, v: u8) void {
+        @atomicStore(u8, &self.step, v, .monotonic);
+    }
+
     /// step s の degree index を pitch_cv へ（範囲 clamp + scale 共有写像）。
     fn pitchForStep(self: *const StepSeq, s: u8) f32 {
         const total = scaleDegreeCount(self.scale, self.octaves);
@@ -515,21 +566,21 @@ pub const StepSeq = struct {
         const g = signal.gateHigh(io.inputs[0]);
         var gate_out: f32 = 0;
         if (g and !self.prev_gate) { // clock rising edge → 現 step を評価して進める
-            const s = self.step;
-            if (bitSet(self.on_mask, s)) {
+            const s = self.loadStep(); // atomic（GUI が playhead を frame 毎 load）
+            if (bitSet(self.loadOnMask(), s)) { // mask は rising edge 時のみ atomic load（毎サンプルでない）
                 gate_out = 1.0;
                 if (self.kind == .bass) {
                     self.target_pitch = self.pitchForStep(s);
-                    if (bitSet(self.slide_mask, s)) {
+                    if (bitSet(self.loadSlideMask(), s)) {
                         self.gliding = true; // 現在 pitch から滑らせる（portamento）
                     } else {
                         self.cur_pitch = self.target_pitch; // 即時ジャンプ
                         self.gliding = false;
                     }
-                    self.accent_held = if (bitSet(self.accent_mask, s)) 1.0 else 0.0;
+                    self.accent_held = if (bitSet(self.loadAccentMask(), s)) 1.0 else 0.0;
                 }
             }
-            self.step = (s + 1) % STEPS;
+            self.storeStep((s + 1) % STEPS); // atomic store（rising edge 時のみ ≈8/秒）
         }
         self.prev_gate = g;
         io.outputs[0] = gate_out;
@@ -1882,6 +1933,50 @@ test "StepSeq: spec exposes 1 output (drum) / 3 outputs (bass) — no dead ports
     var b = StepSeq{ .kind = .bass };
     try testing.expectEqual(@as(usize, 1), d.spec().out_kinds.len);
     try testing.expectEqual(@as(usize, 3), b.spec().out_kinds.len);
+}
+
+test "StepSeq: atomic accessors are value-equal to plain fields (single-thread monotonic)" {
+    // monotonic の atomic load はプレーン read と単一スレッドで完全一致（TASK-40.7.2 の atomic 化が値を
+    // 変えていないことの回帰ガード）。
+    var seq = StepSeq{ .kind = .bass, .on_mask = 0xABCD, .accent_mask = 0x0F0F, .slide_mask = 0x1234, .step = 7 };
+    try testing.expectEqual(seq.on_mask, seq.loadOnMask());
+    try testing.expectEqual(seq.accent_mask, seq.loadAccentMask());
+    try testing.expectEqual(seq.slide_mask, seq.loadSlideMask());
+    try testing.expectEqual(seq.step, seq.loadStep());
+    // store も同様にプレーン field を書く。
+    seq.storeOnMask(0x0001);
+    try testing.expectEqual(@as(u16, 0x0001), seq.on_mask);
+    seq.storeStep(3);
+    try testing.expectEqual(@as(u8, 3), seq.step);
+    // toggle は 1 ビット反転。
+    seq.storeOnMask(0);
+    seq.toggleOnBit(5);
+    try testing.expectEqual(@as(u16, 1 << 5), seq.on_mask);
+    seq.toggleOnBit(5);
+    try testing.expectEqual(@as(u16, 0), seq.on_mask);
+    seq.storeAccentMask(0);
+    seq.toggleAccentBit(0);
+    try testing.expectEqual(@as(u16, 1), seq.accent_mask);
+    seq.storeSlideMask(0);
+    seq.toggleSlideBit(15);
+    try testing.expectEqual(@as(u16, 1 << 15), seq.slide_mask);
+}
+
+test "StepSeq: toggling on_mask via atomic store changes which step fires (GUI→RT edit)" {
+    // grid クリック編集を模す: step 2 を on にすると step 2 で gate が立つようになる（トグル前は立たない）。
+    var seq = StepSeq{ .kind = .drum, .on_mask = 0 };
+    var out: [1]f32 = undefined;
+    // 初期は全 off → step 2 で立たない。
+    var s: u8 = 0;
+    while (s < 2) : (s += 1) _ = stepClock(&seq, &out);
+    try testing.expect(stepClock(&seq, &out) < 0.5); // step 2 off
+    // step 2 を on にトグル（次周で立つ）。
+    seq.toggleOnBit(2);
+    s = 0;
+    while (s < 15) : (s += 1) _ = stepClock(&seq, &out); // 残り 13 + wrap で step 2 直前へ
+    // step 0,1 を空回し
+    while (seq.loadStep() != 2) _ = stepClock(&seq, &out);
+    try testing.expect(stepClock(&seq, &out) > 0.5); // step 2 が now on
 }
 
 test "Lfo: deterministic, bounded, advances by rate" {

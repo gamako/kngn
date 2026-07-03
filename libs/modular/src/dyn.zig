@@ -105,9 +105,10 @@ pub fn KindType(comptime k: ModuleKind) type {
 pub fn poolCap(comptime k: ModuleKind) usize {
     return switch (k) {
         .vco, .vca, .env_gen => 12,
-        .vcf, .mixer, .lfo => 8,
+        // step_seq は 4→8（TASK-40.7.2: DrumMachine×2=4 + BassMachine=1 で cap4 が尽きるため。小型 struct で Pools 増は微小）。
+        .vcf, .mixer, .lfo, .step_seq => 8,
         .euclid, .perc_env, .random => 6,
-        .clock, .clock_divider, .quantizer, .step_seq, .kick, .hat, .turing, .clap, .chord_pad, .saturator, .bitcrusher, .sidechain => 4,
+        .clock, .clock_divider, .quantizer, .kick, .hat, .turing, .clap, .chord_pad, .saturator, .bitcrusher, .sidechain => 4,
         .output, .delay, .reverb, .vinyl, .wow_flutter => 2,
     };
 }
@@ -527,9 +528,18 @@ pub const DynGraph = struct {
         graph_core.processBlock(procs[0..view.node_count], out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels);
     }
 
-    // --- テスト用イントロスペクション / 非 RT config ---
-    /// 非 RT・publish 前 or grace 期間中の初期設定専用。稼働中の live param 変更には使わない
-    /// （RT 読みと data race。live param の atomic 境界は 40.6.3 で定義）。
+    // --- テスト用イントロスペクション / 非 RT config / live atomic param ---
+    /// live pool slot（RT が処理する実インスタンス。publish payload 非対象の DSP 常駐状態）への ptr を返す。
+    ///
+    /// 用途 2 種:
+    ///   1. 非 RT・publish 前 or grace 期間中の初期設定（従来）。
+    ///   2. **atomic 化された field に限り稼働中の atomic アクセス**（TASK-40.7.2 で具体化した「live param の
+    ///      atomic 境界」）。例: StepSeq の mask/step は `@atomicLoad`/`@atomicStore(.monotonic)` 化済みなので、
+    ///      GUI(メインスレッド)の store と RT `process` の load が同一 live インスタンスを介す正しい cross-thread
+    ///      チャネルになる（ptrOf が返すのはまさに RT が処理する pool slot だから）。
+    ///
+    /// **非 atomic field への稼働中書き込みは引き続き禁止**（RT 読みと torn する）。active member のみに使う
+    /// （台帳同期で removeModule 済み handle には使わない）。関数シグネチャ・戻り値は不変。
     pub fn ptrOf(self: *DynGraph, comptime k: ModuleKind, h: Handle) *KindType(k) {
         return &self.poolArray(k)[self.slots[h].pool_idx];
     }

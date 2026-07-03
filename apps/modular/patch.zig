@@ -626,10 +626,12 @@ pub const LofiPatch = struct {
         return .{
             .bpm = self.clock.bpm,
             .clock_phase = phase,
-            .kick_step = self.kick_seq.step,
-            .hat_step = self.hat_seq.step,
-            .clap_step = self.clap_seq.step,
-            .bass_step = self.bass_seq.step,
+            // step は RT process が @atomicStore する（40.7.2）。main スレッドの snapshotState はプレーン read
+            // でなく loadStep()(atomic load) で読む（mixed cross-thread access を避ける。値は monotonic で不変）。
+            .kick_step = self.kick_seq.loadStep(),
+            .hat_step = self.hat_seq.loadStep(),
+            .clap_step = self.clap_seq.loadStep(),
+            .bass_step = self.bass_seq.loadStep(),
             .density = dens,
             .bass_pitch_cv = self.bass_seq.cur_pitch,
             .kick_active = self.kick.active,

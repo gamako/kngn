@@ -109,15 +109,25 @@ const PALETTE = [_]PaletteEntry{
     .{ .primitive = .kick },
     .{ .primitive = .delay },
     .{ .macro_kind = .drum_machine },
+    .{ .macro_kind = .bass_machine },
 };
 const PAL_X0: f32 = 8;
 const PAL_Y: f32 = 6;
-const PAL_W: f32 = 100;
+// 10 ボタンが WIN_W(960) 内に収まる幅（8 + 10*(92+3) < 960）。macro 追加でボタンが増えたため縮小（40.7.2）。
+const PAL_W: f32 = 92;
 const PAL_H: f32 = 22;
-const PAL_GAP: f32 = 4;
+const PAL_GAP: f32 = 3;
 const PAL_BG = gui.Color.rgba(0x2C, 0x32, 0x3C, 0xFF);
 const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
+
+// TR/303 grid セル色（畳みマクロ箱の本体・TASK-40.7.2）。
+const CELL_OFF = gui.Color.rgba(0x30, 0x38, 0x42, 0xFF); // 消灯
+const CELL_ON = gui.Color.rgba(0xE0, 0x90, 0x40, 0xFF); // on（audio 橙寄り）
+const CELL_ACCENT = gui.Color.rgba(0xE0, 0xC0, 0x50, 0xFF); // accent（黄）
+const CELL_SLIDE = gui.Color.rgba(0x50, 0x90, 0xE0, 0xFF); // slide（青）
+const CELL_PITCH = gui.Color.rgba(0x60, 0xC0, 0x70, 0xFF); // pitch 段（緑）
+const PLAYHEAD_COL = gui.Color.rgba(0xF0, 0xF0, 0xF0, 0x60); // playhead 列オーバレイ（半透明白）
 
 fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
@@ -335,7 +345,10 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         const border = if (selected) SEL_COL else if (hovered) HOVER_COL else BORDER_COL;
         dl.rectOutline(rect, border, if (selected) 2 else 1) catch {};
         dl.text(.{ .x = rect.x + 6, .y = rect.y + 4 }, nodeTitle(app, g.handle), TITLE_COL) catch {};
-        if (group.groupIdFromHandle(g.handle) != null) drawToggle(dl, cam, g, true); // 畳み箱は常に collapsed 側
+        if (group.groupIdFromHandle(g.handle)) |gid| {
+            drawToggle(dl, cam, g, true); // 畳み箱は常に collapsed 側
+            drawMacroGrid(app, dl, cam, g, gid); // 本体に TR/303 grid + playhead（TASK-40.7.2）
+        }
         var i: u8 = 0;
         while (i < g.n_in) : (i += 1) {
             const p = cam.worldToScreen(canvas.inPortPos(g, i));
@@ -509,6 +522,137 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, cam: Camera, nodes
 }
 
 // ============================================================================
+// 畳みマクロ箱の TR/303 grid（TASK-40.7.2）。member は台帳経由で解決した実 handle のみを dyn.ptrOf へ渡し、
+// mask/step は atomic load で読む（合成 handle を dyn へ渡さない規約踏襲）。フレーム毎（1 箱で最大 4 行×16 セル）。
+// ============================================================================
+const StepSeqPtr = *modular.StepSeq;
+
+/// gid の step_seq メンバーを handle 昇順で最大 2 個集める（drum: [seqK, seqH] / bass: [seq]）。
+/// active + step_seq + 当該 gid 所属のみ（stale handle を弾く。台帳同期）。
+fn collectStepSeqMembers(app: *const App, gid: group.GroupId) struct { items: [2]Handle, n: usize } {
+    var items: [2]Handle = .{ 0, 0 };
+    var n: usize = 0;
+    var h: Handle = 0;
+    while (h < MAX_MODULES and n < items.len) : (h += 1) {
+        if (app.ledger.group_of[h] == null or app.ledger.group_of[h].? != gid) continue;
+        if (!app.dyn.slotActive(h)) continue;
+        if (app.dyn.kindOf(h) != .step_seq) continue;
+        items[n] = h;
+        n += 1;
+    }
+    return .{ .items = items, .n = n };
+}
+
+/// クリック可能な mask 行数（drum=2 レーン、bass=on/accent/slide の 3 行。bass の pitch 段は表示のみ）。
+fn clickableRows(kind: group.MacroKind) u8 {
+    return switch (kind) {
+        .drum_machine => 2,
+        .bass_machine => 3,
+    };
+}
+
+/// box ローカル矩形（canvas.gridCellRect 由来）を world→screen 変換して塗る。
+fn fillLocalRect(dl: *gui.DrawList, cam: Camera, box_pos: Vec2f, lr: canvas.ScreenRect, col: gui.Color) void {
+    const tl = cam.worldToScreen(.{ .x = box_pos.x + lr.x, .y = box_pos.y + lr.y });
+    const rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(lr.w * cam.zoom), .h = safeU32(lr.h * cam.zoom) };
+    dl.rectFilled(rect, col) catch {};
+}
+
+/// 畳み箱本体に TR grid（drum 2 レーン）/ 303 行（on/accent/slide + pitch 段）+ playhead を描く。
+fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: group.GroupId) void {
+    const kind = app.ledger.groups[gid].kind;
+    const seqs = collectStepSeqMembers(app, gid);
+    if (seqs.n == 0) return;
+
+    // playhead 列: process は現 step 評価後に step++ するので、直近発音した列は (step + STEPS-1) % STEPS。
+    const STEPS = canvas.GRID_STEPS;
+    const head_seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
+    const playhead: u8 = (head_seq.loadStep() + STEPS - 1) % STEPS;
+
+    switch (kind) {
+        .drum_machine => {
+            // 2 レーン: row0=seqK.on_mask / row1=seqH.on_mask。
+            var lane: u8 = 0;
+            while (lane < 2 and lane < seqs.n) : (lane += 1) {
+                const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[lane]);
+                const mask = seq.loadOnMask();
+                drawGridRow(dl, cam, box.pos, lane, mask, CELL_ON, playhead);
+            }
+        },
+        .bass_machine => {
+            const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
+            drawGridRow(dl, cam, box.pos, 0, seq.loadOnMask(), CELL_ON, playhead);
+            drawGridRow(dl, cam, box.pos, 1, seq.loadAccentMask(), CELL_ACCENT, playhead);
+            drawGridRow(dl, cam, box.pos, 2, seq.loadSlideMask(), CELL_SLIDE, playhead);
+            drawPitchStrip(dl, cam, box.pos, 3, seq); // pitch degree の段表示（表示のみ）
+        },
+    }
+}
+
+/// 1 行ぶんの 16 セルを塗る（on=col / off=CELL_OFF）+ playhead 列を半透明白でオーバレイ。
+fn drawGridRow(dl: *gui.DrawList, cam: Camera, box_pos: Vec2f, row: u8, mask: u16, on_col: gui.Color, playhead: u8) void {
+    var s: u8 = 0;
+    while (s < canvas.GRID_STEPS) : (s += 1) {
+        const cr = canvas.gridCellRect(row, s);
+        const on = (mask >> @as(u4, @intCast(s))) & 1 == 1;
+        fillLocalRect(dl, cam, box_pos, cr, if (on) on_col else CELL_OFF);
+        if (s == playhead) fillLocalRect(dl, cam, box_pos, cr, PLAYHEAD_COL);
+    }
+}
+
+/// bass の pitch degree を段バーで表示（各 step の pitch_deg を高さに写像。編集は 40.7.2 スコープ外＝表示のみ）。
+/// pitch_deg は稼働中に書き換わらない（構築時固定）ためプレーン read で安全。
+fn drawPitchStrip(dl: *gui.DrawList, cam: Camera, box_pos: Vec2f, row: u8, seq: StepSeqPtr) void {
+    const total: f32 = @floatFromInt(@max(1, modular.scaleDegreeCount(seq.scale, seq.octaves)));
+    var s: u8 = 0;
+    while (s < canvas.GRID_STEPS) : (s += 1) {
+        const cr = canvas.gridCellRect(row, s);
+        fillLocalRect(dl, cam, box_pos, cr, CELL_OFF); // 段の下地
+        const deg: f32 = @floatFromInt(std.math.clamp(seq.pitch_deg[s], 0, @as(i8, @intCast(@min(127, @as(i32, @intFromFloat(total)) - 1)))));
+        const frac = std.math.clamp(deg / total, 0.0, 1.0);
+        const h = @max(1.0, cr.h * frac);
+        // 下端揃えのバー（高いほど上に伸びる）。
+        const bar = canvas.ScreenRect{ .x = cr.x, .y = cr.y + (cr.h - h), .w = cr.w, .h = h };
+        fillLocalRect(dl, cam, box_pos, bar, CELL_PITCH);
+    }
+}
+
+/// world 点がどの collapsed マクロ箱の grid セルに当たるか（クリック可能行のみ）。
+const GridHit = struct { gid: group.GroupId, cell: canvas.GridCell };
+fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
+    for (app.ledger.groups, 0..) |g, i| {
+        if (!g.active or !g.collapsed) continue;
+        const gid: group.GroupId = @intCast(i);
+        const local = world_pt.sub(g.pos);
+        if (canvas.hitTestGridCell(local, clickableRows(g.kind))) |cell| return .{ .gid = gid, .cell = cell };
+    }
+    return null;
+}
+
+/// grid セルクリック → 対象 StepSeq の mask ビットを atomic store でトグル（publish 無し＝トポロジ不変）。
+fn toggleMacroGridCell(app: *App, hit: GridHit) void {
+    const kind = app.ledger.groups[hit.gid].kind;
+    const seqs = collectStepSeqMembers(app, hit.gid);
+    if (seqs.n == 0) return;
+    switch (kind) {
+        .drum_machine => {
+            if (hit.cell.row >= seqs.n) return;
+            const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[hit.cell.row]);
+            seq.toggleOnBit(hit.cell.step);
+        },
+        .bass_machine => {
+            const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
+            switch (hit.cell.row) {
+                0 => seq.toggleOnBit(hit.cell.step),
+                1 => seq.toggleAccentBit(hit.cell.step),
+                2 => seq.toggleSlideBit(hit.cell.step),
+                else => {},
+            }
+        },
+    }
+}
+
+// ============================================================================
 // 入力
 // ============================================================================
 fn edgeForInput(app: *const App, dst: Handle, dst_in: u8) ?Edge {
@@ -581,6 +725,15 @@ fn onMouseDown(app: *App) void {
         app.ledger.groups[gid].collapsed = !app.ledger.groups[gid].collapsed;
         app.selected = .{ .group = gid };
         app.hover = null;
+        app.drag = .none;
+        return;
+    }
+
+    // 畳み箱本体の TR/303 grid セルクリック → mask ビットトグル（atomic store・publish 無し）。box 本体の
+    // node hit（グループ drag 開始）より優先する。ポートは箱の左右端でグリッドと重ならない（順序不問だが先に処理）。
+    if (hitMacroGrid(app, mw)) |hit| {
+        toggleMacroGridCell(app, hit);
+        app.selected = .{ .group = hit.gid };
         app.drag = .none;
         return;
     }
@@ -675,17 +828,24 @@ fn commitConnect(app: *App, a: PortRef, b: PortRef, detach: ?CableRef) void {
     app.refreshAllExposed(); // 境界が変わりうるので expose を再導出（イベント時のみ）
 }
 
-/// DrumMachine 展開時のメンバー相対配置（group.pos 基準の world offset）。y は展開ヘッダー（group.pos に
-/// タイトル+[−]、高さ ≒ canvas.TITLE_H+PORT_SPACING+BODY_PAD）とメンバーが重ならないよう DRUM_HEADER_BAND
-/// の下から始める（codex #5）。members 配列と同順（cdiv/seqK/seqH/kick/hat/mix）。
-const DRUM_HEADER_BAND: f32 = 58;
+/// マクロ展開時のメンバー相対配置（group.pos 基準の world offset）。y は展開ヘッダー（group.pos に
+/// タイトル+[−]）とメンバーが重ならないよう MACRO_HEADER_BAND の下から始める。各 OFFSETS は
+/// macro.zig の Handles 構造体のフィールド順と同順。
+const MACRO_HEADER_BAND: f32 = 58;
 const DRUM_OFFSETS = [_]Vec2f{
-    .{ .x = 0, .y = DRUM_HEADER_BAND + 40 }, // cdiv（左・中段）
-    .{ .x = 150, .y = DRUM_HEADER_BAND }, // seqK（上段）
-    .{ .x = 150, .y = DRUM_HEADER_BAND + 80 }, // seqH（下段）
-    .{ .x = 300, .y = DRUM_HEADER_BAND }, // kick（上段）
-    .{ .x = 300, .y = DRUM_HEADER_BAND + 80 }, // hat（下段）
-    .{ .x = 450, .y = DRUM_HEADER_BAND + 40 }, // mix（右・中段）
+    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // cdiv（左・中段）
+    .{ .x = 150, .y = MACRO_HEADER_BAND }, // seqK（上段）
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // seqH（下段）
+    .{ .x = 300, .y = MACRO_HEADER_BAND }, // kick（上段）
+    .{ .x = 300, .y = MACRO_HEADER_BAND + 80 }, // hat（下段）
+    .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // mix（右・中段）
+};
+const BASS_OFFSETS = [_]Vec2f{
+    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // seq（左・中段）
+    .{ .x = 150, .y = MACRO_HEADER_BAND }, // vco（上段）
+    .{ .x = 300, .y = MACRO_HEADER_BAND + 40 }, // vcf（中段）
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // env（下段）
+    .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // vca（右・中段）
 };
 
 /// パレット index からモジュール or マクロを追加（comptime kind ディスパッチ）→ 画面中央付近へ配置 → publish。
@@ -712,13 +872,13 @@ fn addByPaletteIndex(app: *App, ki: u8) !void {
     }
 }
 
-/// DrumMachine 展開サブグラフの footprint（group.pos 基準の world 幅・高さ）。header 箱 + 全メンバー node
-/// 実サイズを内包する bbox の右下端（左上端は必ず (0,0)）。
-fn drumFootprint(app: *const App, members: [6]Handle) Vec2f {
+/// マクロ展開サブグラフの footprint（group.pos 基準の world 幅・高さ）。header 箱 + 全メンバー node 実サイズを
+/// 内包する bbox の右下端（左上端は必ず (0,0)）。members/offsets は同順・同長。
+fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec2f) Vec2f {
     const header = NodeGeom{ .handle = group.GROUP_HANDLE_BASE, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 0 };
     var w: f32 = canvas.nodeSize(header).x; // = NODE_W
     var h: f32 = canvas.nodeSize(header).y;
-    for (members, DRUM_OFFSETS) |m, off| {
+    for (members, offsets) |m, off| {
         const geom = NodeGeom{ .handle = m, .pos = off, .n_in = app.dyn.nIn(m), .n_out = app.dyn.nOut(m) };
         const sz = canvas.nodeSize(geom);
         w = @max(w, off.x + sz.x);
@@ -727,52 +887,44 @@ fn drumFootprint(app: *const App, members: [6]Handle) Vec2f {
     return .{ .x = w, .y = h };
 }
 
-/// マクロ（DrumMachine 等）をパレットから追加する。preflight+add+connect+1publish は macro.zig が担い、
-/// publish 成功を確認してから台帳登録（group_of/exposed_in/out/collapsed=true）する（§3.2）。
-/// `anchor` は追加位置の screen 座標。展開時の footprint が既定 fb に収まるよう screen で clamp してから
-/// screenToWorld し（codex #4）、畳み箱・各メンバー layout をそこ基準に置く。
+/// footprint を screen サイズ（world × zoom）に換算し、右下が fb 内に収まるよう anchor(screen) を clamp
+/// してから world 座標へ（codex #4 と同型）。footprint が fb より広くても max が下限を割らないよう @max で保護。
+fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
+    const zoom = app.camera.zoom;
+    const margin: f32 = 16;
+    const top_limit: f32 = PAL_Y + PAL_H + margin; // パレット帯の下端より下に置く
+    const fbw: f32 = @floatFromInt(app.fb_w);
+    const fbh: f32 = @floatFromInt(app.fb_h);
+    const max_x = @max(margin, fbw - fp.x * zoom - margin);
+    const max_y = @max(top_limit, fbh - fp.y * zoom - margin);
+    const sx = std.math.clamp(anchor.x, margin, max_x);
+    const sy = std.math.clamp(anchor.y, top_limit, max_y);
+    return app.camera.screenToWorld(.{ .x = sx, .y = sy });
+}
+
+/// マクロ（DrumMachine / BassMachine）をパレットから追加する。preflight+add+connect+1publish は macro.zig が
+/// 担い、publish 成功を確認してから台帳登録（group_of/exposed_in/out/collapsed=true）する（§3.2/§3.3）。
+/// `anchor` は追加位置の screen 座標。展開時 footprint が既定 fb に収まるよう clamp してから配置する。
 fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
     switch (kind) {
         .drum_machine => {
             const h = try macro.buildDrumMachine(app.dyn); // 失敗時は何も残らない（macro.zig 側の rollback）
+            const members = [_]Handle{ h.cdiv, h.seq_k, h.seq_h, h.kick, h.hat, h.mix };
             const gid = app.ledger.alloc() orelse {
                 // 台帳枯渇（MAX_GROUPS 上限。極めて稀）: 公開済みメンバーを畳んで戻す（1 publish）。
-                app.dyn.removeModule(h.cdiv);
-                app.dyn.removeModule(h.seq_k);
-                app.dyn.removeModule(h.seq_h);
-                app.dyn.removeModule(h.kick);
-                app.dyn.removeModule(h.hat);
-                app.dyn.removeModule(h.mix);
+                for (members) |m| app.dyn.removeModule(m);
                 app.dyn.publish() catch {};
                 return;
             };
-
-            const members = [_]Handle{ h.cdiv, h.seq_k, h.seq_h, h.kick, h.hat, h.mix };
-
-            // footprint を screen サイズ（world × zoom）に換算し、右下が fb 内に収まるよう anchor を clamp。
-            // footprint が fb より広い場合でも max が下限（margin / palette 帯下）を割らないよう @max で保護。
-            const fp = drumFootprint(app, members);
-            const zoom = app.camera.zoom;
-            const margin: f32 = 16;
-            const top_limit: f32 = PAL_Y + PAL_H + margin; // パレット帯の下端より下に置く
-            const fbw: f32 = @floatFromInt(app.fb_w);
-            const fbh: f32 = @floatFromInt(app.fb_h);
-            const max_x = @max(margin, fbw - fp.x * zoom - margin);
-            const max_y = @max(top_limit, fbh - fp.y * zoom - margin);
-            const sx = std.math.clamp(anchor.x, margin, max_x);
-            const sy = std.math.clamp(anchor.y, top_limit, max_y);
-            const pos = app.camera.screenToWorld(.{ .x = sx, .y = sy });
-
+            const pos = clampMacroPos(app, anchor, macroFootprint(app, &members, &DRUM_OFFSETS));
             const g = &app.ledger.groups[gid];
             g.kind = .drum_machine;
             g.collapsed = true;
             g.pos = pos;
-
             for (members, DRUM_OFFSETS) |m, off| {
                 app.ledger.assign(m, gid);
                 app.layout[m] = pos.add(off);
             }
-
             // テンプレ明示 expose（§3.2: clock in = cdiv.in0(gate) / audio out = mix.out0(audio)）。
             g.exposed_in[0] = .{ .member = h.cdiv, .port = 0, .is_input = true };
             group.setLabel(&g.exposed_in[0], "clock");
@@ -782,7 +934,34 @@ fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
             group.setLabel(&g.exposed_out[0], "audio");
             g.n_out = 1;
             g.template_n_out = 1;
-
+            app.selected = .{ .group = gid };
+        },
+        .bass_machine => {
+            const h = try macro.buildBassMachine(app.dyn);
+            const members = [_]Handle{ h.seq, h.vco, h.vcf, h.env, h.vca };
+            const gid = app.ledger.alloc() orelse {
+                for (members) |m| app.dyn.removeModule(m);
+                app.dyn.publish() catch {};
+                return;
+            };
+            const pos = clampMacroPos(app, anchor, macroFootprint(app, &members, &BASS_OFFSETS));
+            const g = &app.ledger.groups[gid];
+            g.kind = .bass_machine;
+            g.collapsed = true;
+            g.pos = pos;
+            for (members, BASS_OFFSETS) |m, off| {
+                app.ledger.assign(m, gid);
+                app.layout[m] = pos.add(off);
+            }
+            // テンプレ明示 expose（§3.3: clock in = seq.in0(gate) / audio out = vca.out0(audio)）。
+            g.exposed_in[0] = .{ .member = h.seq, .port = 0, .is_input = true };
+            group.setLabel(&g.exposed_in[0], "clock");
+            g.n_in = 1;
+            g.template_n_in = 1;
+            g.exposed_out[0] = .{ .member = h.vca, .port = 0, .is_input = false };
+            group.setLabel(&g.exposed_out[0], "audio");
+            g.n_out = 1;
+            g.template_n_out = 1;
             app.selected = .{ .group = gid };
         },
     }

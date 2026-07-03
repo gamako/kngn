@@ -30,13 +30,15 @@ pub const MAX_EXPOSED = 8;
 /// 数値の食い違いを検出する。
 pub const GROUP_HANDLE_BASE = 48;
 
-/// 40.7.1 は drum_machine のみ（40.7.2 で bass_machine 追加）。
+/// 40.7.1: drum_machine / 40.7.2: bass_machine を追加。台帳・expose 導出・表示写像は kind 非依存で共通。
 pub const MacroKind = enum {
     drum_machine,
+    bass_machine,
 
     pub fn displayName(self: MacroKind) []const u8 {
         return switch (self) {
             .drum_machine => "DrumMachine",
+            .bass_machine => "BassMachine",
         };
     }
 };
@@ -81,6 +83,15 @@ pub const DisplayEdge = struct {
     visual: Edge,
     actual: CableRef,
 };
+
+/// 畳み箱の TR/303 grid の行数（箱高さ拡張用。drum=2 レーン、bass=on/accent/slide 3 行 + pitch 段 1 行）。
+/// クリック可能な mask 行数（drum=2 / bass=3）とは別（pitch 段は表示のみ）。canvas.NodeGeom.grid_rows へ渡す。
+pub fn gridRowsForBox(kind: MacroKind) u8 {
+    return switch (kind) {
+        .drum_machine => 2,
+        .bass_machine => 4,
+    };
+}
 
 /// gid ⇔ 合成 handle の変換（両側境界。OOB を閉じる）。
 pub fn handleOfGroup(gid: GroupId) Handle {
@@ -272,7 +283,7 @@ pub const Ledger = struct {
         }
         for (self.groups, 0..) |g, i| {
             if (g.active and g.collapsed and n < out.len) {
-                out[n] = .{ .handle = handleOfGroup(@intCast(i)), .pos = g.pos, .n_in = g.n_in, .n_out = g.n_out };
+                out[n] = .{ .handle = handleOfGroup(@intCast(i)), .pos = g.pos, .n_in = g.n_in, .n_out = g.n_out, .grid_rows = gridRowsForBox(g.kind) };
                 n += 1;
             }
         }
