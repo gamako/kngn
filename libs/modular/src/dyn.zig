@@ -574,6 +574,33 @@ pub const DynGraph = struct {
         if (!self.slotActive(h) or j >= self.instances[h].n_out) return null;
         return self.instances[h].out_kinds[j];
     }
+
+    // --- main 専用の preflight accessor（read-only・RT 非関与。TASK-40.7.1 macro.zig の preflight 用）---
+    // publish/processBlock の RT 経路・RCU/triple-buffer 機構は一切変更しない。add() と同じ reclaim 条件
+    // （live=active || (retired かつ consumed_gen < retire_gen)）を織り込んだ「今 add したら確保できる」
+    // 数を返す（reclaimRetired 実行前でも add が実際に確保できる数と一致させる。非破壊で数えるだけ）。
+
+    /// kind のプールに今 add したら確保できる空き数。
+    pub fn poolFreeCount(self: *const DynGraph, comptime k: ModuleKind) usize {
+        const cg = self.consumed_gen.load(.acquire);
+        var used: usize = 0;
+        for (self.slots) |s| {
+            if (s.kind != k) continue;
+            if (s.active or (s.retired and cg < s.retire_gen)) used += 1;
+        }
+        const cap = poolCap(k);
+        return if (used >= cap) 0 else cap - used;
+    }
+
+    /// 今 add したら確保できる空き handle 数（MAX_MODULES 上限）。
+    pub fn freeHandleCount(self: *const DynGraph) usize {
+        const cg = self.consumed_gen.load(.acquire);
+        var used: usize = 0;
+        for (self.slots) |s| {
+            if (s.active or (s.retired and cg < s.retire_gen)) used += 1;
+        }
+        return if (used >= MAX_MODULES) 0 else MAX_MODULES - used;
+    }
 };
 
 /// union-to-largest の代理サイズ（全 kind の最大 @sizeOf × MAX_MODULES）。テスト（e）で比較。
@@ -902,6 +929,31 @@ test "dyn(d): RT ゼロアロケーション — processBlock/publish が self.a
     try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
 
     g.allocator = testing.allocator; // destroy 用に戻す
+}
+
+test "dyn(i): poolFreeCount/freeHandleCount — add 前の空き数が add の実確保可能数と一致する（reclaim 込み）" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    try testing.expectEqual(poolCap(.output), g.poolFreeCount(.output));
+    try testing.expectEqual(@as(usize, MAX_MODULES), g.freeHandleCount());
+
+    _ = try g.add(.output, .{});
+    try testing.expectEqual(poolCap(.output) - 1, g.poolFreeCount(.output));
+    try testing.expectEqual(@as(usize, MAX_MODULES - 1), g.freeHandleCount());
+
+    // pool 枯渇時は 0（TooManyModules/PoolFull と整合）。
+    const o2 = try g.add(.output, .{}); // cap=2
+    try testing.expectEqual(@as(usize, 0), g.poolFreeCount(.output));
+
+    // remove 直後（publish/consume 前）は grace 未達 = まだ「使用中」扱い（reclaim されない）。
+    g.removeModule(o2);
+    try testing.expectEqual(@as(usize, 0), g.poolFreeCount(.output));
+
+    // publish + processBlock で consumed_gen が retire_gen に追いつく → reclaim 相当で空きが戻る。
+    try g.publish();
+    var buf: [64 * 2]f32 = undefined;
+    g.processBlock(&buf, 64, 2);
+    try testing.expectEqual(@as(usize, 1), g.poolFreeCount(.output));
 }
 
 test "dyn(h3): RCU grace — remove 後 grace 未達の間は同 handle を再利用しない" {

@@ -644,16 +644,29 @@ pub fn build(b: *std.Build) void {
     const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");
     test_app_modular_step.dependOn(&run_modular_app_test.step);
 
-    // apps/patch キャンバス純ロジックテスト（camera 変換 / hit-test / 見切れ検出。display/audio 不要。TASK-40.6.2）
-    const patch_canvas_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/canvas.zig"),
+    // apps/patch 純ロジックテスト集約 root（canvas: camera 変換 / hit-test / 見切れ検出 + group: グループ台帳 /
+    // expose 導出 / 表示写像。display/audio 不要。TASK-40.6.2 / 40.7.1）
+    const patch_tests_mod = b.createModule(.{
+        .root_source_file = b.path("apps/patch/tests.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const patch_canvas_test = b.addTest(.{ .root_module = patch_canvas_test_mod });
-    const run_patch_canvas_test = b.addRunArtifact(patch_canvas_test);
-    const test_patch_step = b.step("test-patch", "Run apps/patch canvas logic tests");
-    test_patch_step.dependOn(&run_patch_canvas_test.step);
+    const patch_tests = b.addTest(.{ .root_module = patch_tests_mod });
+    const run_patch_tests = b.addRunArtifact(patch_tests);
+    const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
+    test_patch_step.dependOn(&run_patch_tests.step);
+
+    // apps/patch マクロ builder テスト（DrumMachine テンプレ: preflight/rollback/決定性/発音回帰。TASK-40.7.1）
+    const patch_macro_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/patch/macro.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    patch_macro_test_mod.addImport("modular", example_modules.modular);
+    const patch_macro_test = b.addTest(.{ .root_module = patch_macro_test_mod });
+    const run_patch_macro_test = b.addRunArtifact(patch_macro_test);
+    const test_macro_step = b.step("test-macro", "Run apps/patch macro (DrumMachine template) tests");
+    test_macro_step.dependOn(&run_patch_macro_test.step);
 
     // src/dsp テスト (Oscillator / Envelope / Filter / Mixer)
     const dsp_test_mod = b.createModule(.{
@@ -706,6 +719,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_modular_step);
     test_step.dependOn(test_app_modular_step);
     test_step.dependOn(test_patch_step);
+    test_step.dependOn(test_macro_step);
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
@@ -1136,8 +1150,11 @@ fn addPixieExe(
 }
 
 // ============================================================
-// ヘルパー: patch app exe を 1 backend 分セットアップ（apps/patch。TASK-40.6.2/40.6.3）
+// ヘルパー: patch app exe を 1 backend 分セットアップ（apps/patch。TASK-40.6.2/40.6.3/40.7.1）
 // platform + gui + modular（動的グラフエンジン）+ audio（40.6.3 ライブ再配線で発音）。
+// canvas.zig/group.zig/macro.zig は main.zig からの相対 @import（同一 module）で取り込む
+// （apps/modular/main.zig が patch.zig を相対 import する既存パターンと同型。macro.zig の
+// @import("modular") はこの exe.root_module に登録済みの "modular" named import をそのまま解決できる）。
 // ============================================================
 fn addPatchExe(
     b: *std.Build,
@@ -1150,7 +1167,6 @@ fn addPatchExe(
     common: *const ExampleModules,
     pm: *const PlatformModules,
 ) *std.Build.Step.Compile {
-    const canvas_mod = b.createModule(.{ .root_source_file = b.path("apps/patch/canvas.zig") });
     const exe = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -1163,7 +1179,6 @@ fn addPatchExe(
     exe.root_module.addImport("gui", common.gui);
     exe.root_module.addImport("modular", common.modular); // 動的グラフエンジン（dsp 依存のみ）
     exe.root_module.addImport("audio", common.audio); // L1 出力（RT callback で dyn.processBlock）
-    exe.root_module.addImport("canvas", canvas_mod);
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);

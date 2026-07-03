@@ -206,6 +206,34 @@ pub fn hitTestPort(world_pt: Vec2f, nodes: []const NodeGeom) ?PortRef {
     return null;
 }
 
+// ----------------------------------------------------------------------------
+// 折り畳みトグル [±]（TASK-40.7.1）: タイトル行右端の小矩形。group.zig の畳み箱・展開枠のヘッダーが
+// NodeGeom 形状で表現される前提で、位置決め/ヒットテストのみをここに置く（group.zig は modular 非依存の
+// ため合成 handle の意味は main.zig 側の責務。ここは純幾何）。
+// ----------------------------------------------------------------------------
+pub const TOGGLE_SIZE: f32 = 14;
+pub const TOGGLE_MARGIN: f32 = 4;
+
+/// タイトル行内の折り畳みトグルの world 左上位置（ノード右端寄せ、固定 NODE_W 基準）。
+pub fn togglePos(g: NodeGeom) Vec2f {
+    return .{ .x = g.pos.x + NODE_W - TOGGLE_SIZE - TOGGLE_MARGIN, .y = g.pos.y + (TITLE_H - TOGGLE_SIZE) / 2 };
+}
+
+fn pointInToggle(world_pt: Vec2f, g: NodeGeom) bool {
+    return pointInRect(world_pt, togglePos(g), .{ .x = TOGGLE_SIZE, .y = TOGGLE_SIZE });
+}
+
+/// world 点近傍のトグルを持つノード（最前面優先）。
+pub fn hitTestToggle(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
+    var i: usize = nodes.len;
+    while (i > 0) {
+        i -= 1;
+        const g = nodes[i];
+        if (pointInToggle(world_pt, g)) return g.handle;
+    }
+    return null;
+}
+
 /// world 点近傍のケーブル（点と線分の距離 <= CABLE_HIT_SLOP）。edge index を返す。
 pub fn hitTestCable(world_pt: Vec2f, nodes: []const NodeGeom, edges: []const Edge) ?usize {
     var idx: usize = edges.len;
@@ -369,6 +397,20 @@ test "canvas: hitTestPort / hitTestCable" {
     try testing.expectEqual(@as(?usize, 0), hitTestCable(mid, &nodes, &edges));
     // ケーブルから離れた点は当たらない
     try testing.expectEqual(@as(?usize, null), hitTestCable(.{ .x = mid.x, .y = mid.y + 100 }, &nodes, &edges));
+}
+
+test "canvas: hitTestToggle hits the toggle box and misses node body / outside" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 5, .pos = .{ .x = 100, .y = 50 }, .n_in = 1, .n_out = 1 },
+    };
+    const tp = togglePos(nodes[0]);
+    const inside = Vec2f{ .x = tp.x + TOGGLE_SIZE / 2, .y = tp.y + TOGGLE_SIZE / 2 };
+    try testing.expectEqual(@as(?Handle, 5), hitTestToggle(inside, &nodes));
+    // ノード内だがトグル外（左端付近）。
+    const node_body = Vec2f{ .x = nodes[0].pos.x + 5, .y = nodes[0].pos.y + 5 };
+    try testing.expectEqual(@as(?Handle, null), hitTestToggle(node_body, &nodes));
+    // ノード外。
+    try testing.expectEqual(@as(?Handle, null), hitTestToggle(.{ .x = 900, .y = 900 }, &nodes));
 }
 
 test "canvas: resolveConnection direction rules (self-loop allowed, same-dir rejected)" {
