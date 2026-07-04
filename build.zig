@@ -403,6 +403,18 @@ pub fn build(b: *std.Build) void {
     const test_pixelops_step = b.step("test-pixelops", "Run libs/pixelops blend/div255/clip-hoist tests");
     test_pixelops_step.dependOn(&run_pixelops_test.step);
 
+    // libs/serde 単体テスト（versioned container の round-trip / 破損検出 / 前方互換 / 固定 fixture。TASK-62.2）
+    const serde_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("libs/serde/src/serde.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_serde_test = b.addRunArtifact(serde_test);
+    const test_serde_step = b.step("test-serde", "Run libs/serde versioned container tests");
+    test_serde_step.dependOn(&run_serde_test.step);
+
     // editor/core テスト (undo: stroke 記録 + undo/redo + PNG round-trip, tool: Tool ゴールデン)
     // + pixie canvas_input (入力状態機械: capture / 外 release / 外継続 / stroke 中無視)
     const core_undo_mod = b.createModule(.{
@@ -810,6 +822,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
     test_step.dependOn(test_pixelops_step);
+    test_step.dependOn(test_serde_step);
 
     // ========================================
     // マイクロベンチ（TASK-50）。純ロジック計測（display / audio デバイス不要・OS 非依存）。
@@ -1036,6 +1049,7 @@ const SharedModules = struct {
     harness: TaggedModule,
     types: TaggedModule,
     pixelops: TaggedModule,
+    serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
     paint: TaggedModule, // 旧 apps/editor/core（ADR-007 R6 で libs/paint へ格上げ）
     spectrogram: TaggedModule, // libs/viz（旧 apps/synth/spectrogram.zig）
     scope: TaggedModule, // libs/viz（旧 apps/synth/scope.zig）
@@ -1065,6 +1079,13 @@ const SharedModules = struct {
         // clip-hoist。TASK-51）。sprite / paint blend / font Color.blend が委譲する。
         const pixelops: TaggedModule = .{ .layer = .lib, .name = "pixelops", .mod = b.createModule(.{
             .root_source_file = b.path("libs/pixelops/src/lib.zig"),
+        }) };
+
+        // libs/serde: versioned container 直列化基盤（TASK-62.2）。std のみ依存（link 不要）。
+        // 流動 lib のため kit 非収録・apps 直 import 許可（app_direct_ok=true）。第一 adopter は
+        // pixie Document(TASK-63)。外部公開しないので createModule（addModule ではない）。
+        const serde: TaggedModule = .{ .layer = .lib, .name = "serde", .app_direct_ok = true, .mod = b.createModule(.{
+            .root_source_file = b.path("libs/serde/src/serde.zig"),
         }) };
 
         // 共有型 module（platform_types）: KeyCode/Event/EventStats 等の単一ソース。
@@ -1185,6 +1206,7 @@ const SharedModules = struct {
             .harness = harness,
             .types = types,
             .pixelops = pixelops,
+            .serde = serde,
             .paint = paint,
             .spectrogram = spectrogram,
             .scope = scope,

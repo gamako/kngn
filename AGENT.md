@@ -39,6 +39,7 @@ video-proto-main/
 ├── libs/              # L2–L3 移植可能な再利用ライブラリ（原則 platform 非依存・headless で単体テスト可）
 │   ├── png/           # PNG codec（decode/encode）
 │   ├── pixelops/      # ピクセルブレンド共有プリミティブ（premul/straight blend + div255 + clip-hoist）
+│   ├── serde/         # versioned container 直列化基盤（RIFF/IFF 系統 + version/CRC。TASK-62.2。std のみ・kit 非収録）
 │   ├── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
 │   ├── font/          # フォント（TrueType/OpenType アウトライン sfnt/glyf/cff + bmfont。※ BDF は src/text.zig）
 │   ├── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
@@ -665,6 +666,7 @@ zig build test-text             # BDF パーサ + テキスト描画
 zig build test-font             # libs/font（bmfont 等）
 zig build test-sprite           # sprite ブレンド / 描画
 zig build test-pixelops         # libs/pixelops（SIMD vs scalar 一致 / div255 恒等 / clipBlit 境界）
+zig build test-serde            # libs/serde（versioned container round-trip / 破損検出 / 前方互換 / 固定 fixture）
 zig build test-dsp              # src/dsp（Oscillator / ADSR / Filter / Mixer）
 zig build test-synth            # libs/synth（SPSC リング / atomic / Voice / VoicePool / Synth）
 zig build test-spectrogram      # apps/synth スペクトログラム（FFT 列ロジック）
