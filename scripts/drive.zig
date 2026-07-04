@@ -77,6 +77,20 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(io, &obuf);
     try stdout.interface.writeAll(resp);
     try stdout.interface.flush();
+
+    // expect/assert の合否伝播（TASK-78）: レスポンス**各行**を走査し、いずれかが `fail ` で始まれば
+    // drive 自身も非0 exit する（agent の自律反復に有効）。stdout への透過は上で完了済み。
+    // 検知は `fail ` 行頭のみ（harness の warnLine 由来 `error:` 等の benign warning は非0化しない=誤検知回避）。
+    // 複数コマンドを1リクエストに入れた場合の 2 行目以降の `fail ` も拾う（全体 startsWith ではなく line scan）。
+    // アサーション失敗は drive のバグではないので、`return error`（Zig のスタックトレースが出る）ではなく
+    // 簡潔な stderr 1行 + `exit(1)` にする（stdout は透過済み・後続は無いので defer close 省略は許容）。
+    var lines = std.mem.splitScalar(u8, resp, '\n');
+    while (lines.next()) |ln| {
+        if (std.mem.startsWith(u8, ln, "fail ")) {
+            std.debug.print("drive: expect/assert に失敗があります（非0 exit）\n", .{});
+            std.process.exit(1);
+        }
+    }
 }
 
 fn readPortFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u16 {

@@ -70,6 +70,10 @@ var line_no: usize = 0;
 var steps_remaining: usize = 0;
 var quit_requested = false;
 
+// expect/assert のアサーション失敗カウンタ（TASK-78。**replay 専用**。live は使わない=合否はレスポンス行のみ）。
+// replay 終了時に >0 なら非0 exit する（AC#1）。resetForTest でゼロクリアする。
+var expect_failures: usize = 0;
+
 // replay 用 script bytes（プロセス寿命まで保持。page_allocator）
 var script_bytes: []const u8 = "";
 
@@ -282,7 +286,12 @@ pub fn startTransport() void {
 /// quit / EOF(replay) / window closed(native_continue=false) / accept 失敗(live) で false。
 /// live ではコマンド到着まで accept でブロックする（= step 待ちで block）。
 pub fn pollGate(native_continue: bool) bool {
-    if (quit_requested or !native_continue) return false;
+    // 早期 return（window close 等で native_continue=false / 既に quit 済み）でも、記帳済みの
+    // expect 失敗を exit code へ落とす（TASK-78。replay 終了 3 経路の 1 つ。live/通常実行では no-op）。
+    if (quit_requested or !native_continue) {
+        replayExitIfFailed();
+        return false;
+    }
     if (steps_remaining > 0) {
         steps_remaining -= 1;
         return true;
@@ -290,7 +299,10 @@ pub fn pollGate(native_continue: bool) bool {
     while (true) {
         if (cursor >= cmd_buf.len) {
             switch (mode) {
-                .replay, .disabled => return false, // EOF
+                .replay, .disabled => {
+                    replayExitIfFailed(); // EOF（replay 終了経路）
+                    return false;
+                },
                 .live => {
                     finishLiveRequest();
                     if (quit_requested) return false;
@@ -312,6 +324,7 @@ pub fn pollGate(native_continue: bool) bool {
         } else if (std.mem.eql(u8, cmd, "quit")) {
             quit_requested = true;
             if (mode == .live) finishLiveRequest();
+            replayExitIfFailed(); // quit（replay 終了経路。live は finishLiveRequest 後で no-op）
             return false;
         } else if (std.mem.eql(u8, cmd, "inject")) {
             handleInject(&it);
@@ -319,6 +332,10 @@ pub fn pollGate(native_continue: bool) bool {
             handleSnapshot(&it);
         } else if (std.mem.eql(u8, cmd, "digest")) {
             handleDigest(&it);
+        } else if (std.mem.eql(u8, cmd, "expect")) {
+            handleExpect(&it, false);
+        } else if (std.mem.eql(u8, cmd, "assert")) {
+            handleExpect(&it, true);
         } else {
             warnLine("不明なコマンド");
         }
@@ -659,30 +676,207 @@ fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
     emitSnapshot(p.name, path, info);
 }
 
-fn handleDigest(it: *Tok) void {
-    const probe = it.next() orelse return warnLine("digest: probe 名不足");
+/// digest 1行 payload の取得結果。`unavailable` は取得できない理由（静的文字列）を保持し、
+/// digest コマンドの warn と expect/assert の `actual=` 表示の両方で診断性を保つ（TASK-78）。
+const DigestResult = union(enum) {
+    ok: []const u8,
+    unavailable: []const u8,
+};
+
+/// probe 名から digest の1行 payload を返す（`digest` コマンドと `expect`/`assert` が共有）。
+/// buf は payload の書き込み先。fb/stats/audio/custom いずれも収まるよう caller は `DIGEST_BUF_LEN` を渡す。
+/// 中身非解釈の不変条件は維持（framework は payload の意味を解釈しない）。
+fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
     if (std.mem.eql(u8, probe, "fb")) {
-        if (!have_frame) return warnLine("digest fb: present 前（フレーム未確定）→ skip");
-        var buf: [512]u8 = undefined;
-        emitDigest("fb", formatFbPayload(&buf));
+        if (!have_frame) return .{ .unavailable = "fb not presented" };
+        return .{ .ok = formatFbPayload(buf) };
     } else if (std.mem.eql(u8, probe, "audio")) {
-        var buf: [128]u8 = undefined;
-        emitDigest("audio", formatAudioPayload(&buf));
+        return .{ .ok = formatAudioPayload(buf) };
     } else if (std.mem.eql(u8, probe, "stats")) {
-        var buf: [512]u8 = undefined;
-        emitDigest("stats", formatStatsPayload(&buf));
+        return .{ .ok = formatStatsPayload(buf) };
     } else if (findProbe(probe)) |p| {
-        digestCustom(p);
+        const dg = p.digest orelse return .{ .unavailable = "digest unsupported" };
+        return .{ .ok = dg(p.ctx, buf) };
     } else {
-        warnLine("digest: 未知の probe");
+        return .{ .unavailable = "unknown probe" };
     }
 }
 
-/// custom probe の digest をルートする（中身非解釈）: callback が 1024B バッファへ書いた1行を emit するだけ。
-fn digestCustom(p: *const Probe) void {
-    const dg = p.digest orelse return warnLine("digest: この probe は digest 非対応");
+fn handleDigest(it: *Tok) void {
+    const probe = it.next() orelse return warnLine("digest: probe 名不足");
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
-    emitDigest(p.name, dg(p.ctx, &buf));
+    switch (digestPayload(probe, &buf)) {
+        .ok => |payload| emitDigest(probe, payload),
+        .unavailable => |reason| warnLine(reason),
+    }
+}
+
+// ============================================================================
+// expect / assert（アサーション層。TASK-78）
+//
+// 文法（replay/live 共通）:
+//   expect <probe> <key><op><value>     op ∈ {= != > <}
+//   expect <probe> contains <substr>
+//   assert ...（expect と同評価。replay では失敗で即 exit 1）
+//   先頭の `digest` トークン（`expect digest fb ...`）はエイリアスで読み飛ばす。
+//
+// 評価対象は digest 1行 payload の **top-level `key=value`**（空白区切り）。ネスト（`l0{..}`）や
+// JSON（stats）は 1 トークンに glue され漏れないので `contains` を使う。中身非解釈の不変条件は維持。
+// ============================================================================
+
+const CmpOp = enum { eq, ne, gt, lt };
+const Cmp = struct { op: CmpOp, key: []const u8, value: []const u8 };
+const ExpectExpr = struct {
+    probe: []const u8,
+    form: union(enum) {
+        cmp: Cmp,
+        contains: []const u8,
+    },
+};
+
+/// `expect`/`assert` の引数トークン列を式へ parse する純関数（module-level 状態に触らない=単体テスト可能）。
+/// 余剰トークン・op 欠落・key/value 空・contains の substr 欠落・substr 余剰は null（= fail-fast, AC#3）。
+fn parseExpectExpr(it: *Tok) ?ExpectExpr {
+    var probe = it.next() orelse return null;
+    if (std.mem.eql(u8, probe, "digest")) {
+        probe = it.next() orelse return null; // `expect digest fb ...` エイリアス
+    }
+    const t2 = it.next() orelse return null;
+    if (std.mem.eql(u8, t2, "contains")) {
+        const sub = it.next() orelse return null; // substr 必須
+        if (it.next() != null) return null; // 余剰トークン
+        return .{ .probe = probe, .form = .{ .contains = sub } };
+    }
+    const cmp = parseCmpToken(t2) orelse return null;
+    if (it.next() != null) return null; // 余剰トークン
+    return .{ .probe = probe, .form = .{ .cmp = cmp } };
+}
+
+/// `key<op>value` 単一トークンを分割する。op ∈ {= != > <}。先頭から最初の `!`/`=`/`<`/`>` を op 開始とする。
+/// key/value いずれか空・op 記号無し・`!` の直後が `=` でない場合は null（不正構文）。
+fn parseCmpToken(tok: []const u8) ?Cmp {
+    var i: usize = 0;
+    while (i < tok.len) : (i += 1) {
+        const c = tok[i];
+        if (c == '=' or c == '<' or c == '>' or c == '!') break;
+    }
+    if (i == 0 or i >= tok.len) return null; // key 空 or op 記号無し
+    var op: CmpOp = undefined;
+    var vstart: usize = undefined;
+    switch (tok[i]) {
+        '=' => {
+            op = .eq;
+            vstart = i + 1;
+        },
+        '>' => {
+            op = .gt;
+            vstart = i + 1;
+        },
+        '<' => {
+            op = .lt;
+            vstart = i + 1;
+        },
+        '!' => {
+            if (i + 1 >= tok.len or tok[i + 1] != '=') return null; // `!` 単独は不正
+            op = .ne;
+            vstart = i + 2;
+        },
+        else => unreachable,
+    }
+    const value = tok[vstart..];
+    if (value.len == 0) return null; // value 空
+    return .{ .op = op, .key = tok[0..i], .value = value };
+}
+
+/// digest payload（1行）から top-level `key=value` の value を抽出する純関数。
+/// 空白（` \t`）のみで token 化し `key ++ "="` で始まる最初のトークンの `=` 以降を返す。
+/// `tok[key.len]=='='` を要求することで prefix 衝突（`f` が `frames=`/`f0=` を誤マッチ）を防ぐ。
+/// ネスト（`l0{..}`）や JSON は空白を含まず 1 トークンに glue されるので拾われない。
+fn findKeyValue(payload: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, payload, " \t");
+    while (it.next()) |tok| {
+        if (tok.len > key.len and std.mem.startsWith(u8, tok, key) and tok[key.len] == '=') {
+            return tok[key.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// actual を op で expected と比較する純関数。
+/// `>`/`<` は両辺 f64 parse 必須（不能は fail）。`=`/`!=` は両辺 f64 parse 可能なら数値、それ以外は文字列一致。
+fn compareValues(actual: []const u8, op: CmpOp, expected: []const u8) bool {
+    const af: ?f64 = std.fmt.parseFloat(f64, actual) catch null;
+    const ef: ?f64 = std.fmt.parseFloat(f64, expected) catch null;
+    return switch (op) {
+        .gt => af != null and ef != null and af.? > ef.?,
+        .lt => af != null and ef != null and af.? < ef.?,
+        .eq => if (af != null and ef != null) af.? == ef.? else std.mem.eql(u8, actual, expected),
+        .ne => if (af != null and ef != null) af.? != ef.? else !std.mem.eql(u8, actual, expected),
+    };
+}
+
+/// payload（digest 1行）に対し式を評価する純関数。true=pass。key 不在は fail。
+fn evalExpect(payload: []const u8, expr: ExpectExpr) bool {
+    switch (expr.form) {
+        .contains => |sub| return std.mem.indexOf(u8, payload, sub) != null,
+        .cmp => |c| {
+            const actual = findKeyValue(payload, c.key) orelse return false; // key 不在 = fail
+            return compareValues(actual, c.op, c.value);
+        },
+    }
+}
+
+/// `expect`/`assert` コマンド本体。probe の digest payload を取り式を評価し、合否を emit + 記帳する。
+/// - replay: 失敗は `expect_failures` に記帳。assert は即 `replayExitIfFailed()`（fail-fast abort）。
+/// - live  : プロセスを終了せず `ok`/`fail` 行を返すだけ（記帳しない）。∴ live では expect と assert は同挙動。
+fn handleExpect(it: *Tok, is_assert: bool) void {
+    const kind: []const u8 = if (is_assert) "assert" else "expect";
+    const expr_text = std.mem.trim(u8, it.rest(), " \t"); // 診断表示用（parse 前に確保。cmd_buf への slice）
+    const expr = parseExpectExpr(it) orelse return reportExpect(kind, false, expr_text, "invalid syntax", is_assert);
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    switch (digestPayload(expr.probe, &buf)) {
+        .unavailable => |reason| reportExpect(kind, false, expr_text, reason, is_assert),
+        .ok => |payload| {
+            const pass = evalExpect(payload, expr);
+            reportExpect(kind, pass, expr_text, if (pass) null else payload, is_assert);
+        },
+    }
+}
+
+/// 合否を emit（replay=stderr / live=resp_buf）し、replay の失敗を記帳する。
+/// actual は失敗時のみ意味を持つ（payload か unavailable 理由。pass 時は null）。
+fn reportExpect(kind: []const u8, pass: bool, expr_text: []const u8, actual: ?[]const u8, is_assert: bool) void {
+    if (mode == .live) {
+        appendResp(if (pass) "ok " else "fail ");
+        appendResp(expr_text);
+        if (!pass) {
+            if (actual) |a| {
+                appendResp(" actual=");
+                appendResp(a);
+            }
+        }
+        appendResp("\n");
+    } else if (pass) {
+        std.debug.print("[harness] {s} ok line {d}: {s}\n", .{ kind, line_no, expr_text });
+    } else if (actual) |a| {
+        std.debug.print("[harness] {s} FAILED line {d}: {s} actual={s}\n", .{ kind, line_no, expr_text, a });
+    } else {
+        std.debug.print("[harness] {s} FAILED line {d}: {s}\n", .{ kind, line_no, expr_text });
+    }
+
+    if (!pass and mode == .replay) {
+        expect_failures += 1;
+        if (is_assert) replayExitIfFailed(); // assert は即 abort
+    }
+}
+
+/// replay 終了時: 失敗があれば summary を出して非0 exit する。
+/// **mode gate を関数内に閉じる**ので live / 通常実行（disabled）では常に no-op（process.exit を呼ばない）。
+fn replayExitIfFailed() void {
+    if (mode == .replay and expect_failures > 0) {
+        std.debug.print("[harness] expect: {d} 件失敗\n", .{expect_failures});
+        std.process.exit(1);
+    }
 }
 
 // ============================================================================
@@ -1010,6 +1204,7 @@ fn resetForTest() void {
     line_no = 0;
     steps_remaining = 0;
     quit_requested = false;
+    expect_failures = 0;
     frame_index = 0;
     inject_count = 0;
     inject_read = 0;
@@ -1422,6 +1617,198 @@ test "live framing: digest/snapshot が response buffer に prefix なしで積�
     try testing.expect(std.mem.endsWith(u8, resp_buf.items, "/tmp/a.wav\n"));
     try testing.expect(std.mem.indexOf(u8, resp_buf.items, "[harness]") == null);
     frame_pixels = &.{};
+}
+
+// ============================================================================
+// expect / assert（アサーション層。TASK-78）tests
+// ============================================================================
+
+test "parseExpectExpr: 正常系（cmp 4演算子 / contains / digest エイリアス / 負数小数）" {
+    {
+        var it = std.mem.tokenizeAny(u8, "fb crc=ABCD1234", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expectEqualStrings("fb", e.probe);
+        try testing.expect(e.form == .cmp);
+        try testing.expectEqual(CmpOp.eq, e.form.cmp.op);
+        try testing.expectEqualStrings("crc", e.form.cmp.key);
+        try testing.expectEqualStrings("ABCD1234", e.form.cmp.value);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "audio silent!=1", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expectEqual(CmpOp.ne, e.form.cmp.op);
+        try testing.expectEqualStrings("silent", e.form.cmp.key);
+        try testing.expectEqualStrings("1", e.form.cmp.value);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "canvas nz>0", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expectEqual(CmpOp.gt, e.form.cmp.op);
+        try testing.expectEqualStrings("nz", e.form.cmp.key);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "audio f0<500", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expectEqual(CmpOp.lt, e.form.cmp.op);
+    }
+    {
+        // 負数・小数 value（op より後は全部 value）
+        var it = std.mem.tokenizeAny(u8, "audio rms>-0.5", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expectEqualStrings("rms", e.form.cmp.key);
+        try testing.expectEqualStrings("-0.5", e.form.cmp.value);
+    }
+    {
+        // `expect digest fb ...` エイリアス（第2トークン digest を読み飛ばす）
+        var it = std.mem.tokenizeAny(u8, "digest fb crc=ABCD", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expectEqualStrings("fb", e.probe);
+        try testing.expectEqualStrings("ABCD", e.form.cmp.value);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "fb contains #FF0000", " \t");
+        const e = parseExpectExpr(&it).?;
+        try testing.expect(e.form == .contains);
+        try testing.expectEqualStrings("#FF0000", e.form.contains);
+    }
+}
+
+test "parseExpectExpr: 異常系は null（fail-fast: op 欠落・空・余剰・! 単独）" {
+    const bad = [_][]const u8{
+        "fb crcABCD", // op 記号無し
+        "fb", // 式無し
+        "", // probe 無し
+        "fb =5", // key 空
+        "fb crc=", // value 空
+        "fb crc!5", // `!` 単独（`=` が続かない）
+        "fb crc=A extra", // 余剰トークン
+        "fb contains", // substr 欠落
+        "fb contains a b", // substr 余剰
+        "digest", // エイリアス後に probe 無し
+        "digest fb", // エイリアス後 probe だけで式無し
+    };
+    for (bad) |s| {
+        var it = std.mem.tokenizeAny(u8, s, " \t");
+        try testing.expect(parseExpectExpr(&it) == null);
+    }
+}
+
+test "findKeyValue: top-level 抽出 / prefix 衝突防止 / ネスト・JSON 非抽出" {
+    const audio = "rms=0.5000 peak=0.7000 f0=440.0 silent=0 frames=4096";
+    try testing.expectEqualStrings("0.5000", findKeyValue(audio, "rms").?);
+    try testing.expectEqualStrings("440.0", findKeyValue(audio, "f0").?);
+    try testing.expectEqualStrings("4096", findKeyValue(audio, "frames").?);
+    try testing.expectEqualStrings("0", findKeyValue(audio, "silent").?);
+    // prefix 衝突: "f" は f0=/frames= を誤マッチしない（tok[key.len]=='=' 要求）
+    try testing.expect(findKeyValue(audio, "f") == null);
+    try testing.expect(findKeyValue(audio, "nope") == null);
+
+    // ネスト（canvas 風）: top-level layers/comp は拾える、内側 crc/nz は漏れない
+    const canvas = "32x32 layers=2 selected=0 comp=DEADBEEF l0{v=1,op=1.00,crc=CAFEBABE,nz=42}";
+    try testing.expectEqualStrings("2", findKeyValue(canvas, "layers").?);
+    try testing.expectEqualStrings("DEADBEEF", findKeyValue(canvas, "comp").?);
+    try testing.expect(findKeyValue(canvas, "nz") == null); // ネスト key は漏れない
+    try testing.expect(findKeyValue(canvas, "crc") == null); // 内側 crc は top-level comp とは別
+
+    // JSON（stats 風）: `key=` 形でないので拾わない → contains を使う想定
+    const json = "{\"frame\":123,\"virtual_fps\":60.0}";
+    try testing.expect(findKeyValue(json, "frame") == null);
+}
+
+test "compareValues: 数値/文字列/大小の切り替え" {
+    // 数値 =（0.5 ≒ 0.5000）
+    try testing.expect(compareValues("0.5000", .eq, "0.5"));
+    try testing.expect(!compareValues("0.5000", .eq, "0.6"));
+    // 文字列 =（crc hex は非数値 → 完全一致）
+    try testing.expect(compareValues("ABCD1234", .eq, "ABCD1234"));
+    try testing.expect(!compareValues("ABCD1234", .eq, "ABCD9999"));
+    // !=
+    try testing.expect(compareValues("ABCD", .ne, "DCBA"));
+    try testing.expect(!compareValues("5", .ne, "5.0")); // 数値等価 → != は false
+    // > <（両辺数値必須）
+    try testing.expect(compareValues("4096", .gt, "4000"));
+    try testing.expect(!compareValues("4096", .gt, "5000"));
+    try testing.expect(compareValues("440.0", .lt, "500"));
+    // > < で非数値は fail（両辺 f64 必須）
+    try testing.expect(!compareValues("ABCD", .gt, "0"));
+    try testing.expect(!compareValues("5", .lt, "xyz"));
+}
+
+test "evalExpect: cmp / contains / key 不在" {
+    const audio = "rms=0.5000 peak=0.7000 f0=440.0 silent=0 frames=4096";
+    try testing.expect(evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .eq, .key = "silent", .value = "0" } } }));
+    try testing.expect(evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .gt, .key = "rms", .value = "0" } } }));
+    try testing.expect(!evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .gt, .key = "nope", .value = "0" } } })); // key 不在 = fail
+    try testing.expect(evalExpect(audio, .{ .probe = "audio", .form = .{ .contains = "f0=440.0" } }));
+    try testing.expect(!evalExpect(audio, .{ .probe = "audio", .form = .{ .contains = "nonexistent" } }));
+}
+
+test "expect replay: expect_failures が 成功=据置 / 失敗=+1 / 未知probe=+1（EOF 未到達で exit 回避）" {
+    resetForTest(); // mode=.replay
+    // 既知 fb フレーム（2x2）を用意して crc を確定
+    var px = [_]u32{ 0xFF000000, 0xFF000000, 0xFF000000, 0xFF0000FF };
+    frame_pixels = px[0..];
+    frame_w = 2;
+    frame_h = 2;
+    have_frame = true;
+    defer frame_pixels = &.{};
+    const crc = png.crc32(std.mem.sliceAsBytes(px[0..4]));
+
+    var sbuf: [256]u8 = undefined;
+    // 正 crc(pass)→step / 偽 crc(fail)→step / 未知 probe(fail)→step。
+    // **EOF/quit に到達させない**（step で止め、最後は pollGate を呼ばない）ことで replayExitIfFailed の exit を踏まない。
+    cmd_buf = std.fmt.bufPrint(&sbuf, "expect fb crc={X:0>8}\nstep 1\nexpect fb crc=00000000\nstep 1\nexpect nosuch x=1\nstep 1\n", .{crc}) catch unreachable;
+    cursor = 0;
+
+    try testing.expect(pollGate(true)); // frame1: 正 crc(pass) → step
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+    try testing.expect(pollGate(true)); // frame2: 偽 crc(fail) → step
+    try testing.expectEqual(@as(usize, 1), expect_failures);
+    try testing.expect(pollGate(true)); // frame3: 未知 probe(fail) → step
+    try testing.expectEqual(@as(usize, 2), expect_failures);
+    // ここで pollGate を再度呼ぶと EOF → replayExitIfFailed で exit(1) するので**呼ばない**。
+    expect_failures = 0; // 次テストへの漏れ防止（明示。resetForTest も後続で行う）
+}
+
+test "expect live: ok/fail 行が resp_buf に積まれる / live は記帳せず assert も exit しない" {
+    resetForTest();
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var px = [_]u32{0xFF010203};
+    frame_pixels = px[0..];
+    frame_w = 1;
+    frame_h = 1;
+    have_frame = true;
+    defer frame_pixels = &.{};
+    const crc = png.crc32(std.mem.sliceAsBytes(px[0..1]));
+
+    // pass → "ok fb crc=..."
+    var lbuf: [64]u8 = undefined;
+    {
+        const line = std.fmt.bufPrint(&lbuf, "fb crc={X:0>8}", .{crc}) catch unreachable;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        handleExpect(&it, false);
+    }
+    try testing.expect(std.mem.startsWith(u8, resp_buf.items, "ok fb crc="));
+    resp_buf.clearRetainingCapacity();
+
+    // fail（actual= 付き）。live なので expect_failures は増えない
+    {
+        var it = std.mem.tokenizeAny(u8, "fb crc=00000000", " \t");
+        handleExpect(&it, false);
+    }
+    try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail fb crc=00000000 actual="));
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+    resp_buf.clearRetainingCapacity();
+
+    // assert + 未知 probe も live では exit せず fail 行 + 理由のみ
+    {
+        var it = std.mem.tokenizeAny(u8, "nosuch x=1", " \t");
+        handleExpect(&it, true);
+    }
+    try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail nosuch x=1 actual=unknown probe"));
+    try testing.expectEqual(@as(usize, 0), expect_failures);
 }
 
 // ============================================================================

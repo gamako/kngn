@@ -462,6 +462,10 @@ snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n>（mono downmix・自己相関 f0）
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...}（JSON 1行）
+expect fb crc=8702DD71     # expect <probe> <key><op><value>（op ∈ = != > <）。digest payload の top-level k=v と照合
+expect audio silent=0      # 一致で ok / 不一致で fail。replay は失敗を溜め終了時に非0 exit、live は ok/fail 行を返す
+assert fb crc=8702DD71     # expect と同評価。replay では失敗した時点で即 非0 exit（fail-fast abort）
+expect fb contains crc=87  # contains <substr>: digest 1行への部分文字列一致（ネスト/JSON はこちらで照合）
 quit                       # 終了（EOF でも終了）
 ```
 
@@ -470,6 +474,13 @@ quit                       # 終了（EOF でも終了）
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
 - **inject の修飾子トークン（TASK-32.5）**: `inject` の必須引数の後に `shift`/`ctrl`/`alt`/`cmd` を 0 個以上付けると、その KeyEvent/MouseEvent の `modifiers` に反映される（順不同・大小無視）。key_down/up・mouse_move/down/up・scroll の全経路で使える。例: `inject key_down S cmd`（Cmd+S）/ `inject key_down Z cmd`（undo）/ `inject mouse_down left alt`。**未知トークンが 1 つでもあれば警告を出し、そのイベントは注入されない（fail-fast。修飾子名の typo を握りつぶさない）**。修飾子無しは従来通り空 modifiers。
+- **expect / assert（アサーション層 / TASK-78）**: probe の **digest 1行 payload** に期待値照合を行い、スクリプトが合否を **exit code / レスポンス**に落とせるようにする（AI が目視なしで自律反復するための乗数施策）。
+  - 文法: `expect <probe> <key><op><value>` / `assert <probe> <key><op><value>` / `expect <probe> contains <substr>`。`expect digest <probe> ...` のように第2トークン `digest` はエイリアスとして読み飛ばす。演算子は `=` `!=` `>` `<` + `contains` の最小セット。
+  - **値の比較規則**: `>` `<` は両辺 f64 parse 必須（不能は失敗）。`=` `!=` は両辺 f64 parse 可能なら数値比較（`rms=0.5` ≒ `0.5000`）、不能なら文字列完全一致（crc hex はこちら）。crc は digest 出力の 8 桁を**そのままコピペ**する運用（全桁数字の crc に短縮値を渡すと数値一致で誤通過し得るため）。
+  - **key 抽出は top-level `k=v`（空白区切り）のみ**。ネスト（canvas の `l0{v=..,crc=..,nz=..}`）や JSON（`stats` の `{"frame":..}`）は 1 トークンに glue され key として拾われない → それらは `contains` を使う（substr は空白を含められない 1 トークン）。
+  - **合否と exit code**: replay = stderr `[harness] expect ok/FAILED line N: <expr> [actual=<payload|理由>]`。`expect` の失敗は溜めて**終了時（EOF/quit/window close いずれの経路でも）に 1 件以上で非0 exit**、`assert` の失敗は**その場で即 非0 exit**（fail-fast abort。exit(1) は後始末を飛ばす debug 挙動）。live = レスポンス行 `ok`/`fail <probe> <expr> [actual=..]` を返すだけで**プロセスは終了しない**（∴ live では expect と assert は同挙動）。`scripts/drive` は**レスポンス各行**を走査し `fail ` 行頭があれば自身も非0 exit する（`error:` 等の警告は非0化しない）。
+  - **fail-fast（typo を握りつぶさない）**: 未知 probe 名 / 不正構文（op 欠落・key/value 空・`!` 単独）/ 余剰トークン / key 不在 / payload 未確定（fb present 前）はすべて**失敗**として扱う。
+  - **record→replay 対称・harness 無効時 no-op** は不変（既存機構にそのまま乗る）。
 
 ### 使い方（replay = file トランスポート）
 
