@@ -45,7 +45,7 @@ video-proto-main/
 │   ├── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
 │   ├── modular/       # モジュラー・グラフエンジン（TASK-40。kit 非収録=流動中）
 │   ├── paint/         # エディタ族の共有コア（旧 apps/editor/core。ADR-007 R6 で格上げ。kit 非収録）
-│   │                  #   Canvas(多レイヤ) / Tool(Pen/Eraser/Brush) / UndoStack / StrokeRecorder / Path / Selection / PNG I/O
+│   │                  #   Canvas(多レイヤ) / Document(frames×layers) / Tool(Pen/Eraser/Brush) / UndoStack / StrokeRecorder / Path / Selection / PNG I/O / document_io(.pix)
 │   └── viz/           # 可視化（旧 apps/synth/spectrogram・scope。synth/modular/patch が共有。kit 非収録）
 ├── apps/              # L4 終端の消費者（kit-only。R5。流動 lib=modular/paint/viz のみ直 import 可）
 │   ├── editor/apps/pixie/ # ドット絵エディタ（Pen/Eraser/レイヤー/範囲選択/ベジェ/DB16 パレット/Undo/PNG）
@@ -306,7 +306,7 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`core/pla
   `Tool`(vtable, Pen/Eraser) / `UndoStack` / `StrokeRecorder` / PNG I/O。root は `libs/paint/src/paint.zig`。
   「エディタ族の共有 lib」なので汎用 kit には載せず、pixie 等の該当 app だけが直 import する。
   使い方は **`libs/paint/README.md`** を参照。
-  - 不変条件: 表示は `composite()`（白背景合成）。**PNG 保存は `savePNG` に渡す pixels を用途で使い分け**（白背景 `composite()` は保存に使わない）: paint の round-trip は raw layer pixels（`layerPixels(idx)`、透明保持）、pixie の通常保存（TASK-43 以降）は全 visible layer を合成した `compositeStraight()`（フラット透明 PNG。単層 opacity=255 で raw と恒等）。pixie の PNG open はフラット画像を layer0 へ読み込み layer 構造は保持しない。
+  - 不変条件: 表示は `composite()`（白背景合成）。**PNG 保存は `savePNG` に渡す pixels を用途で使い分け**（白背景 `composite()` は保存に使わない）: paint の round-trip は raw layer pixels（`layerPixels(idx)`、透明保持）、pixie の通常保存（TASK-43 以降）は全 visible layer を合成した `compositeStraight()`（フラット透明 PNG。単層 opacity=255 で raw と恒等）。pixie の PNG open はフラット画像を layer0 へ読み込み layer 構造は保持しない。**レイヤー保持は `.pix` プロジェクト形式**（`Document` + `document_io`。TASK-63。serde container 上に width/height/frame/layer を直列化し round-trip で bit 復元。layer payload は raw layerPixels、連番書き出し `exportPngSequence` は compositeStraight。undo は非永続=load でリセット。MVP は 1 frame/raster・256×256 固定で pixie の Prj Save/Prj Open から）。
 - **apps/editor/apps/pixie**: ドット絵エディタ MVP。`canvas_input.zig`（入力状態機械）が
   press 起点 capture → Tool 経由で stroke を駆動する。platform / gui / png は `@import("kit")` 経由
   （`kit.platform` / `kit.gui` / `kit.png`）、paint のみ直 import（kit-only 消費者の R5 + 流動 lib 例外）。
@@ -658,7 +658,7 @@ zig build -Dinstall-all=true
 zig build test
 
 # 個別テスト（集約 test に全て含まれる）
-zig build test-core             # libs/paint（undo + tool）+ pixie 入力状態機械
+zig build test-core             # libs/paint（undo + tool + Document/document_io .pix round-trip）+ pixie 入力状態機械
 zig build test-gui              # libs/gui
 zig build test-png-roundtrip    # PNG encode/decode round-trip（+ canvas 単体）
 zig build test-png-format       # PNG format 変換

@@ -23,8 +23,9 @@ pub const PixelDiff = struct { idx: u32, before: u32, after: u32 };
 pub const Offset = struct { dx: i16, dy: i16, cov: u8 };
 pub const Dab = struct { offsets: []const Offset };
 
-/// 1 操作 = 1 コマンド。diffs は gpa 所有の owned slice（pop / deinit で free）。
-pub const UndoCmd = union(enum) {
+/// 1 操作の中身（frame 非依存）。diffs / held layer は gpa 所有の owned（pop / deinit で free）。
+/// tool / selection / path は frame を知らないので `Op` を返し、frame は push 時に付与される（TASK-63）。
+pub const Op = union(enum) {
     paint: struct {
         layer_idx: usize,
         diffs: []PixelDiff,
@@ -57,6 +58,13 @@ pub const UndoCmd = union(enum) {
         before: u8,
         after: u8,
     },
+};
+
+/// 1 undo エントリ = 操作(op) + それが適用されたフレーム(frame)。
+/// frame は Document の frame index。MVP は 1 frame なので常に 0（TASK-45 でアニメ対応）。
+pub const UndoCmd = struct {
+    frame: u32 = 0,
+    op: Op,
 };
 
 /// stroke 記録機械。canvas は所有せず、point/lineTo/stamp に都度渡す。
@@ -164,8 +172,8 @@ pub const StrokeRecorder = struct {
     }
 
     /// stroke を確定する。変更ピクセルが無ければ null（redo を保持するため）。
-    /// 非 null の場合、diffs の所有権は返す UndoCmd へ移る。
-    pub fn finish(self: *StrokeRecorder, gpa: Allocator) ?UndoCmd {
+    /// 非 null の場合、diffs の所有権は返す Op へ移る（frame は push 時に付与）。
+    pub fn finish(self: *StrokeRecorder, gpa: Allocator) ?Op {
         std.debug.assert(self.mode == .replace);
         self.mode = .none;
         if (self.diffs.items.len == 0) return null;
@@ -253,7 +261,7 @@ pub const StrokeRecorder = struct {
 
     /// brush stroke を確定する。canvas が必要（layer!=orig 判定）。変更なしは null。
     /// diff 有無に関わらず touched の coverage を 0 へ戻し（不変条件維持）touched を空にする。
-    pub fn brushFinish(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) ?UndoCmd {
+    pub fn brushFinish(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) ?Op {
         std.debug.assert(self.mode == .brush);
         self.mode = .none;
         const pixels = canvas.layerPixels(self.layer_idx);
@@ -289,51 +297,57 @@ pub const UndoStack = struct {
     }
 
     fn freeStack(gpa: Allocator, stack: *std.ArrayList(UndoCmd)) void {
-        for (stack.items) |cmd| freeCmd(gpa, cmd);
+        for (stack.items) |cmd| freeCmd(gpa, cmd.op);
         stack.deinit(gpa);
     }
 
-    fn freeCmd(gpa: Allocator, cmd: UndoCmd) void {
-        switch (cmd) {
+    fn freeCmd(gpa: Allocator, op: Op) void {
+        switch (op) {
             .paint => |p| gpa.free(p.diffs),
-            .layer_add => |op| if (op.layer) |layer| gpa.free(layer.pixels),
-            .layer_delete => |op| if (op.layer) |layer| gpa.free(layer.pixels),
+            .layer_add => |la| if (la.layer) |layer| gpa.free(layer.pixels),
+            .layer_delete => |ld| if (ld.layer) |layer| gpa.free(layer.pixels),
             .layer_reorder, .layer_visible, .layer_opacity => {},
         }
     }
 
     fn clearRedo(self: *UndoStack, gpa: Allocator) void {
-        for (self.redo.items) |cmd| freeCmd(gpa, cmd);
+        for (self.redo.items) |cmd| freeCmd(gpa, cmd.op);
         self.redo.clearRetainingCapacity();
     }
 
     /// 非空コマンドを積む。redo 履歴をクリアする。空コマンドは渡さないこと（呼び出し側が
-    /// `finish`/`pushClear` で no-op を吸収済み）。
+    /// `finish`/`pushClear` で no-op を吸収済み）。cmd.frame は呼び出し側が付与済み。
     pub fn push(self: *UndoStack, gpa: Allocator, cmd: UndoCmd) void {
         self.clearRedo(gpa);
         // 履歴上限: 最古を解放して trim（イベント時のみの O(n) ポインタシフトは許容。TASK-59）
         if (self.undo.items.len >= max_history) {
-            freeCmd(gpa, self.undo.orderedRemove(0));
+            freeCmd(gpa, self.undo.orderedRemove(0).op);
         }
         self.undo.append(gpa, cmd) catch @panic("UndoStack.push: OOM");
     }
 
     /// 直近のコマンドを取り消す（before 適用）。空スタックでは何もしない。
-    pub fn undoOne(self: *UndoStack, gpa: Allocator, canvas: *Canvas) void {
+    /// `frames` は Document の frame 配列（`[]const *Canvas`）。cmd.frame でどの Canvas に
+    /// 適用するかを解決する（undo→Document 結合を避けるため slice で受ける。TASK-63）。
+    pub fn undoOne(self: *UndoStack, gpa: Allocator, frames: []const *Canvas) void {
         var cmd = self.undo.pop() orelse return;
-        applyBefore(canvas, &cmd);
+        std.debug.assert(cmd.frame < frames.len);
+        applyBefore(frames[cmd.frame], &cmd.op);
         self.redo.append(gpa, cmd) catch @panic("UndoStack.undoOne: OOM");
     }
 
     /// 取り消したコマンドをやり直す（after 適用）。空スタックでは何もしない。
-    pub fn redoOne(self: *UndoStack, gpa: Allocator, canvas: *Canvas) void {
+    pub fn redoOne(self: *UndoStack, gpa: Allocator, frames: []const *Canvas) void {
         var cmd = self.redo.pop() orelse return;
-        applyAfter(canvas, &cmd);
+        std.debug.assert(cmd.frame < frames.len);
+        applyAfter(frames[cmd.frame], &cmd.op);
         self.undo.append(gpa, cmd) catch @panic("UndoStack.redoOne: OOM");
     }
 
-    fn applyBefore(canvas: *Canvas, cmd: *UndoCmd) void {
-        switch (cmd.*) {
+    // op は *Op で受ける（layer_add/delete が op.layer の所有権を undo/redo 間で移動するため。
+    // 値渡しにすると所有権移動が壊れる。TASK-63 codex 指摘）。
+    fn applyBefore(canvas: *Canvas, op_ptr: *Op) void {
+        switch (op_ptr.*) {
             .paint => |p| {
                 const pixels = canvas.layerPixels(p.layer_idx);
                 for (p.diffs) |d| pixels[d.idx] = d.before;
@@ -361,8 +375,8 @@ pub const UndoStack = struct {
         }
     }
 
-    fn applyAfter(canvas: *Canvas, cmd: *UndoCmd) void {
-        switch (cmd.*) {
+    fn applyAfter(canvas: *Canvas, op_ptr: *Op) void {
+        switch (op_ptr.*) {
             .paint => |p| {
                 const pixels = canvas.layerPixels(p.layer_idx);
                 for (p.diffs) |d| pixels[d.idx] = d.after;
@@ -393,7 +407,7 @@ pub const UndoStack = struct {
     /// 全消去を 1 コマンドとして原子的に積む（build→memset→push を 1 API に集約し、
     /// 呼び出し側が memset と push を取り違える事故を防ぐ）。変更ゼロなら何もしない。
     /// 注: 「API 上の集約」であって OOM ロールバックではない。途中 OOM は @panic。
-    pub fn pushClear(self: *UndoStack, gpa: Allocator, canvas: *Canvas, layer_idx: usize) void {
+    pub fn pushClear(self: *UndoStack, gpa: Allocator, canvas: *Canvas, frame: u32, layer_idx: usize) void {
         const pixels = canvas.layerPixels(layer_idx);
         var diffs: std.ArrayList(PixelDiff) = .empty;
         // 上限 = 層の全画素。事前確保してループ内の再確保を排除（TASK-59）
@@ -408,7 +422,7 @@ pub const UndoStack = struct {
         }
         @memset(pixels, 0);
         const owned = diffs.toOwnedSlice(gpa) catch @panic("UndoStack.pushClear: OOM");
-        self.push(gpa, .{ .paint = .{ .layer_idx = layer_idx, .diffs = owned } });
+        self.push(gpa, .{ .frame = frame, .op = .{ .paint = .{ .layer_idx = layer_idx, .diffs = owned } } });
     }
 };
 
@@ -453,16 +467,16 @@ const TestEditor = struct {
         self.rec.lineTo(&self.canvas, self.gpa, x, y);
     }
     fn endStroke(self: *TestEditor) void {
-        if (self.rec.finish(self.gpa)) |cmd| self.undo.push(self.gpa, cmd);
+        if (self.rec.finish(self.gpa)) |op| self.undo.push(self.gpa, .{ .op = op });
     }
     fn undoOp(self: *TestEditor) void {
-        self.undo.undoOne(self.gpa, &self.canvas);
+        self.undo.undoOne(self.gpa, &.{&self.canvas});
     }
     fn redoOp(self: *TestEditor) void {
-        self.undo.redoOne(self.gpa, &self.canvas);
+        self.undo.redoOne(self.gpa, &.{&self.canvas});
     }
     fn clearAll(self: *TestEditor) void {
-        self.undo.pushClear(self.gpa, &self.canvas, 0);
+        self.undo.pushClear(self.gpa, &self.canvas, 0, 0);
     }
 };
 
@@ -622,22 +636,22 @@ test "layer add: undo/redo keeps pixels and selected layer ownership consistent"
     const selected_before = c.selected_layer;
     const idx = try c.addLayer(gpa);
     c.layerPixels(idx)[0] = RED;
-    undo_stack.push(gpa, .{ .layer_add = .{
+    undo_stack.push(gpa, .{ .op = .{ .layer_add = .{
         .index = idx,
         .selected_before = selected_before,
         .selected_after = c.selected_layer,
-    } });
+    } } });
 
-    undo_stack.undoOne(gpa, &c);
+    undo_stack.undoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
     try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
-    try std.testing.expect(undo_stack.redo.items[0].layer_add.layer != null);
+    try std.testing.expect(undo_stack.redo.items[0].op.layer_add.layer != null);
 
-    undo_stack.redoOne(gpa, &c);
+    undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
     try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
     try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
-    try std.testing.expect(undo_stack.undo.items[0].layer_add.layer == null);
+    try std.testing.expect(undo_stack.undo.items[0].op.layer_add.layer == null);
 }
 
 test "layer delete: undo/redo restores pixels metadata and selected layer" {
@@ -655,25 +669,25 @@ test "layer delete: undo/redo restores pixels metadata and selected layer" {
 
     const selected_before = c.selected_layer;
     const removed = c.deleteLayer(1) orelse return error.TestUnexpectedNull;
-    undo_stack.push(gpa, .{ .layer_delete = .{
+    undo_stack.push(gpa, .{ .op = .{ .layer_delete = .{
         .index = 1,
         .selected_before = selected_before,
         .selected_after = c.selected_layer,
         .layer = removed,
-    } });
+    } } });
 
-    undo_stack.undoOne(gpa, &c);
+    undo_stack.undoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
     try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
     try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
     try std.testing.expect(!c.layers.items[1].visible);
     try std.testing.expectEqual(@as(u8, 123), c.layers.items[1].opacity);
-    try std.testing.expect(undo_stack.redo.items[0].layer_delete.layer == null);
+    try std.testing.expect(undo_stack.redo.items[0].op.layer_delete.layer == null);
 
-    undo_stack.redoOne(gpa, &c);
+    undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
     try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
-    try std.testing.expect(undo_stack.undo.items[0].layer_delete.layer != null);
+    try std.testing.expect(undo_stack.undo.items[0].op.layer_delete.layer != null);
 }
 
 test "layer reorder visible opacity: undo/redo restores structure and metadata" {
@@ -688,34 +702,34 @@ test "layer reorder visible opacity: undo/redo restores structure and metadata" 
     c.layerPixels(1)[0] = RED;
     c.selected_layer = 1;
 
-    undo_stack.push(gpa, .{ .layer_reorder = .{
+    undo_stack.push(gpa, .{ .op = .{ .layer_reorder = .{
         .from = 1,
         .to = 0,
         .selected_before = 1,
         .selected_after = 0,
-    } });
+    } } });
     try std.testing.expect(c.moveLayer(1, 0));
-    undo_stack.undoOne(gpa, &c);
+    undo_stack.undoOne(gpa, &.{&c});
     try std.testing.expectEqual(BLACK, c.layerPixels(0)[0]);
     try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
     try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
-    undo_stack.redoOne(gpa, &c);
+    undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqual(RED, c.layerPixels(0)[0]);
     try std.testing.expectEqual(BLACK, c.layerPixels(1)[0]);
     try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
 
-    undo_stack.push(gpa, .{ .layer_visible = .{ .index = 0, .before = true, .after = false } });
+    undo_stack.push(gpa, .{ .op = .{ .layer_visible = .{ .index = 0, .before = true, .after = false } } });
     _ = c.setLayerVisible(0, false);
-    undo_stack.undoOne(gpa, &c);
+    undo_stack.undoOne(gpa, &.{&c});
     try std.testing.expect(c.layers.items[0].visible);
-    undo_stack.redoOne(gpa, &c);
+    undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expect(!c.layers.items[0].visible);
 
-    undo_stack.push(gpa, .{ .layer_opacity = .{ .index = 0, .before = 255, .after = 77 } });
+    undo_stack.push(gpa, .{ .op = .{ .layer_opacity = .{ .index = 0, .before = 255, .after = 77 } } });
     _ = c.setLayerOpacity(0, 77);
-    undo_stack.undoOne(gpa, &c);
+    undo_stack.undoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(u8, 255), c.layers.items[0].opacity);
-    undo_stack.redoOne(gpa, &c);
+    undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(u8, 77), c.layers.items[0].opacity);
 }
 
@@ -839,7 +853,7 @@ test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
     rec.brushBegin(0, 0xFF00FF00, 180); // 緑, opacity 180
     rec.stamp(&c, gpa, 1, 1, dab);
     rec.stampLineTo(&c, gpa, 2, 2, dab);
-    if (rec.brushFinish(&c, gpa)) |cmd| undo_stack.push(gpa, cmd);
+    if (rec.brushFinish(&c, gpa)) |op| undo_stack.push(gpa, .{ .op = op });
 
     // PNG round-trip（保存=raw layer pixels。partial-alpha 込み一致）
     const raw = c.layers.items[0].pixels;
@@ -853,7 +867,7 @@ test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
     // undo で空（原本）へ復元
-    undo_stack.undoOne(gpa, &c);
+    undo_stack.undoOne(gpa, &.{&c});
     try std.testing.expectEqualSlices(u32, blank, c.layers.items[0].pixels);
 }
 
@@ -951,27 +965,27 @@ test "UndoStack: 履歴上限で最古が解放される（paint + layer_delete 
     // 最古（最初に trim される側）に held layer 持ちの layer_delete を積む
     const held = try gpa.alloc(u32, 4);
     @memset(held, 0xFF112233);
-    stack.push(gpa, .{ .layer_delete = .{ .index = 0, .layer = .{ .pixels = held }, .selected_before = 0, .selected_after = 0 } });
+    stack.push(gpa, .{ .op = .{ .layer_delete = .{ .index = 0, .layer = .{ .pixels = held }, .selected_before = 0, .selected_after = 0 } } });
 
     // 上限まで paint を積む（+1 で最古の layer_delete が trim → held が解放される）
     var i: usize = 0;
     while (i < UndoStack.max_history) : (i += 1) {
         const diffs = try gpa.dupe(PixelDiff, &.{.{ .idx = 0, .before = 0, .after = 0xFF000000 }});
-        stack.push(gpa, .{ .paint = .{ .layer_idx = 0, .diffs = diffs } });
+        stack.push(gpa, .{ .op = .{ .paint = .{ .layer_idx = 0, .diffs = diffs } } });
     }
     try std.testing.expectEqual(UndoStack.max_history, stack.undo.items.len);
     // 先頭は paint（layer_delete は trim 済み）
-    try std.testing.expect(stack.undo.items[0] == .paint);
+    try std.testing.expect(stack.undo.items[0].op == .paint);
 
     // さらに積んでも上限維持
     const diffs2 = try gpa.dupe(PixelDiff, &.{.{ .idx = 1, .before = 0, .after = 0xFF0000FF }});
-    stack.push(gpa, .{ .paint = .{ .layer_idx = 0, .diffs = diffs2 } });
+    stack.push(gpa, .{ .op = .{ .paint = .{ .layer_idx = 0, .diffs = diffs2 } } });
     try std.testing.expectEqual(UndoStack.max_history, stack.undo.items.len);
 
     // undo/redo は通常どおり動く
-    stack.undoOne(gpa, &c);
+    stack.undoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(usize, 1), stack.redo.items.len);
-    stack.redoOne(gpa, &c);
+    stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(usize, 0), stack.redo.items.len);
 }
 

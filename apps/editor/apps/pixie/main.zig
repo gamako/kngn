@@ -51,7 +51,7 @@ const MARCH_PERIOD: f64 = 8.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
-const FileOp = enum { save, save_as, open, save_palette, load_palette };
+const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project };
 
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
@@ -131,7 +131,10 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    canvas: core.Canvas,
+    /// ドキュメント（frames × layers。MVP は 1 frame）。Canvas は heap 所有・ポインタ安定（TASK-63）。
+    doc: core.Document,
+    /// アクティブフレームの Canvas（doc.activeCanvas()）。既存参照の churn 最小化のため *Canvas を保持。
+    canvas: *core.Canvas = undefined,
     recorder: core.StrokeRecorder,
     /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
     preview_canvas: core.Canvas,
@@ -183,8 +186,10 @@ const App = struct {
     /// HSV を同期済みの selected。null/不一致なら再同期。
     edit_synced_for: ?usize = null,
     running: bool = true,
-    /// 現在の保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
+    /// 現在の PNG 保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
     current_path: ?[]u8 = null,
+    /// 現在の .pix プロジェクト保存先（gpa 所有。PNG の current_path とは別管理。TASK-63）。
+    current_project_path: ?[]u8 = null,
     /// パレットの .gpl 保存先（gpa 所有。PNG の current_path とは別管理）。
     palette_path: ?[]u8 = null,
     /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
@@ -257,6 +262,8 @@ const App = struct {
             .open => self.doOpen(),
             .save_palette => self.doSavePalette(),
             .load_palette => self.doLoadPalette(),
+            .save_project => self.doSaveProject(),
+            .open_project => self.doOpenProject(),
         }
     }
 
@@ -403,27 +410,90 @@ const App = struct {
         self.setSaveMsg("Loaded: {s}", .{std.fs.path.basename(path)});
     }
 
+    // ── .pix プロジェクト保存/読込（レイヤー構造保持。TASK-63）─────────────────
+
+    /// 記憶している .pix 保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
+    fn doSaveProject(self: *App) void {
+        const path = self.current_project_path orelse return self.doSaveAsProject();
+        core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
+            self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// ダイアログで .pix 保存先を選んで保存。成功時にダイアログ戻り値を current_project_path へ移譲。
+    fn doSaveAsProject(self: *App) void {
+        const maybe = platform.saveFileDialog(self.gpa, self.io, .{
+            .default_name = "untitled.pix",
+            .allowed_ext = "pix",
+        }) catch |err| {
+            self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return; // キャンセル: サイレント no-op
+        core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
+            self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return;
+        };
+        if (self.current_project_path) |old| self.gpa.free(old);
+        self.current_project_path = path; // 移譲
+        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// .pix プロジェクトを読み込んでドキュメントを差し替える（レイヤー構造保持）。
+    /// 進行中 stroke/編集中は破棄。undo/redo はクリア、selection/float 破棄、current_project_path 更新。
+    /// MVP は 256x256 以外を拒否する（layer 復元前にサイズ検査）。任意サイズは resize フェーズ（TASK-39）へ。
+    fn doOpenProject(self: *App) void {
+        if (self.editingBlocked()) return;
+        const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "pix" }) catch |err| {
+            self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return; // キャンセル: サイレント no-op
+        const new_doc = core.document_io.loadDocument(self.io, self.gpa, path, CANVAS_W, CANVAS_H) catch |err| {
+            self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return;
+        };
+        // 成功: 旧 doc を破棄して差し替え、canvas ポインタと preview を張り直す。
+        self.doc.deinit();
+        self.doc = new_doc;
+        self.doc.selected_frame = 0;
+        self.canvas = self.doc.activeCanvas();
+        // ドキュメント差し替え = undo/redo 履歴破棄・選択/フロート破棄（doOpen と同型。AC#4）
+        self.undo.deinit(self.gpa);
+        self.undo = .{};
+        self.canvas.clearSelection();
+        self.sel_in.discardFloat(self.gpa);
+        self.syncPreviewCanvas();
+        if (self.current_project_path) |old| self.gpa.free(old);
+        self.current_project_path = path; // 移譲
+        self.setSaveMsg("Project loaded: {s}", .{std.fs.path.basename(path)});
+    }
+
     /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）
     fn doUndo(self: *App) void {
         if (self.editingBlocked()) return;
-        self.undo.undoOne(self.gpa, &self.canvas);
+        self.undo.undoOne(self.gpa, self.doc.frames.items);
     }
 
     fn doRedo(self: *App) void {
         if (self.editingBlocked()) return;
-        self.undo.redoOne(self.gpa, &self.canvas);
+        self.undo.redoOne(self.gpa, self.doc.frames.items);
     }
 
     fn doClear(self: *App) void {
         if (self.editingBlocked()) return;
-        self.undo.pushClear(self.gpa, &self.canvas, self.canvas.selected_layer);
+        self.undo.pushClear(self.gpa, self.canvas, self.doc.selected_frame, self.canvas.selected_layer);
     }
 
     /// 選択範囲を clipboard へコピー（読み取りのみ・undo 不要）。selection 無しは no-op。
     fn doCopy(self: *App) void {
         if (self.editingBlocked()) return;
         const sel = self.canvas.selection orelse return;
-        const block = core.selection.extract(self.gpa, &self.canvas, self.canvas.selected_layer, sel);
+        const block = core.selection.extract(self.gpa, self.canvas, self.canvas.selected_layer, sel);
         if (self.clipboard) |*old| old.deinit(self.gpa);
         self.clipboard = block;
     }
@@ -432,11 +502,11 @@ const App = struct {
     fn doCut(self: *App) void {
         if (self.editingBlocked()) return;
         const sel = self.canvas.selection orelse return;
-        const block = core.selection.extract(self.gpa, &self.canvas, self.canvas.selected_layer, sel);
+        const block = core.selection.extract(self.gpa, self.canvas, self.canvas.selected_layer, sel);
         if (self.clipboard) |*old| old.deinit(self.gpa);
         self.clipboard = block;
-        if (core.selection.clearRectCmd(self.gpa, &self.canvas, self.canvas.selected_layer, sel)) |cmd| {
-            self.undo.push(self.gpa, cmd);
+        if (core.selection.clearRectCmd(self.gpa, self.canvas, self.canvas.selected_layer, sel)) |cmd| {
+            self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = cmd });
         }
     }
 
@@ -447,8 +517,8 @@ const App = struct {
         const block = self.clipboard orelse return;
         const dx: i32 = if (self.canvas.selection) |s| s.x else 0;
         const dy: i32 = if (self.canvas.selection) |s| s.y else 0;
-        if (core.selection.pasteCmd(self.gpa, &self.canvas, self.canvas.selected_layer, block, dx, dy, self.blend_mode)) |cmd| {
-            self.undo.push(self.gpa, cmd);
+        if (core.selection.pasteCmd(self.gpa, self.canvas, self.canvas.selected_layer, block, dx, dy, self.blend_mode)) |cmd| {
+            self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = cmd });
         }
         const dest = core.Rect{ .x = dx, .y = dy, .w = @intCast(block.w), .h = @intCast(block.h) };
         self.canvas.setSelection(core.selection.clipRect(dest, self.canvas.width, self.canvas.height));
@@ -461,11 +531,11 @@ const App = struct {
             self.setSaveMsg("Layer add failed: {s}", .{@errorName(err)});
             return;
         };
-        self.undo.push(self.gpa, .{ .layer_add = .{
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
             .index = idx,
             .selected_before = selected_before,
             .selected_after = self.canvas.selected_layer,
-        } });
+        } } });
     }
 
     fn doDeleteLayer(self: *App) void {
@@ -473,12 +543,12 @@ const App = struct {
         const idx = self.canvas.selected_layer;
         const selected_before = self.canvas.selected_layer;
         const removed = self.canvas.deleteLayer(idx) orelse return;
-        self.undo.push(self.gpa, .{ .layer_delete = .{
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_delete = .{
             .index = idx,
             .selected_before = selected_before,
             .selected_after = self.canvas.selected_layer,
             .layer = removed,
-        } });
+        } } });
     }
 
     fn doMoveLayer(self: *App, delta: i32) void {
@@ -490,12 +560,12 @@ const App = struct {
         if (to >= self.canvas.layers.items.len or to == from) return;
         const selected_before = self.canvas.selected_layer;
         if (!self.canvas.moveLayer(from, to)) return;
-        self.undo.push(self.gpa, .{ .layer_reorder = .{
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_reorder = .{
             .from = from,
             .to = to,
             .selected_before = selected_before,
             .selected_after = self.canvas.selected_layer,
-        } });
+        } } });
     }
 
     fn doToggleLayerVisible(self: *App, idx: usize) void {
@@ -503,7 +573,7 @@ const App = struct {
         const before = self.canvas.layers.items[idx].visible;
         const after = !before;
         _ = self.canvas.setLayerVisible(idx, after);
-        self.undo.push(self.gpa, .{ .layer_visible = .{ .index = idx, .before = before, .after = after } });
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_visible = .{ .index = idx, .before = before, .after = after } } });
     }
 
     fn doSetLayerOpacity(self: *App, idx: usize, value: u8) void {
@@ -511,7 +581,7 @@ const App = struct {
         const before = self.canvas.layers.items[idx].opacity;
         if (before == value) return;
         _ = self.canvas.setLayerOpacity(idx, value);
-        self.undo.push(self.gpa, .{ .layer_opacity = .{ .index = idx, .before = before, .after = value } });
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_opacity = .{ .index = idx, .before = before, .after = value } } });
     }
 
     fn doSelectLayer(self: *App, idx: usize) void {
@@ -635,8 +705,8 @@ const App = struct {
     /// ベジェ確定（現在ブラシ footprint + color/opacity で rasterize → UndoStack へ push）。
     fn commitBezier(self: *App) void {
         const dab = self.brush.footprint();
-        if (self.bezier_editor.rasterizeCommit(&self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |cmd| {
-            self.undo.push(self.gpa, cmd);
+        if (self.bezier_editor.rasterizeCommit(self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |cmd| {
+            self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = cmd });
         }
     }
 };
@@ -960,12 +1030,15 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         .direction = .row,
         .width = .{ .grow = 1 },
         .padding = .{ 4, 4, 4, 4 },
-        .gap = 8,
+        .gap = 5, // TASK-63: プロジェクトボタン 2 個追加で横溢れするため 8→5 に詰める
         .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
     });
     if (ctx.button("Open")) app.pending_file_op = .open;
     if (ctx.button("Save")) app.pending_file_op = .save;
     if (ctx.button("Save As")) app.pending_file_op = .save_as;
+    // .pix プロジェクト（レイヤー保持）。PNG 保存とは別（TASK-63）。ラベルは "Pal" と対の短縮 "Prj"
+    if (ctx.button("Prj Open")) app.pending_file_op = .open_project;
+    if (ctx.button("Prj Save")) app.pending_file_op = .save_project;
     if (ctx.button("Undo")) app.doUndo();
     if (ctx.button("Redo")) app.doRedo();
     if (ctx.button("Pal Save")) app.pending_file_op = .save_palette;
@@ -1178,7 +1251,7 @@ pub fn main(init: std.process.Init) !void {
     var app: App = .{
         .io = init.io,
         .gpa = gpa,
-        .canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
+        .doc = try core.Document.init(gpa, CANVAS_W, CANVAS_H),
         .recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
         .preview_canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
         .preview_rec = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
@@ -1186,10 +1259,12 @@ pub fn main(init: std.process.Init) !void {
         .pen = .{ .color = 0 },
         .brush = .{ .color = 0 },
     };
+    app.canvas = app.doc.activeCanvas(); // doc の frame 0 canvas を指す（ポインタ安定）
     app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
     app.brush.color = app.palette.current();
     defer {
         if (app.current_path) |p| gpa.free(p);
+        if (app.current_project_path) |p| gpa.free(p);
         if (app.palette_path) |p| gpa.free(p);
         if (app.clipboard) |*cb| cb.deinit(gpa);
         app.sel_in.deinit(gpa);
@@ -1199,7 +1274,7 @@ pub fn main(init: std.process.Init) !void {
         app.palette.deinit(gpa);
         app.undo.deinit(gpa);
         app.recorder.deinit(gpa);
-        app.canvas.deinit();
+        app.doc.deinit();
     }
 
     // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
@@ -1268,8 +1343,8 @@ pub fn main(init: std.process.Init) !void {
                         .time = platform.getTime(),
                     };
                     const dab = app.brush.footprint();
-                    if (app.bez_in.update(frame, &app.bezier_editor, &app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |cmd| {
-                        app.undo.push(gpa, cmd);
+                    if (app.bez_in.update(frame, &app.bezier_editor, app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |cmd| {
+                        app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
                     }
                 } else if (app.active_kind == .select and !app.input.capturing) {
                     const frame: selection_input.SelectionInput.Frame = .{
@@ -1280,8 +1355,8 @@ pub fn main(init: std.process.Init) !void {
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
-                    if (app.sel_in.update(frame, &app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |cmd| {
-                        app.undo.push(gpa, cmd);
+                    if (app.sel_in.update(frame, app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |cmd| {
+                        app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
                     }
                 } else {
                     const frame: canvas_input.CanvasInput.Frame = .{
@@ -1292,8 +1367,8 @@ pub fn main(init: std.process.Init) !void {
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
-                    if (app.input.update(frame, app.activeTool(), &app.canvas, &app.recorder, gpa)) |cmd| {
-                        app.undo.push(gpa, cmd);
+                    if (app.input.update(frame, app.activeTool(), app.canvas, &app.recorder, gpa)) |cmd| {
+                        app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
                     }
                 }
             }
@@ -1338,7 +1413,7 @@ pub fn main(init: std.process.Init) !void {
             // 範囲選択のマーチングアンツ（選択があれば常時表示。select ツール時はドラッグ中の preview を優先）
             {
                 const display_sel: ?core.Rect = if (app.active_kind == .select)
-                    (app.sel_in.previewRect(&app.canvas) orelse app.canvas.selection)
+                    (app.sel_in.previewRect(app.canvas) orelse app.canvas.selection)
                 else
                     app.canvas.selection;
                 if (display_sel != null) {

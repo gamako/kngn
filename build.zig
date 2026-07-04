@@ -467,6 +467,19 @@ pub fn build(b: *std.Build) void {
     const core_path_editor_test = b.addTest(.{ .root_module = core_path_editor_mod });
     const run_core_path_editor_test = b.addRunArtifact(core_path_editor_test);
 
+    // Document / document_io（TASK-63）。document_io.zig root で document.zig の test も含む。
+    // serde(container) / png(exportPngSequence の decode 検証) / pixelops(canvas 経由) が要る。
+    const core_document_mod = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/document_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_document_mod.addImport("serde", shared_modules.serde.mod);
+    core_document_mod.addImport("png", shared_modules.png.mod);
+    core_document_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    const core_document_test = b.addTest(.{ .root_module = core_document_mod });
+    const run_core_document_test = b.addRunArtifact(core_document_test);
+
     const canvas_input_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -476,6 +489,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     canvas_input_core.addImport("pixelops", shared_modules.pixelops.mod);
+    canvas_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    canvas_input_core.addImport("serde", shared_modules.serde.mod);
     canvas_input_mod.addImport("paint", canvas_input_core);
     const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
     const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
@@ -501,6 +516,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     selection_input_core.addImport("pixelops", shared_modules.pixelops.mod);
+    selection_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    selection_input_core.addImport("serde", shared_modules.serde.mod);
     selection_input_mod.addImport("paint", selection_input_core);
     const selection_input_test = b.addTest(.{ .root_module = selection_input_mod });
     const run_selection_input_test = b.addRunArtifact(selection_input_test);
@@ -515,6 +532,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bezier_input_core.addImport("pixelops", shared_modules.pixelops.mod);
+    bezier_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    bezier_input_core.addImport("serde", shared_modules.serde.mod);
     bezier_input_mod.addImport("paint", bezier_input_core);
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
@@ -525,6 +544,7 @@ pub fn build(b: *std.Build) void {
     });
     blit_core.addImport("png", shared_modules.png.mod);
     blit_core.addImport("pixelops", shared_modules.pixelops.mod);
+    blit_core.addImport("serde", shared_modules.serde.mod); // paint.zig → document_io（TASK-63）
     const blit_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
         .target = target,
@@ -550,6 +570,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_bezier_test.step);
     test_core_step.dependOn(&run_core_path_test.step);
     test_core_step.dependOn(&run_core_path_editor_test.step);
+    test_core_step.dependOn(&run_core_document_test.step);
     test_core_step.dependOn(&run_canvas_input_test.step);
     test_core_step.dependOn(&run_bezier_input_test.step);
     test_core_step.dependOn(&run_core_selection_test.step);
@@ -1174,6 +1195,7 @@ const SharedModules = struct {
         }) };
         link(paint, png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
         link(paint, pixelops); // blend.zig が委譲 (TASK-51)
+        link(paint, serde); // document_io.zig が versioned container(libs/serde) に委譲 (TASK-63)
 
         // libs/viz（旧 apps/synth の可視化。synth/modular/patch の 3 app が共有するため
         // R6 の「再利用 vs 終端」で libs へ。流動中のため kit 非収録）。

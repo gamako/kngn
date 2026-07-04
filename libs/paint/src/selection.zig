@@ -4,7 +4,7 @@
 //!   （正規化/clip/抽出）と clipboard（`PixelBlock`）、cut/paste/move のピクセル編集を担う。
 //! - **cut/paste/move は `canvas.layerPixels` へ直接書き込み**、selection ゲート付きの
 //!   `StrokeRecorder` は通さない（さもないと paste/move 先が選択範囲外だとゲートに握り潰される）。
-//!   既存 `UndoCmd.paint`（before/after の PixelDiff 列）を再利用して可逆にする。
+//!   既存 `Op.paint`（before/after の PixelDiff 列）を再利用して可逆にする。
 //! - **paste のピクセル配置は `Blend{replace, over}` で切替**（`pasteCmd` 引数）: `replace`=block の
 //!   透明ピクセルも含めそのまま上書き、`over`=`blend.srcOver` 合成（透明部は配置先を残す）。pixie の既定は
 //!   `over`。move（フロート）の焼き込みも同様に render mode で切替。cut/move の元領域は透明（0）へ。
@@ -18,7 +18,7 @@ const Canvas = canvas_mod.Canvas;
 const Rect = canvas_mod.Rect;
 const undo_mod = @import("undo.zig");
 const PixelDiff = undo_mod.PixelDiff;
-const UndoCmd = undo_mod.UndoCmd;
+const Op = undo_mod.Op;
 const blend = @import("blend.zig");
 
 /// paste/move のブロック配置方法。
@@ -86,7 +86,7 @@ pub fn extract(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) Pi
 
 /// rect（canvas 内前提）を透明（0）化する paint cmd を作り canvas へ適用して返す。
 /// 変更ピクセルが無ければ null（cut で選択が空の領域など）。cut の「元領域消去」に使う。
-pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) ?UndoCmd {
+pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) ?Op {
     const px = canvas.layerPixels(layer_idx);
     const w: usize = @intCast(rect.w);
     const h: usize = @intCast(rect.h);
@@ -111,7 +111,7 @@ pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rec
 /// block を canvas 上 (dx,dy) 左上として配置する paint cmd を作り適用して返す。
 /// mode=replace は上書き、mode=over は srcOver 合成（透明部は配置先を残す）。
 /// canvas 外へはみ出す部分は clip。変更が無ければ null。paste に使う。
-pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelBlock, dx: i32, dy: i32, mode: Blend) ?UndoCmd {
+pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelBlock, dx: i32, dy: i32, mode: Blend) ?Op {
     const px = canvas.layerPixels(layer_idx);
     const w_i: i32 = @intCast(canvas.width);
     const h_i: i32 = @intCast(canvas.height);
@@ -206,7 +206,7 @@ pub fn layerMatchesRender(layer: []const u32, base: []const u32, block: PixelBlo
 }
 
 /// 同型 slice の差分を paint cmd 化する（変更なしは null）。move 確定時の undo entry 生成に使う。
-pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_idx: usize) ?UndoCmd {
+pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_idx: usize) ?Op {
     std.debug.assert(before.len == after.len);
     var diffs: std.ArrayList(PixelDiff) = .empty;
     // 上限 = 全画素。事前確保してループ内の再確保を排除（TASK-59）
@@ -219,7 +219,7 @@ pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_id
 }
 
 /// diffs を owned slice 化して paint cmd を返す。空なら破棄して null。
-fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?UndoCmd {
+fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?Op {
     if (diffs.items.len == 0) {
         diffs.deinit(gpa);
         return null;
@@ -283,10 +283,10 @@ test "clearRectCmd: 領域を透明化し undo で復元" {
     try std.testing.expectEqualSlices(u32, &before, px);
 
     const cmd = clearRectCmd(gpa, &c, 0, .{ .x = 1, .y = 1, .w = 2, .h = 2 }) orelse return error.TestUnexpectedNull;
-    undo.push(gpa, cmd);
+    undo.push(gpa, .{ .op = cmd });
     for ([_]usize{ 5, 6, 9, 10 }) |i| try std.testing.expectEqual(@as(u32, 0), px[i]);
 
-    undo.undoOne(gpa, &c);
+    undo.undoOne(gpa, &.{&c});
     try std.testing.expectEqualSlices(u32, &before, px);
 }
 
@@ -302,14 +302,14 @@ test "pasteCmd: 指定座標へ上書き（gate 非経由）/ clip / undo" {
     defer block.deinit(gpa);
 
     const cmd = pasteCmd(gpa, &c, 0, block, 1, 1, .replace) orelse return error.TestUnexpectedNull;
-    undo.push(gpa, cmd);
+    undo.push(gpa, .{ .op = cmd });
     const px = c.layerPixels(0);
     try std.testing.expectEqual(A, px[1 * 4 + 1]);
     try std.testing.expectEqual(B, px[1 * 4 + 2]);
     try std.testing.expectEqual(C, px[2 * 4 + 1]);
     try std.testing.expectEqual(D, px[2 * 4 + 2]);
 
-    undo.undoOne(gpa, &c);
+    undo.undoOne(gpa, &.{&c});
     for (px) |p| try std.testing.expectEqual(@as(u32, 0), p);
 
     // canvas 端へ clip（(3,3) 起点は A の 1px のみ収まる）

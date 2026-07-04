@@ -30,8 +30,12 @@ core の `savePNG` は **渡された pixels をそのまま PNG 化するだけ
 - **全 visible layer の合成フラット透明 PNG**（TASK-43 以降の pixie 通常保存）: `Canvas.compositeStraight()`
   を渡す。透明背景に visible layer を opacity 込みで src-over するので透明が保持され、単層・opacity=255 では
   raw と恒等になる（既存 round-trip も保たれる）。
-- **注意**: pixie の PNG open はフラット画像を layer0 へ読み込み他 layer を破棄する。**save/open で layer 構造は
-  保持されない**（レイヤー保持形式は非スコープ）。
+- **PNG は交換用フラット画像**: pixie の PNG open はフラット画像を layer0 へ読み込み他 layer を破棄する
+  （PNG では layer 構造を保持しない）。
+- **レイヤー保持は `.pix`（Document + document_io。TASK-63）**: `document_io.saveDocument`/`loadDocument` が
+  serde container 上に width/height/frame/layer(visible/opacity/pixels) を直列化し、round-trip で layer 構造を
+  bit 復元する。layer payload は **raw layerPixels**（透明保持）を格納し、PNG/連番書き出し（`exportPngSequence`）は
+  従来どおり `compositeStraight`（フラット透明）を使う（保存規約は不変）。undo 履歴は保存しない（load でリセット）。
 
 ```zig
 // 表示（白背景）

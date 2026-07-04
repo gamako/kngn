@@ -39,7 +39,7 @@ pub const CanvasInput = struct {
         canvas: *core.Canvas,
         rec: *core.StrokeRecorder,
         gpa: std.mem.Allocator,
-    ) ?core.UndoCmd {
+    ) ?core.Op {
         const rect = frame.canvas_rect orelse return null;
 
         // press 起点 capture: 未 capture かつ canvas 表示領域内で押下 → 開始 + 始点描画
@@ -99,7 +99,7 @@ const Harness = struct {
     fn pixels(self: *Harness) []u32 {
         return self.canvas.layers.items[0].pixels;
     }
-    fn update(self: *Harness, frame: CanvasInput.Frame) ?core.UndoCmd {
+    fn update(self: *Harness, frame: CanvasInput.Frame) ?core.Op {
         return self.ci.update(frame, self.pen.tool(), &self.canvas, &self.rec, self.gpa);
     }
 };

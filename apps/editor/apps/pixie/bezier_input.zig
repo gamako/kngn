@@ -36,7 +36,7 @@ pub const BezierInput = struct {
         dab: core.Dab,
         color: u32,
         opacity: u8,
-    ) ?core.UndoCmd {
+    ) ?core.Op {
         const rect = frame.canvas_rect orelse return null;
         editor.hit_radius = 6.0 / @as(f32, @floatFromInt(frame.zoom)); // screen 6px 相当
 

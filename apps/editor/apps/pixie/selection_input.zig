@@ -72,7 +72,7 @@ pub const SelectionInput = struct {
         layer_idx: usize,
         gpa: std.mem.Allocator,
         mode: core.selection.Blend,
-    ) ?core.UndoCmd {
+    ) ?core.Op {
         const rect = frame.canvas_rect orelse return null;
 
         // press 起点: 未開始かつ canvas 表示領域内で押下 → marquee or moving を開始
@@ -150,7 +150,7 @@ pub const SelectionInput = struct {
     }
 
     /// release: 実レイヤーを最終形へ焼き、1 ドラッグ分の diff を push 用に返す。float は保持。
-    fn commitMove(self: *SelectionInput, canvas: *core.Canvas, layer_idx: usize, gpa: std.mem.Allocator, mode: core.selection.Blend) ?core.UndoCmd {
+    fn commitMove(self: *SelectionInput, canvas: *core.Canvas, layer_idx: usize, gpa: std.mem.Allocator, mode: core.selection.Blend) ?core.Op {
         const f = if (self.float) |*ff| ff else return null;
         const dx = self.cur.x - self.anchor.x;
         const dy = self.cur.y - self.anchor.y;

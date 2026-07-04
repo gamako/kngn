@@ -14,7 +14,7 @@ const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
 const undo_mod = @import("undo.zig");
 const StrokeRecorder = undo_mod.StrokeRecorder;
-const UndoCmd = undo_mod.UndoCmd;
+const Op = undo_mod.Op;
 const Dab = undo_mod.Dab;
 
 pub const Input = union(enum) {
@@ -116,7 +116,7 @@ pub const PathEditor = struct {
 
     /// 唯一の確定経路。rasterize → 戻り値取得 → path クリア。pixie が Enter/ダブルクリックで呼び、
     /// 戻り値（非 null）を UndoStack へ push する（Input に commit を設けず二重 clear を排除）。
-    pub fn rasterizeCommit(self: *PathEditor, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?UndoCmd {
+    pub fn rasterizeCommit(self: *PathEditor, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?Op {
         const cmd = self.path.rasterize(canvas, rec, gpa, dab, color, opacity);
         self.path.anchors.clearRetainingCapacity();
         self.drag = .none;
