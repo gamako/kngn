@@ -31,9 +31,9 @@ video-proto-main/
 │   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群 → 将来 libs/gfx
 ├── kit/               # 公開 umbrella モジュール（ADR-007 R4）。apps と外部消費者はこれのみ import
 │   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth を再エクスポート
-├── examples/          # サンプル 01〜17（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
+├── examples/          # サンプル 01〜18（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
 │   ├── 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering
-│   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone
+│   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone / 18_cursor
 │   ├── 08〜11,13,14,16,17_gui_*  # GUI（primitives/interaction/layout/widgets/slider/color_picker/scroll/toggles）
 │   └── image/         # 共有アセット（実行 example ではない）
 ├── libs/              # L2–L3 移植可能な再利用ライブラリ（原則 platform 非依存・headless で単体テスト可）
@@ -138,8 +138,8 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 
 - ✅ **プラットフォーム backend**: macOS（objc/swift/metal）・Linux（x11/wayland）・Windows（gdi/d3d11）。
   frame pacing の support tier は下記「プラットフォーム層の種類」と `docs/adr/005`。
-- ✅ **サンプル**: `examples/01`〜`17`（基礎描画 / 入力 / スプライト / 固定ステップ / テキスト /
-  ベンチ / マウス / GUI 各種 / アウトラインフォント / オーディオ）。`examples/image/` は共有アセット（run step なし）。
+- ✅ **サンプル**: `examples/01`〜`18`（基礎描画 / 入力 / スプライト / 固定ステップ / テキスト /
+  ベンチ / マウス / GUI 各種 / アウトラインフォント / オーディオ / カーソル形状）。`examples/image/` は共有アセット（run step なし）。
 - ✅ **ヘルパー**: sprite / fixed_timestep / fps_counter / text（`src/`。Phase 2 由来）。
 - ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`・
   `libs/pixelops`（ブレンド共有プリミティブ）・`libs/modular`（グラフエンジン）・`libs/paint`（エディタ共有コア）・
@@ -684,17 +684,18 @@ zig build run-pixie
 # Synth アプリの実行（PC キーボード演奏。A..K = C4..C5、ESC で終了）
 zig build run-synth
 
-# 特定のサンプルを実行（ルートから。run-example_01 〜 _17）
+# 特定のサンプルを実行（ルートから。run-example_01 〜 _18）
 zig build run-example_01        # 01_timed_window
 zig build run-example_04        # 04_fixed_timestep
 zig build run-example_05        # 05_text_rendering
 zig build run-example_07        # 07_mouse_input
 zig build run-example_15        # 15_audio_tone
 zig build run-example_17        # 17_gui_toggles（checkbox/toggle/radio。TASK-48）
+zig build run-example_18        # 18_cursor（system cursor 形状切替。TASK-75.1）
 # 一覧: 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering /
 #       06_sprite_benchmark / 07_mouse_input / 08_gui_primitives / 09_gui_interaction / 10_gui_layout /
 #       11_gui_widgets / 12_outline_font / 13_gui_slider / 14_gui_color_picker / 15_audio_tone /
-#       16_gui_scroll / 17_gui_toggles  （image/ は共有アセットで run step なし）
+#       16_gui_scroll / 17_gui_toggles / 18_cursor  （image/ は共有アセットで run step なし）
 ```
 
 ---

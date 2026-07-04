@@ -619,6 +619,11 @@ class MetalFramebufferView: MTKView {
     weak var platformWindow: PlatformWindowHandle?
     private var customTrackingArea: NSTrackingArea?
 
+    // カーソル制御用 (TASK-75.1)
+    private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // 直近に要求された形状
+    private var cursorHiddenByThisView: Bool = false  // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
+    private var mouseInsideView: Bool = false         // マウスが現在 view 内にあるか（view外では set/hide を保留する）
+
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frame, device: metalDevice)
@@ -628,6 +633,14 @@ class MetalFramebufferView: MTKView {
 
     required init(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        // カーソルを hide したまま破棄されると OS カーソルが消えたままになる (TASK-75.1 codex レビュー指摘)。
+        if cursorHiddenByThisView {
+            NSCursor.unhide()
+            cursorHiddenByThisView = false
+        }
     }
 
     func setupRenderer(width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
@@ -661,10 +674,79 @@ class MetalFramebufferView: MTKView {
             self.removeTrackingArea(ta)
             customTrackingArea = nil
         }
-        let opts: NSTrackingArea.Options = [.mouseMoved, .activeInKeyWindow, .inVisibleRect]
+        // .cursorUpdate: マウス再入時に cursorUpdate(with:) を呼んでもらい、OS がウィンドウ切替等で
+        // カーソルをリセットしても復帰できるようにする (TASK-75.1)。
+        // .mouseEnteredAndExited: view 内外を追跡し、hidden の所有権解除（exited）と形状の適用（entered）を
+        // 行う（codex レビュー: hide/unhide は view 内にいる時のみ行う）。
+        let opts: NSTrackingArea.Options = [.mouseMoved, .cursorUpdate, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect]
         let ta = NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil)
         self.addTrackingArea(ta)
         customTrackingArea = ta
+    }
+
+    // ========================================
+    // カーソル制御 (TASK-75.1)
+    // ========================================
+    //
+    // 方針: NSCursor.hide/unhide はプロセス全体の参照カウント API のため、view が「今 hide を
+    // 所有しているか」を cursorHiddenByThisView で厳密に管理する（hide は false→true 遷移時のみ、
+    // unhide は true→false 遷移時のみ呼ぶ）。加えて set/hide の実適用は mouseInsideView が true の
+    // 間だけ行い、view 外にいる間に来た setCursor はまだ反映せず形状のみ保存する。
+
+    // currentCursorShape に対応する NSCursor を返す（PLATFORM_CURSOR_HIDDEN はここでは扱わない）。
+    // 未対応形状は arrow にフォールバックする。
+    private func nsCursor(for shape: PlatformCursorShape) -> NSCursor {
+        switch shape {
+        case PLATFORM_CURSOR_CROSSHAIR: return .crosshair
+        default: return .arrow // PLATFORM_CURSOR_DEFAULT および未対応形状のフォールバック
+        }
+    }
+
+    // mouseInsideView 前提で currentCursorShape を実際に適用する（hide 所有権の遷移も含む）。
+    private func applyCursorShapeIfInside() {
+        guard mouseInsideView else { return }
+        if currentCursorShape == PLATFORM_CURSOR_HIDDEN {
+            if !cursorHiddenByThisView {
+                NSCursor.hide()
+                cursorHiddenByThisView = true
+            }
+        } else {
+            if cursorHiddenByThisView {
+                NSCursor.unhide()
+                cursorHiddenByThisView = false
+            }
+            nsCursor(for: currentCursorShape).set()
+        }
+    }
+
+    // platform_set_cursor から呼ばれる。形状を保存し、view 内にいれば即時反映する。
+    func setCursorShape(_ shape: PlatformCursorShape) {
+        currentCursorShape = shape
+        applyCursorShapeIfInside()
+    }
+
+    // マウスが view に再入した (TASK-75.1)。現在の形状を反映する。
+    override func mouseEntered(with event: NSEvent) {
+        mouseInsideView = true
+        applyCursorShapeIfInside()
+    }
+
+    // マウスが view から出た (TASK-75.1)。hide を所有中なら必ず解放する
+    // （view 外で OS カーソルが消えたままになるのを防ぐ。codex レビュー指摘）。
+    override func mouseExited(with event: NSEvent) {
+        mouseInsideView = false
+        if cursorHiddenByThisView {
+            NSCursor.unhide()
+            cursorHiddenByThisView = false
+        }
+    }
+
+    // AppKit がトラッキングエリア再入時に呼ぶ。他アプリ切替等で OS がカーソルをリセットしても復帰する。
+    override func cursorUpdate(with event: NSEvent) {
+        // cursorUpdate は tracking rect 内でのみ呼ばれる（.cursorUpdate）ので view 内扱いにする。
+        // mouseEntered 未発火・順序差・window 切替後の cursor reset 復帰でも形状を反映するため（codex レビュー指摘）。
+        mouseInsideView = true
+        applyCursorShapeIfInside()
     }
 
     private func enqueueMouseEvent(type: PlatformEventType, button: PlatformMouseButton, from event: NSEvent) {
@@ -937,6 +1019,21 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
 
     // 手動で描画
     renderer.presentManual(view: handle.metalView)
+}
+
+// カーソル形状を設定する (TASK-75.1)。未知値は PLATFORM_CURSOR_DEFAULT にフォールバックする。
+@_cdecl("platform_set_cursor")
+func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32) -> Void {
+    guard let platformWindow = platformWindow else { return }
+
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let s: PlatformCursorShape
+    switch shape {
+    case Int32(PLATFORM_CURSOR_CROSSHAIR.rawValue): s = PLATFORM_CURSOR_CROSSHAIR
+    case Int32(PLATFORM_CURSOR_HIDDEN.rawValue):    s = PLATFORM_CURSOR_HIDDEN
+    default:                                         s = PLATFORM_CURSOR_DEFAULT
+    }
+    handle.metalView.setCursorShape(s)
 }
 
 // イベント取得API

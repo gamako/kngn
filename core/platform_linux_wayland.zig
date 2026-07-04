@@ -797,6 +797,13 @@ pub const Window = struct {
         buf.busy = true;
         st.locked_index = null;
     }
+
+    /// カーソル形状の設定（TASK-75.1）。現状 no-op スタブ（compile 維持のみ）。
+    /// 実装は TASK-75.3（Linux X11/Wayland system cursor）で行う（wl_pointer.set_cursor 等）。
+    pub fn setCursor(self: Window, shape: types.CursorShape) void {
+        _ = self;
+        _ = shape;
+    }
 };
 
 /// Locked framebuffer view（公開 contract は canonical BGRA `[]u32`、u32 0xAARRGGBB）。

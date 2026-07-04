@@ -88,6 +88,26 @@ uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int*
 // platform_lock_framebuffer()とペアで使用
 void platform_unlock_framebuffer(PlatformWindow* window);
 
+// ========================================
+// カーソル制御API (TASK-75.1)
+// ========================================
+
+// システムカーソルの形状。M1 スコープは 3 種のみ
+// （TASK-75 の設計でツール識別はソフトオーバーレイに委ね、OS ハードカーソルは
+//  precision point 用に crosshair/default/hidden の 3 種だけを使うと確定済み）。
+typedef enum {
+    PLATFORM_CURSOR_DEFAULT = 0,   // 標準の矢印
+    PLATFORM_CURSOR_CROSSHAIR = 1, // 十字（キャンバス等の精密操作向け）
+    PLATFORM_CURSOR_HIDDEN = 2,    // 非表示（ソフトオーバーレイ描画時などに使用）
+} PlatformCursorShape;
+
+// カーソル形状を設定する。
+// 呼び出し頻度: ツール切替・キー入力等のイベント時のみを想定（毎フレーム呼ばない）。
+// shape は PlatformCursorShape の値（enum 型でなく int で受ける。実装は platform_set_cursor 参照）。
+// 未知の値は PLATFORM_CURSOR_DEFAULT にフォールバックする。
+// backend 対応状況: macOS は NSCursor へ即時反映。Linux/Windows は現状 no-op（TASK-75.2/75.3 で実装予定）。
+void platform_set_cursor(PlatformWindow* window, int shape);
+
 // 画面を更新（present = 直近 lock したフレームを表示キューへ submit する）
 // platform_lock_framebuffer()で書き込んだ内容を表示キューへ送る
 //

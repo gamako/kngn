@@ -269,6 +269,22 @@ pub const OpenDialogOptions = struct {
     allowed_ext: ?[:0]const u8 = null,
 };
 
+// ============================================================================
+// CursorShape (システムカーソル。TASK-75.1)
+// ============================================================================
+//
+// M1 スコープは 3 値のみ（TASK-75 の設計でツール識別はソフトオーバーレイに委ね、OS ハードカーソルは
+// precision point 用に crosshair/default/hidden の 3 種だけを使うと確定済み）。値は `platform.h` の
+// PlatformCursorShape と同値（macOS backend が C 値をそのまま流用するため）。
+//
+// 呼び出し頻度: ツール切替・キー入力等の**イベント時のみ**。フレーム毎の全画素ループでも RT（毎サンプル）
+// 経路でもないため、性能規約（SIMD 3点セット・cache_line 分離等）の適用対象外。
+pub const CursorShape = enum(c_int) {
+    default = 0,
+    crosshair = 1,
+    hidden = 2,
+};
+
 test "ModifierFlags round trip via @bitCast" {
     const m = ModifierFlags{ .shift = true, .cmd = true };
     const raw = m.toC();

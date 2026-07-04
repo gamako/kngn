@@ -159,6 +159,11 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
     // マウスイベント用 (TASK-21.1)
     PlatformWindow* platformWindow;  // 非所有の生ポインタ。destroy 時に NULL 化される
     NSTrackingArea* trackingArea;
+
+    // カーソル制御用 (TASK-75.1)
+    PlatformCursorShape currentCursorShape;  // 直近に要求された形状（既定 PLATFORM_CURSOR_DEFAULT）
+    BOOL cursorHiddenByThisView;             // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
+    BOOL mouseInsideView;                    // マウスが現在 view 内にあるか（view外では set/hide を保留する）
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
@@ -177,6 +182,9 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 // destroy 時に呼ぶ。view の back-reference を無効化する。
 - (void)clearPlatformWindow;
 
+// カーソル形状を設定する (TASK-75.1)。platform_set_cursor から呼ばれる。
+- (void)setCursorShape:(PlatformCursorShape)shape;
+
 @end
 
 @implementation FramebufferView
@@ -192,6 +200,9 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
         userdata = ud;
         platformWindow = pw;
         trackingArea = nil;
+        currentCursorShape = PLATFORM_CURSOR_DEFAULT;
+        cursorHiddenByThisView = NO;
+        mouseInsideView = NO;
 
         // ダブルバッファを確保（ページアラインメント推奨）
         buffer0 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
@@ -318,6 +329,12 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 
 - (void)dealloc {
     [self stopDisplayLink];
+
+    // カーソルを hide したまま破棄されると OS カーソルが消えたままになる (TASK-75.1 codex レビュー指摘)。
+    if (cursorHiddenByThisView) {
+        [NSCursor unhide];
+        cursorHiddenByThisView = NO;
+    }
 
     // CGオブジェクトを解放
     if (provider0) CGDataProviderRelease(provider0);
@@ -456,7 +473,13 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
         [self removeTrackingArea:trackingArea];
         trackingArea = nil;
     }
+    // NSTrackingCursorUpdate: マウスが再入した際に cursorUpdate: を呼んでもらい、OS が
+    // ウィンドウ切替等でカーソルをリセットしても復帰できるようにする (TASK-75.1)。
+    // NSTrackingMouseEnteredAndExited: view 内外を追跡し、hidden の所有権解除（mouseExited）と
+    // 形状の適用（mouseEntered）を行う（codex レビュー: hide/unhide は view 内にいる時のみ行う）。
     NSTrackingAreaOptions opts = NSTrackingMouseMoved
+                                | NSTrackingCursorUpdate
+                                | NSTrackingMouseEnteredAndExited
                                 | NSTrackingActiveInKeyWindow
                                 | NSTrackingInVisibleRect;
     trackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
@@ -464,6 +487,78 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
                                                   owner:self
                                                userInfo:nil];
     [self addTrackingArea:trackingArea];
+}
+
+// ========================================
+// カーソル制御 (TASK-75.1)
+// ========================================
+//
+// 方針: NSCursor hide/unhide はプロセス全体の参照カウント API のため、view が「今 hide を
+// 所有しているか」を cursorHiddenByThisView で厳密に管理する（hide は false→true 遷移時のみ、
+// unhide は true→false 遷移時のみ呼ぶ）。加えて set/hide の実適用は mouseInsideView が true の
+// 間だけ行い、view 外にいる間に来た setCursor はまだ反映せず形状のみ保存する（マウスが view 外
+// にある状態で誤って全体のカーソルを hide/変形させないため）。
+
+// currentCursorShape に対応する NSCursor を返す（PLATFORM_CURSOR_HIDDEN はここでは扱わない）。
+// 未対応形状は arrow にフォールバックする。
+- (NSCursor *)nsCursorForShape:(PlatformCursorShape)shape {
+    switch (shape) {
+        case PLATFORM_CURSOR_CROSSHAIR:
+            return [NSCursor crosshairCursor];
+        case PLATFORM_CURSOR_DEFAULT:
+        default:
+            return [NSCursor arrowCursor];
+    }
+}
+
+// mouseInsideView 前提で currentCursorShape を実際に適用する（hide 所有権の遷移も含む）。
+- (void)applyCursorShapeIfInside {
+    if (!mouseInsideView) return;
+    if (currentCursorShape == PLATFORM_CURSOR_HIDDEN) {
+        if (!cursorHiddenByThisView) {
+            [NSCursor hide];
+            cursorHiddenByThisView = YES;
+        }
+    } else {
+        if (cursorHiddenByThisView) {
+            [NSCursor unhide];
+            cursorHiddenByThisView = NO;
+        }
+        [[self nsCursorForShape:currentCursorShape] set];
+    }
+}
+
+// platform_set_cursor から呼ばれる。形状を保存し、view 内にいれば即時反映する。
+- (void)setCursorShape:(PlatformCursorShape)shape {
+    currentCursorShape = shape;
+    [self applyCursorShapeIfInside];
+}
+
+// マウスが view に再入した (TASK-75.1)。現在の形状を反映する。
+- (void)mouseEntered:(NSEvent *)event {
+    (void)event;
+    mouseInsideView = YES;
+    [self applyCursorShapeIfInside];
+}
+
+// マウスが view から出た (TASK-75.1)。hide を所有中なら必ず解放する
+// （view 外で OS カーソルが消えたままになるのを防ぐ。codex レビュー指摘）。
+- (void)mouseExited:(NSEvent *)event {
+    (void)event;
+    mouseInsideView = NO;
+    if (cursorHiddenByThisView) {
+        [NSCursor unhide];
+        cursorHiddenByThisView = NO;
+    }
+}
+
+// AppKit がトラッキングエリア再入時に呼ぶ。他アプリ切替等で OS がカーソルをリセットしても復帰する。
+- (void)cursorUpdate:(NSEvent *)event {
+    (void)event;
+    // cursorUpdate は tracking rect 内でのみ呼ばれる（NSTrackingCursorUpdate）ので view 内扱いにする。
+    // mouseEntered 未発火・順序差・window 切替後の cursor reset 復帰でも形状を反映するため（codex レビュー指摘）。
+    mouseInsideView = YES;
+    [self applyCursorShapeIfInside];
 }
 
 // 共通: mouse_down / mouse_up / mouse_move (button 押下中含む) を enqueue
@@ -875,6 +970,22 @@ void platform_present(PlatformWindow* platformWindow) {
 
         // アクセサメソッドを使用して手動描画
         [view presentManual];
+    }
+}
+
+// カーソル形状を設定する (TASK-75.1)。未知値は PLATFORM_CURSOR_DEFAULT にフォールバックする。
+void platform_set_cursor(PlatformWindow* platformWindow, int shape) {
+    if (!platformWindow) return;
+
+    PlatformCursorShape s;
+    switch (shape) {
+        case PLATFORM_CURSOR_CROSSHAIR: s = PLATFORM_CURSOR_CROSSHAIR; break;
+        case PLATFORM_CURSOR_HIDDEN:    s = PLATFORM_CURSOR_HIDDEN; break;
+        default:                        s = PLATFORM_CURSOR_DEFAULT; break;
+    }
+
+    @autoreleasepool {
+        [platformWindow->view setCursorShape:s];
     }
 }
 

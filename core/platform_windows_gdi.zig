@@ -129,6 +129,13 @@ pub const Window = struct {
         const bmi = makeBitmapInfo(core.width, core.height);
         _ = StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, core.backing.ptr, &bmi, DIB_RGB_COLORS, SRCCOPY);
     }
+
+    /// カーソル形状の設定（TASK-75.1）。現状 no-op スタブ（compile 維持のみ）。
+    /// 実装は TASK-75.2（Windows gdi/d3d11 system cursor）で行う（SetCursor 等）。
+    pub fn setCursor(self: Window, shape: types.CursorShape) void {
+        _ = self;
+        _ = shape;
+    }
 };
 
 fn makeBitmapInfo(width: u32, height: u32) BITMAPINFO {

@@ -379,6 +379,13 @@ pub const Window = struct {
         // Present(SyncInterval=1, Flags=0): fifo 相当（display refresh 同期）。HRESULT 失敗は best-effort 無視。
         _ = d3d.swap_chain.lpVtbl.Present(d3d.swap_chain, 1, 0);
     }
+
+    /// カーソル形状の設定（TASK-75.1）。現状 no-op スタブ（compile 維持のみ）。
+    /// 実装は TASK-75.2（Windows gdi/d3d11 system cursor）で行う（SetCursor 等）。
+    pub fn setCursor(self: Window, shape: types.CursorShape) void {
+        _ = self;
+        _ = shape;
+    }
 };
 
 /// swap chain backbuffer と upload texture を新サイズへ作り直す（TASK-23。present から lazy 呼び出し）。

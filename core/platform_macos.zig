@@ -27,6 +27,7 @@ const EventStats = types.EventStats;
 const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;
 const DialogError = types.DialogError;
+const CursorShape = types.CursorShape;
 
 pub fn init() Error!void {
     if (!c.platform_init()) return error.InitFailed;
@@ -150,6 +151,11 @@ pub const Window = struct {
 
     pub fn present(self: Window) void {
         c.platform_present(self.handle);
+    }
+
+    /// カーソル形状を設定する（TASK-75.1）。イベント時のみ呼ぶ想定（性能規約の対象外）。
+    pub fn setCursor(self: Window, shape: CursorShape) void {
+        c.platform_set_cursor(self.handle, @intFromEnum(shape));
     }
 };
 

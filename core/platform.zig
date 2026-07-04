@@ -61,6 +61,7 @@ pub const EventStats = types.EventStats;
 pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
+pub const CursorShape = types.CursorShape;
 
 /// Locked framebuffer view（facade 独自型。TASK-32.4 P4）。
 /// caller が使うのは `pixels/width/height/unlock()` のみなので backend 直の型と source 互換。
@@ -161,6 +162,15 @@ pub const Window = struct {
             harness.onPresent();
         }
         self.inner.present();
+    }
+
+    /// カーソル形状を設定する（システムカーソル。TASK-75.1）。
+    /// ホットパス宣言: ツール切替等の**イベント時のみ**呼ぶ想定（フレーム毎/RT ではない。
+    /// 性能規約の対象外）。headless 時（表示先が無い＝VP_HARNESS_HEADLESS）は no-op（AC#3）。
+    /// probe が観測する値ではない（副作用が表示にしか出ない）ため harness 側のフック追加は不要。
+    pub fn setCursor(self: Window, shape: CursorShape) void {
+        if (self.headless) return;
+        self.inner.setCursor(shape);
     }
 };
 
