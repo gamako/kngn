@@ -282,6 +282,18 @@ pub const DynGraph = struct {
     tap_mailbox: Mailbox(graph_core.TapConfig) align(std.atomic.cache_line),
     tap: graph_core.TapState align(std.atomic.cache_line),
 
+    // TASK-61: ProcNode 列 + master out_sel を view.gen 不変時は再構築せず使い回す（静的 Graph が
+    // finalize で 1 回焼くのと対称化。RT ブロック毎経路の無駄除去）。RT スレッド専有（processBlock 内
+    // のみ read/write）なので atomic 化・cache_line 分離は非該当（GUI と共有する atomic ペアを増やさない）。
+    proc_cache: [MAX_MODULES]ProcNode,
+    cached_out_sel: ?graph_core.OutputSel,
+    cache_gen: u64,
+    cache_valid: bool,
+    /// ProcNode 列を実再構築した回数（性能の性質＝スキップをテストで固定するための観測量）。
+    /// RT スレッドのみが書き（+%= wrapping で安全ビルドの overflow trap＝RT panic を排除）、テストは同一
+    /// スレッドで processBlock を呼ぶため直接読める。
+    rebuild_count: u64,
+
     /// heap 確保して初期化（自己参照ポインタのためムーブ禁止）。
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) Error!*DynGraph {
         const self = try allocator.create(DynGraph);
@@ -303,6 +315,11 @@ pub const DynGraph = struct {
             .prev = undefined,
             .tap_mailbox = Mailbox(graph_core.TapConfig).init(.{}),
             .tap = .{},
+            .proc_cache = undefined, // cache_valid=false の間は [0..node_count] を読まない
+            .cached_out_sel = null,
+            .cache_gen = 0,
+            .cache_valid = false,
+            .rebuild_count = 0,
         };
         self.cur = self.sig_a[0..];
         self.prev = self.sig_b[0..];
@@ -508,42 +525,57 @@ pub const DynGraph = struct {
 
     /// RT: 最新 view を latch → gen を記録 → handle をレジストリで resolve → graph_core。
     /// alloc/lock/IO/panic/sort なし。未 publish/空 view/channels==0 はゼロ埋め。
+    ///
+    /// RT ブロック毎経路。ProcNode 列 + out_sel の再構築は **view.gen 変化時のみ**（gen 不変なら
+    /// 前ブロックの proc_cache/cached_out_sel をそのまま使う。静的 Graph が finalize で 1 回焼くのと対称）。
+    /// tap config の latch と applied_seq の release store は gen とは独立チャネルなので毎ブロック必須
+    /// （gen スキップの対象外。TASK-40.8 の GUI 描画 gate を止めない）。
     pub fn processBlock(self: *DynGraph, buf: []f32, frames: u32, channels: u32) void {
         const view = self.mailbox.acquire();
         self.consumed_gen.store(view.gen, .release);
         // D: tap config を latch（block あたり 1 回）。差し替わった slot は local_wpos/wpos をリセットして
         // 旧 port の残留サンプルを新 port の窓へ混ぜない。空/無チャンネル時も latch と applied_seq store は行う
-        // （GUI の描画 gate が止まらないように）。
+        // （GUI の描画 gate が止まらないように）。gen スキップとは独立に毎ブロック実行する。
         const any_tap = self.latchTapConfig();
         if (view.node_count == 0 or channels == 0) {
             @memset(buf, 0);
             self.tap.applied_seq.store(self.tap.latched_seq, .release);
             return;
         }
-        var procs: [MAX_MODULES]ProcNode = undefined;
-        var k: usize = 0;
-        while (k < view.node_count) : (k += 1) {
-            const h = view.order[k];
-            const inst = &self.instances[h];
-            procs[k] = .{
-                .vtable = inst.vtable,
-                .ctx = inst.ctx,
-                .n_in = inst.n_in,
-                .n_out = inst.n_out,
-                .out_base = inst.out_base,
-                .in_src = view.in_src[h],
-                .in_delayed = view.in_delayed[h],
-            };
+        // gen 不変なら ProcNode 列 + out_sel の再構築をスキップ。正しさ: gen は publish 毎に単調 +1
+        // （u64・wrap 事実上なし）で同一 gen の GraphView 内容は不変。view 中 handle の RT-read field
+        // （vtable/ctx/out_base/n_in/n_out）は RCU grace（consumed_gen>=retire_gen まで再利用禁止）で
+        // view 参照期間中は不変（add() が書くのは free/reclaim 済み slot のみ＝現 view に居ない handle）。
+        // よって同一 gen の再構築結果は bit 同一＝スキップは出力を変えない。番兵値に頼らず cache_valid で明示。
+        if (!(self.cache_valid and view.gen == self.cache_gen)) {
+            var k: usize = 0;
+            while (k < view.node_count) : (k += 1) {
+                const h = view.order[k];
+                const inst = &self.instances[h];
+                self.proc_cache[k] = .{
+                    .vtable = inst.vtable,
+                    .ctx = inst.ctx,
+                    .n_in = inst.n_in,
+                    .n_out = inst.n_out,
+                    .out_base = inst.out_base,
+                    .in_src = view.in_src[h],
+                    .in_delayed = view.in_delayed[h],
+                };
+            }
+            self.cached_out_sel = if (view.output >= 0) blk: {
+                const oh: Handle = @intCast(view.output);
+                break :blk .{ .out_base = self.instances[oh].out_base, .n_out = self.instances[oh].n_out };
+            } else null;
+            self.cache_gen = view.gen;
+            self.cache_valid = true;
+            self.rebuild_count +%= 1;
         }
-        const out_sel: ?graph_core.OutputSel = if (view.output >= 0) blk: {
-            const oh: Handle = @intCast(view.output);
-            break :blk .{ .out_base = self.instances[oh].out_base, .n_out = self.instances[oh].n_out };
-        } else null;
+        const procs = self.proc_cache[0..view.node_count];
         // block 単位の分岐 1 回のみ: tap slot が 1 つでも active なら tapped 版、なければ従来版（機械語不変）。
         if (any_tap) {
-            graph_core.processBlockTapped(procs[0..view.node_count], out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels, &self.tap);
+            graph_core.processBlockTapped(procs, self.cached_out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels, &self.tap);
         } else {
-            graph_core.processBlock(procs[0..view.node_count], out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels);
+            graph_core.processBlock(procs, self.cached_out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels);
         }
         // block 末尾に latch 済み config の seq を release store（1 store/block。GUI 描画 gate）。
         self.tap.applied_seq.store(self.tap.latched_seq, .release);
@@ -597,6 +629,10 @@ pub const DynGraph = struct {
     }
     pub fn consumedGen(self: *const DynGraph) u64 {
         return self.consumed_gen.load(.acquire);
+    }
+    /// ProcNode 列を実再構築した累積回数（TASK-61。gen スキップの検証用イントロスペクション）。
+    pub fn rebuildCount(self: *const DynGraph) u64 {
+        return self.rebuild_count;
     }
     pub fn currentView(self: *const DynGraph) GraphView {
         return self.last_published;
@@ -1265,4 +1301,116 @@ test "dyn(tap-cacheline): GUI 書き領域(tap_mailbox) と RT 書き領域(tap)
     try testing.expect(tp % cl == 0);
     const diff = if (tp > mb) tp - mb else mb - tp;
     try testing.expect(diff >= cl); // 別ライン（false sharing の GUI×RT ペアを分離）
+}
+
+// ============================================================================
+// TASK-61: ProcNode 列 + out_sel の gen スキップ（性能の性質＝スキップをテストで固定）
+// ============================================================================
+
+test "dyn(cache-1): 同一 gen 連続ブロックで再構築は 1 回・gen 前進で再構築する" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
+    const o = try g.add(.output, .{ .soft_clip = false });
+    try g.connect(v, 0, o, 0);
+    g.setOutput(o);
+    try g.publish();
+
+    var buf: [128 * 2]f32 = undefined;
+    g.processBlock(&buf, 128, 2);
+    g.processBlock(&buf, 128, 2);
+    g.processBlock(&buf, 128, 2);
+    try testing.expectEqual(@as(u64, 1), g.rebuildCount()); // 3 ブロックで再構築 1 回
+
+    // 再 publish（gen 前進）→ 内容が同じでも確実に再構築する側も固定。
+    _ = try g.add(.lfo, .{});
+    try g.publish();
+    g.processBlock(&buf, 128, 2);
+    try testing.expectEqual(@as(u64, 2), g.rebuildCount());
+}
+
+test "dyn(cache-2): スキップ経路と毎ブロック再構築経路の出力が bit 一致" {
+    // A: publish 1 回 → 2 ブロック連続（2 ブロック目は cache skip 経路）。
+    var ga = try DynGraph.create(testing.allocator, 48000);
+    defer ga.destroy();
+    {
+        const v = try ga.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 330 });
+        const f = try ga.add(.vcf, .{ .cutoff = 900, .resonance = 2.0, .mode = .lowpass });
+        const o = try ga.add(.output, .{ .soft_clip = false });
+        try ga.connect(v, 0, f, 0);
+        try ga.connect(f, 0, o, 0);
+        ga.setOutput(o);
+        try ga.publish();
+    }
+    var a1: [128 * 2]f32 = undefined;
+    var a2: [128 * 2]f32 = undefined;
+    ga.processBlock(&a1, 128, 2);
+    ga.processBlock(&a2, 128, 2); // skip 経路
+    try testing.expectEqual(@as(u64, 1), ga.rebuildCount());
+
+    // B: 同一トポロジで、ブロック間に再 publish（内容不変・gen++）を挟み毎回 rebuild 経路を通す。
+    // publish は DSP 状態（VCO 位相等）を触らないので、出力は A と bit 一致するはず。
+    var gb = try DynGraph.create(testing.allocator, 48000);
+    defer gb.destroy();
+    {
+        const v = try gb.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 330 });
+        const f = try gb.add(.vcf, .{ .cutoff = 900, .resonance = 2.0, .mode = .lowpass });
+        const o = try gb.add(.output, .{ .soft_clip = false });
+        try gb.connect(v, 0, f, 0);
+        try gb.connect(f, 0, o, 0);
+        gb.setOutput(o);
+        try gb.publish();
+    }
+    var b1: [128 * 2]f32 = undefined;
+    var b2: [128 * 2]f32 = undefined;
+    gb.processBlock(&b1, 128, 2);
+    try gb.publish(); // gen++ で強制再構築
+    gb.processBlock(&b2, 128, 2);
+    try testing.expectEqual(@as(u64, 2), gb.rebuildCount());
+
+    try testing.expectEqualSlices(f32, &a1, &b1);
+    try testing.expectEqualSlices(f32, &a2, &b2); // skip(a2) == rebuild(b2)：stale cache/swap 漏れを落とす
+}
+
+test "dyn(cache-3): 未 publish の processBlock は cache を汚さず、後続 publish で正しく再構築" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    var buf: [128 * 2]f32 = undefined;
+    // 未 publish（empty view）→ ゼロ埋め・cache には触れない。
+    g.processBlock(&buf, 128, 2);
+    try testing.expectEqual(@as(u64, 0), g.rebuildCount());
+    for (buf) |s| try testing.expectEqual(@as(f32, 0), s);
+
+    // publish → 非無音・再構築 1 回（empty 経路が cache_valid を立てていないことの確認込み）。
+    const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
+    const o = try g.add(.output, .{ .soft_clip = false });
+    try g.connect(v, 0, o, 0);
+    g.setOutput(o);
+    try g.publish();
+    g.processBlock(&buf, 128, 2);
+    try testing.expectEqual(@as(u64, 1), g.rebuildCount());
+    try testing.expect(rmsEven(&buf, 2) > 0.0);
+}
+
+test "dyn(cache-5): master output 切替（gen 前進）で cached_out_sel が追従する" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    // A=VCO sine（非ゼロ源）、B=未接続 Mixer（入力なし＝出力 0）。両者とも全 active ノードとして
+    // 毎サンプル評価される（publish の topo は reachable 限定でない）。master をどちらから読むかで出力が変わる。
+    const a = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
+    const b = try g.add(.mixer, .{ .gain = 1.0 });
+    g.setOutput(a);
+    try g.publish();
+    var buf: [256 * 2]f32 = undefined;
+    g.processBlock(&buf, 256, 2);
+    try testing.expect(rmsEven(&buf, 2) > 0.0); // master=A → sine で非無音
+    const rc1 = g.rebuildCount();
+
+    // master を B（未接続 Mixer=0）へ切替 → gen 前進で cached_out_sel が追従し出力が 0 になるはず。
+    // ProcNode 列だけ更新して out_sel の焼き直しを忘れる実装なら A の sine を読み続けて失敗する。
+    g.setOutput(b);
+    try g.publish();
+    g.processBlock(&buf, 256, 2);
+    try testing.expectEqual(rc1 + 1, g.rebuildCount()); // gen 前進で再構築
+    for (buf) |s| try testing.expectEqual(@as(f32, 0), s); // master=B → 全サンプル 0
 }

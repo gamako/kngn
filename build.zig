@@ -836,6 +836,24 @@ pub fn build(b: *std.Build) void {
     const bench_blit_exe = b.addExecutable(.{ .name = "bench_blit", .root_module = bench_blit_root });
     const bench_blit_step = b.step("bench-blit", "Run pixie canvas blit/checker micro-benchmark (ReleaseFast)");
     bench_blit_step.dependOn(&b.addRunArtifact(bench_blit_exe).step);
+
+    // bench-modular（TASK-61）: DynGraph.processBlock の gen スキップ効果を計測。
+    // modular は dsp のみ依存（test-modular と同じ）。ReleaseFast 固定で独立生成。
+    const bench_modular_mod = b.createModule(.{
+        .root_source_file = b.path("libs/modular/src/modular.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_modular_mod.addImport("dsp", bench_dsp_mod);
+    const bench_modular_root = b.createModule(.{
+        .root_source_file = b.path("bench/modular.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_modular_root.addImport("modular", bench_modular_mod);
+    const bench_modular_exe = b.addExecutable(.{ .name = "bench_modular", .root_module = bench_modular_root });
+    const bench_modular_step = b.step("bench-modular", "Run DynGraph.processBlock micro-benchmark (ReleaseFast)");
+    bench_modular_step.dependOn(&b.addRunArtifact(bench_modular_exe).step);
 }
 
 // ============================================================
