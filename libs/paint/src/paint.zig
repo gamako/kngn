@@ -38,6 +38,12 @@ pub const Pen = tool.Pen;
 pub const Eraser = tool.Eraser;
 pub const Brush = tool.Brush;
 
+// 塗りつぶし（バケツ）ツール（TASK-76）。selection.zig と同じ layerPixels 直書きパターン。
+pub const fill = @import("fill.zig");
+pub const Fill = fill.Fill;
+pub const floodFillCmd = fill.floodFillCmd;
+pub const colorDist = fill.colorDist;
+
 // ベジェ / ベクターパス（TASK-21.13）
 pub const bezier = @import("bezier.zig");
 pub const Vec2f = bezier.Vec2f;

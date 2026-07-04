@@ -83,6 +83,7 @@ const ToolKind = enum {
     brush,
     bezier,
     select,
+    fill,
 
     fn name(self: ToolKind) []const u8 {
         return switch (self) {
@@ -91,6 +92,7 @@ const ToolKind = enum {
             .brush => "Brush",
             .bezier => "Bezier",
             .select => "Select",
+            .fill => "Fill",
         };
     }
 };
@@ -143,6 +145,9 @@ const App = struct {
     pen: core.Pen,
     eraser: core.Eraser = .{},
     brush: core.Brush,
+    /// 塗りつぶし（バケツ）ツール（TASK-76）。Pen/Eraser/Brush と同じく canvas_input 経由の
+    /// down/move/up 契約に乗る（bezier/select のような独立経路は不要）。
+    fill: core.Fill,
     input: canvas_input.CanvasInput = .{},
     /// ベジェ(ペン)ツール（独立経路。TASK-21.13）。状態機械 + マウス入力アダプタ。
     bezier_editor: core.PathEditor = .{},
@@ -177,6 +182,8 @@ const App = struct {
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
     brush_hardness_f32: f32 = 1.0,
+    /// Fill の色許容差 tolerance の UI 状態（Slider の *i32 と u8 の型差吸収。brush_size_i32 と同パターン）。
+    fill_tolerance_i32: i32 = 0,
     /// 編集可能パレット（colors.len>=1）。描画色 = palette.current()。
     palette: palette_mod.Palette,
     /// 編集中 HSV 状態。選択切替/load 後のみ RGB→HSV で再同期（s==0 でも hue を失わない）。
@@ -206,6 +213,7 @@ const App = struct {
             .brush => self.brush.tool(),
             .bezier => self.pen.tool(), // bezier は独立経路で canvas_input を経由しない（到達しないフォールバック）
             .select => self.pen.tool(), // select も独立経路（到達しないフォールバック）
+            .fill => self.fill.tool(),
         };
     }
 
@@ -274,6 +282,7 @@ const App = struct {
         self.palette.setSelectedColor(c);
         self.pen.color = c;
         self.brush.color = c; // Brush の描画色もパレット編集色に追従
+        self.fill.color = c; // Fill の塗り色もパレット編集色に追従
     }
 
     /// 選択（or load）が変わったフレームに編集中 HSV を現在色から再同期する。
@@ -682,6 +691,8 @@ const App = struct {
             self.setActiveKind(.bezier);
         } else if (k.key == .M) {
             self.setActiveKind(.select);
+        } else if (k.key == .G) {
+            self.setActiveKind(.fill);
         } else if (k.key == .C) {
             self.doClear();
         } else if (k.key == .@"0") {
@@ -1129,6 +1140,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         ctx.endBox();
         ctx.beginBox(.{ .direction = .row, .gap = 4 });
         if (ctx.buttonEx("Select", .{ .selected = app.active_kind == .select, .min_w = 56 }).clicked) app.setActiveKind(.select);
+        if (ctx.buttonEx("Fill", .{ .selected = app.active_kind == .fill, .min_w = 56 }).clicked) app.setActiveKind(.fill);
         ctx.endBox();
         // paste/move のブロック配置トグル（gui.toggle スイッチ。TASK-48）。
         // ON=透明を保持(src-over・下の絵を残す) / OFF=上書き(replace)。
@@ -1146,6 +1158,13 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
         app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
         app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
+
+        // Fill 選択時に色許容差(Tol)の Slider を表示（TASK-76）
+        if (app.active_kind == .fill) {
+            _ = ctx.sliderI32Id(0xFEED_0001, "Tol", &app.fill_tolerance_i32, .{ .min = 0, .max = 255, .track_w = 90 });
+        }
+        // UI 状態 → Fill（毎フレーム clamp/変換。型差吸収）
+        app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
 
         try buildLayerPanel(ctx, app);
         ctx.endScrollArea(); // right pane (縦スクロール)
@@ -1224,6 +1243,12 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
             ctx.style.text_subtle,
         );
     }
+    if (app.active_kind == .fill) {
+        ctx.labelEx(
+            try std.fmt.allocPrint(arena, "fill: tol={d}", .{app.fill.tolerance}),
+            ctx.style.text_subtle,
+        );
+    }
     if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
         ctx.labelEx(
             try std.fmt.allocPrint(arena, "anchors: {d}", .{app.bezier_editor.path.anchors.items.len}),
@@ -1258,10 +1283,12 @@ pub fn main(init: std.process.Init) !void {
         .palette = try palette_mod.Palette.initDb16(gpa),
         .pen = .{ .color = 0 },
         .brush = .{ .color = 0 },
+        .fill = .{ .color = 0 },
     };
     app.canvas = app.doc.activeCanvas(); // doc の frame 0 canvas を指す（ポインタ安定）
     app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
     app.brush.color = app.palette.current();
+    app.fill.color = app.palette.current();
     defer {
         if (app.current_path) |p| gpa.free(p);
         if (app.current_project_path) |p| gpa.free(p);

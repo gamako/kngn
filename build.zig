@@ -438,6 +438,18 @@ pub fn build(b: *std.Build) void {
     const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
     const run_core_tool_test = b.addRunArtifact(core_tool_test);
 
+    // 塗りつぶし（バケツ）flood fill + Fill Tool（TASK-76）。tool.zig と同様 png/pixelops が要る
+    // （PNG round-trip テスト + canvas.zig 経由の pixelops）。
+    const core_fill_mod = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/fill.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_fill_mod.addImport("png", shared_modules.png.mod);
+    core_fill_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    const core_fill_test = b.addTest(.{ .root_module = core_fill_mod });
+    const run_core_fill_test = b.addRunArtifact(core_fill_test);
+
     // ベジェ/ベクターパス（TASK-21.13）。bezier=pure。path/path_editor は相対 import 先（undo/path の test）が
     // png を使うため import 要（Zig は同一モジュール内 @import 先の test もコンパイルする）。
     const core_bezier_mod = b.createModule(.{
@@ -568,6 +580,7 @@ pub fn build(b: *std.Build) void {
     const test_core_step = b.step("test-core", "Run editor/core (undo + tool) and pixie input tests");
     test_core_step.dependOn(&run_core_undo_test.step);
     test_core_step.dependOn(&run_core_tool_test.step);
+    test_core_step.dependOn(&run_core_fill_test.step);
     test_core_step.dependOn(&run_core_bezier_test.step);
     test_core_step.dependOn(&run_core_path_test.step);
     test_core_step.dependOn(&run_core_path_editor_test.step);
