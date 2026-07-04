@@ -5,8 +5,8 @@
 //! phase（点線アニメの位相）は main 側で `platform.getTime()` から算出して渡す（このモジュールは
 //! platform 非依存に保つ。harness の仮想クロックなら replay で決定論的に進む）。
 
-const gui = @import("gui");
-const core = @import("core");
+const gui = @import("kit").gui;
+const core = @import("paint");
 
 const DASH: i32 = 4; // dash 1 区間の長さ（screen px）
 const WHITE = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);

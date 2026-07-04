@@ -6,8 +6,8 @@
 //! draw_list 系は Allocator.Error を返すため、既存 emitNode と同じく catch @panic で統一する。
 
 const std = @import("std");
-const gui = @import("gui");
-const core = @import("core");
+const gui = @import("kit").gui;
+const core = @import("paint");
 
 const CURVE_COLOR = gui.Color.rgba(0x40, 0xC0, 0xFF, 0xFF); // シアン
 const HANDLE_COLOR = gui.Color.rgba(0xFF, 0xC0, 0x40, 0xFF); // オレンジ

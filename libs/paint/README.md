@@ -1,7 +1,9 @@
-# editor/core
+# libs/paint（エディタ族の共有コア）
 
 グラフィックエディタ群（pixie / paintly / tilex / animix …）が共有する再利用可能な抽象。
-アプリ非依存（platform / GUI を import しない）。`@import("core")` で `core.zig` の re-export を使う。
+アプリ非依存の headless lib（platform / GUI を import しない。ADR-007 R2）。`@import("paint")` で
+`paint.zig`（root。旧 `apps/editor/core/core.zig`。ADR-007 R6 で libs へ格上げ）の re-export を使う。
+「エディタ族の共有 lib」なので汎用 `kit` には載せず、該当 app（pixie 等）だけが直 import する。
 
 ## 構成
 

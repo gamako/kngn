@@ -15,39 +15,53 @@ video-proto-main/
 │   ├── macos/         # Objective-C実装（CALayer）
 │   ├── macos-swift/   # Swift実装（CADisplayLink）
 │   └── macos-metal/   # Metal実装（GPU）
-├── src/               # Zigコード
-│   ├── main.zig       # メインプログラム（HSV 虹色グラデーション）
+├── core/              # L1 薄い base（platform に依存 / libs に依存しない）。ADR-007 R1
 │   ├── platform.zig   # platform facade（builtin.os.tag で backend を分岐）
-│   ├── platform_types.zig      # 共有型（KeyCode / Event 等の単一ソース）
+│   ├── platform_types.zig      # 共有型（KeyCode / Event 等の単一ソース。type-only module）
 │   ├── platform_macos.zig      # macOS backend（C ABI platform.h 経由。objc/swift/metal 共通）
 │   ├── platform_linux*.zig     # Linux backend（dispatcher + x11 / wayland + 入力変換。純 Zig）
 │   ├── platform_windows*.zig   # Windows backend（dispatcher + gdi / d3d11 + 入力変換。純 Zig）
-│   ├── audio.zig / audio_*.zig # オーディオ出力 facade + OS 別 backend（macOS/Linux/Windows）
-│   ├── dsp/           # DSP ヘルパー（Oscillator / Envelope / Filter / Mixer）
-│   ├── harness.zig    # ヘッドレス検証 harness（入力注入 + フレーム捕捉 + 仮想クロック）
-│   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群
+│   ├── platform_native_stub.zig # native .o archive 公開用 stub（TASK-29.1）
+│   ├── audio.zig / audio_*.zig # オーディオ出力 facade + OS 別 backend（macOS/Linux/Windows/null）
+│   └── control/       # 制御＋観測プレーン（ADR-007 R3）
+│       └── harness.zig # ヘッドレス検証 harness（入力注入 + フレーム捕捉 + 仮想クロック）
+├── src/               # 未移設の Zig コード（R8 日和見: 次に触るタスクで libs/gfx・libs/audio へ移す）
+│   ├── main.zig       # メインプログラム（HSV 虹色グラデーション）
+│   ├── dsp/           # DSP ヘルパー（Oscillator / Envelope / Filter / Mixer）→ 将来 libs/audio
+│   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群 → 将来 libs/gfx
+├── kit/               # 公開 umbrella モジュール（ADR-007 R4）。apps と外部消費者はこれのみ import
+│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth を再エクスポート
 ├── examples/          # サンプル 01〜17（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
 │   ├── 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering
 │   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone
 │   ├── 08〜11,13,14,16,17_gui_*  # GUI（primitives/interaction/layout/widgets/slider/color_picker/scroll/toggles）
 │   └── image/         # 共有アセット（実行 example ではない）
-├── libs/              # 再利用ライブラリ
+├── libs/              # L2–L3 移植可能な再利用ライブラリ（原則 platform 非依存・headless で単体テスト可）
 │   ├── png/           # PNG codec（decode/encode）
 │   ├── pixelops/      # ピクセルブレンド共有プリミティブ（premul/straight blend + div255 + clip-hoist）
 │   ├── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
 │   ├── font/          # フォント（TrueType/OpenType アウトライン sfnt/glyf/cff + bmfont。※ BDF は src/text.zig）
-│   └── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
-├── apps/              # アプリケーション
-│   ├── editor/        # グラフィックエディタ群（TASK-21 ファミリー）
-│   │   ├── core/      # 再利用コア: Canvas(多レイヤ) / Tool(Pen/Eraser/Brush) / UndoStack / StrokeRecorder / Path / Selection / PNG I/O
-│   │   └── apps/pixie/ # ドット絵エディタ（Pen/Eraser/レイヤー/範囲選択/ベジェ/DB16 パレット/Undo/PNG）
-│   └── synth/         # PC キーボード演奏シンセ MVP（run-synth）
+│   ├── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
+│   ├── modular/       # モジュラー・グラフエンジン（TASK-40。kit 非収録=流動中）
+│   ├── paint/         # エディタ族の共有コア（旧 apps/editor/core。ADR-007 R6 で格上げ。kit 非収録）
+│   │                  #   Canvas(多レイヤ) / Tool(Pen/Eraser/Brush) / UndoStack / StrokeRecorder / Path / Selection / PNG I/O
+│   └── viz/           # 可視化（旧 apps/synth/spectrogram・scope。synth/modular/patch が共有。kit 非収録）
+├── apps/              # L4 終端の消費者（kit-only。R5。流動 lib=modular/paint/viz のみ直 import 可）
+│   ├── editor/apps/pixie/ # ドット絵エディタ（Pen/Eraser/レイヤー/範囲選択/ベジェ/DB16 パレット/Undo/PNG）
+│   ├── synth/         # PC キーボード演奏シンセ MVP（run-synth）
+│   ├── modular/       # lofi 生成パッチ（run-modular）
+│   └── patch/         # パッチキャンバス UI（run-patch）
 └── docs/              # ドキュメント
     ├── PLAN.md        # 実装計画（原初の Phase 分け）
     ├── PLAN_*.md      # 個別計画（example_02/03 / libs_gui / png_decoder 等）
-    └── adr/           # アーキテクチャ決定記録
+    └── adr/           # アーキテクチャ決定記録（層構成は 007）
 ```
 （タスク別の計画メモ `docs/plans/` はトップ階層 `video-proto/docs/plans/` 側。この配下ではない）
+
+> **層構成（ADR-007）**: `apps → kit → libs → core → platform` の一方向依存を build.zig の
+> モジュールグラフ（`Layer` タグ + `link()` 検査）で強制する。逆流・層飛ばし・apps の非許可直 import は
+> **build 構成時に panic で停止**する。唯一の例外は `harness(core/control) → png(libs/png)`（snapshot fb の
+> PNG encode / crc32。`linkCoreException` で明示）。移行は R8 の遅延方針で、未移設ファイルは `src/` に残す。
 
 ## クイックスタート
 
@@ -126,11 +140,13 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 - ✅ **サンプル**: `examples/01`〜`17`（基礎描画 / 入力 / スプライト / 固定ステップ / テキスト /
   ベンチ / マウス / GUI 各種 / アウトラインフォント / オーディオ）。`examples/image/` は共有アセット（run step なし）。
 - ✅ **ヘルパー**: sprite / fixed_timestep / fps_counter / text（`src/`。Phase 2 由来）。
-- ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`・`libs/pixelops`（ブレンド共有プリミティブ）。
+- ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`・
+  `libs/pixelops`（ブレンド共有プリミティブ）・`libs/modular`（グラフエンジン）・`libs/paint`（エディタ共有コア）・
+  `libs/viz`（可視化: spectrogram / scope）。
 - ✅ **アプリ**: `apps/editor/apps/pixie`（ドット絵エディタ: レイヤー / 範囲選択 / ベジェ / Undo / PNG）・
-  `apps/synth`（PC キーボード演奏）。
-- ✅ **オーディオ / シンセ層**: `src/audio` + `src/dsp` + `libs/synth`（下記「オーディオ / シンセ層」節）。
-- ✅ **ヘッドレス検証 harness**: `src/harness.zig`（下記「ヘッドレス検証 harness」節）。
+  `apps/synth`（PC キーボード演奏）・`apps/modular`（lofi 生成）・`apps/patch`（パッチキャンバス）。
+- ✅ **オーディオ / シンセ層**: `core/audio` + `src/dsp` + `libs/synth`（下記「オーディオ / シンセ層」節）。
+- ✅ **ヘッドレス検証 harness**: `core/control/harness.zig`（下記「ヘッドレス検証 harness」節）。
 
 > 原初の Phase 分け（プリミティブ / ヘルパー関数群 / テンプレート）は `docs/PLAN.md` に記録。
 > DoubleBuffer や SimpleApp / GameLoop / SnapshotRenderer 等のテンプレート群は未着手。
@@ -142,10 +158,10 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | **Objective-C** | `platform/macos/platform_macos.m`                 | CALayer       | ✅ 完全動作           |
 | **Swift**       | `platform/macos-swift/platform_macos.swift`       | CADisplayLink | ✅ 完全動作           |
 | **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ✅ 1級 frame pacing 対応（TASK-36） |
-| **X11 (Linux)** | `src/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
-| **Wayland (Linux)** | `src/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。shiso 実機検証済み） |
-| **GDI (Windows)** | `src/platform_windows_gdi.zig`（純 Zig / Win32 直接） | GDI `StretchDIBits`（software blit） | ✅ best-effort backend（TASK-31/35） |
-| **D3D11 (Windows)** | `src/platform_windows_d3d11.zig`（純 Zig / COM 手書き vtbl） | D3D11-DXGI swap chain（upload path） | ✅ 1級 frame pacing 対応（TASK-35） |
+| **X11 (Linux)** | `core/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
+| **Wayland (Linux)** | `core/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。shiso 実機検証済み） |
+| **GDI (Windows)** | `core/platform_windows_gdi.zig`（純 Zig / Win32 直接） | GDI `StretchDIBits`（software blit） | ✅ best-effort backend（TASK-31/35） |
+| **D3D11 (Windows)** | `core/platform_windows_d3d11.zig`（純 Zig / COM 手書き vtbl） | D3D11-DXGI swap chain（upload path） | ✅ 1級 frame pacing 対応（TASK-35） |
 
 **Metal版（TASK-36）**: ADR-005 の 1級 frame pacing 契約に適合。triple slot + inflight semaphore で
 drawable/buffer の inflight ownership を管理し、`draw(in:)` 内に drawable 取得を集約して CAMetalLayerDrawable
@@ -153,10 +169,10 @@ lifecycle 警告を解消。`displaySyncEnabled` 明示で fifo（display refres
 
 ### backend の選び方（OS 依存）
 
-`src/platform.zig`（facade）が `builtin.os.tag` で backend を切り替え、`build_options.platform_backend`
-で具体実装を選ぶ。Linux では `src/platform_linux.zig`（dispatcher）が `platform_backend` で x11/wayland
+`core/platform.zig`（facade）が `builtin.os.tag` で backend を切り替え、`build_options.platform_backend`
+で具体実装を選ぶ。Linux では `core/platform_linux.zig`（dispatcher）が `platform_backend` で x11/wayland
 実装を選ぶ（`platform_linux_x11.zig` / `platform_linux_wayland.zig`、共通の `getTime`/dialog は
-`platform_linux_common.zig`）。Windows も同型で `src/platform_windows.zig`（dispatcher）が gdi/d3d11 を
+`platform_linux_common.zig`）。Windows も同型で `core/platform_windows.zig`（dispatcher）が gdi/d3d11 を
 選ぶ（`platform_windows_gdi.zig` / `platform_windows_d3d11.zig`、共通の window/入力/dialog/getTime/CPU backing は
 `platform_windows_common.zig`）。`-Dplatform` の有効値は OS で変わる:
 
@@ -167,7 +183,7 @@ lifecycle 警告を解消。`displaySyncEnabled` 明示で fifo（display refres
   COM 手書き vtbl で直接呼ぶ（TASK-31/35）。
 
 不整合（例: Linux で `-Dplatform=objc`）は明確な build エラーになる。共有型（`KeyCode`/`Event` 等）は
-`src/platform_types.zig` が単一ソース。
+`core/platform_types.zig` が単一ソース。
 
 ### Linux（x86_64）のビルド・検証
 
@@ -183,8 +199,8 @@ bash scripts/sync-to.sh jackjack        # 転送（shiso も同様にホスト�
 bash scripts/sync-to.sh -n jackjack     # dry-run（--delete の前に差分確認）
 ```
 
-入力（key/mouse/scroll/modifier）は `src/platform_linux_x11.zig` が XEvent を変換する（TASK-28.3。dispatcher 化で 28.5.1 にファイル移動）。物理キーは evdev
-X keycode 表で `KeyCode` へ（layout 非依存・KeySym 不使用）。純粋な変換ロジックは `src/platform_linux_input.zig`
+入力（key/mouse/scroll/modifier）は `core/platform_linux_x11.zig` が XEvent を変換する（TASK-28.3。dispatcher 化で 28.5.1 にファイル移動）。物理キーは evdev
+X keycode 表で `KeyCode` へ（layout 非依存・KeySym 不使用）。純粋な変換ロジックは `core/platform_linux_input.zig`
 （`@cImport` しない純 Zig）に分離し、`zig build test-platform-input` で **display 無しでも単体テストできる**（集約 `test` に含む）。
 
 ```bash
@@ -204,9 +220,9 @@ nix develop --command bash scripts/xvfb-screenshot.sh out.png -- zig-out/bin/vid
 
 #### Wayland backend（`-Dplatform=wayland`、TASK-28.5）
 
-Wayland backend（`src/platform_linux_wayland.zig`、wl_shm + xdg-shell + wl_keyboard/pointer + xkbcommon）は
+Wayland backend（`core/platform_linux_wayland.zig`、wl_shm + xdg-shell + wl_keyboard/pointer + xkbcommon）は
 **実コンパイル/表示/入力に Linux + Wayland ライブラリと実セッションが必要**で、macOS では検証できない（shiso 等の Linux で確認）。
-純粋な入力変換は `src/platform_wayland_input.zig`（`@cImport` しない純 Zig）に分離し、`zig build test-platform-wayland-input` で
+純粋な入力変換は `core/platform_wayland_input.zig`（`@cImport` しない純 Zig）に分離し、`zig build test-platform-wayland-input` で
 **display 無しでも単体テストできる**（macOS/集約 `test` に含む）。物理キーは X11 と同じ evdev+8 表で `KeyCode` へ（layout 非依存）。
 
 ```bash
@@ -242,7 +258,7 @@ WAYLAND_SHOT_COMPOSITOR=weston nix develop --command bash scripts/wayland-screen
   実 Wayland session 表示。これらは通常のユーザー Wayland session（GNOME/KDE/Sway 等）で目視確認する。
 
 **zenity ファイルダイアログ（pixie の PNG open/save、TASK-28.5.4）の Wayland 表示条件**:
-`saveFileDialog`/`openFileDialog` は X11/Wayland 共通で `src/platform_linux_common.zig` の zenity サブプロセスを使う
+`saveFileDialog`/`openFileDialog` は X11/Wayland 共通で `core/platform_linux_common.zig` の zenity サブプロセスを使う
 （backend 非依存）。zenity は GTK アプリのため、表示は session 環境に依存する:
 
 - 通常の Wayland desktop session（GNOME/KDE/Sway 等）では `WAYLAND_DISPLAY` 下で GTK/zenity が動き、file chooser が出る。
@@ -254,8 +270,8 @@ WAYLAND_SHOT_COMPOSITOR=weston nix develop --command bash scripts/wayland-screen
 
 ## 主要なプラットフォームAPI
 
-caller は `@import("platform")` で Zig 高レベル API (`src/platform.zig`) にアクセスする。
-C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/platform_macos.zig`) のみが直接利用する。
+caller は `@import("platform")` で Zig 高レベル API (`core/platform.zig`) にアクセスする。
+C ABI (`platform/platform.h`) は内部実装で、バックエンド (`core/platform_macos.zig`) のみが直接利用する。
 
 ### コアプリミティブ
 - `platform.init()` / `platform.shutdown()` - 初期化/終了 (`Error!void`)
@@ -277,19 +293,22 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 ### ユーティリティ
 - `platform.getTime()` - 高精度モノトニック時刻取得
 
-## エディタ（apps/editor + libs/gui）
+## エディタ（apps/editor + libs/paint + libs/gui）
 
-`apps/editor/` はグラフィックエディタ群（TASK-21 ファミリー）。共通基盤の上に複数の小アプリ
-（現状は pixie。将来 paintly / tilex / animix）を載せる構成。
+`apps/editor/` はグラフィックエディタ群（TASK-21 ファミリー）。共通基盤（`libs/paint` + `libs/gui`）の
+上に複数の小アプリ（現状は pixie。将来 paintly / tilex / animix）を載せる構成。
 
-- **libs/gui**: 即時モード GUI。入力管理（hot/active + ID stack）/ Flex レイアウト / 描画プリミティブ /
-  ウィジェット（Button / Label / ColorSwatch / Slider）。`@import("gui")` で使う。
-- **apps/editor/core**: アプリ非依存の再利用コア（platform / GUI を import しない）。
-  `Canvas`（レイヤ・合成・座標変換）/ `Tool`(vtable, Pen/Eraser) / `UndoStack` / `StrokeRecorder` /
-  PNG I/O。使い方は **`apps/editor/core/README.md`** を参照。
-  - 不変条件: 表示は `composite()`（白背景合成）。**PNG 保存は `savePNG` に渡す pixels を用途で使い分け**（白背景 `composite()` は保存に使わない）: core の round-trip は raw layer pixels（`layerPixels(idx)`、透明保持）、pixie の通常保存（TASK-43 以降）は全 visible layer を合成した `compositeStraight()`（フラット透明 PNG。単層 opacity=255 で raw と恒等）。pixie の PNG open はフラット画像を layer0 へ読み込み layer 構造は保持しない。
+- **libs/gui**（`@import("gui")` / kit 収録）: 即時モード GUI。入力管理（hot/active + ID stack）/
+  Flex レイアウト / 描画プリミティブ / ウィジェット（Button / Label / ColorSwatch / Slider）。
+- **libs/paint**（`@import("paint")` / ADR-007 R6 で旧 `apps/editor/core` から格上げ）: アプリ非依存の
+  再利用コア（platform / GUI を import しない headless lib）。`Canvas`（レイヤ・合成・座標変換）/
+  `Tool`(vtable, Pen/Eraser) / `UndoStack` / `StrokeRecorder` / PNG I/O。root は `libs/paint/src/paint.zig`。
+  「エディタ族の共有 lib」なので汎用 kit には載せず、pixie 等の該当 app だけが直 import する。
+  使い方は **`libs/paint/README.md`** を参照。
+  - 不変条件: 表示は `composite()`（白背景合成）。**PNG 保存は `savePNG` に渡す pixels を用途で使い分け**（白背景 `composite()` は保存に使わない）: paint の round-trip は raw layer pixels（`layerPixels(idx)`、透明保持）、pixie の通常保存（TASK-43 以降）は全 visible layer を合成した `compositeStraight()`（フラット透明 PNG。単層 opacity=255 で raw と恒等）。pixie の PNG open はフラット画像を layer0 へ読み込み layer 構造は保持しない。
 - **apps/editor/apps/pixie**: ドット絵エディタ MVP。`canvas_input.zig`（入力状態機械）が
-  press 起点 capture → Tool 経由で stroke を駆動する。
+  press 起点 capture → Tool 経由で stroke を駆動する。platform / gui / png は `@import("kit")` 経由
+  （`kit.platform` / `kit.gui` / `kit.png`）、paint のみ直 import（kit-only 消費者の R5 + 流動 lib 例外）。
 
 > 注: エディタのタスク管理はトップ階層（`video-proto/`）の Backlog.md CLI で行う（上位 AGENTS.md 参照）。
 > Zig 0.16 のイディオムは `zig-best-practices` スキルを参照。
@@ -301,7 +320,7 @@ C ABI (`platform/platform.h`) は内部実装で、バックエンド (`src/plat
 
 | 層 | 場所 | 内容 |
 |---|---|---|
-| **L1 platform** | `src/audio.zig`（facade）+ `src/audio_{macos,linux,windows}.zig`（OS 別実装） | オーディオ出力プリミティブ（`open/start/stop/close/config`）。各 OS ネイティブ API を **extern fn / COM 手書き** で叩く（`@cImport` しない）: macOS=AudioUnit(AudioToolbox) / Linux=ALSA(`alsa`=libasound) / Windows=WASAPI(ole32)。audio backend は audio を使う exe にのみ link（既存 exe は不変）。 |
+| **L1 platform** | `core/audio.zig`（facade）+ `core/audio_{macos,linux,windows}.zig`（OS 別実装） | オーディオ出力プリミティブ（`open/start/stop/close/config`）。各 OS ネイティブ API を **extern fn / COM 手書き** で叩く（`@cImport` しない）: macOS=AudioUnit(AudioToolbox) / Linux=ALSA(`alsa`=libasound) / Windows=WASAPI(ole32)。audio backend は audio を使う exe にのみ link（既存 exe は不変）。 |
 | **L2 helpers** | `src/dsp/`（`@import("dsp")`） | Oscillator / Envelope(ADSR) / Filter(TPT SVF) / Mixer + denormal 対策。純 Zig。 |
 | **L3 libs** | `libs/synth/`（`@import("synth")`） | Voice / 固定 VoicePool（スチール + done 回収）/ Patch / Synth。GUI⇔Audio のロックフリー受け渡し（SPSC `NoteQueue` / `AtomicF32` / `Mailbox`(triple-buffer) / 出力タップ `SampleTap`）。dsp に依存。 |
 | **L4 apps** | `apps/synth/`（`run-synth`）+ `examples/15_audio_tone`（`run-example_15`） | PC キーボード演奏 MVP / サイン波最小サンプル。 |
@@ -331,7 +350,7 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
      こちらが要る（`users.users.<user>.extraGroups = [ "audio" ];` → rebuild → relogin/reboot）。
 3. **確認コマンド**: `wpctl status`（Audio Sink が出ているか）、`ldd zig-out/bin/example_15 | grep asound`
    と `LD_DEBUG=libs`（実行時にロードされる libasound が host plugin 要求版以上か）。
-4. backend 実装（`src/audio_linux.zig` の hw_params 折衝）は**変更不要**。当初 pipewire 1.6.5 で
+4. backend 実装（`core/audio_linux.zig` の hw_params 折衝）は**変更不要**。当初 pipewire 1.6.5 で
    `snd_pcm_hw_params` が失敗するのを hw_params の問題と疑ったが、実機調査で真因は sink 不在（ENOENT）と判明。
    sink さえあれば現行 `period`/`buffer` の組合せがそのまま通る。
 
@@ -410,7 +429,7 @@ scripts/drive --port-file /tmp/vp.port 'quit'
 
 ## ヘッドレス検証 harness（TASK-32 ファミリー）
 
-AI がアプリの出力を手軽に確認するための仕組み。`src/platform.zig`(facade) の 4 フック（`pollEvents`/`nextEvent`/`present`/`getTime`）に `src/harness.zig` を interpose し、**アプリ無改造**で「入力注入 + フレーム捕捉 + 仮想クロック」を行う。env 未設定なら全フック即パススルー（既存挙動と完全一致）。設計の正はトップ階層の `backlog/decisions/decision-1` と TASK-32 系タスク。
+AI がアプリの出力を手軽に確認するための仕組み。`core/platform.zig`(facade) の 4 フック（`pollEvents`/`nextEvent`/`present`/`getTime`）に `core/control/harness.zig` を interpose し、**アプリ無改造**で「入力注入 + フレーム捕捉 + 仮想クロック」を行う。env 未設定なら全フック即パススルー（既存挙動と完全一致）。設計の正はトップ階層の `backlog/decisions/decision-1` と TASK-32 系タスク。
 
 - **P1（TASK-32.1, 実装済み）**: file replay + 組み込み `fb` probe（framebuffer→PNG / 1行 digest）+ 仮想クロック。
 - **P2（TASK-32.2, 実装済み）**: live 制御（TCP loopback + driver CLI `scripts/drive`）/ 組み込み `audio`・`stats` probe / record→replay。
@@ -446,7 +465,7 @@ digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_co
 quit                       # 終了（EOF でも終了）
 ```
 
-- **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `src/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
+- **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `core/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
   `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
@@ -504,7 +523,7 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
 節と同じく CPU framebuffer 捕捉モデルのため、backend を触っても得るものが無いこと）。
 
 - **純 SSH（`DISPLAY`/`WAYLAND_DISPLAY` 無し）で replay/live がそのまま回る**（display 接続が無いため）。
-- **audio も実デバイス無しで駆動できる**: `src/audio_null.zig`（純 Zig・OS 非依存の null 出力デバイス）が
+- **audio も実デバイス無しで駆動できる**: `core/audio_null.zig`（純 Zig・OS 非依存の null 出力デバイス）が
   `audio_linux`/`audio_windows` と同じ push-thread パターン（実時間 pull スレッド）で render callback を
   駆動し、`harness.onAudioSamples()` へ流す。`audio` probe（`digest audio`/`snapshot audio`）が実 sink 不在
   でも成立する。
@@ -526,7 +545,7 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
 
 ### custom probe の足し方（TASK-32.3）
 
-app が内部状態を opt-in で probe として公開する。**framework（`src/harness.zig`）には probe 固有のコードを一切足さない**（中身非パースの不変条件）。手順:
+app が内部状態を opt-in で probe として公開する。**framework（`core/control/harness.zig`）には probe 固有のコードを一切足さない**（中身非パースの不変条件）。手順:
 
 1. app（`@import("platform")` 済み）で probe の callback を書く:
    - `digest: fn(ctx: *anyopaque, buf: []u8) []const u8` — 1行テキストを `buf`（最大 1024B）へ書いて返す（改行を含めない）。
@@ -627,7 +646,7 @@ zig build -Dinstall-all=true
 zig build test
 
 # 個別テスト（集約 test に全て含まれる）
-zig build test-core             # editor/core（undo + tool）+ pixie 入力状態機械
+zig build test-core             # libs/paint（undo + tool）+ pixie 入力状態機械
 zig build test-gui              # libs/gui
 zig build test-png-roundtrip    # PNG encode/decode round-trip（+ canvas 単体）
 zig build test-png-format       # PNG format 変換

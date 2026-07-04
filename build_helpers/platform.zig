@@ -74,7 +74,7 @@ pub fn backendName(backend: PlatformType) []const u8 {
     return @tagName(backend);
 }
 
-/// platform モジュール (`src/platform.zig`) を作成する。
+/// platform モジュール (`core/platform.zig`) を作成する。
 ///
 /// macOS backend は `@cImport` で `platform.h` を取り込むため、`link_libc = true` と
 /// platform/ include path 追加をワンセットで行う（Linux backend は platform.h を
@@ -93,10 +93,10 @@ pub fn createPlatformModule(
     platform_source: std.Build.LazyPath,
     platform_include_root: std.Build.LazyPath,
     backend: PlatformType,
-    /// 共有型 module（src/platform_types.zig）。platform.zig + 各 backend が `@import("platform_types")` で使う。
+    /// 共有型 module（core/platform_types.zig）。platform.zig + 各 backend が `@import("platform_types")` で使う。
     /// harness module と **同一インスタンス** を渡すこと（Event/EventStats の型同一性のため。TASK-32.2）。
     types_mod: *std.Build.Module,
-    /// harness module（src/harness.zig）。platform.zig(facade) が `@import("harness")` で使う。
+    /// harness module（core/control/harness.zig）。platform.zig(facade) が `@import("harness")` で使う。
     /// audio module と **同一インスタンス** を渡すことで module-level state（audio tap 等）を共有する (TASK-32.2)。
     harness_mod: *std.Build.Module,
 ) *std.Build.Module {
@@ -270,13 +270,13 @@ pub const StandaloneSpec = struct {
     base_name: []const u8,
     /// main ソース（build root 相対。`b.path("main.zig")` 等）。
     main_source: std.Build.LazyPath,
-    /// `src/platform.zig`（standalone は `.{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" }`）。
+    /// `core/platform.zig`（standalone は `.{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" }`）。
     platform_source: std.Build.LazyPath,
     /// platform module の include root（`platform.h`。`.{ .cwd_relative = PROJECT_ROOT ++ "/platform" }`）。
     platform_include: std.Build.LazyPath,
     /// setup 用の platform root（macOS backend の .o コンパイル/フレームワーク用。`b.path(PROJECT_ROOT ++ "/platform")`）。
     platform_root: std.Build.LazyPath,
-    /// keyboard.zig（不要なら null）。platform に依存するため backend ごとに作る。
+    /// src/keyboard.zig（不要なら null）。platform に依存するため backend ごとに作る。
     keyboard_source: ?std.Build.LazyPath = null,
     /// OS/backend 非依存の追加 import（sprite / png / gui / core 等）。
     extra: []const Import = &.{},
@@ -288,6 +288,21 @@ pub const StandaloneSpec = struct {
     /// 二重化すると「file exists in modules 'png' and 'png0'」になるため、同一インスタンスを共有する。
     /// null なら buildStandalone が platform_source から導出して1つ作る (TASK-32.2)。
     png_module: ?*std.Build.Module = null,
+    /// kit umbrella（ADR-007 R4）を配線する場合に caller が用意する安定 lib 群。
+    /// apps（pixie 等）の standalone ビルドに必須（apps のソースは `@import("kit")` を使うため）。
+    /// examples は kit を使わないので null のまま。
+    /// **png は spec.png_module と同一インスタンスを渡すこと**（file-in-two-modules 回避）。
+    /// platform / control(harness) / types / audio は buildStandalone が内部で配線する。
+    kit_libs: ?KitLibs = null,
+};
+
+/// standalone の kit 配線に必要な安定 lib module 群（ADR-007 kit 初期セットのうち caller 供給分）。
+pub const KitLibs = struct {
+    gui: *std.Build.Module,
+    png: *std.Build.Module,
+    font: *std.Build.Module,
+    dsp: *std.Build.Module,
+    synth: *std.Build.Module,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
@@ -349,16 +364,17 @@ pub fn buildStandalone(
     // 呼び出し側が extra 用に作った png があればそれを共有する（二重 png module 化を防ぐ）。
     const png_mod = spec.png_module orelse b.createModule(.{ .root_source_file = png_source });
 
-    // 共有型 module（platform_types）と harness module も platform_source の dirname（<ROOT>/src）から
+    // 共有型 module（platform_types）と harness module も platform_source の dirname（<ROOT>/core）から
     // 導出して1つずつ作り、全 backend で共有する。platform.zig(facade) は `@import("platform_types")` /
     // `@import("harness")`、harness は `@import("png")` / `@import("platform_types")` する (TASK-32.2)。
-    const src_dir: []const u8 = switch (spec.platform_source) {
+    // harness は core/control/ 配下（ADR-007 R3: 制御＋観測プレーンへの昇格）。
+    const core_dir: []const u8 = switch (spec.platform_source) {
         .cwd_relative => |s| std.fs.path.dirname(s) orelse ".",
         else => @panic("buildStandalone: platform_source は .cwd_relative 前提です（types/harness パス導出のため）"),
     };
-    const types_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/platform_types.zig", .{src_dir}) } });
+    const types_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/platform_types.zig", .{core_dir}) } });
     const harness_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = b.fmt("{s}/harness.zig", .{src_dir}) },
+        .root_source_file = .{ .cwd_relative = b.fmt("{s}/control/harness.zig", .{core_dir}) },
         .link_libc = true,
     });
     harness_mod.addImport("png", png_mod);
@@ -368,8 +384,8 @@ pub fn buildStandalone(
     // audio.zig は `@import("harness")` するので、platform module と **同一の harness_mod** を共有しないと
     // file-in-two-modules になり audio probe も無音になる。caller が別途 audio module を作って extra で渡すと
     // harness が二重化するため、audio は link_audio に集約する（example_15 等）。
-    const audio_mod: ?*std.Build.Module = if (spec.link_audio) blk: {
-        const am = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/audio.zig", .{src_dir}) } });
+    const audio_mod: ?*std.Build.Module = if (spec.link_audio or spec.kit_libs != null) blk: {
+        const am = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/audio.zig", .{core_dir}) } });
         am.addImport("harness", harness_mod);
         break :blk am;
     } else null;
@@ -383,7 +399,26 @@ pub fn buildStandalone(
             .optimize = optimize,
         });
         root.addImport("platform", platform_mod);
-        if (audio_mod) |am| root.addImport("audio", am);
+        if (spec.link_audio) root.addImport("audio", audio_mod.?);
+
+        // kit umbrella（ADR-007 R4/R5）。apps の standalone は root が `@import("kit")` する。
+        // kit/kit.zig の pub import と 1:1 で揃える（platform は backend 毎なので kit も backend 毎）。
+        if (spec.kit_libs) |kl| {
+            const kit_root: []const u8 = std.fs.path.dirname(core_dir) orelse ".";
+            const kit_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/kit/kit.zig", .{kit_root}) },
+            });
+            kit_mod.addImport("platform", platform_mod);
+            kit_mod.addImport("harness", harness_mod);
+            kit_mod.addImport("platform_types", types_mod);
+            kit_mod.addImport("audio", audio_mod.?);
+            kit_mod.addImport("gui", kl.gui);
+            kit_mod.addImport("png", kl.png);
+            kit_mod.addImport("font", kl.font);
+            kit_mod.addImport("dsp", kl.dsp);
+            kit_mod.addImport("synth", kl.synth);
+            root.addImport("kit", kit_mod);
+        }
         if (spec.keyboard_source) |ks| {
             const kb = b.createModule(.{ .root_source_file = ks });
             kb.addImport("platform", platform_mod);

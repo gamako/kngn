@@ -12,7 +12,7 @@
 //! - tool/色の切替は capture 開始時に latch（進行中 stroke は latch 値で描く）
 
 const std = @import("std");
-const core = @import("core");
+const core = @import("paint");
 
 pub const CanvasInput = struct {
     capturing: bool = false,

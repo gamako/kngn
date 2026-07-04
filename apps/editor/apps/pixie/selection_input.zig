@@ -15,7 +15,7 @@
 //!   なければ stale（外部編集が入った/別レイヤー）とみなして re-lift する（単一地点での無効化）。
 
 const std = @import("std");
-const core = @import("core");
+const core = @import("paint");
 
 pub const SelectionInput = struct {
     state: State = .idle,

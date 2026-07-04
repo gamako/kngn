@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const blit = @import("blit");
-const core = @import("core");
+const core = @import("paint");
 
 const CANVAS_W: u32 = 256;
 const CANVAS_H: u32 = 256;

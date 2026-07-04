@@ -6,13 +6,14 @@
 //! 音は L1 audio の RT コールバックから Synth.render→MasterEffects.process（GUI⇔Audio はロックフリー）。
 
 const std = @import("std");
-const platform = @import("platform");
-const audio = @import("audio");
-const synthlib = @import("synth");
-const dsp = @import("dsp");
-const gui = @import("gui");
-const spectrogram = @import("spectrogram.zig");
-const scope = @import("scope.zig");
+const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
+const platform = kit.platform;
+const audio = kit.audio;
+const synthlib = kit.synth;
+const dsp = kit.dsp;
+const gui = kit.gui;
+const spectrogram = @import("spectrogram");
+const scope = @import("scope");
 
 const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);

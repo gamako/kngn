@@ -6,7 +6,7 @@
 //! （性能規約の 3 点セット準拠。旧 per-pixel 実装は *Ref としてテスト/ベンチの参照に残す）。
 
 const std = @import("std");
-const core = @import("core");
+const core = @import("paint");
 
 pub const CHECKER_CELL: i32 = 8;
 pub const CHECKER_LIGHT: u32 = 0xFF_6A_6A_6A;

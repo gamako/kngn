@@ -36,24 +36,36 @@ pub fn build(b: *std.Build) void {
     });
     gui.addImport("font", font);
     gui.addImport("pixelops", pixelops);
-    const core = b.createModule(.{
-        .root_source_file = b.path("core/core.zig"),
+
+    // paint（旧 editor/core。ADR-007 R6 で libs/paint へ格上げ）: pixie が直 import する
+    // 「エディタ族の共有 lib」（kit 非収録）。
+    const paint = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/paint/src/paint.zig" },
     });
-    core.addImport("png", png); // core/io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
-    core.addImport("pixelops", pixelops); // core/blend.zig が委譲 (TASK-51)
+    paint.addImport("png", png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
+    paint.addImport("pixelops", pixelops); // blend.zig が委譲 (TASK-51)
+
+    // kit（ADR-007 R4）の caller 供給分。pixie ソースは platform/gui/png を @import("kit") 経由で使う。
+    // dsp/synth は pixie からは未参照（lazy 解析でコンパイルされない）が、kit/kit.zig と 1:1 で配線する。
+    const dsp = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
+    });
+    const synth = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
+    });
+    synth.addImport("dsp", dsp);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",
         .main_source = b.path("apps/pixie/main.zig"),
-        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        // harness(platform→harness→png) と core/png で png module を共有する（二重化回避。TASK-32.2）。
+        // harness(platform→harness→png) と kit/paint で png module を共有する（二重化回避。TASK-32.2）。
         .png_module = png,
+        .kit_libs = .{ .gui = gui, .png = png, .font = font, .dsp = dsp, .synth = synth },
         .extra = &.{
-            .{ .name = "core", .module = core },
-            .{ .name = "gui", .module = gui },
-            .{ .name = "png", .module = png },
+            .{ .name = "paint", .module = paint },
         },
     });
 }

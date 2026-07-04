@@ -20,12 +20,13 @@
 //! ESC/閉じるで終了。
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
+const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
+const platform = kit.platform;
+const gui = kit.gui;
 const modular = @import("modular");
-const audio = @import("audio");
-const synth = @import("synth"); // SampleTap（Audio→GUI 出力タップ。C の master 可視化）
-const dsp = @import("dsp"); // mono downmix
+const audio = kit.audio;
+const synth = kit.synth; // SampleTap（Audio→GUI 出力タップ。C の master 可視化）
+const dsp = kit.dsp; // mono downmix
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
 const canvas = @import("canvas.zig");

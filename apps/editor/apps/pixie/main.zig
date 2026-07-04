@@ -12,10 +12,11 @@
 //!         ESC・Cmd+Q=終了（ウィンドウクローズ含め running=false の単一経路）
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
-const core = @import("core");
-const png = @import("png");
+const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
+const platform = kit.platform;
+const gui = kit.gui;
+const core = @import("paint");
+const png = kit.png;
 const canvas_input = @import("canvas_input.zig");
 const blit = @import("blit.zig");
 const palette_mod = @import("palette.zig");

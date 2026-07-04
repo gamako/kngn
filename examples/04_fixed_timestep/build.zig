@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_04_fixed_timestep",
         .main_source = b.path("main.zig"),
-        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/platform.zig" },
+        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .extra = &.{

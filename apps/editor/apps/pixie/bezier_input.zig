@@ -6,7 +6,7 @@
 //! handleKey から PathEditor を直接駆動する（このアダプタはマウスのみ担当）。
 
 const std = @import("std");
-const core = @import("core");
+const core = @import("paint");
 
 pub const BezierInput = struct {
     last_click_t: f64 = -1,
