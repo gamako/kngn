@@ -26,6 +26,7 @@ pub const Metrics = font.Metrics;
 pub const Font = font.Font;
 pub const plotCoverage = font.plotCoverage;
 pub const blitCoverage = font.blitCoverage;
+pub const blitRGBA = font.blitRGBA;
 pub const clipCoverage = font.clipCoverage;
 pub const CovClip = font.CovClip;
 
