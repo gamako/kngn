@@ -125,6 +125,9 @@ tier はビルド時の backend 選択（`-Dplatform`）に対応するが、本
 - **本タスクのスコープ**: 上記は ADR 上の **方針**であり、Zig API の追加・実装は **follow-up**（末尾参照）。現行
   `lockFramebuffer()` 互換経路は残したまま、ゲーム向け pacing API を上に重ねる移行を想定する。
 
+> **API 形は [ADR-008](008_frame_pacing_APIとfatal状態分離.md) で確定**（TASK-38。`Window.beginFrame(wait) FrameResult` /
+> `Window.waitFrame(timeout_ns) WaitResult` の method 形・ライフサイクル規約・harness 整合まで含む）。
+
 ## Fatal State Policy — null と fatal の区別（AC#10）
 
 `lockFramebuffer() == null` は **frame slot unavailable（retry 可能）** のみを表し、**fatal には使わない**。
@@ -139,6 +142,10 @@ device lost（D3D）/ window 破棄 / backend fatal error などは別経路で�
   既存 `.quit`）で通知する。
 
 いずれの案でも、後続 API 破壊を避けるため「現行 `?Framebuffer` 互換経路を壊さずに fatal 経路を足す」ことを条件とする。
+
+> **分離方式は [ADR-008](008_frame_pacing_APIとfatal状態分離.md) で確定**（TASK-38。`FrameResult` tagged union +
+> sticky fatal state を採用。旧 `lockFramebuffer()` は fatal 後も `null` を返し続けつつ
+> `nextEvent()`/`pollEvents()` 側で可視化する併用方式）。
 
 ## Backend ごとの差分
 
@@ -262,3 +269,4 @@ frame_index 進行条件」を変えないか、変えるなら harness の repl
 |---------|------|---------|
 | 1.0 | 2026-06-27 | 初版（TASK-34）。support tier と frame pacing 契約を定義。ADR-004 を Supersede、ADR-002 を改訂。 |
 | 1.1 | 2026-06-28 | TASK-36。Metal backend を 1級 frame pacing 契約へ適合（triple slot + inflight semaphore / draw(in:) 集約で drawable 警告解消 / displaySyncEnabled 明示）。Support Tier 表と Metal 節を実装済みへ更新。 |
+| 1.2 | 2026-07-05 | TASK-38。「Wait / Skip Policy」「Fatal State Policy」両節に [ADR-008](008_frame_pacing_APIとfatal状態分離.md) への参照を追記（API 形・分離方式が確定したため）。本 ADR 自体の決定内容は不変。 |
