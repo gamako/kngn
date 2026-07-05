@@ -1,0 +1,152 @@
+//! apps/modular の harness action（TASK-65）向け純パーサ。
+//!
+//! ホットパス宣言: ここでパースした結果は「イベント時のみ」（harness の `action <name> [args]`
+//! コマンド1回につき1回）dispatch される。毎フレーム全画素ループ・毎サンプル RT 経路のいずれでもない
+//! ため、性能規約（SIMD 3点セット等）の適用対象外。
+//!
+//! このファイルは **std のみに依存**し、App / kit / platform / modular を一切 import しない
+//! （pixie の `actions.zig` と同型。main.zig との circular import を避け、単体テスト可能にする）。
+//! track 名（kick/hat/clap/bass 等）の enum 解決は App の具象型を知る main.zig 側が行う
+//! （pixie の `ToolKind` 解決と同じ分離方針。このファイルは name を素通しする）。
+
+const std = @import("std");
+
+pub const ParseError = error{
+    Empty,
+    InvalidNumber,
+    NonFinite,
+    TooManyTokens,
+    UnknownBool,
+};
+
+fn tokenize(args: []const u8) std.mem.TokenIterator(u8, .any) {
+    return std.mem.tokenizeAny(u8, args, " \t");
+}
+
+fn expectExhausted(it: *std.mem.TokenIterator(u8, .any)) ParseError!void {
+    if (it.next() != null) return error.TooManyTokens;
+}
+
+pub const NameF32 = struct { name: []const u8, value: f32 };
+
+/// "<name> <value>" の2トークン（`set_param` 汎用 f32 setter 用）。
+/// NaN/Inf は `error.NonFinite` で拒否する（fail-fast。非有限値を Controls(atomic) 経由で RT へ
+/// 渡すのを入口で止める。synth の parseNameF32 と対称）。
+pub fn parseNameF32(args: []const u8) ParseError!NameF32 {
+    var it = tokenize(args);
+    const name = it.next() orelse return error.Empty;
+    const v_tok = it.next() orelse return error.Empty;
+    const value = std.fmt.parseFloat(f32, v_tok) catch return error.InvalidNumber;
+    if (!std.math.isFinite(value)) return error.NonFinite;
+    try expectExhausted(&it);
+    return .{ .name = name, .value = value };
+}
+
+pub const NameBool = struct { name: []const u8, on: bool };
+
+/// "<name> <0|1>" の2トークン（`set_mute`/`set_lock` 用）。
+pub fn parseNameBool(args: []const u8) ParseError!NameBool {
+    var it = tokenize(args);
+    const name = it.next() orelse return error.Empty;
+    const b_tok = it.next() orelse return error.Empty;
+    const on = if (std.mem.eql(u8, b_tok, "0"))
+        false
+    else if (std.mem.eql(u8, b_tok, "1"))
+        true
+    else
+        return error.UnknownBool;
+    try expectExhausted(&it);
+    return .{ .name = name, .on = on };
+}
+
+pub const NameU8 = struct { name: []const u8, value: u8 };
+
+/// "<name> <0-255>" の2トークン（`toggle_step` 用: track 名 + step index）。
+pub fn parseNameU8(args: []const u8) ParseError!NameU8 {
+    var it = tokenize(args);
+    const name = it.next() orelse return error.Empty;
+    const v_tok = it.next() orelse return error.Empty;
+    const value = std.fmt.parseUnsigned(u8, v_tok, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return .{ .name = name, .value = value };
+}
+
+pub const TwoU8 = struct { a: u8, b: u8 };
+
+/// "<a> <b>" の2トークン（`set_pitch <step> <deg>` 用）。
+pub fn parseTwoU8(args: []const u8) ParseError!TwoU8 {
+    var it = tokenize(args);
+    const a_tok = it.next() orelse return error.Empty;
+    const a = std.fmt.parseUnsigned(u8, a_tok, 10) catch return error.InvalidNumber;
+    const b_tok = it.next() orelse return error.Empty;
+    const b = std.fmt.parseUnsigned(u8, b_tok, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return .{ .a = a, .b = b };
+}
+
+/// "<0|1>" の1トークン（`set_evolve` 用）。
+pub fn parseBool01(args: []const u8) ParseError!bool {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const on = if (std.mem.eql(u8, tok, "0"))
+        false
+    else if (std.mem.eql(u8, tok, "1"))
+        true
+    else
+        return error.UnknownBool;
+    try expectExhausted(&it);
+    return on;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "parseNameF32: 有効値 / 空 / 不正数値 / 非有限 / 余剰トークン" {
+    const r = try parseNameF32("tempo 128");
+    try testing.expectEqualStrings("tempo", r.name);
+    try testing.expectEqual(@as(f32, 128), r.value);
+    try testing.expectError(error.Empty, parseNameF32(""));
+    try testing.expectError(error.Empty, parseNameF32("tempo"));
+    try testing.expectError(error.InvalidNumber, parseNameF32("tempo abc"));
+    try testing.expectError(error.NonFinite, parseNameF32("tempo nan"));
+    try testing.expectError(error.NonFinite, parseNameF32("tempo inf"));
+    try testing.expectError(error.TooManyTokens, parseNameF32("tempo 128 extra"));
+}
+
+test "parseNameBool: 0/1 のみ許容" {
+    const r = try parseNameBool("kick 1");
+    try testing.expectEqualStrings("kick", r.name);
+    try testing.expectEqual(true, r.on);
+    try testing.expectError(error.UnknownBool, parseNameBool("kick true"));
+    try testing.expectError(error.Empty, parseNameBool("kick"));
+    try testing.expectError(error.TooManyTokens, parseNameBool("kick 1 extra"));
+}
+
+test "parseNameU8: 有効値 / 範囲外 / 余剰トークン" {
+    const r = try parseNameU8("kick 5");
+    try testing.expectEqualStrings("kick", r.name);
+    try testing.expectEqual(@as(u8, 5), r.value);
+    try testing.expectError(error.InvalidNumber, parseNameU8("kick 999"));
+    try testing.expectError(error.Empty, parseNameU8("kick"));
+    try testing.expectError(error.TooManyTokens, parseNameU8("kick 5 6"));
+}
+
+test "parseTwoU8: 有効値 / 不正数値" {
+    const r = try parseTwoU8("3 5");
+    try testing.expectEqual(@as(u8, 3), r.a);
+    try testing.expectEqual(@as(u8, 5), r.b);
+    try testing.expectError(error.InvalidNumber, parseTwoU8("3 abc"));
+    try testing.expectError(error.Empty, parseTwoU8("3"));
+    try testing.expectError(error.TooManyTokens, parseTwoU8("3 5 7"));
+}
+
+test "parseBool01: 0/1 のみ許容" {
+    try testing.expectEqual(true, try parseBool01("1"));
+    try testing.expectEqual(false, try parseBool01("0"));
+    try testing.expectError(error.UnknownBool, parseBool01("yes"));
+    try testing.expectError(error.Empty, parseBool01(""));
+    try testing.expectError(error.TooManyTokens, parseBool01("1 0"));
+}

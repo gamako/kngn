@@ -831,6 +831,17 @@ pub fn build(b: *std.Build) void {
     const test_synth_step = b.step("test-synth", "Run libs/synth unit tests");
     test_synth_step.dependOn(&run_synth_test.step);
 
+    // apps/synth action の純パーサ（TASK-65）。std のみ・App/kit/dsp 非依存で import 不要。
+    const synth_actions_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/synth/actions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_synth_actions_test = b.addRunArtifact(synth_actions_test);
+    test_synth_step.dependOn(&run_synth_actions_test.step);
+
     // libs/modular テスト（グラフエンジン: topo / cycle 遅延辺 / 単一接続 / per-sample / 可変 frames / 長時間レンダー）
     const modular_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/modular/src/modular.zig"),
@@ -857,6 +868,17 @@ pub fn build(b: *std.Build) void {
     const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");
     test_app_modular_step.dependOn(&run_modular_app_test.step);
 
+    // apps/modular action の純パーサ（TASK-65）。std のみ・App/kit/modular 非依存で import 不要。
+    const modular_actions_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/modular/actions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_modular_actions_test = b.addRunArtifact(modular_actions_test);
+    test_app_modular_step.dependOn(&run_modular_actions_test.step);
+
     // apps/patch 純ロジックテスト集約 root（canvas: camera 変換 / hit-test / 見切れ検出 + group: グループ台帳 /
     // expose 導出 / 表示写像。display/audio 不要。TASK-40.6.2 / 40.7.1）
     const patch_tests_mod = b.createModule(.{
@@ -868,6 +890,17 @@ pub fn build(b: *std.Build) void {
     const run_patch_tests = b.addRunArtifact(patch_tests);
     const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
     test_patch_step.dependOn(&run_patch_tests.step);
+
+    // apps/patch action の純パーサ（TASK-65）。std のみ・App/kit/modular 非依存で import 不要。
+    const patch_actions_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/patch/actions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_patch_actions_test = b.addRunArtifact(patch_actions_test);
+    test_patch_step.dependOn(&run_patch_actions_test.step);
 
     // apps/patch マクロ builder テスト（DrumMachine テンプレ: preflight/rollback/決定性/発音回帰。TASK-40.7.1）
     const patch_macro_test_mod = b.createModule(.{

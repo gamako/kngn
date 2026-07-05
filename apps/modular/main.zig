@@ -23,6 +23,7 @@ const patchmod = @import("patch.zig");
 const LofiPatch = patchmod.LofiPatch;
 const PatternCommand = patchmod.PatternCommand;
 const PatchState = patchmod.PatchState;
+const actions = @import("actions.zig");
 
 // ウィンドウ。上部=GUI コントロール + DrumMachine/BassMachine、下部=可視化帯。
 const WIN_W = 1120;
@@ -51,6 +52,11 @@ const BASS_DEG_TOTAL: usize = patchmod.BASS_DEG_TOTAL; // bass の degree 総数
 const App = struct {
     patch: ?*LofiPatch = null,
     tap: Tap = .{},
+    /// GUI スライダ/ボタンが in-place 更新する scalar パラメータ束（TASK-65: harness action からも
+    /// 同じ field を書き換えられるよう main() ローカルから App へ移設）。
+    params: Params = .{},
+    /// GUI が publish した pattern の最新 revision（action もこのカウンタを共有し二重採番を防ぐ）。
+    pattern_rev: u32 = 0,
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -230,8 +236,8 @@ pub fn main() !void {
     osc.* = .{};
     var meter = scope.LevelMeter{};
 
-    var params = Params{};
-    var pattern_rev: u32 = 0; // GUI が publish した最新 revision
+    // scalar パラメータ束 / pattern revision カウンタは App.params / App.pattern_rev（TASK-65。
+    // harness action からも同じ field を書き換えられるよう main() ローカルから App へ移設）。
 
     try platform.init();
     defer platform.shutdown();
@@ -270,6 +276,8 @@ pub fn main() !void {
     defer device.stop();
 
     platform.registerProbe(.{ .name = "modular", .ctx = app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
+    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
+    registerActions(app);
 
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
@@ -318,34 +326,34 @@ pub fn main() !void {
         // scalar コントロール（3 カラム）
         ctx.beginBox(.{ .direction = .row, .gap = 18 });
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x7001, "Tempo    ", &params.tempo, .{ .min = 60, .max = 180, .step = 1 });
-        _ = ctx.sliderF32Id(0x7002, "Cutoff   ", &params.cutoff_norm, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x7004, "Swing    ", &params.swing, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x7005, "Sidechain", &params.sidechain, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x7011, "Ambient  ", &params.ambient_move, .{ .min = 0, .max = 1, .step = 0.02 });
+        _ = ctx.sliderF32Id(0x7001, "Tempo    ", &app.params.tempo, .{ .min = 60, .max = 180, .step = 1 });
+        _ = ctx.sliderF32Id(0x7002, "Cutoff   ", &app.params.cutoff_norm, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x7004, "Swing    ", &app.params.swing, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x7005, "Sidechain", &app.params.sidechain, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x7011, "Ambient  ", &app.params.ambient_move, .{ .min = 0, .max = 1, .step = 0.02 });
         ctx.endBox();
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x7006, "Kick Gain", &params.kick_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x7007, "Hat Gain ", &params.hat_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x7008, "Clap Gain", &params.clap_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x7009, "Bass Gain", &params.bass_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x700A, "Pad Level", &params.pad_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x7006, "Kick Gain", &app.params.kick_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x7007, "Hat Gain ", &app.params.hat_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x7008, "Clap Gain", &app.params.clap_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x7009, "Bass Gain", &app.params.bass_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x700A, "Pad Level", &app.params.pad_gain, .{ .min = 0, .max = 1.5, .step = 0.05 });
         ctx.endBox();
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x700B, "KickPunch", &params.kick_punch, .{ .min = 0, .max = 2, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x700C, "Hat Bright", &params.hat_bright, .{ .min = 0.3, .max = 2.5, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x700E, "Pad Cutoff", &params.pad_cutoff, .{ .min = 200, .max = 6000, .step = 50 });
-        _ = ctx.sliderF32Id(0x700F, "Pad Warm ", &params.pad_warmth, .{ .min = 0, .max = 1, .step = 0.02 });
-        _ = ctx.sliderF32Id(0x7010, "Mst Warm ", &params.master_warmth, .{ .min = 0, .max = 1, .step = 0.02 });
+        _ = ctx.sliderF32Id(0x700B, "KickPunch", &app.params.kick_punch, .{ .min = 0, .max = 2, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x700C, "Hat Bright", &app.params.hat_bright, .{ .min = 0.3, .max = 2.5, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x700E, "Pad Cutoff", &app.params.pad_cutoff, .{ .min = 200, .max = 6000, .step = 50 });
+        _ = ctx.sliderF32Id(0x700F, "Pad Warm ", &app.params.pad_warmth, .{ .min = 0, .max = 1, .step = 0.02 });
+        _ = ctx.sliderF32Id(0x7010, "Mst Warm ", &app.params.master_warmth, .{ .min = 0, .max = 1, .step = 0.02 });
         ctx.endBox();
         ctx.endBox();
         // mute ボタン行
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
-        if (ctx.button(if (params.kick_mute) "Kick: MUTE" else "Kick: on")) params.kick_mute = !params.kick_mute;
-        if (ctx.button(if (params.hat_mute) "Hat: MUTE" else "Hat: on")) params.hat_mute = !params.hat_mute;
-        if (ctx.button(if (params.clap_mute) "Clap: MUTE" else "Clap: on")) params.clap_mute = !params.clap_mute;
-        if (ctx.button(if (params.bass_mute) "Bass: MUTE" else "Bass: on")) params.bass_mute = !params.bass_mute;
-        if (ctx.button(if (params.pad_mute) "Pad: MUTE" else "Pad: on")) params.pad_mute = !params.pad_mute;
+        if (ctx.button(if (app.params.kick_mute) "Kick: MUTE" else "Kick: on")) app.params.kick_mute = !app.params.kick_mute;
+        if (ctx.button(if (app.params.hat_mute) "Hat: MUTE" else "Hat: on")) app.params.hat_mute = !app.params.hat_mute;
+        if (ctx.button(if (app.params.clap_mute) "Clap: MUTE" else "Clap: on")) app.params.clap_mute = !app.params.clap_mute;
+        if (ctx.button(if (app.params.bass_mute) "Bass: MUTE" else "Bass: on")) app.params.bass_mute = !app.params.bass_mute;
+        if (ctx.button(if (app.params.pad_mute) "Pad: MUTE" else "Pad: on")) app.params.pad_mute = !app.params.pad_mute;
         // 自己進化の全体トグル（off で完全な手動シーケンサ。lock していないトラックだけ進化する）
         if (ctx.buttonId(TOGGLE_BASE + 100, if (cmd.evolve) "Evolve: on" else "Evolve: off", .{ .selected = cmd.evolve }).clicked) {
             cmd.evolve = !cmd.evolve;
@@ -432,10 +440,10 @@ pub fn main() !void {
         // pattern_db(Mailbox/triple-buffer) は 1 フレーム最大 1 publish（GUI は ~60fps の frame レート）。
         // RT は毎ブロック(~10ms)で acquire() で最新を latch する。triple-buffer なので consumer が
         // 保持中の slot は後続 publish で書き換わらず torn read が起きない（既存 synth と同方針。TASK-56）。
-        publishControls(patch, params);
+        publishControls(patch, app.params);
         if (edited) {
-            pattern_rev += 1;
-            cmd.rev = pattern_rev;
+            app.pattern_rev += 1;
+            cmd.rev = app.pattern_rev;
             patch.controls.pattern_db.publish(cmd);
         }
 
@@ -560,4 +568,152 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
     const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch "";
     off += tail.len;
     return allocator.dupe(u8, out[0..off]);
+}
+
+// ============================================================================
+// ヘッドレス検証 harness の custom action（TASK-65。TASK-62.1 の registerAction を modular が採用。
+// pixie(TASK-64)/synth(TASK-65) と同じ「probe(read) に対称な write 口。既存の GUI 編集経路と同じ
+// publish 呼び出しをそのまま辿る」構図）。
+//
+// ホットパス宣言: 全 action の `run()` は「イベント時のみ」（harness `action` コマンド1回につき1回、
+// main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
+// action が触れる状態伝播は既存の RT-safe cross-thread hand-off をそのまま使うだけで、RT 経路
+// （`LofiPatch.render`→graph `processBlock`）へ新たな同期/alloc/lock/panic は一切追加しない:
+//   - scalar param / mute: `publishControls`（atomic store。GUI が毎フレーム呼ぶ既存コードと同一）。
+//   - pattern 編集(lock/evolve/step/pitch): `patch.snapshotState()` で最新 pattern を読み
+//     `stateToCommand` で編集用 base に変換 → 該当 field を書換 → `app.pattern_rev` を1回だけ increment
+//     → `patch.controls.pattern_db.publish(cmd)`（triple-buffer Mailbox。GUI の「1 フレームで edited=true
+//     のときだけ publish」と全く同じ経路・同じ revision カウンタを共有するため二重採番が起きない）。
+//
+// パーサは `actions.zig`（std のみ・App/kit/modular 非依存）に切り出し単体テストする。track 名の enum
+// 解決は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と同じ分離方針）。
+// ============================================================================
+
+fn actionApp(ctx: *anyopaque) *App {
+    return @ptrCast(@alignCast(ctx));
+}
+
+/// `Params` の f32 field へ comptime dispatch で書き込む（`set_param` 汎用 setter）。
+fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!void {
+    inline for (@typeInfo(Params).@"struct".fields) |f| {
+        if (f.type == f32 and std.mem.eql(u8, f.name, name)) {
+            @field(p, f.name) = value;
+            return;
+        }
+    }
+    return error.UnknownParam;
+}
+
+fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const nf = try actions.parseNameF32(args);
+    try setParamsF32(&app.params, nf.name, nf.value);
+    publishControls(patch, app.params);
+    return "ok";
+}
+
+const MuteTrack = enum { kick, hat, clap, bass, pad };
+
+fn actionSetMute(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const p = try actions.parseNameBool(args);
+    const track = std.meta.stringToEnum(MuteTrack, p.name) orelse return error.UnknownTrack;
+    switch (track) {
+        .kick => app.params.kick_mute = p.on,
+        .hat => app.params.hat_mute = p.on,
+        .clap => app.params.clap_mute = p.on,
+        .bass => app.params.bass_mute = p.on,
+        .pad => app.params.pad_mute = p.on,
+    }
+    publishControls(patch, app.params);
+    return "ok";
+}
+
+const LockTrack = enum { kick, hat, clap, bass };
+
+fn actionSetLock(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const p = try actions.parseNameBool(args);
+    const track = std.meta.stringToEnum(LockTrack, p.name) orelse return error.UnknownTrack;
+    var cmd = stateToCommand(patch.snapshotState());
+    switch (track) {
+        .kick => cmd.kick.lock = p.on,
+        .hat => cmd.hat.lock = p.on,
+        .clap => cmd.clap.lock = p.on,
+        .bass => cmd.bass.lock = p.on,
+    }
+    app.pattern_rev += 1;
+    cmd.rev = app.pattern_rev;
+    patch.controls.pattern_db.publish(cmd);
+    return "ok";
+}
+
+fn actionSetEvolve(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const on = try actions.parseBool01(args);
+    var cmd = stateToCommand(patch.snapshotState());
+    cmd.evolve = on;
+    app.pattern_rev += 1;
+    cmd.rev = app.pattern_rev;
+    patch.controls.pattern_db.publish(cmd);
+    return "ok";
+}
+
+const StepTarget = enum { kick, hat, clap, bass_on, bass_accent, bass_slide };
+
+fn actionToggleStep(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const p = try actions.parseNameU8(args);
+    const target = std.meta.stringToEnum(StepTarget, p.name) orelse return error.UnknownTrack;
+    if (p.value >= 16) return error.StepOutOfRange;
+    var cmd = stateToCommand(patch.snapshotState());
+    const mask = bitOf(p.value);
+    switch (target) {
+        .kick => cmd.kick.on ^= mask,
+        .hat => cmd.hat.on ^= mask,
+        .clap => cmd.clap.on ^= mask,
+        .bass_on => cmd.bass.on ^= mask,
+        .bass_accent => cmd.bass.accent ^= mask,
+        .bass_slide => cmd.bass.slide ^= mask,
+    }
+    app.pattern_rev += 1;
+    cmd.rev = app.pattern_rev;
+    patch.controls.pattern_db.publish(cmd);
+    return "ok";
+}
+
+fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const p = try actions.parseTwoU8(args); // a=step(0..15) b=deg(0..BASS_DEG_TOTAL-1)
+    if (p.a >= 16) return error.StepOutOfRange;
+    if (p.b >= BASS_DEG_TOTAL) return error.DegreeOutOfRange;
+    var cmd = stateToCommand(patch.snapshotState());
+    cmd.bass.deg[p.a] = @intCast(p.b);
+    app.pattern_rev += 1;
+    cmd.rev = app.pattern_rev;
+    patch.controls.pattern_db.publish(cmd);
+    return "ok";
+}
+
+/// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+fn registerActions(app: *App) void {
+    platform.registerAction(.{ .name = "set_param", .ctx = app, .run = actionSetParam });
+    platform.registerAction(.{ .name = "set_mute", .ctx = app, .run = actionSetMute });
+    platform.registerAction(.{ .name = "set_lock", .ctx = app, .run = actionSetLock });
+    platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = actionSetEvolve });
+    platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = actionToggleStep });
+    platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = actionSetPitch });
 }

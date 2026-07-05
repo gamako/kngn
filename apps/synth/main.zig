@@ -14,6 +14,7 @@ const dsp = kit.dsp;
 const gui = kit.gui;
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
+const actions = @import("actions.zig");
 
 const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);
@@ -53,6 +54,10 @@ const App = struct {
     /// Mailbox の consumer 状態は RT 専有のため probe からは触らない）
     last_patch: Patch = .{},
     tap: Tap,
+    /// GUI スライダ/ボタンが in-place 更新するパラメータ束（TASK-65: harness action からも
+    /// 同じ field を書き換えられるよう main() ローカルから App へ移設）。
+    params: Params = .{},
+    fxp: FxParams = .{},
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -244,14 +249,11 @@ pub fn main() !void {
     var app = try allocator.create(App);
     defer allocator.destroy(app);
 
-    // スライダ用パラメータ（GUI が in-place 更新）
-    var params = Params{};
-    var fxp = FxParams{};
-
-    const initial_patch = makePatch(params);
+    // スライダ/harness action が in-place 更新するパラメータ束は App.params/App.fxp（TASK-65）。
+    const initial_patch = makePatch(Params{});
     app.* = .{
         .synth = Synth.init(48000, initial_patch),
-        .fx = Fx.init(48000, makeFxParams(fxp)),
+        .fx = Fx.init(48000, makeFxParams(FxParams{})),
         .last_patch = initial_patch, // probe が初回 frame 前でも実際の初期 patch を返すように
         .tap = .{},
     };
@@ -296,6 +298,8 @@ pub fn main() !void {
     // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。app は heap 確保で寿命安定。
     platform.registerProbe(.{ .name = "voices", .ctx = app, .ext = "json", .snapshot = voicesSnapshot, .digest = voicesDigest });
     platform.registerProbe(.{ .name = "patch", .ctx = app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
+    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
+    registerActions(app);
 
     var pressed = [_]bool{false} ** 128;
     var mouse_note: ?u8 = null; // マウスで押している鍵
@@ -373,62 +377,62 @@ pub fn main() !void {
         ctx.beginBox(.{ .direction = .row, .gap = 18 });
         // 左カラム: オシレータ/アンプ + キートラック
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &params.cutoff, .{ .min = 100, .max = 18000, .step = 10 });
-        _ = ctx.sliderF32Id(0x6002, "Resonance", &params.resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6003, "Gain     ", &params.gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6004, "Attack   ", &params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6005, "Release  ", &params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &app.params.cutoff, .{ .min = 100, .max = 18000, .step = 10 });
+        _ = ctx.sliderF32Id(0x6002, "Resonance", &app.params.resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6003, "Gain     ", &app.params.gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6004, "Attack   ", &app.params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6005, "Release  ", &app.params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &app.params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
         // 中カラム: フィルタ env + LFO
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6009, "FEnvDec  ", &params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x600A, "LFO Rate ", &params.lfo_rate, .{ .min = 0.1, .max = 20, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x600B, "Vibrato  ", &params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x600C, "Tremolo  ", &params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &app.params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &app.params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6009, "FEnvDec  ", &app.params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x600A, "LFO Rate ", &app.params.lfo_rate, .{ .min = 0.1, .max = 20, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x600B, "Vibrato  ", &app.params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x600C, "Tremolo  ", &app.params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
         // 右カラム: ユニゾン / 2nd osc / ノイズ (27.13)
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x600D, "Unison   ", &params.unison, .{ .min = 1, .max = 7, .step = 1 });
-        _ = ctx.sliderF32Id(0x600E, "Detune   ", &params.detune, .{ .min = 0, .max = 50, .step = 1 });
-        _ = ctx.sliderF32Id(0x600F, "Osc2 Mix ", &params.osc2_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6010, "Osc2 Det ", &params.osc2_detune, .{ .min = -24, .max = 24, .step = 1 });
-        _ = ctx.sliderF32Id(0x6011, "Noise    ", &params.noise_amount, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x600D, "Unison   ", &app.params.unison, .{ .min = 1, .max = 7, .step = 1 });
+        _ = ctx.sliderF32Id(0x600E, "Detune   ", &app.params.detune, .{ .min = 0, .max = 50, .step = 1 });
+        _ = ctx.sliderF32Id(0x600F, "Osc2 Mix ", &app.params.osc2_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6010, "Osc2 Det ", &app.params.osc2_detune, .{ .min = -24, .max = 24, .step = 1 });
+        _ = ctx.sliderF32Id(0x6011, "Noise    ", &app.params.noise_amount, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
         // FX カラム: マスターエフェクト (27.14)
         ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x6012, "Dly Time ", &fxp.delay_time, .{ .min = 0.01, .max = 1.0, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6013, "Dly FB   ", &fxp.delay_fb, .{ .min = 0, .max = 0.95, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6014, "Dly Mix  ", &fxp.delay_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6015, "Cho Rate ", &fxp.chorus_rate, .{ .min = 0.1, .max = 8, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6016, "Cho Depth", &fxp.chorus_depth, .{ .min = 0.5, .max = 10, .step = 0.5 });
-        _ = ctx.sliderF32Id(0x6017, "Cho Mix  ", &fxp.chorus_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6018, "Dist Drv ", &fxp.dist_drive, .{ .min = 1, .max = 20, .step = 0.5 });
-        _ = ctx.sliderF32Id(0x6019, "Dist Mix ", &fxp.dist_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x601A, "Rev Mix  ", &fxp.reverb_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x601B, "Rev Decay", &fxp.reverb_decay, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x601C, "Rev Damp ", &fxp.reverb_damping, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6012, "Dly Time ", &app.fxp.delay_time, .{ .min = 0.01, .max = 1.0, .step = 0.01 });
+        _ = ctx.sliderF32Id(0x6013, "Dly FB   ", &app.fxp.delay_fb, .{ .min = 0, .max = 0.95, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6014, "Dly Mix  ", &app.fxp.delay_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6015, "Cho Rate ", &app.fxp.chorus_rate, .{ .min = 0.1, .max = 8, .step = 0.1 });
+        _ = ctx.sliderF32Id(0x6016, "Cho Depth", &app.fxp.chorus_depth, .{ .min = 0.5, .max = 10, .step = 0.5 });
+        _ = ctx.sliderF32Id(0x6017, "Cho Mix  ", &app.fxp.chorus_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x6018, "Dist Drv ", &app.fxp.dist_drive, .{ .min = 1, .max = 20, .step = 0.5 });
+        _ = ctx.sliderF32Id(0x6019, "Dist Mix ", &app.fxp.dist_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x601A, "Rev Mix  ", &app.fxp.reverb_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x601B, "Rev Decay", &app.fxp.reverb_decay, .{ .min = 0, .max = 1, .step = 0.05 });
+        _ = ctx.sliderF32Id(0x601C, "Rev Damp ", &app.fxp.reverb_damping, .{ .min = 0, .max = 1, .step = 0.05 });
         ctx.endBox();
         ctx.endBox();
         ctx.beginBox(.{ .direction = .row, .gap = 8 });
-        const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[params.wave_idx]}) catch "Wave";
-        if (ctx.button(wlabel)) params.wave_idx = (params.wave_idx + 1) % WAVE_NAMES.len;
-        const flabel = std.fmt.allocPrint(ctx.allocator(), "Filter: {s}", .{FILTER_MODE_NAMES[params.filter_mode_idx]}) catch "Filter";
-        if (ctx.button(flabel)) params.filter_mode_idx = (params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
-        const o2label = std.fmt.allocPrint(ctx.allocator(), "Osc2: {s}", .{WAVE_NAMES[params.osc2_wave_idx]}) catch "Osc2";
-        if (ctx.button(o2label)) params.osc2_wave_idx = (params.osc2_wave_idx + 1) % WAVE_NAMES.len;
-        const fxlabel = if (fxp.bypass) "FX: off" else "FX: on";
-        if (ctx.button(fxlabel)) fxp.bypass = !fxp.bypass;
+        const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[app.params.wave_idx]}) catch "Wave";
+        if (ctx.button(wlabel)) app.params.wave_idx = (app.params.wave_idx + 1) % WAVE_NAMES.len;
+        const flabel = std.fmt.allocPrint(ctx.allocator(), "Filter: {s}", .{FILTER_MODE_NAMES[app.params.filter_mode_idx]}) catch "Filter";
+        if (ctx.button(flabel)) app.params.filter_mode_idx = (app.params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
+        const o2label = std.fmt.allocPrint(ctx.allocator(), "Osc2: {s}", .{WAVE_NAMES[app.params.osc2_wave_idx]}) catch "Osc2";
+        if (ctx.button(o2label)) app.params.osc2_wave_idx = (app.params.osc2_wave_idx + 1) % WAVE_NAMES.len;
+        const fxlabel = if (app.fxp.bypass) "FX: off" else "FX: on";
+        if (ctx.button(fxlabel)) app.fxp.bypass = !app.fxp.bypass;
         ctx.endBox();
         ctx.endBox();
         ctx.endFrame();
 
         // パラメータを publish（atomic/patch publish 経由で audio スレッドへ。audio 側でスムージング）
-        app.last_patch = makePatch(params);
+        app.last_patch = makePatch(app.params);
         app.synth.publishPatch(app.last_patch);
-        app.fx.publishParams(makeFxParams(fxp));
+        app.fx.publishParams(makeFxParams(app.fxp));
 
         // 手動描画（背景 + 鍵盤 + スペクトログラム + オシロ + メータ）→ その上に GUI
         drawSpectrogramBgAndPiano(fb, &pressed);
@@ -540,4 +544,128 @@ fn makeFxParams(p: FxParams) Fx.Params {
         .reverb_decay = p.reverb_decay,
         .reverb_damping = p.reverb_damping,
     };
+}
+
+// ============================================================================
+// ヘッドレス検証 harness の custom action（TASK-65。TASK-62.1 の registerAction を synth が採用。
+// pixie(TASK-64) と同じ「probe(read) に対称な write 口。UI と同じ App.params/App.fxp field を
+// 書き換えるだけ」構図）。
+//
+// ホットパス宣言: 全 action の `run()` は「イベント時のみ」（harness `action` コマンド1回につき1回、
+// main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
+// action が触れる状態伝播は既存の RT-safe cross-thread hand-off（`Synth.publishPatch` /
+// `MasterEffects.publishParams`。いずれも atomic/Mailbox 経由で、毎フレーム GUI が呼ぶ既存コード
+// パスと同一）をそのまま使うだけで、RT 経路（`Synth.render`/`MasterEffects.process`）へ新たな
+// 同期/alloc/lock/panic は一切追加しない。
+//
+// パーサは `actions.zig`（std のみ・App/kit/dsp 非依存）に切り出し単体テストする。enum 名解決
+// （wave/filter 名 → index）は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と
+// 同じ分離方針）。
+// ============================================================================
+
+fn actionApp(ctx: *anyopaque) *App {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn republishPatch(app: *App) void {
+    app.last_patch = makePatch(app.params);
+    app.synth.publishPatch(app.last_patch);
+}
+
+fn republishFx(app: *App) void {
+    app.fx.publishParams(makeFxParams(app.fxp));
+}
+
+/// `Params` の f32 field へ comptime dispatch で書き込む（`set_param` 汎用 setter）。
+fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!void {
+    inline for (@typeInfo(Params).@"struct".fields) |f| {
+        if (f.type == f32 and std.mem.eql(u8, f.name, name)) {
+            @field(p, f.name) = value;
+            return;
+        }
+    }
+    return error.UnknownParam;
+}
+
+/// `FxParams` の f32 field へ comptime dispatch で書き込む（`set_fx_param` 汎用 setter）。
+fn setFxParamsF32(p: *FxParams, name: []const u8, value: f32) error{UnknownParam}!void {
+    inline for (@typeInfo(FxParams).@"struct".fields) |f| {
+        if (f.type == f32 and std.mem.eql(u8, f.name, name)) {
+            @field(p, f.name) = value;
+            return;
+        }
+    }
+    return error.UnknownParam;
+}
+
+fn waveIdxOf(name: []const u8) ?usize {
+    for (WAVE_NAMES, 0..) |n, i| {
+        if (std.mem.eql(u8, n, name)) return i;
+    }
+    return null;
+}
+
+fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const nf = try actions.parseNameF32(args);
+    try setParamsF32(&app.params, nf.name, nf.value);
+    republishPatch(app);
+    return "ok";
+}
+
+fn actionSetWave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const name = try actions.parseName(args);
+    app.params.wave_idx = waveIdxOf(name) orelse return error.UnknownWave;
+    republishPatch(app);
+    return "ok";
+}
+
+fn actionSetOsc2Wave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const name = try actions.parseName(args);
+    app.params.osc2_wave_idx = waveIdxOf(name) orelse return error.UnknownWave;
+    republishPatch(app);
+    return "ok";
+}
+
+fn actionSetFilter(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const name = try actions.parseName(args);
+    const fm = std.meta.stringToEnum(dsp.FilterMode, name) orelse return error.UnknownFilter;
+    app.params.filter_mode_idx = @intFromEnum(fm); // filterModeOf の switch 順と同じ ordinal
+    republishPatch(app);
+    return "ok";
+}
+
+fn actionSetFxParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const nf = try actions.parseNameF32(args);
+    try setFxParamsF32(&app.fxp, nf.name, nf.value);
+    republishFx(app);
+    return "ok";
+}
+
+fn actionSetFxBypass(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    app.fxp.bypass = try actions.parseBool01(args);
+    republishFx(app);
+    return "ok";
+}
+
+/// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+fn registerActions(app: *App) void {
+    platform.registerAction(.{ .name = "set_param", .ctx = app, .run = actionSetParam });
+    platform.registerAction(.{ .name = "set_wave", .ctx = app, .run = actionSetWave });
+    platform.registerAction(.{ .name = "set_osc2_wave", .ctx = app, .run = actionSetOsc2Wave });
+    platform.registerAction(.{ .name = "set_filter", .ctx = app, .run = actionSetFilter });
+    platform.registerAction(.{ .name = "set_fx_param", .ctx = app, .run = actionSetFxParam });
+    platform.registerAction(.{ .name = "set_fx_bypass", .ctx = app, .run = actionSetFxBypass });
 }

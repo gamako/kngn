@@ -32,6 +32,7 @@ const scope = @import("scope");
 const canvas = @import("canvas.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
+const actions = @import("actions.zig");
 
 const DynGraph = modular.DynGraph;
 const PortKind = modular.PortKind;
@@ -1393,6 +1394,8 @@ pub fn main() !void {
     platform.registerProbe(.{ .name = "patch", .ctx = &app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
     platform.registerProbe(.{ .name = "group", .ctx = &app, .ext = "json", .snapshot = null, .digest = groupDigest });
     platform.registerProbe(.{ .name = "viz", .ctx = &app, .ext = "json", .snapshot = vizSnapshot, .digest = vizDigest });
+    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
+    registerActions(&app);
 
     device.start() catch |err| {
         std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
@@ -1705,4 +1708,140 @@ fn vizSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch "";
     off += tail.len;
     return allocator.dupe(u8, out[0..off]);
+}
+
+// ============================================================================
+// ヘッドレス検証 harness の custom action（TASK-65。TASK-62.1 の registerAction を patch が採用。
+// pixie(TASK-64)/synth・modular(TASK-65) と同じ「probe(read) に対称な write 口。既存の UI 操作
+// （パレット追加・drag 配線・Delete）と同じ `DynGraph` メソッド列をそのまま辿る」構図）。
+//
+// ホットパス宣言: 全 action の `run()` は「イベント時のみ」（harness `action` コマンド1回につき1回、
+// main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
+// `DynGraph.add/removeModule/connect/disconnect/publish` はいずれも非RT・staging→triple-buffer
+// publish（既存の `commitConnect`/`deleteSelected`/`addByPaletteIndex` と全く同じ経路）で、RT 経路
+// （`DynGraph.processBlock`）へ新たな同期/alloc/lock/panic は一切追加しない。
+//
+// パーサは `actions.zig`（std のみ・App/kit/modular 非依存）に切り出し単体テストする。`ModuleKind`
+// 名の enum 解決は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と同じ分離方針）。
+//
+// スコープ: ノード add/remove/connect/disconnect のみ（task description が明示する範囲）。
+// マクロ（DrumMachine/BassMachine）の action 化は別議論として見送る。
+// ============================================================================
+
+fn actionApp(ctx: *anyopaque) *App {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn toHandle(v: usize) error{InvalidHandle}!Handle {
+    if (v >= MAX_MODULES) return error.InvalidHandle;
+    return @intCast(v);
+}
+
+/// kind 名（`modular.ModuleKind` の tag 名。26種、パレットの10種より広い）→ comptime dispatch で
+/// `dyn.add(k, .{})`。`addByPaletteIndex` の `inline for` と同型の「runtime enum → comptime 呼び出し」
+/// パターン（`switch (kind) { inline else => |k| ... }` は各 tag ごとに comptime 特殊化された分岐を
+/// 生成し、分岐内の `k` は comptime 値になる）。
+fn addNodeByKindName(app: *App, name: []const u8) !Handle {
+    const kind = std.meta.stringToEnum(modular.ModuleKind, name) orelse return error.UnknownKind;
+    return switch (kind) {
+        inline else => |k| app.dyn.add(k, .{}),
+    };
+}
+
+fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const p = try actions.parseAddNode(args);
+    const h = try addNodeByKindName(app, p.kind);
+    if (p.x) |x| {
+        if (p.y) |y| app.layout[h] = .{ .x = x, .y = y };
+    }
+    try app.dyn.publish();
+    return std.fmt.bufPrint(buf, "handle={d}", .{h}) catch "ok";
+}
+
+/// item が削除対象 handle `h` を参照しているか（remove 後 stale になる selected/hover の判定）。
+/// **`removeModule(h)` の前に**呼ぶこと（cable の src 側判定に削除前の flat edge を引くため）。
+///   - node: 直接一致。
+///   - port: `PortRef.handle` は collapsed group では合成 handle になりうるので `resolvePort` で
+///     実 member へ解決してから比較する。解決不能（既に stale）な port は保守的に落とす（true）。
+///   - cable: `CableRef` は dst しか持たないため、dst 一致に加えて削除前の実 edge を `edgeForInput` で
+///     引き src 側が h の cable も検出する（src 削除で `removeModule` がその接続を消すため stale になる）。
+///   - group: 単一ノード削除では group は消えないので保持（false）。
+/// `deleteSelected` の node 分岐は selected==削除対象前提で無条件 null にするが、action は任意 handle を
+/// 消せるため参照判定で限定する。
+fn refsHandleForRemoval(app: *const App, it: Item, h: Handle) bool {
+    return switch (it) {
+        .node => |sh| sh == h,
+        .port => |pr| blk: {
+            const real = app.ledger.resolvePort(pr) orelse break :blk true;
+            break :blk real.handle == h;
+        },
+        .cable => |cr| blk: {
+            if (cr.dst_handle == h) break :blk true;
+            if (edgeForInput(app, cr.dst_handle, cr.dst_in)) |e| break :blk e.src_handle == h;
+            break :blk false;
+        },
+        .group => false,
+    };
+}
+
+fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const h = try toHandle(try actions.parseUsize(args));
+    if (!app.dyn.slotActive(h)) return error.InvalidHandle;
+    // 削除で stale になる selected/hover を、まだ edge が残っている削除前に判定しておく。
+    const clear_selected = if (app.selected) |it| refsHandleForRemoval(app, it, h) else false;
+    const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
+    // 展開中グループのメンバー個別削除は先に台帳を同期する（`deleteSelected` の `.node` 分岐と同型）。
+    if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
+    app.dyn.removeModule(h);
+    try app.dyn.publish();
+    app.refreshAllExposed();
+    if (clear_selected) app.selected = null;
+    if (clear_hover) app.hover = null;
+    return "ok";
+}
+
+/// `commitConnect` と同じ「検証してから壊す」順序（active/種別一致を先に検証 → 検証 OK なら
+/// 宛先の既存接続を置換）で、無効な接続要求で既存接続を壊さない。
+fn actionConnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const p = try actions.parseFourUsize(args);
+    const src_h = try toHandle(p.a);
+    const dst_h = try toHandle(p.c);
+    if (!app.dyn.slotActive(src_h) or !app.dyn.slotActive(dst_h)) return error.InvalidHandle;
+    const sk = app.dyn.outKindOf(src_h, p.b) orelse return error.InvalidPort;
+    const dk = app.dyn.inKindOf(dst_h, p.d) orelse return error.InvalidPort;
+    if (sk != dk) return error.PortKindMismatch;
+    app.dyn.disconnect(dst_h, p.d); // 検証後の置換（宛先が既接続でも安全に上書き）
+    try app.dyn.connect(src_h, p.b, dst_h, p.d);
+    try app.dyn.publish();
+    app.refreshAllExposed();
+    return "ok";
+}
+
+fn actionDisconnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const p = try actions.parseTwoUsize(args);
+    const dst_h = try toHandle(p.a);
+    if (!app.dyn.slotActive(dst_h)) return error.InvalidHandle;
+    // 入力 port の範囲を検証（connect と同じ fail-fast。存在しない dst_in への typo を握りつぶさない。
+    // `inKindOf` は範囲外/非 active で null を返す）。
+    if (app.dyn.inKindOf(dst_h, p.b) == null) return error.InvalidPort;
+    app.dyn.disconnect(dst_h, p.b);
+    try app.dyn.publish();
+    app.refreshAllExposed();
+    return "ok";
+}
+
+/// 4 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+fn registerActions(app: *App) void {
+    platform.registerAction(.{ .name = "add_node", .ctx = app, .run = actionAddNode });
+    platform.registerAction(.{ .name = "remove_node", .ctx = app, .run = actionRemoveNode });
+    platform.registerAction(.{ .name = "connect", .ctx = app, .run = actionConnect });
+    platform.registerAction(.{ .name = "disconnect", .ctx = app, .run = actionDisconnect });
 }
