@@ -757,6 +757,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_actions_test = b.addRunArtifact(actions_test);
 
+    // レイヤー名インライン編集の入力状態機械（TASK-79.3）。std のみ・paint/App/kit 非依存で import 不要。
+    const layer_rename_input_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/apps/pixie/layer_rename_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_layer_rename_input_test = b.addRunArtifact(layer_rename_input_test);
+
     const test_core_step = b.step("test-core", "Run editor/core (undo + tool) and pixie input tests");
     test_core_step.dependOn(&run_core_undo_test.step);
     test_core_step.dependOn(&run_core_tool_test.step);
@@ -774,6 +784,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_blit_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
     test_core_step.dependOn(&run_actions_test.step);
+    test_core_step.dependOn(&run_layer_rename_input_test.step);
 
     // ========================================
     // PNG デコーダー format.zig テスト

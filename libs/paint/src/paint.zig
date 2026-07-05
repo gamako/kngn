@@ -8,6 +8,7 @@ pub const document_io = @import("document_io.zig");
 
 pub const Canvas = canvas.Canvas;
 pub const Layer = canvas.Layer;
+pub const layer_name_max = canvas.layer_name_max;
 pub const Document = document.Document;
 pub const Vec2 = canvas.Vec2;
 pub const Rect = canvas.Rect;
@@ -25,6 +26,7 @@ pub const UndoStack = undo.UndoStack;
 pub const StrokeRecorder = undo.StrokeRecorder;
 pub const Dab = undo.Dab;
 pub const Offset = undo.Offset;
+pub const NameSnapshot = undo.NameSnapshot; // レイヤー名の固定長スナップショット（TASK-79.3）
 
 // 範囲選択（TASK-44）。selection は Canvas.selection: ?Rect、編集は selection.zig。
 pub const selection = @import("selection.zig");

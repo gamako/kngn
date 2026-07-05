@@ -28,6 +28,15 @@ const selection_overlay = @import("selection_overlay.zig");
 const eyedropper_input = @import("eyedropper_input.zig");
 const brush_edge_cache = @import("brush_edge_cache.zig");
 const cursor_overlay = @import("cursor_overlay.zig");
+const layer_rename_input = @import("layer_rename_input.zig");
+
+// レイヤー名の最大長は libs/paint（保存側）と pixie（編集バッファ側）で独立定義しているため
+// （循環 import 回避。詳細は layer_rename_input.zig 冒頭）、乖離しないことを comptime で保証する。
+comptime {
+    if (core.layer_name_max != layer_rename_input.max_len) {
+        @compileError("layer_name_max mismatch between paint.Canvas and layer_rename_input");
+    }
+}
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -249,6 +258,10 @@ const App = struct {
     save_msg_buf: [128]u8 = undefined,
     save_msg_len: usize = 0,
     save_msg_until: f64 = 0,
+    /// レイヤー名インライン編集の状態機械（TASK-79.3）。`rename_in.active` が true の間、
+    /// メインループのイベントポンプは char_input/ENTER/ESCAPE/BACKSPACE のみをここへ回し、
+    /// 他のキー・gui への pushEvent は止める（タイプ中に B/E 等のツール切替が誤発火しないため）。
+    rename_in: layer_rename_input.LayerRenameInput = .{},
 
     /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
     fn activeTool(self: *App) core.Tool {
@@ -716,6 +729,63 @@ const App = struct {
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_opacity = .{ .index = idx, .before = before, .after = value } } });
     }
 
+    /// レイヤー名を変更する（Rename。TASK-79.3）。他の layer_* setter と同型: 冪等 no-op
+    /// （同一名なら Undo を汚さない）→ `Canvas.setLayerName` → before/after の `NameSnapshot` で
+    /// `undo.push(.layer_rename)`。呼び出し元はインライン編集の確定（`commitRenameLayer`）と
+    /// harness action（将来採用時）を想定。
+    fn doRenameLayer(self: *App, idx: usize, new_name: []const u8) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
+        // 正規化（切り詰め）後の実名で before/after を比較して no-op を弾く。生の new_name で
+        // 比較すると、32B 超で切り詰め後は同名になる入力（action 等）でも空の layer_rename が
+        // 積まれてしまう（codex 指摘）。
+        const before = core.NameSnapshot.of(self.canvas.layers.items[idx].name());
+        _ = self.canvas.setLayerName(idx, new_name);
+        const after = core.NameSnapshot.of(self.canvas.layers.items[idx].name());
+        if (std.mem.eql(u8, before.slice(), after.slice())) return; // 冪等 no-op（Undo を汚さない）
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_rename = .{ .index = idx, .before = before, .after = after } } });
+    }
+
+    /// レイヤー行の右クリックメニュー「Rename...」から呼ぶ。現在名を編集バッファへコピーして
+    /// インライン編集を開始する（確定は `commitRenameLayer`、取消は `cancelRenameLayer`）。
+    fn beginRenameLayer(self: *App, idx: usize) void {
+        if (idx >= self.canvas.layers.items.len) return;
+        self.rename_in.begin(idx, self.canvas.layers.items[idx].name());
+        // rename 開始時点で Space パン modifier が張り付いていると、rename 中は key_up を
+        // 素通りさせない設計（下記イベントポンプ参照）のため解除しておく（codex レビュー指摘
+        // 2026-07-05: rename 前に Space が押されたまま rename に入ると space_down が残留しうる）。
+        self.space_down = false;
+    }
+
+    /// 編集を確定する（ENTER）。`doRenameLayer` へ委譲し Undo へ積む。失敗（境界外等）は無視
+    /// （他の pending file op 等と同型の「UI からの呼び出しはベストエフォート」扱い）。
+    fn commitRenameLayer(self: *App) void {
+        if (!self.rename_in.active) return;
+        const idx = self.rename_in.layer_idx;
+        const committed = self.rename_in.commit();
+        self.doRenameLayer(idx, committed) catch {};
+    }
+
+    /// 編集を取り消す（ESCAPE）。バッファは破棄するだけで Undo には積まない。
+    fn cancelRenameLayer(self: *App) void {
+        self.rename_in.cancel();
+    }
+
+    /// renaming 中の key_down を処理する（メインループのイベントポンプから、通常の
+    /// `handleKey` の代わりに呼ばれる）。ENTER/KP_ENTER=確定・ESCAPE=取消・
+    /// BACKSPACE/DELETE=1文字削除。それ以外はすべて無視（B/E 等のショートカットが
+    /// タイプ中に誤発火しないようにする。gui への pushEvent もイベントポンプ側で止める）。
+    fn handleRenameKey(self: *App, k: platform.KeyEvent) void {
+        if (k.key == .ENTER or k.key == .KP_ENTER) {
+            self.commitRenameLayer();
+        } else if (k.key == .ESCAPE) {
+            self.cancelRenameLayer();
+        } else if (k.key == .BACKSPACE or k.key == .DELETE) {
+            self.rename_in.backspace();
+        }
+        // その他のキーは無視（ツール切替ショートカット等を遮断）
+    }
+
     fn doSelectLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (!self.canvas.selectLayer(idx)) return error.OutOfRange;
@@ -740,6 +810,7 @@ const App = struct {
         @memcpy(new_layer.pixels, src.pixels);
         new_layer.visible = src.visible;
         new_layer.opacity = src.opacity;
+        new_layer.setName(src.name()); // 複製元の名前を継承（TASK-79.3。allocBlankLayer の既定名を上書き）
         const new_idx = src_idx + 1;
         try self.canvas.insertLayer(self.gpa, new_idx, new_layer);
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
@@ -802,6 +873,8 @@ const App = struct {
         self.canvas.selected_layer = 0;
         self.canvas.layers.items[0].visible = true;
         self.canvas.layers.items[0].opacity = 255;
+        self.canvas.layers.items[0].setName("Layer 1"); // Canvas.init と同じ既定名に戻す（TASK-79.3）
+        self.canvas.next_layer_num = 2; // 既存 layer0 を再利用するため counter も明示的にリセット
         @memset(self.canvas.layerPixels(0), 0);
         self.canvas.clearSelection(); // ドキュメント差し替えで選択は解除（TASK-44）
         self.sel_in.discardFloat(self.gpa); // フロートも破棄
@@ -950,12 +1023,13 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         for (layer.pixels) |p| {
             if (p != 0) nonzero += 1;
         }
-        const part = std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d}}}", .{
+        const part = std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d},name={s}}}", .{
             idx,
             layer.visible,
             layer.opacity,
             png.crc32(std.mem.sliceAsBytes(layer.pixels)),
             nonzero,
+            layer.name(),
         }) catch break;
         len += part.len;
     }
@@ -1369,6 +1443,54 @@ fn layerWidgetId(idx: usize, part: gui.Id) gui.Id {
     return LAYER_ROW_ID_BASE + @as(gui.Id, idx) * LAYER_PANEL_ID_STRIDE + part;
 }
 
+/// レイヤー名の表示上限（**切り詰め後を含めた総コードポイント数**。TASK-79.3）。右ペイン幅
+/// 200px の行に収める表示専用の制約で、保存される名前自体（`layer_name_max`=32B）は切り詰めない。
+///
+/// 実測値: サムネ(24px)+可視トグル(min_w 22)+opacity slider(track_w 40 他)を差し引いた
+/// 右ペイン(200px)の残り予算では、名前欄が**総描画 7 文字**（フォントは固定 8px/コードポイント。
+/// `libs/gui/src/font.zig`）を超えると opacity slider がスクロール viewport 外へ押し出され
+/// 操作不能になることを harness snapshot で確認済み（7 文字="Layer 1" は収まる／8 文字="Layer 10"
+/// 相当は収まらない）。既定名 "Layer N" は 1 桁のうちは 7 文字ちょうどで収まるが、2 桁以降
+/// （"Layer 10".."Layer 99"）は下記の切り詰めで "Layer.." のように短縮表示される
+/// （番号は失われるが選択ハイライト/サムネで見分けは付く。3 桁以降も同様）。
+const LAYER_NAME_DISPLAY_MAX: usize = 7;
+
+/// 表示用にレイヤー名を「切り詰め後を含めた総コードポイント数」が `max_total_chars` に収まるよう
+/// 切り詰める（収まらない場合のみ末尾 2 文字を ".." に差し替え）。buttonId/box の width は
+/// min_w を「下限」としてしか扱えないため、切り詰めずに渡すと長い名前でレイヤー行が際限なく
+/// 広がり opacity slider 等がスクロール viewport 外へ押し出され操作不能になりうる
+/// （本関数はその防止専用。保存データは一切変更しない）。
+/// **既にちょうど収まる名前（例: "Layer 1"）を無駄に切り詰めない**よう、「切り詰め要否」の判定は
+/// 元の総コードポイント数で行う（「先頭 N 文字を機械的に切って ".." を足す」だけだと、
+/// 元がわずかに budget を超えるだけの名前で `N+2 > 元の長さ` になり、切り詰めが逆に長くなる
+/// 事故を避けるため）。
+/// alloc は `ctx.allocator()`（フレーム arena）想定で、収まる場合は allocation なしで name を
+/// そのまま返す。
+///
+/// 毎フレーム呼ばれるが（immediate-mode GUI 構築の一部）、対象は高々「レイヤー数×十数文字」で
+/// 全画素ループではない（同じ buildLayerPanel が毎フレーム呼ぶ既存の `fillLayerThumb` と同じ
+/// 「小さい per-frame UI 構築コスト」のクラス。性能規約の SIMD 3点セット等は対象外）。
+fn truncateForDisplay(alloc: std.mem.Allocator, name: []const u8, max_total_chars: usize) []const u8 {
+    const view = std.unicode.Utf8View.init(name) catch return name; // 不正 UTF-8 はそのまま返す（防御）
+    var total: usize = 0;
+    {
+        var counter = view.iterator();
+        while (counter.nextCodepointSlice()) |_| total += 1;
+    }
+    if (total <= max_total_chars) return name; // 収まる → 切り詰め不要
+
+    const keep = if (max_total_chars > 2) max_total_chars - 2 else 0;
+    var it = view.iterator();
+    var end: usize = 0;
+    var count: usize = 0;
+    while (it.nextCodepointSlice()) |slice| {
+        if (count >= keep) break;
+        end += slice.len;
+        count += 1;
+    }
+    return std.fmt.allocPrint(alloc, "{s}..", .{name[0..end]}) catch name[0..end];
+}
+
 /// raw layer pixels（CANVAS_W×CANVAS_H, straight BGRA 0xAARRGGBB）を THUMB へ縮小し、
 /// チェッカー下地へ src-over して不透明サムネを作る（透明部はチェッカーが見える）。
 /// 各サムネ画素は元領域の **alpha 重み付き平均（premultiplied 平均）** にして、1px の細線も
@@ -1447,9 +1569,28 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         const thumb_border = if (idx == app.canvas.selected_layer) ctx.style.border_hover else ctx.style.border;
         ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
 
-        const name = try std.fmt.allocPrint(ctx.allocator(), "L{d}", .{idx});
-        if (ctx.buttonId(layerWidgetId(idx, 0), name, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
-            app.doSelectLayer(idx) catch {};
+        // レイヤー名表示（TASK-79.3）。renaming 中の対象行だけ確定前バッファ+カーソルを表示する。
+        // どちらも `truncateForDisplay` で表示専用に切り詰める（保存名自体は変えない）: buttonId/
+        // beginBox の width は min_w を「下限」としてしか扱えず、テキストが長いと際限なく箱が
+        // 広がる。右ペイン幅 200px からサムネ/可視トグル/opacity slider を差し引くと名前欄の
+        // 実質予算は 70〜90px 程度しかなく、無制限だと opacity slider 等がスクロール viewport
+        // 外へ押し出され操作不能になりうるため。
+        if (app.rename_in.active and app.rename_in.layer_idx == idx) {
+            var cursor_buf: [96]u8 = undefined;
+            const shown = truncateForDisplay(ctx.allocator(), app.rename_in.text(), LAYER_NAME_DISPLAY_MAX);
+            const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
+            ctx.beginBox(.{
+                .padding = .{ 2, 4, 2, 4 },
+                .bg = ctx.style.bg_active,
+                .border = .{ .color = ctx.style.border_hover, .thickness = 1 },
+            });
+            ctx.labelEx(with_cursor, ctx.style.text);
+            ctx.endBox();
+        } else {
+            const shown = truncateForDisplay(ctx.allocator(), layer.name(), LAYER_NAME_DISPLAY_MAX);
+            if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
+                app.doSelectLayer(idx) catch {};
+            }
         }
         const vis_label: []const u8 = if (layer.visible) "V" else "H";
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
@@ -1808,11 +1949,21 @@ pub fn main(init: std.process.Init) !void {
             while (window.nextEvent()) |ev| {
                 switch (ev) {
                     .quit => app.running = false, // ウィンドウクローズも同一経路
-                    .key_down => |k| app.handleKey(k),
+                    // レイヤー名インライン編集中（TASK-79.3）は key_down を専用ハンドラへ回し、
+                    // char_input で確定文字を追記する（TASK-22 char_input の初消費）。key_up は
+                    // 常に通す（Space パン modifier 等の held 状態を rename 中に取りこぼさない
+                    // ため。codex レビュー指摘 2026-07-05）。
+                    .key_down => |k| if (app.rename_in.active) app.handleRenameKey(k) else app.handleKey(k),
                     .key_up => |k| app.handleKeyUp(k),
+                    .char_input => |c| if (app.rename_in.active) app.rename_in.appendCodepoint(c.codepoint),
                     else => {},
                 }
-                if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+                // renaming 中は gui へのマウス/キーイベント転送も止める（他行クリック等での
+                // 干渉を避ける。rename_in はここで破棄されないため、他行の右クリックで
+                // 新たな rename が始まれば単に上書きされるだけでクラッシュはしない）。
+                if (!app.rename_in.active) {
+                    if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+                }
             }
 
             // canvas rect は前フレームの layout 結果（初回フレームは null）。
@@ -1994,7 +2145,7 @@ pub fn main(init: std.process.Init) !void {
                     .{ .label = if (app.canvas.layers.items[app.canvas.selected_layer].visible) "Hide" else "Show" },
                     .{ .label = "Duplicate" },
                     .{ .label = "Merge Down", .enabled = app.canvas.selected_layer > 0 },
-                    .{ .label = "Rename...", .enabled = false }, // placeholder（TASK-79.3 で実装）
+                    .{ .label = "Rename..." }, // TASK-79.3
                     .{ .label = "Rasterize", .enabled = false }, // placeholder（TASK-79.5 で実装）
                 };
                 const ctx_menu_result = ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
@@ -2007,7 +2158,8 @@ pub fn main(init: std.process.Init) !void {
                         4 => app.doToggleLayerVisible(app.canvas.selected_layer),
                         5 => app.doDuplicateLayer() catch {},
                         6 => app.doMergeDown() catch {},
-                        else => {}, // Rename/Rasterize は disabled 固定のためここへは来ない
+                        7 => app.beginRenameLayer(app.canvas.selected_layer),
+                        else => {}, // Rasterize は disabled 固定のためここへは来ない
                     }
                 }
             }

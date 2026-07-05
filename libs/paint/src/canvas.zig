@@ -16,11 +16,55 @@ pub const Rect = struct {
     }
 };
 
+/// レイヤー名の最大 byte 数（UTF-8。TASK-79.3）。固定長インラインで持つ（ownership churn 回避:
+/// 可変長 owned([]u8) にすると deinit/undo(layer_add/delete/merge_down の held layer 解放)/
+/// deleteLayer/allocBlankLayer の全解放経路に新規 free 追従が要るため、既存の
+/// 「Layer は pixels だけを所有する POD」という不変条件を保つ固定長を選ぶ）。
+pub const layer_name_max: usize = 32;
+
 pub const Layer = struct {
     pixels: []u32, // format: canonical BGRA 0xAARRGGBB (bytes [B,G,R,A] on little-endian)
     visible: bool = true,
     opacity: u8 = 255,
+    /// レイヤー名（UTF-8。TASK-79.3）。実データは `name_buf[0..name_len]`。既定は空
+    /// （`Canvas.init`/`allocBlankLayer` が生成直後に `setName` で既定名 "Layer N" を書き込む）。
+    name_buf: [layer_name_max]u8 = undefined,
+    name_len: u8 = 0,
+
+    pub fn name(self: *const Layer) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    /// name を設定する。`layer_name_max` を超える分は UTF-8 継続バイトの途中で切らないように
+    /// 安全に切り詰める（他 reader/将来フォーマットが保存した長い名前を読んでも不正 UTF-8 を
+    /// 作らない防御）。イベント時のみ呼ばれる想定＝ホットパスではない。
+    pub fn setName(self: *Layer, text: []const u8) void {
+        const n = safeUtf8TruncateLen(text, layer_name_max);
+        @memcpy(self.name_buf[0..n], text[0..n]);
+        self.name_len = @intCast(n);
+    }
 };
+
+/// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
+/// 切り詰めた長さを返す。
+fn safeUtf8TruncateLen(text: []const u8, max: usize) usize {
+    var n = @min(text.len, max);
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
+    return n;
+}
+
+/// レイヤー名として外部入力（.pix の LNAM 等）を受け入れてよいか。妥当な UTF-8 かつ
+/// ASCII 制御文字（0x00-0x1F / 0x7F）を含まないこと。破損 .pix が改行や不正 UTF-8 を LNAM に
+/// 持たせても Layer.name に載せない（canvas probe digest の 1 行契約を壊す混入を防ぐ wire framing
+/// 保護。UI 入力側は layer_rename_input が別途弾く）。不可なら呼び出し側は既定名を維持する。
+/// 妥当 UTF-8 では < 0x20 のバイトは ASCII 制御文字のみ（多バイト列は全バイト >= 0x80）。
+pub fn isValidLayerName(text: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(text)) return false;
+    for (text) |b| {
+        if (b < 0x20 or b == 0x7F) return false;
+    }
+    return true;
+}
 
 pub const Canvas = struct {
     layers: std.ArrayList(Layer),
@@ -36,6 +80,10 @@ pub const Canvas = struct {
     allocator: Allocator,
     /// 範囲選択（矩形）。null=選択なし（描画は全域に許可）。canvas 内へ clip 済みの矩形のみ保持する（TASK-44）。
     selection: ?Rect = null,
+    /// 次に `allocBlankLayer` が既定名として使う連番（"Layer N"。TASK-79.3）。削除しても
+    /// 巻き戻さない単調増加（Photoshop 等と同型）。.pix には永続化しない（UI の便宜のみ・
+    /// 一意性は保証しない）。初期レイヤーが "Layer 1" を名乗るため既定値は 2。
+    next_layer_num: u32 = 2,
 
     pub const CacheState = enum { dirty, white_bg, straight };
 
@@ -53,6 +101,7 @@ pub const Canvas = struct {
         var layers: std.ArrayList(Layer) = .empty;
         errdefer layers.deinit(gpa);
         try layers.append(gpa, .{ .pixels = pixels });
+        layers.items[0].setName("Layer 1");
 
         return .{
             .layers = layers,
@@ -80,10 +129,17 @@ pub const Canvas = struct {
         return @as(usize, self.width) * self.height;
     }
 
-    pub fn allocBlankLayer(self: *const Canvas, gpa: Allocator) !Layer {
+    /// 空レイヤーを確保する。既定名 "Layer {next_layer_num}" を付与して連番を+1する（TASK-79.3。
+    /// counter を進めるため `*Canvas`（非 const）が要る）。
+    pub fn allocBlankLayer(self: *Canvas, gpa: Allocator) !Layer {
         const pixels = try gpa.alloc(u32, self.layerPixelCount());
         @memset(pixels, 0);
-        return .{ .pixels = pixels };
+        var layer: Layer = .{ .pixels = pixels };
+        var name_buf: [24]u8 = undefined; // "Layer " + u32 最大10桁で十分な余裕
+        const default_name = std.fmt.bufPrint(&name_buf, "Layer {d}", .{self.next_layer_num}) catch "Layer";
+        layer.setName(default_name);
+        self.next_layer_num += 1;
+        return layer;
     }
 
     pub fn addLayer(self: *Canvas, gpa: Allocator) !usize {
@@ -144,6 +200,15 @@ pub const Canvas = struct {
         if (index >= self.layers.items.len) return false;
         self.layers.items[index].opacity = opacity;
         self.markDirty();
+        return true;
+    }
+
+    /// レイヤー名を設定する（TASK-79.3）。visible/opacity と異なり composite() の結果に
+    /// 影響しないため markDirty() は呼ばない（cache 無効化は合成結果へ影響する変更のみに
+    /// 限定する既存規約。TASK-53）。
+    pub fn setLayerName(self: *Canvas, index: usize, text: []const u8) bool {
+        if (index >= self.layers.items.len) return false;
+        self.layers.items[index].setName(text);
         return true;
     }
 
@@ -633,12 +698,69 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
         };
     }
 
-    // 合成結果に影響しない操作は無効化しない
+    // 合成結果に影響しない操作は無効化しない（TASK-79.3: setLayerName も追加）
     _ = c.compositeStraight();
     const runs = c.composite_runs;
     _ = c.selectLayer(0);
     c.setSelection(.{ .x = 0, .y = 0, .w = 2, .h = 2 });
     c.clearSelection();
+    _ = c.setLayerName(0, "Background");
     _ = c.compositeStraight();
     try std.testing.expectEqual(runs, c.composite_runs);
+}
+
+// ── レイヤー名（TASK-79.3）─────────────────────────────────
+
+test "Layer name: 既定名は Layer 1/2/3.. と単調増加し、削除しても巻き戻らない" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 2, 2);
+    defer c.deinit();
+    try std.testing.expectEqualStrings("Layer 1", c.layers.items[0].name());
+
+    const idx1 = try c.addLayer(gpa);
+    try std.testing.expectEqualStrings("Layer 2", c.layers.items[idx1].name());
+    const idx2 = try c.addLayer(gpa);
+    try std.testing.expectEqualStrings("Layer 3", c.layers.items[idx2].name());
+
+    // 削除しても連番は巻き戻らない（次の追加は Layer 4）
+    const removed = c.deleteLayer(idx2).?;
+    gpa.free(removed.pixels);
+    const idx3 = try c.addLayer(gpa);
+    try std.testing.expectEqualStrings("Layer 4", c.layers.items[idx3].name());
+}
+
+test "Layer name: setLayerName/setName は境界を跨いだ UTF-8 continuation byte で切らない" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 1, 1);
+    defer c.deinit();
+
+    _ = c.setLayerName(0, "Background");
+    try std.testing.expectEqualStrings("Background", c.layers.items[0].name());
+
+    // layer_name_max(32) を超える長い名前は切り詰められる（かつ不正 UTF-8 を作らない）
+    const long_ascii = "A" ** 40;
+    _ = c.setLayerName(0, long_ascii);
+    try std.testing.expectEqual(@as(usize, layer_name_max), c.layers.items[0].name().len);
+
+    // マルチバイト文字（3B/文字の "あ"）を境界ぎりぎりで切り詰めても壊れた UTF-8 を作らない。
+    // "あ" を 11 回（33 バイト）→ layer_name_max(32) に収まるのは 10 個(30B)まで。
+    const multibyte = "あ" ** 11;
+    _ = c.setLayerName(0, multibyte);
+    const got = c.layers.items[0].name();
+    try std.testing.expect(got.len <= layer_name_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+    try std.testing.expectEqualStrings("あ" ** 10, got); // 30B（32 に収まる最大個数）
+
+    try std.testing.expect(!c.setLayerName(5, "OOB")); // 範囲外は false
+}
+
+test "Layer name: resetCanvasToSingleLayer 相当のシナリオでも Canvas.init は Layer 1 を付与する" {
+    // resetCanvasToSingleLayer (pixie main.zig) は既存 layer0 を再利用するため、
+    // 呼び出し側が明示的に setLayerName("Layer 1") + next_layer_num リセットを行う契約
+    // （このテストは Canvas.init 自体の既定名付与を再確認する）。
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 4, 4);
+    defer c.deinit();
+    try std.testing.expectEqualStrings("Layer 1", c.layers.items[0].name());
+    try std.testing.expectEqual(@as(u32, 2), c.next_layer_num);
 }

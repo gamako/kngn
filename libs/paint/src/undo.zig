@@ -15,6 +15,26 @@ const Layer = canvas_mod.Layer;
 const Vec2 = canvas_mod.Vec2;
 const blend = @import("blend.zig");
 
+/// レイヤー名の固定長スナップショット（TASK-79.3）。`Layer.name_buf`/`name_len` と同じ形で
+/// 値コピーするだけなので、layer_add/delete/merge_down の held layer のような null/non-null
+/// 所有権切替は不要（`freeCmd` で何もしない軽量 Op）。
+pub const NameSnapshot = struct {
+    buf: [canvas_mod.layer_name_max]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn of(text: []const u8) NameSnapshot {
+        var s: NameSnapshot = .{};
+        const n = @min(text.len, canvas_mod.layer_name_max);
+        @memcpy(s.buf[0..n], text[0..n]);
+        s.len = @intCast(n);
+        return s;
+    }
+
+    pub fn slice(self: *const NameSnapshot) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 /// 1 ピクセルの変更記録。idx は layer.pixels への平坦インデックス。
 pub const PixelDiff = struct { idx: u32, before: u32, after: u32 };
 
@@ -57,6 +77,13 @@ pub const Op = union(enum) {
         index: usize,
         before: u8,
         after: u8,
+    },
+    /// レイヤー名変更（Rename。TASK-79.3）。before/after は固定長 `NameSnapshot` の値コピーで
+    /// 十分なため、layer_visible/layer_opacity と同じ「所有権移動なしの軽量 Op」として扱う。
+    layer_rename: struct {
+        index: usize,
+        before: NameSnapshot,
+        after: NameSnapshot,
     },
     /// レイヤー結合（merge down。TASK-79.2）: 選択レイヤー(index)を直下(index-1)へ src-over
     /// 焼き込みし、選択レイヤー自体を削除する 1 操作。「下位レイヤーへのピクセル合成」と
@@ -326,7 +353,7 @@ pub const UndoStack = struct {
             .paint => |p| gpa.free(p.diffs),
             .layer_add => |la| if (la.layer) |layer| gpa.free(layer.pixels),
             .layer_delete => |ld| if (ld.layer) |layer| gpa.free(layer.pixels),
-            .layer_reorder, .layer_visible, .layer_opacity => {},
+            .layer_reorder, .layer_visible, .layer_opacity, .layer_rename => {},
             .layer_merge_down => |lm| {
                 if (lm.layer) |layer| gpa.free(layer.pixels);
                 gpa.free(lm.below_before);
@@ -397,6 +424,9 @@ pub const UndoStack = struct {
             .layer_opacity => |op| {
                 if (!canvas.setLayerOpacity(op.index, op.before)) @panic("UndoStack.layer_opacity undo: invalid layer");
             },
+            .layer_rename => |op| {
+                if (!canvas.setLayerName(op.index, op.before.slice())) @panic("UndoStack.layer_rename undo: invalid layer");
+            },
             .layer_merge_down => |*op| {
                 const below_idx = op.index - 1;
                 @memcpy(canvas.layerPixels(below_idx), op.below_before);
@@ -433,6 +463,9 @@ pub const UndoStack = struct {
             },
             .layer_opacity => |op| {
                 if (!canvas.setLayerOpacity(op.index, op.after)) @panic("UndoStack.layer_opacity redo: invalid layer");
+            },
+            .layer_rename => |op| {
+                if (!canvas.setLayerName(op.index, op.after.slice())) @panic("UndoStack.layer_rename redo: invalid layer");
             },
             .layer_merge_down => |*op| {
                 const below_idx = op.index - 1;
@@ -820,6 +853,20 @@ test "layer reorder visible opacity: undo/redo restores structure and metadata" 
     try std.testing.expectEqual(@as(u8, 255), c.layers.items[0].opacity);
     undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqual(@as(u8, 77), c.layers.items[0].opacity);
+
+    // レイヤー名変更（TASK-79.3）。before/after は固定長スナップショットの値コピーなので
+    // freeCmd で解放するものが無く、他の layer_visible/layer_opacity と同型で完結する。
+    // (reorder の往復で index 0 の実体は入れ替わっているので、before は動的に読み取る。)
+    var before_buf: [64]u8 = undefined;
+    const before_str = try std.fmt.bufPrint(&before_buf, "{s}", .{c.layers.items[0].name()});
+    const before_name = NameSnapshot.of(before_str);
+    _ = c.setLayerName(0, "Sketch");
+    const after_name = NameSnapshot.of(c.layers.items[0].name());
+    undo_stack.push(gpa, .{ .op = .{ .layer_rename = .{ .index = 0, .before = before_name, .after = after_name } } });
+    undo_stack.undoOne(gpa, &.{&c});
+    try std.testing.expectEqualStrings(before_str, c.layers.items[0].name());
+    undo_stack.redoOne(gpa, &.{&c});
+    try std.testing.expectEqualStrings("Sketch", c.layers.items[0].name());
 }
 
 test "stroke 内の重複塗りは最初の before を保持する（undo の正しさ）" {

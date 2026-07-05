@@ -10,9 +10,23 @@
 //! - FRAM(frame 毎): frame_index u32 | duration_ms u32(予約=0, TASK-45 用)
 //! - LAYR(layer 毎, 親 FRAM の後に出現順): type u8(0=raster) | visible u8 | opacity u8 | blend u8(予約=0)
 //!                                        | compression u8(0=raw) | pad[3] | pixels[W*H*4]（raw canonical BGRA u32, row-major）
+//! - LNAM(任意・対応する LAYR の直後に出現。TASK-79.3): レイヤー名の UTF-8 バイト列そのまま（ヘッダなし）。
 //!
 //! **pixel byte 順の責務はここ（schema 側）**（serde は payload opaque）。canonical BGRA u32 を
 //! std.mem.sliceAsBytes で直格納 = little-endian BGRA bytes。ターゲット（aarch64/x86_64）は LE なので直格納で足りる。
+//!
+//! **.pix 互換方針（TASK-79.3, LNAM 追加）**: schema_version は bump しない。理由は次の2点:
+//! (1) 前方互換（旧 reader が新ファイルを読める）は **コード変更不要**で成立する。旧
+//!     decodeDocument は DOCH/FRAM/LAYR 以外の tag を元々ハンドラを持たず暗黙 skip する
+//!     （serde の「未知 tag は iterator が skip」という一般契約の帰結）ため、LNAM を単に無視して
+//!     raster を読み切れる。(2) schema_version bump は「対応する全 reader が新バージョンを理解する
+//!     まで新ファイルを一律拒否する」強い後方非互換（`schemaVersion() > schema_version` gate）を
+//!     招く。名前はレイヤー識別に必須ではない付加メタデータなので、そこまで強い gate は不要。
+//! - LNAM の対応関係は「直前に出現した chunk が、実際に追加/上書きした raster LAYR だった場合のみ」
+//!   に限定する（`last_layer_idx` で追跡し、FRAM / 未知 type の LAYR / 他の任意 chunk の出現ごとに
+//!   null へリセットする。codex レビュー指摘 2026-07-05: 未知 LAYR.type の直後に来た LNAM を
+//!   直前の別レイヤーへ誤適用しないため）。LNAM が無いファイル（旧形式）は既定名
+//!   （allocBlankLayer の "Layer N"）のまま＝後方互換（新 reader が旧ファイルを読める）。
 //!
 //! 前方互換: 未知 chunk tag は serde iterator が skip / 未知 LAYR.type は skip（層追加しない）/
 //!           raster かつ compression≠raw は error / 構造違反（DOCH 欠落・重複・LAYR-before-FRAM・payload 長不一致・
@@ -20,7 +34,7 @@
 //!
 //! ホットパス宣言: 保存・読込・書き出しは **イベント時のみ**（メニュー操作 1 回）。全画素規模だが
 //! フレーム毎ループではないため SIMD 3 点セット対象外。pixel payload は @memcpy 一括転送
-//! （per-pixel 除算/関数呼び出し/bounds 検査なし）。
+//! （per-pixel 除算/関数呼び出し/bounds 検査なし）。LNAM の name payload も高々 32B の @memcpy。
 
 const std = @import("std");
 const serde = @import("serde");
@@ -38,6 +52,7 @@ pub const schema_version: u16 = 1;
 const TAG_DOC: [4]u8 = "DOCH".*;
 const TAG_FRAME: [4]u8 = "FRAM".*;
 const TAG_LAYER: [4]u8 = "LAYR".*;
+const TAG_LAYER_NAME: [4]u8 = "LNAM".*;
 
 const doc_header_size: usize = 20;
 const frame_header_size: usize = 8;
@@ -85,6 +100,8 @@ pub fn encodeDocument(doc: *Document, gpa: std.mem.Allocator) ![]u8 {
             buf[7] = 0; // pad
             @memcpy(buf[layer_header_size..], px_bytes);
             try w.addChunk(TAG_LAYER, buf);
+            // LNAM は対応する LAYR の直後（TASK-79.3）。旧 reader は未知 tag として無視する。
+            try w.addChunk(TAG_LAYER_NAME, layer.name());
         }
     }
     return w.finish();
@@ -113,6 +130,10 @@ pub fn decodeDocument(bytes: []const u8, gpa: std.mem.Allocator) !Document {
     var filled_layer0 = false;
     const px_len: usize = @as(usize, width) * height;
     const expected_layer_payload = layer_header_size + px_len * 4;
+    // LNAM の適用先（TASK-79.3）。「直前の chunk が、実際に追加/上書きした raster LAYR だった
+    // 場合のみ」に限定する安全弁。FRAM / 未知 type の LAYR / その他任意の chunk が挟まるたび
+    // null へリセットし、無関係な層への誤適用を防ぐ（codex レビュー指摘 2026-07-05）。
+    var last_layer_idx: ?usize = null;
 
     while (it.next()) |chunk| {
         if (std.mem.eql(u8, &chunk.tag, &TAG_DOC)) return error.DuplicateHeader;
@@ -131,11 +152,15 @@ pub fn decodeDocument(bytes: []const u8, gpa: std.mem.Allocator) !Document {
             };
             cur = c;
             filled_layer0 = false;
+            last_layer_idx = null;
         } else if (std.mem.eql(u8, &chunk.tag, &TAG_LAYER)) {
             const c = cur orelse return error.LayerBeforeFrame;
             const p = chunk.payload;
             if (p.len < layer_header_size) return error.CorruptLayer;
-            if (p[0] != layer_type_raster) continue; // 未知 type: skip（前方互換。層は追加しない）
+            if (p[0] != layer_type_raster) {
+                last_layer_idx = null; // 未知 type: skip（前方互換。層は追加しない）
+                continue;
+            }
             if (p[4] != compression_raw) return error.UnsupportedCompression;
             if (p.len != expected_layer_payload) return error.CorruptLayer;
             const visible = p[1] != 0;
@@ -147,6 +172,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: std.mem.Allocator) !Document {
                 c.layers.items[0].visible = visible;
                 c.layers.items[0].opacity = opacity;
                 filled_layer0 = true;
+                last_layer_idx = 0;
             } else {
                 var layer = try c.allocBlankLayer(gpa);
                 errdefer gpa.free(layer.pixels);
@@ -154,9 +180,22 @@ pub fn decodeDocument(bytes: []const u8, gpa: std.mem.Allocator) !Document {
                 layer.visible = visible;
                 layer.opacity = opacity;
                 try c.insertLayer(gpa, c.layers.items.len, layer);
+                last_layer_idx = c.layers.items.len - 1;
             }
+        } else if (std.mem.eql(u8, &chunk.tag, &TAG_LAYER_NAME)) {
+            // 直前が有効な raster LAYR だった場合のみ適用し、消費後は null に戻す
+            // （同じ LNAM を後続の無関係な chunk へ誤って引き継がないため）。
+            // 破損入力（不正 UTF-8 / 制御文字）は名前を載せず既定名を維持する（digest 1 行契約保護）。
+            if (cur) |c| if (last_layer_idx) |li| {
+                if (li < c.layers.items.len and canvas_mod.isValidLayerName(chunk.payload))
+                    c.layers.items[li].setName(chunk.payload);
+            };
+            last_layer_idx = null;
+        } else {
+            // 未知 tag は無視（serde iterator は全 chunk を返すが match しないものは skip）。
+            // pending の LNAM 適用先も無効化する（未知 chunk を挟んだ誤適用を防ぐ）。
+            last_layer_idx = null;
         }
-        // 未知 tag は無視（serde iterator は全 chunk を返すが match しないものは skip）
     }
 
     if (doc.frameCount() == 0) return error.MissingFrame;
@@ -239,6 +278,9 @@ test "round-trip: 多層（visible/opacity/partial-alpha/透明混在）を bit 
     _ = try c.addLayer(gpa); // idx 2
     fillLayer(c, 2, 0x40ABCDEF);
     c.selected_layer = 1;
+    // レイヤー名（TASK-79.3）: 既定名混在 + 明示リネームを round-trip 確認
+    _ = c.setLayerName(0, "Background");
+    _ = c.setLayerName(2, "あ日本語レイヤー"); // マルチバイト名も通ることを確認
 
     const bytes = try encodeDocument(&doc, gpa);
     defer gpa.free(bytes);
@@ -256,6 +298,9 @@ test "round-trip: 多層（visible/opacity/partial-alpha/透明混在）を bit 
     try testing.expectEqual(@as(u8, 128), lc.layers.items[1].opacity);
     try testing.expectEqual(true, lc.layers.items[0].visible);
     try testing.expectEqual(@as(u8, 255), lc.layers.items[0].opacity);
+    try testing.expectEqualStrings("Background", lc.layers.items[0].name());
+    try testing.expectEqualStrings("Layer 2", lc.layers.items[1].name()); // 未リネームは既定名のまま
+    try testing.expectEqualStrings("あ日本語レイヤー", lc.layers.items[2].name());
 }
 
 test "peekCanvasSize: DOCH の w/h を復元前に取れる" {
@@ -327,6 +372,101 @@ test "前方互換: 未知 chunk tag と未知 LAYR.type を skip して既知 l
     const lc = loaded.activeCanvas();
     try testing.expectEqual(@as(usize, 1), lc.layers.items.len); // 未知 type は skip され raster 1 層のみ
     for (lc.layers.items[0].pixels) |p| try testing.expectEqual(@as(u32, 0xFF010203), p);
+}
+
+// ── LNAM（レイヤー名。TASK-79.3）の互換性 ─────────────────────
+
+test "後方互換: LNAM が無い旧形式ファイルは既定名のまま読める（クラッシュ・構造エラーなし）" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(2, 2, 1, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const frm = frameChunk(0);
+    try w.addChunk(TAG_FRAME, &frm);
+    const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0xFF010203);
+    defer gpa.free(raster);
+    try w.addChunk(TAG_LAYER, raster); // LNAM を書かない旧形式相当
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    const lc = loaded.activeCanvas();
+    try testing.expectEqualStrings("Layer 1", lc.layers.items[0].name()); // allocBlankLayer 相当の既定名
+}
+
+test "前方互換: 旧 LNAM 非対応 decode 相当（未知 tag 一般則）でも LNAM を無視して既知 layer を読む" {
+    // decodeDocument はこのタスクで LNAM を解釈するようになったが、「旧 decodeDocument が
+    // LNAM を単に無視できる」という前方互換の主張自体は、DOCH/FRAM/LAYR 以外を
+    // 明示ハンドラなしで skip する一般則（本テストの "XxYy" と同型）で担保されている。
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(2, 2, 1, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const frm = frameChunk(0);
+    try w.addChunk(TAG_FRAME, &frm);
+    const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0xFF010203);
+    defer gpa.free(raster);
+    try w.addChunk(TAG_LAYER, raster);
+    try w.addChunk(TAG_LAYER_NAME, "Sketch"); // 現行 decode はこれを適用する
+    try w.addChunk("XxYy".*, "future-unknown"); // 全く未知の tag（LNAM 同様に無視されるべき）
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    const lc = loaded.activeCanvas();
+    try testing.expectEqual(@as(usize, 1), lc.layers.items.len);
+    try testing.expectEqualStrings("Sketch", lc.layers.items[0].name());
+}
+
+test "LNAM 誤適用の安全弁: 未知 LAYR.type の直後の LNAM は直前の別レイヤーへ適用されない" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(2, 2, 1, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const frm = frameChunk(0);
+    try w.addChunk(TAG_FRAME, &frm);
+    const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0xFF010203);
+    defer gpa.free(raster);
+    try w.addChunk(TAG_LAYER, raster); // layer0（既知 raster）
+    const vector = try layerChunk(gpa, 2, 2, 1, compression_raw, 0xDEADBEEF); // 未知 type=1 → skip
+    defer gpa.free(vector);
+    try w.addChunk(TAG_LAYER, vector);
+    try w.addChunk(TAG_LAYER_NAME, "Ghost"); // 追加されなかった層への名前 → layer0 へ誤適用しない
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    const lc = loaded.activeCanvas();
+    try testing.expectEqual(@as(usize, 1), lc.layers.items.len);
+    try testing.expectEqualStrings("Layer 1", lc.layers.items[0].name()); // "Ghost" に上書きされない
+}
+
+test "LNAM 誤適用の安全弁: LAYR と LNAM の間に他 chunk を挟むと LNAM は無視される" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(2, 2, 1, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const frm = frameChunk(0);
+    try w.addChunk(TAG_FRAME, &frm);
+    const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0xFF010203);
+    defer gpa.free(raster);
+    try w.addChunk(TAG_LAYER, raster);
+    try w.addChunk("XxYy".*, "between"); // LAYR と LNAM の間に無関係な chunk
+    try w.addChunk(TAG_LAYER_NAME, "Sketch");
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    const lc = loaded.activeCanvas();
+    try testing.expectEqualStrings("Layer 1", lc.layers.items[0].name()); // 直後でない LNAM は無視
 }
 
 test "構造違反: 各エラーを返す" {

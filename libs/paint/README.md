@@ -33,9 +33,12 @@ core の `savePNG` は **渡された pixels をそのまま PNG 化するだけ
 - **PNG は交換用フラット画像**: pixie の PNG open はフラット画像を layer0 へ読み込み他 layer を破棄する
   （PNG では layer 構造を保持しない）。
 - **レイヤー保持は `.pix`（Document + document_io。TASK-63）**: `document_io.saveDocument`/`loadDocument` が
-  serde container 上に width/height/frame/layer(visible/opacity/pixels) を直列化し、round-trip で layer 構造を
+  serde container 上に width/height/frame/layer(visible/opacity/pixels/name) を直列化し、round-trip で layer 構造を
   bit 復元する。layer payload は **raw layerPixels**（透明保持）を格納し、PNG/連番書き出し（`exportPngSequence`）は
   従来どおり `compositeStraight`（フラット透明）を使う（保存規約は不変）。undo 履歴は保存しない（load でリセット）。
+  レイヤー名（TASK-79.3）は `LAYR` とは別の任意 chunk `LNAM`（対応する `LAYR` の直後）に UTF-8 で持ち、
+  旧ファイル（`LNAM` 無し）は既定名（"Layer N"）のまま読める・旧 reader は未知 tag として無視できる
+  （schema_version は bump しない。前方/後方互換とも成立）。
 
 ```zig
 // 表示（白背景）
