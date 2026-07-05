@@ -24,6 +24,8 @@ const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
 const selection_input = @import("selection_input.zig");
 const selection_overlay = @import("selection_overlay.zig");
+const brush_edge_cache = @import("brush_edge_cache.zig");
+const cursor_overlay = @import("cursor_overlay.zig");
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -95,7 +97,25 @@ const ToolKind = enum {
             .fill => "Fill",
         };
     }
+
+    /// ソフトオーバーレイのツールバッジ（cursor_overlay.drawGlyph）用の2文字ラベル + 背景色
+    /// （TASK-75.4）。label は全て string literal（DrawList.text の寿命契約を満たす）。
+    fn glyph(self: ToolKind) struct { label: []const u8, color: gui.Color } {
+        return switch (self) {
+            .pen => .{ .label = "Pn", .color = gui.Color.rgba(0x2A, 0x5F, 0xB0, 0xFF) },
+            .eraser => .{ .label = "Er", .color = gui.Color.rgba(0xB0, 0x33, 0x5A, 0xFF) },
+            .brush => .{ .label = "Br", .color = gui.Color.rgba(0xC9, 0x7A, 0x20, 0xFF) },
+            .bezier => .{ .label = "Bz", .color = gui.Color.rgba(0x1E, 0x9E, 0xC9, 0xFF) },
+            .select => .{ .label = "Sl", .color = gui.Color.rgba(0xB8, 0x9A, 0x16, 0xFF) },
+            .fill => .{ .label = "Fl", .color = gui.Color.rgba(0x2E, 0x9E, 0x52, 0xFF) },
+        };
+    }
 };
+
+/// ブラシ footprint 輪郭リングの配色（selection_overlay の marching ants と同じ「偶奇で交互」流儀。
+/// 任意の canvas 背景色に対するコントラストを確保する）。
+const RING_COLOR_A = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // 白
+const RING_COLOR_B = gui.Color.rgba(0xC9, 0x7A, 0x20, 0xFF); // ブラシバッジと同系オレンジ
 
 /// platform.MouseButton → InputEvent の button index（0=left/1=right/2=middle）。
 fn buttonToU8(b: platform.MouseButton) u8 {
@@ -171,6 +191,17 @@ const App = struct {
     pan_active: bool = false,
     pan_anchor_mouse: core.Vec2 = .{ .x = 0, .y = 0 },
     pan_anchor_pan: core.Vec2 = .{ .x = 0, .y = 0 },
+    /// ── ソフトオーバーレイ（ツールグリフ + ブラシ footprint 輪郭リング。TASK-75.4）──
+    /// hover 中の生スクリーン座標（ツールバッジの錨点）。in_canvas かつ非 busy の時だけ Some
+    /// （updateCursorAndHover が毎フレーム設定）。
+    hover_screen: ?core.Vec2 = null,
+    /// hover 中の canvas 画素座標（footprint リングの錨点）。`core.screenToCanvas` 経由（実 canvas
+    /// 画素範囲外なら null）なので、レターボックス／canvas 外では自然にリングだけ非表示になる。
+    hover_cell: ?core.Vec2 = null,
+    /// 直近に OS へ要求した cursor shape（変化検出用 + `cursor` probe 公開用）。
+    cursor_shape: platform.CursorShape = .default,
+    /// Brush footprint 輪郭リングの縁セルキャッシュ（(size,hardness) 変化時のみ再計算）。
+    brush_edges: brush_edge_cache.EdgeCache = .{},
     /// ── ペイン（TASK-42）。pane は fixed px・canvas は grow。幅/高さは毎フレーム利用可能領域へ clamp ──
     right_pane_w: i32 = RIGHT_PANE_DEFAULT,
     right_visible: bool = true,
@@ -257,6 +288,15 @@ const App = struct {
 
     fn editingBlocked(self: *const App) bool {
         return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle;
+    }
+
+    /// ソフトオーバーレイ（ツールグリフ + footprint リング）を隠すべきか（TASK-75.4）。
+    /// 実際に描画/入力操作が進行中（stroke capture・選択ドラッグ・ベジェのハンドルドラッグ・パン）の間は
+    /// 隠す（bezier hover プレビューの「ドラッグ中は隠す」流儀と同じ）。これにより
+    /// `brush_edges.refresh()`（Brush.footprint() 経由で buildDab を再実行する）が Brush ストローク中に
+    /// 呼ばれることも無くなり、「footprint は down 時に latch・stroke 中不変」という既存契約を壊さない。
+    fn isPointerBusy(self: *const App) bool {
+        return self.input.capturing or self.sel_in.state != .idle or self.bez_in.in_drag or self.pan_active;
     }
 
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
@@ -800,6 +840,28 @@ fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, toolDigest(ctx, &buf));
 }
 
+/// cursor digest/snapshot（TASK-75.4）: 要求中の OS cursor shape + 現在ツール + footprint リング半径。
+/// OS カーソル自体は framebuffer に写らないため、「pixie が要求した値」を assert する用途
+/// （実際に OS カーソルが変わったかは各 backend 手動目視。docs/plans/cursor-support-plan.md 参照）。
+fn cursorDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const shape_name: []const u8 = switch (app.cursor_shape) {
+        .default => "default",
+        .crosshair => "crosshair",
+        .hidden => "hidden",
+    };
+    // ring_r は Brush 選択時のみ意味を持つ（それ以外は 0）。EdgeCache と同じ clampedSize 経由で
+    // size 解釈をズレさせない（brush_edge_cache.clampedSize 参照）。
+    const ring_r: u32 = if (app.active_kind == .brush) brush_edge_cache.clampedSize(&app.brush) / 2 else 0;
+    return std.fmt.bufPrint(buf, "shape={s} tool={s} ring_r={d}", .{
+        shape_name, app.active_kind.name(), ring_r,
+    }) catch buf[0..0];
+}
+fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    var buf: [128]u8 = undefined;
+    return allocator.dupe(u8, cursorDigest(ctx, &buf));
+}
+
 /// canvas_area rect 内に表示領域（CANVAS*zoom 四方）を配置した canvas rect を返す。
 /// vw<=area.w 軸は中央固定（pan=0）、vw>area.w 軸は canvas が area を完全に覆う範囲へ pan を clamp し
 /// app.pan_x/y へ書き戻す。毎フレーム app.last_area も更新する（Fit ズーム計算用）。
@@ -907,6 +969,33 @@ fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) b
         }
     }
     return app.pan_active;
+}
+
+/// M1 配線（TASK-75.4）: hover 領域（canvas / パネル・外）から OS cursor shape を決め、前フレームと
+/// 異なる時だけ `window.setCursor` を呼ぶ（canvas → crosshair、パネル/外 → default）。
+/// あわせて free-hover 位置（`hover_screen`/`hover_cell`）を更新する。
+///
+/// 呼び出しタイミングは「canvas 入力ディスパッチの後・描画の前」（main loop 内）にすること。
+/// ディスパッチ前だと、当フレームで新規 stroke が開始しても `isPointerBusy()` がまだ false のままの
+/// 状態で hover が確定してしまい、直後の描画パスで busy 開始直後の footprint リング（Brush の場合）が
+/// 一瞬出てしまう（codex レビュー指摘。2026-07-05）。
+///
+/// ホットパス宣言: 毎フレーム呼ばれるが O(1)（矩形内外判定 + 座標変換のみ）。全画素ループ非該当。
+fn updateCursorAndHover(app: *App, window: platform.Window, ctx: *const gui.Context, canvas_rect: ?core.Rect) void {
+    const mouse = core.Vec2{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y };
+    const in_canvas = if (app.last_area) |a| a.contains(mouse.x, mouse.y) else false;
+
+    const shape: platform.CursorShape = if (in_canvas) .crosshair else .default;
+    if (shape != app.cursor_shape) {
+        app.cursor_shape = shape;
+        window.setCursor(shape);
+    }
+
+    app.hover_screen = if (in_canvas and !app.isPointerBusy()) mouse else null;
+    app.hover_cell = if (app.hover_screen != null and canvas_rect != null)
+        core.screenToCanvas(mouse, canvas_rect.?, app.view_zoom)
+    else
+        null;
 }
 
 fn layerWidgetId(idx: usize, part: gui.Id) gui.Id {
@@ -1308,6 +1397,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "canvas", .ctx = &app, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
     platform.registerProbe(.{ .name = "undo", .ctx = &app, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
     platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
+    platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
 
     main_loop: while (app.running and window.pollEvents()) {
         // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。
@@ -1400,6 +1490,11 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
+            // ── ソフトオーバーレイ用 hover 追跡 + OS カーソル形状の M1 配線（TASK-75.4）。
+            // 入力ディスパッチの後に置くことで、当フレームで新規 stroke が始まった場合の busy 判定
+            // （isPointerBusy）を正しく反映する（描画パスで footprint リングが一瞬出ることを防ぐ）。
+            updateCursorAndHover(&app, window, &ctx, canvas_rect);
+
             // ── 描画: bg → チェッカー背景 → canvas blit(α src-over) → GUI（上に重ねる） ──
             @memset(fb.pixels, COLOR_WINDOW_BG);
             if (canvas_rect) |rect| {
@@ -1450,6 +1545,22 @@ pub fn main(init: std.process.Init) !void {
                         const phase: i32 = @intFromFloat(@mod(platform.getTime() * MARCH_SPEED, MARCH_PERIOD));
                         selection_overlay.draw(&ctx, display_sel, rect, app.view_zoom, clip_area, phase);
                     };
+                }
+            }
+            // ツールグリフ + ブラシ footprint 輪郭リング（ソフトオーバーレイ最前面。TASK-75.4）。
+            // hover_screen は「in_canvas かつ非 busy」の時だけ Some（updateCursorAndHover 参照）なので、
+            // stroke/選択ドラッグ/ベジェドラッグ/パン中はここに来ない。
+            if (app.hover_screen) |hs| {
+                if (app.last_area) |area| {
+                    const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                    const glyph = app.active_kind.glyph();
+                    cursor_overlay.drawGlyph(&ctx, .{ .x = hs.x, .y = hs.y }, glyph.label, glyph.color, clip_area);
+                    if (app.active_kind == .brush) {
+                        if (app.hover_cell) |hc| if (canvas_rect) |rect| {
+                            app.brush_edges.refresh(&app.brush);
+                            cursor_overlay.drawRing(&ctx, &app.brush_edges, hc, rect, app.view_zoom, clip_area, RING_COLOR_A, RING_COLOR_B);
+                        };
+                    }
                 }
             }
             gui.render(

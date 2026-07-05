@@ -551,6 +551,22 @@ pub fn build(b: *std.Build) void {
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
 
+    // ブラシ footprint 縁セルキャッシュ（TASK-75.4）。gui/kit 非依存の純ロジック。core を名前付き import（canvas_input と同型）
+    const brush_edge_cache_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    const brush_edge_cache_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/brush_edge_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    brush_edge_cache_core.addImport("pixelops", shared_modules.pixelops.mod);
+    brush_edge_cache_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    brush_edge_cache_core.addImport("serde", shared_modules.serde.mod);
+    brush_edge_cache_mod.addImport("paint", brush_edge_cache_core);
+    const brush_edge_cache_test = b.addTest(.{ .root_module = brush_edge_cache_mod });
+    const run_brush_edge_cache_test = b.addRunArtifact(brush_edge_cache_test);
+
     // pixie blit（canvas zoom 転送 + チェッカー。TASK-54）。core を名前付き import（canvas_input と同型）
     const blit_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
@@ -591,6 +607,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_selection_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
+    test_core_step.dependOn(&run_brush_edge_cache_test.step);
 
     // ========================================
     // PNG デコーダー format.zig テスト
