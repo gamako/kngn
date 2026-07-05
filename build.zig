@@ -340,6 +340,7 @@ pub fn build(b: *std.Build) void {
     });
     harness_test_mod.addImport("png", shared_modules.png.mod); // harness が encodePNG/crc32 を使う
     harness_test_mod.addImport("platform_types", shared_modules.types.mod); // harness が Event/EventStats 等を使う
+    harness_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod); // harness の `capture` コマンド/probe が使う（TASK-49.5）
     const harness_test = b.addTest(.{ .root_module = harness_test_mod });
     const run_harness_test = b.addRunArtifact(harness_test);
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
@@ -371,12 +372,13 @@ pub fn build(b: *std.Build) void {
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
-    // capture 入力基盤（TASK-49.1）単体テスト。display/実デバイス不要・OS 非依存。
+    // capture 入力基盤（TASK-49.1/49.5）単体テスト。display/実デバイス不要・OS 非依存。
     // capture_types（TripleBuffer 往復・不変条件・DeviceInfo/CaptureError 構造）+ camera facade
     // （camera_stub.zig を relative import で内包。harness 分岐 + stub 委譲）+ audio.zig の
     // capture 拡張（audio_capture_stub.zig を relative import で内包。既存出力 backend の switch は
     // 参照されない限り分析されない Zig の lazy analysis により、AudioToolbox 等のリンクは不要
-    // ＝実測確認済み）の3本を1 step に束ねる。
+    // ＝実測確認済み）+ capture_synthetic（harness 内蔵 synthetic capture source。TASK-49.5）の
+    // 4本を1 step に束ねる。
     const capture_types_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("core/capture_types.zig"),
@@ -413,6 +415,19 @@ pub fn build(b: *std.Build) void {
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
     test_capture_types_step.dependOn(&b.addRunArtifact(audio_capture_test).step);
+
+    // core/capture_synthetic.zig（harness 内蔵 synthetic capture source。TASK-49.5）。
+    // capture_types にのみ依存（camera/audio facade への配線は無い）。audio 生成スレッドの
+    // std.c.nanosleep 用に link_libc=true（core/audio_null.zig の test と同じ理由）。
+    const capture_synthetic_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/capture_synthetic.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    capture_synthetic_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    const capture_synthetic_test = b.addTest(.{ .root_module = capture_synthetic_test_mod });
+    test_capture_types_step.dependOn(&b.addRunArtifact(capture_synthetic_test).step);
 
     // canvas.zig 単体テスト
     const canvas_test_mod = b.createModule(.{
@@ -1163,6 +1178,7 @@ const SharedModules = struct {
     scope: TaggedModule, // libs/viz（旧 apps/synth/scope.zig）
     capture_types: TaggedModule, // capture 入力基盤の共有型（TASK-49.1。platform_types と同じ type-only）
     camera: TaggedModule, // カメラ L1 facade（TASK-49.1。audio と同格の core layer primitive）
+    capture_synthetic: TaggedModule, // harness 内蔵 synthetic capture source（TASK-49.5。facade 配線は無い）
 
     fn init(b: *std.Build) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
@@ -1278,6 +1294,20 @@ const SharedModules = struct {
         link(camera, capture_types);
         link(camera, harness); // isCaptureSyntheticActive() 継ぎ目
 
+        // capture_synthetic (L1): harness 内蔵の synthetic capture source（偽 mic/camera。
+        // TASK-49.5）。camera/audio facade への配線は無く、harness の組み込み `capture`
+        // コマンド/probe だけが消費する（`isCaptureSyntheticActive()` の doc comment 参照）。
+        // capture_types にのみ依存。std.c.nanosleep（audio 生成スレッドの実時間ペーシング）用に
+        // link_libc=true（std.Thread.spawn 自体の要件ではなく POSIX sleep 側の理由。
+        // core/audio_null.zig と同じ事情）。
+        const capture_synthetic: TaggedModule = .{ .layer = .core, .name = "capture_synthetic", .mod = b.createModule(.{
+            .root_source_file = b.path("core/capture_synthetic.zig"),
+            .link_libc = true,
+        }) };
+        link(capture_synthetic, capture_types);
+        // harness.zig が `@import("capture_synthetic")` で使う（`capture` コマンド/probe）。
+        link(harness, capture_synthetic);
+
         // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
         // （物理位置は src/dsp のまま。libs/audio への移動は R8 日和見で後続タスクにて）
         const dsp: TaggedModule = .{ .layer = .lib, .name = "dsp", .mod = b.createModule(.{
@@ -1343,6 +1373,7 @@ const SharedModules = struct {
             .scope = scope,
             .capture_types = capture_types,
             .camera = camera,
+            .capture_synthetic = capture_synthetic,
         };
     }
 };

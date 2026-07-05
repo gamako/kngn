@@ -31,6 +31,7 @@
 const std = @import("std");
 const types = @import("platform_types");
 const png = @import("png");
+const capture_synthetic = @import("capture_synthetic"); // synthetic capture source（TASK-49.5）
 
 const Event = types.Event;
 const KeyCode = types.KeyCode;
@@ -120,6 +121,12 @@ var headless_pixels: []u32 = &.{};
 var headless_w: u32 = 0;
 var headless_h: u32 = 0;
 
+// synthetic capture source（TASK-49.5）: harness 内蔵の偽 mic/camera。camera.zig/audio.zig への
+// facade 配線は無く、このモジュール内（`capture` コマンド + `capture` probe）で完結する。
+var capture_synthetic_requested = false; // VP_HARNESS_CAPTURE_SYNTHETIC env
+var synth_video: ?capture_synthetic.SyntheticVideoDevice = null;
+var synth_audio: ?capture_synthetic.SyntheticAudioDevice = null;
+
 // custom probe registry（app が opt-in 登録。framework は中身を解釈せず raw+digest をルートするだけ）
 // 単一プロセスの debug facility なので固定長 module-level 配列で十分（動的確保なし）。
 const MAX_PROBES = 16;
@@ -162,7 +169,7 @@ pub fn isEnabled() bool {
 /// snapshot が返す raw バイト列をそのまま file へ書き、digest が返す1行を既存 sink へ流すだけ。
 /// 各 probe の意味づけ（PNG 化 / JSON 整形 等）は全て app 側 callback に閉じる。
 pub const Probe = struct {
-    /// probe 名（snapshot/digest コマンドの引数。fb/audio/stats/capabilities は予約名で登録不可）。
+    /// probe 名（snapshot/digest コマンドの引数。fb/audio/stats/capabilities/capture は予約名で登録不可）。
     name: []const u8,
     /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
     ctx: *anyopaque,
@@ -181,7 +188,7 @@ pub const Probe = struct {
 
 /// custom probe を登録する。app は `platform.registerProbe(...)` 経由で `platform.init()` 後に呼ぶ。
 /// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
-/// - 同名は上書き。fb/audio/stats/capabilities は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
+/// - 同名は上書き。fb/audio/stats/capabilities/capture は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
 pub fn registerProbe(p: Probe) void {
     if (!isEnabled()) return;
     if (isReservedProbeName(p.name)) {
@@ -207,7 +214,8 @@ pub fn registerProbe(p: Probe) void {
 }
 
 fn isReservedProbeName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or std.mem.eql(u8, name, "capabilities");
+    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or
+        std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture");
 }
 
 /// JSON 文字列へ未エスケープで埋め込むと破損する文字（`"` / `\` / ASCII 制御文字 `0x00..0x1F`。
@@ -337,6 +345,8 @@ pub fn parseConfig() void {
     if (headless_requested and !headless_active) {
         std.debug.print("[harness] VP_HARNESS_HEADLESS は VP_HARNESS_SCRIPT か VP_HARNESS_LIVE/PORT と併用が必要です。無視します（通常実行）。\n", .{});
     }
+
+    capture_synthetic_requested = getEnv("VP_HARNESS_CAPTURE_SYNTHETIC") != null;
 }
 
 /// headless 判定（`parseConfig()` 後に確定。env 由来で transport の成否に依存しない）。
@@ -345,16 +355,25 @@ pub fn isHeadlessActive() bool {
     return headless_active;
 }
 
-/// capture（マイク/カメラ）の synthetic source 差し替え判定（TASK-49.5 のプレースホルダ）。
-/// `core/camera.zig`/`core/audio.zig` の capture 系関数（`enumerate`/`requestPermission`/`open`）が
-/// 先頭で呼ぶ分岐点。**現状は常に `false`**（synthetic backend は TASK-49.5 で実装するため、49.1
-/// 時点ではこの関数の中身も呼び出し側の `true` 分岐も到達しない）。有効化条件は既存 audio 出力と
-/// 同じ規約を踏襲する: harness の env 読み（`parseConfig()`）は `platform.init()` 経由でのみ走るため、
-/// `platform.init()` を呼ばない capture-only アプリでは本関数は常に `false` を返す
-/// （`examples/15_audio_tone` 等の audio-only アプリが `VP_HARNESS_HEADLESS` を解釈できないのと
-/// 同じ既知の制約。詳細は `docs/plans/capture-foundation-plan.md` 5章）。
+/// capture（マイク/カメラ）の synthetic source 有効判定（TASK-49.5）。
+/// `VP_HARNESS_CAPTURE_SYNTHETIC` env かつ harness が有効（replay/live）のときのみ `true`。
+/// 既定（env 未設定）では常に `false`（回帰ゼロ）。
+///
+/// **注意（重要な限定）**: `core/camera.zig`/`core/audio.zig` は本タスクでは変更していないため、
+/// この関数が `true` を返しても `camera.open()`/`audio.openCapture()` は引き続き
+/// `error.Unsupported` を返す（49.1 のプレースホルダ分岐がそのまま残る）。本タスクの synthetic
+/// capture は `core/capture_synthetic.zig` + harness 組み込みの `capture` コマンド/probe として
+/// **このモジュール内で完結**しており、facade への配線は別タスクに委ねる
+/// （`docs/plans/capture-foundation-plan.md` 5章の「1行差し替え」は当初案だったが、`camera.zig`
+/// 側の公開 `VideoDevice` 型が具象 alias のため単純な差し替えでは済まないと判明し、TASK-49.5 の
+/// codex レビューでスコープ外と確定した）。
+///
+/// 有効化条件は既存 audio 出力と同じ規約を踏襲する: harness の env 読み（`parseConfig()`）は
+/// `platform.init()` 経由でのみ走るため、`platform.init()` を呼ばない capture-only アプリでは
+/// 本関数は常に `false` を返す（`examples/15_audio_tone` 等の audio-only アプリが
+/// `VP_HARNESS_HEADLESS` を解釈できないのと同じ既知の制約）。
 pub fn isCaptureSyntheticActive() bool {
-    return false;
+    return capture_synthetic_requested and isEnabled();
 }
 
 /// platform.init() が（非 headless 時は `backend.init()` の後に）1度だけ呼ぶ。
@@ -452,6 +471,8 @@ pub fn pollGate(native_continue: bool) bool {
             handleDigest(&it);
         } else if (std.mem.eql(u8, cmd, "action")) {
             handleAction(&it);
+        } else if (std.mem.eql(u8, cmd, "capture")) {
+            handleCapture(&it);
         } else if (std.mem.eql(u8, cmd, "expect")) {
             handleExpect(&it, false);
         } else if (std.mem.eql(u8, cmd, "assert")) {
@@ -779,6 +800,20 @@ fn handleSnapshot(it: *Tok) void {
             return;
         };
         emitSnapshot("capabilities", path, "json");
+    } else if (std.mem.eql(u8, probe, "capture")) {
+        if (synth_video) |*dev| {
+            const frame = dev.renderFrame(frame_index);
+            const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/capture_{d}.png", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+            png.savePNG(io_val, path, frame.pixels, frame.width, frame.height, gpa) catch |err| {
+                std.debug.print("[harness] snapshot capture 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+                return;
+            };
+            var info_buf: [32]u8 = undefined;
+            const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ frame.width, frame.height }) catch "?";
+            emitSnapshot("capture", path, info);
+        } else {
+            warnLine("snapshot capture: video 未 open → skip");
+        }
     } else if (findProbe(probe)) |p| {
         snapshotCustom(p, path_arg, &path_buf);
     } else {
@@ -808,7 +843,7 @@ fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
 // capabilities probe（登録済み probe・action の内省列挙。TASK-62.4）
 //
 // ホットパス宣言: イベント/接続時のみ（digest/snapshot コマンド処理時に固定長 registry
-// （最大 probe 16 + action 16 + 組み込み 4 = 36 件）を1回走査するだけ。フレーム毎・毎サンプルでは
+// （最大 probe 16 + action 16 + 組み込み 5 = 37 件）を1回走査するだけ。フレーム毎・毎サンプルでは
 // 走らない）。RT 共有状態には触れない（main スレッドの固定長 registry 読みのみ）。
 //
 // 中身非解釈の不変条件: name/ext/desc と snapshot/digest の**有無**（callback が non-null か）を
@@ -833,6 +868,7 @@ const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms・peak・f0・silent" },
     .{ .name = "stats", .ext = "json", .desc = "EventStats + 仮想fps JSON" },
     .{ .name = "capabilities", .ext = "json", .desc = "登録済み probe・action の内省列挙" },
+    .{ .name = "capture", .ext = "png", .desc = "synthetic mic/camera capture: video PNG snapshot + video/audio state digest" },
 };
 
 /// `s` を `buf[len.*..limit)` に収まる場合のみ書き込む。収まらなければ何も書かず false を返す
@@ -866,7 +902,7 @@ fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, des
     return appendRaw(buf, limit, len, entry);
 }
 
-/// 登録済み probe（組み込み4件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
+/// 登録済み probe（組み込み5件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
 /// **常に valid JSON を返す**契約（`buf.len >= MIN_CAPABILITIES_BUF_LEN` が前提）。容量超過や
 /// name/ext の不正文字でエントリを省略した場合は末尾に `"truncated":true` を付与する。
 fn formatCapabilitiesPayload(buf: []u8) []const u8 {
@@ -966,6 +1002,8 @@ fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
         return .{ .ok = formatStatsPayload(buf) };
     } else if (std.mem.eql(u8, probe, "capabilities")) {
         return .{ .ok = formatCapabilitiesPayload(&capabilities_buf) };
+    } else if (std.mem.eql(u8, probe, "capture")) {
+        return .{ .ok = formatCapturePayload(buf) };
     } else if (findProbe(probe)) |p| {
         const dg = p.digest orelse return .{ .unavailable = "digest unsupported" };
         return .{ .ok = dg(p.ctx, buf) };
@@ -1043,6 +1081,120 @@ fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
     if (!pass and mode == .replay) {
         expect_failures += 1;
     }
+}
+
+// ============================================================================
+// synthetic capture source（偽 mic/camera。TASK-49.5）
+//
+// 文法（replay/live 共通）:
+//   capture video open <w> <h> [fps]   # synthetic カメラを開く（既 open 済みなら閉じてから開き直す）
+//   capture video close                # synthetic カメラを閉じる
+//   capture audio open [sr] [ch] [hz]  # synthetic マイクを開いて即 start（既 open 済みなら開き直す）
+//   capture audio close                # synthetic マイクを閉じる（stop+join+close）
+//
+// `isCaptureSyntheticActive()`（`VP_HARNESS_CAPTURE_SYNTHETIC` env + harness 有効時のみ true）が
+// false の間はすべて fail-fast（warnLine のみ・状態変化なし。既存 `inject` の未知トークン処理と同じ
+// 思想）。camera.zig/audio.zig への facade 配線は無い（`isCaptureSyntheticActive()` の doc comment
+// 参照）。実装は `core/capture_synthetic.zig` に委譲し、ここでは harness state（`synth_video`/
+// `synth_audio`）の所有・コマンドパース・probe payload 組み立てのみを行う。
+//
+// ホットパス宣言: イベント時のみ（コマンド処理時に1回。フレーム毎・毎サンプルではない）。
+// ============================================================================
+
+fn handleCapture(it: *Tok) void {
+    if (!isCaptureSyntheticActive()) return warnLine("capture: VP_HARNESS_CAPTURE_SYNTHETIC 未設定または harness 無効のため使用不可");
+    const domain = it.next() orelse return warnLine("capture: video|audio 不足");
+    if (std.mem.eql(u8, domain, "video")) {
+        handleCaptureVideo(it);
+    } else if (std.mem.eql(u8, domain, "audio")) {
+        handleCaptureAudio(it);
+    } else {
+        warnLine("capture: 不明な種別（video|audio）");
+    }
+}
+
+fn handleCaptureVideo(it: *Tok) void {
+    const verb = it.next() orelse return warnLine("capture video: open|close 不足");
+    if (std.mem.eql(u8, verb, "open")) {
+        const w = parseUsize(it.next()) orelse return warnLine("capture video open: width 不正");
+        const h = parseUsize(it.next()) orelse return warnLine("capture video open: height 不正");
+        const fps = parseUsize(it.next()) orelse 30;
+        if (synth_video) |*dev| dev.close();
+        synth_video = capture_synthetic.openVideo(gpa, .{
+            .width = std.math.cast(u32, w) orelse return warnLine("capture video open: width 過大"),
+            .height = std.math.cast(u32, h) orelse return warnLine("capture video open: height 過大"),
+            .frame_rate = std.math.cast(u32, fps) orelse return warnLine("capture video open: fps 過大"),
+        }) catch |err| {
+            synth_video = null;
+            std.debug.print("[harness] capture video open 失敗: {s}\n", .{@errorName(err)});
+            return;
+        };
+    } else if (std.mem.eql(u8, verb, "close")) {
+        if (synth_video) |*dev| {
+            dev.close();
+            synth_video = null;
+        } else {
+            warnLine("capture video close: 未 open");
+        }
+    } else {
+        warnLine("capture video: 不明な操作（open|close）");
+    }
+}
+
+fn noopCaptureAudioCallback(frame: capture_synthetic.AudioInFrame, userdata: ?*anyopaque) void {
+    _ = frame;
+    _ = userdata;
+}
+
+fn handleCaptureAudio(it: *Tok) void {
+    const verb = it.next() orelse return warnLine("capture audio: open|close 不足");
+    if (std.mem.eql(u8, verb, "open")) {
+        const sr = parseUsize(it.next()) orelse 48000;
+        const ch = parseUsize(it.next()) orelse 1;
+        const hz = parseF32(it.next()) orelse 440.0;
+        if (synth_audio) |dev| {
+            dev.close();
+            synth_audio = null;
+        }
+        var dev = capture_synthetic.openAudio(gpa, .{
+            .sample_rate = std.math.cast(u32, sr) orelse return warnLine("capture audio open: sample_rate 過大"),
+            .channels = std.math.cast(u32, ch) orelse return warnLine("capture audio open: channels 過大"),
+            .frequency_hz = hz,
+            .capture_callback = noopCaptureAudioCallback,
+        }) catch |err| {
+            std.debug.print("[harness] capture audio open 失敗: {s}\n", .{@errorName(err)});
+            return;
+        };
+        dev.start() catch |err| {
+            std.debug.print("[harness] capture audio start 失敗: {s}\n", .{@errorName(err)});
+            dev.close();
+            return;
+        };
+        synth_audio = dev;
+    } else if (std.mem.eql(u8, verb, "close")) {
+        if (synth_audio) |dev| {
+            dev.close();
+            synth_audio = null;
+        } else {
+            warnLine("capture audio close: 未 open");
+        }
+    } else {
+        warnLine("capture audio: 不明な操作（open|close）");
+    }
+}
+
+/// `capture` probe の digest payload（top-level key=value。expect/assert で照合可能）。
+/// video/audio いずれも未 open なら該当フィールドは 0 を返す（key は常に存在させる）。
+fn formatCapturePayload(buf: []u8) []u8 {
+    const v_open: u8 = @intFromBool(synth_video != null);
+    const v_w: u32 = if (synth_video) |d| d.width else 0;
+    const v_h: u32 = if (synth_video) |d| d.height else 0;
+    const a_open: u8 = @intFromBool(synth_audio != null);
+    const a_frames: u64 = if (synth_audio) |d| d.framesGenerated() else 0;
+    const a_peak: f32 = if (synth_audio) |d| d.lastPeak() else 0;
+    return std.fmt.bufPrint(buf, "video_open={d} video_w={d} video_h={d} video_frame={d} audio_open={d} audio_frames={d} audio_peak={d:.4}", .{
+        v_open, v_w, v_h, frame_index, a_open, a_frames, a_peak,
+    }) catch buf[0..0];
 }
 
 // ============================================================================
@@ -1557,6 +1709,13 @@ fn resetForTest() void {
     audio_rate = .init(0);
     probe_count = 0;
     action_count = 0;
+    // synthetic capture source（TASK-49.5）: 前のテストの残留状態（video の pixel buffer・audio の
+    // 生成スレッド）を確実に片付けてからクリーンな状態で始める（テスト間リークを防ぐ）。
+    if (synth_video) |*dev| dev.close();
+    synth_video = null;
+    if (synth_audio) |dev| dev.close();
+    synth_audio = null;
+    capture_synthetic_requested = false;
 }
 
 test "parseKey: 名前→KeyCode（大小無視・数字）" {
@@ -1924,6 +2083,7 @@ test "custom probe: 同名は上書き / 予約名は拒否 / 満杯は skip" {
     registerProbe(.{ .name = "fb", .ctx = &c1, .digest = testProbeDigest });
     registerProbe(.{ .name = "audio", .ctx = &c1, .digest = testProbeDigest });
     registerProbe(.{ .name = "stats", .ctx = &c1, .digest = testProbeDigest });
+    registerProbe(.{ .name = "capture", .ctx = &c1, .digest = testProbeDigest }); // TASK-49.5 で追加した予約名
     try testing.expectEqual(@as(usize, 1), probe_count);
 
     // 満杯（MAX_PROBES 到達）まで詰め、超過分は skip される（既存 "p" + 新規ユニーク名で埋める）
@@ -2306,7 +2466,7 @@ test "capabilities: 予約名で登録拒否" {
     try testing.expectEqual(@as(usize, 0), probe_count);
 }
 
-test "capabilities: custom probe/action 0件 → 組み込み4 probe + actions:[]" {
+test "capabilities: custom probe/action 0件 → 組み込み5 probe + actions:[]" {
     resetForTest();
     var buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
     _ = &buf; // 使わない（capabilities_buf を直接使う）
@@ -2317,8 +2477,8 @@ test "capabilities: custom probe/action 0件 → 組み込み4 probe + actions:[
     const root = parsed.value.object;
     try testing.expectEqual(@as(?std.json.Value, null), root.get("truncated"));
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 4), probes_arr.len);
-    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities" };
+    try testing.expectEqual(@as(usize, 5), probes_arr.len);
+    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture" };
     for (probes_arr, 0..) |entry, i| {
         try testing.expectEqualStrings(expected_names[i], entry.object.get("name").?.string);
         try testing.expect(entry.object.get("snapshot").?.bool);
@@ -2342,16 +2502,16 @@ test "capabilities: custom probe/action がフィールド値・登録順で現�
     defer parsed.deinit();
     const root = parsed.value.object;
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 6), probes_arr.len); // 組み込み4 + custom2
+    try testing.expectEqual(@as(usize, 7), probes_arr.len); // 組み込み5 + custom2
 
-    const p1 = probes_arr[4].object;
+    const p1 = probes_arr[5].object;
     try testing.expectEqualStrings("p1", p1.get("name").?.string);
     try testing.expectEqualStrings("png", p1.get("ext").?.string);
     try testing.expectEqualStrings("d1", p1.get("desc").?.string);
     try testing.expect(!p1.get("snapshot").?.bool);
     try testing.expect(p1.get("digest").?.bool);
 
-    const p2 = probes_arr[5].object;
+    const p2 = probes_arr[6].object;
     try testing.expectEqualStrings("p2", p2.get("name").?.string);
     try testing.expectEqualStrings("json", p2.get("ext").?.string);
     try testing.expectEqualStrings("", p2.get("desc").?.string);
@@ -2394,8 +2554,8 @@ test "capabilities: name の不正文字（\" / 制御文字）はエントリ�
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 5), probes_arr.len); // 組み込み4 + good1（bad は省略）
-    try testing.expectEqualStrings("good1", probes_arr[4].object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 6), probes_arr.len); // 組み込み5 + good1（bad は省略）
+    try testing.expectEqualStrings("good1", probes_arr[5].object.get("name").?.string);
 }
 
 test "capabilities: action 名の制御文字（NUL。isValidActionName は通過するが JSON では不正）はエントリ省略+truncated" {
@@ -2420,7 +2580,7 @@ test "capabilities: ext の不正文字（tab）もエントリを省略し trun
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
-    try testing.expectEqual(@as(usize, 4), root.get("probes").?.array.items.len); // 組み込み4のみ（p は省略）
+    try testing.expectEqual(@as(usize, 5), root.get("probes").?.array.items.len); // 組み込み5のみ（p は省略）
 }
 
 test "capabilities: MIN_CAPABILITIES_BUF_LEN ちょうどの buf でもフェイルセーフで valid JSON + truncated=true" {
@@ -2460,7 +2620,7 @@ test "capabilities: digestPayload 経由（digest capabilities）でも同じ JS
         .ok => |payload| {
             var parsed = try parseCapabilities(payload);
             defer parsed.deinit();
-            try testing.expectEqual(@as(usize, 4), parsed.value.object.get("probes").?.array.items.len);
+            try testing.expectEqual(@as(usize, 5), parsed.value.object.get("probes").?.array.items.len);
         },
         .unavailable => try testing.expect(false),
     }
@@ -2486,16 +2646,134 @@ test "decideHeadless: SCRIPT/LIVE 併用時のみ true、単独指定・未要�
 }
 
 // ============================================================================
-// capture synthetic source 継ぎ目（TASK-49.1）tests
+// synthetic capture source（TASK-49.5）tests
 // ============================================================================
 
-test "isCaptureSyntheticActive: 49.1 時点では harness の有効/無効に関わらず常に false（プレースホルダ）" {
-    resetForTest();
-    try testing.expect(!isCaptureSyntheticActive());
-
-    mode = .replay; // harness を有効化した状態でも判定は変わらないことを確認
+test "isCaptureSyntheticActive: 既定（env 未設定）では harness の有効/無効に関わらず false" {
+    resetForTest(); // mode=.replay
     defer resetForTest();
     try testing.expect(!isCaptureSyntheticActive());
+    mode = .disabled;
+    try testing.expect(!isCaptureSyntheticActive());
+}
+
+test "isCaptureSyntheticActive: requested かつ harness 有効（replay/live）のときのみ true" {
+    resetForTest(); // mode=.replay
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    try testing.expect(isCaptureSyntheticActive());
+    mode = .live;
+    try testing.expect(isCaptureSyntheticActive());
+    mode = .disabled;
+    try testing.expect(!isCaptureSyntheticActive()); // requested でも harness 無効なら false
+}
+
+test "capture コマンド: synthetic 無効時は fail-fast（warn のみ、状態変化なし）" {
+    resetForTest();
+    defer resetForTest();
+    // capture_synthetic_requested は既定 false のまま = synthetic 無効
+    cmd_buf = "capture video open 8 8\ncapture audio open\nquit";
+    while (pollGate(true)) {}
+    try testing.expect(synth_video == null);
+    try testing.expect(synth_audio == null);
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    try testing.expectEqualStrings("video_open=0 video_w=0 video_h=0 video_frame=0 audio_open=0 audio_frames=0 audio_peak=0.0000", formatCapturePayload(&buf));
+}
+
+test "capture video: video_frame は harness の仮想クロック(frame_index)に連動する（present で進む）" {
+    resetForTest();
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    cmd_buf = "capture video open 8 8 24\nquit";
+    while (pollGate(true)) {}
+    try testing.expect(synth_video != null);
+
+    // frame_index は `step` コマンド自体ではなく app の onPresent() 呼び出しで進む契約
+    // （仮想クロック節参照）。ここでは app 無しで直接3フレーム分 present し、仮想クロックが
+    // 進んだことと `capture` probe の `video_frame` がそれに連動することを確認する。
+    const px = [_]u32{0xFF000000};
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        onLock(&px, 1, 1);
+        onPresent();
+    }
+    try testing.expectEqual(@as(u64, 3), frame_index);
+
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    try testing.expectEqualStrings("video_open=1 video_w=8 video_h=8 video_frame=3 audio_open=0 audio_frames=0 audio_peak=0.0000", formatCapturePayload(&buf));
+
+    if (synth_video) |*dev| dev.close();
+    synth_video = null;
+}
+
+test "capture video open: 状態が digest に反映される（close 前）" {
+    resetForTest();
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    cmd_buf = "capture video open 16 8\nquit";
+    while (pollGate(true)) {}
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    try testing.expectEqualStrings("video_open=1 video_w=16 video_h=8 video_frame=0 audio_open=0 audio_frames=0 audio_peak=0.0000", formatCapturePayload(&buf));
+}
+
+test "capture video open: width/height=0 は ConfigFailed で synth_video は null のまま" {
+    resetForTest();
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    cmd_buf = "capture video open 0 8\nquit";
+    while (pollGate(true)) {}
+    try testing.expect(synth_video == null);
+}
+
+test "capture video open: 2回目の open は前の device を閉じてから開き直す（リーク無し）" {
+    resetForTest();
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    cmd_buf = "capture video open 8 8\ncapture video open 4 4\nquit";
+    while (pollGate(true)) {}
+    try testing.expect(synth_video != null);
+    try testing.expectEqual(@as(u32, 4), synth_video.?.width);
+}
+
+test "capture video: snapshot は video 未 open なら skip（present 前 fb skip と同じ思想）" {
+    resetForTest();
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    cmd_buf = "snapshot capture /tmp/should_not_write_capture.png\nquit";
+    while (pollGate(true)) {}
+    try testing.expect(synth_video == null);
+}
+
+test "capture audio: open→close で probe 状態がリセットされる（実時間検証は capture_synthetic.zig 側の単体テストで実施）" {
+    resetForTest();
+    defer resetForTest();
+    capture_synthetic_requested = true;
+    cmd_buf = "capture audio open 48000 1 440\nquit";
+    while (pollGate(true)) {}
+    try testing.expect(synth_audio != null);
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const payload = formatCapturePayload(&buf);
+    try testing.expect(std.mem.indexOf(u8, payload, "audio_open=1") != null);
+
+    resetForTest(); // クリーンアップ（stop+join+close）が安全に終わることを確認
+    try testing.expect(synth_audio == null);
+}
+
+test "capabilities: capture probe が組み込み一覧に含まれる" {
+    resetForTest();
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const probes_arr = parsed.value.object.get("probes").?.array.items;
+    var found = false;
+    for (probes_arr) |entry| {
+        if (std.mem.eql(u8, entry.object.get("name").?.string, "capture")) {
+            found = true;
+            try testing.expectEqualStrings("png", entry.object.get("ext").?.string);
+            try testing.expect(entry.object.get("snapshot").?.bool);
+            try testing.expect(entry.object.get("digest").?.bool);
+        }
+    }
+    try testing.expect(found);
 }
 
 test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイズ変更で再確保" {
