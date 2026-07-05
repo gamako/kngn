@@ -67,6 +67,11 @@ const RIGHT_SCROLL_ID: gui.Id = 0xC0FFEE06; // 右ペイン縦スクロール領
 const LAYER_PANEL_ID_BASE: gui.Id = 0xA430_0000;
 const LAYER_ROW_ID_BASE: gui.Id = 0xA430_1000;
 const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
+/// レイヤー行の右クリックコンテキストメニュー（TASK-79.2）。popup primitive（TASK-79.1）の id。
+const LAYER_CTX_MENU_ID: gui.Id = 0xA430_2000;
+/// レイヤー行 box 自身の明示 ID に使う `layerWidgetId` part（0..3 は既存: 0=選択ボタン/1=可視
+/// トグル/2=opacity slider/3=サムネ）。右クリックのヒットテストは行全体の矩形を使う。
+const LAYER_ROW_PART_ROW: gui.Id = 4;
 // レイヤーパネルのサムネイル（raw layer をチェッカー下地へ最近傍縮小・等倍 blit）
 const LAYER_THUMB_W: i32 = 24;
 const LAYER_THUMB_H: i32 = 24;
@@ -687,6 +692,79 @@ const App = struct {
         if (!self.canvas.selectLayer(idx)) return error.OutOfRange;
     }
 
+    /// 選択レイヤーを複製し、直上へ挿入する（Duplicate。TASK-79.2。レイヤー右クリックメニュー）。
+    /// 新規 Undo Op は不要: 既存 `.layer_add` の undo（`canvas.deleteLayer(op.index)` の戻り値を
+    /// その場でスナップショットする実装。undo.zig 参照）は push 時点でレイヤーが空か複製済みかを
+    /// 関知しないため、push 前に複製済みの pixels/visible/opacity を書き込んでおくだけで
+    /// undo/redo とも複製内容込みで正しく可逆になる（`doAddLayer` が空レイヤーで同じ Op を使う
+    /// のと全く同じ仕組み）。1 push でアトミック。
+    fn doDuplicateLayer(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        const src_idx = self.canvas.selected_layer;
+        const selected_before = self.canvas.selected_layer;
+        const src = self.canvas.layers.items[src_idx];
+        var new_layer = self.canvas.allocBlankLayer(self.gpa) catch |err| {
+            self.setSaveMsg("Layer duplicate failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        errdefer self.gpa.free(new_layer.pixels);
+        @memcpy(new_layer.pixels, src.pixels);
+        new_layer.visible = src.visible;
+        new_layer.opacity = src.opacity;
+        const new_idx = src_idx + 1;
+        try self.canvas.insertLayer(self.gpa, new_idx, new_layer);
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
+            .index = new_idx,
+            .selected_before = selected_before,
+            .selected_after = self.canvas.selected_layer,
+        } } });
+    }
+
+    /// 選択レイヤーを直下のレイヤーへ結合する（Merge Down。TASK-79.2。レイヤー右クリックメニュー）。
+    /// 選択中レイヤー(top)の内容を opacity 込みで下位レイヤー(bottom=top-1)へ src-over 焼き込みし、
+    /// top 自体を削除する。最下層（index 0）は結合先が無いため error.OutOfRange。
+    ///
+    /// 「下位への合成」と「上位の削除」という 2 つの構造変化は、libs/paint の atomic な
+    /// `.layer_merge_down` Op（undo.zig, TASK-79.2）へ **1 push** で表現する（2 つの UndoCmd に
+    /// 分けると、片方だけ undo された状態で別操作が push された際に古い座標参照が残り不整合を
+    /// 起こし得るため。codex レビュー指摘 2026-07-05）。
+    ///
+    /// ホットパス宣言: イベント時のみ（結合ボタン/メニュー項目クリック時に1回）。下位レイヤーの
+    /// 全画素(256x256)を走るが event-time の1回ループであり、フレーム毎ではない
+    /// （`Canvas.composite`/`UndoStack.pushClear` と同じ既存前例に倣うスカラーループで足りる。
+    /// 性能規約の SIMD 3点セット等は対象外）。
+    fn doMergeDown(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        const top_idx = self.canvas.selected_layer;
+        if (top_idx == 0) return error.OutOfRange;
+        const bottom_idx = top_idx - 1;
+        const selected_before = self.canvas.selected_layer;
+
+        const below_before = self.gpa.dupe(u32, self.canvas.layerPixels(bottom_idx)) catch @panic("doMergeDown: OOM");
+        errdefer self.gpa.free(below_before);
+
+        const top_layer = self.canvas.layers.items[top_idx];
+        const bottom_pixels = self.canvas.layerPixels(bottom_idx);
+        if (top_layer.visible) {
+            for (bottom_pixels, 0..) |*bp, i| {
+                const s = if (top_layer.opacity != 255) core.blend.scaleAlpha(top_layer.pixels[i], top_layer.opacity) else top_layer.pixels[i];
+                bp.* = core.blend.srcOver(bp.*, s);
+            }
+        }
+        const below_after = self.gpa.dupe(u32, bottom_pixels) catch @panic("doMergeDown: OOM");
+        errdefer self.gpa.free(below_after);
+
+        const removed = self.canvas.deleteLayer(top_idx) orelse return error.LastLayer;
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_merge_down = .{
+            .index = top_idx,
+            .selected_before = selected_before,
+            .selected_after = self.canvas.selected_layer,
+            .layer = removed,
+            .below_before = below_before,
+            .below_after = below_after,
+        } } });
+    }
+
     fn resetCanvasToSingleLayer(self: *App) void {
         while (self.canvas.layers.items.len > 1) {
             const removed = self.canvas.deleteLayer(self.canvas.layers.items.len - 1).?;
@@ -933,6 +1011,9 @@ fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 //   set_layer_visible   doSetLayerVisible       yes*  EditingBlocked / OutOfRange
 //   set_layer_opacity   doSetLayerOpacity       yes*  EditingBlocked / OutOfRange
 //   move_layer          doMoveLayer             yes   EditingBlocked / OutOfRange
+//   duplicate_layer     doDuplicateLayer        yes   EditingBlocked / allocator error（TASK-79.2）
+//   merge_down          doMergeDown             yes   EditingBlocked / OutOfRange / LastLayer（TASK-79.2。
+//                                                      atomic `.layer_merge_down` 1 entry。2 push ではない）
 //   set_color           doSetColorHex           no    （guard 無し。常に成功）
 //   set_tool            setActiveKind           no    （guard 無し。既存 UI と同じ「無反応」を許容）
 //   stroke              activeTool().onEvent 直接 yes  EditingBlocked / UnsupportedTool / parse系
@@ -1020,6 +1101,20 @@ fn actionMoveLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
+fn actionDuplicateLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doDuplicateLayer();
+    return "ok";
+}
+
+fn actionMergeDown(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doMergeDown();
+    return "ok";
+}
+
 fn actionSetColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const color = try actions.parseHexColor(args);
@@ -1078,7 +1173,7 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
-/// 14 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+/// 16 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
 fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo });
@@ -1090,6 +1185,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = actionSetLayerVisible });
     platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = actionSetLayerOpacity });
     platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = actionMoveLayer });
+    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = actionDuplicateLayer });
+    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = actionMergeDown });
     platform.registerAction(.{ .name = "set_color", .ctx = app, .run = actionSetColor });
     platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = actionSetTool });
     platform.registerAction(.{ .name = "stroke", .ctx = app, .run = actionStroke });
@@ -1140,6 +1237,10 @@ fn axisPlace(a: i32, aw: i32, vw: i32, pan: *i32) i32 {
 fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) bool {
     const in = &ctx.input;
     const area = app.last_area;
+    // popup（レイヤー右クリックメニュー等。TASK-79.2）表示中は新規のズーム/パン**開始**を
+    // 抑止する（canvas への入力貫通防止。既存の stroke 開始ゲートと同じ狙い）。既に進行中の
+    // パンはそのまま release まで完走させる（下の `if (app.pan_active)` は popup_open を見ない）。
+    const popup_open = ctx.hasOpenPopup();
 
     // マウスが canvas area 内か（ズーム/パン開始の判定に使う）
     const in_area = blk: {
@@ -1152,7 +1253,7 @@ fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) b
 
     // ── ホイールズーム（カーソル中心。area 内のみ）──
     // scroll_delta.y > 0 = 上スクロール = ズームイン（backend により符号が逆なら調整）。
-    if (in_area and in.scroll_delta.y != 0) {
+    if (in_area and in.scroll_delta.y != 0 and !popup_open) {
         if (canvas_rect) |cr| if (area) |a| {
             const old_zoom = app.view_zoom;
             const step: i32 = if (in.scroll_delta.y > 0) 1 else -1;
@@ -1184,7 +1285,7 @@ fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) b
     if (!app.pan_active) {
         const pan_press = (app.space_down and in.mouse_pressed.left) or in.mouse_pressed.middle;
         const bezier_editing = app.active_kind == .bezier and app.bezier_editor.isEditing();
-        if (pan_press and !app.input.capturing and !bezier_editing) {
+        if (pan_press and !app.input.capturing and !bezier_editing and !popup_open) {
             if (area) |a| {
                 const p = in.mouse_pressed_pos;
                 if (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h) {
@@ -1305,7 +1406,9 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         const layer = app.canvas.layers.items[idx];
         // 1 行 = [サムネイル][選択 L{d}][visible][opacity slider]。行高はサムネイル(24px)律速。
         // 横一列で 200px 幅に収め、行を低く保って縦方向に多くの layer を見せる。
-        ctx.beginBox(.{ .direction = .row, .gap = 3, .align_cross = .center });
+        // 明示 ID（row_id）を付けて rect_cache に登録する（右クリックのヒットテスト用。TASK-79.2）。
+        const row_id = layerWidgetId(idx, LAYER_ROW_PART_ROW);
+        ctx.beginBox(.{ .id = row_id, .direction = .row, .gap = 3, .align_cross = .center });
 
         // サムネイル: raw layer をチェッカー下地へ縮小合成。選択中は枠を明色に。
         const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("layer thumb: OOM");
@@ -1326,6 +1429,27 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
             app.doSetLayerOpacity(idx, @intCast(std.math.clamp(op_i32, 0, 255))) catch {};
         }
         ctx.endBox(); // row
+
+        // 右クリックでこの行のレイヤーを選択しコンテキストメニューを開く（TASK-79.2）。
+        // 行矩形は「前フレームの rect_cache」（既存 widget と同じ同期 hit-test 契約。
+        // context.zig 冒頭の契約コメント参照）。openPopup は endFrame 前でも呼べる
+        // （endFrame 後を要求するのは描画+hit-test を行う popupMenu 側のみ。popup.zig 参照）。
+        // レイヤーパネルは右ペインの縦スクロール領域（RIGHT_SCROLL_ID, clip_children=true）配下
+        // にあるため、行 rect 単体だけでは「スクロールでクリップされ実際には見えていない部分」を
+        // 誤ヒットし得る（codex レビュー指摘 2026-07-05）。RIGHT_SCROLL_ID のビューポート矩形
+        // （beginScrollArea が clip_children 付きで登録する viewport box の rect）にも収まっている
+        // ことを追加で確認する（既存 widget の buttonBehavior(rect, clip) と同じ「祖先 clip を
+        // hit-test に使う」契約を、手動 hit-test でも踏襲する）。
+        if (ctx.input.mouse_pressed.right) {
+            if (ctx.getNodeRect(row_id)) |r| {
+                const p = ctx.input.mouse_pressed_pos;
+                const in_viewport = if (ctx.getNodeRect(RIGHT_SCROLL_ID)) |vp| vp.contains(p) else true;
+                if (in_viewport and r.contains(p)) {
+                    app.doSelectLayer(idx) catch {};
+                    ctx.openPopup(LAYER_CTX_MENU_ID, p);
+                }
+            }
+        }
     }
 }
 
@@ -1684,7 +1808,10 @@ pub fn main(init: std.process.Init) !void {
                         false;
                     // active_id==0 = どの widget/splitter も press を取っていない（hover だけの wantsMouse は
                     // 抑止しない＝canvas 内 press → 同一フレーム UI 上へ move でも stroke は開始できる）。
-                    break :gate in_area and ctx.state.active_id == 0;
+                    // !hasOpenPopup() = レイヤー右クリックメニュー（TASK-79.2）表示中は新規 stroke を
+                    // 開始しない（popup は active_id を 0 のまま保つため、上の条件だけでは防げない。
+                    // popup.zig の wantsMouse() が popup_state を OR しているのと同じ理由）。
+                    break :gate in_area and ctx.state.active_id == 0 and !ctx.hasOpenPopup();
                 };
                 if (app.active_kind == .bezier and !app.input.capturing) {
                     const frame: bezier_input.BezierInput.Frame = .{
@@ -1797,6 +1924,37 @@ pub fn main(init: std.process.Init) !void {
                             app.brush_edges.refresh(&app.brush);
                             cursor_overlay.drawRing(&ctx, &app.brush_edges, hc, rect, app.view_zoom, clip_area, RING_COLOR_A, RING_COLOR_B);
                         };
+                    }
+                }
+            }
+            // レイヤー右クリックコンテキストメニュー（TASK-79.2）。popup.zig の「endFrame 後」契約
+            // + 他のオーバーレイ（bezier/selection/cursor）より後に呼ぶことで最前面に描画される。
+            // 呼び出しは毎フレーム無条件でよい（対象 popup が閉じていれば no-op で即返る。
+            // popup.zig の doc comment 参照）。items は selected_layer の現在値から都度算出する
+            // （右クリック時に doSelectLayer 済みなので、以降の全項目は selected_layer に対して動く）。
+            {
+                const items = [_]gui.PopupItem{
+                    .{ .label = "Add Layer" },
+                    .{ .label = "Delete Layer", .enabled = app.canvas.layers.items.len > 1 },
+                    .{ .label = "Move Up", .enabled = app.canvas.selected_layer + 1 < app.canvas.layers.items.len },
+                    .{ .label = "Move Down", .enabled = app.canvas.selected_layer > 0 },
+                    .{ .label = if (app.canvas.layers.items[app.canvas.selected_layer].visible) "Hide" else "Show" },
+                    .{ .label = "Duplicate" },
+                    .{ .label = "Merge Down", .enabled = app.canvas.selected_layer > 0 },
+                    .{ .label = "Rename...", .enabled = false }, // placeholder（TASK-79.3 で実装）
+                    .{ .label = "Rasterize", .enabled = false }, // placeholder（TASK-79.5 で実装）
+                };
+                const ctx_menu_result = ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
+                if (ctx_menu_result.selected) |sel| {
+                    switch (sel) {
+                        0 => app.doAddLayer() catch {},
+                        1 => app.doDeleteLayer() catch {},
+                        2 => app.doMoveLayer(1) catch {},
+                        3 => app.doMoveLayer(-1) catch {},
+                        4 => app.doToggleLayerVisible(app.canvas.selected_layer),
+                        5 => app.doDuplicateLayer() catch {},
+                        6 => app.doMergeDown() catch {},
+                        else => {}, // Rename/Rasterize は disabled 固定のためここへは来ない
                     }
                 }
             }

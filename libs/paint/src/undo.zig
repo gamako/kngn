@@ -58,6 +58,26 @@ pub const Op = union(enum) {
         before: u8,
         after: u8,
     },
+    /// レイヤー結合（merge down。TASK-79.2）: 選択レイヤー(index)を直下(index-1)へ src-over
+    /// 焼き込みし、選択レイヤー自体を削除する 1 操作。「下位レイヤーへのピクセル合成」と
+    /// 「上位レイヤーの削除」という 2 つの構造変化を **1 つの atomic Op** として保持する
+    /// （2 つの UndoCmd に分けると、片方だけ undo された状態で別操作が push された際に
+    /// below_before/after が古いレイヤー構造を指してしまう危険があるため。codex レビュー
+    /// 指摘 2026-07-05）。below_before/below_after は常時保持（layer_add/layer_delete の
+    /// `layer` フィールドのような null/non-null 切替はしない。`.paint` の diffs と同じ扱い）。
+    layer_merge_down: struct {
+        /// 削除された上位レイヤーの元 index（下位は index-1 固定＝隣接前提）。
+        index: usize,
+        selected_before: usize,
+        selected_after: usize,
+        /// 削除された上位レイヤーの完全スナップショット（layer_delete と同じ null/non-null 規約:
+        /// push 時点=非null(canvas はもう保持しない) → undo で reinsert し null → redo で再度非null）。
+        layer: ?Layer,
+        /// 下位レイヤー(index-1)の結合前ピクセル（owned。undo で復元）。
+        below_before: []u32,
+        /// 下位レイヤー(index-1)の結合後ピクセル（owned。redo で復元）。
+        below_after: []u32,
+    },
 };
 
 /// 1 undo エントリ = 操作(op) + それが適用されたフレーム(frame)。
@@ -307,6 +327,11 @@ pub const UndoStack = struct {
             .layer_add => |la| if (la.layer) |layer| gpa.free(layer.pixels),
             .layer_delete => |ld| if (ld.layer) |layer| gpa.free(layer.pixels),
             .layer_reorder, .layer_visible, .layer_opacity => {},
+            .layer_merge_down => |lm| {
+                if (lm.layer) |layer| gpa.free(layer.pixels);
+                gpa.free(lm.below_before);
+                gpa.free(lm.below_after);
+            },
         }
     }
 
@@ -344,8 +369,8 @@ pub const UndoStack = struct {
         self.undo.append(gpa, cmd) catch @panic("UndoStack.redoOne: OOM");
     }
 
-    // op は *Op で受ける（layer_add/delete が op.layer の所有権を undo/redo 間で移動するため。
-    // 値渡しにすると所有権移動が壊れる。TASK-63 codex 指摘）。
+    // op は *Op で受ける（layer_add/delete/merge_down が op.layer の所有権を undo/redo 間で
+    // 移動するため。値渡しにすると所有権移動が壊れる。TASK-63 codex 指摘）。
     fn applyBefore(canvas: *Canvas, op_ptr: *Op) void {
         switch (op_ptr.*) {
             .paint => |p| {
@@ -371,6 +396,14 @@ pub const UndoStack = struct {
             },
             .layer_opacity => |op| {
                 if (!canvas.setLayerOpacity(op.index, op.before)) @panic("UndoStack.layer_opacity undo: invalid layer");
+            },
+            .layer_merge_down => |*op| {
+                const below_idx = op.index - 1;
+                @memcpy(canvas.layerPixels(below_idx), op.below_before);
+                const layer = op.layer orelse @panic("UndoStack.layer_merge_down undo: missing held layer");
+                op.layer = null;
+                canvas.insertLayer(canvas.allocator, op.index, layer) catch @panic("UndoStack.layer_merge_down undo: OOM");
+                _ = canvas.selectLayer(op.selected_before);
             },
         }
     }
@@ -400,6 +433,12 @@ pub const UndoStack = struct {
             },
             .layer_opacity => |op| {
                 if (!canvas.setLayerOpacity(op.index, op.after)) @panic("UndoStack.layer_opacity redo: invalid layer");
+            },
+            .layer_merge_down => |*op| {
+                const below_idx = op.index - 1;
+                @memcpy(canvas.layerPixels(below_idx), op.below_after);
+                op.layer = canvas.deleteLayer(op.index) orelse @panic("UndoStack.layer_merge_down redo: missing layer");
+                _ = canvas.selectLayer(op.selected_after);
             },
         }
     }
@@ -688,6 +727,56 @@ test "layer delete: undo/redo restores pixels metadata and selected layer" {
     try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
     try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
     try std.testing.expect(undo_stack.undo.items[0].op.layer_delete.layer != null);
+}
+
+test "layer merge down: undo/redo restores below-layer pixels and re-inserts removed layer atomically" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 2, 2); // 4px layer
+    defer c.deinit();
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    @memset(c.layerPixels(0), RED);
+    _ = try c.addLayer(gpa); // layer1 = top（結合で消える側）
+    c.layerPixels(1)[0] = 0xFF0000FF; // 不透明青（BGRA）
+    c.layers.items[1].opacity = 200;
+    c.selected_layer = 1;
+
+    // 合成前後のスナップショット（ブレンド自体は doMergeDown 側の責務。ここでは
+    // UndoStack.applyBefore/After が「渡された before/after をそのまま適用する」機械的な
+    // 挙動だけを検証するため、合成結果は決め打ちの値を使う）。
+    const below_before = try gpa.dupe(u32, c.layerPixels(0));
+    const below_after = try gpa.dupe(u32, &[_]u32{ BLACK, RED, RED, RED });
+    @memcpy(c.layerPixels(0), below_after);
+
+    const selected_before = c.selected_layer;
+    const removed = c.deleteLayer(1) orelse return error.TestUnexpectedNull;
+    undo_stack.push(gpa, .{ .op = .{ .layer_merge_down = .{
+        .index = 1,
+        .selected_before = selected_before,
+        .selected_after = c.selected_layer,
+        .layer = removed,
+        .below_before = below_before,
+        .below_after = below_after,
+    } } });
+    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
+
+    // Undo 1 回で「削除されたレイヤーの復元」+「下位レイヤーの合成前ピクセル復元」の両方が
+    // 同時に起きる（2 push には分割しない = 履歴分岐しても中間状態が残らないことの実証）。
+    undo_stack.undoOne(gpa, &.{&c});
+    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ RED, RED, RED, RED }, c.layerPixels(0));
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), c.layerPixels(1)[0]);
+    try std.testing.expectEqual(@as(u8, 200), c.layers.items[1].opacity);
+    try std.testing.expect(undo_stack.redo.items[0].op.layer_merge_down.layer == null);
+
+    // Redo 1 回で結合後の状態（下位=合成後ピクセル、上位レイヤーは再度削除）に戻る。
+    undo_stack.redoOne(gpa, &.{&c});
+    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ BLACK, RED, RED, RED }, c.layerPixels(0));
+    try std.testing.expect(undo_stack.undo.items[0].op.layer_merge_down.layer != null);
 }
 
 test "layer reorder visible opacity: undo/redo restores structure and metadata" {
