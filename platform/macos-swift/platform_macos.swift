@@ -828,6 +828,23 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags)
             handle.event_queue.push(platform_event)
 
+            // keyDown は確定文字 (TASK-22) を CHAR_INPUT として流す。印字可能のみ（制御文字 <0x20 /
+            // DELETE 0x7f、AppKit function-key private-use 域 0xF700-0xF8FF を除外）。Swift の
+            // unicodeScalars は UTF-32 スカラーを直接返す（surrogate 手動結合は不要）。
+            if event.type == .keyDown, let chars = event.characters {
+                let char_mods = extractModifiers(event.modifierFlags)
+                for scalar in chars.unicodeScalars {
+                    let cp = scalar.value
+                    if cp >= 0x20 && cp != 0x7f && !(cp >= 0xF700 && cp <= 0xF8FF) {
+                        var char_event = PlatformEvent()
+                        char_event.type = PLATFORM_EVENT_CHAR_INPUT
+                        char_event.payload.character.codepoint = cp
+                        char_event.payload.character.modifiers = char_mods
+                        handle.event_queue.push(char_event)
+                    }
+                }
+            }
+
             // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
             continue
         }

@@ -749,9 +749,42 @@ fn handleInject(it: *Tok) void {
         const dy = parseF32(it.next()) orelse return warnLine("inject scroll: 量不正");
         const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
         queue(Event{ .mouse_scroll = .{ .x = mouse_x, .y = mouse_y, .dx = dx, .dy = dy, .is_precise = false, .buttons = mouse_buttons, .modifiers = mods } });
+    } else if (std.mem.eql(u8, kind, "char")) {
+        // 確定テキスト文字を注入（TASK-22）。arg は「単一文字リテラル」か「0x/U+ 始まりの16進 codepoint」。
+        // 単一数字（例 5）は文字 '5'(=53) 扱い＝制御文字との曖昧回避（decimal codepoint は非対応）。
+        const arg = it.next() orelse return warnLine("inject char: 引数不足");
+        const cp = parseCodepoint(arg) orelse return warnLine("inject char: codepoint/文字 不正");
+        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
     } else {
         warnLine("inject: 不明な種別");
     }
+}
+
+/// `inject char` の引数を UTF-32 codepoint へ。0x.. / U+.. は16進、それ以外は単一 UTF-8 文字として
+/// その codepoint を返す（2文字以上・不正 UTF-8 は null）。decimal は非対応（単一数字を文字扱いにするため）。
+fn parseCodepoint(tok: []const u8) ?u32 {
+    if (tok.len == 0) return null;
+    const hex: ?[]const u8 = if (std.mem.startsWith(u8, tok, "0x") or std.mem.startsWith(u8, tok, "0X"))
+        tok[2..]
+    else if (std.mem.startsWith(u8, tok, "U+") or std.mem.startsWith(u8, tok, "u+"))
+        tok[2..]
+    else
+        null;
+    const cp: u32 = if (hex) |h| blk: {
+        if (h.len == 0) return null;
+        break :blk std.fmt.parseInt(u32, h, 16) catch return null;
+    } else blk: {
+        // 単一 UTF-8 文字（token 全体がちょうど1 codepoint のときだけ採用）。
+        const seq_len = std.unicode.utf8ByteSequenceLength(tok[0]) catch return null;
+        if (seq_len != tok.len) return null;
+        break :blk std.unicode.utf8Decode(tok) catch return null;
+    };
+    // native backend が実際に出す「印字可能な Unicode スカラー値」に限定する（codex 指摘）:
+    // surrogate(0xD800-0xDFFF)・範囲外(>0x10FFFF)・制御文字(<0x20 / 0x7f) は replay で作れないよう拒否。
+    if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return null;
+    if (cp < 0x20 or cp == 0x7f) return null;
+    return cp;
 }
 
 fn handleSnapshot(it: *Tok) void {

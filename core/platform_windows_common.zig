@@ -80,6 +80,7 @@ const WM_SIZE: UINT = 0x0005; // client area リサイズ（TASK-23）
 const SIZE_MINIMIZED: WPARAM = 1; // WM_SIZE wparam（最小化は無視）
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
+const WM_CHAR: UINT = 0x0102; // 確定文字 (TASK-22。TranslateMessage が WM_KEYDOWN から生成)
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_SYSKEYUP: UINT = 0x0105;
 const WM_KILLFOCUS: UINT = 0x0008; // フォーカス喪失 → 押下中ボタンを解放（取り逃し防止）
@@ -444,6 +445,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             if (msg == WM_SYSKEYUP) return DefWindowProcW(hwnd, msg, wparam, lparam);
             return 0;
         },
+        WM_CHAR => {
+            handleChar(core, wparam);
+            return 0;
+        },
         WM_MOUSEMOVE => {
             handleMotion(core, lparam);
             return 0;
@@ -522,6 +527,17 @@ fn handleKeyDown(core: *Core, wparam: WPARAM, lparam: LPARAM) void {
         .is_repeat = (lp & KF_REPEAT_BIT) != 0,
         .modifiers = modifiersNow(),
     } });
+}
+
+/// WM_CHAR の確定文字 (TASK-22)。wParam は UTF-16 コードユニット。BMP（英数含む）は単一 WM_CHAR。
+/// astral 面（絵文字等）はサロゲートペアで2回来るが、英数 MVP では surrogate を skip する
+/// （BMP のみ char_input を流す。astral 対応は将来 = Core に high-surrogate を latch する拡張）。
+fn handleChar(core: *Core, wparam: WPARAM) void {
+    const u: u32 = @intCast(wparam & 0xFFFF);
+    if (u >= 0xD800 and u <= 0xDFFF) return; // surrogate は skip（BMP のみ）
+    if (input.isTextCodepoint(u)) {
+        core.enqueue(.{ .char_input = .{ .codepoint = u, .modifiers = modifiersNow() } });
+    }
 }
 
 fn handleKeyUp(core: *Core, wparam: WPARAM, lparam: LPARAM) void {

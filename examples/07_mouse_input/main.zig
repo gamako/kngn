@@ -174,6 +174,7 @@ pub fn main() !void {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
             .key_up => {},
+            .char_input => {},
             .mouse_move => |m| {
                 const canvas = windowToCanvas(.{ .x = m.x, .y = m.y });
                 if (m.buttons.left) {

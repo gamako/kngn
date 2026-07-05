@@ -370,11 +370,26 @@ fn handleKeyPress(st: *State, e: *c.XKeyEvent) void {
     // 「直前に既に down だったか」がそのまま is_repeat になる（非対応時の repeat は handleKeyRelease の fallback が直接生成）。
     const was_down = st.keys.isDown(keycode);
     st.keys.setDown(keycode, true); // 修飾 post-state 算出は反映後に行う
+    const mods = input.keyEventModifiers(@intCast(e.state), &st.keys, keycode);
     st.enqueue(.{ .key_down = .{
         .key = input.keycodeToKeyCode(keycode),
         .is_repeat = was_down,
-        .modifiers = input.keyEventModifiers(@intCast(e.state), &st.keys, keycode),
+        .modifiers = mods,
     } });
+    // 確定文字 (TASK-22): XLookupString で確定文字を取り char_input を流す。英数 MVP は Latin-1 で十分
+    // （UTF-8/CJK は XIM/Xutf8LookupString が要る=将来スコープ）。key_down 経路は上で不変。
+    var cbuf: [8]u8 = undefined;
+    var keysym: c.KeySym = undefined;
+    const n = c.XLookupString(e, &cbuf, cbuf.len, &keysym, null);
+    if (n > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(n))) : (i += 1) {
+            const cp: u32 = cbuf[i]; // Latin-1 codepoint
+            if (input.isTextCodepoint(cp)) {
+                st.enqueue(.{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
+            }
+        }
+    }
 }
 
 fn handleKeyRelease(st: *State, dpy: *c.Display, e: *c.XKeyEvent) void {
@@ -389,11 +404,26 @@ fn handleKeyRelease(st: *State, dpy: *c.Display, e: *c.XKeyEvent) void {
         if (next.type == c.KeyPress and next.xkey.keycode == e.keycode and next.xkey.time == e.time) {
             _ = c.XNextEvent(dpy, &next); // peek した KeyPress を実消費
             // keys は down のまま（離していない）。
+            const rmods = input.keyEventModifiers(@intCast(next.xkey.state), &st.keys, keycode);
             st.enqueue(.{ .key_down = .{
                 .key = input.keycodeToKeyCode(keycode),
                 .is_repeat = true,
-                .modifiers = input.keyEventModifiers(@intCast(next.xkey.state), &st.keys, keycode),
+                .modifiers = rmods,
             } });
+            // repeat 中も char_input を出す（押しっぱなしのテキスト入力。codex 指摘 #4）。消費した
+            // KeyPress を XLookupString（Ctrl+A 等は制御文字化されて isTextCodepoint で自然に除外される）。
+            var cbuf: [8]u8 = undefined;
+            var ksym: c.KeySym = undefined;
+            const rn = c.XLookupString(&next.xkey, &cbuf, cbuf.len, &ksym, null);
+            if (rn > 0) {
+                var i: usize = 0;
+                while (i < @as(usize, @intCast(rn))) : (i += 1) {
+                    const cp: u32 = cbuf[i];
+                    if (input.isTextCodepoint(cp)) {
+                        st.enqueue(.{ .char_input = .{ .codepoint = cp, .modifiers = rmods } });
+                    }
+                }
+            }
             return;
         }
     }

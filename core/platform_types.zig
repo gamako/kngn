@@ -211,6 +211,15 @@ pub const KeyEvent = struct {
     modifiers: ModifierFlags,
 };
 
+/// テキスト入力イベント（TASK-22）。key_down（物理キー）と独立した「確定文字」の通知。
+/// codepoint は UTF-32（Unicode スカラー値）。IME/変換・marked text は今回スコープ外
+/// （英数の確定文字前提。将来 IME は TASK-79.6）。制御文字（0x20 未満・DELETE 0x7f）は
+/// backend 側で除外して印字可能文字のみ流す。
+pub const CharEvent = struct {
+    codepoint: u32,
+    modifiers: ModifierFlags,
+};
+
 /// マウスイベント。座標は window 座標 (window contentRect 左上原点・logical 単位)。
 /// framebuffer / canvas への変換は caller の責任。
 pub const MouseEvent = struct {
@@ -236,6 +245,7 @@ pub const Event = union(enum) {
     quit,
     key_down: KeyEvent,
     key_up: KeyEvent,
+    char_input: CharEvent, // 確定テキスト文字（TASK-22。key_down と独立）
     mouse_move: MouseEvent,
     mouse_down: MouseEvent,
     mouse_up: MouseEvent,

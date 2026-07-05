@@ -142,6 +142,7 @@ typedef enum {
     PLATFORM_EVENT_MOUSE_DOWN,
     PLATFORM_EVENT_MOUSE_UP,
     PLATFORM_EVENT_MOUSE_SCROLL,
+    PLATFORM_EVENT_CHAR_INPUT,   // 確定テキスト文字 (TASK-22。末尾追加=後方互換)
 } PlatformEventType;
 
 // マウスボタン (物理ボタン基準: NSEvent.buttonNumber と一致)
@@ -313,6 +314,10 @@ typedef struct PlatformEvent {
             uint8_t buttons_mask;         // post-state
             uint32_t modifiers;
         } scroll;
+        struct {
+            uint32_t codepoint;           // 確定文字の Unicode スカラー値 (UTF-32)。TASK-22
+            uint32_t modifiers;
+        } character;
     } payload;
 } PlatformEvent;
 

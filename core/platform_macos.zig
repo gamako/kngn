@@ -20,6 +20,7 @@ const ModifierFlags = types.ModifierFlags;
 const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
 const KeyEvent = types.KeyEvent;
+const CharEvent = types.CharEvent;
 const MouseEvent = types.MouseEvent;
 const ScrollEvent = types.ScrollEvent;
 const Event = types.Event;
@@ -83,6 +84,13 @@ inline fn makeScrollEvent(ev: c.PlatformEvent) ScrollEvent {
     };
 }
 
+inline fn makeCharEvent(ev: c.PlatformEvent) CharEvent {
+    return .{
+        .codepoint = ev.payload.character.codepoint,
+        .modifiers = ModifierFlags.fromC(ev.payload.character.modifiers),
+    };
+}
+
 // ============================================================================
 // Window / Framebuffer
 // ============================================================================
@@ -121,6 +129,7 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_MOUSE_DOWN => Event{ .mouse_down = makeMouseEvent(ev) },
                 c.PLATFORM_EVENT_MOUSE_UP => Event{ .mouse_up = makeMouseEvent(ev) },
                 c.PLATFORM_EVENT_MOUSE_SCROLL => Event{ .mouse_scroll = makeScrollEvent(ev) },
+                c.PLATFORM_EVENT_CHAR_INPUT => Event{ .char_input = makeCharEvent(ev) },
                 else => continue,
             };
         }

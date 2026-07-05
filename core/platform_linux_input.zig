@@ -205,6 +205,29 @@ pub fn overrideModifierBit(base: ModifierFlags, keys: *const KeyDownSet, keycode
 }
 
 // ============================================================================
+// char_input codepoint フィルタ（TASK-22）
+// ============================================================================
+
+/// char_input として流すべき「確定印字文字」か判定する（x11 XLookupString / wayland
+/// xkb_state_key_get_utf32 の戻り codepoint に共通適用）。制御文字（0x20 未満）・DELETE(0x7f)・
+/// 変換不能(0=文字を持たないキー) を除外する。IME/marked text は今回スコープ外（英数の確定文字前提）。
+pub fn isTextCodepoint(cp: u32) bool {
+    return cp >= 0x20 and cp != 0x7f;
+}
+
+test "isTextCodepoint: 印字可能のみ通す" {
+    try std.testing.expect(!isTextCodepoint(0)); // 文字なしキー
+    try std.testing.expect(!isTextCodepoint(0x08)); // BS
+    try std.testing.expect(!isTextCodepoint(0x0d)); // Enter
+    try std.testing.expect(!isTextCodepoint(0x1b)); // ESC
+    try std.testing.expect(!isTextCodepoint(0x7f)); // DELETE
+    try std.testing.expect(isTextCodepoint(0x20)); // Space
+    try std.testing.expect(isTextCodepoint('A'));
+    try std.testing.expect(isTextCodepoint('5'));
+    try std.testing.expect(isTextCodepoint(0x3042)); // あ
+}
+
+// ============================================================================
 // mouse button / wheel
 // ============================================================================
 

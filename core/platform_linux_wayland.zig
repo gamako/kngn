@@ -530,6 +530,18 @@ fn kbKey(data: ?*anyopaque, kbd: ?*c.struct_wl_keyboard, serial: u32, time: u32,
         // 修飾キー自身の event は xkb modifiers(別 event)と順序がずれ得るため、KeyDownSet で post-state 補正（X11 と同じ）。
         const mods = input.overrideModifierBit(st.modifiers, &st.keys, x_keycode);
         st.queue.enqueue(.{ .key_down = .{ .key = kc, .is_repeat = was_down, .modifiers = mods } });
+        // 確定文字 (TASK-22): xkb_state_key_get_utf32 で現在の modifier を反映した確定 codepoint を取り
+        // char_input を流す（0=文字なしキー / 制御文字は isTextCodepoint で除外）。key_down 経路は不変。
+        // Ctrl/Alt/Cmd 付きはショートカット扱いで抑止する（xkb は修飾付きでも文字を返すため明示除外。
+        // 他 backend は制御文字化/未生成で自然に除外される。shift は許容=大文字。codex 指摘）。
+        if (st.xkb_state) |xs| {
+            if (!mods.ctrl and !mods.alt and !mods.cmd) {
+                const cp = c.xkb_state_key_get_utf32(xs, x_keycode);
+                if (input.isTextCodepoint(cp)) {
+                    st.queue.enqueue(.{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
+                }
+            }
+        }
         // repeat 対象か（modifier 等は対象外）を xkbcommon に判定させ、対象のみ repeat 開始。
         if (st.xkb_keymap) |km| {
             if (c.xkb_keymap_key_repeats(km, x_keycode) != 0) st.repeat.onKeyDown(x_keycode, common.getTime());
@@ -1139,6 +1151,16 @@ pub const Window = struct {
                     .is_repeat = true,
                     .modifiers = st.modifiers,
                 } });
+                // repeat 中も char_input を出す（押しっぱなしのテキスト入力。codex 指摘 #4）。
+                // kbKey の初回発火と同じ抑止条件（Ctrl/Alt/Cmd 除外 + isTextCodepoint）。
+                if (st.xkb_state) |xs| {
+                    if (!st.modifiers.ctrl and !st.modifiers.alt and !st.modifiers.cmd) {
+                        const cp = c.xkb_state_key_get_utf32(xs, xk);
+                        if (input.isTextCodepoint(cp)) {
+                            st.queue.enqueue(.{ .char_input = .{ .codepoint = cp, .modifiers = st.modifiers } });
+                        }
+                    }
+                }
                 st.repeat.advance(now);
             }
         }

@@ -913,6 +913,34 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                 platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags);
                 queue_push(&platformWindow->event_queue, &platform_event);
 
+                // keyDown は確定文字 (TASK-22) を CHAR_INPUT として key_down とは別に流す。
+                // 印字可能文字のみ（制御文字 <0x20 と DELETE 0x7f、AppKit の function-key private-use
+                // 域 0xF700-0xF8FF=矢印/F キー等を除外）。サロゲートペアは UTF-32 に結合する。
+                if (event.type == NSEventTypeKeyDown) {
+                    NSString* chars = event.characters;
+                    NSUInteger clen = chars.length;
+                    uint32_t char_mods = extractModifiers(event.modifierFlags);
+                    for (NSUInteger ci = 0; ci < clen;) {
+                        unichar hi = [chars characterAtIndex:ci];
+                        uint32_t cp;
+                        if (CFStringIsSurrogateHighCharacter(hi) && ci + 1 < clen) {
+                            unichar lo = [chars characterAtIndex:ci + 1];
+                            cp = CFStringGetLongCharacterForSurrogatePair(hi, lo);
+                            ci += 2;
+                        } else {
+                            cp = hi;
+                            ci += 1;
+                        }
+                        if (cp >= 0x20 && cp != 0x7f && !(cp >= 0xF700 && cp <= 0xF8FF)) {
+                            PlatformEvent char_event;
+                            char_event.type = PLATFORM_EVENT_CHAR_INPUT;
+                            char_event.payload.character.codepoint = cp;
+                            char_event.payload.character.modifiers = char_mods;
+                            queue_push(&platformWindow->event_queue, &char_event);
+                        }
+                    }
+                }
+
                 // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
                 continue;
             }

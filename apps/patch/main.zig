@@ -1452,6 +1452,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 },
                 .key_up => {},
+                .char_input => {},
                 .mouse_move => |m| {
                     app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                     onMouseMove(&app);

@@ -240,10 +240,26 @@ pub fn wheelDelta(delta: i32, horizontal: bool) WheelDelta {
         .{ .dx = 0, .dy = mag }; // WM_MOUSEWHEEL 正=up → 上は正
 }
 
+/// char_input として流すべき「確定印字文字」か（WM_CHAR の codepoint に適用。TASK-22）。
+/// 制御文字（0x20 未満）・DELETE(0x7f) を除外。linux 側 platform_linux_input.isTextCodepoint と同契約。
+pub fn isTextCodepoint(cp: u32) bool {
+    return cp >= 0x20 and cp != 0x7f;
+}
+
 // ============================================================================
 // tests（任意 host で回る。Win32 不要）
 // ============================================================================
 const testing = std.testing;
+
+test "isTextCodepoint: 印字可能のみ通す" {
+    try testing.expect(!isTextCodepoint(0x08)); // BS
+    try testing.expect(!isTextCodepoint(0x0d)); // Enter
+    try testing.expect(!isTextCodepoint(0x1b)); // ESC
+    try testing.expect(!isTextCodepoint(0x7f)); // DELETE
+    try testing.expect(isTextCodepoint(0x20)); // Space
+    try testing.expect(isTextCodepoint('A'));
+    try testing.expect(isTextCodepoint('5'));
+}
 
 test "scancodeToKeyCode: 物理キー（set1 make code・layout 非依存）" {
     // 上段/中段/下段の物理位置（US でも JIS でも同 scancode）
