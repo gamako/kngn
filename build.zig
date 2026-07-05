@@ -636,6 +636,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_palette_test = b.addRunArtifact(palette_test);
 
+    // pixie action の純パーサ（TASK-64）。std のみ・App/kit 非依存で import 不要。
+    const actions_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/apps/pixie/actions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_actions_test = b.addRunArtifact(actions_test);
+
     const test_core_step = b.step("test-core", "Run editor/core (undo + tool) and pixie input tests");
     test_core_step.dependOn(&run_core_undo_test.step);
     test_core_step.dependOn(&run_core_tool_test.step);
@@ -651,6 +661,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
+    test_core_step.dependOn(&run_actions_test.step);
 
     // ========================================
     // PNG デコーダー format.zig テスト

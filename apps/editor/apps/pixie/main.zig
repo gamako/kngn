@@ -18,6 +18,7 @@ const gui = kit.gui;
 const core = @import("paint");
 const png = kit.png;
 const canvas_input = @import("canvas_input.zig");
+const actions = @import("actions.zig");
 const blit = @import("blit.zig");
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
@@ -325,6 +326,18 @@ const App = struct {
         self.fill.color = c; // Fill の塗り色もパレット編集色に追従
     }
 
+    /// 指定色を直接パレット選択色へ設定する（action `set_color` 用）。HSV ウィジェットを経由しない
+    /// 直接代入のため `edit_synced_for = null` で次フレームの `syncEditHsv` に再同期を強制する
+    /// （無いと HSV スライダーに触れた瞬間に古い HSV から色が巻き戻る）。`applyEditColor` 同様
+    /// guard 無し（色選択は既存 UI でも editingBlocked に関わらず常に効く）。
+    fn doSetColorHex(self: *App, color: u32) void {
+        self.palette.setSelectedColor(color);
+        self.pen.color = color;
+        self.brush.color = color;
+        self.fill.color = color;
+        self.edit_synced_for = null;
+    }
+
     /// 選択（or load）が変わったフレームに編集中 HSV を現在色から再同期する。
     fn syncEditHsv(self: *App) void {
         if (self.edit_synced_for == self.palette.selected) return;
@@ -386,16 +399,22 @@ const App = struct {
         self.setSaveMsg("Palette loaded: {s}", .{std.fs.path.basename(path)});
     }
 
+    /// 指定パスへ直接保存する（ダイアログ不使用。`doSave` の共通実装 + action `save <path>` 用）。
+    /// current_path は更新しない（headless 呼び出しが UI の「名前を付けて保存」の永続状態へ
+    /// 暗黙に介入しないため）。editingBlocked チェックは無い（既存 doSave/doSaveAs に無いのでそのまま）。
+    fn doSaveTo(self: *App, path: []const u8) !void {
+        const flat = self.canvas.compositeStraight();
+        try core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa);
+        self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
+    }
+
     /// 記憶している保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
     fn doSave(self: *App) void {
         const path = self.current_path orelse return self.doSaveAs();
-        const flat = self.canvas.compositeStraight();
-        core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
-            // current_path は永続パスなので失敗しても保持（free しない）
+        // current_path は永続パスなので失敗しても保持（free しない）
+        self.doSaveTo(path) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
-            return;
         };
-        self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
     }
 
     /// ダイアログで保存先を選んで保存。成功時にダイアログ戻り値を current_path へ移譲する。
@@ -421,19 +440,18 @@ const App = struct {
 
     /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
     /// 進行中 stroke 中は破棄。undo/redo はクリアし、current_path を開いたファイルに更新。
-    fn doOpen(self: *App) void {
-        if (self.input.capturing or self.bezier_editor.isEditing()) return;
-        const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "png" }) catch |err| {
-            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
-            return;
-        };
-        const path = maybe orelse return; // キャンセル: サイレント no-op
-        var img = png.decodePNGFile(self.io, self.gpa, path) catch |err| {
-            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
-            self.gpa.free(path);
-            return;
-        };
+    /// 指定パスから直接読み込む（ダイアログ不使用。`doOpen` の共通実装 + action `open <path>` 用）。
+    /// `doOpen` と同じ narrow guard（`input.capturing or bezier_editor.isEditing()`。`sel_in.state`
+    /// は見ない＝既存 doOpen の挙動をそのまま踏襲）。path は `gpa.dupe` して current_path へ独立
+    /// 所有コピーとして格納する（呼び出し側の path 所有権には関与しない）。
+    fn doOpenPath(self: *App, path: []const u8) !void {
+        if (self.input.capturing or self.bezier_editor.isEditing()) return error.EditingBlocked;
+        var img = try png.decodePNGFile(self.io, self.gpa, path);
         defer img.deinit(self.gpa);
+        // current_path 用の独立コピーを、ドキュメントを差し替える**前**に確保する（後段はすべて
+        // infallible なので、ここで OOM を弾いておけば「読み込み済みだが失敗扱い」という中途半端な
+        // 状態を作らない）。
+        const owned = try self.gpa.dupe(u8, path);
 
         // PNG はフラット形式として読み込み、layer0 だけの新規ドキュメントへ置き換える。
         self.resetCanvasToSingleLayer();
@@ -455,8 +473,22 @@ const App = struct {
         self.undo = .{};
 
         if (self.current_path) |old| self.gpa.free(old);
-        self.current_path = path; // 移譲
+        self.current_path = owned;
         self.setSaveMsg("Loaded: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
+    fn doOpen(self: *App) void {
+        if (self.input.capturing or self.bezier_editor.isEditing()) return;
+        const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "png" }) catch |err| {
+            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return; // キャンセル: サイレント no-op
+        defer self.gpa.free(path);
+        self.doOpenPath(path) catch |err| {
+            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
+        };
     }
 
     // ── .pix プロジェクト保存/読込（レイヤー構造保持。TASK-63）─────────────────
@@ -522,19 +554,23 @@ const App = struct {
         self.setSaveMsg("Project loaded: {s}", .{std.fs.path.basename(path)});
     }
 
-    /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）
-    fn doUndo(self: *App) void {
-        if (self.editingBlocked()) return;
+    /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）。`!void` 化（TASK-64）は UI
+    /// （`catch {}` で無視）と action（`try` で伝播）が同じ判定コードを共有するための変更で、
+    /// 挙動そのものは変わらない（action ⇄ UndoCmd 対応表は下部「custom action」セクションの
+    /// doc comment 参照）。undo/redo スタックが空の場合は失敗にせず冪等 no-op として成功する
+    /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
+    fn doUndo(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
         self.undo.undoOne(self.gpa, self.doc.frames.items);
     }
 
-    fn doRedo(self: *App) void {
-        if (self.editingBlocked()) return;
+    fn doRedo(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
         self.undo.redoOne(self.gpa, self.doc.frames.items);
     }
 
-    fn doClear(self: *App) void {
-        if (self.editingBlocked()) return;
+    fn doClear(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
         self.undo.pushClear(self.gpa, self.canvas, self.doc.selected_frame, self.canvas.selected_layer);
     }
 
@@ -573,12 +609,12 @@ const App = struct {
         self.canvas.setSelection(core.selection.clipRect(dest, self.canvas.width, self.canvas.height));
     }
 
-    fn doAddLayer(self: *App) void {
-        if (self.editingBlocked()) return;
+    fn doAddLayer(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
         const selected_before = self.canvas.selected_layer;
         const idx = self.canvas.addLayer(self.gpa) catch |err| {
             self.setSaveMsg("Layer add failed: {s}", .{@errorName(err)});
-            return;
+            return err;
         };
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
             .index = idx,
@@ -587,11 +623,11 @@ const App = struct {
         } } });
     }
 
-    fn doDeleteLayer(self: *App) void {
-        if (self.editingBlocked()) return;
+    fn doDeleteLayer(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
         const idx = self.canvas.selected_layer;
         const selected_before = self.canvas.selected_layer;
-        const removed = self.canvas.deleteLayer(idx) orelse return;
+        const removed = self.canvas.deleteLayer(idx) orelse return error.LastLayer;
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_delete = .{
             .index = idx,
             .selected_before = selected_before,
@@ -600,15 +636,15 @@ const App = struct {
         } } });
     }
 
-    fn doMoveLayer(self: *App, delta: i32) void {
-        if (self.editingBlocked()) return;
+    fn doMoveLayer(self: *App, delta: i32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
         const from = self.canvas.selected_layer;
         const to_i: i32 = @as(i32, @intCast(from)) + delta;
-        if (to_i < 0) return;
+        if (to_i < 0) return error.OutOfRange;
         const to: usize = @intCast(to_i);
-        if (to >= self.canvas.layers.items.len or to == from) return;
+        if (to >= self.canvas.layers.items.len or to == from) return error.OutOfRange;
         const selected_before = self.canvas.selected_layer;
-        if (!self.canvas.moveLayer(from, to)) return;
+        if (!self.canvas.moveLayer(from, to)) return error.OutOfRange;
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_reorder = .{
             .from = from,
             .to = to,
@@ -617,25 +653,38 @@ const App = struct {
         } } });
     }
 
-    fn doToggleLayerVisible(self: *App, idx: usize) void {
-        if (self.editingBlocked() or idx >= self.canvas.layers.items.len) return;
+    /// レイヤー可視性を明示値へ設定する（`doToggleLayerVisible` の共通実装。TASK-64 で action
+    /// `set_layer_visible` からも直接呼べるよう抽出）。`before == on` は冪等 no-op として黙って
+    /// 成功する（`doSetLayerOpacity` と同じ扱い＝既存 UI のスライダー挙動を踏襲）。
+    fn doSetLayerVisible(self: *App, idx: usize, on: bool) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
         const before = self.canvas.layers.items[idx].visible;
-        const after = !before;
-        _ = self.canvas.setLayerVisible(idx, after);
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_visible = .{ .index = idx, .before = before, .after = after } } });
+        if (before == on) return;
+        _ = self.canvas.setLayerVisible(idx, on);
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_visible = .{ .index = idx, .before = before, .after = on } } });
     }
 
-    fn doSetLayerOpacity(self: *App, idx: usize, value: u8) void {
-        if (self.editingBlocked() or idx >= self.canvas.layers.items.len) return;
+    /// UI のトグルボタン用（現在値の反転）。範囲外は既存どおり黙って無視（idx 境界は `doSetLayerVisible`
+    /// 呼び出し前に確認する必要がある＝ `!before` 読み出しの OOB を避けるため）。
+    fn doToggleLayerVisible(self: *App, idx: usize) void {
+        if (idx >= self.canvas.layers.items.len) return;
+        const before = self.canvas.layers.items[idx].visible;
+        self.doSetLayerVisible(idx, !before) catch {};
+    }
+
+    fn doSetLayerOpacity(self: *App, idx: usize, value: u8) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
         const before = self.canvas.layers.items[idx].opacity;
         if (before == value) return;
         _ = self.canvas.setLayerOpacity(idx, value);
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_opacity = .{ .index = idx, .before = before, .after = value } } });
     }
 
-    fn doSelectLayer(self: *App, idx: usize) void {
-        if (self.editingBlocked()) return;
-        _ = self.canvas.selectLayer(idx);
+    fn doSelectLayer(self: *App, idx: usize) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (!self.canvas.selectLayer(idx)) return error.OutOfRange;
     }
 
     fn resetCanvasToSingleLayer(self: *App) void {
@@ -714,9 +763,9 @@ const App = struct {
         } else if (k.key == .O and accel) {
             self.pending_file_op = .open;
         } else if (k.key == .Z and accel and k.modifiers.shift) {
-            self.doRedo();
+            self.doRedo() catch {};
         } else if (k.key == .Z and accel) {
-            self.doUndo();
+            self.doUndo() catch {};
         } else if (k.key == .C and accel) {
             self.doCopy(); // accel+C は copy（bare C の clear より前に判定）
         } else if (k.key == .X and accel) {
@@ -734,7 +783,7 @@ const App = struct {
         } else if (k.key == .G) {
             self.setActiveKind(.fill);
         } else if (k.key == .C) {
-            self.doClear();
+            self.doClear() catch {};
         } else if (k.key == .@"0") {
             self.zoomTo(1); // 100% (1x)
             self.pan_x = 0;
@@ -860,6 +909,192 @@ fn cursorDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     var buf: [128]u8 = undefined;
     return allocator.dupe(u8, cursorDigest(ctx, &buf));
+}
+
+// ============================================================================
+// ヘッドレス検証 harness の custom action（TASK-64。TASK-62.1 の registerAction を pixie が採用）
+//
+// `platform.registerAction` で opt-in 登録する。probe（read）と対称の write/operate 口。
+// 全 action は既存の UI/キーボードと同じ `App.do*` メソッドを呼ぶだけ（入口の一本化＝
+// undo単位=action単位。UI/キーボード/action の3経路が同じ判定コード＝ do* 内のガードを通る）。
+// パーサは `actions.zig`（std のみ・App/kit/platform 非依存）に切り出し単体テストする。
+//
+// action ⇄ UndoCmd 対応表（push は「この action 呼び出しで undo.push が起きるか」。
+// 高々1回＝0 or 1。複数回 push する action は無い）:
+//
+//   action              → App メソッド          push  失敗時の error
+//   ------------------  ---------------------  ----  --------------------------------
+//   undo                doUndo                  no    EditingBlocked（空履歴は冪等成功）
+//   redo                doRedo                  no    EditingBlocked（空履歴は冪等成功）
+//   clear               doClear                 yes   EditingBlocked
+//   add_layer           doAddLayer              yes   EditingBlocked / allocator error
+//   delete_layer        doDeleteLayer           yes   EditingBlocked / LastLayer
+//   select_layer        doSelectLayer           no    EditingBlocked / OutOfRange
+//   set_layer_visible   doSetLayerVisible       yes*  EditingBlocked / OutOfRange
+//   set_layer_opacity   doSetLayerOpacity       yes*  EditingBlocked / OutOfRange
+//   move_layer          doMoveLayer             yes   EditingBlocked / OutOfRange
+//   set_color           doSetColorHex           no    （guard 無し。常に成功）
+//   set_tool            setActiveKind           no    （guard 無し。既存 UI と同じ「無反応」を許容）
+//   stroke              activeTool().onEvent 直接 yes  EditingBlocked / UnsupportedTool / parse系
+//   save                doSaveTo                no    savePNG の元 error
+//   open                doOpenPath              no    EditingBlocked / decode 系
+//
+//   * before==after の冪等呼び出しは push 無し（既存 UI のスライダー/チェックボックス挙動と同じ）。
+//
+// 非 push action（select_layer/set_color/set_tool/save/open/undo/redo 自体）が undo 対象外なのは
+// 新たな非一貫ではない: 既存 UI でも同じ操作（ツール切替キー・HSV スライダー・ファイル I/O）は
+// undo.push を呼ばない設計だった（`applyEditColor`/`setActiveKind`/`doSave` 参照）。本タスクの主眼は
+// 「UI が辿る undo 判定と全く同じコードを agent（action）からも辿れるようにする」ことで、UndoCmd
+// 自体の構造拡張（tool/color の履歴化等）はスコープ外（TASK-64 plan 参照）。
+//
+// 将来 TASK-65（他アプリへの action 横展開）/ network（TASK-62.3）への申し送り: action 呼び出し列
+// （name+args）がそのまま「ネットワークで流す操作ストリーム」の単位になる、という設計意図をここに
+// 残す。UndoCmd の pixel diff は各ノードでの決定的 re-apply の実装詳細であり、ネットワーク越しに
+// 流す粒度ではない。
+// ============================================================================
+
+fn actionApp(ctx: *anyopaque) *App {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doUndo();
+    return "ok";
+}
+
+fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doRedo();
+    return "ok";
+}
+
+fn actionClear(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doClear();
+    return "ok";
+}
+
+fn actionAddLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doAddLayer();
+    return "ok";
+}
+
+fn actionDeleteLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try actionApp(ctx).doDeleteLayer();
+    return "ok";
+}
+
+fn actionSelectLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const idx = try actions.parseUsize(args);
+    try actionApp(ctx).doSelectLayer(idx);
+    return "ok";
+}
+
+fn actionSetLayerVisible(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const p = try actions.parseIdxBool(args);
+    try actionApp(ctx).doSetLayerVisible(p.idx, p.on);
+    return "ok";
+}
+
+fn actionSetLayerOpacity(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const p = try actions.parseIdxU8(args);
+    try actionApp(ctx).doSetLayerOpacity(p.idx, p.value);
+    return "ok";
+}
+
+fn actionMoveLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const delta = try actions.parseMoveDelta(args);
+    try actionApp(ctx).doMoveLayer(delta);
+    return "ok";
+}
+
+fn actionSetColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const color = try actions.parseHexColor(args);
+    actionApp(ctx).doSetColorHex(color);
+    return "ok";
+}
+
+fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const trimmed = std.mem.trim(u8, args, " \t");
+    const kind = std.meta.stringToEnum(ToolKind, trimmed) orelse return error.UnknownTool;
+    actionApp(ctx).setActiveKind(kind);
+    return "ok";
+}
+
+/// canvas 座標の点列を down→move×N→up で直接駆動する（既存 canvas_input と同じ Tool 経路）。
+/// `active_kind==.bezier/.select` は `activeTool()` が到達しないフォールバック（pen）を返す実装の
+/// ため、意図しない Pen 描画を避けるべく明示的に弾く。
+fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    if (app.active_kind == .bezier or app.active_kind == .select) return error.UnsupportedTool;
+    if (app.editingBlocked()) return error.EditingBlocked;
+    var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
+    const pts = try actions.parseStrokePoints(args, &pts_buf);
+
+    const tool = app.activeTool();
+    _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .down = .{ .x = pts[0].x, .y = pts[0].y } });
+    var cmd: ?core.Op = null;
+    if (pts.len == 1) {
+        cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = pts[0].x, .y = pts[0].y } });
+    } else {
+        for (pts[1..], 0..) |p, i| {
+            if (i == pts.len - 2) {
+                cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = p.x, .y = p.y } });
+            } else {
+                _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .move = .{ .x = p.x, .y = p.y } });
+            }
+        }
+    }
+    if (cmd) |c| app.undo.push(app.gpa, .{ .frame = app.doc.selected_frame, .op = c });
+    return "ok";
+}
+
+fn actionSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const path = try actions.parsePath(args);
+    try actionApp(ctx).doSaveTo(path);
+    return "ok";
+}
+
+fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const path = try actions.parsePath(args);
+    try actionApp(ctx).doOpenPath(path);
+    return "ok";
+}
+
+/// 14 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+fn registerActions(app: *App) void {
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo });
+    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo });
+    platform.registerAction(.{ .name = "clear", .ctx = app, .run = actionClear });
+    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = actionAddLayer });
+    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = actionDeleteLayer });
+    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = actionSelectLayer });
+    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = actionSetLayerVisible });
+    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = actionSetLayerOpacity });
+    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = actionMoveLayer });
+    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = actionSetColor });
+    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = actionSetTool });
+    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = actionStroke });
+    platform.registerAction(.{ .name = "save", .ctx = app, .run = actionSave });
+    platform.registerAction(.{ .name = "open", .ctx = app, .run = actionOpen });
 }
 
 /// canvas_area rect 内に表示領域（CANVAS*zoom 四方）を配置した canvas rect を返す。
@@ -1057,10 +1292,10 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32) void {
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.label("Layers");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) app.doAddLayer();
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) app.doDeleteLayer();
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) app.doMoveLayer(1);
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) app.doMoveLayer(-1);
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) app.doAddLayer() catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) app.doDeleteLayer() catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) app.doMoveLayer(1) catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) app.doMoveLayer(-1) catch {};
     ctx.endBox();
 
     var rev = app.canvas.layers.items.len;
@@ -1080,7 +1315,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
 
         const name = try std.fmt.allocPrint(ctx.allocator(), "L{d}", .{idx});
         if (ctx.buttonId(layerWidgetId(idx, 0), name, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
-            app.doSelectLayer(idx);
+            app.doSelectLayer(idx) catch {};
         }
         const vis_label: []const u8 = if (layer.visible) "V" else "H";
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
@@ -1088,7 +1323,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         }
         var op_i32: i32 = layer.opacity;
         if (ctx.sliderI32Id(layerWidgetId(idx, 2), "O", &op_i32, .{ .min = 0, .max = 255, .track_w = 40 })) {
-            app.doSetLayerOpacity(idx, @intCast(std.math.clamp(op_i32, 0, 255)));
+            app.doSetLayerOpacity(idx, @intCast(std.math.clamp(op_i32, 0, 255))) catch {};
         }
         ctx.endBox(); // row
     }
@@ -1139,8 +1374,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // .pix プロジェクト（レイヤー保持）。PNG 保存とは別（TASK-63）。ラベルは "Pal" と対の短縮 "Prj"
     if (ctx.button("Prj Open")) app.pending_file_op = .open_project;
     if (ctx.button("Prj Save")) app.pending_file_op = .save_project;
-    if (ctx.button("Undo")) app.doUndo();
-    if (ctx.button("Redo")) app.doRedo();
+    if (ctx.button("Undo")) app.doUndo() catch {};
+    if (ctx.button("Redo")) app.doRedo() catch {};
     if (ctx.button("Pal Save")) app.pending_file_op = .save_palette;
     if (ctx.button("Pal Load")) app.pending_file_op = .load_palette;
     // ペイン表示トグル（TASK-42）
@@ -1398,6 +1633,8 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "undo", .ctx = &app, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
     platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
     platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
+    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
+    registerActions(&app);
 
     main_loop: while (app.running and window.pollEvents()) {
         // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。
