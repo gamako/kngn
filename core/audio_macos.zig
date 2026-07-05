@@ -635,9 +635,21 @@ pub const capture = struct {
             return error.NoDevice;
         }
 
+        // 3.5 ハードウェア入力フォーマット（element 1 の Input scope）を取得し、client 側の sample rate を
+        // これに合わせる。AUHAL input で client(output scope)の SR が実デバイス SR と異なると
+        // AudioUnitRender が毎回 -10863（kAudioUnitErr_CannotDoInCurrentContext）を返す（TASK-49.6 実機で
+        // 判明）。要求 sample_rate はヒントに留め、実効値は HW rate（effective.sample_rate に反映＝
+        // spectrogram の周波数軸も negotiated 値を使う）。channels は要求値のまま（AUHAL が downmix）。
+        var hw_asbd = std.mem.zeroes(c.AudioStreamBasicDescription);
+        var hw_size: u32 = @sizeOf(c.AudioStreamBasicDescription);
+        if (c.AudioUnitGetProperty(unit, c.kAudioUnitProperty_StreamFormat, c.kAudioUnitScope_Input, 1, &hw_asbd, &hw_size) != 0) {
+            return error.ConfigFailed;
+        }
+        const client_rate: f64 = if (hw_asbd.mSampleRate > 0) hw_asbd.mSampleRate else @floatFromInt(cfg.sample_rate);
+
         // 4. クライアント側フォーマット（Float32 interleaved）を入力 element の Output scope に設定
         const asbd = c.AudioStreamBasicDescription{
-            .mSampleRate = @floatFromInt(cfg.sample_rate),
+            .mSampleRate = client_rate,
             .mFormatID = c.kAudioFormatLinearPCM,
             .mFormatFlags = c.kAudioFormatFlagIsFloat | c.kAudioFormatFlagIsPacked,
             .mBytesPerPacket = cfg.channels * 4,

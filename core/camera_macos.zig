@@ -58,6 +58,12 @@ extern "c" fn CVPixelBufferGetHeight(pixel_buffer: objc.Id) usize;
 
 /// CoreVideo.framework が公開する `NSString * const kCVPixelBufferPixelFormatTypeKey` 定数。
 extern "c" const kCVPixelBufferPixelFormatTypeKey: objc.Id;
+/// 出力ピクセルバッファのサイズを要求する CoreVideo キー。videoSettings に指定すると AVFoundation が
+/// **フル画角をこのサイズへスケール**して配信する。未指定だと session preset の native 解像度
+/// （640x480 等）で配信され、`onFrame` の `copyBgraRows` が左上 `min(src, 要求)` だけコピー＝画角の
+/// 一部だけをクロップ表示してしまう（TASK-49.6 実機検証で判明。要求 320x240 に対し native をクロップ）。
+extern "c" const kCVPixelBufferWidthKey: objc.Id;
+extern "c" const kCVPixelBufferHeightKey: objc.Id;
 
 const kCVPixelBufferLock_ReadOnly: u64 = 0x0000_0001;
 /// 'BGRA' の FourCharCode（数値定数。NSString ではない）。
@@ -364,6 +370,11 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
     if (dict == null) return error.OpenFailed;
     const num = objc.msgSend(objc.Id, objc.getClass("NSNumber"), objc.sel("numberWithUnsignedInt:"), .{@as(u32, kCVPixelFormatType_32BGRA)});
     objc.msgSend(void, dict, objc.sel("setObject:forKey:"), .{ num, kCVPixelBufferPixelFormatTypeKey });
+    // 要求サイズを指定してフル画角をスケール配信させる（未指定だと native 解像度でクロップ。TASK-49.6）。
+    const wnum = objc.msgSend(objc.Id, objc.getClass("NSNumber"), objc.sel("numberWithUnsignedInt:"), .{cfg.width});
+    objc.msgSend(void, dict, objc.sel("setObject:forKey:"), .{ wnum, kCVPixelBufferWidthKey });
+    const hnum = objc.msgSend(objc.Id, objc.getClass("NSNumber"), objc.sel("numberWithUnsignedInt:"), .{cfg.height});
+    objc.msgSend(void, dict, objc.sel("setObject:forKey:"), .{ hnum, kCVPixelBufferHeightKey });
     objc.msgSend(void, output, objc.sel("setVideoSettings:"), .{dict});
     objc.msgSend(void, dict, objc.sel("release"), .{});
     objc.msgSend(void, output, objc.sel("setAlwaysDiscardsLateVideoFrames:"), .{true});
