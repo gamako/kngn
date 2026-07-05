@@ -293,7 +293,9 @@ fn appendU32(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
 }
 
 /// 合成 sbix テストデータ用の glyph record 記述。builder が offset 配列を自動計算する。
-const RecordSpec = union(enum) {
+/// **テスト専用**（TASK-26.3 で outline_font.zig の統合テストが合成 sbix バイト列生成に
+/// 再利用するため pub 昇格。本番コードから使わない）。
+pub const RecordSpec = union(enum) {
     /// bitmap 無し（off0==off1）。
     empty,
     png: Png,
@@ -306,7 +308,8 @@ const RecordSpec = union(enum) {
     const Raw = struct { x: i16 = 0, y: i16 = 0, kind: [4]u8, data: []const u8 = &.{} };
 };
 
-const StrikeSpec = struct {
+/// **テスト専用**（RecordSpec と同じく TASK-26.3 で pub 昇格）。
+pub const StrikeSpec = struct {
     ppem: u16,
     ppi: u16 = 72,
     /// 長さは num_glyphs と一致必須（各 gid の record を順に記述）。
@@ -314,10 +317,11 @@ const StrikeSpec = struct {
 };
 
 /// strikes から正しい sbix バイト列を組む（呼び出し側が free）。
+/// **テスト専用**（RecordSpec と同じく TASK-26.3 で pub 昇格。本番コードから使わない）。
 /// 単一 strike フィクスチャ（num_strikes==1）を使うテストは、strikeOffsets[0] が常に
 /// 絶対位置 8、strike 本体が常に絶対位置 12、glyphDataOffsets 配列が常に絶対位置 16 から
 /// 始まる（ヘッダ長が固定のため）ことを利用して、正常系バイト列を狙って上書きし境界テストを組む。
-fn buildSbix(alloc: std.mem.Allocator, num_glyphs: u16, strikes: []const StrikeSpec) ![]u8 {
+pub fn buildSbix(alloc: std.mem.Allocator, num_glyphs: u16, strikes: []const StrikeSpec) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
