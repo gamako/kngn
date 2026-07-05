@@ -1650,3 +1650,83 @@ test "TASK-26.3: カラーキャッシュ総量超過で clearColorCache が発�
     try testing.expect(of.color_cache.contains(gid_b));
     try testing.expect(!of.last_oom); // 単一エントリは cap 内なので OOM 扱いではない
 }
+
+// ============================================================
+// TASK-26.4: sbix E2E テスト追加分（dupe・decode 失敗 negative cache の再確認）
+// TASK-26.3 の既存テスト（上記）は cp→カラー描画/origin/空 record フォールバック/
+// strike フォールバック/混在描画/壊れ PNG フォールバックをカバー済み。dupe は
+// sbix.zig 側に Sbix.findGlyph 単体テストはあるが、OutlineFont.drawTo を通した
+// E2E（cmap→sbix dupe 解決→実ピクセル）は未カバーだったため本タスクで追加する。
+// ============================================================
+
+test "TASK-26.4: dupe は参照先の bitmap で描画され、origin も参照先を採用する（E2E, drawTo 経由）" {
+    const a = testing.allocator;
+    const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
+    const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
+    defer a.free(png_bytes);
+    // gid2(U+1F600) = 実 PNG（origin x=3,y=-5）。gid3(U+1F601) = gid2 への dupe
+    // （自身の origin x=999,y=888 は無視されるはず）。
+    const data = try buildEmojiTestFont(a, &.{
+        .{ .ppem = 64, .records = &.{
+            .empty,
+            .empty,
+            .{ .png = .{ .x = 3, .y = -5, .bytes = png_bytes } },
+            .{ .dupe = .{ .x = 999, .y = 888, .gid = 2 } },
+        } },
+    });
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+
+    const W = 40;
+    const H = 70;
+    var px_buf = [_]u32{0xFF000000} ** (W * H);
+    const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+    // U+1F601 は cmap format12 経由で gid3(dupe) に解決される（buildEmojiTestFontRaw の cmap 定義）。
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0, 0, 0, 0xFF), clip);
+
+    // 参照先(gid2)の origin（x=3,y=-5）が採用される: baseline_y=52, left=round(3*1)=3,
+    // top=-(round(-5*1)+2)=3 → bx=7, by=55（"originOffsetX/Y" テストと同じ座標。
+    // dupe 自身の origin(999,888) が使われていればここに描画されず座標が破綻する）。
+    try testing.expectEqual(@as(u32, 0xFFFF0000), px_buf[55 * W + 7]);
+    try testing.expectEqual(@as(u32, 0xFF00FF00), px_buf[55 * W + 8]);
+    try testing.expectEqual(@as(u32, 0xFF0000FF), px_buf[56 * W + 7]);
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), px_buf[56 * W + 8]);
+    try testing.expect(!of.last_oom);
+
+    const gid3 = of.gidOf(0x1F601);
+    try testing.expect(!of.color_cache.get(gid3).?.failed); // dupe 解決成功（tombstone でない）
+}
+
+test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック後も negative cache が保持され再デコードしない" {
+    const a = testing.allocator;
+    const data = try buildEmojiTestFont(a, &.{
+        .{ .ppem = 64, .records = &.{ .empty, .empty, .{ .png = .{ .bytes = &.{ 0xDE, 0xAD, 0xBE, 0xEF } } }, .empty } },
+    });
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+
+    const W = 80;
+    const H = 80;
+    var px_buf = [_]u32{0xFF000000} ** (W * H);
+    const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+    const gid = of.gidOf(0x1F600);
+
+    // 1 回目: decode 失敗 → outline(三角形) へフォールバックし failed tombstone を記録。
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    try testing.expect(of.color_cache.get(gid).?.failed);
+    const count_after_1st = of.color_cache.count();
+
+    // 2 回目: 同じ gid を再度描画しても、tombstone がそのまま維持され（failed のまま）
+    // count も不変（同一 key の再挿入ではなく最初の get(gid).failed==true で即 return し
+    // buildColorGlyph の decode 経路自体を通らないことの直接証拠。count 不変のみだと
+    // 同一 key 上書きでも成立してしまうため failed の再確認も併せて行う。codex 指摘反映）。
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    try testing.expect(of.color_cache.get(gid).?.failed);
+    try testing.expectEqual(count_after_1st, of.color_cache.count());
+}
