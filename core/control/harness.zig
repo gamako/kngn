@@ -70,8 +70,8 @@ var line_no: usize = 0;
 var steps_remaining: usize = 0;
 var quit_requested = false;
 
-// expect/assert のアサーション失敗カウンタ（TASK-78。**replay 専用**。live は使わない=合否はレスポンス行のみ）。
-// replay 終了時に >0 なら非0 exit する（AC#1）。resetForTest でゼロクリアする。
+// expect/assert（TASK-78）+ action（TASK-62.1）の失敗カウンタ（**replay 専用**。live は使わない=
+// 合否はレスポンス行のみ）。replay 終了時に >0 なら非0 exit する（AC#1）。resetForTest でゼロクリアする。
 var expect_failures: usize = 0;
 
 // replay 用 script bytes（プロセス寿命まで保持。page_allocator）
@@ -209,6 +209,76 @@ fn findProbe(name: []const u8) ?*Probe {
     return null;
 }
 
+// ============================================================================
+// custom action（app が opt-in 登録する高レベル操作。probe(read) に対称な write/operate 口。TASK-62.1）
+// ============================================================================
+
+/// app が register する custom action。**framework は中身を解釈しない**（probe と同じ不変条件）:
+/// `action <name> [args...]` の `<name>` 以降の残り行 raw テキストをそのまま `run` へ渡し、
+/// 戻り値（1行）をそのまま既存 sink（replay stderr / live resp）へ流すだけ。
+pub const Action = struct {
+    /// action 名（`action <name> ...` の引数。空白/`;`/改行を含む名前は登録できない）。
+    name: []const u8,
+    /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
+    ctx: *anyopaque,
+    /// capabilities 列挙（TASK-62.4）用の説明文。今回は未使用（省略可）。
+    desc: []const u8 = "",
+    /// 操作を実行し結果1行を返す write callback。
+    /// - `args` は `action <name>` の後の残り行 raw テキスト（trim 済み・再トークン化しない）。
+    ///   区切りは `;`/`\n` なので同一コマンド片内のテキストに限られる（`;` 自体は渡せない）。
+    /// - 戻り値は改行を含めない1行（`Probe.digest` と同じ契約）。`buf`（`DIGEST_BUF_LEN`）内の
+    ///   slice か ctx/静的所有の一時 slice を返してよい。有効期間は `run` 復帰後 `reportAction` が
+    ///   同期的に emit するまでの間だけ（allocator 所有権は移らない）。
+    /// - **callback は main thread（`pollGate` 内・step/フレーム境界）で実行される**。RT callback
+    ///   から呼ばれることは無い。callback 自身が RT スレッドと共有する app 状態に触れる場合、
+    ///   その同期責務は app 側にある（probe の digest/snapshot callback と同じ規約）。
+    run: *const fn (ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8,
+};
+
+const MAX_ACTIONS = 16;
+var actions: [MAX_ACTIONS]Action = undefined;
+var action_count: usize = 0;
+
+/// custom action を登録する。app は `platform.registerAction(...)` 経由で `platform.init()` 後に呼ぶ。
+/// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
+/// - 同名は上書き。空白/`;`/改行を含む名前と空名は拒否（コマンド言語上そもそも呼び出せないため）。
+/// - registry 満杯はスキップ（いずれも warn）。
+pub fn registerAction(a: Action) void {
+    if (!isEnabled()) return;
+    if (!isValidActionName(a.name)) {
+        std.debug.print("[harness] registerAction: 不正な名前 '{s}'（空/空白/';'/改行 は不可）\n", .{a.name});
+        return;
+    }
+    for (actions[0..action_count]) |*existing| {
+        if (std.mem.eql(u8, existing.name, a.name)) {
+            existing.* = a; // 同名上書き
+            return;
+        }
+    }
+    if (action_count >= MAX_ACTIONS) {
+        std.debug.print("[harness] registerAction: registry 満杯（{d}）。'{s}' をスキップ\n", .{ MAX_ACTIONS, a.name });
+        return;
+    }
+    actions[action_count] = a;
+    action_count += 1;
+}
+
+/// action 名としてコマンド言語上呼び出し可能かを検査する（空 / 空白 / `;` / 改行を含む名前は不可）。
+fn isValidActionName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (std.ascii.isWhitespace(c) or c == ';') return false;
+    }
+    return true;
+}
+
+fn findAction(name: []const u8) ?*Action {
+    for (actions[0..action_count]) |*a| {
+        if (std.mem.eql(u8, a.name, name)) return a;
+    }
+    return null;
+}
+
 /// headless 判定の純粋ロジック（env I/O から分離。単体テスト用）。
 /// `VP_HARNESS_HEADLESS` 単独指定（script も live も無し）は無効（false = 通常実行）。
 fn decideHeadless(requested: bool, script_path: ?[]const u8, live_requested: bool) bool {
@@ -332,6 +402,8 @@ pub fn pollGate(native_continue: bool) bool {
             handleSnapshot(&it);
         } else if (std.mem.eql(u8, cmd, "digest")) {
             handleDigest(&it);
+        } else if (std.mem.eql(u8, cmd, "action")) {
+            handleAction(&it);
         } else if (std.mem.eql(u8, cmd, "expect")) {
             handleExpect(&it, false);
         } else if (std.mem.eql(u8, cmd, "assert")) {
@@ -712,6 +784,68 @@ fn handleDigest(it: *Tok) void {
 }
 
 // ============================================================================
+// action（probe 対称の高レベル操作。TASK-62.1）
+//
+// 文法（replay/live 共通）: action <name> [args...]
+//   args は <name> の後の残り行 raw テキスト（trim 済み・再トークン化しない = 中身非解釈）。
+//   framework は name lookup と run() 呼び出しのみ行う（probe と同じ不変条件）。
+//
+// 失敗（名前欠落・未知 action・run() エラー）は expect/assert（TASK-78）と同じ `expect_failures`
+// カウンタに相乗りする（記帳して続行。assert 相当の即時 abort は無い）。EOF/quit/早期 return の
+// 既存3経路（replayExitIfFailed）にタダ乗りするため、新規 exit 経路は追加しない。
+// ============================================================================
+
+/// `action` コマンド本体。name lookup → run() → 結果 emit のみ（args の解釈・再トークン化はしない）。
+fn handleAction(it: *Tok) void {
+    const name = it.next() orelse "";
+    if (name.len == 0) return reportAction(false, "?", "missing action name");
+    const args = std.mem.trim(u8, it.rest(), " \t");
+    const act = findAction(name) orelse return reportAction(false, name, "unknown action");
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const result = act.run(act.ctx, args, &buf) catch |err| return reportAction(false, name, @errorName(err));
+    reportAction(true, name, result);
+}
+
+/// `msg` を最初の `\r`/`\n` の手前で切る（callback が誤って複数行を返しても wire framing を守る。
+/// 特に live の `fail ` 行頭スキャンを次行に誤爆させないための防御実装。中身の解釈ではない）。
+fn firstLine(msg: []const u8) []const u8 {
+    const nl = std.mem.indexOfScalar(u8, msg, '\n');
+    const cr = std.mem.indexOfScalar(u8, msg, '\r');
+    const cut = @min(nl orelse msg.len, cr orelse msg.len);
+    return msg[0..cut];
+}
+
+/// action の合否を emit し、失敗を記帳する（replay=stderr / live=resp_buf）。
+/// - replay 成功: `[harness] action <name> ok <msg>` / 失敗: `[harness] action <name> FAILED <msg>`
+/// - live 成功  : `<name> <msg>`（bare。digest と同じ流儀） / 失敗: `fail <name> <msg>`（drive の
+///   行頭スキャンに乗せるための接頭辞）
+/// - 失敗時のみ `mode == .replay` なら `expect_failures` を加算する（assert 相当の即時 abort は無い）。
+fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
+    const line = firstLine(msg);
+    if (mode == .live) {
+        if (pass) {
+            appendResp(name);
+            appendResp(" ");
+            appendResp(line);
+        } else {
+            appendResp("fail ");
+            appendResp(name);
+            appendResp(" ");
+            appendResp(line);
+        }
+        appendResp("\n");
+    } else if (pass) {
+        std.debug.print("[harness] action {s} ok {s}\n", .{ name, line });
+    } else {
+        std.debug.print("[harness] action {s} FAILED {s}\n", .{ name, line });
+    }
+
+    if (!pass and mode == .replay) {
+        expect_failures += 1;
+    }
+}
+
+// ============================================================================
 // expect / assert（アサーション層。TASK-78）
 //
 // 文法（replay/live 共通）:
@@ -874,7 +1008,7 @@ fn reportExpect(kind: []const u8, pass: bool, expr_text: []const u8, actual: ?[]
 /// **mode gate を関数内に閉じる**ので live / 通常実行（disabled）では常に no-op（process.exit を呼ばない）。
 fn replayExitIfFailed() void {
     if (mode == .replay and expect_failures > 0) {
-        std.debug.print("[harness] expect: {d} 件失敗\n", .{expect_failures});
+        std.debug.print("[harness] 検証失敗: {d} 件（expect/assert/action）\n", .{expect_failures});
         std.process.exit(1);
     }
 }
@@ -1222,6 +1356,7 @@ fn resetForTest() void {
     audio_channels = .init(0);
     audio_rate = .init(0);
     probe_count = 0;
+    action_count = 0;
 }
 
 test "parseKey: 名前→KeyCode（大小無視・数字）" {
@@ -1809,6 +1944,145 @@ test "expect live: ok/fail 行が resp_buf に積まれる / live は記帳せ�
     }
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail nosuch x=1 actual=unknown probe"));
     try testing.expectEqual(@as(usize, 0), expect_failures);
+}
+
+// ============================================================================
+// action（probe 対称の高レベル操作。TASK-62.1）tests
+// ============================================================================
+
+const TestActionCtx = struct {
+    calls: usize = 0,
+    args_buf: [256]u8 = undefined,
+    args_len: usize = 0,
+
+    fn lastArgs(self: *const TestActionCtx) []const u8 {
+        return self.args_buf[0..self.args_len];
+    }
+};
+
+fn testActionRun(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const c: *TestActionCtx = @ptrCast(@alignCast(ctx));
+    c.calls += 1;
+    @memcpy(c.args_buf[0..args.len], args);
+    c.args_len = args.len;
+    return std.fmt.bufPrint(buf, "ok:{s}", .{args}) catch buf[0..0];
+}
+
+fn testActionErr(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = args;
+    _ = buf;
+    return error.Boom;
+}
+
+test "firstLine: 最初の \\r/\\n の手前で切る（無ければ全体・callback の複数行返却を防御）" {
+    try testing.expectEqualStrings("abc", firstLine("abc\ndef"));
+    try testing.expectEqualStrings("abc", firstLine("abc\r\ndef"));
+    try testing.expectEqualStrings("abc", firstLine("abc"));
+    try testing.expectEqualStrings("", firstLine("\nabc"));
+}
+
+test "registerAction: disabled 時 no-op（回帰ゼロ）" {
+    resetForTest();
+    mode = .disabled;
+    action_count = 0;
+    var c = TestActionCtx{};
+    registerAction(.{ .name = "x", .ctx = &c, .run = testActionRun });
+    try testing.expectEqual(@as(usize, 0), action_count);
+}
+
+test "registerAction: 同名上書き / 不正名（空・空白・;・改行）拒否 / 満杯 skip" {
+    resetForTest();
+    action_count = 0;
+    var c1 = TestActionCtx{};
+    var c2 = TestActionCtx{};
+    registerAction(.{ .name = "a", .ctx = &c1, .run = testActionRun });
+    registerAction(.{ .name = "a", .ctx = &c2, .run = testActionRun }); // 同名上書き
+    try testing.expectEqual(@as(usize, 1), action_count);
+    try testing.expectEqual(@as(*anyopaque, &c2), findAction("a").?.ctx);
+
+    registerAction(.{ .name = "", .ctx = &c1, .run = testActionRun }); // 空名
+    registerAction(.{ .name = "b c", .ctx = &c1, .run = testActionRun }); // 空白混入
+    registerAction(.{ .name = "b;c", .ctx = &c1, .run = testActionRun }); // ; 混入
+    registerAction(.{ .name = "b\nc", .ctx = &c1, .run = testActionRun }); // 改行混入
+    try testing.expectEqual(@as(usize, 1), action_count); // いずれも拒否され増えない
+
+    const names = [_][]const u8{ "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p" };
+    for (names) |nm| registerAction(.{ .name = nm, .ctx = &c1, .run = testActionRun });
+    try testing.expectEqual(@as(usize, MAX_ACTIONS), action_count); // 16 で頭打ち（"a"+15件）
+    action_count = 0;
+}
+
+test "action dispatch: raw args 透過（再トークン化しない・連続空白/JSON風ペイロード保持）" {
+    resetForTest();
+    var c = TestActionCtx{};
+    registerAction(.{ .name = "foo", .ctx = &c, .run = testActionRun });
+    defer action_count = 0;
+    cmd_buf =
+        \\action foo 1 2  3
+        \\step 1
+        \\action foo key=val {"a":1,"b":2}
+        \\step 1
+        \\quit
+    ;
+
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(usize, 1), c.calls);
+    try testing.expectEqualStrings("1 2  3", c.lastArgs()); // 連続空白が潰れない = 再トークン化していない
+
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(usize, 2), c.calls);
+    try testing.expectEqualStrings("key=val {\"a\":1,\"b\":2}", c.lastArgs()); // JSON風ペイロードもそのまま
+
+    try testing.expect(!pollGate(true)); // quit
+}
+
+test "action: 未知 action / 名前欠落 / run()エラー は記帳（expect_failures 加算・EOF未到達で exit回避）" {
+    resetForTest();
+    var c = TestActionCtx{};
+    registerAction(.{ .name = "boom", .ctx = &c, .run = testActionErr });
+    defer action_count = 0;
+    cmd_buf =
+        \\action nosuch
+        \\step 1
+        \\action
+        \\step 1
+        \\action boom
+        \\step 1
+    ;
+
+    try testing.expect(pollGate(true)); // 未知 action
+    try testing.expectEqual(@as(usize, 1), expect_failures);
+    try testing.expect(pollGate(true)); // 名前欠落
+    try testing.expectEqual(@as(usize, 2), expect_failures);
+    try testing.expect(pollGate(true)); // run() エラー（クラッシュしない）
+    try testing.expectEqual(@as(usize, 3), expect_failures);
+    // ここで pollGate を再度呼ぶと EOF → replayExitIfFailed で exit(1) するので**呼ばない**。
+    expect_failures = 0; // 次テストへの漏れ防止
+}
+
+test "action live: 成功は bare `<name> <msg>`、失敗は `fail <name> <msg>`（drive 検知）/ live は記帳しない" {
+    resetForTest();
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var c = TestActionCtx{};
+    registerAction(.{ .name = "foo", .ctx = &c, .run = testActionRun });
+    defer action_count = 0;
+
+    {
+        var it = std.mem.tokenizeAny(u8, "foo bar", " \t");
+        handleAction(&it);
+    }
+    try testing.expectEqualStrings("foo ok:bar\n", resp_buf.items);
+    resp_buf.clearRetainingCapacity();
+
+    {
+        var it = std.mem.tokenizeAny(u8, "nosuch", " \t");
+        handleAction(&it);
+    }
+    try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail nosuch unknown action"));
+    try testing.expectEqual(@as(usize, 0), expect_failures); // live は記帳しない
 }
 
 // ============================================================================

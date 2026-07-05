@@ -463,6 +463,7 @@ snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n>（mono downmix・自己相関 f0）
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...}（JSON 1行）
+action <name> [args...]    # app が registerAction した高レベル操作を実行（probe(read)対称のwrite口。TASK-62.1）
 expect fb crc=8702DD71     # expect <probe> <key><op><value>（op ∈ = != > <）。digest payload の top-level k=v と照合
 expect audio silent=0      # 一致で ok / 不一致で fail。replay は失敗を溜め終了時に非0 exit、live は ok/fail 行を返す
 assert fb crc=8702DD71     # expect と同評価。replay では失敗した時点で即 非0 exit（fail-fast abort）
@@ -482,6 +483,12 @@ quit                       # 終了（EOF でも終了）
   - **合否と exit code**: replay = stderr `[harness] expect ok/FAILED line N: <expr> [actual=<payload|理由>]`。`expect` の失敗は溜めて**終了時（EOF/quit/window close いずれの経路でも）に 1 件以上で非0 exit**、`assert` の失敗は**その場で即 非0 exit**（fail-fast abort。exit(1) は後始末を飛ばす debug 挙動）。live = レスポンス行 `ok`/`fail <probe> <expr> [actual=..]` を返すだけで**プロセスは終了しない**（∴ live では expect と assert は同挙動）。`scripts/drive` は**レスポンス各行**を走査し `fail ` 行頭があれば自身も非0 exit する（`error:` 等の警告は非0化しない）。
   - **fail-fast（typo を握りつぶさない）**: 未知 probe 名 / 不正構文（op 欠落・key/value 空・`!` 単独）/ 余剰トークン / key 不在 / payload 未確定（fb present 前）はすべて**失敗**として扱う。
   - **record→replay 対称・harness 無効時 no-op** は不変（既存機構にそのまま乗る）。
+- **action（probe 対称の高レベル操作 / TASK-62.1）**: app が `platform.registerAction(...)` で登録した名前を `action <name> [args...]` で叩ける write/operate 口。UI 座標に依存せずアプリの意味的コマンドを直接実行できる（undo/network の共通コマンド単位の土台）。
+  - 文法: `action <name>` の後の残り行が **raw テキストのまま**（trim のみ・再トークン化しない）`args` として callback に渡る。**`;`/改行はコマンド区切りなので args に含められない**（同一コマンド片内のテキストに限られる）。
+  - callback は `run(ctx, args, buf) anyerror![]const u8`（`buf` は `digest` と同じ 1024B 契約。戻り値は改行を含めない1行）。**framework は args も戻り値の意味も一切解釈しない**（probe と同じ不変条件。改行以降を emit しないのは中身の解釈ではなく wire framing 保護）。callback は **main thread（`pollGate` 内・step/フレーム境界）で実行**され、RT callback から呼ばれることは無い（RT スレッドと共有する app 状態への同期責務は app 側）。
+  - **合否と exit code**: 未知 action・名前欠落・`run()` のエラーは**すべて失敗**として扱い、`expect`/`assert`（TASK-78）と同じ `expect_failures` カウンタに相乗りする（記帳して続行。`assert` のような即時 abort 変種は無い）。replay は終了時（EOF/quit/window close いずれの経路でも）に記帳が 1 件以上あれば非0 exit、live はプロセスを終了せずレスポンス行のみで合否を返す。
+  - **wire format**: replay stderr = 成功 `[harness] action <name> ok <msg>` / 失敗 `[harness] action <name> FAILED <msg>`。live resp = 成功 `<name> <msg>`（**bare。`digest` の `<probe> <payload>` と同じ流儀**）/ 失敗 `fail <name> <msg>`（**`fail ` 接頭辞。`scripts/drive` の行頭スキャンに乗せて非0 exit させるため**）。callback が誤って複数行を返しても `msg` は最初の `\r`/`\n` の手前で切って emit する（wire framing 保護。中身の解釈ではない）。
+  - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（16件）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
 
 ### 使い方（replay = file トランスポート）
 
@@ -577,7 +584,39 @@ app が内部状態を opt-in で probe として公開する。**framework（`c
 - audio RT スレッドが触る状態（synth `voices`/`patch` 等）の読み出しは torn し得る best-effort スナップショット。**RT 経路に同期/alloc/lock を足さない**。
 - 実装の手本: pixie の `canvas`/`undo`/`tool`（`apps/editor/apps/pixie/main.zig`）、synth の `voices`/`patch`（`apps/synth/main.zig`）。
 
-- **実行モデル**: 非 step（inject/snapshot/digest）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
+### custom action の足し方（TASK-62.1）
+
+app が内部の高レベル操作を opt-in で action として公開する。probe（read）の登録手順と対称だが、
+**write callback で成功/失敗を返す点が異なる**。**framework（`core/control/harness.zig`）には
+action 固有のコードを一切足さない**（中身非パースの不変条件は probe と同じ）。手順:
+
+1. app（`@import("platform")` 済み）で action の callback を書く:
+   - `run: fn(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8` — `args`（`action <name>`
+     の後の残り行 raw テキスト。trim 済み・再トークン化されない）を受けて状態を変更し、結果1行を
+     `buf`（最大 1024B）に書いて返す（改行を含めない。`Probe.digest` と同じ契約）。エラーを返すと
+     `run() エラー` として記帳される。
+   - `ctx` は app 状態へのポインタ（例 `*App`）。callback 内で `@ptrCast(@alignCast(ctx))` で戻す。
+2. `platform.init()` 後・main loop 前に登録する:
+   ```zig
+   platform.registerAction(.{ .name = "undo", .ctx = &app, .run = appUndo });
+   ```
+3. これだけで `action undo [args...]` が replay・live 両方で使える。
+
+規約・制約:
+- **args は raw テキスト透過（framework は解釈しない）が、`;`/改行を含められない**（`nextLine()` の
+  コマンド区切りのため。同一コマンド片内のテキストに限られる）。
+- **名前規則**: 空名・空白・`;`・改行を含む名前は登録拒否（コマンド言語上そもそも呼び出せないため）。
+  同名 custom は上書き。registry 上限は 16。予約名は無い（組み込み action を作らないため）。
+- `registerAction` は **harness 無効時（env 未設定）は no-op**なので、通常実行に影響しない（常に呼んでよい）。
+- **callback は main thread（`pollGate` 内・step/フレーム境界）で実行される**。RT callback から呼ばれる
+  ことは無い。callback が RT スレッドと共有する app 状態に触れる場合、その同期責務は app 側にある
+  （probe の digest/snapshot callback と同じ規約）。
+- **失敗の扱い**: 未知 action・名前欠落・`run()` のエラーは `expect`/`assert`（TASK-78）と同じ
+  `expect_failures` カウンタに記帳される（記帳して続行。即時 abort 変種は無い）。詳細な wire format は
+  上記コマンド言語節の「action（probe 対称の高レベル操作 / TASK-62.1）」を参照。
+- 組み込み action は今回作らない。app 側の action 登録は各採用タスク（pixie/synth/modular 等）で行う。
+
+- **実行モデル**: 非 step（inject/snapshot/digest/action）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
 - **制約**: 実ウィンドウ生成は `VP_HARNESS_HEADLESS` 未指定時のみ必須（display 必須。macOS は通常 OK、
   Linux は Xvfb/実セッション）。**`VP_HARNESS_HEADLESS=1` で完全 display-less**（P4, TASK-32.4 実装済み。

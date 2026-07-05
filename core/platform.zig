@@ -222,6 +222,17 @@ pub const Probe = harness.Probe;
 pub const registerProbe = harness.registerProbe;
 
 // ============================================================================
+// custom action（ヘッドレス検証 harness・TASK-62.1）
+//
+// app が `platform.registerAction(.{ .name, .ctx, .run })` で高レベル操作を opt-in 登録する。
+// probe（read）に対称な操作（write）口。platform module は共有 harness module を既に import 済みなので
+// re-export だけで露出でき、build.zig 変更は不要。harness 無効時（env 未設定）は registerAction が no-op。
+// framework は action の中身を解釈しない（probe と同じ不変条件）。
+// ============================================================================
+pub const Action = harness.Action;
+pub const registerAction = harness.registerAction;
+
+// ============================================================================
 // sleep（OS 非依存のフレームウェイト）
 //
 // zig 0.16 は std.time.sleep を廃し sleep が std.Io 経由になったため、main/examples が共通で使える
