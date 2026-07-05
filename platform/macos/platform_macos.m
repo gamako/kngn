@@ -1,6 +1,9 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#if defined(VP_ENABLE_GAMEPAD)
+#import <GameController/GameController.h>
+#endif
 #include "platform.h"
 #include <math.h>
 #include <stdlib.h>
@@ -46,6 +49,133 @@ struct PlatformWindow {
     FramebufferView* view;
     EventQueue event_queue;
 };
+
+// 前方宣言 (定義は下記マウス入力ヘルパーの後。ゲームパッド connect/disconnect ハンドラから使う)。
+static void queue_push(EventQueue* q, const PlatformEvent* ev);
+
+// ========================================
+// ゲームパッド入力 (TASK-80.2。ADR-009)
+// ========================================
+//
+// opt-in（TASK-80.2 opt-in 化）: GameController framework は audio と同じ opt-in link 方式で、
+// ゲームパッドを使う exe（examples/22_gamepad）だけが build.zig から `-DVP_ENABLE_GAMEPAD` を渡す
+// （build_helpers/platform.zig の compilePlatformLayer 参照）。非 opt-in exe はこのブロック全体が
+// コンパイル対象外になり GameController のシンボルを一切参照しない（`otool -L` にも出ない）。
+#if defined(VP_ENABLE_GAMEPAD)
+//
+// GCController ↔ index (0..PLATFORM_MAX_GAMEPADS-1) のマッピングを保持する。ARC のため
+// 強参照配列でよい（GCController 自体は GameController framework が connect している間保持する）。
+// 単一 window 前提（既存コードと同じ）なので、connect/disconnect イベントは
+// 「現在アクティブな window」(最後に create された window) の event_queue へ push する。
+
+static GCController* g_gamepad_slots[PLATFORM_MAX_GAMEPADS];
+static PlatformWindow* g_gamepad_event_window = NULL;
+static BOOL g_gamepad_observers_installed = NO;
+
+// 追跡中の controller の slot index。未追跡なら -1。
+static int gamepadFindSlot(GCController* controller) {
+    for (int i = 0; i < PLATFORM_MAX_GAMEPADS; i++) {
+        if (g_gamepad_slots[i] == controller) return i;
+    }
+    return -1;
+}
+
+// 空きスロットの index。無ければ -1（上限超は無視）。
+static int gamepadFindFreeSlot(void) {
+    for (int i = 0; i < PLATFORM_MAX_GAMEPADS; i++) {
+        if (g_gamepad_slots[i] == nil) return i;
+    }
+    return -1;
+}
+
+// PlatformEvent.payload.gamepad.name（32byte+NUL固定）へ UTF-8 文字列を切り詰めコピーする。
+static void gamepadCopyName(PlatformEvent* ev, NSString* name) {
+    memset(ev->payload.gamepad.name, 0, sizeof(ev->payload.gamepad.name));
+    const char* utf8 = [name UTF8String];
+    if (!utf8) return;
+    strncpy(ev->payload.gamepad.name, utf8, sizeof(ev->payload.gamepad.name) - 1);
+}
+
+// GCController 接続を取り込む。extendedGamepad 非対応（micro gamepad 等）・追跡済み・上限超は無視する。
+static void gamepadHandleConnect(GCController* controller) {
+    if (!controller.extendedGamepad) return; // 標準レイアウト非対応は対象外
+    if (gamepadFindSlot(controller) >= 0) return; // 追跡済み（defensive）
+    if (!g_gamepad_event_window) return; // window 未生成中は無視
+    int idx = gamepadFindFreeSlot();
+    if (idx < 0) return; // PLATFORM_MAX_GAMEPADS 台超は無視
+    g_gamepad_slots[idx] = controller;
+
+    PlatformEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = PLATFORM_EVENT_GAMEPAD_CONNECTED;
+    ev.payload.gamepad.index = idx;
+    gamepadCopyName(&ev, controller.vendorName ?: @"Gamepad");
+    queue_push(&g_gamepad_event_window->event_queue, &ev);
+}
+
+// GCController 切断を取り込む。未追跡なら無視する。
+static void gamepadHandleDisconnect(GCController* controller) {
+    int idx = gamepadFindSlot(controller);
+    if (idx < 0) return;
+    g_gamepad_slots[idx] = nil;
+    if (!g_gamepad_event_window) return;
+
+    PlatformEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = PLATFORM_EVENT_GAMEPAD_DISCONNECTED;
+    ev.payload.gamepad.index = idx;
+    queue_push(&g_gamepad_event_window->event_queue, &ev);
+}
+
+// GCControllerDidConnect/DidDisconnect の Notification 監視を 1 プロセス 1 回だけ設置する。
+// queue に [NSOperationQueue mainQueue] を明示指定し main thread 配信を強制する（queue:nil だと
+// 「通知を post したスレッドで同期実行」になり main thread 保証が無いため。codex レビュー指摘）。
+// これにより event_queue / g_gamepad_slots への書き込みが pollEvents 等の main thread 経路と
+// 同じスレッドに揃い、lock 無しでも race しない。
+static void gamepadInstallObserversIfNeeded(void) {
+    if (g_gamepad_observers_installed) return;
+    g_gamepad_observers_installed = YES;
+    [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification
+                                                       object:nil
+                                                        queue:[NSOperationQueue mainQueue]
+                                                   usingBlock:^(NSNotification* note) {
+        gamepadHandleConnect((GCController*)note.object);
+    }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidDisconnectNotification
+                                                       object:nil
+                                                        queue:[NSOperationQueue mainQueue]
+                                                   usingBlock:^(NSNotification* note) {
+        gamepadHandleDisconnect((GCController*)note.object);
+    }];
+}
+
+// window の create/destroy に合わせて「アクティブ window」を切替える。既に他 window から引き継いだ
+// slot（前 window の生存中に接続済みだった controller）は新 window へ connected event を再送し、
+// 未追跡のコントローラは通常の connect 処理で取り込む（codex レビュー指摘: window 再生成時に
+// 既接続 controller の connected event が新 window に届かない問題への対応）。
+static void gamepadAttachWindow(PlatformWindow* window) {
+    g_gamepad_event_window = window;
+    gamepadInstallObserversIfNeeded();
+    for (int i = 0; i < PLATFORM_MAX_GAMEPADS; i++) {
+        if (g_gamepad_slots[i] == nil) continue;
+        PlatformEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = PLATFORM_EVENT_GAMEPAD_CONNECTED;
+        ev.payload.gamepad.index = i;
+        gamepadCopyName(&ev, g_gamepad_slots[i].vendorName ?: @"Gamepad");
+        queue_push(&window->event_queue, &ev);
+    }
+    for (GCController* controller in [GCController controllers]) {
+        gamepadHandleConnect(controller); // 未追跡のみ実際に処理する（gamepadFindSlot でスキップ）
+    }
+}
+
+static void gamepadDetachWindow(PlatformWindow* window) {
+    if (g_gamepad_event_window == window) {
+        g_gamepad_event_window = NULL;
+    }
+}
+#endif // VP_ENABLE_GAMEPAD
 
 // ========================================
 // マウス入力ヘルパー (TASK-21.1)
@@ -848,6 +978,11 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
         [platformWindow->view startDisplayLink];
     }
 
+#if defined(VP_ENABLE_GAMEPAD)
+    // ゲームパッド: このwindowをアクティブにし、既接続コントローラを取り込む (TASK-80.2)
+    gamepadAttachWindow(platformWindow);
+#endif
+
     return platformWindow;
 }
 
@@ -864,6 +999,11 @@ void platform_run(PlatformWindow* platformWindow) {
 // ウィンドウ破棄
 void platform_destroy_window(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
+
+#if defined(VP_ENABLE_GAMEPAD)
+    // ゲームパッド: このwindowがアクティブなら参照を外す (TASK-80.2)
+    gamepadDetachWindow(platformWindow);
+#endif
 
     @autoreleasepool {
         // 1. view の back-reference を無効化 (以降の mouseDown: 等は早期 return)
@@ -1043,6 +1183,68 @@ bool platform_get_event(PlatformWindow* window, PlatformEvent* event) {
 
     return true;
 }
+
+// ========================================
+// ゲームパッド入力 (TASK-80.2。ADR-009)
+// ========================================
+//
+// opt-in（TASK-80.2 opt-in 化）: `platform_get_gamepad_state` は platform.h で常時宣言されるため
+// シンボル自体は non-opt-in exe でも定義する必要がある。GameController 型を一切参照しない
+// always-false fallback を #else 側に用意し、リンクエラーの可能性を Zig 側の dead-code-elimination
+// 頼みにしない（防御的設計）。
+#if defined(VP_ENABLE_GAMEPAD)
+//
+// GCExtendedGamepad.buttonA/B/X/Y は Apple が「物理位置ベース」で既に正規化済み
+// （Nintendo 系コントローラの A/B・X/Y 入替も GameController framework 側で吸収される。
+// Apple公式ドキュメント: "refer to conceptual roles based on physical position, similar to
+// Xbox layout"）ため、本実装は 1:1 マッピングするだけで良い。stick の Y 軸は GameController の
+// raw 値（上入力 = +1）をそのまま渡す（screen 座標へのフリップは consumer 責務。ADR-009 の
+// raw値契約を継承）。
+//
+// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
+// （alloc/lock 無し）で全画素ループでも RT でもないため性能規約の適用対象外（ADR-009 参照）。
+bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamepadState* out_state) {
+    (void)window;
+    if (!out_state || index < 0 || index >= PLATFORM_MAX_GAMEPADS) return false;
+    GCController* controller = g_gamepad_slots[index];
+    if (!controller) return false;
+    GCExtendedGamepad* pad = controller.extendedGamepad;
+    if (!pad) return false; // 接続後に非対応プロファイルへ変化した場合の防御（通常発生しない）
+
+    uint32_t mask = 0;
+    if (pad.buttonA.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_A;
+    if (pad.buttonB.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_B;
+    if (pad.buttonX.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_X;
+    if (pad.buttonY.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_Y;
+    if (pad.leftShoulder.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_LEFT_SHOULDER;
+    if (pad.rightShoulder.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+    if (pad.buttonMenu.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_START;
+    if (pad.buttonOptions.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_BACK; // nullable。nilメッセージングでfalse
+    if (pad.leftThumbstickButton.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_LEFT_STICK; // nullable
+    if (pad.rightThumbstickButton.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_RIGHT_STICK; // nullable
+    if (pad.dpad.up.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_DPAD_UP;
+    if (pad.dpad.down.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_DPAD_DOWN;
+    if (pad.dpad.left.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_DPAD_LEFT;
+    if (pad.dpad.right.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_DPAD_RIGHT;
+    if (pad.buttonHome.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_GUIDE; // nullable
+
+    out_state->buttons_mask = mask;
+    out_state->left_stick_x = pad.leftThumbstick.xAxis.value;
+    out_state->left_stick_y = pad.leftThumbstick.yAxis.value;
+    out_state->right_stick_x = pad.rightThumbstick.xAxis.value;
+    out_state->right_stick_y = pad.rightThumbstick.yAxis.value;
+    out_state->left_trigger = pad.leftTrigger.value;
+    out_state->right_trigger = pad.rightTrigger.value;
+    return true;
+}
+#else
+bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamepadState* out_state) {
+    (void)window;
+    (void)index;
+    (void)out_state;
+    return false; // opt-in 無効（TASK-80.2 opt-in 化。GameController型を一切参照しない）
+}
+#endif // VP_ENABLE_GAMEPAD
 
 // ========================================
 // ファイル選択ダイアログ (TASK-24)

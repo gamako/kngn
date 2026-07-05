@@ -29,6 +29,11 @@ const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;
 const DialogError = types.DialogError;
 const CursorShape = types.CursorShape;
+const GamepadState = types.GamepadState;
+const GamepadButtons = types.GamepadButtons;
+const GamepadInfo = types.GamepadInfo;
+const GamepadDisconnect = types.GamepadDisconnect;
+const GAMEPAD_NAME_MAX = types.GAMEPAD_NAME_MAX;
 
 pub fn init() Error!void {
     if (!c.platform_init()) return error.InitFailed;
@@ -91,6 +96,22 @@ inline fn makeCharEvent(ev: c.PlatformEvent) CharEvent {
     };
 }
 
+/// C の `gamepad.name`（32byte+NUL固定バッファ）を `GamepadInfo.name_buf` へコピーする（TASK-80.2）。
+/// `strlen` 相当で NUL 終端までを有効長とし、`GAMEPAD_NAME_MAX` を超える分は切り詰める
+/// （backend 側が既に切り詰め済みのため通常は発生しない。防御的にここでも境界を守る）。
+inline fn makeGamepadInfo(ev: c.PlatformEvent) GamepadInfo {
+    var info = GamepadInfo{ .index = @intCast(ev.payload.gamepad.index) };
+    const raw_name: [*:0]const u8 = @ptrCast(&ev.payload.gamepad.name);
+    const len = @min(std.mem.len(raw_name), GAMEPAD_NAME_MAX);
+    @memcpy(info.name_buf[0..len], raw_name[0..len]);
+    info.name_len = @intCast(len);
+    return info;
+}
+
+inline fn makeGamepadDisconnect(ev: c.PlatformEvent) GamepadDisconnect {
+    return .{ .index = @intCast(ev.payload.gamepad.index) };
+}
+
 // ============================================================================
 // Window / Framebuffer
 // ============================================================================
@@ -130,6 +151,8 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_MOUSE_UP => Event{ .mouse_up = makeMouseEvent(ev) },
                 c.PLATFORM_EVENT_MOUSE_SCROLL => Event{ .mouse_scroll = makeScrollEvent(ev) },
                 c.PLATFORM_EVENT_CHAR_INPUT => Event{ .char_input = makeCharEvent(ev) },
+                c.PLATFORM_EVENT_GAMEPAD_CONNECTED => Event{ .gamepad_connected = makeGamepadInfo(ev) },
+                c.PLATFORM_EVENT_GAMEPAD_DISCONNECTED => Event{ .gamepad_disconnected = makeGamepadDisconnect(ev) },
                 else => continue,
             };
         }
@@ -165,6 +188,23 @@ pub const Window = struct {
     /// カーソル形状を設定する（TASK-75.1）。イベント時のみ呼ぶ想定（性能規約の対象外）。
     pub fn setCursor(self: Window, shape: CursorShape) void {
         c.platform_set_cursor(self.handle, @intFromEnum(shape));
+    }
+
+    /// 指定 index のゲームパッド状態を取得する（GameController framework 経由。TASK-80.2。ADR-009）。
+    /// 未接続/index範囲外は null。
+    ///
+    /// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy（alloc/lock 無し）
+    /// で全画素ループでも RT でもないため性能規約の適用対象外（ADR-009 参照）。
+    pub fn getGamepadState(self: Window, index: u8) ?GamepadState {
+        var s: c.PlatformGamepadState = undefined;
+        if (!c.platform_get_gamepad_state(self.handle, @intCast(index), &s)) return null;
+        return .{
+            .buttons = GamepadButtons.fromC(s.buttons_mask),
+            .left_stick = .{ .x = s.left_stick_x, .y = s.left_stick_y },
+            .right_stick = .{ .x = s.right_stick_x, .y = s.right_stick_y },
+            .left_trigger = s.left_trigger,
+            .right_trigger = s.right_trigger,
+        };
     }
 };
 

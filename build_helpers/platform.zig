@@ -99,6 +99,12 @@ pub fn createPlatformModule(
     /// harness module（core/control/harness.zig）。platform.zig(facade) が `@import("harness")` で使う。
     /// audio module と **同一インスタンス** を渡すことで module-level state（audio tap 等）を共有する (TASK-32.2)。
     harness_mod: *std.Build.Module,
+    /// ゲームパッド実 backend（GameController framework 経由。macOS のみ意味を持つ）を有効にするか
+    /// （audio の `link_audio` と対称の opt-in。TASK-80.2 opt-in 化）。`build_options.enable_gamepad` として
+    /// platform module に焼き込まれ、facade（core/platform.zig）の `Window.getGamepadState` が参照する。
+    /// false でも harness synthetic gamepad 経路（inject/digest gamepad）はこの値に関係なく常に動く
+    /// （facade の harness 分岐が os/opt-in 分岐より前段にあるため）。
+    enable_gamepad: bool,
 ) *std.Build.Module {
     // linkSystemLibrary は target 既知の module を要求するため、明示的に target を設定する
     // （import module は通常 importer から target を継承するが、x11 のリンク呼び出しには事前に必要）。
@@ -114,6 +120,7 @@ pub fn createPlatformModule(
 
     const opts = b.addOptions();
     opts.addOption([]const u8, "platform_backend", backendName(backend));
+    opts.addOption(bool, "enable_gamepad", enable_gamepad);
     mod.addOptions("build_options", opts);
 
     // Linux x11 backend は platform_linux_x11.zig が @cImport(<X11/Xlib.h>) / <X11/extensions/XShm.h> する。
@@ -203,6 +210,11 @@ fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
 /// Linux backend: 純 Zig なので .o コンパイルは無く、X11 等のリンクのみ（`sdk_paths` は null）。
 ///
 /// 各 example の build.zig からはこの関数 1 つを呼ぶだけで platform 関連のセットアップが完了する。
+///
+/// `enable_gamepad`: macOS backend（objc/swift/metal）でゲームパッド実 backend（GameController framework）
+/// を有効にするか（TASK-80.2 opt-in 化。audio の `link_audio` と対称）。true の exe だけ .o コンパイルに
+/// `-DVP_ENABLE_GAMEPAD` を渡し GameController framework をリンクする。Linux/Windows backend では無視する
+/// （GameController は macOS 専用で当該分岐に到達しない）。
 pub fn setupExecutableForPlatform(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -210,19 +222,20 @@ pub fn setupExecutableForPlatform(
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
     sdk_paths: ?macos.MacOSSDKPaths,
+    enable_gamepad: bool,
 ) void {
     switch (platform_type) {
         .objc, .swift, .metal => {
             // macOS backend は SDK が必須
             const sdk = sdk_paths orelse @panic("macOS backend には SDK パスが必要です（build.zig の OS 分岐を確認）");
 
-            const compiled = compilePlatformLayer(b, platform_type, optimize, platform_root);
+            const compiled = compilePlatformLayer(b, platform_type, optimize, platform_root, enable_gamepad);
             exe.root_module.addObjectFile(compiled.obj_file);
             exe.root_module.link_libc = true;
             exe.root_module.addIncludePath(platform_root);
             exe.step.dependOn(&compiled.compile_step.step);
 
-            macos.linkMacOSFrameworks(b, exe, sdk);
+            macos.linkMacOSFrameworks(b, exe, sdk, enable_gamepad);
 
             switch (platform_type) {
                 .objc => {},
@@ -314,6 +327,12 @@ pub const StandaloneSpec = struct {
     /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
     /// macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI/COM)。
     link_audio: bool = false,
+    /// ゲームパッド実 backend（GameController framework。macOS のみ意味を持つ）を有効にするか
+    /// （TASK-80.2 opt-in 化。`link_audio` と対称）。true なら platform module の
+    /// `build_options.enable_gamepad` が true になり、macOS backend の .o コンパイルにも
+    /// `-DVP_ENABLE_GAMEPAD` を渡して GameController framework をリンクする。既定 false
+    /// （既存 standalone exe は不変）。opt-in するのは examples/22_gamepad のみ。
+    link_gamepad: bool = false,
     /// png module（libs/png）。**呼び出し側が png を作って `extra` に png 依存モジュール（sprite/core 等）を
     /// 渡す場合は、その同じ png をここにも渡すこと**。harness（platform→harness→png）と extra 側で png module が
     /// 二重化すると「file exists in modules 'png' and 'png0'」になるため、同一インスタンスを共有する。
@@ -444,7 +463,7 @@ pub fn buildStandalone(
     } else null;
 
     for (implementedBackends(target_os)) |be| {
-        const platform_mod = createPlatformModule(b, target, spec.platform_source, spec.platform_include, be, types_mod, harness_mod);
+        const platform_mod = createPlatformModule(b, target, spec.platform_source, spec.platform_include, be, types_mod, harness_mod, spec.link_gamepad);
 
         const root = b.createModule(.{
             .root_source_file = spec.main_source,
@@ -505,7 +524,7 @@ pub fn buildStandalone(
         opts.addOption([]const u8, "platform_name", backendName(be));
         exe.root_module.addOptions("build_options", opts);
 
-        setupExecutableForPlatform(b, exe, be, optimize, spec.platform_root, sdk_paths);
+        setupExecutableForPlatform(b, exe, be, optimize, spec.platform_root, sdk_paths, spec.link_gamepad);
         if (spec.link_audio) linkAudioForStandalone(exe, target_os);
 
         if (be == platform_option) default_exe = exe;
@@ -535,16 +554,21 @@ pub const PlatformCompileResult = struct {
 /// `platform_root` は `platform/` ディレクトリへの LazyPath。
 /// 親プロジェクトからは `b.path("platform")`、examples からは
 /// `b.path("../../platform")` を渡す。
+/// `enable_gamepad`: true なら .o コンパイルに `-DVP_ENABLE_GAMEPAD` を渡す（TASK-80.2 opt-in 化）。
+/// .m/.swift ソース側はこのフラグで gamepad コード（`#if defined(VP_ENABLE_GAMEPAD)` /
+/// `#if VP_ENABLE_GAMEPAD`）を条件コンパイルする。false の exe は GameController framework の
+/// シンボルを一切参照しない .o になる。
 pub fn compilePlatformLayer(
     b: *std.Build,
     platform_type: PlatformType,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
+    enable_gamepad: bool,
 ) PlatformCompileResult {
     return switch (platform_type) {
-        .objc => buildObjC(b, optimize, platform_root),
-        .swift => buildSwift(b, optimize, platform_root),
-        .metal => buildMetal(b, optimize, platform_root),
+        .objc => buildObjC(b, optimize, platform_root, enable_gamepad),
+        .swift => buildSwift(b, optimize, platform_root, enable_gamepad),
+        .metal => buildMetal(b, optimize, platform_root, enable_gamepad),
         // Linux / Windows backend は純 Zig で .o コンパイル不要。setupExecutableForPlatform の
         // macOS 分岐からのみ呼ばれるため、ここには到達しない。
         .x11, .wayland, .gdi, .d3d11 => unreachable,
@@ -555,6 +579,7 @@ fn buildObjC(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
+    enable_gamepad: bool,
 ) PlatformCompileResult {
     const compile_cmd = b.addSystemCommand(&.{
         "clang",
@@ -562,6 +587,8 @@ fn buildObjC(
         "objective-c",
     });
     compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
+    // ゲームパッド opt-in（TASK-80.2 opt-in 化）。platform_macos.m の `#if defined(VP_ENABLE_GAMEPAD)` を有効化する。
+    if (enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
     compile_cmd.addArgs(&.{
         "-fobjc-arc",
         switch (optimize) {
@@ -582,6 +609,7 @@ fn buildSwift(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
+    enable_gamepad: bool,
 ) PlatformCompileResult {
     const compile_cmd = b.addSystemCommand(&.{
         "swiftc",
@@ -598,8 +626,12 @@ fn buildSwift(
         "Cocoa",
         "-framework",
         "QuartzCore",
-        "-import-objc-header",
     });
+    // ゲームパッド opt-in（TASK-80.2 opt-in 化）。platform_macos.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
+    // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く
+    // （後に置くと `-import-objc-header` が `-DVP_ENABLE_GAMEPAD` を誤って path として消費してしまう）。
+    if (enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
+    compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
@@ -611,6 +643,7 @@ fn buildMetal(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
     platform_root: std.Build.LazyPath,
+    enable_gamepad: bool,
 ) PlatformCompileResult {
     const compile_cmd = b.addSystemCommand(&.{
         "swiftc",
@@ -629,8 +662,12 @@ fn buildMetal(
         "Metal",
         "-framework",
         "MetalKit",
-        "-import-objc-header",
     });
+    // ゲームパッド opt-in（TASK-80.2 opt-in 化）。platform_macos_metal.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
+    // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く
+    // （後に置くと `-import-objc-header` が `-DVP_ENABLE_GAMEPAD` を誤って path として消費してしまう）。
+    if (enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
+    compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");

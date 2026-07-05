@@ -80,8 +80,10 @@ pub fn main() !void {
         const pad0 = window.getGamepadState(0);
         if (pad0) |state| {
             const stick = gamepad.applyDeadzone(state.left_stick, DEADZONE);
+            // stick.y は raw値（上入力=+1。ADR-009/TASK-80.2）。framebuffer の Y は下方向が正なので
+            // 符号を反転し、実機で「上に入れると点が上へ動く」直感に合わせる（TASK-80.2 微調整）。
             point_x = std.math.clamp(point_x + stick.x * MOVE_SPEED, 0, WINDOW_W - POINT_SIZE);
-            point_y = std.math.clamp(point_y + stick.y * MOVE_SPEED, 0, WINDOW_H - POINT_SIZE);
+            point_y = std.math.clamp(point_y - stick.y * MOVE_SPEED, 0, WINDOW_H - POINT_SIZE);
             if (gamepad.justPressed(prev_buttons, state.buttons, .a)) {
                 color_idx = (color_idx + 1) % PALETTE.len;
                 std.debug.print("[GAMEPAD] {s} pressed -> color {d}\n", .{ gamepad.getButtonName(.a), color_idx });

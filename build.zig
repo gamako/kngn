@@ -1323,12 +1323,15 @@ fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, defa
 // （platform module には build_options.platform_backend が付与される）
 // ============================================================
 const PlatformModules = struct {
-    platform: TaggedModule,
+    platform: TaggedModule, // ゲームパッド opt-in 無効（既定。main/pixie/synth/modular/patch/大半の example が使う。TASK-80.2 opt-in 化）
+    platform_gamepad: TaggedModule, // ゲームパッド opt-in 有効（GameController framework をリンク。examples/22_gamepad 専用）
     keyboard: *std.Build.Module, // src/ レガシー（examples 専用。層管理外）
-    kit: TaggedModule, // 公開 umbrella（ADR-007 R4）。apps はこれだけを import する（R5）
+    kit: TaggedModule, // 公開 umbrella（ADR-007 R4）。apps はこれだけを import する（R5）。platform(opt-in無効) 側を配線
 };
 
 fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules) PlatformModules {
+    // ゲームパッド opt-in 無効版（既定）。main/pixie/synth/modular/patch/example_01..21 はこちらを使う
+    // （GameController framework 非リンク・.m/.swift の gamepad コードも条件コンパイルで除外。TASK-80.2 opt-in 化）。
     const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
         target,
@@ -1337,14 +1340,30 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         backend,
         common.types.mod,
         common.harness.mod,
+        false,
     ) };
-    // keyboard は KeyCode 型定義を platform から借りる
+    // ゲームパッド opt-in 有効版。examples/22_gamepad だけがこちらを使う（GameController framework をリンクし、
+    // .m/.swift の gamepad コードも有効化される）。同じ backend/types/harness から作るが build_options が異なるため
+    // 別 Module インスタンスが必要（addOptions は Module 生成時に焼き込まれ、共有 Module では上書きできない）。
+    const platform_gamepad_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
+        b,
+        target,
+        b.path("core/platform.zig"),
+        b.path("platform"),
+        backend,
+        common.types.mod,
+        common.harness.mod,
+        true,
+    ) };
+    // keyboard は KeyCode 型定義を platform から借りる（opt-in 無効側で十分。examples の keyboard 入力は
+    // gamepad の有無に依存しない）。
     const keyboard_mod = b.createModule(.{
         .root_source_file = b.path("src/keyboard.zig"),
     });
     keyboard_mod.addImport("platform", platform_mod.mod);
 
     // kit umbrella（backend 毎。ADR-007 R4）。kit/kit.zig の pub import と 1:1 で揃えること。
+    // pixie/synth/modular/patch はゲームパッド opt-in しないため opt-in 無効側の platform を配線する。
     const kit: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
     }) };
@@ -1359,7 +1378,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.synth);
     link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
 
-    return .{ .platform = platform_mod, .keyboard = keyboard_mod, .kit = kit };
+    return .{ .platform = platform_mod, .platform_gamepad = platform_gamepad_mod, .keyboard = keyboard_mod, .kit = kit };
 }
 
 // ============================================================
@@ -1385,7 +1404,8 @@ fn addMainExe(
     });
     // src/main.zig は apps/ 配下でないため R5（kit-only）対象外（examples と同じ従来配線）。
     exe.root_module.addImport("platform", pm.platform.mod);
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。main は gamepad を使わないため既存exe不変）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
     return exe;
 }
 
@@ -1430,6 +1450,14 @@ const SharedModules = struct {
             .link_libc = true,
         }) };
         platform_mod.mod.addIncludePath(b.path("platform"));
+        // build_options.enable_gamepad（TASK-80.2 opt-in 化）: 外部消費者（tictactoe 等。dep.module("platform")）
+        // 向けの facade も core/platform.zig を root にするため同じ named import が要る。外部消費者は
+        // ゲームパッド opt-in を選べないため既定 false（GameController 非リンクの安全側）。
+        {
+            const opts = b.addOptions();
+            opts.addOption(bool, "enable_gamepad", false);
+            platform_mod.mod.addOptions("build_options", opts);
+        }
 
         // keyboard は KeyCode 型定義を platform から借りる（src/ レガシー。examples 専用のため
         // 層管理外の素配線。apps へは配線しない）。
@@ -1687,7 +1715,10 @@ fn addExampleExe(
     });
     // 全 example が platform / keyboard を使う
     // （examples は教材として R5=kit-only の対象外。従来の個別 module 配線を維持する）
-    exe.root_module.addImport("platform", pm.platform.mod);
+    // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs_gamepad の example（22_gamepad のみ）だけ
+    // opt-in 有効側の platform module を使う（GameController framework リンク + .m/.swift の
+    // gamepad コード有効化）。他の example は既定の opt-in 無効側（既存exe不変）。
+    exe.root_module.addImport("platform", if (needs.needs_gamepad) pm.platform_gamepad.mod else pm.platform.mod);
     exe.root_module.addImport("keyboard", pm.keyboard);
     if (needs.needs_sprite) exe.root_module.addImport("sprite", common.sprite);
     if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", common.fps_counter);
@@ -1712,7 +1743,9 @@ fn addExampleExe(
     opts.addOption([]const u8, "platform_name", platform.backendName(platform_type));
     exe.root_module.addOptions("build_options", opts);
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs.needs_gamepad の exe だけ GameController framework
+    // リンク + .m/.swift gamepad コード有効化（上の addImport 選択と揃える）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, needs.needs_gamepad);
     return exe;
 }
 
@@ -1743,7 +1776,8 @@ fn addPixieExe(
     link(root, pm.kit);
     link(root, common.paint);
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
     return exe;
 }
 
@@ -1783,7 +1817,8 @@ fn addPatchExe(
     link(root, common.serde); // graph_io.zig（TASK-65 serialize: ノード/エッジ構成の versioned container 直列化）
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
     return exe;
 }
 
@@ -1818,7 +1853,8 @@ fn addSynthExe(
     link(root, common.serde); // patch_io.zig（音色/FX パラメータの versioned container 直列化）
     linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
     return exe;
 }
 
@@ -1860,7 +1896,8 @@ fn addModularExe(
     linkAppException(root, common.dsp, "apps/modular/patch.zig が test root を兼ねる（FFT band energy 検証）");
     linkAudioBackend(exe, target.result.os.tag);
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
     return exe;
 }
 
@@ -1903,7 +1940,8 @@ fn addCaptureDemoExe(
     exe.root_module.addImport("synth", common.synth.mod); // SampleTap（mic capture callback → メインスレッド可視化のロックフリー受け渡し）
     linkAudioBackend(exe, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture 用 AVFoundation/CoreMedia/CoreVideo/Foundation/objc も含む
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
     return exe;
 }
 
@@ -2014,7 +2052,11 @@ fn addPlatformNativeLib(
     platform_type: platform.PlatformType,
     name: []const u8,
 ) *std.Build.Step.Compile {
-    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root);
+    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化）。外部消費者向け native archive は
+    // SharedModules の外部公開 "platform" module（build_options.enable_gamepad=false）と対で
+    // GameController framework を一切参照しない .o にする（consumer 側で framework 検索パスを
+    // 解決できないのと同じ理由で、opt-in も consumer 側に委ねない）。
+    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, false);
 
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_native_stub.zig"),

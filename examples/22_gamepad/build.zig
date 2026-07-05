@@ -15,5 +15,8 @@ pub fn build(b: *std.Build) void {
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .gamepad_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
+        // ゲームパッド実 backend（GameController framework）を opt-in（TASK-80.2 opt-in 化。audio の
+        // link_audio と対称）。この standalone ビルドの唯一の opt-in exe。
+        .link_gamepad = true,
     });
 }

@@ -39,6 +39,10 @@ const types = @import("platform_types");
 // harness は共有 module（src/audio.zig facade も同一インスタンスを import し module-level state を共有する）。
 // このため source-relative `@import("harness.zig")` ではなく名前付き module import を使う (TASK-32.2)。
 const harness = @import("harness");
+// ゲームパッド実 backend（GameController framework）の opt-in フラグ（TASK-80.2 opt-in 化。audio の
+// `link_audio` と対称）。build.zig の `createPlatformModule`/`buildStandalone` が常にこの named import を
+// 付与するため（外部公開 module も含む）、全 caller で安全に参照できる。
+const build_options = @import("build_options");
 
 const backend = switch (builtin.os.tag) {
     .macos => @import("platform_macos.zig"),
@@ -180,18 +184,26 @@ pub const Window = struct {
         self.inner.setCursor(shape);
     }
 
-    /// 指定 index のゲームパッド状態を取得する（ポーリング主軸。ADR-009 / TASK-80.1）。
-    /// 全 backend は当面 `null` を返すスタブ（実装は TASK-80.2。backend ファイルは本タスクで無改造）。
+    /// 指定 index のゲームパッド状態を取得する（ポーリング主軸。ADR-009 / TASK-80.1・80.2）。
     /// harness 有効時（headless 含む）は facade の 5 つ目のチョークポイントとして
-    /// `harness.getGamepadState` へ委譲し、`inject gamepad_connect/button/axis` の注入 state を返す。
+    /// `harness.getGamepadState` へ委譲し、`inject gamepad_connect/button/axis` の注入 state を返す
+    /// （実 backend の有無・opt-in 状態に関わらず synthetic state を返す。TASK-80.1 の決定を継承）。
+    /// 非 harness 時は macOS かつ `build_options.enable_gamepad`（TASK-80.2 opt-in 化。audio の
+    /// `link_audio` と対称で、exe ごとに build.zig が opt-in する）のときだけ実 backend
+    /// （GameController framework）へ分岐する。他 backend（Linux/Windows）や opt-in 無効の macOS exe は
+    /// `null` を返すスタブのまま（`builtin.os.tag == .macos` と `build_options.enable_gamepad` は
+    /// いずれも comptime-known 条件のため unselected 分岐は解析されない。本 facade の `sleep()`/`win_sleep`
+    /// と同じ idiom で、Linux/Windows の `Window` に `getGamepadState` を実装させる必要が無く、opt-in
+    /// 無効の macOS exe も GameController のシンボルを一切参照しない）。
     ///
     /// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
     /// （alloc/lock 無し）で全画素ループでも RT でもない。性能規約（SIMD 3点セット等）の
     /// 適用対象外（docs/adr/009 参照）。
     pub fn getGamepadState(self: Window, index: u8) ?GamepadState {
-        _ = self;
         if (harness.isEnabled() or harness.isHeadlessActive()) return harness.getGamepadState(index);
-        return null; // 全 backend 未実装スタブ（TASK-80.2）
+        if (builtin.os.tag != .macos) return null; // Linux/Windows backend は当面未実装（TASK-80.2 は macOS のみ）
+        if (!build_options.enable_gamepad) return null; // opt-in 無効（TASK-80.2 opt-in 化）
+        return self.inner.getGamepadState(index);
     }
 };
 

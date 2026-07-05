@@ -42,10 +42,15 @@ pub fn resolveMacOSSDKPaths(
 
 /// macOS フレームワークを exe にリンクする。
 /// 内部で SDK の framework / library 検索パスも追加する。
+///
+/// `enable_gamepad`: ゲームパッド入力 (GCController/GCExtendedGamepad。TASK-80.2。ADR-009) を
+/// 使う exe だけ true にする（audio の `link_audio` と対称の opt-in。TASK-80.2 opt-in 化リファクタ）。
+/// false の exe は GameController framework をリンクしない（`otool -L` に出ない）。
 pub fn linkMacOSFrameworks(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
     sdk_paths: MacOSSDKPaths,
+    enable_gamepad: bool,
 ) void {
     addMacOSSDKSearchPaths(b, exe, sdk_paths);
 
@@ -58,6 +63,10 @@ pub fn linkMacOSFrameworks(
     };
     for (frameworks) |framework| {
         exe.root_module.linkFramework(framework, .{});
+    }
+    if (enable_gamepad) {
+        // ゲームパッド入力 (GCController/GCExtendedGamepad。TASK-80.2。ADR-009)。opt-in exe のみリンク。
+        exe.root_module.linkFramework("GameController", .{});
     }
 }
 

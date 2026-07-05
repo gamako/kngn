@@ -1,6 +1,9 @@
 import Cocoa
 import QuartzCore
 import UniformTypeIdentifiers
+#if VP_ENABLE_GAMEPAD
+import GameController
+#endif
 
 // CALayer最適化版の実装（Swift）
 // 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
@@ -280,6 +283,116 @@ class PlatformWindowHandle: NSObject {
         super.init()
     }
 }
+
+// ========================================
+// ゲームパッド入力 (TASK-80.2。ADR-009)
+// ========================================
+//
+// opt-in（TASK-80.2 opt-in 化）: GameController framework は audio と同じ opt-in link 方式で、
+// ゲームパッドを使う exe（examples/22_gamepad）だけが build.zig から `-DVP_ENABLE_GAMEPAD` を渡す
+// （build_helpers/platform.zig の compilePlatformLayer 参照）。非 opt-in exe はこのブロック全体が
+// コンパイル対象外になり GameController のシンボルを一切参照しない（`otool -L` にも出ない）。
+#if VP_ENABLE_GAMEPAD
+//
+// GCController ↔ index (0..<PLATFORM_MAX_GAMEPADS) のマッピングを module-level state として保持する。
+// 単一 window 前提（既存コードと同じ）なので、connect/disconnect イベントは「現在アクティブな
+// window」(最後に create された window) の event_queue へ push する。
+
+/// 接続中コントローラの index→GCController マッピング。nil = 空きスロット。
+var gamepadSlots: [GCController?] = Array(repeating: nil, count: Int(PLATFORM_MAX_GAMEPADS))
+/// connect/disconnect イベントを push する先の window。
+weak var gamepadEventWindow: PlatformWindowHandle?
+/// GCControllerDidConnect/DidDisconnect の Notification 監視を設置済みか（1プロセス1回）。
+var gamepadObserversInstalled = false
+
+func gamepadFindSlot(for controller: GCController) -> Int? {
+    return gamepadSlots.firstIndex { $0 === controller }
+}
+
+func gamepadFindFreeSlot() -> Int? {
+    return gamepadSlots.firstIndex { $0 == nil }
+}
+
+/// PlatformEvent.payload.gamepad.name（固定33バイト、NUL終端）へ UTF-8 文字列を切り詰めコピーする。
+func setGamepadEventName(_ ev: inout PlatformEvent, _ name: String) {
+    withUnsafeMutableBytes(of: &ev.payload.gamepad.name) { raw in
+        for i in 0..<raw.count { raw[i] = 0 }
+        let bytes = Array(name.utf8.prefix(raw.count - 1))
+        for (i, b) in bytes.enumerated() { raw[i] = b }
+    }
+}
+
+/// GCController 接続を取り込む。extendedGamepad 非対応（micro gamepad 等）・追跡済み・上限超は無視する。
+func gamepadHandleConnect(_ controller: GCController) {
+    guard controller.extendedGamepad != nil else { return } // 標準レイアウト非対応は対象外
+    guard gamepadFindSlot(for: controller) == nil else { return } // 追跡済み（defensive）
+    guard let handle = gamepadEventWindow else { return } // window 未生成中は無視
+    guard let idx = gamepadFindFreeSlot() else { return } // PLATFORM_MAX_GAMEPADS 台超は無視
+    gamepadSlots[idx] = controller
+
+    var ev = PlatformEvent()
+    ev.type = PLATFORM_EVENT_GAMEPAD_CONNECTED
+    ev.payload.gamepad.index = Int32(idx)
+    setGamepadEventName(&ev, controller.vendorName ?? "Gamepad")
+    handle.event_queue.push(ev)
+}
+
+/// GCController 切断を取り込む。未追跡なら無視する。
+func gamepadHandleDisconnect(_ controller: GCController) {
+    guard let idx = gamepadFindSlot(for: controller) else { return }
+    gamepadSlots[idx] = nil
+    guard let handle = gamepadEventWindow else { return }
+
+    var ev = PlatformEvent()
+    ev.type = PLATFORM_EVENT_GAMEPAD_DISCONNECTED
+    ev.payload.gamepad.index = Int32(idx)
+    handle.event_queue.push(ev)
+}
+
+/// GCControllerDidConnect/DidDisconnect の Notification 監視を 1 プロセス 1 回だけ設置する。
+/// `queue: .main` を明示指定し main thread 配信を強制する（`queue: nil` だと「通知を post した
+/// スレッドで同期実行」になり main thread 保証が無いため。codex レビュー指摘）。これにより
+/// event_queue / gamepadSlots への書き込みが pollEvents 等の main thread 経路と同じスレッドに揃い、
+/// lock 無しでも race しない。
+func gamepadInstallObserversIfNeeded() {
+    if gamepadObserversInstalled { return }
+    gamepadObserversInstalled = true
+    NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { note in
+        guard let controller = note.object as? GCController else { return }
+        gamepadHandleConnect(controller)
+    }
+    NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { note in
+        guard let controller = note.object as? GCController else { return }
+        gamepadHandleDisconnect(controller)
+    }
+}
+
+/// window の create/destroy に合わせて「アクティブ window」を切替える。既に他 window から引き継いだ
+/// slot（前 window の生存中に接続済みだった controller）は新 window へ connected event を再送し、
+/// 未追跡のコントローラは通常の connect 処理で取り込む（codex レビュー指摘: window 再生成時に
+/// 既接続 controller の connected event が新 window に届かない問題への対応）。
+func gamepadAttachWindow(_ handle: PlatformWindowHandle) {
+    gamepadEventWindow = handle
+    gamepadInstallObserversIfNeeded()
+    for (idx, controller) in gamepadSlots.enumerated() {
+        guard let controller = controller else { continue }
+        var ev = PlatformEvent()
+        ev.type = PLATFORM_EVENT_GAMEPAD_CONNECTED
+        ev.payload.gamepad.index = Int32(idx)
+        setGamepadEventName(&ev, controller.vendorName ?? "Gamepad")
+        handle.event_queue.push(ev)
+    }
+    for controller in GCController.controllers() {
+        gamepadHandleConnect(controller) // 未追跡のみ実際に処理する（gamepadFindSlot でスキップ）
+    }
+}
+
+func gamepadDetachWindow(_ handle: PlatformWindowHandle) {
+    if gamepadEventWindow === handle {
+        gamepadEventWindow = nil
+    }
+}
+#endif // VP_ENABLE_GAMEPAD
 
 // カスタムNSView - CALayerベースの高速描画
 class FramebufferView: NSView {
@@ -771,6 +884,11 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     // CADisplayLinkを開始
     view.startDisplayLink()
 
+    #if VP_ENABLE_GAMEPAD
+    // ゲームパッド: このwindowをアクティブにし、既接続コントローラを取り込む (TASK-80.2)
+    gamepadAttachWindow(platformWindow)
+    #endif
+
     let handle = UnsafeMutableRawPointer(Unmanaged.passRetained(platformWindow).toOpaque())
 
     return handle
@@ -793,6 +911,10 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
 
     // ハンドルからPlatformWindowHandleを復元してリリース
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeRetainedValue()
+    #if VP_ENABLE_GAMEPAD
+    // ゲームパッド: このwindowがアクティブなら参照を外す (TASK-80.2)
+    gamepadDetachWindow(handle)
+    #endif
     // CADisplayLink を停止 (callback から view への参照を断つ)
     handle.view.stopDisplayLink()
     // window を閉じる
@@ -955,6 +1077,63 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
 
     return true
 }
+
+// ========================================
+// ゲームパッド入力 (TASK-80.2。ADR-009)
+// ========================================
+//
+// opt-in（TASK-80.2 opt-in 化）: `platform_get_gamepad_state` は platform.h（bridging header）で
+// 常時宣言されるため、シンボル自体は non-opt-in exe でも定義する必要がある。GameController 型を
+// 一切参照しない always-false fallback を #else 側に用意し、リンクエラーの可能性を Zig 側の
+// dead-code-elimination 頼みにしない（防御的設計）。
+#if VP_ENABLE_GAMEPAD
+//
+// GCExtendedGamepad.buttonA/B/X/Y は Apple が「物理位置ベース」で既に正規化済み
+// （Nintendo 系コントローラの A/B・X/Y 入替も GameController framework 側で吸収される）ため、
+// 本実装は 1:1 マッピングするだけで良い。stick の Y 軸は GameController の raw 値
+// （上入力 = +1）をそのまま渡す（screen 座標へのフリップは consumer 責務。ADR-009 の raw値契約を継承）。
+//
+// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
+// （alloc/lock 無し）で全画素ループでも RT でもないため性能規約の適用対象外（ADR-009 参照）。
+@_cdecl("platform_get_gamepad_state")
+func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, out_state: UnsafeMutablePointer<PlatformGamepadState>?) -> Bool {
+    guard let out_state = out_state else { return false }
+    guard index >= 0 && Int(index) < gamepadSlots.count else { return false }
+    guard let controller = gamepadSlots[Int(index)] else { return false }
+    guard let pad = controller.extendedGamepad else { return false } // 接続後に非対応プロファイルへ変化した場合の防御
+
+    var mask: UInt32 = 0
+    if pad.buttonA.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_A.rawValue) }
+    if pad.buttonB.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_B.rawValue) }
+    if pad.buttonX.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_X.rawValue) }
+    if pad.buttonY.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_Y.rawValue) }
+    if pad.leftShoulder.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_LEFT_SHOULDER.rawValue) }
+    if pad.rightShoulder.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_RIGHT_SHOULDER.rawValue) }
+    if pad.buttonMenu.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_START.rawValue) }
+    if pad.buttonOptions?.isPressed == true { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_BACK.rawValue) } // nullable
+    if pad.leftThumbstickButton?.isPressed == true { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_LEFT_STICK.rawValue) } // nullable
+    if pad.rightThumbstickButton?.isPressed == true { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_RIGHT_STICK.rawValue) } // nullable
+    if pad.dpad.up.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_DPAD_UP.rawValue) }
+    if pad.dpad.down.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_DPAD_DOWN.rawValue) }
+    if pad.dpad.left.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_DPAD_LEFT.rawValue) }
+    if pad.dpad.right.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_DPAD_RIGHT.rawValue) }
+    if pad.buttonHome?.isPressed == true { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_GUIDE.rawValue) } // nullable
+
+    out_state.pointee.buttons_mask = mask
+    out_state.pointee.left_stick_x = pad.leftThumbstick.xAxis.value
+    out_state.pointee.left_stick_y = pad.leftThumbstick.yAxis.value
+    out_state.pointee.right_stick_x = pad.rightThumbstick.xAxis.value
+    out_state.pointee.right_stick_y = pad.rightThumbstick.yAxis.value
+    out_state.pointee.left_trigger = pad.leftTrigger.value
+    out_state.pointee.right_trigger = pad.rightTrigger.value
+    return true
+}
+#else
+@_cdecl("platform_get_gamepad_state")
+func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, out_state: UnsafeMutablePointer<PlatformGamepadState>?) -> Bool {
+    return false // opt-in 無効（TASK-80.2 opt-in 化。GameController型を一切参照しない）
+}
+#endif // VP_ENABLE_GAMEPAD
 
 // ========================================
 // ファイル選択ダイアログ (TASK-24)
