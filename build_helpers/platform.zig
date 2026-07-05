@@ -131,6 +131,7 @@ pub fn createPlatformModule(
         mod.linkSystemLibrary("wayland-client", .{});
         mod.linkSystemLibrary("xkbcommon", .{});
         mod.addIncludePath(generateXdgShellClientHeaderDir(b));
+        mod.addIncludePath(generateXdgDecorationClientHeaderDir(b)); // TASK-28.5.6: SSD/CSD 装飾
     }
 
     return mod;
@@ -166,6 +167,32 @@ fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
         "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"", "sh",
     });
     return cmd.addOutputFileArg("xdg-shell-protocol.c");
+}
+
+// xdg-decoration protocol glue（TASK-28.5.6。SSD 要求 / CSD フォールバック）
+// xdg-shell と同型。XML は wayland-protocols の unstable/xdg-decoration。2026-07 時点で本家は staging へ
+// 未移動（unstable/ のまま）。万一パスが外れたら shiso で
+// `find "$(pkg-config --variable=pkgdatadir wayland-protocols)" -iname '*decoration*'` で実パス確認。
+// wl_subcompositor は wayland-client 本体の interface（wayland-client.h に宣言済み）なので scanner 生成は不要。
+
+/// `xdg-decoration-unstable-v1-client-protocol.h` を生成し親ディレクトリ（include path 用）を返す。
+fn generateXdgDecorationClientHeaderDir(b: *std.Build) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"",
+        "sh",
+    });
+    return cmd.addOutputFileArg("xdg-decoration-unstable-v1-client-protocol.h").dirname();
+}
+
+/// `xdg-decoration-unstable-v1-protocol.c`（marshalling 実体）を生成して LazyPath を返す。
+fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"",
+        "sh",
+    });
+    return cmd.addOutputFileArg("xdg-decoration-unstable-v1-protocol.c");
 }
 
 /// 実行ファイルにプラットフォーム層をセットアップする。
@@ -225,6 +252,7 @@ pub fn setupExecutableForPlatform(
             exe.root_module.link_libc = true;
             exe.root_module.linkSystemLibrary("wayland-client", .{});
             exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
+            exe.root_module.addCSourceFile(.{ .file = generateXdgDecorationPrivateCode(b) }); // TASK-28.5.6
         },
         .gdi, .d3d11 => {
             // Windows backend（純 Zig）。platform_windows.zig（dispatcher）が Win32 を extern fn で叩く

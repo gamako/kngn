@@ -31,7 +31,10 @@ const c = @cImport({
     @cInclude("wayland-client.h");
     @cInclude("xkbcommon/xkbcommon.h");
     @cInclude("xdg-shell-client-protocol.h");
+    @cInclude("xdg-decoration-unstable-v1-client-protocol.h"); // TASK-28.5.6: SSD 要求 / CSD fallback
 });
+
+const csd = @import("platform_wayland_csd.zig"); // 装飾の純ロジック（レイアウト/ヒットテスト/描画）
 
 const Error = types.Error;
 const Event = types.Event;
@@ -133,6 +136,18 @@ const State = struct {
     xdg_surface: ?*c.struct_xdg_surface = null,
     toplevel: ?*c.struct_xdg_toplevel = null,
 
+    // ウィンドウ装飾（TASK-28.5.6）: SSD 要求 → 不可なら CSD 自前描画。
+    subcompositor: ?*c.struct_wl_subcompositor = null, // CSD subsurface 用（Stage 2b）
+    deco_manager: ?*c.struct_zxdg_decoration_manager_v1 = null,
+    deco_manager_version: u32 = 1,
+    deco_obj: ?*c.struct_zxdg_toplevel_decoration_v1 = null,
+    // pending: mode 未確定 / ssd: compositor 描画 / csd: 自前描画 / none: 装飾なし（manager/subcompositor 不在）
+    deco_state: enum { pending, ssd, csd, none } = .pending,
+    // decoration.configure(mode) は即時適用せず latch し、xdg_surface.configure(ack) で反映（既存 pending_resize と同型）。
+    // 0=未受信 / 1=client_side / 2=server_side。
+    pending_decoration_mode: u32 = 0,
+    maximized: bool = false, // toplevel states の maximized/tiled（CSD 枠折り畳み判定。Stage 2b で使用）
+
     // 入力（TASK-28.5.3）
     seat: ?*c.struct_wl_seat = null,
     keyboard: ?*c.struct_wl_keyboard = null,
@@ -218,6 +233,14 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.struct_wl_registry, name: u32
         const v = @min(version, 5);
         st.seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, v));
         if (st.seat) |seat| _ = c.wl_seat_add_listener(seat, &seat_listener, st);
+    } else if (std.mem.eql(u8, ifn, "wl_subcompositor")) {
+        // CSD subsurface 用（version 1 固定。negotiation 不要）。不在なら CSD を構築しない（TASK-28.5.6）。
+        st.subcompositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_subcompositor_interface, 1));
+    } else if (std.mem.eql(u8, ifn, "zxdg_decoration_manager_v1")) {
+        // SSD 要求用。min(advertised, 2) で bind（v1/v2 差は set_mode の扱いのみ。TASK-28.5.6）。
+        const v = @min(version, 2);
+        st.deco_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zxdg_decoration_manager_v1_interface, v));
+        st.deco_manager_version = v;
     }
 }
 
@@ -239,10 +262,25 @@ fn wmBasePing(data: ?*anyopaque, wm_base: ?*c.struct_xdg_wm_base, serial: u32) c
     c.xdg_wm_base_pong(wm_base, serial);
 }
 
+/// zxdg_toplevel_decoration_v1.configure(mode)。即時適用せず latch し、xdg_surface.configure(ack) で
+/// deco_state に反映する（既存 pending_resize と同型。TASK-28.5.6）。
+fn decorationConfigure(data: ?*anyopaque, deco: ?*c.struct_zxdg_toplevel_decoration_v1, mode: u32) callconv(.c) void {
+    _ = deco;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    st.pending_decoration_mode = mode;
+}
+
 fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, serial: u32) callconv(.c) void {
     const st: *State = @ptrCast(@alignCast(data.?));
     c.xdg_surface_ack_configure(xdg_surface, serial);
     st.configured = true;
+    // 装飾 mode の適用（TASK-28.5.6）: decoration.configure で latch した mode を ack と同じ configure
+    // sequence で反映する。deco_obj がある場合のみ（FORCE_CSD/manager 不在は create 側で確定済み）。
+    if (st.deco_obj != null and st.pending_decoration_mode != 0) {
+        st.deco_state = if (st.pending_decoration_mode == c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE) .ssd else .csd;
+        // TODO(Stage 2b): csd 確定時は subsurface 構築 + window geometry 再発行 + content サイズ変換。
+        // Stage 2a では csd/none は従来どおり装飾なしで表示する（compile + SSD 経路確立が目的）。
+    }
     // resize（TASK-23）: pending suggested size を ack 後に適用する。ただし初期 setupBuffers より前
     // （buffers 未確保）は適用せず requested size を維持する（create 中は従来挙動）。
     // buffer 実体は lockFramebuffer が free buffer を lazy 再確保する（busy buffer には触らない）。
@@ -562,6 +600,7 @@ const registry_listener = std.mem.zeroInit(c.struct_wl_registry_listener, .{
 });
 const shm_listener = std.mem.zeroInit(c.struct_wl_shm_listener, .{ .format = &shmFormat });
 const wm_base_listener = std.mem.zeroInit(c.struct_xdg_wm_base_listener, .{ .ping = &wmBasePing });
+const decoration_listener = std.mem.zeroInit(c.struct_zxdg_toplevel_decoration_v1_listener, .{ .configure = &decorationConfigure });
 const xdg_surface_listener = std.mem.zeroInit(c.struct_xdg_surface_listener, .{ .configure = &xdgSurfaceConfigure });
 const toplevel_listener = std.mem.zeroInit(c.struct_xdg_toplevel_listener, .{
     .configure = &toplevelConfigure,
@@ -639,9 +678,28 @@ pub const Window = struct {
         _ = c.xdg_toplevel_add_listener(st.toplevel, &toplevel_listener, st);
         c.xdg_toplevel_set_title(st.toplevel, title.ptr);
 
+        // 装飾 mode の決定（TASK-28.5.6）。toplevel 生成後・初回 commit の前に行う（v1 の順序制約）。
+        // FORCE_CSD（debug）は decoration object を作らず即 csd 確定。manager 不在も即確定（csd or none）。
+        // 0.16 std には libc 非依存 getenv が無いため libc getenv を使う（x11 backend と同じ）。
+        const force_csd = std.c.getenv("VP_WAYLAND_FORCE_CSD") != null;
+        if (!force_csd and st.deco_manager != null) {
+            st.deco_obj = c.zxdg_decoration_manager_v1_get_toplevel_decoration(st.deco_manager, st.toplevel);
+            if (st.deco_obj) |d| {
+                _ = c.zxdg_toplevel_decoration_v1_add_listener(d, &decoration_listener, st);
+                c.zxdg_toplevel_decoration_v1_set_mode(d, c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+            } else {
+                st.deco_state = if (st.subcompositor != null) .csd else .none;
+            }
+        } else {
+            // manager 不在 / FORCE_CSD: subcompositor があれば CSD、無ければ装飾なし。
+            st.deco_state = if (st.subcompositor != null) .csd else .none;
+        }
+
         // 初回 commit は buffer を attach しない（初回 xdg_surface.configure を誘発）。
         c.wl_surface_commit(st.surface);
-        while (!st.configured) {
+        // decoration object を作った場合は「初回 configure 前の buffer attach 禁止」制約のため、
+        // xdg_surface configure に加えて decoration mode 確定（deco_state != .pending）も待つ（TASK-28.5.6）。
+        while (!st.configured or (st.deco_obj != null and st.deco_state == .pending)) {
             if (c.wl_display_dispatch(dpy) < 0) return error.WindowCreationFailed;
         }
 
@@ -998,9 +1056,17 @@ fn teardown(st: *State) void {
     st.xkb_state = null;
     st.xkb_keymap = null;
     st.xkb_context = null;
+    // 装飾（TASK-28.5.6）: 子オブジェクト優先破棄。decoration object は xdg_toplevel より前に destroy。
+    // （CSD subsurface 群は Stage 2b で surface 破棄の前に挿入する）
+    if (st.deco_obj) |d| c.zxdg_toplevel_decoration_v1_destroy(d);
+    st.deco_obj = null;
     if (st.toplevel) |t| c.xdg_toplevel_destroy(t);
     if (st.xdg_surface) |x| c.xdg_surface_destroy(x);
     if (st.surface) |s| c.wl_surface_destroy(s);
+    if (st.deco_manager) |m| c.zxdg_decoration_manager_v1_destroy(m);
+    if (st.subcompositor) |sc| c.wl_subcompositor_destroy(sc);
+    st.deco_manager = null;
+    st.subcompositor = null;
     if (st.wm_base) |w| c.xdg_wm_base_destroy(w);
     if (st.shm) |s| c.wl_shm_destroy(s);
     if (st.compositor) |co| c.wl_compositor_destroy(co);
