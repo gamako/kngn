@@ -162,7 +162,7 @@ pub fn isEnabled() bool {
 /// snapshot が返す raw バイト列をそのまま file へ書き、digest が返す1行を既存 sink へ流すだけ。
 /// 各 probe の意味づけ（PNG 化 / JSON 整形 等）は全て app 側 callback に閉じる。
 pub const Probe = struct {
-    /// probe 名（snapshot/digest コマンドの引数。fb/audio/stats は予約名で登録不可）。
+    /// probe 名（snapshot/digest コマンドの引数。fb/audio/stats/capabilities は予約名で登録不可）。
     name: []const u8,
     /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
     ctx: *anyopaque,
@@ -173,11 +173,15 @@ pub const Probe = struct {
     snapshot: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
     /// 1行テキストを buf（DIGEST_BUF_LEN バイト）に書いて返す。改行は含めない。null なら digest 非対応。
     digest: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
+    /// capabilities 列挙（TASK-62.4）用の説明文（省略可）。登録時に `sanitizeDesc` で
+    /// 禁止文字（`"`/`\`/ASCII 制御文字）・200 bytes 超をチェックし、違反時は空文字へ落とす
+    /// （中身の意味解釈ではなく capabilities JSON の wire framing 保護）。
+    desc: []const u8 = "",
 };
 
 /// custom probe を登録する。app は `platform.registerProbe(...)` 経由で `platform.init()` 後に呼ぶ。
 /// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
-/// - 同名は上書き。fb/audio/stats は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
+/// - 同名は上書き。fb/audio/stats/capabilities は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
 pub fn registerProbe(p: Probe) void {
     if (!isEnabled()) return;
     if (isReservedProbeName(p.name)) {
@@ -186,7 +190,9 @@ pub fn registerProbe(p: Probe) void {
     }
     for (probes[0..probe_count]) |*existing| {
         if (std.mem.eql(u8, existing.name, p.name)) {
-            existing.* = p; // 同名上書き
+            var mp = p;
+            mp.desc = sanitizeDesc("probe", p.name, p.desc); // 実際に保存する直前にのみ sanitize（満杯 skip 時に無用な warn を出さない）
+            existing.* = mp; // 同名上書き
             return;
         }
     }
@@ -194,12 +200,37 @@ pub fn registerProbe(p: Probe) void {
         std.debug.print("[harness] registerProbe: registry 満杯（{d}）。'{s}' をスキップ\n", .{ MAX_PROBES, p.name });
         return;
     }
-    probes[probe_count] = p;
+    var mp = p;
+    mp.desc = sanitizeDesc("probe", p.name, p.desc);
+    probes[probe_count] = mp;
     probe_count += 1;
 }
 
 fn isReservedProbeName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats");
+    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or std.mem.eql(u8, name, "capabilities");
+}
+
+/// JSON 文字列へ未エスケープで埋め込むと破損する文字（`"` / `\` / ASCII 制御文字 `0x00..0x1F`。
+/// tab や NUL も含む）を含むかを判定する。`sanitizeDesc`（登録時）と capabilities の entry
+/// 組み立て（format 時、name/ext の防御的チェック）の両方が共有する。
+fn containsUnsafeJsonChar(s: []const u8) bool {
+    for (s) |c| {
+        if (c == '"' or c == '\\' or c < 0x20) return true;
+    }
+    return false;
+}
+
+/// capabilities 列挙用の desc を登録時にサニタイズする。禁止文字を含む、または 200 bytes 超の
+/// desc は warn を出し空文字を返す（登録自体は成功させ desc だけ無効化。JSON buffer 安全性のための
+/// wire framing 保護であり、desc の意味解釈ではない）。
+const MAX_DESC_LEN = 200;
+fn sanitizeDesc(kind: []const u8, name: []const u8, desc: []const u8) []const u8 {
+    if (desc.len == 0) return desc;
+    if (desc.len > MAX_DESC_LEN or containsUnsafeJsonChar(desc)) {
+        std.debug.print("[harness] {s} desc for '{s}' は無効化されました（禁止文字 or 200 bytes 超）\n", .{ kind, name });
+        return "";
+    }
+    return desc;
 }
 
 fn findProbe(name: []const u8) ?*Probe {
@@ -221,7 +252,8 @@ pub const Action = struct {
     name: []const u8,
     /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
     ctx: *anyopaque,
-    /// capabilities 列挙（TASK-62.4）用の説明文。今回は未使用（省略可）。
+    /// capabilities 列挙（TASK-62.4）用の説明文（省略可）。登録時に `sanitizeDesc` で
+    /// 禁止文字（`"`/`\`/ASCII 制御文字）・200 bytes 超をチェックし、違反時は空文字へ落とす。
     desc: []const u8 = "",
     /// 操作を実行し結果1行を返す write callback。
     /// - `args` は `action <name>` の後の残り行 raw テキスト（trim 済み・再トークン化しない）。
@@ -251,7 +283,9 @@ pub fn registerAction(a: Action) void {
     }
     for (actions[0..action_count]) |*existing| {
         if (std.mem.eql(u8, existing.name, a.name)) {
-            existing.* = a; // 同名上書き
+            var ma = a;
+            ma.desc = sanitizeDesc("action", a.name, a.desc); // 実際に保存する直前にのみ sanitize（満杯 skip 時に無用な warn を出さない）
+            existing.* = ma; // 同名上書き
             return;
         }
     }
@@ -259,7 +293,9 @@ pub fn registerAction(a: Action) void {
         std.debug.print("[harness] registerAction: registry 満杯（{d}）。'{s}' をスキップ\n", .{ MAX_ACTIONS, a.name });
         return;
     }
-    actions[action_count] = a;
+    var ma = a;
+    ma.desc = sanitizeDesc("action", a.name, a.desc);
+    actions[action_count] = ma;
     action_count += 1;
 }
 
@@ -735,6 +771,14 @@ fn handleSnapshot(it: *Tok) void {
             return;
         };
         emitSnapshot("stats", path, "json");
+    } else if (std.mem.eql(u8, probe, "capabilities")) {
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/capabilities_{d}.json", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        const json = formatCapabilitiesPayload(&capabilities_buf);
+        std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = json }) catch |err| {
+            std.debug.print("[harness] snapshot capabilities 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            return;
+        };
+        emitSnapshot("capabilities", path, "json");
     } else if (findProbe(probe)) |p| {
         snapshotCustom(p, path_arg, &path_buf);
     } else {
@@ -760,6 +804,146 @@ fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
     emitSnapshot(p.name, path, info);
 }
 
+// ============================================================================
+// capabilities probe（登録済み probe・action の内省列挙。TASK-62.4）
+//
+// ホットパス宣言: イベント/接続時のみ（digest/snapshot コマンド処理時に固定長 registry
+// （最大 probe 16 + action 16 + 組み込み 4 = 36 件）を1回走査するだけ。フレーム毎・毎サンプルでは
+// 走らない）。RT 共有状態には触れない（main スレッドの固定長 registry 読みのみ）。
+//
+// 中身非解釈の不変条件: name/ext/desc と snapshot/digest の**有無**（callback が non-null か）を
+// 登録情報からそのまま転記するだけ。callback 自体は絶対に呼ばない。
+// ============================================================================
+
+/// capabilities JSON の組み立て先（単一プロセス debug facility の再利用スクラッチ。
+/// audio_scratch/port_file_buf と同型で単一 main スレッド逐次実行のため競合なし）。
+var capabilities_buf: [16 * 1024]u8 = undefined;
+
+/// `formatCapabilitiesPayload` が「常に valid JSON を返す」契約を満たすために要求する最小 buf 長。
+/// これ未満の buf を渡すのは呼び出し側のバグなので assert で落とす（capabilities_buf・テストの
+/// 明示的な buf は常にこれ以上）。
+const MIN_CAPABILITIES_BUF_LEN = 128;
+/// 末尾のクロージング専用に予約するバイト数。最大想定クロージング文字列
+/// `],"actions":[],"truncated":true}`（34B）に対し余裕を持たせる。
+const CAPABILITIES_RESERVED_TAIL = 64;
+
+const CapabilityBuiltin = struct { name: []const u8, ext: []const u8, desc: []const u8 };
+const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
+    .{ .name = "fb", .ext = "png", .desc = "framebuffer PNG/digest" },
+    .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms・peak・f0・silent" },
+    .{ .name = "stats", .ext = "json", .desc = "EventStats + 仮想fps JSON" },
+    .{ .name = "capabilities", .ext = "json", .desc = "登録済み probe・action の内省列挙" },
+};
+
+/// `s` を `buf[len.*..limit)` に収まる場合のみ書き込む。収まらなければ何も書かず false を返す
+/// （書きかけの半端なバイト列を残さない）。**`len`/`limit` は常に `buf` 全体を基準にした絶対
+/// オフセット**として扱う（呼び出し元で `buf` 自体をスライスして渡さないこと。`len` がフェーズを
+/// またいで大きい `limit`（tail 領域）まで進むことがあるため、`buf` を切り詰めた別スライスと
+/// 座標系が食い違うと `limit - len` が負に振れて overflow panic する。実装中に実際にこの形の
+/// バグを踏んだので、契約として明記する）。
+fn appendRaw(buf: []u8, limit: usize, len: *usize, s: []const u8) bool {
+    if (limit < len.* or limit - len.* < s.len) return false;
+    @memcpy(buf[len.*..][0..s.len], s);
+    len.* += s.len;
+    return true;
+}
+
+/// 1 probe エントリを `buf[0..limit)`（`len` 経由）へ追記する。name/ext に JSON を破損させる
+/// 文字が含まれる、またはエントリが収まらない場合は何も書かず false を返す（呼び出し元が
+/// truncated フラグを立てる）。中身非解釈: 値をそのまま転記するだけで callback は呼ばない。
+fn appendProbeEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, ext: []const u8, has_snapshot: bool, has_digest: bool, desc: []const u8) bool {
+    if (containsUnsafeJsonChar(name) or containsUnsafeJsonChar(ext) or containsUnsafeJsonChar(desc)) return false;
+    var scratch: [768]u8 = undefined;
+    const entry = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"ext\":\"{s}\",\"snapshot\":{},\"digest\":{},\"desc\":\"{s}\"}}", .{ name, ext, has_snapshot, has_digest, desc }) catch return false;
+    return appendRaw(buf, limit, len, entry);
+}
+
+/// `appendProbeEntry` の action 版（`ext`/`snapshot`/`digest` フィールドが無い）。
+fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, desc: []const u8) bool {
+    if (containsUnsafeJsonChar(name) or containsUnsafeJsonChar(desc)) return false;
+    var scratch: [768]u8 = undefined;
+    const entry = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"desc\":\"{s}\"}}", .{ name, desc }) catch return false;
+    return appendRaw(buf, limit, len, entry);
+}
+
+/// 登録済み probe（組み込み4件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
+/// **常に valid JSON を返す**契約（`buf.len >= MIN_CAPABILITIES_BUF_LEN` が前提）。容量超過や
+/// name/ext の不正文字でエントリを省略した場合は末尾に `"truncated":true` を付与する。
+fn formatCapabilitiesPayload(buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= MIN_CAPABILITIES_BUF_LEN);
+    // content_limit: エントリ/区切りを書いてよい範囲。buf.len: クロージング（"]" 等）を書いてよい範囲
+    // （末尾 CAPABILITIES_RESERVED_TAIL 分の余裕）。`len` は常に buf 全体基準の絶対オフセットなので、
+    // フェーズによって limit を使い分けても座標系は矛盾しない（appendRaw 参照）。
+    const content_limit = buf.len - CAPABILITIES_RESERVED_TAIL;
+    var len: usize = 0;
+    var truncated = false;
+
+    _ = appendRaw(buf, content_limit, &len, "{\"probes\":[");
+    var first = true;
+    probes_blk: {
+        for (CAPABILITY_BUILTINS) |b| {
+            const saved_len = len; // entry 追記が失敗したら区切り "," ごとロールバックする（trailing comma 防止）
+            if (!first and !appendRaw(buf, content_limit, &len, ",")) {
+                len = saved_len;
+                truncated = true;
+                break :probes_blk;
+            }
+            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, true, true, b.desc)) {
+                len = saved_len;
+                truncated = true;
+                break :probes_blk;
+            }
+            first = false;
+        }
+        for (probes[0..probe_count]) |p| {
+            const saved_len = len;
+            if (!first and !appendRaw(buf, content_limit, &len, ",")) {
+                len = saved_len;
+                truncated = true;
+                break :probes_blk;
+            }
+            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null, p.digest != null, p.desc)) {
+                len = saved_len;
+                truncated = true;
+                break :probes_blk;
+            }
+            first = false;
+        }
+    }
+    _ = appendRaw(buf, buf.len, &len, "]"); // RESERVED_TAIL 予約分があるので必ず入る
+
+    // "actions" セクションの開始自体が content_limit に収まらない可能性があるため戻り値を確認する
+    // （収まらなければ probes 側で打ち切った場合と同じ扱いに倒す。codex レビューで発見。
+    // これを確認せず進めると `,"actions":[` を書けないまま後段の `]` だけ追記して invalid JSON になる）。
+    if (!truncated and appendRaw(buf, content_limit, &len, ",\"actions\":[")) {
+        first = true;
+        actions_blk: {
+            for (actions[0..action_count]) |a| {
+                const saved_len = len;
+                if (!first and !appendRaw(buf, content_limit, &len, ",")) {
+                    len = saved_len;
+                    truncated = true;
+                    break :actions_blk;
+                }
+                if (!appendActionEntry(buf, content_limit, &len, a.name, a.desc)) {
+                    len = saved_len;
+                    truncated = true;
+                    break :actions_blk;
+                }
+                first = false;
+            }
+        }
+        _ = appendRaw(buf, buf.len, &len, "]"); // RESERVED_TAIL 予約分があるので必ず入る
+    } else {
+        truncated = true;
+        _ = appendRaw(buf, buf.len, &len, ",\"actions\":[]"); // probes 側で打ち切った、または "actions":[ 自体が収まらない
+    }
+
+    if (truncated) _ = appendRaw(buf, buf.len, &len, ",\"truncated\":true");
+    _ = appendRaw(buf, buf.len, &len, "}");
+    return buf[0..len];
+}
+
 /// digest 1行 payload の取得結果。`unavailable` は取得できない理由（静的文字列）を保持し、
 /// digest コマンドの warn と expect/assert の `actual=` 表示の両方で診断性を保つ（TASK-78）。
 const DigestResult = union(enum) {
@@ -768,7 +952,9 @@ const DigestResult = union(enum) {
 };
 
 /// probe 名から digest の1行 payload を返す（`digest` コマンドと `expect`/`assert` が共有）。
-/// buf は payload の書き込み先。fb/stats/audio/custom いずれも収まるよう caller は `DIGEST_BUF_LEN` を渡す。
+/// buf は payload の書き込み先。fb/stats/audio/custom いずれも収まるよう caller は `DIGEST_BUF_LEN` を渡す
+/// （`capabilities` は渡された `buf` を使わず専用の `capabilities_buf`(16KB) を使う。custom probe/action
+/// callback 向けの `DIGEST_BUF_LEN=1024` 契約とは別枠のため）。
 /// 中身非解釈の不変条件は維持（framework は payload の意味を解釈しない）。
 fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
     if (std.mem.eql(u8, probe, "fb")) {
@@ -778,6 +964,8 @@ fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
         return .{ .ok = formatAudioPayload(buf) };
     } else if (std.mem.eql(u8, probe, "stats")) {
         return .{ .ok = formatStatsPayload(buf) };
+    } else if (std.mem.eql(u8, probe, "capabilities")) {
+        return .{ .ok = formatCapabilitiesPayload(&capabilities_buf) };
     } else if (findProbe(probe)) |p| {
         const dg = p.digest orelse return .{ .unavailable = "digest unsupported" };
         return .{ .ok = dg(p.ctx, buf) };
@@ -2095,6 +2283,193 @@ test "action live: 成功は bare `<name> <msg>`、失敗は `fail <name> <msg>`
     }
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail nosuch unknown action"));
     try testing.expectEqual(@as(usize, 0), expect_failures); // live は記帳しない
+}
+
+// ============================================================================
+// capabilities probe（登録済み probe・action の内省列挙。TASK-62.4）tests
+// ============================================================================
+
+fn testProbeSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    _ = ctx;
+    return allocator.dupe(u8, "snap");
+}
+
+/// capabilities JSON をパースし `std.json.Parsed(std.json.Value)` を返す（呼び出し側が `deinit()`）。
+fn parseCapabilities(payload: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
+}
+
+test "capabilities: 予約名で登録拒否" {
+    resetForTest();
+    var c = TestProbeCtx{ .value = 1 };
+    registerProbe(.{ .name = "capabilities", .ctx = &c, .digest = testProbeDigest });
+    try testing.expectEqual(@as(usize, 0), probe_count);
+}
+
+test "capabilities: custom probe/action 0件 → 組み込み4 probe + actions:[]" {
+    resetForTest();
+    var buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
+    _ = &buf; // 使わない（capabilities_buf を直接使う）
+    const payload = formatCapabilitiesPayload(&capabilities_buf);
+
+    var parsed = try parseCapabilities(payload);
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqual(@as(?std.json.Value, null), root.get("truncated"));
+    const probes_arr = root.get("probes").?.array.items;
+    try testing.expectEqual(@as(usize, 4), probes_arr.len);
+    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities" };
+    for (probes_arr, 0..) |entry, i| {
+        try testing.expectEqualStrings(expected_names[i], entry.object.get("name").?.string);
+        try testing.expect(entry.object.get("snapshot").?.bool);
+        try testing.expect(entry.object.get("digest").?.bool);
+    }
+    try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
+}
+
+test "capabilities: custom probe/action がフィールド値・登録順で現れる" {
+    resetForTest();
+    var c1 = TestProbeCtx{ .value = 1 };
+    var c2 = TestProbeCtx{ .value = 2 };
+    registerProbe(.{ .name = "p1", .ctx = &c1, .ext = "png", .desc = "d1", .digest = testProbeDigest }); // digest-only
+    registerProbe(.{ .name = "p2", .ctx = &c2, .ext = "json", .snapshot = testProbeSnapshot }); // snapshot-only・desc省略
+    var ac1 = TestActionCtx{};
+    var ac2 = TestActionCtx{};
+    registerAction(.{ .name = "a1", .ctx = &ac1, .run = testActionRun, .desc = "ad1" });
+    registerAction(.{ .name = "a2", .ctx = &ac2, .run = testActionRun }); // desc省略
+
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const probes_arr = root.get("probes").?.array.items;
+    try testing.expectEqual(@as(usize, 6), probes_arr.len); // 組み込み4 + custom2
+
+    const p1 = probes_arr[4].object;
+    try testing.expectEqualStrings("p1", p1.get("name").?.string);
+    try testing.expectEqualStrings("png", p1.get("ext").?.string);
+    try testing.expectEqualStrings("d1", p1.get("desc").?.string);
+    try testing.expect(!p1.get("snapshot").?.bool);
+    try testing.expect(p1.get("digest").?.bool);
+
+    const p2 = probes_arr[5].object;
+    try testing.expectEqualStrings("p2", p2.get("name").?.string);
+    try testing.expectEqualStrings("json", p2.get("ext").?.string);
+    try testing.expectEqualStrings("", p2.get("desc").?.string);
+    try testing.expect(p2.get("snapshot").?.bool);
+    try testing.expect(!p2.get("digest").?.bool);
+
+    const actions_arr = root.get("actions").?.array.items;
+    try testing.expectEqual(@as(usize, 2), actions_arr.len);
+    try testing.expectEqualStrings("a1", actions_arr[0].object.get("name").?.string);
+    try testing.expectEqualStrings("ad1", actions_arr[0].object.get("desc").?.string);
+    try testing.expectEqualStrings("a2", actions_arr[1].object.get("name").?.string);
+    try testing.expectEqualStrings("", actions_arr[1].object.get("desc").?.string);
+}
+
+test "capabilities: desc 規約違反（禁止文字・200 bytes 超）は登録時に空文字化" {
+    resetForTest();
+    var c = TestProbeCtx{ .value = 1 };
+    registerProbe(.{ .name = "badp", .ctx = &c, .digest = testProbeDigest, .desc = "bad\"desc" });
+    try testing.expectEqual(@as(usize, 0), findProbe("badp").?.desc.len);
+
+    const long_desc = [_]u8{'a'} ** (MAX_DESC_LEN + 1);
+    registerProbe(.{ .name = "badp2", .ctx = &c, .digest = testProbeDigest, .desc = &long_desc });
+    try testing.expectEqual(@as(usize, 0), findProbe("badp2").?.desc.len);
+
+    var ac = TestActionCtx{};
+    registerAction(.{ .name = "bada", .ctx = &ac, .run = testActionRun, .desc = "bad\"desc" });
+    try testing.expectEqual(@as(usize, 0), findAction("bada").?.desc.len);
+}
+
+test "capabilities: name の不正文字（\" / 制御文字）はエントリを省略し truncated=true（手前の正常エントリは残る）" {
+    resetForTest();
+    var c1 = TestProbeCtx{ .value = 1 };
+    var c2 = TestProbeCtx{ .value = 2 };
+    registerProbe(.{ .name = "good1", .ctx = &c1, .digest = testProbeDigest }); // 正常（先に登録）
+    registerProbe(.{ .name = "bad\"name", .ctx = &c2, .digest = testProbeDigest }); // " を含む
+    try testing.expectEqual(@as(usize, 2), probe_count); // 登録自体は成立する
+
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("truncated").?.bool);
+    const probes_arr = root.get("probes").?.array.items;
+    try testing.expectEqual(@as(usize, 5), probes_arr.len); // 組み込み4 + good1（bad は省略）
+    try testing.expectEqualStrings("good1", probes_arr[4].object.get("name").?.string);
+}
+
+test "capabilities: action 名の制御文字（NUL。isValidActionName は通過するが JSON では不正）はエントリ省略+truncated" {
+    resetForTest();
+    var ac = TestActionCtx{};
+    registerAction(.{ .name = "bad\x00name", .ctx = &ac, .run = testActionRun });
+    try testing.expectEqual(@as(usize, 1), action_count); // registerAction 自体は成立する
+
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("truncated").?.bool);
+    try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
+}
+
+test "capabilities: ext の不正文字（tab）もエントリを省略し truncated=true" {
+    resetForTest();
+    var c = TestProbeCtx{ .value = 1 };
+    registerProbe(.{ .name = "p", .ctx = &c, .ext = "bad\text", .digest = testProbeDigest });
+
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("truncated").?.bool);
+    try testing.expectEqual(@as(usize, 4), root.get("probes").?.array.items.len); // 組み込み4のみ（p は省略）
+}
+
+test "capabilities: MIN_CAPABILITIES_BUF_LEN ちょうどの buf でもフェイルセーフで valid JSON + truncated=true" {
+    resetForTest();
+    var small_buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
+    const payload = formatCapabilitiesPayload(&small_buf);
+
+    var parsed = try parseCapabilities(payload);
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("truncated").?.bool);
+    try testing.expectEqual(@as(usize, 0), root.get("probes").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
+}
+
+test "capabilities: buf 境界の全数チェック（probes は収まるが `,\"actions\":[` が収まらない等の境界も含め常に valid JSON）" {
+    // codex レビューで発見された実バグ（"actions" セクション開始の追記失敗を無視し invalid JSON になる）の
+    // 回帰テスト。ピンポイントの magic number ではなく MIN_CAPABILITIES_BUF_LEN から広い範囲を1バイト刻みで
+    // 網羅し、どの buf サイズでも必ず valid JSON になることを固定する。
+    resetForTest();
+    var big_buf: [MIN_CAPABILITIES_BUF_LEN + 700]u8 = undefined;
+    var n: usize = MIN_CAPABILITIES_BUF_LEN;
+    while (n <= big_buf.len) : (n += 1) {
+        const payload = formatCapabilitiesPayload(big_buf[0..n]);
+        var parsed = parseCapabilities(payload) catch |err| {
+            std.debug.print("buf len={d} で invalid JSON: {s}\npayload={s}\n", .{ n, @errorName(err), payload });
+            return err;
+        };
+        parsed.deinit();
+    }
+}
+
+test "capabilities: digestPayload 経由（digest capabilities）でも同じ JSON が得られる" {
+    resetForTest();
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    switch (digestPayload("capabilities", &buf)) {
+        .ok => |payload| {
+            var parsed = try parseCapabilities(payload);
+            defer parsed.deinit();
+            try testing.expectEqual(@as(usize, 4), parsed.value.object.get("probes").?.array.items.len);
+        },
+        .unavailable => try testing.expect(false),
+    }
+}
+
+test "capabilities: pollGate 経由（digest capabilities コマンド）でも例外なく処理される" {
+    resetForTest();
+    cmd_buf = "digest capabilities";
+    try testing.expect(!pollGate(true)); // EOF → replay 終了（expect_failures=0 なので exit しない）
 }
 
 // ============================================================================

@@ -445,6 +445,12 @@ AI がアプリの出力を手軽に確認するための仕組み。`core/platf
 - **P4 スコープ外**: Metal の GPU drawable 読み戻し（描画後の合成サーフェスの readback）。理由は上記の CPU
   framebuffer 経由で既に `snapshot fb`/`digest fb` が metal ビルドでも成立しており（objc と crc bit 一致・
   実測済み）、readback は harness の目的（アプリが描いた内容の検証）に寄与しないため見送った。
+- **action registry（TASK-62.1, 実装済み）**: probe（read）に対称な write/operate 口。app が
+  `platform.registerAction(...)` で opt-in 登録し `action <name> [args...]` で叩ける。詳細は下記
+  「custom action の足し方」。
+- **capabilities（内省 probe。TASK-62.4, 実装済み）**: 組み込み probe `capabilities` が、登録済み
+  probe・action を JSON 1行で列挙する（`digest capabilities`/`snapshot capabilities`）。将来の
+  TASK-62.3（network discover）の入口。詳細は下記コマンド言語節の「capabilities（内省 probe）」。
 
 ### コマンド言語（file replay と live で共通）
 
@@ -463,6 +469,8 @@ snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n>（mono downmix・自己相関 f0）
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...}（JSON 1行）
+digest capabilities        # {"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..},...],"actions":[{"name":..,"desc":..},...]}（登録済み probe・action の内省列挙。TASK-62.4）
+snapshot capabilities /tmp/c.json # capabilities を JSON 保存（省略時 capabilities_<n>.json）
 action <name> [args...]    # app が registerAction した高レベル操作を実行（probe(read)対称のwrite口。TASK-62.1）
 expect fb crc=8702DD71     # expect <probe> <key><op><value>（op ∈ = != > <）。digest payload の top-level k=v と照合
 expect audio silent=0      # 一致で ok / 不一致で fail。replay は失敗を溜め終了時に非0 exit、live は ok/fail 行を返す
@@ -471,8 +479,11 @@ expect fb contains crc=87  # contains <substr>: digest 1行への部分文字列
 quit                       # 終了（EOF でも終了）
 ```
 
-- **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `core/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON)。
+- **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `core/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON) / `capabilities`(登録済み probe・action の内省列挙。下記)。
   `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
+- **capabilities（内省 probe / TASK-62.4）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み4件（`fb`/`audio`/`stats`/`capabilities` 自身。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
+  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 16 + 組み込み4）と desc の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
+  - 将来クライアント（TASK-62.3 network discover 等）が「今このアプリで何を観測・操作できるか」を discover する入口になる。
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
 - **inject の修飾子トークン（TASK-32.5）**: `inject` の必須引数の後に `shift`/`ctrl`/`alt`/`cmd` を 0 個以上付けると、その KeyEvent/MouseEvent の `modifiers` に反映される（順不同・大小無視）。key_down/up・mouse_move/down/up・scroll の全経路で使える。例: `inject key_down S cmd`（Cmd+S）/ `inject key_down Z cmd`（undo）/ `inject mouse_down left alt`。**未知トークンが 1 つでもあれば警告を出し、そのイベントは注入されない（fail-fast。修飾子名の typo を握りつぶさない）**。修飾子無しは従来通り空 modifiers。
@@ -580,9 +591,10 @@ app が内部状態を opt-in で probe として公開する。**framework（`c
 
 規約・制約:
 - **snapshot=raw bytes / digest=1行 / 画像=PNG・構造化=JSON|text**（組み込みと同一規約）。
-- `fb` / `audio` / `stats` は予約名（登録拒否）。同名 custom は上書き。registry 上限は 16。
+- `fb` / `audio` / `stats` / `capabilities` は予約名（登録拒否）。同名 custom は上書き。registry 上限は 16。
 - `registerProbe` は **harness 無効時（env 未設定）は no-op**なので、通常実行に影響しない（常に呼んでよい）。
 - audio RT スレッドが触る状態（synth `voices`/`patch` 等）の読み出しは torn し得る best-effort スナップショット。**RT 経路に同期/alloc/lock を足さない**。
+- **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は登録時にサニタイズされる**: `"` / `\` / ASCII 制御文字（tab・NUL 等）を含む、または 200 bytes 超の desc は warn を出し空文字へ落とされる（登録自体は成功する。desc だけ無効化）。**capabilities JSON は desc を JSON エスケープせずそのまま埋め込む前提**なので、この禁止文字は「意味解釈」ではなく wire framing 保護。
 - 実装の手本: pixie の `canvas`/`undo`/`tool`（`apps/editor/apps/pixie/main.zig`）、synth の `voices`/`patch`（`apps/synth/main.zig`）。
 
 ### custom action の足し方（TASK-62.1）
@@ -616,6 +628,7 @@ action 固有のコードを一切足さない**（中身非パースの不変�
   `expect_failures` カウンタに記帳される（記帳して続行。即時 abort 変種は無い）。詳細な wire format は
   上記コマンド言語節の「action（probe 対称の高レベル操作 / TASK-62.1）」を参照。
 - 組み込み action は今回作らない。app 側の action 登録は各採用タスク（pixie/synth/modular 等）で行う。
+- **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は probe と同じ規則でサニタイズされる**: `"` / `\` / ASCII 制御文字を含む、または 200 bytes 超は warn + 空文字化（登録自体は成功）。
 
 - **実行モデル**: 非 step（inject/snapshot/digest/action）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
