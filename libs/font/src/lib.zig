@@ -15,6 +15,7 @@ pub const cff = @import("cff.zig");
 pub const outline_font = @import("outline_font.zig");
 pub const bmfont = @import("bmfont.zig");
 pub const sbix = @import("sbix.zig");
+pub const text_layer = @import("text_layer.zig");
 
 // pixel/geom プリミティブ（gui が再エクスポートする正準定義）
 pub const Rect = geom.Rect;
@@ -28,8 +29,15 @@ pub const Font = font.Font;
 pub const plotCoverage = font.plotCoverage;
 pub const blitCoverage = font.blitCoverage;
 pub const blitRGBA = font.blitRGBA;
+pub const blitCoverageStraight = font.blitCoverageStraight;
+pub const blitRGBAStraight = font.blitRGBAStraight;
 pub const clipCoverage = font.clipCoverage;
 pub const CovClip = font.CovClip;
+
+// 透明レイヤーへのテキストラスタライズ（TASK-79.4）
+pub const TextLayer = text_layer.TextLayer;
+pub const renderTextLayer = text_layer.renderTextLayer;
+pub const default_font_bytes = text_layer.default_font_bytes;
 
 // sfnt(TrueType/OpenType) コンテナ + cmap + glyf アウトライン
 pub const SfntFile = sfnt.SfntFile;
@@ -60,4 +68,5 @@ test {
     _ = outline_font;
     _ = bmfont;
     _ = sbix;
+    _ = text_layer;
 }

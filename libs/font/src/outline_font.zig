@@ -19,6 +19,7 @@ const raster = @import("raster.zig");
 const outline_mod = @import("outline.zig");
 const sbix_mod = @import("sbix.zig");
 const png_mod = @import("png");
+const pixelops = @import("pixelops");
 
 const Font = font.Font;
 const Metrics = font.Metrics;
@@ -216,6 +217,23 @@ pub const OutlineFont = struct {
     /// に委譲しており、ここで新規の全画素ループは書かない。カラーグリフの cache lookup は
     /// O(1)（hashmap get）で、decode/resize はキャッシュミス時のみ（`getColorGlyph` 参照）。
     pub fn drawTo(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+        self.drawGlyphs(target, pos, text, col, clip, false);
+    }
+
+    /// `drawTo` の透明レイヤー版（TASK-79.4）。AA 縁のカバレッジ・カラーグリフのアルファを
+    /// straight alpha のまま target へ蓄積する（`drawTo` は不透明フレームバッファ前提で出力
+    /// A=0xFF 固定。独立の透明テキストレイヤーへ焼く場合はこちらを使う）。glyph walk・キャッシュは
+    /// `drawTo` と完全に共有し（`drawGlyphs`）、per-glyph の blit だけ straight 版に出し分ける。
+    /// per-glyph 転写は `font.blitCoverageStraight`（モノクロ）/ `font.blitRGBAStraight`（カラー）に
+    /// 委譲（ここで新規の全画素ループは書かない。ホットパス性質は `drawTo` と同じ）。
+    pub fn drawToStraight(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+        self.drawGlyphs(target, pos, text, col, clip, true);
+    }
+
+    /// `drawTo`/`drawToStraight` 共有の glyph walk（TASK-79.4 でリファクタ抽出）。comptime
+    /// `straight` で per-glyph blit だけを出し分け、キャッシュ充填・advance 計算等の挙動は完全に
+    /// 共有する（重複コード排除。`drawTo` 側の既存テストが無改変で通ることで回帰無しを担保）。
+    fn drawGlyphs(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, comptime straight: bool) void {
         self.last_oom = false;
         const m = self.metrics();
         const baseline_y = pos.y +| m.ascent; // 飽和加算（極端 pos.y で trap しない）
@@ -229,7 +247,11 @@ pub const OutlineFont = struct {
             if (self.getColorGlyph(gid)) |cg| {
                 const bx = @as(i32, @intFromFloat(@round(cx))) +| cg.left;
                 const by = baseline_y +| cg.top;
-                font.blitRGBA(target, bx, by, cg.pixels, cg.w, cg.h, clip);
+                if (straight) {
+                    font.blitRGBAStraight(target, bx, by, cg.pixels, cg.w, cg.h, clip);
+                } else {
+                    font.blitRGBA(target, bx, by, cg.pixels, cg.w, cg.h, clip);
+                }
                 cx += self.advancePx(gid); // advance は hmtx 経由（色/モノクロ問わず不変）
                 continue;
             }
@@ -240,7 +262,11 @@ pub const OutlineFont = struct {
             if (cg.bitmap) |bm| {
                 const bx = @as(i32, @intFromFloat(@round(cx))) +| cg.left; // 飽和加算
                 const by = baseline_y +| cg.top;
-                font.blitCoverage(target, bx, by, bm.data, bm.w, bm.h, col, clip);
+                if (straight) {
+                    font.blitCoverageStraight(target, bx, by, bm.data, bm.w, bm.h, col, clip);
+                } else {
+                    font.blitCoverage(target, bx, by, bm.data, bm.w, bm.h, col, clip);
+                }
             }
             cx += cg.advance;
         }
@@ -834,6 +860,134 @@ test "OutlineFont: asFont 経由（Font インターフェース）で measure/m
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     f.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
     try testing.expect(of.cache.count() >= 1);
+}
+
+// ============================================================
+// drawToStraight のテスト（TASK-79.4: 透明レイヤーへのラスタライズ基盤）
+// ============================================================
+
+test "OutlineFont.drawToStraight: 透明レイヤーへ描いてから不透明背景へ手動合成した結果は drawTo の直接描画と bit 完全一致する（AC#1 の最強オラクル）" {
+    // drawToStraight が「後段合成で元の見た目を再現できる」straight alpha を正しく積んでいることを
+    // end-to-end で保証する。drawTo の blitCoverage は Color.blend(=pixelops.srcOverOpaque) で
+    // 直接不透明合成するのに対し、drawToStraight の blitCoverageStraight は透明dstへ
+    // srcOverStraightScalar(dst=0, col, cov) で積む。数学的に両者は
+    // 「透明dstへ積んだ straight pixel {col.rgb, eff_a} を同じ bg へ srcOverOpaque する」のと
+    // 完全に同じ式になる（cov=0 で skip する経路も dst=0 のままなので srcOverOpaque(bg,0)=bg で一致）。
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+
+    const W = 80;
+    const H = 80;
+    const bg: u32 = 0xFF203040; // 不透明な任意背景色
+    const col = Color.rgba(0xFF, 0xE0, 0x10, 0xFF);
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+
+    // 直接描画（不透明 fb を bg で初期化）
+    var of_direct = OutlineFont.init(a, &face, 64);
+    defer of_direct.deinit();
+    var px_direct = [_]u32{bg} ** (W * H);
+    const t_direct = RenderTarget{ .pixels = &px_direct, .width = W, .height = H };
+    of_direct.drawTo(t_direct, .{ .x = 4, .y = 4 }, "A", col, clip);
+
+    // 透明レイヤーへ描画（独立キャッシュ）→ bg へ手動合成
+    var of_layer = OutlineFont.init(a, &face, 64);
+    defer of_layer.deinit();
+    var px_layer = [_]u32{0x00000000} ** (W * H);
+    const t_layer = RenderTarget{ .pixels = &px_layer, .width = W, .height = H };
+    of_layer.drawToStraight(t_layer, .{ .x = 4, .y = 4 }, "A", col, clip);
+
+    var px_composited: [W * H]u32 = undefined;
+    for (px_layer, 0..) |p, i| px_composited[i] = pixelops.srcOverOpaque(bg, p);
+
+    try testing.expectEqualSlices(u32, &px_direct, &px_composited);
+    try testing.expect(!of_direct.last_oom);
+    try testing.expect(!of_layer.last_oom);
+}
+
+test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重なり）した結果は drawTo 直接描画と ±1/channel 以内で一致する" {
+    // codex レビュー指摘を受けて追加: 単一グリフ非重複だけでは弱いため、意図的にずらして重なるように
+    // 2回描画し、かつ半透明色（alpha=128）で「真の透明合成」を発生させる（不透明色だと2回目が完全
+    // 上書きになり重ね塗りの丸め挙動を検証できない）。
+    //
+    // 実測で分かったこと（bit 完全一致ではなく ±1/channel 許容にした理由）: 直接描画側は
+    // 2 回とも `srcOverOpaque`（da は常に255固定の整数 div255Round）だが、透明レイヤー側の
+    // 2 回目は「1回目の非トリビアル alpha を持つ dst」への blend になるため
+    // `srcOverStraightScalar` の可変分母 f32 除算経路を通る（da<255 では div255 に還元できない）。
+    // 二重に重なる画素だけ、整数経路と f32 経路の丸め方式の違いにより ±1 の差が生じ得る
+    // （実測: 1画素で R が 170 → 171 の off-by-one）。単発 blend（このファイルの直前のテスト、
+    // および実運用の「1回の drawToStraight 呼び出しで1レイヤーを焼いて1回だけ合成する」という
+    // 主要ユースケース）は bit 完全一致のままであり、AC#1 が要求する性質はそちらで担保済み。
+    // このテストは「大きく破綻していないこと（丸め1未満のずれに収まること）」を確認する。
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+
+    const W = 90;
+    const H = 90;
+    const bg: u32 = 0xFF102030;
+    const col = Color.rgba(0xF0, 0x60, 0x30, 0x80); // 半透明（alpha=128）
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+    const pos1 = Vec2{ .x = 4, .y = 4 };
+    const pos2 = Vec2{ .x = 18, .y = 12 }; // 三角形グリフが重なる程度にずらす
+
+    var of_direct = OutlineFont.init(a, &face, 64);
+    defer of_direct.deinit();
+    var px_direct = [_]u32{bg} ** (W * H);
+    const t_direct = RenderTarget{ .pixels = &px_direct, .width = W, .height = H };
+    of_direct.drawTo(t_direct, pos1, "A", col, clip);
+    of_direct.drawTo(t_direct, pos2, "A", col, clip);
+
+    var of_layer = OutlineFont.init(a, &face, 64);
+    defer of_layer.deinit();
+    var px_layer = [_]u32{0x00000000} ** (W * H);
+    const t_layer = RenderTarget{ .pixels = &px_layer, .width = W, .height = H };
+    of_layer.drawToStraight(t_layer, pos1, "A", col, clip);
+    of_layer.drawToStraight(t_layer, pos2, "A", col, clip);
+
+    var px_composited: [W * H]u32 = undefined;
+    for (px_layer, 0..) |p, i| px_composited[i] = pixelops.srcOverOpaque(bg, p);
+
+    var mismatches: usize = 0;
+    for (px_direct, px_composited) |d, c| {
+        if (d == c) continue;
+        const db: [4]u8 = @bitCast(d);
+        const cb: [4]u8 = @bitCast(c);
+        for (db, cb) |dch, cch| {
+            const diff: i32 = @as(i32, dch) - @as(i32, cch);
+            try testing.expect(@abs(diff) <= 1); // 丸め方式の違いによる ±1 のみ許容
+        }
+        mismatches += 1;
+    }
+    // 差分は「二重に覆われた極小領域」に留まるはず（三角形グリフ2枚の交差はごく一部）。
+    try testing.expect(mismatches < (W * H) / 4);
+
+    // 重なりが実際に発生した(=非自明なテストである)ことの sanity check（codex レビュー指摘:
+    // 上の ±1 丸め差分が Zig/LLVM/target 依存で偶然 0 件になっても、このテストの前提「真に
+    // overlap した」ことは丸め差分の有無に依存しない別条件で確認する）。
+    // codex 再指摘: 「pos1+pos2 の結果が pos1 単発と異なる」だけでは pos2 が完全非重複でも
+    // 真になるため overlap の証明にならない。正しくは pos1 単発と pos2 単発を別々に描いて、
+    // **同じ画素で両方が bg から変化している**ことを確認する（= その画素は両グリフのカバレッジが
+    // 重なっている）。
+    var of_pos1 = OutlineFont.init(a, &face, 64);
+    defer of_pos1.deinit();
+    var px_pos1 = [_]u32{bg} ** (W * H);
+    const t_pos1 = RenderTarget{ .pixels = &px_pos1, .width = W, .height = H };
+    of_pos1.drawTo(t_pos1, pos1, "A", col, clip);
+
+    var of_pos2 = OutlineFont.init(a, &face, 64);
+    defer of_pos2.deinit();
+    var px_pos2 = [_]u32{bg} ** (W * H);
+    const t_pos2 = RenderTarget{ .pixels = &px_pos2, .width = W, .height = H };
+    of_pos2.drawTo(t_pos2, pos2, "A", col, clip);
+
+    var overlap_found = false;
+    for (px_pos1, px_pos2) |p1, p2| {
+        if (p1 != bg and p2 != bg) overlap_found = true;
+    }
+    try testing.expect(overlap_found);
 }
 
 test "OutlineFont: CFF のみ(.otf 想定)は Unsupported / glyf 無しは InvalidFont" {

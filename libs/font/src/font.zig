@@ -196,6 +196,108 @@ pub fn blitRGBA(
     }
 }
 
+/// w×h のカバレッジバッファ（row-major, 0-255）を **straight alpha（dst alpha 可変・透明対応）**で
+/// (dst_x,dst_y) 起点に累積合成する。`blitCoverage` は出力 A=0xFF 固定（不透明フレームバッファ前提）
+/// だが、こちらは AA 縁のカバレッジがそのまま straight alpha として保存される（TASK-79.4。独立の
+/// 透明テキストレイヤーへラスタライズする用途）。
+///
+/// PRECONDITION: `target` は「a=0 ⇒ RGB=0」の不変条件を満たすこと（`pixelops.srcOverStraightScalar`
+/// 自体が持つ既存の不変条件と同じ。テキストレイヤーを all-zero 初期化し、以後この関数群だけで
+/// 書き込む限り自己維持される）。この前提の下でのみ、cov==0 の画素を skip する最適化が
+/// 「呼んだ場合と bit 一致」になる（da>0 なら常に恒等。da==0 かつ rgb!=0 という非正規値では
+/// skip すると 0 化されず不一致になり得る）。
+///
+/// ラスタライズ実行時にグリフ面積の全画素を走るホットパス（頻度はイベント時のみ。フレーム毎ではない）:
+///   1. clip は `clipCoverage` でループ外 1 回、内側は無検査ループ。
+///   2. ブレンドは `pixelops.srcOverStraightScalar`（自作せず共有実装に委譲）。cov==0 は skip。
+///   3. per-pixel 整数除算なし（dst alpha 可変のため div255 では表現できず、既存 srcOverStraight 系と
+///      同じ f32 経路 1 回のみ）。
+///
+/// **SIMD を採用しない理由（TASK-79.4 で実測・codex レビュー済み）**: 性能規約の「全画素ループの
+/// 3点セット」は本来フレーム毎の全画素ループを想定した規約だが、このループは形状的に該当し得るため
+/// 当初 4px SIMD primitive（`pixelops.srcOverStraightCoverage4`）を実装し bit 一致テストまで
+/// 通した。しかし ReleaseFast・aarch64 実測で SIMD 版は素朴な scalar ループより**常に遅かった**
+/// （完全ランダム coverage で ~1.75倍遅い、グリフ的な coverage 分布でも ~1.3倍遅い）。
+/// `blitRGBAStraight`（下記）の `srcOverStraight4(dst,src,255)` は opacity が comptime 定数のため
+/// 最適化で恩恵を受けるが、coverage は真に可変（comptime 化不可）で同じ恩恵が無く、
+/// `@Vector(16,f32)` パイプラインの命令数が素朴な4回の scalar 呼び出しを上回るコストになる
+/// （measured — 「速くなったはず」を主張しない）。加えてこのループは元々フレーム毎ではなく
+/// イベント時のみ（テキストレイヤー確定時）なので、性能上の実利が無いまま SIMD 特有の複雑さ
+/// （新規 primitive・追加テスト）を抱える理由が無いと判断し、clip-hoist + scalar のみに単純化した。
+pub fn blitCoverageStraight(
+    target: RenderTarget,
+    dst_x: i32,
+    dst_y: i32,
+    coverage: []const u8,
+    w: u32,
+    h: u32,
+    col: Color,
+    clip: Rect,
+) void {
+    std.debug.assert(coverage.len == @as(usize, w) * @as(usize, h));
+    const cc = clipCoverage(target, dst_x, dst_y, w, h, clip) orelse return;
+    const col_u32: u32 = @bitCast(col);
+    var row = cc.cy0;
+    while (row < cc.cy1) : (row += 1) {
+        const cov_base = row * w;
+        // clipCoverage の保証により dst_y+row / dst_x+cx は非負かつ target 内
+        const py: u32 = @intCast(dst_y + @as(i32, @intCast(row)));
+        const dst_base = py * target.width + @as(u32, @intCast(dst_x + @as(i32, @intCast(cc.cx0))));
+        var cx = cc.cx0;
+        // cov==0 は skip（上記 PRECONDITION の下で dst 不変と等価）
+        while (cx < cc.cx1) : (cx += 1) {
+            const cov = coverage[cov_base + cx];
+            if (cov == 0) continue;
+            const idx = dst_base + (cx - cc.cx0);
+            target.pixels[idx] = pixelops.srcOverStraightScalar(target.pixels[idx], col_u32, cov);
+        }
+    }
+}
+
+/// w×h の RGBA ビットマップ（canonical BGRA、straight alpha、row-major 密詰め）を (dst_x,dst_y) 起点で
+/// **straight alpha（dst alpha 可変・透明対応）**で src-over 合成する。`blitRGBA` は出力 A=0xFF 固定
+/// （不透明フレームバッファ前提）だが、こちらはカラーグリフ（sbix 等）を透明テキストレイヤーへ
+/// 焼く用途（TASK-79.4）。opacity=255 固定の `pixelops.srcOverStraight{4,Scalar}` 呼び出しのみで
+/// 表現でき、coverage のような per-pixel 乗算率が無いため新規 SIMD primitive は不要。
+///
+/// 毎フレームではないがラスタライズ実行時にグリフ面積の全画素を走り得るホットパス（性能規約 3 点セット）:
+///   1. clip は `clipCoverage` でループ外に 1 回、内側は無検査の行連続アクセス。
+///   2. ブレンドは `pixelops.srcOverStraight4`（16-lane・4px 同時 SIMD）+
+///      `pixelops.srcOverStraightScalar` の scalar tail。
+///   3. per-pixel 整数除算なし（dst alpha 可変のため f32 除算 1 回のみ、既存実装に委譲）。
+pub fn blitRGBAStraight(
+    target: RenderTarget,
+    dst_x: i32,
+    dst_y: i32,
+    src: []const u32,
+    w: u32,
+    h: u32,
+    clip: Rect,
+) void {
+    std.debug.assert(src.len == @as(usize, w) * @as(usize, h));
+    const cc = clipCoverage(target, dst_x, dst_y, w, h, clip) orelse return;
+    var row = cc.cy0;
+    while (row < cc.cy1) : (row += 1) {
+        const src_base = row * w;
+        // clipCoverage の保証により dst_y+row / dst_x+cx は非負かつ target 内
+        const py: u32 = @intCast(dst_y + @as(i32, @intCast(row)));
+        const dst_base = py * target.width + @as(u32, @intCast(dst_x + @as(i32, @intCast(cc.cx0))));
+        var cx = cc.cx0;
+        while (cx + 4 <= cc.cx1) : (cx += 4) {
+            const src_chunk: *const [4]u32 = src[src_base + cx ..][0..4];
+            const dst_chunk: *[4]u32 = target.pixels[dst_base + (cx - cc.cx0) ..][0..4];
+            const sv: pixelops.Vec16u8 = @bitCast(src_chunk.*);
+            const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
+            dst_chunk.* = @bitCast(pixelops.srcOverStraight4(dv, sv, 255));
+        }
+        // scalar tail
+        while (cx < cc.cx1) : (cx += 1) {
+            const idx = dst_base + (cx - cc.cx0);
+            target.pixels[idx] = pixelops.srcOverStraightScalar(target.pixels[idx], src[src_base + cx], 255);
+        }
+    }
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -506,4 +608,215 @@ test "Font 契約: drawTo はグリフ単位でカラー(blitRGBA)とモノク�
     ColorGlyphFont.font.drawTo(t_blue, .{ .x = 0, .y = 0 }, "MC", Color.rgba(0x00, 0x00, 0xFF, 0xFF), clip);
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), px_blue[0]); // 'M' は青に追従
     try std.testing.expectEqual(@as(u32, 0xFF00FF00), px_blue[2]); // 'C' は緑のまま（col 変更の影響なし）
+}
+
+// ============================================================
+// blitCoverageStraight / blitRGBAStraight のテスト（TASK-79.4: 透明レイヤーへのラスタライズ基盤）
+// ============================================================
+
+test "blitCoverageStraight: 透明dst(0x00000000)への AA 縁カバレッジが straight alpha でそのまま保存される（AC#1 最小オラクル）" {
+    // 透明バッファへ cov=128（半端な AA 縁相当）を1点描く。数学的に:
+    //   dst=0 なので a'=div255Round(col.a*cov)、rgb は col の rgb がそのまま残る
+    //   （分母分子の da 項が消え、比が正確に col.rgb と一致する）。
+    var px = [_]u32{0x00000000} ** (4 * 4);
+    const t = RenderTarget{ .pixels = &px, .width = 4, .height = 4 };
+    const col = Color.rgba(0xE0, 0x40, 0x20, 0xFF);
+    const cov = [_]u8{128};
+    blitCoverageStraight(t, 1, 1, &cov, 1, 1, col, full_clip);
+    const out: Color = @bitCast(px[1 * 4 + 1]);
+    try std.testing.expectEqual(col.r, out.r);
+    try std.testing.expectEqual(col.g, out.g);
+    try std.testing.expectEqual(col.b, out.b);
+    try std.testing.expectEqual(@as(u8, @intCast(pixelops.div255Round(@as(u32, col.a) * 128))), out.a);
+    try std.testing.expect(out.a > 0 and out.a < 255); // 完全透明でも完全不透明でもない＝AA 縁が保存された
+    // 他の画素は透明のまま（cov=0 の周囲を巻き込んでいない）
+    for (px, 0..) |p, i| {
+        if (i == 1 * 4 + 1) continue;
+        try std.testing.expectEqual(@as(u32, 0x00000000), p);
+    }
+}
+
+test "blitCoverageStraight: cov=0 は透明dstを不変にする（skip 最適化が非skip経路と一致）" {
+    var px = [_]u32{0x00000000} ** (4 * 4);
+    const t = RenderTarget{ .pixels = &px, .width = 4, .height = 4 };
+    const cov = [_]u8{0};
+    blitCoverageStraight(t, 1, 1, &cov, 1, 1, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), full_clip);
+    for (px) |p| try std.testing.expectEqual(@as(u32, 0x00000000), p);
+}
+
+test "blitCoverageStraight: cov=255・col.a=255 は不透明置換（blitCoverage と同じ見た目になる境界）" {
+    var px = [_]u32{0x00000000} ** (4 * 4);
+    const t = RenderTarget{ .pixels = &px, .width = 4, .height = 4 };
+    const cov = [_]u8{255};
+    const col = Color.rgba(0x12, 0x34, 0x56, 0xFF);
+    blitCoverageStraight(t, 1, 1, &cov, 1, 1, col, full_clip);
+    try std.testing.expectEqual(@as(u32, @bitCast(col)), px[1 * 4 + 1]);
+}
+
+/// blitCoverageStraight のスカラー参照実装（SIMD/tail chunking も clipCoverage も経由しない素朴な
+/// 2重ループ + per-pixel clip 判定 + srcOverStraightScalar）。独立オラクル。cov==0 でも常に
+/// srcOverStraightScalar を呼ぶ（skip 最適化を経由しない参照実装）。
+fn blitCoverageStraightScalarRef(
+    target: RenderTarget,
+    dst_x: i32,
+    dst_y: i32,
+    coverage: []const u8,
+    w: u32,
+    h: u32,
+    col: Color,
+    clip: Rect,
+) void {
+    if (clip.isEmpty()) return;
+    const col_u32: u32 = @bitCast(col);
+    var row: u32 = 0;
+    while (row < h) : (row += 1) {
+        var cx: u32 = 0;
+        while (cx < w) : (cx += 1) {
+            const px: i64 = @as(i64, dst_x) + @as(i64, cx);
+            const py: i64 = @as(i64, dst_y) + @as(i64, row);
+            if (px < clip.x or py < clip.y) continue;
+            if (px >= @as(i64, clip.x) + @as(i64, clip.w)) continue;
+            if (py >= @as(i64, clip.y) + @as(i64, clip.h)) continue;
+            if (px < 0 or py < 0) continue;
+            const ux: u32 = @intCast(px);
+            const uy: u32 = @intCast(py);
+            if (ux >= target.width or uy >= target.height) continue;
+            const idx = uy * target.width + ux;
+            target.pixels[idx] = pixelops.srcOverStraightScalar(target.pixels[idx], col_u32, coverage[row * w + cx]);
+        }
+    }
+}
+
+test "blitCoverageStraight: clip-hoist 実装が素朴な per-pixel clip 参照と bit 一致（幅1..17・複数配置・部分交差clip・非正規dst除く乱数）" {
+    // blitCoverageStraight は SIMD を採用しない設計（doc comment 参照。実測で aarch64 では
+    // scalar より遅かったため）だが、clipCoverage によるループ外 clip 判定（3点セットの
+    // clip-hoist 部分）自体は per-pixel 判定と bit 一致する必要がある。このテストはその確認。
+    //
+    // PRECONDITION（doc 参照）: blitCoverageStraight の cov==0 skip 最適化は dst が
+    // 「a=0⇒RGB=0」を満たす前提の下で成立するため、このテストの dst 乱数生成もその制約を守る
+    // （a=0 の画素は rgb も 0 に強制する）。
+    var prng = std.Random.DefaultPrng.init(0xFACADE);
+    const rng = prng.random();
+    const widths = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17 };
+    const h: u32 = 5;
+    const clip = Rect{ .x = 1, .y = 1, .w = 30, .h = 30 };
+    const cases = [_]struct { x: i32, y: i32 }{
+        .{ .x = 2, .y = 3 },
+        .{ .x = -2, .y = -1 },
+        .{ .x = 30, .y = 30 },
+        .{ .x = -100, .y = 0 },
+    };
+    const col = Color.rgba(0xE0, 0x40, 0x20, 0xC0);
+    for (widths) |w| {
+        const cov = try std.testing.allocator.alloc(u8, @as(usize, w) * h);
+        defer std.testing.allocator.free(cov);
+        for (cov, 0..) |*c, i| c.* = if (i % 7 == 0) 0 else rng.int(u8); // 0 混じりも含めて網羅
+
+        for (cases) |c| {
+            var px_impl: [32 * 32]u32 = undefined;
+            var px_ref: [32 * 32]u32 = undefined;
+            for (&px_impl, &px_ref) |*a, *b| {
+                const alpha = rng.int(u8);
+                const bytes: [4]u8 = if (alpha == 0)
+                    .{ 0, 0, 0, 0 } // a=0⇒RGB=0（PRECONDITION）
+                else
+                    .{ rng.int(u8), rng.int(u8), rng.int(u8), alpha };
+                const v: u32 = @bitCast(bytes);
+                a.* = v;
+                b.* = v;
+            }
+            const t_impl = RenderTarget{ .pixels = &px_impl, .width = 32, .height = 32 };
+            const t_ref = RenderTarget{ .pixels = &px_ref, .width = 32, .height = 32 };
+
+            blitCoverageStraight(t_impl, c.x, c.y, cov, w, h, col, clip);
+            blitCoverageStraightScalarRef(t_ref, c.x, c.y, cov, w, h, col, clip);
+
+            try std.testing.expectEqualSlices(u32, &px_ref, &px_impl);
+        }
+    }
+}
+
+test "blitRGBAStraight: 透明dstへ straight src を合成すると src が bit 保持される（a>0）" {
+    var px = [_]u32{0x00000000} ** (4 * 4);
+    const t = RenderTarget{ .pixels = &px, .width = 4, .height = 4 };
+    const src = [_]u32{0x80FF8020}; // straight alpha 半透明オレンジ
+    blitRGBAStraight(t, 1, 1, &src, 1, 1, full_clip);
+    try std.testing.expectEqual(src[0], px[1 * 4 + 1]);
+}
+
+test "blitRGBAStraight: w==0 または h==0 は no-op（透明dst前提でも不変）" {
+    var px = [_]u32{0x00000000} ** (4 * 4);
+    const t = RenderTarget{ .pixels = &px, .width = 4, .height = 4 };
+    const empty_src = [_]u32{};
+    blitRGBAStraight(t, 1, 1, &empty_src, 0, 0, full_clip);
+    for (px) |p| try std.testing.expectEqual(@as(u32, 0x00000000), p);
+}
+
+/// blitRGBAStraight のスカラー参照実装（SIMD/tail chunking も clipCoverage も経由しない素朴な
+/// 2重ループ + per-pixel clip 判定 + srcOverStraightScalar(opacity=255)）。独立オラクル。
+fn blitRGBAStraightScalarRef(
+    target: RenderTarget,
+    dst_x: i32,
+    dst_y: i32,
+    src: []const u32,
+    w: u32,
+    h: u32,
+    clip: Rect,
+) void {
+    if (clip.isEmpty()) return;
+    var row: u32 = 0;
+    while (row < h) : (row += 1) {
+        var col: u32 = 0;
+        while (col < w) : (col += 1) {
+            const px: i64 = @as(i64, dst_x) + @as(i64, col);
+            const py: i64 = @as(i64, dst_y) + @as(i64, row);
+            if (px < clip.x or py < clip.y) continue;
+            if (px >= @as(i64, clip.x) + @as(i64, clip.w)) continue;
+            if (py >= @as(i64, clip.y) + @as(i64, clip.h)) continue;
+            if (px < 0 or py < 0) continue;
+            const ux: u32 = @intCast(px);
+            const uy: u32 = @intCast(py);
+            if (ux >= target.width or uy >= target.height) continue;
+            const idx = uy * target.width + ux;
+            target.pixels[idx] = pixelops.srcOverStraightScalar(target.pixels[idx], src[row * w + col], 255);
+        }
+    }
+}
+
+test "blitRGBAStraight: SIMD+tail 実装がスカラー参照と bit 一致（幅4の倍数以外=tail経路・クリップ有り含む）" {
+    var prng = std.Random.DefaultPrng.init(0xB0BACAFE);
+    const rng = prng.random();
+    const widths = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17 };
+    const h: u32 = 5;
+    const clip = Rect{ .x = 1, .y = 1, .w = 30, .h = 30 };
+    const cases = [_]struct { x: i32, y: i32 }{
+        .{ .x = 2, .y = 3 },
+        .{ .x = -2, .y = -1 },
+        .{ .x = 30, .y = 30 },
+        .{ .x = -100, .y = 0 },
+    };
+    for (widths) |w| {
+        const src = try std.testing.allocator.alloc(u32, @as(usize, w) * h);
+        defer std.testing.allocator.free(src);
+        for (src) |*s| s.* = rng.int(u32); // straight alpha 全域を網羅
+
+        for (cases) |c| {
+            // blitRGBAStraight は skip 最適化を持たない（常に srcOverStraightScalar/4 を呼ぶ）ため、
+            // dst は完全乱数でよい（blitCoverageStraight の PRECONDITION 制約は不要）。
+            var px_impl: [32 * 32]u32 = undefined;
+            var px_ref: [32 * 32]u32 = undefined;
+            for (&px_impl, &px_ref) |*a, *b| {
+                const v = rng.int(u32);
+                a.* = v;
+                b.* = v;
+            }
+            const t_impl = RenderTarget{ .pixels = &px_impl, .width = 32, .height = 32 };
+            const t_ref = RenderTarget{ .pixels = &px_ref, .width = 32, .height = 32 };
+
+            blitRGBAStraight(t_impl, c.x, c.y, src, w, h, clip);
+            blitRGBAStraightScalarRef(t_ref, c.x, c.y, src, w, h, clip);
+
+            try std.testing.expectEqualSlices(u32, &px_ref, &px_impl);
+        }
+    }
 }
