@@ -389,32 +389,89 @@ pub fn build(b: *std.Build) void {
     const test_capture_types_step = b.step("test-capture-types", "Run capture_types / camera facade / audio capture extension unit tests (TASK-49.1)");
     test_capture_types_step.dependOn(&b.addRunArtifact(capture_types_test).step);
 
-    // camera.zig facade（camera_stub.zig を relative import で内包）。harness を使うため
-    // harness_test_mod と同じ理由で link_libc=true にする。
+    // camera.zig facade（macOS: camera_macos.zig / 他OS: camera_stub.zig を relative import で
+    // 内包。TASK-49.2）。harness を使うため harness_test_mod と同じ理由で link_libc=true にする
+    // （camera_macos.zig の objc_runtime 経由 std.c.nanosleep/getenv にも同じ理由で必要）。
     const camera_test_mod = b.createModule(.{
         .root_source_file = b.path("core/camera.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // harness.init() 系が libc getenv を使う
+        .link_libc = true, // harness.init() 系が libc getenv を使う + macOS: objc_runtime の nanosleep
     });
     camera_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     camera_test_mod.addImport("harness", shared_modules.harness.mod);
     const camera_test = b.addTest(.{ .root_module = camera_test_mod });
+    // TASK-49.2: macOS は camera_macos.zig が AVFoundation(ObjC専用API)を objc_runtime 経由で
+    // 叩くため、テスト実行はしない（設定検証のみ自動）が compile+link には必要な framework 一式を
+    // 明示リンクする（他OS は camera_stub.zig のまま追加不要）。
+    if (target.result.os.tag == .macos) linkCaptureMacFrameworks(b, camera_test_mod, sdk_paths.?);
     test_capture_types_step.dependOn(&b.addRunArtifact(camera_test).step);
 
     // core/audio.zig（capture 拡張含む全体）。既存出力 backend（audio_macos 等）への `switch` は
-    // 残るが、capture 系テストは出力側の関数を一切呼ばないため Zig の lazy analysis で
-    // 未参照のまま留まり、AudioToolbox 等の追加リンクなしに compile+link できる（実測確認済み）。
-    // audio_capture_stub.zig は relative import で同一 module に含まれるためテストも一緒に走る。
+    // 残るが、出力側の関数は本テストのどの test からも呼ばれないため Zig の lazy analysis で
+    // 未参照のまま留まる（実測確認済み）。capture 側は macOS で実 backend
+    // （`audio_macos.zig` の `capture` 名前空間。TASK-49.2）を経由するため link_libc=true
+    // （objc_runtime 経由 std.c.nanosleep/getenv）が必要。
     const audio_capture_test_mod = b.createModule(.{
         .root_source_file = b.path("core/audio.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     audio_capture_test_mod.addImport("harness", shared_modules.harness.mod);
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
+    // TASK-49.2: macOS の mic capture（AUHAL input）は AudioToolbox/CoreAudio + 権限確認の
+    // AVFoundation(ObjC)を使うため framework を明示リンクする（他OS は audio_capture_stub.zig の
+    // まま追加不要）。
+    if (target.result.os.tag == .macos) linkCaptureMacFrameworks(b, audio_capture_test_mod, sdk_paths.?);
     test_capture_types_step.dependOn(&b.addRunArtifact(audio_capture_test).step);
+
+    // TASK-49.2 実測知見: `zig test` は「root file 自身の test」のみを収集・実行し、root file が
+    // 相対 `@import` する別ファイル（`camera_macos.zig`/`audio_macos.zig` 等）側の test は
+    // 収集されない（root=camera.zig/audio.zig の `camera_test`/`audio_capture_test` はコンパイル
+    // ＝リンクは通るが、それらのファイル内の test は実行数に現れないことを実測確認済み）。
+    // よって `capture_synthetic_test` と同じ方針で、root を直接そのファイルにした専用 addTest を
+    // macOS のみ追加し、`copyBgraRows`/`mapAuthStatus`/config 検証等の自動テストを実際に実行させる。
+    // `objc_runtime.zig`（msgSend/stack block。最も壊れやすい部分）は camera_macos.zig/
+    // audio_macos.zig の双方から相対 import されるため、それらの root test に載って間接的に
+    // 実行される（実測確認済み: root file 自身の「直接の」相対 import は収集対象になる。上記の
+    // 「収集されない」制約は root を跨いだ2段階の間接 import にのみ働く）。ただし依存関係を
+    // 前提にせず明示的に検証できるよう、root を直接 core/objc_runtime.zig にした専用 addTest も
+    // 追加する（codex レビュー指摘）。
+    if (target_os == .macos) {
+        const objc_runtime_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/objc_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // std.c.nanosleep/getenv 用
+        });
+        linkCaptureMacFrameworks(b, objc_runtime_test_mod, sdk_paths.?);
+        const objc_runtime_test = b.addTest(.{ .root_module = objc_runtime_test_mod });
+        test_capture_types_step.dependOn(&b.addRunArtifact(objc_runtime_test).step);
+
+        const camera_macos_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/camera_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // objc_runtime 経由の std.c.nanosleep/getenv 用
+        });
+        camera_macos_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        linkCaptureMacFrameworks(b, camera_macos_test_mod, sdk_paths.?);
+        const camera_macos_test = b.addTest(.{ .root_module = camera_macos_test_mod });
+        test_capture_types_step.dependOn(&b.addRunArtifact(camera_macos_test).step);
+
+        const audio_macos_capture_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/audio_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        audio_macos_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        linkCaptureMacFrameworks(b, audio_macos_capture_test_mod, sdk_paths.?);
+        const audio_macos_capture_test = b.addTest(.{ .root_module = audio_macos_capture_test_mod });
+        test_capture_types_step.dependOn(&b.addRunArtifact(audio_macos_capture_test).step);
+    }
 
     // core/capture_synthetic.zig（harness 内蔵 synthetic capture source。TASK-49.5）。
     // capture_types にのみ依存（camera/audio facade への配線は無い）。audio 生成スレッドの
@@ -1630,13 +1687,48 @@ fn addModularExe(
 // ============================================================
 fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {
-        .macos => exe.root_module.linkFramework("AudioToolbox", .{}),
+        // capture（mic AUHAL input / camera AVFoundation。TASK-49.2）の framework も併せてリンク
+        // する。呼び出し側の全 exe は `platform.setupExecutableForPlatform` を同じ関数内で呼んで
+        // おり、そちらが `-F <sdk>/System/Library/Frameworks` / `-L <sdk>/usr/lib` の検索パスを
+        // 設定する（`build_helpers/macos.zig` の `addMacOSSDKSearchPaths`）ため、ここでは
+        // `linkFramework`/`linkSystemLibrary` の呼び出しだけで足りる（build graph 構築順序は
+        // 実際のリンク時の解決に影響しない）。codex レビュー指摘: capture を実使用する将来の
+        // アプリ（TASK-49.6 想定）がこの関数を素通しした時にリンク不足で壊れないようにする
+        // 予防的追加（現時点でこれらの framework を実際に使う exe はまだ無い＝害が無い）。
+        .macos => {
+            exe.root_module.linkFramework("AudioToolbox", .{});
+            exe.root_module.linkFramework("CoreAudio", .{});
+            exe.root_module.linkFramework("AVFoundation", .{});
+            exe.root_module.linkFramework("CoreMedia", .{});
+            exe.root_module.linkFramework("CoreVideo", .{});
+            exe.root_module.linkFramework("Foundation", .{});
+            exe.root_module.linkSystemLibrary("objc", .{});
+        },
         .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
         // WASAPI は COM 経由。CoCreateInstance/CoInitializeEx/CoTaskMemFree が ole32 にある
         // （IAudioClient 等は COM で取得するので直接リンク不要。Event API は kernel32=自動リンク）。
         .windows => exe.root_module.linkSystemLibrary("ole32", .{}),
         else => @panic("audio backend is only available on macOS / Linux / Windows"),
     }
+}
+
+// ============================================================
+// capture（mic AUHAL input / camera AVFoundation。TASK-49.2）専用 test 用の framework リンク。
+// nix の zig は SDK を自動検出しないため framework/library 検索パスを明示する
+// （`build_helpers/macos.zig` の `addMacOSSDKSearchPaths` と同じ理由・同じパス）。
+// `linkAudioBackend` と異なり、こちらは `platform.setupExecutableForPlatform` を経由しない
+// 素の `b.addTest` 向けなので検索パス自体もここで明示する必要がある。
+// ============================================================
+fn linkCaptureMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos.MacOSSDKPaths) void {
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path}) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_paths.sdk_path}) });
+    mod.linkFramework("AudioToolbox", .{});
+    mod.linkFramework("CoreAudio", .{});
+    mod.linkFramework("AVFoundation", .{});
+    mod.linkFramework("CoreMedia", .{});
+    mod.linkFramework("CoreVideo", .{});
+    mod.linkFramework("Foundation", .{});
+    mod.linkSystemLibrary("objc", .{});
 }
 
 // ============================================================

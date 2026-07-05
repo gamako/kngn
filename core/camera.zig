@@ -3,10 +3,10 @@
 //! `core/audio.zig`（オーディオ出力）と対称の新規 L1 primitive。caller は `@import("camera")` で
 //! このファイルの API のみを使う。設計の正は `docs/plans/capture-foundation-plan.md`。
 //!
-//! 49.1 時点は **全 OS 共通の明示 stub**（`camera_stub.zig`。全動詞が `error.Unsupported`）を
-//! 経由する。TASK-49.2〜.4 が下記 `backend` の import を `builtin.os.tag` 分岐
-//! （`core/audio.zig` の出力 backend と同型: macOS=AVFoundation / Linux=V4L2 /
-//! Windows=Media Foundation）へ置き換える。
+//! TASK-49.2: macOS は実 backend（`camera_macos.zig`。AVFoundation）を経由する。
+//! Linux/Windows は TASK-49.3/.4 未着手のため引き続き全 OS 共通 stub（`camera_stub.zig`。
+//! 全動詞が `error.Unsupported`）を経由する（`core/audio.zig` の出力 backend と同型の
+//! `builtin.os.tag` 分岐）。
 //!
 //! ## harness synthetic source の継ぎ目（TASK-49.5 のプレースホルダ。設計文書 5章）
 //!
@@ -21,12 +21,16 @@
 //! （実際のフレーム生成・BGRA 正規化ループは TASK-49.2〜.4 の backend 側の責務）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const harness = @import("harness");
 const types = @import("capture_types");
 
-// TASK-49.1: 全 OS 共通の明示 stub。TASK-49.2〜.4 が `builtin.os.tag` 分岐へ置き換える
+// TASK-49.2: macOS は実 backend（AVFoundation）、他 OS は引き続き stub
 // （`core/audio.zig` の `const backend = switch (builtin.os.tag) { ... }` と同型）。
-const backend = @import("camera_stub.zig");
+const backend = switch (builtin.os.tag) {
+    .macos => @import("camera_macos.zig"),
+    else => @import("camera_stub.zig"),
+};
 
 pub const CaptureError = types.CaptureError;
 pub const DeviceInfo = types.DeviceInfo;
@@ -66,7 +70,11 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) CaptureError!VideoDevice 
 // ============================================================================
 const testing = std.testing;
 
-test "camera facade: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変）" {
+test "camera facade: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変。非 macOS のみ）" {
+    // macOS は TASK-49.2 で実 backend（AVFoundation）に置き換わっており、requestPermission/open は
+    // 実 TCC ダイアログ・実デバイスに触れるため自動テスト対象外（手動検証レンジ。backlog
+    // task-49.2 notes 参照）。compile+link は test-capture-types 自体が既に担保している。
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerate(testing.allocator));
     try testing.expectError(error.Unsupported, requestPermission());
     try testing.expectError(error.Unsupported, open(testing.allocator, .{}));

@@ -157,16 +157,20 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 // `Capture` を挟む（`core/camera.zig` は新規ファイルのため bare な動詞名を使う。対比は設計文書
 // 4.1 の表）。
 //
-// TASK-49.1 時点は全 OS 共通の明示 stub（`audio_capture_stub.zig`）を経由する。TASK-49.2〜.4 が
-// 下記 `capture_backend` の import を `builtin.os.tag` 分岐へ置き換える。
+// TASK-49.2: macOS は実 backend（`audio_macos.zig` の `capture` 名前空間。AUHAL input）を経由する。
+// Linux/Windows は TASK-49.3/.4 未着手のため引き続き全 OS 共通 stub（`audio_capture_stub.zig`）。
 //
-// ホットパス宣言: この拡張自体は「イベント時のみ / 初期化時のみ」（facade 骨格・stub 委譲）。
-// mic capture callback（`CaptureCallback`）は RT（毎サンプル）契約だが、49.1 の stub は
-// `open()` が常に失敗するため callback は一切呼ばれない（実装は TASK-49.2〜.4）。
+// ホットパス宣言: この拡張自体は「イベント時のみ / 初期化時のみ」（facade 骨格・backend 委譲）。
+// mic capture callback（`CaptureCallback`）は RT（毎サンプル）契約。macOS 実装
+// （`audio_macos.zig` の `inputTrampoline`）は CoreAudio の RT スレッドで呼ばれ、区間内で
+// malloc/lock/IO/panic をしない（詳細は `audio_macos.zig` 冒頭のホットパス宣言）。
 // ============================================================================
 
 const capture_types = @import("capture_types");
-const capture_backend = @import("audio_capture_stub.zig");
+const capture_backend = switch (builtin.os.tag) {
+    .macos => @import("audio_macos.zig").capture,
+    else => @import("audio_capture_stub.zig"),
+};
 
 // capture_types の型を audio module から直接使えるよう再公開する（camera.zig が DeviceInfo 等を
 // 再公開しているのと対称。外部利用者が `capture_types` を別途 import しなくても
@@ -212,7 +216,11 @@ fn noopCaptureCallback(frame: AudioInFrame, userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-test "audio capture 拡張: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変）" {
+test "audio capture 拡張: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変。非 macOS のみ）" {
+    // macOS は TASK-49.2 で実 backend（AUHAL input）に置き換わっており、requestCapturePermission/
+    // openCapture は実 TCC ダイアログ・実デバイスに触れるため自動テスト対象外（手動検証レンジ。
+    // backlog task-49.2 notes 参照）。compile+link は test-capture-types 自体が既に担保している。
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerateCaptureDevices(testing.allocator));
     try testing.expectError(error.Unsupported, requestCapturePermission());
     try testing.expectError(error.Unsupported, openCapture(testing.allocator, .{ .capture_callback = noopCaptureCallback }));

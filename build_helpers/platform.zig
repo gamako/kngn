@@ -151,10 +151,9 @@ pub fn createPlatformModule(
 /// Wayland backend の `@cImport("xdg-shell-client-protocol.h")` 解決に使う。
 fn generateXdgShellClientHeaderDir(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
-        "sh", "-c",
+        "sh",                                                                                                                            "-c",
         // $0=sh, $1=出力パス(addOutputFileArg)。pkg-config で xdg-shell.xml の場所を引く。
-        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"",
-        "sh",
+        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"", "sh",
     });
     return cmd.addOutputFileArg("xdg-shell-client-protocol.h").dirname();
 }
@@ -163,9 +162,8 @@ fn generateXdgShellClientHeaderDir(b: *std.Build) std.Build.LazyPath {
 /// exe に C source として追加する（wl_proxy_* を参照するため wayland-client への link を担保する）。
 fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
-        "sh", "-c",
-        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"",
-        "sh",
+        "sh",                                                                                                                           "-c",
+        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"", "sh",
     });
     return cmd.addOutputFileArg("xdg-shell-protocol.c");
 }
@@ -307,9 +305,23 @@ pub const KitLibs = struct {
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
 /// （top build.zig の linkAudioBackend と同方針）。
+///
+/// macOS 分岐は capture（mic AUHAL input / camera AVFoundation。TASK-49.2）の framework も
+/// 併せてリンクする（トップ階層 build.zig の `linkAudioBackend` と同じ予防的追加。codex
+/// レビュー指摘）。同じループ内で呼ばれる `setupExecutableForPlatform`（呼び出し順序は下記
+/// `buildStandalone` 参照）が -F/-L の検索パスを設定するため、ここでは framework/library 名の
+/// 追加だけで足りる（build graph 構築順序は実際のリンク時の解決に影響しない）。
 fn linkAudioForStandalone(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {
-        .macos => exe.root_module.linkFramework("AudioToolbox", .{}),
+        .macos => {
+            exe.root_module.linkFramework("AudioToolbox", .{});
+            exe.root_module.linkFramework("CoreAudio", .{});
+            exe.root_module.linkFramework("AVFoundation", .{});
+            exe.root_module.linkFramework("CoreMedia", .{});
+            exe.root_module.linkFramework("CoreVideo", .{});
+            exe.root_module.linkFramework("Foundation", .{});
+            exe.root_module.linkSystemLibrary("objc", .{});
+        },
         .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
         .windows => exe.root_module.linkSystemLibrary("ole32", .{}), // WASAPI は COM 経由（CoCreateInstance 等が ole32）
         else => {}, // それ以外: audio backend 未対応。リンクせず compile 時の facade compileError に任せる
