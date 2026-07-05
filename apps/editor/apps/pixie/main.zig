@@ -25,6 +25,7 @@ const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
 const selection_input = @import("selection_input.zig");
 const selection_overlay = @import("selection_overlay.zig");
+const eyedropper_input = @import("eyedropper_input.zig");
 const brush_edge_cache = @import("brush_edge_cache.zig");
 const cursor_overlay = @import("cursor_overlay.zig");
 
@@ -92,6 +93,7 @@ const ToolKind = enum {
     bezier,
     select,
     fill,
+    eyedropper,
 
     fn name(self: ToolKind) []const u8 {
         return switch (self) {
@@ -101,6 +103,7 @@ const ToolKind = enum {
             .bezier => "Bezier",
             .select => "Select",
             .fill => "Fill",
+            .eyedropper => "Eyedropper",
         };
     }
 
@@ -114,6 +117,7 @@ const ToolKind = enum {
             .bezier => .{ .label = "Bz", .color = gui.Color.rgba(0x1E, 0x9E, 0xC9, 0xFF) },
             .select => .{ .label = "Sl", .color = gui.Color.rgba(0xB8, 0x9A, 0x16, 0xFF) },
             .fill => .{ .label = "Fl", .color = gui.Color.rgba(0x2E, 0x9E, 0x52, 0xFF) },
+            .eyedropper => .{ .label = "Ey", .color = gui.Color.rgba(0x7A, 0x4A, 0xC9, 0xFF) },
         };
     }
 };
@@ -180,6 +184,9 @@ const App = struct {
     bez_in: bezier_input.BezierInput = .{},
     /// 範囲選択ツール（独立経路。TASK-44）。マーキー作成 / 選択範囲移動の状態機械。
     sel_in: selection_input.SelectionInput = .{},
+    /// スポイトツール（独立経路。TASK-68）。press-capture の最小状態機械（塗り操作が無いため
+    /// Tool vtable / StrokeRecorder / Undo は不要）。専用ツール選択・Alt+クリック一時スポイトの両方で使う。
+    eye_in: eyedropper_input.EyedropperInput = .{},
     /// clipboard（copy/cut で確保し paste で参照。gpa 所有・deinit で free）。
     clipboard: ?core.PixelBlock = null,
     /// paste/move のブロック配置方法（既定 over=透明を保持＝下の絵を残す）。右ペインのトグルで切替（TASK-44）。
@@ -251,14 +258,15 @@ const App = struct {
             .bezier => self.pen.tool(), // bezier は独立経路で canvas_input を経由しない（到達しないフォールバック）
             .select => self.pen.tool(), // select も独立経路（到達しないフォールバック）
             .fill => self.fill.tool(),
+            .eyedropper => self.pen.tool(), // eyedropper も独立経路（到達しないフォールバック。actionStroke で明示的に弾く）
         };
     }
 
     /// ツール切替を一元化（active_kind への代入は全てここ経由）。
-    /// capture / 選択ドラッグ中は切替しない（進行中操作を宙ぶらりんにしない）。
+    /// capture / 選択ドラッグ / スポイト picking 中は切替しない（進行中操作を宙ぶらりんにしない）。
     /// .bezier から出る時は未確定パスを cancel。.select から出る時は進行中ドラッグを破棄（selection は保持）。
     fn setActiveKind(self: *App, next: ToolKind) void {
-        if (self.input.capturing or self.sel_in.state != .idle) return;
+        if (self.input.capturing or self.sel_in.state != .idle or self.eye_in.picking) return;
         if (self.active_kind == .bezier and next != .bezier) {
             self.bezier_editor.update(self.gpa, .cancel);
         }
@@ -302,7 +310,7 @@ const App = struct {
     /// `brush_edges.refresh()`（Brush.footprint() 経由で buildDab を再実行する）が Brush ストローク中に
     /// 呼ばれることも無くなり、「footprint は down 時に latch・stroke 中不変」という既存契約を壊さない。
     fn isPointerBusy(self: *const App) bool {
-        return self.input.capturing or self.sel_in.state != .idle or self.bez_in.in_drag or self.pan_active;
+        return self.input.capturing or self.sel_in.state != .idle or self.bez_in.in_drag or self.pan_active or self.eye_in.picking;
     }
 
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
@@ -341,6 +349,26 @@ const App = struct {
         self.brush.color = color;
         self.fill.color = color;
         self.edit_synced_for = null;
+    }
+
+    /// スポイト（TASK-68）: 指定 canvas 座標の色を描画色へ反映する。座標は呼び出し側
+    /// （`eyedropper_input.EyedropperInput.update`）が既に canvas 範囲内であることを保証している。
+    /// 取得色は「合成色」（`compositeStraight()`。表示されている見た目の色。設計判断は plan 参照）。
+    /// alpha==0（未描画/透明）は無視する（黒などの偽色を拾わせない）。alpha は不透明へ強制してから
+    /// `doSetColorHex` へ渡す（`palette.zig` の不変条件「色は常に不透明」を守るため）。
+    /// Eraser 選択中に拾った場合は Pen へ自動切替する（Eraser 自体には描画色の概念が無いため。
+    /// パレットスウォッチクリックと同じ既存慣習）。`setActiveKind` は経由しない直接代入で切り替える
+    /// （`setActiveKind` は `eye_in.picking` 中は競合ガードで no-op になるため、drag 中に不透明色を
+    /// 拾った時点で切り替えたい本メソッドの意図と噛み合わない。この切替は「進行中の eyedrop 操作
+    /// 自身の帰結」であり他ツールとの競合ではないので安全にバイパスできる。かつ .eraser から離れる
+    /// 遷移は bezier cancel も sel_in フロート破棄も不要＝`setActiveKind` のガード外処理を再現する
+    /// 必要が無い。codex レビュー指摘 2026-07-05）。
+    fn pickColor(self: *App, x: i32, y: i32) void {
+        const idx = @as(usize, @intCast(y)) * CANVAS_W + @as(usize, @intCast(x));
+        const sampled = self.canvas.compositeStraight()[idx];
+        if (sampled & 0xFF000000 == 0) return; // 透明部は無視
+        self.doSetColorHex(0xFF000000 | (sampled & 0x00FFFFFF));
+        if (self.active_kind == .eraser) self.active_kind = .pen;
     }
 
     /// 選択（or load）が変わったフレームに編集中 HSV を現在色から再同期する。
@@ -860,6 +888,8 @@ const App = struct {
             self.setActiveKind(.select);
         } else if (k.key == .G) {
             self.setActiveKind(.fill);
+        } else if (k.key == .I) {
+            self.setActiveKind(.eyedropper); // Photoshop/GIMP 慣習のキー割当（一時スポイトは Alt+クリック）
         } else if (k.key == .C) {
             self.doClear() catch {};
         } else if (k.key == .@"0") {
@@ -1131,12 +1161,12 @@ fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 }
 
 /// canvas 座標の点列を down→move×N→up で直接駆動する（既存 canvas_input と同じ Tool 経路）。
-/// `active_kind==.bezier/.select` は `activeTool()` が到達しないフォールバック（pen）を返す実装の
-/// ため、意図しない Pen 描画を避けるべく明示的に弾く。
+/// `active_kind==.bezier/.select/.eyedropper` は `activeTool()` が到達しないフォールバック（pen）を
+/// 返す実装のため、意図しない Pen 描画を避けるべく明示的に弾く。
 fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    if (app.active_kind == .bezier or app.active_kind == .select) return error.UnsupportedTool;
+    if (app.active_kind == .bezier or app.active_kind == .select or app.active_kind == .eyedropper) return error.UnsupportedTool;
     if (app.editingBlocked()) return error.EditingBlocked;
     var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
     const pts = try actions.parseStrokePoints(args, &pts_buf);
@@ -1577,7 +1607,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         ctx.endBox();
 
         ctx.label("Tool");
-        // 4 ツールは右ペイン幅に収めるため 2 行に折り返す
+        // 7 ツールは右ペイン幅に収めるため 2 個ずつ折り返す（TASK-68 で Eyedrop 追加・奇数個なので最終行は単独）
         ctx.beginBox(.{ .direction = .row, .gap = 4 });
         if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.setActiveKind(.pen);
         if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.setActiveKind(.eraser);
@@ -1590,6 +1620,10 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         if (ctx.buttonEx("Select", .{ .selected = app.active_kind == .select, .min_w = 56 }).clicked) app.setActiveKind(.select);
         if (ctx.buttonEx("Fill", .{ .selected = app.active_kind == .fill, .min_w = 56 }).clicked) app.setActiveKind(.fill);
         ctx.endBox();
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Eyedrop", .{ .selected = app.active_kind == .eyedropper, .min_w = 56 }).clicked) app.setActiveKind(.eyedropper);
+        ctx.endBox();
+        ctx.labelEx("(Alt+click = temp eyedrop)", ctx.style.text_subtle);
         // paste/move のブロック配置トグル（gui.toggle スイッチ。TASK-48）。
         // ON=透明を保持(src-over・下の絵を残す) / OFF=上書き(replace)。
         var keep_transp = app.blend_mode == .over;
@@ -1838,6 +1872,24 @@ pub fn main(init: std.process.Init) !void {
                     };
                     if (app.sel_in.update(frame, app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |cmd| {
                         app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
+                    }
+                } else if (app.eye_in.picking or app.active_kind == .eyedropper or
+                    (pressed_left_gated and in.modifiers.alt))
+                {
+                    // スポイト（独立経路。TASK-68）。専用ツール選択中、または進行中の picking を完走、
+                    // または Alt+クリックの一時スポイト（bezier/select は上の分岐で既に弾かれているので
+                    // ここに来る active_kind は pen/eraser/brush/fill/eyedropper のいずれか。4ツール
+                    // 全てで Alt+クリックを一律有効にする最小の場合分け）。
+                    const frame: eyedropper_input.EyedropperInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = app.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                    };
+                    if (app.eye_in.update(frame)) |cp| {
+                        app.pickColor(cp.x, cp.y);
                     }
                 } else {
                     const frame: canvas_input.CanvasInput.Frame = .{

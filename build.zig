@@ -667,6 +667,22 @@ pub fn build(b: *std.Build) void {
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
 
+    // スポイトの入力アダプタ（TASK-68）。core を名前付き import（selection_input/bezier_input と同型）
+    const eyedropper_input_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    const eyedropper_input_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/eyedropper_input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    eyedropper_input_core.addImport("pixelops", shared_modules.pixelops.mod);
+    eyedropper_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    eyedropper_input_core.addImport("serde", shared_modules.serde.mod);
+    eyedropper_input_mod.addImport("paint", eyedropper_input_core);
+    const eyedropper_input_test = b.addTest(.{ .root_module = eyedropper_input_mod });
+    const run_eyedropper_input_test = b.addRunArtifact(eyedropper_input_test);
+
     // ブラシ footprint 縁セルキャッシュ（TASK-75.4）。gui/kit 非依存の純ロジック。core を名前付き import（canvas_input と同型）
     const brush_edge_cache_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
@@ -731,6 +747,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_bezier_input_test.step);
     test_core_step.dependOn(&run_core_selection_test.step);
     test_core_step.dependOn(&run_selection_input_test.step);
+    test_core_step.dependOn(&run_eyedropper_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
