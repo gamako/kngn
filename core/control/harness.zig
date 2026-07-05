@@ -309,6 +309,18 @@ pub fn isHeadlessActive() bool {
     return headless_active;
 }
 
+/// capture（マイク/カメラ）の synthetic source 差し替え判定（TASK-49.5 のプレースホルダ）。
+/// `core/camera.zig`/`core/audio.zig` の capture 系関数（`enumerate`/`requestPermission`/`open`）が
+/// 先頭で呼ぶ分岐点。**現状は常に `false`**（synthetic backend は TASK-49.5 で実装するため、49.1
+/// 時点ではこの関数の中身も呼び出し側の `true` 分岐も到達しない）。有効化条件は既存 audio 出力と
+/// 同じ規約を踏襲する: harness の env 読み（`parseConfig()`）は `platform.init()` 経由でのみ走るため、
+/// `platform.init()` を呼ばない capture-only アプリでは本関数は常に `false` を返す
+/// （`examples/15_audio_tone` 等の audio-only アプリが `VP_HARNESS_HEADLESS` を解釈できないのと
+/// 同じ既知の制約。詳細は `docs/plans/capture-foundation-plan.md` 5章）。
+pub fn isCaptureSyntheticActive() bool {
+    return false;
+}
+
 /// platform.init() が（非 headless 時は `backend.init()` の後に）1度だけ呼ぶ。
 /// script 読込 / live listen の実 I/O はここに閉じる（`parseConfig()` との分割は plan §3.1 参照）。
 pub fn startTransport() void {
@@ -2096,6 +2108,19 @@ test "decideHeadless: SCRIPT/LIVE 併用時のみ true、単独指定・未要�
     try testing.expect(decideHeadless(true, null, true)); // HEADLESS + LIVE
     try testing.expect(decideHeadless(true, "script.txt", true)); // 両方（後段の矛盾判定は別）
     try testing.expect(!decideHeadless(false, "script.txt", true)); // HEADLESS 未要求なら無関係
+}
+
+// ============================================================================
+// capture synthetic source 継ぎ目（TASK-49.1）tests
+// ============================================================================
+
+test "isCaptureSyntheticActive: 49.1 時点では harness の有効/無効に関わらず常に false（プレースホルダ）" {
+    resetForTest();
+    try testing.expect(!isCaptureSyntheticActive());
+
+    mode = .replay; // harness を有効化した状態でも判定は変わらないことを確認
+    defer resetForTest();
+    try testing.expect(!isCaptureSyntheticActive());
 }
 
 test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイズ変更で再確保" {

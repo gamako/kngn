@@ -144,3 +144,96 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     const inner = try backend.open(allocator, wrapped_cfg);
     return .{ .inner = .{ .native = inner }, .wrapped = wrapped };
 }
+
+// ============================================================================
+// capture 拡張（マイク入力・TASK-49.1）
+//
+// 既存の出力経路（上記 `Error`/`Config`/`EffectiveConfig`/`AudioDevice`/`open`）とは完全に独立の
+// 追加セクション。既存出力 backend（`audio_{macos,linux,windows}.zig`）は本タスクで無変更のまま、
+// capture 側だけ `audio_capture_stub.zig`（全 OS 共通の明示 stub）を経由させる。
+// mic/camera の facade が同じ動詞概念・同じ型 shape（`CaptureError`/`PermissionState`/
+// `EffectiveConfig`）を共有することが control plane 統一の実体（設計文書
+// `docs/plans/capture-foundation-plan.md` 4章）。命名は既存出力 API との衝突を避けるため
+// `Capture` を挟む（`core/camera.zig` は新規ファイルのため bare な動詞名を使う。対比は設計文書
+// 4.1 の表）。
+//
+// TASK-49.1 時点は全 OS 共通の明示 stub（`audio_capture_stub.zig`）を経由する。TASK-49.2〜.4 が
+// 下記 `capture_backend` の import を `builtin.os.tag` 分岐へ置き換える。
+//
+// ホットパス宣言: この拡張自体は「イベント時のみ / 初期化時のみ」（facade 骨格・stub 委譲）。
+// mic capture callback（`CaptureCallback`）は RT（毎サンプル）契約だが、49.1 の stub は
+// `open()` が常に失敗するため callback は一切呼ばれない（実装は TASK-49.2〜.4）。
+// ============================================================================
+
+const capture_types = @import("capture_types");
+const capture_backend = @import("audio_capture_stub.zig");
+
+// capture_types の型を audio module から直接使えるよう再公開する（camera.zig が DeviceInfo 等を
+// 再公開しているのと対称。外部利用者が `capture_types` を別途 import しなくても
+// `audio.AudioInFrame`/`audio.DeviceInfo`/`audio.PermissionState`/`audio.freeDeviceList` だけで
+// capture API を完結して使えるようにする）。
+pub const CaptureError = capture_types.CaptureError;
+pub const DeviceInfo = capture_types.DeviceInfo;
+pub const PermissionState = capture_types.PermissionState;
+pub const AudioInFrame = capture_types.AudioInFrame;
+pub const freeDeviceList = capture_types.freeDeviceList;
+pub const CaptureCallback = capture_backend.CaptureCallback;
+pub const CaptureConfig = capture_backend.Config;
+pub const CaptureEffectiveConfig = capture_backend.EffectiveConfig;
+pub const CaptureDevice = capture_backend.CaptureDevice;
+
+/// 接続中のマイクデバイスを列挙する。呼び出し側 `allocator` で確保した `DeviceInfo` の配列を返す
+/// （`id`/`name` も同 allocator。解放は `freeDeviceList()`。契約は設計文書 4.4）。
+pub fn enumerateCaptureDevices(allocator: std.mem.Allocator) CaptureError![]DeviceInfo {
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    return capture_backend.enumerate(allocator);
+}
+
+/// マイク権限を要求し、確定した状態を返す（ブロッキング。詳細は設計文書 6章）。
+pub fn requestCapturePermission() CaptureError!PermissionState {
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    return capture_backend.requestPermission();
+}
+
+/// マイクを開く。`cfg` の sample_rate/channels はヒント。実効値は `device.config()` で取得する
+/// （`configure()` という独立動詞は置かない。設計文書 4.2）。
+pub fn openCapture(allocator: std.mem.Allocator, cfg: CaptureConfig) CaptureError!CaptureDevice {
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    return capture_backend.open(allocator, cfg);
+}
+
+// ============================================================================
+// capture 拡張のテスト
+// ============================================================================
+const testing = std.testing;
+
+fn noopCaptureCallback(frame: AudioInFrame, userdata: ?*anyopaque) void {
+    _ = frame;
+    _ = userdata;
+}
+
+test "audio capture 拡張: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変）" {
+    try testing.expectError(error.Unsupported, enumerateCaptureDevices(testing.allocator));
+    try testing.expectError(error.Unsupported, requestCapturePermission());
+    try testing.expectError(error.Unsupported, openCapture(testing.allocator, .{ .capture_callback = noopCaptureCallback }));
+}
+
+test "audio capture 拡張: isCaptureSyntheticActive() は現状常に false（synthetic 分岐は到達しない）" {
+    try testing.expect(!harness.isCaptureSyntheticActive());
+}
+
+test "audio capture 拡張: capture_types を re-export しているので外部利用者は audio.* だけで完結できる" {
+    // capture_types を別途 import せずとも、audio.AudioInFrame / audio.DeviceInfo /
+    // audio.PermissionState / audio.freeDeviceList だけで capture API 一式を組み立てられることを
+    // コンパイル時に固定する（camera.zig の再公開と対称）。
+    const frame: AudioInFrame = .{ .samples = &.{}, .frames = 0, .channels = 1, .sample_rate = 48000, .timestamp_ns = 0 };
+    noopCaptureCallback(frame, null);
+
+    const allocator = testing.allocator;
+    var devices = try allocator.alloc(DeviceInfo, 1);
+    devices[0] = .{ .id = try allocator.dupe(u8, "dev-0"), .name = try allocator.dupe(u8, "Built-in Mic"), .kind = .audio_in, .is_default = true };
+    freeDeviceList(allocator, devices);
+
+    const state: PermissionState = .not_determined;
+    try testing.expectEqual(PermissionState.not_determined, state);
+}

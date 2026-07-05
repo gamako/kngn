@@ -370,6 +370,49 @@ pub fn build(b: *std.Build) void {
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
+    // capture 入力基盤（TASK-49.1）単体テスト。display/実デバイス不要・OS 非依存。
+    // capture_types（TripleBuffer 往復・不変条件・DeviceInfo/CaptureError 構造）+ camera facade
+    // （camera_stub.zig を relative import で内包。harness 分岐 + stub 委譲）+ audio.zig の
+    // capture 拡張（audio_capture_stub.zig を relative import で内包。既存出力 backend の switch は
+    // 参照されない限り分析されない Zig の lazy analysis により、AudioToolbox 等のリンクは不要
+    // ＝実測確認済み）の3本を1 step に束ねる。
+    const capture_types_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("core/capture_types.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_capture_types_step = b.step("test-capture-types", "Run capture_types / camera facade / audio capture extension unit tests (TASK-49.1)");
+    test_capture_types_step.dependOn(&b.addRunArtifact(capture_types_test).step);
+
+    // camera.zig facade（camera_stub.zig を relative import で内包）。harness を使うため
+    // harness_test_mod と同じ理由で link_libc=true にする。
+    const camera_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/camera.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // harness.init() 系が libc getenv を使う
+    });
+    camera_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    camera_test_mod.addImport("harness", shared_modules.harness.mod);
+    const camera_test = b.addTest(.{ .root_module = camera_test_mod });
+    test_capture_types_step.dependOn(&b.addRunArtifact(camera_test).step);
+
+    // core/audio.zig（capture 拡張含む全体）。既存出力 backend（audio_macos 等）への `switch` は
+    // 残るが、capture 系テストは出力側の関数を一切呼ばないため Zig の lazy analysis で
+    // 未参照のまま留まり、AudioToolbox 等の追加リンクなしに compile+link できる（実測確認済み）。
+    // audio_capture_stub.zig は relative import で同一 module に含まれるためテストも一緒に走る。
+    const audio_capture_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/audio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audio_capture_test_mod.addImport("harness", shared_modules.harness.mod);
+    audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
+    test_capture_types_step.dependOn(&b.addRunArtifact(audio_capture_test).step);
+
     // canvas.zig 単体テスト
     const canvas_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/canvas.zig"),
@@ -873,6 +916,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
+    test_step.dependOn(test_capture_types_step);
     test_step.dependOn(test_pixelops_step);
     test_step.dependOn(test_serde_step);
 
@@ -1105,6 +1149,8 @@ const SharedModules = struct {
     paint: TaggedModule, // 旧 apps/editor/core（ADR-007 R6 で libs/paint へ格上げ）
     spectrogram: TaggedModule, // libs/viz（旧 apps/synth/spectrogram.zig）
     scope: TaggedModule, // libs/viz（旧 apps/synth/scope.zig）
+    capture_types: TaggedModule, // capture 入力基盤の共有型（TASK-49.1。platform_types と同じ type-only）
+    camera: TaggedModule, // カメラ L1 facade（TASK-49.1。audio と同格の core layer primitive）
 
     fn init(b: *std.Build) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
@@ -1200,6 +1246,26 @@ const SharedModules = struct {
         // audio facade（core/audio.zig）が `@import("harness")` で onAudioSamples を呼ぶ。
         link(audio, harness);
 
+        // capture 入力基盤の共有型（TASK-49.1）: control plane 共通型 + data plane 型
+        // （DeviceInfo/PermissionState/CaptureError/AudioInFrame/PixelFormat/VideoFrame/TripleBuffer）。
+        // platform_types と同じ type-only module。camera/audio の両方が同一インスタンスを link する
+        // 必要がある（Zig の相対 import は module ごとに別インスタンスの型になるため、型同一性が
+        // 要る共有型は named module 化が必須。詳細は docs/plans/capture-foundation-plan.md 8章）。
+        const capture_types: TaggedModule = .{ .layer = .core, .name = "capture_types", .type_only = true, .mod = b.createModule(.{
+            .root_source_file = b.path("core/capture_types.zig"),
+        }) };
+        // audio facade（core/audio.zig）の capture 拡張が `@import("capture_types")` で使う。
+        link(audio, capture_types);
+
+        // camera (L1 カメラ入力): audio と同格の core layer primitive（TASK-49.1）。49.1 時点は
+        // 全 OS 共通の明示 stub（camera_stub.zig）を経由し、harness の isCaptureSyntheticActive()
+        // 継ぎ目を持つ。TASK-49.2〜.4 が builtin.os.tag 分岐の実 backend へ置き換える。
+        const camera: TaggedModule = .{ .layer = .core, .name = "camera", .mod = b.createModule(.{
+            .root_source_file = b.path("core/camera.zig"),
+        }) };
+        link(camera, capture_types);
+        link(camera, harness); // isCaptureSyntheticActive() 継ぎ目
+
         // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
         // （物理位置は src/dsp のまま。libs/audio への移動は R8 日和見で後続タスクにて）
         const dsp: TaggedModule = .{ .layer = .lib, .name = "dsp", .mod = b.createModule(.{
@@ -1263,6 +1329,8 @@ const SharedModules = struct {
             .paint = paint,
             .spectrogram = spectrogram,
             .scope = scope,
+            .capture_types = capture_types,
+            .camera = camera,
         };
     }
 };
