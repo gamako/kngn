@@ -126,6 +126,28 @@ const ShmBuffer = struct {
     bh: u32 = 0,
 };
 
+// ---- CSD（client-side decoration。TASK-28.5.6 Stage 2b） ----
+
+/// pointer focus 対象（ptrEnter の surface 引数で追跡）。content=本体 / deco=装飾 subsurface / other=不明。
+/// 装飾上のイベント（motion/button/axis/frame）はアプリ EventQueue に流さず装飾操作へ振り分ける。
+const PtrFocus = union(enum) {
+    content,
+    deco: csd.DecoPart,
+    other,
+};
+
+/// CSD 装飾 1 枚（4 枚: title/left/right/bottom）。各自 wl_surface + wl_subsurface + 単一 shm buffer。
+/// buf は content と同型 ShmBuffer を流用（buffer_listener で release→busy=false を受ける）。
+const CsdSurface = struct {
+    part: csd.DecoPart,
+    surface: ?*c.struct_wl_surface = null,
+    subsurface: ?*c.struct_wl_subsurface = null,
+    buf: ShmBuffer = .{},
+    // 現在 buffer を attach して表示中か。empty(maximized 枠)で attach null すると false。
+    // unmap→remap 時に busy-skip で再 attach を取りこぼさないための状態（codex 指摘 #1）。
+    mapped: bool = false,
+};
+
 const State = struct {
     display: *c.struct_wl_display,
     registry: ?*c.struct_wl_registry = null,
@@ -146,7 +168,18 @@ const State = struct {
     // decoration.configure(mode) は即時適用せず latch し、xdg_surface.configure(ack) で反映（既存 pending_resize と同型）。
     // 0=未受信 / 1=client_side / 2=server_side。
     pending_decoration_mode: u32 = 0,
-    maximized: bool = false, // toplevel states の maximized/tiled（CSD 枠折り畳み判定。Stage 2b で使用）
+    maximized: bool = false, // toplevel states の maximized/tiled（CSD 枠折り畳み判定）
+    pending_maximized: bool = false, // toplevelConfigure が states から latch し ack で maximized へ反映
+    // CSD subsurface 群（deco_state==.csd のときのみ構築）。順序固定: 0=title/1=left/2=right/3=bottom。
+    csd_surfaces: [4]CsdSurface = .{
+        .{ .part = .title }, .{ .part = .left }, .{ .part = .right }, .{ .part = .bottom },
+    },
+    csd_built: bool = false,
+    // pointer focus 追跡（装飾イベントの振り分け）。deco 中は deco_local_x/y に part-local 座標を保持。
+    ptr_focus: PtrFocus = .content,
+    deco_local_x: i32 = 0,
+    deco_local_y: i32 = 0,
+    hover_button: csd.Button = .none, // title バーの hover ボタン（変化時のみ再描画）
 
     // 入力（TASK-28.5.3）
     seat: ?*c.struct_wl_seat = null,
@@ -274,29 +307,44 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
     const st: *State = @ptrCast(@alignCast(data.?));
     c.xdg_surface_ack_configure(xdg_surface, serial);
     st.configured = true;
+    // maximized/tiled（TASK-28.5.6）: toplevelConfigure が states から latch した値を ack と同じ
+    // configure sequence で反映する（size 変換より前 = geo→content が正しい maximized で行われる）。
+    st.maximized = st.pending_maximized;
     // 装飾 mode の適用（TASK-28.5.6）: decoration.configure で latch した mode を ack と同じ configure
     // sequence で反映する。deco_obj がある場合のみ（FORCE_CSD/manager 不在は create 側で確定済み）。
+    // client_side でも subcompositor 不在なら CSD を構築できないので .none に倒す（AC#5 のガード）。
     if (st.deco_obj != null and st.pending_decoration_mode != 0) {
-        st.deco_state = if (st.pending_decoration_mode == c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE) .ssd else .csd;
-        // TODO(Stage 2b): csd 確定時は subsurface 構築 + window geometry 再発行 + content サイズ変換。
-        // Stage 2a では csd/none は従来どおり装飾なしで表示する（compile + SSD 経路確立が目的）。
+        st.deco_state = if (st.pending_decoration_mode == c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
+            .ssd
+        else if (st.subcompositor != null) .csd else .none;
     }
     // resize（TASK-23）: pending suggested size を ack 後に適用する。ただし初期 setupBuffers より前
     // （buffers 未確保）は適用せず requested size を維持する（create 中は従来挙動）。
     // buffer 実体は lockFramebuffer が free buffer を lazy 再確保する（busy buffer には触らない）。
+    // CSD 時は compositor の suggested size は window geometry 基準なので content へ変換する（TASK-28.5.6）。
     if (st.pending_resize and st.buffers[0].buffer != null) {
         st.pending_resize = false;
         if (st.pending_width != 0 and st.pending_height != 0) {
-            st.width = st.pending_width;
-            st.height = st.pending_height;
+            if (st.deco_state == .csd) {
+                const cs = csd.geometryToContent(@intCast(st.pending_width), @intCast(st.pending_height), .csd, st.maximized);
+                st.width = @intCast(cs.w);
+                st.height = @intCast(cs.h);
+            } else {
+                st.width = st.pending_width;
+                st.height = st.pending_height;
+            }
         }
     }
+    // 装飾の構築/再配置（buffers 確保後のみ。create 中の初回 configure は setupBuffers 後に create 側が呼ぶ）。
+    if (st.buffers[0].buffer != null) syncDecorations(st);
 }
 
 fn toplevelConfigure(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel, width: i32, height: i32, states: ?*c.struct_wl_array) callconv(.c) void {
     _ = toplevel;
-    _ = states;
     const st: *State = @ptrCast(@alignCast(data.?));
+    // states（maximized/fullscreen/tiled）を latch。CSD の枠折り畳み判定（TASK-28.5.6）。latest-wins なので
+    // 毎回 states を読み直し、実適用は xdg_surface.configure(ack) 側で行う（size と同 sequence）。
+    st.pending_maximized = parseMaximized(states);
     // xdg-shell の 0 は「サイズ指定なし（クライアント裁量）」であり最小化ではない。各 configure は
     // latest-wins なので、両軸 >0 のときだけ pending に記録し、それ以外（0 を含む）は stale pending を
     // 消す（前グループの値を引きずらない）。実適用は xdg_surface.configure(ack) 側で行う。
@@ -307,6 +355,30 @@ fn toplevelConfigure(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel, width
     } else {
         st.pending_resize = false;
     }
+}
+
+/// toplevel states 配列（uint32 enum の wl_array）から「枠を折り畳むべき状態」を判定する。
+/// maximized / fullscreen / 各 tiled を対象（plan: maximized・tiled 系は枠 0）。
+fn parseMaximized(states: ?*c.struct_wl_array) bool {
+    const arr = states orelse return false;
+    const raw = arr.data orelse return false;
+    const n = arr.size / @sizeOf(u32);
+    if (n == 0) return false;
+    const vals: [*]const u32 = @ptrCast(@alignCast(raw));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        switch (vals[i]) {
+            c.XDG_TOPLEVEL_STATE_MAXIMIZED,
+            c.XDG_TOPLEVEL_STATE_FULLSCREEN,
+            c.XDG_TOPLEVEL_STATE_TILED_LEFT,
+            c.XDG_TOPLEVEL_STATE_TILED_RIGHT,
+            c.XDG_TOPLEVEL_STATE_TILED_TOP,
+            c.XDG_TOPLEVEL_STATE_TILED_BOTTOM,
+            => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn toplevelClose(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel) callconv(.c) void {
@@ -513,54 +585,136 @@ fn mouseEvent(st: *State, button: MouseButton) types.MouseEvent {
     };
 }
 
+/// ptrEnter の surface からどの surface に focus したか判定する（TASK-28.5.6）。
+fn resolveFocus(st: *State, surface: ?*c.struct_wl_surface) PtrFocus {
+    if (surface == null) return .other;
+    if (surface == st.surface) return .content;
+    for (&st.csd_surfaces) |*cs| {
+        if (cs.surface != null and surface == cs.surface) return .{ .deco = cs.part };
+    }
+    return .other;
+}
+
 fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface: ?*c.struct_wl_surface, sx: c.wl_fixed_t, sy: c.wl_fixed_t) callconv(.c) void {
     _ = ptr;
     _ = serial;
-    _ = surface;
     const st: *State = @ptrCast(@alignCast(data.?));
-    st.pointer_x = wlinput.fixedToI32(sx);
-    st.pointer_y = wlinput.fixedToI32(sy);
+    const lx = wlinput.fixedToI32(sx);
+    const ly = wlinput.fixedToI32(sy);
+    const focus = resolveFocus(st, surface);
+    st.ptr_focus = focus;
+    switch (focus) {
+        .content => {
+            st.pointer_x = lx;
+            st.pointer_y = ly;
+        },
+        .deco => |part| {
+            st.deco_local_x = lx;
+            st.deco_local_y = ly;
+            // 装飾へ移った瞬間、content 側で蓄積途中の scroll を持ち越さない（plan）。
+            st.scroll_disc = .{};
+            st.scroll_cont = .{};
+            if (part == .title) updateHover(st, lx, ly);
+        },
+        .other => {},
+    }
 }
 
 fn ptrLeave(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface: ?*c.struct_wl_surface) callconv(.c) void {
-    _ = data;
     _ = ptr;
     _ = serial;
-    _ = surface; // no-op
+    const st: *State = @ptrCast(@alignCast(data.?));
+    switch (resolveFocus(st, surface)) {
+        .deco => {
+            // 装飾から離脱: hover を解除（title なら再描画）。
+            if (st.hover_button != .none) {
+                st.hover_button = .none;
+                redrawTitle(st);
+            }
+        },
+        else => {},
+    }
+    st.ptr_focus = .content;
 }
 
 fn ptrMotion(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, sx: c.wl_fixed_t, sy: c.wl_fixed_t) callconv(.c) void {
     _ = ptr;
     _ = time;
     const st: *State = @ptrCast(@alignCast(data.?));
-    st.pointer_x = wlinput.fixedToI32(sx);
-    st.pointer_y = wlinput.fixedToI32(sy);
-    st.queue.enqueue(.{ .mouse_move = mouseEvent(st, .none) });
+    const lx = wlinput.fixedToI32(sx);
+    const ly = wlinput.fixedToI32(sy);
+    switch (st.ptr_focus) {
+        .content => {
+            st.pointer_x = lx;
+            st.pointer_y = ly;
+            st.queue.enqueue(.{ .mouse_move = mouseEvent(st, .none) });
+        },
+        .deco => |part| {
+            st.deco_local_x = lx;
+            st.deco_local_y = ly;
+            if (part == .title) updateHover(st, lx, ly); // 装飾は app へ流さない
+        },
+        .other => {},
+    }
 }
 
 fn ptrButton(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, time: u32, button: u32, state: u32) callconv(.c) void {
     _ = ptr;
-    _ = serial;
     _ = time;
     const st: *State = @ptrCast(@alignCast(data.?));
     const mb = wlinput.evdevButtonToMouseButton(button) orelse return;
     const pressed = state != 0; // WL_POINTER_BUTTON_STATE_PRESSED=1
-    setButton(st, mb, pressed); // post-state にしてから event を組む
-    const ev = mouseEvent(st, mb);
-    st.queue.enqueue(if (pressed) .{ .mouse_down = ev } else .{ .mouse_up = ev });
+    switch (st.ptr_focus) {
+        .content => {
+            setButton(st, mb, pressed); // post-state にしてから event を組む
+            const ev = mouseEvent(st, mb);
+            st.queue.enqueue(if (pressed) .{ .mouse_down = ev } else .{ .mouse_up = ev });
+        },
+        .deco => |part| {
+            // 装飾クリックは move/resize/close/max/min へ。app へは流さない（TASK-28.5.6）。
+            if (pressed and mb == .left) handleDecoPress(st, part, serial);
+        },
+        .other => {},
+    }
+}
+
+/// 装飾上の左押下を hitTest して move/resize/ボタンへ配線する（xdg_toplevel_move/resize は serial 必須）。
+fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
+    const cw: i32 = @intCast(st.width);
+    const ch: i32 = @intCast(st.height);
+    const target = csd.hitTest(part, st.deco_local_x, st.deco_local_y, cw, ch, st.maximized);
+    const tl = st.toplevel orelse return;
+    const seat = st.seat orelse return;
+    switch (target) {
+        .none => {},
+        .move => c.xdg_toplevel_move(tl, seat, serial),
+        .resize => |edge| c.xdg_toplevel_resize(tl, seat, serial, @intFromEnum(edge)),
+        .button => |b| switch (b) {
+            .close => st.enqueueQuit(),
+            .maximize => if (st.maximized) c.xdg_toplevel_unset_maximized(tl) else c.xdg_toplevel_set_maximized(tl),
+            .minimize => c.xdg_toplevel_set_minimized(tl),
+            .none => {},
+        },
+    }
 }
 
 fn ptrAxis(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, axis: u32, value: c.wl_fixed_t) callconv(.c) void {
     _ = ptr;
     _ = time;
     const st: *State = @ptrCast(@alignCast(data.?));
-    st.scroll_cont.add(wlinput.continuousScroll(axis, value));
+    switch (st.ptr_focus) {
+        .content => st.scroll_cont.add(wlinput.continuousScroll(axis, value)),
+        else => {}, // 装飾上の scroll は無視
+    }
 }
 
 fn ptrAxisDiscrete(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, axis: u32, discrete: i32) callconv(.c) void {
     _ = ptr;
     const st: *State = @ptrCast(@alignCast(data.?));
-    st.scroll_disc.add(wlinput.discreteScroll(axis, discrete));
+    switch (st.ptr_focus) {
+        .content => st.scroll_disc.add(wlinput.discreteScroll(axis, discrete)),
+        else => {},
+    }
 }
 
 fn ptrAxisSource(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, axis_source: u32) callconv(.c) void {
@@ -579,6 +733,15 @@ fn ptrAxisStop(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, axis: u
 fn ptrFrame(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer) callconv(.c) void {
     _ = ptr;
     const st: *State = @ptrCast(@alignCast(data.?));
+    // 装飾上では scroll を蓄積しないので accumulator を捨てて終了（frame ごとの持ち越しを防ぐ）。
+    switch (st.ptr_focus) {
+        .content => {},
+        else => {
+            st.scroll_disc = .{};
+            st.scroll_cont = .{};
+            return;
+        },
+    }
     // discrete(notch) を優先、無ければ continuous を fallback。frame ごとに 1 mouse_scroll。
     const disc = st.scroll_disc.take();
     const cont = st.scroll_cont.take();
@@ -633,6 +796,211 @@ const pointer_listener = std.mem.zeroInit(c.struct_wl_pointer_listener, .{
     .axis_stop = &ptrAxisStop,
     .axis_discrete = &ptrAxisDiscrete,
 });
+
+// ============================================================================
+// CSD（client-side decoration）構築・配置・描画・破棄（TASK-28.5.6 Stage 2b）
+// すべて「イベント時のみ」実行（configure/resize/hover/maximized 変化）。純幾何/描画は csd.zig。
+// ============================================================================
+
+/// xdg_surface.set_window_geometry を発行（xdg_surface がある場合のみ）。
+fn setWindowGeometry(st: *State, r: csd.Rect) void {
+    if (st.xdg_surface) |xs| c.xdg_surface_set_window_geometry(xs, r.x, r.y, r.w, r.h);
+}
+
+/// deco_state に応じて装飾を同期する。csd: subsurface 構築+配置+geometry。それ以外: 既存 CSD を破棄。
+/// 「subsurface 位置/描画更新 → window geometry → 親 surface commit」の順を守る（plan: 位置は親 commit 依存）。
+fn syncDecorations(st: *State) void {
+    if (st.deco_state == .csd) {
+        if (ensureCsdCreated(st)) {
+            layoutCsd(st);
+        } else {
+            // CSD 構築失敗（subcompositor 不在 / proxy 作成失敗 / OOM）→ 装飾なしへフォールバック。
+            // geometry は content のまま（装飾込み geometry を発行して subsurface が欠ける不整合を避ける。codex 指摘 #2）。
+            st.deco_state = .none;
+            const cw: i32 = @intCast(st.width);
+            const ch: i32 = @intCast(st.height);
+            setWindowGeometry(st, csd.windowGeometry(cw, ch, .none, false));
+            if (st.surface) |s| c.wl_surface_commit(s);
+        }
+    } else if (st.csd_built) {
+        // csd→ssd/none 遷移: CSD を破棄し window geometry を content へ戻す。
+        destroyCsd(st);
+        const cw: i32 = @intCast(st.width);
+        const ch: i32 = @intCast(st.height);
+        setWindowGeometry(st, csd.windowGeometry(cw, ch, .none, false));
+        if (st.surface) |s| c.wl_surface_commit(s);
+    }
+    // 純 ssd/none（CSD を作ったことがない）は geometry 既定（surface bounds=content）のまま。
+}
+
+/// CSD の 4 subsurface を（未構築なら）生成する。4 枚すべて作れたら true。subcompositor 不在や
+/// 途中の proxy 作成失敗では部分構築を巻き戻して false を返す（csd_built は true にしない。codex 指摘 #2）。
+fn ensureCsdCreated(st: *State) bool {
+    if (st.csd_built) return true;
+    const subc = st.subcompositor orelse return false;
+    const comp = st.compositor orelse return false;
+    const parent = st.surface orelse return false;
+    var ok = true;
+    for (&st.csd_surfaces) |*cs| {
+        const surf = c.wl_compositor_create_surface(comp) orelse {
+            ok = false;
+            break;
+        };
+        const ss = c.wl_subcompositor_get_subsurface(subc, surf, parent) orelse {
+            c.wl_surface_destroy(surf);
+            ok = false;
+            break;
+        };
+        c.wl_subsurface_set_desync(ss); // 自 buffer 再描画を親 commit に依存させない
+        cs.surface = surf;
+        cs.subsurface = ss;
+    }
+    if (!ok) {
+        destroyCsd(st); // 部分構築分を破棄（csd_built=false のまま。focus/hover も reset）
+        return false;
+    }
+    st.csd_built = true;
+    return true;
+}
+
+/// 現在の content 寸法+maximized で全 subsurface を配置・描画し、window geometry を発行して親を 1 回 commit。
+fn layoutCsd(st: *State) void {
+    const cw: i32 = @intCast(st.width);
+    const ch: i32 = @intCast(st.height);
+    const lay = csd.layout(cw, ch, st.maximized);
+    for (&st.csd_surfaces) |*cs| {
+        const surf = cs.surface orelse continue;
+        const ss = cs.subsurface orelse continue;
+        const r = lay.rectOf(cs.part);
+        c.wl_subsurface_set_position(ss, r.x, r.y); // 親 commit で適用
+        if (r.empty()) {
+            // maximized の枠等: buffer を外して非表示（unmap）。mapped=false にして次回 non-empty で
+            // busy-skip に取りこぼされず確実に再 attach させる（codex 指摘 #1）。
+            c.wl_surface_attach(surf, null, 0, 0);
+            c.wl_surface_commit(surf);
+            cs.mapped = false;
+            continue;
+        }
+        drawCsdPart(st, cs, r.w, r.h, cw);
+    }
+    // window geometry（装飾込み）→ 親 commit（subsurface 位置を確定）。
+    setWindowGeometry(st, csd.windowGeometry(cw, ch, .csd, st.maximized));
+    if (st.surface) |s| c.wl_surface_commit(s);
+}
+
+/// subsurface 1 枚のバッファを (w,h) に確保し csd.draw で描いて attach+commit（desync=即時反映）。
+/// 同サイズで busy 中（compositor が読み取り中）なら再描画を skip する（single buffer。次イベントで追い付く）。
+fn drawCsdPart(st: *State, cs: *CsdSurface, w: i32, h: i32, content_w: i32) void {
+    const surf = cs.surface orelse return;
+    const uw: u32 = @intCast(w);
+    const uh: u32 = @intCast(h);
+    // 「既存 buffer へ再描画してよい」= 同サイズ かつ 現在 mapped（表示中）。未 mapped（hide からの復帰）や
+    // サイズ変更時は新 buffer を確保して確実に再 attach する（codex 指摘 #1: unmap→remap の取りこぼし防止）。
+    const reusable = (cs.buf.buffer != null and cs.buf.bw == uw and cs.buf.bh == uh and cs.mapped);
+    if (reusable) {
+        if (cs.buf.busy) return; // 表示中バッファへの上書きは避け次イベントで追い付く（hover のちらつき許容）
+    } else {
+        if (!allocShmBufferSized(st, &cs.buf, w, h)) return; // 再確保失敗（OOM）→ skip
+    }
+    const hover: csd.Button = if (cs.part == .title) st.hover_button else .none;
+    csd.draw(cs.part, cs.buf.pixels, w, h, content_w, hover);
+    c.wl_surface_attach(surf, cs.buf.buffer, 0, 0);
+    if (st.compositor_version >= 4) {
+        c.wl_surface_damage_buffer(surf, 0, 0, w, h);
+    } else {
+        c.wl_surface_damage(surf, 0, 0, w, h);
+    }
+    c.wl_surface_commit(surf);
+    cs.buf.busy = true;
+    cs.mapped = true;
+}
+
+/// title バーの hover ボタンを更新し、変化時のみ title subsurface を再描画する（pointer motion 毎の
+/// 無条件 redraw はしない。plan）。lx/ly は title-local 座標。
+fn updateHover(st: *State, lx: i32, ly: i32) void {
+    if (!st.csd_built) return;
+    const cw: i32 = @intCast(st.width);
+    const nh = csd.hoverButtonAt(lx, ly, cw);
+    if (nh == st.hover_button) return;
+    st.hover_button = nh;
+    redrawTitle(st);
+}
+
+/// title subsurface だけを現在の hover で再描画する（位置不変=親 commit 不要。desync で即時反映）。
+fn redrawTitle(st: *State) void {
+    if (!st.csd_built) return;
+    const cw: i32 = @intCast(st.width);
+    const ch: i32 = @intCast(st.height);
+    const lay = csd.layout(cw, ch, st.maximized);
+    if (lay.title.empty()) return;
+    drawCsdPart(st, &st.csd_surfaces[0], lay.title.w, lay.title.h, cw); // index 0 = title
+}
+
+/// *ShmBuffer を (w,h) の新 shm buffer へ two-phase 再確保する（新確保成功後に旧を破棄）。
+/// buffer_listener を新 buffer に束ねる（release→busy=false）。失敗時は旧を残さず false。
+fn allocShmBufferSized(st: *State, b: *ShmBuffer, w: i32, h: i32) bool {
+    if (w <= 0 or h <= 0) return false;
+    const dims = computeShmDims(@intCast(w), @intCast(h)) orelse return false;
+    const fd = memfd_create("video-proto-wayland-csd", MFD_CLOEXEC);
+    if (fd < 0) return false;
+    if (ftruncate(fd, @intCast(dims.size)) != 0) {
+        _ = close(fd);
+        return false;
+    }
+    const raw = mmap(null, dims.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) orelse {
+        _ = close(fd);
+        return false;
+    };
+    if (@intFromPtr(raw) == MAP_FAILED_INT) {
+        _ = close(fd);
+        return false;
+    }
+    const pool = c.wl_shm_create_pool(st.shm, fd, dims.size_i32) orelse {
+        _ = munmap(raw, dims.size);
+        _ = close(fd);
+        return false;
+    };
+    const wl_buf = c.wl_shm_pool_create_buffer(pool, 0, dims.w_i32, dims.h_i32, dims.stride_i32, st.shm_format) orelse {
+        c.wl_shm_pool_destroy(pool);
+        _ = munmap(raw, dims.size);
+        _ = close(fd);
+        return false;
+    };
+    c.wl_shm_pool_destroy(pool);
+    // 旧リソース破棄（呼び出しは同サイズ busy でない or サイズ変更時のみ）。
+    if (b.buffer) |old| c.wl_buffer_destroy(old);
+    if (b.map_ptr) |p| _ = munmap(p, b.map_size);
+    if (b.fd >= 0) _ = close(b.fd);
+    const px: [*]u32 = @ptrCast(@alignCast(raw));
+    b.* = .{
+        .fd = fd,
+        .map_ptr = raw,
+        .map_size = dims.size,
+        .buffer = wl_buf,
+        .pixels = px[0..dims.pixel_count],
+        .busy = false,
+        .bw = @intCast(w),
+        .bh = @intCast(h),
+    };
+    _ = c.wl_buffer_add_listener(wl_buf, &buffer_listener, b);
+    return true;
+}
+
+/// CSD subsurface 群を破棄する（子=subsurface を親 surface より先に。plan の破棄順序）。
+fn destroyCsd(st: *State) void {
+    for (&st.csd_surfaces) |*cs| {
+        if (cs.subsurface) |ss| c.wl_subsurface_destroy(ss);
+        if (cs.surface) |s| c.wl_surface_destroy(s);
+        if (cs.buf.buffer) |b| c.wl_buffer_destroy(b);
+        if (cs.buf.map_ptr) |p| _ = munmap(p, cs.buf.map_size);
+        if (cs.buf.fd >= 0) _ = close(cs.buf.fd);
+        cs.* = .{ .part = cs.part };
+    }
+    st.csd_built = false;
+    // focus/hover が破棄済み subsurface を指さないよう content へ戻す（use-after-free 防止）。
+    st.ptr_focus = .content;
+    st.hover_button = .none;
+}
 
 // ============================================================================
 // Window / Framebuffer
@@ -709,6 +1077,11 @@ pub const Window = struct {
         // 確保済みなので消費して破棄する（stale pending が次回 configure で誤適用されるのを防ぐ）。
         // 以後 compositor が別サイズを要求すれば map 後の configure で再適用される。
         st.pending_resize = false;
+
+        // 装飾の初回構築（deco_state は configure 待ちループで確定済み）。csd なら subsurface を建て、
+        // ssd/none は何もしない。buffers 確保後なのでここが唯一の初回ビルド点（configure ハンドラは
+        // buffers 未確保の初回は skip する）。
+        syncDecorations(st);
 
         return .{ .state = st };
     }
@@ -1057,11 +1430,12 @@ fn teardown(st: *State) void {
     st.xkb_keymap = null;
     st.xkb_context = null;
     // 装飾（TASK-28.5.6）: 子オブジェクト優先破棄。decoration object は xdg_toplevel より前に destroy。
-    // （CSD subsurface 群は Stage 2b で surface 破棄の前に挿入する）
     if (st.deco_obj) |d| c.zxdg_toplevel_decoration_v1_destroy(d);
     st.deco_obj = null;
     if (st.toplevel) |t| c.xdg_toplevel_destroy(t);
     if (st.xdg_surface) |x| c.xdg_surface_destroy(x);
+    // CSD subsurface 群は親 content surface の破棄より前に destroy する（plan の破棄順序）。
+    destroyCsd(st);
     if (st.surface) |s| c.wl_surface_destroy(s);
     if (st.deco_manager) |m| c.zxdg_decoration_manager_v1_destroy(m);
     if (st.subcompositor) |sc| c.wl_subcompositor_destroy(sc);
