@@ -12,8 +12,16 @@
 //! x86_64 で必要な `objc_msgSend_stret`/`objc_msgSend_fpret` の分岐は不要なため実装しない）。
 //!
 //! `camera_macos.zig`（camera module）と `audio_macos.zig`（audio module。マイク権限確認）の
-//! 両方から相対 import される。状態を持たない純粋関数群のみで型を跨いだ共有が無いため、
-//! `capture_types.zig` と異なり named module 化は不要（8章の型同一性要求はここには無い）。
+//! 両方から使われる。状態を持たない純粋関数群のみで型を跨いだ共有が無いため、
+//! `capture_types.zig` のような**型同一性**の理由での named module 化は不要（8章参照）だったが、
+//! **同一ファイルが2つの異なる module に属することはできない**という Zig の別の制約により、
+//! 結局 named module 化が必要になった（TASK-49.6: camera モジュールと audio モジュールを
+//! 同一 exe に同時 link する初のケース＝mic+camera 両方を使うデモで
+//! 「file exists in modules 'camera' and 'audio'」build エラーとして発覚。camera_macos.zig/
+//! audio_macos.zig がそれぞれ相対 `@import("objc_runtime.zig")` していたため、両 module が
+//! 同一 exe に link されると同じ物理ファイルが2 module に属する矛盾になっていた）。
+//! `core/build.zig` の `SharedModules` が named module `objc_runtime` として1個だけ作り、
+//! `camera`/`audio` 両方に `link()` する。
 //!
 //! ホットパス宣言: 初期化時のみ（`open()`/`requestPermission()`/`close()` 等イベント時に
 //! 数回呼ばれるのみ。フレーム毎(全画素)/RT(毎サンプル)では一切呼ばれない）。

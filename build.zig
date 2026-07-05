@@ -182,6 +182,24 @@ pub fn build(b: *std.Build) void {
             if (is_default) default_modular = modular_exe;
             if (install_all) b.installArtifact(modular_exe);
             addRunStep(b, b.fmt("run-modular-{s}", .{platform.backendName(be)}), b.fmt("Run modular app ({s})", .{platform.backendName(be)}), modular_exe, b.args);
+
+            // ----- 20_capture_demo (examples/20_capture_demo) — mic 波形/FFT可視化 + camera→canvas デモ
+            // (TASK-49.6)。camera/audio の capture 拡張は audio backend 対応 OS でのみ実用的なため
+            // audio_supported ゲート内に置く（他 example と異なり ExampleNeeds テーブルではなく
+            // 専用 helper で配線: camera/harness/capture_synthetic を直 import するため。examples は
+            // R5=kit-only 対象外。build.zig 冒頭コメント参照）。
+            const capture_demo_exe = addCaptureDemoExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "example_20", be, default_be), &shared_modules, &pm);
+            // examples は install-all とは独立に常に全 backend を install（既存 example と同じ方針）。
+            b.installArtifact(capture_demo_exe);
+            if (is_default) {
+                addRunStep(
+                    b,
+                    "run-example_20",
+                    "Run 20_capture_demo example (uses -Dplatform option; set VP_HARNESS_CAPTURE_SYNTHETIC=1 + VP_HARNESS_HEADLESS=1 for headless synthetic mic/camera verification)",
+                    capture_demo_exe,
+                    b.args,
+                );
+            }
         }
 
         // ----- サンプルプログラム -----
@@ -400,6 +418,7 @@ pub fn build(b: *std.Build) void {
     });
     camera_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     camera_test_mod.addImport("harness", shared_modules.harness.mod);
+    camera_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: camera_macos.zig が named import で参照（TASK-49.6）
     const camera_test = b.addTest(.{ .root_module = camera_test_mod });
     // TASK-49.2: macOS は camera_macos.zig が AVFoundation(ObjC専用API)を objc_runtime 経由で
     // 叩くため、テスト実行はしない（設定検証のみ自動）が compile+link には必要な framework 一式を
@@ -420,6 +439,7 @@ pub fn build(b: *std.Build) void {
     });
     audio_capture_test_mod.addImport("harness", shared_modules.harness.mod);
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    audio_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: audio_macos.zig が named import で参照（TASK-49.6）
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
     // TASK-49.2: macOS の mic capture（AUHAL input）は AudioToolbox/CoreAudio + 権限確認の
     // AVFoundation(ObjC)を使うため framework を明示リンクする（他OS は audio_capture_stub.zig の
@@ -457,6 +477,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true, // objc_runtime 経由の std.c.nanosleep/getenv 用
         });
         camera_macos_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        camera_macos_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // TASK-49.6: 相対→named import 化
         linkCaptureMacFrameworks(b, camera_macos_test_mod, sdk_paths.?);
         const camera_macos_test = b.addTest(.{ .root_module = camera_macos_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(camera_macos_test).step);
@@ -468,6 +489,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         audio_macos_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        audio_macos_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // TASK-49.6: 相対→named import 化
         linkCaptureMacFrameworks(b, audio_macos_capture_test_mod, sdk_paths.?);
         const audio_macos_capture_test = b.addTest(.{ .root_module = audio_macos_capture_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_macos_capture_test).step);
@@ -1337,6 +1359,7 @@ const SharedModules = struct {
     capture_types: TaggedModule, // capture 入力基盤の共有型（TASK-49.1。platform_types と同じ type-only）
     camera: TaggedModule, // カメラ L1 facade（TASK-49.1。audio と同格の core layer primitive）
     capture_synthetic: TaggedModule, // harness 内蔵 synthetic capture source（TASK-49.5。facade 配線は無い）
+    objc_runtime: TaggedModule, // Objective-C ランタイム FFI（TASK-49.2。camera/audio 両方が link する共有 module。TASK-49.6 で named module 化）
 
     fn init(b: *std.Build) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
@@ -1409,6 +1432,19 @@ const SharedModules = struct {
         link(gui, font);
         link(gui, pixelops); // render.zig の drawImage SIMD（TASK-58）
 
+        // objc_runtime (L1): Objective-C ランタイム最小 FFI ヘルパー（TASK-49.2）。camera_macos.zig
+        // （camera module）と audio_macos.zig（audio module。マイク権限確認）の両方が使うため、
+        // named module として1個だけ作り両方に link する。`capture_types` と異なり型同一性が
+        // 理由ではなく、「同一ファイルは2つの異なる module に属せない」という Zig の制約が本質
+        // （camera/audio 双方が相対 `@import("objc_runtime.zig")` していたため、両 module を同一
+        // exe に同時 link すると衝突していた。TASK-49.6: mic+camera を同時に使う初のデモで発覚。
+        // 詳細は core/objc_runtime.zig の doc comment 参照）。std.c.nanosleep（権限確認の
+        // ブロッキング待機）を使うため link_libc=true。
+        const objc_runtime: TaggedModule = .{ .layer = .core, .name = "objc_runtime", .mod = b.createModule(.{
+            .root_source_file = b.path("core/objc_runtime.zig"),
+            .link_libc = true,
+        }) };
+
         // audio (L1 オーディオ出力): platform バックエンド非依存。@cImport しないので
         // 通常の createModule でよい（audio system lib は exe 側で OS 別にリンク:
         // macOS=AudioToolbox / Linux=asound / Windows=ole32(WASAPI)。linkAudioBackend 参照）。
@@ -1431,6 +1467,8 @@ const SharedModules = struct {
         link(platform_mod, harness);
         // audio facade（core/audio.zig）が `@import("harness")` で onAudioSamples を呼ぶ。
         link(audio, harness);
+        // macOS: audio_macos.zig の capture(マイク) 拡張が objc_runtime 経由で権限確認を叩く。
+        link(audio, objc_runtime);
 
         // capture 入力基盤の共有型（TASK-49.1）: control plane 共通型 + data plane 型
         // （DeviceInfo/PermissionState/CaptureError/AudioInFrame/PixelFormat/VideoFrame/TripleBuffer）。
@@ -1451,6 +1489,7 @@ const SharedModules = struct {
         }) };
         link(camera, capture_types);
         link(camera, harness); // isCaptureSyntheticActive() 継ぎ目
+        link(camera, objc_runtime); // macOS: camera_macos.zig が objc_runtime 経由で AVFoundation を叩く
 
         // capture_synthetic (L1): harness 内蔵の synthetic capture source（偽 mic/camera。
         // TASK-49.5）。camera/audio facade への配線は無く、harness の組み込み `capture`
@@ -1532,6 +1571,7 @@ const SharedModules = struct {
             .capture_types = capture_types,
             .camera = camera,
             .capture_synthetic = capture_synthetic,
+            .objc_runtime = objc_runtime,
         };
     }
 };
@@ -1743,6 +1783,49 @@ fn addModularExe(
     linkAppException(root, common.synth, "apps/modular/patch.zig が test root を兼ねる（SampleTap / AtomicF32）");
     linkAppException(root, common.dsp, "apps/modular/patch.zig が test root を兼ねる（FFT band energy 検証）");
     linkAudioBackend(exe, target.result.os.tag);
+
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
+    return exe;
+}
+
+// ============================================================================
+// ヘルパー: 20_capture_demo exe を 1 backend 分セットアップ（examples/20_capture_demo。TASK-49.6）。
+//
+// R5(kit-only) は apps/ のみが対象で examples は対象外（build.zig 冒頭コメント）なので、他 example
+// と同じ「直 addImport」配線を使う（appRoot/link() は使わない）。camera/audio/capture_synthetic
+// （いずれも core layer）を直接消費するのは、headless 検証に harness 内蔵の synthetic capture
+// source（core/capture_synthetic.zig。TASK-49.5。camera.zig/audio.zig facade へは配線されていない
+// 独立モジュール）への直 import が必須なため（apps 層からは R5 で到達できない）。
+// camera.zig/audio.zig の facade API 自体は本タスクで変更しない（consume に徹する）。
+// ============================================================================
+fn addCaptureDemoExe(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+    sdk_paths: ?macos.MacOSSDKPaths,
+    platform_type: platform.PlatformType,
+    name: []const u8,
+    common: *const SharedModules,
+    pm: *const PlatformModules,
+) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/20_capture_demo/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("platform", pm.platform.mod);
+    exe.root_module.addImport("harness", common.harness.mod); // isCaptureSyntheticActive() 判定用
+    exe.root_module.addImport("camera", common.camera.mod); // カメラ実 capture（macOS 実装 / 他OS stub。TASK-49.2）
+    exe.root_module.addImport("audio", common.audio.mod); // マイク実 capture 拡張（audio.zig 経由。TASK-49.2）
+    exe.root_module.addImport("capture_synthetic", common.capture_synthetic.mod); // harness 内蔵 synthetic source（TASK-49.5。VP_HARNESS_CAPTURE_SYNTHETIC=1 時のみ使用）
+    exe.root_module.addImport("spectrogram", common.spectrogram.mod);
+    exe.root_module.addImport("scope", common.scope.mod);
+    exe.root_module.addImport("synth", common.synth.mod); // SampleTap（mic capture callback → メインスレッド可視化のロックフリー受け渡し）
+    linkAudioBackend(exe, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture 用 AVFoundation/CoreMedia/CoreVideo/Foundation/objc も含む
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
     return exe;

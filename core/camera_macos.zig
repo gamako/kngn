@@ -35,7 +35,7 @@
 
 const std = @import("std");
 const types = @import("capture_types");
-const objc = @import("objc_runtime.zig");
+const objc = @import("objc_runtime");
 
 // ============================================================================
 // AVFoundation / CoreMedia / CoreVideo C ABI（最小サブセット）
