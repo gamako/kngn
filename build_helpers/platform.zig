@@ -421,6 +421,13 @@ pub fn buildStandalone(
     });
     harness_mod.addImport("png", png_mod);
     harness_mod.addImport("platform_types", types_mod);
+    // harness は synthetic capture source（TASK-49.5）を `@import("capture_synthetic")` する。
+    // capture_synthetic は capture_types にのみ依存（camera/audio facade へは配線しない）。
+    // これを wire しないと harness を使う全 example の standalone build が壊れる（TASK-22.1 で判明）。
+    const capture_types_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/capture_types.zig", .{core_dir}) } });
+    const capture_synthetic_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/capture_synthetic.zig", .{core_dir}) } });
+    capture_synthetic_mod.addImport("capture_types", capture_types_mod);
+    harness_mod.addImport("capture_synthetic", capture_synthetic_mod);
 
     // link_audio のとき audio facade module を **buildStandalone が生成**し、harness を配線する（TASK-32.2）。
     // audio.zig は `@import("harness")` するので、platform module と **同一の harness_mod** を共有しないと
