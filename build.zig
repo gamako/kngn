@@ -813,6 +813,20 @@ pub fn build(b: *std.Build) void {
     test_platform_wayland_input_step.dependOn(&run_platform_wayland_input_test.step);
 
     // ========================================
+    // platform_wayland_csd.zig テスト（Wayland CSD 装飾の純ロジック: レイアウト/ヒットテスト/
+    // window geometry ⇄ content サイズ変換/装飾描画）。純 Zig（@cImport なし）なので host でも回る（TASK-28.5.6）
+    // ========================================
+    const platform_wayland_csd_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/platform_wayland_csd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const platform_wayland_csd_test = b.addTest(.{ .root_module = platform_wayland_csd_test_mod });
+    const run_platform_wayland_csd_test = b.addRunArtifact(platform_wayland_csd_test);
+    const test_platform_wayland_csd_step = b.step("test-platform-wayland-csd", "Run Wayland CSD decoration layout/hit-test/geometry/draw unit tests");
+    test_platform_wayland_csd_step.dependOn(&run_platform_wayland_csd_test.step);
+
+    // ========================================
     // platform_windows_input.zig テスト（Windows 入力の純粋変換: VK→KeyCode/modifier(post-state)/wheel 符号）
     // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-31 / AC#3）
     // ========================================
@@ -1082,6 +1096,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_input_step);
     test_step.dependOn(test_platform_convert_step);
     test_step.dependOn(test_platform_wayland_input_step);
+    test_step.dependOn(test_platform_wayland_csd_step);
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_audio_null_step);
