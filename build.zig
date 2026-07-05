@@ -518,6 +518,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     canvas_test_mod.addImport("pixelops", shared_modules.pixelops.mod); // blend.zig facade 経由（TASK-51）
+    canvas_test_mod.addImport("font", shared_modules.font.mod); // text_render.zig 経由（TASK-79.5）
     const canvas_test = b.addTest(.{ .root_module = canvas_test_mod });
     const run_canvas_test = b.addRunArtifact(canvas_test);
     test_png_roundtrip_step.dependOn(&run_canvas_test.step);
@@ -566,6 +567,7 @@ pub fn build(b: *std.Build) void {
     });
     core_undo_mod.addImport("png", shared_modules.png.mod);
     core_undo_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_undo_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_undo_test = b.addTest(.{ .root_module = core_undo_mod });
     const run_core_undo_test = b.addRunArtifact(core_undo_test);
 
@@ -576,6 +578,7 @@ pub fn build(b: *std.Build) void {
     });
     core_tool_mod.addImport("png", shared_modules.png.mod);
     core_tool_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_tool_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
     const run_core_tool_test = b.addRunArtifact(core_tool_test);
 
@@ -588,6 +591,7 @@ pub fn build(b: *std.Build) void {
     });
     core_fill_mod.addImport("png", shared_modules.png.mod);
     core_fill_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_fill_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_fill_test = b.addTest(.{ .root_module = core_fill_mod });
     const run_core_fill_test = b.addRunArtifact(core_fill_test);
 
@@ -608,6 +612,7 @@ pub fn build(b: *std.Build) void {
     });
     core_path_mod.addImport("png", shared_modules.png.mod);
     core_path_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_path_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_path_test = b.addTest(.{ .root_module = core_path_mod });
     const run_core_path_test = b.addRunArtifact(core_path_test);
 
@@ -618,6 +623,7 @@ pub fn build(b: *std.Build) void {
     });
     core_path_editor_mod.addImport("png", shared_modules.png.mod);
     core_path_editor_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_path_editor_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_path_editor_test = b.addTest(.{ .root_module = core_path_editor_mod });
     const run_core_path_editor_test = b.addRunArtifact(core_path_editor_test);
 
@@ -631,6 +637,7 @@ pub fn build(b: *std.Build) void {
     core_document_mod.addImport("serde", shared_modules.serde.mod);
     core_document_mod.addImport("png", shared_modules.png.mod);
     core_document_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_document_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_document_test = b.addTest(.{ .root_module = core_document_mod });
     const run_core_document_test = b.addRunArtifact(core_document_test);
 
@@ -645,6 +652,7 @@ pub fn build(b: *std.Build) void {
     canvas_input_core.addImport("pixelops", shared_modules.pixelops.mod);
     canvas_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
     canvas_input_core.addImport("serde", shared_modules.serde.mod);
+    canvas_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     canvas_input_mod.addImport("paint", canvas_input_core);
     const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
     const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
@@ -657,6 +665,7 @@ pub fn build(b: *std.Build) void {
     });
     core_selection_mod.addImport("png", shared_modules.png.mod);
     core_selection_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    core_selection_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
     const core_selection_test = b.addTest(.{ .root_module = core_selection_mod });
     const run_core_selection_test = b.addRunArtifact(core_selection_test);
 
@@ -672,6 +681,7 @@ pub fn build(b: *std.Build) void {
     selection_input_core.addImport("pixelops", shared_modules.pixelops.mod);
     selection_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
     selection_input_core.addImport("serde", shared_modules.serde.mod);
+    selection_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     selection_input_mod.addImport("paint", selection_input_core);
     const selection_input_test = b.addTest(.{ .root_module = selection_input_mod });
     const run_selection_input_test = b.addRunArtifact(selection_input_test);
@@ -688,6 +698,7 @@ pub fn build(b: *std.Build) void {
     bezier_input_core.addImport("pixelops", shared_modules.pixelops.mod);
     bezier_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
     bezier_input_core.addImport("serde", shared_modules.serde.mod);
+    bezier_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     bezier_input_mod.addImport("paint", bezier_input_core);
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
@@ -704,6 +715,7 @@ pub fn build(b: *std.Build) void {
     eyedropper_input_core.addImport("pixelops", shared_modules.pixelops.mod);
     eyedropper_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
     eyedropper_input_core.addImport("serde", shared_modules.serde.mod);
+    eyedropper_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     eyedropper_input_mod.addImport("paint", eyedropper_input_core);
     const eyedropper_input_test = b.addTest(.{ .root_module = eyedropper_input_mod });
     const run_eyedropper_input_test = b.addRunArtifact(eyedropper_input_test);
@@ -720,6 +732,7 @@ pub fn build(b: *std.Build) void {
     brush_edge_cache_core.addImport("pixelops", shared_modules.pixelops.mod);
     brush_edge_cache_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
     brush_edge_cache_core.addImport("serde", shared_modules.serde.mod);
+    brush_edge_cache_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     brush_edge_cache_mod.addImport("paint", brush_edge_cache_core);
     const brush_edge_cache_test = b.addTest(.{ .root_module = brush_edge_cache_mod });
     const run_brush_edge_cache_test = b.addRunArtifact(brush_edge_cache_test);
@@ -731,6 +744,7 @@ pub fn build(b: *std.Build) void {
     blit_core.addImport("png", shared_modules.png.mod);
     blit_core.addImport("pixelops", shared_modules.pixelops.mod);
     blit_core.addImport("serde", shared_modules.serde.mod); // paint.zig → document_io（TASK-63）
+    blit_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     const blit_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
         .target = target,
@@ -770,6 +784,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_layer_rename_input_test = b.addRunArtifact(layer_rename_input_test);
 
+    // テキストレイヤー内容編集の入力状態機械（TASK-79.5）。layer_rename_input.zig と同じ設計
+    // パターンの独立実装。std のみ・paint/App/kit 非依存で import 不要。
+    const text_content_input_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/apps/pixie/text_content_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_text_content_input_test = b.addRunArtifact(text_content_input_test);
+
     const test_core_step = b.step("test-core", "Run editor/core (undo + tool) and pixie input tests");
     test_core_step.dependOn(&run_core_undo_test.step);
     test_core_step.dependOn(&run_core_tool_test.step);
@@ -788,6 +813,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
     test_core_step.dependOn(&run_actions_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);
+    test_core_step.dependOn(&run_text_content_input_test.step);
 
     // ========================================
     // PNG デコーダー format.zig テスト
@@ -1171,12 +1197,27 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    // bench 用 png/font も ReleaseFast 固定で独立生成（bench_canvas_core が canvas.zig →
+    // text_render.zig 経由で font を要するため、bench_gui 用の定義より前に前詰めする。TASK-79.5）。
+    const bench_png_mod = b.createModule(.{
+        .root_source_file = b.path("libs/png/src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_font_mod = b.createModule(.{
+        .root_source_file = b.path("libs/font/src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_font_mod.addImport("png", bench_png_mod);
+    bench_font_mod.addImport("pixelops", bench_pixelops_mod);
     const bench_canvas_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/canvas.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
     bench_canvas_core.addImport("pixelops", bench_pixelops_mod);
+    bench_canvas_core.addImport("font", bench_font_mod); // text_render.zig 経由（TASK-79.5）
     bench_canvas_root.addImport("editor_canvas", bench_canvas_core);
     const bench_canvas_exe = b.addExecutable(.{ .name = "bench_canvas", .root_module = bench_canvas_root });
     const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
@@ -1206,18 +1247,7 @@ pub fn build(b: *std.Build) void {
     bench_synth_step.dependOn(&b.addRunArtifact(bench_synth_exe).step);
 
     // bench-gui（TASK-58）: rect_filled / image / text の描画を public API 経由で計測
-    const bench_png_mod = b.createModule(.{
-        .root_source_file = b.path("libs/png/src/lib.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const bench_font_mod = b.createModule(.{
-        .root_source_file = b.path("libs/font/src/lib.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_font_mod.addImport("png", bench_png_mod);
-    bench_font_mod.addImport("pixelops", bench_pixelops_mod);
+    // （bench_png_mod/bench_font_mod は上の bench_canvas_core 用に前詰め済み。TASK-79.5）
     const bench_gui_mod = b.createModule(.{
         .root_source_file = b.path("libs/gui/src/gui.zig"),
         .target = target,
@@ -1243,6 +1273,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_blit_core.addImport("png", bench_png_mod);
     bench_blit_core.addImport("pixelops", bench_pixelops_mod);
+    bench_blit_core.addImport("font", bench_font_mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
     const bench_blit_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
         .target = target,
@@ -1571,6 +1602,7 @@ const SharedModules = struct {
         link(paint, png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
         link(paint, pixelops); // blend.zig が委譲 (TASK-51)
         link(paint, serde); // document_io.zig が versioned container(libs/serde) に委譲 (TASK-63)
+        link(paint, font); // canvas.zig → text_render.zig がテキストラスタライズに委譲 (TASK-79.5)
 
         // libs/viz（旧 apps/synth の可視化。synth/modular/patch の 3 app が共有するため
         // R6 の「再利用 vs 終端」で libs へ。流動中のため kit 非収録）。

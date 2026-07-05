@@ -95,6 +95,12 @@ pub fn parseIdxU8(args: []const u8) ParseError!IdxU8 {
     return .{ .idx = idx, .value = value };
 }
 
+// TASK-79.5（テキストレイヤー）向けの action パーサは追加していない。harness の action
+// registry は `MAX_ACTIONS=16`（core/control/harness.zig）固定で pixie は既に使い切っており
+// （main.zig の `registerActions` doc comment 参照）、harness.zig 改変はスコープ外のため
+// 空き slot が無い。テキストレイヤーの harness 検証は UI 操作（右クリックメニュー +
+// `inject char`）で行う。
+
 /// "#RRGGBB" または "RRGGBB"（大小無視）の1トークン → canonical 0xFFRRGGBB（straight・alpha=255固定）。
 pub fn parseHexColor(args: []const u8) ParseError!u32 {
     var it = tokenize(args);
@@ -229,3 +235,4 @@ test "parseNoArgs: 空は許容 / 余剰トークンは拒否" {
     try parseNoArgs("   ");
     try testing.expectError(error.TooManyTokens, parseNoArgs("typo"));
 }
+

@@ -29,12 +29,19 @@ const eyedropper_input = @import("eyedropper_input.zig");
 const brush_edge_cache = @import("brush_edge_cache.zig");
 const cursor_overlay = @import("cursor_overlay.zig");
 const layer_rename_input = @import("layer_rename_input.zig");
+const text_content_input = @import("text_content_input.zig");
 
 // レイヤー名の最大長は libs/paint（保存側）と pixie（編集バッファ側）で独立定義しているため
 // （循環 import 回避。詳細は layer_rename_input.zig 冒頭）、乖離しないことを comptime で保証する。
 comptime {
     if (core.layer_name_max != layer_rename_input.max_len) {
         @compileError("layer_name_max mismatch between paint.Canvas and layer_rename_input");
+    }
+}
+// テキストレイヤー内容の最大長も同様に独立定義しているため乖離しないことを保証する（TASK-79.5）。
+comptime {
+    if (core.text_content_max != text_content_input.max_len) {
+        @compileError("text_content_max mismatch between paint.Canvas and text_content_input");
     }
 }
 
@@ -79,6 +86,8 @@ const LAYER_ROW_ID_BASE: gui.Id = 0xA430_1000;
 const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
 /// レイヤー行の右クリックコンテキストメニュー（TASK-79.2）。popup primitive（TASK-79.1）の id。
 const LAYER_CTX_MENU_ID: gui.Id = 0xA430_2000;
+/// テキストレイヤー編集パネル（TASK-79.5）の明示 ID 群。
+const TEXT_PANEL_ID_BASE: gui.Id = 0xA430_3000;
 /// レイヤー行 box 自身の明示 ID に使う `layerWidgetId` part（0..3 は既存: 0=選択ボタン/1=可視
 /// トグル/2=opacity slider/3=サムネ）。右クリックのヒットテストは行全体の矩形を使う。
 const LAYER_ROW_PART_ROW: gui.Id = 4;
@@ -263,6 +272,19 @@ const App = struct {
     /// メインループのイベントポンプは char_input/ENTER/ESCAPE/BACKSPACE のみをここへ回し、
     /// 他のキー・gui への pushEvent は止める（タイプ中に B/E 等のツール切替が誤発火しないため）。
     rename_in: layer_rename_input.LayerRenameInput = .{},
+    /// テキストレイヤー内容インライン編集の状態機械（TASK-79.5）。`rename_in` と対称
+    /// （どちらか一方のみ active。`beginTextEdit`/`beginRenameLayer` が互いを明示的に cancel する）。
+    text_in: text_content_input.TextContentInput = .{},
+
+    /// 選択中レイヤーが text kind か（テキストレイヤーへの直接 raster 編集を防ぐガード。
+    /// TASK-79.5）。text layer の pixels は「TextParams からの再ラスタライズ結果」という
+    /// 不変条件（libs/paint/src/canvas.zig の `TextParams` doc comment 参照）を守るため、
+    /// Pen/Eraser/Brush/Fill/Bezier/選択操作（cut/paste/move）の書き込み経路はこれで弾く
+    /// （Rasterize 確定後=kind が raster 化した後は通常どおり描画できる）。
+    fn selectedLayerIsText(self: *const App) bool {
+        return self.canvas.selected_layer < self.canvas.layers.items.len and
+            self.canvas.layers.items[self.canvas.selected_layer].kind == .text;
+    }
 
     /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
     fn activeTool(self: *App) core.Tool {
@@ -619,10 +641,12 @@ const App = struct {
 
     fn doClear(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
+        if (self.selectedLayerIsText()) return error.EditingBlocked; // TASK-79.5: text layer 直接編集禁止
         self.undo.pushClear(self.gpa, self.canvas, self.doc.selected_frame, self.canvas.selected_layer);
     }
 
     /// 選択範囲を clipboard へコピー（読み取りのみ・undo 不要）。selection 無しは no-op。
+    /// 読み取りのみ（pixels を変更しない）なので text layer 選択中でも許可する（TASK-79.5）。
     fn doCopy(self: *App) void {
         if (self.editingBlocked()) return;
         const sel = self.canvas.selection orelse return;
@@ -634,6 +658,7 @@ const App = struct {
     /// 選択範囲を clipboard へコピーし、選択内を透明化する（undo 可）。selection 無しは no-op。
     fn doCut(self: *App) void {
         if (self.editingBlocked()) return;
+        if (self.selectedLayerIsText()) return; // TASK-79.5: text layer 直接編集禁止
         const sel = self.canvas.selection orelse return;
         const block = core.selection.extract(self.gpa, self.canvas, self.canvas.selected_layer, sel);
         if (self.clipboard) |*old| old.deinit(self.gpa);
@@ -647,6 +672,7 @@ const App = struct {
     /// selection を貼付矩形（canvas 内 clip）へ更新する。clipboard 無しは no-op。
     fn doPaste(self: *App) void {
         if (self.editingBlocked()) return;
+        if (self.selectedLayerIsText()) return; // TASK-79.5: text layer 直接編集禁止
         const block = self.clipboard orelse return;
         const dx: i32 = if (self.canvas.selection) |s| s.x else 0;
         const dy: i32 = if (self.canvas.selection) |s| s.y else 0;
@@ -751,6 +777,7 @@ const App = struct {
     /// インライン編集を開始する（確定は `commitRenameLayer`、取消は `cancelRenameLayer`）。
     fn beginRenameLayer(self: *App, idx: usize) void {
         if (idx >= self.canvas.layers.items.len) return;
+        self.text_in.cancel(); // rename/text 編集は同時に active にしない（TASK-79.5）
         self.rename_in.begin(idx, self.canvas.layers.items[idx].name());
         // rename 開始時点で Space パン modifier が張り付いていると、rename 中は key_up を
         // 素通りさせない設計（下記イベントポンプ参照）のため解除しておく（codex レビュー指摘
@@ -787,6 +814,89 @@ const App = struct {
         // その他のキーは無視（ツール切替ショートカット等を遮断）
     }
 
+    // ── テキストレイヤー（TASK-79.5）─────────────────────────────
+
+    /// テキストレイヤーを新規追加する（右クリックメニュー「Add Text Layer」）。既定
+    /// テキスト "Text" / font_px=16 / 現在のパレット色 / 位置(8,8) で作成し選択する。
+    /// Undo は既存 `.layer_add`（Layer 値コピーに kind/text_params が自動的に乗るため
+    /// Op 変更は不要。`doAddLayer` と同じ仕組み）。
+    fn doAddTextLayer(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        const selected_before = self.canvas.selected_layer;
+        var params: core.TextParams = .{ .x = 8, .y = 8, .color = self.palette.current() };
+        params.setText("Text");
+        const idx = self.canvas.addTextLayer(self.gpa, params) catch |err| {
+            self.setSaveMsg("Text layer add failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
+            .index = idx,
+            .selected_before = selected_before,
+            .selected_after = self.canvas.selected_layer,
+        } } });
+    }
+
+    /// テキストレイヤーの text_params を更新し再ラスタライズする（内容確定・サイズ/位置
+    /// スライダー・色ボタンの共通適用口。TASK-79.5）。値が変わらない冪等呼び出しは
+    /// `TextParams.eql` で弾き Undo を汚さない（他の layer_* setter と同じ流儀）。
+    fn doSetTextParams(self: *App, idx: usize, params: core.TextParams) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
+        const before = self.canvas.layers.items[idx].text_params;
+        if (before.eql(params)) return;
+        try self.canvas.setLayerTextParams(idx, params);
+        const after = self.canvas.layers.items[idx].text_params;
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_text_params = .{ .index = idx, .before = before, .after = after } } });
+    }
+
+    /// テキストレイヤーを通常 raster レイヤーへ確定する（Rasterize。右クリックメニュー。
+    /// TASK-79.5）。pixels 不変・kind/text_params のみ変化。Undo 1 回で戻せる。
+    fn doRasterizeLayer(self: *App, idx: usize) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        const before = try self.canvas.rasterizeLayer(idx);
+        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_rasterize = .{ .index = idx, .before = before } } });
+    }
+
+    /// レイヤー右クリックメニュー「Edit Text...」（kind==text の時のみ有効）から呼ぶ。
+    /// 現在テキストを編集バッファへコピーしてインライン編集を開始する（確定は
+    /// `commitTextEdit`、取消は `cancelTextEdit`）。`rename_in`/`text_in` は対称実装。
+    fn beginTextEdit(self: *App, idx: usize) void {
+        if (idx >= self.canvas.layers.items.len) return;
+        if (self.canvas.layers.items[idx].kind != .text) return;
+        self.rename_in.cancel(); // rename/text 編集は同時に active にしない（beginRenameLayer と対称）
+        self.text_in.begin(idx, self.canvas.layers.items[idx].text_params.text());
+        self.space_down = false; // beginRenameLayer と同じ理由（Space 残留防止）
+    }
+
+    /// 編集を確定する（ENTER）。`doSetTextParams` へ委譲する（色/サイズ/位置は現状値を維持し
+    /// 文字列だけ更新）。失敗（境界外等）は無視（他の pending file op 等と同型）。
+    fn commitTextEdit(self: *App) void {
+        if (!self.text_in.active) return;
+        const idx = self.text_in.layer_idx;
+        const committed = self.text_in.commit();
+        if (idx >= self.canvas.layers.items.len) return;
+        var params = self.canvas.layers.items[idx].text_params;
+        params.setText(committed);
+        self.doSetTextParams(idx, params) catch {};
+    }
+
+    /// 編集を取り消す（ESCAPE）。バッファは破棄するだけで Undo には積まない。
+    fn cancelTextEdit(self: *App) void {
+        self.text_in.cancel();
+    }
+
+    /// テキスト編集中の key_down を処理する（`handleRenameKey` と対称）。
+    fn handleTextEditKey(self: *App, k: platform.KeyEvent) void {
+        if (k.key == .ENTER or k.key == .KP_ENTER) {
+            self.commitTextEdit();
+        } else if (k.key == .ESCAPE) {
+            self.cancelTextEdit();
+        } else if (k.key == .BACKSPACE or k.key == .DELETE) {
+            self.text_in.backspace();
+        }
+        // その他のキーは無視（ツール切替ショートカット等を遮断）
+    }
+
     fn doSelectLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (!self.canvas.selectLayer(idx)) return error.OutOfRange;
@@ -812,6 +922,8 @@ const App = struct {
         new_layer.visible = src.visible;
         new_layer.opacity = src.opacity;
         new_layer.setName(src.name()); // 複製元の名前を継承（TASK-79.3。allocBlankLayer の既定名を上書き）
+        new_layer.kind = src.kind; // kind/text_params も継承（TASK-79.5。POD なので値コピーで足りる）
+        new_layer.text_params = src.text_params;
         const new_idx = src_idx + 1;
         try self.canvas.insertLayer(self.gpa, new_idx, new_layer);
         self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
@@ -834,11 +946,19 @@ const App = struct {
     /// 全画素(256x256)を走るが event-time の1回ループであり、フレーム毎ではない
     /// （`Canvas.composite`/`UndoStack.pushClear` と同じ既存前例に倣うスカラーループで足りる。
     /// 性能規約の SIMD 3点セット等は対象外）。
+    ///
+    /// **TASK-79.5**: top・bottom いずれかが `kind==.text` なら `error.TextLayerSelected` で
+    /// 拒否する（「選択中レイヤーが text か」だけでは top=raster(選択中)・bottom=text の組を
+    /// 見逃す＝bottom の pixels が直接書き換えられ「text layer の pixels は text_params からの
+    /// 再ラスタライズ結果」という不変条件を破る。codex レビュー指摘 2026-07-05）。
     fn doMergeDown(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const top_idx = self.canvas.selected_layer;
         if (top_idx == 0) return error.OutOfRange;
         const bottom_idx = top_idx - 1;
+        if (self.canvas.layers.items[top_idx].kind == .text or self.canvas.layers.items[bottom_idx].kind == .text) {
+            return error.TextLayerSelected;
+        }
         const selected_before = self.canvas.selected_layer;
 
         const below_before = self.gpa.dupe(u32, self.canvas.layerPixels(bottom_idx)) catch @panic("doMergeDown: OOM");
@@ -875,6 +995,8 @@ const App = struct {
         self.canvas.layers.items[0].visible = true;
         self.canvas.layers.items[0].opacity = 255;
         self.canvas.layers.items[0].setName("Layer 1"); // Canvas.init と同じ既定名に戻す（TASK-79.3）
+        self.canvas.layers.items[0].kind = .raster; // TASK-79.5: layer0 が text だった場合の取り残し防止
+        self.canvas.layers.items[0].text_params = .{};
         self.canvas.next_layer_num = 2; // 既存 layer0 を再利用するため counter も明示的にリセット
         @memset(self.canvas.layerPixels(0), 0);
         self.canvas.clearSelection(); // ドキュメント差し替えで選択は解除（TASK-44）
@@ -1024,14 +1146,18 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         for (layer.pixels) |p| {
             if (p != 0) nonzero += 1;
         }
-        const part = std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d},name={s}}}", .{
-            idx,
-            layer.visible,
-            layer.opacity,
-            png.crc32(std.mem.sliceAsBytes(layer.pixels)),
-            nonzero,
-            layer.name(),
-        }) catch break;
+        const crc = png.crc32(std.mem.sliceAsBytes(layer.pixels));
+        // kind=text の時だけ text= を nested 内へ追加する（TASK-79.5。既存 name= と同じ
+        // 「nested は contains で見る」規約。text_content_input が ASCII 制御文字を弾くため
+        // 改行等の混入は無い＝1行契約は保たれる）。
+        const part = if (layer.kind == .text)
+            std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d},name={s},kind=text,text={s}}}", .{
+                idx, layer.visible, layer.opacity, crc, nonzero, layer.name(), layer.text_params.text(),
+            }) catch break
+        else
+            std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d},name={s},kind=raster}}", .{
+                idx, layer.visible, layer.opacity, crc, nonzero, layer.name(),
+            }) catch break;
         len += part.len;
     }
     return buf[0..len];
@@ -1127,6 +1253,12 @@ fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 //   open                doOpenPath              no    EditingBlocked / decode 系
 //
 //   * before==after の冪等呼び出しは push 無し（既存 UI のスライダー/チェックボックス挙動と同じ）。
+//
+//   TASK-79.5（テキストレイヤー: doAddTextLayer/doSetTextParams/doRasterizeLayer）には action を
+//   追加していない。harness の action registry は `MAX_ACTIONS=16`（core/control/harness.zig）
+//   固定で pixie は既に 16 件を使い切っており、harness.zig 改変はスコープ外（AGENT.md 上位
+//   ルール）のため空き slot が無い。これらは UI 操作（右クリックメニュー + `inject char`
+//   による文字入力）で harness 検証する。
 //
 // 非 push action（select_layer/set_color/set_tool/save/open/undo/redo 自体）が undo 対象外なのは
 // 新たな非一貫ではない: 既存 UI でも同じ操作（ツール切替キー・HSV スライダー・ファイル I/O）は
@@ -1244,6 +1376,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     const app = actionApp(ctx);
     if (app.active_kind == .bezier or app.active_kind == .select or app.active_kind == .eyedropper) return error.UnsupportedTool;
     if (app.editingBlocked()) return error.EditingBlocked;
+    if (app.selectedLayerIsText()) return error.TextLayerSelected; // TASK-79.5: text layer 直接編集禁止
     var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
     const pts = try actions.parseStrokePoints(args, &pts_buf);
 
@@ -1278,6 +1411,13 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     try actionApp(ctx).doOpenPath(path);
     return "ok";
 }
+
+// テキストレイヤー（TASK-79.5）に action は追加しない: harness の action registry は
+// `MAX_ACTIONS=16`（core/control/harness.zig）固定で、pixie は既に 16 件登録済み（undo〜open）
+// のため空き slot が無い。harness.zig の改変は本タスクのスコープ外（AGENT.md 上位ルール）。
+// AC#5 の harness 検証は既存の `inject mouse_down/up`（右クリックメニュー操作）+
+// `inject char`（TASK-22 char_input 注入。テキスト内容の入力）+ 既存 `inject key_down`
+// （Undo 等）で UI をそのまま駆動する（座標依存だが action 追加なしで完結する）。
 
 /// 16 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
@@ -1626,6 +1766,71 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     }
 }
 
+/// テキストレイヤー（kind==.text）専用の編集パネル。選択中レイヤーが text の時のみ表示する
+/// （TASK-79.5）。内容編集（`text_in` 経由のインライン編集）/ font size / 位置(x,y) /
+/// 現在色の適用を扱う。値変化時に `App.doSetTextParams` へ委譲する（既存 opacity スライダーと
+/// 同じ「値が変わった時だけ呼ぶ」パターン。ドラッグ中の複数回 push は既存 opacity スライダーと
+/// 同クラスの既知トレードオフで新規の懸念ではない）。
+///
+/// ホットパス宣言: 毎フレーム構築されるが（immediate-mode GUI の一部）、実際の再ラスタライズ
+/// （`doSetTextParams` 経由）はスライダー値変化・文字列確定等の**イベント時のみ**走る。
+fn buildTextLayerPanel(ctx: *gui.Context, app: *App) !void {
+    const idx = app.canvas.selected_layer;
+    if (idx >= app.canvas.layers.items.len) return;
+    if (app.canvas.layers.items[idx].kind != .text) return;
+    const layer = app.canvas.layers.items[idx];
+
+    ctx.label("Text Layer");
+    ctx.beginBox(.{ .direction = .column, .gap = 3 });
+
+    if (app.text_in.active and app.text_in.layer_idx == idx) {
+        var cursor_buf: [160]u8 = undefined;
+        const shown = truncateForDisplay(ctx.allocator(), app.text_in.text(), LAYER_NAME_DISPLAY_MAX);
+        const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
+        ctx.beginBox(.{
+            .padding = .{ 2, 4, 2, 4 },
+            .bg = ctx.style.bg_active,
+            .border = .{ .color = ctx.style.border_hover, .thickness = 1 },
+        });
+        ctx.labelEx(with_cursor, ctx.style.text);
+        ctx.endBox();
+    } else {
+        const shown = truncateForDisplay(ctx.allocator(), layer.text_params.text(), LAYER_NAME_DISPLAY_MAX);
+        if (ctx.buttonId(TEXT_PANEL_ID_BASE + 1, shown, .{ .min_w = 100 }).clicked) {
+            app.beginTextEdit(idx);
+        }
+    }
+
+    var px_f32: f32 = layer.text_params.font_px;
+    if (ctx.sliderF32Id(TEXT_PANEL_ID_BASE + 2, "Size", &px_f32, .{ .min = 6, .max = 96, .step = 1, .track_w = 80 })) {
+        var params = layer.text_params;
+        params.font_px = px_f32;
+        app.doSetTextParams(idx, params) catch {};
+    }
+
+    var x_i32: i32 = layer.text_params.x;
+    if (ctx.sliderI32Id(TEXT_PANEL_ID_BASE + 3, "X", &x_i32, .{ .min = 0, .max = @as(i32, @intCast(CANVAS_W)) - 1, .track_w = 80 })) {
+        var params = layer.text_params;
+        params.x = x_i32;
+        app.doSetTextParams(idx, params) catch {};
+    }
+
+    var y_i32: i32 = layer.text_params.y;
+    if (ctx.sliderI32Id(TEXT_PANEL_ID_BASE + 4, "Y", &y_i32, .{ .min = 0, .max = @as(i32, @intCast(CANVAS_H)) - 1, .track_w = 80 })) {
+        var params = layer.text_params;
+        params.y = y_i32;
+        app.doSetTextParams(idx, params) catch {};
+    }
+
+    if (ctx.buttonId(TEXT_PANEL_ID_BASE + 5, "Apply Color", .{ .min_w = 80 }).clicked) {
+        var params = layer.text_params;
+        params.color = app.palette.current();
+        app.doSetTextParams(idx, params) catch {};
+    }
+
+    ctx.endBox();
+}
+
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
@@ -1792,6 +1997,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
 
         try buildLayerPanel(ctx, app);
+        try buildTextLayerPanel(ctx, app); // TASK-79.5: 選択中レイヤーが text kind の時のみ表示
         ctx.endScrollArea(); // right pane (縦スクロール)
     } // right_visible
 
@@ -1950,19 +2156,28 @@ pub fn main(init: std.process.Init) !void {
             while (window.nextEvent()) |ev| {
                 switch (ev) {
                     .quit => app.running = false, // ウィンドウクローズも同一経路
-                    // レイヤー名インライン編集中（TASK-79.3）は key_down を専用ハンドラへ回し、
-                    // char_input で確定文字を追記する（TASK-22 char_input の初消費）。key_up は
-                    // 常に通す（Space パン modifier 等の held 状態を rename 中に取りこぼさない
-                    // ため。codex レビュー指摘 2026-07-05）。
-                    .key_down => |k| if (app.rename_in.active) app.handleRenameKey(k) else app.handleKey(k),
+                    // レイヤー名インライン編集中（TASK-79.3）・テキストレイヤー内容編集中
+                    // （TASK-79.5、`text_in`。rename_in と対称・互いに同時 active にならない）は
+                    // key_down を専用ハンドラへ回し、char_input で確定文字を追記する（TASK-22
+                    // char_input の初消費）。key_up は常に通す（Space パン modifier 等の held
+                    // 状態を編集中に取りこぼさないため。codex レビュー指摘 2026-07-05）。
+                    .key_down => |k| if (app.rename_in.active)
+                        app.handleRenameKey(k)
+                    else if (app.text_in.active)
+                        app.handleTextEditKey(k)
+                    else
+                        app.handleKey(k),
                     .key_up => |k| app.handleKeyUp(k),
-                    .char_input => |c| if (app.rename_in.active) app.rename_in.appendCodepoint(c.codepoint),
+                    .char_input => |c| if (app.rename_in.active)
+                        app.rename_in.appendCodepoint(c.codepoint)
+                    else if (app.text_in.active)
+                        app.text_in.appendCodepoint(c.codepoint),
                     else => {},
                 }
-                // renaming 中は gui へのマウス/キーイベント転送も止める（他行クリック等での
-                // 干渉を避ける。rename_in はここで破棄されないため、他行の右クリックで
-                // 新たな rename が始まれば単に上書きされるだけでクラッシュはしない）。
-                if (!app.rename_in.active) {
+                // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
+                // での干渉を避ける。rename_in/text_in はここで破棄されないため、他行の右クリックで
+                // 新たな編集が始まれば単に上書きされるだけでクラッシュはしない）。
+                if (!app.rename_in.active and !app.text_in.active) {
                     if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
                 }
             }
@@ -1982,7 +2197,12 @@ pub fn main(init: std.process.Init) !void {
             canvas_rect = canvasBlitRect(&ctx, &app);
 
             // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
-            if (!panning) {
+            // TASK-79.5: 選択中レイヤーが text kind の間は、この分岐全体（bezier/select/
+            // eyedropper/通常 canvas_input のいずれも）を丸ごと止める。「text layer の pixels は
+            // text_params からの再ラスタライズ結果」という不変条件を守るため（eyedropper は
+            // 本来読み取りのみで実害は無いが、分岐追加のミスリスクよりシンプルさを優先し
+            // 丸ごと止める設計判断。text layer 選択中は色スポイトも一時的に使えない）。
+            if (!panning and !app.selectedLayerIsText()) {
                 const in = &ctx.input;
                 // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
                 // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
@@ -2138,29 +2358,36 @@ pub fn main(init: std.process.Init) !void {
             // popup.zig の doc comment 参照）。items は selected_layer の現在値から都度算出する
             // （右クリック時に doSelectLayer 済みなので、以降の全項目は selected_layer に対して動く）。
             {
+                const sel_is_text = app.selectedLayerIsText();
                 const items = [_]gui.PopupItem{
                     .{ .label = "Add Layer" },
+                    .{ .label = "Add Text Layer" }, // TASK-79.5
                     .{ .label = "Delete Layer", .enabled = app.canvas.layers.items.len > 1 },
                     .{ .label = "Move Up", .enabled = app.canvas.selected_layer + 1 < app.canvas.layers.items.len },
                     .{ .label = "Move Down", .enabled = app.canvas.selected_layer > 0 },
                     .{ .label = if (app.canvas.layers.items[app.canvas.selected_layer].visible) "Hide" else "Show" },
                     .{ .label = "Duplicate" },
-                    .{ .label = "Merge Down", .enabled = app.canvas.selected_layer > 0 },
+                    .{ .label = "Merge Down", .enabled = app.canvas.selected_layer > 0 and !sel_is_text and
+                        app.canvas.layers.items[app.canvas.selected_layer - 1].kind != .text },
                     .{ .label = "Rename..." }, // TASK-79.3
-                    .{ .label = "Rasterize", .enabled = false }, // placeholder（TASK-79.5 で実装）
+                    .{ .label = "Edit Text...", .enabled = sel_is_text }, // TASK-79.5
+                    .{ .label = "Rasterize", .enabled = sel_is_text }, // TASK-79.5
                 };
                 const ctx_menu_result = ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
                 if (ctx_menu_result.selected) |sel| {
                     switch (sel) {
                         0 => app.doAddLayer() catch {},
-                        1 => app.doDeleteLayer() catch {},
-                        2 => app.doMoveLayer(1) catch {},
-                        3 => app.doMoveLayer(-1) catch {},
-                        4 => app.doToggleLayerVisible(app.canvas.selected_layer),
-                        5 => app.doDuplicateLayer() catch {},
-                        6 => app.doMergeDown() catch {},
-                        7 => app.beginRenameLayer(app.canvas.selected_layer),
-                        else => {}, // Rasterize は disabled 固定のためここへは来ない
+                        1 => app.doAddTextLayer() catch {},
+                        2 => app.doDeleteLayer() catch {},
+                        3 => app.doMoveLayer(1) catch {},
+                        4 => app.doMoveLayer(-1) catch {},
+                        5 => app.doToggleLayerVisible(app.canvas.selected_layer),
+                        6 => app.doDuplicateLayer() catch {},
+                        7 => app.doMergeDown() catch {},
+                        8 => app.beginRenameLayer(app.canvas.selected_layer),
+                        9 => app.beginTextEdit(app.canvas.selected_layer),
+                        10 => app.doRasterizeLayer(app.canvas.selected_layer) catch {},
+                        else => {},
                     }
                 }
             }

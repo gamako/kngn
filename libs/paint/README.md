@@ -113,6 +113,27 @@ undo.undoOne(gpa, &canvas); // 取り消し
 - pixie 側のプレビュー描画（`bezier_overlay.zig`）と入力アダプタ（`bezier_input.zig`）は GUI/platform 依存
   のため core には置かない（core は数学・データ・状態機械・rasterize のみ）。
 
+## テキストレイヤー（TASK-79.5）
+
+`Layer` は `kind: LayerKind`（`.raster` / `.text`）で分岐する（TASK-72 の raster|vector 分岐と
+同じ器。vector 追加時も composite/merge/duplicate は `pixels` のみを見る kind-agnostic 設計の
+ため無改造で済む）。`kind==.text` の Layer は `text_params: TextParams`（文字列/font_px/色/位置。
+固定長 POD）をサイドカーとして持ち、`pixels` は**その TextParams を再ラスタライズした結果の
+キャッシュ**として保持する。
+
+- **不変条件**: `kind==.text` の Layer の `pixels` は常に「直近の `text_params` を
+  `text_render.rasterizeTextLayer` で再ラスタライズした結果と bit 一致する」。これは Undo の
+  `layer_text_params`/`layer_rasterize`（pixels を保持せず再ラスタライズで復元する軽量 Op）の
+  可逆性の前提であり、**text レイヤーへの直接 raster 編集（Pen/Eraser/Fill/選択操作等）は
+  pixie（App 層）が全経路で禁止する**ことで維持される（`libs/paint` 自体はこの禁止を強制しない
+  ＝既存 `editingBlocked()` と同じ「App が振る舞いを決め、Canvas は素直に従う」役割分担）。
+- **API**: `Canvas.addTextLayer` / `setLayerTextParams`（再ラスタライズあり）/
+  `rasterizeLayer`（bake。kind=raster化のみで pixels 不変）/
+  `setLayerKindText`（bake の Undo/Redo 専用の低レベル setter）。
+- **.pix 互換**: `document_io.zig` は text kind でも LAYR チャンクは常に raster として pixels を
+  保存し、text 固有メタは新規 `LTXT` チャンク（`LNAM` の直後）に持つ（方式(b)。旧 reader は
+  `LTXT` を無視して raster として正しく開ける）。
+
 ## 範囲選択（TASK-44）
 
 矩形選択の MVP。selection は `Canvas.selection: ?Rect`（矩形のみ。投げ縄/ワンドは非スコープ）。

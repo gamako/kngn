@@ -9,6 +9,10 @@ pub const document_io = @import("document_io.zig");
 pub const Canvas = canvas.Canvas;
 pub const Layer = canvas.Layer;
 pub const layer_name_max = canvas.layer_name_max;
+// テキストレイヤー（TASK-79.5）
+pub const LayerKind = canvas.LayerKind;
+pub const TextParams = canvas.TextParams;
+pub const text_content_max = canvas.text_content_max;
 pub const Document = document.Document;
 pub const Vec2 = canvas.Vec2;
 pub const Rect = canvas.Rect;

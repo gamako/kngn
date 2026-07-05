@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const pixelops = @import("pixelops");
 const bezier = @import("bezier.zig");
+const text_render = @import("text_render.zig");
 
 pub const Vec2 = struct { x: i32, y: i32 };
 pub const Rect = struct {
@@ -22,6 +23,59 @@ pub const Rect = struct {
 /// 「Layer は pixels だけを所有する POD」という不変条件を保つ固定長を選ぶ）。
 pub const layer_name_max: usize = 32;
 
+/// レイヤーの種類（TASK-79.5。TASK-72 の raster|vector 分岐と同じ器）。
+/// `.text` は「TextParams から再ラスタライズしたキャッシュを pixels に保持する」レイヤー。
+/// composite/compositeStraight/merge/duplicate はいずれも `pixels` のみを見るため kind
+/// 非依存で無改造（vector が将来追加されても同様の器を使えば無改造で済む＝AC#4）。
+pub const LayerKind = enum(u8) { raster = 0, text = 1 };
+
+/// テキストレイヤーの内容量（UTF-8 バイト数。TASK-79.5）。`layer_name_max`（32）とは独立の定数
+/// （テキスト内容はレイヤー名より長くなりうるため）。
+pub const text_content_max: usize = 96;
+
+/// テキストレイヤーのパラメータ（文字列/フォントサイズ/色/位置）。固定長 POD
+/// （`Layer.name_buf` と同じ ownership churn 回避方針。可変長 owned([]u8) にしない）。
+/// **不変条件（TASK-79.5 の要）**: `kind==.text` の Layer の `pixels` は常に
+/// 「この TextParams を `text_render.rasterizeTextLayer` で再ラスタライズした結果と bit 一致する」
+/// （Undo の `layer_text_params`/`layer_rasterize` が pixels を保持せず再ラスタライズで復元する
+/// 設計の前提。この不変条件は pixie（apps/editor/apps/pixie/main.zig）側の
+/// `App.selectedLayerIsText()` ガードが「text レイヤーへの直接 raster 編集」を全経路で禁止する
+/// ことで維持される。Canvas 自体はこの禁止を強制しない＝既存 `editingBlocked()` と同じ
+/// 「App が振る舞いを決め、Canvas は素直に従う」役割分担）。
+pub const TextParams = struct {
+    text_buf: [text_content_max]u8 = undefined,
+    text_len: u8 = 0,
+    font_px: f32 = 16.0,
+    /// canonical straight BGRA 0xAARRGGBB。`font.Color` と同一ビットレイアウト（@bitCast 可）。
+    color: u32 = 0xFFFFFFFF,
+    x: i32 = 0,
+    y: i32 = 0,
+
+    pub fn text(self: *const TextParams) []const u8 {
+        return self.text_buf[0..self.text_len];
+    }
+
+    /// text を設定する。`text_content_max` を超える分は UTF-8 継続バイトの途中で切らないように
+    /// 安全に切り詰める（`Layer.setName` と同型）。
+    pub fn setText(self: *TextParams, s: []const u8) void {
+        const n = safeUtf8TruncateLen(s, text_content_max);
+        @memcpy(self.text_buf[0..n], s[0..n]);
+        self.text_len = @intCast(n);
+    }
+
+    /// 意味的等価判定。`text_buf` の未使用末尾バイトは `undefined` 初期化のため raw struct
+    /// 比較（`std.meta.eql`）は使わず `text()` の中身のみ比較する（`layer_rename` が
+    /// `NameSnapshot.slice()` を比較するのと同じ流儀）。`font_px` は `==` でなく bit 比較にし、
+    /// NaN が万一保存されていても「値が変わったか」の判定を安定させる（IEEE754 の NaN!=NaN の
+    /// 影響を受けない）。
+    pub fn eql(a: TextParams, b: TextParams) bool {
+        const a_px_bits: u32 = @bitCast(a.font_px);
+        const b_px_bits: u32 = @bitCast(b.font_px);
+        return a_px_bits == b_px_bits and a.color == b.color and a.x == b.x and a.y == b.y and
+            std.mem.eql(u8, a.text(), b.text());
+    }
+};
+
 pub const Layer = struct {
     pixels: []u32, // format: canonical BGRA 0xAARRGGBB (bytes [B,G,R,A] on little-endian)
     visible: bool = true,
@@ -30,6 +84,10 @@ pub const Layer = struct {
     /// （`Canvas.init`/`allocBlankLayer` が生成直後に `setName` で既定名 "Layer N" を書き込む）。
     name_buf: [layer_name_max]u8 = undefined,
     name_len: u8 = 0,
+    /// レイヤーの種類（TASK-79.5）。既定は raster。
+    kind: LayerKind = .raster,
+    /// `kind==.text` の時のみ意味を持つサイドカー（TextParams のドキュメント参照）。
+    text_params: TextParams = .{},
 
     pub fn name(self: *const Layer) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -209,6 +267,79 @@ pub const Canvas = struct {
     pub fn setLayerName(self: *Canvas, index: usize, text: []const u8) bool {
         if (index >= self.layers.items.len) return false;
         self.layers.items[index].setName(text);
+        return true;
+    }
+
+    // ── テキストレイヤー（TASK-79.5）───────────────────────────
+
+    /// テキストレイヤーを新規追加する。`allocBlankLayer` で確保した空レイヤーを text kind 化し、
+    /// `params` でラスタライズしてから挿入する（既存 `insertLayer` の markDirty 経路に乗る）。
+    /// イベント時のみ（レイヤー追加操作の都度1回）。
+    pub fn addTextLayer(self: *Canvas, gpa: Allocator, params: TextParams) !usize {
+        var layer = try self.allocBlankLayer(gpa);
+        errdefer gpa.free(layer.pixels);
+        layer.kind = .text;
+        layer.text_params = params;
+        try text_render.rasterizeTextLayer(
+            self.allocator,
+            layer.pixels,
+            self.width,
+            self.height,
+            layer.text_params.text(),
+            layer.text_params.font_px,
+            layer.text_params.color,
+            layer.text_params.x,
+            layer.text_params.y,
+        );
+        const idx = self.layers.items.len;
+        try self.insertLayer(gpa, idx, layer);
+        return idx;
+    }
+
+    /// 既存テキストレイヤーの text_params を更新し pixels を再ラスタライズする（TASK-79.5）。
+    /// `kind!=.text` は `error.NotTextLayer`。pixels が変わるため `markDirty()` は必須
+    /// （`setLayerName` と異なり合成結果に影響する）。イベント時のみ（内容/サイズ/色/位置の
+    /// 編集確定の都度1回）。
+    pub fn setLayerTextParams(self: *Canvas, index: usize, params: TextParams) !void {
+        if (index >= self.layers.items.len) return error.OutOfRange;
+        if (self.layers.items[index].kind != .text) return error.NotTextLayer;
+        self.layers.items[index].text_params = params;
+        const layer = &self.layers.items[index];
+        try text_render.rasterizeTextLayer(
+            self.allocator,
+            layer.pixels,
+            self.width,
+            self.height,
+            layer.text_params.text(),
+            layer.text_params.font_px,
+            layer.text_params.color,
+            layer.text_params.x,
+            layer.text_params.y,
+        );
+        self.markDirty();
+    }
+
+    /// テキストレイヤーを通常 raster レイヤーへ確定する（Rasterize/bake。TASK-79.5）。
+    /// `kind!=.text` は `error.NotTextLayer`。pixels は不変（不変条件により既に最新の
+    /// ラスタライズ結果）なので**再ラスタライズも markDirty も不要**（`setLayerName` と同じ
+    /// 「合成結果に影響しない変更は cache 無効化しない」規約。TASK-53）。呼び出し前の
+    /// text_params を返す（呼び出し側=App が Undo `.layer_rasterize` へ積む用）。
+    pub fn rasterizeLayer(self: *Canvas, index: usize) !TextParams {
+        if (index >= self.layers.items.len) return error.OutOfRange;
+        if (self.layers.items[index].kind != .text) return error.NotTextLayer;
+        const before = self.layers.items[index].text_params;
+        self.layers.items[index].kind = .raster;
+        self.layers.items[index].text_params = .{};
+        return before;
+    }
+
+    /// pixels に触れず kind/text_params だけを直接設定する低レベル setter
+    /// （`rasterizeLayer` の Undo/Redo 専用。redo は `kind=.raster, params=.{}` の決定的値を
+    /// 渡すだけで済むため pixels スナップショットが要らない）。
+    pub fn setLayerKindText(self: *Canvas, index: usize, kind: LayerKind, params: TextParams) bool {
+        if (index >= self.layers.items.len) return false;
+        self.layers.items[index].kind = kind;
+        self.layers.items[index].text_params = params;
         return true;
     }
 
@@ -672,6 +803,8 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
         move_layer,
         set_visible,
         set_opacity,
+        add_text_layer,
+        set_text_params,
     };
     inline for (std.meta.fields(Op)) |f| {
         const op: Op = @enumFromInt(f.value);
@@ -690,6 +823,12 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
             .move_layer => _ = c.moveLayer(0, c.layers.items.len - 1),
             .set_visible => _ = c.setLayerVisible(0, false),
             .set_opacity => _ = c.setLayerOpacity(0, 200),
+            .add_text_layer => _ = try c.addTextLayer(gpa, .{}), // 末尾に text layer を追加（enum 順序: 直後の set_text_params が同レイヤーを想定）
+            .set_text_params => {
+                var p: TextParams = .{};
+                p.setText("hi");
+                try c.setLayerTextParams(c.layers.items.len - 1, p);
+            },
         }
         _ = c.compositeStraight();
         std.testing.expectEqual(runs_before + 1, c.composite_runs) catch |err| {
@@ -698,15 +837,21 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
         };
     }
 
-    // 合成結果に影響しない操作は無効化しない（TASK-79.3: setLayerName も追加）
+    // 合成結果に影響しない操作は無効化しない（TASK-79.3: setLayerName / TASK-79.5: rasterizeLayer も追加）。
+    // 直前のループの末尾 op が add_text_layer→set_text_params の順だったため、末尾レイヤーは
+    // 現在 kind==.text（TextParams.text()=="hi"）。
     _ = c.compositeStraight();
     const runs = c.composite_runs;
     _ = c.selectLayer(0);
     c.setSelection(.{ .x = 0, .y = 0, .w = 2, .h = 2 });
     c.clearSelection();
     _ = c.setLayerName(0, "Background");
+    const text_idx = c.layers.items.len - 1;
+    try std.testing.expectEqual(LayerKind.text, c.layers.items[text_idx].kind);
+    _ = try c.rasterizeLayer(text_idx); // pixels 不変・kind=raster 化のみ → cache 無効化しない
     _ = c.compositeStraight();
     try std.testing.expectEqual(runs, c.composite_runs);
+    try std.testing.expectEqual(LayerKind.raster, c.layers.items[text_idx].kind);
 }
 
 // ── レイヤー名（TASK-79.3）─────────────────────────────────
@@ -763,4 +908,114 @@ test "Layer name: resetCanvasToSingleLayer 相当のシナリオでも Canvas.in
     defer c.deinit();
     try std.testing.expectEqualStrings("Layer 1", c.layers.items[0].name());
     try std.testing.expectEqual(@as(u32, 2), c.next_layer_num);
+}
+
+// ── テキストレイヤー（TASK-79.5）─────────────────────────────
+
+test "TextParams: setText/text は UTF-8 境界を壊さず切り詰める" {
+    var p: TextParams = .{};
+    p.setText("Hello");
+    try std.testing.expectEqualStrings("Hello", p.text());
+
+    const long_ascii = "A" ** (text_content_max + 10);
+    p.setText(long_ascii);
+    try std.testing.expectEqual(text_content_max, p.text().len);
+
+    const multibyte = "あ" ** 40; // 120B（96 に収まるのは 32 個=96B まで）
+    p.setText(multibyte);
+    try std.testing.expect(p.text().len <= text_content_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(p.text()));
+    try std.testing.expectEqualStrings("あ" ** 32, p.text());
+}
+
+test "TextParams.eql: text_buf の未使用末尾バイトを無視し意味的に比較する（font_px は bit 比較）" {
+    var a: TextParams = .{ .font_px = 24, .color = 0xFFFFFFFF, .x = 1, .y = 2 };
+    a.setText("Hi");
+    var b: TextParams = .{ .font_px = 24, .color = 0xFFFFFFFF, .x = 1, .y = 2 };
+    b.setText("Hi");
+    // a/b は別々に setText した独立インスタンス（text_buf の未使用末尾は undefined で
+    // 一致する保証が無い）。それでも eql は true になる。
+    try std.testing.expect(a.eql(b));
+
+    var c: TextParams = a;
+    c.setText("Ho"); // 内容が違う
+    try std.testing.expect(!a.eql(c));
+
+    var d: TextParams = a;
+    d.font_px = 25;
+    try std.testing.expect(!a.eql(d));
+
+    // NaN font_px 同士は bit 比較なら同一 NaN 表現で true（IEEE754 の NaN!=NaN の影響を受けない）。
+    const nan_val = std.math.nan(f32);
+    var e1: TextParams = .{ .font_px = nan_val };
+    var e2: TextParams = .{ .font_px = nan_val };
+    e1.setText("Z");
+    e2.setText("Z");
+    try std.testing.expect(e1.eql(e2));
+}
+
+test "Canvas.addTextLayer: text kind で追加され pixels がラスタライズ結果になる" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 64, 32);
+    defer c.deinit();
+
+    var params: TextParams = .{ .font_px = 16, .color = 0xFFFFFFFF, .x = 0, .y = 0 };
+    params.setText("Hi");
+    const idx = try c.addTextLayer(gpa, params);
+    try std.testing.expectEqual(@as(usize, 1), idx); // layer0 の上に追加
+    try std.testing.expectEqual(LayerKind.text, c.layers.items[idx].kind);
+    try std.testing.expectEqualStrings("Hi", c.layers.items[idx].text_params.text());
+
+    var non_transparent: usize = 0;
+    for (c.layerPixels(idx)) |p| {
+        if (p & 0xFF000000 != 0) non_transparent += 1;
+    }
+    try std.testing.expect(non_transparent > 0); // 文字が焼かれている
+}
+
+test "Canvas.setLayerTextParams: kind!=text は NotTextLayer、text は再ラスタライズされる" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 64, 32);
+    defer c.deinit();
+
+    try std.testing.expectError(error.NotTextLayer, c.setLayerTextParams(0, .{}));
+
+    var params: TextParams = .{ .font_px = 16, .x = 0, .y = 0 };
+    params.setText("A");
+    const idx = try c.addTextLayer(gpa, params);
+    const before_pixels = try gpa.dupe(u32, c.layerPixels(idx));
+    defer gpa.free(before_pixels);
+
+    var params2 = params;
+    params2.setText("ABCDE"); // 文字列を変えると pixels が変わるはず
+    try c.setLayerTextParams(idx, params2);
+    try std.testing.expect(!std.mem.eql(u32, before_pixels, c.layerPixels(idx)));
+    try std.testing.expectEqualStrings("ABCDE", c.layers.items[idx].text_params.text());
+}
+
+test "Canvas.rasterizeLayer/setLayerKindText: bake は pixels 不変・kind のみ切替、Undo/Redo 相当が可逆" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 64, 32);
+    defer c.deinit();
+
+    try std.testing.expectError(error.NotTextLayer, c.rasterizeLayer(0));
+
+    var params: TextParams = .{ .font_px = 16 };
+    params.setText("X");
+    const idx = try c.addTextLayer(gpa, params);
+    const pixels_before = try gpa.dupe(u32, c.layerPixels(idx));
+    defer gpa.free(pixels_before);
+
+    const before = try c.rasterizeLayer(idx);
+    try std.testing.expect(before.eql(params));
+    try std.testing.expectEqual(LayerKind.raster, c.layers.items[idx].kind);
+    try std.testing.expectEqualSlices(u32, pixels_before, c.layerPixels(idx)); // pixels 不変
+
+    // setLayerKindText で undo（.text へ戻す）→ redo（.raster へ戻す）
+    try std.testing.expect(c.setLayerKindText(idx, .text, before));
+    try std.testing.expectEqual(LayerKind.text, c.layers.items[idx].kind);
+    try std.testing.expectEqualSlices(u32, pixels_before, c.layerPixels(idx)); // pixels は今も不変
+    try std.testing.expect(c.setLayerKindText(idx, .raster, .{}));
+    try std.testing.expectEqual(LayerKind.raster, c.layers.items[idx].kind);
+    try std.testing.expect(!c.setLayerKindText(999, .text, .{})); // 範囲外は false
 }

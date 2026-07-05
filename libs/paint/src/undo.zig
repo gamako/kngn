@@ -13,6 +13,7 @@ const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
 const Layer = canvas_mod.Layer;
 const Vec2 = canvas_mod.Vec2;
+const TextParams = canvas_mod.TextParams;
 const blend = @import("blend.zig");
 
 /// レイヤー名の固定長スナップショット（TASK-79.3）。`Layer.name_buf`/`name_len` と同じ形で
@@ -104,6 +105,27 @@ pub const Op = union(enum) {
         below_before: []u32,
         /// 下位レイヤー(index-1)の結合後ピクセル（owned。redo で復元）。
         below_after: []u32,
+    },
+    /// テキストレイヤーの text_params 変更（内容/サイズ/色/位置の編集確定。TASK-79.5）。
+    /// `TextParams` は POD（所有権を持つスライスが無い）なので、before/after は値コピーの
+    /// 固定長スナップショットで足りる。pixels は before/after の TextParams から
+    /// `Canvas.setLayerTextParams`（内部で `text_render.rasterizeTextLayer`）で再生成できるため
+    /// 保持しない（`layer_rename` と同じ「軽量 Op」の分類。この可逆性は「text kind の Layer は
+    /// text layer への直接 raster 編集を禁止する」という pixie App 層の不変条件に依存する。
+    /// canvas.zig の `TextParams` doc comment 参照）。
+    layer_text_params: struct {
+        index: usize,
+        before: canvas_mod.TextParams,
+        after: canvas_mod.TextParams,
+    },
+    /// テキストレイヤーの raster 確定（Rasterize/bake。TASK-79.5）。pixels は不変（bake は
+    /// ラスタライズ済みキャッシュをそのまま raster として確定するだけ）なので、undo/redo とも
+    /// `Canvas.setLayerKindText` の呼び出しのみで済む（pixels スナップショットが要らない）。
+    /// redo（`.raster` 化）は常に決定的な値（`text_params=.{}` の既定値）になるため after は
+    /// 持たない。
+    layer_rasterize: struct {
+        index: usize,
+        before: canvas_mod.TextParams,
     },
 };
 
@@ -354,6 +376,7 @@ pub const UndoStack = struct {
             .layer_add => |la| if (la.layer) |layer| gpa.free(layer.pixels),
             .layer_delete => |ld| if (ld.layer) |layer| gpa.free(layer.pixels),
             .layer_reorder, .layer_visible, .layer_opacity, .layer_rename => {},
+            .layer_text_params, .layer_rasterize => {}, // POD（所有権を持つスライス無し）
             .layer_merge_down => |lm| {
                 if (lm.layer) |layer| gpa.free(layer.pixels);
                 gpa.free(lm.below_before);
@@ -427,6 +450,12 @@ pub const UndoStack = struct {
             .layer_rename => |op| {
                 if (!canvas.setLayerName(op.index, op.before.slice())) @panic("UndoStack.layer_rename undo: invalid layer");
             },
+            .layer_text_params => |op| {
+                canvas.setLayerTextParams(op.index, op.before) catch @panic("UndoStack.layer_text_params undo: invalid layer/rasterize failed");
+            },
+            .layer_rasterize => |op| {
+                if (!canvas.setLayerKindText(op.index, .text, op.before)) @panic("UndoStack.layer_rasterize undo: invalid layer");
+            },
             .layer_merge_down => |*op| {
                 const below_idx = op.index - 1;
                 @memcpy(canvas.layerPixels(below_idx), op.below_before);
@@ -466,6 +495,12 @@ pub const UndoStack = struct {
             },
             .layer_rename => |op| {
                 if (!canvas.setLayerName(op.index, op.after.slice())) @panic("UndoStack.layer_rename redo: invalid layer");
+            },
+            .layer_text_params => |op| {
+                canvas.setLayerTextParams(op.index, op.after) catch @panic("UndoStack.layer_text_params redo: invalid layer/rasterize failed");
+            },
+            .layer_rasterize => |op| {
+                if (!canvas.setLayerKindText(op.index, .raster, .{})) @panic("UndoStack.layer_rasterize redo: invalid layer");
             },
             .layer_merge_down => |*op| {
                 const below_idx = op.index - 1;
@@ -867,6 +902,69 @@ test "layer reorder visible opacity: undo/redo restores structure and metadata" 
     try std.testing.expectEqualStrings(before_str, c.layers.items[0].name());
     undo_stack.redoOne(gpa, &.{&c});
     try std.testing.expectEqualStrings("Sketch", c.layers.items[0].name());
+}
+
+// ── テキストレイヤー（TASK-79.5）─────────────────────────────
+
+test "layer_text_params: undo/redo は pixels スナップショット無しで再ラスタライズにより復元する" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 64, 32);
+    defer c.deinit();
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    var before: TextParams = .{ .font_px = 16, .x = 0, .y = 0 };
+    before.setText("A");
+    const idx = try c.addTextLayer(gpa, before);
+    const pixels_a = try gpa.dupe(u32, c.layerPixels(idx));
+    defer gpa.free(pixels_a);
+
+    var after: TextParams = .{ .font_px = 16, .x = 0, .y = 0 };
+    after.setText("ABCDE");
+    try c.setLayerTextParams(idx, after);
+    const pixels_b = try gpa.dupe(u32, c.layerPixels(idx));
+    defer gpa.free(pixels_b);
+    try std.testing.expect(!std.mem.eql(u32, pixels_a, pixels_b));
+
+    undo_stack.push(gpa, .{ .op = .{ .layer_text_params = .{ .index = idx, .before = before, .after = after } } });
+
+    undo_stack.undoOne(gpa, &.{&c});
+    try std.testing.expectEqualStrings("A", c.layers.items[idx].text_params.text());
+    try std.testing.expectEqualSlices(u32, pixels_a, c.layerPixels(idx)); // 再ラスタライズで bit 復元
+
+    undo_stack.redoOne(gpa, &.{&c});
+    try std.testing.expectEqualStrings("ABCDE", c.layers.items[idx].text_params.text());
+    try std.testing.expectEqualSlices(u32, pixels_b, c.layerPixels(idx));
+}
+
+test "layer_rasterize: undo/redo は pixels 不変で kind/text_params だけ切替（bake の可逆性）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 64, 32);
+    defer c.deinit();
+    var undo_stack: UndoStack = .{};
+    defer undo_stack.deinit(gpa);
+
+    var params: TextParams = .{ .font_px = 16, .x = 2, .y = 2 };
+    params.setText("Bake");
+    const idx = try c.addTextLayer(gpa, params);
+    const pixels_snapshot = try gpa.dupe(u32, c.layerPixels(idx));
+    defer gpa.free(pixels_snapshot);
+
+    const before = try c.rasterizeLayer(idx);
+    try std.testing.expect(before.eql(params));
+    try std.testing.expectEqual(canvas_mod.LayerKind.raster, c.layers.items[idx].kind);
+    try std.testing.expectEqualSlices(u32, pixels_snapshot, c.layerPixels(idx)); // bake は pixels 不変
+
+    undo_stack.push(gpa, .{ .op = .{ .layer_rasterize = .{ .index = idx, .before = before } } });
+
+    undo_stack.undoOne(gpa, &.{&c});
+    try std.testing.expectEqual(canvas_mod.LayerKind.text, c.layers.items[idx].kind);
+    try std.testing.expect(c.layers.items[idx].text_params.eql(params));
+    try std.testing.expectEqualSlices(u32, pixels_snapshot, c.layerPixels(idx)); // undo も pixels 不変
+
+    undo_stack.redoOne(gpa, &.{&c});
+    try std.testing.expectEqual(canvas_mod.LayerKind.raster, c.layers.items[idx].kind);
+    try std.testing.expectEqualSlices(u32, pixels_snapshot, c.layerPixels(idx)); // redo も pixels 不変
 }
 
 test "stroke 内の重複塗りは最初の before を保持する（undo の正しさ）" {

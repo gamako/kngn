@@ -11,6 +11,8 @@
 //! - LAYR(layer 毎, 親 FRAM の後に出現順): type u8(0=raster) | visible u8 | opacity u8 | blend u8(予約=0)
 //!                                        | compression u8(0=raw) | pad[3] | pixels[W*H*4]（raw canonical BGRA u32, row-major）
 //! - LNAM(任意・対応する LAYR の直後に出現。TASK-79.3): レイヤー名の UTF-8 バイト列そのまま（ヘッダなし）。
+//! - LTXT(任意・対応する LAYR の LNAM の直後に出現。TASK-79.5・text kind の layer のみ):
+//!   font_px f32(LE, bitcast→u32) | color u32(LE) | x i32(LE) | y i32(LE) | text bytes(残り, UTF-8, ヘッダなし)。
 //!
 //! **pixel byte 順の責務はここ（schema 側）**（serde は payload opaque）。canonical BGRA u32 を
 //! std.mem.sliceAsBytes で直格納 = little-endian BGRA bytes。ターゲット（aarch64/x86_64）は LE なので直格納で足りる。
@@ -28,13 +30,33 @@
 //!   直前の別レイヤーへ誤適用しないため）。LNAM が無いファイル（旧形式）は既定名
 //!   （allocBlankLayer の "Layer N"）のまま＝後方互換（新 reader が旧ファイルを読める）。
 //!
+//! **.pix 互換方針（TASK-79.5, LTXT 追加, 方式(b)）**: text kind の Layer も LAYR チャンクの
+//! `type` バイトは常に `layer_type_raster`(=0) のまま pixels（既に最新のラスタライズ結果）を
+//! 書く（旧 reader・pixie 以外の raster-only reader からも正しい絵として見える）。text 固有の
+//! メタ（font_px/color/x/y/text文字列）だけを新規 LTXT チャンクへ、LNAM の**直後**に書く
+//! （1層あたり: LAYR → LNAM → LTXT(text kind のみ)）。(a)「LAYR.type 自体を text 用の値にする」
+//! 案は、既存 decode の「type!=raster は丸ごと skip（層を追加しない）」ロジックのため、旧
+//! reader がレイヤーを完全に読み落とす（raster としても見えない）ため不採用。
+//! - LTXT を LNAM の直後に置く設計上、**LNAM ハンドラは消費後に `last_layer_idx` を null へ
+//!   リセットしない**（既存は消費後に null化していたが、それだと直後の LTXT が対象レイヤーを
+//!   見失う。codex レビュー指摘 2026-07-05）。この変更は既存テストの結果に影響しない
+//!   （LAYR と LNAM の間に無関係な chunk を挟む既存テストは「else（未知 tag）」分岐のリセットで
+//!   担保されており、LNAM 自身の事後リセットとは無関係）。新規 LTXT ハンドラも同様に事後リセット
+//!   しない（対称性。将来さらに sidecar chunk が増えても連鎖できる形にしておく）。
+//! - LTXT の font_px は `std.math.isFinite(font_px) and font_px > 0` を満たさない場合、LTXT
+//!   全体を無視する（`TextParams.font_px` に非有限値を保存させないための decode 側の防御。
+//!   `font.OutlineFont.init` 自体は px を安全値へ自己 sanitize するため描画は落ちないが、
+//!   保存値の健全性は decode 側で守る）。text 部分は `canvas_mod.isValidLayerName`（制御文字/
+//!   不正UTF-8を弾く既存関数の再利用）で検証し、不正なら LTXT 全体を無視する（既定 raster の
+//!   まま）。
+//!
 //! 前方互換: 未知 chunk tag は serde iterator が skip / 未知 LAYR.type は skip（層追加しない）/
 //!           raster かつ compression≠raw は error / 構造違反（DOCH 欠落・重複・LAYR-before-FRAM・payload 長不一致・
 //!           schema_version 超過・frame_count 不一致）は error。
 //!
 //! ホットパス宣言: 保存・読込・書き出しは **イベント時のみ**（メニュー操作 1 回）。全画素規模だが
 //! フレーム毎ループではないため SIMD 3 点セット対象外。pixel payload は @memcpy 一括転送
-//! （per-pixel 除算/関数呼び出し/bounds 検査なし）。LNAM の name payload も高々 32B の @memcpy。
+//! （per-pixel 除算/関数呼び出し/bounds 検査なし）。LNAM/LTXT の payload も高々 100B 強の @memcpy。
 
 const std = @import("std");
 const serde = @import("serde");
@@ -53,12 +75,15 @@ const TAG_DOC: [4]u8 = "DOCH".*;
 const TAG_FRAME: [4]u8 = "FRAM".*;
 const TAG_LAYER: [4]u8 = "LAYR".*;
 const TAG_LAYER_NAME: [4]u8 = "LNAM".*;
+const TAG_LAYER_TEXT: [4]u8 = "LTXT".*;
 
 const doc_header_size: usize = 20;
 const frame_header_size: usize = 8;
 const layer_header_size: usize = 8;
 const layer_type_raster: u8 = 0;
 const compression_raw: u8 = 0;
+/// LTXT ヘッダ長（font_px:f32 + color:u32 + x:i32 + y:i32）。残りが text bytes。
+const text_header_size: usize = 16;
 
 pub const CanvasSize = struct { w: u32, h: u32 };
 
@@ -102,6 +127,21 @@ pub fn encodeDocument(doc: *Document, gpa: std.mem.Allocator) ![]u8 {
             try w.addChunk(TAG_LAYER, buf);
             // LNAM は対応する LAYR の直後（TASK-79.3）。旧 reader は未知 tag として無視する。
             try w.addChunk(TAG_LAYER_NAME, layer.name());
+            // LTXT は LNAM の直後、text kind の時のみ（TASK-79.5）。pixels は常に raster として
+            // 上で書き込み済み（旧 reader は raster として読める。方式(b)）。
+            if (layer.kind == .text) {
+                const tp = layer.text_params;
+                const text_bytes = tp.text();
+                const tbuf = try gpa.alloc(u8, text_header_size + text_bytes.len);
+                defer gpa.free(tbuf);
+                const px_bits: u32 = @bitCast(tp.font_px);
+                std.mem.writeInt(u32, tbuf[0..4], px_bits, .little);
+                std.mem.writeInt(u32, tbuf[4..8], tp.color, .little);
+                std.mem.writeInt(i32, tbuf[8..12], tp.x, .little);
+                std.mem.writeInt(i32, tbuf[12..16], tp.y, .little);
+                @memcpy(tbuf[text_header_size..], text_bytes);
+                try w.addChunk(TAG_LAYER_TEXT, tbuf);
+            }
         }
     }
     return w.finish();
@@ -183,14 +223,41 @@ pub fn decodeDocument(bytes: []const u8, gpa: std.mem.Allocator) !Document {
                 last_layer_idx = c.layers.items.len - 1;
             }
         } else if (std.mem.eql(u8, &chunk.tag, &TAG_LAYER_NAME)) {
-            // 直前が有効な raster LAYR だった場合のみ適用し、消費後は null に戻す
-            // （同じ LNAM を後続の無関係な chunk へ誤って引き継がないため）。
+            // 直前が有効な raster LAYR だった場合のみ適用する。
             // 破損入力（不正 UTF-8 / 制御文字）は名前を載せず既定名を維持する（digest 1 行契約保護）。
+            // **`last_layer_idx` は消費後もリセットしない**（TASK-79.5: LNAM の直後に来る LTXT が
+            // 同じレイヤーを対象にできるようにするため。誤適用防止は下の "else"（未知 tag）分岐と
+            // 新規 LAYR/FRAM 出現時の明示上書きで担保される＝ LAYR と LNAM/LTXT の間に無関係な
+            // chunk が挟まれば "else" 分岐が null へリセットする。既存テストはこの経路のみを
+            // 検証しているため、本行の削除は既存挙動に影響しない）。
             if (cur) |c| if (last_layer_idx) |li| {
                 if (li < c.layers.items.len and canvas_mod.isValidLayerName(chunk.payload))
                     c.layers.items[li].setName(chunk.payload);
             };
-            last_layer_idx = null;
+        } else if (std.mem.eql(u8, &chunk.tag, &TAG_LAYER_TEXT)) {
+            // LNAM と対称: 直前が有効な raster LAYR（LNAM 経由でも良い。last_layer_idx は
+            // LNAM で null 化されないため）だった場合のみ適用する（TASK-79.5）。
+            // 破損入力（16B未満・非有限/非正 font_px・不正 UTF-8/制御文字を含む text）は
+            // 無視し、kind=raster のまま既定 text_params を維持する。
+            if (cur) |c| if (last_layer_idx) |li| blk: {
+                if (li >= c.layers.items.len) break :blk;
+                const p = chunk.payload;
+                if (p.len < text_header_size) break :blk;
+                const px_bits = std.mem.readInt(u32, p[0..4], .little);
+                const font_px: f32 = @bitCast(px_bits);
+                if (!std.math.isFinite(font_px) or font_px <= 0) break :blk;
+                const color = std.mem.readInt(u32, p[4..8], .little);
+                const tx = std.mem.readInt(i32, p[8..12], .little);
+                const ty = std.mem.readInt(i32, p[12..16], .little);
+                const text_bytes = p[text_header_size..];
+                if (!canvas_mod.isValidLayerName(text_bytes)) break :blk;
+                var params = canvas_mod.TextParams{ .font_px = font_px, .color = color, .x = tx, .y = ty };
+                params.setText(text_bytes);
+                c.layers.items[li].kind = .text;
+                c.layers.items[li].text_params = params;
+            };
+            // last_layer_idx は維持する（LTXT は現状 sidecar chain の最後だが、LNAM と同じ
+            // 「消費後にリセットしない」規約で対称にしておく。将来 chunk が増えても連鎖できる）。
         } else {
             // 未知 tag は無視（serde iterator は全 chunk を返すが match しないものは skip）。
             // pending の LNAM 適用先も無効化する（未知 chunk を挟んだ誤適用を防ぐ）。
@@ -332,6 +399,18 @@ fn layerChunk(gpa: std.mem.Allocator, w: u32, h: u32, ltype: u8, compression: u8
     return buf;
 }
 
+/// LTXT chunk payload を組む（TASK-79.5 テスト用）。
+fn textChunk(gpa: std.mem.Allocator, font_px: f32, color: u32, x: i32, y: i32, text: []const u8) ![]u8 {
+    const buf = try gpa.alloc(u8, text_header_size + text.len);
+    const px_bits: u32 = @bitCast(font_px);
+    std.mem.writeInt(u32, buf[0..4], px_bits, .little);
+    std.mem.writeInt(u32, buf[4..8], color, .little);
+    std.mem.writeInt(i32, buf[8..12], x, .little);
+    std.mem.writeInt(i32, buf[12..16], y, .little);
+    @memcpy(buf[text_header_size..], text);
+    return buf;
+}
+
 fn docChunk(w: u32, h: u32, frame_count: u32, selected: u32) [doc_header_size]u8 {
     var d: [doc_header_size]u8 = undefined;
     std.mem.writeInt(u32, d[0..4], w, .little);
@@ -467,6 +546,167 @@ test "LNAM 誤適用の安全弁: LAYR と LNAM の間に他 chunk を挟むと 
     defer loaded.deinit();
     const lc = loaded.activeCanvas();
     try testing.expectEqualStrings("Layer 1", lc.layers.items[0].name()); // 直後でない LNAM は無視
+}
+
+// ── LTXT（テキストレイヤーメタ。TASK-79.5）の互換性 ─────────────────
+
+test "round-trip: LAYR→LNAM→LTXT の順で text kind/text_params が bit 復元される" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 8, 4);
+    defer doc.deinit();
+    const c = doc.activeCanvas();
+
+    var params = canvas_mod.TextParams{ .font_px = 24.5, .color = 0xFFAABBCC, .x = 3, .y = -2 };
+    params.setText("Hi あ");
+    const idx = try c.addTextLayer(gpa, params);
+    _ = c.setLayerName(idx, "Label");
+
+    const bytes = try encodeDocument(&doc, gpa);
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    const lc = loaded.activeCanvas();
+    try testing.expectEqual(canvas_mod.LayerKind.text, lc.layers.items[idx].kind);
+    try testing.expect(lc.layers.items[idx].text_params.eql(params));
+    try testing.expectEqualStrings("Label", lc.layers.items[idx].name());
+    try testing.expectEqualSlices(u32, c.layers.items[idx].pixels, lc.layers.items[idx].pixels);
+}
+
+test "後方互換: LTXT が無いファイルは既定 raster のまま読める（LNAM のみの既存ファイル相当）" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(2, 2, 1, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const frm = frameChunk(0);
+    try w.addChunk(TAG_FRAME, &frm);
+    const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0xFF010203);
+    defer gpa.free(raster);
+    try w.addChunk(TAG_LAYER, raster);
+    try w.addChunk(TAG_LAYER_NAME, "Sketch"); // LTXT を書かない（旧形式相当）
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    const lc = loaded.activeCanvas();
+    try testing.expectEqual(canvas_mod.LayerKind.raster, lc.layers.items[0].kind);
+    try testing.expectEqualStrings("Sketch", lc.layers.items[0].name());
+}
+
+test "LTXT 破損は無視される（16B未満・非有限font_px・不正UTF-8のいずれも raster のまま）" {
+    const gpa = testing.allocator;
+
+    // 16B 未満（ヘッダ不完全）
+    {
+        var w = try serde.Writer.init(gpa, magic, schema_version);
+        defer w.deinit();
+        const doch = docChunk(2, 2, 1, 0);
+        try w.addChunk(TAG_DOC, &doch);
+        const frm = frameChunk(0);
+        try w.addChunk(TAG_FRAME, &frm);
+        const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0);
+        defer gpa.free(raster);
+        try w.addChunk(TAG_LAYER, raster);
+        try w.addChunk(TAG_LAYER_NAME, "L");
+        try w.addChunk(TAG_LAYER_TEXT, "short"); // 5B < 16B
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        var loaded = try decodeDocument(bytes, gpa);
+        defer loaded.deinit();
+        try testing.expectEqual(canvas_mod.LayerKind.raster, loaded.activeCanvas().layers.items[0].kind);
+    }
+    // 非有限 font_px（NaN）
+    {
+        var w = try serde.Writer.init(gpa, magic, schema_version);
+        defer w.deinit();
+        const doch = docChunk(2, 2, 1, 0);
+        try w.addChunk(TAG_DOC, &doch);
+        const frm = frameChunk(0);
+        try w.addChunk(TAG_FRAME, &frm);
+        const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0);
+        defer gpa.free(raster);
+        try w.addChunk(TAG_LAYER, raster);
+        const t = try textChunk(gpa, std.math.nan(f32), 0xFFFFFFFF, 0, 0, "X");
+        defer gpa.free(t);
+        try w.addChunk(TAG_LAYER_TEXT, t);
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        var loaded = try decodeDocument(bytes, gpa);
+        defer loaded.deinit();
+        try testing.expectEqual(canvas_mod.LayerKind.raster, loaded.activeCanvas().layers.items[0].kind);
+    }
+    // 不正 UTF-8 な text 部分
+    {
+        var w = try serde.Writer.init(gpa, magic, schema_version);
+        defer w.deinit();
+        const doch = docChunk(2, 2, 1, 0);
+        try w.addChunk(TAG_DOC, &doch);
+        const frm = frameChunk(0);
+        try w.addChunk(TAG_FRAME, &frm);
+        const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0);
+        defer gpa.free(raster);
+        try w.addChunk(TAG_LAYER, raster);
+        const t = try textChunk(gpa, 16, 0xFFFFFFFF, 0, 0, "\xFF\xFE");
+        defer gpa.free(t);
+        try w.addChunk(TAG_LAYER_TEXT, t);
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        var loaded = try decodeDocument(bytes, gpa);
+        defer loaded.deinit();
+        try testing.expectEqual(canvas_mod.LayerKind.raster, loaded.activeCanvas().layers.items[0].kind);
+    }
+}
+
+test "LNAM/LTXT chain の頑健性: 重複 LNAM は後勝ち、不正 LTXT の後の正常 LTXT は適用される" {
+    const gpa = testing.allocator;
+
+    // LAYR → LNAM → LNAM（重複。後勝ちで安全にクラッシュしない）
+    {
+        var w = try serde.Writer.init(gpa, magic, schema_version);
+        defer w.deinit();
+        const doch = docChunk(2, 2, 1, 0);
+        try w.addChunk(TAG_DOC, &doch);
+        const frm = frameChunk(0);
+        try w.addChunk(TAG_FRAME, &frm);
+        const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0);
+        defer gpa.free(raster);
+        try w.addChunk(TAG_LAYER, raster);
+        try w.addChunk(TAG_LAYER_NAME, "First");
+        try w.addChunk(TAG_LAYER_NAME, "Second");
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        var loaded = try decodeDocument(bytes, gpa);
+        defer loaded.deinit();
+        try testing.expectEqualStrings("Second", loaded.activeCanvas().layers.items[0].name());
+    }
+    // LAYR → LNAM → LTXT(不正:16B未満) → LTXT(正常) → 正常な方が適用される
+    // （last_layer_idx を LNAM/不正LTXTのいずれの後もリセットしない設計の直接確認）。
+    {
+        var w = try serde.Writer.init(gpa, magic, schema_version);
+        defer w.deinit();
+        const doch = docChunk(2, 2, 1, 0);
+        try w.addChunk(TAG_DOC, &doch);
+        const frm = frameChunk(0);
+        try w.addChunk(TAG_FRAME, &frm);
+        const raster = try layerChunk(gpa, 2, 2, layer_type_raster, compression_raw, 0);
+        defer gpa.free(raster);
+        try w.addChunk(TAG_LAYER, raster);
+        try w.addChunk(TAG_LAYER_NAME, "L");
+        try w.addChunk(TAG_LAYER_TEXT, "bad"); // 不正（短すぎ）→ 無視されるが last_layer_idx は維持
+        const good = try textChunk(gpa, 20, 0xFFFFFFFF, 1, 1, "OK");
+        defer gpa.free(good);
+        try w.addChunk(TAG_LAYER_TEXT, good);
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        var loaded = try decodeDocument(bytes, gpa);
+        defer loaded.deinit();
+        const lc = loaded.activeCanvas();
+        try testing.expectEqual(canvas_mod.LayerKind.text, lc.layers.items[0].kind);
+        try testing.expectEqualStrings("OK", lc.layers.items[0].text_params.text());
+        try testing.expectEqualStrings("L", lc.layers.items[0].name());
+    }
 }
 
 test "構造違反: 各エラーを返す" {
