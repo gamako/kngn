@@ -14,6 +14,7 @@ pub const charstring = @import("charstring.zig");
 pub const cff = @import("cff.zig");
 pub const outline_font = @import("outline_font.zig");
 pub const bmfont = @import("bmfont.zig");
+pub const sbix = @import("sbix.zig");
 
 // pixel/geom プリミティブ（gui が再エクスポートする正準定義）
 pub const Rect = geom.Rect;
@@ -41,6 +42,9 @@ pub const FontFace = outline_font.FontFace;
 pub const OutlineFont = outline_font.OutlineFont;
 pub const BMFont = bmfont.BMFont;
 
+// sbix(埋め込みカラービットマップ)テーブルパーサ（TASK-26.2。統合は TASK-26.3）
+pub const Sbix = sbix.Sbix;
+
 test {
     _ = geom;
     _ = color;
@@ -55,4 +59,5 @@ test {
     _ = cff;
     _ = outline_font;
     _ = bmfont;
+    _ = sbix;
 }
