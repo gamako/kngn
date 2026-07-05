@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
     });
     paint.addImport("png", png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
     paint.addImport("pixelops", pixelops); // blend.zig が委譲 (TASK-51)
+    paint.addImport("font", font); // text_render.zig が委譲 (TASK-79.4/79.5。standalone build 配線漏れの修正。TASK-82)
 
     // kit（ADR-007 R4）の caller 供給分。pixie ソースは platform/gui/png を @import("kit") 経由で使う。
     // dsp/synth は pixie からは未参照（lazy 解析でコンパイルされない）が、kit/kit.zig と 1:1 で配線する。

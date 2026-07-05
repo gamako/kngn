@@ -17,6 +17,7 @@ const platform = kit.platform;
 const gui = kit.gui;
 const core = @import("paint");
 const png = kit.png;
+const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
 const canvas_input = @import("canvas_input.zig");
 const actions = @import("actions.zig");
 const blit = @import("blit.zig");
@@ -43,6 +44,61 @@ comptime {
     if (core.text_content_max != text_content_input.max_len) {
         @compileError("text_content_max mismatch between paint.Canvas and text_content_input");
     }
+}
+
+// ── system font ランタイム読込（TASK-82）───────────────────────────
+//
+// テキストレイヤーの日本語(CJK)表示のため、TASK-79.4 が同梱した embedded フォント
+// （Press Start 2P。ASCII のみ）に代えて OS の system font を優先的に使う。方式は
+// `examples/12_outline_font`/`examples/21_char_input` と同一（日本語 `.ttc` を優先候補にし、
+// ASCII フォントへフォールバック。再配布ではないのでライセンス問題なし）。
+// この候補パス配列・読込ロジックは examples 側と重複するが、pixie は kit-only 消費者（apps は
+// libs 非直 import、ADR-007 R5）で examples は独立ビルドツリーのため、共有モジュール化すると
+// 新規の共通 helper lib が要りスコープ超過になる。将来 libs/font 側に格上げする際に統合を検討する。
+const system_font_paths = [_][]const u8{
+    // macOS: 日本語 .ttc（ASCII も含むので 1 本で混在描画可）→ ASCII フォールバック
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+    "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
+    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+    "/Library/Fonts/Arial.ttf",
+    // Windows: 日本語 → ASCII
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/consola.ttf",
+    // Linux（Ubuntu / nix）: 日本語(CJK) → ASCII
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+};
+
+/// 候補パスを順に読み `fontmod.FontFace.init` で parse 検証し、最初に成功したものの
+/// bytes（所有権は呼び出し側へ移譲）を返す。**FontFace 自体は保持しない**（検証のみ。
+/// `text_render.rasterizeTextLayer` は毎回 fresh に `FontFace.init(bytes)` するため
+/// 十分軽く、Canvas に借用参照として渡す bytes だけキャッシュすれば良い。TASK-82）。
+/// 全候補が失敗（FileNotFound 含む）した場合は `null`（呼び出し側は embedded ASCII フォントへ
+/// フォールバックする）。initialization 時のみ呼ばれる（ホットパス外）。
+fn loadSystemFontBytes(io: std.Io, gpa: std.mem.Allocator) ?[]u8 {
+    for (system_font_paths) |path| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| {
+            if (err != error.FileNotFound) std.debug.print("system font read {s}: {s}\n", .{ path, @errorName(err) });
+            continue;
+        };
+        const face = fontmod.FontFace.init(bytes) catch |err| {
+            std.debug.print("system font parse {s}: {s}\n", .{ path, @errorName(err) });
+            gpa.free(bytes);
+            continue;
+        };
+        _ = face; // 検証のみ（保持しない）
+        std.debug.print("system font: loaded {s} ({d} bytes)\n", .{ path, bytes.len });
+        return bytes;
+    }
+    return null;
 }
 
 const WINDOW_W: u32 = 780;
@@ -187,6 +243,12 @@ const App = struct {
     doc: core.Document,
     /// アクティブフレームの Canvas（doc.activeCanvas()）。既存参照の churn 最小化のため *Canvas を保持。
     canvas: *core.Canvas = undefined,
+    /// system font（TASK-82）バイト列への **borrowed** view。実体の所有・解放は `main()` の
+    /// ローカル変数側（起動時に一度だけ `loadSystemFontBytes` で読み込み、`main()` の defer で
+    /// 解放する。App はこのフィールドで参照するだけで free しない）。`applySystemFont()` が
+    /// `doc.frames` の各 Canvas へこの値を伝播する。見つからない/parse 失敗環境では `null`
+    /// のままで、`text_render` 側が embedded ASCII フォントへフォールバックする。
+    system_font_bytes: ?[]const u8 = null,
     recorder: core.StrokeRecorder,
     /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
     preview_canvas: core.Canvas,
@@ -284,6 +346,17 @@ const App = struct {
     fn selectedLayerIsText(self: *const App) bool {
         return self.canvas.selected_layer < self.canvas.layers.items.len and
             self.canvas.layers.items[self.canvas.selected_layer].kind == .text;
+    }
+
+    /// `system_font_bytes`（TASK-82）を `doc` の全 frame Canvas へ反映する。新しい Canvas
+    /// インスタンス（`core.Document.init`/`document_io.loadDocument` が返す）は
+    /// `Canvas.system_font` が既定 `null` で始まるため、Document を新規作成/差し替えた直後は
+    /// 必ず呼ぶ必要がある（`main()` 起動時 + `doOpenProject`）。`preview_canvas` は
+    /// `addTextLayer`/`setLayerTextParams` を一切呼ばないため対象外。イベント時/初期化時のみ
+    /// （フレーム毎には呼ばない。frame 数は現状 MVP=1 だが将来のアニメ拡張にも耐える設計として
+    /// 全 frame を回す）。
+    fn applySystemFont(self: *App) void {
+        for (self.doc.frames.items) |f| f.system_font = self.system_font_bytes;
     }
 
     /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
@@ -613,6 +686,7 @@ const App = struct {
         self.doc = new_doc;
         self.doc.selected_frame = 0;
         self.canvas = self.doc.activeCanvas();
+        self.applySystemFont(); // 新 Document の Canvas は system_font=null で始まるため再設定（TASK-82）
         // ドキュメント差し替え = undo/redo 履歴破棄・選択/フロート破棄（doOpen と同型。AC#4）
         self.undo.deinit(self.gpa);
         self.undo = .{};
@@ -2104,6 +2178,14 @@ pub fn main(init: std.process.Init) !void {
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
 
+    // system font（TASK-82）の読込は App 構築より前に行い、直後に defer で解放する。
+    // struct literal 内には複数の fallible 初期化（`try core.Document.init` 等）が続くため、
+    // 解放をこの位置に置くことで「後続フィールドの初期化失敗時も含め、どの終了経路でも
+    // 必ず一度だけ解放される」を保証する（App 側の cleanup defer には重複して置かない＝
+    // 二重解放防止）。
+    const system_font_bytes = loadSystemFontBytes(init.io, gpa);
+    defer if (system_font_bytes) |b| gpa.free(b);
+
     var app: App = .{
         .io = init.io,
         .gpa = gpa,
@@ -2115,8 +2197,10 @@ pub fn main(init: std.process.Init) !void {
         .pen = .{ .color = 0 },
         .brush = .{ .color = 0 },
         .fill = .{ .color = 0 },
+        .system_font_bytes = system_font_bytes,
     };
     app.canvas = app.doc.activeCanvas(); // doc の frame 0 canvas を指す（ポインタ安定）
+    app.applySystemFont(); // 初期 doc の frame Canvas へ system font を反映（TASK-82）
     app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
     app.brush.color = app.palette.current();
     app.fill.color = app.palette.current();

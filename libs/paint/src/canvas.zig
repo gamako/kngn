@@ -35,13 +35,22 @@ pub const text_content_max: usize = 96;
 
 /// テキストレイヤーのパラメータ（文字列/フォントサイズ/色/位置）。固定長 POD
 /// （`Layer.name_buf` と同じ ownership churn 回避方針。可変長 owned([]u8) にしない）。
-/// **不変条件（TASK-79.5 の要）**: `kind==.text` の Layer の `pixels` は常に
-/// 「この TextParams を `text_render.rasterizeTextLayer` で再ラスタライズした結果と bit 一致する」
+/// **不変条件（TASK-79.5 の要。TASK-82 で「現在の font 設定」の限定が追加）**: `kind==.text` の
+/// Layer の `pixels` は、`addTextLayer`/`setLayerTextParams` を経由した**直後**は常に
+/// 「この TextParams を、その時点の `Canvas.system_font`（TASK-82）込みで
+/// `text_render.rasterizeTextLayer` により再ラスタライズした結果と bit 一致する」
 /// （Undo の `layer_text_params`/`layer_rasterize` が pixels を保持せず再ラスタライズで復元する
 /// 設計の前提。この不変条件は pixie（apps/editor/apps/pixie/main.zig）側の
 /// `App.selectedLayerIsText()` ガードが「text レイヤーへの直接 raster 編集」を全経路で禁止する
 /// ことで維持される。Canvas 自体はこの禁止を強制しない＝既存 `editingBlocked()` と同じ
 /// 「App が振る舞いを決め、Canvas は素直に従う」役割分担）。
+/// **例外（TASK-82 で明確化）**: `document_io.decodeDocument`（.pix load）は保存済み raw pixels を
+/// そのまま復元するだけで再ラスタライズしない（load を font 可用性に依存させない意図的設計）。
+/// そのため load 直後の text layer の pixels は「保存時点の font 設定でのラスタライズ結果」を
+/// 正としており、「現在の `Canvas.system_font` から再生成した結果と一致する」ことは要求しない
+/// （system font が保存時と異なる/存在しない環境で開いても表示は保存時のまま安定する利点の
+/// トレードオフ）。次に `setLayerTextParams` を経由すれば現在の font 設定で再生成され、
+/// 通常の不変条件が回復する。
 pub const TextParams = struct {
     text_buf: [text_content_max]u8 = undefined,
     text_len: u8 = 0,
@@ -142,6 +151,14 @@ pub const Canvas = struct {
     /// 巻き戻さない単調増加（Photoshop 等と同型）。.pix には永続化しない（UI の便宜のみ・
     /// 一意性は保証しない）。初期レイヤーが "Layer 1" を名乗るため既定値は 2。
     next_layer_num: u32 = 2,
+    /// system font（TrueType/OpenType の `.ttf`/`.ttc`）バイト列への **borrowed** 参照
+    /// （TASK-82）。Canvas は所有・解放しない＝呼び出し側（pixie の App。実ディスク読込は
+    /// App 起動時に1回のみ）がライフタイムを保証する。`addTextLayer`/`setLayerTextParams` が
+    /// `text_render.rasterizeTextLayer` へそのまま渡す。既定 `null` は「未設定」を表し、
+    /// `text_render` 側が embedded ASCII フォント（Press Start 2P）へフォールバックする
+    /// （既存の全 Canvas テストはこの既定のまま無改造で動く）。日本語(CJK)テキストレイヤーの
+    /// 表示には CJK グリフを含む system font の設定が必要。
+    system_font: ?[]const u8 = null,
 
     pub const CacheState = enum { dirty, white_bg, straight };
 
@@ -290,6 +307,7 @@ pub const Canvas = struct {
             layer.text_params.color,
             layer.text_params.x,
             layer.text_params.y,
+            self.system_font,
         );
         const idx = self.layers.items.len;
         try self.insertLayer(gpa, idx, layer);
@@ -315,6 +333,7 @@ pub const Canvas = struct {
             layer.text_params.color,
             layer.text_params.x,
             layer.text_params.y,
+            self.system_font,
         );
         self.markDirty();
     }
