@@ -129,6 +129,7 @@ pub fn createPlatformModule(
         // (b) exe への lib リンク伝播 を行う。xdg-shell-client-protocol.h は wayland-scanner 生成物
         // なので、生成 header の dir を include path に追加する。
         mod.linkSystemLibrary("wayland-client", .{});
+        mod.linkSystemLibrary("wayland-cursor", .{}); // TASK-75.3: system cursor（wl_cursor_theme / @cInclude <wayland-cursor.h>）
         mod.linkSystemLibrary("xkbcommon", .{});
         mod.addIncludePath(generateXdgShellClientHeaderDir(b));
         mod.addIncludePath(generateXdgDecorationClientHeaderDir(b)); // TASK-28.5.6: SSD/CSD 装飾
@@ -251,6 +252,7 @@ pub fn setupExecutableForPlatform(
             // symbol 解決を確実にする（module からの伝播に依存しない）。
             exe.root_module.link_libc = true;
             exe.root_module.linkSystemLibrary("wayland-client", .{});
+            exe.root_module.linkSystemLibrary("wayland-cursor", .{}); // TASK-75.3: system cursor
             exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
             exe.root_module.addCSourceFile(.{ .file = generateXdgDecorationPrivateCode(b) }); // TASK-28.5.6
         },

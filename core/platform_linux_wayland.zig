@@ -29,6 +29,7 @@ const build_options = @import("build_options");
 
 const c = @cImport({
     @cInclude("wayland-client.h");
+    @cInclude("wayland-cursor.h"); // TASK-75.3: system cursor（wl_cursor_theme / set_cursor 用 buffer）
     @cInclude("xkbcommon/xkbcommon.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("xdg-decoration-unstable-v1-client-protocol.h"); // TASK-28.5.6: SSD 要求 / CSD fallback
@@ -194,6 +195,14 @@ const State = struct {
     pointer_x: i32 = 0,
     pointer_y: i32 = 0,
     repeat: wlinput.RepeatState = .{},
+
+    // system cursor（TASK-75.3）: theme/surface は遅延構築。content focus 中の enter serial を保持し、
+    // setCursor / ptrEnter(content) の両方から wl_pointer.set_cursor を発行する。HiDPI は M1 非対応（scale=1）。
+    cursor_theme: ?*c.struct_wl_cursor_theme = null,
+    cursor_surface: ?*c.struct_wl_surface = null,
+    cursor_shape: types.CursorShape = .default,
+    pointer_enter_serial: u32 = 0,
+    have_pointer_enter: bool = false, // content surface に pointer が入っているか（set_cursor 可否）
     // wl_pointer.frame 内の axis 蓄積。discrete(notch) を優先し、無ければ continuous を fallback。
     scroll_disc: wlinput.ScrollAccumulator = .{},
     scroll_cont: wlinput.ScrollAccumulator = .{},
@@ -455,6 +464,11 @@ fn releasePointer(st: *State) void {
         st.pointer = null;
     }
     st.buttons = .{};
+    // TASK-75.3: capability 喪失経路（leave を伴わない）でも stale な enter serial で
+    // set_cursor しないよう focus/serial を落とす。再取得後は次の enter まで no-op。
+    st.have_pointer_enter = false;
+    st.pointer_enter_serial = 0;
+    st.ptr_focus = .content;
 }
 
 // ---- wl_keyboard ----
@@ -609,7 +623,6 @@ fn resolveFocus(st: *State, surface: ?*c.struct_wl_surface) PtrFocus {
 
 fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface: ?*c.struct_wl_surface, sx: c.wl_fixed_t, sy: c.wl_fixed_t) callconv(.c) void {
     _ = ptr;
-    _ = serial;
     const st: *State = @ptrCast(@alignCast(data.?));
     const lx = wlinput.fixedToI32(sx);
     const ly = wlinput.fixedToI32(sy);
@@ -619,8 +632,14 @@ fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface:
         .content => {
             st.pointer_x = lx;
             st.pointer_y = ly;
+            // TASK-75.3: content に入った瞬間の serial を保持し、現在の cursor_shape を適用する
+            // （compositor は enter ごとに client の set_cursor を要求する）。
+            st.pointer_enter_serial = serial;
+            st.have_pointer_enter = true;
+            applyCursor(st);
         },
         .deco => |part| {
+            st.have_pointer_enter = false; // 装飾上は content カーソルを出さない
             st.deco_local_x = lx;
             st.deco_local_y = ly;
             // 装飾へ移った瞬間、content 側で蓄積途中の scroll を持ち越さない（plan）。
@@ -628,7 +647,7 @@ fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface:
             st.scroll_cont = .{};
             if (part == .title) updateHover(st, lx, ly);
         },
-        .other => {},
+        .other => st.have_pointer_enter = false,
     }
 }
 
@@ -646,6 +665,8 @@ fn ptrLeave(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface:
         },
         else => {},
     }
+    // leave 後は次の enter まで set_cursor の serial が無効（TASK-75.3）。
+    st.have_pointer_enter = false;
     st.ptr_focus = .content;
 }
 
@@ -1251,13 +1272,77 @@ pub const Window = struct {
         st.locked_index = null;
     }
 
-    /// カーソル形状の設定（TASK-75.1）。現状 no-op スタブ（compile 維持のみ）。
-    /// 実装は TASK-75.3（Linux X11/Wayland system cursor）で行う（wl_pointer.set_cursor 等）。
+    /// カーソル形状の設定（TASK-75.3）。shape を保持し、pointer が content 上にあれば即適用する。
+    /// 呼び出し頻度: イベント時のみ（性能規約 対象外）。theme/surface 取得失敗は best-effort no-op。
     pub fn setCursor(self: Window, shape: types.CursorShape) void {
-        _ = self;
-        _ = shape;
+        const st = self.state;
+        st.cursor_shape = shape;
+        applyCursor(st); // content 外（have_pointer_enter=false）なら no-op、次の enter で反映
     }
 };
+
+// ---- system cursor（TASK-75.3）----
+// wl_cursor_theme / cursor_surface は遅延構築。default/crosshair は default theme の名前付きカーソル、
+// hidden は set_cursor(surface=null)。HiDPI(output scale) は M1 非対応（scale=1・size=24 固定）。
+
+/// 現在の cursor_shape を pointer へ適用する（content focus 中のみ発行）。失敗は no-op。
+fn applyCursor(st: *State) void {
+    if (!st.have_pointer_enter) return;
+    const ptr = st.pointer orelse return;
+    if (st.cursor_shape == .hidden) {
+        // 透明カーソル: surface=null を渡す。
+        c.wl_pointer_set_cursor(ptr, st.pointer_enter_serial, null, 0, 0);
+        _ = c.wl_display_flush(st.display);
+        return;
+    }
+    const surf = ensureCursorSurface(st) orelse return;
+    const image = loadCursorImage(st, st.cursor_shape) orelse return;
+    const buffer = c.wl_cursor_image_get_buffer(image);
+    if (buffer == null) return;
+    // 先に set_cursor で surface へ cursor role を与えてから buffer を attach/commit する
+    // （canonical な cursor 更新順。初回適用/hotspot 変更の反映が compositor 依存になりにくい）。
+    c.wl_pointer_set_cursor(ptr, st.pointer_enter_serial, surf, @intCast(image.hotspot_x), @intCast(image.hotspot_y));
+    c.wl_surface_attach(surf, buffer, 0, 0);
+    c.wl_surface_damage(surf, 0, 0, @intCast(image.width), @intCast(image.height));
+    c.wl_surface_commit(surf);
+    _ = c.wl_display_flush(st.display);
+}
+
+/// カーソル画像を載せる wl_surface を遅延生成。
+fn ensureCursorSurface(st: *State) ?*c.struct_wl_surface {
+    if (st.cursor_surface) |s| return s;
+    const comp = st.compositor orelse return null;
+    const s = c.wl_compositor_create_surface(comp); // [*c] を返すため == null で判定
+    if (s == null) return null;
+    st.cursor_surface = s;
+    return s;
+}
+
+/// default cursor theme を遅延ロード（shm 必須）。
+fn ensureCursorTheme(st: *State) ?*c.struct_wl_cursor_theme {
+    if (st.cursor_theme) |t| return t;
+    const shm = st.shm orelse return null;
+    const t = c.wl_cursor_theme_load(null, 24, shm); // name=null → 既定テーマ、size=24
+    if (t == null) return null;
+    st.cursor_theme = t;
+    return t;
+}
+
+/// shape に対応する cursor image（1 フレーム目）を返す。theme に該当名が無ければ null。
+fn loadCursorImage(st: *State, shape: types.CursorShape) ?*c.struct_wl_cursor_image {
+    const theme = ensureCursorTheme(st) orelse return null;
+    const name: [*c]const u8 = switch (shape) {
+        .default => "left_ptr",
+        .crosshair => "crosshair",
+        .hidden => return null, // hidden は surface=null 経路（ここには来ない）
+    };
+    const cursor = c.wl_cursor_theme_get_cursor(theme, name);
+    if (cursor == null) return null;
+    if (cursor.*.image_count == 0) return null;
+    const img = cursor.*.images[0];
+    if (img == null) return null;
+    return img;
+}
 
 /// Locked framebuffer view（公開 contract は canonical BGRA `[]u32`、u32 0xAARRGGBB）。
 /// pixels は shm buffer を直接指す（present で変換コピーされない）。
@@ -1451,6 +1536,12 @@ fn teardown(st: *State) void {
     st.xkb_state = null;
     st.xkb_keymap = null;
     st.xkb_context = null;
+    // system cursor（TASK-75.3）: cursor_surface は compositor より前、theme の buffer は shm 由来なので
+    // shm より前に破棄する（この teardown 順序は下の compositor/shm 破棄より上）。
+    if (st.cursor_surface) |s| c.wl_surface_destroy(s);
+    if (st.cursor_theme) |t| c.wl_cursor_theme_destroy(t);
+    st.cursor_surface = null;
+    st.cursor_theme = null;
     // 装飾（TASK-28.5.6）: 子オブジェクト優先破棄。decoration object は xdg_toplevel より前に destroy。
     if (st.deco_obj) |d| c.zxdg_toplevel_decoration_v1_destroy(d);
     st.deco_obj = null;

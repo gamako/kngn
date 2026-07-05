@@ -32,6 +32,7 @@ const c = @cImport({
     @cInclude("X11/Xlib.h");
     @cInclude("X11/Xutil.h");
     @cInclude("X11/XKBlib.h"); // XkbSetDetectableAutoRepeat
+    @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair（system cursor。TASK-75.3）
     @cInclude("X11/extensions/XShm.h");
     @cInclude("sys/ipc.h");
     @cInclude("sys/shm.h");
@@ -153,6 +154,10 @@ const State = struct {
     keys: input.KeyDownSet, // keycode 押下集合（is_repeat / 修飾 post-state 判定）
     detectable_repeat: bool, // g_detectable_repeat のコピー
 
+    // system cursor（TASK-75.3）: CursorShape(default/crosshair/hidden) 別に遅延生成した
+    // X11 Cursor をキャッシュ（0=None=未生成）。destroy で XFreeCursor する。
+    cursors: [3]c.Cursor = .{ 0, 0, 0 },
+
     fn enqueue(self: *State, ev: Event) void {
         self.queue.enqueue(ev);
     }
@@ -256,6 +261,10 @@ pub const Window = struct {
         const dpy = st.display;
 
         teardownBlit(st);
+        // system cursor（TASK-75.3）: キャッシュ済み Cursor を解放。
+        for (st.cursors) |cur| {
+            if (cur != 0) _ = c.XFreeCursor(dpy, cur);
+        }
         _ = c.XDestroyWindow(dpy, st.window);
         // fallback の backing は別 alloc。direct の backing は image data の別名なので teardownBlit が解放済み。
         if (!st.direct) alloc.free(st.backing);
@@ -339,13 +348,40 @@ pub const Window = struct {
         _ = c.XFlush(dpy);
     }
 
-    /// カーソル形状の設定（TASK-75.1）。現状 no-op スタブ（compile 維持のみ）。
-    /// 実装は TASK-75.3（Linux X11/Wayland system cursor）で行う（XDefineCursor 等）。
+    /// カーソル形状の設定（TASK-75.3）。CursorShape 別に Cursor を遅延生成・キャッシュし XDefineCursor で反映。
+    /// 呼び出し頻度: ツール切替・キー入力等のイベント時のみ（性能規約の対象外）。
+    /// 生成失敗は best-effort no-op（描画・実行を壊さない）。
     pub fn setCursor(self: Window, shape: types.CursorShape) void {
-        _ = self;
-        _ = shape;
+        const st = self.state;
+        const idx: usize = @intCast(@intFromEnum(shape));
+        if (idx >= st.cursors.len) return; // non-exhaustive な値は無視
+        if (st.cursors[idx] == 0) st.cursors[idx] = createCursor(st, shape);
+        const cur = st.cursors[idx];
+        if (cur == 0) return; // 作成失敗
+        _ = c.XDefineCursor(st.display, st.window, cur);
+        _ = c.XFlush(st.display);
     }
 };
+
+/// CursorShape → X11 Cursor を生成する（失敗時は 0=None）。default/crosshair は標準カーソルフォント、
+/// hidden は透明 1x1 pixmap カーソル。
+fn createCursor(st: *State, shape: types.CursorShape) c.Cursor {
+    return switch (shape) {
+        .default => c.XCreateFontCursor(st.display, c.XC_left_ptr),
+        .crosshair => c.XCreateFontCursor(st.display, c.XC_crosshair),
+        .hidden => createHiddenCursor(st),
+    };
+}
+
+/// 透明カーソル: 全ビット 0 の 1x1 bitmap を source/mask に使い XCreatePixmapCursor で作る。
+fn createHiddenCursor(st: *State) c.Cursor {
+    var data = [_]u8{0};
+    const bmp = c.XCreateBitmapFromData(st.display, st.window, &data, 1, 1);
+    if (bmp == 0) return 0;
+    defer _ = c.XFreePixmap(st.display, bmp);
+    var col = std.mem.zeroes(c.XColor);
+    return c.XCreatePixmapCursor(st.display, bmp, bmp, &col, &col, 0, 0);
+}
 
 /// Locked framebuffer view（公開 contract は canonical BGRA `[]u32`、u32 0xAARRGGBB）。
 /// direct モードでは pixels が XImage/shm バッファを直接指す（present で変換コピーされない）。
