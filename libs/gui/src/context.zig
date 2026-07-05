@@ -32,6 +32,8 @@ const style_mod = @import("style.zig");
 // widgets.zig とは相互 import（widgets は *Context を取る。Zig の import 循環は合法）。
 // Context 構造体内の decl alias で `ctx.button(...)` メソッド構文を提供する。
 const widgets = @import("widgets.zig");
+// popup.zig も同じ相互 import パターン（TASK-79.1）。
+const popup_mod = @import("popup.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -46,6 +48,10 @@ pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 pub const BoxConfig = layout.BoxConfig;
 pub const Style = style_mod.Style;
+// ポップアップ/コンテキストメニュー（TASK-79.1）。実装・doc comment は popup.zig。
+pub const PopupState = popup_mod.PopupState;
+pub const PopupItem = popup_mod.PopupItem;
+pub const PopupResult = popup_mod.PopupResult;
 
 /// rect キャッシュのエントリ。clip は祖先の clip_children を intersect 済みの有効クリップで、
 /// buttonBehavior(ctx, id, rect, clip) にそのまま渡せる（21.5 の widget hit-test 用）。
@@ -91,6 +97,10 @@ pub const Context = struct {
     scroll_stack: std.ArrayList(ScrollState) = .empty,
     /// widget 共通スタイル（TASK-21.5）。caller が直接書き換えてよい（push/pop なし）。
     style: Style,
+    /// ポップアップ/コンテキストメニューの開閉状態（TASK-79.1）。MVP は同時に1つのみ。
+    /// null = 閉じている。非 null 時は buttonBehavior が背後 widget の hover/active 取得を
+    /// 抑止する（モーダル吸収。詳細は buttonBehavior の doc comment / popup.zig 参照）。
+    popup_state: ?PopupState = null,
 
     // ── widget 層（TASK-21.5）。実装は widgets.zig（メソッド構文用の alias） ──
     pub const button = widgets.button;
@@ -123,6 +133,12 @@ pub const Context = struct {
     // 縦横スクロール領域（TASK-46）
     pub const beginScrollArea = widgets.beginScrollArea;
     pub const endScrollArea = widgets.endScrollArea;
+    // ポップアップ/コンテキストメニュー（TASK-79.1）。実装・契約は popup.zig 参照。
+    pub const openPopup = popup_mod.openPopup;
+    pub const closePopup = popup_mod.closePopup;
+    pub const hasOpenPopup = popup_mod.hasOpenPopup;
+    pub const isPopupOpen = popup_mod.isPopupOpen;
+    pub const popupMenu = popup_mod.popupMenu;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{
@@ -200,8 +216,12 @@ pub const Context = struct {
         self.input.pushEvent(ev);
     }
 
+    /// popup 表示中（TASK-79.1）は背後 widget の buttonBehavior が hover を一切立てなくなり
+    /// this_frame_hovered_any も false のままになるため、popup_state を明示的に OR する
+    /// （「モーダル吸収中は wantsMouse()==true 相当」という契約を保つ。app 側の canvas 等
+    /// 入力ゲートはこれを使って背後入力を抑止できる）。
     pub fn wantsMouse(self: *const Context) bool {
-        return self.state.active_id != 0 or self.state.this_frame_hovered_any;
+        return self.state.active_id != 0 or self.state.this_frame_hovered_any or self.popup_state != null;
     }
 
     pub fn wantsKeyboard(self: *const Context) bool {
@@ -341,6 +361,14 @@ pub const ButtonResult = struct {
 /// rect / clip は呼び出し側が渡す（21.2 は layout を持たないため）。
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
     std.debug.assert(ctx.frame_active);
+    // モーダル吸収（TASK-79.1）: popup 表示中は背後 widget の hover/hot/active 取得を
+    // 一切行わない。popup.openPopup() が展開時に active_id/hot_id/next_hot_id を必ず 0 に
+    // リセットする不変条件があるため、「既に active な widget だけ例外的に通す」特例は
+    // 不要（このガード自体が新規 acquire を防ぐので、popup 表示中に active_id が非 0 に
+    // なることは構造的に起こらない）。popup 自体は buttonBehavior を経由しない手動
+    // hit-test（popup.zig の hitTestItem）で描画するため、このガードの影響を受けない。
+    if (ctx.popup_state != null) return .{};
+
     const mp = ctx.input.mouse_pos;
     const hovered_now = rect.contains(mp) and clip.contains(mp);
     var result: ButtonResult = .{};

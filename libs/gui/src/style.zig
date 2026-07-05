@@ -50,6 +50,10 @@ pub const Style = struct {
     switch_w: i32 = 28,
     switch_h: i32 = 16,
     radio_size: i32 = 16,
+    // ポップアップ/コンテキストメニュー（TASK-79.1）。色は既存 bg/bg_hover/border/text/
+    // text_subtle を再利用する（新規色フィールドは追加しない）。
+    popup_item_h: i32 = 20,
+    popup_padding: i32 = 4,
 };
 
 /// 既存 example（09/10）系統のダークテーマ。text は白（21.4 までの label 既定色と同じ）。

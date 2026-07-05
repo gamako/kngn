@@ -71,6 +71,18 @@ pub const SplitterOpts = @import("widgets.zig").SplitterOpts;
 pub const splitter = @import("widgets.zig").splitter;
 pub const ScrollAreaOpts = @import("widgets.zig").ScrollAreaOpts;
 
+// ポップアップ/コンテキストメニュー（TASK-79.1）。任意座標にメニューを表示し、
+// 項目クリックで選択を返す汎用 primitive。使い方は popup.zig の doc comment 参照。
+// Context メソッド（ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /
+// ctx.popupMenu）として呼ぶのが通常の使い方（widget と同型）。
+pub const PopupState = @import("popup.zig").PopupState;
+pub const PopupItem = @import("popup.zig").PopupItem;
+pub const PopupResult = @import("popup.zig").PopupResult;
+pub const PopupGeometry = @import("popup.zig").PopupGeometry;
+pub const layoutPopup = @import("popup.zig").layoutPopup;
+pub const itemRect = @import("popup.zig").itemRect;
+pub const hitTestItem = @import("popup.zig").hitTestItem;
+
 // test-gui 用に各ファイルの test を収集する。
 // `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
 // namespace 全体を `_ = @import(...)` で参照して test ブロックを取り込む。
@@ -87,4 +99,5 @@ test {
     _ = @import("layout.zig");
     _ = @import("style.zig");
     _ = @import("widgets.zig");
+    _ = @import("popup.zig");
 }
