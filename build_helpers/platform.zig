@@ -306,6 +306,9 @@ pub const StandaloneSpec = struct {
     platform_root: std.Build.LazyPath,
     /// src/keyboard.zig（不要なら null）。platform に依存するため backend ごとに作る。
     keyboard_source: ?std.Build.LazyPath = null,
+    /// src/gamepad.zig（不要なら null。TASK-80.1）。keyboard_source と対称だが platform_types のみに
+    /// 依存する（platform facade は不要）。
+    gamepad_source: ?std.Build.LazyPath = null,
     /// OS/backend 非依存の追加 import（sprite / png / gui / core 等）。
     extra: []const Import = &.{},
     /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
@@ -320,7 +323,8 @@ pub const StandaloneSpec = struct {
     /// apps（pixie 等）の standalone ビルドに必須（apps のソースは `@import("kit")` を使うため）。
     /// examples は kit を使わないので null のまま。
     /// **png は spec.png_module と同一インスタンスを渡すこと**（file-in-two-modules 回避）。
-    /// platform / control(harness) / types / audio は buildStandalone が内部で配線する。
+    /// platform / control(harness) / types / audio / gamepad は buildStandalone が内部で配線する
+    /// （gamepad は TASK-80.1。platform_types のみに依存するため caller から受け取る必要が無い）。
     kit_libs: ?KitLibs = null,
 };
 
@@ -466,12 +470,26 @@ pub fn buildStandalone(
             kit_mod.addImport("font", kl.font);
             kit_mod.addImport("dsp", kl.dsp);
             kit_mod.addImport("synth", kl.synth);
+            // gamepad（TASK-80.1）: kit.zig が無条件 import するため、caller の KitLibs には含めず
+            // ここで自前に1つ作って types_mod だけを配線する（platform_types のみに依存する headless
+            // lib のため kl から受け取る必要が無い）。既存の唯一の kit_libs 消費者
+            // （apps/editor/build.zig の pixie standalone）を無改造のまま壊さないための対応。
+            const kit_gamepad_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/src/gamepad.zig", .{kit_root}) },
+            });
+            kit_gamepad_mod.addImport("platform_types", types_mod);
+            kit_mod.addImport("gamepad", kit_gamepad_mod);
             root.addImport("kit", kit_mod);
         }
         if (spec.keyboard_source) |ks| {
             const kb = b.createModule(.{ .root_source_file = ks });
             kb.addImport("platform", platform_mod);
             root.addImport("keyboard", kb);
+        }
+        if (spec.gamepad_source) |gs| {
+            const gp = b.createModule(.{ .root_source_file = gs });
+            gp.addImport("platform_types", types_mod);
+            root.addImport("gamepad", gp);
         }
         for (spec.extra) |imp| root.addImport(imp.name, imp.module);
 

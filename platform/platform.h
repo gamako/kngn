@@ -143,6 +143,8 @@ typedef enum {
     PLATFORM_EVENT_MOUSE_UP,
     PLATFORM_EVENT_MOUSE_SCROLL,
     PLATFORM_EVENT_CHAR_INPUT,   // 確定テキスト文字 (TASK-22。末尾追加=後方互換)
+    PLATFORM_EVENT_GAMEPAD_CONNECTED,    // ゲームパッド接続 (TASK-80.1。実消費は TASK-80.2。末尾追加=後方互換)
+    PLATFORM_EVENT_GAMEPAD_DISCONNECTED, // ゲームパッド切断
 } PlatformEventType;
 
 // マウスボタン (物理ボタン基準: NSEvent.buttonNumber と一致)
@@ -318,6 +320,11 @@ typedef struct PlatformEvent {
             uint32_t codepoint;           // 確定文字の Unicode スカラー値 (UTF-32)。TASK-22
             uint32_t modifiers;
         } character;
+        struct {
+            int32_t index;                // PLATFORM_MAX_GAMEPADS 範囲の pad index
+            char name[33];                 // NUL 終端デバイス名 (32 bytes + NUL。32超は切り詰め)。
+                                            // CONNECTED のみ有効、DISCONNECTED は空文字。TASK-80.1
+        } gamepad;
     } payload;
 } PlatformEvent;
 
@@ -336,6 +343,52 @@ typedef struct PlatformEventStats {
 
 // イベントキューのカウンタ snapshot を取得
 void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
+
+// ========================================
+// ゲームパッド入力 (TASK-80.1。ADR-009。実消費は TASK-80.2)
+// ========================================
+//
+// 設計の正は core/platform_types.zig 側の GamepadButton/GamepadButtons/GamepadState と
+// docs/adr/009_ゲームパッド入力.md。button の bit 位置は下記 enum の宣言順（a=bit0 … guide=bit14）と
+// Zig 側 GamepadButtons のフィールド順を一致させる。トリガーは axis のみで公開する（ボタンとしては
+// 公開しない）。stick/trigger は raw 値（deadzone 未適用）。
+//
+// 本タスク（80.1）はこの型・プロトタイプの宣言のみを確定する。呼び出しコードは存在しないため、
+// macOS の .m/.swift 実装ファイルへの変更は不要（未使用の extern 宣言は link 要求を発生させない）。
+
+// PlatformGamepadState.buttons_mask の bit-mask 版
+typedef enum {
+    PLATFORM_GAMEPAD_BUTTON_A = 0x0001,
+    PLATFORM_GAMEPAD_BUTTON_B = 0x0002,
+    PLATFORM_GAMEPAD_BUTTON_X = 0x0004,
+    PLATFORM_GAMEPAD_BUTTON_Y = 0x0008,
+    PLATFORM_GAMEPAD_BUTTON_LEFT_SHOULDER = 0x0010,
+    PLATFORM_GAMEPAD_BUTTON_RIGHT_SHOULDER = 0x0020,
+    PLATFORM_GAMEPAD_BUTTON_BACK = 0x0040,
+    PLATFORM_GAMEPAD_BUTTON_START = 0x0080,
+    PLATFORM_GAMEPAD_BUTTON_LEFT_STICK = 0x0100,   // スティック押し込み（クリック）
+    PLATFORM_GAMEPAD_BUTTON_RIGHT_STICK = 0x0200,
+    PLATFORM_GAMEPAD_BUTTON_DPAD_UP = 0x0400,
+    PLATFORM_GAMEPAD_BUTTON_DPAD_DOWN = 0x0800,
+    PLATFORM_GAMEPAD_BUTTON_DPAD_LEFT = 0x1000,
+    PLATFORM_GAMEPAD_BUTTON_DPAD_RIGHT = 0x2000,
+    PLATFORM_GAMEPAD_BUTTON_GUIDE = 0x4000,        // Xbox ボタン相当（ホームボタン）
+} PlatformGamepadButtonFlags;
+
+// 同時サポートするゲームパッド数
+#define PLATFORM_MAX_GAMEPADS 4
+
+// ゲームパッドの正規化済みポーリング状態
+typedef struct PlatformGamepadState {
+    uint32_t buttons_mask;              // PlatformGamepadButtonFlags の bit-or
+    float left_stick_x, left_stick_y;   // -1.0..1.0（raw値。deadzone 未適用）
+    float right_stick_x, right_stick_y; // -1.0..1.0
+    float left_trigger, right_trigger;  // 0.0..1.0（raw値。トリガーは axis のみで公開）
+} PlatformGamepadState;
+
+// 指定 index のゲームパッド状態を取得する（ポーリング。実装は TASK-80.2）。
+// 戻り値: 接続されていれば true（out_state 書込み済み）、未接続/index範囲外は false。
+bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamepadState* out_state);
 
 // ========================================
 // ファイル選択ダイアログ (TASK-24)

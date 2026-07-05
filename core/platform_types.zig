@@ -250,6 +250,8 @@ pub const Event = union(enum) {
     mouse_down: MouseEvent,
     mouse_up: MouseEvent,
     mouse_scroll: ScrollEvent,
+    gamepad_connected: GamepadInfo, // ゲームパッド接続（TASK-80.1。ADR-009）
+    gamepad_disconnected: GamepadDisconnect, // ゲームパッド切断
 };
 
 /// イベントキューの観測カウンタ (累積値の snapshot)
@@ -257,6 +259,170 @@ pub const EventStats = struct {
     mouse_move_merge_count: u64,
     mouse_scroll_merge_count: u64,
     event_drop_count: u64,
+};
+
+// ============================================================================
+// ゲームパッド (TASK-80.1。ADR-009)
+// ============================================================================
+//
+// 設計の正は docs/adr/009_ゲームパッド入力.md。ポーリング主軸（Window.getGamepadState）+
+// 接続イベント（Event.gamepad_connected/disconnected）。標準レイアウトへ正規化済みの値のみを
+// 公開し（native raw レポートは backend 内部に閉じる）、トリガーは axis のみ（ボタンとしては
+// 公開しない）。deadzone は未適用の raw 値（stick -1..1 / trigger 0..1）を返し、適用は
+// `src/gamepad.zig` の `applyDeadzone()` へ委ねる。
+//
+// 呼び出し頻度: `GamepadState` はフレーム毎にポーリングされる想定だが、4台×少数フィールドの
+// 固定長 copy（alloc/lock 無し）で全画素ループでも RT でもないため性能規約
+// （SIMD 3点セット・cache_line 分離等）の適用対象外（ADR-009「ホットパス宣言」節）。
+
+/// 同時サポートするゲームパッド数（`Window.getGamepadState`/harness の `gamepad_states` 配列長の
+/// 単一ソース）。
+pub const MAX_GAMEPADS: u8 = 4;
+
+/// 標準レイアウトのボタン（15 種。exhaustive enum。ADR-009 決定）。
+/// 固定レイアウトのため拡張は「末尾に値を追加」で足りる。non-exhaustive にすると
+/// isSet/set/getButtonName/harness parser 全箇所に未知値分岐が要るため見送った。
+pub const GamepadButton = enum(u8) {
+    a,
+    b,
+    x,
+    y,
+    left_shoulder,
+    right_shoulder,
+    back,
+    start,
+    left_stick, // スティック押し込み（クリック）
+    right_stick,
+    dpad_up,
+    dpad_down,
+    dpad_left,
+    dpad_right,
+    guide, // Xbox ボタン相当（ホームボタン）
+};
+
+// ============================================================================
+// GamepadButtons (packed struct, LSB-first で C の PlatformGamepadButtonFlags と一致)
+// ============================================================================
+
+pub const GamepadButtons = packed struct(u32) {
+    a: bool = false,
+    b: bool = false,
+    x: bool = false,
+    y: bool = false,
+    left_shoulder: bool = false,
+    right_shoulder: bool = false,
+    back: bool = false,
+    start: bool = false,
+    left_stick: bool = false,
+    right_stick: bool = false,
+    dpad_up: bool = false,
+    dpad_down: bool = false,
+    dpad_left: bool = false,
+    dpad_right: bool = false,
+    guide: bool = false,
+    _reserved: u17 = 0,
+
+    pub inline fn fromC(raw: u32) GamepadButtons {
+        return @bitCast(raw);
+    }
+
+    pub inline fn toC(self: GamepadButtons) u32 {
+        return @bitCast(self);
+    }
+
+    pub fn isSet(self: GamepadButtons, btn: GamepadButton) bool {
+        return switch (btn) {
+            .a => self.a,
+            .b => self.b,
+            .x => self.x,
+            .y => self.y,
+            .left_shoulder => self.left_shoulder,
+            .right_shoulder => self.right_shoulder,
+            .back => self.back,
+            .start => self.start,
+            .left_stick => self.left_stick,
+            .right_stick => self.right_stick,
+            .dpad_up => self.dpad_up,
+            .dpad_down => self.dpad_down,
+            .dpad_left => self.dpad_left,
+            .dpad_right => self.dpad_right,
+            .guide => self.guide,
+        };
+    }
+
+    pub fn set(self: *GamepadButtons, btn: GamepadButton, value: bool) void {
+        switch (btn) {
+            .a => self.a = value,
+            .b => self.b = value,
+            .x => self.x = value,
+            .y => self.y = value,
+            .left_shoulder => self.left_shoulder = value,
+            .right_shoulder => self.right_shoulder = value,
+            .back => self.back = value,
+            .start => self.start = value,
+            .left_stick => self.left_stick = value,
+            .right_stick => self.right_stick = value,
+            .dpad_up => self.dpad_up = value,
+            .dpad_down => self.dpad_down = value,
+            .dpad_left => self.dpad_left = value,
+            .dpad_right => self.dpad_right = value,
+            .guide => self.guide = value,
+        }
+    }
+};
+
+comptime {
+    // C 側 PlatformGamepadButtonFlags の bit 位置（a=bit0 … guide=bit14）と一致することを保証
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .a = true })) == 0x0001);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .b = true })) == 0x0002);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .x = true })) == 0x0004);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .y = true })) == 0x0008);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .left_shoulder = true })) == 0x0010);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .right_shoulder = true })) == 0x0020);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .back = true })) == 0x0040);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .start = true })) == 0x0080);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .left_stick = true })) == 0x0100);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .right_stick = true })) == 0x0200);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .dpad_up = true })) == 0x0400);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .dpad_down = true })) == 0x0800);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .dpad_left = true })) == 0x1000);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .dpad_right = true })) == 0x2000);
+    std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .guide = true })) == 0x4000);
+}
+
+/// アナログスティック（raw値。-1.0..1.0。deadzone 未適用。ADR-009）。
+pub const Stick = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+};
+
+/// ゲームパッドの正規化済みポーリング状態（`Window.getGamepadState` の戻り値）。
+pub const GamepadState = struct {
+    buttons: GamepadButtons = .{},
+    left_stick: Stick = .{},
+    right_stick: Stick = .{},
+    left_trigger: f32 = 0, // raw値。0.0..1.0
+    right_trigger: f32 = 0, // raw値。0.0..1.0
+};
+
+/// `GamepadInfo.name` の最大バイト数（UTF-8 バイト列。NUL 不要 = name_len で管理）。
+pub const GAMEPAD_NAME_MAX: usize = 32;
+
+/// ゲームパッド接続イベントのペイロード。`name` は `name_len` バイトのみ有効
+/// （固定長 buffer + 使用長。allocator 不要で Event union に値として載せられる）。
+pub const GamepadInfo = struct {
+    index: u8,
+    name_len: u8 = 0,
+    name_buf: [GAMEPAD_NAME_MAX]u8 = [_]u8{0} ** GAMEPAD_NAME_MAX,
+
+    pub fn name(self: *const GamepadInfo) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+/// ゲームパッド切断イベントのペイロード。
+pub const GamepadDisconnect = struct {
+    index: u8,
 };
 
 // ============================================================================
@@ -304,4 +470,41 @@ test "ModifierFlags round trip via @bitCast" {
     try std.testing.expect(!back.ctrl);
     try std.testing.expect(!back.alt);
     try std.testing.expect(back.cmd);
+}
+
+test "GamepadButtons: isSet/set は全15ボタンで独立に効き、他ビットを汚さない" {
+    var b = GamepadButtons{};
+    inline for (@typeInfo(GamepadButton).@"enum".fields) |f| {
+        const btn: GamepadButton = @enumFromInt(f.value);
+        try std.testing.expect(!b.isSet(btn));
+    }
+    b.set(.a, true);
+    b.set(.start, true);
+    try std.testing.expect(b.isSet(.a));
+    try std.testing.expect(b.isSet(.start));
+    try std.testing.expect(!b.isSet(.b));
+    try std.testing.expect(!b.isSet(.guide));
+    b.set(.a, false);
+    try std.testing.expect(!b.isSet(.a));
+    try std.testing.expect(b.isSet(.start)); // 他ビットは無変更
+}
+
+test "GamepadButtons round trip via @bitCast (toC/fromC)" {
+    var b = GamepadButtons{};
+    b.set(.a, true);
+    b.set(.guide, true);
+    const raw = b.toC();
+    try std.testing.expectEqual(@as(u32, 0x0001 | 0x4000), raw);
+    const back = GamepadButtons.fromC(raw);
+    try std.testing.expect(back.isSet(.a));
+    try std.testing.expect(back.isSet(.guide));
+    try std.testing.expect(!back.isSet(.b));
+}
+
+test "GamepadInfo.name: name_len が指す範囲だけを返す" {
+    var info = GamepadInfo{ .index = 0 };
+    const src = "Pad";
+    @memcpy(info.name_buf[0..src.len], src);
+    info.name_len = src.len;
+    try std.testing.expectEqualStrings("Pad", info.name());
 }

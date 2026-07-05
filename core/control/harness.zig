@@ -42,6 +42,12 @@ const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
 const ModifierFlags = types.ModifierFlags;
 const EventStats = types.EventStats;
+const GamepadButton = types.GamepadButton;
+const GamepadState = types.GamepadState;
+const GamepadInfo = types.GamepadInfo;
+const GamepadDisconnect = types.GamepadDisconnect;
+const GAMEPAD_NAME_MAX = types.GAMEPAD_NAME_MAX;
+const MAX_GAMEPADS = types.MAX_GAMEPADS;
 
 const net = std.Io.net;
 
@@ -94,6 +100,10 @@ var inject_read: usize = 0;
 var mouse_x: i32 = 0;
 var mouse_y: i32 = 0;
 var mouse_buttons: MouseButtons = .{};
+
+// ゲームパッド状態（TASK-80.1。ADR-009）。inject gamepad_connect/disconnect/button/axis で更新し、
+// facade の Window.getGamepadState / 組み込み probe `gamepad` が読む。null = 未接続。
+var gamepad_states: [MAX_GAMEPADS]?GamepadState = [_]?GamepadState{null} ** MAX_GAMEPADS;
 
 // lockFramebuffer で記録する現在のフレームバッファ view（present/unlock まで有効）
 var lock_pixels: []const u32 = &.{};
@@ -215,7 +225,7 @@ pub fn registerProbe(p: Probe) void {
 
 fn isReservedProbeName(name: []const u8) bool {
     return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or
-        std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture");
+        std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture") or std.mem.eql(u8, name, "gamepad");
 }
 
 /// JSON 文字列へ未エスケープで埋め込むと破損する文字（`"` / `\` / ASCII 制御文字 `0x00..0x1F`。
@@ -503,6 +513,13 @@ pub fn filterNativeEvent(ev: Event) ?Event {
     };
 }
 
+/// facade `Window.getGamepadState` の5つ目のチョークポイント（TASK-80.1）。index 範囲外は null。
+/// イベント時のみ更新される state を読むだけ（alloc/lock 無し。ホットパスではない。ADR-009 参照）。
+pub fn getGamepadState(index: u8) ?GamepadState {
+    if (index >= gamepad_states.len) return null;
+    return gamepad_states[index];
+}
+
 /// lockFramebuffer 成功時に現在の pixels/寸法を記録する（present で owned copy するため）。
 pub fn onLock(pixels: []const u32, w: u32, h: u32) void {
     lock_pixels = pixels;
@@ -756,9 +773,84 @@ fn handleInject(it: *Tok) void {
         const cp = parseCodepoint(arg) orelse return warnLine("inject char: codepoint/文字 不正");
         const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
         queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
+    } else if (std.mem.eql(u8, kind, "gamepad_connect")) {
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_connect: index 不正");
+        const raw_name = std.mem.trim(u8, it.rest(), " \t"); // 残り全体を name として使う（TASK-22 char と同系統）
+        var info = GamepadInfo{ .index = idx };
+        const n = @min(raw_name.len, GAMEPAD_NAME_MAX);
+        @memcpy(info.name_buf[0..n], raw_name[0..n]);
+        info.name_len = @intCast(n);
+        gamepad_states[idx] = .{}; // 既定 state（全ボタン off / stick 0 / trigger 0）
+        queue(Event{ .gamepad_connected = info });
+    } else if (std.mem.eql(u8, kind, "gamepad_disconnect")) {
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_disconnect: index 不正");
+        gamepad_states[idx] = null;
+        queue(Event{ .gamepad_disconnected = .{ .index = idx } });
+    } else if (std.mem.eql(u8, kind, "gamepad_button")) {
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_button: index 不正");
+        const btn = parseGamepadButton(it.next()) orelse return warnLine("inject gamepad_button: 不明なボタン");
+        const v = parseUsize(it.next()) orelse return warnLine("inject gamepad_button: 値不正（0|1）");
+        if (v != 0 and v != 1) return warnLine("inject gamepad_button: 値は0か1");
+        if (gamepad_states[idx] == null) return warnLine("inject gamepad_button: pad 未接続");
+        gamepad_states[idx].?.buttons.set(btn, v == 1);
+    } else if (std.mem.eql(u8, kind, "gamepad_axis")) {
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_axis: index 不正");
+        const axis = it.next() orelse return warnLine("inject gamepad_axis: axis 不足");
+        const v = parseF32(it.next()) orelse return warnLine("inject gamepad_axis: 値不正");
+        if (gamepad_states[idx] == null) return warnLine("inject gamepad_axis: pad 未接続");
+        if (!setGamepadAxis(&gamepad_states[idx].?, axis, v)) return warnLine("inject gamepad_axis: 不明な axis または値域外");
     } else {
         warnLine("inject: 不明な種別");
     }
+}
+
+/// gamepad index トークンを parse する（0..MAX_GAMEPADS-1 のみ有効）。
+fn parseGamepadIndex(tok: ?[]const u8) ?u8 {
+    const v = parseUsize(tok) orelse return null;
+    if (v >= MAX_GAMEPADS) return null;
+    return @intCast(v);
+}
+
+/// gamepad button 名トークンを parse する（大小無視。GamepadButton の宣言名と一致）。
+fn parseGamepadButton(tok: ?[]const u8) ?GamepadButton {
+    const name = tok orelse return null;
+    var buf: [24]u8 = undefined;
+    if (name.len == 0 or name.len > buf.len) return null;
+    for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return std.meta.stringToEnum(GamepadButton, buf[0..name.len]);
+}
+
+/// `inject gamepad_axis` の axis 名 + 値を state へ反映する。
+/// 値域は raw 値契約を守るため reject（clamp しない）: stick(left_x/left_y/right_x/right_y) は
+/// [-1,1]、trigger(left_trigger/right_trigger) は [0,1]。不明 axis 名 or 値域外は false（state 不変）。
+/// NaN/inf は `v < lo or v > hi` の比較が両方 false になり素通りしてしまうため、先頭で明示的に
+/// reject する（codex レビューで発見。fail-fast の抜け穴を塞ぐ）。
+fn setGamepadAxis(state: *GamepadState, axis: []const u8, v: f32) bool {
+    if (!std.math.isFinite(v)) return false;
+    var buf: [16]u8 = undefined;
+    if (axis.len == 0 or axis.len > buf.len) return false;
+    for (axis, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const name = buf[0..axis.len];
+    if (std.mem.eql(u8, name, "left_x")) {
+        if (v < -1 or v > 1) return false;
+        state.left_stick.x = v;
+    } else if (std.mem.eql(u8, name, "left_y")) {
+        if (v < -1 or v > 1) return false;
+        state.left_stick.y = v;
+    } else if (std.mem.eql(u8, name, "right_x")) {
+        if (v < -1 or v > 1) return false;
+        state.right_stick.x = v;
+    } else if (std.mem.eql(u8, name, "right_y")) {
+        if (v < -1 or v > 1) return false;
+        state.right_stick.y = v;
+    } else if (std.mem.eql(u8, name, "left_trigger")) {
+        if (v < 0 or v > 1) return false;
+        state.left_trigger = v;
+    } else if (std.mem.eql(u8, name, "right_trigger")) {
+        if (v < 0 or v > 1) return false;
+        state.right_trigger = v;
+    } else return false;
+    return true;
 }
 
 /// `inject char` の引数を UTF-32 codepoint へ。0x.. / U+.. は16進、それ以外は単一 UTF-8 文字として
@@ -847,6 +939,15 @@ fn handleSnapshot(it: *Tok) void {
         } else {
             warnLine("snapshot capture: video 未 open → skip");
         }
+    } else if (std.mem.eql(u8, probe, "gamepad")) {
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/gamepad_{d}.txt", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        var buf: [DIGEST_BUF_LEN]u8 = undefined;
+        const payload = formatGamepadPayload(&buf);
+        std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = payload }) catch |err| {
+            std.debug.print("[harness] snapshot gamepad 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            return;
+        };
+        emitSnapshot("gamepad", path, "txt");
     } else if (findProbe(probe)) |p| {
         snapshotCustom(p, path_arg, &path_buf);
     } else {
@@ -876,7 +977,7 @@ fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
 // capabilities probe（登録済み probe・action の内省列挙。TASK-62.4）
 //
 // ホットパス宣言: イベント/接続時のみ（digest/snapshot コマンド処理時に固定長 registry
-// （最大 probe 16 + action 16 + 組み込み 5 = 37 件）を1回走査するだけ。フレーム毎・毎サンプルでは
+// （最大 probe 16 + action 16 + 組み込み 6 = 38 件）を1回走査するだけ。フレーム毎・毎サンプルでは
 // 走らない）。RT 共有状態には触れない（main スレッドの固定長 registry 読みのみ）。
 //
 // 中身非解釈の不変条件: name/ext/desc と snapshot/digest の**有無**（callback が non-null か）を
@@ -902,6 +1003,7 @@ const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "stats", .ext = "json", .desc = "EventStats + 仮想fps JSON" },
     .{ .name = "capabilities", .ext = "json", .desc = "登録済み probe・action の内省列挙" },
     .{ .name = "capture", .ext = "png", .desc = "synthetic mic/camera capture: video PNG snapshot + video/audio state digest" },
+    .{ .name = "gamepad", .ext = "txt", .desc = "gamepad state: connected mask + per-pad buttons/sticks/triggers" },
 };
 
 /// `s` を `buf[len.*..limit)` に収まる場合のみ書き込む。収まらなければ何も書かず false を返す
@@ -935,7 +1037,7 @@ fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, des
     return appendRaw(buf, limit, len, entry);
 }
 
-/// 登録済み probe（組み込み5件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
+/// 登録済み probe（組み込み6件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
 /// **常に valid JSON を返す**契約（`buf.len >= MIN_CAPABILITIES_BUF_LEN` が前提）。容量超過や
 /// name/ext の不正文字でエントリを省略した場合は末尾に `"truncated":true` を付与する。
 fn formatCapabilitiesPayload(buf: []u8) []const u8 {
@@ -1037,6 +1139,8 @@ fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
         return .{ .ok = formatCapabilitiesPayload(&capabilities_buf) };
     } else if (std.mem.eql(u8, probe, "capture")) {
         return .{ .ok = formatCapturePayload(buf) };
+    } else if (std.mem.eql(u8, probe, "gamepad")) {
+        return .{ .ok = formatGamepadPayload(buf) };
     } else if (findProbe(probe)) |p| {
         const dg = p.digest orelse return .{ .unavailable = "digest unsupported" };
         return .{ .ok = dg(p.ctx, buf) };
@@ -1228,6 +1332,43 @@ fn formatCapturePayload(buf: []u8) []u8 {
     return std.fmt.bufPrint(buf, "video_open={d} video_w={d} video_h={d} video_frame={d} audio_open={d} audio_frames={d} audio_peak={d:.4}", .{
         v_open, v_w, v_h, frame_index, a_open, a_frames, a_peak,
     }) catch buf[0..0];
+}
+
+// ============================================================================
+// gamepad probe（組み込み。TASK-80.1。ADR-009）
+//
+// ホットパス宣言: digest/snapshot コマンド処理時のみ（イベント時のみ。フレーム毎ではない）。
+// ============================================================================
+
+/// `v` が数値上 0（`-0.0` 含む）なら正の `0.0` に正規化する。float format の `-0.0000` 表記ゆれを防ぎ
+/// `expect`/`digest` を安定させる（ADR-009「harness state モデル」節）。
+fn normalizeZero(v: f32) f32 {
+    return if (v == 0) 0 else v;
+}
+
+/// `connected=<bitmask> p<idx>_buttons=<hex8> p<idx>_lx=.. p<idx>_ly=.. p<idx>_rx=.. p<idx>_ry=.. p<idx>_lt=.. p<idx>_rt=..`
+/// （接続中の pad のみ列挙。top-level key=value を保つため pad ごとに `p<idx>_` prefix。float は固定4桁+
+/// 負ゼロ正規化）。
+fn formatGamepadPayload(buf: []u8) []u8 {
+    var len: usize = 0;
+    var mask: u32 = 0;
+    for (gamepad_states, 0..) |st, i| {
+        if (st != null) mask |= @as(u32, 1) << @intCast(i);
+    }
+    len += (std.fmt.bufPrint(buf[len..], "connected={d}", .{mask}) catch return buf[0..len]).len;
+    for (gamepad_states, 0..) |maybe_st, i| {
+        const st = maybe_st orelse continue;
+        len += (std.fmt.bufPrint(buf[len..], " p{d}_buttons={X:0>8} p{d}_lx={d:.4} p{d}_ly={d:.4} p{d}_rx={d:.4} p{d}_ry={d:.4} p{d}_lt={d:.4} p{d}_rt={d:.4}", .{
+            i, st.buttons.toC(),
+            i, normalizeZero(st.left_stick.x),
+            i, normalizeZero(st.left_stick.y),
+            i, normalizeZero(st.right_stick.x),
+            i, normalizeZero(st.right_stick.y),
+            i, normalizeZero(st.left_trigger),
+            i, normalizeZero(st.right_trigger),
+        }) catch return buf[0..len]).len;
+    }
+    return buf[0..len];
 }
 
 // ============================================================================
@@ -1730,6 +1871,7 @@ fn resetForTest() void {
     mouse_x = 0;
     mouse_y = 0;
     mouse_buttons = .{};
+    gamepad_states = [_]?GamepadState{null} ** MAX_GAMEPADS;
     lock_pixels = &.{};
     lock_w = 0;
     lock_h = 0;
@@ -2117,6 +2259,7 @@ test "custom probe: 同名は上書き / 予約名は拒否 / 満杯は skip" {
     registerProbe(.{ .name = "audio", .ctx = &c1, .digest = testProbeDigest });
     registerProbe(.{ .name = "stats", .ctx = &c1, .digest = testProbeDigest });
     registerProbe(.{ .name = "capture", .ctx = &c1, .digest = testProbeDigest }); // TASK-49.5 で追加した予約名
+    registerProbe(.{ .name = "gamepad", .ctx = &c1, .digest = testProbeDigest }); // TASK-80.1 で追加した予約名
     try testing.expectEqual(@as(usize, 1), probe_count);
 
     // 満杯（MAX_PROBES 到達）まで詰め、超過分は skip される（既存 "p" + 新規ユニーク名で埋める）
@@ -2499,7 +2642,7 @@ test "capabilities: 予約名で登録拒否" {
     try testing.expectEqual(@as(usize, 0), probe_count);
 }
 
-test "capabilities: custom probe/action 0件 → 組み込み5 probe + actions:[]" {
+test "capabilities: custom probe/action 0件 → 組み込み6 probe + actions:[]" {
     resetForTest();
     var buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
     _ = &buf; // 使わない（capabilities_buf を直接使う）
@@ -2510,8 +2653,8 @@ test "capabilities: custom probe/action 0件 → 組み込み5 probe + actions:[
     const root = parsed.value.object;
     try testing.expectEqual(@as(?std.json.Value, null), root.get("truncated"));
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 5), probes_arr.len);
-    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture" };
+    try testing.expectEqual(@as(usize, 6), probes_arr.len);
+    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture", "gamepad" };
     for (probes_arr, 0..) |entry, i| {
         try testing.expectEqualStrings(expected_names[i], entry.object.get("name").?.string);
         try testing.expect(entry.object.get("snapshot").?.bool);
@@ -2535,16 +2678,16 @@ test "capabilities: custom probe/action がフィールド値・登録順で現�
     defer parsed.deinit();
     const root = parsed.value.object;
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 7), probes_arr.len); // 組み込み5 + custom2
+    try testing.expectEqual(@as(usize, 8), probes_arr.len); // 組み込み6 + custom2
 
-    const p1 = probes_arr[5].object;
+    const p1 = probes_arr[6].object;
     try testing.expectEqualStrings("p1", p1.get("name").?.string);
     try testing.expectEqualStrings("png", p1.get("ext").?.string);
     try testing.expectEqualStrings("d1", p1.get("desc").?.string);
     try testing.expect(!p1.get("snapshot").?.bool);
     try testing.expect(p1.get("digest").?.bool);
 
-    const p2 = probes_arr[6].object;
+    const p2 = probes_arr[7].object;
     try testing.expectEqualStrings("p2", p2.get("name").?.string);
     try testing.expectEqualStrings("json", p2.get("ext").?.string);
     try testing.expectEqualStrings("", p2.get("desc").?.string);
@@ -2587,8 +2730,8 @@ test "capabilities: name の不正文字（\" / 制御文字）はエントリ�
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 6), probes_arr.len); // 組み込み5 + good1（bad は省略）
-    try testing.expectEqualStrings("good1", probes_arr[5].object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 7), probes_arr.len); // 組み込み6 + good1（bad は省略）
+    try testing.expectEqualStrings("good1", probes_arr[6].object.get("name").?.string);
 }
 
 test "capabilities: action 名の制御文字（NUL。isValidActionName は通過するが JSON では不正）はエントリ省略+truncated" {
@@ -2613,7 +2756,7 @@ test "capabilities: ext の不正文字（tab）もエントリを省略し trun
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
-    try testing.expectEqual(@as(usize, 5), root.get("probes").?.array.items.len); // 組み込み5のみ（p は省略）
+    try testing.expectEqual(@as(usize, 6), root.get("probes").?.array.items.len); // 組み込み6のみ（p は省略）
 }
 
 test "capabilities: MIN_CAPABILITIES_BUF_LEN ちょうどの buf でもフェイルセーフで valid JSON + truncated=true" {
@@ -2653,7 +2796,7 @@ test "capabilities: digestPayload 経由（digest capabilities）でも同じ JS
         .ok => |payload| {
             var parsed = try parseCapabilities(payload);
             defer parsed.deinit();
-            try testing.expectEqual(@as(usize, 5), parsed.value.object.get("probes").?.array.items.len);
+            try testing.expectEqual(@as(usize, 6), parsed.value.object.get("probes").?.array.items.len);
         },
         .unavailable => try testing.expect(false),
     }
@@ -2807,6 +2950,217 @@ test "capabilities: capture probe が組み込み一覧に含まれる" {
         }
     }
     try testing.expect(found);
+}
+
+test "capabilities: gamepad probe が組み込み一覧に含まれる" {
+    resetForTest();
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const probes_arr = parsed.value.object.get("probes").?.array.items;
+    var found = false;
+    for (probes_arr) |entry| {
+        if (std.mem.eql(u8, entry.object.get("name").?.string, "gamepad")) {
+            found = true;
+            try testing.expectEqualStrings("txt", entry.object.get("ext").?.string);
+            try testing.expect(entry.object.get("snapshot").?.bool);
+            try testing.expect(entry.object.get("digest").?.bool);
+        }
+    }
+    try testing.expect(found);
+}
+
+// ============================================================================
+// gamepad（TASK-80.1。ADR-009）tests
+// ============================================================================
+
+test "gamepad: 未接続時は getGamepadState が全 index で null" {
+    resetForTest();
+    var i: u8 = 0;
+    while (i < MAX_GAMEPADS) : (i += 1) {
+        try testing.expectEqual(@as(?GamepadState, null), getGamepadState(i));
+    }
+    try testing.expectEqual(@as(?GamepadState, null), getGamepadState(MAX_GAMEPADS)); // 範囲外
+}
+
+test "inject gamepad_connect/disconnect: state 更新 + Event 発火 + digest の connected ビット" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 0 TestPad
+        \\step 1
+        \\digest gamepad
+        \\inject gamepad_disconnect 0
+        \\step 1
+        \\digest gamepad
+        \\quit
+    ;
+
+    try testing.expect(pollGate(true));
+    var e = nextInjectedEvent().?;
+    try testing.expect(e == .gamepad_connected);
+    try testing.expectEqual(@as(u8, 0), e.gamepad_connected.index);
+    try testing.expectEqualStrings("TestPad", e.gamepad_connected.name());
+    try testing.expect(std.meta.eql(getGamepadState(0).?, GamepadState{})); // 既定 state（全0）
+
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    try testing.expectEqualStrings(
+        "connected=1 p0_buttons=00000000 p0_lx=0.0000 p0_ly=0.0000 p0_rx=0.0000 p0_ry=0.0000 p0_lt=0.0000 p0_rt=0.0000",
+        formatGamepadPayload(&buf),
+    );
+
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expect(e == .gamepad_disconnected);
+    try testing.expectEqual(@as(u8, 0), e.gamepad_disconnected.index);
+    try testing.expectEqual(@as(?GamepadState, null), getGamepadState(0));
+    try testing.expectEqualStrings("connected=0", formatGamepadPayload(&buf));
+
+    try testing.expect(!pollGate(true));
+}
+
+test "inject gamepad_button/gamepad_axis: 接続済み pad の state を更新する" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 0
+        \\inject gamepad_button 0 a 1
+        \\inject gamepad_button 0 start 1
+        \\inject gamepad_axis 0 left_x 0.5
+        \\inject gamepad_axis 0 left_y -0.25
+        \\inject gamepad_axis 0 right_trigger 1
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const st = getGamepadState(0).?;
+    try testing.expect(st.buttons.isSet(.a));
+    try testing.expect(st.buttons.isSet(.start));
+    try testing.expect(!st.buttons.isSet(.b));
+    try testing.expectApproxEqAbs(@as(f32, 0.5), st.left_stick.x, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -0.25), st.left_stick.y, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), st.right_trigger, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), st.right_stick.x, 1e-6);
+
+    // 別ボタンを off にしても他ボタンは無変更（bit 独立性）
+    cmd_buf = "inject gamepad_button 0 a 0\nstep 1\nquit";
+    cursor = 0;
+    try testing.expect(pollGate(true));
+    const st2 = getGamepadState(0).?;
+    try testing.expect(!st2.buttons.isSet(.a));
+    try testing.expect(st2.buttons.isSet(.start));
+}
+
+test "inject gamepad_button/gamepad_axis: 未接続 pad への操作は fail-fast（state 不変・注入なし）" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_button 0 a 1
+        \\inject gamepad_axis 0 left_x 0.5
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(?GamepadState, null), getGamepadState(0));
+}
+
+test "inject gamepad_button: 不明ボタン名・値不正（0/1以外）は拒否" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 0
+        \\inject gamepad_button 0 nosuch 1
+        \\inject gamepad_button 0 a 2
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const st = getGamepadState(0).?;
+    try testing.expect(!st.buttons.isSet(.a)); // どちらも拒否され state は既定のまま
+}
+
+test "inject gamepad_axis: 値域外（stick|trigger）は拒否（state 不変）" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 0
+        \\inject gamepad_axis 0 left_x 1.5
+        \\inject gamepad_axis 0 left_trigger -0.1
+        \\inject gamepad_axis 0 nosuch 0.5
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const st = getGamepadState(0).?;
+    try testing.expectEqual(@as(f32, 0), st.left_stick.x);
+    try testing.expectEqual(@as(f32, 0), st.left_trigger);
+}
+
+test "inject gamepad_axis: NaN/inf は素通りせず拒否（codex レビューで発見した抜け穴の回帰）" {
+    // `v < lo or v > hi` は NaN では両方 false になり素通りしうるため、明示 reject が必要。
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 0
+        \\inject gamepad_axis 0 left_x nan
+        \\inject gamepad_axis 0 left_y inf
+        \\inject gamepad_axis 0 left_trigger -inf
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const st = getGamepadState(0).?;
+    try testing.expectEqual(@as(f32, 0), st.left_stick.x);
+    try testing.expectEqual(@as(f32, 0), st.left_stick.y);
+    try testing.expectEqual(@as(f32, 0), st.left_trigger);
+}
+
+test "setGamepadAxis: NaN/inf は直接呼び出しでも false（state 不変）" {
+    var st = GamepadState{};
+    try testing.expect(!setGamepadAxis(&st, "left_x", std.math.nan(f32)));
+    try testing.expect(!setGamepadAxis(&st, "right_trigger", std.math.inf(f32)));
+    try testing.expectEqual(@as(f32, 0), st.left_stick.x);
+    try testing.expectEqual(@as(f32, 0), st.right_trigger);
+}
+
+test "inject gamepad_connect/gamepad_button/gamepad_disconnect: index 範囲外は拒否" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 99
+        \\inject gamepad_button 99 a 1
+        \\inject gamepad_disconnect 99
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    var i: u8 = 0;
+    while (i < MAX_GAMEPADS) : (i += 1) try testing.expectEqual(@as(?GamepadState, null), getGamepadState(i));
+}
+
+test "gamepad probe digest: 複数 pad 接続時は connected ビットマスクと p<idx>_ prefix が両立する" {
+    resetForTest();
+    cmd_buf =
+        \\inject gamepad_connect 0
+        \\inject gamepad_connect 2
+        \\inject gamepad_axis 2 right_y -1
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const payload = formatGamepadPayload(&buf);
+    try testing.expect(std.mem.startsWith(u8, payload, "connected=5 ")); // pad0(bit0)+pad2(bit2) = 0b101 = 5
+    try testing.expect(std.mem.indexOf(u8, payload, "p0_buttons=") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "p1_buttons=") == null); // pad1 は未接続
+    try testing.expect(std.mem.indexOf(u8, payload, "p2_ry=-1.0000") != null);
+}
+
+test "gamepad probe: digest コマンド経由（headless replay の self-check 経路）でも同じ payload が得られる" {
+    resetForTest(); // mode=.replay
+    cmd_buf = "inject gamepad_connect 0\nstep 1\nquit";
+    try testing.expect(pollGate(true)); // inject 消費 + step
+    try testing.expect(!pollGate(true)); // quit → 終了
+
+    // digest のルーティング自体は live framing で確認（既存 "custom probe: register + digest routing" と同型）。
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var it = std.mem.tokenizeAny(u8, "gamepad", " \t");
+    handleDigest(&it);
+    try testing.expect(std.mem.startsWith(u8, resp_buf.items, "gamepad connected=1 "));
 }
 
 test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイズ変更で再確保" {

@@ -1453,6 +1453,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .key_up => {},
                 .char_input => {},
+                .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 app 未消費（cross-cutting Event 追加）
                 .mouse_move => |m| {
                     app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                     onMouseMove(&app);

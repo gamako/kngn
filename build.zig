@@ -207,26 +207,27 @@ pub fn build(b: *std.Build) void {
         // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
         // 揃えること（inline for で型不一致を避けるため）。
         inline for (.{
-            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false },
-            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = true, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false },
-            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true },
-            .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false },
-            .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false },
-            .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false },
+            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false },
+            .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_22", .path = "examples/22_gamepad/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -237,6 +238,7 @@ pub fn build(b: *std.Build) void {
                 .needs_png = example.needs_png,
                 .needs_font = example.needs_font,
                 .needs_audio = example.needs_audio,
+                .needs_gamepad = example.needs_gamepad,
             };
             // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
@@ -1083,6 +1085,19 @@ pub fn build(b: *std.Build) void {
     const test_dsp_step = b.step("test-dsp", "Run src/dsp unit tests");
     test_dsp_step.dependOn(&run_dsp_test.step);
 
+    // src/gamepad.zig テスト（getButtonName/justPressed/justReleased/applyDeadzone。TASK-80.1）。
+    // platform_types のみに依存する headless lib（display/backend 不要）。
+    const gamepad_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/gamepad.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gamepad_test_mod.addImport("platform_types", shared_modules.types.mod);
+    const gamepad_test = b.addTest(.{ .root_module = gamepad_test_mod });
+    const run_gamepad_test = b.addRunArtifact(gamepad_test);
+    const test_gamepad_step = b.step("test-gamepad", "Run src/gamepad unit tests (ADR-009)");
+    test_gamepad_step.dependOn(&run_gamepad_test.step);
+
     // apps/synth スペクトログラム解析テスト (FFT 列ロジック)
     const spec_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/viz/src/spectrogram.zig"),
@@ -1125,6 +1140,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_patch_step);
     test_step.dependOn(test_macro_step);
     test_step.dependOn(test_dsp_step);
+    test_step.dependOn(test_gamepad_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
     test_step.dependOn(test_platform_input_step);
@@ -1310,6 +1326,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.font);
     link(kit, common.dsp);
     link(kit, common.synth);
+    link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
 
     return .{ .platform = platform_mod, .keyboard = keyboard_mod, .kit = kit };
 }
@@ -1372,6 +1389,7 @@ const SharedModules = struct {
     camera: TaggedModule, // カメラ L1 facade（TASK-49.1。audio と同格の core layer primitive）
     capture_synthetic: TaggedModule, // harness 内蔵 synthetic capture source（TASK-49.5。facade 配線は無い）
     objc_runtime: TaggedModule, // Objective-C ランタイム FFI（TASK-49.2。camera/audio 両方が link する共有 module。TASK-49.6 で named module 化）
+    gamepad: TaggedModule, // src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する headless lib。kit 収録）
 
     fn init(b: *std.Build) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
@@ -1415,6 +1433,15 @@ const SharedModules = struct {
             .root_source_file = b.path("core/platform_types.zig"),
         }) };
         link(platform_mod, types);
+
+        // src/gamepad.zig: ゲームパッド入力ヘルパー（TASK-80.1。ADR-009）。platform_types のみに
+        // 依存する headless lib（layer=.lib）。ADR-007 R2「libs が type-only core module を直接
+        // 参照してよい唯一の形」の初適用（`link()` の `.lib => dep.layer==.core and dep.type_only` 分岐）。
+        // keyboard 等の他 src/ ヘルパーと異なり kit にも収録するため TaggedModule 化する。
+        const gamepad: TaggedModule = .{ .layer = .lib, .name = "gamepad", .mod = b.createModule(.{
+            .root_source_file = b.path("src/gamepad.zig"),
+        }) };
+        link(gamepad, types);
 
         const sprite = b.createModule(.{
             .root_source_file = b.path("src/sprite.zig"),
@@ -1584,6 +1611,7 @@ const SharedModules = struct {
             .camera = camera,
             .capture_synthetic = capture_synthetic,
             .objc_runtime = objc_runtime,
+            .gamepad = gamepad,
         };
     }
 };
@@ -1597,6 +1625,7 @@ const ExampleNeeds = struct {
     needs_png: bool,
     needs_font: bool,
     needs_audio: bool,
+    needs_gamepad: bool, // TASK-80.1（examples/22_gamepad のみ true）
 };
 
 // ============================================================
@@ -1640,6 +1669,9 @@ fn addExampleExe(
         // L1 オーディオ出力の system ライブラリ（needs_audio の exe にのみ付与。OS 別）。
         linkAudioBackend(exe, target.result.os.tag);
     }
+    // gamepad は platform_types のみに依存する backend 非依存 lib（TASK-80.1）。common（SharedModules）から
+    // 直接 addImport する（kit を使わない examples の既存慣習に揃える）。
+    if (needs.needs_gamepad) exe.root_module.addImport("gamepad", common.gamepad.mod);
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。

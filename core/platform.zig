@@ -62,6 +62,13 @@ pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 pub const CursorShape = types.CursorShape;
+pub const MAX_GAMEPADS = types.MAX_GAMEPADS;
+pub const GamepadButton = types.GamepadButton;
+pub const GamepadButtons = types.GamepadButtons;
+pub const Stick = types.Stick;
+pub const GamepadState = types.GamepadState;
+pub const GamepadInfo = types.GamepadInfo;
+pub const GamepadDisconnect = types.GamepadDisconnect;
 
 /// Locked framebuffer view（facade 独自型。TASK-32.4 P4）。
 /// caller が使うのは `pixels/width/height/unlock()` のみなので backend 直の型と source 互換。
@@ -171,6 +178,20 @@ pub const Window = struct {
     pub fn setCursor(self: Window, shape: CursorShape) void {
         if (self.headless) return;
         self.inner.setCursor(shape);
+    }
+
+    /// 指定 index のゲームパッド状態を取得する（ポーリング主軸。ADR-009 / TASK-80.1）。
+    /// 全 backend は当面 `null` を返すスタブ（実装は TASK-80.2。backend ファイルは本タスクで無改造）。
+    /// harness 有効時（headless 含む）は facade の 5 つ目のチョークポイントとして
+    /// `harness.getGamepadState` へ委譲し、`inject gamepad_connect/button/axis` の注入 state を返す。
+    ///
+    /// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
+    /// （alloc/lock 無し）で全画素ループでも RT でもない。性能規約（SIMD 3点セット等）の
+    /// 適用対象外（docs/adr/009 参照）。
+    pub fn getGamepadState(self: Window, index: u8) ?GamepadState {
+        _ = self;
+        if (harness.isEnabled() or harness.isHeadlessActive()) return harness.getGamepadState(index);
+        return null; // 全 backend 未実装スタブ（TASK-80.2）
     }
 };
 

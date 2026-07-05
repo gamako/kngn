@@ -175,6 +175,7 @@ pub fn main() !void {
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
             .key_up => {},
             .char_input => {},
+            .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 example 未消費（cross-cutting Event 追加）
             .mouse_move => |m| {
                 const canvas = windowToCanvas(.{ .x = m.x, .y = m.y });
                 if (m.buttons.left) {
