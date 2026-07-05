@@ -65,6 +65,14 @@ pub fn parseFourUsize(args: []const u8) ParseError!FourUsize {
     return .{ .a = a, .b = b, .c = c, .d = d };
 }
 
+/// `save_graph`/`load_graph` 用: 前後の空白のみ trim し、内部の空白はそのまま保持する
+/// （path は空白を含みうる1本の文字列として扱う。pixie/synth/modular の `parsePath` と同型）。
+pub fn parsePath(args: []const u8) ParseError![]const u8 {
+    const trimmed = std.mem.trim(u8, args, " \t");
+    if (trimmed.len == 0) return error.Empty;
+    return trimmed;
+}
+
 pub const AddNode = struct { kind: []const u8, x: ?f32 = null, y: ?f32 = null };
 
 /// "<kind> [x y]" — kind 名の1トークン + 省略可能な world 座標2トークン（`add_node` 用）。
@@ -112,6 +120,13 @@ test "parseFourUsize: 有効値 / 不足 / 余剰トークン" {
     try testing.expectEqual(@as(usize, 1), r.d);
     try testing.expectError(error.Empty, parseFourUsize("1 0 2"));
     try testing.expectError(error.TooManyTokens, parseFourUsize("1 0 2 1 9"));
+}
+
+test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {
+    try testing.expectEqualStrings("/tmp/out.ptcg", try parsePath("  /tmp/out.ptcg  "));
+    try testing.expectEqualStrings("/tmp/my graph.ptcg", try parsePath("/tmp/my graph.ptcg"));
+    try testing.expectError(error.Empty, parsePath(""));
+    try testing.expectError(error.Empty, parsePath("   "));
 }
 
 test "parseAddNode: kind のみ / kind+xy / 不正数値 / x のみは OddExtraTokens" {

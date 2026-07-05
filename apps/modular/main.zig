@@ -24,6 +24,7 @@ const LofiPatch = patchmod.LofiPatch;
 const PatternCommand = patchmod.PatternCommand;
 const PatchState = patchmod.PatchState;
 const actions = @import("actions.zig");
+const pattern_io = @import("pattern_io.zig");
 
 // ウィンドウ。上部=GUI コントロール + DrumMachine/BassMachine、下部=可視化帯。
 const WIN_W = 1120;
@@ -57,6 +58,9 @@ const App = struct {
     params: Params = .{},
     /// GUI が publish した pattern の最新 revision（action もこのカウンタを共有し二重採番を防ぐ）。
     pattern_rev: u32 = 0,
+    /// `save_pattern`/`load_pattern` action（TASK-65 serialize）が使うファイル I/O ハンドル
+    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
+    io: std.Io,
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -219,14 +223,14 @@ fn pitchColor(deg: i8) gui.Color {
     return gui.Color.rgba(0x30, g, 0x50, 0xFF);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("apps/modular: lofi テクノ生成パッチ（grid 編集・スライダ操作・ESC で終了）\n", .{});
 
     const allocator = std.heap.c_allocator;
 
     const app = try allocator.create(App);
     defer allocator.destroy(app);
-    app.* = .{};
+    app.* = .{ .io = init.io }; // save_pattern/load_pattern action（TASK-65 serialize）用
 
     const spec = try allocator.create(Spec);
     defer allocator.destroy(spec);
@@ -707,7 +711,72 @@ fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
-/// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+// ============================================================================
+// save_pattern / load_pattern（TASK-65 serialize。probe `modular` と対称の永続化口）。
+//
+// ホットパス宣言: save/load はイベント時のみ（action 1回につき1回。std.Io のブロッキング file I/O は
+// main thread の pollGate 内で完結する）。RT 経路（LofiPatch.render→graph processBlock）には
+// 一切触れない。保存対象は App.params（scalar）+ 現在の grid/303 pattern（PatternCommand の中身）。
+// load は既存の pattern 編集 action と同じ経路（publishControls / pattern_rev++ → pattern_db.publish）
+// をそのまま辿るため revision の二重採番は起きない。
+// ============================================================================
+
+/// 現在の `PatternCommand` を `pattern_io.PatternPayload`（app 非依存の plain struct）へ写す。
+fn patternToPayload(cmd: PatternCommand) pattern_io.PatternPayload {
+    return .{
+        .evolve = cmd.evolve,
+        .kick_on = cmd.kick.on,
+        .kick_lock = cmd.kick.lock,
+        .hat_on = cmd.hat.on,
+        .hat_lock = cmd.hat.lock,
+        .clap_on = cmd.clap.on,
+        .clap_lock = cmd.clap.lock,
+        .bass_on = cmd.bass.on,
+        .bass_accent = cmd.bass.accent,
+        .bass_slide = cmd.bass.slide,
+        .bass_lock = cmd.bass.lock,
+        .bass_deg = cmd.bass.deg,
+    };
+}
+
+/// `pattern_io.PatternPayload` を `rev` 付きで `PatternCommand` へ復元する（rev は payload に
+/// 含めず、他の pattern 編集 action と同じ「app.pattern_rev を1回 increment」で払い出す）。
+fn payloadToPatternCommand(rev: u32, p: pattern_io.PatternPayload) PatternCommand {
+    return .{
+        .rev = rev,
+        .evolve = p.evolve,
+        .kick = .{ .on = p.kick_on, .lock = p.kick_lock },
+        .hat = .{ .on = p.hat_on, .lock = p.hat_lock },
+        .clap = .{ .on = p.clap_on, .lock = p.clap_lock },
+        .bass = .{ .on = p.bass_on, .accent = p.bass_accent, .slide = p.bass_slide, .deg = p.bass_deg, .lock = p.bass_lock },
+    };
+}
+
+fn actionSavePattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const path = try actions.parsePath(args);
+    const cmd = stateToCommand(patch.snapshotState());
+    try pattern_io.save(app.io, path, Params, app.params, patternToPayload(cmd), std.heap.c_allocator);
+    return "ok";
+}
+
+fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const path = try actions.parsePath(args);
+    const loaded = try pattern_io.load(app.io, std.heap.c_allocator, path, Params);
+    app.params = loaded.params;
+    publishControls(patch, app.params);
+    app.pattern_rev += 1;
+    const cmd = payloadToPatternCommand(app.pattern_rev, loaded.pattern);
+    patch.controls.pattern_db.publish(cmd);
+    return "ok";
+}
+
+/// 8 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
 fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_param", .ctx = app, .run = actionSetParam });
@@ -716,4 +785,6 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = actionSetEvolve });
     platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = actionToggleStep });
     platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = actionSetPitch });
+    platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = actionSavePattern });
+    platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = actionLoadPattern });
 }

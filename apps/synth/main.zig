@@ -15,6 +15,7 @@ const gui = kit.gui;
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
 const actions = @import("actions.zig");
+const patch_io = @import("patch_io.zig");
 
 const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);
@@ -58,6 +59,9 @@ const App = struct {
     /// 同じ field を書き換えられるよう main() ローカルから App へ移設）。
     params: Params = .{},
     fxp: FxParams = .{},
+    /// `save_patch`/`load_patch` action（TASK-65 serialize）が使うファイル I/O ハンドル
+    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
+    io: std.Io,
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -241,7 +245,7 @@ fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, formatPatch(@ptrCast(@alignCast(ctx)), &buf));
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("apps/synth: A..K=C4..C5 / 画面鍵盤クリック / スライダで音色変更 / ESC 終了\n", .{});
 
     const allocator = std.heap.c_allocator;
@@ -256,6 +260,7 @@ pub fn main() !void {
         .fx = Fx.init(48000, makeFxParams(FxParams{})),
         .last_patch = initial_patch, // probe が初回 frame 前でも実際の初期 patch を返すように
         .tap = .{},
+        .io = init.io, // save_patch/load_patch action（TASK-65 serialize）用
     };
 
     const spec = try allocator.create(Spec);
@@ -659,7 +664,36 @@ fn actionSetFxBypass(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return "ok";
 }
 
-/// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+// ============================================================================
+// save_patch / load_patch（TASK-65 serialize。probe `patch` と対称の永続化口）。
+//
+// ホットパス宣言: save/load はイベント時のみ（action 1回につき1回。std.Io のブロッキング file I/O は
+// main thread の pollGate 内で完結する）。RT 経路（Synth.render/MasterEffects.process）には一切触れない。
+// 保存対象は App.params/App.fxp（GUI スライダと同じ値）のみ。load 後は既存の republishPatch/
+// republishFx（既存の atomic/Mailbox publish 経路）でそのまま audio スレッドへ反映する。
+// ============================================================================
+
+fn actionSavePatch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+    try patch_io.save(app.io, path, Params, FxParams, app.params, app.fxp, std.heap.c_allocator);
+    return "ok";
+}
+
+fn actionLoadPatch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+    const loaded = try patch_io.load(app.io, std.heap.c_allocator, path, Params, FxParams);
+    app.params = loaded.params;
+    app.fxp = loaded.fxp;
+    republishPatch(app);
+    republishFx(app);
+    return "ok";
+}
+
+/// 8 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
 fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_param", .ctx = app, .run = actionSetParam });
@@ -668,4 +702,6 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_filter", .ctx = app, .run = actionSetFilter });
     platform.registerAction(.{ .name = "set_fx_param", .ctx = app, .run = actionSetFxParam });
     platform.registerAction(.{ .name = "set_fx_bypass", .ctx = app, .run = actionSetFxBypass });
+    platform.registerAction(.{ .name = "save_patch", .ctx = app, .run = actionSavePatch });
+    platform.registerAction(.{ .name = "load_patch", .ctx = app, .run = actionLoadPatch });
 }

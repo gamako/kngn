@@ -69,6 +69,15 @@ pub fn parseBool01(args: []const u8) ParseError!bool {
     return on;
 }
 
+/// `save_patch`/`load_patch` 用: 前後の空白のみ trim し、内部の空白はそのまま保持する（path は
+/// 空白を含みうる1本の文字列として扱う。数値系パーサのようにトークナイズしない。pixie の
+/// `parsePath` と同型）。
+pub fn parsePath(args: []const u8) ParseError![]const u8 {
+    const trimmed = std.mem.trim(u8, args, " \t");
+    if (trimmed.len == 0) return error.Empty;
+    return trimmed;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -106,4 +115,11 @@ test "parseBool01: 0/1 のみ許容" {
     try testing.expectError(error.UnknownBool, parseBool01("true"));
     try testing.expectError(error.Empty, parseBool01(""));
     try testing.expectError(error.TooManyTokens, parseBool01("1 0"));
+}
+
+test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {
+    try testing.expectEqualStrings("/tmp/out.synp", try parsePath("  /tmp/out.synp  "));
+    try testing.expectEqualStrings("/tmp/my patch.synp", try parsePath("/tmp/my patch.synp"));
+    try testing.expectError(error.Empty, parsePath(""));
+    try testing.expectError(error.Empty, parsePath("   "));
 }

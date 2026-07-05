@@ -33,6 +33,7 @@ const canvas = @import("canvas.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
 const actions = @import("actions.zig");
+const graph_io = @import("graph_io.zig");
 
 const DynGraph = modular.DynGraph;
 const PortKind = modular.PortKind;
@@ -202,6 +203,10 @@ const App = struct {
     tap_slot_seq: [TAP_SLOTS]u32 = [_]u32{0} ** TAP_SLOTS,
     tap_count: usize = 0,
     tap_seq: u32 = 0,
+
+    /// `save_graph`/`load_graph` action（TASK-65 serialize）が使うファイル I/O ハンドル
+    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
+    io: std.Io,
 
     /// キャンバス有効高（画面下端の可視化帯を除いた領域）。見切れ判定・ヒットテスト・tap 対象選択で共通に使う。
     fn canvasH(self: *const App) f32 {
@@ -1340,7 +1345,7 @@ fn drawVizBand(app: *const App, fb: platform.Framebuffer, spec: *const Spec, osc
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("apps/patch: パッチキャンバス（drag=move/pan, scroll=zoom, ESC で終了）\n", .{});
     const allocator = std.heap.c_allocator;
 
@@ -1372,7 +1377,7 @@ pub fn main() !void {
     };
     defer dyn.destroy();
 
-    app = App{ .dyn = dyn }; // start 前に app を完全初期化（callback が app.dyn を触る前に確定）
+    app = App{ .dyn = dyn, .io = init.io }; // start 前に app を完全初期化（callback が app.dyn を触る前に確定）
     buildPatch(&app) catch |err| {
         std.debug.print("buildPatch failed: {s}\n", .{@errorName(err)}); // publish 失敗等は panic せず終了
         return;
@@ -1737,15 +1742,20 @@ fn toHandle(v: usize) error{InvalidHandle}!Handle {
     return @intCast(v);
 }
 
-/// kind 名（`modular.ModuleKind` の tag 名。26種、パレットの10種より広い）→ comptime dispatch で
-/// `dyn.add(k, .{})`。`addByPaletteIndex` の `inline for` と同型の「runtime enum → comptime 呼び出し」
-/// パターン（`switch (kind) { inline else => |k| ... }` は各 tag ごとに comptime 特殊化された分岐を
-/// 生成し、分岐内の `k` は comptime 値になる）。
-fn addNodeByKindName(app: *App, name: []const u8) !Handle {
-    const kind = std.meta.stringToEnum(modular.ModuleKind, name) orelse return error.UnknownKind;
+/// `modular.ModuleKind` → comptime dispatch で `dyn.add(k, .{})`。`addByPaletteIndex` の
+/// `inline for` と同型の「runtime enum → comptime 呼び出し」パターン（`switch (kind) { inline else
+/// => |k| ... }` は各 tag ごとに comptime 特殊化された分岐を生成し、分岐内の `k` は comptime 値になる）。
+/// `actionAddNode`（kind 名）と `load_graph`（`graph_io.decodeGraph` が返す typed kind）の両方が使う。
+fn addNodeByKind(app: *App, kind: modular.ModuleKind) !Handle {
     return switch (kind) {
         inline else => |k| app.dyn.add(k, .{}),
     };
+}
+
+/// kind 名（`modular.ModuleKind` の tag 名。26種、パレットの10種より広い）→ `addNodeByKind`。
+fn addNodeByKindName(app: *App, name: []const u8) !Handle {
+    const kind = std.meta.stringToEnum(modular.ModuleKind, name) orelse return error.UnknownKind;
+    return addNodeByKind(app, kind);
 }
 
 fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -1837,11 +1847,123 @@ fn actionDisconnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     return "ok";
 }
 
-/// 4 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+// ============================================================================
+// save_graph / load_graph（TASK-65 serialize。probe `patch` と対称の永続化口）。
+//
+// ホットパス宣言: save/load はイベント時のみ（action 1回につき1回。std.Io のブロッキング file I/O は
+// main thread の pollGate 内で完結する）。RT 経路（DynGraph.processBlock）には一切触れない。
+//
+// スコープ: `graph_io.zig` と同じく生ノード（add/remove/connect/disconnect）のみ。マクロの折り畳み
+// 情報は保存されない。load_graph は「既存グラフの置換」意味論: 現在の全ノードを削除してから復元する
+// （pixie の `open` が canvas 全体を差し替えるのと同じ考え方）。ハンドル番号は保存値をそのまま
+// 再現できるとは限らない（`DynGraph.add` が空き slot から動的採番するため）ので、load 側で
+// 旧 handle→新 handle の対応表を作って EDGE を訳し直す。
+// ============================================================================
+
+fn actionSaveGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+
+    var node_buf: [MAX_MODULES]graph_io.NodeEntry = undefined;
+    var nn: usize = 0;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) continue;
+        const pos = app.layout[h];
+        node_buf[nn] = .{ .handle = h, .kind = app.dyn.kindOf(h).?, .x = pos.x, .y = pos.y };
+        nn += 1;
+    }
+
+    var flat_buf: [MAX_EDGES]Edge = undefined;
+    const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
+    var edge_buf: [MAX_EDGES]graph_io.EdgeEntry = undefined;
+    for (flat, 0..) |e, i| {
+        edge_buf[i] = .{ .src_handle = e.src_handle, .src_out = e.src_out, .dst_handle = e.dst_handle, .dst_in = e.dst_in };
+    }
+
+    try graph_io.saveGraph(app.io, path, std.heap.c_allocator, node_buf[0..nn], edge_buf[0..flat.len]);
+    return "ok";
+}
+
+/// 既存グラフを全消去する（load_graph の「置換」意味論。台帳/選択/hover も併せてリセット）。
+fn clearGraph(app: *App) void {
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) continue;
+        if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
+        app.dyn.removeModule(h);
+    }
+    app.ledger = .{}; // グループ台帳も完全リセット（load_graph はマクロ折り畳み情報を持たない）
+    app.selected = null;
+    app.hover = null;
+    app.drag = .none;
+}
+
+fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+    const gpa = std.heap.c_allocator;
+    var decoded = try graph_io.loadGraph(app.io, gpa, path);
+    defer decoded.deinit(gpa);
+
+    // 容量事前検証（「検証してから壊す」。commitConnect と同方針）: clearGraph() で retired にした
+    // slot は RT が次 publish を consume するまで（RCU grace）この action 呼び出し内では再利用でき
+    // ない。`DynGraph.freeHandleCount()`/`poolFreeCount(k)` は「今 add したら確保できる数」を
+    // 既存の active/retired(未 reclaim) を織り込んで返す（`add()` の reclaim 条件と同一式）ため、
+    // clearGraph 前に読んでも clearGraph 直後の実際の空きと一致する（retire は「active→retired」
+    // であって pool/handle 占有を解放しないため）。
+    // 事前に2種の容量（全体 handle 数 / kind 別 pool 数）を検証し、どちらか超過なら既存グラフを
+    // 破壊せずに拒否する（黙って一部だけ復元して「成功」を返すのを防ぐ。codex 指摘。当初
+    // `MAX_MODULES - activeCount()` という手書き計算だったが、(a) 既存 retired 分を見落とす、
+    // (b) kind 別 pool cap を見ない、の2点で不十分だったため公開 API に置き換えた）。
+    if (decoded.nodes.len > app.dyn.freeHandleCount()) return error.TooManyNodesForCapacity;
+    inline for (@typeInfo(modular.ModuleKind).@"enum".fields) |kf| {
+        const k: modular.ModuleKind = @enumFromInt(kf.value);
+        var need: usize = 0;
+        for (decoded.nodes) |n| {
+            if (n.kind == k) need += 1;
+        }
+        if (need > app.dyn.poolFreeCount(k)) return error.TooManyNodesForCapacity;
+    }
+
+    clearGraph(app);
+
+    // 旧 handle → 新 handle 対応表（DynGraph.add は空き slot から動的採番するため保存値は再現されない）。
+    // add が失敗（TooManyModules/PoolFull）したノードは skip（fail-soft。addByPaletteIndex と同方針）。
+    // 実際に復元できた数を数え、返り値に「要求数/復元数」を出す（部分成功を隠さない。codex 指摘）。
+    var mapping = [_]?Handle{null} ** MAX_MODULES;
+    var nodes_restored: usize = 0;
+    for (decoded.nodes) |n| {
+        if (n.handle >= MAX_MODULES) continue; // 破損/範囲外 handle は skip
+        const nh = addNodeByKind(app, n.kind) catch continue;
+        app.layout[nh] = .{ .x = n.x, .y = n.y };
+        mapping[n.handle] = nh;
+        nodes_restored += 1;
+    }
+    var edges_restored: usize = 0;
+    for (decoded.edges) |e| {
+        if (e.src_handle >= MAX_MODULES or e.dst_handle >= MAX_MODULES) continue;
+        const src = mapping[e.src_handle] orelse continue; // 対応ノードが skip されていたら edge も skip
+        const dst = mapping[e.dst_handle] orelse continue;
+        app.dyn.connect(src, e.src_out, dst, e.dst_in) catch continue; // 型不一致/範囲外は skip（fail-soft）
+        edges_restored += 1;
+    }
+
+    try app.dyn.publish();
+    app.refreshAllExposed();
+    return std.fmt.bufPrint(buf, "nodes={d}/{d} edges={d}/{d}", .{
+        nodes_restored, decoded.nodes.len, edges_restored, decoded.edges.len,
+    }) catch "ok";
+}
+
+/// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
 fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "add_node", .ctx = app, .run = actionAddNode });
     platform.registerAction(.{ .name = "remove_node", .ctx = app, .run = actionRemoveNode });
     platform.registerAction(.{ .name = "connect", .ctx = app, .run = actionConnect });
     platform.registerAction(.{ .name = "disconnect", .ctx = app, .run = actionDisconnect });
+    platform.registerAction(.{ .name = "save_graph", .ctx = app, .run = actionSaveGraph });
+    platform.registerAction(.{ .name = "load_graph", .ctx = app, .run = actionLoadGraph });
 }

@@ -899,6 +899,17 @@ pub fn build(b: *std.Build) void {
     const run_synth_actions_test = b.addRunArtifact(synth_actions_test);
     test_synth_step.dependOn(&run_synth_actions_test.step);
 
+    // apps/synth 音色/FX パラメータ直列化（TASK-65 serialize）。std + serde のみ・App/kit 非依存。
+    const synth_patch_io_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/synth/patch_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    synth_patch_io_test_mod.addImport("serde", shared_modules.serde.mod);
+    const synth_patch_io_test = b.addTest(.{ .root_module = synth_patch_io_test_mod });
+    const run_synth_patch_io_test = b.addRunArtifact(synth_patch_io_test);
+    test_synth_step.dependOn(&run_synth_patch_io_test.step);
+
     // libs/modular テスト（グラフエンジン: topo / cycle 遅延辺 / 単一接続 / per-sample / 可変 frames / 長時間レンダー）
     const modular_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/modular/src/modular.zig"),
@@ -936,6 +947,18 @@ pub fn build(b: *std.Build) void {
     const run_modular_actions_test = b.addRunArtifact(modular_actions_test);
     test_app_modular_step.dependOn(&run_modular_actions_test.step);
 
+    // apps/modular scalar params + grid/303 pattern 直列化（TASK-65 serialize）。std + serde のみ・
+    // App/kit/modular 非依存（PatternPayload は plain struct。main.zig 側で PatternCommand と変換）。
+    const modular_pattern_io_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/modular/pattern_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    modular_pattern_io_test_mod.addImport("serde", shared_modules.serde.mod);
+    const modular_pattern_io_test = b.addTest(.{ .root_module = modular_pattern_io_test_mod });
+    const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
+    test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
+
     // apps/patch 純ロジックテスト集約 root（canvas: camera 変換 / hit-test / 見切れ検出 + group: グループ台帳 /
     // expose 導出 / 表示写像。display/audio 不要。TASK-40.6.2 / 40.7.1）
     const patch_tests_mod = b.createModule(.{
@@ -958,6 +981,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_patch_actions_test = b.addRunArtifact(patch_actions_test);
     test_patch_step.dependOn(&run_patch_actions_test.step);
+
+    // apps/patch ノード/エッジ構成の直列化（TASK-65 serialize）。std + serde + modular（ModuleKind の
+    // 単一ソース）のみ・App/kit/canvas 非依存。
+    const patch_graph_io_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/patch/graph_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    patch_graph_io_test_mod.addImport("serde", shared_modules.serde.mod);
+    patch_graph_io_test_mod.addImport("modular", shared_modules.modular.mod);
+    const patch_graph_io_test = b.addTest(.{ .root_module = patch_graph_io_test_mod });
+    const run_patch_graph_io_test = b.addRunArtifact(patch_graph_io_test);
+    test_patch_step.dependOn(&run_patch_graph_io_test.step);
 
     // apps/patch マクロ builder テスト（DrumMachine テンプレ: preflight/rollback/決定性/発音回帰。TASK-40.7.1）
     const patch_macro_test_mod = b.createModule(.{
@@ -1596,6 +1632,7 @@ fn addPatchExe(
     link(root, common.modular); // 動的グラフエンジン（dsp 依存のみ。macro.zig も参照）
     link(root, common.spectrogram); // TASK-40.8: 信号可視化（master scope/spectrogram/level meter）
     link(root, common.scope);
+    link(root, common.serde); // graph_io.zig（TASK-65 serialize: ノード/エッジ構成の versioned container 直列化）
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
@@ -1625,11 +1662,12 @@ fn addSynthExe(
         }),
     });
     // apps は kit-only 消費者（R5）。platform/audio/synth/dsp/gui は kit.* で参照。
-    // 可視化（libs/viz。流動中で kit 非収録）だけ直 import。
+    // 可視化（libs/viz。流動中で kit 非収録）+ serde（TASK-65 serialize: patch_io.zig が直 import）だけ直 import。
     const root = appRoot(exe, "synth");
     link(root, pm.kit);
     link(root, common.spectrogram);
     link(root, common.scope);
+    link(root, common.serde); // patch_io.zig（音色/FX パラメータの versioned container 直列化）
     linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths);
@@ -1661,11 +1699,13 @@ fn addModularExe(
     });
     // apps は kit-only 消費者（R5）。platform/audio/gui は kit.* で参照。
     // modular / 可視化（libs/viz）は流動中で kit 非収録のため直 import。
+    // serde（TASK-65 serialize: pattern_io.zig が直 import）も同様に直 import。
     const root = appRoot(exe, "modular");
     link(root, pm.kit);
     link(root, common.modular); // グラフエンジン（dsp 依存のみ）
     link(root, common.spectrogram);
     link(root, common.scope);
+    link(root, common.serde); // pattern_io.zig（scalar params + grid/303 pattern の versioned container 直列化）
     // patch.zig は pure-test root（test-app-modular）を兼ねるため synth/dsp を named 直 import する。
     // kit と同一 module インスタンスなので型同一性は保たれる（linkAppException の doc 参照）。
     linkAppException(root, common.synth, "apps/modular/patch.zig が test root を兼ねる（SampleTap / AtomicF32）");
