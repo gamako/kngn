@@ -37,6 +37,11 @@ pub fn build(b: *std.Build) void {
     gui.addImport("font", font);
     gui.addImport("pixelops", pixelops);
 
+    // .pix プロジェクト形式の versioned container（std のみ・依存なし）
+    const serde = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/serde/src/serde.zig" },
+    });
+
     // paint（旧 editor/core。ADR-007 R6 で libs/paint へ格上げ）: pixie が直 import する
     // 「エディタ族の共有 lib」（kit 非収録）。
     const paint = b.createModule(.{
@@ -45,6 +50,7 @@ pub fn build(b: *std.Build) void {
     paint.addImport("png", png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
     paint.addImport("pixelops", pixelops); // blend.zig が委譲 (TASK-51)
     paint.addImport("font", font); // text_render.zig が委譲 (TASK-79.4/79.5。standalone build 配線漏れの修正。TASK-82)
+    paint.addImport("serde", serde); // document_io.zig が .pix container(libs/serde) に委譲 (TASK-63。standalone build 配線漏れの修正。TASK-81)
 
     // kit（ADR-007 R4）の caller 供給分。pixie ソースは platform/gui/png を @import("kit") 経由で使う。
     // dsp/synth は pixie からは未参照（lazy 解析でコンパイルされない）が、kit/kit.zig と 1:1 で配線する。
