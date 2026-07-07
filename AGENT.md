@@ -58,7 +58,8 @@ video-proto-main/
     ├── PLAN_*.md      # 個別計画（example_02/03 / libs_gui / png_decoder 等）
     └── adr/           # アーキテクチャ決定記録（層構成は 007）
 ```
-（タスク別の計画メモ `docs/plans/` はトップ階層 `video-proto/docs/plans/` 側。この配下ではない）
+（タスク別の詳細計画は backlog のタスク plan 欄（歴史的な詳細版は `backlog/docs/plans/`）に、
+タスク横断の設計文書はトップ階層 `video-proto/docs/plans/` に置く。いずれもこの配下ではない）
 
 > **層構成（ADR-007）**: `apps → kit → libs → core → platform` の一方向依存を build.zig の
 > モジュールグラフ（`Layer` タグ + `link()` 検査）で強制する。逆流・層飛ばし・apps の非許可直 import は

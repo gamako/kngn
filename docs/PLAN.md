@@ -4,7 +4,7 @@
 > task-11 で Zig 高レベル interface 層 (`src/platform.zig`) を上に被せた。
 > caller (`src/main.zig`, `examples/`) は `@import("platform")` で Zig API のみを利用する。
 > C ABI (`platform.h`) は内部実装で、バックエンド (`src/platform_macos.zig`) のみが直接利用する。
-> 新 API の実装計画は `../docs/plans/task-11-woolly-zephyr.md` を参照。
+> 新 API の実装計画は `../backlog/docs/plans/task-11-woolly-zephyr.md`（トップ階層 backlog リポジトリ側）を参照。
 
 ## アーキテクチャ設計
 
