@@ -12,7 +12,7 @@ const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
 const undo_mod = @import("undo.zig");
 const StrokeRecorder = undo_mod.StrokeRecorder;
-const Op = undo_mod.Op;
+const PaintDiff = undo_mod.PaintDiff;
 const Dab = undo_mod.Dab;
 
 /// ラスタライズ/プレビュー共通の平坦化許容誤差（論理 px）。
@@ -66,9 +66,9 @@ pub const Path = struct {
         return null;
     }
 
-    /// flatten 点列を round → brush 経路で AA ラスタライズ。1パス=1 Op（変更なしは null）。
+    /// flatten 点列を round → brush 経路で AA ラスタライズ。1パス=1 PaintDiff（変更なしは null）。
     /// `dab`/`color`/`opacity` は確定時の active ブラシから呼び出し側が渡す（Brush ツール非依存）。
-    pub fn rasterize(self: *const Path, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?Op {
+    pub fn rasterize(self: *const Path, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?PaintDiff {
         if (self.anchors.items.len < 2) return null; // 曲線は 2 アンカー以上
         var pts: std.ArrayList(Vec2f) = .empty;
         defer pts.deinit(gpa);
@@ -138,16 +138,17 @@ test "flattenAll: 端点を含む（2 アンカー直線）" {
 }
 
 test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round-trip" {
+    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
     const png = @import("png");
     const io_png = @import("io_png.zig");
+    const document_mod = @import("document.zig");
     const gpa = std.testing.allocator;
 
-    var canvas = try Canvas.init(gpa, 16, 16);
-    defer canvas.deinit();
+    var doc = try document_mod.Document.init(gpa, 16, 16);
+    defer doc.deinit();
+    const canvas = doc.activeCanvas();
     var rec = try StrokeRecorder.init(gpa, 16, 16);
     defer rec.deinit(gpa);
-    var undo: undo_mod.UndoStack = .{};
-    defer undo.deinit(gpa);
 
     const blank = try gpa.dupe(u32, canvas.layerPixels(0));
     defer gpa.free(blank);
@@ -159,7 +160,7 @@ test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
     const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
-    if (path.rasterize(&canvas, &rec, gpa, dab, RED, 255)) |cmd| undo.push(gpa, .{ .op = cmd });
+    if (path.rasterize(canvas, &rec, gpa, dab, RED, 255)) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 
     // y=2 の x=2..13 が不透明 RED（cov=255・opacity=255 → 原本透明へ src-over で RED）
     for (2..14) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[2 * 16 + x]);
@@ -176,7 +177,7 @@ test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
     // undo で空へ復元
-    undo.undoOne(gpa, &.{&canvas});
+    doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, blank, canvas.layerPixels(0));
 }
 
@@ -190,7 +191,7 @@ test "rasterize: アンカー 1 個は null（描けない）" {
     defer path.deinit(gpa);
     try path.anchors.append(gpa, anchorAt(4, 4));
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    try std.testing.expectEqual(@as(?Op, null), path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255));
+    try std.testing.expectEqual(@as(?PaintDiff, null), path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255));
 }
 
 test "rasterize: selected_layer に描画する" {
@@ -207,10 +208,10 @@ test "rasterize: selected_layer に描画する" {
     try path.anchors.append(gpa, anchorAt(3, 1));
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const cmd = path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    const pd = path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255) orelse return error.TestUnexpectedNull;
+    defer gpa.free(pd.diffs);
 
     try std.testing.expectEqual(@as(u32, 0), canvas.layerPixels(0)[1 * 8 + 1]);
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), canvas.layerPixels(1)[1 * 8 + 1]);
-    try std.testing.expectEqual(@as(usize, 1), cmd.paint.layer_idx);
+    try std.testing.expectEqual(@as(usize, 1), pd.layer_idx);
 }

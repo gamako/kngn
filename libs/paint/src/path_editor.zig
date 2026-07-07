@@ -14,7 +14,7 @@ const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
 const undo_mod = @import("undo.zig");
 const StrokeRecorder = undo_mod.StrokeRecorder;
-const Op = undo_mod.Op;
+const PaintDiff = undo_mod.PaintDiff;
 const Dab = undo_mod.Dab;
 
 pub const Input = union(enum) {
@@ -116,7 +116,7 @@ pub const PathEditor = struct {
 
     /// 唯一の確定経路。rasterize → 戻り値取得 → path クリア。pixie が Enter/ダブルクリックで呼び、
     /// 戻り値（非 null）を UndoStack へ push する（Input に commit を設けず二重 clear を排除）。
-    pub fn rasterizeCommit(self: *PathEditor, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?Op {
+    pub fn rasterizeCommit(self: *PathEditor, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?PaintDiff {
         const cmd = self.path.rasterize(canvas, rec, gpa, dab, color, opacity);
         self.path.anchors.clearRetainingCapacity();
         self.drag = .none;
@@ -135,7 +135,7 @@ pub const PathEditor = struct {
         defer if (added) {
             _ = self.path.anchors.pop();
         };
-        if (self.path.rasterize(dst, rec, gpa, dab, color, opacity)) |cmd| gpa.free(cmd.paint.diffs);
+        if (self.path.rasterize(dst, rec, gpa, dab, color, opacity)) |pd| gpa.free(pd.diffs);
     }
 };
 
@@ -238,8 +238,8 @@ test "rasterizeCommit: 描画して path をクリア" {
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
     const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
-    const cmd = ed.rasterizeCommit(&canvas, &rec, gpa, dab, RED, 255) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    const pd = ed.rasterizeCommit(&canvas, &rec, gpa, dab, RED, 255) orelse return error.TestUnexpectedNull;
+    defer gpa.free(pd.diffs);
 
     try std.testing.expect(!ed.isEditing()); // クリアされた
     try std.testing.expectEqual(@as(?Hit, null), ed.selected);

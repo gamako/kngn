@@ -29,7 +29,7 @@ const Canvas = canvas_mod.Canvas;
 const Rect = canvas_mod.Rect;
 const undo_mod = @import("undo.zig");
 const PixelDiff = undo_mod.PixelDiff;
-const Op = undo_mod.Op;
+const PaintDiff = undo_mod.PaintDiff;
 const StrokeRecorder = undo_mod.StrokeRecorder;
 const tool_mod = @import("tool.zig");
 const Tool = tool_mod.Tool;
@@ -72,7 +72,7 @@ pub fn floodFillCmd(
     seed_y: i32,
     fill_color: u32,
     tolerance: u8,
-) ?Op {
+) ?PaintDiff {
     const search: Rect = canvas.selection orelse .{
         .x = 0,
         .y = 0,
@@ -145,13 +145,13 @@ pub fn floodFillCmd(
 }
 
 /// diffs を owned slice 化して paint cmd を返す。空なら破棄して null（no-op。selection.zig と同型）。
-fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?Op {
+fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?PaintDiff {
     if (diffs.items.len == 0) {
         diffs.deinit(gpa);
         return null;
     }
     const owned = diffs.toOwnedSlice(gpa) catch @panic("fill.finishDiffs: OOM");
-    return .{ .paint = .{ .layer_idx = layer_idx, .diffs = owned } };
+    return .{ .layer_idx = layer_idx, .diffs = owned };
 }
 
 /// Fill Tool（vtable 実装）。down で floodFillCmd を実行し結果を pending に保持、move は no-op、
@@ -161,7 +161,7 @@ pub const Fill = struct {
     color: u32,
     tolerance: u8 = 0,
     /// down〜up の間だけ保持する保留中の結果。up で必ず消費される想定（下記 reset() 参照）。
-    pending: ?Op = null,
+    pending: ?PaintDiff = null,
 
     const vtable: Tool.VTable = .{ .onEvent = onEventImpl, .reset = resetImpl };
 
@@ -169,14 +169,14 @@ pub const Fill = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?Op {
+    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff {
         _ = rec; // Fill は StrokeRecorder を使わない（selection.zig と同じ layerPixels 直書きパターン）
         const self: *Fill = @ptrCast(@alignCast(ptr));
         switch (ev) {
             .down => |p| {
                 // 保険: 前回の pending が未消費のまま残っていれば解放してから上書き
                 // （canvas_input の契約上 down/up は必ず対になるため実運用では発生しないはず）。
-                if (self.pending) |leftover| gpa.free(leftover.paint.diffs);
+                if (self.pending) |leftover| gpa.free(leftover.diffs);
                 self.pending = floodFillCmd(gpa, canvas, canvas.selected_layer, p.x, p.y, self.color, self.tolerance);
                 return null;
             },
@@ -228,8 +228,8 @@ test "floodFillCmd: 連結領域のみ塗る（非連結の同色領域は対象
     for ([_][2]usize{ .{ 6, 2 }, .{ 7, 2 }, .{ 6, 3 }, .{ 7, 3 } }) |p| px[p[1] * 8 + p[0]] = RED;
 
     const cmd = floodFillCmd(gpa, &c, 0, 0, 0, GREEN, 0) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 4), cmd.paint.diffs.len); // 左上 2x2 のみ
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(usize, 4), cmd.diffs.len); // 左上 2x2 のみ
 
     for ([_][2]usize{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } }) |p| try std.testing.expectEqual(GREEN, px[p[1] * 8 + p[0]]);
     // 右下は RED のまま（非連結なので対象外）
@@ -247,8 +247,8 @@ test "floodFillCmd: 4連結で対角は塗らない" {
     px[1 * 4 + 1] = RED;
 
     const cmd = floodFillCmd(gpa, &c, 0, 0, 0, GREEN, 0) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 1), cmd.paint.diffs.len); // (0,0) のみ
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(usize, 1), cmd.diffs.len); // (0,0) のみ
     try std.testing.expectEqual(GREEN, px[0]);
     try std.testing.expectEqual(RED, px[1 * 4 + 1]); // 対角は塗られない
 }
@@ -263,7 +263,7 @@ test "floodFillCmd: tolerance 境界（dist==tol は塗る、dist==tol+1 は塗�
     px[2] = 0xFF000B00; // R=11（dist=11）
 
     const cmd = floodFillCmd(gpa, &c, 0, 0, 0, GREEN, 10) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    defer gpa.free(cmd.diffs);
     try std.testing.expectEqual(GREEN, px[0]);
     try std.testing.expectEqual(GREEN, px[1]); // dist==tolerance(10) → 塗る
     try std.testing.expectEqual(@as(u32, 0xFF000B00), px[2]); // dist==11>10 → 塗らない
@@ -279,8 +279,8 @@ test "floodFillCmd: tolerance=0 は完全一致 flood fill と同義" {
     px[2] = RED;
 
     const cmd = floodFillCmd(gpa, &c, 0, 0, 0, GREEN, 0) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 1), cmd.paint.diffs.len); // (0,0) のみ
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(usize, 1), cmd.diffs.len); // (0,0) のみ
     try std.testing.expectEqual(GREEN, px[0]);
     try std.testing.expectEqual(@as(u32, 0xFFFE0000), px[1]); // 完全一致でないので対象外
     try std.testing.expectEqual(RED, px[2]); // (1,0) で遮断され到達しない
@@ -301,9 +301,9 @@ test "floodFillCmd: no-op は「結果的に何も変わらない」場合のみ
     // （事前ガードを撤廃した理由そのものの再発防止テスト。codex レビュー指摘）。
     px[2] = 0xFFFE0000; // 1箇所だけ僅かに違う色（seedからdist=1、fillからもdist=1）
     const cmd = floodFillCmd(gpa, &c, 0, 0, 0, 0xFFFE0000, 5) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    defer gpa.free(cmd.diffs);
     // seed(RED)含め領域全体が fill_color(0xFFFE0000) に塗り替えられる（3px 変化: idx0,1,3。idx2は既に一致）
-    try std.testing.expectEqual(@as(usize, 3), cmd.paint.diffs.len);
+    try std.testing.expectEqual(@as(usize, 3), cmd.diffs.len);
     for (px) |p| try std.testing.expectEqual(@as(u32, 0xFFFE0000), p);
 }
 
@@ -316,8 +316,8 @@ test "floodFillCmd: 透明 seed(a=0) で塗れる / 不透明画素で探索が�
     px[3] = RED;
 
     const cmd = floodFillCmd(gpa, &c, 0, 0, 0, BLUE, 0) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 3), cmd.paint.diffs.len); // px[0..2] のみ
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(usize, 3), cmd.diffs.len); // px[0..2] のみ
     for (0..3) |i| try std.testing.expectEqual(BLUE, px[i]);
     try std.testing.expectEqual(RED, px[3]); // 不透明画素は対象外（探索が止まる）
 }
@@ -335,8 +335,8 @@ test "floodFillCmd: selection 内に探索・塗りが限定される / seed が
 
     // 選択内 seed → 選択矩形内のみ塗られる（隣接する選択外の同色ピクセルには及ばない）
     const cmd = floodFillCmd(gpa, &c, 0, 2, 0, RED, 0) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 3), cmd.paint.diffs.len);
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(usize, 3), cmd.diffs.len);
     const px = c.layerPixels(0);
     try std.testing.expectEqual(BLUE, px[0]); // 選択外
     for (1..4) |i| try std.testing.expectEqual(RED, px[i]); // 選択内
@@ -351,40 +351,43 @@ test "floodFillCmd: canvas 境界（端 seed / 1x1 canvas / 全面塗り）" {
         var c = try Canvas.init(gpa, 4, 4);
         defer c.deinit();
         const cmd = floodFillCmd(gpa, &c, 0, 3, 3, RED, 0) orelse return error.TestUnexpectedNull;
-        defer gpa.free(cmd.paint.diffs);
-        try std.testing.expectEqual(@as(usize, 16), cmd.paint.diffs.len); // 全面透明が連結
+        defer gpa.free(cmd.diffs);
+        try std.testing.expectEqual(@as(usize, 16), cmd.diffs.len); // 全面透明が連結
     }
     // 1x1 canvas
     {
         var c = try Canvas.init(gpa, 1, 1);
         defer c.deinit();
         const cmd = floodFillCmd(gpa, &c, 0, 0, 0, RED, 0) orelse return error.TestUnexpectedNull;
-        defer gpa.free(cmd.paint.diffs);
-        try std.testing.expectEqual(@as(usize, 1), cmd.paint.diffs.len);
+        defer gpa.free(cmd.diffs);
+        try std.testing.expectEqual(@as(usize, 1), cmd.diffs.len);
     }
     // 全面同色（64x64）→ visited/stack/diffs が上限内で完走する（オーバーフローしないことの確認。AC#5）
     {
         var c = try Canvas.init(gpa, 64, 64);
         defer c.deinit();
         const cmd = floodFillCmd(gpa, &c, 0, 0, 0, RED, 0) orelse return error.TestUnexpectedNull;
-        defer gpa.free(cmd.paint.diffs);
-        try std.testing.expectEqual(@as(usize, 64 * 64), cmd.paint.diffs.len);
+        defer gpa.free(cmd.diffs);
+        try std.testing.expectEqual(@as(usize, 64 * 64), cmd.diffs.len);
     }
 }
 
-test "floodFillCmd + UndoStack: 塗り1回が1 Opでbit復元、PNG round-trip一致" {
+test "floodFillCmd + Document.pushPaintOp: 塗り1回が1 Opでbit復元、PNG round-trip一致" {
+    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne/redoOne）へ移設済み
+    // （TASK-45.1）。ここでは floodFillCmd 自身の diffs が Document 経由で正しく可逆になることを
+    // 確認する（PaintDiff を素通しするだけで動くことの統合確認）。
     const png = @import("png");
     const io_png = @import("io_png.zig");
+    const document_mod = @import("document.zig");
     const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 8, 8);
-    defer c.deinit();
-    var undo: undo_mod.UndoStack = .{};
-    defer undo.deinit(gpa);
+    var doc = try document_mod.Document.init(gpa, 8, 8);
+    defer doc.deinit();
+    const c = doc.activeCanvas();
 
     const blank = try gpa.dupe(u32, c.layerPixels(0));
     defer gpa.free(blank);
 
-    if (floodFillCmd(gpa, &c, 0, 4, 4, GREEN, 0)) |op| undo.push(gpa, .{ .op = op });
+    if (floodFillCmd(gpa, c, 0, 4, 4, GREEN, 0)) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
     const filled = try gpa.dupe(u32, c.layerPixels(0));
     defer gpa.free(filled);
     for (filled) |p| try std.testing.expectEqual(GREEN, p); // 全面連結（透明）→全面塗り
@@ -401,10 +404,10 @@ test "floodFillCmd + UndoStack: 塗り1回が1 Opでbit復元、PNG round-trip�
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
     // undo で bit 復元
-    undo.undoOne(gpa, &.{&c});
+    doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, blank, c.layerPixels(0));
     // redo で bit 復元
-    undo.redoOne(gpa, &.{&c});
+    doc.redoOne(gpa);
     try std.testing.expectEqualSlices(u32, filled, c.layerPixels(0));
 }
 
@@ -419,18 +422,18 @@ test "Fill Tool: onEvent(down/move/up) がcanvas_inputの契約通りに動く�
     const t = fill.tool();
 
     // down: floodFillCmd を実行し pending に保持、戻り値は null
-    try std.testing.expectEqual(@as(?Op, null), t.onEvent(&c, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } }));
+    try std.testing.expectEqual(@as(?PaintDiff, null), t.onEvent(&c, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } }));
     try std.testing.expect(fill.pending != null);
     for (c.layerPixels(0)) |p| try std.testing.expectEqual(RED, p); // 既に塗られている（down 時点で確定）
 
     // move: no-op（pending は変化しない）
-    try std.testing.expectEqual(@as(?Op, null), t.onEvent(&c, &rec, gpa, .{ .move = .{ .x = 2, .y = 2 } }));
+    try std.testing.expectEqual(@as(?PaintDiff, null), t.onEvent(&c, &rec, gpa, .{ .move = .{ .x = 2, .y = 2 } }));
     try std.testing.expect(fill.pending != null);
 
     // up: pending を返し null に戻す
     const cmd = t.onEvent(&c, &rec, gpa, .{ .up = .{ .x = 2, .y = 2 } }) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(?Op, null), fill.pending);
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(?PaintDiff, null), fill.pending);
 }
 
 test "Fill Tool: selected_layer に塗る" {
@@ -446,9 +449,9 @@ test "Fill Tool: selected_layer に塗る" {
     const t = fill.tool();
     _ = t.onEvent(&c, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
     const cmd = t.onEvent(&c, &rec, gpa, .{ .up = .{ .x = 0, .y = 0 } }) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    defer gpa.free(cmd.diffs);
 
     try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[0]); // layer0 は無変更
     try std.testing.expectEqual(RED, c.layerPixels(1)[0]); // layer1 (selected) に塗られる
-    try std.testing.expectEqual(@as(usize, 1), cmd.paint.layer_idx);
+    try std.testing.expectEqual(@as(usize, 1), cmd.layer_idx);
 }

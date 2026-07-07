@@ -22,11 +22,17 @@ pub const screenToCanvasF = canvas.screenToCanvasF;
 pub const encodePNG = io_png.encodePNG;
 pub const savePNG = io_png.savePNG;
 
-// Undo / stroke 記録（TASK-21.7 / brush は 21.11 / frame 対応は TASK-63）
+// Undo / stroke 記録（TASK-21.7 / brush は 21.11 / frame 対応は TASK-63 / セルグリッドは TASK-45.1）。
+// Op/UndoStack は document.zig 側（Document が cel_pool/grid を直接操作するため。循環 import 回避）。
 pub const PixelDiff = undo.PixelDiff;
-pub const Op = undo.Op; // 1 操作の中身（frame 非依存）。tool/selection/path が返す
-pub const UndoCmd = undo.UndoCmd; // = { frame, op }。UndoStack が保持
-pub const UndoStack = undo.UndoStack;
+pub const PaintDiff = undo.PaintDiff; // まだ Document の cel_id を知らない生の編集結果（TASK-45.1）
+pub const Op = document.Op; // 1 操作の中身。tool/selection/path は PaintDiff を返す
+pub const CelId = document.CelId;
+pub const Cel = document.Cel;
+pub const LayerDef = document.LayerDef;
+pub const Frame = document.Frame;
+pub const CelSetSnapshot = document.CelSetSnapshot;
+pub const UndoStack = document.UndoStack;
 pub const StrokeRecorder = undo.StrokeRecorder;
 pub const Dab = undo.Dab;
 pub const Offset = undo.Offset;

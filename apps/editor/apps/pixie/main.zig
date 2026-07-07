@@ -253,7 +253,7 @@ const App = struct {
     /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
     preview_canvas: core.Canvas,
     preview_rec: core.StrokeRecorder,
-    undo: core.UndoStack = .{},
+    // undo は独立フィールドを廃止し `doc.undo` を経由する（TASK-45.1。plan 8.3節）。
     pen: core.Pen,
     eraser: core.Eraser = .{},
     brush: core.Brush,
@@ -348,15 +348,16 @@ const App = struct {
             self.canvas.layers.items[self.canvas.selected_layer].kind == .text;
     }
 
-    /// `system_font_bytes`（TASK-82）を `doc` の全 frame Canvas へ反映する。新しい Canvas
+    /// `system_font_bytes`（TASK-82）を `doc.active_view` へ反映する。新しい Document
     /// インスタンス（`core.Document.init`/`document_io.loadDocument` が返す）は
-    /// `Canvas.system_font` が既定 `null` で始まるため、Document を新規作成/差し替えた直後は
+    /// `active_view.system_font` が既定 `null` で始まるため、Document を新規作成/差し替えた直後は
     /// 必ず呼ぶ必要がある（`main()` 起動時 + `doOpenProject`）。`preview_canvas` は
     /// `addTextLayer`/`setLayerTextParams` を一切呼ばないため対象外。イベント時/初期化時のみ
-    /// （フレーム毎には呼ばない。frame 数は現状 MVP=1 だが将来のアニメ拡張にも耐える設計として
-    /// 全 frame を回す）。
+    /// （フレーム毎には呼ばない）。**TASK-45.1**: セルグリッド化により「アクティブフレームの
+    /// 編集可能ビュー」は `doc.active_view` の1個のみになった（`resyncActiveView` は
+    /// `system_font` を一切触らないため、ここで一度設定すれば保持され続ける。plan 4.2節）。
     fn applySystemFont(self: *App) void {
-        for (self.doc.frames.items) |f| f.system_font = self.system_font_bytes;
+        self.doc.active_view.system_font = self.system_font_bytes;
     }
 
     /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
@@ -611,9 +612,9 @@ const App = struct {
         }
         self.syncPreviewCanvas();
 
-        // load はドキュメント差し替えなので undo/redo 履歴を破棄（recorder は stroke 非進行中）
-        self.undo.deinit(self.gpa);
-        self.undo = .{};
+        // load はドキュメント差し替えなので undo/redo 履歴を破棄（recorder は stroke 非進行中）。
+        // `resetCanvasToSingleLayer`（= `doc.resetToSingleBlankLayer`）が既に doc.undo を
+        // リセット済みなので、ここで重複して行う必要はない（TASK-45.1）。
 
         if (self.current_path) |old| self.gpa.free(old);
         self.current_path = owned;
@@ -684,12 +685,15 @@ const App = struct {
         // 成功: 旧 doc を破棄して差し替え、canvas ポインタと preview を張り直す。
         self.doc.deinit();
         self.doc = new_doc;
+        // pixie は現状 frame 切替 UI を持たない（45.2 以降の範囲）ため常に frame 0 を表示する
+        // （多 frame の .pix を手編集/将来ツールで作られていても、pixie は先頭 frame だけ見せる）。
         self.doc.selected_frame = 0;
+        self.doc.resyncActiveView(self.gpa); // selected_frame 強制に合わせて active_view を再同期
         self.canvas = self.doc.activeCanvas();
-        self.applySystemFont(); // 新 Document の Canvas は system_font=null で始まるため再設定（TASK-82）
-        // ドキュメント差し替え = undo/redo 履歴破棄・選択/フロート破棄（doOpen と同型。AC#4）
-        self.undo.deinit(self.gpa);
-        self.undo = .{};
+        self.applySystemFont(); // 新 Document の active_view は system_font=null で始まるため再設定（TASK-82）
+        // ドキュメント差し替え = undo/redo 履歴破棄・選択/フロート破棄（doOpen と同型。AC#4）。
+        // `new_doc`（decodeDocument が返す fresh Document）は元々 undo 履歴を持たないため
+        // 追加のリセットは不要（TASK-45.1。旧コードの独立 `app.undo` フィールドは廃止済み）。
         self.canvas.clearSelection();
         self.sel_in.discardFloat(self.gpa);
         self.syncPreviewCanvas();
@@ -705,18 +709,20 @@ const App = struct {
     /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        self.undo.undoOne(self.gpa, self.doc.frames.items);
+        self.doc.undoOne(self.gpa);
     }
 
     fn doRedo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        self.undo.redoOne(self.gpa, self.doc.frames.items);
+        self.doc.redoOne(self.gpa);
     }
 
     fn doClear(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (self.selectedLayerIsText()) return error.EditingBlocked; // TASK-79.5: text layer 直接編集禁止
-        self.undo.pushClear(self.gpa, self.canvas, self.doc.selected_frame, self.canvas.selected_layer);
+        self.doc.pushClear(self.gpa, self.canvas.selected_layer) catch |err| switch (err) {
+            error.TextLayerSelected => return error.EditingBlocked, // 上のガードで既に弾いているはずの防御的分岐
+        };
     }
 
     /// 選択範囲を clipboard へコピー（読み取りのみ・undo 不要）。selection 無しは no-op。
@@ -737,8 +743,8 @@ const App = struct {
         const block = core.selection.extract(self.gpa, self.canvas, self.canvas.selected_layer, sel);
         if (self.clipboard) |*old| old.deinit(self.gpa);
         self.clipboard = block;
-        if (core.selection.clearRectCmd(self.gpa, self.canvas, self.canvas.selected_layer, sel)) |cmd| {
-            self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = cmd });
+        if (core.selection.clearRectCmd(self.gpa, self.canvas, self.canvas.selected_layer, sel)) |pd| {
+            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // 上で text layer は既に弾いている
         }
     }
 
@@ -750,38 +756,26 @@ const App = struct {
         const block = self.clipboard orelse return;
         const dx: i32 = if (self.canvas.selection) |s| s.x else 0;
         const dy: i32 = if (self.canvas.selection) |s| s.y else 0;
-        if (core.selection.pasteCmd(self.gpa, self.canvas, self.canvas.selected_layer, block, dx, dy, self.blend_mode)) |cmd| {
-            self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = cmd });
+        if (core.selection.pasteCmd(self.gpa, self.canvas, self.canvas.selected_layer, block, dx, dy, self.blend_mode)) |pd| {
+            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // 上で text layer は既に弾いている
         }
         const dest = core.Rect{ .x = dx, .y = dy, .w = @intCast(block.w), .h = @intCast(block.h) };
         self.canvas.setSelection(core.selection.clipRect(dest, self.canvas.width, self.canvas.height));
     }
 
+    /// `Document.addLayer` が mutation + Op構築 + push を内部で完結する（plan 5.4節「一般化」）。
     fn doAddLayer(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const selected_before = self.canvas.selected_layer;
-        const idx = self.canvas.addLayer(self.gpa) catch |err| {
+        _ = self.doc.addLayer(self.gpa) catch |err| {
             self.setSaveMsg("Layer add failed: {s}", .{@errorName(err)});
             return err;
         };
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
-            .index = idx,
-            .selected_before = selected_before,
-            .selected_after = self.canvas.selected_layer,
-        } } });
     }
 
     fn doDeleteLayer(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const idx = self.canvas.selected_layer;
-        const selected_before = self.canvas.selected_layer;
-        const removed = self.canvas.deleteLayer(idx) orelse return error.LastLayer;
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_delete = .{
-            .index = idx,
-            .selected_before = selected_before,
-            .selected_after = self.canvas.selected_layer,
-            .layer = removed,
-        } } });
+        try self.doc.deleteLayer(self.gpa, idx);
     }
 
     fn doMoveLayer(self: *App, delta: i32) !void {
@@ -789,28 +783,15 @@ const App = struct {
         const from = self.canvas.selected_layer;
         const to_i: i32 = @as(i32, @intCast(from)) + delta;
         if (to_i < 0) return error.OutOfRange;
-        const to: usize = @intCast(to_i);
-        if (to >= self.canvas.layers.items.len or to == from) return error.OutOfRange;
-        const selected_before = self.canvas.selected_layer;
-        if (!self.canvas.moveLayer(from, to)) return error.OutOfRange;
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_reorder = .{
-            .from = from,
-            .to = to,
-            .selected_before = selected_before,
-            .selected_after = self.canvas.selected_layer,
-        } } });
+        try self.doc.reorderLayer(self.gpa, from, @intCast(to_i));
     }
 
     /// レイヤー可視性を明示値へ設定する（`doToggleLayerVisible` の共通実装。TASK-64 で action
-    /// `set_layer_visible` からも直接呼べるよう抽出）。`before == on` は冪等 no-op として黙って
-    /// 成功する（`doSetLayerOpacity` と同じ扱い＝既存 UI のスライダー挙動を踏襲）。
+    /// `set_layer_visible` からも直接呼べるよう抽出）。`Document.setLayerVisible` が冪等 no-op
+    /// 判定込みで mutation + Op構築 + push を完結する。
     fn doSetLayerVisible(self: *App, idx: usize, on: bool) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
-        const before = self.canvas.layers.items[idx].visible;
-        if (before == on) return;
-        _ = self.canvas.setLayerVisible(idx, on);
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_visible = .{ .index = idx, .before = before, .after = on } } });
+        try self.doc.setLayerVisible(self.gpa, idx, on);
     }
 
     /// UI のトグルボタン用（現在値の反転）。範囲外は既存どおり黙って無視（idx 境界は `doSetLayerVisible`
@@ -823,28 +804,15 @@ const App = struct {
 
     fn doSetLayerOpacity(self: *App, idx: usize, value: u8) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
-        const before = self.canvas.layers.items[idx].opacity;
-        if (before == value) return;
-        _ = self.canvas.setLayerOpacity(idx, value);
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_opacity = .{ .index = idx, .before = before, .after = value } } });
+        try self.doc.setLayerOpacity(self.gpa, idx, value);
     }
 
-    /// レイヤー名を変更する（Rename。TASK-79.3）。他の layer_* setter と同型: 冪等 no-op
-    /// （同一名なら Undo を汚さない）→ `Canvas.setLayerName` → before/after の `NameSnapshot` で
-    /// `undo.push(.layer_rename)`。呼び出し元はインライン編集の確定（`commitRenameLayer`）と
-    /// harness action（将来採用時）を想定。
+    /// レイヤー名を変更する（Rename。TASK-79.3）。`Document.renameLayer` が冪等 no-op 判定込みで
+    /// mutation + Op構築 + push を完結する。呼び出し元はインライン編集の確定
+    /// （`commitRenameLayer`）と harness action（将来採用時）を想定。
     fn doRenameLayer(self: *App, idx: usize, new_name: []const u8) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
-        // 正規化（切り詰め）後の実名で before/after を比較して no-op を弾く。生の new_name で
-        // 比較すると、32B 超で切り詰め後は同名になる入力（action 等）でも空の layer_rename が
-        // 積まれてしまう（codex 指摘）。
-        const before = core.NameSnapshot.of(self.canvas.layers.items[idx].name());
-        _ = self.canvas.setLayerName(idx, new_name);
-        const after = core.NameSnapshot.of(self.canvas.layers.items[idx].name());
-        if (std.mem.eql(u8, before.slice(), after.slice())) return; // 冪等 no-op（Undo を汚さない）
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_rename = .{ .index = idx, .before = before, .after = after } } });
+        try self.doc.renameLayer(self.gpa, idx, new_name);
     }
 
     /// レイヤー行の右クリックメニュー「Rename...」から呼ぶ。現在名を編集バッファへコピーして
@@ -896,39 +864,27 @@ const App = struct {
     /// Op 変更は不要。`doAddLayer` と同じ仕組み）。
     fn doAddTextLayer(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const selected_before = self.canvas.selected_layer;
         var params: core.TextParams = .{ .x = 8, .y = 8, .color = self.palette.current() };
         params.setText("Text");
-        const idx = self.canvas.addTextLayer(self.gpa, params) catch |err| {
+        _ = self.doc.addTextLayer(self.gpa, params) catch |err| {
             self.setSaveMsg("Text layer add failed: {s}", .{@errorName(err)});
             return err;
         };
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
-            .index = idx,
-            .selected_before = selected_before,
-            .selected_after = self.canvas.selected_layer,
-        } } });
     }
 
     /// テキストレイヤーの text_params を更新し再ラスタライズする（内容確定・サイズ/位置
-    /// スライダー・色ボタンの共通適用口。TASK-79.5）。値が変わらない冪等呼び出しは
-    /// `TextParams.eql` で弾き Undo を汚さない（他の layer_* setter と同じ流儀）。
+    /// スライダー・色ボタンの共通適用口。TASK-79.5）。`Document.setLayerTextParams` が
+    /// 冪等 no-op 判定・共有cel再ラスタライズ・Op構築+push を完結する。
     fn doSetTextParams(self: *App, idx: usize, params: core.TextParams) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (idx >= self.canvas.layers.items.len) return error.OutOfRange;
-        const before = self.canvas.layers.items[idx].text_params;
-        if (before.eql(params)) return;
-        try self.canvas.setLayerTextParams(idx, params);
-        const after = self.canvas.layers.items[idx].text_params;
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_text_params = .{ .index = idx, .before = before, .after = after } } });
+        try self.doc.setLayerTextParams(self.gpa, idx, params);
     }
 
     /// テキストレイヤーを通常 raster レイヤーへ確定する（Rasterize。右クリックメニュー。
     /// TASK-79.5）。pixels 不変・kind/text_params のみ変化。Undo 1 回で戻せる。
     fn doRasterizeLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const before = try self.canvas.rasterizeLayer(idx);
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_rasterize = .{ .index = idx, .before = before } } });
+        _ = try self.doc.rasterizeLayer(self.gpa, idx);
     }
 
     /// レイヤー右クリックメニュー「Edit Text...」（kind==text の時のみ有効）から呼ぶ。
@@ -973,38 +929,19 @@ const App = struct {
 
     fn doSelectLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (!self.canvas.selectLayer(idx)) return error.OutOfRange;
+        try self.doc.selectLayer(idx);
     }
 
     /// 選択レイヤーを複製し、直上へ挿入する（Duplicate。TASK-79.2。レイヤー右クリックメニュー）。
-    /// 新規 Undo Op は不要: 既存 `.layer_add` の undo（`canvas.deleteLayer(op.index)` の戻り値を
-    /// その場でスナップショットする実装。undo.zig 参照）は push 時点でレイヤーが空か複製済みかを
-    /// 関知しないため、push 前に複製済みの pixels/visible/opacity を書き込んでおくだけで
-    /// undo/redo とも複製内容込みで正しく可逆になる（`doAddLayer` が空レイヤーで同じ Op を使う
-    /// のと全く同じ仕組み）。1 push でアトミック。
+    /// `Document.duplicateLayer` が raster(各frame深いコピー)/text(新規cel全frameリンク)の
+    /// 分岐込みで mutation + Op構築 + push を完結する（4.4/4.5節）。
     fn doDuplicateLayer(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const src_idx = self.canvas.selected_layer;
-        const selected_before = self.canvas.selected_layer;
-        const src = self.canvas.layers.items[src_idx];
-        var new_layer = self.canvas.allocBlankLayer(self.gpa) catch |err| {
+        _ = self.doc.duplicateLayer(self.gpa, src_idx) catch |err| {
             self.setSaveMsg("Layer duplicate failed: {s}", .{@errorName(err)});
             return err;
         };
-        errdefer self.gpa.free(new_layer.pixels);
-        @memcpy(new_layer.pixels, src.pixels);
-        new_layer.visible = src.visible;
-        new_layer.opacity = src.opacity;
-        new_layer.setName(src.name()); // 複製元の名前を継承（TASK-79.3。allocBlankLayer の既定名を上書き）
-        new_layer.kind = src.kind; // kind/text_params も継承（TASK-79.5。POD なので値コピーで足りる）
-        new_layer.text_params = src.text_params;
-        const new_idx = src_idx + 1;
-        try self.canvas.insertLayer(self.gpa, new_idx, new_layer);
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_add = .{
-            .index = new_idx,
-            .selected_before = selected_before,
-            .selected_after = self.canvas.selected_layer,
-        } } });
     }
 
     /// 選択レイヤーを直下のレイヤーへ結合する（Merge Down。TASK-79.2。レイヤー右クリックメニュー）。
@@ -1025,55 +962,18 @@ const App = struct {
     /// 拒否する（「選択中レイヤーが text か」だけでは top=raster(選択中)・bottom=text の組を
     /// 見逃す＝bottom の pixels が直接書き換えられ「text layer の pixels は text_params からの
     /// 再ラスタライズ結果」という不変条件を破る。codex レビュー指摘 2026-07-05）。
+    /// `Document.mergeDown` が frame数1制限（9.1節MVP制限）込みで mutation + Op構築 + push を
+    /// 完結する（below の焼き込み・top の削除を1 push でatomicに。plan 4.5/5.3節）。
     fn doMergeDown(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const top_idx = self.canvas.selected_layer;
-        if (top_idx == 0) return error.OutOfRange;
-        const bottom_idx = top_idx - 1;
-        if (self.canvas.layers.items[top_idx].kind == .text or self.canvas.layers.items[bottom_idx].kind == .text) {
-            return error.TextLayerSelected;
-        }
-        const selected_before = self.canvas.selected_layer;
-
-        const below_before = self.gpa.dupe(u32, self.canvas.layerPixels(bottom_idx)) catch @panic("doMergeDown: OOM");
-        errdefer self.gpa.free(below_before);
-
-        const top_layer = self.canvas.layers.items[top_idx];
-        const bottom_pixels = self.canvas.layerPixels(bottom_idx);
-        if (top_layer.visible) {
-            for (bottom_pixels, 0..) |*bp, i| {
-                const s = if (top_layer.opacity != 255) core.blend.scaleAlpha(top_layer.pixels[i], top_layer.opacity) else top_layer.pixels[i];
-                bp.* = core.blend.srcOver(bp.*, s);
-            }
-        }
-        const below_after = self.gpa.dupe(u32, bottom_pixels) catch @panic("doMergeDown: OOM");
-        errdefer self.gpa.free(below_after);
-
-        const removed = self.canvas.deleteLayer(top_idx) orelse return error.LastLayer;
-        self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = .{ .layer_merge_down = .{
-            .index = top_idx,
-            .selected_before = selected_before,
-            .selected_after = self.canvas.selected_layer,
-            .layer = removed,
-            .below_before = below_before,
-            .below_after = below_after,
-        } } });
+        try self.doc.mergeDown(self.gpa, top_idx);
     }
 
+    /// PNG open 用: doc/active_view を「1layer・1frame・1cel(空)」状態へ縮める
+    /// （`Document.resetToSingleBlankLayer`。undo/redo も内部で破棄される。plan 8.5節）。
     fn resetCanvasToSingleLayer(self: *App) void {
-        while (self.canvas.layers.items.len > 1) {
-            const removed = self.canvas.deleteLayer(self.canvas.layers.items.len - 1).?;
-            self.gpa.free(removed.pixels);
-        }
-        self.canvas.selected_layer = 0;
-        self.canvas.layers.items[0].visible = true;
-        self.canvas.layers.items[0].opacity = 255;
-        self.canvas.layers.items[0].setName("Layer 1"); // Canvas.init と同じ既定名に戻す（TASK-79.3）
-        self.canvas.layers.items[0].kind = .raster; // TASK-79.5: layer0 が text だった場合の取り残し防止
-        self.canvas.layers.items[0].text_params = .{};
-        self.canvas.next_layer_num = 2; // 既存 layer0 を再利用するため counter も明示的にリセット
-        @memset(self.canvas.layerPixels(0), 0);
-        self.canvas.clearSelection(); // ドキュメント差し替えで選択は解除（TASK-44）
+        self.doc.resetToSingleBlankLayer(self.gpa);
         self.sel_in.discardFloat(self.gpa); // フロートも破棄
     }
 
@@ -1181,11 +1081,11 @@ const App = struct {
         if (k.key == .SPACE) self.space_down = false;
     }
 
-    /// ベジェ確定（現在ブラシ footprint + color/opacity で rasterize → UndoStack へ push）。
+    /// ベジェ確定（現在ブラシ footprint + color/opacity で rasterize → `Document.pushPaintOp`）。
     fn commitBezier(self: *App) void {
         const dab = self.brush.footprint();
-        if (self.bezier_editor.rasterizeCommit(self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |cmd| {
-            self.undo.push(self.gpa, .{ .frame = self.doc.selected_frame, .op = cmd });
+        if (self.bezier_editor.rasterizeCommit(self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |pd| {
+            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの経路に到達しない
         }
     }
 };
@@ -1247,13 +1147,13 @@ fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return std.fmt.bufPrint(buf, "{{\"depth\":{d},\"redo\":{d}}}", .{
-        app.undo.undo.items.len, app.undo.redo.items.len,
+        app.doc.undo.undo.items.len, app.doc.undo.redo.items.len,
     }) catch buf[0..0];
 }
 fn undoSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return std.fmt.allocPrint(allocator, "{{\"depth\":{d},\"redo\":{d}}}", .{
-        app.undo.undo.items.len, app.undo.redo.items.len,
+        app.doc.undo.undo.items.len, app.doc.undo.redo.items.len,
     });
 }
 
@@ -1456,7 +1356,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
 
     const tool = app.activeTool();
     _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .down = .{ .x = pts[0].x, .y = pts[0].y } });
-    var cmd: ?core.Op = null;
+    var cmd: ?core.PaintDiff = null;
     if (pts.len == 1) {
         cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = pts[0].x, .y = pts[0].y } });
     } else {
@@ -1468,7 +1368,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
             }
         }
     }
-    if (cmd) |c| app.undo.push(app.gpa, .{ .frame = app.doc.selected_frame, .op = c });
+    if (cmd) |pd| try app.doc.pushPaintOp(app.gpa, pd.layer_idx, pd.diffs);
     return "ok";
 }
 
@@ -2199,8 +2099,8 @@ pub fn main(init: std.process.Init) !void {
         .fill = .{ .color = 0 },
         .system_font_bytes = system_font_bytes,
     };
-    app.canvas = app.doc.activeCanvas(); // doc の frame 0 canvas を指す（ポインタ安定）
-    app.applySystemFont(); // 初期 doc の frame Canvas へ system font を反映（TASK-82）
+    app.canvas = app.doc.activeCanvas(); // doc の active_view を指す（ポインタ安定）
+    app.applySystemFont(); // 初期 doc の active_view へ system font を反映（TASK-82）
     app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
     app.brush.color = app.palette.current();
     app.fill.color = app.palette.current();
@@ -2214,7 +2114,7 @@ pub fn main(init: std.process.Init) !void {
         app.preview_rec.deinit(gpa);
         app.preview_canvas.deinit();
         app.palette.deinit(gpa);
-        app.undo.deinit(gpa);
+        // app.doc.deinit() が doc.undo も内部で解放する（TASK-45.1。独立 app.undo は廃止済み）。
         app.recorder.deinit(gpa);
         app.doc.deinit();
     }
@@ -2315,8 +2215,8 @@ pub fn main(init: std.process.Init) !void {
                         .time = platform.getTime(),
                     };
                     const dab = app.brush.footprint();
-                    if (app.bez_in.update(frame, &app.bezier_editor, app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |cmd| {
-                        app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
+                    if (app.bez_in.update(frame, &app.bezier_editor, app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |pd| {
+                        app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
                     }
                 } else if (app.active_kind == .select and !app.input.capturing) {
                     const frame: selection_input.SelectionInput.Frame = .{
@@ -2327,8 +2227,8 @@ pub fn main(init: std.process.Init) !void {
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
-                    if (app.sel_in.update(frame, app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |cmd| {
-                        app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
+                    if (app.sel_in.update(frame, app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |pd| {
+                        app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
                     }
                 } else if (app.eye_in.picking or app.active_kind == .eyedropper or
                     (pressed_left_gated and in.modifiers.alt))
@@ -2357,8 +2257,8 @@ pub fn main(init: std.process.Init) !void {
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
-                    if (app.input.update(frame, app.activeTool(), app.canvas, &app.recorder, gpa)) |cmd| {
-                        app.undo.push(gpa, .{ .frame = app.doc.selected_frame, .op = cmd });
+                    if (app.input.update(frame, app.activeTool(), app.canvas, &app.recorder, gpa)) |pd| {
+                        app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
                     }
                 }
             }

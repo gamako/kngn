@@ -72,7 +72,7 @@ pub const SelectionInput = struct {
         layer_idx: usize,
         gpa: std.mem.Allocator,
         mode: core.selection.Blend,
-    ) ?core.Op {
+    ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
 
         // press 起点: 未開始かつ canvas 表示領域内で押下 → marquee or moving を開始
@@ -150,7 +150,7 @@ pub const SelectionInput = struct {
     }
 
     /// release: 実レイヤーを最終形へ焼き、1 ドラッグ分の diff を push 用に返す。float は保持。
-    fn commitMove(self: *SelectionInput, canvas: *core.Canvas, layer_idx: usize, gpa: std.mem.Allocator, mode: core.selection.Blend) ?core.Op {
+    fn commitMove(self: *SelectionInput, canvas: *core.Canvas, layer_idx: usize, gpa: std.mem.Allocator, mode: core.selection.Blend) ?core.PaintDiff {
         const f = if (self.float) |*ff| ff else return null;
         const dx = self.cur.x - self.anchor.x;
         const dy = self.cur.y - self.anchor.y;
@@ -290,7 +290,7 @@ test "selection_input float: 選択内 drag で内容移動・元領域が空く
     try std.testing.expectEqual(A, px[1 * 16 + 1]);
     // (3,1) へ release（dx=2,dy=0）
     const cmd = si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    defer gpa.free(cmd.diffs);
     try std.testing.expectEqual(core.Rect{ .x = 3, .y = 1, .w = 2, .h = 2 }, c.selection.?);
     try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 1]); // 元領域は空く
     try std.testing.expectEqual(A, px[1 * 16 + 3]);
@@ -311,13 +311,13 @@ test "selection_input float: release 後の再 drag は再キャプチャせず�
 
     // move1: (1,1)→(3,1)。over なので (4,2) の X は透明部の下で残る
     _ = si.update(mkFrame(1, 1, 1, 1, true, false), &c, 0, gpa, .over);
-    if (si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.paint.diffs);
+    if (si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
     try std.testing.expectEqual(A, px[1 * 16 + 3]);
     try std.testing.expectEqual(X, px[2 * 16 + 4]);
 
     // move2: (3,1)→(5,1)。フロート再利用なら block は A 1px のみ。X は (4,2) に残り (6,2) へ運ばれない。
     _ = si.update(mkFrame(3, 1, 3, 1, true, false), &c, 0, gpa, .over);
-    if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.paint.diffs);
+    if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
     try std.testing.expectEqual(A, px[1 * 16 + 5]); // A は (5,1) へ
     try std.testing.expectEqual(X, px[2 * 16 + 4]); // X は据え置き（再キャプチャしていない証拠）
     try std.testing.expectEqual(@as(u32, 0), px[2 * 16 + 6]); // 再キャプチャなら X がここへ来るはず → 0
@@ -357,12 +357,12 @@ test "selection_input float: 外部編集が入ると次の move 開始で再 li
 
     // move1: (1,1)→(3,1)
     _ = si.update(mkFrame(1, 1, 1, 1, true, false), &c, 0, gpa, .over);
-    if (si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.paint.diffs);
+    if (si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
     // 外部編集を模す: 移動後の (3,1)=A を別色 B へ書き換え（layer != base+block@rect になる）
     px[1 * 16 + 3] = B;
     // move2 開始: stale 検知で再 lift → block は現レイヤーの内容（B）になる
     _ = si.update(mkFrame(3, 1, 3, 1, true, false), &c, 0, gpa, .over);
-    if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.paint.diffs);
+    if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
     try std.testing.expectEqual(B, px[1 * 16 + 5]); // 再 lift した B が移動
     try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 3]); // 前位置は空く
 }

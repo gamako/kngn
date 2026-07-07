@@ -39,7 +39,7 @@ pub const CanvasInput = struct {
         canvas: *core.Canvas,
         rec: *core.StrokeRecorder,
         gpa: std.mem.Allocator,
-    ) ?core.Op {
+    ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
 
         // press 起点 capture: 未 capture かつ canvas 表示領域内で押下 → 開始 + 始点描画
@@ -99,7 +99,7 @@ const Harness = struct {
     fn pixels(self: *Harness) []u32 {
         return self.canvas.layers.items[0].pixels;
     }
-    fn update(self: *Harness, frame: CanvasInput.Frame) ?core.Op {
+    fn update(self: *Harness, frame: CanvasInput.Frame) ?core.PaintDiff {
         return self.ci.update(frame, self.pen.tool(), &self.canvas, &self.rec, self.gpa);
     }
 };
@@ -137,8 +137,8 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
     try std.testing.expect(!h.ci.capturing);
 
     const c = cmd.?;
-    defer h.gpa.free(c.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 1), c.paint.diffs.len);
+    defer h.gpa.free(c.diffs);
+    try std.testing.expectEqual(@as(usize, 1), c.diffs.len);
 }
 
 test "canvas_input: 同フレーム down→move（押下即ドラッグ）で初手セグメントが欠落しない" {
@@ -192,7 +192,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
     try std.testing.expect(cmd != null);
     try std.testing.expect(!h.ci.capturing);
     const c = cmd.?;
-    defer h.gpa.free(c.paint.diffs);
+    defer h.gpa.free(c.diffs);
     // 行 y=2 の x=2..15 は塗られている（出ていく途中）
     for (2..16) |x| try std.testing.expectEqual(RED, h.pixels()[2 * 16 + x]);
 }
@@ -238,7 +238,7 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
     }, eraser.tool(), &h.canvas, &h.rec, h.gpa);
     try std.testing.expect(cmd != null);
     const c = cmd.?;
-    defer h.gpa.free(c.paint.diffs);
+    defer h.gpa.free(c.diffs);
     // Pen(RED) で塗られている（Eraser=透明 ではない）
     for (0..4) |x| try std.testing.expectEqual(RED, h.pixels()[x]);
 }

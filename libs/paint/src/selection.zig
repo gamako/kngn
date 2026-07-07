@@ -18,7 +18,7 @@ const Canvas = canvas_mod.Canvas;
 const Rect = canvas_mod.Rect;
 const undo_mod = @import("undo.zig");
 const PixelDiff = undo_mod.PixelDiff;
-const Op = undo_mod.Op;
+const PaintDiff = undo_mod.PaintDiff;
 const blend = @import("blend.zig");
 
 /// paste/move のブロック配置方法。
@@ -86,7 +86,7 @@ pub fn extract(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) Pi
 
 /// rect（canvas 内前提）を透明（0）化する paint cmd を作り canvas へ適用して返す。
 /// 変更ピクセルが無ければ null（cut で選択が空の領域など）。cut の「元領域消去」に使う。
-pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) ?Op {
+pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) ?PaintDiff {
     const px = canvas.layerPixels(layer_idx);
     const w: usize = @intCast(rect.w);
     const h: usize = @intCast(rect.h);
@@ -111,7 +111,7 @@ pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rec
 /// block を canvas 上 (dx,dy) 左上として配置する paint cmd を作り適用して返す。
 /// mode=replace は上書き、mode=over は srcOver 合成（透明部は配置先を残す）。
 /// canvas 外へはみ出す部分は clip。変更が無ければ null。paste に使う。
-pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelBlock, dx: i32, dy: i32, mode: Blend) ?Op {
+pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelBlock, dx: i32, dy: i32, mode: Blend) ?PaintDiff {
     const px = canvas.layerPixels(layer_idx);
     const w_i: i32 = @intCast(canvas.width);
     const h_i: i32 = @intCast(canvas.height);
@@ -206,7 +206,7 @@ pub fn layerMatchesRender(layer: []const u32, base: []const u32, block: PixelBlo
 }
 
 /// 同型 slice の差分を paint cmd 化する（変更なしは null）。move 確定時の undo entry 生成に使う。
-pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_idx: usize) ?Op {
+pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_idx: usize) ?PaintDiff {
     std.debug.assert(before.len == after.len);
     var diffs: std.ArrayList(PixelDiff) = .empty;
     // 上限 = 全画素。事前確保してループ内の再確保を排除（TASK-59）
@@ -219,20 +219,21 @@ pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_id
 }
 
 /// diffs を owned slice 化して paint cmd を返す。空なら破棄して null。
-fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?Op {
+fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?PaintDiff {
     if (diffs.items.len == 0) {
         diffs.deinit(gpa);
         return null;
     }
     const owned = diffs.toOwnedSlice(gpa) catch @panic("selection.finishDiffs: OOM");
-    return .{ .paint = .{ .layer_idx = layer_idx, .diffs = owned } };
+    return .{ .layer_idx = layer_idx, .diffs = owned };
 }
 
 // ============================================================
 // Tests
 // ============================================================
 
-const UndoStack = undo_mod.UndoStack;
+const document_mod = @import("document.zig");
+const Document = document_mod.Document;
 const A: u32 = 0xFF000001;
 const B: u32 = 0xFF000002;
 const C: u32 = 0xFF000003;
@@ -271,50 +272,57 @@ test "extract: layer から矩形を複製する" {
 }
 
 test "clearRectCmd: 領域を透明化し undo で復元" {
+    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
     const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 4, 4);
-    defer c.deinit();
-    var undo: UndoStack = .{};
-    defer undo.deinit(gpa);
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+    const c = doc.activeCanvas();
     const px = c.layerPixels(0);
     px[1 * 4 + 1] = A;
     px[2 * 4 + 2] = D;
     const before = [_]u32{ 0, 0, 0, 0, 0, A, 0, 0, 0, 0, D, 0, 0, 0, 0, 0 };
     try std.testing.expectEqualSlices(u32, &before, px);
+    // 初回コミット（grid が null→cel化。created=true）を先に確定しておく。これをしないと
+    // 直後の clearRectCmd の undo が「created フラグの初回paint」扱いになり、grid が null に
+    // 戻って透明（全0）へ復元されてしまう（意図通りの厳密挙動。plan §14 v6/5.4節）。
+    const initial_diffs = try gpa.dupe(PixelDiff, &.{
+        .{ .idx = 5, .before = 0, .after = A },
+        .{ .idx = 10, .before = 0, .after = D },
+    });
+    try doc.pushPaintOp(gpa, 0, initial_diffs);
 
-    const cmd = clearRectCmd(gpa, &c, 0, .{ .x = 1, .y = 1, .w = 2, .h = 2 }) orelse return error.TestUnexpectedNull;
-    undo.push(gpa, .{ .op = cmd });
+    const pd = clearRectCmd(gpa, c, 0, .{ .x = 1, .y = 1, .w = 2, .h = 2 }) orelse return error.TestUnexpectedNull;
+    try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
     for ([_]usize{ 5, 6, 9, 10 }) |i| try std.testing.expectEqual(@as(u32, 0), px[i]);
 
-    undo.undoOne(gpa, &.{&c});
+    doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, &before, px);
 }
 
 test "pasteCmd: 指定座標へ上書き（gate 非経由）/ clip / undo" {
     const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 4, 4);
-    defer c.deinit();
-    var undo: UndoStack = .{};
-    defer undo.deinit(gpa);
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+    const c = doc.activeCanvas();
     // selection を張っていても paste は gate をバイパスして書ける（選択外 (1,1) 起点へ）
     c.setSelection(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
     var block = PixelBlock{ .w = 2, .h = 2, .pixels = try gpa.dupe(u32, &[_]u32{ A, B, C, D }) };
     defer block.deinit(gpa);
 
-    const cmd = pasteCmd(gpa, &c, 0, block, 1, 1, .replace) orelse return error.TestUnexpectedNull;
-    undo.push(gpa, .{ .op = cmd });
+    const pd = pasteCmd(gpa, c, 0, block, 1, 1, .replace) orelse return error.TestUnexpectedNull;
+    try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
     const px = c.layerPixels(0);
     try std.testing.expectEqual(A, px[1 * 4 + 1]);
     try std.testing.expectEqual(B, px[1 * 4 + 2]);
     try std.testing.expectEqual(C, px[2 * 4 + 1]);
     try std.testing.expectEqual(D, px[2 * 4 + 2]);
 
-    undo.undoOne(gpa, &.{&c});
+    doc.undoOne(gpa);
     for (px) |p| try std.testing.expectEqual(@as(u32, 0), p);
 
     // canvas 端へ clip（(3,3) 起点は A の 1px のみ収まる）
-    const cmd2 = pasteCmd(gpa, &c, 0, block, 3, 3, .replace) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd2.paint.diffs);
+    const pd2 = pasteCmd(gpa, c, 0, block, 3, 3, .replace) orelse return error.TestUnexpectedNull;
+    defer gpa.free(pd2.diffs);
     try std.testing.expectEqual(A, px[3 * 4 + 3]);
     var n: usize = 0;
     for (px) |p| {
@@ -334,7 +342,7 @@ test "pasteCmd over: 透明部は配置先を残す（replace は消す）" {
         var block = PixelBlock{ .w = 2, .h = 2, .pixels = try gpa.dupe(u32, &[_]u32{ A, 0, 0, 0 }) };
         defer block.deinit(gpa);
         const cmd = pasteCmd(gpa, &c, 0, block, 0, 0, .over) orelse return error.TestUnexpectedNull;
-        defer gpa.free(cmd.paint.diffs);
+        defer gpa.free(cmd.diffs);
         try std.testing.expectEqual(A, c.layerPixels(0)[0]); // 不透明部は配置
         try std.testing.expectEqual(X, c.layerPixels(0)[1 * 4 + 1]); // 透明部の下の X は残る
     }
@@ -345,7 +353,7 @@ test "pasteCmd over: 透明部は配置先を残す（replace は消す）" {
         var block = PixelBlock{ .w = 2, .h = 2, .pixels = try gpa.dupe(u32, &[_]u32{ A, 0, 0, 0 }) };
         defer block.deinit(gpa);
         const cmd = pasteCmd(gpa, &c, 0, block, 0, 0, .replace) orelse return error.TestUnexpectedNull;
-        defer gpa.free(cmd.paint.diffs);
+        defer gpa.free(cmd.diffs);
         try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[1 * 4 + 1]); // X は消える
     }
 }
@@ -411,7 +419,7 @@ test "diffCmd: 差分のみ paint cmd 化 / 無変更は null" {
     const before = [_]u32{ 0, A, 0, 0 };
     const after = [_]u32{ 0, B, C, 0 };
     const cmd = diffCmd(gpa, &before, &after, 0) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 2), cmd.paint.diffs.len); // idx1(A→B), idx2(0→C)
+    defer gpa.free(cmd.diffs);
+    try std.testing.expectEqual(@as(usize, 2), cmd.diffs.len); // idx1(A→B), idx2(0→C)
     try std.testing.expect(diffCmd(gpa, &before, &before, 0) == null); // 無変更
 }

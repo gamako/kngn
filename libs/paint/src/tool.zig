@@ -4,7 +4,7 @@
 //!   （`ptr: *anyopaque` + `vtable: *const VTable`）。
 //! - stroke 記録機械（dedup・before 観測・Bresenham）は tool 非依存なので
 //!   `core/undo.zig` の共有 `StrokeRecorder` に置き、Tool は「どの色で塗るか」だけを決める。
-//! - `onEvent` は `.up` で stroke を確定し `?Op` を返す（呼び出し側が UndoStack へ push）。
+//! - `onEvent` は `.up` で stroke を確定し `?PaintDiff` を返す（呼び出し側が UndoStack へ push）。
 //!   `.down` で対象レイヤ・色を recorder に latch するので、stroke 中にツール/色を
 //!   切り替えても進行中の stroke は latch 値で描かれる（＝旧 PaintEngine の挙動）。
 //! - Pen / Eraser は塗り色が違うだけ（実態）。vtable は将来 Fill / Picker が挿さる拡張点。
@@ -15,7 +15,7 @@ const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
 const undo_mod = @import("undo.zig");
 const StrokeRecorder = undo_mod.StrokeRecorder;
-const Op = undo_mod.Op;
+const PaintDiff = undo_mod.PaintDiff;
 
 /// Eraser の塗り色（透明）。canonical BGRA 0xAARRGGBB の a=0。
 pub const ERASER_COLOR: u32 = 0x00000000;
@@ -32,14 +32,14 @@ pub const Tool = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// down: begin(layer,色)+point / move: lineTo / up: lineTo+finish→?Op。
+        /// down: begin(layer,色)+point / move: lineTo / up: lineTo+finish→?PaintDiff。
         /// gpa は finish 用。OOM は finish 内で @panic なので error union は返さない。
-        onEvent: *const fn (ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?Op,
+        onEvent: *const fn (ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff,
         /// ツール自身の内部状態をリセットする（Pen/Eraser は状態を持たないので no-op）。
         reset: *const fn (ptr: *anyopaque) void,
     };
 
-    pub fn onEvent(self: Tool, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?Op {
+    pub fn onEvent(self: Tool, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff {
         return self.vtable.onEvent(self.ptr, canvas, rec, gpa, ev);
     }
     pub fn reset(self: Tool) void {
@@ -48,7 +48,7 @@ pub const Tool = struct {
 };
 
 /// Pen / Eraser 共通の「単色ブラシ」イベント処理。size>1 は本タスク未実装。
-fn brushOnEvent(rec: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, color: u32, ev: ToolEvent) ?Op {
+fn brushOnEvent(rec: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, color: u32, ev: ToolEvent) ?PaintDiff {
     switch (ev) {
         .down => |p| {
             rec.begin(canvas.selected_layer, color);
@@ -75,7 +75,7 @@ pub const Pen = struct {
     pub fn tool(self: *Pen) Tool {
         return .{ .ptr = self, .vtable = &vtable };
     }
-    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?Op {
+    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff {
         const self: *Pen = @ptrCast(@alignCast(ptr));
         return brushOnEvent(rec, canvas, gpa, self.color, ev);
     }
@@ -92,7 +92,7 @@ pub const Eraser = struct {
     pub fn tool(self: *Eraser) Tool {
         return .{ .ptr = self, .vtable = &vtable };
     }
-    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?Op {
+    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff {
         const self: *Eraser = @ptrCast(@alignCast(ptr));
         _ = self;
         return brushOnEvent(rec, canvas, gpa, ERASER_COLOR, ev);
@@ -174,7 +174,7 @@ pub const Brush = struct {
         }
     }
 
-    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?Op {
+    fn onEventImpl(ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff {
         const self: *Brush = @ptrCast(@alignCast(ptr));
         switch (ev) {
             .down => |p| {
@@ -202,29 +202,29 @@ pub const Brush = struct {
 // Tests
 // ============================================================
 
-const UndoStack = undo_mod.UndoStack;
 const Offset = undo_mod.Offset;
 const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
 
 // Tool 経路（onEvent down/move/up）でゴールデン: 描画 → undo → PNG round-trip 一致（AC#3）。
+// undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
 test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip が一致する" {
     const png = @import("png");
     const io_png = @import("io_png.zig");
+    const document_mod = @import("document.zig");
     const gpa = std.testing.allocator;
 
-    var canvas = try Canvas.init(gpa, 16, 16);
-    defer canvas.deinit();
+    var doc = try document_mod.Document.init(gpa, 16, 16);
+    defer doc.deinit();
+    const canvas = doc.activeCanvas();
     var rec = try StrokeRecorder.init(gpa, 16, 16);
     defer rec.deinit(gpa);
-    var undo: UndoStack = .{};
-    defer undo.deinit(gpa);
 
     // Pen で (0,0)→(5,0) を RED で描く
     var pen: Pen = .{ .color = RED };
     const pt = pen.tool();
-    try std.testing.expectEqual(@as(?Op, null), pt.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } }));
-    try std.testing.expectEqual(@as(?Op, null), pt.onEvent(&canvas, &rec, gpa, .{ .move = .{ .x = 5, .y = 0 } }));
-    if (pt.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 5, .y = 0 } })) |cmd| undo.push(gpa, .{ .op = cmd });
+    try std.testing.expectEqual(@as(?PaintDiff, null), pt.onEvent(canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } }));
+    try std.testing.expectEqual(@as(?PaintDiff, null), pt.onEvent(canvas, &rec, gpa, .{ .move = .{ .x = 5, .y = 0 } }));
+    if (pt.onEvent(canvas, &rec, gpa, .{ .up = .{ .x = 5, .y = 0 } })) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 
     for (0..6) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[x]);
 
@@ -235,14 +235,14 @@ test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip 
     // Eraser で同じ線を消す（透明 = 0）
     var eraser: Eraser = .{};
     const et = eraser.tool();
-    _ = et.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
-    _ = et.onEvent(&canvas, &rec, gpa, .{ .move = .{ .x = 5, .y = 0 } });
-    if (et.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 5, .y = 0 } })) |cmd| undo.push(gpa, .{ .op = cmd });
+    _ = et.onEvent(canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
+    _ = et.onEvent(canvas, &rec, gpa, .{ .move = .{ .x = 5, .y = 0 } });
+    if (et.onEvent(canvas, &rec, gpa, .{ .up = .{ .x = 5, .y = 0 } })) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 
     for (0..6) |x| try std.testing.expectEqual(@as(u32, 0), canvas.layerPixels(0)[x]);
 
     // undo で Pen の線が復元される
-    undo.undoOne(gpa, &.{&canvas});
+    doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, drawn, canvas.layerPixels(0));
 
     // PNG round-trip（保存は raw layer pixels）
@@ -274,7 +274,7 @@ test "Tool: stroke 中の Pen.color 変更は進行中 stroke に影響しない
     pen.color = GREEN; // stroke 中に色変更（UI はこの場で更新されるが描画色は据え置きのはず）
     _ = pt.onEvent(&canvas, &rec, gpa, .{ .move = .{ .x = 3, .y = 0 } });
     if (pt.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 3, .y = 0 } })) |cmd| {
-        defer gpa.free(cmd.paint.diffs);
+        defer gpa.free(cmd.diffs);
     }
 
     // (0,0)..(3,0) は全て RED（GREEN が混ざらない）
@@ -299,7 +299,7 @@ test "Tool: 空 stroke（変更なし）では onEvent(.up) が null を返す" 
     var eraser: Eraser = .{};
     const et = eraser.tool();
     _ = et.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 2, .y = 2 } });
-    try std.testing.expectEqual(@as(?Op, null), et.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 4, .y = 4 } }));
+    try std.testing.expectEqual(@as(?PaintDiff, null), et.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 4, .y = 4 } }));
 }
 
 test "Tool: selected_layer に描画する" {
@@ -316,11 +316,11 @@ test "Tool: selected_layer に描画する" {
     const pt = pen.tool();
     _ = pt.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
     const cmd = pt.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 0, .y = 0 } }) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    defer gpa.free(cmd.diffs);
 
     try std.testing.expectEqual(@as(u32, 0), canvas.layerPixels(0)[0]);
     try std.testing.expectEqual(RED, canvas.layerPixels(1)[0]);
-    try std.testing.expectEqual(@as(usize, 1), cmd.paint.layer_idx);
+    try std.testing.expectEqual(@as(usize, 1), cmd.layer_idx);
 }
 
 // ── Brush footprint / stroke テスト（TASK-21.12）─────────────
@@ -376,25 +376,26 @@ test "Brush.buildDab: size=64 / size>64(clamp) で overflow しない" {
 }
 
 test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（partial alpha）" {
+    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
     const png = @import("png");
     const io_png = @import("io_png.zig");
+    const document_mod = @import("document.zig");
     const gpa = std.testing.allocator;
 
-    var canvas = try Canvas.init(gpa, 16, 16);
-    defer canvas.deinit();
+    var doc = try document_mod.Document.init(gpa, 16, 16);
+    defer doc.deinit();
+    const canvas = doc.activeCanvas();
     var rec = try StrokeRecorder.init(gpa, 16, 16);
     defer rec.deinit(gpa);
-    var undo: UndoStack = .{};
-    defer undo.deinit(gpa);
 
     const blank = try gpa.dupe(u32, canvas.layerPixels(0));
     defer gpa.free(blank);
 
     var brush: Brush = .{ .color = 0xFF00FF00, .size = 3, .opacity = 255, .hardness_q = 255 };
     const bt = brush.tool();
-    _ = bt.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 4, .y = 4 } });
-    _ = bt.onEvent(&canvas, &rec, gpa, .{ .move = .{ .x = 9, .y = 4 } });
-    if (bt.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 9, .y = 4 } })) |cmd| undo.push(gpa, .{ .op = cmd });
+    _ = bt.onEvent(canvas, &rec, gpa, .{ .down = .{ .x = 4, .y = 4 } });
+    _ = bt.onEvent(canvas, &rec, gpa, .{ .move = .{ .x = 9, .y = 4 } });
+    if (bt.onEvent(canvas, &rec, gpa, .{ .up = .{ .x = 9, .y = 4 } })) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 
     // 何かしら塗られている（size=3 で太さが出る → 中心線以外も塗られる）
     var painted: usize = 0;
@@ -415,6 +416,6 @@ test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（part
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
     // undo で空へ復元
-    undo.undoOne(gpa, &.{&canvas});
+    doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, blank, canvas.layerPixels(0));
 }

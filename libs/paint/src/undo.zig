@@ -1,19 +1,21 @@
-//! Undo/Redo とストローク記録（TASK-21.7 で pixie/paint.zig から core へ移設）
+//! ストローク記録（TASK-21.7 で pixie/paint.zig から core へ移設。TASK-45.1 で Document 側へ
+//! Op/UndoStack を移設し本ファイルを縮小）。
 //!
 //! - `StrokeRecorder`: stroke 中に変更したピクセルの (idx, before, after) を記録する
 //!   tool 非依存の機械。dedup（同一 stroke 内の再塗りは最初の before のみ）・before 観測・
-//!   Bresenham 線補間を担う。`finish` で owned slice の `UndoCmd` を確定して返す。
-//! - `UndoStack`: `UndoCmd` を before/after 両持ちで保持し、undo/redo はスタック間の
-//!   移動 + 値適用だけで可逆。`pushClear` は全消去を 1 コマンドとして原子的に積む。
+//!   Bresenham 線補間を担う。`finish`/`brushFinish` で owned slice の `PaintDiff` を確定して返す。
+//! - `PaintDiff`: 「まだ Document の cel_id を知らない、生の編集結果」を表す中間型
+//!   （layer_idx + diffs）。呼び出し側（pixie App）はこれを `Document.pushPaintOp` へそのまま渡す。
+//! - **本ファイルは `document.zig` を一切 import しない**（依存は一方向:
+//!   `document.zig` → `undo.zig` → `canvas.zig`。循環 import 回避。TASK-45.1 plan 5.1節）。
+//!   `Op`/`UndoStack`（push/apply・CelSetSnapshot 込み）は `document.zig` 側に移設済み。
 //! - OOM は `@panic`（core 全体のポリシー。決定と理由は docs/adr/006_editor_coreのOOMポリシー.md）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const canvas_mod = @import("canvas.zig");
 const Canvas = canvas_mod.Canvas;
-const Layer = canvas_mod.Layer;
 const Vec2 = canvas_mod.Vec2;
-const TextParams = canvas_mod.TextParams;
 const blend = @import("blend.zig");
 
 /// レイヤー名の固定長スナップショット（TASK-79.3）。`Layer.name_buf`/`name_len` と同じ形で
@@ -44,96 +46,11 @@ pub const PixelDiff = struct { idx: u32, before: u32, after: u32 };
 pub const Offset = struct { dx: i16, dy: i16, cov: u8 };
 pub const Dab = struct { offsets: []const Offset };
 
-/// 1 操作の中身（frame 非依存）。diffs / held layer は gpa 所有の owned（pop / deinit で free）。
-/// tool / selection / path は frame を知らないので `Op` を返し、frame は push 時に付与される（TASK-63）。
-pub const Op = union(enum) {
-    paint: struct {
-        layer_idx: usize,
-        diffs: []PixelDiff,
-    },
-    layer_add: struct {
-        index: usize,
-        selected_before: usize,
-        selected_after: usize,
-        layer: ?Layer = null,
-    },
-    layer_delete: struct {
-        index: usize,
-        selected_before: usize,
-        selected_after: usize,
-        layer: ?Layer,
-    },
-    layer_reorder: struct {
-        from: usize,
-        to: usize,
-        selected_before: usize,
-        selected_after: usize,
-    },
-    layer_visible: struct {
-        index: usize,
-        before: bool,
-        after: bool,
-    },
-    layer_opacity: struct {
-        index: usize,
-        before: u8,
-        after: u8,
-    },
-    /// レイヤー名変更（Rename。TASK-79.3）。before/after は固定長 `NameSnapshot` の値コピーで
-    /// 十分なため、layer_visible/layer_opacity と同じ「所有権移動なしの軽量 Op」として扱う。
-    layer_rename: struct {
-        index: usize,
-        before: NameSnapshot,
-        after: NameSnapshot,
-    },
-    /// レイヤー結合（merge down。TASK-79.2）: 選択レイヤー(index)を直下(index-1)へ src-over
-    /// 焼き込みし、選択レイヤー自体を削除する 1 操作。「下位レイヤーへのピクセル合成」と
-    /// 「上位レイヤーの削除」という 2 つの構造変化を **1 つの atomic Op** として保持する
-    /// （2 つの UndoCmd に分けると、片方だけ undo された状態で別操作が push された際に
-    /// below_before/after が古いレイヤー構造を指してしまう危険があるため。codex レビュー
-    /// 指摘 2026-07-05）。below_before/below_after は常時保持（layer_add/layer_delete の
-    /// `layer` フィールドのような null/non-null 切替はしない。`.paint` の diffs と同じ扱い）。
-    layer_merge_down: struct {
-        /// 削除された上位レイヤーの元 index（下位は index-1 固定＝隣接前提）。
-        index: usize,
-        selected_before: usize,
-        selected_after: usize,
-        /// 削除された上位レイヤーの完全スナップショット（layer_delete と同じ null/non-null 規約:
-        /// push 時点=非null(canvas はもう保持しない) → undo で reinsert し null → redo で再度非null）。
-        layer: ?Layer,
-        /// 下位レイヤー(index-1)の結合前ピクセル（owned。undo で復元）。
-        below_before: []u32,
-        /// 下位レイヤー(index-1)の結合後ピクセル（owned。redo で復元）。
-        below_after: []u32,
-    },
-    /// テキストレイヤーの text_params 変更（内容/サイズ/色/位置の編集確定。TASK-79.5）。
-    /// `TextParams` は POD（所有権を持つスライスが無い）なので、before/after は値コピーの
-    /// 固定長スナップショットで足りる。pixels は before/after の TextParams から
-    /// `Canvas.setLayerTextParams`（内部で `text_render.rasterizeTextLayer`）で再生成できるため
-    /// 保持しない（`layer_rename` と同じ「軽量 Op」の分類。この可逆性は「text kind の Layer は
-    /// text layer への直接 raster 編集を禁止する」という pixie App 層の不変条件に依存する。
-    /// canvas.zig の `TextParams` doc comment 参照）。
-    layer_text_params: struct {
-        index: usize,
-        before: canvas_mod.TextParams,
-        after: canvas_mod.TextParams,
-    },
-    /// テキストレイヤーの raster 確定（Rasterize/bake。TASK-79.5）。pixels は不変（bake は
-    /// ラスタライズ済みキャッシュをそのまま raster として確定するだけ）なので、undo/redo とも
-    /// `Canvas.setLayerKindText` の呼び出しのみで済む（pixels スナップショットが要らない）。
-    /// redo（`.raster` 化）は常に決定的な値（`text_params=.{}` の既定値）になるため after は
-    /// 持たない。
-    layer_rasterize: struct {
-        index: usize,
-        before: canvas_mod.TextParams,
-    },
-};
-
-/// 1 undo エントリ = 操作(op) + それが適用されたフレーム(frame)。
-/// frame は Document の frame index。MVP は 1 frame なので常に 0（TASK-45 でアニメ対応）。
-pub const UndoCmd = struct {
-    frame: u32 = 0,
-    op: Op,
+/// stroke 確定結果（frame/cel をまだ知らない生の編集結果。TASK-45.1）。
+/// `diffs` は gpa 所有（呼び出し側が `Document.pushPaintOp` へ渡すと所有権が移る）。
+pub const PaintDiff = struct {
+    layer_idx: usize,
+    diffs: []PixelDiff,
 };
 
 /// stroke 記録機械。canvas は所有せず、point/lineTo/stamp に都度渡す。
@@ -241,15 +158,16 @@ pub const StrokeRecorder = struct {
     }
 
     /// stroke を確定する。変更ピクセルが無ければ null（redo を保持するため）。
-    /// 非 null の場合、diffs の所有権は返す Op へ移る（frame は push 時に付与）。
-    pub fn finish(self: *StrokeRecorder, gpa: Allocator) ?Op {
+    /// 非 null の場合、diffs の所有権は返す PaintDiff へ移る（呼び出し側が
+    /// `Document.pushPaintOp` へそのまま渡す。TASK-45.1）。
+    pub fn finish(self: *StrokeRecorder, gpa: Allocator) ?PaintDiff {
         std.debug.assert(self.mode == .replace);
         self.mode = .none;
         if (self.diffs.items.len == 0) return null;
         // toOwnedSlice でなく exact コピー + capacity 維持（次 stroke がゼロから再成長しない。TASK-59）
         const owned = gpa.dupe(PixelDiff, self.diffs.items) catch @panic("StrokeRecorder.finish: OOM");
         self.diffs.clearRetainingCapacity();
-        return .{ .paint = .{ .layer_idx = self.layer_idx, .diffs = owned } };
+        return .{ .layer_idx = self.layer_idx, .diffs = owned };
     }
 
     // ── brush 経路（ソフトブラシ・paint 専用。TASK-21.11）─────────────────
@@ -330,7 +248,7 @@ pub const StrokeRecorder = struct {
 
     /// brush stroke を確定する。canvas が必要（layer!=orig 判定）。変更なしは null。
     /// diff 有無に関わらず touched の coverage を 0 へ戻し（不変条件維持）touched を空にする。
-    pub fn brushFinish(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) ?Op {
+    pub fn brushFinish(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) ?PaintDiff {
         std.debug.assert(self.mode == .brush);
         self.mode = .none;
         const pixels = canvas.layerPixels(self.layer_idx);
@@ -347,207 +265,36 @@ pub const StrokeRecorder = struct {
         // toOwnedSlice でなく exact コピー + capacity 維持（次 stroke がゼロから再成長しない。TASK-59）
         const owned = gpa.dupe(PixelDiff, self.diffs.items) catch @panic("StrokeRecorder.brushFinish: OOM");
         self.diffs.clearRetainingCapacity();
-        return .{ .paint = .{ .layer_idx = self.layer_idx, .diffs = owned } };
-    }
-};
-
-/// Undo/Redo スタック。各 UndoCmd の diffs は gpa 所有。
-/// 履歴は `max_history` 件で打ち止め（超過時は最古を解放して trim = 長時間編集でも単調増加しない。TASK-59）。
-pub const UndoStack = struct {
-    /// undo 履歴の上限件数。超過時に最古の cmd を解放して落とす。
-    pub const max_history: usize = 128;
-
-    undo: std.ArrayList(UndoCmd) = .empty,
-    redo: std.ArrayList(UndoCmd) = .empty,
-
-    pub fn deinit(self: *UndoStack, gpa: Allocator) void {
-        freeStack(gpa, &self.undo);
-        freeStack(gpa, &self.redo);
-    }
-
-    fn freeStack(gpa: Allocator, stack: *std.ArrayList(UndoCmd)) void {
-        for (stack.items) |cmd| freeCmd(gpa, cmd.op);
-        stack.deinit(gpa);
-    }
-
-    fn freeCmd(gpa: Allocator, op: Op) void {
-        switch (op) {
-            .paint => |p| gpa.free(p.diffs),
-            .layer_add => |la| if (la.layer) |layer| gpa.free(layer.pixels),
-            .layer_delete => |ld| if (ld.layer) |layer| gpa.free(layer.pixels),
-            .layer_reorder, .layer_visible, .layer_opacity, .layer_rename => {},
-            .layer_text_params, .layer_rasterize => {}, // POD（所有権を持つスライス無し）
-            .layer_merge_down => |lm| {
-                if (lm.layer) |layer| gpa.free(layer.pixels);
-                gpa.free(lm.below_before);
-                gpa.free(lm.below_after);
-            },
-        }
-    }
-
-    fn clearRedo(self: *UndoStack, gpa: Allocator) void {
-        for (self.redo.items) |cmd| freeCmd(gpa, cmd.op);
-        self.redo.clearRetainingCapacity();
-    }
-
-    /// 非空コマンドを積む。redo 履歴をクリアする。空コマンドは渡さないこと（呼び出し側が
-    /// `finish`/`pushClear` で no-op を吸収済み）。cmd.frame は呼び出し側が付与済み。
-    pub fn push(self: *UndoStack, gpa: Allocator, cmd: UndoCmd) void {
-        self.clearRedo(gpa);
-        // 履歴上限: 最古を解放して trim（イベント時のみの O(n) ポインタシフトは許容。TASK-59）
-        if (self.undo.items.len >= max_history) {
-            freeCmd(gpa, self.undo.orderedRemove(0).op);
-        }
-        self.undo.append(gpa, cmd) catch @panic("UndoStack.push: OOM");
-    }
-
-    /// 直近のコマンドを取り消す（before 適用）。空スタックでは何もしない。
-    /// `frames` は Document の frame 配列（`[]const *Canvas`）。cmd.frame でどの Canvas に
-    /// 適用するかを解決する（undo→Document 結合を避けるため slice で受ける。TASK-63）。
-    pub fn undoOne(self: *UndoStack, gpa: Allocator, frames: []const *Canvas) void {
-        var cmd = self.undo.pop() orelse return;
-        std.debug.assert(cmd.frame < frames.len);
-        applyBefore(frames[cmd.frame], &cmd.op);
-        self.redo.append(gpa, cmd) catch @panic("UndoStack.undoOne: OOM");
-    }
-
-    /// 取り消したコマンドをやり直す（after 適用）。空スタックでは何もしない。
-    pub fn redoOne(self: *UndoStack, gpa: Allocator, frames: []const *Canvas) void {
-        var cmd = self.redo.pop() orelse return;
-        std.debug.assert(cmd.frame < frames.len);
-        applyAfter(frames[cmd.frame], &cmd.op);
-        self.undo.append(gpa, cmd) catch @panic("UndoStack.redoOne: OOM");
-    }
-
-    // op は *Op で受ける（layer_add/delete/merge_down が op.layer の所有権を undo/redo 間で
-    // 移動するため。値渡しにすると所有権移動が壊れる。TASK-63 codex 指摘）。
-    fn applyBefore(canvas: *Canvas, op_ptr: *Op) void {
-        switch (op_ptr.*) {
-            .paint => |p| {
-                const pixels = canvas.layerPixels(p.layer_idx);
-                for (p.diffs) |d| pixels[d.idx] = d.before;
-            },
-            .layer_add => |*op| {
-                op.layer = canvas.deleteLayer(op.index) orelse @panic("UndoStack.layer_add undo: missing layer");
-                _ = canvas.selectLayer(op.selected_before);
-            },
-            .layer_delete => |*op| {
-                const layer = op.layer orelse @panic("UndoStack.layer_delete undo: missing held layer");
-                op.layer = null;
-                canvas.insertLayer(canvas.allocator, op.index, layer) catch @panic("UndoStack.layer_delete undo: OOM");
-                _ = canvas.selectLayer(op.selected_before);
-            },
-            .layer_reorder => |op| {
-                if (!canvas.moveLayer(op.to, op.from)) @panic("UndoStack.layer_reorder undo: invalid layer");
-                _ = canvas.selectLayer(op.selected_before);
-            },
-            .layer_visible => |op| {
-                if (!canvas.setLayerVisible(op.index, op.before)) @panic("UndoStack.layer_visible undo: invalid layer");
-            },
-            .layer_opacity => |op| {
-                if (!canvas.setLayerOpacity(op.index, op.before)) @panic("UndoStack.layer_opacity undo: invalid layer");
-            },
-            .layer_rename => |op| {
-                if (!canvas.setLayerName(op.index, op.before.slice())) @panic("UndoStack.layer_rename undo: invalid layer");
-            },
-            .layer_text_params => |op| {
-                canvas.setLayerTextParams(op.index, op.before) catch @panic("UndoStack.layer_text_params undo: invalid layer/rasterize failed");
-            },
-            .layer_rasterize => |op| {
-                if (!canvas.setLayerKindText(op.index, .text, op.before)) @panic("UndoStack.layer_rasterize undo: invalid layer");
-            },
-            .layer_merge_down => |*op| {
-                const below_idx = op.index - 1;
-                @memcpy(canvas.layerPixels(below_idx), op.below_before);
-                const layer = op.layer orelse @panic("UndoStack.layer_merge_down undo: missing held layer");
-                op.layer = null;
-                canvas.insertLayer(canvas.allocator, op.index, layer) catch @panic("UndoStack.layer_merge_down undo: OOM");
-                _ = canvas.selectLayer(op.selected_before);
-            },
-        }
-    }
-
-    fn applyAfter(canvas: *Canvas, op_ptr: *Op) void {
-        switch (op_ptr.*) {
-            .paint => |p| {
-                const pixels = canvas.layerPixels(p.layer_idx);
-                for (p.diffs) |d| pixels[d.idx] = d.after;
-            },
-            .layer_add => |*op| {
-                const layer = op.layer orelse @panic("UndoStack.layer_add redo: missing held layer");
-                op.layer = null;
-                canvas.insertLayer(canvas.allocator, op.index, layer) catch @panic("UndoStack.layer_add redo: OOM");
-                _ = canvas.selectLayer(op.selected_after);
-            },
-            .layer_delete => |*op| {
-                op.layer = canvas.deleteLayer(op.index) orelse @panic("UndoStack.layer_delete redo: missing layer");
-                _ = canvas.selectLayer(op.selected_after);
-            },
-            .layer_reorder => |op| {
-                if (!canvas.moveLayer(op.from, op.to)) @panic("UndoStack.layer_reorder redo: invalid layer");
-                _ = canvas.selectLayer(op.selected_after);
-            },
-            .layer_visible => |op| {
-                if (!canvas.setLayerVisible(op.index, op.after)) @panic("UndoStack.layer_visible redo: invalid layer");
-            },
-            .layer_opacity => |op| {
-                if (!canvas.setLayerOpacity(op.index, op.after)) @panic("UndoStack.layer_opacity redo: invalid layer");
-            },
-            .layer_rename => |op| {
-                if (!canvas.setLayerName(op.index, op.after.slice())) @panic("UndoStack.layer_rename redo: invalid layer");
-            },
-            .layer_text_params => |op| {
-                canvas.setLayerTextParams(op.index, op.after) catch @panic("UndoStack.layer_text_params redo: invalid layer/rasterize failed");
-            },
-            .layer_rasterize => |op| {
-                if (!canvas.setLayerKindText(op.index, .raster, .{})) @panic("UndoStack.layer_rasterize redo: invalid layer");
-            },
-            .layer_merge_down => |*op| {
-                const below_idx = op.index - 1;
-                @memcpy(canvas.layerPixels(below_idx), op.below_after);
-                op.layer = canvas.deleteLayer(op.index) orelse @panic("UndoStack.layer_merge_down redo: missing layer");
-                _ = canvas.selectLayer(op.selected_after);
-            },
-        }
-    }
-
-    /// 全消去を 1 コマンドとして原子的に積む（build→memset→push を 1 API に集約し、
-    /// 呼び出し側が memset と push を取り違える事故を防ぐ）。変更ゼロなら何もしない。
-    /// 注: 「API 上の集約」であって OOM ロールバックではない。途中 OOM は @panic。
-    pub fn pushClear(self: *UndoStack, gpa: Allocator, canvas: *Canvas, frame: u32, layer_idx: usize) void {
-        const pixels = canvas.layerPixels(layer_idx);
-        var diffs: std.ArrayList(PixelDiff) = .empty;
-        // 上限 = 層の全画素。事前確保してループ内の再確保を排除（TASK-59）
-        diffs.ensureTotalCapacity(gpa, pixels.len) catch @panic("UndoStack.pushClear: OOM");
-        for (pixels, 0..) |p, i| {
-            if (p == 0) continue;
-            diffs.appendAssumeCapacity(.{ .idx = @intCast(i), .before = p, .after = 0 });
-        }
-        if (diffs.items.len == 0) {
-            diffs.deinit(gpa);
-            return;
-        }
-        @memset(pixels, 0);
-        const owned = diffs.toOwnedSlice(gpa) catch @panic("UndoStack.pushClear: OOM");
-        self.push(gpa, .{ .frame = frame, .op = .{ .paint = .{ .layer_idx = layer_idx, .diffs = owned } } });
+        return .{ .layer_idx = self.layer_idx, .diffs = owned };
     }
 };
 
 // ============================================================
 // Tests
+//
+// 本ファイルは StrokeRecorder（diff 記録の正しさ）だけをテストする。push/undo/redo/Op の
+// 正しさは document.zig 側（Document.pushPaintOp/undoOne/redoOne 経由）でテストする
+// （TASK-45.1 で Op/UndoStack を document.zig へ移設したため）。
 // ============================================================
 
 const BLACK: u32 = 0xFF000000;
 const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
 const ERASE: u32 = 0x00000000;
 
-/// テスト用の薄い配線（StrokeRecorder + UndoStack + Canvas）。
-/// main / Tool 経路と同じ core API を駆動するので、これらのテストが「挙動の前後一致」の証明になる。
+/// diffs を before 方向へ適用する（「undo」相当だが UndoStack を経由しない直接適用。
+/// StrokeRecorder が記録した diffs 自体の正しさを検証する用途）。
+fn applyDiffsBefore(pixels: []u32, diffs: []const PixelDiff) void {
+    for (diffs) |d| pixels[d.idx] = d.before;
+}
+
+/// テスト用の薄い配線（StrokeRecorder + Canvas）。UndoStack は持たない
+/// （StrokeRecorder の diff 記録の正しさをテストするだけなら不要。undo 相当は
+/// `applyDiffsBefore` で直接検証する）。
 const TestEditor = struct {
     gpa: Allocator,
     canvas: Canvas,
     rec: StrokeRecorder,
-    undo: UndoStack = .{},
+    last_diffs: ?[]PixelDiff = null,
 
     fn init(gpa: Allocator, w: u32, h: u32) !TestEditor {
         var c = try Canvas.init(gpa, w, h);
@@ -557,7 +304,7 @@ const TestEditor = struct {
     }
 
     fn deinit(self: *TestEditor) void {
-        self.undo.deinit(self.gpa);
+        if (self.last_diffs) |d| self.gpa.free(d);
         self.rec.deinit(self.gpa);
         self.canvas.deinit();
     }
@@ -573,17 +320,16 @@ const TestEditor = struct {
     fn strokeTo(self: *TestEditor, x: i32, y: i32) void {
         self.rec.lineTo(&self.canvas, self.gpa, x, y);
     }
+    /// stroke を確定し、直近の diffs を保持する（次の endStroke/deinit で解放）。
     fn endStroke(self: *TestEditor) void {
-        if (self.rec.finish(self.gpa)) |op| self.undo.push(self.gpa, .{ .op = op });
+        if (self.last_diffs) |d| self.gpa.free(d);
+        self.last_diffs = null;
+        if (self.rec.finish(self.gpa)) |pd| self.last_diffs = pd.diffs;
     }
+    /// 直近 stroke の diffs を before 方向へ適用する（undo 相当）。
     fn undoOp(self: *TestEditor) void {
-        self.undo.undoOne(self.gpa, &.{&self.canvas});
-    }
-    fn redoOp(self: *TestEditor) void {
-        self.undo.redoOne(self.gpa, &.{&self.canvas});
-    }
-    fn clearAll(self: *TestEditor) void {
-        self.undo.pushClear(self.gpa, &self.canvas, 0, 0);
+        const d = self.last_diffs orelse return;
+        applyDiffsBefore(self.pixels(), d);
     }
 };
 
@@ -634,7 +380,7 @@ test "eraser: stroke で透明化できる" {
     }
 }
 
-test "undo/redo: 複数 stroke の連続 undo / redo で状態が正確に戻る" {
+test "stroke → 手動 undo(diffs) で状態が正確に戻る" {
     const gpa = std.testing.allocator;
     var e = try TestEditor.init(gpa, 8, 8);
     defer e.deinit();
@@ -648,323 +394,14 @@ test "undo/redo: 複数 stroke の連続 undo / redo で状態が正確に戻る
     const s1 = try gpa.dupe(u32, e.pixels());
     defer gpa.free(s1);
 
-    e.beginStroke(0, 1, RED);
-    e.strokeTo(3, 1);
-    e.endStroke();
-    const s2 = try gpa.dupe(u32, e.pixels());
-    defer gpa.free(s2);
-
-    e.undoOp();
-    try std.testing.expectEqualSlices(u32, s1, e.pixels());
     e.undoOp();
     try std.testing.expectEqualSlices(u32, s0, e.pixels());
-    e.undoOp(); // 空スタック → 変化なし
-    try std.testing.expectEqualSlices(u32, s0, e.pixels());
-    e.redoOp();
+
+    // 再度描いて s1 と一致することを確認（記録の再現性）
+    e.beginStroke(0, 0, BLACK);
+    e.strokeTo(3, 0);
+    e.endStroke();
     try std.testing.expectEqualSlices(u32, s1, e.pixels());
-    e.redoOp();
-    try std.testing.expectEqualSlices(u32, s2, e.pixels());
-    e.redoOp(); // 空スタック → 変化なし
-    try std.testing.expectEqualSlices(u32, s2, e.pixels());
-}
-
-test "undo/redo: no-op 操作（空 stroke / 空 clearAll）では redo が保持される" {
-    const gpa = std.testing.allocator;
-    var e = try TestEditor.init(gpa, 8, 8);
-    defer e.deinit();
-
-    e.beginStroke(0, 0, BLACK);
-    e.endStroke();
-    const drawn = try gpa.dupe(u32, e.pixels());
-    defer gpa.free(drawn);
-    e.undoOp(); // → 空キャンバス、redo に 1 件
-
-    // 空 stroke（空キャンバスに ERASE = 変更なし）と空 clearAll は redo を消さない
-    e.beginStroke(3, 3, ERASE);
-    e.strokeTo(5, 5);
-    e.endStroke();
-    e.clearAll();
-    try std.testing.expectEqual(@as(usize, 1), e.undo.redo.items.len);
-
-    e.redoOp();
-    try std.testing.expectEqualSlices(u32, drawn, e.pixels());
-}
-
-test "undo/redo: 新しい stroke で redo がクリアされる" {
-    const gpa = std.testing.allocator;
-    var e = try TestEditor.init(gpa, 8, 8);
-    defer e.deinit();
-
-    e.beginStroke(0, 0, BLACK);
-    e.endStroke();
-    e.undoOp();
-
-    // undo 後に新 stroke → redo は無効化される
-    e.beginStroke(2, 2, RED);
-    e.endStroke();
-    const after = try gpa.dupe(u32, e.pixels());
-    defer gpa.free(after);
-
-    e.redoOp(); // クリア済みなので何も起きない
-    try std.testing.expectEqualSlices(u32, after, e.pixels());
-}
-
-test "clearAll: 全消去して undo で復元できる" {
-    const gpa = std.testing.allocator;
-    var e = try TestEditor.init(gpa, 8, 8);
-    defer e.deinit();
-
-    e.beginStroke(1, 1, BLACK);
-    e.strokeTo(4, 4);
-    e.endStroke();
-    const drawn = try gpa.dupe(u32, e.pixels());
-    defer gpa.free(drawn);
-
-    e.clearAll();
-    try std.testing.expectEqual(@as(usize, 0), countColored(&e, BLACK));
-
-    e.undoOp();
-    try std.testing.expectEqualSlices(u32, drawn, e.pixels());
-
-    // 何も描かれていない状態の clearAll はコマンドを積まない
-    e.undoOp(); // → 空キャンバス
-    e.undoOp(); // 空スタック
-    e.clearAll();
-    try std.testing.expectEqual(@as(usize, 0), e.undo.undo.items.len);
-}
-
-test "layer add: undo/redo keeps pixels and selected layer ownership consistent" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 2, 2);
-    defer c.deinit();
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
-
-    const selected_before = c.selected_layer;
-    const idx = try c.addLayer(gpa);
-    c.layerPixels(idx)[0] = RED;
-    undo_stack.push(gpa, .{ .op = .{ .layer_add = .{
-        .index = idx,
-        .selected_before = selected_before,
-        .selected_after = c.selected_layer,
-    } } });
-
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
-    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
-    try std.testing.expect(undo_stack.redo.items[0].op.layer_add.layer != null);
-
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
-    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
-    try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
-    try std.testing.expect(undo_stack.undo.items[0].op.layer_add.layer == null);
-}
-
-test "layer delete: undo/redo restores pixels metadata and selected layer" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 2, 2);
-    defer c.deinit();
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
-
-    _ = try c.addLayer(gpa);
-    c.layerPixels(1)[0] = RED;
-    c.layers.items[1].visible = false;
-    c.layers.items[1].opacity = 123;
-    c.selected_layer = 1;
-
-    const selected_before = c.selected_layer;
-    const removed = c.deleteLayer(1) orelse return error.TestUnexpectedNull;
-    undo_stack.push(gpa, .{ .op = .{ .layer_delete = .{
-        .index = 1,
-        .selected_before = selected_before,
-        .selected_after = c.selected_layer,
-        .layer = removed,
-    } } });
-
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
-    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
-    try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
-    try std.testing.expect(!c.layers.items[1].visible);
-    try std.testing.expectEqual(@as(u8, 123), c.layers.items[1].opacity);
-    try std.testing.expect(undo_stack.redo.items[0].op.layer_delete.layer == null);
-
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
-    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
-    try std.testing.expect(undo_stack.undo.items[0].op.layer_delete.layer != null);
-}
-
-test "layer merge down: undo/redo restores below-layer pixels and re-inserts removed layer atomically" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 2, 2); // 4px layer
-    defer c.deinit();
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
-
-    @memset(c.layerPixels(0), RED);
-    _ = try c.addLayer(gpa); // layer1 = top（結合で消える側）
-    c.layerPixels(1)[0] = 0xFF0000FF; // 不透明青（BGRA）
-    c.layers.items[1].opacity = 200;
-    c.selected_layer = 1;
-
-    // 合成前後のスナップショット（ブレンド自体は doMergeDown 側の責務。ここでは
-    // UndoStack.applyBefore/After が「渡された before/after をそのまま適用する」機械的な
-    // 挙動だけを検証するため、合成結果は決め打ちの値を使う）。
-    const below_before = try gpa.dupe(u32, c.layerPixels(0));
-    const below_after = try gpa.dupe(u32, &[_]u32{ BLACK, RED, RED, RED });
-    @memcpy(c.layerPixels(0), below_after);
-
-    const selected_before = c.selected_layer;
-    const removed = c.deleteLayer(1) orelse return error.TestUnexpectedNull;
-    undo_stack.push(gpa, .{ .op = .{ .layer_merge_down = .{
-        .index = 1,
-        .selected_before = selected_before,
-        .selected_after = c.selected_layer,
-        .layer = removed,
-        .below_before = below_before,
-        .below_after = below_after,
-    } } });
-    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
-
-    // Undo 1 回で「削除されたレイヤーの復元」+「下位レイヤーの合成前ピクセル復元」の両方が
-    // 同時に起きる（2 push には分割しない = 履歴分岐しても中間状態が残らないことの実証）。
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 2), c.layers.items.len);
-    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
-    try std.testing.expectEqualSlices(u32, &[_]u32{ RED, RED, RED, RED }, c.layerPixels(0));
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), c.layerPixels(1)[0]);
-    try std.testing.expectEqual(@as(u8, 200), c.layers.items[1].opacity);
-    try std.testing.expect(undo_stack.redo.items[0].op.layer_merge_down.layer == null);
-
-    // Redo 1 回で結合後の状態（下位=合成後ピクセル、上位レイヤーは再度削除）に戻る。
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 1), c.layers.items.len);
-    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
-    try std.testing.expectEqualSlices(u32, &[_]u32{ BLACK, RED, RED, RED }, c.layerPixels(0));
-    try std.testing.expect(undo_stack.undo.items[0].op.layer_merge_down.layer != null);
-}
-
-test "layer reorder visible opacity: undo/redo restores structure and metadata" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 1, 1);
-    defer c.deinit();
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
-
-    _ = try c.addLayer(gpa);
-    c.layerPixels(0)[0] = BLACK;
-    c.layerPixels(1)[0] = RED;
-    c.selected_layer = 1;
-
-    undo_stack.push(gpa, .{ .op = .{ .layer_reorder = .{
-        .from = 1,
-        .to = 0,
-        .selected_before = 1,
-        .selected_after = 0,
-    } } });
-    try std.testing.expect(c.moveLayer(1, 0));
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(BLACK, c.layerPixels(0)[0]);
-    try std.testing.expectEqual(RED, c.layerPixels(1)[0]);
-    try std.testing.expectEqual(@as(usize, 1), c.selected_layer);
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(RED, c.layerPixels(0)[0]);
-    try std.testing.expectEqual(BLACK, c.layerPixels(1)[0]);
-    try std.testing.expectEqual(@as(usize, 0), c.selected_layer);
-
-    undo_stack.push(gpa, .{ .op = .{ .layer_visible = .{ .index = 0, .before = true, .after = false } } });
-    _ = c.setLayerVisible(0, false);
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expect(c.layers.items[0].visible);
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expect(!c.layers.items[0].visible);
-
-    undo_stack.push(gpa, .{ .op = .{ .layer_opacity = .{ .index = 0, .before = 255, .after = 77 } } });
-    _ = c.setLayerOpacity(0, 77);
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(u8, 255), c.layers.items[0].opacity);
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(u8, 77), c.layers.items[0].opacity);
-
-    // レイヤー名変更（TASK-79.3）。before/after は固定長スナップショットの値コピーなので
-    // freeCmd で解放するものが無く、他の layer_visible/layer_opacity と同型で完結する。
-    // (reorder の往復で index 0 の実体は入れ替わっているので、before は動的に読み取る。)
-    var before_buf: [64]u8 = undefined;
-    const before_str = try std.fmt.bufPrint(&before_buf, "{s}", .{c.layers.items[0].name()});
-    const before_name = NameSnapshot.of(before_str);
-    _ = c.setLayerName(0, "Sketch");
-    const after_name = NameSnapshot.of(c.layers.items[0].name());
-    undo_stack.push(gpa, .{ .op = .{ .layer_rename = .{ .index = 0, .before = before_name, .after = after_name } } });
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqualStrings(before_str, c.layers.items[0].name());
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqualStrings("Sketch", c.layers.items[0].name());
-}
-
-// ── テキストレイヤー（TASK-79.5）─────────────────────────────
-
-test "layer_text_params: undo/redo は pixels スナップショット無しで再ラスタライズにより復元する" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 64, 32);
-    defer c.deinit();
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
-
-    var before: TextParams = .{ .font_px = 16, .x = 0, .y = 0 };
-    before.setText("A");
-    const idx = try c.addTextLayer(gpa, before);
-    const pixels_a = try gpa.dupe(u32, c.layerPixels(idx));
-    defer gpa.free(pixels_a);
-
-    var after: TextParams = .{ .font_px = 16, .x = 0, .y = 0 };
-    after.setText("ABCDE");
-    try c.setLayerTextParams(idx, after);
-    const pixels_b = try gpa.dupe(u32, c.layerPixels(idx));
-    defer gpa.free(pixels_b);
-    try std.testing.expect(!std.mem.eql(u32, pixels_a, pixels_b));
-
-    undo_stack.push(gpa, .{ .op = .{ .layer_text_params = .{ .index = idx, .before = before, .after = after } } });
-
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqualStrings("A", c.layers.items[idx].text_params.text());
-    try std.testing.expectEqualSlices(u32, pixels_a, c.layerPixels(idx)); // 再ラスタライズで bit 復元
-
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqualStrings("ABCDE", c.layers.items[idx].text_params.text());
-    try std.testing.expectEqualSlices(u32, pixels_b, c.layerPixels(idx));
-}
-
-test "layer_rasterize: undo/redo は pixels 不変で kind/text_params だけ切替（bake の可逆性）" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 64, 32);
-    defer c.deinit();
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
-
-    var params: TextParams = .{ .font_px = 16, .x = 2, .y = 2 };
-    params.setText("Bake");
-    const idx = try c.addTextLayer(gpa, params);
-    const pixels_snapshot = try gpa.dupe(u32, c.layerPixels(idx));
-    defer gpa.free(pixels_snapshot);
-
-    const before = try c.rasterizeLayer(idx);
-    try std.testing.expect(before.eql(params));
-    try std.testing.expectEqual(canvas_mod.LayerKind.raster, c.layers.items[idx].kind);
-    try std.testing.expectEqualSlices(u32, pixels_snapshot, c.layerPixels(idx)); // bake は pixels 不変
-
-    undo_stack.push(gpa, .{ .op = .{ .layer_rasterize = .{ .index = idx, .before = before } } });
-
-    undo_stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(canvas_mod.LayerKind.text, c.layers.items[idx].kind);
-    try std.testing.expect(c.layers.items[idx].text_params.eql(params));
-    try std.testing.expectEqualSlices(u32, pixels_snapshot, c.layerPixels(idx)); // undo も pixels 不変
-
-    undo_stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(canvas_mod.LayerKind.raster, c.layers.items[idx].kind);
-    try std.testing.expectEqualSlices(u32, pixels_snapshot, c.layerPixels(idx)); // redo も pixels 不変
 }
 
 test "stroke 内の重複塗りは最初の before を保持する（undo の正しさ）" {
@@ -1064,12 +501,12 @@ test "brush: 単一 dab で src-over、coverage max でビルドアップしな�
     rec.stamp(&c, gpa, 2, 2, dab);
     try std.testing.expectEqual(a1, (px[idx] >> 24) & 0xFF); // 不変（ビルドアップなし）
 
-    const cmd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
-    try std.testing.expectEqual(@as(usize, 1), cmd.paint.diffs.len);
+    const pd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
+    defer gpa.free(pd.diffs);
+    try std.testing.expectEqual(@as(usize, 1), pd.diffs.len);
 }
 
-test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
+test "brush: 手動 undo(diffs) で原本復元 + PNG round-trip（partial alpha）" {
     const png = @import("png");
     const io_png = @import("io_png.zig");
     const gpa = std.testing.allocator;
@@ -1077,8 +514,6 @@ test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
     defer c.deinit();
     var rec = try StrokeRecorder.init(gpa, 4, 4);
     defer rec.deinit(gpa);
-    var undo_stack: UndoStack = .{};
-    defer undo_stack.deinit(gpa);
 
     const blank = try gpa.dupe(u32, c.layers.items[0].pixels);
     defer gpa.free(blank);
@@ -1087,7 +522,7 @@ test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
     rec.brushBegin(0, 0xFF00FF00, 180); // 緑, opacity 180
     rec.stamp(&c, gpa, 1, 1, dab);
     rec.stampLineTo(&c, gpa, 2, 2, dab);
-    if (rec.brushFinish(&c, gpa)) |op| undo_stack.push(gpa, .{ .op = op });
+    const pd = rec.brushFinish(&c, gpa);
 
     // PNG round-trip（保存=raw layer pixels。partial-alpha 込み一致）
     const raw = c.layers.items[0].pixels;
@@ -1100,8 +535,11 @@ test "brush: undo で原本復元 + PNG round-trip（partial alpha）" {
     }
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
-    // undo で空（原本）へ復元
-    undo_stack.undoOne(gpa, &.{&c});
+    // 手動 undo（diffs を before 方向へ）で空（原本）へ復元
+    if (pd) |d| {
+        defer gpa.free(d.diffs);
+        applyDiffsBefore(c.layers.items[0].pixels, d.diffs);
+    }
     try std.testing.expectEqualSlices(u32, blank, c.layers.items[0].pixels);
 }
 
@@ -1116,14 +554,14 @@ test "brush: replace stroke の後に brush が正常（状態分離）" {
     rec.begin(0, BLACK);
     rec.point(&c, gpa, 0, 0);
     rec.lineTo(&c, gpa, 3, 0);
-    if (rec.finish(gpa)) |cmd| gpa.free(cmd.paint.diffs);
+    if (rec.finish(gpa)) |pd| gpa.free(pd.diffs);
 
     // 続けて brush（別経路）。replace の塗りは保持され、brush も正しく塗れる
     const dab: Dab = .{ .offsets = &[_]Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
     rec.brushBegin(0, RED, 255);
     rec.stamp(&c, gpa, 5, 5, dab);
-    const cmd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    const pd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
+    defer gpa.free(pd.diffs);
 
     const px = c.layers.items[0].pixels;
     for (0..4) |x| try std.testing.expectEqual(BLACK, px[x]); // replace の (0,0)-(3,0) 保持
@@ -1176,8 +614,8 @@ test "selection: brush dab も選択範囲外を塗らない" {
     } };
     rec.brushBegin(0, RED, 255);
     rec.stamp(&c, gpa, 3, 3, dab);
-    const cmd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
-    defer gpa.free(cmd.paint.diffs);
+    const pd = rec.brushFinish(&c, gpa) orelse return error.TestUnexpectedNull;
+    defer gpa.free(pd.diffs);
     const px = c.layers.items[0].pixels;
     var n: usize = 0;
     for (px) |p| {
@@ -1187,40 +625,6 @@ test "selection: brush dab も選択範囲外を塗らない" {
     try std.testing.expectEqual(RED, px[3 * 8 + 3]);
     try std.testing.expectEqual(RED, px[4 * 8 + 4]);
     try std.testing.expectEqual(@as(u32, 0), px[2 * 8 + 2]); // 範囲外
-}
-
-test "UndoStack: 履歴上限で最古が解放される（paint + layer_delete 混在。リークは testing.allocator が検出）" {
-    const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 2, 2);
-    defer c.deinit();
-    var stack: UndoStack = .{};
-    defer stack.deinit(gpa);
-
-    // 最古（最初に trim される側）に held layer 持ちの layer_delete を積む
-    const held = try gpa.alloc(u32, 4);
-    @memset(held, 0xFF112233);
-    stack.push(gpa, .{ .op = .{ .layer_delete = .{ .index = 0, .layer = .{ .pixels = held }, .selected_before = 0, .selected_after = 0 } } });
-
-    // 上限まで paint を積む（+1 で最古の layer_delete が trim → held が解放される）
-    var i: usize = 0;
-    while (i < UndoStack.max_history) : (i += 1) {
-        const diffs = try gpa.dupe(PixelDiff, &.{.{ .idx = 0, .before = 0, .after = 0xFF000000 }});
-        stack.push(gpa, .{ .op = .{ .paint = .{ .layer_idx = 0, .diffs = diffs } } });
-    }
-    try std.testing.expectEqual(UndoStack.max_history, stack.undo.items.len);
-    // 先頭は paint（layer_delete は trim 済み）
-    try std.testing.expect(stack.undo.items[0].op == .paint);
-
-    // さらに積んでも上限維持
-    const diffs2 = try gpa.dupe(PixelDiff, &.{.{ .idx = 1, .before = 0, .after = 0xFF0000FF }});
-    stack.push(gpa, .{ .op = .{ .paint = .{ .layer_idx = 0, .diffs = diffs2 } } });
-    try std.testing.expectEqual(UndoStack.max_history, stack.undo.items.len);
-
-    // undo/redo は通常どおり動く
-    stack.undoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 1), stack.redo.items.len);
-    stack.redoOne(gpa, &.{&c});
-    try std.testing.expectEqual(@as(usize, 0), stack.redo.items.len);
 }
 
 test "StrokeRecorder: stroke 間で diffs の capacity を再利用する（2 回目は再確保なし）" {
@@ -1234,8 +638,8 @@ test "StrokeRecorder: stroke 間で diffs の capacity を再利用する（2 �
     rec.begin(0, 0xFF111111);
     var x: i32 = 0;
     while (x < 8) : (x += 1) rec.point(&c, gpa, x, 0);
-    const cmd1 = rec.finish(gpa).?;
-    defer gpa.free(cmd1.paint.diffs);
+    const pd1 = rec.finish(gpa).?;
+    defer gpa.free(pd1.diffs);
     try std.testing.expect(rec.diffs.capacity >= 8); // capacity 維持
     const ptr1 = rec.diffs.items.ptr;
 
@@ -1243,8 +647,8 @@ test "StrokeRecorder: stroke 間で diffs の capacity を再利用する（2 �
     rec.begin(0, 0xFF222222);
     x = 0;
     while (x < 8) : (x += 1) rec.point(&c, gpa, x, 1);
-    const cmd2 = rec.finish(gpa).?;
-    defer gpa.free(cmd2.paint.diffs);
+    const pd2 = rec.finish(gpa).?;
+    defer gpa.free(pd2.diffs);
     try std.testing.expectEqual(ptr1, rec.diffs.items.ptr);
 }
 
@@ -1258,16 +662,16 @@ test "StrokeRecorder(brush): diffs/touched の capacity を stroke 間で再利�
     const dab = Dab{ .offsets = &.{ .{ .dx = 0, .dy = 0, .cov = 255 }, .{ .dx = 1, .dy = 0, .cov = 255 } } };
     rec.brushBegin(0, 0xFF334455, 200);
     rec.stamp(&c, gpa, 2, 2, dab);
-    const cmd1 = rec.brushFinish(&c, gpa);
-    if (cmd1) |cc| gpa.free(cc.paint.diffs);
+    const pd1 = rec.brushFinish(&c, gpa);
+    if (pd1) |pp| gpa.free(pp.diffs);
     const dptr = rec.diffs.items.ptr;
     const tptr = rec.touched.items.ptr;
     try std.testing.expect(rec.diffs.capacity > 0);
 
     rec.brushBegin(0, 0xFF556677, 200);
     rec.stamp(&c, gpa, 5, 5, dab);
-    const cmd2 = rec.brushFinish(&c, gpa);
-    if (cmd2) |cc| gpa.free(cc.paint.diffs);
+    const pd2 = rec.brushFinish(&c, gpa);
+    if (pd2) |pp| gpa.free(pp.diffs);
     try std.testing.expectEqual(dptr, rec.diffs.items.ptr);
     try std.testing.expectEqual(tptr, rec.touched.items.ptr);
 }

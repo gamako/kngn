@@ -36,7 +36,7 @@ pub const BezierInput = struct {
         dab: core.Dab,
         color: u32,
         opacity: u8,
-    ) ?core.Op {
+    ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
         editor.hit_radius = 6.0 / @as(f32, @floatFromInt(frame.zoom)); // screen 6px 相当
 
@@ -139,6 +139,6 @@ test "クリックでアンカー追加、ダブルクリックで確定" {
     // 同じ場所を素早く再クリック（ダブルクリック）→ 確定して path クリア
     const cmd = bi.update(frameAt(12, 2, true, true, 2.1), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expect(cmd != null);
-    if (cmd) |c| gpa.free(c.paint.diffs);
+    if (cmd) |c| gpa.free(c.diffs);
     try std.testing.expect(!ed.isEditing());
 }
