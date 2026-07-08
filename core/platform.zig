@@ -51,6 +51,11 @@ const backend = switch (builtin.os.tag) {
     else => @compileError("video-proto: unsupported OS for platform backend: " ++ @tagName(builtin.os.tag)),
 };
 
+fn nativePumpPoll(ctx: *anyopaque) bool {
+    const inner: *backend.Window = @ptrCast(@alignCast(ctx));
+    return inner.pollEvents();
+}
+
 // 型は platform_types を単一ソースに re-export（backend 間で乖離させない）
 pub const Error = types.Error;
 pub const KeyCode = types.KeyCode;
@@ -121,9 +126,14 @@ pub const Window = struct {
 
     pub fn pollEvents(self: Window) bool {
         if (self.headless) return harness.pollGate(true); // native window closed 相当が無いので常に continue
-        const native = self.inner.pollEvents();
+        var inner = self.inner;
+        const native = inner.pollEvents();
         if (!harness.isEnabled()) return native;
-        return harness.pollGate(native);
+        const pump = harness.NativePump{
+            .ptr = @ptrCast(&inner),
+            .pollFn = nativePumpPoll,
+        };
+        return harness.pollGateWithPump(native, pump);
     }
 
     pub fn nextEvent(self: Window) ?Event {

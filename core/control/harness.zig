@@ -11,7 +11,7 @@
 //! - **live（TCP loopback）**: `VP_HARNESS_LIVE=1`（ephemeral）または `VP_HARNESS_PORT=<n>`（固定）で
 //!   `127.0.0.1` に listen。driver が1接続=1リクエスト（複数コマンド可）=1レスポンスで叩く。状態はプロセスに残る。
 //! - **スクリプト形式 == ライブ protocol**: パーサ・実行モデルは共通。差分は「コマンド source（file/socket）」と
-//!   「step がコマンド到着まで block する（live は pollGate が accept でブロック）」点のみ。
+//!   「step がコマンド到着まで block する（live は pollGate が accept/read 待機。実表示では pump 付き）」点のみ。
 //!
 //! ## レスポンス sink と framing
 //! digest/snapshot のコア payload は共通。framing は sink が決める:
@@ -29,6 +29,8 @@
 //! - facade フックは io を持たないため、ファイル I/O / TCP は harness が自前の `std.Io.Threaded` io で行う。
 
 const std = @import("std");
+const builtin = @import("builtin");
+const posix = std.posix;
 const types = @import("platform_types");
 const png = @import("png");
 const capture_synthetic = @import("capture_synthetic"); // synthetic capture source（TASK-49.5）
@@ -159,6 +161,10 @@ var resp_buf: std.ArrayList(u8) = .empty;
 var record_path: ?[]const u8 = null;
 var record_buf: std.ArrayList(u8) = .empty;
 
+// live fd poll の timeout（ms）。テストのみ短縮上書き可（フレーキー回避）。
+var test_live_poll_timeout_ms: ?i32 = null;
+const live_poll_timeout_default_ms: i32 = 16;
+
 // audio tap
 var audio_buf: [AUDIO_CAP]f32 = undefined;
 var audio_head: std.atomic.Value(usize) = .init(0);
@@ -174,6 +180,17 @@ var audio_mono: [ANALYZE_FRAMES]f32 = undefined; // downmix scratch（メイン�
 pub fn isEnabled() bool {
     return mode != .disabled;
 }
+
+/// live 実表示時に harness が accept/read 待機中に呼ぶ native event pump callback。
+/// `pollFn` が `false` を返したら window close / compositor disconnect として live wait を中断する。
+pub const NativePump = struct {
+    ptr: *anyopaque,
+    pollFn: *const fn (*anyopaque) bool,
+
+    pub fn poll(self: NativePump) bool {
+        return self.pollFn(self.ptr);
+    }
+};
 
 /// app が register する custom probe。**framework は中身を解釈しない**:
 /// snapshot が返す raw バイト列をそのまま file へ書き、digest が返す1行を既存 sink へ流すだけ。
@@ -431,8 +448,13 @@ pub fn startTransport() void {
 
 /// フレーム進行の同期点。1 フレーム分の進行を許可するとき true。
 /// quit / EOF(replay) / window closed(native_continue=false) / accept 失敗(live) で false。
-/// live ではコマンド到着まで accept でブロックする（= step 待ちで block）。
+/// live ではコマンド到着まで accept/read 待機する（= step 待ちで block）。`pump != null` のとき
+/// 待機中も native compositor event pump を短周期で回す（Wayland ANR 回避。TASK-32.6）。
 pub fn pollGate(native_continue: bool) bool {
+    return pollGateWithPump(native_continue, null);
+}
+
+pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
     // 早期 return（window close 等で native_continue=false / 既に quit 済み）でも、記帳済みの
     // expect 失敗を exit code へ落とす（TASK-78。replay 終了 3 経路の 1 つ。live/通常実行では no-op）。
     if (quit_requested or !native_continue) {
@@ -453,7 +475,7 @@ pub fn pollGate(native_continue: bool) bool {
                 .live => {
                     finishLiveRequest();
                     if (quit_requested) return false;
-                    if (!acceptLiveRequest()) return false; // accept 失敗 = 終了
+                    if (!acceptLiveRequest(pump)) return false; // accept 失敗 = 終了
                     continue;
                 },
             }
@@ -627,11 +649,85 @@ pub fn destroyHeadlessWindow() void {
 // live transport
 // ============================================================================
 
+fn livePollTimeoutMs() i32 {
+    return test_live_poll_timeout_ms orelse live_poll_timeout_default_ms;
+}
+
+fn runNativePump(pump: ?NativePump) bool {
+    const p = pump orelse return true;
+    return p.poll();
+}
+
+/// fd が readable になるまで poll し、timeout ごとに native pump を回す。
+/// `false` = pump が window close を報告、または fd エラー。
+fn waitFdReadable(fd: net.Socket.Handle, pump: ?NativePump) bool {
+    switch (comptime builtin.os.tag) {
+        .windows => unreachable,
+        else => return waitFdReadablePosix(fd, pump),
+    }
+}
+
+fn waitFdReadablePosix(fd: net.Socket.Handle, pump: ?NativePump) bool {
+    const events: i16 = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP;
+    while (true) {
+        var pfds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = events,
+            .revents = 0,
+        }};
+        const n = posix.poll(&pfds, livePollTimeoutMs()) catch return false;
+        if (n == 0) {
+            if (!runNativePump(pump)) return false;
+            continue;
+        }
+        const revents = pfds[0].revents;
+        if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return false;
+        // POLLHUP は half-close 後の残データ読み取りに使う（IN と同時/単独どちらも read 試行）。
+        if (revents & (posix.POLL.IN | posix.POLL.HUP) != 0) return true;
+    }
+}
+
+fn waitListenerReadable(pump: ?NativePump) bool {
+    return waitFdReadable(server.socket.handle, pump);
+}
+
+const ReadLiveRequestError = error{
+    ReadFailed,
+    RequestTooLarge,
+};
+
+fn readLiveRequestBody(stream: net.Stream, pump: ?NativePump) ReadLiveRequestError![]u8 {
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(gpa);
+
+    var rbuf: [4096]u8 = undefined;
+    const fd = stream.socket.handle;
+    const limit: usize = 1 << 20;
+
+    while (true) {
+        if (!waitFdReadable(fd, pump)) return error.ReadFailed;
+        var bufs = [_][]u8{rbuf[0..]};
+        const n = io_val.vtable.netRead(io_val.userdata, fd, bufs[0..]) catch return error.ReadFailed;
+        if (n == 0) break;
+        if (acc.items.len + n > limit) return error.RequestTooLarge;
+        acc.appendSlice(gpa, rbuf[0..n]) catch return error.ReadFailed;
+    }
+    return acc.toOwnedSlice(gpa) catch error.ReadFailed;
+}
+
 /// 1接続を accept し、リクエスト全体（client の half-close まで）を読み込んで cmd_buf に載せる。
 /// 戻り false = accept 不能（server 終了）→ アプリ終了。
-fn acceptLiveRequest() bool {
+fn acceptLiveRequest(pump: ?NativePump) bool {
+    const use_poll = pump != null and builtin.os.tag != .windows;
+
     while (true) {
-        const stream = server.accept(io_val) catch |err| {
+        const stream = if (use_poll) blk: {
+            if (!waitListenerReadable(pump)) return false;
+            break :blk server.accept(io_val) catch |err| {
+                std.debug.print("[harness] accept 失敗: {s}\n", .{@errorName(err)});
+                return false;
+            };
+        } else server.accept(io_val) catch |err| {
             std.debug.print("[harness] accept 失敗: {s}\n", .{@errorName(err)});
             return false;
         };
@@ -639,13 +735,25 @@ fn acceptLiveRequest() bool {
         live_req_open = true;
         resp_buf.clearRetainingCapacity();
 
-        var rbuf: [4096]u8 = undefined;
-        var reader = stream.reader(io_val, &rbuf);
-        const bytes = reader.interface.allocRemaining(gpa, std.Io.Limit.limited(1 << 20)) catch |err| {
-            std.debug.print("[harness] request read 失敗: {s}\n", .{@errorName(err)});
-            appendResp("error: request read failed\n");
-            finishLiveRequest();
-            continue; // 次の接続を待つ
+        const bytes = if (use_poll) blk: {
+            break :blk readLiveRequestBody(stream, pump) catch |err| {
+                switch (err) {
+                    ReadLiveRequestError.RequestTooLarge => appendResp("error: request too large\n"),
+                    else => appendResp("error: request read failed\n"),
+                }
+                std.debug.print("[harness] request read 失敗: {s}\n", .{@errorName(err)});
+                finishLiveRequest();
+                continue;
+            };
+        } else blk: {
+            var rbuf: [4096]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            break :blk reader.interface.allocRemaining(gpa, std.Io.Limit.limited(1 << 20)) catch |err| {
+                std.debug.print("[harness] request read 失敗: {s}\n", .{@errorName(err)});
+                appendResp("error: request read failed\n");
+                finishLiveRequest();
+                continue;
+            };
         };
         req_bytes = bytes;
         cmd_buf = bytes;
@@ -3185,4 +3293,236 @@ test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイ�
     view = headlessLock();
     try testing.expectEqual(@as(usize, 3), view.pixels.len);
     try testing.expectEqual(@as(u32, 0), view.pixels[0]);
+}
+
+fn testSleepMs(ms: u64) void {
+    const sec: i64 = @intCast(ms / 1000);
+    const nsec: i64 = @intCast((ms % 1000) * 1_000_000);
+    const req = std.posix.timespec{ .sec = sec, .nsec = nsec };
+    _ = std.c.nanosleep(&req, null);
+}
+
+fn initLiveServerForTest() !u16 {
+    threaded = std.Io.Threaded.init(gpa, .{});
+    io_val = threaded.io();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    server = try addr.listen(io_val, .{ .reuse_address = true });
+    mode = .live;
+    cmd_buf = "";
+    cursor = 0;
+    line_no = 0;
+    steps_remaining = 0;
+    quit_requested = false;
+    live_req_open = false;
+    req_bytes = &.{};
+    resp_buf.clearRetainingCapacity();
+    return server.socket.address.getPort();
+}
+
+fn deinitLiveServerForTest() void {
+    if (live_req_open) finishLiveRequest();
+    server.deinit(io_val);
+    test_live_poll_timeout_ms = null;
+    mode = .replay;
+    cmd_buf = "";
+    cursor = 0;
+}
+
+test "pollGateWithPump: null pump は pollGate と同じ（replay）" {
+    const runSequence = struct {
+        fn run(use_with_pump: bool) [2]bool {
+            resetForTest();
+            cmd_buf = "step 1\nquit";
+            return .{
+                if (use_with_pump) pollGateWithPump(true, null) else pollGate(true),
+                if (use_with_pump) pollGateWithPump(true, null) else pollGate(true),
+            };
+        }
+    }.run;
+    try testing.expectEqual(runSequence(false), runSequence(true));
+}
+
+test "pollGateWithPump: replay では fake pump が呼ばれない" {
+    resetForTest();
+    cmd_buf = "step 1\nquit";
+    var pump_count: usize = 0;
+    const PumpCtx = struct { count: *usize };
+    var ctx = PumpCtx{ .count = &pump_count };
+    const pump = NativePump{
+        .ptr = @ptrCast(&ctx),
+        .pollFn = struct {
+            fn poll(p: *anyopaque) bool {
+                const c: *PumpCtx = @ptrCast(@alignCast(p));
+                c.count.* += 1;
+                return true;
+            }
+        }.poll,
+    };
+    try testing.expect(pollGateWithPump(true, pump));
+    try testing.expectEqual(@as(usize, 0), pump_count);
+}
+
+test "pollGateWithPump: fake pump false で live accept 待機を中断" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    resetForTest();
+    test_live_poll_timeout_ms = 5;
+    _ = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+
+    const pump = NativePump{
+        .ptr = undefined,
+        .pollFn = struct {
+            fn poll(_: *anyopaque) bool {
+                return false;
+            }
+        }.poll,
+    };
+    try testing.expect(!pollGateWithPump(true, pump));
+}
+
+test "live pump: accept 待機中に fake pump が呼ばれる" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    resetForTest();
+    test_live_poll_timeout_ms = 5;
+    const port = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+
+    var pump_count: usize = 0;
+    const PumpCtx = struct { count: *usize };
+    var ctx = PumpCtx{ .count = &pump_count };
+    const pump = NativePump{
+        .ptr = @ptrCast(&ctx),
+        .pollFn = struct {
+            fn poll(p: *anyopaque) bool {
+                const c: *PumpCtx = @ptrCast(@alignCast(p));
+                c.count.* += 1;
+                return true;
+            }
+        }.poll,
+    };
+
+    const Connect = struct {
+        fn run(port_val: u16) void {
+            var client_threaded = std.Io.Threaded.init(gpa, .{});
+            const client_io = client_threaded.io();
+            testSleepMs(50);
+            const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
+            const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+            defer stream.close(client_io);
+            var wbuf: [64]u8 = undefined;
+            var writer = stream.writer(client_io, &wbuf);
+            writer.interface.writeAll("step 1\n") catch return;
+            writer.interface.flush() catch return;
+            stream.shutdown(client_io, .send) catch {};
+        }
+    };
+    const t = std.Thread.spawn(.{}, Connect.run, .{port}) catch return error.SkipZigTest;
+    defer t.join();
+
+    try testing.expect(pollGateWithPump(true, pump));
+    try testing.expect(pump_count >= 3);
+}
+
+test "live pump: request read 中も fake pump が呼ばれる" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    resetForTest();
+    test_live_poll_timeout_ms = 5;
+    const port = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+
+    var pump_count: usize = 0;
+    const PumpCtx = struct { count: *usize };
+    var ctx = PumpCtx{ .count = &pump_count };
+    const pump = NativePump{
+        .ptr = @ptrCast(&ctx),
+        .pollFn = struct {
+            fn poll(p: *anyopaque) bool {
+                const c: *PumpCtx = @ptrCast(@alignCast(p));
+                c.count.* += 1;
+                return true;
+            }
+        }.poll,
+    };
+
+    const SlowConnect = struct {
+        fn run(port_val: u16) void {
+            var client_threaded = std.Io.Threaded.init(gpa, .{});
+            const client_io = client_threaded.io();
+            const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
+            const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+            defer stream.close(client_io);
+            var wbuf: [4096]u8 = undefined;
+            var writer = stream.writer(client_io, &wbuf);
+            writer.interface.writeAll("step") catch return;
+            writer.interface.flush() catch return;
+            testSleepMs(50);
+            writer.interface.writeAll(" 1\n") catch return;
+            writer.interface.flush() catch return;
+            stream.shutdown(client_io, .send) catch {};
+        }
+    };
+    const t = std.Thread.spawn(.{}, SlowConnect.run, .{port}) catch return error.SkipZigTest;
+    defer t.join();
+
+    try testing.expect(pollGateWithPump(true, pump));
+    try testing.expect(pump_count >= 3);
+}
+
+test "live pump: request 1 MiB 超過後も次接続を accept できる" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    resetForTest();
+    test_live_poll_timeout_ms = 5;
+    const port = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+
+    const always_pump = NativePump{
+        .ptr = undefined,
+        .pollFn = struct {
+            fn poll(_: *anyopaque) bool {
+                return true;
+            }
+        }.poll,
+    };
+
+    const HugeThenStep = struct {
+        fn run(port_val: u16) void {
+            var client_threaded = std.Io.Threaded.init(gpa, .{});
+            const client_io = client_threaded.io();
+            {
+                const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
+                const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+                var wbuf: [8192]u8 = undefined;
+                var writer = stream.writer(client_io, &wbuf);
+                var chunk: [65536]u8 = undefined;
+                @memset(&chunk, 'a');
+                var sent: usize = 0;
+                const over = (1 << 20) + 1;
+                while (sent < over) : (sent += chunk.len) {
+                    const n = @min(chunk.len, over - sent);
+                    writer.interface.writeAll(chunk[0..n]) catch return;
+                }
+                writer.interface.flush() catch return;
+                stream.shutdown(client_io, .send) catch {};
+                stream.close(client_io);
+            }
+            {
+                const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
+                const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+                defer stream.close(client_io);
+                var wbuf: [64]u8 = undefined;
+                var writer = stream.writer(client_io, &wbuf);
+                writer.interface.writeAll("step 1\n") catch return;
+                writer.interface.flush() catch return;
+                stream.shutdown(client_io, .send) catch {};
+            }
+        }
+    };
+    const t = std.Thread.spawn(.{}, HugeThenStep.run, .{port}) catch return error.SkipZigTest;
+    defer t.join();
+
+    try testing.expect(pollGateWithPump(true, always_pump));
 }

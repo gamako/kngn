@@ -630,14 +630,13 @@ action 固有のコードを一切足さない**（中身非パースの不変�
 - 組み込み action は今回作らない。app 側の action 登録は各採用タスク（pixie/synth/modular 等）で行う。
 - **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は probe と同じ規則でサニタイズされる**: `"` / `\` / ASCII 制御文字を含む、または 200 bytes 超は warn + 空文字化（登録自体は成功）。
 
-- **実行モデル**: 非 step（inject/snapshot/digest/action）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept でブロック**（= step 待ちで block）。
+- **実行モデル**: 非 step（inject/snapshot/digest/action）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept/read 待機**（= step 待ちで block）。**live 実表示**では待機中も facade 経由で native `pollEvents()` を短周期（~16ms timeout）で pump し、Wayland ping / macOS window 更新を維持する（TASK-32.6）。**headless live**（`VP_HARNESS_HEADLESS=1`）は compositor 未接続のため pump callback は渡さず、従来通り blocking accept/read。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
 - **制約**: 実ウィンドウ生成は `VP_HARNESS_HEADLESS` 未指定時のみ必須（display 必須。macOS は通常 OK、
   Linux は Xvfb/実セッション）。**`VP_HARNESS_HEADLESS=1` で完全 display-less**（P4, TASK-32.4 実装済み。
   詳細は上記「完全 display-less（P4）」節）。`audio` は RT スレッド実時間依存なので record→replay で
   digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論。headless でも同様に bit 決定論で、実測で
-  headless と非 headless の fb crc も bit 一致）。live の accept ブロック中は window pump が止まる
-  （headless 時は pump 自体が無いのでこの影響を受けない）。`fb` の捕捉は CPU フレームバッファ経路で
+  headless と非 headless の fb crc も bit 一致）。`fb` の捕捉は CPU フレームバッファ経路で
   **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。Metal の GPU
   drawable 読み戻しは P4 スコープ外（上記参照）。
 - **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
