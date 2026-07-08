@@ -324,6 +324,13 @@ pub const Document = struct {
         return self.grid.items[self.gridIndex(layer_idx, frame_idx)];
     }
 
+    /// cel_pool の pixels を参照する（タイムラインサムネ等。TASK-45.2）。
+    pub fn celPixels(self: *const Document, id: CelId) ?[]const u32 {
+        if (id >= self.cel_pool.items.len) return null;
+        if (self.cel_pool.items[id]) |cel| return cel.pixels;
+        return null;
+    }
+
     fn setGrid(self: *Document, layer_idx: usize, frame_idx: u32, id: ?CelId) void {
         self.grid.items[self.gridIndex(layer_idx, frame_idx)] = id;
     }

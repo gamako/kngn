@@ -151,6 +151,17 @@ const LAYER_ROW_PART_ROW: gui.Id = 4;
 const LAYER_THUMB_W: i32 = 24;
 const LAYER_THUMB_H: i32 = 24;
 const LAYER_THUMB_CELL: usize = 4; // サムネ内チェッカーのセル px
+/// タイムライン UI（TASK-45.2）
+const TIMELINE_SCROLL_ID: gui.Id = 0xC0FFEE07;
+const TIMELINE_PANEL_ID_BASE: gui.Id = 0xA440_0000;
+const TIMELINE_HEADER_ID_BASE: gui.Id = 0xA441_0000;
+const TIMELINE_CELL_ID_BASE: gui.Id = 0xA442_0000;
+const TIMELINE_CELL_FRAME_STRIDE: gui.Id = 4096;
+const TIMELINE_CELL_W: i32 = 24;
+const TIMELINE_CELL_H: i32 = 24;
+const TIMELINE_LABEL_W: i32 = 72;
+const TIMELINE_LINK_BORDER = gui.Color.rgba(0x40, 0xA0, 0xE0, 0xFF);
+const TIMELINE_PLAYHEAD_BORDER = gui.Color.rgba(0xE0, 0xC0, 0x40, 0xFF);
 
 const COLOR_WINDOW_BG: u32 = 0xFF_24_20_20; // canonical BGRA: r=24,g=20,b=20（従来の見た目を維持）
 
@@ -304,6 +315,13 @@ const App = struct {
     right_scroll: gui.Vec2f = .{},
     bottom_pane_h: i32 = BOTTOM_PANE_DEFAULT,
     bottom_visible: bool = false,
+    /// タイムライン UI 状態（TASK-45.2）
+    timeline_scroll: gui.Vec2f = .{},
+    timeline_playing: bool = false,
+    timeline_fps: f32 = 10.0,
+    timeline_last_advance: f64 = 0,
+    timeline_target_layer: usize = 0,
+    timeline_target_frame: u32 = 0,
     /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
@@ -685,11 +703,9 @@ const App = struct {
         // 成功: 旧 doc を破棄して差し替え、canvas ポインタと preview を張り直す。
         self.doc.deinit();
         self.doc = new_doc;
-        // pixie は現状 frame 切替 UI を持たない（45.2 以降の範囲）ため常に frame 0 を表示する
-        // （多 frame の .pix を手編集/将来ツールで作られていても、pixie は先頭 frame だけ見せる）。
-        self.doc.selected_frame = 0;
-        self.doc.resyncActiveView(self.gpa); // selected_frame 強制に合わせて active_view を再同期
+        self.doc.resyncActiveView(self.gpa);
         self.canvas = self.doc.activeCanvas();
+        self.clampTimelineTarget();
         self.applySystemFont(); // 新 Document の active_view は system_font=null で始まるため再設定（TASK-82）
         // ドキュメント差し替え = undo/redo 履歴破棄・選択/フロート破棄（doOpen と同型。AC#4）。
         // `new_doc`（decodeDocument が返す fresh Document）は元々 undo 履歴を持たないため
@@ -710,11 +726,13 @@ const App = struct {
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         self.doc.undoOne(self.gpa);
+        self.clampTimelineTarget();
     }
 
     fn doRedo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         self.doc.redoOne(self.gpa);
+        self.clampTimelineTarget();
     }
 
     fn doClear(self: *App) !void {
@@ -770,12 +788,14 @@ const App = struct {
             self.setSaveMsg("Layer add failed: {s}", .{@errorName(err)});
             return err;
         };
+        self.clampTimelineTarget();
     }
 
     fn doDeleteLayer(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const idx = self.canvas.selected_layer;
         try self.doc.deleteLayer(self.gpa, idx);
+        self.clampTimelineTarget();
     }
 
     fn doMoveLayer(self: *App, delta: i32) !void {
@@ -968,6 +988,101 @@ const App = struct {
         if (self.editingBlocked()) return error.EditingBlocked;
         const top_idx = self.canvas.selected_layer;
         try self.doc.mergeDown(self.gpa, top_idx);
+    }
+
+    // ── タイムライン（TASK-45.2）──────────────────────────────────
+
+    fn clampTimelineTarget(self: *App) void {
+        if (self.doc.layers.items.len == 0) {
+            self.timeline_target_layer = 0;
+        } else if (self.timeline_target_layer >= self.doc.layers.items.len) {
+            self.timeline_target_layer = self.doc.layers.items.len - 1;
+        }
+        if (self.doc.frames.items.len == 0) {
+            self.timeline_target_frame = 0;
+        } else if (self.timeline_target_frame >= self.doc.frames.items.len) {
+            self.timeline_target_frame = @intCast(self.doc.frames.items.len - 1);
+        }
+    }
+
+    fn doSelectFrame(self: *App, frame: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (self.doc.selected_frame == frame) return;
+        self.doc.selected_frame = frame;
+        self.doc.resyncActiveView(self.gpa);
+        self.syncPreviewCanvas();
+        self.clampTimelineTarget();
+    }
+
+    fn doAddFrame(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        const at = self.doc.selected_frame + 1;
+        try self.doc.addFrame(self.gpa, at);
+        self.clampTimelineTarget();
+    }
+
+    fn doDuplicateFrame(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        try self.doc.duplicateFrame(self.gpa, self.doc.selected_frame);
+        self.clampTimelineTarget();
+    }
+
+    fn doDeleteFrame(self: *App) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        try self.doc.deleteFrame(self.gpa, self.doc.selected_frame);
+        self.clampTimelineTarget();
+    }
+
+    fn doAdvanceFrame(self: *App, delta: i32) !void {
+        const nf: i32 = @intCast(self.doc.frames.items.len);
+        if (nf <= 0) return;
+        const cur: i32 = @intCast(self.doc.selected_frame);
+        const next = std.math.clamp(cur + delta, 0, nf - 1);
+        try self.doSelectFrame(@intCast(next));
+    }
+
+    fn doCreateCelAt(self: *App, layer: usize, frame: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (layer >= self.doc.layers.items.len or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
+        _ = self.doc.createCel(self.gpa, layer, frame);
+    }
+
+    fn doClearCelAt(self: *App, layer: usize, frame: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (layer >= self.doc.layers.items.len or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
+        const was_selected = self.doc.selected_frame == frame;
+        self.doc.clearCel(self.gpa, layer, frame);
+        if (was_selected) self.doc.resyncActiveView(self.gpa);
+        self.clampTimelineTarget();
+    }
+
+    fn doLinkCelLeft(self: *App, layer: usize, frame: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (layer >= self.doc.layers.items.len or frame == 0 or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
+        try self.doc.linkCel(self.gpa, layer, frame, frame - 1);
+    }
+
+    fn doUnlinkCelAt(self: *App, layer: usize, frame: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (layer >= self.doc.layers.items.len or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
+        try self.doc.unlinkCel(self.gpa, layer, frame);
+    }
+
+    fn tickTimelinePlayback(self: *App, now: f64) void {
+        if (!self.timeline_playing or self.editingBlocked()) return;
+        const interval = 1.0 / self.timeline_fps;
+        if (self.timeline_last_advance == 0) self.timeline_last_advance = now;
+        if (now - self.timeline_last_advance < interval) return;
+        self.timeline_last_advance = now;
+        const nframes = self.doc.frames.items.len;
+        if (nframes == 0) return;
+        const next: u32 = if (self.doc.selected_frame + 1 >= nframes) 0 else self.doc.selected_frame + 1;
+        self.doSelectFrame(next) catch {};
     }
 
     /// PNG open 用: doc/active_view を「1layer・1frame・1cel(空)」状態へ縮める
@@ -1805,6 +1920,189 @@ fn buildTextLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.endBox();
 }
 
+fn timelineCellId(layer_idx: usize, frame_idx: u32) gui.Id {
+    return TIMELINE_CELL_ID_BASE + @as(gui.Id, @intCast(layer_idx)) * TIMELINE_CELL_FRAME_STRIDE + frame_idx;
+}
+
+fn timelineHeaderId(frame_idx: u32) gui.Id {
+    return TIMELINE_HEADER_ID_BASE + frame_idx;
+}
+
+/// 空セル用チェッカーサムネ（cel 無し）。
+fn fillEmptyThumb(buf: []u32) void {
+    const tw: usize = @intCast(LAYER_THUMB_W);
+    const th: usize = @intCast(LAYER_THUMB_H);
+    var ty: usize = 0;
+    while (ty < th) : (ty += 1) {
+        var tx: usize = 0;
+        while (tx < tw) : (tx += 1) {
+            const checker = (tx / LAYER_THUMB_CELL + ty / LAYER_THUMB_CELL) & 1;
+            buf[ty * tw + tx] = if (checker == 0) CHECKER_LIGHT else CHECKER_DARK;
+        }
+    }
+}
+
+const TimelineCellDraw = struct {
+    buf: []const u32,
+    border_left: bool,
+    border_right: bool,
+    border_top: bool,
+    border_bottom: bool,
+    border_color: gui.Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect) void {
+        const self: *const TimelineCellDraw = @ptrCast(@alignCast(ctx_ptr));
+        dl.image(rect, self.buf, @intCast(LAYER_THUMB_W), @intCast(LAYER_THUMB_H)) catch @panic("timeline cell: OOM");
+        const t: u32 = 1;
+        const col = self.border_color;
+        const rh: i32 = @intCast(rect.h);
+        const rw: i32 = @intCast(rect.w);
+        const ti: i32 = @intCast(t);
+        if (self.border_top) dl.rectFilled(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = t }, col) catch @panic("timeline cell: OOM");
+        if (self.border_bottom) dl.rectFilled(.{ .x = rect.x, .y = rect.y + rh - ti, .w = rect.w, .h = t }, col) catch @panic("timeline cell: OOM");
+        if (self.border_left) dl.rectFilled(.{ .x = rect.x, .y = rect.y, .w = t, .h = rect.h }, col) catch @panic("timeline cell: OOM");
+        if (self.border_right) dl.rectFilled(.{ .x = rect.x + rw - ti, .y = rect.y, .w = t, .h = rect.h }, col) catch @panic("timeline cell: OOM");
+    }
+};
+
+fn timelineCellBorderSides(doc: *const core.Document, layer_idx: usize, frame_idx: u32) struct { left: bool, right: bool, is_linked: bool } {
+    const cid = doc.gridGet(layer_idx, frame_idx);
+    if (cid == null) return .{ .left = true, .right = true, .is_linked = false };
+    const left_same = if (frame_idx > 0) doc.gridGet(layer_idx, frame_idx - 1) == cid else false;
+    const right_same = if (frame_idx + 1 < doc.frames.items.len) doc.gridGet(layer_idx, frame_idx + 1) == cid else false;
+    return .{ .left = !left_same, .right = !right_same, .is_linked = left_same or right_same };
+}
+
+/// 下ペインのタイムライン UI（TASK-45.2）。行=layer × 列=frame のセルグリッド。
+/// ホットパス宣言: 毎フレーム構築（immediate-mode GUI）。サムネは 24×24 縮小のみ。
+fn buildTimelinePanel(ctx: *gui.Context, app: *App) !void {
+    app.clampTimelineTarget();
+    const tl = TIMELINE_PANEL_ID_BASE;
+    const target_layer = app.timeline_target_layer;
+    const target_frame = app.timeline_target_frame;
+
+    ctx.beginBox(.{ .direction = .row, .gap = 4, .align_cross = .center });
+    const play_label: []const u8 = if (app.timeline_playing) "Pause" else "Play";
+    if (ctx.buttonId(tl + 1, play_label, .{ .min_w = 44, .selected = app.timeline_playing }).clicked) {
+        app.timeline_playing = !app.timeline_playing;
+        app.timeline_last_advance = platform.getTime();
+    }
+    var fps_f32 = app.timeline_fps;
+    if (ctx.sliderF32Id(tl + 2, "FPS", &fps_f32, .{ .min = 1, .max = 30, .step = 1, .track_w = 60 })) {
+        app.timeline_fps = fps_f32;
+    }
+    if (ctx.buttonId(tl + 3, "Fr+", .{ .min_w = 32 }).clicked) app.doAddFrame() catch {};
+    if (ctx.buttonId(tl + 4, "Dup", .{ .min_w = 32 }).clicked) app.doDuplicateFrame() catch {};
+    if (ctx.buttonId(tl + 5, "Del", .{ .min_w = 32 }).clicked) app.doDeleteFrame() catch {};
+    if (ctx.buttonId(tl + 6, "<", .{ .min_w = 24 }).clicked) app.doAdvanceFrame(-1) catch {};
+    if (ctx.buttonId(tl + 7, ">", .{ .min_w = 24 }).clicked) app.doAdvanceFrame(1) catch {};
+    if (ctx.buttonId(tl + 8, "Cel+", .{ .min_w = 36 }).clicked) app.doCreateCelAt(target_layer, target_frame) catch {};
+    if (ctx.buttonId(tl + 9, "Clr", .{ .min_w = 32 }).clicked) app.doClearCelAt(target_layer, target_frame) catch {};
+    if (ctx.buttonId(tl + 10, "Link", .{ .min_w = 36 }).clicked) app.doLinkCelLeft(target_layer, target_frame) catch {};
+    if (ctx.buttonId(tl + 11, "Unlk", .{ .min_w = 36 }).clicked) app.doUnlinkCelAt(target_layer, target_frame) catch {};
+    ctx.endBox();
+
+    ctx.beginScrollArea(TIMELINE_SCROLL_ID, &app.timeline_scroll, .{
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .direction = .column,
+        .gap = 1,
+        .content_width = .fit,
+        .content_height = .fit,
+    });
+
+    ctx.beginBox(.{ .direction = .row, .gap = 1, .align_cross = .center });
+    ctx.beginBox(.{ .width = .{ .fixed = TIMELINE_LABEL_W }, .height = .{ .fixed = TIMELINE_CELL_H } });
+    ctx.endBox();
+    var fi: u32 = 0;
+    while (fi < app.doc.frames.items.len) : (fi += 1) {
+        var num_buf: [8]u8 = undefined;
+        const num_txt = try std.fmt.bufPrint(&num_buf, "{d}", .{fi + 1});
+        if (ctx.buttonId(timelineHeaderId(fi), num_txt, .{
+            .min_w = TIMELINE_CELL_W,
+            .selected = fi == app.doc.selected_frame,
+        }).clicked) {
+            app.doSelectFrame(fi) catch {};
+        }
+    }
+    ctx.endBox();
+
+    var rev = app.doc.layers.items.len;
+    while (rev > 0) {
+        rev -= 1;
+        const li = rev;
+        const layer_def = app.doc.layers.items[li];
+        ctx.beginBox(.{ .direction = .row, .gap = 1, .align_cross = .center });
+        const shown = truncateForDisplay(ctx.allocator(), layer_def.name(), LAYER_NAME_DISPLAY_MAX);
+        if (ctx.buttonId(tl + 100 + @as(gui.Id, @intCast(li)), shown, .{
+            .min_w = TIMELINE_LABEL_W,
+            .selected = li == app.canvas.selected_layer,
+        }).clicked) {
+            app.doSelectLayer(li) catch {};
+            app.timeline_target_layer = li;
+        }
+
+        fi = 0;
+        while (fi < app.doc.frames.items.len) : (fi += 1) {
+            const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("timeline thumb: OOM");
+            if (app.doc.gridGet(li, fi)) |cel_id| {
+                if (app.doc.celPixels(cel_id)) |pixels| fillLayerThumb(thumb, pixels);
+            } else {
+                fillEmptyThumb(thumb);
+            }
+            const sides = timelineCellBorderSides(&app.doc, li, fi);
+            const is_playhead = fi == app.doc.selected_frame;
+            const is_target = li == target_layer and fi == target_frame;
+            const border_color = if (is_playhead)
+                TIMELINE_PLAYHEAD_BORDER
+            else if (sides.is_linked)
+                TIMELINE_LINK_BORDER
+            else if (is_target)
+                ctx.style.border_hover
+            else
+                ctx.style.border;
+            const data = ctx.allocator().create(TimelineCellDraw) catch @panic("timeline cell: OOM");
+            data.* = .{
+                .buf = thumb,
+                .border_left = sides.left or is_playhead,
+                .border_right = sides.right or is_playhead,
+                .border_top = true,
+                .border_bottom = true,
+                .border_color = border_color,
+            };
+            ctx.beginBox(.{ .id = timelineCellId(li, fi), .width = .{ .fixed = TIMELINE_CELL_W }, .height = .{ .fixed = TIMELINE_CELL_H } });
+            ctx.custom(.{ .x = TIMELINE_CELL_W, .y = TIMELINE_CELL_H }, TimelineCellDraw.draw, data);
+            ctx.endBox();
+        }
+        ctx.endBox();
+    }
+
+    ctx.endScrollArea();
+
+    if (ctx.input.mouse_pressed.left) {
+        const p = ctx.input.mouse_pressed_pos;
+        const in_viewport = if (ctx.getNodeRect(TIMELINE_SCROLL_ID)) |vp| vp.contains(p) else false;
+        if (in_viewport) {
+            var li2 = app.doc.layers.items.len;
+            while (li2 > 0) {
+                li2 -= 1;
+                fi = 0;
+                while (fi < app.doc.frames.items.len) : (fi += 1) {
+                    if (ctx.getNodeRect(timelineCellId(li2, fi))) |r| {
+                        if (r.contains(p)) {
+                            app.timeline_target_layer = li2;
+                            app.timeline_target_frame = fi;
+                            app.doSelectFrame(fi) catch {};
+                            app.doSelectLayer(li2) catch {};
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
@@ -1981,14 +2279,15 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     if (app.bottom_visible) {
         _ = ctx.splitter(SPLIT_BOTTOM_ID, .horizontal, &app.bottom_pane_h, .{ .thickness = SPLITTER_T, .min = BOTTOM_PANE_MIN, .max = bottom_max, .invert = true });
         ctx.beginBox(.{
-            .direction = .row,
+            .direction = .column,
             .width = .{ .grow = 1 },
             .height = .{ .fixed = app.bottom_pane_h },
-            .padding = .{ 6, 8, 6, 8 },
+            .padding = .{ 4, 6, 4, 6 },
+            .gap = 4,
             .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
             .clip_children = true,
         });
-        ctx.labelEx("Timeline (placeholder)", ctx.style.text_subtle);
+        try buildTimelinePanel(ctx, app);
         ctx.endBox(); // bottom pane
     }
 
@@ -2034,6 +2333,10 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     );
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "layer: {d}/{d}", .{ app.canvas.selected_layer + 1, app.canvas.layers.items.len }),
+        ctx.style.text_subtle,
+    );
+    ctx.labelEx(
+        try std.fmt.allocPrint(arena, "frame: {d}/{d}", .{ app.doc.selected_frame + 1, app.doc.frames.items.len }),
         ctx.style.text_subtle,
     );
     ctx.labelEx(
@@ -2169,6 +2472,8 @@ pub fn main(init: std.process.Init) !void {
             // canvas rect は前フレームの layout 結果（初回フレームは null）。
             // canvasBlitRect は pan を現 area に clamp して app へ書き戻し、last_area も更新する。
             var canvas_rect = canvasBlitRect(&ctx, &app);
+
+            app.tickTimelinePlayback(platform.getTime());
 
             try buildUi(&ctx, &app, canvas_rect);
             ctx.endFrame();
