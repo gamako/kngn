@@ -55,6 +55,7 @@ pub const Input = struct {
     mouse_pressed: MouseButtons = .{}, // このフレームで押された (edge)
     mouse_released: MouseButtons = .{}, // このフレームで離された (edge)
     mouse_pressed_pos: Vec2 = .{ .x = 0, .y = 0 }, // 直近の press edge の座標
+    mouse_released_pos: Vec2 = .{ .x = 0, .y = 0 }, // 直近の左 release edge の座標
     scroll_delta: Vec2f = .{},
     modifiers: ModifierFlags = .{},
 
@@ -100,6 +101,7 @@ pub const Input = struct {
             .mouse_up => |m| {
                 self.setMousePos(m.x, m.y);
                 self.modifiers = @bitCast(m.modifiers);
+                if (m.button == 0) self.mouse_released_pos = .{ .x = m.x, .y = m.y };
                 self.applyButton(m.button, false);
             },
             .mouse_scroll => |m| {
@@ -216,6 +218,34 @@ test "Input: mouse_pressed_pos は down の瞬間の座標を保持（down 後 m
     // mouse_pos はフレーム最終位置
     try std.testing.expectEqual(@as(i32, 200), in.mouse_pos.x);
     try std.testing.expectEqual(@as(i32, 201), in.mouse_pos.y);
+}
+
+test "Input: mouse_released_pos は up の瞬間の座標を保持（up 後 move でも不変）" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+
+    in.beginFrame();
+    in.pushEvent(.{ .mouse_up = .{ .x = 10, .y = 20, .button = 0, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_move = .{ .x = 200, .y = 201, .modifiers = 0 } });
+
+    try std.testing.expectEqual(@as(i32, 10), in.mouse_released_pos.x);
+    try std.testing.expectEqual(@as(i32, 20), in.mouse_released_pos.y);
+    try std.testing.expectEqual(@as(i32, 200), in.mouse_pos.x);
+    try std.testing.expectEqual(@as(i32, 201), in.mouse_pos.y);
+}
+
+test "Input: mouse_released_pos は左 up の座標のみ latch（同フレーム右 up で上書きしない）" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+
+    in.beginFrame();
+    in.pushEvent(.{ .mouse_up = .{ .x = 10, .y = 20, .button = 0, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_up = .{ .x = 99, .y = 88, .button = 1, .modifiers = 0 } });
+
+    try std.testing.expectEqual(@as(i32, 10), in.mouse_released_pos.x);
+    try std.testing.expectEqual(@as(i32, 20), in.mouse_released_pos.y);
+    try std.testing.expect(in.mouse_released.left);
+    try std.testing.expect(in.mouse_released.right);
 }
 
 test "Input: mouse_pos は move を伴わない up でも最新化される" {

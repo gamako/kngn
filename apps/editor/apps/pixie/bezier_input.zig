@@ -19,6 +19,7 @@ pub const BezierInput = struct {
         zoom: i32,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
+        mouse_released_pos: core.Vec2,
         pressed_left: bool,
         released_left: bool,
         time: f64,
@@ -60,11 +61,13 @@ pub const BezierInput = struct {
         }
 
         if (self.in_drag) {
-            const cp = core.screenToCanvasF(frame.mouse_pos, rect, frame.zoom);
             if (frame.released_left) {
-                editor.update(gpa, .{ .pointer_up = cp });
+                const released = core.screenToCanvasF(frame.mouse_released_pos, rect, frame.zoom);
+                editor.update(gpa, .{ .pointer_move = released });
+                editor.update(gpa, .{ .pointer_up = released });
                 self.in_drag = false;
             } else {
+                const cp = core.screenToCanvasF(frame.mouse_pos, rect, frame.zoom);
                 editor.update(gpa, .{ .pointer_move = cp });
             }
         }
@@ -93,11 +96,16 @@ const DUMMY_DAB: core.Dab = .{ .offsets = &[_]core.Offset{.{ .dx = 0, .dy = 0, .
 const RECT0 = core.Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
 
 fn frameAt(x: i32, y: i32, pressed: bool, released: bool, t: f64) BezierInput.Frame {
+    return frameAtSplit(x, y, x, y, x, y, pressed, released, t);
+}
+
+fn frameAtSplit(px: i32, py: i32, mx: i32, my: i32, rx: i32, ry: i32, pressed: bool, released: bool, t: f64) BezierInput.Frame {
     return .{
         .canvas_rect = RECT0,
         .zoom = 1,
-        .mouse_pos = .{ .x = x, .y = y },
-        .mouse_pressed_pos = .{ .x = x, .y = y },
+        .mouse_pos = .{ .x = mx, .y = my },
+        .mouse_pressed_pos = .{ .x = px, .y = py },
+        .mouse_released_pos = .{ .x = rx, .y = ry },
         .pressed_left = pressed,
         .released_left = released,
         .time = t,
@@ -141,4 +149,29 @@ test "クリックでアンカー追加、ダブルクリックで確定" {
     try std.testing.expect(cmd != null);
     if (cmd) |c| gpa.free(c.diffs);
     try std.testing.expect(!ed.isEditing());
+}
+
+test "bezier_input: release 確定は mouse_released_pos（up 後 move が同フレームでも h_out がずれない）" {
+    const gpa = std.testing.allocator;
+    var ed: core.PathEditor = .{};
+    defer ed.deinit(gpa);
+    var canvas = try core.Canvas.init(gpa, 16, 16);
+    defer canvas.deinit();
+    var rec = try core.StrokeRecorder.init(gpa, 16, 16);
+    defer rec.deinit(gpa);
+    var bi: BezierInput = .{};
+
+    _ = bi.update(frameAt(2, 2, true, false, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
+    _ = bi.update(frameAtSplit(2, 2, 2, 2, 2, 2, false, true, 1.1), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
+    try std.testing.expectEqual(@as(usize, 1), ed.path.anchors.items.len);
+    const a = ed.path.anchors.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), a.h_out.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), a.h_out.y, 0.001);
+
+    _ = bi.update(frameAt(12, 2, true, false, 2.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
+    _ = bi.update(frameAtSplit(12, 2, 50, 2, 14, 2, false, true, 2.1), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
+    try std.testing.expectEqual(@as(usize, 2), ed.path.anchors.items.len);
+    const b = ed.path.anchors.items[1];
+    try std.testing.expectApproxEqAbs(@as(f32, 14.0), b.h_out.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), b.h_out.y, 0.001);
 }

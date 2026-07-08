@@ -41,6 +41,7 @@ pub const SelectionInput = struct {
         zoom: i32,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
+        mouse_released_pos: core.Vec2,
         pressed_left: bool, // gate 済み（canvas area 内・widget 非 active 時のみ true）
         released_left: bool,
     };
@@ -93,7 +94,8 @@ pub const SelectionInput = struct {
         }
 
         if (self.state != .idle) {
-            self.cur = core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom);
+            const pos = if (frame.released_left) frame.mouse_released_pos else frame.mouse_pos;
+            self.cur = core.screenToCanvasRaw(pos, rect, frame.zoom);
             if (frame.released_left) {
                 const prev = self.state;
                 self.state = .idle;
@@ -222,11 +224,16 @@ const X: u32 = 0xFF0000FF;
 const RECT0 = core.Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
 
 fn mkFrame(px: i32, py: i32, mx: i32, my: i32, pressed: bool, released: bool) SelectionInput.Frame {
+    return mkFrameSplit(px, py, mx, my, mx, my, pressed, released);
+}
+
+fn mkFrameSplit(px: i32, py: i32, mx: i32, my: i32, rx: i32, ry: i32, pressed: bool, released: bool) SelectionInput.Frame {
     return .{
         .canvas_rect = RECT0,
         .zoom = 1,
         .mouse_pos = .{ .x = mx, .y = my },
         .mouse_pressed_pos = .{ .x = px, .y = py },
+        .mouse_released_pos = .{ .x = rx, .y = ry },
         .pressed_left = pressed,
         .released_left = released,
     };
@@ -365,4 +372,17 @@ test "selection_input float: 外部編集が入ると次の move 開始で再 li
     if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
     try std.testing.expectEqual(B, px[1 * 16 + 5]); // 再 lift した B が移動
     try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 3]); // 前位置は空く
+}
+
+test "selection_input: release 確定は mouse_released_pos（up 後 move が同フレームでもずれない）" {
+    const gpa = std.testing.allocator;
+    var c = try core.Canvas.init(gpa, 16, 16);
+    defer c.deinit();
+    var si: SelectionInput = .{};
+    defer si.deinit(gpa);
+
+    _ = si.update(mkFrame(5, 5, 5, 5, true, false), &c, 0, gpa, .over);
+    const cmd = si.update(mkFrameSplit(5, 5, 20, 20, 8, 5, false, true), &c, 0, gpa, .over);
+    try std.testing.expect(cmd == null);
+    try std.testing.expectEqual(core.Rect{ .x = 5, .y = 5, .w = 4, .h = 1 }, c.selection.?);
 }

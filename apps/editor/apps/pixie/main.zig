@@ -2210,6 +2210,7 @@ pub fn main(init: std.process.Init) !void {
                         .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                         .time = platform.getTime(),
@@ -2224,6 +2225,7 @@ pub fn main(init: std.process.Init) !void {
                         .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
@@ -2254,6 +2256,7 @@ pub fn main(init: std.process.Init) !void {
                         .zoom = app.view_zoom,
                         .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                         .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };

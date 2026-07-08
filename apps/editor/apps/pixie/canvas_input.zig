@@ -26,6 +26,7 @@ pub const CanvasInput = struct {
         zoom: i32,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
+        mouse_released_pos: core.Vec2,
         pressed_left: bool, // このフレームで左ボタンが押された
         released_left: bool, // このフレームで左ボタンが離された
     };
@@ -54,12 +55,13 @@ pub const CanvasInput = struct {
 
         // capturing 中は現在位置まで継続。release フレームは確定（旧 strokeTo→endStroke 相当）。
         if (self.capturing) {
-            const cp = core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom);
             if (frame.released_left) {
+                const cp = core.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom);
                 const cmd = self.stroke_tool.onEvent(canvas, rec, gpa, .{ .up = .{ .x = cp.x, .y = cp.y } });
                 self.capturing = false;
                 return cmd;
             }
+            const cp = core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom);
             _ = self.stroke_tool.onEvent(canvas, rec, gpa, .{ .move = .{ .x = cp.x, .y = cp.y } });
         }
         return null;
@@ -117,6 +119,7 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
         .zoom = 1,
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -130,6 +133,7 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
         .zoom = 1,
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
         .pressed_left = false,
         .released_left = true,
     });
@@ -151,6 +155,7 @@ test "canvas_input: 同フレーム down→move（押下即ドラッグ）で初
         .zoom = 1,
         .mouse_pos = .{ .x = 5, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -168,6 +173,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
         .zoom = 1,
         .mouse_pos = .{ .x = 2, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
+        .mouse_released_pos = .{ .x = 2, .y = 2 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -177,6 +183,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
         .zoom = 1,
         .mouse_pos = .{ .x = 100, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
+        .mouse_released_pos = .{ .x = 2, .y = 2 },
         .pressed_left = false,
         .released_left = false,
     });
@@ -186,6 +193,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
         .zoom = 1,
         .mouse_pos = .{ .x = 100, .y = -50 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
+        .mouse_released_pos = .{ .x = 100, .y = -50 },
         .pressed_left = false,
         .released_left = true,
     });
@@ -206,6 +214,7 @@ test "canvas_input: 表示領域外の press では capture を開始しない" 
         .zoom = 1,
         .mouse_pos = .{ .x = 100, .y = 100 },
         .mouse_pressed_pos = .{ .x = 100, .y = 100 }, // rect 外
+        .mouse_released_pos = .{ .x = 100, .y = 100 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -223,6 +232,7 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
         .zoom = 1,
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -233,6 +243,7 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
         .zoom = 1,
         .mouse_pos = .{ .x = 3, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 3, .y = 0 },
         .pressed_left = false,
         .released_left = true,
     }, eraser.tool(), &h.canvas, &h.rec, h.gpa);
@@ -241,4 +252,42 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
     defer h.gpa.free(c.diffs);
     // Pen(RED) で塗られている（Eraser=透明 ではない）
     for (0..4) |x| try std.testing.expectEqual(RED, h.pixels()[x]);
+}
+
+test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フレームでも伸びない）" {
+    var h = try Harness.init(std.testing.allocator, 16, 16, RED);
+    defer h.deinit();
+
+    _ = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 0, .y = 0 },
+        .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
+        .pressed_left = true,
+        .released_left = false,
+    });
+    _ = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 5, .y = 0 },
+        .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
+        .pressed_left = false,
+        .released_left = false,
+    });
+    const cmd = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 50, .y = 0 },
+        .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 10, .y = 0 },
+        .pressed_left = false,
+        .released_left = true,
+    });
+    try std.testing.expect(cmd != null);
+    const c = cmd.?;
+    defer h.gpa.free(c.diffs);
+    for (0..11) |x| try std.testing.expectEqual(RED, h.pixels()[x]);
+    for (11..16) |x| try std.testing.expectEqual(@as(u32, 0), h.pixels()[x]);
 }
