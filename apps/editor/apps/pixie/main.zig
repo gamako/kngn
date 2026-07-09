@@ -322,6 +322,11 @@ const App = struct {
     timeline_last_advance: f64 = 0,
     timeline_target_layer: usize = 0,
     timeline_target_frame: u32 = 0,
+    /// オニオンスキン（TASK-45.3）。表示専用。
+    onion_enabled: bool = false,
+    onion_count: u32 = 1,
+    onion_buf: []u32 = &.{},
+    onion_scratch: []u32 = &.{},
     /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
@@ -1113,6 +1118,22 @@ const App = struct {
         self.preview_canvas.markDirty();
     }
 
+    /// 描画用の straight-alpha composite を返す（ベジェ/選択プレビュー時は preview_canvas）。
+    fn resolveDisplayComposite(self: *App, gpa: std.mem.Allocator) []const u32 {
+        if (self.active_kind == .bezier and self.bezier_editor.isEditing()) {
+            self.syncPreviewCanvas();
+            const dab = self.brush.footprint();
+            self.bezier_editor.rasterizePreview(&self.preview_canvas, &self.preview_rec, gpa, dab, self.brush.color, self.brush.opacity);
+            return self.preview_canvas.compositeStraight();
+        }
+        if (self.active_kind == .select and self.sel_in.state == .moving) {
+            self.syncPreviewCanvas();
+            _ = self.sel_in.renderMovePreview(self.preview_canvas.layerPixels(self.canvas.selected_layer), CANVAS_W, CANVAS_H, self.blend_mode);
+            return self.preview_canvas.compositeStraight();
+        }
+        return self.canvas.compositeStraight();
+    }
+
     fn handleKey(self: *App, k: platform.KeyEvent) void {
         // Space はパン用 modifier（押下継続を追跡。解放は handleKeyUp）。他処理には回さない。
         if (k.key == .SPACE) {
@@ -1442,6 +1463,37 @@ fn actionMergeDown(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
+/// `add` で空フレーム追加、`select <idx>` でフレーム選択（harness 向け。registry 節約のため1名）。
+fn actionFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    const sub = it.next() orelse return error.Empty;
+    if (std.mem.eql(u8, sub, "add")) {
+        if (it.next() != null) return error.TooManyTokens;
+        try actionApp(ctx).doAddFrame();
+        return "ok";
+    }
+    if (std.mem.eql(u8, sub, "select")) {
+        const idx_tok = it.next() orelse return error.Empty;
+        if (it.next() != null) return error.TooManyTokens;
+        const idx = std.fmt.parseUnsigned(u32, idx_tok, 10) catch return error.InvalidNumber;
+        try actionApp(ctx).doSelectFrame(idx);
+        return "ok";
+    }
+    return error.InvalidNumber;
+}
+
+fn actionSetOnion(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const p = try actions.parseOnion(args);
+    const app = actionApp(ctx);
+    app.onion_enabled = p.enabled;
+    if (p.count) |c| {
+        app.onion_count = @intCast(std.math.clamp(c, 1, core.onion_skin.max_count));
+    }
+    return "ok";
+}
+
 fn actionSetColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const color = try actions.parseHexColor(args);
@@ -1522,6 +1574,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = actionMoveLayer });
     platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = actionDuplicateLayer });
     platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = actionMergeDown });
+    platform.registerAction(.{ .name = "frame", .ctx = app, .run = actionFrame });
+    platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = actionSetOnion });
     platform.registerAction(.{ .name = "set_color", .ctx = app, .run = actionSetColor });
     platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = actionSetTool });
     platform.registerAction(.{ .name = "stroke", .ctx = app, .run = actionStroke });
@@ -2000,6 +2054,13 @@ fn buildTimelinePanel(ctx: *gui.Context, app: *App) !void {
     if (ctx.buttonId(tl + 9, "Clr", .{ .min_w = 32 }).clicked) app.doClearCelAt(target_layer, target_frame) catch {};
     if (ctx.buttonId(tl + 10, "Link", .{ .min_w = 36 }).clicked) app.doLinkCelLeft(target_layer, target_frame) catch {};
     if (ctx.buttonId(tl + 11, "Unlk", .{ .min_w = 36 }).clicked) app.doUnlinkCelAt(target_layer, target_frame) catch {};
+    _ = ctx.toggleId(tl + 12, "Onion", &app.onion_enabled);
+    if (app.onion_enabled) {
+        var onion_n_i32: i32 = @intCast(app.onion_count);
+        if (ctx.sliderI32Id(tl + 13, "On.N", &onion_n_i32, .{ .min = 1, .max = @as(i32, @intCast(core.onion_skin.max_count)), .step = 1, .track_w = 40 })) {
+            app.onion_count = @intCast(std.math.clamp(onion_n_i32, 1, @as(i32, @intCast(core.onion_skin.max_count))));
+        }
+    }
     ctx.endBox();
 
     ctx.beginScrollArea(TIMELINE_SCROLL_ID, &app.timeline_scroll, .{
@@ -2407,6 +2468,11 @@ pub fn main(init: std.process.Init) !void {
     app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
     app.brush.color = app.palette.current();
     app.fill.color = app.palette.current();
+    const canvas_pixel_count = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
+    app.onion_buf = try gpa.alloc(u32, canvas_pixel_count);
+    errdefer gpa.free(app.onion_buf);
+    app.onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
+    errdefer gpa.free(app.onion_scratch);
     defer {
         if (app.current_path) |p| gpa.free(p);
         if (app.current_project_path) |p| gpa.free(p);
@@ -2417,6 +2483,8 @@ pub fn main(init: std.process.Init) !void {
         app.preview_rec.deinit(gpa);
         app.preview_canvas.deinit();
         app.palette.deinit(gpa);
+        gpa.free(app.onion_buf);
+        gpa.free(app.onion_scratch);
         // app.doc.deinit() が doc.undo も内部で解放する（TASK-45.1。独立 app.undo は廃止済み）。
         app.recorder.deinit(gpa);
         app.doc.deinit();
@@ -2589,21 +2657,13 @@ pub fn main(init: std.process.Init) !void {
                         .h = @as(i32, @intCast(CANVAS_H)) * zoom,
                     };
                     blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
-                    if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
-                        // 確定前ブラシプレビュー: 本 canvas 全 layer のコピーへ path(+仮点)を実ブラシ描画して表示（非破壊）
-                        app.syncPreviewCanvas();
-                        const dab = app.brush.footprint();
-                        app.bezier_editor.rasterizePreview(&app.preview_canvas, &app.preview_rec, gpa, dab, app.brush.color, app.brush.opacity);
-                        blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), CANVAS_W, CANVAS_H, rect, zoom, area);
-                    } else if (app.active_kind == .select and app.sel_in.state == .moving) {
-                        // フローティング move プレビュー: 実 canvas は不変のまま、preview_canvas の選択レイヤーへ
-                        // 「base+block@現在位置（blend_mode 合成）」を描いて表示する（確定は release）。
-                        app.syncPreviewCanvas();
-                        _ = app.sel_in.renderMovePreview(app.preview_canvas.layerPixels(app.canvas.selected_layer), CANVAS_W, CANVAS_H, app.blend_mode);
-                        blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, app.preview_canvas.compositeStraight(), CANVAS_W, CANVAS_H, rect, zoom, area);
-                    } else {
-                        blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, app.canvas.compositeStraight(), CANVAS_W, CANVAS_H, rect, zoom, area);
-                    }
+                    const base_composite = app.resolveDisplayComposite(gpa);
+                    const display_composite: []const u32 = if (app.onion_enabled and app.doc.frames.items.len > 1) blk: {
+                        const cnt = @min(app.onion_count, core.onion_skin.max_count);
+                        core.onion_skin.build(&app.doc, base_composite, app.doc.selected_frame, cnt, app.onion_buf, app.onion_scratch);
+                        break :blk app.onion_buf;
+                    } else base_composite;
+                    blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, CANVAS_W, CANVAS_H, rect, zoom, area);
                 }
             }
             // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる。area で clip）

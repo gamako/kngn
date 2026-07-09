@@ -12,11 +12,13 @@
 //! - CelId は Document 生存期間中 **一度払い出したら二度と別の cel へ再割り当てしない**
 //!   （free-list 無し。plan 4.3節。undo/redo 履歴が古い CelId を値として保持し続けるため）。
 //!
-//! ホットパス宣言: 本ファイルの API はすべて **イベント時のみ**（frame 切替・undo/redo・
-//! cel/frame/layer 操作はいずれもユーザー操作 1 回につき 1 回)。フレーム毎全画素ループは
-//! `active_view.composite()`/`compositeStraight()`（既存 Canvas の SIMD 経路。無改造）のみで、
-//! 本ファイルは一切新設しない。`resyncActiveView`/`pushPaintOp` の `@memcpy` は1layer〜数layer分の
-//! 1回コピーであり、frame切替直後・undo/redo直後・project load直後・stroke確定時のみ走る
+//! ホットパス宣言: 本ファイルのイベント時 API は **イベント時のみ**（frame 切替・undo/redo・
+//! cel/frame/layer 操作はいずれもユーザー操作 1 回につき 1 回)。フレーム毎全画素ループの主経路は
+//! `active_view.composite()`/`compositeStraight()`（既存 Canvas の SIMD 経路。無改造）。
+//! **例外**: `compositeFrameStraight` は表示フレーム毎・全画素（オニオンスキン経由のみ。TASK-45.3）。
+//! `selected_frame` / `active_view` / composite cache は変更しない。
+//! `resyncActiveView`/`pushPaintOp` の `@memcpy` は1layer〜数layer分の1回コピーであり、
+//! frame切替直後・undo/redo直後・project load直後・stroke確定時のみ走る
 //! （main loop の毎フレーム経路には混入させない。plan 2節の明示的禁止事項）。
 
 const std = @import("std");
@@ -31,6 +33,7 @@ pub const PixelDiff = undo_mod.PixelDiff;
 const NameSnapshot = undo_mod.NameSnapshot;
 const text_render = @import("text_render.zig");
 const blend = @import("blend.zig");
+const pixelops = @import("pixelops");
 
 /// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
 /// 切り詰めた長さを返す（`canvas.zig` の同名 private 関数と同じロジック。`LayerDef.setName`
@@ -514,6 +517,36 @@ pub const Document = struct {
         }
         // selected_layer は doc が唯一の権威（4.5節）。system_font は一切触らない。
         self.active_view.selected_layer = self.selected_layer;
+    }
+
+    /// 指定 frame の全 visible layer を straight-alpha 合成して `dst` へ書く（表示専用。TASK-45.3）。
+    /// `selected_frame` / `active_view` / composite cache は一切変更しない。
+    ///
+    /// 毎フレーム全画素×レイヤ数を走るホットパス（オニオンスキン表示のみ。`onion_skin.build` 経由）。
+    /// `canvas.compositeStraight` と同型の pixelops SIMD 4px ループ（cel_pool 直読み）。
+    pub fn compositeFrameStraight(self: *const Document, frame_idx: u32, dst: []u32) void {
+        const n = @as(usize, self.width) * self.height;
+        std.debug.assert(dst.len == n);
+        std.debug.assert(frame_idx < self.frames.items.len);
+        @memset(dst, 0);
+        for (self.layers.items, 0..) |def, i| {
+            if (!def.visible) continue;
+            const op = def.opacity;
+            const cel_id = self.gridGet(i, frame_idx) orelse continue;
+            const layer_pixels = self.cel_pool.items[cel_id].?.pixels;
+            var j: usize = 0;
+            while (j + 4 <= n) : (j += 4) {
+                const s4: [4]u32 = layer_pixels[j..][0..4].*;
+                if ((s4[0] | s4[1] | s4[2] | s4[3]) & 0xFF000000 == 0) continue;
+                const dst_chunk: *[4]u32 = dst[j..][0..4];
+                dst_chunk.* = @bitCast(pixelops.srcOverStraight4(@bitCast(dst_chunk.*), @bitCast(s4), op));
+            }
+            while (j < n) : (j += 1) {
+                const s = layer_pixels[j];
+                if (s & 0xFF000000 == 0) continue;
+                dst[j] = pixelops.srcOverStraightScalar(dst[j], s, op);
+            }
+        }
     }
 
     /// raster ピクセルを変更する全ての操作が経由する唯一のコミット口

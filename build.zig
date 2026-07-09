@@ -754,6 +754,19 @@ pub fn build(b: *std.Build) void {
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
 
+    // onion_skin（TASK-45.3）。paint 内の表示専用オニオン合成。
+    const onion_skin_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/onion_skin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    onion_skin_test_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    onion_skin_test_mod.addImport("png", shared_modules.png.mod);
+    onion_skin_test_mod.addImport("serde", shared_modules.serde.mod);
+    onion_skin_test_mod.addImport("font", shared_modules.font.mod);
+    const onion_skin_test = b.addTest(.{ .root_module = onion_skin_test_mod });
+    const run_onion_skin_test = b.addRunArtifact(onion_skin_test);
+
     // pixie palette（モデル + GIMP .gpl）。pure（std のみ・import 不要）。
     const palette_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -810,6 +823,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_eyedropper_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
+    test_core_step.dependOn(&run_onion_skin_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
     test_core_step.dependOn(&run_actions_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);

@@ -5,6 +5,7 @@ pub const tool = @import("tool.zig");
 pub const blend = @import("blend.zig");
 pub const document = @import("document.zig");
 pub const document_io = @import("document_io.zig");
+pub const onion_skin = @import("onion_skin.zig");
 
 pub const Canvas = canvas.Canvas;
 pub const Layer = canvas.Layer;

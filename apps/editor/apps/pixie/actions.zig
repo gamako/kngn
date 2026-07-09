@@ -82,6 +82,28 @@ pub fn parseIdxBool(args: []const u8) ParseError!IdxBool {
     return .{ .idx = idx, .on = on };
 }
 
+pub const OnionArgs = struct { enabled: bool, count: ?u32 };
+
+/// "on [count]" / "off" / "1 [count]" / "0"。count は省略可（1..3 を呼び出し側で clamp）。
+pub fn parseOnion(args: []const u8) ParseError!OnionArgs {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const enabled = if (std.ascii.eqlIgnoreCase(tok, "on") or std.mem.eql(u8, tok, "1"))
+        true
+    else if (std.ascii.eqlIgnoreCase(tok, "off") or std.mem.eql(u8, tok, "0"))
+        false
+    else
+        return error.UnknownBool;
+    const count_tok = it.next();
+    if (count_tok) |ct| {
+        const c = std.fmt.parseUnsigned(u32, ct, 10) catch return error.InvalidNumber;
+        try expectExhausted(&it);
+        return .{ .enabled = enabled, .count = c };
+    }
+    try expectExhausted(&it);
+    return .{ .enabled = enabled, .count = null };
+}
+
 pub const IdxU8 = struct { idx: usize, value: u8 };
 
 /// "<idx> <0-255>" の2トークン。
