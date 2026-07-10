@@ -816,6 +816,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_actions_test = b.addRunArtifact(actions_test);
 
+    // history summary schema（TASK-62.5.5）。kit.platform.command 型を使うため default backend の kit を配線。
+    const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules);
+    const history_summary_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/history_summary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    history_summary_mod.addImport("kit", history_summary_pm.kit.mod);
+    const history_summary_test = b.addTest(.{ .root_module = history_summary_mod });
+    const run_history_summary_test = b.addRunArtifact(history_summary_test);
+    const test_history_summary_step = b.step("test-history-summary", "Run history_summary schema unit tests (TASK-62.5.5)");
+    test_history_summary_step.dependOn(&run_history_summary_test.step);
+
     // レイヤー名インライン編集の入力状態機械（TASK-79.3）。std のみ・paint/App/kit 非依存で import 不要。
     const layer_rename_input_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -855,6 +868,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_onion_skin_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
     test_core_step.dependOn(&run_actions_test.step);
+    test_core_step.dependOn(&run_history_summary_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);
     test_core_step.dependOn(&run_text_content_input_test.step);
 

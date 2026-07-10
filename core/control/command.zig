@@ -25,6 +25,8 @@ const std = @import("std");
 
 /// action name の inline 所有バイト数上限（既存 action 名は最長 20B 弱。余裕を含む）。
 pub const MAX_CMD_NAME = 64;
+/// adapter.summarize / 履歴表示文言の上限（**bytes**。UTF-8 境界で切り詰め。TASK-62.5.5）。
+pub const MAX_SUMMARY = 64;
 /// args の inline 所有バイト数上限（UI/agent stroke の点列格納。62.3 wire の
 /// `MAX_ACTION_FRAME_BYTES` 目安 4096B と同値。TASK-62.5.3 で 1024→4096。
 /// 応答バッファの `DIGEST_BUF_LEN`=1024 とは無関係）。
@@ -124,8 +126,15 @@ pub const CommandLog = struct {
         if (self.filled < MAX_CMD_LOG) self.filled += 1;
     }
 
-    /// i: 0 = 最古 … `filled - 1` = 最新。
-    fn recordAt(self: *CommandLog, i: u32) *CommandRecord {
+    /// i: 0 = 最古 … `filled - 1` = 最新。読み取り専用（履歴 panel / probe 用。TASK-62.5.5）。
+    /// 範囲外は caller 責任（`i < filled`）。
+    pub fn recordAt(self: *const CommandLog, i: u32) *const CommandRecord {
+        const idx = (self.head + MAX_CMD_LOG - self.filled + i) % MAX_CMD_LOG;
+        return &self.records[idx];
+    }
+
+    /// 内部用（reverted マーク等）。`recordAt` と同位置の可変参照。
+    fn recordAtMut(self: *CommandLog, i: u32) *CommandRecord {
         const idx = (self.head + MAX_CMD_LOG - self.filled + i) % MAX_CMD_LOG;
         return &self.records[idx];
     }
@@ -134,7 +143,7 @@ pub const CommandLog = struct {
     pub fn findBySeq(self: *CommandLog, seq: u64) ?*CommandRecord {
         var i: u32 = 0;
         while (i < self.filled) : (i += 1) {
-            const r = self.recordAt(i);
+            const r = self.recordAtMut(i);
             if (r.seq == seq) return r;
         }
         return null;
@@ -143,7 +152,7 @@ pub const CommandLog = struct {
     /// 最新（直近に append された）record。空なら null（history probe 等の観測用。TASK-62.5.3）。
     pub fn latest(self: *CommandLog) ?*CommandRecord {
         if (self.filled == 0) return null;
-        return self.recordAt(self.filled - 1);
+        return self.recordAtMut(self.filled - 1);
     }
 };
 
@@ -185,6 +194,10 @@ pub const CommandAdapter = struct {
     /// （逆適用が失敗しうる app は `canUndo` 側で false を返す責務を負う。
     /// これにより transaction の all-or-nothing が事前検証だけで成立する）。
     applyUndo: *const fn (ctx: *anyopaque, rec: *const CommandRecord) void,
+    /// record の短い表示文言を `buf`（呼び出し側が `MAX_SUMMARY` 以上）に書き、書いた slice を返す。
+    /// 失敗しない（不明なら name を写す）。alloc/副作用なし。戻りは ASCII 印刷可能（0x20..0x7E）に
+    /// 正規化済みであること。executor は呼ばない（履歴 UI / probe 用。TASK-62.5.5）。
+    summarize: *const fn (ctx: *anyopaque, rec: *const CommandRecord, buf: []u8) []const u8,
 };
 
 pub const UndoOutcome = struct {
@@ -834,13 +847,20 @@ const MockApp = struct {
             if (ref < self.valid.len) self.valid[ref] = false;
         }
     }
+
+    fn summarize(ctx: *anyopaque, rec: *const CommandRecord, buf: []u8) []const u8 {
+        _ = ctx;
+        const n = @min(rec.name().len, buf.len);
+        @memcpy(buf[0..n], rec.name()[0..n]);
+        return buf[0..n];
+    }
 };
 
 fn wire(app: *MockApp, log: *CommandLog, exec: *Executor) void {
     log.* = .{};
     exec.* = Executor.init(.{ .ctx = app, .run = MockApp.run });
     exec.log = log;
-    exec.adapter = .{ .ctx = app, .canUndo = MockApp.canUndo, .applyUndo = MockApp.applyUndo };
+    exec.adapter = .{ .ctx = app, .canUndo = MockApp.canUndo, .applyUndo = MockApp.applyUndo, .summarize = MockApp.summarize };
     app.* = .{ .exec = exec };
 }
 

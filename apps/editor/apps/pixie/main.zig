@@ -31,6 +31,7 @@ const brush_edge_cache = @import("brush_edge_cache.zig");
 const cursor_overlay = @import("cursor_overlay.zig");
 const layer_rename_input = @import("layer_rename_input.zig");
 const text_content_input = @import("text_content_input.zig");
+const history_summary = @import("history_summary.zig");
 
 // レイヤー名の最大長は libs/paint（保存側）と pixie（編集バッファ側）で独立定義しているため
 // （循環 import 回避。詳細は layer_rename_input.zig 冒頭）、乖離しないことを comptime で保証する。
@@ -532,7 +533,7 @@ const App = struct {
         var i: u32 = self.cmd_log.filled;
         while (i > 0) {
             i -= 1;
-            const rec = logRecordAt(&self.cmd_log, i);
+            const rec = self.cmd_log.recordAt(i);
             if (rec.seq < first_seq) break; // seq は単調（これより古い record にタグ対象はない）
             if (rec.kind != .normal) continue;
             const ref = rec.undo_ref orelse continue;
@@ -975,11 +976,11 @@ const App = struct {
 
     /// CommandLog を後方走査して undo_ref==handle の normal record を返す（userUndo の
     /// op→record 対応判定。イベント時のみ・最大 128 slot の線形走査）。
-    fn findRecordByUndoRef(self: *App, handle: u64) ?*platform.command.CommandRecord {
+    fn findRecordByUndoRef(self: *App, handle: u64) ?*const platform.command.CommandRecord {
         var i: u32 = self.cmd_log.filled;
         while (i > 0) {
             i -= 1;
-            const rec = logRecordAt(&self.cmd_log, i);
+            const rec = self.cmd_log.recordAt(i);
             if (rec.kind == .normal and rec.undo_ref != null and rec.undo_ref.? == handle) return rec;
         }
         return null;
@@ -1610,53 +1611,32 @@ fn adapterApplyUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord)
     _ = app.doc.revertByHandle(app.gpa, rec.undo_ref.?, .discard);
 }
 
-/// CommandLog のリング i 番目（0=最古）を返す（App 側の観測 helper。`CommandLog.recordAt` と
-/// 同じ ring 計算。イベント時のみ）。
-fn logRecordAt(log: *platform.command.CommandLog, i: u32) *platform.command.CommandRecord {
-    const cap: u32 = platform.command.MAX_CMD_LOG;
-    const idx = (log.head + cap - log.filled + i) % cap;
-    return &log.records[idx];
+fn adapterSummarize(_: *anyopaque, rec: *const platform.command.CommandRecord, buf: []u8) []const u8 {
+    return history_summary.summarizeRecord(rec, buf);
 }
 
-/// history digest（TASK-62.5.3 §5d の**暫定** probe。正式な summary schema は 62.5.5 で確定し、
-/// この digest はその際に置換・拡張してよい）: CommandLog の外部観測手段（AC #1 の headless 検証用）。
-/// `last_undo_live` = 最新 record の undo_ref handle が現在 UndoStack に現存するか（AC #2 の
-/// 対応付けと §5b' の stale 遷移の外部検証用。undo_ref が無い record は `-`）。
+fn historyHasHandle(ctx: *anyopaque, ref: u64) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.doc.undo.hasHandle(ref);
+}
+
+fn historyCtx(app: *App) history_summary.HistoryContext {
+    return .{
+        .ctx = app,
+        .hasHandle = historyHasHandle,
+        .log = &app.cmd_log,
+    };
+}
+
+/// history probe（TASK-62.5.5 正式 schema）: digest=最新+集計（expect 用）、snapshot=全件 JSON。
 fn historyDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    const latest = app.cmd_log.latest() orelse {
-        return std.fmt.bufPrint(buf, "count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=- last_kind=- last_target=- last_redo_of=- last2_tx=-", .{}) catch buf[0..0];
-    };
-    var ref_buf: [24]u8 = undefined;
-    const ref_str: []const u8 = if (latest.undo_ref) |r| (std.fmt.bufPrint(&ref_buf, "{d}", .{r}) catch "-") else "-";
-    const live_str: []const u8 = if (latest.undo_ref) |r| (if (app.doc.undo.hasHandle(r)) "1" else "0") else "-";
-    var tx_buf: [24]u8 = undefined;
-    const tx_str: []const u8 = if (latest.transaction_id) |t| (std.fmt.bufPrint(&tx_buf, "{d}", .{t}) catch "-") else "-";
-    // TASK-62.5.4 §4c: revert/redo/tx bundle の観測用フィールド（62.5.5 で正式 schema に置換可）
-    var target_buf: [24]u8 = undefined;
-    const target_str: []const u8 = if (latest.target_seq) |t| (std.fmt.bufPrint(&target_buf, "{d}", .{t}) catch "-") else "-";
-    var redo_of_buf: [24]u8 = undefined;
-    const redo_of_str: []const u8 = if (latest.redo_of) |r| (std.fmt.bufPrint(&redo_of_buf, "{d}", .{r}) catch "-") else "-";
-    var tx2_buf: [24]u8 = undefined;
-    const tx2_str: []const u8 = blk: {
-        if (app.cmd_log.filled < 2) break :blk "-";
-        const second = logRecordAt(&app.cmd_log, app.cmd_log.filled - 2);
-        break :blk if (second.transaction_id) |t| (std.fmt.bufPrint(&tx2_buf, "{d}", .{t}) catch "-") else "-";
-    };
-    return std.fmt.bufPrint(buf, "count={d} last_seq={d} last_actor={s} last_name={s} last_undoable={d} last_undo_ref={s} last_undo_live={s} last_tx={s} last_kind={s} last_target={s} last_redo_of={s} last2_tx={s}", .{
-        app.cmd_log.filled,
-        latest.seq,
-        @tagName(latest.actor),
-        latest.name(),
-        @as(u1, if (latest.undoable) 1 else 0),
-        ref_str,
-        live_str,
-        tx_str,
-        @tagName(latest.kind),
-        target_str,
-        redo_of_str,
-        tx2_str,
-    }) catch buf[0..0];
+    return history_summary.formatDigest(historyCtx(app), buf);
+}
+
+fn historySnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return history_summary.formatSnapshotJson(historyCtx(app), allocator);
 }
 
 // ============================================================================
@@ -2988,7 +2968,7 @@ pub fn main(init: std.process.Init) !void {
     // 共有 executor に設定する（copilot 無効時は no-op。記録自体は transport の有無に依存しない）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchPixieAction });
     app.cmd_exec.log = &app.cmd_log;
-    app.cmd_exec.adapter = .{ .ctx = &app, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo }; // per-actor undo（TASK-62.5.4）
+    app.cmd_exec.adapter = .{ .ctx = &app, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo, .summarize = adapterSummarize }; // per-actor undo + history summary（TASK-62.5.4/62.5.5）
     platform.setCommandExecutor(&app.cmd_exec);
 
     // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
@@ -2996,7 +2976,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "undo", .ctx = &app, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
     platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
     platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
-    platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "txt", .digest = historyDigest }); // 暫定（§5d。62.5.5 で置換可）
+    platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest }); // TASK-62.5.5 正式 schema
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
     registerActions(&app);
 
