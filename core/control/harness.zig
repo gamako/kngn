@@ -142,7 +142,7 @@ var synth_audio: ?capture_synthetic.SyntheticAudioDevice = null;
 // custom probe registry（app が opt-in 登録。framework は中身を解釈せず raw+digest をルートするだけ）
 // 単一プロセスの debug facility なので固定長 module-level 配列で十分（動的確保なし）。
 const MAX_PROBES = 16;
-const DIGEST_BUF_LEN = 1024; // custom digest callback に渡す共通バッファ長
+pub const DIGEST_BUF_LEN = 1024; // custom digest callback に渡す共通バッファ長（copilot も同契約で使う）
 var probes: [MAX_PROBES]Probe = undefined;
 var probe_count: usize = 0;
 
@@ -181,6 +181,22 @@ pub fn isEnabled() bool {
     return mode != .disabled;
 }
 
+/// 外部 control-plane（copilot。TASK-62.5.2）が registry 登録を有効化するフラグ。
+/// 62.3 v6 の `setEnabled` OR 条件の先行形（依存は copilot→harness の一方向で、
+/// harness から copilot の関数は呼ばない）。
+var external_registry_enabled = false;
+
+/// 外部 transport（copilot 等）が probe/action registry の登録ゲートを開く。
+/// `registerProbe`/`registerAction` の有効判定が `isEnabled() or このフラグ` になる。
+pub fn setExternalRegistryEnabled(v: bool) void {
+    external_registry_enabled = v;
+}
+
+/// probe/action registry の登録ゲート（harness 有効 or 外部 transport 有効）。
+fn registryEnabled() bool {
+    return isEnabled() or external_registry_enabled;
+}
+
 /// live 実表示時に harness が accept/read 待機中に呼ぶ native event pump callback。
 /// `pollFn` が `false` を返したら window close / compositor disconnect として live wait を中断する。
 pub const NativePump = struct {
@@ -217,7 +233,7 @@ pub const Probe = struct {
 /// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
 /// - 同名は上書き。fb/audio/stats/capabilities/capture は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
 pub fn registerProbe(p: Probe) void {
-    if (!isEnabled()) return;
+    if (!registryEnabled()) return;
     if (isReservedProbeName(p.name)) {
         std.debug.print("[harness] registerProbe: 予約名 '{s}' は登録できません\n", .{p.name});
         return;
@@ -268,7 +284,8 @@ fn sanitizeDesc(kind: []const u8, name: []const u8, desc: []const u8) []const u8
     return desc;
 }
 
-fn findProbe(name: []const u8) ?*Probe {
+/// 登録済み custom probe の name lookup（copilot 等の外部 control-plane も使う。TASK-62.5.2 で pub 化）。
+pub fn findProbe(name: []const u8) ?*Probe {
     for (probes[0..probe_count]) |*p| {
         if (std.mem.eql(u8, p.name, name)) return p;
     }
@@ -311,7 +328,7 @@ var action_count: usize = 0;
 /// - 同名は上書き。空白/`;`/改行を含む名前と空名は拒否（コマンド言語上そもそも呼び出せないため）。
 /// - registry 満杯はスキップ（いずれも warn）。
 pub fn registerAction(a: Action) void {
-    if (!isEnabled()) return;
+    if (!registryEnabled()) return;
     if (!isValidActionName(a.name)) {
         std.debug.print("[harness] registerAction: 不正な名前 '{s}'（空/空白/';'/改行 は不可）\n", .{a.name});
         return;
@@ -343,7 +360,8 @@ fn isValidActionName(name: []const u8) bool {
     return true;
 }
 
-fn findAction(name: []const u8) ?*Action {
+/// 登録済み custom action の name lookup（copilot 等の外部 control-plane も使う。TASK-62.5.2 で pub 化）。
+pub fn findAction(name: []const u8) ?*Action {
     for (actions[0..action_count]) |*a| {
         if (std.mem.eql(u8, a.name, name)) return a;
     }
@@ -1223,6 +1241,11 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
     return buf[0..len];
 }
 
+/// `formatCapabilitiesPayload` の pub wrapper（copilot の `digest capabilities` が使う。TASK-62.5.2）。
+pub fn capabilitiesPayload(buf: []u8) []const u8 {
+    return formatCapabilitiesPayload(buf);
+}
+
 /// digest 1行 payload の取得結果。`unavailable` は取得できない理由（静的文字列）を保持し、
 /// digest コマンドの warn と expect/assert の `actual=` 表示の両方で診断性を保つ（TASK-78）。
 const DigestResult = union(enum) {
@@ -1992,6 +2015,7 @@ fn resetForTest() void {
     audio_rate = .init(0);
     probe_count = 0;
     action_count = 0;
+    external_registry_enabled = false;
     // synthetic capture source（TASK-49.5）: 前のテストの残留状態（video の pixel buffer・audio の
     // 生成スレッド）を確実に片付けてからクリーンな状態で始める（テスト間リークを防ぐ）。
     if (synth_video) |*dev| dev.close();
@@ -3526,3 +3550,10 @@ test "live pump: request 1 MiB 超過後も次接続を accept できる" {
 
     try testing.expect(pollGateWithPump(true, always_pump));
 }
+
+// ============================================================================
+// copilot（第3 control-plane。TASK-62.5.2）の namespace 再エクスポート。
+// facade が `@import("harness").copilot` で届くようにするためだけの 1 行で、
+// harness から copilot の関数は呼ばない（意味的依存は copilot→harness の一方向）。
+// ============================================================================
+pub const copilot = @import("copilot.zig");

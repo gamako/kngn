@@ -39,6 +39,9 @@ const types = @import("platform_types");
 // harness は共有 module（src/audio.zig facade も同一インスタンスを import し module-level state を共有する）。
 // このため source-relative `@import("harness.zig")` ではなく名前付き module import を使う (TASK-32.2)。
 const harness = @import("harness");
+// copilot（通常 UX と共存する assist transport。TASK-62.5.2）。harness module 内の namespace
+// 再エクスポート経由で参照する（意味的依存は copilot→harness の一方向）。
+const copilot = harness.copilot;
 // ゲームパッド実 backend（GameController framework）の opt-in フラグ（TASK-80.2 opt-in 化。audio の
 // `link_audio` と対称）。build.zig の `createPlatformModule`/`buildStandalone` が常にこの named import を
 // 付与するため（外部公開 module も含む）、全 caller で安全に参照できる。
@@ -128,7 +131,12 @@ pub const Window = struct {
         if (self.headless) return harness.pollGate(true); // native window closed 相当が無いので常に continue
         var inner = self.inner;
         const native = inner.pollEvents();
-        if (!harness.isEnabled()) return native;
+        if (!harness.isEnabled()) {
+            // 通常 UX の毎フレーム末尾で copilot transport を進める（disabled 時は即 return の no-op。
+            // harness 有効時は排他により copilot は必ず disabled なので、このパスに置くだけで足りる）。
+            copilot.pump();
+            return native;
+        }
         const pump = harness.NativePump{
             .ptr = @ptrCast(&inner),
             .pollFn = nativePumpPoll,
@@ -220,14 +228,19 @@ pub const Window = struct {
 pub fn init() Error!void {
     // headless 判定を先に確定させる（env 読取のみ・副作用無し）。headless なら backend.init() 自体を
     // スキップする（display 接続を一切しない。TASK-32.4 P4）。非 headless は従来通り backend→transport の順を保つ。
+    // copilot は TASK-62.5.2 §3b の順序: harness.parseConfig → copilot.parseConfig → backend init →
+    // harness.startTransport → copilot.startTransport（排他は env 存在ベースで parseConfig 時点に確定）。
     harness.parseConfig();
+    copilot.parseConfig();
     if (!harness.isHeadlessActive()) {
         try backend.init();
     }
     harness.startTransport();
+    copilot.startTransport();
 }
 
 pub fn shutdown() void {
+    copilot.stopTransport(); // 接続中 stream → listener の順に close（disabled 時は no-op）
     if (harness.isHeadlessActive()) return; // backend.init() を呼んでいないので shutdown も呼ばない
     backend.shutdown();
 }

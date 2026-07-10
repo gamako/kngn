@@ -378,6 +378,24 @@ pub fn build(b: *std.Build) void {
     const test_command_step = b.step("test-command", "Run command model unit tests (types / executor / undo-redo / no-op recorder)");
     test_command_step.dependOn(&run_command_test.step);
 
+    // copilot transport 単体テスト（ConnState state machine / コマンド実行層 / registry OR ゲート / 排他。
+    // socket・display 不要。TASK-62.5.2）。root=copilot.zig は harness.zig を import するため
+    // harness_test_mod と同じ import/link_libc 構成が要る。"copilot:" filter で copilot のテストのみ
+    // 実行する（import された harness/command のテストは test-harness / test-command が担う。二重実行を避ける）。
+    const copilot_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/copilot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // copilot/harness とも libc getenv を使う
+    });
+    copilot_test_mod.addImport("png", shared_modules.png.mod);
+    copilot_test_mod.addImport("platform_types", shared_modules.types.mod);
+    copilot_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod);
+    const copilot_test = b.addTest(.{ .root_module = copilot_test_mod, .filters = &.{"copilot:"} });
+    const run_copilot_test = b.addRunArtifact(copilot_test);
+    const test_copilot_step = b.step("test-copilot", "Run copilot transport unit tests (ConnState / command layer / registry OR gate)");
+    test_copilot_step.dependOn(&run_copilot_test.step);
+
     // audio_null 単体テスト（headless の実デバイス無し出力。RT ゼロアロケーション / pull ループ。
     // display・実オーディオデバイス不要・OS 非依存。TASK-32.4 P4）
     const audio_null_test_mod = b.createModule(.{
@@ -1201,6 +1219,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_command_step);
+    test_step.dependOn(test_copilot_step);
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
     test_step.dependOn(test_capture_types_step);
