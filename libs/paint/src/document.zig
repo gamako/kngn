@@ -239,6 +239,11 @@ pub const UndoStack = struct {
     redo: std.ArrayList(Op) = .empty,
     /// `undo` と要素同期する handle 並行配列（handles.items.len == undo.items.len 不変）。
     handles: std.ArrayList(u64) = .empty,
+    /// `undo` と要素同期する所有者タグ並行配列（TASK-62.5.4 review: CommandLog リング退避後の
+    /// 所有者誤認防止）。**paint は値の意味を解釈しない**（0=unknown を既定とし、それ以外の
+    /// 値の規約は app 側 = pixie が持つ）。push/redo 再 push は 0 で積まれ、app が `setOwner` で
+    /// 確定する。
+    owners: std.ArrayList(u8) = .empty,
     /// 次に採番する handle（単調・再利用なし）。
     next_handle: u64 = 1,
 
@@ -246,6 +251,7 @@ pub const UndoStack = struct {
         freeStack(gpa, &self.undo);
         freeStack(gpa, &self.redo);
         self.handles.deinit(gpa);
+        self.owners.deinit(gpa);
     }
 
     fn freeStack(gpa: Allocator, stack: *std.ArrayList(Op)) void {
@@ -272,6 +278,24 @@ pub const UndoStack = struct {
         return self.handles.items[n - 1];
     }
 
+    /// 指定 handle の op に所有者タグを付ける（handle 不在なら no-op。タグの意味は app 規約）。
+    pub fn setOwner(self: *UndoStack, handle: u64, tag: u8) void {
+        for (self.handles.items, 0..) |h, i| {
+            if (h == handle) {
+                self.owners.items[i] = tag;
+                return;
+            }
+        }
+    }
+
+    /// 指定 handle の所有者タグ（不在は 0=unknown）。
+    pub fn ownerOf(self: *const UndoStack, handle: u64) u8 {
+        for (self.handles.items, 0..) |h, i| {
+            if (h == handle) return self.owners.items[i];
+        }
+        return 0;
+    }
+
     /// 指定 handle の Op が undo 配列に現存するか（CommandRecord.undo_ref の live 判定用）。
     pub fn hasHandle(self: *const UndoStack, handle: u64) bool {
         for (self.handles.items) |h| {
@@ -287,9 +311,11 @@ pub const UndoStack = struct {
             var oldest = self.undo.orderedRemove(0);
             freeOp(gpa, &oldest);
             _ = self.handles.orderedRemove(0);
+            _ = self.owners.orderedRemove(0);
         }
         self.undo.append(gpa, op) catch @panic("UndoStack.push: OOM");
         self.handles.append(gpa, self.allocHandle()) catch @panic("UndoStack.push: OOM");
+        self.owners.append(gpa, 0) catch @panic("UndoStack.push: OOM");
     }
 
     /// undo/redo 履歴を全クリアするが **handle 採番（next_handle）は保持する**。
@@ -1182,7 +1208,8 @@ pub const Document = struct {
 
     pub fn undoOne(self: *Document, gpa: Allocator) void {
         var op = self.undo.undo.pop() orelse return;
-        _ = self.undo.handles.pop(); // handle 並行配列を同期（redo 側はタグ対象外）
+        _ = self.undo.handles.pop(); // handle/owner 並行配列を同期（redo 側はタグ対象外）
+        _ = self.undo.owners.pop();
         self.applyBefore(gpa, &op);
         self.undo.redo.append(gpa, op) catch @panic("Document.undoOne: OOM");
         self.resyncActiveView(gpa);
@@ -1194,7 +1221,124 @@ pub const Document = struct {
         self.undo.undo.append(gpa, op) catch @panic("Document.redoOne: OOM");
         // 再 push は**新 handle を採番**（旧 CommandRecord との対応は復活しない。UndoStack doc 参照）。
         self.undo.handles.append(gpa, self.undo.allocHandle()) catch @panic("Document.redoOne: OOM");
+        self.undo.owners.append(gpa, 0) catch @panic("Document.redoOne: OOM"); // 再 push は unknown（app が再確定）
         self.resyncActiveView(gpa);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 任意位置 revert（per-actor undo。TASK-62.5.4）
+    // ══════════════════════════════════════════════════════════════════
+
+    /// handle 指定の Op を undo stack の**任意位置**から逆適用できるか（TASK-62.5.4 §3）。
+    /// true の条件（すべて満たす）:
+    ///   1. handle が undo stack に現存
+    ///   2. Op 種別が `.paint`
+    ///   3. 対象 cel が生存（`cel_pool[op.cel_id] != null`）
+    ///   4. 位置前提の維持: `op.layer_idx`/`op.frame_idx` が現 document の範囲内 かつ
+    ///      `grid(layer_idx, frame_idx) == op.cel_id`（created の有無によらず一律。後続の
+    ///      layer/frame 操作・cel link/unlink で位置対応が崩れた op の逆適用（誤 grid slot 消去・
+    ///      panic）を防ぐ。前提が崩れた op は候補外 = per-actor undo の canUndo=false → framework
+    ///      の全件事前検証で transaction ごと skip される）
+    ///
+    /// **構造 Op 制約（MVP 割り切りの明記②）**: layer_add/delete/reorder/visible/opacity/rename/
+    /// text/rasterize/merge・frame 系・cel link 系の**構造 Op は任意位置逆適用の対象外**（後続の
+    /// 構造変更後に古い index へ逆適用すると別対象を壊す・cel ownership が不整合になるため）。
+    /// 全 Op の任意位置 undo は rollback-replay 化（62.3 Stage 2）までスコープ外。agent の構造
+    /// action（add_layer 等）は CommandRecord に記録はされるが per-actor undo の候補にならない
+    /// （canUndo=false で skip。最上位の未記録構造 Op は従来の `undoOne` でのみ戻せる）。
+    pub fn canRevertByHandle(self: *const Document, handle: u64) bool {
+        const idx = self.indexOfHandle(handle) orelse return false;
+        const op = &self.undo.undo.items[idx];
+        if (op.* != .paint) return false;
+        const p = op.paint;
+        if (p.cel_id >= self.cel_pool.items.len) return false;
+        if (self.cel_pool.items[p.cel_id] == null) return false;
+        if (p.layer_idx >= self.layers.items.len) return false;
+        if (p.frame_idx >= self.frames.items.len) return false;
+        const current = self.gridGet(p.layer_idx, p.frame_idx) orelse return false;
+        return current == p.cel_id;
+    }
+
+    fn indexOfHandle(self: *const Document, handle: u64) ?usize {
+        for (self.undo.handles.items, 0..) |h, i| {
+            if (h == handle) return i;
+        }
+        return null;
+    }
+
+    pub const RevertMode = enum {
+        /// 逆適用した Op を legacy redo stack へ移す（未記録 op の legacy redo 用）。
+        move_to_redo,
+        /// 逆適用した Op を解放する（CommandRecord 記録済み op 用。redo は CommandLog の
+        /// name/args 再 dispatch で行うため Op は不要）。
+        discard,
+    };
+
+    /// handle 指定の `.paint` Op を undo stack の**任意位置**から逆適用して取り除く（TASK-62.5.4 §3）。
+    /// 成功で true。対象が `canRevertByHandle` の条件を満たさない場合は **false を返し何もしない**
+    /// （非 paint Op・handle 不在・cel/位置前提の崩れ、いずれも同じ）。内部で `resyncActiveView` まで
+    /// 行う（App 側同期 = `clampTimelineTarget` 等は呼び出し側の責務）。
+    ///
+    /// **pixel 巻き添え artifact（MVP 割り切りの明記①）**: Op は snapshot-inverse（pixel diff）
+    /// なので、対象 Op より**後**に同じ画素へ描かれた内容は revert で巻き添えに戻る（diff の
+    /// before 値が「対象 Op 実行直後」の画素だから）。solo Co-pilot でも netsync
+    /// （62.3 v5 §1.5.1-4）と同じ MVP 割り切り（親 plan §5.1。ユーザー了承済み 2026-07-07）。
+    /// 解消は rollback-replay 化（62.3 Stage 2）。実用上の緩和は actor ごとのレイヤー分担。
+    /// **created cel の条件付き teardown（applyBefore と異なる点）**: LIFO 前提の `applyBefore` は
+    /// created=true で cel を無条件に解放し grid を null にするが、**任意位置** revert では後続 op が
+    /// 同じ cel を参照している場合にそれを行うと (a) 後続 op の描画内容ごと消える (b) 後続 op が
+    /// 解放済み cel を参照し以後の undo で panic する。よって teardown は「他に参照 op が無い」
+    /// 場合のみ行い、参照が残る場合は before 復元済みの cel を生かしたまま op の created を降ろす
+    /// （以後その op は「既存 cel への paint」として扱われ redo 側 `applyAfter` とも整合する）。
+    /// skip 時に残る blank 相当の cel は描画上透明と同一で無害（メモリ/保存サイズのみ）。
+    pub fn revertByHandle(self: *Document, gpa: Allocator, handle: u64, mode: RevertMode) bool {
+        if (!self.canRevertByHandle(handle)) return false;
+        const idx = self.indexOfHandle(handle).?; // canRevertByHandle が現存を保証
+        var op = self.undo.undo.orderedRemove(idx);
+        _ = self.undo.handles.orderedRemove(idx);
+        _ = self.undo.owners.orderedRemove(idx);
+
+        const p = &op.paint; // canRevertByHandle が .paint を保証
+        {
+            const pixels = self.cel_pool.items[p.cel_id].?.pixels;
+            for (p.diffs) |d| pixels[d.idx] = d.before;
+        }
+        if (p.created) {
+            if (self.celReferencedByOps(p.cel_id)) {
+                p.created = false; // teardown skip（doc comment 参照）
+            } else {
+                if (self.releaseCelMaybeCapture(p.cel_id)) |captured| p.created_released = captured;
+                self.setGrid(p.layer_idx, p.frame_idx, null);
+            }
+        }
+        switch (mode) {
+            .move_to_redo => self.undo.redo.append(gpa, op) catch @panic("Document.revertByHandle: OOM"),
+            .discard => freeOp(gpa, &op),
+        }
+        self.resyncActiveView(gpa);
+        return true;
+    }
+
+    /// undo/redo stack 上の op が `cel_id` への「生きた cel 参照」を持ちうるか
+    /// （`revertByHandle` の created teardown 判定用）。cel snapshot/link を持つ構造 op は
+    /// **保守的に true**（teardown を skip して blank cel を残す方が常に安全。誤 skip の
+    /// 影響は lingering blank cel のみ）。
+    fn opMayReferenceCel(op: *const Op, cel_id: CelId) bool {
+        return switch (op.*) {
+            .paint => |p2| p2.cel_id == cel_id,
+            .layer_visible, .layer_opacity, .layer_rename, .layer_reorder, .layer_text_params, .layer_rasterize => false,
+            else => true,
+        };
+    }
+
+    fn celReferencedByOps(self: *const Document, cel_id: CelId) bool {
+        for (self.undo.undo.items) |*op| {
+            if (opMayReferenceCel(op, cel_id)) return true;
+        }
+        for (self.undo.redo.items) |*op| {
+            if (opMayReferenceCel(op, cel_id)) return true;
+        }
+        return false;
     }
 
     fn applyBefore(self: *Document, gpa: Allocator, op_ptr: *Op) void {
@@ -1493,4 +1637,164 @@ test "UndoStack handles: リセット後も next_handle は単調（clearHistory
     try testing.expectEqual(nh, s.next_handle);
     s.push(gpa, testVisOp(0));
     try testing.expect(s.topHandle().? >= nh);
+}
+
+// ── 任意位置 revert（TASK-62.5.4 §3）のテスト ──────────────────────────
+
+fn pushTestPaint(doc: *Document, gpa: Allocator, layer_idx: usize, pixel_idx: u32, color: u32) !void {
+    const pixels = doc.active_view.layerPixels(layer_idx);
+    const diffs = try gpa.alloc(PixelDiff, 1);
+    diffs[0] = .{ .idx = pixel_idx, .before = pixels[pixel_idx], .after = color };
+    pixels[pixel_idx] = color;
+    try doc.pushPaintOp(gpa, layer_idx, diffs);
+}
+
+test "revertByHandle: 最上位でない .paint op を任意位置逆適用（上の op は残る・対象だけ戻る）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // A: px0（handle 1）
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // B: px1（handle 2）
+    try testing.expect(doc.canRevertByHandle(1));
+
+    try testing.expect(doc.revertByHandle(gpa, 1, .discard)); // A だけ任意位置 revert（discard = op 解放）
+    const px = doc.active_view.layerPixels(0);
+    try testing.expectEqual(@as(u32, 0), px[0]); // A は戻った
+    try testing.expectEqual(@as(u32, 0xFF00FF00), px[1]); // B は残る
+    try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len);
+    try testing.expectEqual(@as(?u64, 2), doc.undo.topHandle());
+    try testing.expect(!doc.canRevertByHandle(1)); // 取り除かれた handle は不在
+}
+
+test "revertByHandle: 構造 op は false（任意位置逆適用の対象外）/ 存在しない handle も false" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    _ = try doc.addLayer(gpa); // 構造 op（layer_add。handle 1）
+    try testing.expect(!doc.canRevertByHandle(1));
+    try testing.expect(!doc.revertByHandle(gpa, 1, .discard)); // false + 何もしない
+    try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len); // op は残る
+    try testing.expectEqual(@as(usize, 2), doc.layers.items.len); // layer も残る
+
+    try testing.expect(!doc.canRevertByHandle(999)); // 存在しない handle
+    try testing.expect(!doc.revertByHandle(gpa, 999, .discard));
+}
+
+test "revertByHandle: layer 削除で cel が解放された paint op は false（最終防衛）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    _ = try doc.addLayer(gpa); // handle 1（構造 op）
+    try pushTestPaint(&doc, gpa, 1, 0, 0xFFFF0000); // handle 2（layer1 に paint）
+    try testing.expect(doc.canRevertByHandle(2));
+
+    try doc.deleteLayer(gpa, 1); // handle 3（構造 op）。layer1 の cel は解放される
+    try testing.expect(!doc.canRevertByHandle(2)); // cel 解放 + layer 範囲外 → 候補外
+    try testing.expect(!doc.revertByHandle(gpa, 2, .discard));
+}
+
+test "revertByHandle: layer reorder で位置対応が崩れた paint op は false（誤 slot を消さない）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    _ = try doc.addLayer(gpa); // 2 layers（handle 1）
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 2: layer0 の cel（grid(0,0)）
+    try pushTestPaint(&doc, gpa, 1, 1, 0xFF00FF00); // handle 3: layer1 の cel（grid(1,0)）
+    try testing.expect(doc.canRevertByHandle(2));
+    try testing.expect(doc.canRevertByHandle(3));
+
+    try doc.reorderLayer(gpa, 0, 1); // grid 行が入れ替わる → 両 op の layer_idx が旧位置を指す
+    try testing.expect(!doc.canRevertByHandle(2)); // grid(0,0) != op.cel_id → 候補外
+    try testing.expect(!doc.canRevertByHandle(3));
+    try testing.expect(!doc.revertByHandle(gpa, 2, .discard));
+}
+
+test "revertByHandle: move_to_redo で legacy redoOne が再適用する（新 handle 採番）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // A（handle 1）
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // B（handle 2）
+
+    try testing.expect(doc.revertByHandle(gpa, 1, .move_to_redo)); // A を legacy redo へ
+    try testing.expectEqual(@as(u32, 0), doc.active_view.layerPixels(0)[0]);
+    try testing.expectEqual(@as(usize, 1), doc.undo.redo.items.len);
+
+    doc.redoOne(gpa); // legacy redo → A 再適用 + 新 handle（3）で undo stack へ
+    try testing.expectEqual(@as(u32, 0xFFFF0000), doc.active_view.layerPixels(0)[0]);
+    try testing.expectEqual(@as(usize, 2), doc.undo.undo.items.len);
+    try testing.expectEqual(@as(?u64, 3), doc.undo.topHandle());
+}
+
+test "revertByHandle: created op 単独なら teardown（cel 解放 + grid null）/ 参照が残れば skip" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    // 単独の created op → teardown（legacy undoOne と同じ最終状態）
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 1（created=true）
+    const cel_id = doc.gridGet(0, 0).?;
+    try testing.expect(doc.revertByHandle(gpa, 1, .discard));
+    try testing.expectEqual(@as(?CelId, null), doc.gridGet(0, 0)); // grid null
+    try testing.expect(doc.cel_pool.items[cel_id] == null); // cel 解放
+
+    // 参照が残る場合（後続 paint が同一 cel）は skip（test「最上位でない…」が実質検証済み。
+    // ここでは grid が生き残ることを明示）
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 2（created=true・新 cel）
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // handle 3（同一 cel）
+    const cel2 = doc.gridGet(0, 0).?;
+    try testing.expect(doc.revertByHandle(gpa, 2, .discard));
+    try testing.expectEqual(@as(?CelId, cel2), doc.gridGet(0, 0)); // cel は生存
+    try testing.expectEqual(@as(u32, 0xFF00FF00), doc.active_view.layerPixels(0)[1]); // 後続 op の描画は無傷
+}
+
+test "UndoStack owners: push=unknown / setOwner/ownerOf / 溢れ・undo/redo・revert 経路の同期" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 1
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // handle 2
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(1)); // push 直後は unknown
+    doc.undo.setOwner(1, 1);
+    doc.undo.setOwner(2, 2);
+    try testing.expectEqual(@as(u8, 1), doc.undo.ownerOf(1));
+    try testing.expectEqual(@as(u8, 2), doc.undo.ownerOf(2));
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(999)); // 不在は unknown
+    doc.undo.setOwner(999, 1); // 不在 handle は no-op（クラッシュしない）
+
+    // undoOne の pop で owners も同期
+    doc.undoOne(gpa);
+    try testing.expectEqual(doc.undo.undo.items.len, doc.undo.owners.items.len);
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(2)); // handle 2 は不在扱い
+
+    // 再 push（legacy redo）は unknown で積まれる（app が再確定する規約）
+    doc.redoOne(gpa); // 新 handle 3
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(3));
+    try testing.expectEqual(doc.undo.undo.items.len, doc.undo.owners.items.len);
+
+    // revertByHandle でも同期（任意位置除去）
+    doc.undo.setOwner(1, 1);
+    try testing.expect(doc.revertByHandle(gpa, 1, .discard));
+    try testing.expectEqual(doc.undo.undo.items.len, doc.undo.owners.items.len);
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(1));
+}
+
+test "UndoStack owners: max_history 溢れで最古の owner も同期して消える" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < UndoStack.max_history + 1) : (i += 1) {
+        s.push(gpa, testVisOp(i));
+    }
+    try testing.expectEqual(s.undo.items.len, s.owners.items.len);
+    try testing.expectEqual(s.undo.items.len, s.handles.items.len);
+    try testing.expectEqual(@as(u8, 0), s.ownerOf(1)); // 溢れた handle は不在
 }

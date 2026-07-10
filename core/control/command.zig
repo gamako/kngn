@@ -320,6 +320,16 @@ pub const Executor = struct {
         return if (self.findActorSlot(actor)) |s| s.epoch else 0;
     }
 
+    /// 記録なしで actor の redo_epoch を +1 する（TASK-62.5.4 §2b）。app が「CommandLog に
+    /// 載らない undoable 編集」（段階移行中の未記録 UI 操作）を検出した時に呼び、その actor の
+    /// 未消費 redo 候補を失効させる（通常の失効は undoable normal command の記録時に自動で
+    /// 起きる。これはその記録外変種）。actor 表が満杯で未登録の場合は no-op（記録も undo 候補も
+    /// 無い actor に失効させる redo は存在しない）。
+    pub fn bumpEpoch(self: *Executor, actor: ActorId) void {
+        const slot = self.ensureActor(actor) catch return;
+        slot.epoch += 1;
+    }
+
     // ------------------------------------------------------------------
     // transaction
     // ------------------------------------------------------------------
@@ -1511,4 +1521,31 @@ test "19: MAX_CMD_ARGS=4096 境界(丁度は通り +1 は reject)" {
     var over: [MAX_CMD_ARGS + 1]u8 = undefined;
     @memset(&over, 'a');
     try testing.expectError(error.ArgsTooLong, exec.executeAction("big", &over, .{ .actor = .local_user }, &buf));
+}
+
+test "20: bumpEpoch(記録なしで redo 候補を失効させる。未記録 UI 編集の epoch 破棄)" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "a", &buf); // seq1
+    _ = try exec.undoOne(.local_user, &buf); // revert target=1
+
+    // 対照: bump しなければ redo 候補がある（別 executor で確認）
+    // 本題: bumpEpoch 後は epoch 不一致で候補なし
+    exec.bumpEpoch(.local_user);
+    const r = try exec.redoOne(.local_user, &buf);
+    try testing.expect(!r.happened);
+
+    // 他 actor の epoch には影響しない
+    _ = try exec1(&exec, .local_agent, "b", &buf);
+    _ = try exec.undoOne(.local_agent, &buf);
+    const r2 = try exec.redoOne(.local_agent, &buf); // local_user の bump は無関係
+    try testing.expect(r2.happened);
+
+    // 未登録 actor への bump は登録して epoch を進める（後の記録と整合）
+    exec.bumpEpoch(.{ .peer = 9 });
+    try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.{ .peer = 9 }));
 }

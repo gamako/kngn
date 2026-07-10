@@ -380,6 +380,11 @@ const App = struct {
     /// 上限超過 → この stroke は記録しない（257 点以上を記録すると 62.5.4 の redo 再 dispatch が
     /// TooManyPoints で失敗するため。Op は legacy UndoStack に残り既存 undo UI では戻せる）。
     ui_stroke_overflow: bool = false,
+    /// 未記録 undoable 編集の検出用（TASK-62.5.4 §2b）: 記録が起きた点（noteUndo/
+    /// recordUiStroke/legacy redo）で `doc.undo.next_handle` に追従させ、フレーム末尾に
+    /// `next_handle > last_seen_handle` なら「CommandLog に載らない undoable push があった」と
+    /// 判定して `bumpEpoch(.local_user)` する（O(1) の整数比較 1 回/フレーム）。
+    last_seen_handle: u64 = 1,
     /// capture 開始時に latch した実効パラメータ（canonical args の材料。§5c'）。
     ui_stroke_tool: ToolKind = .pen,
     ui_stroke_color: u32 = 0,
@@ -511,6 +516,40 @@ const App = struct {
         self.edit_synced_for = null;
     }
 
+    /// undo op の所有者タグ（`UndoStack.owners` の pixie 規約。TASK-62.5.4 review 反映:
+    /// CommandLog リング退避で record が消えても op の所有者を誤認しないための op 側タグ）。
+    /// unknown は「まだ確定していない未記録 push」で、フレーム末尾の `checkUnrecordedEdits` が
+    /// user に確定する（agent 操作は常に action 経由で同イベント内にタグ付けされるため、
+    /// フレーム末尾まで unknown で残る push は user の UI 操作しかない）。
+    const OP_OWNER_UNKNOWN: u8 = 0;
+    const OP_OWNER_USER: u8 = 1;
+    const OP_OWNER_AGENT: u8 = 2;
+
+    /// `first_seq`（呼び出し前の `cmd_log.next_seq`）**以降**に記録された normal record の
+    /// undo_ref op へ所有者タグを付ける（executeAction / redoOne の後始末。record の actor が
+    /// 確定している時点で op 側へ転記する）。
+    fn tagOwnersFromRecords(self: *App, first_seq: u64, tag: u8) void {
+        var i: u32 = self.cmd_log.filled;
+        while (i > 0) {
+            i -= 1;
+            const rec = logRecordAt(&self.cmd_log, i);
+            if (rec.seq < first_seq) break; // seq は単調（これより古い record にタグ対象はない）
+            if (rec.kind != .normal) continue;
+            const ref = rec.undo_ref orelse continue;
+            self.doc.undo.setOwner(ref, tag);
+        }
+    }
+
+    /// ドキュメント読込/リセットで CommandLog 上の stale な undo/redo 候補を失効させる
+    /// （TASK-62.5.4 review 反映）。undo 側は handle 単調化 + `hasHandle=false`（canUndo）で
+    /// 自然失効するが、**redo 側（revert record）は epoch を進めないと旧 document の command を
+    /// 新 document に再実行してしまう**ため、両 actor の epoch を明示的に bump する。
+    fn invalidateHistoryAfterDocReset(self: *App) void {
+        self.cmd_exec.bumpEpoch(.local_user);
+        self.cmd_exec.bumpEpoch(.local_agent);
+        self.last_seen_handle = self.doc.undo.next_handle;
+    }
+
     /// stroke の実効パラメータを解決する（§5c': 明示 k=v > 現在の App 状態）。tool 未指定かつ
     /// 現在ツールが pen/eraser/brush 以外は `error.UnsupportedTool`（fill は呼び出し側が
     /// legacy 経路で扱う。bezier/select/eyedropper は従来どおり拒否）。
@@ -594,7 +633,10 @@ const App = struct {
         var msg_buf: [64]u8 = undefined;
         _ = self.cmd_exec.recordExecuted("stroke", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
             std.debug.print("pixie: UI stroke の記録に失敗: {s}\n", .{@errorName(err)});
+            return; // 記録失敗 = 未記録 push としてフレーム末尾の bumpEpoch に委ねる（§2b）
         };
+        if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER); // op は user 所有（review 反映）
+        self.last_seen_handle = self.doc.undo.next_handle; // 記録された push（§2b の追従点）
     }
 
     /// スポイト（TASK-68）: 指定 canvas 座標の色を描画色へ反映する。座標は呼び出し側
@@ -825,6 +867,7 @@ const App = struct {
         self.doc.deinit();
         self.doc = new_doc;
         self.doc.undo.next_handle = preserved_next_handle;
+        self.invalidateHistoryAfterDocReset(); // 旧 document への framework redo を失効（review 反映）
         self.doc.resyncActiveView(self.gpa);
         self.canvas = self.doc.activeCanvas();
         self.clampTimelineTarget();
@@ -847,14 +890,114 @@ const App = struct {
     /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        self.doc.undoOne(self.gpa);
+        self.userUndo();
         self.clampTimelineTarget();
     }
 
     fn doRedo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        self.doc.redoOne(self.gpa);
+        self.userRedo();
         self.clampTimelineTarget();
+    }
+
+    /// local_user の undo（ハイブリッド。TASK-62.5.4 §2）: undo stack を上から走査し、最初の
+    /// 「local_user 所有の op」を undo する。
+    /// - CommandLog に record が対応する op:
+    ///   - actor が local_user 以外（agent 等）→ skip（agent の op は `action undo` でのみ戻す）
+    ///   - actor=local_user → framework 経路 `cmd_exec.undoOne(.local_user)`（revert record の
+    ///     append・reverted マーク・tx bundle・epoch は framework が処理）
+    /// - record が対応しない（未記録）op = local_user 所有（agent 操作は常に action 経由で記録
+    ///   される。62.5.3 の構造）→ legacy 経路:
+    ///   - 最上位なら従来の `doc.undoOne()`（redo stack へ移動）
+    ///   - 最上位でない `.paint` op は `revertByHandle(move_to_redo)`（agent op が上にある場合）
+    ///   - 最上位でない未記録**構造 op は undo 不能として skip**（任意位置 revert は paint 限定 =
+    ///     `Document.canRevertByHandle` の構造 Op 制約参照）。走査は次の user 所有 op へ進む
+    /// 2 系統（framework revert / legacy stack）の時系列交錯は**近似**（MVP 割り切り。62.5.3 の
+    /// 段階移行が完了すれば legacy 系統は消える）。pixel 巻き添え artifact の割り切りは
+    /// `Document.revertByHandle` の doc comment 参照。
+    fn userUndo(self: *App) void {
+        var i: usize = self.doc.undo.handles.items.len;
+        while (i > 0) {
+            i -= 1;
+            const h = self.doc.undo.handles.items[i];
+            // 所有者判定は record 逆引きでなく op 側の owner タグが正（CommandLog リング退避で
+            // record が消えた agent op を「未記録 = user 所有」と誤認して legacy undo しないため。
+            // review 反映）。unknown は user 扱い（§2 の根拠: agent 操作は常にタグ付けされる）。
+            if (self.doc.undo.owners.items[i] == OP_OWNER_AGENT) continue;
+            if (self.findRecordByUndoRef(h)) |rec| {
+                if (!rec.actor.eql(.local_user)) continue; // 防御（owner タグと二重の保険）
+                var buf: [256]u8 = undefined;
+                _ = self.cmd_exec.undoOne(.local_user, &buf) catch |err| {
+                    std.debug.print("pixie: undoOne 失敗: {s}\n", .{@errorName(err)});
+                };
+                return;
+            }
+            // 未記録 = local_user 所有 → legacy 経路
+            if (i == self.doc.undo.undo.items.len - 1) {
+                self.doc.undoOne(self.gpa);
+                return;
+            }
+            if (self.doc.canRevertByHandle(h)) {
+                _ = self.doc.revertByHandle(self.gpa, h, .move_to_redo);
+                return;
+            }
+            // 最上位でない未記録構造 op → skip して次の user 所有 op へ
+        }
+    }
+
+    /// local_user の redo（ハイブリッド。§2）: framework `redoOne(.local_user)` を先に試み、
+    /// **候補なしなら legacy `doc.redoOne()`**（legacy undo で redo stack に載った未記録 op 用）。
+    /// legacy の再 push は「新規編集」ではないため `last_seen_handle` を追従させ epoch bump を
+    /// 防ぐ（§2b）。framework redo の再 dispatch 側は `dispatchPixieAction` の noteUndo 経路で
+    /// 追従済み。エラー（PartialRedo 等）時は legacy へ流さない（部分適用の上に重ねない）。
+    fn userRedo(self: *App) void {
+        var buf: [256]u8 = undefined;
+        const seq_before = self.cmd_log.next_seq;
+        const outcome = self.cmd_exec.redoOne(.local_user, &buf) catch |err| {
+            std.debug.print("pixie: redoOne 失敗: {s}\n", .{@errorName(err)});
+            self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // PartialRedo でも適用済み分はタグ
+            return;
+        };
+        if (!outcome.happened) {
+            const handle_before = self.doc.undo.next_handle;
+            self.doc.redoOne(self.gpa);
+            self.last_seen_handle = self.doc.undo.next_handle;
+            // legacy redo が実際に再 push した場合のみ owner を user に確定する（no-op 時に
+            // 既存 top（agent 所有かもしれない）を誤って上書きしない。last_seen 更新で
+            // checkUnrecordedEdits の unknown→USER 確定は走らないため、ここで直接付ける）
+            if (self.doc.undo.next_handle > handle_before) {
+                if (self.doc.undo.topHandle()) |h| self.doc.undo.setOwner(h, OP_OWNER_USER);
+            }
+            return;
+        }
+        self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // 再 dispatch された新 op は user 所有
+    }
+
+    /// CommandLog を後方走査して undo_ref==handle の normal record を返す（userUndo の
+    /// op→record 対応判定。イベント時のみ・最大 128 slot の線形走査）。
+    fn findRecordByUndoRef(self: *App, handle: u64) ?*platform.command.CommandRecord {
+        var i: u32 = self.cmd_log.filled;
+        while (i > 0) {
+            i -= 1;
+            const rec = logRecordAt(&self.cmd_log, i);
+            if (rec.kind == .normal and rec.undo_ref != null and rec.undo_ref.? == handle) return rec;
+        }
+        return null;
+    }
+
+    /// フレーム末尾の未記録 undoable 編集検出（§2b）。検出したら local_user の redo 候補を
+    /// epoch で失効させる（layer add 等の未記録 UI 操作で framework redo が古い候補を再実行
+    /// しないため）。
+    fn checkUnrecordedEdits(self: *App) void {
+        if (self.doc.undo.next_handle > self.last_seen_handle) {
+            self.cmd_exec.bumpEpoch(.local_user);
+            self.last_seen_handle = self.doc.undo.next_handle;
+            // 未記録 push の owner を user に確定（agent 操作は同イベント内にタグ済み = unknown で
+            // フレーム末尾まで残るのは user の UI 操作のみ。bump 発生時のみの O(depth) 走査）
+            for (self.doc.undo.owners.items) |*o| {
+                if (o.* == OP_OWNER_UNKNOWN) o.* = OP_OWNER_USER;
+            }
+        }
     }
 
     fn doClear(self: *App) !void {
@@ -1212,6 +1355,7 @@ const App = struct {
     fn resetCanvasToSingleLayer(self: *App) void {
         self.doc.resetToSingleBlankLayer(self.gpa);
         self.sel_in.discardFloat(self.gpa); // フロートも破棄
+        self.invalidateHistoryAfterDocReset(); // 旧 document への framework redo を失効（review 反映）
     }
 
     fn syncPreviewCanvas(self: *App) void {
@@ -1448,6 +1592,32 @@ fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, cursorDigest(ctx, &buf));
 }
 
+/// CommandAdapter（TASK-62.5.4 §4a）: framework undo の逆適用口。
+/// canUndo = handle 現存 + .paint + cel 生存 + 位置前提（`Document.canRevertByHandle`）。
+/// applyUndo は**不可失敗契約**（canUndo==true 前提で呼ばれる。万一の handle 消失時も
+/// `revertByHandle` が no-op で戻るだけ = 部分 undo なし）。mode=.discard（記録済み op の redo は
+/// CommandLog の name/args 再 dispatch で行うため Op は破棄）。resyncActiveView は revertByHandle
+/// 内部・clampTimelineTarget 等の App 同期は undo/redo 呼び出し側の責務（既存 doUndo と同じ分担）。
+/// 構造 Op 制約・pixel 巻き添え artifact の割り切りは `Document.canRevertByHandle`/`revertByHandle` 参照。
+fn adapterCanUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const ref = rec.undo_ref orelse return false;
+    return app.doc.canRevertByHandle(ref);
+}
+
+fn adapterApplyUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    _ = app.doc.revertByHandle(app.gpa, rec.undo_ref.?, .discard);
+}
+
+/// CommandLog のリング i 番目（0=最古）を返す（App 側の観測 helper。`CommandLog.recordAt` と
+/// 同じ ring 計算。イベント時のみ）。
+fn logRecordAt(log: *platform.command.CommandLog, i: u32) *platform.command.CommandRecord {
+    const cap: u32 = platform.command.MAX_CMD_LOG;
+    const idx = (log.head + cap - log.filled + i) % cap;
+    return &log.records[idx];
+}
+
 /// history digest（TASK-62.5.3 §5d の**暫定** probe。正式な summary schema は 62.5.5 で確定し、
 /// この digest はその際に置換・拡張してよい）: CommandLog の外部観測手段（AC #1 の headless 検証用）。
 /// `last_undo_live` = 最新 record の undo_ref handle が現在 UndoStack に現存するか（AC #2 の
@@ -1455,14 +1625,25 @@ fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 fn historyDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const latest = app.cmd_log.latest() orelse {
-        return std.fmt.bufPrint(buf, "count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=-", .{}) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=- last_kind=- last_target=- last_redo_of=- last2_tx=-", .{}) catch buf[0..0];
     };
     var ref_buf: [24]u8 = undefined;
     const ref_str: []const u8 = if (latest.undo_ref) |r| (std.fmt.bufPrint(&ref_buf, "{d}", .{r}) catch "-") else "-";
     const live_str: []const u8 = if (latest.undo_ref) |r| (if (app.doc.undo.hasHandle(r)) "1" else "0") else "-";
     var tx_buf: [24]u8 = undefined;
     const tx_str: []const u8 = if (latest.transaction_id) |t| (std.fmt.bufPrint(&tx_buf, "{d}", .{t}) catch "-") else "-";
-    return std.fmt.bufPrint(buf, "count={d} last_seq={d} last_actor={s} last_name={s} last_undoable={d} last_undo_ref={s} last_undo_live={s} last_tx={s}", .{
+    // TASK-62.5.4 §4c: revert/redo/tx bundle の観測用フィールド（62.5.5 で正式 schema に置換可）
+    var target_buf: [24]u8 = undefined;
+    const target_str: []const u8 = if (latest.target_seq) |t| (std.fmt.bufPrint(&target_buf, "{d}", .{t}) catch "-") else "-";
+    var redo_of_buf: [24]u8 = undefined;
+    const redo_of_str: []const u8 = if (latest.redo_of) |r| (std.fmt.bufPrint(&redo_of_buf, "{d}", .{r}) catch "-") else "-";
+    var tx2_buf: [24]u8 = undefined;
+    const tx2_str: []const u8 = blk: {
+        if (app.cmd_log.filled < 2) break :blk "-";
+        const second = logRecordAt(&app.cmd_log, app.cmd_log.filled - 2);
+        break :blk if (second.transaction_id) |t| (std.fmt.bufPrint(&tx2_buf, "{d}", .{t}) catch "-") else "-";
+    };
+    return std.fmt.bufPrint(buf, "count={d} last_seq={d} last_actor={s} last_name={s} last_undoable={d} last_undo_ref={s} last_undo_live={s} last_tx={s} last_kind={s} last_target={s} last_redo_of={s} last2_tx={s}", .{
         app.cmd_log.filled,
         latest.seq,
         @tagName(latest.actor),
@@ -1471,6 +1652,10 @@ fn historyDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         ref_str,
         live_str,
         tx_str,
+        @tagName(latest.kind),
+        target_str,
+        redo_of_str,
+        tx2_str,
     }) catch buf[0..0];
 }
 
@@ -1487,8 +1672,8 @@ fn historyDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 //
 //   action              → App メソッド          push  失敗時の error
 //   ------------------  ---------------------  ----  --------------------------------
-//   undo                doUndo                  no    EditingBlocked（空履歴は冪等成功）
-//   redo                doRedo                  no    EditingBlocked（空履歴は冪等成功）
+//   undo                cmd_exec.undoOne(.local_agent)  no*   EditingBlocked（候補なしは冪等成功。TASK-62.5.4
+//   redo                cmd_exec.redoOne(.local_agent)  no*   で per-actor revert 化。UI の Cmd+Z は userUndo/userRedo）
 //   clear               doClear                 yes   EditingBlocked
 //   add_layer           doAddLayer              yes   EditingBlocked / allocator error
 //   delete_layer        doDeleteLayer           yes   EditingBlocked / LastLayer
@@ -1529,18 +1714,32 @@ fn actionApp(ctx: *anyopaque) *App {
     return @ptrCast(@alignCast(ctx));
 }
 
+/// action `undo`/`redo`（agent。TASK-62.5.4 §4b）: **executeAction を経由せず** framework の
+/// `undoOne`/`redoOne(.local_agent)` を直接呼ぶ登録 callback（undo/redo は begin_tx と同種の
+/// **制御コマンド**。executeAction 経由だと redoOne の内部再 dispatch が `ReentrantDispatch` に
+/// なるため構造的に不可）。既存ガード（editingBlocked）と実行後の App 同期（clampTimelineTarget）
+/// は従来 doUndo/doRedo と同じ。agent 操作は全て記録済みなのでハイブリッド（userUndo）は不要。
 fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
     try actions.parseNoArgs(args);
-    try actionApp(ctx).doUndo();
-    return "ok";
+    const app = actionApp(ctx);
+    if (app.editingBlocked()) return error.EditingBlocked;
+    const outcome = try app.cmd_exec.undoOne(.local_agent, buf);
+    app.clampTimelineTarget();
+    return outcome.message;
 }
 
 fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
     try actions.parseNoArgs(args);
-    try actionApp(ctx).doRedo();
-    return "ok";
+    const app = actionApp(ctx);
+    if (app.editingBlocked()) return error.EditingBlocked;
+    const seq_before = app.cmd_log.next_seq;
+    const outcome = app.cmd_exec.redoOne(.local_agent, buf) catch |err| {
+        app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // PartialRedo でも適用済み分はタグ
+        return err;
+    };
+    app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 再 dispatch された新 op は agent 所有
+    app.clampTimelineTarget();
+    return outcome.message;
 }
 
 fn actionClear(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -1756,9 +1955,9 @@ const ActionEntry = struct {
 };
 
 /// name→実ハンドラ表（`dispatchPixieAction` が引く。登録 wrapper とは分離）。
+/// undo/redo は載せない（executeAction/redo 再 dispatch の対象外 = 制御コマンド。§4b。
+/// registry へは actionUndo/actionRedo を直接登録する）。
 const PIXIE_ACTIONS = [_]ActionEntry{
-    .{ .name = "undo", .run = actionUndo },
-    .{ .name = "redo", .run = actionRedo },
     .{ .name = "clear", .run = actionClear },
     .{ .name = "add_layer", .run = actionAddLayer },
     .{ .name = "delete_layer", .run = actionDeleteLayer },
@@ -1797,6 +1996,7 @@ fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf:
             };
             if (pushes == 1) {
                 if (app.doc.undo.topHandle()) |h| app.cmd_exec.noteUndo(h);
+                app.last_seen_handle = app.doc.undo.next_handle; // 記録される push（§2b の追従点）
             } else if (pushes >= 2) {
                 std.debug.print("pixie: action '{s}' が {d} 回 undo.push（1 command = 1 Op が崩れるため noteUndo しない。62.5.4 申し送り）\n", .{ name, pushes });
             }
@@ -1813,11 +2013,13 @@ fn recordedAction(comptime name: []const u8, comptime policy: platform.command.R
     return &struct {
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
+            const seq_before = app.cmd_log.next_seq;
             const res = try app.cmd_exec.executeAction(name, args, .{
                 .actor = .local_agent,
                 .transaction = app.cmd_exec.openTransactionFor(.local_agent),
                 .record_policy = policy,
             }, buf);
+            app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 生んだ op は agent 所有（review 反映）
             return res.output;
         }
     }.run;
@@ -1841,11 +2043,13 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         break :blk args; // fill legacy（actionStroke 側も同じ判定で legacy 経路に入る）
     };
 
+    const seq_before = app.cmd_log.next_seq;
     const res = try app.cmd_exec.executeAction("stroke", exec_args, .{
         .actor = .local_agent,
         .transaction = app.cmd_exec.openTransactionFor(.local_agent),
         .record_policy = .record,
     }, buf);
+    app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 生んだ op は agent 所有（review 反映）
     return res.output;
 }
 
@@ -1853,8 +2057,8 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
 /// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "undo", .ctx = app, .run = recordedAction("undo", .no_record) });
-    platform.registerAction(.{ .name = "redo", .ctx = app, .run = recordedAction("redo", .no_record) });
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo }); // 制御コマンド（§4b。executor 非経由）
+    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo });
     platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record) });
     platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record) });
     platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record) });
@@ -2784,6 +2988,7 @@ pub fn main(init: std.process.Init) !void {
     // 共有 executor に設定する（copilot 無効時は no-op。記録自体は transport の有無に依存しない）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchPixieAction });
     app.cmd_exec.log = &app.cmd_log;
+    app.cmd_exec.adapter = .{ .ctx = &app, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo }; // per-actor undo（TASK-62.5.4）
     platform.setCommandExecutor(&app.cmd_exec);
 
     // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
@@ -3072,5 +3277,8 @@ pub fn main(init: std.process.Init) !void {
         // 安全点: framebuffer unlock 済み・当フレームの入力更新も完了。ここでモーダルを開く。
         // 終了要求と同フレームで保存/読込が pending でも、終了中はダイアログを開かない。
         if (app.running) app.runPendingFileOp();
+
+        // フレーム末尾: 未記録 undoable 編集の検出 → redo 候補の epoch 失効（TASK-62.5.4 §2b）
+        app.checkUnrecordedEdits();
     }
 }
