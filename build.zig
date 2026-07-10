@@ -367,6 +367,17 @@ pub fn build(b: *std.Build) void {
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
     test_harness_step.dependOn(&run_harness_test.step);
 
+    // command model 単体テスト（型 + executor + no-op recorder。std のみ・platform/harness 非依存。TASK-62.5.1）
+    const command_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/command.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const command_test = b.addTest(.{ .root_module = command_test_mod });
+    const run_command_test = b.addRunArtifact(command_test);
+    const test_command_step = b.step("test-command", "Run command model unit tests (types / executor / undo-redo / no-op recorder)");
+    test_command_step.dependOn(&run_command_test.step);
+
     // audio_null 単体テスト（headless の実デバイス無し出力。RT ゼロアロケーション / pull ループ。
     // display・実オーディオデバイス不要・OS 非依存。TASK-32.4 P4）
     const audio_null_test_mod = b.createModule(.{
@@ -1189,6 +1200,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_wayland_csd_step);
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
+    test_step.dependOn(test_command_step);
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
     test_step.dependOn(test_capture_types_step);
