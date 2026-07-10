@@ -396,6 +396,28 @@ pub fn build(b: *std.Build) void {
     const test_copilot_step = b.step("test-copilot", "Run copilot transport unit tests (ConnState / command layer / registry OR gate)");
     test_copilot_step.dependOn(&run_copilot_test.step);
 
+    // netsync transport 単体テスト（action_registry + frame codec + loopback HELLO/queue。
+    // display 不要。TASK-62.3.1）。root=netsync.zig は action_registry.zig を相対 import する。
+    const netsync_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/netsync.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // getenv
+    });
+    const netsync_test = b.addTest(.{ .root_module = netsync_test_mod, .filters = &.{"netsync:"} });
+    const run_netsync_test = b.addRunArtifact(netsync_test);
+    const test_netsync_step = b.step("test-netsync", "Run netsync transport unit tests (codec / HELLO / loopback queues)");
+    test_netsync_step.dependOn(&run_netsync_test.step);
+
+    // action_registry 単体も test-netsync に含める（filter 無しの別 artifact）。
+    const action_registry_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/action_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const action_registry_test = b.addTest(.{ .root_module = action_registry_test_mod });
+    test_netsync_step.dependOn(&b.addRunArtifact(action_registry_test).step);
+
     // audio_null 単体テスト（headless の実デバイス無し出力。RT ゼロアロケーション / pull ループ。
     // display・実オーディオデバイス不要・OS 非依存。TASK-32.4 P4）
     const audio_null_test_mod = b.createModule(.{
@@ -1234,6 +1256,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_command_step);
     test_step.dependOn(test_copilot_step);
+    test_step.dependOn(test_netsync_step);
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
     test_step.dependOn(test_capture_types_step);

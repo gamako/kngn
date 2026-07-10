@@ -34,6 +34,7 @@ const posix = std.posix;
 const types = @import("platform_types");
 const png = @import("png");
 const capture_synthetic = @import("capture_synthetic"); // synthetic capture source（TASK-49.5）
+pub const action_registry = @import("action_registry.zig"); // TASK-62.3.1: Action/registry 分離
 
 const Event = types.Event;
 const KeyCode = types.KeyCode;
@@ -181,18 +182,22 @@ pub fn isEnabled() bool {
     return mode != .disabled;
 }
 
-/// 外部 control-plane（copilot。TASK-62.5.2）が registry 登録を有効化するフラグ。
-/// 62.3 v6 の `setEnabled` OR 条件の先行形（依存は copilot→harness の一方向で、
-/// harness から copilot の関数は呼ばない）。
+/// 外部 control-plane（copilot。TASK-62.5.2）が probe registry 登録を有効化するフラグ。
+/// action 側は `action_registry.setEnabled`（OR 条件）へ転送する（TASK-62.3.1）。
+/// 依存は copilot→harness の一方向で、harness から copilot の関数は呼ばない。
 var external_registry_enabled = false;
 
 /// 外部 transport（copilot 等）が probe/action registry の登録ゲートを開く。
-/// `registerProbe`/`registerAction` の有効判定が `isEnabled() or このフラグ` になる。
+/// - probe: `registerProbe` の有効判定が `isEnabled() or このフラグ`。
+/// - action: `v==true` のときだけ `action_registry.setEnabled(true)` へ転送。
+///   `false` は action_registry に伝えない（無効化は `action_registry.resetForTest` 必須）。
 pub fn setExternalRegistryEnabled(v: bool) void {
     external_registry_enabled = v;
+    if (v) action_registry.setEnabled(true);
 }
 
-/// probe/action registry の登録ゲート（harness 有効 or 外部 transport 有効）。
+/// probe registry の登録ゲート（harness 有効 or 外部 transport 有効）。
+/// action のゲートは `action_registry.enabled` のみ（registerProbe のゲートはここに残す）。
 fn registryEnabled() bool {
     return isEnabled() or external_registry_enabled;
 }
@@ -293,80 +298,15 @@ pub fn findProbe(name: []const u8) ?*Probe {
 }
 
 // ============================================================================
-// custom action（app が opt-in 登録する高レベル操作。probe(read) に対称な write/operate 口。TASK-62.1）
+// custom action（TASK-62.1 → TASK-62.3.1 で action_registry.zig へ移送）
 // ============================================================================
 
-/// app が register する custom action。**framework は中身を解釈しない**（probe と同じ不変条件）:
-/// `action <name> [args...]` の `<name>` 以降の残り行 raw テキストをそのまま `run` へ渡し、
-/// 戻り値（1行）をそのまま既存 sink（replay stderr / live resp）へ流すだけ。
-pub const Action = struct {
-    /// action 名（`action <name> ...` の引数。空白/`;`/改行を含む名前は登録できない）。
-    name: []const u8,
-    /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
-    ctx: *anyopaque,
-    /// capabilities 列挙（TASK-62.4）用の説明文（省略可）。登録時に `sanitizeDesc` で
-    /// 禁止文字（`"`/`\`/ASCII 制御文字）・200 bytes 超をチェックし、違反時は空文字へ落とす。
-    desc: []const u8 = "",
-    /// 操作を実行し結果1行を返す write callback。
-    /// - `args` は `action <name>` の後の残り行 raw テキスト（trim 済み・再トークン化しない）。
-    ///   区切りは `;`/`\n` なので同一コマンド片内のテキストに限られる（`;` 自体は渡せない）。
-    /// - 戻り値は改行を含めない1行（`Probe.digest` と同じ契約）。`buf`（`DIGEST_BUF_LEN`）内の
-    ///   slice か ctx/静的所有の一時 slice を返してよい。有効期間は `run` 復帰後 `reportAction` が
-    ///   同期的に emit するまでの間だけ（allocator 所有権は移らない）。
-    /// - **callback は main thread（`pollGate` 内・step/フレーム境界）で実行される**。RT callback
-    ///   から呼ばれることは無い。callback 自身が RT スレッドと共有する app 状態に触れる場合、
-    ///   その同期責務は app 側にある（probe の digest/snapshot callback と同じ規約）。
-    run: *const fn (ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8,
-};
-
-const MAX_ACTIONS = 32; // TASK-62.5.3 で 16→32（pixie の登録 18 件が上限超過し save/open が skip されていた既存事象の解消。62.3.1 の引き上げの先行）
-var actions: [MAX_ACTIONS]Action = undefined;
-var action_count: usize = 0;
-
-/// custom action を登録する。app は `platform.registerAction(...)` 経由で `platform.init()` 後に呼ぶ。
-/// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
-/// - 同名は上書き。空白/`;`/改行を含む名前と空名は拒否（コマンド言語上そもそも呼び出せないため）。
-/// - registry 満杯はスキップ（いずれも warn）。
-pub fn registerAction(a: Action) void {
-    if (!registryEnabled()) return;
-    if (!isValidActionName(a.name)) {
-        std.debug.print("[harness] registerAction: 不正な名前 '{s}'（空/空白/';'/改行 は不可）\n", .{a.name});
-        return;
-    }
-    for (actions[0..action_count]) |*existing| {
-        if (std.mem.eql(u8, existing.name, a.name)) {
-            var ma = a;
-            ma.desc = sanitizeDesc("action", a.name, a.desc); // 実際に保存する直前にのみ sanitize（満杯 skip 時に無用な warn を出さない）
-            existing.* = ma; // 同名上書き
-            return;
-        }
-    }
-    if (action_count >= MAX_ACTIONS) {
-        std.debug.print("[harness] registerAction: registry 満杯（{d}）。'{s}' をスキップ\n", .{ MAX_ACTIONS, a.name });
-        return;
-    }
-    var ma = a;
-    ma.desc = sanitizeDesc("action", a.name, a.desc);
-    actions[action_count] = ma;
-    action_count += 1;
-}
-
-/// action 名としてコマンド言語上呼び出し可能かを検査する（空 / 空白 / `;` / 改行を含む名前は不可）。
-fn isValidActionName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| {
-        if (std.ascii.isWhitespace(c) or c == ';') return false;
-    }
-    return true;
-}
-
-/// 登録済み custom action の name lookup（copilot 等の外部 control-plane も使う。TASK-62.5.2 で pub 化）。
-pub fn findAction(name: []const u8) ?*Action {
-    for (actions[0..action_count]) |*a| {
-        if (std.mem.eql(u8, a.name, name)) return a;
-    }
-    return null;
-}
+/// Action / NetworkPolicy / registerAction / findAction は `action_registry` へ移送済み。
+/// 既存 caller（copilot・harness テスト）向けに re-export する。
+pub const Action = action_registry.Action;
+pub const NetworkPolicy = action_registry.NetworkPolicy;
+pub const registerAction = action_registry.registerAction;
+pub const findAction = action_registry.findAction;
 
 /// headless 判定の純粋ロジック（env I/O から分離。単体テスト用）。
 /// `VP_HARNESS_HEADLESS` 単独指定（script も live も無し）は無効（false = 通常実行）。
@@ -446,6 +386,7 @@ pub fn startTransport() void {
         };
         cmd_buf = script_bytes;
         mode = .replay;
+        action_registry.setEnabled(true);
         std.debug.print("[harness] replay 有効: script={s} out={s}\n", .{ path, out_dir });
         return;
     }
@@ -459,6 +400,7 @@ pub fn startTransport() void {
     };
     record_path = getEnv("VP_HARNESS_RECORD");
     mode = .live;
+    action_registry.setEnabled(true);
     const chosen = server.socket.address.getPort();
     std.debug.print("[harness] live 有効: 127.0.0.1:{d} out={s}\n", .{ chosen, out_dir });
     writePortFile(chosen);
@@ -1215,7 +1157,9 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
     if (!truncated and appendRaw(buf, content_limit, &len, ",\"actions\":[")) {
         first = true;
         actions_blk: {
-            for (actions[0..action_count]) |a| {
+            var i: usize = 0;
+            while (i < action_registry.actionCount()) : (i += 1) {
+                const a = action_registry.actionAt(i).?;
                 const saved_len = len;
                 if (!first and !appendRaw(buf, content_limit, &len, ",")) {
                     len = saved_len;
@@ -1301,14 +1245,17 @@ fn handleDigest(it: *Tok) void {
 // 既存3経路（replayExitIfFailed）にタダ乗りするため、新規 exit 経路は追加しない。
 // ============================================================================
 
-/// `action` コマンド本体。name lookup → run() → 結果 emit のみ（args の解釈・再トークン化はしない）。
+/// `action` コマンド本体。`routeLocalAction` → 結果 emit のみ（args の解釈・再トークン化はしない）。
+/// reportAction の wire 整形・expect_failures 記帳は不変（TASK-62.3.1）。
 fn handleAction(it: *Tok) void {
     const name = it.next() orelse "";
     if (name.len == 0) return reportAction(false, "?", "missing action name");
     const args = std.mem.trim(u8, it.rest(), " \t");
-    const act = findAction(name) orelse return reportAction(false, name, "unknown action");
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
-    const result = act.run(act.ctx, args, &buf) catch |err| return reportAction(false, name, @errorName(err));
+    const result = action_registry.routeLocalAction(name, args, &buf) catch |err| {
+        if (err == error.UnknownAction) return reportAction(false, name, "unknown action");
+        return reportAction(false, name, @errorName(err));
+    };
     reportAction(true, name, result);
 }
 
@@ -2014,8 +1961,11 @@ fn resetForTest() void {
     audio_channels = .init(0);
     audio_rate = .init(0);
     probe_count = 0;
-    action_count = 0;
     external_registry_enabled = false;
+    // action registry は分離モジュール（TASK-62.3.1）。reset 後に setEnabled(true) して
+    // 旧挙動（mode=.replay で registerAction 可）をテスト既定として保つ。
+    action_registry.resetForTest();
+    action_registry.setEnabled(true);
     // synthetic capture source（TASK-49.5）: 前のテストの残留状態（video の pixel buffer・audio の
     // 生成スレッド）を確実に片付けてからクリーンな状態で始める（テスト間リークを防ぐ）。
     if (synth_video) |*dev| dev.close();
@@ -2653,43 +2603,41 @@ test "firstLine: 最初の \\r/\\n の手前で切る（無ければ全体・cal
 test "registerAction: disabled 時 no-op（回帰ゼロ）" {
     resetForTest();
     mode = .disabled;
-    action_count = 0;
+    action_registry.resetForTest(); // enabled=false（harness.resetForTest はテスト既定で setEnabled する）
     var c = TestActionCtx{};
     registerAction(.{ .name = "x", .ctx = &c, .run = testActionRun });
-    try testing.expectEqual(@as(usize, 0), action_count);
+    try testing.expectEqual(@as(usize, 0), action_registry.actionCount());
 }
 
 test "registerAction: 同名上書き / 不正名（空・空白・;・改行）拒否 / 満杯 skip" {
     resetForTest();
-    action_count = 0;
     var c1 = TestActionCtx{};
     var c2 = TestActionCtx{};
     registerAction(.{ .name = "a", .ctx = &c1, .run = testActionRun });
     registerAction(.{ .name = "a", .ctx = &c2, .run = testActionRun }); // 同名上書き
-    try testing.expectEqual(@as(usize, 1), action_count);
+    try testing.expectEqual(@as(usize, 1), action_registry.actionCount());
     try testing.expectEqual(@as(*anyopaque, &c2), findAction("a").?.ctx);
 
     registerAction(.{ .name = "", .ctx = &c1, .run = testActionRun }); // 空名
     registerAction(.{ .name = "b c", .ctx = &c1, .run = testActionRun }); // 空白混入
     registerAction(.{ .name = "b;c", .ctx = &c1, .run = testActionRun }); // ; 混入
     registerAction(.{ .name = "b\nc", .ctx = &c1, .run = testActionRun }); // 改行混入
-    try testing.expectEqual(@as(usize, 1), action_count); // いずれも拒否され増えない
+    try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // いずれも拒否され増えない
 
     // 満杯 skip: "a" + MAX_ACTIONS 件以上を登録しても MAX_ACTIONS(=32) で頭打ち
-    var name_bufs: [MAX_ACTIONS + 4][8]u8 = undefined;
+    var name_bufs: [action_registry.MAX_ACTIONS + 4][8]u8 = undefined;
     for (&name_bufs, 0..) |*nb, i| {
         const nm = std.fmt.bufPrint(nb, "act{d}", .{i}) catch unreachable;
         registerAction(.{ .name = nm, .ctx = &c1, .run = testActionRun });
     }
-    try testing.expectEqual(@as(usize, MAX_ACTIONS), action_count);
-    action_count = 0;
+    try testing.expectEqual(@as(usize, action_registry.MAX_ACTIONS), action_registry.actionCount());
 }
 
 test "action dispatch: raw args 透過（再トークン化しない・連続空白/JSON風ペイロード保持）" {
     resetForTest();
     var c = TestActionCtx{};
     registerAction(.{ .name = "foo", .ctx = &c, .run = testActionRun });
-    defer action_count = 0;
+    defer action_registry.resetForTest();
     cmd_buf =
         \\action foo 1 2  3
         \\step 1
@@ -2713,7 +2661,7 @@ test "action: 未知 action / 名前欠落 / run()エラー は記帳（expect_f
     resetForTest();
     var c = TestActionCtx{};
     registerAction(.{ .name = "boom", .ctx = &c, .run = testActionErr });
-    defer action_count = 0;
+    defer action_registry.resetForTest();
     cmd_buf =
         \\action nosuch
         \\step 1
@@ -2740,7 +2688,7 @@ test "action live: 成功は bare `<name> <msg>`、失敗は `fail <name> <msg>`
     defer resp_buf.clearRetainingCapacity();
     var c = TestActionCtx{};
     registerAction(.{ .name = "foo", .ctx = &c, .run = testActionRun });
-    defer action_count = 0;
+    defer action_registry.resetForTest();
 
     {
         var it = std.mem.tokenizeAny(u8, "foo bar", " \t");
@@ -2874,7 +2822,7 @@ test "capabilities: action 名の制御文字（NUL。isValidActionName は通�
     resetForTest();
     var ac = TestActionCtx{};
     registerAction(.{ .name = "bad\x00name", .ctx = &ac, .run = testActionRun });
-    try testing.expectEqual(@as(usize, 1), action_count); // registerAction 自体は成立する
+    try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // registerAction 自体は成立する
 
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();

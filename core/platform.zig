@@ -278,15 +278,16 @@ pub const Probe = harness.Probe;
 pub const registerProbe = harness.registerProbe;
 
 // ============================================================================
-// custom action（ヘッドレス検証 harness・TASK-62.1）
+// custom action（TASK-62.1 → TASK-62.3.1 で action_registry へ分離）
 //
 // app が `platform.registerAction(.{ .name, .ctx, .run })` で高レベル操作を opt-in 登録する。
-// probe（read）に対称な操作（write）口。platform module は共有 harness module を既に import 済みなので
-// re-export だけで露出でき、build.zig 変更は不要。harness 無効時（env 未設定）は registerAction が no-op。
+// probe（read）に対称な操作（write）口。参照先は `action_registry`（harness 経由の同一インスタンス）。
+// harness/action_registry 無効時（env 未設定）は registerAction が no-op。
 // framework は action の中身を解釈しない（probe と同じ不変条件）。
 // ============================================================================
-pub const Action = harness.Action;
-pub const registerAction = harness.registerAction;
+pub const Action = harness.action_registry.Action;
+pub const NetworkPolicy = harness.action_registry.NetworkPolicy;
+pub const registerAction = harness.action_registry.registerAction;
 
 // ============================================================================
 // command model（TASK-62.5.1/62.5.3）

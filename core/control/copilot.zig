@@ -650,6 +650,8 @@ fn resetCopilotForTest() void {
     enabled = false;
     shared_executor = null;
     harness.setExternalRegistryEnabled(false);
+    // false は action_registry に伝わらないため、無効化は resetForTest 必須（TASK-62.3.1）。
+    harness.action_registry.resetForTest();
 }
 
 /// テスト用 convenience: 1 リクエスト分の bytes を ConnState に通し全コマンドを実行、応答 slice を返す。
@@ -696,7 +698,10 @@ test "copilot: 2 OR ゲート（setExternalRegistryEnabled で registerProbe/reg
     resetCopilotForTest();
     try testing.expect(!harness.isEnabled()); // 前提: harness は disabled のまま
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var ac = TestActionCtx{};
     var pc = TestProbeCtx{};
     harness.registerAction(.{ .name = "copilot_gate_a", .ctx = &ac, .run = testActionPing });
@@ -708,7 +713,10 @@ test "copilot: 2 OR ゲート（setExternalRegistryEnabled で registerProbe/reg
 test "copilot: 3 action 応答形式 + CommandLog に actor=local_agent kind=normal で記録" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var ac = TestActionCtx{};
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
 
@@ -729,7 +737,10 @@ test "copilot: 3 action 応答形式 + CommandLog に actor=local_agent kind=nor
 test "copilot: 4 begin_tx→action→end_tx で transaction_id が付く / 二重 begin・handle 不整合は fail" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var ac = TestActionCtx{};
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
 
@@ -759,7 +770,10 @@ test "copilot: 4 begin_tx→action→end_tx で transaction_id が付く / 二�
 test "copilot: 5 netsync session 中は operate 拒否・observe は許可（AC #3）" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var ac = TestActionCtx{};
     var pc = TestProbeCtx{ .value = 42 };
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
@@ -802,7 +816,10 @@ test "copilot: 5 netsync session 中は operate 拒否・observe は許可（AC 
 test "copilot: 6 digest/snapshot/未知の応答形式（capabilities/custom/明示 path/fail 形式/quit 非対応）" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var pc = TestProbeCtx{ .value = 9 };
     harness.registerProbe(.{ .name = "cp_probe", .ctx = &pc, .digest = testProbeDigest, .snapshot = testProbeSnapshot });
 
@@ -864,7 +881,10 @@ test "copilot: 8 排他（VP_HARNESS_* 併用時は copilot 無効）" {
 test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/truncated/deadline/budget 持ち越し）" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var ac = TestActionCtx{};
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
 
@@ -926,7 +946,10 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
 test "copilot: 10 setSharedExecutor（action は own-log 非記録の直 dispatch / tx は共有 executor / 未設定時は従来挙動）" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
-    defer harness.setExternalRegistryEnabled(false);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
     var ac = TestActionCtx{};
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
 
