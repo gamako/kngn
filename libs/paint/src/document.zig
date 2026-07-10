@@ -226,15 +226,26 @@ fn freeOp(gpa: Allocator, op: *Op) void {
 }
 
 /// Undo/Redo スタック。各 Op の owned スライスは gpa 所有。
+///
+/// **handle タグ（TASK-62.5.3）**: `undo` 配列の各 Op に単調一意な u64 handle を並行配列
+/// `handles` で対応付ける（CommandRecord の `undo_ref` がこの handle を指す = AC #2 の対応付け。
+/// platform 非依存を保つため u64 のみで command 型には依存しない）。`redo` 配列はタグ対象外
+/// （undo 候補でないため）。`redoOne` の再 push は**新 handle を採番**する（旧 record との対応は
+/// 切れる。62.5.4 で undo/redo が revert record 化されるまでの暫定仕様）。
 pub const UndoStack = struct {
     pub const max_history: usize = 128;
 
     undo: std.ArrayList(Op) = .empty,
     redo: std.ArrayList(Op) = .empty,
+    /// `undo` と要素同期する handle 並行配列（handles.items.len == undo.items.len 不変）。
+    handles: std.ArrayList(u64) = .empty,
+    /// 次に採番する handle（単調・再利用なし）。
+    next_handle: u64 = 1,
 
     pub fn deinit(self: *UndoStack, gpa: Allocator) void {
         freeStack(gpa, &self.undo);
         freeStack(gpa, &self.redo);
+        self.handles.deinit(gpa);
     }
 
     fn freeStack(gpa: Allocator, stack: *std.ArrayList(Op)) void {
@@ -247,14 +258,49 @@ pub const UndoStack = struct {
         self.redo.clearRetainingCapacity();
     }
 
+    /// handle を採番する（push と `Document.redoOne` の再 push が使う）。
+    fn allocHandle(self: *UndoStack) u64 {
+        const h = self.next_handle;
+        self.next_handle += 1;
+        return h;
+    }
+
+    /// 直近 push された op の handle（undo 配列が空なら null）。
+    pub fn topHandle(self: *const UndoStack) ?u64 {
+        const n = self.handles.items.len;
+        if (n == 0) return null;
+        return self.handles.items[n - 1];
+    }
+
+    /// 指定 handle の Op が undo 配列に現存するか（CommandRecord.undo_ref の live 判定用）。
+    pub fn hasHandle(self: *const UndoStack, handle: u64) bool {
+        for (self.handles.items) |h| {
+            if (h == handle) return true;
+        }
+        return false;
+    }
+
     /// 非空コマンドを積む。redo 履歴をクリアする。
     pub fn push(self: *UndoStack, gpa: Allocator, op: Op) void {
         self.clearRedo(gpa);
         if (self.undo.items.len >= max_history) {
             var oldest = self.undo.orderedRemove(0);
             freeOp(gpa, &oldest);
+            _ = self.handles.orderedRemove(0);
         }
         self.undo.append(gpa, op) catch @panic("UndoStack.push: OOM");
+        self.handles.append(gpa, self.allocHandle()) catch @panic("UndoStack.push: OOM");
+    }
+
+    /// undo/redo 履歴を全クリアするが **handle 採番（next_handle）は保持する**。
+    /// ドキュメント読込等のリセット経路は必ずこちらを使う（`deinit` + `= .{}` で作り直すと
+    /// next_handle が 1 に戻り、①リセット前の採番値との差分計算が巻き戻って underflow
+    /// ②リセット前の CommandRecord.undo_ref と新規 Op の handle が衝突して live 判定が偽陽性、
+    /// の 2 つの不具合を生む。handle は App/CommandLog の生存期間で単調・再利用なし。TASK-62.5.3）。
+    pub fn clearHistoryPreservingHandles(self: *UndoStack, gpa: Allocator) void {
+        const preserved = self.next_handle;
+        self.deinit(gpa);
+        self.* = .{ .next_handle = preserved };
     }
 };
 
@@ -1127,8 +1173,7 @@ pub const Document = struct {
         self.grid.append(gpa, null) catch @panic("Document.resetToSingleBlankLayer: OOM");
         self.selected_layer = 0;
         self.selected_frame = 0;
-        self.undo.deinit(gpa);
-        self.undo = .{};
+        self.undo.clearHistoryPreservingHandles(gpa);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1137,6 +1182,7 @@ pub const Document = struct {
 
     pub fn undoOne(self: *Document, gpa: Allocator) void {
         var op = self.undo.undo.pop() orelse return;
+        _ = self.undo.handles.pop(); // handle 並行配列を同期（redo 側はタグ対象外）
         self.applyBefore(gpa, &op);
         self.undo.redo.append(gpa, op) catch @panic("Document.undoOne: OOM");
         self.resyncActiveView(gpa);
@@ -1146,6 +1192,8 @@ pub const Document = struct {
         var op = self.undo.redo.pop() orelse return;
         self.applyAfter(gpa, &op);
         self.undo.undo.append(gpa, op) catch @panic("Document.redoOne: OOM");
+        // 再 push は**新 handle を採番**（旧 CommandRecord との対応は復活しない。UndoStack doc 参照）。
+        self.undo.handles.append(gpa, self.undo.allocHandle()) catch @panic("Document.redoOne: OOM");
         self.resyncActiveView(gpa);
     }
 
@@ -1349,3 +1397,100 @@ pub const Document = struct {
         }
     }
 };
+
+// ============================================================================
+// tests（UndoStack handle タグ。TASK-62.5.3）
+// ============================================================================
+
+const testing = std.testing;
+
+fn testVisOp(index: usize) Op {
+    return .{ .layer_visible = .{ .index = index, .before = true, .after = false } };
+}
+
+test "UndoStack handles: 採番の単調性 / push→topHandle / 長さ同期の不変条件" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+
+    try testing.expectEqual(@as(?u64, null), s.topHandle());
+
+    s.push(gpa, testVisOp(0));
+    try testing.expectEqual(@as(?u64, 1), s.topHandle());
+    s.push(gpa, testVisOp(1));
+    try testing.expectEqual(@as(?u64, 2), s.topHandle()); // 単調増加
+    try testing.expectEqual(s.undo.items.len, s.handles.items.len);
+    try testing.expect(s.hasHandle(1));
+    try testing.expect(s.hasHandle(2));
+    try testing.expect(!s.hasHandle(3));
+}
+
+test "UndoStack handles: max_history 溢れで最古 handle も同期して消える" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < UndoStack.max_history + 2) : (i += 1) {
+        s.push(gpa, testVisOp(i));
+    }
+    try testing.expectEqual(UndoStack.max_history, s.undo.items.len);
+    try testing.expectEqual(s.undo.items.len, s.handles.items.len);
+    try testing.expect(!s.hasHandle(1)); // 最古2件は溢れて消えた
+    try testing.expect(!s.hasHandle(2));
+    try testing.expect(s.hasHandle(3)); // 残存の先頭
+    try testing.expectEqual(@as(?u64, UndoStack.max_history + 2), s.topHandle());
+}
+
+test "UndoStack handles: Document.undoOne の pop / redoOne の再 push は新 handle 採番" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    doc.undo.push(gpa, testVisOp(0));
+    doc.undo.push(gpa, testVisOp(0));
+    try testing.expectEqual(@as(?u64, 2), doc.undo.topHandle());
+
+    doc.undoOne(gpa); // handle=2 の Op が pop（redo 側はタグ対象外）
+    try testing.expectEqual(@as(?u64, 1), doc.undo.topHandle());
+    try testing.expectEqual(doc.undo.undo.items.len, doc.undo.handles.items.len);
+    try testing.expect(!doc.undo.hasHandle(2));
+
+    doc.redoOne(gpa); // 再 push は**新 handle**（=3。2 は復活しない）
+    try testing.expectEqual(@as(?u64, 3), doc.undo.topHandle());
+    try testing.expectEqual(doc.undo.undo.items.len, doc.undo.handles.items.len);
+    try testing.expect(!doc.undo.hasHandle(2));
+}
+
+test "UndoStack handles: リセット後も next_handle は単調（clearHistoryPreservingHandles / 再利用しない）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    doc.undo.push(gpa, testVisOp(0));
+    doc.undo.push(gpa, testVisOp(0));
+    const before_reset = doc.undo.next_handle; // = 3
+    try testing.expectEqual(@as(u64, 3), before_reset);
+
+    // ドキュメント読込相当のリセット（doOpenPath 経由の resetToSingleBlankLayer が使う）
+    doc.resetToSingleBlankLayer(gpa);
+    try testing.expectEqual(@as(usize, 0), doc.undo.undo.items.len); // 履歴はクリア
+    try testing.expectEqual(@as(usize, 0), doc.undo.handles.items.len);
+    try testing.expectEqual(before_reset, doc.undo.next_handle); // 採番は保持
+
+    // リセット後の push はリセット前より大きい handle（再利用しない）
+    doc.undo.push(gpa, testVisOp(0));
+    try testing.expectEqual(@as(?u64, 3), doc.undo.topHandle());
+    try testing.expect(doc.undo.topHandle().? >= before_reset);
+
+    // UndoStack 単体でも同様（clearHistoryPreservingHandles 直接）
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+    s.push(gpa, testVisOp(0));
+    s.push(gpa, testVisOp(0));
+    const nh = s.next_handle;
+    s.clearHistoryPreservingHandles(gpa);
+    try testing.expectEqual(nh, s.next_handle);
+    s.push(gpa, testVisOp(0));
+    try testing.expect(s.topHandle().? >= nh);
+}

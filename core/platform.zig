@@ -289,6 +289,24 @@ pub const Action = harness.Action;
 pub const registerAction = harness.registerAction;
 
 // ============================================================================
+// command model（TASK-62.5.1/62.5.3）
+//
+// app が CommandLog + Executor を所有して「誰が（ActorId）・何を実行したか」を記録する型群。
+// command.zig は std のみ（platform/harness 非依存）だが、型の単一 instance 共有のため
+// harness module 経由で再エクスポートする。apps は `kit.platform.command` で届く
+// （command は std のみなので層規約上の追加依存は生じない）。
+// ============================================================================
+pub const command = harness.command;
+
+/// Co-pilot の共有 executor を設定する（copilot.setSharedExecutor への委譲。TASK-62.5.3）。
+/// 設定時、copilot transport の `action` は app 側 wrapper（executor 経由の記録を一元化）へ
+/// 直 dispatch し、`begin_tx`/`end_tx`/`cancel_tx` はこの executor に対して操作する。
+/// **harness 無効・copilot 無効時も呼んでよい**（module 変数の代入のみの no-op 規約）。
+pub fn setCommandExecutor(exec: ?*command.Executor) void {
+    copilot.setSharedExecutor(exec);
+}
+
+// ============================================================================
 // sleep（OS 非依存のフレームウェイト）
 //
 // zig 0.16 は std.time.sleep を廃し sleep が std.Io 経由になったため、main/examples が共通で使える

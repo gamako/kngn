@@ -78,6 +78,25 @@ var command_log: command.CommandLog = undefined;
 var executor: command.Executor = undefined;
 /// wire の begin_tx/end_tx/cancel_tx が管理する open transaction（同時 1 個）。
 var open_tx: ?command.TransactionHandle = null;
+/// app 所有の共有 executor（TASK-62.5.3）。設定時は own executor/log を使わない:
+/// - `action` は harness.findAction の run を**直接呼ぶ**（記録は app 側 wrapper が一元化。
+///   own-executor 経由だと app wrapper の executeAction と二重記録になり、同一 executor なら
+///   ReentrantDispatch になるため）。
+/// - `begin_tx`/`end_tx`/`cancel_tx` は共有 executor に対して actor=.local_agent で操作する
+///   （app wrapper が `openTransactionFor(.local_agent)` で自動参加する）。
+/// 未設定（null）時は 62.5.2 の挙動（own executor + own log）を完全維持。
+var shared_executor: ?*command.Executor = null;
+
+/// 共有 executor を設定する（facade の `platform.setCommandExecutor` から委譲される。
+/// harness/copilot 無効時も呼んでよい no-op 規約 = module 変数の代入のみ）。
+pub fn setSharedExecutor(exec: ?*command.Executor) void {
+    shared_executor = exec;
+}
+
+/// operate（action/tx 制御）の対象 executor（共有 executor 優先）。
+fn targetExecutor() *command.Executor {
+    return shared_executor orelse &executor;
+}
 
 /// capabilities JSON の組み立て先（harness の capabilities_buf と同型の再利用スクラッチ）。
 var caps_buf: [16 * 1024]u8 = undefined;
@@ -555,6 +574,19 @@ fn handleActionCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any))
     if (netsync_active) return failResp(conn_state, name, "netsync session active (operate disabled)");
     const args = std.mem.trim(u8, it.rest(), " \t");
     var buf: [harness.DIGEST_BUF_LEN]u8 = undefined;
+    if (shared_executor != null) {
+        // 共有 executor 設定時: registry の run を直接呼ぶ（app 側 wrapper が executor 経由の
+        // 記録を一元化しているため、ここで own executor を通すと二重記録/ReentrantDispatch になる）。
+        const act = harness.findAction(name) orelse return failResp(conn_state, name, "unknown action");
+        const result = act.run(act.ctx, args, &buf) catch |err| {
+            return failResp(conn_state, name, @errorName(err));
+        };
+        conn_state.appendResp(name);
+        conn_state.appendResp(" ");
+        conn_state.appendResp(firstLine(result));
+        conn_state.appendResp("\n");
+        return;
+    }
     const result = executor.executeAction(name, args, .{
         .actor = .local_agent,
         .transaction = open_tx,
@@ -573,12 +605,13 @@ fn handleBeginTx(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any)) v
     if (netsync_active) return failResp(conn_state, "begin_tx", "netsync session active (operate disabled)");
     if (open_tx != null) return failResp(conn_state, "begin_tx", "transaction already open");
     const label = std.mem.trim(u8, it.rest(), " \t");
-    const handle = executor.beginTransaction(.local_agent, label) catch |err| {
+    const exec = targetExecutor();
+    const handle = exec.beginTransaction(.local_agent, label) catch |err| {
         return failResp(conn_state, "begin_tx", @errorName(err));
     };
     open_tx = handle;
     var buf: [32]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "ok tx={d}\n", .{executor.tx_table[handle.index].id}) catch "ok\n";
+    const line = std.fmt.bufPrint(&buf, "ok tx={d}\n", .{exec.tx_table[handle.index].id}) catch "ok\n";
     conn_state.appendResp(line);
 }
 
@@ -586,7 +619,7 @@ fn handleEndTx(conn_state: *ConnState) void {
     if (netsync_active) return failResp(conn_state, "end_tx", "netsync session active (operate disabled)");
     const handle = open_tx orelse return failResp(conn_state, "end_tx", "no open transaction");
     open_tx = null;
-    executor.endTransaction(handle, .local_agent) catch |err| {
+    targetExecutor().endTransaction(handle, .local_agent) catch |err| {
         return failResp(conn_state, "end_tx", @errorName(err));
     };
     conn_state.appendResp("ok\n");
@@ -596,7 +629,7 @@ fn handleCancelTx(conn_state: *ConnState) void {
     if (netsync_active) return failResp(conn_state, "cancel_tx", "netsync session active (operate disabled)");
     const handle = open_tx orelse return failResp(conn_state, "cancel_tx", "no open transaction");
     open_tx = null;
-    executor.cancelTransaction(handle, .local_agent) catch |err| {
+    targetExecutor().cancelTransaction(handle, .local_agent) catch |err| {
         return failResp(conn_state, "cancel_tx", @errorName(err));
     };
     conn_state.appendResp("ok\n");
@@ -615,6 +648,7 @@ fn resetCopilotForTest() void {
     initExecutorState();
     netsync_active = false;
     enabled = false;
+    shared_executor = null;
     harness.setExternalRegistryEnabled(false);
 }
 
@@ -887,4 +921,43 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
     cs.executeBudget();
     try testing.expectEqual(@as(u32, CMD_BUDGET + 1), ac.calls); // 2 pump 目で残りを消化
     try testing.expectEqual(Phase.sending, cs.phase);
+}
+
+test "copilot: 10 setSharedExecutor（action は own-log 非記録の直 dispatch / tx は共有 executor / 未設定時は従来挙動）" {
+    resetCopilotForTest();
+    harness.setExternalRegistryEnabled(true);
+    defer harness.setExternalRegistryEnabled(false);
+    var ac = TestActionCtx{};
+    harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
+
+    // 共有 executor（app 所有想定。ここではテストローカル）を設定
+    var shared_log: command.CommandLog = .{};
+    var shared_exec = command.Executor.init(.{ .ctx = undefined, .run = dispatchHarnessAction });
+    shared_exec.log = &shared_log;
+    setSharedExecutor(&shared_exec);
+    defer setSharedExecutor(null);
+
+    // action: own-log に記録されず直 dispatch される（記録は app wrapper の責務 = ここでは無記録）
+    var cs: ConnState = undefined;
+    const resp = handleRequest(&cs, "action ping hello");
+    try testing.expectEqualStrings("ping pong hello\n", resp);
+    try testing.expectEqual(@as(u32, 1), ac.calls); // dispatch はされる
+    try testing.expectEqual(@as(u32, 0), command_log.filled); // own-log には記録されない
+    try testing.expectEqual(@as(u32, 0), shared_log.filled); // executor 経由でもない（app wrapper が居ないので無記録）
+
+    // begin_tx は共有 executor に開き、openTransactionFor(.local_agent) で見える
+    const resp2 = handleRequest(&cs, "begin_tx macro");
+    try testing.expectEqualStrings("ok tx=1\n", resp2);
+    try testing.expect(shared_exec.openTransactionFor(.local_agent) != null);
+    try testing.expect(executor.openTransactionFor(.local_agent) == null); // own executor は無関係
+    const resp3 = handleRequest(&cs, "end_tx");
+    try testing.expectEqualStrings("ok\n", resp3);
+    try testing.expect(shared_exec.openTransactionFor(.local_agent) == null);
+
+    // 未設定へ戻すと従来挙動（own executor 経由で own-log に記録される）
+    setSharedExecutor(null);
+    const resp4 = handleRequest(&cs, "action ping x");
+    try testing.expectEqualStrings("ping pong x\n", resp4);
+    try testing.expectEqual(@as(u32, 1), command_log.filled); // own-log に記録
+    try testing.expect(command_log.latest().?.actor.eql(.local_agent));
 }

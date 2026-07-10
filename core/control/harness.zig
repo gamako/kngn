@@ -319,7 +319,7 @@ pub const Action = struct {
     run: *const fn (ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8,
 };
 
-const MAX_ACTIONS = 16;
+const MAX_ACTIONS = 32; // TASK-62.5.3 で 16→32（pixie の登録 18 件が上限超過し save/open が skip されていた既存事象の解消。62.3.1 の引き上げの先行）
 var actions: [MAX_ACTIONS]Action = undefined;
 var action_count: usize = 0;
 
@@ -2675,9 +2675,13 @@ test "registerAction: 同名上書き / 不正名（空・空白・;・改行）
     registerAction(.{ .name = "b\nc", .ctx = &c1, .run = testActionRun }); // 改行混入
     try testing.expectEqual(@as(usize, 1), action_count); // いずれも拒否され増えない
 
-    const names = [_][]const u8{ "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p" };
-    for (names) |nm| registerAction(.{ .name = nm, .ctx = &c1, .run = testActionRun });
-    try testing.expectEqual(@as(usize, MAX_ACTIONS), action_count); // 16 で頭打ち（"a"+15件）
+    // 満杯 skip: "a" + MAX_ACTIONS 件以上を登録しても MAX_ACTIONS(=32) で頭打ち
+    var name_bufs: [MAX_ACTIONS + 4][8]u8 = undefined;
+    for (&name_bufs, 0..) |*nb, i| {
+        const nm = std.fmt.bufPrint(nb, "act{d}", .{i}) catch unreachable;
+        registerAction(.{ .name = nm, .ctx = &c1, .run = testActionRun });
+    }
+    try testing.expectEqual(@as(usize, MAX_ACTIONS), action_count);
     action_count = 0;
 }
 
@@ -3557,3 +3561,7 @@ test "live pump: request 1 MiB 超過後も次接続を accept できる" {
 // harness から copilot の関数は呼ばない（意味的依存は copilot→harness の一方向）。
 // ============================================================================
 pub const copilot = @import("copilot.zig");
+
+// command model（TASK-62.5.1/62.5.3）の namespace 再エクスポート。copilot と同じく型の単一
+// instance 共有のため（facade が `@import("harness").command` で届く。command.zig は std のみ）。
+pub const command = @import("command.zig");

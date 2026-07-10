@@ -25,8 +25,10 @@ const std = @import("std");
 
 /// action name の inline 所有バイト数上限（既存 action 名は最長 20B 弱。余裕を含む）。
 pub const MAX_CMD_NAME = 64;
-/// args の inline 所有バイト数上限（`Action.run` の buf 契約 1024B と同値）。
-pub const MAX_CMD_ARGS = 1024;
+/// args の inline 所有バイト数上限（UI/agent stroke の点列格納。62.3 wire の
+/// `MAX_ACTION_FRAME_BYTES` 目安 4096B と同値。TASK-62.5.3 で 1024→4096。
+/// 応答バッファの `DIGEST_BUF_LEN`=1024 とは無関係）。
+pub const MAX_CMD_ARGS = 4096;
 /// `CommandLog` の固定リング容量（62.3 plan v6 の undo 保持数 max_history=128 と整合）。
 pub const MAX_CMD_LOG = 128;
 /// 追跡できる actor（redo_epoch 表）の上限（netsync peer 規模と同水準）。
@@ -136,6 +138,12 @@ pub const CommandLog = struct {
             if (r.seq == seq) return r;
         }
         return null;
+    }
+
+    /// 最新（直近に append された）record。空なら null（history probe 等の観測用。TASK-62.5.3）。
+    pub fn latest(self: *CommandLog) ?*CommandRecord {
+        if (self.filled == 0) return null;
+        return self.recordAt(self.filled - 1);
     }
 };
 
@@ -514,6 +522,59 @@ pub const Executor = struct {
         });
 
         return .{ .seq = seq, .output = dr.output };
+    }
+
+    /// その actor の open 中 transaction の handle を返す（MVP は actor あたり 1 個前提で
+    /// 最初の一致。無ければ null）。app の action wrapper が「copilot の begin_tx で開いた tx」へ
+    /// 自動参加するために使う（TASK-62.5.3）。
+    pub fn openTransactionFor(self: *Executor, actor: ActorId) ?TransactionHandle {
+        for (self.tx_table, 0..) |slot, i| {
+            if (slot.open and slot.actor.eql(actor)) {
+                return .{ .index = @intCast(i), .generation = slot.generation };
+            }
+        }
+        return null;
+    }
+
+    /// **既に実行済みの操作を dispatch せずに記録する**（UI 操作の記録用。TASK-62.5.3）。
+    /// preflight は `executeAction` と同一・epoch bump 規則も同一（`appendRecord` 共有）。
+    /// undoable = `undo_ref != null`。`record_policy` は `.record` のみ許容（それ以外は
+    /// `error.InvalidRecordPolicy`）。戻り値は記録された seq（log 無し = no-op recorder は null）。
+    /// redo（62.5.4）はこの record を通常どおり dispatcher で再実行する。
+    pub fn recordExecuted(self: *Executor, name: []const u8, args: []const u8, opts: ExecuteOptions, undo_ref: ?UndoRef, buf: []u8) anyerror!?u64 {
+        _ = buf; // executeAction と対称のシグネチャ（dispatch しないため現状未使用）
+        if (opts.record_policy != .record) return error.InvalidRecordPolicy;
+        try self.preflight(name, args, opts);
+        if (self.log == null) return null;
+
+        var transaction_id: ?u64 = null;
+        var tx_member_index: u16 = 0;
+        if (opts.transaction) |h| {
+            const slot = &self.tx_table[h.index];
+            transaction_id = slot.id;
+            if (undo_ref != null) {
+                slot.undoable_member_count += 1;
+                tx_member_index = slot.undoable_member_count;
+            }
+        }
+
+        const redo_of: ?u64 = switch (opts.source) {
+            .local => null,
+            .remote_commit => |rc| if (rc.pending_local_meta) |m| m.redo_of else null,
+        };
+
+        return try self.appendRecord(.{
+            .actor = opts.actor,
+            .kind = .normal,
+            .name = name,
+            .args = args,
+            .transaction_id = transaction_id,
+            .undoable = undo_ref != null,
+            .undo_ref = undo_ref,
+            .redo_of = redo_of,
+            .tx_member_index = tx_member_index,
+            .source = opts.source,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1363,4 +1424,91 @@ test "16: tx部分溢れ(先頭member喪失でtx全体・revert bundle全体が�
     }
     const r2 = try exec2.redoOne(.local_user, &buf);
     try testing.expect(!r2.happened);
+}
+
+test "17: recordExecuted(dispatchなし・記録あり・epoch bump・undoable=undo_ref有無・record のみ許容)" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    // dispatch されない + undo_ref 付きで記録される
+    const seq1 = try exec.recordExecuted("stroke", "tool=pen 1 1", .{ .actor = .local_user }, 42, &buf);
+    try testing.expectEqual(@as(?u64, 1), seq1);
+    try testing.expectEqual(@as(u64, 0), app.run_count); // dispatcher は呼ばれない
+    const rec1 = log.findBySeq(1).?;
+    try testing.expect(rec1.undoable);
+    try testing.expectEqual(@as(?UndoRef, 42), rec1.undo_ref);
+    try testing.expectEqualStrings("stroke", rec1.name());
+    try testing.expectEqualStrings("tool=pen 1 1", rec1.args());
+    try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.local_user)); // undoable 記録で epoch bump
+
+    // undo_ref=null は undoable=false + epoch 不変
+    _ = try exec.recordExecuted("set_color", "FF0000", .{ .actor = .local_user }, null, &buf);
+    try testing.expect(!log.findBySeq(2).?.undoable);
+    try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.local_user));
+
+    // preflight は executeAction と同一（空名 / args 超過は dispatch も記録もされない）
+    try testing.expectError(error.NameEmpty, exec.recordExecuted("", "", .{ .actor = .local_user }, null, &buf));
+    var big_args: [MAX_CMD_ARGS + 1]u8 = undefined;
+    @memset(&big_args, 'x');
+    try testing.expectError(error.ArgsTooLong, exec.recordExecuted("stroke", &big_args, .{ .actor = .local_user }, null, &buf));
+    try testing.expectEqual(@as(u32, 2), log.filled);
+
+    // record 以外の record_policy は拒否
+    try testing.expectError(error.InvalidRecordPolicy, exec.recordExecuted("a", "", .{ .actor = .local_user, .record_policy = .no_record }, null, &buf));
+    try testing.expectError(error.InvalidRecordPolicy, exec.recordExecuted("a", "", .{ .actor = .local_user, .record_policy = .dry_run }, null, &buf));
+
+    // no-op recorder(log=null)は preflight のみで null を返す
+    var exec2: Executor = Executor.init(.{ .ctx = &app, .run = MockApp.run });
+    const none = try exec2.recordExecuted("stroke", "1 1", .{ .actor = .local_user }, 7, &buf);
+    try testing.expectEqual(@as(?u64, null), none);
+
+    // recordExecuted で記録した undoable record は undoOne の対象になる（記録一点主義の対応付け）
+    app.valid[42] = true; // MockApp の canUndo が参照する ref 台帳に載せる
+    const u = try exec.undoOne(.local_user, &buf);
+    try testing.expect(u.happened);
+    try testing.expect(log.findBySeq(1).?.reverted);
+}
+
+test "18: openTransactionFor(open 中のみ・actor 別・close 後 null)" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+
+    try testing.expect(exec.openTransactionFor(.local_agent) == null);
+
+    const tx = try exec.beginTransaction(.local_agent, "macro");
+    const found = exec.openTransactionFor(.local_agent).?;
+    try testing.expectEqual(tx.index, found.index);
+    try testing.expectEqual(tx.generation, found.generation);
+    try testing.expect(exec.openTransactionFor(.local_user) == null); // actor 別
+
+    // 見つけた handle は executeAction の transaction 照合を通る
+    var buf: [256]u8 = undefined;
+    const res = try exec.executeAction("m1", "", .{ .actor = .local_agent, .transaction = found }, &buf);
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(res.seq.?).?.transaction_id);
+
+    try exec.endTransaction(tx, .local_agent);
+    try testing.expect(exec.openTransactionFor(.local_agent) == null); // close 後 null
+}
+
+test "19: MAX_CMD_ARGS=4096 境界(丁度は通り +1 は reject)" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    try testing.expectEqual(4096, MAX_CMD_ARGS);
+    var exact: [MAX_CMD_ARGS]u8 = undefined;
+    @memset(&exact, 'a');
+    const res = try exec.executeAction("big", &exact, .{ .actor = .local_user }, &buf);
+    try testing.expectEqual(@as(usize, MAX_CMD_ARGS), log.findBySeq(res.seq.?).?.args().len);
+
+    var over: [MAX_CMD_ARGS + 1]u8 = undefined;
+    @memset(&over, 'a');
+    try testing.expectError(error.ArgsTooLong, exec.executeAction("big", &over, .{ .actor = .local_user }, &buf));
 }

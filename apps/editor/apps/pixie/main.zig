@@ -45,6 +45,12 @@ comptime {
         @compileError("text_content_max mismatch between paint.Canvas and text_content_input");
     }
 }
+// brush size 上限も actions.zig（std のみ）と paint 側で独立定義しているため乖離を防ぐ（TASK-62.5.3）。
+comptime {
+    if (actions.MAX_BRUSH_SIZE != core.Brush.MAX_SIZE) {
+        @compileError("MAX_BRUSH_SIZE mismatch between actions.zig and paint.Brush");
+    }
+}
 
 // ── system font ランタイム読込（TASK-82）───────────────────────────
 //
@@ -361,6 +367,26 @@ const App = struct {
     /// （どちらか一方のみ active。`beginTextEdit`/`beginRenameLayer` が互いを明示的に cancel する）。
     text_in: text_content_input.TextContentInput = .{},
 
+    /// ── command model（TASK-62.5.3）。「誰が（local_user/local_agent）・何を実行したか」の単一 log ──
+    /// 常時有効・固定容量（alloc なし）。transport の有無に依存しない（harness replay でも copilot
+    /// でも通常起動でも同じ経路）。記録はイベント時のみ（ホットパス外）。
+    cmd_log: platform.command.CommandLog = .{},
+    /// dispatcher/log は main() で配線する（ctx に &app が要るため field default にできない）。
+    cmd_exec: platform.command.Executor = undefined,
+    /// UI stroke（canvas_input 経由）の点列蓄積（§5c。press〜release のイベント時 append・固定上限は
+    /// actions.MAX_STROKE_POINTS を共有）。連続同一点は追加しない（同一点 move は描画上 no-op）。
+    ui_stroke_pts: [actions.MAX_STROKE_POINTS]actions.Point = undefined,
+    ui_stroke_len: usize = 0,
+    /// 上限超過 → この stroke は記録しない（257 点以上を記録すると 62.5.4 の redo 再 dispatch が
+    /// TooManyPoints で失敗するため。Op は legacy UndoStack に残り既存 undo UI では戻せる）。
+    ui_stroke_overflow: bool = false,
+    /// capture 開始時に latch した実効パラメータ（canonical args の材料。§5c'）。
+    ui_stroke_tool: ToolKind = .pen,
+    ui_stroke_color: u32 = 0,
+    ui_stroke_size: u32 = 4,
+    ui_stroke_opacity: u8 = 255,
+    ui_stroke_hardness: u8 = 255,
+
     /// 選択中レイヤーが text kind か（テキストレイヤーへの直接 raster 編集を防ぐガード。
     /// TASK-79.5）。text layer の pixels は「TextParams からの再ラスタライズ結果」という
     /// 不変条件（libs/paint/src/canvas.zig の `TextParams` doc comment 参照）を守るため、
@@ -483,6 +509,92 @@ const App = struct {
         self.brush.color = color;
         self.fill.color = color;
         self.edit_synced_for = null;
+    }
+
+    /// stroke の実効パラメータを解決する（§5c': 明示 k=v > 現在の App 状態）。tool 未指定かつ
+    /// 現在ツールが pen/eraser/brush 以外は `error.UnsupportedTool`（fill は呼び出し側が
+    /// legacy 経路で扱う。bezier/select/eyedropper は従来どおり拒否）。
+    fn resolveEffectiveStroke(self: *App, p: actions.StrokeParams) error{UnsupportedTool}!actions.EffectiveStroke {
+        const tool: actions.StrokeTool = p.tool orelse switch (self.active_kind) {
+            .pen => .pen,
+            .eraser => .eraser,
+            .brush => .brush,
+            else => return error.UnsupportedTool,
+        };
+        return .{
+            .tool = tool,
+            .color = p.color orelse self.palette.current(),
+            .size = p.size orelse self.brush.size,
+            .opacity = p.opacity orelse self.brush.opacity,
+            .hardness = p.hardness orelse self.brush.hardness_q,
+        };
+    }
+
+    /// UI stroke の点列蓄積を開始する（capture 開始時。実効パラメータもここで latch する。§5c）。
+    fn uiStrokeBegin(self: *App, p: core.Vec2) void {
+        self.ui_stroke_len = 0;
+        self.ui_stroke_overflow = false;
+        self.ui_stroke_tool = self.active_kind;
+        self.ui_stroke_color = self.palette.current();
+        self.ui_stroke_size = self.brush.size;
+        self.ui_stroke_opacity = self.brush.opacity;
+        self.ui_stroke_hardness = self.brush.hardness_q;
+        self.uiStrokeAppend(p);
+    }
+
+    fn uiStrokeAppend(self: *App, p: core.Vec2) void {
+        if (self.ui_stroke_overflow) return;
+        if (self.ui_stroke_len > 0) {
+            const last = self.ui_stroke_pts[self.ui_stroke_len - 1];
+            if (last.x == p.x and last.y == p.y) return; // 連続同一点は蓄積しない
+        }
+        if (self.ui_stroke_len >= actions.MAX_STROKE_POINTS) {
+            self.ui_stroke_overflow = true;
+            return;
+        }
+        self.ui_stroke_pts[self.ui_stroke_len] = .{ .x = p.x, .y = p.y };
+        self.ui_stroke_len += 1;
+    }
+
+    fn uiStrokeDiscard(self: *App) void {
+        self.ui_stroke_len = 0;
+        self.ui_stroke_overflow = false;
+    }
+
+    /// UI stroke の確定点で CommandRecord を記録する（§5c。actor=local_user・canonical args。
+    /// one-shot: 蓄積は必ずクリアする）。`pushed` = pushPaintOp で Op が実際に push されたか
+    /// （true なら undo_ref = 直近 push の handle = AC #2 の対応付け）。
+    fn recordUiStroke(self: *App, pushed: bool) void {
+        const len = self.ui_stroke_len;
+        const overflow = self.ui_stroke_overflow;
+        self.uiStrokeDiscard();
+        if (len == 0) return;
+        if (overflow) {
+            std.debug.print("pixie: UI stroke の記録を skip（{d} 点超過。Op は legacy UndoStack に残る）\n", .{actions.MAX_STROKE_POINTS});
+            return;
+        }
+        const tool: actions.StrokeTool = switch (self.ui_stroke_tool) {
+            .pen => .pen,
+            .eraser => .eraser,
+            .brush => .brush,
+            else => return, // fill 等は §5c の記録対象外（pen/eraser/brush のみ）
+        };
+        var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+        const canon = actions.formatCanonicalStroke(&canon_buf, .{
+            .tool = tool,
+            .color = self.ui_stroke_color,
+            .size = self.ui_stroke_size,
+            .opacity = self.ui_stroke_opacity,
+            .hardness = self.ui_stroke_hardness,
+        }, self.ui_stroke_pts[0..len]) catch {
+            std.debug.print("pixie: UI stroke の記録を skip（canonical args が {d}B 超過。Op は legacy UndoStack に残る）\n", .{platform.command.MAX_CMD_ARGS});
+            return;
+        };
+        const undo_ref: ?u64 = if (pushed) self.doc.undo.topHandle() else null;
+        var msg_buf: [64]u8 = undefined;
+        _ = self.cmd_exec.recordExecuted("stroke", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
+            std.debug.print("pixie: UI stroke の記録に失敗: {s}\n", .{@errorName(err)});
+        };
     }
 
     /// スポイト（TASK-68）: 指定 canvas 座標の色を描画色へ反映する。座標は呼び出し側
@@ -706,8 +818,13 @@ const App = struct {
             return;
         };
         // 成功: 旧 doc を破棄して差し替え、canvas ポインタと preview を張り直す。
+        // undo handle の採番は App/CommandLog の生存期間で単調に保つ（fresh Document は
+        // next_handle=1 で始まるため、引き継がないと load 前の CommandRecord.undo_ref と
+        // 新規 Op の handle が衝突し live 判定が偽陽性になる。UndoStack doc 参照）。
+        const preserved_next_handle = self.doc.undo.next_handle;
         self.doc.deinit();
         self.doc = new_doc;
+        self.doc.undo.next_handle = preserved_next_handle;
         self.doc.resyncActiveView(self.gpa);
         self.canvas = self.doc.activeCanvas();
         self.clampTimelineTarget();
@@ -1331,6 +1448,32 @@ fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, cursorDigest(ctx, &buf));
 }
 
+/// history digest（TASK-62.5.3 §5d の**暫定** probe。正式な summary schema は 62.5.5 で確定し、
+/// この digest はその際に置換・拡張してよい）: CommandLog の外部観測手段（AC #1 の headless 検証用）。
+/// `last_undo_live` = 最新 record の undo_ref handle が現在 UndoStack に現存するか（AC #2 の
+/// 対応付けと §5b' の stale 遷移の外部検証用。undo_ref が無い record は `-`）。
+fn historyDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const latest = app.cmd_log.latest() orelse {
+        return std.fmt.bufPrint(buf, "count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=-", .{}) catch buf[0..0];
+    };
+    var ref_buf: [24]u8 = undefined;
+    const ref_str: []const u8 = if (latest.undo_ref) |r| (std.fmt.bufPrint(&ref_buf, "{d}", .{r}) catch "-") else "-";
+    const live_str: []const u8 = if (latest.undo_ref) |r| (if (app.doc.undo.hasHandle(r)) "1" else "0") else "-";
+    var tx_buf: [24]u8 = undefined;
+    const tx_str: []const u8 = if (latest.transaction_id) |t| (std.fmt.bufPrint(&tx_buf, "{d}", .{t}) catch "-") else "-";
+    return std.fmt.bufPrint(buf, "count={d} last_seq={d} last_actor={s} last_name={s} last_undoable={d} last_undo_ref={s} last_undo_live={s} last_tx={s}", .{
+        app.cmd_log.filled,
+        latest.seq,
+        @tagName(latest.actor),
+        latest.name(),
+        @as(u1, if (latest.undoable) 1 else 0),
+        ref_str,
+        live_str,
+        tx_str,
+    }) catch buf[0..0];
+}
+
 // ============================================================================
 // ヘッドレス検証 harness の custom action（TASK-64。TASK-62.1 の registerAction を pixie が採用）
 //
@@ -1510,18 +1653,57 @@ fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 }
 
 /// canvas 座標の点列を down→move×N→up で直接駆動する（既存 canvas_input と同じ Tool 経路）。
-/// `active_kind==.bezier/.select/.eyedropper` は `activeTool()` が到達しないフォールバック（pen）を
-/// 返す実装のため、意図しない Pen 描画を避けるべく明示的に弾く。
+/// TASK-62.5.3 §5c': `[tool=|color=|size=|opacity=|hardness=]` の k=v 前置を受け、明示された
+/// パラメータを**一時的に latch して実行後に元の App 状態へ復元**する（redo が現在のユーザー
+/// 設定を壊さない）。パラメータ無しは従来どおり現在状態を使う（TASK-64 文法と後方互換。
+/// fill は tool= で表現できない legacy 経路として従来どおり現在ツールで実行する）。
+/// bezier/select/eyedropper は従来どおり明示的に弾く（`activeTool()` の到達しないフォールバック
+/// による意図しない Pen 描画の回避）。
 fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    if (app.active_kind == .bezier or app.active_kind == .select or app.active_kind == .eyedropper) return error.UnsupportedTool;
     if (app.editingBlocked()) return error.EditingBlocked;
     if (app.selectedLayerIsText()) return error.TextLayerSelected; // TASK-79.5: text layer 直接編集禁止
     var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
-    const pts = try actions.parseStrokePoints(args, &pts_buf);
+    const parsed = try actions.parseStroke(args, &pts_buf);
+    const pts = parsed.points;
 
-    const tool = app.activeTool();
+    // 実効パラメータの解決と latch。fill（tool= 無し + active_kind==.fill）のみ legacy 経路。
+    var tool: core.Tool = undefined;
+    const saved_pen_color = app.pen.color;
+    const saved_brush_color = app.brush.color;
+    const saved_brush_size = app.brush.size;
+    const saved_brush_opacity = app.brush.opacity;
+    const saved_brush_hardness = app.brush.hardness_q;
+    defer {
+        app.pen.color = saved_pen_color;
+        app.brush.color = saved_brush_color;
+        app.brush.size = saved_brush_size;
+        app.brush.opacity = saved_brush_opacity;
+        app.brush.hardness_q = saved_brush_hardness;
+    }
+    if (app.resolveEffectiveStroke(parsed.params)) |eff| {
+        switch (eff.tool) {
+            .pen => {
+                app.pen.color = eff.color;
+                tool = app.pen.tool();
+            },
+            .eraser => tool = app.eraser.tool(),
+            .brush => {
+                app.brush.color = eff.color;
+                app.brush.size = eff.size;
+                app.brush.opacity = eff.opacity;
+                app.brush.hardness_q = eff.hardness;
+                tool = app.brush.tool();
+            },
+        }
+    } else |err| {
+        // tool= 無しで現在ツールが fill → 従来どおり現在状態で実行（TASK-64 後方互換）。
+        // bezier/select/eyedropper は従来どおり UnsupportedTool。
+        if (app.active_kind != .fill or parsed.params.tool != null) return err;
+        tool = app.activeTool();
+    }
+
     _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .down = .{ .x = pts[0].x, .y = pts[0].y } });
     var cmd: ?core.PaintDiff = null;
     if (pts.len == 1) {
@@ -1553,34 +1735,142 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
-// テキストレイヤー（TASK-79.5）に action は追加しない: harness の action registry は
-// `MAX_ACTIONS=16`（core/control/harness.zig）固定で、pixie は既に 16 件登録済み（undo〜open）
-// のため空き slot が無い。harness.zig の改変は本タスクのスコープ外（AGENT.md 上位ルール）。
-// AC#5 の harness 検証は既存の `inject mouse_down/up`（右クリックメニュー操作）+
-// `inject char`（TASK-22 char_input 注入。テキスト内容の入力）+ 既存 `inject key_down`
-// （Undo 等）で UI をそのまま駆動する（座標依存だが action 追加なしで完結する）。
+// テキストレイヤー（TASK-79.5）向け action（doAddTextLayer/doSetTextParams/doRasterizeLayer）は
+// 未追加のまま（TASK-62.5.3 で MAX_ACTIONS は 32 へ拡張済みで slot は空いたが、追加自体は
+// 本タスクのスコープ外）。harness 検証は既存の `inject mouse_down/up` + `inject char` で行う。
 
-/// 16 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
-/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+// ============================================================================
+// command model 統合（TASK-62.5.3）
+//
+// App が CommandLog + Executor を所有し（常時有効・固定容量）、記録は次の 2 箇所に一元化する:
+//   1. registerAction 経由（harness `action` / copilot `action`）→ 下の記録 wrapper が
+//      `executeAction(actor=.local_agent)` で実ハンドラ（PIXIE_ACTIONS 表）を dispatch + 記録
+//   2. UI の canvas stroke 確定点 → `App.recordUiStroke`（`recordExecuted(actor=.local_user)`）
+// undo/redo action は `.no_record`（正規化された undo 表現は 62.5.4 の revert record。normal
+// record としてログを汚さない）。undo_ref は `UndoStack.handles` の handle（AC #2 の対応付け）。
+// ============================================================================
+
+const ActionEntry = struct {
+    name: []const u8,
+    run: *const fn (ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8,
+};
+
+/// name→実ハンドラ表（`dispatchPixieAction` が引く。登録 wrapper とは分離）。
+const PIXIE_ACTIONS = [_]ActionEntry{
+    .{ .name = "undo", .run = actionUndo },
+    .{ .name = "redo", .run = actionRedo },
+    .{ .name = "clear", .run = actionClear },
+    .{ .name = "add_layer", .run = actionAddLayer },
+    .{ .name = "delete_layer", .run = actionDeleteLayer },
+    .{ .name = "select_layer", .run = actionSelectLayer },
+    .{ .name = "set_layer_visible", .run = actionSetLayerVisible },
+    .{ .name = "set_layer_opacity", .run = actionSetLayerOpacity },
+    .{ .name = "move_layer", .run = actionMoveLayer },
+    .{ .name = "duplicate_layer", .run = actionDuplicateLayer },
+    .{ .name = "merge_down", .run = actionMergeDown },
+    .{ .name = "frame", .run = actionFrame },
+    .{ .name = "set_onion", .run = actionSetOnion },
+    .{ .name = "set_color", .run = actionSetColor },
+    .{ .name = "set_tool", .run = actionSetTool },
+    .{ .name = "stroke", .run = actionStroke },
+    .{ .name = "save", .run = actionSave },
+    .{ .name = "open", .run = actionOpen },
+};
+
+/// `App.cmd_exec` の Dispatcher: name→実ハンドラ dispatch + noteUndo 配線（§5b）。
+/// dispatch 前後の undo push 回数を handle 採番カウンタ（`next_handle` の差分 = 「深さ +
+/// topHandle」比較の正確化。max_history 満杯時に深さが増えない push も正しく数える）で判定し、
+/// **丁度 1 push のときのみ** `noteUndo(topHandle)` する（0 push = non-undoable、2 push 以上 =
+/// 1 command = 1 Op の対応が崩れるため noteUndo しない + warn。現行 action set では発生しない想定）。
+fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    for (&PIXIE_ACTIONS) |*e| {
+        if (std.mem.eql(u8, e.name, name)) {
+            const handle_before = app.doc.undo.next_handle;
+            const out = try e.run(ctx, args, buf);
+            const handle_after = app.doc.undo.next_handle;
+            // 防御: 採番は生存期間単調が不変条件（clearHistoryPreservingHandles / doOpenProject の
+            // 引き継ぎで維持）だが、万一巻き戻っても unsigned underflow で落とさない（0 push 扱い + warn）。
+            const pushes = if (handle_after >= handle_before) handle_after - handle_before else blk: {
+                std.debug.print("pixie: action '{s}' で undo handle 採番が巻き戻り（{d}→{d}）。noteUndo を skip\n", .{ name, handle_before, handle_after });
+                break :blk 0;
+            };
+            if (pushes == 1) {
+                if (app.doc.undo.topHandle()) |h| app.cmd_exec.noteUndo(h);
+            } else if (pushes >= 2) {
+                std.debug.print("pixie: action '{s}' が {d} 回 undo.push（1 command = 1 Op が崩れるため noteUndo しない。62.5.4 申し送り）\n", .{ name, pushes });
+            }
+            return out;
+        }
+    }
+    return error.UnknownAction;
+}
+
+/// registerAction 用の記録 wrapper を comptime 生成する（§5a）。executor 経由で実ハンドラを
+/// dispatch し `actor=.local_agent` で記録する。copilot の `begin_tx` で開いた transaction には
+/// `openTransactionFor` で自動参加する。`policy=.no_record` は undo/redo 用（dispatch のみ）。
+fn recordedAction(comptime name: []const u8, comptime policy: platform.command.RecordPolicy) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
+    return &struct {
+        fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const res = try app.cmd_exec.executeAction(name, args, .{
+                .actor = .local_agent,
+                .transaction = app.cmd_exec.openTransactionFor(.local_agent),
+                .record_policy = policy,
+            }, buf);
+            return res.output;
+        }
+    }.run;
+}
+
+/// `stroke` 専用の記録 wrapper（§5c'）: 入力 args を parse → 実効パラメータ解決（明示 k=v >
+/// 現在状態）→ **各 key をちょうど一度だけ含む canonical args** を生成 → canonical args で
+/// executeAction（dispatch も canonical を実行するため挙動は入力の意味と同一。CommandLog 上の
+/// 全 stroke record が状態非依存に再実行可能になる）。fill の legacy 経路（tool= で表現不能）
+/// のみ raw args のまま記録する（従来挙動の互換維持。canonical 化は pen/eraser/brush が対象）。
+fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
+    const parsed = try actions.parseStroke(args, &pts_buf);
+
+    var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+    const exec_args: []const u8 = if (app.resolveEffectiveStroke(parsed.params)) |eff|
+        actions.formatCanonicalStroke(&canon_buf, eff, parsed.points) catch return error.ArgsTooLong
+    else |err| blk: {
+        if (app.active_kind != .fill or parsed.params.tool != null) return err;
+        break :blk args; // fill legacy（actionStroke 側も同じ判定で legacy 経路に入る）
+    };
+
+    const res = try app.cmd_exec.executeAction("stroke", exec_args, .{
+        .actor = .local_agent,
+        .transaction = app.cmd_exec.openTransactionFor(.local_agent),
+        .record_policy = .record,
+    }, buf);
+    return res.output;
+}
+
+/// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
+/// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
+/// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo });
-    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo });
-    platform.registerAction(.{ .name = "clear", .ctx = app, .run = actionClear });
-    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = actionAddLayer });
-    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = actionDeleteLayer });
-    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = actionSelectLayer });
-    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = actionSetLayerVisible });
-    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = actionSetLayerOpacity });
-    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = actionMoveLayer });
-    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = actionDuplicateLayer });
-    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = actionMergeDown });
-    platform.registerAction(.{ .name = "frame", .ctx = app, .run = actionFrame });
-    platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = actionSetOnion });
-    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = actionSetColor });
-    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = actionSetTool });
-    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = actionStroke });
-    platform.registerAction(.{ .name = "save", .ctx = app, .run = actionSave });
-    platform.registerAction(.{ .name = "open", .ctx = app, .run = actionOpen });
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = recordedAction("undo", .no_record) });
+    platform.registerAction(.{ .name = "redo", .ctx = app, .run = recordedAction("redo", .no_record) });
+    platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record) });
+    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record) });
+    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record) });
+    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = recordedAction("select_layer", .record) });
+    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = recordedAction("set_layer_visible", .record) });
+    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = recordedAction("set_layer_opacity", .record) });
+    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = recordedAction("move_layer", .record) });
+    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = recordedAction("duplicate_layer", .record) });
+    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record) });
+    platform.registerAction(.{ .name = "frame", .ctx = app, .run = recordedAction("frame", .record) });
+    platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = recordedAction("set_onion", .record) });
+    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record) });
+    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record) });
+    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke });
+    platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record) });
+    platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record) });
 }
 
 /// canvas_area rect 内に表示領域（CANVAS*zoom 四方）を配置した canvas rect を返す。
@@ -2490,11 +2780,18 @@ pub fn main(init: std.process.Init) !void {
         app.doc.deinit();
     }
 
+    // command model（TASK-62.5.3）: App 所有の CommandLog/Executor を配線し、copilot transport の
+    // 共有 executor に設定する（copilot 無効時は no-op。記録自体は transport の有無に依存しない）。
+    app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchPixieAction });
+    app.cmd_exec.log = &app.cmd_log;
+    platform.setCommandExecutor(&app.cmd_exec);
+
     // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
     platform.registerProbe(.{ .name = "canvas", .ctx = &app, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
     platform.registerProbe(.{ .name = "undo", .ctx = &app, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
     platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
     platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
+    platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "txt", .digest = historyDigest }); // 暫定（§5d。62.5.5 で置換可）
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
     registerActions(&app);
 
@@ -2633,8 +2930,29 @@ pub fn main(init: std.process.Init) !void {
                         .pressed_left = pressed_left_gated,
                         .released_left = in.mouse_released.left,
                     };
-                    if (app.input.update(frame, app.activeTool(), app.canvas, &app.recorder, gpa)) |pd| {
+                    const was_capturing = app.input.capturing;
+                    const pd_opt = app.input.update(frame, app.activeTool(), app.canvas, &app.recorder, gpa);
+                    // ── UI stroke の点列追跡（TASK-62.5.3 §5c。canvas_input の down/move/up と同じ座標変換）──
+                    if (canvas_rect) |rect| {
+                        if (pd_opt != null) {
+                            // release で確定（同一フレーム press+release は begin から。up は released_pos）
+                            if (!was_capturing) app.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
+                            app.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom));
+                        } else if (!was_capturing and app.input.capturing) {
+                            // capture 開始（down=pressed_pos + 同フレーム move=mouse_pos）
+                            app.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
+                            app.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
+                        } else if (app.input.capturing) {
+                            app.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
+                        }
+                    }
+                    if (pd_opt) |pd| {
+                        const handle_before = app.doc.undo.next_handle;
                         app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                        // 確定点で CommandRecord を記録（actor=local_user。undo_ref = push された Op の handle）
+                        app.recordUiStroke(app.doc.undo.next_handle != handle_before);
+                    } else if (!app.input.capturing) {
+                        app.uiStrokeDiscard(); // release したが確定 diff なし → 蓄積破棄
                     }
                 }
             }
