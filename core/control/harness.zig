@@ -23,7 +23,7 @@
 //! （文法・状態遷移の対称。`fb` は仮想クロックで bit 決定論、`audio` は RT 実時間依存で bit 一致は非保証）。
 //!
 //! ## 依存と非依存
-//! - import は `std` / `platform_types.zig`(共有型) / `png`(エンコーダ+crc32) のみ。
+//! - import は `std` / `platform_types.zig`(共有型) / `png`(エンコーダ+crc32) / `dsp`(FFT・スペクトル解析) のみ。
 //!   backend(platform_macos/linux*) と audio backend には依存しない。audio サンプルは `audio.zig` facade が
 //!   `onAudioSamples()` で push する（依存方向 audio→harness）。
 //! - facade フックは io を持たないため、ファイル I/O / TCP は harness が自前の `std.Io.Threaded` io で行う。
@@ -33,6 +33,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const types = @import("platform_types");
 const png = @import("png");
+const dsp = @import("dsp"); // TASK-92: magnitudeSpectrum（band/centroid/onset）。RT 経路では呼ばない
 const capture_synthetic = @import("capture_synthetic"); // synthetic capture source（TASK-49.5）
 pub const action_registry = @import("action_registry.zig"); // TASK-62.3.1: Action/registry 分離
 pub const netsync = @import("netsync.zig"); // TASK-62.3.2: PROPOSE/COMMIT/REJECT（同一 action_registry インスタンス共有）
@@ -65,7 +66,12 @@ const VIRTUAL_FPS: f64 = 60.0;
 // consumer=メインスレッドが「直近窓」を non-destructive に peek する。
 const AUDIO_CAP: usize = 1 << 16; // interleaved f32 サンプル数（48kHz stereo で ~0.68s）
 const AUDIO_MASK: usize = AUDIO_CAP - 1;
-const ANALYZE_FRAMES: usize = 4096; // digest 解析窓（mono frames）
+const ANALYZE_FRAMES: usize = 4096; // digest 解析窓（mono frames。既存 rms/peak/f0 用。変更禁止）
+const EXT_FRAMES: usize = 32768; // TASK-92 拡張解析窓（LUFS 400ms@48k=19200 を収容。最大 ~0.68s）
+const EXT_FFT_N: usize = 4096; // band/centroid 用 FFT 点数
+const ONSET_FFT_N: usize = 2048; // onset 用 FFT 点数
+const ONSET_HOP: usize = 1024; // onset 用 hop
+const LUFS_FLOOR: f32 = -99.0; // 無音・窓不足時の LUFS 床値
 
 // ============================================================================
 // module-level state（単一プロセス・単一ウィンドウ前提の debug facility）
@@ -173,7 +179,17 @@ var audio_head: std.atomic.Value(usize) = .init(0);
 var audio_channels: std.atomic.Value(u32) = .init(0);
 var audio_rate: std.atomic.Value(u32) = .init(0);
 var audio_scratch: [AUDIO_CAP]f32 = undefined; // peek 先（メインスレッド）
-var audio_mono: [ANALYZE_FRAMES]f32 = undefined; // downmix scratch（メインスレッド）
+var audio_mono: [ANALYZE_FRAMES]f32 = undefined; // downmix scratch（メインスレッド・既存 analyzeAudio）
+var audio_mono_ext: [EXT_FRAMES]f32 = undefined; // TASK-92 拡張解析 downmix（メインスレッド）
+// FFT scratch（digest 要求時のみ。RT 非接触。module-level で alloc 回避）
+var ext_fft_re: [EXT_FFT_N]f32 = undefined;
+var ext_fft_im: [EXT_FFT_N]f32 = undefined;
+var ext_mags: [EXT_FFT_N / 2]f32 = undefined;
+var onset_fft_re: [ONSET_FFT_N]f32 = undefined;
+var onset_fft_im: [ONSET_FFT_N]f32 = undefined;
+var onset_mags_cur: [ONSET_FFT_N / 2]f32 = undefined;
+var onset_mags_prev: [ONSET_FFT_N / 2]f32 = undefined;
+var onset_win: [ONSET_FFT_N]f32 = undefined;
 
 // ============================================================================
 // 公開: 初期化 / hook API（platform.zig facade から呼ばれる）
@@ -1069,7 +1085,7 @@ const CAPABILITIES_RESERVED_TAIL = 64;
 const CapabilityBuiltin = struct { name: []const u8, ext: []const u8, desc: []const u8 };
 const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "fb", .ext = "png", .desc = "framebuffer PNG/digest" },
-    .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms・peak・f0・silent" },
+    .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms・peak・f0・silent / band・centroid・onsets・lufs" },
     .{ .name = "stats", .ext = "json", .desc = "EventStats + 仮想fps JSON" },
     .{ .name = "capabilities", .ext = "json", .desc = "登録済み probe・action の内省列挙" },
     .{ .name = "capture", .ext = "png", .desc = "synthetic mic/camera capture: video PNG snapshot + video/audio state digest" },
@@ -1708,8 +1724,28 @@ fn peekRecentAudio(dst: []f32) usize {
 
 const AudioStats = struct { rms: f32, peak: f32, f0: f32, silent: bool, frames: usize };
 
+/// TASK-92 拡張解析結果（既存 AudioStats と独立。additive キー用）。
+const AudioExtStats = struct {
+    band_low: f32,
+    band_mid: f32,
+    band_high: f32,
+    centroid: f32,
+    onsets: u32,
+    lufs: f32,
+};
+
+const audio_ext_zero = AudioExtStats{
+    .band_low = 0,
+    .band_mid = 0,
+    .band_high = 0,
+    .centroid = 0,
+    .onsets = 0,
+    .lufs = LUFS_FLOOR,
+};
+
 /// interleaved サンプルの直近 min(frames, mono_scratch.len) frames を mono downmix して RMS/peak/f0/silent を計算する。
 /// 純ロジック（単体テスト可能）。mono_scratch は呼び出し側が渡す（hidden global を持たない）。
+/// **TASK-92: 本関数と AudioStats・ANALYZE_FRAMES は変更しない**（既存キー bit 安定）。
 fn analyzeAudio(interleaved: []const f32, channels: u32, sample_rate: u32, mono_scratch: []f32) AudioStats {
     if (channels == 0 or interleaved.len < channels) return .{ .rms = 0, .peak = 0, .f0 = 0, .silent = true, .frames = 0 };
     const ch: usize = channels;
@@ -1736,6 +1772,222 @@ fn analyzeAudio(interleaved: []const f32, channels: u32, sample_rate: u32, mono_
     const silent = rms < 1e-4;
     const f0: f32 = if (silent) 0 else estimateF0(mono, sample_rate);
     return .{ .rms = rms, .peak = peak, .f0 = f0, .silent = silent, .frames = w };
+}
+
+/// TASK-92: band/centroid/onsets/lufs。digest 要求時（イベント時）のみ呼ばれる。RT 経路非接触。
+/// 純ロジック（単体テスト直呼び可）。mono_scratch は呼び出し側が渡す（最大 EXT_FRAMES）。
+/// sample_rate==0 / channels==0 / 窓 0 → 全ゼロ + lufs 床値。窓不足は縮退計算（0 なら床値）。
+fn analyzeAudioExt(interleaved: []const f32, channels: u32, sample_rate: u32, mono_scratch: []f32) AudioExtStats {
+    if (channels == 0 or sample_rate == 0 or interleaved.len < channels) return audio_ext_zero;
+    const ch: usize = channels;
+    const total_frames = interleaved.len / ch;
+    if (total_frames == 0) return audio_ext_zero;
+    const w = @min(total_frames, mono_scratch.len);
+    const off = total_frames - w;
+    var i: usize = 0;
+    while (i < w) : (i += 1) {
+        var acc: f32 = 0;
+        var c: usize = 0;
+        while (c < ch) : (c += 1) acc += interleaved[(off + i) * ch + c];
+        mono_scratch[i] = acc / @as(f32, @floatFromInt(ch));
+    }
+    const mono = mono_scratch[0..w];
+    const sr: f32 = @floatFromInt(sample_rate);
+
+    const bands = computeBandCentroid(mono, sr);
+    const onsets = countOnsets(mono, sr);
+    const lufs = computeLufsMomentary(mono, sample_rate);
+    return .{
+        .band_low = bands.low,
+        .band_mid = bands.mid,
+        .band_high = bands.high,
+        .centroid = bands.centroid,
+        .onsets = onsets,
+        .lufs = lufs,
+    };
+}
+
+/// 直近 4096 フレーム（不足はゼロ詰め）に Hann+magnitudeSpectrum を掛け、
+/// band_low(20–250) / band_mid(250–2000) / band_high(2000–Nyquist) の正規化エネルギー比と
+/// spectral centroid [Hz] を返す。全帯域エネルギー 0 なら全て 0。
+fn computeBandCentroid(mono: []const f32, sample_rate: f32) struct { low: f32, mid: f32, high: f32, centroid: f32 } {
+    if (mono.len == 0 or sample_rate <= 0) return .{ .low = 0, .mid = 0, .high = 0, .centroid = 0 };
+
+    // 直近 min(len, 4096) をバッファ末尾に置き、先頭はゼロ詰め
+    @memset(ext_fft_re[0..], 0);
+    const n_copy = @min(mono.len, EXT_FFT_N);
+    const src_off = mono.len - n_copy;
+    const dst_off = EXT_FFT_N - n_copy;
+    @memcpy(ext_fft_re[dst_off..][0..n_copy], mono[src_off..][0..n_copy]);
+    // magnitudeSpectrum は samples をコピーして Hann するので、samples 用に re を snapshot
+    var samples: [EXT_FFT_N]f32 = undefined;
+    @memcpy(samples[0..], ext_fft_re[0..]);
+    dsp.magnitudeSpectrum(samples[0..], ext_fft_re[0..], ext_fft_im[0..], ext_mags[0..]);
+
+    const n_bins = EXT_FFT_N / 2;
+    const bin_hz = sample_rate / @as(f32, @floatFromInt(EXT_FFT_N));
+    const nyquist = sample_rate * 0.5;
+    var e_low: f64 = 0;
+    var e_mid: f64 = 0;
+    var e_high: f64 = 0;
+    var sum_mag: f64 = 0;
+    var sum_f_mag: f64 = 0;
+    var k: usize = 0;
+    while (k < n_bins) : (k += 1) {
+        const f = @as(f32, @floatFromInt(k)) * bin_hz;
+        if (f < 20.0 or f > nyquist) continue;
+        const mag = ext_mags[k];
+        const e = @as(f64, mag) * @as(f64, mag);
+        sum_mag += mag;
+        sum_f_mag += @as(f64, f) * mag;
+        if (f < 250.0) {
+            e_low += e;
+        } else if (f < 2000.0) {
+            e_mid += e;
+        } else {
+            e_high += e;
+        }
+    }
+    const e_tot = e_low + e_mid + e_high;
+    if (e_tot <= 0) return .{ .low = 0, .mid = 0, .high = 0, .centroid = 0 };
+    const centroid: f32 = if (sum_mag > 0) @floatCast(sum_f_mag / sum_mag) else 0;
+    return .{
+        .low = @floatCast(e_low / e_tot),
+        .mid = @floatCast(e_mid / e_tot),
+        .high = @floatCast(e_high / e_tot),
+        .centroid = centroid,
+    };
+}
+
+/// hop=1024 / FFT=2048 のスペクトラルフラックス（正差分和）列を作り、
+/// threshold=mean+1.5σ 超えのローカルピーク数を数える（決定的・固定係数）。
+/// 連続して閾値を超えるプラトーは先頭ピークのみ数える（同一 onset の多重カウント防止）。
+fn countOnsets(mono: []const f32, sample_rate: f32) u32 {
+    _ = sample_rate;
+    if (mono.len < ONSET_FFT_N) return 0;
+
+    // 最大 hop 数: (EXT_FRAMES - ONSET_FFT_N) / ONSET_HOP + 1 ≤ 31
+    const max_hops = (EXT_FRAMES - ONSET_FFT_N) / ONSET_HOP + 1;
+    var flux: [max_hops]f64 = undefined;
+    var n_flux: usize = 0;
+
+    var have_prev = false;
+    var frame_start: usize = 0;
+    while (frame_start + ONSET_FFT_N <= mono.len) : (frame_start += ONSET_HOP) {
+        @memcpy(onset_win[0..], mono[frame_start..][0..ONSET_FFT_N]);
+        dsp.magnitudeSpectrum(onset_win[0..], onset_fft_re[0..], onset_fft_im[0..], onset_mags_cur[0..]);
+        if (have_prev) {
+            var sum: f64 = 0;
+            var k: usize = 0;
+            while (k < ONSET_FFT_N / 2) : (k += 1) {
+                const d = onset_mags_cur[k] - onset_mags_prev[k];
+                if (d > 0) sum += d;
+            }
+            if (n_flux < max_hops) {
+                flux[n_flux] = sum;
+                n_flux += 1;
+            }
+        }
+        @memcpy(onset_mags_prev[0..], onset_mags_cur[0..]);
+        have_prev = true;
+    }
+    if (n_flux == 0) return 0;
+
+    // mean + 1.5σ
+    var mean: f64 = 0;
+    for (flux[0..n_flux]) |v| mean += v;
+    mean /= @as(f64, @floatFromInt(n_flux));
+    var var_acc: f64 = 0;
+    for (flux[0..n_flux]) |v| {
+        const d = v - mean;
+        var_acc += d * d;
+    }
+    const sigma = @sqrt(var_acc / @as(f64, @floatFromInt(n_flux)));
+    const thresh = mean + 1.5 * sigma;
+
+    var count: u32 = 0;
+    var i: usize = 0;
+    while (i < n_flux) : (i += 1) {
+        if (flux[i] <= thresh) continue;
+        const left_ok = (i == 0) or (flux[i] >= flux[i - 1]);
+        const right_ok = (i + 1 >= n_flux) or (flux[i] > flux[i + 1]); // 右は厳密 > でプラトーを1回だけ
+        if (left_ok and right_ok) count += 1;
+    }
+    return count;
+}
+
+/// BS.1770 K-weighting（high-shelf + high-pass の 2 biquad。係数は sample_rate から設計式で算出）
+/// → 直近 400ms の mean-square → -0.691 + 10·log10(ms)。mono 1ch 扱い。無音は床値 -99.0。
+fn computeLufsMomentary(mono: []const f32, sample_rate: u32) f32 {
+    if (mono.len == 0 or sample_rate == 0) return LUFS_FLOOR;
+    const sr: f64 = @floatFromInt(sample_rate);
+    const win_n = @min(mono.len, @as(usize, @intFromFloat(0.4 * sr)));
+    if (win_n == 0) return LUFS_FLOOR;
+    const off = mono.len - win_n;
+
+    // Stage 1: high-shelf（ITU-R BS.1770 アナログ原型 → bilinear）
+    // f0=1681.974... Hz, G=3.999... dB, Q=0.707175...
+    const hs = kWeightShelfCoeffs(sr);
+    // Stage 2: high-pass f0=38.135... Hz, Q=0.500327...
+    const hp = kWeightHpCoeffs(sr);
+
+    var z1_hs: f64 = 0;
+    var z2_hs: f64 = 0;
+    var z1_hp: f64 = 0;
+    var z2_hp: f64 = 0;
+    var sum_sq: f64 = 0;
+    var i: usize = 0;
+    while (i < win_n) : (i += 1) {
+        const x: f64 = mono[off + i];
+        // Direct Form I transposed: y = b0*x + z1; z1 = b1*x - a1*y + z2; z2 = b2*x - a2*y
+        const y1 = hs.b0 * x + z1_hs;
+        z1_hs = hs.b1 * x - hs.a1 * y1 + z2_hs;
+        z2_hs = hs.b2 * x - hs.a2 * y1;
+        const y2 = hp.b0 * y1 + z1_hp;
+        z1_hp = hp.b1 * y1 - hp.a1 * y2 + z2_hp;
+        z2_hp = hp.b2 * y1 - hp.a2 * y2;
+        sum_sq += y2 * y2;
+    }
+    const ms = sum_sq / @as(f64, @floatFromInt(win_n));
+    if (ms <= 1e-12) return LUFS_FLOOR;
+    const lufs = -0.691 + 10.0 * std.math.log10(ms);
+    if (lufs < LUFS_FLOOR) return LUFS_FLOOR;
+    return @floatCast(lufs);
+}
+
+const BiquadCoeffs = struct { b0: f64, b1: f64, b2: f64, a1: f64, a2: f64 };
+
+/// BS.1770 pre-filter（high shelf）係数。sample_rate 依存（48k 決め打ち禁止）。
+fn kWeightShelfCoeffs(sample_rate: f64) BiquadCoeffs {
+    const f0 = 1681.974450955533;
+    const G = 3.999843853973347;
+    const Q = 0.7071752369554196;
+    const K = @tan(std.math.pi * f0 / sample_rate);
+    const Vh = std.math.pow(f64, 10.0, G / 20.0);
+    const Vb = std.math.pow(f64, Vh, 0.4996667741545416);
+    const a0 = 1.0 + K / Q + K * K;
+    return .{
+        .b0 = (Vh + Vb * K / Q + K * K) / a0,
+        .b1 = 2.0 * (K * K - Vh) / a0,
+        .b2 = (Vh - Vb * K / Q + K * K) / a0,
+        .a1 = 2.0 * (K * K - 1.0) / a0,
+        .a2 = (1.0 - K / Q + K * K) / a0,
+    };
+}
+
+/// BS.1770 RLB-weighting（high-pass）係数。sample_rate 依存。
+fn kWeightHpCoeffs(sample_rate: f64) BiquadCoeffs {
+    const f0 = 38.13547087602444;
+    const Q = 0.5003270373238773;
+    const K = @tan(std.math.pi * f0 / sample_rate);
+    const a0 = 1.0 + K / Q + K * K;
+    return .{
+        .b0 = 1.0 / a0,
+        .b1 = -2.0 / a0,
+        .b2 = 1.0 / a0,
+        .a1 = 2.0 * (K * K - 1.0) / a0,
+        .a2 = (1.0 - K / Q + K * K) / a0,
+    };
 }
 
 /// 自己相関で基本周波数を推定する（50–2000Hz）。clean tone に強い。検出不能/無音は 0。
@@ -1781,12 +2033,15 @@ fn formatAudioPayload(buf: []u8) []u8 {
     const channels = audio_channels.load(.monotonic);
     const rate = audio_rate.load(.monotonic);
     const n = peekRecentAudio(&audio_scratch);
+    // キー集合は分岐間で一致させる（expect の key 不在失敗を防ぐ）。TASK-92 additive。
     if (n == 0 or channels == 0) {
-        return std.fmt.bufPrint(buf, "rms=0.0000 peak=0.0000 f0=0.0 silent=1 frames=0", .{}) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "rms=0.0000 peak=0.0000 f0=0.0 silent=1 frames=0 band_low=0.0000 band_mid=0.0000 band_high=0.0000 centroid=0 onsets=0 lufs=-99.0", .{}) catch buf[0..0];
     }
     const st = analyzeAudio(audio_scratch[0..n], channels, rate, &audio_mono);
-    return std.fmt.bufPrint(buf, "rms={d:.4} peak={d:.4} f0={d:.1} silent={d} frames={d}", .{
-        st.rms, st.peak, st.f0, @intFromBool(st.silent), st.frames,
+    const ext = analyzeAudioExt(audio_scratch[0..n], channels, rate, &audio_mono_ext);
+    return std.fmt.bufPrint(buf, "rms={d:.4} peak={d:.4} f0={d:.1} silent={d} frames={d} band_low={d:.4} band_mid={d:.4} band_high={d:.4} centroid={d:.0} onsets={d} lufs={d:.1}", .{
+        st.rms,     st.peak,     st.f0,          @intFromBool(st.silent), st.frames,
+        ext.band_low, ext.band_mid, ext.band_high, ext.centroid,          ext.onsets, ext.lufs,
     }) catch buf[0..0];
 }
 
@@ -2273,6 +2528,141 @@ test "analyzeAudio: silence / 定数 / 440Hz sine を絶対値 assert" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), a1.peak, 0.02); // 振幅 0.5
     try testing.expectApproxEqAbs(@as(f32, 0.3536), a1.rms, 0.02); // 0.5/√2
     try testing.expectApproxEqAbs(@as(f32, 440), a1.f0, 5.0); // ±5Hz
+}
+
+/// 既知 sine を mono バッファへ埋める（振幅 amp・周波数 freq_hz・sr）。
+fn fillSine(dst: []f32, amp: f32, freq_hz: f32, sample_rate: f32) void {
+    for (dst, 0..) |*s, i| {
+        s.* = amp * @sin(2.0 * std.math.pi * freq_hz * @as(f32, @floatFromInt(i)) / sample_rate);
+    }
+}
+
+test "analyzeAudioExt: 440Hz sine — band_mid 支配・centroid≈440・onsets=0" {
+    var mono_ext: [EXT_FRAMES]f32 = undefined;
+    var sine: [4800]f32 = undefined;
+    fillSine(&sine, 0.5, 440, 48000);
+    const ext = analyzeAudioExt(&sine, 1, 48000, &mono_ext);
+    try testing.expect(ext.band_mid > 0.9);
+    try testing.expectApproxEqAbs(@as(f32, 440), ext.centroid, 20.0);
+    try testing.expectEqual(@as(u32, 0), ext.onsets);
+}
+
+test "analyzeAudioExt: 100Hz → band_low 支配 / 6kHz → band_high 支配" {
+    var mono_ext: [EXT_FRAMES]f32 = undefined;
+    var low: [4800]f32 = undefined;
+    fillSine(&low, 0.5, 100, 48000);
+    const e_low = analyzeAudioExt(&low, 1, 48000, &mono_ext);
+    try testing.expect(e_low.band_low > 0.9);
+
+    var high: [4800]f32 = undefined;
+    fillSine(&high, 0.5, 6000, 48000);
+    const e_high = analyzeAudioExt(&high, 1, 48000, &mono_ext);
+    try testing.expect(e_high.band_high > 0.9);
+}
+
+test "analyzeAudioExt: 997Hz sine 振幅 0.5 の LUFS ≈ -9.1" {
+    // BS.1770 K-weighting は 997Hz でわずかに boost があり、
+    // amp=0.5 連続 sine の momentary は ≈-9.07（unweighted 理論 -9.72 より約 +0.65 dB）。
+    // plan の「K≈0dB → -9.7」は近似。実装は標準設計式に忠実。
+    var mono_ext: [EXT_FRAMES]f32 = undefined;
+    // 400ms @48k = 19200 サンプル以上（momentary 窓を満杯にする）
+    var sine: [24000]f32 = undefined;
+    fillSine(&sine, 0.5, 997, 48000);
+    const ext = analyzeAudioExt(&sine, 1, 48000, &mono_ext);
+    try testing.expectApproxEqAbs(@as(f32, -9.1), ext.lufs, 0.5);
+}
+
+test "analyzeAudioExt: 無音→バースト×3 で onsets=3" {
+    var mono_ext: [EXT_FRAMES]f32 = undefined;
+    const sr: usize = 48000;
+    const burst_n = sr * 50 / 1000; // 50ms
+    const gap_n = sr * 150 / 1000; // 150ms
+    // leading silence + 3 bursts + 2 gaps + trailing silence（終端プラトーを避ける）
+    const total = 4096 + 3 * burst_n + 2 * gap_n + 4096;
+    var buf: [32768]f32 = undefined;
+    try testing.expect(total <= buf.len);
+    @memset(buf[0..total], 0);
+    var pos: usize = 4096; // leading silence
+    var b: usize = 0;
+    while (b < 3) : (b += 1) {
+        // 広帯域に近い決定的バースト（LCG ノイズ）。純 sine は位相で flux が割れ閾値を外しやすい。
+        var rng: u32 = 0xA341316C +% @as(u32, @intCast(b)) *% 0x9E3779B9;
+        var j: usize = 0;
+        while (j < burst_n) : (j += 1) {
+            rng = rng *% 1664525 +% 1013904223;
+            const u = @as(f32, @floatFromInt(rng >> 8)) * (1.0 / 16777216.0); // [0,1)
+            buf[pos + j] = (u * 2.0 - 1.0) * 0.8;
+        }
+        pos += burst_n;
+        if (b + 1 < 3) pos += gap_n;
+    }
+    const ext = analyzeAudioExt(buf[0..total], 1, 48000, &mono_ext);
+    try testing.expectEqual(@as(u32, 3), ext.onsets);
+}
+
+test "analyzeAudioExt: 無音は新キー 0 / lufs=-99.0" {
+    var mono_ext: [EXT_FRAMES]f32 = undefined;
+    var sil = [_]f32{0} ** 4096;
+    const ext = analyzeAudioExt(&sil, 1, 48000, &mono_ext);
+    try testing.expectEqual(@as(f32, 0), ext.band_low);
+    try testing.expectEqual(@as(f32, 0), ext.band_mid);
+    try testing.expectEqual(@as(f32, 0), ext.band_high);
+    try testing.expectEqual(@as(f32, 0), ext.centroid);
+    try testing.expectEqual(@as(u32, 0), ext.onsets);
+    try testing.expectEqual(@as(f32, LUFS_FLOOR), ext.lufs);
+}
+
+test "analyzeAudioExt: sample_rate=0 / channels=0 は床値ガード" {
+    var mono_ext: [EXT_FRAMES]f32 = undefined;
+    var sine: [256]f32 = undefined;
+    fillSine(&sine, 0.5, 440, 48000);
+    const e0 = analyzeAudioExt(&sine, 1, 0, &mono_ext);
+    try testing.expectEqual(@as(f32, LUFS_FLOOR), e0.lufs);
+    try testing.expectEqual(@as(f32, 0), e0.band_mid);
+    const e1 = analyzeAudioExt(&sine, 0, 48000, &mono_ext);
+    try testing.expectEqual(@as(f32, LUFS_FLOOR), e1.lufs);
+}
+
+test "formatAudioPayload: 既存キー prefix が従来と bit 一致（回帰）+ 新キー存在 + 1024B 以内" {
+    resetForTest();
+    mode = .replay;
+    audio_head = .init(0);
+    audio_channels = .init(0);
+    audio_rate = .init(0);
+
+    // 空バッファ: 無音分岐。既存キー部分は従来と bit 一致し、新キーが続く。
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const empty = formatAudioPayload(&buf);
+    try testing.expect(std.mem.startsWith(u8, empty, "rms=0.0000 peak=0.0000 f0=0.0 silent=1 frames=0"));
+    try testing.expect(std.mem.indexOf(u8, empty, "band_low=0.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "band_mid=0.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "band_high=0.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "centroid=0") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "onsets=0") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "lufs=-99.0") != null);
+    try testing.expect(empty.len < DIGEST_BUF_LEN);
+
+    // 440Hz sine を ring に流し、既存キー prefix が analyzeAudio と bit 一致 + 新キー additive。
+    var sine: [4800]f32 = undefined;
+    fillSine(&sine, 0.5, 440, 48000);
+    onAudioSamples(&sine, 4800, 1, 48000);
+    const payload = formatAudioPayload(&buf);
+    try testing.expect(std.mem.indexOf(u8, payload, "silent=0") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "band_mid=") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "centroid=") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "onsets=") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "lufs=") != null);
+    try testing.expect(payload.len < DIGEST_BUF_LEN);
+
+    // 既存キー部分だけを analyzeAudio の format と bit 比較（新キーを削った prefix = 回帰ゼロ）
+    var mono: [ANALYZE_FRAMES]f32 = undefined;
+    // formatAudioPayload と同じ直近窓（ring に入れた sine 全体）で legacy を組み立てる
+    const st = analyzeAudio(&sine, 1, 48000, &mono);
+    var legacy: [128]u8 = undefined;
+    const legacy_s = try std.fmt.bufPrint(&legacy, "rms={d:.4} peak={d:.4} f0={d:.1} silent={d} frames={d}", .{
+        st.rms, st.peak, st.f0, @intFromBool(st.silent), st.frames,
+    });
+    try testing.expect(std.mem.startsWith(u8, payload, legacy_s));
 }
 
 test "encodeWav: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 assert" {

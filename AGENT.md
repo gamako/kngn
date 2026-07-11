@@ -62,8 +62,9 @@ video-proto-main/
 
 > **層構成（ADR-007）**: `apps → kit → libs → core → platform` の一方向依存を build.zig の
 > モジュールグラフ（`Layer` タグ + `link()` 検査）で強制する。逆流・層飛ばし・apps の非許可直 import は
-> **build 構成時に panic で停止**する。唯一の例外は `harness(core/control) → png(libs/png)`（snapshot fb の
-> PNG encode / crc32。`linkCoreException` で明示）。移行は R8 の遅延方針で、未移設ファイルは `src/` に残す。
+> **build 構成時に panic で停止**する。例外は `harness(core/control) → png(libs/png)`（snapshot fb の
+> PNG encode / crc32）と `harness → dsp`（digest audio のスペクトル解析。TASK-92）の 2 つのみ
+> （いずれも `linkCoreException` で明示）。移行は R8 の遅延方針で、未移設ファイルは `src/` に残す。
 
 ## クイックスタート
 
@@ -473,7 +474,7 @@ snapshot fb  /tmp/out.png  # 直近 present フレームを PNG 保存（省略�
 snapshot audio /tmp/a.wav  # 直近の audio tap を PCM16 WAV 保存（省略時 audio_<n>.wav）
 snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
-digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n>（mono downmix・自己相関 f0）
+digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n> band_low/mid/high=<0..1> centroid=<Hz> onsets=<n> lufs=<f>（mono downmix・自己相関 f0 + TASK-92: 帯域/セントロイド/オンセット/momentary LUFS。既存 audio への additive。audio2 等の新 probe は作らない）
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...}（JSON 1行）
 digest capabilities        # {"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..},...],"actions":[{"name":..,"desc":..},...]}（登録済み probe・action の内省列挙。TASK-62.4）
 snapshot capabilities /tmp/c.json # capabilities を JSON 保存（省略時 capabilities_<n>.json）
@@ -486,7 +487,11 @@ quit                       # 終了（EOF でも終了）
 ```
 
 - **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `core/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON) / `capabilities`(登録済み probe・action の内省列挙。下記)。
-  `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
+  `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。
+  **TASK-92 拡張（additive・既存キー bit 安定）**: `band_low`/`band_mid`/`band_high`（正規化エネルギー比・合計≈1）/
+  `centroid`[Hz] / `onsets`（スペクトラルフラックスピーク数）/ `lufs`（BS.1770 K-weighting momentary 400ms。無音床値 -99.0）。
+  AC 判断: 新 probe 名（audio2 等）は作らず既存 `audio` にキーを足す。解析は digest 要求時のみ（RT 経路不変）。
+  `virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
 - **capabilities（内省 probe / TASK-62.4）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み4件（`fb`/`audio`/`stats`/`capabilities` 自身。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
   - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 32 + 組み込み4）と desc の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
   - 将来クライアント（TASK-62.3 network discover 等）が「今このアプリで何を観測・操作できるか」を discover する入口になる。

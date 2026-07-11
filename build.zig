@@ -51,7 +51,7 @@ fn link(consumer: TaggedModule, dep: TaggedModule) void {
         .kit => dep.layer == .core or dep.layer == .lib,
         // libs は libs 同士 + type-only な core module（platform_types）のみ（R2）。
         .lib => dep.layer == .lib or (dep.layer == .core and dep.type_only),
-        // core は core 同士のみ（唯一の例外 harness→png は linkCoreException 経由）。
+        // core は core 同士のみ（例外 harness→png / harness→dsp は linkCoreException 経由）。
         .core => dep.layer == .core,
     };
     if (!ok) std.debug.panic(
@@ -61,9 +61,10 @@ fn link(consumer: TaggedModule, dep: TaggedModule) void {
     consumer.mod.addImport(dep.name, dep.mod);
 }
 
-/// core → libs の明示例外。現状 harness(core/control) → png(libs/png) の 1 箇所のみ
-/// （snapshot fb の PNG encode / crc32 のため。png は依存ゼロの純 Zig 葉 lib で headless 性を
-/// 壊さない）。新たな例外を足す場合は ADR-007 の改訂を伴うこと。
+/// core → libs の明示例外。現状:
+///   - harness(core/control) → png(libs/png)（snapshot fb の PNG encode / crc32）
+///   - harness(core/control) → dsp（digest audio のスペクトル解析 band/centroid/onset。TASK-92）
+/// 新たな例外を足す場合は ADR-007 の改訂を伴うこと。
 fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .core and dep.layer == .lib);
@@ -362,6 +363,7 @@ pub fn build(b: *std.Build) void {
     harness_test_mod.addImport("png", shared_modules.png.mod); // harness が encodePNG/crc32 を使う
     harness_test_mod.addImport("platform_types", shared_modules.types.mod); // harness が Event/EventStats 等を使う
     harness_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod); // harness の `capture` コマンド/probe が使う（TASK-49.5）
+    harness_test_mod.addImport("dsp", shared_modules.dsp.mod); // TASK-92: digest audio スペクトル解析（band/centroid/onset）
     const harness_test = b.addTest(.{ .root_module = harness_test_mod });
     const run_harness_test = b.addRunArtifact(harness_test);
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
@@ -1696,7 +1698,7 @@ const SharedModules = struct {
             .root_source_file = b.path("core/control/harness.zig"),
             .link_libc = true,
         }) };
-        linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の唯一の例外");
+        linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");
         link(harness, types);
         // 公開 platform module（addModule "platform"）も harness 経由になるため伝播。
         link(platform_mod, harness);
@@ -1745,6 +1747,9 @@ const SharedModules = struct {
         const dsp: TaggedModule = .{ .layer = .lib, .name = "dsp", .mod = b.createModule(.{
             .root_source_file = b.path("src/dsp/dsp.zig"),
         }) };
+        // TASK-92: digest audio の band/centroid/onset が magnitudeSpectrum を使う。
+        // harness は dsp 定義後に link（png と同様 linkCoreException。ADR-007 追記済み）。
+        linkCoreException(harness, dsp, "digest audio のスペクトル解析（band/centroid/onset）");
 
         // synth (L3): Voice/VoicePool/Patch/Synth + GUI⇔Audio 受け渡し機構。dsp に依存。
         const synth: TaggedModule = .{ .layer = .lib, .name = "synth", .mod = b.createModule(.{
