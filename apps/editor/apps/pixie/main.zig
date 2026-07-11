@@ -353,6 +353,8 @@ const App = struct {
     edit_v: f32 = 0,
     /// HSV を同期済みの selected。null/不一致なら再同期。
     edit_synced_for: ?usize = null,
+    /// UI Repl 用: スウォッチ選択時点の色（applyEditColor で swatch が変わっても from を保持。TASK-89）。
+    repl_source: ?u32 = null,
     running: bool = true,
     /// 現在の PNG 保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
     current_path: ?[]u8 = null,
@@ -557,6 +559,59 @@ const App = struct {
         self.brush.color = color;
         self.fill.color = color;
         self.edit_synced_for = null;
+    }
+
+    /// App.palette.colors → doc.palette へ同期（.pix encode / netsync export 前。TASK-89）。
+    fn syncPaletteToDoc(self: *App) void {
+        self.doc.palette.clearRetainingCapacity();
+        self.doc.palette.ensureTotalCapacity(self.gpa, self.palette.colors.items.len) catch @panic("syncPaletteToDoc: OOM");
+        for (self.palette.colors.items) |c| self.doc.palette.appendAssumeCapacity(c);
+    }
+
+    /// doc.palette → App.palette 再構築（空なら DB16。load / netsync import 後。TASK-89）。
+    fn loadPaletteFromDoc(self: *App) void {
+        self.palette.colors.clearRetainingCapacity();
+        if (self.doc.palette.items.len == 0) {
+            // DB16 初期化（initDb16 と同内容・既存 gpa の colors を再利用）
+            self.palette.colors.ensureTotalCapacity(self.gpa, palette_mod.db16.len) catch @panic("loadPaletteFromDoc: OOM");
+            for (palette_mod.db16) |rgb| self.palette.colors.appendAssumeCapacity(palette_mod.rgbToCanvas(rgb));
+        } else {
+            self.palette.colors.ensureTotalCapacity(self.gpa, self.doc.palette.items.len) catch @panic("loadPaletteFromDoc: OOM");
+            for (self.doc.palette.items) |c| self.palette.colors.appendAssumeCapacity(c);
+        }
+        self.palette.selected = 0;
+        const c = self.palette.current();
+        self.pen.color = c;
+        self.brush.color = c;
+        self.fill.color = c;
+        self.edit_synced_for = null;
+        self.repl_source = null;
+    }
+
+    /// パレット色列を全置換する（palette_set / palette_ramp / palette_from_png 共通。undo 対象外）。
+    fn doReplacePalette(self: *App, colors: []const u32) void {
+        std.debug.assert(colors.len >= 1);
+        self.palette.colors.clearRetainingCapacity();
+        self.palette.colors.ensureTotalCapacity(self.gpa, colors.len) catch @panic("doReplacePalette: OOM");
+        for (colors) |c| self.palette.colors.appendAssumeCapacity(c);
+        self.palette.select(0); // clamp selected
+        const cur = self.palette.current();
+        self.pen.color = cur;
+        self.brush.color = cur;
+        self.fill.color = cur;
+        self.edit_synced_for = null;
+        self.repl_source = null;
+    }
+
+    /// 指定 layer の from→to 色置換（UI Repl / action replace_color。undo 可 = .paint Op）。
+    /// layer_idx は呼び出し側が resolve（action は layer ref、UI は selected）。
+    fn doReplaceColor(self: *App, layer_idx: usize, from: u32, to: u32) !u32 {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (layer_idx >= self.doc.layers.items.len) return error.OutOfRange;
+        if (self.doc.layers.items[layer_idx].kind == .text) return error.TextLayerSelected;
+        return self.doc.pushReplaceColor(self.gpa, layer_idx, from, to) catch |err| switch (err) {
+            error.TextLayerSelected => return error.TextLayerSelected,
+        };
     }
 
     /// undo op の所有者タグ（`UndoStack.owners` の pixie 規約。TASK-62.5.4 review 反映:
@@ -856,6 +911,11 @@ const App = struct {
         self.palette.colors = colors;
         self.palette.selected = 0;
         self.edit_synced_for = null; // 次フレームで HSV 再同期
+        self.repl_source = null;
+        const cur = self.palette.current();
+        self.pen.color = cur;
+        self.brush.color = cur;
+        self.fill.color = cur;
         self.setSaveMsg("Palette loaded: {s}", .{std.fs.path.basename(path)});
     }
 
@@ -956,6 +1016,7 @@ const App = struct {
     /// 記憶している .pix 保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
     fn doSaveProject(self: *App) void {
         const path = self.current_project_path orelse return self.doSaveAsProject();
+        self.syncPaletteToDoc();
         core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             return;
@@ -973,6 +1034,7 @@ const App = struct {
             return;
         };
         const path = maybe orelse return; // キャンセル: サイレント no-op
+        self.syncPaletteToDoc();
         core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
@@ -1016,6 +1078,7 @@ const App = struct {
         // 追加のリセットは不要（TASK-45.1。旧コードの独立 `app.undo` フィールドは廃止済み）。
         self.canvas.clearSelection();
         self.sel_in.discardFloat(self.gpa);
+        self.loadPaletteFromDoc();
         self.syncPreviewCanvas();
         if (self.current_project_path) |old| self.gpa.free(old);
         self.current_project_path = path; // 移譲
@@ -1754,6 +1817,68 @@ fn diffDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
+/// palette digest（TASK-89）: パレット色数 / canvas 一意色数 / 上位 4 色（fb top 書式整合）。
+/// イベント時のみ（compositeStraight + AutoHashMap ヒストグラム）。
+fn paletteDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const flat = app.canvas.compositeStraight();
+    const n = flat.len;
+    var counts = std.AutoHashMap(u32, u32).init(app.gpa);
+    defer counts.deinit();
+    for (flat) |p| {
+        // 完全透明は used に含めない（表示色統計）
+        if (p & 0xFF000000 == 0) continue;
+        const c = 0xFF000000 | (p & 0x00FFFFFF);
+        const gop = counts.getOrPut(c) catch return buf[0..0];
+        if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+    }
+    const used = counts.count();
+    // 上位 4 色（count 降順・同数は color 昇順）
+    const Top = struct { color: u32 = 0, count: u32 = 0 };
+    var top = [_]Top{.{}} ** 4;
+    const better = struct {
+        fn f(a: Top, b: Top) bool {
+            return a.count > b.count or (a.count == b.count and a.color < b.color);
+        }
+    }.f;
+    var it = counts.iterator();
+    while (it.next()) |e| {
+        const cand = Top{ .color = e.key_ptr.*, .count = e.value_ptr.* };
+        if (better(cand, top[0])) {
+            top[3] = top[2];
+            top[2] = top[1];
+            top[1] = top[0];
+            top[0] = cand;
+        } else if (better(cand, top[1])) {
+            top[3] = top[2];
+            top[2] = top[1];
+            top[1] = cand;
+        } else if (better(cand, top[2])) {
+            top[3] = top[2];
+            top[2] = cand;
+        } else if (better(cand, top[3])) {
+            top[3] = cand;
+        }
+    }
+    var len: usize = 0;
+    len += (std.fmt.bufPrint(buf[len..], "colors={d} used={d} top=[", .{
+        app.palette.colors.items.len, used,
+    }) catch return buf[0..0]).len;
+    // 分母は全画素（透明含む）で fb digest と同じ % 規約
+    var first = true;
+    for (top) |t| {
+        if (t.count == 0) continue;
+        const pct = if (n == 0) 0 else @as(u64, t.count) * 100 / n;
+        const sep = if (first) "" else ",";
+        first = false;
+        len += (std.fmt.bufPrint(buf[len..], "{s}#{X:0>6}:{d}%", .{
+            sep, t.color & 0xFFFFFF, pct,
+        }) catch break).len;
+    }
+    len += (std.fmt.bufPrint(buf[len..], "]", .{}) catch return buf[0..len]).len;
+    return buf[0..len];
+}
+
 /// compositeStraight を diff_base へコピー（未確保なら alloc）。借用スライスは保持しない。
 fn copyCompositeToDiffBase(app: *App) !void {
     const n = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
@@ -1866,6 +1991,11 @@ fn historySnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
 //   stroke              activeTool().onEvent 直接 yes  EditingBlocked / UnsupportedTool / parse系
 //   save                doSaveTo                no    savePNG の元 error
 //   open                doOpenPath              no    EditingBlocked / decode 系
+//   replace_color       doReplaceColor(layer)   yes*  EditingBlocked / TextLayer / OutOfRange / IdRequired / parse系
+//                                                      args=`[#id|idx] from to`（省略時 selected。netsync 中は #id 必須）
+//   palette_ramp        doReplacePalette        no    parse系（パレット変更は undo 対象外。.reject_when_synced）
+//   palette_from_png    doReplacePalette        no    EmptyPalette / decode 系（.reject_when_synced）
+//   palette_set         doReplacePalette        no    parse系（.reject_when_synced）
 //
 //   * before==after の冪等呼び出しは push 無し（既存 UI のスライダー/チェックボックス挙動と同じ）。
 //
@@ -2196,7 +2326,54 @@ fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Al
     return recipe.collectNormalEntries(gpa, views_buf[0..n]);
 }
 
-/// `diff_mark`: 現在の composite を差分基準にコピー。記録しないメタ操作（TASK-87）。
+/// `replace_color [#<id>|<index>] <from> <to>`（layer 省略時 selected。netsync 中は #id 必須。TASK-89）。
+fn actionReplaceColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    const p = try actions.parseReplaceColor(args);
+    const layer_idx: usize = if (p.layer) |ref|
+        try resolveLayerRef(app, ref, true)
+    else blk: {
+        // 省略 = selected。netsync 中は peer ごとに selected が違うため #id 必須。
+        if (platform.netsyncActive()) {
+            platform.setActionErrorDetail("id_required", "use #<id> from digest canvas during netsync");
+            return error.IdRequired;
+        }
+        break :blk app.canvas.selected_layer;
+    };
+    const n = try app.doReplaceColor(layer_idx, p.from, p.to);
+    return std.fmt.bufPrint(buf, "ok replaced={d}", .{n}) catch return error.ArgsTooLong;
+}
+
+fn actionPaletteRamp(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const p = try actions.parsePaletteRamp(args);
+    var ramp: [palette_mod.MAX_RAMP_N]u32 = undefined;
+    palette_mod.generateRamp(p.seed, p.n, ramp[0..p.n]);
+    app.doReplacePalette(ramp[0..p.n]);
+    return std.fmt.bufPrint(buf, "ok colors={d}", .{p.n}) catch return error.ArgsTooLong;
+}
+
+fn actionPaletteFromPng(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+    var img = try png.decodePNGFile(app.io, app.gpa, path);
+    defer img.deinit(app.gpa);
+    const colors = try palette_mod.extractColorsByFrequency(app.gpa, img.pixels, palette_mod.MAX_PALETTE_COLORS);
+    defer app.gpa.free(colors);
+    if (colors.len == 0) return error.EmptyPalette;
+    app.doReplacePalette(colors);
+    return std.fmt.bufPrint(buf, "ok colors={d}", .{colors.len}) catch return error.ArgsTooLong;
+}
+
+fn actionPaletteSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    var color_buf: [actions.MAX_PALETTE_SET]u32 = undefined;
+    const colors = try actions.parsePaletteSet(args, &color_buf);
+    app.doReplacePalette(colors);
+    return std.fmt.bufPrint(buf, "ok colors={d}", .{colors.len}) catch return error.ArgsTooLong;
+}
+
 fn actionDiffMark(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     try actions.parseNoArgs(args);
@@ -2295,6 +2472,11 @@ const PIXIE_ACTIONS = [_]ActionEntry{
     .{ .name = "stroke", .run = actionStroke },
     .{ .name = "save", .run = actionSave },
     .{ .name = "open", .run = actionOpen },
+    // TASK-89: 末尾追加のみ（並列制約）
+    .{ .name = "replace_color", .run = actionReplaceColor },
+    .{ .name = "palette_ramp", .run = actionPaletteRamp },
+    .{ .name = "palette_from_png", .run = actionPaletteFromPng },
+    .{ .name = "palette_set", .run = actionPaletteSet },
 };
 
 /// `App.cmd_exec` の Dispatcher: name→実ハンドラ dispatch + noteUndo 配線（§5b）。
@@ -2366,13 +2548,23 @@ fn canonicalizeLayerArgs(app: *App, comptime name: []const u8, args: []const u8,
         std.mem.eql(u8, name, "delete_layer") or
         std.mem.eql(u8, name, "duplicate_layer") or
         std.mem.eql(u8, name, "merge_down") or
-        std.mem.eql(u8, name, "move_layer"));
+        std.mem.eql(u8, name, "move_layer") or
+        std.mem.eql(u8, name, "replace_color"));
     if (!is_layer) return args;
 
     // select_layer は .local_only なので netsync 中も index→id 補完を許容。relay 系は禁止。
     const can_fill = (comptime std.mem.eql(u8, name, "select_layer")) or actions.allowLayerCanonFill(platform.netsyncActive());
     const forbid_fill = !can_fill;
 
+    if (comptime std.mem.eql(u8, name, "replace_color")) {
+        // `#id RRGGBB RRGGBB` に正規化（.relay で peer が同一 layer に適用するため）。
+        const p = try actions.parseReplaceColor(args);
+        const id: u64 = if (p.layer) |ref|
+            try layerRefToId(app, ref, forbid_fill)
+        else
+            try selectedLayerIdRaw(app, forbid_fill);
+        return std.fmt.bufPrint(buf, "#{d} {X:0>6} {X:0>6}", .{ id, p.from & 0xFFFFFF, p.to & 0xFFFFFF }) catch return error.ArgsTooLong;
+    }
     if (comptime std.mem.eql(u8, name, "select_layer")) {
         const ref = try actions.parseLayerRef(args);
         const id = try layerRefToId(app, ref, false);
@@ -2524,6 +2716,22 @@ const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
 const pixie_args_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path" },
 };
+// TASK-89 args
+const pixie_args_replace_color: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。netsync 中は #id 必須" },
+    .{ .name = "from", .kind = "string", .pattern = "#?RRGGBB" },
+    .{ .name = "to", .kind = "string", .pattern = "#?RRGGBB" },
+};
+const pixie_args_palette_ramp: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "seed", .kind = "string", .pattern = "#?RRGGBB" },
+    .{ .name = "n", .kind = "int", .min = 2, .max = 32 },
+};
+const pixie_args_palette_from_png: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "path", .kind = "path" },
+};
+const pixie_args_palette_set: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "hex", .kind = "string", .pattern = "#?RRGGBB", .variadic = true, .desc = "1..=64 色" },
+};
 
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
@@ -2554,10 +2762,17 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only, .args = pixie_args_path });
     // diff_mark（TASK-87）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "diff_mark", .ctx = app, .run = actionDiffMark, .network_policy = .local_only, .desc = "mark current composite as diff baseline", .args = pixie_args_none });
+    // TASK-89: 末尾追加のみ（並列制約。既存行の変更・並べ替え禁止）
+    platform.registerAction(.{ .name = "replace_color", .ctx = app, .run = recordedAction("replace_color", .record), .network_policy = .relay, .desc = "replace color A→B on layer ([#id|idx] from to; undoable)", .args = pixie_args_replace_color });
+    // palette は document 状態（SYNC 対象）なので session 中のローカル変更は diverge → reject_when_synced
+    platform.registerAction(.{ .name = "palette_ramp", .ctx = app, .run = recordedAction("palette_ramp", .record), .network_policy = .reject_when_synced, .desc = "OKLCH light-dark ramp from seed (n=2..32)", .args = pixie_args_palette_ramp });
+    platform.registerAction(.{ .name = "palette_from_png", .ctx = app, .run = recordedAction("palette_from_png", .record), .network_policy = .reject_when_synced, .desc = "extract palette from PNG by frequency (max 64)", .args = pixie_args_palette_from_png });
+    platform.registerAction(.{ .name = "palette_set", .ctx = app, .run = recordedAction("palette_set", .record), .network_policy = .reject_when_synced, .desc = "replace palette with hex list (1..64)", .args = pixie_args_palette_set });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
+    app.syncPaletteToDoc();
     return core.document_io.encodeDocument(&app.doc, allocator);
 }
 
@@ -2576,6 +2791,7 @@ fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     app.canvas = app.doc.activeCanvas();
     app.clampTimelineTarget();
     app.applySystemFont();
+    app.loadPaletteFromDoc();
     app.canvas.clearSelection();
     app.sel_in.discardFloat(app.gpa);
     app.syncPreviewCanvas();
@@ -3287,6 +3503,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
                         .size = 22,
                     }).clicked) {
                         app.palette.select(idx); // HSV は次フレームで再同期
+                        app.repl_source = app.palette.current(); // Repl の from を選択時点色に固定（TASK-89）
                         if (app.active_kind == .eraser) app.setActiveKind(.pen); // 色は pen 用（brush/bezier は維持）
                     }
                     idx += 1;
@@ -3304,6 +3521,24 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
             // edit_synced_for を無効化し、次フレームで現 current 色から HSV 再同期する
             // （さもないと applyEditColor が旧 HSV で新色を上書きする）。
             app.edit_synced_for = null;
+            app.repl_source = null;
+        }
+        // TASK-89: 選択スウォッチ選択時色 → 現在 HSV 編集色に canvas 置換 + swatch 更新
+        // netsync 中は peer の selected が違うと diverge するため拒否（fill と同型ガード。TASK-94 Phase C）
+        if (ctx.buttonEx("Repl", .{ .min_w = 36 }).clicked) {
+            if (platform.netsyncActive()) {
+                app.setSaveMsg("netsync: Repl unavailable (use replace_color with #id)", .{});
+            } else {
+                const to: u32 = @bitCast(gui.Color.fromHsv(app.edit_h, app.edit_s, app.edit_v));
+                const from = app.repl_source orelse app.palette.current();
+                _ = app.doReplaceColor(app.canvas.selected_layer, from, to) catch {};
+                app.palette.setSelectedColor(to);
+                app.pen.color = to;
+                app.brush.color = to;
+                app.fill.color = to;
+                app.edit_synced_for = null;
+                app.repl_source = to;
+            }
         }
         ctx.endBox();
 
@@ -3525,6 +3760,8 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
     platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest }); // TASK-62.5.5 正式 schema
     platform.registerProbe(.{ .name = "diff", .ctx = &app, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" }); // TASK-87
+    // TASK-89: 末尾追加のみ（並列制約）
+    platform.registerProbe(.{ .name = "palette", .ctx = &app, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
     registerActions(&app);
     registerStateSync(&app);

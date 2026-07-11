@@ -1,20 +1,26 @@
-//! document_io — Document の直列化（.pix プロジェクトファイル v3 schema）と PNG 連番書き出し
-//! （TASK-63 で v1 導入・TASK-45.1 で v2 セルグリッド schema へ全面改訂・TASK-94 で v3=LayerId）。
+//! document_io — Document の直列化（.pix プロジェクトファイル v4 schema）と PNG 連番書き出し
+//! （TASK-63 で v1 導入・TASK-45.1 で v2 セルグリッド schema へ全面改訂・TASK-94 で v3=LayerId・
+//! TASK-89 で v4=PLTE パレット）。
 //!
 //! 62.2 の `serde` versioned container（RIFF/IFF 系統）に pixie の schema を載せる。
 //! serde が「コンテナ（magic/version/chunk/CRC）」を、この module が「pixie schema
-//! （DOCH/LAYR/FRAM/CEL）」を担う。serde は file I/O を持たないので、実 I/O は
+//! （DOCH/LAYR/FRAM/CEL/PLTE）」を担う。serde は file I/O を持たないので、実 I/O は
 //! ここで `std.Io` 経由に行う（既存 io_png.savePNG と同じ流儀）。
 //!
-//! **schema v3（`schema_version = 3`、現行 write）**: LayerId（安定 handle）と `next_layer_id`
-//! を永続化（TASK-94 Phase A）。netsync SYNC も本 module 経由のため、全 peer の id が一致する。
+//! **schema v4（`schema_version = 4`、現行 write）**: 任意 chunk `PLTE`（count u16 + u32×N）で
+//! Document.palette を永続化（TASK-89）。空 palette は chunk 省略。v3 以前 read は palette 空。
+//! netsync SYNC も本 module 経由のため palette も自動同期。
+//! **互換**: v4 reader は schema 2/3/4 を読む（後方互換）。旧 reader（max schema=3）は
+//! `ver > schema_version` で v4 を拒否する（前方互換ではない＝v4 ファイルを v3 reader は読めない）。
+//!
+//! **schema v3（read 互換）**: LayerId（安定 handle）と `next_layer_id` を永続化（TASK-94 Phase A）。
 //!
 //! **schema v2（read 互換）**: LayerDef を Document レベルへ（TASK-45.1）、cel の実体は grid と
 //! 分離して CEL チャンクへ1回だけ書く。**id 無し**のため load 時に layer 順で決定的採番する
 //! （`next_layer_id = layer_count+1`）。
 //!
 //! 旧 v1（`frames:[]*Canvas`、LAYR に pixels を直接埋め込む形式）の読み込み互換は**実装しない**
-//! （破壊的変更。backlog task-45.1 plan §6.3/§9.7）。`decodeDocument` は schema 2/3 のみ受理し、
+//! （破壊的変更。backlog task-45.1 plan §6.3/§9.7）。`decodeDocument` は schema 2/3/4 を受理し、
 //! それ以外（v1・将来超過）は `error.UnsupportedSchemaVersion` で拒否する。
 //!
 //! フォーマット（streaming walk。すべて little-endian）:
@@ -33,6 +39,7 @@
 //!   | grid[layer_count](u32 each, LE. 0xFFFFFFFF=無し・それ以外=シリアルID)
 //! - CEL(K回・全FRAMの後にまとめて。K=ユニーク参照cel数・4B+W*H*4B): compression u8(0=raw)
 //!   | pad[3] | pixels[W*H*4](canonical BGRA u32 の raw bytes, row-major)
+//! - PLTE(任意・v4・CEL の後): count u16(LE) | colors[count] u32(LE each, canonical BGRA)
 //!
 //! **シリアルID圧縮**（ファイル内表現のみ。in-memory の `CelId`/`CelSetSnapshot` とは別物）:
 //! encode は「FRAM を frame 順・各 frame は layer 順に走査した時の初出順」で 0 から
@@ -51,7 +58,7 @@
 //!   余剰 CEL は許容（load後 refcount=0 として自動回収）。
 //! - 同一シリアルID（＝同一 CelId）が異なる複数の layer の grid から参照されている
 //!   → `error.CrossLayerCelShare`（cel の共有は layer 内に閉じるという設計前提の保護。plan 4.3節）。
-//! - `DOCH` 欠落/重複・`schema_version` が 2/3 以外は拒否。
+//! - `DOCH` 欠落/重複・`schema_version` が 2/3/4 以外は拒否。
 //!
 //! ホットパス宣言: 保存・読込・書き出しは **イベント時のみ**（メニュー操作 1 回）。全画素規模だが
 //! フレーム毎ループではないため SIMD 3 点セット対象外。pixel payload は @memcpy 一括転送
@@ -72,10 +79,14 @@ const CelId = document_mod.CelId;
 /// .pix の magic（FourCC 'PIX1' の little-endian u32）。serde の expected_magic に渡す。
 pub const magic: u32 = @as(u32, 'P') | (@as(u32, 'I') << 8) | (@as(u32, 'X') << 16) | (@as(u32, '1') << 24);
 /// pixie schema のバージョン（serde の container_version とは別。app 管理）。
-/// TASK-45.1 で v2・TASK-94 で v3（LayerId）。write は常に現行版。
-pub const schema_version: u16 = 3;
+/// TASK-45.1 で v2・TASK-94 で v3（LayerId）・TASK-89 で v4（PLTE）。write は常に現行版。
+pub const schema_version: u16 = 4;
 /// 読み込みを受け付ける最古 schema（v2 セルグリッド）。v1 は拒否。
 pub const schema_version_min: u16 = 2;
+/// v3 schema 定数（read 分岐・手書き fixture 用。v2→v3 併置パターン踏襲）。
+pub const schema_version_v3: u16 = 3;
+/// v2 schema 定数。
+pub const schema_version_v2: u16 = 2;
 
 const TAG_DOC: [4]u8 = "DOCH".*;
 const TAG_FRAME: [4]u8 = "FRAM".*;
@@ -83,15 +94,19 @@ const TAG_LAYER: [4]u8 = "LAYR".*;
 const TAG_LAYER_NAME: [4]u8 = "LNAM".*;
 const TAG_LAYER_TEXT: [4]u8 = "LTXT".*;
 const TAG_CEL: [4]u8 = "CELS".*;
+const TAG_PLTE: [4]u8 = "PLTE".*;
 
 const doc_header_size_v2: usize = 28;
-const doc_header_size_v3: usize = 36; // + next_layer_id u64
+const doc_header_size_v3: usize = 36; // + next_layer_id u64（v3/v4 共通）
 const doc_header_size: usize = doc_header_size_v3; // encode 用
 const layer_header_size_v2: usize = 8;
-const layer_header_size_v3: usize = 16; // + id u64
+const layer_header_size_v3: usize = 16; // + id u64（v3/v4 共通）
 const layer_header_size: usize = layer_header_size_v3; // encode 用
 const frame_header_size: usize = 8; // grid[layer_count] はこれに続く可変長部分
 const cel_header_size: usize = 4;
+const plte_header_size: usize = 2; // count u16
+/// PLTE 色数上限（u16 全幅は拒否。DoS / 破損防御。TASK-89 review）。
+const plte_max_colors: usize = 256;
 const layer_type_raster: u8 = 0;
 const layer_type_text: u8 = 1;
 const compression_raw: u8 = 0;
@@ -105,7 +120,7 @@ pub const CanvasSize = struct { w: u32, h: u32 };
 
 // ── encode / decode（bytes ⇔ Document。file I/O なし）─────────────────────
 
-/// Document を .pix バイト列へ直列化する（caller が free）。schema は現行版（v3）で書く。
+/// Document を .pix バイト列へ直列化する（caller が free）。schema は現行版（v4）で書く。
 pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -192,6 +207,18 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
         try w.addChunk(TAG_CEL, buf);
     }
 
+    // PLTE（v4。空 = 未設定なので chunk 省略）。
+    if (doc.palette.items.len > 0) {
+        const n = doc.palette.items.len;
+        const buf = try gpa.alloc(u8, plte_header_size + n * 4);
+        defer gpa.free(buf);
+        std.mem.writeInt(u16, buf[0..2], @intCast(n), .little);
+        for (doc.palette.items, 0..) |c, i| {
+            std.mem.writeInt(u32, buf[plte_header_size + i * 4 ..][0..4], c, .little);
+        }
+        try w.addChunk(TAG_PLTE, buf);
+    }
+
     return w.finish();
 }
 
@@ -204,8 +231,8 @@ fn readU64(b: []const u8) u64 {
 }
 
 /// .pix バイト列から Document を復元する（任意サイズ。size 制限は呼び出し側=pixie 責務）。
-/// schema_version ∈ {2,3} を受理する（v1 / 超過は `error.UnsupportedSchemaVersion`）。
-/// v2（id 無し）は layer 順に決定的採番する（TASK-94）。
+/// schema_version ∈ {2,3,4} を受理する（v1 / 超過は `error.UnsupportedSchemaVersion`）。
+/// v2（id 無し）は layer 順に決定的採番する（TASK-94）。v3 以前は palette 空。
 pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
     const container = try serde.Container.parse(bytes, magic);
     const ver = container.schemaVersion();
@@ -316,6 +343,20 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
             @memcpy(std.mem.sliceAsBytes(pixels), p[cel_header_size..]);
             try doc.cel_pool.append(gpa, .{ .pixels = pixels, .refcount = 0 });
             doc.next_cel_id += 1;
+            last_layer_idx = null;
+        } else if (std.mem.eql(u8, &chunk.tag, &TAG_PLTE)) {
+            // v4 パレット（v3 以前ファイルには無い。複数 PLTE は後勝ちで置き換え）。
+            const p = chunk.payload;
+            if (p.len < plte_header_size) return error.CorruptPalette;
+            const count: usize = std.mem.readInt(u16, p[0..2], .little);
+            if (count > plte_max_colors) return error.CorruptPalette;
+            if (p.len != plte_header_size + count * 4) return error.CorruptPalette;
+            doc.palette.clearRetainingCapacity();
+            try doc.palette.ensureTotalCapacity(gpa, count);
+            for (0..count) |i| {
+                const c = readU32(p[plte_header_size + i * 4 ..][0..4]);
+                doc.palette.appendAssumeCapacity(c);
+            }
             last_layer_idx = null;
         } else {
             last_layer_idx = null;
@@ -1120,4 +1161,107 @@ test "file I/O: saveDocument→loadDocument 往復 + サイズ拒否 + exportPng
     }
     const flat = c.compositeStraight();
     try testing.expectEqualSlices(u32, flat, png_img.pixels);
+}
+
+// ── TASK-89: v4 PLTE ──────────────────────────────────────────────────
+
+test "v4 PLTE: palette round-trip" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 2, 2);
+    defer doc.deinit();
+    try doc.palette.append(gpa, 0xFFFF0000);
+    try doc.palette.append(gpa, 0xFF00FF00);
+    try doc.palette.append(gpa, 0xFF0000FF);
+
+    const bytes = try encodeDocument(&doc, gpa);
+    defer gpa.free(bytes);
+    // 現行 write は schema v4
+    const container = try serde.Container.parse(bytes, magic);
+    try testing.expectEqual(schema_version, container.schemaVersion());
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 3), loaded.palette.items.len);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), loaded.palette.items[0]);
+    try testing.expectEqual(@as(u32, 0xFF00FF00), loaded.palette.items[1]);
+    try testing.expectEqual(@as(u32, 0xFF0000FF), loaded.palette.items[2]);
+}
+
+test "v3 読み: palette は空（PLTE 無し）" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version_v3);
+    defer w.deinit();
+    const doch = docChunkV3(2, 2, 1, 1, 0, 0, 2);
+    try w.addChunk(TAG_DOC, &doch);
+    const lay = layerChunkV3(layer_type_raster, true, 255, 1);
+    try w.addChunk(TAG_LAYER, &lay);
+    const frm = try frameChunk(gpa, 0, 100, &.{grid_none});
+    defer gpa.free(frm);
+    try w.addChunk(TAG_FRAME, frm);
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 0), loaded.palette.items.len);
+    try testing.expectEqual(@as(usize, 1), loaded.layers.items.len);
+}
+
+test "v4: 空 palette は PLTE 省略・round-trip で空" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 2, 2);
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 0), doc.palette.items.len);
+    const bytes = try encodeDocument(&doc, gpa);
+    defer gpa.free(bytes);
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 0), loaded.palette.items.len);
+}
+
+test "未知 chunk 後も PLTE を読む（同一 schema 内の tag skip）" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(2, 2, 1, 1, 0, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const lay = layerChunk(layer_type_raster, true, 255);
+    try w.addChunk(TAG_LAYER, &lay);
+    const frm = try frameChunk(gpa, 0, 100, &.{grid_none});
+    defer gpa.free(frm);
+    try w.addChunk(TAG_FRAME, frm);
+    try w.addChunk("XxYy".*, "future");
+    var plte: [2 + 4]u8 = undefined;
+    std.mem.writeInt(u16, plte[0..2], 1, .little);
+    std.mem.writeInt(u32, plte[2..6], 0xFFAABBCC, .little);
+    try w.addChunk(TAG_PLTE, &plte);
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 1), loaded.palette.items.len);
+    try testing.expectEqual(@as(u32, 0xFFAABBCC), loaded.palette.items[0]);
+}
+
+test "PLTE: 256 色超は CorruptPalette" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, schema_version);
+    defer w.deinit();
+    const doch = docChunk(1, 1, 1, 1, 0, 0);
+    try w.addChunk(TAG_DOC, &doch);
+    const lay = layerChunk(layer_type_raster, true, 255);
+    try w.addChunk(TAG_LAYER, &lay);
+    const frm = try frameChunk(gpa, 0, 100, &.{grid_none});
+    defer gpa.free(frm);
+    try w.addChunk(TAG_FRAME, frm);
+    const count: u16 = 257;
+    const plte = try gpa.alloc(u8, 2 + @as(usize, count) * 4);
+    defer gpa.free(plte);
+    std.mem.writeInt(u16, plte[0..2], count, .little);
+    @memset(plte[2..], 0);
+    try w.addChunk(TAG_PLTE, plte);
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+    try testing.expectError(error.CorruptPalette, decodeDocument(bytes, gpa));
 }

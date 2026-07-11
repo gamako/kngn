@@ -362,6 +362,9 @@ pub const Document = struct {
     active_view: Canvas,
     undo: UndoStack = .{},
     allocator: Allocator,
+    /// ドキュメント付属パレット（TASK-89）。空 = 未設定（load 時 DB16 等で初期化は app 側）。
+    /// selected は view 状態なので永続化しない。色は canonical BGRA 0xAARRGGBB。
+    palette: std.ArrayList(u32) = .empty,
 
     /// 1 layer / 1 frame（blank）の Document を作る。App 起動時の初期状態。
     pub fn init(gpa: Allocator, w: u32, h: u32) !Document {
@@ -412,6 +415,7 @@ pub const Document = struct {
         self.frames.deinit(self.allocator);
         self.grid.deinit(self.allocator);
         self.undo.deinit(self.allocator);
+        self.palette.deinit(self.allocator);
         self.active_view.deinit();
     }
 
@@ -698,6 +702,30 @@ pub const Document = struct {
         @memset(pixels, 0);
         const owned = diffs.toOwnedSlice(gpa) catch @panic("Document.pushClear: OOM");
         try self.pushPaintOp(gpa, layer_idx, owned);
+    }
+
+    /// 選択中 layer の現フレームで色 `from` を `to` に一括置換する（TASK-89）。
+    /// 全一致比較・tolerance なし（ドット絵前提）。`from==to` または 0 画素は no-op（Op を積まない）。
+    /// 戻り値 = 置換画素数。イベント時のみ（フレーム毎ループではない）。
+    pub fn pushReplaceColor(self: *Document, gpa: Allocator, layer_idx: usize, from: u32, to: u32) error{TextLayerSelected}!u32 {
+        if (from == to) return 0;
+        if (self.layers.items[layer_idx].kind == .text) return error.TextLayerSelected;
+        const pixels = self.active_view.layerPixels(layer_idx);
+        var diffs: std.ArrayList(PixelDiff) = .empty;
+        diffs.ensureTotalCapacity(gpa, pixels.len) catch @panic("Document.pushReplaceColor: OOM");
+        for (pixels, 0..) |p, i| {
+            if (p != from) continue;
+            diffs.appendAssumeCapacity(.{ .idx = @intCast(i), .before = p, .after = to });
+        }
+        if (diffs.items.len == 0) {
+            diffs.deinit(gpa);
+            return 0;
+        }
+        const count: u32 = @intCast(diffs.items.len);
+        for (diffs.items) |d| pixels[d.idx] = to;
+        const owned = diffs.toOwnedSlice(gpa) catch @panic("Document.pushReplaceColor: OOM");
+        try self.pushPaintOp(gpa, layer_idx, owned);
+        return count;
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1981,4 +2009,61 @@ test "LayerId: duplicateLayer は新規 id / reset 後も next_layer_id は単�
     try testing.expect(doc.layerIdAt(0).? != .invalid);
     try testing.expect(doc.next_layer_id > before_reset);
     try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id0)); // 旧 id は不在
+}
+
+// ── TASK-89: pushReplaceColor ──────────────────────────────────────────
+
+test "pushReplaceColor: 置換→undo で bit 復元 / from==to と 0 画素は no-op" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+    const px = doc.active_view.layerPixels(0);
+    const red: u32 = 0xFFFF0000;
+    const blue: u32 = 0xFF0000FF;
+    // 4 画素を red に
+    try pushTestPaint(&doc, gpa, 0, 0, red);
+    try pushTestPaint(&doc, gpa, 0, 1, red);
+    try pushTestPaint(&doc, gpa, 0, 2, red);
+    try pushTestPaint(&doc, gpa, 0, 3, red);
+    const before = try gpa.dupe(u32, px);
+    defer gpa.free(before);
+
+    // from==to → no-op（Op を積まない）
+    const depth_before = doc.undo.undo.items.len;
+    const n0 = try doc.pushReplaceColor(gpa, 0, red, red);
+    try testing.expectEqual(@as(u32, 0), n0);
+    try testing.expectEqual(depth_before, doc.undo.undo.items.len);
+
+    // 存在しない色 → replaced=0・no-op
+    const n1 = try doc.pushReplaceColor(gpa, 0, 0xFF00FF00, blue);
+    try testing.expectEqual(@as(u32, 0), n1);
+    try testing.expectEqual(depth_before, doc.undo.undo.items.len);
+
+    // 4 画素置換
+    const n2 = try doc.pushReplaceColor(gpa, 0, red, blue);
+    try testing.expectEqual(@as(u32, 4), n2);
+    try testing.expectEqual(blue, px[0]);
+    try testing.expectEqual(blue, px[3]);
+    try testing.expectEqual(depth_before + 1, doc.undo.undo.items.len);
+
+    // undo で bit 復元
+    doc.undoOne(gpa);
+    try testing.expectEqualSlices(u32, before, px);
+}
+
+test "pushReplaceColor: 全画素置換" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 2, 2);
+    defer doc.deinit();
+    const px = doc.active_view.layerPixels(0);
+    @memset(px, 0xFF112233);
+    // pushPaintOp で cel にコミットしてから置換（pushReplaceColor が ensureCelAt する）
+    try doc.pushPaintOp(gpa, 0, blk: {
+        const d = try gpa.alloc(PixelDiff, px.len);
+        for (px, 0..) |p, i| d[i] = .{ .idx = @intCast(i), .before = 0, .after = p };
+        break :blk d;
+    });
+    const n = try doc.pushReplaceColor(gpa, 0, 0xFF112233, 0xFFAABBCC);
+    try testing.expectEqual(@as(u32, 4), n);
+    for (px) |p| try testing.expectEqual(@as(u32, 0xFFAABBCC), p);
 }

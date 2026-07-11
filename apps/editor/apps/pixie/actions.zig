@@ -409,6 +409,84 @@ pub fn parsePath(args: []const u8) ParseError![]const u8 {
     return trimmed;
 }
 
+// ── TASK-89: palette / replace_color パーサ ────────────────────────────
+
+pub const ReplaceColorArgs = struct {
+    /// 省略時は handler が selected layer を使う（netsync 中は #id 必須で reject）。
+    layer: ?LayerRef = null,
+    from: u32,
+    to: u32,
+};
+
+/// 先頭トークンが layer ref か（`#`+十進 = id / 十進のみ = index）。
+/// `#RRGGBB`（hex 色）は十進以外を含むので false → 色トークンとして扱う。
+fn looksLikeLayerRefToken(tok: []const u8) bool {
+    if (tok.len == 0) return false;
+    if (tok[0] == '#') {
+        if (tok.len < 2) return true; // パース時に InvalidNumber
+        for (tok[1..]) |c| {
+            if (c < '0' or c > '9') return false;
+        }
+        return true;
+    }
+    for (tok) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+/// `replace_color [#<id>|<index>] <from> <to>`（layer ref は optional・省略時 selected）。
+/// hex 2 個のみは従来互換。先頭が `#`+十進 or 数値のみなら layer ref と解釈する。
+pub fn parseReplaceColor(args: []const u8) ParseError!ReplaceColorArgs {
+    var it = tokenize(args);
+    const t1 = it.next() orelse return error.Empty;
+    const t2 = it.next() orelse return error.Empty;
+    if (it.next()) |t3| {
+        // 3 トークン: layer ref + from + to
+        if (!looksLikeLayerRefToken(t1)) return error.TooManyTokens;
+        const ref = try parseLayerRefToken(t1);
+        const from = try parseHexColorToken(t2);
+        const to = try parseHexColorToken(t3);
+        try expectExhausted(&it);
+        return .{ .layer = ref, .from = from, .to = to };
+    }
+    // 2 トークン: from + to（従来互換）
+    const from = try parseHexColorToken(t1);
+    const to = try parseHexColorToken(t2);
+    return .{ .layer = null, .from = from, .to = to };
+}
+
+pub const PaletteRampArgs = struct { seed: u32, n: u8 };
+
+/// `palette_ramp <seed_hex> <n>`（n は 2..=32）。
+pub fn parsePaletteRamp(args: []const u8) ParseError!PaletteRampArgs {
+    var it = tokenize(args);
+    const seed_tok = it.next() orelse return error.Empty;
+    const n_tok = it.next() orelse return error.Empty;
+    const seed = try parseHexColorToken(seed_tok);
+    const n_u = std.fmt.parseUnsigned(u8, n_tok, 10) catch return error.InvalidNumber;
+    if (n_u < 2 or n_u > 32) return error.ValueOutOfRange;
+    try expectExhausted(&it);
+    return .{ .seed = seed, .n = n_u };
+}
+
+/// palette_set の色数上限（palette.zig MAX_PALETTE_COLORS と同値。乖離は main の comptime で防ぐ）。
+pub const MAX_PALETTE_SET: usize = 64;
+
+/// `palette_set <hex...>`（1..=64 個・# 任意）→ `buf` に詰めて borrowed slice。
+pub fn parsePaletteSet(args: []const u8, buf: []u32) ParseError![]u32 {
+    var it = tokenize(args);
+    var n: usize = 0;
+    while (it.next()) |tok| {
+        if (n >= buf.len) return error.TooManyTokens;
+        if (n >= MAX_PALETTE_SET) return error.TooManyTokens;
+        buf[n] = try parseHexColorToken(tok);
+        n += 1;
+    }
+    if (n == 0) return error.Empty;
+    return buf[0..n];
+}
+
 /// 引数を取らない action（undo/redo/clear/add_layer/delete_layer）用: trim 後に空であることを
 /// 確認する（余剰トークンは `error.TooManyTokens`。typo を握りつぶさない）。
 pub fn parseNoArgs(args: []const u8) ParseError!void {
@@ -588,6 +666,61 @@ test "finishDigestWithTrunc: 非 trunc は bit 一致 / trunc 時は末尾に tr
     const out = finishDigestWithTrunc(&full, full.len, true);
     try testing.expect(std.mem.endsWith(u8, out, DIGEST_TRUNC_MARKER));
     try testing.expectEqual(@as(usize, full.len), out.len);
+}
+
+test "parseReplaceColor: hex 2 個 / # 任意 / layer ref 省略・付き / 余剰・不足" {
+    const a = try parseReplaceColor("FF0000 00FF00");
+    try testing.expect(a.layer == null);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), a.from);
+    try testing.expectEqual(@as(u32, 0xFF00FF00), a.to);
+    // #RRGGBB は色（layer id ではない）
+    const b = try parseReplaceColor("#aabbcc #112233");
+    try testing.expect(b.layer == null);
+    try testing.expectEqual(@as(u32, 0xFFAABBCC), b.from);
+    try testing.expectEqual(@as(u32, 0xFF112233), b.to);
+    // optional layer ref: #<id> / bare index
+    const c = try parseReplaceColor("#2 FF0000 00FF00");
+    try testing.expectEqual(LayerRef{ .id = 2 }, c.layer.?);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), c.from);
+    try testing.expectEqual(@as(u32, 0xFF00FF00), c.to);
+    const d = try parseReplaceColor("0 aabbcc 112233");
+    try testing.expectEqual(LayerRef{ .index = 0 }, d.layer.?);
+    try testing.expectEqual(@as(u32, 0xFFAABBCC), d.from);
+    try testing.expectError(error.Empty, parseReplaceColor(""));
+    try testing.expectError(error.Empty, parseReplaceColor("FF0000"));
+    // 3 hex 色（先頭が ref に見えない）→ TooManyTokens
+    try testing.expectError(error.TooManyTokens, parseReplaceColor("FF0000 00FF00 0000FF"));
+    try testing.expectError(error.InvalidNumber, parseReplaceColor("GGGGGG 00FF00"));
+    try testing.expectError(error.TooManyTokens, parseReplaceColor("#1 FF0000 00FF00 extra"));
+}
+
+test "parsePaletteRamp: n 2..=32 / 範囲外" {
+    const a = try parsePaletteRamp("336699 8");
+    try testing.expectEqual(@as(u32, 0xFF336699), a.seed);
+    try testing.expectEqual(@as(u8, 8), a.n);
+    try testing.expectError(error.ValueOutOfRange, parsePaletteRamp("336699 1"));
+    try testing.expectError(error.ValueOutOfRange, parsePaletteRamp("336699 33"));
+    try testing.expectError(error.Empty, parsePaletteRamp("336699"));
+    try testing.expectError(error.TooManyTokens, parsePaletteRamp("336699 8 extra"));
+}
+
+test "parsePaletteSet: 1..=64 hex / 空 / 過多" {
+    var buf: [64]u32 = undefined;
+    const one = try parsePaletteSet("FF0000", &buf);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), one[0]);
+    const three = try parsePaletteSet("#FF0000 00FF00 0000FF", &buf);
+    try testing.expectEqual(@as(usize, 3), three.len);
+    try testing.expectError(error.Empty, parsePaletteSet("", &buf));
+    // 65 個 → TooManyTokens（"FF0000 " × 65 ≒ 455B）
+    var many_buf: [512]u8 = undefined;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < 65) : (i += 1) {
+        const part = std.fmt.bufPrint(many_buf[len..], "{s}FF0000", .{if (i == 0) "" else " "}) catch unreachable;
+        len += part.len;
+    }
+    try testing.expectError(error.TooManyTokens, parsePaletteSet(many_buf[0..len], &buf));
 }
 
 test "packDigestEntries: 少エントリは trunc 無し / 多エントリは trunc=1" {
