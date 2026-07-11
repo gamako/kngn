@@ -1,17 +1,28 @@
-//! netsync transport 基盤（TASK-62.3.1）: 持続 TCP 接続・HELLO 握手・フレーム codec・キュー。
+//! netsync transport + PROPOSE/COMMIT/REJECT relay（TASK-62.3.1 / 62.3.2）。
 //!
-//! PROPOSE/COMMIT の semantic routing / action_registry router 登録 / platform 配線は 62.3.2。
-//! 本モジュールは std のみ（ADR-007 core 層。harness/libs 非依存）。
+//! 62.3.1: 持続 TCP・HELLO・フレーム codec・キュー。
+//! 62.3.2: NetworkPolicy router・commitAndBroadcast / proposeToHost・pump 内 semantic 適用。
+//! StateSync / revert undo / command log 統合（remote_commit）は 62.3.3〜62.3.5。
+//! 本モジュールは std のみ（ADR-007 core 層。harness/libs 非依存）。action_registry / command は
+//! 相対 import（harness 経由で同一インスタンスを共有する）。
 //!
 //! ## ホットパス宣言
-//! 全コードは「イベント時のみ」（接続確立・フレーム受信・HELLO 処理）。フレーム毎（全画素）/
-//! RT（毎サンプル）経路には一切触れない。reader/writer/acceptor thread はブロッキング socket I/O
-//! 専用で app 状態に触れない（app 状態に触れるのは main thread の pump のみ＝62.3.2 以降）。
+//! 全コードは「イベント時のみ」（接続確立・フレーム受信・HELLO・PROPOSE/COMMIT 適用）。
+//! `pump()` は毎フレーム呼ばれるが、処理量は inbound pending 件数に比例（空なら即 return）。
+//! フレーム毎の全画素ループ / RT（毎サンプル）には触れない。reader/writer/acceptor は
+//! ブロッキング socket I/O 専用で app 状態に触れない（適用は main thread の pump のみ）。
+//!
+//! ## remote 適用の暫定例外（62.3.2）
+//! wire seq を `ExecuteSource.remote_commit` で流し込まない（client local_only の seq 消費と
+//! StaleRemoteSeq 衝突のため）。共有 executor 経由 `source=.local` + `record_policy=.no_record`。
+//! 62.3.5 で本則へ移行。executor 未設定時は `action_registry.dispatch` fallback。
 
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.Io.net;
 const Io = std.Io;
+const action_registry = @import("action_registry.zig");
+const command = @import("command.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -151,6 +162,70 @@ pub fn formatHostHello(buf: []u8, peer_id: u32) ![]const u8 {
     return std.fmt.bufPrint(buf, "host {d} {d}", .{ PROTOCOL_VERSION, peer_id });
 }
 
+/// `"<name> <args>"` または `"<name>"` を分割（name=最初の空白まで、args=残り）。
+pub fn splitNameArgs(s: []const u8) struct { name: []const u8, args: []const u8 } {
+    const t = std.mem.trim(u8, s, &std.ascii.whitespace);
+    if (t.len == 0) return .{ .name = "", .args = "" };
+    if (std.mem.indexOfScalar(u8, t, ' ')) |i| {
+        return .{ .name = t[0..i], .args = t[i + 1 ..] };
+    }
+    return .{ .name = t, .args = "" };
+}
+
+pub fn formatProposePayload(buf: []u8, proposal_id: u32, name: []const u8, args: []const u8) ![]const u8 {
+    if (buf.len < 4) return error.PayloadTooLarge;
+    std.mem.writeInt(u32, buf[0..4], proposal_id, .little);
+    const rest = if (args.len == 0)
+        try std.fmt.bufPrint(buf[4..], "{s}", .{name})
+    else
+        try std.fmt.bufPrint(buf[4..], "{s} {s}", .{ name, args });
+    return buf[0 .. 4 + rest.len];
+}
+
+pub fn parseProposePayload(payload: []const u8) ProtocolError!struct { proposal_id: u32, name: []const u8, args: []const u8 } {
+    if (payload.len < 4) return error.ProtocolError;
+    const id = std.mem.readInt(u32, payload[0..4], .little);
+    const na = splitNameArgs(payload[4..]);
+    if (na.name.len == 0) return error.ProtocolError;
+    return .{ .proposal_id = id, .name = na.name, .args = na.args };
+}
+
+pub fn formatCommitPayload(buf: []u8, seq: u64, origin_peer: u32, name: []const u8, args: []const u8) ![]const u8 {
+    if (buf.len < 12) return error.PayloadTooLarge;
+    std.mem.writeInt(u64, buf[0..8], seq, .little);
+    std.mem.writeInt(u32, buf[8..12], origin_peer, .little);
+    const rest = if (args.len == 0)
+        try std.fmt.bufPrint(buf[12..], "{s}", .{name})
+    else
+        try std.fmt.bufPrint(buf[12..], "{s} {s}", .{ name, args });
+    return buf[0 .. 12 + rest.len];
+}
+
+pub fn parseCommitPayload(payload: []const u8) ProtocolError!struct { seq: u64, origin_peer: u32, name: []const u8, args: []const u8 } {
+    if (payload.len < 12) return error.ProtocolError;
+    const seq = std.mem.readInt(u64, payload[0..8], .little);
+    const origin = std.mem.readInt(u32, payload[8..12], .little);
+    const na = splitNameArgs(payload[12..]);
+    if (na.name.len == 0) return error.ProtocolError;
+    return .{ .seq = seq, .origin_peer = origin, .name = na.name, .args = na.args };
+}
+
+pub fn formatRejectPayload(buf: []u8, proposal_id: u32, reason: []const u8) ![]const u8 {
+    if (buf.len < 4) return error.PayloadTooLarge;
+    std.mem.writeInt(u32, buf[0..4], proposal_id, .little);
+    if (4 + reason.len > buf.len) return error.PayloadTooLarge;
+    if (reason.len > 0) @memcpy(buf[4 .. 4 + reason.len], reason);
+    return buf[0 .. 4 + reason.len];
+}
+
+pub fn parseRejectPayload(payload: []const u8) ProtocolError!struct { proposal_id: u32, reason: []const u8 } {
+    if (payload.len < 4) return error.ProtocolError;
+    return .{
+        .proposal_id = std.mem.readInt(u32, payload[0..4], .little),
+        .reason = payload[4..],
+    };
+}
+
 // ============================================================================
 // Queues
 // ============================================================================
@@ -158,6 +233,8 @@ pub fn formatHostHello(buf: []u8, peer_id: u32) ![]const u8 {
 const QueueSlot = struct {
     kind: u8 = 0,
     len: u32 = 0,
+    /// 受信元 peer_id（host の PROPOSE 処理・REJECT 返送用。client 受信は 0=host）。
+    peer_id: u32 = 0,
     data: [MAX_ACTION_FRAME_BYTES]u8 = undefined,
 };
 
@@ -168,7 +245,7 @@ const InboundQueue = struct {
     tail: usize = 0,
     count: usize = 0,
 
-    fn enqueue(self: *InboundQueue, io: Io, kind: u8, payload: []const u8) bool {
+    fn enqueue(self: *InboundQueue, io: Io, kind: u8, payload: []const u8, peer_id: u32) bool {
         if (payload.len > MAX_ACTION_FRAME_BYTES) return false;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -176,18 +253,20 @@ const InboundQueue = struct {
         const s = &self.slots[self.tail];
         s.kind = kind;
         s.len = @intCast(payload.len);
+        s.peer_id = peer_id;
         if (payload.len > 0) @memcpy(s.data[0..payload.len], payload);
         self.tail = (self.tail + 1) % INBOUND_CAP;
         self.count += 1;
         return true;
     }
 
-    fn dequeue(self: *InboundQueue, io: Io, out_kind: *u8, out_buf: []u8) ?usize {
+    fn dequeue(self: *InboundQueue, io: Io, out_kind: *u8, out_peer: *u32, out_buf: []u8) ?usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.count == 0) return null;
         const s = &self.slots[self.head];
         out_kind.* = s.kind;
+        out_peer.* = s.peer_id;
         const n = @min(s.len, out_buf.len);
         if (n > 0) @memcpy(out_buf[0..n], s.data[0..n]);
         self.head = (self.head + 1) % INBOUND_CAP;
@@ -293,10 +372,12 @@ const ConnSlot = struct {
 //
 // ## 同期規約（peers_mutex）
 // 次のフィールドの読み書きはすべて `peers_mutex` 下で行う（イベント時のみの経路）:
-//   role / started / local_peer_id / next_peer_id /
+//   role / started / local_peer_id / next_peer_id / router_clear_pending /
 //   slots[*].state および slot の peer メタ（peer_id/kind/label/hello_done/socket_open）/
 //   client_slot の同種フィールド
 // `stop_flag` のみ atomic。`have_server` / acceptor_thread は main（init/shutdown）専有。
+// wire_seq / next_proposal_id / last_rejected_* / shared_executor は main thread 専有
+// （pump / router / setSharedExecutor。reader は触らない）。
 // outbound キューは独自 mutex を持ち、ロック順序は **peers_mutex → outbound.mutex**（逆順禁止）。
 
 var role: Role = .disabled;
@@ -321,8 +402,28 @@ var local_peer_id: u32 = 0; // client が host HELLO で受け取る
 var inbound: InboundQueue = .{};
 
 var client_actor_kind: ActorKind = .human;
-var client_label_buf: [MAX_LABEL_LEN]u8 = undefined;
-var client_label_len: usize = 6; // "client"
+/// 既定 label。`undefined` + len だけ先に立てると NUL が HELLO に載り host が切断する（E2E で確認済み）。
+const default_client_label = "client";
+var client_label_buf: [MAX_LABEL_LEN]u8 = blk: {
+    var b = [_]u8{0} ** MAX_LABEL_LEN;
+    @memcpy(b[0..default_client_label.len], default_client_label);
+    break :blk b;
+};
+var client_label_len: usize = default_client_label.len;
+
+/// client fail-soft（reader 起点）から main の pump へ router 解除を依頼するフラグ。
+var router_clear_pending: bool = false;
+
+/// host の wire COMMIT seq（単調増加。main thread 専有）。
+var wire_seq: u64 = 0;
+/// client の proposal_id（単調増加。main thread 専有）。
+var next_proposal_id: u32 = 0;
+
+var shared_executor: ?*command.Executor = null;
+
+var last_rejected_proposal: u32 = 0;
+var last_reject_reason_buf: [256]u8 = undefined;
+var last_reject_reason_len: usize = 0;
 
 fn ensureIo() void {
     if (io_inited) return;
@@ -363,6 +464,44 @@ pub fn isClient() bool {
     peers_mutex.lockUncancelable(io_val);
     defer peers_mutex.unlock(io_val);
     return role == .client and started;
+}
+
+/// platform.setCommandExecutor から転送。remote COMMIT / host PROPOSE 適用に使う（main thread）。
+pub fn setSharedExecutor(exec: ?*command.Executor) void {
+    shared_executor = exec;
+}
+
+pub fn lastRejectedProposal() u32 {
+    return last_rejected_proposal;
+}
+
+pub fn lastRejectReason() []const u8 {
+    return last_reject_reason_buf[0..last_reject_reason_len];
+}
+
+pub fn wireSeq() u64 {
+    return wire_seq;
+}
+
+fn enableRouter() void {
+    action_registry.setRouter(netsyncRouter);
+    action_registry.setEnabled(true);
+}
+
+fn clearRouterMain() void {
+    action_registry.setRouter(null);
+    if (io_inited) {
+        peers_mutex.lockUncancelable(io_val);
+        router_clear_pending = false;
+        peers_mutex.unlock(io_val);
+    } else {
+        router_clear_pending = false;
+    }
+}
+
+fn requestRouterClear() void {
+    // peers_mutex 保持下で呼ぶこと（cleanup / failSoftLocked）。
+    router_clear_pending = true;
 }
 
 pub fn listeningPort() ?u16 {
@@ -443,9 +582,8 @@ pub fn setClientIdentity(kind: ActorKind, label: []const u8) void {
 }
 
 fn defaultClientLabel() void {
-    const d = "client";
-    @memcpy(client_label_buf[0..d.len], d);
-    client_label_len = d.len;
+    @memcpy(client_label_buf[0..default_client_label.len], default_client_label);
+    client_label_len = default_client_label.len;
     client_actor_kind = .human;
 }
 
@@ -522,10 +660,15 @@ pub fn initHost(port: u16) void {
         peers_mutex.unlock(io_val);
         return;
     };
+    wire_seq = 0;
+    enableRouter();
     std.debug.print("[netsync] host 有効: 127.0.0.1:{d}\n", .{server.socket.address.getPort()});
 }
 
 pub fn initClient(addr: net.IpAddress) void {
+    // initFromEnv→initClient は initHost と違い defaultClientLabel を呼ばない。
+    // 宣言時初期化が正だが、空なら既定を入れ直す（client 経路の label 常時有効を保証）。
+    if (client_label_len == 0) defaultClientLabel();
     initClientAs(addr, client_actor_kind, client_label_buf[0..client_label_len]);
 }
 
@@ -541,6 +684,10 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     stop_flag.store(false, .seq_cst);
     setClientIdentity(kind, label);
     inbound.clear(io_val);
+
+    // HELLO encode にも内部保存と同じ切り詰め済み label を使う（201B 以上を素通しすると
+    // host 側の label 上限で protocol error 切断になるため、API 境界で clamp する）。
+    const label_clamped = client_label_buf[0..client_label_len];
 
     const stream = addr.connect(io_val, .{ .mode = .stream }) catch |err| {
         std.debug.print("[netsync] client 接続失敗: {s}（netsync 無効のまま起動継続）\n", .{@errorName(err)});
@@ -558,9 +705,8 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
         .slot_index = 0,
         .actor_kind = kind,
     };
-    const n = @min(label.len, MAX_LABEL_LEN);
-    if (n > 0) @memcpy(client_slot.label_buf[0..n], label[0..n]);
-    client_slot.label_len = n;
+    if (label_clamped.len > 0) @memcpy(client_slot.label_buf[0..label_clamped.len], label_clamped);
+    client_slot.label_len = label_clamped.len;
     client_slot.outbound.reset(io_val);
     peers_mutex.unlock(io_val);
 
@@ -596,7 +742,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
 
     // client HELLO を outbound へ
     var hbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
-    const hello = formatClientHello(&hbuf, kind, label) catch {
+    const hello = formatClientHello(&hbuf, kind, label_clamped) catch {
         requestCloseSlot(&client_slot);
         return;
     };
@@ -608,21 +754,194 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
         requestCloseSlot(&client_slot);
         return;
     }
+    next_proposal_id = 0;
+    enableRouter();
     std.debug.print("[netsync] client 接続中\n", .{});
 }
 
+/// inbound を drain し PROPOSE/COMMIT/REJECT を適用する（main thread。毎フレーム可）。
+/// `router_clear_pending` の処理は `isEnabled` 早期 return より前（fail-soft 後も解除する）。
 pub fn pump() void {
+    if (!io_inited) return;
+
+    // fail-soft 後の router 解除（main thread のみ setRouter）。
+    peers_mutex.lockUncancelable(io_val);
+    const clear = router_clear_pending;
+    if (clear) router_clear_pending = false;
+    peers_mutex.unlock(io_val);
+    if (clear) {
+        action_registry.setRouter(null);
+    }
+
     if (!isEnabled()) return;
+
     var kind: u8 = 0;
+    var peer: u32 = 0;
     var buf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
-    // 62.3.1: semantic 適用はしない。inbound を drain するだけ。
-    while (inbound.dequeue(io_val, &kind, &buf)) |_| {}
+    while (inbound.dequeue(io_val, &kind, &peer, &buf)) |n| {
+        const payload = buf[0..n];
+        handleInboundFrame(kind, peer, payload);
+    }
 }
 
-/// テスト用: inbound を drain せず 1 件 peek/dequeue。
+/// テスト用: inbound を 1 件 dequeue。
 pub fn dequeueInbound(out_kind: *u8, out_buf: []u8) ?usize {
     if (!isEnabled()) return null;
-    return inbound.dequeue(io_val, out_kind, out_buf);
+    var peer: u32 = 0;
+    return inbound.dequeue(io_val, out_kind, &peer, out_buf);
+}
+
+fn handleInboundFrame(kind: u8, from_peer: u32, payload: []const u8) void {
+    const k: FrameKind = @enumFromInt(kind);
+    switch (k) {
+        .propose => handlePropose(from_peer, payload),
+        .commit => handleCommit(payload),
+        .reject => handleReject(payload),
+        else => {}, // HELLO は reader 内処理済み。他は 62.3.x 以降
+    }
+}
+
+fn applyRemoteNoRecord(name: []const u8, args: []const u8, origin_peer: u32, buf: []u8) anyerror![]const u8 {
+    if (shared_executor) |exec| {
+        const res = try exec.executeAction(name, args, .{
+            .actor = .{ .peer = origin_peer },
+            .source = .local,
+            .record_policy = .no_record,
+        }, buf);
+        return res.output;
+    }
+    return action_registry.dispatch(name, args, buf);
+}
+
+fn enqueueToPeer(peer_id: u32, kind: u8, payload: []const u8) bool {
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    for (&slots) |*s| {
+        if (s.state == .active and s.peer_id == peer_id) {
+            return s.outbound.enqueue(io_val, kind, payload);
+        }
+    }
+    return false;
+}
+
+fn nextWireSeq() u64 {
+    wire_seq += 1;
+    return wire_seq;
+}
+
+fn broadcastCommit(seq: u64, origin_peer: u32, name: []const u8, args: []const u8) void {
+    var cbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    const payload = formatCommitPayload(&cbuf, seq, origin_peer, name, args) catch {
+        std.debug.print("[netsync] COMMIT payload 構築失敗\n", .{});
+        return;
+    };
+    broadcast(@intFromEnum(FrameKind.commit), payload);
+}
+
+fn sendReject(peer_id: u32, proposal_id: u32, reason: []const u8) void {
+    var rbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    const payload = formatRejectPayload(&rbuf, proposal_id, reason) catch return;
+    _ = enqueueToPeer(peer_id, @intFromEnum(FrameKind.reject), payload);
+}
+
+/// host ローカル .relay: dispatch → 成功時 wire seq 採番 → 全 client へ COMMIT(origin=0)。
+pub fn commitAndBroadcast(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const out = try action_registry.dispatch(name, args, buf);
+    const seq = nextWireSeq();
+    broadcastCommit(seq, 0, name, args);
+    return out;
+}
+
+/// client ローカル .relay: proposal_id 採番 + PROPOSE 送信。ローカル適用なし。
+pub fn proposeToHost(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    next_proposal_id += 1;
+    const id = next_proposal_id;
+    var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    const payload = formatProposePayload(&pbuf, id, name, args) catch return error.PayloadTooLarge;
+    if (!clientSend(@intFromEnum(FrameKind.propose), payload)) {
+        return error.ProposeSendFailed;
+    }
+    return std.fmt.bufPrint(buf, "proposed {d}", .{id});
+}
+
+fn handlePropose(from_peer: u32, payload: []const u8) void {
+    if (!isHost()) return;
+    const parsed = parseProposePayload(payload) catch {
+        sendReject(from_peer, 0, "bad propose");
+        return;
+    };
+    const act = action_registry.findAction(parsed.name);
+    if (act == null or act.?.network_policy != .relay) {
+        sendReject(from_peer, parsed.proposal_id, "not relayable");
+        return;
+    }
+    var abuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    _ = applyRemoteNoRecord(parsed.name, parsed.args, from_peer, &abuf) catch |err| {
+        var reason_buf: [64]u8 = undefined;
+        const reason = std.fmt.bufPrint(&reason_buf, "{s}", .{@errorName(err)}) catch "apply failed";
+        sendReject(from_peer, parsed.proposal_id, reason);
+        return;
+    };
+    const seq = nextWireSeq();
+    broadcastCommit(seq, from_peer, parsed.name, parsed.args);
+}
+
+fn handleCommit(payload: []const u8) void {
+    if (!isClient()) return;
+    const parsed = parseCommitPayload(payload) catch {
+        std.debug.print("[netsync] COMMIT parse 失敗\n", .{});
+        return;
+    };
+    // wire seq は記録しない（暫定例外）。単調性の観測用にだけ進める。
+    if (parsed.seq > wire_seq) wire_seq = parsed.seq;
+    var abuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    _ = applyRemoteNoRecord(parsed.name, parsed.args, parsed.origin_peer, &abuf) catch |err| {
+        std.debug.print("[netsync] COMMIT 適用失敗: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn handleReject(payload: []const u8) void {
+    if (!isClient()) return;
+    const parsed = parseRejectPayload(payload) catch {
+        std.debug.print("[netsync] REJECT parse 失敗\n", .{});
+        return;
+    };
+    last_rejected_proposal = parsed.proposal_id;
+    const n = @min(parsed.reason.len, last_reject_reason_buf.len);
+    if (n > 0) @memcpy(last_reject_reason_buf[0..n], parsed.reason[0..n]);
+    last_reject_reason_len = n;
+    std.debug.print("[netsync] REJECT proposal={d} reason={s}\n", .{ parsed.proposal_id, lastRejectReason() });
+}
+
+/// host/client 対称の NetworkPolicy 分岐（親 plan §1.3）。
+/// **main thread のみ**（routeLocalAction 経由）。role=.disabled なら dispatch fallback。
+fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    peers_mutex.lockUncancelable(io_val);
+    const cur = role;
+    const on = started;
+    peers_mutex.unlock(io_val);
+    if (cur == .disabled or !on) {
+        return action_registry.dispatch(name, args, buf);
+    }
+
+    const act = action_registry.findAction(name) orelse return error.UnknownAction;
+    return switch (cur) {
+        .host => switch (act.network_policy) {
+            .relay => commitAndBroadcast(name, args, buf),
+            .local_only => action_registry.dispatch(name, args, buf),
+            .reject_when_synced => error.RejectedWhileSynced,
+            // TODO(62.3.5): commitRevertOwnLatest / commitReapplyOwnReverted に差し替え
+            .undo_own, .redo_own => error.RejectedWhileSynced,
+        },
+        .client => switch (act.network_policy) {
+            .relay => proposeToHost(name, args, buf),
+            .local_only => action_registry.dispatch(name, args, buf),
+            .reject_when_synced => error.RejectedWhileSynced,
+            // TODO(62.3.5): proposeRevertOwnLatest / reproposeOwnReverted に差し替え
+            .undo_own, .redo_own => error.RejectedWhileSynced,
+        },
+        .disabled => action_registry.dispatch(name, args, buf),
+    };
 }
 
 /// active な全接続の outbound へ fan-out。
@@ -664,13 +983,22 @@ pub fn shutdown() void {
 
     stop_flag.store(true, .seq_cst);
 
+    // listen socket を先に close すると blocking accept が BADF panic になる。
+    // ダミー connect で accept を起こし、acceptor join 後にだけ listen を閉じる。
     if (have_server) {
-        server.socket.close(io_val);
-        have_server = false;
+        const port = server.socket.address.getPort();
+        const wake_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+        if (wake_addr.connect(io_val, .{ .mode = .stream })) |s| {
+            s.close(io_val);
+        } else |_| {}
     }
     if (acceptor_thread) |t| {
         t.join();
         acceptor_thread = null;
+    }
+    if (have_server) {
+        server.deinit(io_val);
+        have_server = false;
     }
 
     if (cur_role == .host) {
@@ -693,7 +1021,14 @@ pub fn shutdown() void {
     started = false;
     local_peer_id = 0;
     next_peer_id = 1;
+    router_clear_pending = false;
     peers_mutex.unlock(io_val);
+    // main thread のみ setRouter(null)
+    action_registry.setRouter(null);
+    wire_seq = 0;
+    next_proposal_id = 0;
+    last_rejected_proposal = 0;
+    last_reject_reason_len = 0;
 }
 
 fn requestCloseSlot(s: *ConnSlot) void {
@@ -773,6 +1108,7 @@ fn failSoftDisableClientLocked() void {
     role = .disabled;
     started = false;
     local_peer_id = 0;
+    requestRouterClear();
 }
 
 // ============================================================================
@@ -897,16 +1233,27 @@ fn readerMain(slot: *ConnSlot) void {
 
         if (!slot.hello_done) {
             // 上で HELLO 以外は弾済み
-            handleHello(slot, payload) catch break;
+            handleHello(slot, payload) catch {
+                // host: 不正 HELLO（制御文字 label 等）。label 内容は出さない。
+                if (!slot.is_client_conn) {
+                    std.debug.print("[netsync] HELLO protocol error — 切断\n", .{});
+                }
+                break;
+            };
             continue;
         }
 
         if (kind == @intFromEnum(FrameKind.hello)) break; // duplicate HELLO
 
-        if (!inbound.enqueue(io_val, kind, payload)) {
+        if (!inbound.enqueue(io_val, kind, payload, slot.peer_id)) {
             std.debug.print("[netsync] inbound 満杯 — 接続を切断します\n", .{});
             break;
         }
+    }
+
+    // client: HELLO 完了前に EOF/切断された場合（silent break だと原因究明が難しい）。
+    if (!slot.hello_done and slot.is_client_conn) {
+        std.debug.print("[netsync] HELLO 握手失敗（接続が閉じられました）\n", .{});
     }
 }
 
@@ -945,11 +1292,12 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
     slot.peer_id = 0;
     slot.label_len = 0;
     slot.reader_thread = null;
-    // client 切断後は同 mutex 下で netsync を fail-soft 無効化。
+    // client 切断後は同 mutex 下で netsync を fail-soft 無効化。router 解除は pump へ委譲。
     if (was_client) {
         role = .disabled;
         started = false;
         local_peer_id = 0;
+        requestRouterClear();
     }
     peers_mutex.unlock(io_val);
 
@@ -999,8 +1347,15 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
 /// テスト用リセット（shutdown + 状態クリア）。
 pub fn resetForTest() void {
     shutdown();
+    clearRouterMain();
+    action_registry.resetForTest();
+    shared_executor = null;
     defaultClientLabel();
     stop_flag.store(false, .seq_cst);
+    wire_seq = 0;
+    next_proposal_id = 0;
+    last_rejected_proposal = 0;
+    last_reject_reason_len = 0;
 }
 
 // ============================================================================
@@ -1560,4 +1915,558 @@ test "netsync: clientSend outbound 満杯で fail-soft" {
     }
     try testing.expect(failed);
     try testing.expect(!isEnabled());
+}
+
+// ============================================================================
+// TASK-62.3.2 semantic tests
+// ============================================================================
+
+const SemCtx = struct {
+    calls: u32 = 0,
+    fail: bool = false,
+    last_args: [128]u8 = undefined,
+    last_args_len: usize = 0,
+};
+
+fn semRun(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const c: *SemCtx = @ptrCast(@alignCast(ctx));
+    if (c.fail) return error.SemFail;
+    c.calls += 1;
+    const n = @min(args.len, c.last_args.len);
+    if (n > 0) @memcpy(c.last_args[0..n], args[0..n]);
+    c.last_args_len = n;
+    return std.fmt.bufPrint(buf, "ok:{s}", .{args}) catch "ok";
+}
+
+fn registerSem(name: []const u8, ctx: *SemCtx, policy: action_registry.NetworkPolicy) void {
+    action_registry.setEnabled(true);
+    action_registry.registerAction(.{
+        .name = name,
+        .ctx = ctx,
+        .run = semRun,
+        .network_policy = policy,
+    });
+}
+
+fn rawHelloConnect(addr: net.IpAddress, label: []const u8) !net.Stream {
+    ensureIo();
+    const s = try addr.connect(io_val, .{ .mode = .stream });
+    var wbuf: [256]u8 = undefined;
+    var writer = s.writer(io_val, &wbuf);
+    var hbuf: [128]u8 = undefined;
+    const hello = try std.fmt.bufPrint(&hbuf, "client {d} human {s}", .{ PROTOCOL_VERSION, label });
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), hello);
+    try writer.interface.flush();
+    var rbuf: [256]u8 = undefined;
+    var reader = s.reader(io_val, &rbuf);
+    var pbuf: [128]u8 = undefined;
+    const frame = try decodeFrame(&reader.interface, &pbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.hello), frame.kind);
+    _ = try parseHostHello(frame.payload);
+    return s;
+}
+
+test "netsync: payload PROPOSE/COMMIT/REJECT round-trip" {
+    var buf: [256]u8 = undefined;
+    const p = try formatProposePayload(&buf, 7, "stroke", "1 2");
+    const pp = try parseProposePayload(p);
+    try testing.expectEqual(@as(u32, 7), pp.proposal_id);
+    try testing.expectEqualStrings("stroke", pp.name);
+    try testing.expectEqualStrings("1 2", pp.args);
+
+    const c = try formatCommitPayload(&buf, 42, 3, "set_tool", "pen");
+    const cp = try parseCommitPayload(c);
+    try testing.expectEqual(@as(u64, 42), cp.seq);
+    try testing.expectEqual(@as(u32, 3), cp.origin_peer);
+    try testing.expectEqualStrings("set_tool", cp.name);
+    try testing.expectEqualStrings("pen", cp.args);
+
+    const r = try formatRejectPayload(&buf, 9, "not relayable");
+    const rp = try parseRejectPayload(r);
+    try testing.expectEqual(@as(u32, 9), rp.proposal_id);
+    try testing.expectEqualStrings("not relayable", rp.reason);
+}
+
+test "netsync: router host 5 policy 分岐" {
+    resetForTest();
+    defer resetForTest();
+    var ctx: SemCtx = .{};
+    registerSem("h_relay", &ctx, .relay);
+    registerSem("h_local", &ctx, .local_only);
+    registerSem("h_reject", &ctx, .reject_when_synced);
+    registerSem("h_undo", &ctx, .undo_own);
+    registerSem("h_redo", &ctx, .redo_own);
+    initHost(0);
+    try testing.expect(isHost());
+
+    var buf: [128]u8 = undefined;
+    const r0 = try action_registry.routeLocalAction("h_relay", "a", &buf);
+    try testing.expectEqualStrings("ok:a", r0);
+    try testing.expectEqual(@as(u64, 1), wireSeq());
+
+    const r1 = try action_registry.routeLocalAction("h_local", "b", &buf);
+    try testing.expectEqualStrings("ok:b", r1);
+    try testing.expectEqual(@as(u64, 1), wireSeq()); // local_only は seq 消費しない
+
+    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_reject", "", &buf));
+    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_undo", "", &buf));
+    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_redo", "", &buf));
+}
+
+test "netsync: router client 5 policy 分岐" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            // PROPOSE を1件読んで捨てる（client relay 用）
+            _ = decodeFrame(&reader.interface, &pbuf) catch {};
+            sleepMs(200);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("c_relay", &ctx, .relay);
+    registerSem("c_local", &ctx, .local_only);
+    registerSem("c_reject", &ctx, .reject_when_synced);
+    registerSem("c_undo", &ctx, .undo_own);
+    registerSem("c_redo", &ctx, .redo_own);
+
+    const caddr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    initClientAs(caddr, .human, "pol");
+    try waitClientActive(2000);
+
+    var buf: [128]u8 = undefined;
+    const pr = try action_registry.routeLocalAction("c_relay", "x", &buf);
+    try testing.expectEqualStrings("proposed 1", pr);
+    try testing.expectEqual(@as(u32, 0), ctx.calls); // ローカル適用なし
+
+    const loc = try action_registry.routeLocalAction("c_local", "y", &buf);
+    try testing.expectEqualStrings("ok:y", loc);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+
+    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("c_reject", "", &buf));
+    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("c_undo", "", &buf));
+    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("c_redo", "", &buf));
+}
+
+test "netsync: commitAndBroadcast seq 単調増加と COMMIT origin_peer=0" {
+    resetForTest();
+    defer resetForTest();
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "bob");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+
+    var buf: [128]u8 = undefined;
+    _ = try commitAndBroadcast("stroke", "10 10", &buf);
+    _ = try commitAndBroadcast("stroke", "20 20", &buf);
+    try testing.expectEqual(@as(u64, 2), wireSeq());
+
+    var rbuf: [512]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var pbuf: [256]u8 = undefined;
+    const f1 = try decodeFrame(&reader.interface, &pbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit), f1.kind);
+    const c1 = try parseCommitPayload(f1.payload);
+    try testing.expectEqual(@as(u64, 1), c1.seq);
+    try testing.expectEqual(@as(u32, 0), c1.origin_peer);
+    try testing.expectEqualStrings("stroke", c1.name);
+    try testing.expectEqualStrings("10 10", c1.args);
+
+    const f2 = try decodeFrame(&reader.interface, &pbuf);
+    const c2 = try parseCommitPayload(f2.payload);
+    try testing.expectEqual(@as(u64, 2), c2.seq);
+    try testing.expectEqual(@as(u32, 0), c2.origin_peer);
+}
+
+test "netsync: host PROPOSE 再検証 REJECT（non-relay・未知）" {
+    resetForTest();
+    defer resetForTest();
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    registerSem("undo", &ctx, .reject_when_synced);
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "eve");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [128]u8 = undefined;
+    const bad = try formatProposePayload(&pbuf, 3, "undo", "");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), bad);
+    try writer.interface.flush();
+    const unk = try formatProposePayload(&pbuf, 4, "no_such", "");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), unk);
+    try writer.interface.flush();
+
+    // host が読むまで待つ
+    var waited: u64 = 0;
+    while (inboundLen() < 2 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    pump();
+
+    var rbuf: [256]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [128]u8 = undefined;
+    const r1 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.reject), r1.kind);
+    const p1 = try parseRejectPayload(r1.payload);
+    try testing.expectEqual(@as(u32, 3), p1.proposal_id);
+    try testing.expectEqualStrings("not relayable", p1.reason);
+
+    const r2 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.reject), r2.kind);
+    const p2 = try parseRejectPayload(r2.payload);
+    try testing.expectEqual(@as(u32, 4), p2.proposal_id);
+    try testing.expectEqualStrings("not relayable", p2.reason);
+}
+
+test "netsync: PROPOSE→COMMIT round-trip（no_record で CommandRecord 増えない）" {
+    resetForTest();
+    defer resetForTest();
+
+    var log: command.CommandLog = .{};
+    var exec = command.Executor.init(.{
+        .ctx = undefined,
+        .run = struct {
+            fn d(_: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+                _ = name;
+                return std.fmt.bufPrint(buf, "d:{s}", .{args});
+            }
+        }.d,
+    });
+    exec.log = &log;
+    setSharedExecutor(&exec);
+
+    var ctx: SemCtx = .{};
+    // dispatch fallback 経路も動くよう register（executor が優先）
+    registerSem("stroke", &ctx, .relay);
+    // executor 経由にするため dispatcher を action 名で呼ぶ — applyRemoteNoRecord は executor を使う
+    // register の run は host ローカル commitAndBroadcast 用。PROPOSE 適用は executor。
+
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "carol");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+
+    const before = log.filled;
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [128]u8 = undefined;
+    const prop = try formatProposePayload(&pbuf, 1, "stroke", "5 5");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), prop);
+    try writer.interface.flush();
+
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    try testing.expectEqual(before, log.filled); // no_record
+    try testing.expectEqual(@as(u64, 1), wireSeq());
+
+    var rbuf: [256]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [128]u8 = undefined;
+    const f = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit), f.kind);
+    const c = try parseCommitPayload(f.payload);
+    try testing.expectEqual(@as(u64, 1), c.seq);
+    try testing.expect(c.origin_peer != 0);
+    try testing.expectEqualStrings("stroke", c.name);
+}
+
+test "netsync: REJECT 受信で last_rejected_proposal 保存" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [256]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 2) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            const rej = formatRejectPayload(&pbuf, 11, "nope") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.reject), rej) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(100);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    const caddr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    initClientAs(caddr, .human, "rj");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    try testing.expectEqual(@as(u32, 11), lastRejectedProposal());
+    try testing.expectEqualStrings("nope", lastRejectReason());
+}
+
+test "netsync: proposal_id 単調増加" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [512]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [256]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            _ = decodeFrame(&reader.interface, &pbuf) catch {};
+            _ = decodeFrame(&reader.interface, &pbuf) catch {};
+            sleepMs(100);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "pid");
+    try waitClientActive(2000);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("proposed 1", try proposeToHost("stroke", "a", &buf));
+    try testing.expectEqualStrings("proposed 2", try proposeToHost("stroke", "b", &buf));
+}
+
+test "netsync: local_only seq 消費後も remote no_record 適用成功" {
+    resetForTest();
+    defer resetForTest();
+
+    var log: command.CommandLog = .{};
+    var exec_ctx: SemCtx = .{};
+    var exec = command.Executor.init(.{
+        .ctx = &exec_ctx,
+        .run = struct {
+            fn d(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+                _ = name;
+                const c: *SemCtx = @ptrCast(@alignCast(ctx));
+                c.calls += 1;
+                return std.fmt.bufPrint(buf, "e:{s}", .{args});
+            }
+        }.d,
+    });
+    exec.log = &log;
+    setSharedExecutor(&exec);
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [256]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [256]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            // local_only が終わるのを待ってから COMMIT を送る
+            sleepMs(50);
+            const commit = formatCommitPayload(&pbuf, 99, 0, "stroke", "remote") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.commit), commit) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(100);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("save", &ctx, .local_only);
+    registerSem("stroke", &ctx, .relay);
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "lo");
+    try waitClientActive(2000);
+
+    // local_only を executor 経由で記録（seq 消費）
+    var buf: [128]u8 = undefined;
+    _ = try exec.executeAction("save", "/tmp/x", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    try testing.expectEqual(@as(u32, 1), log.filled);
+    const next_after_local = log.next_seq;
+
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    // no_record なので filled は増えず、Stale にもならない
+    try testing.expectEqual(@as(u32, 1), log.filled);
+    try testing.expectEqual(next_after_local, log.next_seq);
+    try testing.expect(exec_ctx.calls >= 2); // save + remote stroke
+}
+
+test "netsync: fail-soft 後 pump で router 解除され通常ローカル動作" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    const port = srv.socket.address.getPort();
+
+    var close_gate: std.atomic.Value(bool) = .init(false);
+    const Host = struct {
+        fn run(listen_srv: *net.Server, gate: *std.atomic.Value(bool)) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            // client が active になるまで維持してから切断
+            var waited: u64 = 0;
+            while (!gate.load(.seq_cst) and waited < 5000) : (waited += 10) sleepMs(10);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{ &srv, &close_gate });
+    defer {
+        close_gate.store(true, .seq_cst);
+        ht.join();
+        srv.deinit(io_val);
+    }
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "fs");
+    try waitClientActive(2000);
+    try testing.expect(isEnabled());
+
+    close_gate.store(true, .seq_cst); // host が接続を閉じる
+    var waited: u64 = 0;
+    while (isEnabled() and waited < 3000) : (waited += 10) sleepMs(10);
+    try testing.expect(!isEnabled());
+
+    pump(); // router_clear_pending → setRouter(null)
+    var buf: [64]u8 = undefined;
+    const out = try action_registry.routeLocalAction("stroke", "z", &buf);
+    try testing.expectEqualStrings("ok:z", out);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+}
+
+test "netsync: shutdown 後 routeLocalAction は dispatch 等価" {
+    resetForTest();
+    defer resetForTest();
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    initHost(0);
+    try testing.expect(isHost());
+    shutdown();
+    try testing.expect(!isEnabled());
+    // shutdown は setRouter(null)。register は残る（resetForTest 前）
+    action_registry.setEnabled(true);
+    var buf: [64]u8 = undefined;
+    const out = try action_registry.routeLocalAction("stroke", "s", &buf);
+    try testing.expectEqualStrings("ok:s", out);
+}
+
+test "netsync: env 未設定パススルー（pump/isEnabled）" {
+    resetForTest();
+    defer resetForTest();
+    try testing.expect(!isEnabled());
+    pump(); // no-op
+    try testing.expectEqual(@as(usize, 0), inboundLen());
+}
+
+test "netsync: デフォルト識別子 HELLO は parseClientHello 受理（initClient 経路）" {
+    resetForTest();
+    defer resetForTest();
+    // initClient が渡すのと同じスライスで HELLO を組み立てる（宣言時 "client" 初期化の回帰）。
+    try testing.expectEqual(@as(usize, default_client_label.len), client_label_len);
+    try testing.expectEqualStrings(default_client_label, client_label_buf[0..client_label_len]);
+    var buf: [256]u8 = undefined;
+    const payload = try formatClientHello(&buf, client_actor_kind, client_label_buf[0..client_label_len]);
+    const parsed = try parseClientHello(payload);
+    try testing.expectEqual(ActorKind.human, parsed.kind);
+    try testing.expectEqualStrings("client", parsed.label);
+    for (parsed.label) |c| try testing.expect(c >= 0x20);
+}
+
+test "netsync: 未初期化相当 label でも defaultClientLabel 後は HELLO 受理" {
+    resetForTest();
+    defer resetForTest();
+    // E2E で観測したバグ状態: len=6 だが buf が NUL 埋め
+    @memset(client_label_buf[0..6], 0);
+    client_label_len = 6;
+    var bad_buf: [256]u8 = undefined;
+    const bad = try formatClientHello(&bad_buf, .human, client_label_buf[0..client_label_len]);
+    try testing.expectError(error.ProtocolError, parseClientHello(bad));
+
+    defaultClientLabel();
+    var buf: [256]u8 = undefined;
+    const payload = try formatClientHello(&buf, client_actor_kind, client_label_buf[0..client_label_len]);
+    const parsed = try parseClientHello(payload);
+    try testing.expectEqualStrings("client", parsed.label);
 }

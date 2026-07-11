@@ -134,11 +134,14 @@ pub fn dispatch(name: []const u8, args: []const u8, buf: []u8) anyerror![]const 
 }
 
 /// netsync 等の router を設定する（未設定時 `routeLocalAction` は `dispatch` 等価）。
+/// **main thread のみ**から呼ぶ（harness handleAction / copilot pump / netsync.shutdown・pump も main）。
 pub fn setRouter(r: ?RouterFn) void {
     router = r;
 }
 
 /// router 設定時は router へ委譲、未設定時は `dispatch` と完全等価。
+/// **main thread のみ**（harness `handleAction` / copilot pump）。router 読みは同期プリミティブ無し
+/// （書き手も main thread のみ。client fail-soft の解除は netsync.pump が main で行う）。
 pub fn routeLocalAction(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     if (router) |r| return r(name, args, buf);
     return dispatch(name, args, buf);

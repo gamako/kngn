@@ -482,7 +482,7 @@ quit                       # 終了（EOF でも終了）
 - **組み込み probe（framework 所有）**: `fb`(framebuffer→PNG/digest) / `audio`(libs/synth 等の出力を facade `core/audio.zig` が tap→WAV/digest) / `stats`(EventStats + 仮想 fps→JSON) / `capabilities`(登録済み probe・action の内省列挙。下記)。
   `audio` は **直近窓（latest-wins）** を測るので「今鳴っている音」を assert できる（無音は silent=1, f0=0）。`virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
 - **capabilities（内省 probe / TASK-62.4）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み4件（`fb`/`audio`/`stats`/`capabilities` 自身。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
-  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 16 + 組み込み4）と desc の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
+  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 32 + 組み込み4）と desc の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
   - 将来クライアント（TASK-62.3 network discover 等）が「今このアプリで何を観測・操作できるか」を discover する入口になる。
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..,name=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
@@ -499,7 +499,7 @@ quit                       # 終了（EOF でも終了）
   - callback は `run(ctx, args, buf) anyerror![]const u8`（`buf` は `digest` と同じ 1024B 契約。戻り値は改行を含めない1行）。**framework は args も戻り値の意味も一切解釈しない**（probe と同じ不変条件。改行以降を emit しないのは中身の解釈ではなく wire framing 保護）。callback は **main thread（`pollGate` 内・step/フレーム境界）で実行**され、RT callback から呼ばれることは無い（RT スレッドと共有する app 状態への同期責務は app 側）。
   - **合否と exit code**: 未知 action・名前欠落・`run()` のエラーは**すべて失敗**として扱い、`expect`/`assert`（TASK-78）と同じ `expect_failures` カウンタに相乗りする（記帳して続行。`assert` のような即時 abort 変種は無い）。replay は終了時（EOF/quit/window close いずれの経路でも）に記帳が 1 件以上あれば非0 exit、live はプロセスを終了せずレスポンス行のみで合否を返す。
   - **wire format**: replay stderr = 成功 `[harness] action <name> ok <msg>` / 失敗 `[harness] action <name> FAILED <msg>`。live resp = 成功 `<name> <msg>`（**bare。`digest` の `<probe> <payload>` と同じ流儀**）/ 失敗 `fail <name> <msg>`（**`fail ` 接頭辞。`scripts/drive` の行頭スキャンに乗せて非0 exit させるため**）。callback が誤って複数行を返しても `msg` は最初の `\r`/`\n` の手前で切って emit する（wire framing 保護。中身の解釈ではない）。
-  - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（16件）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
+  - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（32件。TASK-62.5.3 で 16→32）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
   - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（`#` 有無どちらも許容） / `set_tool <pen|eraser|brush|bezier|select|fill>` / `stroke <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗） / `save <path>` / `open <path>`。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
 
 ### 使い方（replay = file トランスポート）
@@ -619,7 +619,7 @@ action 固有のコードを一切足さない**（中身非パースの不変�
 - **args は raw テキスト透過（framework は解釈しない）が、`;`/改行を含められない**（`nextLine()` の
   コマンド区切りのため。同一コマンド片内のテキストに限られる）。
 - **名前規則**: 空名・空白・`;`・改行を含む名前は登録拒否（コマンド言語上そもそも呼び出せないため）。
-  同名 custom は上書き。registry 上限は 16。予約名は無い（組み込み action を作らないため）。
+  同名 custom は上書き。registry 上限は 32（TASK-62.5.3 で 16→32）。予約名は無い（組み込み action を作らないため）。
 - `registerAction` は **harness 無効時（env 未設定）は no-op**なので、通常実行に影響しない（常に呼んでよい）。
 - **callback は main thread（`pollGate` 内・step/フレーム境界）で実行される**。RT callback から呼ばれる
   ことは無い。callback が RT スレッドと共有する app 状態に触れる場合、その同期責務は app 側にある
@@ -640,6 +640,76 @@ action 固有のコードを一切足さない**（中身非パースの不変�
   **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。Metal の GPU
   drawable 読み戻しは P4 スコープ外（上記参照）。
 - **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
+
+## network 同時編集（netsync, TASK-62.3）
+
+持続 TCP で複数 pixie プロセスが同一ドキュメントを同時編集する（host 権威の PROPOSE/COMMIT）。
+実装は `core/control/netsync.zig` + `action_registry.NetworkPolicy`。env 未設定時は完全パススルー。
+
+### 環境変数
+
+| 変数 | 意味 |
+|---|---|
+| `VP_NETSYNC_HOST=1` | host 役で listen（`VP_NETSYNC_PORT` 必須） |
+| `VP_NETSYNC_PORT` | host の listen port |
+| `VP_NETSYNC_CONNECT=ip:port` | client 役で接続 |
+| （将来）actor 種別/ラベル | HELLO に載る。現状は既定 `human` / `client` |
+
+`HOST` と `CONNECT` の同時指定は無効化。listen/connect 失敗は fail-soft（アプリは netsync 無しで継続）。
+
+### フレーム仕様（要点）
+
+```
+Frame = { kind: u8, len: u32 LE, payload: [len]u8 }
+```
+
+| kind | 値 | payload |
+|---|---|---|
+| HELLO | `0x01` | テキスト（client→host / host→client） |
+| PROPOSE | `0x02` | `u32 LE proposal_id` ++ `"<name> <args>"`（client→host） |
+| COMMIT | `0x03` | `u64 LE seq` ++ `u32 LE origin_peer` ++ `"<name> <args>"`（host→clients。host 自身へは送らない） |
+| REJECT | `0x05` | `u32 LE proposal_id` ++ `"<reason>"`（host→提案元のみ） |
+
+action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。超過は当該接続切断。
+
+### NetworkPolicy
+
+| 値 | host | client |
+|---|---|---|
+| `.relay` | ローカル適用 → COMMIT fan-out | PROPOSE のみ（応答 `"proposed <id>"`。適用は後続 COMMIT） |
+| `.local_only` | ローカルのみ（broadcast なし） | ローカルのみ（PROPOSE なし） |
+| `.reject_when_synced` | 即 `RejectedWhileSynced` | 同左 |
+| `.undo_own` / `.redo_own` | 62.3.2 時点は reject（62.3.5 で解禁） | 同左 |
+
+既定は `.reject_when_synced`。pixie MVP: `stroke`/`set_color`/`set_tool`=`.relay`、`save`=`.local_only`。
+
+### PROPOSE/COMMIT/REJECT の流れ
+
+1. client が `.relay` action → `proposed <id>` を即返し、PROPOSE を host へ送る（ローカル未適用）
+2. host が `network_policy==.relay` を再検証 → 適用 → 全 client へ COMMIT（失敗時は提案元へ REJECT）
+3. client が COMMIT を受けて適用（自分起源も含む。router 非経由）
+4. REJECT は warn + `last_rejected_proposal`/`last_reject_reason` に保存（62.3.4 probe のデータ源）
+
+**remote 適用の暫定例外（62.3.2）**: CommandRecord を作らず共有 executor の `record_policy=.no_record` で実行する（wire seq と local_only の seq 衝突回避。62.3.5 で本則へ）。
+
+### MVP 2 プロセス手順
+
+```bash
+VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vpHost.port \
+  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9100 zig build run-pixie &
+VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vpClient.port \
+  VP_NETSYNC_CONNECT=127.0.0.1:9100 zig build run-pixie &
+scripts/drive --port-file /tmp/vpClient.port 'action stroke 10 10 60 10'  # → "proposed <id>"
+scripts/drive --port-file /tmp/vpHost.port 'digest canvas'
+scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
+```
+
+### セッション中の制約・retry
+
+- undo/redo・レイヤー操作・PNG open は session 中不可（既定 reject）
+- save のみローカル可
+- **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` を一度受けたら再送しない（二重適用回避）。以後は digest の polling のみ
+- 接続確立前の action は失敗しうる → 確立後に再試行（上記 retry 条件）
 
 ## 性能規約（メモリI/O・キャッシュ最適化）
 

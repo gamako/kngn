@@ -42,6 +42,7 @@ const harness = @import("harness");
 // copilot（通常 UX と共存する assist transport。TASK-62.5.2）。harness module 内の namespace
 // 再エクスポート経由で参照する（意味的依存は copilot→harness の一方向）。
 const copilot = harness.copilot;
+const netsync = harness.netsync;
 // ゲームパッド実 backend（GameController framework）の opt-in フラグ（TASK-80.2 opt-in 化。audio の
 // `link_audio` と対称）。build.zig の `createPlatformModule`/`buildStandalone` が常にこの named import を
 // 付与するため（外部公開 module も含む）、全 caller で安全に参照できる。
@@ -128,6 +129,9 @@ pub const Window = struct {
     }
 
     pub fn pollEvents(self: Window) bool {
+        // netsync.pump は headless の pollGate 早期 return より前（全経路・毎フレーム。TASK-62.3.2）。
+        // queue 空なら即 return。env 未設定時も started ガードでパススルー。
+        netsync.pump();
         if (self.headless) return harness.pollGate(true); // native window closed 相当が無いので常に continue
         var inner = self.inner;
         const native = inner.pollEvents();
@@ -237,9 +241,12 @@ pub fn init() Error!void {
     }
     harness.startTransport();
     copilot.startTransport();
+    // netsync は headless 分岐でも起動（env 未設定なら initFromEnv 即 return。TASK-62.3.2）。
+    netsync.initFromEnv();
 }
 
 pub fn shutdown() void {
+    netsync.shutdown(); // main thread で setRouter(null)。disabled 時は no-op
     copilot.stopTransport(); // 接続中 stream → listener の順に close（disabled 時は no-op）
     if (harness.isHeadlessActive()) return; // backend.init() を呼んでいないので shutdown も呼ばない
     backend.shutdown();
@@ -305,6 +312,7 @@ pub const command = harness.command;
 /// **harness 無効・copilot 無効時も呼んでよい**（module 変数の代入のみの no-op 規約）。
 pub fn setCommandExecutor(exec: ?*command.Executor) void {
     copilot.setSharedExecutor(exec);
+    netsync.setSharedExecutor(exec); // remote COMMIT 適用（no_record）。未設定時 netsync は dispatch fallback
 }
 
 // ============================================================================

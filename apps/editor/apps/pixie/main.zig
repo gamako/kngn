@@ -2050,10 +2050,10 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record) });
     platform.registerAction(.{ .name = "frame", .ctx = app, .run = recordedAction("frame", .record) });
     platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = recordedAction("set_onion", .record) });
-    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record) });
-    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record) });
-    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke });
-    platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record) });
+    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay });
+    platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only });
     platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record) });
 }
 

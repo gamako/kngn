@@ -35,6 +35,7 @@ const types = @import("platform_types");
 const png = @import("png");
 const capture_synthetic = @import("capture_synthetic"); // synthetic capture source（TASK-49.5）
 pub const action_registry = @import("action_registry.zig"); // TASK-62.3.1: Action/registry 分離
+pub const netsync = @import("netsync.zig"); // TASK-62.3.2: PROPOSE/COMMIT/REJECT（同一 action_registry インスタンス共有）
 
 const Event = types.Event;
 const KeyCode = types.KeyCode;
