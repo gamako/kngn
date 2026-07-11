@@ -7,10 +7,12 @@ const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
 const sfnt = @import("sfnt.zig");
 const outline = @import("outline.zig");
+const gvar_mod = @import("gvar.zig");
 
 const Vec2f = outline.Vec2f;
 const Outline = outline.Outline;
 const Builder = outline.Builder;
+const Gvar = gvar_mod.Gvar;
 
 pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 
@@ -88,26 +90,84 @@ pub const Glyf = struct {
     }
 
     /// gid の輪郭を Outline（font units）として返す。空グリフは空 contours。
+    /// 可変無し（gvar 未適用）の default 外形。後方互換。
     pub fn outline(self: *const Glyf, alloc: std.mem.Allocator, gid: u16) Error!Outline {
+        return self.outlineVaried(alloc, gid, null, &.{});
+    }
+
+    /// 可変対応 outline。gvar が null または norm が空/全 0 なら default 外形と bit 一致。
+    /// composite の gvar デルタは本フェーズでは無視（default 成分合成）。
+    pub fn outlineVaried(
+        self: *const Glyf,
+        alloc: std.mem.Allocator,
+        gid: u16,
+        gvar: ?*const Gvar,
+        norm: []const f32,
+    ) Error!Outline {
         var b = Builder.init(alloc);
         errdefer b.deinit();
-        try self.appendGlyph(gid, &b, .{}, 0);
+        try self.appendGlyph(gid, &b, .{}, 0, gvar, norm);
         return try b.finish();
     }
 
-    fn appendGlyph(self: *const Glyf, gid: u16, b: *Builder, xform: Xform, depth: u32) Error!void {
+    /// phantom 経路用: simple の点数と座標・endPts を返す（composite/空は null）。
+    /// 呼び出し側が pts/end_pts を free。
+    pub fn parseSimpleGeometry(
+        self: *const Glyf,
+        alloc: std.mem.Allocator,
+        gid: u16,
+    ) Error!?struct { pts: []Vec2f, end_pts: []u16 } {
+        const data = (try self.glyphData(gid)) orelse return null;
+        const r = Reader{ .data = data };
+        const num_contours_i = try r.i16At(0);
+        if (num_contours_i < 0) return null; // composite
+        const num_contours: u16 = @intCast(num_contours_i);
+        var parsed = try parseSimplePoints(alloc, data, num_contours);
+        alloc.free(parsed.flags);
+        parsed.flags = &.{};
+        if (parsed.pts.len == 0) {
+            alloc.free(parsed.pts);
+            alloc.free(parsed.end_pts);
+            return null;
+        }
+        // flags は不要。pts の on は捨てて Vec2f だけ返す
+        const coords = try alloc.alloc(Vec2f, parsed.pts.len);
+        errdefer alloc.free(coords);
+        for (parsed.pts, 0..) |pt, i| coords[i] = pt.p;
+        alloc.free(parsed.pts);
+        return .{ .pts = coords, .end_pts = parsed.end_pts };
+    }
+
+    fn appendGlyph(
+        self: *const Glyf,
+        gid: u16,
+        b: *Builder,
+        xform: Xform,
+        depth: u32,
+        gvar: ?*const Gvar,
+        norm: []const f32,
+    ) Error!void {
         if (depth > max_component_depth) return error.InvalidFont;
         const data = (try self.glyphData(gid)) orelse return; // 空グリフ
         const r = Reader{ .data = data };
         const num_contours = try r.i16At(0);
         if (num_contours >= 0) {
-            try appendSimple(alloc_of(b), data, @intCast(num_contours), b, xform);
+            try appendSimple(alloc_of(b), data, @intCast(num_contours), b, xform, gvar, gid, norm);
         } else {
-            try self.appendComposite(data, b, xform, depth);
+            // composite: gvar デルタ無視（Ph-gvar-simple）。成分は再帰で varied。
+            try self.appendComposite(data, b, xform, depth, gvar, norm);
         }
     }
 
-    fn appendComposite(self: *const Glyf, data: []const u8, b: *Builder, parent: Xform, depth: u32) Error!void {
+    fn appendComposite(
+        self: *const Glyf,
+        data: []const u8,
+        b: *Builder,
+        parent: Xform,
+        depth: u32,
+        gvar: ?*const Gvar,
+        norm: []const f32,
+    ) Error!void {
         const r = Reader{ .data = data };
         try r.require(0, 10); // glyph header
         var p: usize = 10; // header 後
@@ -169,7 +229,7 @@ pub const Glyf = struct {
                 comp.dy = ody;
             }
 
-            try self.appendGlyph(gid, b, parent.compose(comp), depth + 1);
+            try self.appendGlyph(gid, b, parent.compose(comp), depth + 1, gvar, norm);
             if (flags & 0x0020 == 0) break; // MORE_COMPONENTS なし
         }
         // WE_HAVE_INSTRUCTIONS: 末尾 instructions は描画には使わないが、範囲だけは検証する
@@ -190,11 +250,17 @@ fn alloc_of(b: *Builder) std.mem.Allocator {
 
 const Pt = struct { p: Vec2f, on: bool };
 
-fn appendSimple(alloc: std.mem.Allocator, data: []const u8, num_contours: u16, b: *Builder, xform: Xform) Error!void {
-    const r = Reader{ .data = data };
-    try r.require(0, 10); // glyph header（numberOfContours + bbox）
+const ParsedSimple = struct {
+    pts: []Pt,
+    end_pts: []u16,
+    flags: []u8,
+};
 
-    // endPtsOfContours（昇順=厳密増加を検証）
+/// simple 点列を復元（flags RLE + x/y デルタ）。呼び出し側が全 slice を free。
+fn parseSimplePoints(alloc: std.mem.Allocator, data: []const u8, num_contours: u16) Error!ParsedSimple {
+    const r = Reader{ .data = data };
+    try r.require(0, 10);
+
     const end_pts_off = 10;
     var prev: i32 = -1;
     var ci: usize = 0;
@@ -205,16 +271,24 @@ fn appendSimple(alloc: std.mem.Allocator, data: []const u8, num_contours: u16, b
     }
     const num_points: usize = if (num_contours == 0) 0 else @as(usize, @intCast(prev)) + 1;
 
-    // instructionLength + instructions skip（0-contour でも範囲を検証）
     const instr_len_off = end_pts_off + 2 * @as(usize, num_contours);
     const instr_len = try r.u16At(instr_len_off);
     var pos: usize = instr_len_off + 2 + instr_len;
-    try r.require(pos, 0); // instructions が slice 内
-    if (num_points == 0) return; // 輪郭なし（header/instructions は検証済み）
+    try r.require(pos, 0);
 
-    // flags（RLE 展開）
+    const end_pts = try alloc.alloc(u16, num_contours);
+    errdefer alloc.free(end_pts);
+    ci = 0;
+    while (ci < num_contours) : (ci += 1) {
+        end_pts[ci] = try r.u16At(end_pts_off + 2 * ci);
+    }
+
+    if (num_points == 0) {
+        return .{ .pts = try alloc.alloc(Pt, 0), .end_pts = end_pts, .flags = try alloc.alloc(u8, 0) };
+    }
+
     const flags = try alloc.alloc(u8, num_points);
-    defer alloc.free(flags);
+    errdefer alloc.free(flags);
     {
         var i: usize = 0;
         while (i < num_points) {
@@ -222,10 +296,10 @@ fn appendSimple(alloc: std.mem.Allocator, data: []const u8, num_contours: u16, b
             pos += 1;
             flags[i] = f;
             i += 1;
-            if (f & 0x08 != 0) { // REPEAT
+            if (f & 0x08 != 0) {
                 const rep = try r.u8At(pos);
                 pos += 1;
-                if (rep > num_points - i) return error.InvalidFont; // RLE オーバーラン
+                if (rep > num_points - i) return error.InvalidFont;
                 var k: usize = 0;
                 while (k < rep) : (k += 1) {
                     flags[i] = f;
@@ -235,32 +309,30 @@ fn appendSimple(alloc: std.mem.Allocator, data: []const u8, num_contours: u16, b
         }
     }
 
-    // x 座標（デルタ、i32 累積）
     const pts = try alloc.alloc(Pt, num_points);
-    defer alloc.free(pts);
+    errdefer alloc.free(pts);
     {
         var x: i32 = 0;
         var i: usize = 0;
         while (i < num_points) : (i += 1) {
             const f = flags[i];
-            if (f & 0x02 != 0) { // X_SHORT
+            if (f & 0x02 != 0) {
                 const d = try r.u8At(pos);
                 pos += 1;
                 x += if (f & 0x10 != 0) @as(i32, d) else -@as(i32, d);
-            } else if (f & 0x10 == 0) { // 2-byte signed delta
+            } else if (f & 0x10 == 0) {
                 x += try r.i16At(pos);
                 pos += 2;
-            } // else: same（バイト消費なし）
+            }
             pts[i].p.x = @floatFromInt(x);
         }
     }
-    // y 座標
     {
         var y: i32 = 0;
         var i: usize = 0;
         while (i < num_points) : (i += 1) {
             const f = flags[i];
-            if (f & 0x04 != 0) { // Y_SHORT
+            if (f & 0x04 != 0) {
                 const d = try r.u8At(pos);
                 pos += 1;
                 y += if (f & 0x20 != 0) @as(i32, d) else -@as(i32, d);
@@ -272,13 +344,49 @@ fn appendSimple(alloc: std.mem.Allocator, data: []const u8, num_contours: u16, b
             pts[i].on = flags[i] & 0x01 != 0;
         }
     }
+    return .{ .pts = pts, .end_pts = end_pts, .flags = flags };
+}
 
-    // 各 contour を implicit on-curve 解決しながら Builder へ
+fn appendSimple(
+    alloc: std.mem.Allocator,
+    data: []const u8,
+    num_contours: u16,
+    b: *Builder,
+    xform: Xform,
+    gvar: ?*const Gvar,
+    gid: u16,
+    norm: []const f32,
+) Error!void {
+    var parsed = try parseSimplePoints(alloc, data, num_contours);
+    defer {
+        alloc.free(parsed.pts);
+        alloc.free(parsed.end_pts);
+        alloc.free(parsed.flags);
+    }
+    if (parsed.pts.len == 0) return;
+
+    // gvar 適用（font units 点空間・buildContour 前）
+    if (gvar) |gv| {
+        if (norm.len >= gv.axis_count and gv.axis_count > 0) {
+            const n = parsed.pts.len;
+            const deltas = try alloc.alloc(Vec2f, n + 4);
+            defer alloc.free(deltas);
+            const coords = try alloc.alloc(Vec2f, n);
+            defer alloc.free(coords);
+            for (parsed.pts, 0..) |pt, i| coords[i] = pt.p;
+            try gv.applySimple(alloc, gid, coords, parsed.end_pts, norm, deltas);
+            for (parsed.pts, 0..) |*pt, i| {
+                pt.p.x += deltas[i].x;
+                pt.p.y += deltas[i].y;
+            }
+        }
+    }
+
     var start_idx: usize = 0;
-    ci = 0;
+    var ci: usize = 0;
     while (ci < num_contours) : (ci += 1) {
-        const end_idx = try r.u16At(end_pts_off + 2 * ci);
-        const seg = pts[start_idx .. @as(usize, end_idx) + 1];
+        const end_idx = parsed.end_pts[ci];
+        const seg = parsed.pts[start_idx .. @as(usize, end_idx) + 1];
         start_idx = @as(usize, end_idx) + 1;
         try buildContour(b, seg, xform);
     }

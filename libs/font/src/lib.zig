@@ -17,6 +17,8 @@ pub const bmfont = @import("bmfont.zig");
 pub const sbix = @import("sbix.zig");
 pub const fvar = @import("fvar.zig");
 pub const avar = @import("avar.zig");
+pub const gvar = @import("gvar.zig");
+pub const hvar = @import("hvar.zig");
 pub const var_common = @import("var_common.zig");
 pub const text_layer = @import("text_layer.zig");
 
@@ -73,6 +75,8 @@ test {
     _ = sbix;
     _ = fvar;
     _ = avar;
+    _ = gvar;
+    _ = hvar;
     _ = var_common;
     _ = text_layer;
 }

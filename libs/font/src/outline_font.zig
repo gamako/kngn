@@ -20,6 +20,8 @@ const outline_mod = @import("outline.zig");
 const sbix_mod = @import("sbix.zig");
 const fvar_mod = @import("fvar.zig");
 const avar_mod = @import("avar.zig");
+const gvar_mod = @import("gvar.zig");
+const hvar_mod = @import("hvar.zig");
 const var_common = @import("var_common.zig");
 const png_mod = @import("png");
 const pixelops = @import("pixelops");
@@ -56,6 +58,10 @@ pub const FontFace = struct {
     fvar: ?fvar_mod.Fvar = null,
     /// avar テーブル（正規化座標の非線形マップ）。fvar があるときのみ・不在は identity。
     avar: ?avar_mod.Avar = null,
+    /// gvar テーブル（glyf 点変分）。不在は default 外形。破損は InvalidFont。
+    gvar: ?gvar_mod.Gvar = null,
+    /// HVAR テーブル（advance 変分）。不在は phantom fallback。破損は InvalidFont。
+    hvar: ?hvar_mod.Hvar = null,
 
     /// data は呼び出し側所有・FontFace より長命であること。
     pub fn init(data: []const u8) Error!FontFace {
@@ -90,6 +96,8 @@ pub const FontFace = struct {
 
         var fvar_opt: ?fvar_mod.Fvar = null;
         var avar_opt: ?avar_mod.Avar = null;
+        var gvar_opt: ?gvar_mod.Gvar = null;
+        var hvar_opt: ?hvar_mod.Hvar = null;
         if (sf.tableSlice("fvar") catch return error.InvalidFont) |fvar_tbl| {
             const fv = fvar_mod.Fvar.parse(fvar_tbl) catch |e| switch (e) {
                 error.Unsupported => return error.Unsupported,
@@ -102,9 +110,34 @@ pub const FontFace = struct {
                     else => return error.InvalidFont,
                 };
             }
+            if (has_glyf) {
+                if (sf.tableSlice("gvar") catch return error.InvalidFont) |gvar_tbl| {
+                    gvar_opt = gvar_mod.Gvar.parse(gvar_tbl, sf.num_glyphs, fv.axis_count) catch |e| switch (e) {
+                        error.Unsupported => return error.Unsupported,
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.InvalidFont,
+                    };
+                }
+            }
+            if (sf.tableSlice("HVAR") catch return error.InvalidFont) |hvar_tbl| {
+                hvar_opt = hvar_mod.Hvar.parse(hvar_tbl, fv.axis_count) catch |e| switch (e) {
+                    error.Unsupported => return error.Unsupported,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidFont,
+                };
+            }
         }
 
-        return .{ .sfnt = sf, .source = source, .cmap = cm, .sbix = sbx, .fvar = fvar_opt, .avar = avar_opt };
+        return .{
+            .sfnt = sf,
+            .source = source,
+            .cmap = cm,
+            .sbix = sbx,
+            .fvar = fvar_opt,
+            .avar = avar_opt,
+            .gvar = gvar_opt,
+            .hvar = hvar_opt,
+        };
     }
 };
 
@@ -160,6 +193,9 @@ pub const OutlineFont = struct {
     axis_norm: [MAX_AXES]f32 = .{0} ** MAX_AXES,
     axis_count: u16 = 0,
     axes_generation: u32 = 0,
+    /// 軸別 advance cache（numGlyphs 長・案(b)）。軸変更で eager 再構築。非可変は null。
+    /// measure(*const)/color drawGlyphs は read-only 参照のみ（確保しない）。
+    advance_cache: ?[]f32 = null,
 
     pub fn init(alloc: std.mem.Allocator, face: *const FontFace, px: f32) OutlineFont {
         // px をサニタイズ（非有限/非正/過大 → 安全値）。advance/メトリクスの trap・暴走を防ぐ。
@@ -211,6 +247,7 @@ pub const OutlineFont = struct {
     }
 
     /// design space で 1 軸設定。未知 tag / 非可変 face は Unsupported。
+    /// 軸変更で advance_cache を eager 再構築（OOM は error.OutOfMemory）。
     pub fn setAxis(self: *OutlineFont, tag: *const [4]u8, value: f32) Error!void {
         if (self.axis_count == 0) return error.Unsupported;
         if (!std.math.isFinite(value)) return error.Unsupported;
@@ -219,9 +256,7 @@ pub const OutlineFont = struct {
         const ax = fv.axes[idx];
         self.axis_design[idx] = std.math.clamp(value, ax.min, ax.max);
         self.recomputeNormFromDesign();
-        self.clearCache();
-        self.clearColorCache();
-        self.axes_generation +%= 1;
+        try self.onAxesChanged();
     }
 
     /// 全軸を design 配列で設定（len == axis_count）。
@@ -237,9 +272,7 @@ pub const OutlineFont = struct {
             self.axis_design[i] = std.math.clamp(v, ax.min, ax.max);
         }
         self.recomputeNormFromDesign();
-        self.clearCache();
-        self.clearColorCache();
-        self.axes_generation +%= 1;
+        try self.onAxesChanged();
     }
 
     /// fvar の named instance を選択。
@@ -252,8 +285,8 @@ pub const OutlineFont = struct {
         try self.setAxes(coords[0..fv.axis_count]);
     }
 
-    /// 全軸 default に戻す。
-    pub fn resetAxes(self: *OutlineFont) void {
+    /// 全軸 default に戻す。cache 再構築の OOM を伝播。
+    pub fn resetAxes(self: *OutlineFont) Error!void {
         if (self.axis_count == 0) return;
         const fv = self.face.fvar.?;
         var i: u16 = 0;
@@ -261,9 +294,75 @@ pub const OutlineFont = struct {
             self.axis_design[i] = fv.axes[i].def;
         }
         self.recomputeNormFromDesign();
+        try self.onAxesChanged();
+    }
+
+    fn onAxesChanged(self: *OutlineFont) Error!void {
         self.clearCache();
         self.clearColorCache();
         self.axes_generation +%= 1;
+        try self.rebuildAdvanceCache();
+    }
+
+    fn freeAdvanceCache(self: *OutlineFont) void {
+        if (self.advance_cache) |c| {
+            self.alloc.free(c);
+            self.advance_cache = null;
+        }
+    }
+
+    /// 軸変更時: 全 GID の advance を eager 構築（HVAR > phantom > hmtx）。
+    fn rebuildAdvanceCache(self: *OutlineFont) Error!void {
+        self.freeAdvanceCache();
+        if (self.axis_count == 0) return;
+        const n = self.face.sfnt.num_glyphs;
+        const cache = try self.alloc.alloc(f32, n);
+        errdefer self.alloc.free(cache);
+        var gid: u16 = 0;
+        while (gid < n) : (gid += 1) {
+            cache[gid] = try self.computeAdvancePx(gid);
+        }
+        self.advance_cache = cache;
+    }
+
+    /// metrics 専用経路: advance（px）。outline 構築はしない。
+    /// HVAR > gvar phantom > default hmtx。
+    fn computeAdvancePx(self: *const OutlineFont, gid: u16) Error!f32 {
+        const base_fu: f32 = @floatFromInt(self.face.sfnt.advanceWidth(gid) catch 0);
+        var delta_fu: f32 = 0;
+        if (self.face.hvar) |*hv| {
+            delta_fu = hv.advanceDelta(gid, self.axis_norm[0..self.axis_count]) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidFont,
+            };
+        } else if (self.face.gvar) |*gv| {
+            // phantom fallback（simple のみ。composite/空は 0）
+            delta_fu = self.phantomAdvanceDelta(gv, gid) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidFont,
+            };
+        }
+        return (base_fu + delta_fu) * self.scale;
+    }
+
+    fn phantomAdvanceDelta(self: *const OutlineFont, gv: *const gvar_mod.Gvar, gid: u16) Error!f32 {
+        const g = switch (self.face.source) {
+            .glyf => |*gl| gl,
+            .cff => return 0,
+        };
+        const geom = (try g.parseSimpleGeometry(self.alloc, gid)) orelse return 0;
+        defer {
+            self.alloc.free(geom.pts);
+            self.alloc.free(geom.end_pts);
+        }
+        return try gv.phantomAdvanceDelta(
+            self.alloc,
+            gid,
+            geom.pts.len,
+            geom.pts,
+            geom.end_pts,
+            self.axis_norm[0..self.axis_count],
+        );
     }
 
     fn recomputeNormFromDesign(self: *OutlineFont) void {
@@ -285,6 +384,7 @@ pub const OutlineFont = struct {
         self.cache.deinit(self.alloc);
         self.freeColorBitmaps();
         self.color_cache.deinit(self.alloc);
+        self.freeAdvanceCache();
         self.* = undefined;
     }
 
@@ -334,6 +434,9 @@ pub const OutlineFont = struct {
         return self.metrics();
     }
 
+    /// ピクセルメトリクス（ascender 等）。**MVAR 非対応のため軸非依存の近似**
+    /// （default インスタンスの hhea/OS/2 由来）。可変で縦メトリクスが変わるフォントでは
+    /// 正確な軸依存値にはならない。
     pub fn metrics(self: *const OutlineFont) Metrics {
         return self.face.sfnt.pixelMetrics(self.px);
     }
@@ -343,7 +446,12 @@ pub const OutlineFont = struct {
         return if (gid >= self.face.sfnt.num_glyphs) 0 else gid;
     }
 
+    /// advance（px）。advance_cache があれば O(1) read-only。無ければ default hmtx。
+    /// 軸変更後は cache が構築済み（案(b)）。const 経路では gvar/HVAR を decode しない。
     fn advancePx(self: *const OutlineFont, gid: u16) f32 {
+        if (self.advance_cache) |c| {
+            if (gid < c.len) return c[gid];
+        }
         const aw = self.face.sfnt.advanceWidth(gid) catch 0;
         return @as(f32, @floatFromInt(aw)) * self.scale;
     }
@@ -472,7 +580,12 @@ pub const OutlineFont = struct {
     fn buildGlyph(self: *OutlineFont, gid: u16) Error!CachedGlyph {
         const adv = self.advancePx(gid);
         var ol = (switch (self.face.source) {
-            .glyf => |*g| g.outline(self.alloc, gid),
+            .glyf => |*g| g.outlineVaried(
+                self.alloc,
+                gid,
+                if (self.face.gvar) |*gv| gv else null,
+                self.axis_norm[0..self.axis_count],
+            ),
             .cff => |*c| c.outline(self.alloc, gid),
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -789,8 +902,10 @@ fn buildTriangleGlyph(a: std.mem.Allocator, pts: []const [2]i16) ![]u8 {
     return g.toOwnedSlice(a);
 }
 
+const SfntTable = struct { tag: [4]u8, body: []const u8 };
+
 /// sfnt(tag,body) 群からフォントバイト列を組む。
-fn buildSfnt(a: std.mem.Allocator, tables: []const struct { tag: [4]u8, body: []const u8 }) ![]u8 {
+fn buildSfnt(a: std.mem.Allocator, tables: []const SfntTable) ![]u8 {
     const n: u16 = @intCast(tables.len);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
@@ -2191,7 +2306,7 @@ test "TASK-25.15.1: 軸 API setAxis/setAxes/resetAxes/selectNamedInstance" {
     try of.setAxes(&.{400});
     try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
 
-    of.resetAxes();
+    try of.resetAxes();
     try testing.expectApproxEqAbs(@as(f32, 400), of.axisValue(0).?, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
 }
@@ -2517,6 +2632,328 @@ test "TASK-25.15.1: setAxis 後 clearCache（axes_generation 増加）" {
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     try of.setAxis(&wght, 700);
     try testing.expectEqual(@as(u32, 0), of.cache.count()); // clearCache 済み
+}
+
+// ── TASK-25.15.2: gvar / HVAR / advance_cache ──
+
+fn appendI16List(l: *std.ArrayList(u8), a: std.mem.Allocator, v: i16) !void {
+    try appendU16(l, a, @bitCast(v));
+}
+
+/// 1 軸 gvar（gid1='A' に全点デルタ）。gid0/2 は空 variation。
+fn buildGvarForTestFont(a: std.mem.Allocator, n_outline: usize, dx: []const i16, dy: []const i16) ![]u8 {
+    // n_total = n_outline + 4
+    const n_total = n_outline + 4;
+    std.debug.assert(dx.len == n_total and dy.len == n_total);
+
+    // GVD for gid1
+    var ser: std.ArrayList(u8) = .empty;
+    defer ser.deinit(a);
+    try ser.append(a, 0); // all points
+    // X then Y deltas as i16 runs
+    var i: usize = 0;
+    while (i < n_total) {
+        const run = @min(n_total - i, 64);
+        try ser.append(a, 0x40 | @as(u8, @intCast(run - 1)));
+        var k: usize = 0;
+        while (k < run) : (k += 1) try appendI16List(&ser, a, dx[i + k]);
+        i += run;
+    }
+    i = 0;
+    while (i < n_total) {
+        const run = @min(n_total - i, 64);
+        try ser.append(a, 0x40 | @as(u8, @intCast(run - 1)));
+        var k: usize = 0;
+        while (k < run) : (k += 1) try appendI16List(&ser, a, dy[i + k]);
+        i += run;
+    }
+
+    var gvd: std.ArrayList(u8) = .empty;
+    defer gvd.deinit(a);
+    const data_off: u16 = 4 + 4 + 2;
+    try appendU16(&gvd, a, 1);
+    try appendU16(&gvd, a, data_off);
+    try appendU16(&gvd, a, @intCast(ser.items.len));
+    try appendU16(&gvd, a, 0x8000 | 0x2000);
+    try appendI16List(&gvd, a, var_common.f32ToF2dot14(1.0));
+    try gvd.appendSlice(a, ser.items);
+
+    // 3 glyphs: 0 empty, 1 = gvd, 2 empty
+    // offsets long: 0, 0, gvd.len, gvd.len
+    var table: std.ArrayList(u8) = .empty;
+    errdefer table.deinit(a);
+    try appendU16(&table, a, 1);
+    try appendU16(&table, a, 0);
+    try appendU16(&table, a, 1); // axisCount
+    try appendU16(&table, a, 0);
+    try appendU32(&table, a, 0);
+    try appendU16(&table, a, 3); // glyphCount
+    try appendU16(&table, a, 1); // long offsets
+    const gvd_off: u32 = 20 + 4 * 4; // header + 4 offsets
+    try appendU32(&table, a, gvd_off);
+    try appendU32(&table, a, 0); // gid0
+    try appendU32(&table, a, 0); // gid0 end = gid1 start
+    try appendU32(&table, a, @intCast(gvd.items.len)); // gid1 end
+    try appendU32(&table, a, @intCast(gvd.items.len)); // gid2 end
+    try table.appendSlice(a, gvd.items);
+    return table.toOwnedSlice(a);
+}
+
+/// HVAR direct: 3 items (per gid), 1 region peak=1, deltas [0, 16, 0] for gid0/1/2.
+fn buildHvarForTestFont() [80]u8 {
+    var buf: [80]u8 = .{0} ** 80;
+    putU16(&buf, 0, 1);
+    putU16(&buf, 2, 0);
+    putU32(&buf, 4, 20);
+    putU32(&buf, 8, 0); // direct
+    putU32(&buf, 12, 0);
+    putU32(&buf, 16, 0);
+    const ivs: usize = 20;
+    putU16(&buf, ivs, 1);
+    putU32(&buf, ivs + 2, 12);
+    putU16(&buf, ivs + 6, 1);
+    putU32(&buf, ivs + 8, 22);
+    const rl = ivs + 12;
+    putU16(&buf, rl, 1);
+    putU16(&buf, rl + 2, 1);
+    putI16(&buf, rl + 4, var_common.f32ToF2dot14(0));
+    putI16(&buf, rl + 6, var_common.f32ToF2dot14(1));
+    putI16(&buf, rl + 8, var_common.f32ToF2dot14(1));
+    const ivd = ivs + 22;
+    putU16(&buf, ivd, 3); // 3 items for gid 0,1,2
+    putU16(&buf, ivd + 2, 0);
+    putU16(&buf, ivd + 4, 1);
+    putU16(&buf, ivd + 6, 0);
+    buf[ivd + 8] = 0;
+    buf[ivd + 9] = 16; // advance delta for 'A'
+    buf[ivd + 10] = 0;
+    return buf;
+}
+
+fn buildVarFontWithGvarHvar(
+    a: std.mem.Allocator,
+    adv: u16,
+    gvar_tbl: ?[]const u8,
+    hvar_tbl: ?[]const u8,
+) ![]u8 {
+    const fvar_tbl = buildFvarTableWght();
+    var head = [_]u8{0} ** 54;
+    head[12] = 0x5F;
+    head[13] = 0x0F;
+    head[14] = 0x3C;
+    head[15] = 0xF5;
+    putU16(&head, 18, 64);
+    putU16(&head, 50, 0);
+    var maxp = [_]u8{0} ** 6;
+    putU16(&maxp, 4, 3);
+    var hhea = [_]u8{0} ** 36;
+    putU16(&hhea, 4, @bitCast(@as(i16, 48)));
+    putU16(&hhea, 6, @bitCast(@as(i16, -16)));
+    putU16(&hhea, 34, 3);
+    var hmtx = [_]u8{0} ** (4 * 3);
+    putU16(&hmtx, 0, adv);
+    putU16(&hmtx, 4, adv);
+    putU16(&hmtx, 8, adv);
+    const tri = try buildTriangleGlyph(a, &.{ .{ 8, 0 }, .{ 56, 0 }, .{ 32, 48 } });
+    defer a.free(tri);
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(a);
+    var loca: std.ArrayList(u8) = .empty;
+    defer loca.deinit(a);
+    try appendU16(&loca, a, 0);
+    try appendU16(&loca, a, 0);
+    try glyf.appendSlice(a, tri);
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    var cmap_sub = [_]u8{0} ** (16 + 8 * 3);
+    putU16(&cmap_sub, 0, 4);
+    putU16(&cmap_sub, 2, @intCast(cmap_sub.len));
+    putU16(&cmap_sub, 6, 6);
+    const end_off = 14;
+    const reserved_off = end_off + 2 * 3;
+    const start_off = reserved_off + 2;
+    const delta_off = start_off + 2 * 3;
+    const range_off = delta_off + 2 * 3;
+    putU16(&cmap_sub, end_off + 0, 0x20);
+    putU16(&cmap_sub, start_off + 0, 0x20);
+    putU16(&cmap_sub, delta_off + 0, @bitCast(@as(i16, 2 - 0x20)));
+    putU16(&cmap_sub, range_off + 0, 0);
+    putU16(&cmap_sub, end_off + 2, 0x41);
+    putU16(&cmap_sub, start_off + 2, 0x41);
+    putU16(&cmap_sub, delta_off + 2, @bitCast(@as(i16, 1 - 0x41)));
+    putU16(&cmap_sub, range_off + 2, 0);
+    putU16(&cmap_sub, end_off + 4, 0xFFFF);
+    putU16(&cmap_sub, start_off + 4, 0xFFFF);
+    putU16(&cmap_sub, delta_off + 4, 1);
+    putU16(&cmap_sub, range_off + 4, 0);
+    var cmap_tbl = [_]u8{0} ** (4 + 8 + cmap_sub.len);
+    putU16(&cmap_tbl, 0, 0);
+    putU16(&cmap_tbl, 2, 1);
+    putU16(&cmap_tbl, 4, 3);
+    putU16(&cmap_tbl, 6, 1);
+    cmap_tbl[11] = 12;
+    @memcpy(cmap_tbl[12..], &cmap_sub);
+
+    // 動的にテーブル列を組む
+    var tables: std.ArrayList(SfntTable) = .empty;
+    defer tables.deinit(a);
+    try tables.append(a, .{ .tag = "head".*, .body = &head });
+    try tables.append(a, .{ .tag = "maxp".*, .body = &maxp });
+    try tables.append(a, .{ .tag = "hhea".*, .body = &hhea });
+    try tables.append(a, .{ .tag = "hmtx".*, .body = &hmtx });
+    try tables.append(a, .{ .tag = "cmap".*, .body = &cmap_tbl });
+    try tables.append(a, .{ .tag = "loca".*, .body = loca.items });
+    try tables.append(a, .{ .tag = "glyf".*, .body = glyf.items });
+    try tables.append(a, .{ .tag = "fvar".*, .body = &fvar_tbl });
+    if (gvar_tbl) |gt| try tables.append(a, .{ .tag = "gvar".*, .body = gt });
+    if (hvar_tbl) |ht| try tables.append(a, .{ .tag = "HVAR".*, .body = ht });
+    return buildSfnt(a, tables.items);
+}
+
+test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一致" {
+    const a = testing.allocator;
+    // triangle 3 points + 4 phantom
+    const dx = [_]i16{ 10, 10, 10, 0, 0, 0, 0 };
+    const dy = [_]i16{ 0, 0, 0, 0, 0, 0, 0 };
+    const gvar_tbl = try buildGvarForTestFont(a, 3, &dx, &dy);
+    defer a.free(gvar_tbl);
+    const data = try buildVarFontWithGvarHvar(a, 64, gvar_tbl, null);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    try testing.expect(face.gvar != null);
+
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+
+    // norm=0: outline は default と一致（outlineVaried vs outline）
+    const g = face.source.glyf;
+    var o0 = try g.outline(a, 1);
+    defer o0.deinit(a);
+    var o1 = try g.outlineVaried(a, 1, &face.gvar.?, &.{0},);
+    defer o1.deinit(a);
+    try testing.expectEqual(o0.contours[0].start.x, o1.contours[0].start.x);
+
+    // setAxis max → norm=1 → 点 x が +10
+    try of.setAxis(&wght, 900);
+    var o2 = try g.outlineVaried(a, 1, &face.gvar.?, of.axis_norm[0..1]);
+    defer o2.deinit(a);
+    try testing.expectApproxEqAbs(o0.contours[0].start.x + 10, o2.contours[0].start.x, 0.5);
+
+    // 描画 snapshot: 軸変更前後でピクセルが変わる
+    const W = 80;
+    var px_before = [_]u32{0xFF000000} ** (W * W);
+    var px_after = [_]u32{0xFF000000} ** (W * W);
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    try of.resetAxes();
+    of.drawTo(.{ .pixels = &px_before, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+    try of.setAxis(&wght, 900);
+    of.drawTo(.{ .pixels = &px_after, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+    try testing.expect(!std.mem.eql(u32, &px_before, &px_after));
+}
+
+test "TASK-25.15.2: HVAR advance が measure/draw 送りと一致" {
+    const a = testing.allocator;
+    const hvar_tbl = buildHvarForTestFont();
+    const data = try buildVarFontWithGvarHvar(a, 64, null, &hvar_tbl);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    try testing.expect(face.hvar != null);
+    var of = OutlineFont.init(a, &face, 64); // scale=1
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of.setAxis(&wght, 900); // norm=1 → delta=+16 → advance=80
+    try testing.expect(of.advance_cache != null);
+    try testing.expectApproxEqAbs(@as(f32, 80), of.advance_cache.?[1], 0.01);
+    try testing.expectEqual(@as(u32, 80), of.measure("A"));
+
+    // draw の送り: 'A' + space。space は delta 0 → 64。合計 144
+    try testing.expectEqual(@as(u32, 144), of.measure("A "));
+    // CachedGlyph.advance も cache 経由
+    const cg = try of.getCached(1);
+    try testing.expectApproxEqAbs(@as(f32, 80), cg.advance, 0.01);
+}
+
+test "TASK-25.15.2: phantom advance fallback（HVAR 無し）" {
+    const a = testing.allocator;
+    // phantom: n=3 → indices 3,4。dx[3]=0, dx[4]=8 → advance delta=8
+    const dx = [_]i16{ 0, 0, 0, 0, 8, 0, 0 };
+    const dy = [_]i16{ 0, 0, 0, 0, 0, 0, 0 };
+    const gvar_tbl = try buildGvarForTestFont(a, 3, &dx, &dy);
+    defer a.free(gvar_tbl);
+    const data = try buildVarFontWithGvarHvar(a, 64, gvar_tbl, null);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    try testing.expect(face.hvar == null);
+    try testing.expect(face.gvar != null);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of.setAxis(&wght, 900);
+    try testing.expectApproxEqAbs(@as(f32, 72), of.advance_cache.?[1], 0.01); // 64+8
+    try testing.expectEqual(@as(u32, 72), of.measure("A"));
+}
+
+test "TASK-25.15.2: advance_cache は axis change で再構築・measure は decode しない" {
+    const a = testing.allocator;
+    const hvar_tbl = buildHvarForTestFont();
+    const data = try buildVarFontWithGvarHvar(a, 64, null, &hvar_tbl);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    try testing.expect(of.advance_cache == null); // init 時は null
+
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of.setAxis(&wght, 900);
+    try testing.expectApproxEqAbs(@as(f32, 80), of.advance_cache.?[1], 0.01);
+
+    // measure は const・cache read のみ（gvar/HVAR decode しない）
+    try testing.expectEqual(@as(u32, 80), of.measure("A"));
+
+    try of.setAxis(&wght, 400); // norm=0 → delta=0 → advance=64
+    try testing.expect(of.advance_cache != null);
+    try testing.expectApproxEqAbs(@as(f32, 64), of.advance_cache.?[1], 0.01);
+    try testing.expectEqual(@as(u32, 64), of.measure("A"));
+}
+
+test "TASK-25.15.2: setAxis OOM は OutOfMemory を伝播（AC#8）" {
+    const a = testing.allocator;
+    const hvar_tbl = buildHvarForTestFont();
+    const data = try buildVarFontWithGvarHvar(a, 64, null, &hvar_tbl);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+
+    // FailingAllocator: 最初の alloc（advance_cache 確保）で即 OOM
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var of = OutlineFont.init(failing.allocator(), &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try testing.expectError(error.OutOfMemory, of.setAxis(&wght, 700));
+}
+
+test "TASK-25.15.2: 壊れた HVAR は FontFace.init で InvalidFont" {
+    const a = testing.allocator;
+    var bad_hvar = buildHvarForTestFont();
+    putU16(&bad_hvar, 0, 9); // bad major
+    const data = try buildVarFontWithGvarHvar(a, 64, null, &bad_hvar);
+    defer a.free(data);
+    try testing.expectError(error.InvalidFont, FontFace.init(data));
+}
+
+test "TASK-25.15.2: 壊れた gvar は FontFace.init で InvalidFont" {
+    const a = testing.allocator;
+    var bad: [28]u8 = .{0} ** 28;
+    putU16(&bad, 0, 1);
+    putU16(&bad, 2, 0);
+    putU16(&bad, 4, 99); // axisCount ≠ fvar の 1
+    putU16(&bad, 12, 3);
+    putU16(&bad, 14, 1);
+    putU32(&bad, 16, 28);
+    const data = try buildVarFontWithGvarHvar(a, 64, &bad, null);
+    defer a.free(data);
+    try testing.expectError(error.InvalidFont, FontFace.init(data));
 }
 
 test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック後も negative cache が保持され再デコードしない" {
