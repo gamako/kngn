@@ -18,8 +18,13 @@ const cff_mod = @import("cff.zig");
 const raster = @import("raster.zig");
 const outline_mod = @import("outline.zig");
 const sbix_mod = @import("sbix.zig");
+const fvar_mod = @import("fvar.zig");
+const avar_mod = @import("avar.zig");
+const var_common = @import("var_common.zig");
 const png_mod = @import("png");
 const pixelops = @import("pixelops");
+
+const MAX_AXES = var_common.MAX_AXES;
 
 const Font = font.Font;
 const Metrics = font.Metrics;
@@ -47,6 +52,10 @@ pub const FontFace = struct {
     /// 先に InvalidFont を返すため FontFace 自体が成立しない。
     /// `flags` の bit1（draw outlines 指示）は MVP では無視・保持のみ（`Sbix.flags` 経由）。
     sbix: ?sbix_mod.Sbix = null,
+    /// fvar テーブル（可変フォント軸定義）。不在は null（非可変）。
+    fvar: ?fvar_mod.Fvar = null,
+    /// avar テーブル（正規化座標の非線形マップ）。fvar があるときのみ・不在は identity。
+    avar: ?avar_mod.Avar = null,
 
     /// data は呼び出し側所有・FontFace より長命であること。
     pub fn init(data: []const u8) Error!FontFace {
@@ -54,6 +63,8 @@ pub const FontFace = struct {
             error.UnsupportedFormat => return error.Unsupported,
             error.InvalidFont => return error.InvalidFont,
         };
+        // CFF2 可変は glyf フェーズ未対応（TASK-25.15.4 で実装予定）。
+        if ((sf.tableSlice("CFF2") catch return error.InvalidFont) != null) return error.Unsupported;
         // ソース選択（table 優先・version は問わない）: glyf と CFF 同居は不正。
         const has_glyf = (sf.tableSlice("glyf") catch null) != null;
         const cff_tbl = sf.tableSlice("CFF ") catch null;
@@ -76,7 +87,24 @@ pub const FontFace = struct {
         const cm = cmap_mod.Cmap.parse(cmap_tbl) catch return error.InvalidFont;
         // sbix はテーブル不在・構造破壊のどちらも null に縮約（上記 doc 参照）。
         const sbx: ?sbix_mod.Sbix = sbix_mod.Sbix.init(&sf) catch null;
-        return .{ .sfnt = sf, .source = source, .cmap = cm, .sbix = sbx };
+
+        var fvar_opt: ?fvar_mod.Fvar = null;
+        var avar_opt: ?avar_mod.Avar = null;
+        if (sf.tableSlice("fvar") catch return error.InvalidFont) |fvar_tbl| {
+            const fv = fvar_mod.Fvar.parse(fvar_tbl) catch |e| switch (e) {
+                error.Unsupported => return error.Unsupported,
+                else => return error.InvalidFont,
+            };
+            fvar_opt = fv;
+            if (sf.tableSlice("avar") catch return error.InvalidFont) |avar_tbl| {
+                avar_opt = avar_mod.Avar.parse(avar_tbl, fv.axis_count) catch |e| switch (e) {
+                    error.Unsupported => return error.Unsupported,
+                    else => return error.InvalidFont,
+                };
+            }
+        }
+
+        return .{ .sfnt = sf, .source = source, .cmap = cm, .sbix = sbx, .fvar = fvar_opt, .avar = avar_opt };
     }
 };
 
@@ -127,10 +155,129 @@ pub const OutlineFont = struct {
     /// 途中 strike の破壊で後続 strike に正常 bitmap があっても保守的に全 sbix を無効化する）。
     sbix_broken: bool = false,
 
+    /// 可変フォント軸状態（インスタンス局所。gvar 未接続時は外形 default 不変）。
+    axis_design: [MAX_AXES]f32 = .{0} ** MAX_AXES,
+    axis_norm: [MAX_AXES]f32 = .{0} ** MAX_AXES,
+    axis_count: u16 = 0,
+    axes_generation: u32 = 0,
+
     pub fn init(alloc: std.mem.Allocator, face: *const FontFace, px: f32) OutlineFont {
         // px をサニタイズ（非有限/非正/過大 → 安全値）。advance/メトリクスの trap・暴走を防ぐ。
         const safe_px: f32 = if (std.math.isFinite(px) and px > 0) @min(px, max_glyph_dim) else 16;
-        return .{ .alloc = alloc, .face = face, .px = safe_px, .scale = face.sfnt.scaleForPixelSize(safe_px) };
+        var result: OutlineFont = .{
+            .alloc = alloc,
+            .face = face,
+            .px = safe_px,
+            .scale = face.sfnt.scaleForPixelSize(safe_px),
+        };
+        if (face.fvar) |fv| {
+            result.axis_count = fv.axis_count;
+            var i: u16 = 0;
+            while (i < fv.axis_count) : (i += 1) {
+                result.axis_design[i] = fv.axes[i].def;
+                result.axis_norm[i] = 0; // default → norm 0
+            }
+        }
+        return result;
+    }
+
+    // ── 可変フォント軸 API（UI/起動時イベント。軸変更で clearCache）──
+
+    pub fn axisCount(self: *const OutlineFont) u16 {
+        return self.axis_count;
+    }
+
+    pub fn axisTag(self: *const OutlineFont, index: u16) ?[4]u8 {
+        const fv = self.face.fvar orelse return null;
+        if (index >= fv.axis_count) return null;
+        return fv.axes[index].tag;
+    }
+
+    pub fn axisRange(self: *const OutlineFont, index: u16) ?struct { min: f32, def: f32, max: f32 } {
+        const fv = self.face.fvar orelse return null;
+        if (index >= fv.axis_count) return null;
+        const ax = fv.axes[index];
+        return .{ .min = ax.min, .def = ax.def, .max = ax.max };
+    }
+
+    pub fn axisValue(self: *const OutlineFont, index: u16) ?f32 {
+        if (index >= self.axis_count) return null;
+        return self.axis_design[index];
+    }
+
+    pub fn normalizedAxes(self: *const OutlineFont, out: []f32) void {
+        const n = @min(out.len, self.axis_count);
+        @memcpy(out[0..n], self.axis_norm[0..n]);
+    }
+
+    /// design space で 1 軸設定。未知 tag / 非可変 face は Unsupported。
+    pub fn setAxis(self: *OutlineFont, tag: *const [4]u8, value: f32) Error!void {
+        if (self.axis_count == 0) return error.Unsupported;
+        if (!std.math.isFinite(value)) return error.Unsupported;
+        const fv = self.face.fvar.?;
+        const idx = fv.axisIndex(tag) orelse return error.Unsupported;
+        const ax = fv.axes[idx];
+        self.axis_design[idx] = std.math.clamp(value, ax.min, ax.max);
+        self.recomputeNormFromDesign();
+        self.clearCache();
+        self.clearColorCache();
+        self.axes_generation +%= 1;
+    }
+
+    /// 全軸を design 配列で設定（len == axis_count）。
+    pub fn setAxes(self: *OutlineFont, values: []const f32) Error!void {
+        if (self.axis_count == 0) return error.Unsupported;
+        if (values.len != self.axis_count) return error.Unsupported;
+        const fv = self.face.fvar.?;
+        var i: u16 = 0;
+        while (i < self.axis_count) : (i += 1) {
+            const v = values[i];
+            if (!std.math.isFinite(v)) return error.Unsupported;
+            const ax = fv.axes[i];
+            self.axis_design[i] = std.math.clamp(v, ax.min, ax.max);
+        }
+        self.recomputeNormFromDesign();
+        self.clearCache();
+        self.clearColorCache();
+        self.axes_generation +%= 1;
+    }
+
+    /// fvar の named instance を選択。
+    pub fn selectNamedInstance(self: *OutlineFont, index: u16) Error!void {
+        if (self.axis_count == 0) return error.Unsupported;
+        const fv = self.face.fvar.?;
+        if (index >= fv.instance_count) return error.Unsupported;
+        var coords: [MAX_AXES]f32 = undefined;
+        try fv.namedInstanceCoords(index, coords[0..fv.axis_count]);
+        try self.setAxes(coords[0..fv.axis_count]);
+    }
+
+    /// 全軸 default に戻す。
+    pub fn resetAxes(self: *OutlineFont) void {
+        if (self.axis_count == 0) return;
+        const fv = self.face.fvar.?;
+        var i: u16 = 0;
+        while (i < fv.axis_count) : (i += 1) {
+            self.axis_design[i] = fv.axes[i].def;
+        }
+        self.recomputeNormFromDesign();
+        self.clearCache();
+        self.clearColorCache();
+        self.axes_generation +%= 1;
+    }
+
+    fn recomputeNormFromDesign(self: *OutlineFont) void {
+        const fv = self.face.fvar orelse return;
+        var i: u16 = 0;
+        while (i < self.axis_count) : (i += 1) {
+            const ax = fv.axes[i];
+            const pre = var_common.normalizeDesign(self.axis_design[i], ax.min, ax.def, ax.max);
+            if (self.face.avar) |av| {
+                self.axis_norm[i] = av.mapAxis(i, pre);
+            } else {
+                self.axis_norm[i] = pre;
+            }
+        }
     }
 
     pub fn deinit(self: *OutlineFont) void {
@@ -1852,6 +1999,524 @@ test "TASK-26.4: dupe は参照先の bitmap で描画され、origin も参照�
 
     const gid3 = of.gidOf(0x1F601);
     try testing.expect(!of.color_cache.get(gid3).?.failed); // dupe 解決成功（tombstone でない）
+}
+
+// ============================================================
+// TASK-25.15.1: 可変フォント軸基盤テスト
+// ============================================================
+
+fn putI32(buf: []u8, off: usize, v: i32) void {
+    putU32(buf, off, @bitCast(v));
+}
+fn putI16(buf: []u8, off: usize, v: i16) void {
+    putU16(buf, off, @bitCast(v));
+}
+
+/// OpenType 仕様どおりの 1 軸 wght fvar テーブル（instance 無し）。
+fn buildFvarTableWght() [36]u8 {
+    const full = buildFvarTableWghtWithInstances(0, &.{});
+    var buf: [36]u8 = undefined;
+    @memcpy(&buf, full.buf[0..full.len]);
+    return buf;
+}
+
+const FvarTestTable = struct {
+    buf: [128]u8,
+    len: usize,
+};
+
+/// named instance 付き fvar（1 軸 wght）。instances は instance_count 個の 8 バイトレコード。
+fn buildFvarTableWghtWithInstances(instance_count: u16, instances: []const [8]u8) FvarTestTable {
+    const axes_off: usize = 16;
+    const inst_off = axes_off + 20;
+    const len = inst_off + instances.len * 8;
+    var result: FvarTestTable = .{ .buf = undefined, .len = len };
+    @memset(&result.buf, 0);
+    putU16(&result.buf, 0, 1); // majorVersion
+    putU16(&result.buf, 2, 0); // minorVersion
+    putU16(&result.buf, 4, @intCast(axes_off)); // axesArrayOffset
+    putU16(&result.buf, 6, 2); // reserved
+    putU16(&result.buf, 8, 1); // axisCount
+    putU16(&result.buf, 10, 20); // axisSize
+    putU16(&result.buf, 12, instance_count);
+    putU16(&result.buf, 14, 8); // instanceSize
+    result.buf[axes_off] = 'w';
+    result.buf[axes_off + 1] = 'g';
+    result.buf[axes_off + 2] = 'h';
+    result.buf[axes_off + 3] = 't';
+    putI32(&result.buf, axes_off + 4, 100 * 65536);
+    putI32(&result.buf, axes_off + 8, 400 * 65536);
+    putI32(&result.buf, axes_off + 12, 900 * 65536);
+    for (instances, 0..) |inst, i| {
+        @memcpy(result.buf[inst_off + i * 8 ..][0..8], &inst);
+    }
+    return result;
+}
+
+/// 1 軸・必須マップ (-1,-1),(0,0),(1,1) + 中間 (0.5,0.75) の avar テーブル。
+fn buildAvarTableWght() [26]u8 {
+    var buf: [26]u8 = undefined;
+    @memset(&buf, 0);
+    putU16(&buf, 0, 1);
+    putU16(&buf, 6, 1);
+    putU16(&buf, 8, 4);
+    putI16(&buf, 10, -16384);
+    putI16(&buf, 12, -16384);
+    putI16(&buf, 14, 0);
+    putI16(&buf, 16, 0);
+    putI16(&buf, 18, 8192);
+    putI16(&buf, 20, 12288);
+    putI16(&buf, 22, 16384);
+    putI16(&buf, 24, 16384);
+    return buf;
+}
+
+/// buildTestFont に fvar を追加した可変版。avar_tbl を渡せば fvar+avar 付き。
+fn buildVarTestFont(a: std.mem.Allocator, adv: u16, avar_tbl: ?[]const u8) ![]u8 {
+    const fvar_tbl = buildFvarTableWght();
+    var head = [_]u8{0} ** 54;
+    head[12] = 0x5F;
+    head[13] = 0x0F;
+    head[14] = 0x3C;
+    head[15] = 0xF5;
+    putU16(&head, 18, 64);
+    putU16(&head, 50, 0);
+    var maxp = [_]u8{0} ** 6;
+    putU16(&maxp, 4, 3);
+    var hhea = [_]u8{0} ** 36;
+    putU16(&hhea, 4, @bitCast(@as(i16, 48)));
+    putU16(&hhea, 6, @bitCast(@as(i16, -16)));
+    putU16(&hhea, 34, 3);
+    var hmtx = [_]u8{0} ** (4 * 3);
+    putU16(&hmtx, 0, adv);
+    putU16(&hmtx, 4, adv);
+    putU16(&hmtx, 8, adv);
+    const tri = try buildTriangleGlyph(a, &.{ .{ 8, 0 }, .{ 56, 0 }, .{ 32, 48 } });
+    defer a.free(tri);
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(a);
+    var loca: std.ArrayList(u8) = .empty;
+    defer loca.deinit(a);
+    try appendU16(&loca, a, 0);
+    try appendU16(&loca, a, 0);
+    try glyf.appendSlice(a, tri);
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    // cmap format4: buildTestFont と同一レイアウト
+    var cmap_sub = [_]u8{0} ** (16 + 8 * 3);
+    putU16(&cmap_sub, 0, 4);
+    putU16(&cmap_sub, 2, @intCast(cmap_sub.len));
+    putU16(&cmap_sub, 6, 6);
+    const end_off = 14;
+    const reserved_off = end_off + 2 * 3;
+    const start_off = reserved_off + 2;
+    const delta_off = start_off + 2 * 3;
+    const range_off = delta_off + 2 * 3;
+    putU16(&cmap_sub, end_off + 0, 0x20);
+    putU16(&cmap_sub, start_off + 0, 0x20);
+    putU16(&cmap_sub, delta_off + 0, @bitCast(@as(i16, 2 - 0x20)));
+    putU16(&cmap_sub, range_off + 0, 0);
+    putU16(&cmap_sub, end_off + 2, 0x41);
+    putU16(&cmap_sub, start_off + 2, 0x41);
+    putU16(&cmap_sub, delta_off + 2, @bitCast(@as(i16, 1 - 0x41)));
+    putU16(&cmap_sub, range_off + 2, 0);
+    putU16(&cmap_sub, end_off + 4, 0xFFFF);
+    putU16(&cmap_sub, start_off + 4, 0xFFFF);
+    putU16(&cmap_sub, delta_off + 4, 1);
+    putU16(&cmap_sub, range_off + 4, 0);
+    var cmap_tbl = [_]u8{0} ** (4 + 8 + cmap_sub.len);
+    putU16(&cmap_tbl, 0, 0);
+    putU16(&cmap_tbl, 2, 1);
+    putU16(&cmap_tbl, 4, 3);
+    putU16(&cmap_tbl, 6, 1);
+    cmap_tbl[11] = 12;
+    @memcpy(cmap_tbl[12..], &cmap_sub);
+    var avar_owned: [26]u8 = undefined;
+    if (avar_tbl) |at| {
+        @memcpy(&avar_owned, at);
+        return buildSfnt(a, &.{
+            .{ .tag = "head".*, .body = &head },
+            .{ .tag = "maxp".*, .body = &maxp },
+            .{ .tag = "hhea".*, .body = &hhea },
+            .{ .tag = "hmtx".*, .body = &hmtx },
+            .{ .tag = "cmap".*, .body = &cmap_tbl },
+            .{ .tag = "loca".*, .body = loca.items },
+            .{ .tag = "glyf".*, .body = glyf.items },
+            .{ .tag = "fvar".*, .body = &fvar_tbl },
+            .{ .tag = "avar".*, .body = &avar_owned },
+        });
+    }
+    return buildSfnt(a, &.{
+        .{ .tag = "head".*, .body = &head },
+        .{ .tag = "maxp".*, .body = &maxp },
+        .{ .tag = "hhea".*, .body = &hhea },
+        .{ .tag = "hmtx".*, .body = &hmtx },
+        .{ .tag = "cmap".*, .body = &cmap_tbl },
+        .{ .tag = "loca".*, .body = loca.items },
+        .{ .tag = "glyf".*, .body = glyf.items },
+        .{ .tag = "fvar".*, .body = &fvar_tbl },
+    });
+}
+
+test "TASK-25.15.1: 非可変 setAxis は Unsupported" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try testing.expectEqual(@as(u16, 0), of.axisCount());
+    try testing.expectError(error.Unsupported, of.setAxis(&wght, 700));
+}
+
+test "TASK-25.15.1: 軸 API setAxis/setAxes/resetAxes/selectNamedInstance" {
+    const a = testing.allocator;
+    const data = try buildVarTestFont(a, 64, null);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    try testing.expect(face.fvar != null);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    try testing.expectEqual(@as(u16, 1), of.axisCount());
+
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    const gen0 = of.axes_generation;
+    try of.setAxis(&wght, 700);
+    try testing.expect(of.axes_generation != gen0);
+    try testing.expectApproxEqAbs(@as(f32, 700), of.axisValue(0).?, 0.001);
+    // wght 700: norm = (700-400)/(900-400) = 0.6
+    try testing.expectApproxEqAbs(@as(f32, 0.6), of.axis_norm[0], 0.01);
+
+    try of.setAxes(&.{400});
+    try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
+
+    of.resetAxes();
+    try testing.expectApproxEqAbs(@as(f32, 400), of.axisValue(0).?, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
+}
+
+test "TASK-25.15.1: selectNamedInstance で design coords を一括設定" {
+    const a = testing.allocator;
+    // instance0: subfamily=1, flags=0, wght=700 (Fixed 16.16 = 700*65536 = 0x02BC0000)
+    const inst0 = [_]u8{ 0, 1, 0, 0, 0x02, 0xBC, 0x00, 0x00 };
+    const fvar_tbl = buildFvarTableWghtWithInstances(1, &.{inst0});
+    var head = [_]u8{0} ** 54;
+    head[12] = 0x5F;
+    head[13] = 0x0F;
+    head[14] = 0x3C;
+    head[15] = 0xF5;
+    putU16(&head, 18, 64);
+    var maxp = [_]u8{0} ** 6;
+    putU16(&maxp, 4, 3);
+    var hhea = [_]u8{0} ** 36;
+    putU16(&hhea, 34, 3);
+    var hmtx = [_]u8{0} ** 12;
+    putU16(&hmtx, 0, 64);
+    putU16(&hmtx, 4, 64);
+    putU16(&hmtx, 8, 64);
+    const tri = try buildTriangleGlyph(a, &.{ .{ 8, 0 }, .{ 56, 0 }, .{ 32, 48 } });
+    defer a.free(tri);
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(a);
+    var loca: std.ArrayList(u8) = .empty;
+    defer loca.deinit(a);
+    try appendU16(&loca, a, 0);
+    try appendU16(&loca, a, 0);
+    try glyf.appendSlice(a, tri);
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    var cmap_sub = [_]u8{0} ** (16 + 8 * 2);
+    putU16(&cmap_sub, 0, 4);
+    putU16(&cmap_sub, 2, @intCast(cmap_sub.len));
+    putU16(&cmap_sub, 6, 4); // segCountX2
+    putU16(&cmap_sub, 14, 0x41); // end[0]
+    putU16(&cmap_sub, 16, 0xFFFF); // end[1] sentinel
+    // reservedPad @18 = 0
+    putU16(&cmap_sub, 20, 0x41); // start[0]
+    putU16(&cmap_sub, 22, 0xFFFF); // start[1]
+    putU16(&cmap_sub, 24, @bitCast(@as(i16, 1 - 0x41))); // idDelta[0]
+    putU16(&cmap_sub, 26, 1); // idDelta[1]
+    // idRangeOffset[0,1] = 0 @28,30
+    var cmap_tbl = [_]u8{0} ** (12 + cmap_sub.len);
+    putU16(&cmap_tbl, 2, 1);
+    putU16(&cmap_tbl, 4, 3);
+    putU16(&cmap_tbl, 6, 1);
+    cmap_tbl[11] = 12;
+    @memcpy(cmap_tbl[12..], &cmap_sub);
+    const data = try buildSfnt(a, &.{
+        .{ .tag = "head".*, .body = &head },
+        .{ .tag = "maxp".*, .body = &maxp },
+        .{ .tag = "hhea".*, .body = &hhea },
+        .{ .tag = "hmtx".*, .body = &hmtx },
+        .{ .tag = "cmap".*, .body = &cmap_tbl },
+        .{ .tag = "loca".*, .body = loca.items },
+        .{ .tag = "glyf".*, .body = glyf.items },
+        .{ .tag = "fvar".*, .body = fvar_tbl.buf[0..fvar_tbl.len] },
+    });
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    try testing.expectEqual(@as(u16, 1), face.fvar.?.instance_count);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    try of.selectNamedInstance(0);
+    try testing.expectApproxEqAbs(@as(f32, 700), of.axisValue(0).?, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), of.axis_norm[0], 0.02);
+}
+
+test "TASK-25.15.1: 正規化 wght min/def/max → -1/0/1" {
+    const a = testing.allocator;
+    const data = try buildVarTestFont(a, 64, null);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of.setAxis(&wght, 100);
+    try testing.expectApproxEqAbs(@as(f32, -1), of.axis_norm[0], 0.01);
+    try of.setAxis(&wght, 400);
+    try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.01);
+    try of.setAxis(&wght, 900);
+    try testing.expectApproxEqAbs(@as(f32, 1), of.axis_norm[0], 0.01);
+}
+
+test "TASK-25.15.1: FontFace 経由 avar 配線（setAxis → axis_norm が区分線形マップを通る）" {
+    const a = testing.allocator;
+    const avar_tbl = buildAvarTableWght();
+    const data = try buildVarTestFont(a, 64, &avar_tbl);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    try testing.expect(face.avar != null);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+
+    // wght=650 → 線形正規化 pre=0.5 → avar (0.5→0.75) で axis_norm=0.75
+    try of.setAxis(&wght, 650);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), of.axis_norm[0], 0.02);
+
+    // wght=400 → pre=0 → avar identity
+    try of.setAxis(&wght, 400);
+    try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
+
+    // wght=550 → pre=0.3 → avar 区分線形: (0,0)〜(0.5,0.75) 間 → 0.45
+    try of.setAxis(&wght, 550);
+    try testing.expectApproxEqAbs(@as(f32, 0.45), of.axis_norm[0], 0.02);
+}
+
+test "TASK-25.15.1: CFF2 ダミーは Unsupported" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    // CFF2 ダミーテーブルを追加した sfnt
+    const cff2_dummy = [_]u8{ 0x01, 0x00, 0x04, 0x00 };
+    var head = [_]u8{0} ** 54;
+    head[12] = 0x5F;
+    head[13] = 0x0F;
+    head[14] = 0x3C;
+    head[15] = 0xF5;
+    putU16(&head, 18, 64);
+    var maxp = [_]u8{0} ** 6;
+    putU16(&maxp, 4, 3);
+    var hhea = [_]u8{0} ** 36;
+    putU16(&hhea, 34, 3);
+    var hmtx = [_]u8{0} ** 12;
+    putU16(&hmtx, 0, 64);
+    putU16(&hmtx, 4, 64);
+    putU16(&hmtx, 8, 64);
+    const tri = try buildTriangleGlyph(a, &.{ .{ 8, 0 }, .{ 56, 0 }, .{ 32, 48 } });
+    defer a.free(tri);
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(a);
+    var loca: std.ArrayList(u8) = .empty;
+    defer loca.deinit(a);
+    try appendU16(&loca, a, 0);
+    try appendU16(&loca, a, 0);
+    try glyf.appendSlice(a, tri);
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    var cmap_sub = [_]u8{0} ** (16 + 8 * 3);
+    putU16(&cmap_sub, 0, 4);
+    putU16(&cmap_sub, 2, @intCast(cmap_sub.len));
+    putU16(&cmap_sub, 6, 6);
+    putU16(&cmap_sub, 14, 0x41);
+    putU16(&cmap_sub, 18, 0x41);
+    putU16(&cmap_sub, 26, @bitCast(@as(i16, 1 - 0x41)));
+    putU16(&cmap_sub, 16, 0xFFFF);
+    putU16(&cmap_sub, 22, 0xFFFF);
+    putU16(&cmap_sub, 28, 1);
+    var cmap_tbl = [_]u8{0} ** (12 + cmap_sub.len);
+    putU16(&cmap_tbl, 2, 1);
+    putU16(&cmap_tbl, 4, 3);
+    putU16(&cmap_tbl, 6, 1);
+    cmap_tbl[11] = 12;
+    @memcpy(cmap_tbl[12..], &cmap_sub);
+    const cff2_data = try buildSfnt(a, &.{
+        .{ .tag = "head".*, .body = &head },
+        .{ .tag = "maxp".*, .body = &maxp },
+        .{ .tag = "hhea".*, .body = &hhea },
+        .{ .tag = "hmtx".*, .body = &hmtx },
+        .{ .tag = "cmap".*, .body = &cmap_tbl },
+        .{ .tag = "loca".*, .body = loca.items },
+        .{ .tag = "glyf".*, .body = glyf.items },
+        .{ .tag = "CFF2".*, .body = &cff2_dummy },
+    });
+    defer a.free(cff2_data);
+    try testing.expectError(error.Unsupported, FontFace.init(cff2_data));
+}
+
+/// 壊れた fvar を差し替えた最小可変フォントを組む（FontFace.init 検証用）。
+fn buildVarFontWithBadFvar(a: std.mem.Allocator, bad_fvar: []const u8) ![]u8 {
+    var head = [_]u8{0} ** 54;
+    head[12] = 0x5F;
+    head[13] = 0x0F;
+    head[14] = 0x3C;
+    head[15] = 0xF5;
+    putU16(&head, 18, 64);
+    var maxp = [_]u8{0} ** 6;
+    putU16(&maxp, 4, 3);
+    var hhea = [_]u8{0} ** 36;
+    putU16(&hhea, 34, 3);
+    var hmtx = [_]u8{0} ** 12;
+    const tri = try buildTriangleGlyph(a, &.{ .{ 8, 0 }, .{ 56, 0 }, .{ 32, 48 } });
+    defer a.free(tri);
+    var glyf: std.ArrayList(u8) = .empty;
+    defer glyf.deinit(a);
+    var loca: std.ArrayList(u8) = .empty;
+    defer loca.deinit(a);
+    try appendU16(&loca, a, 0);
+    try appendU16(&loca, a, 0);
+    try glyf.appendSlice(a, tri);
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    try appendU16(&loca, a, @intCast(tri.len / 2));
+    var cmap_tbl = [_]u8{0} ** 20;
+    putU16(&cmap_tbl, 2, 0);
+    return buildSfnt(a, &.{
+        .{ .tag = "head".*, .body = &head },
+        .{ .tag = "maxp".*, .body = &maxp },
+        .{ .tag = "hhea".*, .body = &hhea },
+        .{ .tag = "hmtx".*, .body = &hmtx },
+        .{ .tag = "cmap".*, .body = &cmap_tbl },
+        .{ .tag = "loca".*, .body = loca.items },
+        .{ .tag = "glyf".*, .body = glyf.items },
+        .{ .tag = "fvar".*, .body = bad_fvar },
+    });
+}
+
+test "TASK-25.15.1: 壊れた fvar version は InvalidFont" {
+    const a = testing.allocator;
+    var bad_fvar = buildFvarTableWght();
+    putU16(&bad_fvar, 0, 2); // 不正 majorVersion
+    const bad_data = try buildVarFontWithBadFvar(a, &bad_fvar);
+    defer a.free(bad_data);
+    try testing.expectError(error.InvalidFont, FontFace.init(bad_data));
+}
+
+test "TASK-25.15.1: 壊れた fvar axesArrayOffset は InvalidFont" {
+    const a = testing.allocator;
+    // (a) テーブル末尾超え
+    var past_end = buildFvarTableWght();
+    putU16(&past_end, 4, 200); // 36B テーブルに対し軸配列先頭が範囲外
+    const data_past = try buildVarFontWithBadFvar(a, &past_end);
+    defer a.free(data_past);
+    try testing.expectError(error.InvalidFont, FontFace.init(data_past));
+
+    // (b) 軸レコード途中（header=16, axisSize=20 → 正当先頭=16。20 はレコード中腹）
+    var mid_record = buildFvarTableWght();
+    putU16(&mid_record, 4, 20);
+    const data_mid = try buildVarFontWithBadFvar(a, &mid_record);
+    defer a.free(data_mid);
+    try testing.expectError(error.InvalidFont, FontFace.init(data_mid));
+}
+
+test "TASK-25.15.1: fvar あり norm=0 と完全非可変経路の描画 bit 一致" {
+    const a = testing.allocator;
+    const data_static = try buildTestFont(a, 64);
+    defer a.free(data_static);
+    const data_var = try buildVarTestFont(a, 64, null);
+    defer a.free(data_var);
+
+    const face_static = try FontFace.init(data_static);
+    const face_var = try FontFace.init(data_var);
+    try testing.expect(face_var.fvar != null);
+
+    var of_static = OutlineFont.init(a, &face_static, 64);
+    defer of_static.deinit();
+    var of_var = OutlineFont.init(a, &face_var, 64);
+    defer of_var.deinit();
+    // norm=0（default）確認
+    try testing.expectApproxEqAbs(@as(f32, 0), of_var.axis_norm[0], 0.001);
+
+    const W = 80;
+    const H = 80;
+    var px_static = [_]u32{0xFF000000} ** (W * H);
+    var px_var = [_]u32{0xFF000000} ** (W * H);
+    const target_s = RenderTarget{ .pixels = &px_static, .width = W, .height = H };
+    const target_v = RenderTarget{ .pixels = &px_var, .width = W, .height = H };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    of_static.drawTo(target_s, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of_var.drawTo(target_v, .{ .x = 4, .y = 4 }, "A", col, clip);
+    try testing.expectEqualSlices(u32, &px_static, &px_var);
+}
+
+test "TASK-25.15.1: setAxis は範囲外値を clamp して axis_design に保存" {
+    const a = testing.allocator;
+    const data = try buildVarTestFont(a, 64, null);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of.setAxis(&wght, 50); // min=100 未満
+    try testing.expectApproxEqAbs(@as(f32, 100), of.axisValue(0).?, 0.001);
+    try of.setAxis(&wght, 1000); // max=900 超過
+    try testing.expectApproxEqAbs(@as(f32, 900), of.axisValue(0).?, 0.001);
+}
+
+test "TASK-25.15.1: OutlineFont.init は VF/非VF で同一アロケーション（fvar/avar parse 追加分ゼロ）" {
+    const a = testing.allocator;
+    const data_static = try buildTestFont(a, 64);
+    defer a.free(data_static);
+    const avar_tbl = buildAvarTableWght();
+    const data_var = try buildVarTestFont(a, 64, &avar_tbl);
+    defer a.free(data_var);
+
+    const face_static = try FontFace.init(data_static);
+    const face_var = try FontFace.init(data_var);
+    try testing.expect(face_var.fvar != null);
+    try testing.expect(face_var.avar != null);
+
+    var failing_static = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    _ = OutlineFont.init(failing_static.allocator(), &face_static, 64);
+    const allocs_static = failing_static.allocations;
+
+    var failing_var = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    _ = OutlineFont.init(failing_var.allocator(), &face_var, 64);
+    const allocs_var = failing_var.allocations;
+
+    try testing.expectEqual(allocs_static, allocs_var);
+    try testing.expectEqual(@as(usize, 0), allocs_static);
+}
+
+test "TASK-25.15.1: setAxis 後 clearCache（axes_generation 増加）" {
+    const a = testing.allocator;
+    const data = try buildVarTestFont(a, 64, null);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 64);
+    defer of.deinit();
+
+    const W = 80;
+    var px_buf = [_]u32{0} ** (W * W);
+    const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    try testing.expect(of.cache.count() >= 1);
+
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of.setAxis(&wght, 700);
+    try testing.expectEqual(@as(u32, 0), of.cache.count()); // clearCache 済み
 }
 
 test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック後も negative cache が保持され再デコードしない" {

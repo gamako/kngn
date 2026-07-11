@@ -28,6 +28,9 @@ pub const Reader = struct {
             (@as(u32, self.data[off + 2]) << 8) |
             self.data[off + 3];
     }
+    pub fn i32At(self: Reader, off: usize) error{InvalidFont}!i32 {
+        return @bitCast(try self.u32At(off));
+    }
 };
 
 test "Reader: BE 読み取りと範囲チェック" {

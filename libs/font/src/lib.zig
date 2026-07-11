@@ -15,6 +15,9 @@ pub const cff = @import("cff.zig");
 pub const outline_font = @import("outline_font.zig");
 pub const bmfont = @import("bmfont.zig");
 pub const sbix = @import("sbix.zig");
+pub const fvar = @import("fvar.zig");
+pub const avar = @import("avar.zig");
+pub const var_common = @import("var_common.zig");
 pub const text_layer = @import("text_layer.zig");
 
 // pixel/geom プリミティブ（gui が再エクスポートする正準定義）
@@ -68,5 +71,8 @@ test {
     _ = outline_font;
     _ = bmfont;
     _ = sbix;
+    _ = fvar;
+    _ = avar;
+    _ = var_common;
     _ = text_layer;
 }
