@@ -26,6 +26,7 @@ const PatternCommand = patchmod.PatternCommand;
 const PatchState = patchmod.PatchState;
 const actions = @import("actions.zig");
 const pattern_io = @import("pattern_io.zig");
+const wav = @import("wav.zig");
 
 // ウィンドウ。上部=GUI コントロール + DrumMachine/BassMachine、下部=可視化帯。
 const WIN_W = 1120;
@@ -62,6 +63,8 @@ const App = struct {
     /// `save_pattern`/`load_pattern` action（TASK-65 serialize）が使うファイル I/O ハンドル
     /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
     io: std.Io,
+    /// device config の整数 sample_rate（`action render` の WAV ヘッダと offline patch の単一ソース。TASK-86）。
+    sample_rate: u32 = 48000,
     /// CommandLog + Executor（TASK-62.5.7: 記録のみ。undo/tx/probe 統合なし）。
     cmd_log: platform.command.CommandLog = .{},
     cmd_exec: platform.command.Executor = undefined,
@@ -270,7 +273,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer device.close();
 
-    const sr: f32 = @floatFromInt(device.config().sample_rate);
+    const sr_u32 = device.config().sample_rate;
+    app.sample_rate = sr_u32;
+    const sr: f32 = @floatFromInt(sr_u32);
     const patch = LofiPatch.create(allocator, sr) catch |err| {
         std.debug.print("patch init failed: {s}\n", .{@errorName(err)});
         return;
@@ -797,6 +802,90 @@ fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
+/// `action render <path> <seconds>`: offline LofiPatch で master を PCM16 WAV に書き出す（TASK-86）。
+///
+/// ホットパス宣言: イベント時・main thread のみ。live patch の RT 経路には触らない。
+/// offline は完全別インスタンス。複製は seed + 公開済み編集状態（params + snapshot pattern）。
+/// live の bar 途中の変異位置（クロック位相・step）は複製しない（完全再現は seed+recipe）。
+/// レンダー中 main thread がブロックし UI が止まるのは MVP 割り切り。
+fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const live = app.patch orelse return error.NotReady;
+
+    const parsed = actions.parseRender(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: render <path> <seconds 1..600>");
+        return error.BadArgs;
+    };
+
+    const sr_u32 = app.sample_rate;
+    const sr_f32: f32 = @floatFromInt(sr_u32);
+    // u64 で秒×sr を計算し RIFF u32 制約を先に検査（seconds<=600 では通常到達しない防御）。
+    const total_frames_u64: u64 = @as(u64, parsed.seconds) * @as(u64, sr_u32);
+    const data_size_u64: u64 = total_frames_u64 * 2 * 2; // stereo PCM16
+    if (total_frames_u64 > std.math.maxInt(u32) or 36 + data_size_u64 > std.math.maxInt(u32)) {
+        platform.setActionErrorDetail("bad_args", "output too long for RIFF");
+        return error.TooLong;
+    }
+    const total_frames: u32 = @intCast(total_frames_u64);
+    const chunk: u32 = 4800;
+    const channels: u32 = 2;
+
+    const gpa = std.heap.c_allocator;
+    const offline = LofiPatch.create(gpa, sr_f32) catch |err| {
+        platform.setActionErrorDetail("create_failed", "offline patch create failed");
+        return err;
+    };
+    defer offline.destroy();
+
+    // live.base_seed は digest と同じ best-effort torn read（新規同期を足さない）。
+    offline.resetWithSeed(live.base_seed);
+    publishControls(offline, app.params);
+    // snapshot pattern を offline に載せ、rev をずらして必ず apply させる。
+    var cmd = stateToCommand(live.snapshotState());
+    cmd.rev = offline.applied_rev +% 1;
+    offline.controls.pattern_db.publish(cmd);
+
+    var file = std.Io.Dir.cwd().createFile(app.io, parsed.path, .{}) catch |err| {
+        platform.setActionErrorDetail("write_failed", "cannot create output path");
+        return err;
+    };
+    defer file.close(app.io); // File.close は void（error union ではない）
+
+    var wbuf: [8192]u8 = undefined;
+    var fwriter = file.writerStreaming(app.io, &wbuf);
+    var wav_w = wav.WavWriter.init(&fwriter.interface, channels, sr_u32, total_frames) catch |err| {
+        if (err == error.TooLong) {
+            platform.setActionErrorDetail("bad_args", "output too long for RIFF");
+        } else {
+            platform.setActionErrorDetail("write_failed", "wav header write failed");
+        }
+        return err;
+    };
+
+    const audio_buf = gpa.alloc(f32, chunk * channels) catch |err| {
+        platform.setActionErrorDetail("write_failed", "render buffer alloc failed");
+        return err;
+    };
+    defer gpa.free(audio_buf);
+
+    var rendered: u32 = 0;
+    while (rendered < total_frames) {
+        const n = @min(chunk, total_frames - rendered);
+        offline.render(audio_buf, n, channels);
+        wav_w.writeChunk(audio_buf[0 .. n * channels]) catch |err| {
+            platform.setActionErrorDetail("write_failed", "wav chunk write failed");
+            return err;
+        };
+        rendered += n;
+    }
+    wav_w.finish() catch |err| {
+        platform.setActionErrorDetail("write_failed", "wav finish failed");
+        return err;
+    };
+
+    return std.fmt.bufPrint(buf, "ok path={s} seconds={d} sr={d}", .{ parsed.path, parsed.seconds, sr_u32 }) catch "ok";
+}
+
 /// CommandLog の kind=normal を seq 順で Entry 化（TASK-62.5.8）。name/args は log 借用。
 fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
     var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
@@ -924,6 +1013,8 @@ fn registerActions(app: *App) void {
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
+    // render（TASK-86）: offline WAV 書き出し。recipe_save と同じ local_only・CommandLog 非記録。
+    platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = .local_only });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

@@ -17,6 +17,7 @@ pub const ParseError = error{
     NonFinite,
     TooManyTokens,
     UnknownBool,
+    OutOfRange,
 };
 
 fn tokenize(args: []const u8) std.mem.TokenIterator(u8, .any) {
@@ -115,6 +116,23 @@ pub fn parsePath(args: []const u8) ParseError![]const u8 {
     return trimmed;
 }
 
+pub const RenderArgs = struct {
+    path: []const u8,
+    seconds: u32,
+};
+
+/// `render <path> <seconds>` 用: path=空白を含まない1トークン + seconds=u32（範囲 1..=600）。
+/// 範囲外は `error.OutOfRange`（clamp せず fail-fast。TASK-86）。
+pub fn parseRender(args: []const u8) ParseError!RenderArgs {
+    var it = tokenize(args);
+    const path = it.next() orelse return error.Empty;
+    const sec_tok = it.next() orelse return error.Empty;
+    const seconds = std.fmt.parseUnsigned(u32, sec_tok, 10) catch return error.InvalidNumber;
+    if (seconds < 1 or seconds > 600) return error.OutOfRange;
+    try expectExhausted(&it);
+    return .{ .path = path, .seconds = seconds };
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -182,4 +200,18 @@ test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {
     try testing.expectEqualStrings("/tmp/my pattern.mdlp", try parsePath("/tmp/my pattern.mdlp"));
     try testing.expectError(error.Empty, parsePath(""));
     try testing.expectError(error.Empty, parsePath("   "));
+}
+
+test "parseRender: 正常系 / 秒数 0・601・非数値・トークン不足の fail-fast" {
+    const r = try parseRender("/tmp/out.wav 4");
+    try testing.expectEqualStrings("/tmp/out.wav", r.path);
+    try testing.expectEqual(@as(u32, 4), r.seconds);
+    try testing.expectEqual(@as(u32, 1), (try parseRender("a.wav 1")).seconds);
+    try testing.expectEqual(@as(u32, 600), (try parseRender("a.wav 600")).seconds);
+    try testing.expectError(error.OutOfRange, parseRender("a.wav 0"));
+    try testing.expectError(error.OutOfRange, parseRender("a.wav 601"));
+    try testing.expectError(error.InvalidNumber, parseRender("a.wav abc"));
+    try testing.expectError(error.Empty, parseRender(""));
+    try testing.expectError(error.Empty, parseRender("a.wav"));
+    try testing.expectError(error.TooManyTokens, parseRender("a.wav 4 extra"));
 }

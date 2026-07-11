@@ -1131,6 +1131,17 @@ pub fn build(b: *std.Build) void {
     const run_modular_actions_test = b.addRunArtifact(modular_actions_test);
     test_app_modular_step.dependOn(&run_modular_actions_test.step);
 
+    // apps/modular WAV writer（TASK-86）。std のみ・ストリーミング PCM16 RIFF/WAVE。
+    const modular_wav_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/modular/wav.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_modular_wav_test = b.addRunArtifact(modular_wav_test);
+    test_app_modular_step.dependOn(&run_modular_wav_test.step);
+
     // apps/modular scalar params + grid/303 pattern 直列化（TASK-65 serialize）。std + serde のみ・
     // App/kit/modular 非依存（PatternPayload は plain struct。main.zig 側で PatternCommand と変換）。
     const modular_pattern_io_test_mod = b.createModule(.{

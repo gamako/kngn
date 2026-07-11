@@ -813,6 +813,7 @@ pub const LofiPatch = struct {
 // tests（offline・display/audio デバイス不要）
 // ============================================================================
 const testing = std.testing;
+const wav = @import("wav.zig");
 
 fn renderCrc(allocator: std.mem.Allocator, sample_rate: f32, frames: u32) !u32 {
     const patch = try LofiPatch.create(allocator, sample_rate);
@@ -871,6 +872,126 @@ test "LofiPatch: deterministic across bars with fixed chunking (per-bar mutation
     const crc_a = try renderCrcChunked(testing.allocator, 48000, 4800, 48000 * 10);
     const crc_b = try renderCrcChunked(testing.allocator, 48000, 4800, 48000 * 10);
     try testing.expectEqual(crc_a, crc_b);
+}
+
+/// offline render → PCM16 WAV バイト列（chunk=4800・2ch。action render と同型）。
+/// `setup` が non-null なら create/resetWithSeed 後に呼ばれ、actionRender 相当の状態複製を行う。
+fn renderToWavBytes(
+    allocator: std.mem.Allocator,
+    sample_rate: u32,
+    seconds: u32,
+    base_seed: u64,
+    setup: ?*const fn (*LofiPatch) void,
+) ![]u8 {
+    const total_frames_u64: u64 = @as(u64, seconds) * @as(u64, sample_rate);
+    if (total_frames_u64 > std.math.maxInt(u32)) return error.TooLong;
+    const total_frames: u32 = @intCast(total_frames_u64);
+    const chunk: u32 = 4800;
+    const channels: u32 = 2;
+    const patch = try LofiPatch.create(allocator, @floatFromInt(sample_rate));
+    defer patch.destroy();
+    patch.resetWithSeed(base_seed);
+    if (setup) |f| f(patch);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var ww = try wav.WavWriter.init(&aw.writer, channels, sample_rate, total_frames);
+    const buf = try allocator.alloc(f32, chunk * channels);
+    defer allocator.free(buf);
+    var rendered: u32 = 0;
+    while (rendered < total_frames) {
+        const n = @min(chunk, total_frames - rendered);
+        patch.render(buf, n, channels);
+        try ww.writeChunk(buf[0 .. n * channels]);
+        rendered += n;
+    }
+    try ww.finish();
+    return try aw.toOwnedSlice();
+}
+
+test "LofiPatch: offline renderToWav is deterministic (2x bit-identical) and non-silent" {
+    // TASK-86: 同一 seed + 同一チャンク分割で 2 回 render → WAV 全バイト bit 一致 + 非無音。
+    const sr: u32 = 48000;
+    const seconds: u32 = 1;
+    const a = try renderToWavBytes(testing.allocator, sr, seconds, 42, null);
+    defer testing.allocator.free(a);
+    const b = try renderToWavBytes(testing.allocator, sr, seconds, 42, null);
+    defer testing.allocator.free(b);
+
+    try testing.expectEqual(a.len, b.len);
+    try testing.expectEqualStrings("RIFF", a[0..4]);
+    try testing.expectEqualStrings("WAVE", a[8..12]);
+    // ヘッダ 44B + PCM16 stereo: 44 + seconds*sr*2*2
+    try testing.expectEqual(@as(usize, 44 + @as(usize, seconds) * sr * 2 * 2), a.len);
+    try testing.expectEqualSlices(u8, a, b);
+
+    var nonzero: bool = false;
+    // PCM16 payload が全ゼロでないこと（非無音）。
+    var i: usize = 44;
+    while (i + 1 < a.len) : (i += 2) {
+        if (std.mem.readInt(i16, a[i..][0..2], .little) != 0) {
+            nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(nonzero);
+}
+
+/// actionRender と同じ状態複製: 非デフォルト scalar Controls + pattern（rev 強制 apply）。
+fn setupActionLikeEditState(patch: *LofiPatch) void {
+    // publishControls 相当（非デフォルト params）
+    const c = &patch.controls;
+    c.tempo_bpm.store(140.0);
+    c.master_cutoff.store(4000.0);
+    c.swing.store(0.15);
+    c.sidechain_amount.store(0.5);
+    c.kick_gain.store(0.8);
+    c.hat_gain.store(0.6);
+    c.clap_gain.store(0.7);
+    c.bass_gain.store(0.9);
+    c.pad_gain.store(0.5);
+    c.kick_mute.store(0, .release);
+    c.hat_mute.store(0, .release);
+    c.clap_mute.store(0, .release);
+    c.bass_mute.store(0, .release);
+    c.pad_mute.store(0, .release);
+    c.kick_punch.store(1.2);
+    c.hat_bright.store(1.1);
+    c.hat_decay.store(0.06);
+    c.pad_cutoff.store(1200.0);
+    c.pad_warmth.store(0.4);
+    c.master_warmth.store(0.3);
+    c.ambient_move.store(0.55);
+
+    // stateToCommand + cmd.rev = offline.applied_rev +% 1 相当
+    var cmd = PatternCommand.default();
+    cmd.kick = .{ .on = 0x1111, .lock = true };
+    cmd.hat = .{ .on = 0xAAAA, .lock = false };
+    cmd.clap = .{ .on = 0x0101, .lock = false };
+    cmd.bass = .{
+        .on = 0x8888,
+        .accent = 0x0808,
+        .slide = 0x0000,
+        .deg = [_]i8{ 0, 2, 4, 5, 7, 9, 11, 12, 0, 2, 4, 5, 7, 9, 11, 12 },
+        .lock = true,
+    };
+    cmd.evolve = false;
+    cmd.rev = patch.applied_rev +% 1;
+    c.pattern_db.publish(cmd);
+}
+
+test "LofiPatch: offline renderToWav with action-like state copy is deterministic (2x bit-identical)" {
+    // TASK-86 修正3: actionRender と同じ状態複製経路でも 2 回 render が bit 一致。
+    const sr: u32 = 48000;
+    const seconds: u32 = 1;
+    const a = try renderToWavBytes(testing.allocator, sr, seconds, 99, setupActionLikeEditState);
+    defer testing.allocator.free(a);
+    const b = try renderToWavBytes(testing.allocator, sr, seconds, 99, setupActionLikeEditState);
+    defer testing.allocator.free(b);
+
+    try testing.expectEqual(a.len, b.len);
+    try testing.expectEqualStrings("RIFF", a[0..4]);
+    try testing.expectEqualSlices(u8, a, b);
 }
 
 /// render して finite/有界を検証しつつ peak/rms を返す（テスト用）。

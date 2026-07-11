@@ -394,6 +394,11 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
     その後また per-bar 変異）。RT 経路に alloc/lock/IO/panic を足さない。
   - harness `modular` probe が生成状態を公開（digest=bpm/density/steps/active/gains/muted/ph4/ambient/pattern masks
     hex/lock/evolve/rev/mut を 1024B 以内、snapshot=さらに bass_deg 配列）。
+  - **`action render <path> <seconds>`**（TASK-86）: offline の別 `LofiPatch` インスタンスで master 出力を
+    PCM16 stereo WAV にストリーミング書き出し（1..=600 秒。ヘッダ先書き + chunk=4800）。live の seed +
+    公開済み編集状態（params / snapshot pattern）を複製し、同一条件 2 回で bit 一致。RT 再生経路には
+    手を入れない（main thread ブロックは MVP 割り切り）。`network_policy=.local_only`・CommandLog 非記録
+    （`recipe_save` と同型）。応答: `ok path=... seconds=... sr=...`。
 - **apps/patch**（`run-patch`）: 動的グラフエンジン（`DynGraph`, TASK-40.6.1）をビジュアルに編集する
   パッチキャンバス（40.6.2〜）。ノード=矩形＋種別色ポート（audio 橙/cv 青/gate 緑）＋ケーブルで描画し、
   pan/zoom/drag/ライブ再配線・パレット追加・DrumMachine/BassMachine マクロ（畳み/展開・TR/303 grid）ができる。
