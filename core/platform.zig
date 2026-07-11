@@ -241,6 +241,8 @@ pub fn init() Error!void {
     }
     harness.startTransport();
     copilot.startTransport();
+    // netsync session → copilot operate 拒否（callback は initFromEnv の enableRouter より前に登録）。
+    netsync.setSessionStateCallback(copilot.setNetsyncSessionActive);
     // netsync は headless 分岐でも起動（env 未設定なら initFromEnv 即 return。TASK-62.3.2）。
     netsync.initFromEnv();
     // 観測 probe（TASK-62.3.4）。有効時のみ。netsync→harness 逆依存を避けるため platform から登録。

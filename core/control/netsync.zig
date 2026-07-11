@@ -162,6 +162,39 @@ pub fn formatHostHello(buf: []u8, peer_id: u32) ![]const u8 {
     return std.fmt.bufPrint(buf, "host {d} {d}", .{ PROTOCOL_VERSION, peer_id });
 }
 
+/// PEER_INFO payload の kind バイト（親 plan §1.7: 0=human, 1=agent, 0xFF=left）。
+pub const PEER_INFO_KIND_HUMAN: u8 = 0;
+pub const PEER_INFO_KIND_AGENT: u8 = 1;
+pub const PEER_INFO_KIND_LEFT: u8 = 0xFF;
+
+/// PEER_INFO payload（親 plan §1.7）: u32 LE peer_id (4B) ++ u8 kind (1B) ++ "<label>"（残り全体）。
+/// codec のみ（TASK-62.5.6。**配布＝送受信の semantic 処理は TASK-83 Phase 2**。§6 の段階規定）。
+pub fn formatPeerInfo(buf: []u8, peer_id: u32, kind: u8, label: []const u8) ![]const u8 {
+    if (label.len > MAX_LABEL_LEN) return error.LabelTooLong;
+    const total = 4 + 1 + label.len;
+    if (buf.len < total) return error.NoSpaceLeft;
+    std.mem.writeInt(u32, buf[0..4], peer_id, .little);
+    buf[4] = kind;
+    @memcpy(buf[5..][0..label.len], label);
+    return buf[0..total];
+}
+
+/// PEER_INFO payload の decode（label は payload 内 slice）。kind の未知値・label の
+/// 制御文字/上限超過は protocol error（HELLO の label 検証と同じ規則）。
+pub fn parsePeerInfo(payload: []const u8) ProtocolError!struct { peer_id: u32, kind: u8, label: []const u8 } {
+    if (payload.len < 5) return error.ProtocolError;
+    const peer_id = std.mem.readInt(u32, payload[0..4], .little);
+    const kind = payload[4];
+    if (kind != PEER_INFO_KIND_HUMAN and kind != PEER_INFO_KIND_AGENT and kind != PEER_INFO_KIND_LEFT)
+        return error.ProtocolError;
+    const label = payload[5..];
+    if (label.len > MAX_LABEL_LEN) return error.ProtocolError;
+    for (label) |c| {
+        if (c < 0x20) return error.ProtocolError; // ASCII 制御文字
+    }
+    return .{ .peer_id = peer_id, .kind = kind, .label = label };
+}
+
 /// `"<name> <args>"` または `"<name>"` を分割（name=最初の空白まで、args=残り）。
 pub fn splitNameArgs(s: []const u8) struct { name: []const u8, args: []const u8 } {
     const t = std.mem.trim(u8, s, &std.ascii.whitespace);
@@ -520,6 +553,19 @@ var next_proposal_id: u32 = 0;
 
 var shared_executor: ?*command.Executor = null;
 
+/// session 開始/終了の通知（copilot operate 拒否用。platform が登録。netsync→copilot 逆 import なし）。
+/// **main thread のみ**（enableRouter / clearRouterMain / pump の router_clear。wire_session と同地点）。
+pub const SessionStateCallback = *const fn (active: bool) void;
+var session_state_cb: ?SessionStateCallback = null;
+
+pub fn setSessionStateCallback(cb: ?SessionStateCallback) void {
+    session_state_cb = cb;
+}
+
+fn notifySessionState(active: bool) void {
+    if (session_state_cb) |cb| cb(active);
+}
+
 var last_rejected_proposal: u32 = 0;
 var last_reject_reason_buf: [256]u8 = undefined;
 var last_reject_reason_len: usize = 0;
@@ -594,11 +640,13 @@ fn pendingRemoveProposal(proposal_id: u32) void {
     std.debug.print("[netsync] pending REJECT 不一致 proposal={d}\n", .{proposal_id});
 }
 
-/// 観測用スナップショット（TASK-62.3.4）。
+/// 観測用スナップショット（TASK-62.3.4 / 62.5.6）。
 /// `gatherStats` / probe digest・snapshot は harness 設計上 **main thread（pollGate 内）でのみ**呼ぶ。
 pub const NetsyncStats = struct {
     role: Role = .disabled,
     peers: usize = 0,
+    /// 接続中の agent 種別 peer 数（host=peer テーブル / client=自分のみ。PEER_INFO 未配布）。
+    agents: usize = 0,
     peer_id: u32 = 0,
     last_seq: u64 = 0,
     pending: usize = 0,
@@ -621,10 +669,14 @@ pub fn gatherStats() NetsyncStats {
         st.pending = inbound.len(io_val);
         if (role == .host) {
             for (&slots) |*s| {
-                if (s.state == .active) st.peers += 1;
+                if (s.state == .active) {
+                    st.peers += 1;
+                    if (s.actor_kind == .agent) st.agents += 1;
+                }
             }
         } else if (role == .client and client_slot.state == .active) {
             st.peers = 1;
+            if (client_slot.actor_kind == .agent) st.agents = 1;
         }
     }
     peers_mutex.unlock(io_val);
@@ -658,7 +710,7 @@ fn roleDigestName(r: Role) []const u8 {
     };
 }
 
-/// digest 1 行 payload（probe 名は harness が付与。`role=... peers=...`）。**main thread 専用**。
+/// digest 1 行 payload（probe 名は harness が付与。`role=... peers=... agents=...`）。**main thread 専用**。
 pub fn formatDigest(buf: []u8) []const u8 {
     const st = gatherStats();
     var reason_buf: [reject_reason_token_max]u8 = undefined;
@@ -674,9 +726,10 @@ pub fn formatDigest(buf: []u8) []const u8 {
         (std.fmt.bufPrint(&reject_id_buf, "{d}", .{st.last_reject}) catch "?");
 
     var base: [384]u8 = undefined;
-    const head = std.fmt.bufPrint(&base, "role={s} peers={d} peer_id={d} last_seq={d} pending={d} awaiting_sync={d} last_reject={s} reject_reason={s}", .{
+    const head = std.fmt.bufPrint(&base, "role={s} peers={d} agents={d} peer_id={d} last_seq={d} pending={d} awaiting_sync={d} last_reject={s} reject_reason={s}", .{
         roleDigestName(st.role),
         st.peers,
+        st.agents,
         st.peer_id,
         st.last_seq,
         st.pending,
@@ -747,7 +800,20 @@ fn formatLogDigestTail(buf: []u8) []const u8 {
     return buf[0..pos];
 }
 
-/// snapshot JSON 1 オブジェクト + 全 command log 配列（executor 不在時は log=[]）。
+fn sanitizeJsonToken(out: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, out.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c = s[i];
+        out[i] = if (c == '"' or c == '\\' or c <= 0x20 or c == 0x7f) '_' else c;
+    }
+    return out[0..n];
+}
+
+/// snapshot JSON 1 オブジェクト。
+/// `peers` は `[{peer_id,kind,label},...]`（host=peer テーブル全件 / client=自分のみ）。
+/// **既知制約（PEER_INFO 未配布）**: client は他 peer の kind/label を知らないため配列は自 slot のみ。
+/// 配布は TASK-83 Phase 2（62.5 plan §6）。`log` は全 command 配列（executor 不在時は []）。
 /// **main thread 専用**。
 pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     const st = gatherStats();
@@ -760,8 +826,8 @@ pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     const await_s: []const u8 = if (st.awaiting_sync) "true" else "false";
     var head_buf: [512]u8 = undefined;
     const head = if (st.last_reject == 0)
-        try std.fmt.bufPrint(&head_buf, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":null,\"reject_reason\":null,\"log\":[", .{
-            role_s, st.peers, st.peer_id, st.last_seq, st.pending, await_s,
+        try std.fmt.bufPrint(&head_buf, "{{\"role\":\"{s}\",\"peer_id\":{d},\"agents\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":null,\"reject_reason\":null,\"peers\":[", .{
+            role_s, st.peer_id, st.agents, st.last_seq, st.pending, await_s,
         })
     else blk: {
         const reason_tok = sanitizeRejectReasonToken(&reason_buf, lastRejectReason());
@@ -770,11 +836,30 @@ pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
         for (reason_tok[0..rn], 0..) |c, i| {
             json_reason[i] = if (c == '"' or c == '\\') '_' else c;
         }
-        break :blk try std.fmt.bufPrint(&head_buf, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":{d},\"reject_reason\":\"{s}\",\"log\":[", .{
-            role_s, st.peers, st.peer_id, st.last_seq, st.pending, await_s, st.last_reject, json_reason[0..rn],
+        break :blk try std.fmt.bufPrint(&head_buf, "{{\"role\":\"{s}\",\"peer_id\":{d},\"agents\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":{d},\"reject_reason\":\"{s}\",\"peers\":[", .{
+            role_s, st.peer_id, st.agents, st.last_seq, st.pending, await_s, st.last_reject, json_reason[0..rn],
         });
     };
     try list.appendSlice(allocator, head);
+
+    // peers 配列（getPeer 経由。mutex は getPeer 内）
+    var pi: usize = 0;
+    while (true) : (pi += 1) {
+        var lbuf: [MAX_LABEL_LEN]u8 = undefined;
+        const p = getPeer(pi, &lbuf) orelse break;
+        if (pi > 0) try list.append(allocator, ',');
+        var jlabel: [MAX_LABEL_LEN]u8 = undefined;
+        const lab = sanitizeJsonToken(&jlabel, p.label);
+        var entry_buf: [MAX_LABEL_LEN + 64]u8 = undefined;
+        const entry = try std.fmt.bufPrint(&entry_buf, "{{\"peer_id\":{d},\"kind\":\"{s}\",\"label\":\"{s}\"}}", .{
+            p.peer_id,
+            p.kind.toToken(),
+            lab,
+        });
+        try list.appendSlice(allocator, entry);
+    }
+
+    try list.appendSlice(allocator, "],\"log\":[");
 
     if (shared_executor) |exec| {
         if (exec.log) |log| {
@@ -904,11 +989,13 @@ fn enableRouter() void {
     action_registry.setRouter(netsyncRouter);
     action_registry.setEnabled(true);
     setWireSessionFlag(true);
+    notifySessionState(true);
 }
 
 fn clearRouterMain() void {
     action_registry.setRouter(null);
     setWireSessionFlag(false);
+    notifySessionState(false);
     if (io_inited) {
         peers_mutex.lockUncancelable(io_val);
         router_clear_pending = false;
@@ -1039,8 +1126,20 @@ pub fn initFromEnv() void {
             std.debug.print("[netsync] VP_NETSYNC_CONNECT が不正です（ip:port）: {s}\n", .{c});
             return;
         };
+        const kind = parseActorEnv(getEnv("VP_NETSYNC_ACTOR"));
+        const label = getEnv("VP_NETSYNC_LABEL") orelse default_client_label;
+        setClientIdentity(kind, label);
         initClient(addr);
     }
+}
+
+/// `VP_NETSYNC_ACTOR` 解釈（既定 human。不正値は warn+human）。テストからも呼ぶ。
+pub fn parseActorEnv(raw: ?[]const u8) ActorKind {
+    const s = raw orelse return .human;
+    return ActorKind.fromToken(s) orelse {
+        std.debug.print("[netsync] VP_NETSYNC_ACTOR が不正（human|agent）: {s} — human 扱い\n", .{s});
+        return .human;
+    };
 }
 
 pub fn initHost(port: u16) void {
@@ -1201,6 +1300,7 @@ pub fn pump() void {
     if (clear) {
         action_registry.setRouter(null);
         setWireSessionFlag(false);
+        notifySessionState(false);
     }
 
     if (!isEnabled()) return;
@@ -1795,9 +1895,10 @@ pub fn shutdown() void {
     awaiting_sync = false;
     freePendingSyncLocked();
     peers_mutex.unlock(io_val);
-    // main thread のみ setRouter(null)
+    // main thread のみ setRouter(null) / wire_session / copilot session 解除（clearRouterMain と対称）
     action_registry.setRouter(null);
     setWireSessionFlag(false);
+    notifySessionState(false);
     wire_seq = 0;
     last_applied_seq = 0;
     next_proposal_id = 0;
@@ -2180,6 +2281,7 @@ pub fn resetForTest() void {
     clearRouterMain();
     action_registry.resetForTest();
     shared_executor = null;
+    session_state_cb = null;
     state_sync = null;
     defaultClientLabel();
     stop_flag.store(false, .seq_cst);
@@ -2421,6 +2523,34 @@ test "netsync: HELLO parse フィールド不足・不正 actor_kind・label 超
     try testing.expectError(error.ProtocolError, parseHostHello("host 1"));
     try testing.expectError(error.ProtocolError, parseHostHello("host 2 3"));
     try testing.expectEqual(@as(u32, 7), try parseHostHello("host 1 7"));
+}
+
+test "netsync: PEER_INFO codec round-trip と検証（codec のみ。配布は TASK-83 Phase 2）" {
+    var buf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+
+    // round-trip（human / agent / left。label は空白可・空も可）
+    const p1 = try formatPeerInfo(&buf, 3, PEER_INFO_KIND_AGENT, "copilot bot");
+    const d1 = try parsePeerInfo(p1);
+    try testing.expectEqual(@as(u32, 3), d1.peer_id);
+    try testing.expectEqual(PEER_INFO_KIND_AGENT, d1.kind);
+    try testing.expectEqualStrings("copilot bot", d1.label);
+
+    const p2 = try formatPeerInfo(&buf, 0xFFFF_FFFF, PEER_INFO_KIND_LEFT, "");
+    const d2 = try parsePeerInfo(p2);
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), d2.peer_id);
+    try testing.expectEqual(PEER_INFO_KIND_LEFT, d2.kind);
+    try testing.expectEqualStrings("", d2.label);
+
+    // 不正: payload 短小 / 未知 kind / label 制御文字 / label 上限超過
+    try testing.expectError(error.ProtocolError, parsePeerInfo(&[_]u8{ 1, 0, 0, 0 }));
+    var bad_kind: [5]u8 = .{ 1, 0, 0, 0, 2 };
+    try testing.expectError(error.ProtocolError, parsePeerInfo(&bad_kind));
+    const p3 = try formatPeerInfo(&buf, 1, PEER_INFO_KIND_HUMAN, "ok");
+    buf[p3.len - 1] = 0x01; // 末尾を制御文字に改変
+    try testing.expectError(error.ProtocolError, parsePeerInfo(buf[0..p3.len]));
+    var long: [MAX_LABEL_LEN + 1]u8 = undefined;
+    @memset(&long, 'x');
+    try testing.expectError(error.LabelTooLong, formatPeerInfo(&buf, 1, PEER_INFO_KIND_HUMAN, &long));
 }
 
 test "netsync: loopback HELLO 握手成功" {
@@ -2867,12 +2997,16 @@ fn registerSem(name: []const u8, ctx: *SemCtx, policy: action_registry.NetworkPo
 }
 
 fn rawHelloConnect(addr: net.IpAddress, label: []const u8) !net.Stream {
+    return rawHelloConnectAs(addr, .human, label);
+}
+
+fn rawHelloConnectAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) !net.Stream {
     ensureIo();
     const s = try addr.connect(io_val, .{ .mode = .stream });
     var wbuf: [256]u8 = undefined;
     var writer = s.writer(io_val, &wbuf);
     var hbuf: [128]u8 = undefined;
-    const hello = try std.fmt.bufPrint(&hbuf, "client {d} human {s}", .{ PROTOCOL_VERSION, label });
+    const hello = try formatClientHello(&hbuf, kind, label);
     try encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), hello);
     try writer.interface.flush();
     var rbuf: [256]u8 = undefined;
@@ -3845,6 +3979,7 @@ test "netsync: gatherStats 無効時は既定値" {
     const st = gatherStats();
     try testing.expectEqual(Role.disabled, st.role);
     try testing.expectEqual(@as(usize, 0), st.peers);
+    try testing.expectEqual(@as(usize, 0), st.agents);
     try testing.expectEqual(@as(u32, 0), st.peer_id);
     try testing.expectEqual(@as(u64, 0), st.last_seq);
     try testing.expectEqual(@as(usize, 0), st.pending);
@@ -4658,4 +4793,125 @@ test "netsync: COMMIT 適用失敗で pending 保持 + fail-soft" {
     const res = try exec.executeAction("stroke", "local", .{ .actor = .local_user, .record_policy = .record }, &buf);
     try testing.expect(res.seq != null);
     try testing.expectEqual(@as(u32, 1), log.filled);
+}
+
+// ============================================================================
+// TASK-62.5.6 session callback / env actor / probe peers+agents
+// ============================================================================
+
+var test_session_flag: bool = false;
+fn testSessionCb(active: bool) void {
+    test_session_flag = active;
+}
+
+test "netsync: session callback は enable/clear/fail-soft で発火" {
+    resetForTest();
+    defer resetForTest();
+    test_session_flag = false;
+    setSessionStateCallback(testSessionCb);
+
+    initHost(0);
+    try testing.expect(test_session_flag);
+
+    shutdown();
+    try testing.expect(!test_session_flag);
+
+    // fail-soft 経路: client 接続→切断→pump
+    test_session_flag = false;
+    setSessionStateCallback(testSessionCb);
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    const port = srv.socket.address.getPort();
+    var close_gate: std.atomic.Value(bool) = .init(false);
+    const Host = struct {
+        fn run(listen_srv: *net.Server, gate: *std.atomic.Value(bool)) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
+            var waited: u64 = 0;
+            while (!gate.load(.seq_cst) and waited < 5000) : (waited += 10) sleepMs(10);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{ &srv, &close_gate });
+    defer {
+        close_gate.store(true, .seq_cst);
+        ht.join();
+        srv.deinit(io_val);
+    }
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "cb");
+    try waitClientActive(2000);
+    try testing.expect(test_session_flag);
+
+    close_gate.store(true, .seq_cst);
+    var waited: u64 = 0;
+    while (isEnabled() and waited < 3000) : (waited += 10) sleepMs(10);
+    try testing.expect(!isEnabled());
+    pump();
+    try testing.expect(!test_session_flag);
+}
+
+test "netsync: parseActorEnv 既定・agent・不正は human" {
+    try testing.expectEqual(ActorKind.human, parseActorEnv(null));
+    try testing.expectEqual(ActorKind.human, parseActorEnv("human"));
+    try testing.expectEqual(ActorKind.agent, parseActorEnv("agent"));
+    try testing.expectEqual(ActorKind.human, parseActorEnv("robot"));
+    try testing.expectEqual(ActorKind.human, parseActorEnv(""));
+}
+
+test "netsync: agent HELLO が host peer テーブルに kind=agent で登録" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    const port = listeningPort().?;
+    var stream = try rawHelloConnectAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .agent, "copilot");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+
+    var lbuf: [MAX_LABEL_LEN]u8 = undefined;
+    const p = getPeer(0, &lbuf).?;
+    try testing.expectEqual(ActorKind.agent, p.kind);
+    try testing.expectEqualStrings("copilot", p.label);
+    try testing.expectEqual(@as(usize, 1), gatherStats().agents);
+
+    var dig_buf: [512]u8 = undefined;
+    const dig = formatDigest(&dig_buf);
+    try testing.expect(std.mem.indexOf(u8, dig, "agents=1") != null);
+
+    const snap = try formatSnapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"kind\":\"agent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"label\":\"copilot\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"peers\":[") != null);
+}
+
+test "netsync: setClientIdentity が VP_NETSYNC_ACTOR/LABEL 相当を保持" {
+    resetForTest();
+    defer resetForTest();
+    const kind = parseActorEnv("agent");
+    setClientIdentity(kind, "env-bot");
+    try testing.expectEqual(ActorKind.agent, client_actor_kind);
+    try testing.expectEqualStrings("env-bot", client_label_buf[0..client_label_len]);
+    // initClient は client_actor_kind / label を HELLO に載せる（initHost の defaultClientLabel とは独立）
+    var hbuf: [128]u8 = undefined;
+    const hello = try formatClientHello(&hbuf, client_actor_kind, client_label_buf[0..client_label_len]);
+    const parsed = try parseClientHello(hello);
+    try testing.expectEqual(ActorKind.agent, parsed.kind);
+    try testing.expectEqualStrings("env-bot", parsed.label);
 }

@@ -105,7 +105,7 @@ pub fn isEnabled() bool {
     return enabled;
 }
 
-/// netsync session の operate 拒否フラグ（将来 62.3.x が呼ぶ。現状の caller はテストのみ）。
+/// netsync session の operate 拒否フラグ（platform が `netsync.setSessionStateCallback` で配線。TASK-62.5.6）。
 pub fn setNetsyncSessionActive(active: bool) void {
     netsync_active = active;
 }
@@ -983,4 +983,45 @@ test "copilot: 10 setSharedExecutor（action は own-log 非記録の直 dispatc
     try testing.expectEqualStrings("ping pong x\n", resp4);
     try testing.expectEqual(@as(u32, 1), command_log.filled); // own-log に記録
     try testing.expect(command_log.latest().?.actor.eql(.local_agent));
+}
+
+test "copilot: 8 netsync session callback 配線で operate 拒否・終了で復帰" {
+    resetCopilotForTest();
+    harness.netsync.resetForTest();
+    harness.setExternalRegistryEnabled(true);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+        harness.netsync.resetForTest();
+        setNetsyncSessionActive(false);
+    }
+
+    var ac = TestActionCtx{};
+    var pc = TestProbeCtx{ .value = 7 };
+    harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
+    harness.registerProbe(.{ .name = "cp_probe", .ctx = &pc, .digest = testProbeDigest, .snapshot = testProbeSnapshot });
+
+    // platform.init 相当（callback は enableRouter より前）
+    harness.netsync.setSessionStateCallback(setNetsyncSessionActive);
+    harness.netsync.initHost(0);
+    try testing.expect(netsync_active);
+
+    var cs: ConnState = undefined;
+    const denied = handleRequest(&cs, "action ping x; begin_tx m");
+    try testing.expectEqualStrings(
+        "fail ping netsync session active (operate disabled)\n" ++
+            "fail begin_tx netsync session active (operate disabled)\n",
+        denied,
+    );
+    try testing.expectEqual(@as(u32, 0), ac.calls);
+
+    const obs = handleRequest(&cs, "digest cp_probe");
+    try testing.expectEqualStrings("cp_probe value=7\n", obs);
+
+    harness.netsync.shutdown();
+    try testing.expect(!netsync_active);
+
+    const ok = handleRequest(&cs, "action ping y");
+    try testing.expectEqualStrings("ping pong y\n", ok);
+    try testing.expectEqual(@as(u32, 1), ac.calls);
 }

@@ -653,9 +653,12 @@ action 固有のコードを一切足さない**（中身非パースの不変�
 | `VP_NETSYNC_HOST=1` | host 役で listen（`VP_NETSYNC_PORT` 必須） |
 | `VP_NETSYNC_PORT` | host の listen port |
 | `VP_NETSYNC_CONNECT=ip:port` | client 役で接続 |
-| （将来）actor 種別/ラベル | HELLO に載る。現状は既定 `human` / `client` |
+| `VP_NETSYNC_ACTOR=human\|agent` | client HELLO の actor 種別（既定 `human`。不正値は warn+human） |
+| `VP_NETSYNC_LABEL=<表示名>` | client HELLO の表示ラベル（既定 `client`。最大 200B） |
 
 `HOST` と `CONNECT` の同時指定は無効化。listen/connect 失敗は fail-soft（アプリは netsync 無しで継続）。
+
+**copilot との関係（TASK-62.5.6）**: netsync session 中は copilot transport の operate（`action` / `begin_tx` / `end_tx` / `cancel_tx`）を拒否する（observe=digest/snapshot は可）。agent の操作は `VP_NETSYNC_ACTOR=agent` の専用 peer 接続へ一本化。
 
 ### フレーム仕様（要点）
 
@@ -728,11 +731,12 @@ scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
 
 | 項目 | 内容 |
 |---|---|
-| digest | 1 行 k=v（live 応答は `netsync ` 接頭）: `role=<host\|client> peers=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none> [log=<seq:origin:name,...>]` |
-| snapshot | 同内容の JSON 1 オブジェクト + `log` 全件配列（`ext=json`） |
+| digest | 1 行 k=v（live 応答は `netsync ` 接頭）: `role=<host\|client> peers=<n> agents=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none> [log=<seq:origin:name,...>]` |
+| snapshot | JSON 1 オブジェクト: `peers` 配列 `[{peer_id,kind,label}]` + `agents` + `log` 全件（`ext=json`）。client の peers は自分のみ（PEER_INFO 未配布の既知制約） |
 | last_seq | host = wire commit カウンタ / client = 最後に適用した COMMIT の seq |
 | reject_reason | ASCII whitespace・制御文字を `_` 置換、64B 切り詰め |
 | log 要約 | 末尾数件。revert は `seq:origin:revert->target` |
+| agents | 接続中の `kind=agent` peer 数（host=peer テーブル / client=自分） |
 
 ### session 中の undo/redo（TASK-62.3.5）
 
