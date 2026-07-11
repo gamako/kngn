@@ -15,6 +15,7 @@ const std = @import("std");
 const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
 const platform = kit.platform;
 const gui = kit.gui;
+const recipe = kit.recipe;
 const core = @import("paint");
 const png = kit.png;
 const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
@@ -374,6 +375,8 @@ const App = struct {
     cmd_log: platform.command.CommandLog = .{},
     /// dispatcher/log は main() で配線する（ctx に &app が要るため field default にできない）。
     cmd_exec: platform.command.Executor = undefined,
+    /// recipe_replay 実行中フラグ（入れ子 `recipe_replay` 拒否用。TASK-62.5.8）。
+    recipe_replaying: bool = false,
     /// UI stroke（canvas_input 経由）の点列蓄積（§5c。press〜release のイベント時 append・固定上限は
     /// actions.MAX_STROKE_POINTS を共有）。連続同一点は追加しない（同一点 move は描画上 no-op）。
     ui_stroke_pts: [actions.MAX_STROKE_POINTS]actions.Point = undefined,
@@ -1937,6 +1940,75 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
+/// CommandLog の kind=normal を seq 順（recordAt の古い→新しい）で Entry 化する（TASK-62.5.8）。
+/// 返る Entry の name/args は log 内バッファへの借用。スライスは caller が free。
+fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
+    var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < log.filled) : (i += 1) {
+        const rec = log.recordAt(i);
+        views_buf[n] = .{
+            .is_normal = rec.kind == .normal,
+            .name = rec.name(),
+            .args = rec.args(),
+        };
+        n += 1;
+    }
+    return recipe.collectNormalEntries(gpa, views_buf[0..n]);
+}
+
+/// `recipe_save <path>`: CommandLog → recipe ファイル（header.app_name="pixie"）。記録しない（メタ操作）。
+fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+    const entries = try recipeEntriesFromLog(&app.cmd_log, app.gpa);
+    defer app.gpa.free(entries);
+    try recipe.save(app.io, path, .{ .app_name = "pixie" }, entries, app.gpa);
+    return "ok";
+}
+
+/// `recipe_replay <path>`: load → app_name 検証 → 各 entry を routeLocalAction で逐次適用。
+/// 失敗で中断（structured error に何番目かを含む）。入れ子 recipe_replay は拒否。
+fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    recipe.checkNotReplaying(app.recipe_replaying) catch {
+        platform.setActionErrorDetail("nested_replay", "wait for current recipe_replay to finish");
+        return error.NestedReplay;
+    };
+    const path = try actions.parsePath(args);
+    var loaded = recipe.load(app.io, app.gpa, path) catch |err| {
+        if (err == error.FileNotFound) {
+            platform.setActionErrorDetail("file_not_found", "check path or use recipe_save first");
+        }
+        return err;
+    };
+    defer loaded.deinit();
+
+    recipe.checkAppName(loaded.header.app_name, "pixie") catch {
+        platform.setActionErrorDetail("app_mismatch", "open with the correct app");
+        return error.AppMismatch;
+    };
+
+    app.recipe_replaying = true;
+    defer app.recipe_replaying = false;
+
+    for (loaded.entries, 0..) |entry, idx| {
+        _ = platform.routeAction(entry.name, entry.args, buf) catch |err| {
+            // 入れ子 recipe_replay は内側が nested_replay detail をセット済み → 上書きしない
+            if (err == error.NestedReplay) return err;
+            var code_buf: [32]u8 = undefined;
+            const code = std.fmt.bufPrint(&code_buf, "replay_failed_at_{d}", .{idx + 1}) catch "replay_failed";
+            var next_buf: [200]u8 = undefined;
+            const next = std.fmt.bufPrint(&next_buf, "fix entry {d} ({s}) or preceding state", .{ idx + 1, entry.name }) catch "fix recipe entry";
+            platform.setActionErrorDetail(code, next);
+            return error.ReplayFailed;
+        };
+    }
+    return "ok";
+}
+
 // テキストレイヤー（TASK-79.5）向け action（doAddTextLayer/doSetTextParams/doRasterizeLayer）は
 // 未追加のまま（TASK-62.5.3 で MAX_ACTIONS は 32 へ拡張済みで slot は空いたが、追加自体は
 // 本タスクのスコープ外）。harness 検証は既存の `inject mouse_down/up` + `inject char` で行う。
@@ -2078,6 +2150,9 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay });
     platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only });
     platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record) });
+    // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
+    platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
+    platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

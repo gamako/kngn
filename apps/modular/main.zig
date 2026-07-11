@@ -17,6 +17,7 @@ const audio = kit.audio;
 const synth = kit.synth; // SampleTap（Audio→GUI の出力タップ）
 const dsp = kit.dsp; // mono downmix
 const gui = kit.gui; // スライダ / ボタン / グリッドセル
+const recipe = kit.recipe;
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
 const patchmod = @import("patch.zig");
@@ -64,6 +65,8 @@ const App = struct {
     /// CommandLog + Executor（TASK-62.5.7: 記録のみ。undo/tx/probe 統合なし）。
     cmd_log: platform.command.CommandLog = .{},
     cmd_exec: platform.command.Executor = undefined,
+    /// recipe_replay 実行中フラグ（入れ子拒否用。TASK-62.5.8）。
+    recipe_replaying: bool = false,
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -794,6 +797,74 @@ fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
+/// CommandLog の kind=normal を seq 順で Entry 化（TASK-62.5.8）。name/args は log 借用。
+fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
+    var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < log.filled) : (i += 1) {
+        const rec = log.recordAt(i);
+        views_buf[n] = .{
+            .is_normal = rec.kind == .normal,
+            .name = rec.name(),
+            .args = rec.args(),
+        };
+        n += 1;
+    }
+    return recipe.collectNormalEntries(gpa, views_buf[0..n]);
+}
+
+/// `recipe_save <path>`: CommandLog → recipe（app_name="modular"）。記録しない。
+fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const gpa = std.heap.c_allocator;
+    const path = try actions.parsePath(args);
+    const entries = try recipeEntriesFromLog(&app.cmd_log, gpa);
+    defer gpa.free(entries);
+    try recipe.save(app.io, path, .{ .app_name = "modular" }, entries, gpa);
+    return "ok";
+}
+
+/// `recipe_replay <path>`: load → app_name 検証 → routeLocalAction 逐次適用。入れ子拒否。
+fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const gpa = std.heap.c_allocator;
+    recipe.checkNotReplaying(app.recipe_replaying) catch {
+        platform.setActionErrorDetail("nested_replay", "wait for current recipe_replay to finish");
+        return error.NestedReplay;
+    };
+    const path = try actions.parsePath(args);
+    var loaded = recipe.load(app.io, gpa, path) catch |err| {
+        if (err == error.FileNotFound) {
+            platform.setActionErrorDetail("file_not_found", "check path or use recipe_save first");
+        }
+        return err;
+    };
+    defer loaded.deinit();
+
+    recipe.checkAppName(loaded.header.app_name, "modular") catch {
+        platform.setActionErrorDetail("app_mismatch", "open with the correct app");
+        return error.AppMismatch;
+    };
+
+    app.recipe_replaying = true;
+    defer app.recipe_replaying = false;
+
+    for (loaded.entries, 0..) |entry, idx| {
+        _ = platform.routeAction(entry.name, entry.args, buf) catch |err| {
+            if (err == error.NestedReplay) return err;
+            var code_buf: [32]u8 = undefined;
+            const code = std.fmt.bufPrint(&code_buf, "replay_failed_at_{d}", .{idx + 1}) catch "replay_failed";
+            var next_buf: [200]u8 = undefined;
+            const next = std.fmt.bufPrint(&next_buf, "fix entry {d} ({s}) or preceding state", .{ idx + 1, entry.name }) catch "fix recipe entry";
+            platform.setActionErrorDetail(code, next);
+            return error.ReplayFailed;
+        };
+    }
+    return "ok";
+}
+
 // ============================================================================
 // command model 統合（TASK-62.5.7: 記録のみ。pixie 62.5.3 の最小版）
 //
@@ -850,6 +921,9 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = recordedAction("save_pattern") });
     platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = recordedAction("load_pattern") });
     platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed") });
+    // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
+    platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
+    platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

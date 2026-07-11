@@ -30,7 +30,7 @@ video-proto-main/
 │   ├── dsp/           # DSP ヘルパー（Oscillator / Envelope / Filter / Mixer）→ 将来 libs/audio
 │   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群 → 将来 libs/gfx
 ├── kit/               # 公開 umbrella モジュール（ADR-007 R4）。apps と外部消費者はこれのみ import
-│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth を再エクスポート
+│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth / gamepad / recipe を再エクスポート
 ├── examples/          # サンプル 01〜19（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
 │   ├── 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering
 │   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone / 18_cursor / 19_color_emoji
@@ -40,6 +40,7 @@ video-proto-main/
 │   ├── png/           # PNG codec（decode/encode）
 │   ├── pixelops/      # ピクセルブレンド共有プリミティブ（premul/straight blend + div255 + clip-hoist）
 │   ├── serde/         # versioned container 直列化基盤（RIFF/IFF 系統 + version/CRC。TASK-62.2。std のみ・kit 非収録）
+│   ├── recipe/        # CommandRecord 列の save/replay（TASK-62.5.8。std + serde。kit 収録）
 │   ├── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
 │   ├── font/          # フォント（TrueType/OpenType アウトライン sfnt/glyf/cff + bmfont。※ BDF は src/text.zig）
 │   ├── synth/         # シンセ（Voice / VoicePool / Patch / ロックフリー受け渡し）
@@ -506,7 +507,7 @@ quit                       # 終了（EOF でも終了）
     - **非解釈の不変条件**: code/suggestion の語彙は app 側が返す。framework は透過（desc と同様に framing 保護だけ）。MCP ブリッジ（TASK-88）はこの wire をそのまま tool エラーとして読む前提。
     - **pixie 実例**: `open` の読込失敗（`ReadFailed`/`FileNotFound`）→ `code=file_not_found` / `next=check path or use save first`。`select_layer` の `OutOfRange` → `code=index_out_of_range` / `next=use add_layer or 0..N-1`。
   - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（32件。TASK-62.5.3 で 16→32）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
-  - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（`#` 有無どちらも許容） / `set_tool <pen|eraser|brush|bezier|select|fill>` / `stroke <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗） / `save <path>` / `open <path>`。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
+  - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（`#` 有無どちらも許容） / `set_tool <pen|eraser|brush|bezier|select|fill>` / `stroke <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗） / `save <path>` / `open <path>` / `recipe_save <path>` / `recipe_replay <path>`（TASK-62.5.8。下記「レシピ」節）。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
 
 ### 使い方（replay = file トランスポート）
 
@@ -793,6 +794,42 @@ memset も避ける）。
 **ホットパス**: seed の受理・記録はイベント時のみ。RT への反映は既存の lock-free 受け渡し（atomic/Mailbox）+
 生成境界での latch/再初期化のみ。RT 経路に alloc/lock/毎サンプル分岐を追加しない。
 
+## レシピ（recipe, TASK-62.5.8）
+
+CommandRecord 列（意味的コマンド列）をファイルへ save/replay し、作品の再現・共有を可能にする。
+実装は `libs/recipe`（kit.recipe）+ pixie/modular の `recipe_save` / `recipe_replay` action。
+
+### harness replay script との役割分担
+
+| | harness replay script | recipe |
+|---|---|---|
+| 中身 | 低レベル入力列（`inject` / `step` / `snapshot` / `digest` / `action`） | 意味的コマンド列（action name+args のみ） |
+| 用途 | 検証・再現テスト（ヘッドレス harness） | 作品の保存・共有・再現 |
+| 実行 | harness が script を解釈 | app が `routeLocalAction` で逐次適用 |
+| 形式 | テキスト行（`;` 区切り可） | serde versioned container（magic=`RCP1`、format_version=1） |
+
+両者は置換関係ではない。harness script で `action recipe_replay <path>` を呼ぶことはできるが、
+script 自体がレシピの代替ではない。
+
+### 形式
+
+- **header**: `app_name`（≤64B）+ `format_version=1`
+- **entries**: `{name, args}` の列（CommandLog の **kind=normal** を **seq 順**に書き出したもの）
+- 破損（CRC）・版不一致・app_name 長超過はエラー
+- `recipe_replay` は header.app_name を検証し、不一致なら `code=app_mismatch`（正しい app で開く）
+
+### seed 規約（62.5.7）との組
+
+`seed` も通常の normal command として保存・再生される。**seed + 後続コマンド列 = 作品の完全な再現**
+（上記 seed 規約参照）。modular では `action seed N` が recipe に含まれ、replay で同じ生成状態から始まる。
+
+### MVP 制約
+
+- **revert 非対応**: CommandLog の kind=revert は save 対象外（「undo も再生する」再現は 62.3.5 wire 経路依存のためスコープ外）
+- **入れ子拒否**: `recipe_replay` 実行中の `recipe_replay` は `code=nested_replay` で拒否
+- **失敗中断**: 途中 entry が失敗したらそこで止まり、`code=replay_failed_at_N`（1-based）を載せる
+- remix（部分適用・パラメータ差し替え）は将来スコープ
+
 ## 性能規約（メモリI/O・キャッシュ最適化）
 
 2026-07 の全ホットパス監査に基づく規約。RT 契約（「オーディオ / シンセ層」節）が全 backend で
@@ -871,6 +908,7 @@ zig build test-font             # libs/font（bmfont 等）
 zig build test-sprite           # sprite ブレンド / 描画
 zig build test-pixelops         # libs/pixelops（SIMD vs scalar 一致 / div255 恒等 / clipBlit 境界）
 zig build test-serde            # libs/serde（versioned container round-trip / 破損検出 / 前方互換 / 固定 fixture）
+zig build test-recipe           # libs/recipe（CommandRecord 列 save/load / collect / app_name。TASK-62.5.8）
 zig build test-dsp              # src/dsp（Oscillator / ADSR / Filter / Mixer）
 zig build test-synth            # libs/synth（SPSC リング / atomic / Voice / VoicePool / Synth）
 zig build test-spectrogram      # apps/synth スペクトログラム（FFT 列ロジック）

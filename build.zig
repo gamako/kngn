@@ -609,6 +609,18 @@ pub fn build(b: *std.Build) void {
     const test_serde_step = b.step("test-serde", "Run libs/serde versioned container tests");
     test_serde_step.dependOn(&run_serde_test.step);
 
+    // libs/recipe 単体テスト（CommandRecord 列 save/load。TASK-62.5.8。serde に依存）
+    const recipe_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/recipe/src/recipe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recipe_test_mod.addImport("serde", shared_modules.serde.mod);
+    const recipe_test = b.addTest(.{ .root_module = recipe_test_mod });
+    const run_recipe_test = b.addRunArtifact(recipe_test);
+    const test_recipe_step = b.step("test-recipe", "Run libs/recipe save/load / collect / app_name tests");
+    test_recipe_step.dependOn(&run_recipe_test.step);
+
     // editor/core テスト (undo: stroke 記録 + undo/redo + PNG round-trip, tool: Tool ゴールデン)
     // + pixie canvas_input (入力状態機械: capture / 外 release / 外継続 / stroke 中無視)
     const core_undo_mod = b.createModule(.{
@@ -1284,6 +1296,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_capture_types_step);
     test_step.dependOn(test_pixelops_step);
     test_step.dependOn(test_serde_step);
+    test_step.dependOn(test_recipe_step);
 
     // ========================================
     // マイクロベンチ（TASK-50）。純ロジック計測（display / audio デバイス不要・OS 非依存）。
@@ -1481,6 +1494,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.dsp);
     link(kit, common.synth);
     link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
+    link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
 
     return .{ .platform = platform_mod, .platform_gamepad = platform_gamepad_mod, .keyboard = keyboard_mod, .kit = kit };
 }
@@ -1537,6 +1551,7 @@ const SharedModules = struct {
     types: TaggedModule,
     pixelops: TaggedModule,
     serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
+    recipe: TaggedModule, // libs/recipe（CommandRecord 列 save/replay。TASK-62.5.8。std + serde。kit 収録）
     paint: TaggedModule, // 旧 apps/editor/core（ADR-007 R6 で libs/paint へ格上げ）
     spectrogram: TaggedModule, // libs/viz（旧 apps/synth/spectrogram.zig）
     scope: TaggedModule, // libs/viz（旧 apps/synth/scope.zig）
@@ -1587,6 +1602,13 @@ const SharedModules = struct {
         const serde: TaggedModule = .{ .layer = .lib, .name = "serde", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/serde/src/serde.zig"),
         }) };
+
+        // libs/recipe: CommandRecord 列の save/replay（TASK-62.5.8）。std + serde のみ。
+        // kit 収録（apps は kit.recipe 経由。R5）。core 非依存。
+        const recipe: TaggedModule = .{ .layer = .lib, .name = "recipe", .mod = b.createModule(.{
+            .root_source_file = b.path("libs/recipe/src/recipe.zig"),
+        }) };
+        link(recipe, serde);
 
         // 共有型 module（platform_types）: KeyCode/Event/EventStats 等の単一ソース。
         // type-only（ADR-007 未決#1 の確定: libs が core から参照してよい唯一の module）。
@@ -1768,6 +1790,7 @@ const SharedModules = struct {
             .types = types,
             .pixelops = pixelops,
             .serde = serde,
+            .recipe = recipe,
             .paint = paint,
             .spectrogram = spectrogram,
             .scope = scope,

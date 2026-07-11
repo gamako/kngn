@@ -12,6 +12,7 @@
 //! - gamepad: src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する
 //!   headless lib として layer=.lib で扱う。keyboard.zig 等の他 src/ ヘルパーは examples 専用で
 //!   kit 非収録だが、gamepad は将来 apps からの直接利用も想定するため kit に載せる）
+//! - recipe: libs/recipe（CommandRecord 列の save/replay。TASK-62.5.8。std + serde のみ）
 //!
 //! **流動中の lib（modular / paint / viz 等）は載せない**。apps はそれらを「内部・壊れうる」
 //! 前提の直 import で使い、API が固まったら kit へ昇格する（成熟ゲート）。
@@ -29,3 +30,4 @@ pub const font = @import("font");
 pub const dsp = @import("dsp");
 pub const synth = @import("synth");
 pub const gamepad = @import("gamepad");
+pub const recipe = @import("recipe");
