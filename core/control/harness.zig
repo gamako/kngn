@@ -308,6 +308,7 @@ pub const Action = action_registry.Action;
 pub const NetworkPolicy = action_registry.NetworkPolicy;
 pub const registerAction = action_registry.registerAction;
 pub const findAction = action_registry.findAction;
+pub const setActionErrorDetail = action_registry.setActionErrorDetail;
 
 /// headless 判定の純粋ロジック（env I/O から分離。単体テスト用）。
 /// `VP_HARNESS_HEADLESS` 単独指定（script も live も無し）は無効（false = 通常実行）。
@@ -1269,13 +1270,24 @@ fn firstLine(msg: []const u8) []const u8 {
     return msg[0..cut];
 }
 
+/// structured error の末尾サフィックス（未セット時は空 = 従来 bit 一致。TASK-62.5.9）。
+/// ` code=<c> next=<n>`（先頭 space 付き）。next は空白可の残り全体。
+fn actionErrorDetailSuffix(buf: []u8) []const u8 {
+    const d = action_registry.actionErrorDetail() orelse return "";
+    return std.fmt.bufPrint(buf, " code={s} next={s}", .{ d.code, d.next }) catch "";
+}
+
 /// action の合否を emit し、失敗を記帳する（replay=stderr / live=resp_buf）。
 /// - replay 成功: `[harness] action <name> ok <msg>` / 失敗: `[harness] action <name> FAILED <msg>`
 /// - live 成功  : `<name> <msg>`（bare。digest と同じ流儀） / 失敗: `fail <name> <msg>`（drive の
 ///   行頭スキャンに乗せるための接頭辞）
+/// - 失敗時、app が `setActionErrorDetail` 済みなら末尾に ` code=<c> next=<n>` を追記（TASK-62.5.9。
+///   未セット時は従来形式と bit 一致。行頭 `fail ` 不変 → scripts/drive の行頭スキャン無改修）
 /// - 失敗時のみ `mode == .replay` なら `expect_failures` を加算する（assert 相当の即時 abort は無い）。
 fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
     const line = firstLine(msg);
+    var detail_buf: [action_registry.MAX_ERROR_CODE_LEN + action_registry.MAX_ERROR_NEXT_LEN + 16]u8 = undefined;
+    const suffix = if (!pass) actionErrorDetailSuffix(&detail_buf) else "";
     if (mode == .live) {
         if (pass) {
             appendResp(name);
@@ -1286,12 +1298,13 @@ fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
             appendResp(name);
             appendResp(" ");
             appendResp(line);
+            appendResp(suffix);
         }
         appendResp("\n");
     } else if (pass) {
         std.debug.print("[harness] action {s} ok {s}\n", .{ name, line });
     } else {
-        std.debug.print("[harness] action {s} FAILED {s}\n", .{ name, line });
+        std.debug.print("[harness] action {s} FAILED {s}{s}\n", .{ name, line, suffix });
     }
 
     if (!pass and mode == .replay) {
@@ -2704,6 +2717,118 @@ test "action live: 成功は bare `<name> <msg>`、失敗は `fail <name> <msg>`
     }
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail nosuch unknown action"));
     try testing.expectEqual(@as(usize, 0), expect_failures); // live は記帳しない
+}
+
+fn testActionErrWithDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = args;
+    _ = buf;
+    action_registry.setActionErrorDetail("file_not_found", "check path or use save first");
+    return error.Boom;
+}
+
+fn testActionErrMaybeDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = buf;
+    if (std.mem.eql(u8, args, "set")) {
+        action_registry.setActionErrorDetail("stale_code", "should not leak to next fail");
+    }
+    return error.Boom;
+}
+
+test "action structured error: live 失敗行に code=/next= 追記 / 未セット時は従来 bit 一致 / fail 行頭不変" {
+    resetForTest();
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var c = TestActionCtx{};
+    registerAction(.{ .name = "boom", .ctx = &c, .run = testActionErrWithDetail });
+    registerAction(.{ .name = "plain", .ctx = &c, .run = testActionErr });
+    defer action_registry.resetForTest();
+
+    {
+        var it = std.mem.tokenizeAny(u8, "boom", " \t");
+        handleAction(&it);
+    }
+    // 行頭 `fail ` 不変 → scripts/drive の fail 行頭スキャン回帰（AC#2）
+    try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail boom "));
+    try testing.expectEqualStrings("fail boom Boom code=file_not_found next=check path or use save first\n", resp_buf.items);
+    resp_buf.clearRetainingCapacity();
+
+    // detail 未セット時は従来形式と bit 一致（code=/next= を一切付けない）
+    {
+        var it = std.mem.tokenizeAny(u8, "plain", " \t");
+        handleAction(&it);
+    }
+    try testing.expectEqualStrings("fail plain Boom\n", resp_buf.items);
+    try testing.expect(std.mem.indexOf(u8, resp_buf.items, "code=") == null);
+    try testing.expect(std.mem.indexOf(u8, resp_buf.items, "next=") == null);
+    try testing.expectEqual(@as(usize, 0), expect_failures); // live は記帳しない
+}
+
+test "action structured error: dispatch 毎クリアで前回 detail が次の失敗に漏れない" {
+    resetForTest();
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var c = TestActionCtx{};
+    registerAction(.{ .name = "maybe", .ctx = &c, .run = testActionErrMaybeDetail });
+    defer action_registry.resetForTest();
+
+    {
+        var it = std.mem.tokenizeAny(u8, "maybe set", " \t");
+        handleAction(&it);
+    }
+    try testing.expectEqualStrings("fail maybe Boom code=stale_code next=should not leak to next fail\n", resp_buf.items);
+    resp_buf.clearRetainingCapacity();
+
+    {
+        var it = std.mem.tokenizeAny(u8, "maybe noset", " \t");
+        handleAction(&it);
+    }
+    try testing.expectEqualStrings("fail maybe Boom\n", resp_buf.items);
+}
+
+test "action structured error: next の空白保持 / sanitize（改行→_）" {
+    resetForTest();
+    mode = .live;
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    var c = TestActionCtx{};
+    const run = struct {
+        fn f(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+            _ = ctx;
+            _ = args;
+            _ = buf;
+            action_registry.setActionErrorDetail("a b\nc", "use add_layer or 0..N-1");
+            return error.Bad;
+        }
+    }.f;
+    registerAction(.{ .name = "x", .ctx = &c, .run = run });
+    defer action_registry.resetForTest();
+
+    {
+        var it = std.mem.tokenizeAny(u8, "x", " \t");
+        handleAction(&it);
+    }
+    try testing.expectEqualStrings("fail x Bad code=a_b_c next=use add_layer or 0..N-1\n", resp_buf.items);
+}
+
+test "action structured error: replay/live 両 wire の suffix 形式（未セットは空）" {
+    resetForTest();
+    var sbuf: [128]u8 = undefined;
+    // 未セット → 空（従来 bit 一致の根拠）
+    try testing.expectEqualStrings("", actionErrorDetailSuffix(&sbuf));
+
+    action_registry.setActionErrorDetail("file_not_found", "check path or use save first");
+    const suf = actionErrorDetailSuffix(&sbuf);
+    try testing.expectEqualStrings(" code=file_not_found next=check path or use save first", suf);
+
+    // live: `fail <name> <msg>` + suffix / replay: `[harness] action <name> FAILED <msg>` + suffix
+    // （同一 suffix を両 sink が共有。reportAction が組み立てる）
+    try testing.expect(std.mem.endsWith(u8, "fail boom Boom code=file_not_found next=check path or use save first", suf));
+    try testing.expect(std.mem.endsWith(u8, "[harness] action boom FAILED Boom code=file_not_found next=check path or use save first", suf));
+    try testing.expect(std.mem.startsWith(u8, "fail boom Boom", "fail ")); // drive 行頭スキャン
 }
 
 // ============================================================================

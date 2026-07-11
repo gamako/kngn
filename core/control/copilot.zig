@@ -206,8 +206,10 @@ fn initExecutorState() void {
 
 /// executor の Dispatcher: harness action registry の name lookup → run() 委譲
 /// （framework は args も戻り値も解釈しない）。
+/// structured error は `action_registry.dispatch` と同様、run 前に毎回クリアする（TASK-62.5.9）。
 fn dispatchHarnessAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = ctx;
+    harness.action_registry.clearActionErrorDetail();
     const act = harness.findAction(name) orelse return error.UnknownAction;
     return act.run(act.ctx, args, buf);
 }
@@ -509,10 +511,28 @@ fn errorResp(conn_state: *ConnState, reason: []const u8) void {
 }
 
 fn failResp(conn_state: *ConnState, name: []const u8, reason: []const u8) void {
+    failRespEx(conn_state, name, reason, false);
+}
+
+/// action run 失敗専用: app が `setActionErrorDetail` 済みなら末尾に ` code=<c> next=<n>` を追記
+/// （TASK-62.5.9。未セット時は `failResp` と同じ = 従来 bit 一致。行頭 `fail ` 不変）。
+fn failActionResp(conn_state: *ConnState, name: []const u8, reason: []const u8) void {
+    failRespEx(conn_state, name, reason, true);
+}
+
+fn failRespEx(conn_state: *ConnState, name: []const u8, reason: []const u8, with_detail: bool) void {
     conn_state.appendResp("fail ");
     conn_state.appendResp(name);
     conn_state.appendResp(" ");
     conn_state.appendResp(firstLine(reason));
+    if (with_detail) {
+        if (harness.action_registry.actionErrorDetail()) |d| {
+            conn_state.appendResp(" code=");
+            conn_state.appendResp(d.code);
+            conn_state.appendResp(" next=");
+            conn_state.appendResp(d.next);
+        }
+    }
     conn_state.appendResp("\n");
 }
 
@@ -578,8 +598,10 @@ fn handleActionCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any))
         // 共有 executor 設定時: registry の run を直接呼ぶ（app 側 wrapper が executor 経由の
         // 記録を一元化しているため、ここで own executor を通すと二重記録/ReentrantDispatch になる）。
         const act = harness.findAction(name) orelse return failResp(conn_state, name, "unknown action");
+        // direct-run は action_registry.dispatch を経由しないので structured error を手動クリア
+        harness.action_registry.clearActionErrorDetail();
         const result = act.run(act.ctx, args, &buf) catch |err| {
-            return failResp(conn_state, name, @errorName(err));
+            return failActionResp(conn_state, name, @errorName(err));
         };
         conn_state.appendResp(name);
         conn_state.appendResp(" ");
@@ -593,7 +615,7 @@ fn handleActionCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any))
         .record_policy = .record,
     }, &buf) catch |err| {
         if (err == error.UnknownAction) return failResp(conn_state, name, "unknown action");
-        return failResp(conn_state, name, @errorName(err));
+        return failActionResp(conn_state, name, @errorName(err));
     };
     conn_state.appendResp(name);
     conn_state.appendResp(" ");
@@ -671,6 +693,15 @@ fn testActionPing(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return std.fmt.bufPrint(buf, "pong {s}", .{args}) catch "pong";
 }
 
+fn testActionBoomDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = buf;
+    if (std.mem.eql(u8, args, "set")) {
+        harness.setActionErrorDetail("file_not_found", "check path or use save first");
+    }
+    return error.Boom;
+}
+
 const TestProbeCtx = struct { value: u32 = 7 };
 
 fn testProbeDigest(ctx: *anyopaque, buf: []u8) []const u8 {
@@ -732,6 +763,30 @@ test "copilot: 3 action 応答形式 + CommandLog に actor=local_agent kind=nor
     try testing.expectEqualStrings("ping", rec.name());
     try testing.expectEqualStrings("hello", rec.args());
     try testing.expect(!rec.undoable); // noteUndo 呼び出し元がまだ無い（62.5.3 で pixie が対応）
+}
+
+test "copilot: 3b failActionResp に structured error（code=/next=）/ 未セット時 bit 一致 / fail 行頭" {
+    resetCopilotForTest();
+    harness.setExternalRegistryEnabled(true);
+    defer {
+        harness.setExternalRegistryEnabled(false);
+        harness.action_registry.resetForTest();
+    }
+    var ac = TestActionCtx{};
+    harness.registerAction(.{ .name = "boom", .ctx = &ac, .run = testActionBoomDetail });
+
+    var cs: ConnState = undefined;
+    const resp1 = handleRequest(&cs, "action boom set");
+    try testing.expect(std.mem.startsWith(u8, resp1, "fail boom "));
+    try testing.expectEqualStrings("fail boom Boom code=file_not_found next=check path or use save first\n", resp1);
+
+    // dispatch 相当のクリア: 次の失敗（detail 未セット）は従来形式と bit 一致
+    const resp2 = handleRequest(&cs, "action boom noset");
+    try testing.expectEqualStrings("fail boom Boom\n", resp2);
+
+    // 非 action 失敗（begin_tx 等）は detail を付けない
+    const resp3 = handleRequest(&cs, "end_tx");
+    try testing.expectEqualStrings("fail end_tx no open transaction\n", resp3);
 }
 
 test "copilot: 4 begin_tx→action→end_tx で transaction_id が付く / 二重 begin・handle 不整合は fail" {

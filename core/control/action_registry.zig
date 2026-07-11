@@ -58,6 +58,69 @@ var router: ?RouterFn = null;
 
 const MAX_DESC_LEN = 200;
 
+// ============================================================================
+// structured error（TASK-62.5.9）: action 失敗時の opt-in code + suggested_next_action
+//
+// main thread 専有の module 変数。handler がエラー return 直前に `setActionErrorDetail` を
+// 呼ぶと、harness/copilot の失敗行末尾に ` code=<c> next=<n>` が追記される。未呼び出し時は
+// 従来 wire と bit 一致（code=/next= を一切付けない）。framework は code/next の語彙を
+// **解釈しない**（wire framing 保護の sanitize のみ）。
+// ============================================================================
+
+/// error code の wire 上限（1 トークン想定）。
+pub const MAX_ERROR_CODE_LEN = 64;
+/// suggested_next_action の wire 上限（空白可・行末最終フィールド）。
+pub const MAX_ERROR_NEXT_LEN = 200;
+
+var err_code_buf: [MAX_ERROR_CODE_LEN]u8 = undefined;
+var err_code_len: usize = 0;
+var err_next_buf: [MAX_ERROR_NEXT_LEN]u8 = undefined;
+var err_next_len: usize = 0;
+var err_detail_set: bool = false;
+
+/// framing 保護: 制御文字/`DEL` を `_` に置換し `out.len` で切り詰める。
+/// `collapse_ws=true` のとき ASCII whitespace（space 含む）も `_`（code は 1 トークン）。
+/// `collapse_ws=false` のとき space は保持（next は空白可）。
+fn sanitizeErrorField(out: []u8, src: []const u8, comptime collapse_ws: bool) usize {
+    const n = @min(src.len, out.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c = src[i];
+        if (collapse_ws) {
+            out[i] = if (c <= 0x20 or c == 0x7f) '_' else c;
+        } else {
+            out[i] = if (c < 0x20 or c == 0x7f) '_' else c;
+        }
+    }
+    return n;
+}
+
+/// structured error をクリアする（`dispatch` 開始時 / copilot の direct-run 前。framework 内部用）。
+pub fn clearActionErrorDetail() void {
+    err_code_len = 0;
+    err_next_len = 0;
+    err_detail_set = false;
+}
+
+/// action 失敗の構造化エラーをセットする（app opt-in・main thread のみ）。
+/// `dispatch` 開始時に毎回クリアされるので、**エラー return の直前**に呼ぶ。
+/// sanitize は wire framing 保護のみ（意味は非解釈）: 制御文字→`_`、上限 code=64B / next=200B。
+pub fn setActionErrorDetail(code: []const u8, suggested_next_action: []const u8) void {
+    err_code_len = sanitizeErrorField(&err_code_buf, code, true);
+    err_next_len = sanitizeErrorField(&err_next_buf, suggested_next_action, false);
+    err_detail_set = true;
+}
+
+/// 直近の structured error（未セットなら null）。`dispatch` クリア〜set までの peek。
+/// harness/copilot の wire 整形専用（app は通常使わない）。
+pub fn actionErrorDetail() ?struct { code: []const u8, next: []const u8 } {
+    if (!err_detail_set) return null;
+    return .{
+        .code = err_code_buf[0..err_code_len],
+        .next = err_next_buf[0..err_next_len],
+    };
+}
+
 fn containsUnsafeJsonChar(s: []const u8) bool {
     for (s) |c| {
         if (c == '"' or c == '\\' or c < 0x20) return true;
@@ -128,7 +191,9 @@ pub fn findAction(name: []const u8) ?*Action {
 }
 
 /// name lookup → `run()`。未知 action は `error.UnknownAction`。`run()` のエラーはそのまま透過。
+/// **structured error は毎回クリア**してから `run` する（前回 detail の漏れを防ぐ。TASK-62.5.9）。
 pub fn dispatch(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    clearActionErrorDetail();
     const act = findAction(name) orelse return error.UnknownAction;
     return act.run(act.ctx, args, buf);
 }
@@ -142,16 +207,20 @@ pub fn setRouter(r: ?RouterFn) void {
 /// router 設定時は router へ委譲、未設定時は `dispatch` と完全等価。
 /// **main thread のみ**（harness `handleAction` / copilot pump）。router 読みは同期プリミティブ無し
 /// （書き手も main thread のみ。client fail-soft の解除は netsync.pump が main で行う）。
+/// structured error は入口で毎回クリア（router が dispatch に到達せずエラーを返す経路でも
+/// 前回 detail が漏れない。TASK-62.5.9 P1。dispatch 内クリアは冪等）。
 pub fn routeLocalAction(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    clearActionErrorDetail();
     if (router) |r| return r(name, args, buf);
     return dispatch(name, args, buf);
 }
 
-/// テスト用リセット（count=0 / enabled=false / router=null）。
+/// テスト用リセット（count=0 / enabled=false / router=null / error detail クリア）。
 pub fn resetForTest() void {
     action_count = 0;
     enabled = false;
     router = null;
+    clearActionErrorDetail();
 }
 
 /// capabilities 列挙用 iterator: 登録件数。
@@ -299,4 +368,101 @@ test "action_registry: network_policy 既定は reject_when_synced" {
     try testing.expectEqual(NetworkPolicy.reject_when_synced, findAction("n").?.network_policy);
     registerAction(.{ .name = "r", .ctx = &c, .run = testRun, .network_policy = .relay });
     try testing.expectEqual(NetworkPolicy.relay, findAction("r").?.network_policy);
+}
+
+fn testRunSetDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = args;
+    _ = buf;
+    setActionErrorDetail("file_not_found", "check path or use save first");
+    return error.Boom;
+}
+
+fn testRunSetDetailStale(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = buf;
+    // args が "set" のときだけ detail を載せる（dispatch クリアの回帰確認用）
+    if (std.mem.eql(u8, args, "set")) {
+        setActionErrorDetail("stale_code", "should not leak");
+    }
+    return error.Boom;
+}
+
+test "action_registry: setActionErrorDetail / 未セットは null / sanitize / next 空白保持" {
+    resetForTest();
+    try testing.expect(actionErrorDetail() == null);
+
+    setActionErrorDetail("index_out_of_range", "use add_layer or 0..N-1");
+    const d0 = actionErrorDetail().?;
+    try testing.expectEqualStrings("index_out_of_range", d0.code);
+    try testing.expectEqualStrings("use add_layer or 0..N-1", d0.next); // 空白保持
+
+    // code: whitespace/制御 → `_`、上限 64B。next: 制御のみ `_`、上限 200B、space 保持
+    setActionErrorDetail("a b\nc\td", "go\nhere now");
+    const d1 = actionErrorDetail().?;
+    try testing.expectEqualStrings("a_b_c_d", d1.code);
+    try testing.expectEqualStrings("go_here now", d1.next);
+
+    var long_code: [80]u8 = undefined;
+    @memset(&long_code, 'X');
+    var long_next: [250]u8 = undefined;
+    @memset(&long_next, 'y');
+    setActionErrorDetail(&long_code, &long_next);
+    const d2 = actionErrorDetail().?;
+    try testing.expectEqual(@as(usize, MAX_ERROR_CODE_LEN), d2.code.len);
+    try testing.expectEqual(@as(usize, MAX_ERROR_NEXT_LEN), d2.next.len);
+}
+
+test "action_registry: dispatch 開始時に error detail をクリア（前回漏れ防止）" {
+    resetForTest();
+    setEnabled(true);
+    var c = TestCtx{};
+    registerAction(.{ .name = "boom", .ctx = &c, .run = testRunSetDetailStale });
+    var buf: [32]u8 = undefined;
+
+    try testing.expectError(error.Boom, dispatch("boom", "set", &buf));
+    try testing.expect(actionErrorDetail() != null);
+    try testing.expectEqualStrings("stale_code", actionErrorDetail().?.code);
+
+    // 2 回目: handler は set しない → dispatch がクリアするので detail は null
+    try testing.expectError(error.Boom, dispatch("boom", "noset", &buf));
+    try testing.expect(actionErrorDetail() == null);
+}
+
+test "action_registry: dispatch run エラー後も set 済み detail が残る（wire 整形側が読む）" {
+    resetForTest();
+    setEnabled(true);
+    var c = TestCtx{};
+    registerAction(.{ .name = "boom", .ctx = &c, .run = testRunSetDetail });
+    var buf: [32]u8 = undefined;
+    try testing.expectError(error.Boom, dispatch("boom", "", &buf));
+    const d = actionErrorDetail().?;
+    try testing.expectEqualStrings("file_not_found", d.code);
+    try testing.expectEqualStrings("check path or use save first", d.next);
+}
+
+/// netsyncRouter の reject/unknown 等、dispatch 非到達でエラーを返す経路を模した偽 router。
+fn testRouterFailNoDispatch(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = name;
+    _ = args;
+    _ = buf;
+    return error.UnknownAction;
+}
+
+test "action_registry: routeLocalAction 入口で detail クリア（router 非到達失敗に前回 code/next が漏れない）" {
+    resetForTest();
+    setEnabled(true);
+    var c = TestCtx{};
+    registerAction(.{ .name = "boom", .ctx = &c, .run = testRunSetDetail });
+    var buf: [32]u8 = undefined;
+
+    // 直前 action が detail 付きで失敗
+    try testing.expectError(error.Boom, dispatch("boom", "", &buf));
+    try testing.expect(actionErrorDetail() != null);
+    try testing.expectEqualStrings("file_not_found", actionErrorDetail().?.code);
+
+    // router 経由で dispatch 非到達の失敗（未知 action 相当）→ 入口 clear で前回 detail が消える
+    setRouter(testRouterFailNoDispatch);
+    try testing.expectError(error.UnknownAction, routeLocalAction("nosuch", "", &buf));
+    try testing.expect(actionErrorDetail() == null);
 }

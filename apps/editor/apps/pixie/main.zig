@@ -1756,7 +1756,13 @@ fn actionDeleteLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 fn actionSelectLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const idx = try actions.parseUsize(args);
-    try actionApp(ctx).doSelectLayer(idx);
+    actionApp(ctx).doSelectLayer(idx) catch |err| {
+        // structured error（TASK-62.5.9）: 範囲外は自己回復ヒントを wire に載せる
+        if (err == error.OutOfRange) {
+            platform.setActionErrorDetail("index_out_of_range", "use add_layer or 0..N-1");
+        }
+        return err;
+    };
     return "ok";
 }
 
@@ -1920,7 +1926,14 @@ fn actionSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
 fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const path = try actions.parsePath(args);
-    try actionApp(ctx).doOpenPath(path);
+    actionApp(ctx).doOpenPath(path) catch |err| {
+        // structured error（TASK-62.5.9）: 読込失敗（png は FileNotFound 等を ReadFailed に正規化）は
+        // 自己回復ヒントを wire に載せる。
+        if (err == error.ReadFailed or err == error.FileNotFound) {
+            platform.setActionErrorDetail("file_not_found", "check path or use save first");
+        }
+        return err;
+    };
     return "ok";
 }
 

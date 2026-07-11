@@ -308,6 +308,8 @@ pub const registerProbe = harness.registerProbe;
 pub const Action = harness.action_registry.Action;
 pub const NetworkPolicy = harness.action_registry.NetworkPolicy;
 pub const registerAction = harness.action_registry.registerAction;
+/// action 失敗時の structured error（code + suggested_next_action）。opt-in。TASK-62.5.9。
+pub const setActionErrorDetail = harness.action_registry.setActionErrorDetail;
 
 pub const StateSync = netsync.StateSync;
 /// netsync join 時の document/patch 同期アダプタ登録（無効時も保存のみ・常に呼んでよい）。

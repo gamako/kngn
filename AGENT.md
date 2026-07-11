@@ -499,6 +499,12 @@ quit                       # 終了（EOF でも終了）
   - callback は `run(ctx, args, buf) anyerror![]const u8`（`buf` は `digest` と同じ 1024B 契約。戻り値は改行を含めない1行）。**framework は args も戻り値の意味も一切解釈しない**（probe と同じ不変条件。改行以降を emit しないのは中身の解釈ではなく wire framing 保護）。callback は **main thread（`pollGate` 内・step/フレーム境界）で実行**され、RT callback から呼ばれることは無い（RT スレッドと共有する app 状態への同期責務は app 側）。
   - **合否と exit code**: 未知 action・名前欠落・`run()` のエラーは**すべて失敗**として扱い、`expect`/`assert`（TASK-78）と同じ `expect_failures` カウンタに相乗りする（記帳して続行。`assert` のような即時 abort 変種は無い）。replay は終了時（EOF/quit/window close いずれの経路でも）に記帳が 1 件以上あれば非0 exit、live はプロセスを終了せずレスポンス行のみで合否を返す。
   - **wire format**: replay stderr = 成功 `[harness] action <name> ok <msg>` / 失敗 `[harness] action <name> FAILED <msg>`。live resp = 成功 `<name> <msg>`（**bare。`digest` の `<probe> <payload>` と同じ流儀**）/ 失敗 `fail <name> <msg>`（**`fail ` 接頭辞。`scripts/drive` の行頭スキャンに乗せて非0 exit させるため**）。callback が誤って複数行を返しても `msg` は最初の `\r`/`\n` の手前で切って emit する（wire framing 保護。中身の解釈ではない）。
+  - **structured error（code + suggested_next_action / TASK-62.5.9）**: action 失敗の自己回復ヒントを app が opt-in で載せる wire 拡張。
+    - **API**: `platform.setActionErrorDetail(code, suggested_next_action)`（main thread 専有。`action_registry` の module 変数）。handler が **エラー return の直前**に呼ぶ。`dispatch` 開始時（および copilot の direct-run 前）に毎回クリアされるので、呼ばなければ**従来失敗行と bit 一致**（` code=`/` next=` を一切付けない）。
+    - **sanitize**: wire framing 保護のみ（意味は非解釈）。制御文字/`DEL` を `_` に置換、上限 code=64B / next=200B。code は 1 トークン想定のため ASCII whitespace も `_`。next は空白可（`next=` は行末最終フィールドで残り全体）。
+    - **wire（失敗行の末尾追記のみ）**: live/copilot = `fail <name> <msg> code=<c> next=<n>` / replay = `[harness] action <name> FAILED <msg> code=<c> next=<n>`。**行頭 `fail ` は不変**（`scripts/drive` の fail 行頭スキャン・非0 exit 運用は無改修で維持）。netsync の REJECT reason・capabilities JSON は本拡張の対象外。
+    - **非解釈の不変条件**: code/suggestion の語彙は app 側が返す。framework は透過（desc と同様に framing 保護だけ）。MCP ブリッジ（TASK-88）はこの wire をそのまま tool エラーとして読む前提。
+    - **pixie 実例**: `open` の読込失敗（`ReadFailed`/`FileNotFound`）→ `code=file_not_found` / `next=check path or use save first`。`select_layer` の `OutOfRange` → `code=index_out_of_range` / `next=use add_layer or 0..N-1`。
   - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（32件。TASK-62.5.3 で 16→32）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
   - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（`#` 有無どちらも許容） / `set_tool <pen|eraser|brush|bezier|select|fill>` / `stroke <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗） / `save <path>` / `open <path>`。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
 
@@ -627,6 +633,10 @@ action 固有のコードを一切足さない**（中身非パースの不変�
 - **失敗の扱い**: 未知 action・名前欠落・`run()` のエラーは `expect`/`assert`（TASK-78）と同じ
   `expect_failures` カウンタに記帳される（記帳して続行。即時 abort 変種は無い）。詳細な wire format は
   上記コマンド言語節の「action（probe 対称の高レベル操作 / TASK-62.1）」を参照。
+- **structured error（TASK-62.5.9・opt-in）**: エラー return の直前に
+  `platform.setActionErrorDetail(code, suggested_next_action)` を呼ぶと、失敗行末尾に
+  ` code=<c> next=<n>` が追記される（未呼び出し時は従来と bit 一致）。語彙は app 所有・framework 非解釈。
+  詳細は上記 action 節の structured error 項。
 - 組み込み action は今回作らない。app 側の action 登録は各採用タスク（pixie/synth/modular 等）で行う。
 - **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は probe と同じ規則でサニタイズされる**: `"` / `\` / ASCII 制御文字を含む、または 200 bytes 超は warn + 空文字化（登録自体は成功）。
 
