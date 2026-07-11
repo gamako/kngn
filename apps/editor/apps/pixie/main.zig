@@ -891,13 +891,23 @@ const App = struct {
     /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        self.userUndo();
+        if (platform.netsyncActive()) {
+            var buf: [128]u8 = undefined;
+            _ = try platform.routeAction("undo", "", &buf);
+        } else {
+            self.userUndo();
+        }
         self.clampTimelineTarget();
     }
 
     fn doRedo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        self.userRedo();
+        if (platform.netsyncActive()) {
+            var buf: [128]u8 = undefined;
+            _ = try platform.routeAction("redo", "", &buf);
+        } else {
+            self.userRedo();
+        }
         self.clampTimelineTarget();
     }
 
@@ -2037,8 +2047,8 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
 /// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo }); // 制御コマンド（§4b。executor 非経由）
-    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo });
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own }); // 制御コマンド（§4b。executor 非経由）
+    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own });
     platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record) });
     platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record) });
     platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record) });

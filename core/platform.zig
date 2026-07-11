@@ -311,6 +311,12 @@ pub const StateSync = netsync.StateSync;
 /// netsync join 時の document/patch 同期アダプタ登録（無効時も保存のみ・常に呼んでよい）。
 pub const registerStateSync = netsync.registerStateSync;
 
+/// netsync session が有効か（host/client 接続中）。キーボード undo/redo の経路切替用（TASK-62.3.5）。
+pub const netsyncActive = netsync.isEnabled;
+
+/// action を netsync router 経由で実行（router 未設定時は dispatch 等価）。
+pub const routeAction = harness.action_registry.routeLocalAction;
+
 // ============================================================================
 // command model（TASK-62.5.1/62.5.3）
 //

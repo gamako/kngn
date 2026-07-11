@@ -687,7 +687,7 @@ action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry�
 | `.relay` | ローカル適用 → COMMIT fan-out | PROPOSE のみ（応答 `"proposed <id>"`。適用は後続 COMMIT） |
 | `.local_only` | ローカルのみ（broadcast なし） | ローカルのみ（PROPOSE なし） |
 | `.reject_when_synced` | 即 `RejectedWhileSynced` | 同左 |
-| `.undo_own` / `.redo_own` | 62.3.2 時点は reject（62.3.5 で解禁） | 同左 |
+| `.undo_own` / `.redo_own` | 自分の最新 undoable を revert / 直近 revert を再 commit（62.3.5） | PROPOSE_REVERT / 原コマンド PROPOSE |
 
 既定は `.reject_when_synced`。pixie MVP: `stroke`/`set_color`/`set_tool`=`.relay`、`save`=`.local_only`。
 
@@ -698,7 +698,7 @@ action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry�
 3. client が COMMIT を受けて適用（自分起源も含む。router 非経由）
 4. REJECT は warn + `last_rejected_proposal`/`last_reject_reason` に保存（62.3.4 probe のデータ源）
 
-**remote 適用の暫定例外（62.3.2）**: CommandRecord を作らず共有 executor の `record_policy=.no_record` で実行する（wire seq と local_only の seq 衝突回避。62.3.5 で本則へ）。
+**remote 適用（62.3.5）**: 全 wire commit を `source=.remote_commit{seq}` で CommandLog に記録。session 中の local 記録は `wire_session` で抑止（62.3.2 の no_record 暫定例外は解消済み）。
 
 ### MVP 2 プロセス手順（probe ベースの決定的待ち）
 
@@ -728,18 +728,27 @@ scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
 
 | 項目 | 内容 |
 |---|---|
-| digest | 1 行 k=v（live 応答は `netsync ` 接頭）: `role=<host\|client> peers=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none>` |
-| snapshot | 同内容の JSON 1 オブジェクト（`ext=json`）。command log 要約は 62.3.5 まで未提供 |
+| digest | 1 行 k=v（live 応答は `netsync ` 接頭）: `role=<host\|client> peers=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none> [log=<seq:origin:name,...>]` |
+| snapshot | 同内容の JSON 1 オブジェクト + `log` 全件配列（`ext=json`） |
 | last_seq | host = wire commit カウンタ / client = 最後に適用した COMMIT の seq |
 | reject_reason | ASCII whitespace・制御文字を `_` 置換、64B 切り詰め |
+| log 要約 | 末尾数件。revert は `seq:origin:revert->target` |
+
+### session 中の undo/redo（TASK-62.3.5）
+
+- 自分の wire commit のみ undo 可（`.undo_own`）。host 検証: unknown / not yours / not undoable / already reverted / transaction unsupported / too old / before peer join
+- undo は revert 前進適用（`PROPOSE_REVERT` / `COMMIT_REVERT`）。重なり領域の pixel 巻き添えは MVP 割り切り
+- redo は原コマンドの通常 PROPOSE/COMMIT（wire に redo_of 非搭載。発行者ローカルの pending meta で epoch を守る）
+- transaction undo は session 中非対応
+- キーボード Cmd+Z は `netsyncActive()` 中 `routeAction("undo"/"redo")` 経由
 
 決定的待ちは `drive 'digest netsync'` を until で再照合する（固定 sleep リトライは使わない。プロセス起動の port file 待ちだけ sleep 可）。
 
 ### セッション中の制約・retry
 
-- undo/redo・レイヤー操作・PNG open は session 中不可（既定 reject）
-- save のみローカル可
-- **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` を一度受けたら再送しない（二重適用回避）。以後は `digest netsync` の決定的待ち
+- レイヤー操作・PNG open は session 中不可（既定 reject）
+- save のみローカル可（session 中は CommandLog に記録しない = wire seq 非消費）
+- **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` / `"revert proposed"` を一度受けたら再送しない。以後は `digest netsync` の決定的待ち
 - 接続確立前の action は失敗しうる → join 完了（`awaiting_sync=0`）後に再試行（上記 retry 条件）
 
 ## 性能規約（メモリI/O・キャッシュ最適化）

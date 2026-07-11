@@ -226,6 +226,38 @@ pub fn parseRejectPayload(payload: []const u8) ProtocolError!struct { proposal_i
     };
 }
 
+/// PROPOSE_REVERT: u32 proposal_id ++ u64 target_seq
+pub fn formatProposeRevertPayload(buf: []u8, proposal_id: u32, target_seq: u64) ![]const u8 {
+    if (buf.len < 12) return error.PayloadTooLarge;
+    std.mem.writeInt(u32, buf[0..4], proposal_id, .little);
+    std.mem.writeInt(u64, buf[4..12], target_seq, .little);
+    return buf[0..12];
+}
+
+pub fn parseProposeRevertPayload(payload: []const u8) ProtocolError!struct { proposal_id: u32, target_seq: u64 } {
+    if (payload.len < 12) return error.ProtocolError;
+    return .{
+        .proposal_id = std.mem.readInt(u32, payload[0..4], .little),
+        .target_seq = std.mem.readInt(u64, payload[4..12], .little),
+    };
+}
+
+/// COMMIT_REVERT: u64 seq ++ u64 target_seq
+pub fn formatCommitRevertPayload(buf: []u8, seq: u64, target_seq: u64) ![]const u8 {
+    if (buf.len < 16) return error.PayloadTooLarge;
+    std.mem.writeInt(u64, buf[0..8], seq, .little);
+    std.mem.writeInt(u64, buf[8..16], target_seq, .little);
+    return buf[0..16];
+}
+
+pub fn parseCommitRevertPayload(payload: []const u8) ProtocolError!struct { seq: u64, target_seq: u64 } {
+    if (payload.len < 16) return error.ProtocolError;
+    return .{
+        .seq = std.mem.readInt(u64, payload[0..8], .little),
+        .target_seq = std.mem.readInt(u64, payload[8..16], .little),
+    };
+}
+
 // ============================================================================
 // Queues
 // ============================================================================
@@ -498,6 +530,70 @@ var awaiting_sync: bool = false;
 /// client reader が積む SYNC payload（seq+state）。peers_mutex 下で置換・解放。
 var pending_sync: ?[]u8 = null;
 
+/// client のローカル PROPOSE/PROPOSE_REVERT 待ち行列（TASK-62.3.5）。main thread 専有。
+pub const PENDING_CAP: usize = 64;
+const PendingKind = enum { normal, revert };
+const PendingEntry = struct {
+    proposal_id: u32 = 0,
+    kind: PendingKind = .normal,
+    redo_of: ?u64 = null,
+    target_seq: u64 = 0,
+};
+var pending_q: [PENDING_CAP]PendingEntry = undefined;
+var pending_head: usize = 0;
+var pending_tail: usize = 0;
+var pending_count: usize = 0;
+
+fn pendingClear() void {
+    pending_head = 0;
+    pending_tail = 0;
+    pending_count = 0;
+}
+
+fn pendingEnqueue(e: PendingEntry) bool {
+    if (pending_count >= PENDING_CAP) return false;
+    pending_q[pending_tail] = e;
+    pending_tail = (pending_tail + 1) % PENDING_CAP;
+    pending_count += 1;
+    return true;
+}
+
+fn pendingPeek() ?PendingEntry {
+    if (pending_count == 0) return null;
+    return pending_q[pending_head];
+}
+
+fn pendingPopHead() void {
+    if (pending_count == 0) return;
+    pending_head = (pending_head + 1) % PENDING_CAP;
+    pending_count -= 1;
+}
+
+fn pendingRemoveProposal(proposal_id: u32) void {
+    if (pending_count == 0) return;
+    if (pending_q[pending_head].proposal_id == proposal_id) {
+        pendingPopHead();
+        return;
+    }
+    var i: usize = 0;
+    while (i < pending_count) : (i += 1) {
+        const idx = (pending_head + i) % PENDING_CAP;
+        if (pending_q[idx].proposal_id == proposal_id) {
+            std.debug.print("[netsync] pending REJECT が head 以外 — scan 除去 proposal={d}\n", .{proposal_id});
+            var j = i;
+            while (j + 1 < pending_count) : (j += 1) {
+                const a = (pending_head + j) % PENDING_CAP;
+                const b = (pending_head + j + 1) % PENDING_CAP;
+                pending_q[a] = pending_q[b];
+            }
+            pending_count -= 1;
+            pending_tail = (pending_head + pending_count) % PENDING_CAP;
+            return;
+        }
+    }
+    std.debug.print("[netsync] pending REJECT 不一致 proposal={d}\n", .{proposal_id});
+}
+
 /// 観測用スナップショット（TASK-62.3.4）。
 /// `gatherStats` / probe digest・snapshot は harness 設計上 **main thread（pollGate 内）でのみ**呼ぶ。
 pub const NetsyncStats = struct {
@@ -577,7 +673,8 @@ pub fn formatDigest(buf: []u8) []const u8 {
     else
         (std.fmt.bufPrint(&reject_id_buf, "{d}", .{st.last_reject}) catch "?");
 
-    return std.fmt.bufPrint(buf, "role={s} peers={d} peer_id={d} last_seq={d} pending={d} awaiting_sync={d} last_reject={s} reject_reason={s}", .{
+    var base: [384]u8 = undefined;
+    const head = std.fmt.bufPrint(&base, "role={s} peers={d} peer_id={d} last_seq={d} pending={d} awaiting_sync={d} last_reject={s} reject_reason={s}", .{
         roleDigestName(st.role),
         st.peers,
         st.peer_id,
@@ -586,41 +683,132 @@ pub fn formatDigest(buf: []u8) []const u8 {
         @as(u8, if (st.awaiting_sync) 1 else 0),
         reject_tok,
         reason_tok,
-    }) catch buf[0..0];
+    }) catch return buf[0..0];
+
+    var log_part: [512]u8 = undefined;
+    const log_s = formatLogDigestTail(&log_part);
+    if (log_s.len == 0) {
+        return std.fmt.bufPrint(buf, "{s}", .{head}) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, "{s} log={s}", .{ head, log_s }) catch head;
 }
 
-/// snapshot JSON 1 オブジェクト。command log 要約は 62.3.5 まで未提供（no_record 暫定例外のため）。
+const log_digest_tail = 8;
+
+fn actorOriginToken(actor: command.ActorId, out: []u8) []const u8 {
+    return switch (actor) {
+        .local_user => std.fmt.bufPrint(out, "local", .{}) catch "?",
+        .local_agent => std.fmt.bufPrint(out, "agent", .{}) catch "?",
+        .peer => |id| std.fmt.bufPrint(out, "{d}", .{id}) catch "?",
+        .system => std.fmt.bufPrint(out, "sys", .{}) catch "?",
+    };
+}
+
+/// 末尾数件 `seq:origin:name`（revert は `seq:origin:revert->target`）。executor 不在時は空。
+fn formatLogDigestTail(buf: []u8) []const u8 {
+    const exec = shared_executor orelse return "";
+    const log = exec.log orelse return "";
+    if (log.filled == 0) return "";
+
+    var pos: usize = 0;
+    const start: u32 = if (log.filled > log_digest_tail) log.filled - log_digest_tail else 0;
+    var i: u32 = start;
+    var first = true;
+    while (i < log.filled) : (i += 1) {
+        const rec = log.recordAt(i);
+        var obuf: [16]u8 = undefined;
+        const origin = actorOriginToken(rec.actor, &obuf);
+        var piece: [128]u8 = undefined;
+        const one = if (rec.kind == .revert)
+            (std.fmt.bufPrint(&piece, "{s}{d}:{s}:revert->{d}", .{
+                if (first) "" else ",",
+                rec.seq,
+                origin,
+                rec.target_seq orelse 0,
+            }) catch break)
+        else blk: {
+            var nbuf: [command.MAX_CMD_NAME]u8 = undefined;
+            const n = @min(rec.name().len, nbuf.len);
+            for (rec.name()[0..n], 0..) |c, j| {
+                nbuf[j] = if (c <= 0x20 or c == 0x7f) '_' else c;
+            }
+            break :blk (std.fmt.bufPrint(&piece, "{s}{d}:{s}:{s}", .{
+                if (first) "" else ",",
+                rec.seq,
+                origin,
+                nbuf[0..n],
+            }) catch break);
+        };
+        if (pos + one.len > buf.len) break;
+        @memcpy(buf[pos..][0..one.len], one);
+        pos += one.len;
+        first = false;
+    }
+    return buf[0..pos];
+}
+
+/// snapshot JSON 1 オブジェクト + 全 command log 配列（executor 不在時は log=[]）。
 /// **main thread 専用**。
 pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     const st = gatherStats();
     var reason_buf: [reject_reason_token_max]u8 = undefined;
-    if (st.last_reject == 0) {
-        return std.fmt.allocPrint(allocator, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":null,\"reject_reason\":null}}", .{
-            roleDigestName(st.role),
-            st.peers,
-            st.peer_id,
-            st.last_seq,
-            st.pending,
-            if (st.awaiting_sync) "true" else "false",
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    const role_s = roleDigestName(st.role);
+    const await_s: []const u8 = if (st.awaiting_sync) "true" else "false";
+    var head_buf: [512]u8 = undefined;
+    const head = if (st.last_reject == 0)
+        try std.fmt.bufPrint(&head_buf, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":null,\"reject_reason\":null,\"log\":[", .{
+            role_s, st.peers, st.peer_id, st.last_seq, st.pending, await_s,
+        })
+    else blk: {
+        const reason_tok = sanitizeRejectReasonToken(&reason_buf, lastRejectReason());
+        var json_reason: [reject_reason_token_max]u8 = undefined;
+        const rn = @min(reason_tok.len, json_reason.len);
+        for (reason_tok[0..rn], 0..) |c, i| {
+            json_reason[i] = if (c == '"' or c == '\\') '_' else c;
+        }
+        break :blk try std.fmt.bufPrint(&head_buf, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":{d},\"reject_reason\":\"{s}\",\"log\":[", .{
+            role_s, st.peers, st.peer_id, st.last_seq, st.pending, await_s, st.last_reject, json_reason[0..rn],
         });
+    };
+    try list.appendSlice(allocator, head);
+
+    if (shared_executor) |exec| {
+        if (exec.log) |log| {
+            var i: u32 = 0;
+            while (i < log.filled) : (i += 1) {
+                if (i > 0) try list.append(allocator, ',');
+                const rec = log.recordAt(i);
+                var obuf: [16]u8 = undefined;
+                const origin = actorOriginToken(rec.actor, &obuf);
+                var entry_buf: [256]u8 = undefined;
+                const entry = if (rec.kind == .revert)
+                    try std.fmt.bufPrint(&entry_buf, "{{\"seq\":{d},\"origin\":\"{s}\",\"kind\":\"revert\",\"target_seq\":{d}}}", .{
+                        rec.seq, origin, rec.target_seq orelse 0,
+                    })
+                else blk: {
+                    var nbuf: [command.MAX_CMD_NAME]u8 = undefined;
+                    const n = @min(rec.name().len, nbuf.len);
+                    for (rec.name()[0..n], 0..) |c, j| {
+                        nbuf[j] = if (c == '"' or c == '\\' or c <= 0x20) '_' else c;
+                    }
+                    break :blk try std.fmt.bufPrint(&entry_buf, "{{\"seq\":{d},\"origin\":\"{s}\",\"kind\":\"normal\",\"name\":\"{s}\",\"undoable\":{s},\"reverted\":{s}}}", .{
+                        rec.seq,
+                        origin,
+                        nbuf[0..n],
+                        if (rec.undoable) "true" else "false",
+                        if (rec.reverted) "true" else "false",
+                    });
+                };
+                try list.appendSlice(allocator, entry);
+            }
+        }
     }
-    const reason_tok = sanitizeRejectReasonToken(&reason_buf, lastRejectReason());
-    // JSON 文字列用に " \ を除外（sanitize 後も残りうる）
-    var json_reason: [reject_reason_token_max]u8 = undefined;
-    const rn = @min(reason_tok.len, json_reason.len);
-    for (reason_tok[0..rn], 0..) |c, i| {
-        json_reason[i] = if (c == '"' or c == '\\') '_' else c;
-    }
-    return std.fmt.allocPrint(allocator, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":{d},\"reject_reason\":\"{s}\"}}", .{
-        roleDigestName(st.role),
-        st.peers,
-        st.peer_id,
-        st.last_seq,
-        st.pending,
-        if (st.awaiting_sync) "true" else "false",
-        st.last_reject,
-        json_reason[0..rn],
-    });
+    try list.appendSlice(allocator, "]}");
+    return try list.toOwnedSlice(allocator);
 }
 
 /// harness custom probe 用 digest（ctx 未使用）。
@@ -689,7 +877,11 @@ pub fn isClient() bool {
 
 /// platform.setCommandExecutor から転送。remote COMMIT / host PROPOSE 適用に使う（main thread）。
 pub fn setSharedExecutor(exec: ?*command.Executor) void {
+    if (shared_executor) |old| old.setWireSession(false);
     shared_executor = exec;
+    if (exec) |e| {
+        if (isEnabled()) e.setWireSession(true);
+    }
 }
 
 pub fn lastRejectedProposal() u32 {
@@ -704,13 +896,19 @@ pub fn wireSeq() u64 {
     return wire_seq;
 }
 
+fn setWireSessionFlag(on: bool) void {
+    if (shared_executor) |e| e.setWireSession(on);
+}
+
 fn enableRouter() void {
     action_registry.setRouter(netsyncRouter);
     action_registry.setEnabled(true);
+    setWireSessionFlag(true);
 }
 
 fn clearRouterMain() void {
     action_registry.setRouter(null);
+    setWireSessionFlag(false);
     if (io_inited) {
         peers_mutex.lockUncancelable(io_val);
         router_clear_pending = false;
@@ -995,13 +1193,14 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
 pub fn pump() void {
     if (!io_inited) return;
 
-    // fail-soft 後の router 解除（main thread のみ setRouter）。
+    // fail-soft 後の router / wire_session 解除（main thread。shutdown の clearRouterMain と対称）。
     peers_mutex.lockUncancelable(io_val);
     const clear = router_clear_pending;
     if (clear) router_clear_pending = false;
     peers_mutex.unlock(io_val);
     if (clear) {
         action_registry.setRouter(null);
+        setWireSessionFlag(false);
     }
 
     if (!isEnabled()) return;
@@ -1017,7 +1216,8 @@ pub fn pump() void {
     var kind: u8 = 0;
     var peer: u32 = 0;
     var buf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
-    while (inbound.dequeue(io_val, &kind, &peer, &buf)) |n| {
+    while (isEnabled()) {
+        const n = inbound.dequeue(io_val, &kind, &peer, &buf) orelse break;
         const payload = buf[0..n];
         if (kind == INTERNAL_CLIENT_JOINED) {
             handleClientJoined(payload);
@@ -1042,10 +1242,11 @@ fn handleInboundFrame(kind: u8, from_peer: u32, payload: []const u8) void {
     const k: FrameKind = @enumFromInt(kind);
     switch (k) {
         .propose => handlePropose(from_peer, payload),
+        .propose_revert => handleProposeRevert(from_peer, payload),
         .commit => handleCommit(payload),
+        .commit_revert => handleCommitRevert(payload),
         .reject => handleReject(payload),
         .sync => {
-            // host が SYNC を受けるのは仕様外（reader 側でも切断するが防御）。
             std.debug.print("[netsync] unexpected SYNC on host path — ignore\n", .{});
         },
         else => {},
@@ -1186,16 +1387,29 @@ fn tryApplyPendingSync() void {
     peers_mutex.unlock(io_val);
 }
 
-fn applyRemoteNoRecord(name: []const u8, args: []const u8, origin_peer: u32, buf: []u8) anyerror![]const u8 {
+fn applyWireCommit(name: []const u8, args: []const u8, origin_peer: u32, seq: u64, pending_meta: ?command.PendingMeta, buf: []u8) anyerror![]const u8 {
     if (shared_executor) |exec| {
         const res = try exec.executeAction(name, args, .{
             .actor = .{ .peer = origin_peer },
-            .source = .local,
-            .record_policy = .no_record,
+            .source = .{ .remote_commit = .{ .seq = seq, .pending_local_meta = pending_meta } },
+            .record_policy = .record,
         }, buf);
         return res.output;
     }
+    // executor 未設定: 62.3.2 fallback（記録なし）
     return action_registry.dispatch(name, args, buf);
+}
+
+fn allocateCommitSeq() u64 {
+    if (shared_executor) |exec| {
+        if (exec.log) |log| return log.next_seq;
+    }
+    wire_seq += 1;
+    return wire_seq;
+}
+
+fn noteWireSeq(seq: u64) void {
+    if (seq > wire_seq) wire_seq = seq;
 }
 
 fn enqueueToPeer(peer_id: u32, kind: u8, payload: []const u8) bool {
@@ -1209,11 +1423,6 @@ fn enqueueToPeer(peer_id: u32, kind: u8, payload: []const u8) bool {
     return false;
 }
 
-fn nextWireSeq() u64 {
-    wire_seq += 1;
-    return wire_seq;
-}
-
 fn broadcastCommit(seq: u64, origin_peer: u32, name: []const u8, args: []const u8) void {
     var cbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     const payload = formatCommitPayload(&cbuf, seq, origin_peer, name, args) catch {
@@ -1223,28 +1432,53 @@ fn broadcastCommit(seq: u64, origin_peer: u32, name: []const u8, args: []const u
     broadcast(@intFromEnum(FrameKind.commit), payload);
 }
 
+fn broadcastCommitRevert(seq: u64, target_seq: u64) void {
+    var cbuf: [32]u8 = undefined;
+    const payload = formatCommitRevertPayload(&cbuf, seq, target_seq) catch return;
+    broadcast(@intFromEnum(FrameKind.commit_revert), payload);
+}
+
 fn sendReject(peer_id: u32, proposal_id: u32, reason: []const u8) void {
     var rbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     const payload = formatRejectPayload(&rbuf, proposal_id, reason) catch return;
     _ = enqueueToPeer(peer_id, @intFromEnum(FrameKind.reject), payload);
 }
 
-/// host ローカル .relay: dispatch → 成功時 wire seq 採番 → 全 client へ COMMIT(origin=0)。
+fn maxJoinSnapshotSeq() u64 {
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    var m: u64 = 0;
+    for (&slots) |*s| {
+        if (s.state == .active and s.join_snapshot_seq > m) m = s.join_snapshot_seq;
+    }
+    return m;
+}
+
+/// host ローカル .relay: executor 直（actor=.peer(0), remote_commit）→ COMMIT broadcast。
 pub fn commitAndBroadcast(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
-    const out = try action_registry.dispatch(name, args, buf);
-    const seq = nextWireSeq();
+    const seq = allocateCommitSeq();
+    const out = try applyWireCommit(name, args, 0, seq, null, buf);
+    noteWireSeq(seq);
     broadcastCommit(seq, 0, name, args);
     return out;
 }
 
 /// client ローカル .relay: proposal_id 採番 + PROPOSE 送信。ローカル適用なし。
 pub fn proposeToHost(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    return proposeToHostWithMeta(name, args, null, buf);
+}
+
+fn proposeToHostWithMeta(name: []const u8, args: []const u8, redo_of: ?u64, buf: []u8) anyerror![]const u8 {
+    if (pending_count >= PENDING_CAP) return error.PendingQueueFull;
     next_proposal_id += 1;
     const id = next_proposal_id;
     var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     const payload = formatProposePayload(&pbuf, id, name, args) catch return error.PayloadTooLarge;
     if (!clientSend(@intFromEnum(FrameKind.propose), payload)) {
         return error.ProposeSendFailed;
+    }
+    if (!pendingEnqueue(.{ .proposal_id = id, .kind = .normal, .redo_of = redo_of, .target_seq = 0 })) {
+        return error.PendingQueueFull;
     }
     return std.fmt.bufPrint(buf, "proposed {d}", .{id});
 }
@@ -1260,15 +1494,79 @@ fn handlePropose(from_peer: u32, payload: []const u8) void {
         sendReject(from_peer, parsed.proposal_id, "not relayable");
         return;
     }
+    const seq = allocateCommitSeq();
     var abuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
-    _ = applyRemoteNoRecord(parsed.name, parsed.args, from_peer, &abuf) catch |err| {
+    _ = applyWireCommit(parsed.name, parsed.args, from_peer, seq, null, &abuf) catch |err| {
         var reason_buf: [64]u8 = undefined;
         const reason = std.fmt.bufPrint(&reason_buf, "{s}", .{@errorName(err)}) catch "apply failed";
         sendReject(from_peer, parsed.proposal_id, reason);
         return;
     };
-    const seq = nextWireSeq();
+    noteWireSeq(seq);
     broadcastCommit(seq, from_peer, parsed.name, parsed.args);
+}
+
+fn validateRevertTarget(target_seq: u64, proposer: u32) ?[]const u8 {
+    const exec = shared_executor orelse return "no executor";
+    const log = exec.log orelse return "no log";
+    const adapter = exec.adapter orelse return "no adapter";
+    const rec = log.findBySeq(target_seq) orelse return "unknown seq";
+    if (!rec.actor.eql(.{ .peer = proposer })) return "not yours";
+    if (!rec.undoable) return "not undoable";
+    if (rec.reverted) return "already reverted";
+    if (rec.transaction_id != null) return "transaction undo unsupported";
+    if (!adapter.canUndo(adapter.ctx, rec)) return "too old";
+    if (target_seq <= maxJoinSnapshotSeq()) return "before peer join";
+    return null;
+}
+
+fn writeNothing(buf: []u8, msg: []const u8) []const u8 {
+    const n = @min(buf.len, msg.len);
+    @memcpy(buf[0..n], msg[0..n]);
+    return buf[0..n];
+}
+
+fn proposeRevertOwn(buf: []u8) anyerror![]const u8 {
+    const exec = shared_executor orelse return error.NoExecutor;
+    const me = localPeerId();
+    const target = exec.findUndoCandidate(.{ .peer = me }) orelse {
+        return writeNothing(buf, "nothing to undo");
+    };
+    if (pending_count >= PENDING_CAP) return error.PendingQueueFull;
+    next_proposal_id += 1;
+    const id = next_proposal_id;
+    var pbuf: [16]u8 = undefined;
+    const payload = formatProposeRevertPayload(&pbuf, id, target) catch return error.PayloadTooLarge;
+    if (!clientSend(@intFromEnum(FrameKind.propose_revert), payload)) {
+        return error.ProposeSendFailed;
+    }
+    if (!pendingEnqueue(.{ .proposal_id = id, .kind = .revert, .redo_of = null, .target_seq = target })) {
+        return error.PendingQueueFull;
+    }
+    return std.fmt.bufPrint(buf, "revert proposed {d}", .{id});
+}
+
+fn handleProposeRevert(from_peer: u32, payload: []const u8) void {
+    if (!isHost()) return;
+    const parsed = parseProposeRevertPayload(payload) catch {
+        sendReject(from_peer, 0, "bad propose_revert");
+        return;
+    };
+    if (validateRevertTarget(parsed.target_seq, from_peer)) |reason| {
+        sendReject(from_peer, parsed.proposal_id, reason);
+        return;
+    }
+    const exec = shared_executor orelse {
+        sendReject(from_peer, parsed.proposal_id, "no executor");
+        return;
+    };
+    const new_seq = allocateCommitSeq();
+    exec.applyWireRevert(parsed.target_seq, new_seq) catch |err| {
+        sendReject(from_peer, parsed.proposal_id, @errorName(err));
+        return;
+    };
+    noteWireSeq(new_seq);
+    broadcastCommitRevert(new_seq, parsed.target_seq);
 }
 
 fn handleCommit(payload: []const u8) void {
@@ -1277,13 +1575,52 @@ fn handleCommit(payload: []const u8) void {
         std.debug.print("[netsync] COMMIT parse 失敗\n", .{});
         return;
     };
-    // wire seq は記録しない（暫定例外）。単調性の観測用にだけ進める。
-    if (parsed.seq > wire_seq) wire_seq = parsed.seq;
+    // peek のみ。pop は適用成功後（失敗時に pending を失わない）。
+    var pending_meta: ?command.PendingMeta = null;
+    var pop_pending = false;
+    if (parsed.origin_peer == localPeerId()) {
+        if (pendingPeek()) |head| {
+            if (head.kind == .normal and head.proposal_id != 0) {
+                pending_meta = if (head.redo_of) |r| .{ .redo_of = r } else null;
+                pop_pending = true;
+            }
+        }
+    }
     var abuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
-    _ = applyRemoteNoRecord(parsed.name, parsed.args, parsed.origin_peer, &abuf) catch |err| {
-        std.debug.print("[netsync] COMMIT 適用失敗: {s}\n", .{@errorName(err)});
+    _ = applyWireCommit(parsed.name, parsed.args, parsed.origin_peer, parsed.seq, pending_meta, &abuf) catch |err| {
+        std.debug.print("[netsync] COMMIT 適用失敗: {s} — fail-soft\n", .{@errorName(err)});
+        failSoftDisableClient();
         return;
     };
+    if (pop_pending) pendingPopHead();
+    noteWireSeq(parsed.seq);
+    last_applied_seq = parsed.seq;
+}
+
+fn handleCommitRevert(payload: []const u8) void {
+    if (!isClient()) return;
+    const parsed = parseCommitRevertPayload(payload) catch {
+        std.debug.print("[netsync] COMMIT_REVERT parse 失敗\n", .{});
+        return;
+    };
+    var pop_pending = false;
+    if (pendingPeek()) |head| {
+        if (head.kind == .revert and head.target_seq == parsed.target_seq) {
+            pop_pending = true;
+        }
+    }
+    const exec = shared_executor orelse {
+        std.debug.print("[netsync] COMMIT_REVERT: executor 未設定 — fail-soft\n", .{});
+        failSoftDisableClient();
+        return;
+    };
+    exec.applyWireRevert(parsed.target_seq, parsed.seq) catch |err| {
+        std.debug.print("[netsync] COMMIT_REVERT 適用失敗: {s} — fail-soft\n", .{@errorName(err)});
+        failSoftDisableClient();
+        return;
+    };
+    if (pop_pending) pendingPopHead();
+    noteWireSeq(parsed.seq);
     last_applied_seq = parsed.seq;
 }
 
@@ -1293,11 +1630,46 @@ fn handleReject(payload: []const u8) void {
         std.debug.print("[netsync] REJECT parse 失敗\n", .{});
         return;
     };
+    pendingRemoveProposal(parsed.proposal_id);
     last_rejected_proposal = parsed.proposal_id;
     const n = @min(parsed.reason.len, last_reject_reason_buf.len);
     if (n > 0) @memcpy(last_reject_reason_buf[0..n], parsed.reason[0..n]);
     last_reject_reason_len = n;
     std.debug.print("[netsync] REJECT proposal={d} reason={s}\n", .{ parsed.proposal_id, lastRejectReason() });
+}
+
+fn commitRedoOwn(actor_peer: u32, buf: []u8) anyerror![]const u8 {
+    const exec = shared_executor orelse return error.NoExecutor;
+    const cand = exec.findRedoCandidate(.{ .peer = actor_peer }) orelse {
+        return writeNothing(buf, "nothing to redo");
+    };
+    // name/args をコピー（execute が log を mutate する）
+    var name_buf: [command.MAX_CMD_NAME]u8 = undefined;
+    var args_buf: [command.MAX_CMD_ARGS]u8 = undefined;
+    const nlen = @min(cand.name.len, name_buf.len);
+    const alen = @min(cand.args.len, args_buf.len);
+    @memcpy(name_buf[0..nlen], cand.name[0..nlen]);
+    @memcpy(args_buf[0..alen], cand.args[0..alen]);
+    const seq = allocateCommitSeq();
+    const out = try applyWireCommit(name_buf[0..nlen], args_buf[0..alen], actor_peer, seq, .{ .redo_of = cand.target_seq }, buf);
+    noteWireSeq(seq);
+    broadcastCommit(seq, actor_peer, name_buf[0..nlen], args_buf[0..alen]);
+    return out;
+}
+
+fn proposeRedoOwn(buf: []u8) anyerror![]const u8 {
+    const exec = shared_executor orelse return error.NoExecutor;
+    const me = localPeerId();
+    const cand = exec.findRedoCandidate(.{ .peer = me }) orelse {
+        return writeNothing(buf, "nothing to redo");
+    };
+    var name_buf: [command.MAX_CMD_NAME]u8 = undefined;
+    var args_buf: [command.MAX_CMD_ARGS]u8 = undefined;
+    const nlen = @min(cand.name.len, name_buf.len);
+    const alen = @min(cand.args.len, args_buf.len);
+    @memcpy(name_buf[0..nlen], cand.name[0..nlen]);
+    @memcpy(args_buf[0..alen], cand.args[0..alen]);
+    return proposeToHostWithMeta(name_buf[0..nlen], args_buf[0..alen], cand.target_seq, buf);
 }
 
 /// host/client 対称の NetworkPolicy 分岐（親 plan §1.3）。
@@ -1317,15 +1689,27 @@ fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const
             .relay => commitAndBroadcast(name, args, buf),
             .local_only => action_registry.dispatch(name, args, buf),
             .reject_when_synced => error.RejectedWhileSynced,
-            // TODO(62.3.5): commitRevertOwnLatest / commitReapplyOwnReverted に差し替え
-            .undo_own, .redo_own => error.RejectedWhileSynced,
+            .undo_own => blk: {
+                const exec = shared_executor orelse break :blk error.NoExecutor;
+                const target = exec.findUndoCandidate(.{ .peer = 0 }) orelse break :blk writeNothing(buf, "nothing to undo");
+                if (validateRevertTarget(target, 0)) |reason| {
+                    std.debug.print("[netsync] host undo reject: {s}\n", .{reason});
+                    break :blk error.RevertRejected;
+                }
+                const new_seq = allocateCommitSeq();
+                try exec.applyWireRevert(target, new_seq);
+                noteWireSeq(new_seq);
+                broadcastCommitRevert(new_seq, target);
+                break :blk (std.fmt.bufPrint(buf, "reverted {d}", .{target}) catch "reverted");
+            },
+            .redo_own => commitRedoOwn(0, buf),
         },
         .client => switch (act.network_policy) {
             .relay => proposeToHost(name, args, buf),
             .local_only => action_registry.dispatch(name, args, buf),
             .reject_when_synced => error.RejectedWhileSynced,
-            // TODO(62.3.5): proposeRevertOwnLatest / reproposeOwnReverted に差し替え
-            .undo_own, .redo_own => error.RejectedWhileSynced,
+            .undo_own => proposeRevertOwn(buf),
+            .redo_own => proposeRedoOwn(buf),
         },
         .disabled => action_registry.dispatch(name, args, buf),
     };
@@ -1413,11 +1797,13 @@ pub fn shutdown() void {
     peers_mutex.unlock(io_val);
     // main thread のみ setRouter(null)
     action_registry.setRouter(null);
+    setWireSessionFlag(false);
     wire_seq = 0;
     last_applied_seq = 0;
     next_proposal_id = 0;
     last_rejected_proposal = 0;
     last_reject_reason_len = 0;
+    pendingClear();
 }
 
 fn requestCloseSlot(s: *ConnSlot) void {
@@ -1804,6 +2190,7 @@ pub fn resetForTest() void {
     last_reject_reason_len = 0;
     awaiting_sync = false;
     freePendingSyncLocked();
+    pendingClear();
 }
 
 /// テスト用: slot の synced / snapshot_valid / join_snapshot_seq。
@@ -1829,6 +2216,25 @@ pub fn testAwaitingSync() bool {
     peers_mutex.lockUncancelable(io_val);
     defer peers_mutex.unlock(io_val);
     return awaiting_sync;
+}
+
+/// テスト用: client pending queue 件数（PROPOSE/PROPOSE_REVERT 待ち）。
+pub fn testPendingCount() usize {
+    return pending_count;
+}
+
+/// テスト用: active slot の join_snapshot_seq を上書き（before peer join 検証用）。
+pub fn testSetJoinSnapshotSeq(peer_id: u32, seq: u64) bool {
+    if (!io_inited) return false;
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    for (&slots) |*s| {
+        if (s.state == .active and s.peer_id == peer_id) {
+            s.join_snapshot_seq = seq;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -2521,8 +2927,8 @@ test "netsync: router host 5 policy 分岐" {
     try testing.expectEqual(@as(u64, 1), wireSeq()); // local_only は seq 消費しない
 
     try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_reject", "", &buf));
-    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_undo", "", &buf));
-    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_redo", "", &buf));
+    try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("h_undo", "", &buf));
+    try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("h_redo", "", &buf));
 }
 
 test "netsync: router client 5 policy 分岐" {
@@ -2578,8 +2984,8 @@ test "netsync: router client 5 policy 分岐" {
     try testing.expectEqual(@as(u32, 1), ctx.calls);
 
     try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("c_reject", "", &buf));
-    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("c_undo", "", &buf));
-    try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("c_redo", "", &buf));
+    try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("c_undo", "", &buf));
+    try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("c_redo", "", &buf));
 }
 
 test "netsync: commitAndBroadcast seq 単調増加と COMMIT origin_peer=0" {
@@ -2665,7 +3071,7 @@ test "netsync: host PROPOSE 再検証 REJECT（non-relay・未知）" {
     try testing.expectEqualStrings("not relayable", p2.reason);
 }
 
-test "netsync: PROPOSE→COMMIT round-trip（no_record で CommandRecord 増えない）" {
+test "netsync: PROPOSE→COMMIT round-trip（remote_commit で CommandRecord が増える）" {
     resetForTest();
     defer resetForTest();
 
@@ -2683,10 +3089,7 @@ test "netsync: PROPOSE→COMMIT round-trip（no_record で CommandRecord 増え�
     setSharedExecutor(&exec);
 
     var ctx: SemCtx = .{};
-    // dispatch fallback 経路も動くよう register（executor が優先）
     registerSem("stroke", &ctx, .relay);
-    // executor 経由にするため dispatcher を action 名で呼ぶ — applyRemoteNoRecord は executor を使う
-    // register の run は host ローカル commitAndBroadcast 用。PROPOSE 適用は executor。
 
     initHost(0);
     const port = listeningPort().?;
@@ -2708,8 +3111,9 @@ test "netsync: PROPOSE→COMMIT round-trip（no_record で CommandRecord 増え�
     var waited: u64 = 0;
     while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
     pump();
-    try testing.expectEqual(before, log.filled); // no_record
+    try testing.expectEqual(before + 1, log.filled); // remote_commit 記録
     try testing.expectEqual(@as(u64, 1), wireSeq());
+    try testing.expect(log.findBySeq(1).?.actor.eql(.{ .peer = 1 }));
 
     var rbuf: [256]u8 = undefined;
     var reader = stream.reader(io_val, &rbuf);
@@ -2818,7 +3222,7 @@ test "netsync: proposal_id 単調増加" {
     try testing.expectEqualStrings("proposed 2", try proposeToHost("stroke", "b", &buf));
 }
 
-test "netsync: local_only seq 消費後も remote no_record 適用成功" {
+test "netsync: wire_session 中 local save は seq 非消費→COMMIT が Stale にならない" {
     resetForTest();
     defer resetForTest();
 
@@ -2863,9 +3267,8 @@ test "netsync: local_only seq 消費後も remote no_record 適用成功" {
             std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
             writer.interface.flush() catch return;
-            // local_only が終わるのを待ってから COMMIT を送る
             sleepMs(50);
-            const commit = formatCommitPayload(&pbuf, 99, 0, "stroke", "remote") catch return;
+            const commit = formatCommitPayload(&pbuf, 1, 0, "stroke", "remote") catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.commit), commit) catch return;
             writer.interface.flush() catch return;
             sleepMs(100);
@@ -2881,7 +3284,6 @@ test "netsync: local_only seq 消費後も remote no_record 適用成功" {
     initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "lo");
     try waitClientActive(2000);
 
-    // 空 SYNC でゲート解除
     var waited_sync: u64 = 0;
     while (testAwaitingSync() and waited_sync < 2000) : (waited_sync += 5) {
         pump();
@@ -2889,19 +3291,18 @@ test "netsync: local_only seq 消費後も remote no_record 適用成功" {
     }
     try testing.expect(!testAwaitingSync());
 
-    // local_only を executor 経由で記録（seq 消費）
+    // wire_session 中の local 記録は抑止
     var buf: [128]u8 = undefined;
     _ = try exec.executeAction("save", "/tmp/x", .{ .actor = .local_user, .record_policy = .record }, &buf);
-    try testing.expectEqual(@as(u32, 1), log.filled);
-    const next_after_local = log.next_seq;
+    try testing.expectEqual(@as(u32, 0), log.filled);
+    try testing.expectEqual(@as(u64, 1), log.next_seq);
 
     var waited: u64 = 0;
     while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
     pump();
-    // no_record なので filled は増えず、Stale にもならない
     try testing.expectEqual(@as(u32, 1), log.filled);
-    try testing.expectEqual(next_after_local, log.next_seq);
-    try testing.expect(exec_ctx.calls >= 2); // save + remote stroke
+    try testing.expectEqual(@as(u64, 2), log.next_seq);
+    try testing.expect(exec_ctx.calls >= 2); // save dispatch + remote stroke
 }
 
 test "netsync: fail-soft 後 pump で router 解除され通常ローカル動作" {
@@ -3606,4 +4007,655 @@ test "netsync: digest 整形・reject_reason 正規化と切り詰め" {
     defer testing.allocator.free(snap);
     try testing.expect(std.mem.indexOf(u8, snap, "\"last_reject\":42") != null);
     try testing.expect(std.mem.indexOf(u8, snap, "\"reject_reason\":\"bad_reason_\"") != null);
+}
+
+// ============================================================================
+// TASK-62.3.5 undo/redo / pending / REJECT
+// ============================================================================
+
+/// noteUndo 付き executor 用モック（netsync wire undo テスト）。
+const WireUndo = struct {
+    exec: *command.Executor = undefined,
+    next_ref: u64 = 1,
+    valid: [128]bool = [_]bool{false} ** 128,
+
+    fn run(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+        const self: *WireUndo = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, name, "set_tool") and !std.mem.eql(u8, name, "save")) {
+            const ref = self.next_ref;
+            self.next_ref += 1;
+            if (ref < self.valid.len) self.valid[ref] = true;
+            self.exec.noteUndo(ref);
+        }
+        return std.fmt.bufPrint(buf, "ok:{s}", .{args}) catch "ok";
+    }
+
+    fn canUndo(ctx: *anyopaque, rec: *const command.CommandRecord) bool {
+        const self: *WireUndo = @ptrCast(@alignCast(ctx));
+        const ref = rec.undo_ref orelse return false;
+        return ref < self.valid.len and self.valid[ref];
+    }
+
+    fn applyUndo(ctx: *anyopaque, rec: *const command.CommandRecord) void {
+        const self: *WireUndo = @ptrCast(@alignCast(ctx));
+        if (rec.undo_ref) |ref| {
+            if (ref < self.valid.len) self.valid[ref] = false;
+        }
+    }
+
+    fn summarize(ctx: *anyopaque, rec: *const command.CommandRecord, buf: []u8) []const u8 {
+        _ = ctx;
+        const n = @min(rec.name().len, buf.len);
+        @memcpy(buf[0..n], rec.name()[0..n]);
+        return buf[0..n];
+    }
+};
+
+fn setupWireUndo(wu: *WireUndo, log: *command.CommandLog, exec: *command.Executor) void {
+    log.* = .{};
+    exec.* = command.Executor.init(.{ .ctx = wu, .run = WireUndo.run });
+    exec.log = log;
+    exec.adapter = .{
+        .ctx = wu,
+        .canUndo = WireUndo.canUndo,
+        .applyUndo = WireUndo.applyUndo,
+        .summarize = WireUndo.summarize,
+    };
+    wu.* = .{ .exec = exec };
+    setSharedExecutor(exec);
+}
+
+fn readRejectFrom(stream: net.Stream, reason_buf: []u8) !struct { proposal_id: u32, reason: []const u8 } {
+    var rbuf: [256]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [128]u8 = undefined;
+    const f = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.reject), f.kind);
+    const parsed = try parseRejectPayload(f.payload);
+    const n = @min(parsed.reason.len, reason_buf.len);
+    if (n > 0) @memcpy(reason_buf[0..n], parsed.reason[0..n]);
+    return .{ .proposal_id = parsed.proposal_id, .reason = reason_buf[0..n] };
+}
+
+test "netsync: undo 候補なしは no-op（PROPOSE_REVERT 非送信）" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
+            // 接続維持（blocking read しない。shutdown で切断）
+            sleepMs(300);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("undo", &ctx, .undo_own);
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "u0");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (testAwaitingSync() and waited < 2000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+
+    var buf: [64]u8 = undefined;
+    const out = try action_registry.routeLocalAction("undo", "", &buf);
+    try testing.expectEqualStrings("nothing to undo", out);
+    try testing.expectEqual(@as(usize, 0), testPendingCount());
+}
+
+test "netsync: PROPOSE_REVERT→COMMIT_REVERT round-trip" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    registerSem("undo", &ctx, .undo_own);
+
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "rev");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+
+    // peer1 stroke
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [128]u8 = undefined;
+    const prop = try formatProposePayload(&pbuf, 1, "stroke", "1 1");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), prop);
+    try writer.interface.flush();
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    try testing.expect(log.findBySeq(1).?.undoable);
+    try testing.expect(!log.findBySeq(1).?.reverted);
+
+    // PROPOSE_REVERT
+    const prev = try formatProposeRevertPayload(&pbuf, 2, 1);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), prev);
+    try writer.interface.flush();
+    waited = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+
+    try testing.expect(log.findBySeq(1).?.reverted);
+    const rev = log.findBySeq(2).?;
+    try testing.expectEqual(command.CommandKind.revert, rev.kind);
+    try testing.expectEqual(@as(u64, 1), rev.target_seq.?);
+    try testing.expect(rev.actor.eql(.{ .peer = 1 }));
+
+    var rbuf: [256]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [128]u8 = undefined;
+    // COMMIT for stroke
+    const f1 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit), f1.kind);
+    const f2 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit_revert), f2.kind);
+    const cr = try parseCommitRevertPayload(f2.payload);
+    try testing.expectEqual(@as(u64, 2), cr.seq);
+    try testing.expectEqual(@as(u64, 1), cr.target_seq);
+}
+
+test "netsync: PROPOSE_REVERT REJECT 全 reason" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "rej");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+
+    var abuf: [128]u8 = undefined;
+    // seq1: peer1 undoable
+    _ = try exec.executeAction("stroke", "a", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 1 } } }, &abuf);
+    noteWireSeq(1);
+    // seq2: peer1 not undoable
+    _ = try exec.executeAction("set_tool", "pen", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 2 } } }, &abuf);
+    noteWireSeq(2);
+    // seq3: peer2（not yours for peer1）
+    _ = try exec.executeAction("stroke", "b", .{ .actor = .{ .peer = 2 }, .source = .{ .remote_commit = .{ .seq = 3 } } }, &abuf);
+    noteWireSeq(3);
+    // seq4: peer1 already reverted
+    _ = try exec.executeAction("stroke", "c", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 4 } } }, &abuf);
+    noteWireSeq(4);
+    log.findBySeq(4).?.reverted = true;
+    // seq5: peer1 in open transaction
+    const tx = try exec.beginTransaction(.{ .peer = 1 }, "t");
+    _ = try exec.executeAction("stroke", "d", .{
+        .actor = .{ .peer = 1 },
+        .transaction = tx,
+        .source = .{ .remote_commit = .{ .seq = 5 } },
+    }, &abuf);
+    noteWireSeq(5);
+    try exec.endTransaction(tx, .{ .peer = 1 });
+    // seq6: peer1 too old（undo_ref 無効化）
+    _ = try exec.executeAction("stroke", "e", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 6 } } }, &abuf);
+    noteWireSeq(6);
+    wu.valid[log.findBySeq(6).?.undo_ref.?] = false;
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [32]u8 = undefined;
+
+    const cases = [_]struct { id: u32, target: u64, reason: []const u8 }{
+        .{ .id = 10, .target = 99, .reason = "unknown seq" },
+        .{ .id = 11, .target = 3, .reason = "not yours" },
+        .{ .id = 12, .target = 2, .reason = "not undoable" },
+        .{ .id = 13, .target = 4, .reason = "already reverted" },
+        .{ .id = 14, .target = 5, .reason = "transaction undo unsupported" },
+        .{ .id = 15, .target = 6, .reason = "too old" },
+    };
+    for (cases) |c| {
+        const pl = try formatProposeRevertPayload(&pbuf, c.id, c.target);
+        try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), pl);
+        try writer.interface.flush();
+        var waited_case: u64 = 0;
+        while (inboundLen() < 1 and waited_case < 2000) : (waited_case += 5) sleepMs(5);
+        pump();
+        var reason_storage: [64]u8 = undefined;
+        const rej = try readRejectFrom(stream, &reason_storage);
+        try testing.expectEqual(c.id, rej.proposal_id);
+        try testing.expectEqualStrings(c.reason, rej.reason);
+    }
+
+    // before peer join: join_snapshot_seq を seq1 以上に
+    try testing.expect(testSetJoinSnapshotSeq(1, 1));
+    const pl = try formatProposeRevertPayload(&pbuf, 16, 1);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), pl);
+    try writer.interface.flush();
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    var reason_storage: [64]u8 = undefined;
+    const rej = try readRejectFrom(stream, &reason_storage);
+    try testing.expectEqual(@as(u32, 16), rej.proposal_id);
+    try testing.expectEqualStrings("before peer join", rej.reason);
+}
+
+test "netsync: host 多段 undo→redo 連鎖（epoch 自壊しない）" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    registerSem("undo", &ctx, .undo_own);
+    registerSem("redo", &ctx, .redo_own);
+
+    initHost(0);
+    // peer 無しでも host ローカル undo/redo は動く
+    var buf: [128]u8 = undefined;
+    _ = try action_registry.routeLocalAction("stroke", "a", &buf); // seq1
+    _ = try action_registry.routeLocalAction("stroke", "b", &buf); // seq2
+    try testing.expectEqual(@as(u32, 2), log.filled);
+
+    const undo1 = try action_registry.routeLocalAction("undo", "", &buf);
+    try testing.expect(std.mem.indexOf(u8, undo1, "reverted") != null);
+    try testing.expect(log.findBySeq(2).?.reverted);
+    _ = try action_registry.routeLocalAction("undo", "", &buf);
+    try testing.expect(log.findBySeq(1).?.reverted);
+
+    const redo1 = try action_registry.routeLocalAction("redo", "", &buf);
+    try testing.expect(std.mem.indexOf(u8, redo1, "ok:") != null);
+    // redo 由来は epoch を進めない → 2 段目 redo も候補あり
+    const redo2 = try action_registry.routeLocalAction("redo", "", &buf);
+    try testing.expect(std.mem.indexOf(u8, redo2, "ok:") != null);
+
+    // 再 undo 可能（自壊していない）
+    _ = try action_registry.routeLocalAction("undo", "", &buf);
+    try testing.expect(exec.findUndoCandidate(.{ .peer = 0 }) != null or exec.findRedoCandidate(.{ .peer = 0 }) != null);
+}
+
+test "netsync: pending REJECT 除去" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [512]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [256]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [256]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
+
+            const f = decodeFrame(&reader.interface, &pbuf) catch return;
+            if (f.kind == @intFromEnum(FrameKind.propose)) {
+                const pp = parseProposePayload(f.payload) catch return;
+                const rej = formatRejectPayload(&pbuf, pp.proposal_id, "nope") catch return;
+                encodeFrame(&writer.interface, @intFromEnum(FrameKind.reject), rej) catch return;
+                writer.interface.flush() catch return;
+            }
+            sleepMs(200);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "pq");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (testAwaitingSync() and waited < 2000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+
+    var buf: [64]u8 = undefined;
+    _ = try action_registry.routeLocalAction("stroke", "1", &buf);
+    try testing.expectEqual(@as(usize, 1), testPendingCount());
+    waited = 0;
+    while (testPendingCount() > 0 and waited < 2000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expectEqual(@as(usize, 0), testPendingCount());
+    try testing.expect(lastRejectedProposal() != 0);
+}
+
+test "netsync: pending 満杯 backpressure" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(400);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "full");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (testAwaitingSync() and waited < 2000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+
+    // outbound を詰まらせずに pending を満杯にする（直接 enqueue）
+    var i: u32 = 0;
+    while (i < PENDING_CAP) : (i += 1) {
+        try testing.expect(pendingEnqueue(.{ .proposal_id = i + 1, .kind = .normal, .redo_of = null, .target_seq = 0 }));
+    }
+    try testing.expectEqual(PENDING_CAP, testPendingCount());
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.PendingQueueFull, action_registry.routeLocalAction("stroke", "y", &buf));
+}
+
+test "netsync: 同一 target 並行 revert の後着 REJECT" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "par");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+
+    var abuf: [64]u8 = undefined;
+    _ = try exec.executeAction("stroke", "z", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 1 } } }, &abuf);
+    noteWireSeq(1);
+
+    var wbuf: [128]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [32]u8 = undefined;
+    const p1 = try formatProposeRevertPayload(&pbuf, 1, 1);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), p1);
+    const p2 = try formatProposeRevertPayload(&pbuf, 2, 1);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), p2);
+    try writer.interface.flush();
+
+    var waited: u64 = 0;
+    while (inboundLen() < 2 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+    pump();
+
+    try testing.expect(log.findBySeq(1).?.reverted);
+    try testing.expectEqual(command.CommandKind.revert, log.findBySeq(2).?.kind);
+
+    // COMMIT_REVERT の後に REJECT
+    var rbuf: [256]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [128]u8 = undefined;
+    const f1 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit_revert), f1.kind);
+    const f2 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.reject), f2.kind);
+    const rej = try parseRejectPayload(f2.payload);
+    try testing.expectEqual(@as(u32, 2), rej.proposal_id);
+    try testing.expectEqualStrings("already reverted", rej.reason);
+}
+
+test "netsync: fail-soft 後 wire_session 解除で local が record される" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    const port = srv.socket.address.getPort();
+
+    var close_gate: std.atomic.Value(bool) = .init(false);
+    const Host = struct {
+        fn run(listen_srv: *net.Server, gate: *std.atomic.Value(bool)) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
+            var waited: u64 = 0;
+            while (!gate.load(.seq_cst) and waited < 5000) : (waited += 10) sleepMs(10);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{ &srv, &close_gate });
+    defer {
+        close_gate.store(true, .seq_cst);
+        ht.join();
+        srv.deinit(io_val);
+    }
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "ws");
+    try waitClientActive(2000);
+    var waited_sync: u64 = 0;
+    while (testAwaitingSync() and waited_sync < 2000) : (waited_sync += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expect(exec.wire_session);
+
+    close_gate.store(true, .seq_cst);
+    var waited: u64 = 0;
+    while (isEnabled() and waited < 3000) : (waited += 10) sleepMs(10);
+    try testing.expect(!isEnabled());
+
+    pump(); // router_clear → wire_session=false
+    try testing.expect(!exec.wire_session);
+
+    var buf: [128]u8 = undefined;
+    const res = try exec.executeAction("stroke", "solo", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    try testing.expect(res.seq != null);
+    try testing.expectEqual(@as(u32, 1), log.filled);
+}
+
+test "netsync: COMMIT 適用失敗で pending 保持 + fail-soft" {
+    resetForTest();
+    defer resetForTest();
+
+    var fail_ctx: SemCtx = .{ .fail = true };
+    var log: command.CommandLog = .{};
+    var exec = command.Executor.init(.{
+        .ctx = &fail_ctx,
+        .run = struct {
+            fn d(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+                _ = name;
+                return semRun(ctx, args, buf);
+            }
+        }.d,
+    });
+    exec.log = &log;
+    setSharedExecutor(&exec);
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [256]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [256]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 7) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(40);
+            // origin=自 peer(7) の COMMIT → pending head と対応
+            const commit = formatCommitPayload(&pbuf, 1, 7, "stroke", "boom") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.commit), commit) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(200);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var actx: SemCtx = .{};
+    registerSem("stroke", &actx, .relay);
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "af");
+    try waitClientActive(2000);
+    var waited_sync: u64 = 0;
+    while (testAwaitingSync() and waited_sync < 2000) : (waited_sync += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expectEqual(@as(u32, 7), localPeerId());
+
+    try testing.expect(pendingEnqueue(.{ .proposal_id = 1, .kind = .normal, .redo_of = null, .target_seq = 0 }));
+    try testing.expectEqual(@as(usize, 1), testPendingCount());
+
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump(); // COMMIT 適用失敗 → fail-soft（pending は残る）
+    try testing.expect(!isEnabled());
+    try testing.expectEqual(@as(usize, 1), testPendingCount());
+    try testing.expectEqual(@as(u32, 0), log.filled);
+
+    pump(); // wire_session 解除
+    try testing.expect(!exec.wire_session);
+
+    // 以後ローカル記録に戻る（fail を外す）
+    fail_ctx.fail = false;
+    var buf: [128]u8 = undefined;
+    const res = try exec.executeAction("stroke", "local", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    try testing.expect(res.seq != null);
+    try testing.expectEqual(@as(u32, 1), log.filled);
 }

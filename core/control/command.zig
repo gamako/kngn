@@ -282,10 +282,18 @@ pub const Executor = struct {
     pending_undo_ref: ?UndoRef = null,
     pending_set: bool = false,
 
+    /// netsync session 中は true。source=.local の record を no_record に落とす（wire seq 衝突防止。TASK-62.3.5）。
+    /// **main thread のみ**設定（netsync gate open / shutdown / fail-soft）。
+    wire_session: bool = false,
+
     pub fn init(dispatcher: Dispatcher) Executor {
         var self: Executor = .{ .dispatcher = dispatcher };
         for (&self.tx_table) |*slot| slot.* = .{};
         return self;
+    }
+
+    pub fn setWireSession(self: *Executor, on: bool) void {
+        self.wire_session = on;
     }
 
     /// dispatch callback 実行中に app が呼ぶ。**dispatch 開始時に pending を clear、正常復帰時のみ
@@ -511,7 +519,14 @@ pub const Executor = struct {
 
         const dr = try self.runDispatchCapturingUndo(name, args, buf);
 
-        if (opts.record_policy == .no_record or self.log == null) {
+        // netsync session 中の local 記録は抑止（wire seq と衝突させない。TASK-62.3.5 A-2）。
+        const effective_policy: RecordPolicy = blk: {
+            if (opts.record_policy == .no_record) break :blk .no_record;
+            if (self.wire_session and opts.source == .local) break :blk .no_record;
+            break :blk opts.record_policy;
+        };
+
+        if (effective_policy == .no_record or self.log == null) {
             return .{ .seq = null, .output = dr.output };
         }
 
@@ -569,6 +584,8 @@ pub const Executor = struct {
         if (opts.record_policy != .record) return error.InvalidRecordPolicy;
         try self.preflight(name, args, opts);
         if (self.log == null) return null;
+        // netsync session 中の local 記録は抑止（UI stroke 等。TASK-62.3.5 A-2）。
+        if (self.wire_session and opts.source == .local) return null;
 
         var transaction_id: ?u64 = null;
         var tx_member_index: u16 = 0;
@@ -655,6 +672,61 @@ pub const Executor = struct {
         return .{ .happened = true, .message = writeMsg(buf, "undo ok") };
     }
 
+    /// 後方走査で単発 undo 候補 seq を返す（tx member 除外。netsync `.undo_own` 用。TASK-62.3.5）。
+    /// 条件: actor 一致・kind=normal・undoable・!reverted・transaction_id==null・canUndo。
+    pub fn findUndoCandidate(self: *Executor, actor: ActorId) ?u64 {
+        if (actor.eql(.system)) return null;
+        const log = self.log orelse return null;
+        const adapter = self.adapter orelse return null;
+
+        var i: u32 = log.filled;
+        while (i > 0) {
+            i -= 1;
+            const rec = log.recordAt(i);
+            if (!rec.actor.eql(actor)) continue;
+            if (rec.kind != .normal) continue;
+            if (!rec.undoable) continue;
+            if (rec.reverted) continue;
+            if (rec.transaction_id != null) continue; // wire/netsync は単発のみ
+            if (!adapter.canUndo(adapter.ctx, rec)) continue;
+            return rec.seq;
+        }
+        return null;
+    }
+
+    /// wire COMMIT_REVERT 適用（TASK-62.3.5）。target を逆適用し reverted 固定 + revert record を
+    /// `source=.remote_commit{seq=new_seq}` で append。actor は target の actor を継承。
+    /// revert record は solo undoOne と同様に transaction_id 付き 1-member bundle（redoOne 探索互換）。
+    pub fn applyWireRevert(self: *Executor, target_seq: u64, new_seq: u64) !void {
+        const log = self.log orelse return error.NoLog;
+        const adapter = self.adapter orelse return error.NoAdapter;
+        const rec = log.findBySeq(target_seq) orelse return error.UnknownSeq;
+        if (rec.kind != .normal) return error.NotUndoable;
+        if (!rec.undoable) return error.NotUndoable;
+        if (rec.reverted) return error.AlreadyReverted;
+        if (rec.transaction_id != null) return error.TransactionUndoUnsupported;
+        if (!adapter.canUndo(adapter.ctx, rec)) return error.TooOld;
+
+        const actor = rec.actor;
+        adapter.applyUndo(adapter.ctx, rec);
+        if (log.findBySeq(target_seq)) |live| live.reverted = true;
+
+        const revert_tx_id = self.allocTransactionId() orelse return error.TransactionIdExhausted;
+        _ = try self.appendRecord(.{
+            .actor = actor,
+            .kind = .revert,
+            .name = "revert",
+            .args = "",
+            .transaction_id = revert_tx_id,
+            .undoable = false,
+            .undo_ref = null,
+            .target_seq = target_seq,
+            .redo_of = null,
+            .tx_member_index = 1,
+            .source = .{ .remote_commit = .{ .seq = new_seq } },
+        });
+    }
+
     /// 後方走査で「actor 一致・kind=normal・undoable・!reverted・canUndo=true」の最新候補を探し、
     /// 逆適用 + revert record 群を append する。`.system` actor は常に候補なし。
     pub fn undoOne(self: *Executor, actor: ActorId, buf: []u8) anyerror!UndoOutcome {
@@ -686,6 +758,7 @@ pub const Executor = struct {
 
                 return try self.performUndoBundle(log, adapter, actor, snap.items[0..snap.count], buf);
             } else {
+                // 単発: findUndoCandidate と同じ述語（canUndo）。挙動不変のためここでも直接判定。
                 if (!adapter.canUndo(adapter.ctx, rec)) continue;
                 const single = [1]CommandRecord{rec.*};
                 return try self.performUndoBundle(log, adapter, actor, single[0..1], buf);
@@ -757,6 +830,46 @@ pub const Executor = struct {
 
         if (dispatch_err) |e| return e;
         return .{ .happened = true, .message = writeMsg(buf, "redo ok") };
+    }
+
+    /// redo 候補（target の name/args）。slice は CommandLog 内を指すため、呼び出し側は
+    /// mutate 前にコピーすること。netsync `.redo_own` 用（TASK-62.3.5）。
+    ///
+    /// **既知の許容（peer 間 epoch 発散）**: redo_of は wire 非搭載のため、他 peer では redo 由来
+    /// commit が normal に見え epoch が進む。actor ごとの epoch 値は peer 間で発散しうるが、
+    /// redo 探索は発行者ローカルでしか使わないため無害（§1.5.1 v6）。
+    pub const RedoCandidate = struct {
+        target_seq: u64,
+        name: []const u8,
+        args: []const u8,
+    };
+
+    pub fn findRedoCandidate(self: *Executor, actor: ActorId) ?RedoCandidate {
+        if (actor.eql(.system)) return null;
+        const log = self.log orelse return null;
+        const current_epoch = self.currentEpoch(actor);
+
+        var i: u32 = log.filled;
+        while (i > 0) {
+            i -= 1;
+            const rec = log.recordAt(i);
+            if (!rec.actor.eql(actor)) continue;
+            if (rec.kind != .revert) continue;
+            if (rec.redo_consumed) continue;
+            if (rec.epoch != current_epoch) continue;
+            const tx_id = rec.transaction_id orelse continue;
+
+            const snap = collectMembers(log, tx_id, .revert) orelse continue;
+            // netsync は単発のみ（bundle は session 中非対応）
+            if (snap.count != 1) continue;
+
+            const m = snap.items[0];
+            const t_seq = m.target_seq orelse continue;
+            const t = log.findBySeq(t_seq) orelse continue;
+            if (!t.reverted) continue;
+            return .{ .target_seq = t_seq, .name = t.name(), .args = t.args() };
+        }
+        return null;
     }
 
     /// 後方走査で「actor 一致・kind=revert・!redo_consumed・epoch==現在値・target が現存し reverted の
@@ -1568,4 +1681,59 @@ test "20: bumpEpoch(記録なしで redo 候補を失効させる。未記録 UI
     // 未登録 actor への bump は登録して epoch を進める（後の記録と整合）
     exec.bumpEpoch(.{ .peer = 9 });
     try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.{ .peer = 9 }));
+}
+
+test "21: applyWireRevert（reverted 固定・revert record・epoch 焼き込み）" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec.executeAction("paint", "x", .{ .actor = .{ .peer = 0 }, .source = .{ .remote_commit = .{ .seq = 1 } } }, &buf);
+    try testing.expectEqual(@as(u64, 2), log.next_seq);
+    const epoch_before = exec.currentEpoch(.{ .peer = 0 });
+
+    try exec.applyWireRevert(1, 2);
+    try testing.expect(log.findBySeq(1).?.reverted);
+    const rev = log.findBySeq(2).?;
+    try testing.expectEqual(CommandKind.revert, rev.kind);
+    try testing.expectEqualStrings("revert", rev.name());
+    try testing.expectEqual(@as(u64, 1), rev.target_seq.?);
+    try testing.expect(rev.actor.eql(.{ .peer = 0 }));
+    try testing.expectEqual(epoch_before, rev.epoch); // 焼き込み（normal undoable ではないので epoch 不変）
+    try testing.expectEqual(@as(u64, 3), log.next_seq);
+
+    // findUndoCandidate / findRedoCandidate
+    try testing.expect(exec.findUndoCandidate(.{ .peer = 0 }) == null);
+    const rc = exec.findRedoCandidate(.{ .peer = 0 }).?;
+    try testing.expectEqual(@as(u64, 1), rc.target_seq);
+    try testing.expectEqualStrings("paint", rc.name);
+}
+
+test "22: wire_session は local 記録を抑止し remote_commit は記録する" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    exec.setWireSession(true);
+    const local = try exec.executeAction("save", "/tmp/x", .{ .actor = .local_user }, &buf);
+    try testing.expect(local.seq == null);
+    try testing.expectEqual(@as(u64, 1), log.next_seq); // 消費しない
+
+    const remote = try exec.executeAction("stroke", "1 2", .{
+        .actor = .{ .peer = 0 },
+        .source = .{ .remote_commit = .{ .seq = 1 } },
+    }, &buf);
+    try testing.expectEqual(@as(u64, 1), remote.seq.?);
+    try testing.expectEqual(@as(u64, 2), log.next_seq);
+
+    _ = try exec.recordExecuted("ui", "", .{ .actor = .local_user }, 1, &buf);
+    try testing.expectEqual(@as(u32, 1), log.filled); // UI record も抑止
+
+    exec.setWireSession(false);
+    const after = try exec.executeAction("local2", "", .{ .actor = .local_user }, &buf);
+    try testing.expectEqual(@as(u64, 2), after.seq.?);
 }
