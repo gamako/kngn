@@ -1,18 +1,19 @@
 # 可変フォント（OpenType Font Variations）API
 
-`libs/font` の TrueType（glyf）可変フォント対応の使い方。軸 API は `OutlineFont` インスタンス局所で、
-描画キャッシュと advance キャッシュは軸変更時に無効化・再構築される。
+`libs/font` の OpenType 可変フォント対応の使い方（TrueType glyf + CFF2）。軸 API は `OutlineFont`
+インスタンス局所で、描画キャッシュと advance キャッシュは軸変更時に無効化・再構築される。
 
 ## 概要
 
 | テーブル | 役割 |
 |----------|------|
-| `fvar` | 軸定義・named instance（必須で可変とみなす） |
+| `fvar` | 軸定義・named instance（あれば可変 API 有効） |
 | `avar` | 正規化座標の非線形マップ（任意） |
 | `gvar` | glyf 点列 / composite offset の tuple 変分 |
 | `HVAR` | advance 変分（優先。無ければ gvar phantom） |
+| `CFF2` | CFF2 アウトライン + VariationStore + charstring `blend`/`vsindex` |
 
-- **CFF2 可変**は未対応（`FontFace.init` → `error.Unsupported`）。
+- **CFF1 静的**は従来どおり。**CFF と CFF2 の同居・glyf と CFF/CFF2 の同居は `InvalidFont`**。
 - **pixelMetrics**（ascender 等）は MVAR 非対応のため **軸非依存の近似**（default インスタンス由来）。
 
 ## 基本的な使い方
@@ -61,6 +62,24 @@ of.normalizedAxes(&norm); // avar 後の正規化座標
 - **advance 優先順位**:
   1. composite で `USE_MY_METRICS` が在る → **最後**に現れた component の advance（再帰で HVAR > phantom > hmtx）
   2. それ以外 → 当該 gid の HVAR > gvar phantom > hmtx
+
+## CFF2 可変
+
+- `FontFace.init` が `CFF2` テーブルを受理する（`OutlineSource.cff2`）。
+- 外形変分は charstring の **`blend` / `vsindex`** と TopDICT の **VariationStore**（ItemVariationStore。HVAR と共有基盤）。
+- **Private DICT の初期 `vsindex`** を尊重。CharString 内 `vsindex` で上書き可。
+- **advance は CFF2 内に無い** → `hmtx` / `HVAR`（metrics cache 経由）を使用。width operand は読まない。
+- 軸座標は glyf VF と同じ `setAxis` / `axis_norm` latch を `Cff2Font.outline(..., norm)` に渡す。
+- `gvar` / IUP は CFF2 では使わない。
+
+```zig
+// CFF2 VF も同じ軸 API
+const face = try font.FontFace.init(otf_cff2_bytes);
+var of = font.OutlineFont.init(allocator, &face, 48);
+defer of.deinit();
+try of.setAxis(&wght, 700);
+of.drawTo(target, pos, "あ", col, clip); // 外形が軸に応じて変化
+```
 
 ## composite と gvar
 

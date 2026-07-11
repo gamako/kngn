@@ -20,6 +20,7 @@ pub const avar = @import("avar.zig");
 pub const gvar = @import("gvar.zig");
 pub const hvar = @import("hvar.zig");
 pub const var_common = @import("var_common.zig");
+pub const ivs = @import("ivs.zig");
 pub const text_layer = @import("text_layer.zig");
 
 // pixel/geom プリミティブ（gui が再エクスポートする正準定義）
@@ -78,5 +79,6 @@ test {
     _ = gvar;
     _ = hvar;
     _ = var_common;
+    _ = ivs;
     _ = text_layer;
 }

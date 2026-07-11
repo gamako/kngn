@@ -41,7 +41,11 @@ pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 const max_glyph_dim: f32 = 4096;
 
 /// アウトライン供給源（TrueType glyf か OpenType CFF か）。table 実体で選択する。
-pub const OutlineSource = union(enum) { glyf: glyf_mod.Glyf, cff: cff_mod.CffFont };
+pub const OutlineSource = union(enum) {
+    glyf: glyf_mod.Glyf,
+    cff: cff_mod.CffFont,
+    cff2: cff_mod.Cff2Font,
+};
 
 pub const FontFace = struct {
     sfnt: sfnt.SfntFile,
@@ -69,12 +73,16 @@ pub const FontFace = struct {
             error.UnsupportedFormat => return error.Unsupported,
             error.InvalidFont => return error.InvalidFont,
         };
-        // CFF2 可変は glyf フェーズ未対応（TASK-25.15.4 で実装予定）。
-        if ((sf.tableSlice("CFF2") catch return error.InvalidFont) != null) return error.Unsupported;
-        // ソース選択（table 優先・version は問わない）: glyf と CFF 同居は不正。
+        // ソース選択: glyf / CFF / CFF2。同居は不正。
         const has_glyf = (sf.tableSlice("glyf") catch null) != null;
         const cff_tbl = sf.tableSlice("CFF ") catch null;
-        if (has_glyf and cff_tbl != null) return error.InvalidFont;
+        const cff2_tbl = sf.tableSlice("CFF2") catch null;
+        const n_outline_src: u2 =
+            @as(u2, @intFromBool(has_glyf)) +
+            @as(u2, @intFromBool(cff_tbl != null)) +
+            @as(u2, @intFromBool(cff2_tbl != null));
+        if (n_outline_src > 1) return error.InvalidFont;
+        if (n_outline_src == 0) return error.InvalidFont;
 
         var source: OutlineSource = undefined;
         if (has_glyf) {
@@ -84,9 +92,24 @@ pub const FontFace = struct {
                 error.Unsupported => return error.Unsupported,
                 else => return error.InvalidFont,
             };
-            // gidOf/advanceWidth は sfnt.num_glyphs 基準。CFF の CharStrings count と一致必須。
             if (cf.numGlyphs() != sf.num_glyphs) return error.InvalidFont;
             source = .{ .cff = cf };
+        } else if (cff2_tbl) |c2| {
+            // fvar は後で読むが、CFF2 parse に axis を渡すため先に fvar を peek
+            var peek_axes: u16 = 0;
+            if (sf.tableSlice("fvar") catch null) |ft| {
+                const fv = fvar_mod.Fvar.parse(ft) catch |e| switch (e) {
+                    error.Unsupported => return error.Unsupported,
+                    else => return error.InvalidFont,
+                };
+                peek_axes = fv.axis_count;
+            }
+            const cf2 = cff_mod.Cff2Font.parse(c2, peek_axes) catch |e| switch (e) {
+                error.Unsupported => return error.Unsupported,
+                else => return error.InvalidFont,
+            };
+            if (cf2.numGlyphs() != sf.num_glyphs) return error.InvalidFont;
+            source = .{ .cff2 = cf2 };
         } else return error.InvalidFont;
 
         const cmap_tbl = (sf.tableSlice("cmap") catch return error.InvalidFont) orelse return error.InvalidFont;
@@ -347,7 +370,7 @@ pub const OutlineFont = struct {
                     }
                 }
             },
-            .cff => {},
+            .cff, .cff2 => {},
         }
 
         const base_fu: f32 = @floatFromInt(self.face.sfnt.advanceWidth(gid) catch 0);
@@ -369,7 +392,7 @@ pub const OutlineFont = struct {
     fn phantomAdvanceDelta(self: *const OutlineFont, gv: *const gvar_mod.Gvar, gid: u16) Error!f32 {
         const g = switch (self.face.source) {
             .glyf => |*gl| gl,
-            .cff => return 0,
+            .cff, .cff2 => return 0,
         };
         // simple
         if (try g.parseSimpleGeometry(self.alloc, gid)) |geom| {
@@ -629,6 +652,7 @@ pub const OutlineFont = struct {
                 self.axis_norm[0..self.axis_count],
             ),
             .cff => |*c| c.outline(self.alloc, gid),
+            .cff2 => |*c| c.outline(self.alloc, gid, self.axis_norm[0..self.axis_count]),
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidFont,
@@ -2461,11 +2485,109 @@ test "TASK-25.15.1: FontFace 経由 avar 配線（setAxis → axis_norm が区�
     try testing.expectApproxEqAbs(@as(f32, 0.45), of.axis_norm[0], 0.02);
 }
 
-test "TASK-25.15.1: CFF2 ダミーは Unsupported" {
+test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
+    const a = testing.allocator;
+    // 再利用可能な fixture（監督者 snapshot 用: ファイル書き出し可）
+    const sfnt_bytes = try cff_mod.buildCff2VfSfnt(a, .{});
+    defer a.free(sfnt_bytes);
+
+    // (a) FontFace.init 成功
+    const face = try FontFace.init(sfnt_bytes);
+    try testing.expect(face.source == .cff2);
+    try testing.expect(face.fvar != null);
+
+    var of_def = OutlineFont.init(a, &face, 64);
+    defer of_def.deinit();
+    var of_var = OutlineFont.init(a, &face, 64);
+    defer of_var.deinit();
+
+    // (c) norm=0: CFF2 outline 直接 + 軸 default
+    const g = &face.source.cff2;
+    var o_def = try g.outline(a, 0, &.{0});
+    defer o_def.deinit(a);
+    try testing.expectApproxEqAbs(@as(f32, 100), o_def.contours[0].segments[0].line.x, 0.5);
+
+    // default OutlineFont の描画
+    const W = 80;
+    var px_def = [_]u32{0xFF000000} ** (W * W);
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    of_def.drawTo(.{ .pixels = &px_def, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+
+    // (b) setAxis max → 公開経路で外形変化
+    const wght = [4]u8{ 'w', 'g', 'h', 't' };
+    try of_var.setAxis(&wght, 900);
+    try testing.expectApproxEqAbs(@as(f32, 1), of_var.axis_norm[0], 0.01);
+
+    var px_var = [_]u32{0xFF000000} ** (W * W);
+    of_var.drawTo(.{ .pixels = &px_var, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+
+    // raster が default と異なる
+    try testing.expect(!std.mem.eql(u32, &px_def, &px_var));
+
+    // (d) drawTo で非空ピクセル
+    var any_def = false;
+    var any_var = false;
+    for (px_def) |p| {
+        if (p != 0xFF000000) any_def = true;
+    }
+    for (px_var) |p| {
+        if (p != 0xFF000000) any_var = true;
+    }
+    try testing.expect(any_def);
+    try testing.expect(any_var);
+
+    // (c) resetAxes 後 measure は hmtx advance
+    try of_var.resetAxes();
+    try testing.expectEqual(@as(u32, 64), of_var.measure("A"));
+
+    // norm=0 outline と default 軸の Cff2Font.outline 一致
+    var o_after = try g.outline(a, 0, of_var.axis_norm[0..1]);
+    defer o_after.deinit(a);
+    try testing.expectApproxEqAbs(
+        o_def.contours[0].segments[0].line.x,
+        o_after.contours[0].segments[0].line.x,
+        0.01,
+    );
+}
+
+test "TASK-25.15.4: CFF と CFF2 同居は InvalidFont" {
+    const a = testing.allocator;
+    // 最小 head/maxp/hhea/hmtx/cmap + 両方の CFF ダミー
+    var head = [_]u8{0} ** 54;
+    head[12] = 0x5F;
+    head[13] = 0x0F;
+    head[14] = 0x3C;
+    head[15] = 0xF5;
+    putU16(&head, 18, 64);
+    var maxp = [_]u8{0} ** 6;
+    putU16(&maxp, 4, 1);
+    var hhea = [_]u8{0} ** 36;
+    putU16(&hhea, 34, 1);
+    var hmtx = [_]u8{0} ** 4;
+    putU16(&hmtx, 0, 64);
+    var cmap_tbl = [_]u8{0} ** 20;
+    putU16(&cmap_tbl, 2, 0);
+    const cff1 = [_]u8{ 1, 0, 4, 1 }; // ダミー CFF1
+    const cff2 = [_]u8{ 2, 0, 5, 0, 0 }; // CFF2 header only（parse 前に同居で弾く）
+    const data = try buildSfnt(a, &.{
+        .{ .tag = "head".*, .body = &head },
+        .{ .tag = "maxp".*, .body = &maxp },
+        .{ .tag = "hhea".*, .body = &hhea },
+        .{ .tag = "hmtx".*, .body = &hmtx },
+        .{ .tag = "cmap".*, .body = &cmap_tbl },
+        .{ .tag = "CFF ".*, .body = &cff1 },
+        .{ .tag = "CFF2".*, .body = &cff2 },
+    });
+    defer a.free(data);
+    try testing.expectError(error.InvalidFont, FontFace.init(data));
+}
+
+test "TASK-25.15.4: CFF2 ダミー（壊れた）は InvalidFont" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
-    // CFF2 ダミーテーブルを追加した sfnt
+    // CFF2 ダミー（不正 major / 不完全）を glyf と同居 → InvalidFont（同居禁止）
     const cff2_dummy = [_]u8{ 0x01, 0x00, 0x04, 0x00 };
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
@@ -2519,7 +2641,8 @@ test "TASK-25.15.1: CFF2 ダミーは Unsupported" {
         .{ .tag = "CFF2".*, .body = &cff2_dummy },
     });
     defer a.free(cff2_data);
-    try testing.expectError(error.Unsupported, FontFace.init(cff2_data));
+    // glyf + CFF2 同居
+    try testing.expectError(error.InvalidFont, FontFace.init(cff2_data));
 }
 
 /// 壊れた fvar を差し替えた最小可変フォントを組む（FontFace.init 検証用）。

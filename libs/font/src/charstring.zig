@@ -1,25 +1,30 @@
-// CFF INDEX 構造 + Type2 charstring インタプリタ。
+// CFF INDEX 構造 + Type2 / CFF2 charstring インタプリタ。
 //
-// CFF コンテナ(cff.zig)が各 INDEX のパースと subr の供給に Index を使い、glyph 描画で run() を
-// 呼ぶ（cff → charstring の一方向依存）。run() は charstring を解釈し outline.Builder へ
-// moveTo/lineTo/cubicTo を発行する（Type2 は 3 次 Bezier）。
+// CFF コンテナ(cff.zig)が各 INDEX のパースと subr の供給に Index を使い、glyph 描画で run() /
+// runCff2() を呼ぶ。run() は CFF1 Type2、runCff2() は CFF2（blend/vsindex・width 無し）。
+//
+// ホットパス宣言: charstring 解釈は **ラスタキャッシュミス時のみ**。
 //
 // 制限（受け入れ済み）: arithmetic/logical/storage/conditional の 12xx は非対応(Unsupported)。
-// flex 系(12 34-37)は対応。seac / Type1 charstring は非対応。width は消費のみ(advance は hmtx 優先)。
+// flex 系(12 34-37)は対応。seac / Type1 charstring は非対応。CFF1 width は消費のみ(advance は hmtx)。
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
 const outline = @import("outline.zig");
+const ivs = @import("ivs.zig");
+const var_common = @import("var_common.zig");
 
 pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 
 const max_stack = 48;
+const max_stack_cff2 = 513;
 const max_depth = 10;
 const max_stems = 96;
 const max_steps = 1 << 20; // 暴走防止（総オペレータ実行数）
+const max_regions = 64; // blend 用 region scalar 上限
 
-/// CFF INDEX（Name / Top DICT / String / Subr / CharStrings 共通）。
-/// count(u16) offSize(u8) offset[count+1](1-based) object-data。
+/// CFF / CFF2 INDEX。count は CFF1=u16 / CFF2=u32。
+/// offset[count+1](1-based) object-data。
 pub const Index = struct {
     data: []const u8,
     count: u32,
@@ -28,21 +33,38 @@ pub const Index = struct {
     obj_base: usize, // offset 値 v → byte (obj_base + v)。すなわち data-1。
     end: usize, // INDEX の末尾（次の構造の開始）
 
-    /// data[off..] の INDEX をパースし検証する。
+    /// CFF1: count(u16) offSize offset[] data
     pub fn parse(data: []const u8, off: usize) Error!Index {
+        return parseInner(data, off, false);
+    }
+
+    /// CFF2: count(u32) offSize offset[] data
+    pub fn parseCff2(data: []const u8, off: usize) Error!Index {
+        return parseInner(data, off, true);
+    }
+
+    fn parseInner(data: []const u8, off: usize, is_cff2: bool) Error!Index {
         const r = Reader{ .data = data };
-        const count: u32 = try r.u16At(off);
+        const count_size: usize = if (is_cff2) 4 else 2;
+        try r.require(off, count_size);
+        const count: u32 = if (is_cff2) try r.u32At(off) else try r.u16At(off);
         if (count == 0) {
-            return .{ .data = data, .count = 0, .off_size = 0, .offsets_start = off + 2, .obj_base = off + 2, .end = off + 2 };
+            return .{
+                .data = data,
+                .count = 0,
+                .off_size = 0,
+                .offsets_start = off + count_size,
+                .obj_base = off + count_size,
+                .end = off + count_size,
+            };
         }
-        const off_size = try r.u8At(off + 2);
+        const off_size = try r.u8At(off + count_size);
         if (off_size < 1 or off_size > 4) return error.InvalidFont;
-        const offsets_start = off + 3;
-        const n_off = count + 1;
+        const offsets_start = off + count_size + 1;
+        const n_off = @as(usize, count) + 1;
         try r.require(offsets_start, n_off * @as(usize, off_size));
         const obj_base = offsets_start + n_off * @as(usize, off_size) - 1;
 
-        // offset[0]==1、単調非減少、末尾が data 内を検証
         var prev: u32 = 0;
         var i: usize = 0;
         while (i < n_off) : (i += 1) {
@@ -54,9 +76,16 @@ pub const Index = struct {
             }
             prev = v;
         }
-        const last = prev; // offset[count]
-        try r.require(obj_base, last); // obj_base + last <= data.len
-        return .{ .data = data, .count = count, .off_size = off_size, .offsets_start = offsets_start, .obj_base = obj_base, .end = obj_base + last };
+        const last = prev;
+        try r.require(obj_base, last);
+        return .{
+            .data = data,
+            .count = count,
+            .off_size = off_size,
+            .offsets_start = offsets_start,
+            .obj_base = obj_base,
+            .end = obj_base + last,
+        };
     }
 
     /// entry i のバイト列。範囲外は null。
@@ -87,6 +116,37 @@ pub fn subrBias(count: u32) i32 {
 
 const Result = enum { normal, returned, ended };
 
+/// CFF2 blend 用コンテキスト（VariationStore + 現在 vsindex + region scalars）。
+pub const BlendState = struct {
+    table: []const u8,
+    ivs_off: usize,
+    axis_count: u16,
+    vsindex: u16 = 0,
+    scalars: [max_regions]f32 = undefined,
+    n_regions: u16 = 0,
+    scalars_valid: bool = false,
+
+    fn ensureScalars(self: *BlendState, norm: []const f32) Error!void {
+        if (self.scalars_valid) return;
+        self.n_regions = try ivs.regionScalarsForIvd(
+            self.table,
+            self.ivs_off,
+            self.vsindex,
+            norm,
+            self.axis_count,
+            self.scalars[0..],
+        );
+        self.scalars_valid = true;
+    }
+
+    fn setVsindex(self: *BlendState, idx: u16) void {
+        if (self.vsindex != idx) {
+            self.vsindex = idx;
+            self.scalars_valid = false;
+        }
+    }
+};
+
 const Ctx = struct {
     b: *outline.Builder,
     gsubrs: Index,
@@ -95,8 +155,13 @@ const Ctx = struct {
     lbias: i32,
     nominal_width: f64,
     default_width: f64,
+    /// CFF2 モード: width 無し・blend/vsindex・大きめ stack
+    cff2: bool = false,
+    blend: ?*BlendState = null,
+    norm: []const f32 = &.{},
+    stack_limit: usize = max_stack,
 
-    stack: [max_stack]f64 = undefined,
+    stack: [max_stack_cff2]f64 = undefined,
     sp: usize = 0,
     x: f64 = 0,
     y: f64 = 0,
@@ -106,7 +171,7 @@ const Ctx = struct {
     steps: u32 = 0,
 
     fn push(self: *Ctx, v: f64) Error!void {
-        if (self.sp >= max_stack) return error.InvalidFont;
+        if (self.sp >= self.stack_limit) return error.InvalidFont;
         self.stack[self.sp] = v;
         self.sp += 1;
     }
@@ -164,7 +229,7 @@ fn shiftLeft(self: *Ctx) void {
     self.sp -= 1;
 }
 
-/// charstring を実行し Builder へパスを発行する。
+/// CFF1 Type2 charstring を実行し Builder へパスを発行する。
 pub fn run(
     b: *outline.Builder,
     code: []const u8,
@@ -181,6 +246,34 @@ pub fn run(
         .lbias = subrBias(lsubrs.count),
         .nominal_width = nominal_width,
         .default_width = default_width,
+        .cff2 = false,
+        .stack_limit = max_stack,
+    };
+    _ = try exec(&ctx, code, 0);
+}
+
+/// CFF2 charstring（width 無し・blend/vsindex）。blend_state=null なら blend は InvalidFont。
+pub fn runCff2(
+    b: *outline.Builder,
+    code: []const u8,
+    gsubrs: Index,
+    lsubrs: Index,
+    blend_state: ?*BlendState,
+    norm: []const f32,
+) Error!void {
+    var ctx = Ctx{
+        .b = b,
+        .gsubrs = gsubrs,
+        .gbias = subrBias(gsubrs.count),
+        .lsubrs = lsubrs,
+        .lbias = subrBias(lsubrs.count),
+        .nominal_width = 0,
+        .default_width = 0,
+        .cff2 = true,
+        .blend = blend_state,
+        .norm = norm,
+        .stack_limit = max_stack_cff2,
+        .width_parsed = true, // width 無し
     };
     _ = try exec(&ctx, code, 0);
 }
@@ -194,8 +287,8 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
         const b0 = code[i];
         i += 1;
 
-        if (b0 >= 32 or b0 == 28) {
-            // operand（数値）
+        if (b0 >= 32 or b0 == 28 or (ctx.cff2 and b0 == 255)) {
+            // operand（数値）。CFF2 は Fixed (255) も可。
             const v = try readOperand(code, &i, b0);
             try ctx.push(v);
             continue;
@@ -331,12 +424,26 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
                 if (depth == 0) return error.InvalidFont; // top-level return は不正
                 return .returned;
             },
-            14 => { // endchar
-                ctx.maybeWidth(false);
-                // seac 風(width 消費後に 4 引数)は非対応。余剰引数は黙殺せず弾く。
-                if (ctx.sp == 4) return error.Unsupported; // seac
-                if (ctx.sp != 0) return error.InvalidFont;
+            14 => { // endchar（CFF1）。CFF2 では未使用だが来たら終了。
+                if (!ctx.cff2) {
+                    ctx.maybeWidth(false);
+                    if (ctx.sp == 4) return error.Unsupported; // seac
+                    if (ctx.sp != 0) return error.InvalidFont;
+                }
                 return .ended;
+            },
+            15 => { // CFF2 vsindex
+                if (!ctx.cff2) return error.Unsupported;
+                if (ctx.sp < 1) return error.InvalidFont;
+                ctx.sp -= 1;
+                const idx_f = ctx.stack[ctx.sp];
+                if (!std.math.isFinite(idx_f) or idx_f < 0 or idx_f > 65535) return error.InvalidFont;
+                const bs = ctx.blend orelse return error.InvalidFont;
+                bs.setVsindex(@intFromFloat(idx_f));
+            },
+            16 => { // CFF2 blend
+                if (!ctx.cff2) return error.Unsupported;
+                try doBlend(ctx);
             },
             12 => { // escape（2 byte op）
                 if (i >= code.len) return error.InvalidFont;
@@ -355,6 +462,33 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
         }
     }
     return .normal;
+}
+
+/// CFF2 blend: stack = [ … def0..defN-1, deltas(n*k), n ]
+/// result_i = def_i + sum_j(delta[i*k+j] * scalar[j])
+fn doBlend(ctx: *Ctx) Error!void {
+    const bs = ctx.blend orelse return error.InvalidFont;
+    try bs.ensureScalars(ctx.norm);
+    const k: usize = bs.n_regions;
+    if (ctx.sp < 1) return error.InvalidFont;
+    const n_f = ctx.stack[ctx.sp - 1];
+    if (!std.math.isFinite(n_f) or n_f < 1 or n_f != @floor(n_f)) return error.InvalidFont;
+    const n: usize = @intFromFloat(n_f);
+    // need n defaults + n*k deltas + 1 (n)
+    const need = n + n * k + 1;
+    if (ctx.sp < need) return error.InvalidFont;
+    const base = ctx.sp - need;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var v = ctx.stack[base + i];
+        var j: usize = 0;
+        while (j < k) : (j += 1) {
+            const d = ctx.stack[base + n + i * k + j];
+            v += d * @as(f64, bs.scalars[j]);
+        }
+        ctx.stack[base + i] = v;
+    }
+    ctx.sp = base + n;
 }
 
 fn addStems(ctx: *Ctx) void {
@@ -429,13 +563,23 @@ fn flex1(ctx: *Ctx) Error!void {
     }
 }
 
-/// Type2 operand を読む（b0 は先頭バイト、i は b0 の次を指す）。
+/// Type2 / CFF2 operand を読む（b0 は先頭バイト、i は b0 の次を指す）。
 fn readOperand(code: []const u8, i: *usize, b0: u8) Error!f64 {
     if (b0 == 28) {
         if (i.* + 2 > code.len) return error.InvalidFont;
         const v: i16 = @bitCast((@as(u16, code[i.*]) << 8) | code[i.* + 1]);
         i.* += 2;
         return @floatFromInt(v);
+    }
+    if (b0 == 255) {
+        // Fixed 16.16 (CFF2 CharString only)
+        if (i.* + 4 > code.len) return error.InvalidFont;
+        const raw: i32 = @bitCast((@as(u32, code[i.*]) << 24) |
+            (@as(u32, code[i.* + 1]) << 16) |
+            (@as(u32, code[i.* + 2]) << 8) |
+            code[i.* + 3]);
+        i.* += 4;
+        return @as(f64, @floatFromInt(raw)) / 65536.0;
     }
     if (b0 < 247) { // 32..246
         return @as(f64, @floatFromInt(@as(i32, b0) - 139));
