@@ -681,6 +681,24 @@ action 固有のコードを一切足さない**（中身非パースの不変�
   drawable 読み戻しは P4 スコープ外（上記参照）。
 - **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
 
+### vp-mcp（MCP server。TASK-88.2）
+
+harness live TCP の 1 client として attach し、capabilities から MCP tools を動的生成する stdio JSON-RPC アダプタ（アプリ無改造）。
+
+```bash
+zig build mcp                    # → zig-out/bin/vp-mcp
+# アプリを headless live で起動したうえで:
+VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
+zig-out/bin/vp-mcp --port-file /tmp/vp.port
+# または scripts/mcp --port-file /tmp/vp.port
+```
+
+- **引数**: `--port` / `--port-file`（drive と同じ優先順位 + env `VP_HARNESS_PORT`/`VP_HARNESS_PORT_FILE`）+ `--out <dir>`（snapshot 出力先。省略時 `$TMPDIR/vp-mcp-<port>`。起動時に絶対化 + mkdir）
+- **起動時**: `digest capabilities` を 1 回取り、`"truncated":true` なら起動失敗。tool 表は以後固定（アプリ再起動追従なし）
+- **MCP**: protocolVersion `2025-06-18` 固定 / initialize → notifications/initialized ゲート / tools/list・tools/call・ping / stdout は JSON-RPC のみ（ログは stderr）
+- **tools**: probe → `digest_<name>` / `snapshot_<name>`（path 引数なし。vp-mcp が `--out` 配下の絶対 path を注入）/ action → `<name>`（衝突時 `a_<name>`）
+- **検証**: `zig build test-mcp`（純関数単体テスト）
+
 ## network 同時編集（netsync, TASK-62.3）
 
 持続 TCP で複数 pixie プロセスが同一ドキュメントを同時編集する（host 権威の PROPOSE/COMMIT）。

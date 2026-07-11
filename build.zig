@@ -307,6 +307,20 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(drive_exe);
     addBuildStep(b, "drive", "Build the live harness driver CLI (zig-out/bin/drive)", drive_exe);
 
+    // ----- MCP server CLI（TASK-88.2）-----
+    // 純 std + std.Io.net の単独 exe（platform/audio 非依存）。drive と同型。
+    // `scripts/mcp` wrapper が `zig-out/bin/vp-mcp` を直接 exec する。
+    const mcp_exe = b.addExecutable(.{
+        .name = "vp-mcp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/mcp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(mcp_exe);
+    addBuildStep(b, "mcp", "Build the MCP server CLI (zig-out/bin/vp-mcp)", mcp_exe);
+
     // ========================================
     // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
     // facade module(addModule "platform") と責務分離。外部は dep.artifact("platform_native_<plat>")
@@ -368,6 +382,17 @@ pub fn build(b: *std.Build) void {
     const run_harness_test = b.addRunArtifact(harness_test);
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
     test_harness_step.dependOn(&run_harness_test.step);
+
+    // vp-mcp 単体テスト（schema 変換・直列化・fail 抽出・衝突解決・contract。std のみ。TASK-88.2）
+    const mcp_test_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/mcp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const mcp_test = b.addTest(.{ .root_module = mcp_test_mod });
+    const run_mcp_test = b.addRunArtifact(mcp_test);
+    const test_mcp_step = b.step("test-mcp", "Run vp-mcp unit tests (schema / serialize / fail / contract)");
+    test_mcp_step.dependOn(&run_mcp_test.step);
 
     // command model 単体テスト（型 + executor + no-op recorder。std のみ・platform/harness 非依存。TASK-62.5.1）
     const command_test_mod = b.createModule(.{
@@ -1323,6 +1348,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_wayland_csd_step);
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
+    test_step.dependOn(test_mcp_step);
     test_step.dependOn(test_command_step);
     test_step.dependOn(test_copilot_step);
     test_step.dependOn(test_netsync_step);

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# vp-mcp: harness live TCP ↔ stdio MCP の薄い入口（TASK-88.2）。
+# ビルド済み zig-out/bin/vp-mcp を直接 exec する（毎回 zig build しない＝stdout を汚さない）。
+#
+#   scripts/mcp --port-file /tmp/vp.port
+#
+# 先に `zig build mcp`（または `zig build`）で zig-out/bin/vp-mcp を生成しておくこと。
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bin="$here/zig-out/bin/vp-mcp"
+if [[ ! -x "$bin" ]]; then
+  echo "vp-mcp: $bin が見つかりません。先に 'zig build mcp'（または zig build）でビルドしてください。" >&2
+  exit 1
+fi
+exec "$bin" "$@"
