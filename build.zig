@@ -852,6 +852,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_actions_test = b.addRunArtifact(actions_test);
 
+    // pixie 視覚差分（TASK-87）。std のみ・App/kit 非依存で import 不要。
+    const diff_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/apps/pixie/diff.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_diff_test = b.addRunArtifact(diff_test);
+
     // history summary schema（TASK-62.5.5）。kit.platform.command 型を使うため default backend の kit を配線。
     const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules);
     const history_summary_mod = b.createModule(.{
@@ -904,6 +914,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_onion_skin_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
     test_core_step.dependOn(&run_actions_test.step);
+    test_core_step.dependOn(&run_diff_test.step);
     test_core_step.dependOn(&run_history_summary_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);
     test_core_step.dependOn(&run_text_content_input_test.step);

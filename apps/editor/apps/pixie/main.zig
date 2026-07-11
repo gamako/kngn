@@ -21,6 +21,7 @@ const png = kit.png;
 const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
 const canvas_input = @import("canvas_input.zig");
 const actions = @import("actions.zig");
+const diff = @import("diff.zig");
 const blit = @import("blit.zig");
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
@@ -290,6 +291,9 @@ const App = struct {
     eye_in: eyedropper_input.EyedropperInput = .{},
     /// clipboard（copy/cut で確保し paste で参照。gpa 所有・deinit で free）。
     clipboard: ?core.PixelBlock = null,
+    /// 視覚差分の基準スナップショット（TASK-87。遅延 alloc・gpa 所有・deinit で free）。
+    /// compositeStraight の借用スライスは保持せず、必ずコピーする。
+    diff_base: ?[]u32 = null,
     /// paste/move のブロック配置方法（既定 over=透明を保持＝下の絵を残す）。右ペインのトグルで切替（TASK-44）。
     blend_mode: core.selection.Blend = .over,
     active_kind: ToolKind = .pen,
@@ -1729,6 +1733,39 @@ fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, toolDigest(ctx, &buf));
 }
 
+/// diff digest（TASK-87）: 基準スナップショットとの変更画素数 / bbox / 最頻 before・after 色。
+/// 初回（未 mark）は現 composite を基準として自動初期化し changed=0 を返す。snapshot なし。
+fn diffDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (app.diff_base == null) {
+        copyCompositeToDiffBase(app) catch return buf[0..0];
+        return std.fmt.bufPrint(buf, "changed=0 bbox=none from=none to=none", .{}) catch buf[0..0];
+    }
+    const base = app.diff_base.?;
+    const cur = app.canvas.compositeStraight();
+    const r = diff.computeDiff(app.gpa, base, cur, CANVAS_W, CANVAS_H) catch return buf[0..0];
+    if (r.changed == 0) {
+        return std.fmt.bufPrint(buf, "changed=0 bbox=none from=none to=none", .{}) catch buf[0..0];
+    }
+    const from = diff.rgbChannels(r.from);
+    const to = diff.rgbChannels(r.to);
+    return std.fmt.bufPrint(buf, "changed={d} bbox={d},{d},{d},{d} from=#{X:0>2}{X:0>2}{X:0>2} to=#{X:0>2}{X:0>2}{X:0>2}", .{
+        r.changed, r.x0, r.y0, r.x1, r.y1, from.r, from.g, from.b, to.r, to.g, to.b,
+    }) catch buf[0..0];
+}
+
+/// compositeStraight を diff_base へコピー（未確保なら alloc）。借用スライスは保持しない。
+fn copyCompositeToDiffBase(app: *App) !void {
+    const n = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
+    const dst = if (app.diff_base) |b| b else blk: {
+        const b = try app.gpa.alloc(u32, n);
+        app.diff_base = b;
+        break :blk b;
+    };
+    const src = app.canvas.compositeStraight();
+    @memcpy(dst, src);
+}
+
 /// cursor digest/snapshot（TASK-75.4）: 要求中の OS cursor shape + 現在ツール + footprint リング半径。
 /// OS カーソル自体は framebuffer に写らないため、「pixie が要求した値」を assert する用途
 /// （実際に OS カーソルが変わったかは各 backend 手動目視。docs/plans/cursor-support-plan.md 参照）。
@@ -2159,6 +2196,14 @@ fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Al
     return recipe.collectNormalEntries(gpa, views_buf[0..n]);
 }
 
+/// `diff_mark`: 現在の composite を差分基準にコピー。記録しないメタ操作（TASK-87）。
+fn actionDiffMark(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try copyCompositeToDiffBase(actionApp(ctx));
+    return "ok";
+}
+
 /// `recipe_save <path>`: CommandLog → recipe ファイル（header.app_name="pixie"）。記録しない（メタ操作）。
 fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
@@ -2465,6 +2510,8 @@ fn registerActions(app: *App) void {
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
+    // diff_mark（TASK-87）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
+    platform.registerAction(.{ .name = "diff_mark", .ctx = app, .run = actionDiffMark, .network_policy = .local_only, .desc = "mark current composite as diff baseline" });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -3409,6 +3456,7 @@ pub fn main(init: std.process.Init) !void {
         if (app.current_project_path) |p| gpa.free(p);
         if (app.palette_path) |p| gpa.free(p);
         if (app.clipboard) |*cb| cb.deinit(gpa);
+        if (app.diff_base) |b| gpa.free(b);
         app.sel_in.deinit(gpa);
         app.bezier_editor.deinit(gpa);
         app.preview_rec.deinit(gpa);
@@ -3434,6 +3482,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
     platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
     platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest }); // TASK-62.5.5 正式 schema
+    platform.registerProbe(.{ .name = "diff", .ctx = &app, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" }); // TASK-87
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
     registerActions(&app);
     registerStateSync(&app);
