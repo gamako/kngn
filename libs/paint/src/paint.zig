@@ -30,6 +30,7 @@ pub const PaintDiff = undo.PaintDiff; // まだ Document の cel_id を知らな
 pub const Op = document.Op; // 1 操作の中身。tool/selection/path は PaintDiff を返す
 pub const CelId = document.CelId;
 pub const Cel = document.Cel;
+pub const LayerId = document.LayerId;
 pub const LayerDef = document.LayerDef;
 pub const Frame = document.Frame;
 pub const CelSetSnapshot = document.CelSetSnapshot;

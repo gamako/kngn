@@ -53,9 +53,21 @@ pub const Cel = struct {
     refcount: u32 = 1, // 同一 layer 内で何個の frame 列がこの cel を参照しているか
 };
 
+/// 安定レイヤー handle（TASK-94 Phase A）。index とは独立し、move/delete/insert を跨いで
+/// 同一レイヤーを指し続ける。**0 は invalid 予約**・単調採番・**再利用なし**
+/// （undo で LayerDef ごと戻る場合を除き、削除済み id は再割り当てしない）。
+/// 採番・解決はイベント時のみ（フレーム毎 composite には触れない）。
+pub const LayerId = enum(u64) {
+    invalid = 0,
+    _,
+};
+
 /// レイヤー定義（Document レベル。全 frame で共有。TASK-79.3/79.5 の name/kind/TextParams は
 /// ここへ移動する）。
 pub const LayerDef = struct {
+    /// 安定 handle。作成時（add/insert/load）に Document が採番する。既定 `.invalid` は
+    /// 一時構築用で、Document.layers に載る時点では必ず非 invalid。
+    id: LayerId = .invalid,
     visible: bool = true,
     opacity: u8 = 255,
     name_buf: [layer_name_max]u8 = undefined,
@@ -340,6 +352,8 @@ pub const Document = struct {
     /// null = 解放済みスロット（永久に再利用しない）。
     cel_pool: std.ArrayList(?Cel) = .empty,
     next_cel_id: CelId = 0,
+    /// 次に採番する LayerId の raw 値（単調・0=invalid 予約のため 1 始まり・再利用なし。TASK-94）。
+    next_layer_id: u64 = 1,
     /// grid[layer_idx * frames.items.len + frame_idx] = ?CelId
     grid: std.ArrayList(?CelId) = .empty,
     selected_layer: usize = 0,
@@ -353,7 +367,7 @@ pub const Document = struct {
     pub fn init(gpa: Allocator, w: u32, h: u32) !Document {
         var doc = try initEmpty(gpa, w, h);
         errdefer doc.deinit();
-        var def: LayerDef = .{};
+        var def: LayerDef = .{ .id = doc.allocLayerId() };
         def.setName("Layer 1");
         try doc.layers.append(gpa, def);
         try doc.frames.append(gpa, .{});
@@ -367,6 +381,28 @@ pub const Document = struct {
     pub fn initEmpty(gpa: Allocator, w: u32, h: u32) !Document {
         const view = try Canvas.init(gpa, w, h);
         return .{ .width = w, .height = h, .active_view = view, .allocator = gpa };
+    }
+
+    /// 新規 LayerId を 1 つ採番する（単調・再利用なし。0=invalid は返さない）。
+    pub fn allocLayerId(self: *Document) LayerId {
+        const raw = self.next_layer_id;
+        self.next_layer_id += 1;
+        return @enumFromInt(raw);
+    }
+
+    /// index → 安定 handle。範囲外は null。
+    pub fn layerIdAt(self: *const Document, index: usize) ?LayerId {
+        if (index >= self.layers.items.len) return null;
+        return self.layers.items[index].id;
+    }
+
+    /// 安定 handle → 現在の index。削除済み / invalid / 不在は null。
+    pub fn layerIndexOf(self: *const Document, id: LayerId) ?usize {
+        if (id == .invalid) return null;
+        for (self.layers.items, 0..) |def, i| {
+            if (def.id == id) return i;
+        }
+        return null;
     }
 
     pub fn deinit(self: *Document) void {
@@ -848,6 +884,35 @@ pub const Document = struct {
         self.undo.push(gpa, .{ .layer_reorder = .{ .from = from, .to = to, .selected_before = selected_before, .selected_after = self.selected_layer } });
     }
 
+    // ── LayerId 解決 wrapper（additive。既存 index API は不変。TASK-94 Phase A）──
+    // 削除済み / invalid id は `error.UnknownLayerId`。index 系と同じ結果を返す。
+
+    pub fn selectLayerById(self: *Document, id: LayerId) !void {
+        const index = self.layerIndexOf(id) orelse return error.UnknownLayerId;
+        try self.selectLayer(index);
+    }
+
+    pub fn setLayerVisibleById(self: *Document, gpa: Allocator, id: LayerId, visible: bool) !void {
+        const index = self.layerIndexOf(id) orelse return error.UnknownLayerId;
+        try self.setLayerVisible(gpa, index, visible);
+    }
+
+    pub fn setLayerOpacityById(self: *Document, gpa: Allocator, id: LayerId, opacity: u8) !void {
+        const index = self.layerIndexOf(id) orelse return error.UnknownLayerId;
+        try self.setLayerOpacity(gpa, index, opacity);
+    }
+
+    /// `id` の layer を index `to` へ移動する（`reorderLayer(from, to)` と同値）。
+    pub fn moveLayerById(self: *Document, gpa: Allocator, id: LayerId, to: usize) !void {
+        const from = self.layerIndexOf(id) orelse return error.UnknownLayerId;
+        try self.reorderLayer(gpa, from, to);
+    }
+
+    pub fn deleteLayerById(self: *Document, gpa: Allocator, id: LayerId) !void {
+        const index = self.layerIndexOf(id) orelse return error.UnknownLayerId;
+        try self.deleteLayer(gpa, index);
+    }
+
     /// doc.layers と grid の行を入れ替える（`ArrayList.orderedRemove`+`insert` と同じ
     /// index 意味論。`to` は削除後の配列における挿入位置）。
     fn moveLayerRaw(self: *Document, gpa: Allocator, from: usize, to: usize) void {
@@ -871,7 +936,7 @@ pub const Document = struct {
         const selected_before = self.selected_layer;
         const av_layer = try self.active_view.allocBlankLayer(gpa);
         errdefer gpa.free(av_layer.pixels);
-        var def: LayerDef = .{};
+        var def: LayerDef = .{ .id = self.allocLayerId() };
         def.setName(av_layer.name());
         try self.layers.append(gpa, def);
         const nframes = self.frames.items.len;
@@ -895,7 +960,7 @@ pub const Document = struct {
         const selected_before = self.selected_layer;
         const av_layer = try self.active_view.allocBlankLayer(gpa);
         errdefer gpa.free(av_layer.pixels);
-        var def: LayerDef = .{ .kind = .text, .text_params = params };
+        var def: LayerDef = .{ .id = self.allocLayerId(), .kind = .text, .text_params = params };
         def.setName(av_layer.name());
         const nframes = self.frames.items.len;
         const cel_id = self.allocBlankCel(gpa);
@@ -959,7 +1024,9 @@ pub const Document = struct {
         const new_idx = src_idx + 1;
         const selected_before = self.selected_layer;
         const src_def = self.layers.items[src_idx];
-        const new_def = src_def; // POD値コピー（text_params含む・名前も継承）
+        // POD 値コピー（text_params・名前継承）+ 新規 LayerId（複製は別 identity。TASK-94）
+        var new_def = src_def;
+        new_def.id = self.allocLayerId();
         const nframes = self.frames.items.len;
         const row = gpa.alloc(?CelId, nframes) catch @panic("Document.duplicateLayer: OOM");
         defer gpa.free(row);
@@ -1193,7 +1260,8 @@ pub const Document = struct {
         self.frames.clearRetainingCapacity();
         self.frames.append(gpa, .{}) catch @panic("Document.resetToSingleBlankLayer: OOM");
         self.layers.clearRetainingCapacity();
-        var def: LayerDef = .{};
+        // LayerId 採番は保持（undo handle と同様・再利用なし。TASK-94）
+        var def: LayerDef = .{ .id = self.allocLayerId() };
         def.setName("Layer 1");
         self.layers.append(gpa, def) catch @panic("Document.resetToSingleBlankLayer: OOM");
         self.grid.append(gpa, null) catch @panic("Document.resetToSingleBlankLayer: OOM");
@@ -1797,4 +1865,120 @@ test "UndoStack owners: max_history 溢れで最古の owner も同期して消�
     try testing.expectEqual(s.undo.items.len, s.owners.items.len);
     try testing.expectEqual(s.undo.items.len, s.handles.items.len);
     try testing.expectEqual(@as(u8, 0), s.ownerOf(1)); // 溢れた handle は不在
+}
+
+// ── LayerId 安定 handle（TASK-94 Phase A）──────────────────────────────
+
+test "LayerId: add→move→delete→insert を跨いで id が安定・再利用なし" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    const id0 = doc.layerIdAt(0).?;
+    try testing.expect(id0 != .invalid);
+    try testing.expectEqual(@as(?usize, 0), doc.layerIndexOf(id0));
+
+    const idx1 = try doc.addLayer(gpa);
+    const id1 = doc.layerIdAt(idx1).?;
+    const idx2 = try doc.addLayer(gpa);
+    const id2 = doc.layerIdAt(idx2).?;
+    try testing.expect(id0 != id1 and id1 != id2 and id0 != id2);
+    try testing.expectEqual(@as(u64, 4), doc.next_layer_id); // 1,2,3 使用済み → next=4
+
+    // move: reorderLayer(0, 2) 後も id は同じ layer を指す
+    try doc.reorderLayer(gpa, 0, 2); // [id1, id2, id0]
+    try testing.expectEqual(id1, doc.layerIdAt(0).?);
+    try testing.expectEqual(id2, doc.layerIdAt(1).?);
+    try testing.expectEqual(id0, doc.layerIdAt(2).?);
+    try testing.expectEqual(@as(?usize, 2), doc.layerIndexOf(id0));
+    try testing.expectEqual(@as(?usize, 0), doc.layerIndexOf(id1));
+    try testing.expectEqual(@as(?usize, 1), doc.layerIndexOf(id2));
+
+    // delete id1: 解決は null・next_layer_id は戻らない
+    try doc.deleteLayerById(gpa, id1);
+    try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id1));
+    try testing.expectEqual(@as(u64, 4), doc.next_layer_id);
+    try testing.expectEqual(@as(?usize, 0), doc.layerIndexOf(id2));
+    try testing.expectEqual(@as(?usize, 1), doc.layerIndexOf(id0));
+
+    // insert（add）: 新規 id は削除済み id1 を再利用しない
+    const idx_new = try doc.addLayer(gpa);
+    const id_new = doc.layerIdAt(idx_new).?;
+    try testing.expect(id_new != id1);
+    try testing.expectEqual(@as(LayerId, @enumFromInt(4)), id_new);
+    try testing.expectEqual(@as(u64, 5), doc.next_layer_id);
+
+    // invalid / 範囲外
+    try testing.expectEqual(@as(?LayerId, null), doc.layerIdAt(99));
+    try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(.invalid));
+}
+
+test "LayerId ById wrapper: index 系と同一結果 / 削除済み id は UnknownLayerId" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+    _ = try doc.addLayer(gpa);
+    _ = try doc.addLayer(gpa);
+    const id0 = doc.layerIdAt(0).?;
+    const id1 = doc.layerIdAt(1).?;
+    const id2 = doc.layerIdAt(2).?;
+
+    // select
+    try doc.selectLayerById(id1);
+    try testing.expectEqual(@as(usize, 1), doc.selected_layer);
+    try doc.selectLayer(0);
+    try testing.expectEqual(@as(usize, 0), doc.selected_layer);
+    try doc.selectLayerById(id0);
+    try testing.expectEqual(@as(usize, 0), doc.selected_layer);
+
+    // visible / opacity
+    try doc.setLayerVisibleById(gpa, id2, false);
+    try testing.expectEqual(false, doc.layers.items[2].visible);
+    try doc.setLayerOpacityById(gpa, id2, 100);
+    try testing.expectEqual(@as(u8, 100), doc.layers.items[2].opacity);
+    // index 系と同値（既に false/100 なので no-op 相当。再設定で状態一致を確認）
+    try doc.setLayerVisible(gpa, 2, true);
+    try doc.setLayerVisibleById(gpa, id2, false);
+    try testing.expectEqual(false, doc.layers.items[doc.layerIndexOf(id2).?].visible);
+    try doc.setLayerOpacity(gpa, 2, 200);
+    try doc.setLayerOpacityById(gpa, id2, 50);
+    try testing.expectEqual(@as(u8, 50), doc.layers.items[doc.layerIndexOf(id2).?].opacity);
+
+    // move: id0 を to=2 へ
+    try doc.moveLayerById(gpa, id0, 2);
+    try testing.expectEqual(id1, doc.layerIdAt(0).?);
+    try testing.expectEqual(id2, doc.layerIdAt(1).?);
+    try testing.expectEqual(id0, doc.layerIdAt(2).?);
+
+    // delete
+    try doc.deleteLayerById(gpa, id2);
+    try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id2));
+    try testing.expectEqual(@as(usize, 2), doc.layers.items.len);
+
+    // 削除済み id → UnknownLayerId
+    try testing.expectError(error.UnknownLayerId, doc.selectLayerById(id2));
+    try testing.expectError(error.UnknownLayerId, doc.setLayerVisibleById(gpa, id2, true));
+    try testing.expectError(error.UnknownLayerId, doc.setLayerOpacityById(gpa, id2, 1));
+    try testing.expectError(error.UnknownLayerId, doc.moveLayerById(gpa, id2, 0));
+    try testing.expectError(error.UnknownLayerId, doc.deleteLayerById(gpa, id2));
+    try testing.expectError(error.UnknownLayerId, doc.selectLayerById(.invalid));
+}
+
+test "LayerId: duplicateLayer は新規 id / reset 後も next_layer_id は単調" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+    const id0 = doc.layerIdAt(0).?;
+    const dup_idx = try doc.duplicateLayer(gpa, 0);
+    const id_dup = doc.layerIdAt(dup_idx).?;
+    try testing.expect(id_dup != id0);
+    try testing.expectEqual(@as(?usize, 0), doc.layerIndexOf(id0));
+    try testing.expectEqual(@as(?usize, 1), doc.layerIndexOf(id_dup));
+
+    const before_reset = doc.next_layer_id;
+    doc.resetToSingleBlankLayer(gpa);
+    try testing.expectEqual(@as(usize, 1), doc.layers.items.len);
+    try testing.expect(doc.layerIdAt(0).? != .invalid);
+    try testing.expect(doc.next_layer_id > before_reset);
+    try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id0)); // 旧 id は不在
 }
