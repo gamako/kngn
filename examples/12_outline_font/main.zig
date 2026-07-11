@@ -38,6 +38,33 @@ const font_paths = [_][]const u8{
 
 const Loaded = struct { bytes: []u8, face: fontmod.FontFace };
 
+/// 可変フォント（fvar あり glyf VF）の候補。macOS の SF Pro が代表
+/// （4 軸 wdth/opsz/GRAD/wght + gvar + HVAR。TASK-25.15 の VF スタックのデモ）。
+const var_font_paths = [_][]const u8{
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/SFNSRounded.ttf",
+    "C:/Windows/Fonts/segoeui.ttf", // 新しめの Windows では VF 版がある
+    "/usr/share/fonts/truetype/noto/NotoSans-VariableFont_wdth,wght.ttf",
+};
+
+/// 各候補を read→FontFace.init し、fvar を持つ最初のものを返す（無ければ null → VF 段はスキップ）。
+fn loadVarFace(io: std.Io, alloc: std.mem.Allocator) ?Loaded {
+    for (var_font_paths) |path| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch continue;
+        const face = fontmod.FontFace.init(bytes) catch {
+            alloc.free(bytes);
+            continue;
+        };
+        if (face.fvar == null) {
+            alloc.free(bytes);
+            continue;
+        }
+        std.debug.print("variable font: loaded {s}\n", .{path});
+        return .{ .bytes = bytes, .face = face };
+    }
+    return null;
+}
+
 /// 各候補を read→FontFace.init まで試し、最初に成功したものを返す。
 /// FileNotFound は静かに次へ。それ以外（権限/IO/parse 失敗）はログして次候補へ。
 fn loadFace(io: std.Io, alloc: std.mem.Allocator) ?Loaded {
@@ -83,6 +110,26 @@ pub fn main(init: std.process.Init) !void {
     }
     defer for (&fonts) |*of| if (of.*) |*o| o.deinit();
 
+    // 可変フォント段（fvar を持つ system フォントがあれば wght 別に描画）
+    const var_loaded = loadVarFace(init.io, allocator);
+    defer if (var_loaded) |l| allocator.free(l.bytes);
+    var var_face: ?fontmod.FontFace = if (var_loaded) |l| l.face else null;
+    const var_weights = [_]f32{ 100, 400, 700, 900 };
+    var var_fonts: [var_weights.len]?fontmod.OutlineFont = .{null} ** var_weights.len;
+    if (var_face) |*vf| {
+        const wght_tag = [4]u8{ 'w', 'g', 'h', 't' };
+        for (&var_fonts, var_weights) |*of, w| {
+            var o = fontmod.OutlineFont.init(allocator, vf, 40);
+            // 軸 set 失敗（wght 軸なし等）はその weight 行だけスキップ
+            o.setAxis(&wght_tag, w) catch {
+                o.deinit();
+                continue;
+            };
+            of.* = o;
+        }
+    }
+    defer for (&var_fonts) |*of| if (of.*) |*o| o.deinit();
+
     const white = fontmod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
     const cyan = fontmod.Color.rgba(0x66, 0xCC, 0xFF, 0xFF);
 
@@ -106,6 +153,17 @@ pub fn main(init: std.process.Init) !void {
                 small.asFont().drawTo(target, .{ .x = 24, .y = 150 }, "abcdefghijklmnopqrstuvwxyz 0123456789 !?@#&", white, clip);
                 small.asFont().drawTo(target, .{ .x = 24, .y = 180 }, "ESC to quit. Glyphs are rasterized on demand and cached.", cyan, clip);
                 small.asFont().drawTo(target, .{ .x = 24, .y = 300 }, "日本語: ひらがな カタカナ 漢字（CFF/.ttc）", cyan, clip);
+            }
+
+            // 可変フォント段: 同一 face から wght 100/400/700/900（fvar/avar/gvar/HVAR 経路）
+            if (var_face != null) {
+                if (fonts[2]) |*small| small.asFont().drawTo(target, .{ .x = 24, .y = 340 }, "Variable font (fvar/gvar): wght 100 / 400 / 700 / 900", cyan, clip);
+                const labels = [_][]const u8{ "Thin 100", "Regular 400", "Bold 700", "Black 900" };
+                var vy: i32 = 370;
+                for (&var_fonts, labels) |*of, label| {
+                    if (of.*) |*o| o.asFont().drawTo(target, .{ .x = 24, .y = vy }, label, white, clip);
+                    vy += 52;
+                }
             }
 
             window.present();
