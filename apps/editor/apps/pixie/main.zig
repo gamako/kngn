@@ -1061,28 +1061,30 @@ const App = struct {
     }
 
     /// `Document.addLayer` が mutation + Op構築 + push を内部で完結する（plan 5.4節「一般化」）。
-    fn doAddLayer(self: *App) !void {
+    /// 戻り値は新規レイヤーの LayerId raw（action 応答 `ok id=#N` 用。TASK-94 Phase B review）。
+    fn doAddLayer(self: *App) !u64 {
         if (self.editingBlocked()) return error.EditingBlocked;
-        _ = self.doc.addLayer(self.gpa) catch |err| {
+        const idx = self.doc.addLayer(self.gpa) catch |err| {
             self.setSaveMsg("Layer add failed: {s}", .{@errorName(err)});
             return err;
         };
         self.clampTimelineTarget();
+        return @intFromEnum(self.doc.layerIdAt(idx).?);
     }
 
-    fn doDeleteLayer(self: *App) !void {
+    /// 明示 index のレイヤーを削除する（TASK-94 Phase B: selected 暗黙参照を排除）。
+    fn doDeleteLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const idx = self.canvas.selected_layer;
         try self.doc.deleteLayer(self.gpa, idx);
         self.clampTimelineTarget();
     }
 
-    fn doMoveLayer(self: *App, delta: i32) !void {
+    /// 明示 index のレイヤーを delta（±1）だけ移動する（TASK-94 Phase B）。
+    fn doMoveLayer(self: *App, idx: usize, delta: i32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const from = self.canvas.selected_layer;
-        const to_i: i32 = @as(i32, @intCast(from)) + delta;
+        const to_i: i32 = @as(i32, @intCast(idx)) + delta;
         if (to_i < 0) return error.OutOfRange;
-        try self.doc.reorderLayer(self.gpa, from, @intCast(to_i));
+        try self.doc.reorderLayer(self.gpa, idx, @intCast(to_i));
     }
 
     /// レイヤー可視性を明示値へ設定する（`doToggleLayerVisible` の共通実装。TASK-64 で action
@@ -1231,21 +1233,23 @@ const App = struct {
         try self.doc.selectLayer(idx);
     }
 
-    /// 選択レイヤーを複製し、直上へ挿入する（Duplicate。TASK-79.2。レイヤー右クリックメニュー）。
+    /// 明示 index のレイヤーを複製し、直上へ挿入する（Duplicate。TASK-79.2。TASK-94 Phase B で
+    /// selected 暗黙参照を排除）。戻り値は新規レイヤーの LayerId raw（action 応答用）。
     /// `Document.duplicateLayer` が raster(各frame深いコピー)/text(新規cel全frameリンク)の
     /// 分岐込みで mutation + Op構築 + push を完結する（4.4/4.5節）。
-    fn doDuplicateLayer(self: *App) !void {
+    fn doDuplicateLayer(self: *App, idx: usize) !u64 {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const src_idx = self.canvas.selected_layer;
-        _ = self.doc.duplicateLayer(self.gpa, src_idx) catch |err| {
+        const new_idx = self.doc.duplicateLayer(self.gpa, idx) catch |err| {
             self.setSaveMsg("Layer duplicate failed: {s}", .{@errorName(err)});
             return err;
         };
+        return @intFromEnum(self.doc.layerIdAt(new_idx).?);
     }
 
-    /// 選択レイヤーを直下のレイヤーへ結合する（Merge Down。TASK-79.2。レイヤー右クリックメニュー）。
-    /// 選択中レイヤー(top)の内容を opacity 込みで下位レイヤー(bottom=top-1)へ src-over 焼き込みし、
-    /// top 自体を削除する。最下層（index 0）は結合先が無いため error.OutOfRange。
+    /// 明示 index のレイヤーを直下のレイヤーへ結合する（Merge Down。TASK-79.2。TASK-94 Phase B で
+    /// selected 暗黙参照を排除）。選択中レイヤー(top)の内容を opacity 込みで下位レイヤー
+    /// (bottom=top-1)へ src-over 焼き込みし、top 自体を削除する。最下層（index 0）は結合先が
+    /// 無いため error.OutOfRange。
     ///
     /// 「下位への合成」と「上位の削除」という 2 つの構造変化は、libs/paint の atomic な
     /// `.layer_merge_down` Op（undo.zig, TASK-79.2）へ **1 push** で表現する（2 つの UndoCmd に
@@ -1263,10 +1267,9 @@ const App = struct {
     /// 再ラスタライズ結果」という不変条件を破る。codex レビュー指摘 2026-07-05）。
     /// `Document.mergeDown` が frame数1制限（9.1節MVP制限）込みで mutation + Op構築 + push を
     /// 完結する（below の焼き込み・top の削除を1 push でatomicに。plan 4.5/5.3節）。
-    fn doMergeDown(self: *App) !void {
+    fn doMergeDown(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        const top_idx = self.canvas.selected_layer;
-        try self.doc.mergeDown(self.gpa, top_idx);
+        try self.doc.mergeDown(self.gpa, idx);
     }
 
     // ── タイムライン（TASK-45.2）──────────────────────────────────
@@ -1510,9 +1513,11 @@ const App = struct {
 // ============================================================================
 
 /// canvas digest: サイズ / layer 数 / selected / composite crc / layer metadata。
+/// 1024B に入り切らない場合は打ち切り、top-level `trunc=1` を末尾に付与（TASK-94 Phase B P2）。
 fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var len: usize = 0;
+    var truncated = false;
     const head = std.fmt.bufPrint(buf[len..], "{d}x{d} layers={d} selected={d} comp={X:0>8}", .{
         CANVAS_W,
         CANVAS_H,
@@ -1532,20 +1537,29 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
             if (p != 0) nonzero += 1;
         }
         const crc = png.crc32(std.mem.sliceAsBytes(layer.pixels));
+        // id= を nested 先頭へ（TASK-94 Phase B review: agent が #id を発見する手段）。
+        // nested は expect contains 規約。1024B 予算のため id は短い u64 十進のみ追加。
+        const layer_id: u64 = if (app.doc.layerIdAt(idx)) |lid| @intFromEnum(lid) else 0;
         // kind=text の時だけ text= を nested 内へ追加する（TASK-79.5。既存 name= と同じ
         // 「nested は contains で見る」規約。text_content_input が ASCII 制御文字を弾くため
         // 改行等の混入は無い＝1行契約は保たれる）。
         const part = if (layer.kind == .text)
-            std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d},name={s},kind=text,text={s}}}", .{
-                idx, layer.visible, layer.opacity, crc, nonzero, layer.name(), layer.text_params.text(),
-            }) catch break
+            std.fmt.bufPrint(buf[len..], " l{d}{{id={d},v={},op={d},crc={X:0>8},nz={d},name={s},kind=text,text={s}}}", .{
+                idx, layer_id, layer.visible, layer.opacity, crc, nonzero, layer.name(), layer.text_params.text(),
+            }) catch {
+                truncated = true;
+                break;
+            }
         else
-            std.fmt.bufPrint(buf[len..], " l{d}{{v={},op={d},crc={X:0>8},nz={d},name={s},kind=raster}}", .{
-                idx, layer.visible, layer.opacity, crc, nonzero, layer.name(),
-            }) catch break;
+            std.fmt.bufPrint(buf[len..], " l{d}{{id={d},v={},op={d},crc={X:0>8},nz={d},name={s},kind=raster}}", .{
+                idx, layer_id, layer.visible, layer.opacity, crc, nonzero, layer.name(),
+            }) catch {
+                truncated = true;
+                break;
+            };
         len += part.len;
     }
-    return buf[0..len];
+    return actions.finishDigestWithTrunc(buf, len, truncated);
 }
 
 /// canvas snapshot: visible layer を合成したフラット透明 PNG。
@@ -1669,14 +1683,16 @@ fn historySnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
 //   redo                cmd_exec.redoOne(.local_agent)  no*   で per-actor revert 化。UI の Cmd+Z は userUndo/userRedo）
 //   clear               doClear                 yes   EditingBlocked
 //   add_layer           doAddLayer              yes   EditingBlocked / allocator error
-//   delete_layer        doDeleteLayer           yes   EditingBlocked / LastLayer
-//   select_layer        doSelectLayer           no    EditingBlocked / OutOfRange
-//   set_layer_visible   doSetLayerVisible       yes*  EditingBlocked / OutOfRange
-//   set_layer_opacity   doSetLayerOpacity       yes*  EditingBlocked / OutOfRange
-//   move_layer          doMoveLayer             yes   EditingBlocked / OutOfRange
-//   duplicate_layer     doDuplicateLayer        yes   EditingBlocked / allocator error（TASK-79.2）
-//   merge_down          doMergeDown             yes   EditingBlocked / OutOfRange / LastLayer（TASK-79.2。
+//   delete_layer        doDeleteLayer(idx)      yes   EditingBlocked / LastLayer / UnknownLayerId（TASK-94: args=`#<id>`|idx）
+//   select_layer        doSelectLayer           no    EditingBlocked / OutOfRange / UnknownLayerId（.local_only）
+//   set_layer_visible   doSetLayerVisible       yes*  EditingBlocked / OutOfRange / UnknownLayerId
+//   set_layer_opacity   doSetLayerOpacity       yes*  EditingBlocked / OutOfRange / UnknownLayerId
+//   move_layer          doMoveLayer(idx,δ)      yes   EditingBlocked / OutOfRange / UnknownLayerId（args=`#<id> ±1`）
+//   duplicate_layer     doDuplicateLayer(idx)   yes   EditingBlocked / allocator error / UnknownLayerId（TASK-79.2）
+//   merge_down          doMergeDown(idx)        yes   EditingBlocked / OutOfRange / LastLayer / UnknownLayerId（TASK-79.2。
 //                                                      atomic `.layer_merge_down` 1 entry。2 push ではない）
+//   ※ layer 構造 op は canRevertByHandle=false → noteUndo せず wire 上 undoable=false（62.3.5 MVP）
+//   ※ add/delete/visible/opacity/move/duplicate/merge_down は .relay、select_layer は .local_only（TASK-94 B）
 //   set_color           doSetColorHex           no    （guard 無し。常に成功）
 //   set_tool            setActiveKind           no    （guard 無し。既存 UI と同じ「無反応」を許容）
 //   stroke              activeTool().onEvent 直接 yes  EditingBlocked / UnsupportedTool / parse系
@@ -1743,64 +1759,96 @@ fn actionClear(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8
 }
 
 fn actionAddLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
     try actions.parseNoArgs(args);
-    try actionApp(ctx).doAddLayer();
-    return "ok";
+    const id = try actionApp(ctx).doAddLayer();
+    return std.fmt.bufPrint(buf, "ok id=#{d}", .{id}) catch return error.ArgsTooLong;
+}
+
+/// LayerRef → 現在の index。stale id は `unknown_layer_id`、範囲外 index は `index_out_of_range`。
+/// `require_id_during_netsync=true`（.relay layer op）かつ netsync 中の bare index は `id_required`。
+fn resolveLayerRef(app: *App, ref: actions.LayerRef, require_id_during_netsync: bool) !usize {
+    if (require_id_during_netsync and actions.layerRefRejectDuringNetsync(ref, platform.netsyncActive())) {
+        platform.setActionErrorDetail("id_required", "use #<id> from digest canvas during netsync");
+        return error.IdRequired;
+    }
+    switch (ref) {
+        .id => |raw| {
+            const id: core.LayerId = @enumFromInt(raw);
+            return app.doc.layerIndexOf(id) orelse {
+                platform.setActionErrorDetail("unknown_layer_id", "layer was deleted or never existed");
+                return error.UnknownLayerId;
+            };
+        },
+        .index => |idx| {
+            if (idx >= app.doc.layers.items.len) {
+                platform.setActionErrorDetail("index_out_of_range", "use add_layer or 0..N-1");
+                return error.OutOfRange;
+            }
+            return idx;
+        },
+    }
 }
 
 fn actionDeleteLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
-    try actions.parseNoArgs(args);
-    try actionApp(ctx).doDeleteLayer();
+    const app = actionApp(ctx);
+    const ref = try actions.parseLayerRef(args);
+    const idx = try resolveLayerRef(app, ref, true);
+    try app.doDeleteLayer(idx);
     return "ok";
 }
 
 fn actionSelectLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
-    const idx = try actions.parseUsize(args);
-    actionApp(ctx).doSelectLayer(idx) catch |err| {
-        // structured error（TASK-62.5.9）: 範囲外は自己回復ヒントを wire に載せる
-        if (err == error.OutOfRange) {
-            platform.setActionErrorDetail("index_out_of_range", "use add_layer or 0..N-1");
-        }
-        return err;
-    };
+    const app = actionApp(ctx);
+    const ref = try actions.parseLayerRef(args);
+    // select_layer は .local_only（per-peer view）なので netsync 中も bare index を許容。
+    const idx = try resolveLayerRef(app, ref, false);
+    try app.doSelectLayer(idx);
     return "ok";
 }
 
 fn actionSetLayerVisible(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
-    const p = try actions.parseIdxBool(args);
-    try actionApp(ctx).doSetLayerVisible(p.idx, p.on);
+    const app = actionApp(ctx);
+    const p = try actions.parseLayerRefBool(args);
+    const idx = try resolveLayerRef(app, p.ref, true);
+    try app.doSetLayerVisible(idx, p.on);
     return "ok";
 }
 
 fn actionSetLayerOpacity(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
-    const p = try actions.parseIdxU8(args);
-    try actionApp(ctx).doSetLayerOpacity(p.idx, p.value);
+    const app = actionApp(ctx);
+    const p = try actions.parseLayerRefU8(args);
+    const idx = try resolveLayerRef(app, p.ref, true);
+    try app.doSetLayerOpacity(idx, p.value);
     return "ok";
 }
 
 fn actionMoveLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
-    const delta = try actions.parseMoveDelta(args);
-    try actionApp(ctx).doMoveLayer(delta);
+    const app = actionApp(ctx);
+    const p = try actions.parseLayerRefDelta(args);
+    const idx = try resolveLayerRef(app, p.ref, true);
+    try app.doMoveLayer(idx, p.delta);
     return "ok";
 }
 
 fn actionDuplicateLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
-    try actions.parseNoArgs(args);
-    try actionApp(ctx).doDuplicateLayer();
-    return "ok";
+    const app = actionApp(ctx);
+    const ref = try actions.parseLayerRef(args);
+    const idx = try resolveLayerRef(app, ref, true);
+    const id = try app.doDuplicateLayer(idx);
+    return std.fmt.bufPrint(buf, "ok id=#{d}", .{id}) catch return error.ArgsTooLong;
 }
 
 fn actionMergeDown(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
-    try actions.parseNoArgs(args);
-    try actionApp(ctx).doMergeDown();
+    const app = actionApp(ctx);
+    const ref = try actions.parseLayerRef(args);
+    const idx = try resolveLayerRef(app, ref, true);
+    try app.doMergeDown(idx);
     return "ok";
 }
 
@@ -2070,7 +2118,11 @@ fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf:
                 break :blk 0;
             };
             if (pushes == 1) {
-                if (app.doc.undo.topHandle()) |h| app.cmd_exec.noteUndo(h);
+                // 62.3.5 revert は `.paint` のみ（canRevertByHandle）。構造 layer op は push しても
+                // adapter 逆適用不能 → noteUndo せず undoable=false（TASK-94 Phase B MVP）。
+                if (app.doc.undo.topHandle()) |h| {
+                    if (app.doc.canRevertByHandle(h)) app.cmd_exec.noteUndo(h);
+                }
                 app.last_seen_handle = app.doc.undo.next_handle; // 記録される push（§2b の追従点）
             } else if (pushes >= 2) {
                 std.debug.print("pixie: action '{s}' が {d} 回 undo.push（1 command = 1 Op が崩れるため noteUndo しない。62.5.4 申し送り）\n", .{ name, pushes });
@@ -2084,12 +2136,17 @@ fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf:
 /// registerAction 用の記録 wrapper を comptime 生成する（§5a）。executor 経由で実ハンドラを
 /// dispatch し `actor=.local_agent` で記録する。copilot の `begin_tx` で開いた transaction には
 /// `openTransactionFor` で自動参加する。`policy=.no_record` は undo/redo 用（dispatch のみ）。
+/// layer 系は executeAction 前に index→`#<id>` へ正規化する（TASK-94 Phase B。記録・solo
+/// dispatch 経路の args を id 形式に統一。netsync `.relay` は act.run を迂回するため、relay
+/// 呼び出し側は canonical args を渡すこと＝stroke の recordedStroke と同型）。
 fn recordedAction(comptime name: []const u8, comptime policy: platform.command.RecordPolicy) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
     return &struct {
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
+            var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+            const exec_args = try canonicalizeLayerArgs(app, name, args, &canon_buf);
             const seq_before = app.cmd_log.next_seq;
-            const res = try app.cmd_exec.executeAction(name, args, .{
+            const res = try app.cmd_exec.executeAction(name, exec_args, .{
                 .actor = .local_agent,
                 .transaction = app.cmd_exec.openTransactionFor(.local_agent),
                 .record_policy = policy,
@@ -2098,6 +2155,106 @@ fn recordedAction(comptime name: []const u8, comptime policy: platform.command.R
             return res.output;
         }
     }.run;
+}
+
+/// layer 系 action の args を `#<id>` 形式へ正規化する（非 layer / add_layer はそのまま返す）。
+/// solo: 空 args の delete/duplicate/merge_down と bare delta の move_layer は selected の id を付与。
+/// netsync 中の .relay 対象（select_layer 以外）: 暗黙 selected / bare index の補完・変換を禁止し
+/// `id_required`（peer ごとの selected 補完で diverge するため。TASK-94 Phase B P1）。
+fn canonicalizeLayerArgs(app: *App, comptime name: []const u8, args: []const u8, buf: []u8) ![]const u8 {
+    const is_layer = comptime (std.mem.eql(u8, name, "select_layer") or
+        std.mem.eql(u8, name, "set_layer_visible") or
+        std.mem.eql(u8, name, "set_layer_opacity") or
+        std.mem.eql(u8, name, "delete_layer") or
+        std.mem.eql(u8, name, "duplicate_layer") or
+        std.mem.eql(u8, name, "merge_down") or
+        std.mem.eql(u8, name, "move_layer"));
+    if (!is_layer) return args;
+
+    // select_layer は .local_only なので netsync 中も index→id 補完を許容。relay 系は禁止。
+    const can_fill = (comptime std.mem.eql(u8, name, "select_layer")) or actions.allowLayerCanonFill(platform.netsyncActive());
+    const forbid_fill = !can_fill;
+
+    if (comptime std.mem.eql(u8, name, "select_layer")) {
+        const ref = try actions.parseLayerRef(args);
+        const id = try layerRefToId(app, ref, false);
+        return actions.formatLayerId(buf, id) catch return error.ArgsTooLong;
+    }
+    if (comptime std.mem.eql(u8, name, "set_layer_visible")) {
+        const p = try actions.parseLayerRefBool(args);
+        const id = try layerRefToId(app, p.ref, forbid_fill);
+        return actions.formatLayerIdBool(buf, id, p.on) catch return error.ArgsTooLong;
+    }
+    if (comptime std.mem.eql(u8, name, "set_layer_opacity")) {
+        const p = try actions.parseLayerRefU8(args);
+        const id = try layerRefToId(app, p.ref, forbid_fill);
+        return actions.formatLayerIdU8(buf, id, p.value) catch return error.ArgsTooLong;
+    }
+    if (comptime (std.mem.eql(u8, name, "delete_layer") or
+        std.mem.eql(u8, name, "duplicate_layer") or
+        std.mem.eql(u8, name, "merge_down")))
+    {
+        const trimmed = std.mem.trim(u8, args, " \t");
+        const id: u64 = if (trimmed.len == 0)
+            try selectedLayerIdRaw(app, forbid_fill)
+        else blk: {
+            const ref = try actions.parseLayerRef(args);
+            break :blk try layerRefToId(app, ref, forbid_fill);
+        };
+        return actions.formatLayerId(buf, id) catch return error.ArgsTooLong;
+    }
+    if (comptime std.mem.eql(u8, name, "move_layer")) {
+        // 旧形式 `<±1>` → selected id を前置。新形式 `ref ±1` はそのまま id 化。
+        const trimmed = std.mem.trim(u8, args, " \t");
+        var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const first = it.next() orelse return error.Empty;
+        if (it.next()) |second| {
+            if (it.next() != null) return error.TooManyTokens;
+            const ref = try actions.parseLayerRefToken(first);
+            const delta = std.fmt.parseInt(i32, second, 10) catch return error.InvalidNumber;
+            if (delta != 1 and delta != -1) return error.InvalidDelta;
+            const id = try layerRefToId(app, ref, forbid_fill);
+            return actions.formatLayerIdDelta(buf, id, delta) catch return error.ArgsTooLong;
+        } else {
+            const delta = std.fmt.parseInt(i32, first, 10) catch return error.InvalidNumber;
+            if (delta != 1 and delta != -1) return error.InvalidDelta;
+            const id = try selectedLayerIdRaw(app, forbid_fill);
+            return actions.formatLayerIdDelta(buf, id, delta) catch return error.ArgsTooLong;
+        }
+    }
+    return args;
+}
+
+fn rejectIdRequired() error{IdRequired} {
+    platform.setActionErrorDetail("id_required", "use #<id> from digest canvas during netsync");
+    return error.IdRequired;
+}
+
+fn selectedLayerIdRaw(app: *App, forbid_implicit: bool) !u64 {
+    if (forbid_implicit) return rejectIdRequired();
+    const idx = app.canvas.selected_layer;
+    const id = app.doc.layerIdAt(idx) orelse {
+        platform.setActionErrorDetail("index_out_of_range", "use add_layer or 0..N-1");
+        return error.OutOfRange;
+    };
+    return @intFromEnum(id);
+}
+
+fn layerRefToId(app: *App, ref: actions.LayerRef, forbid_index: bool) !u64 {
+    switch (ref) {
+        .id => |raw| {
+            // 既に id 形式ならそのまま（存在確認は handler 側。stale は適用時 REJECT）。
+            return raw;
+        },
+        .index => |idx| {
+            if (forbid_index) return rejectIdRequired();
+            const id = app.doc.layerIdAt(idx) orelse {
+                platform.setActionErrorDetail("index_out_of_range", "use add_layer or 0..N-1");
+                return error.OutOfRange;
+            };
+            return @intFromEnum(id);
+        },
+    }
 }
 
 /// `stroke` 専用の記録 wrapper（§5c'）: 入力 args を parse → 実効パラメータ解決（明示 k=v >
@@ -2135,14 +2292,16 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own }); // 制御コマンド（§4b。executor 非経由）
     platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own });
     platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record) });
-    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record) });
-    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record) });
-    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = recordedAction("select_layer", .record) });
-    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = recordedAction("set_layer_visible", .record) });
-    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = recordedAction("set_layer_opacity", .record) });
-    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = recordedAction("move_layer", .record) });
-    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = recordedAction("duplicate_layer", .record) });
-    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record) });
+    // TASK-94 Phase B: layer 構造 op は handle 参照化済みのため .relay 昇格。
+    // select_layer のみ .local_only（selection は per-peer view。relay すると選択を奪い合う）。
+    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = recordedAction("select_layer", .record), .network_policy = .local_only });
+    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = recordedAction("set_layer_visible", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = recordedAction("set_layer_opacity", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = recordedAction("move_layer", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = recordedAction("duplicate_layer", .record), .network_policy = .relay });
+    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record), .network_policy = .relay });
     platform.registerAction(.{ .name = "frame", .ctx = app, .run = recordedAction("frame", .record) });
     platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = recordedAction("set_onion", .record) });
     platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record), .network_policy = .relay });
@@ -2435,10 +2594,10 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32) void {
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.label("Layers");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) app.doAddLayer() catch {};
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) app.doDeleteLayer() catch {};
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) app.doMoveLayer(1) catch {};
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) app.doMoveLayer(-1) catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) _ = app.doAddLayer() catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) app.doDeleteLayer(app.canvas.selected_layer) catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) app.doMoveLayer(app.canvas.selected_layer, 1) catch {};
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) app.doMoveLayer(app.canvas.selected_layer, -1) catch {};
     ctx.endBox();
 
     var rev = app.canvas.layers.items.len;
@@ -3362,18 +3521,19 @@ pub fn main(init: std.process.Init) !void {
                 };
                 const ctx_menu_result = ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
                 if (ctx_menu_result.selected) |sel| {
+                    const sel_idx = app.canvas.selected_layer;
                     switch (sel) {
-                        0 => app.doAddLayer() catch {},
+                        0 => _ = app.doAddLayer() catch {},
                         1 => app.doAddTextLayer() catch {},
-                        2 => app.doDeleteLayer() catch {},
-                        3 => app.doMoveLayer(1) catch {},
-                        4 => app.doMoveLayer(-1) catch {},
-                        5 => app.doToggleLayerVisible(app.canvas.selected_layer),
-                        6 => app.doDuplicateLayer() catch {},
-                        7 => app.doMergeDown() catch {},
-                        8 => app.beginRenameLayer(app.canvas.selected_layer),
-                        9 => app.beginTextEdit(app.canvas.selected_layer),
-                        10 => app.doRasterizeLayer(app.canvas.selected_layer) catch {},
+                        2 => app.doDeleteLayer(sel_idx) catch {},
+                        3 => app.doMoveLayer(sel_idx, 1) catch {},
+                        4 => app.doMoveLayer(sel_idx, -1) catch {},
+                        5 => app.doToggleLayerVisible(sel_idx),
+                        6 => _ = app.doDuplicateLayer(sel_idx) catch {},
+                        7 => app.doMergeDown(sel_idx) catch {},
+                        8 => app.beginRenameLayer(sel_idx),
+                        9 => app.beginTextEdit(sel_idx),
+                        10 => app.doRasterizeLayer(sel_idx) catch {},
                         else => {},
                     }
                 }

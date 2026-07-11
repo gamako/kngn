@@ -31,6 +31,12 @@ pub const ParseError = error{
     ValueOutOfRange,
 };
 
+/// layer 参照（TASK-94 Phase B）: `#<id>`（安定 handle）または bare 数値（index・後方互換）。
+pub const LayerRef = union(enum) {
+    id: u64,
+    index: usize,
+};
+
 fn tokenize(args: []const u8) std.mem.TokenIterator(u8, .any) {
     return std.mem.tokenizeAny(u8, args, " \t");
 }
@@ -153,6 +159,104 @@ pub fn parseMoveDelta(args: []const u8) ParseError!i32 {
     if (v != 1 and v != -1) return error.InvalidDelta;
     try expectExhausted(&it);
     return v;
+}
+
+/// 単一トークンの layer 参照: `#<id>` → `.id` / bare 数値 → `.index`（TASK-94 Phase B）。
+pub fn parseLayerRefToken(tok: []const u8) ParseError!LayerRef {
+    if (tok.len == 0) return error.Empty;
+    if (tok[0] == '#') {
+        if (tok.len < 2) return error.InvalidNumber;
+        const id = std.fmt.parseUnsigned(u64, tok[1..], 10) catch return error.InvalidNumber;
+        return .{ .id = id };
+    }
+    const idx = std.fmt.parseUnsigned(usize, tok, 10) catch return error.InvalidNumber;
+    return .{ .index = idx };
+}
+
+/// "`#<id>` | `<idx>`" の1トークン（select_layer / delete_layer / duplicate_layer / merge_down）。
+pub fn parseLayerRef(args: []const u8) ParseError!LayerRef {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const ref = try parseLayerRefToken(tok);
+    try expectExhausted(&it);
+    return ref;
+}
+
+pub const LayerRefBool = struct { ref: LayerRef, on: bool };
+
+/// "`#<id>`|`<idx>` <0|1>"（set_layer_visible）。
+pub fn parseLayerRefBool(args: []const u8) ParseError!LayerRefBool {
+    var it = tokenize(args);
+    const ref_tok = it.next() orelse return error.Empty;
+    const ref = try parseLayerRefToken(ref_tok);
+    const b_tok = it.next() orelse return error.Empty;
+    const on = if (std.mem.eql(u8, b_tok, "0"))
+        false
+    else if (std.mem.eql(u8, b_tok, "1"))
+        true
+    else
+        return error.UnknownBool;
+    try expectExhausted(&it);
+    return .{ .ref = ref, .on = on };
+}
+
+pub const LayerRefU8 = struct { ref: LayerRef, value: u8 };
+
+/// "`#<id>`|`<idx>` <0-255>"（set_layer_opacity）。
+pub fn parseLayerRefU8(args: []const u8) ParseError!LayerRefU8 {
+    var it = tokenize(args);
+    const ref_tok = it.next() orelse return error.Empty;
+    const ref = try parseLayerRefToken(ref_tok);
+    const v_tok = it.next() orelse return error.Empty;
+    const value = std.fmt.parseUnsigned(u8, v_tok, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return .{ .ref = ref, .value = value };
+}
+
+pub const LayerRefDelta = struct { ref: LayerRef, delta: i32 };
+
+/// "`#<id>`|`<idx>` <+1|-1>"（move_layer の canonical / 二形式）。
+pub fn parseLayerRefDelta(args: []const u8) ParseError!LayerRefDelta {
+    var it = tokenize(args);
+    const ref_tok = it.next() orelse return error.Empty;
+    const ref = try parseLayerRefToken(ref_tok);
+    const d_tok = it.next() orelse return error.Empty;
+    const delta = std.fmt.parseInt(i32, d_tok, 10) catch return error.InvalidNumber;
+    if (delta != 1 and delta != -1) return error.InvalidDelta;
+    try expectExhausted(&it);
+    return .{ .ref = ref, .delta = delta };
+}
+
+/// `#<id>` を buf に書く（canonicalize / UI helper 用）。
+pub fn formatLayerId(buf: []u8, id: u64) error{TooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "#{d}", .{id}) catch return error.TooLong;
+}
+
+/// `#<id> <0|1>`。
+pub fn formatLayerIdBool(buf: []u8, id: u64, on: bool) error{TooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "#{d} {d}", .{ id, @as(u8, if (on) 1 else 0) }) catch return error.TooLong;
+}
+
+/// `#<id> <0-255>`。
+pub fn formatLayerIdU8(buf: []u8, id: u64, value: u8) error{TooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "#{d} {d}", .{ id, value }) catch return error.TooLong;
+}
+
+/// `#<id> <+1|-1>`。
+pub fn formatLayerIdDelta(buf: []u8, id: u64, delta: i32) error{TooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "#{d} {d}", .{ id, delta }) catch return error.TooLong;
+}
+
+/// netsync 中の .relay layer op は `#<id>` 必須（bare index / 暗黙 selected は誤ターゲット）。
+/// solo では false（従来どおり index 許容）。純関数なので単体テスト可能。
+pub fn layerRefRejectDuringNetsync(ref: LayerRef, netsync_active: bool) bool {
+    return netsync_active and ref == .index;
+}
+
+/// canonicalize が暗黙 selected / bare index を #id に補完・変換してよいか。
+/// netsync 中は禁止（peer ごとに selected が違うと diverge。TASK-94 Phase B P1）。
+pub fn allowLayerCanonFill(netsync_active: bool) bool {
+    return !netsync_active;
 }
 
 pub const Point = struct { x: i32, y: i32 };
@@ -348,6 +452,135 @@ test "parseMoveDelta: +1/-1 のみ許容" {
     try testing.expectEqual(@as(i32, -1), try parseMoveDelta("-1"));
     try testing.expectError(error.InvalidDelta, parseMoveDelta("2"));
     try testing.expectError(error.InvalidDelta, parseMoveDelta("0"));
+}
+
+test "parseLayerRef: #<id> と bare index の二形式 / 不正トークン" {
+    try testing.expectEqual(LayerRef{ .id = 1 }, try parseLayerRef("#1"));
+    try testing.expectEqual(LayerRef{ .id = 42 }, try parseLayerRef("  #42  "));
+    try testing.expectEqual(LayerRef{ .index = 0 }, try parseLayerRef("0"));
+    try testing.expectEqual(LayerRef{ .index = 3 }, try parseLayerRef("3"));
+    try testing.expectError(error.Empty, parseLayerRef(""));
+    try testing.expectError(error.InvalidNumber, parseLayerRef("#"));
+    try testing.expectError(error.InvalidNumber, parseLayerRef("#abc"));
+    try testing.expectError(error.InvalidNumber, parseLayerRef("abc"));
+    try testing.expectError(error.TooManyTokens, parseLayerRef("#1 2"));
+}
+
+test "parseLayerRefBool / parseLayerRefU8 / parseLayerRefDelta" {
+    const vb = try parseLayerRefBool("#2 1");
+    try testing.expectEqual(LayerRef{ .id = 2 }, vb.ref);
+    try testing.expect(vb.on);
+    const ib = try parseLayerRefBool("0 0");
+    try testing.expectEqual(LayerRef{ .index = 0 }, ib.ref);
+    try testing.expect(!ib.on);
+    try testing.expectError(error.UnknownBool, parseLayerRefBool("#1 true"));
+
+    const vu = try parseLayerRefU8("#3 128");
+    try testing.expectEqual(LayerRef{ .id = 3 }, vu.ref);
+    try testing.expectEqual(@as(u8, 128), vu.value);
+    try testing.expectError(error.InvalidNumber, parseLayerRefU8("1 999"));
+
+    const vd = try parseLayerRefDelta("#4 -1");
+    try testing.expectEqual(LayerRef{ .id = 4 }, vd.ref);
+    try testing.expectEqual(@as(i32, -1), vd.delta);
+    const id = try parseLayerRefDelta("1 1");
+    try testing.expectEqual(LayerRef{ .index = 1 }, id.ref);
+    try testing.expectEqual(@as(i32, 1), id.delta);
+    try testing.expectError(error.InvalidDelta, parseLayerRefDelta("#1 2"));
+    try testing.expectError(error.Empty, parseLayerRefDelta("#1"));
+}
+
+test "formatLayerId*: round-trip with parsers" {
+    var buf: [64]u8 = undefined;
+    const a = try formatLayerId(&buf, 7);
+    try testing.expectEqualStrings("#7", a);
+    try testing.expectEqual(LayerRef{ .id = 7 }, try parseLayerRef(a));
+
+    const b = try formatLayerIdBool(&buf, 2, true);
+    try testing.expectEqualStrings("#2 1", b);
+    const pb = try parseLayerRefBool(b);
+    try testing.expectEqual(LayerRef{ .id = 2 }, pb.ref);
+    try testing.expect(pb.on);
+
+    const c = try formatLayerIdU8(&buf, 3, 128);
+    try testing.expectEqualStrings("#3 128", c);
+    const d = try formatLayerIdDelta(&buf, 1, -1);
+    try testing.expectEqualStrings("#1 -1", d);
+}
+
+test "layerRefRejectDuringNetsync: netsync 中は bare index のみ拒否 / id は許容 / solo は両方許容" {
+    try testing.expect(!layerRefRejectDuringNetsync(.{ .id = 1 }, false));
+    try testing.expect(!layerRefRejectDuringNetsync(.{ .index = 0 }, false));
+    try testing.expect(!layerRefRejectDuringNetsync(.{ .id = 1 }, true));
+    try testing.expect(layerRefRejectDuringNetsync(.{ .index = 0 }, true));
+    try testing.expect(layerRefRejectDuringNetsync(.{ .index = 3 }, true));
+}
+
+test "allowLayerCanonFill: netsync 中は暗黙 selected / index→id 補完禁止" {
+    try testing.expect(allowLayerCanonFill(false)); // solo: 補完可
+    try testing.expect(!allowLayerCanonFill(true)); // netsync: 補完禁止
+}
+
+/// digest 末尾の trunc マーカー（canvasDigest と共有。`" trunc=1"` = 8 bytes）。
+pub const DIGEST_TRUNC_MARKER = " trunc=1";
+
+/// `truncated=false` なら `buf[0..written]` をそのまま返す（bit 一致）。
+/// `truncated=true` なら末尾に ` trunc=1` を書き、必要なら written を削って領域を確保する。
+pub fn finishDigestWithTrunc(buf: []u8, written: usize, truncated: bool) []const u8 {
+    if (!truncated) return buf[0..written];
+    const marker = DIGEST_TRUNC_MARKER;
+    var n = written;
+    if (n > buf.len) n = buf.len;
+    if (n + marker.len > buf.len) {
+        if (buf.len < marker.len) return buf[0..0];
+        n = buf.len - marker.len;
+    }
+    @memcpy(buf[n..][0..marker.len], marker);
+    return buf[0 .. n + marker.len];
+}
+
+/// テスト用: 空白区切りエントリを buf に詰め、入り切らなければ trunc=1。
+pub fn packDigestEntries(buf: []u8, prefix: []const u8, entries: []const []const u8) []const u8 {
+    var len: usize = 0;
+    if (prefix.len > 0) {
+        if (prefix.len > buf.len) return finishDigestWithTrunc(buf, 0, true);
+        @memcpy(buf[0..prefix.len], prefix);
+        len = prefix.len;
+    }
+    var truncated = false;
+    for (entries) |e| {
+        const part = std.fmt.bufPrint(buf[len..], " {s}", .{e}) catch {
+            truncated = true;
+            break;
+        };
+        len += part.len;
+    }
+    return finishDigestWithTrunc(buf, len, truncated);
+}
+
+test "finishDigestWithTrunc: 非 trunc は bit 一致 / trunc 時は末尾に trunc=1" {
+    var buf: [64]u8 = undefined;
+    const base = "32x32 layers=1 sel=none";
+    @memcpy(buf[0..base.len], base);
+    try testing.expectEqualStrings(base, finishDigestWithTrunc(&buf, base.len, false));
+
+    var full: [20]u8 = undefined;
+    @memset(&full, 'x');
+    const out = finishDigestWithTrunc(&full, full.len, true);
+    try testing.expect(std.mem.endsWith(u8, out, DIGEST_TRUNC_MARKER));
+    try testing.expectEqual(@as(usize, full.len), out.len);
+}
+
+test "packDigestEntries: 少エントリは trunc 無し / 多エントリは trunc=1" {
+    var small_buf: [128]u8 = undefined;
+    const few = packDigestEntries(&small_buf, "head", &[_][]const u8{ "l0{id=1,name=a}", "l1{id=2,name=b}" });
+    try testing.expect(std.mem.startsWith(u8, few, "head "));
+    try testing.expect(std.mem.indexOf(u8, few, "trunc=1") == null);
+
+    var tiny: [40]u8 = undefined;
+    const long_name = "l0{id=1,v=true,op=255,crc=DEADBEEF,nz=0,name=VeryLongLayerNameForTrunc,kind=raster}";
+    const many = packDigestEntries(&tiny, "head", &[_][]const u8{ long_name, long_name, long_name });
+    try testing.expect(std.mem.endsWith(u8, many, DIGEST_TRUNC_MARKER));
 }
 
 test "parseStrokePoints: 有効列 / 奇数個 / 空 / 上限超過" {
