@@ -143,6 +143,67 @@ pub fn parseRender(args: []const u8) ParseError!RenderArgs {
 }
 
 // ============================================================================
+// TASK-91: Song/Chain/Phrase action パーサ（std のみ・固定容量・fail-fast）
+// ============================================================================
+
+/// `phrase_capture <idx>` / `song_len <n>` / `song_goto <row>` 用: u8 1 トークン。
+pub fn parseU8(args: []const u8) ParseError!u8 {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const value = std.fmt.parseUnsigned(u8, tok, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return value;
+}
+
+pub const ChainSetArgs = struct {
+    chain_idx: u8,
+    /// phrase index 列（1..16）
+    phrases: [16]u8 = undefined,
+    len: u8 = 0,
+};
+
+/// `chain_set <chain_idx> <phrase_idx...>`（phrase 1..16 個）。
+pub fn parseChainSet(args: []const u8) ParseError!ChainSetArgs {
+    var it = tokenize(args);
+    const c_tok = it.next() orelse return error.Empty;
+    const chain_idx = std.fmt.parseUnsigned(u8, c_tok, 10) catch return error.InvalidNumber;
+    var phrases: [16]u8 = undefined;
+    var len: u8 = 0;
+    while (it.next()) |tok| {
+        if (len >= 16) return error.TooManyTokens;
+        phrases[len] = std.fmt.parseUnsigned(u8, tok, 10) catch return error.InvalidNumber;
+        len += 1;
+    }
+    if (len == 0) return error.Empty;
+    return .{ .chain_idx = chain_idx, .phrases = phrases, .len = len };
+}
+
+pub const SongRowArgs = struct {
+    row_idx: u8,
+    kick: u8,
+    hat: u8,
+    clap: u8,
+    bass: u8,
+};
+
+/// `song_row <row_idx> <kick_chain> <hat_chain> <clap_chain> <bass_chain>`。
+pub fn parseSongRow(args: []const u8) ParseError!SongRowArgs {
+    var it = tokenize(args);
+    const r = it.next() orelse return error.Empty;
+    const k = it.next() orelse return error.Empty;
+    const h = it.next() orelse return error.Empty;
+    const c = it.next() orelse return error.Empty;
+    const b = it.next() orelse return error.Empty;
+    const row_idx = std.fmt.parseUnsigned(u8, r, 10) catch return error.InvalidNumber;
+    const kick = std.fmt.parseUnsigned(u8, k, 10) catch return error.InvalidNumber;
+    const hat = std.fmt.parseUnsigned(u8, h, 10) catch return error.InvalidNumber;
+    const clap = std.fmt.parseUnsigned(u8, c, 10) catch return error.InvalidNumber;
+    const bass = std.fmt.parseUnsigned(u8, b, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return .{ .row_idx = row_idx, .kick = kick, .hat = hat, .clap = clap, .bass = bass };
+}
+
+// ============================================================================
 // TASK-93: mini-notation パーサ + 評価器（std のみ・固定容量・alloc なし・決定的）
 //
 // 文法（空白区切りトークン列）:
@@ -788,4 +849,59 @@ test "notation: 64 tokens exact capacity" {
     const r = evalNotation(ast, 0, 0);
     // 64 等分 → 各 i/64 *16 を round → 全 16 step が OR で立つ
     try testing.expectEqual(@as(u16, 0xFFFF), r.on);
+}
+
+// ============================================================================
+// TASK-91 parsers
+// ============================================================================
+
+test "parseU8: 有効値 / 空 / 不正 / 余剰" {
+    try testing.expectEqual(@as(u8, 0), try parseU8("0"));
+    try testing.expectEqual(@as(u8, 63), try parseU8("63"));
+    try testing.expectError(error.Empty, parseU8(""));
+    try testing.expectError(error.InvalidNumber, parseU8("abc"));
+    try testing.expectError(error.InvalidNumber, parseU8("256"));
+    try testing.expectError(error.TooManyTokens, parseU8("1 2"));
+}
+
+test "parseChainSet: 1..16 phrases / fail-fast" {
+    const r = try parseChainSet("0 1 2 3");
+    try testing.expectEqual(@as(u8, 0), r.chain_idx);
+    try testing.expectEqual(@as(u8, 3), r.len);
+    try testing.expectEqual(@as(u8, 1), r.phrases[0]);
+    try testing.expectEqual(@as(u8, 2), r.phrases[1]);
+    try testing.expectEqual(@as(u8, 3), r.phrases[2]);
+
+    const one = try parseChainSet("5 7");
+    try testing.expectEqual(@as(u8, 5), one.chain_idx);
+    try testing.expectEqual(@as(u8, 1), one.len);
+    try testing.expectEqual(@as(u8, 7), one.phrases[0]);
+
+    // 16 phrases exact
+    const full = try parseChainSet("1 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15");
+    try testing.expectEqual(@as(u8, 16), full.len);
+
+    try testing.expectError(error.Empty, parseChainSet(""));
+    try testing.expectError(error.Empty, parseChainSet("3")); // chain only, no phrases
+    try testing.expectError(error.InvalidNumber, parseChainSet("0 x"));
+    try testing.expectError(error.TooManyTokens, parseChainSet("0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16"));
+}
+
+test "parseSongRow: 5 tokens / fail-fast" {
+    const r = try parseSongRow("0 1 2 3 4");
+    try testing.expectEqual(@as(u8, 0), r.row_idx);
+    try testing.expectEqual(@as(u8, 1), r.kick);
+    try testing.expectEqual(@as(u8, 2), r.hat);
+    try testing.expectEqual(@as(u8, 3), r.clap);
+    try testing.expectEqual(@as(u8, 4), r.bass);
+    try testing.expectError(error.Empty, parseSongRow("0 1 2 3"));
+    try testing.expectError(error.TooManyTokens, parseSongRow("0 1 2 3 4 5"));
+    try testing.expectError(error.InvalidNumber, parseSongRow("0 a 2 3 4"));
+}
+
+test "parseBool01 / parseU8 for song_loop / song_play / song_len / song_goto" {
+    try testing.expectEqual(true, try parseBool01("1"));
+    try testing.expectEqual(false, try parseBool01("0"));
+    try testing.expectEqual(@as(u8, 8), try parseU8("8"));
+    try testing.expectEqual(@as(u8, 0), try parseU8("0"));
 }

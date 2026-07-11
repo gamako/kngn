@@ -26,8 +26,11 @@ const PatternCommand = patchmod.PatternCommand;
 const PatchState = patchmod.PatchState;
 const actions = @import("actions.zig");
 const pattern_io = @import("pattern_io.zig");
+const project_io = @import("project_io.zig");
 const wav = @import("wav.zig");
 const seedmod = @import("seed.zig");
+const SongData = patchmod.SongData;
+const Chain = patchmod.Chain;
 
 // ウィンドウ。上部=GUI コントロール + DrumMachine/BassMachine、下部=可視化帯。
 const WIN_W = 1120;
@@ -79,6 +82,8 @@ const App = struct {
     notation_counter: u32 = 0,
     /// bar 境界前の連続 `action pattern` 用。直前に publish した quantize cmd（後続の base）。
     last_quantized_cmd: ?PatternCommand = null,
+    /// TASK-91: SongData 編集用（RT へは rev++ → song_db.publish）。
+    song: SongData = .{},
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -563,14 +568,17 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         st.master_drive,    st.pre_clip_peak,   st.clip_rate,
         st.ambient_move,    st.ambient_register, st.ambient_root_cv,
     }) catch return buf[0..a.len];
-    // Ph5 pattern（masks は hex。bass_deg 配列は snapshot 側）。
+    // Ph5 pattern（masks は hex。bass_deg 配列は snapshot 側）+ TASK-91 song 要約。
+    // 末尾は 1 つの `}` で JSON を閉じる（1024B 注意）。
     const c = std.fmt.bufPrint(buf[a.len + b.len ..], "\"patterns\":{{\"kick\":\"{x:0>4}\",\"hat\":\"{x:0>4}\"," ++
         "\"clap\":\"{x:0>4}\",\"bass_on\":\"{x:0>4}\",\"bass_accent\":\"{x:0>4}\",\"bass_slide\":\"{x:0>4}\"}}," ++
-        "\"lock\":[{d},{d},{d},{d}],\"evolve\":{d},\"rev\":{d},\"mut\":{d},\"seed\":{d}}}", .{
+        "\"lock\":[{d},{d},{d},{d}],\"evolve\":{d},\"rev\":{d},\"mut\":{d},\"seed\":{d}," ++
+        "\"song\":{{\"playing\":{d},\"row\":{d},\"bar\":{d},\"rows\":{d}}}}}", .{
         st.kick_on,                 st.hat_on,                  st.clap_on,
         st.bass_on,                 st.bass_accent,             st.bass_slide,
         b01(st.lock[0]),            b01(st.lock[1]),            b01(st.lock[2]),            b01(st.lock[3]),
         b01(st.evolve),             st.pattern_rev,             st.mutation_count,          st.base_seed,
+        b01(st.song_playing),       st.song_row,                st.song_bar_in_row,         st.song_rows,
     }) catch return buf[0 .. a.len + b.len];
     return buf[0 .. a.len + b.len + c.len];
 }
@@ -579,7 +587,7 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
     const app: *App = @ptrCast(@alignCast(ctx));
     const p = app.patch orelse return allocator.dupe(u8, "{\"playing\":false}");
     const st = p.snapshotState();
-    // digest（1024B 以内）に bass_deg 配列を足した詳細スナップショット（固定 buf に組み立て→dupe）。
+    // digest（1024B 以内）に bass_deg 配列 + song 詳細を足した詳細スナップショット（固定 buf に組み立て→dupe）。
     var dbuf: [1024]u8 = undefined;
     const d = modularDigest(ctx, &dbuf);
     const body = if (d.len > 0 and d[d.len - 1] == '}') d[0 .. d.len - 1] else d; // 末尾 '}' を外す
@@ -594,7 +602,40 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
         const piece = std.fmt.bufPrint(out[off..], "{s}{d}", .{ sep, dg }) catch break;
         off += piece.len;
     }
-    const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch "";
+    // TASK-91: song 詳細（rows 要約 + chain lens + loop）
+    {
+        const piece = std.fmt.bufPrint(out[off..], "],\"song_detail\":{{\"loop\":{d},\"rev\":{d},\"rows\":[", .{
+            b01(st.song_loop),
+            st.song_rev,
+        }) catch {
+            const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch "";
+            off += tail.len;
+            return allocator.dupe(u8, out[0..off]);
+        };
+        off += piece.len;
+    }
+    const song = p.song;
+    const n_rows: usize = @min(@as(usize, st.song_rows), 8); // 要約: 先頭 8 row
+    var ri: usize = 0;
+    while (ri < n_rows) : (ri += 1) {
+        const row = song.rows[ri];
+        const sep: []const u8 = if (ri == 0) "" else ",";
+        const piece = std.fmt.bufPrint(out[off..], "{s}[{d},{d},{d},{d}]", .{
+            sep, row.kick, row.hat, row.clap, row.bass,
+        }) catch break;
+        off += piece.len;
+    }
+    {
+        const piece = std.fmt.bufPrint(out[off..], "],\"chain_lens\":[", .{}) catch "";
+        off += piece.len;
+    }
+    var ci: usize = 0;
+    while (ci < 8) : (ci += 1) {
+        const sep: []const u8 = if (ci == 0) "" else ",";
+        const piece = std.fmt.bufPrint(out[off..], "{s}{d}", .{ sep, song.chains[ci].len }) catch break;
+        off += piece.len;
+    }
+    const tail = std.fmt.bufPrint(out[off..], "]}}}}", .{}) catch "";
     off += tail.len;
     return allocator.dupe(u8, out[0..off]);
 }
@@ -810,6 +851,257 @@ fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     const n = try actions.parseU64(args);
     app.notation_seed = n;
     patch.requestSeed(n);
+    return "ok";
+}
+
+// ============================================================================
+// TASK-91: Song/Chain/Phrase actions（recorded = seed+recipe 決定性に整合）
+// 編集は app.song を書き換え → rev++ → song_db.publish（宣言的全置換粒度 = SongData 全体）。
+// ============================================================================
+
+fn publishSong(app: *App, patch: *LofiPatch) void {
+    app.song.rev +%= 1;
+    patch.controls.song_db.publish(app.song);
+}
+
+/// `phrase_capture <idx>`: 現在パターンを drum pool[idx]×3 + bass pool[idx] へ取り込み。
+fn actionPhraseCapture(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const idx = actions.parseU8(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: phrase_capture <idx 0..31>");
+        return error.BadArgs;
+    };
+    // bass pool 上限 32 に合わせる（4 track 同 idx のため）
+    if (idx >= patchmod.MAX_BASS_PHRASES) {
+        platform.setActionErrorDetail("index_out_of_range", "phrase idx must be 0..31");
+        return error.IndexOutOfRange;
+    }
+    const st = patch.snapshotState();
+    app.song.phrases_kick[idx] = st.kick_on;
+    app.song.phrases_hat[idx] = st.hat_on;
+    app.song.phrases_clap[idx] = st.clap_on;
+    app.song.phrases_bass[idx] = .{
+        .on = st.bass_on,
+        .accent = st.bass_accent,
+        .slide = st.bass_slide,
+        .deg = st.bass_deg,
+    };
+    publishSong(app, patch);
+    return "ok";
+}
+
+/// `chain_set <chain_idx> <phrase_idx...>`（1..16）。
+fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const parsed = actions.parseChainSet(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: chain_set <chain_idx> <phrase_idx...>");
+        return error.BadArgs;
+    };
+    if (parsed.chain_idx >= patchmod.MAX_CHAINS) {
+        platform.setActionErrorDetail("index_out_of_range", "chain_idx must be 0..31");
+        return error.IndexOutOfRange;
+    }
+    var i: u8 = 0;
+    while (i < parsed.len) : (i += 1) {
+        // drum pool 64 / bass 32。chain は共有なので 0..63 を許容（bass 解決時 OOB は RT で現行維持）
+        if (parsed.phrases[i] >= patchmod.MAX_DRUM_PHRASES) {
+            platform.setActionErrorDetail("index_out_of_range", "phrase_idx must be 0..63");
+            return error.IndexOutOfRange;
+        }
+    }
+    var ch: Chain = .{};
+    ch.len = parsed.len;
+    @memcpy(ch.entries[0..parsed.len], parsed.phrases[0..parsed.len]);
+    app.song.chains[parsed.chain_idx] = ch;
+    publishSong(app, patch);
+    return "ok";
+}
+
+/// `song_row <row_idx> <kick_chain> <hat_chain> <clap_chain> <bass_chain>`。
+fn actionSongRow(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const parsed = actions.parseSongRow(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: song_row <row> <kick> <hat> <clap> <bass>");
+        return error.BadArgs;
+    };
+    if (parsed.row_idx >= patchmod.MAX_SONG_ROWS) {
+        platform.setActionErrorDetail("index_out_of_range", "row_idx must be 0..63");
+        return error.IndexOutOfRange;
+    }
+    if (parsed.kick >= patchmod.MAX_CHAINS or parsed.hat >= patchmod.MAX_CHAINS or
+        parsed.clap >= patchmod.MAX_CHAINS or parsed.bass >= patchmod.MAX_CHAINS)
+    {
+        platform.setActionErrorDetail("index_out_of_range", "chain index must be 0..31");
+        return error.IndexOutOfRange;
+    }
+    app.song.rows[parsed.row_idx] = .{
+        .kick = parsed.kick,
+        .hat = parsed.hat,
+        .clap = parsed.clap,
+        .bass = parsed.bass,
+    };
+    publishSong(app, patch);
+    return "ok";
+}
+
+/// `song_len <n>`（0..64）。
+fn actionSongLen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const n = actions.parseU8(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: song_len <0..64>");
+        return error.BadArgs;
+    };
+    if (n > patchmod.MAX_SONG_ROWS) {
+        platform.setActionErrorDetail("index_out_of_range", "song_len must be 0..64");
+        return error.IndexOutOfRange;
+    }
+    app.song.row_count = n;
+    publishSong(app, patch);
+    return "ok";
+}
+
+/// `song_loop <0|1>`。
+fn actionSongLoop(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const on = actions.parseBool01(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: song_loop <0|1>");
+        return error.BadArgs;
+    };
+    app.song.loop = on;
+    publishSong(app, patch);
+    return "ok";
+}
+
+/// `song_play <0|1>`。開始時は RT が position リセット（applyControls の rising edge）。
+fn actionSongPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const on = actions.parseBool01(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: song_play <0|1>");
+        return error.BadArgs;
+    };
+    // SongData 最新を載せてから play（編集後の unpublish 漏れ防止）
+    publishSong(app, patch);
+    patch.controls.song_playing.store(@intFromBool(on), .release);
+    return "ok";
+}
+
+/// `song_goto <row>`。
+fn actionSongGoto(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const row = actions.parseU8(args) catch {
+        platform.setActionErrorDetail("bad_args", "usage: song_goto <row 0..63>");
+        return error.BadArgs;
+    };
+    if (row >= patchmod.MAX_SONG_ROWS) {
+        platform.setActionErrorDetail("index_out_of_range", "row must be 0..63");
+        return error.IndexOutOfRange;
+    }
+    patch.controls.song_goto_row.store(row, .release);
+    _ = patch.controls.song_goto_gen.fetchAdd(1, .release);
+    return "ok";
+}
+
+fn songToPayload(s: SongData) project_io.SongPayload {
+    var out: project_io.SongPayload = .{};
+    out.phrases_kick = s.phrases_kick;
+    out.phrases_hat = s.phrases_hat;
+    out.phrases_clap = s.phrases_clap;
+    for (s.phrases_bass, 0..) |bp, i| {
+        out.phrases_bass[i] = .{ .on = bp.on, .accent = bp.accent, .slide = bp.slide, .deg = bp.deg };
+    }
+    for (s.chains, 0..) |ch, i| {
+        out.chains[i] = .{ .entries = ch.entries, .len = ch.len };
+    }
+    for (s.rows, 0..) |row, i| {
+        out.rows[i] = .{ .kick = row.kick, .hat = row.hat, .clap = row.clap, .bass = row.bass };
+    }
+    out.row_count = s.row_count;
+    out.loop = s.loop;
+    return out;
+}
+
+fn payloadToSong(rev: u32, p: project_io.SongPayload) SongData {
+    var out: SongData = .{};
+    out.rev = rev;
+    out.phrases_kick = p.phrases_kick;
+    out.phrases_hat = p.phrases_hat;
+    out.phrases_clap = p.phrases_clap;
+    for (p.phrases_bass, 0..) |bp, i| {
+        out.phrases_bass[i] = .{ .on = bp.on, .accent = bp.accent, .slide = bp.slide, .deg = bp.deg };
+    }
+    for (p.chains, 0..) |ch, i| {
+        out.chains[i] = .{ .entries = ch.entries, .len = ch.len };
+    }
+    for (p.rows, 0..) |row, i| {
+        out.rows[i] = .{ .kick = row.kick, .hat = row.hat, .clap = row.clap, .bass = row.bass };
+    }
+    out.row_count = p.row_count;
+    out.loop = p.loop;
+    return out;
+}
+
+/// `save_project <path>`: MPRJ（params+pattern+seed+song）。local_only・非記録。
+fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const path = try actions.parsePath(args);
+    const cmd = stateToCommand(patch.snapshotState());
+    const st = patch.snapshotState();
+    const seed = project_io.SeedPayload{
+        .base_seed = st.base_seed,
+        .notation_seed = app.notation_seed,
+        .notation_counter = app.notation_counter,
+    };
+    try project_io.save(
+        app.io,
+        path,
+        Params,
+        app.params,
+        patternToPayload(cmd),
+        seed,
+        songToPayload(app.song),
+        std.heap.c_allocator,
+    );
+    return "ok";
+}
+
+/// `load_project <path>`: SongData publish + params publish + seed 復元。local_only・非記録。
+fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const path = try actions.parsePath(args);
+    const loaded = project_io.load(app.io, std.heap.c_allocator, path, Params) catch |err| {
+        if (err == error.FileNotFound) {
+            platform.setActionErrorDetail("file_not_found", "check path or use save_project first");
+        }
+        return err;
+    };
+    app.params = loaded.params;
+    publishControls(patch, app.params);
+    app.pattern_rev += 1;
+    const cmd = payloadToPatternCommand(app.pattern_rev, loaded.pattern);
+    patch.controls.pattern_db.publish(cmd);
+    app.song = payloadToSong(app.song.rev +% 1, loaded.song);
+    patch.controls.song_db.publish(app.song);
+    app.notation_seed = loaded.seed.notation_seed;
+    app.notation_counter = loaded.seed.notation_counter;
+    patch.requestSeed(loaded.seed.base_seed);
     return "ok";
 }
 
@@ -1058,6 +1350,14 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "load_pattern", .run = actionLoadPattern },
     .{ .name = "seed", .run = actionSeed },
     .{ .name = "pattern", .run = actionPattern },
+    // TASK-91: Song/Chain/Phrase（recorded）
+    .{ .name = "phrase_capture", .run = actionPhraseCapture },
+    .{ .name = "chain_set", .run = actionChainSet },
+    .{ .name = "song_row", .run = actionSongRow },
+    .{ .name = "song_len", .run = actionSongLen },
+    .{ .name = "song_loop", .run = actionSongLoop },
+    .{ .name = "song_play", .run = actionSongPlay },
+    .{ .name = "song_goto", .run = actionSongGoto },
 };
 
 fn dispatchModularAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -1094,11 +1394,22 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed") });
     // TASK-93: mini-notation。レシピには記法の生テキストを記録（replay 時 counter 順で再評価→決定的）。
     platform.registerAction(.{ .name = "pattern", .ctx = app, .run = recordedAction("pattern") });
+    // TASK-91: Song/Chain/Phrase（recorded。seed+recipe 決定性に整合）
+    platform.registerAction(.{ .name = "phrase_capture", .ctx = app, .run = recordedAction("phrase_capture") });
+    platform.registerAction(.{ .name = "chain_set", .ctx = app, .run = recordedAction("chain_set") });
+    platform.registerAction(.{ .name = "song_row", .ctx = app, .run = recordedAction("song_row") });
+    platform.registerAction(.{ .name = "song_len", .ctx = app, .run = recordedAction("song_len") });
+    platform.registerAction(.{ .name = "song_loop", .ctx = app, .run = recordedAction("song_loop") });
+    platform.registerAction(.{ .name = "song_play", .ctx = app, .run = recordedAction("song_play") });
+    platform.registerAction(.{ .name = "song_goto", .ctx = app, .run = recordedAction("song_goto") });
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
     // render（TASK-86）: offline WAV 書き出し。recipe_save と同じ local_only・CommandLog 非記録。
     platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = .local_only });
+    // TASK-91: プロジェクト直列化（save_pattern 同型・local_only・非記録）
+    platform.registerAction(.{ .name = "save_project", .ctx = app, .run = actionSaveProject, .network_policy = .local_only });
+    platform.registerAction(.{ .name = "load_project", .ctx = app, .run = actionLoadProject, .network_policy = .local_only });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

@@ -393,6 +393,12 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
   - **pattern 所有モデル**: RT(StepSeq) が grid/303 pattern の authoritative。GUI は毎フレーム snapshot を読んで
     grid 表示し、編集時のみ `Controls.pattern_db`(Mailbox) へ publish（RT が revision 変化時のみ取り込み、
     その後また per-bar 変異）。RT 経路に alloc/lock/IO/panic を足さない。
+  - **Song/Chain/Phrase 3層**（TASK-91 / M8 式）: Phrase=1 bar×1 track の番号参照 pool、Chain=Phrase index 列、
+    Song=トラック毎 Chain 列。`SongData` を `Controls.song_db`(Mailbox) で publish。Song position は RT
+    authoritative。bar 境界の適用順は **seed → song → pending_bar_cmd → mutate**（93 の bar-latch と共存。
+    切替 bar は mutate スキップ = evolve 変異は切替時リセット）。action:
+    `phrase_capture` / `chain_set` / `song_row` / `song_len` / `song_loop` / `song_play` / `song_goto`
+    （recorded）+ `save_project` / `load_project`（MPRJ serde・local_only 非記録。pattern_io の MDLP は不変）。
   - **mini-notation action**（TASK-93）: `action pattern <track> <notation>`（track ∈ kick|hat|clap|bass）で
     Tidal 風サブセット記法を 16-step mask へ評価し、該当 track を**宣言的全置換**する。文法: 空白区切り /
     `x`=hit / `~`=休符 / `0..9`=bass 度数（hit+deg）/ `[a b]`=スロット内サブ分割（ネスト深さ 2）/
@@ -404,7 +410,7 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
     **recipe replay は `notation_counter` を 0 から再評価**する（`action recipe_replay` 冒頭でリセット）。
     現在パターンの読み出しは既存 `digest modular` の pattern masks hex で充足（読み書き対称。新 probe なし）。
   - harness `modular` probe が生成状態を公開（digest=bpm/density/steps/active/gains/muted/ph4/ambient/pattern masks
-    hex/lock/evolve/rev/mut を 1024B 以内、snapshot=さらに bass_deg 配列）。
+    hex/lock/evolve/rev/mut/seed/song={playing,row,bar,rows} を 1024B 以内、snapshot=さらに bass_deg + song_detail）。
   - **`action render <path> <seconds>`**（TASK-86）: offline の別 `LofiPatch` インスタンスで master 出力を
     PCM16 stereo WAV にストリーミング書き出し（1..=600 秒。ヘッダ先書き + chunk=4800）。live の seed +
     公開済み編集状態（params / snapshot pattern）を複製し、同一条件 2 回で bit 一致。RT 再生経路には

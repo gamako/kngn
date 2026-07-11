@@ -111,6 +111,62 @@ pub const PatternCommand = struct {
     }
 };
 
+// ----------------------------------------------------------------------------
+// TASK-91: M8 式 Song/Chain/Phrase 3層（番号参照・全て固定容量）
+// ----------------------------------------------------------------------------
+pub const MAX_DRUM_PHRASES: usize = 64;
+pub const MAX_BASS_PHRASES: usize = 32;
+pub const MAX_CHAINS: usize = 32;
+pub const MAX_CHAIN_LEN: usize = 16;
+pub const MAX_SONG_ROWS: usize = 64;
+/// song_last_phrase の「未適用」番兵（初回 bar は必ず切替扱い）。
+pub const PHRASE_NONE: u8 = 0xFF;
+
+/// bass 1 bar 分の Phrase（on/accent/slide + degree 列）。
+pub const BassPhrase = struct {
+    on: u16 = 0,
+    accent: u16 = 0,
+    slide: u16 = 0,
+    deg: [16]i8 = [_]i8{0} ** 16,
+};
+
+/// Phrase index 列（最大 16）。len=0 は空 chain（その track は現行パターン維持）。
+pub const Chain = struct {
+    entries: [MAX_CHAIN_LEN]u8 = [_]u8{0} ** MAX_CHAIN_LEN,
+    len: u8 = 0,
+};
+
+/// Song 1 行 = トラック毎の chain index。
+pub const SongRow = struct {
+    kick: u8 = 0,
+    hat: u8 = 0,
+    clap: u8 = 0,
+    bass: u8 = 0,
+};
+
+/// Song 全体（phrase pool + chain pool + rows）。Mailbox で GUI/action → RT へ publish。
+///
+/// drum phrase pool: plan の `phrases_drum: [64]u16` を **track 別 3 本**に展開した実装。
+/// 番号空間 0..63 は共有（chain の phrase index は全 drum track で同じ語彙 = 番号参照の再利用）。
+/// 同一 index でも track ごとに別 mask を持てるので `phrase_capture <idx>` が 4 track を同 idx に書ける。
+/// 同じ mask を複数 track で再利用したい場合は capture 時に同じ値を 3 本へ書けばよい。
+pub const SongData = struct {
+    rev: u32 = 0,
+    /// plan 名 `phrases_drum` の実体（kick/hat/clap 列。layout は project_io で固定）。
+    phrases_kick: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
+    phrases_hat: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
+    phrases_clap: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
+    phrases_bass: [MAX_BASS_PHRASES]BassPhrase = [_]BassPhrase{.{}} ** MAX_BASS_PHRASES,
+    chains: [MAX_CHAINS]Chain = [_]Chain{.{}} ** MAX_CHAINS,
+    rows: [MAX_SONG_ROWS]SongRow = [_]SongRow{.{}} ** MAX_SONG_ROWS,
+    row_count: u8 = 0,
+    loop: bool = false,
+
+    pub fn default() SongData {
+        return .{};
+    }
+};
+
 /// GUI(メインスレッド)→ Audio(RT) のリアルタイム操作。GUI は store/publish のみ、
 /// render() 冒頭の applyControls() が load→clamp/finite して各モジュール field へ適用する。
 pub const Controls = struct {
@@ -139,6 +195,13 @@ pub const Controls = struct {
     ambient_move: synth.AtomicF32,
     // Ph5: grid/303 pattern（整合的に差し替えるため Mailbox(triple-buffer)。GUI=producer / RT=consumer）
     pattern_db: synth.Mailbox(PatternCommand),
+    // TASK-91: SongData（固定長・triple-buffer。pattern_db と同型）
+    song_db: synth.Mailbox(SongData),
+    // TASK-91: song 再生 on/off（0/1）。開始エッジで RT が position をリセット。
+    song_playing: std.atomic.Value(u32),
+    // TASK-91: song_goto。gen 変化で row を latch（0xFF_FF_FF_FF = 無効）。
+    song_goto_row: std.atomic.Value(u32),
+    song_goto_gen: std.atomic.Value(u64),
     // TASK-62.5.7: main→RT の pending seed（次 bar 境界で latch）。gen が変わったら pending を読む。
     pending_seed: std.atomic.Value(u64),
     pending_seed_gen: std.atomic.Value(u64),
@@ -167,6 +230,10 @@ pub const Controls = struct {
             .pad_mute = std.atomic.Value(u32).init(0),
             .ambient_move = synth.AtomicF32.init(AMBIENT_MOVE_DEFAULT),
             .pattern_db = synth.Mailbox(PatternCommand).init(PatternCommand.default()),
+            .song_db = synth.Mailbox(SongData).init(SongData.default()),
+            .song_playing = std.atomic.Value(u32).init(0),
+            .song_goto_row = std.atomic.Value(u32).init(0),
+            .song_goto_gen = std.atomic.Value(u64).init(0),
             .pending_seed = std.atomic.Value(u64).init(seedmod.DEFAULT_BASE_SEED),
             .pending_seed_gen = std.atomic.Value(u64).init(0),
         };
@@ -244,6 +311,13 @@ pub const PatchState = struct {
     base_seed: u64,
     // TASK-93: bar 境界待ちの quantize pattern があるか（pending_bar_cmd != null。torn 可）
     bar_pending: bool,
+    // TASK-91: Song 再生位置（RT authoritative・torn 可）
+    song_playing: bool,
+    song_row: u8,
+    song_bar_in_row: u16,
+    song_rows: u8,
+    song_loop: bool,
+    song_rev: u32,
 };
 
 pub const LofiPatch = struct {
@@ -302,6 +376,16 @@ pub const LofiPatch = struct {
     applied_seed_gen: u64,
     // TASK-93: quantize_bar=true の PatternCommand を次 bar 境界まで退避（固定長・alloc なし）
     pending_bar_cmd: ?PatternCommand,
+    // TASK-91: Song（RT 所有。applyControls で rev 変化時 latch / position は bar 境界で進行）
+    song: SongData,
+    song_playing: bool,
+    song_row: u8,
+    song_bar_in_row: u16,
+    /// 直前 bar の各 track phrase idx（PHRASE_NONE=空 chain / 未適用。切替検出用）
+    song_last_phrase: [4]u8,
+    applied_song_goto_gen: u64,
+    /// play/goto 直後の初回 bar を bar 境界を待たず強制 apply する（plan: 初回 bar は必ず切替扱い）
+    song_force_apply: bool,
 
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) !*LofiPatch {
         const self = try allocator.create(LofiPatch);
@@ -366,6 +450,13 @@ pub const LofiPatch = struct {
             .base_seed = base,
             .applied_seed_gen = 0,
             .pending_bar_cmd = null,
+            .song = SongData.default(),
+            .song_playing = false,
+            .song_row = 0,
+            .song_bar_in_row = 0,
+            .song_last_phrase = .{ PHRASE_NONE, PHRASE_NONE, PHRASE_NONE, PHRASE_NONE },
+            .applied_song_goto_gen = 0,
+            .song_force_apply = false,
         };
 
         self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 40, .max_ports = 64 });
@@ -484,6 +575,12 @@ pub const LofiPatch = struct {
     /// RT callback から呼ぶ（alloc/lock/IO/panic なし）。interleaved 出力へ書く。
     pub fn render(self: *LofiPatch, buf: []f32, frames: u32, channels: u32) void {
         self.applyControls();
+        // TASK-91: play/goto 直後の初回 bar を processBlock 前に 1 回だけ apply（bar 境界待ちをしない）。
+        // 固定長・alloc なし。force 消費後は通常の maybeEvolve bar 境界経路のみ。
+        if (self.song_force_apply and self.song_playing) {
+            self.song_force_apply = false;
+            _ = self.applySongBar();
+        }
         self.graph.processBlock(buf, frames, channels);
         self.maybeEvolve(); // 小節境界を跨いだら 1 小節 1 回だけ前景を変異
     }
@@ -504,6 +601,32 @@ pub const LofiPatch = struct {
                 // 即反映（GUI / 既存 action）。pending 中の bar 予約は破棄（明示の即時編集が勝つ）。
                 self.pending_bar_cmd = null;
                 self.applyPatternCommand(cmd.*);
+            }
+        }
+        // TASK-91: SongData latch（rev 変化時のみ固定長コピー）
+        const sd = c.song_db.acquire();
+        if (sd.rev != self.song.rev) {
+            self.song = sd.*;
+        }
+        // TASK-91: song_playing 開始エッジで position リセット + 初回 bar 強制 apply
+        const want_play = c.song_playing.load(.acquire) != 0;
+        if (want_play and !self.song_playing) {
+            self.song_row = 0;
+            self.song_bar_in_row = 0;
+            self.song_last_phrase = .{ PHRASE_NONE, PHRASE_NONE, PHRASE_NONE, PHRASE_NONE };
+            self.song_force_apply = true;
+        }
+        self.song_playing = want_play;
+        // TASK-91: song_goto（gen 変化で row を即 latch + 強制 apply）
+        const ggen = c.song_goto_gen.load(.acquire);
+        if (ggen != self.applied_song_goto_gen) {
+            self.applied_song_goto_gen = ggen;
+            const gr = c.song_goto_row.load(.acquire);
+            if (gr < MAX_SONG_ROWS) {
+                self.song_row = @intCast(gr);
+                self.song_bar_in_row = 0;
+                self.song_last_phrase = .{ PHRASE_NONE, PHRASE_NONE, PHRASE_NONE, PHRASE_NONE };
+                if (self.song_playing) self.song_force_apply = true;
             }
         }
         // scalar controls
@@ -544,10 +667,12 @@ pub const LofiPatch = struct {
 
     /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら、
     /// 1) pending seed があれば PRNG/生成状態を再初期化（TASK-62.5.7）
-    /// 2) quantize_bar pending pattern を反映（TASK-93。seed の後なので seed→pattern 列で pattern が生きる）
-    /// 3) どちらも無ければ 1 小節 1 回だけ前景パターンを変異
+    /// 2) Song 進行で phrase 切替（TASK-91。seed の後・pending の前）
+    /// 3) quantize_bar pending pattern を反映（TASK-93。song の後なので明示編集がその bar は勝つ）
+    /// 4) いずれも無ければ 1 小節 1 回だけ前景パターンを変異
+    /// 適用順: seed → song → pending_bar_cmd → mutate
     /// block 数ではなく musical bar をキーにする（決定性は固定 seed + 固定 render チャンクで担保）。
-    /// ホットパス: bar 境界での固定長 struct コピー + bool 分岐のみ（alloc/lock なし）。
+    /// ホットパス: bar 境界での index 計算 + 固定長 PatternCommand 組み立て 1 回（alloc/lock なし）。
     fn maybeEvolve(self: *LofiPatch) void {
         if (!self.clock.started) return;
         const bar = self.clock.tick_index / STEPS_PER_BAR;
@@ -563,7 +688,13 @@ pub const LofiPatch = struct {
             applied_seed = true;
         }
 
-        // 2) seed の後に pending pattern（seed→pattern 操作列で pattern が残る）。
+        // 2) Song 進行（phrase 切替。独立ステップ = pending を占有しない）
+        var applied_song = false;
+        if (self.song_playing) {
+            applied_song = self.applySongBar();
+        }
+
+        // 3) seed/song の後に pending pattern（ユーザー明示編集がその bar は後勝ち）
         var applied_pending = false;
         if (self.pending_bar_cmd) |cmd| {
             self.applyPatternCommand(cmd);
@@ -571,9 +702,142 @@ pub const LofiPatch = struct {
             applied_pending = true;
         }
 
-        // seed / pattern を適用した bar は evolve 変異しない。
-        if (applied_seed or applied_pending) return;
+        // seed / song 切替 / pending を適用した bar は evolve 変異しない。
+        if (applied_seed or applied_song or applied_pending) return;
         self.mutatePattern();
+    }
+
+    /// 現在の song position の phrase を解決し、変化した track だけ PatternCommand を組み立てて適用。
+    /// 適用後に position を 1 bar 進める。戻り値 = 切替を適用したか（mutate スキップ用）。
+    /// ホットパス: 固定長コピー + index 計算のみ（alloc/lock なし）。
+    fn applySongBar(self: *LofiPatch) bool {
+        // song_len=0 で play → 即 stop
+        if (self.song.row_count == 0) {
+            self.song_playing = false;
+            self.controls.song_playing.store(0, .release);
+            return false;
+        }
+        if (self.song_row >= self.song.row_count) {
+            if (self.song.loop) {
+                self.song_row = 0;
+                self.song_bar_in_row = 0;
+            } else {
+                self.song_playing = false;
+                self.controls.song_playing.store(0, .release);
+                return false;
+            }
+        }
+
+        const row = self.song.rows[self.song_row];
+        const phrases = self.resolveRowPhrases(row, self.song_bar_in_row);
+        const row_len = self.rowLength(row);
+
+        // phrase idx が直前 bar から変化した track がある bar のみ PatternCommand を組み立て
+        var any_change = false;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            if (phrases[i] != PHRASE_NONE and phrases[i] != self.song_last_phrase[i]) {
+                any_change = true;
+                break;
+            }
+        }
+
+        var applied = false;
+        if (any_change) {
+            // 現行 pattern を base に、変化 track だけ pool から上書き（空 chain = 現行維持）
+            var cmd: PatternCommand = .{
+                .rev = self.applied_rev,
+                .evolve = self.evolve,
+                .kick = .{ .on = self.kick_seq.on_mask, .lock = self.lock[0] },
+                .hat = .{ .on = self.hat_seq.on_mask, .lock = self.lock[1] },
+                .clap = .{ .on = self.clap_seq.on_mask, .lock = self.lock[2] },
+                .bass = .{
+                    .on = self.bass_seq.on_mask,
+                    .accent = self.bass_seq.accent_mask,
+                    .slide = self.bass_seq.slide_mask,
+                    .deg = self.bass_seq.pitch_deg,
+                    .lock = self.lock[3],
+                },
+            };
+            if (phrases[0] != PHRASE_NONE and phrases[0] != self.song_last_phrase[0]) {
+                if (phrases[0] < MAX_DRUM_PHRASES) cmd.kick.on = self.song.phrases_kick[phrases[0]];
+            }
+            if (phrases[1] != PHRASE_NONE and phrases[1] != self.song_last_phrase[1]) {
+                if (phrases[1] < MAX_DRUM_PHRASES) cmd.hat.on = self.song.phrases_hat[phrases[1]];
+            }
+            if (phrases[2] != PHRASE_NONE and phrases[2] != self.song_last_phrase[2]) {
+                if (phrases[2] < MAX_DRUM_PHRASES) cmd.clap.on = self.song.phrases_clap[phrases[2]];
+            }
+            if (phrases[3] != PHRASE_NONE and phrases[3] != self.song_last_phrase[3]) {
+                if (phrases[3] < MAX_BASS_PHRASES) {
+                    const bp = self.song.phrases_bass[phrases[3]];
+                    cmd.bass.on = bp.on;
+                    cmd.bass.accent = bp.accent;
+                    cmd.bass.slide = bp.slide;
+                    cmd.bass.deg = bp.deg;
+                }
+            }
+            // 切替時は anchor も更新（evolve 復帰先が新 phrase になる = 確定方針）
+            self.applyPatternCommand(cmd);
+            applied = true;
+        }
+
+        // last_phrase を常に更新（空 chain → NONE 番兵。phrase0→空→phrase0 の再入場を切替扱いにする）
+        self.song_last_phrase = phrases;
+
+        // position を 1 bar 進める
+        if (row_len == 0) {
+            // 全 chain 空 → この row は 1 bar 扱いで次 row へ
+            self.advanceSongRow();
+        } else {
+            self.song_bar_in_row +%= 1;
+            if (self.song_bar_in_row >= row_len) {
+                self.song_bar_in_row = 0;
+                self.advanceSongRow();
+            }
+        }
+        return applied;
+    }
+
+    fn advanceSongRow(self: *LofiPatch) void {
+        const next = @as(u16, self.song_row) + 1;
+        if (next >= self.song.row_count) {
+            if (self.song.loop) {
+                self.song_row = 0;
+            } else {
+                // 最終 row の最終 bar を再生し終えた → stop（次回 applySongBar で playing=false）
+                self.song_row = self.song.row_count; // sentinel >= row_count
+            }
+        } else {
+            self.song_row = @intCast(next);
+        }
+    }
+
+    /// row 内 chain len の最大値（0 = 全空）。
+    fn rowLength(self: *const LofiPatch, row: SongRow) u16 {
+        var max_len: u16 = 0;
+        const idxs = [_]u8{ row.kick, row.hat, row.clap, row.bass };
+        for (idxs) |ci| {
+            if (ci < MAX_CHAINS) {
+                const clen: u16 = self.song.chains[ci].len;
+                if (clen > max_len) max_len = clen;
+            }
+        }
+        return max_len;
+    }
+
+    /// 各 track の phrase idx を解決。空 chain / OOB → PHRASE_NONE（現行維持）。
+    fn resolveRowPhrases(self: *const LofiPatch, row: SongRow, bar_in_row: u16) [4]u8 {
+        var out: [4]u8 = .{ PHRASE_NONE, PHRASE_NONE, PHRASE_NONE, PHRASE_NONE };
+        const chain_idxs = [_]u8{ row.kick, row.hat, row.clap, row.bass };
+        for (chain_idxs, 0..) |ci, t| {
+            if (ci >= MAX_CHAINS) continue;
+            const ch = self.song.chains[ci];
+            if (ch.len == 0) continue;
+            const entry_i = bar_in_row % ch.len;
+            out[t] = ch.entries[entry_i];
+        }
+        return out;
     }
 
     /// 生成状態を base seed 由来の初期状態へ戻す（RT・alloc/lock なし）。
@@ -844,6 +1108,12 @@ pub const LofiPatch = struct {
             .ambient_lfo = self.ambient_lfo.lfo.phase,
             .base_seed = self.base_seed,
             .bar_pending = self.pending_bar_cmd != null,
+            .song_playing = self.song_playing,
+            .song_row = self.song_row,
+            .song_bar_in_row = self.song_bar_in_row,
+            .song_rows = self.song.row_count,
+            .song_loop = self.song.loop,
+            .song_rev = self.song.rev,
         };
     }
 
@@ -1726,4 +1996,310 @@ test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
     try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
     try testing.expectEqual(@as(u16, 0xAAAA), patch.hat_seq.on_mask);
     try testing.expect(!patch.snapshotState().bar_pending);
+}
+
+// ============================================================================
+// TASK-91: Song/Chain/Phrase（bar 境界切替・evolve 共存・loop/stop・pending 後勝ち・決定性）
+// ============================================================================
+
+/// evolve OFF + 2 phrase chain で song を組み立てる共通ヘルパ。
+/// phrase 0/1 はどちらも**既定 KICK_ON と異なる**（初回 bar 適用を見逃さない）。
+fn setupSongTwoPhrase(patch: *LofiPatch, loop: bool) void {
+    // evolve を止めて変異ノイズを排除
+    var freeze = PatternCommand.default();
+    freeze.rev = 1;
+    freeze.evolve = false;
+    publishPattern(patch, freeze);
+
+    var song = SongData.default();
+    song.rev = 1;
+    // phrase 0/1 とも既定と異なる mask
+    song.phrases_kick[0] = 0x0F0F;
+    song.phrases_hat[0] = 0xF0F0;
+    song.phrases_clap[0] = 0x00FF;
+    song.phrases_bass[0] = .{ .on = 0x1111, .accent = 0x0001, .slide = 0, .deg = [_]i8{2} ** 16 };
+    song.phrases_kick[1] = 0x5555;
+    song.phrases_hat[1] = 0xAAAA;
+    song.phrases_clap[1] = 0x2222;
+    song.phrases_bass[1] = .{ .on = 0x8888, .accent = 0x0001, .slide = 0, .deg = [_]i8{1} ** 16 };
+    // chain 0 = [0, 1]
+    song.chains[0] = .{ .entries = .{ 0, 1 } ++ ([_]u8{0} ** 14), .len = 2 };
+    song.rows[0] = .{ .kick = 0, .hat = 0, .clap = 0, .bass = 0 };
+    song.row_count = 1;
+    song.loop = loop;
+    patch.controls.song_db.publish(song);
+}
+
+test "TASK-91: song play force-applies phrase on first bar (not default)" {
+    // P1-1: play 直後の bar 0 で phrase が適用される（既定 KICK_ON と異なる phrase 0）
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    setupSongTwoPhrase(patch, true);
+    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask); // play 前は既定
+    patch.controls.song_playing.store(1, .release);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+    // 1 ブロック render で force apply が走る（bar 境界を待たない）
+    patch.render(buf, chunk, 2);
+    try testing.expectEqual(@as(u16, 0x0F0F), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0xF0F0), patch.hat_seq.on_mask);
+    try testing.expect(patch.song_playing);
+    try testing.expect(!patch.song_force_apply); // 消費済み
+}
+
+test "TASK-91: song play switches phrase at bar boundary" {
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    setupSongTwoPhrase(patch, true);
+    patch.controls.song_playing.store(1, .release);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    var seen0 = false;
+    var seen1 = false;
+    var rendered: u64 = 0;
+    const limit: u64 = 48000 * 20;
+    while (rendered < limit) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+        const k = patch.kick_seq.on_mask;
+        if (k == 0x0F0F) seen0 = true;
+        if (k == 0x5555) seen1 = true;
+        if (seen0 and seen1) break;
+    }
+    try testing.expect(seen0);
+    try testing.expect(seen1);
+    try testing.expect(patch.snapshotState().song_playing);
+}
+
+test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
+    // P1-2: phrase0 → 空 chain → phrase0 で復帰 bar に再適用（間に evolve 変異を挟む）
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+
+    // evolve ON + 全 lock 解除で、空 chain bar 中に mutate が kick を変えうる
+    var evo = PatternCommand.default();
+    evo.rev = 1;
+    evo.evolve = true;
+    evo.kick.on = KICK_ON;
+    publishPattern(patch, evo);
+
+    var song = SongData.default();
+    song.rev = 1;
+    song.phrases_kick[0] = 0x0F0F; // 既定とも変異後とも区別しやすい
+    song.phrases_hat[0] = HAT_ON;
+    song.phrases_clap[0] = CLAP_ON;
+    song.phrases_bass[0] = .{ .on = BASS_ON, .accent = BASS_ACCENT, .slide = BASS_SLIDE, .deg = BASS_DEG };
+    // chain 0 = [phrase 0], chain 1 = 空
+    song.chains[0] = .{ .entries = .{0} ++ ([_]u8{0} ** 15), .len = 1 };
+    song.chains[1] = .{ .len = 0 }; // 空
+    // 3 row: phrase0 → 空 → phrase0（各 1 bar）
+    song.rows[0] = .{ .kick = 0, .hat = 0, .clap = 0, .bass = 0 };
+    song.rows[1] = .{ .kick = 1, .hat = 1, .clap = 1, .bass = 1 }; // 空 chain
+    song.rows[2] = .{ .kick = 0, .hat = 0, .clap = 0, .bass = 0 };
+    song.row_count = 3;
+    song.loop = false;
+    patch.controls.song_db.publish(song);
+    patch.controls.song_playing.store(1, .release);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    // force: phrase 0 適用
+    patch.render(buf, chunk, 2);
+    try testing.expectEqual(@as(u16, 0x0F0F), patch.kick_seq.on_mask);
+
+    // 空 chain row へ進むまで render（変異が kick を 0x0F0F から動かしうる）
+    var rendered: u64 = 0;
+    var saw_empty_row = false;
+    var saw_reapply = false;
+    while (rendered < 48000 * 30) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+        // 空 chain 中は last_phrase が NONE
+        if (patch.song_last_phrase[0] == PHRASE_NONE) {
+            saw_empty_row = true;
+            // 空 row 中に kick を強制改変して「間の変異」をシミュレート
+            if (patch.kick_seq.on_mask == 0x0F0F) {
+                patch.kick_seq.on_mask = 0x0001; // phrase 0 でも既定でもない
+            }
+        }
+        // 復帰 row で phrase 0 が再適用される
+        if (saw_empty_row and patch.kick_seq.on_mask == 0x0F0F and patch.song_last_phrase[0] == 0) {
+            saw_reapply = true;
+            break;
+        }
+        if (!patch.song_playing and saw_empty_row) break;
+    }
+    try testing.expect(saw_empty_row);
+    try testing.expect(saw_reapply);
+}
+
+test "TASK-91: switch bar skips mutate; non-switch bar mutates when evolve on" {
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+
+    // phrase 0 のみの 1 要素 chain → 毎 bar 同じ phrase（切替なし）+ evolve ON
+    var song = SongData.default();
+    song.rev = 1;
+    song.phrases_kick[0] = KICK_ON;
+    song.phrases_hat[0] = HAT_ON;
+    song.phrases_clap[0] = CLAP_ON;
+    song.phrases_bass[0] = .{ .on = BASS_ON, .accent = BASS_ACCENT, .slide = BASS_SLIDE, .deg = BASS_DEG };
+    song.chains[0] = .{ .entries = .{0} ++ ([_]u8{0} ** 15), .len = 1 };
+    song.rows[0] = .{ .kick = 0, .hat = 0, .clap = 0, .bass = 0 };
+    song.row_count = 1;
+    song.loop = true;
+    patch.controls.song_db.publish(song);
+    // evolve ON（default）のまま
+    patch.controls.song_playing.store(1, .release);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+    // 初回 bar は切替（last=NONE→0）で mutate スキップ。2 bar 目以降は phrase 不変 → mutate 可。
+    var rendered: u64 = 0;
+    while (rendered < 48000 * 12) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    // 非切替 bar が走っていれば mutation_count > 0
+    try testing.expect(patch.mutation_count > 0);
+
+    // 対比: 2 phrase 交互 + evolve ON → 切替 bar は毎 bar（phrase が毎 bar 変わる）で mutate 抑制
+    const patch2 = try LofiPatch.create(testing.allocator, sr);
+    defer patch2.destroy();
+    setupSongTwoPhrase(patch2, true);
+    // setup が evolve OFF にするので ON に戻す
+    var evo = PatternCommand.default();
+    evo.rev = 2;
+    evo.evolve = true;
+    publishPattern(patch2, evo);
+    patch2.controls.song_playing.store(1, .release);
+    rendered = 0;
+    while (rendered < 48000 * 8) : (rendered += chunk) {
+        patch2.render(buf, chunk, 2);
+    }
+    // 毎 bar 切替なので mutation は起きない（applied_song が毎 bar true）
+    try testing.expectEqual(@as(u32, 0), patch2.mutation_count);
+}
+
+test "TASK-91: song loop vs stop at end" {
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    // loop=false, row_count=1, chain len=2 → 2 bar で stop
+    const stop_p = try LofiPatch.create(testing.allocator, sr);
+    defer stop_p.destroy();
+    setupSongTwoPhrase(stop_p, false);
+    stop_p.controls.song_playing.store(1, .release);
+    var rendered: u64 = 0;
+    while (rendered < 48000 * 20) : (rendered += chunk) {
+        stop_p.render(buf, chunk, 2);
+        if (!stop_p.song_playing) break;
+    }
+    try testing.expect(!stop_p.song_playing);
+
+    // loop=true → 長く回しても playing のまま
+    const loop_p = try LofiPatch.create(testing.allocator, sr);
+    defer loop_p.destroy();
+    setupSongTwoPhrase(loop_p, true);
+    loop_p.controls.song_playing.store(1, .release);
+    rendered = 0;
+    while (rendered < 48000 * 12) : (rendered += chunk) {
+        loop_p.render(buf, chunk, 2);
+    }
+    try testing.expect(loop_p.song_playing);
+}
+
+test "TASK-91: pending_bar_cmd wins over song on same bar" {
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    setupSongTwoPhrase(patch, true);
+    patch.controls.song_playing.store(1, .release);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    // 1 bar 進めて song を走らせる
+    var rendered: u64 = 0;
+    while (rendered < 48000 * 2) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+
+    // quantize pending で kick を 0xFFFF に（song の後に適用される）
+    var pending = PatternCommand.default();
+    pending.rev = 10;
+    pending.evolve = false;
+    pending.quantize_bar = true;
+    pending.kick.on = 0xFFFF;
+    pending.hat.on = patch.hat_seq.on_mask;
+    pending.clap.on = patch.clap_seq.on_mask;
+    pending.bass = .{
+        .on = patch.bass_seq.on_mask,
+        .accent = patch.bass_seq.accent_mask,
+        .slide = patch.bass_seq.slide_mask,
+        .deg = patch.bass_seq.pitch_deg,
+    };
+    publishPattern(patch, pending);
+
+    // 次の bar 境界まで
+    rendered = 0;
+    while (rendered < 48000 * 4) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+        if (patch.kick_seq.on_mask == 0xFFFF) break;
+    }
+    try testing.expectEqual(@as(u16, 0xFFFF), patch.kick_seq.on_mask);
+}
+
+fn songRenderCrc(seed: u64, chunk: u32, target: u64) !u32 {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    patch.resetWithSeed(seed);
+    setupSongTwoPhrase(patch, true);
+    patch.controls.song_playing.store(1, .release);
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+    var crc = std.hash.Crc32.init();
+    var rendered: u64 = 0;
+    while (rendered < target) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+        crc.update(std.mem.sliceAsBytes(buf));
+    }
+    return crc.final();
+}
+
+test "TASK-91: song_playing is deterministic (same seed+song → bit identical)" {
+    const a = try songRenderCrc(42, 4800, 48000 * 8);
+    const b = try songRenderCrc(42, 4800, 48000 * 8);
+    try testing.expectEqual(a, b);
+}
+
+test "TASK-91: song_len=0 play stops immediately at bar boundary" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var song = SongData.default();
+    song.rev = 1;
+    song.row_count = 0;
+    patch.controls.song_db.publish(song);
+    patch.controls.song_playing.store(1, .release);
+
+    const buf = try testing.allocator.alloc(f32, 4800 * 2);
+    defer testing.allocator.free(buf);
+    // 1 bar 以上進めて applySongBar を踏ませる
+    var rendered: u64 = 0;
+    while (rendered < 48000 * 3) : (rendered += 4800) {
+        patch.render(buf, 4800, 2);
+    }
+    try testing.expect(!patch.song_playing);
 }

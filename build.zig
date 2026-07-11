@@ -1167,6 +1167,17 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
+    // apps/modular プロジェクト直列化（TASK-91 MPRJ）。std + serde + pattern_io.PatternPayload。
+    const modular_project_io_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/modular/project_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    modular_project_io_test_mod.addImport("serde", shared_modules.serde.mod);
+    const modular_project_io_test = b.addTest(.{ .root_module = modular_project_io_test_mod });
+    const run_modular_project_io_test = b.addRunArtifact(modular_project_io_test);
+    test_app_modular_step.dependOn(&run_modular_project_io_test.step);
+
     // apps/modular seed derive（TASK-62.5.7）。std のみ。
     const modular_seed_test = b.addTest(.{
         .root_module = b.createModule(.{
