@@ -202,33 +202,62 @@ pub const Gvar = struct {
         @memset(out_deltas[0..n_total], .{ .x = 0, .y = 0 });
 
         const gvd = (try self.glyphData(gid)) orelse return;
-        try applyGlyphVariationData(self, alloc, gvd, points, end_pts, n_outline, norm, out_deltas);
+        try applyGlyphVariationData(self, alloc, gvd, points, end_pts, n_outline, norm, out_deltas, true);
+    }
+
+    /// composite glyph の gvar を適用。点番号 = component index（仮想点）+ 末尾 phantom 4。
+    /// **IUP しない**（OpenType: inferred deltas は composite に適用しない。未参照 component のデルタは 0）。
+    /// out_deltas 長さ = component_count + 4。deltas[i] は component i の配置 offset への加算量。
+    pub fn applyComposite(
+        self: *const Gvar,
+        alloc: std.mem.Allocator,
+        gid: u16,
+        component_count: usize,
+        norm: []const f32,
+        out_deltas: []Vec2f,
+    ) Error!void {
+        const n_total = component_count + 4;
+        if (out_deltas.len < n_total) return error.InvalidFont;
+        if (norm.len < self.axis_count) return error.InvalidFont;
+        @memset(out_deltas[0..n_total], .{ .x = 0, .y = 0 });
+
+        const gvd = (try self.glyphData(gid)) orelse return;
+        // points/end_pts は IUP しないので空でよい
+        try applyGlyphVariationData(self, alloc, gvd, &.{}, &.{}, component_count, norm, out_deltas, false);
     }
 
     /// phantom 4 点の X デルタのみ復元（full outline 不要の metrics 経路）。
     /// advance_delta = phantom[1].x - phantom[0].x。
+    /// simple: n_points = outline 点数。composite: n_points = component_count（IUP 無し）。
     pub fn phantomAdvanceDelta(
         self: *const Gvar,
         alloc: std.mem.Allocator,
         gid: u16,
-        /// outline 点数（phantom の論理 index 基準）。空グリフは 0。
-        n_outline: usize,
-        /// outline 点座標（IUP に必要。n_outline==0 なら空で可）。
+        /// 非 phantom 点数（simple=outline 点 / composite=component 数）。
+        n_points: usize,
+        /// simple の outline 点座標（IUP 用）。composite は空で可。
         points: []const Vec2f,
         end_pts: []const u16,
         norm: []const f32,
+        /// true=simple（IUP 有り）、false=composite（IUP 無し）。
+        is_simple: bool,
     ) Error!f32 {
-        if (points.len != n_outline) return error.InvalidFont;
-        const n_total = n_outline + 4;
+        if (is_simple and points.len != n_points) return error.InvalidFont;
+        const n_total = n_points + 4;
         const deltas = try alloc.alloc(Vec2f, n_total);
         defer alloc.free(deltas);
-        try self.applySimple(alloc, gid, points, end_pts, norm, deltas);
+        if (is_simple) {
+            try self.applySimple(alloc, gid, points, end_pts, norm, deltas);
+        } else {
+            try self.applyComposite(alloc, gid, n_points, norm, deltas);
+        }
         // phantom index: n, n+1 = LSB / advance
-        return deltas[n_outline + 1].x - deltas[n_outline].x;
+        return deltas[n_points + 1].x - deltas[n_points].x;
     }
 };
 
 /// GlyphVariationData 1 個分を decode して net deltas に累積。
+/// do_iup: simple のみ true。composite は false（仕様: inferred deltas 非適用）。
 fn applyGlyphVariationData(
     gvar: *const Gvar,
     alloc: std.mem.Allocator,
@@ -238,6 +267,7 @@ fn applyGlyphVariationData(
     n_outline: usize,
     norm: []const f32,
     out_deltas: []Vec2f,
+    do_iup: bool,
 ) Error!void {
     const r = Reader{ .data = gvd };
     try r.require(0, 4);
@@ -384,8 +414,8 @@ fn applyGlyphVariationData(
             }
         }
 
-        // per-tuple IUP（outline 点のみ。phantom は対象外）
-        if (n_outline > 0 and !all_points) {
+        // per-tuple IUP（simple のみ。composite は仕様で IUP しない。phantom も対象外）
+        if (do_iup and n_outline > 0 and !all_points) {
             try iupInfer(points, end_pts, n_outline, has_delta, tuple_dx, tuple_dy);
         }
 
@@ -1038,4 +1068,70 @@ test "gvar: X と Y で IUP 結果が独立" {
     // Y: p1.y=10 は [0,100] 内 → proportion = 10/100 = 0.1 → (1-0.1)*100 + 0.1*0 = 90
     try testing.expectApproxEqAbs(@as(f32, 20), iupComponent(0, 100, 50, 10, 30), 0.01);
     try testing.expectApproxEqAbs(@as(f32, 90), iupComponent(0, 100, 10, 100, 0), 0.01);
+}
+
+/// composite 用 gvar: component_count=2 仮想点 + 4 phantom。
+/// private points: point 1 only, dx=50（IUP しても point 0 に漏れないことを確認）。
+fn buildCompositePartialGvar(alloc: std.mem.Allocator) ![]u8 {
+    // component_count=2 → n_total=6
+    // private: count=1, point 1, dx=50, dy=0, phantoms not listed
+    var ser: std.ArrayList(u8) = .empty;
+    defer ser.deinit(alloc);
+    try ser.append(alloc, 1); // count=1
+    try ser.append(alloc, 0); // run 1 byte
+    try ser.append(alloc, 1); // point 1
+    try ser.append(alloc, 0x40); // 1 word X
+    try appendI16(&ser, alloc, 50);
+    try ser.append(alloc, 0x40); // 1 word Y
+    try appendI16(&ser, alloc, 0);
+
+    var gvd: std.ArrayList(u8) = .empty;
+    defer gvd.deinit(alloc);
+    const data_off: u16 = 4 + 4 + 2;
+    try appendU16(&gvd, alloc, 1);
+    try appendU16(&gvd, alloc, data_off);
+    try appendU16(&gvd, alloc, @intCast(ser.items.len));
+    try appendU16(&gvd, alloc, 0x8000 | 0x2000);
+    try appendI16(&gvd, alloc, f2d(1.0));
+    try gvd.appendSlice(alloc, ser.items);
+
+    var table: std.ArrayList(u8) = .empty;
+    errdefer table.deinit(alloc);
+    try appendU16(&table, alloc, 1);
+    try appendU16(&table, alloc, 0);
+    try appendU16(&table, alloc, 1);
+    try appendU16(&table, alloc, 0);
+    try appendU32(&table, alloc, 0);
+    try appendU16(&table, alloc, 1);
+    try appendU16(&table, alloc, 1);
+    try appendU32(&table, alloc, 28);
+    try appendU32(&table, alloc, 0);
+    try appendU32(&table, alloc, @intCast(gvd.items.len));
+    try table.appendSlice(alloc, gvd.items);
+    return table.toOwnedSlice(alloc);
+}
+
+test "gvar: applyComposite は IUP しない（未参照 component デルタ=0）" {
+    const a = testing.allocator;
+    const table = try buildCompositePartialGvar(a);
+    defer a.free(table);
+    const gv = try Gvar.parse(table, 1, 1);
+    var deltas: [6]Vec2f = undefined;
+    try gv.applyComposite(a, 0, 2, &.{1.0}, &deltas);
+    // component 0 未参照 → 0（IUP したら 50 になる）
+    try testing.expectApproxEqAbs(@as(f32, 0), deltas[0].x, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 50), deltas[1].x, 0.01);
+}
+
+test "gvar: composite phantomAdvanceDelta" {
+    const a = testing.allocator;
+    // all points for 2 components + 4 phantom: n_total=6
+    // phantom lsb=0 (idx 2), adv=+12 (idx 3)
+    const dx = [_]i16{ 0, 0, 0, 12, 0, 0 };
+    const dy = [_]i16{ 0, 0, 0, 0, 0, 0 };
+    const table = try buildMinimalGvar(a, 2, &dx, &dy); // n_outline=2 treated as virtual points
+    defer a.free(table);
+    const gv = try Gvar.parse(table, 1, 1);
+    const d = try gv.phantomAdvanceDelta(a, 0, 2, &.{}, &.{}, &.{1.0}, false);
+    try testing.expectApproxEqAbs(@as(f32, 12), d, 0.01);
 }

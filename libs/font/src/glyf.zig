@@ -96,7 +96,7 @@ pub const Glyf = struct {
     }
 
     /// 可変対応 outline。gvar が null または norm が空/全 0 なら default 外形と bit 一致。
-    /// composite の gvar デルタは本フェーズでは無視（default 成分合成）。
+    /// composite は component index の仮想点として offset のみ変分（scale/2x2 は不変）。
     pub fn outlineVaried(
         self: *const Glyf,
         alloc: std.mem.Allocator,
@@ -138,6 +138,52 @@ pub const Glyf = struct {
         return .{ .pts = coords, .end_pts = parsed.end_pts };
     }
 
+    /// composite の構造情報（metrics / phantom 用）。simple・空は null。
+    /// 点マッチ（非 XY）は Unsupported。
+    pub const CompositeInfo = struct {
+        component_count: u16,
+        /// 最後に現れた USE_MY_METRICS component の gid。無ければ null。
+        use_my_metrics_gid: ?u16,
+    };
+
+    pub fn parseCompositeInfo(self: *const Glyf, gid: u16) Error!?CompositeInfo {
+        const data = (try self.glyphData(gid)) orelse return null;
+        const r = Reader{ .data = data };
+        const num_contours = try r.i16At(0);
+        if (num_contours >= 0) return null; // simple
+        var p: usize = 10;
+        var count: u16 = 0;
+        var use_my: ?u16 = null;
+        var first = true;
+        while (true) {
+            const flags = try r.u16At(p);
+            p += 2;
+            const comp_gid = try r.u16At(p);
+            p += 2;
+            const arg_words = flags & 0x0001 != 0;
+            const args_xy = flags & 0x0002 != 0;
+            if (first and !args_xy) return error.Unsupported;
+            first = false;
+            if (!args_xy) return error.Unsupported;
+            if (arg_words) {
+                p += 4;
+            } else {
+                p += 2;
+            }
+            if (flags & 0x0008 != 0) {
+                p += 2; // WE_HAVE_A_SCALE
+            } else if (flags & 0x0040 != 0) {
+                p += 4; // X_AND_Y_SCALE
+            } else if (flags & 0x0080 != 0) {
+                p += 8; // TWO_BY_TWO
+            }
+            if (flags & 0x0200 != 0) use_my = comp_gid; // USE_MY_METRICS（後勝ち）
+            count += 1;
+            if (flags & 0x0020 == 0) break; // MORE_COMPONENTS なし
+        }
+        return .{ .component_count = count, .use_my_metrics_gid = use_my };
+    }
+
     fn appendGlyph(
         self: *const Glyf,
         gid: u16,
@@ -154,13 +200,25 @@ pub const Glyf = struct {
         if (num_contours >= 0) {
             try appendSimple(alloc_of(b), data, @intCast(num_contours), b, xform, gvar, gid, norm);
         } else {
-            // composite: gvar デルタ無視（Ph-gvar-simple）。成分は再帰で varied。
-            try self.appendComposite(data, b, xform, depth, gvar, norm);
+            try self.appendComposite(gid, data, b, xform, depth, gvar, norm);
         }
     }
 
+    /// composite 成分エントリ（gvar offset デルタ適用前の生値）。
+    const CompEntry = struct {
+        flags: u16,
+        gid: u16,
+        dx: f32,
+        dy: f32,
+        a: f32 = 1,
+        b: f32 = 0,
+        c: f32 = 0,
+        d: f32 = 1,
+    };
+
     fn appendComposite(
         self: *const Glyf,
+        composite_gid: u16,
         data: []const u8,
         b: *Builder,
         parent: Xform,
@@ -168,9 +226,14 @@ pub const Glyf = struct {
         gvar: ?*const Gvar,
         norm: []const f32,
     ) Error!void {
+        const alloc = alloc_of(b);
         const r = Reader{ .data = data };
-        try r.require(0, 10); // glyph header
-        var p: usize = 10; // header 後
+        try r.require(0, 10);
+
+        // 1st pass: 全 component をパース（gvar 適用に component_count が必要）
+        var comps: std.ArrayList(CompEntry) = .empty;
+        defer comps.deinit(alloc);
+        var p: usize = 10;
         var first = true;
         var last_flags: u16 = 0;
         while (true) {
@@ -181,9 +244,9 @@ pub const Glyf = struct {
             p += 2;
             const arg_words = flags & 0x0001 != 0;
             const args_xy = flags & 0x0002 != 0;
-            if (first and !args_xy) return error.Unsupported; // 先頭は XY 必須
+            if (first and !args_xy) return error.Unsupported;
             first = false;
-            if (!args_xy) return error.Unsupported; // 点マッチングは非対応
+            if (!args_xy) return error.Unsupported;
 
             var dx: f32 = 0;
             var dy: f32 = 0;
@@ -199,45 +262,67 @@ pub const Glyf = struct {
                 p += 1;
             }
 
-            var comp = Xform{ .dx = dx, .dy = dy };
-            if (flags & 0x0008 != 0) { // WE_HAVE_A_SCALE
+            var entry = CompEntry{ .flags = flags, .gid = gid, .dx = dx, .dy = dy };
+            if (flags & 0x0008 != 0) {
                 const s = f2dot14(try r.i16At(p));
                 p += 2;
-                comp.a = s;
-                comp.d = s;
-            } else if (flags & 0x0040 != 0) { // X_AND_Y_SCALE
-                comp.a = f2dot14(try r.i16At(p));
+                entry.a = s;
+                entry.d = s;
+            } else if (flags & 0x0040 != 0) {
+                entry.a = f2dot14(try r.i16At(p));
                 p += 2;
-                comp.d = f2dot14(try r.i16At(p));
+                entry.d = f2dot14(try r.i16At(p));
                 p += 2;
-            } else if (flags & 0x0080 != 0) { // TWO_BY_TWO
-                comp.a = f2dot14(try r.i16At(p));
+            } else if (flags & 0x0080 != 0) {
+                entry.a = f2dot14(try r.i16At(p));
                 p += 2;
-                comp.b = f2dot14(try r.i16At(p));
+                entry.b = f2dot14(try r.i16At(p));
                 p += 2;
-                comp.c = f2dot14(try r.i16At(p));
+                entry.c = f2dot14(try r.i16At(p));
                 p += 2;
-                comp.d = f2dot14(try r.i16At(p));
+                entry.d = f2dot14(try r.i16At(p));
                 p += 2;
             }
+            try comps.append(alloc, entry);
+            if (flags & 0x0020 == 0) break;
+        }
+        if (last_flags & 0x0100 != 0) {
+            const instr_len = try r.u16At(p);
+            p += 2;
+            try r.require(p + instr_len, 0);
+        }
 
-            // offset スケーリング: 既定 unscaled。SCALED(0x800) かつ !UNSCALED(0x1000) のとき offset に 2x2 適用。
-            if (flags & 0x0800 != 0 and flags & 0x1000 == 0) {
+        const n_comp = comps.items.len;
+        // gvar: component index の仮想点。offset のみ加算。IUP なし。
+        var deltas: ?[]Vec2f = null;
+        defer if (deltas) |d| alloc.free(d);
+        if (gvar) |gv| {
+            if (norm.len >= gv.axis_count and gv.axis_count > 0 and n_comp > 0) {
+                const d = try alloc.alloc(Vec2f, n_comp + 4);
+                errdefer alloc.free(d);
+                try gv.applyComposite(alloc, composite_gid, n_comp, norm, d);
+                deltas = d;
+            }
+        }
+
+        // 2nd pass: デルタ適用後に offset scaling → 再帰
+        for (comps.items, 0..) |entry, i| {
+            var dx = entry.dx;
+            var dy = entry.dy;
+            // ARGS_ARE_XY_VALUES のみここまで到達。gvar デルタを offset に加算（scale/2x2 は不変）。
+            if (deltas) |d| {
+                dx += d[i].x;
+                dy += d[i].y;
+            }
+            var comp = Xform{ .a = entry.a, .b = entry.b, .c = entry.c, .d = entry.d, .dx = dx, .dy = dy };
+            // offset スケーリング: デルタ適用後の offset に既存 SCALED_COMPONENT_OFFSET 規則。
+            if (entry.flags & 0x0800 != 0 and entry.flags & 0x1000 == 0) {
                 const odx = comp.a * dx + comp.c * dy;
                 const ody = comp.b * dx + comp.d * dy;
                 comp.dx = odx;
                 comp.dy = ody;
             }
-
-            try self.appendGlyph(gid, b, parent.compose(comp), depth + 1, gvar, norm);
-            if (flags & 0x0020 == 0) break; // MORE_COMPONENTS なし
-        }
-        // WE_HAVE_INSTRUCTIONS: 末尾 instructions は描画には使わないが、範囲だけは検証する
-        // （末尾が切り詰められた不正データを弾く）。
-        if (last_flags & 0x0100 != 0) {
-            const instr_len = try r.u16At(p);
-            p += 2;
-            try r.require(p + instr_len, 0);
+            try self.appendGlyph(entry.gid, b, parent.compose(comp), depth + 1, gvar, norm);
         }
     }
 };
@@ -503,6 +588,12 @@ fn buildSimpleGlyph(alloc: std.mem.Allocator, contours: []const []const Pt) ![]u
 
 fn appendU16(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u16) !void {
     try list.append(alloc, @intCast(v >> 8));
+    try list.append(alloc, @truncate(v));
+}
+fn appendU32(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
+    try list.append(alloc, @truncate(v >> 24));
+    try list.append(alloc, @truncate(v >> 16));
+    try list.append(alloc, @truncate(v >> 8));
     try list.append(alloc, @truncate(v));
 }
 fn appendI16(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i16) !void {
@@ -858,6 +949,141 @@ test "glyf composite: WE_HAVE_INSTRUCTIONS 末尾が切れていると InvalidFo
     defer tf.deinit(a);
     const glyf = try tf.glyfObj(2);
     try testing.expectError(error.InvalidFont, glyf.outline(a, 1));
+}
+
+test "TASK-25.15.3: composite+gvar offset のみ変分・transform 不変・norm0 一致" {
+    const a = testing.allocator;
+    const tri = [_]Pt{
+        .{ .p = .{ .x = 0, .y = 0 }, .on = true },
+        .{ .p = .{ .x = 100, .y = 0 }, .on = true },
+        .{ .p = .{ .x = 50, .y = 100 }, .on = true },
+    };
+    const g0 = try buildSimpleGlyph(a, &.{&tri});
+    defer a.free(g0);
+
+    // composite: 2 components — gid0@ (0,0) scale 0.5, gid0@ (200,0) no scale
+    // flags: WORDS|XY|SCALE for first, WORDS|XY|MORE for first, WORDS|XY for second
+    var comp: std.ArrayList(u8) = .empty;
+    defer comp.deinit(a);
+    try appendI16(&comp, a, -1);
+    for (0..4) |_| try appendI16(&comp, a, 0);
+    // component 0: XY words + WE_HAVE_A_SCALE + MORE_COMPONENTS
+    try appendU16(&comp, a, 0x0001 | 0x0002 | 0x0008 | 0x0020);
+    try appendU16(&comp, a, 0);
+    try appendI16(&comp, a, 0); // dx
+    try appendI16(&comp, a, 0); // dy
+    try appendI16(&comp, a, 0x2000); // F2Dot14 0.5
+    // component 1: XY words
+    try appendU16(&comp, a, 0x0001 | 0x0002);
+    try appendU16(&comp, a, 0);
+    try appendI16(&comp, a, 200);
+    try appendI16(&comp, a, 0);
+    if (comp.items.len % 2 != 0) try comp.append(a, 0);
+    const g1 = try comp.toOwnedSlice(a);
+    defer a.free(g1);
+
+    var tf = try TestFont.make(a, &.{ g0, g1 });
+    defer tf.deinit(a);
+    const glyf = try tf.glyfObj(2);
+
+    // gvar for gid1 (composite): component 1 dx += 50 at peak=1
+    // reuse pattern from gvar tests: 2 virtual points + 4 phantom, private point 1
+    var ser: std.ArrayList(u8) = .empty;
+    defer ser.deinit(a);
+    try ser.append(a, 1);
+    try ser.append(a, 0);
+    try ser.append(a, 1); // point 1
+    try ser.append(a, 0x40);
+    try appendI16(&ser, a, 50);
+    try ser.append(a, 0x40);
+    try appendI16(&ser, a, 0);
+    var gvd: std.ArrayList(u8) = .empty;
+    defer gvd.deinit(a);
+    try appendU16(&gvd, a, 1);
+    try appendU16(&gvd, a, 10);
+    try appendU16(&gvd, a, @intCast(ser.items.len));
+    try appendU16(&gvd, a, 0x8000 | 0x2000);
+    try appendI16(&gvd, a, var_common_f2d(1.0));
+    try gvd.appendSlice(a, ser.items);
+    // gvar: 2 glyphs (gid0 empty, gid1 = gvd)
+    var gvar_tbl: std.ArrayList(u8) = .empty;
+    defer gvar_tbl.deinit(a);
+    try appendU16(&gvar_tbl, a, 1);
+    try appendU16(&gvar_tbl, a, 0);
+    try appendU16(&gvar_tbl, a, 1);
+    try appendU16(&gvar_tbl, a, 0);
+    try appendU32(&gvar_tbl, a, 0);
+    try appendU16(&gvar_tbl, a, 2);
+    try appendU16(&gvar_tbl, a, 1); // long
+    try appendU32(&gvar_tbl, a, 20 + 3 * 4); // gvd array after 3 offsets
+    try appendU32(&gvar_tbl, a, 0); // gid0 empty
+    try appendU32(&gvar_tbl, a, 0);
+    try appendU32(&gvar_tbl, a, @intCast(gvd.items.len));
+    try gvar_tbl.appendSlice(a, gvd.items);
+    const gv = try gvar_mod.Gvar.parse(gvar_tbl.items, 2, 1);
+
+    // norm=0: 現行 outline と一致
+    var o_def = try glyf.outline(a, 1);
+    defer o_def.deinit(a);
+    var o0 = try glyf.outlineVaried(a, 1, &gv, &.{0});
+    defer o0.deinit(a);
+    try testing.expectEqual(o_def.contours.len, o0.contours.len);
+    try testing.expectEqual(o_def.contours[0].start.x, o0.contours[0].start.x);
+    try testing.expectEqual(o_def.contours[1].start.x, o0.contours[1].start.x);
+
+    // default: contour0 scaled 0.5 from origin, contour1 at (200,0)
+    try testing.expectApproxEqAbs(@as(f32, 0), o_def.contours[0].start.x, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 50), o_def.contours[0].segments[0].line.x, 0.01); // 100*0.5
+    try testing.expectApproxEqAbs(@as(f32, 200), o_def.contours[1].start.x, 0.01);
+
+    // norm=1: component1 offset 200+50=250, scale on component0 不変
+    var o1 = try glyf.outlineVaried(a, 1, &gv, &.{1.0});
+    defer o1.deinit(a);
+    try testing.expectApproxEqAbs(@as(f32, 0), o1.contours[0].start.x, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 50), o1.contours[0].segments[0].line.x, 0.01); // scale 不変
+    try testing.expectApproxEqAbs(@as(f32, 250), o1.contours[1].start.x, 0.01); // offset 変分
+    try testing.expectApproxEqAbs(@as(f32, 350), o1.contours[1].segments[0].line.x, 0.01); // 100+250
+}
+
+fn var_common_f2d(v: f32) i16 {
+    return @import("var_common.zig").f32ToF2dot14(v);
+}
+
+test "TASK-25.15.3: parseCompositeInfo USE_MY_METRICS 後勝ち" {
+    const a = testing.allocator;
+    const tri = [_]Pt{
+        .{ .p = .{ .x = 0, .y = 0 }, .on = true },
+        .{ .p = .{ .x = 10, .y = 0 }, .on = true },
+        .{ .p = .{ .x = 5, .y = 10 }, .on = true },
+    };
+    const g0 = try buildSimpleGlyph(a, &.{&tri});
+    defer a.free(g0);
+    const g1 = try buildSimpleGlyph(a, &.{&tri});
+    defer a.free(g1);
+
+    // composite: comp0 USE_MY_METRICS gid0, comp1 USE_MY_METRICS gid1 → last=g1
+    var comp: std.ArrayList(u8) = .empty;
+    defer comp.deinit(a);
+    try appendI16(&comp, a, -1);
+    for (0..4) |_| try appendI16(&comp, a, 0);
+    try appendU16(&comp, a, 0x0002 | 0x0200 | 0x0020); // XY | USE_MY_METRICS | MORE
+    try appendU16(&comp, a, 0);
+    try comp.append(a, 0);
+    try comp.append(a, 0);
+    try appendU16(&comp, a, 0x0002 | 0x0200); // XY | USE_MY_METRICS
+    try appendU16(&comp, a, 1);
+    try comp.append(a, 10);
+    try comp.append(a, 0);
+    if (comp.items.len % 2 != 0) try comp.append(a, 0);
+    const g2 = try comp.toOwnedSlice(a);
+    defer a.free(g2);
+
+    var tf = try TestFont.make(a, &.{ g0, g1, g2 });
+    defer tf.deinit(a);
+    const glyf = try tf.glyfObj(3);
+    const info = (try glyf.parseCompositeInfo(2)).?;
+    try testing.expectEqual(@as(u16, 2), info.component_count);
+    try testing.expectEqual(@as(?u16, 1), info.use_my_metrics_gid);
 }
 
 test "glyf simple: フラグ枝（X_SHORT 正/負 / X_SAME・Y_SAME ノーバイト / REPEAT）— 生バイト" {
