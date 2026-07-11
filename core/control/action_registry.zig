@@ -27,6 +27,24 @@ pub const NetworkPolicy = enum {
     redo_own,
 };
 
+/// action/probe の引数シグネチャ 1 要素（TASK-88.1）。
+/// **framework は転記のみ・意味を解釈しない**（kind の語彙検証も values の整合も行わない）。
+/// スライス（name/kind/values/pattern/desc）は登録側が static lifetime を保証する（Action.name と同じ契約）。
+///
+/// kind は文字列（推奨語彙: "int"/"float"/"string"/"bool"/"enum"/"path"。app 独自 kind も可。
+/// 未知 kind の解釈は消費側＝MCP の責務）。
+pub const ArgSpec = struct {
+    name: []const u8,
+    kind: []const u8,
+    min: ?f64 = null,
+    max: ?f64 = null,
+    values: []const []const u8 = &.{},
+    pattern: []const u8 = "",
+    optional: bool = false,
+    variadic: bool = false,
+    desc: []const u8 = "",
+};
+
 /// app が register する custom action。**framework は中身を解釈しない**（probe と同じ不変条件）:
 /// `action <name> [args...]` の `<name>` 以降の残り行 raw テキストをそのまま `run` へ渡し、
 /// 戻り値（1行）をそのまま既存 sink へ流すだけ。
@@ -37,6 +55,10 @@ pub const Action = struct {
     ctx: *anyopaque,
     /// capabilities 列挙用の説明文（省略可）。登録時に sanitize で禁止文字・200B 超を空文字化。
     desc: []const u8 = "",
+    /// args シグネチャ（TASK-88.1。省略可・後方互換）。
+    /// **null=未指定（従来どおり・JSON に args フィールド無し）/ 空 slice=「引数なし」を明示宣言**
+    /// （MCP の fallback 判定に必要な区別。null と `[]` は JSON 上で異なる）。
+    args: ?[]const ArgSpec = null,
     /// netsync 配送ポリシー（既定 `.reject_when_synced`。既存 registerAction 呼び出しは無改修）。
     network_policy: NetworkPolicy = .reject_when_synced,
     /// 操作を実行し結果1行を返す write callback。
@@ -57,6 +79,10 @@ var enabled: bool = false;
 var router: ?RouterFn = null;
 
 const MAX_DESC_LEN = 200;
+const MAX_ARG_NAME_LEN = 32;
+const MAX_ARG_KIND_LEN = 32;
+const MAX_ARG_VALUE_LEN = 64;
+const MAX_ARG_PATTERN_LEN = 100;
 
 // ============================================================================
 // structured error（TASK-62.5.9）: action 失敗時の opt-in code + suggested_next_action
@@ -137,6 +163,38 @@ fn sanitizeDesc(name: []const u8, desc: []const u8) []const u8 {
     return desc;
 }
 
+/// args シグネチャの登録時サニタイズ（TASK-88.1）。
+/// name/kind/values[*]/pattern/desc に containsUnsafeJsonChar + 長さ上限を適用。
+/// **違反時は warn + args 全体を null に落とす**（登録自体は成功。desc の空文字化と同型のフェイルセーフ）。
+/// framework は型の意味を解釈しない（wire framing 保護のみ）。
+fn sanitizeArgs(action_name: []const u8, args: ?[]const ArgSpec) ?[]const ArgSpec {
+    const specs = args orelse return null;
+    for (specs) |s| {
+        // NaN/Inf は JSON 数値として emit できない（常に valid JSON の契約を壊す）ため登録時に拒否
+        if ((s.min != null and !std.math.isFinite(s.min.?)) or
+            (s.max != null and !std.math.isFinite(s.max.?)))
+        {
+            std.debug.print("[action_registry] action args for '{s}' は無効化されました（min/max が非有限）\n", .{action_name});
+            return null;
+        }
+        if (s.name.len > MAX_ARG_NAME_LEN or containsUnsafeJsonChar(s.name) or
+            s.kind.len > MAX_ARG_KIND_LEN or containsUnsafeJsonChar(s.kind) or
+            s.pattern.len > MAX_ARG_PATTERN_LEN or containsUnsafeJsonChar(s.pattern) or
+            s.desc.len > MAX_DESC_LEN or containsUnsafeJsonChar(s.desc))
+        {
+            std.debug.print("[action_registry] action args for '{s}' は無効化されました（禁止文字 or 長さ上限超過）\n", .{action_name});
+            return null;
+        }
+        for (s.values) |v| {
+            if (v.len > MAX_ARG_VALUE_LEN or containsUnsafeJsonChar(v)) {
+                std.debug.print("[action_registry] action args for '{s}' は無効化されました（禁止文字 or 長さ上限超過）\n", .{action_name});
+                return null;
+            }
+        }
+    }
+    return specs;
+}
+
 fn isValidActionName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
@@ -168,6 +226,7 @@ pub fn registerAction(a: Action) void {
         if (std.mem.eql(u8, existing.name, a.name)) {
             var ma = a;
             ma.desc = sanitizeDesc(a.name, a.desc);
+            ma.args = sanitizeArgs(a.name, a.args);
             existing.* = ma;
             return;
         }
@@ -178,6 +237,7 @@ pub fn registerAction(a: Action) void {
     }
     var ma = a;
     ma.desc = sanitizeDesc(a.name, a.desc);
+    ma.args = sanitizeArgs(a.name, a.args);
     actions[action_count] = ma;
     action_count += 1;
 }

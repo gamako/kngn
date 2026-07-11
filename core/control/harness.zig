@@ -230,6 +230,9 @@ pub const NativePump = struct {
     }
 };
 
+/// action/probe 共通の args シグネチャ型（TASK-88.1。action_registry が単一ソース）。
+pub const ArgSpec = action_registry.ArgSpec;
+
 /// app が register する custom probe。**framework は中身を解釈しない**:
 /// snapshot が返す raw バイト列をそのまま file へ書き、digest が返す1行を既存 sink へ流すだけ。
 /// 各 probe の意味づけ（PNG 化 / JSON 整形 等）は全て app 側 callback に閉じる。
@@ -249,6 +252,9 @@ pub const Probe = struct {
     /// 禁止文字（`"`/`\`/ASCII 制御文字）・200 bytes 超をチェックし、違反時は空文字へ落とす
     /// （中身の意味解釈ではなく capabilities JSON の wire framing 保護）。
     desc: []const u8 = "",
+    /// args シグネチャ（TASK-88.1。省略可・後方互換）。Action と同じ契約:
+    /// **null=未指定（JSON に args 無し）/ 空 slice=引数なし明示**。現状の probe は全て null のまま。
+    args: ?[]const ArgSpec = null,
 };
 
 /// custom probe を登録する。app は `platform.registerProbe(...)` 経由で `platform.init()` 後に呼ぶ。
@@ -264,6 +270,7 @@ pub fn registerProbe(p: Probe) void {
         if (std.mem.eql(u8, existing.name, p.name)) {
             var mp = p;
             mp.desc = sanitizeDesc("probe", p.name, p.desc); // 実際に保存する直前にのみ sanitize（満杯 skip 時に無用な warn を出さない）
+            mp.args = sanitizeArgs("probe", p.name, p.args);
             existing.* = mp; // 同名上書き
             return;
         }
@@ -274,6 +281,7 @@ pub fn registerProbe(p: Probe) void {
     }
     var mp = p;
     mp.desc = sanitizeDesc("probe", p.name, p.desc);
+    mp.args = sanitizeArgs("probe", p.name, p.args);
     probes[probe_count] = mp;
     probe_count += 1;
 }
@@ -297,6 +305,10 @@ fn containsUnsafeJsonChar(s: []const u8) bool {
 /// desc は warn を出し空文字を返す（登録自体は成功させ desc だけ無効化。JSON buffer 安全性のための
 /// wire framing 保護であり、desc の意味解釈ではない）。
 const MAX_DESC_LEN = 200;
+const MAX_ARG_NAME_LEN = 32;
+const MAX_ARG_KIND_LEN = 32;
+const MAX_ARG_VALUE_LEN = 64;
+const MAX_ARG_PATTERN_LEN = 100;
 fn sanitizeDesc(kind: []const u8, name: []const u8, desc: []const u8) []const u8 {
     if (desc.len == 0) return desc;
     if (desc.len > MAX_DESC_LEN or containsUnsafeJsonChar(desc)) {
@@ -304,6 +316,36 @@ fn sanitizeDesc(kind: []const u8, name: []const u8, desc: []const u8) []const u8
         return "";
     }
     return desc;
+}
+
+/// probe args シグネチャの登録時サニタイズ（TASK-88.1。action_registry 側と同規則・重複定義維持）。
+/// 違反時は warn + args 全体を null（登録自体は成功）。
+fn sanitizeArgs(kind: []const u8, name: []const u8, args: ?[]const ArgSpec) ?[]const ArgSpec {
+    const specs = args orelse return null;
+    for (specs) |s| {
+        // NaN/Inf は JSON 数値として emit できない（常に valid JSON の契約を壊す）ため登録時に拒否
+        if ((s.min != null and !std.math.isFinite(s.min.?)) or
+            (s.max != null and !std.math.isFinite(s.max.?)))
+        {
+            std.debug.print("[harness] {s} args for {s} は無効化されました（min/max が非有限）\n", .{ kind, name });
+            return null;
+        }
+        if (s.name.len > MAX_ARG_NAME_LEN or containsUnsafeJsonChar(s.name) or
+            s.kind.len > MAX_ARG_KIND_LEN or containsUnsafeJsonChar(s.kind) or
+            s.pattern.len > MAX_ARG_PATTERN_LEN or containsUnsafeJsonChar(s.pattern) or
+            s.desc.len > MAX_DESC_LEN or containsUnsafeJsonChar(s.desc))
+        {
+            std.debug.print("[harness] {s} args for '{s}' は無効化されました（禁止文字 or 長さ上限超過）\n", .{ kind, name });
+            return null;
+        }
+        for (s.values) |v| {
+            if (v.len > MAX_ARG_VALUE_LEN or containsUnsafeJsonChar(v)) {
+                std.debug.print("[harness] {s} args for '{s}' は無効化されました（禁止文字 or 長さ上限超過）\n", .{ kind, name });
+                return null;
+            }
+        }
+    }
+    return specs;
 }
 
 /// 登録済み custom probe の name lookup（copilot 等の外部 control-plane も使う。TASK-62.5.2 で pub 化）。
@@ -1105,22 +1147,83 @@ fn appendRaw(buf: []u8, limit: usize, len: *usize, s: []const u8) bool {
     return true;
 }
 
+/// 1 個の ArgSpec を JSON object として追記する（非デフォルト値のみ emit。TASK-88.1）。
+/// 中身非解釈: 登録済み文字列をそのまま転記するだけ。
+fn appendArgSpecEntry(buf: []u8, limit: usize, len: *usize, s: ArgSpec) bool {
+    if (containsUnsafeJsonChar(s.name) or containsUnsafeJsonChar(s.kind) or
+        containsUnsafeJsonChar(s.pattern) or containsUnsafeJsonChar(s.desc)) return false;
+    for (s.values) |v| {
+        if (containsUnsafeJsonChar(v)) return false;
+    }
+    var scratch: [512]u8 = undefined;
+    const head = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"kind\":\"{s}\"", .{ s.name, s.kind }) catch return false;
+    if (!appendRaw(buf, limit, len, head)) return false;
+    if (s.min) |m| {
+        const part = std.fmt.bufPrint(&scratch, ",\"min\":{d}", .{m}) catch return false;
+        if (!appendRaw(buf, limit, len, part)) return false;
+    }
+    if (s.max) |m| {
+        const part = std.fmt.bufPrint(&scratch, ",\"max\":{d}", .{m}) catch return false;
+        if (!appendRaw(buf, limit, len, part)) return false;
+    }
+    if (s.values.len > 0) {
+        if (!appendRaw(buf, limit, len, ",\"values\":[")) return false;
+        for (s.values, 0..) |v, i| {
+            if (i > 0 and !appendRaw(buf, limit, len, ",")) return false;
+            const part = std.fmt.bufPrint(&scratch, "\"{s}\"", .{v}) catch return false;
+            if (!appendRaw(buf, limit, len, part)) return false;
+        }
+        if (!appendRaw(buf, limit, len, "]")) return false;
+    }
+    if (s.pattern.len > 0) {
+        const part = std.fmt.bufPrint(&scratch, ",\"pattern\":\"{s}\"", .{s.pattern}) catch return false;
+        if (!appendRaw(buf, limit, len, part)) return false;
+    }
+    if (s.optional and !appendRaw(buf, limit, len, ",\"optional\":true")) return false;
+    if (s.variadic and !appendRaw(buf, limit, len, ",\"variadic\":true")) return false;
+    if (s.desc.len > 0) {
+        const part = std.fmt.bufPrint(&scratch, ",\"desc\":\"{s}\"", .{s.desc}) catch return false;
+        if (!appendRaw(buf, limit, len, part)) return false;
+    }
+    return appendRaw(buf, limit, len, "}");
+}
+
+/// `args != null` のときだけ `,"args":[...]` を追記する（null は呼び出し側でスキップ＝従来 bit 一致）。
+fn appendArgsField(buf: []u8, limit: usize, len: *usize, args: []const ArgSpec) bool {
+    if (!appendRaw(buf, limit, len, ",\"args\":[")) return false;
+    for (args, 0..) |s, i| {
+        if (i > 0 and !appendRaw(buf, limit, len, ",")) return false;
+        if (!appendArgSpecEntry(buf, limit, len, s)) return false;
+    }
+    return appendRaw(buf, limit, len, "]");
+}
+
 /// 1 probe エントリを `buf[0..limit)`（`len` 経由）へ追記する。name/ext に JSON を破損させる
 /// 文字が含まれる、またはエントリが収まらない場合は何も書かず false を返す（呼び出し元が
 /// truncated フラグを立てる）。中身非解釈: 値をそのまま転記するだけで callback は呼ばない。
-fn appendProbeEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, ext: []const u8, has_snapshot: bool, has_digest: bool, desc: []const u8) bool {
+/// `args != null` のときのみ `"args":[...]` を追記（TASK-88.1。フィールド追加のみ）。
+fn appendProbeEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, ext: []const u8, has_snapshot: bool, has_digest: bool, desc: []const u8, args: ?[]const ArgSpec) bool {
     if (containsUnsafeJsonChar(name) or containsUnsafeJsonChar(ext) or containsUnsafeJsonChar(desc)) return false;
     var scratch: [768]u8 = undefined;
-    const entry = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"ext\":\"{s}\",\"snapshot\":{},\"digest\":{},\"desc\":\"{s}\"}}", .{ name, ext, has_snapshot, has_digest, desc }) catch return false;
-    return appendRaw(buf, limit, len, entry);
+    const head = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"ext\":\"{s}\",\"snapshot\":{},\"digest\":{},\"desc\":\"{s}\"", .{ name, ext, has_snapshot, has_digest, desc }) catch return false;
+    if (!appendRaw(buf, limit, len, head)) return false;
+    if (args) |as| {
+        if (!appendArgsField(buf, limit, len, as)) return false;
+    }
+    return appendRaw(buf, limit, len, "}");
 }
 
 /// `appendProbeEntry` の action 版（`ext`/`snapshot`/`digest` フィールドが無い）。
-fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, desc: []const u8) bool {
+/// `args != null` のときのみ `"args":[...]` を追記（TASK-88.1。null は従来と bit 一致）。
+fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, desc: []const u8, args: ?[]const ArgSpec) bool {
     if (containsUnsafeJsonChar(name) or containsUnsafeJsonChar(desc)) return false;
     var scratch: [768]u8 = undefined;
-    const entry = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"desc\":\"{s}\"}}", .{ name, desc }) catch return false;
-    return appendRaw(buf, limit, len, entry);
+    const head = std.fmt.bufPrint(&scratch, "{{\"name\":\"{s}\",\"desc\":\"{s}\"", .{ name, desc }) catch return false;
+    if (!appendRaw(buf, limit, len, head)) return false;
+    if (args) |as| {
+        if (!appendArgsField(buf, limit, len, as)) return false;
+    }
+    return appendRaw(buf, limit, len, "}");
 }
 
 /// 登録済み probe（組み込み6件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
@@ -1145,7 +1248,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, true, true, b.desc)) {
+            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, true, true, b.desc, null)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;
@@ -1159,7 +1262,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null, p.digest != null, p.desc)) {
+            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null, p.digest != null, p.desc, p.args)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;
@@ -1184,7 +1287,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                     truncated = true;
                     break :actions_blk;
                 }
-                if (!appendActionEntry(buf, content_limit, &len, a.name, a.desc)) {
+                if (!appendActionEntry(buf, content_limit, &len, a.name, a.desc, a.args)) {
                     len = saved_len;
                     truncated = true;
                     break :actions_blk;
@@ -3567,6 +3670,193 @@ test "capabilities: gamepad probe が組み込み一覧に含まれる" {
         }
     }
     try testing.expect(found);
+}
+
+// ============================================================================
+// capabilities args シグネチャ（TASK-88.1）tests
+// ============================================================================
+
+test "capabilities: args=null の action/probe → JSON が従来と文字列一致（args フィールド無し）" {
+    resetForTest();
+    var c = TestProbeCtx{ .value = 1 };
+    var ac = TestActionCtx{};
+    // .args 省略（= null）で登録
+    registerProbe(.{ .name = "pnull", .ctx = &c, .ext = "txt", .desc = "pd", .digest = testProbeDigest });
+    registerAction(.{ .name = "anull", .ctx = &ac, .run = testActionRun, .desc = "ad" });
+
+    var saved: [capabilities_buf.len]u8 = undefined;
+    const payload0 = formatCapabilitiesPayload(&capabilities_buf);
+    @memcpy(saved[0..payload0.len], payload0);
+    const payload = saved[0..payload0.len];
+    // 文字列レベルで "args" キーが一切出ない（フィールド追加のみ方針の回帰ゼロ）
+    try testing.expect(std.mem.indexOf(u8, payload, "\"args\"") == null);
+
+    // エントリ形が従来どおり name/desc（+ probe は ext/snapshot/digest）のみ
+    var parsed = try parseCapabilities(payload);
+    defer parsed.deinit();
+    const probes_arr = parsed.value.object.get("probes").?.array.items;
+    const p = probes_arr[probes_arr.len - 1].object;
+    try testing.expectEqualStrings("pnull", p.get("name").?.string);
+    try testing.expect(p.get("args") == null);
+    const a = parsed.value.object.get("actions").?.array.items[0].object;
+    try testing.expectEqualStrings("anull", a.get("name").?.string);
+    try testing.expectEqualStrings("ad", a.get("desc").?.string);
+    try testing.expect(a.get("args") == null);
+
+    // 明示 .args=null も省略時と bit 一致
+    resetForTest();
+    registerProbe(.{ .name = "pnull", .ctx = &c, .ext = "txt", .desc = "pd", .digest = testProbeDigest, .args = null });
+    registerAction(.{ .name = "anull", .ctx = &ac, .run = testActionRun, .desc = "ad", .args = null });
+    const payload2 = formatCapabilitiesPayload(&capabilities_buf);
+    try testing.expectEqualStrings(payload, payload2);
+}
+
+test "capabilities: args 付き action → 非デフォルトフィールドのみ emit" {
+    resetForTest();
+    var ac = TestActionCtx{};
+    const specs = [_]ArgSpec{
+        .{
+            .name = "tool",
+            .kind = "enum",
+            .values = &.{ "pen", "eraser" },
+            .optional = true,
+            .desc = "tool name",
+        },
+        .{
+            .name = "n",
+            .kind = "int",
+            .min = 0,
+            .max = 255,
+            .variadic = true,
+        },
+        .{
+            .name = "color",
+            .kind = "string",
+            .pattern = "#?RRGGBB",
+        },
+    };
+    registerAction(.{ .name = "full", .ctx = &ac, .run = testActionRun, .args = &specs });
+
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const a = parsed.value.object.get("actions").?.array.items[0].object;
+    const args_arr = a.get("args").?.array.items;
+    try testing.expectEqual(@as(usize, 3), args_arr.len);
+
+    const t0 = args_arr[0].object;
+    try testing.expectEqualStrings("tool", t0.get("name").?.string);
+    try testing.expectEqualStrings("enum", t0.get("kind").?.string);
+    try testing.expectEqual(@as(usize, 2), t0.get("values").?.array.items.len);
+    try testing.expectEqualStrings("pen", t0.get("values").?.array.items[0].string);
+    try testing.expect(t0.get("optional").?.bool);
+    try testing.expectEqualStrings("tool name", t0.get("desc").?.string);
+    try testing.expect(t0.get("min") == null);
+    try testing.expect(t0.get("max") == null);
+    try testing.expect(t0.get("pattern") == null);
+    try testing.expect(t0.get("variadic") == null); // false は省略
+
+    const t1 = args_arr[1].object;
+    // JSON 数値は整数リテラルだと .integer になりうる（0/255）
+    const min_f: f64 = switch (t1.get("min").?) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => return error.TestUnexpectedResult,
+    };
+    const max_f: f64 = switch (t1.get("max").?) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(f64, 0), min_f);
+    try testing.expectEqual(@as(f64, 255), max_f);
+    try testing.expect(t1.get("variadic").?.bool);
+    try testing.expect(t1.get("values") == null);
+    try testing.expect(t1.get("optional") == null);
+
+    const t2 = args_arr[2].object;
+    try testing.expectEqualStrings("#?RRGGBB", t2.get("pattern").?.string);
+    try testing.expect(t2.get("desc") == null);
+}
+
+test "capabilities: 空 slice → args:[] が現れ null と区別される" {
+    resetForTest();
+    var ac = TestActionCtx{};
+    const empty: []const ArgSpec = &.{};
+    registerAction(.{ .name = "none", .ctx = &ac, .run = testActionRun, .args = empty });
+
+    const payload = formatCapabilitiesPayload(&capabilities_buf);
+    try testing.expect(std.mem.indexOf(u8, payload, "\"args\":[]") != null);
+
+    var parsed = try parseCapabilities(payload);
+    defer parsed.deinit();
+    const a = parsed.value.object.get("actions").?.array.items[0].object;
+    try testing.expectEqual(@as(usize, 0), a.get("args").?.array.items.len);
+}
+
+test "capabilities: args サニタイズ違反（kind 制御文字 / values に \" / pattern 100B 超）→ warn + args 消失・登録成功" {
+    resetForTest();
+    var ac = TestActionCtx{};
+    var c = TestProbeCtx{ .value = 1 };
+
+    // kind に制御文字
+    const bad_kind = [_]ArgSpec{.{ .name = "x", .kind = "in\tt" }};
+    registerAction(.{ .name = "bk", .ctx = &ac, .run = testActionRun, .args = &bad_kind });
+    try testing.expect(findAction("bk") != null);
+    try testing.expect(findAction("bk").?.args == null);
+
+    // values に "
+    const bad_val = [_]ArgSpec{.{ .name = "x", .kind = "enum", .values = &.{"a\"b"} }};
+    registerAction(.{ .name = "bv", .ctx = &ac, .run = testActionRun, .args = &bad_val });
+    try testing.expect(findAction("bv") != null);
+    try testing.expect(findAction("bv").?.args == null);
+
+    // pattern 100B 超
+    const long_pat = [_]u8{'p'} ** (MAX_ARG_PATTERN_LEN + 1);
+    const bad_pat = [_]ArgSpec{.{ .name = "x", .kind = "string", .pattern = &long_pat }};
+    registerAction(.{ .name = "bp", .ctx = &ac, .run = testActionRun, .args = &bad_pat });
+    try testing.expect(findAction("bp") != null);
+    try testing.expect(findAction("bp").?.args == null);
+
+    // probe 側も同規則
+    const bad_probe = [_]ArgSpec{.{ .name = "x", .kind = "in\tt" }};
+    registerProbe(.{ .name = "bp2", .ctx = &c, .digest = testProbeDigest, .args = &bad_probe });
+    try testing.expect(findProbe("bp2") != null);
+    try testing.expect(findProbe("bp2").?.args == null);
+
+    // capabilities JSON にも args が載らない（消失後）
+    const payload = formatCapabilitiesPayload(&capabilities_buf);
+    try testing.expect(std.mem.indexOf(u8, payload, "\"args\"") == null);
+
+    // min/max の非有限値（NaN/Inf は JSON 数値にならない）→ args 消失・登録成功（codex P2）
+    const nan_min = [_]ArgSpec{.{ .name = "x", .kind = "int", .min = std.math.nan(f64) }};
+    registerAction(.{ .name = "bnan", .ctx = &ac, .run = testActionRun, .args = &nan_min });
+    try testing.expect(findAction("bnan") != null);
+    try testing.expect(findAction("bnan").?.args == null);
+    const inf_max = [_]ArgSpec{.{ .name = "x", .kind = "int", .max = std.math.inf(f64) }};
+    registerProbe(.{ .name = "binf", .ctx = &c, .digest = testProbeDigest, .args = &inf_max });
+    try testing.expect(findProbe("binf") != null);
+    try testing.expect(findProbe("binf").?.args == null);
+}
+
+test "capabilities: 大量 args で buf 溢れても既存 truncated 機構で valid JSON を維持" {
+    resetForTest();
+    var ac = TestActionCtx{};
+    // 長大 desc 付き ArgSpec を多数載せ、entry が content_limit に収まらない経路を踏む
+    const long_desc = [_]u8{'d'} ** 200;
+    var many: [40]ArgSpec = undefined;
+    for (&many) |*s| {
+        s.* = .{ .name = "argname", .kind = "string", .desc = &long_desc };
+    }
+    registerAction(.{ .name = "huge", .ctx = &ac, .run = testActionRun, .args = &many });
+
+    // 小さめ buf で capabilities を組み立て → 必ず valid JSON
+    var small: [MIN_CAPABILITIES_BUF_LEN + 200]u8 = undefined;
+    const payload = formatCapabilitiesPayload(&small);
+    var parsed = try parseCapabilities(payload);
+    defer parsed.deinit();
+    // truncated か、収まったかのどちらでも JSON として valid であればよい
+    _ = parsed.value.object.get("probes");
+    _ = parsed.value.object.get("actions");
 }
 
 // ============================================================================

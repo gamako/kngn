@@ -2483,35 +2483,77 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return res.output;
 }
 
+// TASK-88.1: capabilities 用 args シグネチャ（file-scope const。registerActions 直前）。
+// `@FieldType(platform.Action, "args")` = `?[]const ArgSpec`。null=未指定 / 空 slice=引数なし明示。
+const pixie_args_none: @FieldType(platform.Action, "args") = &.{};
+/// 省略可 layer ref（TASK-94: delete/duplicate/merge。省略時 selected。netsync 中は #id 必須）。
+const pixie_args_layer_ref_opt: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。netsync 中は #id 必須" },
+};
+const pixie_args_select_layer: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "netsync 中は #id 必須" },
+};
+const pixie_args_set_layer_visible: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "netsync 中は #id 必須" },
+    .{ .name = "visible", .kind = "bool", .desc = "0|1" },
+};
+const pixie_args_set_layer_opacity: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "netsync 中は #id 必須" },
+    .{ .name = "value", .kind = "int", .min = 0, .max = 255 },
+};
+const pixie_args_move_layer: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "delta", .kind = "enum", .values = &.{ "1", "-1" }, .desc = "+1|-1" },
+};
+const pixie_args_frame: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "sub", .kind = "enum", .values = &.{ "add", "select" } },
+    .{ .name = "idx", .kind = "int", .optional = true, .desc = "select 時の frame index" },
+};
+const pixie_args_set_onion: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "enabled", .kind = "enum", .values = &.{ "on", "off", "1", "0" } },
+    .{ .name = "count", .kind = "int", .min = 1, .max = 3, .optional = true },
+};
+const pixie_args_set_color: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "color", .kind = "string", .pattern = "#?RRGGBB" },
+};
+const pixie_args_set_tool: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "tool", .kind = "enum", .values = &.{ "pen", "eraser", "brush", "bezier", "select", "fill", "eyedropper" } },
+};
+const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "xy", .kind = "int", .variadic = true, .desc = "canvas 座標 x y の組（偶数個・最低1組）" },
+};
+const pixie_args_path: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "path", .kind = "path" },
+};
+
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
 /// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own }); // 制御コマンド（§4b。executor 非経由）
-    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own });
-    platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record) });
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own, .args = pixie_args_none }); // 制御コマンド（§4b。executor 非経由）
+    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record), .args = pixie_args_none });
     // TASK-94 Phase B: layer 構造 op は handle 参照化済みのため .relay 昇格。
     // select_layer のみ .local_only（selection は per-peer view。relay すると選択を奪い合う）。
-    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = recordedAction("select_layer", .record), .network_policy = .local_only });
-    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = recordedAction("set_layer_visible", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = recordedAction("set_layer_opacity", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = recordedAction("move_layer", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = recordedAction("duplicate_layer", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "frame", .ctx = app, .run = recordedAction("frame", .record) });
-    platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = recordedAction("set_onion", .record) });
-    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record), .network_policy = .relay });
-    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay });
-    platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only });
-    platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record) });
+    platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record), .network_policy = .relay, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record), .network_policy = .relay, .args = pixie_args_layer_ref_opt });
+    platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = recordedAction("select_layer", .record), .network_policy = .local_only, .args = pixie_args_select_layer });
+    platform.registerAction(.{ .name = "set_layer_visible", .ctx = app, .run = recordedAction("set_layer_visible", .record), .network_policy = .relay, .args = pixie_args_set_layer_visible });
+    platform.registerAction(.{ .name = "set_layer_opacity", .ctx = app, .run = recordedAction("set_layer_opacity", .record), .network_policy = .relay, .args = pixie_args_set_layer_opacity });
+    platform.registerAction(.{ .name = "move_layer", .ctx = app, .run = recordedAction("move_layer", .record), .network_policy = .relay, .args = pixie_args_move_layer });
+    platform.registerAction(.{ .name = "duplicate_layer", .ctx = app, .run = recordedAction("duplicate_layer", .record), .network_policy = .relay, .args = pixie_args_layer_ref_opt });
+    platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record), .network_policy = .relay, .args = pixie_args_layer_ref_opt });
+    platform.registerAction(.{ .name = "frame", .ctx = app, .run = recordedAction("frame", .record), .args = pixie_args_frame });
+    platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = recordedAction("set_onion", .record), .args = pixie_args_set_onion });
+    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record), .network_policy = .relay, .args = pixie_args_set_color });
+    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record), .network_policy = .relay, .args = pixie_args_set_tool });
+    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay, .args = pixie_args_stroke });
+    platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only, .args = pixie_args_path });
+    platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record), .args = pixie_args_path });
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
-    platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
-    platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
+    platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only, .args = pixie_args_path });
+    platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only, .args = pixie_args_path });
     // diff_mark（TASK-87）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
-    platform.registerAction(.{ .name = "diff_mark", .ctx = app, .run = actionDiffMark, .network_policy = .local_only, .desc = "mark current composite as diff baseline" });
+    platform.registerAction(.{ .name = "diff_mark", .ctx = app, .run = actionDiffMark, .network_policy = .local_only, .desc = "mark current composite as diff baseline", .args = pixie_args_none });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

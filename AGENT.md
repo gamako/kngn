@@ -486,7 +486,7 @@ snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n> band_low/mid/high=<0..1> centroid=<Hz> onsets=<n> lufs=<f>（mono downmix・自己相関 f0 + TASK-92: 帯域/セントロイド/オンセット/momentary LUFS。既存 audio への additive。audio2 等の新 probe は作らない）
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...}（JSON 1行）
-digest capabilities        # {"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..},...],"actions":[{"name":..,"desc":..},...]}（登録済み probe・action の内省列挙。TASK-62.4）
+digest capabilities        # {"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}（登録済み probe・action の内省列挙。TASK-62.4 + args シグネチャ TASK-88.1）
 snapshot capabilities /tmp/c.json # capabilities を JSON 保存（省略時 capabilities_<n>.json）
 action <name> [args...]    # app が registerAction した高レベル操作を実行（probe(read)対称のwrite口。TASK-62.1）
 expect fb crc=8702DD71     # expect <probe> <key><op><value>（op ∈ = != > <）。digest payload の top-level k=v と照合
@@ -502,9 +502,10 @@ quit                       # 終了（EOF でも終了）
   `centroid`[Hz] / `onsets`（スペクトラルフラックスピーク数）/ `lufs`（BS.1770 K-weighting momentary 400ms。無音床値 -99.0）。
   AC 判断: 新 probe 名（audio2 等）は作らず既存 `audio` にキーを足す。解析は digest 要求時のみ（RT 経路不変）。
   `virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
-- **capabilities（内省 probe / TASK-62.4）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み4件（`fb`/`audio`/`stats`/`capabilities` 自身。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
-  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 32 + 組み込み4）と desc の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
-  - 将来クライアント（TASK-62.3 network discover 等）が「今このアプリで何を観測・操作できるか」を discover する入口になる。
+- **capabilities（内省 probe / TASK-62.4 + args シグネチャ TASK-88.1）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み6件（`fb`/`audio`/`stats`/`capabilities` 自身/`capture`/`gamepad`。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**フィールド追加のみ**で `args`（省略可）を載せられる（下記）。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない。kind の語彙も検証しない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
+  - **args シグネチャ（TASK-88.1）**: `registerAction`/`registerProbe` に `args: ?[]const ArgSpec = null` を渡せる（省略可・後方互換）。`ArgSpec = {name, kind, min?, max?, values, pattern, optional, variadic, desc}`。**null=未指定（JSON に `args` フィールド無し・従来と bit 一致）/ 空 slice=`"args":[]`（引数なしを明示。MCP の fallback 判定用に null と区別）**。`args != null` のときだけ `"args":[{"name":..,"kind":..(,"min":..)(,"max":..)(,"values":[..])(,"pattern":..)(,"optional":true)(,"variadic":true)(,"desc":..)},...]` を追記（**非デフォルト値のみ emit**）。kind は文字列（推奨: `int`/`float`/`string`/`bool`/`enum`/`path`。app 独自 kind 可。解釈は消費側=MCP）。
+  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 32 + 組み込み6）と desc/args の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
+  - 将来クライアント（TASK-62.3 network discover / TASK-88 MCP 等）が「今このアプリで何を観測・操作できるか」を discover する入口になる。
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..,name=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`) / `cursor` / `history` / `diff`(`changed=N bbox=x0,y0,x1,y1 from=#RRGGBB to=#RRGGBB`。基準は `action diff_mark` または初回 digest で自動初期化。changed=0 時は `bbox=none from=none to=none`)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
 - **inject の修飾子トークン（TASK-32.5）**: `inject` の必須引数の後に `shift`/`ctrl`/`alt`/`cmd` を 0 個以上付けると、その KeyEvent/MouseEvent の `modifiers` に反映される（順不同・大小無視）。key_down/up・mouse_move/down/up・scroll の全経路で使える。例: `inject key_down S cmd`（Cmd+S）/ `inject key_down Z cmd`（undo）/ `inject mouse_down left alt`。**未知トークンが 1 つでもあれば警告を出し、そのイベントは注入されない（fail-fast。修飾子名の typo を握りつぶさない）**。修飾子無しは従来通り空 modifiers。
@@ -622,6 +623,7 @@ app が内部状態を opt-in で probe として公開する。**framework（`c
 - `registerProbe` は **harness 無効時（env 未設定）は no-op**なので、通常実行に影響しない（常に呼んでよい）。
 - audio RT スレッドが触る状態（synth `voices`/`patch` 等）の読み出しは torn し得る best-effort スナップショット。**RT 経路に同期/alloc/lock を足さない**。
 - **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は登録時にサニタイズされる**: `"` / `\` / ASCII 制御文字（tab・NUL 等）を含む、または 200 bytes 超の desc は warn を出し空文字へ落とされる（登録自体は成功する。desc だけ無効化）。**capabilities JSON は desc を JSON エスケープせずそのまま埋め込む前提**なので、この禁止文字は「意味解釈」ではなく wire framing 保護。
+- **`args`（TASK-88.1。省略可）も登録時にサニタイズされる**: 各 `ArgSpec` の文字列フィールド（name/kind/values[*]/pattern/desc）に同じ禁止文字規則 + 長さ上限（name/kind 32B・values 各 64B・pattern 100B・desc 200B）を適用。**違反時は warn + args 全体を null に落とす**（登録自体は成功。desc の空文字化と同型のフェイルセーフ）。framework は kind の意味を解釈しない。
 - 実装の手本: pixie の `canvas`/`undo`/`tool`（`apps/editor/apps/pixie/main.zig`）、synth の `voices`/`patch`（`apps/synth/main.zig`）。
 
 ### custom action の足し方（TASK-62.1）
@@ -660,6 +662,7 @@ action 固有のコードを一切足さない**（中身非パースの不変�
   詳細は上記 action 節の structured error 項。
 - 組み込み action は今回作らない。app 側の action 登録は各採用タスク（pixie/synth/modular 等）で行う。
 - **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は probe と同じ規則でサニタイズされる**: `"` / `\` / ASCII 制御文字を含む、または 200 bytes 超は warn + 空文字化（登録自体は成功）。
+- **`args`（TASK-88.1。省略可）も probe と同じ規則でサニタイズされる**: name/kind/values/pattern/desc の禁止文字 + 長さ上限違反時は warn + args 全体を null（登録自体は成功。null=JSON から args 省略 / 空 slice=`"args":[]` は区別される）。pixie は全登録 action にシグネチャを付与（`stroke`=variadic 座標列 / `set_tool`=enum / `set_color`=hex pattern / path 系 等）。
 
 - **実行モデル**: 非 step（inject/snapshot/digest/action）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept/read 待機**（= step 待ちで block）。**live 実表示**では待機中も facade 経由で native `pollEvents()` を短周期（~16ms timeout）で pump し、Wayland ping / macOS window 更新を維持する（TASK-32.6）。**headless live**（`VP_HARNESS_HEADLESS=1`）は compositor 未接続のため pump callback は渡さず、従来通り blocking accept/read。
 - **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
