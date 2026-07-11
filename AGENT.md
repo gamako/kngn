@@ -700,24 +700,47 @@ action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry�
 
 **remote 適用の暫定例外（62.3.2）**: CommandRecord を作らず共有 executor の `record_policy=.no_record` で実行する（wire seq と local_only の seq 衝突回避。62.3.5 で本則へ）。
 
-### MVP 2 プロセス手順
+### MVP 2 プロセス手順（probe ベースの決定的待ち）
 
 ```bash
+# 起動（port file 出現待ちだけ sleep 可）
 VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vpHost.port \
   VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9100 zig build run-pixie &
 VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vpClient.port \
   VP_NETSYNC_CONNECT=127.0.0.1:9100 zig build run-pixie &
+
+# client join 完了: awaiting_sync=0 まで再照合
+until scripts/drive --port-file /tmp/vpClient.port 'digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+
 scripts/drive --port-file /tmp/vpClient.port 'action stroke 10 10 60 10'  # → "proposed <id>"
+
+# relay 完了: 両側 last_seq>=1 && pending=0 まで再照合（N は期待 commit 数）
+until scripts/drive --port-file /tmp/vpHost.port 'digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/drive --port-file /tmp/vpClient.port 'digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+
 scripts/drive --port-file /tmp/vpHost.port 'digest canvas'
 scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
 ```
+
+### netsync 観測 probe（TASK-62.3.4）
+
+`platform.init` で netsync 有効時のみ custom probe `netsync` を登録（予約名ではない）。
+
+| 項目 | 内容 |
+|---|---|
+| digest | 1 行 k=v（live 応答は `netsync ` 接頭）: `role=<host\|client> peers=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none>` |
+| snapshot | 同内容の JSON 1 オブジェクト（`ext=json`）。command log 要約は 62.3.5 まで未提供 |
+| last_seq | host = wire commit カウンタ / client = 最後に適用した COMMIT の seq |
+| reject_reason | ASCII whitespace・制御文字を `_` 置換、64B 切り詰め |
+
+決定的待ちは `drive 'digest netsync'` を until で再照合する（固定 sleep リトライは使わない。プロセス起動の port file 待ちだけ sleep 可）。
 
 ### セッション中の制約・retry
 
 - undo/redo・レイヤー操作・PNG open は session 中不可（既定 reject）
 - save のみローカル可
-- **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` を一度受けたら再送しない（二重適用回避）。以後は digest の polling のみ
-- 接続確立前の action は失敗しうる → 確立後に再試行（上記 retry 条件）
+- **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` を一度受けたら再送しない（二重適用回避）。以後は `digest netsync` の決定的待ち
+- 接続確立前の action は失敗しうる → join 完了（`awaiting_sync=0`）後に再試行（上記 retry 条件）
 
 ## 性能規約（メモリI/O・キャッシュ最適化）
 

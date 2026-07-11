@@ -3504,6 +3504,44 @@ test "live pump: request 1 MiB 超過後も次接続を accept できる" {
     try testing.expect(pollGateWithPump(true, always_pump));
 }
 
+test "netsync probe: 無効時は未登録 / host 有効時 expect role=host" {
+    resetForTest();
+    defer resetForTest();
+    // 無効時（register 前）capabilities に netsync は出ない
+    try testing.expect(findProbe("netsync") == null);
+    {
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        const probe_list = parsed.value.object.get("probes").?.array;
+        for (probe_list.items) |item| {
+            const name = item.object.get("name").?.string;
+            try testing.expect(!std.mem.eql(u8, name, "netsync"));
+        }
+    }
+
+    netsync.resetForTest();
+    defer netsync.resetForTest();
+    netsync.initHost(0);
+    registerProbe(.{
+        .name = "netsync",
+        .ctx = @ptrFromInt(1),
+        .ext = "json",
+        .desc = "netsync stats",
+        .digest = netsync.probeDigest,
+        .snapshot = netsync.probeSnapshot,
+    });
+    try testing.expect(findProbe("netsync") != null);
+
+    // headless replay: expect netsync role=host
+    var sbuf: [128]u8 = undefined;
+    cmd_buf = "expect netsync role=host\nstep 1\n";
+    _ = &sbuf;
+    cursor = 0;
+    expect_failures = 0;
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+}
+
 // ============================================================================
 // copilot（第3 control-plane。TASK-62.5.2）の namespace 再エクスポート。
 // facade が `@import("harness").copilot` で届くようにするためだけの 1 行で、

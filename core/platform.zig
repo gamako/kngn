@@ -243,6 +243,17 @@ pub fn init() Error!void {
     copilot.startTransport();
     // netsync は headless 分岐でも起動（env 未設定なら initFromEnv 即 return。TASK-62.3.2）。
     netsync.initFromEnv();
+    // 観測 probe（TASK-62.3.4）。有効時のみ。netsync→harness 逆依存を避けるため platform から登録。
+    if (netsync.isEnabled()) {
+        harness.registerProbe(.{
+            .name = "netsync",
+            .ctx = @ptrFromInt(1),
+            .ext = "json",
+            .desc = "netsync role/peers/last_seq/pending/awaiting_sync/last_reject",
+            .digest = netsync.probeDigest,
+            .snapshot = netsync.probeSnapshot,
+        });
+    }
 }
 
 pub fn shutdown() void {

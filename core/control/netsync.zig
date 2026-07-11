@@ -75,7 +75,7 @@ pub const PeerView = struct {
     label: []const u8,
 };
 
-const Role = enum { disabled, host, client };
+pub const Role = enum { disabled, host, client };
 const SlotState = enum { empty, hello_pending, active, closing };
 
 pub const ProtocolError = error{
@@ -441,7 +441,7 @@ pub const StateSync = struct {
 //   slots[*].state および slot の peer メタ（peer_id/kind/label/hello_done/socket_open）/
 //   client_slot の同種フィールド
 // `stop_flag` のみ atomic。`have_server` / acceptor_thread は main（init/shutdown）専有。
-// wire_seq / next_proposal_id / last_rejected_* / shared_executor は main thread 専有
+// wire_seq / next_proposal_id / last_rejected_* / last_applied_seq / shared_executor は main thread 専有
 // （pump / router / setSharedExecutor。reader は触らない）。
 // outbound キューは独自 mutex を持ち、ロック順序は **peers_mutex → outbound.mutex**（逆順禁止）。
 
@@ -481,6 +481,8 @@ var router_clear_pending: bool = false;
 
 /// host の wire COMMIT seq（単調増加。main thread 専有）。
 var wire_seq: u64 = 0;
+/// client: 最後に適用した COMMIT の seq（main thread 専有。digest last_seq の client 側）。
+var last_applied_seq: u64 = 0;
 /// client の proposal_id（単調増加。main thread 専有）。
 var next_proposal_id: u32 = 0;
 
@@ -495,6 +497,141 @@ var state_sync: ?StateSync = null;
 var awaiting_sync: bool = false;
 /// client reader が積む SYNC payload（seq+state）。peers_mutex 下で置換・解放。
 var pending_sync: ?[]u8 = null;
+
+/// 観測用スナップショット（TASK-62.3.4）。
+/// `gatherStats` / probe digest・snapshot は harness 設計上 **main thread（pollGate 内）でのみ**呼ぶ。
+pub const NetsyncStats = struct {
+    role: Role = .disabled,
+    peers: usize = 0,
+    peer_id: u32 = 0,
+    last_seq: u64 = 0,
+    pending: usize = 0,
+    awaiting_sync: bool = false,
+    last_reject: u32 = 0,
+};
+
+/// reader 共有フィールドを 1 回の `peers_mutex` 保持で一括取得し、main thread 専有値を足す。
+/// **main thread 専用**（probe = pollGate 内前提）。
+pub fn gatherStats() NetsyncStats {
+    var st: NetsyncStats = .{};
+    if (!io_inited) return st;
+
+    peers_mutex.lockUncancelable(io_val);
+    const on = started and role != .disabled;
+    if (on) {
+        st.role = role;
+        st.peer_id = if (role == .host) 0 else local_peer_id;
+        st.awaiting_sync = awaiting_sync;
+        st.pending = inbound.len(io_val);
+        if (role == .host) {
+            for (&slots) |*s| {
+                if (s.state == .active) st.peers += 1;
+            }
+        } else if (role == .client and client_slot.state == .active) {
+            st.peers = 1;
+        }
+    }
+    peers_mutex.unlock(io_val);
+
+    if (!on) return st;
+
+    // main thread 専有（lock 不要）
+    st.last_seq = if (st.role == .host) wire_seq else last_applied_seq;
+    st.last_reject = last_rejected_proposal;
+    return st;
+}
+
+const reject_reason_token_max = 64;
+
+/// ASCII whitespace（space/tab/CR/LF）と制御文字を `_` に置換し、最大 64B に切り詰める。
+pub fn sanitizeRejectReasonToken(out: []u8, reason: []const u8) []const u8 {
+    const n = @min(reason.len, @min(out.len, reject_reason_token_max));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c = reason[i];
+        out[i] = if (c <= 0x20 or c == 0x7f) '_' else c;
+    }
+    return out[0..n];
+}
+
+fn roleDigestName(r: Role) []const u8 {
+    return switch (r) {
+        .disabled => "disabled",
+        .host => "host",
+        .client => "client",
+    };
+}
+
+/// digest 1 行 payload（probe 名は harness が付与。`role=... peers=...`）。**main thread 専用**。
+pub fn formatDigest(buf: []u8) []const u8 {
+    const st = gatherStats();
+    var reason_buf: [reject_reason_token_max]u8 = undefined;
+    const reason_tok = if (st.last_reject == 0)
+        "none"
+    else
+        sanitizeRejectReasonToken(&reason_buf, lastRejectReason());
+
+    var reject_id_buf: [16]u8 = undefined;
+    const reject_tok = if (st.last_reject == 0)
+        "none"
+    else
+        (std.fmt.bufPrint(&reject_id_buf, "{d}", .{st.last_reject}) catch "?");
+
+    return std.fmt.bufPrint(buf, "role={s} peers={d} peer_id={d} last_seq={d} pending={d} awaiting_sync={d} last_reject={s} reject_reason={s}", .{
+        roleDigestName(st.role),
+        st.peers,
+        st.peer_id,
+        st.last_seq,
+        st.pending,
+        @as(u8, if (st.awaiting_sync) 1 else 0),
+        reject_tok,
+        reason_tok,
+    }) catch buf[0..0];
+}
+
+/// snapshot JSON 1 オブジェクト。command log 要約は 62.3.5 まで未提供（no_record 暫定例外のため）。
+/// **main thread 専用**。
+pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
+    const st = gatherStats();
+    var reason_buf: [reject_reason_token_max]u8 = undefined;
+    if (st.last_reject == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":null,\"reject_reason\":null}}", .{
+            roleDigestName(st.role),
+            st.peers,
+            st.peer_id,
+            st.last_seq,
+            st.pending,
+            if (st.awaiting_sync) "true" else "false",
+        });
+    }
+    const reason_tok = sanitizeRejectReasonToken(&reason_buf, lastRejectReason());
+    // JSON 文字列用に " \ を除外（sanitize 後も残りうる）
+    var json_reason: [reject_reason_token_max]u8 = undefined;
+    const rn = @min(reason_tok.len, json_reason.len);
+    for (reason_tok[0..rn], 0..) |c, i| {
+        json_reason[i] = if (c == '"' or c == '\\') '_' else c;
+    }
+    return std.fmt.allocPrint(allocator, "{{\"role\":\"{s}\",\"peers\":{d},\"peer_id\":{d},\"last_seq\":{d},\"pending\":{d},\"awaiting_sync\":{s},\"last_reject\":{d},\"reject_reason\":\"{s}\"}}", .{
+        roleDigestName(st.role),
+        st.peers,
+        st.peer_id,
+        st.last_seq,
+        st.pending,
+        if (st.awaiting_sync) "true" else "false",
+        st.last_reject,
+        json_reason[0..rn],
+    });
+}
+
+/// harness custom probe 用 digest（ctx 未使用）。
+pub fn probeDigest(_: *anyopaque, buf: []u8) []const u8 {
+    return formatDigest(buf);
+}
+
+/// harness custom probe 用 snapshot（ctx 未使用）。
+pub fn probeSnapshot(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    return formatSnapshot(allocator);
+}
 
 /// StateSync を登録する（netsync 無効時も保存のみ・常に呼んでよい）。
 /// export_fn は 0 byte を返してはならない（返した場合は export 失敗扱い）。
@@ -745,6 +882,7 @@ pub fn initHost(port: u16) void {
         return;
     };
     wire_seq = 0;
+    last_applied_seq = 0;
     enableRouter();
     std.debug.print("[netsync] host 有効: 127.0.0.1:{d}\n", .{server.socket.address.getPort()});
 }
@@ -827,6 +965,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     // HELLO 送出前に awaiting_sync を立てる（reader が先行して置いた pending_sync を
     // 後から free して永久停止する race を防ぐ）。
     next_proposal_id = 0;
+    last_applied_seq = 0;
     peers_mutex.lockUncancelable(io_val);
     awaiting_sync = true;
     freePendingSyncLocked();
@@ -1143,7 +1282,9 @@ fn handleCommit(payload: []const u8) void {
     var abuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     _ = applyRemoteNoRecord(parsed.name, parsed.args, parsed.origin_peer, &abuf) catch |err| {
         std.debug.print("[netsync] COMMIT 適用失敗: {s}\n", .{@errorName(err)});
+        return;
     };
+    last_applied_seq = parsed.seq;
 }
 
 fn handleReject(payload: []const u8) void {
@@ -1273,6 +1414,7 @@ pub fn shutdown() void {
     // main thread のみ setRouter(null)
     action_registry.setRouter(null);
     wire_seq = 0;
+    last_applied_seq = 0;
     next_proposal_id = 0;
     last_rejected_proposal = 0;
     last_reject_reason_len = 0;
@@ -1656,6 +1798,7 @@ pub fn resetForTest() void {
     defaultClientLabel();
     stop_flag.store(false, .seq_cst);
     wire_seq = 0;
+    last_applied_seq = 0;
     next_proposal_id = 0;
     last_rejected_proposal = 0;
     last_reject_reason_len = 0;
@@ -3293,4 +3436,174 @@ test "netsync: shutdown 中の未送出 big-entry 解放と writer join" {
     try testing.expectEqual(@as(usize, 0), slots[0].outbound.count);
     try testing.expect(slots[0].writer_thread == null);
     try testing.expect(slots[0].state == .empty);
+}
+
+test "netsync: gatherStats 無効時は既定値" {
+    resetForTest();
+    defer resetForTest();
+    const st = gatherStats();
+    try testing.expectEqual(Role.disabled, st.role);
+    try testing.expectEqual(@as(usize, 0), st.peers);
+    try testing.expectEqual(@as(u32, 0), st.peer_id);
+    try testing.expectEqual(@as(u64, 0), st.last_seq);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expect(!st.awaiting_sync);
+    try testing.expectEqual(@as(u32, 0), st.last_reject);
+}
+
+test "netsync: gatherStats host 有効時 peers・pending" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    const port = listeningPort().?;
+    var stream = try rawHelloConnect(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, "gs");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+
+    // ClientJoined 未 pump → pending>=1
+    const before = gatherStats();
+    try testing.expectEqual(Role.host, before.role);
+    try testing.expectEqual(@as(usize, 1), before.peers);
+    try testing.expectEqual(@as(u32, 0), before.peer_id);
+    try testing.expect(before.pending >= 1);
+
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+    const after = gatherStats();
+    try testing.expectEqual(@as(usize, 0), after.pending);
+    try testing.expectEqual(@as(u64, 0), after.last_seq);
+}
+
+test "netsync: gatherStats client awaiting_sync 遷移と last_applied_seq" {
+    resetForTest();
+    defer resetForTest();
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [512]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [512]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 7) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            const sync_bytes = buildSyncPayload(0, "S") catch return;
+            defer gpa.free(sync_bytes);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), sync_bytes) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(30);
+            const commit = formatCommitPayload(&pbuf, 3, 0, "stroke", "a") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.commit), commit) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(100);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var sctx: SyncCtx = .{};
+    registerStateSync(.{ .ctx = &sctx, .export_fn = syncExport, .import_fn = syncImport });
+    var actx: SemCtx = .{};
+    registerSem("stroke", &actx, .relay);
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "gs2");
+    try waitClientActive(2000);
+    try testing.expect(gatherStats().awaiting_sync);
+
+    var waited: u64 = 0;
+    while (testAwaitingSync() and waited < 3000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expect(!gatherStats().awaiting_sync);
+    try testing.expectEqual(@as(u64, 0), gatherStats().last_seq);
+
+    waited = 0;
+    while (gatherStats().last_seq < 3 and waited < 3000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expectEqual(@as(u64, 3), gatherStats().last_seq);
+    try testing.expectEqual(@as(u32, 1), actx.calls);
+}
+
+test "netsync: digest 整形・reject_reason 正規化と切り詰め" {
+    resetForTest();
+    defer resetForTest();
+
+    var buf: [512]u8 = undefined;
+    const disabled = formatDigest(&buf);
+    try testing.expect(std.mem.startsWith(u8, disabled, "role=disabled"));
+    try testing.expect(std.mem.indexOf(u8, disabled, "last_reject=none") != null);
+    try testing.expect(std.mem.indexOf(u8, disabled, "reject_reason=none") != null);
+
+    // reason 正規化（単体）
+    var tok: [64]u8 = undefined;
+    const s1 = sanitizeRejectReasonToken(&tok, "a b\tc\nd\r");
+    try testing.expectEqualStrings("a_b_c_d_", s1);
+    const long = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefEXTRA";
+    const s2 = sanitizeRejectReasonToken(&tok, long);
+    try testing.expectEqual(@as(usize, 64), s2.len);
+    try testing.expect(std.mem.eql(u8, s2, long[0..64]));
+
+    // REJECT 後の digest
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [256]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [256]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            const rej = formatRejectPayload(&pbuf, 42, "bad\treason\n") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.reject), rej) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(80);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "dig");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (lastRejectedProposal() == 0 and waited < 3000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+    const dig = formatDigest(&buf);
+    try testing.expect(std.mem.indexOf(u8, dig, "role=client") != null);
+    try testing.expect(std.mem.indexOf(u8, dig, "last_reject=42") != null);
+    try testing.expect(std.mem.indexOf(u8, dig, "reject_reason=bad_reason_") != null);
+    try testing.expectEqual(@as(u32, 42), gatherStats().last_reject);
+
+    const snap = try formatSnapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"last_reject\":42") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"reject_reason\":\"bad_reason_\"") != null);
 }
