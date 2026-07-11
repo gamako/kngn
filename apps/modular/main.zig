@@ -27,6 +27,7 @@ const PatchState = patchmod.PatchState;
 const actions = @import("actions.zig");
 const pattern_io = @import("pattern_io.zig");
 const wav = @import("wav.zig");
+const seedmod = @import("seed.zig");
 
 // ウィンドウ。上部=GUI コントロール + DrumMachine/BassMachine、下部=可視化帯。
 const WIN_W = 1120;
@@ -70,6 +71,14 @@ const App = struct {
     cmd_exec: platform.command.Executor = undefined,
     /// recipe_replay 実行中フラグ（入れ子拒否用。TASK-62.5.8）。
     recipe_replaying: bool = false,
+    /// TASK-93 mini-notation 用。`action seed` で同期する app 所有 base seed（RT base_seed は
+    /// bar 進行依存で replay 決定性が壊れるため読まない）。初期値 = DEFAULT_BASE_SEED。
+    notation_seed: u64 = seedmod.DEFAULT_BASE_SEED,
+    /// 評価ごと ++。rng_seed / alt_index の両方に使い、レシピ replay で counter 順が一致すれば決定的。
+    /// `recipe_replay` 冒頭で 0 にリセットする。
+    notation_counter: u32 = 0,
+    /// bar 境界前の連続 `action pattern` 用。直前に publish した quantize cmd（後続の base）。
+    last_quantized_cmd: ?PatternCommand = null,
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -793,11 +802,13 @@ fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 }
 
 /// `action seed <n>`: main thread で parse → lock-free publish → 次 bar 境界で RT が適用（TASK-62.5.7）。
+/// TASK-93: app.notation_seed も同期（mini-notation の `?` / 交代が seed 規約と整合する）。
 fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
     const patch = app.patch orelse return error.NotReady;
     const n = try actions.parseU64(args);
+    app.notation_seed = n;
     patch.requestSeed(n);
     return "ok";
 }
@@ -886,6 +897,73 @@ fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     return std.fmt.bufPrint(buf, "ok path={s} seconds={d} sr={d}", .{ parsed.path, parsed.seconds, sr_u32 }) catch "ok";
 }
 
+// ============================================================================
+// TASK-93: `action pattern <track> <notation>`（mini-notation → pattern_db、小節境界適用）
+//
+// ホットパス宣言: parse/eval は action 実行時（main thread・イベント時）のみ。RT へは評価済み
+// PatternCommand（quantize_bar=true）を publish するだけ。RT 追加分は patch.zig の bar 境界
+// 固定長コピー（alloc/lock なし）。
+// ============================================================================
+
+const PatternTrack = enum { kick, hat, clap, bass };
+
+fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const pa = actions.parsePatternArgs(args) catch {
+        platform.setActionErrorDetail("invalid_notation", "usage: pattern <kick|hat|clap|bass> <notation>");
+        return error.InvalidNotation;
+    };
+    const track = std.meta.stringToEnum(PatternTrack, pa.track) orelse {
+        platform.setActionErrorDetail("unknown_track", "track must be kick|hat|clap|bass");
+        return error.UnknownTrack;
+    };
+    const ast = actions.parseNotation(pa.notation) catch {
+        platform.setActionErrorDetail("invalid_notation", "check mini-notation syntax");
+        return error.InvalidNotation;
+    };
+    // rng_seed = splitmix64(notation_seed ^ counter)、alt_index = counter。評価後に ++。
+    const alt_index = app.notation_counter;
+    const rng_seed = seedmod.splitmix64(app.notation_seed ^ @as(u64, alt_index));
+    app.notation_counter +%= 1;
+    const result = actions.evalNotation(ast, rng_seed, alt_index);
+
+    // P1-3: bar 待ち中（または publish 済みで RT 未 acquire）は last_quantized_cmd を base にし、
+    // 連続 pattern で先行 track を潰さない。
+    const st = patch.snapshotState();
+    var cmd = stateToCommand(st);
+    if (app.last_quantized_cmd) |lq| {
+        // 我々の最新 quantize がまだ bar 反映前: bar_pending、または applied_rev 未到達
+        if (lq.rev == app.pattern_rev and (st.bar_pending or st.pattern_rev != lq.rev)) {
+            cmd = lq;
+        }
+    }
+    switch (track) {
+        .kick => cmd.kick.on = result.on,
+        .hat => cmd.hat.on = result.on,
+        .clap => cmd.clap.on = result.on,
+        .bass => {
+            // 宣言的全置換: on は全置換、deg は deg_set の step のみ上書き（accent/slide は維持）
+            cmd.bass.on = result.on;
+            var s: u8 = 0;
+            while (s < 16) : (s += 1) {
+                const m = bitOf(s);
+                if (result.deg_set & m != 0) {
+                    cmd.bass.deg[s] = result.deg[s];
+                }
+            }
+        },
+    }
+    // lock されていても明示編集は通す（GUI toggle_step と同挙動）
+    cmd.quantize_bar = true;
+    app.pattern_rev += 1;
+    cmd.rev = app.pattern_rev;
+    app.last_quantized_cmd = cmd;
+    patch.controls.pattern_db.publish(cmd);
+    return "ok";
+}
+
 /// CommandLog の kind=normal を seq 順で Entry 化（TASK-62.5.8）。name/args は log 借用。
 fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
     var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
@@ -916,6 +994,7 @@ fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
 }
 
 /// `recipe_replay <path>`: load → app_name 検証 → routeLocalAction 逐次適用。入れ子拒否。
+/// TASK-93: notation_counter を 0 から再評価（seed+pattern 列の決定性）。
 fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const gpa = std.heap.c_allocator;
@@ -923,6 +1002,8 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
         platform.setActionErrorDetail("nested_replay", "wait for current recipe_replay to finish");
         return error.NestedReplay;
     };
+    // mini-notation の `?` / `<a b>` を recipe 先頭から決定的に再評価する。
+    app.notation_counter = 0;
     const path = try actions.parsePath(args);
     var loaded = recipe.load(app.io, gpa, path) catch |err| {
         if (err == error.FileNotFound) {
@@ -976,6 +1057,7 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "save_pattern", .run = actionSavePattern },
     .{ .name = "load_pattern", .run = actionLoadPattern },
     .{ .name = "seed", .run = actionSeed },
+    .{ .name = "pattern", .run = actionPattern },
 };
 
 fn dispatchModularAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -1010,6 +1092,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = recordedAction("save_pattern") });
     platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = recordedAction("load_pattern") });
     platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed") });
+    // TASK-93: mini-notation。レシピには記法の生テキストを記録（replay 時 counter 順で再評価→決定的）。
+    platform.registerAction(.{ .name = "pattern", .ctx = app, .run = recordedAction("pattern") });
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });

@@ -90,6 +90,8 @@ pub const BassLane = struct {
 /// GUI が publish する pattern スナップショット（rev で変化検知）。
 /// evolve = 自己進化の全体トグル（off で完全な手動シーケンサ）、lock = トラック単位の凍結。
 /// トラックが per-bar 変異するのは evolve かつ !lock のときだけ。
+/// quantize_bar（TASK-93）: true なら RT はブロック境界で即反映せず、次 bar 境界まで pending。
+/// GUI 編集・既存 action は false（挙動不変）。mini-notation `action pattern` のみ true。
 pub const PatternCommand = struct {
     rev: u32 = 0,
     evolve: bool = true, // 全体の自己進化 on/off（既定 ON）
@@ -97,6 +99,7 @@ pub const PatternCommand = struct {
     hat: DrumTrack = .{},
     clap: DrumTrack = .{},
     bass: BassLane = .{},
+    quantize_bar: bool = false,
 
     pub fn default() PatternCommand {
         return .{
@@ -239,6 +242,8 @@ pub const PatchState = struct {
     ambient_lfo: f32, // 現 LFO 値（-1..1）
     // TASK-62.5.7: 適用済み base seed（digest 用。pending ではなく RT が latch した値）
     base_seed: u64,
+    // TASK-93: bar 境界待ちの quantize pattern があるか（pending_bar_cmd != null。torn 可）
+    bar_pending: bool,
 };
 
 pub const LofiPatch = struct {
@@ -295,6 +300,8 @@ pub const LofiPatch = struct {
     // TASK-62.5.7: 適用済み base seed / pending gen（RT 所有。digest は base_seed を読む）
     base_seed: u64,
     applied_seed_gen: u64,
+    // TASK-93: quantize_bar=true の PatternCommand を次 bar 境界まで退避（固定長・alloc なし）
+    pending_bar_cmd: ?PatternCommand,
 
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) !*LofiPatch {
         const self = try allocator.create(LofiPatch);
@@ -358,6 +365,7 @@ pub const LofiPatch = struct {
             .evolve = true,
             .base_seed = base,
             .applied_seed_gen = 0,
+            .pending_bar_cmd = null,
         };
 
         self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 40, .max_ports = 64 });
@@ -374,9 +382,11 @@ pub const LofiPatch = struct {
 
     /// offline / 初期化用: base seed を即時適用（live の `action seed` は `requestSeed`＝次 bar 境界）。
     /// pending gen も同期し、直後の bar 境界で二重適用しない。
+    /// offline なので bar 待ち pattern も破棄する（live の maybeEvolve 経路とは別）。
     pub fn resetWithSeed(self: *LofiPatch, base: u64) void {
         self.requestSeed(base);
         self.applied_seed_gen = self.controls.pending_seed_gen.load(.acquire);
+        self.pending_bar_cmd = null;
         self.applyBaseSeed(base);
         if (self.clock.started) {
             self.last_bar = self.clock.tick_index / STEPS_PER_BAR;
@@ -479,22 +489,22 @@ pub const LofiPatch = struct {
     }
 
     /// GUI が store/publish した Controls を各モジュール field へ反映（RT 単一スレッド）。
+    /// ホットパス: ブロック先頭・bool 分岐 + 固定長 struct コピーのみ（alloc/lock/超越関数なし）。
     fn applyControls(self: *LofiPatch) void {
         const c = &self.controls;
         // grid/303 pattern: revision 変化時のみ取り込む（GUI 編集を反映、StepSeq.step は保持）。
         const cmd = c.pattern_db.acquire(); // Mailbox: 最新 publish を latch（*const、fresh 無しは現値維持）
         if (cmd.rev != self.applied_rev) {
             self.applied_rev = cmd.rev;
-            self.anchor = cmd.*; // 復帰先 = ユーザーの直近 intent
-            self.kick_seq.on_mask = cmd.kick.on;
-            self.hat_seq.on_mask = cmd.hat.on;
-            self.clap_seq.on_mask = cmd.clap.on;
-            self.bass_seq.on_mask = cmd.bass.on;
-            self.bass_seq.accent_mask = cmd.bass.accent;
-            self.bass_seq.slide_mask = cmd.bass.slide;
-            self.bass_seq.pitch_deg = cmd.bass.deg;
-            self.lock = .{ cmd.kick.lock, cmd.hat.lock, cmd.clap.lock, cmd.bass.lock };
-            self.evolve = cmd.evolve;
+            if (cmd.quantize_bar) {
+                // TASK-93: 小節境界まで退避（後着 publish は pending 上書き = latest-wins）。
+                // rev は consumed。StepSeq への反映は maybeEvolve の bar 境界。
+                self.pending_bar_cmd = cmd.*;
+            } else {
+                // 即反映（GUI / 既存 action）。pending 中の bar 予約は破棄（明示の即時編集が勝つ）。
+                self.pending_bar_cmd = null;
+                self.applyPatternCommand(cmd.*);
+            }
         }
         // scalar controls
         self.clock.bpm = clampFinite(c.tempo_bpm.load(), 40.0, 220.0, DEFAULT_BPM);
@@ -518,27 +528,59 @@ pub const LofiPatch = struct {
         self.pad.cutoff_mod_oct = 0.2 + mv * 0.8;
     }
 
-    /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら、pending seed があれば
-    /// PRNG/生成状態を再初期化し、無ければ 1 小節 1 回だけ前景パターンを変異する。
+    /// PatternCommand を StepSeq / lock / evolve / anchor へ反映（RT・alloc/lock なし・固定長コピー）。
+    fn applyPatternCommand(self: *LofiPatch, cmd: PatternCommand) void {
+        self.anchor = cmd;
+        self.kick_seq.on_mask = cmd.kick.on;
+        self.hat_seq.on_mask = cmd.hat.on;
+        self.clap_seq.on_mask = cmd.clap.on;
+        self.bass_seq.on_mask = cmd.bass.on;
+        self.bass_seq.accent_mask = cmd.bass.accent;
+        self.bass_seq.slide_mask = cmd.bass.slide;
+        self.bass_seq.pitch_deg = cmd.bass.deg;
+        self.lock = .{ cmd.kick.lock, cmd.hat.lock, cmd.clap.lock, cmd.bass.lock };
+        self.evolve = cmd.evolve;
+    }
+
+    /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら、
+    /// 1) pending seed があれば PRNG/生成状態を再初期化（TASK-62.5.7）
+    /// 2) quantize_bar pending pattern を反映（TASK-93。seed の後なので seed→pattern 列で pattern が生きる）
+    /// 3) どちらも無ければ 1 小節 1 回だけ前景パターンを変異
     /// block 数ではなく musical bar をキーにする（決定性は固定 seed + 固定 render チャンクで担保）。
+    /// ホットパス: bar 境界での固定長 struct コピー + bool 分岐のみ（alloc/lock なし）。
     fn maybeEvolve(self: *LofiPatch) void {
         if (!self.clock.started) return;
         const bar = self.clock.tick_index / STEPS_PER_BAR;
         if (bar == self.last_bar) return;
         self.last_bar = bar;
-        // 次 bar 境界: pending seed を latch（規約 2/4）。適用した bar では変異しない（作品の「最初」）。
+
+        // 1) pending seed を先に latch（規約 2/4）。applyBaseSeed は pending_bar_cmd を触らない。
+        var applied_seed = false;
         const gen = self.controls.pending_seed_gen.load(.acquire);
         if (gen != self.applied_seed_gen) {
             self.applied_seed_gen = gen;
             self.applyBaseSeed(self.controls.pending_seed.load(.acquire));
-            return;
+            applied_seed = true;
         }
+
+        // 2) seed の後に pending pattern（seed→pattern 操作列で pattern が残る）。
+        var applied_pending = false;
+        if (self.pending_bar_cmd) |cmd| {
+            self.applyPatternCommand(cmd);
+            self.pending_bar_cmd = null;
+            applied_pending = true;
+        }
+
+        // seed / pattern を適用した bar は evolve 変異しない。
+        if (applied_seed or applied_pending) return;
         self.mutatePattern();
     }
 
     /// 生成状態を base seed 由来の初期状態へ戻す（RT・alloc/lock なし）。
     /// パターン・変異・生成 RNG・StepSeq 実行位置・クロック位相・背景生成 runtime を
     /// fresh create 相当へ揃える。音響残響 transient（reverb/delay 尾・envelope 等）は対象外。
+    /// **pending_bar_cmd はクリアしない**（maybeEvolve が seed 後に pattern を載せるため。
+    /// offline の `resetWithSeed` だけが pending を明示クリアする）。
     fn applyBaseSeed(self: *LofiPatch, base: u64) void {
         self.base_seed = base;
 
@@ -801,6 +843,7 @@ pub const LofiPatch = struct {
             .ambient_root_cv = self.ambient_quant.last_out,
             .ambient_lfo = self.ambient_lfo.lfo.phase,
             .base_seed = self.base_seed,
+            .bar_pending = self.pending_bar_cmd != null,
         };
     }
 
@@ -1510,4 +1553,177 @@ test "seed: mid-run applyBaseSeed matches fresh create gen-layer state field-wis
     run.resetWithSeed(base); // = requestSeed 同期 + applyBaseSeed
 
     try expectGenLayerEqual(fresh, run);
+}
+
+// ----------------------------------------------------------------------------
+// TASK-93: quantize_bar（小節境界適用）
+// ----------------------------------------------------------------------------
+
+test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    // 1 bar ≒ 16 ticks * (48000*60)/(122*4) ≒ 94426 samples。
+    const pre_frames: u64 = 48000; // < 1 bar
+    const post_frames: u64 = 48000 * 4; // bar 境界を跨ぐ
+
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    // evolve OFF で変異ノイズを排除（pattern 比較を決定的に）
+    var freeze = PatternCommand.default();
+    freeze.rev = 1;
+    freeze.evolve = false;
+    publishPattern(patch, freeze);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    // bar 0 の途中まで進める
+    var rendered: u64 = 0;
+    while (rendered < pre_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    const old_kick = patch.kick_seq.on_mask;
+    try testing.expectEqual(KICK_ON, old_kick);
+
+    // quantize_bar=true で新 pattern を publish → 次 bar まで旧のまま
+    var cmd = PatternCommand.default();
+    cmd.rev = 2;
+    cmd.evolve = false;
+    cmd.quantize_bar = true;
+    cmd.kick.on = 0x5555;
+    publishPattern(patch, cmd);
+
+    // 同一 bar 内で少し render → まだ旧 pattern
+    const mid_extra: u64 = 24000;
+    rendered = 0;
+    while (rendered < mid_extra) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(old_kick, patch.kick_seq.on_mask);
+    try testing.expect(patch.pending_bar_cmd != null);
+
+    // bar 境界を跨ぐ → 新 pattern 反映
+    rendered = 0;
+    while (rendered < post_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
+    try testing.expect(patch.pending_bar_cmd == null);
+}
+
+test "TASK-93: quantize_bar=false still applies immediately (GUI path unchanged)" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var cmd = PatternCommand.default();
+    cmd.rev = 1;
+    cmd.quantize_bar = false;
+    cmd.kick.on = 0xFFFF;
+    publishPattern(patch, cmd);
+    // render 1 block で applyControls が走る
+    var buf: [256]f32 = undefined;
+    patch.render(&buf, 128, 2);
+    try testing.expectEqual(@as(u16, 0xFFFF), patch.kick_seq.on_mask);
+    try testing.expect(patch.pending_bar_cmd == null);
+}
+
+test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
+    // maybeEvolve 順: seed → pattern。同一 bar に両 pending があっても notation pattern が残る。
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const pre_frames: u64 = 48000;
+    const post_frames: u64 = 48000 * 4;
+
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    var freeze = PatternCommand.default();
+    freeze.rev = 1;
+    freeze.evolve = false;
+    publishPattern(patch, freeze);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    var rendered: u64 = 0;
+    while (rendered < pre_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+
+    // 同一 bar 内: seed 42 + quantize pattern（kick 0x5555）
+    patch.requestSeed(42);
+    var cmd = PatternCommand.default();
+    cmd.rev = 2;
+    cmd.evolve = false;
+    cmd.quantize_bar = true;
+    cmd.kick.on = 0x5555;
+    publishPattern(patch, cmd);
+
+    // 境界前: seed 未適用・pattern 未適用
+    rendered = 0;
+    while (rendered < 24000) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, patch.base_seed);
+    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask);
+    try testing.expect(patch.pending_bar_cmd != null);
+
+    // 境界後: seed=42 かつ kick=0x5555（pattern が seed 後に載る）
+    rendered = 0;
+    while (rendered < post_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(@as(u64, 42), patch.base_seed);
+    try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
+    try testing.expect(patch.pending_bar_cmd == null);
+}
+
+test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
+    // 連続 quantize publish で後着が先行 track を潰さないこと（main の last_quantized_cmd 相当を
+    // ここでは cmd を累積して publish する統合テストで担保）。
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const pre_frames: u64 = 48000;
+    const post_frames: u64 = 48000 * 4;
+
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    var freeze = PatternCommand.default();
+    freeze.rev = 1;
+    freeze.evolve = false;
+    publishPattern(patch, freeze);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    var rendered: u64 = 0;
+    while (rendered < pre_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+
+    // 1st: kick のみ置換（hat は default 維持）
+    var cmd1 = PatternCommand.default();
+    cmd1.rev = 2;
+    cmd1.evolve = false;
+    cmd1.quantize_bar = true;
+    cmd1.kick.on = 0x5555;
+    publishPattern(patch, cmd1);
+    // applyControls で pending に載せる
+    patch.render(buf, chunk, 2);
+    try testing.expect(patch.snapshotState().bar_pending);
+
+    // 2nd: cmd1 を base に hat を置換（main の last_quantized チェーン相当）
+    var cmd2 = cmd1;
+    cmd2.rev = 3;
+    cmd2.hat.on = 0xAAAA;
+    publishPattern(patch, cmd2);
+    patch.render(buf, chunk, 2);
+    try testing.expect(patch.pending_bar_cmd != null);
+
+    // 境界後: kick と hat の両方が反映
+    rendered = 0;
+    while (rendered < post_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0xAAAA), patch.hat_seq.on_mask);
+    try testing.expect(!patch.snapshotState().bar_pending);
 }

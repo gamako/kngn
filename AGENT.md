@@ -393,6 +393,16 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
   - **pattern 所有モデル**: RT(StepSeq) が grid/303 pattern の authoritative。GUI は毎フレーム snapshot を読んで
     grid 表示し、編集時のみ `Controls.pattern_db`(Mailbox) へ publish（RT が revision 変化時のみ取り込み、
     その後また per-bar 変異）。RT 経路に alloc/lock/IO/panic を足さない。
+  - **mini-notation action**（TASK-93）: `action pattern <track> <notation>`（track ∈ kick|hat|clap|bass）で
+    Tidal 風サブセット記法を 16-step mask へ評価し、該当 track を**宣言的全置換**する。文法: 空白区切り /
+    `x`=hit / `~`=休符 / `0..9`=bass 度数（hit+deg）/ `[a b]`=スロット内サブ分割（ネスト深さ 2）/
+    `<a b>`=**評価ごと**交代（action 再実行で交代。bar ごと連続交代は将来スコープ）/ `a*2`=スロット内反復 /
+    `a?`=50% 確率（`splitmix64(notation_seed ^ counter)` 下位 bit。`action seed` と整合）/
+    `x(k,n)`=スパン内ユークリッド。位置は bar を有理数分割し `round(pos*16)` で量子化（衝突 OR）。
+    適用は **小節境界クオンタイズ**（`PatternCommand.quantize_bar=true` → RT の `pending_bar_cmd` 経由。
+    GUI/他 action は即反映のまま）。レシピには記法の生テキストを記録（replay 時 counter 順で再評価→決定的）。
+    **recipe replay は `notation_counter` を 0 から再評価**する（`action recipe_replay` 冒頭でリセット）。
+    現在パターンの読み出しは既存 `digest modular` の pattern masks hex で充足（読み書き対称。新 probe なし）。
   - harness `modular` probe が生成状態を公開（digest=bpm/density/steps/active/gains/muted/ph4/ambient/pattern masks
     hex/lock/evolve/rev/mut を 1024B 以内、snapshot=さらに bass_deg 配列）。
   - **`action render <path> <seconds>`**（TASK-86）: offline の別 `LofiPatch` インスタンスで master 出力を
