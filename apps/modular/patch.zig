@@ -7,7 +7,8 @@
 //!   - 背景(アンビエント連続生成): Turing→Quantizer が ChordPad の和音 root を scale 内でゆっくり遷移させ、
 //!     LFO が cutoff を連続変調、S&H が level をゆらす。無操作でも連続的に流れ続ける（Ph5 方針 C）。
 //! Mixer 後に lofi FX チェーン(Saturator→Bitcrusher→Delay→Reverb→VinylNoise→WowFlutter)。
-//! 主スレッド介入なし・全 RNG fixed seed で決定的（offline 2 回 render の CRC 一致で担保）。
+//! 主スレッド介入なし・生成 RNG は base seed + derive で決定的（offline 2 回 render の CRC 一致で担保）。
+//! 音色用 fixed seed（Kick/Hat/Clap）は base seed 非依存（TASK-62.5.7）。
 //!
 //! 自己参照（graph が各モジュール struct への ctx ポインタを保持）するため、
 //! ヒープに固定確保して**ムーブさせない**（create/destroy）。RT callback は render のみ呼ぶ。
@@ -15,11 +16,15 @@
 //! pattern 所有モデル: RT 側 StepSeq field が grid/303 pattern の唯一の authoritative。GUI は毎フレーム
 //! snapshot を読んで表示し、編集時のみ Controls.pattern_db(Mailbox) へ publish する。RT は revision
 //! 変化時のみ取り込み、その後また per-bar 変異を続ける（RT 経路に alloc/lock/IO/panic なし）。
+//!
+//! seed 適用（TASK-62.5.7）: main が `requestSeed`（atomic）→ RT は次 bar 境界で PRNG 再構築 +
+//! 生成状態初期化。RT に alloc/lock を足さない。
 
 const std = @import("std");
 const modular = @import("modular");
 const synth = @import("synth"); // AtomicF32 / Mailbox（GUI→RT のロックフリー受け渡し）
 const dsp = @import("dsp"); // FFT（band energy 検証・テスト用）/ Noise（変異 PRNG）
+const seedmod = @import("seed.zig");
 
 // ----------------------------------------------------------------------------
 // 既定値（= 構築時のパッチ値）。Controls の既定もこれに合わせ、無操作時は従来どおりにする。
@@ -131,6 +136,9 @@ pub const Controls = struct {
     ambient_move: synth.AtomicF32,
     // Ph5: grid/303 pattern（整合的に差し替えるため Mailbox(triple-buffer)。GUI=producer / RT=consumer）
     pattern_db: synth.Mailbox(PatternCommand),
+    // TASK-62.5.7: main→RT の pending seed（次 bar 境界で latch）。gen が変わったら pending を読む。
+    pending_seed: std.atomic.Value(u64),
+    pending_seed_gen: std.atomic.Value(u64),
 
     pub fn init() Controls {
         return .{
@@ -156,6 +164,8 @@ pub const Controls = struct {
             .pad_mute = std.atomic.Value(u32).init(0),
             .ambient_move = synth.AtomicF32.init(AMBIENT_MOVE_DEFAULT),
             .pattern_db = synth.Mailbox(PatternCommand).init(PatternCommand.default()),
+            .pending_seed = std.atomic.Value(u64).init(seedmod.DEFAULT_BASE_SEED),
+            .pending_seed_gen = std.atomic.Value(u64).init(0),
         };
     }
 };
@@ -227,6 +237,8 @@ pub const PatchState = struct {
     ambient_register: u32,
     ambient_root_cv: f32, // ChordPad へ与えている pitch_cv
     ambient_lfo: f32, // 現 LFO 値（-1..1）
+    // TASK-62.5.7: 適用済み base seed（digest 用。pending ではなく RT が latch した値）
+    base_seed: u64,
 };
 
 pub const LofiPatch = struct {
@@ -272,7 +284,7 @@ pub const LofiPatch = struct {
 
     controls: Controls,
 
-    // 前景の per-bar 変異状態（RT 所有・固定 seed で決定的）
+    // 前景の per-bar 変異状態（RT 所有・base seed derive で決定的）
     mut_noise: dsp.Noise,
     last_bar: u64,
     mutation_count: u32,
@@ -280,12 +292,17 @@ pub const LofiPatch = struct {
     anchor: PatternCommand, // 復帰先（= 直近にユーザーが publish した pattern。迷子防止）
     lock: [4]bool, // kick,hat,clap,bass（トラック単位の凍結）
     evolve: bool, // 自己進化の全体トグル
+    // TASK-62.5.7: 適用済み base seed / pending gen（RT 所有。digest は base_seed を読む）
+    base_seed: u64,
+    applied_seed_gen: u64,
 
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) !*LofiPatch {
         const self = try allocator.create(LofiPatch);
         errdefer allocator.destroy(self);
 
         const def = PatternCommand.default();
+        const base = seedmod.DEFAULT_BASE_SEED;
+        const treg = seedmod.deriveU32(base, .ambient_turing_register);
         self.* = .{
             .allocator = allocator,
             .graph = undefined,
@@ -302,10 +319,20 @@ pub const LofiPatch = struct {
             .pad_eu = .{ .steps = 2, .pulses = 1, .rotation = 0 },
             .pad = .{ .gain = PAD_BASE_GAIN, .cutoff = PAD_CUTOFF_DEFAULT, .warmth = PAD_WARMTH_DEFAULT },
             // アンビエント: turing(lock 高め)→quant(scale 内 root)→pad。LFO は cutoff、random は level。
-            .ambient_turing = .{ .bits = 8, .lock = 0.94 },
+            .ambient_turing = .{
+                .bits = 8,
+                .lock = 0.94,
+                .noise = .{ .state = seedmod.deriveU32(base, .ambient_turing) },
+                .register = treg,
+                .anchor_register = treg,
+            },
             .ambient_quant = .{ .scale = .minor_pentatonic, .octaves = 1, .root_semitone = 0 },
             .ambient_lfo = .{ .rate_hz = 0.08 },
-            .ambient_random = .{ .min = -1.0, .max = 1.0 },
+            .ambient_random = .{
+                .min = -1.0,
+                .max = 1.0,
+                .noise = .{ .state = seedmod.deriveU32(base, .ambient_random) },
+            },
             .bass_perc = .{ .decay = 0.18 },
             .vco = .{ .osc = .{ .waveform = .triangle }, .base_hz = 65.41 }, // C2 ベース
             .vcf = .{ .cutoff = 600, .resonance = 0.9, .mode = .lowpass, .mod_octaves = 1.0 },
@@ -322,19 +349,38 @@ pub const LofiPatch = struct {
             .wow = .{},
             .output = .{ .gain = 1.0, .pan = 0.0, .soft_clip = true },
             .controls = Controls.init(),
-            .mut_noise = .{ .state = 0x4D555431 }, // "MUT1"
+            .mut_noise = .{ .state = seedmod.deriveU32(base, .mutate) },
             .last_bar = 0,
             .mutation_count = 0,
             .applied_rev = def.rev, // 既定(rev 0)は構築時に直接セット済み＝適用不要
             .anchor = def,
             .lock = .{ false, false, false, false },
             .evolve = true,
+            .base_seed = base,
+            .applied_seed_gen = 0,
         };
 
         self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 40, .max_ports = 64 });
         errdefer self.graph.deinit();
         try self.wire();
         return self;
+    }
+
+    /// main thread: 次 bar 境界で適用する base seed を publish（alloc/lock なし・atomic のみ）。
+    pub fn requestSeed(self: *LofiPatch, base: u64) void {
+        self.controls.pending_seed.store(base, .release);
+        _ = self.controls.pending_seed_gen.fetchAdd(1, .release);
+    }
+
+    /// offline / 初期化用: base seed を即時適用（live の `action seed` は `requestSeed`＝次 bar 境界）。
+    /// pending gen も同期し、直後の bar 境界で二重適用しない。
+    pub fn resetWithSeed(self: *LofiPatch, base: u64) void {
+        self.requestSeed(base);
+        self.applied_seed_gen = self.controls.pending_seed_gen.load(.acquire);
+        self.applyBaseSeed(base);
+        if (self.clock.started) {
+            self.last_bar = self.clock.tick_index / STEPS_PER_BAR;
+        }
     }
 
     pub fn destroy(self: *LofiPatch) void {
@@ -472,14 +518,95 @@ pub const LofiPatch = struct {
         self.pad.cutoff_mod_oct = 0.2 + mv * 0.8;
     }
 
-    /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら 1 小節 1 回だけ前景パターンを変異する。
+    /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら、pending seed があれば
+    /// PRNG/生成状態を再初期化し、無ければ 1 小節 1 回だけ前景パターンを変異する。
     /// block 数ではなく musical bar をキーにする（決定性は固定 seed + 固定 render チャンクで担保）。
     fn maybeEvolve(self: *LofiPatch) void {
         if (!self.clock.started) return;
         const bar = self.clock.tick_index / STEPS_PER_BAR;
         if (bar == self.last_bar) return;
         self.last_bar = bar;
+        // 次 bar 境界: pending seed を latch（規約 2/4）。適用した bar では変異しない（作品の「最初」）。
+        const gen = self.controls.pending_seed_gen.load(.acquire);
+        if (gen != self.applied_seed_gen) {
+            self.applied_seed_gen = gen;
+            self.applyBaseSeed(self.controls.pending_seed.load(.acquire));
+            return;
+        }
         self.mutatePattern();
+    }
+
+    /// 生成状態を base seed 由来の初期状態へ戻す（RT・alloc/lock なし）。
+    /// パターン・変異・生成 RNG・StepSeq 実行位置・クロック位相・背景生成 runtime を
+    /// fresh create 相当へ揃える。音響残響 transient（reverb/delay 尾・envelope 等）は対象外。
+    fn applyBaseSeed(self: *LofiPatch, base: u64) void {
+        self.base_seed = base;
+
+        // --- 生成 RNG ---
+        self.mut_noise.state = seedmod.deriveU32(base, .mutate);
+        self.ambient_random.noise.state = seedmod.deriveU32(base, .ambient_random);
+        self.ambient_random.prev_gate = false;
+        self.ambient_random.held = 0.0;
+        const treg = seedmod.deriveU32(base, .ambient_turing_register);
+        self.ambient_turing.noise.state = seedmod.deriveU32(base, .ambient_turing);
+        self.ambient_turing.register = treg;
+        self.ambient_turing.anchor_register = treg;
+        self.ambient_turing.last_cv = 0.0;
+        self.ambient_turing.prev_gate = false;
+        self.ambient_turing.edge_count = 0;
+        self.ambient_lfo.lfo.phase = 0.0;
+        self.ambient_quant.last_out = 0.0;
+
+        // --- クロック位相（bar/step の起点を fresh と揃える）---
+        self.clock.phase_samples = 0;
+        self.clock.tick_index = 0;
+        self.clock.started = false;
+        self.clock.samples_per_tick = 0;
+        self.clock.cur_interval = 0;
+        self.last_bar = 0;
+
+        // --- 前景 pattern + StepSeq runtime ---
+        const def = PatternCommand.default();
+        resetStepSeqRuntime(&self.kick_seq, .{ .on = def.kick.on });
+        resetStepSeqRuntime(&self.hat_seq, .{ .on = def.hat.on });
+        resetStepSeqRuntime(&self.clap_seq, .{ .on = def.clap.on });
+        resetStepSeqRuntime(&self.bass_seq, .{
+            .on = def.bass.on,
+            .accent = def.bass.accent,
+            .slide = def.bass.slide,
+            .deg = def.bass.deg,
+        });
+        self.lock = .{ def.kick.lock, def.hat.lock, def.clap.lock, def.bass.lock };
+        self.evolve = def.evolve;
+        self.anchor = def;
+        self.mutation_count = 0;
+
+        // --- 背景生成のシーケンサ実行位置（pad トリガ経路）---
+        self.pad_div.count = 0;
+        self.pad_div.prev_gate = false;
+        self.pad_eu.step = 0;
+        self.pad_eu.prev_gate = false;
+    }
+
+    const StepSeqReset = struct {
+        on: u16,
+        accent: u16 = 0,
+        slide: u16 = 0,
+        deg: ?[16]i8 = null,
+    };
+
+    /// StepSeq の pattern + runtime を fresh create 相当へ戻す（RT・alloc なし）。
+    fn resetStepSeqRuntime(seq: *modular.StepSeq, p: StepSeqReset) void {
+        seq.storeOnMask(p.on);
+        seq.storeAccentMask(p.accent);
+        seq.storeSlideMask(p.slide);
+        if (p.deg) |d| seq.pitch_deg = d;
+        seq.storeStep(0);
+        seq.prev_gate = false;
+        seq.cur_pitch = 0;
+        seq.target_pitch = 0;
+        seq.gliding = false;
+        seq.accent_held = 0;
     }
 
     fn rand01(self: *LofiPatch) f32 {
@@ -673,6 +800,7 @@ pub const LofiPatch = struct {
             .ambient_register = self.ambient_turing.register,
             .ambient_root_cv = self.ambient_quant.last_out,
             .ambient_lfo = self.ambient_lfo.lfo.phase,
+            .base_seed = self.base_seed,
         };
     }
 
@@ -1077,4 +1205,188 @@ test "Ph5: default patch has low-band (kick body) energy and is not harsh-domina
     try testing.expect(total > 0.0);
     try testing.expect(sub / total > 0.05);
     try testing.expect(harsh / total < 0.6);
+}
+
+// ----------------------------------------------------------------------------
+// TASK-62.5.7: seed 決定性 / bar 境界遅延
+// ----------------------------------------------------------------------------
+
+fn renderCrcChunkedSeeded(allocator: std.mem.Allocator, sample_rate: f32, chunk: u32, target: u64, base: u64) !u32 {
+    const patch = try LofiPatch.create(allocator, sample_rate);
+    defer patch.destroy();
+    if (base != seedmod.DEFAULT_BASE_SEED) patch.resetWithSeed(base);
+    const buf = try allocator.alloc(f32, chunk * 2);
+    defer allocator.free(buf);
+    var crc = std.hash.Crc32.init();
+    var rendered: u64 = 0;
+    while (rendered < target) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+        crc.update(std.mem.sliceAsBytes(buf));
+    }
+    return crc.final();
+}
+
+test "seed: same base seed → CRC bit match; different seed → CRC differs" {
+    const chunk: u32 = 4800;
+    const target: u64 = 48000 * 8;
+    const a1 = try renderCrcChunkedSeeded(testing.allocator, 48000, chunk, target, 42);
+    const a2 = try renderCrcChunkedSeeded(testing.allocator, 48000, chunk, target, 42);
+    try testing.expectEqual(a1, a2);
+    const b = try renderCrcChunkedSeeded(testing.allocator, 48000, chunk, target, 99);
+    try testing.expect(a1 != b);
+}
+
+test "seed: DEFAULT_BASE_SEED path matches create()-only render (legacy compat)" {
+    const chunk: u32 = 4800;
+    const target: u64 = 48000 * 8;
+    const legacy = try renderCrcChunked(testing.allocator, 48000, chunk, target);
+    const via_default = try renderCrcChunkedSeeded(testing.allocator, 48000, chunk, target, seedmod.DEFAULT_BASE_SEED);
+    try testing.expectEqual(legacy, via_default);
+}
+
+test "seed: requestSeed applies only at next bar boundary (pre-boundary output unchanged)" {
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    // 1 bar ≒ 16 ticks * (48000*60)/(122*4) ≒ 94426 samples。pre = 半小節弱。
+    const pre_frames: u64 = 48000; // < 1 bar
+    const post_frames: u64 = 48000 * 6;
+
+    const ctrl = try LofiPatch.create(testing.allocator, sr);
+    defer ctrl.destroy();
+    const chg = try LofiPatch.create(testing.allocator, sr);
+    defer chg.destroy();
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    var crc_ctrl = std.hash.Crc32.init();
+    var crc_chg = std.hash.Crc32.init();
+    var rendered: u64 = 0;
+    while (rendered < pre_frames) : (rendered += chunk) {
+        ctrl.render(buf, chunk, 2);
+        crc_ctrl.update(std.mem.sliceAsBytes(buf));
+        chg.render(buf, chunk, 2);
+        crc_chg.update(std.mem.sliceAsBytes(buf));
+    }
+    try testing.expectEqual(crc_ctrl.final(), crc_chg.final());
+    try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, chg.base_seed);
+
+    // まだ bar 0 の途中で pending を立てる → 境界まで base_seed は変わらない
+    chg.requestSeed(42);
+    crc_ctrl = std.hash.Crc32.init();
+    crc_chg = std.hash.Crc32.init();
+    // 追加で少し render（まだ同一 bar 内に留まる長さ）
+    const mid_extra: u64 = 24000;
+    rendered = 0;
+    while (rendered < mid_extra) : (rendered += chunk) {
+        ctrl.render(buf, chunk, 2);
+        crc_ctrl.update(std.mem.sliceAsBytes(buf));
+        chg.render(buf, chunk, 2);
+        crc_chg.update(std.mem.sliceAsBytes(buf));
+    }
+    try testing.expectEqual(crc_ctrl.final(), crc_chg.final());
+    try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, chg.base_seed); // 未適用
+
+    // bar 境界を跨ぐまで進める → chg だけ seed 適用され出力が分岐
+    crc_ctrl = std.hash.Crc32.init();
+    crc_chg = std.hash.Crc32.init();
+    rendered = 0;
+    while (rendered < post_frames) : (rendered += chunk) {
+        ctrl.render(buf, chunk, 2);
+        crc_ctrl.update(std.mem.sliceAsBytes(buf));
+        chg.render(buf, chunk, 2);
+        crc_chg.update(std.mem.sliceAsBytes(buf));
+    }
+    try testing.expectEqual(@as(u64, 42), chg.base_seed);
+    try testing.expect(crc_ctrl.final() != crc_chg.final());
+}
+
+test "seed: resetWithSeed restores initial pattern and clears mutation_count" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    _ = try renderLong(patch, 4800, 48000 * 8);
+    try testing.expect(patch.mutation_count > 0);
+
+    patch.resetWithSeed(7);
+    try testing.expectEqual(@as(u64, 7), patch.base_seed);
+    try testing.expectEqual(@as(u32, 0), patch.mutation_count);
+    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask);
+}
+
+/// 生成レイヤ（pattern / StepSeq runtime / 変異 / 生成 RNG / クロック位相 / 背景生成 runtime）の
+/// field 単位一致。音響 transient（reverb 尾等）は比較しない。
+fn expectGenLayerEqual(a: *const LofiPatch, b: *const LofiPatch) !void {
+    try testing.expectEqual(a.base_seed, b.base_seed);
+    try testing.expectEqual(a.mutation_count, b.mutation_count);
+    try testing.expectEqual(a.last_bar, b.last_bar);
+    try testing.expectEqual(a.evolve, b.evolve);
+    try testing.expectEqual(a.lock, b.lock);
+
+    try testing.expectEqual(a.clock.started, b.clock.started);
+    try testing.expectEqual(a.clock.tick_index, b.clock.tick_index);
+    try testing.expectEqual(a.clock.phase_samples, b.clock.phase_samples);
+    try testing.expectEqual(a.clock.samples_per_tick, b.clock.samples_per_tick);
+    try testing.expectEqual(a.clock.cur_interval, b.clock.cur_interval);
+
+    try expectStepSeqGenEqual(&a.kick_seq, &b.kick_seq);
+    try expectStepSeqGenEqual(&a.hat_seq, &b.hat_seq);
+    try expectStepSeqGenEqual(&a.clap_seq, &b.clap_seq);
+    try expectStepSeqGenEqual(&a.bass_seq, &b.bass_seq);
+
+    try testing.expectEqual(a.mut_noise.state, b.mut_noise.state);
+    try testing.expectEqual(a.ambient_random.noise.state, b.ambient_random.noise.state);
+    try testing.expectEqual(a.ambient_random.prev_gate, b.ambient_random.prev_gate);
+    try testing.expectEqual(a.ambient_random.held, b.ambient_random.held);
+    try testing.expectEqual(a.ambient_turing.noise.state, b.ambient_turing.noise.state);
+    try testing.expectEqual(a.ambient_turing.register, b.ambient_turing.register);
+    try testing.expectEqual(a.ambient_turing.anchor_register, b.ambient_turing.anchor_register);
+    try testing.expectEqual(a.ambient_turing.last_cv, b.ambient_turing.last_cv);
+    try testing.expectEqual(a.ambient_turing.prev_gate, b.ambient_turing.prev_gate);
+    try testing.expectEqual(a.ambient_turing.edge_count, b.ambient_turing.edge_count);
+    try testing.expectEqual(a.ambient_lfo.lfo.phase, b.ambient_lfo.lfo.phase);
+    try testing.expectEqual(a.ambient_quant.last_out, b.ambient_quant.last_out);
+    try testing.expectEqual(a.pad_div.count, b.pad_div.count);
+    try testing.expectEqual(a.pad_div.prev_gate, b.pad_div.prev_gate);
+    try testing.expectEqual(a.pad_eu.step, b.pad_eu.step);
+    try testing.expectEqual(a.pad_eu.prev_gate, b.pad_eu.prev_gate);
+
+    // 生成 RNG の次値（state 消費前にコピーして比較）
+    var na = a.mut_noise;
+    var nb = b.mut_noise;
+    try testing.expectEqual(na.next(), nb.next());
+    var ra = a.ambient_random.noise;
+    var rb = b.ambient_random.noise;
+    try testing.expectEqual(ra.next(), rb.next());
+    var ta = a.ambient_turing.noise;
+    var tb = b.ambient_turing.noise;
+    try testing.expectEqual(ta.next(), tb.next());
+}
+
+fn expectStepSeqGenEqual(a: *const modular.StepSeq, b: *const modular.StepSeq) !void {
+    try testing.expectEqual(a.loadOnMask(), b.loadOnMask());
+    try testing.expectEqual(a.loadAccentMask(), b.loadAccentMask());
+    try testing.expectEqual(a.loadSlideMask(), b.loadSlideMask());
+    try testing.expectEqual(a.pitch_deg, b.pitch_deg);
+    try testing.expectEqual(a.loadStep(), b.loadStep());
+    try testing.expectEqual(a.prev_gate, b.prev_gate);
+    try testing.expectEqual(a.cur_pitch, b.cur_pitch);
+    try testing.expectEqual(a.target_pitch, b.target_pitch);
+    try testing.expectEqual(a.gliding, b.gliding);
+    try testing.expectEqual(a.accent_held, b.accent_held);
+}
+
+test "seed: mid-run applyBaseSeed matches fresh create gen-layer state field-wise" {
+    const base: u64 = 42;
+    const fresh = try LofiPatch.create(testing.allocator, 48000);
+    defer fresh.destroy();
+    fresh.resetWithSeed(base);
+
+    const run = try LofiPatch.create(testing.allocator, 48000);
+    defer run.destroy();
+    _ = try renderLong(run, 4800, 48000 * 10); // 数 bar 進めて runtime を汚す
+    try testing.expect(run.clock.started);
+    try testing.expect(run.kick_seq.loadStep() != 0 or run.clock.tick_index > 0);
+    try testing.expect(run.mutation_count > 0);
+    run.resetWithSeed(base); // = requestSeed 同期 + applyBaseSeed
+
+    try expectGenLayerEqual(fresh, run);
 }

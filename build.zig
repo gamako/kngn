@@ -1131,6 +1131,28 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
+    // apps/modular seed derive（TASK-62.5.7）。std のみ。
+    const modular_seed_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/modular/seed.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_modular_seed_test = b.addRunArtifact(modular_seed_test);
+    test_app_modular_step.dependOn(&run_modular_seed_test.step);
+
+    // apps/modular CommandRecord 配線契約（TASK-62.5.7）。command は std のみ・既存 API 利用。
+    const modular_cmd_seed_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/modular/cmd_seed_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    modular_cmd_seed_test_mod.addImport("command", command_test_mod);
+    const modular_cmd_seed_test = b.addTest(.{ .root_module = modular_cmd_seed_test_mod });
+    const run_modular_cmd_seed_test = b.addRunArtifact(modular_cmd_seed_test);
+    test_app_modular_step.dependOn(&run_modular_cmd_seed_test.step);
+
     // apps/patch 純ロジックテスト集約 root（canvas: camera 変換 / hit-test / 見切れ検出 + group: グループ台帳 /
     // expose 導出 / 表示写像。display/audio 不要。TASK-40.6.2 / 40.7.1）
     const patch_tests_mod = b.createModule(.{

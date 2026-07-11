@@ -61,6 +61,9 @@ const App = struct {
     /// `save_pattern`/`load_pattern` action（TASK-65 serialize）が使うファイル I/O ハンドル
     /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
     io: std.Io,
+    /// CommandLog + Executor（TASK-62.5.7: 記録のみ。undo/tx/probe 統合なし）。
+    cmd_log: platform.command.CommandLog = .{},
+    cmd_exec: platform.command.Executor = undefined,
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -280,6 +283,10 @@ pub fn main(init: std.process.Init) !void {
     defer device.stop();
 
     platform.registerProbe(.{ .name = "modular", .ctx = app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
+    // command model（TASK-62.5.7）: 記録のみ。pixie 62.5.3 の最小版（undo/tx なし）。
+    app.cmd_exec = platform.command.Executor.init(.{ .ctx = app, .run = dispatchModularAction });
+    app.cmd_exec.log = &app.cmd_log;
+    platform.setCommandExecutor(&app.cmd_exec);
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     registerActions(app);
     registerStateSync(app);
@@ -542,11 +549,11 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     // Ph5 pattern（masks は hex。bass_deg 配列は snapshot 側）。
     const c = std.fmt.bufPrint(buf[a.len + b.len ..], "\"patterns\":{{\"kick\":\"{x:0>4}\",\"hat\":\"{x:0>4}\"," ++
         "\"clap\":\"{x:0>4}\",\"bass_on\":\"{x:0>4}\",\"bass_accent\":\"{x:0>4}\",\"bass_slide\":\"{x:0>4}\"}}," ++
-        "\"lock\":[{d},{d},{d},{d}],\"evolve\":{d},\"rev\":{d},\"mut\":{d}}}", .{
+        "\"lock\":[{d},{d},{d},{d}],\"evolve\":{d},\"rev\":{d},\"mut\":{d},\"seed\":{d}}}", .{
         st.kick_on,                 st.hat_on,                  st.clap_on,
         st.bass_on,                 st.bass_accent,             st.bass_slide,
         b01(st.lock[0]),            b01(st.lock[1]),            b01(st.lock[2]),            b01(st.lock[3]),
-        b01(st.evolve),             st.pattern_rev,             st.mutation_count,
+        b01(st.evolve),             st.pattern_rev,             st.mutation_count,          st.base_seed,
     }) catch return buf[0 .. a.len + b.len];
     return buf[0 .. a.len + b.len + c.len];
 }
@@ -777,17 +784,72 @@ fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return "ok";
 }
 
-/// 8 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
-/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+/// `action seed <n>`: main thread で parse → lock-free publish → 次 bar 境界で RT が適用（TASK-62.5.7）。
+fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const n = try actions.parseU64(args);
+    patch.requestSeed(n);
+    return "ok";
+}
+
+// ============================================================================
+// command model 統合（TASK-62.5.7: 記録のみ。pixie 62.5.3 の最小版）
+//
+// App が CommandLog + Executor を所有し、registerAction 経由の harness/copilot action を
+// executeAction(actor=.local_agent) で dispatch + 記録する。undo/transaction/probe 統合はしない。
+// ============================================================================
+
+const ActionEntry = struct {
+    name: []const u8,
+    run: *const fn (ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8,
+};
+
+const MODULAR_ACTIONS = [_]ActionEntry{
+    .{ .name = "set_param", .run = actionSetParam },
+    .{ .name = "set_mute", .run = actionSetMute },
+    .{ .name = "set_lock", .run = actionSetLock },
+    .{ .name = "set_evolve", .run = actionSetEvolve },
+    .{ .name = "toggle_step", .run = actionToggleStep },
+    .{ .name = "set_pitch", .run = actionSetPitch },
+    .{ .name = "save_pattern", .run = actionSavePattern },
+    .{ .name = "load_pattern", .run = actionLoadPattern },
+    .{ .name = "seed", .run = actionSeed },
+};
+
+fn dispatchModularAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    for (&MODULAR_ACTIONS) |*e| {
+        if (std.mem.eql(u8, e.name, name)) return e.run(ctx, args, buf);
+    }
+    return error.UnknownAction;
+}
+
+fn recordedAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
+    return &struct {
+        fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const res = try app.cmd_exec.executeAction(name, args, .{
+                .actor = .local_agent,
+                .record_policy = .record,
+            }, buf);
+            return res.output;
+        }
+    }.run;
+}
+
+/// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
+/// `registerAction` 自体が no-op なので通常実行に影響しない）。記録 wrapper 経由。
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "set_param", .ctx = app, .run = actionSetParam });
-    platform.registerAction(.{ .name = "set_mute", .ctx = app, .run = actionSetMute });
-    platform.registerAction(.{ .name = "set_lock", .ctx = app, .run = actionSetLock });
-    platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = actionSetEvolve });
-    platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = actionToggleStep });
-    platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = actionSetPitch });
-    platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = actionSavePattern });
-    platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = actionLoadPattern });
+    platform.registerAction(.{ .name = "set_param", .ctx = app, .run = recordedAction("set_param") });
+    platform.registerAction(.{ .name = "set_mute", .ctx = app, .run = recordedAction("set_mute") });
+    platform.registerAction(.{ .name = "set_lock", .ctx = app, .run = recordedAction("set_lock") });
+    platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = recordedAction("set_evolve") });
+    platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = recordedAction("toggle_step") });
+    platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = recordedAction("set_pitch") });
+    platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = recordedAction("save_pattern") });
+    platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = recordedAction("load_pattern") });
+    platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed") });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

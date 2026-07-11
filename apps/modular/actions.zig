@@ -98,6 +98,15 @@ pub fn parseBool01(args: []const u8) ParseError!bool {
     return on;
 }
 
+/// "<u64>" の1トークン（`seed` 用。10 進）。
+pub fn parseU64(args: []const u8) ParseError!u64 {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const value = std.fmt.parseUnsigned(u64, tok, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return value;
+}
+
 /// `save_pattern`/`load_pattern` 用: 前後の空白のみ trim し、内部の空白はそのまま保持する
 /// （path は空白を含みうる1本の文字列として扱う。pixie/synth の `parsePath` と同型）。
 pub fn parsePath(args: []const u8) ParseError![]const u8 {
@@ -157,6 +166,15 @@ test "parseBool01: 0/1 のみ許容" {
     try testing.expectError(error.UnknownBool, parseBool01("yes"));
     try testing.expectError(error.Empty, parseBool01(""));
     try testing.expectError(error.TooManyTokens, parseBool01("1 0"));
+}
+
+test "parseU64: 有効値 / 空 / 不正 / 余剰トークン" {
+    try testing.expectEqual(@as(u64, 42), try parseU64("42"));
+    try testing.expectEqual(@as(u64, 0), try parseU64("0"));
+    try testing.expectError(error.Empty, parseU64(""));
+    try testing.expectError(error.InvalidNumber, parseU64("abc"));
+    try testing.expectError(error.InvalidNumber, parseU64("-1"));
+    try testing.expectError(error.TooManyTokens, parseU64("42 1"));
 }
 
 test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {

@@ -755,6 +755,34 @@ scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
 - **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` / `"revert proposed"` を一度受けたら再送しない。以後は `digest netsync` の決定的待ち
 - 接続確立前の action は失敗しうる → join 完了（`awaiting_sync=0`）後に再試行（上記 retry 条件）
 
+## seed/決定論規約（TASK-62.5.7）
+
+seed + コマンド列（レシピ）で作品を完全再現するための共通規約。framework は action 名を予約・解釈しない
+（app が `registerAction` する通常 custom action）。62.5.8 のレシピは command 列 replay で seed を再現する。
+
+1. **action 名**: 共通で `seed`。args は u64 の 10 進文字列 1 個。
+2. **適用タイミング**: 即時ではなく**次の生成境界**（modular = 次 bar 境界）。再現性の切れ目を境界に
+   量子化し、`seed` + 後続コマンド列の replay 決定性を成立させる。
+3. **決定論の定義**: `action seed N` 適用後の生成出力は、同一の後続コマンド列・同一 render チャンク分割に
+   対して bit 決定的。
+4. **seed 適用のセマンティクス**: **生成状態の初期化 + 再スタート**（modular では変異 RNG・背景生成 RNG・
+   pattern anchor・シーケンサ実行位置・クロック位相を seed 由来の初期状態へ戻す）。「途中から乱数だけ変わる」
+   ではなく「その seed の作品として最初から」が再現性の単位。
+5. **CommandRecord への記録**: 通常の recorded command として記録する（専用フィールドは設けない）。
+
+**リセット範囲**: seed 適用がリセットするのは**生成状態**（パターン・変異・生成 RNG・シーケンサ実行位置・
+クロック位相）であり、**音響残響 transient は対象外**（reverb/delay の尾・envelope 追従・アンチクリック等）。
+出力の bit 決定性は fresh 起動 + コマンド列 replay（レシピ 62.5.8 の実行モデル）で成立し、動作中の seed
+変更は「生成レイヤが最初から」を保証する（transient は減衰する非生成状態で、RT callback での大バッファ
+memset も避ける）。
+
+**RNG 注入**: app は base seed（u64）+ 用途別 derive（splitmix64 系）に集約する。音色用 fixed seed
+（合成ドラムの `"KICK"` / `"HAT1"` / `"CLAP"` 等）は**音色の同一性**が目的なので base seed から独立のまま
+（本規約の対象外）。
+
+**ホットパス**: seed の受理・記録はイベント時のみ。RT への反映は既存の lock-free 受け渡し（atomic/Mailbox）+
+生成境界での latch/再初期化のみ。RT 経路に alloc/lock/毎サンプル分岐を追加しない。
+
 ## 性能規約（メモリI/O・キャッシュ最適化）
 
 2026-07 の全ホットパス監査に基づく規約。RT 契約（「オーディオ / シンセ層」節）が全 backend で
