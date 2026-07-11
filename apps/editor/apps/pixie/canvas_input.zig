@@ -66,6 +66,12 @@ pub const CanvasInput = struct {
         }
         return null;
     }
+
+    /// 進行中 capture を確定せず中断する（capturing=false。stroke_tool は未使用になる）。
+    /// StrokeRecorder / Fill pending の巻き戻しは呼び出し側（App）の責務。TASK-94 Phase C P1。
+    pub fn cancel(self: *CanvasInput) void {
+        self.capturing = false;
+    }
 };
 
 /// window 座標が canvas 表示領域（ZOOM 倍後）内か（旧 main.blitRectContains 相当）。
@@ -290,4 +296,72 @@ test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フ
     defer h.gpa.free(c.diffs);
     for (0..11) |x| try std.testing.expectEqual(RED, h.pixels()[x]);
     for (11..16) |x| try std.testing.expectEqual(@as(u32, 0), h.pixels()[x]);
+}
+
+test "canvas_input: cancel は capture を中断し次の press で再開できる" {
+    var h = try Harness.init(std.testing.allocator, 16, 16, RED);
+    defer h.deinit();
+
+    _ = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 0, .y = 0 },
+        .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
+        .pressed_left = true,
+        .released_left = false,
+    });
+    try std.testing.expect(h.ci.capturing);
+    _ = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 3, .y = 0 },
+        .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
+        .pressed_left = false,
+        .released_left = false,
+    });
+    try std.testing.expect(h.ci.capturing);
+
+    h.ci.cancel();
+    try std.testing.expect(!h.ci.capturing);
+    // recorder 巻き戻しは呼び出し側責務（App）。次 stroke の begin assert を避けるため abandon。
+    h.rec.abandon(&h.canvas, h.gpa);
+
+    // cancel 後の release は確定しない（capturing=false）
+    const noop = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 3, .y = 0 },
+        .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 3, .y = 0 },
+        .pressed_left = false,
+        .released_left = true,
+    });
+    try std.testing.expect(noop == null);
+    try std.testing.expect(!h.ci.capturing);
+
+    // 新しい press で capture 再開できる
+    _ = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 1, .y = 1 },
+        .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
+        .pressed_left = true,
+        .released_left = false,
+    });
+    try std.testing.expect(h.ci.capturing);
+    const cmd = h.update(.{
+        .canvas_rect = RECT0,
+        .zoom = 1,
+        .mouse_pos = .{ .x = 1, .y = 1 },
+        .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 1, .y = 1 },
+        .pressed_left = false,
+        .released_left = true,
+    });
+    try std.testing.expect(cmd != null);
+    defer h.gpa.free(cmd.?.diffs);
+    try std.testing.expect(!h.ci.capturing);
 }

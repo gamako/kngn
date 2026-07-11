@@ -259,6 +259,18 @@ pub fn allowLayerCanonFill(netsync_active: bool) bool {
     return !netsync_active;
 }
 
+/// netsync 中の UI paint 確定の分岐（TASK-94 Phase C review）。
+/// - solo: netsync 無効 → pushPaintOp + recordUiStroke
+/// - relay: netsync + pen/eraser/brush → rewind → routeAction("stroke")
+/// - rewind_discard: netsync + fill 等（action 語彙なし）→ rewind して破棄（silent diverge 防止）
+pub const UiPaintCommitPath = enum { solo, relay, rewind_discard };
+
+pub fn uiPaintCommitPath(netsync_active: bool, relays_via_action: bool) UiPaintCommitPath {
+    if (!netsync_active) return .solo;
+    if (relays_via_action) return .relay;
+    return .rewind_discard;
+}
+
 pub const Point = struct { x: i32, y: i32 };
 
 /// stroke action の点列上限（呼び出し側がこのサイズの固定長スタックバッファを用意する）。
@@ -519,6 +531,13 @@ test "layerRefRejectDuringNetsync: netsync 中は bare index のみ拒否 / id �
 test "allowLayerCanonFill: netsync 中は暗黙 selected / index→id 補完禁止" {
     try testing.expect(allowLayerCanonFill(false)); // solo: 補完可
     try testing.expect(!allowLayerCanonFill(true)); // netsync: 補完禁止
+}
+
+test "uiPaintCommitPath: solo / relay / rewind_discard の 3 分岐" {
+    try testing.expectEqual(UiPaintCommitPath.solo, uiPaintCommitPath(false, false));
+    try testing.expectEqual(UiPaintCommitPath.solo, uiPaintCommitPath(false, true));
+    try testing.expectEqual(UiPaintCommitPath.relay, uiPaintCommitPath(true, true));
+    try testing.expectEqual(UiPaintCommitPath.rewind_discard, uiPaintCommitPath(true, false));
 }
 
 /// digest 末尾の trunc マーカー（canvasDigest と共有。`" trunc=1"` = 8 bytes）。

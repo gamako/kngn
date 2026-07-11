@@ -267,6 +267,31 @@ pub const StrokeRecorder = struct {
         self.diffs.clearRetainingCapacity();
         return .{ .layer_idx = self.layer_idx, .diffs = owned };
     }
+
+    /// 進行中 stroke を確定せず破棄し、canvas を開始前に戻して mode=.none にする
+    /// （netsync 中の remote COMMIT 適用前にローカル preview を中断する用途。TASK-94 Phase C P1）。
+    /// mode=.none なら no-op。
+    pub fn abandon(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) void {
+        _ = gpa;
+        switch (self.mode) {
+            .none => {},
+            .replace => {
+                const pixels = canvas.layerPixels(self.layer_idx);
+                for (self.diffs.items) |d| pixels[d.idx] = d.before;
+                self.diffs.clearRetainingCapacity();
+                self.mode = .none;
+            },
+            .brush => {
+                const pixels = canvas.layerPixels(self.layer_idx);
+                for (self.touched.items) |idx| {
+                    pixels[idx] = self.orig[idx];
+                    self.coverage[idx] = 0;
+                }
+                self.touched.clearRetainingCapacity();
+                self.mode = .none;
+            },
+        }
+    }
 };
 
 // ============================================================
@@ -674,4 +699,31 @@ test "StrokeRecorder(brush): diffs/touched の capacity を stroke 間で再利�
     if (pd2) |pp| gpa.free(pp.diffs);
     try std.testing.expectEqual(dptr, rec.diffs.items.ptr);
     try std.testing.expectEqual(tptr, rec.touched.items.ptr);
+}
+
+test "StrokeRecorder: abandon は preview を巻き戻し mode=.none" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+
+    rec.begin(0, RED);
+    rec.point(&c, gpa, 1, 1);
+    rec.point(&c, gpa, 2, 1);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[1 * 8 + 1]);
+    try std.testing.expectEqual(StrokeRecorder.Mode.replace, rec.mode);
+
+    rec.abandon(&c, gpa);
+    try std.testing.expectEqual(StrokeRecorder.Mode.none, rec.mode);
+    try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[1 * 8 + 1]);
+    try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[1 * 8 + 2]);
+    try std.testing.expectEqual(@as(usize, 0), rec.diffs.items.len);
+
+    // abandon 後に新しい stroke を開始できる
+    rec.begin(0, RED);
+    rec.point(&c, gpa, 0, 0);
+    const pd = rec.finish(gpa).?;
+    defer gpa.free(pd.diffs);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[0]);
 }

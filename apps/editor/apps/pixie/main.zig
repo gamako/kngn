@@ -473,6 +473,41 @@ const App = struct {
         return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle;
     }
 
+    /// netsync 中に editingBlocked なら、ローカル編集（capture / bezier / select ドラッグ）を
+    /// 中断して適用を許可する（host 権威の remote COMMIT を fail-soft 切断させない。TASK-94 Phase C P1）。
+    /// solo は従来どおり EditingBlocked。
+    fn checkEditingAllowed(self: *App) error{EditingBlocked}!void {
+        if (!self.editingBlocked()) return;
+        if (!platform.netsyncActive()) return error.EditingBlocked;
+        self.interruptLocalEditForNetsync();
+    }
+
+    /// ローカルの進行中編集を破棄する（canvas 画素を汚す capture/fill のみ巻き戻し。
+    /// bezier / select ドラッグは確定前に canvas を汚さないので cancel のみ）。
+    fn interruptLocalEditForNetsync(self: *App) void {
+        if (self.input.capturing) {
+            self.recorder.abandon(self.canvas, self.gpa);
+            if (self.fill.pending) |pd| {
+                const pixels = self.canvas.layerPixels(pd.layer_idx);
+                for (pd.diffs) |d| pixels[d.idx] = d.before;
+                self.gpa.free(pd.diffs);
+                self.fill.pending = null;
+            }
+            self.uiStrokeDiscard();
+            self.input.cancel();
+        }
+        if (self.bezier_editor.isEditing()) {
+            // ESC と同じ内部処理（未確定 path 破棄）。ドラッグ中フラグも落とす。
+            self.bezier_editor.update(self.gpa, .cancel);
+            self.bez_in.in_drag = false;
+        }
+        if (self.sel_in.state != .idle) {
+            // ESC ドラッグ中断と同じ（実レイヤーは drag 中不変 → 画素巻き戻し不要）。
+            self.sel_in.cancel(self.gpa);
+        }
+        self.setSaveMsg("netsync: 進行中の編集は相手の操作適用のため中断されました", .{});
+    }
+
     /// ソフトオーバーレイ（ツールグリフ + footprint リング）を隠すべきか（TASK-75.4）。
     /// 実際に描画/入力操作が進行中（stroke capture・選択ドラッグ・ベジェのハンドルドラッグ・パン）の間は
     /// 隠す（bezier hover プレビューの「ドラッグ中は隠す」流儀と同じ）。これにより
@@ -641,6 +676,102 @@ const App = struct {
         };
         if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER); // op は user 所有（review 反映）
         self.last_seen_handle = self.doc.undo.next_handle; // 記録された push（§2b の追従点）
+    }
+
+    /// netsync 中の UI stroke を routeAction("stroke") へ流す対象か（pen/eraser/brush のみ。
+    /// fill 等は action 語彙なし → netsync 中は rewind_discard。TASK-94 Phase C）。
+    fn uiStrokeRelaysViaAction(self: *const App) bool {
+        return switch (self.ui_stroke_tool) {
+            .pen, .eraser, .brush => true,
+            else => false,
+        };
+    }
+
+    /// ローカル preview 塗りを pd.diffs の before（= ストローク開始前値。StrokeRecorder dedup /
+    /// brush orig）で巻き戻し、diffs を解放する（pushPaintOp しない。TASK-94 Phase C-1b）。
+    fn rewindPaintDiff(self: *App, pd: core.PaintDiff) void {
+        const pixels = self.canvas.layerPixels(pd.layer_idx);
+        for (pd.diffs) |d| pixels[d.idx] = d.before;
+        self.gpa.free(pd.diffs);
+    }
+
+    /// netsync 中 UI stroke 確定: 巻き戻し → canonical args で routeAction("stroke")。
+    /// solo の recordUiStroke と対になる経路（actor は wire の origin peer。TASK-94 Phase C-1）。
+    fn relayUiStroke(self: *App) void {
+        const len = self.ui_stroke_len;
+        const overflow = self.ui_stroke_overflow;
+        const tool_kind = self.ui_stroke_tool;
+        const color = self.ui_stroke_color;
+        const size = self.ui_stroke_size;
+        const opacity = self.ui_stroke_opacity;
+        const hardness = self.ui_stroke_hardness;
+        // 点列は discard 前に canon 化するため、slice を先に取る（discard は len を 0 にするだけ）。
+        const pts = self.ui_stroke_pts[0..len];
+        self.uiStrokeDiscard();
+        if (len == 0) return;
+        if (overflow) {
+            std.debug.print("pixie: netsync UI stroke を skip（{d} 点超過。preview は巻き戻し済み）\n", .{actions.MAX_STROKE_POINTS});
+            return;
+        }
+        const tool: actions.StrokeTool = switch (tool_kind) {
+            .pen => .pen,
+            .eraser => .eraser,
+            .brush => .brush,
+            else => return,
+        };
+        var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+        const canon = actions.formatCanonicalStroke(&canon_buf, .{
+            .tool = tool,
+            .color = color,
+            .size = size,
+            .opacity = opacity,
+            .hardness = hardness,
+        }, pts) catch {
+            std.debug.print("pixie: netsync UI stroke を skip（canonical args 超過）\n", .{});
+            return;
+        };
+        var out_buf: [256]u8 = undefined;
+        _ = platform.routeAction("stroke", canon, &out_buf) catch |err| {
+            std.debug.print("pixie: netsync UI stroke routeAction 失敗: {s}\n", .{@errorName(err)});
+            self.setSaveMsg("netsync: stroke を送信できませんでした（{s}）", .{@errorName(err)});
+        };
+    }
+
+    /// netsync 中のみ routeAction、solo は呼び出し側が do* を使う（TASK-94 Phase C-2）。
+    fn routeUi(self: *App, name: []const u8, args: []const u8) void {
+        var buf: [256]u8 = undefined;
+        _ = platform.routeAction(name, args, &buf) catch |err| {
+            std.debug.print("pixie: routeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+            self.setSaveMsg("netsync: {s} を送信できませんでした（{s}）", .{ name, @errorName(err) });
+        };
+    }
+
+    fn routeUiLayerOp(self: *App, name: []const u8, idx: usize) void {
+        const id = self.doc.layerIdAt(idx) orelse return;
+        var args_buf: [64]u8 = undefined;
+        const args = actions.formatLayerId(&args_buf, @intFromEnum(id)) catch return;
+        self.routeUi(name, args);
+    }
+
+    fn routeUiLayerVisible(self: *App, idx: usize, on: bool) void {
+        const id = self.doc.layerIdAt(idx) orelse return;
+        var args_buf: [64]u8 = undefined;
+        const args = actions.formatLayerIdBool(&args_buf, @intFromEnum(id), on) catch return;
+        self.routeUi("set_layer_visible", args);
+    }
+
+    fn routeUiLayerOpacity(self: *App, idx: usize, value: u8) void {
+        const id = self.doc.layerIdAt(idx) orelse return;
+        var args_buf: [64]u8 = undefined;
+        const args = actions.formatLayerIdU8(&args_buf, @intFromEnum(id), value) catch return;
+        self.routeUi("set_layer_opacity", args);
+    }
+
+    fn routeUiLayerMove(self: *App, idx: usize, delta: i32) void {
+        const id = self.doc.layerIdAt(idx) orelse return;
+        var args_buf: [64]u8 = undefined;
+        const args = actions.formatLayerIdDelta(&args_buf, @intFromEnum(id), delta) catch return;
+        self.routeUi("move_layer", args);
     }
 
     /// スポイト（TASK-68）: 指定 canvas 座標の色を描画色へ反映する。座標は呼び出し側
@@ -1731,7 +1862,7 @@ fn actionApp(ctx: *anyopaque) *App {
 fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     try actions.parseNoArgs(args);
     const app = actionApp(ctx);
-    if (app.editingBlocked()) return error.EditingBlocked;
+    try app.checkEditingAllowed();
     const outcome = try app.cmd_exec.undoOne(.local_agent, buf);
     app.clampTimelineTarget();
     return outcome.message;
@@ -1740,7 +1871,7 @@ fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
 fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     try actions.parseNoArgs(args);
     const app = actionApp(ctx);
-    if (app.editingBlocked()) return error.EditingBlocked;
+    try app.checkEditingAllowed();
     const seq_before = app.cmd_log.next_seq;
     const outcome = app.cmd_exec.redoOne(.local_agent, buf) catch |err| {
         app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // PartialRedo でも適用済み分はタグ
@@ -1754,13 +1885,17 @@ fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
 fn actionClear(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     try actions.parseNoArgs(args);
-    try actionApp(ctx).doClear();
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    try app.doClear();
     return "ok";
 }
 
 fn actionAddLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     try actions.parseNoArgs(args);
-    const id = try actionApp(ctx).doAddLayer();
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    const id = try app.doAddLayer();
     return std.fmt.bufPrint(buf, "ok id=#{d}", .{id}) catch return error.ArgsTooLong;
 }
 
@@ -1792,6 +1927,7 @@ fn resolveLayerRef(app: *App, ref: actions.LayerRef, require_id_during_netsync: 
 fn actionDeleteLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const ref = try actions.parseLayerRef(args);
     const idx = try resolveLayerRef(app, ref, true);
     try app.doDeleteLayer(idx);
@@ -1801,6 +1937,7 @@ fn actionDeleteLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 fn actionSelectLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const ref = try actions.parseLayerRef(args);
     // select_layer は .local_only（per-peer view）なので netsync 中も bare index を許容。
     const idx = try resolveLayerRef(app, ref, false);
@@ -1811,6 +1948,7 @@ fn actionSelectLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 fn actionSetLayerVisible(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const p = try actions.parseLayerRefBool(args);
     const idx = try resolveLayerRef(app, p.ref, true);
     try app.doSetLayerVisible(idx, p.on);
@@ -1820,6 +1958,7 @@ fn actionSetLayerVisible(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
 fn actionSetLayerOpacity(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const p = try actions.parseLayerRefU8(args);
     const idx = try resolveLayerRef(app, p.ref, true);
     try app.doSetLayerOpacity(idx, p.value);
@@ -1829,6 +1968,7 @@ fn actionSetLayerOpacity(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
 fn actionMoveLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const p = try actions.parseLayerRefDelta(args);
     const idx = try resolveLayerRef(app, p.ref, true);
     try app.doMoveLayer(idx, p.delta);
@@ -1837,6 +1977,7 @@ fn actionMoveLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 
 fn actionDuplicateLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const ref = try actions.parseLayerRef(args);
     const idx = try resolveLayerRef(app, ref, true);
     const id = try app.doDuplicateLayer(idx);
@@ -1846,6 +1987,7 @@ fn actionDuplicateLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![
 fn actionMergeDown(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const ref = try actions.parseLayerRef(args);
     const idx = try resolveLayerRef(app, ref, true);
     try app.doMergeDown(idx);
@@ -1855,18 +1997,20 @@ fn actionMergeDown(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 /// `add` で空フレーム追加、`select <idx>` でフレーム選択（harness 向け。registry 節約のため1名）。
 fn actionFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     var it = std.mem.tokenizeAny(u8, args, " \t");
     const sub = it.next() orelse return error.Empty;
     if (std.mem.eql(u8, sub, "add")) {
         if (it.next() != null) return error.TooManyTokens;
-        try actionApp(ctx).doAddFrame();
+        try app.doAddFrame();
         return "ok";
     }
     if (std.mem.eql(u8, sub, "select")) {
         const idx_tok = it.next() orelse return error.Empty;
         if (it.next() != null) return error.TooManyTokens;
         const idx = std.fmt.parseUnsigned(u32, idx_tok, 10) catch return error.InvalidNumber;
-        try actionApp(ctx).doSelectFrame(idx);
+        try app.doSelectFrame(idx);
         return "ok";
     }
     return error.InvalidNumber;
@@ -1876,6 +2020,7 @@ fn actionSetOnion(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     _ = buf;
     const p = try actions.parseOnion(args);
     const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     app.onion_enabled = p.enabled;
     if (p.count) |c| {
         app.onion_count = @intCast(std.math.clamp(c, 1, core.onion_skin.max_count));
@@ -1885,16 +2030,20 @@ fn actionSetOnion(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 
 fn actionSetColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const color = try actions.parseHexColor(args);
-    actionApp(ctx).doSetColorHex(color);
+    app.doSetColorHex(color);
     return "ok";
 }
 
 fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const trimmed = std.mem.trim(u8, args, " \t");
     const kind = std.meta.stringToEnum(ToolKind, trimmed) orelse return error.UnknownTool;
-    actionApp(ctx).setActiveKind(kind);
+    app.setActiveKind(kind);
     return "ok";
 }
 
@@ -1908,7 +2057,7 @@ fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    if (app.editingBlocked()) return error.EditingBlocked;
+    try app.checkEditingAllowed();
     if (app.selectedLayerIsText()) return error.TextLayerSelected; // TASK-79.5: text layer 直接編集禁止
     var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
     const parsed = try actions.parseStroke(args, &pts_buf);
@@ -1969,15 +2118,19 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
 
 fn actionSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const path = try actions.parsePath(args);
-    try actionApp(ctx).doSaveTo(path);
+    try app.doSaveTo(path);
     return "ok";
 }
 
 fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
     const path = try actions.parsePath(args);
-    actionApp(ctx).doOpenPath(path) catch |err| {
+    app.doOpenPath(path) catch |err| {
         // structured error（TASK-62.5.9）: 読込失敗（png は FileNotFound 等を ReadFailed に正規化）は
         // 自己回復ヒントを wire に載せる。
         if (err == error.ReadFailed or err == error.FileNotFound) {
@@ -2321,7 +2474,7 @@ fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 
 fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    if (app.editingBlocked()) return error.EditingBlocked;
+    try app.checkEditingAllowed();
     const sz = try core.document_io.peekCanvasSize(bytes);
     if (sz.w != CANVAS_W or sz.h != CANVAS_H) return error.UnsupportedCanvasSize;
     const new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
@@ -2594,10 +2747,22 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32) void {
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.label("Layers");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) _ = app.doAddLayer() catch {};
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) app.doDeleteLayer(app.canvas.selected_layer) catch {};
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) app.doMoveLayer(app.canvas.selected_layer, 1) catch {};
-    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) app.doMoveLayer(app.canvas.selected_layer, -1) catch {};
+    // TASK-94 Phase C: netsync 中は routeAction（#id）、solo は do* 直呼び。
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) {
+        if (platform.netsyncActive()) app.routeUi("add_layer", "") else _ = app.doAddLayer() catch {};
+    }
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 2, "-", .{ .min_w = 28 }).clicked) {
+        const idx = app.canvas.selected_layer;
+        if (platform.netsyncActive()) app.routeUiLayerOp("delete_layer", idx) else app.doDeleteLayer(idx) catch {};
+    }
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 3, "Up", .{ .min_w = 34 }).clicked) {
+        const idx = app.canvas.selected_layer;
+        if (platform.netsyncActive()) app.routeUiLayerMove(idx, 1) else app.doMoveLayer(idx, 1) catch {};
+    }
+    if (ctx.buttonId(LAYER_PANEL_ID_BASE + 4, "Dn", .{ .min_w = 34 }).clicked) {
+        const idx = app.canvas.selected_layer;
+        if (platform.netsyncActive()) app.routeUiLayerMove(idx, -1) else app.doMoveLayer(idx, -1) catch {};
+    }
     ctx.endBox();
 
     var rev = app.canvas.layers.items.len;
@@ -2637,16 +2802,18 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         } else {
             const shown = truncateForDisplay(ctx.allocator(), layer.name(), LAYER_NAME_DISPLAY_MAX);
             if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
+                // select_layer は .local_only（per-peer view）→ netsync 中もローカル do*
                 app.doSelectLayer(idx) catch {};
             }
         }
         const vis_label: []const u8 = if (layer.visible) "V" else "H";
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
-            app.doToggleLayerVisible(idx);
+            if (platform.netsyncActive()) app.routeUiLayerVisible(idx, !layer.visible) else app.doToggleLayerVisible(idx);
         }
         var op_i32: i32 = layer.opacity;
         if (ctx.sliderI32Id(layerWidgetId(idx, 2), "O", &op_i32, .{ .min = 0, .max = 255, .track_w = 40 })) {
-            app.doSetLayerOpacity(idx, @intCast(std.math.clamp(op_i32, 0, 255))) catch {};
+            const v: u8 = @intCast(std.math.clamp(op_i32, 0, 255));
+            if (platform.netsyncActive()) app.routeUiLayerOpacity(idx, v) else app.doSetLayerOpacity(idx, v) catch {};
         }
         ctx.endBox(); // row
 
@@ -3423,10 +3590,27 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                     if (pd_opt) |pd| {
-                        const handle_before = app.doc.undo.next_handle;
-                        app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
-                        // 確定点で CommandRecord を記録（actor=local_user。undo_ref = push された Op の handle）
-                        app.recordUiStroke(app.doc.undo.next_handle != handle_before);
+                        // TASK-94 Phase C: netsync 中は preview を巻き戻し → routeAction("stroke")。
+                        // fill 等（action 語彙なし）は rewind 破棄（silent diverge 防止）。
+                        // solo は従来どおり pushPaintOp + recordUiStroke。
+                        switch (actions.uiPaintCommitPath(platform.netsyncActive(), app.uiStrokeRelaysViaAction())) {
+                            .relay => {
+                                app.rewindPaintDiff(pd);
+                                app.relayUiStroke();
+                            },
+                            .rewind_discard => {
+                                app.rewindPaintDiff(pd);
+                                app.uiStrokeDiscard();
+                                std.debug.print("pixie: netsync 中は fill 等は使えません（action 語彙なし・preview を破棄）\n", .{});
+                                app.setSaveMsg("netsync: fill unavailable (no action)", .{});
+                            },
+                            .solo => {
+                                const handle_before = app.doc.undo.next_handle;
+                                app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                                // 確定点で CommandRecord を記録（actor=local_user。undo_ref = push された Op の handle）
+                                app.recordUiStroke(app.doc.undo.next_handle != handle_before);
+                            },
+                        }
                     } else if (!app.input.capturing) {
                         app.uiStrokeDiscard(); // release したが確定 diff なし → 蓄積破棄
                     }
@@ -3522,15 +3706,33 @@ pub fn main(init: std.process.Init) !void {
                 const ctx_menu_result = ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
                 if (ctx_menu_result.selected) |sel| {
                     const sel_idx = app.canvas.selected_layer;
+                    const synced = platform.netsyncActive();
                     switch (sel) {
-                        0 => _ = app.doAddLayer() catch {},
-                        1 => app.doAddTextLayer() catch {},
-                        2 => app.doDeleteLayer(sel_idx) catch {},
-                        3 => app.doMoveLayer(sel_idx, 1) catch {},
-                        4 => app.doMoveLayer(sel_idx, -1) catch {},
-                        5 => app.doToggleLayerVisible(sel_idx),
-                        6 => _ = app.doDuplicateLayer(sel_idx) catch {},
-                        7 => app.doMergeDown(sel_idx) catch {},
+                        0 => {
+                            if (synced) app.routeUi("add_layer", "") else _ = app.doAddLayer() catch {};
+                        },
+                        1 => app.doAddTextLayer() catch {}, // action 未登録・relay 対象外
+                        2 => {
+                            if (synced) app.routeUiLayerOp("delete_layer", sel_idx) else app.doDeleteLayer(sel_idx) catch {};
+                        },
+                        3 => {
+                            if (synced) app.routeUiLayerMove(sel_idx, 1) else app.doMoveLayer(sel_idx, 1) catch {};
+                        },
+                        4 => {
+                            if (synced) app.routeUiLayerMove(sel_idx, -1) else app.doMoveLayer(sel_idx, -1) catch {};
+                        },
+                        5 => {
+                            if (synced)
+                                app.routeUiLayerVisible(sel_idx, !app.canvas.layers.items[sel_idx].visible)
+                            else
+                                app.doToggleLayerVisible(sel_idx);
+                        },
+                        6 => {
+                            if (synced) app.routeUiLayerOp("duplicate_layer", sel_idx) else _ = app.doDuplicateLayer(sel_idx) catch {};
+                        },
+                        7 => {
+                            if (synced) app.routeUiLayerOp("merge_down", sel_idx) else app.doMergeDown(sel_idx) catch {};
+                        },
                         8 => app.beginRenameLayer(sel_idx),
                         9 => app.beginTextEdit(sel_idx),
                         10 => app.doRasterizeLayer(sel_idx) catch {},
