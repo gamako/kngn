@@ -305,6 +305,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "patch", .ctx = app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     registerActions(app);
+    registerStateSync(app);
 
     var pressed = [_]bool{false} ** 128;
     var mouse_note: ?u8 = null; // マウスで押している鍵
@@ -704,4 +705,26 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_fx_bypass", .ctx = app, .run = actionSetFxBypass });
     platform.registerAction(.{ .name = "save_patch", .ctx = app, .run = actionSavePatch });
     platform.registerAction(.{ .name = "load_patch", .ctx = app, .run = actionLoadPatch });
+}
+
+fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app = actionApp(ctx);
+    return patch_io.encode(Params, FxParams, allocator, app.params, app.fxp);
+}
+
+fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+    const app = actionApp(ctx);
+    const loaded = try patch_io.decode(Params, FxParams, bytes);
+    app.params = loaded.params;
+    app.fxp = loaded.fxp;
+    republishPatch(app);
+    republishFx(app);
+}
+
+fn registerStateSync(app: *App) void {
+    platform.registerStateSync(.{
+        .ctx = app,
+        .export_fn = netsyncExport,
+        .import_fn = netsyncImport,
+    });
 }

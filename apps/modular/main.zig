@@ -282,6 +282,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "modular", .ctx = app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     registerActions(app);
+    registerStateSync(app);
 
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
@@ -787,4 +788,30 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = actionSetPitch });
     platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = actionSavePattern });
     platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = actionLoadPattern });
+}
+
+fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const cmd = stateToCommand(patch.snapshotState());
+    return pattern_io.encode(Params, allocator, app.params, patternToPayload(cmd));
+}
+
+fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+    const app = actionApp(ctx);
+    const patch = app.patch orelse return error.NotReady;
+    const loaded = try pattern_io.decode(Params, bytes);
+    app.params = loaded.params;
+    publishControls(patch, app.params);
+    app.pattern_rev += 1;
+    const cmd = payloadToPatternCommand(app.pattern_rev, loaded.pattern);
+    patch.controls.pattern_db.publish(cmd);
+}
+
+fn registerStateSync(app: *App) void {
+    platform.registerStateSync(.{
+        .ctx = app,
+        .export_fn = netsyncExport,
+        .import_fn = netsyncImport,
+    });
 }

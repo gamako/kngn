@@ -668,9 +668,17 @@ Frame = { kind: u8, len: u32 LE, payload: [len]u8 }
 | HELLO | `0x01` | テキスト（client→host / host→client） |
 | PROPOSE | `0x02` | `u32 LE proposal_id` ++ `"<name> <args>"`（client→host） |
 | COMMIT | `0x03` | `u64 LE seq` ++ `u32 LE origin_peer` ++ `"<name> <args>"`（host→clients。host 自身へは送らない） |
+| SYNC | `0x04` | `u64 LE seq` ++ state bytes（host→client。join 時 1 回。空 state=snapshot なし） |
 | REJECT | `0x05` | `u32 LE proposal_id` ++ `"<reason>"`（host→提案元のみ） |
 
-action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。超過は当該接続切断。
+action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry（heap）で `MAX_SYNC_BYTES`（16MiB）まで。超過は当該接続切断。
+
+### join 時 SYNC（TASK-62.3.3）
+
+1. host: HELLO 成功 → inbound に ClientJoined（内部 kind。peer_id+generation）→ pump が export → SYNC(seq=`wire_seq`) を outbound FIFO に big-entry enqueue → `synced=true`。broadcast は synced slot のみ
+2. export 未登録 → state 0 の空 SYNC + `snapshot_valid=false`。登録済み exporter が 0 byte を返すのは失敗扱い（切断）
+3. client: 接続時 `awaiting_sync=true`。解除まで pump は inbound dequeue ループに入らない（COMMIT は queue に滞留）。SYNC は heap `pending_sync`（後着は置換）。空 SYNC は import なしで解除。import 失敗は保留 COMMIT 不適用のまま fail-soft
+4. 4 app は既存 serde（pixie=`document_io` / synth=`patch_io` / modular=`pattern_io` / patch=`graph_io`）を薄い `registerStateSync` で呼ぶだけ
 
 ### NetworkPolicy
 

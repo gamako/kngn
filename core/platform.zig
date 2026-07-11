@@ -296,6 +296,10 @@ pub const Action = harness.action_registry.Action;
 pub const NetworkPolicy = harness.action_registry.NetworkPolicy;
 pub const registerAction = harness.action_registry.registerAction;
 
+pub const StateSync = netsync.StateSync;
+/// netsync join 時の document/patch 同期アダプタ登録（無効時も保存のみ・常に呼んでよい）。
+pub const registerStateSync = netsync.registerStateSync;
+
 // ============================================================================
 // command model（TASK-62.5.1/62.5.3）
 //

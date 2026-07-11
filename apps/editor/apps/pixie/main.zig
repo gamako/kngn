@@ -2057,6 +2057,39 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record) });
 }
 
+fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return core.document_io.encodeDocument(&app.doc, allocator);
+}
+
+fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (app.editingBlocked()) return error.EditingBlocked;
+    const sz = try core.document_io.peekCanvasSize(bytes);
+    if (sz.w != CANVAS_W or sz.h != CANVAS_H) return error.UnsupportedCanvasSize;
+    const new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
+    const preserved_next_handle = app.doc.undo.next_handle;
+    app.doc.deinit();
+    app.doc = new_doc;
+    app.doc.undo.next_handle = preserved_next_handle;
+    app.invalidateHistoryAfterDocReset();
+    app.doc.resyncActiveView(app.gpa);
+    app.canvas = app.doc.activeCanvas();
+    app.clampTimelineTarget();
+    app.applySystemFont();
+    app.canvas.clearSelection();
+    app.sel_in.discardFloat(app.gpa);
+    app.syncPreviewCanvas();
+}
+
+fn registerStateSync(app: *App) void {
+    platform.registerStateSync(.{
+        .ctx = app,
+        .export_fn = netsyncExport,
+        .import_fn = netsyncImport,
+    });
+}
+
 /// canvas_area rect 内に表示領域（CANVAS*zoom 四方）を配置した canvas rect を返す。
 /// vw<=area.w 軸は中央固定（pan=0）、vw>area.w 軸は canvas が area を完全に覆う範囲へ pan を clamp し
 /// app.pan_x/y へ書き戻す。毎フレーム app.last_area も更新する（Fit ズーム計算用）。
@@ -2979,6 +3012,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest }); // TASK-62.5.5 正式 schema
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
     registerActions(&app);
+    registerStateSync(&app);
 
     main_loop: while (app.running and window.pollEvents()) {
         // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。

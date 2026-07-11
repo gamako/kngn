@@ -1401,6 +1401,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "viz", .ctx = &app, .ext = "json", .snapshot = vizSnapshot, .digest = vizDigest });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     registerActions(&app);
+    registerStateSync(&app);
 
     device.start() catch |err| {
         std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
@@ -1968,4 +1969,68 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "disconnect", .ctx = app, .run = actionDisconnect });
     platform.registerAction(.{ .name = "save_graph", .ctx = app, .run = actionSaveGraph });
     platform.registerAction(.{ .name = "load_graph", .ctx = app, .run = actionLoadGraph });
+}
+
+fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app = actionApp(ctx);
+    var node_buf: [MAX_MODULES]graph_io.NodeEntry = undefined;
+    var nn: usize = 0;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) continue;
+        const pos = app.layout[h];
+        node_buf[nn] = .{ .handle = h, .kind = app.dyn.kindOf(h).?, .x = pos.x, .y = pos.y };
+        nn += 1;
+    }
+    var flat_buf: [MAX_EDGES]Edge = undefined;
+    const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
+    var edge_buf: [MAX_EDGES]graph_io.EdgeEntry = undefined;
+    for (flat, 0..) |e, i| {
+        edge_buf[i] = .{ .src_handle = e.src_handle, .src_out = e.src_out, .dst_handle = e.dst_handle, .dst_in = e.dst_in };
+    }
+    return graph_io.encodeGraph(allocator, node_buf[0..nn], edge_buf[0..flat.len]);
+}
+
+fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+    const app = actionApp(ctx);
+    const gpa = std.heap.c_allocator;
+    var decoded = try graph_io.decodeGraph(gpa, bytes);
+    defer decoded.deinit(gpa);
+
+    if (decoded.nodes.len > app.dyn.freeHandleCount()) return error.TooManyNodesForCapacity;
+    inline for (@typeInfo(modular.ModuleKind).@"enum".fields) |kf| {
+        const k: modular.ModuleKind = @enumFromInt(kf.value);
+        var need: usize = 0;
+        for (decoded.nodes) |n| {
+            if (n.kind == k) need += 1;
+        }
+        if (need > app.dyn.poolFreeCount(k)) return error.TooManyNodesForCapacity;
+    }
+
+    clearGraph(app);
+
+    var mapping = [_]?Handle{null} ** MAX_MODULES;
+    for (decoded.nodes) |n| {
+        if (n.handle >= MAX_MODULES) continue;
+        const nh = addNodeByKind(app, n.kind) catch continue;
+        app.layout[nh] = .{ .x = n.x, .y = n.y };
+        mapping[n.handle] = nh;
+    }
+    for (decoded.edges) |e| {
+        if (e.src_handle >= MAX_MODULES or e.dst_handle >= MAX_MODULES) continue;
+        const src = mapping[e.src_handle] orelse continue;
+        const dst = mapping[e.dst_handle] orelse continue;
+        app.dyn.connect(src, e.src_out, dst, e.dst_in) catch continue;
+    }
+
+    try app.dyn.publish();
+    app.refreshAllExposed();
+}
+
+fn registerStateSync(app: *App) void {
+    platform.registerStateSync(.{
+        .ctx = app,
+        .export_fn = netsyncExport,
+        .import_fn = netsyncImport,
+    });
 }
