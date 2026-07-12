@@ -90,6 +90,27 @@ pub const Frame = struct {
     duration_ms: u32 = 100,
 };
 
+/// 再生の実効間隔（秒）。`interval = (1/fps) × (duration_ms/100)`。
+/// fps は全体レート、duration_ms は frame 相対係数（既定 100 → 係数 1.0 = 従来の 1/fps）。
+///
+/// 仕様（TASK-45.4）:
+/// - 計算は全て f64
+/// - `fps <= 0` → `+inf`（進まない。UI スライダーは正値のみだが防御）
+/// - `duration_ms == 0` → 100 として扱う（ゼロ間隔の busy advance を防ぐ）
+/// - 入力は slider(f32 正値)/u32 のみで非有限値は入らない
+pub fn playbackIntervalSec(fps: f32, duration_ms: u32) f64 {
+    if (fps <= 0) return std.math.inf(f64);
+    const fps_f64: f64 = @floatCast(fps);
+    const dur: f64 = if (duration_ms == 0) 100.0 else @as(f64, @floatFromInt(duration_ms));
+    return dur / 100.0 * (1.0 / fps_f64);
+}
+
+/// 追いつき無し advance 判定。`now - last >= interval` なら true。
+/// 残余時間の補償はしない（呼び出し側が advance 後に `last = now` へリセットする）。
+pub fn shouldAdvance(now: f64, last: f64, interval: f64) bool {
+    return now - last >= interval;
+}
+
 /// 1 layer の全 frame 分の行（layer_add/delete 用）、または 1 frame の全 layer 分の列
 /// （frame_add/delete/duplicate 用）を、削除/復元のために一時保持する。
 /// `CelSetSnapshot.fully_released`/`Document.mergeDown` 用の共有 named 型（匿名 struct は
@@ -2066,4 +2087,37 @@ test "pushReplaceColor: 全画素置換" {
     const n = try doc.pushReplaceColor(gpa, 0, 0xFF112233, 0xFFAABBCC);
     try testing.expectEqual(@as(u32, 4), n);
     for (px) |p| try testing.expectEqual(@as(u32, 0xFFAABBCC), p);
+}
+
+// ── TASK-45.4: 再生 interval / advance 判定 ──────────────────────────
+
+test "playbackIntervalSec: 100ms→1/fps / 200ms→2/fps / 50ms→0.5/fps / fps=0→inf / duration=0→1/fps" {
+    // fps=10 → 1/fps = 0.1
+    try testing.expectApproxEqAbs(@as(f64, 0.1), playbackIntervalSec(10.0, 100), 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.2), playbackIntervalSec(10.0, 200), 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.05), playbackIntervalSec(10.0, 50), 1e-12);
+    try testing.expect(std.math.isInf(playbackIntervalSec(0.0, 100)));
+    try testing.expect(std.math.isInf(playbackIntervalSec(-1.0, 100)));
+    // duration_ms==0 は 100 扱い → 1/fps
+    try testing.expectApproxEqAbs(@as(f64, 0.1), playbackIntervalSec(10.0, 0), 1e-12);
+    // fps=1 で係数そのまま秒数になることも固定
+    try testing.expectApproxEqAbs(@as(f64, 1.0), playbackIntervalSec(1.0, 100), 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), playbackIntervalSec(1.0, 200), 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), playbackIntervalSec(1.0, 50), 1e-12);
+}
+
+test "shouldAdvance: 追いつき無し（0.35s 経過でも 1 tick で 1 frame・残余補償なし）" {
+    const interval: f64 = 0.1; // fps=10, duration=100
+    try testing.expect(!shouldAdvance(0.05, 0.0, interval));
+    try testing.expect(shouldAdvance(0.1, 0.0, interval));
+    // 0.35 秒経過: 判定は true だが、呼び出し側が last=now にリセットするので
+    // 同 tick で複数 frame は進まない（残余 0.25s の補償なし）。
+    const now: f64 = 0.35;
+    try testing.expect(shouldAdvance(now, 0.0, interval));
+    const last_after = now; // last_advance = now（既存挙動）
+    try testing.expect(!shouldAdvance(now, last_after, interval));
+    // 次の advance は last_after からフル interval 必要（残余クレジットなし）。
+    // f64 の 0.1 は非有限小数なので境界ちょうどではなく 0.5× / 1.5× で固定する。
+    try testing.expect(!shouldAdvance(last_after + interval * 0.5, last_after, interval));
+    try testing.expect(shouldAdvance(last_after + interval * 1.5, last_after, interval));
 }

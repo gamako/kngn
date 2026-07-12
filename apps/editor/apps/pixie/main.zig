@@ -1553,14 +1553,20 @@ const App = struct {
         try self.doc.unlinkCel(self.gpa, layer, frame);
     }
 
+    /// フレーム境界の再生 tick（毎フレーム 1 回・f64 比較のみ。全画素・RT 非該当）。
+    /// 実効間隔 = playbackIntervalSec(fps, 現在 frame の duration_ms)。追いつき無し（1 tick で 1 frame）。
+    ///
+    /// `timeline_last_advance` は play 開始時（UI / action play）に `getTime()` で seed する。
+    /// 旧実装の `last==0` 再 seed は、仮想クロックが 0 起点のとき毎 tick で上書きされ
+    /// （advance 前は last が 0 のまま残る）step 数をずらすため行わない（TASK-45.4）。
     fn tickTimelinePlayback(self: *App, now: f64) void {
         if (!self.timeline_playing or self.editingBlocked()) return;
-        const interval = 1.0 / self.timeline_fps;
-        if (self.timeline_last_advance == 0) self.timeline_last_advance = now;
-        if (now - self.timeline_last_advance < interval) return;
-        self.timeline_last_advance = now;
         const nframes = self.doc.frames.items.len;
         if (nframes == 0) return;
+        const duration_ms = self.doc.frames.items[self.doc.selected_frame].duration_ms;
+        const interval = core.document.playbackIntervalSec(self.timeline_fps, duration_ms);
+        if (!core.document.shouldAdvance(now, self.timeline_last_advance, interval)) return;
+        self.timeline_last_advance = now;
         const next: u32 = if (self.doc.selected_frame + 1 >= nframes) 0 else self.doc.selected_frame + 1;
         self.doSelectFrame(next) catch {};
     }
@@ -1789,6 +1795,26 @@ fn toolDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const b: u8 = @truncate(c);
     return std.fmt.bufPrint(buf, "tool={s} color=#{X:0>2}{X:0>2}{X:0>2}", .{
         app.active_kind.name(), r, g, b,
+    }) catch buf[0..0];
+}
+
+/// timeline digest（TASK-45.4）: 再生状態を top-level k=v 1 行で公開（snapshot なし・expect 適合）。
+/// 形式: `playing=<0|1> frame=<n> frames=<n> fps=<f:.1> dur=<ms> layers=<n> onion=<0|1>`
+fn timelineDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const sf = app.doc.selected_frame;
+    const dur: u32 = if (sf < app.doc.frames.items.len)
+        app.doc.frames.items[sf].duration_ms
+    else
+        100;
+    return std.fmt.bufPrint(buf, "playing={d} frame={d} frames={d} fps={d:.1} dur={d} layers={d} onion={d}", .{
+        @intFromBool(app.timeline_playing),
+        sf,
+        app.doc.frames.items.len,
+        app.timeline_fps,
+        dur,
+        app.doc.layers.items.len,
+        @intFromBool(app.onion_enabled),
     }) catch buf[0..0];
 }
 fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -2381,6 +2407,43 @@ fn actionDiffMark(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
+/// `play`: timeline 再生開始（UI Play ボタンと同一処理）。CommandLog 非記録・冪等。
+fn actionPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    const app = actionApp(ctx);
+    app.timeline_playing = true;
+    app.timeline_last_advance = platform.getTime();
+    return "ok";
+}
+
+/// `pause`: timeline 再生停止。CommandLog 非記録・冪等。
+fn actionPause(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    const app = actionApp(ctx);
+    app.timeline_playing = false;
+    return "ok";
+}
+
+/// `goto_frame <idx>`: 表示 frame を選択（doSelectFrame・undo-free）。編集中は拒否。
+/// CommandLog 非記録（recordedAction 非経由）。範囲外は structured error。
+fn actionGotoFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    app.checkEditingAllowed() catch {
+        platform.setActionErrorDetail("editing_in_progress", "finish current stroke/selection first");
+        return error.EditingBlocked;
+    };
+    const idx = try actions.parseGotoFrame(args);
+    if (idx >= app.doc.frames.items.len) {
+        platform.setActionErrorDetail("index_out_of_range", "use 0..frames-1");
+        return error.OutOfRange;
+    }
+    try app.doSelectFrame(idx);
+    return "ok";
+}
+
 /// `recipe_save <path>`: CommandLog → recipe ファイル（header.app_name="pixie"）。記録しない（メタ操作）。
 fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
@@ -2732,6 +2795,10 @@ const pixie_args_palette_from_png: @FieldType(platform.Action, "args") = &.{
 const pixie_args_palette_set: @FieldType(platform.Action, "args") = &.{
     .{ .name = "hex", .kind = "string", .pattern = "#?RRGGBB", .variadic = true, .desc = "1..=64 色" },
 };
+// TASK-45.4: timeline view actions
+const pixie_args_goto_frame: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "idx", .kind = "int", .desc = "frame index" },
+};
 
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
@@ -2762,6 +2829,10 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only, .args = pixie_args_path });
     // diff_mark（TASK-87）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "diff_mark", .ctx = app, .run = actionDiffMark, .network_policy = .local_only, .desc = "mark current composite as diff baseline", .args = pixie_args_none });
+    // TASK-45.4: timeline view actions（executor 非経由・CommandLog 非記録・local_only）
+    platform.registerAction(.{ .name = "play", .ctx = app, .run = actionPlay, .network_policy = .local_only, .desc = "start timeline playback", .args = pixie_args_none });
+    platform.registerAction(.{ .name = "pause", .ctx = app, .run = actionPause, .network_policy = .local_only, .desc = "pause timeline playback", .args = pixie_args_none });
+    platform.registerAction(.{ .name = "goto_frame", .ctx = app, .run = actionGotoFrame, .network_policy = .local_only, .desc = "select frame by index (view only, no undo)", .args = pixie_args_goto_frame });
     // TASK-89: 末尾追加のみ（並列制約。既存行の変更・並べ替え禁止）
     platform.registerAction(.{ .name = "replace_color", .ctx = app, .run = recordedAction("replace_color", .record), .network_policy = .relay, .desc = "replace color A→B on layer ([#id|idx] from to; undoable)", .args = pixie_args_replace_color });
     // palette は document 状態（SYNC 対象）なので session 中のローカル変更は diverge → reject_when_synced
@@ -3760,6 +3831,8 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
     platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest }); // TASK-62.5.5 正式 schema
     platform.registerProbe(.{ .name = "diff", .ctx = &app, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" }); // TASK-87
+    // TASK-45.4: timeline 再生状態（digest のみ・snapshot=null）
+    platform.registerProbe(.{ .name = "timeline", .ctx = &app, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
     // TASK-89: 末尾追加のみ（並列制約）
     platform.registerProbe(.{ .name = "palette", .ctx = &app, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。

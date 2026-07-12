@@ -493,6 +493,15 @@ pub fn parseNoArgs(args: []const u8) ParseError!void {
     if (std.mem.trim(u8, args, " \t").len != 0) return error.TooManyTokens;
 }
 
+/// `goto_frame <idx>` 用: frame index の1トークン（u32）。
+pub fn parseGotoFrame(args: []const u8) ParseError!u32 {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const v = std.fmt.parseUnsigned(u32, tok, 10) catch return error.InvalidNumber;
+    try expectExhausted(&it);
+    return v;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -760,6 +769,16 @@ test "parseNoArgs: 空は許容 / 余剰トークンは拒否" {
     try parseNoArgs("");
     try parseNoArgs("   ");
     try testing.expectError(error.TooManyTokens, parseNoArgs("typo"));
+}
+
+test "parseGotoFrame: 有効値 / Empty / InvalidNumber / TooManyTokens" {
+    try testing.expectEqual(@as(u32, 0), try parseGotoFrame("0"));
+    try testing.expectEqual(@as(u32, 12), try parseGotoFrame("  12  "));
+    try testing.expectError(error.Empty, parseGotoFrame(""));
+    try testing.expectError(error.Empty, parseGotoFrame("   "));
+    try testing.expectError(error.InvalidNumber, parseGotoFrame("abc"));
+    try testing.expectError(error.InvalidNumber, parseGotoFrame("-1"));
+    try testing.expectError(error.TooManyTokens, parseGotoFrame("1 2"));
 }
 
 test "parseStroke: パラメータ無しは従来文法と後方互換" {
