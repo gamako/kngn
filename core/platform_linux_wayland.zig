@@ -225,7 +225,6 @@ const State = struct {
 
     configured: bool = false,
     closing: bool = false,
-    quit_delivered: bool = false,
     quit_enqueued: bool = false,
     queue: input.EventQueue = .{},
 
@@ -244,9 +243,10 @@ const State = struct {
     }
 
     /// connection error 等の異常系: .quit を 1 回積んで pollEvents の戻り値を返す。
+    /// closing 後は app の .quit drain を待たず false（TASK-28.5.7。lock-first main loop 救済）。
     fn fail(self: *State) bool {
         self.enqueueQuit();
-        return !self.quit_delivered;
+        return false;
     }
 };
 
@@ -1146,9 +1146,9 @@ pub const Window = struct {
         const n = poll(&pfd, 1, 0);
         const re = pfd[0].revents;
         if (n < 0) {
-            // poll 自体の失敗（EINTR 等）。read を解除して継続。
+            // poll 自体の失敗（EINTR 等）。read を解除して継続（closing 中は下で false）。
             c.wl_display_cancel_read(dpy);
-            return !st.quit_delivered;
+            return !st.closing;
         }
         if ((re & (POLLERR | POLLHUP)) != 0) {
             // compositor 切断。read は試みず cancel して quit。
@@ -1164,36 +1164,41 @@ pub const Window = struct {
 
         // keyboard repeat（repeat_info ベースに is_repeat=true を生成。AC#3）。
         // repeat.key は X keycode 系(evdev+8)なので keycodeToKeyCode をそのまま使う。
-        const now = common.getTime();
-        if (st.repeat.due(now)) {
-            if (st.repeat.key) |xk| {
-                st.queue.enqueue(.{ .key_down = .{
-                    .key = input.keycodeToKeyCode(xk),
-                    .is_repeat = true,
-                    .modifiers = st.modifiers,
-                } });
-                // repeat 中も char_input を出す（押しっぱなしのテキスト入力。codex 指摘 #4）。
-                // kbKey の初回発火と同じ抑止条件（Ctrl/Alt/Cmd 除外 + isTextCodepoint）。
-                if (st.xkb_state) |xs| {
-                    if (!st.modifiers.ctrl and !st.modifiers.alt and !st.modifiers.cmd) {
-                        const cp = c.xkb_state_key_get_utf32(xs, xk);
-                        if (input.isTextCodepoint(cp)) {
-                            st.queue.enqueue(.{ .char_input = .{ .codepoint = cp, .modifiers = st.modifiers } });
+        // closing 中は repeat を積まない（loop 終了直前の無駄 enqueue を避ける）。
+        if (!st.closing) {
+            const now = common.getTime();
+            if (st.repeat.due(now)) {
+                if (st.repeat.key) |xk| {
+                    st.queue.enqueue(.{ .key_down = .{
+                        .key = input.keycodeToKeyCode(xk),
+                        .is_repeat = true,
+                        .modifiers = st.modifiers,
+                    } });
+                    // repeat 中も char_input を出す（押しっぱなしのテキスト入力。codex 指摘 #4）。
+                    // kbKey の初回発火と同じ抑止条件（Ctrl/Alt/Cmd 除外 + isTextCodepoint）。
+                    if (st.xkb_state) |xs| {
+                        if (!st.modifiers.ctrl and !st.modifiers.alt and !st.modifiers.cmd) {
+                            const cp = c.xkb_state_key_get_utf32(xs, xk);
+                            if (input.isTextCodepoint(cp)) {
+                                st.queue.enqueue(.{ .char_input = .{ .codepoint = cp, .modifiers = st.modifiers } });
+                            }
                         }
                     }
+                    st.repeat.advance(now);
                 }
-                st.repeat.advance(now);
             }
         }
 
-        return !st.quit_delivered;
+        // TASK-28.5.7: closing なら app の .quit drain に依存せず false を返す。
+        // Wayland は lockFramebuffer が closing で恒久 null のため、quit_delivered 待ちだと
+        // lock-first な main loop が nextEvent に到達できず無限ループする。
+        // macOS は close 検知時に enqueue + 即 false（drain 不要）で同等契約。
+        return !st.closing;
     }
 
     pub fn nextEvent(self: Window) ?Event {
         const st = self.state;
-        const ev = st.queue.dequeue() orelse return null;
-        if (ev == .quit) st.quit_delivered = true;
-        return ev;
+        return st.queue.dequeue() orelse return null;
     }
 
     pub fn getEventStats(self: Window) EventStats {
