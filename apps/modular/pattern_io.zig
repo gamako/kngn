@@ -312,8 +312,13 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingSprm/Missin
 test "file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const path = ".task65_modular_pattern_io_test.mdlp";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // このテストは pattern_io 単体 root と project_io root（@import 経由）の 2 バイナリに
+    // 含まれ `zig build test` で並列実行される。cwd 固定名だと同一ファイルを取り合って
+    // race する（TASK-96 で実測）ため tmpDir のランダム sub_path で分離する。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/pattern_io_test.mdlp", .{&tmp.sub_path});
 
     const params = TestParams{ .tempo = 96, .kick_mute = false, .idx = 1 };
     const pattern = PatternPayload{ .kick_on = 0x8421, .bass_deg = [16]i8{ 5, 4, 3, 2, 1, 0, -1, -2, 0, 0, 0, 0, 0, 0, 0, 0 } };

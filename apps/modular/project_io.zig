@@ -656,8 +656,11 @@ test "project decode: 未知 chunk skip（前方互換）" {
 test "project file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const path = ".task91_modular_project_io_test.mprj";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // cwd 固定名は複数テストバイナリの並列実行で race しうる（pattern_io と同型。TASK-96）。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/project_io_test.mprj", .{&tmp.sub_path});
 
     const params = TestParams{ .tempo = 96, .idx = 1 };
     const pattern = pattern_io.PatternPayload{ .kick_on = 0x8421 };
