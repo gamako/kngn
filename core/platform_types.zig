@@ -433,8 +433,10 @@ pub const GamepadDisconnect = struct {
 /// - DialogUnavailable: ダイアログ機構が使えない（Linux: zenity 不在）。
 ///   macOS/Windows は通常返さない（型互換のため宣言に含める）。
 /// - DialogFailed: 予期せぬ失敗（異常終了 / signal / 環境不備等）。
+/// - DialogPending: 非同期ダイアログが進行中（wasm file picker。次 frame で再試行。TASK-73.3）。
+///   native backend は返さない（型互換のため宣言に含める）。
 /// ユーザーキャンセルは error ではなく null で表す。OOM は Allocator.Error。
-pub const DialogError = error{ DialogUnavailable, DialogFailed };
+pub const DialogError = error{ DialogUnavailable, DialogFailed, DialogPending };
 
 pub const SaveDialogOptions = struct {
     default_name: ?[:0]const u8 = null,

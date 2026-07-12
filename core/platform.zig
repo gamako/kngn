@@ -333,9 +333,36 @@ pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOption
 }
 
 /// ファイルを開くダイアログ。headless 時は即 `error.DialogFailed`（`saveFileDialog` と同じ理由）。
+/// wasm では非同期: 未 pick 時 `error.DialogPending`（次 frame で再試行。TASK-73.3）。
 pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     if (harness.isHeadlessActive()) return error.DialogFailed;
     return backend.openFileDialog(gpa, io, opts);
+}
+
+// ============================================================================
+// System clipboard（TASK-73.3 wasm。native は no-op / 未実装）
+// ============================================================================
+
+/// システム clipboard へ text を書く。backend 未実装時は no-op。
+pub fn clipboardWrite(text: []const u8) void {
+    if (comptime @hasDecl(backend, "clipboardWrite")) {
+        backend.clipboardWrite(text);
+    }
+}
+
+/// システム clipboard の text を非同期要求。backend 未実装時は no-op。
+pub fn clipboardRequestPaste() void {
+    if (comptime @hasDecl(backend, "clipboardRequestPaste")) {
+        backend.clipboardRequestPaste();
+    }
+}
+
+/// 届いていれば text を返し消費する。未着・未実装は null。
+pub fn clipboardTakePaste() ?[]const u8 {
+    if (comptime @hasDecl(backend, "clipboardTakePaste")) {
+        return backend.clipboardTakePaste();
+    }
+    return null;
 }
 
 // ============================================================================

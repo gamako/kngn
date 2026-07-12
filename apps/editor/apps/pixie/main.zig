@@ -356,6 +356,10 @@ const App = struct {
     palette_path: ?[]u8 = null,
     /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
     pending_file_op: ?FileOp = null,
+    /// wasm file picker 進行中の FileOp（TASK-73.3 修正1）。
+    /// DialogPending のあいだはこの op だけを再試行し、待機中に pending_file_op へ積まれた別要求は破棄する
+    /// （例: Cmd+O 待ち中の Cmd+Shift+S が picked path を誤って save_as に食わせない）。
+    dialog_op: ?FileOp = null,
     save_msg_buf: [128]u8 = undefined,
     save_msg_len: usize = 0,
     save_msg_until: f64 = 0,
@@ -546,11 +550,20 @@ const App = struct {
     }
 
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
-    /// 冒頭で one-shot 消費するので、capturing 等による早期 return でも要求は残らない。
+    /// `error.DialogPending`（wasm file picker 待ち）のときは `dialog_op` に当該 op を保持して次 frame 再試行。
+    /// dialog 待ち中に `pending_file_op` へ積まれた別要求は破棄する（picker 結果の誤配送防止。TASK-73.3 修正1）。
+    /// それ以外（成功・キャンセル null・他 error 表示済み）では `dialog_op` をクリアして消費する。
     fn runPendingFileOp(self: *App) void {
-        const op = self.pending_file_op orelse return;
+        // システム clipboard paste（色 #RRGGBB）の非同期届けを安全点で取り込む。
+        if (platform.clipboardTakePaste()) |text| {
+            self.applySystemClipboardColor(text);
+        }
+
+        // dialog 進行中は dialog_op を優先。無ければ pending を 1 回だけ起動。
+        const op = self.dialog_op orelse (self.pending_file_op orelse return);
+        // dialog 待ち中に積まれた別要求は破棄（通知なし。意図: picker 結果を別 op に食わせない）。
         self.pending_file_op = null;
-        switch (op) {
+        const pending = switch (op) {
             .save => self.doSave(),
             .save_as => self.doSaveAs(),
             .open => self.doOpen(),
@@ -560,7 +573,35 @@ const App = struct {
             .open_project => self.doOpenProject(),
             .export_seq => self.doExportSeq(),
             .export_sheet => self.doExportSheet(),
+        };
+        if (pending == .dialog_pending) {
+            self.dialog_op = op;
+            return;
         }
+        self.dialog_op = null;
+    }
+
+    /// ファイル op の結果。`.dialog_pending` は wasm open の picker 待ち。
+    const FileOpResult = enum { done, dialog_pending };
+
+    /// システム clipboard の text を色として解釈（`#RRGGBB` / `RRGGBB`。他は無視）。
+    fn applySystemClipboardColor(self: *App, text: []const u8) void {
+        var s = std.mem.trim(u8, text, " \t\r\n");
+        if (s.len > 0 and s[0] == '#') s = s[1..];
+        if (s.len != 6) return;
+        const rgb = std.fmt.parseInt(u32, s, 16) catch return;
+        self.doSetColorHex(0xFF000000 | rgb);
+    }
+
+    /// 現在の描画色を `#RRGGBB` でシステム clipboard へ（wasm Clipboard API。native は no-op）。
+    fn copySystemColor(self: *App) void {
+        const c = self.pen.color;
+        const r: u8 = @truncate(c >> 16);
+        const g: u8 = @truncate(c >> 8);
+        const b: u8 = @truncate(c);
+        var buf: [7]u8 = undefined;
+        const hex = std.fmt.bufPrint(&buf, "#{X:0>2}{X:0>2}{X:0>2}", .{ r, g, b }) catch return;
+        platform.clipboardWrite(hex);
     }
 
     /// 選択スウォッチの色を編集中 HSV から決定し、palette と描画色（pen）へ反映する。
@@ -936,47 +977,50 @@ const App = struct {
     }
 
     /// パレットを .gpl で保存（名前を付けて保存。成功でダイアログ戻り値を palette_path へ移譲）。
-    fn doSavePalette(self: *App) void {
+    fn doSavePalette(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "palette.gpl",
             .allowed_ext = "gpl",
         }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Palette save failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return;
+        const path = maybe orelse return .done;
         const bytes = palette_mod.encodeGpl(self.palette.colors.items, "pixie", self.gpa) catch |err| {
             self.setSaveMsg("Palette save failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
-            return;
+            return .done;
         };
         defer self.gpa.free(bytes);
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes }) catch |err| {
             self.setSaveMsg("Palette save failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
-            return;
+            return .done;
         };
         if (self.palette_path) |old| self.gpa.free(old);
         self.palette_path = path;
         self.setSaveMsg("Palette saved: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     /// .gpl を読み込んでパレットを差し替える（成功時のみ。失敗時は既存パレットを保持）。
-    fn doLoadPalette(self: *App) void {
+    fn doLoadPalette(self: *App) FileOpResult {
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "gpl" }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return;
+        const path = maybe orelse return .done;
         defer self.gpa.free(path);
         const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .unlimited) catch |err| {
             self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
         defer self.gpa.free(bytes);
         const colors = palette_mod.decodeGpl(self.gpa, bytes) catch |err| {
             self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
         // 成功: 旧 colors を解放して差し替え、selected/HSV を初期化
         self.palette.colors.deinit(self.gpa);
@@ -989,6 +1033,7 @@ const App = struct {
         self.brush.color = cur;
         self.fill.color = cur;
         self.setSaveMsg("Palette loaded: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     /// 指定パスへ直接保存する（ダイアログ不使用。`doSave` の共通実装 + action `save <path>` 用）。
@@ -1001,33 +1046,36 @@ const App = struct {
     }
 
     /// 記憶している保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
-    fn doSave(self: *App) void {
+    fn doSave(self: *App) FileOpResult {
         const path = self.current_path orelse return self.doSaveAs();
         // current_path は永続パスなので失敗しても保持（free しない）
         self.doSaveTo(path) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
         };
+        return .done;
     }
 
     /// ダイアログで保存先を選んで保存。成功時にダイアログ戻り値を current_path へ移譲する。
-    fn doSaveAs(self: *App) void {
+    fn doSaveAs(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "untitled.png",
             .allowed_ext = "png",
         }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // キャンセル: サイレント no-op
         const flat = self.canvas.compositeStraight();
         core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             self.gpa.free(path); // 失敗時はダイアログ戻り値を解放・旧 current_path は触らない
-            return;
+            return .done;
         };
         if (self.current_path) |old| self.gpa.free(old);
         self.current_path = path; // 移譲（再 dupe しない）
         self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
@@ -1070,67 +1118,73 @@ const App = struct {
     }
 
     /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
-    fn doOpen(self: *App) void {
-        if (self.input.capturing or self.bezier_editor.isEditing()) return;
+    fn doOpen(self: *App) FileOpResult {
+        if (self.input.capturing or self.bezier_editor.isEditing()) return .done;
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "png" }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // キャンセル: サイレント no-op
         defer self.gpa.free(path);
         self.doOpenPath(path) catch |err| {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
         };
+        return .done;
     }
 
     // ── .pix プロジェクト保存/読込（レイヤー構造保持。TASK-63）─────────────────
 
     /// 記憶している .pix 保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
-    fn doSaveProject(self: *App) void {
+    fn doSaveProject(self: *App) FileOpResult {
         const path = self.current_project_path orelse return self.doSaveAsProject();
         self.syncPaletteToDoc();
         core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
         self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     /// ダイアログで .pix 保存先を選んで保存。成功時にダイアログ戻り値を current_project_path へ移譲。
-    fn doSaveAsProject(self: *App) void {
+    fn doSaveAsProject(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "untitled.pix",
             .allowed_ext = "pix",
         }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // キャンセル: サイレント no-op
         self.syncPaletteToDoc();
         core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
-            return;
+            return .done;
         };
         if (self.current_project_path) |old| self.gpa.free(old);
         self.current_project_path = path; // 移譲
         self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     /// .pix プロジェクトを読み込んでドキュメントを差し替える（レイヤー構造保持）。
     /// 進行中 stroke/編集中は破棄。undo/redo はクリア、selection/float 破棄、current_project_path 更新。
     /// MVP は 256x256 以外を拒否する（layer 復元前にサイズ検査）。任意サイズは resize フェーズ（TASK-39）へ。
-    fn doOpenProject(self: *App) void {
-        if (self.editingBlocked()) return;
+    fn doOpenProject(self: *App) FileOpResult {
+        if (self.editingBlocked()) return .done;
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "pix" }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // キャンセル: サイレント no-op
         const new_doc = core.document_io.loadDocument(self.io, self.gpa, path, CANVAS_W, CANVAS_H) catch |err| {
             self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
-            return;
+            return .done;
         };
         // 成功: 旧 doc を破棄して差し替え、canvas ポインタと preview を張り直す。
         // undo handle の採番は App/CommandLog の生存期間で単調に保つ（fresh Document は
@@ -1155,6 +1209,7 @@ const App = struct {
         if (self.current_project_path) |old| self.gpa.free(old);
         self.current_project_path = path; // 移譲
         self.setSaveMsg("Project loaded: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     // ── 連番 PNG / スプライトシート書き出し（TASK-45.5）──────────────────────
@@ -1168,45 +1223,49 @@ const App = struct {
     }
 
     /// ダイアログで stem を選び連番 PNG（`<stem>_NNNN.png`）を書き出す。
-    fn doExportSeq(self: *App) void {
+    fn doExportSeq(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "sequence.png",
             .allowed_ext = "png",
         }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return;
+        const path = maybe orelse return .done;
         const stem = App.pathToPngStem(self.gpa, path) catch |err| {
             self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
-            return;
+            return .done;
         };
         defer self.gpa.free(path);
         defer self.gpa.free(stem);
         core.document_io.exportPngSequence(self.io, stem, &self.doc, self.gpa) catch |err| {
             self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
         self.setSaveMsg("Exported sequence: {s}", .{std.fs.path.basename(stem)});
+        return .done;
     }
 
     /// ダイアログで path を選びスプライトシート PNG を書き出す（columns/margin は既定）。
-    fn doExportSheet(self: *App) void {
+    fn doExportSheet(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "spritesheet.png",
             .allowed_ext = "png",
         }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
             self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
-        const path = maybe orelse return;
+        const path = maybe orelse return .done;
         defer self.gpa.free(path);
         core.document_io.exportSpriteSheet(self.io, path, &self.doc, self.gpa, .{}) catch |err| {
             self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
-            return;
+            return .done;
         };
         self.setSaveMsg("Exported sheet: {s}", .{std.fs.path.basename(path)});
+        return .done;
     }
 
     /// 指定 stem へ連番 PNG を直接書き出す（action `export_seq <stem>` 用）。
@@ -1892,10 +1951,14 @@ const App = struct {
             self.doUndo() catch {};
         } else if (k.key == .C and accel) {
             self.doCopy(); // accel+C は copy（bare C の clear より前に判定）
+            // システム clipboard へ現在色 #RRGGBB（wasm Clipboard API。TASK-73.3）
+            self.copySystemColor();
         } else if (k.key == .X and accel) {
             self.doCut();
         } else if (k.key == .V and accel) {
             self.doPaste();
+            // システム clipboard から色 paste を非同期要求（結果は runPendingFileOp で適用）
+            platform.clipboardRequestPaste();
         } else if (k.key == .B) {
             self.setActiveKind(.pen);
         } else if (k.key == .E) {

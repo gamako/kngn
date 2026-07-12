@@ -35,6 +35,12 @@ extern "env" fn vp_now() f64;
 extern "env" fn vp_present(ptr: [*]const u8, w: u32, h: u32) void;
 extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
 extern "env" fn vp_set_cursor(shape: c_int) void;
+/// ブラウザ file picker を発火（allowed_ext ヒント。空可）。二重発火防止は Zig/JS 双方。
+extern "env" fn vp_request_open(ext_ptr: [*]const u8, ext_len: u32) void;
+/// `navigator.clipboard.writeText`（text/plain）。
+extern "env" fn vp_clipboard_write(ptr: [*]const u8, len: u32) void;
+/// `navigator.clipboard.readText` を非同期開始。結果は `vp_clipboard_text` で届く。
+extern "env" fn vp_request_paste() void;
 
 // ============================================================================
 // DOM KeyboardEvent.code → KeyCode（Zig 側純データ表。platform_linux_input 流儀）
@@ -378,12 +384,189 @@ pub fn getTime() f64 {
     return vp_now();
 }
 
-pub fn saveFileDialog(_: std.mem.Allocator, _: std.Io, _: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    return error.DialogUnavailable;
+// ============================================================================
+// File dialog（TASK-73.3）— パスモデル温存 + JS メモリ FS
+// ============================================================================
+//
+// open: 非同期（browser file picker）。未 pick → DialogPending、pick 後の再呼び出しで path を返す。
+// save: 同期に default_name を返す（実体保存は WASI write → JS memfs → Blob download）。
+// request 中の再 open は picker を二重発火せず DialogPending のまま待つ。
+
+/// open ダイアログの pending 状態機械（DOM 非依存・単体テスト対象）。
+const OpenDialogState = enum { idle, requested, picked, cancelled };
+
+const OpenDialogMachine = struct {
+    state: OpenDialogState = .idle,
+    path_buf: [256]u8 = undefined,
+    path_len: u32 = 0,
+
+    /// openFileDialog 呼び出し時の遷移。`.request` のときだけ JS picker を発火する。
+    fn onCall(self: *OpenDialogMachine) enum { request, pending, take_path, cancelled } {
+        return switch (self.state) {
+            .idle => blk: {
+                self.state = .requested;
+                break :blk .request;
+            },
+            .requested => .pending,
+            .picked => blk: {
+                self.state = .idle;
+                break :blk .take_path;
+            },
+            .cancelled => blk: {
+                self.state = .idle;
+                self.path_len = 0;
+                break :blk .cancelled;
+            },
+        };
+    }
+
+    /// JS が path を scratch 経由で届けたとき。request 中以外は無視（二重 request 防止）。
+    fn onPicked(self: *OpenDialogMachine, path: []const u8) void {
+        if (self.state != .requested) return;
+        const n = @min(path.len, self.path_buf.len);
+        if (n > 0) @memcpy(self.path_buf[0..n], path[0..n]);
+        self.path_len = @intCast(n);
+        self.state = .picked;
+    }
+
+    fn onCancelled(self: *OpenDialogMachine) void {
+        if (self.state != .requested) return;
+        self.path_len = 0;
+        self.state = .cancelled;
+    }
+
+    fn takePathSlice(self: *const OpenDialogMachine) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+
+    fn reset(self: *OpenDialogMachine) void {
+        self.* = .{};
+    }
+};
+
+/// pick 仮想 path: `pick/<basename>`（path traversal を潰した basename）。
+/// 戻り値は `out` 内スライス。名前が空なら `pick/file`。
+fn makePickPath(name: []const u8, out: []u8) []const u8 {
+    const base = basenameSanitize(name);
+    const prefix = "pick/";
+    const n = @min(base.len, out.len -| prefix.len);
+    if (out.len < prefix.len) return out[0..0];
+    @memcpy(out[0..prefix.len], prefix);
+    if (n > 0) @memcpy(out[prefix.len..][0..n], base[0..n]);
+    return out[0 .. prefix.len + n];
 }
 
-pub fn openFileDialog(_: std.mem.Allocator, _: std.Io, _: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    return error.DialogUnavailable;
+/// `/` `\` を除き、`.` `..` を `file` に落とす。
+fn basenameSanitize(name: []const u8) []const u8 {
+    var s = name;
+    // 末尾の path 区切りを落とす
+    while (s.len > 0 and (s[s.len - 1] == '/' or s[s.len - 1] == '\\')) s = s[0 .. s.len - 1];
+    // 最後の区切り以降
+    if (std.mem.lastIndexOfAny(u8, s, "/\\")) |i| s = s[i + 1 ..];
+    if (s.len == 0 or std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return "file";
+    return s;
+}
+
+var open_dialog: OpenDialogMachine = .{};
+
+/// JS が pick path 文字列を書く固定スクラッチ（最大 256B）。
+var file_path_scratch: [256]u8 = undefined;
+
+export fn vp_file_path_scratch() [*]u8 {
+    return &file_path_scratch;
+}
+
+/// scratch に書いた仮想 path（len バイト）を open 状態機械へ届け、picked にする。
+export fn vp_file_picked(len: u32) void {
+    const n = @min(len, file_path_scratch.len);
+    open_dialog.onPicked(file_path_scratch[0..n]);
+}
+
+export fn vp_file_cancelled() void {
+    open_dialog.onCancelled();
+}
+
+fn requestOpenJs(ext: []const u8) void {
+    if (builtin.is_test) return;
+    if (ext.len == 0) {
+        // JS は len=0 を「フィルタ無し」と解釈。ptr は読まない。
+        vp_request_open(@as([*]const u8, @ptrFromInt(1)), 0);
+    } else {
+        vp_request_open(ext.ptr, @intCast(ext.len));
+    }
+}
+
+pub fn saveFileDialog(allocator: std.mem.Allocator, _: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    // 同期: ブラウザ download UI が保存先を担うので default_name をそのまま path として返す。
+    const name = opts.default_name orelse "download.bin";
+    return try allocator.dupe(u8, name);
+}
+
+pub fn openFileDialog(allocator: std.mem.Allocator, _: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    switch (open_dialog.onCall()) {
+        .request => {
+            const ext = opts.allowed_ext orelse "";
+            requestOpenJs(ext);
+            return error.DialogPending;
+        },
+        .pending => return error.DialogPending,
+        .take_path => {
+            const slice = open_dialog.takePathSlice();
+            if (slice.len == 0) return null;
+            return try allocator.dupe(u8, slice);
+        },
+        .cancelled => return null,
+    }
+}
+
+// ============================================================================
+// Clipboard（TASK-73.3）— 色 #RRGGBB の text/plain
+// ============================================================================
+
+const ClipboardPasteState = enum { idle, requested, delivered };
+
+var clipboard_paste_state: ClipboardPasteState = .idle;
+/// paste テキスト固定スクラッチ（#RRGGBB 用途。長文は切り詰め）。
+var clipboard_text_scratch: [64]u8 = undefined;
+var clipboard_text_len: u32 = 0;
+
+export fn vp_clipboard_text_scratch() [*]u8 {
+    return &clipboard_text_scratch;
+}
+
+/// JS が readText 結果を scratch に書いたあと呼ぶ。
+export fn vp_clipboard_text(len: u32) void {
+    const n = @min(len, clipboard_text_scratch.len);
+    clipboard_text_len = n;
+    clipboard_paste_state = .delivered;
+}
+
+/// システム clipboard へ text を書く（wasm: Clipboard API。native は no-op 経路）。
+pub fn clipboardWrite(text: []const u8) void {
+    if (text.len == 0) return;
+    if (builtin.is_test) return;
+    vp_clipboard_write(text.ptr, @intCast(text.len));
+}
+
+/// paste を非同期要求。二重 request は無視。
+pub fn clipboardRequestPaste() void {
+    if (clipboard_paste_state == .requested) return;
+    clipboard_paste_state = .requested;
+    clipboard_text_len = 0;
+    if (builtin.is_test) return;
+    vp_request_paste();
+}
+
+/// 届いていれば text スライスを返し idle に戻す。未着は null。
+pub fn clipboardTakePaste() ?[]const u8 {
+    if (clipboard_paste_state != .delivered) return null;
+    clipboard_paste_state = .idle;
+    return clipboard_text_scratch[0..clipboard_text_len];
+}
+
+fn clipboardResetForTest() void {
+    clipboard_paste_state = .idle;
+    clipboard_text_len = 0;
 }
 
 /// freestanding 向け log（std_options.logFn から呼ぶ想定）。
@@ -505,4 +688,165 @@ test "vp_resize: pending 未消化中は旧 fb サイズのまま" {
     const fb2 = win.lockFramebuffer() orelse unreachable;
     try std.testing.expectEqual(@as(u32, 640), fb2.width);
     try std.testing.expectEqual(@as(u32, 480), fb2.height);
+}
+
+// ---- TASK-73.3: open dialog 状態機械 / pick path / clipboard pending ----
+
+/// App.runPendingFileOp の dialog_op latch 規約（修正1）を純ロジックで表現した tick。
+/// `dialog_op` 優先、tick 冒頭で `pending` を破棄、pending 結果なら latch 維持。
+fn dialogOpLatchTick(dialog_op: *?u8, pending: *?u8, result_pending: bool) ?u8 {
+    const op = dialog_op.* orelse (pending.* orelse return null);
+    // dialog 待ち中に積まれた別要求は破棄（picker 結果の誤配送防止）
+    pending.* = null;
+    if (result_pending) {
+        dialog_op.* = op;
+    } else {
+        dialog_op.* = null;
+    }
+    return op;
+}
+
+test "dialog_op latch: pending 中の別 op 要求は破棄され dialog_op が維持される" {
+    // 1=open, 2=save_as（App.FileOp の代理。platform_wasm から App を import しない）
+    var dialog_op: ?u8 = null;
+    var pending: ?u8 = null;
+
+    // frame1: user open → DialogPending
+    pending = 1;
+    try std.testing.expectEqual(@as(?u8, 1), dialogOpLatchTick(&dialog_op, &pending, true));
+    try std.testing.expectEqual(@as(?u8, 1), dialog_op);
+    try std.testing.expectEqual(@as(?u8, null), pending);
+
+    // 待ち中に save_as を要求（pending に積む）→ 次 tick で破棄され open が継続
+    pending = 2;
+    try std.testing.expectEqual(@as(?u8, 1), dialogOpLatchTick(&dialog_op, &pending, true));
+    try std.testing.expectEqual(@as(?u8, 1), dialog_op);
+    try std.testing.expectEqual(@as(?u8, null), pending);
+
+    // picker 完了 → open 成功、dialog_op クリア。残留 pending 無し
+    try std.testing.expectEqual(@as(?u8, 1), dialogOpLatchTick(&dialog_op, &pending, false));
+    try std.testing.expectEqual(@as(?u8, null), dialog_op);
+    try std.testing.expectEqual(@as(?u8, null), pending);
+
+    // 完了後に初めて save_as が走れる
+    pending = 2;
+    try std.testing.expectEqual(@as(?u8, 2), dialogOpLatchTick(&dialog_op, &pending, false));
+    try std.testing.expectEqual(@as(?u8, null), dialog_op);
+    try std.testing.expectEqual(@as(?u8, null), pending);
+}
+
+test "open dialog machine: request → picked → take path → idle" {
+    open_dialog.reset();
+    defer open_dialog.reset();
+
+    try std.testing.expectEqual(.request, open_dialog.onCall());
+    try std.testing.expectEqual(OpenDialogState.requested, open_dialog.state);
+
+    // request 中の再 call は pending（二重 request しない）
+    try std.testing.expectEqual(.pending, open_dialog.onCall());
+    try std.testing.expectEqual(OpenDialogState.requested, open_dialog.state);
+
+    open_dialog.onPicked("pick/foo.png");
+    try std.testing.expectEqual(OpenDialogState.picked, open_dialog.state);
+    try std.testing.expectEqualStrings("pick/foo.png", open_dialog.takePathSlice());
+
+    try std.testing.expectEqual(.take_path, open_dialog.onCall());
+    try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
+}
+
+test "open dialog machine: cancel → null 相当 → idle" {
+    open_dialog.reset();
+    defer open_dialog.reset();
+
+    try std.testing.expectEqual(.request, open_dialog.onCall());
+    open_dialog.onCancelled();
+    try std.testing.expectEqual(OpenDialogState.cancelled, open_dialog.state);
+    try std.testing.expectEqual(.cancelled, open_dialog.onCall());
+    try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
+}
+
+test "open dialog machine: pick/cancel は request 中以外無視" {
+    open_dialog.reset();
+    defer open_dialog.reset();
+
+    open_dialog.onPicked("pick/x.png"); // idle 中は無視
+    try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
+    open_dialog.onCancelled();
+    try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
+
+    _ = open_dialog.onCall(); // → requested
+    open_dialog.onPicked("pick/a.png");
+    open_dialog.onPicked("pick/b.png"); // already picked: 無視
+    try std.testing.expectEqualStrings("pick/a.png", open_dialog.takePathSlice());
+}
+
+test "openFileDialog: request→DialogPending / picked→path / cancel→null" {
+    open_dialog.reset();
+    defer open_dialog.reset();
+    const a = std.testing.allocator;
+
+    // 1st call: request + DialogPending
+    try std.testing.expectError(error.DialogPending, openFileDialog(a, undefined, .{ .allowed_ext = "png" }));
+
+    // 2nd call while waiting: still pending（二重 request 防止）
+    try std.testing.expectError(error.DialogPending, openFileDialog(a, undefined, .{ .allowed_ext = "png" }));
+
+    // simulate JS deliver
+    const path_src = "pick/usako.png";
+    @memcpy(file_path_scratch[0..path_src.len], path_src);
+    vp_file_picked(@intCast(path_src.len));
+
+    const got = try openFileDialog(a, undefined, .{ .allowed_ext = "png" });
+    defer if (got) |p| a.free(p);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings(path_src, got.?);
+
+    // cancel path
+    try std.testing.expectError(error.DialogPending, openFileDialog(a, undefined, .{}));
+    vp_file_cancelled();
+    const cancelled = try openFileDialog(a, undefined, .{});
+    try std.testing.expect(cancelled == null);
+}
+
+test "saveFileDialog: default_name を同期返却" {
+    const a = std.testing.allocator;
+    const got = try saveFileDialog(a, undefined, .{ .default_name = "untitled.png", .allowed_ext = "png" });
+    defer if (got) |p| a.free(p);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("untitled.png", got.?);
+
+    const got2 = try saveFileDialog(a, undefined, .{});
+    defer if (got2) |p| a.free(p);
+    try std.testing.expectEqualStrings("download.bin", got2.?);
+}
+
+test "makePickPath / basenameSanitize" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("pick/foo.png", makePickPath("foo.png", &buf));
+    try std.testing.expectEqualStrings("pick/bar.pix", makePickPath("/tmp/evil/../bar.pix", &buf));
+    try std.testing.expectEqualStrings("pick/file", makePickPath("..", &buf));
+    try std.testing.expectEqualStrings("pick/file", makePickPath("", &buf));
+    try std.testing.expectEqualStrings("pick/a.png", makePickPath("dir\\a.png", &buf));
+}
+
+test "clipboard paste machine: request → deliver → take → idle" {
+    clipboardResetForTest();
+    defer clipboardResetForTest();
+
+    try std.testing.expect(clipboardTakePaste() == null);
+    clipboardRequestPaste();
+    try std.testing.expectEqual(ClipboardPasteState.requested, clipboard_paste_state);
+    // 二重 request は state 維持
+    clipboardRequestPaste();
+    try std.testing.expectEqual(ClipboardPasteState.requested, clipboard_paste_state);
+
+    const text = "#FF00AA";
+    @memcpy(clipboard_text_scratch[0..text.len], text);
+    vp_clipboard_text(@intCast(text.len));
+    try std.testing.expectEqual(ClipboardPasteState.delivered, clipboard_paste_state);
+
+    const got = clipboardTakePaste() orelse unreachable;
+    try std.testing.expectEqualStrings(text, got);
+    try std.testing.expectEqual(ClipboardPasteState.idle, clipboard_paste_state);
+    try std.testing.expect(clipboardTakePaste() == null);
 }
