@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pixie (wasm)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #1a1818; }
+    #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+    canvas {
+      background: #242020;
+      outline: none;
+      image-rendering: pixelated;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="vp-canvas" width="780" height="600" tabindex="0"></canvas>
+  </div>
+  <script type="module" src="./vp.js"></script>
+</body>
+</html>

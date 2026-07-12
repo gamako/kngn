@@ -31,3 +31,4 @@ pub const dsp = @import("dsp");
 pub const synth = @import("synth");
 pub const gamepad = @import("gamepad");
 pub const recipe = @import("recipe");
+pub const app_runtime = @import("app_runtime");

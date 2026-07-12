@@ -303,6 +303,53 @@ pub const Clip = struct {
     h: u32,
 };
 
+// ============================================================
+// BGRA↔RGBA byte swizzle（TASK-73.1。wasm present ホットパス）
+// ============================================================
+//
+// canonical BGRA u32 = 0xAARRGGBB（LE メモリ [B,G,R,A]）→ ImageData [R,G,B,A]。
+// ホットパス宣言: フレーム毎・全画素 1 パス。per-pixel 除算/関数呼び出し/bounds 検査なし。
+// SIMD=@Vector(16,u8) で 4px 同時 + scalar tail。行連続・clip 無し（同一 w×h 連続領域）。
+
+/// スカラー参照版。1 画素の [B,G,R,A] → [R,G,B,A]。
+pub fn swizzleBgraToRgbaScalar(dst: []u8, src: []const u8) void {
+    std.debug.assert(dst.len == src.len);
+    std.debug.assert(dst.len % 4 == 0);
+    var i: usize = 0;
+    while (i < src.len) : (i += 4) {
+        dst[i + 0] = src[i + 2]; // R
+        dst[i + 1] = src[i + 1]; // G
+        dst[i + 2] = src[i + 0]; // B
+        dst[i + 3] = src[i + 3]; // A
+    }
+}
+
+/// SIMD 版（4px=@Vector(16,u8) byte shuffle + scalar tail）。SIMD=scalar bit 一致をテストで担保。
+pub fn swizzleBgraToRgba(dst: []u8, src: []const u8) void {
+    std.debug.assert(dst.len == src.len);
+    std.debug.assert(dst.len % 4 == 0);
+    // shuffle mask: out[i] = in[mask[i]]。BGRA→RGBA = B↔R 入替（4px 分）。
+    const perm: @Vector(16, i32) = .{
+        2,  1,  0,  3,
+        6,  5,  4,  7,
+        10, 9,  8,  11,
+        14, 13, 12, 15,
+    };
+    var i: usize = 0;
+    const simd_end = src.len - (src.len % 16);
+    while (i < simd_end) : (i += 16) {
+        const in: @Vector(16, u8) = src[i..][0..16].*;
+        dst[i..][0..16].* = @shuffle(u8, in, undefined, perm);
+    }
+    // scalar tail（0..3 px）
+    while (i < src.len) : (i += 4) {
+        dst[i + 0] = src[i + 2];
+        dst[i + 1] = src[i + 1];
+        dst[i + 2] = src[i + 0];
+        dst[i + 3] = src[i + 3];
+    }
+}
+
 /// (x, y) に src_w×src_h を置いたとき、dst_w×dst_h 内に収まる可視範囲を返す。
 /// 完全に外（または dst/src が 0 サイズ）なら null。null でなければ w/h >= 1。
 /// 内側ループは戻り値の範囲を無検査で走査してよい（per-pixel clip 比較の禁止に対応）。
@@ -642,5 +689,27 @@ test "clipBlit: table-driven 境界" {
             std.debug.print("case '{s}' failed\n", .{c.name});
             return err;
         };
+    }
+}
+
+test "swizzleBgraToRgba matches scalar（境界長 + 乱数）" {
+    var prng = std.Random.DefaultPrng.init(0x73015A12);
+    const rng = prng.random();
+    // 0/1/3/4/5/7/8/15/16/17 px（SIMD 境界と tail）を強制し、残りは乱数長
+    const forced_px = [_]usize{ 0, 1, 3, 4, 5, 7, 8, 15, 16, 17, 64, 65, 127, 128 };
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        const px: usize = if (trial < forced_px.len) forced_px[trial] else (rng.int(usize) % 400);
+        const nbytes = px * 4;
+        const src = try testing.allocator.alloc(u8, nbytes);
+        defer testing.allocator.free(src);
+        rng.bytes(src);
+        const dst_simd = try testing.allocator.alloc(u8, nbytes);
+        defer testing.allocator.free(dst_simd);
+        const dst_scalar = try testing.allocator.alloc(u8, nbytes);
+        defer testing.allocator.free(dst_scalar);
+        swizzleBgraToRgba(dst_simd, src);
+        swizzleBgraToRgbaScalar(dst_scalar, src);
+        try testing.expectEqualSlices(u8, dst_scalar, dst_simd);
     }
 }

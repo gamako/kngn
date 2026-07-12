@@ -12,10 +12,12 @@
 //!         ESC・Cmd+Q=終了（ウィンドウクローズ含め running=false の単一経路）
 
 const std = @import("std");
+const builtin = @import("builtin");
 const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
 const platform = kit.platform;
 const gui = kit.gui;
 const recipe = kit.recipe;
+const app_runtime = kit.app_runtime;
 const core = @import("paint");
 const png = kit.png;
 const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
@@ -93,6 +95,8 @@ const system_font_paths = [_][]const u8{
 /// 全候補が失敗（FileNotFound 含む）した場合は `null`（呼び出し側は embedded ASCII フォントへ
 /// フォールバックする）。initialization 時のみ呼ばれる（ホットパス外）。
 fn loadSystemFontBytes(io: std.Io, gpa: std.mem.Allocator) ?[]u8 {
+    // wasm では std.Io.Dir による system font 探索を skip（73.1。既存フォールバック経路へ）。
+    if (builtin.cpu.arch.isWasm()) return null;
     for (system_font_paths) |path| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| {
             if (err != error.FileNotFound) std.debug.print("system font read {s}: {s}\n", .{ path, @errorName(err) });
@@ -257,18 +261,36 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 
 /// アプリ状態（イベント処理と UI 構築の両方から触る）
 const App = struct {
+    /// app_runtime が参照する初期ウィンドウ仕様（TASK-73.1）
+    pub const window = .{ .w = WINDOW_W, .h = WINDOW_H, .title = "Pixie" };
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) !*App {
+        return appInit(gpa, io);
+    }
+    pub fn deinit(self: *App) void {
+        appDeinit(self);
+    }
+    pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
+        return appFrame(self, win, now);
+    }
+    /// app_runtime が Window.create + App.init 直後に呼ぶ opt-in hook（TASK-23.1 統合）。
+    /// ライブリサイズ redraw callback を登録する（harness/headless 時は facade 側で no-op）。
+    pub fn onWindowReady(self: *App, win: *platform.Window) void {
+        self.redraw_win = win.*;
+        win.setRedrawCallback(self, redrawCb);
+    }
+
     io: std.Io,
     gpa: std.mem.Allocator,
+    /// GUI コンテキスト（跨フレーム永続。wasm runtime 用に App へ寄せた。TASK-73.1）
+    ctx: gui.Context,
     /// ドキュメント（frames × layers。MVP は 1 frame）。Canvas は heap 所有・ポインタ安定（TASK-63）。
     doc: core.Document,
     /// アクティブフレームの Canvas（doc.activeCanvas()）。既存参照の churn 最小化のため *Canvas を保持。
     canvas: *core.Canvas = undefined,
-    /// system font（TASK-82）バイト列への **borrowed** view。実体の所有・解放は `main()` の
-    /// ローカル変数側（起動時に一度だけ `loadSystemFontBytes` で読み込み、`main()` の defer で
-    /// 解放する。App はこのフィールドで参照するだけで free しない）。`applySystemFont()` が
-    /// `doc.frames` の各 Canvas へこの値を伝播する。見つからない/parse 失敗環境では `null`
-    /// のままで、`text_render` 側が embedded ASCII フォントへフォールバックする。
-    system_font_bytes: ?[]const u8 = null,
+    /// system font（TASK-82）バイト列。所有は App（init で読込・deinit で解放）。
+    /// 見つからない/parse 失敗/wasm では `null` のままで、`text_render` 側が embedded ASCII へフォールバック。
+    system_font_bytes: ?[]u8 = null,
     recorder: core.StrokeRecorder,
     /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
     preview_canvas: core.Canvas,
@@ -356,6 +378,10 @@ const App = struct {
     /// UI Repl 用: スウォッチ選択時点の色（applyEditColor で swatch が変わっても from を保持。TASK-89）。
     repl_source: ?u32 = null,
     running: bool = true,
+    /// フレーム本体の再入ガード（TASK-23.1。redraw callback と main loop の二重実行防止）。
+    in_frame: bool = false,
+    /// redraw callback 用に onWindowReady で保持する Window 値コピー（TASK-23.1。FrameCtx 相当）。
+    redraw_win: ?platform.Window = null,
     /// 現在の PNG 保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
     current_path: ?[]u8 = null,
     /// 現在の .pix プロジェクト保存先（gpa 所有。PNG の current_path とは別管理。TASK-63）。
@@ -1485,11 +1511,11 @@ const App = struct {
         }
     }
 
-    fn doSelectFrame(self: *App, frame: u32) !void {
+    fn doSelectFrame(self: *App, frame_idx: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (frame >= self.doc.frames.items.len) return error.OutOfRange;
-        if (self.doc.selected_frame == frame) return;
-        self.doc.selected_frame = frame;
+        if (frame_idx >= self.doc.frames.items.len) return error.OutOfRange;
+        if (self.doc.selected_frame == frame_idx) return;
+        self.doc.selected_frame = frame_idx;
         self.doc.resyncActiveView(self.gpa);
         self.syncPreviewCanvas();
         self.clampTimelineTarget();
@@ -1522,35 +1548,35 @@ const App = struct {
         try self.doSelectFrame(@intCast(next));
     }
 
-    fn doCreateCelAt(self: *App, layer: usize, frame: u32) !void {
+    fn doCreateCelAt(self: *App, layer: usize, frame_idx: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (layer >= self.doc.layers.items.len or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (layer >= self.doc.layers.items.len or frame_idx >= self.doc.frames.items.len) return error.OutOfRange;
         if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
-        _ = self.doc.createCel(self.gpa, layer, frame);
+        _ = self.doc.createCel(self.gpa, layer, frame_idx);
     }
 
-    fn doClearCelAt(self: *App, layer: usize, frame: u32) !void {
+    fn doClearCelAt(self: *App, layer: usize, frame_idx: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (layer >= self.doc.layers.items.len or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (layer >= self.doc.layers.items.len or frame_idx >= self.doc.frames.items.len) return error.OutOfRange;
         if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
-        const was_selected = self.doc.selected_frame == frame;
-        self.doc.clearCel(self.gpa, layer, frame);
+        const was_selected = self.doc.selected_frame == frame_idx;
+        self.doc.clearCel(self.gpa, layer, frame_idx);
         if (was_selected) self.doc.resyncActiveView(self.gpa);
         self.clampTimelineTarget();
     }
 
-    fn doLinkCelLeft(self: *App, layer: usize, frame: u32) !void {
+    fn doLinkCelLeft(self: *App, layer: usize, frame_idx: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (layer >= self.doc.layers.items.len or frame == 0 or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (layer >= self.doc.layers.items.len or frame_idx == 0 or frame_idx >= self.doc.frames.items.len) return error.OutOfRange;
         if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
-        try self.doc.linkCel(self.gpa, layer, frame, frame - 1);
+        try self.doc.linkCel(self.gpa, layer, frame_idx, frame_idx - 1);
     }
 
-    fn doUnlinkCelAt(self: *App, layer: usize, frame: u32) !void {
+    fn doUnlinkCelAt(self: *App, layer: usize, frame_idx: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (layer >= self.doc.layers.items.len or frame >= self.doc.frames.items.len) return error.OutOfRange;
+        if (layer >= self.doc.layers.items.len or frame_idx >= self.doc.frames.items.len) return error.OutOfRange;
         if (self.doc.layers.items[layer].kind == .text) return error.EditingBlocked;
-        try self.doc.unlinkCel(self.gpa, layer, frame);
+        try self.doc.unlinkCel(self.gpa, layer, frame_idx);
     }
 
     /// フレーム境界の再生 tick（毎フレーム 1 回・f64 比較のみ。全画素・RT 非該当）。
@@ -3756,435 +3782,485 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     ctx.endBox(); // root
 }
 
-/// ライブリサイズ中の redraw callback と main loop 双方から呼ぶフレーム本体（TASK-23.1）。
-const FrameCtx = struct {
-    window: platform.Window,
-    gpa: std.mem.Allocator,
-    ctx: *gui.Context,
-    app: *App,
-    in_frame: bool = false,
-};
-
-fn runFrame(fc: *FrameCtx) !void {
-    // in_frame ガード: early return / error return でも必ず戻るよう defer で落とす（実装メモ）。
-    if (fc.in_frame) return;
-    fc.in_frame = true;
-    defer fc.in_frame = false;
-
-    const window = fc.window;
-    const gpa = fc.gpa;
-    const ctx = fc.ctx;
-    const app = fc.app;
-
-    const fb = window.lockFramebuffer() orelse return;
-    defer fb.unlock();
-
-    ctx.beginFrame(fb.width, fb.height);
-
-    while (window.nextEvent()) |ev| {
-        switch (ev) {
-            .quit => app.running = false, // ウィンドウクローズも同一経路
-            // レイヤー名インライン編集中（TASK-79.3）・テキストレイヤー内容編集中
-            // （TASK-79.5、`text_in`。rename_in と対称・互いに同時 active にならない）は
-            // key_down を専用ハンドラへ回し、char_input で確定文字を追記する（TASK-22
-            // char_input の初消費）。key_up は常に通す（Space パン modifier 等の held
-            // 状態を編集中に取りこぼさないため。codex レビュー指摘 2026-07-05）。
-            .key_down => |k| if (app.rename_in.active)
-                app.handleRenameKey(k)
-            else if (app.text_in.active)
-                app.handleTextEditKey(k)
-            else
-                app.handleKey(k),
-            .key_up => |k| app.handleKeyUp(k),
-            .char_input => |c| if (app.rename_in.active)
-                app.rename_in.appendCodepoint(c.codepoint)
-            else if (app.text_in.active)
-                app.text_in.appendCodepoint(c.codepoint),
-            else => {},
-        }
-        // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
-        // での干渉を避ける。rename_in/text_in はここで破棄されないため、他行の右クリックで
-        // 新たな編集が始まれば単に上書きされるだけでクラッシュはしない）。
-        if (!app.rename_in.active and !app.text_in.active) {
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
-        }
-    }
-
-    // canvas rect は前フレームの layout 結果（初回フレームは null）。
-    // canvasBlitRect は pan を現 area に clamp して app へ書き戻し、last_area も更新する。
-    var canvas_rect = canvasBlitRect(ctx, app);
-
-    app.tickTimelinePlayback(platform.getTime());
-
-    try buildUi(ctx, app, canvas_rect);
-    ctx.endFrame();
-
-    // ── ビューポート: ホイールズーム（カーソル中心）/ パン（Space+左 or middle ドラッグ）──
-    // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。
-    const panning = updateViewport(app, ctx, canvas_rect);
-    // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
-    // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果）。
-    canvas_rect = canvasBlitRect(ctx, app);
-
-    // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
-    // TASK-79.5: 選択中レイヤーが text kind の間は、この分岐全体（bezier/select/
-    // eyedropper/通常 canvas_input のいずれも）を丸ごと止める。「text layer の pixels は
-    // text_params からの再ラスタライズ結果」という不変条件を守るため（eyedropper は
-    // 本来読み取りのみで実害は無いが、分岐追加のミスリスクよりシンプルさを優先し
-    // 丸ごと止める設計判断。text layer 選択中は色スポイトも一時的に使えない）。
-    if (!panning and !app.selectedLayerIsText()) {
-        const in = &ctx.input;
-        // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
-        // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
-        // pressed_left のみ落として update は通し、release を届けて完走させる（capturing 張り付き防止）。
-        const pressed_left_gated = in.mouse_pressed.left and gate: {
-            const p = in.mouse_pressed_pos;
-            const in_area = if (app.last_area) |a|
-                (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h)
-            else
-                false;
-            // active_id==0 = どの widget/splitter も press を取っていない（hover だけの wantsMouse は
-            // 抑止しない＝canvas 内 press → 同一フレーム UI 上へ move でも stroke は開始できる）。
-            // !hasOpenPopup() = レイヤー右クリックメニュー（TASK-79.2）表示中は新規 stroke を
-            // 開始しない（popup は active_id を 0 のまま保つため、上の条件だけでは防げない。
-            // popup.zig の wantsMouse() が popup_state を OR しているのと同じ理由）。
-            break :gate in_area and ctx.state.active_id == 0 and !ctx.hasOpenPopup();
-        };
-        if (app.active_kind == .bezier and !app.input.capturing) {
-            const frame: bezier_input.BezierInput.Frame = .{
-                .canvas_rect = canvas_rect,
-                .zoom = app.view_zoom,
-                .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
-                .pressed_left = pressed_left_gated,
-                .released_left = in.mouse_released.left,
-                .time = platform.getTime(),
-            };
-            const dab = app.brush.footprint();
-            if (app.bez_in.update(frame, &app.bezier_editor, app.canvas, &app.recorder, gpa, dab, app.brush.color, app.brush.opacity)) |pd| {
-                app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
-            }
-        } else if (app.active_kind == .select and !app.input.capturing) {
-            const frame: selection_input.SelectionInput.Frame = .{
-                .canvas_rect = canvas_rect,
-                .zoom = app.view_zoom,
-                .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
-                .pressed_left = pressed_left_gated,
-                .released_left = in.mouse_released.left,
-            };
-            if (app.sel_in.update(frame, app.canvas, app.canvas.selected_layer, gpa, app.blend_mode)) |pd| {
-                app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
-            }
-        } else if (app.eye_in.picking or app.active_kind == .eyedropper or
-            (pressed_left_gated and in.modifiers.alt))
-        {
-            // スポイト（独立経路。TASK-68）。専用ツール選択中、または進行中の picking を完走、
-            // または Alt+クリックの一時スポイト（bezier/select は上の分岐で既に弾かれているので
-            // ここに来る active_kind は pen/eraser/brush/fill/eyedropper のいずれか。4ツール
-            // 全てで Alt+クリックを一律有効にする最小の場合分け）。
-            const frame: eyedropper_input.EyedropperInput.Frame = .{
-                .canvas_rect = canvas_rect,
-                .zoom = app.view_zoom,
-                .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                .pressed_left = pressed_left_gated,
-                .released_left = in.mouse_released.left,
-            };
-            if (app.eye_in.update(frame)) |cp| {
-                app.pickColor(cp.x, cp.y);
-            }
-        } else {
-            const frame: canvas_input.CanvasInput.Frame = .{
-                .canvas_rect = canvas_rect,
-                .zoom = app.view_zoom,
-                .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
-                .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
-                .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
-                .pressed_left = pressed_left_gated,
-                .released_left = in.mouse_released.left,
-            };
-            const was_capturing = app.input.capturing;
-            const pd_opt = app.input.update(frame, app.activeTool(), app.canvas, &app.recorder, gpa);
-            // ── UI stroke の点列追跡（TASK-62.5.3 §5c。canvas_input の down/move/up と同じ座標変換）──
-            if (canvas_rect) |rect| {
-                if (pd_opt != null) {
-                    // release で確定（同一フレーム press+release は begin から。up は released_pos）
-                    if (!was_capturing) app.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
-                    app.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom));
-                } else if (!was_capturing and app.input.capturing) {
-                    // capture 開始（down=pressed_pos + 同フレーム move=mouse_pos）
-                    app.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
-                    app.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
-                } else if (app.input.capturing) {
-                    app.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
-                }
-            }
-            if (pd_opt) |pd| {
-                // TASK-94 Phase C: netsync 中は preview を巻き戻し → routeAction("stroke")。
-                // fill 等（action 語彙なし）は rewind 破棄（silent diverge 防止）。
-                // solo は従来どおり pushPaintOp + recordUiStroke。
-                switch (actions.uiPaintCommitPath(platform.netsyncActive(), app.uiStrokeRelaysViaAction())) {
-                    .relay => {
-                        app.rewindPaintDiff(pd);
-                        app.relayUiStroke();
-                    },
-                    .rewind_discard => {
-                        app.rewindPaintDiff(pd);
-                        app.uiStrokeDiscard();
-                        std.debug.print("pixie: netsync 中は fill 等は使えません（action 語彙なし・preview を破棄）\n", .{});
-                        app.setSaveMsg("netsync: fill unavailable (no action)", .{});
-                    },
-                    .solo => {
-                        const handle_before = app.doc.undo.next_handle;
-                        app.doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
-                        // 確定点で CommandRecord を記録（actor=local_user。undo_ref = push された Op の handle）
-                        app.recordUiStroke(app.doc.undo.next_handle != handle_before);
-                    },
-                }
-            } else if (!app.input.capturing) {
-                app.uiStrokeDiscard(); // release したが確定 diff なし → 蓄積破棄
-            }
-        }
-    }
-
-    // ── ソフトオーバーレイ用 hover 追跡 + OS カーソル形状の M1 配線（TASK-75.4）。
-    // 入力ディスパッチの後に置くことで、当フレームで新規 stroke が始まった場合の busy 判定
-    // （isPointerBusy）を正しく反映する（描画パスで footprint リングが一瞬出ることを防ぐ）。
-    updateCursorAndHover(app, window, ctx, canvas_rect);
-
-    // ── 描画: bg → チェッカー背景 → canvas blit(α src-over) → GUI（上に重ねる） ──
-    @memset(fb.pixels, COLOR_WINDOW_BG);
-    if (canvas_rect) |rect| {
-        if (app.last_area) |area| {
-            const zoom = app.view_zoom;
-            // 表示矩形（screen px 実寸。canvasBlitRect の rect.w/h は canvas px なので zoom 倍）
-            const screen_rect: core.Rect = .{
-                .x = rect.x,
-                .y = rect.y,
-                .w = @as(i32, @intCast(CANVAS_W)) * zoom,
-                .h = @as(i32, @intCast(CANVAS_H)) * zoom,
-            };
-            blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
-            const base_composite = app.resolveDisplayComposite(gpa);
-            const display_composite: []const u32 = if (app.onion_enabled and app.doc.frames.items.len > 1) blk: {
-                const cnt = @min(app.onion_count, core.onion_skin.max_count);
-                core.onion_skin.build(&app.doc, base_composite, app.doc.selected_frame, cnt, app.onion_buf, app.onion_scratch);
-                break :blk app.onion_buf;
-            } else base_composite;
-            blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, CANVAS_W, CANVAS_H, rect, zoom, area);
-        }
-    }
-    // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる。area で clip）
-    if (app.active_kind == .bezier) {
-        if (canvas_rect) |rect| if (app.last_area) |area| {
-            const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
-            bezier_overlay.draw(ctx, &app.bezier_editor, rect, app.view_zoom, clip_area);
-        };
-    }
-    // 範囲選択のマーチングアンツ（選択があれば常時表示。select ツール時はドラッグ中の preview を優先）
-    {
-        const display_sel: ?core.Rect = if (app.active_kind == .select)
-            (app.sel_in.previewRect(app.canvas) orelse app.canvas.selection)
-        else
-            app.canvas.selection;
-        if (display_sel != null) {
-            if (canvas_rect) |rect| if (app.last_area) |area| {
-                const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
-                // phase は時間由来。MARCH_PERIOD(=2*DASH) で mod し i32 overflow を防ぐ（パターンは保存）。
-                const phase: i32 = @intFromFloat(@mod(platform.getTime() * MARCH_SPEED, MARCH_PERIOD));
-                selection_overlay.draw(ctx, display_sel, rect, app.view_zoom, clip_area, phase);
-            };
-        }
-    }
-    // ツールグリフ + ブラシ footprint 輪郭リング（ソフトオーバーレイ最前面。TASK-75.4）。
-    // hover_screen は「in_canvas かつ非 busy」の時だけ Some（updateCursorAndHover 参照）なので、
-    // stroke/選択ドラッグ/ベジェドラッグ/パン中はここに来ない。
-    if (app.hover_screen) |hs| {
-        if (app.last_area) |area| {
-            const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
-            const glyph = app.active_kind.glyph();
-            cursor_overlay.drawGlyph(ctx, .{ .x = hs.x, .y = hs.y }, glyph.label, glyph.color, clip_area);
-            if (app.active_kind == .brush) {
-                if (app.hover_cell) |hc| if (canvas_rect) |rect| {
-                    app.brush_edges.refresh(&app.brush);
-                    cursor_overlay.drawRing(ctx, &app.brush_edges, hc, rect, app.view_zoom, clip_area, RING_COLOR_A, RING_COLOR_B);
-                };
-            }
-        }
-    }
-    // レイヤー右クリックコンテキストメニュー（TASK-79.2）。popup.zig の「endFrame 後」契約
-    // + 他のオーバーレイ（bezier/selection/cursor）より後に呼ぶことで最前面に描画される。
-    // 呼び出しは毎フレーム無条件でよい（対象 popup が閉じていれば no-op で即返る。
-    // popup.zig の doc comment 参照）。items は selected_layer の現在値から都度算出する
-    // （右クリック時に doSelectLayer 済みなので、以降の全項目は selected_layer に対して動く）。
-    {
-        const sel_is_text = app.selectedLayerIsText();
-        const items = [_]gui.PopupItem{
-            .{ .label = "Add Layer" },
-            .{ .label = "Add Text Layer" }, // TASK-79.5
-            .{ .label = "Delete Layer", .enabled = app.canvas.layers.items.len > 1 },
-            .{ .label = "Move Up", .enabled = app.canvas.selected_layer + 1 < app.canvas.layers.items.len },
-            .{ .label = "Move Down", .enabled = app.canvas.selected_layer > 0 },
-            .{ .label = if (app.canvas.layers.items[app.canvas.selected_layer].visible) "Hide" else "Show" },
-            .{ .label = "Duplicate" },
-            .{ .label = "Merge Down", .enabled = app.canvas.selected_layer > 0 and !sel_is_text and
-                app.canvas.layers.items[app.canvas.selected_layer - 1].kind != .text },
-            .{ .label = "Rename..." }, // TASK-79.3
-            .{ .label = "Edit Text...", .enabled = sel_is_text }, // TASK-79.5
-            .{ .label = "Rasterize", .enabled = sel_is_text }, // TASK-79.5
-        };
-        const ctx_menu_result = ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
-        if (ctx_menu_result.selected) |sel| {
-            const sel_idx = app.canvas.selected_layer;
-            const synced = platform.netsyncActive();
-            switch (sel) {
-                0 => {
-                    if (synced) app.routeUi("add_layer", "") else _ = app.doAddLayer() catch {};
-                },
-                1 => app.doAddTextLayer() catch {}, // action 未登録・relay 対象外
-                2 => {
-                    if (synced) app.routeUiLayerOp("delete_layer", sel_idx) else app.doDeleteLayer(sel_idx) catch {};
-                },
-                3 => {
-                    if (synced) app.routeUiLayerMove(sel_idx, 1) else app.doMoveLayer(sel_idx, 1) catch {};
-                },
-                4 => {
-                    if (synced) app.routeUiLayerMove(sel_idx, -1) else app.doMoveLayer(sel_idx, -1) catch {};
-                },
-                5 => {
-                    if (synced)
-                        app.routeUiLayerVisible(sel_idx, !app.canvas.layers.items[sel_idx].visible)
-                    else
-                        app.doToggleLayerVisible(sel_idx);
-                },
-                6 => {
-                    if (synced) app.routeUiLayerOp("duplicate_layer", sel_idx) else _ = app.doDuplicateLayer(sel_idx) catch {};
-                },
-                7 => {
-                    if (synced) app.routeUiLayerOp("merge_down", sel_idx) else app.doMergeDown(sel_idx) catch {};
-                },
-                8 => app.beginRenameLayer(sel_idx),
-                9 => app.beginTextEdit(sel_idx),
-                10 => app.doRasterizeLayer(sel_idx) catch {},
-                else => {},
-            }
-        }
-    }
-    gui.render(
-        .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
-        &ctx.draw_list,
-        ctx.font,
-    );
-    window.present();
-}
-
-fn redrawCb(ctx_ptr: *anyopaque) void {
-    const fc: *FrameCtx = @ptrCast(@alignCast(ctx_ptr));
-    runFrame(fc) catch |e| {
-        std.log.err("pixie: redraw callback frame failed: {s}", .{@errorName(e)});
+fn wasmLogFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = message_level;
+    _ = scope;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, format, args) catch return;
+    const env = struct {
+        extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
     };
+    env.vp_log(msg.ptr, @intCast(msg.len));
 }
 
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+fn wasmPanic(msg: []const u8, _: ?usize) noreturn {
+    const env = struct {
+        extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
+    };
+    env.vp_log(msg.ptr, @intCast(@min(msg.len, std.math.maxInt(u32))));
+    @trap();
+}
 
-    try platform.init();
-    defer platform.shutdown();
+pub const std_options: std.Options = if (builtin.cpu.arch.isWasm())
+    .{ .logFn = wasmLogFn }
+else
+    .{};
 
-    const window = try platform.Window.create(WINDOW_W, WINDOW_H, "Pixie");
-    defer window.destroy();
+pub const panic = if (builtin.cpu.arch.isWasm())
+    std.debug.FullPanic(wasmPanic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
+fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
+    const self = try gpa.create(App);
+    errdefer gpa.destroy(self);
+
+    // fallible 資源は literal 前に段階化 + errdefer（変更前 main の ctx 先行 defer を復元し、
+    // さらに doc/recorder/preview/palette/onion も同等以上の保証にする。literal は移動のみ）。
+    const system_font_bytes = loadSystemFontBytes(io, gpa);
+    errdefer if (system_font_bytes) |b| gpa.free(b);
 
     var ctx = gui.Context.init(gpa, gui.default_font);
-    defer ctx.deinit();
+    errdefer ctx.deinit();
 
-    // system font（TASK-82）の読込は App 構築より前に行い、直後に defer で解放する。
-    // struct literal 内には複数の fallible 初期化（`try core.Document.init` 等）が続くため、
-    // 解放をこの位置に置くことで「後続フィールドの初期化失敗時も含め、どの終了経路でも
-    // 必ず一度だけ解放される」を保証する（App 側の cleanup defer には重複して置かない＝
-    // 二重解放防止）。
-    const system_font_bytes = loadSystemFontBytes(init.io, gpa);
-    defer if (system_font_bytes) |b| gpa.free(b);
+    var doc = try core.Document.init(gpa, CANVAS_W, CANVAS_H);
+    errdefer doc.deinit();
 
-    var app: App = .{
-        .io = init.io,
+    var recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H);
+    errdefer recorder.deinit(gpa);
+
+    var preview_canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H);
+    errdefer preview_canvas.deinit();
+
+    var preview_rec = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H);
+    errdefer preview_rec.deinit(gpa);
+
+    var palette = try palette_mod.Palette.initDb16(gpa);
+    errdefer palette.deinit(gpa);
+
+    const canvas_pixel_count = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
+    const onion_buf = try gpa.alloc(u32, canvas_pixel_count);
+    errdefer gpa.free(onion_buf);
+    const onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
+    errdefer gpa.free(onion_scratch);
+
+    // ここから infallible（所有は App へ移動。成功 return 時は上記 errdefer は発火しない）
+    self.* = .{
+        .io = io,
         .gpa = gpa,
-        .doc = try core.Document.init(gpa, CANVAS_W, CANVAS_H),
-        .recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
-        .preview_canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H),
-        .preview_rec = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H),
-        .palette = try palette_mod.Palette.initDb16(gpa),
+        .ctx = ctx,
+        .doc = doc,
+        .recorder = recorder,
+        .preview_canvas = preview_canvas,
+        .preview_rec = preview_rec,
+        .palette = palette,
         .pen = .{ .color = 0 },
         .brush = .{ .color = 0 },
         .fill = .{ .color = 0 },
         .system_font_bytes = system_font_bytes,
+        .onion_buf = onion_buf,
+        .onion_scratch = onion_scratch,
     };
-    app.canvas = app.doc.activeCanvas(); // doc の active_view を指す（ポインタ安定）
-    app.applySystemFont(); // 初期 doc の active_view へ system font を反映（TASK-82）
-    app.pen.color = app.palette.current(); // 初期描画色 = パレット先頭
-    app.brush.color = app.palette.current();
-    app.fill.color = app.palette.current();
-    const canvas_pixel_count = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
-    app.onion_buf = try gpa.alloc(u32, canvas_pixel_count);
-    errdefer gpa.free(app.onion_buf);
-    app.onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
-    errdefer gpa.free(app.onion_scratch);
-    defer {
-        if (app.current_path) |p| gpa.free(p);
-        if (app.current_project_path) |p| gpa.free(p);
-        if (app.palette_path) |p| gpa.free(p);
-        if (app.clipboard) |*cb| cb.deinit(gpa);
-        if (app.diff_base) |b| gpa.free(b);
-        app.sel_in.deinit(gpa);
-        app.bezier_editor.deinit(gpa);
-        app.preview_rec.deinit(gpa);
-        app.preview_canvas.deinit();
-        app.palette.deinit(gpa);
-        gpa.free(app.onion_buf);
-        gpa.free(app.onion_scratch);
-        // app.doc.deinit() が doc.undo も内部で解放する（TASK-45.1。独立 app.undo は廃止済み）。
-        app.recorder.deinit(gpa);
-        app.doc.deinit();
-    }
 
-    // command model（TASK-62.5.3）: App 所有の CommandLog/Executor を配線し、copilot transport の
-    // 共有 executor に設定する（copilot 無効時は no-op。記録自体は transport の有無に依存しない）。
-    app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchPixieAction });
-    app.cmd_exec.log = &app.cmd_log;
-    app.cmd_exec.adapter = .{ .ctx = &app, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo, .summarize = adapterSummarize }; // per-actor undo + history summary（TASK-62.5.4/62.5.5）
-    platform.setCommandExecutor(&app.cmd_exec);
+    self.canvas = self.doc.activeCanvas();
+    self.applySystemFont();
+    self.pen.color = self.palette.current();
+    self.brush.color = self.palette.current();
+    self.fill.color = self.palette.current();
 
-    // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
-    platform.registerProbe(.{ .name = "canvas", .ctx = &app, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
-    platform.registerProbe(.{ .name = "undo", .ctx = &app, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
-    platform.registerProbe(.{ .name = "tool", .ctx = &app, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
-    platform.registerProbe(.{ .name = "cursor", .ctx = &app, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
-    platform.registerProbe(.{ .name = "history", .ctx = &app, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest }); // TASK-62.5.5 正式 schema
-    platform.registerProbe(.{ .name = "diff", .ctx = &app, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" }); // TASK-87
+    self.cmd_exec = platform.command.Executor.init(.{ .ctx = self, .run = dispatchPixieAction });
+    self.cmd_exec.log = &self.cmd_log;
+    self.cmd_exec.adapter = .{ .ctx = self, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo, .summarize = adapterSummarize };
+    platform.setCommandExecutor(&self.cmd_exec);
+
+    platform.registerProbe(.{ .name = "canvas", .ctx = self, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
+    platform.registerProbe(.{ .name = "undo", .ctx = self, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
+    platform.registerProbe(.{ .name = "tool", .ctx = self, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
+    platform.registerProbe(.{ .name = "cursor", .ctx = self, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
+    platform.registerProbe(.{ .name = "history", .ctx = self, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest });
+    platform.registerProbe(.{ .name = "diff", .ctx = self, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" });
     // TASK-45.4: timeline 再生状態（digest のみ・snapshot=null）
-    platform.registerProbe(.{ .name = "timeline", .ctx = &app, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
-    // TASK-89: 末尾追加のみ（並列制約）
-    platform.registerProbe(.{ .name = "palette", .ctx = &app, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
-    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-64）。
-    registerActions(&app);
-    registerStateSync(&app);
+    platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
+    platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
+    registerActions(self);
+    registerStateSync(self);
+    return self;
+}
 
-    var fc: FrameCtx = .{
-        .window = window,
-        .gpa = gpa,
-        .ctx = &ctx,
-        .app = &app,
-    };
-    // ライブリサイズ再描画 callback（harness 有効時は facade 側で no-op。TASK-23.1）
-    window.setRedrawCallback(&fc, redrawCb);
+fn appDeinit(self: *App) void {
+    const gpa = self.gpa;
+    if (self.current_path) |p| gpa.free(p);
+    if (self.current_project_path) |p| gpa.free(p);
+    if (self.palette_path) |p| gpa.free(p);
+    if (self.clipboard) |*cb| cb.deinit(gpa);
+    if (self.diff_base) |b| gpa.free(b);
+    self.sel_in.deinit(gpa);
+    self.bezier_editor.deinit(gpa);
+    self.preview_rec.deinit(gpa);
+    self.preview_canvas.deinit();
+    self.palette.deinit(gpa);
+    gpa.free(self.onion_buf);
+    gpa.free(self.onion_scratch);
+    self.recorder.deinit(gpa);
+    self.doc.deinit();
+    self.ctx.deinit();
+    if (self.system_font_bytes) |b| gpa.free(b);
+    gpa.destroy(self);
+}
 
-    while (app.running and window.pollEvents()) {
-        try runFrame(&fc);
-        // 安全点: framebuffer unlock 済み。モーダルダイアログは runFrame 外に残す。
-        if (app.running) app.runPendingFileOp();
-        // フレーム末尾: 未記録 undoable 編集の検出 → redo 候補の epoch 失効（TASK-62.5.4 §2b）
-        app.checkUnrecordedEdits();
-    }
+/// ライブリサイズ中の redraw callback と通常 frame の双方から呼ぶフレーム本体（TASK-23.1）。
+/// モーダルダイアログ（runPendingFileOp）は含めない（callback からダイアログを開かない契約）。
+fn appFrameInner(self: *App, win: *platform.Window) !void {
+    // in_frame ガード: early return / error return でも必ず戻るよう defer で落とす。
+    if (self.in_frame) return;
+    self.in_frame = true;
+    defer self.in_frame = false;
+        // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。
+        // ファイルダイアログ（モーダル）は lock 中に呼ぶと再入で危険なので、ここでは pending を
+        // セットするだけにし、unlock 後の安全点（下の runPendingFileOp）で実行する。
+        {
+            const fb = win.lockFramebuffer() orelse return;
+            defer fb.unlock();
+
+            self.ctx.beginFrame(fb.width, fb.height);
+
+            while (win.nextEvent()) |ev| {
+                switch (ev) {
+                    .quit => self.running = false, // ウィンドウクローズも同一経路
+                    // レイヤー名インライン編集中（TASK-79.3）・テキストレイヤー内容編集中
+                    // （TASK-79.5、`text_in`。rename_in と対称・互いに同時 active にならない）は
+                    // key_down を専用ハンドラへ回し、char_input で確定文字を追記する（TASK-22
+                    // char_input の初消費）。key_up は常に通す（Space パン modifier 等の held
+                    // 状態を編集中に取りこぼさないため。codex レビュー指摘 2026-07-05）。
+                    .key_down => |k| if (self.rename_in.active)
+                        self.handleRenameKey(k)
+                    else if (self.text_in.active)
+                        self.handleTextEditKey(k)
+                    else
+                        self.handleKey(k),
+                    .key_up => |k| self.handleKeyUp(k),
+                    .char_input => |c| if (self.rename_in.active)
+                        self.rename_in.appendCodepoint(c.codepoint)
+                    else if (self.text_in.active)
+                        self.text_in.appendCodepoint(c.codepoint),
+                    else => {},
+                }
+                // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
+                // での干渉を避ける。rename_in/text_in はここで破棄されないため、他行の右クリックで
+                // 新たな編集が始まれば単に上書きされるだけでクラッシュはしない）。
+                if (!self.rename_in.active and !self.text_in.active) {
+                    if (toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
+                }
+            }
+
+            // canvas rect は前フレームの layout 結果（初回フレームは null）。
+            // canvasBlitRect は pan を現 area に clamp して app へ書き戻し、last_area も更新する。
+            var canvas_rect = canvasBlitRect(&self.ctx, self);
+
+            self.tickTimelinePlayback(platform.getTime());
+
+            try buildUi(&self.ctx, self, canvas_rect);
+            self.ctx.endFrame();
+
+            // ── ビューポート: ホイールズーム（カーソル中心）/ パン（Space+左 or middle ドラッグ）──
+            // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。
+            const panning = updateViewport(self, &self.ctx, canvas_rect);
+            // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
+            // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果）。
+            canvas_rect = canvasBlitRect(&self.ctx, self);
+
+            // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
+            // TASK-79.5: 選択中レイヤーが text kind の間は、この分岐全体（bezier/select/
+            // eyedropper/通常 canvas_input のいずれも）を丸ごと止める。「text layer の pixels は
+            // text_params からの再ラスタライズ結果」という不変条件を守るため（eyedropper は
+            // 本来読み取りのみで実害は無いが、分岐追加のミスリスクよりシンプルさを優先し
+            // 丸ごと止める設計判断。text layer 選択中は色スポイトも一時的に使えない）。
+            if (!panning and !self.selectedLayerIsText()) {
+                const in = &self.ctx.input;
+                // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
+                // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
+                // pressed_left のみ落として update は通し、release を届けて完走させる（capturing 張り付き防止）。
+                const pressed_left_gated = in.mouse_pressed.left and gate: {
+                    const p = in.mouse_pressed_pos;
+                    const in_area = if (self.last_area) |a|
+                        (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h)
+                    else
+                        false;
+                    // active_id==0 = どの widget/splitter も press を取っていない（hover だけの wantsMouse は
+                    // 抑止しない＝canvas 内 press → 同一フレーム UI 上へ move でも stroke は開始できる）。
+                    // !hasOpenPopup() = レイヤー右クリックメニュー（TASK-79.2）表示中は新規 stroke を
+                    // 開始しない（popup は active_id を 0 のまま保つため、上の条件だけでは防げない。
+                    // popup.zig の wantsMouse() が popup_state を OR しているのと同じ理由）。
+                    break :gate in_area and self.ctx.state.active_id == 0 and !self.ctx.hasOpenPopup();
+                };
+                if (self.active_kind == .bezier and !self.input.capturing) {
+                    const frame: bezier_input.BezierInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = self.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                        .time = platform.getTime(),
+                    };
+                    const dab = self.brush.footprint();
+                    if (self.bez_in.update(frame, &self.bezier_editor, self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |pd| {
+                        self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                    }
+                } else if (self.active_kind == .select and !self.input.capturing) {
+                    const frame: selection_input.SelectionInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = self.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                    };
+                    if (self.sel_in.update(frame, self.canvas, self.canvas.selected_layer, self.gpa, self.blend_mode)) |pd| {
+                        self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                    }
+                } else if (self.eye_in.picking or self.active_kind == .eyedropper or
+                    (pressed_left_gated and in.modifiers.alt))
+                {
+                    // スポイト（独立経路。TASK-68）。専用ツール選択中、または進行中の picking を完走、
+                    // または Alt+クリックの一時スポイト（bezier/select は上の分岐で既に弾かれているので
+                    // ここに来る active_kind は pen/eraser/brush/fill/eyedropper のいずれか。4ツール
+                    // 全てで Alt+クリックを一律有効にする最小の場合分け）。
+                    const frame: eyedropper_input.EyedropperInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = self.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                    };
+                    if (self.eye_in.update(frame)) |cp| {
+                        self.pickColor(cp.x, cp.y);
+                    }
+                } else {
+                    const frame: canvas_input.CanvasInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = self.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                    };
+                    const was_capturing = self.input.capturing;
+                    const pd_opt = self.input.update(frame, self.activeTool(), self.canvas, &self.recorder, self.gpa);
+                    // ── UI stroke の点列追跡（TASK-62.5.3 §5c。canvas_input の down/move/up と同じ座標変換）──
+                    if (canvas_rect) |rect| {
+                        if (pd_opt != null) {
+                            // release で確定（同一フレーム press+release は begin から。up は released_pos）
+                            if (!was_capturing) self.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
+                            self.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom));
+                        } else if (!was_capturing and self.input.capturing) {
+                            // capture 開始（down=pressed_pos + 同フレーム move=mouse_pos）
+                            self.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
+                            self.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
+                        } else if (self.input.capturing) {
+                            self.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
+                        }
+                    }
+                    if (pd_opt) |pd| {
+                        // TASK-94 Phase C: netsync 中は preview を巻き戻し → routeAction("stroke")。
+                        // fill 等（action 語彙なし）は rewind 破棄（silent diverge 防止）。
+                        // solo は従来どおり pushPaintOp + recordUiStroke。
+                        switch (actions.uiPaintCommitPath(platform.netsyncActive(), self.uiStrokeRelaysViaAction())) {
+                            .relay => {
+                                self.rewindPaintDiff(pd);
+                                self.relayUiStroke();
+                            },
+                            .rewind_discard => {
+                                self.rewindPaintDiff(pd);
+                                self.uiStrokeDiscard();
+                                std.debug.print("pixie: netsync 中は fill 等は使えません（action 語彙なし・preview を破棄）\n", .{});
+                                self.setSaveMsg("netsync: fill unavailable (no action)", .{});
+                            },
+                            .solo => {
+                                const handle_before = self.doc.undo.next_handle;
+                                self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                                // 確定点で CommandRecord を記録（actor=local_user。undo_ref = push された Op の handle）
+                                self.recordUiStroke(self.doc.undo.next_handle != handle_before);
+                            },
+                        }
+                    } else if (!self.input.capturing) {
+                        self.uiStrokeDiscard(); // release したが確定 diff なし → 蓄積破棄
+                    }
+                }
+            }
+
+            // ── ソフトオーバーレイ用 hover 追跡 + OS カーソル形状の M1 配線（TASK-75.4）。
+            // 入力ディスパッチの後に置くことで、当フレームで新規 stroke が始まった場合の busy 判定
+            // （isPointerBusy）を正しく反映する（描画パスで footprint リングが一瞬出ることを防ぐ）。
+            updateCursorAndHover(self, win.*, &self.ctx, canvas_rect);
+
+            // ── 描画: bg → チェッカー背景 → canvas blit(α src-over) → GUI（上に重ねる） ──
+            @memset(fb.pixels, COLOR_WINDOW_BG);
+            if (canvas_rect) |rect| {
+                if (self.last_area) |area| {
+                    const zoom = self.view_zoom;
+                    // 表示矩形（screen px 実寸。canvasBlitRect の rect.w/h は canvas px なので zoom 倍）
+                    const screen_rect: core.Rect = .{
+                        .x = rect.x,
+                        .y = rect.y,
+                        .w = @as(i32, @intCast(CANVAS_W)) * zoom,
+                        .h = @as(i32, @intCast(CANVAS_H)) * zoom,
+                    };
+                    blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
+                    const base_composite = self.resolveDisplayComposite(self.gpa);
+                    const display_composite: []const u32 = if (self.onion_enabled and self.doc.frames.items.len > 1) blk: {
+                        const cnt = @min(self.onion_count, core.onion_skin.max_count);
+                        core.onion_skin.build(&self.doc, base_composite, self.doc.selected_frame, cnt, self.onion_buf, self.onion_scratch);
+                        break :blk self.onion_buf;
+                    } else base_composite;
+                    blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, CANVAS_W, CANVAS_H, rect, zoom, area);
+                }
+            }
+            // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる。area で clip）
+            if (self.active_kind == .bezier) {
+                if (canvas_rect) |rect| if (self.last_area) |area| {
+                    const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                    bezier_overlay.draw(&self.ctx, &self.bezier_editor, rect, self.view_zoom, clip_area);
+                };
+            }
+            // 範囲選択のマーチングアンツ（選択があれば常時表示。select ツール時はドラッグ中の preview を優先）
+            {
+                const display_sel: ?core.Rect = if (self.active_kind == .select)
+                    (self.sel_in.previewRect(self.canvas) orelse self.canvas.selection)
+                else
+                    self.canvas.selection;
+                if (display_sel != null) {
+                    if (canvas_rect) |rect| if (self.last_area) |area| {
+                        const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                        // phase は時間由来。MARCH_PERIOD(=2*DASH) で mod し i32 overflow を防ぐ（パターンは保存）。
+                        const phase: i32 = @intFromFloat(@mod(platform.getTime() * MARCH_SPEED, MARCH_PERIOD));
+                        selection_overlay.draw(&self.ctx, display_sel, rect, self.view_zoom, clip_area, phase);
+                    };
+                }
+            }
+            // ツールグリフ + ブラシ footprint 輪郭リング（ソフトオーバーレイ最前面。TASK-75.4）。
+            // hover_screen は「in_canvas かつ非 busy」の時だけ Some（updateCursorAndHover 参照）なので、
+            // stroke/選択ドラッグ/ベジェドラッグ/パン中はここに来ない。
+            if (self.hover_screen) |hs| {
+                if (self.last_area) |area| {
+                    const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                    const glyph = self.active_kind.glyph();
+                    cursor_overlay.drawGlyph(&self.ctx, .{ .x = hs.x, .y = hs.y }, glyph.label, glyph.color, clip_area);
+                    if (self.active_kind == .brush) {
+                        if (self.hover_cell) |hc| if (canvas_rect) |rect| {
+                            self.brush_edges.refresh(&self.brush);
+                            cursor_overlay.drawRing(&self.ctx, &self.brush_edges, hc, rect, self.view_zoom, clip_area, RING_COLOR_A, RING_COLOR_B);
+                        };
+                    }
+                }
+            }
+            // レイヤー右クリックコンテキストメニュー（TASK-79.2）。popup.zig の「endFrame 後」契約
+            // + 他のオーバーレイ（bezier/selection/cursor）より後に呼ぶことで最前面に描画される。
+            // 呼び出しは毎フレーム無条件でよい（対象 popup が閉じていれば no-op で即返る。
+            // popup.zig の doc comment 参照）。items は selected_layer の現在値から都度算出する
+            // （右クリック時に doSelectLayer 済みなので、以降の全項目は selected_layer に対して動く）。
+            {
+                const sel_is_text = self.selectedLayerIsText();
+                const items = [_]gui.PopupItem{
+                    .{ .label = "Add Layer" },
+                    .{ .label = "Add Text Layer" }, // TASK-79.5
+                    .{ .label = "Delete Layer", .enabled = self.canvas.layers.items.len > 1 },
+                    .{ .label = "Move Up", .enabled = self.canvas.selected_layer + 1 < self.canvas.layers.items.len },
+                    .{ .label = "Move Down", .enabled = self.canvas.selected_layer > 0 },
+                    .{ .label = if (self.canvas.layers.items[self.canvas.selected_layer].visible) "Hide" else "Show" },
+                    .{ .label = "Duplicate" },
+                    .{ .label = "Merge Down", .enabled = self.canvas.selected_layer > 0 and !sel_is_text and
+                        self.canvas.layers.items[self.canvas.selected_layer - 1].kind != .text },
+                    .{ .label = "Rename..." }, // TASK-79.3
+                    .{ .label = "Edit Text...", .enabled = sel_is_text }, // TASK-79.5
+                    .{ .label = "Rasterize", .enabled = sel_is_text }, // TASK-79.5
+                };
+                const ctx_menu_result = self.ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
+                if (ctx_menu_result.selected) |sel| {
+                    const sel_idx = self.canvas.selected_layer;
+                    const synced = platform.netsyncActive();
+                    switch (sel) {
+                        0 => {
+                            if (synced) self.routeUi("add_layer", "") else _ = self.doAddLayer() catch {};
+                        },
+                        1 => self.doAddTextLayer() catch {}, // action 未登録・relay 対象外
+                        2 => {
+                            if (synced) self.routeUiLayerOp("delete_layer", sel_idx) else self.doDeleteLayer(sel_idx) catch {};
+                        },
+                        3 => {
+                            if (synced) self.routeUiLayerMove(sel_idx, 1) else self.doMoveLayer(sel_idx, 1) catch {};
+                        },
+                        4 => {
+                            if (synced) self.routeUiLayerMove(sel_idx, -1) else self.doMoveLayer(sel_idx, -1) catch {};
+                        },
+                        5 => {
+                            if (synced)
+                                self.routeUiLayerVisible(sel_idx, !self.canvas.layers.items[sel_idx].visible)
+                            else
+                                self.doToggleLayerVisible(sel_idx);
+                        },
+                        6 => {
+                            if (synced) self.routeUiLayerOp("duplicate_layer", sel_idx) else _ = self.doDuplicateLayer(sel_idx) catch {};
+                        },
+                        7 => {
+                            if (synced) self.routeUiLayerOp("merge_down", sel_idx) else self.doMergeDown(sel_idx) catch {};
+                        },
+                        8 => self.beginRenameLayer(sel_idx),
+                        9 => self.beginTextEdit(sel_idx),
+                        10 => self.doRasterizeLayer(sel_idx) catch {},
+                        else => {},
+                    }
+                }
+            }
+            gui.render(
+                .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
+                &self.ctx.draw_list,
+                self.ctx.font,
+            );
+            win.present();
+        } // ← ここで framebuffer unlock
+}
+
+fn appFrame(self: *App, win: *platform.Window, now: f64) !bool {
+    _ = now;
+    try appFrameInner(self, win);
+
+    // 安全点: framebuffer unlock 済み・当フレームの入力更新も完了。ここでモーダルを開く。
+    // 終了要求と同フレームで保存/読込が pending でも、終了中はダイアログを開かない。
+    if (self.running) self.runPendingFileOp();
+
+    // フレーム末尾: 未記録 undoable 編集の検出 → redo 候補の epoch 失効（TASK-62.5.4 §2b）
+    self.checkUnrecordedEdits();
+
+    return self.running;
+}
+
+/// ライブリサイズ redraw callback（TASK-23.1）。OS モーダルループ中に backend から呼ばれ 1 フレーム描く。
+/// エラーは log して当該フレームを skip（callback は void）。
+fn redrawCb(ctx_ptr: *anyopaque) void {
+    const self: *App = @ptrCast(@alignCast(ctx_ptr));
+    var win = self.redraw_win orelse return;
+    appFrameInner(self, &win) catch |e| std.log.err("redraw frame failed: {s}", .{@errorName(e)});
+}
+
+
+
+
+const Rt = app_runtime.Runtime(App);
+
+pub fn enableWasmRuntime() void {
+    Rt.enableWasmExports();
+}
+
+pub fn main(process_init: std.process.Init) !void {
+    try Rt.runNative(process_init);
 }

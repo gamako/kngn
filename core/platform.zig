@@ -48,7 +48,9 @@ const netsync = harness.netsync;
 // 付与するため（外部公開 module も含む）、全 caller で安全に参照できる。
 const build_options = @import("build_options");
 
-const backend = switch (builtin.os.tag) {
+const backend = if (builtin.cpu.arch.isWasm())
+    @import("platform_wasm.zig")
+else switch (builtin.os.tag) {
     .macos => @import("platform_macos.zig"),
     .linux => @import("platform_linux.zig"),
     .windows => @import("platform_windows.zig"),
@@ -401,16 +403,25 @@ const win_sleep = if (builtin.os.tag == .windows) struct {
 } else struct {};
 
 /// 指定ナノ秒だけ最低限スリープする（精度は OS 依存）。
-pub fn sleep(nanoseconds: u64) void {
-    if (builtin.os.tag == .windows) {
-        win_sleep.Sleep(@intCast(nanoseconds / 1_000_000));
-    } else {
-        var req = std.c.timespec{
-            .sec = @intCast(nanoseconds / 1_000_000_000),
-            .nsec = @intCast(nanoseconds % 1_000_000_000),
-        };
-        _ = std.c.nanosleep(&req, null);
+/// wasm では no-op（rAF がペーシング。nanosleep 参照を comptime で除外。TASK-73.1）。
+const sleep_impl = if (builtin.cpu.arch.isWasm()) struct {
+    fn call(_: u64) void {}
+} else struct {
+    fn call(nanoseconds: u64) void {
+        if (builtin.os.tag == .windows) {
+            win_sleep.Sleep(@intCast(nanoseconds / 1_000_000));
+        } else {
+            var req = std.c.timespec{
+                .sec = @intCast(nanoseconds / 1_000_000_000),
+                .nsec = @intCast(nanoseconds % 1_000_000_000),
+            };
+            _ = std.c.nanosleep(&req, null);
+        }
     }
+};
+
+pub fn sleep(nanoseconds: u64) void {
+    sleep_impl.call(nanoseconds);
 }
 
 /// フレーム毎の main loop ウェイト（TASK-32.4 P4）。harness 有効時（headless に限らず replay/live とも）は

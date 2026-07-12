@@ -51,7 +51,7 @@ fn link(consumer: TaggedModule, dep: TaggedModule) void {
         .kit => dep.layer == .core or dep.layer == .lib,
         // libs は libs 同士 + type-only な core module（platform_types）のみ（R2）。
         .lib => dep.layer == .lib or (dep.layer == .core and dep.type_only),
-        // core は core 同士のみ（例外 harness→png / harness→dsp は linkCoreException 経由）。
+        // core は core 同士のみ（例外 harness→png / harness→dsp / platform→pixelops は linkCoreException 経由）。
         .core => dep.layer == .core,
     };
     if (!ok) std.debug.panic(
@@ -64,6 +64,7 @@ fn link(consumer: TaggedModule, dep: TaggedModule) void {
 /// core → libs の明示例外。現状:
 ///   - harness(core/control) → png(libs/png)（snapshot fb の PNG encode / crc32）
 ///   - harness(core/control) → dsp（digest audio のスペクトル解析 band/centroid/onset。TASK-92）
+///   - platform(core) → pixelops(libs/pixelops)（wasm present の BGRA→RGBA SIMD swizzle。TASK-73.1）
 /// 新たな例外を足す場合は ADR-007 の改訂を伴うこと。
 fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
@@ -85,6 +86,53 @@ fn appRoot(exe: *std.Build.Step.Compile, name: []const u8) TaggedModule {
     return .{ .mod = exe.root_module, .layer = .app, .name = name };
 }
 
+/// wasm32-wasi 専用ビルド（TASK-73.1）。pixie のみ・entry disabled・rdynamic・
+/// single_threaded。成果物は zig-out/web/{pixie.wasm,index.html,vp.js}。
+/// root は wasm_root.zig（main 無し）にし、wasi command/_start 経路を避ける（reactor=export 駆動）。
+fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const shared = SharedModules.init(b, true);
+    const pm = makePlatformModules(b, target, .wasm, &shared);
+
+    const pixie_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    // apps は kit-only + paint（addPixieExe と同型）
+    {
+        const root = TaggedModule{ .mod = pixie_mod, .layer = .app, .name = "pixie" };
+        link(root, pm.kit);
+        link(root, shared.paint);
+    }
+
+    const exe = b.addExecutable(.{
+        .name = "pixie",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/editor/apps/pixie/wasm_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+        }),
+    });
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    exe.root_module.addImport("pixie", pixie_mod);
+
+    // install → zig-out/web/
+    const wasm_install = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = "web" } },
+    });
+    b.getInstallStep().dependOn(&wasm_install.step);
+
+    const install_html = b.addInstallFile(b.path("web/index.html"), "web/index.html");
+    const install_js = b.addInstallFile(b.path("web/vp.js"), "web/vp.js");
+    b.getInstallStep().dependOn(&install_html.step);
+    b.getInstallStep().dependOn(&install_js.step);
+
+    addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", exe);
+}
+
 pub fn build(b: *std.Build) void {
     // ========================================
     // プロジェクト特有のセットアップ
@@ -92,6 +140,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const target_os = target.result.os.tag;
+    const is_wasm = target.result.cpu.arch.isWasm();
+
+    // ========================================
+    // wasm 専用ブランチ（TASK-73.1: wasm32-wasi）
+    // wasi でも既存 native backend ループは使わず専用経路。pixie のみ。
+    // ========================================
+    if (is_wasm) {
+        buildWasm(b, target, optimize);
+        return;
+    }
 
     // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）。
     // 省略時は OS のデフォルト。OS/backend 不整合は assertBackendForOs で build エラー。
@@ -127,7 +185,7 @@ pub fn build(b: *std.Build) void {
     // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
     // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
     // ========================================
-    const shared_modules = SharedModules.init(b);
+    const shared_modules = SharedModules.init(b, false);
 
     // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）
     const backends = platform.implementedBackends(target_os);
@@ -470,6 +528,18 @@ pub fn build(b: *std.Build) void {
     });
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
+
+    // wasm platform の DOM→MouseButton / KeyCode 写像（native でも実行。extern env はテスト経路から未参照）。
+    const platform_wasm_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/platform_wasm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    platform_wasm_test_mod.addImport("platform_types", shared_modules.types.mod);
+    platform_wasm_test_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    const platform_wasm_test = b.addTest(.{ .root_module = platform_wasm_test_mod });
+    const test_platform_wasm_step = b.step("test-platform-wasm", "Run platform_wasm DOM→MouseButton / KeyCode unit tests (TASK-73.1)");
+    test_platform_wasm_step.dependOn(&b.addRunArtifact(platform_wasm_test).step);
 
     // capture 入力基盤（TASK-49.1/49.5）単体テスト。display/実デバイス不要・OS 非依存。
     // capture_types（TripleBuffer 往復・不変条件・DeviceInfo/CaptureError 構造）+ camera facade
@@ -1354,6 +1424,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_netsync_step);
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
+    test_step.dependOn(test_platform_wasm_step);
     test_step.dependOn(test_capture_types_step);
     test_step.dependOn(test_pixelops_step);
     test_step.dependOn(test_serde_step);
@@ -1557,6 +1628,21 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
     link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
 
+    // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎。
+    const app_runtime: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
+        .root_source_file = b.path("core/app_runtime.zig"),
+        .target = target,
+        .single_threaded = if (backend == .wasm) true else null,
+    }) };
+    link(app_runtime, platform_mod);
+    link(kit, app_runtime);
+
+    // wasm present の BGRA→RGBA SIMD swizzle（platform_wasm → pixelops）。
+    // ADR-007 の core→lib 例外として linkCoreException 経由（素の addImport は不可）。
+    if (backend == .wasm) {
+        linkCoreException(platform_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
+    }
+
     return .{ .platform = platform_mod, .platform_gamepad = platform_gamepad_mod, .keyboard = keyboard_mod, .kit = kit };
 }
 
@@ -1622,7 +1708,7 @@ const SharedModules = struct {
     objc_runtime: TaggedModule, // Objective-C ランタイム FFI（TASK-49.2。camera/audio 両方が link する共有 module。TASK-49.6 で named module 化）
     gamepad: TaggedModule, // src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する headless lib。kit 収録）
 
-    fn init(b: *std.Build) SharedModules {
+    fn init(b: *std.Build, is_wasm: bool) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
         // facade。@cImport("platform.h") のため link_libc + include path を内包。
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
@@ -1742,18 +1828,23 @@ const SharedModules = struct {
         // 1 exe 内で共有させるため、同じ harness を platform module(per-backend,
         // makePlatformModules→createPlatformModule) と audio module の両方に注入する (TASK-32.2)。
         // harness は png(encodePNG/crc32) に依存し getenv で link_libc。
+        // wasm では harness_wasm.zig（no-op stub）に差し替え、png/capture_synthetic/dsp を張らない（TASK-73.1）。
         const harness: TaggedModule = .{ .layer = .core, .name = "harness", .mod = b.createModule(.{
-            .root_source_file = b.path("core/control/harness.zig"),
-            .link_libc = true,
+            .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
+            .link_libc = !is_wasm,
+            .single_threaded = if (is_wasm) true else null,
         }) };
-        linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");
+        if (!is_wasm) {
+            linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");
+        }
         link(harness, types);
         // 公開 platform module（addModule "platform"）も harness 経由になるため伝播。
         link(platform_mod, harness);
         // audio facade（core/audio.zig）が `@import("harness")` で onAudioSamples を呼ぶ。
         link(audio, harness);
         // macOS: audio_macos.zig の capture(マイク) 拡張が objc_runtime 経由で権限確認を叩く。
-        link(audio, objc_runtime);
+        // wasm では audio_web が objc を触らないが、import 配線は無害（未参照なら解析されない）。
+        if (!is_wasm) link(audio, objc_runtime);
 
         // capture 入力基盤の共有型（TASK-49.1）: control plane 共通型 + data plane 型
         // （DeviceInfo/PermissionState/CaptureError/AudioInFrame/PixelFormat/VideoFrame/TripleBuffer）。
@@ -1774,7 +1865,7 @@ const SharedModules = struct {
         }) };
         link(camera, capture_types);
         link(camera, harness); // isCaptureSyntheticActive() 継ぎ目
-        link(camera, objc_runtime); // macOS: camera_macos.zig が objc_runtime 経由で AVFoundation を叩く
+        if (!is_wasm) link(camera, objc_runtime); // macOS: camera_macos.zig が objc_runtime 経由で AVFoundation を叩く
 
         // capture_synthetic (L1): harness 内蔵の synthetic capture source（偽 mic/camera。
         // TASK-49.5）。camera/audio facade への配線は無く、harness の組み込み `capture`
@@ -1788,7 +1879,8 @@ const SharedModules = struct {
         }) };
         link(capture_synthetic, capture_types);
         // harness.zig が `@import("capture_synthetic")` で使う（`capture` コマンド/probe）。
-        link(harness, capture_synthetic);
+        // wasm stub は capture_synthetic 非依存なので張らない（TASK-73.1）。
+        if (!is_wasm) link(harness, capture_synthetic);
 
         // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
         // （物理位置は src/dsp のまま。libs/audio への移動は R8 日和見で後続タスクにて）
@@ -1797,7 +1889,8 @@ const SharedModules = struct {
         }) };
         // TASK-92: digest audio の band/centroid/onset が magnitudeSpectrum を使う。
         // harness は dsp 定義後に link（png と同様 linkCoreException。ADR-007 追記済み）。
-        linkCoreException(harness, dsp, "digest audio のスペクトル解析（band/centroid/onset）");
+        // wasm stub は dsp 非依存なので張らない。
+        if (!is_wasm) linkCoreException(harness, dsp, "digest audio のスペクトル解析（band/centroid/onset）");
 
         // synth (L3): Voice/VoicePool/Patch/Synth + GUI⇔Audio 受け渡し機構。dsp に依存。
         const synth: TaggedModule = .{ .layer = .lib, .name = "synth", .mod = b.createModule(.{

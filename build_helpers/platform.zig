@@ -18,6 +18,8 @@ pub const PlatformType = enum {
     // Windows backends（純 Zig。gdi=GDI software blit/best-effort（TASK-31）、d3d11=D3D11-DXGI/1級（TASK-35））
     gdi,
     d3d11,
+    // wasm32-wasi（TASK-73。JS glue + canvas。stdlib は wasi、描画/入力は env import）
+    wasm,
 };
 
 /// 当該 OS のデフォルト backend（`-Dplatform` 省略時に使う）。
@@ -26,6 +28,8 @@ pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
         .macos => .objc,
         .linux => .x11,
         .windows => .gdi, // 当面 GDI 既定（d3d11 は opt-in。TASK-35）
+        .wasi => .wasm, // TASK-73.1: wasm32-wasi
+        .freestanding => .wasm, // 旧 freestanding 表記の残骸；本タスクの正は wasi
         else => .objc, // 実際には build.zig 側の OS チェックで到達しない
     };
 }
@@ -38,6 +42,8 @@ pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
         .macos => &.{ .objc, .swift, .metal },
         .linux => &.{ .x11, .wayland },
         .windows => &.{ .gdi, .d3d11 },
+        .wasi => &.{.wasm}, // TASK-73.1: wasm32-wasi 専用ブランチが主経路
+        .freestanding => &.{.wasm},
         else => &.{},
     };
 }
@@ -60,6 +66,7 @@ pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
         .macos => "objc / swift / metal",
         .linux => "x11 / wayland",
         .windows => "gdi / d3d11",
+        .wasi, .freestanding => "wasm",
         else => "(なし)",
     };
     std.log.err(
@@ -108,12 +115,14 @@ pub fn createPlatformModule(
 ) *std.Build.Module {
     // linkSystemLibrary は target 既知の module を要求するため、明示的に target を設定する
     // （import module は通常 importer から target を継承するが、x11 のリンク呼び出しには事前に必要）。
+    const is_wasm = backend == .wasm;
     const mod = b.createModule(.{
         .root_source_file = platform_source,
         .target = target,
-        .link_libc = true,
+        .link_libc = !is_wasm, // wasm（wasi）は wasi preview1 + 手書き JS shim。libc 不要
+        .single_threaded = if (is_wasm) true else null,
     });
-    mod.addIncludePath(platform_include_root);
+    if (!is_wasm) mod.addIncludePath(platform_include_root);
     // platform.zig + backends は `@import("platform_types")`、facade は `@import("harness")` を使う。
     mod.addImport("platform_types", types_mod);
     mod.addImport("harness", harness_mod);
@@ -290,6 +299,10 @@ pub fn setupExecutableForPlatform(
             // コンソール窓が出る）。コンソール出力が本体のツール（例: example_06 ベンチ）は
             // caller 側で .Console に上書きする。std.debug.print はコンソール非接続時 no-op になる。
             exe.subsystem = .Windows;
+        },
+        .wasm => {
+            // wasm32-wasi（TASK-73.1）。native .o / system lib は不要。
+            // entry/rdynamic/single_threaded は build.zig の wasm ブランチ側で設定する。
         },
     }
 }
@@ -571,7 +584,7 @@ pub fn compilePlatformLayer(
         .metal => buildMetal(b, optimize, platform_root, enable_gamepad),
         // Linux / Windows backend は純 Zig で .o コンパイル不要。setupExecutableForPlatform の
         // macOS 分岐からのみ呼ばれるため、ここには到達しない。
-        .x11, .wayland, .gdi, .d3d11 => unreachable,
+        .x11, .wayland, .gdi, .d3d11, .wasm => unreachable,
     };
 }
 

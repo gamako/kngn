@@ -94,7 +94,7 @@ pub fn layoutPopup(
     const cw: i64 = @max(@as(i64, content_w), 0);
     const pad64: i64 = pad;
     const item_h64: i64 = item_h;
-    const count64: i64 = @intCast(@min(item_count, @as(usize, std.math.maxInt(i64))));
+    const count64: i64 = std.math.cast(i64, item_count) orelse std.math.maxInt(i64);
     const sw: i64 = screen_w;
     const sh: i64 = screen_h;
 
@@ -128,7 +128,7 @@ pub fn itemRect(geo: PopupGeometry, index: usize) Rect {
     // i64 中間計算にして i32 演算の overflow trap を避ける。
     const pad64: i64 = geo.pad;
     const item_h64: i64 = geo.item_h;
-    const idx64: i64 = @intCast(@min(index, @as(usize, std.math.maxInt(i64))));
+    const idx64: i64 = std.math.cast(i64, index) orelse std.math.maxInt(i64);
     const x: i64 = @as(i64, geo.outer.x) + pad64;
     const y: i64 = @as(i64, geo.outer.y) + pad64 + idx64 * item_h64;
     const w: i64 = @max(@as(i64, geo.outer.w) - pad64 * 2, 0);

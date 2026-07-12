@@ -27,14 +27,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("harness");
 
-const backend = switch (builtin.os.tag) {
+const backend = if (builtin.cpu.arch.isWasm())
+    @import("audio_web.zig")
+else switch (builtin.os.tag) {
     .macos => @import("audio_macos.zig"),
     .linux => @import("audio_linux.zig"),
     .windows => @import("audio_windows.zig"),
     else => @compileError("video-proto: unsupported OS for audio backend: " ++ @tagName(builtin.os.tag)),
 };
 
-const NullImpl = @import("audio_null.zig").NullBackend(backend);
+const NullImpl = if (builtin.cpu.arch.isWasm())
+    @import("audio_web.zig").NullWebStub(backend)
+else
+    @import("audio_null.zig").NullBackend(backend);
 
 pub const Error = backend.Error;
 pub const Config = backend.Config;
@@ -167,7 +172,9 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 // ============================================================================
 
 const capture_types = @import("capture_types");
-const capture_backend = switch (builtin.os.tag) {
+const capture_backend = if (builtin.cpu.arch.isWasm())
+    @import("audio_capture_stub.zig")
+else switch (builtin.os.tag) {
     .macos => @import("audio_macos.zig").capture,
     else => @import("audio_capture_stub.zig"),
 };
