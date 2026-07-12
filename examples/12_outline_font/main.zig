@@ -12,31 +12,7 @@ const std = @import("std");
 const platform = @import("platform");
 const fontmod = @import("font");
 
-// 試行する system フォントパス（glyf 系 TTF）。先に見つかったものを使う。
-const font_paths = [_][]const u8{
-    // 日本語フォントを優先（.ttc コレクション＝CID-keyed CFF。ASCII も含むので 1 本で混在描画可）
-    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-    "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
-    "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
-    // ASCII フォント（日本語が無い場合のフォールバック）
-    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
-    "/Library/Fonts/Arial.ttf",
-    // Windows（system フォント。forward slash でも Win32 file API は解決する）。
-    "C:/Windows/Fonts/YuGothM.ttc", // 游ゴシック Medium（日本語, glyf TrueType）
-    "C:/Windows/Fonts/meiryo.ttc", // メイリオ（日本語, glyf TrueType）
-    "C:/Windows/Fonts/msgothic.ttc", // MS ゴシック（日本語）
-    "C:/Windows/Fonts/arial.ttf", // ASCII フォールバック
-    "C:/Windows/Fonts/segoeui.ttf",
-    "C:/Windows/Fonts/consola.ttf",
-    // Linux（Ubuntu / nix の system フォント）。他 OS では FileNotFound で skip される。
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // 日本語（CJK, CID-keyed CFF）
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // ASCII フォールバック
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-};
-
-const Loaded = struct { bytes: []u8, face: fontmod.FontFace };
+const Loaded = fontmod.LoadedSystemFontFace;
 
 /// 可変フォント（fvar あり glyf VF）の候補。macOS の SF Pro が代表
 /// （4 軸 wdth/opsz/GRAD/wght + gvar + HVAR。TASK-25.15 の VF スタックのデモ）。
@@ -65,25 +41,6 @@ fn loadVarFace(io: std.Io, alloc: std.mem.Allocator) ?Loaded {
     return null;
 }
 
-/// 各候補を read→FontFace.init まで試し、最初に成功したものを返す。
-/// FileNotFound は静かに次へ。それ以外（権限/IO/parse 失敗）はログして次候補へ。
-fn loadFace(io: std.Io, alloc: std.mem.Allocator) ?Loaded {
-    for (font_paths) |path| {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch |err| {
-            if (err != error.FileNotFound) std.debug.print("font read {s}: {s}\n", .{ path, @errorName(err) });
-            continue;
-        };
-        const face = fontmod.FontFace.init(bytes) catch |err| {
-            std.debug.print("font parse {s}: {s}\n", .{ path, @errorName(err) });
-            alloc.free(bytes);
-            continue;
-        };
-        std.debug.print("font: loaded {s} ({d} bytes)\n", .{ path, bytes.len });
-        return .{ .bytes = bytes, .face = face };
-    }
-    return null;
-}
-
 pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -96,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
     defer window.destroy();
 
     // フォント bytes は FontFace より長命であること（main 寿命で保持）。
-    const loaded = loadFace(init.io, allocator);
+    const loaded = fontmod.loadSystemTextFace(init.io, allocator);
     defer if (loaded) |l| allocator.free(l.bytes);
     if (loaded == null) std.debug.print("no usable system .ttf found; window will be blank.\n", .{});
 

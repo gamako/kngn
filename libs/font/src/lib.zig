@@ -22,6 +22,7 @@ pub const hvar = @import("hvar.zig");
 pub const var_common = @import("var_common.zig");
 pub const ivs = @import("ivs.zig");
 pub const text_layer = @import("text_layer.zig");
+pub const system_font = @import("system_font.zig");
 
 // pixel/geom プリミティブ（gui が再エクスポートする正準定義）
 pub const Rect = geom.Rect;
@@ -44,6 +45,9 @@ pub const CovClip = font.CovClip;
 pub const TextLayer = text_layer.TextLayer;
 pub const renderTextLayer = text_layer.renderTextLayer;
 pub const default_font_bytes = text_layer.default_font_bytes;
+pub const LoadedSystemFontFace = system_font.LoadedFace;
+pub const loadSystemTextFace = system_font.loadSystemTextFace;
+pub const loadSystemTextFontBytes = system_font.loadSystemTextFontBytes;
 
 // sfnt(TrueType/OpenType) コンテナ + cmap + glyf アウトライン
 pub const SfntFile = sfnt.SfntFile;
@@ -81,4 +85,11 @@ test {
     _ = var_common;
     _ = ivs;
     _ = text_layer;
+    _ = system_font;
+}
+
+test "system_font public exports are reachable" {
+    _ = LoadedSystemFontFace;
+    _ = loadSystemTextFace;
+    _ = loadSystemTextFontBytes;
 }

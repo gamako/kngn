@@ -82,6 +82,8 @@
             pkgs.xdotool
             # ファイルダイアログ (TASK-28.4)
             pkgs.zenity
+            # system font 動的解決 (TASK-85): fc-match
+            pkgs.fontconfig
             # L1 オーディオ出力 (TASK-28.7 / 28.7.1): ALSA (libasound) を audio exe にリンク。
             # host(nixos-unstable)の pipewire プラグイン版に合わせ alsa-lib だけ unstable から取得する
             # （25.11 の 1.2.14 では plugin dlopen 失敗で NoDevice。詳細は nixpkgs-audio input のコメント）。

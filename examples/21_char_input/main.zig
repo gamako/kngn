@@ -30,50 +30,6 @@ const fontmod = @import("font");
 
 const MAX_BYTES = 512;
 
-/// 試行する system フォントパス（example_12 と同一の候補群。日本語 .ttc 優先→ASCII フォールバック。
-/// 候補を揃えることで「example_12 は描けるが 21 は of==null」という環境差を避ける）。
-const font_paths = [_][]const u8{
-    // macOS: 日本語 .ttc（ASCII も含むので 1 本で混在描画可）→ ASCII フォールバック
-    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-    "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
-    "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
-    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
-    "/Library/Fonts/Arial.ttf",
-    // Windows: 日本語 → ASCII
-    "C:/Windows/Fonts/YuGothM.ttc",
-    "C:/Windows/Fonts/meiryo.ttc",
-    "C:/Windows/Fonts/msgothic.ttc",
-    "C:/Windows/Fonts/arial.ttf",
-    "C:/Windows/Fonts/segoeui.ttf",
-    "C:/Windows/Fonts/consola.ttf",
-    // Linux（Ubuntu / nix）: 日本語(CJK) → ASCII
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-};
-
-const Loaded = struct { bytes: []u8, face: fontmod.FontFace };
-
-/// 各候補を read→FontFace.init まで試し、最初に成功したものを返す（example_12 と同じ）。
-fn loadFace(io: std.Io, alloc: std.mem.Allocator) ?Loaded {
-    for (font_paths) |path| {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch |err| {
-            if (err != error.FileNotFound) std.debug.print("font read {s}: {s}\n", .{ path, @errorName(err) });
-            continue;
-        };
-        const face = fontmod.FontFace.init(bytes) catch |err| {
-            std.debug.print("font parse {s}: {s}\n", .{ path, @errorName(err) });
-            alloc.free(bytes);
-            continue;
-        };
-        std.debug.print("font: loaded {s} ({d} bytes)\n", .{ path, bytes.len });
-        return .{ .bytes = bytes, .face = face };
-    }
-    return null;
-}
-
 /// 入力状態（`chars` probe の ctx）。buf は UTF-8。改行は '\n' をそのまま格納し描画側で分割する。
 const State = struct {
     buf: [MAX_BYTES]u8 = undefined,
@@ -129,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
     defer window.destroy();
 
     // フォント bytes は FontFace より長命であること（main 寿命で保持）。
-    const loaded = loadFace(init.io, allocator);
+    const loaded = fontmod.loadSystemTextFace(init.io, allocator);
     defer if (loaded) |l| allocator.free(l.bytes);
     if (loaded == null) std.debug.print("no usable system font found; text will not render (chars probe still works).\n", .{});
     var face: ?fontmod.FontFace = if (loaded) |l| l.face else null;

@@ -25,46 +25,12 @@ const Color = fontmod.Color;
 const RenderTarget = fontmod.RenderTarget;
 const Rect = fontmod.Rect;
 
-// テキスト face の候補（12_outline_font と同じ流儀。日本語優先→ASCII フォールバック）。
-const text_font_paths = [_][]const u8{
-    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-    "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
-    "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    "/Library/Fonts/Arial.ttf",
-    "C:/Windows/Fonts/YuGothM.ttc",
-    "C:/Windows/Fonts/meiryo.ttc",
-    "C:/Windows/Fonts/arial.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-};
-
 // Apple Color Emoji（macOS 標準搭載。再配布はしない・runtime 読込のみ）。
 const emoji_font_path = "/System/Library/Fonts/Apple Color Emoji.ttc";
 
 const target_emoji_cp = "\u{1F600}"; // 😀 default emoji presentation の単一 codepoint
 
-const Loaded = struct { bytes: []u8, face: fontmod.FontFace };
-
-/// 候補パスを順に read→FontFace.init まで試し、最初に成功したものを返す。
-/// FileNotFound は静かに次へ。それ以外（権限/IO/parse 失敗）はログして次候補へ。
-fn loadFaceFromCandidates(io: std.Io, alloc: std.mem.Allocator, paths: []const []const u8) ?Loaded {
-    for (paths) |path| {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch |err| {
-            if (err != error.FileNotFound) std.debug.print("font read {s}: {s}\n", .{ path, @errorName(err) });
-            continue;
-        };
-        const face = fontmod.FontFace.init(bytes) catch |err| {
-            std.debug.print("font parse {s}: {s}\n", .{ path, @errorName(err) });
-            alloc.free(bytes);
-            continue;
-        };
-        std.debug.print("font: loaded {s} ({d} bytes)\n", .{ path, bytes.len });
-        return .{ .bytes = bytes, .face = face };
-    }
-    return null;
-}
+const Loaded = fontmod.LoadedSystemFontFace;
 
 /// 単一パスを read→FontFace.init する（Apple Color Emoji 専用。候補リスト無し）。
 fn loadSingleFace(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?Loaded {
@@ -128,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     defer window.destroy();
 
     // テキスト face（ASCII/日本語）。
-    const text_loaded = loadFaceFromCandidates(init.io, allocator, &text_font_paths);
+    const text_loaded = fontmod.loadSystemTextFace(init.io, allocator);
     defer if (text_loaded) |l| allocator.free(l.bytes);
     if (text_loaded == null) std.debug.print("no usable system text font found; labels will be blank.\n", .{});
     var text_face: ?fontmod.FontFace = if (text_loaded) |l| l.face else null;
