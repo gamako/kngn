@@ -53,12 +53,21 @@ pub const PaintDiff = struct {
     diffs: []PixelDiff,
 };
 
+/// 対称描画モード（TASK-90）。軸はキャンバス中心相当: 鏡像 x' = (w-1)-x / y' = (h-1)-y
+/// （偶数サイズでも定義が一意。テストで固定）。
+pub const Symmetry = enum { off, vertical, horizontal, quad };
+
 /// stroke 記録機械。canvas は所有せず、point/lineTo/stamp に都度渡す。
 /// 2 つの記録経路を持つ:
 /// - replace（Pen/Eraser）: begin/point/lineTo/finish。色を単純置換し stroke_seen で dedup。
 /// - brush（ソフトブラシ）: brushBegin/stamp/stampLineTo/brushFinish。coverage の max を原本へ src-over
 ///   再合成（均一不透明度・ビルドアップなし）。brush は stroke_seen を使わず coverage==0 を初回番兵にする。
 /// mode で経路を分離し、誤用（begin 後に stamp 等）を debug assert で検出する。
+///
+/// TASK-90 拡張（**デフォルト off で既存挙動 bit 不変**）:
+/// - `pixel_perfect`: replace 経路のみ。直近 3 点が L 字なら中間画素を un-plot（Aseprite 方式）。
+///   size=1 Pen 向けフラグを App が立てる（recorder は size を知らない）。
+/// - `symmetry`: begin/brushBegin で latch。point/lineTo/stamp が鏡像点も plot。
 pub const StrokeRecorder = struct {
     stroke_seen: []bool, // replace 経路の dedup
     coverage: []u8, // brush 経路の coverage（非 active 時は全 0 不変）
@@ -70,6 +79,15 @@ pub const StrokeRecorder = struct {
     layer_idx: usize = 0,
     last: Vec2 = .{ .x = 0, .y = 0 },
     mode: Mode = .none,
+    /// 次 stroke 用設定（begin/brushBegin で latch。デフォルト off = 既存 bit 一致）
+    pixel_perfect: bool = false,
+    symmetry: Symmetry = .off,
+    /// stroke 中に有効な latch 値（begin/brushBegin でコピー）
+    pp_active: bool = false,
+    sym_active: Symmetry = .off,
+    /// pixel_perfect 用の直近点履歴（primary 座標のみ。最大 2 点保持 + 新規で 3 点判定）
+    pp_hist: [2]Vec2 = .{ .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 } },
+    pp_hist_len: u8 = 0,
 
     pub const Mode = enum { none, replace, brush };
 
@@ -93,21 +111,30 @@ pub const StrokeRecorder = struct {
         gpa.free(self.orig);
     }
 
+    /// 対称軸の鏡像 X（w は canvas.width。軸定義: x' = (w-1)-x）
+    pub fn mirrorX(x: i32, w: i32) i32 {
+        return (w - 1) - x;
+    }
+    pub fn mirrorY(y: i32, h: i32) i32 {
+        return (h - 1) - y;
+    }
+
     /// replace stroke を開始する。対象レイヤと色を latch し、dedup ビットマップを reset する。
     /// 始点の描画は呼び出し側が直後に `point` で行う（onEvent(.down) の責務）。
+    /// `pixel_perfect` / `symmetry` はこの時点のフィールド値を latch する（TASK-90）。
     pub fn begin(self: *StrokeRecorder, layer_idx: usize, color: u32) void {
         std.debug.assert(self.mode == .none);
         @memset(self.stroke_seen, false);
         self.mode = .replace;
         self.layer_idx = layer_idx;
         self.color = color;
+        self.pp_active = self.pixel_perfect;
+        self.sym_active = self.symmetry;
+        self.pp_hist_len = 0;
     }
 
-    /// 1px 塗り + diff 記録。canvas 外は無視（clip）。同一 stroke 内の再塗りは
-    /// 最初の before のみ記録する（undo の正しさ）。記録後 `last` を更新。
-    pub fn point(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
-        std.debug.assert(self.mode == .replace);
-        self.last = .{ .x = x, .y = y };
+    /// 1 画素の塗り + diff 記録（対称・pixel_perfect なしの素の path）。
+    fn plotOne(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
         if (x < 0 or y < 0) return;
         const ux: u32 = @intCast(x);
         const uy: u32 = @intCast(y);
@@ -123,9 +150,112 @@ pub const StrokeRecorder = struct {
                 .idx = @intCast(idx),
                 .before = before,
                 .after = self.color,
-            }) catch @panic("StrokeRecorder.point: OOM");
+            }) catch @panic("StrokeRecorder.plotOne: OOM");
         }
         pixels[idx] = self.color;
+    }
+
+    /// 対称を含む plot（replace 経路）。
+    fn plotWithSymmetry(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
+        self.plotOne(canvas, gpa, x, y);
+        const w: i32 = @intCast(canvas.width);
+        const h: i32 = @intCast(canvas.height);
+        switch (self.sym_active) {
+            .off => {},
+            .vertical => self.plotOne(canvas, gpa, mirrorX(x, w), y),
+            .horizontal => self.plotOne(canvas, gpa, x, mirrorY(y, h)),
+            .quad => {
+                const mx = mirrorX(x, w);
+                const my = mirrorY(y, h);
+                self.plotOne(canvas, gpa, mx, y);
+                self.plotOne(canvas, gpa, x, my);
+                self.plotOne(canvas, gpa, mx, my);
+            },
+        }
+    }
+
+    /// この stroke で塗った画素を before へ戻し、diff から除去（pixel_perfect un-plot）。
+    fn unplotOne(self: *StrokeRecorder, canvas: *Canvas, x: i32, y: i32) void {
+        if (x < 0 or y < 0) return;
+        const ux: u32 = @intCast(x);
+        const uy: u32 = @intCast(y);
+        if (ux >= canvas.width or uy >= canvas.height) return;
+        const idx: u32 = @intCast(uy * canvas.width + ux);
+        const pixels = canvas.layerPixels(self.layer_idx);
+        var i: usize = 0;
+        while (i < self.diffs.items.len) : (i += 1) {
+            if (self.diffs.items[i].idx == idx) {
+                pixels[idx] = self.diffs.items[i].before;
+                _ = self.diffs.swapRemove(i);
+                self.stroke_seen[idx] = false;
+                return;
+            }
+        }
+    }
+
+    fn unplotWithSymmetry(self: *StrokeRecorder, canvas: *Canvas, x: i32, y: i32) void {
+        self.unplotOne(canvas, x, y);
+        const w: i32 = @intCast(canvas.width);
+        const h: i32 = @intCast(canvas.height);
+        switch (self.sym_active) {
+            .off => {},
+            .vertical => self.unplotOne(canvas, mirrorX(x, w), y),
+            .horizontal => self.unplotOne(canvas, x, mirrorY(y, h)),
+            .quad => {
+                const mx = mirrorX(x, w);
+                const my = mirrorY(y, h);
+                self.unplotOne(canvas, mx, y);
+                self.unplotOne(canvas, x, my);
+                self.unplotOne(canvas, mx, my);
+            },
+        }
+    }
+
+    /// 直近 3 点が L 字（直交する 1px 隣接 2 辺）なら中間画素を un-plot。
+    /// 対称 ON 時は中間の鏡像も戻す（併用仕様をテストで固定）。
+    fn afterPlotPixelPerfect(self: *StrokeRecorder, canvas: *Canvas, x: i32, y: i32) void {
+        if (!self.pp_active) return;
+        const c = Vec2{ .x = x, .y = y };
+        if (self.pp_hist_len < 2) {
+            if (self.pp_hist_len == 1 and self.pp_hist[0].x == c.x and self.pp_hist[0].y == c.y) return;
+            self.pp_hist[self.pp_hist_len] = c;
+            self.pp_hist_len += 1;
+            return;
+        }
+        const a = self.pp_hist[0];
+        const b = self.pp_hist[1];
+        if (b.x == c.x and b.y == c.y) return; // 同一点は履歴を進めない
+        if (isLShape(a, b, c)) {
+            self.unplotWithSymmetry(canvas, b.x, b.y);
+            self.pp_hist[0] = a;
+            self.pp_hist[1] = c;
+            // len stays 2
+        } else {
+            self.pp_hist[0] = b;
+            self.pp_hist[1] = c;
+        }
+    }
+
+    /// a→b→c が 1px 直交 L 字か（Aseprite pixel-perfect）。
+    fn isLShape(a: Vec2, b: Vec2, c: Vec2) bool {
+        const dax = b.x - a.x;
+        const day = b.y - a.y;
+        const dbx = c.x - b.x;
+        const dby = c.y - b.y;
+        if (@abs(dax) + @abs(day) != 1) return false;
+        if (@abs(dbx) + @abs(dby) != 1) return false;
+        // 直交（内積 0）かつ直進でない
+        return dax * dbx + day * dby == 0;
+    }
+
+    /// 1px 塗り + diff 記録。canvas 外は無視（clip）。同一 stroke 内の再塗りは
+    /// 最初の before のみ記録する（undo の正しさ）。記録後 `last` を更新。
+    /// 対称・pixel_perfect は begin で latch した値に従う（TASK-90）。
+    pub fn point(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
+        std.debug.assert(self.mode == .replace);
+        self.last = .{ .x = x, .y = y };
+        self.plotWithSymmetry(canvas, gpa, x, y);
+        self.afterPlotPixelPerfect(canvas, x, y);
     }
 
     /// `last` から (x,y) まで Bresenham 補間で塗る。座標は canvas 外でもよい（clip）。
@@ -163,6 +293,9 @@ pub const StrokeRecorder = struct {
     pub fn finish(self: *StrokeRecorder, gpa: Allocator) ?PaintDiff {
         std.debug.assert(self.mode == .replace);
         self.mode = .none;
+        self.pp_active = false;
+        self.sym_active = .off;
+        self.pp_hist_len = 0;
         if (self.diffs.items.len == 0) return null;
         // toOwnedSlice でなく exact コピー + capacity 維持（次 stroke がゼロから再成長しない。TASK-59）
         const owned = gpa.dupe(PixelDiff, self.diffs.items) catch @panic("StrokeRecorder.finish: OOM");
@@ -175,6 +308,7 @@ pub const StrokeRecorder = struct {
     // ビルドアップが起きず、ドラッグ中も layer に即時プレビューされる。確定は brushFinish。
 
     /// brush stroke を開始する。layer/color/opacity を latch。touched は空前提（不変条件）。
+    /// symmetry を latch（pixel_perfect は brush 経路では無視）。
     pub fn brushBegin(self: *StrokeRecorder, layer_idx: usize, color: u32, opacity: u8) void {
         std.debug.assert(self.mode == .none);
         std.debug.assert(self.touched.items.len == 0);
@@ -182,6 +316,8 @@ pub const StrokeRecorder = struct {
         self.layer_idx = layer_idx;
         self.color = color;
         self.opacity = opacity;
+        self.pp_active = false; // brush では pixel_perfect 無効
+        self.sym_active = self.symmetry;
     }
 
     fn scaleU8(a: u8, b: u8) u8 {
@@ -209,13 +345,35 @@ pub const StrokeRecorder = struct {
         pixels[idx] = blend.srcOver(self.orig[idx], src); // 常に原本へ再合成
     }
 
-    /// dab を中心 (cx,cy) に置く。last を (cx,cy) に更新。
-    pub fn stamp(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, cx: i32, cy: i32, dab: Dab) void {
-        std.debug.assert(self.mode == .brush);
+    fn stampOne(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, cx: i32, cy: i32, dab: Dab) void {
         for (dab.offsets) |o| {
             self.applyCoverage(canvas, gpa, cx + o.dx, cy + o.dy, o.cov);
         }
+    }
+
+    /// dab を中心 (cx,cy) に置く。last を (cx,cy) に更新。対称 ON なら鏡像中心にも stamp。
+    pub fn stamp(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, cx: i32, cy: i32, dab: Dab) void {
+        std.debug.assert(self.mode == .brush);
+        self.stampWithSymmetry(canvas, gpa, cx, cy, dab);
         self.last = .{ .x = cx, .y = cy };
+    }
+
+    fn stampWithSymmetry(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, cx: i32, cy: i32, dab: Dab) void {
+        self.stampOne(canvas, gpa, cx, cy, dab);
+        const w: i32 = @intCast(canvas.width);
+        const h: i32 = @intCast(canvas.height);
+        switch (self.sym_active) {
+            .off => {},
+            .vertical => self.stampOne(canvas, gpa, mirrorX(cx, w), cy, dab),
+            .horizontal => self.stampOne(canvas, gpa, cx, mirrorY(cy, h), dab),
+            .quad => {
+                const mx = mirrorX(cx, w);
+                const my = mirrorY(cy, h);
+                self.stampOne(canvas, gpa, mx, cy, dab);
+                self.stampOne(canvas, gpa, cx, my, dab);
+                self.stampOne(canvas, gpa, mx, my, dab);
+            },
+        }
     }
 
     /// last から (x,y) まで Bresenham 経路の各中心点へ dab をスタンプ。座標は canvas 外でもよい。
@@ -231,7 +389,7 @@ pub const StrokeRecorder = struct {
         const sy: i32 = if (y0 < y) 1 else -1;
         var err: i32 = @as(i32, @intCast(dx)) - @as(i32, @intCast(dy));
         while (true) {
-            for (dab.offsets) |o| self.applyCoverage(canvas, gpa, cx + o.dx, cy + o.dy, o.cov);
+            self.stampWithSymmetry(canvas, gpa, cx, cy, dab);
             if (cx == x and cy == y) break;
             const e2 = 2 * err;
             if (e2 > -@as(i32, @intCast(dy))) {
@@ -251,6 +409,7 @@ pub const StrokeRecorder = struct {
     pub fn brushFinish(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator) ?PaintDiff {
         std.debug.assert(self.mode == .brush);
         self.mode = .none;
+        self.sym_active = .off;
         const pixels = canvas.layerPixels(self.layer_idx);
         // 上限 = touched 数。事前確保してループ内の再確保を排除（TASK-59）
         self.diffs.ensureTotalCapacity(gpa, self.touched.items.len) catch @panic("StrokeRecorder.brushFinish: OOM");
@@ -280,6 +439,9 @@ pub const StrokeRecorder = struct {
                 for (self.diffs.items) |d| pixels[d.idx] = d.before;
                 self.diffs.clearRetainingCapacity();
                 self.mode = .none;
+                self.pp_active = false;
+                self.sym_active = .off;
+                self.pp_hist_len = 0;
             },
             .brush => {
                 const pixels = canvas.layerPixels(self.layer_idx);
@@ -289,6 +451,7 @@ pub const StrokeRecorder = struct {
                 }
                 self.touched.clearRetainingCapacity();
                 self.mode = .none;
+                self.sym_active = .off;
             },
         }
     }
@@ -726,4 +889,110 @@ test "StrokeRecorder: abandon は preview を巻き戻し mode=.none" {
     const pd = rec.finish(gpa).?;
     defer gpa.free(pd.diffs);
     try std.testing.expectEqual(RED, c.layerPixels(0)[0]);
+}
+
+// ── pixel_perfect / symmetry（TASK-90）─────────────────────────
+
+test "pixel_perfect: L 字の中間画素が残らない・before 復元（undo diff 整合）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    // 中間になる画素に既存色を置いて before 復元を検証
+    const CORNER_BEFORE: u32 = 0xFF00FF00;
+    c.layerPixels(0)[1 * 8 + 1] = CORNER_BEFORE;
+
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    rec.pixel_perfect = true;
+    rec.begin(0, RED);
+    // (0,0) → (1,0) → (1,1) は L 字。中間 (1,0) が un-plot される
+    rec.point(&c, gpa, 0, 0);
+    rec.point(&c, gpa, 1, 0);
+    rec.point(&c, gpa, 1, 1);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[0 * 8 + 0]);
+    try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[0 * 8 + 1]); // (1,0) un-plot → transparent
+    try std.testing.expectEqual(RED, c.layerPixels(0)[1 * 8 + 1]); // (1,1) は塗られる（既存 CORNER を上書き）
+
+    const pd = rec.finish(gpa).?;
+    defer gpa.free(pd.diffs);
+    // (1,0) は diffs に残らない
+    for (pd.diffs) |d| {
+        try std.testing.expect(d.idx != 0 * 8 + 1);
+    }
+    // undo 相当: before 復元で CORNER_BEFORE が戻る
+    applyDiffsBefore(c.layerPixels(0), pd.diffs);
+    try std.testing.expectEqual(CORNER_BEFORE, c.layerPixels(0)[1 * 8 + 1]);
+    try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[0]);
+}
+
+test "pixel_perfect off: L 字でも 3 点すべて残る（デフォルト bit 互換）" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    // pixel_perfect 既定 false
+    rec.begin(0, RED);
+    rec.point(&c, gpa, 0, 0);
+    rec.point(&c, gpa, 1, 0);
+    rec.point(&c, gpa, 1, 1);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[0 * 8 + 1]); // 中間が残る
+    if (rec.finish(gpa)) |pd| gpa.free(pd.diffs);
+}
+
+test "symmetry vertical: 偶数 canvas の軸定義 mirrorX=(w-1)-x" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8); // 偶数
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    rec.symmetry = .vertical;
+    rec.begin(0, RED);
+    rec.point(&c, gpa, 1, 2);
+    // mirror of 1 on w=8 is 6
+    try std.testing.expectEqual(@as(i32, 6), StrokeRecorder.mirrorX(1, 8));
+    try std.testing.expectEqual(RED, c.layerPixels(0)[2 * 8 + 1]);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[2 * 8 + 6]);
+    if (rec.finish(gpa)) |pd| gpa.free(pd.diffs);
+}
+
+test "symmetry quad: 4 点が塗られる" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    rec.symmetry = .quad;
+    rec.begin(0, RED);
+    rec.point(&c, gpa, 1, 2);
+    const mx = StrokeRecorder.mirrorX(1, 8);
+    const my = StrokeRecorder.mirrorY(2, 8);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[2 * 8 + 1]);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[2 * 8 + @as(usize, @intCast(mx))]);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[@as(usize, @intCast(my)) * 8 + 1]);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[@as(usize, @intCast(my)) * 8 + @as(usize, @intCast(mx))]);
+    if (rec.finish(gpa)) |pd| gpa.free(pd.diffs);
+}
+
+test "pixel_perfect + symmetry: L 字 un-plot が鏡像も戻す" {
+    const gpa = std.testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8);
+    defer c.deinit();
+    var rec = try StrokeRecorder.init(gpa, 8, 8);
+    defer rec.deinit(gpa);
+    rec.pixel_perfect = true;
+    rec.symmetry = .vertical;
+    rec.begin(0, RED);
+    rec.point(&c, gpa, 0, 0);
+    rec.point(&c, gpa, 1, 0);
+    rec.point(&c, gpa, 1, 1);
+    // primary 中間 (1,0) と鏡像 (6,0) が un-plot
+    try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[0 * 8 + 1]);
+    try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[0 * 8 + 6]);
+    // 端点と鏡像は残る
+    try std.testing.expectEqual(RED, c.layerPixels(0)[0 * 8 + 0]);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[0 * 8 + 7]); // mirror of 0
+    try std.testing.expectEqual(RED, c.layerPixels(0)[1 * 8 + 1]);
+    try std.testing.expectEqual(RED, c.layerPixels(0)[1 * 8 + 6]);
+    if (rec.finish(gpa)) |pd| gpa.free(pd.diffs);
 }

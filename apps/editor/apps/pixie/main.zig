@@ -30,6 +30,8 @@ const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
 const selection_input = @import("selection_input.zig");
 const selection_overlay = @import("selection_overlay.zig");
+const shape_input = @import("shape_input.zig");
+const shape_overlay = @import("shape_overlay.zig");
 const eyedropper_input = @import("eyedropper_input.zig");
 const brush_edge_cache = @import("brush_edge_cache.zig");
 const cursor_overlay = @import("cursor_overlay.zig");
@@ -192,6 +194,9 @@ const ToolKind = enum {
     select,
     fill,
     eyedropper,
+    line,
+    rect,
+    ellipse,
 
     fn name(self: ToolKind) []const u8 {
         return switch (self) {
@@ -202,6 +207,9 @@ const ToolKind = enum {
             .select => "Select",
             .fill => "Fill",
             .eyedropper => "Eyedropper",
+            .line => "Line",
+            .rect => "Rect",
+            .ellipse => "Ellipse",
         };
     }
 
@@ -216,7 +224,14 @@ const ToolKind = enum {
             .select => .{ .label = "Sl", .color = gui.Color.rgba(0xB8, 0x9A, 0x16, 0xFF) },
             .fill => .{ .label = "Fl", .color = gui.Color.rgba(0x2E, 0x9E, 0x52, 0xFF) },
             .eyedropper => .{ .label = "Ey", .color = gui.Color.rgba(0x7A, 0x4A, 0xC9, 0xFF) },
+            .line => .{ .label = "Ln", .color = gui.Color.rgba(0x4A, 0x7A, 0xC9, 0xFF) },
+            .rect => .{ .label = "Rc", .color = gui.Color.rgba(0x5A, 0x9E, 0x7A, 0xFF) },
+            .ellipse => .{ .label = "El", .color = gui.Color.rgba(0x9E, 0x6A, 0xC9, 0xFF) },
         };
+    }
+
+    fn isShape(self: ToolKind) bool {
+        return self == .line or self == .rect or self == .ellipse;
     }
 };
 
@@ -308,6 +323,12 @@ const App = struct {
     bez_in: bezier_input.BezierInput = .{},
     /// 範囲選択ツール（独立経路。TASK-44）。マーキー作成 / 選択範囲移動の状態機械。
     sel_in: selection_input.SelectionInput = .{},
+    /// シェイプツール（独立経路。TASK-90）。Line/Rect/Ellipse の press→drag→release。
+    shape_in: shape_input.ShapeInput = .{},
+    /// ピクセルパーフェクト線（Pen size=1 のみ有効。StrokeRecorder へ反映。TASK-90）。
+    pixel_perfect: bool = false,
+    /// 対称描画（StrokeRecorder へ反映。Pen/Eraser/Brush/Shape 全部に効く。TASK-90）。
+    symmetry: core.Symmetry = .off,
     /// スポイトツール（独立経路。TASK-68）。press-capture の最小状態機械（塗り操作が無いため
     /// Tool vtable / StrokeRecorder / Undo は不要）。専用ツール選択・Alt+クリック一時スポイトの両方で使う。
     eye_in: eyedropper_input.EyedropperInput = .{},
@@ -460,18 +481,39 @@ const App = struct {
             .select => self.pen.tool(), // select も独立経路（到達しないフォールバック）
             .fill => self.fill.tool(),
             .eyedropper => self.pen.tool(), // eyedropper も独立経路（到達しないフォールバック。actionStroke で明示的に弾く）
+            .line, .rect, .ellipse => self.pen.tool(), // shape も独立経路（到達しないフォールバック）
         };
     }
 
+    /// StrokeRecorder に UI の pixel_perfect / symmetry を反映する（stroke/shape 開始前に呼ぶ）。
+    /// pixel_perfect は Pen のみ（size=1 固定の現状 Pen）。
+    fn syncRecorderModes(self: *App) void {
+        self.recorder.pixel_perfect = self.pixel_perfect and self.active_kind == .pen;
+        self.recorder.symmetry = self.symmetry;
+    }
+
     /// ツール切替を一元化（active_kind への代入は全てここ経由）。
-    /// capture / 選択ドラッグ / スポイト picking 中は切替しない（進行中操作を宙ぶらりんにしない）。
+    /// capture / 選択ドラッグ / シェイプドラッグ / スポイト picking 中は切替しない（進行中操作を宙ぶらりんにしない）。
     /// .bezier から出る時は未確定パスを cancel。.select から出る時は進行中ドラッグを破棄（selection は保持）。
+    /// シェイプから出る時は進行中ドラッグを cancel。
     fn setActiveKind(self: *App, next: ToolKind) void {
-        if (self.input.capturing or self.sel_in.state != .idle or self.eye_in.picking) return;
+        if (self.input.capturing or self.sel_in.state != .idle or self.shape_in.state != .idle or self.eye_in.picking) return;
         if (self.active_kind == .bezier and next != .bezier) {
             self.bezier_editor.update(self.gpa, .cancel);
         }
+        if (self.active_kind.isShape() and !next.isShape()) {
+            self.shape_in.cancel();
+        }
         if (next != .select) self.sel_in.discardFloat(self.gpa); // 選択ツールを離れる → フロート破棄（canvas は最終形のまま）
+        // shape ツール種別を shape_in へ同期
+        if (next.isShape()) {
+            self.shape_in.kind = switch (next) {
+                .line => .line,
+                .rect => .rect,
+                .ellipse => .ellipse,
+                else => unreachable,
+            };
+        }
         self.active_kind = next;
     }
 
@@ -502,7 +544,7 @@ const App = struct {
     }
 
     fn editingBlocked(self: *const App) bool {
-        return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle;
+        return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle or self.shape_in.state != .idle;
     }
 
     /// netsync 中に editingBlocked なら、ローカル編集（capture / bezier / select ドラッグ）を
@@ -537,6 +579,9 @@ const App = struct {
             // ESC ドラッグ中断と同じ（実レイヤーは drag 中不変 → 画素巻き戻し不要）。
             self.sel_in.cancel(self.gpa);
         }
+        if (self.shape_in.state != .idle) {
+            self.shape_in.cancel(); // プレビューのみ・canvas 非汚染
+        }
         self.setSaveMsg("netsync: 進行中の編集は相手の操作適用のため中断されました", .{});
     }
 
@@ -546,7 +591,7 @@ const App = struct {
     /// `brush_edges.refresh()`（Brush.footprint() 経由で buildDab を再実行する）が Brush ストローク中に
     /// 呼ばれることも無くなり、「footprint は down 時に latch・stroke 中不変」という既存契約を壊さない。
     fn isPointerBusy(self: *const App) bool {
-        return self.input.capturing or self.sel_in.state != .idle or self.bez_in.in_drag or self.pan_active or self.eye_in.picking;
+        return self.input.capturing or self.sel_in.state != .idle or self.shape_in.state != .idle or self.bez_in.in_drag or self.pan_active or self.eye_in.picking;
     }
 
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
@@ -778,6 +823,54 @@ const App = struct {
         const pixels = self.canvas.layerPixels(pd.layer_idx);
         for (pd.diffs) |d| pixels[d.idx] = d.before;
         self.gpa.free(pd.diffs);
+    }
+
+    /// UI shape 確定の CommandRecord 記録（TASK-90。actor=local_user）。
+    fn recordUiShape(self: *App, pushed: bool) void {
+        var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+        const canon = actions.formatCanonicalShape(&canon_buf, .{
+            .kind = switch (self.shape_in.kind) {
+                .line => .line,
+                .rect => .rect,
+                .ellipse => .ellipse,
+            },
+            .p0 = .{ .x = self.shape_in.anchor.x, .y = self.shape_in.anchor.y },
+            .p1 = .{ .x = self.shape_in.cur.x, .y = self.shape_in.cur.y },
+            .fill = self.shape_in.fill,
+        }) catch {
+            std.debug.print("pixie: UI shape の記録を skip（canonical args 超過）\n", .{});
+            return;
+        };
+        const undo_ref: ?u64 = if (pushed) self.doc.undo.topHandle() else null;
+        var msg_buf: [64]u8 = undefined;
+        _ = self.cmd_exec.recordExecuted("shape", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
+            std.debug.print("pixie: UI shape の記録に失敗: {s}\n", .{@errorName(err)});
+            return;
+        };
+        if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER);
+        self.last_seen_handle = self.doc.undo.next_handle;
+    }
+
+    /// netsync 中 UI shape 確定: 巻き戻し済み → routeAction("shape")。
+    fn relayUiShape(self: *App) void {
+        var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+        const canon = actions.formatCanonicalShape(&canon_buf, .{
+            .kind = switch (self.shape_in.kind) {
+                .line => .line,
+                .rect => .rect,
+                .ellipse => .ellipse,
+            },
+            .p0 = .{ .x = self.shape_in.anchor.x, .y = self.shape_in.anchor.y },
+            .p1 = .{ .x = self.shape_in.cur.x, .y = self.shape_in.cur.y },
+            .fill = self.shape_in.fill,
+        }) catch {
+            std.debug.print("pixie: netsync UI shape を skip（canonical args 超過）\n", .{});
+            return;
+        };
+        var out_buf: [256]u8 = undefined;
+        _ = platform.routeAction("shape", canon, &out_buf) catch |err| {
+            std.debug.print("pixie: netsync UI shape routeAction 失敗: {s}\n", .{@errorName(err)});
+        };
     }
 
     /// netsync 中 UI stroke 確定: 巻き戻し → canonical args で routeAction("stroke")。
@@ -1246,6 +1339,68 @@ const App = struct {
         };
     }
 
+    /// シェイプを 1 回描画して UndoStack へ push（TASK-90）。UI 確定 / action shape が共有。
+    /// pixel_perfect は一時無効。symmetry は recorder 設定に従う。
+    fn doShape(self: *App, kind: actions.ShapeKind, p0: actions.Point, p1: actions.Point, fill: bool) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (self.selectedLayerIsText()) return error.TextLayerSelected;
+        self.syncRecorderModes();
+        const saved_pp = self.recorder.pixel_perfect;
+        self.recorder.pixel_perfect = false;
+        defer self.recorder.pixel_perfect = saved_pp;
+
+        self.recorder.begin(self.canvas.selected_layer, self.palette.current());
+        const PlotCtx = struct {
+            rec: *core.StrokeRecorder,
+            canvas: *core.Canvas,
+            gpa: std.mem.Allocator,
+            fn plot(c: *anyopaque, x: i32, y: i32) void {
+                const s: *@This() = @ptrCast(@alignCast(c));
+                s.rec.point(s.canvas, s.gpa, x, y);
+            }
+        };
+        var pctx: PlotCtx = .{ .rec = &self.recorder, .canvas = self.canvas, .gpa = self.gpa };
+        switch (kind) {
+            .line => core.plotLine(p0.x, p0.y, p1.x, p1.y, &pctx, PlotCtx.plot),
+            .rect => core.plotRect(p0.x, p0.y, p1.x, p1.y, fill, &pctx, PlotCtx.plot),
+            .ellipse => core.plotEllipse(p0.x, p0.y, p1.x, p1.y, fill, &pctx, PlotCtx.plot),
+        }
+        if (self.recorder.finish(self.gpa)) |pd| {
+            try self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs);
+        }
+    }
+
+    /// 対称描画モードを設定する（TASK-90。UI / action set_symmetry 共通）。
+    fn doSetSymmetry(self: *App, mode: core.Symmetry) void {
+        self.symmetry = mode;
+        self.recorder.symmetry = mode;
+    }
+
+    /// ピクセルパーフェクトを設定する（TASK-90。UI / action set_pixel_perfect 共通）。
+    fn doSetPixelPerfect(self: *App, on: bool) void {
+        self.pixel_perfect = on;
+    }
+
+    /// UI から対称を切替（TASK-94 Phase C: netsync 中は routeAction、solo は do* 直呼び）。
+    fn uiSetSymmetry(self: *App, mode: core.Symmetry) void {
+        const args: []const u8 = switch (mode) {
+            .off => "off",
+            .vertical => "v",
+            .horizontal => "h",
+            .quad => "quad",
+        };
+        if (platform.netsyncActive()) self.routeUi("set_symmetry", args) else self.doSetSymmetry(mode);
+    }
+
+    /// UI から pixel_perfect を切替（netsync 中は routeAction）。
+    fn uiSetPixelPerfect(self: *App, on: bool) void {
+        if (platform.netsyncActive()) {
+            self.routeUi("set_pixel_perfect", if (on) "1" else "0");
+        } else {
+            self.doSetPixelPerfect(on);
+        }
+    }
+
     /// 選択範囲を clipboard へコピー（読み取りのみ・undo 不要）。selection 無しは no-op。
     /// 読み取りのみ（pixels を変更しない）なので text layer 選択中でも許可する（TASK-79.5）。
     fn doCopy(self: *App) void {
@@ -1666,8 +1821,10 @@ const App = struct {
         // （Ctrl+S 等は Linux の保存の慣習にも合致。macOS は従来どおり Cmd で、Ctrl も追加で効く）。
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         if (k.key == .ESCAPE) {
-            // 選択ドラッグ中なら破棄 → 選択(またはフロート)があれば解除 → それ以外は終了（TASK-44 で優先動作を追加）
-            if (self.sel_in.state != .idle) {
+            // シェイプ/選択ドラッグ中なら破棄 → 選択(またはフロート)があれば解除 → それ以外は終了
+            if (self.shape_in.state != .idle) {
+                self.shape_in.cancel();
+            } else if (self.sel_in.state != .idle) {
                 self.sel_in.cancel(self.gpa); // drag 中断（フロート破棄・実レイヤーは drag 中不変）
             } else if (self.canvas.selection != null or self.sel_in.float != null) {
                 self.canvas.clearSelection();
@@ -2266,6 +2423,42 @@ fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return "ok";
 }
 
+/// `action shape <line|rect|ellipse> <p0> <p1> [fill]`（TASK-90）。
+/// `App.doShape` 経由（UI 確定と同じ描画/undo 経路）。agent 操作の undo は `action undo`
+/// （Cmd+Z は local_user 専用のハイブリッド。既存 stroke action と同型）。
+fn actionShape(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    const parsed = try actions.parseShape(args, @intCast(CANVAS_W), @intCast(CANVAS_H));
+    try app.doShape(parsed.kind, parsed.p0, parsed.p1, parsed.fill);
+    return "ok";
+}
+
+/// `action set_symmetry <off|v|h|quad>`（TASK-90）。document 描画に影響 → .relay。
+fn actionSetSymmetry(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    const mode = try actions.parseSymmetry(args);
+    app.doSetSymmetry(switch (mode) {
+        .off => .off,
+        .v => .vertical,
+        .h => .horizontal,
+        .quad => .quad,
+    });
+    return "ok";
+}
+
+/// `action set_pixel_perfect <0|1>`（TASK-90）。Pen 描画に影響 → .relay。
+fn actionSetPixelPerfect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    app.doSetPixelPerfect(try actions.parsePixelPerfect(args));
+    return "ok";
+}
+
 /// canvas 座標の点列を down→move×N→up で直接駆動する（既存 canvas_input と同じ Tool 経路）。
 /// TASK-62.5.3 §5c': `[tool=|color=|size=|opacity=|hardness=]` の k=v 前置を受け、明示された
 /// パラメータを**一時的に latch して実行後に元の App 状態へ復元**する（redo が現在のユーザー
@@ -2566,6 +2759,10 @@ const PIXIE_ACTIONS = [_]ActionEntry{
     .{ .name = "palette_ramp", .run = actionPaletteRamp },
     .{ .name = "palette_from_png", .run = actionPaletteFromPng },
     .{ .name = "palette_set", .run = actionPaletteSet },
+    // TASK-90: 末尾追加のみ
+    .{ .name = "shape", .run = actionShape },
+    .{ .name = "set_symmetry", .run = actionSetSymmetry },
+    .{ .name = "set_pixel_perfect", .run = actionSetPixelPerfect },
 };
 
 /// `App.cmd_exec` の Dispatcher: name→実ハンドラ dispatch + noteUndo 配線（§5b）。
@@ -2797,7 +2994,19 @@ const pixie_args_set_color: @FieldType(platform.Action, "args") = &.{
     .{ .name = "color", .kind = "string", .pattern = "#?RRGGBB" },
 };
 const pixie_args_set_tool: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "tool", .kind = "enum", .values = &.{ "pen", "eraser", "brush", "bezier", "select", "fill", "eyedropper" } },
+    .{ .name = "tool", .kind = "enum", .values = &.{ "pen", "eraser", "brush", "bezier", "select", "fill", "eyedropper", "line", "rect", "ellipse" } },
+};
+const pixie_args_shape: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "kind", .kind = "enum", .values = &.{ "line", "rect", "ellipse" } },
+    .{ .name = "p0", .kind = "string", .pattern = "x,y|anchor", .desc = "x,y or center/top-left/..." },
+    .{ .name = "p1", .kind = "string", .pattern = "x,y|anchor" },
+    .{ .name = "fill", .kind = "enum", .values = &.{"fill"}, .optional = true },
+};
+const pixie_args_set_symmetry: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "mode", .kind = "enum", .values = &.{ "off", "v", "h", "quad" } },
+};
+const pixie_args_set_pixel_perfect: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "on", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
     .{ .name = "xy", .kind = "int", .variadic = true, .desc = "canvas 座標 x y の組（偶数個・最低1組）" },
@@ -2865,6 +3074,12 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "palette_ramp", .ctx = app, .run = recordedAction("palette_ramp", .record), .network_policy = .reject_when_synced, .desc = "OKLCH light-dark ramp from seed (n=2..32)", .args = pixie_args_palette_ramp });
     platform.registerAction(.{ .name = "palette_from_png", .ctx = app, .run = recordedAction("palette_from_png", .record), .network_policy = .reject_when_synced, .desc = "extract palette from PNG by frequency (max 64)", .args = pixie_args_palette_from_png });
     platform.registerAction(.{ .name = "palette_set", .ctx = app, .run = recordedAction("palette_set", .record), .network_policy = .reject_when_synced, .desc = "replace palette with hex list (1..64)", .args = pixie_args_palette_set });
+    // TASK-90: shape は stroke と同じ .relay（document 画素変更・undoable）。
+    // set_symmetry / set_pixel_perfect も描画結果に影響する document 系トグル → .relay
+    // （set_tool / set_color と同型。peer 間で描画モードを共有する）。
+    platform.registerAction(.{ .name = "shape", .ctx = app, .run = recordedAction("shape", .record), .network_policy = .relay, .desc = "draw shape line|rect|ellipse p0 p1 [fill]", .args = pixie_args_shape });
+    platform.registerAction(.{ .name = "set_symmetry", .ctx = app, .run = recordedAction("set_symmetry", .record), .network_policy = .relay, .desc = "symmetry off|v|h|quad", .args = pixie_args_set_symmetry });
+    platform.registerAction(.{ .name = "set_pixel_perfect", .ctx = app, .run = recordedAction("set_pixel_perfect", .record), .network_policy = .relay, .desc = "pixel-perfect pen 0|1", .args = pixie_args_set_pixel_perfect });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -3656,6 +3871,14 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         ctx.beginBox(.{ .direction = .row, .gap = 4 });
         if (ctx.buttonEx("Eyedrop", .{ .selected = app.active_kind == .eyedropper, .min_w = 56 }).clicked) app.setActiveKind(.eyedropper);
         ctx.endBox();
+        // TASK-90: Line / Rect / Ellipse
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Line", .{ .selected = app.active_kind == .line, .min_w = 56 }).clicked) app.setActiveKind(.line);
+        if (ctx.buttonEx("Rect", .{ .selected = app.active_kind == .rect, .min_w = 56 }).clicked) app.setActiveKind(.rect);
+        ctx.endBox();
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Ellipse", .{ .selected = app.active_kind == .ellipse, .min_w = 56 }).clicked) app.setActiveKind(.ellipse);
+        ctx.endBox();
         ctx.labelEx("(Alt+click = temp eyedrop)", ctx.style.text_subtle);
         // paste/move のブロック配置トグル（gui.toggle スイッチ。TASK-48）。
         // ON=透明を保持(src-over・下の絵を残す) / OFF=上書き(replace)。
@@ -3663,6 +3886,34 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         if (ctx.toggle("Keep Transp", &keep_transp)) {
             app.blend_mode = if (keep_transp) .over else .replace;
         }
+        // TASK-90: shape fill / pixel_perfect / symmetry
+        if (app.active_kind == .rect or app.active_kind == .ellipse) {
+            var fill_on = app.shape_in.fill;
+            if (ctx.toggle("Shape Fill", &fill_on)) {
+                app.shape_in.fill = fill_on;
+            }
+        }
+        // TASK-90 + TASK-94 Phase C: netsync 中は routeAction、solo は do* 直呼び
+        var pp_on = app.pixel_perfect;
+        if (ctx.toggle("Pixel Perfect", &pp_on)) {
+            app.uiSetPixelPerfect(pp_on);
+        }
+        // symmetry: Off / V / H / Quad を 1 行ボタン
+        ctx.label("Symmetry");
+        ctx.beginBox(.{ .direction = .row, .gap = 4 });
+        if (ctx.buttonEx("Off", .{ .selected = app.symmetry == .off, .min_w = 36 }).clicked) {
+            app.uiSetSymmetry(.off);
+        }
+        if (ctx.buttonEx("V", .{ .selected = app.symmetry == .vertical, .min_w = 28 }).clicked) {
+            app.uiSetSymmetry(.vertical);
+        }
+        if (ctx.buttonEx("H", .{ .selected = app.symmetry == .horizontal, .min_w = 28 }).clicked) {
+            app.uiSetSymmetry(.horizontal);
+        }
+        if (ctx.buttonEx("Q", .{ .selected = app.symmetry == .quad, .min_w = 28 }).clicked) {
+            app.uiSetSymmetry(.quad);
+        }
+        ctx.endBox();
         // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
         if (app.active_kind == .brush or app.active_kind == .bezier) {
             _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
@@ -4009,9 +4260,40 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                         .released_left = in.mouse_released.left,
                         .time = platform.getTime(),
                     };
+                    self.syncRecorderModes();
                     const dab = self.brush.footprint();
                     if (self.bez_in.update(frame, &self.bezier_editor, self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |pd| {
                         self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                    }
+                } else if (self.active_kind.isShape() and !self.input.capturing) {
+                    // シェイプ（独立経路。TASK-90）。press→drag→release で shape 確定。
+                    const frame: shape_input.ShapeInput.Frame = .{
+                        .canvas_rect = canvas_rect,
+                        .zoom = self.view_zoom,
+                        .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
+                        .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                        .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
+                        .pressed_left = pressed_left_gated,
+                        .released_left = in.mouse_released.left,
+                    };
+                    self.syncRecorderModes();
+                    // shape_in.kind / fill は UI・setActiveKind で同期済み
+                    if (self.shape_in.update(frame, self.canvas, &self.recorder, self.gpa, self.palette.current())) |pd| {
+                        switch (actions.uiPaintCommitPath(platform.netsyncActive(), true)) {
+                            .relay => {
+                                // netsync: preview を巻き戻し → action shape で再適用
+                                self.rewindPaintDiff(pd);
+                                self.relayUiShape();
+                            },
+                            .rewind_discard => {
+                                self.rewindPaintDiff(pd);
+                            },
+                            .solo => {
+                                const handle_before = self.doc.undo.next_handle;
+                                self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {};
+                                self.recordUiShape(self.doc.undo.next_handle != handle_before);
+                            },
+                        }
                     }
                 } else if (self.active_kind == .select and !self.input.capturing) {
                     const frame: selection_input.SelectionInput.Frame = .{
@@ -4055,6 +4337,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                         .released_left = in.mouse_released.left,
                     };
                     const was_capturing = self.input.capturing;
+                    self.syncRecorderModes();
                     const pd_opt = self.input.update(frame, self.activeTool(), self.canvas, &self.recorder, self.gpa);
                     // ── UI stroke の点列追跡（TASK-62.5.3 §5c。canvas_input の down/move/up と同じ座標変換）──
                     if (canvas_rect) |rect| {
@@ -4146,6 +4429,13 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                         selection_overlay.draw(&self.ctx, display_sel, rect, self.view_zoom, clip_area, phase);
                     };
                 }
+            }
+            // シェイプドラッグ中の輪郭プレビュー（TASK-90）
+            if (self.active_kind.isShape() and self.shape_in.state == .dragging) {
+                if (canvas_rect) |rect| if (self.last_area) |area| {
+                    const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                    shape_overlay.draw(&self.ctx, &self.shape_in, rect, self.view_zoom, clip_area);
+                };
             }
             // ツールグリフ + ブラシ footprint 輪郭リング（ソフトオーバーレイ最前面。TASK-75.4）。
             // hover_screen は「in_canvas かつ非 busy」の時だけ Some（updateCursorAndHover 参照）なので、

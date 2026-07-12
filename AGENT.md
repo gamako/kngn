@@ -535,7 +535,7 @@ quit                       # 終了（EOF でも終了）
     - **wire（失敗行の末尾追記のみ）**: live/copilot = `fail <name> <msg> code=<c> next=<n>` / replay = `[harness] action <name> FAILED <msg> code=<c> next=<n>`。**行頭 `fail ` は不変**（`scripts/drive` の fail 行頭スキャン・非0 exit 運用は無改修で維持）。netsync の REJECT reason・capabilities JSON は本拡張の対象外。
     - **非解釈の不変条件**: code/suggestion の語彙は app 側が返す。framework は透過（desc と同様に framing 保護だけ）。MCP ブリッジ（TASK-88）はこの wire をそのまま tool エラーとして読む前提。
     - **pixie 実例**: `open` の読込失敗（`ReadFailed`/`FileNotFound`）→ `code=file_not_found` / `next=check path or use save first`。`select_layer` の `OutOfRange` → `code=index_out_of_range` / `next=use add_layer or 0..N-1`。
-  - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（32件。TASK-62.5.3 で 16→32）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
+  - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（48件。TASK-90 で 32→48。以前 TASK-62.5.3 で 16→32）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
   - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor`/`history`/`diff`/`palette` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（`#` 有無どちらも許容） / `set_tool <pen|eraser|brush|bezier|select|fill>` / `stroke <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗） / `save <path>` / `open <path>` / `recipe_save <path>` / `recipe_replay <path>`（TASK-62.5.8。下記「レシピ」節） / `diff_mark`（TASK-87。現 composite を `digest diff` の基準にコピー。引数なし・メタ操作で CommandLog 非記録） / `replace_color [#<id>|<index>] <from> <to>`（TASK-89。layer ref は optional・省略時 selected。netsync 中は #id 必須・`.relay`。hex 2 個のみは従来互換・undo 可） / `palette_ramp <seed_hex> <n>`（TASK-89。OKLCH 明暗ランプ n=2..32・パレット全置換・`.reject_when_synced`） / `palette_from_png <path>`（TASK-89。PNG 頻度抽出→パレット全置換・上限64・`.reject_when_synced`） / `palette_set <hex...>`（TASK-89。1..64 色でパレット全置換・`.reject_when_synced`）。palette 系は document 状態（.pix v4 PLTE / netsync SYNC 対象）のため session 中のローカル変更は拒否。**.pix 互換**: v4 reader が v2/v3 を読む後方互換のみ（v3 reader は schema>3 を拒否。旧 reader が v4 を読めるわけではない）。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
 
 ### 使い方（replay = file トランスポート）
@@ -656,7 +656,7 @@ action 固有のコードを一切足さない**（中身非パースの不変�
 - **args は raw テキスト透過（framework は解釈しない）が、`;`/改行を含められない**（`nextLine()` の
   コマンド区切りのため。同一コマンド片内のテキストに限られる）。
 - **名前規則**: 空名・空白・`;`・改行を含む名前は登録拒否（コマンド言語上そもそも呼び出せないため）。
-  同名 custom は上書き。registry 上限は 32（TASK-62.5.3 で 16→32）。予約名は無い（組み込み action を作らないため）。
+  同名 custom は上書き。registry 上限は 48（TASK-90 で 32→48。以前 TASK-62.5.3 で 16→32）。予約名は無い（組み込み action を作らないため）。
 - `registerAction` は **harness 無効時（env 未設定）は no-op**なので、通常実行に影響しない（常に呼んでよい）。
 - **callback は main thread（`pollGate` 内・step/フレーム境界）で実行される**。RT callback から呼ばれる
   ことは無い。callback が RT スレッドと共有する app 状態に触れる場合、その同期責務は app 側にある

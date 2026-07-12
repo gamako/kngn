@@ -58,6 +58,13 @@ pub const Fill = fill.Fill;
 pub const floodFillCmd = fill.floodFillCmd;
 pub const colorDist = fill.colorDist;
 
+// シェイプラスタライズ（TASK-90）。line/rect/ellipse → plot callback。
+pub const shape = @import("shape.zig");
+pub const Symmetry = undo.Symmetry;
+pub const plotLine = shape.plotLine;
+pub const plotRect = shape.plotRect;
+pub const plotEllipse = shape.plotEllipse;
+
 // ベジェ / ベクターパス（TASK-21.13）
 pub const bezier = @import("bezier.zig");
 pub const Vec2f = bezier.Vec2f;

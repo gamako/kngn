@@ -29,6 +29,9 @@ pub const ParseError = error{
     UnknownKey,
     UnknownTool,
     ValueOutOfRange,
+    UnknownShape,
+    UnknownSymmetry,
+    UnknownAnchor,
 };
 
 /// layer 参照（TASK-94 Phase B）: `#<id>`（安定 handle）または bare 数値（index・後方互換）。
@@ -473,6 +476,111 @@ pub fn parsePaletteRamp(args: []const u8) ParseError!PaletteRampArgs {
 /// palette_set の色数上限（palette.zig MAX_PALETTE_COLORS と同値。乖離は main の comptime で防ぐ）。
 pub const MAX_PALETTE_SET: usize = 64;
 
+// ── TASK-90: shape / symmetry / pixel_perfect ────────────────────────
+
+pub const ShapeKind = enum { line, rect, ellipse };
+
+/// 対称モード（StrokeRecorder.Symmetry と同語彙。v/h は短縮形）。
+pub const SymmetryMode = enum { off, v, h, quad };
+
+pub const ShapeArgs = struct {
+    kind: ShapeKind,
+    p0: Point,
+    p1: Point,
+    fill: bool = false,
+};
+
+/// アンカー名 → canvas 座標（App 非依存。w/h は呼び出し側が渡す）。
+/// center / top-left / top-right / bottom-left / bottom-right /
+/// mid-top / mid-bottom / mid-left / mid-right。
+pub fn resolveAnchor(name: []const u8, w: i32, h: i32) ParseError!Point {
+    if (w < 1 or h < 1) return error.ValueOutOfRange;
+    const r = w - 1;
+    const b = h - 1;
+    const mx = @divTrunc(w, 2);
+    const my = @divTrunc(h, 2);
+    if (std.mem.eql(u8, name, "center")) return .{ .x = mx, .y = my };
+    if (std.mem.eql(u8, name, "top-left")) return .{ .x = 0, .y = 0 };
+    if (std.mem.eql(u8, name, "top-right")) return .{ .x = r, .y = 0 };
+    if (std.mem.eql(u8, name, "bottom-left")) return .{ .x = 0, .y = b };
+    if (std.mem.eql(u8, name, "bottom-right")) return .{ .x = r, .y = b };
+    if (std.mem.eql(u8, name, "mid-top")) return .{ .x = mx, .y = 0 };
+    if (std.mem.eql(u8, name, "mid-bottom")) return .{ .x = mx, .y = b };
+    if (std.mem.eql(u8, name, "mid-left")) return .{ .x = 0, .y = my };
+    if (std.mem.eql(u8, name, "mid-right")) return .{ .x = r, .y = my };
+    return error.UnknownAnchor;
+}
+
+/// `x,y` 座標トークン or アンカー名。
+/// 数値経路は canvas 内 `0 <= x < w` / `0 <= y < h` を必須（範囲外・負値は ValueOutOfRange）。
+/// アンカー経路は定義上範囲内なので追加検証なし。
+fn parsePointToken(tok: []const u8, w: i32, h: i32) ParseError!Point {
+    if (std.mem.indexOfScalar(u8, tok, ',')) |comma| {
+        const xs = tok[0..comma];
+        const ys = tok[comma + 1 ..];
+        if (xs.len == 0 or ys.len == 0) return error.InvalidNumber;
+        const x = std.fmt.parseInt(i32, xs, 10) catch return error.InvalidNumber;
+        const y = std.fmt.parseInt(i32, ys, 10) catch return error.InvalidNumber;
+        if (x < 0 or y < 0 or x >= w or y >= h) return error.ValueOutOfRange;
+        return .{ .x = x, .y = y };
+    }
+    return resolveAnchor(tok, w, h);
+}
+
+/// `shape <line|rect|ellipse> <p0> <p1> [fill]`
+/// p は `x,y` またはアンカー名。fill は rect/ellipse のみ意味を持つ（line でも許容）。
+pub fn parseShape(args: []const u8, canvas_w: i32, canvas_h: i32) ParseError!ShapeArgs {
+    var it = tokenize(args);
+    const kind_tok = it.next() orelse return error.Empty;
+    const kind = std.meta.stringToEnum(ShapeKind, kind_tok) orelse return error.UnknownShape;
+    const p0_tok = it.next() orelse return error.Empty;
+    const p1_tok = it.next() orelse return error.Empty;
+    const p0 = try parsePointToken(p0_tok, canvas_w, canvas_h);
+    const p1 = try parsePointToken(p1_tok, canvas_w, canvas_h);
+    var fill = false;
+    if (it.next()) |fill_tok| {
+        if (!std.ascii.eqlIgnoreCase(fill_tok, "fill")) return error.TooManyTokens;
+        fill = true;
+        try expectExhausted(&it);
+    }
+    return .{ .kind = kind, .p0 = p0, .p1 = p1, .fill = fill };
+}
+
+/// `set_symmetry <off|v|h|quad>`
+pub fn parseSymmetry(args: []const u8) ParseError!SymmetryMode {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const mode = std.meta.stringToEnum(SymmetryMode, tok) orelse return error.UnknownSymmetry;
+    try expectExhausted(&it);
+    return mode;
+}
+
+/// `set_pixel_perfect <0|1>`
+pub fn parsePixelPerfect(args: []const u8) ParseError!bool {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const on = if (std.mem.eql(u8, tok, "0"))
+        false
+    else if (std.mem.eql(u8, tok, "1"))
+        true
+    else
+        return error.UnknownBool;
+    try expectExhausted(&it);
+    return on;
+}
+
+/// canonical shape args（UI 記録 / redo 用）。
+pub fn formatCanonicalShape(buf: []u8, a: ShapeArgs) error{TooLong}![]const u8 {
+    if (a.fill) {
+        return std.fmt.bufPrint(buf, "{s} {d},{d} {d},{d} fill", .{
+            @tagName(a.kind), a.p0.x, a.p0.y, a.p1.x, a.p1.y,
+        }) catch return error.TooLong;
+    }
+    return std.fmt.bufPrint(buf, "{s} {d},{d} {d},{d}", .{
+        @tagName(a.kind), a.p0.x, a.p0.y, a.p1.x, a.p1.y,
+    }) catch return error.TooLong;
+}
+
 /// `palette_set <hex...>`（1..=64 個・# 任意）→ `buf` に詰めて borrowed slice。
 pub fn parsePaletteSet(args: []const u8, buf: []u32) ParseError![]u32 {
     var it = tokenize(args);
@@ -852,4 +960,69 @@ test "formatCanonicalStroke: ツール別の key 集合がちょうど一度 + p
     // 収まらない buf は TooLong
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.TooLong, formatCanonicalStroke(&tiny, .{ .tool = .pen, .color = 0, .size = 1, .opacity = 255, .hardness = 255 }, &pts));
+}
+
+// ── TASK-90 パーサ ─────────────────────────────────────────
+
+test "parseShape: 座標 / アンカー / fill / エラー" {
+    const a = try parseShape("rect 4,4 20,14", 256, 256);
+    try testing.expectEqual(ShapeKind.rect, a.kind);
+    try testing.expectEqual(Point{ .x = 4, .y = 4 }, a.p0);
+    try testing.expectEqual(Point{ .x = 20, .y = 14 }, a.p1);
+    try testing.expect(!a.fill);
+
+    const b = try parseShape("ellipse top-left bottom-right fill", 256, 256);
+    try testing.expectEqual(ShapeKind.ellipse, b.kind);
+    try testing.expectEqual(Point{ .x = 0, .y = 0 }, b.p0);
+    try testing.expectEqual(Point{ .x = 255, .y = 255 }, b.p1);
+    try testing.expect(b.fill);
+
+    const c = try parseShape("line center mid-right", 10, 10);
+    try testing.expectEqual(ShapeKind.line, c.kind);
+    try testing.expectEqual(Point{ .x = 5, .y = 5 }, c.p0);
+    try testing.expectEqual(Point{ .x = 9, .y = 5 }, c.p1);
+
+    try testing.expectError(error.UnknownShape, parseShape("circle 0,0 1,1", 16, 16));
+    try testing.expectError(error.UnknownAnchor, parseShape("line nowhere mid-top", 16, 16));
+    try testing.expectError(error.Empty, parseShape("line 0,0", 16, 16));
+    try testing.expectError(error.TooManyTokens, parseShape("rect 0,0 1,1 fill extra", 16, 16));
+
+    // 数値座標の範囲検証（0 <= x < w, 0 <= y < h）。アンカーは定義上範囲内で不変。
+    try testing.expectError(error.ValueOutOfRange, parseShape("line -1,0 1,1", 16, 16));
+    try testing.expectError(error.ValueOutOfRange, parseShape("line 0,-1 1,1", 16, 16));
+    try testing.expectError(error.ValueOutOfRange, parseShape("line 0,0 16,1", 16, 16)); // x == w
+    try testing.expectError(error.ValueOutOfRange, parseShape("line 0,0 1,16", 16, 16)); // y == h
+    try testing.expectError(error.ValueOutOfRange, parseShape("line 0,0 999,999", 16, 16));
+    try testing.expectError(error.ValueOutOfRange, parseShape("rect 0,0 2147483647,0", 256, 256));
+    // 端点 inclusive（w-1,h-1）は受理
+    const edge = try parseShape("line 0,0 15,15", 16, 16);
+    try testing.expectEqual(Point{ .x = 15, .y = 15 }, edge.p1);
+}
+
+test "resolveAnchor: 偶数サイズの mid/center" {
+    try testing.expectEqual(Point{ .x = 4, .y = 4 }, try resolveAnchor("center", 8, 8));
+    try testing.expectEqual(Point{ .x = 7, .y = 0 }, try resolveAnchor("top-right", 8, 8));
+    try testing.expectEqual(Point{ .x = 4, .y = 7 }, try resolveAnchor("mid-bottom", 8, 8));
+}
+
+test "parseSymmetry / parsePixelPerfect" {
+    try testing.expectEqual(SymmetryMode.off, try parseSymmetry("off"));
+    try testing.expectEqual(SymmetryMode.v, try parseSymmetry("v"));
+    try testing.expectEqual(SymmetryMode.h, try parseSymmetry("h"));
+    try testing.expectEqual(SymmetryMode.quad, try parseSymmetry("quad"));
+    try testing.expectError(error.UnknownSymmetry, parseSymmetry("vertical"));
+    try testing.expectError(error.TooManyTokens, parseSymmetry("v extra"));
+
+    try testing.expectEqual(true, try parsePixelPerfect("1"));
+    try testing.expectEqual(false, try parsePixelPerfect("0"));
+    try testing.expectError(error.UnknownBool, parsePixelPerfect("yes"));
+}
+
+test "formatCanonicalShape round-trip" {
+    var buf: [64]u8 = undefined;
+    const s = try formatCanonicalShape(&buf, .{ .kind = .rect, .p0 = .{ .x = 4, .y = 4 }, .p1 = .{ .x = 20, .y = 14 }, .fill = true });
+    try testing.expectEqualStrings("rect 4,4 20,14 fill", s);
+    const rt = try parseShape(s, 256, 256);
+    try testing.expectEqual(ShapeKind.rect, rt.kind);
+    try testing.expect(rt.fill);
 }

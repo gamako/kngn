@@ -3131,7 +3131,7 @@ test "registerAction: 同名上書き / 不正名（空・空白・;・改行）
     registerAction(.{ .name = "b\nc", .ctx = &c1, .run = testActionRun }); // 改行混入
     try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // いずれも拒否され増えない
 
-    // 満杯 skip: "a" + MAX_ACTIONS 件以上を登録しても MAX_ACTIONS(=32) で頭打ち
+    // 満杯 skip: "a" + MAX_ACTIONS 件以上を登録しても MAX_ACTIONS(=48) で頭打ち
     var name_bufs: [action_registry.MAX_ACTIONS + 4][8]u8 = undefined;
     for (&name_bufs, 0..) |*nb, i| {
         const nm = std.fmt.bufPrint(nb, "act{d}", .{i}) catch unreachable;

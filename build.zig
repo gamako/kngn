@@ -755,6 +755,15 @@ pub fn build(b: *std.Build) void {
     const core_fill_test = b.addTest(.{ .root_module = core_fill_mod });
     const run_core_fill_test = b.addRunArtifact(core_fill_test);
 
+    // シェイプラスタライズ（TASK-90）。std のみの純関数（canvas 非依存）。
+    const core_shape_mod = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/shape.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const core_shape_test = b.addTest(.{ .root_module = core_shape_mod });
+    const run_core_shape_test = b.addRunArtifact(core_shape_test);
+
     // ベジェ/ベクターパス（TASK-21.13）。bezier=pure。path/path_editor は相対 import 先（undo/path の test）が
     // png を使うため import 要（Zig は同一モジュール内 @import 先の test もコンパイルする）。
     const core_bezier_mod = b.createModule(.{
@@ -845,6 +854,23 @@ pub fn build(b: *std.Build) void {
     selection_input_mod.addImport("paint", selection_input_core);
     const selection_input_test = b.addTest(.{ .root_module = selection_input_mod });
     const run_selection_input_test = b.addRunArtifact(selection_input_test);
+
+    // シェイプ入力アダプタ（TASK-90）。core を名前付き import（selection_input と同型）
+    const shape_input_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    const shape_input_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/shape_input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shape_input_core.addImport("pixelops", shared_modules.pixelops.mod);
+    shape_input_core.addImport("png", shared_modules.png.mod);
+    shape_input_core.addImport("serde", shared_modules.serde.mod);
+    shape_input_core.addImport("font", shared_modules.font.mod);
+    shape_input_mod.addImport("paint", shape_input_core);
+    const shape_input_test = b.addTest(.{ .root_module = shape_input_mod });
+    const run_shape_input_test = b.addRunArtifact(shape_input_test);
 
     // ベジェ入力アダプタ（TASK-21.13）。core を名前付き import（canvas_input と同型）
     const bezier_input_core = b.createModule(.{
@@ -995,6 +1021,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_undo_test.step);
     test_core_step.dependOn(&run_core_tool_test.step);
     test_core_step.dependOn(&run_core_fill_test.step);
+    test_core_step.dependOn(&run_core_shape_test.step);
     test_core_step.dependOn(&run_core_bezier_test.step);
     test_core_step.dependOn(&run_core_path_test.step);
     test_core_step.dependOn(&run_core_path_editor_test.step);
@@ -1003,6 +1030,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_bezier_input_test.step);
     test_core_step.dependOn(&run_core_selection_test.step);
     test_core_step.dependOn(&run_selection_input_test.step);
+    test_core_step.dependOn(&run_shape_input_test.step);
     test_core_step.dependOn(&run_eyedropper_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);

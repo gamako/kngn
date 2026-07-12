@@ -71,7 +71,7 @@ pub const Action = struct {
 /// router 未設定時の `routeLocalAction` は `dispatch` と完全等価。
 pub const RouterFn = *const fn (name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8;
 
-pub const MAX_ACTIONS = 32; // TASK-62.5.3 で 16→32（pixie 登録超過の解消。62.3.1 で移送）
+pub const MAX_ACTIONS = 48; // TASK-90 で 32→48（pixie 31 件で満杯目前の解消）。以前: TASK-62.5.3 で 16→32
 
 var actions: [MAX_ACTIONS]Action = undefined;
 var action_count: usize = 0;
