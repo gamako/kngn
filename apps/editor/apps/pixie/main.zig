@@ -105,6 +105,8 @@ const TEXT_PANEL_ID_BASE: gui.Id = 0xA430_3000;
 /// レイヤー行 box 自身の明示 ID に使う `layerWidgetId` part（0..3 は既存: 0=選択ボタン/1=可視
 /// トグル/2=opacity slider/3=サムネ）。右クリックのヒットテストは行全体の矩形を使う。
 const LAYER_ROW_PART_ROW: gui.Id = 4;
+/// 履歴パネル（TASK-83 Phase 1）の明示 ID 群。
+const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
 // レイヤーパネルのサムネイル（raw layer をチェッカー下地へ最近傍縮小・等倍 blit）
 const LAYER_THUMB_W: i32 = 24;
 const LAYER_THUMB_H: i32 = 24;
@@ -385,6 +387,12 @@ const App = struct {
     /// `next_handle > last_seen_handle` なら「CommandLog に載らない undoable push があった」と
     /// 判定して `bumpEpoch(.local_user)` する（O(1) の整数比較 1 回/フレーム）。
     last_seen_handle: u64 = 1,
+    /// 履歴パネル表示用キャッシュ（TASK-83。CommandLog 変異を跨いで保持しない契約のため
+    /// dirty 時に全置換再構築。alloc なし・MAX_CMD_LOG 固定配列）。
+    history_entries: [platform.command.MAX_CMD_LOG]history_summary.HistoryEntry = undefined,
+    history_count: u32 = 0,
+    history_dirty: bool = true,
+    history_seen_seq: u64 = 1,
     /// capture 開始時に latch した実効パラメータ（canonical args の材料。§5c'）。
     ui_stroke_tool: ToolKind = .pen,
     ui_stroke_color: u32 = 0,
@@ -1221,6 +1229,8 @@ const App = struct {
     /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
+        // defer: routeAction が途中失敗しても revert フラグ等の変異は起きうる（next_seq 非依存）
+        defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
             var buf: [128]u8 = undefined;
             _ = try platform.routeAction("undo", "", &buf);
@@ -1232,6 +1242,7 @@ const App = struct {
 
     fn doRedo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
+        defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
             var buf: [128]u8 = undefined;
             _ = try platform.routeAction("redo", "", &buf);
@@ -1239,6 +1250,31 @@ const App = struct {
             self.userRedo();
         }
         self.clampTimelineTarget();
+    }
+
+    fn markHistoryDirty(self: *App) void {
+        self.history_dirty = true;
+    }
+
+    fn rebuildHistoryEntries(self: *App) void {
+        const hctx = historyCtx(self);
+        self.history_count = self.cmd_log.filled;
+        var i: u32 = 0;
+        while (i < self.cmd_log.filled) : (i += 1) {
+            const rec = self.cmd_log.recordAt(i);
+            self.history_entries[i] = history_summary.makeHistoryEntry(hctx, rec);
+            // HistoryEntry.name は CommandRecord 内バッファへの借用（history_summary.zig の
+            // 「CommandLog 変異を跨いで保持禁止」契約）。パネルは summary（inline copy）のみ
+            // 使うので、キャッシュには借用を残さない。
+            self.history_entries[i].name = "";
+        }
+        self.history_seen_seq = self.cmd_log.next_seq;
+        self.history_dirty = false;
+    }
+
+    fn ensureHistoryFresh(self: *App) void {
+        if (!self.history_dirty and self.history_seen_seq == self.cmd_log.next_seq) return;
+        self.rebuildHistoryEntries();
     }
 
     /// local_user の undo（ハイブリッド。TASK-62.5.4 §2）: undo stack を上から走査し、最初の
@@ -2249,6 +2285,9 @@ fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     try actions.parseNoArgs(args);
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
+    // defer: undoOne が失敗しても record フラグの変異は起きうる（next_seq 非依存のため
+    // dirty で拾う。codex 指摘）
+    defer app.markHistoryDirty();
     const outcome = try app.cmd_exec.undoOne(.local_agent, buf);
     app.clampTimelineTarget();
     return outcome.message;
@@ -2259,6 +2298,9 @@ fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
     const seq_before = app.cmd_log.next_seq;
+    // defer: redoOne は途中失敗でも redo_consumed を更新しうる（next_seq 不変のケースが
+    // あるため dirty で拾う。codex 指摘）
+    defer app.markHistoryDirty();
     const outcome = app.cmd_exec.redoOne(.local_agent, buf) catch |err| {
         app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // PartialRedo でも適用済み分はタグ
         return err;
@@ -3513,6 +3555,56 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     }
 }
 
+fn historyActorAbbrev(entry: *const history_summary.HistoryEntry, buf: []u8) []const u8 {
+    if (std.mem.eql(u8, entry.actor, "local_user")) return "u";
+    if (std.mem.eql(u8, entry.actor, "local_agent")) return "ai";
+    if (std.mem.eql(u8, entry.actor, "system")) return "sys";
+    if (entry.actor_peer) |id| {
+        return std.fmt.bufPrint(buf, "#{d}", .{id}) catch "peer";
+    }
+    return "peer";
+}
+
+fn historyRowColor(ctx: *gui.Context, entry: *const history_summary.HistoryEntry) gui.Color {
+    if (entry.reverted) return ctx.style.text_subtle;
+    if (entry.redo_consumed) return gui.Color.rgba(0x68, 0x70, 0x78, 0xFF);
+    return ctx.style.text;
+}
+
+fn formatHistoryLine(entry: *const history_summary.HistoryEntry, buf: []u8) []const u8 {
+    var actor_buf: [16]u8 = undefined;
+    const actor = historyActorAbbrev(entry, &actor_buf);
+    if (entry.tx != null) {
+        return std.fmt.bufPrint(buf, "#{d} {s} T {s}", .{ entry.seq, actor, entry.summary() }) catch "";
+    }
+    return std.fmt.bufPrint(buf, "#{d} {s} {s}", .{ entry.seq, actor, entry.summary() }) catch "";
+}
+
+fn historyRowId(idx: u32) gui.Id {
+    return HISTORY_PANEL_ID_BASE + @as(gui.Id, idx);
+}
+
+/// 操作履歴パネル（TASK-83 Phase 1）。CommandLog を最新が上の縦リストで表示する。
+/// ホットパス宣言: 毎フレーム構築されるが履歴データの再構築は dirty 時のみ（イベント時相当）。
+fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
+    app.ensureHistoryFresh();
+    ctx.label("History");
+    if (app.history_count == 0) {
+        ctx.labelEx("(empty)", ctx.style.text_subtle);
+        return;
+    }
+    var rev: u32 = app.history_count;
+    while (rev > 0) {
+        rev -= 1;
+        const entry = &app.history_entries[rev];
+        var line_buf: [platform.command.MAX_SUMMARY + 48]u8 = undefined;
+        const line = formatHistoryLine(entry, &line_buf);
+        ctx.beginBox(.{ .id = historyRowId(rev), .direction = .row, .gap = 2 });
+        ctx.labelEx(line, historyRowColor(ctx, entry));
+        ctx.endBox();
+    }
+}
+
 /// テキストレイヤー（kind==.text）専用の編集パネル。選択中レイヤーが text の時のみ表示する
 /// （TASK-79.5）。内容編集（`text_in` 経由のインライン編集）/ font size / 位置(x,y) /
 /// 現在色の適用を扱う。値変化時に `App.doSetTextParams` へ委譲する（既存 opacity スライダーと
@@ -3992,6 +4084,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
 
         try buildLayerPanel(ctx, app);
         try buildTextLayerPanel(ctx, app); // TASK-79.5: 選択中レイヤーが text kind の時のみ表示
+        buildHistoryPanel(ctx, app);
         ctx.endScrollArea(); // right pane (縦スクロール)
     } // right_visible
 
