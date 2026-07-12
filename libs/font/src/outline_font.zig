@@ -2995,7 +2995,12 @@ test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一
     const g = face.source.glyf;
     var o0 = try g.outline(a, 1);
     defer o0.deinit(a);
-    var o1 = try g.outlineVaried(a, 1, &face.gvar.?, &.{0},);
+    var o1 = try g.outlineVaried(
+        a,
+        1,
+        &face.gvar.?,
+        &.{0},
+    );
     defer o1.deinit(a);
     try testing.expectEqual(o0.contours[0].start.x, o1.contours[0].start.x);
 

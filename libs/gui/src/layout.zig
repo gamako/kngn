@@ -371,11 +371,15 @@ test "measure: text leaf は font 由来（8×len, glyph_h）" {
 }
 
 test "measure: leaf override font が width/height 両方に効く" {
-    var t: Node = .{ .leaf = .{ .text = .{
-        .str = "ab",
-        .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
-        .font = override_font, // advance=16, line_height=24
-    } } };
+    var t: Node = .{
+        .leaf = .{
+            .text = .{
+                .str = "ab",
+                .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+                .font = override_font, // advance=16, line_height=24
+            },
+        },
+    };
     measure(&t, test_font);
     try std.testing.expectEqual(@as(i32, 32), t.measured_w); // 16 * 2（override の advance）
     try std.testing.expectEqual(@as(i32, 24), t.measured_h); // override の line_height

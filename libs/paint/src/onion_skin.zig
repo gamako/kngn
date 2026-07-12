@@ -18,17 +18,17 @@ pub fn onionOpacity(dist: u32) u8 {
 const tint_half: u8 = 128;
 
 const bg_lane_mask: @Vector(16, bool) = .{
-    true,  true,  false, false,
-    true,  true,  false, false,
-    true,  true,  false, false,
-    true,  true,  false, false,
+    true, true, false, false,
+    true, true, false, false,
+    true, true, false, false,
+    true, true, false, false,
 };
 
 const rg_lane_mask: @Vector(16, bool) = .{
-    false, true,  true,  false,
-    false, true,  true,  false,
-    false, true,  true,  false,
-    false, true,  true,  false,
+    false, true, true, false,
+    false, true, true, false,
+    false, true, true, false,
+    false, true, true, false,
 };
 
 /// 前フレーム用減色（赤味）: G/B を 1/2 に抑える。alpha は不変。

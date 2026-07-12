@@ -1934,12 +1934,16 @@ const SharedModules = struct {
         // makePlatformModules→createPlatformModule) と audio module の両方に注入する (TASK-32.2)。
         // harness は png(encodePNG/crc32) に依存し getenv で link_libc。
         // wasm では harness_wasm.zig（no-op stub）に差し替え、png/capture_synthetic/dsp を張らない（TASK-73.1）。
-        const harness: TaggedModule = .{ .layer = .core, .name = "harness", .mod = b.createModule(.{
-            .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
-            .link_libc = !is_wasm,
-            // wasm non-shared (pixie): single_threaded。shared audio (synth): multi（atomics）。
-            .single_threaded = if (is_wasm) !wasm_shared else null,
-        }) };
+        const harness: TaggedModule = .{
+            .layer = .core,
+            .name = "harness",
+            .mod = b.createModule(.{
+                .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
+                .link_libc = !is_wasm,
+                // wasm non-shared (pixie): single_threaded。shared audio (synth): multi（atomics）。
+                .single_threaded = if (is_wasm) !wasm_shared else null,
+            }),
+        };
         if (!is_wasm) {
             linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");
         }

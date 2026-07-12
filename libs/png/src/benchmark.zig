@@ -108,8 +108,7 @@ fn benchmarkImage(io: std.Io, profiled: *ProfiledAllocator, test_image: TestImag
     // Format and print results
     const size_str = formatSize(first_image.width, first_image.height);
 
-    std.debug.print("{s:<35} {s:>12} {d:>15.2} {d:>15.2} {d:>12}\n",
-        .{ test_image.name, size_str, @as(f64, @floatFromInt(avg_us)), throughput, peak_kb });
+    std.debug.print("{s:<35} {s:>12} {d:>15.2} {d:>15.2} {d:>12}\n", .{ test_image.name, size_str, @as(f64, @floatFromInt(avg_us)), throughput, peak_kb });
 }
 
 fn formatSize(width: u32, height: u32) [20]u8 {

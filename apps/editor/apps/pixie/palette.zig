@@ -389,8 +389,7 @@ test "extractColorsByFrequency: 頻度降順・上限・透明スキップ" {
     // 赤×3、緑×2、青×1、透明×2
     const px = [_]u32{
         0xFFFF0000, 0xFFFF0000, 0xFFFF0000,
-        0xFF00FF00, 0xFF00FF00,
-        0xFF0000FF,
+        0xFF00FF00, 0xFF00FF00, 0xFF0000FF,
         0x00000000, 0x80FFFFFF, // 完全透明スキップ / 半透明は不透明化して数える
     };
     // 0x80FFFFFF → 0xFFFFFFFF としてカウント 1

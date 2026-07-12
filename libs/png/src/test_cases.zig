@@ -129,12 +129,12 @@ pub fn generateRGBAGradientExpected(
 
 /// Pattern type for test cases
 pub const PatternType = union(enum) {
-    hardcoded: []const u32,                      // For fixed test cases
-    gradient: struct { step: u8 },               // For grayscale gradient patterns
-    rgb_checkerboard: void,                      // For RGB checkerboard pattern
-    rgb_gradient: void,                          // For RGB gradient pattern
-    rgba_checkerboard: void,                     // For RGBA checkerboard pattern
-    rgba_gradient: void,                         // For RGBA gradient pattern
+    hardcoded: []const u32, // For fixed test cases
+    gradient: struct { step: u8 }, // For grayscale gradient patterns
+    rgb_checkerboard: void, // For RGB checkerboard pattern
+    rgb_gradient: void, // For RGB gradient pattern
+    rgba_checkerboard: void, // For RGBA checkerboard pattern
+    rgba_gradient: void, // For RGBA gradient pattern
 };
 
 /// Test case metadata

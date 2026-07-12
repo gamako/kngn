@@ -24,8 +24,8 @@ pub const PNG_SIGNATURE = [_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
 /// Note: This structure holds only Type and Data fields.
 /// Length and CRC are validated during parsing but not stored.
 pub const Chunk = struct {
-    chunk_type: [4]u8,      // Chunk Type (4-byte ASCII, e.g., "IHDR")
-    data: []const u8,       // Chunk Data (length varies)
+    chunk_type: [4]u8, // Chunk Type (4-byte ASCII, e.g., "IHDR")
+    data: []const u8, // Chunk Data (length varies)
 };
 
 /// IHDR (Image Header) chunk information
@@ -33,13 +33,13 @@ pub const Chunk = struct {
 ///
 /// The IHDR chunk must appear first and contains critical image metadata.
 pub const IHDRInfo = struct {
-    width: u32,         // Image width in pixels (1-2^31-1)
-    height: u32,        // Image height in pixels (1-2^31-1)
-    bit_depth: u8,      // Bits per sample (1, 2, 4, 8, 16)
-    color_type: u8,     // Color type: 0=grayscale, 2=RGB, 3=indexed, 4=grayscale+alpha, 6=RGBA
-    compression: u8,    // Compression method (0=deflate/inflate)
-    filter: u8,         // Filter method (0=adaptive filtering with 5 basic filter types)
-    interlace: u8,      // Interlace method (0=no interlace, 1=Adam7 interlace)
+    width: u32, // Image width in pixels (1-2^31-1)
+    height: u32, // Image height in pixels (1-2^31-1)
+    bit_depth: u8, // Bits per sample (1, 2, 4, 8, 16)
+    color_type: u8, // Color type: 0=grayscale, 2=RGB, 3=indexed, 4=grayscale+alpha, 6=RGBA
+    compression: u8, // Compression method (0=deflate/inflate)
+    filter: u8, // Filter method (0=adaptive filtering with 5 basic filter types)
+    interlace: u8, // Interlace method (0=no interlace, 1=Adam7 interlace)
 };
 
 /// ChunkIterator: iterate through PNG chunks
@@ -227,7 +227,7 @@ pub const IDATChunkStream = struct {
 pub const IDATChunkStreamAdapter = struct {
     chunk_stream: IDATChunkStream,
     interface: std.Io.Reader,
-    buffer: [64]u8,  // Small internal buffer for Reader operations
+    buffer: [64]u8, // Small internal buffer for Reader operations
 
     const vtable: std.Io.Reader.VTable = .{
         .stream = stream,
@@ -245,7 +245,7 @@ pub const IDATChunkStreamAdapter = struct {
             .buffer = undefined,
             .interface = .{
                 .vtable = &vtable,
-                .buffer = undefined,  // Will be set by caller after init
+                .buffer = undefined, // Will be set by caller after init
                 .seek = 0,
                 .end = 0,
             },
@@ -277,7 +277,6 @@ pub const IDATChunkStreamAdapter = struct {
 
         return n;
     }
-
 };
 
 /// Calculate CRC-32 (ISO HDLC) for PNG chunk validation

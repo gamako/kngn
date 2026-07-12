@@ -103,8 +103,19 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
 
 fn keyToNote(key: platform.KeyCode) ?u8 {
     return switch (key) {
-        .A => 60, .W => 61, .S => 62, .E => 63, .D => 64, .F => 65,
-        .T => 66, .G => 67, .Y => 68, .H => 69, .U => 70, .J => 71, .K => 72,
+        .A => 60,
+        .W => 61,
+        .S => 62,
+        .E => 63,
+        .D => 64,
+        .F => 65,
+        .T => 66,
+        .G => 67,
+        .Y => 68,
+        .H => 69,
+        .U => 70,
+        .J => 71,
+        .K => 72,
         else => null,
     };
 }

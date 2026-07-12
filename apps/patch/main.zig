@@ -1537,7 +1537,8 @@ fn patchDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const tail = std.fmt.bufPrint(buf[off..], "],\"output\":{d},\"cam\":{{\"zoom\":{d:.3},\"pan\":[{d:.1},{d:.1}]}}," ++
         "\"fb_size\":[{d},{d}],\"offscreen\":{{\"node\":{d},\"port\":{d},\"cable\":{d}}}}}", .{
         view.output, app.camera.zoom, app.camera.pan.x, app.camera.pan.y,
-        app.fb_w,    app.fb_h,        oc.node,          oc.port,           oc.cable,
+        app.fb_w,    app.fb_h,        oc.node,          oc.port,
+        oc.cable,
     }) catch return errDigest(buf);
     off += tail.len;
     return buf[0..off];

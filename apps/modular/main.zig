@@ -554,19 +554,22 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         "\"gains\":{{\"kick\":{d:.3},\"hat\":{d:.3},\"clap\":{d:.3},\"bass\":{d:.3},\"pad\":{d:.3}}}," ++
         "\"muted\":{{\"kick\":{},\"hat\":{},\"clap\":{},\"bass\":{},\"pad\":{}}},", .{
         st.bpm,           st.clock_phase,      st.density,
-        st.swing,         st.sidechain_amount, st.master_cutoff, st.bass_pitch_cv,
-        st.kick_step,     st.hat_step,         st.clap_step,     st.bass_step,
-        st.kick_active,   st.hat_active,       st.clap_active,   st.pad_active,
-        st.kick_gain,     st.hat_gain,         st.clap_gain,     st.bass_gain,  st.pad_gain,
-        st.kick_muted,    st.hat_muted,        st.clap_muted,    st.bass_muted, st.pad_muted,
+        st.swing,         st.sidechain_amount, st.master_cutoff,
+        st.bass_pitch_cv, st.kick_step,        st.hat_step,
+        st.clap_step,     st.bass_step,        st.kick_active,
+        st.hat_active,    st.clap_active,      st.pad_active,
+        st.kick_gain,     st.hat_gain,         st.clap_gain,
+        st.bass_gain,     st.pad_gain,         st.kick_muted,
+        st.hat_muted,     st.clap_muted,       st.bass_muted,
+        st.pad_muted,
     }) catch return buf[0..0];
     const b = std.fmt.bufPrint(buf[a.len..], "\"ph4\":{{\"kick_click\":{d:.3},\"hat_bright\":{d:.3}," ++
         "\"pad_cutoff\":{d:.0},\"pad_warmth\":{d:.3},\"master_drive\":{d:.3}," ++
         "\"pre_clip_peak\":{d:.3},\"clip_rate\":{d:.4}}}," ++
         "\"ambient\":{{\"move\":{d:.3},\"register\":{d},\"root_cv\":{d:.4}}},", .{
-        st.kick_click_gain, st.hat_brightness,  st.pad_cutoff, st.pad_warmth,
-        st.master_drive,    st.pre_clip_peak,   st.clip_rate,
-        st.ambient_move,    st.ambient_register, st.ambient_root_cv,
+        st.kick_click_gain,  st.hat_brightness,  st.pad_cutoff, st.pad_warmth,
+        st.master_drive,     st.pre_clip_peak,   st.clip_rate,  st.ambient_move,
+        st.ambient_register, st.ambient_root_cv,
     }) catch return buf[0..a.len];
     // Ph5 pattern（masks は hex。bass_deg 配列は snapshot 側）+ TASK-91 song 要約。
     // 末尾は 1 つの `}` で JSON を閉じる（1024B 注意）。
@@ -574,11 +577,12 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         "\"clap\":\"{x:0>4}\",\"bass_on\":\"{x:0>4}\",\"bass_accent\":\"{x:0>4}\",\"bass_slide\":\"{x:0>4}\"}}," ++
         "\"lock\":[{d},{d},{d},{d}],\"evolve\":{d},\"rev\":{d},\"mut\":{d},\"seed\":{d}," ++
         "\"song\":{{\"playing\":{d},\"row\":{d},\"bar\":{d},\"rows\":{d}}}}}", .{
-        st.kick_on,                 st.hat_on,                  st.clap_on,
-        st.bass_on,                 st.bass_accent,             st.bass_slide,
-        b01(st.lock[0]),            b01(st.lock[1]),            b01(st.lock[2]),            b01(st.lock[3]),
-        b01(st.evolve),             st.pattern_rev,             st.mutation_count,          st.base_seed,
-        b01(st.song_playing),       st.song_row,                st.song_bar_in_row,         st.song_rows,
+        st.kick_on,        st.hat_on,          st.clap_on,
+        st.bass_on,        st.bass_accent,     st.bass_slide,
+        b01(st.lock[0]),   b01(st.lock[1]),    b01(st.lock[2]),
+        b01(st.lock[3]),   b01(st.evolve),     st.pattern_rev,
+        st.mutation_count, st.base_seed,       b01(st.song_playing),
+        st.song_row,       st.song_bar_in_row, st.song_rows,
     }) catch return buf[0 .. a.len + b.len];
     return buf[0 .. a.len + b.len + c.len];
 }

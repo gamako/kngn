@@ -112,10 +112,22 @@ pub fn main() !void {
 
                 var mod_buf: [64]u8 = undefined;
                 var mod_pos: usize = 0;
-                if (mods.shift) { @memcpy(mod_buf[mod_pos..][0..6], "SHIFT+"); mod_pos += 6; }
-                if (mods.ctrl)  { @memcpy(mod_buf[mod_pos..][0..5], "CTRL+");  mod_pos += 5; }
-                if (mods.alt)   { @memcpy(mod_buf[mod_pos..][0..4], "ALT+");   mod_pos += 4; }
-                if (mods.cmd)   { @memcpy(mod_buf[mod_pos..][0..4], "CMD+");   mod_pos += 4; }
+                if (mods.shift) {
+                    @memcpy(mod_buf[mod_pos..][0..6], "SHIFT+");
+                    mod_pos += 6;
+                }
+                if (mods.ctrl) {
+                    @memcpy(mod_buf[mod_pos..][0..5], "CTRL+");
+                    mod_pos += 5;
+                }
+                if (mods.alt) {
+                    @memcpy(mod_buf[mod_pos..][0..4], "ALT+");
+                    mod_pos += 4;
+                }
+                if (mods.cmd) {
+                    @memcpy(mod_buf[mod_pos..][0..4], "CMD+");
+                    mod_pos += 4;
+                }
 
                 const key_name = keyboard.getKeyName(k.key);
                 std.debug.print("[KEY_DOWN] {s}{s} (code={d}){s}\n", .{

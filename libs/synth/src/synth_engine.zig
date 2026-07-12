@@ -106,8 +106,6 @@ pub fn Synth(comptime max_voices: usize) type {
             }
             self.smoothed_gain = g1;
         }
-
-
     };
 }
 
@@ -271,7 +269,6 @@ fn renderSampleMajorRef(self: *Synth(8), buf: []f32, frames: u32, channels: u32)
     }
     self.smoothed_gain = g1;
 }
-
 
 test "Voice: 超越関数は control-rate（ctrl_ticks 上限 + sustain 後は filter_recalcs 停止）（TASK-57）" {
     const voice_mod = @import("voice.zig");

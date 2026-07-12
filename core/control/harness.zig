@@ -2143,8 +2143,9 @@ fn formatAudioPayload(buf: []u8) []u8 {
     const st = analyzeAudio(audio_scratch[0..n], channels, rate, &audio_mono);
     const ext = analyzeAudioExt(audio_scratch[0..n], channels, rate, &audio_mono_ext);
     return std.fmt.bufPrint(buf, "rms={d:.4} peak={d:.4} f0={d:.1} silent={d} frames={d} band_low={d:.4} band_mid={d:.4} band_high={d:.4} centroid={d:.0} onsets={d} lufs={d:.1}", .{
-        st.rms,     st.peak,     st.f0,          @intFromBool(st.silent), st.frames,
-        ext.band_low, ext.band_mid, ext.band_high, ext.centroid,          ext.onsets, ext.lufs,
+        st.rms,       st.peak,      st.f0,         @intFromBool(st.silent), st.frames,
+        ext.band_low, ext.band_mid, ext.band_high, ext.centroid,            ext.onsets,
+        ext.lufs,
     }) catch buf[0..0];
 }
 

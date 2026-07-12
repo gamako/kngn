@@ -25,7 +25,7 @@ pub fn grayscaleToRGBA8888(
         // Gray value replicated to R, G, B
         // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, gray) << 16) |
-                     (@as(u32, gray) << 8) | @as(u32, gray);
+            (@as(u32, gray) << 8) | @as(u32, gray);
         result[i] = rgba;
     }
 
@@ -57,7 +57,7 @@ pub fn rgbToRGBA8888(
 
         // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, r) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, b);
+            (@as(u32, g) << 8) | @as(u32, b);
         result[out_idx] = rgba;
         out_idx += 1;
     }
@@ -91,7 +91,7 @@ pub fn rgbaToRGBA8888(
 
         // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, a) << 24) | (@as(u32, r) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, b);
+            (@as(u32, g) << 8) | @as(u32, b);
         result[out_idx] = rgba;
         out_idx += 1;
     }
@@ -119,7 +119,7 @@ pub fn grayscaleToRGBA8888Row(output: []u32, grayscale_row: []const u8) void {
         // Gray value replicated to R, G, B
         // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, gray) << 16) |
-                     (@as(u32, gray) << 8) | @as(u32, gray);
+            (@as(u32, gray) << 8) | @as(u32, gray);
         output[i] = rgba;
     }
 }
@@ -141,7 +141,7 @@ pub fn rgbToRGBA8888Row(output: []u32, rgb_row: []const u8) void {
 
         // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, 0xFF) << 24) | (@as(u32, r) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, b);
+            (@as(u32, g) << 8) | @as(u32, b);
         output[out_idx] = rgba;
         out_idx += 1;
     }
@@ -165,7 +165,7 @@ pub fn rgbaToRGBA8888Row(output: []u32, rgba_row: []const u8) void {
 
         // Little-endian value 0xAARRGGBB produces byte order [B, G, R, A] in memory
         const rgba = (@as(u32, a) << 24) | (@as(u32, r) << 16) |
-                     (@as(u32, g) << 8) | @as(u32, b);
+            (@as(u32, g) << 8) | @as(u32, b);
         output[out_idx] = rgba;
         out_idx += 1;
     }
@@ -277,8 +277,8 @@ test "RGB to RGBA8888 - multiple pixels" {
 
     // Input: two RGB pixels
     const rgb = [_]u8{
-        255, 0,   0,   // Red
-        0,   255, 0,   // Green
+        255, 0, 0, // Red
+        0, 255, 0, // Green
     };
 
     const result = try rgbToRGBA8888(allocator, &rgb);
@@ -323,8 +323,8 @@ test "RGBA to RGBA8888 - multiple pixels" {
 
     // Input: two RGBA pixels
     const rgba = [_]u8{
-        255, 0,   0,   255,   // Red (fully opaque)
-        0,   255, 0,   128,   // Green (semi-transparent)
+        255, 0, 0, 255, // Red (fully opaque)
+        0, 255, 0, 128, // Green (semi-transparent)
     };
 
     const result = try rgbaToRGBA8888(allocator, &rgba);
@@ -451,8 +451,8 @@ test "rgbaToPremultipliedRGBA8888Row - fully transparent pixel" {
 test "rgbaToPremultipliedRGBA8888Row - multiple pixels" {
     // Input: two RGBA pixels
     const input = [_]u8{
-        255, 0,   0,   255, // Red (fully opaque)
-        0,   255, 0,   128, // Green (semi-transparent)
+        255, 0, 0, 255, // Red (fully opaque)
+        0, 255, 0, 128, // Green (semi-transparent)
     };
     var output: [2]u32 = undefined;
 

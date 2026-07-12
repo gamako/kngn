@@ -455,7 +455,7 @@ test "draw: title 地色 + hover でボタン背景が変わる（bit assert）"
     var buf: [300 * TITLE_H]u32 = undefined;
 
     // hover 無し
-    draw(.title, buf[0 .. @as(usize, @intCast(w * h))], w, h, cw, .none);
+    draw(.title, buf[0..@as(usize, @intCast(w * h))], w, h, cw, .none);
     // 左端（ドラッグ域）は地色
     try std.testing.expectEqual(COL_BAR, buf[@intCast(2 * w + 2)]);
     // close ボタン中央のピクセル（hover 無しでは地色 or 記号。少なくとも hover 背景色ではない）
@@ -464,7 +464,7 @@ test "draw: title 地色 + hover でボタン背景が変わる（bit assert）"
     try std.testing.expect(buf[cpx] != COL_CLOSE_HOVER);
 
     // close hover
-    draw(.title, buf[0 .. @as(usize, @intCast(w * h))], w, h, cw, .close);
+    draw(.title, buf[0..@as(usize, @intCast(w * h))], w, h, cw, .close);
     // close ボタン背景の隅（記号でない位置）が赤み hover 色
     const corner: usize = @intCast(1 * w + (close_r.x + 1));
     try std.testing.expectEqual(COL_CLOSE_HOVER, buf[corner]);

@@ -197,9 +197,8 @@ fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
 /// `xdg-decoration-unstable-v1-client-protocol.h` を生成し親ディレクトリ（include path 用）を返す。
 fn generateXdgDecorationClientHeaderDir(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
-        "sh", "-c",
-        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"",
-        "sh",
+        "sh",                                                                                                                                                    "-c",
+        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"", "sh",
     });
     return cmd.addOutputFileArg("xdg-decoration-unstable-v1-client-protocol.h").dirname();
 }
@@ -207,9 +206,8 @@ fn generateXdgDecorationClientHeaderDir(b: *std.Build) std.Build.LazyPath {
 /// `xdg-decoration-unstable-v1-protocol.c`（marshalling 実体）を生成して LazyPath を返す。
 fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
-        "sh", "-c",
-        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"",
-        "sh",
+        "sh",                                                                                                                                                   "-c",
+        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"", "sh",
     });
     return cmd.addOutputFileArg("xdg-decoration-unstable-v1-protocol.c");
 }

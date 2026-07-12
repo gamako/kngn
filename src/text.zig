@@ -28,17 +28,17 @@ const Color = fontmod.Color;
 pub const Glyph = struct {
     width: u32,
     height: u32,
-    x_offset: i32,        // BBX の x オフセット (left-side bearing、signed)
-    y_offset: i32,        // BBX の y オフセット (baseline 基準・上向き正、signed)
-    advance: u32,         // DWIDTH の x 成分
-    bitmap: []const u8,   // height 行 × ((width+7)/8) byte (MSB-first)、bitmap_storage の slice
+    x_offset: i32, // BBX の x オフセット (left-side bearing、signed)
+    y_offset: i32, // BBX の y オフセット (baseline 基準・上向き正、signed)
+    advance: u32, // DWIDTH の x 成分
+    bitmap: []const u8, // height 行 × ((width+7)/8) byte (MSB-first)、bitmap_storage の slice
 };
 
 pub const BitmapFont = struct {
     glyphs: std.AutoHashMapUnmanaged(u32, Glyph),
     bitmap_storage: []u8,
-    ascent: u32,          // FONTBOUNDINGBOX から導出 (= bbox_height + bbox_y_offset)
-    line_height: u32,     // 改行 advance (FONTBOUNDINGBOX 高さ)
+    ascent: u32, // FONTBOUNDINGBOX から導出 (= bbox_height + bbox_y_offset)
+    line_height: u32, // 改行 advance (FONTBOUNDINGBOX 高さ)
 
     pub fn initFromBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont {
         return parseBdf(allocator, data);

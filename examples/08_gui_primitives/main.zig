@@ -77,22 +77,30 @@ pub fn main(init: std.process.Init) !void {
         // ── line: 水平・垂直・斜め ─────────────────────
         // 水平
         try draw_list.line(
-            .{ .x = 10, .y = 120 }, .{ .x = 480, .y = 120 },
-            gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), 1,
+            .{ .x = 10, .y = 120 },
+            .{ .x = 480, .y = 120 },
+            gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+            1,
         );
         // 垂直
         try draw_list.line(
-            .{ .x = 490, .y = 10 }, .{ .x = 490, .y = 200 },
-            gui.Color.rgba(0xFF, 0x80, 0x00, 0xFF), 1,
+            .{ .x = 490, .y = 10 },
+            .{ .x = 490, .y = 200 },
+            gui.Color.rgba(0xFF, 0x80, 0x00, 0xFF),
+            1,
         );
         // 斜め（任意角度、Bresenham）
         try draw_list.line(
-            .{ .x = 10, .y = 140 }, .{ .x = 480, .y = 200 },
-            gui.Color.rgba(0x00, 0xFF, 0xFF, 0xFF), 1,
+            .{ .x = 10, .y = 140 },
+            .{ .x = 480, .y = 200 },
+            gui.Color.rgba(0x00, 0xFF, 0xFF, 0xFF),
+            1,
         );
         try draw_list.line(
-            .{ .x = 480, .y = 140 }, .{ .x = 10, .y = 200 },
-            gui.Color.rgba(0xFF, 0x00, 0xFF, 0xFF), 1,
+            .{ .x = 480, .y = 140 },
+            .{ .x = 10, .y = 200 },
+            gui.Color.rgba(0xFF, 0x00, 0xFF, 0xFF),
+            1,
         );
 
         // ── text ──────────────────────────────────────
@@ -111,22 +119,29 @@ pub fn main(init: std.process.Init) !void {
         // デコードした PNG（16x16）を 3 か所に配置
         try draw_list.image(
             .{ .x = 10, .y = 270, .w = img_w, .h = img_h },
-            sample_img.pixels, img_w, img_h,
+            sample_img.pixels,
+            img_w,
+            img_h,
         );
         try draw_list.image(
             .{ .x = 30, .y = 270, .w = img_w, .h = img_h },
-            sample_img.pixels, img_w, img_h,
+            sample_img.pixels,
+            img_w,
+            img_h,
         );
         try draw_list.image(
             .{ .x = 50, .y = 270, .w = img_w, .h = img_h },
-            sample_img.pixels, img_w, img_h,
+            sample_img.pixels,
+            img_w,
+            img_h,
         );
 
         // ── clip demo ──────────────────────────────────
         // clip rect のアウトラインを描画
         try draw_list.rectOutline(
             .{ .x = 9, .y = 319, .w = 202, .h = 102 },
-            gui.Color.rgba(0xFF, 0xFF, 0x00, 0xFF), 1,
+            gui.Color.rgba(0xFF, 0xFF, 0x00, 0xFF),
+            1,
         );
         // clip を設定して大きめの rect を描画 → clip 外はみ出さない
         try draw_list.pushClip(.{ .x = 10, .y = 320, .w = 200, .h = 100 });

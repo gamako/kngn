@@ -718,8 +718,8 @@ test "charstring: hintmask は (numStems+7)/8 byte を読み飛ばす" {
     const code = [_]u8{
         op8(100), op8(100), op8(100), op8(100), 18, // hstemhm (2 stems)
         19, 0xFF, // hintmask + 1 mask byte
-        op8(0),  op8(0),   21, // rmoveto
-        op8(10), op8(0),   5, // rlineto
+        op8(0), op8(0), 21, // rmoveto
+        op8(10), op8(0), 5, // rlineto
         14,
     };
     var o = try runToOutline(a, &code);

@@ -343,9 +343,9 @@ test "raster: 直角三角形の厳密 coverage golden（対角セルは 0.5=128
 
     const expected = [16]u8{
         128, 255, 255, 255, // row0
-        0,   128, 255, 255, // row1
-        0,   0,   128, 255, // row2
-        0,   0,   0,   128, // row3
+        0, 128, 255, 255, // row1
+        0, 0, 128, 255, // row2
+        0, 0, 0, 128, // row3
     };
     for (0..4) |yy| for (0..4) |xx| {
         try testing.expectEqual(expected[yy * 4 + xx], px(bm, @intCast(xx), @intCast(yy)));

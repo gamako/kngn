@@ -106,17 +106,29 @@ fn hsvToRGB(hue: f32, saturation: f32, value: f32) u32 {
     var g: f32 = 0;
     var b: f32 = 0;
     if (h_norm < 1.0) {
-        r = c; g = x; b = 0;
+        r = c;
+        g = x;
+        b = 0;
     } else if (h_norm < 2.0) {
-        r = x; g = c; b = 0;
+        r = x;
+        g = c;
+        b = 0;
     } else if (h_norm < 3.0) {
-        r = 0; g = c; b = x;
+        r = 0;
+        g = c;
+        b = x;
     } else if (h_norm < 4.0) {
-        r = 0; g = x; b = c;
+        r = 0;
+        g = x;
+        b = c;
     } else if (h_norm < 5.0) {
-        r = x; g = 0; b = c;
+        r = x;
+        g = 0;
+        b = c;
     } else {
-        r = c; g = 0; b = x;
+        r = c;
+        g = 0;
+        b = x;
     }
 
     const ri = @as(u32, @intFromFloat((r + m) * 255.0));
@@ -127,10 +139,22 @@ fn hsvToRGB(hue: f32, saturation: f32, value: f32) u32 {
 
 fn modifierStr(buf: []u8, mods: platform.ModifierFlags) []const u8 {
     var pos: usize = 0;
-    if (mods.shift) { @memcpy(buf[pos..][0..6], "SHIFT+"); pos += 6; }
-    if (mods.ctrl)  { @memcpy(buf[pos..][0..5], "CTRL+");  pos += 5; }
-    if (mods.alt)   { @memcpy(buf[pos..][0..4], "ALT+");   pos += 4; }
-    if (mods.cmd)   { @memcpy(buf[pos..][0..4], "CMD+");   pos += 4; }
+    if (mods.shift) {
+        @memcpy(buf[pos..][0..6], "SHIFT+");
+        pos += 6;
+    }
+    if (mods.ctrl) {
+        @memcpy(buf[pos..][0..5], "CTRL+");
+        pos += 5;
+    }
+    if (mods.alt) {
+        @memcpy(buf[pos..][0..4], "ALT+");
+        pos += 4;
+    }
+    if (mods.cmd) {
+        @memcpy(buf[pos..][0..4], "CMD+");
+        pos += 4;
+    }
     return buf[0..pos];
 }
 
