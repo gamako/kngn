@@ -108,6 +108,18 @@ typedef enum {
 // backend 対応状況: macOS は NSCursor へ即時反映。Linux/Windows は現状 no-op（TASK-75.2/75.3 で実装予定）。
 void platform_set_cursor(PlatformWindow* window, int shape);
 
+// ========================================
+// ライブリサイズ再描画コールバック (TASK-23.1)
+// ========================================
+//
+// OS のモーダル/ネストした event-tracking ループ（枠ドラッグ中）から、app へ
+// 「今 1 フレーム描いてほしい」とだけ通知する opt-in 機構。pixels は渡さない
+// （app が普段どおり lockFramebuffer → draw → present を回す）。
+// cb == NULL で登録解除。単一ウィンドウ前提。
+
+typedef void (*PlatformRedrawCallback)(void* userdata);
+void platform_set_redraw_callback(PlatformWindow* window, PlatformRedrawCallback cb, void* userdata);
+
 // 画面を更新（present = 直近 lock したフレームを表示キューへ submit する）
 // platform_lock_framebuffer()で書き込んだ内容を表示キューへ送る
 //

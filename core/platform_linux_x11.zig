@@ -361,6 +361,18 @@ pub const Window = struct {
         _ = c.XDefineCursor(st.display, st.window, cur);
         _ = c.XFlush(st.display);
     }
+
+    /// ライブリサイズ再描画コールバック（TASK-23.1）。X11 はモーダルループが無く元々ライブなので no-op スタブ。
+    pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        _ = self;
+        _ = ctx;
+        _ = cb;
+    }
+
+    /// destroy 用の private clear 経路（no-op。TASK-23.1）。
+    pub fn clearRedrawCallback(self: Window) void {
+        _ = self;
+    }
 };
 
 /// CursorShape → X11 Cursor を生成する（失敗時は 0=None）。default/crosshair は標準カーソルフォント、

@@ -60,6 +60,41 @@ fn nativePumpPoll(ctx: *anyopaque) bool {
     return inner.pollEvents();
 }
 
+// ============================================================================
+// ライブリサイズ redraw コールバック（TASK-23.1）
+// ============================================================================
+//
+// OS のモーダル/ネストした event-tracking ループ（枠ドラッグ中）から app へ
+// 「今 1 フレーム描いてほしい」とだけ通知する opt-in 機構。
+//
+// 契約:
+// - callback は**イベントポンプ（pollEvents 内の sendEvent / DispatchMessageW）実行中**に呼ばれる。
+// - callback 内で `pollEvents` を呼んではならない（ネイティブポンプへの再入）。
+// - `nextEvent` はキューを読むだけ（ポンプしない）なので呼んでよい。
+// - モーダルダイアログ（file dialog）を callback から開いてはならない。
+// - lockFramebuffer 保持中に pollEvents を呼ぶ設計のアプリは登録不可。
+// - 単一プロセス・単一ウィンドウ前提の module-level 状態（harness / registerProbe と同じ設計）。
+// - harness 有効時（VP_HARNESS_*）は登録自体をしない（frame_index / 仮想クロック / replay の
+//   bit 決定論を壊さないため。registerProbe の「harness 無効時 no-op」と対称）。
+
+/// OS モーダルループ中に backend が 1 フレームの描画を app へ要求するコールバック型。
+pub const RedrawFn = *const fn (ctx: *anyopaque) void;
+
+var redraw_guard: struct {
+    ctx: *anyopaque = undefined,
+    cb: ?RedrawFn = null,
+    in_callback: bool = false,
+} = .{};
+
+fn redrawWrapper(ctx: *anyopaque) void {
+    _ = ctx;
+    if (redraw_guard.in_callback) return;
+    const cb = redraw_guard.cb orelse return;
+    redraw_guard.in_callback = true;
+    defer redraw_guard.in_callback = false;
+    cb(redraw_guard.ctx);
+}
+
 // 型は platform_types を単一ソースに re-export（backend 間で乖離させない）
 pub const Error = types.Error;
 pub const KeyCode = types.KeyCode;
@@ -121,10 +156,14 @@ pub const Window = struct {
     }
 
     pub fn destroy(self: Window) void {
+        // callback clear は public setRedrawCallback に null を通さず、facade/backend の
+        // private clear 経路で行う（TASK-23.1 実装メモ）。destroy 後の遅延 setFrameSize 防御。
+        redraw_guard = .{};
         if (self.headless) {
             harness.destroyHeadlessWindow();
             return;
         }
+        self.inner.clearRedrawCallback();
         self.inner.destroy();
     }
 
@@ -204,6 +243,16 @@ pub const Window = struct {
     pub fn setCursor(self: Window, shape: CursorShape) void {
         if (self.headless) return;
         self.inner.setCursor(shape);
+    }
+
+    /// OS のモーダルループ（ライブリサイズ等）中に backend が 1 フレームの描画を app へ要求する
+    /// opt-in 登録（TASK-23.1）。未登録時は backend が何も呼ばず従来挙動。
+    /// harness 有効時（VP_HARNESS_*）および headless 時は登録自体をしない（no-op）。
+    /// 再入ガードは facade の `redrawWrapper` に集約（コールバック中の再コールバックを遮断）。
+    pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: RedrawFn) void {
+        if (self.headless or harness.isEnabled()) return;
+        redraw_guard = .{ .ctx = ctx, .cb = cb, .in_callback = false };
+        self.inner.setRedrawCallback(@ptrCast(&redraw_guard), redrawWrapper);
     }
 
     /// 指定 index のゲームパッド状態を取得する（ポーリング主軸。ADR-009 / TASK-80.1・80.2）。

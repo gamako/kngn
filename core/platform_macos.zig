@@ -113,6 +113,26 @@ inline fn makeGamepadDisconnect(ev: c.PlatformEvent) GamepadDisconnect {
 }
 
 // ============================================================================
+// ライブリサイズ redraw トランポリン（TASK-23.1）
+// ============================================================================
+//
+// C ABI の `PlatformRedrawCallback` は `callconv(.c)` が必要なため、facade から渡された
+// Zig `RedrawFn` を module-level に保持し、C トランポリンから呼ぶ。単一ウィンドウ前提。
+
+pub const RedrawFn = *const fn (ctx: *anyopaque) void;
+
+var redraw_trampoline: struct {
+    ctx: *anyopaque = undefined,
+    cb: ?RedrawFn = null,
+} = .{};
+
+fn macosRedrawTrampoline(userdata: ?*anyopaque) callconv(.c) void {
+    _ = userdata;
+    const cb = redraw_trampoline.cb orelse return;
+    cb(redraw_trampoline.ctx);
+}
+
+// ============================================================================
 // Window / Framebuffer
 // ============================================================================
 
@@ -188,6 +208,20 @@ pub const Window = struct {
     /// カーソル形状を設定する（TASK-75.1）。イベント時のみ呼ぶ想定（性能規約の対象外）。
     pub fn setCursor(self: Window, shape: CursorShape) void {
         c.platform_set_cursor(self.handle, @intFromEnum(shape));
+    }
+
+    /// ライブリサイズ再描画コールバック登録（TASK-23.1）。
+    /// facade から渡された Zig 関数を C トランポリン経由で native へ渡す。
+    /// 単一ウィンドウ前提（module-level に `{ctx, cb}` を保持）。
+    pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: RedrawFn) void {
+        redraw_trampoline = .{ .ctx = ctx, .cb = cb };
+        c.platform_set_redraw_callback(self.handle, macosRedrawTrampoline, null);
+    }
+
+    /// destroy 用の private clear 経路（public API に null を通さない。TASK-23.1 実装メモ）。
+    pub fn clearRedrawCallback(self: Window) void {
+        redraw_trampoline = .{};
+        c.platform_set_redraw_callback(self.handle, null, null);
     }
 
     /// 指定 index のゲームパッド状態を取得する（GameController framework 経由。TASK-80.2。ADR-009）。

@@ -432,20 +432,24 @@ class FramebufferView: NSView {
     private var cursorHiddenByThisView: Bool = false  // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
     private var mouseInsideView: Bool = false         // マウスが現在 view 内にあるか（view外では set/hide を保留する）
 
+    // ライブリサイズ再描画 (TASK-23.1)。CADisplayLink 用 FrameCallback とは別 field。
+    private var redrawCallback: PlatformRedrawCallback?
+    private var redrawUserdata: UnsafeMutableRawPointer?
+
     init(frame: NSRect, width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
         self.width = width
         self.height = height
         self.callback = callback
         self.userdata = userdata
 
-        // ダブルバッファを確保
+        // ダブルバッファを確保（calloc = ゼロ初期化 + OOM は nil。objc 版と同型）
         let bufferSize = width * height
-        self.buffer0 = UnsafeMutablePointer<UInt32>.allocate(capacity: bufferSize)
-        self.buffer1 = UnsafeMutablePointer<UInt32>.allocate(capacity: bufferSize)
-
-        // バッファを初期化（ゼロで埋める）
-        self.buffer0.initialize(repeating: 0, count: bufferSize)
-        self.buffer1.initialize(repeating: 0, count: bufferSize)
+        guard let raw0 = calloc(bufferSize, MemoryLayout<UInt32>.size),
+              let raw1 = calloc(bufferSize, MemoryLayout<UInt32>.size) else {
+            fatalError("FramebufferView: OOM allocating framebuffers")
+        }
+        self.buffer0 = raw0.assumingMemoryBound(to: UInt32.self)
+        self.buffer1 = raw1.assumingMemoryBound(to: UInt32.self)
 
         self.currentBuffer = self.buffer0
         self.displayBuffer = self.buffer1
@@ -455,8 +459,14 @@ class FramebufferView: NSView {
 
         // no-copy provider（objc 版 CGDataProviderCreateWithData と同型。TASK-55）。
         // バッファは view が所有するため releaseData は no-op。
-        self.provider0 = Self.makeNoCopyProvider(buffer: self.buffer0, count: bufferSize)
-        self.provider1 = Self.makeNoCopyProvider(buffer: self.buffer1, count: bufferSize)
+        guard let p0 = Self.makeNoCopyProvider(buffer: self.buffer0, count: bufferSize),
+              let p1 = Self.makeNoCopyProvider(buffer: self.buffer1, count: bufferSize) else {
+            free(raw0)
+            free(raw1)
+            fatalError("FramebufferView: failed to create CGDataProvider")
+        }
+        self.provider0 = p0
+        self.provider1 = p1
 
         // レイヤー
         self.contentLayer = CALayer()
@@ -500,14 +510,15 @@ class FramebufferView: NSView {
     }
 
     /// buffer を直接参照する no-copy CGDataProvider を作る（コピーなし。TASK-55）。
+    /// 失敗時は nil（force unwrap しない。resizeBuffers の回復可能経路用）。
     /// buffer の解放前に provider の参照（layer.contents 含む）を必ず切ること。
-    private static func makeNoCopyProvider(buffer: UnsafeMutablePointer<UInt32>, count: Int) -> CGDataProvider {
+    private static func makeNoCopyProvider(buffer: UnsafeMutablePointer<UInt32>, count: Int) -> CGDataProvider? {
         return CGDataProvider(
             dataInfo: nil,
             data: UnsafeRawPointer(buffer),
             size: count * MemoryLayout<UInt32>.size,
             releaseData: { _, _, _ in } // バッファは view 所有（no-op）
-        )!
+        )
     }
 
     /// 表示中バッファに対応する no-copy provider から CGImage を作る（ピクセルコピーなし）。
@@ -761,32 +772,46 @@ class FramebufferView: NSView {
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
     }
 
-    // TASK-23: 新サイズへ two-phase でバッファを再確保する。
+    // TASK-23 / TASK-23.1: 新サイズへ two-phase でバッファを再確保する。
     // TASK-55 で provider が buffer を **no-copy 参照**するため、旧 buffer の解放前に
     // 「layer.contents の参照を切る → 旧 provider を解放する」順序が必須（objc 版と同順序）。
     // 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
-    func resizeBuffers(width w0: Int, height h0: Int) {
+    // 戻り値: サイズが実際に変わって再確保した場合 true。変化なし / OOM / provider 失敗は
+    // false（旧サイズ維持・redraw callback 非発火。allocate trap は使わない）。
+    @discardableResult
+    func resizeBuffers(width w0: Int, height h0: Int) -> Bool {
         let w = max(1, w0)
         let h = max(1, h0)
-        if w == width && h == height { return } // 変化なし
+        if w == width && h == height { return false } // 変化なし
         let newSize = w * h
-        // phase 1: 新バッファ + 新 no-copy provider を確保（Swift の allocate は失敗時 trap）
-        let nb0 = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
-        let nb1 = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
-        nb0.initialize(repeating: 0, count: newSize)
-        nb1.initialize(repeating: 0, count: newSize)
-        let np0 = Self.makeNoCopyProvider(buffer: nb0, count: newSize)
-        let np1 = Self.makeNoCopyProvider(buffer: nb1, count: newSize)
-        // phase 2: 旧 buffer への参照を先に全て切る（contents → provider の順）
+
+        // phase 1: 新バッファ + 新 no-copy provider を確保（成功するまで旧リソースには触れない）
+        guard let raw0 = calloc(newSize, MemoryLayout<UInt32>.size) else { return false }
+        guard let raw1 = calloc(newSize, MemoryLayout<UInt32>.size) else {
+            free(raw0)
+            return false
+        }
+        let nb0 = raw0.assumingMemoryBound(to: UInt32.self)
+        let nb1 = raw1.assumingMemoryBound(to: UInt32.self)
+
+        guard let np0 = Self.makeNoCopyProvider(buffer: nb0, count: newSize) else {
+            free(raw0)
+            free(raw1)
+            return false
+        }
+        guard let np1 = Self.makeNoCopyProvider(buffer: nb1, count: newSize) else {
+            free(raw0)
+            free(raw1)
+            return false // np0 はローカル ARC で解放
+        }
+
+        // phase 2: 旧 buffer への参照を先に全て切る（contents → provider の順。TASK-55）
         contentLayer.contents = nil
         provider0 = nil
         provider1 = nil
-        // phase 3: 旧バッファを破棄して差し替え
-        let oldSize = width * height
-        buffer0.deinitialize(count: oldSize)
-        buffer0.deallocate()
-        buffer1.deinitialize(count: oldSize)
-        buffer1.deallocate()
+        // phase 3: 旧バッファを破棄して差し替え（calloc 所有なので free）
+        free(UnsafeMutableRawPointer(buffer0))
+        free(UnsafeMutableRawPointer(buffer1))
         buffer0 = nb0
         buffer1 = nb1
         provider0 = np0
@@ -796,12 +821,22 @@ class FramebufferView: NSView {
         width = w
         height = h
         contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+        return true
     }
 
     // NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
+    // resizeBuffers 成功（実サイズ変化）のときだけ redraw callback を発火する（TASK-23.1）。
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        resizeBuffers(width: Int(newSize.width), height: Int(newSize.height))
+        if resizeBuffers(width: Int(newSize.width), height: Int(newSize.height)), let cb = redrawCallback {
+            cb(redrawUserdata)
+        }
+    }
+
+    // ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+    func setRedrawCallback(_ cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
+        redrawCallback = cb
+        redrawUserdata = userdata
     }
 
     deinit {
@@ -819,11 +854,8 @@ class FramebufferView: NSView {
         contentLayer.contents = nil
         provider0 = nil
         provider1 = nil
-        let bufferSize = width * height
-        buffer0.deinitialize(count: bufferSize)
-        buffer0.deallocate()
-        buffer1.deinitialize(count: bufferSize)
-        buffer1.deallocate()
+        free(UnsafeMutableRawPointer(buffer0))
+        free(UnsafeMutableRawPointer(buffer1))
     }
 }
 
@@ -1054,6 +1086,14 @@ func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32)
     default:                                         s = PLATFORM_CURSOR_DEFAULT
     }
     handle.view.setCursorShape(s)
+}
+
+// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+@_cdecl("platform_set_redraw_callback")
+func platform_set_redraw_callback(platformWindow: UnsafeMutableRawPointer?, cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.view.setRedrawCallback(cb, userdata: userdata)
 }
 
 // イベント取得API

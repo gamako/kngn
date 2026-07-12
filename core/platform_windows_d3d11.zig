@@ -386,6 +386,16 @@ pub const Window = struct {
         _ = self;
         _ = shape;
     }
+
+    /// ライブリサイズ再描画コールバック登録（TASK-23.1）。Core へ委譲。
+    pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        self.core.setRedrawCallback(ctx, cb);
+    }
+
+    /// destroy 用の private clear 経路（TASK-23.1 実装メモ）。
+    pub fn clearRedrawCallback(self: Window) void {
+        self.core.clearRedrawCallback();
+    }
 };
 
 /// swap chain backbuffer と upload texture を新サイズへ作り直す（TASK-23。present から lazy 呼び出し）。

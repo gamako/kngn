@@ -678,10 +678,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     // present(submitFrame) とは同一メインスレッドで直列なので非並行。
     // - 旧 CPU buffer: submitFrame で texture.replace により同期コピー済み → GPU は非同期参照しない → 解放安全。
     // - 旧 texture: inflight command buffer が ARC で完了まで保持 → 配列から外しても安全。
-    func resize(width w0: Int, height h0: Int) {
+    // 戻り値: サイズが実際に変わって再確保した場合 true（TASK-23.1 redraw 発火判定用）。
+    @discardableResult
+    func resize(width w0: Int, height h0: Int) -> Bool {
         let w = max(1, w0)
         let h = max(1, h0)
-        if w == width && h == height { return } // 変化なし
+        if w == width && h == height { return false } // 変化なし
         let newSize = w * h
 
         // phase 1: 新リソースを確保
@@ -707,7 +709,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 buf.deinitialize(count: newSize)
                 buf.deallocate()
             }
-            return
+            return false
         }
 
         // phase 2: 旧 CPU buffer を解放して swap（texture は ARC に任せる）
@@ -721,6 +723,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         width = w
         height = h
         currentSlotIndex = 0
+        return true
     }
 }
 
@@ -736,6 +739,10 @@ class MetalFramebufferView: MTKView {
     private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // 直近に要求された形状
     private var cursorHiddenByThisView: Bool = false  // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
     private var mouseInsideView: Bool = false         // マウスが現在 view 内にあるか（view外では set/hide を保留する）
+
+    // ライブリサイズ再描画 (TASK-23.1)。CADisplayLink 用 FrameCallback とは別 field。
+    private var redrawCallback: PlatformRedrawCallback?
+    private var redrawUserdata: UnsafeMutableRawPointer?
 
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
@@ -768,9 +775,20 @@ class MetalFramebufferView: MTKView {
 
     // NSView がリサイズ時に呼ぶ。renderer の fb を新しい logical サイズへ再確保する（TASK-23）。
     // MTKView の drawableSize は別途自動更新され、texture は drawable へ upscale される。
+    // サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。
+    // callback 内 present は presentManual → view.draw() で同期。manual モードは isPaused=true）。
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        metalRenderer?.resize(width: Int(newSize.width), height: Int(newSize.height))
+        guard let renderer = metalRenderer else { return }
+        if renderer.resize(width: Int(newSize.width), height: Int(newSize.height)), let cb = redrawCallback {
+            cb(redrawUserdata)
+        }
+    }
+
+    // ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+    func setRedrawCallback(_ cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
+        redrawCallback = cb
+        redrawUserdata = userdata
     }
 
     // ========================================
@@ -1173,6 +1191,14 @@ func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32)
     default:                                         s = PLATFORM_CURSOR_DEFAULT
     }
     handle.metalView.setCursorShape(s)
+}
+
+// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+@_cdecl("platform_set_redraw_callback")
+func platform_set_redraw_callback(platformWindow: UnsafeMutableRawPointer?, cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.metalView.setRedrawCallback(cb, userdata: userdata)
 }
 
 // イベント取得API

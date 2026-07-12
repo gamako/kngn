@@ -273,6 +273,10 @@ pub const Core = struct {
     last_x: i32, // 直近のマウス client 座標（focus/capture 喪失時の synthetic mouse_up 用）
     last_y: i32,
 
+    // ライブリサイズ再描画 (TASK-23.1)。未登録時は null。destroy で clear。
+    redraw_ctx: *anyopaque = undefined,
+    redraw_fn: ?*const fn (ctx: *anyopaque) void = null,
+
     fn enqueue(self: *Core, ev: Event) void {
         self.queue.enqueue(ev);
     }
@@ -318,6 +322,8 @@ pub const Core = struct {
             .buttons = .{},
             .last_x = 0,
             .last_y = 0,
+            .redraw_ctx = undefined,
+            .redraw_fn = null,
         };
 
         const hwnd = CreateWindowExW(
@@ -364,9 +370,21 @@ pub const Core = struct {
     /// window を破棄し、backing と Core 自身を解放する。
     /// （presentation resource の解放は backend 側が core.destroy より前に行う。）
     pub fn destroy(self: *Core) void {
+        self.redraw_fn = null;
         _ = DestroyWindow(self.hwnd);
         alloc.free(self.backing);
         alloc.destroy(self);
+    }
+
+    /// ライブリサイズ再描画コールバック登録（TASK-23.1）。
+    pub fn setRedrawCallback(self: *Core, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        self.redraw_ctx = ctx;
+        self.redraw_fn = cb;
+    }
+
+    /// destroy 用の private clear 経路（public API に null を通さない。TASK-23.1 実装メモ）。
+    pub fn clearRedrawCallback(self: *Core) void {
+        self.redraw_fn = null;
     }
 
     pub fn pollEvents(self: *Core) bool {
@@ -428,9 +446,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_SIZE => {
             // 自由リサイズ（TASK-23）。最小化(SIZE_MINIMIZED)以外で client area の新寸法へ backing を再確保。
             // lparam: LOWORD=client width, HIWORD=client height。pollEvents（lock 外）で処理されるので安全。
+            // サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。WM_TIMER は不採用）。
             if (wparam != SIZE_MINIMIZED) {
                 const lw: u32 = @truncate(@as(usize, @bitCast(lparam)));
+                const old_w = core.width;
+                const old_h = core.height;
                 core.resizeBacking(lw & 0xFFFF, (lw >> 16) & 0xFFFF);
+                if ((core.width != old_w or core.height != old_h)) {
+                    if (core.redraw_fn) |f| f(core.redraw_ctx);
+                }
             }
             return 0;
         },

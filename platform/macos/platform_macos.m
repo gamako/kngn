@@ -294,6 +294,10 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
     PlatformCursorShape currentCursorShape;  // 直近に要求された形状（既定 PLATFORM_CURSOR_DEFAULT）
     BOOL cursorHiddenByThisView;             // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
     BOOL mouseInsideView;                    // マウスが現在 view 内にあるか（view外では set/hide を保留する）
+
+    // ライブリサイズ再描画 (TASK-23.1)。FrameCallback とは別。未登録時は NULL。
+    PlatformRedrawCallback redrawCallback;
+    void* redrawUserdata;
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
@@ -315,6 +319,9 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 // カーソル形状を設定する (TASK-75.1)。platform_set_cursor から呼ばれる。
 - (void)setCursorShape:(PlatformCursorShape)shape;
 
+// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==NULL で解除。
+- (void)setRedrawCallback:(PlatformRedrawCallback)cb userdata:(void*)ud;
+
 @end
 
 @implementation FramebufferView
@@ -333,6 +340,8 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
         currentCursorShape = PLATFORM_CURSOR_DEFAULT;
         cursorHiddenByThisView = NO;
         mouseInsideView = NO;
+        redrawCallback = NULL;
+        redrawUserdata = NULL;
 
         // ダブルバッファを確保（ページアラインメント推奨）
         buffer0 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
@@ -577,9 +586,22 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 }
 
 // NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
+// サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。
+// AppKit の live-resize tracking run loop 中でも CATransaction commit により画面反映される）。
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
-    [self resizeBuffersTo:(int)newSize.width height:(int)newSize.height];
+    const int old_w = width;
+    const int old_h = height;
+    if ([self resizeBuffersTo:(int)newSize.width height:(int)newSize.height]) {
+        if ((width != old_w || height != old_h) && redrawCallback) {
+            redrawCallback(redrawUserdata);
+        }
+    }
+}
+
+- (void)setRedrawCallback:(PlatformRedrawCallback)cb userdata:(void*)ud {
+    redrawCallback = cb;
+    redrawUserdata = ud;
 }
 
 // ========================================
@@ -1154,6 +1176,14 @@ void platform_set_cursor(PlatformWindow* platformWindow, int shape) {
 
     @autoreleasepool {
         [platformWindow->view setCursorShape:s];
+    }
+}
+
+// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==NULL で解除。
+void platform_set_redraw_callback(PlatformWindow* platformWindow, PlatformRedrawCallback cb, void* userdata) {
+    if (!platformWindow) return;
+    @autoreleasepool {
+        [platformWindow->view setRedrawCallback:cb userdata:userdata];
     }
 }
 

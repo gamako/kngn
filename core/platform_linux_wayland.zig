@@ -1279,6 +1279,18 @@ pub const Window = struct {
         st.cursor_shape = shape;
         applyCursor(st); // content 外（have_pointer_enter=false）なら no-op、次の enter で反映
     }
+
+    /// ライブリサイズ再描画コールバック（TASK-23.1）。Wayland はモーダルループが無く元々ライブなので no-op スタブ。
+    pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        _ = self;
+        _ = ctx;
+        _ = cb;
+    }
+
+    /// destroy 用の private clear 経路（no-op。TASK-23.1）。
+    pub fn clearRedrawCallback(self: Window) void {
+        _ = self;
+    }
 };
 
 // ---- system cursor（TASK-75.3）----
