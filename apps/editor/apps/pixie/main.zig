@@ -85,7 +85,7 @@ const MARCH_PERIOD: f64 = 8.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
-const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project };
+const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project, export_seq, export_sheet };
 
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
@@ -550,6 +550,8 @@ const App = struct {
             .load_palette => self.doLoadPalette(),
             .save_project => self.doSaveProject(),
             .open_project => self.doOpenProject(),
+            .export_seq => self.doExportSeq(),
+            .export_sheet => self.doExportSheet(),
         }
     }
 
@@ -1145,6 +1147,71 @@ const App = struct {
         if (self.current_project_path) |old| self.gpa.free(old);
         self.current_project_path = path; // 移譲
         self.setSaveMsg("Project loaded: {s}", .{std.fs.path.basename(path)});
+    }
+
+    // ── 連番 PNG / スプライトシート書き出し（TASK-45.5）──────────────────────
+
+    /// saveFileDialog で選んだ path から `.png` 拡張子を除いた stem を返す（連番書き出し用）。
+    fn pathToPngStem(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        if (path.len >= 4 and std.ascii.eqlIgnoreCase(path[path.len - 4 ..], ".png")) {
+            return allocator.dupe(u8, path[0 .. path.len - 4]);
+        }
+        return allocator.dupe(u8, path);
+    }
+
+    /// ダイアログで stem を選び連番 PNG（`<stem>_NNNN.png`）を書き出す。
+    fn doExportSeq(self: *App) void {
+        const maybe = platform.saveFileDialog(self.gpa, self.io, .{
+            .default_name = "sequence.png",
+            .allowed_ext = "png",
+        }) catch |err| {
+            self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return;
+        const stem = App.pathToPngStem(self.gpa, path) catch |err| {
+            self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return;
+        };
+        defer self.gpa.free(path);
+        defer self.gpa.free(stem);
+        core.document_io.exportPngSequence(self.io, stem, &self.doc, self.gpa) catch |err| {
+            self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.setSaveMsg("Exported sequence: {s}", .{std.fs.path.basename(stem)});
+    }
+
+    /// ダイアログで path を選びスプライトシート PNG を書き出す（columns/margin は既定）。
+    fn doExportSheet(self: *App) void {
+        const maybe = platform.saveFileDialog(self.gpa, self.io, .{
+            .default_name = "spritesheet.png",
+            .allowed_ext = "png",
+        }) catch |err| {
+            self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const path = maybe orelse return;
+        defer self.gpa.free(path);
+        core.document_io.exportSpriteSheet(self.io, path, &self.doc, self.gpa, .{}) catch |err| {
+            self.setSaveMsg("Export failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.setSaveMsg("Exported sheet: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// 指定 stem へ連番 PNG を直接書き出す（action `export_seq <stem>` 用）。
+    fn doExportSeqTo(self: *App, stem: []const u8) !void {
+        if (self.doc.frames.items.len == 0) return error.NoFrames;
+        try core.document_io.exportPngSequence(self.io, stem, &self.doc, self.gpa);
+        self.setSaveMsg("Exported sequence: {s}", .{std.fs.path.basename(stem)});
+    }
+
+    /// 指定 path へスプライトシートを直接書き出す（action `export_sheet` 用）。
+    fn doExportSheetTo(self: *App, path: []const u8, opts: core.document_io.SpriteSheetOpts) !void {
+        try core.document_io.exportSpriteSheet(self.io, path, &self.doc, self.gpa, opts);
+        self.setSaveMsg("Exported sheet: {s}", .{std.fs.path.basename(path)});
     }
 
     /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）。`!void` 化（TASK-64）は UI
@@ -2606,6 +2673,41 @@ fn actionGotoFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
+/// `export_seq <stem>`: 連番 PNG 書き出し（CommandLog 非記録・undo 対象外）。
+fn actionExportSeq(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const stem = try actions.parseExportSeq(args);
+    app.doExportSeqTo(stem) catch |err| {
+        if (err == error.NoFrames) {
+            platform.setActionErrorDetail("no_frames", "add frames before export");
+        } else if (err == error.OutOfMemory) {
+            platform.setActionErrorDetail("out_of_memory", "reduce canvas size or frame count");
+        }
+        return err;
+    };
+    return std.fmt.bufPrint(buf, "ok stem={s}", .{stem}) catch "ok";
+}
+
+/// `export_sheet <path> [columns] [margin]`: スプライトシート書き出し（CommandLog 非記録）。
+fn actionExportSheet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const parsed = try actions.parseExportSheet(args);
+    const opts: core.document_io.SpriteSheetOpts = .{
+        .columns = parsed.columns,
+        .margin = parsed.margin,
+    };
+    app.doExportSheetTo(parsed.path, opts) catch |err| {
+        switch (err) {
+            error.NoFrames => platform.setActionErrorDetail("no_frames", "add frames before export"),
+            error.SheetTooLarge => platform.setActionErrorDetail("sheet_too_large", "reduce columns/margin or canvas size"),
+            error.OutOfMemory => platform.setActionErrorDetail("out_of_memory", "reduce canvas size or frame count"),
+            else => {},
+        }
+        return err;
+    };
+    return std.fmt.bufPrint(buf, "ok path={s}", .{parsed.path}) catch "ok";
+}
+
 /// `recipe_save <path>`: CommandLog → recipe ファイル（header.app_name="pixie"）。記録しない（メタ操作）。
 fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
@@ -2977,6 +3079,14 @@ const pixie_args_palette_set: @FieldType(platform.Action, "args") = &.{
 const pixie_args_goto_frame: @FieldType(platform.Action, "args") = &.{
     .{ .name = "idx", .kind = "int", .desc = "frame index" },
 };
+const pixie_args_export_seq: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "stem", .kind = "path", .desc = "output stem for <stem>_NNNN.png" },
+};
+const pixie_args_export_sheet: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "path", .kind = "path" },
+    .{ .name = "columns", .kind = "int", .optional = true, .desc = "0=auto ceil(sqrt(n))" },
+    .{ .name = "margin", .kind = "int", .optional = true, .desc = "gap between frames in px" },
+};
 
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
@@ -3011,6 +3121,9 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "play", .ctx = app, .run = actionPlay, .network_policy = .local_only, .desc = "start timeline playback", .args = pixie_args_none });
     platform.registerAction(.{ .name = "pause", .ctx = app, .run = actionPause, .network_policy = .local_only, .desc = "pause timeline playback", .args = pixie_args_none });
     platform.registerAction(.{ .name = "goto_frame", .ctx = app, .run = actionGotoFrame, .network_policy = .local_only, .desc = "select frame by index (view only, no undo)", .args = pixie_args_goto_frame });
+    // TASK-45.5: 書き出し（executor 非経由・CommandLog 非記録・local_only）
+    platform.registerAction(.{ .name = "export_seq", .ctx = app, .run = actionExportSeq, .network_policy = .local_only, .desc = "export numbered PNG sequence", .args = pixie_args_export_seq });
+    platform.registerAction(.{ .name = "export_sheet", .ctx = app, .run = actionExportSheet, .network_policy = .local_only, .desc = "export sprite sheet PNG", .args = pixie_args_export_sheet });
     // TASK-89: 末尾追加のみ（並列制約。既存行の変更・並べ替え禁止）
     platform.registerAction(.{ .name = "replace_color", .ctx = app, .run = recordedAction("replace_color", .record), .network_policy = .relay, .desc = "replace color A→B on layer ([#id|idx] from to; undoable)", .args = pixie_args_replace_color });
     // palette は document 状態（SYNC 対象）なので session 中のローカル変更は diverge → reject_when_synced
@@ -3700,6 +3813,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // .pix プロジェクト（レイヤー保持）。PNG 保存とは別（TASK-63）。ラベルは "Pal" と対の短縮 "Prj"
     if (ctx.button("Prj Open")) app.pending_file_op = .open_project;
     if (ctx.button("Prj Save")) app.pending_file_op = .save_project;
+    if (ctx.button("Exp Seq")) app.pending_file_op = .export_seq;
+    if (ctx.button("Exp Sheet")) app.pending_file_op = .export_sheet;
     if (ctx.button("Undo")) app.doUndo() catch {};
     if (ctx.button("Redo")) app.doRedo() catch {};
     if (ctx.button("Pal Save")) app.pending_file_op = .save_palette;

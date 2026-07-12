@@ -499,6 +499,80 @@ pub fn exportPngSequence(io: std.Io, stem: []const u8, doc: *Document, gpa: Allo
     }
 }
 
+pub const SpriteSheetOpts = struct {
+    columns: u32 = 0,
+    margin: u32 = 0,
+};
+
+/// 全フレームを compositeStraight（フラット透明）して 1 枚のスプライトシート PNG へ書き出す。
+/// `columns=0` は `ceil(sqrt(n))` を自動採用。セル間余白は `margin` px（透明）。
+pub fn exportSpriteSheet(io: std.Io, path: []const u8, doc: *Document, gpa: Allocator, opts: SpriteSheetOpts) !void {
+    const n_frames = doc.frames.items.len;
+    if (n_frames == 0) return error.NoFrames;
+
+    const cols: u32 = if (opts.columns == 0) blk: {
+        const sqrt_n = @sqrt(@as(f64, @floatFromInt(n_frames)));
+        break :blk @intFromFloat(@ceil(sqrt_n));
+    } else opts.columns;
+    const rows: u32 = @intCast((n_frames + @as(usize, cols) - 1) / @as(usize, cols));
+
+    const fw: u64 = doc.width;
+    const fh: u64 = doc.height;
+    const margin: u64 = opts.margin;
+
+    // 乗算・加算とも checked（巨大な columns/margin 引数でも panic せず SheetTooLarge を返す）
+    const cells_w = std.math.mul(u64, cols, fw) catch return error.SheetTooLarge;
+    const gaps_w = std.math.mul(u64, @as(u64, cols) -| 1, margin) catch return error.SheetTooLarge;
+    const sheet_w_u64 = std.math.add(u64, cells_w, gaps_w) catch return error.SheetTooLarge;
+    const cells_h = std.math.mul(u64, rows, fh) catch return error.SheetTooLarge;
+    const gaps_h = std.math.mul(u64, @as(u64, rows) -| 1, margin) catch return error.SheetTooLarge;
+    const sheet_h_u64 = std.math.add(u64, cells_h, gaps_h) catch return error.SheetTooLarge;
+    const pixel_count_u64 = std.math.mul(u64, sheet_w_u64, sheet_h_u64) catch return error.SheetTooLarge;
+    if (sheet_w_u64 > std.math.maxInt(u32) or sheet_h_u64 > std.math.maxInt(u32) or
+        pixel_count_u64 > std.math.maxInt(usize))
+    {
+        return error.SheetTooLarge;
+    }
+
+    const sheet_w: u32 = @intCast(sheet_w_u64);
+    const sheet_h: u32 = @intCast(sheet_h_u64);
+    const pixel_count: usize = @intCast(pixel_count_u64);
+
+    const buf = try gpa.alloc(u32, pixel_count);
+    defer gpa.free(buf);
+    @memset(buf, 0x00000000);
+
+    const saved_frame = doc.selected_frame;
+    defer {
+        doc.selected_frame = saved_frame;
+        doc.resyncActiveView(gpa);
+    }
+
+    const fw_usize: usize = @intCast(fw);
+    const fh_usize: usize = @intCast(fh);
+    const margin_usize: usize = @intCast(margin);
+    const sheet_w_usize: usize = @intCast(sheet_w);
+
+    for (0..n_frames) |f| {
+        doc.selected_frame = @intCast(f);
+        doc.resyncActiveView(gpa);
+        const flat = doc.active_view.compositeStraight();
+
+        const col = @as(u32, @intCast(f)) % cols;
+        const row = @as(u32, @intCast(f)) / cols;
+        const dst_x = @as(usize, col) * (fw_usize + margin_usize);
+        const dst_y = @as(usize, row) * (fh_usize + margin_usize);
+
+        for (0..fh_usize) |y| {
+            const src_row = flat[y * fw_usize ..][0..fw_usize];
+            const dst_off = (dst_y + y) * sheet_w_usize + dst_x;
+            @memcpy(buf[dst_off..][0..fw_usize], src_row);
+        }
+    }
+
+    try io_png.savePNG(io, path, buf, sheet_w, sheet_h, gpa);
+}
+
 // ============================ tests ============================
 
 const testing = std.testing;
@@ -1161,6 +1235,99 @@ test "file I/O: saveDocument→loadDocument 往復 + サイズ拒否 + exportPng
     }
     const flat = c.compositeStraight();
     try testing.expectEqualSlices(u32, flat, png_img.pixels);
+}
+
+fn paintFramePixel(doc: *Document, gpa: Allocator, frame_idx: u32, color: u32) !void {
+    doc.selected_frame = frame_idx;
+    doc.resyncActiveView(gpa);
+    const px = doc.activeCanvas().layerPixels(0);
+    px[0] = color;
+    try doc.pushPaintOp(gpa, 0, try gpa.dupe(document_mod.PixelDiff, &.{
+        .{ .idx = 0, .before = 0, .after = color },
+    }));
+}
+
+test "exportSpriteSheet: 2x2 配置・1 frame 恒等・margin・columns 指定・frame 0 はエラー" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    const png = @import("png");
+
+    // frame 数 0 は拒否
+    var empty = try Document.initEmpty(gpa, 2, 2);
+    defer empty.deinit();
+    try testing.expectError(error.NoFrames, exportSpriteSheet(io, ".task45_sheet_empty.png", &empty, gpa, .{}));
+
+    // 1 frame 恒等（columns 自動 = 1）
+    var one = try Document.init(gpa, 2, 2);
+    defer one.deinit();
+    try paintFramePixel(&one, gpa, 0, 0xFFFF0000);
+    const one_path = ".task45_sheet_one.png";
+    defer std.Io.Dir.cwd().deleteFile(io, one_path) catch {};
+    try exportSpriteSheet(io, one_path, &one, gpa, .{});
+    const one_img = try png.decodePNGFile(io, gpa, one_path);
+    defer {
+        var img = one_img;
+        img.deinit(gpa);
+    }
+    try testing.expectEqual(@as(u32, 2), one_img.width);
+    try testing.expectEqual(@as(u32, 2), one_img.height);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), one_img.pixels[0]);
+
+    // 2x2 配置（4 frame・2x2 canvas・columns=2）
+    var doc = try Document.init(gpa, 2, 2);
+    defer doc.deinit();
+    const colors = [_]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
+    try paintFramePixel(&doc, gpa, 0, colors[0]);
+    for (1..4) |fi| {
+        try doc.addFrame(gpa, @intCast(fi));
+        try paintFramePixel(&doc, gpa, @intCast(fi), colors[fi]);
+    }
+    const sheet_path = ".task45_sheet_2x2.png";
+    defer std.Io.Dir.cwd().deleteFile(io, sheet_path) catch {};
+    try exportSpriteSheet(io, sheet_path, &doc, gpa, .{ .columns = 2 });
+    const sheet = try png.decodePNGFile(io, gpa, sheet_path);
+    defer {
+        var img = sheet;
+        img.deinit(gpa);
+    }
+    try testing.expectEqual(@as(u32, 4), sheet.width);
+    try testing.expectEqual(@as(u32, 4), sheet.height);
+    // 各フレームの (0,0) ピクセルが格子位置へ配置される
+    try testing.expectEqual(colors[0], sheet.pixels[0]); // (0,0)
+    try testing.expectEqual(colors[1], sheet.pixels[2]); // (2,0)
+    try testing.expectEqual(colors[2], sheet.pixels[8]); // (0,2) = row 2 * width 4
+    try testing.expectEqual(colors[3], sheet.pixels[10]); // (2,2)
+
+    // margin 付き（2 frame・1x2 canvas・columns=2・margin=1）
+    var margin_doc = try Document.init(gpa, 1, 2);
+    defer margin_doc.deinit();
+    try paintFramePixel(&margin_doc, gpa, 0, 0xFFFF0000);
+    try margin_doc.addFrame(gpa, 1);
+    try paintFramePixel(&margin_doc, gpa, 1, 0xFF00FF00);
+    const margin_path = ".task45_sheet_margin.png";
+    defer std.Io.Dir.cwd().deleteFile(io, margin_path) catch {};
+    try exportSpriteSheet(io, margin_path, &margin_doc, gpa, .{ .columns = 2, .margin = 1 });
+    const margin_img = try png.decodePNGFile(io, gpa, margin_path);
+    defer {
+        var img = margin_img;
+        img.deinit(gpa);
+    }
+    // width = 2*1 + 1*1 = 3, height = 1*2 = 2
+    try testing.expectEqual(@as(u32, 3), margin_img.width);
+    try testing.expectEqual(@as(u32, 2), margin_img.height);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), margin_img.pixels[0]);
+    try testing.expectEqual(@as(u32, 0xFF00FF00), margin_img.pixels[2]); // x = 1 + 1 margin
+}
+
+test "exportSpriteSheet: 巨大 columns/margin は SheetTooLarge（checked 演算・panic しない）" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    var doc = try Document.init(gpa, 2, 2);
+    defer doc.deinit();
+    try testing.expectError(error.SheetTooLarge, exportSpriteSheet(io, ".task45_sheet_huge.png", &doc, gpa, .{
+        .columns = std.math.maxInt(u32),
+        .margin = std.math.maxInt(u32),
+    }));
 }
 
 // ── TASK-89: v4 PLTE ──────────────────────────────────────────────────

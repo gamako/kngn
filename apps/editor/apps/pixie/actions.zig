@@ -610,6 +610,32 @@ pub fn parseGotoFrame(args: []const u8) ParseError!u32 {
     return v;
 }
 
+/// `export_seq <stem>` 用: 連番 PNG の stem（path トークン1個・空白 trim のみ）。
+pub fn parseExportSeq(args: []const u8) ParseError![]const u8 {
+    return parsePath(args);
+}
+
+pub const ExportSheetArgs = struct {
+    path: []const u8,
+    columns: u32 = 0,
+    margin: u32 = 0,
+};
+
+/// `export_sheet <path> [columns] [margin]` 用。
+pub fn parseExportSheet(args: []const u8) ParseError!ExportSheetArgs {
+    var it = tokenize(args);
+    const path_tok = it.next() orelse return error.Empty;
+    var result: ExportSheetArgs = .{ .path = path_tok };
+    if (it.next()) |col_tok| {
+        result.columns = std.fmt.parseUnsigned(u32, col_tok, 10) catch return error.InvalidNumber;
+        if (it.next()) |mar_tok| {
+            result.margin = std.fmt.parseUnsigned(u32, mar_tok, 10) catch return error.InvalidNumber;
+        }
+        try expectExhausted(&it);
+    }
+    return result;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -887,6 +913,31 @@ test "parseGotoFrame: 有効値 / Empty / InvalidNumber / TooManyTokens" {
     try testing.expectError(error.InvalidNumber, parseGotoFrame("abc"));
     try testing.expectError(error.InvalidNumber, parseGotoFrame("-1"));
     try testing.expectError(error.TooManyTokens, parseGotoFrame("1 2"));
+}
+
+test "parseExportSeq: parsePath と同型" {
+    try testing.expectEqualStrings("/tmp/seq", try parseExportSeq("/tmp/seq"));
+    try testing.expectError(error.Empty, parseExportSeq(""));
+}
+
+test "parseExportSheet: path のみ / columns+margin / 余剰トークン拒否" {
+    const a = try parseExportSheet("/tmp/sheet.png");
+    try testing.expectEqualStrings("/tmp/sheet.png", a.path);
+    try testing.expectEqual(@as(u32, 0), a.columns);
+    try testing.expectEqual(@as(u32, 0), a.margin);
+
+    const b = try parseExportSheet("/tmp/s.png 4 2");
+    try testing.expectEqualStrings("/tmp/s.png", b.path);
+    try testing.expectEqual(@as(u32, 4), b.columns);
+    try testing.expectEqual(@as(u32, 2), b.margin);
+
+    const c = try parseExportSheet("/tmp/s.png 3");
+    try testing.expectEqual(@as(u32, 3), c.columns);
+    try testing.expectEqual(@as(u32, 0), c.margin);
+
+    try testing.expectError(error.Empty, parseExportSheet(""));
+    try testing.expectError(error.InvalidNumber, parseExportSheet("/tmp/s.png abc"));
+    try testing.expectError(error.TooManyTokens, parseExportSheet("/tmp/s.png 4 2 1"));
 }
 
 test "parseStroke: パラメータ無しは従来文法と後方互換" {
