@@ -7,6 +7,7 @@
 //! ホットパス宣言: present の全画素 swizzle はフレーム毎。入力/init はイベント時・初期化時のみ。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("platform_types");
 const pixelops = @import("pixelops");
 
@@ -222,35 +223,59 @@ var pixels_buf: []u32 = &.{};
 var rgba_buf: []u8 = &.{};
 var fb_w: u32 = 0;
 var fb_h: u32 = 0;
-const gpa = std.heap.wasm_allocator;
+/// 0 = 保留なし。vp_resize がセットし、次の lockFramebuffer 冒頭で適用（フレーム境界）。
+var pending_w: u32 = 0;
+var pending_h: u32 = 0;
+const default_gpa: std.mem.Allocator = if (builtin.cpu.arch.isWasm())
+    std.heap.wasm_allocator
+else
+    std.heap.page_allocator;
+/// テストから OOM を注入できるよう var（本番では default_gpa 固定。init/resize 時のみ使用）。
+var gpa: std.mem.Allocator = default_gpa;
+
+const MIN_FB_W: u32 = 320;
+const MIN_FB_H: u32 = 240;
+const MAX_FB_W: u32 = 8192;
+const MAX_FB_H: u32 = 8192;
+
+fn clampResizeDim(w: u32, h: u32) struct { w: u32, h: u32 } {
+    return .{
+        .w = @max(MIN_FB_W, @min(w, MAX_FB_W)),
+        .h = @max(MIN_FB_H, @min(h, MAX_FB_H)),
+    };
+}
+
+/// JS ResizeObserver から呼ぶ。フレーム中のバッファ差し替えを避け pending に保持する。
+export fn vp_resize(w: u32, h: u32) void {
+    const c = clampResizeDim(w, h);
+    pending_w = c.w;
+    pending_h = c.h;
+}
+
+/// 失敗時は pending を保持したまま返す（旧 framebuffer は two-phase 確保で無傷なので
+/// 旧サイズで描画継続 + 次の lockFramebuffer で再試行）。
+fn applyPendingResize() void {
+    if (pending_w == 0 or pending_h == 0) return;
+    ensureFramebuffer(pending_w, pending_h) catch return;
+    pending_w = 0;
+    pending_h = 0;
+}
 
 fn ensureFramebuffer(w: u32, h: u32) Error!void {
     const n = @as(usize, w) * @as(usize, h);
     if (pixels_buf.len == n and fb_w == w and fb_h == h) return;
 
-    // free 直後に空 slice へ戻し、再 alloc 失敗時の dangling / 二重解放を防ぐ
-    if (pixels_buf.len != 0) {
-        gpa.free(pixels_buf);
-        pixels_buf = &.{};
-    }
-    if (rgba_buf.len != 0) {
-        gpa.free(rgba_buf);
-        rgba_buf = &.{};
-    }
-    fb_w = 0;
-    fb_h = 0;
-
-    pixels_buf = gpa.alloc(u32, n) catch {
-        pixels_buf = &.{};
-        rgba_buf = &.{};
+    // two-phase commit: 新バッファ 2 枚の確保が両方成功してから旧バッファを解放する。
+    // 途中失敗しても旧 framebuffer は無傷（OOM 後も旧サイズで描画継続できる）。
+    const new_pixels = gpa.alloc(u32, n) catch return error.WindowCreationFailed;
+    const new_rgba = gpa.alloc(u8, n * 4) catch {
+        gpa.free(new_pixels);
         return error.WindowCreationFailed;
     };
-    rgba_buf = gpa.alloc(u8, n * 4) catch {
-        gpa.free(pixels_buf);
-        pixels_buf = &.{};
-        rgba_buf = &.{};
-        return error.WindowCreationFailed;
-    };
+    if (pixels_buf.len != 0) gpa.free(pixels_buf);
+    if (rgba_buf.len != 0) gpa.free(rgba_buf);
+    pixels_buf = new_pixels;
+    rgba_buf = new_rgba;
     @memset(pixels_buf, 0);
     fb_w = w;
     fb_h = h;
@@ -266,7 +291,7 @@ pub const Window = struct {
 
     pub fn create(width: u32, height: u32, _: [:0]const u8) Error!Window {
         try ensureFramebuffer(width, height);
-        return .{ .width = width, .height = height };
+        return .{ .width = fb_w, .height = fb_h };
     }
 
     pub fn destroy(_: Window) void {
@@ -298,20 +323,21 @@ pub const Window = struct {
         };
     }
 
-    pub fn lockFramebuffer(self: Window) ?Framebuffer {
+    pub fn lockFramebuffer(_: Window) ?Framebuffer {
+        applyPendingResize();
         if (pixels_buf.len == 0) return null;
         return .{
             .pixels = pixels_buf,
-            .width = self.width,
-            .height = self.height,
+            .width = fb_w,
+            .height = fb_h,
         };
     }
 
-    pub fn present(self: Window) void {
+    pub fn present(_: Window) void {
         if (pixels_buf.len == 0 or rgba_buf.len == 0) return;
         const src = std.mem.sliceAsBytes(pixels_buf);
         pixelops.swizzleBgraToRgba(rgba_buf, src);
-        vp_present(rgba_buf.ptr, self.width, self.height);
+        vp_present(rgba_buf.ptr, fb_w, fb_h);
     }
 
     pub fn setCursor(_: Window, shape: CursorShape) void {
@@ -381,4 +407,102 @@ test "domCodeToKeyCode: pixie 最低限キー" {
     try std.testing.expectEqual(KeyCode.ESCAPE, domCodeToKeyCode("Escape"));
     try std.testing.expectEqual(KeyCode.LEFT, domCodeToKeyCode("ArrowLeft"));
     try std.testing.expectEqual(KeyCode.UNKNOWN, domCodeToKeyCode("F13"));
+}
+
+fn testResetFramebufferState() void {
+    gpa = default_gpa;
+    if (pixels_buf.len != 0) {
+        gpa.free(pixels_buf);
+        pixels_buf = &.{};
+    }
+    if (rgba_buf.len != 0) {
+        gpa.free(rgba_buf);
+        rgba_buf = &.{};
+    }
+    fb_w = 0;
+    fb_h = 0;
+    pending_w = 0;
+    pending_h = 0;
+}
+
+test "vp_resize: lockFramebuffer で寸法反映" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.create(320, 240, "t");
+    defer win.destroy();
+
+    vp_resize(640, 480);
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb.width);
+    try std.testing.expectEqual(@as(u32, 480), fb.height);
+    try std.testing.expectEqual(@as(usize, 640 * 480), fb.pixels.len);
+}
+
+test "vp_resize: 複数回は最後の値が勝つ" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    vp_resize(400, 300);
+    vp_resize(500, 400);
+    vp_resize(640, 480);
+    try std.testing.expectEqual(@as(u32, 640), pending_w);
+    try std.testing.expectEqual(@as(u32, 480), pending_h);
+}
+
+test "vp_resize: clamp min 320x240 max 8192" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    vp_resize(10, 10);
+    try std.testing.expectEqual(@as(u32, 320), pending_w);
+    try std.testing.expectEqual(@as(u32, 240), pending_h);
+
+    vp_resize(10000, 10000);
+    try std.testing.expectEqual(@as(u32, 8192), pending_w);
+    try std.testing.expectEqual(@as(u32, 8192), pending_h);
+}
+
+test "vp_resize: OOM 失敗時は旧 fb 温存 + pending 保持で再試行（codex P1）" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.create(320, 240, "t");
+    defer win.destroy();
+
+    // 以後の alloc を全て失敗させる（two-phase なので旧バッファは無傷のはず）
+    var failing = std.testing.FailingAllocator.init(default_gpa, .{ .fail_index = 0 });
+    gpa = failing.allocator();
+
+    vp_resize(640, 480);
+    const fb = win.lockFramebuffer() orelse unreachable; // 旧 fb で描画継続
+    try std.testing.expectEqual(@as(u32, 320), fb.width);
+    try std.testing.expectEqual(@as(u32, 240), fb.height);
+    try std.testing.expectEqual(@as(u32, 640), pending_w); // pending は保持（再試行対象）
+    try std.testing.expectEqual(@as(u32, 480), pending_h);
+
+    // alloc が回復したら次の lockFramebuffer で適用される
+    gpa = default_gpa;
+    const fb2 = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb2.width);
+    try std.testing.expectEqual(@as(u32, 480), fb2.height);
+    try std.testing.expectEqual(@as(u32, 0), pending_w);
+}
+
+test "vp_resize: pending 未消化中は旧 fb サイズのまま" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.create(320, 240, "t");
+    defer win.destroy();
+
+    _ = win.lockFramebuffer() orelse unreachable;
+    vp_resize(640, 480);
+    try std.testing.expectEqual(@as(u32, 320), fb_w);
+    try std.testing.expectEqual(@as(u32, 240), fb_h);
+    try std.testing.expectEqual(@as(usize, 320 * 240), pixels_buf.len);
+
+    const fb2 = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb2.width);
+    try std.testing.expectEqual(@as(u32, 480), fb2.height);
 }

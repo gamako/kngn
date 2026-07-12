@@ -311,10 +311,14 @@ function shouldPreventKey(e) {
   );
 }
 
-function syncCanvasCssSize() {
-  // logical サイズを CSS にも合わせ、devicePixelRatio でボケないよう属性は logical のまま
-  canvas.style.width = canvas.width + "px";
-  canvas.style.height = canvas.height + "px";
+/** コンテナの論理 px（DPR 非適用）を wasm へ通知。pending 方式でフレーム境界適用。 */
+function reportCanvasSize() {
+  if (!instance) return;
+  const w = Math.round(canvas.clientWidth);
+  const h = Math.round(canvas.clientHeight);
+  if (w > 0 && h > 0) {
+    instance.exports.vp_resize(w, h);
+  }
 }
 
 const importObject = {
@@ -334,7 +338,6 @@ const importObject = {
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
-          syncCanvasCssSize();
         }
       }
       imageData.data.set(wasmView);
@@ -393,8 +396,13 @@ function bindInput() {
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 }
 
+function bindResize() {
+  const ro = new ResizeObserver(() => reportCanvasSize());
+  ro.observe(canvas);
+  reportCanvasSize();
+}
+
 async function main() {
-  syncCanvasCssSize();
   canvas.focus();
 
   const resp = await fetch("./pixie.wasm");
@@ -403,6 +411,7 @@ async function main() {
   memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
 
   bindInput();
+  bindResize();
   instance.exports.vp_init();
 
   function loop(ts) {
