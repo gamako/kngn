@@ -1,0 +1,26 @@
+# Cloudflare Pages — cross-origin isolation for synth (SharedArrayBuffer / AudioWorklet).
+# Pixie (index.html) does not need COOP/COEP.
+#
+# Cloudflare Pages 308-redirects /synth.html -> /synth (clean URLs), so the
+# actually-served path must be listed too, or the browser never sees these headers.
+/synth.html
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/synth
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+# Same-origin subresources loaded by synth.html (COEP: require-corp).
+/vp.js
+  Cross-Origin-Resource-Policy: same-origin
+
+/vp-worklet.js
+  Cross-Origin-Resource-Policy: same-origin
+
+/synth.wasm
+  Cross-Origin-Resource-Policy: same-origin
+  Content-Type: application/wasm
+
+/pixie.wasm
+  Content-Type: application/wasm

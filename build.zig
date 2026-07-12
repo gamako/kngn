@@ -86,25 +86,84 @@ fn appRoot(exe: *std.Build.Step.Compile, name: []const u8) TaggedModule {
     return .{ .mod = exe.root_module, .layer = .app, .name = name };
 }
 
+const WasmExeBuild = struct {
+    exe: *std.Build.Step.Compile,
+    install: *std.Build.Step.InstallArtifact,
+};
+
+const WebStaticInstalls = struct {
+    html: *std.Build.Step.InstallFile,
+    synth_html: *std.Build.Step.InstallFile,
+    js: *std.Build.Step.InstallFile,
+    worklet: *std.Build.Step.InstallFile,
+    headers: *std.Build.Step.InstallFile,
+    netlify: *std.Build.Step.InstallFile,
+    serve_script: *std.Build.Step.InstallFile,
+
+    fn dependOnAll(self: WebStaticInstalls, step: *std.Build.Step) void {
+        step.dependOn(&self.html.step);
+        step.dependOn(&self.synth_html.step);
+        step.dependOn(&self.js.step);
+        step.dependOn(&self.worklet.step);
+        step.dependOn(&self.headers.step);
+        step.dependOn(&self.netlify.step);
+        step.dependOn(&self.serve_script.step);
+    }
+};
+
+/// HTML/JS + ホスティング設定雛形を zig-out/web/ へ install。
+fn installWebStaticAssets(b: *std.Build) WebStaticInstalls {
+    return .{
+        .html = b.addInstallFile(b.path("web/index.html"), "web/index.html"),
+        .synth_html = b.addInstallFile(b.path("web/synth.html"), "web/synth.html"),
+        .js = b.addInstallFile(b.path("web/vp.js"), "web/vp.js"),
+        .worklet = b.addInstallFile(b.path("web/vp-worklet.js"), "web/vp-worklet.js"),
+        .headers = b.addInstallFile(b.path("web/deploy/_headers"), "web/_headers"),
+        .netlify = b.addInstallFile(b.path("web/deploy/netlify.toml"), "web/netlify.toml"),
+        .serve_script = b.addInstallFile(b.path("web/deploy/serve-coop-coep.py"), "web/serve-coop-coep.py"),
+    };
+}
+
+fn addPackageWebStep(
+    b: *std.Build,
+    pixie: WasmExeBuild,
+    synth: WasmExeBuild,
+    static_assets: WebStaticInstalls,
+) void {
+    const package_step = b.step(
+        "package-web",
+        "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
+    );
+    package_step.dependOn(&pixie.install.step);
+    package_step.dependOn(&synth.install.step);
+    static_assets.dependOnAll(package_step);
+}
+
 /// wasm32-wasi 専用ビルド（TASK-73.1 pixie + TASK-73.2 synth audio）。
 /// pixie は従来どおり non-shared / single_threaded（ブラウザ回帰を出さない）。
 /// synth のみ shared memory + atomics（AudioWorklet 2nd Instance）。
 /// root は wasm_root.zig（main 無し）にし、wasi command/_start 経路を避ける（reactor=export 駆動）。
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    buildWasmPixie(b, target, optimize);
-    buildWasmSynth(b, target, optimize);
-
-    const install_html = b.addInstallFile(b.path("web/index.html"), "web/index.html");
-    const install_synth_html = b.addInstallFile(b.path("web/synth.html"), "web/synth.html");
-    const install_js = b.addInstallFile(b.path("web/vp.js"), "web/vp.js");
-    const install_worklet = b.addInstallFile(b.path("web/vp-worklet.js"), "web/vp-worklet.js");
-    b.getInstallStep().dependOn(&install_html.step);
-    b.getInstallStep().dependOn(&install_synth_html.step);
-    b.getInstallStep().dependOn(&install_js.step);
-    b.getInstallStep().dependOn(&install_worklet.step);
+    const pixie = buildWasmPixie(b, target, optimize, .{ .build_step_name = "build-pixie" });
+    const synth = buildWasmSynth(b, target, optimize, .{ .build_step_name = "build-synth-wasm" });
+    const static_assets = installWebStaticAssets(b);
+    static_assets.dependOnAll(b.getInstallStep());
+    addPackageWebStep(b, pixie, synth, static_assets);
 }
 
-fn buildWasmPixie(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+const WasmBuildOpts = struct {
+    /// true のとき `zig build`（install step）に wasm install を束ねる。
+    default_install: bool = true,
+    /// null のとき専用 build step を張らない（package-web 経由の cross-compile 用）。
+    build_step_name: ?[]const u8,
+};
+
+fn buildWasmPixie(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    opts: WasmBuildOpts,
+) WasmExeBuild {
     const shared = SharedModules.init(b, true, false);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
@@ -136,8 +195,11 @@ fn buildWasmPixie(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     const wasm_install = b.addInstallArtifact(exe, .{
         .dest_dir = .{ .override = .{ .custom = "web" } },
     });
-    b.getInstallStep().dependOn(&wasm_install.step);
-    addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", exe);
+    if (opts.default_install) b.getInstallStep().dependOn(&wasm_install.step);
+    if (opts.build_step_name) |name| {
+        addBuildStep(b, name, "Build Pixie wasm (wasm32-wasi)", exe);
+    }
+    return .{ .exe = exe, .install = wasm_install };
 }
 
 /// synth wasm: SharedArrayBuffer + atomics + dual Instance（main + AudioWorklet）。
@@ -148,7 +210,12 @@ fn buildWasmPixie(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 /// - ただし target に `+atomics` があれば single_threaded でも i32.atomic.* が生成される
 ///   （/tmp/task-73.2 atom PoC で single/multi の atomic 命令が一致することを確認）
 /// - Zig Thread は spawn しない（JS 側 main + AudioWorklet の 2 Instance が共有 memory を触る）
-fn buildWasmSynth(b: *std.Build, base_target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn buildWasmSynth(
+    b: *std.Build,
+    base_target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    opts: WasmBuildOpts,
+) WasmExeBuild {
     // atomics + bulk_memory を足した target（shared memory 必須）
     const query = std.Target.Query{
         .cpu_arch = .wasm32,
@@ -204,8 +271,29 @@ fn buildWasmSynth(b: *std.Build, base_target: std.Build.ResolvedTarget, optimize
     const wasm_install = b.addInstallArtifact(exe, .{
         .dest_dir = .{ .override = .{ .custom = "web" } },
     });
-    b.getInstallStep().dependOn(&wasm_install.step);
-    addBuildStep(b, "build-synth-wasm", "Build Synth wasm (shared memory + AudioWorklet)", exe);
+    if (opts.default_install) b.getInstallStep().dependOn(&wasm_install.step);
+    if (opts.build_step_name) |name| {
+        addBuildStep(b, name, "Build Synth wasm (shared memory + AudioWorklet)", exe);
+    }
+    return .{ .exe = exe, .install = wasm_install };
+}
+
+/// native ターゲットから wasm web 配布物を cross-compile して zig-out/web/ へ集約（TASK-73.4）。
+fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const wasi_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .wasi,
+    });
+    const cross_opts = WasmBuildOpts{
+        .default_install = false,
+        .build_step_name = null,
+    };
+    const pixie = buildWasmPixie(b, wasi_target, optimize, cross_opts);
+    const synth = buildWasmSynth(b, wasi_target, optimize, cross_opts);
+    const static_assets = installWebStaticAssets(b);
+    addPackageWebStep(b, pixie, synth, static_assets);
+    addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", pixie.exe);
+    addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", synth.exe);
 }
 
 pub fn build(b: *std.Build) void {
@@ -453,6 +541,10 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(mcp_exe);
     addBuildStep(b, "mcp", "Build the MCP server CLI (zig-out/bin/vp-mcp)", mcp_exe);
+
+    // ----- wasm web 配布パッケージ（TASK-73.4）-----
+    // native ターゲットから cross-compile して zig-out/web/ へ集約。開発時の web/ 配置は不変。
+    packageWebFromNative(b, optimize);
 
     // ========================================
     // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ

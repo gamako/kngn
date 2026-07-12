@@ -1,0 +1,47 @@
+# Netlify — deploy zig-out/web/ as publish directory.
+# Pixie (index.html) works without COOP/COEP. Synth requires cross-origin isolation.
+
+[build]
+  publish = "zig-out/web"
+  command = "zig build package-web"
+
+# Netlify serves /synth.html at its literal path by default (no clean-URL redirect
+# like Cloudflare Pages), but the /synth rule is kept for parity/safety if pretty
+# URLs are enabled on the site.
+[[headers]]
+  for = "/synth.html"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+
+[[headers]]
+  for = "/synth"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+
+[[headers]]
+  for = "/vp.js"
+  [headers.values]
+    Cross-Origin-Resource-Policy = "same-origin"
+
+[[headers]]
+  for = "/vp-worklet.js"
+  [headers.values]
+    Cross-Origin-Resource-Policy = "same-origin"
+
+[[headers]]
+  for = "/synth.wasm"
+  [headers.values]
+    Cross-Origin-Resource-Policy = "same-origin"
+    Content-Type = "application/wasm"
+
+[[headers]]
+  for = "/pixie.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+
+[[headers]]
+  for = "/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
