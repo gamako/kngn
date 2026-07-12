@@ -36,6 +36,13 @@ else switch (builtin.os.tag) {
     else => @compileError("video-proto: unsupported OS for audio backend: " ++ @tagName(builtin.os.tag)),
 };
 
+/// wasm: AudioWorklet 用 export をリンクに残す（TASK-73.2）。native は no-op。
+pub fn enableWebAudioExports() void {
+    if (builtin.cpu.arch.isWasm()) {
+        backend.enableAudioExports();
+    }
+}
+
 const NullImpl = if (builtin.cpu.arch.isWasm())
     @import("audio_web.zig").NullWebStub(backend)
 else

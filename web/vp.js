@@ -1,7 +1,13 @@
-// video-proto wasm JS glue（TASK-73.1）
+// video-proto wasm JS glue（TASK-73.1 + TASK-73.2 audio）
 // import table:
 //   env: vp_now / vp_present / vp_log / vp_set_cursor
+//        + vp_audio_open / vp_audio_start / vp_audio_stop / vp_audio_close（audio app）
 //   wasi_snapshot_preview1: 生成 wasm の import 実測に基づく手書き shim（外部依存なし）
+//
+// boot オプション（script type=module から、または data-*）:
+//   wasm: "pixie.wasm" | "synth.wasm"（既定 pixie.wasm）
+//   sharedMemory: true のとき import shared memory（synth audio 必須）
+//   audio: true のとき AudioWorklet 経路を有効化（sharedMemory 必須）
 //
 // 時刻契約（M2）:
 //   - アプリのフレーム時刻は常に env.vp_now（performance.now 基準・秒）
@@ -15,6 +21,8 @@ const ctx2d = canvas.getContext("2d", { alpha: false });
 let memory;
 /** @type {WebAssembly.Instance} */
 let instance;
+/** @type {WebAssembly.Module | null} */
+let wasmModule = null;
 
 // ImageData は再利用（サイズ変化・memory growth 時のみ再生成。codex Medium#3）
 let imageData = null;
@@ -22,6 +30,23 @@ let imageW = 0;
 let imageH = 0;
 
 const CURSOR_CSS = ["default", "crosshair", "none"];
+
+// ---- audio state（TASK-73.2）----
+/** @type {AudioContext | null} */
+let audioCtx = null;
+/** @type {AudioWorkletNode | null} */
+let audioNode = null;
+let audioChannels = 2;
+/** start 意図フラグ。stop 後の gesture で意図せず resume しない（修正4） */
+let audioWantRunning = false;
+let audioGestureBound = false;
+/**
+ * boot で worklet Node 構築 + 2nd Instance + sentinel 検証が成功したとき true。
+ * envAudioOpen はこれが false なら 0 を返す → Zig open が error.OpenFailed（修正2）。
+ */
+let audioReady = false;
+const WORKLET_READY_TIMEOUT_MS = 5000;
+const SENTINEL_MAGIC = 0x56504153;
 
 // ---- WASI preview1 errno / clockid（実測 import 用最小面）----
 const WASI_ESUCCESS = 0;
@@ -299,7 +324,7 @@ function pushKey(e, down) {
 }
 
 function shouldPreventKey(e) {
-  // pixie が使うキー（Space パン、ツール切替、undo 等）のページデフォルトを抑止
+  // pixie / synth が使うキーのページデフォルトを抑止
   const c = e.code;
   return (
     c === "Space" ||
@@ -307,7 +332,9 @@ function shouldPreventKey(e) {
     c.startsWith("Arrow") ||
     c === "Backspace" ||
     c === "Delete" ||
-    ((e.metaKey || e.ctrlKey) && (c === "KeyZ" || c === "KeyS" || c === "KeyO" || c === "KeyQ"))
+    ((e.metaKey || e.ctrlKey) && (c === "KeyZ" || c === "KeyS" || c === "KeyO" || c === "KeyQ")) ||
+    // synth 鍵盤 A..K 周辺
+    (c.startsWith("Key") && c.length === 4)
   );
 }
 
@@ -321,38 +348,248 @@ function reportCanvasSize() {
   }
 }
 
-const importObject = {
-  env: {
-    // アプリ時刻の正（フレーム・getTime）。WASI clock は使わない。
-    vp_now() {
-      return performance.now() / 1000;
-    },
-    vp_present(ptr, w, h) {
-      // memory growth で旧 ArrayBuffer が detach するため、毎回 buffer から view を作り直す
-      const nbytes = (w * h * 4) >>> 0;
-      const wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
-      if (!imageData || imageW !== w || imageH !== h || imageData.data.length !== nbytes) {
-        imageData = ctx2d.createImageData(w, h);
-        imageW = w;
-        imageH = h;
-        if (canvas.width !== w || canvas.height !== h) {
-          canvas.width = w;
-          canvas.height = h;
-        }
+function bindResize() {
+  const ro = new ResizeObserver(() => reportCanvasSize());
+  ro.observe(canvas);
+  reportCanvasSize();
+}
+
+// ---- audio env imports ----
+
+function showAudioError(msg) {
+  console.error(msg);
+  const el = document.getElementById("vp-error");
+  if (el) {
+    el.textContent = String(msg);
+    el.style.display = "block";
+  }
+}
+
+function ensureAudioGestureResume() {
+  if (audioGestureBound) return;
+  audioGestureBound = true;
+  const hint = document.getElementById("vp-audio-hint");
+  const tryResume = async () => {
+    // stop 後の gesture で意図せず再開しない（修正4）
+    if (!audioWantRunning) return;
+    if (!audioCtx) return;
+    if (audioCtx.state === "suspended") {
+      try {
+        await audioCtx.resume();
+      } catch (e) {
+        console.warn("AudioContext.resume failed:", e);
       }
-      imageData.data.set(wasmView);
-      ctx2d.putImageData(imageData, 0, 0);
+    }
+    if (audioCtx.state === "running" && hint) {
+      hint.style.display = "none";
+    }
+  };
+  // クリック / キーで resume（autoplay policy）
+  const onGesture = () => {
+    void tryResume();
+  };
+  canvas.addEventListener("pointerdown", onGesture, { capture: true });
+  window.addEventListener("keydown", onGesture, { capture: true });
+  if (hint) {
+    hint.style.display = "block";
+    hint.addEventListener("click", onGesture);
+  }
+}
+
+/**
+ * boot: main Instance 生成後・vp_init 前に AudioWorkletNode を構築し、
+ * worklet 側 2nd Instance + sentinel 検証の ready を await する（修正1/2）。
+ * g_state は未設定だが worklet は running ゲート内でしか読まないので安全。
+ * @param {number} channels
+ * @returns {Promise<void>}
+ */
+function prepareAudioWorkletNode(channels) {
+  return new Promise((resolve, reject) => {
+    if (!audioCtx || !wasmModule || !memory || !instance) {
+      reject(new Error("prepareAudioWorkletNode: ctx/module/memory/instance missing"));
+      return;
+    }
+    if (typeof instance.exports.vp_audio_set_sentinel !== "function") {
+      reject(new Error("prepareAudioWorkletNode: missing vp_audio_set_sentinel"));
+      return;
+    }
+    // main が shared memory 上に magic を書く（worklet instantiate 前）
+    instance.exports.vp_audio_set_sentinel();
+
+    const stackTop =
+      typeof instance.exports.vp_audio_worklet_stack_top === "function"
+        ? instance.exports.vp_audio_worklet_stack_top() >>> 0
+        : 0;
+    if (!stackTop) {
+      reject(new Error("prepareAudioWorkletNode: missing stack top"));
+      return;
+    }
+
+    audioChannels = channels || 2;
+    const actualSr = audioCtx.sampleRate | 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("vp-worklet: ready timeout (" + WORKLET_READY_TIMEOUT_MS + "ms)"));
+    }, WORKLET_READY_TIMEOUT_MS);
+
+    try {
+      if (audioNode) {
+        try {
+          audioNode.disconnect();
+        } catch (_) {}
+        audioNode = null;
+      }
+      audioNode = new AudioWorkletNode(audioCtx, "vp-audio-processor", {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [audioChannels],
+        processorOptions: {
+          module: wasmModule,
+          memory: memory,
+          stackTop: stackTop,
+          channels: audioChannels,
+          sampleRate: actualSr,
+        },
+      });
+      audioNode.port.onmessage = (ev) => {
+        const data = ev.data || {};
+        if (data.type === "ready") {
+          if (settled) return;
+          if ((data.sentinel >>> 0) !== SENTINEL_MAGIC) {
+            settled = true;
+            clearTimeout(timer);
+            reject(new Error("vp-worklet: ready with bad sentinel 0x" + (data.sentinel >>> 0).toString(16)));
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+          return;
+        }
+        if (data.type === "error") {
+          if (settled) {
+            console.error("vp-worklet:", data.message);
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error("vp-worklet: " + data.message));
+        }
+      };
+      audioNode.connect(audioCtx.destination);
+    } catch (e) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(e);
+      }
+    }
+  });
+}
+
+/**
+ * Zig `vp_audio_open` → boot 済み worklet を確認して実 sample rate を返す。
+ * Node 生成は boot に前倒し済み。audioReady でなければ 0（修正2）。
+ * @returns {number} actual sample rate, or 0 on failure
+ */
+function envAudioOpen(sampleRate, channels, bufferFrames) {
+  void sampleRate;
+  void bufferFrames;
+  void channels;
+  try {
+    if (typeof SharedArrayBuffer === "undefined") {
+      console.error("vp_audio_open: SharedArrayBuffer unavailable (need COOP/COEP)");
+      return 0;
+    }
+    if (!globalThis.crossOriginIsolated) {
+      console.error(
+        "vp_audio_open: crossOriginIsolated=false (serve with COOP/COEP; scripts/serve-web.py)",
+      );
+      return 0;
+    }
+    if (!audioReady || !audioCtx || !audioNode) {
+      console.error("vp_audio_open: worklet not ready (boot failed or not audio app)");
+      return 0;
+    }
+    ensureAudioGestureResume();
+    return audioCtx.sampleRate | 0;
+  } catch (e) {
+    console.error("vp_audio_open failed:", e);
+    return 0;
+  }
+}
+
+function envAudioStart() {
+  audioWantRunning = true;
+  if (!audioCtx) return;
+  if (audioCtx.state === "suspended") {
+    ensureAudioGestureResume();
+    void audioCtx.resume().catch((e) => console.warn("resume:", e));
+  }
+}
+
+function envAudioStop() {
+  audioWantRunning = false;
+  if (audioCtx && audioCtx.state === "running") {
+    void audioCtx.suspend().catch(() => {});
+  }
+}
+
+function envAudioClose() {
+  audioWantRunning = false;
+  audioReady = false;
+  if (audioNode) {
+    try {
+      audioNode.disconnect();
+    } catch (_) {}
+    audioNode = null;
+  }
+  if (audioCtx) {
+    void audioCtx.close().catch(() => {});
+    audioCtx = null;
+  }
+}
+
+function makeImportObject() {
+  return {
+    env: {
+      // アプリ時刻の正（フレーム・getTime）。WASI clock は使わない。
+      vp_now() {
+        return performance.now() / 1000;
+      },
+      vp_present(ptr, w, h) {
+        // memory growth で旧 ArrayBuffer が detach するため、毎回 buffer から view を作り直す
+        const nbytes = (w * h * 4) >>> 0;
+        const wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
+        if (!imageData || imageW !== w || imageH !== h || imageData.data.length !== nbytes) {
+          imageData = ctx2d.createImageData(w, h);
+          imageW = w;
+          imageH = h;
+          if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+          }
+        }
+        imageData.data.set(wasmView);
+        ctx2d.putImageData(imageData, 0, 0);
+      },
+      vp_log(ptr, len) {
+        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        console.log(new TextDecoder().decode(bytes));
+      },
+      vp_set_cursor(shape) {
+        canvas.style.cursor = CURSOR_CSS[shape] || "default";
+      },
+      vp_audio_open: envAudioOpen,
+      vp_audio_start: envAudioStart,
+      vp_audio_stop: envAudioStop,
+      vp_audio_close: envAudioClose,
     },
-    vp_log(ptr, len) {
-      const bytes = new Uint8Array(memory.buffer, ptr, len);
-      console.log(new TextDecoder().decode(bytes));
-    },
-    vp_set_cursor(shape) {
-      canvas.style.cursor = CURSOR_CSS[shape] || "default";
-    },
-  },
-  wasi_snapshot_preview1: wasi,
-};
+    wasi_snapshot_preview1: wasi,
+  };
+}
 
 function bindInput() {
   canvas.addEventListener("keydown", (e) => {
@@ -396,19 +633,75 @@ function bindInput() {
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 }
 
-function bindResize() {
-  const ro = new ResizeObserver(() => reportCanvasSize());
-  ro.observe(canvas);
-  reportCanvasSize();
-}
+/**
+ * @param {{
+ *   wasm?: string,
+ *   sharedMemory?: boolean,
+ *   audio?: boolean,
+ *   initialPages?: number,
+ *   maxPages?: number,
+ * }} [opts]
+ */
+export async function boot(opts = {}) {
+  const wasmUrl = opts.wasm || "pixie.wasm";
+  const useShared = !!(opts.sharedMemory || opts.audio);
+  const useAudio = !!opts.audio;
+  const initialPages = opts.initialPages || 256; // 16 MiB
+  const maxPages = opts.maxPages || 1024; // 64 MiB
 
-async function main() {
   canvas.focus();
+  audioReady = false;
 
-  const resp = await fetch("./pixie.wasm");
-  const { instance: inst } = await WebAssembly.instantiateStreaming(resp, importObject);
-  instance = inst;
-  memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
+  if (useAudio) {
+    // addModule は「node を作る同一 AudioContext」に対して必須。
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error("AudioContext not available");
+    if (typeof SharedArrayBuffer === "undefined" || !globalThis.crossOriginIsolated) {
+      throw new Error(
+        "audio requires cross-origin isolation (COOP/COEP). Use: python3 scripts/serve-web.py zig-out/web",
+      );
+    }
+    audioCtx = new AC({ sampleRate: 48000 });
+    await audioCtx.audioWorklet.addModule(new URL("./vp-worklet.js", import.meta.url).href);
+  }
+
+  const resp = await fetch(new URL("./" + wasmUrl, import.meta.url).href);
+  const bytes = await resp.arrayBuffer();
+  wasmModule = await WebAssembly.compile(bytes);
+
+  const importObject = makeImportObject();
+
+  if (useShared) {
+    if (typeof SharedArrayBuffer === "undefined" || !globalThis.crossOriginIsolated) {
+      throw new Error(
+        "shared memory requires cross-origin isolation (COOP/COEP). Use: python3 scripts/serve-web.py",
+      );
+    }
+    memory = new WebAssembly.Memory({
+      initial: initialPages,
+      maximum: maxPages,
+      shared: true,
+    });
+    importObject.env.memory = memory;
+    instance = await WebAssembly.instantiate(wasmModule, importObject);
+  } else {
+    instance = await WebAssembly.instantiate(wasmModule, importObject);
+    memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
+  }
+
+  // audio: vp_init 前に 2nd Instance + sentinel 検証を完了（失敗 → open も失敗）（修正2）
+  if (useAudio) {
+    try {
+      await prepareAudioWorkletNode(2);
+      audioReady = true;
+      ensureAudioGestureResume();
+    } catch (e) {
+      audioReady = false;
+      showAudioError(e && e.message ? e.message : e);
+      // グラフィックスは続行。audio.open は OpenFailed になる。
+      console.warn("audio disabled:", e);
+    }
+  }
 
   bindInput();
   bindResize();
@@ -421,6 +714,31 @@ async function main() {
   requestAnimationFrame(loop);
 }
 
-main().catch((err) => {
-  console.error(err);
-});
+// 既定: index.html は data 属性 or クエリ無しで pixie
+function defaultOptsFromPage() {
+  const params = new URLSearchParams(location.search);
+  const body = document.body;
+  const wasm =
+    params.get("wasm") || body?.dataset?.wasm || (location.pathname.includes("synth") ? "synth.wasm" : "pixie.wasm");
+  const audio =
+    params.get("audio") === "1" ||
+    body?.dataset?.audio === "1" ||
+    wasm.includes("synth");
+  const sharedMemory =
+    params.get("shared") === "1" ||
+    body?.dataset?.shared === "1" ||
+    audio;
+  return { wasm, audio, sharedMemory };
+}
+
+// type=module のトップレベル自動起動（import { boot } でも可）
+if (!globalThis.__vpManualBoot) {
+  boot(defaultOptsFromPage()).catch((err) => {
+    console.error(err);
+    const el = document.getElementById("vp-error");
+    if (el) {
+      el.textContent = String(err && err.message ? err.message : err);
+      el.style.display = "block";
+    }
+  });
+}

@@ -86,12 +86,27 @@ fn appRoot(exe: *std.Build.Step.Compile, name: []const u8) TaggedModule {
     return .{ .mod = exe.root_module, .layer = .app, .name = name };
 }
 
-/// wasm32-wasi 専用ビルド（TASK-73.1）。pixie のみ・entry disabled・rdynamic・
-/// single_threaded。成果物は zig-out/web/{pixie.wasm,index.html,vp.js}。
+/// wasm32-wasi 専用ビルド（TASK-73.1 pixie + TASK-73.2 synth audio）。
+/// pixie は従来どおり non-shared / single_threaded（ブラウザ回帰を出さない）。
+/// synth のみ shared memory + atomics（AudioWorklet 2nd Instance）。
 /// root は wasm_root.zig（main 無し）にし、wasi command/_start 経路を避ける（reactor=export 駆動）。
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const shared = SharedModules.init(b, true);
-    const pm = makePlatformModules(b, target, .wasm, &shared);
+    buildWasmPixie(b, target, optimize);
+    buildWasmSynth(b, target, optimize);
+
+    const install_html = b.addInstallFile(b.path("web/index.html"), "web/index.html");
+    const install_synth_html = b.addInstallFile(b.path("web/synth.html"), "web/synth.html");
+    const install_js = b.addInstallFile(b.path("web/vp.js"), "web/vp.js");
+    const install_worklet = b.addInstallFile(b.path("web/vp-worklet.js"), "web/vp-worklet.js");
+    b.getInstallStep().dependOn(&install_html.step);
+    b.getInstallStep().dependOn(&install_synth_html.step);
+    b.getInstallStep().dependOn(&install_js.step);
+    b.getInstallStep().dependOn(&install_worklet.step);
+}
+
+fn buildWasmPixie(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const shared = SharedModules.init(b, true, false);
+    const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const pixie_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/main.zig"),
@@ -99,7 +114,6 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .optimize = optimize,
         .single_threaded = true,
     });
-    // apps は kit-only + paint（addPixieExe と同型）
     {
         const root = TaggedModule{ .mod = pixie_mod, .layer = .app, .name = "pixie" };
         link(root, pm.kit);
@@ -119,18 +133,79 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     exe.rdynamic = true;
     exe.root_module.addImport("pixie", pixie_mod);
 
-    // install → zig-out/web/
     const wasm_install = b.addInstallArtifact(exe, .{
         .dest_dir = .{ .override = .{ .custom = "web" } },
     });
     b.getInstallStep().dependOn(&wasm_install.step);
-
-    const install_html = b.addInstallFile(b.path("web/index.html"), "web/index.html");
-    const install_js = b.addInstallFile(b.path("web/vp.js"), "web/vp.js");
-    b.getInstallStep().dependOn(&install_html.step);
-    b.getInstallStep().dependOn(&install_js.step);
-
     addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", exe);
+}
+
+/// synth wasm: SharedArrayBuffer + atomics + dual Instance（main + AudioWorklet）。
+/// notes: pixie は non-shared のまま。audio を使う app だけ shared 化する（回帰最小化）。
+///
+/// single_threaded=true を維持する理由（TASK-73.2 notes）:
+/// - zig 0.16 の `std.heap.wasm_allocator` は multi-thread 未実装
+/// - ただし target に `+atomics` があれば single_threaded でも i32.atomic.* が生成される
+///   （/tmp/task-73.2 atom PoC で single/multi の atomic 命令が一致することを確認）
+/// - Zig Thread は spawn しない（JS 側 main + AudioWorklet の 2 Instance が共有 memory を触る）
+fn buildWasmSynth(b: *std.Build, base_target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    // atomics + bulk_memory を足した target（shared memory 必須）
+    const query = std.Target.Query{
+        .cpu_arch = .wasm32,
+        .os_tag = base_target.result.os.tag, // wasi
+        .abi = base_target.result.abi,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }),
+    };
+    const target = b.resolveTargetQuery(query);
+
+    // wasm_shared=false → single_threaded=true（wasm_allocator 可）。atomics は target feature で担保。
+    const shared = SharedModules.init(b, true, false);
+    const pm = makePlatformModules(b, target, .wasm, &shared, false);
+
+    const synth_mod = b.createModule(.{
+        .root_source_file = b.path("apps/synth/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    {
+        const root = TaggedModule{ .mod = synth_mod, .layer = .app, .name = "synth" };
+        link(root, pm.kit);
+        link(root, shared.spectrogram);
+        link(root, shared.scope);
+        link(root, shared.serde);
+    }
+
+    const root_mod = b.createModule(.{
+        .root_source_file = b.path("apps/synth/wasm_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    // worklet が Instance 毎に __stack_pointer Global を差し替える（PoC a）
+    root_mod.export_symbol_names = &.{"__stack_pointer"};
+
+    const exe = b.addExecutable(.{
+        .name = "synth",
+        .root_module = root_mod,
+    });
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    exe.shared_memory = true;
+    exe.import_memory = true;
+    exe.export_memory = false;
+    // 16 MiB initial / 64 MiB max（FB 1080×520 + audio stack/scratch + synth 状態）
+    exe.initial_memory = 16 * 1024 * 1024;
+    exe.max_memory = 64 * 1024 * 1024;
+    // MasterEffects(65536) は ~0.5MiB+。init で値返し一時がスタックに乗るため余裕を取る。
+    exe.stack_size = 2 * 1024 * 1024;
+    exe.root_module.addImport("synth_app", synth_mod);
+
+    const wasm_install = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = "web" } },
+    });
+    b.getInstallStep().dependOn(&wasm_install.step);
+    addBuildStep(b, "build-synth-wasm", "Build Synth wasm (shared memory + AudioWorklet)", exe);
 }
 
 pub fn build(b: *std.Build) void {
@@ -185,7 +260,7 @@ pub fn build(b: *std.Build) void {
     // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
     // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
     // ========================================
-    const shared_modules = SharedModules.init(b, false);
+    const shared_modules = SharedModules.init(b, false, false);
 
     // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）
     const backends = platform.implementedBackends(target_os);
@@ -208,7 +283,7 @@ pub fn build(b: *std.Build) void {
 
     for (backends) |be| {
         const is_default = (be == platform_option);
-        const pm = makePlatformModules(b, target, be, &shared_modules);
+        const pm = makePlatformModules(b, target, be, &shared_modules, false);
 
         // ----- メインアプリケーション -----
         const main_exe = addMainExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, APP_NAME, be, default_be), &pm);
@@ -984,7 +1059,7 @@ pub fn build(b: *std.Build) void {
     const run_diff_test = b.addRunArtifact(diff_test);
 
     // history summary schema（TASK-62.5.5）。kit.platform.command 型を使うため default backend の kit を配線。
-    const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules);
+    const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
     const history_summary_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/history_summary.zig"),
         .target = target,
@@ -1606,7 +1681,7 @@ const PlatformModules = struct {
     kit: TaggedModule, // 公開 umbrella（ADR-007 R4）。apps はこれだけを import する（R5）。platform(opt-in無効) 側を配線
 };
 
-fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules) PlatformModules {
+fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules, wasm_shared: bool) PlatformModules {
     // ゲームパッド opt-in 無効版（既定）。main/pixie/synth/modular/patch/example_01..21 はこちらを使う
     // （GameController framework 非リンク・.m/.swift の gamepad コードも条件コンパイルで除外。TASK-80.2 opt-in 化）。
     const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
@@ -1657,10 +1732,11 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
 
     // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎。
+    // wasm shared audio（TASK-73.2）は single_threaded=false（atomics を本物にする）。
     const app_runtime: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
-        .single_threaded = if (backend == .wasm) true else null,
+        .single_threaded = if (backend == .wasm) !wasm_shared else null,
     }) };
     link(app_runtime, platform_mod);
     link(kit, app_runtime);
@@ -1736,7 +1812,8 @@ const SharedModules = struct {
     objc_runtime: TaggedModule, // Objective-C ランタイム FFI（TASK-49.2。camera/audio 両方が link する共有 module。TASK-49.6 で named module 化）
     gamepad: TaggedModule, // src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する headless lib。kit 収録）
 
-    fn init(b: *std.Build, is_wasm: bool) SharedModules {
+    /// `wasm_shared`: TASK-73.2 AudioWorklet 用。atomics を有効にするため single_threaded=false。
+    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
         // facade。@cImport("platform.h") のため link_libc + include path を内包。
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
@@ -1860,7 +1937,8 @@ const SharedModules = struct {
         const harness: TaggedModule = .{ .layer = .core, .name = "harness", .mod = b.createModule(.{
             .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
             .link_libc = !is_wasm,
-            .single_threaded = if (is_wasm) true else null,
+            // wasm non-shared (pixie): single_threaded。shared audio (synth): multi（atomics）。
+            .single_threaded = if (is_wasm) !wasm_shared else null,
         }) };
         if (!is_wasm) {
             linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");

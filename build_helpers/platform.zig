@@ -116,11 +116,13 @@ pub fn createPlatformModule(
     // linkSystemLibrary は target 既知の module を要求するため、明示的に target を設定する
     // （import module は通常 importer から target を継承するが、x11 のリンク呼び出しには事前に必要）。
     const is_wasm = backend == .wasm;
+    // wasm shared audio（TASK-73.2）: atomics 付き target なら multi-thread（本物の atomic 命令）。
+    const wasm_shared = is_wasm and target.result.cpu.has(.wasm, .atomics);
     const mod = b.createModule(.{
         .root_source_file = platform_source,
         .target = target,
         .link_libc = !is_wasm, // wasm（wasi）は wasi preview1 + 手書き JS shim。libc 不要
-        .single_threaded = if (is_wasm) true else null,
+        .single_threaded = if (is_wasm) !wasm_shared else null,
     });
     if (!is_wasm) mod.addIncludePath(platform_include_root);
     // platform.zig + backends は `@import("platform_types")`、facade は `@import("harness")` を使う。

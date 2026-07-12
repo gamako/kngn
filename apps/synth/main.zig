@@ -12,6 +12,7 @@ const audio = kit.audio;
 const synthlib = kit.synth;
 const dsp = kit.dsp;
 const gui = kit.gui;
+const app_runtime = kit.app_runtime;
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
 const actions = @import("actions.zig");
@@ -48,20 +49,48 @@ const PIANO_H = 55;
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
 const Scope = scope.Oscilloscope(SCOPE_W, VIS_H);
 
+/// アプリ状態（TASK-73.2: app_runtime へ移行。native 挙動不変 + wasm export 駆動）。
 const App = struct {
+    /// app_runtime が参照する初期ウィンドウ仕様
+    pub const window = .{
+        .w = WIN_W,
+        .h = WIN_H,
+        .title = "synth - keyboard + sliders + spectrogram",
+    };
+
+    gpa: std.mem.Allocator,
+    /// `save_patch`/`load_patch` action（TASK-65 serialize）が使うファイル I/O ハンドル
+    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
+    io: std.Io,
     synth: Synth,
     fx: Fx,
     /// GUI 側で最後に publish した patch のコピー（patch probe 用。TASK-56。
     /// Mailbox の consumer 状態は RT 専有のため probe からは触らない）
     last_patch: Patch = .{},
-    tap: Tap,
-    /// GUI スライダ/ボタンが in-place 更新するパラメータ束（TASK-65: harness action からも
-    /// 同じ field を書き換えられるよう main() ローカルから App へ移設）。
+    tap: Tap = .{},
+    /// GUI スライダ/ボタンが in-place 更新するパラメータ束（TASK-65）
     params: Params = .{},
     fxp: FxParams = .{},
-    /// `save_patch`/`load_patch` action（TASK-65 serialize）が使うファイル I/O ハンドル
-    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
-    io: std.Io,
+    device: audio.AudioDevice,
+    ctx: gui.Context,
+    spec: *Spec,
+    osc: *Scope,
+    meter: scope.LevelMeter = .{},
+    pressed: [128]bool = [_]bool{false} ** 128,
+    mouse_note: ?u8 = null,
+    stereo: [2048]f32 = undefined,
+    mono: [1024]f32 = undefined,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) !*App {
+        return appInit(gpa, io);
+    }
+    pub fn deinit(self: *App) void {
+        appDeinit(self);
+    }
+    pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
+        _ = now;
+        return appFrame(self, win);
+    }
 };
 
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
@@ -245,44 +274,34 @@ fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, formatPatch(@ptrCast(@alignCast(ctx)), &buf));
 }
 
-pub fn main(init: std.process.Init) !void {
-    std.debug.print("apps/synth: A..K=C4..C5 / 画面鍵盤クリック / スライダで音色変更 / ESC 終了\n", .{});
+fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
+    const app = try gpa.create(App);
+    errdefer gpa.destroy(app);
 
-    const allocator = std.heap.c_allocator;
-
-    var app = try allocator.create(App);
-    defer allocator.destroy(app);
-
-    // スライダ/harness action が in-place 更新するパラメータ束は App.params/App.fxp（TASK-65）。
     const initial_patch = makePatch(Params{});
-    app.* = .{
-        .synth = Synth.init(48000, initial_patch),
-        .fx = Fx.init(48000, makeFxParams(FxParams{})),
-        .last_patch = initial_patch, // probe が初回 frame 前でも実際の初期 patch を返すように
-        .tap = .{},
-        .io = init.io, // save_patch/load_patch action（TASK-65 serialize）用
-    };
-
-    const spec = try allocator.create(Spec);
-    defer allocator.destroy(spec);
+    const spec = try gpa.create(Spec);
+    errdefer gpa.destroy(spec);
     spec.init(48000); // 仮 sr。audio.open 後に setSampleRate で対数軸を再算出
 
-    // オシロスコープ(リング大なので heap 確保) + レベルメータ
-    const osc = try allocator.create(Scope);
-    defer allocator.destroy(osc);
+    const osc = try gpa.create(Scope);
+    errdefer gpa.destroy(osc);
     osc.* = .{};
-    var meter = scope.LevelMeter{};
 
-    try platform.init();
-    defer platform.shutdown();
+    // device は後で open。一旦 undefined を避け open 成功後に書く。
+    app.* = .{
+        .gpa = gpa,
+        .io = io,
+        .synth = Synth.init(48000, initial_patch),
+        .fx = Fx.init(48000, makeFxParams(FxParams{})),
+        .last_patch = initial_patch,
+        .device = undefined,
+        .ctx = gui.Context.init(gpa, gui.default_font),
+        .spec = spec,
+        .osc = osc,
+    };
+    errdefer app.ctx.deinit();
 
-    var window = try platform.Window.create(WIN_W, WIN_H, "synth - keyboard + sliders + spectrogram");
-    defer window.destroy();
-
-    var ctx = gui.Context.init(allocator, gui.default_font);
-    defer ctx.deinit();
-
-    const device = audio.open(allocator, .{
+    const device = audio.open(gpa, .{
         .sample_rate = 48000,
         .buffer_frames = 512,
         .channels = 2,
@@ -290,169 +309,192 @@ pub fn main(init: std.process.Init) !void {
         .userdata = app,
     }) catch |err| {
         std.debug.print("audio.open failed: {s}\n", .{@errorName(err)});
-        return;
+        return err;
     };
-    defer device.close();
+    app.device = device;
 
-    app.synth.sample_rate = @floatFromInt(device.config().sample_rate);
-    app.fx.setSampleRate(@floatFromInt(device.config().sample_rate)); // reverb タップ再算出(start 前)
-    spec.setSampleRate(@floatFromInt(device.config().sample_rate)); // 対数周波数軸を実 sr で再算出
-    try device.start();
-    defer device.stop();
+    const sr: f32 = @floatFromInt(device.config().sample_rate);
+    app.synth.sample_rate = sr;
+    app.fx.setSampleRate(sr);
+    app.spec.setSampleRate(sr);
 
-    // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。app は heap 確保で寿命安定。
+    device.start() catch |err| {
+        app.device.close();
+        std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // harness custom probe / action（無効時 no-op）
     platform.registerProbe(.{ .name = "voices", .ctx = app, .ext = "json", .snapshot = voicesSnapshot, .digest = voicesDigest });
     platform.registerProbe(.{ .name = "patch", .ctx = app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
-    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     registerActions(app);
     registerStateSync(app);
 
-    var pressed = [_]bool{false} ** 128;
-    var mouse_note: ?u8 = null; // マウスで押している鍵
-    var stereo: [2048]f32 = undefined;
-    var mono: [1024]f32 = undefined;
+    return app;
+}
+
+fn appDeinit(self: *App) void {
+    self.device.stop();
+    self.device.close();
+    self.ctx.deinit();
+    self.gpa.destroy(self.osc);
+    self.gpa.destroy(self.spec);
+    self.gpa.destroy(self);
+}
+
+fn appFrame(self: *App, window: *platform.Window) !bool {
     var running = true;
+    const fb = window.lockFramebuffer() orelse {
+        // frame slot 無し（retry 可）。native はほぼ常に non-null。
+        platform.frameDelay(16_000_000);
+        return true;
+    };
+    defer fb.unlock();
 
-    main_loop: while (running and window.pollEvents()) {
-        const fb = window.lockFramebuffer() orelse continue :main_loop;
-        defer fb.unlock();
+    self.ctx.beginFrame(fb.width, fb.height);
 
-        ctx.beginFrame(fb.width, fb.height);
-
-        while (window.nextEvent()) |ev| {
-            switch (ev) {
-                .quit => running = false,
-                .key_down => |k| {
-                    if (k.key == .ESCAPE) {
-                        running = false;
-                    } else if (keyToNote(k.key)) |note| {
-                        if (!k.is_repeat and !pressed[note]) {
-                            pressed[note] = true;
-                            _ = app.synth.sendNoteOn(note, 1.0);
-                        }
+    while (window.nextEvent()) |ev| {
+        switch (ev) {
+            .quit => running = false,
+            .key_down => |k| {
+                if (k.key == .ESCAPE) {
+                    running = false;
+                } else if (keyToNote(k.key)) |note| {
+                    if (!k.is_repeat and !self.pressed[note]) {
+                        self.pressed[note] = true;
+                        _ = self.synth.sendNoteOn(note, 1.0);
                     }
-                },
-                .key_up => |k| {
-                    if (keyToNote(k.key)) |note| {
-                        if (pressed[note]) {
-                            pressed[note] = false;
-                            _ = app.synth.sendNoteOff(note);
-                        }
+                }
+            },
+            .key_up => |k| {
+                if (keyToNote(k.key)) |note| {
+                    if (self.pressed[note]) {
+                        self.pressed[note] = false;
+                        _ = self.synth.sendNoteOff(note);
                     }
-                },
-                .mouse_down => |m| {
-                    if (pianoHitTest(m.x, m.y)) |note| {
-                        mouse_note = note;
-                        if (!pressed[note]) {
-                            pressed[note] = true;
-                            _ = app.synth.sendNoteOn(note, 1.0);
-                        }
+                }
+            },
+            .mouse_down => |m| {
+                if (pianoHitTest(m.x, m.y)) |note| {
+                    self.mouse_note = note;
+                    if (!self.pressed[note]) {
+                        self.pressed[note] = true;
+                        _ = self.synth.sendNoteOn(note, 1.0);
                     }
-                },
-                .mouse_up => {
-                    if (mouse_note) |note| {
-                        pressed[note] = false;
-                        _ = app.synth.sendNoteOff(note);
-                        mouse_note = null;
-                    }
-                },
-                else => {},
-            }
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+                }
+            },
+            .mouse_up => {
+                if (self.mouse_note) |note| {
+                    self.pressed[note] = false;
+                    _ = self.synth.sendNoteOff(note);
+                    self.mouse_note = null;
+                }
+            },
+            else => {},
         }
-
-        // 出力タップを drain → mono downmix → スペクトログラム / オシロスコープ / レベルメータ
-        while (true) {
-            const n = app.tap.read(&stereo);
-            if (n < 2) break;
-            const frames = n / 2;
-            dsp.downmixStereoToMono(stereo[0 .. frames * 2], mono[0..frames]);
-            spec.feed(mono[0..frames]);
-            osc.feed(mono[0..frames]);
-            meter.feed(mono[0..frames]);
-        }
-
-        // GUI コントロールパネル（上部）を構築。スライダは 2 カラムでパネルを低く保つ。
-        ctx.beginBox(.{
-            .direction = .column,
-            .padding = .{ 10, 10, 10, 10 },
-            .gap = 6,
-            .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
-        });
-        ctx.label("Synth controls (drag knobs):");
-        ctx.beginBox(.{ .direction = .row, .gap = 18 });
-        // 左カラム: オシレータ/アンプ + キートラック
-        ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x6001, "Cutoff   ", &app.params.cutoff, .{ .min = 100, .max = 18000, .step = 10 });
-        _ = ctx.sliderF32Id(0x6002, "Resonance", &app.params.resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6003, "Gain     ", &app.params.gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6004, "Attack   ", &app.params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6005, "Release  ", &app.params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6006, "KeyTrack ", &app.params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
-        ctx.endBox();
-        // 中カラム: フィルタ env + LFO
-        ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x6007, "FiltEnv  ", &app.params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6008, "FEnvAtk  ", &app.params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6009, "FEnvDec  ", &app.params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x600A, "LFO Rate ", &app.params.lfo_rate, .{ .min = 0.1, .max = 20, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x600B, "Vibrato  ", &app.params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x600C, "Tremolo  ", &app.params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
-        ctx.endBox();
-        // 右カラム: ユニゾン / 2nd osc / ノイズ (27.13)
-        ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x600D, "Unison   ", &app.params.unison, .{ .min = 1, .max = 7, .step = 1 });
-        _ = ctx.sliderF32Id(0x600E, "Detune   ", &app.params.detune, .{ .min = 0, .max = 50, .step = 1 });
-        _ = ctx.sliderF32Id(0x600F, "Osc2 Mix ", &app.params.osc2_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6010, "Osc2 Det ", &app.params.osc2_detune, .{ .min = -24, .max = 24, .step = 1 });
-        _ = ctx.sliderF32Id(0x6011, "Noise    ", &app.params.noise_amount, .{ .min = 0, .max = 1, .step = 0.05 });
-        ctx.endBox();
-        // FX カラム: マスターエフェクト (27.14)
-        ctx.beginBox(.{ .direction = .column, .gap = 4 });
-        _ = ctx.sliderF32Id(0x6012, "Dly Time ", &app.fxp.delay_time, .{ .min = 0.01, .max = 1.0, .step = 0.01 });
-        _ = ctx.sliderF32Id(0x6013, "Dly FB   ", &app.fxp.delay_fb, .{ .min = 0, .max = 0.95, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6014, "Dly Mix  ", &app.fxp.delay_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6015, "Cho Rate ", &app.fxp.chorus_rate, .{ .min = 0.1, .max = 8, .step = 0.1 });
-        _ = ctx.sliderF32Id(0x6016, "Cho Depth", &app.fxp.chorus_depth, .{ .min = 0.5, .max = 10, .step = 0.5 });
-        _ = ctx.sliderF32Id(0x6017, "Cho Mix  ", &app.fxp.chorus_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x6018, "Dist Drv ", &app.fxp.dist_drive, .{ .min = 1, .max = 20, .step = 0.5 });
-        _ = ctx.sliderF32Id(0x6019, "Dist Mix ", &app.fxp.dist_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x601A, "Rev Mix  ", &app.fxp.reverb_mix, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x601B, "Rev Decay", &app.fxp.reverb_decay, .{ .min = 0, .max = 1, .step = 0.05 });
-        _ = ctx.sliderF32Id(0x601C, "Rev Damp ", &app.fxp.reverb_damping, .{ .min = 0, .max = 1, .step = 0.05 });
-        ctx.endBox();
-        ctx.endBox();
-        ctx.beginBox(.{ .direction = .row, .gap = 8 });
-        const wlabel = std.fmt.allocPrint(ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[app.params.wave_idx]}) catch "Wave";
-        if (ctx.button(wlabel)) app.params.wave_idx = (app.params.wave_idx + 1) % WAVE_NAMES.len;
-        const flabel = std.fmt.allocPrint(ctx.allocator(), "Filter: {s}", .{FILTER_MODE_NAMES[app.params.filter_mode_idx]}) catch "Filter";
-        if (ctx.button(flabel)) app.params.filter_mode_idx = (app.params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
-        const o2label = std.fmt.allocPrint(ctx.allocator(), "Osc2: {s}", .{WAVE_NAMES[app.params.osc2_wave_idx]}) catch "Osc2";
-        if (ctx.button(o2label)) app.params.osc2_wave_idx = (app.params.osc2_wave_idx + 1) % WAVE_NAMES.len;
-        const fxlabel = if (app.fxp.bypass) "FX: off" else "FX: on";
-        if (ctx.button(fxlabel)) app.fxp.bypass = !app.fxp.bypass;
-        ctx.endBox();
-        ctx.endBox();
-        ctx.endFrame();
-
-        // パラメータを publish（atomic/patch publish 経由で audio スレッドへ。audio 側でスムージング）
-        app.last_patch = makePatch(app.params);
-        app.synth.publishPatch(app.last_patch);
-        app.fx.publishParams(makeFxParams(app.fxp));
-
-        // 手動描画（背景 + 鍵盤 + スペクトログラム + オシロ + メータ）→ その上に GUI
-        drawSpectrogramBgAndPiano(fb, &pressed);
-        spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
-        osc.draw(fb.pixels, fb.width, fb.height, SCOPE_X0, VIS_Y0);
-        meter.draw(fb.pixels, fb.width, fb.height, METER_X0, VIS_Y0, METER_W, VIS_H);
-        drawSpecLabels(fb, spec); // 周波数ラベル + カラースケール凡例
-        const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &ctx.draw_list, ctx.font);
-
-        window.present();
-
-        platform.frameDelay(16_000_000); // ~16ms（約 60fps）
+        if (toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
     }
+
+    // 出力タップを drain → mono downmix → スペクトログラム / オシロスコープ / レベルメータ
+    while (true) {
+        const n = self.tap.read(&self.stereo);
+        if (n < 2) break;
+        const frames = n / 2;
+        dsp.downmixStereoToMono(self.stereo[0 .. frames * 2], self.mono[0..frames]);
+        self.spec.feed(self.mono[0..frames]);
+        self.osc.feed(self.mono[0..frames]);
+        self.meter.feed(self.mono[0..frames]);
+    }
+
+    // GUI コントロールパネル（上部）
+    self.ctx.beginBox(.{
+        .direction = .column,
+        .padding = .{ 10, 10, 10, 10 },
+        .gap = 6,
+        .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+    });
+    self.ctx.label("Synth controls (drag knobs):");
+    self.ctx.beginBox(.{ .direction = .row, .gap = 18 });
+    self.ctx.beginBox(.{ .direction = .column, .gap = 4 });
+    _ = self.ctx.sliderF32Id(0x6001, "Cutoff   ", &self.params.cutoff, .{ .min = 100, .max = 18000, .step = 10 });
+    _ = self.ctx.sliderF32Id(0x6002, "Resonance", &self.params.resonance, .{ .min = 0.5, .max = 8, .step = 0.1 });
+    _ = self.ctx.sliderF32Id(0x6003, "Gain     ", &self.params.gain, .{ .min = 0, .max = 0.5, .step = 0.01 });
+    _ = self.ctx.sliderF32Id(0x6004, "Attack   ", &self.params.attack, .{ .min = 0, .max = 1, .step = 0.01 });
+    _ = self.ctx.sliderF32Id(0x6005, "Release  ", &self.params.release, .{ .min = 0.01, .max = 2, .step = 0.01 });
+    _ = self.ctx.sliderF32Id(0x6006, "KeyTrack ", &self.params.keytrack, .{ .min = 0, .max = 1, .step = 0.05 });
+    self.ctx.endBox();
+    self.ctx.beginBox(.{ .direction = .column, .gap = 4 });
+    _ = self.ctx.sliderF32Id(0x6007, "FiltEnv  ", &self.params.filter_env_amount, .{ .min = 0, .max = 5, .step = 0.1 });
+    _ = self.ctx.sliderF32Id(0x6008, "FEnvAtk  ", &self.params.filter_attack, .{ .min = 0, .max = 1, .step = 0.01 });
+    _ = self.ctx.sliderF32Id(0x6009, "FEnvDec  ", &self.params.filter_decay, .{ .min = 0.01, .max = 1, .step = 0.01 });
+    _ = self.ctx.sliderF32Id(0x600A, "LFO Rate ", &self.params.lfo_rate, .{ .min = 0.1, .max = 20, .step = 0.1 });
+    _ = self.ctx.sliderF32Id(0x600B, "Vibrato  ", &self.params.vibrato_depth, .{ .min = 0, .max = 2, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x600C, "Tremolo  ", &self.params.tremolo_depth, .{ .min = 0, .max = 1, .step = 0.05 });
+    self.ctx.endBox();
+    self.ctx.beginBox(.{ .direction = .column, .gap = 4 });
+    _ = self.ctx.sliderF32Id(0x600D, "Unison   ", &self.params.unison, .{ .min = 1, .max = 7, .step = 1 });
+    _ = self.ctx.sliderF32Id(0x600E, "Detune   ", &self.params.detune, .{ .min = 0, .max = 50, .step = 1 });
+    _ = self.ctx.sliderF32Id(0x600F, "Osc2 Mix ", &self.params.osc2_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x6010, "Osc2 Det ", &self.params.osc2_detune, .{ .min = -24, .max = 24, .step = 1 });
+    _ = self.ctx.sliderF32Id(0x6011, "Noise    ", &self.params.noise_amount, .{ .min = 0, .max = 1, .step = 0.05 });
+    self.ctx.endBox();
+    self.ctx.beginBox(.{ .direction = .column, .gap = 4 });
+    _ = self.ctx.sliderF32Id(0x6012, "Dly Time ", &self.fxp.delay_time, .{ .min = 0.01, .max = 1.0, .step = 0.01 });
+    _ = self.ctx.sliderF32Id(0x6013, "Dly FB   ", &self.fxp.delay_fb, .{ .min = 0, .max = 0.95, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x6014, "Dly Mix  ", &self.fxp.delay_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x6015, "Cho Rate ", &self.fxp.chorus_rate, .{ .min = 0.1, .max = 8, .step = 0.1 });
+    _ = self.ctx.sliderF32Id(0x6016, "Cho Depth", &self.fxp.chorus_depth, .{ .min = 0.5, .max = 10, .step = 0.5 });
+    _ = self.ctx.sliderF32Id(0x6017, "Cho Mix  ", &self.fxp.chorus_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x6018, "Dist Drv ", &self.fxp.dist_drive, .{ .min = 1, .max = 20, .step = 0.5 });
+    _ = self.ctx.sliderF32Id(0x6019, "Dist Mix ", &self.fxp.dist_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x601A, "Rev Mix  ", &self.fxp.reverb_mix, .{ .min = 0, .max = 1, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x601B, "Rev Decay", &self.fxp.reverb_decay, .{ .min = 0, .max = 1, .step = 0.05 });
+    _ = self.ctx.sliderF32Id(0x601C, "Rev Damp ", &self.fxp.reverb_damping, .{ .min = 0, .max = 1, .step = 0.05 });
+    self.ctx.endBox();
+    self.ctx.endBox();
+    self.ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    const wlabel = std.fmt.allocPrint(self.ctx.allocator(), "Wave: {s}", .{WAVE_NAMES[self.params.wave_idx]}) catch "Wave";
+    if (self.ctx.button(wlabel)) self.params.wave_idx = (self.params.wave_idx + 1) % WAVE_NAMES.len;
+    const flabel = std.fmt.allocPrint(self.ctx.allocator(), "Filter: {s}", .{FILTER_MODE_NAMES[self.params.filter_mode_idx]}) catch "Filter";
+    if (self.ctx.button(flabel)) self.params.filter_mode_idx = (self.params.filter_mode_idx + 1) % FILTER_MODE_NAMES.len;
+    const o2label = std.fmt.allocPrint(self.ctx.allocator(), "Osc2: {s}", .{WAVE_NAMES[self.params.osc2_wave_idx]}) catch "Osc2";
+    if (self.ctx.button(o2label)) self.params.osc2_wave_idx = (self.params.osc2_wave_idx + 1) % WAVE_NAMES.len;
+    const fxlabel = if (self.fxp.bypass) "FX: off" else "FX: on";
+    if (self.ctx.button(fxlabel)) self.fxp.bypass = !self.fxp.bypass;
+    self.ctx.endBox();
+    self.ctx.endBox();
+    self.ctx.endFrame();
+
+    // パラメータを publish（atomic/patch publish 経由で audio スレッドへ）
+    self.last_patch = makePatch(self.params);
+    self.synth.publishPatch(self.last_patch);
+    self.fx.publishParams(makeFxParams(self.fxp));
+
+    // 手動描画 → GUI
+    drawSpectrogramBgAndPiano(fb, &self.pressed);
+    self.spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
+    self.osc.draw(fb.pixels, fb.width, fb.height, SCOPE_X0, VIS_Y0);
+    self.meter.draw(fb.pixels, fb.width, fb.height, METER_X0, VIS_Y0, METER_W, VIS_H);
+    drawSpecLabels(fb, self.spec);
+    const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
+    gui.render(target, &self.ctx.draw_list, self.ctx.font);
+
+    window.present();
+    platform.frameDelay(16_000_000); // ~16ms（約 60fps）。wasm では rAF 律速なので実質 no-op 相当
+    return running;
+}
+
+const Rt = app_runtime.Runtime(App);
+
+pub fn enableWasmRuntime() void {
+    Rt.enableWasmExports();
+    // audio_web の export（vp_audio_render / stack_top / render_buf）を DCE から守る
+    audio.enableWebAudioExports();
+}
+
+pub fn main(process_init: std.process.Init) !void {
+    std.debug.print("apps/synth: A..K=C4..C5 / 画面鍵盤クリック / スライダで音色変更 / ESC 終了\n", .{});
+    try Rt.runNative(process_init);
 }
 
 /// GUI スライダ/ボタンが in-place 更新するパラメータ束。
@@ -678,7 +720,7 @@ fn actionSavePatch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     _ = buf;
     const app = actionApp(ctx);
     const path = try actions.parsePath(args);
-    try patch_io.save(app.io, path, Params, FxParams, app.params, app.fxp, std.heap.c_allocator);
+    try patch_io.save(app.io, path, Params, FxParams, app.params, app.fxp, app.gpa);
     return "ok";
 }
 
@@ -686,7 +728,7 @@ fn actionLoadPatch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     _ = buf;
     const app = actionApp(ctx);
     const path = try actions.parsePath(args);
-    const loaded = try patch_io.load(app.io, std.heap.c_allocator, path, Params, FxParams);
+    const loaded = try patch_io.load(app.io, app.gpa, path, Params, FxParams);
     app.params = loaded.params;
     app.fxp = loaded.fxp;
     republishPatch(app);
