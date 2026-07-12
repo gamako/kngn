@@ -7,11 +7,10 @@
 //! 優先し ASCII も 1 本で混在描画。再配布でないので repo にアセットを持たず・ネットワーク取得も不要）。
 //! フォント自体は日本語グリフを持つので、char_input で**届いた** codepoint は日本語も描画できる。
 //!
-//! **既知の制限（TASK-79.6）**: 実 IME（日本語変換）入力はまだ動かない。macOS backend の
-//! イベントループは keyDown を横取りして `event.characters` を直接読むため Cocoa の
-//! `interpretKeyEvents:`/`NSTextInputClient` を通らず、IME の composition 機構にイベントが届かない。
-//! よって「英数字の直接入力」は動くが「日本語変換入力」は TASK-79.6 待ち。届いた codepoint 自体は
-//! 下段 'last: U+XXXX' で確認でき、harness `inject char` では日本語 codepoint も描画・検証できる。
+//! **IME（TASK-79.6.1）**: macOS は view を NSTextInputClient 化し、keyDown を
+//! `interpretKeyEvents:` 経由で insertText → `char_input` に流す（確定日本語が入る）。
+//! 変換中 preedit の inline 描画は 79.6.2。harness は `inject commit <text>` で確定列を
+//! codepoint 分解注入できる（`inject char` と同経路）。
 //!
 //! 操作: 文字をタイプ＝`char_input` でバッファ追記 / BACKSPACE=1 コードポイント削除 /
 //!       ENTER=改行 / ESC=終了。
@@ -133,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
                 const lh: i32 = @intCast(f.metrics().line_height);
 
                 f.drawTo(target, .{ .x = 8, .y = 8 }, "char_input demo: type ASCII / BACKSPACE / ENTER / ESC quit", gray, clip);
-                f.drawTo(target, .{ .x = 8, .y = 8 + lh }, "(日本語 IME 入力は TASK-79.6 待ち。届いた codepoint は下段 'last' で確認)", gray, clip);
+                f.drawTo(target, .{ .x = 8, .y = 8 + lh }, "(IME: 変換→確定で日本語。preedit 下線は 79.6.2。inject commit 可)", gray, clip);
 
                 // 入力テキスト（'\n' で行分割）。末尾に静的キャレット '_'（blink しない＝決定的）。
                 const text_top: i32 = 8 + lh * 2;

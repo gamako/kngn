@@ -259,8 +259,29 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 // CALayer最適化版の実装
 // ========================================
 
-// カスタムNSView - CALayerベースの高速描画
-@interface FramebufferView : NSView {
+// IME composition 固定バッファ（preedit UTF-8。TASK-79.6.1）
+#define COMPOSITION_UTF8_CAP 1024
+
+/// s[0..len] のうち cap バイト以内に収まる最長の UTF-8 codepoint 境界プレフィックス長。
+/// cap を超える場合は continuation (0b10xxxxxx) を含む途中切断を避け、完全な codepoint だけ残す。
+static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
+    size_t i = 0;
+    while (i < len && i < cap) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t need;
+        if ((c & 0x80) == 0) need = 1;
+        else if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else break; // 不正 lead: 手前まで
+        if (i + need > cap || i + need > len) break;
+        i += need;
+    }
+    return i;
+}
+
+// カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
+@interface FramebufferView : NSView <NSTextInputClient> {
     int width;
     int height;
     CADisplayLink* displayLink;
@@ -298,6 +319,14 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
     // ライブリサイズ再描画 (TASK-23.1)。FrameCallback とは別。未登録時は NULL。
     PlatformRedrawCallback redrawCallback;
     void* redrawUserdata;
+
+    // IME composition 状態 (TASK-79.6.1)。本文は snapshot API、変化は PLATFORM_EVENT_COMPOSITION。
+    NSMutableString* markedText;
+    NSRange imeSelectedRange; // markedText 内の選択（UTF-16 単位）
+    char compositionUtf8[COMPOSITION_UTF8_CAP];
+    uint32_t compositionLen;
+    uint32_t compositionRevision;
+    uint32_t compositionCursor; // preedit 内 UTF-8 バイトオフセット
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
@@ -322,6 +351,9 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 // ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==NULL で解除。
 - (void)setRedrawCallback:(PlatformRedrawCallback)cb userdata:(void*)ud;
 
+// composition snapshot（platform_get_composition_snapshot から呼ぶ）
+- (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta;
+
 @end
 
 @implementation FramebufferView
@@ -342,6 +374,12 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
         mouseInsideView = NO;
         redrawCallback = NULL;
         redrawUserdata = NULL;
+        markedText = [[NSMutableString alloc] init];
+        imeSelectedRange = NSMakeRange(0, 0);
+        compositionLen = 0;
+        compositionRevision = 0;
+        compositionCursor = 0;
+        memset(compositionUtf8, 0, sizeof(compositionUtf8));
 
         // ダブルバッファを確保（ページアラインメント推奨）
         buffer0 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
@@ -475,6 +513,8 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
         cursorHiddenByThisView = NO;
     }
 
+    markedText = nil;
+
     // CGオブジェクトを解放
     if (provider0) CGDataProviderRelease(provider0);
     if (provider1) CGDataProviderRelease(provider1);
@@ -602,6 +642,204 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 - (void)setRedrawCallback:(PlatformRedrawCallback)cb userdata:(void*)ud {
     redrawCallback = cb;
     redrawUserdata = ud;
+}
+
+// ========================================
+// NSTextInputClient / IME composition (TASK-79.6.1)
+// ========================================
+// keyDown は poll ループで物理 key_down を積んだ後 interpretKeyEvents: に渡し、
+// insertText: が char_input の唯一の生成元になる（旧 event.characters 直読みは廃止）。
+
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
+- (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta {
+    // latest-wins: 常に現在 preedit。event.revision は取りこぼし検知用（過去 revision は取れない）。
+    if (meta) {
+        meta->revision = compositionRevision;
+        meta->cursor = compositionCursor;
+        meta->len = 0;
+    }
+    if (!buf || cap == 0 || compositionLen == 0) {
+        if (meta) meta->len = 0;
+        return 0;
+    }
+    // UTF-8 codepoint 境界で切断（codex 修正 A）
+    uint32_t n = (uint32_t)utf8SafePrefixLen(compositionUtf8, compositionLen, cap);
+    memcpy(buf, compositionUtf8, n);
+    if (meta) {
+        meta->len = n;
+        if (meta->cursor > n) meta->cursor = n;
+    }
+    return n;
+}
+
+/// markedText → compositionUtf8 / compositionCursor を同期する。
+- (void)syncCompositionBufferFromMarked {
+    const char* utf8 = [markedText UTF8String];
+    if (!utf8) {
+        compositionLen = 0;
+        compositionCursor = 0;
+        return;
+    }
+    size_t raw_len = strlen(utf8);
+    // 固定バッファへ UTF-8 境界で truncate（codex 修正 A）
+    size_t len = utf8SafePrefixLen(utf8, raw_len, COMPOSITION_UTF8_CAP);
+    memcpy(compositionUtf8, utf8, len);
+    compositionLen = (uint32_t)len;
+    // selectedRange.location は UTF-16 単位。UTF-8 オフセットへ変換する。
+    NSUInteger loc = imeSelectedRange.location;
+    if (loc > markedText.length) loc = markedText.length;
+    NSString* prefix = [markedText substringToIndex:loc];
+    const char* pfx = [prefix UTF8String];
+    compositionCursor = pfx ? (uint32_t)strlen(pfx) : 0;
+    if (compositionCursor > compositionLen) compositionCursor = compositionLen;
+}
+
+- (void)pushCompositionPhase:(uint8_t)phase {
+    if (!platformWindow) return;
+    compositionRevision += 1;
+    PlatformEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = PLATFORM_EVENT_COMPOSITION;
+    ev.payload.composition.revision = compositionRevision;
+    ev.payload.composition.phase = phase;
+    ev.payload.composition.cursor = compositionCursor;
+    queue_push(&platformWindow->event_queue, &ev);
+}
+
+/// insertText の文字列を codepoint 分解して CHAR_INPUT を積む（制御/private-use 除外）。
+/// Cmd/Ctrl 押下中は char_input を出さない（キーバインド経由 insertText の誤印字防止。codex 修正 B）。
+- (void)pushCharInputsFromString:(NSString*)str {
+    if (!platformWindow || !str) return;
+    uint32_t char_mods = extractModifiers([NSEvent modifierFlags]);
+    // printable フィルタと同列の invariant: cmd/ctrl 付きは印字しない
+    if (char_mods & (PLATFORM_MOD_CMD | PLATFORM_MOD_CTRL)) return;
+    NSUInteger clen = str.length;
+    for (NSUInteger ci = 0; ci < clen;) {
+        unichar hi = [str characterAtIndex:ci];
+        uint32_t cp;
+        if (CFStringIsSurrogateHighCharacter(hi) && ci + 1 < clen) {
+            unichar lo = [str characterAtIndex:ci + 1];
+            cp = CFStringGetLongCharacterForSurrogatePair(hi, lo);
+            ci += 2;
+        } else {
+            cp = hi;
+            ci += 1;
+        }
+        if (cp >= 0x20 && cp != 0x7f && !(cp >= 0xF700 && cp <= 0xF8FF)) {
+            PlatformEvent char_event;
+            memset(&char_event, 0, sizeof(char_event));
+            char_event.type = PLATFORM_EVENT_CHAR_INPUT;
+            char_event.payload.character.codepoint = cp;
+            char_event.payload.character.modifiers = char_mods;
+            queue_push(&platformWindow->event_queue, &char_event);
+        }
+    }
+}
+
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
+    (void)replacementRange;
+    NSString* str = [string isKindOfClass:[NSAttributedString class]]
+        ? [(NSAttributedString*)string string]
+        : (NSString*)string;
+    BOOL hadMarked = (markedText.length > 0);
+    if (hadMarked) {
+        [markedText setString:@""];
+        imeSelectedRange = NSMakeRange(0, 0);
+        compositionLen = 0;
+        compositionCursor = 0;
+        [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_COMMIT];
+    }
+    [self pushCharInputsFromString:str];
+}
+
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange {
+    // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
+    (void)replacementRange;
+    NSString* str = [string isKindOfClass:[NSAttributedString class]]
+        ? [(NSAttributedString*)string string]
+        : (NSString*)string;
+    if (!str) str = @"";
+    BOOL wasEmpty = (markedText.length == 0);
+    [markedText setString:str];
+    imeSelectedRange = selectedRange;
+    if (selectedRange.location == NSNotFound) {
+        imeSelectedRange = NSMakeRange(markedText.length, 0);
+    }
+    [self syncCompositionBufferFromMarked];
+    if (markedText.length == 0) {
+        compositionLen = 0;
+        compositionCursor = 0;
+        if (!wasEmpty) {
+            [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_CANCEL];
+        }
+        return;
+    }
+    uint8_t phase = wasEmpty
+        ? PLATFORM_COMPOSITION_PHASE_START
+        : PLATFORM_COMPOSITION_PHASE_UPDATE;
+    [self pushCompositionPhase:phase];
+}
+
+- (void)unmarkText {
+    if (markedText.length == 0) return;
+    [markedText setString:@""];
+    imeSelectedRange = NSMakeRange(0, 0);
+    compositionLen = 0;
+    compositionCursor = 0;
+    [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_CANCEL];
+}
+
+- (BOOL)hasMarkedText {
+    return markedText.length > 0;
+}
+
+- (NSRange)markedRange {
+    if (markedText.length == 0) return NSMakeRange(NSNotFound, 0);
+    return NSMakeRange(0, markedText.length);
+}
+
+- (NSRange)selectedRange {
+    if (markedText.length == 0) return NSMakeRange(NSNotFound, 0);
+    return imeSelectedRange;
+}
+
+- (NSArray<NSAttributedStringKey>*)validAttributesForMarkedText {
+    return @[];
+}
+
+- (NSAttributedString*)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    if (markedText.length == 0) return nil;
+    NSRange full = NSMakeRange(0, markedText.length);
+    NSRange clipped = NSIntersectionRange(full, range);
+    if (clipped.length == 0) return nil;
+    if (actualRange) *actualRange = clipped;
+    return [[NSAttributedString alloc] initWithString:[markedText substringWithRange:clipped]];
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    (void)point;
+    return NSNotFound;
+}
+
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    if (actualRange) *actualRange = range;
+    // MVP: view 左上近傍の固定 rect（候補窓が window 近傍に出ること。caret 供給は 79.6.2）。
+    // AppKit view 座標は下原点。bounds 上端付近へ置く。
+    NSRect r = NSMakeRect(20.0, self.bounds.size.height - 48.0, 1.0, 18.0);
+    r = [self convertRect:r toView:nil];
+    if (self.window) {
+        r = [self.window convertRectToScreen:r];
+    }
+    return r;
+}
+
+- (void)doCommandBySelector:(SEL)selector {
+    // 未処理 command を吸収してビープ抑止。BACKSPACE/ENTER 等の物理キーは key_down 経路で既に届く。
+    (void)selector;
 }
 
 // ========================================
@@ -994,6 +1232,8 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
         // ウィンドウを表示
         [platformWindow->window center];
         [platformWindow->window makeKeyAndOrderFront:nil];
+        // IME: view を first responder にして inputContext / interpretKeyEvents が効くようにする（TASK-79.6.1）
+        [platformWindow->window makeFirstResponder:platformWindow->view];
         [app activateIgnoringOtherApps:YES];
 
         // CADisplayLinkを開始
@@ -1067,6 +1307,7 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
             // キーボードイベントをイベントキューに追加
             if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
                 PlatformEvent platform_event;
+                memset(&platform_event, 0, sizeof(platform_event));
                 platform_event.type = (event.type == NSEventTypeKeyDown)
                     ? PLATFORM_EVENT_KEY_DOWN
                     : PLATFORM_EVENT_KEY_UP;
@@ -1075,32 +1316,11 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                 platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags);
                 queue_push(&platformWindow->event_queue, &platform_event);
 
-                // keyDown は確定文字 (TASK-22) を CHAR_INPUT として key_down とは別に流す。
-                // 印字可能文字のみ（制御文字 <0x20 と DELETE 0x7f、AppKit の function-key private-use
-                // 域 0xF700-0xF8FF=矢印/F キー等を除外）。サロゲートペアは UTF-32 に結合する。
-                if (event.type == NSEventTypeKeyDown) {
-                    NSString* chars = event.characters;
-                    NSUInteger clen = chars.length;
-                    uint32_t char_mods = extractModifiers(event.modifierFlags);
-                    for (NSUInteger ci = 0; ci < clen;) {
-                        unichar hi = [chars characterAtIndex:ci];
-                        uint32_t cp;
-                        if (CFStringIsSurrogateHighCharacter(hi) && ci + 1 < clen) {
-                            unichar lo = [chars characterAtIndex:ci + 1];
-                            cp = CFStringGetLongCharacterForSurrogatePair(hi, lo);
-                            ci += 2;
-                        } else {
-                            cp = hi;
-                            ci += 1;
-                        }
-                        if (cp >= 0x20 && cp != 0x7f && !(cp >= 0xF700 && cp <= 0xF8FF)) {
-                            PlatformEvent char_event;
-                            char_event.type = PLATFORM_EVENT_CHAR_INPUT;
-                            char_event.payload.character.codepoint = cp;
-                            char_event.payload.character.modifiers = char_mods;
-                            queue_push(&platformWindow->event_queue, &char_event);
-                        }
-                    }
+                // keyDown: 物理 key_down を積んだ後 IME/inputContext 経路へ（TASK-79.6.1）。
+                // insertText: が char_input の唯一の生成元。旧 event.characters 直読みは廃止
+                // （二重入力・IME 迂回防止）。sendEvent は呼ばない（ビープは doCommandBySelector で吸収）。
+                if (event.type == NSEventTypeKeyDown && platformWindow->view) {
+                    [platformWindow->view interpretKeyEvents:@[event]];
                 }
 
                 // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
@@ -1185,6 +1405,17 @@ void platform_set_redraw_callback(PlatformWindow* platformWindow, PlatformRedraw
     @autoreleasepool {
         [platformWindow->view setRedrawCallback:cb userdata:userdata];
     }
+}
+
+// IME composition preedit snapshot（TASK-79.6.1）
+uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta) {
+    if (meta) {
+        meta->revision = 0;
+        meta->cursor = 0;
+        meta->len = 0;
+    }
+    if (!window || !window->view) return 0;
+    return [window->view copyCompositionSnapshot:buf cap:cap meta:meta];
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

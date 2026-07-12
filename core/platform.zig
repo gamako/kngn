@@ -102,6 +102,10 @@ pub const Error = types.Error;
 pub const KeyCode = types.KeyCode;
 pub const ModifierFlags = types.ModifierFlags;
 pub const KeyEvent = types.KeyEvent;
+pub const CharEvent = types.CharEvent;
+pub const CompositionPhase = types.CompositionPhase;
+pub const CompositionEvent = types.CompositionEvent;
+pub const CompositionSnapshot = types.CompositionSnapshot;
 pub const MouseButton = types.MouseButton;
 pub const MouseButtons = types.MouseButtons;
 pub const MouseEvent = types.MouseEvent;
@@ -277,6 +281,19 @@ pub const Window = struct {
         if (builtin.os.tag != .macos) return null; // Linux/Windows backend は当面未実装（TASK-80.2 は macOS のみ）
         if (!build_options.enable_gamepad) return null; // opt-in 無効（TASK-80.2 opt-in 化）
         return self.inner.getGamepadState(index);
+    }
+
+    /// IME composition preedit 本文を buf へ書く（TASK-79.6.1）。
+    /// headless / 非対応 backend は常に空（text 0 長・revision/cursor 0）。
+    ///
+    /// **latest-wins 契約（親 TASK-79.6 codex 収束）**: snapshot は常に「現在の」未確定状態。
+    /// 同一 poll 内の複数 `composition_changed` は最新 snapshot に潰れる。event の `revision` は
+    /// 取りこぼし検知用で、過去 revision の snapshot は取得できない。
+    ///
+    /// ホットパス宣言: イベント時のみ（描画前の preedit 読み。フレーム毎全画素でも RT でもない）。
+    pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
+        if (self.headless) return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
+        return self.inner.getCompositionSnapshot(buf);
     }
 };
 

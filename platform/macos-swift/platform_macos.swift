@@ -394,8 +394,30 @@ func gamepadDetachWindow(_ handle: PlatformWindowHandle) {
 }
 #endif // VP_ENABLE_GAMEPAD
 
-// カスタムNSView - CALayerベースの高速描画
-class FramebufferView: NSView {
+// composition preedit 固定バッファ容量（UTF-8。TASK-79.6.1）
+private let compositionUtf8Cap = 1024
+
+/// s[0..<len] のうち cap 以内に収まる最長 UTF-8 codepoint 境界プレフィックス長（codex 修正 A）。
+private func utf8SafePrefixLen(_ s: [UInt8], len: Int, cap: Int) -> Int {
+    var i = 0
+    let n = min(len, s.count)
+    let limit = min(n, cap)
+    while i < limit {
+        let c = s[i]
+        let need: Int
+        if (c & 0x80) == 0 { need = 1 }
+        else if (c & 0xE0) == 0xC0 { need = 2 }
+        else if (c & 0xF0) == 0xE0 { need = 3 }
+        else if (c & 0xF8) == 0xF0 { need = 4 }
+        else { break }
+        if i + need > limit { break }
+        i += need
+    }
+    return i
+}
+
+// カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
+class FramebufferView: NSView, NSTextInputClient {
     private var width: Int
     private var height: Int
     private var displayLink: CADisplayLink?
@@ -435,6 +457,14 @@ class FramebufferView: NSView {
     // ライブリサイズ再描画 (TASK-23.1)。CADisplayLink 用 FrameCallback とは別 field。
     private var redrawCallback: PlatformRedrawCallback?
     private var redrawUserdata: UnsafeMutableRawPointer?
+
+    // IME composition 状態 (TASK-79.6.1)
+    private var markedTextStorage = NSMutableString()
+    private var imeSelectedRange = NSRange(location: 0, length: 0)
+    private var compositionUtf8 = [UInt8](repeating: 0, count: compositionUtf8Cap)
+    private var compositionLen: UInt32 = 0
+    private var compositionRevision: UInt32 = 0
+    private var compositionCursor: UInt32 = 0
 
     init(frame: NSRect, width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
         self.width = width
@@ -492,6 +522,201 @@ class FramebufferView: NSView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    // MARK: - NSTextInputClient / IME (TASK-79.6.1)
+
+    override var acceptsFirstResponder: Bool { true }
+
+    func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
+        // latest-wins: 常に現在 preedit。event.revision は取りこぼし検知用（過去 revision は取れない）。
+        if let meta = meta {
+            meta.pointee.revision = compositionRevision
+            meta.pointee.cursor = compositionCursor
+            meta.pointee.len = 0
+        }
+        guard let buf = buf, cap > 0, compositionLen > 0 else { return 0 }
+        // UTF-8 codepoint 境界で切断（codex 修正 A）
+        let n = UInt32(utf8SafePrefixLen(compositionUtf8, len: Int(compositionLen), cap: Int(cap)))
+        compositionUtf8.withUnsafeBytes { raw in
+            if let base = raw.baseAddress {
+                memcpy(buf, base, Int(n))
+            }
+        }
+        if let meta = meta {
+            meta.pointee.len = n
+            if meta.pointee.cursor > n { meta.pointee.cursor = n }
+        }
+        return n
+    }
+
+    private func syncCompositionBufferFromMarked() {
+        let str = markedTextStorage as String
+        guard let data = str.data(using: .utf8) else {
+            compositionLen = 0
+            compositionCursor = 0
+            return
+        }
+        // 固定バッファへ UTF-8 境界で truncate（codex 修正 A）
+        var tmp = [UInt8](repeating: 0, count: data.count)
+        data.copyBytes(to: &tmp, count: data.count)
+        let len = utf8SafePrefixLen(tmp, len: data.count, cap: compositionUtf8Cap)
+        for i in 0..<len { compositionUtf8[i] = tmp[i] }
+        compositionLen = UInt32(len)
+        var loc = imeSelectedRange.location
+        if loc == NSNotFound { loc = markedTextStorage.length }
+        if loc > markedTextStorage.length { loc = markedTextStorage.length }
+        let prefix = markedTextStorage.substring(to: loc)
+        if let pdata = prefix.data(using: .utf8) {
+            compositionCursor = UInt32(min(pdata.count, Int(compositionLen)))
+        } else {
+            compositionCursor = 0
+        }
+        if compositionCursor > compositionLen { compositionCursor = compositionLen }
+    }
+
+    private func pushCompositionPhase(_ phase: UInt8) {
+        guard let handle = platformWindow else { return }
+        compositionRevision &+= 1
+        var ev = PlatformEvent()
+        ev.type = PLATFORM_EVENT_COMPOSITION
+        ev.payload.composition.revision = compositionRevision
+        ev.payload.composition.phase = phase
+        ev.payload.composition.cursor = compositionCursor
+        handle.event_queue.push(ev)
+    }
+
+    /// Cmd/Ctrl 押下中は char_input を出さない（キーバインド経由 insertText の誤印字防止。codex 修正 B）。
+    private func pushCharInputs(from str: String) {
+        guard let handle = platformWindow else { return }
+        let charMods = extractModifiers(NSEvent.modifierFlags)
+        // printable フィルタと同列の invariant: cmd/ctrl 付きは印字しない
+        if (charMods & (UInt32(PLATFORM_MOD_CMD.rawValue) | UInt32(PLATFORM_MOD_CTRL.rawValue))) != 0 {
+            return
+        }
+        for scalar in str.unicodeScalars {
+            let cp = scalar.value
+            if cp >= 0x20 && cp != 0x7f && !(cp >= 0xF700 && cp <= 0xF8FF) {
+                var charEvent = PlatformEvent()
+                charEvent.type = PLATFORM_EVENT_CHAR_INPUT
+                charEvent.payload.character.codepoint = cp
+                charEvent.payload.character.modifiers = charMods
+                handle.event_queue.push(charEvent)
+            }
+        }
+    }
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
+        _ = replacementRange
+        let str: String
+        if let attr = string as? NSAttributedString {
+            str = attr.string
+        } else if let s = string as? String {
+            str = s
+        } else {
+            str = ""
+        }
+        let hadMarked = markedTextStorage.length > 0
+        if hadMarked {
+            markedTextStorage.setString("")
+            imeSelectedRange = NSRange(location: 0, length: 0)
+            compositionLen = 0
+            compositionCursor = 0
+            pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_COMMIT.rawValue))
+        }
+        pushCharInputs(from: str)
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
+        _ = replacementRange
+        let str: String
+        if let attr = string as? NSAttributedString {
+            str = attr.string
+        } else if let s = string as? String {
+            str = s
+        } else {
+            str = ""
+        }
+        let wasEmpty = markedTextStorage.length == 0
+        markedTextStorage.setString(str)
+        imeSelectedRange = selectedRange
+        if selectedRange.location == NSNotFound {
+            imeSelectedRange = NSRange(location: markedTextStorage.length, length: 0)
+        }
+        syncCompositionBufferFromMarked()
+        if markedTextStorage.length == 0 {
+            compositionLen = 0
+            compositionCursor = 0
+            if !wasEmpty {
+                pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
+            }
+            return
+        }
+        let phase: UInt8 = wasEmpty
+            ? UInt8(PLATFORM_COMPOSITION_PHASE_START.rawValue)
+            : UInt8(PLATFORM_COMPOSITION_PHASE_UPDATE.rawValue)
+        pushCompositionPhase(phase)
+    }
+
+    func unmarkText() {
+        guard markedTextStorage.length > 0 else { return }
+        markedTextStorage.setString("")
+        imeSelectedRange = NSRange(location: 0, length: 0)
+        compositionLen = 0
+        compositionCursor = 0
+        pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
+    }
+
+    func hasMarkedText() -> Bool {
+        return markedTextStorage.length > 0
+    }
+
+    func markedRange() -> NSRange {
+        if markedTextStorage.length == 0 { return NSRange(location: NSNotFound, length: 0) }
+        return NSRange(location: 0, length: markedTextStorage.length)
+    }
+
+    func selectedRange() -> NSRange {
+        if markedTextStorage.length == 0 { return NSRange(location: NSNotFound, length: 0) }
+        return imeSelectedRange
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+        return []
+    }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        if markedTextStorage.length == 0 { return nil }
+        let full = NSRange(location: 0, length: markedTextStorage.length)
+        let clipped = NSIntersectionRange(full, range)
+        if clipped.length == 0 { return nil }
+        actualRange?.pointee = clipped
+        let sub = markedTextStorage.substring(with: clipped)
+        return NSAttributedString(string: sub)
+    }
+
+    func characterIndex(for point: NSPoint) -> Int {
+        _ = point
+        return NSNotFound
+    }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        actualRange?.pointee = range
+        // MVP: view 左上近傍の固定 rect（候補窓が window 近傍に出ること。caret 供給は 79.6.2）
+        var r = NSRect(x: 20.0, y: bounds.size.height - 48.0, width: 1.0, height: 18.0)
+        r = convert(r, to: nil)
+        if let win = window {
+            r = win.convertToScreen(r)
+        }
+        return r
+    }
+
+    override func doCommand(by selector: Selector) {
+        // 未処理 command を吸収してビープ抑止。物理キーは key_down 経路で既に届く。
+        // super は呼ばない（未処理 command のビープを抑止する NSTextInputClient 契約）。
+        _ = selector
     }
 
     func startDisplayLink() {
@@ -911,6 +1136,8 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     // ウィンドウを表示
     window.center()
     window.makeKeyAndOrderFront(nil)
+    // IME: view を first responder にして inputContext / interpretKeyEvents が効くようにする（TASK-79.6.1）
+    window.makeFirstResponder(view)
     app.activate(ignoringOtherApps: true)
 
     // CADisplayLinkを開始
@@ -982,21 +1209,10 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags)
             handle.event_queue.push(platform_event)
 
-            // keyDown は確定文字 (TASK-22) を CHAR_INPUT として流す。印字可能のみ（制御文字 <0x20 /
-            // DELETE 0x7f、AppKit function-key private-use 域 0xF700-0xF8FF を除外）。Swift の
-            // unicodeScalars は UTF-32 スカラーを直接返す（surrogate 手動結合は不要）。
-            if event.type == .keyDown, let chars = event.characters {
-                let char_mods = extractModifiers(event.modifierFlags)
-                for scalar in chars.unicodeScalars {
-                    let cp = scalar.value
-                    if cp >= 0x20 && cp != 0x7f && !(cp >= 0xF700 && cp <= 0xF8FF) {
-                        var char_event = PlatformEvent()
-                        char_event.type = PLATFORM_EVENT_CHAR_INPUT
-                        char_event.payload.character.codepoint = cp
-                        char_event.payload.character.modifiers = char_mods
-                        handle.event_queue.push(char_event)
-                    }
-                }
+            // keyDown: 物理 key_down を積んだ後 IME/inputContext 経路へ（TASK-79.6.1）。
+            // insertText が char_input の唯一の生成元。旧 event.characters 直読みは廃止。
+            if event.type == .keyDown {
+                handle.view.interpretKeyEvents([event])
             }
 
             // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
@@ -1017,6 +1233,24 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     }
 
     return true
+}
+
+// IME composition preedit snapshot（TASK-79.6.1）
+@_cdecl("platform_get_composition_snapshot")
+func platform_get_composition_snapshot(
+    platformWindow: UnsafeMutableRawPointer?,
+    buf: UnsafeMutablePointer<CChar>?,
+    cap: UInt32,
+    meta: UnsafeMutablePointer<PlatformCompositionMeta>?
+) -> UInt32 {
+    if let meta = meta {
+        meta.pointee.revision = 0
+        meta.pointee.cursor = 0
+        meta.pointee.len = 0
+    }
+    guard let platformWindow = platformWindow else { return 0 }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    return handle.view.copyCompositionSnapshot(buf: buf, cap: cap, meta: meta)
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

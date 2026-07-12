@@ -1291,6 +1291,12 @@ pub const Window = struct {
     pub fn clearRedrawCallback(self: Window) void {
         _ = self;
     }
+
+    /// IME composition snapshot（TASK-79.6.1）。Linux IME は 79.6.3。常に空。
+    pub fn getCompositionSnapshot(self: Window, buf: []u8) types.CompositionSnapshot {
+        _ = self;
+        return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
+    }
 };
 
 // ---- system cursor（TASK-75.3）----

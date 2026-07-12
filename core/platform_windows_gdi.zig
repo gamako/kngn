@@ -146,6 +146,12 @@ pub const Window = struct {
     pub fn clearRedrawCallback(self: Window) void {
         self.core.clearRedrawCallback();
     }
+
+    /// IME composition snapshot（TASK-79.6.1）。Windows IME は 79.6.4。常に空。
+    pub fn getCompositionSnapshot(self: Window, buf: []u8) types.CompositionSnapshot {
+        _ = self;
+        return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
+    }
 };
 
 fn makeBitmapInfo(width: u32, height: u32) BITMAPINFO {

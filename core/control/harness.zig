@@ -501,7 +501,10 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
             }
         }
         const raw = nextLine() orelse continue;
-        const line = std.mem.trim(u8, raw, " \t\r");
+        // 先頭空白のみ除去。行末スペースは `inject commit` 等が保持するため残す（TASK-79.6.1 codex D）。
+        // 行末 \r のみ落とす（record→replay 対称: commit 本文の前後空白を失わない）。
+        var line = std.mem.trimStart(u8, raw, " \t");
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (line.len == 0 or line[0] == '#') continue;
         var it = std.mem.tokenizeAny(u8, line, " \t");
         const cmd = it.next() orelse continue;
@@ -901,6 +904,47 @@ fn handleInject(it: *Tok) void {
         const cp = parseCodepoint(arg) orelse return warnLine("inject char: codepoint/文字 不正");
         const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
         queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
+    } else if (std.mem.eql(u8, kind, "commit")) {
+        // IME 確定テキスト列を注入（TASK-79.6.1）。残りの行を UTF-8 とみなし codepoint 分解して
+        // char_input を連続 queue（実 IME の insertText と同じ消費経路）。modifiers は空。
+        // inject preedit は 79.6.2 へ先送り（preedit 描画 consumer が無く assert 不能）。
+        //
+        // 空白: `it.rest()` は先頭 delimiter を全部飛ばすため、トークン直後の raw を使う。
+        // next() 後の index は "commit" 直後（区切り空白上）。区切りは 1 個だけ落とし、
+        // その後ろは空白込みでそのまま注入（record→replay 対称。codex 修正 D）。
+        var text = it.buffer[it.index..];
+        if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
+        if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
+        if (text.len == 0) return warnLine("inject commit: 空テキスト");
+
+        // Pass 1: 全量検証してから Pass 2 で queue（途中失敗で部分注入しない。codex 修正 C）。
+        if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject commit: 不正 UTF-8");
+        {
+            var i: usize = 0;
+            while (i < text.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+                    return warnLine("inject commit: 不正 UTF-8");
+                };
+                const cp = std.unicode.utf8Decode(text[i..][0..seq_len]) catch {
+                    return warnLine("inject commit: 不正 UTF-8");
+                };
+                // parseCodepoint と同フィルタ（印字可能スカラーのみ。制御/surrogate/範囲外は拒否）。
+                if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) or cp < 0x20 or cp == 0x7f) {
+                    return warnLine("inject commit: 非印字 codepoint");
+                }
+                i += seq_len;
+            }
+        }
+        // Pass 2: 検証済みのみ queue
+        {
+            var i: usize = 0;
+            while (i < text.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch unreachable;
+                const cp = std.unicode.utf8Decode(text[i..][0..seq_len]) catch unreachable;
+                queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = .{} } });
+                i += seq_len;
+            }
+        }
     } else if (std.mem.eql(u8, kind, "gamepad_connect")) {
         const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_connect: index 不正");
         const raw_name = std.mem.trim(u8, it.rest(), " \t"); // 残り全体を name として使う（TASK-22 char と同系統）
@@ -4019,6 +4063,81 @@ test "inject gamepad_connect/gamepad_button/gamepad_disconnect: index 範囲外�
     try testing.expect(pollGate(true));
     var i: u8 = 0;
     while (i < MAX_GAMEPADS) : (i += 1) try testing.expectEqual(@as(?GamepadState, null), getGamepadState(i));
+}
+
+test "inject commit: UTF-8 文字列を codepoint 分解して char_input 連続 queue（TASK-79.6.1）" {
+    resetForTest();
+    // こんにちは = U+3053 U+3093 U+306B U+3061 U+306F（5 codepoints）
+    cmd_buf =
+        \\inject commit こんにちは
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const expected = [_]u32{ 0x3053, 0x3093, 0x306B, 0x3061, 0x306F };
+    for (expected) |want| {
+        const e = nextInjectedEvent().?;
+        try testing.expect(e == .char_input);
+        try testing.expectEqual(want, e.char_input.codepoint);
+        try testing.expect(!e.char_input.modifiers.shift);
+        try testing.expect(!e.char_input.modifiers.ctrl);
+        try testing.expect(!e.char_input.modifiers.alt);
+        try testing.expect(!e.char_input.modifiers.cmd);
+    }
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    try testing.expect(!pollGate(true));
+}
+
+test "inject commit: 空テキスト / 不正 UTF-8 は fail-fast（注入なし）" {
+    resetForTest();
+    cmd_buf =
+        \\inject commit
+        \\inject commit 
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    try testing.expect(!pollGate(true));
+}
+
+test "inject commit: 不正 UTF-8 は途中まで注入せずゼロ件（codex 修正 C）" {
+    resetForTest();
+    // 先頭 'A' は valid だが後続 0xFF で不正。Pass1 全量検証で拒否し、A も queue しない。
+    cmd_buf = "inject commit A\xffZ\nstep 1\nquit";
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    try testing.expect(!pollGate(true));
+}
+
+test "inject commit: 区切り後の前後空白を保持（codex 修正 D / record→replay 対称）" {
+    resetForTest();
+    // `commit` 直後の区切り 1 空白の後ろ: " a b "（先頭スペース + a + スペース + b + 末尾スペース）
+    // → 5 codepoints。行末スペースは line の左 trim のみ方針で保持。
+    cmd_buf = "inject commit  a b \nstep 1\nquit";
+    try testing.expect(pollGate(true));
+    const expected = [_]u32{ ' ', 'a', ' ', 'b', ' ' };
+    for (expected) |want| {
+        const e = nextInjectedEvent().?;
+        try testing.expect(e == .char_input);
+        try testing.expectEqual(want, e.char_input.codepoint);
+    }
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+}
+
+test "inject commit: ASCII 混在も char_input 連続（inject char と同経路）" {
+    resetForTest();
+    cmd_buf =
+        \\inject commit Ab
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const e0 = nextInjectedEvent().?;
+    try testing.expect(e0 == .char_input and e0.char_input.codepoint == 'A');
+    const e1 = nextInjectedEvent().?;
+    try testing.expect(e1 == .char_input and e1.char_input.codepoint == 'b');
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
 test "gamepad probe digest: 複数 pad 接続時は connected ビットマスクと p<idx>_ prefix が両立する" {

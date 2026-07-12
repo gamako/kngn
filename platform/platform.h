@@ -157,7 +157,16 @@ typedef enum {
     PLATFORM_EVENT_CHAR_INPUT,   // 確定テキスト文字 (TASK-22。末尾追加=後方互換)
     PLATFORM_EVENT_GAMEPAD_CONNECTED,    // ゲームパッド接続 (TASK-80.1。実消費は TASK-80.2。末尾追加=後方互換)
     PLATFORM_EVENT_GAMEPAD_DISCONNECTED, // ゲームパッド切断
+    PLATFORM_EVENT_COMPOSITION,  // IME composition 状態変化 (TASK-79.6.1。末尾追加=後方互換)
 } PlatformEventType;
+
+// IME composition phase（TASK-79.6.1。Zig CompositionPhase と値一致）
+typedef enum {
+    PLATFORM_COMPOSITION_PHASE_START = 0,
+    PLATFORM_COMPOSITION_PHASE_UPDATE = 1,
+    PLATFORM_COMPOSITION_PHASE_COMMIT = 2,
+    PLATFORM_COMPOSITION_PHASE_CANCEL = 3,
+} PlatformCompositionPhase;
 
 // マウスボタン (物理ボタン基準: NSEvent.buttonNumber と一致)
 // C enum はストレージ型未指定 = int 幅。Zig 側は enum(c_int) で受ける。
@@ -337,8 +346,25 @@ typedef struct PlatformEvent {
             char name[33];                 // NUL 終端デバイス名 (32 bytes + NUL。32超は切り詰め)。
                                             // CONNECTED のみ有効、DISCONNECTED は空文字。TASK-80.1
         } gamepad;
+        struct {
+            uint32_t revision;            // snapshot 突合用。setMarkedText/unmark/insert 毎に増分
+            uint8_t phase;                // PlatformCompositionPhase
+            uint32_t cursor;              // preedit 内 UTF-8 バイトオフセット（caret）
+        } composition;                    // TASK-79.6.1。本文は platform_get_composition_snapshot
     } payload;
 } PlatformEvent;
+
+// IME composition snapshot のメタ（本文は caller の buf へ UTF-8 で書く。TASK-79.6.1）
+typedef struct PlatformCompositionMeta {
+    uint32_t revision;
+    uint32_t cursor;   // preedit 内 UTF-8 バイトオフセット
+    uint32_t len;      // buf に書いたバイト数（cap で切り詰め済み。NUL 非付与）
+} PlatformCompositionMeta;
+
+// 現在の preedit 本文を buf に書く。戻り値 = 書いたバイト数（0 = 空/未 composition）。
+// meta は常に埋める（空時は revision/cursor/len = 0）。非 macOS / 未対応 backend は常に 0。
+// cap==0 または buf==NULL でも meta は埋める（本文は書かない）。
+uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta);
 
 // イベント取得API（1つずつ）
 // ウィンドウのイベントキューから1つイベントを取得する

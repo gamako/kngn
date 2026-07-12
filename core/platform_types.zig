@@ -212,12 +212,37 @@ pub const KeyEvent = struct {
 };
 
 /// テキスト入力イベント（TASK-22）。key_down（物理キー）と独立した「確定文字」の通知。
-/// codepoint は UTF-32（Unicode スカラー値）。IME/変換・marked text は今回スコープ外
-/// （英数の確定文字前提。将来 IME は TASK-79.6）。制御文字（0x20 未満・DELETE 0x7f）は
+/// codepoint は UTF-32（Unicode スカラー値）。IME 確定文字もこの経路で流れる
+/// （TASK-79.6.1: macOS insertText → char_input）。変換中 preedit は `composition_changed`
+/// + `getCompositionSnapshot`（TASK-79.6）。制御文字（0x20 未満・DELETE 0x7f）は
 /// backend 側で除外して印字可能文字のみ流す。
 pub const CharEvent = struct {
     codepoint: u32,
     modifiers: ModifierFlags,
+};
+
+/// IME composition（変換中 preedit）の状態遷移 phase（TASK-79.6.1）。
+/// 本文は event に載せず per-window snapshot API で読む（codex 決定: 寿命契約を曖昧にしない）。
+pub const CompositionPhase = enum(u8) {
+    start = 0,
+    update = 1,
+    commit = 2,
+    cancel = 3,
+};
+
+/// composition_changed イベント本体。revision は snapshot との突合用カウンタ。
+/// cursor は preedit 内 UTF-8 バイトオフセット（caret）。
+pub const CompositionEvent = struct {
+    revision: u32,
+    phase: CompositionPhase,
+    cursor: u32,
+};
+
+/// `Window.getCompositionSnapshot` の戻り値（caller の buf へ UTF-8 を書き込んだ slice）。
+pub const CompositionSnapshot = struct {
+    text: []const u8,
+    revision: u32,
+    cursor: u32,
 };
 
 /// マウスイベント。座標は window 座標 (window contentRect 左上原点・logical 単位)。
@@ -252,6 +277,9 @@ pub const Event = union(enum) {
     mouse_scroll: ScrollEvent,
     gamepad_connected: GamepadInfo, // ゲームパッド接続（TASK-80.1。ADR-009）
     gamepad_disconnected: GamepadDisconnect, // ゲームパッド切断
+    /// IME composition 状態変化通知（TASK-79.6.1）。本文は snapshot API で読む。
+    /// **末尾追加** = exhaustive switch 破壊範囲を TASK-22 と同型で一括対応。
+    composition_changed: CompositionEvent,
 };
 
 /// イベントキューの観測カウンタ (累積値の snapshot)

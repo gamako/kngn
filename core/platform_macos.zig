@@ -21,6 +21,9 @@ const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
 const KeyEvent = types.KeyEvent;
 const CharEvent = types.CharEvent;
+const CompositionEvent = types.CompositionEvent;
+const CompositionPhase = types.CompositionPhase;
+const CompositionSnapshot = types.CompositionSnapshot;
 const MouseEvent = types.MouseEvent;
 const ScrollEvent = types.ScrollEvent;
 const Event = types.Event;
@@ -93,6 +96,14 @@ inline fn makeCharEvent(ev: c.PlatformEvent) CharEvent {
     return .{
         .codepoint = ev.payload.character.codepoint,
         .modifiers = ModifierFlags.fromC(ev.payload.character.modifiers),
+    };
+}
+
+inline fn makeCompositionEvent(ev: c.PlatformEvent) CompositionEvent {
+    return .{
+        .revision = ev.payload.composition.revision,
+        .phase = @as(CompositionPhase, @enumFromInt(ev.payload.composition.phase)),
+        .cursor = ev.payload.composition.cursor,
     };
 }
 
@@ -173,9 +184,32 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_CHAR_INPUT => Event{ .char_input = makeCharEvent(ev) },
                 c.PLATFORM_EVENT_GAMEPAD_CONNECTED => Event{ .gamepad_connected = makeGamepadInfo(ev) },
                 c.PLATFORM_EVENT_GAMEPAD_DISCONNECTED => Event{ .gamepad_disconnected = makeGamepadDisconnect(ev) },
+                c.PLATFORM_EVENT_COMPOSITION => Event{ .composition_changed = makeCompositionEvent(ev) },
                 else => continue,
             };
         }
+    }
+
+    /// IME composition preedit 本文を buf へ書く（TASK-79.6.1）。空なら text は 0 長。
+    /// latest-wins: 常に現在状態。event.revision は取りこぼし検知用で過去 revision は取得不可。
+    pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
+        var meta: c.PlatformCompositionMeta = .{
+            .revision = 0,
+            .cursor = 0,
+            .len = 0,
+        };
+        const n = c.platform_get_composition_snapshot(
+            self.handle,
+            if (buf.len > 0) buf.ptr else null,
+            @intCast(buf.len),
+            &meta,
+        );
+        const len: usize = @min(@as(usize, n), buf.len);
+        return .{
+            .text = buf[0..len],
+            .revision = meta.revision,
+            .cursor = meta.cursor,
+        };
     }
 
     pub fn getEventStats(self: Window) EventStats {

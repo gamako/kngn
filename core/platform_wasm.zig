@@ -366,6 +366,11 @@ pub const Window = struct {
     pub fn getGamepadState(_: Window, _: u8) ?types.GamepadState {
         return null;
     }
+
+    /// IME composition snapshot（TASK-79.6.1）。web IME は別タスク。常に空。
+    pub fn getCompositionSnapshot(_: Window, buf: []u8) types.CompositionSnapshot {
+        return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
+    }
 };
 
 pub const Framebuffer = struct {
