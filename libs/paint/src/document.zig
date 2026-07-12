@@ -682,6 +682,23 @@ pub const Document = struct {
         }
     }
 
+    /// active_view の指定 layer を現 `selected_frame` の cel_pool へ全面書き戻す
+    /// （`ensureCelAt` + memcpy。`created` を返す）。pushPaintOp / commitActiveLayerToCel 共用。
+    fn writebackActiveLayerToCel(self: *Document, gpa: Allocator, layer_idx: usize) EnsureResult {
+        const ensured = self.ensureCelAt(gpa, layer_idx, self.selected_frame);
+        @memcpy(self.cel_pool.items[ensured.id].?.pixels, self.active_view.layerPixels(layer_idx));
+        return ensured;
+    }
+
+    /// active_view の指定 layer を現 `selected_frame` の cel へ書き戻す（undo Op なし）。
+    /// PNG open 等、Op 化しない全面置き換え用。frame は常に `selected_frame`
+    /// （`resetToSingleBlankLayer` 後は 0）。text layer は呼び出し禁止（assert）。
+    /// ホットパス: イベント時のみ（open/save 経路）。
+    pub fn commitActiveLayerToCel(self: *Document, gpa: Allocator, layer_idx: usize) void {
+        std.debug.assert(self.layers.items[layer_idx].kind != .text);
+        _ = self.writebackActiveLayerToCel(gpa, layer_idx);
+    }
+
     /// raster ピクセルを変更する全ての操作が経由する唯一のコミット口
     /// （ensureCelAt→書き戻し→Op構築→push の3手順を1回の呼び出しに集約）。
     /// `diffs` の所有権は呼ばれた時点で常に doc へ移る（早期returnでも必ず解放する）。
@@ -694,8 +711,7 @@ pub const Document = struct {
             gpa.free(diffs); // 変化なし。cel を作らない・push しない
             return;
         }
-        const ensured = self.ensureCelAt(gpa, layer_idx, self.selected_frame);
-        @memcpy(self.cel_pool.items[ensured.id].?.pixels, self.active_view.layerPixels(layer_idx));
+        const ensured = self.writebackActiveLayerToCel(gpa, layer_idx);
         self.undo.push(gpa, .{ .paint = .{
             .cel_id = ensured.id,
             .diffs = diffs,

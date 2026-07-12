@@ -1089,9 +1089,9 @@ const App = struct {
         if (self.input.capturing or self.bezier_editor.isEditing()) return error.EditingBlocked;
         var img = try png.decodePNGFile(self.io, self.gpa, path);
         defer img.deinit(self.gpa);
-        // current_path 用の独立コピーを、ドキュメントを差し替える**前**に確保する（後段はすべて
-        // infallible なので、ここで OOM を弾いておけば「読み込み済みだが失敗扱い」という中途半端な
-        // 状態を作らない）。
+        // current_path 用の独立コピーを、ドキュメントを差し替える**前**に確保する（後段はエラーを
+        // return しない: Document 系の OOM は panic 契約（commitActiveLayerToCel 含む）。エラー return
+        // で「読み込み済みだが失敗扱い」という中途半端な状態を作らない、の意）。
         const owned = try self.gpa.dupe(u8, path);
 
         // PNG はフラット形式として読み込み、layer0 だけの新規ドキュメントへ置き換える。
@@ -1108,6 +1108,10 @@ const App = struct {
             @memcpy(layer0[y * CANVAS_W ..][0..cols], img.pixels[y * iw ..][0..cols]);
         }
         self.syncPreviewCanvas();
+        // active_view は cel のコピー。saveDocument は cel_pool を直列化するため、
+        // layer0 直書き後に cel へ書き戻す（TASK-95。undo Op は reset 済みで不要）。
+        // selected_frame は resetToSingleBlankLayer で 0 に確定済み。
+        self.doc.commitActiveLayerToCel(self.gpa, 0);
 
         // load はドキュメント差し替えなので undo/redo 履歴を破棄（recorder は stroke 非進行中）。
         // `resetCanvasToSingleLayer`（= `doc.resetToSingleBlankLayer`）が既に doc.undo を

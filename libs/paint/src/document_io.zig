@@ -1068,6 +1068,42 @@ test "任意サイズ round-trip（document_io 自体は size 非依存。256 �
     try testing.expectEqualSlices(u32, doc.activeCanvas().layerPixels(0), loaded.activeCanvas().layerPixels(0));
 }
 
+// TASK-95: PNG open 相当（reset → active_view 直書き → commitActiveLayerToCel）後に
+// saveDocument → loadDocument で pixels が bit 一致すること（cel 未書き戻しだと空 .pix になる）。
+test "TASK-95: reset + layerPixels 直書き + commitActiveLayerToCel → save/load pixels bit 一致" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+    _ = try doc.addLayer(gpa); // multi-layer から open 相当の縮退を再現
+    doc.resetToSingleBlankLayer(gpa);
+    try testing.expectEqual(@as(u32, 0), doc.selected_frame);
+    try testing.expectEqual(@as(usize, 1), doc.layers.items.len);
+    try testing.expectEqual(@as(usize, 0), doc.cel_pool.items.len); // reset 直後は cel 0 個
+
+    const color: u32 = 0xFF112233;
+    const px = doc.activeCanvas().layerPixels(0);
+    @memset(px, color);
+
+    doc.commitActiveLayerToCel(gpa, 0);
+    const cel_id = doc.gridGet(0, 0).?;
+    try testing.expectEqualSlices(u32, px, doc.celPixels(cel_id).?);
+
+    // cwd 固定名は並列テストバイナリ間で race する（TASK-96 で実測）ため tmpDir で分離する。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const pix_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/task95_open_commit.pix", .{&tmp.sub_path});
+    try saveDocument(io, pix_path, &doc, gpa);
+
+    var loaded = try loadDocument(io, gpa, pix_path, 4, 4);
+    defer loaded.deinit();
+    try testing.expectEqualSlices(u32, px, loaded.activeCanvas().layerPixels(0));
+    // cel 経由でも同一（save が cel_pool を書いた証拠）
+    try testing.expectEqualSlices(u32, px, loaded.celPixels(loaded.gridGet(0, 0).?).?);
+}
+
 test "LayerId: .pix v3 round-trip で id/next_layer_id 保持 + reorder 後も id 安定" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 2, 2);
