@@ -27,11 +27,12 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
         head: usize = 0, // 次に書く列（リング）
         filled: usize = 0,
 
-        // 対数周波数軸(setSampleRate で算出)
+        // 周波数軸(setSampleRate/setSampleRateLinear で算出)
         sample_rate: f32 = 48000,
         f_min: f32 = 50,
         f_max: f32 = 24000,
         row_bin: [height]usize = undefined, // 表示行(0=低域) → FFT bin
+        log_scale: bool = true, // false ならリニア周波数軸（既定は対数=既存挙動と完全一致）
 
         pub fn init(self: *Self, sample_rate: f32) void {
             self.accum_len = 0;
@@ -43,15 +44,33 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
 
         /// サンプルレートを設定し、行→bin の対数マッピングを再計算する(audio.open 後・start 前に呼ぶ)。
         pub fn setSampleRate(self: *Self, sample_rate: f32) void {
+            self.log_scale = true;
+            self.recomputeRowBin(sample_rate);
+        }
+
+        /// サンプルレートを設定し、行→bin の**リニア**マッピングを再計算する。対数軸では高域ほど
+        /// 表示行が圧縮される(例: 48kHz サンプリングでの 16kHz 以上は上端のごく僅かな行にしかならない)ため、
+        /// 特定の高域バンドを監視する用途(例: 超高域アラート)ではリニア軸の方が帯域に見合った表示面積を
+        /// 確保できる。`init()` の後に呼んで軸だけリニアに上書きする使い方を想定
+        /// （`init()` 自体は既存呼び出し元との後方互換のため対数のまま）。
+        pub fn setSampleRateLinear(self: *Self, sample_rate: f32) void {
+            self.log_scale = false;
+            self.recomputeRowBin(sample_rate);
+        }
+
+        fn recomputeRowBin(self: *Self, sample_rate: f32) void {
             self.sample_rate = sample_rate;
             const bin_hz = sample_rate / @as(f32, @floatFromInt(FFT_SIZE));
             self.f_min = @max(bin_hz, 50.0); // 最低ビン(=bin_hz)未満は意味がない。ゼロ割回避
             self.f_max = sample_rate * 0.5; // ナイキスト(ラベル範囲用の理論上限)
-            const ratio = self.f_max / self.f_min;
             const denom: f32 = @floatFromInt(height - 1);
+            const ratio = self.f_max / self.f_min; // log_scale 時のみ使用
             for (0..height) |r| {
                 const frac = @as(f32, @floatFromInt(r)) / denom; // 0..1(0=低域)
-                const freq = self.f_min * std.math.pow(f32, ratio, frac);
+                const freq = if (self.log_scale)
+                    self.f_min * std.math.pow(f32, ratio, frac)
+                else
+                    self.f_min + frac * (self.f_max - self.f_min);
                 const bin: usize = @intFromFloat(@round(freq / bin_hz));
                 self.row_bin[r] = std.math.clamp(bin, 1, N_BINS - 1);
             }
@@ -61,7 +80,10 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
         /// 描画は py = y0 + (height-1-row) なので offset = height-1-row。
         pub fn rowOffsetForFreq(self: *const Self, freq: f32) ?usize {
             if (freq < self.f_min or freq > self.f_max) return null;
-            const frac = @log(freq / self.f_min) / @log(self.f_max / self.f_min); // 0..1
+            const frac = if (self.log_scale)
+                @log(freq / self.f_min) / @log(self.f_max / self.f_min) // 0..1
+            else
+                (freq - self.f_min) / (self.f_max - self.f_min);
             const r: usize = @min(@as(usize, @intFromFloat(@round(frac * @as(f32, @floatFromInt(height - 1))))), height - 1);
             return (height - 1) - r;
         }
@@ -230,6 +252,48 @@ test "Spectrogram: rowOffsetForFreq maps low->bottom, high->top, out-of-range nu
     try testing.expect(lo > hi); // 低域=下(offset 大), 高域=上(offset 小)
     try testing.expect(lo <= 63 and hi <= 63);
     try testing.expect(spec.rowOffsetForFreq(10.0) == null); // f_min 未満
+    try testing.expect(spec.rowOffsetForFreq(30000.0) == null); // f_max 超
+}
+
+test "Spectrogram: linear frequency axis (row_bin non-decreasing, fewer low-freq rows than log)" {
+    const Spec = Spectrogram(8, 64);
+    var log_spec: Spec = undefined;
+    log_spec.init(48000); // 既定=対数
+    var lin_spec: Spec = undefined;
+    lin_spec.init(48000);
+    lin_spec.setSampleRateLinear(48000); // 軸だけリニアに上書き
+    // リニアでも単調非減少
+    var prev: usize = lin_spec.row_bin[0];
+    for (lin_spec.row_bin[1..]) |b| {
+        try testing.expect(b >= prev);
+        prev = b;
+    }
+    // リニアは低域強調しない: bin <= N_BINS/8 にマップされる行数が対数軸より少ない
+    var log_low: usize = 0;
+    var lin_low: usize = 0;
+    for (0..64) |r| {
+        if (log_spec.row_bin[r] <= N_BINS / 8) log_low += 1;
+        if (lin_spec.row_bin[r] <= N_BINS / 8) lin_low += 1;
+    }
+    try testing.expect(lin_low < log_low);
+    // 線形性は「算術中点の周波数が縦のほぼ中央に来る」テスト（下記 rowOffsetForFreq linear）で固定する。
+    // 端点は clamp([1, N_BINS-1]) で歪む（FFT_SIZE=512 だと f_max=24kHz が bin 256→255 にクランプされ
+    // 上端数行がフラット化する）ため、隣接行の等間隔性は表示行全域では成り立たない。
+}
+
+test "Spectrogram: rowOffsetForFreq linear maps arithmetic mid to vertical middle" {
+    const Spec = Spectrogram(8, 64);
+    var spec: Spec = undefined;
+    spec.init(48000);
+    spec.setSampleRateLinear(48000);
+    const lo = spec.rowOffsetForFreq(spec.freqMin()).?;
+    const hi = spec.rowOffsetForFreq(spec.freqMax() * 0.999).?;
+    try testing.expect(lo > hi); // 低域=下(offset 大), 高域=上(offset 小)
+    // リニアでは算術中点の周波数が縦のほぼ中央に来る（対数では幾何中点が中央）
+    const mid_freq = (spec.freqMin() + spec.freqMax()) / 2.0;
+    const mid_off = spec.rowOffsetForFreq(mid_freq).?;
+    try testing.expect(mid_off >= 28 and mid_off <= 35); // height=64 → 中央 ≈ 31
+    try testing.expect(spec.rowOffsetForFreq(spec.freqMin() - 1.0) == null); // 範囲外
     try testing.expect(spec.rowOffsetForFreq(30000.0) == null); // f_max 超
 }
 
