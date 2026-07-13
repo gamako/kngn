@@ -367,6 +367,11 @@ pub const KitLibs = struct {
     font: *std.Build.Module,
     dsp: *std.Build.Module,
     synth: *std.Build.Module,
+    /// kit.recipe（TASK-62.5.8）は serde に依存する。caller が paint 等でも serde module を
+    /// 作っている場合（例: apps/editor）、**同一インスタンス**を渡さないと同じ serde.zig が
+    /// 2 module に属し「file exists in modules」エラーになる。渡されなければ buildStandalone が
+    /// 単独生成する（recipe 以外で serde を使わない kit 消費者向けの後方互換）。
+    serde: ?*std.Build.Module = null,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
@@ -465,6 +470,17 @@ pub fn buildStandalone(
     capture_synthetic_mod.addImport("capture_types", capture_types_mod);
     harness_mod.addImport("capture_synthetic", capture_synthetic_mod);
 
+    // harness は digest audio のスペクトル解析（band/centroid/onset。TASK-92）で `@import("dsp")` する
+    // （トップ階層 build.zig の `linkCoreException(harness, dsp, ...)` と同じ配線）。これが無いと
+    // harness を使う全 standalone build（例: soundalert）が壊れる（capture_synthetic と同じ理由）。
+    // caller が kit_libs.dsp を渡していればそれを共有し（同一ファイルの二重 module 化回避）、
+    // 渡していなければここで単独の dsp module を作る。
+    const harness_dsp_mod: *std.Build.Module = if (spec.kit_libs) |kl|
+        kl.dsp
+    else
+        b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/../src/dsp/dsp.zig", .{core_dir}) } });
+    harness_mod.addImport("dsp", harness_dsp_mod);
+
     // link_audio のとき audio facade module を **buildStandalone が生成**し、harness を配線する（TASK-32.2）。
     // audio.zig は `@import("harness")` するので、platform module と **同一の harness_mod** を共有しないと
     // file-in-two-modules になり audio probe も無音になる。caller が別途 audio module を作って extra で渡すと
@@ -472,6 +488,11 @@ pub fn buildStandalone(
     const audio_mod: ?*std.Build.Module = if (spec.link_audio or spec.kit_libs != null) blk: {
         const am = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/audio.zig", .{core_dir}) } });
         am.addImport("harness", harness_mod);
+        // audio.zig の capture 拡張（マイク入力。TASK-49.1）が `@import("capture_types")` する
+        // （named module。トップ階層 build.zig の `link(audio, capture_types)` と同じ配線）。
+        // これが無いと standalone で `audio.openCapture`/`requestCapturePermission` 等を実際に
+        // 使う caller（例: soundalert）がコンパイルエラーになる。
+        am.addImport("capture_types", capture_types_mod);
         break :blk am;
     } else null;
 
@@ -511,6 +532,28 @@ pub fn buildStandalone(
             });
             kit_gamepad_mod.addImport("platform_types", types_mod);
             kit_mod.addImport("gamepad", kit_gamepad_mod);
+            // recipe（TASK-62.5.8）: kit.zig が無条件 import する（トップ階層 build.zig の
+            // `link(kit, common.recipe)` と同じ）。libs/recipe は serde にのみ依存する headless lib。
+            // serde module は caller（paint 等で serde を使う場合）と**同一インスタンスを共有**する
+            // 必要がある（別々に作ると同じ serde.zig が 2 module に属しコンパイルエラー）。caller が
+            // kl.serde を渡していればそれを使い、無ければ gamepad と同様ここで自前生成する。
+            const kit_serde_mod: *std.Build.Module = if (kl.serde) |s|
+                s
+            else
+                b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/serde/src/serde.zig", .{kit_root}) } });
+            const kit_recipe_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/recipe/src/recipe.zig", .{kit_root}) },
+            });
+            kit_recipe_mod.addImport("serde", kit_serde_mod);
+            kit_mod.addImport("recipe", kit_recipe_mod);
+            // app_runtime（TASK-73）: kit.zig が無条件 import する（トップ階層 build.zig の
+            // `link(kit, app_runtime)` と同じ）。frame-driven runtime で platform に依存するため
+            // backend 毎に生成し platform_mod を配線する（KitLibs には含めない）。
+            const kit_app_runtime_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/app_runtime.zig", .{core_dir}) },
+            });
+            kit_app_runtime_mod.addImport("platform", platform_mod);
+            kit_mod.addImport("app_runtime", kit_app_runtime_mod);
             root.addImport("kit", kit_mod);
         }
         if (spec.keyboard_source) |ks| {

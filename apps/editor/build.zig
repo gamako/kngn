@@ -70,7 +70,9 @@ pub fn build(b: *std.Build) void {
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         // harness(platform→harness→png) と kit/paint で png module を共有する（二重化回避。TASK-32.2）。
         .png_module = png,
-        .kit_libs = .{ .gui = gui, .png = png, .font = font, .dsp = dsp, .synth = synth },
+        // serde は kit.recipe（TASK-62.5.8）と paint(document_io) の両方が使う。同一インスタンスを
+        // 渡さないと同じ serde.zig が 2 module に属しコンパイルエラーになる（TASK-98）。
+        .kit_libs = .{ .gui = gui, .png = png, .font = font, .dsp = dsp, .synth = synth, .serde = serde },
         .extra = &.{
             .{ .name = "paint", .module = paint },
         },
