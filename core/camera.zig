@@ -1,12 +1,11 @@
-//! カメラ入力 L1 facade（TASK-49.1: 設計 + 骨格 + 全 OS 明示 stub）。
+//! カメラ入力 L1 facade（TASK-49.1 の設計を OS 別 backend へ委譲）。
 //!
 //! `core/audio.zig`（オーディオ出力）と対称の新規 L1 primitive。caller は `@import("camera")` で
 //! このファイルの API のみを使う。設計の正は `docs/plans/capture-foundation-plan.md`。
 //!
-//! TASK-49.2: macOS は実 backend（`camera_macos.zig`。AVFoundation）を経由する。
-//! Linux/Windows は TASK-49.3/.4 未着手のため引き続き全 OS 共通 stub（`camera_stub.zig`。
-//! 全動詞が `error.Unsupported`）を経由する（`core/audio.zig` の出力 backend と同型の
-//! `builtin.os.tag` 分岐）。
+//! TASK-49.2/49.3: macOS は AVFoundation（`camera_macos.zig`）、Linux は raw V4L2
+//! （`camera_v4l2.zig`）を経由する。Windows/その他は全 OS 共通 stub（`camera_stub.zig`。
+//! 全動詞が `error.Unsupported`）を経由する（`builtin.os.tag` 分岐）。
 //!
 //! ## harness synthetic source の継ぎ目（TASK-49.5 のプレースホルダ。設計文書 5章）
 //!
@@ -25,12 +24,17 @@ const builtin = @import("builtin");
 const harness = @import("harness");
 const types = @import("capture_types");
 
-// TASK-49.2: macOS は実 backend（AVFoundation）、他 OS は引き続き stub
+// TASK-49.2/49.3: macOS は AVFoundation、Linux は raw V4L2、その他は stub
 // （`core/audio.zig` の `const backend = switch (builtin.os.tag) { ... }` と同型）。
 const backend = switch (builtin.os.tag) {
     .macos => @import("camera_macos.zig"),
+    .linux => @import("camera_v4l2.zig"),
     else => @import("camera_stub.zig"),
 };
+
+fn hasRealCaptureBackend() bool {
+    return builtin.os.tag == .macos or builtin.os.tag == .linux;
+}
 
 pub const CaptureError = types.CaptureError;
 pub const DeviceInfo = types.DeviceInfo;
@@ -71,10 +75,13 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) CaptureError!VideoDevice 
 const testing = std.testing;
 
 test "camera facade: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変。非 macOS のみ）" {
-    // macOS は TASK-49.2 で実 backend（AVFoundation）に置き換わっており、requestPermission/open は
-    // 実 TCC ダイアログ・実デバイスに触れるため自動テスト対象外（手動検証レンジ。backlog
-    // task-49.2 notes 参照）。compile+link は test-capture-types 自体が既に担保している。
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
+    // 実 backend（AVFoundation/V4L2）は permission/open が実デバイスに触れるため自動テスト対象外。
+    // backend の compile+link は backend 専用 test（camera_macos_test / camera_v4l2_test）が担保し、
+    // 純関数/config も同 test で検証する。
+    // `comptime` 必須: ランタイム呼び出しにすると Zig が後続 body を dead-code 消去できず、macOS/Linux
+    // でも実 backend の enumerate/open/requestPermission がこの facade test 経由でコンパイルされてしまう
+    // （facade test は stub 委譲を確認するのが目的で、実 backend 内部を巻き込むべきではない）。
+    if (comptime hasRealCaptureBackend()) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerate(testing.allocator));
     try testing.expectError(error.Unsupported, requestPermission());
     try testing.expectError(error.Unsupported, open(testing.allocator, .{}));

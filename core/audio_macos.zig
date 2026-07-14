@@ -521,7 +521,9 @@ pub const capture = struct {
                 .mElement = c.kAudioObjectPropertyElementMain,
             };
             var uid_size: u32 = @sizeOf(objc.Id);
-            if (c.AudioObjectGetPropertyData(dev_id, &uid_addr, 0, null, &uid_size, &uid_ref) != 0) continue;
+            // out_data は ?*anyopaque。&uid_ref は *?*anyopaque（objc.Id=?*anyopaque への addr-of）で
+            // 二重ポインタになり暗黙キャスト不可のため @ptrCast で opaque ポインタへ落とす。
+            if (c.AudioObjectGetPropertyData(dev_id, &uid_addr, 0, null, &uid_size, @ptrCast(&uid_ref)) != 0) continue;
             defer if (uid_ref) |r| objc.msgSend(void, r, objc.sel("release"), .{});
 
             var name_ref: objc.Id = null;
@@ -531,7 +533,8 @@ pub const capture = struct {
                 .mElement = c.kAudioObjectPropertyElementMain,
             };
             var name_size: u32 = @sizeOf(objc.Id);
-            if (c.AudioObjectGetPropertyData(dev_id, &name_addr, 0, null, &name_size, &name_ref) != 0) continue;
+            // 同上（&name_ref = *?*anyopaque を @ptrCast で ?*anyopaque へ）。
+            if (c.AudioObjectGetPropertyData(dev_id, &name_addr, 0, null, &name_size, @ptrCast(&name_ref)) != 0) continue;
             defer if (name_ref) |r| objc.msgSend(void, r, objc.sel("release"), .{});
 
             const uid_c: [*:0]const u8 = if (uid_ref) |r| objc.msgSend([*:0]const u8, r, objc.sel("UTF8String"), .{}) else "";
@@ -743,6 +746,13 @@ fn noopCaptureCallback(frame: types.AudioInFrame, userdata: ?*anyopaque) void {
 test "open: sample_rate/channels=0 は AudioToolbox を呼ばず ConfigFailed" {
     try testing.expectError(error.ConfigFailed, capture.open(testing.allocator, .{ .sample_rate = 0, .capture_callback = noopCaptureCallback }));
     try testing.expectError(error.ConfigFailed, capture.open(testing.allocator, .{ .channels = 0, .capture_callback = noopCaptureCallback }));
+}
+
+test "capture.enumerate は compile 検証する（実デバイスに触れるため run しない・compile-only 参照）" {
+    // enumerate は CoreAudio 実 API を叩くため自動 run できないが、参照が無いと Zig の lazy analysis で
+    // 一切コンパイルされず型エラーが潜在化する（実際 TASK-49.2 は AudioObjectGetPropertyData の
+    // 二重ポインタ引数型エラーを未コンパイルのまま抱えていた）。関数ポインタを取ってコンパイルを強制する。
+    _ = &capture.enumerate;
 }
 
 // ========================================================================

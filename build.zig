@@ -787,6 +787,7 @@ pub fn build(b: *std.Build) void {
     audio_capture_test_mod.addImport("harness", shared_modules.harness.mod);
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     audio_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: audio_macos.zig が named import で参照（TASK-49.6）
+    if (target.result.os.tag == .linux) audio_capture_test_mod.linkSystemLibrary("alsa", .{});
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
     // TASK-49.2: macOS の mic capture（AUHAL input）は AudioToolbox/CoreAudio + 権限確認の
     // AVFoundation(ObjC)を使うため framework を明示リンクする（他OS は audio_capture_stub.zig の
@@ -840,6 +841,29 @@ pub fn build(b: *std.Build) void {
         linkCaptureMacFrameworks(b, audio_macos_capture_test_mod, sdk_paths.?);
         const audio_macos_capture_test = b.addTest(.{ .root_module = audio_macos_capture_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_macos_capture_test).step);
+    }
+
+    if (target_os == .linux) {
+        const camera_v4l2_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/camera_v4l2.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        camera_v4l2_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        const camera_v4l2_test = b.addTest(.{ .root_module = camera_v4l2_test_mod });
+        test_capture_types_step.dependOn(&b.addRunArtifact(camera_v4l2_test).step);
+
+        const audio_linux_capture_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/audio_linux.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        audio_linux_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        audio_linux_capture_test_mod.linkSystemLibrary("alsa", .{});
+        const audio_linux_capture_test = b.addTest(.{ .root_module = audio_linux_capture_test_mod });
+        test_capture_types_step.dependOn(&b.addRunArtifact(audio_linux_capture_test).step);
     }
 
     // core/capture_synthetic.zig（harness 内蔵 synthetic capture source。TASK-49.5）。
@@ -1699,6 +1723,26 @@ pub fn build(b: *std.Build) void {
     const bench_canvas_exe = b.addExecutable(.{ .name = "bench_canvas", .root_module = bench_canvas_root });
     const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
     bench_canvas_step.dependOn(&b.addRunArtifact(bench_canvas_exe).step);
+
+    // bench-yuyv（TASK-49.3）: V4L2 YUYV→BGRA の純粋な色変換を計測する。
+    // camera backend は libc の ioctl/mmap を使うが、ベンチは純関数だけを呼ぶためデバイス不要。
+    const bench_yuyv_root = b.createModule(.{
+        .root_source_file = b.path("bench/yuyv.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    const bench_camera_v4l2_mod = b.createModule(.{
+        .root_source_file = b.path("core/camera_v4l2.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    bench_camera_v4l2_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    bench_yuyv_root.addImport("camera_v4l2", bench_camera_v4l2_mod);
+    const bench_yuyv_exe = b.addExecutable(.{ .name = "bench_yuyv", .root_module = bench_yuyv_root });
+    const bench_yuyv_step = b.step("bench-yuyv", "Run YUYV to BGRA micro-benchmark (ReleaseFast)");
+    bench_yuyv_step.dependOn(&b.addRunArtifact(bench_yuyv_exe).step);
 
     // bench 用に dsp/synth を ReleaseFast で独立生成（shared_modules の共有インスタンスは
     // 通常ビルドの optimize を引き継ぐため使わない）

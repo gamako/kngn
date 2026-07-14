@@ -169,8 +169,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 // `Capture` を挟む（`core/camera.zig` は新規ファイルのため bare な動詞名を使う。対比は設計文書
 // 4.1 の表）。
 //
-// TASK-49.2: macOS は実 backend（`audio_macos.zig` の `capture` 名前空間。AUHAL input）を経由する。
-// Linux/Windows は TASK-49.3/.4 未着手のため引き続き全 OS 共通 stub（`audio_capture_stub.zig`）。
+// TASK-49.2/49.3: macOS は AUHAL、Linux は ALSA、Windows は将来実 backend を経由する。
 //
 // ホットパス宣言: この拡張自体は「イベント時のみ / 初期化時のみ」（facade 骨格・backend 委譲）。
 // mic capture callback（`CaptureCallback`）は RT（毎サンプル）契約。macOS 実装
@@ -183,8 +182,13 @@ const capture_backend = if (builtin.cpu.arch.isWasm())
     @import("audio_capture_stub.zig")
 else switch (builtin.os.tag) {
     .macos => @import("audio_macos.zig").capture,
+    .linux => @import("audio_linux.zig").capture,
     else => @import("audio_capture_stub.zig"),
 };
+
+fn hasRealCaptureBackendOs() bool {
+    return builtin.os.tag == .macos or builtin.os.tag == .linux;
+}
 
 // capture_types の型を audio module から直接使えるよう再公開する（camera.zig が DeviceInfo 等を
 // 再公開しているのと対称。外部利用者が `capture_types` を別途 import しなくても
@@ -230,11 +234,14 @@ fn noopCaptureCallback(frame: AudioInFrame, userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-test "audio capture 拡張: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変。非 macOS のみ）" {
-    // macOS は TASK-49.2 で実 backend（AUHAL input）に置き換わっており、requestCapturePermission/
-    // openCapture は実 TCC ダイアログ・実デバイスに触れるため自動テスト対象外（手動検証レンジ。
-    // backlog task-49.2 notes 参照）。compile+link は test-capture-types 自体が既に担保している。
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
+test "audio capture 拡張: harness 無効時の stub 委譲を確認する（実 backend OS 以外）" {
+    // 実 backend（AUHAL/ALSA）は permission/open が実デバイスに触れるため自動テスト対象外。
+    // backend の compile+link は backend 専用 test（audio_macos_capture_test / audio_linux_capture_test）が
+    // 担保し、config も同 test で検証する。
+    // `comptime` 必須: ランタイム呼び出しにすると Zig が後続 body を dead-code 消去できず、macOS/Linux でも
+    // 実 backend の capture enumerate/open がこの facade test 経由でコンパイルされてしまう（macOS では
+    // audio_macos.zig の capture 経路がその一例で、facade test は stub 委譲確認が目的）。
+    if (comptime hasRealCaptureBackendOs()) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerateCaptureDevices(testing.allocator));
     try testing.expectError(error.Unsupported, requestCapturePermission());
     try testing.expectError(error.Unsupported, openCapture(testing.allocator, .{ .capture_callback = noopCaptureCallback }));
