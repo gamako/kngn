@@ -6,4 +6,5 @@
 comptime {
     _ = @import("canvas.zig");
     _ = @import("group.zig");
+    _ = @import("grid_test.zig");
 }

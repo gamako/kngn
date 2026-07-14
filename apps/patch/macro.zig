@@ -13,17 +13,13 @@ const modular = @import("modular");
 const DynGraph = modular.DynGraph;
 pub const Handle = modular.dyn.Handle;
 
-/// DrumMachine テンプレの kick/hat パターン（4 つ打ち / 裏拍 8 分。apps/modular/patch.zig の
-/// KICK_ON/HAT_ON と同じ値。on_mask=0 だと gate が出ず無音になるため非空を明示）。
-const KICK_MASK: u16 = 0x1111; // step 0,4,8,12
-const HAT_MASK: u16 = 0x4444; // step 2,6,10,14
-
-/// BassMachine テンプレのパターン（apps/modular/patch.zig の BASS_ON/BASS_ACCENT/BASS_SLIDE/BASS_DEG と同値。
-/// on_mask/pitch_deg 非空で発音・音程を担保）。
-const BASS_ON: u16 = 0x4949; // step 0,3,6,8,11,14
-const BASS_ACCENT: u16 = 0x0101; // step 0,8
-const BASS_SLIDE: u16 = 0x0808; // step 3,11
-const BASS_DEG = [16]i8{ 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0, 5, 0, 0, 2, 0 };
+/// DrumMachine / BassMachine テンプレの初期値は libs/modular が単一ソース。
+const KICK_MASK = modular.grid_presets.KICK_ON;
+const HAT_MASK = modular.grid_presets.HAT_ON;
+const BASS_ON = modular.grid_presets.BASS_ON;
+const BASS_ACCENT = modular.grid_presets.BASS_ACCENT;
+const BASS_SLIDE = modular.grid_presets.BASS_SLIDE;
+const BASS_DEG = modular.grid_presets.BASS_DEG;
 
 /// buildDrumMachine が add したモジュールの handle（テンプレの役割名で公開）。
 pub const DrumMachineHandles = struct {

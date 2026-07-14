@@ -11,6 +11,7 @@ pub const graph_core = @import("graph_core.zig");
 pub const graph = @import("graph.zig");
 pub const dyn = @import("dyn.zig");
 pub const modules = @import("modules.zig");
+pub const grid_presets = @import("presets.zig");
 
 pub const Graph = graph.Graph;
 pub const Caps = graph.Caps;
@@ -75,6 +76,7 @@ test {
     _ = graph;
     _ = dyn;
     _ = modules;
+    _ = grid_presets;
 }
 
 // ============================================================================

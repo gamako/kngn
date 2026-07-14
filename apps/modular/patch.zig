@@ -55,14 +55,14 @@ const BASS_OCTAVES: u8 = 2;
 /// bass の degree index の総数（GUI の pitch 循環範囲の単一ソース）。
 pub const BASS_DEG_TOTAL: usize = modular.scaleDegreeCount(BASS_SCALE, BASS_OCTAVES);
 
-// 初期パターン（現行 Euclid 配置から seed。bar 0 は従来に近い鳴り、以後 unlocked step が変異する）。
-const KICK_ON: u16 = 0x1111; // step 0,4,8,12（four-on-floor）
-const HAT_ON: u16 = 0x4444; // step 2,6,10,14（裏拍 8 分）
-const CLAP_ON: u16 = 0x1010; // step 4,12（2・4 拍寄り）
-const BASS_ON: u16 = 0x4949; // step 0,3,6,8,11,14（303 ライクに少し跳ねる）
-const BASS_ACCENT: u16 = 0x0101; // step 0,8（頭にアクセント）
-const BASS_SLIDE: u16 = 0x0808; // step 3,11（滑らせる）
-const BASS_DEG = [16]i8{ 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0, 5, 0, 0, 2, 0 };
+// 初期パターン（現行 Euclid 配置から seed。libs/modular が単一ソース）。
+const KICK_ON = modular.grid_presets.KICK_ON;
+const HAT_ON = modular.grid_presets.HAT_ON;
+const CLAP_ON = modular.grid_presets.CLAP_ON;
+const BASS_ON = modular.grid_presets.BASS_ON;
+const BASS_ACCENT = modular.grid_presets.BASS_ACCENT;
+const BASS_SLIDE = modular.grid_presets.BASS_SLIDE;
+const BASS_DEG = modular.grid_presets.BASS_DEG;
 
 // 変異の密度バンド（§4.7 density clamp）。kick は four-on-floor 付近で安定させる。
 const KICK_BAND = [2]u32{ 3, 5 };

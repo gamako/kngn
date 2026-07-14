@@ -23,6 +23,7 @@ const std = @import("std");
 const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
 const platform = kit.platform;
 const gui = kit.gui;
+const stepgrid = gui.stepgrid;
 const modular = @import("modular");
 const audio = kit.audio;
 const synth = kit.synth; // SampleTap（Audio→GUI 出力タップ。C の master 可視化）
@@ -158,14 +159,6 @@ const PAL_GAP: f32 = 3;
 const PAL_BG = gui.Color.rgba(0x2C, 0x32, 0x3C, 0xFF);
 const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
-
-// TR/303 grid セル色（畳みマクロ箱の本体・TASK-40.7.2）。
-const CELL_OFF = gui.Color.rgba(0x30, 0x38, 0x42, 0xFF); // 消灯
-const CELL_ON = gui.Color.rgba(0xE0, 0x90, 0x40, 0xFF); // on（audio 橙寄り）
-const CELL_ACCENT = gui.Color.rgba(0xE0, 0xC0, 0x50, 0xFF); // accent（黄）
-const CELL_SLIDE = gui.Color.rgba(0x50, 0x90, 0xE0, 0xFF); // slide（青）
-const CELL_PITCH = gui.Color.rgba(0x60, 0xC0, 0x70, 0xFF); // pitch 段（緑）
-const PLAYHEAD_COL = gui.Color.rgba(0xF0, 0xF0, 0xF0, 0x60); // playhead 列オーバレイ（半透明白）
 
 fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
@@ -624,11 +617,16 @@ fn clickableRows(kind: group.MacroKind) u8 {
     };
 }
 
-/// box ローカル矩形（canvas.gridCellRect 由来）を world→screen 変換して塗る。
-fn fillLocalRect(dl: *gui.DrawList, cam: Camera, box_pos: Vec2f, lr: canvas.ScreenRect, col: gui.Color) void {
-    const tl = cam.worldToScreen(.{ .x = box_pos.x + lr.x, .y = box_pos.y + lr.y });
-    const rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(lr.w * cam.zoom), .h = safeU32(lr.h * cam.zoom) };
-    dl.rectFilled(rect, col) catch {};
+fn macroGridGeometry(cam: Camera, box_pos: Vec2f) stepgrid.Geometry {
+    const g = canvas.macroGridGeometry(cam, box_pos);
+    return .{
+        .origin_x = g.origin_x,
+        .origin_y = g.origin_y,
+        .cell_w = g.cell_w,
+        .cell_h = g.cell_h,
+        .step_pitch = g.step_pitch,
+        .row_pitch = g.row_pitch,
+    };
 }
 
 /// 畳み箱本体に TR grid（drum 2 レーン）/ 303 行（on/accent/slide + pitch 段）+ playhead を描く。
@@ -638,66 +636,43 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: 
     if (seqs.n == 0) return;
 
     // playhead 列: process は現 step 評価後に step++ するので、直近発音した列は (step + STEPS-1) % STEPS。
-    const STEPS = canvas.GRID_STEPS;
     const head_seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
-    const playhead: u8 = (head_seq.loadStep() + STEPS - 1) % STEPS;
+    const playhead: u8 = (head_seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
+    const geometry = macroGridGeometry(cam, box.pos);
 
     switch (kind) {
         .drum_machine => {
             // 2 レーン: row0=seqK.on_mask / row1=seqH.on_mask。
+            var rows: [2]stepgrid.DrawRow = undefined;
             var lane: u8 = 0;
             while (lane < 2 and lane < seqs.n) : (lane += 1) {
                 const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[lane]);
-                const mask = seq.loadOnMask();
-                drawGridRow(dl, cam, box.pos, lane, mask, CELL_ON, playhead);
+                rows[lane] = .{ .mask = seq.loadOnMask(), .on_color = stepgrid.DEFAULT_ON };
             }
+            stepgrid.draw(dl, geometry, rows[0..seqs.n], .{ .playhead = @intCast(playhead) });
         },
         .bass_machine => {
             const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
-            drawGridRow(dl, cam, box.pos, 0, seq.loadOnMask(), CELL_ON, playhead);
-            drawGridRow(dl, cam, box.pos, 1, seq.loadAccentMask(), CELL_ACCENT, playhead);
-            drawGridRow(dl, cam, box.pos, 2, seq.loadSlideMask(), CELL_SLIDE, playhead);
-            drawPitchStrip(dl, cam, box.pos, 3, seq); // pitch degree の段表示（表示のみ）
+            const rows = [_]stepgrid.DrawRow{
+                .{ .mask = seq.loadOnMask(), .on_color = stepgrid.DEFAULT_ON },
+                .{ .mask = seq.loadAccentMask(), .on_color = stepgrid.DEFAULT_ACCENT },
+                .{ .mask = seq.loadSlideMask(), .on_color = stepgrid.DEFAULT_SLIDE },
+                .{ .pitch = .{ .degrees = seq.pitch_deg[0..], .degree_count = modular.scaleDegreeCount(seq.scale, seq.octaves), .color = stepgrid.DEFAULT_PITCH, .style = .bars } },
+            };
+            stepgrid.draw(dl, geometry, rows[0..], .{ .playhead = @intCast(playhead) });
         },
-    }
-}
-
-/// 1 行ぶんの 16 セルを塗る（on=col / off=CELL_OFF）+ playhead 列を半透明白でオーバレイ。
-fn drawGridRow(dl: *gui.DrawList, cam: Camera, box_pos: Vec2f, row: u8, mask: u16, on_col: gui.Color, playhead: u8) void {
-    var s: u8 = 0;
-    while (s < canvas.GRID_STEPS) : (s += 1) {
-        const cr = canvas.gridCellRect(row, s);
-        const on = (mask >> @as(u4, @intCast(s))) & 1 == 1;
-        fillLocalRect(dl, cam, box_pos, cr, if (on) on_col else CELL_OFF);
-        if (s == playhead) fillLocalRect(dl, cam, box_pos, cr, PLAYHEAD_COL);
-    }
-}
-
-/// bass の pitch degree を段バーで表示（各 step の pitch_deg を高さに写像。編集は 40.7.2 スコープ外＝表示のみ）。
-/// pitch_deg は稼働中に書き換わらない（構築時固定）ためプレーン read で安全。
-fn drawPitchStrip(dl: *gui.DrawList, cam: Camera, box_pos: Vec2f, row: u8, seq: StepSeqPtr) void {
-    const total: f32 = @floatFromInt(@max(1, modular.scaleDegreeCount(seq.scale, seq.octaves)));
-    var s: u8 = 0;
-    while (s < canvas.GRID_STEPS) : (s += 1) {
-        const cr = canvas.gridCellRect(row, s);
-        fillLocalRect(dl, cam, box_pos, cr, CELL_OFF); // 段の下地
-        const deg: f32 = @floatFromInt(std.math.clamp(seq.pitch_deg[s], 0, @as(i8, @intCast(@min(127, @as(i32, @intFromFloat(total)) - 1)))));
-        const frac = std.math.clamp(deg / total, 0.0, 1.0);
-        const h = @max(1.0, cr.h * frac);
-        // 下端揃えのバー（高いほど上に伸びる）。
-        const bar = canvas.ScreenRect{ .x = cr.x, .y = cr.y + (cr.h - h), .w = cr.w, .h = h };
-        fillLocalRect(dl, cam, box_pos, bar, CELL_PITCH);
     }
 }
 
 /// world 点がどの collapsed マクロ箱の grid セルに当たるか（クリック可能行のみ）。
-const GridHit = struct { gid: group.GroupId, cell: canvas.GridCell };
+const GridHit = struct { gid: group.GroupId, cell: stepgrid.GridCell };
 fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
     for (app.ledger.groups, 0..) |g, i| {
         if (!g.active or !g.collapsed) continue;
         const gid: group.GroupId = @intCast(i);
         const local = world_pt.sub(g.pos);
-        if (canvas.hitTestGridCell(local, clickableRows(g.kind))) |cell| return .{ .gid = gid, .cell = cell };
+        const geometry = macroGridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 });
+        if (stepgrid.hitTest(geometry, local.x, local.y, clickableRows(g.kind))) |cell| return .{ .gid = gid, .cell = cell };
     }
     return null;
 }

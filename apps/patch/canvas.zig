@@ -242,15 +242,25 @@ pub fn hitTestToggle(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
 }
 
 // ----------------------------------------------------------------------------
-// 畳みマクロ箱の TR/303 grid 幾何（TASK-40.7.2）。box ローカル座標（箱左上を原点とする world 単位）だけを
-// 扱う純関数。platform/gui 非依存で test-patch から単体テストできる。描画側（main.zig）は各セル矩形を
-// box.pos + cellRect で world → screen 変換して塗る。クリックは box ローカル点で hitTestGridCell。
+// 畳みマクロ箱の TR/303 grid レイアウト定数（TASK-40.7.2）。セル矩形とヒットテストは
+// libs/gui.stepgrid が一元管理し、main.zig が camera 変換前後の adapter を担当する。
 // ----------------------------------------------------------------------------
 pub const GRID_STEPS: u8 = 16;
 pub const GRID_SIDE_PAD: f32 = 10; // 左右マージン（左右ポート dot を避ける）
 pub const GRID_TOP_PAD: f32 = 4; // タイトル下からグリッド先頭までの余白
 pub const GRID_CELL_H: f32 = 8; // セル高
 pub const GRID_ROW_GAP: f32 = 2; // 行間
+
+/// stepgrid へ渡す前の box-local grid 幾何。gui を import しない canvas 側でも、描画と
+/// hit-test が同じ定数を使う adapter の入力を単一化する。
+pub const GridGeometry = struct {
+    origin_x: f32,
+    origin_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    step_pitch: f32,
+    row_pitch: f32,
+};
 
 /// 1 step の水平ピッチ（cell 幅 + gap 込み）。16 step が箱内幅に収まる。
 pub fn gridStepWidth() f32 {
@@ -263,33 +273,18 @@ pub fn gridBlockHeight(rows: u8) f32 {
     return GRID_TOP_PAD + fr * (GRID_CELL_H + GRID_ROW_GAP);
 }
 
-/// (row, step) セルの box ローカル矩形（箱左上原点）。
-pub fn gridCellRect(row: u8, step: u8) ScreenRect {
-    const sw = gridStepWidth();
-    const fr: f32 = @floatFromInt(row);
+/// macro box の screen geometry。box-local の呼び出しでは box_pos = (0, 0) を渡す。
+pub fn macroGridGeometry(cam: Camera, box_pos: Vec2f) GridGeometry {
+    const top_left = cam.worldToScreen(box_pos);
+    const step_pitch = gridStepWidth() * cam.zoom;
     return .{
-        .x = GRID_SIDE_PAD + @as(f32, @floatFromInt(step)) * sw,
-        .y = TITLE_H + GRID_TOP_PAD + fr * (GRID_CELL_H + GRID_ROW_GAP),
-        .w = sw - 1.5, // セル間の見た目 gap
-        .h = GRID_CELL_H,
+        .origin_x = top_left.x + GRID_SIDE_PAD * cam.zoom,
+        .origin_y = top_left.y + (TITLE_H + GRID_TOP_PAD) * cam.zoom,
+        .cell_w = step_pitch - 1.5 * cam.zoom,
+        .cell_h = GRID_CELL_H * cam.zoom,
+        .step_pitch = step_pitch,
+        .row_pitch = (GRID_CELL_H + GRID_ROW_GAP) * cam.zoom,
     };
-}
-
-pub const GridCell = struct { row: u8, step: u8 };
-
-/// box ローカル点がどの (row, step) セルに当たるか（rows 行 × 16 step のうち）。gap は null。
-pub fn hitTestGridCell(local: Vec2f, rows: u8) ?GridCell {
-    var r: u8 = 0;
-    while (r < rows) : (r += 1) {
-        var s: u8 = 0;
-        while (s < GRID_STEPS) : (s += 1) {
-            const cr = gridCellRect(r, s);
-            if (local.x >= cr.x and local.x <= cr.x + cr.w and local.y >= cr.y and local.y <= cr.y + cr.h) {
-                return .{ .row = r, .step = s };
-            }
-        }
-    }
-    return null;
 }
 
 /// world 点近傍のケーブル（点と線分の距離 <= CABLE_HIT_SLOP）。edge index を返す。
@@ -572,27 +567,6 @@ test "canvas: nodeSize grows for grid box (grid_rows>0) and matches gridBlockHei
     // 明示式と一致（port 高さより grid 高さが大きいケース）。
     const expect_h = TITLE_H + gridBlockHeight(2) + BODY_PAD;
     try testing.expectApproxEqAbs(expect_h, nodeSize(box).y, 1e-4);
-}
-
-test "canvas: gridCellRect / hitTestGridCell round-trip (box-local)" {
-    // 各セルの中心が自分自身に hit する。gap（セル間）は null。
-    const rows: u8 = 3;
-    var r: u8 = 0;
-    while (r < rows) : (r += 1) {
-        var s: u8 = 0;
-        while (s < GRID_STEPS) : (s += 1) {
-            const cr = gridCellRect(r, s);
-            const center = Vec2f{ .x = cr.x + cr.w / 2, .y = cr.y + cr.h / 2 };
-            const hit = hitTestGridCell(center, rows).?;
-            try testing.expectEqual(r, hit.row);
-            try testing.expectEqual(s, hit.step);
-        }
-    }
-    // グリッド外（タイトル内）は null。
-    try testing.expectEqual(@as(?GridCell, null), hitTestGridCell(.{ .x = 5, .y = 2 }, rows));
-    // rows を超える行は当たらない（row=3 の中心を rows=3 で引くと範囲外）。
-    const beyond = gridCellRect(rows, 0);
-    try testing.expectEqual(@as(?GridCell, null), hitTestGridCell(.{ .x = beyond.x + beyond.w / 2, .y = beyond.y + beyond.h / 2 }, rows));
 }
 
 test "canvas: resolveConnection direction rules (self-loop allowed, same-dir rejected)" {

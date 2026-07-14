@@ -17,6 +17,7 @@ const audio = kit.audio;
 const synth = kit.synth; // SampleTap（Audio→GUI の出力タップ）
 const dsp = kit.dsp; // mono downmix
 const gui = kit.gui; // スライダ / ボタン / グリッドセル
+const stepgrid = gui.stepgrid;
 const recipe = kit.recipe;
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
@@ -195,18 +196,19 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 // ----------------------------------------------------------------------------
 // DrumMachine / BassMachine UI（colorSwatchId で独立クリック可能なセル grid。明示 ID）。
 // ----------------------------------------------------------------------------
-const CELL: i32 = 16;
-const DIM = gui.Color.rgba(0x2A, 0x2E, 0x36, 0xFF); // off セル
-const DIM_BEAT = gui.Color.rgba(0x3A, 0x40, 0x4A, 0xFF); // off セル（4 拍頭の目印）
 const LOCK_COL = gui.Color.rgba(0xC0, 0x60, 0x60, 0xFF);
+const DIM = gui.Color.rgba(0x2A, 0x2E, 0x36, 0xFF);
+const DIM_BEAT = gui.Color.rgba(0x3A, 0x40, 0x4A, 0xFF);
+const KICK_ON = gui.Color.rgba(0xE0, 0x60, 0x50, 0xFF);
+const HAT_ON = gui.Color.rgba(0x50, 0xC0, 0xD0, 0xFF);
+const CLAP_ON = gui.Color.rgba(0xE0, 0xC0, 0x50, 0xFF);
+const BASS_ON = gui.Color.rgba(0x60, 0xD0, 0x70, 0xFF);
+const ACCENT_ON = gui.Color.rgba(0xE0, 0x90, 0x40, 0xFF);
+const SLIDE_ON = gui.Color.rgba(0x60, 0x80, 0xE0, 0xFF);
 
 const DRUM_CELL_BASE: u64 = 0x8000;
 const BASS_CELL_BASE: u64 = 0x8200;
 const TOGGLE_BASE: u64 = 0x8400;
-
-fn cellOffColor(step: u8) gui.Color {
-    return if (step % 4 == 0) DIM_BEAT else DIM;
-}
 
 /// 1 本の drum track 行を描く。clicked なセルがあれば cmd を編集して edited=true。
 /// 行末に Lock トグル（自己進化からそのトラックを凍結）。自己進化 on/off は全体トグル。
@@ -221,29 +223,21 @@ fn drumRow(
 ) void {
     ctx.beginBox(.{ .direction = .row, .gap = 2, .align_cross = .center });
     ctx.label(label);
-    var s: u8 = 0;
-    while (s < 16) : (s += 1) {
-        const on = (on_mask.* & bitOf(s)) != 0;
-        const col = if (on) on_color else cellOffColor(s);
-        const id: u64 = DRUM_CELL_BASE + track * 16 + s;
-        if (ctx.colorSwatchId(id, .{ .color = col, .size = CELL }).clicked) {
-            on_mask.* ^= bitOf(s);
-            edited.* = true;
-        }
+    if (stepgrid.widgetRow(ctx, .{
+        .id_base = DRUM_CELL_BASE + track * 16,
+        .mask = on_mask.*,
+        .on_color = on_color,
+        .off_color = DIM,
+        .off_beat_color = DIM_BEAT,
+    })) |cell| {
+        on_mask.* ^= bitOf(cell.step);
+        edited.* = true;
     }
     if (ctx.buttonId(TOGGLE_BASE + track, if (lock.*) "Lock: on" else "Lock: off", .{ .selected = lock.* }).clicked) {
         lock.* = !lock.*;
         edited.* = true;
     }
     ctx.endBox();
-}
-
-/// degree(0..total-1) を緑系の明るさへ。
-fn pitchColor(deg: i8) gui.Color {
-    const d: f32 = @floatFromInt(std.math.clamp(@as(i32, deg), 0, @as(i32, BASS_DEG_TOTAL) - 1));
-    const t = d / @as(f32, @floatFromInt(BASS_DEG_TOTAL - 1));
-    const g: u8 = @intFromFloat(70.0 + t * 170.0);
-    return gui.Color.rgba(0x30, g, 0x50, 0xFF);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -397,25 +391,24 @@ pub fn main(init: std.process.Init) !void {
 
         // DrumMachine grid（行末 Lock = そのトラックを進化から凍結）
         ctx.label("DRUM MACHINE (click cells; Lock=freeze track):");
-        drumRow(&ctx, 0, "Kick ", gui.Color.rgba(0xE0, 0x60, 0x50, 0xFF), &cmd.kick.on, &cmd.kick.lock, &edited);
-        drumRow(&ctx, 1, "Hat  ", gui.Color.rgba(0x50, 0xC0, 0xD0, 0xFF), &cmd.hat.on, &cmd.hat.lock, &edited);
-        drumRow(&ctx, 2, "Clap ", gui.Color.rgba(0xE0, 0xC0, 0x50, 0xFF), &cmd.clap.on, &cmd.clap.lock, &edited);
+        drumRow(&ctx, 0, "Kick ", KICK_ON, &cmd.kick.on, &cmd.kick.lock, &edited);
+        drumRow(&ctx, 1, "Hat  ", HAT_ON, &cmd.hat.on, &cmd.hat.lock, &edited);
+        drumRow(&ctx, 2, "Clap ", CLAP_ON, &cmd.clap.on, &cmd.clap.lock, &edited);
 
         // BassMachine（303 レーン: on / pitch / accent / slide）
         ctx.label("BASS MACHINE (303):");
         // on 行
         ctx.beginBox(.{ .direction = .row, .gap = 2, .align_cross = .center });
         ctx.label("On   ");
-        {
-            var s: u8 = 0;
-            while (s < 16) : (s += 1) {
-                const on = (cmd.bass.on & bitOf(s)) != 0;
-                const col = if (on) gui.Color.rgba(0x60, 0xD0, 0x70, 0xFF) else cellOffColor(s);
-                if (ctx.colorSwatchId(BASS_CELL_BASE + 0 * 16 + s, .{ .color = col, .size = CELL }).clicked) {
-                    cmd.bass.on ^= bitOf(s);
-                    edited = true;
-                }
-            }
+        if (stepgrid.widgetRow(&ctx, .{
+            .id_base = BASS_CELL_BASE + 0 * 16,
+            .mask = cmd.bass.on,
+            .on_color = BASS_ON,
+            .off_color = DIM,
+            .off_beat_color = DIM_BEAT,
+        })) |cell| {
+            cmd.bass.on ^= bitOf(cell.step);
+            edited = true;
         }
         if (ctx.buttonId(TOGGLE_BASE + 3, if (cmd.bass.lock) "Lock: on" else "Lock: off", .{ .selected = cmd.bass.lock }).clicked) {
             cmd.bass.lock = !cmd.bass.lock;
@@ -425,45 +418,43 @@ pub fn main(init: std.process.Init) !void {
         // pitch 行（クリックで degree を循環）
         ctx.beginBox(.{ .direction = .row, .gap = 2, .align_cross = .center });
         ctx.label("Pitch");
-        {
-            var s: u8 = 0;
-            while (s < 16) : (s += 1) {
-                if (ctx.colorSwatchId(BASS_CELL_BASE + 1 * 16 + s, .{ .color = pitchColor(cmd.bass.deg[s]), .size = CELL }).clicked) {
-                    const next: i32 = @mod(@as(i32, cmd.bass.deg[s]) + 1, @as(i32, BASS_DEG_TOTAL));
-                    cmd.bass.deg[s] = @intCast(next);
-                    edited = true;
-                }
-            }
+        if (stepgrid.widgetRow(&ctx, .{
+            .id_base = BASS_CELL_BASE + 1 * 16,
+            .pitch = .{ .degrees = cmd.bass.deg[0..], .degree_count = BASS_DEG_TOTAL, .style = .cells },
+            .off_color = DIM,
+            .off_beat_color = DIM_BEAT,
+        })) |cell| {
+            const next: i32 = @mod(@as(i32, cmd.bass.deg[cell.step]) + 1, @as(i32, BASS_DEG_TOTAL));
+            cmd.bass.deg[cell.step] = @intCast(next);
+            edited = true;
         }
         ctx.endBox();
         // accent 行
         ctx.beginBox(.{ .direction = .row, .gap = 2, .align_cross = .center });
         ctx.label("Accnt");
-        {
-            var s: u8 = 0;
-            while (s < 16) : (s += 1) {
-                const on = (cmd.bass.accent & bitOf(s)) != 0;
-                const col = if (on) gui.Color.rgba(0xE0, 0x90, 0x40, 0xFF) else cellOffColor(s);
-                if (ctx.colorSwatchId(BASS_CELL_BASE + 2 * 16 + s, .{ .color = col, .size = CELL }).clicked) {
-                    cmd.bass.accent ^= bitOf(s);
-                    edited = true;
-                }
-            }
+        if (stepgrid.widgetRow(&ctx, .{
+            .id_base = BASS_CELL_BASE + 2 * 16,
+            .mask = cmd.bass.accent,
+            .on_color = ACCENT_ON,
+            .off_color = DIM,
+            .off_beat_color = DIM_BEAT,
+        })) |cell| {
+            cmd.bass.accent ^= bitOf(cell.step);
+            edited = true;
         }
         ctx.endBox();
         // slide 行
         ctx.beginBox(.{ .direction = .row, .gap = 2, .align_cross = .center });
         ctx.label("Slide");
-        {
-            var s: u8 = 0;
-            while (s < 16) : (s += 1) {
-                const on = (cmd.bass.slide & bitOf(s)) != 0;
-                const col = if (on) gui.Color.rgba(0x60, 0x80, 0xE0, 0xFF) else cellOffColor(s);
-                if (ctx.colorSwatchId(BASS_CELL_BASE + 3 * 16 + s, .{ .color = col, .size = CELL }).clicked) {
-                    cmd.bass.slide ^= bitOf(s);
-                    edited = true;
-                }
-            }
+        if (stepgrid.widgetRow(&ctx, .{
+            .id_base = BASS_CELL_BASE + 3 * 16,
+            .mask = cmd.bass.slide,
+            .on_color = SLIDE_ON,
+            .off_color = DIM,
+            .off_beat_color = DIM_BEAT,
+        })) |cell| {
+            cmd.bass.slide ^= bitOf(cell.step);
+            edited = true;
         }
         ctx.endBox();
 

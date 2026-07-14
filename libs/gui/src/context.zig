@@ -34,6 +34,7 @@ const style_mod = @import("style.zig");
 const widgets = @import("widgets.zig");
 // popup.zig も同じ相互 import パターン（TASK-79.1）。
 const popup_mod = @import("popup.zig");
+const stepgrid_mod = @import("stepgrid.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -52,6 +53,7 @@ pub const Style = style_mod.Style;
 pub const PopupState = popup_mod.PopupState;
 pub const PopupItem = popup_mod.PopupItem;
 pub const PopupResult = popup_mod.PopupResult;
+pub const stepgrid = stepgrid_mod;
 
 /// rect キャッシュのエントリ。clip は祖先の clip_children を intersect 済みの有効クリップで、
 /// buttonBehavior(ctx, id, rect, clip) にそのまま渡せる（21.5 の widget hit-test 用）。
@@ -284,6 +286,13 @@ pub const Context = struct {
         if (id == 0) return null;
         const entry = self.rect_cache.get(id) orelse return null;
         return entry.rect;
+    }
+
+    /// 明示 ID widget の前フレーム {rect, clip}。共有 widget が同期 hit-test を
+    /// Context の契約どおりに行うための read-only access。
+    pub fn getNodeCachedRect(self: *const Context, id: Id) ?CachedRect {
+        if (id == 0) return null;
+        return self.rect_cache.get(id);
     }
 
     /// 明示 ID ノードの前フレーム measured サイズ（自然サイズ）。scroll 量の clamp に使う。

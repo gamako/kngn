@@ -71,6 +71,9 @@ pub const SplitterOpts = @import("widgets.zig").SplitterOpts;
 pub const splitter = @import("widgets.zig").splitter;
 pub const ScrollAreaOpts = @import("widgets.zig").ScrollAreaOpts;
 
+// 16-step grid（純幾何/描画 + Flex row widget。TASK-105.1）。
+pub const stepgrid = @import("context.zig").stepgrid;
+
 // ポップアップ/コンテキストメニュー（TASK-79.1）。任意座標にメニューを表示し、
 // 項目クリックで選択を返す汎用 primitive。使い方は popup.zig の doc comment 参照。
 // Context メソッド（ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /
@@ -100,4 +103,5 @@ test {
     _ = @import("style.zig");
     _ = @import("widgets.zig");
     _ = @import("popup.zig");
+    _ = @import("stepgrid.zig");
 }
