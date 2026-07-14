@@ -92,6 +92,13 @@ pub const Window = struct {
         return .{ .core = core };
     }
 
+    /// 本物のフルスクリーン window を作成する（TASK-100.1）。GDI は StretchDIBits が stateless なので
+    /// Core のモニタ全面 window を包むだけ（present は core 寸法に追従）。
+    pub fn createFullscreen(title: [:0]const u8) Error!Window {
+        const core = try common.Core.createFullscreen(title);
+        return .{ .core = core };
+    }
+
     pub fn destroy(self: Window) void {
         self.core.destroy();
     }

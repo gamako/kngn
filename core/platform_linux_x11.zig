@@ -31,6 +31,7 @@ const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("X11/Xlib.h");
     @cInclude("X11/Xutil.h");
+    @cInclude("X11/Xatom.h"); // XA_ATOM（createFullscreen の _NET_WM_STATE 設定用。TASK-100）
     @cInclude("X11/XKBlib.h"); // XkbSetDetectableAutoRepeat
     @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair（system cursor。TASK-75.3）
     @cInclude("X11/extensions/XShm.h");
@@ -171,6 +172,22 @@ pub const Window = struct {
     state: *State,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
+        return createInternal(width, height, title, false);
+    }
+
+    /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。装飾なし・画面解像度いっぱい）。
+    /// 画面解像度は `XDisplayWidth`/`XDisplayHeight`（既定 screen）で取得し、`XMapWindow` 前に
+    /// EWMH `_NET_WM_STATE_FULLSCREEN` を `_NET_WM_STATE` プロパティへセットする。準拠 WM は
+    /// map 時点でこれを見て装飾なし・画面サイズへフルスクリーン化する（`create()` の挙動は無変更）。
+    pub fn createFullscreen(title: [:0]const u8) Error!Window {
+        const dpy = g_display orelse return error.WindowCreationFailed;
+        const screen = c.XDefaultScreen(dpy);
+        const w: u32 = @intCast(c.XDisplayWidth(dpy, screen));
+        const h: u32 = @intCast(c.XDisplayHeight(dpy, screen));
+        return createInternal(w, h, title, true);
+    }
+
+    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
@@ -205,12 +222,21 @@ pub const Window = struct {
         var wm_delete = c.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
         _ = c.XSetWMProtocols(dpy, win, &wm_delete, 1);
 
-        // resizable（TASK-23）。最小サイズだけ与え、max は与えない（自由リサイズ）。
-        var hints = std.mem.zeroes(c.XSizeHints);
-        hints.flags = c.PMinSize;
-        hints.min_width = 1;
-        hints.min_height = 1;
-        _ = c.XSetWMNormalHints(dpy, win, &hints);
+        if (fullscreen) {
+            // EWMH: map 前に _NET_WM_STATE へ _NET_WM_STATE_FULLSCREEN をセットしておくと、
+            // 準拠 WM は map 時点で装飾なしの本物のフルスクリーンにする（後追いの
+            // ClientMessage 送信は不要）。format=32 の要素は Atom(=c_ulong. 64bit では long 幅)。
+            const net_wm_state = c.XInternAtom(dpy, "_NET_WM_STATE", 0);
+            var fullscreen_atom = c.XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", 0);
+            _ = c.XChangeProperty(dpy, win, net_wm_state, c.XA_ATOM, 32, c.PropModeReplace, @ptrCast(&fullscreen_atom), 1);
+        } else {
+            // resizable（TASK-23）。最小サイズだけ与え、max は与えない（自由リサイズ）。
+            var hints = std.mem.zeroes(c.XSizeHints);
+            hints.flags = c.PMinSize;
+            hints.min_width = 1;
+            hints.min_height = 1;
+            _ = c.XSetWMNormalHints(dpy, win, &hints);
+        }
 
         const gc = c.XDefaultGC(dpy, screen);
 

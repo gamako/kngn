@@ -985,10 +985,12 @@ zig build run-example_15        # 15_audio_tone
 zig build run-example_17        # 17_gui_toggles（checkbox/toggle/radio。TASK-48）
 zig build run-example_18        # 18_cursor（system cursor 形状切替。TASK-75.1）
 zig build run-example_19        # 19_color_emoji（Apple Color Emoji.ttc の sbix カラー絵文字デモ。TASK-26.4）
+zig build run-example_23        # 23_fullscreen（Window.createFullscreen デモ。全域 animated グラデーション。ESC/Q で終了。TASK-100）
 # 一覧: 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering /
 #       06_sprite_benchmark / 07_mouse_input / 08_gui_primitives / 09_gui_interaction / 10_gui_layout /
 #       11_gui_widgets / 12_outline_font / 13_gui_slider / 14_gui_color_picker / 15_audio_tone /
-#       16_gui_scroll / 17_gui_toggles / 18_cursor / 19_color_emoji  （image/ は共有アセットで run step なし）
+#       16_gui_scroll / 17_gui_toggles / 18_cursor / 19_color_emoji / 20_capture_demo / 21_char_input /
+#       22_gamepad / 23_fullscreen  （image/ は共有アセットで run step なし）
 ```
 
 ---

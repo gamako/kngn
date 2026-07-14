@@ -67,7 +67,13 @@ const WS_SYSMENU: DWORD = 0x00080000;
 const WS_MINIMIZEBOX: DWORD = 0x00020000;
 const WS_THICKFRAME: DWORD = 0x00040000; // リサイズ枠（TASK-23）
 const WS_MAXIMIZEBOX: DWORD = 0x00010000;
+const WS_POPUP: DWORD = 0x80000000; // 装飾なし（フルスクリーン用。TASK-100.1）
 const WINDOW_STYLE: DWORD = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX; // 自由リサイズ
+// フルスクリーン: 装飾なし + 初期表示。client=window 全面（AdjustWindowRectEx 不要）。
+const FULLSCREEN_STYLE: DWORD = WS_POPUP | WS_VISIBLE;
+const WS_VISIBLE: DWORD = 0x10000000;
+const SM_CXSCREEN: c_int = 0; // プライマリモニタ幅（GetSystemMetrics。TASK-100.1）
+const SM_CYSCREEN: c_int = 1; // プライマリモニタ高さ
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 const SW_SHOW: c_int = 5;
 const PM_REMOVE: UINT = 0x0001;
@@ -191,6 +197,7 @@ extern "user32" fn PeekMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT, w
 extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
 extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.winapi) BOOL;
+extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.winapi) c_int; // プライマリモニタ寸法（TASK-100.1）
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
@@ -288,6 +295,20 @@ pub const Core = struct {
     /// window を生成し、canonical BGRA backing を確保して `*Core`（heap）を返す。
     /// presentation resource は持たない（各 backend が create で別途用意する）。
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!*Core {
+        return createInternal(width, height, title, false);
+    }
+
+    /// 本物のフルスクリーン window を作成する（TASK-100.1）。プライマリモニタ全面を覆う
+    /// 装飾なし（WS_POPUP）window を (0,0) に置く。実サイズは `GetSystemMetrics` で取得し、
+    /// backing / core.width/height もその寸法になる（gdi/d3d11 の presentation はこれに追従）。
+    pub fn createFullscreen(title: [:0]const u8) Error!*Core {
+        const sw = GetSystemMetrics(SM_CXSCREEN);
+        const sh = GetSystemMetrics(SM_CYSCREEN);
+        if (sw <= 0 or sh <= 0) return error.WindowCreationFailed;
+        return createInternal(@intCast(sw), @intCast(sh), title, true);
+    }
+
+    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool) Error!*Core {
         if (!g_class_registered) return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
@@ -297,11 +318,22 @@ pub const Core = struct {
         title_buf[tn] = 0;
         const title_ptr: LPCWSTR = @ptrCast(&title_buf);
 
-        // client area を width×height にするため outer 寸法を算出する。失敗時は寸法がズレるので中断。
-        var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
-        if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
-        const outer_w = rect.right - rect.left;
-        const outer_h = rect.bottom - rect.top;
+        // 通常: client area を width×height にするため outer 寸法を AdjustWindowRectEx で算出。
+        // フルスクリーン: WS_POPUP は装飾なしなので client=window。(0,0) にモニタ全面を置く。
+        const style: DWORD = if (fullscreen) FULLSCREEN_STYLE else WINDOW_STYLE;
+        var outer_w: c_int = @intCast(width);
+        var outer_h: c_int = @intCast(height);
+        var pos_x: c_int = CW_USEDEFAULT;
+        var pos_y: c_int = CW_USEDEFAULT;
+        if (fullscreen) {
+            pos_x = 0;
+            pos_y = 0;
+        } else {
+            var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
+            if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
+            outer_w = rect.right - rect.left;
+            outer_h = rect.bottom - rect.top;
+        }
 
         const core = alloc.create(Core) catch return error.WindowCreationFailed;
         errdefer alloc.destroy(core);
@@ -330,9 +362,9 @@ pub const Core = struct {
             0,
             class_name,
             title_ptr,
-            WINDOW_STYLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            style,
+            pos_x,
+            pos_y,
             outer_w,
             outer_h,
             null,

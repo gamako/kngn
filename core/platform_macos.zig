@@ -161,6 +161,17 @@ pub const Window = struct {
         return .{ .handle = w };
     }
 
+    /// 本物のフルスクリーンウィンドウを作成する（TASK-100.1）。facade の Window.createFullscreen が
+    /// `@hasDecl` でこれを検出して使う。通常ウィンドウを作ってから `platform_enter_fullscreen`
+    /// （NSWindow toggleFullScreen:）でネイティブフルスクリーン化する。実サイズは画面解像度に
+    /// なり、framebuffer は既存の setFrameSize 経路で追従する（fb.width/height に反映）。
+    /// 初期サイズは toggle 前の一瞬だけ有効なプレースホルダ。
+    pub fn createFullscreen(title: [:0]const u8) Error!Window {
+        const w = c.platform_create_window(1280, 720, title.ptr, null, null) orelse return error.WindowCreationFailed;
+        c.platform_enter_fullscreen(w);
+        return .{ .handle = w };
+    }
+
     pub fn destroy(self: Window) void {
         c.platform_destroy_window(self.handle);
     }

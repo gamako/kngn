@@ -1043,6 +1043,17 @@ pub const Window = struct {
     state: *State,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
+        return createInternal(width, height, title, false);
+    }
+
+    /// 本物のフルスクリーン toplevel を作成する（agent-face 向け。TASK-100）。`xdg_toplevel_set_fullscreen`
+    /// を初回 commit 前に要求する。実サイズは compositor が初回 configure で報告するため、
+    /// 引数の width/height はプレースホルダ（初回 configure で確定した値に上書きされる）。
+    pub fn createFullscreen(title: [:0]const u8) Error!Window {
+        return createInternal(1, 1, title, true);
+    }
+
+    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
@@ -1079,11 +1090,22 @@ pub const Window = struct {
         _ = c.xdg_toplevel_add_listener(st.toplevel, &toplevel_listener, st);
         c.xdg_toplevel_set_title(st.toplevel, title.ptr);
 
+        if (fullscreen) {
+            // output=null（サーフェスが乗っている出力に compositor が合わせる）。初回 commit 前に要求する。
+            c.xdg_toplevel_set_fullscreen(st.toplevel, null);
+        }
+
         // 装飾 mode の決定（TASK-28.5.6）。toplevel 生成後・初回 commit の前に行う（v1 の順序制約）。
         // FORCE_CSD（debug）は decoration object を作らず即 csd 確定。manager 不在も即確定（csd or none）。
         // 0.16 std には libc 非依存 getenv が無いため libc getenv を使う（x11 backend と同じ）。
         const force_csd = std.c.getenv("VP_WAYLAND_FORCE_CSD") != null;
-        if (!force_csd and st.deco_manager != null) {
+        if (fullscreen) {
+            // フルスクリーンは装飾なし固定（CSD タイトルバーを建てない）。decoration manager 非対応の
+            // compositor では通常経路が subcompositor 有無で .csd に落ち、syncDecorations が CSD タイトルバーを
+            // 構築してしまう（parseMaximized は fullscreen を maximized 扱いだが CSD は maximized でも
+            // タイトルバーを残す）。fullscreen では deco_obj も作らず .none に確定する（TASK-100・codex 指摘）。
+            st.deco_state = .none;
+        } else if (!force_csd and st.deco_manager != null) {
             st.deco_obj = c.zxdg_decoration_manager_v1_get_toplevel_decoration(st.deco_manager, st.toplevel);
             if (st.deco_obj) |d| {
                 _ = c.zxdg_toplevel_decoration_v1_add_listener(d, &decoration_listener, st);
@@ -1102,6 +1124,14 @@ pub const Window = struct {
         // xdg_surface configure に加えて decoration mode 確定（deco_state != .pending）も待つ（TASK-28.5.6）。
         while (!st.configured or (st.deco_obj != null and st.deco_state == .pending)) {
             if (c.wl_display_dispatch(dpy) < 0) return error.WindowCreationFailed;
+        }
+
+        // fullscreen: 初回 configure の suggested size（実際の出力解像度）を setupBuffers 前に
+        // 手動で反映する。通常の resize 適用（xdgSurfaceConfigure）は buffers 確保後のみ有効な
+        // ガードのため、create 中はそのままでは（プレースホルダ 1x1 のまま）捨てられてしまう。
+        if (fullscreen and st.pending_resize and st.pending_width != 0 and st.pending_height != 0) {
+            st.width = st.pending_width;
+            st.height = st.pending_height;
         }
 
         // configure 後に shm ダブルバッファを確保。

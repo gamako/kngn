@@ -1254,6 +1254,21 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     return handle
 }
 
+// TASK-100.1: 既存ウィンドウをネイティブフルスクリーン化する（緑ボタンと同じ toggleFullScreen(nil)）。
+// 既にフルスクリーンなら no-op（二重 toggle 防止）。
+@_cdecl("platform_enter_fullscreen")
+func platform_enter_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let window = handle.window
+    if !window.collectionBehavior.contains(.fullScreenPrimary) {
+        window.collectionBehavior.insert(.fullScreenPrimary)
+    }
+    if !window.styleMask.contains(.fullScreen) {
+        window.toggleFullScreen(nil)
+    }
+}
+
 @_cdecl("platform_run")
 func platform_run(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }

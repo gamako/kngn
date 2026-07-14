@@ -161,6 +161,22 @@ pub const Window = struct {
         return .{ .inner = try backend.Window.create(width, height, title), .headless = false };
     }
 
+    /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。video-proto に
+    /// OS レベルのフルスクリーン切替 API が無かったため追加）。`backend.Window` が
+    /// `createFullscreen` を実装していれば（Linux x11/wayland）それを使い、無ければ
+    /// 固定サイズの通常ウィンドウへフォールバックする（macOS/Windows backend は無改造）。
+    /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
+    pub fn createFullscreen(title: [:0]const u8) Error!Window {
+        if (harness.isHeadlessActive()) {
+            harness.createHeadlessWindow(1920, 1080) catch return error.WindowCreationFailed;
+            return .{ .inner = undefined, .headless = true };
+        }
+        if (@hasDecl(backend.Window, "createFullscreen")) {
+            return .{ .inner = try backend.Window.createFullscreen(title), .headless = false };
+        }
+        return .{ .inner = try backend.Window.create(1920, 1080, title), .headless = false };
+    }
+
     pub fn destroy(self: Window) void {
         // callback clear は public setRedrawCallback に null を通さず、facade/backend の
         // private clear 経路で行う（TASK-23.1 実装メモ）。destroy 後の遅延 setFrameSize 防御。

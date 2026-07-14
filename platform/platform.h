@@ -30,6 +30,11 @@ bool platform_init(void);
 PlatformWindow* platform_create_window(int width, int height, const char* title,
                                        FrameCallback callback, void* userdata);
 
+// 既存ウィンドウを本物のフルスクリーンにする（TASK-100.1）。
+// facade の Window.createFullscreen が create 後に呼ぶ。macOS は NSWindow の
+// toggleFullScreen:（緑ボタンと同じネイティブフルスクリーン。既にフルスクリーンなら no-op）。
+void platform_enter_fullscreen(PlatformWindow* window);
+
 // メインイベントループを開始（ブロッキング）
 // ウィンドウが閉じられるまで戻らない
 void platform_run(PlatformWindow* window);

@@ -241,8 +241,21 @@ pub const Window = struct {
     d3d: *D3DState,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        const core = try common.Core.create(width, height, title);
+        return finishFromCore(try common.Core.create(width, height, title));
+    }
+
+    /// 本物のフルスクリーン window を作成する（TASK-100.1）。Core のモニタ全面 window を作り、
+    /// swap chain / upload texture をその実寸法（core.width/height）で構築する。
+    pub fn createFullscreen(title: [:0]const u8) Error!Window {
+        return finishFromCore(try common.Core.createFullscreen(title));
+    }
+
+    /// Core（通常 or フルスクリーン）から D3D11 presentation resource を構築して Window を返す。
+    /// 寸法は core.width/core.height を使う（フルスクリーンでもモニタ実寸法に一致する）。
+    fn finishFromCore(core: *common.Core) Error!Window {
         errdefer core.destroy();
+        const width = core.width;
+        const height = core.height;
 
         var desc = std.mem.zeroes(DXGI_SWAP_CHAIN_DESC);
         desc.BufferDesc.Width = width;

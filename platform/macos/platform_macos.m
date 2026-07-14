@@ -1248,6 +1248,23 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
     return platformWindow;
 }
 
+// TASK-100.1: 既存ウィンドウをネイティブフルスクリーン化する（緑ボタンと同じ toggleFullScreen:）。
+// titled+resizable window は既定でフルスクリーン可だが、念のため collectionBehavior に
+// FullScreenPrimary を立ててから toggle する。既にフルスクリーンなら no-op（二重 toggle 防止）。
+void platform_enter_fullscreen(PlatformWindow* window) {
+    if (!window) return;
+    @autoreleasepool {
+        NSWindow* w = window->window;
+        if (!w) return;
+        if (!([w collectionBehavior] & NSWindowCollectionBehaviorFullScreenPrimary)) {
+            [w setCollectionBehavior:[w collectionBehavior] | NSWindowCollectionBehaviorFullScreenPrimary];
+        }
+        if (!([w styleMask] & NSWindowStyleMaskFullScreen)) {
+            [w toggleFullScreen:nil];
+        }
+    }
+}
+
 // メインループ
 void platform_run(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
