@@ -322,44 +322,46 @@ pub const PatchState = struct {
 
 pub const LofiPatch = struct {
     allocator: std.mem.Allocator,
-    graph: modular.Graph,
+    graph: *modular.DynGraph,
 
-    clock: modular.Clock,
+    // DynGraph は起動時に構築して以後 removeModule しないため、ptrOf の結果を保持できる。
+    // live 再配線で handle を retire/reuse する場合のポインタ更新は TASK-105.3 以降の課題。
+    clock: *modular.Clock,
     // 前景: editable step シーケンサ（DrumMachine + BassMachine）
-    kick_seq: modular.StepSeq,
-    hat_seq: modular.StepSeq,
-    clap_seq: modular.StepSeq,
-    bass_seq: modular.StepSeq,
+    kick_seq: *modular.StepSeq,
+    hat_seq: *modular.StepSeq,
+    clap_seq: *modular.StepSeq,
+    bass_seq: *modular.StepSeq,
     // drums
-    kick: modular.Kick,
-    hat: modular.Hat,
-    clap: modular.Clap,
+    kick: *modular.Kick,
+    hat: *modular.Hat,
+    clap: *modular.Clap,
     // 背景: アンビエント連続生成（pad の和音 root / cutoff / level をゆっくり動かす）
-    pad_div: modular.ClockDivider,
-    pad_eu: modular.EuclideanSeq,
-    pad: modular.ChordPad,
-    ambient_turing: modular.TuringMachine,
-    ambient_quant: modular.Quantizer,
-    ambient_lfo: modular.Lfo,
-    ambient_random: modular.Random,
+    pad_div: *modular.ClockDivider,
+    pad_eu: *modular.EuclideanSeq,
+    pad: *modular.ChordPad,
+    ambient_turing: *modular.TuringMachine,
+    ambient_quant: *modular.Quantizer,
+    ambient_lfo: *modular.Lfo,
+    ambient_random: *modular.Random,
     // bass voice（StepSeq に駆動される）
-    bass_perc: modular.PercEnv,
-    vco: modular.Vco,
-    vcf: modular.Vcf,
-    vca: modular.Vca,
+    bass_perc: *modular.PercEnv,
+    vco: *modular.Vco,
+    vcf: *modular.Vcf,
+    vca: *modular.Vca,
     // mix（kick は素通し / 非kick は sidechain でダッキング）
-    nonkick_mixer: modular.Mixer,
-    sidechain: modular.Sidechain,
-    master_mixer: modular.Mixer,
-    master_vcf: modular.Vcf,
+    nonkick_mixer: *modular.Mixer,
+    sidechain: *modular.Sidechain,
+    master_mixer: *modular.Mixer,
+    master_vcf: *modular.Vcf,
     // lofi FX チェーン
-    saturator: modular.Saturator,
-    bitcrusher: modular.Bitcrusher,
-    delay_fx: modular.DelayFx,
-    reverb_fx: modular.ReverbFx,
-    vinyl: modular.VinylNoiseFx,
-    wow: modular.WowFlutterFx,
-    output: modular.Output,
+    saturator: *modular.Saturator,
+    bitcrusher: *modular.Bitcrusher,
+    delay_fx: *modular.DelayFx,
+    reverb_fx: *modular.ReverbFx,
+    vinyl: *modular.VinylNoiseFx,
+    wow: *modular.WowFlutterFx,
+    output: *modular.Output,
 
     controls: Controls,
 
@@ -393,52 +395,41 @@ pub const LofiPatch = struct {
 
         const def = PatternCommand.default();
         const base = seedmod.DEFAULT_BASE_SEED;
-        const treg = seedmod.deriveU32(base, .ambient_turing_register);
         self.* = .{
             .allocator = allocator,
             .graph = undefined,
-            .clock = .{ .bpm = DEFAULT_BPM, .ppqn = 4, .swing = 0.0 },
-            .kick_seq = .{ .kind = .drum, .on_mask = KICK_ON },
-            .hat_seq = .{ .kind = .drum, .on_mask = HAT_ON },
-            .clap_seq = .{ .kind = .drum, .on_mask = CLAP_ON },
-            .bass_seq = .{ .kind = .bass, .on_mask = BASS_ON, .accent_mask = BASS_ACCENT, .slide_mask = BASS_SLIDE, .pitch_deg = BASS_DEG, .scale = BASS_SCALE, .octaves = BASS_OCTAVES },
-            .kick = .{},
-            .hat = .{},
-            .clap = .{},
+            .clock = undefined,
+            .kick_seq = undefined,
+            .hat_seq = undefined,
+            .clap_seq = undefined,
+            .bass_seq = undefined,
+            .kick = undefined,
+            .hat = undefined,
+            .clap = undefined,
             // pad: 1 小節パルス(div=16)→2 小節周期(steps=2,pulses=1)で和音 trigger
-            .pad_div = .{ .div = 16 },
-            .pad_eu = .{ .steps = 2, .pulses = 1, .rotation = 0 },
-            .pad = .{ .gain = PAD_BASE_GAIN, .cutoff = PAD_CUTOFF_DEFAULT, .warmth = PAD_WARMTH_DEFAULT },
+            .pad_div = undefined,
+            .pad_eu = undefined,
+            .pad = undefined,
             // アンビエント: turing(lock 高め)→quant(scale 内 root)→pad。LFO は cutoff、random は level。
-            .ambient_turing = .{
-                .bits = 8,
-                .lock = 0.94,
-                .noise = .{ .state = seedmod.deriveU32(base, .ambient_turing) },
-                .register = treg,
-                .anchor_register = treg,
-            },
-            .ambient_quant = .{ .scale = .minor_pentatonic, .octaves = 1, .root_semitone = 0 },
-            .ambient_lfo = .{ .rate_hz = 0.08 },
-            .ambient_random = .{
-                .min = -1.0,
-                .max = 1.0,
-                .noise = .{ .state = seedmod.deriveU32(base, .ambient_random) },
-            },
-            .bass_perc = .{ .decay = 0.18 },
-            .vco = .{ .osc = .{ .waveform = .triangle }, .base_hz = 65.41 }, // C2 ベース
-            .vcf = .{ .cutoff = 600, .resonance = 0.9, .mode = .lowpass, .mod_octaves = 1.0 },
-            .vca = .{ .gain = 0.7 },
-            .nonkick_mixer = .{ .gain = 0.9 },
-            .sidechain = .{ .amount = DEFAULT_SIDECHAIN, .release = 0.18 },
-            .master_mixer = .{ .gain = 0.9 },
-            .master_vcf = .{ .cutoff = MASTER_CUTOFF_MAX, .resonance = 0.707, .mode = .lowpass },
-            .saturator = .{ .drive = 1.5, .post_gain = 1.0 },
-            .bitcrusher = .{ .bc = .{ .bit_depth = 11, .hold_samples = 2, .wet = 0.5 } },
-            .delay_fx = .{ .delay_ms = 333.0, .feedback = 0.3, .wet = 0.16 },
-            .reverb_fx = .{ .decay = 0.62, .damping = 0.4, .wet = 0.14 },
-            .vinyl = .{},
-            .wow = .{},
-            .output = .{ .gain = 1.0, .pan = 0.0, .soft_clip = true },
+            .ambient_turing = undefined,
+            .ambient_quant = undefined,
+            .ambient_lfo = undefined,
+            .ambient_random = undefined,
+            .bass_perc = undefined,
+            .vco = undefined,
+            .vcf = undefined,
+            .vca = undefined,
+            .nonkick_mixer = undefined,
+            .sidechain = undefined,
+            .master_mixer = undefined,
+            .master_vcf = undefined,
+            .saturator = undefined,
+            .bitcrusher = undefined,
+            .delay_fx = undefined,
+            .reverb_fx = undefined,
+            .vinyl = undefined,
+            .wow = undefined,
+            .output = undefined,
             .controls = Controls.init(),
             .mut_noise = .{ .state = seedmod.deriveU32(base, .mutate) },
             .last_bar = 0,
@@ -459,8 +450,8 @@ pub const LofiPatch = struct {
             .song_force_apply = false,
         };
 
-        self.graph = try modular.Graph.init(allocator, sample_rate, .{ .max_modules = 40, .max_ports = 64 });
-        errdefer self.graph.deinit();
+        self.graph = try modular.DynGraph.create(allocator, sample_rate);
+        errdefer self.graph.destroy();
         try self.wire();
         return self;
     }
@@ -486,42 +477,54 @@ pub const LofiPatch = struct {
 
     pub fn destroy(self: *LofiPatch) void {
         const allocator = self.allocator;
-        self.graph.deinit();
+        self.graph.destroy();
         allocator.destroy(self);
     }
 
     fn wire(self: *LofiPatch) !void {
-        const g = &self.graph;
-        const n_clock = try g.addModule(self.clock.spec());
-        const n_kick_seq = try g.addModule(self.kick_seq.spec());
-        const n_hat_seq = try g.addModule(self.hat_seq.spec());
-        const n_clap_seq = try g.addModule(self.clap_seq.spec());
-        const n_bass_seq = try g.addModule(self.bass_seq.spec());
-        const n_kick = try g.addModule(self.kick.spec());
-        const n_hat = try g.addModule(self.hat.spec());
-        const n_clap = try g.addModule(self.clap.spec());
-        const n_pad_div = try g.addModule(self.pad_div.spec());
-        const n_pad_eu = try g.addModule(self.pad_eu.spec());
-        const n_pad = try g.addModule(self.pad.spec());
-        const n_amb_turing = try g.addModule(self.ambient_turing.spec());
-        const n_amb_quant = try g.addModule(self.ambient_quant.spec());
-        const n_amb_lfo = try g.addModule(self.ambient_lfo.spec());
-        const n_amb_random = try g.addModule(self.ambient_random.spec());
-        const n_bass_perc = try g.addModule(self.bass_perc.spec());
-        const n_vco = try g.addModule(self.vco.spec());
-        const n_vcf = try g.addModule(self.vcf.spec());
-        const n_vca = try g.addModule(self.vca.spec());
-        const n_nonkick = try g.addModule(self.nonkick_mixer.spec());
-        const n_sidechain = try g.addModule(self.sidechain.spec());
-        const n_master = try g.addModule(self.master_mixer.spec());
-        const n_master_vcf = try g.addModule(self.master_vcf.spec());
-        const n_sat = try g.addModule(self.saturator.spec());
-        const n_bit = try g.addModule(self.bitcrusher.spec());
-        const n_delay = try g.addModule(self.delay_fx.spec());
-        const n_reverb = try g.addModule(self.reverb_fx.spec());
-        const n_vinyl = try g.addModule(self.vinyl.spec());
-        const n_wow = try g.addModule(self.wow.spec());
-        const n_output = try g.addModule(self.output.spec());
+        const g = self.graph;
+        const base = seedmod.DEFAULT_BASE_SEED;
+        const treg = seedmod.deriveU32(base, .ambient_turing_register);
+        const n_clock = try g.add(.clock, .{ .bpm = DEFAULT_BPM, .ppqn = 4, .swing = 0.0 });
+        const n_kick_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = KICK_ON });
+        const n_hat_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = HAT_ON });
+        const n_clap_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = CLAP_ON });
+        const n_bass_seq = try g.add(.step_seq, .{ .kind = .bass, .on_mask = BASS_ON, .accent_mask = BASS_ACCENT, .slide_mask = BASS_SLIDE, .pitch_deg = BASS_DEG, .scale = BASS_SCALE, .octaves = BASS_OCTAVES });
+        const n_kick = try g.add(.kick, .{});
+        const n_hat = try g.add(.hat, .{});
+        const n_clap = try g.add(.clap, .{});
+        const n_pad_div = try g.add(.clock_divider, .{ .div = 16 });
+        const n_pad_eu = try g.add(.euclid, .{ .steps = 2, .pulses = 1, .rotation = 0 });
+        const n_pad = try g.add(.chord_pad, .{ .gain = PAD_BASE_GAIN, .cutoff = PAD_CUTOFF_DEFAULT, .warmth = PAD_WARMTH_DEFAULT });
+        const n_amb_turing = try g.add(.turing, .{
+            .bits = 8,
+            .lock = 0.94,
+            .noise = .{ .state = seedmod.deriveU32(base, .ambient_turing) },
+            .register = treg,
+            .anchor_register = treg,
+        });
+        const n_amb_quant = try g.add(.quantizer, .{ .scale = .minor_pentatonic, .octaves = 1, .root_semitone = 0 });
+        const n_amb_lfo = try g.add(.lfo, .{ .rate_hz = 0.08 });
+        const n_amb_random = try g.add(.random, .{
+            .min = -1.0,
+            .max = 1.0,
+            .noise = .{ .state = seedmod.deriveU32(base, .ambient_random) },
+        });
+        const n_bass_perc = try g.add(.perc_env, .{ .decay = 0.18 });
+        const n_vco = try g.add(.vco, .{ .osc = .{ .waveform = .triangle }, .base_hz = 65.41 });
+        const n_vcf = try g.add(.vcf, .{ .cutoff = 600, .resonance = 0.9, .mode = .lowpass, .mod_octaves = 1.0 });
+        const n_vca = try g.add(.vca, .{ .gain = 0.7 });
+        const n_nonkick = try g.add(.mixer, .{ .gain = 0.9 });
+        const n_sidechain = try g.add(.sidechain, .{ .amount = DEFAULT_SIDECHAIN, .release = 0.18 });
+        const n_master = try g.add(.mixer, .{ .gain = 0.9 });
+        const n_master_vcf = try g.add(.vcf, .{ .cutoff = MASTER_CUTOFF_MAX, .resonance = 0.707, .mode = .lowpass });
+        const n_sat = try g.add(.saturator, .{ .drive = 1.5, .post_gain = 1.0 });
+        const n_bit = try g.add(.bitcrusher, .{ .bc = .{ .bit_depth = 11, .hold_samples = 2, .wet = 0.5 } });
+        const n_delay = try g.add(.delay, .{ .delay_ms = 333.0, .feedback = 0.3, .wet = 0.16 });
+        const n_reverb = try g.add(.reverb, .{ .decay = 0.62, .damping = 0.4, .wet = 0.14 });
+        const n_vinyl = try g.add(.vinyl, .{});
+        const n_wow = try g.add(.wow_flutter, .{});
+        const n_output = try g.add(.output, .{ .gain = 1.0, .pan = 0.0, .soft_clip = true });
 
         // timing（clock を前景 StepSeq と pad_div へ fan-out）
         try g.connect(n_clock, 0, n_kick_seq, 0);
@@ -568,8 +571,40 @@ pub const LofiPatch = struct {
         try g.connect(n_vinyl, 0, n_wow, 0);
         try g.connect(n_wow, 0, n_output, 0);
 
-        g.setOutputNode(n_output);
-        try g.finalize();
+        g.setOutput(n_output);
+        try g.publish();
+
+        // このパッチは起動時構築後に removeModule しないため、pool slot のポインタを保持する。
+        self.clock = g.ptrOf(.clock, n_clock);
+        self.kick_seq = g.ptrOf(.step_seq, n_kick_seq);
+        self.hat_seq = g.ptrOf(.step_seq, n_hat_seq);
+        self.clap_seq = g.ptrOf(.step_seq, n_clap_seq);
+        self.bass_seq = g.ptrOf(.step_seq, n_bass_seq);
+        self.kick = g.ptrOf(.kick, n_kick);
+        self.hat = g.ptrOf(.hat, n_hat);
+        self.clap = g.ptrOf(.clap, n_clap);
+        self.pad_div = g.ptrOf(.clock_divider, n_pad_div);
+        self.pad_eu = g.ptrOf(.euclid, n_pad_eu);
+        self.pad = g.ptrOf(.chord_pad, n_pad);
+        self.ambient_turing = g.ptrOf(.turing, n_amb_turing);
+        self.ambient_quant = g.ptrOf(.quantizer, n_amb_quant);
+        self.ambient_lfo = g.ptrOf(.lfo, n_amb_lfo);
+        self.ambient_random = g.ptrOf(.random, n_amb_random);
+        self.bass_perc = g.ptrOf(.perc_env, n_bass_perc);
+        self.vco = g.ptrOf(.vco, n_vco);
+        self.vcf = g.ptrOf(.vcf, n_vcf);
+        self.vca = g.ptrOf(.vca, n_vca);
+        self.nonkick_mixer = g.ptrOf(.mixer, n_nonkick);
+        self.sidechain = g.ptrOf(.sidechain, n_sidechain);
+        self.master_mixer = g.ptrOf(.mixer, n_master);
+        self.master_vcf = g.ptrOf(.vcf, n_master_vcf);
+        self.saturator = g.ptrOf(.saturator, n_sat);
+        self.bitcrusher = g.ptrOf(.bitcrusher, n_bit);
+        self.delay_fx = g.ptrOf(.delay, n_delay);
+        self.reverb_fx = g.ptrOf(.reverb, n_reverb);
+        self.vinyl = g.ptrOf(.vinyl, n_vinyl);
+        self.wow = g.ptrOf(.wow_flutter, n_wow);
+        self.output = g.ptrOf(.output, n_output);
     }
 
     /// RT callback から呼ぶ（alloc/lock/IO/panic なし）。interleaved 出力へ書く。
@@ -873,10 +908,10 @@ pub const LofiPatch = struct {
 
         // --- 前景 pattern + StepSeq runtime ---
         const def = PatternCommand.default();
-        resetStepSeqRuntime(&self.kick_seq, .{ .on = def.kick.on });
-        resetStepSeqRuntime(&self.hat_seq, .{ .on = def.hat.on });
-        resetStepSeqRuntime(&self.clap_seq, .{ .on = def.clap.on });
-        resetStepSeqRuntime(&self.bass_seq, .{
+        resetStepSeqRuntime(self.kick_seq, .{ .on = def.kick.on });
+        resetStepSeqRuntime(self.hat_seq, .{ .on = def.hat.on });
+        resetStepSeqRuntime(self.clap_seq, .{ .on = def.clap.on });
+        resetStepSeqRuntime(self.bass_seq, .{
             .on = def.bass.on,
             .accent = def.bass.accent,
             .slide = def.bass.slide,
@@ -1043,10 +1078,10 @@ pub const LofiPatch = struct {
             return;
         }
         switch (pick) {
-            0 => self.mutateDrumLane(&self.kick_seq, KICK_BAND),
-            1 => self.mutateDrumLane(&self.hat_seq, HAT_BAND),
-            2 => self.mutateDrumLane(&self.clap_seq, CLAP_BAND),
-            else => self.mutateBassLane(&self.bass_seq),
+            0 => self.mutateDrumLane(self.kick_seq, KICK_BAND),
+            1 => self.mutateDrumLane(self.hat_seq, HAT_BAND),
+            2 => self.mutateDrumLane(self.clap_seq, CLAP_BAND),
+            else => self.mutateBassLane(self.bass_seq),
         }
     }
 
@@ -1185,6 +1220,28 @@ test "LofiPatch: deterministic across bars with fixed chunking (per-bar mutation
     const crc_a = try renderCrcChunked(testing.allocator, 48000, 4800, 48000 * 10);
     const crc_b = try renderCrcChunked(testing.allocator, 48000, 4800, 48000 * 10);
     try testing.expectEqual(crc_a, crc_b);
+}
+
+test "LofiPatch: RT render is zero-allocation (FailingAllocator)" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    patch.graph.allocator = failing.allocator();
+    defer patch.graph.allocator = testing.allocator; // destroy は構築時 allocator へ戻す
+
+    const chunk: u32 = 4096;
+    var buf: [chunk * 2]f32 = undefined;
+    var rendered: u64 = 0;
+    const target: u64 = 96_000;
+    while (rendered < target) : (rendered += chunk) {
+        patch.render(&buf, chunk, 2);
+        for (buf) |s| {
+            try testing.expect(std.math.isFinite(s));
+            try testing.expect(@abs(s) <= 1.0001);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
 }
 
 /// offline render → PCM16 WAV バイト列（chunk=4800・2ch。action render と同型）。
@@ -1761,10 +1818,10 @@ fn expectGenLayerEqual(a: *const LofiPatch, b: *const LofiPatch) !void {
     try testing.expectEqual(a.clock.samples_per_tick, b.clock.samples_per_tick);
     try testing.expectEqual(a.clock.cur_interval, b.clock.cur_interval);
 
-    try expectStepSeqGenEqual(&a.kick_seq, &b.kick_seq);
-    try expectStepSeqGenEqual(&a.hat_seq, &b.hat_seq);
-    try expectStepSeqGenEqual(&a.clap_seq, &b.clap_seq);
-    try expectStepSeqGenEqual(&a.bass_seq, &b.bass_seq);
+    try expectStepSeqGenEqual(a.kick_seq, b.kick_seq);
+    try expectStepSeqGenEqual(a.hat_seq, b.hat_seq);
+    try expectStepSeqGenEqual(a.clap_seq, b.clap_seq);
+    try expectStepSeqGenEqual(a.bass_seq, b.bass_seq);
 
     try testing.expectEqual(a.mut_noise.state, b.mut_noise.state);
     try testing.expectEqual(a.ambient_random.noise.state, b.ambient_random.noise.state);

@@ -1754,6 +1754,26 @@ pub fn build(b: *std.Build) void {
     const bench_modular_exe = b.addExecutable(.{ .name = "bench_modular", .root_module = bench_modular_root });
     const bench_modular_step = b.step("bench-modular", "Run DynGraph.processBlock micro-benchmark (ReleaseFast)");
     bench_modular_step.dependOn(&b.addRunArtifact(bench_modular_exe).step);
+
+    // bench-lofi（TASK-105.2）: LofiPatch.render の DynGraph 載せ替え前後を同一条件で比較。
+    // patch は pure-test root と同じく modular/synth/dsp のみを必要とする。
+    const bench_lofi_patch_mod = b.createModule(.{
+        .root_source_file = b.path("apps/modular/patch.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_lofi_patch_mod.addImport("modular", bench_modular_mod);
+    bench_lofi_patch_mod.addImport("synth", bench_synth_mod);
+    bench_lofi_patch_mod.addImport("dsp", bench_dsp_mod);
+    const bench_lofi_root = b.createModule(.{
+        .root_source_file = b.path("bench/lofi.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_lofi_root.addImport("patch", bench_lofi_patch_mod);
+    const bench_lofi_exe = b.addExecutable(.{ .name = "bench_lofi", .root_module = bench_lofi_root });
+    const bench_lofi_step = b.step("bench-lofi", "Run LofiPatch.render micro-benchmark (ReleaseFast)");
+    bench_lofi_step.dependOn(&b.addRunArtifact(bench_lofi_exe).step);
 }
 
 // ============================================================
