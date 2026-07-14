@@ -22,6 +22,7 @@
 //! - `UndoRef`: app 内部の逆適用データへの opaque handle。framework は中身非解釈。
 
 const std = @import("std");
+const command_types = @import("command_types");
 
 /// action name の inline 所有バイト数上限（既存 action 名は最長 20B 弱。余裕を含む）。
 pub const MAX_CMD_NAME = 64;
@@ -1736,4 +1737,144 @@ test "22: wire_session は local 記録を抑止し remote_commit は記録す�
     exec.setWireSession(false);
     const after = try exec.executeAction("local2", "", .{ .actor = .local_user }, &buf);
     try testing.expectEqual(@as(u64, 2), after.seq.?);
+}
+
+// ============================================================================
+// App.dispatchCommand adapter (TASK-97.1)
+// ============================================================================
+
+pub const RouteFn = *const fn (name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8;
+pub const NetsyncStateFn = *const fn (ctx: *anyopaque) bool;
+
+/// app が所有する command table 1 行。ID は stable、action name は Executor/router の lookup 名。
+pub const AppCommandBinding = struct {
+    id: command_types.CommandId,
+    action: []const u8,
+    args: []const u8 = "",
+};
+
+pub const AppDispatchResult = struct {
+    output: []const u8,
+    seq: ?u64,
+    routed: bool,
+};
+
+/// app が所有する Executor を menu command の共通入口へ接続する adapter。
+/// NetworkPolicy の意味は action registry/router に委譲し、この層では解釈しない。
+pub const App = struct {
+    executor: *Executor,
+    bindings: []const AppCommandBinding,
+    netsync_ctx: *anyopaque = undefined,
+    is_netsync: NetsyncStateFn,
+    route: RouteFn,
+
+    pub fn dispatchCommand(self: *App, id: command_types.CommandId, buf: []u8) anyerror!AppDispatchResult {
+        const binding = self.find(id) orelse return error.UnknownCommand;
+        if (self.is_netsync(self.netsync_ctx)) {
+            return .{
+                .output = try self.route(binding.action, binding.args, buf),
+                .seq = null,
+                .routed = true,
+            };
+        }
+        const result = try self.executor.executeAction(binding.action, binding.args, .{ .actor = .local_user }, buf);
+        return .{ .output = result.output, .seq = result.seq, .routed = false };
+    }
+
+    fn find(self: *const App, id: command_types.CommandId) ?AppCommandBinding {
+        for (self.bindings) |binding| {
+            if (binding.id == id) return binding;
+        }
+        return null;
+    }
+};
+
+const AppAdapterFakeState = struct {
+    netsync: bool = false,
+    dispatch_count: u32 = 0,
+};
+
+fn appAdapterFakeIsNetsync(ctx: *anyopaque) bool {
+    return @as(*AppAdapterFakeState, @ptrCast(@alignCast(ctx))).netsync;
+}
+
+fn appAdapterFakeDispatch(ctx: *anyopaque, name: []const u8, _: []const u8, buf: []u8) anyerror![]const u8 {
+    const state = @as(*AppAdapterFakeState, @ptrCast(@alignCast(ctx)));
+    state.dispatch_count += 1;
+    const msg = if (std.mem.eql(u8, name, "local")) "solo" else "unexpected";
+    @memcpy(buf[0..msg.len], msg);
+    return buf[0..msg.len];
+}
+
+fn appAdapterFakeRoute(name: []const u8, _: []const u8, buf: []u8) anyerror![]const u8 {
+    // fake router は NetworkPolicy の結果だけを表現する。実際の解釈は router 側の責務。
+    if (std.mem.eql(u8, name, "reject")) return error.RejectedWhileSynced;
+    if (std.mem.eql(u8, name, "undo_own")) {
+        @memcpy(buf[0..4], "undo");
+        return buf[0..4];
+    }
+    @memcpy(buf[0..5], "relay");
+    return buf[0..5];
+}
+
+test "App.dispatchCommand: solo は app 所有 Executor を通り、記録される" {
+    var state: AppAdapterFakeState = .{};
+    var log = CommandLog{};
+    var executor = Executor.init(.{ .ctx = @ptrCast(&state), .run = appAdapterFakeDispatch });
+    executor.log = &log;
+    const bindings = [_]AppCommandBinding{.{ .id = 10, .action = "local" }};
+    var app = App{
+        .executor = &executor,
+        .bindings = &bindings,
+        .netsync_ctx = @ptrCast(&state),
+        .is_netsync = appAdapterFakeIsNetsync,
+        .route = appAdapterFakeRoute,
+    };
+    var buf: [16]u8 = undefined;
+    const result = try app.dispatchCommand(10, &buf);
+    try testing.expect(!result.routed);
+    try testing.expectEqual(@as(u64, 1), result.seq.?);
+    try testing.expectEqualStrings("solo", result.output);
+    try testing.expectEqual(@as(u32, 1), state.dispatch_count);
+    try testing.expectEqual(@as(u32, 1), log.filled);
+}
+
+test "App.dispatchCommand: netsync は relay/reject/undo_own を router に委譲する" {
+    var state: AppAdapterFakeState = .{ .netsync = true };
+    var executor = Executor.init(.{ .ctx = @ptrCast(&state), .run = appAdapterFakeDispatch });
+    const bindings = [_]AppCommandBinding{
+        .{ .id = 1, .action = "relay" },
+        .{ .id = 2, .action = "reject" },
+        .{ .id = 3, .action = "undo_own" },
+    };
+    var app = App{
+        .executor = &executor,
+        .bindings = &bindings,
+        .netsync_ctx = @ptrCast(&state),
+        .is_netsync = appAdapterFakeIsNetsync,
+        .route = appAdapterFakeRoute,
+    };
+    var buf: [16]u8 = undefined;
+    const relay = try app.dispatchCommand(1, &buf);
+    try testing.expect(relay.routed);
+    try testing.expectEqualStrings("relay", relay.output);
+    try testing.expectError(error.RejectedWhileSynced, app.dispatchCommand(2, &buf));
+    const undo = try app.dispatchCommand(3, &buf);
+    try testing.expectEqualStrings("undo", undo.output);
+    try testing.expectEqual(@as(u32, 0), state.dispatch_count);
+}
+
+test "App.dispatchCommand: 未登録 ID は Executor/router に届かない" {
+    var state: AppAdapterFakeState = .{};
+    var executor = Executor.init(.{ .ctx = @ptrCast(&state), .run = appAdapterFakeDispatch });
+    const bindings = [_]AppCommandBinding{.{ .id = 1, .action = "local" }};
+    var app = App{
+        .executor = &executor,
+        .bindings = &bindings,
+        .netsync_ctx = @ptrCast(&state),
+        .is_netsync = appAdapterFakeIsNetsync,
+        .route = appAdapterFakeRoute,
+    };
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.UnknownCommand, app.dispatchCommand(99, &buf));
 }

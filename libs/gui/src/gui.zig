@@ -74,6 +74,13 @@ pub const ScrollAreaOpts = @import("widgets.zig").ScrollAreaOpts;
 // 16-step grid（純幾何/描画 + Flex row widget。TASK-105.1）。
 pub const stepgrid = @import("context.zig").stepgrid;
 
+// メニュー定義は core の type-only module を直接参照する。gui は Command を実行せず、
+// platform facade と同じ定義を UI 側から見せるだけである（ADR-007 R2）。
+pub const Command = @import("command_types").Command;
+pub const CommandId = @import("command_types").CommandId;
+pub const CommandKind = @import("command_types").CommandKind;
+pub const ExecutionPolicy = @import("command_types").ExecutionPolicy;
+pub const Shortcut = @import("command_types").Shortcut;
 // ポップアップ/コンテキストメニュー（TASK-79.1）。任意座標にメニューを表示し、
 // 項目クリックで選択を返す汎用 primitive。使い方は popup.zig の doc comment 参照。
 // Context メソッド（ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /

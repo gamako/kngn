@@ -1431,6 +1431,7 @@ pub fn main(init: std.process.Init) !void {
                 .char_input => {},
                 .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 app 未消費（cross-cutting Event 追加）
                 .composition_changed => {}, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
+                .menu_command => {}, // TASK-97.1: 97.2 の App.dispatchCommand 統合前は未消費
                 .mouse_move => |m| {
                     app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                     onMouseMove(&app);

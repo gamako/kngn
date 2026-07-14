@@ -201,6 +201,7 @@ pub fn main() !void {
             .char_input => {},
             .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 example 未消費（cross-cutting Event 追加）
             .composition_changed => {}, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
+            .menu_command => {}, // TASK-97.1: app の共通 dispatch 入口で消費
             .mouse_move => |m| {
                 const canvas = windowToCanvas(.{ .x = m.x, .y = m.y });
                 if (m.buttons.left) {

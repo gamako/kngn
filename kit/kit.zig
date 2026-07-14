@@ -23,6 +23,7 @@
 pub const platform = @import("platform");
 pub const control = @import("harness");
 pub const types = @import("platform_types");
+pub const command_types = @import("command_types");
 pub const audio = @import("audio");
 pub const gui = @import("gui");
 pub const png = @import("png");

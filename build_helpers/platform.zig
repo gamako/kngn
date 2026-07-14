@@ -103,6 +103,8 @@ pub fn createPlatformModule(
     /// 共有型 module（core/platform_types.zig）。platform.zig + 各 backend が `@import("platform_types")` で使う。
     /// harness module と **同一インスタンス** を渡すこと（Event/EventStats の型同一性のため。TASK-32.2）。
     types_mod: *std.Build.Module,
+    /// Command/menu の type-only module（core/command_types.zig）。facade と backend の共通契約。
+    command_types_mod: *std.Build.Module,
     /// harness module（core/control/harness.zig）。platform.zig(facade) が `@import("harness")` で使う。
     /// audio module と **同一インスタンス** を渡すことで module-level state（audio tap 等）を共有する (TASK-32.2)。
     harness_mod: *std.Build.Module,
@@ -127,6 +129,7 @@ pub fn createPlatformModule(
     if (!is_wasm) mod.addIncludePath(platform_include_root);
     // platform.zig + backends は `@import("platform_types")`、facade は `@import("harness")` を使う。
     mod.addImport("platform_types", types_mod);
+    mod.addImport("command_types", command_types_mod);
     mod.addImport("harness", harness_mod);
 
     const opts = b.addOptions();
@@ -362,6 +365,10 @@ pub const StandaloneSpec = struct {
 
 /// standalone の kit 配線に必要な安定 lib module 群（ADR-007 kit 初期セットのうち caller 供給分）。
 pub const KitLibs = struct {
+    /// platform facade と command_types が共有する core type-only module。
+    platform_types: *std.Build.Module,
+    /// kit.command_types と libs/gui が共有する core type-only module。
+    command_types: *std.Build.Module,
     gui: *std.Build.Module,
     png: *std.Build.Module,
     font: *std.Build.Module,
@@ -455,13 +462,24 @@ pub fn buildStandalone(
         .cwd_relative => |s| std.fs.path.dirname(s) orelse ".",
         else => @panic("buildStandalone: platform_source は .cwd_relative 前提です（types/harness パス導出のため）"),
     };
-    const types_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/platform_types.zig", .{core_dir}) } });
+    const types_mod: *std.Build.Module = if (spec.kit_libs) |kl|
+        kl.platform_types
+    else
+        b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/platform_types.zig", .{core_dir}) } });
+    const command_types_mod: *std.Build.Module = if (spec.kit_libs) |kl|
+        kl.command_types
+    else blk: {
+        const m = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/command_types.zig", .{core_dir}) } });
+        m.addImport("platform_types", types_mod);
+        break :blk m;
+    };
     const harness_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = b.fmt("{s}/control/harness.zig", .{core_dir}) },
         .link_libc = true,
     });
     harness_mod.addImport("png", png_mod);
     harness_mod.addImport("platform_types", types_mod);
+    harness_mod.addImport("command_types", command_types_mod);
     // harness は synthetic capture source（TASK-49.5）を `@import("capture_synthetic")` する。
     // capture_synthetic は capture_types にのみ依存（camera/audio facade へは配線しない）。
     // これを wire しないと harness を使う全 example の standalone build が壊れる（TASK-22.1 で判明）。
@@ -497,7 +515,17 @@ pub fn buildStandalone(
     } else null;
 
     for (implementedBackends(target_os)) |be| {
-        const platform_mod = createPlatformModule(b, target, spec.platform_source, spec.platform_include, be, types_mod, harness_mod, spec.link_gamepad);
+        const platform_mod = createPlatformModule(
+            b,
+            target,
+            spec.platform_source,
+            spec.platform_include,
+            be,
+            types_mod,
+            command_types_mod,
+            harness_mod,
+            spec.link_gamepad,
+        );
 
         const root = b.createModule(.{
             .root_source_file = spec.main_source,
@@ -517,6 +545,7 @@ pub fn buildStandalone(
             kit_mod.addImport("platform", platform_mod);
             kit_mod.addImport("harness", harness_mod);
             kit_mod.addImport("platform_types", types_mod);
+            kit_mod.addImport("command_types", command_types_mod);
             kit_mod.addImport("audio", audio_mod.?);
             kit_mod.addImport("gui", kl.gui);
             kit_mod.addImport("png", kl.png);

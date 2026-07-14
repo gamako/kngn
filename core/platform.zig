@@ -36,6 +36,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("platform_types");
+const command_types = @import("command_types");
 // harness は共有 module（src/audio.zig facade も同一インスタンスを import し module-level state を共有する）。
 // このため source-relative `@import("harness.zig")` ではなく名前付き module import を使う (TASK-32.2)。
 const harness = @import("harness");
@@ -112,6 +113,11 @@ pub const MouseEvent = types.MouseEvent;
 pub const ScrollEvent = types.ScrollEvent;
 pub const Event = types.Event;
 pub const EventStats = types.EventStats;
+pub const CommandId = command_types.CommandId;
+pub const Command = command_types.Command;
+pub const CommandKind = command_types.CommandKind;
+pub const ExecutionPolicy = command_types.ExecutionPolicy;
+pub const Shortcut = command_types.Shortcut;
 pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
@@ -299,6 +305,52 @@ pub const Window = struct {
         return self.inner.getGamepadState(index);
     }
 
+    // ========================================================================
+    // native menu (TASK-97.1)
+    // ========================================================================
+
+    /// この backend が native menu API を提供するかを返す。
+    ///
+    /// backend は module-level の任意 decl で実装する。未実装 backend と headless は
+    /// 常に false。Command の slice は register/update 呼び出し中だけ有効でよく、
+    /// backend が必要な分を copy する。
+    pub fn nativeMenuAvailable(self: Window) bool {
+        if (self.headless) return false;
+        if (comptime @hasDecl(backend, "nativeMenuAvailable")) {
+            return backend.nativeMenuAvailable(self.inner);
+        }
+        return false;
+    }
+
+    /// native menu を登録する。未実装 backend / headless では no-op。
+    /// macOS のように app 単位のメニューバーを持つ backend では、window は契約上
+    /// 無視して最後の登録が全体を差し替える。Windows 等は window 単位で扱う。
+    pub fn registerMenu(self: Window, commands: []const Command) void {
+        if (self.headless) return;
+        if (comptime @hasDecl(backend, "registerMenu")) {
+            backend.registerMenu(self.inner, commands);
+        }
+    }
+
+    /// 登録済み native menu の enabled/checked 等を更新する。未実装 backend / headless は no-op。
+    pub fn updateMenu(self: Window, commands: []const Command) void {
+        if (self.headless) return;
+        if (comptime @hasDecl(backend, "updateMenu")) {
+            backend.updateMenu(self.inner, commands);
+        }
+    }
+
+    /// 登録済み native menu を破棄する。未実装 backend / headless は no-op。
+    pub fn destroyMenu(self: Window) void {
+        if (self.headless) return;
+        if (comptime @hasDecl(backend, "destroyMenu")) {
+            backend.destroyMenu(self.inner);
+        }
+    }
+
+    /// 呼び出し側の命名差を避けるための query alias。意味と契約は nativeMenuAvailable と同じ。
+    pub const supportsNativeMenus = nativeMenuAvailable;
+
     /// IME composition preedit 本文を buf へ書く（TASK-79.6.1）。
     /// headless / 非対応 backend は常に空（text 0 長・revision/cursor 0）。
     ///
@@ -441,6 +493,8 @@ pub const routeAction = harness.action_registry.routeLocalAction;
 // （command は std のみなので層規約上の追加依存は生じない）。
 // ============================================================================
 pub const command = harness.command;
+/// app の `dispatchCommand(id)` を Executor/router へ接続する adapter 契約。
+pub const command_adapter = harness.command;
 
 /// Co-pilot の共有 executor を設定する（copilot.setSharedExecutor への委譲。TASK-62.5.3）。
 /// 設定時、copilot transport の `action` は app 側 wrapper（executor 経由の記録を一元化）へ

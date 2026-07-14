@@ -26,6 +26,13 @@ pub fn build(b: *std.Build) void {
     const pixelops = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
     });
+    const platform_types = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
+    });
+    const command_types = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/command_types.zig" },
+    });
+    command_types.addImport("platform_types", platform_types);
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
@@ -36,6 +43,7 @@ pub fn build(b: *std.Build) void {
     });
     gui.addImport("font", font);
     gui.addImport("pixelops", pixelops);
+    gui.addImport("command_types", command_types);
 
     // .pix プロジェクト形式の versioned container（std のみ・依存なし）
     const serde = b.createModule(.{
@@ -72,7 +80,16 @@ pub fn build(b: *std.Build) void {
         .png_module = png,
         // serde は kit.recipe（TASK-62.5.8）と paint(document_io) の両方が使う。同一インスタンスを
         // 渡さないと同じ serde.zig が 2 module に属しコンパイルエラーになる（TASK-98）。
-        .kit_libs = .{ .gui = gui, .png = png, .font = font, .dsp = dsp, .synth = synth, .serde = serde },
+        .kit_libs = .{
+            .platform_types = platform_types,
+            .command_types = command_types,
+            .gui = gui,
+            .png = png,
+            .font = font,
+            .dsp = dsp,
+            .synth = synth,
+            .serde = serde,
+        },
         .extra = &.{
             .{ .name = "paint", .module = paint },
         },

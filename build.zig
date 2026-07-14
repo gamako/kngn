@@ -602,6 +602,7 @@ pub fn build(b: *std.Build) void {
     });
     harness_test_mod.addImport("png", shared_modules.png.mod); // harness が encodePNG/crc32 を使う
     harness_test_mod.addImport("platform_types", shared_modules.types.mod); // harness が Event/EventStats 等を使う
+    harness_test_mod.addImport("command_types", shared_modules.command_types.mod);
     harness_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod); // harness の `capture` コマンド/probe が使う（TASK-49.5）
     harness_test_mod.addImport("dsp", shared_modules.dsp.mod); // TASK-92: digest audio スペクトル解析（band/centroid/onset）
     const harness_test = b.addTest(.{ .root_module = harness_test_mod });
@@ -626,10 +627,35 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    command_test_mod.addImport("command_types", shared_modules.command_types.mod);
     const command_test = b.addTest(.{ .root_module = command_test_mod });
     const run_command_test = b.addRunArtifact(command_test);
     const test_command_step = b.step("test-command", "Run command model unit tests (types / executor / undo-redo / no-op recorder)");
     test_command_step.dependOn(&run_command_test.step);
+
+    // TASK-97.1: menu Command の type-only model と App.dispatchCommand adapter。
+    const command_types_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/command_types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    command_types_test_mod.addImport("platform_types", shared_modules.types.mod);
+    const command_types_test = b.addTest(.{ .root_module = command_types_test_mod });
+    const run_command_types_test = b.addRunArtifact(command_types_test);
+    const test_command_types_step = b.step("test-command-types", "Run menu Command type-only model tests");
+    test_command_types_step.dependOn(&run_command_types_test.step);
+
+    const platform_menu_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/platform_menu_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    platform_menu_test_mod.addImport("platform", shared_modules.platform.mod);
+    platform_menu_test_mod.addImport("command_types", shared_modules.command_types.mod);
+    const platform_menu_test = b.addTest(.{ .root_module = platform_menu_test_mod });
+    const run_platform_menu_test = b.addRunArtifact(platform_menu_test);
+    const test_platform_menu_step = b.step("test-platform-menu", "Run display-less platform menu facade tests");
+    test_platform_menu_step.dependOn(&run_platform_menu_test.step);
 
     // copilot transport 単体テスト（ConnState state machine / コマンド実行層 / registry OR ゲート / 排他。
     // socket・display 不要。TASK-62.5.2）。root=copilot.zig は harness.zig を import するため
@@ -643,6 +669,7 @@ pub fn build(b: *std.Build) void {
     });
     copilot_test_mod.addImport("png", shared_modules.png.mod);
     copilot_test_mod.addImport("platform_types", shared_modules.types.mod);
+    copilot_test_mod.addImport("command_types", shared_modules.command_types.mod);
     copilot_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod);
     const copilot_test = b.addTest(.{ .root_module = copilot_test_mod, .filters = &.{"copilot:"} });
     const run_copilot_test = b.addRunArtifact(copilot_test);
@@ -657,6 +684,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true, // getenv
     });
+    netsync_test_mod.addImport("command_types", shared_modules.command_types.mod);
     const netsync_test = b.addTest(.{ .root_module = netsync_test_mod, .filters = &.{"netsync:"} });
     const run_netsync_test = b.addRunArtifact(netsync_test);
     const test_netsync_step = b.step("test-netsync", "Run netsync transport unit tests (codec / HELLO / loopback queues)");
@@ -1346,6 +1374,7 @@ pub fn build(b: *std.Build) void {
     });
     gui_test_root.addImport("font", shared_modules.font.mod);
     gui_test_root.addImport("pixelops", shared_modules.pixelops.mod);
+    gui_test_root.addImport("command_types", shared_modules.command_types.mod);
     const gui_test = b.addTest(.{ .root_module = gui_test_root });
     const run_gui_test = b.addRunArtifact(gui_test);
     const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
@@ -1617,6 +1646,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_harness_step);
     test_step.dependOn(test_mcp_step);
     test_step.dependOn(test_command_step);
+    test_step.dependOn(test_command_types_step);
+    test_step.dependOn(test_platform_menu_step);
     test_step.dependOn(test_copilot_step);
     test_step.dependOn(test_netsync_step);
     test_step.dependOn(test_audio_null_step);
@@ -1805,6 +1836,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         b.path("platform"),
         backend,
         common.types.mod,
+        common.command_types.mod,
         common.harness.mod,
         false,
     ) };
@@ -1818,6 +1850,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         b.path("platform"),
         backend,
         common.types.mod,
+        common.command_types.mod,
         common.harness.mod,
         true,
     ) };
@@ -1836,6 +1869,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, platform_mod);
     link(kit, common.harness); // kit.control
     link(kit, common.types); // kit.types
+    link(kit, common.command_types); // kit.command_types
     link(kit, common.audio);
     link(kit, common.gui);
     link(kit, common.png);
@@ -1908,6 +1942,7 @@ const SharedModules = struct {
     png: TaggedModule,
     font: TaggedModule,
     gui: TaggedModule,
+    command_types: TaggedModule,
     audio: TaggedModule,
     synth: TaggedModule,
     modular: TaggedModule,
@@ -1985,6 +2020,15 @@ const SharedModules = struct {
         }) };
         link(platform_mod, types);
 
+        // メニュー/command の共有型。platform_types と同じく type-only で、libs/gui と
+        // platform facade が同一インスタンスを参照する。adapter は core 実行契約なので
+        // 別の通常 core module として facade にだけ配線する。
+        const command_types: TaggedModule = .{ .layer = .core, .name = "command_types", .type_only = true, .mod = b.createModule(.{
+            .root_source_file = b.path("core/command_types.zig"),
+        }) };
+        link(command_types, types);
+        link(platform_mod, command_types);
+
         // src/gamepad.zig: ゲームパッド入力ヘルパー（TASK-80.1。ADR-009）。platform_types のみに
         // 依存する headless lib（layer=.lib）。ADR-007 R2「libs が type-only core module を直接
         // 参照してよい唯一の形」の初適用（`link()` の `.lib => dep.layer==.core and dep.type_only` 分岐）。
@@ -2021,6 +2065,7 @@ const SharedModules = struct {
         }) };
         link(gui, font);
         link(gui, pixelops); // render.zig の drawImage SIMD（TASK-58）
+        link(gui, command_types);
 
         // objc_runtime (L1): Objective-C ランタイム最小 FFI ヘルパー（TASK-49.2）。camera_macos.zig
         // （camera module）と audio_macos.zig（audio module。マイク権限確認）の両方が使うため、
@@ -2058,6 +2103,8 @@ const SharedModules = struct {
                 .single_threaded = if (is_wasm) !wasm_shared else null,
             }),
         };
+        // command adapter は harness が保持する command module を facade が再 export する。
+        link(harness, command_types);
         if (!is_wasm) {
             linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");
         }
@@ -2163,6 +2210,7 @@ const SharedModules = struct {
             .png = png,
             .font = font,
             .gui = gui,
+            .command_types = command_types,
             .audio = audio,
             .synth = synth,
             .modular = modular,

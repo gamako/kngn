@@ -280,6 +280,9 @@ pub const Event = union(enum) {
     /// IME composition 状態変化通知（TASK-79.6.1）。本文は snapshot API で読む。
     /// **末尾追加** = exhaustive switch 破壊範囲を TASK-22 と同型で一括対応。
     composition_changed: CompositionEvent,
+    /// ネイティブ/GUI メニューから app の command table へ配送する ID。
+    /// **必ず末尾に追加**し、backend の C ABI 変換は 97.3/97.4 で行う。
+    menu_command: u32,
 };
 
 /// イベントキューの観測カウンタ (累積値の snapshot)
@@ -537,4 +540,12 @@ test "GamepadInfo.name: name_len が指す範囲だけを返す" {
     @memcpy(info.name_buf[0..src.len], src);
     info.name_len = src.len;
     try std.testing.expectEqualStrings("Pad", info.name());
+}
+
+test "Event: menu_command は数値 ID をそのまま配送できる" {
+    const ev: Event = .{ .menu_command = 0x1234 };
+    switch (ev) {
+        .menu_command => |id| try std.testing.expectEqual(@as(u32, 0x1234), id),
+        else => return error.UnexpectedEvent,
+    }
 }
