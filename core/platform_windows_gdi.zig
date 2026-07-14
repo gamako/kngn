@@ -99,6 +99,27 @@ pub const Window = struct {
         return .{ .core = core };
     }
 
+    /// 透過 / borderless オプション付き作成（TASK-104.1）。facade が @hasDecl で検出して使う。
+    /// present は core.transparent のとき UpdateLayeredWindow 経路（下記 present 参照）。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: @import("platform_types").WindowOptions) Error!Window {
+        const core = try common.Core.createWithOptions(width, height, title, opts);
+        return .{ .core = core };
+    }
+
+    /// 対話的ドラッグ / 最前面 / クリック透過 / 終了メニュー（TASK-104.1）。Core へ委譲。
+    pub fn beginDrag(self: Window) void {
+        self.core.beginDrag();
+    }
+    pub fn setAlwaysOnTop(self: Window, on: bool) void {
+        self.core.setAlwaysOnTop(on);
+    }
+    pub fn setClickThrough(self: Window, on: bool) void {
+        self.core.setClickThrough(on);
+    }
+    pub fn showQuitMenu(self: Window) void {
+        self.core.showQuitMenu();
+    }
+
     pub fn destroy(self: Window) void {
         self.core.destroy();
     }
@@ -127,6 +148,7 @@ pub const Window = struct {
 
     pub fn present(self: Window) void {
         const core = self.core;
+        if (core.transparent) return core.presentLayered(); // TASK-104.1: 透過は UpdateLayeredWindow 経路
         const hdc = GetDC(core.hwnd) orelse return;
         defer _ = ReleaseDC(core.hwnd, hdc);
         const w: c_int = @intCast(core.width);

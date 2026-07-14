@@ -35,6 +35,54 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
 // toggleFullScreen:（緑ボタンと同じネイティブフルスクリーン。既にフルスクリーンなら no-op）。
 void platform_enter_fullscreen(PlatformWindow* window);
 
+// ========================================
+// 透過 / borderless ウィンドウ + 対話的ドラッグ移動 (TASK-104)
+// ========================================
+//
+// デスクトップマスコット等の「背後が透けて枠の無い浮遊ウィンドウ」を作るための拡張。
+// 透過は fb の alpha を honor する（透過時のみ premultiplied alpha 前提。不透明時は従来どおり
+// alpha 無視）。ドラッグ移動は OS の対話的ウィンドウ移動へ委譲する（Wayland のように
+// クライアントが絶対位置を設定できない環境でも成立させるため。macOS は
+// performWindowDragWithEvent:）。詳細設計は docs/plans/transparent-window-plan.md。
+
+// ウィンドウ生成オプション（bit flags）。opts==NULL は既定（不透明・タイトル付き）と同義。
+typedef struct PlatformWindowOptions {
+    uint32_t flags;     // PLATFORM_WINDOW_* の OR
+    uint32_t reserved;  // 将来拡張用（0 埋め）
+} PlatformWindowOptions;
+
+#define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // fb の alpha を honor（背後が透ける）
+#define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // タイトルバー・枠なし（borderless）
+
+// options 付きでウィンドウを作成する（既存 platform_create_window の拡張版）。
+// opts==NULL は既定動作（platform_create_window と同義）。unknown flags / reserved!=0 は
+// NULL を返す（silent 無視しない。facade 側で error.Unsupported に変換される）。
+PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
+                                          FrameCallback callback, void* userdata,
+                                          const PlatformWindowOptions* opts);
+
+// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（実移動は OS 側）。
+// アプリは「掴む領域で mouse_down を受けたら」これを呼ぶ。macOS は保持した直近の左ボタン
+// mouse-down NSEvent を performWindowDragWithEvent: に渡し、呼び出し時に保持 event をクリアする
+// （one-shot。保持 event が無ければ no-op）。呼び出し頻度: mouse_down 起点のイベント時のみ。
+void platform_begin_window_drag(PlatformWindow* window);
+
+// 常に最前面（always-on-top）を設定する。macOS は NSWindow.level を切替える。イベント時のみ。
+void platform_set_always_on_top(PlatformWindow* window, bool on);
+
+// クリック透過（per-pixel）を設定する。ON のとき、直近表示フレームの alpha==0 の画素上の
+// クリックは背後のアプリへ抜け、alpha>0（不透明な絵の本体）上のクリックだけが window に届く。
+// マスコット本体をドラッグしつつ透明な余白はデスクトップへ抜けさせるための機能。イベント時のみ。
+void platform_set_click_through(PlatformWindow* window, bool on);
+
+// Dock アイコン / メニューバーの表示を切替える（アプリ全体。window 非依存）。
+// visible=false で NSApplicationActivationPolicyAccessory（常駐アプリらしくする）。
+void platform_set_dock_visible(bool visible);
+
+// 終了メニューをポップアップする（右クリック等から。1 項目「終了」の native メニュー）。
+// 「終了」が選ばれたら window のイベントキューに QUIT を積む（モーダル。選択なしは何もしない）。
+void platform_show_quit_menu(PlatformWindow* window);
+
 // メインイベントループを開始（ブロッキング）
 // ウィンドウが閉じられるまで戻らない
 void platform_run(PlatformWindow* window);

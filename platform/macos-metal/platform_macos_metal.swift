@@ -480,6 +480,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var slotBuffers: [UnsafeMutablePointer<UInt32>] = []
     private var slotTextures: [MTLTexture?] = []
     private var currentSlotIndex = 0
+    private var lastSubmittedSlot = -1  // TASK-104: click-through hitTest が読む直近表示済み slot（-1=未 submit）
 
     // inflight 上限 = slotCount - 1（= 2）。display sync(fifo) の pacing を司る。
     // present のたびに wait()、command buffer の completion handler で signal()。
@@ -576,6 +577,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             if submitFrame(view: view, slotIndex: currentSlotIndex) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
+            // TASK-104: callback 経路でも click-through を更新（objc/swift 対称。無効時は即 return）
+            (view as? MetalFramebufferView)?.refreshClickThrough()
         }
         // 上記いずれでもない（callback=nil かつ manual でない起動）は何もしない。
         // manual mode は isPaused=true なので display-link 由来の空 draw は来ない。
@@ -611,6 +614,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let region = MTLRegionMake2D(0, 0, width, height)
         let bytesPerRow = width * MemoryLayout<UInt32>.size
         texture.replace(region: region, mipmapLevel: 0, withBytes: slotBuffers[slotIndex], bytesPerRow: bytesPerRow)
+        lastSubmittedSlot = slotIndex // TASK-104: click-through hitTest 用（直近表示中の CPU buffer）
 
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setFragmentTexture(texture, index: 0)
@@ -663,6 +667,15 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
     func getCurrentBuffer() -> UnsafeMutablePointer<UInt32> {
         return slotBuffers[currentSlotIndex]
+    }
+
+    // TASK-104: click-through 用に直近表示中フレームの alpha を読む（best-effort）。
+    // 未 submit（-1）は不透明扱い（255）で抜けさせない。範囲外は 0（抜けさせる）。
+    func sampleAlpha(x: Int, y: Int) -> UInt8 {
+        if x < 0 || y < 0 || x >= width || y >= height { return 0 }
+        if lastSubmittedSlot < 0 { return 255 } // 初回 present 前は不透明扱い（ゼロ buffer を読まない）
+        let pixel = slotBuffers[lastSubmittedSlot][y * width + x]
+        return UInt8((pixel >> 24) & 0xFF)
     }
 
     // 手動描画の present。drawable を直接触らず、MTKView の draw サイクルを起動するだけ。
@@ -723,6 +736,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         width = w
         height = h
         currentSlotIndex = 0
+        lastSubmittedSlot = -1 // TASK-104: 新規ゼロ buffer を「表示済み」と誤読しないよう次 submit まで不透明扱い
         return true
     }
 }
@@ -773,6 +787,12 @@ class MetalFramebufferView: MTKView, NSTextInputClient {
     private var compositionLen: UInt32 = 0
     private var compositionRevision: UInt32 = 0
     private var compositionCursor: UInt32 = 0
+
+    // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
+    private var transparentMode: Bool = false
+    private var clickThrough: Bool = false
+    private var clickThroughState: Bool = false // 直近設定した ignoresMouseEvents 値（変化時のみ再設定）
+    private var lastMouseDownEvent: NSEvent?
 
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
@@ -1142,10 +1162,59 @@ class MetalFramebufferView: MTKView, NSTextInputClient {
         handle.event_queue.push(ev)
     }
 
+    // TASK-104: 透過モード（isOpaque）/ クリック透過（per-pixel hitTest）/ beginDrag 用 event。
+    override var isOpaque: Bool {
+        return !transparentMode
+    }
+    // TASK-104: クリック透過（per-pixel）。present 毎に現在のカーソル位置の alpha を見て
+    // `window.ignoresMouseEvents` をトグルする（NSView.hitTest では背後の別アプリへ抜けないため）。
+    // alpha は renderer が持つ直近表示 slot から読む。ホットパス宣言: present 毎だが 1 画素サンプルのみ。
+    func refreshClickThrough() {
+        guard clickThrough, let win = window, let r = metalRenderer else { return }
+        let screenPt = NSEvent.mouseLocation
+        let winPt = win.convertPoint(fromScreen: screenPt)
+        let local = convert(winPt, from: nil) // window → view（非 flipped = 左下原点）
+        let b = bounds
+        let w = r.getWidth()
+        let h = r.getHeight()
+        var passThrough = true // カーソルが window 外/未確定なら抜けさせる
+        if b.width > 0 && b.height > 0 &&
+           local.x >= 0 && local.x < b.width && local.y >= 0 && local.y < b.height {
+            var px = Int(local.x / b.width * CGFloat(w))
+            var py = Int((1.0 - local.y / b.height) * CGFloat(h)) // top-left 原点へ
+            if px >= w { px = w - 1 } // 右端/下端の丸め込み clamp（下端1px落ち防止）
+            if py >= h { py = h - 1 }
+            if px < 0 { px = 0 }
+            if py < 0 { py = 0 }
+            passThrough = (r.sampleAlpha(x: px, y: py) == 0)
+        }
+        if passThrough != clickThroughState { // 値が変わったときだけ WindowServer 状態を書く
+            win.ignoresMouseEvents = passThrough
+            clickThroughState = passThrough
+        }
+    }
+    func setTransparentMode(_ on: Bool) {
+        transparentMode = on
+    }
+    func setClickThrough(_ on: Bool) {
+        clickThrough = on
+        if !on {
+            window?.ignoresMouseEvents = false // 無効化時は受け取りへ戻す
+            clickThroughState = false
+        }
+    }
+    func takeLastMouseDownEvent() -> NSEvent? {
+        let ev = lastMouseDownEvent
+        lastMouseDownEvent = nil
+        return ev
+    }
+
     override func mouseDown(with event: NSEvent) {
+        lastMouseDownEvent = event // TASK-104: beginDrag 用に保持
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
     }
     override func mouseUp(with event: NSEvent) {
+        lastMouseDownEvent = nil // TASK-104: up で stale 破棄
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
     }
     override func mouseDragged(with event: NSEvent) {
@@ -1184,8 +1253,33 @@ func platform_init() -> Bool {
     return true
 }
 
+// TASK-104: borderless ウィンドウは既定では key/main になれない。subclass で有効化する。
+class MascotWindow: NSWindow {
+    override var canBecomeKey: Bool { return true }
+    override var canBecomeMain: Bool { return true }
+}
+
 @_cdecl("platform_create_window")
 func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false)
+}
+
+// TASK-104: options 付きウィンドウ作成。opts==NULL は従来動作。unknown flags / reserved!=0 は NULL。
+@_cdecl("platform_create_window_ex")
+func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, opts: UnsafePointer<PlatformWindowOptions>?) -> UnsafeMutableRawPointer? {
+    var transparent = false
+    var borderless = false
+    if let opts = opts {
+        let flags = opts.pointee.flags
+        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS)
+        if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
+        transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
+        borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
+    }
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless)
+}
+
+private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
@@ -1193,20 +1287,30 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     let windowHeight = CGFloat(height)
     let frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
 
-    let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable] // TASK-23: 自由リサイズ
+    let styleMask: NSWindow.StyleMask = borderless
+        ? [.borderless]                                     // TASK-104: 枠なし
+        : [.titled, .closable, .miniaturizable, .resizable] // TASK-23: 自由リサイズ
 
-    let window = NSWindow(
-        contentRect: frame,
-        styleMask: styleMask,
-        backing: .buffered,
-        defer: false
-    )
+    let window: NSWindow = borderless
+        ? MascotWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
+        : NSWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
 
     // タイトルを設定
     window.title = String(cString: title)
 
     // hover の mouseMoved を受け取るために必須 (TASK-21.1)
     window.acceptsMouseMovedEvents = true
+
+    // TASK-104: 透過ウィンドウ設定（背後が透ける）
+    if transparent {
+        window.isOpaque = false
+        window.backgroundColor = NSColor.clear
+    }
+    // borderless は透過有無に関わらず矩形影を消し、ドラッグ移動可能にする（設計契約）
+    if borderless {
+        window.hasShadow = false
+        window.isMovable = true
+    }
 
     // Metal用ビューを作成
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
@@ -1217,6 +1321,12 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     let metalView = MetalFramebufferView(frame: frame, device: metalDevice)
     metalView.framebufferOnly = false
     metalView.enableSetNeedsDisplay = false
+    // TASK-104: Metal の透過（drawable の alpha を保持し CAMetalLayer で背後合成）
+    if transparent {
+        metalView.setTransparentMode(true) // isOpaque override が false を返す
+        metalView.layer?.isOpaque = false
+        metalView.clearColor = MTLClearColorMake(0, 0, 0, 0) // 透明クリア
+    }
     // 手動描画経路（callback=nil。Zig facade の lockFramebuffer→present 経路）では display-link を止め、
     // present() が view.draw() で 1 フレームずつ駆動する。callback 経路（objc/swift 対称・未使用）は
     // 従来どおり display-link 駆動のため isPaused=false にする。
@@ -1267,6 +1377,60 @@ func platform_enter_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Void
     if !window.styleMask.contains(.fullScreen) {
         window.toggleFullScreen(nil)
     }
+}
+
+// TASK-104: 透過 / borderless ウィンドウ + ドラッグ移動 の C ABI 実装
+@_cdecl("platform_begin_window_drag")
+func platform_begin_window_drag(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    guard let ev = handle.metalView.takeLastMouseDownEvent() else { return }
+    handle.window.performDrag(with: ev)
+}
+
+@_cdecl("platform_set_always_on_top")
+func platform_set_always_on_top(platformWindow: UnsafeMutableRawPointer?, on: Bool) -> Void {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.window.level = on ? .statusBar : .normal
+}
+
+@_cdecl("platform_set_click_through")
+func platform_set_click_through(platformWindow: UnsafeMutableRawPointer?, on: Bool) -> Void {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.metalView.setClickThrough(on)
+}
+
+@_cdecl("platform_set_dock_visible")
+func platform_set_dock_visible(visible: Bool) -> Void {
+    NSApplication.shared.setActivationPolicy(visible ? .regular : .accessory)
+}
+
+@_cdecl("platform_show_quit_menu")
+func platform_show_quit_menu(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let target = QuitMenuTarget()
+    let menu = NSMenu(title: "Mascot")
+    let item = NSMenuItem(title: "終了", action: #selector(QuitMenuTarget.onQuit(_:)), keyEquivalent: "")
+    item.target = target
+    menu.addItem(item)
+    let screenPt = NSEvent.mouseLocation
+    let winPt = handle.window.convertPoint(fromScreen: screenPt)
+    let viewPt = handle.metalView.convert(winPt, from: nil)
+    menu.popUp(positioning: nil, at: viewPt, in: handle.metalView)
+    if target.quitChosen {
+        var ev = PlatformEvent()
+        ev.type = PLATFORM_EVENT_QUIT
+        handle.event_queue.push(ev)
+    }
+}
+
+// 終了メニュー用ターゲット。
+class QuitMenuTarget: NSObject {
+    var quitChosen = false
+    @objc func onQuit(_ sender: Any?) { quitChosen = true }
 }
 
 @_cdecl("platform_run")
@@ -1425,6 +1589,9 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
 
     // 手動で描画
     renderer.presentManual(view: handle.metalView)
+
+    // TASK-104: クリック透過のカーソル位置判定を更新（clickThrough 無効時は即 return）
+    handle.metalView.refreshClickThrough()
 }
 
 // カーソル形状を設定する (TASK-75.1)。未知値は PLATFORM_CURSOR_DEFAULT にフォールバックする。

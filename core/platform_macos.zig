@@ -50,6 +50,12 @@ pub fn getTime() f64 {
     return c.platform_get_time();
 }
 
+/// Dock アイコン / メニューバーの表示を切替える（TASK-104。アプリ全体・window 非依存）。
+/// visible=false で accessory（常駐アプリらしくする）。イベント/初期化時のみ。
+pub fn setDockVisible(visible: bool) void {
+    c.platform_set_dock_visible(visible);
+}
+
 // ============================================================================
 // C 値 → 共有型 への変換
 // ============================================================================
@@ -170,6 +176,46 @@ pub const Window = struct {
         const w = c.platform_create_window(1280, 720, title.ptr, null, null) orelse return error.WindowCreationFailed;
         c.platform_enter_fullscreen(w);
         return .{ .handle = w };
+    }
+
+    /// 透過 / borderless オプション付きでウィンドウを作成する（TASK-104）。facade の
+    /// Window.createWithOptions が `@hasDecl` でこれを検出して使う。unknown flags は
+    /// C 側が NULL を返す（→ WindowCreationFailed）。透過は premultiplied alpha 前提。
+    /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        var flags: u32 = 0;
+        if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
+        if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
+        var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0 };
+        const w = c.platform_create_window_ex(
+            @intCast(width),
+            @intCast(height),
+            title.ptr,
+            null,
+            null,
+            &copts,
+        ) orelse return error.WindowCreationFailed;
+        return .{ .handle = w };
+    }
+
+    /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。イベント時のみ。
+    pub fn beginDrag(self: Window) void {
+        c.platform_begin_window_drag(self.handle);
+    }
+
+    /// 常に最前面（always-on-top）を設定する（TASK-104）。イベント時のみ。
+    pub fn setAlwaysOnTop(self: Window, on: bool) void {
+        c.platform_set_always_on_top(self.handle, on);
+    }
+
+    /// クリック透過（per-pixel。透明画素上のクリックを背後へ抜けさせる）を設定する（TASK-104）。
+    pub fn setClickThrough(self: Window, on: bool) void {
+        c.platform_set_click_through(self.handle, on);
+    }
+
+    /// 終了メニューをポップアップする（TASK-104。選択時に window の event queue に quit を積む）。
+    pub fn showQuitMenu(self: Window) void {
+        c.platform_show_quit_menu(self.handle);
     }
 
     pub fn destroy(self: Window) void {

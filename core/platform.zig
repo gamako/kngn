@@ -122,6 +122,7 @@ pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 pub const CursorShape = types.CursorShape;
+pub const WindowOptions = types.WindowOptions; // TASK-104
 pub const MAX_GAMEPADS = types.MAX_GAMEPADS;
 pub const GamepadButton = types.GamepadButton;
 pub const GamepadButtons = types.GamepadButtons;
@@ -181,6 +182,25 @@ pub const Window = struct {
             return .{ .inner = try backend.Window.createFullscreen(title), .headless = false };
         }
         return .{ .inner = try backend.Window.create(1920, 1080, title), .headless = false };
+    }
+
+    /// 透過 / borderless オプション付きでウィンドウを作成する（TASK-104）。`.{}` は
+    /// 従来 create と同一挙動（後方互換）。backend が `createWithOptions` を実装していれば
+    /// （macOS）それを使い、無ければ透過/borderless 要求時に `error.Unsupported`、無指定なら
+    /// 通常 create へフォールバックする（Linux/Windows backend は無改造）。
+    /// headless（VP_HARNESS_HEADLESS）は options を受理し CPU framebuffer だけで動く
+    /// （表示は無いが fb の alpha を digest 検証できる）。
+    /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
+        if (harness.isHeadlessActive()) {
+            harness.createHeadlessWindow(width, height) catch return error.WindowCreationFailed;
+            return .{ .inner = undefined, .headless = true };
+        }
+        if (@hasDecl(backend.Window, "createWithOptions")) {
+            return .{ .inner = try backend.Window.createWithOptions(width, height, title, opts), .headless = false };
+        }
+        if (opts.transparent or opts.borderless) return error.Unsupported;
+        return .{ .inner = try backend.Window.create(width, height, title), .headless = false };
     }
 
     pub fn destroy(self: Window) void {
@@ -271,6 +291,34 @@ pub const Window = struct {
     pub fn setCursor(self: Window, shape: CursorShape) void {
         if (self.headless) return;
         self.inner.setCursor(shape);
+    }
+
+    /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。
+    /// アプリは掴む領域で mouse_down を受けたら呼ぶ。backend 未対応・headless は no-op。
+    /// ホットパス宣言: mouse_down 起点のイベント時のみ。
+    pub fn beginDrag(self: Window) void {
+        if (self.headless) return;
+        if (@hasDecl(backend.Window, "beginDrag")) self.inner.beginDrag();
+    }
+
+    /// 常に最前面（always-on-top）を設定する（TASK-104）。backend 未対応・headless は no-op。イベント時のみ。
+    pub fn setAlwaysOnTop(self: Window, on: bool) void {
+        if (self.headless) return;
+        if (@hasDecl(backend.Window, "setAlwaysOnTop")) self.inner.setAlwaysOnTop(on);
+    }
+
+    /// クリック透過（per-pixel。透明画素上のクリックを背後へ抜けさせる）を設定する（TASK-104）。
+    /// backend 未対応・headless は no-op。イベント時のみ。
+    pub fn setClickThrough(self: Window, on: bool) void {
+        if (self.headless) return;
+        if (@hasDecl(backend.Window, "setClickThrough")) self.inner.setClickThrough(on);
+    }
+
+    /// 終了メニューをポップアップする（TASK-104。選択時に window の event queue に quit を積む）。
+    /// backend 未対応・headless は no-op。イベント時のみ。
+    pub fn showQuitMenu(self: Window) void {
+        if (self.headless) return;
+        if (@hasDecl(backend.Window, "showQuitMenu")) self.inner.showQuitMenu();
     }
 
     /// OS のモーダルループ（ライブリサイズ等）中に backend が 1 フレームの描画を app へ要求する
@@ -408,6 +456,14 @@ pub fn getTime() f64 {
     // backend に依存せず常に安全に呼べる。
     if (harness.isEnabled() or harness.isHeadlessActive()) return harness.now();
     return backend.getTime();
+}
+
+/// Dock アイコン / メニューバーの表示を切替える（TASK-104。アプリ全体・window 非依存）。
+/// visible=false で常駐アプリらしくする（macOS=accessory policy）。backend 未対応・headless は no-op。
+/// ホットパス宣言: 初期化/イベント時のみ。
+pub fn setDockVisible(visible: bool) void {
+    if (harness.isHeadlessActive()) return;
+    if (@hasDecl(backend, "setDockVisible")) backend.setDockVisible(visible);
 }
 
 /// ファイル保存ダイアログ。headless 時は backend が未初期化（native panel / zenity を呼べない）ため

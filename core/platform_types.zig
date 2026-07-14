@@ -10,6 +10,15 @@ const std = @import("std");
 pub const Error = error{
     InitFailed,
     WindowCreationFailed,
+    /// backend が要求されたウィンドウ機能（透過 / borderless 等）に未対応（TASK-104）。
+    Unsupported,
+};
+
+/// ウィンドウ生成オプション（TASK-104）。既定 `.{}` は現行と同一挙動（不透明・タイトル付き）。
+/// 透過は per-pixel alpha（premultiplied alpha 前提）。borderless は枠・タイトルバーなし。
+pub const WindowOptions = struct {
+    transparent: bool = false,
+    borderless: bool = false,
 };
 
 // ============================================================================

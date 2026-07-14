@@ -223,6 +223,13 @@ const State = struct {
     has_argb8888: bool = false,
     shm_format: u32 = 0,
 
+    // 透過 / borderless / クリック透過 / ドラッグ (TASK-104.3)
+    transparent: bool = false,   // ARGB8888 選択 + opaque region を出さない（背後が透ける）
+    borderless: bool = false,    // 装飾なし（deco_state=.none）
+    click_through: bool = false, // 透明画素領域のクリックを背後へ抜けさせる（input region で近似）
+    last_button_serial: u32 = 0, // content 上の直近左押下 serial（beginDrag=xdg_toplevel_move に必須。one-shot）
+    ct_region_valid: bool = false, // click-through input region を設定済みか（未設定なら次 present で 1 回計算）
+
     configured: bool = false,
     closing: bool = false,
     quit_enqueued: bool = false,
@@ -322,7 +329,9 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
     // 装飾 mode の適用（TASK-28.5.6）: decoration.configure で latch した mode を ack と同じ configure
     // sequence で反映する。deco_obj がある場合のみ（FORCE_CSD/manager 不在は create 側で確定済み）。
     // client_side でも subcompositor 不在なら CSD を構築できないので .none に倒す（AC#5 のガード）。
-    if (st.deco_obj != null and st.pending_decoration_mode != 0) {
+    // borderless（TASK-104.3）は装飾なし .none を維持する（CLIENT_SIDE を要求済みでも csd に倒さない。
+    // csd にすると geometryToContent が phantom タイトルバー分 content 高さを削るため）。
+    if (!st.borderless and st.deco_obj != null and st.pending_decoration_mode != 0) {
         st.deco_state = if (st.pending_decoration_mode == c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
             .ssd
         else if (st.subcompositor != null) .csd else .none;
@@ -334,6 +343,8 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
     if (st.pending_resize and st.buffers[0].buffer != null) {
         st.pending_resize = false;
         if (st.pending_width != 0 and st.pending_height != 0) {
+            const prev_w = st.width;
+            const prev_h = st.height;
             if (st.deco_state == .csd) {
                 const cs = csd.geometryToContent(@intCast(st.pending_width), @intCast(st.pending_height), .csd, st.maximized);
                 st.width = @intCast(cs.w);
@@ -342,6 +353,8 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
                 st.width = st.pending_width;
                 st.height = st.pending_height;
             }
+            // TASK-104.3: サイズが変わったら click-through input region を再計算させる（旧 bbox は stale）。
+            if (st.width != prev_w or st.height != prev_h) st.ct_region_valid = false;
         }
     }
     // 装飾の構築/再配置（buffers 確保後のみ。create 中の初回 configure は setupBuffers 後に create 側が呼ぶ）。
@@ -699,6 +712,8 @@ fn ptrButton(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, time: u
     const pressed = state != 0; // WL_POINTER_BUTTON_STATE_PRESSED=1
     switch (st.ptr_focus) {
         .content => {
+            // TASK-104.3: content 上の左押下 serial を beginDrag(xdg_toplevel_move) 用に保持。
+            if (pressed and mb == .left) st.last_button_serial = serial;
             setButton(st, mb, pressed); // post-state にしてから event を組む
             const ev = mouseEvent(st, mb);
             st.queue.enqueue(if (pressed) .{ .mouse_down = ev } else .{ .mouse_up = ev });
@@ -729,6 +744,50 @@ fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
             .none => {},
         },
     }
+}
+
+/// TASK-104.3: click-through の input region を設定する。不透明画素（alpha>0）の bounding box を
+/// 1 回だけ求め、wl_surface の input region をその矩形に設定する（透明な余白＝bbox 外のクリックは
+/// 背後へ抜ける。per-pixel の厳密透過ではなく矩形近似。graceful degrade 方針）。
+/// **ホットパス回避**: 全画素走査は `ct_region_valid` でゲートし、click_through 有効化後の最初の
+/// present で 1 回だけ走る（毎フレームの全画素ループにはしない＝性能規約の SIMD 3点セット対象外）。
+/// 静止画マスコット前提。silhouette が変わる用途では setClickThrough の再呼び出しで invalidate する。
+/// buf.pixels は canonical BGRA（u32 0xAARRGGBB）で alpha は上位 8bit。commit は呼び出し側 present が行う。
+fn refreshInputRegion(st: *State, buf: *ShmBuffer, surface: *c.struct_wl_surface) void {
+    if (st.ct_region_valid) return; // 設定済みなら走査しない（毎フレーム全画素ループを避ける）
+    const compositor = st.compositor orelse return;
+    const w: i32 = @intCast(st.width);
+    const h: i32 = @intCast(st.height);
+    const px = buf.pixels;
+    if (px.len < @as(usize, @intCast(w)) * @as(usize, @intCast(h))) return;
+
+    // 不透明画素の bbox を走査（有効化後 1 回のみ。64x64 級で安価）。
+    var x0: i32 = w;
+    var y0: i32 = h;
+    var x1: i32 = -1;
+    var y1: i32 = -1;
+    var y: i32 = 0;
+    while (y < h) : (y += 1) {
+        const row = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
+        var x: i32 = 0;
+        while (x < w) : (x += 1) {
+            if ((px[row + @as(usize, @intCast(x))] >> 24) != 0) {
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+        }
+    }
+
+    const region = c.wl_compositor_create_region(compositor) orelse return; // 失敗時は valid を立てず次 present で再試行
+    if (x1 >= x0 and y1 >= y0) {
+        c.wl_region_add(region, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+    }
+    // 不透明画素が皆無なら空 region（全面 click-through）。
+    c.wl_surface_set_input_region(surface, region);
+    c.wl_region_destroy(region);
+    st.ct_region_valid = true; // 設定成功後にのみ確定（失敗時は上の orelse return で valid のまま）
 }
 
 fn ptrAxis(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, axis: u32, value: c.wl_fixed_t) callconv(.c) void {
@@ -843,6 +902,11 @@ fn setWindowGeometry(st: *State, r: csd.Rect) void {
 /// deco_state に応じて装飾を同期する。csd: subsurface 構築+配置+geometry。それ以外: 既存 CSD を破棄。
 /// 「subsurface 位置/描画更新 → window geometry → 親 surface commit」の順を守る（plan: 位置は親 commit 依存）。
 fn syncDecorations(st: *State) void {
+    // TASK-104.3: borderless は装飾を一切描かない（CLIENT_SIDE 要求で SSD は止まり、ここで CSD も作らない）。
+    if (st.borderless) {
+        if (st.csd_built) destroyCsd(st);
+        return;
+    }
     if (st.deco_state == .csd) {
         if (ensureCsdCreated(st)) {
             layoutCsd(st);
@@ -1043,22 +1107,29 @@ pub const Window = struct {
     state: *State,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        return createInternal(width, height, title, false);
+        return createInternal(width, height, title, false, .{});
+    }
+
+    /// 透過 / borderless オプション付き作成（TASK-104.3）。facade が @hasDecl で検出して使う。
+    /// 透過は ARGB8888（無ければ error.Unsupported）。borderless は装飾なし。
+    /// ホットパス宣言: 初期化時のみ。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        return createInternal(width, height, title, false, opts);
     }
 
     /// 本物のフルスクリーン toplevel を作成する（agent-face 向け。TASK-100）。`xdg_toplevel_set_fullscreen`
     /// を初回 commit 前に要求する。実サイズは compositor が初回 configure で報告するため、
     /// 引数の width/height はプレースホルダ（初回 configure で確定した値に上書きされる）。
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        return createInternal(1, 1, title, true);
+        return createInternal(1, 1, title, true, .{});
     }
 
-    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool) Error!Window {
+    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
         const st = alloc.create(State) catch return error.WindowCreationFailed;
-        st.* = .{ .display = dpy, .width = width, .height = height };
+        st.* = .{ .display = dpy, .width = width, .height = height, .transparent = opts.transparent, .borderless = opts.borderless };
         errdefer {
             teardown(st);
             alloc.destroy(st);
@@ -1073,8 +1144,14 @@ pub const Window = struct {
 
         if (st.compositor == null or st.shm == null or st.wm_base == null) return error.WindowCreationFailed;
 
-        // shm format 選択（XRGB8888 優先、無ければ ARGB8888、どちらも無ければ失敗）。
-        if (st.has_xrgb8888) {
+        // shm format 選択。透過時は ARGB8888 必須（alpha を honor）。非透過は XRGB8888 優先（従来）。
+        if (opts.transparent) {
+            if (st.has_argb8888) {
+                st.shm_format = FMT_ARGB8888;
+            } else {
+                return error.Unsupported; // 透過要求だが ARGB8888 非対応
+            }
+        } else if (st.has_xrgb8888) {
             st.shm_format = FMT_XRGB8888;
         } else if (st.has_argb8888) {
             st.shm_format = FMT_ARGB8888;
@@ -1100,10 +1177,27 @@ pub const Window = struct {
         // 0.16 std には libc 非依存 getenv が無いため libc getenv を使う（x11 backend と同じ）。
         const force_csd = std.c.getenv("VP_WAYLAND_FORCE_CSD") != null;
         if (fullscreen) {
-            // フルスクリーンは装飾なし固定（CSD タイトルバーを建てない）。decoration manager 非対応の
-            // compositor では通常経路が subcompositor 有無で .csd に落ち、syncDecorations が CSD タイトルバーを
-            // 構築してしまう（parseMaximized は fullscreen を maximized 扱いだが CSD は maximized でも
-            // タイトルバーを残す）。fullscreen では deco_obj も作らず .none に確定する（TASK-100・codex 指摘）。
+            // fullscreen（TASK-100）は装飾なし固定。deco_obj も作らず .none に確定する（CSD タイトルバーを
+            // 建てない）。decoration manager 非対応の compositor では通常経路が subcompositor 有無で .csd に
+            // 落ち、syncDecorations が CSD タイトルバーを構築してしまうため、ここで deco_obj を作らないことが
+            // 重要（TASK-100 codex 指摘）。
+            st.deco_state = .none;
+        } else if (opts.borderless) {
+            // borderless（TASK-104.3）: 装飾を一切出さない。compositor が SSD を描くのを止めるため
+            // xdg-decoration に CLIENT_SIDE を明示要求し（manager があるとき。sway 等は既定で SSD を描くため
+            // 必須）、自前 CSD も描かない（syncDecorations が st.borderless で no-op）。manager 不在の
+            // compositor は元々 SSD を持たないので .none で十分。VP_WAYLAND_FORCE_CSD（通常窓の CSD 強制
+            // デバッグ用）に関わらず、manager があれば CLIENT_SIDE を要求する（borderless は装飾ゼロが目的）。
+            if (st.deco_manager != null) {
+                st.deco_obj = c.zxdg_decoration_manager_v1_get_toplevel_decoration(st.deco_manager, st.toplevel);
+                if (st.deco_obj) |d| {
+                    _ = c.zxdg_toplevel_decoration_v1_add_listener(d, &decoration_listener, st);
+                    c.zxdg_toplevel_decoration_v1_set_mode(d, c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+                }
+            }
+            // borderless は常に装飾なし .none に固定（CLIENT_SIDE を要求して SSD を止めつつ、CSD も作らない）。
+            // deco_state を .csd にすると geometryToContent が phantom タイトルバー分だけ content 高さを
+            // 削ってしまうため、必ず .none にする（xdgSurfaceConfigure 側も borderless では mode 反映しない）。
             st.deco_state = .none;
         } else if (!force_csd and st.deco_manager != null) {
             st.deco_obj = c.zxdg_decoration_manager_v1_get_toplevel_decoration(st.deco_manager, st.toplevel);
@@ -1300,11 +1394,44 @@ pub const Window = struct {
             }
         }
 
+        // TASK-104.3: click-through が有効なら、今 present するフレームの不透明画素 bbox から
+        // input region を更新する（bbox が変わったときだけ set_input_region。commit は下で 1 回）。
+        if (st.click_through) refreshInputRegion(st, buf, surface);
+
         c.wl_surface_commit(surface);
         _ = c.wl_display_flush(st.display);
 
         buf.busy = true;
         st.locked_index = null;
+    }
+
+    /// 直近の content 左押下から OS の対話的ウィンドウ移動を開始する（TASK-104.3）。
+    /// serial 未取得（まだ押下していない）なら no-op。ホットパス宣言: イベント時のみ。
+    pub fn beginDrag(self: Window) void {
+        const st = self.state;
+        const tl = st.toplevel orelse return;
+        const seat = st.seat orelse return;
+        if (st.last_button_serial == 0) return;
+        const serial = st.last_button_serial;
+        st.last_button_serial = 0; // one-shot 消費（button press への応答としてのみ使う。macOS 実装と対称）
+        c.xdg_toplevel_move(tl, seat, serial);
+    }
+
+    /// クリック透過（per-pixel 近似）の設定（TASK-104.3）。on にすると invalidate し、次回 present で
+    /// 1 回だけ不透明画素の bounding box を走査して input region に設定する（透明な余白のクリックを
+    /// 背後へ抜けさせる）。off で input region を null（全面受け取り）へ戻す。
+    /// ホットパス宣言: イベント時のみ。bbox の全画素走査は invalidate 後の次回 present で一度だけ走り
+    /// （ct_region_valid ゲート）、毎フレームの全画素ループにはしない（性能規約の SIMD 対象外）。
+    pub fn setClickThrough(self: Window, on: bool) void {
+        const st = self.state;
+        st.click_through = on;
+        st.ct_region_valid = false; // 再有効化でも silhouette 再走査するよう常に invalidate（次 present で再計算）
+        if (!on) {
+            if (st.surface) |s| {
+                c.wl_surface_set_input_region(s, null); // 全面で受け取る
+                c.wl_surface_commit(s);
+            }
+        }
     }
 
     /// カーソル形状の設定（TASK-75.3）。shape を保持し、pointer が content 上にあれば即適用する。

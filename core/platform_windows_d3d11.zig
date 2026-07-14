@@ -250,6 +250,27 @@ pub const Window = struct {
         return finishFromCore(try common.Core.createFullscreen(title));
     }
 
+    /// 透過 / borderless オプション付き作成（TASK-104.1）。透過は swapchain 経路と両立しないため
+    /// 現状 error.Unsupported（gdi backend か将来の layered 経路対応で。borderless=不透明枠なしは対応）。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: @import("platform_types").WindowOptions) Error!Window {
+        if (opts.transparent) return error.Unsupported; // d3d11 透過は follow-up（gdi を使う）
+        return finishFromCore(try common.Core.createWithOptions(width, height, title, opts));
+    }
+
+    /// 対話的ドラッグ / 最前面 / クリック透過 / 終了メニュー（TASK-104.1）。Core へ委譲。
+    pub fn beginDrag(self: Window) void {
+        self.core.beginDrag();
+    }
+    pub fn setAlwaysOnTop(self: Window, on: bool) void {
+        self.core.setAlwaysOnTop(on);
+    }
+    pub fn setClickThrough(self: Window, on: bool) void {
+        self.core.setClickThrough(on);
+    }
+    pub fn showQuitMenu(self: Window) void {
+        self.core.showQuitMenu();
+    }
+
     /// Core（通常 or フルスクリーン）から D3D11 presentation resource を構築して Window を返す。
     /// 寸法は core.width/core.height を使う（フルスクリーンでもモニタ実寸法に一致する）。
     fn finishFromCore(core: *common.Core) Error!Window {

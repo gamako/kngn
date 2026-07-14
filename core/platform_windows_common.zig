@@ -74,6 +74,70 @@ const FULLSCREEN_STYLE: DWORD = WS_POPUP | WS_VISIBLE;
 const WS_VISIBLE: DWORD = 0x10000000;
 const SM_CXSCREEN: c_int = 0; // プライマリモニタ幅（GetSystemMetrics。TASK-100.1）
 const SM_CYSCREEN: c_int = 1; // プライマリモニタ高さ
+
+// 透過 / borderless ウィンドウ + ドラッグ移動（TASK-104.1）
+const WS_EX_LAYERED: DWORD = 0x00080000; // per-pixel alpha 合成（UpdateLayeredWindow）
+const WS_EX_TOOLWINDOW: DWORD = 0x00000080; // タスクバーに出さない（マスコット向け）
+const BORDERLESS_STYLE: DWORD = WS_POPUP; // 枠・タイトルバーなし（WS_VISIBLE は付けず ShowWindow で表示）
+const ULW_ALPHA: DWORD = 0x00000002; // UpdateLayeredWindow: per-pixel alpha
+const AC_SRC_OVER: u8 = 0x00;
+const AC_SRC_ALPHA: u8 = 0x01; // 供給元は premultiplied alpha
+const HWND_TOPMOST: isize = -1;
+const HWND_NOTOPMOST: isize = -2;
+const SWP_NOMOVE: UINT = 0x0002;
+const SWP_NOSIZE: UINT = 0x0001;
+const SWP_NOACTIVATE: UINT = 0x0010;
+const WM_NCLBUTTONDOWN: UINT = 0x00A1;
+const HTCAPTION: WPARAM = 2;
+const BI_RGB: DWORD = 0;
+const DIB_RGB_COLORS: UINT = 0;
+const MF_STRING: UINT = 0x0000;
+const TPM_RETURNCMD: UINT = 0x0100;
+const TPM_RIGHTBUTTON: UINT = 0x0002;
+const QUIT_MENU_ID: UINT = 1;
+
+const HGDIOBJ = win.HANDLE; // GDI オブジェクトハンドル（std.os.windows に HGDIOBJ 別名が無いため HANDLE を使う）
+const SIZE = extern struct { cx: LONG, cy: LONG };
+const BLENDFUNCTION = extern struct {
+    BlendOp: u8,
+    BlendFlags: u8,
+    SourceConstantAlpha: u8,
+    AlphaFormat: u8,
+};
+const BITMAPINFOHEADER = extern struct {
+    biSize: DWORD,
+    biWidth: LONG,
+    biHeight: LONG,
+    biPlanes: u16,
+    biBitCount: u16,
+    biCompression: DWORD,
+    biSizeImage: DWORD,
+    biXPelsPerMeter: LONG,
+    biYPelsPerMeter: LONG,
+    biClrUsed: DWORD,
+    biClrImportant: DWORD,
+};
+const BITMAPINFO = extern struct { bmiHeader: BITMAPINFOHEADER, bmiColors: [1]u32 = .{0} };
+
+// 透過 present（UpdateLayeredWindow）/ ドラッグ / 最前面 / メニュー用の Win32 API。
+extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?win.HDC;
+extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: win.HDC) callconv(.winapi) c_int;
+extern "user32" fn UpdateLayeredWindow(hWnd: HWND, hdcDst: ?win.HDC, pptDst: ?*const POINT, psize: ?*const SIZE, hdcSrc: ?win.HDC, pptSrc: ?*const POINT, crKey: DWORD, pblend: ?*const BLENDFUNCTION, dwFlags: DWORD) callconv(.winapi) BOOL;
+extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, X: c_int, Y: c_int, cx: c_int, cy: c_int, uFlags: UINT) callconv(.winapi) BOOL;
+extern "user32" fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
+extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(.winapi) BOOL;
+extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
+extern "user32" fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) BOOL;
+extern "user32" fn TrackPopupMenu(hMenu: HMENU, uFlags: UINT, x: c_int, y: c_int, nReserved: c_int, hWnd: HWND, prcRect: ?*const RECT) callconv(.winapi) BOOL;
+extern "user32" fn DestroyMenu(hMenu: HMENU) callconv(.winapi) BOOL;
+extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
+const WM_NULL: UINT = 0x0000;
+extern "gdi32" fn CreateCompatibleDC(hdc: ?win.HDC) callconv(.winapi) ?win.HDC;
+extern "gdi32" fn DeleteDC(hdc: win.HDC) callconv(.winapi) BOOL;
+extern "gdi32" fn CreateDIBSection(hdc: ?win.HDC, pbmi: *const BITMAPINFO, usage: UINT, ppvBits: *?*anyopaque, hSection: ?*anyopaque, offset: DWORD) callconv(.winapi) ?HGDIOBJ;
+extern "gdi32" fn SelectObject(hdc: win.HDC, h: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
+extern "gdi32" fn DeleteObject(ho: HGDIOBJ) callconv(.winapi) BOOL;
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 const SW_SHOW: c_int = 5;
 const PM_REMOVE: UINT = 0x0001;
@@ -284,6 +348,17 @@ pub const Core = struct {
     redraw_ctx: *anyopaque = undefined,
     redraw_fn: ?*const fn (ctx: *anyopaque) void = null,
 
+    // 透過ウィンドウ (TASK-104.1)。true なら present は StretchDIBits ではなく
+    // UpdateLayeredWindow（premultiplied BGRA backing を per-pixel alpha 合成）を使う。
+    transparent: bool = false,
+    // 透過 present 用のキャッシュ資源（フレーム毎の DIB/DC 作成を避ける。size 変化時のみ再作成）。
+    layer_dc: ?win.HDC = null,
+    layer_dib: ?HGDIOBJ = null,
+    layer_old_bmp: ?HGDIOBJ = null, // DC に元々選択されていた bitmap（DIB 破棄前に再選択して deselect する）
+    layer_bits: ?[*]u32 = null,
+    layer_w: u32 = 0,
+    layer_h: u32 = 0,
+
     fn enqueue(self: *Core, ev: Event) void {
         self.queue.enqueue(ev);
     }
@@ -295,7 +370,14 @@ pub const Core = struct {
     /// window を生成し、canonical BGRA backing を確保して `*Core`（heap）を返す。
     /// presentation resource は持たない（各 backend が create で別途用意する）。
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!*Core {
-        return createInternal(width, height, title, false);
+        return createInternal(width, height, title, false, .{});
+    }
+
+    /// 透過 / borderless オプション付き作成（TASK-104.1）。各 backend の Window.createWithOptions から呼ぶ。
+    /// transparent → WS_EX_LAYERED + UpdateLayeredWindow present。borderless → WS_POPUP + タスクバー非表示。
+    /// ホットパス宣言: 初期化時のみ。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!*Core {
+        return createInternal(width, height, title, false, opts);
     }
 
     /// 本物のフルスクリーン window を作成する（TASK-100.1）。プライマリモニタ全面を覆う
@@ -305,10 +387,10 @@ pub const Core = struct {
         const sw = GetSystemMetrics(SM_CXSCREEN);
         const sh = GetSystemMetrics(SM_CYSCREEN);
         if (sw <= 0 or sh <= 0) return error.WindowCreationFailed;
-        return createInternal(@intCast(sw), @intCast(sh), title, true);
+        return createInternal(@intCast(sw), @intCast(sh), title, true, .{});
     }
 
-    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool) Error!*Core {
+    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!*Core {
         if (!g_class_registered) return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
@@ -319,8 +401,16 @@ pub const Core = struct {
         const title_ptr: LPCWSTR = @ptrCast(&title_buf);
 
         // 通常: client area を width×height にするため outer 寸法を AdjustWindowRectEx で算出。
-        // フルスクリーン: WS_POPUP は装飾なしなので client=window。(0,0) にモニタ全面を置く。
-        const style: DWORD = if (fullscreen) FULLSCREEN_STYLE else WINDOW_STYLE;
+        // フルスクリーン / borderless: WS_POPUP は装飾なしなので client=window。
+        // TASK-104.1: borderless=WS_POPUP、transparent=WS_EX_LAYERED、borderless は WS_EX_TOOLWINDOW で
+        // タスクバー非表示（マスコット向け）。透過フラグは present 経路の分岐に使う。
+        // 透過は WS_POPUP（枠なし）に統一する。titled + layered は UpdateLayeredWindow の psize
+        // （window 全体サイズ）が client サイズと食い違い、タイトルバー分の欠落 / WM_SIZE 縮小が起きるため。
+        const borderless = opts.borderless or opts.transparent;
+        const style: DWORD = if (fullscreen or borderless) BORDERLESS_STYLE else WINDOW_STYLE;
+        var ex_style: DWORD = 0;
+        if (opts.transparent) ex_style |= WS_EX_LAYERED;
+        if (borderless) ex_style |= WS_EX_TOOLWINDOW; // 枠なし/透過はタスクバー非表示（マスコット向け）
         var outer_w: c_int = @intCast(width);
         var outer_h: c_int = @intCast(height);
         var pos_x: c_int = CW_USEDEFAULT;
@@ -328,6 +418,8 @@ pub const Core = struct {
         if (fullscreen) {
             pos_x = 0;
             pos_y = 0;
+        } else if (borderless) {
+            // 装飾なし: client=window。CW_USEDEFAULT のまま（compositor/WM が配置）。
         } else {
             var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
             if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
@@ -356,10 +448,11 @@ pub const Core = struct {
             .last_y = 0,
             .redraw_ctx = undefined,
             .redraw_fn = null,
+            .transparent = opts.transparent,
         };
 
         const hwnd = CreateWindowExW(
-            0,
+            ex_style,
             class_name,
             title_ptr,
             style,
@@ -383,6 +476,122 @@ pub const Core = struct {
         return core;
     }
 
+    /// TASK-104.1: 透過ウィンドウの present。premultiplied BGRA backing を per-pixel alpha 合成で表示する
+    /// （UpdateLayeredWindow）。gdi/d3d11 の present が core.transparent のとき StretchDIBits / swapchain の
+    /// 代わりに呼ぶ。
+    /// ホットパス宣言: フレーム毎。ただし DIB/DC は Core にキャッシュし **size 変化時のみ再作成**する
+    /// （フレーム毎の一時メモリ確保を避ける＝性能規約準拠）。毎フレームは backing→DIB の @memcpy 1 回 +
+    /// UpdateLayeredWindow のみで、新規の per-pixel ループ・alloc は無い。
+    pub fn presentLayered(self: *Core) void {
+        if (!self.ensureLayerResources()) return;
+        const dst = self.layer_bits orelse return;
+        @memcpy(dst[0..self.backing.len], self.backing); // premultiplied BGRA をそのまま DIB へ
+        const w: c_int = @intCast(self.width);
+        const h: c_int = @intCast(self.height);
+        var size = SIZE{ .cx = w, .cy = h };
+        var src_pt = POINT{ .x = 0, .y = 0 };
+        var blend = BLENDFUNCTION{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
+        // hdcSrc は DIB を select 済みの memory DC。hdcDst=null で画面全体基準。
+        _ = UpdateLayeredWindow(self.hwnd, null, null, &size, self.layer_dc, &src_pt, 0, &blend, ULW_ALPHA);
+    }
+
+    /// 透過 present 用の memory DC + top-down 32bpp DIB section を size に合わせて用意する。
+    /// 既にあり size 一致ならそのまま true。size 変化時は破棄→再作成。作成失敗時 false（present skip）。
+    fn ensureLayerResources(self: *Core) bool {
+        if (self.layer_dc != null and self.layer_w == self.width and self.layer_h == self.height) return true;
+        self.freeLayerResources();
+        const screen_dc = GetDC(null) orelse return false;
+        defer _ = ReleaseDC(null, screen_dc);
+        const mem_dc = CreateCompatibleDC(screen_dc) orelse return false;
+        var bmi = BITMAPINFO{ .bmiHeader = .{
+            .biSize = @sizeOf(BITMAPINFOHEADER),
+            .biWidth = @intCast(self.width),
+            .biHeight = -@as(LONG, @intCast(self.height)), // top-down（backing の先頭 = 左上）
+            .biPlanes = 1,
+            .biBitCount = 32,
+            .biCompression = BI_RGB,
+            .biSizeImage = 0,
+            .biXPelsPerMeter = 0,
+            .biYPelsPerMeter = 0,
+            .biClrUsed = 0,
+            .biClrImportant = 0,
+        } };
+        var bits: ?*anyopaque = null;
+        const dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse {
+            _ = DeleteDC(mem_dc);
+            return false;
+        };
+        const raw = bits orelse {
+            _ = DeleteObject(dib);
+            _ = DeleteDC(mem_dc);
+            return false;
+        };
+        self.layer_old_bmp = SelectObject(mem_dc, dib); // DIB を select し元 bitmap を保存（破棄時に deselect 用）
+        self.layer_dc = mem_dc;
+        self.layer_dib = dib;
+        self.layer_bits = @ptrCast(@alignCast(raw));
+        self.layer_w = self.width;
+        self.layer_h = self.height;
+        return true;
+    }
+
+    fn freeLayerResources(self: *Core) void {
+        if (self.layer_dc) |dc| {
+            // 選択中の DIB は DeleteObject が失敗しリークするため、元 bitmap を再選択して deselect してから破棄。
+            if (self.layer_old_bmp) |old| _ = SelectObject(dc, old);
+            if (self.layer_dib) |dib| _ = DeleteObject(dib);
+            _ = DeleteDC(dc);
+        }
+        self.layer_dc = null;
+        self.layer_dib = null;
+        self.layer_old_bmp = null;
+        self.layer_bits = null;
+        self.layer_w = 0;
+        self.layer_h = 0;
+    }
+
+    /// TASK-104.1: OS の対話的ウィンドウ移動を開始する。左押下でキャプチャ済みなので先に解放してから
+    /// タイトルバー相当の移動メッセージを送る。ホットパス宣言: イベント時のみ。
+    pub fn beginDrag(self: *Core) void {
+        _ = ReleaseCapture();
+        _ = SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+
+    /// TASK-104.1: 常に最前面（always-on-top）。ホットパス宣言: イベント時のみ。
+    pub fn setAlwaysOnTop(self: *Core, on: bool) void {
+        const after: HWND = @ptrFromInt(@as(usize, @bitCast(if (on) HWND_TOPMOST else HWND_NOTOPMOST)));
+        _ = SetWindowPos(self.hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    /// TASK-104.1: クリック透過。**契約（Windows 固有）**: 透過(WS_EX_LAYERED)ウィンドウは
+    /// UpdateLayeredWindow の per-pixel alpha により alpha==0 の画素で **常に自動的に** click-through に
+    /// なる（本体=不透明画素はクリックを受け、透明余白は背後へ抜ける）。この挙動は透過を保ったまま
+    /// on/off できない（無効化には WS_EX_LAYERED 除去＝透過解除が要る）ため、本関数は意図的に no-op で、
+    /// 透過ウィンドウでは click-through が常時有効。非透過ウィンドウの per-pixel 透過は Windows では
+    /// layered 化前提で MVP 対象外（graceful degrade）。
+    pub fn setClickThrough(self: *Core, on: bool) void {
+        _ = self;
+        _ = on;
+    }
+
+    /// TASK-104.1: 終了メニューをポップアップする。「終了」選択で quit を積む。ホットパス宣言: イベント時のみ。
+    pub fn showQuitMenu(self: *Core) void {
+        const menu = CreatePopupMenu() orelse return;
+        defer _ = DestroyMenu(menu);
+        const label = std.unicode.utf8ToUtf16LeStringLiteral("終了");
+        _ = AppendMenuW(menu, MF_STRING, QUIT_MENU_ID, label);
+        var pt: POINT = undefined;
+        _ = GetCursorPos(&pt);
+        // 非アクティブ状態からのメニューは、前面化しないと外側クリックで閉じない（Win32 の定石）。
+        _ = SetForegroundWindow(self.hwnd);
+        const cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.hwnd, null);
+        _ = PostMessageW(self.hwnd, WM_NULL, 0, 0); // 2 回目のメニューが即閉じする Win32 既知問題の回避（定石）
+        if (cmd != 0) { // TPM_RETURNCMD: 選択された項目 ID（QUIT_MENU_ID）
+            self.closing = true;
+            self.enqueue(.quit);
+        }
+    }
+
     /// WM_SIZE で client area が変わった時に CPU backing を two-phase 再確保する（TASK-23）。
     /// 新確保に成功してから旧を解放（OOM 時は旧サイズ維持）。最小化/ゼロ/同サイズは no-op。
     /// presentation resource（swap chain / DIB 等）の追従は各 backend が present 時に core 寸法と
@@ -403,6 +612,7 @@ pub const Core = struct {
     /// （presentation resource の解放は backend 側が core.destroy より前に行う。）
     pub fn destroy(self: *Core) void {
         self.redraw_fn = null;
+        self.freeLayerResources(); // TASK-104.1: 透過 present のキャッシュ DIB/DC を解放
         _ = DestroyWindow(self.hwnd);
         alloc.free(self.backing);
         alloc.destroy(self);

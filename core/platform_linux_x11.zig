@@ -35,6 +35,7 @@ const c = @cImport({
     @cInclude("X11/XKBlib.h"); // XkbSetDetectableAutoRepeat
     @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair（system cursor。TASK-75.3）
     @cInclude("X11/extensions/XShm.h");
+    @cInclude("X11/extensions/shape.h"); // クリック透過の input shape（TASK-104.2）
     @cInclude("sys/ipc.h");
     @cInclude("sys/shm.h");
 });
@@ -159,6 +160,14 @@ const State = struct {
     // X11 Cursor をキャッシュ（0=None=未生成）。destroy で XFreeCursor する。
     cursors: [3]c.Cursor = .{ 0, 0, 0 },
 
+    // 透過 / borderless / クリック透過（TASK-104.2）
+    transparent: bool = false,
+    borderless: bool = false,
+    click_through: bool = false,
+    colormap: c.Colormap = 0, // 透過 ARGB visual 用（destroy で XFreeColormap。0=既定 visual で未作成）
+    own_gc: bool = false, // st.gc を XCreateGC で自作したか（透過 window 用。destroy で XFreeGC）
+    ct_region_valid: bool = false, // click-through input shape 設定済みか（未設定なら次 present で 1 回計算）
+
     fn enqueue(self: *State, ev: Event) void {
         self.queue.enqueue(ev);
     }
@@ -172,7 +181,14 @@ pub const Window = struct {
     state: *State,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        return createInternal(width, height, title, false);
+        return createInternal(width, height, title, false, .{});
+    }
+
+    /// 透過 / borderless オプション付き作成（TASK-104.2）。facade が @hasDecl で検出して使う。
+    /// 透過は 32bit ARGB visual（XMatchVisualInfo。無ければ error.Unsupported）+ colormap + XCreateWindow。
+    /// **実際に背後が透けるにはコンポジタ（picom 等）が必要**。ホットパス宣言: 初期化時のみ。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        return createInternal(width, height, title, false, opts);
     }
 
     /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。装飾なし・画面解像度いっぱい）。
@@ -184,35 +200,72 @@ pub const Window = struct {
         const screen = c.XDefaultScreen(dpy);
         const w: u32 = @intCast(c.XDisplayWidth(dpy, screen));
         const h: u32 = @intCast(c.XDisplayHeight(dpy, screen));
-        return createInternal(w, h, title, true);
+        return createInternal(w, h, title, true, .{});
     }
 
-    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool) Error!Window {
+    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
         const screen = c.XDefaultScreen(dpy);
         const root = c.XRootWindow(dpy, screen);
-        const visual = c.XDefaultVisual(dpy, screen);
-        if (visual == null) return error.WindowCreationFailed;
-        const depth: c_uint = @intCast(c.XDefaultDepth(dpy, screen));
-        const black = c.XBlackPixel(dpy, screen);
 
-        // §2.1: 既定 visual が TrueColor であることを要求（DirectColor 等は colormap 前提で非対応）
-        if (visual.*.class != c.TrueColor) return error.WindowCreationFailed;
+        var visual: ?*c.Visual = undefined;
+        var depth: c_uint = undefined;
+        var win: c.Window = undefined;
+        var colormap: c.Colormap = 0;
+        var own_gc = false;
+        var gc: c.GC = undefined;
 
-        const win = c.XCreateSimpleWindow(
-            dpy,
-            root,
-            0,
-            0,
-            @intCast(width),
-            @intCast(height),
-            0,
-            black,
-            black,
-        );
-        errdefer _ = c.XDestroyWindow(dpy, win);
+        if (opts.transparent) {
+            // 32bit ARGB TrueColor visual を探す（無ければ透過不可）。colormap + XCreateWindow で作る。
+            var vinfo: c.XVisualInfo = undefined;
+            if (c.XMatchVisualInfo(dpy, screen, 32, c.TrueColor, &vinfo) == 0) return error.Unsupported;
+            // canonical BGRA(0xAARRGGBB) の直書き経路（classifyVisual=direct）で alpha を保つには標準
+            // ARGB 配置（R=0xFF0000/G=0xFF00/B=0xFF）が必須。非標準 shift は fallback 変換で alpha が
+            // 落ちる（全画素透明化）ため、ここで弾いて Unsupported にする（codex 指摘）。
+            if (vinfo.visual.*.red_mask != 0xFF0000 or vinfo.visual.*.green_mask != 0x00FF00 or vinfo.visual.*.blue_mask != 0x0000FF) {
+                return error.Unsupported;
+            }
+            visual = vinfo.visual;
+            depth = 32;
+            colormap = c.XCreateColormap(dpy, root, vinfo.visual, c.AllocNone);
+            if (colormap == 0) return error.WindowCreationFailed;
+            errdefer _ = c.XFreeColormap(dpy, colormap); // colormap のみこの分岐内で守る（win 前に確保するため）
+            var attrs = std.mem.zeroes(c.XSetWindowAttributes);
+            attrs.colormap = colormap;
+            attrs.border_pixel = 0;
+            attrs.background_pixel = 0; // 透明背景
+            attrs.event_mask = c.ExposureMask | c.StructureNotifyMask |
+                c.KeyPressMask | c.KeyReleaseMask |
+                c.ButtonPressMask | c.ButtonReleaseMask | c.PointerMotionMask;
+            const valuemask: c_ulong = c.CWColormap | c.CWBorderPixel | c.CWBackPixel | c.CWEventMask;
+            win = c.XCreateWindow(dpy, root, 0, 0, @intCast(width), @intCast(height), 0, 32, c.InputOutput, vinfo.visual, valuemask, &attrs);
+            if (win == 0) return error.WindowCreationFailed; // ここまでで失敗 → 上の errdefer が colormap 解放
+            // 32bit drawable には depth 一致の GC が要る（既定 GC は depth 24 で BadMatch になりうる）。
+            gc = c.XCreateGC(dpy, win, 0, null) orelse {
+                _ = c.XDestroyWindow(dpy, win);
+                return error.WindowCreationFailed; // colormap は errdefer が解放
+            };
+            own_gc = true;
+        } else {
+            visual = c.XDefaultVisual(dpy, screen);
+            if (visual == null) return error.WindowCreationFailed;
+            depth = @intCast(c.XDefaultDepth(dpy, screen));
+            const black = c.XBlackPixel(dpy, screen);
+            // §2.1: 既定 visual が TrueColor であることを要求（DirectColor 等は colormap 前提で非対応）
+            if (visual.?.class != c.TrueColor) return error.WindowCreationFailed;
+            win = c.XCreateSimpleWindow(dpy, root, 0, 0, @intCast(width), @intCast(height), 0, black, black);
+            gc = c.XDefaultGC(dpy, screen);
+        }
+        // 以降（setupBlit / alloc.create 等）の失敗で win/GC/colormap をまとめて解放（透過生成のリーク防止）。
+        // 成功時は State が所有し destroy() が解放するので、この errdefer は発火しない。非透過は own_gc=false /
+        // colormap=0 なので XDestroyWindow のみ（従来と同じ）。
+        errdefer {
+            if (own_gc) _ = c.XFreeGC(dpy, gc);
+            _ = c.XDestroyWindow(dpy, win);
+            if (colormap != 0) _ = c.XFreeColormap(dpy, colormap);
+        }
 
         _ = c.XStoreName(dpy, win, title.ptr);
         _ = c.XSelectInput(dpy, win, c.ExposureMask | c.StructureNotifyMask |
@@ -238,7 +291,19 @@ pub const Window = struct {
             _ = c.XSetWMNormalHints(dpy, win, &hints);
         }
 
-        const gc = c.XDefaultGC(dpy, screen);
+        // TASK-104.2: borderless は _MOTIF_WM_HINTS で装飾を落とす + タスクバー/pager 非表示（マスコット向け）。
+        if (opts.borderless) {
+            const motif = c.XInternAtom(dpy, "_MOTIF_WM_HINTS", 0);
+            // MotifWmHints: [flags, functions, decorations, input_mode, status]。flags=MWM_HINTS_DECORATIONS(1<<1)、decorations=0。
+            var mwm = [5]c_ulong{ 2, 0, 0, 0, 0 };
+            _ = c.XChangeProperty(dpy, win, motif, motif, 32, c.PropModeReplace, @ptrCast(&mwm), 5);
+            const net_wm_state = c.XInternAtom(dpy, "_NET_WM_STATE", 0);
+            var skip = [2]c.Atom{
+                c.XInternAtom(dpy, "_NET_WM_STATE_SKIP_TASKBAR", 0),
+                c.XInternAtom(dpy, "_NET_WM_STATE_SKIP_PAGER", 0),
+            };
+            _ = c.XChangeProperty(dpy, win, net_wm_state, c.XA_ATOM, 32, c.PropModeReplace, @ptrCast(&skip), 2);
+        }
 
         const st = alloc.create(State) catch return error.WindowCreationFailed;
         errdefer alloc.destroy(st);
@@ -252,6 +317,10 @@ pub const Window = struct {
             .wm_delete = wm_delete,
             .visual = visual,
             .depth = depth,
+            .transparent = opts.transparent,
+            .borderless = opts.borderless,
+            .colormap = colormap,
+            .own_gc = own_gc,
             .backing = &.{},
             .image = undefined,
             .bytes_per_line = 0,
@@ -291,7 +360,9 @@ pub const Window = struct {
         for (st.cursors) |cur| {
             if (cur != 0) _ = c.XFreeCursor(dpy, cur);
         }
+        if (st.own_gc) _ = c.XFreeGC(dpy, st.gc); // TASK-104.2: 透過 window 用の自作 GC を解放
         _ = c.XDestroyWindow(dpy, st.window);
+        if (st.colormap != 0) _ = c.XFreeColormap(dpy, st.colormap); // 透過 ARGB colormap を解放
         // fallback の backing は別 alloc。direct の backing は image data の別名なので teardownBlit が解放済み。
         if (!st.direct) alloc.free(st.backing);
         alloc.destroy(st);
@@ -362,6 +433,7 @@ pub const Window = struct {
     pub fn present(self: Window) void {
         const st = self.state;
         const dpy = st.display;
+        if (st.click_through and !st.ct_region_valid) refreshInputShape(st); // TASK-104.2: 有効化後 1 回だけ
         // direct は caller が image data を直接書いているので変換不要。fallback のみ backing→image data 変換。
         if (!st.direct) convert(st);
         const w: c_uint = @intCast(st.width);
@@ -372,6 +444,75 @@ pub const Window = struct {
             _ = c.XPutImage(dpy, st.window, st.gc, st.image, 0, 0, 0, 0, w, h);
         }
         _ = c.XFlush(dpy);
+    }
+
+    /// TASK-104.2: 対話的ウィンドウ移動を WM へ依頼する（_NET_WM_MOVERESIZE）。押下 grab を外し、
+    /// 現在のポインタ root 座標 + button + source を載せて root へ ClientMessage を送る。
+    /// ホットパス宣言: イベント時のみ。
+    pub fn beginDrag(self: Window) void {
+        const st = self.state;
+        const dpy = st.display;
+        const screen = c.XDefaultScreen(dpy);
+        const root = c.XRootWindow(dpy, screen);
+        // ポインタ root 座標を取得。
+        var rret: c.Window = undefined;
+        var cret: c.Window = undefined;
+        var rx: c_int = 0;
+        var ry: c_int = 0;
+        var wx: c_int = 0;
+        var wy: c_int = 0;
+        var mask: c_uint = 0;
+        _ = c.XQueryPointer(dpy, st.window, &rret, &cret, &rx, &ry, &wx, &wy, &mask);
+        _ = c.XUngrabPointer(dpy, c.CurrentTime); // press grab を外して WM に move を渡す
+        const net = c.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0);
+        var ev = std.mem.zeroes(c.XEvent);
+        ev.xclient.type = c.ClientMessage;
+        ev.xclient.window = st.window;
+        ev.xclient.message_type = net;
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = rx; // x_root
+        ev.xclient.data.l[1] = ry; // y_root
+        ev.xclient.data.l[2] = 8; // _NET_WM_MOVERESIZE_MOVE
+        ev.xclient.data.l[3] = 1; // button 1（左）
+        ev.xclient.data.l[4] = 1; // source indication = application
+        _ = c.XSendEvent(dpy, root, 0, c.SubstructureRedirectMask | c.SubstructureNotifyMask, &ev);
+        _ = c.XFlush(dpy);
+    }
+
+    /// TASK-104.2: 常に最前面（_NET_WM_STATE_ABOVE の add/remove ClientMessage）。WM 依存（graceful）。
+    /// ホットパス宣言: イベント時のみ。
+    pub fn setAlwaysOnTop(self: Window, on: bool) void {
+        const st = self.state;
+        const dpy = st.display;
+        const screen = c.XDefaultScreen(dpy);
+        const root = c.XRootWindow(dpy, screen);
+        const net_state = c.XInternAtom(dpy, "_NET_WM_STATE", 0);
+        const above = c.XInternAtom(dpy, "_NET_WM_STATE_ABOVE", 0);
+        var ev = std.mem.zeroes(c.XEvent);
+        ev.xclient.type = c.ClientMessage;
+        ev.xclient.window = st.window;
+        ev.xclient.message_type = net_state;
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = if (on) 1 else 0; // _NET_WM_STATE_ADD / REMOVE
+        ev.xclient.data.l[1] = @intCast(above);
+        ev.xclient.data.l[2] = 0;
+        ev.xclient.data.l[3] = 1; // source = application
+        _ = c.XSendEvent(dpy, root, 0, c.SubstructureRedirectMask | c.SubstructureNotifyMask, &ev);
+        _ = c.XFlush(dpy);
+    }
+
+    /// TASK-104.2: クリック透過（X Shape の input shape）。on のとき次 present で不透明画素 bbox を
+    /// input shape に設定し透明余白のクリックを背後へ抜けさせる。off で input shape を全面へ戻す。
+    /// ホットパス宣言: イベント時のみ（present 側の bbox 走査は有効化後 1 回だけ・ct_region_valid ゲート）。
+    pub fn setClickThrough(self: Window, on: bool) void {
+        const st = self.state;
+        st.click_through = on;
+        st.ct_region_valid = false; // 再有効化でも silhouette 再走査（次 present）
+        if (!on) {
+            // input shape を全面（NULL region = bounding と一致）へ戻す。
+            c.XShapeCombineMask(st.display, st.window, c.ShapeInput, 0, 0, 0, c.ShapeSet);
+            _ = c.XFlush(st.display);
+        }
     }
 
     /// カーソル形状の設定（TASK-75.3）。CursorShape 別に Cursor を遅延生成・キャッシュし XDefineCursor で反映。
@@ -572,6 +713,38 @@ fn handleMotion(st: *State, e: *c.XMotionEvent) void {
 // ============================================================================
 // blit セットアップ / pixel 変換
 // ============================================================================
+
+/// TASK-104.2: クリック透過用に不透明画素（alpha>0）から **per-pixel の 1bit マスク**を作り、X Shape の
+/// input shape に設定する（透明画素＝alpha0 のクリックは正確に背後へ抜け、不透明画素＝本体はクリックを受ける）。
+/// bounding box では丸い絵の透明な四隅も窓が受けてしまう（クリック透過が効かない）ため、per-pixel マスクにする。
+/// ct_region_valid でゲートし有効化後 1 回だけ走る（毎フレーム全画素ループにしない＝性能規約準拠）。
+/// canonical BGRA の alpha は上位 8bit。XCreateBitmapFromData は LSB-first・行ごと byte 境界 pad。
+fn refreshInputShape(st: *State) void {
+    const w = st.width;
+    const h = st.height;
+    const px = st.backing;
+    if (px.len < @as(usize, w) * @as(usize, h)) return;
+    const stride = (w + 7) / 8; // 1 行あたりの byte 数（8px/byte、byte 境界 pad）
+    const data = alloc.alloc(u8, @as(usize, stride) * @as(usize, h)) catch return;
+    defer alloc.free(data);
+    @memset(data, 0);
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        const row = @as(usize, y) * @as(usize, w);
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            if ((px[row + x] >> 24) != 0) { // 不透明画素 → bit を立てる（この画素はクリックを受ける）
+                data[@as(usize, y) * @as(usize, stride) + (x >> 3)] |= (@as(u8, 1) << @intCast(x & 7));
+            }
+        }
+    }
+    const bmp = c.XCreateBitmapFromData(st.display, st.window, @ptrCast(data.ptr), @intCast(w), @intCast(h));
+    if (bmp == 0) return; // 失敗時は valid を立てず次 present で再試行
+    c.XShapeCombineMask(st.display, st.window, c.ShapeInput, 0, 0, bmp, c.ShapeSet);
+    _ = c.XFreePixmap(st.display, bmp);
+    _ = c.XFlush(st.display);
+    st.ct_region_valid = true;
+}
 
 fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: u32) Error!void {
     const dpy = st.display;
@@ -824,6 +997,7 @@ fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
     };
     st.width = new_w;
     st.height = new_h;
+    st.ct_region_valid = false; // TASK-104.2: サイズ変更で click-through input shape を再計算させる（旧マスクは stale）
     freeBlitState(st.display, &old);
 }
 

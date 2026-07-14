@@ -327,6 +327,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     uint32_t compositionLen;
     uint32_t compositionRevision;
     uint32_t compositionCursor; // preedit 内 UTF-8 バイトオフセット
+
+    // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
+    BOOL transparentMode;      // YES で CGImage を premultiplied alpha 化し fb の alpha を honor
+    BOOL clickThrough;         // YES で透明画素上のクリックを背後へ抜けさせる（per-pixel）
+    BOOL clickThroughState;    // 直近設定した ignoresMouseEvents 値（変化時のみ再設定するためのキャッシュ）
+    NSEvent* lastMouseDownEvent; // 直近の左ボタン mouse-down（beginDrag 用に retain。one-shot で消費）
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
@@ -354,6 +360,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 // composition snapshot（platform_get_composition_snapshot から呼ぶ）
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta;
 
+// 透過ウィンドウ関連 (TASK-104)
+- (void)setTransparentMode:(BOOL)on;
+- (void)setClickThrough:(BOOL)on;
+- (void)refreshClickThrough;
+- (NSEvent *)takeLastMouseDownEvent;
+
 @end
 
 @implementation FramebufferView
@@ -380,6 +392,10 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         compositionRevision = 0;
         compositionCursor = 0;
         memset(compositionUtf8, 0, sizeof(compositionUtf8));
+        transparentMode = NO;   // TASK-104: 既定は不透明（従来挙動と bit 一致）
+        clickThrough = NO;
+        clickThroughState = NO; // 初期 ignoresMouseEvents=NO と一致
+        lastMouseDownEvent = nil;
 
         // ダブルバッファを確保（ページアラインメント推奨）
         buffer0 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
@@ -461,6 +477,10 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         CGDataProviderRef provider = (displayBuffer == buffer0) ? provider0 : provider1;
 
         // CGImageを作成（毎フレーム必要）
+        // TASK-104: 透過モードは premultiplied alpha で fb の alpha を honor。既定は従来どおり alpha skip。
+        CGBitmapInfo bitmapInfo = (transparentMode
+            ? (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
+            : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
         CGImageRef image = CGImageCreate(
             width,
             height,
@@ -468,7 +488,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             32,
             width * 4,
             colorSpace,
-            kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
+            bitmapInfo,
             provider,
             NULL,
             false,
@@ -480,6 +500,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
         // CGImageを解放
         CGImageRelease(image);
+
+        // TASK-104: callback/display-link 経路でも click-through を更新（無効時は即 return）
+        [self refreshClickThrough];
 
         CFAbsoluteTime renderEnd = CFAbsoluteTimeGetCurrent();
 
@@ -547,7 +570,10 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     // 表示するバッファに対応するCGDataProviderを選択
     CGDataProviderRef provider = (displayBuffer == buffer0) ? provider0 : provider1;
 
-    // CGImageを作成
+    // CGImageを作成（TASK-104: 透過モードは premultiplied alpha で alpha を honor）
+    CGBitmapInfo bitmapInfo = (transparentMode
+        ? (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
+        : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
     CGImageRef image = CGImageCreate(
         width,
         height,
@@ -555,7 +581,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         32,
         width * 4,
         colorSpace,
-        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
+        bitmapInfo,
         provider,
         NULL,
         false,
@@ -567,10 +593,72 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
     // CGImageを解放
     CGImageRelease(image);
+
+    // TASK-104: クリック透過のカーソル位置判定を更新（clickThrough 無効時は即 return）
+    [self refreshClickThrough];
 }
 
 - (BOOL)isOpaque {
-    return YES;
+    return transparentMode ? NO : YES; // TASK-104: 透過モードは非不透明
+}
+
+// TASK-104: クリック透過（per-pixel）。NSView.hitTest で nil を返しても背後の別アプリへは
+// イベントが抜けない（それは window-level の ignoresMouseEvents）。そこで present 毎に現在の
+// カーソル位置の alpha を見て `window.ignoresMouseEvents` をトグルする: 透明画素(alpha==0)上なら
+// クリックが背後へ抜け、不透明な本体上なら window が受ける（ドラッグ/右クリックが効く）。
+// present はアプリの main loop が毎フレーム回すためカーソルが本体へ戻れば次フレームで復帰する。
+// ホットパス宣言: present 毎（フレーム毎）だが 1 画素サンプル + 座標変換 + プロパティ設定のみ。
+// 座標変換の除算はフレーム毎に定数回（per-pixel ループではない）。alloc なし。性能規約の全画素ループ対象外。
+- (void)refreshClickThrough {
+    if (!clickThrough) return;
+    NSWindow* win = self.window;
+    if (!win) return;
+    uint32_t* buf = displayBuffer ? displayBuffer : currentBuffer;
+    if (!buf) return;
+    NSPoint screenPt = [NSEvent mouseLocation];
+    NSPoint winPt = [win convertPointFromScreen:screenPt];
+    NSPoint local = [self convertPoint:winPt fromView:nil]; // window → view（非 flipped = 左下原点）
+    NSRect b = self.bounds;
+    BOOL passThrough = YES; // カーソルが window 外/未確定なら抜けさせる
+    // カーソルが view 矩形の内側にあるときだけ alpha を見る（外は passThrough=YES のまま）
+    if (b.size.width > 0 && b.size.height > 0 &&
+        local.x >= 0 && local.x < b.size.width && local.y >= 0 && local.y < b.size.height) {
+        int px = (int)(local.x / b.size.width * (CGFloat)width);
+        int py = (int)((1.0 - local.y / b.size.height) * (CGFloat)height); // top-left 原点へ
+        if (px >= width) px = width - 1; // 右端/下端の丸め込みで範囲外になるのを clamp（下端1px落ち防止）
+        if (py >= height) py = height - 1;
+        if (px < 0) px = 0;
+        if (py < 0) py = 0;
+        uint8_t alpha = (uint8_t)(buf[py * width + px] >> 24); // canonical BGRA: 上位8bit=alpha
+        passThrough = (alpha == 0);
+    }
+    if (passThrough != clickThroughState) { // 値が変わったときだけ WindowServer 状態を書く
+        win.ignoresMouseEvents = passThrough;
+        clickThroughState = passThrough;
+    }
+}
+
+// TASK-104: 透過/クリック透過モードの設定（platform_create_window_ex / platform_set_click_through から）。
+- (void)setTransparentMode:(BOOL)on {
+    transparentMode = on;
+    contentLayer.opaque = on ? NO : YES;
+    [self setNeedsDisplay:YES];
+}
+- (void)setClickThrough:(BOOL)on {
+    clickThrough = on;
+    if (!on && self.window) {
+        self.window.ignoresMouseEvents = NO; // 無効化時は必ず受け取りへ戻す
+        clickThroughState = NO;
+    }
+}
+
+// TASK-104: 直近の左ボタン mouse-down NSEvent を beginDrag 用に取り出して消費する（one-shot）。
+// 呼び出し時点で保持をクリアし、同じ event を再利用しない（performWindowDragWithEvent: 後に
+// mouse-up が届かない場合があるため、mouse-up 破棄だけに頼らない）。無ければ nil。
+- (NSEvent *)takeLastMouseDownEvent {
+    NSEvent* ev = lastMouseDownEvent;
+    lastMouseDownEvent = nil;
+    return ev;
 }
 
 // ========================================
@@ -1000,9 +1088,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 // mouseDown / mouseUp / mouseDragged: 左ボタン
 - (void)mouseDown:(NSEvent *)event {
+    lastMouseDownEvent = event; // TASK-104: beginDrag 用に直近の左 down を保持（ARC strong）
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:button_from_event(event) from:event];
 }
 - (void)mouseUp:(NSEvent *)event {
+    lastMouseDownEvent = nil; // TASK-104: up で stale 破棄（drag 開始済みなら既に消費済み）
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_UP withButton:button_from_event(event) from:event];
 }
 - (void)mouseDragged:(NSEvent *)event {
@@ -1187,9 +1277,35 @@ bool platform_init(void) {
     return true;
 }
 
-// ウィンドウ作成
+// TASK-104: borderless ウィンドウは既定では key/main になれない。NSWindow を subclass して
+// canBecomeKeyWindow/canBecomeMainWindow を YES にし、入力・IME first responder・
+// performWindowDragWithEvent: が効くようにする。透過/borderless 時のみ使う。
+@interface MascotWindow : NSWindow
+@end
+@implementation MascotWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
+// ウィンドウ作成（既存 API。opts なし = 従来どおり不透明・タイトル付き）
 PlatformWindow* platform_create_window(int width, int height, const char* title,
                                       FrameCallback callback, void* userdata) {
+    return platform_create_window_ex(width, height, title, callback, userdata, NULL);
+}
+
+// TASK-104: options 付きウィンドウ作成。opts==NULL は従来動作。
+PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
+                                          FrameCallback callback, void* userdata,
+                                          const PlatformWindowOptions* opts) {
+    // unknown flags / reserved!=0 は NULL（silent 無視しない。facade が error.Unsupported へ）
+    BOOL transparent = NO, borderless = NO;
+    if (opts) {
+        const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS;
+        if ((opts->flags & ~known) != 0 || opts->reserved != 0) return NULL;
+        transparent = (opts->flags & PLATFORM_WINDOW_TRANSPARENT) != 0;
+        borderless = (opts->flags & PLATFORM_WINDOW_BORDERLESS) != 0;
+    }
+
     PlatformWindow* platformWindow = (PlatformWindow*)malloc(sizeof(PlatformWindow));
     if (!platformWindow) return NULL;
 
@@ -1203,20 +1319,38 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
 
         // ウィンドウを作成
         NSRect frame = NSMakeRect(0, 0, width, height);
-        NSWindowStyleMask styleMask = NSWindowStyleMaskTitled |
-                                       NSWindowStyleMaskClosable |
-                                       NSWindowStyleMaskMiniaturizable |
-                                       NSWindowStyleMaskResizable; // TASK-23: 自由リサイズ
+        NSWindowStyleMask styleMask;
+        if (borderless) {
+            styleMask = NSWindowStyleMaskBorderless; // TASK-104: 枠なし（マスコット等）
+        } else {
+            styleMask = NSWindowStyleMaskTitled |
+                        NSWindowStyleMaskClosable |
+                        NSWindowStyleMaskMiniaturizable |
+                        NSWindowStyleMaskResizable; // TASK-23: 自由リサイズ
+        }
 
-        platformWindow->window = [[NSWindow alloc] initWithContentRect:frame
-                                                             styleMask:styleMask
-                                                               backing:NSBackingStoreBuffered
-                                                                 defer:NO];
+        // borderless は key window になれる subclass を使う（transparent 単独は通常 NSWindow で可）
+        Class windowClass = borderless ? [MascotWindow class] : [NSWindow class];
+        platformWindow->window = [[windowClass alloc] initWithContentRect:frame
+                                                               styleMask:styleMask
+                                                                 backing:NSBackingStoreBuffered
+                                                                   defer:NO];
 
         [platformWindow->window setTitle:[NSString stringWithUTF8String:title]];
 
         // hover の mouseMoved: を受け取るために必須 (TASK-21.1)
         [platformWindow->window setAcceptsMouseMovedEvents:YES];
+
+        // TASK-104: 透過ウィンドウ設定（背後が透ける）
+        if (transparent) {
+            [platformWindow->window setOpaque:NO];
+            [platformWindow->window setBackgroundColor:[NSColor clearColor]];
+        }
+        // borderless は透過有無に関わらず矩形影を消し、ドラッグ移動可能にする（設計契約）
+        if (borderless) {
+            [platformWindow->window setHasShadow:NO];
+            [platformWindow->window setMovable:YES];
+        }
 
         // カスタムビューを作成して設定
         platformWindow->view = [[FramebufferView alloc] initWithFrame:frame
@@ -1225,6 +1359,9 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
                                                             callback:callback
                                                             userdata:userdata
                                                      platformWindow:platformWindow];
+        if (transparent) {
+            [platformWindow->view setTransparentMode:YES]; // CGImage を premultiplied alpha 化
+        }
         [platformWindow->window setContentView:platformWindow->view];
         // setContentView 後に updateTrackingAreas を呼ぶ (view の bounds が確定したタイミングで TrackingArea を構築)
         [platformWindow->view updateTrackingAreas];
@@ -1261,6 +1398,76 @@ void platform_enter_fullscreen(PlatformWindow* window) {
         }
         if (!([w styleMask] & NSWindowStyleMaskFullScreen)) {
             [w toggleFullScreen:nil];
+        }
+    }
+}
+
+// ========================================
+// 透過 / borderless ウィンドウ + ドラッグ移動 の C ABI 実装 (TASK-104)
+// ========================================
+
+// 直近の左 mouse-down を使って OS の対話的ウィンドウ移動を開始する。
+void platform_begin_window_drag(PlatformWindow* window) {
+    if (!window || !window->view || !window->window) return;
+    @autoreleasepool {
+        NSEvent* ev = [window->view takeLastMouseDownEvent]; // one-shot 消費（呼び出し時にクリア）
+        if (!ev) return; // 保持 event が無ければ no-op
+        [window->window performWindowDragWithEvent:ev];
+    }
+}
+
+void platform_set_always_on_top(PlatformWindow* window, bool on) {
+    if (!window || !window->window) return;
+    @autoreleasepool {
+        // status level = Dock より前・大半のウィンドウより前。off は通常レベルへ戻す。
+        [window->window setLevel:(on ? NSStatusWindowLevel : NSNormalWindowLevel)];
+    }
+}
+
+void platform_set_click_through(PlatformWindow* window, bool on) {
+    if (!window || !window->view) return;
+    [window->view setClickThrough:(on ? YES : NO)];
+}
+
+void platform_set_dock_visible(bool visible) {
+    @autoreleasepool {
+        NSApplication* app = [NSApplication sharedApplication];
+        // accessory = Dock アイコン/メニューバー無しの常駐アプリ。regular = 通常アプリ。
+        [app setActivationPolicy:(visible ? NSApplicationActivationPolicyRegular
+                                          : NSApplicationActivationPolicyAccessory)];
+    }
+}
+
+// 終了メニュー用のターゲット。action でフラグを立て、popUp のモーダル復帰後に読む。
+@interface QuitMenuTarget : NSObject
+@property (nonatomic) BOOL quitChosen;
+- (void)onQuit:(id)sender;
+@end
+@implementation QuitMenuTarget
+- (void)onQuit:(id)sender { (void)sender; self.quitChosen = YES; }
+@end
+
+void platform_show_quit_menu(PlatformWindow* window) {
+    if (!window || !window->view) return;
+    @autoreleasepool {
+        QuitMenuTarget* target = [[QuitMenuTarget alloc] init];
+        target.quitChosen = NO;
+        NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Mascot"];
+        NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:@"終了"
+                                                      action:@selector(onQuit:)
+                                               keyEquivalent:@""];
+        [item setTarget:target];
+        [menu addItem:item];
+        // 現在のマウス位置（view ローカル）にポップアップ。モーダルで、選択されるまで戻らない。
+        NSPoint screenPt = [NSEvent mouseLocation];
+        NSPoint winPt = [window->window convertPointFromScreen:screenPt];
+        NSPoint viewPt = [window->view convertPoint:winPt fromView:nil];
+        [menu popUpMenuPositioningItem:nil atLocation:viewPt inView:window->view];
+        if (target.quitChosen) {
+            PlatformEvent ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = PLATFORM_EVENT_QUIT;
+            queue_push(&window->event_queue, &ev);
         }
     }
 }
