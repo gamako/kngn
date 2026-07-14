@@ -399,6 +399,7 @@ const App = struct {
     history_dirty: bool = true,
     history_seen_seq: u64 = 1,
     /// capture 開始時に latch した実効パラメータ（canonical args の材料。§5c'）。
+    ui_stroke_layer_id: u64 = 1,
     ui_stroke_tool: ToolKind = .pen,
     ui_stroke_color: u32 = 0,
     ui_stroke_size: u32 = 4,
@@ -725,6 +726,7 @@ const App = struct {
             else => return error.UnsupportedTool,
         };
         return .{
+            .layer_id = 0,
             .tool = tool,
             .color = p.color orelse self.palette.current(),
             .size = p.size orelse self.brush.size,
@@ -733,10 +735,47 @@ const App = struct {
         };
     }
 
+    /// stroke の発信元 layer を安定 id へ解決する。省略時は capture/dispatch 元の selected layer。
+    fn resolveStrokeLayerId(self: *App, ref: ?actions.LayerRef) !u64 {
+        const idx = if (ref) |r|
+            self.resolveStrokeLayerIndex(r) catch |err| {
+                platform.setActionErrorDetail("layer_not_found", "use #<id> from digest canvas");
+                return err;
+            }
+        else
+            self.canvas.selected_layer;
+        return @intFromEnum(self.doc.layerIdAt(idx) orelse {
+            platform.setActionErrorDetail("layer_not_found", "use #<id> from digest canvas");
+            return error.LayerNotFound;
+        });
+    }
+
+    fn resolveStrokeLayerIndex(self: *App, ref: actions.LayerRef) !usize {
+        return resolveLayerRef(self, ref, true) catch |err| switch (err) {
+            error.IdRequired, error.UnknownLayerId, error.OutOfRange => return error.LayerNotFound,
+        };
+    }
+
+    /// `.relay` route の入口で、発信元の tool/color/brush 設定と layer id を焼き込む。
+    /// fill の旧 legacy 経路だけは従来の raw args を維持する。
+    fn canonicalizeStroke(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
+        const parsed = try actions.parseStroke(args, &pts_buf);
+        const eff = app.resolveEffectiveStroke(parsed.params) catch |err| {
+            if (app.active_kind == .fill and parsed.params.tool == null) return args;
+            return err;
+        };
+        var canonical = eff;
+        canonical.layer_id = try app.resolveStrokeLayerId(parsed.params.layer);
+        return actions.formatCanonicalStroke(scratch, canonical, parsed.points) catch return error.ArgsTooLong;
+    }
+
     /// UI stroke の点列蓄積を開始する（capture 開始時。実効パラメータもここで latch する。§5c）。
     fn uiStrokeBegin(self: *App, p: core.Vec2) void {
         self.ui_stroke_len = 0;
         self.ui_stroke_overflow = false;
+        self.ui_stroke_layer_id = @intFromEnum(self.doc.layerIdAt(self.canvas.selected_layer) orelse .invalid);
         self.ui_stroke_tool = self.active_kind;
         self.ui_stroke_color = self.palette.current();
         self.ui_stroke_size = self.brush.size;
@@ -784,6 +823,7 @@ const App = struct {
         };
         var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
         const canon = actions.formatCanonicalStroke(&canon_buf, .{
+            .layer_id = self.ui_stroke_layer_id,
             .tool = tool,
             .color = self.ui_stroke_color,
             .size = self.ui_stroke_size,
@@ -894,6 +934,7 @@ const App = struct {
         };
         var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
         const canon = actions.formatCanonicalStroke(&canon_buf, .{
+            .layer_id = self.ui_stroke_layer_id,
             .tool = tool,
             .color = color,
             .size = size,
@@ -2590,10 +2631,23 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     _ = buf;
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
-    if (app.selectedLayerIsText()) return error.TextLayerSelected; // TASK-79.5: text layer 直接編集禁止
     var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
     const parsed = try actions.parseStroke(args, &pts_buf);
     const pts = parsed.points;
+    const target_layer = if (parsed.params.layer) |ref|
+        try app.resolveStrokeLayerIndex(ref)
+    else
+        app.canvas.selected_layer;
+    if (target_layer >= app.canvas.layers.items.len) return error.LayerNotFound;
+    if (app.canvas.layers.items[target_layer].kind == .text) return error.TextLayerSelected;
+    const saved_doc_layer = app.doc.selected_layer;
+    const saved_canvas_layer = app.canvas.selected_layer;
+    defer {
+        app.doc.selected_layer = saved_doc_layer;
+        app.canvas.selected_layer = saved_canvas_layer;
+    }
+    app.doc.selected_layer = target_layer;
+    app.canvas.selected_layer = target_layer;
 
     // 実効パラメータの解決と latch。fill（tool= 無し + active_kind==.fill）のみ legacy 経路。
     var tool: core.Tool = undefined;
@@ -3095,13 +3149,10 @@ fn layerRefToId(app: *App, ref: actions.LayerRef, forbid_index: bool) !u64 {
 /// のみ raw args のまま記録する（従来挙動の互換維持。canonical 化は pen/eraser/brush が対象）。
 fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
-    const parsed = try actions.parseStroke(args, &pts_buf);
-
     var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
-    const exec_args: []const u8 = if (app.resolveEffectiveStroke(parsed.params)) |eff|
-        actions.formatCanonicalStroke(&canon_buf, eff, parsed.points) catch return error.ArgsTooLong
-    else |err| blk: {
+    const exec_args = App.canonicalizeStroke(app, args, &canon_buf) catch |err| blk: {
+        var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
+        const parsed = actions.parseStroke(args, &pts_buf) catch return err;
         if (app.active_kind != .fill or parsed.params.tool != null) return err;
         break :blk args; // fill legacy（actionStroke 側も同じ判定で legacy 経路に入る）
     };
@@ -3164,6 +3215,8 @@ const pixie_args_set_pixel_perfect: @FieldType(platform.Action, "args") = &.{
     .{ .name = "on", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。canonical wire は #id" },
+    .{ .name = "params", .kind = "string", .optional = true, .desc = "tool/color/size/opacity/hardness の k=v" },
     .{ .name = "xy", .kind = "int", .variadic = true, .desc = "canvas 座標 x y の組（偶数個・最低1組）" },
 };
 const pixie_args_path: @FieldType(platform.Action, "args") = &.{
@@ -3217,9 +3270,9 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "merge_down", .ctx = app, .run = recordedAction("merge_down", .record), .network_policy = .relay, .args = pixie_args_layer_ref_opt });
     platform.registerAction(.{ .name = "frame", .ctx = app, .run = recordedAction("frame", .record), .args = pixie_args_frame });
     platform.registerAction(.{ .name = "set_onion", .ctx = app, .run = recordedAction("set_onion", .record), .args = pixie_args_set_onion });
-    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record), .network_policy = .relay, .args = pixie_args_set_color });
-    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record), .network_policy = .relay, .args = pixie_args_set_tool });
-    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay, .args = pixie_args_stroke });
+    platform.registerAction(.{ .name = "set_color", .ctx = app, .run = recordedAction("set_color", .record), .network_policy = .local_only, .args = pixie_args_set_color });
+    platform.registerAction(.{ .name = "set_tool", .ctx = app, .run = recordedAction("set_tool", .record), .network_policy = .local_only, .args = pixie_args_set_tool });
+    platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay, .canonicalize = App.canonicalizeStroke, .args = pixie_args_stroke });
     platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record), .args = pixie_args_path });
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
@@ -3242,7 +3295,7 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "palette_set", .ctx = app, .run = recordedAction("palette_set", .record), .network_policy = .reject_when_synced, .desc = "replace palette with hex list (1..64)", .args = pixie_args_palette_set });
     // TASK-90: shape は stroke と同じ .relay（document 画素変更・undoable）。
     // set_symmetry / set_pixel_perfect も描画結果に影響する document 系トグル → .relay
-    // （set_tool / set_color と同型。peer 間で描画モードを共有する）。
+    // set_tool / set_color は per-peer のため .local_only。stroke は tool/color を payload に焼き込む。
     platform.registerAction(.{ .name = "shape", .ctx = app, .run = recordedAction("shape", .record), .network_policy = .relay, .desc = "draw shape line|rect|ellipse p0 p1 [fill]", .args = pixie_args_shape });
     platform.registerAction(.{ .name = "set_symmetry", .ctx = app, .run = recordedAction("set_symmetry", .record), .network_policy = .relay, .desc = "symmetry off|v|h|quad", .args = pixie_args_set_symmetry });
     platform.registerAction(.{ .name = "set_pixel_perfect", .ctx = app, .run = recordedAction("set_pixel_perfect", .record), .network_policy = .relay, .desc = "pixel-perfect pen 0|1", .args = pixie_args_set_pixel_perfect });

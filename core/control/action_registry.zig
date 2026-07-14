@@ -61,6 +61,8 @@ pub const Action = struct {
     args: ?[]const ArgSpec = null,
     /// netsync 配送ポリシー（既定 `.reject_when_synced`。既存 registerAction 呼び出しは無改修）。
     network_policy: NetworkPolicy = .reject_when_synced,
+    /// `.relay` の PROPOSE/ローカル適用前に引数を canonical 化する callback（省略可）。
+    canonicalize: ?CanonicalizeFn = null,
     /// 操作を実行し結果1行を返す write callback。
     /// - `args` は `action <name>` の後の残り行 raw テキスト（trim 済み・再トークン化しない）。
     /// - 戻り値は改行を含めない1行。`buf` 内の slice か ctx/静的所有の一時 slice を返してよい。
@@ -70,6 +72,10 @@ pub const Action = struct {
 
 /// router 未設定時の `routeLocalAction` は `dispatch` と完全等価。
 pub const RouterFn = *const fn (name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8;
+
+/// `.relay` action の wire 引数を router へ渡す前に発信元の文脈で正規化する callback。
+/// 戻り値は `scratch` または static storage を借用してよい。router は同期的に消費する。
+pub const CanonicalizeFn = *const fn (ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8;
 
 pub const MAX_ACTIONS = 48; // TASK-90 で 32→48（pixie 31 件で満杯目前の解消）。以前: TASK-62.5.3 で 16→32
 
@@ -271,8 +277,18 @@ pub fn setRouter(r: ?RouterFn) void {
 /// 前回 detail が漏れない。TASK-62.5.9 P1。dispatch 内クリアは冪等）。
 pub fn routeLocalAction(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     clearActionErrorDetail();
-    if (router) |r| return r(name, args, buf);
-    return dispatch(name, args, buf);
+    const act = findAction(name);
+    var routed_args = args;
+    var scratch: [4096]u8 = undefined;
+    if (act) |a| {
+        if (a.network_policy == .relay) {
+            if (a.canonicalize) |canonicalize| {
+                routed_args = try canonicalize(a.ctx, args, &scratch);
+            }
+        }
+    }
+    if (router) |r| return r(name, routed_args, buf);
+    return dispatch(name, routed_args, buf);
 }
 
 /// テスト用リセット（count=0 / enabled=false / router=null / error detail クリア）。
@@ -323,6 +339,12 @@ fn testRunErr(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
 
 fn testRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     return std.fmt.bufPrint(buf, "routed:{s}:{s}", .{ name, args }) catch "routed";
+}
+
+fn testCanonicalize(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const c: *TestCtx = @ptrCast(@alignCast(ctx));
+    _ = c;
+    return std.fmt.bufPrint(scratch, "canonical:{s}", .{args}) catch error.TooLong;
 }
 
 test "action_registry: disabled no-op" {
@@ -428,6 +450,17 @@ test "action_registry: network_policy 既定は reject_when_synced" {
     try testing.expectEqual(NetworkPolicy.reject_when_synced, findAction("n").?.network_policy);
     registerAction(.{ .name = "r", .ctx = &c, .run = testRun, .network_policy = .relay });
     try testing.expectEqual(NetworkPolicy.relay, findAction("r").?.network_policy);
+}
+
+test "action_registry: relay の canonicalize は router 前に適用される" {
+    resetForTest();
+    setEnabled(true);
+    var c = TestCtx{};
+    registerAction(.{ .name = "stroke", .ctx = &c, .run = testRun, .network_policy = .relay, .canonicalize = testCanonicalize });
+    setRouter(testRouter);
+    var buf: [128]u8 = undefined;
+    const out = try routeLocalAction("stroke", "1 2", &buf);
+    try testing.expectEqualStrings("routed:stroke:canonical:1 2", out);
 }
 
 fn testRunSetDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {

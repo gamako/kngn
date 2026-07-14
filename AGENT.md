@@ -537,7 +537,7 @@ quit                       # 終了（EOF でも終了）
     - **非解釈の不変条件**: code/suggestion の語彙は app 側が返す。framework は透過（desc と同様に framing 保護だけ）。MCP ブリッジ（TASK-88）はこの wire をそのまま tool エラーとして読む前提。
     - **pixie 実例**: `open` の読込失敗（`ReadFailed`/`FileNotFound`）→ `code=file_not_found` / `next=check path or use save first`。`select_layer` の `OutOfRange` → `code=index_out_of_range` / `next=use add_layer or 0..N-1`。
   - **登録**: `registerAction` は harness 無効時 no-op、同名上書き、空白/`;`/改行を含む名前と空名は拒否、registry 満杯（48件。TASK-90 で 32→48。以前 TASK-62.5.3 で 16→32）は skip。組み込み action は無い（framework は action の中身を一切解釈しないので予約名の概念も無い）。app 側の登録は各採用タスクで行う（本タスクは framework 側のみ）。
-  - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor`/`history`/`diff`/`palette` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（`#` 有無どちらも許容） / `set_tool <pen|eraser|brush|bezier|select|fill>` / `stroke <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗） / `save <path>` / `open <path>` / `recipe_save <path>` / `recipe_replay <path>`（TASK-62.5.8。下記「レシピ」節） / `diff_mark`（TASK-87。現 composite を `digest diff` の基準にコピー。引数なし・メタ操作で CommandLog 非記録） / `replace_color [#<id>|<index>] <from> <to>`（TASK-89。layer ref は optional・省略時 selected。netsync 中は #id 必須・`.relay`。hex 2 個のみは従来互換・undo 可） / `palette_ramp <seed_hex> <n>`（TASK-89。OKLCH 明暗ランプ n=2..32・パレット全置換・`.reject_when_synced`） / `palette_from_png <path>`（TASK-89。PNG 頻度抽出→パレット全置換・上限64・`.reject_when_synced`） / `palette_set <hex...>`（TASK-89。1..64 色でパレット全置換・`.reject_when_synced`）。palette 系は document 状態（.pix v4 PLTE / netsync SYNC 対象）のため session 中のローカル変更は拒否。**.pix 互換**: v4 reader が v2/v3 を読む後方互換のみ（v3 reader は schema>3 を拒否。旧 reader が v4 を読めるわけではない）。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
+  - **pixie の登録 action（TASK-64。probe の pixie=`canvas`/`undo`/`tool`/`cursor`/`history`/`diff`/`palette` と対称の write 口）**: `undo` / `redo` / `clear` / `add_layer` / `delete_layer` / `select_layer <idx>` / `set_layer_visible <idx> <0|1>` / `set_layer_opacity <idx> <0-255>` / `move_layer <+1|-1>` / `set_color <RRGGBB>`（per-peer local） / `set_tool <pen|eraser|brush|bezier|select|fill>`（per-peer local） / `stroke [layer=#<id>] [tool=...] [color=...] [size=...] [opacity=...] [hardness=...] <x0> <y0> [x y ...]`（canvas 座標。奇数個は失敗。relay wire は origin context + stable layer id を焼き込む） / `save <path>` / `open <path>` / `recipe_save <path>` / `recipe_replay <path>`（TASK-62.5.8。下記「レシピ」節） / `diff_mark`（TASK-87。現 composite を `digest diff` の基準にコピー。引数なし・メタ操作で CommandLog 非記録） / `replace_color [#<id>|<index>] <from> <to>`（TASK-89。layer ref は optional・省略時 selected。netsync 中は #id 必須・`.relay`。hex 2 個のみは従来互換・undo 可） / `palette_ramp <seed_hex> <n>`（TASK-89。OKLCH 明暗ランプ n=2..32・パレット全置換・`.reject_when_synced`） / `palette_from_png <path>`（TASK-89。PNG 頻度抽出→パレット全置換・上限64・`.reject_when_synced`） / `palette_set <hex...>`（TASK-89。1..64 色でパレット全置換・`.reject_when_synced`）。palette 系は document 状態（.pix v4 PLTE / netsync SYNC 対象）のため session 中のローカル変更は拒否。**.pix 互換**: v4 reader が v2/v3 を読む後方互換のみ（v3 reader は schema>3 を拒否。旧 reader が v4 を読めるわけではない）。全 action は UI/キーボードと同じ `App.do*` メソッドを通るため undo 経路が一致する（`action stroke` で描いた内容を `inject key_down Z cmd` で undo できる、等）。実装は `apps/editor/apps/pixie/main.zig`（dispatch + `registerActions`）+ `actions.zig`（純パーサ。App/kit 非依存で単体テスト可能）。詳細な action⇄UndoCmd対応表は main.zig の該当セクションの doc comment 参照。
 
 ### 使い方（replay = file トランスポート）
 
@@ -753,7 +753,9 @@ action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry�
 | `.reject_when_synced` | 即 `RejectedWhileSynced` | 同左 |
 | `.undo_own` / `.redo_own` | 自分の最新 undoable を revert / 直近 revert を再 commit（62.3.5） | PROPOSE_REVERT / 原コマンド PROPOSE |
 
-既定は `.reject_when_synced`。pixie MVP: `stroke`/`set_color`/`set_tool`=`.relay`、`save`=`.local_only`。
+既定は `.reject_when_synced`。pixie MVP: `stroke`=`.relay`（発信元の tool/color/size/opacity/hardness と
+`layer=#<id>` を canonical 化）、`set_color`/`set_tool`=`.local_only`（per-peer UI 状態）、
+`save`=`.local_only`。layer 構造 op（add/delete/visible/opacity/move 等）は TASK-94 で `.relay` 昇格済み。
 
 ### PROPOSE/COMMIT/REJECT の流れ
 
@@ -767,23 +769,38 @@ action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry�
 ### MVP 2 プロセス手順（probe ベースの決定的待ち）
 
 ```bash
-# 起動（port file 出現待ちだけ sleep 可）
-VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vpHost.port \
-  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9100 zig build run-pixie &
-VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vpClient.port \
-  VP_NETSYNC_CONNECT=127.0.0.1:9100 zig build run-pixie &
+# 起動（port file 出現待ちだけ sleep 可。netsync=9110、port file は workspace の .e2e）
+mkdir -p .e2e
+VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=./.e2e/host.port \
+  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
+VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=./.e2e/client.port \
+  VP_NETSYNC_CONNECT=127.0.0.1:9110 zig build run-pixie &
 
 # client join 完了: awaiting_sync=0 まで再照合
-until scripts/drive --port-file /tmp/vpClient.port 'digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+until scripts/drive --port-file ./.e2e/client.port 'digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
 
-scripts/drive --port-file /tmp/vpClient.port 'action stroke 10 10 60 10'  # → "proposed <id>"
+# 共有 layer を1枚増やし、host/client が別 layer を選ぶ（select_layer は local_only）。
+scripts/drive --port-file ./.e2e/host.port 'action add_layer'
+until scripts/drive --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+scripts/drive --port-file ./.e2e/host.port 'action select_layer 0; action set_tool brush; action set_color FF0000'
+scripts/drive --port-file ./.e2e/client.port 'action select_layer 1; action set_tool pen; action set_color 0000FF'
 
-# relay 完了: 両側 last_seq>=1 && pending=0 まで再照合（N は期待 commit 数）
-until scripts/drive --port-file /tmp/vpHost.port 'digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
-until scripts/drive --port-file /tmp/vpClient.port 'digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+# 相互 stroke。canonical wire には origin の layer=#id/color/tool が入る。
+scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
+scripts/drive --port-file ./.e2e/client.port 'action stroke 20 20 70 20'  # → "proposed <id>"
 
-scripts/drive --port-file /tmp/vpHost.port 'digest canvas'
-scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
+# relay 完了: COMMIT を進める host の step を混ぜ、両側 last_seq>=3 && pending=0 を再照合。
+until scripts/drive --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+
+scripts/drive --port-file ./.e2e/host.port 'digest canvas'    # l0/l1 の crc
+scripts/drive --port-file ./.e2e/client.port 'digest canvas'  # 同じ l0/l1 crc、selected は各 peer のまま
+
+# 実測値を採取して l0/l1 の crc 一致、tool/color/selected の peer-local 性を assert する。
+# 終了は必ず scripts/drive の quit（pkill 禁止）。
+scripts/drive --port-file ./.e2e/host.port 'quit'
+scripts/drive --port-file ./.e2e/client.port 'quit'
 ```
 
 ### netsync 観測 probe（TASK-62.3.4）
@@ -811,7 +828,7 @@ scripts/drive --port-file /tmp/vpClient.port 'digest canvas'  # crc 一致
 
 ### セッション中の制約・retry
 
-- レイヤー操作・PNG open は session 中不可（既定 reject）
+- PNG open は session 中不可（既定 reject）。layer 構造 op は `.relay` で、同じ stable `#id` を全 peer に適用する。
 - save のみローカル可（session 中は CommandLog に記録しない = wire seq 非消費）
 - **retry するのは clientSend 失敗（エラー応答）のときだけ**。`"proposed"` / `"revert proposed"` を一度受けたら再送しない。以後は `digest netsync` の決定的待ち
 - 接続確立前の action は失敗しうる → join 完了（`awaiting_sync=0`）後に再試行（上記 retry 条件）

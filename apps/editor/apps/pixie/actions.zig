@@ -298,7 +298,7 @@ pub fn parseStrokePoints(args: []const u8, buf: []Point) ParseError![]Point {
 
 // ── stroke の k=v 拡張（TASK-62.5.3 §5c'）─────────────────────────────
 //
-// 文法: `stroke [tool=pen|eraser|brush] [color=RRGGBB] [size=N] [opacity=N] [hardness=N] x0 y0 [x y ...]`
+// 文法: `stroke [layer=#id] [tool=pen|eraser|brush] [color=RRGGBB] [size=N] [opacity=N] [hardness=N] x0 y0 [x y ...]`
 // k=v トークンは座標列の**前**にのみ置ける（0 個以上・順不同）。パラメータ無しは従来文法と
 // 後方互換（TASK-64 の既存 replay スクリプト不変）。fail-fast 規約: 重複 key・未知 key・
 // 値不正（tool 名 / hex / 数値範囲）はすべてエラー（inject 修飾子の「typo を握りつぶさない」
@@ -313,6 +313,7 @@ pub const MAX_BRUSH_SIZE: u32 = 64;
 
 /// stroke の明示 k=v パラメータ（null = 未指定 → 呼び出し側が現在の App 状態で補完する）。
 pub const StrokeParams = struct {
+    layer: ?LayerRef = null,
     tool: ?StrokeTool = null,
     color: ?u32 = null, // canonical 0xFFRRGGBB
     size: ?u32 = null, // 1..MAX_BRUSH_SIZE
@@ -333,7 +334,10 @@ pub fn parseStroke(args: []const u8, buf: []Point) ParseError!StrokeArgs {
         if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
             const key = tok[0..eq];
             const val = tok[eq + 1 ..];
-            if (std.mem.eql(u8, key, "tool")) {
+            if (std.mem.eql(u8, key, "layer")) {
+                if (params.layer != null) return error.DuplicateKey;
+                params.layer = try parseLayerRefToken(val);
+            } else if (std.mem.eql(u8, key, "tool")) {
                 if (params.tool != null) return error.DuplicateKey;
                 params.tool = std.meta.stringToEnum(StrokeTool, val) orelse return error.UnknownTool;
             } else if (std.mem.eql(u8, key, "color")) {
@@ -376,6 +380,7 @@ pub fn parseStroke(args: []const u8, buf: []Point) ParseError!StrokeArgs {
 
 /// canonical stroke の実効パラメータ（明示 k=v > 現在の App 状態、の解決済み値）。
 pub const EffectiveStroke = struct {
+    layer_id: u64,
     tool: StrokeTool,
     color: u32, // 0xFFRRGGBB
     size: u32,
@@ -390,10 +395,10 @@ pub const EffectiveStroke = struct {
 pub fn formatCanonicalStroke(buf: []u8, eff: EffectiveStroke, points: []const Point) error{TooLong}![]const u8 {
     var len: usize = 0;
     const head = switch (eff.tool) {
-        .pen => std.fmt.bufPrint(buf, "tool=pen color={X:0>6}", .{eff.color & 0xFFFFFF}) catch return error.TooLong,
-        .eraser => std.fmt.bufPrint(buf, "tool=eraser", .{}) catch return error.TooLong,
-        .brush => std.fmt.bufPrint(buf, "tool=brush color={X:0>6} size={d} opacity={d} hardness={d}", .{
-            eff.color & 0xFFFFFF, eff.size, eff.opacity, eff.hardness,
+        .pen => std.fmt.bufPrint(buf, "layer=#{d} tool=pen color={X:0>6}", .{ eff.layer_id, eff.color & 0xFFFFFF }) catch return error.TooLong,
+        .eraser => std.fmt.bufPrint(buf, "layer=#{d} tool=eraser", .{eff.layer_id}) catch return error.TooLong,
+        .brush => std.fmt.bufPrint(buf, "layer=#{d} tool=brush color={X:0>6} size={d} opacity={d} hardness={d}", .{
+            eff.layer_id, eff.color & 0xFFFFFF, eff.size, eff.opacity, eff.hardness,
         }) catch return error.TooLong,
     };
     len += head.len;
@@ -988,29 +993,38 @@ test "formatCanonicalStroke: ツール別の key 集合がちょうど一度 + p
     var out: [512]u8 = undefined;
     const pts = [_]Point{ .{ .x = 1, .y = 2 }, .{ .x = -3, .y = 4 } };
 
-    const pen = try formatCanonicalStroke(&out, .{ .tool = .pen, .color = 0xFFFF0000, .size = 8, .opacity = 255, .hardness = 255 }, &pts);
-    try testing.expectEqualStrings("tool=pen color=FF0000 1 2 -3 4", pen);
+    const pen = try formatCanonicalStroke(&out, .{ .layer_id = 7, .tool = .pen, .color = 0xFFFF0000, .size = 8, .opacity = 255, .hardness = 255 }, &pts);
+    try testing.expectEqualStrings("layer=#7 tool=pen color=FF0000 1 2 -3 4", pen);
 
     var buf: [MAX_STROKE_POINTS]Point = undefined;
     const rt = try parseStroke(pen, &buf);
     try testing.expectEqual(StrokeTool.pen, rt.params.tool.?);
     try testing.expectEqual(@as(u32, 0xFFFF0000), rt.params.color.?);
+    try testing.expectEqual(LayerRef{ .id = 7 }, rt.params.layer.?);
     try testing.expectEqual(@as(usize, 2), rt.points.len);
     try testing.expectEqual(Point{ .x = -3, .y = 4 }, rt.points[1]);
 
     var out2: [512]u8 = undefined;
-    const eraser = try formatCanonicalStroke(&out2, .{ .tool = .eraser, .color = 0, .size = 1, .opacity = 0, .hardness = 0 }, pts[0..1]);
-    try testing.expectEqualStrings("tool=eraser 1 2", eraser);
+    const eraser = try formatCanonicalStroke(&out2, .{ .layer_id = 7, .tool = .eraser, .color = 0, .size = 1, .opacity = 0, .hardness = 0 }, pts[0..1]);
+    try testing.expectEqualStrings("layer=#7 tool=eraser 1 2", eraser);
 
     var out3: [512]u8 = undefined;
-    const brush = try formatCanonicalStroke(&out3, .{ .tool = .brush, .color = 0xFF00FF00, .size = 8, .opacity = 128, .hardness = 200 }, pts[0..1]);
-    try testing.expectEqualStrings("tool=brush color=00FF00 size=8 opacity=128 hardness=200 1 2", brush);
+    const brush = try formatCanonicalStroke(&out3, .{ .layer_id = 7, .tool = .brush, .color = 0xFF00FF00, .size = 8, .opacity = 128, .hardness = 200 }, pts[0..1]);
+    try testing.expectEqualStrings("layer=#7 tool=brush color=00FF00 size=8 opacity=128 hardness=200 1 2", brush);
     const rt3 = try parseStroke(brush, &buf);
     try testing.expectEqual(@as(u8, 200), rt3.params.hardness.?);
 
     // 収まらない buf は TooLong
     var tiny: [8]u8 = undefined;
-    try testing.expectError(error.TooLong, formatCanonicalStroke(&tiny, .{ .tool = .pen, .color = 0, .size = 1, .opacity = 255, .hardness = 255 }, &pts));
+    try testing.expectError(error.TooLong, formatCanonicalStroke(&tiny, .{ .layer_id = 7, .tool = .pen, .color = 0, .size = 1, .opacity = 255, .hardness = 255 }, &pts));
+}
+
+test "parseStroke: layer ref は optional で round-trip、legacy は省略を許容" {
+    var points: [MAX_STROKE_POINTS]Point = undefined;
+    const with_layer = try parseStroke("layer=#42 tool=pen color=112233 1 2", &points);
+    try testing.expectEqual(LayerRef{ .id = 42 }, with_layer.params.layer.?);
+    const legacy = try parseStroke("1 2", &points);
+    try testing.expect(legacy.params.layer == null);
 }
 
 // ── TASK-90 パーサ ─────────────────────────────────────────
