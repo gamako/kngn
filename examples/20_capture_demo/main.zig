@@ -324,15 +324,32 @@ fn drawBorder(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, w: 
 /// 伴わない不透明の行コピー（`core/camera_macos.zig` の `copyBgraRows` と同クラス）。clip はループ外
 /// で1回だけ計算し、内側は無検査の `@memcpy`（行連続アクセス）にする。ブレンドが無いため
 /// `pixelops` の SIMD 3点セットはそもそも対象外（copyBgraRows 自身の判断根拠と同じ）。
+/// カメラフレームを CAM_W×CAM_H の枠に nearest-neighbor で収めて描く。
+///
+/// frame の実寸（`frame.width/height`）は driver 都合で要求値と食い違う（V4L2 は要求解像度を
+/// 対応する離散値へ丸める。例: 320×240 要求 → uvcvideo が 640×480 を返す）。実寸のまま転写すると
+/// 枠と隣の可視化パネルにはみ出すため、常に枠サイズへスケールする。640×480→320×240 のように
+/// アスペクト比が一致する場合は全視野が歪みなく収まる（一致しない場合は非等方スケールになるが
+/// デモのプレビュー用途では許容）。
+///
+/// ホットパス宣言: 毎フレーム、枠 CAM_W×CAM_H 分の全画素を走る。per-pixel 除算を避けるため列の
+/// ソース x マップをループ外で1回だけ作る（性能規約「per-pixel 除算の禁止」）。SIMD 化はしない
+/// （camera fps・320×240 のデモプレビューで十分速く、nearest-neighbor gather は SIMD 化の利が薄い）。
 fn drawVideoFrame(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, frame: camera.VideoFrame) void {
-    if (x0 >= fb_w or y0 >= fb_h) return;
-    const copy_w = @min(@as(usize, frame.width), fb_w - x0);
-    const copy_h = @min(@as(usize, frame.height), fb_h - y0);
-    var y: usize = 0;
-    while (y < copy_h) : (y += 1) {
-        const src_row = frame.pixels[y * @as(usize, frame.stride) ..][0..copy_w];
-        const dst_row = pixels[(y0 + y) * fb_w + x0 ..][0..copy_w];
-        @memcpy(dst_row, src_row);
+    if (x0 >= fb_w or y0 >= fb_h or frame.width == 0 or frame.height == 0) return;
+    const box_w = @min(@as(usize, CAM_W), fb_w - x0); // fb 端で clip（枠が画面外に出る分だけ）
+    const box_h = @min(@as(usize, CAM_H), fb_h - y0);
+    // 列マップ（枠 x → フレーム x）をループ外で1回。box_w <= CAM_W なので [CAM_W]usize で足りる。
+    var x_map: [CAM_W]usize = undefined;
+    var dx: usize = 0;
+    while (dx < box_w) : (dx += 1) x_map[dx] = dx * @as(usize, frame.width) / CAM_W;
+    var dy: usize = 0;
+    while (dy < box_h) : (dy += 1) {
+        const sy = dy * @as(usize, frame.height) / CAM_H; // 行のソース y（per-row・per-pixel ではない）
+        const src_base = sy * @as(usize, frame.stride);
+        const dst_base = (y0 + dy) * fb_w + x0;
+        dx = 0;
+        while (dx < box_w) : (dx += 1) pixels[dst_base + dx] = frame.pixels[src_base + x_map[dx]];
     }
 }
 
