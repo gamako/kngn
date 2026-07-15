@@ -324,44 +324,43 @@ pub const LofiPatch = struct {
     allocator: std.mem.Allocator,
     graph: *modular.DynGraph,
 
-    // DynGraph は起動時に構築して以後 removeModule しないため、ptrOf の結果を保持できる。
-    // live 再配線で handle を retire/reuse する場合のポインタ更新は TASK-105.3 以降の課題。
-    clock: *modular.Clock,
+    // 生成モジュールは handle で保持する。pool slot の再利用でポインタが dangling するのを防ぐ。
+    clock_h: modular.dyn.Handle,
     // 前景: editable step シーケンサ（DrumMachine + BassMachine）
-    kick_seq: *modular.StepSeq,
-    hat_seq: *modular.StepSeq,
-    clap_seq: *modular.StepSeq,
-    bass_seq: *modular.StepSeq,
+    kick_seq_h: modular.dyn.Handle,
+    hat_seq_h: modular.dyn.Handle,
+    clap_seq_h: modular.dyn.Handle,
+    bass_seq_h: modular.dyn.Handle,
     // drums
-    kick: *modular.Kick,
-    hat: *modular.Hat,
-    clap: *modular.Clap,
+    kick_h: modular.dyn.Handle,
+    hat_h: modular.dyn.Handle,
+    clap_h: modular.dyn.Handle,
     // 背景: アンビエント連続生成（pad の和音 root / cutoff / level をゆっくり動かす）
-    pad_div: *modular.ClockDivider,
-    pad_eu: *modular.EuclideanSeq,
-    pad: *modular.ChordPad,
-    ambient_turing: *modular.TuringMachine,
-    ambient_quant: *modular.Quantizer,
-    ambient_lfo: *modular.Lfo,
-    ambient_random: *modular.Random,
+    pad_div_h: modular.dyn.Handle,
+    pad_eu_h: modular.dyn.Handle,
+    pad_h: modular.dyn.Handle,
+    ambient_turing_h: modular.dyn.Handle,
+    ambient_quant_h: modular.dyn.Handle,
+    ambient_lfo_h: modular.dyn.Handle,
+    ambient_random_h: modular.dyn.Handle,
     // bass voice（StepSeq に駆動される）
-    bass_perc: *modular.PercEnv,
-    vco: *modular.Vco,
-    vcf: *modular.Vcf,
-    vca: *modular.Vca,
+    bass_perc_h: modular.dyn.Handle,
+    vco_h: modular.dyn.Handle,
+    vcf_h: modular.dyn.Handle,
+    vca_h: modular.dyn.Handle,
     // mix（kick は素通し / 非kick は sidechain でダッキング）
-    nonkick_mixer: *modular.Mixer,
-    sidechain: *modular.Sidechain,
-    master_mixer: *modular.Mixer,
-    master_vcf: *modular.Vcf,
+    nonkick_mixer_h: modular.dyn.Handle,
+    sidechain_h: modular.dyn.Handle,
+    master_mixer_h: modular.dyn.Handle,
+    master_vcf_h: modular.dyn.Handle,
     // lofi FX チェーン
-    saturator: *modular.Saturator,
-    bitcrusher: *modular.Bitcrusher,
-    delay_fx: *modular.DelayFx,
-    reverb_fx: *modular.ReverbFx,
-    vinyl: *modular.VinylNoiseFx,
-    wow: *modular.WowFlutterFx,
-    output: *modular.Output,
+    saturator_h: modular.dyn.Handle,
+    bitcrusher_h: modular.dyn.Handle,
+    delay_fx_h: modular.dyn.Handle,
+    reverb_fx_h: modular.dyn.Handle,
+    vinyl_h: modular.dyn.Handle,
+    wow_h: modular.dyn.Handle,
+    output_h: modular.dyn.Handle,
 
     controls: Controls,
 
@@ -398,38 +397,38 @@ pub const LofiPatch = struct {
         self.* = .{
             .allocator = allocator,
             .graph = undefined,
-            .clock = undefined,
-            .kick_seq = undefined,
-            .hat_seq = undefined,
-            .clap_seq = undefined,
-            .bass_seq = undefined,
-            .kick = undefined,
-            .hat = undefined,
-            .clap = undefined,
+            .clock_h = undefined,
+            .kick_seq_h = undefined,
+            .hat_seq_h = undefined,
+            .clap_seq_h = undefined,
+            .bass_seq_h = undefined,
+            .kick_h = undefined,
+            .hat_h = undefined,
+            .clap_h = undefined,
             // pad: 1 小節パルス(div=16)→2 小節周期(steps=2,pulses=1)で和音 trigger
-            .pad_div = undefined,
-            .pad_eu = undefined,
-            .pad = undefined,
+            .pad_div_h = undefined,
+            .pad_eu_h = undefined,
+            .pad_h = undefined,
             // アンビエント: turing(lock 高め)→quant(scale 内 root)→pad。LFO は cutoff、random は level。
-            .ambient_turing = undefined,
-            .ambient_quant = undefined,
-            .ambient_lfo = undefined,
-            .ambient_random = undefined,
-            .bass_perc = undefined,
-            .vco = undefined,
-            .vcf = undefined,
-            .vca = undefined,
-            .nonkick_mixer = undefined,
-            .sidechain = undefined,
-            .master_mixer = undefined,
-            .master_vcf = undefined,
-            .saturator = undefined,
-            .bitcrusher = undefined,
-            .delay_fx = undefined,
-            .reverb_fx = undefined,
-            .vinyl = undefined,
-            .wow = undefined,
-            .output = undefined,
+            .ambient_turing_h = undefined,
+            .ambient_quant_h = undefined,
+            .ambient_lfo_h = undefined,
+            .ambient_random_h = undefined,
+            .bass_perc_h = undefined,
+            .vco_h = undefined,
+            .vcf_h = undefined,
+            .vca_h = undefined,
+            .nonkick_mixer_h = undefined,
+            .sidechain_h = undefined,
+            .master_mixer_h = undefined,
+            .master_vcf_h = undefined,
+            .saturator_h = undefined,
+            .bitcrusher_h = undefined,
+            .delay_fx_h = undefined,
+            .reverb_fx_h = undefined,
+            .vinyl_h = undefined,
+            .wow_h = undefined,
+            .output_h = undefined,
             .controls = Controls.init(),
             .mut_noise = .{ .state = seedmod.deriveU32(base, .mutate) },
             .last_bar = 0,
@@ -470,8 +469,8 @@ pub const LofiPatch = struct {
         self.applied_seed_gen = self.controls.pending_seed_gen.load(.acquire);
         self.pending_bar_cmd = null;
         self.applyBaseSeed(base);
-        if (self.clock.started) {
-            self.last_bar = self.clock.tick_index / STEPS_PER_BAR;
+        if (self.ptr(.clock, self.clock_h)) |clock| {
+            if (clock.started) self.last_bar = clock.tick_index / STEPS_PER_BAR;
         }
     }
 
@@ -574,37 +573,49 @@ pub const LofiPatch = struct {
         g.setOutput(n_output);
         try g.publish();
 
-        // このパッチは起動時構築後に removeModule しないため、pool slot のポインタを保持する。
-        self.clock = g.ptrOf(.clock, n_clock);
-        self.kick_seq = g.ptrOf(.step_seq, n_kick_seq);
-        self.hat_seq = g.ptrOf(.step_seq, n_hat_seq);
-        self.clap_seq = g.ptrOf(.step_seq, n_clap_seq);
-        self.bass_seq = g.ptrOf(.step_seq, n_bass_seq);
-        self.kick = g.ptrOf(.kick, n_kick);
-        self.hat = g.ptrOf(.hat, n_hat);
-        self.clap = g.ptrOf(.clap, n_clap);
-        self.pad_div = g.ptrOf(.clock_divider, n_pad_div);
-        self.pad_eu = g.ptrOf(.euclid, n_pad_eu);
-        self.pad = g.ptrOf(.chord_pad, n_pad);
-        self.ambient_turing = g.ptrOf(.turing, n_amb_turing);
-        self.ambient_quant = g.ptrOf(.quantizer, n_amb_quant);
-        self.ambient_lfo = g.ptrOf(.lfo, n_amb_lfo);
-        self.ambient_random = g.ptrOf(.random, n_amb_random);
-        self.bass_perc = g.ptrOf(.perc_env, n_bass_perc);
-        self.vco = g.ptrOf(.vco, n_vco);
-        self.vcf = g.ptrOf(.vcf, n_vcf);
-        self.vca = g.ptrOf(.vca, n_vca);
-        self.nonkick_mixer = g.ptrOf(.mixer, n_nonkick);
-        self.sidechain = g.ptrOf(.sidechain, n_sidechain);
-        self.master_mixer = g.ptrOf(.mixer, n_master);
-        self.master_vcf = g.ptrOf(.vcf, n_master_vcf);
-        self.saturator = g.ptrOf(.saturator, n_sat);
-        self.bitcrusher = g.ptrOf(.bitcrusher, n_bit);
-        self.delay_fx = g.ptrOf(.delay, n_delay);
-        self.reverb_fx = g.ptrOf(.reverb, n_reverb);
-        self.vinyl = g.ptrOf(.vinyl, n_vinyl);
-        self.wow = g.ptrOf(.wow_flutter, n_wow);
-        self.output = g.ptrOf(.output, n_output);
+        // 構築順序・接続内容は従来どおり。以後の参照は制御レートで handle から解決する。
+        self.clock_h = n_clock;
+        self.kick_seq_h = n_kick_seq;
+        self.hat_seq_h = n_hat_seq;
+        self.clap_seq_h = n_clap_seq;
+        self.bass_seq_h = n_bass_seq;
+        self.kick_h = n_kick;
+        self.hat_h = n_hat;
+        self.clap_h = n_clap;
+        self.pad_div_h = n_pad_div;
+        self.pad_eu_h = n_pad_eu;
+        self.pad_h = n_pad;
+        self.ambient_turing_h = n_amb_turing;
+        self.ambient_quant_h = n_amb_quant;
+        self.ambient_lfo_h = n_amb_lfo;
+        self.ambient_random_h = n_amb_random;
+        self.bass_perc_h = n_bass_perc;
+        self.vco_h = n_vco;
+        self.vcf_h = n_vcf;
+        self.vca_h = n_vca;
+        self.nonkick_mixer_h = n_nonkick;
+        self.sidechain_h = n_sidechain;
+        self.master_mixer_h = n_master;
+        self.master_vcf_h = n_master_vcf;
+        self.saturator_h = n_sat;
+        self.bitcrusher_h = n_bit;
+        self.delay_fx_h = n_delay;
+        self.reverb_fx_h = n_reverb;
+        self.vinyl_h = n_vinyl;
+        self.wow_h = n_wow;
+        self.output_h = n_output;
+    }
+
+    /// 制御レート用の handle 解決。retire 済み handle は null として呼び出し側で no-op にする。
+    inline fn ptr(self: *LofiPatch, comptime kind: modular.ModuleKind, handle: modular.dyn.Handle) ?*modular.dyn.KindType(kind) {
+        if (!self.graph.isActive(handle)) return null;
+        return self.graph.ptrOf(kind, handle);
+    }
+
+    /// snapshot 用の const handle 解決。ptrOf は既存の mutable API を維持し、ここで const view にする。
+    inline fn ptrConst(self: *const LofiPatch, comptime kind: modular.ModuleKind, handle: modular.dyn.Handle) ?*const modular.dyn.KindType(kind) {
+        if (!self.graph.isActive(handle)) return null;
+        return @constCast(self.graph).ptrOf(kind, handle);
     }
 
     /// RT callback から呼ぶ（alloc/lock/IO/panic なし）。interleaved 出力へ書く。
@@ -665,37 +676,47 @@ pub const LofiPatch = struct {
             }
         }
         // scalar controls
-        self.clock.bpm = clampFinite(c.tempo_bpm.load(), 40.0, 220.0, DEFAULT_BPM);
-        self.clock.swing = clampFinite(c.swing.load(), 0.0, 1.0, 0.0);
-        self.sidechain.amount = clampFinite(c.sidechain_amount.load(), 0.0, 1.0, DEFAULT_SIDECHAIN);
-        self.master_vcf.cutoff = clampFinite(c.master_cutoff.load(), MASTER_CUTOFF_MIN, MASTER_CUTOFF_MAX, MASTER_CUTOFF_MAX);
-        self.kick.gain = KICK_BASE_GAIN * trackGain(&c.kick_gain, &c.kick_mute);
-        self.hat.gain = HAT_BASE_GAIN * trackGain(&c.hat_gain, &c.hat_mute);
-        self.clap.gain = CLAP_BASE_GAIN * trackGain(&c.clap_gain, &c.clap_mute);
-        self.bass_perc.peak = trackGain(&c.bass_gain, &c.bass_mute);
-        self.kick.click_gain = KICK_CLICK_BASE * clampFinite(c.kick_punch.load(), 0.0, 2.0, 1.0);
-        self.hat.brightness = clampFinite(c.hat_bright.load(), 0.3, 2.5, HAT_BASE_BRIGHT);
-        self.hat.decay = clampFinite(c.hat_decay.load(), 0.01, 0.2, HAT_BASE_DECAY);
-        self.pad.gain = PAD_BASE_GAIN * trackGain(&c.pad_gain, &c.pad_mute);
-        self.pad.cutoff = clampFinite(c.pad_cutoff.load(), PAD_CUTOFF_MIN, PAD_CUTOFF_MAX, PAD_CUTOFF_DEFAULT);
-        self.pad.warmth = clampFinite(c.pad_warmth.load(), 0.0, 1.0, PAD_WARMTH_DEFAULT);
-        self.saturator.drive = 1.0 + clampFinite(c.master_warmth.load(), 0.0, 1.0, MASTER_WARMTH_DEFAULT);
+        if (self.ptr(.clock, self.clock_h)) |clock| {
+            clock.bpm = clampFinite(c.tempo_bpm.load(), 40.0, 220.0, DEFAULT_BPM);
+            clock.swing = clampFinite(c.swing.load(), 0.0, 1.0, 0.0);
+        }
+        if (self.ptr(.sidechain, self.sidechain_h)) |sidechain| sidechain.amount = clampFinite(c.sidechain_amount.load(), 0.0, 1.0, DEFAULT_SIDECHAIN);
+        if (self.ptr(.vcf, self.master_vcf_h)) |master_vcf| master_vcf.cutoff = clampFinite(c.master_cutoff.load(), MASTER_CUTOFF_MIN, MASTER_CUTOFF_MAX, MASTER_CUTOFF_MAX);
+        if (self.ptr(.kick, self.kick_h)) |kick| {
+            kick.gain = KICK_BASE_GAIN * trackGain(&c.kick_gain, &c.kick_mute);
+            kick.click_gain = KICK_CLICK_BASE * clampFinite(c.kick_punch.load(), 0.0, 2.0, 1.0);
+        }
+        if (self.ptr(.hat, self.hat_h)) |hat| {
+            hat.gain = HAT_BASE_GAIN * trackGain(&c.hat_gain, &c.hat_mute);
+            hat.brightness = clampFinite(c.hat_bright.load(), 0.3, 2.5, HAT_BASE_BRIGHT);
+            hat.decay = clampFinite(c.hat_decay.load(), 0.01, 0.2, HAT_BASE_DECAY);
+        }
+        if (self.ptr(.clap, self.clap_h)) |clap| clap.gain = CLAP_BASE_GAIN * trackGain(&c.clap_gain, &c.clap_mute);
+        if (self.ptr(.perc_env, self.bass_perc_h)) |bass_perc| bass_perc.peak = trackGain(&c.bass_gain, &c.bass_mute);
+        if (self.ptr(.chord_pad, self.pad_h)) |pad| {
+            pad.gain = PAD_BASE_GAIN * trackGain(&c.pad_gain, &c.pad_mute);
+            pad.cutoff = clampFinite(c.pad_cutoff.load(), PAD_CUTOFF_MIN, PAD_CUTOFF_MAX, PAD_CUTOFF_DEFAULT);
+            pad.warmth = clampFinite(c.pad_warmth.load(), 0.0, 1.0, PAD_WARMTH_DEFAULT);
+        }
+        if (self.ptr(.saturator, self.saturator_h)) |saturator| saturator.drive = 1.0 + clampFinite(c.master_warmth.load(), 0.0, 1.0, MASTER_WARMTH_DEFAULT);
         // ambient_move(0..1) → LFO rate(0.03..0.45Hz) + pad cutoff 変調深さ(0.2..1.0 oct)
         const mv = clampFinite(c.ambient_move.load(), 0.0, 1.0, AMBIENT_MOVE_DEFAULT);
-        self.ambient_lfo.rate_hz = 0.03 + mv * 0.42;
-        self.pad.cutoff_mod_oct = 0.2 + mv * 0.8;
+        if (self.ptr(.lfo, self.ambient_lfo_h)) |ambient_lfo| ambient_lfo.rate_hz = 0.03 + mv * 0.42;
+        if (self.ptr(.chord_pad, self.pad_h)) |pad| pad.cutoff_mod_oct = 0.2 + mv * 0.8;
     }
 
     /// PatternCommand を StepSeq / lock / evolve / anchor へ反映（RT・alloc/lock なし・固定長コピー）。
     fn applyPatternCommand(self: *LofiPatch, cmd: PatternCommand) void {
         self.anchor = cmd;
-        self.kick_seq.on_mask = cmd.kick.on;
-        self.hat_seq.on_mask = cmd.hat.on;
-        self.clap_seq.on_mask = cmd.clap.on;
-        self.bass_seq.on_mask = cmd.bass.on;
-        self.bass_seq.accent_mask = cmd.bass.accent;
-        self.bass_seq.slide_mask = cmd.bass.slide;
-        self.bass_seq.pitch_deg = cmd.bass.deg;
+        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| seq.on_mask = cmd.kick.on;
+        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.on_mask = cmd.hat.on;
+        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| seq.on_mask = cmd.clap.on;
+        if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
+            seq.on_mask = cmd.bass.on;
+            seq.accent_mask = cmd.bass.accent;
+            seq.slide_mask = cmd.bass.slide;
+            seq.pitch_deg = cmd.bass.deg;
+        }
         self.lock = .{ cmd.kick.lock, cmd.hat.lock, cmd.clap.lock, cmd.bass.lock };
         self.evolve = cmd.evolve;
     }
@@ -709,8 +730,9 @@ pub const LofiPatch = struct {
     /// block 数ではなく musical bar をキーにする（決定性は固定 seed + 固定 render チャンクで担保）。
     /// ホットパス: bar 境界での index 計算 + 固定長 PatternCommand 組み立て 1 回（alloc/lock なし）。
     fn maybeEvolve(self: *LofiPatch) void {
-        if (!self.clock.started) return;
-        const bar = self.clock.tick_index / STEPS_PER_BAR;
+        const clock = self.ptr(.clock, self.clock_h) orelse return;
+        if (!clock.started) return;
+        const bar = clock.tick_index / STEPS_PER_BAR;
         if (bar == self.last_bar) return;
         self.last_bar = bar;
 
@@ -783,17 +805,20 @@ pub const LofiPatch = struct {
             var cmd: PatternCommand = .{
                 .rev = self.applied_rev,
                 .evolve = self.evolve,
-                .kick = .{ .on = self.kick_seq.on_mask, .lock = self.lock[0] },
-                .hat = .{ .on = self.hat_seq.on_mask, .lock = self.lock[1] },
-                .clap = .{ .on = self.clap_seq.on_mask, .lock = self.lock[2] },
-                .bass = .{
-                    .on = self.bass_seq.on_mask,
-                    .accent = self.bass_seq.accent_mask,
-                    .slide = self.bass_seq.slide_mask,
-                    .deg = self.bass_seq.pitch_deg,
-                    .lock = self.lock[3],
-                },
+                .kick = .{ .lock = self.lock[0] },
+                .hat = .{ .lock = self.lock[1] },
+                .clap = .{ .lock = self.lock[2] },
+                .bass = .{ .lock = self.lock[3] },
             };
+            if (self.ptr(.step_seq, self.kick_seq_h)) |seq| cmd.kick.on = seq.on_mask;
+            if (self.ptr(.step_seq, self.hat_seq_h)) |seq| cmd.hat.on = seq.on_mask;
+            if (self.ptr(.step_seq, self.clap_seq_h)) |seq| cmd.clap.on = seq.on_mask;
+            if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
+                cmd.bass.on = seq.on_mask;
+                cmd.bass.accent = seq.accent_mask;
+                cmd.bass.slide = seq.slide_mask;
+                cmd.bass.deg = seq.pitch_deg;
+            }
             if (phrases[0] != PHRASE_NONE and phrases[0] != self.song_last_phrase[0]) {
                 if (phrases[0] < MAX_DRUM_PHRASES) cmd.kick.on = self.song.phrases_kick[phrases[0]];
             }
@@ -885,33 +910,39 @@ pub const LofiPatch = struct {
 
         // --- 生成 RNG ---
         self.mut_noise.state = seedmod.deriveU32(base, .mutate);
-        self.ambient_random.noise.state = seedmod.deriveU32(base, .ambient_random);
-        self.ambient_random.prev_gate = false;
-        self.ambient_random.held = 0.0;
         const treg = seedmod.deriveU32(base, .ambient_turing_register);
-        self.ambient_turing.noise.state = seedmod.deriveU32(base, .ambient_turing);
-        self.ambient_turing.register = treg;
-        self.ambient_turing.anchor_register = treg;
-        self.ambient_turing.last_cv = 0.0;
-        self.ambient_turing.prev_gate = false;
-        self.ambient_turing.edge_count = 0;
-        self.ambient_lfo.lfo.phase = 0.0;
-        self.ambient_quant.last_out = 0.0;
+        if (self.ptr(.random, self.ambient_random_h)) |ambient_random| {
+            ambient_random.noise.state = seedmod.deriveU32(base, .ambient_random);
+            ambient_random.prev_gate = false;
+            ambient_random.held = 0.0;
+        }
+        if (self.ptr(.turing, self.ambient_turing_h)) |ambient_turing| {
+            ambient_turing.noise.state = seedmod.deriveU32(base, .ambient_turing);
+            ambient_turing.register = treg;
+            ambient_turing.anchor_register = treg;
+            ambient_turing.last_cv = 0.0;
+            ambient_turing.prev_gate = false;
+            ambient_turing.edge_count = 0;
+        }
+        if (self.ptr(.lfo, self.ambient_lfo_h)) |ambient_lfo| ambient_lfo.lfo.phase = 0.0;
+        if (self.ptr(.quantizer, self.ambient_quant_h)) |ambient_quant| ambient_quant.last_out = 0.0;
 
         // --- クロック位相（bar/step の起点を fresh と揃える）---
-        self.clock.phase_samples = 0;
-        self.clock.tick_index = 0;
-        self.clock.started = false;
-        self.clock.samples_per_tick = 0;
-        self.clock.cur_interval = 0;
+        if (self.ptr(.clock, self.clock_h)) |clock| {
+            clock.phase_samples = 0;
+            clock.tick_index = 0;
+            clock.started = false;
+            clock.samples_per_tick = 0;
+            clock.cur_interval = 0;
+        }
         self.last_bar = 0;
 
         // --- 前景 pattern + StepSeq runtime ---
         const def = PatternCommand.default();
-        resetStepSeqRuntime(self.kick_seq, .{ .on = def.kick.on });
-        resetStepSeqRuntime(self.hat_seq, .{ .on = def.hat.on });
-        resetStepSeqRuntime(self.clap_seq, .{ .on = def.clap.on });
-        resetStepSeqRuntime(self.bass_seq, .{
+        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| resetStepSeqRuntime(seq, .{ .on = def.kick.on });
+        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| resetStepSeqRuntime(seq, .{ .on = def.hat.on });
+        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| resetStepSeqRuntime(seq, .{ .on = def.clap.on });
+        if (self.ptr(.step_seq, self.bass_seq_h)) |seq| resetStepSeqRuntime(seq, .{
             .on = def.bass.on,
             .accent = def.bass.accent,
             .slide = def.bass.slide,
@@ -923,10 +954,14 @@ pub const LofiPatch = struct {
         self.mutation_count = 0;
 
         // --- 背景生成のシーケンサ実行位置（pad トリガ経路）---
-        self.pad_div.count = 0;
-        self.pad_div.prev_gate = false;
-        self.pad_eu.step = 0;
-        self.pad_eu.prev_gate = false;
+        if (self.ptr(.clock_divider, self.pad_div_h)) |pad_div| {
+            pad_div.count = 0;
+            pad_div.prev_gate = false;
+        }
+        if (self.ptr(.euclid, self.pad_eu_h)) |pad_eu| {
+            pad_eu.step = 0;
+            pad_eu.prev_gate = false;
+        }
     }
 
     const StepSeqReset = struct {
@@ -1021,20 +1056,22 @@ pub const LofiPatch = struct {
         const s = self.randStep();
         const b = bitOf(s);
         switch (lane) {
-            0 => recoverOn(&self.kick_seq.on_mask, self.anchor.kick.on, b, KICK_BAND),
-            1 => recoverOn(&self.hat_seq.on_mask, self.anchor.hat.on, b, HAT_BAND),
-            2 => recoverOn(&self.clap_seq.on_mask, self.anchor.clap.on, b, CLAP_BAND),
+            0 => if (self.ptr(.step_seq, self.kick_seq_h)) |seq| recoverOn(&seq.on_mask, self.anchor.kick.on, b, KICK_BAND),
+            1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| recoverOn(&seq.on_mask, self.anchor.hat.on, b, HAT_BAND),
+            2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| recoverOn(&seq.on_mask, self.anchor.clap.on, b, CLAP_BAND),
             else => {
                 // bass も「1 小節 1 パラメータ」を守るため、戻す要素を 1 つだけ選ぶ。
                 const which = self.rand01();
-                if (which < 0.5) {
-                    recoverOn(&self.bass_seq.on_mask, self.anchor.bass.on, b, BASS_BAND);
-                } else if (which < 0.7) {
-                    copyBit(&self.bass_seq.accent_mask, self.anchor.bass.accent, b);
-                } else if (which < 0.85) {
-                    copyBit(&self.bass_seq.slide_mask, self.anchor.bass.slide, b);
-                } else {
-                    self.bass_seq.pitch_deg[s] = self.anchor.bass.deg[s];
+                if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
+                    if (which < 0.5) {
+                        recoverOn(&seq.on_mask, self.anchor.bass.on, b, BASS_BAND);
+                    } else if (which < 0.7) {
+                        copyBit(&seq.accent_mask, self.anchor.bass.accent, b);
+                    } else if (which < 0.85) {
+                        copyBit(&seq.slide_mask, self.anchor.bass.slide, b);
+                    } else {
+                        seq.pitch_deg[s] = self.anchor.bass.deg[s];
+                    }
                 }
             },
         }
@@ -1078,69 +1115,88 @@ pub const LofiPatch = struct {
             return;
         }
         switch (pick) {
-            0 => self.mutateDrumLane(self.kick_seq, KICK_BAND),
-            1 => self.mutateDrumLane(self.hat_seq, HAT_BAND),
-            2 => self.mutateDrumLane(self.clap_seq, CLAP_BAND),
-            else => self.mutateBassLane(self.bass_seq),
+            0 => if (self.ptr(.step_seq, self.kick_seq_h)) |seq| self.mutateDrumLane(seq, KICK_BAND),
+            1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| self.mutateDrumLane(seq, HAT_BAND),
+            2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| self.mutateDrumLane(seq, CLAP_BAND),
+            else => if (self.ptr(.step_seq, self.bass_seq_h)) |seq| self.mutateBassLane(seq),
         }
     }
 
     /// harness probe 用の生成状態スナップショット（alloc/lock/IO なし・torn 可）。
     pub fn snapshotState(self: *const LofiPatch) PatchState {
-        const spt = self.clock.samples_per_tick;
-        const phase: f32 = if (spt > 0) @floatCast(self.clock.phase_samples / spt) else 0;
-        const dens = (onFrac(self.kick_seq.on_mask) + onFrac(self.hat_seq.on_mask) +
-            onFrac(self.clap_seq.on_mask) + onFrac(self.bass_seq.on_mask)) / 4.0;
+        const clock = self.ptrConst(.clock, self.clock_h);
+        const kick_seq = self.ptrConst(.step_seq, self.kick_seq_h);
+        const hat_seq = self.ptrConst(.step_seq, self.hat_seq_h);
+        const clap_seq = self.ptrConst(.step_seq, self.clap_seq_h);
+        const bass_seq = self.ptrConst(.step_seq, self.bass_seq_h);
+        const kick = self.ptrConst(.kick, self.kick_h);
+        const hat = self.ptrConst(.hat, self.hat_h);
+        const clap = self.ptrConst(.clap, self.clap_h);
+        const sidechain = self.ptrConst(.sidechain, self.sidechain_h);
+        const master_vcf = self.ptrConst(.vcf, self.master_vcf_h);
+        const bass_perc = self.ptrConst(.perc_env, self.bass_perc_h);
+        const pad = self.ptrConst(.chord_pad, self.pad_h);
+        const saturator = self.ptrConst(.saturator, self.saturator_h);
+        const output = self.ptrConst(.output, self.output_h);
+        const ambient_lfo = self.ptrConst(.lfo, self.ambient_lfo_h);
+        const ambient_turing = self.ptrConst(.turing, self.ambient_turing_h);
+        const ambient_quant = self.ptrConst(.quantizer, self.ambient_quant_h);
+        const spt = if (clock) |p| p.samples_per_tick else 0;
+        const phase: f32 = if (spt > 0) @floatCast(clock.?.phase_samples / spt) else 0;
+        const dens = (if (kick_seq) |p| onFrac(p.on_mask) else 0.0) +
+            (if (hat_seq) |p| onFrac(p.on_mask) else 0.0) +
+            (if (clap_seq) |p| onFrac(p.on_mask) else 0.0) +
+            (if (bass_seq) |p| onFrac(p.on_mask) else 0.0);
         return .{
-            .bpm = self.clock.bpm,
+            .bpm = if (clock) |p| p.bpm else DEFAULT_BPM,
             .clock_phase = phase,
             // step は RT process が @atomicStore する（40.7.2）。main スレッドの snapshotState はプレーン read
             // でなく loadStep()(atomic load) で読む（mixed cross-thread access を避ける。値は monotonic で不変）。
-            .kick_step = self.kick_seq.loadStep(),
-            .hat_step = self.hat_seq.loadStep(),
-            .clap_step = self.clap_seq.loadStep(),
-            .bass_step = self.bass_seq.loadStep(),
-            .density = dens,
-            .bass_pitch_cv = self.bass_seq.cur_pitch,
-            .kick_active = self.kick.active,
-            .hat_active = self.hat.active,
-            .clap_active = self.clap.active,
-            .swing = self.clock.swing,
-            .sidechain_amount = self.sidechain.amount,
-            .master_cutoff = self.master_vcf.cutoff,
-            .kick_gain = self.kick.gain,
-            .hat_gain = self.hat.gain,
-            .clap_gain = self.clap.gain,
-            .bass_gain = self.bass_perc.peak,
+            .kick_step = if (kick_seq) |p| p.loadStep() else 0,
+            .hat_step = if (hat_seq) |p| p.loadStep() else 0,
+            .clap_step = if (clap_seq) |p| p.loadStep() else 0,
+            .bass_step = if (bass_seq) |p| p.loadStep() else 0,
+            .density = dens / 4.0,
+            .bass_pitch_cv = if (bass_seq) |p| p.cur_pitch else 0,
+            .kick_active = if (kick) |p| p.active else false,
+            .hat_active = if (hat) |p| p.active else false,
+            .clap_active = if (clap) |p| p.active else false,
+            .swing = if (clock) |p| p.swing else 0,
+            .sidechain_amount = if (sidechain) |p| p.amount else DEFAULT_SIDECHAIN,
+            .master_cutoff = if (master_vcf) |p| p.cutoff else MASTER_CUTOFF_MAX,
+            .kick_gain = if (kick) |p| p.gain else 0,
+            .hat_gain = if (hat) |p| p.gain else 0,
+            .clap_gain = if (clap) |p| p.gain else 0,
+            .bass_gain = if (bass_perc) |p| p.peak else 0,
             .kick_muted = self.controls.kick_mute.load(.acquire) != 0,
             .hat_muted = self.controls.hat_mute.load(.acquire) != 0,
             .clap_muted = self.controls.clap_mute.load(.acquire) != 0,
             .bass_muted = self.controls.bass_mute.load(.acquire) != 0,
-            .kick_click_gain = self.kick.click_gain,
-            .hat_brightness = self.hat.brightness,
-            .pad_gain = self.pad.gain,
-            .pad_cutoff = self.pad.cutoff,
-            .pad_warmth = self.pad.warmth,
-            .pad_active = self.pad.attacking or self.pad.env > 1e-3,
+            .kick_click_gain = if (kick) |p| p.click_gain else 0,
+            .hat_brightness = if (hat) |p| p.brightness else 0,
+            .pad_gain = if (pad) |p| p.gain else 0,
+            .pad_cutoff = if (pad) |p| p.cutoff else PAD_CUTOFF_DEFAULT,
+            .pad_warmth = if (pad) |p| p.warmth else PAD_WARMTH_DEFAULT,
+            .pad_active = if (pad) |p| p.attacking or p.env > 1e-3 else false,
             .pad_muted = self.controls.pad_mute.load(.acquire) != 0,
-            .master_drive = self.saturator.drive,
-            .pre_clip_peak = self.output.pre_clip_peak,
-            .clip_rate = self.output.clipRate(),
-            .kick_on = self.kick_seq.on_mask,
-            .hat_on = self.hat_seq.on_mask,
-            .clap_on = self.clap_seq.on_mask,
-            .bass_on = self.bass_seq.on_mask,
-            .bass_accent = self.bass_seq.accent_mask,
-            .bass_slide = self.bass_seq.slide_mask,
-            .bass_deg = self.bass_seq.pitch_deg,
+            .master_drive = if (saturator) |p| p.drive else 0,
+            .pre_clip_peak = if (output) |p| p.pre_clip_peak else 0,
+            .clip_rate = if (output) |p| p.clipRate() else 0,
+            .kick_on = if (kick_seq) |p| p.on_mask else 0,
+            .hat_on = if (hat_seq) |p| p.on_mask else 0,
+            .clap_on = if (clap_seq) |p| p.on_mask else 0,
+            .bass_on = if (bass_seq) |p| p.on_mask else 0,
+            .bass_accent = if (bass_seq) |p| p.accent_mask else 0,
+            .bass_slide = if (bass_seq) |p| p.slide_mask else 0,
+            .bass_deg = if (bass_seq) |p| p.pitch_deg else [_]i8{0} ** 16,
             .lock = self.lock,
             .evolve = self.evolve,
             .pattern_rev = self.applied_rev,
             .mutation_count = self.mutation_count,
-            .ambient_move = self.ambient_lfo.rate_hz,
-            .ambient_register = self.ambient_turing.register,
-            .ambient_root_cv = self.ambient_quant.last_out,
-            .ambient_lfo = self.ambient_lfo.lfo.phase,
+            .ambient_move = if (ambient_lfo) |p| p.rate_hz else 0,
+            .ambient_register = if (ambient_turing) |p| p.register else 0,
+            .ambient_root_cv = if (ambient_quant) |p| p.last_out else 0,
+            .ambient_lfo = if (ambient_lfo) |p| p.lfo.phase else 0,
             .base_seed = self.base_seed,
             .bar_pending = self.pending_bar_cmd != null,
             .song_playing = self.song_playing,
@@ -1398,22 +1454,22 @@ test "Controls: defaults match constructed patch values (no-op baseline)" {
     defer patch.destroy();
     var buf: [64]f32 = undefined;
     patch.render(&buf, 32, 2);
-    try testing.expectEqual(@as(f32, DEFAULT_BPM), patch.clock.bpm);
-    try testing.expectEqual(@as(f32, 0.0), patch.clock.swing);
-    try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), patch.sidechain.amount);
-    try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), patch.master_vcf.cutoff);
-    try testing.expectEqual(@as(f32, KICK_BASE_GAIN), patch.kick.gain);
-    try testing.expectEqual(@as(f32, 1.0), patch.bass_perc.peak);
-    try testing.expectEqual(@as(f32, KICK_CLICK_BASE), patch.kick.click_gain);
-    try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), patch.hat.brightness);
-    try testing.expectEqual(@as(f32, HAT_BASE_DECAY), patch.hat.decay);
-    try testing.expectEqual(@as(f32, PAD_BASE_GAIN), patch.pad.gain);
-    try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), patch.pad.cutoff);
-    try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), patch.pad.warmth);
-    try testing.expectEqual(@as(f32, 1.5), patch.saturator.drive);
+    try testing.expectEqual(@as(f32, DEFAULT_BPM), testClock(patch).bpm);
+    try testing.expectEqual(@as(f32, 0.0), testClock(patch).swing);
+    try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), testSidechain(patch).amount);
+    try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), testMasterVcf(patch).cutoff);
+    try testing.expectEqual(@as(f32, KICK_BASE_GAIN), testKick(patch).gain);
+    try testing.expectEqual(@as(f32, 1.0), testBassPerc(patch).peak);
+    try testing.expectEqual(@as(f32, KICK_CLICK_BASE), testKick(patch).click_gain);
+    try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), testHat(patch).brightness);
+    try testing.expectEqual(@as(f32, HAT_BASE_DECAY), testHat(patch).decay);
+    try testing.expectEqual(@as(f32, PAD_BASE_GAIN), testPad(patch).gain);
+    try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), testPad(patch).cutoff);
+    try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), testPad(patch).warmth);
+    try testing.expectEqual(@as(f32, 1.5), testSaturator(patch).drive);
     // 初期 pattern が seed 値で StepSeq に入っている
-    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask);
-    try testing.expectEqual(BASS_ON, patch.bass_seq.on_mask);
+    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(BASS_ON, testSeq(patch, patch.bass_seq_h).on_mask);
 }
 
 test "Controls: swing/sidechain/cutoff change output (bounded & finite)" {
@@ -1478,16 +1534,16 @@ test "Controls: non-finite values fall back to safe defaults (finite output)" {
     patch.controls.master_warmth.store(std.math.inf(f32));
     patch.controls.ambient_move.store(std.math.nan(f32));
     _ = try renderStats(patch, buf, frames);
-    try testing.expectEqual(@as(f32, DEFAULT_BPM), patch.clock.bpm);
-    try testing.expectEqual(@as(f32, 0.0), patch.clock.swing);
-    try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), patch.sidechain.amount);
-    try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), patch.master_vcf.cutoff);
-    try testing.expectEqual(@as(f32, KICK_CLICK_BASE), patch.kick.click_gain);
-    try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), patch.hat.brightness);
-    try testing.expectEqual(@as(f32, HAT_BASE_DECAY), patch.hat.decay);
-    try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), patch.pad.cutoff);
-    try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), patch.pad.warmth);
-    try testing.expectEqual(@as(f32, 1.0 + MASTER_WARMTH_DEFAULT), patch.saturator.drive);
+    try testing.expectEqual(@as(f32, DEFAULT_BPM), testClock(patch).bpm);
+    try testing.expectEqual(@as(f32, 0.0), testClock(patch).swing);
+    try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), testSidechain(patch).amount);
+    try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), testMasterVcf(patch).cutoff);
+    try testing.expectEqual(@as(f32, KICK_CLICK_BASE), testKick(patch).click_gain);
+    try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), testHat(patch).brightness);
+    try testing.expectEqual(@as(f32, HAT_BASE_DECAY), testHat(patch).decay);
+    try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), testPad(patch).cutoff);
+    try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), testPad(patch).warmth);
+    try testing.expectEqual(@as(f32, 1.0 + MASTER_WARMTH_DEFAULT), testSaturator(patch).drive);
 }
 
 // ----------------------------------------------------------------------------
@@ -1496,6 +1552,35 @@ test "Controls: non-finite values fall back to safe defaults (finite output)" {
 
 fn publishPattern(patch: *LofiPatch, cmd: PatternCommand) void {
     patch.controls.pattern_db.publish(cmd);
+}
+
+// テストは wire 済み active handle を前提に、実装と同じガード付き解決を通す。
+fn testClock(patch: *LofiPatch) *modular.Clock {
+    return patch.ptr(.clock, patch.clock_h).?;
+}
+fn testSeq(patch: *LofiPatch, handle: modular.dyn.Handle) *modular.StepSeq {
+    return patch.ptr(.step_seq, handle).?;
+}
+fn testKick(patch: *LofiPatch) *modular.Kick {
+    return patch.ptr(.kick, patch.kick_h).?;
+}
+fn testHat(patch: *LofiPatch) *modular.Hat {
+    return patch.ptr(.hat, patch.hat_h).?;
+}
+fn testSidechain(patch: *LofiPatch) *modular.Sidechain {
+    return patch.ptr(.sidechain, patch.sidechain_h).?;
+}
+fn testMasterVcf(patch: *LofiPatch) *modular.Vcf {
+    return patch.ptr(.vcf, patch.master_vcf_h).?;
+}
+fn testBassPerc(patch: *LofiPatch) *modular.PercEnv {
+    return patch.ptr(.perc_env, patch.bass_perc_h).?;
+}
+fn testPad(patch: *LofiPatch) *modular.ChordPad {
+    return patch.ptr(.chord_pad, patch.pad_h).?;
+}
+fn testSaturator(patch: *LofiPatch) *modular.Saturator {
+    return patch.ptr(.saturator, patch.saturator_h).?;
 }
 
 test "Ph5: grid edit (publish) changes output CRC" {
@@ -1518,7 +1603,7 @@ test "Ph5: grid edit (publish) changes output CRC" {
     const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
 
     try testing.expect(crc_base != crc_mod);
-    try testing.expectEqual(@as(u16, 0xFFFF), mod.kick_seq.on_mask); // 取り込まれた
+    try testing.expectEqual(@as(u16, 0xFFFF), testSeq(mod, mod.kick_seq_h).on_mask); // 取り込まれた
     try testing.expectEqual(@as(u32, 1), mod.applied_rev);
 }
 
@@ -1534,11 +1619,11 @@ test "Ph5: locked track does not mutate over many bars" {
     cmd.bass.lock = true;
     publishPattern(patch, cmd);
     _ = try renderLong(patch, 4800, 48000 * 12); // 多数の bar を跨ぐ
-    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask);
-    try testing.expectEqual(HAT_ON, patch.hat_seq.on_mask);
-    try testing.expectEqual(CLAP_ON, patch.clap_seq.on_mask);
-    try testing.expectEqual(BASS_ON, patch.bass_seq.on_mask);
-    try testing.expectEqual(BASS_ACCENT, patch.bass_seq.accent_mask);
+    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(HAT_ON, testSeq(patch, patch.hat_seq_h).on_mask);
+    try testing.expectEqual(CLAP_ON, testSeq(patch, patch.clap_seq_h).on_mask);
+    try testing.expectEqual(BASS_ON, testSeq(patch, patch.bass_seq_h).on_mask);
+    try testing.expectEqual(BASS_ACCENT, testSeq(patch, patch.bass_seq_h).accent_mask);
 }
 
 test "Ph5: evolve OFF freezes pattern; evolve ON evolves it (deterministic)" {
@@ -1550,8 +1635,8 @@ test "Ph5: evolve OFF freezes pattern; evolve ON evolves it (deterministic)" {
     off.evolve = false;
     publishPattern(frozen, off);
     _ = try renderLong(frozen, 4800, 48000 * 12);
-    try testing.expectEqual(KICK_ON, frozen.kick_seq.on_mask);
-    try testing.expectEqual(HAT_ON, frozen.hat_seq.on_mask);
+    try testing.expectEqual(KICK_ON, testSeq(frozen, frozen.kick_seq_h).on_mask);
+    try testing.expectEqual(HAT_ON, testSeq(frozen, frozen.hat_seq_h).on_mask);
     try testing.expectEqual(@as(u32, 0), frozen.mutation_count);
 
     // evolve ON（既定）→ 変異が起き、固定 seed なので 2 回 render で同じ最終状態
@@ -1576,10 +1661,10 @@ test "Ph5: drum mutation keeps density within band (kick stays four-on-floor-ish
     var rendered: u64 = 0;
     while (rendered < 48000 * 30) : (rendered += 4800) {
         patch.render(buf, 4800, 2);
-        const kc: u32 = @popCount(patch.kick_seq.on_mask);
-        const hc: u32 = @popCount(patch.hat_seq.on_mask);
-        const cc: u32 = @popCount(patch.clap_seq.on_mask);
-        const bc: u32 = @popCount(patch.bass_seq.on_mask);
+        const kc: u32 = @popCount(testSeq(patch, patch.kick_seq_h).on_mask);
+        const hc: u32 = @popCount(testSeq(patch, patch.hat_seq_h).on_mask);
+        const cc: u32 = @popCount(testSeq(patch, patch.clap_seq_h).on_mask);
+        const bc: u32 = @popCount(testSeq(patch, patch.bass_seq_h).on_mask);
         try testing.expect(kc >= KICK_BAND[0] and kc <= KICK_BAND[1]);
         try testing.expect(hc >= HAT_BAND[0] and hc <= HAT_BAND[1]);
         try testing.expect(cc >= CLAP_BAND[0] and cc <= CLAP_BAND[1]);
@@ -1800,7 +1885,7 @@ test "seed: resetWithSeed restores initial pattern and clears mutation_count" {
     patch.resetWithSeed(7);
     try testing.expectEqual(@as(u64, 7), patch.base_seed);
     try testing.expectEqual(@as(u32, 0), patch.mutation_count);
-    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask);
+    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
 }
 
 /// 生成レイヤ（pattern / StepSeq runtime / 変異 / 生成 RNG / クロック位相 / 背景生成 runtime）の
@@ -1812,43 +1897,49 @@ fn expectGenLayerEqual(a: *const LofiPatch, b: *const LofiPatch) !void {
     try testing.expectEqual(a.evolve, b.evolve);
     try testing.expectEqual(a.lock, b.lock);
 
-    try testing.expectEqual(a.clock.started, b.clock.started);
-    try testing.expectEqual(a.clock.tick_index, b.clock.tick_index);
-    try testing.expectEqual(a.clock.phase_samples, b.clock.phase_samples);
-    try testing.expectEqual(a.clock.samples_per_tick, b.clock.samples_per_tick);
-    try testing.expectEqual(a.clock.cur_interval, b.clock.cur_interval);
+    const a_clock = a.ptrConst(.clock, a.clock_h).?;
+    const b_clock = b.ptrConst(.clock, b.clock_h).?;
+    try testing.expectEqual(a_clock.started, b_clock.started);
+    try testing.expectEqual(a_clock.tick_index, b_clock.tick_index);
+    try testing.expectEqual(a_clock.phase_samples, b_clock.phase_samples);
+    try testing.expectEqual(a_clock.samples_per_tick, b_clock.samples_per_tick);
+    try testing.expectEqual(a_clock.cur_interval, b_clock.cur_interval);
 
-    try expectStepSeqGenEqual(a.kick_seq, b.kick_seq);
-    try expectStepSeqGenEqual(a.hat_seq, b.hat_seq);
-    try expectStepSeqGenEqual(a.clap_seq, b.clap_seq);
-    try expectStepSeqGenEqual(a.bass_seq, b.bass_seq);
+    try expectStepSeqGenEqual(a.ptrConst(.step_seq, a.kick_seq_h).?, b.ptrConst(.step_seq, b.kick_seq_h).?);
+    try expectStepSeqGenEqual(a.ptrConst(.step_seq, a.hat_seq_h).?, b.ptrConst(.step_seq, b.hat_seq_h).?);
+    try expectStepSeqGenEqual(a.ptrConst(.step_seq, a.clap_seq_h).?, b.ptrConst(.step_seq, b.clap_seq_h).?);
+    try expectStepSeqGenEqual(a.ptrConst(.step_seq, a.bass_seq_h).?, b.ptrConst(.step_seq, b.bass_seq_h).?);
 
     try testing.expectEqual(a.mut_noise.state, b.mut_noise.state);
-    try testing.expectEqual(a.ambient_random.noise.state, b.ambient_random.noise.state);
-    try testing.expectEqual(a.ambient_random.prev_gate, b.ambient_random.prev_gate);
-    try testing.expectEqual(a.ambient_random.held, b.ambient_random.held);
-    try testing.expectEqual(a.ambient_turing.noise.state, b.ambient_turing.noise.state);
-    try testing.expectEqual(a.ambient_turing.register, b.ambient_turing.register);
-    try testing.expectEqual(a.ambient_turing.anchor_register, b.ambient_turing.anchor_register);
-    try testing.expectEqual(a.ambient_turing.last_cv, b.ambient_turing.last_cv);
-    try testing.expectEqual(a.ambient_turing.prev_gate, b.ambient_turing.prev_gate);
-    try testing.expectEqual(a.ambient_turing.edge_count, b.ambient_turing.edge_count);
-    try testing.expectEqual(a.ambient_lfo.lfo.phase, b.ambient_lfo.lfo.phase);
-    try testing.expectEqual(a.ambient_quant.last_out, b.ambient_quant.last_out);
-    try testing.expectEqual(a.pad_div.count, b.pad_div.count);
-    try testing.expectEqual(a.pad_div.prev_gate, b.pad_div.prev_gate);
-    try testing.expectEqual(a.pad_eu.step, b.pad_eu.step);
-    try testing.expectEqual(a.pad_eu.prev_gate, b.pad_eu.prev_gate);
+    const a_random = a.ptrConst(.random, a.ambient_random_h).?;
+    const b_random = b.ptrConst(.random, b.ambient_random_h).?;
+    try testing.expectEqual(a_random.noise.state, b_random.noise.state);
+    try testing.expectEqual(a_random.prev_gate, b_random.prev_gate);
+    try testing.expectEqual(a_random.held, b_random.held);
+    const a_turing = a.ptrConst(.turing, a.ambient_turing_h).?;
+    const b_turing = b.ptrConst(.turing, b.ambient_turing_h).?;
+    try testing.expectEqual(a_turing.noise.state, b_turing.noise.state);
+    try testing.expectEqual(a_turing.register, b_turing.register);
+    try testing.expectEqual(a_turing.anchor_register, b_turing.anchor_register);
+    try testing.expectEqual(a_turing.last_cv, b_turing.last_cv);
+    try testing.expectEqual(a_turing.prev_gate, b_turing.prev_gate);
+    try testing.expectEqual(a_turing.edge_count, b_turing.edge_count);
+    try testing.expectEqual(a.ptrConst(.lfo, a.ambient_lfo_h).?.lfo.phase, b.ptrConst(.lfo, b.ambient_lfo_h).?.lfo.phase);
+    try testing.expectEqual(a.ptrConst(.quantizer, a.ambient_quant_h).?.last_out, b.ptrConst(.quantizer, b.ambient_quant_h).?.last_out);
+    try testing.expectEqual(a.ptrConst(.clock_divider, a.pad_div_h).?.count, b.ptrConst(.clock_divider, b.pad_div_h).?.count);
+    try testing.expectEqual(a.ptrConst(.clock_divider, a.pad_div_h).?.prev_gate, b.ptrConst(.clock_divider, b.pad_div_h).?.prev_gate);
+    try testing.expectEqual(a.ptrConst(.euclid, a.pad_eu_h).?.step, b.ptrConst(.euclid, b.pad_eu_h).?.step);
+    try testing.expectEqual(a.ptrConst(.euclid, a.pad_eu_h).?.prev_gate, b.ptrConst(.euclid, b.pad_eu_h).?.prev_gate);
 
     // 生成 RNG の次値（state 消費前にコピーして比較）
     var na = a.mut_noise;
     var nb = b.mut_noise;
     try testing.expectEqual(na.next(), nb.next());
-    var ra = a.ambient_random.noise;
-    var rb = b.ambient_random.noise;
+    var ra = a_random.noise;
+    var rb = b_random.noise;
     try testing.expectEqual(ra.next(), rb.next());
-    var ta = a.ambient_turing.noise;
-    var tb = b.ambient_turing.noise;
+    var ta = a_turing.noise;
+    var tb = b_turing.noise;
     try testing.expectEqual(ta.next(), tb.next());
 }
 
@@ -1874,8 +1965,8 @@ test "seed: mid-run applyBaseSeed matches fresh create gen-layer state field-wis
     const run = try LofiPatch.create(testing.allocator, 48000);
     defer run.destroy();
     _ = try renderLong(run, 4800, 48000 * 10); // 数 bar 進めて runtime を汚す
-    try testing.expect(run.clock.started);
-    try testing.expect(run.kick_seq.loadStep() != 0 or run.clock.tick_index > 0);
+    try testing.expect(testClock(run).started);
+    try testing.expect(testSeq(run, run.kick_seq_h).loadStep() != 0 or testClock(run).tick_index > 0);
     try testing.expect(run.mutation_count > 0);
     run.resetWithSeed(base); // = requestSeed 同期 + applyBaseSeed
 
@@ -1909,7 +2000,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     while (rendered < pre_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
     }
-    const old_kick = patch.kick_seq.on_mask;
+    const old_kick = testSeq(patch, patch.kick_seq_h).on_mask;
     try testing.expectEqual(KICK_ON, old_kick);
 
     // quantize_bar=true で新 pattern を publish → 次 bar まで旧のまま
@@ -1926,7 +2017,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     while (rendered < mid_extra) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
     }
-    try testing.expectEqual(old_kick, patch.kick_seq.on_mask);
+    try testing.expectEqual(old_kick, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd != null);
 
     // bar 境界を跨ぐ → 新 pattern 反映
@@ -1934,7 +2025,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     while (rendered < post_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
     }
-    try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0x5555), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
 }
 
@@ -1949,7 +2040,7 @@ test "TASK-93: quantize_bar=false still applies immediately (GUI path unchanged)
     // render 1 block で applyControls が走る
     var buf: [256]f32 = undefined;
     patch.render(&buf, 128, 2);
-    try testing.expectEqual(@as(u16, 0xFFFF), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0xFFFF), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
 }
 
@@ -1990,7 +2081,7 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
         patch.render(buf, chunk, 2);
     }
     try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, patch.base_seed);
-    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask);
+    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd != null);
 
     // 境界後: seed=42 かつ kick=0x5555（pattern が seed 後に載る）
@@ -1999,7 +2090,7 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
         patch.render(buf, chunk, 2);
     }
     try testing.expectEqual(@as(u64, 42), patch.base_seed);
-    try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0x5555), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
 }
 
@@ -2050,8 +2141,8 @@ test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
     while (rendered < post_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
     }
-    try testing.expectEqual(@as(u16, 0x5555), patch.kick_seq.on_mask);
-    try testing.expectEqual(@as(u16, 0xAAAA), patch.hat_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0x5555), testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0xAAAA), testSeq(patch, patch.hat_seq_h).on_mask);
     try testing.expect(!patch.snapshotState().bar_pending);
 }
 
@@ -2094,15 +2185,15 @@ test "TASK-91: song play force-applies phrase on first bar (not default)" {
     const patch = try LofiPatch.create(testing.allocator, sr);
     defer patch.destroy();
     setupSongTwoPhrase(patch, true);
-    try testing.expectEqual(KICK_ON, patch.kick_seq.on_mask); // play 前は既定
+    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask); // play 前は既定
     patch.controls.song_playing.store(1, .release);
 
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
     // 1 ブロック render で force apply が走る（bar 境界を待たない）
     patch.render(buf, chunk, 2);
-    try testing.expectEqual(@as(u16, 0x0F0F), patch.kick_seq.on_mask);
-    try testing.expectEqual(@as(u16, 0xF0F0), patch.hat_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0x0F0F), testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0xF0F0), testSeq(patch, patch.hat_seq_h).on_mask);
     try testing.expect(patch.song_playing);
     try testing.expect(!patch.song_force_apply); // 消費済み
 }
@@ -2124,7 +2215,7 @@ test "TASK-91: song play switches phrase at bar boundary" {
     const limit: u64 = 48000 * 20;
     while (rendered < limit) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
-        const k = patch.kick_seq.on_mask;
+        const k = testSeq(patch, patch.kick_seq_h).on_mask;
         if (k == 0x0F0F) seen0 = true;
         if (k == 0x5555) seen1 = true;
         if (seen0 and seen1) break;
@@ -2171,7 +2262,7 @@ test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
 
     // force: phrase 0 適用
     patch.render(buf, chunk, 2);
-    try testing.expectEqual(@as(u16, 0x0F0F), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0x0F0F), testSeq(patch, patch.kick_seq_h).on_mask);
 
     // 空 chain row へ進むまで render（変異が kick を 0x0F0F から動かしうる）
     var rendered: u64 = 0;
@@ -2183,12 +2274,12 @@ test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
         if (patch.song_last_phrase[0] == PHRASE_NONE) {
             saw_empty_row = true;
             // 空 row 中に kick を強制改変して「間の変異」をシミュレート
-            if (patch.kick_seq.on_mask == 0x0F0F) {
-                patch.kick_seq.on_mask = 0x0001; // phrase 0 でも既定でもない
+            if (testSeq(patch, patch.kick_seq_h).on_mask == 0x0F0F) {
+                testSeq(patch, patch.kick_seq_h).on_mask = 0x0001; // phrase 0 でも既定でもない
             }
         }
         // 復帰 row で phrase 0 が再適用される
-        if (saw_empty_row and patch.kick_seq.on_mask == 0x0F0F and patch.song_last_phrase[0] == 0) {
+        if (saw_empty_row and testSeq(patch, patch.kick_seq_h).on_mask == 0x0F0F and patch.song_last_phrase[0] == 0) {
             saw_reapply = true;
             break;
         }
@@ -2300,13 +2391,13 @@ test "TASK-91: pending_bar_cmd wins over song on same bar" {
     pending.evolve = false;
     pending.quantize_bar = true;
     pending.kick.on = 0xFFFF;
-    pending.hat.on = patch.hat_seq.on_mask;
-    pending.clap.on = patch.clap_seq.on_mask;
+    pending.hat.on = testSeq(patch, patch.hat_seq_h).on_mask;
+    pending.clap.on = testSeq(patch, patch.clap_seq_h).on_mask;
     pending.bass = .{
-        .on = patch.bass_seq.on_mask,
-        .accent = patch.bass_seq.accent_mask,
-        .slide = patch.bass_seq.slide_mask,
-        .deg = patch.bass_seq.pitch_deg,
+        .on = testSeq(patch, patch.bass_seq_h).on_mask,
+        .accent = testSeq(patch, patch.bass_seq_h).accent_mask,
+        .slide = testSeq(patch, patch.bass_seq_h).slide_mask,
+        .deg = testSeq(patch, patch.bass_seq_h).pitch_deg,
     };
     publishPattern(patch, pending);
 
@@ -2314,9 +2405,9 @@ test "TASK-91: pending_bar_cmd wins over song on same bar" {
     rendered = 0;
     while (rendered < 48000 * 4) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
-        if (patch.kick_seq.on_mask == 0xFFFF) break;
+        if (testSeq(patch, patch.kick_seq_h).on_mask == 0xFFFF) break;
     }
-    try testing.expectEqual(@as(u16, 0xFFFF), patch.kick_seq.on_mask);
+    try testing.expectEqual(@as(u16, 0xFFFF), testSeq(patch, patch.kick_seq_h).on_mask);
 }
 
 fn songRenderCrc(seed: u64, chunk: u32, target: u64) !u32 {

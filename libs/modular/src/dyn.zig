@@ -362,7 +362,7 @@ pub const DynGraph = struct {
         };
     }
 
-    fn isActive(self: *const DynGraph, h: Handle) bool {
+    pub fn isActive(self: *const DynGraph, h: Handle) bool {
         return h < MAX_MODULES and self.slots[h].active;
     }
 
