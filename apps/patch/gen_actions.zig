@@ -1,4 +1,4 @@
-//! apps/modular の harness action（TASK-65 / TASK-93）向け純パーサ。
+//! apps/patch の生成レイヤ harness action（TASK-65 / TASK-93）向け純パーサ。
 //!
 //! ホットパス宣言: ここでパースした結果は「イベント時のみ」（harness の `action <name> [args]`
 //! コマンド1回につき1回）dispatch される。毎フレーム全画素ループ・毎サンプル RT 経路のいずれでもない

@@ -1,4 +1,4 @@
-//! apps/modular のオフライン WAV 書き出し（TASK-86）。
+//! apps/patch のオフライン WAV 書き出し（TASK-86）。
 //!
 //! ホットパス宣言: イベント時のみ（`action render` / 単体テスト）。main thread で offline
 //! LofiPatch をチャンクループする。RT 再生経路（live patch の render / onAudioSamples）には

@@ -1,4 +1,4 @@
-//! apps/modular: 「lofi ミニマルテクノ生成パッチ」(TASK-40.2.1/40.2.2/40.3/40.4/40.5)。
+//! apps/patch の「lofi ミニマルテクノ生成パッチ」(TASK-40.2.1〜105.3)。
 //!
 //! libs/modular のグラフエンジン上に 2 系統の生成を併存させる:
 //!   - 前景(grid/303): editable StepSeq が Clock に同期して Kick/Hat/Clap/Bass を駆動。

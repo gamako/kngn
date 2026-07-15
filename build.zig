@@ -73,7 +73,7 @@ fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason:
 }
 
 /// app → kit 収録 lib の直 import 例外。app 内ファイルが pure-test root を兼ねる場合
-/// （apps/modular/patch.zig の synth/dsp）に限り、テスト module を platform 非依存に保つため
+/// （apps/patch/lofi.zig の synth/dsp）に限り、テスト module を platform 非依存に保つため
 /// named 直 import を許す。kit と同一 module インスタンスなので型同一性は保たれる。
 fn linkAppException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
@@ -366,7 +366,6 @@ pub fn build(b: *std.Build) void {
     var default_main: ?*std.Build.Step.Compile = null;
     var default_pixie: ?*std.Build.Step.Compile = null;
     var default_synth: ?*std.Build.Step.Compile = null;
-    var default_modular: ?*std.Build.Step.Compile = null;
     var default_patch: ?*std.Build.Step.Compile = null;
 
     for (backends) |be| {
@@ -398,12 +397,6 @@ pub fn build(b: *std.Build) void {
             if (is_default) default_synth = synth_exe;
             if (install_all) b.installArtifact(synth_exe);
             addRunStep(b, b.fmt("run-synth-{s}", .{platform.backendName(be)}), b.fmt("Run synth app ({s})", .{platform.backendName(be)}), synth_exe, b.args);
-
-            // ----- Modular アプリ (apps/modular) — lofi 生成パッチ MVP (TASK-40.2.1)。audio backend は macOS/Linux/Windows -----
-            const modular_exe = addModularExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "modular", be, default_be), &shared_modules, &pm);
-            if (is_default) default_modular = modular_exe;
-            if (install_all) b.installArtifact(modular_exe);
-            addRunStep(b, b.fmt("run-modular-{s}", .{platform.backendName(be)}), b.fmt("Run modular app ({s})", .{platform.backendName(be)}), modular_exe, b.args);
 
             // ----- 20_capture_demo (examples/20_capture_demo) — mic 波形/FFT可視化 + camera→canvas デモ
             // (TASK-49.6)。camera/audio の capture 拡張は audio backend 対応 OS でのみ実用的なため
@@ -502,12 +495,6 @@ pub fn build(b: *std.Build) void {
     if (default_synth) |ds| {
         addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", ds, b.args);
         addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
-    }
-
-    // modular も audio 対応 OS のみ生成。
-    if (default_modular) |dm| {
-        addRunStep(b, "run-modular", "Run modular app (uses -Dplatform option)", dm, b.args);
-        addBuildStep(b, "build-modular", "Build modular app only (uses -Dplatform option)", dm);
     }
 
     // patch canvas も audio 対応 OS のみ生成（40.6.3 で発音するため。default_patch は非対応 OS で null）。
@@ -1464,9 +1451,9 @@ pub fn build(b: *std.Build) void {
     const test_modular_step = b.step("test-modular", "Run libs/modular unit tests");
     test_modular_step.dependOn(&run_modular_test.step);
 
-    // apps/modular パッチテスト（LofiPatch の offline render: 非無音/有限/決定的 CRC。display/audio 不要。TASK-40.2.1）
+    // apps/patch 生成レイヤテスト（LofiPatch の offline render: 非無音/有限/決定的 CRC）。
     const modular_app_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/modular/patch.zig"),
+        .root_source_file = b.path("apps/patch/lofi.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1475,13 +1462,13 @@ pub fn build(b: *std.Build) void {
     modular_app_test_mod.addImport("dsp", shared_modules.dsp.mod); // patch が FFT で band energy を検証（Ph4）
     const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
     const run_modular_app_test = b.addRunArtifact(modular_app_test);
-    const test_app_modular_step = b.step("test-app-modular", "Run apps/modular LofiPatch tests");
+    const test_app_modular_step = b.step("test-app-modular", "Run apps/patch LofiPatch tests");
     test_app_modular_step.dependOn(&run_modular_app_test.step);
 
-    // apps/modular action の純パーサ（TASK-65）。std のみ・App/kit/modular 非依存で import 不要。
+    // apps/patch generation action の純パーサ（TASK-65）。std のみ。
     const modular_actions_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/modular/actions.zig"),
+            .root_source_file = b.path("apps/patch/gen_actions.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1489,10 +1476,10 @@ pub fn build(b: *std.Build) void {
     const run_modular_actions_test = b.addRunArtifact(modular_actions_test);
     test_app_modular_step.dependOn(&run_modular_actions_test.step);
 
-    // apps/modular WAV writer（TASK-86）。std のみ・ストリーミング PCM16 RIFF/WAVE。
+    // apps/patch WAV writer（TASK-86）。std のみ・ストリーミング PCM16 RIFF/WAVE。
     const modular_wav_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/modular/wav.zig"),
+            .root_source_file = b.path("apps/patch/wav.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1500,10 +1487,10 @@ pub fn build(b: *std.Build) void {
     const run_modular_wav_test = b.addRunArtifact(modular_wav_test);
     test_app_modular_step.dependOn(&run_modular_wav_test.step);
 
-    // apps/modular scalar params + grid/303 pattern 直列化（TASK-65 serialize）。std + serde のみ・
+    // apps/patch scalar params + grid/303 pattern 直列化（TASK-65 serialize）。std + serde のみ・
     // App/kit/modular 非依存（PatternPayload は plain struct。main.zig 側で PatternCommand と変換）。
     const modular_pattern_io_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/modular/pattern_io.zig"),
+        .root_source_file = b.path("apps/patch/pattern_io.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1512,9 +1499,9 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
-    // apps/modular プロジェクト直列化（TASK-91 MPRJ）。std + serde + pattern_io.PatternPayload。
+    // apps/patch プロジェクト直列化（TASK-91 MPRJ）。std + serde + pattern_io.PatternPayload。
     const modular_project_io_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/modular/project_io.zig"),
+        .root_source_file = b.path("apps/patch/project_io.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1523,10 +1510,10 @@ pub fn build(b: *std.Build) void {
     const run_modular_project_io_test = b.addRunArtifact(modular_project_io_test);
     test_app_modular_step.dependOn(&run_modular_project_io_test.step);
 
-    // apps/modular seed derive（TASK-62.5.7）。std のみ。
+    // apps/patch seed derive（TASK-62.5.7）。std のみ。
     const modular_seed_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/modular/seed.zig"),
+            .root_source_file = b.path("apps/patch/seed.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1534,9 +1521,9 @@ pub fn build(b: *std.Build) void {
     const run_modular_seed_test = b.addRunArtifact(modular_seed_test);
     test_app_modular_step.dependOn(&run_modular_seed_test.step);
 
-    // apps/modular CommandRecord 配線契約（TASK-62.5.7）。command は std のみ・既存 API 利用。
+    // apps/patch CommandRecord 配線契約（TASK-62.5.7）。command は std のみ・既存 API 利用。
     const modular_cmd_seed_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/modular/cmd_seed_test.zig"),
+        .root_source_file = b.path("apps/patch/cmd_seed_test.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1834,7 +1821,7 @@ pub fn build(b: *std.Build) void {
     // bench-lofi（TASK-105.2）: LofiPatch.render の DynGraph 載せ替え前後を同一条件で比較。
     // patch は pure-test root と同じく modular/synth/dsp のみを必要とする。
     const bench_lofi_patch_mod = b.createModule(.{
-        .root_source_file = b.path("apps/modular/patch.zig"),
+        .root_source_file = b.path("apps/patch/lofi.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -2386,7 +2373,7 @@ fn addPixieExe(
 // ヘルパー: patch app exe を 1 backend 分セットアップ（apps/patch。TASK-40.6.2/40.6.3/40.7.1）
 // platform + gui + modular（動的グラフエンジン）+ audio（40.6.3 ライブ再配線で発音）。
 // canvas.zig/group.zig/macro.zig は main.zig からの相対 @import（同一 module）で取り込む
-// （apps/modular/main.zig が patch.zig を相対 import する既存パターンと同型。macro.zig の
+// （apps/patch/main.zig が lofi.zig を相対 import する構成。macro.zig の
 // @import("modular") はこの exe.root_module に登録済みの "modular" named import をそのまま解決できる）。
 // ============================================================
 fn addPatchExe(
@@ -2416,6 +2403,8 @@ fn addPatchExe(
     link(root, common.spectrogram); // TASK-40.8: 信号可視化（master scope/spectrogram/level meter）
     link(root, common.scope);
     link(root, common.serde); // graph_io.zig（TASK-65 serialize: ノード/エッジ構成の versioned container 直列化）
+    linkAppException(root, common.synth, "apps/patch/lofi.zig が生成レイヤを直接利用（SampleTap / AtomicF32）");
+    linkAppException(root, common.dsp, "apps/patch/lofi.zig が生成レイヤを直接利用（FFT band energy 検証）");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
     // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
@@ -2453,49 +2442,6 @@ fn addSynthExe(
     link(root, common.scope);
     link(root, common.serde); // patch_io.zig（音色/FX パラメータの versioned container 直列化）
     linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
-
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
-    return exe;
-}
-
-// ============================================================================
-// ヘルパー: modular app exe を 1 backend 分セットアップ（apps/modular。TASK-40.2.1）
-// platform + audio + modular(グラフエンジン)。GUI は最小なので gui は import しない。
-// ============================================================================
-fn addModularExe(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    platform_root: std.Build.LazyPath,
-    sdk_paths: ?macos.MacOSSDKPaths,
-    platform_type: platform.PlatformType,
-    name: []const u8,
-    common: *const SharedModules,
-    pm: *const PlatformModules,
-) *std.Build.Step.Compile {
-    const exe = b.addExecutable(.{
-        .name = name,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/modular/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    // apps は kit-only 消費者（R5）。platform/audio/gui は kit.* で参照。
-    // modular / 可視化（libs/viz）は流動中で kit 非収録のため直 import。
-    // serde（TASK-65 serialize: pattern_io.zig が直 import）も同様に直 import。
-    const root = appRoot(exe, "modular");
-    link(root, pm.kit);
-    link(root, common.modular); // グラフエンジン（dsp 依存のみ）
-    link(root, common.spectrogram);
-    link(root, common.scope);
-    link(root, common.serde); // pattern_io.zig（scalar params + grid/303 pattern の versioned container 直列化）
-    // patch.zig は pure-test root（test-app-modular）を兼ねるため synth/dsp を named 直 import する。
-    // kit と同一 module インスタンスなので型同一性は保たれる（linkAppException の doc 参照）。
-    linkAppException(root, common.synth, "apps/modular/patch.zig が test root を兼ねる（SampleTap / AtomicF32）");
-    linkAppException(root, common.dsp, "apps/modular/patch.zig が test root を兼ねる（FFT band energy 検証）");
-    linkAudioBackend(exe, target.result.os.tag);
 
     // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);

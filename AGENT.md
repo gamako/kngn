@@ -51,8 +51,7 @@ video-proto-main/
 ├── apps/              # L4 終端の消費者（kit-only。R5。流動 lib=modular/paint/viz のみ直 import 可）
 │   ├── editor/apps/pixie/ # ドット絵エディタ（Pen/Eraser/レイヤー/範囲選択/ベジェ/DB16 パレット/Undo/PNG）
 │   ├── synth/         # PC キーボード演奏シンセ MVP（run-synth）
-│   ├── modular/       # lofi 生成パッチ（run-modular）
-│   └── patch/         # パッチキャンバス UI（run-patch）
+│   └── patch/         # lofi 生成 + パッチキャンバス統合（run-patch）
 └── docs/              # ドキュメント
     ├── PLAN.md        # 実装計画（原初の Phase 分け）
     ├── PLAN_*.md      # 個別計画（example_02/03 / libs_gui / png_decoder 等）
@@ -150,7 +149,7 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
   `libs/pixelops`（ブレンド共有プリミティブ）・`libs/modular`（グラフエンジン）・`libs/paint`（エディタ共有コア）・
   `libs/viz`（可視化: spectrogram / scope）。
 - ✅ **アプリ**: `apps/editor/apps/pixie`（ドット絵エディタ: レイヤー / 範囲選択 / ベジェ / Undo / PNG）・
-  `apps/synth`（PC キーボード演奏）・`apps/modular`（lofi 生成）・`apps/patch`（パッチキャンバス）。
+  `apps/synth`（PC キーボード演奏）・`apps/patch`（lofi 生成 + パッチキャンバス統合）。
 - ✅ **オーディオ / シンセ層**: `core/audio` + `src/dsp` + `libs/synth`（下記「オーディオ / シンセ層」節）。
 - ✅ **ヘッドレス検証 harness**: `core/control/harness.zig`（下記「ヘッドレス検証 harness」節）。
 
@@ -385,7 +384,7 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
     kind=.drum は gate 1 出力、kind=.bass は gate/pitch_cv/accent_cv の 3 出力（slide は内部 pitch glide。未配線出力は作らない）。
 - **lofi FX dsp**（`src/dsp`）: Bitcrush（bit/SR 低減）/ VinylNoise（crackle+hiss）/ WowFlutter（可変 delay の
   ピッチ揺れ）。既存 DelayLine/Reverb/softClip も FX wrapper module から利用。
-- **apps/modular**（`run-modular`）: `patch.zig` の `LofiPatch`（自己生成パッチを 1 回構築し RT で
+- **apps/patch**（`run-patch`）: `lofi.zig` の `LofiPatch`（自己生成パッチを 1 回構築し RT で
   `graph.processBlock`）＋ `main.zig`（window+audio+harness probe + DrumMachine/BassMachine GUI）。`LofiPatch` は
   graph が各モジュールへの ctx ポインタを保持する自己参照のため**ヒープ確保しムーブしない**（`create`/`destroy`）。
   - **生成は 2 系統**（Ph5 方針 C）: ①前景 = editable StepSeq の grid/303 を **per-bar 離散変異**（evolve(全体トグル)/
@@ -435,24 +434,23 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
     master rms/peak + tap 中 port/レベル/wpos を公開（`patch`/`group` probe と併用）。
 
 ```bash
-zig build run-modular          # lofi 生成パッチを再生（ESC で終了。-Dplatform で backend 切替）
-zig build run-patch            # パッチキャンバス（drag=配線/move/pan・scroll=zoom・下帯=信号可視化）
+zig build run-patch            # 統合 lofi 生成 + パッチキャンバス（ESC で終了）
 zig build test-modular         # libs/modular（topo/cycle/単一接続/生成CV/合成ドラム/per-port tap。display/audio 不要）
-zig build test-app-modular     # apps/modular の LofiPatch（offline 非無音/有限/決定的 CRC）
+zig build test-app-modular     # apps/patch/lofi.zig の LofiPatch（offline 非無音/有限/決定的 CRC）
 zig build test-patch           # apps/patch 純幾何（camera/hit-test/見切れ/tap 選択/ミニスコープ幾何）+ group 台帳
 ```
 
 ヘッドレス AC 確認（macOS 実機で発音、live で audio digest）:
 
 ```bash
-VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-modular &   # 背景起動
+VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-patch &     # 背景起動
 scripts/drive --port-file /tmp/vp.port 'digest audio'                        # → silent=0 / rms>0 を確認
 scripts/drive --port-file /tmp/vp.port 'quit'
 ```
 
 > 決定性は `test-app-modular` の「2 回 render の CRC 一致」で担保（合成パラメータ変更で壊れる golden 定数は
 > 置かない）。Linux 発音は環境依存（[ALSA→PipeWire 前提条件](#linux-で音を鳴らす前提条件alsapipewiretask-2871)）で
-> `run-modular` は manual、`test-modular`/`test-app-modular` は OS 非依存で必須。
+> `run-patch` は manual、`test-modular`/`test-app-modular` は OS 非依存で必須。
 
 ## ヘッドレス検証 harness（TASK-32 ファミリー）
 

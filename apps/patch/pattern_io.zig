@@ -1,4 +1,4 @@
-//! apps/modular の scalar パラメータ + grid/303 pattern 直列化（TASK-65 serialize）。
+//! apps/patch の scalar パラメータ + grid/303 pattern 直列化（TASK-65 serialize）。
 //!
 //! libs/serde の versioned container（TASK-62.2）に 2 chunk を載せる:
 //!   - SPRM: scalar `Params`（tempo/gain/mute 等）。main.zig の具体型を comptime で汎用直列化
@@ -8,7 +8,7 @@
 //!   - PTRN: grid/303 pattern（`PatternPayload`。固定 layout・明示 offset。document_io.zig の
 //!     DOCH と同じ流儀）。
 //!
-//! **循環 import 回避**: `Params`/`PatternCommand`（apps/modular/main.zig・patch.zig 具体型）は
+//! **循環 import 回避**: `Params`/`PatternCommand`（apps/patch/main.zig・lofi.zig 具体型）は
 //! import しない。main.zig 側が `PatternPayload` との変換（`patternToPayload`/`payloadToPatternCommand`）
 //! を行う。
 //!
@@ -94,7 +94,7 @@ fn unpackFrom(comptime T: type, bytes: []const u8) error{NonFiniteField}!T {
 
 // ── grid/303 pattern（固定 layout。PatternCommand の中身相当。rev は含まない）───────────────────
 
-/// `PatternCommand`（apps/modular/patch.zig）の中身を app 非依存の形で保持する plain struct。
+/// `PatternCommand`（apps/patch/lofi.zig）の中身を app 非依存の形で保持する plain struct。
 /// main.zig が `PatternCommand` との変換を行う。
 pub const PatternPayload = struct {
     evolve: bool = true,

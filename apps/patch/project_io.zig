@@ -1,4 +1,4 @@
-//! apps/modular プロジェクト直列化（TASK-91）。
+//! apps/patch プロジェクト直列化（TASK-91）。
 //!
 //! libs/serde の versioned container に 4 chunk を載せる（.pix の音楽版）:
 //!   - SPRM: scalar Params（pattern_io と同じフラットパッカー）
