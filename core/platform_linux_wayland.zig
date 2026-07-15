@@ -746,9 +746,10 @@ fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
     }
 }
 
-/// TASK-104.3: click-through の input region を設定する。不透明画素（alpha>0）の bounding box を
-/// 1 回だけ求め、wl_surface の input region をその矩形に設定する（透明な余白＝bbox 外のクリックは
-/// 背後へ抜ける。per-pixel の厳密透過ではなく矩形近似。graceful degrade 方針）。
+/// TASK-104.3: click-through の input region を設定する。不透明画素（alpha>0）を各行のラン（連続区間）
+/// ごとに 1px 高の矩形として wl_region に足し（per-row spans）、wl_surface の input region に設定する。
+/// これにより丸い絵の輪郭に沿って透明な余白・四隅のクリックが背後へ抜ける（bbox 単一矩形だと四隅が
+/// 抜けない問題を near-per-pixel で解決。X11 の per-pixel マスクに相当）。
 /// **ホットパス回避**: 全画素走査は `ct_region_valid` でゲートし、click_through 有効化後の最初の
 /// present で 1 回だけ走る（毎フレームの全画素ループにはしない＝性能規約の SIMD 3点セット対象外）。
 /// 静止画マスコット前提。silhouette が変わる用途では setClickThrough の再呼び出しで invalidate する。
@@ -761,30 +762,27 @@ fn refreshInputRegion(st: *State, buf: *ShmBuffer, surface: *c.struct_wl_surface
     const px = buf.pixels;
     if (px.len < @as(usize, @intCast(w)) * @as(usize, @intCast(h))) return;
 
-    // 不透明画素の bbox を走査（有効化後 1 回のみ。64x64 級で安価）。
-    var x0: i32 = w;
-    var y0: i32 = h;
-    var x1: i32 = -1;
-    var y1: i32 = -1;
+    const region = c.wl_compositor_create_region(compositor) orelse return; // 失敗時は valid を立てず次 present で再試行
+
+    // 各行の不透明画素ラン（alpha>0 の連続区間）を 1px 高の矩形として region に足す（per-row spans）。
+    // bbox 単一矩形だと丸い絵の透明な四隅が抜けないため、輪郭に沿った near-per-pixel の入力領域にする。
+    // wl_region は矩形和なので複数 add で OK。不透明画素が皆無なら空 region（全面 click-through）。
     var y: i32 = 0;
     while (y < h) : (y += 1) {
         const row = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
         var x: i32 = 0;
-        while (x < w) : (x += 1) {
-            if ((px[row + @as(usize, @intCast(x))] >> 24) != 0) {
-                if (x < x0) x0 = x;
-                if (x > x1) x1 = x;
-                if (y < y0) y0 = y;
-                if (y > y1) y1 = y;
+        while (x < w) {
+            // 不透明画素まで進める
+            if ((px[row + @as(usize, @intCast(x))] >> 24) == 0) {
+                x += 1;
+                continue;
             }
+            const run_start = x;
+            while (x < w and (px[row + @as(usize, @intCast(x))] >> 24) != 0) : (x += 1) {}
+            c.wl_region_add(region, run_start, y, x - run_start, 1); // [run_start, x) の 1px 高矩形
         }
     }
 
-    const region = c.wl_compositor_create_region(compositor) orelse return; // 失敗時は valid を立てず次 present で再試行
-    if (x1 >= x0 and y1 >= y0) {
-        c.wl_region_add(region, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-    }
-    // 不透明画素が皆無なら空 region（全面 click-through）。
     c.wl_surface_set_input_region(surface, region);
     c.wl_region_destroy(region);
     st.ct_region_valid = true; // 設定成功後にのみ確定（失敗時は上の orelse return で valid のまま）
