@@ -80,3 +80,17 @@ zig build test-gui            # 個別（例: libs/gui）。他に test-core / t
 macOS の Swift/Metal ビルドで使う SDK / Swift ツールチェーンのパスは `xcrun` / `xcode-select` から
 自動検出します（Xcode 更新時も `build.zig` の修正は不要）。CI 等で明示指定したい場合は
 `-Dswift-toolchain-path=` / `-Dswift-sdk-path=` を渡せます。
+
+## ライセンス
+
+本プロジェクトのコードは [MIT License](LICENSE) で公開しています。ただし同梱の第三者アセット・ライブラリは
+それぞれ元のライセンスに従います（各ディレクトリの LICENSE を参照）:
+
+| コンポーネント | ライセンス | 場所 |
+|---|---|---|
+| Press Start 2P（フォント） | SIL OFL 1.1 | [`libs/font/LICENSE`](libs/font/LICENSE) |
+| Spleen（ビットマップフォント） | BSD-2-Clause | [`libs/gui/LICENSE`](libs/gui/LICENSE) / [`examples/05_text_rendering/assets/LICENSE-spleen`](examples/05_text_rendering/assets/LICENSE-spleen) |
+| LodePNG（開発ツールのみ・ビルド非同梱） | zlib License | [`libs/png/tools/lodepng/LICENSE`](libs/png/tools/lodepng/LICENSE) |
+
+なお `examples/19_color_emoji` 等の一部サンプルは OS のシステムフォント（Apple Color Emoji 等）を実行時に
+読み込むだけで、リポジトリには同梱していません。

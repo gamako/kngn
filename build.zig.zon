@@ -81,8 +81,8 @@
         // package として自己完結させるには含める必要がある（TASK-29.1 codex レビュー指摘）。
         "apps",
         "examples",
+        "LICENSE",
         // For example...
-        //"LICENSE",
         //"README.md",
     },
 }
