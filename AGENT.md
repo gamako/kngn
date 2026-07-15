@@ -721,6 +721,8 @@ zig-out/bin/vp-mcp --port-file /tmp/vp.port
 
 **copilot との関係（TASK-62.5.6）**: netsync session 中は copilot transport の operate（`action` / `begin_tx` / `end_tx` / `cancel_tx`）を拒否する（observe=digest/snapshot は可）。agent の操作は `VP_NETSYNC_ACTOR=agent` の専用 peer 接続へ一本化。
 
+**teardown 契約（TASK-109）**: Executor は caller 所有の借用で、`platform.shutdown` が App 解放後の teardown に先立って netsync/copilot の借用を drop する。
+
 ### フレーム仕様（要点）
 
 ```

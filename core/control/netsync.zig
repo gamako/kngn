@@ -969,6 +969,11 @@ pub fn setSharedExecutor(exec: ?*command.Executor) void {
     }
 }
 
+/// teardown 前に共有 executor の借用だけを破棄する（旧ポインタを deref しない）。
+pub fn forgetSharedExecutor() void {
+    shared_executor = null;
+}
+
 pub fn lastRejectedProposal() u32 {
     return last_rejected_proposal;
 }

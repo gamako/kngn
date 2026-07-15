@@ -123,6 +123,7 @@ pub const copilot = struct {
     pub fn stopTransport() void {}
     pub fn pump() void {}
     pub fn setSharedExecutor(_: ?*command.Executor) void {}
+    pub fn forgetSharedExecutor() void {}
     pub fn setNetsyncSessionActive(_: bool) void {}
     pub fn isEnabled() bool {
         return false;
@@ -151,6 +152,7 @@ pub const netsync = struct {
     }
     pub fn registerStateSync(_: StateSync) void {}
     pub fn setSharedExecutor(_: ?*command.Executor) void {}
+    pub fn forgetSharedExecutor() void {}
 
     pub fn probeDigest(_: *anyopaque, buf: []u8) []const u8 {
         return buf[0..0];

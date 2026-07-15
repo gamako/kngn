@@ -443,6 +443,10 @@ pub fn init() Error!void {
 }
 
 pub fn shutdown() void {
+    // app_runtime の defer は登録順と逆に実行されるため App.deinit が先に走る。
+    // 借用先の App 解放後に netsync/copilot が executor を deref しないよう、先に借用を drop する。
+    netsync.forgetSharedExecutor();
+    copilot.forgetSharedExecutor();
     netsync.shutdown(); // main thread で setRouter(null)。disabled 時は no-op
     copilot.stopTransport(); // 接続中 stream → listener の順に close（disabled 時は no-op）
     if (harness.isHeadlessActive()) return; // backend.init() を呼んでいないので shutdown も呼ばない
@@ -552,10 +556,12 @@ pub const command = harness.command;
 /// app の `dispatchCommand(id)` を Executor/router へ接続する adapter 契約。
 pub const command_adapter = harness.command;
 
-/// Co-pilot の共有 executor を設定する（copilot.setSharedExecutor への委譲。TASK-62.5.3）。
+/// Co-pilot / netsync の共有 executor を設定する（各 setSharedExecutor への委譲。TASK-62.5.3）。
 /// 設定時、copilot transport の `action` は app 側 wrapper（executor 経由の記録を一元化）へ
 /// 直 dispatch し、`begin_tx`/`end_tx`/`cancel_tx` はこの executor に対して操作する。
 /// **harness 無効・copilot 無効時も呼んでよい**（module 変数の代入のみの no-op 規約）。
+/// Executor は caller 所有の借用であり、platform.shutdown が teardown 時に借用を drop するため
+/// app 側の明示的な登録解除は不要。ただし platform.shutdown より後まで Executor を生かし続けてはならない。
 pub fn setCommandExecutor(exec: ?*command.Executor) void {
     copilot.setSharedExecutor(exec);
     netsync.setSharedExecutor(exec); // remote COMMIT 適用（no_record）。未設定時 netsync は dispatch fallback

@@ -93,6 +93,11 @@ pub fn setSharedExecutor(exec: ?*command.Executor) void {
     shared_executor = exec;
 }
 
+/// teardown 前に共有 executor の借用だけを破棄する（旧ポインタを deref しない）。
+pub fn forgetSharedExecutor() void {
+    shared_executor = null;
+}
+
 /// operate（action/tx 制御）の対象 executor（共有 executor 優先）。
 fn targetExecutor() *command.Executor {
     return shared_executor orelse &executor;
