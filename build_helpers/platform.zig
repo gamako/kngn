@@ -380,6 +380,8 @@ pub const KitLibs = struct {
     /// 2 module に属し「file exists in modules」エラーになる。渡されなければ buildStandalone が
     /// 単独生成する（recipe 以外で serde を使わない kit 消費者向けの後方互換）。
     serde: ?*std.Build.Module = null,
+    /// kit.appshell（TASK-114.1）。serde と同一 module instance を共有する。
+    appshell: ?*std.Build.Module = null,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
@@ -590,6 +592,12 @@ pub fn buildStandalone(
             });
             kit_recipe_mod.addImport("serde", kit_serde_mod);
             kit_mod.addImport("recipe", kit_recipe_mod);
+            const kit_appshell_mod: *std.Build.Module = if (kl.appshell) |a| a else blk: {
+                const m = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/appshell/src/appshell.zig", .{kit_root}) } });
+                m.addImport("serde", kit_serde_mod);
+                break :blk m;
+            };
+            kit_mod.addImport("appshell", kit_appshell_mod);
             // app_runtime（TASK-73）: kit.zig が無条件 import する（トップ階層 build.zig の
             // `link(kit, app_runtime)` と同じ）。frame-driven runtime で platform に依存するため
             // backend 毎に生成し platform_mod を配線する（KitLibs には含めない）。

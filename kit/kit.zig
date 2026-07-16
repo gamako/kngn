@@ -33,4 +33,5 @@ pub const synth = @import("synth");
 pub const gamepad = @import("gamepad");
 pub const recipe = @import("recipe");
 pub const gmath = @import("gmath");
+pub const appshell = @import("appshell");
 pub const app_runtime = @import("app_runtime");

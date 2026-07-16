@@ -446,6 +446,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
             .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
             .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = true },
+            .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -927,6 +928,18 @@ pub fn build(b: *std.Build) void {
     const run_serde_test = b.addRunArtifact(serde_test);
     const test_serde_step = b.step("test-serde", "Run libs/serde versioned container tests");
     test_serde_step.dependOn(&run_serde_test.step);
+
+    // libs/appshell 単体テスト（設定 / window state / recent files。TASK-114.1）
+    const appshell_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/appshell/src/appshell.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    appshell_test_mod.addImport("serde", shared_modules.serde.mod);
+    const appshell_test = b.addTest(.{ .root_module = appshell_test_mod });
+    const run_appshell_test = b.addRunArtifact(appshell_test);
+    const test_appshell_step = b.step("test-appshell", "Run libs/appshell persistence tests");
+    test_appshell_step.dependOn(&run_appshell_test.step);
 
     // libs/recipe 単体テスト（CommandRecord 列 save/load。TASK-62.5.8。serde に依存）
     const recipe_test_mod = b.createModule(.{
@@ -1682,6 +1695,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_capture_types_step);
     test_step.dependOn(test_pixelops_step);
     test_step.dependOn(test_serde_step);
+    test_step.dependOn(test_appshell_step);
     test_step.dependOn(test_recipe_step);
     test_step.dependOn(test_gmath_step);
 
@@ -1926,6 +1940,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
     link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
     link(kit, common.gmath); // kit.gmath（TASK-111.1）
+    link(kit, common.appshell); // kit.appshell（TASK-114.1）
 
     // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎。
     // wasm shared audio（TASK-73.2）は single_threaded=false（atomics を本物にする）。
@@ -2000,6 +2015,7 @@ const SharedModules = struct {
     pixelops: TaggedModule,
     gmath: TaggedModule,
     serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
+    appshell: TaggedModule, // libs/appshell（設定 / window / recent files。TASK-114.1）
     recipe: TaggedModule, // libs/recipe（CommandRecord 列 save/replay。TASK-62.5.8。std + serde。kit 収録）
     paint: TaggedModule, // 旧 apps/editor/core（ADR-007 R6 で libs/paint へ格上げ）
     spectrogram: TaggedModule, // libs/viz（旧 apps/synth/spectrogram.zig）
@@ -2058,6 +2074,11 @@ const SharedModules = struct {
         const serde: TaggedModule = .{ .layer = .lib, .name = "serde", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/serde/src/serde.zig"),
         }) };
+
+        const appshell: TaggedModule = .{ .layer = .lib, .name = "appshell", .mod = b.createModule(.{
+            .root_source_file = b.path("libs/appshell/src/appshell.zig"),
+        }) };
+        link(appshell, serde);
 
         // libs/recipe: CommandRecord 列の save/replay（TASK-62.5.8）。std + serde のみ。
         // kit 収録（apps は kit.recipe 経由。R5）。core 非依存。
@@ -2275,6 +2296,7 @@ const SharedModules = struct {
             .pixelops = pixelops,
             .gmath = gmath,
             .serde = serde,
+            .appshell = appshell,
             .recipe = recipe,
             .paint = paint,
             .spectrogram = spectrogram,
@@ -2349,6 +2371,10 @@ fn addExampleExe(
     // 直接 addImport する（kit を使わない examples の既存慣習に揃える）。
     if (needs.needs_gamepad) exe.root_module.addImport("gamepad", common.gamepad.mod);
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
+    if (std.mem.startsWith(u8, name, "example_26")) {
+        exe.root_module.addImport("kit", pm.kit.mod);
+        exe.root_module.addImport("appshell", common.appshell.mod);
+    }
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。
