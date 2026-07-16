@@ -294,6 +294,35 @@ pub const Event = union(enum) {
     menu_command: u32,
 };
 
+// ============================================================================
+// MIDI (TASK-115.1。ADR-010)
+// ============================================================================
+//
+// MIDI は Window イベントとは異なる受信頻度・所有モデルを持つため、Event union には
+// 追加せず、core/midi.zig のポーリング facade で公開する。note/controller/value は
+// MIDI 標準の 7-bit 値域 (0..127) を u8 で保持する。backend 境界では値域を検証してから
+// この型を構築する。
+
+pub const MidiDeviceId = u32;
+
+pub const MidiNoteEvent = struct {
+    device_id: MidiDeviceId,
+    note: u8, // MIDI note number: 0..127
+    velocity: u8, // note_on velocity / note_off release velocity: 0..127
+};
+
+pub const MidiCcEvent = struct {
+    device_id: MidiDeviceId,
+    controller: u8, // MIDI controller number: 0..127
+    value: u8, // MIDI controller value: 0..127
+};
+
+pub const MidiEvent = union(enum) {
+    note_on: MidiNoteEvent,
+    note_off: MidiNoteEvent,
+    cc: MidiCcEvent,
+};
+
 /// イベントキューの観測カウンタ (累積値の snapshot)
 pub const EventStats = struct {
     mouse_move_merge_count: u64,
@@ -557,4 +586,28 @@ test "Event: menu_command は数値 ID をそのまま配送できる" {
         .menu_command => |id| try std.testing.expectEqual(@as(u32, 0x1234), id),
         else => return error.UnexpectedEvent,
     }
+}
+
+test "MidiEvent: 3 variant は device id と payload を保持する" {
+    const note_on: MidiEvent = .{ .note_on = .{ .device_id = 7, .note = 60, .velocity = 100 } };
+    const note_off: MidiEvent = .{ .note_off = .{ .device_id = 7, .note = 60, .velocity = 12 } };
+    const cc: MidiEvent = .{ .cc = .{ .device_id = 7, .controller = 74, .value = 96 } };
+
+    try std.testing.expectEqual(@as(MidiDeviceId, 7), note_on.note_on.device_id);
+    try std.testing.expectEqual(@as(u8, 60), note_on.note_on.note);
+    try std.testing.expectEqual(@as(u8, 100), note_on.note_on.velocity);
+    try std.testing.expectEqual(@as(u8, 12), note_off.note_off.velocity);
+    try std.testing.expectEqual(@as(u8, 74), cc.cc.controller);
+    try std.testing.expectEqual(@as(u8, 96), cc.cc.value);
+}
+
+test "MidiEvent: MIDI 7-bit 境界値 0 と 127 を保持する" {
+    const low: MidiEvent = .{ .cc = .{ .device_id = 0, .controller = 0, .value = 0 } };
+    const high: MidiEvent = .{ .note_on = .{ .device_id = std.math.maxInt(MidiDeviceId), .note = 127, .velocity = 127 } };
+
+    try std.testing.expectEqual(@as(u8, 0), low.cc.controller);
+    try std.testing.expectEqual(@as(u8, 0), low.cc.value);
+    try std.testing.expectEqual(@as(MidiDeviceId, std.math.maxInt(MidiDeviceId)), high.note_on.device_id);
+    try std.testing.expectEqual(@as(u8, 127), high.note_on.note);
+    try std.testing.expectEqual(@as(u8, 127), high.note_on.velocity);
 }

@@ -53,6 +53,8 @@ const GamepadInfo = types.GamepadInfo;
 const GamepadDisconnect = types.GamepadDisconnect;
 const CompositionPhase = types.CompositionPhase;
 const CompositionSnapshot = types.CompositionSnapshot;
+const MidiEvent = types.MidiEvent;
+const MidiDeviceId = types.MidiDeviceId;
 const GAMEPAD_NAME_MAX = types.GAMEPAD_NAME_MAX;
 const MAX_GAMEPADS = types.MAX_GAMEPADS;
 
@@ -107,6 +109,17 @@ var port_file_buf: [1024]u8 = undefined;
 var inject_buf: [256]Event = undefined;
 var inject_count: usize = 0;
 var inject_read: usize = 0;
+
+// MIDI synthetic FIFO/state（TASK-115.1・ADR-010）。Window Event queue とは独立させ、
+// midi facade の pollMidi() だけが FIFO を読む。state は注入時点で更新し、app の drain 前でも
+// `digest midi` が最後の論理状態を観測できるようにする。
+const MIDI_FIFO_CAP: usize = 256;
+var midi_buf: [MIDI_FIFO_CAP]MidiEvent = undefined;
+var midi_count: usize = 0;
+var midi_read: usize = 0;
+var midi_pressed: [16]u8 = [_]u8{0} ** 16;
+var midi_cc_values: [128]u8 = [_]u8{0} ** 128;
+var midi_cc_set: [128]bool = [_]bool{false} ** 128;
 
 // マウス状態（move/down/up/scroll の一貫したイベント構築用）
 var mouse_x: i32 = 0;
@@ -298,7 +311,8 @@ pub fn registerProbe(p: Probe) void {
 
 fn isReservedProbeName(name: []const u8) bool {
     return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or
-        std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture") or std.mem.eql(u8, name, "gamepad");
+        std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture") or
+        std.mem.eql(u8, name, "gamepad") or std.mem.eql(u8, name, "midi");
 }
 
 /// JSON 文字列へ未エスケープで埋め込むと破損する文字（`"` / `\` / ASCII 制御文字 `0x00..0x1F`。
@@ -557,6 +571,18 @@ pub fn nextInjectedEvent() ?Event {
     }
     inject_read = 0;
     inject_count = 0;
+    return null;
+}
+
+/// 当該フレームの synthetic MIDI event を1件返す。FIFO が尽きたら次フレーム用に reset する。
+pub fn nextMidiEvent() ?MidiEvent {
+    if (midi_read < midi_count) {
+        const ev = midi_buf[midi_read];
+        midi_read += 1;
+        return ev;
+    }
+    midi_read = 0;
+    midi_count = 0;
     return null;
 }
 
@@ -925,6 +951,28 @@ fn handleInject(it: *Tok) void {
         const cp = parseCodepoint(arg) orelse return warnLine("inject char: codepoint/文字 不正");
         const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
         queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
+    } else if (std.mem.eql(u8, kind, "midi")) {
+        const event_kind = it.next() orelse return warnLine("inject midi: event 種別不足");
+        if (std.mem.eql(u8, event_kind, "note_on") or std.mem.eql(u8, event_kind, "note_off")) {
+            const note = parseMidiValue(it.next()) orelse return warnLine("inject midi note: note は0..127");
+            const velocity = parseMidiValue(it.next()) orelse return warnLine("inject midi note: velocity は0..127");
+            if (it.next() != null) return warnLine("inject midi note: 引数過多");
+            const event: MidiEvent = if (std.mem.eql(u8, event_kind, "note_on") and velocity != 0)
+                .{ .note_on = .{ .device_id = 0, .note = note, .velocity = velocity } }
+            else
+                .{ .note_off = .{ .device_id = 0, .note = note, .velocity = velocity } };
+            if (!queueMidi(event)) return;
+            applyMidiState(event);
+        } else if (std.mem.eql(u8, event_kind, "cc")) {
+            const controller = parseMidiValue(it.next()) orelse return warnLine("inject midi cc: controller は0..127");
+            const value = parseMidiValue(it.next()) orelse return warnLine("inject midi cc: value は0..127");
+            if (it.next() != null) return warnLine("inject midi cc: 引数過多");
+            const event: MidiEvent = .{ .cc = .{ .device_id = 0, .controller = controller, .value = value } };
+            if (!queueMidi(event)) return;
+            applyMidiState(event);
+        } else {
+            return warnLine("inject midi: 不明な event");
+        }
     } else if (std.mem.eql(u8, kind, "commit")) {
         // IME 確定テキスト列を注入（TASK-79.6.1）。残りの行を UTF-8 とみなし codepoint 分解して
         // char_input を連続 queue（実 IME の insertText と同じ消費経路）。modifiers は空。
@@ -1084,6 +1132,13 @@ fn clampUtf8Offset(text: []const u8, offset: usize) usize {
 fn parseGamepadIndex(tok: ?[]const u8) ?u8 {
     const v = parseUsize(tok) orelse return null;
     if (v >= MAX_GAMEPADS) return null;
+    return @intCast(v);
+}
+
+/// MIDI の 7-bit 値を parse する。clamp はせず、範囲外を reject する。
+fn parseMidiValue(tok: ?[]const u8) ?u8 {
+    const v = parseUsize(tok) orelse return null;
+    if (v > 127) return null;
     return @intCast(v);
 }
 
@@ -1272,7 +1327,13 @@ const MIN_CAPABILITIES_BUF_LEN = 128;
 /// `],"actions":[],"truncated":true}`（34B）に対し余裕を持たせる。
 const CAPABILITIES_RESERVED_TAIL = 64;
 
-const CapabilityBuiltin = struct { name: []const u8, ext: []const u8, desc: []const u8 };
+const CapabilityBuiltin = struct {
+    name: []const u8,
+    ext: []const u8,
+    snapshot: bool = true,
+    digest: bool = true,
+    desc: []const u8,
+};
 const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "fb", .ext = "png", .desc = "framebuffer PNG/digest" },
     .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms・peak・f0・silent / band・centroid・onsets・lufs" },
@@ -1280,6 +1341,7 @@ const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "capabilities", .ext = "json", .desc = "登録済み probe・action の内省列挙" },
     .{ .name = "capture", .ext = "png", .desc = "synthetic mic/camera capture: video PNG snapshot + video/audio state digest" },
     .{ .name = "gamepad", .ext = "txt", .desc = "gamepad state: connected mask + per-pad buttons/sticks/triggers" },
+    .{ .name = "midi", .ext = "txt", .snapshot = false, .digest = true, .desc = "MIDI state: device 0 pressed-note bitset + controller values" },
 };
 
 /// `s` を `buf[len.*..limit)` に収まる場合のみ書き込む。収まらなければ何も書かず false を返す
@@ -1374,7 +1436,7 @@ fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, des
     return appendRaw(buf, limit, len, "}");
 }
 
-/// 登録済み probe（組み込み6件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
+/// 登録済み probe（組み込み7件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
 /// **常に valid JSON を返す**契約（`buf.len >= MIN_CAPABILITIES_BUF_LEN` が前提）。容量超過や
 /// name/ext の不正文字でエントリを省略した場合は末尾に `"truncated":true` を付与する。
 fn formatCapabilitiesPayload(buf: []u8) []const u8 {
@@ -1396,7 +1458,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, true, true, b.desc, null)) {
+            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, b.snapshot, b.digest, b.desc, null)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;
@@ -1485,6 +1547,8 @@ fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
         return .{ .ok = formatCapturePayload(buf) };
     } else if (std.mem.eql(u8, probe, "gamepad")) {
         return .{ .ok = formatGamepadPayload(buf) };
+    } else if (std.mem.eql(u8, probe, "midi")) {
+        return .{ .ok = formatMidiPayload(buf) };
     } else if (findProbe(probe)) |p| {
         const dg = p.digest orelse return .{ .unavailable = "digest unsupported" };
         return .{ .ok = dg(p.ctx, buf) };
@@ -1726,6 +1790,48 @@ fn formatGamepadPayload(buf: []u8) []u8 {
             i, normalizeZero(st.left_trigger),
             i, normalizeZero(st.right_trigger),
         }) catch return buf[0..len]).len;
+    }
+    return buf[0..len];
+}
+
+// ============================================================================
+// MIDI probe（組み込み。TASK-115.1・ADR-010）
+//
+// ホットパス宣言: digest コマンド処理時のみ（イベント時のみ）。固定長 state を走査するだけで、
+// フレーム毎・RT 経路ではない。
+// ============================================================================
+
+fn appendMidiHexByte(buf: []u8, len: *usize, value: u8) bool {
+    if (buf.len -| len.* < 2) return false;
+    const digits = "0123456789ABCDEF";
+    buf[len.*] = digits[value >> 4];
+    buf[len.* + 1] = digits[value & 0x0F];
+    len.* += 2;
+    return true;
+}
+
+fn formatMidiPayload(buf: []u8) []u8 {
+    var note_count: usize = 0;
+    for (0..128) |note| {
+        if ((midi_pressed[note / 8] & (@as(u8, 1) << @intCast(note % 8))) != 0) note_count += 1;
+    }
+    var cc_count: usize = 0;
+    for (midi_cc_set) |set| {
+        if (set) cc_count += 1;
+    }
+
+    var len = (std.fmt.bufPrint(buf, "midi device=0 note_count={d} notes=", .{note_count}) catch return buf[0..0]).len;
+    for (midi_pressed) |byte| if (!appendMidiHexByte(buf, &len, byte)) return buf[0..len];
+    len += (std.fmt.bufPrint(buf[len..], " cc_count={d} cc=", .{cc_count}) catch return buf[0..len]).len;
+    for (midi_cc_set, 0..) |set, i| {
+        if (set) {
+            if (!appendMidiHexByte(buf, &len, midi_cc_values[i])) return buf[0..len];
+        } else {
+            if (buf.len -| len < 2) return buf[0..len];
+            buf[len] = '-';
+            buf[len + 1] = '-';
+            len += 2;
+        }
     }
     return buf[0..len];
 }
@@ -2362,6 +2468,27 @@ fn queue(ev: Event) void {
     inject_count += 1;
 }
 
+fn queueMidi(ev: MidiEvent) bool {
+    if (midi_count >= midi_buf.len) {
+        warnLine("midi FIFO 溢れ: drop");
+        return false;
+    }
+    midi_buf[midi_count] = ev;
+    midi_count += 1;
+    return true;
+}
+
+fn applyMidiState(ev: MidiEvent) void {
+    switch (ev) {
+        .note_on => |note| midi_pressed[note.note / 8] |= @as(u8, 1) << @intCast(note.note % 8),
+        .note_off => |note| midi_pressed[note.note / 8] &= ~(@as(u8, 1) << @intCast(note.note % 8)),
+        .cc => |cc| {
+            midi_cc_values[cc.controller] = cc.value;
+            midi_cc_set[cc.controller] = true;
+        },
+    }
+}
+
 /// 次の1コマンドを返す。区切りは `\n` または `;`（1引数で `'inject A; step 3; digest fb'` と書けるように）。
 fn nextLine() ?[]const u8 {
     if (cursor >= cmd_buf.len) return null;
@@ -2467,6 +2594,11 @@ fn resetForTest() void {
     frame_index = 0;
     inject_count = 0;
     inject_read = 0;
+    midi_count = 0;
+    midi_read = 0;
+    @memset(&midi_pressed, 0);
+    @memset(&midi_cc_values, 0);
+    @memset(&midi_cc_set, false);
     mouse_x = 0;
     mouse_y = 0;
     mouse_buttons = .{};
@@ -3576,7 +3708,7 @@ test "capabilities: 予約名で登録拒否" {
     try testing.expectEqual(@as(usize, 0), probe_count);
 }
 
-test "capabilities: custom probe/action 0件 → 組み込み6 probe + actions:[]" {
+test "capabilities: custom probe/action 0件 → 組み込み7 probe + actions:[]" {
     resetForTest();
     var buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
     _ = &buf; // 使わない（capabilities_buf を直接使う）
@@ -3587,11 +3719,11 @@ test "capabilities: custom probe/action 0件 → 組み込み6 probe + actions:[
     const root = parsed.value.object;
     try testing.expectEqual(@as(?std.json.Value, null), root.get("truncated"));
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 6), probes_arr.len);
-    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture", "gamepad" };
+    try testing.expectEqual(@as(usize, 7), probes_arr.len);
+    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture", "gamepad", "midi" };
     for (probes_arr, 0..) |entry, i| {
         try testing.expectEqualStrings(expected_names[i], entry.object.get("name").?.string);
-        try testing.expect(entry.object.get("snapshot").?.bool);
+        try testing.expect(if (i == 6) !entry.object.get("snapshot").?.bool else entry.object.get("snapshot").?.bool);
         try testing.expect(entry.object.get("digest").?.bool);
     }
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
@@ -3612,16 +3744,16 @@ test "capabilities: custom probe/action がフィールド値・登録順で現�
     defer parsed.deinit();
     const root = parsed.value.object;
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 8), probes_arr.len); // 組み込み6 + custom2
+    try testing.expectEqual(@as(usize, 9), probes_arr.len); // 組み込み7 + custom2
 
-    const p1 = probes_arr[6].object;
+    const p1 = probes_arr[7].object;
     try testing.expectEqualStrings("p1", p1.get("name").?.string);
     try testing.expectEqualStrings("png", p1.get("ext").?.string);
     try testing.expectEqualStrings("d1", p1.get("desc").?.string);
     try testing.expect(!p1.get("snapshot").?.bool);
     try testing.expect(p1.get("digest").?.bool);
 
-    const p2 = probes_arr[7].object;
+    const p2 = probes_arr[8].object;
     try testing.expectEqualStrings("p2", p2.get("name").?.string);
     try testing.expectEqualStrings("json", p2.get("ext").?.string);
     try testing.expectEqualStrings("", p2.get("desc").?.string);
@@ -3664,8 +3796,8 @@ test "capabilities: name の不正文字（\" / 制御文字）はエントリ�
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 7), probes_arr.len); // 組み込み6 + good1（bad は省略）
-    try testing.expectEqualStrings("good1", probes_arr[6].object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 8), probes_arr.len); // 組み込み7 + good1（bad は省略）
+    try testing.expectEqualStrings("good1", probes_arr[7].object.get("name").?.string);
 }
 
 test "capabilities: action 名の制御文字（NUL。isValidActionName は通過するが JSON では不正）はエントリ省略+truncated" {
@@ -3690,7 +3822,7 @@ test "capabilities: ext の不正文字（tab）もエントリを省略し trun
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
-    try testing.expectEqual(@as(usize, 6), root.get("probes").?.array.items.len); // 組み込み6のみ（p は省略）
+    try testing.expectEqual(@as(usize, 7), root.get("probes").?.array.items.len); // 組み込み7のみ（p は省略）
 }
 
 test "capabilities: MIN_CAPABILITIES_BUF_LEN ちょうどの buf でもフェイルセーフで valid JSON + truncated=true" {
@@ -3730,7 +3862,7 @@ test "capabilities: digestPayload 経由（digest capabilities）でも同じ JS
         .ok => |payload| {
             var parsed = try parseCapabilities(payload);
             defer parsed.deinit();
-            try testing.expectEqual(@as(usize, 6), parsed.value.object.get("probes").?.array.items.len);
+            try testing.expectEqual(@as(usize, 7), parsed.value.object.get("probes").?.array.items.len);
         },
         .unavailable => try testing.expect(false),
     }
@@ -3897,6 +4029,23 @@ test "capabilities: gamepad probe が組み込み一覧に含まれる" {
             found = true;
             try testing.expectEqualStrings("txt", entry.object.get("ext").?.string);
             try testing.expect(entry.object.get("snapshot").?.bool);
+            try testing.expect(entry.object.get("digest").?.bool);
+        }
+    }
+    try testing.expect(found);
+}
+
+test "capabilities: midi probe は digest 専用で組み込み一覧に含まれる" {
+    resetForTest();
+    var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+    defer parsed.deinit();
+    const probes_arr = parsed.value.object.get("probes").?.array.items;
+    var found = false;
+    for (probes_arr) |entry| {
+        if (std.mem.eql(u8, entry.object.get("name").?.string, "midi")) {
+            found = true;
+            try testing.expectEqualStrings("txt", entry.object.get("ext").?.string);
+            try testing.expect(!entry.object.get("snapshot").?.bool);
             try testing.expect(entry.object.get("digest").?.bool);
         }
     }
@@ -4088,6 +4237,128 @@ test "capabilities: 大量 args で buf 溢れても既存 truncated 機構で v
     // truncated か、収まったかのどちらでも JSON として valid であればよい
     _ = parsed.value.object.get("probes");
     _ = parsed.value.object.get("actions");
+}
+
+// ============================================================================
+// MIDI（TASK-115.1・ADR-010）tests
+// ============================================================================
+
+test "MIDI inject: note/cc/note-off の FIFO 順序と state 更新" {
+    resetForTest();
+    cmd_buf =
+        "inject midi note_on 60 100\n" ++
+        "inject midi cc 7 96\n" ++
+        "inject midi note_off 60 12\n" ++
+        "step 1\nquit";
+    try testing.expect(pollGate(true));
+
+    const first = nextMidiEvent().?;
+    try testing.expect(first == .note_on);
+    try testing.expectEqual(@as(MidiDeviceId, 0), first.note_on.device_id);
+    try testing.expectEqual(@as(u8, 60), first.note_on.note);
+    const second = nextMidiEvent().?;
+    try testing.expect(second == .cc);
+    try testing.expectEqual(@as(u8, 7), second.cc.controller);
+    const third = nextMidiEvent().?;
+    try testing.expect(third == .note_off);
+    try testing.expectEqual(@as(u8, 12), third.note_off.velocity);
+    try testing.expectEqual(@as(?MidiEvent, null), nextMidiEvent());
+
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const digest = switch (digestPayload("midi", &buf)) {
+        .ok => |payload| payload,
+        .unavailable => return error.UnexpectedResult,
+    };
+    try testing.expect(std.mem.startsWith(u8, digest, "midi device=0 note_count=0 notes="));
+    try testing.expect(std.mem.indexOf(u8, digest, "cc_count=1") != null);
+    const cc_pos = std.mem.indexOf(u8, digest, "cc=").? + 3;
+    try testing.expectEqualStrings("60", digest[cc_pos + 7 * 2 ..][0..2]);
+}
+
+test "MIDI inject: note_on velocity 0 は note_off に正規化される" {
+    resetForTest();
+    cmd_buf = "inject midi note_on 9 0\nstep 1";
+    try testing.expect(pollGate(true));
+    const ev = nextMidiEvent().?;
+    try testing.expect(ev == .note_off);
+    try testing.expectEqual(@as(u8, 9), ev.note_off.note);
+    try testing.expectEqual(@as(?MidiEvent, null), nextMidiEvent());
+
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const digest = switch (digestPayload("midi", &buf)) {
+        .ok => |payload| payload,
+        .unavailable => return error.UnexpectedResult,
+    };
+    try testing.expect(std.mem.indexOf(u8, digest, "note_count=0") != null);
+}
+
+test "MIDI inject: 範囲外・未知 event・引数不足は queue/state を変更しない" {
+    resetForTest();
+    cmd_buf =
+        "inject midi note_on 60 100\n" ++
+        "inject midi note_on 128 1\n" ++
+        "inject midi cc 8 128\n" ++
+        "inject midi bogus 1 2\n" ++
+        "inject midi note_off\n" ++
+        "step 1";
+    try testing.expect(pollGate(true));
+    const ev = nextMidiEvent().?;
+    try testing.expect(ev == .note_on);
+    try testing.expectEqual(@as(?MidiEvent, null), nextMidiEvent());
+
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const digest = switch (digestPayload("midi", &buf)) {
+        .ok => |payload| payload,
+        .unavailable => return error.UnexpectedResult,
+    };
+    try testing.expect(std.mem.indexOf(u8, digest, "note_count=1") != null);
+    try testing.expect(std.mem.indexOf(u8, digest, "cc_count=0") != null);
+}
+
+test "MIDI digest: 空状態は固定順序・固定長で 1024B 未満" {
+    resetForTest();
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const digest = switch (digestPayload("midi", &buf)) {
+        .ok => |payload| payload,
+        .unavailable => return error.UnexpectedResult,
+    };
+    try testing.expect(digest.len < DIGEST_BUF_LEN);
+    try testing.expect(std.mem.startsWith(u8, digest, "midi device=0 note_count=0 notes="));
+    try testing.expect(std.mem.indexOf(u8, digest, " cc_count=0 cc=") != null);
+    try testing.expectEqual(@as(usize, 256), digest[digest.len - 256 ..].len);
+
+    // 0/127 note と controller 0/127 を昇順 wire order で出す。
+    midi_pressed[0] |= 1;
+    midi_pressed[15] |= 0x80;
+    midi_cc_values[0] = 0;
+    midi_cc_values[127] = 127;
+    midi_cc_set[0] = true;
+    midi_cc_set[127] = true;
+    const ordered = switch (digestPayload("midi", &buf)) {
+        .ok => |payload| payload,
+        .unavailable => return error.UnexpectedResult,
+    };
+    const notes_pos = std.mem.indexOf(u8, ordered, "notes=").? + 6;
+    try testing.expectEqualStrings("01", ordered[notes_pos..][0..2]);
+    try testing.expectEqualStrings("80", ordered[notes_pos + 30 ..][0..2]);
+    const cc_pos = std.mem.indexOf(u8, ordered, "cc=").? + 3;
+    try testing.expectEqualStrings("00", ordered[cc_pos..][0..2]);
+    try testing.expectEqualStrings("7F", ordered[cc_pos + 127 * 2 ..][0..2]);
+}
+
+test "MIDI reset: state と FIFO が空になる" {
+    resetForTest();
+    cmd_buf = "inject midi note_on 1 1\ninject midi cc 2 3\nstep 1";
+    try testing.expect(pollGate(true));
+    resetForTest();
+    try testing.expectEqual(@as(?MidiEvent, null), nextMidiEvent());
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const digest = switch (digestPayload("midi", &buf)) {
+        .ok => |payload| payload,
+        .unavailable => return error.UnexpectedResult,
+    };
+    try testing.expect(std.mem.indexOf(u8, digest, "note_count=0") != null);
+    try testing.expect(std.mem.indexOf(u8, digest, "cc_count=0") != null);
 }
 
 // ============================================================================

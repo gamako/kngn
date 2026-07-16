@@ -449,6 +449,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_paint = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_27", .path = "examples/27_selectable_label/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_28", .path = "examples/28_text_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_29", .path = "examples/29_midi_monitor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_30", .path = "examples/30_sound_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
         }) |example| {
             const needs: ExampleNeeds = .{
@@ -462,6 +463,7 @@ pub fn build(b: *std.Build) void {
                 .needs_paint = if (@hasField(@TypeOf(example), "needs_paint")) example.needs_paint else false,
                 .needs_audio = example.needs_audio,
                 .needs_gamepad = example.needs_gamepad,
+                .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
             };
@@ -720,6 +722,27 @@ pub fn build(b: *std.Build) void {
     });
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
+
+    // MIDI facade/null backend 単体テスト（OS 非依存。TASK-115.1・ADR-010）。
+    const midi_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/midi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    midi_test_mod.addImport("platform_types", shared_modules.types.mod);
+    midi_test_mod.addImport("harness", shared_modules.harness.mod);
+    const midi_test = b.addTest(.{ .root_module = midi_test_mod });
+    const midi_null_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/midi_null.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    midi_null_test_mod.addImport("platform_types", shared_modules.types.mod);
+    const midi_null_test = b.addTest(.{ .root_module = midi_null_test_mod });
+    const test_midi_step = b.step("test-midi", "Run MIDI facade/null backend unit tests (TASK-115.1)");
+    test_midi_step.dependOn(&b.addRunArtifact(midi_test).step);
+    test_midi_step.dependOn(&b.addRunArtifact(midi_null_test).step);
 
     // wasm platform の DOM→MouseButton / KeyCode 写像（native でも実行。extern env はテスト経路から未参照）。
     const platform_wasm_test_mod = b.createModule(.{
@@ -1693,6 +1716,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_macro_step);
     test_step.dependOn(test_dsp_step);
     test_step.dependOn(test_gamepad_step);
+    test_step.dependOn(test_midi_step);
     test_step.dependOn(test_spec_step);
     test_step.dependOn(test_scope_step);
     test_step.dependOn(test_platform_input_step);
@@ -1957,6 +1981,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.dsp);
     link(kit, common.synth);
     link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
+    link(kit, common.midi); // kit.midi（TASK-115.1）
     link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
     link(kit, common.gmath); // kit.gmath（TASK-111.1）
     link(kit, common.appshell); // kit.appshell（TASK-114.1）
@@ -2046,6 +2071,7 @@ const SharedModules = struct {
     objc_runtime: TaggedModule, // Objective-C ランタイム FFI（TASK-49.2。camera/audio 両方が link する共有 module。TASK-49.6 で named module 化）
     gamepad: TaggedModule, // src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する headless lib。kit 収録）
     sound: TaggedModule, // libs/sound（WAV デコード + SE/BGM ミキサー。TASK-111.6。dsp + synth。kit 収録）
+    midi: TaggedModule, // core/midi.zig（MIDI facade。TASK-115.1）
 
     /// `wasm_shared`: TASK-73.2 AudioWorklet 用。atomics を有効にするため single_threaded=false。
     fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool) SharedModules {
@@ -2210,6 +2236,14 @@ const SharedModules = struct {
         link(platform_mod, harness);
         // audio facade（core/audio.zig）が `@import("harness")` で onAudioSamples を呼ぶ。
         link(audio, harness);
+
+        // MIDI facade（L1）。115.1 は全 OS で midi_null を選び、harness 時だけ synthetic FIFO を読む。
+        // platform_types と harness は named module の同一インスタンスを共有する。
+        const midi: TaggedModule = .{ .layer = .core, .name = "midi", .mod = b.createModule(.{
+            .root_source_file = b.path("core/midi.zig"),
+        }) };
+        link(midi, types);
+        link(midi, harness);
         // macOS: audio_macos.zig の capture(マイク) 拡張が objc_runtime 経由で権限確認を叩く。
         // wasm では audio_web が objc を触らないが、import 配線は無害（未参照なら解析されない）。
         if (!is_wasm) link(audio, objc_runtime);
@@ -2336,6 +2370,7 @@ const SharedModules = struct {
             .objc_runtime = objc_runtime,
             .gamepad = gamepad,
             .sound = sound,
+            .midi = midi,
         };
     }
 };
@@ -2351,6 +2386,7 @@ const ExampleNeeds = struct {
     needs_paint: bool = false,
     needs_audio: bool,
     needs_gamepad: bool, // TASK-80.1（examples/22_gamepad のみ true）
+    needs_midi: bool, // TASK-115.1（examples/29_midi_monitor のみ true）
     needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
     needs_sound: bool, // TASK-111.6（examples/30_sound_demo のみ true）
 };
@@ -2406,6 +2442,7 @@ fn addExampleExe(
     // gamepad は platform_types のみに依存する backend 非依存 lib（TASK-80.1）。common（SharedModules）から
     // 直接 addImport する（kit を使わない examples の既存慣習に揃える）。
     if (needs.needs_gamepad) exe.root_module.addImport("gamepad", common.gamepad.mod);
+    if (needs.needs_midi) exe.root_module.addImport("midi", common.midi.mod);
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
     if (std.mem.startsWith(u8, name, "example_26")) {
