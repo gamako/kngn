@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     });
     text.addImport("font", font);
     const fps_counter = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fps_counter.zig" },
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
     });
 
     platform.buildStandalone(b, target, optimize, .{
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },
+        .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
         // harness(platform→harness→png) と font で png module を共有する（二重化回避。TASK-32.2）。
         .png_module = png,
         .extra = &.{

@@ -2,8 +2,8 @@
 //!
 //! `platform_types.GamepadButton`/`GamepadButtons`/`Stick` に対するヘルパー関数（ボタン名取得・
 //! rising-edge 判定・deadzone 適用）。型自体は `platform_types.zig` で定義されており、ここではそれを
-//! 再 export する。`keyboard.zig` と同じ「src/ レガシー配置」だが、AC#6 により `kit/kit.zig` でも
-//! 再エクスポートする（keyboard.zig は examples 専用で kit 非収録）。
+//! 再 export する。`keyboard.zig` と同じ「ヘルパー」だが、AC#6 により `kit/kit.zig` でも
+//! 再エクスポートする（keyboard は TASK-111.2 で libs/gfx へ移設し kit.gfx 経由でも公開）。
 //!
 //! `platform_types` のみに依存する（`platform` facade は import しない）ため、display/backend 不要で
 //! headless に単体テストできる。

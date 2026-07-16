@@ -8,12 +8,13 @@
 //! - control:  core/control/harness.zig（制御＋観測プレーン: probe / replay / live / 仮想クロック）
 //! - types:    core/platform_types.zig（KeyCode / Event 等の type-only 共有型）
 //! - audio:    core/audio.zig facade（L1 オーディオ出力）
-//! - gui / png / font / dsp / synth / sound / gmath / appshell: 安定 libs
+//! - gui / png / font / dsp / synth / sound / gmath / gfx / appshell: 安定 libs
 //! - gamepad: src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する
-//!   headless lib として layer=.lib で扱う。keyboard.zig 等の他 src/ ヘルパーは examples 専用で
-//!   kit 非収録だが、gamepad は将来 apps からの直接利用も想定するため kit に載せる）
+//!   headless lib として layer=.lib で扱う。keyboard 等の gfx ヘルパーは TASK-111.2 で libs/gfx へ
+//!   移設し kit.gfx 経由でも公開する）
 //! - recipe: libs/recipe（CommandRecord 列の save/replay。TASK-62.5.8。std + serde のみ）
 //! - sound: libs/sound（WAV デコード + SE/BGM ミキサー。TASK-111.6。dsp + synth）
+//! - gfx: libs/gfx（sprite / fixed_timestep / fps_counter / keyboard。TASK-111.2）
 //!
 //! **流動中の lib（modular / paint / viz 等）は載せない**。apps はそれらを「内部・壊れうる」
 //! 前提の直 import で使い、API が固まったら kit へ昇格する（成熟ゲート）。
@@ -35,6 +36,7 @@ pub const gamepad = @import("gamepad");
 pub const midi = @import("midi");
 pub const recipe = @import("recipe");
 pub const gmath = @import("gmath");
+pub const gfx = @import("gfx");
 pub const appshell = @import("appshell");
 pub const app_runtime = @import("app_runtime");
 pub const sound = @import("sound");

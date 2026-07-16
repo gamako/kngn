@@ -180,7 +180,7 @@ pub fn blitRGBA(
         const dst_base = py * target.width + @as(u32, @intCast(dst_x + @as(i32, @intCast(cc.cx0))));
         var cx = cc.cx0;
         // SIMD-4 パス。cc.cx1 <= w かつ target 境界内であることが clipCoverage の
-        // 保証なので、4px チャンクが行をまたぐことはない（sprite.zig drawSprite と同じ不変条件）。
+        // 保証なので、4px チャンクが行をまたぐことはない（libs/gfx sprite.drawSprite と同じ不変条件）。
         while (cx + 4 <= cc.cx1) : (cx += 4) {
             const src_chunk: *const [4]u32 = src[src_base + cx ..][0..4];
             const dst_chunk: *[4]u32 = target.pixels[dst_base + (cx - cc.cx0) ..][0..4];

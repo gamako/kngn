@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/src/keyboard.zig" },
+        .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
         // harness(platform→harness→png) と font で png module を共有する（二重化回避）。
         .png_module = png,
         .extra = &.{

@@ -333,7 +333,8 @@ pub const StandaloneSpec = struct {
     platform_include: std.Build.LazyPath,
     /// setup 用の platform root（macOS backend の .o コンパイル/フレームワーク用。`b.path(PROJECT_ROOT ++ "/platform")`）。
     platform_root: std.Build.LazyPath,
-    /// src/keyboard.zig（不要なら null）。platform に依存するため backend ごとに作る。
+    /// libs/gfx/src/keyboard.zig（不要なら null）。platform_types（KeyCode）のみに依存するため
+    /// backend ごとに作るが platform facade は不要（TASK-111.2）。
     keyboard_source: ?std.Build.LazyPath = null,
     /// src/gamepad.zig（不要なら null。TASK-80.1）。keyboard_source と対称だが platform_types のみに
     /// 依存する（platform facade は不要）。
@@ -375,6 +376,8 @@ pub const KitLibs = struct {
     dsp: *std.Build.Module,
     synth: *std.Build.Module,
     gmath: *std.Build.Module,
+    /// kit.gfx（TASK-111.2）。sprite / fixed_timestep / fps_counter / keyboard。
+    gfx: *std.Build.Module,
     /// kit.sound（TASK-111.6）。WAV デコード + SE/BGM ミキサー。dsp + synth に依存。
     sound: *std.Build.Module,
     /// kit.recipe（TASK-62.5.8）は serde に依存する。caller が paint 等でも serde module を
@@ -573,6 +576,7 @@ pub fn buildStandalone(
             kit_mod.addImport("dsp", kl.dsp);
             kit_mod.addImport("synth", kl.synth);
             kit_mod.addImport("gmath", kl.gmath);
+            kit_mod.addImport("gfx", kl.gfx);
             kit_mod.addImport("sound", kl.sound);
             // gamepad（TASK-80.1）: kit.zig が無条件 import するため、caller の KitLibs には含めず
             // ここで自前に1つ作って types_mod だけを配線する（platform_types のみに依存する headless
@@ -625,7 +629,7 @@ pub fn buildStandalone(
         if (spec.kit_libs) |kl| if (kl.paint) |paint| root.addImport("paint", paint);
         if (spec.keyboard_source) |ks| {
             const kb = b.createModule(.{ .root_source_file = ks });
-            kb.addImport("platform", platform_mod);
+            kb.addImport("platform_types", types_mod);
             root.addImport("keyboard", kb);
         }
         if (spec.gamepad_source) |gs| {

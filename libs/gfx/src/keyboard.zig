@@ -1,12 +1,13 @@
 //! Keyboard utility module
 //!
-//! `platform.KeyCode` enum に対するヘルパー関数（キー名取得・分類・文字変換）。
-//! KeyCode 型自体は `platform.zig` で定義されており、ここではそれを再 export する。
+//! `platform_types.KeyCode` enum に対するヘルパー関数（キー名取得・分類・文字変換）。
+//! KeyCode 型自体は `core/platform_types.zig` が単一ソース。libs/gfx は type-only core のみ参照する
+//! （ADR-007: libs → type-only core。platform facade 実装には依存しない）。
 
 const std = @import("std");
-const platform = @import("platform");
+const platform_types = @import("platform_types");
 
-pub const KeyCode = platform.KeyCode;
+pub const KeyCode = platform_types.KeyCode;
 
 /// キーコードを人間が読める文字列に変換します。
 /// 文字キー（A-Z）と数字キー（0-9）は実際の文字を返します。

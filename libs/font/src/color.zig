@@ -2,7 +2,7 @@ const std = @import("std");
 const pixelops = @import("pixelops");
 
 /// u32 = 0xAARRGGBB（little-endian、メモリ上[B,G,R,A]順）
-/// sprite.zig の blendPixel と同レイアウト。
+/// libs/gfx sprite の blend と同レイアウト。
 /// alpha 規約: straight alpha（非 premultiplied）。
 pub const Color = packed struct(u32) {
     b: u8,

@@ -1,5 +1,7 @@
 # 実装計画 - Example 03: Sprite Rendering
 
+> **配置更新（TASK-111.2）**: `src/sprite.zig` / `src/keyboard.zig` は `libs/gfx/src/` へ移設済み。本資料の `src/` パス記述は歴史的記録。
+
 ## 概要
 
 **目的**: スプライトシステムの確立とPNG画像表示のデモンストレーション

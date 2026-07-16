@@ -25,20 +25,23 @@ video-proto-main/
 │   ├── audio.zig / audio_*.zig # オーディオ出力 facade + OS 別 backend（macOS/Linux/Windows/null）
 │   └── control/       # 制御＋観測プレーン（ADR-007 R3）
 │       └── harness.zig # ヘッドレス検証 harness（入力注入 + フレーム捕捉 + 仮想クロック）
-├── src/               # 未移設の Zig コード（R8 日和見: 次に触るタスクで libs/gfx・libs/audio へ移す）
+├── src/               # 未移設の Zig コード（R8 日和見: 次に触るタスクで libs へ移す）
 │   ├── main.zig       # メインプログラム（HSV 虹色グラデーション）
 │   ├── dsp/           # DSP ヘルパー（Oscillator / Envelope / Filter / Mixer）→ 将来 libs/audio
-│   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群 → 将来 libs/gfx
+│   ├── gamepad.zig    # ゲームパッド入力ヘルパー（kit 収録。TASK-80.1）
+│   └── text.zig       # BDF テキスト（→ 将来 libs/gfx 隣接）
 ├── kit/               # 公開 umbrella モジュール（ADR-007 R4）。apps と外部消費者はこれのみ import
-│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth / gamepad / recipe / gmath / appshell / sound / midi 等を再エクスポート
-├── examples/          # サンプル 01〜19（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
+│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth / gamepad / recipe / gmath / gfx / appshell / sound / midi 等を再エクスポート
+├── examples/          # サンプル 01〜31（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
 │   ├── 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering
 │   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone / 18_cursor / 19_color_emoji
 │   ├── 08〜11,13,14,16,17_gui_*  # GUI（primitives/interaction/layout/widgets/slider/color_picker/scroll/toggles）
+│   ├── 31_sprite_ex   # drawSpriteEx デモ（kit.gfx。TASK-111.2）
 │   └── image/         # 共有アセット（実行 example ではない）
 ├── libs/              # L2–L3 移植可能な再利用ライブラリ（原則 platform 非依存・headless で単体テスト可）
 │   ├── png/           # PNG codec（decode/encode）
 │   ├── pixelops/      # ピクセルブレンド共有プリミティブ（premul/straight blend + div255 + clip-hoist）
+│   ├── gfx/           # スプライト描画 + Phase2 ヘルパー（sprite/fixed_timestep/fps_counter/keyboard。TASK-111.2。kit 収録）
 │   ├── serde/         # versioned container 直列化基盤（RIFF/IFF 系統 + version/CRC。TASK-62.2。std のみ・kit 非収録）
 │   ├── recipe/        # CommandRecord 列の save/replay（TASK-62.5.8。std + serde。kit 収録）
 │   ├── gui/           # 即時モード GUI（入力 / ID stack / Flex レイアウト / 描画 / ウィジェット）
@@ -144,9 +147,9 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
   frame pacing の support tier は下記「プラットフォーム層の種類」と `docs/adr/005`。
 - ✅ **サンプル**: `examples/01`〜`18`（基礎描画 / 入力 / スプライト / 固定ステップ / テキスト /
   ベンチ / マウス / GUI 各種 / アウトラインフォント / オーディオ / カーソル形状）。`examples/image/` は共有アセット（run step なし）。
-- ✅ **ヘルパー**: sprite / fixed_timestep / fps_counter / text（`src/`。Phase 2 由来）。
+- ✅ **ヘルパー**: sprite / fixed_timestep / fps_counter / keyboard（`libs/gfx`。TASK-111.2）/ text（`src/`）。
 - ✅ **ライブラリ**: `libs/png`（PNG codec）・`libs/gui`（即時モード GUI）・`libs/font`・`libs/synth`・
-  `libs/pixelops`（ブレンド共有プリミティブ）・`libs/modular`（グラフエンジン）・`libs/paint`（エディタ共有コア）・
+  `libs/pixelops`（ブレンド共有プリミティブ）・`libs/gfx`（スプライト拡張）・`libs/modular`（グラフエンジン）・`libs/paint`（エディタ共有コア）・
   `libs/viz`（可視化: spectrogram / scope）。
 - ✅ **アプリ**: `apps/editor/apps/pixie`（ドット絵エディタ: レイヤー / 範囲選択 / ベジェ / Undo / PNG）・
   `apps/synth`（PC キーボード演奏）・`apps/patch`（lofi 生成 + パッチキャンバス統合）。
@@ -908,7 +911,7 @@ script 自体がレシピの代替ではない。
 の場合はファイル or 関数の doc comment に明記**する（例: `/// 毎フレーム全画素を走る`）。
 実装計画（backlog の plan 欄）にも同じ宣言を含める。頻度の判定を誤ると以下の規約の要否を誤る。
 
-### 全画素ループの3点セット（`libs/pixelops` が正準実装・`src/sprite.zig` が消費例）
+### 全画素ループの3点セット（`libs/pixelops` が正準実装・`libs/gfx/src/sprite.zig` が消費例）
 
 フレーム毎に全画素（またはそれに準ずる面積）を走るループは:
 
@@ -1013,7 +1016,7 @@ zig build run-example_23        # 23_fullscreen（Window.createFullscreen デモ
 #       11_gui_widgets / 12_outline_font / 13_gui_slider / 14_gui_color_picker / 15_audio_tone /
 #       16_gui_scroll / 17_gui_toggles / 18_cursor / 19_color_emoji / 20_capture_demo / 21_char_input /
 #       22_gamepad / 23_fullscreen / 24_desktop_mascot / 25_collision_demo / 26_appshell_demo /
-#       27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo  （image/ は共有アセットで run step なし）
+#       27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo / 31_sprite_ex  （image/ は共有アセットで run step なし）
 ```
 
 ---

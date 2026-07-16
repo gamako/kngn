@@ -451,6 +451,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_28", .path = "examples/28_text_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_29", .path = "examples/29_midi_monitor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_30", .path = "examples/30_sound_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
+            .{ .name = "example_31", .path = "examples/31_sprite_ex/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -466,6 +467,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
@@ -1408,7 +1410,7 @@ pub fn build(b: *std.Build) void {
     test_text_step.dependOn(&run_text_test.step);
 
     // ========================================
-    // sprite.zig テスト (blend4Pixels / drawSprite)
+    // libs/gfx/src/sprite.zig テスト (blend / drawSprite / drawSpriteEx)
     // ========================================
     const sprite_test_png = b.createModule(.{
         .root_source_file = b.path("libs/png/src/lib.zig"),
@@ -1416,7 +1418,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const sprite_test_module = b.createModule(.{
-        .root_source_file = b.path("src/sprite.zig"),
+        .root_source_file = b.path("libs/gfx/src/sprite.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1428,6 +1430,45 @@ pub fn build(b: *std.Build) void {
     const run_sprite_test = b.addRunArtifact(sprite_test);
     const test_sprite_step = b.step("test-sprite", "Run sprite blending and drawing tests");
     test_sprite_step.dependOn(&run_sprite_test.step);
+
+    // ========================================
+    // libs/gfx テスト（umbrella + 移設 helper。TASK-111.2）
+    // ========================================
+    const gfx_test_keyboard = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gfx_test_keyboard.addImport("platform_types", shared_modules.types.mod);
+    const gfx_test_ft = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/fixed_timestep.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gfx_test_fps = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/fps_counter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gfx_test_root = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/gfx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gfx_test_root.addImport("sprite", sprite_test_module);
+    gfx_test_root.addImport("fixed_timestep", gfx_test_ft);
+    gfx_test_root.addImport("fps_counter", gfx_test_fps);
+    gfx_test_root.addImport("keyboard", gfx_test_keyboard);
+    const gfx_test = b.addTest(.{ .root_module = gfx_test_root });
+    const run_gfx_test = b.addRunArtifact(gfx_test);
+    const run_gfx_ft_test = b.addRunArtifact(b.addTest(.{ .root_module = gfx_test_ft }));
+    const run_gfx_fps_test = b.addRunArtifact(b.addTest(.{ .root_module = gfx_test_fps }));
+    const run_gfx_kb_test = b.addRunArtifact(b.addTest(.{ .root_module = gfx_test_keyboard }));
+    const test_gfx_step = b.step("test-gfx", "Run libs/gfx umbrella and helper unit tests");
+    test_gfx_step.dependOn(&run_gfx_test.step);
+    test_gfx_step.dependOn(&run_gfx_ft_test.step);
+    test_gfx_step.dependOn(&run_gfx_fps_test.step);
+    test_gfx_step.dependOn(&run_gfx_kb_test.step);
 
     // ========================================
     // libs/gui テスト (geom / color / draw / font + input / id / state / context)
@@ -1707,6 +1748,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_png_format_step);
     test_step.dependOn(test_text_step);
     test_step.dependOn(test_sprite_step);
+    test_step.dependOn(test_gfx_step);
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_synth_step);
@@ -1783,6 +1825,25 @@ pub fn build(b: *std.Build) void {
     const bench_canvas_exe = b.addExecutable(.{ .name = "bench_canvas", .root_module = bench_canvas_root });
     const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
     bench_canvas_step.dependOn(&b.addRunArtifact(bench_canvas_exe).step);
+
+    // bench-sprite（TASK-111.2）: drawSprite / drawSpriteEx の plain/flip/2x/tint を計測。
+    // display/audio 非依存。前後比較は ReleaseFast 固定で notes に記録する。
+    const bench_sprite_mod = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/sprite.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_sprite_mod.addImport("png", bench_png_mod);
+    bench_sprite_mod.addImport("pixelops", bench_pixelops_mod);
+    const bench_sprite_root = b.createModule(.{
+        .root_source_file = b.path("bench/sprite.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_sprite_root.addImport("sprite", bench_sprite_mod);
+    const bench_sprite_exe = b.addExecutable(.{ .name = "bench_sprite", .root_module = bench_sprite_root });
+    const bench_sprite_step = b.step("bench-sprite", "Run sprite drawSprite/drawSpriteEx micro-benchmark (ReleaseFast)");
+    bench_sprite_step.dependOn(&b.addRunArtifact(bench_sprite_exe).step);
 
     // bench-yuyv（TASK-49.3）: V4L2 YUYV→BGRA の純粋な色変換を計測する。
     // camera backend は libc の ioctl/mmap を使うが、ベンチは純関数だけを呼ぶためデバイス不要。
@@ -1958,12 +2019,12 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.harness.mod,
         true,
     ) };
-    // keyboard は KeyCode 型定義を platform から借りる（opt-in 無効側で十分。examples の keyboard 入力は
-    // gamepad の有無に依存しない）。
+    // keyboard は KeyCode 型定義を platform_types から借りる（opt-in 無効側の types で十分。
+    // TASK-111.2: platform facade ではなく type-only core のみ依存）。
     const keyboard_mod = b.createModule(.{
-        .root_source_file = b.path("src/keyboard.zig"),
+        .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
     });
-    keyboard_mod.addImport("platform", platform_mod.mod);
+    keyboard_mod.addImport("platform_types", common.types.mod);
 
     // kit umbrella（backend 毎。ADR-007 R4）。kit/kit.zig の pub import と 1:1 で揃えること。
     // pixie/synth/modular/patch はゲームパッド opt-in しないため opt-in 無効側の platform を配線する。
@@ -1984,6 +2045,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.midi); // kit.midi（TASK-115.1）
     link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
     link(kit, common.gmath); // kit.gmath（TASK-111.1）
+    link(kit, common.gfx); // kit.gfx（TASK-111.2）
     link(kit, common.appshell); // kit.appshell（TASK-114.1）
     link(kit, common.sound); // kit.sound（TASK-111.6）
 
@@ -2059,6 +2121,7 @@ const SharedModules = struct {
     types: TaggedModule,
     pixelops: TaggedModule,
     gmath: TaggedModule,
+    gfx: TaggedModule, // libs/gfx（sprite/fixed_timestep/fps_counter/keyboard。TASK-111.2。kit 収録）
     serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
     appshell: TaggedModule, // libs/appshell（設定 / window / recent files。TASK-114.1）
     recipe: TaggedModule, // libs/recipe（CommandRecord 列 save/replay。TASK-62.5.8。std + serde。kit 収録）
@@ -2090,13 +2153,6 @@ const SharedModules = struct {
             opts.addOption(bool, "enable_gamepad", false);
             platform_mod.mod.addOptions("build_options", opts);
         }
-
-        // keyboard は KeyCode 型定義を platform から借りる（src/ レガシー。examples 専用のため
-        // 層管理外の素配線。apps へは配線しない）。
-        const keyboard_mod = b.createModule(.{
-            .root_source_file = b.path("src/keyboard.zig"),
-        });
-        keyboard_mod.addImport("platform", platform_mod.mod);
 
         // TASK-29.1: 外部公開 module。dep.module("png")。
         const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = b.addModule("png", .{
@@ -2143,6 +2199,13 @@ const SharedModules = struct {
         }) };
         link(platform_mod, types);
 
+        // keyboard は KeyCode を platform_types から借りる（TASK-111.2: libs/gfx。type-only core のみ）。
+        // examples 専用の named module 名 `keyboard` は維持（consumer の import 文不変）。
+        const keyboard_mod = b.createModule(.{
+            .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
+        });
+        keyboard_mod.addImport("platform_types", types.mod);
+
         // メニュー/command の共有型。platform_types と同じく type-only で、libs/gui と
         // platform facade が同一インスタンスを参照する。adapter は core 実行契約なので
         // 別の通常 core module として facade にだけ配線する。
@@ -2155,17 +2218,33 @@ const SharedModules = struct {
         // src/gamepad.zig: ゲームパッド入力ヘルパー（TASK-80.1。ADR-009）。platform_types のみに
         // 依存する headless lib（layer=.lib）。ADR-007 R2「libs が type-only core module を直接
         // 参照してよい唯一の形」の初適用（`link()` の `.lib => dep.layer==.core and dep.type_only` 分岐）。
-        // keyboard 等の他 src/ ヘルパーと異なり kit にも収録するため TaggedModule 化する。
+        // keyboard は TASK-111.2 で libs/gfx へ移設し kit.gfx 経由でも公開する。
         const gamepad: TaggedModule = .{ .layer = .lib, .name = "gamepad", .mod = b.createModule(.{
             .root_source_file = b.path("src/gamepad.zig"),
         }) };
         link(gamepad, types);
 
         const sprite = b.createModule(.{
-            .root_source_file = b.path("src/sprite.zig"),
+            .root_source_file = b.path("libs/gfx/src/sprite.zig"),
         });
         sprite.addImport("png", png.mod);
         sprite.addImport("pixelops", pixelops.mod);
+
+        const fixed_timestep_mod = b.createModule(.{
+            .root_source_file = b.path("libs/gfx/src/fixed_timestep.zig"),
+        });
+        const fps_counter_mod = b.createModule(.{
+            .root_source_file = b.path("libs/gfx/src/fps_counter.zig"),
+        });
+
+        // libs/gfx umbrella（TASK-111.2）。named module の sprite/helpers を再エクスポート。kit 収録。
+        const gfx: TaggedModule = .{ .layer = .lib, .name = "gfx", .mod = b.createModule(.{
+            .root_source_file = b.path("libs/gfx/src/gfx.zig"),
+        }) };
+        gfx.mod.addImport("sprite", sprite);
+        gfx.mod.addImport("fixed_timestep", fixed_timestep_mod);
+        gfx.mod.addImport("fps_counter", fps_counter_mod);
+        gfx.mod.addImport("keyboard", keyboard_mod);
 
         // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
         // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png に依存。
@@ -2339,12 +2418,8 @@ const SharedModules = struct {
             .platform = platform_mod,
             .keyboard = keyboard_mod,
             .sprite = sprite,
-            .fixed_timestep = b.createModule(.{
-                .root_source_file = b.path("src/fixed_timestep.zig"),
-            }),
-            .fps_counter = b.createModule(.{
-                .root_source_file = b.path("src/fps_counter.zig"),
-            }),
+            .fixed_timestep = fixed_timestep_mod,
+            .fps_counter = fps_counter_mod,
             .text = text_mod,
             .png = png,
             .font = font,
@@ -2358,6 +2433,7 @@ const SharedModules = struct {
             .types = types,
             .pixelops = pixelops,
             .gmath = gmath,
+            .gfx = gfx,
             .serde = serde,
             .appshell = appshell,
             .recipe = recipe,
@@ -2389,6 +2465,7 @@ const ExampleNeeds = struct {
     needs_midi: bool, // TASK-115.1（examples/29_midi_monitor のみ true）
     needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
     needs_sound: bool, // TASK-111.6（examples/30_sound_demo のみ true）
+    needs_kit: bool = false, // TASK-111.2（example_31）/ example_26
 };
 
 // ============================================================
@@ -2445,8 +2522,10 @@ fn addExampleExe(
     if (needs.needs_midi) exe.root_module.addImport("midi", common.midi.mod);
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
-    if (std.mem.startsWith(u8, name, "example_26")) {
+    if (needs.needs_kit) {
         exe.root_module.addImport("kit", pm.kit.mod);
+    }
+    if (std.mem.startsWith(u8, name, "example_26")) {
         exe.root_module.addImport("appshell", common.appshell.mod);
     }
 

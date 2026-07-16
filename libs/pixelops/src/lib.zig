@@ -1,6 +1,6 @@
 //! libs/pixelops: ピクセルブレンドの共有プリミティブ（TASK-51）。
 //!
-//! 3 箇所に分散していたブレンド実装（src/sprite.zig の premultiplied SIMD /
+//! 3 箇所に分散していたブレンド実装（旧 src/sprite.zig＝現 libs/gfx/src/sprite.zig の premultiplied SIMD /
 //! apps/editor/core/blend.zig の straight scalar / libs/font/src/color.zig の
 //! opaque-dst scalar）をここへ統合した。「速い実装がデフォルトの実装」の置き場。
 //!
@@ -56,7 +56,7 @@ pub inline fn div255RoundVec16(x: Vec16u16) Vec16u16 {
 }
 
 // ============================================================
-// premultiplied 系（旧 src/sprite.zig blendPixel / blend4Pixels）
+// premultiplied 系（旧 src/sprite.zig / 現 libs/gfx/src/sprite.zig blendPixel / blend4Pixels）
 // ============================================================
 
 /// u32 ピクセル → Vec4u16（メモリ順 [B,G,R,A]）。

@@ -9,10 +9,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const fixed_timestep = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fixed_timestep.zig" },
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fixed_timestep.zig" },
     });
     const fps_counter = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/fps_counter.zig" },
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
     });
 
     platform.buildStandalone(b, target, optimize, .{

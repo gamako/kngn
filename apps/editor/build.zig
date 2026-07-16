@@ -78,6 +78,30 @@ pub fn build(b: *std.Build) void {
     sound.addImport("dsp", dsp);
     sound.addImport("synth", synth);
 
+    // kit.gfx（TASK-111.2）: pixie は未使用だが kit.zig が無条件 import するため配線が必要。
+    const gfx_keyboard = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
+    });
+    gfx_keyboard.addImport("platform_types", platform_types);
+    const gfx_sprite = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/sprite.zig" },
+    });
+    gfx_sprite.addImport("png", png);
+    gfx_sprite.addImport("pixelops", pixelops);
+    const gfx_ft = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fixed_timestep.zig" },
+    });
+    const gfx_fps = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
+    });
+    const gfx = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" },
+    });
+    gfx.addImport("sprite", gfx_sprite);
+    gfx.addImport("fixed_timestep", gfx_ft);
+    gfx.addImport("fps_counter", gfx_fps);
+    gfx.addImport("keyboard", gfx_keyboard);
+
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",
         .main_source = b.path("apps/pixie/main.zig"),
@@ -97,6 +121,7 @@ pub fn build(b: *std.Build) void {
             .dsp = dsp,
             .synth = synth,
             .gmath = gmath,
+            .gfx = gfx,
             .sound = sound,
             .serde = serde,
         },
