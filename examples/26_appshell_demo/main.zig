@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const kit = @import("kit");
-const gui = @import("gui");
+const gui = kit.gui;
 const paint = @import("paint");
 
 const platform = kit.platform;

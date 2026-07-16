@@ -611,6 +611,15 @@ pub fn buildStandalone(
             });
             kit_app_runtime_mod.addImport("platform", platform_mod);
             kit_mod.addImport("app_runtime", kit_app_runtime_mod);
+            // midi（TASK-115.1）: kit.zig が無条件 import する。core/midi.zig は platform_types と
+            // harness（synthetic FIFO）に依存し、harness が backend 毎のため midi も backend 毎に
+            // ここで自前生成する（gamepad/app_runtime と同じ理由で KitLibs には含めない）。
+            const kit_midi_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/midi.zig", .{core_dir}) },
+            });
+            kit_midi_mod.addImport("platform_types", types_mod);
+            kit_midi_mod.addImport("harness", harness_mod);
+            kit_mod.addImport("midi", kit_midi_mod);
             root.addImport("kit", kit_mod);
         }
         if (spec.kit_libs) |kl| if (kl.paint) |paint| root.addImport("paint", paint);
