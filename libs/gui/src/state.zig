@@ -1,4 +1,4 @@
-// interaction state（hot / active / focused）。
+// interaction state（hot / active / focused）と widget ごとの永続状態。
 //
 // hot_id は 1 フレーム遅延の安定 hover ID（描画フィードバック用）。当フレーム計算中の
 // hover は next_hot_id に積み、beginFrame で hot_id に昇格させる。これによりネスト
@@ -6,8 +6,35 @@
 // 描画時は state.hot_id == id を見る（buttonBehavior の result.hovered は当フレーム生値）。
 
 const id_mod = @import("id.zig");
+const text_edit = @import("text_edit.zig");
 
 pub const Id = id_mod.Id;
+
+/// SelectableLabel など、ID に紐づく widget のフレーム間状態。
+pub const PerIdState = struct {
+    selection: text_edit.SelectionState = .{},
+    last_click_time: f64 = -1.0,
+    last_click_pos: struct { x: i32 = 0, y: i32 = 0 } = .{},
+};
+
+/// ID ごとの状態を必要な ID だけ遅延確保する state store。
+pub const PerIdStateStore = struct {
+    map: std.AutoHashMapUnmanaged(Id, PerIdState) = .empty,
+
+    pub fn deinit(self: *PerIdStateStore, gpa: std.mem.Allocator) void {
+        self.map.deinit(gpa);
+    }
+
+    pub fn getOrPut(self: *PerIdStateStore, gpa: std.mem.Allocator, id: Id) *PerIdState {
+        const gop = self.map.getOrPut(gpa, id) catch @panic("PerIdStateStore: OOM");
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        return gop.value_ptr;
+    }
+
+    pub fn get(self: *const PerIdStateStore, id: Id) ?*const PerIdState {
+        return self.map.getPtr(id);
+    }
+};
 
 pub const InteractionState = struct {
     hot_id: Id = 0, // 前フレーム確定の hover ID（描画用・安定）

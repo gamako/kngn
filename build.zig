@@ -447,6 +447,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
             .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = true },
             .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_27", .path = "examples/27_selectable_label/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,

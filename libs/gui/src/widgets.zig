@@ -21,6 +21,7 @@ const draw_mod = @import("draw.zig");
 const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
+const text_edit = @import("text_edit.zig");
 pub const Vec2f = input_mod.Vec2f;
 
 pub const Context = context_mod.Context;
@@ -29,6 +30,20 @@ pub const Color = color_mod.Color;
 pub const DrawList = draw_mod.DrawList;
 pub const Rect = geom.Rect;
 pub const Id = id_mod.Id;
+pub const TextRange = text_edit.TextRange;
+pub const CopyRequest = text_edit.CopyRequest;
+
+pub const SelectableLabelOpts = struct {
+    /// null なら Context.style.text
+    text_color: ?Color = null,
+    /// null なら Context.style.selection_background
+    selection_background: ?Color = null,
+};
+
+pub const SelectableLabelResult = struct {
+    selection: TextRange,
+    copy_request: ?CopyRequest = null,
+};
 
 pub const ButtonOpts = struct {
     /// 0 より大きければボタン幅の下限（text + padding がそれ未満でも min_w を確保）
@@ -152,6 +167,132 @@ fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
     const cached = ctx.rect_cache.get(id) orelse return .{};
     return context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
 }
+
+/// SelectableLabel（read-only）。編集・caret・複数行・折返しは扱わない。
+pub fn selectableLabel(ctx: *Context, text: []const u8, opts: SelectableLabelOpts) SelectableLabelResult {
+    return selectableLabelId(ctx, ctx.id_stack.make(text), text, opts);
+}
+
+pub fn selectableLabelId(
+    ctx: *Context,
+    id: Id,
+    text: []const u8,
+    opts: SelectableLabelOpts,
+) SelectableLabelResult {
+    std.debug.assert(ctx.frame_active);
+    std.debug.assert(id != 0);
+
+    // layout の配列は per-frame arena に置く。widget 呼び出し時の O(codepoint) 処理で、
+    // endFrame の custom leaf callback まで生存する。
+    const layout_data = text_edit.buildTextLayout(ctx.allocator(), ctx.font, text) catch
+        @panic("selectableLabel: OOM");
+    const count = layout_data.count();
+    const per_id = ctx.perIdState(id);
+    per_id.selection.anchor = @min(per_id.selection.anchor, count);
+    per_id.selection.extent = @min(per_id.selection.extent, count);
+
+    if (ctx.rect_cache.get(id)) |cached| {
+        const rect = cached.rect;
+        const clip = cached.clip;
+        const down = ctx.input.mouse_pressed.left and rect.contains(ctx.input.mouse_pressed_pos) and
+            clip.contains(ctx.input.mouse_pressed_pos);
+        if (down) {
+            const index = text_edit.hitTest(layout_data, ctx.input.mouse_pressed_pos.x - rect.x);
+            const same_click = per_id.last_click_time >= 0 and
+                ctx.now() - per_id.last_click_time <= 0.5 and
+                per_id.last_click_pos.x == ctx.input.mouse_pressed_pos.x and
+                per_id.last_click_pos.y == ctx.input.mouse_pressed_pos.y;
+
+            _ = ctx.claimFocus(id);
+            if (same_click) {
+                per_id.selection.selectWord(text_edit.wordRange(layout_data, index));
+            } else {
+                per_id.selection.beginDrag(index, ctx.input.mouse_pressed_modifiers.shift);
+            }
+        }
+
+        // Input は state をフレーム間で保持するため、move event が無いフレームでも
+        // capture 中の extent を最新 mouse_pos へ追従させる。rect 外も意図的に許可する。
+        if (per_id.selection.dragging and ctx.state.focused_id == id and ctx.input.mouse_buttons.left) {
+            per_id.selection.updateDrag(text_edit.hitTest(layout_data, ctx.input.mouse_pos.x - rect.x));
+        }
+        if (ctx.input.mouse_released.left) {
+            if (per_id.selection.dragging) {
+                per_id.selection.updateDrag(text_edit.hitTest(layout_data, ctx.input.mouse_released_pos.x - rect.x));
+                per_id.selection.dragging = false;
+            }
+            // click の位置は release 側で記録する。これによりドラッグ終了後に同じ位置で
+            // press された double-click も、通常の click と同じ位置規則で認識できる。
+            per_id.last_click_time = ctx.now();
+            per_id.last_click_pos = .{
+                .x = ctx.input.mouse_released_pos.x,
+                .y = ctx.input.mouse_released_pos.y,
+            };
+        }
+    }
+
+    var copy_request: ?CopyRequest = null;
+    if (ctx.state.focused_id == id) {
+        for (ctx.input.orderedTextEvents()) |event| switch (event) {
+            .key_down => |key| {
+                // libs/gui は core/platform を import しない。KeyCode.C の共有値は
+                // platform_types の契約に従う（ASCII 'C'）。
+                if (key.code == 'C' and key.modifiers & 0x08 != 0 and !key.repeat) {
+                    const selection = per_id.selection.normalized();
+                    if (selection.start != selection.end) {
+                        const start = layout_data.byte_offsets[selection.start];
+                        const end = layout_data.byte_offsets[selection.end];
+                        copy_request = .{ .id = id, .text = text[start..end] };
+                    }
+                }
+            },
+            .char_input => {},
+        };
+    }
+
+    const width = layout_data.prefix_widths[count];
+    const line_height = ctx.font.metrics().line_height;
+    const draw_data = ctx.allocator().create(SelectableLabelDraw) catch
+        @panic("selectableLabel: OOM");
+    draw_data.* = .{
+        .text = text,
+        .layout = layout_data,
+        .selection = per_id.selection.normalized(),
+        .text_color = opts.text_color orelse ctx.style.text,
+        .selection_background = opts.selection_background orelse ctx.style.selection_background,
+    };
+    ctx.beginBox(.{
+        .id = id,
+        .width = .{ .fixed = @intCast(width) },
+        .height = .{ .fixed = @intCast(line_height) },
+    });
+    ctx.custom(.{ .x = @intCast(width), .y = @intCast(line_height) }, SelectableLabelDraw.draw, draw_data);
+    ctx.endBox();
+
+    return .{ .selection = draw_data.selection, .copy_request = copy_request };
+}
+
+/// 選択範囲の rect → text の順で DrawCmd を発行する callback。実ピクセル描画は既存
+/// gui.render / Font.drawTo 経路が行うため、新しい全画素ループは持たない。
+const SelectableLabelDraw = struct {
+    text: []const u8,
+    layout: text_edit.TextLayout,
+    selection: TextRange,
+    text_color: Color,
+    selection_background: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const SelectableLabelDraw = @ptrCast(@alignCast(ctx_ptr));
+        if (self.selection.start < self.selection.end) {
+            const x0: i32 = rect.x + @as(i32, @intCast(self.layout.prefix_widths[self.selection.start]));
+            const x1: i32 = rect.x + @as(i32, @intCast(self.layout.prefix_widths[self.selection.end]));
+            dl.rectFilled(.{ .x = x0, .y = rect.y, .w = @intCast(x1 - x0), .h = rect.h }, self.selection_background) catch
+                @panic("selectableLabel draw: OOM");
+        }
+        dl.textEx(.{ .x = rect.x, .y = rect.y }, self.text, self.text_color, null) catch
+            @panic("selectableLabel draw: OOM");
+    }
+};
 
 /// thickness <= 0 は「枠なし」（render の rectOutline は thickness 0 を 1 扱いするため、
 /// ここで null に落とす）。

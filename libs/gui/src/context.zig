@@ -49,6 +49,7 @@ pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 pub const BoxConfig = layout.BoxConfig;
 pub const Style = style_mod.Style;
+pub const PerIdState = state_mod.PerIdState;
 // ポップアップ/コンテキストメニュー（TASK-79.1）。実装・doc comment は popup.zig。
 pub const PopupState = popup_mod.PopupState;
 pub const PopupItem = popup_mod.PopupItem;
@@ -83,11 +84,14 @@ pub const Context = struct {
     input: Input,
     id_stack: IdStack,
     state: InteractionState = .{},
+    per_id_state: state_mod.PerIdStateStore = .{},
     draw_list: DrawList,
     font: Font,
     screen_w: u32 = 0,
     screen_h: u32 = 0,
     frame_active: bool = false,
+    frame_index: u64 = 0,
+    now_s: f64 = 0,
     /// レイアウトツリーの暗黙 root（beginFrame で arena 上に生成）
     layout_root: ?*layout.Node = null,
     /// beginBox / endBox のカーソル（現在の親）
@@ -130,6 +134,9 @@ pub const Context = struct {
     pub const toggleId = widgets.toggleId;
     pub const radio = widgets.radio;
     pub const radioId = widgets.radioId;
+    // read-only text selection（TASK-113.1）
+    pub const selectableLabel = widgets.selectableLabel;
+    pub const selectableLabelId = widgets.selectableLabelId;
     // Splitter（ペイン境界。TASK-41）
     pub const splitter = widgets.splitter;
     // 縦横スクロール領域（TASK-46）
@@ -156,6 +163,7 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         self.rect_cache.deinit(self.gpa);
+        self.per_id_state.deinit(self.gpa);
         self.scroll_stack.deinit(self.gpa);
         self.draw_list.deinit();
         self.id_stack.deinit();
@@ -169,10 +177,22 @@ pub const Context = struct {
     }
 
     pub fn beginFrame(self: *Context, screen_w: u32, screen_h: u32) void {
+        const frame_time = @as(f64, @floatFromInt(self.frame_index)) / 60.0;
+        self.frame_index += 1;
+        self.beginFrameAtInternal(screen_w, screen_h, frame_time);
+    }
+
+    /// 実時間または harness 仮想時刻を明示してフレームを開始する。
+    pub fn beginFrameAt(self: *Context, screen_w: u32, screen_h: u32, now_s: f64) void {
+        self.beginFrameAtInternal(screen_w, screen_h, now_s);
+    }
+
+    fn beginFrameAtInternal(self: *Context, screen_w: u32, screen_h: u32, now_s: f64) void {
         std.debug.assert(!self.frame_active);
         self.frame_active = true;
         self.screen_w = screen_w;
         self.screen_h = screen_h;
+        self.now_s = now_s;
         _ = self.arena.reset(.retain_capacity); // 前フレームの payload とレイアウトツリーをここで解放
         self.input.beginFrame();
         self.id_stack.clear();
@@ -228,6 +248,24 @@ pub const Context = struct {
 
     pub fn wantsKeyboard(self: *const Context) bool {
         return self.state.focused_id != 0;
+    }
+
+    /// widget の mouse down 時にキーボード focus を取得する。ID ごとの selection state
+    /// は別 store に残るので、focus の切替で選択内容は消えない。
+    pub fn claimFocus(self: *Context, id: Id) bool {
+        std.debug.assert(self.frame_active);
+        if (id == 0) return false;
+        self.state.focused_id = id;
+        return true;
+    }
+
+    pub fn now(self: *const Context) f64 {
+        return self.now_s;
+    }
+
+    pub fn perIdState(self: *Context, id: Id) *state_mod.PerIdState {
+        std.debug.assert(id != 0);
+        return self.per_id_state.getOrPut(self.gpa, id);
     }
 
     // ──────────────────────────────────────────────
@@ -518,6 +556,35 @@ test "Context.wantsMouse: active 解除後も hover 継続中は true" {
     _ = buttonBehavior(&ctx, id, btn_rect, full_clip);
     try std.testing.expectEqual(@as(Id, 0), ctx.state.active_id);
     try std.testing.expect(ctx.wantsMouse());
+    ctx.endFrame();
+}
+
+test "Context: beginFrameAt の時刻、focus claim、ID state persistence" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(320, 200, 12.5);
+    try std.testing.expectEqual(@as(f64, 12.5), ctx.now());
+    try std.testing.expect(ctx.claimFocus(77));
+    ctx.perIdState(77).selection = .{ .anchor = 2, .extent = 5 };
+    ctx.endFrame();
+
+    ctx.beginFrameAt(320, 200, 13.0);
+    try std.testing.expectEqual(@as(Id, 77), ctx.state.focused_id);
+    try std.testing.expectEqual(@as(usize, 2), ctx.perIdState(77).selection.anchor);
+    try std.testing.expectEqual(@as(usize, 5), ctx.perIdState(77).selection.extent);
+    ctx.endFrame();
+}
+
+test "Context.beginFrame: 仮想時刻は frame index / 60" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(320, 200);
+    try std.testing.expectEqual(@as(f64, 0.0), ctx.now());
+    ctx.endFrame();
+    ctx.beginFrame(320, 200);
+    try std.testing.expectEqual(@as(f64, 1.0 / 60.0), ctx.now());
     ctx.endFrame();
 }
 

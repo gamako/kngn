@@ -22,6 +22,10 @@ pub const Style = struct {
     text: Color,
     /// 補助テキスト色（status bar 等の caller 用途）
     text_subtle: Color,
+    /// SelectableLabel の選択範囲の背景色
+    selection_background: Color = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
+    /// 将来の caret 描画で使う色（113.1 では caret 自体を描画しない）
+    caret: Color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
     swatch_size: i32 = 18,
     swatch_border: i32 = 1,
     swatch_border_selected: i32 = 2,

@@ -43,6 +43,13 @@ pub const InputEvent = union(enum) {
     mouse_scroll: struct { x: i32, y: i32, dx: f32, dy: f32, modifiers: u32 },
     key_down: struct { code: u32, modifiers: u32, repeat: bool },
     key_up: struct { code: u32, modifiers: u32 },
+    char_input: struct { codepoint: u32, modifiers: u32 },
+};
+
+/// key_down と char_input の到着順を保持する列。
+pub const OrderedTextEvent = union(enum) {
+    key_down: struct { code: u32, modifiers: u32, repeat: bool },
+    char_input: struct { codepoint: u32, modifiers: u32 },
 };
 
 /// long-lived。keys_* は gpa 保持の ArrayList（unmanaged）。
@@ -55,6 +62,7 @@ pub const Input = struct {
     mouse_pressed: MouseButtons = .{}, // このフレームで押された (edge)
     mouse_released: MouseButtons = .{}, // このフレームで離された (edge)
     mouse_pressed_pos: Vec2 = .{ .x = 0, .y = 0 }, // 直近の press edge の座標
+    mouse_pressed_modifiers: ModifierFlags = .{},
     mouse_released_pos: Vec2 = .{ .x = 0, .y = 0 }, // 直近の左 release edge の座標
     scroll_delta: Vec2f = .{},
     modifiers: ModifierFlags = .{},
@@ -62,6 +70,7 @@ pub const Input = struct {
     keys_pressed: std.ArrayList(u32) = .empty, // このフレームで押された code（edge）
     keys_released: std.ArrayList(u32) = .empty, // このフレームで離された code（edge）
     keys_down: std.ArrayList(u32) = .empty, // 現在押下中の code 集合
+    ordered_text_events: std.ArrayList(OrderedTextEvent) = .empty,
 
     pub fn init(alloc: Allocator) Input {
         return .{ .alloc = alloc };
@@ -71,6 +80,7 @@ pub const Input = struct {
         self.keys_pressed.deinit(self.alloc);
         self.keys_released.deinit(self.alloc);
         self.keys_down.deinit(self.alloc);
+        self.ordered_text_events.deinit(self.alloc);
     }
 
     /// フレーム冒頭で呼ぶ。edge をクリアし、前フレーム最終位置を mouse_prev に保存。
@@ -82,6 +92,7 @@ pub const Input = struct {
         self.scroll_delta = .{};
         self.keys_pressed.clearRetainingCapacity();
         self.keys_released.clearRetainingCapacity();
+        self.ordered_text_events.clearRetainingCapacity();
         // keys_down / mouse_buttons / mouse_pos は状態なので維持する。
     }
 
@@ -96,6 +107,7 @@ pub const Input = struct {
                 self.setMousePos(m.x, m.y);
                 self.modifiers = @bitCast(m.modifiers);
                 self.mouse_pressed_pos = .{ .x = m.x, .y = m.y };
+                self.mouse_pressed_modifiers = @bitCast(m.modifiers);
                 self.applyButton(m.button, true);
             },
             .mouse_up => |m| {
@@ -112,6 +124,12 @@ pub const Input = struct {
             },
             .key_down => |k| {
                 self.modifiers = @bitCast(k.modifiers);
+                self.ordered_text_events.append(self.alloc, .{ .key_down = .{
+                    .code = k.code,
+                    .modifiers = k.modifiers,
+                    .repeat = k.repeat,
+                } }) catch
+                    @panic("Input.events: OOM");
                 // edge は初回 down のみ（repeat は押下継続だが pressed には積まない）。
                 if (!k.repeat) appendUnique(&self.keys_pressed, self.alloc, k.code);
                 appendUnique(&self.keys_down, self.alloc, k.code);
@@ -121,7 +139,19 @@ pub const Input = struct {
                 appendUnique(&self.keys_released, self.alloc, k.code);
                 removeFirst(&self.keys_down, k.code);
             },
+            .char_input => |ch| {
+                self.modifiers = @bitCast(ch.modifiers);
+                self.ordered_text_events.append(self.alloc, .{ .char_input = .{
+                    .codepoint = ch.codepoint,
+                    .modifiers = ch.modifiers,
+                } }) catch
+                    @panic("Input.events: OOM");
+            },
         }
+    }
+
+    pub fn orderedTextEvents(self: *const Input) []const OrderedTextEvent {
+        return self.ordered_text_events.items;
     }
 
     pub fn isDown(self: *const Input, code: u32) bool {
@@ -309,4 +339,19 @@ test "Input: modifiers が raw bits から変換される" {
     in.pushEvent(.{ .mouse_down = .{ .x = 0, .y = 0, .button = 0, .modifiers = 0x01 } }); // shift
     try std.testing.expect(in.modifiers.shift);
     try std.testing.expect(!in.modifiers.ctrl);
+}
+
+test "Input: char_input と key_down の順序を保持し、frame reset する" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+
+    in.beginFrame();
+    in.pushEvent(.{ .char_input = .{ .codepoint = 'あ', .modifiers = 0 } });
+    in.pushEvent(.{ .key_down = .{ .code = 67, .modifiers = 8, .repeat = false } });
+    try std.testing.expectEqual(@as(usize, 2), in.orderedTextEvents().len);
+    try std.testing.expectEqual(@as(u32, 'あ'), in.orderedTextEvents()[0].char_input.codepoint);
+    try std.testing.expectEqual(@as(u32, 67), in.orderedTextEvents()[1].key_down.code);
+
+    in.beginFrame();
+    try std.testing.expectEqual(@as(usize, 0), in.orderedTextEvents().len);
 }
