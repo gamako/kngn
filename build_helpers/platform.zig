@@ -511,6 +511,19 @@ pub fn buildStandalone(
         // これが無いと standalone で `audio.openCapture`/`requestCapturePermission` 等を実際に
         // 使う caller（例: soundalert）がコンパイルエラーになる。
         am.addImport("capture_types", capture_types_mod);
+        // macOS の audio_macos.zig（capture 権限確認。TASK-49.2）が `@import("objc_runtime")` する
+        // （トップ階層 build.zig の `link(audio, objc_runtime)` と同じ配線。std.c.nanosleep を使うため
+        // link_libc=true も同じ）。これが無いと macOS standalone で capture API を参照する caller が
+        // `no module named 'objc_runtime'` になる。非 macOS native では未参照のため解析されず無害だが、
+        // wasm（audio_web 経路）ではトップ階層の `if (!is_wasm) link(audio, objc_runtime)` と同じく
+        // 配線しない（意図の明示。wasi/freestanding が buildStandalone の wasm 経路）。
+        if (target_os != .wasi and target_os != .freestanding) {
+            const objc_runtime_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/objc_runtime.zig", .{core_dir}) },
+                .link_libc = true,
+            });
+            am.addImport("objc_runtime", objc_runtime_mod);
+        }
         break :blk am;
     } else null;
 
