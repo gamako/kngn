@@ -422,29 +422,30 @@ pub fn build(b: *std.Build) void {
         // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
         // 揃えること（inline for で型不一致を避けるため）。
         inline for (.{
-            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false },
-            .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_22", .path = "examples/22_gamepad/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true },
-            .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
-            .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false },
+            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_22", .path = "examples/22_gamepad/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false },
+            .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false },
+            .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = true },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -456,6 +457,7 @@ pub fn build(b: *std.Build) void {
                 .needs_font = example.needs_font,
                 .needs_audio = example.needs_audio,
                 .needs_gamepad = example.needs_gamepad,
+                .needs_gmath = example.needs_gmath,
             };
             // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
@@ -901,6 +903,18 @@ pub fn build(b: *std.Build) void {
     const run_pixelops_test = b.addRunArtifact(pixelops_test);
     const test_pixelops_step = b.step("test-pixelops", "Run libs/pixelops blend/div255/clip-hoist tests");
     test_pixelops_step.dependOn(&run_pixelops_test.step);
+
+    // libs/gmath 単体テスト（Vec2 / Rect / scalar / 衝突。platform 非依存。TASK-111.1）
+    const gmath_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("libs/gmath/src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_gmath_test = b.addRunArtifact(gmath_test);
+    const test_gmath_step = b.step("test-gmath", "Run libs/gmath unit tests");
+    test_gmath_step.dependOn(&run_gmath_test.step);
 
     // libs/serde 単体テスト（versioned container の round-trip / 破損検出 / 前方互換 / 固定 fixture。TASK-62.2）
     const serde_test = b.addTest(.{
@@ -1669,6 +1683,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_pixelops_step);
     test_step.dependOn(test_serde_step);
     test_step.dependOn(test_recipe_step);
+    test_step.dependOn(test_gmath_step);
 
     // ========================================
     // マイクロベンチ（TASK-50）。純ロジック計測（display / audio デバイス不要・OS 非依存）。
@@ -1910,6 +1925,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.synth);
     link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
     link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
+    link(kit, common.gmath); // kit.gmath（TASK-111.1）
 
     // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎。
     // wasm shared audio（TASK-73.2）は single_threaded=false（atomics を本物にする）。
@@ -1982,6 +1998,7 @@ const SharedModules = struct {
     harness: TaggedModule,
     types: TaggedModule,
     pixelops: TaggedModule,
+    gmath: TaggedModule,
     serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
     recipe: TaggedModule, // libs/recipe（CommandRecord 列 save/replay。TASK-62.5.8。std + serde。kit 収録）
     paint: TaggedModule, // 旧 apps/editor/core（ADR-007 R6 で libs/paint へ格上げ）
@@ -2027,6 +2044,12 @@ const SharedModules = struct {
         // clip-hoist。TASK-51）。sprite / paint blend / font Color.blend が委譲する。
         const pixelops: TaggedModule = .{ .layer = .lib, .name = "pixelops", .mod = b.createModule(.{
             .root_source_file = b.path("libs/pixelops/src/lib.zig"),
+        }) };
+
+        // libs/gmath: platform-independent f32 game math and collision primitives (TASK-111.1).
+        // It is a stable L2-L3 library and is publicly exposed through kit.gmath.
+        const gmath: TaggedModule = .{ .layer = .lib, .name = "gmath", .mod = b.addModule("gmath", .{
+            .root_source_file = b.path("libs/gmath/src/lib.zig"),
         }) };
 
         // libs/serde: versioned container 直列化基盤（TASK-62.2）。std のみ依存（link 不要）。
@@ -2250,6 +2273,7 @@ const SharedModules = struct {
             .harness = harness,
             .types = types,
             .pixelops = pixelops,
+            .gmath = gmath,
             .serde = serde,
             .recipe = recipe,
             .paint = paint,
@@ -2274,6 +2298,7 @@ const ExampleNeeds = struct {
     needs_font: bool,
     needs_audio: bool,
     needs_gamepad: bool, // TASK-80.1（examples/22_gamepad のみ true）
+    needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
 };
 
 // ============================================================
@@ -2323,6 +2348,7 @@ fn addExampleExe(
     // gamepad は platform_types のみに依存する backend 非依存 lib（TASK-80.1）。common（SharedModules）から
     // 直接 addImport する（kit を使わない examples の既存慣習に揃える）。
     if (needs.needs_gamepad) exe.root_module.addImport("gamepad", common.gamepad.mod);
+    if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
 
     // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
     // 任意の example が `@import("build_options").platform_name` で参照可能。

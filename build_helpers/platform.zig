@@ -374,6 +374,7 @@ pub const KitLibs = struct {
     font: *std.Build.Module,
     dsp: *std.Build.Module,
     synth: *std.Build.Module,
+    gmath: *std.Build.Module,
     /// kit.recipe（TASK-62.5.8）は serde に依存する。caller が paint 等でも serde module を
     /// 作っている場合（例: apps/editor）、**同一インスタンス**を渡さないと同じ serde.zig が
     /// 2 module に属し「file exists in modules」エラーになる。渡されなければ buildStandalone が
@@ -565,6 +566,7 @@ pub fn buildStandalone(
             kit_mod.addImport("font", kl.font);
             kit_mod.addImport("dsp", kl.dsp);
             kit_mod.addImport("synth", kl.synth);
+            kit_mod.addImport("gmath", kl.gmath);
             // gamepad（TASK-80.1）: kit.zig が無条件 import するため、caller の KitLibs には含めず
             // ここで自前に1つ作って types_mod だけを配線する（platform_types のみに依存する headless
             // lib のため kl から受け取る必要が無い）。既存の唯一の kit_libs 消費者

@@ -69,6 +69,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
     });
     synth.addImport("dsp", dsp);
+    const gmath = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
+    });
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",
@@ -88,6 +91,7 @@ pub fn build(b: *std.Build) void {
             .font = font,
             .dsp = dsp,
             .synth = synth,
+            .gmath = gmath,
             .serde = serde,
         },
         .extra = &.{
