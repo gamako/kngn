@@ -15,6 +15,12 @@ pub const PerIdState = struct {
     selection: text_edit.SelectionState = .{},
     last_click_time: f64 = -1.0,
     last_click_pos: struct { x: i32 = 0, y: i32 = 0 } = .{},
+    /// TextInput の caret は selection.extent と同期する codepoint index。
+    caret: usize = 0,
+    /// content の左端からの横スクロール量（px）。
+    scroll_x: i32 = 0,
+    /// caret が表示を開始した Context 仮想時刻。
+    caret_blink_start_s: f64 = 0,
 };
 
 /// ID ごとの状態を必要な ID だけ遅延確保する state store。
@@ -40,7 +46,8 @@ pub const InteractionState = struct {
     hot_id: Id = 0, // 前フレーム確定の hover ID（描画用・安定）
     active_id: Id = 0, // 押下中ロック ID
     next_hot_id: Id = 0, // 今フレーム計算中の hover 候補（描画順で最後勝ち）
-    focused_id: Id = 0, // text field focus（本タスクでは設定しない）
+    focused_id: Id = 0, // TextInput focus
+    focus_claimed_this_frame: bool = false,
     this_frame_hovered_any: bool = false, // wantsMouse 算出用
     active_submitted: bool = false, // 当フレームに active widget が評価されたか（張り付き防止用）
 
@@ -49,6 +56,7 @@ pub const InteractionState = struct {
         self.next_hot_id = 0;
         self.this_frame_hovered_any = false;
         self.active_submitted = false;
+        self.focus_claimed_this_frame = false;
         // active_id / focused_id は状態なので維持する。
     }
 };

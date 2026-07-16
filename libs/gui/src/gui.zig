@@ -48,6 +48,8 @@ pub const PerIdStateStore = @import("state.zig").PerIdStateStore;
 pub const TextRange = @import("text_edit.zig").TextRange;
 pub const TextLayout = @import("text_edit.zig").TextLayout;
 pub const SelectionState = @import("text_edit.zig").SelectionState;
+pub const MoveKey = @import("text_edit.zig").MoveKey;
+pub const TextBuffer = @import("text_edit.zig").TextBuffer;
 pub const CopyRequest = @import("text_edit.zig").CopyRequest;
 pub const OrderedTextEvent = @import("input.zig").OrderedTextEvent;
 pub const buildTextLayout = @import("text_edit.zig").buildTextLayout;
@@ -87,6 +89,9 @@ pub const SelectableLabelOpts = @import("widgets.zig").SelectableLabelOpts;
 pub const SelectableLabelResult = @import("widgets.zig").SelectableLabelResult;
 pub const selectableLabel = @import("widgets.zig").selectableLabel;
 pub const selectableLabelId = @import("widgets.zig").selectableLabelId;
+pub const TextInputOpts = @import("widgets.zig").TextInputOpts;
+pub const TextInputResult = @import("widgets.zig").TextInputResult;
+pub const textInputId = @import("widgets.zig").textInputId;
 
 // 16-step grid（純幾何/描画 + Flex row widget。TASK-105.1）。
 pub const stepgrid = @import("context.zig").stepgrid;

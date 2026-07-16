@@ -151,7 +151,114 @@ pub const SelectionState = struct {
         else
             .{ .start = self.extent, .end = self.anchor };
     }
+
+    /// 選択範囲を保った caret 移動。非 Shift 移動では既存選択を先に collapse する。
+    pub fn moveCaret(self: *SelectionState, count: usize, key: MoveKey, shift: bool) void {
+        const range = self.normalized();
+        const target = switch (key) {
+            .left => if (!shift and range.start != range.end)
+                range.start
+            else
+                self.extent -| 1,
+            .right => if (!shift and range.start != range.end)
+                range.end
+            else
+                @min(count, self.extent + 1),
+            .home => 0,
+            .end => count,
+        };
+        if (shift) {
+            self.extent = target;
+        } else {
+            self.anchor = target;
+            self.extent = target;
+        }
+        self.dragging = false;
+    }
 };
+
+pub const MoveKey = enum { left, right, home, end };
+
+/// caller が所有する単一行 UTF-8 buffer。caret/selection は codepoint index を使い、
+/// 実体の ArrayList は UTF-8 byte 列を保持する。
+pub const TextBuffer = struct {
+    bytes: std.ArrayList(u8),
+    alloc: Allocator,
+
+    pub fn init(a: Allocator, initial: []const u8) !TextBuffer {
+        var self: TextBuffer = .{ .bytes = .empty, .alloc = a };
+        errdefer self.deinit();
+        try self.bytes.appendSlice(a, initial);
+        return self;
+    }
+
+    pub fn deinit(self: *TextBuffer) void {
+        self.bytes.deinit(self.alloc);
+    }
+
+    pub fn slice(self: *const TextBuffer) []const u8 {
+        return self.bytes.items;
+    }
+
+    /// codepoint を index の位置へ挿入し、新しい caret index を返す。
+    pub fn insertCodepoint(self: *TextBuffer, index: usize, cp: u32) !usize {
+        if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return error.InvalidCodepoint;
+        var encoded: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(@intCast(cp), &encoded);
+        const count = codepointCount(self.slice());
+        const clamped = @min(index, count);
+        try self.bytes.insertSlice(self.alloc, byteIndex(self.slice(), clamped), encoded[0..n]);
+        return clamped + 1;
+    }
+
+    pub fn deleteRange(self: *TextBuffer, range: TextRange) void {
+        const count = codepointCount(self.slice());
+        const raw_start = @min(range.start, count);
+        const raw_end = @min(range.end, count);
+        const start = @min(raw_start, raw_end);
+        const end = @max(raw_start, raw_end);
+        if (start == end) return;
+        const byte_start = byteIndex(self.slice(), start);
+        const byte_end = byteIndex(self.slice(), end);
+        self.bytes.replaceRange(self.alloc, byte_start, byte_end - byte_start, &.{}) catch
+            @panic("TextBuffer.deleteRange: OOM");
+    }
+
+    pub fn backspace(self: *TextBuffer, selection: *SelectionState) void {
+        const range = selection.normalized();
+        if (range.start != range.end) {
+            self.deleteRange(range);
+            selection.anchor = range.start;
+            selection.extent = range.start;
+            return;
+        }
+        if (selection.extent == 0) return;
+        const caret = selection.extent;
+        self.deleteRange(.{ .start = caret - 1, .end = caret });
+        selection.anchor = caret - 1;
+        selection.extent = caret - 1;
+    }
+
+    pub fn deleteForward(self: *TextBuffer, selection: *SelectionState) void {
+        const range = selection.normalized();
+        if (range.start != range.end) {
+            self.deleteRange(range);
+            selection.anchor = range.start;
+            selection.extent = range.start;
+            return;
+        }
+        const count = codepointCount(self.slice());
+        if (selection.extent >= count) return;
+        self.deleteRange(.{ .start = selection.extent, .end = selection.extent + 1 });
+    }
+};
+
+fn codepointCount(text: []const u8) usize {
+    var pos: usize = 0;
+    var count: usize = 0;
+    while (pos < text.len) : (count += 1) pos += codepointByteLength(text, pos);
+    return count;
+}
 
 fn codepointByteLength(text: []const u8, pos: usize) usize {
     const first = text[pos];
@@ -240,4 +347,51 @@ test "wordRange: ASCII word / 空白・句読点 / 日本語連続列" {
     try testing.expectEqual(TextRange{ .start = 5, .end = 6 }, wordRange(layout, 5));
     try testing.expectEqual(TextRange{ .start = 7, .end = 10 }, wordRange(layout, 8));
     try testing.expectEqual(TextRange{ .start = 11, .end = 16 }, wordRange(layout, 11));
+}
+
+test "TextBuffer: ASCII / 日本語 insert と前後削除" {
+    var buffer = try TextBuffer.init(testing.allocator, "Ab");
+    defer buffer.deinit();
+
+    try testing.expectEqual(@as(usize, 3), try buffer.insertCodepoint(2, 'あ'));
+    try testing.expectEqualStrings("Abあ", buffer.slice());
+    var selection: SelectionState = .{ .anchor = 3, .extent = 3 };
+    buffer.backspace(&selection);
+    try testing.expectEqualStrings("Ab", buffer.slice());
+    try testing.expectEqual(@as(usize, 2), selection.extent);
+    buffer.deleteForward(&selection);
+    try testing.expectEqualStrings("Ab", buffer.slice());
+    selection.extent = 1;
+    buffer.deleteForward(&selection);
+    try testing.expectEqualStrings("A", buffer.slice());
+}
+
+test "TextBuffer: selection replacement と容量拡張" {
+    var buffer = try TextBuffer.init(testing.allocator, "0123456789");
+    defer buffer.deinit();
+
+    var selection: SelectionState = .{ .anchor = 2, .extent = 8 };
+    const range = selection.normalized();
+    buffer.deleteRange(range);
+    selection.anchor = range.start;
+    selection.extent = range.start;
+    _ = try buffer.insertCodepoint(selection.extent, 'あ');
+    selection.anchor += 1;
+    selection.extent += 1;
+    try testing.expectEqualStrings("01あ89", buffer.slice());
+    try testing.expectEqual(@as(usize, 3), selection.extent);
+}
+
+test "SelectionState: Left/Right/Home/End と Shift selection" {
+    var selection: SelectionState = .{ .anchor = 2, .extent = 2 };
+    selection.moveCaret(5, .left, false);
+    try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
+    selection.moveCaret(5, .right, true);
+    try testing.expectEqual(TextRange{ .start = 1, .end = 2 }, selection.normalized());
+    selection.moveCaret(5, .end, true);
+    try testing.expectEqual(TextRange{ .start = 1, .end = 5 }, selection.normalized());
+    selection.moveCaret(5, .left, false);
+    try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
+    selection.moveCaret(5, .home, false);
+    try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
 }

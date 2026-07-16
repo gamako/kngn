@@ -22,6 +22,7 @@ const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const text_edit = @import("text_edit.zig");
+const state_mod = @import("state.zig");
 pub const Vec2f = input_mod.Vec2f;
 
 pub const Context = context_mod.Context;
@@ -32,6 +33,8 @@ pub const Rect = geom.Rect;
 pub const Id = id_mod.Id;
 pub const TextRange = text_edit.TextRange;
 pub const CopyRequest = text_edit.CopyRequest;
+pub const TextBuffer = text_edit.TextBuffer;
+pub const MoveKey = text_edit.MoveKey;
 
 pub const SelectableLabelOpts = struct {
     /// null なら Context.style.text
@@ -42,6 +45,20 @@ pub const SelectableLabelOpts = struct {
 
 pub const SelectableLabelResult = struct {
     selection: TextRange,
+    copy_request: ?CopyRequest = null,
+};
+
+pub const TextInputOpts = struct {
+    width: layout.Sizing = .{ .fixed = 320 },
+    /// top, right, bottom, left
+    padding: [4]i32 = .{ 4, 8, 4, 8 },
+    placeholder: []const u8 = "",
+};
+
+pub const TextInputResult = struct {
+    changed: bool = false,
+    focused: bool = false,
+    selection: TextRange = .{ .start = 0, .end = 0 },
     copy_request: ?CopyRequest = null,
 };
 
@@ -291,6 +308,244 @@ const SelectableLabelDraw = struct {
         }
         dl.textEx(.{ .x = rect.x, .y = rect.y }, self.text, self.text_color, null) catch
             @panic("selectableLabel draw: OOM");
+    }
+};
+
+/// 単一行 TextInput。編集は event queue の順序を保ったまま focused ID だけが消費する。
+pub fn textInputId(
+    ctx: *Context,
+    id: Id,
+    buffer: *TextBuffer,
+    opts: TextInputOpts,
+) TextInputResult {
+    std.debug.assert(ctx.frame_active);
+    std.debug.assert(id != 0);
+
+    var text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+        @panic("textInput: OOM");
+    var per_id = ctx.perIdState(id);
+    clampTextInputState(per_id, text_layout.count());
+    var claimed_here = false;
+
+    if (ctx.rect_cache.get(id)) |cached| {
+        const down = ctx.input.mouse_pressed.left and
+            cached.rect.contains(ctx.input.mouse_pressed_pos) and
+            cached.clip.contains(ctx.input.mouse_pressed_pos);
+        if (down) {
+            claimed_here = true;
+            const local_x = ctx.input.mouse_pressed_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
+            per_id.selection.beginDrag(text_edit.hitTest(text_layout, local_x), ctx.input.mouse_pressed_modifiers.shift);
+            per_id.caret = per_id.selection.extent;
+            _ = ctx.claimFocus(id);
+            per_id.caret_blink_start_s = ctx.now();
+        }
+
+        if (per_id.selection.dragging and ctx.focusedId() == id and ctx.input.mouse_buttons.left) {
+            const local_x = ctx.input.mouse_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
+            per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
+            per_id.caret = per_id.selection.extent;
+            per_id.caret_blink_start_s = ctx.now();
+        }
+        if (ctx.input.mouse_released.left and per_id.selection.dragging) {
+            const local_x = ctx.input.mouse_released_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
+            per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
+            per_id.selection.dragging = false;
+            per_id.caret = per_id.selection.extent;
+        }
+    }
+
+    var changed = false;
+    var copy_request: ?CopyRequest = null;
+    // 同一 frame に別 input への mouse press が先に focus を移す場合、widget 呼び出し順で
+    // 旧 focused ID が後続 key/char event を誤消費しないよう、claim した widget だけ許可する。
+    if (ctx.focusedId() == id and (!ctx.input.mouse_pressed.left or claimed_here)) {
+        for (ctx.input.orderedTextEvents()) |event| switch (event) {
+            .key_down => |key| {
+                const shift = key.modifiers & 0x01 != 0;
+                if (key.code == 'C' and key.modifiers & 0x08 != 0 and !key.repeat) {
+                    const selection = per_id.selection.normalized();
+                    if (selection.start != selection.end) {
+                        const start = text_edit.byteIndex(buffer.slice(), selection.start);
+                        const end = text_edit.byteIndex(buffer.slice(), selection.end);
+                        copy_request = .{ .id = id, .text = buffer.slice()[start..end] };
+                    }
+                } else if (key.code == 259) { // BACKSPACE
+                    const before = buffer.slice().len;
+                    buffer.backspace(&per_id.selection);
+                    changed = changed or buffer.slice().len != before;
+                    if (buffer.slice().len != before) {
+                        text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+                            @panic("textInput: OOM");
+                    }
+                    per_id.caret = per_id.selection.extent;
+                    if (changed) per_id.caret_blink_start_s = ctx.now();
+                } else if (key.code == 261) { // DELETE
+                    const before = buffer.slice().len;
+                    buffer.deleteForward(&per_id.selection);
+                    changed = changed or buffer.slice().len != before;
+                    if (buffer.slice().len != before) {
+                        text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+                            @panic("textInput: OOM");
+                    }
+                    per_id.caret = per_id.selection.extent;
+                    if (changed) per_id.caret_blink_start_s = ctx.now();
+                } else if (key.code == 263 or key.code == 264 or key.code == 269 or key.code == 270) {
+                    const move_key: MoveKey = switch (key.code) {
+                        263 => .left,
+                        264 => .right,
+                        269 => .home,
+                        270 => .end,
+                        else => unreachable,
+                    };
+                    text_edit.SelectionState.moveCaret(&per_id.selection, text_layout.count(), move_key, shift);
+                    per_id.caret = per_id.selection.extent;
+                    per_id.caret_blink_start_s = ctx.now();
+                }
+            },
+            .char_input => |ch| {
+                if (!isInsertableCodepoint(ch.codepoint)) continue;
+                const selection = per_id.selection.normalized();
+                if (selection.start != selection.end) {
+                    buffer.deleteRange(selection);
+                    per_id.selection.anchor = selection.start;
+                    per_id.selection.extent = selection.start;
+                }
+                _ = buffer.insertCodepoint(per_id.selection.extent, ch.codepoint) catch
+                    @panic("textInput: OOM");
+                per_id.selection.anchor += 1;
+                per_id.selection.extent += 1;
+                per_id.caret = per_id.selection.extent;
+                changed = true;
+                per_id.caret_blink_start_s = ctx.now();
+                text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+                    @panic("textInput: OOM");
+            },
+        };
+    }
+
+    // 編集で byte 列が変わった後の layout を描画と copy の基準にする。
+    if (changed) {
+        text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+            @panic("textInput: OOM");
+        clampTextInputState(per_id, text_layout.count());
+    }
+    const width = resolveTextInputWidth(ctx, buffer.slice(), opts);
+    const line_height: i32 = @intCast(ctx.font.metrics().line_height);
+    const height = line_height + opts.padding[0] + opts.padding[2];
+    const content_width = @max(0, width - opts.padding[3] - opts.padding[1]);
+    updateTextInputScroll(per_id, text_layout, content_width);
+
+    const draw_data = ctx.allocator().create(TextInputDraw) catch @panic("textInput: OOM");
+    draw_data.* = .{
+        .layout = text_layout,
+        .placeholder = opts.placeholder,
+        .selection = per_id.selection.normalized(),
+        .caret = per_id.caret,
+        .scroll_x = per_id.scroll_x,
+        .focused = ctx.focusedId() == id,
+        .caret_visible = ctx.focusedId() == id and blinkVisible(ctx.now(), per_id.caret_blink_start_s),
+        .padding = opts.padding,
+        .background = ctx.style.input_background,
+        .selection_background = ctx.style.selection_background,
+        .caret_color = ctx.style.caret,
+        .text_color = ctx.style.text,
+        .placeholder_color = ctx.style.text_subtle,
+    };
+    ctx.beginBox(.{
+        .id = id,
+        .width = .{ .fixed = width },
+        .height = .{ .fixed = height },
+        .clip_children = true,
+        .border = .{ .color = if (ctx.focusedId() == id) ctx.style.border_hover else ctx.style.border, .thickness = 1 },
+    });
+    ctx.custom(.{ .x = width, .y = height }, TextInputDraw.draw, draw_data);
+    ctx.endBox();
+
+    return .{
+        .changed = changed,
+        .focused = ctx.focusedId() == id,
+        .selection = per_id.selection.normalized(),
+        .copy_request = copy_request,
+    };
+}
+
+fn clampTextInputState(per_id: *state_mod.PerIdState, count: usize) void {
+    per_id.selection.anchor = @min(per_id.selection.anchor, count);
+    per_id.selection.extent = @min(per_id.selection.extent, count);
+    per_id.caret = @min(per_id.caret, count);
+    per_id.caret = per_id.selection.extent;
+}
+
+fn resolveTextInputWidth(ctx: *Context, text: []const u8, opts: TextInputOpts) i32 {
+    return switch (opts.width) {
+        .fixed => |w| @max(w, opts.padding[3] + opts.padding[1]),
+        .fit => @intCast(ctx.font.measure(if (text.len == 0) opts.placeholder else text) +
+            @as(u32, @intCast(opts.padding[3] + opts.padding[1]))),
+        .grow => @max(0, @as(i32, @intCast(ctx.screen_w))),
+        .percent => |p| @max(0, @as(i32, @intFromFloat(@floor(@as(f64, @floatFromInt(ctx.screen_w)) * @as(f64, p))))),
+    };
+}
+
+fn updateTextInputScroll(per_id: *state_mod.PerIdState, text_layout: text_edit.TextLayout, viewport: i32) void {
+    const content = @as(i32, @intCast(text_layout.prefix_widths[text_layout.count()]));
+    const caret_x = @as(i32, @intCast(text_layout.prefix_widths[per_id.caret]));
+    const max_scroll = @max(0, content - viewport);
+    if (caret_x < per_id.scroll_x) per_id.scroll_x = caret_x;
+    if (caret_x > per_id.scroll_x + viewport) per_id.scroll_x = caret_x - viewport;
+    per_id.scroll_x = std.math.clamp(per_id.scroll_x, 0, max_scroll);
+}
+
+fn blinkVisible(now_s: f64, start_s: f64) bool {
+    const elapsed = @max(0.0, now_s - start_s);
+    const phase = elapsed - @floor(elapsed);
+    return phase < 0.5;
+}
+
+fn isInsertableCodepoint(cp: u32) bool {
+    return cp >= 0x20 and cp != 0x7F and cp <= 0x10FFFF and !(cp >= 0xD800 and cp <= 0xDFFF);
+}
+
+const TextInputDraw = struct {
+    layout: text_edit.TextLayout,
+    placeholder: []const u8,
+    selection: TextRange,
+    caret: usize,
+    scroll_x: i32,
+    focused: bool,
+    caret_visible: bool,
+    padding: [4]i32,
+    background: Color,
+    selection_background: Color,
+    caret_color: Color,
+    text_color: Color,
+    placeholder_color: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const TextInputDraw = @ptrCast(@alignCast(ctx_ptr));
+        dl.rectFilled(rect, self.background) catch @panic("textInput draw: OOM");
+        const content = Rect{
+            .x = rect.x + self.padding[3],
+            .y = rect.y + self.padding[0],
+            .w = @intCast(@max(0, @as(i32, @intCast(rect.w)) - self.padding[3] - self.padding[1])),
+            .h = @intCast(@max(0, @as(i32, @intCast(rect.h)) - self.padding[0] - self.padding[2])),
+        };
+        dl.pushClip(content) catch @panic("textInput draw: OOM");
+        if (self.selection.start < self.selection.end) {
+            const x0 = content.x + @as(i32, @intCast(self.layout.prefix_widths[self.selection.start])) - self.scroll_x;
+            const x1 = content.x + @as(i32, @intCast(self.layout.prefix_widths[self.selection.end])) - self.scroll_x;
+            dl.rectFilled(.{ .x = x0, .y = content.y, .w = @intCast(x1 - x0), .h = content.h }, self.selection_background) catch
+                @panic("textInput draw: OOM");
+        }
+        const text = if (self.layout.text.len == 0) self.placeholder else self.layout.text;
+        const text_color = if (self.layout.text.len == 0) self.placeholder_color else self.text_color;
+        dl.textEx(.{ .x = content.x - self.scroll_x, .y = content.y }, text, text_color, null) catch
+            @panic("textInput draw: OOM");
+        if (self.focused and self.caret_visible) {
+            const caret_x = content.x + @as(i32, @intCast(self.layout.prefix_widths[self.caret])) - self.scroll_x;
+            dl.rectFilled(.{ .x = caret_x, .y = content.y, .w = 1, .h = content.h }, self.caret_color) catch
+                @panic("textInput draw: OOM");
+        }
+        dl.popClip();
     }
 };
 
@@ -2139,4 +2394,76 @@ test "radio group: caller パターンで排他選択（clicked のみ true・�
     try std.testing.expect(!res[0]);
     try std.testing.expect(res[1]);
     try std.testing.expectEqual(Sel.b, sel);
+}
+
+test "TextInput: focus、char_input、invalid scalar、Cmd+C、外側解除" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xD1132;
+
+    ctx.beginFrameAt(240, 120, 0);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(id).?;
+
+    ctx.beginFrameAt(240, 120, 0.1);
+    clickAt(&ctx, rect.x + 8, rect.y + 8);
+    const focused = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(focused.focused);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 0xD800, .modifiers = 0 } });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 'あ', .modifiers = 0 } });
+    const inserted = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(inserted.changed);
+    try std.testing.expectEqualStrings("あab", buffer.slice());
+    ctx.endFrame();
+
+    ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 2 };
+    ctx.perIdState(id).caret = 2;
+    ctx.beginFrameAt(240, 120, 0.3);
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
+    const copied = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(copied.copy_request != null);
+    try std.testing.expectEqualStrings("a", copied.copy_request.?.text);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.4);
+    clickAt(&ctx, 200, 100);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.focusedId());
+}
+
+test "TextInput: 横スクロールは caret を viewport に追従" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "0123456789");
+    defer buffer.deinit();
+    const id: Id = 0xD1133;
+
+    ctx.beginFrame(160, 80);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(id).?;
+    ctx.beginFrame(160, 80);
+    clickAt(&ctx, rect.x + 8, rect.y + 8);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
+    ctx.endFrame();
+    ctx.beginFrame(160, 80);
+    ctx.pushEvent(.{ .key_down = .{ .code = 270, .modifiers = 0, .repeat = false } });
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
+    try std.testing.expect(ctx.perIdState(id).scroll_x > 0);
+    ctx.endFrame();
+}
+
+test "TextInput: caret blink は仮想時刻だけで決定" {
+    try std.testing.expect(blinkVisible(0.0, 0.0));
+    try std.testing.expect(blinkVisible(0.49, 0.0));
+    try std.testing.expect(!blinkVisible(0.5, 0.0));
+    try std.testing.expect(!blinkVisible(0.99, 0.0));
+    try std.testing.expect(blinkVisible(1.0, 0.0));
 }

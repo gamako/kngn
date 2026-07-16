@@ -137,6 +137,8 @@ pub const Context = struct {
     // read-only text selection（TASK-113.1）
     pub const selectableLabel = widgets.selectableLabel;
     pub const selectableLabelId = widgets.selectableLabelId;
+    // single-line editable text（TASK-113.2）
+    pub const textInputId = widgets.textInputId;
     // Splitter（ペイン境界。TASK-41）
     pub const splitter = widgets.splitter;
     // 縦横スクロール領域（TASK-46）
@@ -225,6 +227,11 @@ pub const Context = struct {
             self.emitNode(root);
         }
         self.frame_active = false;
+        // TextInput 等の focus widget が当フレームの外側クリックを claim しなかった
+        // 場合だけ keyboard focus を解除する。mouse down の無いフレームは維持する。
+        if (self.input.mouse_pressed.left and !self.state.focus_claimed_this_frame) {
+            self.state.focused_id = 0;
+        }
         // active widget が当フレーム未評価（非表示・分岐で未描画）かつ既にボタンが
         // 離されているなら、active_id の張り付き（wantsMouse の引きずり）を防ぐため解除する。
         if (self.state.active_id != 0 and !self.state.active_submitted and !self.input.mouse_buttons.left) {
@@ -256,7 +263,19 @@ pub const Context = struct {
         std.debug.assert(self.frame_active);
         if (id == 0) return false;
         self.state.focused_id = id;
+        self.state.focus_claimed_this_frame = true;
         return true;
+    }
+
+    /// 現在の keyboard focus を解除する。実際の外側クリック解除は endFrame で、当フレーム
+    /// にどの widget も claim しなかった場合に自動で行う。
+    pub fn releaseFocus(self: *Context) void {
+        std.debug.assert(self.frame_active);
+        self.state.focused_id = 0;
+    }
+
+    pub fn focusedId(self: *const Context) Id {
+        return self.state.focused_id;
     }
 
     pub fn now(self: *const Context) f64 {
