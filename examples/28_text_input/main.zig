@@ -8,6 +8,7 @@
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
+const fontmod = @import("font");
 
 const COMPOSITION_BYTES = 1024;
 
@@ -153,7 +154,17 @@ pub fn main(init: std.process.Init) !void {
     var second_buffer = try gui.TextBuffer.init(gpa, "A long second input demonstrates horizontal caret scrolling");
     defer second_buffer.deinit();
 
-    var ctx = gui.Context.init(gpa, gui.default_font);
+    // フォント bytes は FontFace より長命であること（main 寿命で保持）。
+    const loaded = fontmod.loadSystemTextFace(init.io, gpa);
+    defer if (loaded) |l| gpa.free(l.bytes);
+    if (loaded == null) std.debug.print("no usable system font found; falling back to gui.default_font.\n", .{});
+    var face: ?fontmod.FontFace = if (loaded) |l| l.face else null;
+    // gui.default_font の line_height=16 に合わせたピクセルサイズ。
+    var outline_font: ?fontmod.OutlineFont = if (face) |*f| fontmod.OutlineFont.init(gpa, f, 16) else null;
+    defer if (outline_font) |*o| o.deinit();
+
+    const app_font = if (outline_font) |*o| o.asFont() else gui.default_font;
+    var ctx = gui.Context.init(gpa, app_font);
     defer ctx.deinit();
 
     var input_probe: InputProbe = .{};
