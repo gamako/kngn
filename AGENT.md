@@ -671,7 +671,12 @@ action 固有のコードを一切足さない**（中身非パースの不変�
   Linux は Xvfb/実セッション）。**`VP_HARNESS_HEADLESS=1` で完全 display-less**（P4, TASK-32.4 実装済み。
   詳細は上記「完全 display-less（P4）」節）。`audio` は RT スレッド実時間依存なので record→replay で
   digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論。headless でも同様に bit 決定論で、実測で
-  headless と非 headless の fb crc も bit 一致）。`fb` の捕捉は CPU フレームバッファ経路で
+  headless と非 headless の fb crc も bit 一致）。**ただし audio を伴うアプリ（run-modular / run-patch）は
+  fb crc も非決定**（ポート活性 glow・ミニスコープ・可視化帯など RT 実時間依存の描画があり、main 同士の
+  連続実行でも crc 不一致を実測。2026-07-15）→ fb crc を回帰オラクルにせず、(a) grid/UI 領域に限定した
+  画素 diff（PNG デコードして領域比較） (b) warm cache でのマクロ box snapshot bit 比較 (c) `snapshot fb` の
+  Read 目視で照合し、音は `digest audio`（silent/rms/band）で判定する（pixie 等 audio 無しアプリの fb crc は
+  従来どおり bit 決定的）。`fb` の捕捉は CPU フレームバッファ経路で
   **objc / swift / metal いずれでも可**（実測で objc と Metal の fb crc は bit 一致）。Metal の GPU
   drawable 読み戻しは P4 スコープ外（上記参照）。
 - **driver は std.Io.net 1本実装**で mac/Linux/Windows 共通コード（`drive` は OS gate 無しで常時 install される。Windows 上での動作は未検証）。`scripts/drive` は `zig-out/bin/drive` を直接 exec する薄い wrapper（応答 stdout を汚さない）。
@@ -976,6 +981,9 @@ zig build test-spectrogram      # apps/synth スペクトログラム（FFT 列�
 zig build test-scope            # apps/synth オシロスコープ / レベルメータ
 zig build test-harness          # harness（parser / 実行モデル / 仮想クロック）
 # 入力変換の単体テスト（display/compositor 不要）: test-platform-input / -wayland-input / -windows-input / -convert / test-platform-types
+# テスト実装の規約: ファイル I/O を伴うテストは cwd 固定ファイル名を使わず std.testing.tmpDir(.{}) を使う
+# （@import 連鎖で同じテストが複数テストバイナリに同居し、集約 test の並列実行で固定名を取り合って
+#   高負荷時のみ flaky になる。単体実行では再現しない。TASK-96 実測・tmpDir 化で根治）
 
 # マイクロベンチ（性能変更の前後比較。ReleaseFast 固定・display/audio デバイス不要・OS 非依存。TASK-50）
 zig build bench-canvas          # Canvas.composite / compositeStraight の ns/frame・Mpx/s
