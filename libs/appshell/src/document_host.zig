@@ -68,6 +68,19 @@ pub const DocumentHost = struct {
         return self.current_path;
     }
 
+    /// autosave から decode 済みの document metadata を採用する。
+    /// document bytes の decode/差し替えは caller が行い、この関数は callback/I/O を行わない。
+    pub fn adoptRecovered(self: *DocumentHost, path: ?[]const u8) !void {
+        if (self.pending_kind != .none) return error.PendingConfirmation;
+        if (path) |value| {
+            if (value.len == 0) return error.InvalidPath;
+            try self.setCurrentPath(value);
+        } else {
+            self.clearCurrentPath();
+        }
+        self.dirty = true;
+    }
+
     pub fn pendingPath(self: *const DocumentHost) ?[]const u8 {
         return self.pending_path;
     }
@@ -368,4 +381,20 @@ test "DocumentHost saveAs and clean close" {
     try std.testing.expectEqualStrings("/tmp/alias.pix", host.currentPath().?);
     try std.testing.expectEqual(Result.allowed, try host.requestClose());
     try std.testing.expectEqual(Confirmation.none, host.confirmation());
+}
+
+test "DocumentHost recovery adoption sets named or untitled dirty metadata" {
+    var state: CallbackState = .{};
+    var host = testHost(&state);
+    defer host.deinit();
+
+    try host.adoptRecovered("recovered.pix");
+    try std.testing.expectEqual(NameState.named, host.nameState());
+    try std.testing.expectEqual(EditState.dirty, host.editState());
+    try std.testing.expectEqualStrings("recovered.pix", host.currentPath().?);
+
+    try host.adoptRecovered(null);
+    try std.testing.expectEqual(NameState.untitled, host.nameState());
+    try std.testing.expect(host.isDirty());
+    try std.testing.expectError(error.InvalidPath, host.adoptRecovered(""));
 }

@@ -25,6 +25,36 @@ pub fn openAppDataDir(
     return std.Io.Dir.openDirAbsolute(io, path, .{});
 }
 
+/// アプリデータディレクトリ内の autosave 用ディレクトリを作成して開く。
+pub fn openAutosaveDir(io: std.Io, app_data_dir: std.Io.Dir) !std.Io.Dir {
+    app_data_dir.createDirPath(io, "autosave") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return app_data_dir.openDir(io, "autosave", .{});
+}
+
+/// 文書 path から、ファイル名に安全な安定 autosave ID を生成する。
+///
+/// 相対 path は cwd に対して正規化してから hash する。元 path 自体は autosave
+/// envelope に保存するため、この関数の戻り値に path の情報を持たせない。
+pub fn autosaveFileName(io: std.Io, allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
+    if (path == null) return allocator.dupe(u8, "untitled.autosave");
+    const normalized = try normalizePath(io, allocator, path.?);
+    defer allocator.free(normalized);
+    const hash = std.hash.Wyhash.hash(0, normalized);
+    return std.fmt.allocPrint(allocator, "{x:0>16}.autosave", .{hash});
+}
+
+/// autosave ID の元になる path を OS の区切りと `.`/`..` に対して正規化する。
+pub fn normalizePath(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(allocator, &.{path});
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    return std.fs.path.resolve(allocator, &.{ cwd_buf[0..cwd_len], path });
+}
+
 fn env(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     return std.mem.span(value);
@@ -63,4 +93,20 @@ test "override path is created and opened" {
     });
     var dir = try openAppDataDir(std.testing.io, std.testing.allocator, "ignored", path);
     dir.close(std.testing.io);
+}
+
+test "autosave directory and names use tmpDir and stable IDs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var autosave_dir = try openAutosaveDir(std.testing.io, tmp.dir);
+    defer autosave_dir.close(std.testing.io);
+
+    const named_a = try autosaveFileName(std.testing.io, std.testing.allocator, "a/../document.pix");
+    defer std.testing.allocator.free(named_a);
+    const named_b = try autosaveFileName(std.testing.io, std.testing.allocator, "document.pix");
+    defer std.testing.allocator.free(named_b);
+    try std.testing.expectEqualStrings(named_a, named_b);
+    const untitled = try autosaveFileName(std.testing.io, std.testing.allocator, null);
+    defer std.testing.allocator.free(untitled);
+    try std.testing.expectEqualStrings("untitled.autosave", untitled);
 }

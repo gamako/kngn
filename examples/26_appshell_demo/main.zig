@@ -27,6 +27,8 @@ const App = struct {
     background: u32,
     doc: paint.Document,
     host: appshell.document_host.DocumentHost,
+    autosave: appshell.autosave.Controller,
+    recovery: ?appshell.autosave.Candidate = null,
     window: ?*platform.Window = null,
     should_quit: bool = false,
     drawing: bool = false,
@@ -46,6 +48,8 @@ pub fn main() !void {
     const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
     var data_dir = try appshell.paths.openAppDataDir(io, allocator, "video-proto-example-26", override_path);
     defer data_dir.close(io);
+    var autosave_dir = try appshell.paths.openAutosaveDir(io, data_dir);
+    defer autosave_dir.close(io);
 
     var prefs = appshell.preferences.Preferences.init(allocator);
     defer prefs.deinit();
@@ -59,6 +63,7 @@ pub fn main() !void {
     _ = try recent.load(io, data_dir, "recent_files.ash");
 
     const doc = try paint.Document.init(allocator, DOODLE_WIDTH, DOODLE_HEIGHT);
+    const autosave_controller = try appshell.autosave.Controller.init(allocator, io, autosave_dir, null);
     var app: App = .{
         .allocator = allocator,
         .io = io,
@@ -69,6 +74,8 @@ pub fn main() !void {
         .background = background,
         .doc = doc,
         .host = undefined,
+        .autosave = autosave_controller,
+        .recovery = try appshell.autosave.scan(allocator, io, autosave_dir),
     };
     app.host = .init(allocator, .{
         .ctx = &app,
@@ -77,6 +84,10 @@ pub fn main() !void {
         .saveDocument = saveDocument,
     });
     defer app.host.deinit();
+    defer {
+        if (app.recovery) |*candidate| candidate.deinit();
+        app.autosave.deinit();
+    }
     defer app.doc.deinit();
 
     registerHarness(&app);
@@ -99,17 +110,17 @@ pub fn main() !void {
         while (window.nextEvent()) |event| {
             switch (event) {
                 .quit => {
-                    const result = try app.host.requestClose();
+                    const result = try requestClose(&app);
                     if (result == .allowed) app.should_quit = true else window.cancelQuit();
                 },
                 .key_down => |key| {
                     if (key.key == .ESCAPE or key.key == .Q) {
-                        const result = try app.host.requestClose();
+                        const result = try requestClose(&app);
                         if (result == .allowed) app.should_quit = true else window.cancelQuit();
                     }
                 },
                 .mouse_down => |mouse| {
-                    if (app.host.confirmation() != .none) {
+                    if (app.recovery != null or app.host.confirmation() != .none) {
                         try handleConfirmationClick(&app, mouse.x, mouse.y);
                     } else if (mouse.button == .left) {
                         app.drawing = true;
@@ -128,6 +139,8 @@ pub fn main() !void {
                 else => {},
             }
         }
+
+        _ = try app.autosave.tick(platform.getTime(), &app, snapshotDocument);
 
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
@@ -149,7 +162,11 @@ pub fn main() !void {
                 try draw_list.text(.{ .x = 310, .y = 132 + @as(i32, @intCast(i * 18)) }, path, gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
             }
         }
-        if (app.host.confirmation() != .none) try drawConfirmation(&draw_list, &app);
+        if (app.recovery != null) {
+            try drawRecovery(&draw_list);
+        } else if (app.host.confirmation() != .none) {
+            try drawConfirmation(&draw_list, &app);
+        }
         gui.render(target, &draw_list, gui.default_font);
         window.present();
         platform.frameDelay(16_666_666);
@@ -165,6 +182,7 @@ fn backgroundFromPrefs(prefs: *const appshell.preferences.Preferences) u32 {
 }
 
 fn saveAll(app: *App) !void {
+    try app.autosave.clear();
     try app.prefs.setI64(PREF_BACKGROUND, app.background);
     try app.prefs.save(app.io, app.data_dir, "preferences.ash");
     try appshell.window_state.save(app.io, app.data_dir, "window_state.ash", app.window_state);
@@ -173,9 +191,11 @@ fn saveAll(app: *App) !void {
 
 fn newDocument(ctx: *anyopaque) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    try app.autosave.clear();
     const next = try paint.Document.init(app.allocator, DOODLE_WIDTH, DOODLE_HEIGHT);
     app.doc.deinit();
     app.doc = next;
+    try app.autosave.setPath(null);
 }
 
 fn openDocument(ctx: *anyopaque, path: []const u8) !void {
@@ -183,14 +203,22 @@ fn openDocument(ctx: *anyopaque, path: []const u8) !void {
     var next = try paint.document_io.loadDocument(app.io, app.allocator, path, 0, 0);
     errdefer next.deinit();
     try app.recent.push(path);
+    try app.autosave.clear();
     app.doc.deinit();
     app.doc = next;
+    try app.autosave.setPath(path);
 }
 
 fn saveDocument(ctx: *anyopaque, path: []const u8) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    try paint.document_io.saveDocument(app.io, path, &app.doc, app.allocator);
+    syncDocumentForSave(app);
+    const bytes = try paint.document_io.encodeDocument(&app.doc, app.allocator);
+    defer app.allocator.free(bytes);
+    try appshell.file_safety.writeAtomic(app.io, path, bytes, .{ .backup = true });
     try app.recent.push(path);
+    try app.autosave.clear();
+    try appshell.autosave.clearPath(app.io, app.autosave.dir, app.allocator, path);
+    try app.autosave.setPath(path);
 }
 
 fn drawLine(app: *App, from: paint.Vec2, to: paint.Vec2) void {
@@ -214,7 +242,9 @@ fn drawLine(app: *App, from: paint.Vec2, to: paint.Vec2) void {
             y += sy;
         }
     }
+    const now = platform.getTime();
     app.host.markDirty();
+    app.autosave.markDirty(now);
 }
 
 fn drawStrokeAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
@@ -232,7 +262,7 @@ fn drawStrokeAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
 fn requestCloseAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     if (args.len != 0) return error.InvalidArgument;
-    const result = try app.host.requestClose();
+    const result = try requestClose(app);
     if (result == .allowed) app.should_quit = true else if (result == .confirmation_required) if (app.window) |window| window.cancelQuit();
     return std.fmt.bufPrint(buf, "ok close={s}", .{@tagName(result)}) catch error.BufferTooSmall;
 }
@@ -248,6 +278,7 @@ fn confirmDiscardAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u
     const app: *App = @ptrCast(@alignCast(ctx));
     if (args.len != 0) return error.InvalidArgument;
     const result = try app.host.confirmDiscard();
+    if (result == .allowed) try app.autosave.clear();
     return std.fmt.bufPrint(buf, "ok confirm_discard={s}", .{@tagName(result)}) catch error.BufferTooSmall;
 }
 
@@ -280,9 +311,79 @@ fn saveAsPath(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
 }
 
 fn handleConfirmationClick(app: *App, x: i32, y: i32) !void {
+    if (app.recovery != null) {
+        if (x < 300 or x >= 570 or y < 470 or y >= 520) return;
+        if (x < 435) {
+            try recover(app);
+        } else {
+            try discardRecovery(app);
+        }
+        return;
+    }
     if (x < 300 or x >= 700 or y < 470 or y >= 520) return;
     const result = if (x < 430) try app.host.confirmSave("doodle.pix") else if (x < 565) try app.host.confirmDiscard() else app.host.confirmCancel();
     if (result == .allowed) app.should_quit = true;
+}
+
+fn requestClose(app: *App) !appshell.document_host.Result {
+    if (app.recovery != null) return .rejected;
+    return app.host.requestClose();
+}
+
+fn snapshotDocument(ctx: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    syncDocumentForSave(app);
+    return paint.document_io.encodeDocument(&app.doc, allocator);
+}
+
+fn syncDocumentForSave(app: *App) void {
+    app.doc.commitActiveLayerToCel(app.allocator, app.doc.selected_layer);
+}
+
+fn recoverAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (args.len != 0) return error.InvalidArgument;
+    try recover(app);
+    return std.fmt.bufPrint(buf, "ok recover", .{}) catch error.BufferTooSmall;
+}
+
+fn discardRecoveryAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (args.len != 0) return error.InvalidArgument;
+    try discardRecovery(app);
+    return std.fmt.bufPrint(buf, "ok discard_recovery", .{}) catch error.BufferTooSmall;
+}
+
+fn recover(app: *App) !void {
+    const candidate = &(app.recovery orelse return error.NoRecoveryPending);
+    var decoded = try paint.document_io.decodeDocument(candidate.envelope.snapshot, app.allocator);
+    errdefer decoded.deinit();
+    try app.host.adoptRecovered(candidate.envelope.original_path);
+    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    app.doc.deinit();
+    app.doc = decoded;
+    decoded = undefined;
+    candidate.deinit();
+    app.recovery = null;
+    try app.autosave.setPath(app.host.currentPath());
+    app.autosave.markDirty(platform.getTime());
+}
+
+fn discardRecovery(app: *App) !void {
+    const candidate = &(app.recovery orelse return error.NoRecoveryPending);
+    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    candidate.deinit();
+    app.recovery = null;
+}
+
+fn drawRecovery(draw_list: *gui.DrawList) !void {
+    try draw_list.rectFilled(.{ .x = 286, .y = 420, .w = 560, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
+    try draw_list.rectOutline(.{ .x = 286, .y = 420, .w = 560, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
+    try draw_list.text(.{ .x = 310, .y = 438 }, "Recover autosaved changes?", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+    try draw_list.rectFilled(.{ .x = 310, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
+    try draw_list.rectFilled(.{ .x = 445, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
+    try draw_list.text(.{ .x = 330, .y = 489 }, "Recover", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+    try draw_list.text(.{ .x = 462, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
 }
 
 fn drawConfirmation(draw_list: *gui.DrawList, app: *const App) !void {
@@ -324,6 +425,8 @@ fn registerHarness(app: *App) void {
     platform.registerAction(.{ .name = "open", .ctx = app, .args = &.{.{ .name = "path", .kind = "path" }}, .network_policy = .local_only, .run = openPath });
     platform.registerAction(.{ .name = "save", .ctx = app, .network_policy = .local_only, .run = savePath });
     platform.registerAction(.{ .name = "save_as", .ctx = app, .args = &.{.{ .name = "path", .kind = "path" }}, .network_policy = .local_only, .run = saveAsPath });
+    platform.registerAction(.{ .name = "recover", .ctx = app, .network_policy = .local_only, .run = recoverAction });
+    platform.registerAction(.{ .name = "discard_recovery", .ctx = app, .network_policy = .local_only, .run = discardRecoveryAction });
 }
 
 fn digest(ctx: *anyopaque, buf: []u8) []const u8 {
@@ -347,14 +450,27 @@ fn doodleDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var title_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
     const title = app.host.title(&title_buf);
-    return std.fmt.bufPrint(buf, "dirty={d} named={d} confirm={s} recent={d} edited={d} title={s}", .{
+    const canvas = app.doc.activeCanvas().compositeStraight();
+    const canvas_crc = std.hash.Crc32.hash(std.mem.sliceAsBytes(canvas));
+    const autosave_present = app.recovery != null or activeAutosavePresent(app);
+    return std.fmt.bufPrint(buf, "dirty={d} named={d} confirm={s} recent={d} edited={d} title={s} recovery={s} autosave={d} canvas_crc={X:0>8}", .{
         @intFromBool(app.host.isDirty()),
         @intFromBool(app.host.nameState() == .named),
         @tagName(app.host.confirmation()),
         app.recent.items().len,
         @intFromBool(app.host.isDirty()),
         title,
+        if (app.recovery != null) "pending" else "none",
+        @intFromBool(autosave_present),
+        canvas_crc,
     }) catch buf[0..0];
+}
+
+fn activeAutosavePresent(app: *const App) bool {
+    const name = appshell.paths.autosaveFileName(app.io, app.autosave.allocator, app.autosave.current_path) catch return false;
+    defer app.autosave.allocator.free(name);
+    app.autosave.dir.access(app.io, name, .{}) catch return false;
+    return true;
 }
 
 fn setBackground(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {

@@ -8,6 +8,8 @@ pub const preferences = @import("preferences.zig");
 pub const window_state = @import("window_state.zig");
 pub const recent_files = @import("recent_files.zig");
 pub const document_host = @import("document_host.zig");
+pub const file_safety = @import("file_safety.zig");
+pub const autosave = @import("autosave.zig");
 
 // サブモジュールの test decl を test-appshell に収集するための明示的参照。
 test {
@@ -16,4 +18,6 @@ test {
     _ = window_state;
     _ = recent_files;
     _ = document_host;
+    _ = file_safety;
+    _ = autosave;
 }
