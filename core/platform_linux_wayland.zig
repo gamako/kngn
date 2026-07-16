@@ -224,8 +224,8 @@ const State = struct {
     shm_format: u32 = 0,
 
     // 透過 / borderless / クリック透過 / ドラッグ (TASK-104.3)
-    transparent: bool = false,   // ARGB8888 選択 + opaque region を出さない（背後が透ける）
-    borderless: bool = false,    // 装飾なし（deco_state=.none）
+    transparent: bool = false, // ARGB8888 選択 + opaque region を出さない（背後が透ける）
+    borderless: bool = false, // 装飾なし（deco_state=.none）
     click_through: bool = false, // 透明画素領域のクリックを背後へ抜けさせる（input region で近似）
     last_button_serial: u32 = 0, // content 上の直近左押下 serial（beginDrag=xdg_toplevel_move に必須。one-shot）
     ct_region_valid: bool = false, // click-through input region を設定済みか（未設定なら次 present で 1 回計算）

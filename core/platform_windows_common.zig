@@ -503,19 +503,21 @@ pub const Core = struct {
         const screen_dc = GetDC(null) orelse return false;
         defer _ = ReleaseDC(null, screen_dc);
         const mem_dc = CreateCompatibleDC(screen_dc) orelse return false;
-        var bmi = BITMAPINFO{ .bmiHeader = .{
-            .biSize = @sizeOf(BITMAPINFOHEADER),
-            .biWidth = @intCast(self.width),
-            .biHeight = -@as(LONG, @intCast(self.height)), // top-down（backing の先頭 = 左上）
-            .biPlanes = 1,
-            .biBitCount = 32,
-            .biCompression = BI_RGB,
-            .biSizeImage = 0,
-            .biXPelsPerMeter = 0,
-            .biYPelsPerMeter = 0,
-            .biClrUsed = 0,
-            .biClrImportant = 0,
-        } };
+        var bmi = BITMAPINFO{
+            .bmiHeader = .{
+                .biSize = @sizeOf(BITMAPINFOHEADER),
+                .biWidth = @intCast(self.width),
+                .biHeight = -@as(LONG, @intCast(self.height)), // top-down（backing の先頭 = 左上）
+                .biPlanes = 1,
+                .biBitCount = 32,
+                .biCompression = BI_RGB,
+                .biSizeImage = 0,
+                .biXPelsPerMeter = 0,
+                .biYPelsPerMeter = 0,
+                .biClrUsed = 0,
+                .biClrImportant = 0,
+            },
+        };
         var bits: ?*anyopaque = null;
         const dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse {
             _ = DeleteDC(mem_dc);
