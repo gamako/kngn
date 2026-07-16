@@ -657,6 +657,10 @@ pub const Kick = struct {
     pitch_k: f32 = 0.0,
     click_k: f32 = 0.0,
     applied_sr: f32 = -1.0,
+    applied_amp_decay: f32 = -1.0,
+    applied_pitch_decay: f32 = -1.0,
+    applied_click_decay: f32 = -1.0,
+    applied_click_cutoff: f32 = -1.0,
 
     const done_eps: f32 = 1e-4;
     const in_kinds = [_]PortKind{.gate};
@@ -669,7 +673,9 @@ pub const Kick = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Kick = @ptrCast(@alignCast(ctx));
-        if (self.applied_sr == sr) return; // sr 不変なら係数(@exp/tan)再計算しない（decay/cutoff は静的）
+        if (self.applied_sr == sr and self.applied_amp_decay == self.amp_decay and
+            self.applied_pitch_decay == self.pitch_decay and self.applied_click_decay == self.click_decay and
+            self.applied_click_cutoff == self.click_cutoff) return;
         self.amp_k = decayCoef(self.amp_decay, sr);
         self.pitch_k = decayCoef(self.pitch_decay, sr);
         self.click_k = decayCoef(self.click_decay, sr);
@@ -677,6 +683,10 @@ pub const Kick = struct {
         self.click_hp.setMode(.highpass);
         self.click_hp.setParams(self.click_cutoff, 0.707);
         self.applied_sr = sr;
+        self.applied_amp_decay = self.amp_decay;
+        self.applied_pitch_decay = self.pitch_decay;
+        self.applied_click_decay = self.click_decay;
+        self.applied_click_cutoff = self.click_cutoff;
     }
 
     fn process(ctx: *anyopaque, io: *Io) void {
@@ -726,6 +736,9 @@ pub const Hat = struct {
     coeffs_sr: f32 = -1.0, // フィルタ係数を計算した sr（変化時のみ再計算）
     applied_bright: f32 = -1.0, // 反映済み brightness（runtime 変更検出）
     applied_decay: f32 = -1.0, // 反映済み decay（runtime 変更検出）
+    applied_hp_cutoff: f32 = -1.0,
+    applied_bp_cutoff: f32 = -1.0,
+    applied_bp_q: f32 = -1.0,
 
     const done_eps: f32 = 1e-4;
     const in_kinds = [_]PortKind{.gate};
@@ -739,7 +752,9 @@ pub const Hat = struct {
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Hat = @ptrCast(@alignCast(ctx));
         // sr/brightness/decay いずれか変化時のみ係数(@exp/tan)再計算（GUI からの runtime 変更を拾う）。
-        if (self.coeffs_sr == sr and self.applied_bright == self.brightness and self.applied_decay == self.decay) return;
+        if (self.coeffs_sr == sr and self.applied_bright == self.brightness and self.applied_decay == self.decay and
+            self.applied_hp_cutoff == self.hp_cutoff and self.applied_bp_cutoff == self.bp_cutoff and
+            self.applied_bp_q == self.bp_q) return;
         self.amp_k = decayCoef(self.decay, sr);
         const b = if (std.math.isFinite(self.brightness)) std.math.clamp(self.brightness, 0.3, 2.5) else 1.0;
         self.hp.sample_rate = sr;
@@ -751,6 +766,9 @@ pub const Hat = struct {
         self.coeffs_sr = sr;
         self.applied_bright = self.brightness;
         self.applied_decay = self.decay;
+        self.applied_hp_cutoff = self.hp_cutoff;
+        self.applied_bp_cutoff = self.bp_cutoff;
+        self.applied_bp_q = self.bp_q;
     }
 
     fn process(ctx: *anyopaque, io: *Io) void {
@@ -789,6 +807,7 @@ pub const PercEnv = struct {
     level: f32 = 0.0,
     k: f32 = 0.0,
     applied_sr: f32 = -1.0,
+    applied_decay: f32 = -1.0,
 
     const done_eps: f32 = 1e-4;
     const in_kinds = [_]PortKind{.gate};
@@ -801,9 +820,10 @@ pub const PercEnv = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *PercEnv = @ptrCast(@alignCast(ctx));
-        if (self.applied_sr == sr) return; // sr 不変なら @exp 再計算しない
+        if (self.applied_sr == sr and self.applied_decay == self.decay) return;
         self.k = decayCoef(self.decay, sr);
         self.applied_sr = sr;
+        self.applied_decay = self.decay;
     }
 
     fn process(ctx: *anyopaque, io: *Io) void {
@@ -940,6 +960,10 @@ pub const Clap = struct {
     bp_cutoff: f32 = 1800.0,
     bp_q: f32 = 1.0,
     coeffs_sr: f32 = -1.0,
+    applied_decay: f32 = -1.0,
+    applied_hp_cutoff: f32 = -1.0,
+    applied_bp_cutoff: f32 = -1.0,
+    applied_bp_q: f32 = -1.0,
 
     const done_eps: f32 = 1e-4;
     const in_kinds = [_]PortKind{.gate};
@@ -965,7 +989,9 @@ pub const Clap = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Clap = @ptrCast(@alignCast(ctx));
-        if (self.coeffs_sr == sr) return;
+        if (self.coeffs_sr == sr and self.applied_decay == self.decay and
+            self.applied_hp_cutoff == self.hp_cutoff and self.applied_bp_cutoff == self.bp_cutoff and
+            self.applied_bp_q == self.bp_q) return;
         self.amp_k = decayCoef(self.decay, sr);
         self.hp.sample_rate = sr;
         self.hp.setMode(.highpass);
@@ -974,6 +1000,10 @@ pub const Clap = struct {
         self.bp.setMode(.bandpass);
         self.bp.setParams(self.bp_cutoff, self.bp_q);
         self.coeffs_sr = sr;
+        self.applied_decay = self.decay;
+        self.applied_hp_cutoff = self.hp_cutoff;
+        self.applied_bp_cutoff = self.bp_cutoff;
+        self.applied_bp_q = self.bp_q;
     }
 
     fn process(ctx: *anyopaque, io: *Io) void {
@@ -1041,6 +1071,8 @@ pub const ChordPad = struct {
     applied_attack: f32 = -1.0,
     applied_release: f32 = -1.0,
     applied_warmth: f32 = -1.0,
+    applied_base_hz: f32 = -1.0,
+    applied_detune: f32 = -1.0,
     // 実フィルタ係数 / pitch_cv root の dirty-gate（tan/@exp2 を変化時のみ）
     applied_fc: f32 = -1.0,
     applied_lp_sr: f32 = -1.0,
@@ -1086,18 +1118,26 @@ pub const ChordPad = struct {
         const self: *ChordPad = @ptrCast(@alignCast(ctx));
         // sr/cutoff/attack/release/warmth のいずれか変化時のみ係数(@exp2/tan)再計算（GUI runtime 変更を拾う）。
         // process は毎サンプル軽量算術のみ（重い transcendental はここ＝ブロックレートに集約）。
-        if (self.applied_sr == sr and self.applied_cutoff == self.cutoff and
+        if (self.applied_sr == sr and self.applied_base_hz == self.base_hz and self.applied_detune == self.detune and
+            self.applied_cutoff == self.cutoff and
             self.applied_attack == self.attack and self.applied_release == self.release and
             self.applied_warmth == self.warmth) return;
         const atk = @max(self.attack, 1e-3);
         self.atk_inc = 1.0 / (atk * sr);
         self.rel_k = decayCoef(self.release, sr);
+        if (self.root_cv_init) {
+            self.root_hz = self.base_hz * @exp2(self.applied_root_cv);
+        } else {
+            self.root_hz = self.base_hz;
+        }
         var fc = if (std.math.isFinite(self.cutoff)) self.cutoff else 1400.0;
         fc = std.math.clamp(fc, 50.0, @max(60.0, sr * 0.5 - 1.0));
         self.base_fc = fc;
         self.applyLp(sr, fc); // base cutoff（cutoff modulation 未接続時はこれが効く）
         self.recomputeFreqs();
         self.applied_sr = sr;
+        self.applied_base_hz = self.base_hz;
+        self.applied_detune = self.detune;
         self.applied_cutoff = self.cutoff;
         self.applied_attack = self.attack;
         self.applied_release = self.release;
@@ -1224,6 +1264,8 @@ pub const ReverbFx = struct {
     damping: f32 = 0.3,
     wet: f32 = 0.12,
     coeffs_sr: f32 = -1.0,
+    applied_decay: f32 = -1.0,
+    applied_damping: f32 = -1.0,
     ready: bool = false, // dsp.Reverb の tap 長は setSampleRate 前は undefined。未初期化なら dry を返す
     const in_kinds = [_]PortKind{.audio};
     const out_kinds = [_]PortKind{.audio};
@@ -1238,7 +1280,11 @@ pub const ReverbFx = struct {
             self.coeffs_sr = sr;
             self.ready = true;
         }
-        self.rev.setParams(self.decay, self.damping); // 軽量（tan なし）
+        if (self.applied_decay != self.decay or self.applied_damping != self.damping) {
+            self.rev.setParams(self.decay, self.damping); // 軽量（tan なし）
+            self.applied_decay = self.decay;
+            self.applied_damping = self.damping;
+        }
     }
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *ReverbFx = @ptrCast(@alignCast(ctx));
@@ -1293,6 +1339,7 @@ pub const Sidechain = struct {
     k: f32 = 0.0,
     prev_gate: bool = false,
     applied_sr: f32 = -1.0,
+    applied_release: f32 = -1.0,
 
     const in_kinds = [_]PortKind{ .audio, .gate };
     const out_kinds = [_]PortKind{.audio};
@@ -1304,9 +1351,10 @@ pub const Sidechain = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Sidechain = @ptrCast(@alignCast(ctx));
-        if (self.applied_sr == sr) return;
+        if (self.applied_sr == sr and self.applied_release == self.release) return;
         self.k = decayCoef(self.release, sr);
         self.applied_sr = sr;
+        self.applied_release = self.release;
     }
 
     fn process(ctx: *anyopaque, io: *Io) void {

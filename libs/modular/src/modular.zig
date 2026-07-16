@@ -11,6 +11,7 @@ pub const graph_core = @import("graph_core.zig");
 pub const graph = @import("graph.zig");
 pub const dyn = @import("dyn.zig");
 pub const modules = @import("modules.zig");
+pub const params = @import("params.zig");
 pub const grid_presets = @import("presets.zig");
 
 pub const Graph = graph.Graph;
@@ -24,6 +25,17 @@ pub const NodeSpec = signal.NodeSpec;
 pub const DynGraph = dyn.DynGraph;
 pub const ModuleKind = dyn.ModuleKind;
 pub const GraphView = dyn.GraphView;
+
+// TASK-110.3: UI 非依存の parameter descriptor / live field access。
+pub const ParamDesc = params.ParamDesc;
+pub const ParamValue = params.ParamValue;
+pub const ParamKind = params.ParamKind;
+pub const ScalarDesc = params.ScalarDesc;
+pub const ChoiceDesc = params.ChoiceDesc;
+pub const ParamError = params.Error;
+pub const descriptors = params.descriptors;
+pub const getParam = params.getParam;
+pub const setParam = params.setParam;
 
 // TASK-40.8 D: per-port tap（ポート別ミニ oscilloscope）。
 pub const TapConfig = graph_core.TapConfig;
@@ -76,6 +88,7 @@ test {
     _ = graph;
     _ = dyn;
     _ = modules;
+    _ = params;
     _ = grid_presets;
 }
 

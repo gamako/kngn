@@ -642,6 +642,12 @@ pub const DynGraph = struct {
     pub fn ptrOf(self: *DynGraph, comptime k: ModuleKind, h: Handle) *KindType(k) {
         return &self.poolArray(k)[self.slots[h].pool_idx];
     }
+
+    /// read-only live pool slot への ptr。param descriptor の getter など、非 RT の参照専用経路で使う。
+    /// 呼び出し側は active handle を事前に検証する（ptrOf と同じ前提）。
+    pub fn ptrOfConst(self: *const DynGraph, comptime k: ModuleKind, h: Handle) *const KindType(k) {
+        return &@constCast(self).poolArray(k)[self.slots[h].pool_idx];
+    }
     pub fn activeCount(self: *const DynGraph) usize {
         var n: usize = 0;
         for (self.slots) |s| {
