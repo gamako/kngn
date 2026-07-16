@@ -1444,6 +1444,14 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     return handle
 }
 
+// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+@_cdecl("platform_set_title")
+func platform_set_title(platformWindow: UnsafeMutableRawPointer?, title: UnsafePointer<CChar>?) -> Void {
+    guard let platformWindow = platformWindow, let title = title else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.window.title = String(cString: title)
+}
+
 // TASK-100.1: 既存ウィンドウをネイティブフルスクリーン化する（緑ボタンと同じ toggleFullScreen(nil)）。
 // 既にフルスクリーンなら no-op（二重 toggle 防止）。
 @_cdecl("platform_enter_fullscreen")

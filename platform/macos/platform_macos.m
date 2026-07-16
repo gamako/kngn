@@ -1481,6 +1481,14 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
     return platformWindow;
 }
 
+// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+void platform_set_title(PlatformWindow* platformWindow, const char* title) {
+    if (!platformWindow || !title) return;
+    @autoreleasepool {
+        [platformWindow->window setTitle:[NSString stringWithUTF8String:title]];
+    }
+}
+
 // TASK-100.1: 既存ウィンドウをネイティブフルスクリーン化する（緑ボタンと同じ toggleFullScreen:）。
 // titled+resizable window は既定でフルスクリーン可だが、念のため collectionBehavior に
 // FullScreenPrimary を立ててから toggle する。既にフルスクリーンなら no-op（二重 toggle 防止）。

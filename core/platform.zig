@@ -300,6 +300,13 @@ pub const Window = struct {
         self.inner.setCursor(shape);
     }
 
+    /// 表示中の OS ウィンドウタイトルを更新する。状態遷移時のみ呼ぶ。
+    /// headless と未対応 backend は no-op とし、framebuffer を変更しない。
+    pub fn setTitle(self: Window, title: [:0]const u8) void {
+        if (self.headless) return;
+        if (@hasDecl(backend.Window, "setTitle")) self.inner.setTitle(title);
+    }
+
     /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。
     /// アプリは掴む領域で mouse_down を受けたら呼ぶ。backend 未対応・headless は no-op。
     /// ホットパス宣言: mouse_down 起点のイベント時のみ。

@@ -124,6 +124,7 @@ extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?win.HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: win.HDC) callconv(.winapi) c_int;
 extern "user32" fn UpdateLayeredWindow(hWnd: HWND, hdcDst: ?win.HDC, pptDst: ?*const POINT, psize: ?*const SIZE, hdcSrc: ?win.HDC, pptSrc: ?*const POINT, crKey: DWORD, pblend: ?*const BLENDFUNCTION, dwFlags: DWORD) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, X: c_int, Y: c_int, cx: c_int, cy: c_int, uFlags: UINT) callconv(.winapi) BOOL;
+extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.winapi) BOOL;
 extern "user32" fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(.winapi) BOOL;
 extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
@@ -624,6 +625,14 @@ pub const Core = struct {
     pub fn setRedrawCallback(self: *Core, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         self.redraw_ctx = ctx;
         self.redraw_fn = cb;
+    }
+
+    /// 表示中のタイトルを更新する。イベント時のみ。
+    pub fn setTitle(self: *Core, title: [:0]const u8) void {
+        var title_buf: [512]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(title_buf[0 .. title_buf.len - 1], title) catch return;
+        title_buf[n] = 0;
+        _ = SetWindowTextW(self.hwnd, @ptrCast(&title_buf));
     }
 
     /// destroy 用の private clear 経路（public API に null を通さない。TASK-23.1 実装メモ）。

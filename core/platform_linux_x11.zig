@@ -536,6 +536,12 @@ pub const Window = struct {
         _ = c.XFlush(st.display);
     }
 
+    /// 表示中のタイトルを更新する。イベント時のみ。
+    pub fn setTitle(self: Window, title: [:0]const u8) void {
+        _ = c.XStoreName(self.state.display, self.state.window, title.ptr);
+        _ = c.XFlush(self.state.display);
+    }
+
     /// ライブリサイズ再描画コールバック（TASK-23.1）。X11 はモーダルループが無く元々ライブなので no-op スタブ。
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         _ = self;

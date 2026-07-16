@@ -1454,6 +1454,13 @@ pub const Window = struct {
         applyCursor(st); // content 外（have_pointer_enter=false）なら no-op、次の enter で反映
     }
 
+    /// 表示中のタイトルを更新する。イベント時のみ。
+    pub fn setTitle(self: Window, title: [:0]const u8) void {
+        c.xdg_toplevel_set_title(self.state.toplevel, title.ptr);
+        c.wl_surface_commit(self.state.surface.?);
+        _ = c.wl_display_flush(self.state.display);
+    }
+
     /// ライブリサイズ再描画コールバック（TASK-23.1）。Wayland はモーダルループが無く元々ライブなので no-op スタブ。
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         _ = self;

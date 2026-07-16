@@ -241,6 +241,11 @@ pub const Window = struct {
         return .{ .handle = w };
     }
 
+    /// 表示中の OS ウィンドウタイトルを更新する。イベント境界でのみ呼ぶ。
+    pub fn setTitle(self: Window, title: [:0]const u8) void {
+        c.platform_set_title(self.handle, title.ptr);
+    }
+
     /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。イベント時のみ。
     pub fn beginDrag(self: Window) void {
         c.platform_begin_window_drag(self.handle);

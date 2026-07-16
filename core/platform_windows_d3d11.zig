@@ -425,6 +425,10 @@ pub const Window = struct {
         _ = shape;
     }
 
+    pub fn setTitle(self: Window, title: [:0]const u8) void {
+        self.core.setTitle(title);
+    }
+
     /// ライブリサイズ再描画コールバック登録（TASK-23.1）。Core へ委譲。
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         self.core.setRedrawCallback(ctx, cb);

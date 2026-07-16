@@ -350,6 +350,9 @@ pub const Window = struct {
         vp_set_cursor(@intFromEnum(shape));
     }
 
+    /// wasm は OS window title を持たないため no-op。
+    pub fn setTitle(_: Window, _: [:0]const u8) void {}
+
     /// ライブリサイズ再描画コールバック（TASK-23.1）。ブラウザは OS モーダルループが無く
     /// リサイズ中も rAF が回り続けるため no-op スタブ（X11/Wayland と同型）。
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {

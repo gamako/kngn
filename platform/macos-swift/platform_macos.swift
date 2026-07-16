@@ -1336,6 +1336,14 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     return handle
 }
 
+// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+@_cdecl("platform_set_title")
+func platform_set_title(platformWindow: UnsafeMutableRawPointer?, title: UnsafePointer<CChar>?) -> Void {
+    guard let platformWindow = platformWindow, let title = title else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.window.title = String(cString: title)
+}
+
 // TASK-104: 透過 / borderless ウィンドウ + ドラッグ移動 の C ABI 実装
 @_cdecl("platform_begin_window_drag")
 func platform_begin_window_drag(platformWindow: UnsafeMutableRawPointer?) -> Void {

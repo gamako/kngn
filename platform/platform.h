@@ -61,6 +61,9 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts);
 
+// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+void platform_set_title(PlatformWindow* window, const char* title);
+
 // 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（実移動は OS 側）。
 // アプリは「掴む領域で mouse_down を受けたら」これを呼ぶ。macOS は保持した直近の左ボタン
 // mouse-down NSEvent を performWindowDragWithEvent: に渡し、呼び出し時に保持 event をクリアする

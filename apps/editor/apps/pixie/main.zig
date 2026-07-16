@@ -18,6 +18,7 @@ const platform = kit.platform;
 const gui = kit.gui;
 const recipe = kit.recipe;
 const app_runtime = kit.app_runtime;
+const appshell = kit.appshell;
 const core = @import("paint");
 const png = kit.png;
 const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
@@ -85,7 +86,7 @@ const MARCH_PERIOD: f64 = 8.0;
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
-const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project, export_seq, export_sheet };
+const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project, export_seq, export_sheet, confirm_save_as };
 
 // ── File/Edit/View Command 定義（TASK-97.2）────────────────────────────────
 // ID は stable。separator は INVALID_COMMAND_ID。GUI fallback / keyboard / menu_command が
@@ -96,6 +97,7 @@ const CmdId = struct {
     pub const save_as: platform.CommandId = 3;
     pub const open_project: platform.CommandId = 4;
     pub const save_project: platform.CommandId = 5;
+    pub const new_document: platform.CommandId = 14;
     pub const export_seq: platform.CommandId = 6;
     pub const export_sheet: platform.CommandId = 7;
     pub const save_palette: platform.CommandId = 8;
@@ -106,7 +108,8 @@ const CmdId = struct {
     pub const toggle_timeline: platform.CommandId = 13;
 };
 
-const MENU_CMD_CAP = 24;
+const MENU_CMD_CAP = 40;
+const RECENT_CMD_BASE: platform.CommandId = 100;
 
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
@@ -298,7 +301,9 @@ const App = struct {
     /// ライブリサイズ redraw callback を登録する（harness/headless 時は facade 側で no-op）。
     pub fn onWindowReady(self: *App, win: *platform.Window) void {
         self.redraw_win = win.*;
+        self.os_window = win;
         win.setRedrawCallback(self, redrawCb);
+        self.refreshTitle();
     }
 
     fn syncComposition(self: *App, win: *platform.Window) void {
@@ -421,10 +426,23 @@ const App = struct {
     in_frame: bool = false,
     /// redraw callback 用に onWindowReady で保持する Window 値コピー（TASK-23.1。FrameCtx 相当）。
     redraw_win: ?platform.Window = null,
+    /// appshell title 更新用の借用 Window。runtime が window を所有する。
+    os_window: ?*platform.Window = null,
     /// 現在の PNG 保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
     current_path: ?[]u8 = null,
     /// 現在の .pix プロジェクト保存先（gpa 所有。PNG の current_path とは別管理。TASK-63）。
     current_project_path: ?[]u8 = null,
+    /// .pix の lifecycle は DocumentHost が正本。legacy field は既存 UI/action との同期用。
+    host: appshell.document_host.DocumentHost = undefined,
+    data_dir: std.Io.Dir = undefined,
+    autosave_dir: std.Io.Dir = undefined,
+    recent: appshell.recent_files.RecentFiles = undefined,
+    autosave: appshell.autosave.Controller = undefined,
+    recovery: ?appshell.autosave.Candidate = null,
+    pending_png_path: ?[]u8 = null,
+    png_import_pending: bool = false,
+    title_cache: [std.fs.max_path_bytes + 64]u8 = undefined,
+    title_cache_len: usize = 0,
     /// パレットの .gpl 保存先（gpa 所有。PNG の current_path とは別管理）。
     palette_path: ?[]u8 = null,
     /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
@@ -583,6 +601,44 @@ const App = struct {
         self.save_msg_until = platform.getTime() + SAVE_MSG_DURATION;
     }
 
+    /// appshell の title を OS 側へ反映する。title は状態遷移時だけ更新し、毎フレームは触らない。
+    fn refreshTitle(self: *App) void {
+        var doc_title_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+        const doc_title = self.host.title(&doc_title_buf);
+        var title_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const title = std.fmt.bufPrintZ(&title_buf, "Pixie — {s}", .{doc_title}) catch return;
+        if (self.title_cache_len == title.len and std.mem.eql(u8, self.title_cache[0..self.title_cache_len], title[0..title.len])) return;
+        @memcpy(self.title_cache[0..title.len], title[0..title.len]);
+        self.title_cache_len = title.len;
+        if (self.os_window) |win| win.setTitle(title);
+    }
+
+    fn setProjectPath(self: *App, path: ?[]const u8) !void {
+        const owned = if (path) |value| try self.gpa.dupe(u8, value) else null;
+        if (self.current_project_path) |old| self.gpa.free(old);
+        self.current_project_path = owned;
+    }
+
+    /// DocumentHost の path と autosave ID、既存 pixie field を同期するイベント境界。
+    fn syncProjectState(self: *App) void {
+        self.setProjectPath(self.host.currentPath()) catch @panic("syncProjectState: OOM");
+        self.autosave.setPath(self.host.currentPath()) catch @panic("syncProjectState: OOM");
+        if (self.host.isDirty()) self.autosave.markDirty(platform.getTime());
+        self.refreshTitle();
+    }
+
+    /// document 内容を変更した編集イベントの共通入口。選択/tool/zoom では呼ばない。
+    fn markProjectDirty(self: *App) void {
+        self.host.markDirty();
+        self.autosave.markDirty(platform.getTime());
+        self.refreshTitle();
+    }
+
+    fn clearProjectAfterSave(self: *App) void {
+        self.autosave.clear() catch |err| self.setSaveMsg("Autosave clear failed: {s}", .{@errorName(err)});
+        self.syncProjectState();
+    }
+
     fn saveMsg(self: *const App) ?[]const u8 {
         if (self.save_msg_len == 0 or platform.getTime() >= self.save_msg_until) return null;
         return self.save_msg_buf[0..self.save_msg_len];
@@ -663,6 +719,7 @@ const App = struct {
             .open_project => self.doOpenProject(),
             .export_seq => self.doExportSeq(),
             .export_sheet => self.doExportSheet(),
+            .confirm_save_as => self.doConfirmSaveAs(),
         };
         if (pending == .dialog_pending) {
             self.dialog_op = op;
@@ -756,6 +813,7 @@ const App = struct {
         self.fill.color = cur;
         self.edit_synced_for = null;
         self.repl_source = null;
+        self.markProjectDirty();
     }
 
     /// 指定 layer の from→to 色置換（UI Repl / action replace_color。undo 可 = .paint Op）。
@@ -895,6 +953,7 @@ const App = struct {
     /// one-shot: 蓄積は必ずクリアする）。`pushed` = pushPaintOp で Op が実際に push されたか
     /// （true なら undo_ref = 直近 push の handle = AC #2 の対応付け）。
     fn recordUiStroke(self: *App, pushed: bool) void {
+        if (pushed) self.markProjectDirty();
         const len = self.ui_stroke_len;
         const overflow = self.ui_stroke_overflow;
         self.uiStrokeDiscard();
@@ -950,6 +1009,7 @@ const App = struct {
 
     /// UI shape 確定の CommandRecord 記録（TASK-90。actor=local_user）。
     fn recordUiShape(self: *App, pushed: bool) void {
+        if (pushed) self.markProjectDirty();
         var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
         const canon = actions.formatCanonicalShape(&canon_buf, .{
             .kind = switch (self.shape_in.kind) {
@@ -1260,24 +1320,45 @@ const App = struct {
             return .done;
         };
         const path = maybe orelse return .done; // キャンセル: サイレント no-op
-        defer self.gpa.free(path);
-        self.doOpenPath(path) catch |err| {
+        _ = self.requestPngImport(path) catch |err| {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
         };
+        self.gpa.free(path);
         return .done;
+    }
+
+    fn requestPngImport(self: *App, path: []const u8) !appshell.document_host.Result {
+        if (self.host.confirmation() != .none) return error.PendingConfirmation;
+        const owned = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(owned);
+        self.pending_png_path = owned;
+        self.png_import_pending = true;
+        const result = self.host.newDocument() catch |err| {
+            self.pending_png_path = null;
+            self.png_import_pending = false;
+            return err;
+        };
+        if (result != .confirmation_required) finishHostResult(self, result);
+        return result;
+    }
+
+    fn requestNewDocument(self: *App) !appshell.document_host.Result {
+        const result = try self.host.newDocument();
+        if (result != .confirmation_required) finishHostResult(self, result);
+        return result;
     }
 
     // ── .pix プロジェクト保存/読込（レイヤー構造保持。TASK-63）─────────────────
 
     /// 記憶している .pix 保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
     fn doSaveProject(self: *App) FileOpResult {
-        const path = self.current_project_path orelse return self.doSaveAsProject();
-        self.syncPaletteToDoc();
-        core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
+        const result = self.host.save() catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             return .done;
         };
-        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+        if (result == .needs_save_as) return self.doSaveAsProject();
+        finishHostResult(self, result);
+        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(self.current_project_path orelse "untitled.pix")});
         return .done;
     }
 
@@ -1292,15 +1373,35 @@ const App = struct {
             return .done;
         };
         const path = maybe orelse return .done; // キャンセル: サイレント no-op
-        self.syncPaletteToDoc();
-        core.document_io.saveDocument(self.io, path, &self.doc, self.gpa) catch |err| {
+        const result = self.host.saveAs(path) catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
             return .done;
         };
-        if (self.current_project_path) |old| self.gpa.free(old);
-        self.current_project_path = path; // 移譲
         self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+        finishHostResult(self, result);
+        self.gpa.free(path);
+        return .done;
+    }
+
+    fn doConfirmSaveAs(self: *App) FileOpResult {
+        const maybe = platform.saveFileDialog(self.gpa, self.io, .{
+            .default_name = "untitled.pix",
+            .allowed_ext = "pix",
+        }) catch |err| {
+            if (err == error.DialogPending) return .dialog_pending;
+            self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+            return .done;
+        };
+        const path = maybe orelse return .done;
+        const result = self.host.confirmSave(path) catch |err| {
+            self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+            self.gpa.free(path);
+            return .done;
+        };
+        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(path)});
+        finishHostResult(self, result);
+        self.gpa.free(path);
         return .done;
     }
 
@@ -1315,35 +1416,17 @@ const App = struct {
             return .done;
         };
         const path = maybe orelse return .done; // キャンセル: サイレント no-op
-        const new_doc = core.document_io.loadDocument(self.io, self.gpa, path, CANVAS_W, CANVAS_H) catch |err| {
+        _ = self.requestProjectOpen(path) catch |err| {
             self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
-            self.gpa.free(path);
-            return .done;
         };
-        // 成功: 旧 doc を破棄して差し替え、canvas ポインタと preview を張り直す。
-        // undo handle の採番は App/CommandLog の生存期間で単調に保つ（fresh Document は
-        // next_handle=1 で始まるため、引き継がないと load 前の CommandRecord.undo_ref と
-        // 新規 Op の handle が衝突し live 判定が偽陽性になる。UndoStack doc 参照）。
-        const preserved_next_handle = self.doc.undo.next_handle;
-        self.doc.deinit();
-        self.doc = new_doc;
-        self.doc.undo.next_handle = preserved_next_handle;
-        self.invalidateHistoryAfterDocReset(); // 旧 document への framework redo を失効（review 反映）
-        self.doc.resyncActiveView(self.gpa);
-        self.canvas = self.doc.activeCanvas();
-        self.clampTimelineTarget();
-        self.applySystemFont(); // 新 Document の active_view は system_font=null で始まるため再設定（TASK-82）
-        // ドキュメント差し替え = undo/redo 履歴破棄・選択/フロート破棄（doOpen と同型。AC#4）。
-        // `new_doc`（decodeDocument が返す fresh Document）は元々 undo 履歴を持たないため
-        // 追加のリセットは不要（TASK-45.1。旧コードの独立 `app.undo` フィールドは廃止済み）。
-        self.canvas.clearSelection();
-        self.sel_in.discardFloat(self.gpa);
-        self.loadPaletteFromDoc();
-        self.syncPreviewCanvas();
-        if (self.current_project_path) |old| self.gpa.free(old);
-        self.current_project_path = path; // 移譲
-        self.setSaveMsg("Project loaded: {s}", .{std.fs.path.basename(path)});
+        self.gpa.free(path);
         return .done;
+    }
+
+    fn requestProjectOpen(self: *App, path: []const u8) !appshell.document_host.Result {
+        const result = try self.host.open(path);
+        if (result != .confirmation_required) finishHostResult(self, result);
+        return result;
     }
 
     // ── 連番 PNG / スプライトシート書き出し（TASK-45.5）──────────────────────
@@ -1422,6 +1505,8 @@ const App = struct {
     /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
+        const undo_before = self.doc.undo.undo.items.len;
+        const redo_before = self.doc.undo.redo.items.len;
         // defer: routeAction が途中失敗しても revert フラグ等の変異は起きうる（next_seq 非依存）
         defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
@@ -1431,10 +1516,13 @@ const App = struct {
             self.userUndo();
         }
         self.clampTimelineTarget();
+        if (undo_before != self.doc.undo.undo.items.len or redo_before != self.doc.undo.redo.items.len) self.markProjectDirty();
     }
 
     fn doRedo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
+        const undo_before = self.doc.undo.undo.items.len;
+        const redo_before = self.doc.undo.redo.items.len;
         defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
             var buf: [128]u8 = undefined;
@@ -1443,6 +1531,7 @@ const App = struct {
             self.userRedo();
         }
         self.clampTimelineTarget();
+        if (undo_before != self.doc.undo.undo.items.len or redo_before != self.doc.undo.redo.items.len) self.markProjectDirty();
     }
 
     fn markHistoryDirty(self: *App) void {
@@ -1560,6 +1649,7 @@ const App = struct {
     /// しないため）。
     fn checkUnrecordedEdits(self: *App) void {
         if (self.doc.undo.next_handle > self.last_seen_handle) {
+            self.markProjectDirty();
             self.cmd_exec.bumpEpoch(.local_user);
             self.last_seen_handle = self.doc.undo.next_handle;
             // 未記録 push の owner を user に確定（agent 操作は同イベント内にタグ済み = unknown で
@@ -2048,7 +2138,14 @@ const App = struct {
         // disabled 項目を実行しない（エラーでなく無視）。
         const cmd = self.findMenuCommand(id) orelse return;
         if (!cmd.enabled) return;
+        if (id >= RECENT_CMD_BASE and id < RECENT_CMD_BASE + 10) {
+            const index: usize = @intCast(id - RECENT_CMD_BASE);
+            const items = self.recent.items();
+            if (index < items.len) _ = self.requestProjectOpen(items[index]) catch |err| self.setSaveMsg("Recent open failed: {s}", .{@errorName(err)});
+            return;
+        }
         switch (id) {
+            CmdId.new_document => _ = self.requestNewDocument() catch |err| self.setSaveMsg("New failed: {s}", .{@errorName(err)}),
             CmdId.open => {
                 self.pending_file_op = .open;
                 self.menu_pending_probe = .open;
@@ -2123,6 +2220,7 @@ const App = struct {
             }
         }.go;
 
+        put(self, &n, .{ .id = CmdId.new_document, .label = "New", .menu = .{ .title = "File", .order = 99 } });
         put(self, &n, .{ .id = CmdId.open, .label = "Open", .menu = .{ .title = "File", .order = 100 }, .shortcut = .{ .key = .O, .modifiers = accel_mod } });
         put(self, &n, .{ .id = CmdId.save, .label = "Save", .menu = .{ .title = "File", .order = 101 }, .shortcut = .{ .key = .S, .modifiers = accel_mod } });
         put(self, &n, .{ .id = CmdId.save_as, .label = "Save As", .menu = .{ .title = "File", .order = 102 }, .shortcut = .{ .key = .S, .modifiers = accel_shift } });
@@ -2135,6 +2233,21 @@ const App = struct {
         put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 109 } });
         put(self, &n, .{ .id = CmdId.save_palette, .label = "Pal Save", .menu = .{ .title = "File", .order = 110 } });
         put(self, &n, .{ .id = CmdId.load_palette, .label = "Pal Load", .menu = .{ .title = "File", .order = 111 } });
+        if (self.recent.items().len > 0) {
+            put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 112 } });
+            for (self.recent.items(), 0..) |path, index| {
+                if (index >= 10) break;
+                const base = std.fs.path.basename(path);
+                var duplicate = false;
+                for (self.recent.items(), 0..) |other, other_index| {
+                    if (other_index != index and std.mem.eql(u8, base, std.fs.path.basename(other))) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                put(self, &n, .{ .id = RECENT_CMD_BASE + @as(platform.CommandId, @intCast(index)), .label = if (duplicate) path else base, .menu = .{ .title = "File", .order = @intCast(113 + index) } });
+            }
+        }
 
         put(self, &n, .{ .id = CmdId.undo, .label = "Undo", .menu = .{ .title = "Edit", .order = 200 }, .shortcut = .{ .key = .Z, .modifiers = accel_mod }, .execution_policy = .undo });
         put(self, &n, .{ .id = CmdId.redo, .label = "Redo", .menu = .{ .title = "Edit", .order = 201 }, .shortcut = .{ .key = .Z, .modifiers = accel_shift }, .execution_policy = .redo });
@@ -2165,6 +2278,52 @@ const App = struct {
             return cmd.id;
         }
         return null;
+    }
+
+    fn requestClose(self: *App, win: *platform.Window) void {
+        if (self.recovery != null) {
+            win.cancelQuit();
+            return;
+        }
+        const result = self.host.requestClose() catch |err| {
+            self.setSaveMsg("Close failed: {s}", .{@errorName(err)});
+            win.cancelQuit();
+            return;
+        };
+        if (result == .allowed) {
+            self.running = false;
+        } else {
+            win.cancelQuit();
+            self.refreshTitle();
+        }
+    }
+
+    fn handleConfirmationClick(self: *App, x: i32, y: i32) void {
+        if (self.recovery != null) {
+            if (x >= 100 and x < 210 and y >= 480 and y < 520) recoverAutosave(self) catch |err| self.setSaveMsg("Recover failed: {s}", .{@errorName(err)}) else if (x >= 245 and x < 355 and y >= 480 and y < 520) discardRecovery(self) catch |err| self.setSaveMsg("Discard recovery failed: {s}", .{@errorName(err)});
+            return;
+        }
+        if (x < 100 or x >= 500 or y < 480 or y >= 520) return;
+        if (x < 210) {
+            if (self.host.nameState() == .untitled) {
+                self.pending_file_op = .confirm_save_as;
+                self.dialog_op = null;
+            } else {
+                const result = self.host.confirmSave(null) catch |err| {
+                    self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                finishHostResult(self, result);
+            }
+        } else if (x < 355) {
+            const result = self.host.confirmDiscard() catch |err| {
+                self.setSaveMsg("Discard failed: {s}", .{@errorName(err)});
+                return;
+            };
+            finishHostResult(self, result);
+        } else {
+            finishHostResult(self, self.host.confirmCancel());
+        }
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
@@ -2206,10 +2365,10 @@ const App = struct {
                 self.canvas.clearSelection();
                 self.sel_in.discardFloat(self.gpa);
             } else {
-                self.running = false;
+                if (self.os_window) |win| self.requestClose(win);
             }
         } else if (k.key == .Q and accel) {
-            self.running = false;
+            if (self.os_window) |win| self.requestClose(win);
         } else if (self.matchMenuShortcut(k)) |cmd_id| {
             // File/Edit ショートカットは Command 表経由（single-owner。GUI メニューと同じ入口）。
             self.dispatchCommand(cmd_id);
@@ -2362,6 +2521,33 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "open={s} items={d} enabled={X:0>8} checked={X:0>8} pending={s} last_op={s}", .{
         open, items, enabled_mask, checked_mask, pending, last_op,
     }) catch buf[0..0];
+}
+
+fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    var title_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const title = app.host.title(&title_buf);
+    const path = app.host.currentPath() orelse "none";
+    const recent0 = if (app.recent.items().len > 0) app.recent.items()[0] else "none";
+    const recovery = if (app.recovery != null) "pending" else "none";
+    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} autosave={d} netsync={d} title={s}", .{
+        @intFromBool(app.host.isDirty()),
+        path,
+        @tagName(app.host.confirmation()),
+        app.recent.items().len,
+        recent0,
+        recovery,
+        @intFromBool(activeAutosavePresent(app)),
+        @intFromBool(platform.netsyncActive()),
+        title,
+    }) catch buf[0..0];
+}
+
+fn activeAutosavePresent(app: *const App) bool {
+    const name = appshell.paths.autosaveFileName(app.io, app.gpa, app.autosave.current_path) catch return false;
+    defer app.gpa.free(name);
+    app.autosave.dir.access(app.io, name, .{}) catch return false;
+    return true;
 }
 fn undoSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -2962,7 +3148,7 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
     const path = try actions.parsePath(args);
-    app.doOpenPath(path) catch |err| {
+    _ = app.requestPngImport(path) catch |err| {
         // structured error（TASK-62.5.9）: 読込失敗（png は FileNotFound 等を ReadFailed に正規化）は
         // 自己回復ヒントを wire に載せる。
         if (err == error.ReadFailed or err == error.FileNotFound) {
@@ -3239,6 +3425,7 @@ fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf:
                 break :blk 0;
             };
             if (pushes == 1) {
+                app.markProjectDirty();
                 // 62.3.5 revert は `.paint` のみ（canRevertByHandle）。構造 layer op は push しても
                 // adapter 逆適用不能 → noteUndo せず undoable=false（TASK-94 Phase B MVP）。
                 if (app.doc.undo.topHandle()) |h| {
@@ -3468,6 +3655,9 @@ const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
 const pixie_args_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path" },
 };
+const appshell_args_optional_path: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "path", .kind = "path", .optional = true },
+};
 // TASK-89 args
 const pixie_args_replace_color: @FieldType(platform.Action, "args") = &.{
     .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。netsync 中は #id 必須" },
@@ -3497,6 +3687,70 @@ const pixie_args_export_sheet: @FieldType(platform.Action, "args") = &.{
     .{ .name = "margin", .kind = "int", .optional = true, .desc = "gap between frames in px" },
 };
 
+fn actionRequestClose(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    try actions.parseNoArgs(args);
+    const app = actionApp(ctx);
+    const win = app.os_window orelse return error.NoWindow;
+    if (app.recovery != null) {
+        win.cancelQuit();
+        return "ok close=rejected";
+    }
+    const result = try app.host.requestClose();
+    if (result == .allowed) app.running = false else win.cancelQuit();
+    return std.fmt.bufPrint(buf, "ok close={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
+fn actionNewDocument(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    try actions.parseNoArgs(args);
+    const app = actionApp(ctx);
+    const result = try app.requestNewDocument();
+    return std.fmt.bufPrint(buf, "ok new={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
+fn actionOpenProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    if (args.len == 0) return error.InvalidArgument;
+    const result = try app.requestProjectOpen(args);
+    return std.fmt.bufPrint(buf, "ok open_project={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
+fn actionConfirmSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const result = try app.host.confirmSave(if (args.len == 0) null else args);
+    finishHostResult(app, result);
+    return std.fmt.bufPrint(buf, "ok confirm_save={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
+fn actionConfirmDiscard(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    try actions.parseNoArgs(args);
+    const app = actionApp(ctx);
+    const result = try app.host.confirmDiscard();
+    finishHostResult(app, result);
+    return std.fmt.bufPrint(buf, "ok confirm_discard={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
+fn actionConfirmCancel(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    try actions.parseNoArgs(args);
+    const app = actionApp(ctx);
+    const result = app.host.confirmCancel();
+    finishHostResult(app, result);
+    return std.fmt.bufPrint(buf, "ok confirm_cancel={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
+fn actionRecover(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try recoverAutosave(actionApp(ctx));
+    return "ok recover";
+}
+
+fn actionDiscardRecovery(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    try discardRecovery(actionApp(ctx));
+    return "ok discard_recovery";
+}
+
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
 /// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
@@ -3521,6 +3775,14 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "stroke", .ctx = app, .run = recordedStroke, .network_policy = .relay, .canonicalize = App.canonicalizeStroke, .args = pixie_args_stroke });
     platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record), .args = pixie_args_path });
+    platform.registerAction(.{ .name = "request_close", .ctx = app, .run = actionRequestClose, .network_policy = .local_only, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "new", .ctx = app, .run = actionNewDocument, .network_policy = .local_only, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "open_project", .ctx = app, .run = actionOpenProject, .network_policy = .local_only, .args = pixie_args_path });
+    platform.registerAction(.{ .name = "confirm_save", .ctx = app, .run = actionConfirmSave, .network_policy = .local_only, .args = appshell_args_optional_path });
+    platform.registerAction(.{ .name = "confirm_discard", .ctx = app, .run = actionConfirmDiscard, .network_policy = .local_only, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "confirm_cancel", .ctx = app, .run = actionConfirmCancel, .network_policy = .local_only, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "recover", .ctx = app, .run = actionRecover, .network_policy = .local_only, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "discard_recovery", .ctx = app, .run = actionDiscardRecovery, .network_policy = .local_only, .args = pixie_args_none });
     // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only, .args = pixie_args_path });
@@ -3572,6 +3834,7 @@ fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     app.canvas.clearSelection();
     app.sel_in.discardFloat(app.gpa);
     app.syncPreviewCanvas();
+    app.markProjectDirty();
 }
 
 fn registerStateSync(app: *App) void {
@@ -4600,6 +4863,146 @@ pub const panic = if (builtin.cpu.arch.isWasm())
 else
     std.debug.FullPanic(std.debug.defaultPanic);
 
+fn hostNewDocument(ctx: *anyopaque) !void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (app.pending_png_path) |path| {
+        app.doOpenPath(path) catch |err| return err;
+        app.gpa.free(path);
+        app.pending_png_path = null;
+        try app.setProjectPath(null);
+        try app.autosave.clear();
+        try app.autosave.setPath(null);
+        return;
+    }
+    app.resetCanvasToSingleLayer();
+    if (app.current_path) |old| app.gpa.free(old);
+    app.current_path = null;
+    try app.setProjectPath(null);
+    try app.autosave.clear();
+    try app.autosave.setPath(null);
+}
+
+fn hostOpenDocument(ctx: *anyopaque, path: []const u8) !void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try loadProjectPath(app, path);
+    try app.recent.push(path);
+    try app.autosave.clear();
+    try app.autosave.setPath(path);
+}
+
+fn hostSaveDocument(ctx: *anyopaque, path: []const u8) !void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.syncPaletteToDoc();
+    const bytes = try core.document_io.encodeDocument(&app.doc, app.gpa);
+    defer app.gpa.free(bytes);
+    try appshell.file_safety.writeAtomic(app.io, path, bytes, .{ .backup = true });
+    try app.recent.push(path);
+    try app.autosave.clear();
+    try app.autosave.setPath(path);
+    try app.setProjectPath(path);
+}
+
+fn loadProjectPath(app: *App, path: []const u8) !void {
+    if (app.editingBlocked()) return error.EditingBlocked;
+    const new_doc = try core.document_io.loadDocument(app.io, app.gpa, path, CANVAS_W, CANVAS_H);
+    const preserved_next_handle = app.doc.undo.next_handle;
+    app.doc.deinit();
+    app.doc = new_doc;
+    app.doc.undo.next_handle = preserved_next_handle;
+    app.invalidateHistoryAfterDocReset();
+    app.doc.resyncActiveView(app.gpa);
+    app.canvas = app.doc.activeCanvas();
+    app.clampTimelineTarget();
+    app.applySystemFont();
+    app.canvas.clearSelection();
+    app.sel_in.discardFloat(app.gpa);
+    app.loadPaletteFromDoc();
+    app.syncPreviewCanvas();
+    try app.setProjectPath(path);
+}
+
+fn drawAppshellOverlay(ctx: *gui.Context, app: *const App) !void {
+    if (app.recovery != null) {
+        try ctx.draw_list.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
+        try ctx.draw_list.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
+        try ctx.draw_list.text(.{ .x = 100, .y = 438 }, "Recover autosaved changes?", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try ctx.draw_list.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
+        try ctx.draw_list.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
+        try ctx.draw_list.text(.{ .x = 120, .y = 489 }, "Recover", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try ctx.draw_list.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        return;
+    }
+    if (app.host.confirmation() != .none) {
+        try ctx.draw_list.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
+        try ctx.draw_list.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
+        try ctx.draw_list.text(.{ .x = 100, .y = 438 }, "Unsaved changes", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try ctx.draw_list.text(.{ .x = 100, .y = 458 }, "Save before continuing?", gui.Color.rgba(0xC0, 0xC8, 0xD8, 0xFF));
+        try ctx.draw_list.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
+        try ctx.draw_list.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
+        try ctx.draw_list.rectFilled(.{ .x = 390, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x50, 0x58, 0x68, 0xFF));
+        try ctx.draw_list.text(.{ .x = 120, .y = 489 }, "Save", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try ctx.draw_list.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try ctx.draw_list.text(.{ .x = 410, .y = 489 }, "Cancel", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+    }
+}
+
+fn finishHostResult(app: *App, result: appshell.document_host.Result) void {
+    switch (result) {
+        .applied, .allowed, .canceled => {},
+        else => return,
+    }
+    if (result == .canceled and app.pending_png_path != null) {
+        app.gpa.free(app.pending_png_path.?);
+        app.pending_png_path = null;
+        app.png_import_pending = false;
+    }
+    app.syncProjectState();
+    if (app.png_import_pending and result == .applied) {
+        app.png_import_pending = false;
+        app.markProjectDirty();
+    }
+    if (result == .allowed) app.running = false;
+}
+
+fn recoverAutosave(app: *App) !void {
+    const candidate = &(app.recovery orelse return error.NoRecoveryPending);
+    var decoded = try core.document_io.decodeDocument(candidate.envelope.snapshot, app.gpa);
+    errdefer decoded.deinit();
+    try app.host.adoptRecovered(candidate.envelope.original_path);
+    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    app.doc.deinit();
+    app.doc = decoded;
+    decoded = undefined;
+    app.invalidateHistoryAfterDocReset();
+    app.doc.resyncActiveView(app.gpa);
+    app.canvas = app.doc.activeCanvas();
+    app.clampTimelineTarget();
+    app.applySystemFont();
+    app.canvas.clearSelection();
+    app.sel_in.discardFloat(app.gpa);
+    app.loadPaletteFromDoc();
+    app.syncPreviewCanvas();
+    candidate.deinit();
+    app.recovery = null;
+    app.syncProjectState();
+    app.markProjectDirty();
+}
+
+fn discardRecovery(app: *App) !void {
+    const candidate = &(app.recovery orelse return error.NoRecoveryPending);
+    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    candidate.deinit();
+    app.recovery = null;
+    app.refreshTitle();
+}
+
+fn snapshotProject(ctx: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.syncPaletteToDoc();
+    app.doc.commitActiveLayerToCel(app.gpa, app.doc.selected_layer);
+    return core.document_io.encodeDocument(&app.doc, allocator);
+}
+
 fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     const self = try gpa.create(App);
     errdefer gpa.destroy(self);
@@ -4633,6 +5036,20 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     const onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
     errdefer gpa.free(onion_scratch);
 
+    const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
+    var data_dir = try appshell.paths.openAppDataDir(io, gpa, "pixie", override_path);
+    errdefer data_dir.close(io);
+    var autosave_dir = try appshell.paths.openAutosaveDir(io, data_dir);
+    errdefer autosave_dir.close(io);
+    var recent = appshell.recent_files.RecentFiles.init(gpa, 10);
+    errdefer recent.deinit();
+    _ = try recent.load(io, data_dir, "recent_files.ash");
+    _ = try recent.pruneMissing(io, std.Io.Dir.cwd());
+    var autosave_controller = try appshell.autosave.Controller.init(gpa, io, autosave_dir, null);
+    errdefer autosave_controller.deinit();
+    var recovery = try appshell.autosave.scan(gpa, io, autosave_dir);
+    errdefer if (recovery) |*candidate| candidate.deinit();
+
     // ここから infallible（所有は App へ移動。成功 return 時は上記 errdefer は発火しない）
     self.* = .{
         .io = io,
@@ -4649,7 +5066,19 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .system_font_bytes = system_font_bytes,
         .onion_buf = onion_buf,
         .onion_scratch = onion_scratch,
+        .data_dir = data_dir,
+        .autosave_dir = autosave_dir,
+        .recent = recent,
+        .autosave = autosave_controller,
+        .recovery = recovery,
     };
+
+    self.host = appshell.document_host.DocumentHost.init(gpa, .{
+        .ctx = self,
+        .newDocument = hostNewDocument,
+        .openDocument = hostOpenDocument,
+        .saveDocument = hostSaveDocument,
+    });
 
     self.canvas = self.doc.activeCanvas();
     self.applySystemFont();
@@ -4672,6 +5101,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
+    platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title state" });
     registerActions(self);
     registerStateSync(self);
     return self;
@@ -4679,6 +5109,17 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
 
 fn appDeinit(self: *App) void {
     const gpa = self.gpa;
+    if (self.recovery == null and !self.host.isDirty()) {
+        self.autosave.clear() catch |err| std.log.err("pixie: autosave clear failed: {s}", .{@errorName(err)});
+    }
+    self.recent.save(self.io, self.data_dir, "recent_files.ash") catch |err| std.log.err("pixie: recent save failed: {s}", .{@errorName(err)});
+    if (self.pending_png_path) |p| gpa.free(p);
+    self.host.deinit();
+    if (self.recovery) |*candidate| candidate.deinit();
+    self.autosave.deinit();
+    self.recent.deinit();
+    self.autosave_dir.close(self.io);
+    self.data_dir.close(self.io);
     if (self.current_path) |p| gpa.free(p);
     if (self.current_project_path) |p| gpa.free(p);
     if (self.palette_path) |p| gpa.free(p);
@@ -4718,8 +5159,17 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         self.rebuildMenuCommands();
 
         while (win.nextEvent()) |ev| {
+            if (self.recovery != null or self.host.confirmation() != .none) {
+                switch (ev) {
+                    .mouse_down => |m| self.handleConfirmationClick(m.x, m.y),
+                    .key_down => |k| if (k.key == .ESCAPE) finishHostResult(self, self.host.confirmCancel()),
+                    .quit => win.cancelQuit(),
+                    else => {},
+                }
+                continue;
+            }
             switch (ev) {
-                .quit => self.running = false, // ウィンドウクローズも同一経路
+                .quit => self.requestClose(win), // ウィンドウクローズも同一経路
                 // レイヤー名インライン編集中（TASK-79.3）・テキストレイヤー内容編集中
                 // （TASK-79.5、`text_in`。rename_in と対称・互いに同時 active にならない）は
                 // key_down を専用ハンドラへ回し、char_input で確定文字を追記する（TASK-22
@@ -4758,6 +5208,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         try buildUi(&self.ctx, self, canvas_rect);
         self.ctx.endFrame();
+        // endFrame が GUI の draw command を確定した後に追加し、確認 UI を最前面へ置く。
+        try drawAppshellOverlay(&self.ctx, self);
 
         // GUI fallback ドロップダウン（endFrame 後契約。popup.zig と同型）。
         {
@@ -5107,12 +5559,15 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 }
 
 fn appFrame(self: *App, win: *platform.Window, now: f64) !bool {
-    _ = now;
     try appFrameInner(self, win);
 
     // 安全点: framebuffer unlock 済み・当フレームの入力更新も完了。ここでモーダルを開く。
     // 終了要求と同フレームで保存/読込が pending でも、終了中はダイアログを開かない。
     if (self.running) self.runPendingFileOp();
+
+    if (self.running and self.recovery == null and !platform.netsyncActive()) {
+        _ = self.autosave.tick(now, self, snapshotProject) catch |err| self.setSaveMsg("Autosave failed: {s}", .{@errorName(err)});
+    }
 
     // フレーム末尾: 未記録 undoable 編集の検出 → redo 候補の epoch 失効（TASK-62.5.4 §2b）
     self.checkUnrecordedEdits();
