@@ -116,6 +116,18 @@ pub const layoutPopup = @import("popup.zig").layoutPopup;
 pub const itemRect = @import("popup.zig").itemRect;
 pub const hitTestItem = @import("popup.zig").hitTestItem;
 
+// Command 定義から生成するメニューバー / ドロップダウン（TASK-97.2）。
+// gui は Command を実行せず、選択 CommandId を返すだけ（app の dispatchCommand が所有）。
+pub const MenuBarState = @import("menu.zig").MenuBarState;
+pub const MenuBarResult = @import("menu.zig").MenuBarResult;
+pub const MENU_BAR_POPUP_ID = @import("menu.zig").MENU_BAR_POPUP_ID;
+pub const formatShortcut = @import("menu.zig").formatShortcut;
+pub const formatItemLabel = @import("menu.zig").formatItemLabel;
+pub const collectMenuTitles = @import("menu.zig").collectMenuTitles;
+pub const collectMenuCommands = @import("menu.zig").collectMenuCommands;
+pub const menuBar = @import("menu.zig").menuBar;
+pub const menuBarPopup = @import("menu.zig").menuBarPopup;
+
 // test-gui 用に各ファイルの test を収集する。
 // `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
 // namespace 全体を `_ = @import(...)` で参照して test ブロックを取り込む。
@@ -134,5 +146,6 @@ test {
     _ = @import("style.zig");
     _ = @import("widgets.zig");
     _ = @import("popup.zig");
+    _ = @import("menu.zig");
     _ = @import("stepgrid.zig");
 }

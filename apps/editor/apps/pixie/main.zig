@@ -87,6 +87,27 @@ const MARCH_PERIOD: f64 = 8.0;
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
 const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project, export_seq, export_sheet };
 
+// ── File/Edit/View Command 定義（TASK-97.2）────────────────────────────────
+// ID は stable。separator は INVALID_COMMAND_ID。GUI fallback / keyboard / menu_command が
+// 同じ App.dispatchCommand へ到達する。
+const CmdId = struct {
+    pub const open: platform.CommandId = 1;
+    pub const save: platform.CommandId = 2;
+    pub const save_as: platform.CommandId = 3;
+    pub const open_project: platform.CommandId = 4;
+    pub const save_project: platform.CommandId = 5;
+    pub const export_seq: platform.CommandId = 6;
+    pub const export_sheet: platform.CommandId = 7;
+    pub const save_palette: platform.CommandId = 8;
+    pub const load_palette: platform.CommandId = 9;
+    pub const undo: platform.CommandId = 10;
+    pub const redo: platform.CommandId = 11;
+    pub const toggle_panel: platform.CommandId = 12;
+    pub const toggle_timeline: platform.CommandId = 13;
+};
+
+const MENU_CMD_CAP = 24;
+
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
 /// ペイン分割（TASK-42）の明示 ID。CONTENT_ROW=横分割の利用可能幅、MAIN_AREA=縦分割の利用可能高 の基準。
@@ -241,7 +262,7 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
         .char_input => null,
         .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: pixie 未消費（cross-cutting Event 追加。他機能は無改造）
         .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: 97.2 の App.dispatchCommand 統合前は未消費
+        .menu_command => null, // TASK-97.2: App.dispatchCommand で消費（gui へは渡さない）
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -408,6 +429,16 @@ const App = struct {
     palette_path: ?[]u8 = null,
     /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
     pending_file_op: ?FileOp = null,
+    /// digest menu の last_op キー用ラッチ（TASK-97.2）: 直近に dispatch された FileOp。
+    /// 次の dispatch まで保持（情報提供のみ。真の未消費状態は pending キー = dialog_op/pending_file_op）。
+    /// headless では runPendingFileOp が同フレームで消費するため、「メニュー選択が FileOp を
+    /// 積んだ」ことは last_op で観測する。
+    menu_pending_probe: ?FileOp = null,
+    /// GUI fallback メニューバーの開閉（TASK-97.2）。
+    menu_bar_state: gui.MenuBarState = .{},
+    /// 毎フレーム再構築する Command 表（enabled/checked 反映。native updateMenu と同役割）。
+    menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
+    menu_command_count: usize = 0,
     /// wasm file picker 進行中の FileOp（TASK-73.3 修正1）。
     /// DialogPending のあいだはこの op だけを再試行し、待機中に pending_file_op へ積まれた別要求は破棄する
     /// （例: Cmd+O 待ち中の Cmd+Shift+S が picked path を誤って save_as に食わせない）。
@@ -2005,6 +2036,137 @@ const App = struct {
         return self.canvas.compositeStraight();
     }
 
+    /// File/Edit/View の共通実行入口（TASK-97.2）。
+    /// keyboard / GUI メニュー / menu_command イベントがここに集約する。
+    /// File 系は pending_file_op へ積むだけ（ダイアログは runPendingFileOp 安全点）。
+    /// Undo/Redo は既存 doUndo/doRedo（ハイブリッド userUndo + netsync route）を維持し、
+    /// 結果と undo 記録を変えない。
+    fn dispatchCommand(self: *App, id: platform.CommandId) void {
+        // stale event / disabled 項目の最終防御: 共通入口で Command 表の存在 + enabled を
+        // 再検証する。GUI click / shortcut は各自チェック済みだが、native/harness の
+        // menu_command イベントは ID をそのまま運ぶため、状態更新後の stale event でも
+        // disabled 項目を実行しない（エラーでなく無視）。
+        const cmd = self.findMenuCommand(id) orelse return;
+        if (!cmd.enabled) return;
+        switch (id) {
+            CmdId.open => {
+                self.pending_file_op = .open;
+                self.menu_pending_probe = .open;
+            },
+            CmdId.save => {
+                self.pending_file_op = .save;
+                self.menu_pending_probe = .save;
+            },
+            CmdId.save_as => {
+                self.pending_file_op = .save_as;
+                self.menu_pending_probe = .save_as;
+            },
+            CmdId.open_project => {
+                self.pending_file_op = .open_project;
+                self.menu_pending_probe = .open_project;
+            },
+            CmdId.save_project => {
+                self.pending_file_op = .save_project;
+                self.menu_pending_probe = .save_project;
+            },
+            CmdId.export_seq => {
+                self.pending_file_op = .export_seq;
+                self.menu_pending_probe = .export_seq;
+            },
+            CmdId.export_sheet => {
+                self.pending_file_op = .export_sheet;
+                self.menu_pending_probe = .export_sheet;
+            },
+            CmdId.save_palette => {
+                self.pending_file_op = .save_palette;
+                self.menu_pending_probe = .save_palette;
+            },
+            CmdId.load_palette => {
+                self.pending_file_op = .load_palette;
+                self.menu_pending_probe = .load_palette;
+            },
+            CmdId.undo => self.doUndo() catch {},
+            CmdId.redo => self.doRedo() catch {},
+            CmdId.toggle_panel => self.right_visible = !self.right_visible,
+            CmdId.toggle_timeline => self.bottom_visible = !self.bottom_visible,
+            else => {},
+        }
+    }
+
+    /// Command 表から id を検索（separator は対象外）。dispatchCommand の最終防御用。
+    fn findMenuCommand(self: *const App, id: platform.CommandId) ?platform.Command {
+        if (id == 0) return null;
+        for (self.menu_commands[0..self.menu_command_count]) |cmd| {
+            if (cmd.kind == .separator) continue;
+            if (cmd.id == id) return cmd;
+        }
+        return null;
+    }
+
+    /// 現在の app 状態から Command 表を再構築（checked = Panel/Timeline 表示状態）。
+    fn rebuildMenuCommands(self: *App) void {
+        const accel_mod: platform.ModifierFlags = if (builtin.os.tag == .macos)
+            .{ .cmd = true }
+        else
+            .{ .ctrl = true };
+        const accel_shift: platform.ModifierFlags = if (builtin.os.tag == .macos)
+            .{ .cmd = true, .shift = true }
+        else
+            .{ .ctrl = true, .shift = true };
+
+        var n: usize = 0;
+        const put = struct {
+            fn go(app: *App, idx: *usize, cmd: platform.Command) void {
+                if (idx.* >= MENU_CMD_CAP) return;
+                app.menu_commands[idx.*] = cmd;
+                idx.* += 1;
+            }
+        }.go;
+
+        put(self, &n, .{ .id = CmdId.open, .label = "Open", .menu = .{ .title = "File", .order = 100 }, .shortcut = .{ .key = .O, .modifiers = accel_mod } });
+        put(self, &n, .{ .id = CmdId.save, .label = "Save", .menu = .{ .title = "File", .order = 101 }, .shortcut = .{ .key = .S, .modifiers = accel_mod } });
+        put(self, &n, .{ .id = CmdId.save_as, .label = "Save As", .menu = .{ .title = "File", .order = 102 }, .shortcut = .{ .key = .S, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 103 } });
+        put(self, &n, .{ .id = CmdId.open_project, .label = "Prj Open", .menu = .{ .title = "File", .order = 104 } });
+        put(self, &n, .{ .id = CmdId.save_project, .label = "Prj Save", .menu = .{ .title = "File", .order = 105 } });
+        put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 106 } });
+        put(self, &n, .{ .id = CmdId.export_seq, .label = "Exp Seq", .menu = .{ .title = "File", .order = 107 } });
+        put(self, &n, .{ .id = CmdId.export_sheet, .label = "Exp Sheet", .menu = .{ .title = "File", .order = 108 } });
+        put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 109 } });
+        put(self, &n, .{ .id = CmdId.save_palette, .label = "Pal Save", .menu = .{ .title = "File", .order = 110 } });
+        put(self, &n, .{ .id = CmdId.load_palette, .label = "Pal Load", .menu = .{ .title = "File", .order = 111 } });
+
+        put(self, &n, .{ .id = CmdId.undo, .label = "Undo", .menu = .{ .title = "Edit", .order = 200 }, .shortcut = .{ .key = .Z, .modifiers = accel_mod }, .execution_policy = .undo });
+        put(self, &n, .{ .id = CmdId.redo, .label = "Redo", .menu = .{ .title = "Edit", .order = 201 }, .shortcut = .{ .key = .Z, .modifiers = accel_shift }, .execution_policy = .redo });
+
+        put(self, &n, .{ .id = CmdId.toggle_panel, .label = "Panel", .menu = .{ .title = "View", .order = 300 }, .checked = self.right_visible });
+        put(self, &n, .{ .id = CmdId.toggle_timeline, .label = "Timeline", .menu = .{ .title = "View", .order = 301 }, .checked = self.bottom_visible });
+
+        self.menu_command_count = n;
+    }
+
+    fn menuCommandsSlice(self: *App) []const platform.Command {
+        return self.menu_commands[0..self.menu_command_count];
+    }
+
+    /// GUI fallback 環境のショートカット照合（single-owner = アプリ側。TASK-97.2 plan 4）。
+    /// primary accel は cmd または ctrl（既存 handleKey と同じ）。
+    fn matchMenuShortcut(self: *const App, k: platform.KeyEvent) ?platform.CommandId {
+        const accel = k.modifiers.cmd or k.modifiers.ctrl;
+        for (self.menu_commands[0..self.menu_command_count]) |cmd| {
+            if (cmd.kind == .separator) continue;
+            if (!cmd.enabled) continue;
+            const sc = cmd.shortcut orelse continue;
+            if (sc.key != k.key) continue;
+            const want_accel = sc.modifiers.cmd or sc.modifiers.ctrl;
+            if (want_accel != accel) continue;
+            if (sc.modifiers.shift != k.modifiers.shift) continue;
+            if (sc.modifiers.alt != k.modifiers.alt) continue;
+            return cmd.id;
+        }
+        return null;
+    }
+
     fn handleKey(self: *App, k: platform.KeyEvent) void {
         // Space はパン用 modifier（押下継続を追跡。解放は handleKeyUp）。他処理には回さない。
         if (k.key == .SPACE) {
@@ -2029,6 +2191,12 @@ const App = struct {
         // （Ctrl+S 等は Linux の保存の慣習にも合致。macOS は従来どおり Cmd で、Ctrl も追加で効く）。
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         if (k.key == .ESCAPE) {
+            // メニュー表示中の Esc はメニューを閉じるだけ（アプリ終了に落とさない）。
+            // popup 本体は次の menuBarPopup が open_title==null を見て閉じる。
+            if (self.menu_bar_state.open_title != null) {
+                self.menu_bar_state.open_title = null;
+                return;
+            }
             // シェイプ/選択ドラッグ中なら破棄 → 選択(またはフロート)があれば解除 → それ以外は終了
             if (self.shape_in.state != .idle) {
                 self.shape_in.cancel();
@@ -2042,16 +2210,9 @@ const App = struct {
             }
         } else if (k.key == .Q and accel) {
             self.running = false;
-        } else if (k.key == .S and accel and k.modifiers.shift) {
-            self.pending_file_op = .save_as;
-        } else if (k.key == .S and accel) {
-            self.pending_file_op = .save;
-        } else if (k.key == .O and accel) {
-            self.pending_file_op = .open;
-        } else if (k.key == .Z and accel and k.modifiers.shift) {
-            self.doRedo() catch {};
-        } else if (k.key == .Z and accel) {
-            self.doUndo() catch {};
+        } else if (self.matchMenuShortcut(k)) |cmd_id| {
+            // File/Edit ショートカットは Command 表経由（single-owner。GUI メニューと同じ入口）。
+            self.dispatchCommand(cmd_id);
         } else if (k.key == .C and accel) {
             self.doCopy(); // accel+C は copy（bare C の clear より前に判定）
             // システム clipboard へ現在色 #RRGGBB（wasm Clipboard API。TASK-73.3）
@@ -2172,6 +2333,34 @@ fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return std.fmt.bufPrint(buf, "{{\"depth\":{d},\"redo\":{d}}}", .{
         app.doc.undo.undo.items.len, app.doc.undo.redo.items.len,
+    }) catch buf[0..0];
+}
+
+/// menu digest（TASK-97.2）: 開閉・項目数・enabled/checked mask・pending_file_op。
+/// `open=<title|none> items=<n> enabled=<hex> checked=<hex> pending=<tag|none>`
+/// enabled/checked は非 separator 項目の出現順ビット（bit0=先頭の item）。
+fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const open = if (app.menu_bar_state.open_title) |t| t else "none";
+    var enabled_mask: u32 = 0;
+    var checked_mask: u32 = 0;
+    var items: u32 = 0;
+    for (app.menu_commands[0..app.menu_command_count]) |cmd| {
+        if (cmd.kind == .separator) continue;
+        if (items >= 32) break;
+        const bit: u32 = @as(u32, 1) << @intCast(items);
+        if (cmd.enabled) enabled_mask |= bit;
+        if (cmd.checked) checked_mask |= bit;
+        items += 1;
+    }
+    // pending = 実際に未消費の FileOp（dialog 進行中を優先。真の状態）。
+    // last_op = 直近に dispatch された FileOp のラッチ（次の dispatch まで保持。headless では
+    // 同フレームで消費されるため「メニュー選択が FileOp を積んだ」ことはこちらで観測する）。
+    const live_pending = app.dialog_op orelse app.pending_file_op;
+    const pending = if (live_pending) |op| @tagName(op) else "none";
+    const last_op = if (app.menu_pending_probe) |op| @tagName(op) else "none";
+    return std.fmt.bufPrint(buf, "open={s} items={d} enabled={X:0>8} checked={X:0>8} pending={s} last_op={s}", .{
+        open, items, enabled_mask, checked_mask, pending, last_op,
     }) catch buf[0..0];
 }
 fn undoSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -4097,29 +4286,16 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         .gap = 4,
     });
 
-    // ── 1 段目: menu bar ──
+    // ── 1 段目: menu bar（Command 定義から File/Edit/View。TASK-97.2）──
     ctx.beginBox(.{
         .direction = .row,
         .width = .{ .grow = 1 },
         .padding = .{ 4, 4, 4, 4 },
-        .gap = 5, // TASK-63: プロジェクトボタン 2 個追加で横溢れするため 8→5 に詰める
+        .gap = 5,
         .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
     });
-    if (ctx.button("Open")) app.pending_file_op = .open;
-    if (ctx.button("Save")) app.pending_file_op = .save;
-    if (ctx.button("Save As")) app.pending_file_op = .save_as;
-    // .pix プロジェクト（レイヤー保持）。PNG 保存とは別（TASK-63）。ラベルは "Pal" と対の短縮 "Prj"
-    if (ctx.button("Prj Open")) app.pending_file_op = .open_project;
-    if (ctx.button("Prj Save")) app.pending_file_op = .save_project;
-    if (ctx.button("Exp Seq")) app.pending_file_op = .export_seq;
-    if (ctx.button("Exp Sheet")) app.pending_file_op = .export_sheet;
-    if (ctx.button("Undo")) app.doUndo() catch {};
-    if (ctx.button("Redo")) app.doRedo() catch {};
-    if (ctx.button("Pal Save")) app.pending_file_op = .save_palette;
-    if (ctx.button("Pal Load")) app.pending_file_op = .load_palette;
-    // ペイン表示トグル（TASK-42）
-    if (ctx.buttonEx("Panel", .{ .selected = app.right_visible }).clicked) app.right_visible = !app.right_visible;
-    if (ctx.buttonEx("Timeline", .{ .selected = app.bottom_visible }).clicked) app.bottom_visible = !app.bottom_visible;
+    app.rebuildMenuCommands();
+    gui.menuBar(ctx, app.menuCommandsSlice(), &app.menu_bar_state);
     ctx.endBox();
 
     // ── main area: content row(canvas + 右ペイン) + 任意の下ペイン（TASK-42。縦分割の基準 ID） ──
@@ -4495,6 +4671,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     // TASK-45.4: timeline 再生状態（digest のみ・snapshot=null）
     platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
+    platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
     registerActions(self);
     registerStateSync(self);
     return self;
@@ -4537,6 +4714,9 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         self.ctx.beginFrame(fb.width, fb.height);
 
+        // Command 表をイベント処理前に更新（ショートカット照合・probe 用。checked 反映）。
+        self.rebuildMenuCommands();
+
         while (win.nextEvent()) |ev| {
             switch (ev) {
                 .quit => self.running = false, // ウィンドウクローズも同一経路
@@ -4557,6 +4737,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 else if (self.text_in.active)
                     self.text_in.appendCodepoint(c.codepoint),
                 .composition_changed => self.composition_dirty = true,
+                .menu_command => |id| self.dispatchCommand(id),
                 else => {},
             }
             // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
@@ -4577,6 +4758,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         try buildUi(&self.ctx, self, canvas_rect);
         self.ctx.endFrame();
+
+        // GUI fallback ドロップダウン（endFrame 後契約。popup.zig と同型）。
+        {
+            const menu_res = gui.menuBarPopup(&self.ctx, self.menuCommandsSlice(), &self.menu_bar_state);
+            if (menu_res.selected) |id| self.dispatchCommand(id);
+            // View トグル後に checked を即反映（同一フレームの probe 用）
+            if (menu_res.selected != null) self.rebuildMenuCommands();
+        }
 
         // IME 候補窓の基準 caret。rect cache は endFrame 後に確定するため、この時点で供給する。
         // preedit の有無でゲートしない: IME は composition 開始打鍵の handleEvent 中（= app が
