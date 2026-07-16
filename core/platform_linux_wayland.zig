@@ -17,7 +17,7 @@
 //!
 //! C-interop 規約: wayland/xdg/xkb ヘッダは bare struct（typedef 無し）のため、型は
 //! `c.struct_wl_*`/`c.struct_xdg_*`、関数/enum 定数は C 名そのまま（`c.wl_*`/`c.WL_SHM_FORMAT_*`）。
-//! 最終的な field 型・nullable・listener signature は shiso の compile で確定する（macOS では
+//! 最終的な field 型・nullable・listener signature は Linux 実機の compile で確定する（macOS では
 //! Linux 専用 @cImport のため本ファイルはコンパイルされない）。
 
 const std = @import("std");

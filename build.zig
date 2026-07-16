@@ -2499,7 +2499,7 @@ fn addCaptureDemoExe(
 //
 // Linux は pkg-config 名 "alsa"（.pc は alsa-lib-dev が提供）を渡す。これで pkg-config が
 // `-lasound` と lib パスの両方を解決する。ライブラリ名 "asound" を直接渡すと .pc が無く、
-// zig は既存の -L（X11 等）しか探さず libasound.so を見つけられない（shiso 実ビルドで確認）。
+// zig は既存の -L（X11 等）しか探さず libasound.so を見つけられない（Linux 実ビルドで確認）。
 // ============================================================
 fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {

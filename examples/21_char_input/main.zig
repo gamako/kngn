@@ -1,7 +1,7 @@
 //! 21_char_input: TASK-22 の `char_input`（確定テキスト文字。UTF-32 codepoint）を単体で確認する
 //! 最小サンプル。pixie の rename や capture demo に混ぜず「文字入力だけ」を見られる vehicle で、
 //! 全 backend（macOS objc/swift/metal・Linux x11/wayland・Windows gdi/d3d11）の char_input 発火を
-//! 実機で目視確認する土台にする（walle-win の Windows・shiso の x11/wayland にも流用）。
+//! 実機で目視確認する土台にする（Windows・Linux x11/wayland にも流用）。
 //!
 //! フォントは **OS のシステムフォントをランタイム読込**する（example_12 と同じ方式。日本語 .ttc を
 //! 優先し ASCII も 1 本で混在描画。再配布でないので repo にアセットを持たず・ネットワーク取得も不要）。

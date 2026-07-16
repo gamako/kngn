@@ -75,7 +75,7 @@ pub fn modifiersFromActive(shift: bool, ctrl: bool, alt: bool, super: bool) Modi
 //
 // Wayland は「正 = 下 / 右」。X11 wheelDelta は up=+16/down=-16, left=+16/right=-16 なので
 // 縦横とも符号を反転する。1 notch = ±SCROLL_LINE_TO_POINTS。
-// 最終的な符号/係数の体感は shiso 実機で確認する（plan §3.10）。
+// 最終的な符号/係数の体感は Linux 実機で確認する（plan §3.10）。
 // ============================================================================
 
 pub const ScrollDelta = struct { dx: f32 = 0, dy: f32 = 0 };
@@ -91,7 +91,7 @@ pub fn discreteScroll(axis: u32, discrete: i32) ScrollDelta {
 }
 
 /// continuous（`wl_pointer.axis` の wl_fixed）→ ScrollDelta（discrete が無い compositor の fallback）。
-/// 係数は wl_fixed→point の 1:1（fixed/256）を起点にし、体感は shiso で調整する。
+/// 係数は wl_fixed→point の 1:1（fixed/256）を起点にし、体感は Linux 実機で調整する。
 pub fn continuousScroll(axis: u32, value_fixed: i32) ScrollDelta {
     const v = @as(f32, @floatFromInt(value_fixed)) / 256.0;
     return switch (axis) {

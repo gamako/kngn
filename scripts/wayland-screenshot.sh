@@ -17,8 +17,8 @@
 #   SETTLE_SECS              クライアント起動後、撮影までの待ち秒（既定 1.5）
 #   ALLOW_CLIENT_EXIT        1 なら、撮影前にクライアントが終了しても続行（既定 0=失敗扱い）
 #
-# 注: headless compositor の起動法・出力名・screenshooter の権限は実機（shiso）依存のため、
-# 実起動・撮影は shiso で検証して調整する。macOS では実行できない（bash -n の構文確認のみ可）。
+# 注: headless compositor の起動法・出力名・screenshooter の権限は実機（Linux）依存のため、
+# 実起動・撮影は Linux 実機で検証して調整する。macOS では実行できない（bash -n の構文確認のみ可）。
 set -euo pipefail
 
 if [ "$#" -lt 1 ]; then
@@ -94,7 +94,7 @@ else
 fi
 
 if [ -z "${WAYLAND_DISPLAY:-}" ] || [ ! -S "$runtime_dir/$WAYLAND_DISPLAY" ]; then
-  echo "error: $COMPOSITOR の Wayland socket が現れませんでした（headless 起動可否を shiso で確認）" >&2
+  echo "error: $COMPOSITOR の Wayland socket が現れませんでした（headless 起動可否を Linux 実機で確認）" >&2
   exit 1
 fi
 export WAYLAND_DISPLAY

@@ -41,8 +41,8 @@ const V4L2_PIX_FMT_YUYV: u32 = @as(u32, 'Y') | (@as(u32, 'U') << 8) | (@as(u32, 
 
 // Linux x86_64 videodev2.h: _IOC(dir,type,nr,size), with dir=1 write/2 read,
 // type='V', and the ioctl numbers listed in the UAPI header. The resulting values
-// are stable for the x86_64 target used by this backend; shiso must still compare
-// these against a C program including <linux/videodev2.h>.
+// are stable for the x86_64 target used by this backend; verification on the target
+// Linux host must still compare these against a C program including <linux/videodev2.h>.
 const IOC_WRITE: c_ulong = 1;
 const IOC_READ: c_ulong = 2;
 const IOC_TYPEBITS: c_ulong = 8;
@@ -141,8 +141,8 @@ const v4l2_buffer = extern struct {
 };
 
 // These are deliberately compile-time ABI tripwires. Values are the x86_64
-// Linux UAPI measurements; shiso verification must compare sizeof/offsetof to
-// a C program including <linux/videodev2.h> before real-device sign-off.
+// Linux UAPI measurements; verification on the target Linux host must compare
+// sizeof/offsetof to a C program including <linux/videodev2.h> before real-device sign-off.
 comptime {
     std.debug.assert(@sizeOf(v4l2_format) == 208);
     std.debug.assert(@offsetOf(v4l2_format, "pix") == 8);

@@ -164,7 +164,7 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | **Swift**       | `platform/macos-swift/platform_macos.swift`       | CADisplayLink | ✅ 完全動作           |
 | **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ✅ 1級 frame pacing 対応（TASK-36） |
 | **X11 (Linux)** | `core/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
-| **Wayland (Linux)** | `core/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。shiso 実機検証済み） |
+| **Wayland (Linux)** | `core/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。Linux 実機検証済み） |
 | **GDI (Windows)** | `core/platform_windows_gdi.zig`（純 Zig / Win32 直接） | GDI `StretchDIBits`（software blit） | ✅ best-effort backend（TASK-31/35） |
 | **D3D11 (Windows)** | `core/platform_windows_d3d11.zig`（純 Zig / COM 手書き vtbl） | D3D11-DXGI swap chain（upload path） | ✅ 1級 frame pacing 対応（TASK-35） |
 
@@ -182,7 +182,7 @@ lifecycle 警告を解消。`displaySyncEnabled` 明示で fifo（display refres
 `platform_windows_common.zig`）。`-Dplatform` の有効値は OS で変わる:
 
 - **macOS**: `objc`（既定）/ `swift` / `metal`
-- **Linux**: `x11`（既定）/ `wayland`。wayland は TASK-28.5 で display/入力/pixie まで実装し shiso 実機で
+- **Linux**: `x11`（既定）/ `wayland`。wayland は TASK-28.5 で display/入力/pixie まで実装し Linux 実機で
   検証済み（busy loop の present flood は frame callback(vsync)律速で対処）。
 - **Windows**: `gdi`（既定、best-effort）/ `d3d11`（1級 frame pacing）。純 Zig で Win32 API を extern fn /
   COM 手書き vtbl で直接呼ぶ（TASK-31/35）。
@@ -195,14 +195,8 @@ lifecycle 警告を解消。`displaySyncEnabled` 明示で fifo（display refres
 `flake.nix` は `aarch64-darwin` と `x86_64-linux` の 2 system を提供する。Linux 側 devShell は
 zig 0.16 + zls + X11 dev lib（`libX11`/`libXext`）+ Xvfb（`xorgserver`）+ `xwd` + `ffmpeg` + `zenity` + `xdotool`（入力合成）を含む。
 
-**ソース転送（jackjack / shiso は jj/git remote 無し）**: Mac から `scripts/sync-to.sh <host>` で
-`video-proto-main/` を `<host>:~/video-proto-main/` へ rsync ミラーしてから現地でネイティブビルドする。
-`.zig-cache`/`zig-out`/`.git`/`.jj`/`.DS_Store` は除外するので現地のビルドキャッシュは保持される。
-
-```bash
-bash scripts/sync-to.sh jackjack        # 転送（shiso も同様にホスト名を渡す）
-bash scripts/sync-to.sh -n jackjack     # dry-run（--delete の前に差分確認）
-```
+> **ソース転送**: Linux/Windows の実機へソースを送って現地でネイティブビルドする転送スクリプトは、
+> 実機ホスト名を含むため上位メタリポ側（`tools/`）に置く。手順はメタリポの `AGENTS.md` を参照。
 
 入力（key/mouse/scroll/modifier）は `core/platform_linux_x11.zig` が XEvent を変換する（TASK-28.3。dispatcher 化で 28.5.1 にファイル移動）。物理キーは evdev
 X keycode 表で `KeyCode` へ（layout 非依存・KeySym 不使用）。純粋な変換ロジックは `core/platform_linux_input.zig`
@@ -226,7 +220,7 @@ nix develop --command bash scripts/xvfb-screenshot.sh out.png -- zig-out/bin/vid
 #### Wayland backend（`-Dplatform=wayland`、TASK-28.5）
 
 Wayland backend（`core/platform_linux_wayland.zig`、wl_shm + xdg-shell + wl_keyboard/pointer + xkbcommon）は
-**実コンパイル/表示/入力に Linux + Wayland ライブラリと実セッションが必要**で、macOS では検証できない（shiso 等の Linux で確認）。
+**実コンパイル/表示/入力に Linux + Wayland ライブラリと実セッションが必要**で、macOS では検証できない（Linux 実機で確認）。
 純粋な入力変換は `core/platform_wayland_input.zig`（`@cImport` しない純 Zig）に分離し、`zig build test-platform-wayland-input` で
 **display 無しでも単体テストできる**（macOS/集約 `test` に含む）。物理キーは X11 と同じ evdev+8 表で `KeyCode` へ（layout 非依存）。
 
@@ -247,13 +241,13 @@ nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/
 WAYLAND_SHOT_COMPOSITOR=weston nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/video_proto
 ```
 
-> compositor の headless 起動法・出力名・screenshooter 権限は **実機（shiso）依存**で、最終調整は shiso で行う
+> compositor の headless 起動法・出力名・screenshooter 権限は **Linux 実機依存**で、最終調整は Linux 実機で行う
 > （macOS では Wayland を実行できない。スクリプトは `bash -n` の構文確認のみ可能）。
 
 **入力合成の現実解と自動化範囲（TASK-28.5.5）**: X11 の `xdotool` のような統一手段は Wayland に無い。
 
 - **keyboard**: `wtype`（Wayland virtual-keyboard protocol）。compositor の対応に依存（headless sway/weston で
-  効くかは shiso 確認）。compositor の socket が専用 `XDG_RUNTIME_DIR` 配下にある場合はそれも渡す:
+  効くかは Linux 実機で確認）。compositor の socket が専用 `XDG_RUNTIME_DIR` 配下にある場合はそれも渡す:
   `XDG_RUNTIME_DIR=<dir> WAYLAND_DISPLAY=wayland-N wtype a`（実 session なら既存の環境変数のまま `wtype a`）。
 - **mouse / scroll**: compositor 固有手段か `ydotool`。`ydotool` は `/dev/uinput` の権限（root / `input` グループ /
   systemd サービス）が要り CI 的自動化のリスクが大きいため、**devShell には含めず手動確認レンジ**とする。
@@ -359,8 +353,8 @@ libasound が dlopen）を通る。`run-example_15` / `run-synth` が Linux で�
    `snd_pcm_hw_params` が失敗するのを hw_params の問題と疑ったが、実機調査で真因は sink 不在（ENOENT）と判明。
    sink さえあれば現行 `period`/`buffer` の組合せがそのまま通る。
 
-> 検証機 jackjack は NixOS（version 表示は 26.11 だが実体は **nixos-unstable**。`nixos-26.11` ブランチは未存在）。
-> jackjack で Apple T2 は `apple-t2x4.conf` プロファイルで Speakers/Headphones sink を生成する。
+> 検証機が NixOS の場合、version 表示は 26.11 でも実体は **nixos-unstable** のことがある（`nixos-26.11`
+> ブランチは未存在）。Apple T2 機では `apple-t2x4.conf` プロファイルで Speakers/Headphones sink を生成する。
 
 ## モジュラーシンセ層（TASK-40 ファミリー）
 
@@ -603,9 +597,9 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
   `harness.parseConfig()` が走らないため `VP_HARNESS_HEADLESS` を解釈できない（headless 判定は
   `platform.init()` 起点）。もっとも harness 自体は frame loop（`window.pollEvents()`）駆動が前提であり、
   window を持たないアプリは元々 replay スクリプトで駆動できない（`step` 相当の同期点が無い）ため実害は無い。
-- 実機検証済み（2026-07-04）: **Linux は shiso**（Ubuntu・VPN 経由の純 SSH）で x11/wayland build 緑、
+- 実機検証済み（2026-07-04）: **Linux（Ubuntu・VPN 経由の純 SSH）**で x11/wayland build 緑、
   `DISPLAY`/`WAYLAND_DISPLAY` を unset した純 SSH で headless replay 動作（fb crc が mac と bit 一致）、
-  sink 不在でも `audio_null` が発音（`digest audio` f0≈262Hz・silent=0）。**Windows は walle-win** で
+  sink 不在でも `audio_null` が発音（`digest audio` f0≈262Hz・silent=0）。**Windows 実機**で
   gdi/d3d11 の full build 緑、純 Zig の `test-harness`/`test-audio-null` も compile+pass（facade 型変更が
   Windows backend で compile 確認。runtime headless は OS 非依存で mac/Linux 実証済み）。
 

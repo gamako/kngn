@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    # alsa-lib のみ host(検証機 jackjack は nixos-unstable。version は NixOS 26.11 と表示)と同版に
+    # alsa-lib のみ host(検証機は nixos-unstable。version は NixOS 26.11 と表示)と同版に
     # 揃えるための追加 pin (TASK-28.7.1)。host の pipewire ALSA プラグイン(/etc/alsa/conf.d が絶対パスで
     # 指定、unstable の alsa-lib 1.2.15.3 でビルド)を dlopen するには、アプリがリンクする libasound が
     # そのビルド版以上である必要がある。25.11 の 1.2.14 では古く plugin が開けず NoDevice になるため、
@@ -27,7 +27,7 @@
       zlsFor = system: zls.packages.${system}.default;
       # alsa-lib は host(nixos-unstable) と同 version/src を使うが、ビルドは 25.11 の stdenv で行う
       # （理由は nixpkgs-audio input のコメント参照）。unstable の alsa-lib を「丸ごと」使うと unstable の
-      # glibc(2.42)を引き込み、古い system glibc の distro(例: Ubuntu 24.04=shiso)で GLIBC_ABI_* 不一致で
+      # glibc(2.42)を引き込み、古い system glibc の distro(例: Ubuntu 24.04)で GLIBC_ABI_* 不一致で
       # 実行不能になる。そこで 25.11 の alsa-lib derivation を base に version/src だけ newer に差し替え、
       # glibc は 25.11 のまま（=従来 distro 互換）で alsa symbol だけ 1.2.15.3 に上げる。
       alsaLibFor = system:
@@ -68,7 +68,7 @@
             # Wayland headless 検証 (TASK-28.5.5): headless compositor + screenshot + keyboard 合成。
             # sway(WLR_BACKENDS=headless)+grim を既定、weston(headless backend)+weston-screenshooter を代替に
             # scripts/wayland-screenshot.sh が使う。keyboard 合成は wtype。属性名は nix eval で存在確認済みだが、
-            # headless 起動可否/screenshot/入力の実動作は shiso で確認する。mouse/scroll は ydotool(uinput 権限が
+            # headless 起動可否/screenshot/入力の実動作は Linux 実機で確認する。mouse/scroll は ydotool(uinput 権限が
             # 重い)を要するため devShell には入れず手動確認レンジとする（AGENT.md 参照）。
             pkgs.sway
             pkgs.grim

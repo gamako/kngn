@@ -164,7 +164,7 @@ pub fn createPlatformModule(
 //
 // Wayland の window 管理は xdg-shell プロトコルで行う。手書きせず標準経路の `wayland-scanner`
 // で client-header(.h) と private-code(.c) を build 時生成する。`xdg-shell.xml` は
-// `pkg-config --variable=pkgdatadir wayland-protocols` から引く（shiso/nix devShell 前提）。
+// `pkg-config --variable=pkgdatadir wayland-protocols` から引く（nix devShell 前提）。
 //
 // 生成は backend×exe ごとに走るが、macOS が setupExecutableForPlatform 内で platform_macos.m を
 // exe ごとに clang する既存スタイルと対称で、helper シグネチャを増やさずに済む（scanner は軽量）。
@@ -193,7 +193,7 @@ fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
 
 // xdg-decoration protocol glue（TASK-28.5.6。SSD 要求 / CSD フォールバック）
 // xdg-shell と同型。XML は wayland-protocols の unstable/xdg-decoration。2026-07 時点で本家は staging へ
-// 未移動（unstable/ のまま）。万一パスが外れたら shiso で
+// 未移動（unstable/ のまま）。万一パスが外れたら Linux 実機で
 // `find "$(pkg-config --variable=pkgdatadir wayland-protocols)" -iname '*decoration*'` で実パス確認。
 // wl_subcompositor は wayland-client 本体の interface（wayland-client.h に宣言済み）なので scanner 生成は不要。
 
