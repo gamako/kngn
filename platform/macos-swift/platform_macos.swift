@@ -92,6 +92,9 @@ class EventQueue {
     }
 
     // キューに push (満杯なら drop カウンタを増やして捨てる)
+    // token は gamepad connect の後追い無効化にのみ使う。他の呼び出し元は戻り値不要のため
+    // @discardableResult（swiftc の unused-result 警告を抑止。objc 側の queue_push と同じ扱い）。
+    @discardableResult
     func push(_ ev: PlatformEvent) -> EventQueueToken? {
         let next_head = (head + 1) % EVENT_QUEUE_SIZE
         if next_head == tail {
