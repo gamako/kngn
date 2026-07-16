@@ -107,6 +107,9 @@ pub const Context = struct {
     /// null = 閉じている。非 null 時は buttonBehavior が背後 widget の hover/active 取得を
     /// 抑止する（モーダル吸収。詳細は buttonBehavior の doc comment / popup.zig 参照）。
     popup_state: ?PopupState = null,
+    /// IME composition（preedit）の frame-local 状態。beginFrame で空に戻り、
+    /// アプリが widget 呼び出し前に setComposition で毎フレーム設定する（TASK-113.3）。
+    composition: input_mod.CompositionState = .{},
 
     // ── widget 層（TASK-21.5）。実装は widgets.zig（メソッド構文用の alias） ──
     pub const button = widgets.button;
@@ -199,6 +202,7 @@ pub const Context = struct {
         self.input.beginFrame();
         self.id_stack.clear();
         self.state.beginFrame();
+        self.composition = .{};
         self.draw_list.reset(screen_w, screen_h);
         // レイアウトツリーの暗黙 root（caller は気にせず beginBox から使う）
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");
@@ -243,6 +247,13 @@ pub const Context = struct {
     pub fn pushEvent(self: *Context, ev: InputEvent) void {
         std.debug.assert(self.frame_active);
         self.input.pushEvent(ev);
+    }
+
+    /// IME composition 状態を frame-local に設定する。`text` は caller 所有の借用 slice
+    /// （endFrame の描画まで有効）。platform 型は受け取らない（ADR-007）。
+    pub fn setComposition(self: *Context, state: input_mod.CompositionState) void {
+        std.debug.assert(self.frame_active);
+        self.composition = state;
     }
 
     /// popup 表示中（TASK-79.1）は背後 widget の buttonBehavior が hover を一切立てなくなり

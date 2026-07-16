@@ -36,6 +36,7 @@ pub const Input = @import("input.zig").Input;
 pub const MouseButtons = @import("input.zig").MouseButtons;
 pub const ModifierFlags = @import("input.zig").ModifierFlags;
 pub const Vec2f = @import("input.zig").Vec2f;
+pub const CompositionState = @import("input.zig").CompositionState;
 
 pub const Id = @import("id.zig").Id;
 pub const IdStack = @import("id.zig").IdStack;

@@ -60,6 +60,9 @@ pub const TextInputResult = struct {
     focused: bool = false,
     selection: TextRange = .{ .start = 0, .end = 0 },
     copy_request: ?CopyRequest = null,
+    /// TextInput box 左上原点のローカル caret rect。非 focus 時は null。
+    /// 絶対座標は endFrame 後に `getNodeRect(id)` と合成する（TASK-113.3）。
+    caret_rect: ?Rect = null,
 };
 
 pub const ButtonOpts = struct {
@@ -312,6 +315,7 @@ const SelectableLabelDraw = struct {
 };
 
 /// 単一行 TextInput。編集は event queue の順序を保ったまま focused ID だけが消費する。
+/// composition（IME preedit）も focused ID のみが消費する（TASK-113.3）。
 pub fn textInputId(
     ctx: *Context,
     id: Id,
@@ -354,11 +358,17 @@ pub fn textInputId(
         }
     }
 
+    const focused = ctx.focusedId() == id;
+    // 同一 frame に別 input へ mouse press がある場合、旧 focused が composition / キーを誤消費しない。
+    const input_owner = focused and (!ctx.input.mouse_pressed.left or claimed_here);
+    // composition は focused（かつ input_owner）の TextInput のみが消費する（付記1）。
+    const composing = input_owner and ctx.composition.active;
+
     var changed = false;
     var copy_request: ?CopyRequest = null;
     // 同一 frame に別 input への mouse press が先に focus を移す場合、widget 呼び出し順で
     // 旧 focused ID が後続 key/char event を誤消費しないよう、claim した widget だけ許可する。
-    if (ctx.focusedId() == id and (!ctx.input.mouse_pressed.left or claimed_here)) {
+    if (input_owner) {
         for (ctx.input.orderedTextEvents()) |event| switch (event) {
             .key_down => |key| {
                 const shift = key.modifiers & 0x01 != 0;
@@ -369,6 +379,9 @@ pub fn textInputId(
                         const end = text_edit.byteIndex(buffer.slice(), selection.end);
                         copy_request = .{ .id = id, .text = buffer.slice()[start..end] };
                     }
+                } else if (composing and isCompositionBlockedEditKey(key.code)) {
+                    // composition 中は文書を変更する編集・移動キーを無視する。
+                    // char_input（commit 確定文字）は抑止しない。
                 } else if (key.code == 259) { // BACKSPACE
                     const before = buffer.slice().len;
                     buffer.backspace(&per_id.selection);
@@ -429,11 +442,30 @@ pub fn textInputId(
             @panic("textInput: OOM");
         clampTextInputState(per_id, text_layout.count());
     }
+
+    // preedit は TextBuffer に入れない。focused + active のときだけ表示する。
+    const preedit: []const u8 = if (composing) ctx.composition.text else "";
+    const preedit_cursor = clampUtf8ByteOffset(preedit, if (composing) ctx.composition.cursor else 0);
+    const committed_prefix_w: u32 = text_layout.prefix_widths[per_id.caret];
+    const preedit_w: u32 = if (preedit.len == 0) 0 else ctx.font.measure(preedit);
+    const preedit_cursor_w: u32 = if (preedit_cursor == 0) 0 else ctx.font.measure(preedit[0..preedit_cursor]);
+    const follow_x: i32 = @intCast(committed_prefix_w + preedit_cursor_w);
+    const content_span: i32 = @intCast(text_layout.prefix_widths[text_layout.count()] + preedit_w);
+
     const width = resolveTextInputWidth(ctx, buffer.slice(), opts);
-    const line_height: i32 = @intCast(ctx.font.metrics().line_height);
+    const metrics = ctx.font.metrics();
+    const line_height: i32 = @intCast(metrics.line_height);
     const height = line_height + opts.padding[0] + opts.padding[2];
     const content_width = @max(0, width - opts.padding[3] - opts.padding[1]);
-    updateTextInputScroll(per_id, text_layout, content_width);
+    updateTextInputScroll(per_id, follow_x, content_span, content_width);
+
+    const caret_local_x = opts.padding[3] + follow_x - per_id.scroll_x;
+    const caret_rect: ?Rect = if (input_owner) .{
+        .x = caret_local_x,
+        .y = opts.padding[0],
+        .w = 1,
+        .h = @intCast(line_height),
+    } else null;
 
     const draw_data = ctx.allocator().create(TextInputDraw) catch @panic("textInput: OOM");
     draw_data.* = .{
@@ -442,30 +474,36 @@ pub fn textInputId(
         .selection = per_id.selection.normalized(),
         .caret = per_id.caret,
         .scroll_x = per_id.scroll_x,
-        .focused = ctx.focusedId() == id,
-        .caret_visible = ctx.focusedId() == id and blinkVisible(ctx.now(), per_id.caret_blink_start_s),
+        .focused = focused,
+        .caret_visible = focused and blinkVisible(ctx.now(), per_id.caret_blink_start_s),
         .padding = opts.padding,
         .background = ctx.style.input_background,
         .selection_background = ctx.style.selection_background,
         .caret_color = ctx.style.caret,
         .text_color = ctx.style.text,
         .placeholder_color = ctx.style.text_subtle,
+        .preedit = preedit,
+        .committed_prefix_w = committed_prefix_w,
+        .preedit_w = preedit_w,
+        .preedit_cursor_w = preedit_cursor_w,
+        .ascent = metrics.ascent,
     };
     ctx.beginBox(.{
         .id = id,
         .width = .{ .fixed = width },
         .height = .{ .fixed = height },
         .clip_children = true,
-        .border = .{ .color = if (ctx.focusedId() == id) ctx.style.border_hover else ctx.style.border, .thickness = 1 },
+        .border = .{ .color = if (focused) ctx.style.border_hover else ctx.style.border, .thickness = 1 },
     });
     ctx.custom(.{ .x = width, .y = height }, TextInputDraw.draw, draw_data);
     ctx.endBox();
 
     return .{
         .changed = changed,
-        .focused = ctx.focusedId() == id,
+        .focused = focused,
         .selection = per_id.selection.normalized(),
         .copy_request = copy_request,
+        .caret_rect = caret_rect,
     };
 }
 
@@ -486,12 +524,10 @@ fn resolveTextInputWidth(ctx: *Context, text: []const u8, opts: TextInputOpts) i
     };
 }
 
-fn updateTextInputScroll(per_id: *state_mod.PerIdState, text_layout: text_edit.TextLayout, viewport: i32) void {
-    const content = @as(i32, @intCast(text_layout.prefix_widths[text_layout.count()]));
-    const caret_x = @as(i32, @intCast(text_layout.prefix_widths[per_id.caret]));
+fn updateTextInputScroll(per_id: *state_mod.PerIdState, follow_x: i32, content: i32, viewport: i32) void {
     const max_scroll = @max(0, content - viewport);
-    if (caret_x < per_id.scroll_x) per_id.scroll_x = caret_x;
-    if (caret_x > per_id.scroll_x + viewport) per_id.scroll_x = caret_x - viewport;
+    if (follow_x < per_id.scroll_x) per_id.scroll_x = follow_x;
+    if (follow_x > per_id.scroll_x + viewport) per_id.scroll_x = follow_x - viewport;
     per_id.scroll_x = std.math.clamp(per_id.scroll_x, 0, max_scroll);
 }
 
@@ -503,6 +539,18 @@ fn blinkVisible(now_s: f64, start_s: f64) bool {
 
 fn isInsertableCodepoint(cp: u32) bool {
     return cp >= 0x20 and cp != 0x7F and cp <= 0x10FFFF and !(cp >= 0xD800 and cp <= 0xDFFF);
+}
+
+/// composition 中に TextBuffer を変更してはいけない編集・移動キー。
+fn isCompositionBlockedEditKey(code: u32) bool {
+    return code == 259 or code == 261 or code == 263 or code == 264 or code == 269 or code == 270;
+}
+
+/// UTF-8 byte offset を codepoint 境界へ clamp する（継続バイト上なら手前へ）。
+fn clampUtf8ByteOffset(text: []const u8, offset: usize) usize {
+    var n = @min(offset, text.len);
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
+    return n;
 }
 
 const TextInputDraw = struct {
@@ -519,6 +567,11 @@ const TextInputDraw = struct {
     caret_color: Color,
     text_color: Color,
     placeholder_color: Color,
+    preedit: []const u8 = "",
+    committed_prefix_w: u32 = 0,
+    preedit_w: u32 = 0,
+    preedit_cursor_w: u32 = 0,
+    ascent: i32 = 0,
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const TextInputDraw = @ptrCast(@alignCast(ctx_ptr));
@@ -536,12 +589,44 @@ const TextInputDraw = struct {
             dl.rectFilled(.{ .x = x0, .y = content.y, .w = @intCast(x1 - x0), .h = content.h }, self.selection_background) catch
                 @panic("textInput draw: OOM");
         }
-        const text = if (self.layout.text.len == 0) self.placeholder else self.layout.text;
-        const text_color = if (self.layout.text.len == 0) self.placeholder_color else self.text_color;
-        dl.textEx(.{ .x = content.x - self.scroll_x, .y = content.y }, text, text_color, null) catch
-            @panic("textInput draw: OOM");
+
+        const origin_x = content.x - self.scroll_x;
+        if (self.preedit.len != 0) {
+            const caret_byte = text_edit.byteIndex(self.layout.text, self.caret);
+            const prefix = self.layout.text[0..caret_byte];
+            const suffix = self.layout.text[caret_byte..];
+            const preedit_x = origin_x + @as(i32, @intCast(self.committed_prefix_w));
+            if (prefix.len != 0) {
+                dl.textEx(.{ .x = origin_x, .y = content.y }, prefix, self.text_color, null) catch
+                    @panic("textInput draw: OOM");
+            }
+            dl.textEx(.{ .x = preedit_x, .y = content.y }, self.preedit, self.text_color, null) catch
+                @panic("textInput draw: OOM");
+            if (suffix.len != 0) {
+                const suffix_x = preedit_x + @as(i32, @intCast(self.preedit_w));
+                dl.textEx(.{ .x = suffix_x, .y = content.y }, suffix, self.text_color, null) catch
+                    @panic("textInput draw: OOM");
+            }
+            // preedit 下線（baseline 直下。example_21 と同方針）
+            const underline_y = @min(content.y + self.ascent + 2, content.y + @as(i32, @intCast(content.h)) - 1);
+            dl.line(
+                .{ .x = preedit_x, .y = underline_y },
+                .{ .x = preedit_x + @as(i32, @intCast(self.preedit_w)), .y = underline_y },
+                self.text_color,
+                1,
+            ) catch @panic("textInput draw: OOM");
+        } else {
+            const text = if (self.layout.text.len == 0) self.placeholder else self.layout.text;
+            const text_color = if (self.layout.text.len == 0) self.placeholder_color else self.text_color;
+            dl.textEx(.{ .x = origin_x, .y = content.y }, text, text_color, null) catch
+                @panic("textInput draw: OOM");
+        }
+
         if (self.focused and self.caret_visible) {
-            const caret_x = content.x + @as(i32, @intCast(self.layout.prefix_widths[self.caret])) - self.scroll_x;
+            const caret_x = if (self.preedit.len != 0)
+                origin_x + @as(i32, @intCast(self.committed_prefix_w + self.preedit_cursor_w))
+            else
+                origin_x + @as(i32, @intCast(self.layout.prefix_widths[self.caret]));
             dl.rectFilled(.{ .x = caret_x, .y = content.y, .w = 1, .h = content.h }, self.caret_color) catch
                 @panic("textInput draw: OOM");
         }
@@ -2466,4 +2551,283 @@ test "TextInput: caret blink は仮想時刻だけで決定" {
     try std.testing.expect(!blinkVisible(0.5, 0.0));
     try std.testing.expect(!blinkVisible(0.99, 0.0));
     try std.testing.expect(blinkVisible(1.0, 0.0));
+}
+
+fn focusTextInput(ctx: *Context, id: Id, buffer: *TextBuffer) void {
+    _ = ctx.textInputId(id, buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(id).?;
+    ctx.beginFrameAt(240, 120, ctx.now() + 0.1);
+    clickAt(ctx, rect.x + 8, rect.y + 8);
+    _ = ctx.textInputId(id, buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+}
+
+fn countDrawText(cmds: []const draw_mod.DrawCmd, needle: []const u8) usize {
+    var n: usize = 0;
+    for (cmds) |cmd| switch (cmd) {
+        .text => |t| if (std.mem.eql(u8, t.text, needle)) {
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+fn countDrawLines(cmds: []const draw_mod.DrawCmd) usize {
+    var n: usize = 0;
+    for (cmds) |cmd| switch (cmd) {
+        .line => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "TextInput: composition start/update で TextBuffer 不変・preedit 描画と下線" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xD1134;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = true, .text = "に", .cursor = 0 });
+    const before = try std.testing.allocator.dupe(u8, buffer.slice());
+    defer std.testing.allocator.free(before);
+    const r = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expectEqualStrings(before, buffer.slice());
+    try std.testing.expect(r.focused);
+    ctx.endFrame();
+
+    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "に") >= 1);
+    try std.testing.expect(countDrawLines(ctx.draw_list.cmds.items) >= 1);
+}
+
+test "TextInput: preedit cursor は UTF-8 境界へ clamp され caret_rect.x が追従" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "");
+    defer buffer.deinit();
+    const id: Id = 0xD1135;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+
+    // "日本" = 6 bytes。cursor=4 は 2 文字目先頭、cursor=5 は継続バイトなので 4 へ clamp。
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = true, .text = "日本", .cursor = 4 });
+    const at_boundary = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    const x_boundary = at_boundary.caret_rect.?.x;
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.3);
+    ctx.setComposition(.{ .active = true, .text = "日本", .cursor = 5 });
+    const clamped = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expectEqual(x_boundary, clamped.caret_rect.?.x);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.4);
+    ctx.setComposition(.{ .active = true, .text = "日本", .cursor = 0 });
+    const at_start = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(at_start.caret_rect.?.x < x_boundary);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.5);
+    ctx.setComposition(.{ .active = true, .text = "日本", .cursor = 6 });
+    const at_end = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(at_end.caret_rect.?.x > x_boundary);
+    ctx.endFrame();
+}
+
+test "TextInput: composition 中は編集キー抑止・char_input は挿入" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "xy");
+    defer buffer.deinit();
+    const id: Id = 0xD1136;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+    ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
+    ctx.perIdState(id).caret = 2;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
+    ctx.pushEvent(.{ .key_down = .{ .code = 259, .modifiers = 0, .repeat = false } }); // BACKSPACE
+    ctx.pushEvent(.{ .key_down = .{ .code = 261, .modifiers = 0, .repeat = false } }); // DELETE
+    ctx.pushEvent(.{ .key_down = .{ .code = 263, .modifiers = 0, .repeat = false } }); // LEFT
+    ctx.pushEvent(.{ .key_down = .{ .code = 264, .modifiers = 0, .repeat = false } }); // RIGHT
+    ctx.pushEvent(.{ .key_down = .{ .code = 269, .modifiers = 0, .repeat = false } }); // HOME
+    ctx.pushEvent(.{ .key_down = .{ .code = 270, .modifiers = 0, .repeat = false } }); // END
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expectEqualStrings("xy", buffer.slice());
+    try std.testing.expectEqual(@as(usize, 2), ctx.perIdState(id).caret);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.3);
+    ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = '日', .modifiers = 0 } });
+    const inserted = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(inserted.changed);
+    try std.testing.expectEqualStrings("xy日", buffer.slice());
+    ctx.endFrame();
+}
+
+test "TextInput: commit 後 preedit 消え TextBuffer 残存 / cancel で不変" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "");
+    defer buffer.deinit();
+    const id: Id = 0xD1137;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+
+    // commit 相当: composition を下ろし char_input で確定
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = false, .text = "", .cursor = 0 });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = '日', .modifiers = 0 } });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = '本', .modifiers = 0 } });
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("日本", buffer.slice());
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "に"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawLines(ctx.draw_list.cmds.items));
+
+    // cancel 相当: preedit 表示後に active=false、buffer 不変
+    const before = try std.testing.allocator.dupe(u8, buffer.slice());
+    defer std.testing.allocator.free(before);
+    ctx.beginFrameAt(240, 120, 0.3);
+    ctx.setComposition(.{ .active = true, .text = "変", .cursor = 0 });
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "変") >= 1);
+
+    ctx.beginFrameAt(240, 120, 0.4);
+    ctx.setComposition(.{ .active = false, .text = "", .cursor = 0 });
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expectEqualStrings(before, buffer.slice());
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "変"));
+}
+
+test "TextInput: preedit caret が viewport 外なら scroll 追従" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "");
+    defer buffer.deinit();
+    const id: Id = 0xD1138;
+
+    ctx.beginFrameAt(160, 80, 0);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(id).?;
+    ctx.beginFrameAt(160, 80, 0.1);
+    clickAt(&ctx, rect.x + 8, rect.y + 8);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
+    ctx.endFrame();
+
+    // 長い preedit + cursor 末尾 → scroll が追従
+    const long_preedit = "あいうえおかきくけこ";
+    ctx.beginFrameAt(160, 80, 0.2);
+    ctx.setComposition(.{ .active = true, .text = long_preedit, .cursor = long_preedit.len });
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
+    try std.testing.expect(ctx.perIdState(id).scroll_x > 0);
+    ctx.endFrame();
+}
+
+test "TextInput: beginFrame 後 composition は stale にならない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "");
+    defer buffer.deinit();
+    const id: Id = 0xD1139;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "あ") >= 1);
+
+    // setComposition せず beginFrame → 空状態へリセット
+    ctx.beginFrameAt(240, 120, 0.3);
+    try std.testing.expect(!ctx.composition.active);
+    try std.testing.expectEqual(@as(usize, 0), ctx.composition.text.len);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "あ"));
+}
+
+test "TextInput: composition は focused のみ消費（非 focus は preedit 非描画・キー抑止なし）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var a = try TextBuffer.init(std.testing.allocator, "A");
+    defer a.deinit();
+    var b = try TextBuffer.init(std.testing.allocator, "B");
+    defer b.deinit();
+    const id_a: Id = 0xD113A;
+    const id_b: Id = 0xD113B;
+
+    ctx.beginFrameAt(320, 160, 0);
+    ctx.beginBox(.{ .direction = .column, .gap = 8 });
+    _ = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const rect_a = ctx.getNodeRect(id_a).?;
+    const rect_b = ctx.getNodeRect(id_b).?;
+
+    // A に focus + composition → A のみ preedit
+    ctx.beginFrameAt(320, 160, 0.1);
+    clickAt(&ctx, rect_a.x + 8, rect_a.y + 8);
+    ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
+    ctx.beginBox(.{ .direction = .column, .gap = 8 });
+    _ = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "あ"));
+
+    // B に focus を移してから composition を載せる（同一 frame の press 競合を避ける）
+    ctx.beginFrameAt(320, 160, 0.2);
+    clickAt(&ctx, rect_b.x + 8, rect_b.y + 8);
+    ctx.beginBox(.{ .direction = .column, .gap = 8 });
+    _ = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(id_b, ctx.focusedId());
+
+    ctx.beginFrameAt(320, 160, 0.25);
+    ctx.setComposition(.{ .active = true, .text = "い", .cursor = 0 });
+    ctx.pushEvent(.{ .key_down = .{ .code = 259, .modifiers = 0, .repeat = false } });
+    ctx.beginBox(.{ .direction = .column, .gap = 8 });
+    _ = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("A", a.slice());
+    try std.testing.expectEqualStrings("B", b.slice()); // B focused + composing → Backspace 抑止
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "い"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "あ"));
+
+    // B の composition を下ろし、非 composition なら B の Backspace が効く
+    ctx.perIdState(id_b).selection = .{ .anchor = 1, .extent = 1 };
+    ctx.perIdState(id_b).caret = 1;
+    ctx.beginFrameAt(320, 160, 0.3);
+    ctx.setComposition(.{});
+    ctx.pushEvent(.{ .key_down = .{ .code = 259, .modifiers = 0, .repeat = false } });
+    ctx.beginBox(.{ .direction = .column, .gap = 8 });
+    _ = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("", b.slice());
 }

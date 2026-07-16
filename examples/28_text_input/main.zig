@@ -1,11 +1,17 @@
-//! 28_text_input: 単一行 TextInput の focus / UTF-8 編集 / selection / scroll デモ。
+//! 28_text_input: 単一行 TextInput の focus / UTF-8 編集 / selection / scroll / IME デモ。
 //!
-//! ホットパス宣言: 編集・caret・selection・scroll はイベント時のみ。描画は既存 DrawCmd と
-//! Font 経路を再利用し、caret blink は Context の仮想時刻だけで決定する。
+//! ホットパス宣言: 編集・caret・selection・scroll はイベント時のみ。composition snapshot の
+//! 再読取は active 中に毎フレーム（latest-wins。イベント欠落時の stale preedit 回避）。
+//! preedit 描画は既存 DrawCmd と Font 経路を再利用し、caret blink は Context の仮想時刻だけで
+//! 決定する。composition 本文は固定 buffer 借用（heap alloc なし）。
 
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
+
+const COMPOSITION_BYTES = 1024;
+
+const CompositionCaretRect = struct { x: i32, y: i32, w: i32, h: i32 };
 
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
@@ -44,6 +50,9 @@ const InputProbe = struct {
     selection_start: usize = 0,
     selection_end: usize = 0,
     scroll: i32 = 0,
+    preedit_active: u32 = 0,
+    preedit_len: usize = 0,
+    preedit_cursor: usize = 0,
 
     fn update(self: *InputProbe, buffer: *const gui.TextBuffer, result: gui.TextInputResult, caret: usize) void {
         self.focus = if (result.focused) 1 else 0;
@@ -55,13 +64,16 @@ const InputProbe = struct {
 
     fn digest(ctx: *anyopaque, buf: []u8) []const u8 {
         const self: *const InputProbe = @ptrCast(@alignCast(ctx));
-        return std.fmt.bufPrint(buf, "focus={d} len={d} caret={d} selection={d}:{d} scroll={d}", .{
+        return std.fmt.bufPrint(buf, "focus={d} len={d} caret={d} selection={d}:{d} scroll={d} preedit_active={d} preedit_len={d} preedit_cursor={d}", .{
             self.focus,
             self.len,
             self.caret,
             self.selection_start,
             self.selection_end,
             self.scroll,
+            self.preedit_active,
+            self.preedit_len,
+            self.preedit_cursor,
         }) catch buf[0..0];
     }
 };
@@ -75,6 +87,57 @@ const CopyProbe = struct {
         return std.fmt.bufPrint(buf, "count={d} bytes={d}", .{ self.count, self.bytes }) catch buf[0..0];
     }
 };
+
+const ImeState = struct {
+    preedit: [COMPOSITION_BYTES]u8 = undefined,
+    preedit_len: usize = 0,
+    preedit_cursor: usize = 0,
+    active: bool = false,
+    dirty: bool = false,
+    last_phase: platform.CompositionPhase = .cancel,
+    composition_rect: ?CompositionCaretRect = null,
+
+    fn syncFromWindow(self: *ImeState, window: platform.Window) void {
+        // dirty（composition_changed）または active 中は毎フレーム snapshot を再読取する。
+        // text/cursor は常に latest-wins。イベント欠落時の stale preedit を避ける。
+        //
+        // 既知の残余制約（修正不要）: commit/cancel イベント自体が欠落した場合の active
+        // フラグ解除は、CompositionSnapshot に active 情報が無いため検出不能
+        // （platform 側 79.6.x の将来課題。example_21 と同じ制約）。
+        if (!self.dirty and !self.active) return;
+        const snapshot = window.getCompositionSnapshot(self.preedit[0..]);
+        self.preedit_len = snapshot.text.len;
+        self.preedit_cursor = @min(@as(usize, snapshot.cursor), self.preedit_len);
+        if (self.dirty) {
+            self.active = switch (self.last_phase) {
+                .start, .update => true,
+                .commit, .cancel => false,
+            };
+            self.dirty = false;
+        }
+    }
+
+    fn guiState(self: *const ImeState) gui.CompositionState {
+        return .{
+            .active = self.active,
+            .text = self.preedit[0..self.preedit_len],
+            .cursor = self.preedit_cursor,
+        };
+    }
+};
+
+fn notifyCompositionRect(window: platform.Window, state: *ImeState, rect: ?CompositionCaretRect) void {
+    const next = rect orelse CompositionCaretRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    if (state.composition_rect) |prev| {
+        if (prev.x == next.x and prev.y == next.y and prev.w == next.w and prev.h == next.h) return;
+    } else if (next.w == 0 and next.h == 0) {
+        // 初回のクリアは不要（候補窓も未表示）
+        state.composition_rect = next;
+        return;
+    }
+    window.setCompositionRect(next.x, next.y, next.w, next.h);
+    state.composition_rect = next;
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -95,12 +158,13 @@ pub fn main(init: std.process.Init) !void {
 
     var input_probe: InputProbe = .{};
     var copy_probe: CopyProbe = .{};
+    var ime: ImeState = .{};
     platform.registerProbe(.{
         .name = "input",
         .ctx = &input_probe,
         .ext = "txt",
         .digest = InputProbe.digest,
-        .desc = "TextInput focus/edit state",
+        .desc = "TextInput focus/edit/IME preedit state",
     });
     platform.registerProbe(.{
         .name = "copy",
@@ -118,8 +182,15 @@ pub fn main(init: std.process.Init) !void {
         ctx.beginFrameAt(fb.width, fb.height, platform.getTime());
         while (window.nextEvent()) |ev| {
             if (ev == .quit) running = false;
+            if (ev == .composition_changed) {
+                ime.dirty = true;
+                ime.last_phase = ev.composition_changed.phase;
+            }
             if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
+
+        ime.syncFromWindow(window);
+        ctx.setComposition(ime.guiState());
 
         @memset(fb.pixels, 0xFF_18181C);
         ctx.beginBox(.{
@@ -137,17 +208,10 @@ pub fn main(init: std.process.Init) !void {
             .width = .{ .fixed = 320 },
             .placeholder = "Second input",
         });
-        ctx.labelEx("single-line UTF-8 input / Shift selection / Cmd+C", gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
+        ctx.labelEx("single-line UTF-8 / Shift selection / Cmd+C", gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
+        ctx.labelEx("IME: 変換中 preedit は下線付き inline。Enter=確定 / Esc=取消", gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
         ctx.endBox();
 
-        if (first.focused or ctx.focusedId() == 0) {
-            input_probe.update(&first_buffer, first, ctx.perIdState(0x2801).caret);
-            input_probe.scroll = ctx.perIdState(0x2801).scroll_x;
-        } else {
-            input_probe.update(&second_buffer, second, ctx.perIdState(0x2802).caret);
-            input_probe.scroll = ctx.perIdState(0x2802).scroll_x;
-        }
-        if (ctx.focusedId() == 0) input_probe.focus = 0;
         if (first.copy_request) |r| {
             platform.clipboardWrite(r.text);
             copy_probe.count += 1;
@@ -160,6 +224,47 @@ pub fn main(init: std.process.Init) !void {
         }
 
         ctx.endFrame();
+
+        // endFrame 後の focusedId を正とする（同一 frame で second が claim した直後に
+        // first.focused の stale 値で rect をクリアしない）。
+        const focused_id = ctx.focusedId();
+        switch (focused_id) {
+            0x2801 => {
+                input_probe.update(&first_buffer, first, ctx.perIdState(0x2801).caret);
+                input_probe.scroll = ctx.perIdState(0x2801).scroll_x;
+            },
+            0x2802 => {
+                input_probe.update(&second_buffer, second, ctx.perIdState(0x2802).caret);
+                input_probe.scroll = ctx.perIdState(0x2802).scroll_x;
+            },
+            else => {
+                input_probe.update(&first_buffer, first, ctx.perIdState(0x2801).caret);
+                input_probe.scroll = ctx.perIdState(0x2801).scroll_x;
+                input_probe.focus = 0;
+            },
+        }
+        input_probe.preedit_active = if (ime.active) 1 else 0;
+        input_probe.preedit_len = ime.preedit_len;
+        input_probe.preedit_cursor = ime.preedit_cursor;
+
+        const local_caret: ?gui.Rect = switch (focused_id) {
+            0x2801 => first.caret_rect,
+            0x2802 => second.caret_rect,
+            else => null,
+        };
+        if (local_caret) |local| {
+            if (ctx.getNodeRect(focused_id)) |node| {
+                notifyCompositionRect(window, &ime, .{
+                    .x = node.x + local.x,
+                    .y = node.y + local.y,
+                    .w = @intCast(local.w),
+                    .h = @intCast(local.h),
+                });
+            }
+        } else {
+            notifyCompositionRect(window, &ime, null);
+        }
+
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font);
         window.present();

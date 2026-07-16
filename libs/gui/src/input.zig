@@ -52,6 +52,15 @@ pub const OrderedTextEvent = union(enum) {
     char_input: struct { codepoint: u32, modifiers: u32 },
 };
 
+/// IME composition（変換中 preedit）の表示専用状態。platform 非依存。
+/// `text` は caller 所有の借用 UTF-8 slice（endFrame まで有効であること）。
+/// `cursor` は `text` 内の UTF-8 byte offset（表示 caret）。
+pub const CompositionState = struct {
+    active: bool = false,
+    text: []const u8 = "",
+    cursor: usize = 0,
+};
+
 /// long-lived。keys_* は gpa 保持の ArrayList（unmanaged）。
 pub const Input = struct {
     alloc: Allocator,
