@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
     const dsp = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" } });
     const synth = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" } });
     synth.addImport("dsp", dsp);
+    const gmath = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" } });
+    const sound = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" } });
+    sound.addImport("dsp", dsp);
+    sound.addImport("synth", synth);
     const serde = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/serde/src/serde.zig" } });
     const appshell = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/appshell/src/appshell.zig" } });
     appshell.addImport("serde", serde);
@@ -40,6 +44,8 @@ pub fn build(b: *std.Build) void {
             .font = font,
             .dsp = dsp,
             .synth = synth,
+            .gmath = gmath,
+            .sound = sound,
             .serde = serde,
             .appshell = appshell,
         },

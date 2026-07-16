@@ -72,6 +72,11 @@ pub fn build(b: *std.Build) void {
     const gmath = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
     });
+    const sound = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" },
+    });
+    sound.addImport("dsp", dsp);
+    sound.addImport("synth", synth);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",
@@ -92,6 +97,7 @@ pub fn build(b: *std.Build) void {
             .dsp = dsp,
             .synth = synth,
             .gmath = gmath,
+            .sound = sound,
             .serde = serde,
         },
         .extra = &.{
