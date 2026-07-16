@@ -66,6 +66,11 @@ pub const ModuleKind = enum {
     vinyl,
     wow_flutter,
     sidechain,
+    slew,
+    sample_hold,
+    comparator,
+    ring_mod,
+    logic,
 };
 
 /// kind → 具体型。
@@ -97,6 +102,11 @@ pub fn KindType(comptime k: ModuleKind) type {
         .vinyl => modules.VinylNoiseFx,
         .wow_flutter => modules.WowFlutterFx,
         .sidechain => modules.Sidechain,
+        .slew => modules.Slew,
+        .sample_hold => modules.SampleHold,
+        .comparator => modules.Comparator,
+        .ring_mod => modules.RingMod,
+        .logic => modules.Logic,
     };
 }
 
@@ -110,6 +120,8 @@ pub fn poolCap(comptime k: ModuleKind) usize {
         .euclid, .perc_env, .random => 6,
         .clock, .clock_divider, .quantizer, .kick, .hat, .turing, .clap, .chord_pad, .saturator, .bitcrusher, .sidechain => 4,
         .output, .delay, .reverb, .vinyl, .wow_flutter => 2,
+        .slew, .sample_hold, .comparator, .logic => 6,
+        .ring_mod => 4,
     };
 }
 
@@ -141,6 +153,11 @@ const Pools = struct {
     vinyl: [poolCap(.vinyl)]modules.VinylNoiseFx,
     wow_flutter: [poolCap(.wow_flutter)]modules.WowFlutterFx,
     sidechain: [poolCap(.sidechain)]modules.Sidechain,
+    slew: [poolCap(.slew)]modules.Slew,
+    sample_hold: [poolCap(.sample_hold)]modules.SampleHold,
+    comparator: [poolCap(.comparator)]modules.Comparator,
+    ring_mod: [poolCap(.ring_mod)]modules.RingMod,
+    logic: [poolCap(.logic)]modules.Logic,
 };
 
 /// RT が読む安定レジストリ field（init 後、対応 handle が active/retired の間は不変）。
@@ -359,6 +376,11 @@ pub const DynGraph = struct {
             .vinyl => &self.pools.vinyl,
             .wow_flutter => &self.pools.wow_flutter,
             .sidechain => &self.pools.sidechain,
+            .slew => &self.pools.slew,
+            .sample_hold => &self.pools.sample_hold,
+            .comparator => &self.pools.comparator,
+            .ring_mod => &self.pools.ring_mod,
+            .logic => &self.pools.logic,
         };
     }
 
@@ -1005,6 +1027,99 @@ test "dyn(f2a): pool 枯渇は PoolFull（handle 空間に余裕があっても�
     _ = try g.add(.output, .{});
     try testing.expectError(Error.PoolFull, g.add(.output, .{}));
     try testing.expect(g.activeCount() < MAX_MODULES);
+}
+
+test "dyn(f2b): TASK-107 の各 pool は計画容量まで使えて次で枯渇する" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const kinds = [_]ModuleKind{ .slew, .sample_hold, .comparator, .ring_mod, .logic };
+    inline for (kinds) |k| {
+        const cap = poolCap(k);
+        var i: usize = 0;
+        while (i < cap) : (i += 1) _ = try g.add(k, .{});
+        try testing.expectEqual(@as(usize, 0), g.poolFreeCount(k));
+        try testing.expectError(Error.PoolFull, g.add(k, .{}));
+    }
+}
+
+test "dyn(f2c): TASK-107 5種を接続した発音経路は有限かつ非ゼロ" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+
+    const vco_a = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 220 });
+    const vco_b = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 330 });
+    const lfo = try g.add(.lfo, .{});
+    const clock = try g.add(.clock, .{});
+    const divider = try g.add(.clock_divider, .{});
+    const slew = try g.add(.slew, .{});
+    const sh = try g.add(.sample_hold, .{});
+    const cmp = try g.add(.comparator, .{});
+    const rm = try g.add(.ring_mod, .{});
+    const logic = try g.add(.logic, .{});
+    const output = try g.add(.output, .{});
+
+    try g.connect(vco_a, 0, rm, 0);
+    try g.connect(vco_b, 0, rm, 1);
+    try g.connect(rm, 0, output, 0);
+    try g.connect(lfo, 0, slew, 0);
+    try g.connect(lfo, 0, sh, 0);
+    try g.connect(clock, 0, sh, 1);
+    try g.connect(lfo, 0, cmp, 0);
+    try g.connect(slew, 0, cmp, 1);
+    try g.connect(cmp, 0, logic, 0);
+    try g.connect(divider, 0, logic, 1);
+    try g.connect(clock, 0, divider, 0);
+    g.setOutput(output);
+    try g.publish();
+
+    var buf: [4096 * 2]f32 = undefined;
+    g.processBlock(&buf, 4096, 2);
+    var nonzero = false;
+    for (buf) |sample| {
+        try testing.expect(std.math.isFinite(sample));
+        if (@abs(sample) > 1e-6) nonzero = true;
+    }
+    try testing.expect(nonzero);
+}
+
+test "dyn(f2d): TASK-107 の5種を FailingAllocator 下で複数 block 処理できる" {
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const vco_a = try g.add(.vco, .{});
+    const vco_b = try g.add(.vco, .{});
+    const lfo = try g.add(.lfo, .{});
+    const clock = try g.add(.clock, .{});
+    const divider = try g.add(.clock_divider, .{});
+    const slew = try g.add(.slew, .{});
+    const sh = try g.add(.sample_hold, .{});
+    const cmp = try g.add(.comparator, .{});
+    const rm = try g.add(.ring_mod, .{});
+    const logic = try g.add(.logic, .{});
+    const output = try g.add(.output, .{});
+    try g.connect(vco_a, 0, rm, 0);
+    try g.connect(vco_b, 0, rm, 1);
+    try g.connect(rm, 0, output, 0);
+    try g.connect(lfo, 0, slew, 0);
+    try g.connect(lfo, 0, sh, 0);
+    try g.connect(clock, 0, sh, 1);
+    try g.connect(lfo, 0, cmp, 0);
+    try g.connect(slew, 0, cmp, 1);
+    try g.connect(cmp, 0, logic, 0);
+    try g.connect(divider, 0, logic, 1);
+    try g.connect(clock, 0, divider, 0);
+    g.setOutput(output);
+    try g.publish();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    g.allocator = failing.allocator();
+    var buf: [1024 * 2]f32 = undefined;
+    var block: usize = 0;
+    while (block < 16) : (block += 1) {
+        g.processBlock(&buf, 1024, 2);
+        for (buf) |sample| try testing.expect(std.math.isFinite(sample));
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    g.allocator = testing.allocator;
 }
 
 test "dyn(f2b): handle 空間枯渇は TooManyModules（pool に余裕があっても）" {

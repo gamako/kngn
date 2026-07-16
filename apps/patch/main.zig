@@ -162,13 +162,19 @@ const PALETTE = [_]PaletteEntry{
     .{ .primitive = .delay },
     .{ .macro_kind = .drum_machine },
     .{ .macro_kind = .bass_machine },
+    .{ .primitive = .slew },
+    .{ .primitive = .sample_hold },
+    .{ .primitive = .comparator },
+    .{ .primitive = .ring_mod },
+    .{ .primitive = .logic },
 };
 const PAL_X0: f32 = 8;
 const PAL_Y: f32 = 6;
-// 10 ボタンが WIN_W(960) 内に収まる幅（8 + 10*(92+3) < 960）。macro 追加でボタンが増えたため縮小（40.7.2）。
+const COLS: usize = 10;
 const PAL_W: f32 = 92;
 const PAL_H: f32 = 22;
 const PAL_GAP: f32 = 3;
+const paletteBottom: f32 = PAL_Y + 2.0 * (PAL_H + PAL_GAP);
 const PAL_BG = gui.Color.rgba(0x2C, 0x32, 0x3C, 0xFF);
 const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
@@ -176,8 +182,16 @@ const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
 fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
     for (0..PALETTE.len) |i| {
-        const fi: f32 = @floatFromInt(i);
-        btns[i] = .{ .kind_index = @intCast(i), .rect = .{ .x = PAL_X0 + fi * (PAL_W + PAL_GAP), .y = PAL_Y, .w = PAL_W, .h = PAL_H } };
+        const col = i % COLS;
+        const row = i / COLS;
+        const x: f32 = @floatFromInt(col);
+        const y: f32 = @floatFromInt(row);
+        btns[i] = .{ .kind_index = @intCast(i), .rect = .{
+            .x = PAL_X0 + x * (PAL_W + PAL_GAP),
+            .y = PAL_Y + y * (PAL_H + PAL_GAP),
+            .w = PAL_W,
+            .h = PAL_H,
+        } };
     }
     return btns;
 }
@@ -1027,7 +1041,7 @@ fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec
 fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
     const zoom = app.camera.zoom;
     const margin: f32 = 16;
-    const top_limit: f32 = PAL_Y + PAL_H + margin; // パレット帯の下端より下に置く
+    const top_limit: f32 = paletteBottom + margin; // 2段パレット帯の下端より下に置く
     const fbw: f32 = @floatFromInt(app.fb_w);
     const fbh: f32 = @floatFromInt(app.fb_h);
     const max_x = @max(margin, fbw - fp.x * zoom - margin);
@@ -1822,7 +1836,7 @@ fn addNodeByKind(app: *App, kind: modular.ModuleKind) !Handle {
     };
 }
 
-/// kind 名（`modular.ModuleKind` の tag 名。26種、パレットの10種より広い）→ `addNodeByKind`。
+/// kind 名（`modular.ModuleKind` の tag 名。31種、パレットの15種より広い）→ `addNodeByKind`。
 fn addNodeByKindName(app: *App, name: []const u8) !Handle {
     const kind = std.meta.stringToEnum(modular.ModuleKind, name) orelse return error.UnknownKind;
     return addNodeByKind(app, kind);

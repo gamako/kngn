@@ -1322,6 +1322,162 @@ pub const Sidechain = struct {
     }
 };
 
+// ----------------------------------------------------------------------------
+// Slew: signal(cv) + rise/fall rate(cv) -> cv。rate は CV-units/秒。
+// rate の既定値は 1 CV-unit/秒。係数 inv_sr はブロック先頭でのみ更新する。
+// ----------------------------------------------------------------------------
+pub const Slew = struct {
+    state: f32 = 0.0,
+    rise: f32 = 1.0,
+    fall: f32 = 1.0,
+    inv_sr: f32 = 0.0,
+    applied_sr: f32 = -1.0,
+
+    pub const default_rate: f32 = 1.0;
+    const in_kinds = [_]PortKind{ .cv, .cv, .cv };
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = updateParams };
+
+    pub fn spec(self: *Slew) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn updateParams(ctx: *anyopaque, sample_rate: f32) void {
+        const self: *Slew = @ptrCast(@alignCast(ctx));
+        if (self.applied_sr == sample_rate) return;
+        self.inv_sr = if (std.math.isFinite(sample_rate) and sample_rate > 0.0) 1.0 / sample_rate else 0.0;
+        self.applied_sr = sample_rate;
+    }
+
+    fn rateOrDefault(raw: ?f32, fallback_raw: f32) f32 {
+        const fallback = if (std.math.isFinite(fallback_raw)) @max(0.0, fallback_raw) else default_rate;
+        var rate = raw orelse fallback;
+        if (!std.math.isFinite(rate)) rate = fallback;
+        return if (rate < 0.0) 0.0 else rate;
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Slew = @ptrCast(@alignCast(ctx));
+        const target_raw = optInput(io, 0);
+        const target = if (target_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0;
+        const rise = rateOrDefault(optInput(io, 1), self.rise);
+        const fall = rateOrDefault(optInput(io, 2), self.fall);
+        const delta = target - self.state;
+        if (!std.math.isFinite(delta)) {
+            self.state = target;
+        } else if (delta > 0.0) {
+            self.state += @min(delta, rise * self.inv_sr);
+        } else {
+            self.state += @max(delta, -fall * self.inv_sr);
+        }
+        if (!std.math.isFinite(self.state)) self.state = target;
+        io.outputs[0] = self.state;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// SampleHold: signal(cv) + trig(gate) -> cv。立ち上がり時だけ signal をラッチする。
+// ----------------------------------------------------------------------------
+pub const SampleHold = struct {
+    held: f32 = 0.0,
+    prev_gate: bool = false,
+
+    const in_kinds = [_]PortKind{ .cv, .gate };
+    const out_kinds = [_]PortKind{.cv};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *SampleHold) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *SampleHold = @ptrCast(@alignCast(ctx));
+        const signal_raw = optInput(io, 0);
+        const signal_value = if (signal_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0;
+        const gate_raw = optInput(io, 1);
+        const gate_value = if (gate_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0;
+        const gate = signal.gateHigh(gate_value);
+        if (gate and !self.prev_gate) self.held = signal_value;
+        self.prev_gate = gate;
+        io.outputs[0] = self.held;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Comparator: signal(cv) >= threshold(cv) -> gate。
+// ----------------------------------------------------------------------------
+pub const Comparator = struct {
+    const default_threshold: f32 = 0.5;
+    const in_kinds = [_]PortKind{ .cv, .cv };
+    const out_kinds = [_]PortKind{.gate};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *Comparator) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(_: *anyopaque, io: *Io) void {
+        const signal_raw = optInput(io, 0);
+        const signal_value = if (signal_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0;
+        const threshold_raw = optInput(io, 1);
+        const threshold = if (threshold_raw) |x| if (std.math.isFinite(x)) x else 0.0 else default_threshold;
+        io.outputs[0] = if (signal_value >= threshold) 1.0 else 0.0;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// RingMod: audio(a) * audio(b) -> audio。
+// ----------------------------------------------------------------------------
+pub const RingMod = struct {
+    const in_kinds = [_]PortKind{ .audio, .audio };
+    const out_kinds = [_]PortKind{.audio};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *RingMod) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(_: *anyopaque, io: *Io) void {
+        const a_raw = optInput(io, 0);
+        const b_raw = optInput(io, 1);
+        const a = if (a_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0;
+        const b = if (b_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0;
+        const out = a * b;
+        io.outputs[0] = if (std.math.isFinite(out)) out else 0.0;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Logic: gate(a) / gate(b) -> gate。op は将来の per-node UI 用に状態として保持する。
+// ----------------------------------------------------------------------------
+pub const LogicOp = enum { @"and", @"or", xor };
+
+pub const Logic = struct {
+    op: LogicOp = .xor,
+
+    const in_kinds = [_]PortKind{ .gate, .gate };
+    const out_kinds = [_]PortKind{.gate};
+    const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
+
+    pub fn spec(self: *Logic) NodeSpec {
+        return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    fn process(ctx: *anyopaque, io: *Io) void {
+        const self: *Logic = @ptrCast(@alignCast(ctx));
+        const a_raw = optInput(io, 0);
+        const b_raw = optInput(io, 1);
+        const a = signal.gateHigh(if (a_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0);
+        const b = signal.gateHigh(if (b_raw) |x| if (std.math.isFinite(x)) x else 0.0 else 0.0);
+        const result = switch (self.op) {
+            .@"and" => a and b,
+            .@"or" => a or b,
+            .xor => a != b,
+        };
+        io.outputs[0] = if (result) 1.0 else 0.0;
+    }
+};
+
 // ============================================================================
 // module-level tests（Io を手組みして process を直接駆動。display/graph 不要）
 // ============================================================================
@@ -1834,6 +1990,109 @@ test "Sidechain: finite under invalid amount/release" {
         drive(&Sidechain.vtable, &sc, &.{ 1.0, trig }, &.{ true, true }, &o, 48000);
         try testing.expect(std.math.isFinite(o[0]));
     }
+}
+
+test "Slew: rise/fall, CV rate, defaults, and non-finite policy" {
+    var slew = Slew{ .rise = 2.0, .fall = 4.0 };
+    Slew.updateParams(&slew, 10.0);
+    var out: [1]f32 = undefined;
+
+    drive(&Slew.vtable, &slew, &.{ 1.0, 2.0, 4.0 }, &.{ true, true, true }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), out[0], 1e-6);
+    drive(&Slew.vtable, &slew, &.{ 1.0, 5.0, 5.0 }, &.{ true, true, true }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.7), out[0], 1e-6); // CV rate changes the step.
+
+    drive(&Slew.vtable, &slew, &.{ 0.0, 4.0, 4.0 }, &.{ true, true, true }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), out[0], 1e-6); // fall=4 CV-units/s.
+    drive(&Slew.vtable, &slew, &.{ 1.0, -1.0, -1.0 }, &.{ true, true, true }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), out[0], 1e-6); // negative rate = hold.
+
+    drive(&Slew.vtable, &slew, &.{ 1.0, std.math.nan(f32), std.math.inf(f32) }, &.{ true, true, true }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6); // invalid rates use defaults.
+    drive(&Slew.vtable, &slew, &.{ std.math.inf(f32), 0.0, 0.0 }, &.{ true, true, true }, &out, 10.0);
+    try testing.expect(std.math.isFinite(out[0]));
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6); // invalid signal becomes target=0.
+
+    var defaults = Slew{ .rise = 2.0, .fall = 4.0 };
+    Slew.updateParams(&defaults, 10.0);
+    drive(&Slew.vtable, &defaults, &.{ 1.0, 0.0, 0.0 }, &.{ true, false, false }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), out[0], 1e-6); // unconnected rate uses default.
+    drive(&Slew.vtable, &defaults, &.{ 0.0, 0.0, 0.0 }, &.{ false, false, false }, &out, 10.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6); // unconnected signal targets zero.
+}
+
+test "SampleHold: rising edge only, unconnected input, and non-finite policy" {
+    var sh = SampleHold{};
+    var out: [1]f32 = undefined;
+    drive(&SampleHold.vtable, &sh, &.{ 0.25, 0.0 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    drive(&SampleHold.vtable, &sh, &.{ 0.25, 1.0 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.25), out[0]);
+    drive(&SampleHold.vtable, &sh, &.{ 0.75, 1.0 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.25), out[0]);
+    drive(&SampleHold.vtable, &sh, &.{ 0.75, 0.0 }, &.{ true, true }, &out, 48000);
+    drive(&SampleHold.vtable, &sh, &.{ std.math.nan(f32), 1.0 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+
+    var unconnected = SampleHold{};
+    drive(&SampleHold.vtable, &unconnected, &.{ 9.0, 1.0 }, &.{ false, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+}
+
+test "Comparator: threshold transition, default threshold, and non-finite policy" {
+    var cmp = Comparator{};
+    var out: [1]f32 = undefined;
+    drive(&Comparator.vtable, &cmp, &.{ 0.49, 0.5 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    drive(&Comparator.vtable, &cmp, &.{ 0.5, 0.5 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 1.0), out[0]);
+    drive(&Comparator.vtable, &cmp, &.{ 0.5, 0.0 }, &.{ true, false }, &out, 48000);
+    try testing.expectEqual(@as(f32, 1.0), out[0]);
+    drive(&Comparator.vtable, &cmp, &.{ std.math.nan(f32), 0.5 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    drive(&Comparator.vtable, &cmp, &.{ 0.0, std.math.inf(f32) }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 1.0), out[0]); // Inf threshold becomes 0.
+    drive(&Comparator.vtable, &cmp, &.{ 0.0, 0.5 }, &.{ false, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+}
+
+test "RingMod: product, zero on unconnected/non-finite input" {
+    var rm = RingMod{};
+    var out: [1]f32 = undefined;
+    drive(&RingMod.vtable, &rm, &.{ 0.5, -0.25 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, -0.125), out[0]);
+    drive(&RingMod.vtable, &rm, &.{ 0.5, 0.0 }, &.{ true, false }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    drive(&RingMod.vtable, &rm, &.{ std.math.inf(f32), 0.5 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    drive(&RingMod.vtable, &rm, &.{ 0.5, std.math.nan(f32) }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+}
+
+test "Logic: XOR truth table, 0.5 boundary, op state, and unconnected low" {
+    var logic = Logic{};
+    var out: [1]f32 = undefined;
+    const values = [_]struct { a: f32, b: f32, expected: f32 }{
+        .{ .a = 0.0, .b = 0.0, .expected = 0.0 },
+        .{ .a = 0.0, .b = 0.5, .expected = 1.0 },
+        .{ .a = 0.5, .b = 0.0, .expected = 1.0 },
+        .{ .a = 0.5, .b = 0.5, .expected = 0.0 },
+    };
+    for (values) |v| {
+        drive(&Logic.vtable, &logic, &.{ v.a, v.b }, &.{ true, true }, &out, 48000);
+        try testing.expectEqual(v.expected, out[0]);
+    }
+    drive(&Logic.vtable, &logic, &.{ std.math.inf(f32), 0.0 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+    drive(&Logic.vtable, &logic, &.{ 1.0, 0.0 }, &.{ false, false }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
+
+    logic.op = .@"and";
+    drive(&Logic.vtable, &logic, &.{ 1.0, 0.5 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 1.0), out[0]);
+    logic.op = .@"or";
+    drive(&Logic.vtable, &logic, &.{ 0.0, 0.0 }, &.{ true, true }, &out, 48000);
+    try testing.expectEqual(@as(f32, 0.0), out[0]);
 }
 
 // ============================================================================

@@ -206,6 +206,33 @@ test "前方互換: 未知 kind の NODE と未知 chunk tag を skip する" {
     try testing.expectEqual(ModuleKind.vco, got.nodes[0].kind);
 }
 
+test "後方互換: 107 実装前の sidechain(ordinal 25) fixture と新 kind 末尾追加" {
+    const gpa = testing.allocator;
+    // TASK-107 前に保存された固定バイト列。NODE(sidechain, ordinal=25) + EDGE。
+    const legacy = [_]u8{
+        0x50, 0x54, 0x43, 0x47, 0x01, 0x00, 0x01, 0x00,
+        0x4E, 0x4F, 0x44, 0x45, 0x0B, 0x00, 0x00, 0x00,
+        0x07, 0x00, 0x19, 0x00, 0x00, 0x48, 0x41, 0x00,
+        0x00, 0x40, 0xC0, 0x45, 0x44, 0x47, 0x45, 0x06,
+        0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x08, 0x00,
+        0x00, 0xD8, 0x7B, 0x8E, 0x7C,
+    };
+    var old = try decodeGraph(gpa, &legacy);
+    defer old.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), old.nodes.len);
+    try testing.expectEqual(ModuleKind.sidechain, old.nodes[0].kind);
+    try testing.expectEqual(@as(u8, 25), @intFromEnum(old.nodes[0].kind));
+    try testing.expectEqual(@as(usize, 1), old.edges.len);
+    try testing.expectEqual(@as(Handle, 7), old.edges[0].src_handle);
+    try testing.expectEqual(@as(Handle, 8), old.edges[0].dst_handle);
+
+    try testing.expectEqual(@as(u8, 26), @intFromEnum(ModuleKind.slew));
+    try testing.expectEqual(@as(u8, 27), @intFromEnum(ModuleKind.sample_hold));
+    try testing.expectEqual(@as(u8, 28), @intFromEnum(ModuleKind.comparator));
+    try testing.expectEqual(@as(u8, 29), @intFromEnum(ModuleKind.ring_mod));
+    try testing.expectEqual(@as(u8, 30), @intFromEnum(ModuleKind.logic));
+}
+
 test "破損検出: UnsupportedSchemaVersion / CorruptNode / CorruptEdge / BadMagic" {
     const gpa = testing.allocator;
 
