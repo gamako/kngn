@@ -30,7 +30,7 @@ video-proto-main/
 │   ├── dsp/           # DSP ヘルパー（Oscillator / Envelope / Filter / Mixer）→ 将来 libs/audio
 │   └── sprite.zig / text.zig / fixed_timestep.zig / fps_counter.zig / keyboard.zig  # Phase 2 ヘルパー群 → 将来 libs/gfx
 ├── kit/               # 公開 umbrella モジュール（ADR-007 R4）。apps と外部消費者はこれのみ import
-│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth / gamepad / recipe を再エクスポート
+│   └── kit.zig        # platform / control / types / audio / gui / png / font / dsp / synth / gamepad / recipe / gmath / appshell / sound / midi 等を再エクスポート
 ├── examples/          # サンプル 01〜19（ルートから run-example_NN で実行）+ image/（共有アセット usako.png）
 │   ├── 01_timed_window / 02_keyboard_input / 03_sprite_rendering / 04_fixed_timestep / 05_text_rendering
 │   ├── 06_sprite_benchmark / 07_mouse_input / 12_outline_font / 15_audio_tone / 18_cursor / 19_color_emoji
@@ -503,9 +503,9 @@ quit                       # 終了（EOF でも終了）
   `centroid`[Hz] / `onsets`（スペクトラルフラックスピーク数）/ `lufs`（BS.1770 K-weighting momentary 400ms。無音床値 -99.0）。
   AC 判断: 新 probe 名（audio2 等）は作らず既存 `audio` にキーを足す。解析は digest 要求時のみ（RT 経路不変）。
   `virtual_fps` は仮想クロック由来の固定値（≒60。実性能ではない）。
-- **capabilities（内省 probe / TASK-62.4 + args シグネチャ TASK-88.1）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み6件（`fb`/`audio`/`stats`/`capabilities` 自身/`capture`/`gamepad`。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**フィールド追加のみ**で `args`（省略可）を載せられる（下記）。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない。kind の語彙も検証しない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
+- **capabilities（内省 probe / TASK-62.4 + args シグネチャ TASK-88.1）**: `digest capabilities` / `snapshot capabilities [path]`（ext=json）で、登録済み probe・action を JSON 1行で列挙する。組み込み7件（`fb`/`audio`/`stats`/`capabilities` 自身/`capture`/`gamepad`/`midi`。固定 desc）→ custom probe（登録順）→ action（登録順）の順。各 probe エントリは `name`/`ext`/`snapshot`(bool)/`digest`(bool)/`desc`、action エントリは `name`/`desc`。**フィールド追加のみ**で `args`（省略可）を載せられる（下記）。**中身非解釈の不変条件を維持**（登録簿のメタ情報を転記するだけ。callback は呼ばない。kind の語彙も検証しない）。イベント/接続時のみ走る（フレーム毎・毎サンプルではない）。ホットパスではない。
   - **args シグネチャ（TASK-88.1）**: `registerAction`/`registerProbe` に `args: ?[]const ArgSpec = null` を渡せる（省略可・後方互換）。`ArgSpec = {name, kind, min?, max?, values, pattern, optional, variadic, desc}`。**null=未指定（JSON に `args` フィールド無し・従来と bit 一致）/ 空 slice=`"args":[]`（引数なしを明示。MCP の fallback 判定用に null と区別）**。`args != null` のときだけ `"args":[{"name":..,"kind":..(,"min":..)(,"max":..)(,"values":[..])(,"pattern":..)(,"optional":true)(,"variadic":true)(,"desc":..)},...]` を追記（**非デフォルト値のみ emit**）。kind は文字列（推奨: `int`/`float`/`string`/`bool`/`enum`/`path`。app 独自 kind 可。解釈は消費側=MCP）。
-  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 32 + 組み込み6）と desc/args の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
+  - **常に valid JSON を返す契約**: registry 上限（custom probe 16 + action 48 + 組み込み7）と desc/args の登録時サニタイズ（下記）により通常は発生しないが、フェイルセーフとして「収まらない・name/ext に JSON を破損させる文字を含む」エントリはそこで列挙を打ち切り、末尾に `"truncated":true` を付与する（値が false の通常時はフィールド自体を省略）。将来 TASK-62.3（network discover）の互換のため、フィールドは追加のみで変更する。
   - 将来クライアント（TASK-62.3 network discover / TASK-88 MCP 等）が「今このアプリで何を観測・操作できるか」を discover する入口になる。
 - **custom probe（app 所有・opt-in / TASK-32.3）**: app が `platform.registerProbe(...)` で登録した名前。`snapshot <name>` / `digest <name>` を組み込みと同じ文法・出力で扱える。現状: pixie=`canvas`(composite フラット透明 PNG / `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..,name=..}`) / `undo`(`{"depth":N,"redo":M}`) / `tool`(`tool=Pen color=#RRGGBB`) / `cursor` / `history` / `diff`(`changed=N bbox=x0,y0,x1,y1 from=#RRGGBB to=#RRGGBB`。基準は `action diff_mark` または初回 digest で自動初期化。changed=0 時は `bbox=none from=none to=none`) / `palette`(`colors=N used=M top=[#RRGGBB:NN%,...]`。パレット色数 + composite 一意色数 + 上位4色。TASK-89)、synth=`voices`(`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) / `patch`(現在 patch JSON)。**framework は custom probe の中身を解釈しない**（raw bytes と1行 digest をルートするだけ）。
 - **digest の出力先**: replay=stderr に `[harness] digest <probe> <payload>`、live=接続レスポンスに prefix なしの `<probe> <payload>`。snapshot は file 保存し、live はそのパスを返す。
@@ -979,7 +979,10 @@ zig build test-dsp              # src/dsp（Oscillator / ADSR / Filter / Mixer�
 zig build test-synth            # libs/synth（SPSC リング / atomic / Voice / VoicePool / Synth）
 zig build test-spectrogram      # apps/synth スペクトログラム（FFT 列ロジック）
 zig build test-scope            # apps/synth オシロスコープ / レベルメータ
-zig build test-harness          # harness（parser / 実行モデル / 仮想クロック）
+zig build test-harness          # harness（parser / 実行モデル / 仮想クロック / inject midi）
+zig build test-appshell         # libs/appshell（Preferences/WindowState/RecentFiles/DocumentHost）
+zig build test-midi             # core/midi facade + null backend（TASK-115.1）
+zig build test-sound            # libs/sound（WAV decode / SoundPlayer RT ゼロアロケーション。TASK-111.6）
 # 入力変換の単体テスト（display/compositor 不要）: test-platform-input / -wayland-input / -windows-input / -convert / test-platform-types
 # テスト実装の規約: ファイル I/O を伴うテストは cwd 固定ファイル名を使わず std.testing.tmpDir(.{}) を使う
 # （@import 連鎖で同じテストが複数テストバイナリに同居し、集約 test の並列実行で固定名を取り合って
@@ -1009,7 +1012,8 @@ zig build run-example_23        # 23_fullscreen（Window.createFullscreen デモ
 #       06_sprite_benchmark / 07_mouse_input / 08_gui_primitives / 09_gui_interaction / 10_gui_layout /
 #       11_gui_widgets / 12_outline_font / 13_gui_slider / 14_gui_color_picker / 15_audio_tone /
 #       16_gui_scroll / 17_gui_toggles / 18_cursor / 19_color_emoji / 20_capture_demo / 21_char_input /
-#       22_gamepad / 23_fullscreen  （image/ は共有アセットで run step なし）
+#       22_gamepad / 23_fullscreen / 24_desktop_mascot / 25_collision_demo / 26_appshell_demo /
+#       27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo  （image/ は共有アセットで run step なし）
 ```
 
 ---

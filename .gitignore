@@ -4,6 +4,7 @@
 ### https://raw.github.com/github/gitignore/01d2bee6fa7bbe6930e4ebba4cf9ac9c6bef91bc/Zig.gitignore
 
 .zig-cache/
+.zig-global-cache/
 zig-out/
 *.o
 
