@@ -411,6 +411,13 @@ pub const Window = struct {
         return ev;
     }
 
+    /// quit event を consumer が処理した後、close latch を解除する。
+    /// ホットパス宣言: quit/close イベント時のみ。
+    pub fn cancelQuit(self: Window) void {
+        self.state.closing = false;
+        self.state.quit_delivered = false;
+    }
+
     pub fn getEventStats(self: Window) EventStats {
         const q = &self.state.queue;
         return .{

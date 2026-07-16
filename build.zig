@@ -446,7 +446,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = true, .needs_sound = false },
-            .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_paint = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_27", .path = "examples/27_selectable_label/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_28", .path = "examples/28_text_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_30", .path = "examples/30_sound_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
@@ -459,6 +459,7 @@ pub fn build(b: *std.Build) void {
                 .needs_gui = example.needs_gui,
                 .needs_png = example.needs_png,
                 .needs_font = example.needs_font,
+                .needs_paint = if (@hasField(@TypeOf(example), "needs_paint")) example.needs_paint else false,
                 .needs_audio = example.needs_audio,
                 .needs_gamepad = example.needs_gamepad,
                 .needs_gmath = example.needs_gmath,
@@ -2347,6 +2348,7 @@ const ExampleNeeds = struct {
     needs_gui: bool,
     needs_png: bool,
     needs_font: bool,
+    needs_paint: bool = false,
     needs_audio: bool,
     needs_gamepad: bool, // TASK-80.1（examples/22_gamepad のみ true）
     needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
@@ -2392,6 +2394,10 @@ fn addExampleExe(
     if (needs.needs_gui) exe.root_module.addImport("gui", common.gui.mod);
     if (needs.needs_png) exe.root_module.addImport("png", common.png.mod);
     if (needs.needs_font) exe.root_module.addImport("font", common.font.mod);
+    if (needs.needs_paint) {
+        // paint は kit 非収録の流動 lib。Layer.app_direct_ok=true のため example root から直 import 可。
+        linkAppException(appRoot(exe, name), common.paint, "example_26 doodle の direct paint import");
+    }
     if (needs.needs_audio) {
         exe.root_module.addImport("audio", common.audio.mod);
         // L1 オーディオ出力の system ライブラリ（needs_audio の exe にのみ付与。OS 別）。

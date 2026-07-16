@@ -54,8 +54,13 @@ fn defaultPath(buf: []u8, base_buf: []u8, app_name: []const u8) ![]const u8 {
 test "override path is created and opened" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realPathAlloc(std.testing.io, std.testing.allocator, ".");
-    defer std.testing.allocator.free(path);
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(std.testing.io, &cwd_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/.zig-cache/tmp/{s}", .{
+        cwd_buf[0..cwd_len],
+        tmp.sub_path[0..],
+    });
     var dir = try openAppDataDir(std.testing.io, std.testing.allocator, "ignored", path);
     dir.close(std.testing.io);
 }

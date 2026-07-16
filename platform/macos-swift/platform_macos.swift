@@ -300,12 +300,34 @@ class PlatformWindowHandle: NSObject {
     var window: NSWindow
     var view: FramebufferView
     var event_queue: EventQueue
+    var quitDelegate: QuitWindowDelegate?
+    var quitRequested: Bool = false
 
     init(window: NSWindow, view: FramebufferView) {
         self.window = window
         self.view = view
         self.event_queue = EventQueue()
         super.init()
+        let delegate = QuitWindowDelegate()
+        delegate.handle = self
+        self.quitDelegate = delegate
+        window.delegate = delegate
+    }
+}
+
+// close ボタンを終了要求へ変換し、consumer が判断するまで window を閉じない。
+final class QuitWindowDelegate: NSObject, NSWindowDelegate {
+    weak var handle: PlatformWindowHandle?
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        _ = sender
+        guard let handle = handle else { return true }
+        if handle.quitRequested { return false }
+        handle.quitRequested = true
+        var ev = PlatformEvent()
+        ev.type = PLATFORM_EVENT_QUIT
+        handle.event_queue.push(ev)
+        return false
     }
 }
 
@@ -1407,10 +1429,22 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
     #endif
     // CADisplayLink を停止 (callback から view への参照を断つ)
     handle.view.stopDisplayLink()
+    // delegate を外してから自己終了する（windowShouldClose の誤 quit を防止）
+    handle.window.delegate = nil
+    handle.quitDelegate?.handle = nil
+    handle.quitDelegate = nil
     // window を閉じる
     handle.window.close()
     // weak var platformWindow は自動で nil 化される
     // handleはここで自動的にdeallocされる
+}
+
+// consumer が close request をキャンセルして window を継続する。
+@_cdecl("platform_cancel_quit")
+func platform_cancel_quit(platformWindow: UnsafeMutableRawPointer?) -> Void {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.quitRequested = false
 }
 
 @_cdecl("platform_shutdown")

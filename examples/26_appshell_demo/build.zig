@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
     const serde = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/serde/src/serde.zig" } });
     const appshell = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/appshell/src/appshell.zig" } });
     appshell.addImport("serde", serde);
+    const paint = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/paint/src/paint.zig" } });
+    paint.addImport("png", png);
+    paint.addImport("pixelops", pixelops);
+    paint.addImport("font", font);
+    paint.addImport("serde", serde);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_26_appshell_demo",
@@ -48,6 +53,7 @@ pub fn build(b: *std.Build) void {
             .sound = sound,
             .serde = serde,
             .appshell = appshell,
+            .paint = paint,
         },
     });
 }

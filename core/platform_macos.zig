@@ -13,6 +13,10 @@ const c = @cImport({
     @cInclude("platform.h");
 });
 
+// platform.h は旧 C 公開面を維持し、quit cancel はこの backend 専用の追加 ABI として
+// native 実装（objc/swift/metal）が同名 symbol を提供する。
+extern fn platform_cancel_quit(window: *c.PlatformWindow) void;
+
 // 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
 const Error = types.Error;
 const KeyCode = types.KeyCode;
@@ -259,6 +263,12 @@ pub const Window = struct {
 
     pub fn destroy(self: Window) void {
         c.platform_destroy_window(self.handle);
+    }
+
+    /// close delegate が積んだ quit request を consumer がキャンセルする。
+    /// ホットパス宣言: quit/close イベント時のみ。
+    pub fn cancelQuit(self: Window) void {
+        platform_cancel_quit(self.handle);
     }
 
     pub fn pollEvents(self: Window) bool {

@@ -233,6 +233,7 @@ const State = struct {
     configured: bool = false,
     closing: bool = false,
     quit_enqueued: bool = false,
+    quit_delivered: bool = false,
     queue: input.EventQueue = .{},
 
     buffers: [2]ShmBuffer = .{ .{}, .{} },
@@ -245,13 +246,13 @@ const State = struct {
     fn enqueueQuit(self: *State) void {
         if (self.quit_enqueued) return;
         self.quit_enqueued = true;
-        self.closing = true;
         self.queue.enqueue(.quit);
     }
 
     /// connection error 等の異常系: .quit を 1 回積んで pollEvents の戻り値を返す。
     /// closing 後は app の .quit drain を待たず false（TASK-28.5.7。lock-first main loop 救済）。
     fn fail(self: *State) bool {
+        self.closing = true;
         self.enqueueQuit();
         return false;
     }
@@ -1320,7 +1321,20 @@ pub const Window = struct {
 
     pub fn nextEvent(self: Window) ?Event {
         const st = self.state;
-        return st.queue.dequeue() orelse return null;
+        const ev = st.queue.dequeue() orelse return null;
+        if (ev == .quit) st.quit_delivered = true;
+        return ev;
+    }
+
+    /// quit request を consumer がキャンセルして通常運転へ戻す。
+    /// fatal connection failure の closing は解除しない。
+    /// ホットパス宣言: quit/close イベント時のみ。
+    pub fn cancelQuit(self: Window) void {
+        const st = self.state;
+        if (!st.closing) {
+            st.quit_enqueued = false;
+            st.quit_delivered = false;
+        }
     }
 
     pub fn getEventStats(self: Window) EventStats {

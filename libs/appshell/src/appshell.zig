@@ -7,3 +7,13 @@ pub const paths = @import("paths.zig");
 pub const preferences = @import("preferences.zig");
 pub const window_state = @import("window_state.zig");
 pub const recent_files = @import("recent_files.zig");
+pub const document_host = @import("document_host.zig");
+
+// サブモジュールの test decl を test-appshell に収集するための明示的参照。
+test {
+    _ = paths;
+    _ = preferences;
+    _ = window_state;
+    _ = recent_files;
+    _ = document_host;
+}

@@ -369,6 +369,10 @@ pub const Window = struct {
         self.core.destroy();
     }
 
+    pub fn cancelQuit(self: Window) void {
+        self.core.cancelQuit();
+    }
+
     pub fn pollEvents(self: Window) bool {
         return self.core.pollEvents();
     }

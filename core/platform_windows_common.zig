@@ -647,6 +647,13 @@ pub const Core = struct {
         return ev;
     }
 
+    /// WM_CLOSE の終了要求を consumer がキャンセルする。
+    /// ホットパス宣言: quit/close イベント時のみ。
+    pub fn cancelQuit(self: *Core) void {
+        self.closing = false;
+        self.quit_delivered = false;
+    }
+
     pub fn getEventStats(self: *Core) EventStats {
         const q = &self.queue;
         return .{

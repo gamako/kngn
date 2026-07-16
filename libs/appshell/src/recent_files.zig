@@ -106,7 +106,8 @@ pub const RecentFiles = struct {
 test "recent files MRU, limit, and delayed prune" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createFile(std.testing.io, "present.txt", .{});
+    var present = try tmp.dir.createFile(std.testing.io, "present.txt", .{});
+    defer present.close(std.testing.io);
     var recent = RecentFiles.init(std.testing.allocator, 2);
     defer recent.deinit();
     try recent.push("missing.txt");

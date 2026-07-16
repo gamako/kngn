@@ -215,6 +215,13 @@ pub const Window = struct {
         self.inner.destroy();
     }
 
+    /// OS の close/quit 要求を consumer がキャンセルし、window を継続する。
+    /// ホットパス宣言: quit/close イベント時のみ。headless は no-op。
+    pub fn cancelQuit(self: Window) void {
+        if (self.headless) return;
+        if (@hasDecl(backend.Window, "cancelQuit")) self.inner.cancelQuit();
+    }
+
     pub fn pollEvents(self: Window) bool {
         // netsync.pump は headless の pollGate 早期 return より前（全経路・毎フレーム。TASK-62.3.2）。
         // queue 空なら即 return。env 未設定時も started ガードでパススルー。

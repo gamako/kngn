@@ -384,6 +384,8 @@ pub const KitLibs = struct {
     serde: ?*std.Build.Module = null,
     /// kit.appshell（TASK-114.1）。serde と同一 module instance を共有する。
     appshell: ?*std.Build.Module = null,
+    /// 流動中の paint は kit 非収録。example/app の root へ direct import する。
+    paint: ?*std.Build.Module = null,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
@@ -611,6 +613,7 @@ pub fn buildStandalone(
             kit_mod.addImport("app_runtime", kit_app_runtime_mod);
             root.addImport("kit", kit_mod);
         }
+        if (spec.kit_libs) |kl| if (kl.paint) |paint| root.addImport("paint", paint);
         if (spec.keyboard_source) |ks| {
             const kb = b.createModule(.{ .root_source_file = ks });
             kb.addImport("platform", platform_mod);

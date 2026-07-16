@@ -56,11 +56,33 @@ struct PlatformWindow {
     NSWindow* window;
     FramebufferView* view;
     EventQueue event_queue;
+    __strong id quit_delegate;
+    bool quit_requested;
 };
 
 // 前方宣言 (定義は下記マウス入力ヘルパーの後。ゲームパッド connect/disconnect ハンドラから使う)。
 static EventQueueToken queue_push(EventQueue* q, const PlatformEvent* ev);
 static bool queue_mark_none(EventQueue* q, EventQueueToken token);
+
+// close ボタンは native window を閉じず、quit request として consumer へ渡す。
+@interface QuitWindowDelegate : NSObject <NSWindowDelegate>
+@property(nonatomic, assign) PlatformWindow* platformWindow;
+@end
+
+@implementation QuitWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+    (void)sender;
+    PlatformWindow* window = self.platformWindow;
+    if (!window) return YES;
+    if (window->quit_requested) return NO;
+    window->quit_requested = true;
+    PlatformEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = PLATFORM_EVENT_QUIT;
+    queue_push(&window->event_queue, &ev);
+    return NO;
+}
+@end
 
 static bool g_key_trace_enabled = false;
 
@@ -1379,6 +1401,8 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
 
     // イベントキューを初期化
     memset(&platformWindow->event_queue, 0, sizeof(EventQueue));
+    platformWindow->quit_delegate = nil;
+    platformWindow->quit_requested = false;
 
     @autoreleasepool {
         // NSApplicationを取得
@@ -1425,8 +1449,12 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
                                                                width:width
                                                               height:height
                                                             callback:callback
-                                                            userdata:userdata
+                                                             userdata:userdata
                                                      platformWindow:platformWindow];
+        QuitWindowDelegate* quitDelegate = [[QuitWindowDelegate alloc] init];
+        quitDelegate.platformWindow = platformWindow;
+        platformWindow->quit_delegate = quitDelegate;
+        [platformWindow->window setDelegate:quitDelegate];
         if (transparent) {
             [platformWindow->view setTransparentMode:YES]; // CGImage を premultiplied alpha 化
         }
@@ -1566,12 +1594,21 @@ void platform_destroy_window(PlatformWindow* platformWindow) {
         // 2. CADisplayLink を停止 (callback から view への参照を断つ)
         [platformWindow->view stopDisplayLink];
 
-        // 3. window を閉じる → NSWindow が contentView (view) を release
+        // 3. delegate を外してから自己終了する（windowShouldClose が誤って quit を積まないため）。
+        [platformWindow->window setDelegate:nil];
+        platformWindow->quit_delegate = nil;
+        // 4. window を閉じる → NSWindow が contentView (view) を release
         [platformWindow->window close];
     }
 
-    // 4. PlatformWindow 自体を解放
+    // 5. PlatformWindow 自体を解放
     free(platformWindow);
+}
+
+// consumer が close request をキャンセルして window を継続する。
+void platform_cancel_quit(PlatformWindow* platformWindow) {
+    if (!platformWindow) return;
+    platformWindow->quit_requested = false;
 }
 
 // プラットフォームシャットダウン
