@@ -102,9 +102,11 @@ const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
 const LAYER_CTX_MENU_ID: gui.Id = 0xA430_2000;
 /// テキストレイヤー編集パネル（TASK-79.5）の明示 ID 群。
 const TEXT_PANEL_ID_BASE: gui.Id = 0xA430_3000;
+const TEXT_EDIT_BOX_ID: gui.Id = TEXT_PANEL_ID_BASE + 6;
 /// レイヤー行 box 自身の明示 ID に使う `layerWidgetId` part（0..3 は既存: 0=選択ボタン/1=可視
 /// トグル/2=opacity slider/3=サムネ）。右クリックのヒットテストは行全体の矩形を使う。
 const LAYER_ROW_PART_ROW: gui.Id = 4;
+const LAYER_ROW_PART_IME: gui.Id = 5;
 /// 履歴パネル（TASK-83 Phase 1）の明示 ID 群。
 const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
 // レイヤーパネルのサムネイル（raw layer をチェッカー下地へ最近傍縮小・等倍 blit）
@@ -185,6 +187,42 @@ const ToolKind = enum {
 const RING_COLOR_A = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // 白
 const RING_COLOR_B = gui.Color.rgba(0xC9, 0x7A, 0x20, 0xFF); // ブラシバッジと同系オレンジ
 
+const InlineCompositionDraw = struct {
+    committed: []const u8,
+    preedit: []const u8,
+    cursor: usize,
+    font: gui.Font,
+    color: gui.Color,
+    preedit_color: gui.Color,
+};
+
+const CompositionCaretRect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+fn drawInlineComposition(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect) void {
+    const d: *const InlineCompositionDraw = @ptrCast(@alignCast(ctx_ptr));
+    const committed_w: i32 = @intCast(d.font.measure(d.committed));
+    const preedit_w: i32 = @intCast(d.font.measure(d.preedit));
+    dl.textEx(.{ .x = rect.x, .y = rect.y }, d.committed, d.color, d.font) catch @panic("composition text: OOM");
+    dl.textEx(.{ .x = rect.x + committed_w, .y = rect.y }, d.preedit, d.preedit_color, d.font) catch @panic("composition preedit: OOM");
+    const metrics = d.font.metrics();
+    const start_x = rect.x + committed_w;
+    // 下線は baseline 直下（ascent+2）。行ボックス最下端だと descent 下に浮く（実機指摘）。
+    const underline_y = @min(rect.y + @as(i32, @intCast(metrics.ascent)) + 2, rect.y + @as(i32, @intCast(metrics.line_height)) - 1);
+    dl.line(.{
+        .x = start_x,
+        .y = underline_y,
+    }, .{
+        .x = start_x + preedit_w,
+        .y = underline_y,
+    }, d.preedit_color, 1) catch @panic("composition underline: OOM");
+    const cursor_prefix = d.preedit[0..@min(d.cursor, d.preedit.len)];
+    const cursor_x = start_x + @as(i32, @intCast(d.font.measure(cursor_prefix)));
+    dl.line(.{ .x = cursor_x, .y = rect.y + 2 }, .{
+        .x = cursor_x,
+        .y = rect.y + @as(i32, @intCast(metrics.line_height)) - 2,
+    }, d.preedit_color, 1) catch @panic("composition caret: OOM");
+}
+
 /// platform.MouseButton → InputEvent の button index（0=left/1=right/2=middle）。
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
@@ -240,6 +278,18 @@ const App = struct {
     pub fn onWindowReady(self: *App, win: *platform.Window) void {
         self.redraw_win = win.*;
         win.setRedrawCallback(self, redrawCb);
+    }
+
+    fn syncComposition(self: *App, win: *platform.Window) void {
+        if (!self.composition_dirty) return;
+        const snapshot = win.getCompositionSnapshot(self.preedit_buf[0..]);
+        self.preedit_len = snapshot.text.len;
+        self.preedit_cursor = @min(@as(usize, snapshot.cursor), self.preedit_len);
+        self.composition_dirty = false;
+    }
+
+    fn preedit(self: *const App) []const u8 {
+        return self.preedit_buf[0..self.preedit_len];
     }
 
     io: std.Io,
@@ -372,6 +422,12 @@ const App = struct {
     /// テキストレイヤー内容インライン編集の状態機械（TASK-79.5）。`rename_in` と対称
     /// （どちらか一方のみ active。`beginTextEdit`/`beginRenameLayer` が互いを明示的に cancel する）。
     text_in: text_content_input.TextContentInput = .{},
+    /// IME preedit snapshot（latest-wins）。composition_changed を受けたフレームで更新する。
+    preedit_buf: [1024]u8 = undefined,
+    preedit_len: usize = 0,
+    preedit_cursor: usize = 0,
+    composition_dirty: bool = false,
+    composition_rect: ?CompositionCaretRect = null,
 
     /// ── command model（TASK-62.5.3）。「誰が（local_user/local_agent）・何を実行したか」の単一 log ──
     /// 常時有効・固定容量（alloc なし）。transport の有無に依存しない（harness replay でも copilot
@@ -3626,15 +3682,29 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         // 実質予算は 70〜90px 程度しかなく、無制限だと opacity slider 等がスクロール viewport
         // 外へ押し出され操作不能になりうるため。
         if (app.rename_in.active and app.rename_in.layer_idx == idx) {
-            var cursor_buf: [96]u8 = undefined;
             const shown = truncateForDisplay(ctx.allocator(), app.rename_in.text(), LAYER_NAME_DISPLAY_MAX);
-            const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
             ctx.beginBox(.{
+                .id = layerWidgetId(idx, LAYER_ROW_PART_IME),
                 .padding = .{ 2, 4, 2, 4 },
                 .bg = ctx.style.bg_active,
                 .border = .{ .color = ctx.style.border_hover, .thickness = 1 },
             });
-            ctx.labelEx(with_cursor, ctx.style.text);
+            if (app.preedit().len > 0) {
+                const draw_ctx = ctx.allocator().create(InlineCompositionDraw) catch @panic("composition draw ctx: OOM");
+                draw_ctx.* = .{
+                    .committed = shown,
+                    .preedit = app.preedit(),
+                    .cursor = app.preedit_cursor,
+                    .font = ctx.font,
+                    .color = ctx.style.text,
+                    .preedit_color = gui.Color.rgba(0x66, 0xCC, 0xFF, 0xFF),
+                };
+                ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = @intCast(ctx.font.metrics().line_height) }, drawInlineComposition, draw_ctx);
+            } else {
+                var cursor_buf: [96]u8 = undefined;
+                const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
+                ctx.labelEx(with_cursor, ctx.style.text);
+            }
             ctx.endBox();
         } else {
             const shown = truncateForDisplay(ctx.allocator(), layer.name(), LAYER_NAME_DISPLAY_MAX);
@@ -3745,15 +3815,29 @@ fn buildTextLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.beginBox(.{ .direction = .column, .gap = 3 });
 
     if (app.text_in.active and app.text_in.layer_idx == idx) {
-        var cursor_buf: [160]u8 = undefined;
         const shown = truncateForDisplay(ctx.allocator(), app.text_in.text(), LAYER_NAME_DISPLAY_MAX);
-        const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
         ctx.beginBox(.{
+            .id = TEXT_EDIT_BOX_ID,
             .padding = .{ 2, 4, 2, 4 },
             .bg = ctx.style.bg_active,
             .border = .{ .color = ctx.style.border_hover, .thickness = 1 },
         });
-        ctx.labelEx(with_cursor, ctx.style.text);
+        if (app.preedit().len > 0) {
+            const draw_ctx = ctx.allocator().create(InlineCompositionDraw) catch @panic("composition draw ctx: OOM");
+            draw_ctx.* = .{
+                .committed = shown,
+                .preedit = app.preedit(),
+                .cursor = app.preedit_cursor,
+                .font = ctx.font,
+                .color = ctx.style.text,
+                .preedit_color = gui.Color.rgba(0x66, 0xCC, 0xFF, 0xFF),
+            };
+            ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = @intCast(ctx.font.metrics().line_height) }, drawInlineComposition, draw_ctx);
+        } else {
+            var cursor_buf: [160]u8 = undefined;
+            const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
+            ctx.labelEx(with_cursor, ctx.style.text);
+        }
         ctx.endBox();
     } else {
         const shown = truncateForDisplay(ctx.allocator(), layer.text_params.text(), LAYER_NAME_DISPLAY_MAX);
@@ -4472,6 +4556,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     self.rename_in.appendCodepoint(c.codepoint)
                 else if (self.text_in.active)
                     self.text_in.appendCodepoint(c.codepoint),
+                .composition_changed => self.composition_dirty = true,
                 else => {},
             }
             // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
@@ -4482,6 +4567,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             }
         }
 
+        self.syncComposition(win);
+
         // canvas rect は前フレームの layout 結果（初回フレームは null）。
         // canvasBlitRect は pan を現 area に clamp して app へ書き戻し、last_area も更新する。
         var canvas_rect = canvasBlitRect(&self.ctx, self);
@@ -4490,6 +4577,43 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         try buildUi(&self.ctx, self, canvas_rect);
         self.ctx.endFrame();
+
+        // IME 候補窓の基準 caret。rect cache は endFrame 後に確定するため、この時点で供給する。
+        // preedit の有無でゲートしない: IME は composition 開始打鍵の handleEvent 中（= app が
+        // 新 rect を供給する前）に窓位置を決めるため、入力 UI がアクティブな間は常に caret を
+        // 指しておく（stale rect による初回表示ずれの実機指摘 2026-07-17）。
+        if (self.text_in.active or self.rename_in.active) {
+            const caret_text = if (self.text_in.active)
+                self.text_in.text()
+            else if (self.rename_in.active)
+                self.rename_in.text()
+            else
+                "";
+            const caret_x_offset: i32 = @intCast(self.ctx.font.measure(caret_text));
+            const caret_id = if (self.text_in.active)
+                TEXT_EDIT_BOX_ID
+            else if (self.rename_in.active)
+                layerWidgetId(self.rename_in.layer_idx, LAYER_ROW_PART_IME)
+            else
+                0;
+            if (caret_id != 0) if (self.ctx.getNodeRect(caret_id)) |r| {
+                const rect = CompositionCaretRect{
+                    .x = r.x + 4 + caret_x_offset,
+                    .y = r.y + 2,
+                    .w = 1,
+                    .h = @intCast(self.ctx.font.metrics().line_height),
+                };
+                if (self.composition_rect == null or
+                    self.composition_rect.?.x != rect.x or
+                    self.composition_rect.?.y != rect.y or
+                    self.composition_rect.?.w != rect.w or
+                    self.composition_rect.?.h != rect.h)
+                {
+                    win.setCompositionRect(rect.x, rect.y, rect.w, rect.h);
+                    self.composition_rect = rect;
+                }
+            };
+        }
 
         // ── ビューポート: ホイールズーム（カーソル中心）/ パン（Space+左 or middle ドラッグ）──
         // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。

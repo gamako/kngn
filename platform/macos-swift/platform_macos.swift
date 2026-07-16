@@ -16,10 +16,23 @@ let IMPLEMENTATION_TYPE = "CALayer Optimized (Swift)"
 // ========================================
 
 let EVENT_QUEUE_SIZE = 256
+let keyTraceEnabled = ProcessInfo.processInfo.environment["VP_KEY_TRACE"] == "1"
+
+func keyTrace(_ message: String) {
+    guard keyTraceEnabled else { return }
+    let line = Data("[key-trace] \(message)\n".utf8)
+    FileHandle.standardError.write(line)
+}
+
+struct EventQueueToken {
+    let index: Int
+    let generation: UInt32
+}
 
 // イベントキュー構造体（固定サイズ配列を使用）
 class EventQueue {
     private var events: UnsafeMutablePointer<PlatformEvent>
+    private var slotGeneration: [UInt32]
     var head: Int = 0  // 次に書き込む位置
     var tail: Int = 0  // 次に読む位置
     // 観測カウンタ (累積値、example で差分監視に使う)
@@ -32,6 +45,7 @@ class EventQueue {
         events = UnsafeMutablePointer<PlatformEvent>.allocate(capacity: EVENT_QUEUE_SIZE)
         // すべてのイベントを 0 初期化 (type = PLATFORM_EVENT_NONE)
         events.initialize(repeating: PlatformEvent(), count: EVENT_QUEUE_SIZE)
+        slotGeneration = [UInt32](repeating: 0, count: EVENT_QUEUE_SIZE)
     }
 
     subscript(index: Int) -> PlatformEvent {
@@ -78,14 +92,25 @@ class EventQueue {
     }
 
     // キューに push (満杯なら drop カウンタを増やして捨てる)
-    func push(_ ev: PlatformEvent) {
+    func push(_ ev: PlatformEvent) -> EventQueueToken? {
         let next_head = (head + 1) % EVENT_QUEUE_SIZE
         if next_head == tail {
             eventDropCount += 1
-            return
+            return nil
         }
-        events[head] = ev
+        let index = head
+        slotGeneration[index] &+= 1
+        events[index] = ev
         head = next_head
+        return EventQueueToken(index: index, generation: slotGeneration[index])
+    }
+
+    func markNone(_ token: EventQueueToken) -> Bool {
+        guard token.index >= 0 && token.index < EVENT_QUEUE_SIZE else { return false }
+        guard slotGeneration[token.index] == token.generation else { return false }
+        guard events[token.index].type == PLATFORM_EVENT_KEY_DOWN else { return false }
+        events[token.index].type = PLATFORM_EVENT_NONE
+        return true
     }
 
     deinit {
@@ -465,6 +490,8 @@ class FramebufferView: NSView, NSTextInputClient {
     private var compositionLen: UInt32 = 0
     private var compositionRevision: UInt32 = 0
     private var compositionCursor: UInt32 = 0
+    private var compositionRectPixels = NSRect.zero
+    private var compositionRectSet = false
 
     // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
     private var transparentMode: Bool = false  // true で CGImage を premultiplied alpha 化し fb の alpha を honor
@@ -590,6 +617,7 @@ class FramebufferView: NSView, NSTextInputClient {
         ev.payload.composition.phase = phase
         ev.payload.composition.cursor = compositionCursor
         handle.event_queue.push(ev)
+        keyTrace("composition phase=\(phase) revision=\(compositionRevision) cursor=\(compositionCursor)")
     }
 
     /// Cmd/Ctrl 押下中は char_input を出さない（キーバインド経由 insertText の誤印字防止。codex 修正 B）。
@@ -608,6 +636,7 @@ class FramebufferView: NSView, NSTextInputClient {
                 charEvent.payload.character.codepoint = cp
                 charEvent.payload.character.modifiers = charMods
                 handle.event_queue.push(charEvent)
+                keyTrace(String(format: "char_input cp=U+%X mods=0x%X", cp, charMods))
             }
         }
     }
@@ -615,6 +644,7 @@ class FramebufferView: NSView, NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
         _ = replacementRange
+        keyTrace("insertText")
         let str: String
         if let attr = string as? NSAttributedString {
             str = attr.string
@@ -637,6 +667,7 @@ class FramebufferView: NSView, NSTextInputClient {
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
         _ = replacementRange
+        keyTrace("setMarkedText")
         let str: String
         if let attr = string as? NSAttributedString {
             str = attr.string
@@ -710,8 +741,24 @@ class FramebufferView: NSView, NSTextInputClient {
 
     func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
         actualRange?.pointee = range
-        // MVP: view 左上近傍の固定 rect（候補窓が window 近傍に出ること。caret 供給は 79.6.2）
-        var r = NSRect(x: 20.0, y: bounds.size.height - 48.0, width: 1.0, height: 18.0)
+        var r: NSRect
+        if compositionRectSet && compositionRectPixels.width > 0 && compositionRectPixels.height > 0 {
+            // fb は Retina backing ではなく layer が bounds 全面へ拡縮表示するため、換算は
+            // bounds 比（mouse 変換の逆写像と同型）。
+            let sx = width > 0 ? bounds.width / CGFloat(width) : 1.0
+            let sy = height > 0 ? bounds.height / CGFloat(height) : 1.0
+            var x = compositionRectPixels.origin.x * sx
+            var top = compositionRectPixels.origin.y * sy
+            var w = compositionRectPixels.width * sx
+            var h = compositionRectPixels.height * sy
+            x = max(bounds.minX, min(x, bounds.maxX))
+            top = max(0.0, min(top, bounds.height))
+            w = min(w, max(0.0, bounds.maxX - x))
+            h = min(h, max(0.0, bounds.height - top))
+            r = NSRect(x: x, y: bounds.height - top - h, width: w, height: h)
+        } else {
+            r = NSRect(x: 20.0, y: bounds.size.height - 48.0, width: 1.0, height: 18.0)
+        }
         r = convert(r, to: nil)
         if let win = window {
             r = win.convertToScreen(r)
@@ -722,7 +769,16 @@ class FramebufferView: NSView, NSTextInputClient {
     override func doCommand(by selector: Selector) {
         // 未処理 command を吸収してビープ抑止。物理キーは key_down 経路で既に届く。
         // super は呼ばない（未処理 command のビープを抑止する NSTextInputClient 契約）。
-        _ = selector
+        keyTrace("doCommandBySelector=\(NSStringFromSelector(selector))")
+    }
+
+    func setCompositionRectPixels(x: Int32, y: Int32, w: Int32, h: Int32) {
+        let next = NSRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(w), height: CGFloat(h))
+        let nextSet = w > 0 && h > 0
+        guard next != compositionRectPixels || nextSet != compositionRectSet else { return }
+        compositionRectPixels = next
+        compositionRectSet = nextSet
+        inputContext?.invalidateCharacterCoordinates()
     }
 
     func startDisplayLink() {
@@ -1382,12 +1438,22 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
             platform_event.payload.keyboard.is_repeat = event.isARepeat
             platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags)
-            handle.event_queue.push(platform_event)
+            let token = handle.event_queue.push(platform_event)
+            keyTrace("key_\(event.type == .keyDown ? "down" : "up") push=\(token != nil) key=\(platform_event.payload.keyboard.key) mods=0x\(String(platform_event.payload.keyboard.modifiers, radix: 16))")
 
             // keyDown: 物理 key_down を積んだ後 IME/inputContext 経路へ（TASK-79.6.1）。
             // insertText が char_input の唯一の生成元。旧 event.characters 直読みは廃止。
             if event.type == .keyDown {
-                handle.view.interpretKeyEvents([event])
+                let hadMarked = handle.view.hasMarkedText()
+                let hasInputContext = handle.view.inputContext != nil
+                var handled = false
+                if let inputContext = handle.view.inputContext {
+                    handled = inputContext.handleEvent(event)
+                }
+                let hasMarked = handle.view.hasMarkedText()
+                let commandModified = (platform_event.payload.keyboard.modifiers & (UInt32(PLATFORM_MOD_CMD.rawValue) | UInt32(PLATFORM_MOD_CTRL.rawValue))) != 0
+                let tombstone = hasInputContext && !commandModified && (hadMarked || hasMarked) && token.map { handle.event_queue.markNone($0) } == true
+                keyTrace("handleEvent bool=\(handled) marked=\(hadMarked)->\(hasMarked) tombstone=\(tombstone)")
             }
 
             // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
@@ -1426,6 +1492,13 @@ func platform_get_composition_snapshot(
     guard let platformWindow = platformWindow else { return 0 }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     return handle.view.copyCompositionSnapshot(buf: buf, cap: cap, meta: meta)
+}
+
+@_cdecl("platform_set_composition_rect")
+func platform_set_composition_rect(platformWindow: UnsafeMutableRawPointer?, x: Int32, y: Int32, w: Int32, h: Int32) {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.view.setCompositionRectPixels(x: x, y: y, w: w, h: h)
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

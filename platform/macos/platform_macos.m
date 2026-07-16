@@ -7,6 +7,7 @@
 #include "platform.h"
 #include <math.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <time.h>
 
@@ -34,7 +35,14 @@ static uint32_t extractModifiers(NSEventModifierFlags nsModifiers) {
 
 // イベントキュー構造体
 typedef struct {
+    int index;
+    uint32_t generation;
+    bool valid;
+} EventQueueToken;
+
+typedef struct {
     PlatformEvent events[EVENT_QUEUE_SIZE];
+    uint32_t slot_generation[EVENT_QUEUE_SIZE];
     int head;  // 次に書き込む位置
     int tail;  // 次に読む位置
     // 観測カウンタ (累積値、example で差分監視に使う)
@@ -51,7 +59,20 @@ struct PlatformWindow {
 };
 
 // 前方宣言 (定義は下記マウス入力ヘルパーの後。ゲームパッド connect/disconnect ハンドラから使う)。
-static void queue_push(EventQueue* q, const PlatformEvent* ev);
+static EventQueueToken queue_push(EventQueue* q, const PlatformEvent* ev);
+static bool queue_mark_none(EventQueue* q, EventQueueToken token);
+
+static bool g_key_trace_enabled = false;
+
+static void key_trace(const char* fmt, ...) {
+    if (!g_key_trace_enabled) return;
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[key-trace] ");
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
+    va_end(args);
+}
 
 // ========================================
 // ゲームパッド入力 (TASK-80.2。ADR-009)
@@ -219,15 +240,27 @@ static bool try_merge_mouse_scroll(EventQueue* q, const PlatformEvent* ev) {
     return true;
 }
 
-// キューに push (満杯なら drop カウンタを増やして捨てる)
-static void queue_push(EventQueue* q, const PlatformEvent* ev) {
+// キューに push (満杯なら drop カウンタを増やして捨てる)。成功時は slot token を返す。
+static EventQueueToken queue_push(EventQueue* q, const PlatformEvent* ev) {
+    EventQueueToken invalid = { .index = -1, .generation = 0, .valid = false };
     int next_head = (q->head + 1) % EVENT_QUEUE_SIZE;
     if (next_head == q->tail) {
         q->event_drop_count++;
-        return;
+        return invalid;
     }
-    q->events[q->head] = *ev;
+    const int index = q->head;
+    q->slot_generation[index] += 1;
+    q->events[index] = *ev;
     q->head = next_head;
+    return (EventQueueToken){ .index = index, .generation = q->slot_generation[index], .valid = true };
+}
+
+static bool queue_mark_none(EventQueue* q, EventQueueToken token) {
+    if (!token.valid || token.index < 0 || token.index >= EVENT_QUEUE_SIZE) return false;
+    if (q->slot_generation[token.index] != token.generation) return false;
+    if (q->events[token.index].type != PLATFORM_EVENT_KEY_DOWN) return false;
+    q->events[token.index].type = PLATFORM_EVENT_NONE;
+    return true;
 }
 
 // NSEvent の locationInWindow を view 内の左上原点座標へ変換 (floor 整数化)。
@@ -327,6 +360,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     uint32_t compositionLen;
     uint32_t compositionRevision;
     uint32_t compositionCursor; // preedit 内 UTF-8 バイトオフセット
+    NSRect compositionRectPixels; // framebuffer pixel・content 左上原点
+    BOOL compositionRectSet;
 
     // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
     BOOL transparentMode;      // YES で CGImage を premultiplied alpha 化し fb の alpha を honor
@@ -359,6 +394,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 // composition snapshot（platform_get_composition_snapshot から呼ぶ）
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta;
+- (void)setCompositionRectPixelsX:(int32_t)x y:(int32_t)y w:(int32_t)w h:(int32_t)h;
 
 // 透過ウィンドウ関連 (TASK-104)
 - (void)setTransparentMode:(BOOL)on;
@@ -392,6 +428,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         compositionRevision = 0;
         compositionCursor = 0;
         memset(compositionUtf8, 0, sizeof(compositionUtf8));
+        compositionRectPixels = NSZeroRect;
+        compositionRectSet = NO;
         transparentMode = NO;   // TASK-104: 既定は不透明（従来挙動と bit 一致）
         clickThrough = NO;
         clickThroughState = NO; // 初期 ignoresMouseEvents=NO と一致
@@ -795,6 +833,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     ev.payload.composition.phase = phase;
     ev.payload.composition.cursor = compositionCursor;
     queue_push(&platformWindow->event_queue, &ev);
+    key_trace("composition phase=%u revision=%u cursor=%u", phase, compositionRevision, compositionCursor);
 }
 
 /// insertText の文字列を codepoint 分解して CHAR_INPUT を積む（制御/private-use 除外）。
@@ -823,6 +862,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             char_event.payload.character.codepoint = cp;
             char_event.payload.character.modifiers = char_mods;
             queue_push(&platformWindow->event_queue, &char_event);
+            key_trace("char_input cp=U+%X mods=0x%X", cp, char_mods);
         }
     }
 }
@@ -830,6 +870,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
     // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
     (void)replacementRange;
+    key_trace("insertText");
     NSString* str = [string isKindOfClass:[NSAttributedString class]]
         ? [(NSAttributedString*)string string]
         : (NSString*)string;
@@ -847,6 +888,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange {
     // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
     (void)replacementRange;
+    key_trace("setMarkedText");
     NSString* str = [string isKindOfClass:[NSAttributedString class]]
         ? [(NSAttributedString*)string string]
         : (NSString*)string;
@@ -915,9 +957,26 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
     if (actualRange) *actualRange = range;
-    // MVP: view 左上近傍の固定 rect（候補窓が window 近傍に出ること。caret 供給は 79.6.2）。
-    // AppKit view 座標は下原点。bounds 上端付近へ置く。
-    NSRect r = NSMakeRect(20.0, self.bounds.size.height - 48.0, 1.0, 18.0);
+    // app の framebuffer pixel rect を view point へ換算する。fb は Retina backing ではなく
+    // contentLayer が bounds 全面へ拡縮表示するため、換算は bounds 比（mouse 変換の逆写像と同型）。
+    NSRect r;
+    if (compositionRectSet && compositionRectPixels.size.width > 0 && compositionRectPixels.size.height > 0) {
+        const NSRect bounds = self.bounds;
+        CGFloat sx = (width > 0) ? bounds.size.width / (CGFloat)width : 1.0;
+        CGFloat sy = (height > 0) ? bounds.size.height / (CGFloat)height : 1.0;
+        CGFloat x = compositionRectPixels.origin.x * sx;
+        CGFloat top = compositionRectPixels.origin.y * sy;
+        CGFloat w = compositionRectPixels.size.width * sx;
+        CGFloat h = compositionRectPixels.size.height * sy;
+        x = MAX(bounds.origin.x, MIN(x, NSMaxX(bounds)));
+        top = MAX(0.0, MIN(top, bounds.size.height));
+        w = MIN(w, MAX(0.0, NSMaxX(bounds) - x));
+        h = MIN(h, MAX(0.0, bounds.size.height - top));
+        r = NSMakeRect(x, bounds.size.height - top - h, w, h);
+    } else {
+        // 未供給/0 サイズは既存 MVP 固定 rect fallback。
+        r = NSMakeRect(20.0, self.bounds.size.height - 48.0, 1.0, 18.0);
+    }
     r = [self convertRect:r toView:nil];
     if (self.window) {
         r = [self.window convertRectToScreen:r];
@@ -927,7 +986,15 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 - (void)doCommandBySelector:(SEL)selector {
     // 未処理 command を吸収してビープ抑止。BACKSPACE/ENTER 等の物理キーは key_down 経路で既に届く。
-    (void)selector;
+    key_trace("doCommandBySelector=%s", selector ? sel_getName(selector) : "(null)");
+}
+
+- (void)setCompositionRectPixelsX:(int32_t)x y:(int32_t)y w:(int32_t)w h:(int32_t)h {
+    NSRect next = NSMakeRect(x, y, w, h);
+    if (NSEqualRects(compositionRectPixels, next) && compositionRectSet == (w > 0 && h > 0)) return;
+    compositionRectPixels = next;
+    compositionRectSet = w > 0 && h > 0;
+    [self.inputContext invalidateCharacterCoordinates];
 }
 
 // ========================================
@@ -1273,7 +1340,8 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
 
 // プラットフォーム初期化
 bool platform_init(void) {
-    // macOSでは特に初期化不要
+    const char* trace = getenv("VP_KEY_TRACE");
+    g_key_trace_enabled = trace && strcmp(trace, "1") == 0;
     return true;
 }
 
@@ -1538,13 +1606,24 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                 platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode);
                 platform_event.payload.keyboard.is_repeat = event.isARepeat;
                 platform_event.payload.keyboard.modifiers = extractModifiers(event.modifierFlags);
-                queue_push(&platformWindow->event_queue, &platform_event);
+                EventQueueToken token = queue_push(&platformWindow->event_queue, &platform_event);
+                key_trace("key_%s push=%d slot=%d gen=%u key=%d mods=0x%X", event.type == NSEventTypeKeyDown ? "down" : "up", token.valid, token.index, token.generation, platform_event.payload.keyboard.key, platform_event.payload.keyboard.modifiers);
 
                 // keyDown: 物理 key_down を積んだ後 IME/inputContext 経路へ（TASK-79.6.1）。
                 // insertText: が char_input の唯一の生成元。旧 event.characters 直読みは廃止
                 // （二重入力・IME 迂回防止）。sendEvent は呼ばない（ビープは doCommandBySelector で吸収）。
                 if (event.type == NSEventTypeKeyDown && platformWindow->view) {
-                    [platformWindow->view interpretKeyEvents:@[event]];
+                    FramebufferView* view = platformWindow->view;
+                    const BOOL hadMarked = [view hasMarkedText];
+                    BOOL handled = NO;
+                    const BOOL hasInputContext = [view inputContext] != nil;
+                    if (hasInputContext) {
+                        handled = [[view inputContext] handleEvent:event];
+                    }
+                    const BOOL hasMarked = [view hasMarkedText];
+                    const BOOL commandModified = (platform_event.payload.keyboard.modifiers & (PLATFORM_MOD_CMD | PLATFORM_MOD_CTRL)) != 0;
+                    const BOOL tombstone = token.valid && hasInputContext && !commandModified && (hadMarked || hasMarked) && queue_mark_none(&platformWindow->event_queue, token);
+                    key_trace("handleEvent bool=%d marked=%d->%d tombstone=%d", handled, hadMarked, hasMarked, tombstone);
                 }
 
                 // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
@@ -1640,6 +1719,11 @@ uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, ui
     }
     if (!window || !window->view) return 0;
     return [window->view copyCompositionSnapshot:buf cap:cap meta:meta];
+}
+
+void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!window || !window->view) return;
+    [window->view setCompositionRectPixelsX:x y:y w:w h:h];
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

@@ -408,8 +408,18 @@ pub const Window = struct {
     ///
     /// ホットパス宣言: イベント時のみ（描画前の preedit 読み。フレーム毎全画素でも RT でもない）。
     pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
+        if (harness.isEnabled()) return harness.getCompositionSnapshot(buf);
         if (self.headless) return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
         return self.inner.getCompositionSnapshot(buf);
+    }
+
+    /// IME 候補窓の caret 基準 rect を framebuffer pixel・content 左上原点で供給する。
+    /// headless / 未対応 backend は no-op。レイアウト変化時などイベント時のみ呼ぶ。
+    pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
+        if (self.headless) return;
+        if (comptime @hasDecl(backend.Window, "setCompositionRect")) {
+            self.inner.setCompositionRect(x, y, w, h);
+        }
     }
 };
 

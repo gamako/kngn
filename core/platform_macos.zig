@@ -113,6 +113,22 @@ inline fn makeCompositionEvent(ev: c.PlatformEvent) CompositionEvent {
     };
 }
 
+inline fn isFacadeSkipEvent(raw: c.PlatformEventType) bool {
+    return raw == c.PLATFORM_EVENT_NONE;
+}
+
+test "macOS facade NONE skip: FIFO 順を保ったまま wrap 境界を越える" {
+    try std.testing.expect(isFacadeSkipEvent(c.PLATFORM_EVENT_NONE));
+    try std.testing.expect(!isFacadeSkipEvent(c.PLATFORM_EVENT_KEY_DOWN));
+    var index: usize = 254;
+    index = (index + 1) % 256;
+    try std.testing.expectEqual(@as(usize, 255), index);
+    index = (index + 1) % 256;
+    try std.testing.expectEqual(@as(usize, 0), index);
+    index = (index + 1) % 256;
+    try std.testing.expectEqual(@as(usize, 1), index);
+}
+
 /// C の `gamepad.name`（32byte+NUL固定バッファ）を `GamepadInfo.name_buf` へコピーする（TASK-80.2）。
 /// `strlen` 相当で NUL 終端までを有効長とし、`GAMEPAD_NAME_MAX` を超える分は切り詰める
 /// （backend 側が既に切り詰め済みのため通常は発生しない。防御的にここでも境界を守る）。
@@ -127,6 +143,29 @@ inline fn makeGamepadInfo(ev: c.PlatformEvent) GamepadInfo {
 
 inline fn makeGamepadDisconnect(ev: c.PlatformEvent) GamepadDisconnect {
     return .{ .index = @intCast(ev.payload.gamepad.index) };
+}
+
+var key_trace_state: ?bool = null;
+
+fn keyTraceEnabled() bool {
+    if (key_trace_state) |enabled| return enabled;
+    const enabled = if (std.c.getenv("VP_KEY_TRACE")) |value|
+        std.mem.eql(u8, std.mem.span(value), "1")
+    else
+        false;
+    key_trace_state = enabled;
+    return enabled;
+}
+
+fn traceFacadeEvent(ev: Event) void {
+    if (!keyTraceEnabled()) return;
+    switch (ev) {
+        .key_down => |k| std.debug.print("[key-trace] facade key_down key={d} repeat={d} mods=0x{X}\n", .{ @intFromEnum(k.key), @intFromBool(k.is_repeat), k.modifiers.toC() }),
+        .key_up => |k| std.debug.print("[key-trace] facade key_up key={d} mods=0x{X}\n", .{ @intFromEnum(k.key), k.modifiers.toC() }),
+        .char_input => |ch| std.debug.print("[key-trace] facade char_input cp=U+{X} mods=0x{X}\n", .{ ch.codepoint, ch.modifiers.toC() }),
+        .composition_changed => |co| std.debug.print("[key-trace] facade composition phase={s} rev={d} cursor={d}\n", .{ @tagName(co.phase), co.revision, co.cursor }),
+        else => {},
+    }
 }
 
 // ============================================================================
@@ -230,7 +269,8 @@ pub const Window = struct {
         while (true) {
             var ev: c.PlatformEvent = undefined;
             if (!c.platform_get_event(self.handle, &ev)) return null;
-            return switch (ev.type) {
+            if (isFacadeSkipEvent(ev.type)) continue;
+            const mapped: ?Event = switch (ev.type) {
                 c.PLATFORM_EVENT_QUIT => .quit,
                 c.PLATFORM_EVENT_KEY_DOWN => Event{ .key_down = makeKeyEvent(ev) },
                 c.PLATFORM_EVENT_KEY_UP => Event{ .key_up = makeKeyEvent(ev) },
@@ -242,8 +282,12 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_GAMEPAD_CONNECTED => Event{ .gamepad_connected = makeGamepadInfo(ev) },
                 c.PLATFORM_EVENT_GAMEPAD_DISCONNECTED => Event{ .gamepad_disconnected = makeGamepadDisconnect(ev) },
                 c.PLATFORM_EVENT_COMPOSITION => Event{ .composition_changed = makeCompositionEvent(ev) },
-                else => continue,
+                else => null,
             };
+            if (mapped) |event| {
+                traceFacadeEvent(event);
+                return event;
+            }
         }
     }
 
@@ -267,6 +311,11 @@ pub const Window = struct {
             .revision = meta.revision,
             .cursor = meta.cursor,
         };
+    }
+
+    /// IME 候補窓の caret 基準 rect を framebuffer pixel で供給する（イベント時のみ）。
+    pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
+        c.platform_set_composition_rect(self.handle, x, y, w, h);
     }
 
     pub fn getEventStats(self: Window) EventStats {

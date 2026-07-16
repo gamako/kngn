@@ -51,6 +51,8 @@ const GamepadButton = types.GamepadButton;
 const GamepadState = types.GamepadState;
 const GamepadInfo = types.GamepadInfo;
 const GamepadDisconnect = types.GamepadDisconnect;
+const CompositionPhase = types.CompositionPhase;
+const CompositionSnapshot = types.CompositionSnapshot;
 const GAMEPAD_NAME_MAX = types.GAMEPAD_NAME_MAX;
 const MAX_GAMEPADS = types.MAX_GAMEPADS;
 
@@ -114,6 +116,14 @@ var mouse_buttons: MouseButtons = .{};
 // ゲームパッド状態（TASK-80.1。ADR-009）。inject gamepad_connect/disconnect/button/axis で更新し、
 // facade の Window.getGamepadState / 組み込み probe `gamepad` が読む。null = 未接続。
 var gamepad_states: [MAX_GAMEPADS]?GamepadState = [_]?GamepadState{null} ** MAX_GAMEPADS;
+
+// synthetic IME composition（TASK-79.6.2）。本文は latest-wins snapshot、イベントは状態変化通知。
+const COMPOSITION_CAP: usize = 1024;
+var composition_text: [COMPOSITION_CAP]u8 = undefined;
+var composition_len: usize = 0;
+var composition_cursor: usize = 0;
+var composition_revision: u32 = 0;
+var composition_active = false;
 
 // lockFramebuffer で記録する現在のフレームバッファ view（present/unlock まで有効）
 var lock_pixels: []const u32 = &.{};
@@ -550,6 +560,17 @@ pub fn nextInjectedEvent() ?Event {
     return null;
 }
 
+/// harness 注入 composition の latest-wins snapshot。commit/cancel 後も最新 revision を返す。
+pub fn getCompositionSnapshot(buf: []u8) CompositionSnapshot {
+    const n = @min(composition_len, buf.len);
+    @memcpy(buf[0..n], composition_text[0..n]);
+    return .{
+        .text = buf[0..n],
+        .revision = composition_revision,
+        .cursor = @intCast(@min(composition_cursor, n)),
+    };
+}
+
 /// native(OS) イベントの取捨。replay 決定性のため quit のみ通し、他の OS 入力は捨てる。
 pub fn filterNativeEvent(ev: Event) ?Event {
     return switch (ev) {
@@ -873,8 +894,8 @@ fn handleInject(it: *Tok) void {
             warnLine("inject key: 不明なキー");
             return;
         };
-        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
-        const ke = KeyEvent{ .key = kc, .is_repeat = false, .modifiers = mods };
+        const extras = parseKeyExtras(it) orelse return warnLine("inject: 不明な修飾子または repeat");
+        const ke = KeyEvent{ .key = kc, .is_repeat = extras.repeat, .modifiers = extras.modifiers };
         queue(if (std.mem.eql(u8, kind, "key_down")) Event{ .key_down = ke } else Event{ .key_up = ke });
     } else if (std.mem.eql(u8, kind, "mouse_move")) {
         const x = parseI32(it.next()) orelse return warnLine("inject mouse_move: 座標不正");
@@ -907,7 +928,6 @@ fn handleInject(it: *Tok) void {
     } else if (std.mem.eql(u8, kind, "commit")) {
         // IME 確定テキスト列を注入（TASK-79.6.1）。残りの行を UTF-8 とみなし codepoint 分解して
         // char_input を連続 queue（実 IME の insertText と同じ消費経路）。modifiers は空。
-        // inject preedit は 79.6.2 へ先送り（preedit 描画 consumer が無く assert 不能）。
         //
         // 空白: `it.rest()` は先頭 delimiter を全部飛ばすため、トークン直後の raw を使う。
         // next() 後の index は "commit" 直後（区切り空白上）。区切りは 1 個だけ落とし、
@@ -915,7 +935,13 @@ fn handleInject(it: *Tok) void {
         var text = it.buffer[it.index..];
         if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
         if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
-        if (text.len == 0) return warnLine("inject commit: 空テキスト");
+        if (text.len == 0) {
+            if (!composition_active) return warnLine("inject commit: update 前は no-op");
+            clearComposition(.commit);
+            return;
+        }
+
+        const has_composition = composition_active;
 
         // Pass 1: 全量検証してから Pass 2 で queue（途中失敗で部分注入しない。codex 修正 C）。
         if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject commit: 不正 UTF-8");
@@ -935,6 +961,10 @@ fn handleInject(it: *Tok) void {
                 i += seq_len;
             }
         }
+        // composition 中だけ commit event を出し snapshot を空にする。bare commit は
+        // TASK-79.6.1 の後方互換契約どおり、composition 状態を変更せず char_input のみ積む。
+        if (has_composition) clearComposition(.commit);
+
         // Pass 2: 検証済みのみ queue
         {
             var i: usize = 0;
@@ -944,6 +974,27 @@ fn handleInject(it: *Tok) void {
                 queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = .{} } });
                 i += seq_len;
             }
+        }
+    } else if (std.mem.eql(u8, kind, "composition")) {
+        const phase = it.next() orelse return warnLine("inject composition: phase 不足");
+        if (std.mem.eql(u8, phase, "update")) {
+            const cursor_arg = parseUsize(it.next()) orelse return warnLine("inject composition update: cursor 不正");
+            var text = it.buffer[it.index..];
+            if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
+            if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
+            if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject composition update: 不正 UTF-8");
+            const n = utf8SafePrefixLen(text, COMPOSITION_CAP);
+            @memcpy(composition_text[0..n], text[0..n]);
+            composition_len = n;
+            composition_cursor = clampUtf8Offset(composition_text[0..n], cursor_arg);
+            const phase_value: CompositionPhase = if (composition_active) .update else .start;
+            composition_active = true;
+            enqueueComposition(phase_value);
+        } else if (std.mem.eql(u8, phase, "cancel")) {
+            if (!composition_active) return warnLine("inject composition cancel: update 前は no-op");
+            clearComposition(.cancel);
+        } else {
+            warnLine("inject composition: phase は update/cancel");
         }
     } else if (std.mem.eql(u8, kind, "gamepad_connect")) {
         const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_connect: index 不正");
@@ -974,6 +1025,59 @@ fn handleInject(it: *Tok) void {
     } else {
         warnLine("inject: 不明な種別");
     }
+}
+
+const KeyExtras = struct { modifiers: ModifierFlags, repeat: bool };
+
+/// key 注入だけは modifier に加えて `repeat` トークンを受け付ける。
+fn parseKeyExtras(it: *Tok) ?KeyExtras {
+    var result: KeyExtras = .{ .modifiers = .{}, .repeat = false };
+    while (it.next()) |tok| {
+        var buf: [16]u8 = undefined;
+        if (tok.len == 0 or tok.len > buf.len) return null;
+        for (tok, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        const name = buf[0..tok.len];
+        if (std.mem.eql(u8, name, "repeat")) {
+            result.repeat = true;
+        } else if (std.mem.eql(u8, name, "shift")) {
+            result.modifiers.shift = true;
+        } else if (std.mem.eql(u8, name, "ctrl")) {
+            result.modifiers.ctrl = true;
+        } else if (std.mem.eql(u8, name, "alt")) {
+            result.modifiers.alt = true;
+        } else if (std.mem.eql(u8, name, "cmd")) {
+            result.modifiers.cmd = true;
+        } else return null;
+    }
+    return result;
+}
+
+fn enqueueComposition(phase: CompositionPhase) void {
+    composition_revision +%= 1;
+    queue(Event{ .composition_changed = .{
+        .revision = composition_revision,
+        .phase = phase,
+        .cursor = @intCast(composition_cursor),
+    } });
+}
+
+fn clearComposition(phase: CompositionPhase) void {
+    composition_len = 0;
+    composition_cursor = 0;
+    composition_active = false;
+    enqueueComposition(phase);
+}
+
+fn utf8SafePrefixLen(text: []const u8, cap: usize) usize {
+    var n = @min(text.len, cap);
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
+    return n;
+}
+
+fn clampUtf8Offset(text: []const u8, offset: usize) usize {
+    var n = @min(offset, text.len);
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
+    return n;
 }
 
 /// gamepad index トークンを parse する（0..MAX_GAMEPADS-1 のみ有効）。
@@ -2367,6 +2471,11 @@ fn resetForTest() void {
     mouse_y = 0;
     mouse_buttons = .{};
     gamepad_states = [_]?GamepadState{null} ** MAX_GAMEPADS;
+    @memset(&composition_text, 0);
+    composition_len = 0;
+    composition_cursor = 0;
+    composition_revision = 0;
+    composition_active = false;
     lock_pixels = &.{};
     lock_w = 0;
     lock_h = 0;
@@ -2437,6 +2546,83 @@ test "parseModifiers: 0個=空 / 単一 / 複数（大小無視）/ 未知=null"
         var it = std.mem.tokenizeAny(u8, "cmd bogus", " \t"); // 認識済みが先でも未知が混ざれば null
         try testing.expectEqual(@as(?ModifierFlags, null), parseModifiers(&it));
     }
+}
+
+test "parseKeyExtras: repeat は key_down の token として配送される" {
+    var it = std.mem.tokenizeAny(u8, "cmd repeat", " \t");
+    const extras = parseKeyExtras(&it).?;
+    try testing.expect(extras.repeat);
+    try testing.expect(extras.modifiers.cmd);
+    var bad = std.mem.tokenizeAny(u8, "repeatt", " \t");
+    try testing.expectEqual(@as(?KeyExtras, null), parseKeyExtras(&bad));
+}
+
+test "inject composition: update/commit/cancel の latest-wins 状態契約" {
+    resetForTest();
+    cmd_buf =
+        "inject composition update 4 あい\n" ++
+        "inject composition update 2 あい\n" ++
+        "inject commit 確\n" ++
+        "inject composition cancel\n" ++
+        "step 1\nquit";
+    try testing.expect(pollGate(true));
+
+    // start/update/commit/char の順序を保持する。
+    const start = nextInjectedEvent().?;
+    try testing.expect(start == .composition_changed and start.composition_changed.phase == .start);
+    const update = nextInjectedEvent().?;
+    try testing.expect(update == .composition_changed and update.composition_changed.phase == .update);
+    const commit = nextInjectedEvent().?;
+    try testing.expect(commit == .composition_changed and commit.composition_changed.phase == .commit);
+    try testing.expectEqual(@as(u32, 3), commit.composition_changed.revision);
+    const ch = nextInjectedEvent().?;
+    try testing.expect(ch == .char_input and ch.char_input.codepoint == '確');
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    var buf: [COMPOSITION_CAP]u8 = undefined;
+    const snapshot = getCompositionSnapshot(&buf);
+    try testing.expectEqualStrings("", snapshot.text);
+    try testing.expectEqual(@as(u32, 3), snapshot.revision);
+    try testing.expectEqual(@as(u32, 0), snapshot.cursor);
+}
+
+test "inject commit: bare commit は composition_changed なしで char_input を配送" {
+    resetForTest();
+    cmd_buf =
+        "inject commit AB\n" ++
+        "step 1\nquit";
+    try testing.expect(pollGate(true));
+
+    const a = nextInjectedEvent().?;
+    try testing.expect(a == .char_input and a.char_input.codepoint == 'A');
+    const b = nextInjectedEvent().?;
+    try testing.expect(b == .char_input and b.char_input.codepoint == 'B');
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    var buf: [COMPOSITION_CAP]u8 = undefined;
+    const snapshot = getCompositionSnapshot(&buf);
+    try testing.expectEqualStrings("", snapshot.text);
+    try testing.expectEqual(@as(u32, 0), snapshot.revision);
+    try testing.expectEqual(@as(u32, 0), snapshot.cursor);
+}
+
+test "inject composition: 空 update は許容、cancel は update 前 no-op、cursor は UTF-8 境界へ clamp" {
+    resetForTest();
+    cmd_buf =
+        "inject composition cancel\n" ++
+        "inject composition update 99\n" ++
+        "inject composition update 4 あい\n" ++
+        "step 1\nquit";
+    try testing.expect(pollGate(true));
+    const empty = nextInjectedEvent().?;
+    try testing.expect(empty == .composition_changed and empty.composition_changed.phase == .start);
+    const update = nextInjectedEvent().?;
+    try testing.expect(update == .composition_changed and update.composition_changed.cursor == 3);
+    var buf: [COMPOSITION_CAP]u8 = undefined;
+    const snapshot = getCompositionSnapshot(&buf);
+    try testing.expectEqualStrings("あい", snapshot.text);
+    try testing.expectEqual(@as(u32, 3), snapshot.cursor);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
 test "inject modifiers: 全6経路で反映 / 無指定は空" {
@@ -4069,11 +4255,14 @@ test "inject commit: UTF-8 文字列を codepoint 分解して char_input 連続
     resetForTest();
     // こんにちは = U+3053 U+3093 U+306B U+3061 U+306F（5 codepoints）
     cmd_buf =
+        \\inject composition update 0 x
         \\inject commit こんにちは
         \\step 1
         \\quit
     ;
     try testing.expect(pollGate(true));
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
     const expected = [_]u32{ 0x3053, 0x3093, 0x306B, 0x3061, 0x306F };
     for (expected) |want| {
         const e = nextInjectedEvent().?;
@@ -4104,8 +4293,9 @@ test "inject commit: 空テキスト / 不正 UTF-8 は fail-fast（注入なし
 test "inject commit: 不正 UTF-8 は途中まで注入せずゼロ件（codex 修正 C）" {
     resetForTest();
     // 先頭 'A' は valid だが後続 0xFF で不正。Pass1 全量検証で拒否し、A も queue しない。
-    cmd_buf = "inject commit A\xffZ\nstep 1\nquit";
+    cmd_buf = "inject composition update 0 x\ninject commit A\xffZ\nstep 1\nquit";
     try testing.expect(pollGate(true));
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
     try testing.expect(!pollGate(true));
 }
@@ -4114,8 +4304,10 @@ test "inject commit: 区切り後の前後空白を保持（codex 修正 D / rec
     resetForTest();
     // `commit` 直後の区切り 1 空白の後ろ: " a b "（先頭スペース + a + スペース + b + 末尾スペース）
     // → 5 codepoints。行末スペースは line の左 trim のみ方針で保持。
-    cmd_buf = "inject commit  a b \nstep 1\nquit";
+    cmd_buf = "inject composition update 0 x\ninject commit  a b \nstep 1\nquit";
     try testing.expect(pollGate(true));
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
     const expected = [_]u32{ ' ', 'a', ' ', 'b', ' ' };
     for (expected) |want| {
         const e = nextInjectedEvent().?;
@@ -4128,11 +4320,14 @@ test "inject commit: 区切り後の前後空白を保持（codex 修正 D / rec
 test "inject commit: ASCII 混在も char_input 連続（inject char と同経路）" {
     resetForTest();
     cmd_buf =
+        \\inject composition update 0 x
         \\inject commit Ab
         \\step 1
         \\quit
     ;
     try testing.expect(pollGate(true));
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
+    try testing.expect(nextInjectedEvent().? == .composition_changed);
     const e0 = nextInjectedEvent().?;
     try testing.expect(e0 == .char_input and e0.char_input.codepoint == 'A');
     const e1 = nextInjectedEvent().?;

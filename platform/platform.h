@@ -419,6 +419,10 @@ typedef struct PlatformCompositionMeta {
 // cap==0 または buf==NULL でも meta は埋める（本文は書かない）。
 uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta);
 
+// IME 候補窓の基準 caret rect を設定する。座標は framebuffer pixel・window content 左上原点。
+// backend は firstRectForCharacterRange の問い合わせ時に backing scale を適用する。
+void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y, int32_t w, int32_t h);
+
 // イベント取得API（1つずつ）
 // ウィンドウのイベントキューから1つイベントを取得する
 // イベントがあればtrue、ないならfalseを返す

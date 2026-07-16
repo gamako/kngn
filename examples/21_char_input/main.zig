@@ -7,10 +7,9 @@
 //! 優先し ASCII も 1 本で混在描画。再配布でないので repo にアセットを持たず・ネットワーク取得も不要）。
 //! フォント自体は日本語グリフを持つので、char_input で**届いた** codepoint は日本語も描画できる。
 //!
-//! **IME（TASK-79.6.1）**: macOS は view を NSTextInputClient 化し、keyDown を
-//! `interpretKeyEvents:` 経由で insertText → `char_input` に流す（確定日本語が入る）。
-//! 変換中 preedit の inline 描画は 79.6.2。harness は `inject commit <text>` で確定列を
-//! codepoint 分解注入できる（`inject char` と同経路）。
+//! **IME（TASK-79.6.2）**: macOS は view を NSTextInputClient 化し、確定文字を `char_input`、
+//! 変換中は composition snapshot を下線付き inline で描画する。harness は
+//! `inject composition update/cancel` と `inject commit <text>` で同じ状態契約を検証できる。
 //!
 //! 操作: 文字をタイプ＝`char_input` でバッファ追記 / BACKSPACE=1 コードポイント削除 /
 //!       ENTER=改行 / ESC=終了。
@@ -28,6 +27,9 @@ const platform = @import("platform");
 const fontmod = @import("font");
 
 const MAX_BYTES = 512;
+const COMPOSITION_BYTES = 1024;
+
+const CompositionCaretRect = struct { x: i32, y: i32, w: i32, h: i32 };
 
 /// 入力状態（`chars` probe の ctx）。buf は UTF-8。改行は '\n' をそのまま格納し描画側で分割する。
 const State = struct {
@@ -35,6 +37,11 @@ const State = struct {
     len: usize = 0,
     last_cp: u32 = 0,
     last_mods: u32 = 0,
+    preedit: [COMPOSITION_BYTES]u8 = undefined,
+    preedit_len: usize = 0,
+    preedit_cursor: usize = 0,
+    composition_dirty: bool = false,
+    composition_rect: ?CompositionCaretRect = null,
 
     /// `char_input` の codepoint を UTF-8 で追記する。制御文字（本来 char_input には来ない想定だが
     /// 防御）と容量超過は無視（fail-safe: 取りこぼしがあってもクラッシュしない）。
@@ -62,6 +69,14 @@ const State = struct {
         if (self.len + 1 > self.buf.len) return;
         self.buf[self.len] = '\n';
         self.len += 1;
+    }
+
+    fn syncComposition(self: *State, window: platform.Window) void {
+        if (!self.composition_dirty) return;
+        const snapshot = window.getCompositionSnapshot(self.preedit[0..]);
+        self.preedit_len = snapshot.text.len;
+        self.preedit_cursor = @min(@as(usize, snapshot.cursor), self.preedit_len);
+        self.composition_dirty = false;
     }
 };
 
@@ -114,10 +129,13 @@ pub fn main(init: std.process.Init) !void {
                 .ENTER, .KP_ENTER => state.newline(),
                 else => {},
             },
+            .composition_changed => state.composition_dirty = true,
             // 印字は char_input 経由（日本語含む確定文字）。key_down は制御キーのみ。
             .char_input => |ch| state.appendCodepoint(ch.codepoint, ch.modifiers.toC()),
             else => {},
         };
+
+        state.syncComposition(window);
 
         if (window.lockFramebuffer()) |fb| {
             defer fb.unlock();
@@ -146,8 +164,36 @@ pub fn main(init: std.process.Init) !void {
                     last_y = y;
                     y += lh;
                 }
-                const caret_x: i32 = 8 + @as(i32, @intCast(f.measure(last_line)));
+                var caret_x: i32 = 8 + @as(i32, @intCast(f.measure(last_line)));
+                if (state.preedit_len > 0) {
+                    const preedit = state.preedit[0..state.preedit_len];
+                    f.drawTo(target, .{ .x = caret_x, .y = last_y }, preedit, cyan, clip);
+                    const preedit_w: i32 = @intCast(f.measure(preedit));
+                    // 下線は baseline 直下（ascent+2）。行ボックス最下端（lh-2）だと descent+gap の
+                    // 下に浮いて見える（実機指摘 2026-07-17）。行内に収まるよう lh-1 で clamp。
+                    const underline_y = @min(last_y + @as(i32, @intCast(f.metrics().ascent)) + 2, last_y + lh - 1);
+                    var ux = caret_x;
+                    while (ux < caret_x + preedit_w) : (ux += 1) {
+                        fontmod.plotCoverage(target, ux, underline_y, cyan, 0xFF, clip);
+                    }
+                    const cursor_prefix = preedit[0..@min(state.preedit_cursor, preedit.len)];
+                    caret_x += @intCast(f.measure(cursor_prefix));
+                }
                 f.drawTo(target, .{ .x = caret_x, .y = last_y }, "_", green, clip);
+                // rect は preedit の有無に関係なく常に caret を指す（composition 開始打鍵の
+                // handleEvent 時点で正しい位置が既に供給されているように。実機指摘 2026-07-17）。
+                {
+                    const rect = CompositionCaretRect{ .x = caret_x, .y = last_y, .w = 1, .h = lh };
+                    if (state.composition_rect == null or
+                        state.composition_rect.?.x != rect.x or
+                        state.composition_rect.?.y != rect.y or
+                        state.composition_rect.?.w != rect.w or
+                        state.composition_rect.?.h != rect.h)
+                    {
+                        window.setCompositionRect(rect.x, rect.y, rect.w, rect.h);
+                        state.composition_rect = rect;
+                    }
+                }
 
                 // 直近の codepoint / modifier（非 ASCII でも受信を数値で確認できる）。
                 var dbg: [80]u8 = undefined;
