@@ -236,8 +236,12 @@ expect_state "audio_output=headphones"
 drive "snapshot fb" >>"$LOG" 2>&1
 log "[e2e] scenario 4 PASS"
 
-# ── Scenario 5: long form scroll + bottom hit-test ──
-log "[e2e] === scenario 5: editor scroll + workspace_path ==="
+# ── Scenario 5: long form scroll + bottom hit-test + caller 所有 scroll 保持 ──
+# ScrollArea の *Vec2f は app 側 state（PerIdStateStore 外）。他 section 表示中も digest 上
+# editor_scroll_y が保たれることを固定する（store trim の影響を受けない契約）。
+# 再表示直後の 1 フレームは rect_cache miss で max_y=0 clamp し得る（ScrollArea 同期契約・
+# TASK-46）。その再 clamp は TASK-127 スコープ外のため、ここでは非表示中の保持のみ assert。
+log "[e2e] === scenario 5: editor scroll + workspace_path + scroll ownership ==="
 LAYOUT=$(digest_layout)
 read -r nx ny nw nh <<<"$(layout_rect nav_editor "$LAYOUT")"
 read -r cx cy <<<"$(rect_center "$nx" "$ny" "$nw" "$nh")"
@@ -250,6 +254,34 @@ read -r cx cy <<<"$(rect_center "$sx" "$sy" "$sw" "$sh")"
 drive "inject mouse_move $cx $cy; step 1; inject scroll 0 -4; step 2"
 digest_state >/dev/null
 expect_state "editor_scroll_y>0"
+STATE=$(digest_state)
+SCROLL_Y_BEFORE=$(parse_kv editor_scroll_y "$STATE")
+if [[ -z "$SCROLL_Y_BEFORE" ]]; then
+  log "[e2e] FAIL: missing editor_scroll_y before section switch"
+  exit 1
+fi
+log "[e2e] editor_scroll_y before switch=$SCROLL_Y_BEFORE"
+# Audio へ切替（Editor ScrollArea は非表示）。caller 所有 y が digest に残ること。
+LAYOUT=$(digest_layout)
+read -r nx ny nw nh <<<"$(layout_rect nav_audio "$LAYOUT")"
+read -r cx cy <<<"$(rect_center "$nx" "$ny" "$nw" "$nh")"
+click_xy "$cx" "$cy"
+digest_state >/dev/null
+expect_state "selected=audio"
+expect_state "editor_scroll_y=$SCROLL_Y_BEFORE"
+log "[e2e] editor_scroll_y held while hidden=$SCROLL_Y_BEFORE"
+# Editor へ戻る（既存: workspace_path hit-test）
+LAYOUT=$(digest_layout)
+read -r nx ny nw nh <<<"$(layout_rect nav_editor "$LAYOUT")"
+read -r cx cy <<<"$(rect_center "$nx" "$ny" "$nw" "$nh")"
+click_xy "$cx" "$cy"
+digest_state >/dev/null
+expect_state "selected=editor"
+LAYOUT=$(digest_layout)
+read -r sx sy sw sh <<<"$(layout_rect editor_scroll "$LAYOUT")"
+read -r cx cy <<<"$(rect_center "$sx" "$sy" "$sw" "$sh")"
+# 再表示後に cache が戻るまで必要なら再スクロールして workspace_path を露出
+drive "inject mouse_move $cx $cy; step 1; inject scroll 0 -4; step 2"
 LAYOUT=$(digest_layout)
 read -r tx ty tw th <<<"$(layout_rect editor_workspace_path "$LAYOUT")"
 # if still -1 or clipped, scroll more

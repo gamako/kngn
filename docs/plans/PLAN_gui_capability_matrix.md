@@ -160,14 +160,14 @@ examples/35_gui_gallery/e2e.txt は各 section で digest gallery と path 省�
 - 実行記録・起票候補: `docs/notes/TASK-121.2_gui_torture.md`
 - example: `examples/37_gui_torture`（probe: `state` / `layout` / `scroll`）
 - bench: `zig build bench-gui-frame`（full Context frame 500/1000 行）
-- leak: `zig build test-gui-leak`（PerIdStateStore 30000 entries）
+- leak: `zig build test-gui-leak`（PerIdStateStore 上限 assert: final=3072, max≤4096）
 
 ### 121.2 で発見された Missing（起票候補・概要）
 
 詳細・file:line・再現 script は notes を正とする。
 
 1. Nested ScrollArea の wheel が内側優先にならず outer/inner 同時変化
-2. PerIdStateStore に trim/TTL/上限がなく ID 長期変化で単調増加
+2. PerIdStateStore に trim/TTL/上限がなく ID 長期変化で単調増加 → **TASK-127 で LRU 上限を導入済み**（§18）
 3. TextBuffer / textInputId に最大長 API がない
 4. 改行・CJK・emoji の measure / coverage は §17 で default font の観測契約を明文化済み
 5. popup 長文 item の小画面 outer はみ出し仕様が未明文化
@@ -415,3 +415,29 @@ Release build での最後勝ち上書きは契約上の許容動作ではなく
 | 自動 ID 同一ラベル | Debug assert で検出（`endFrame` cache 更新時） |
 
 観測 E2E: `examples/37_gui_torture/e2e_text.txt`（ASCII/CJK/emoji/改行入り label、500 codepoints measure、TextInput caret/selection の codepoint 境界）。
+
+## 18. PerIdStateStore lifetime / LRU 上限（TASK-127）
+
+`PerIdStateStore`（`libs/gui/src/state.zig`）は ID ごとの selection / caret / double-click / TextInput 横スクロールを保持する。
+
+| 項目 | 契約 |
+|---|---|
+| 方式 | frame generation touch + ID リンク LRU |
+| 既定上限 | `max_entries=4096`、`trim_to=3072` |
+| touch | `getOrPut`（`Context.perIdState`）が current-frame を記録し LRU 末尾へ。`get` は touch しない |
+| trim 発火 | `Context.endFrame` 末尾の frame boundary のみ（`count > max_entries` 時） |
+| 保護 | current-frame touch / `active_id` / `focused_id` / `hot_id` / `next_hot_id` |
+| 非表示 | 上限超過時に LRU 古い entry から破棄され得る。再表示時は `PerIdState` 初期値 |
+| caller 所有 | `TextBuffer` と ScrollArea の `*Vec2f` は store 外（trim の影響なし） |
+
+| widget | store state | trim 後の挙動 |
+|---|---|---|
+| `selectableLabelId` | selection / dragging / double-click | 再生成時に初期 selection |
+| `textInputId` | selection / caret / `scroll_x` / blink | TextBuffer は保持、編集 state は初期化 |
+| `beginScrollArea` | caller 所有 `Vec2f` | store trim の影響なし |
+
+検証入口:
+
+- unit: `zig build test-gui`（`state.zig` / `context.zig` の LRU・保護・再初期化テスト）
+- leak: `zig build test-gui-leak`（30,000 unique ID 生成でも final=3072、max_observed≤4096）
+- E2E: `examples/39_settings_shell/e2e.sh` scenario 5（他 section 表示中も `editor_scroll_y` が app 側で保持。再表示直後の rect_cache miss clamp は ScrollArea 契約）

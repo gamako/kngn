@@ -1,6 +1,6 @@
-//! PerIdStateStore state-leak measurement (TASK-121.2).
-//! 100 unique IDs/frame × 300 frames = 30,000 unique IDs.
-//! libs/gui は変更しない。現行実装は entry を trim しないため state_entries_final=30000 を観測値として固定。
+//! PerIdStateStore capacity / LRU trim measurement (TASK-127).
+//! 100 unique IDs/frame × 300 frames = 30,000 unique IDs を生成しても
+//! 既定上限（max_entries=4096, trim_to=3072）により entry 数が収束することを assert する。
 //!
 //! ホットパス宣言: 300 フレームの計測専用ループ。RT / 通常 GUI 経路には影響しない。
 
@@ -12,7 +12,8 @@ const W: u32 = 1024;
 const H: u32 = 768;
 const IDS_PER_FRAME: usize = 100;
 const FRAMES: usize = 300;
-const EXPECTED_FINAL: usize = IDS_PER_FRAME * FRAMES; // 30000
+const MAX_ENTRIES: usize = gui.PerIdStateStore.default_max_entries; // 4096
+const TRIM_TO: usize = gui.PerIdStateStore.default_trim_to; // 3072
 
 /// Zig 0.16 には CountingAllocator が無いため、live/peak/alloc 回数を数える薄い wrapper。
 const CountingAllocator = struct {
@@ -84,6 +85,7 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
     entries_frame_1: usize,
     entries_frame_300: usize,
     entries_final: usize,
+    max_observed: usize,
     capacity: usize,
     live_after: usize,
     peak: usize,
@@ -98,6 +100,7 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
 
     var entries_frame_1: usize = 0;
     var entries_frame_300: usize = 0;
+    var max_observed: usize = 0;
 
     var frame: usize = 0;
     while (frame < FRAMES) : (frame += 1) {
@@ -114,8 +117,10 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
             _ = ctx.selectableLabelId(id, owned, .{});
         }
         ctx.endFrame();
-        if (frame == 0) entries_frame_1 = ctx.per_id_state.map.count();
-        if (frame == FRAMES - 1) entries_frame_300 = ctx.per_id_state.map.count();
+        const n = ctx.per_id_state.map.count();
+        if (n > max_observed) max_observed = n;
+        if (frame == 0) entries_frame_1 = n;
+        if (frame == FRAMES - 1) entries_frame_300 = n;
     }
 
     const entries_final = ctx.per_id_state.map.count();
@@ -133,6 +138,7 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
         .entries_frame_1 = entries_frame_1,
         .entries_frame_300 = entries_frame_300,
         .entries_final = entries_final,
+        .max_observed = max_observed,
         .capacity = capacity,
         .live_after = live_after,
         .peak = peak,
@@ -143,17 +149,23 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
     };
 }
 
-test "gui leak: 100 unique IDs/frame x 300 frames leaves 30000 PerIdState entries" {
+test "gui leak: 100 unique IDs/frame x 300 frames stays within PerIdStateStore cap" {
     var parent_da: std.heap.DebugAllocator(.{}) = .init;
     defer _ = parent_da.deinit();
     var counter: CountingAllocator = .{ .parent = parent_da.allocator() };
 
     const r = try runLeakScenario(&counter);
 
-    // Regression on entry count (current observed contract: no trim)
+    // TASK-127: 30,000 unique ID を生成しても endFrame 後の entry は max_entries 以下。
+    // trim は count > max_entries のときだけ発火し trim_to まで減らすため、
+    // final は常に 3072 固定ではなく [trim_to, max_entries] 付近に収まる。
     try testing.expectEqual(@as(usize, IDS_PER_FRAME), r.entries_frame_1);
-    try testing.expectEqual(@as(usize, EXPECTED_FINAL), r.entries_frame_300);
-    try testing.expectEqual(@as(usize, EXPECTED_FINAL), r.entries_final);
+    try testing.expect(r.entries_frame_300 <= MAX_ENTRIES);
+    try testing.expect(r.entries_final <= MAX_ENTRIES);
+    try testing.expect(r.max_observed <= MAX_ENTRIES);
+    // 上限なし旧仕様（30000）へ退行していないこと
+    try testing.expect(r.entries_final <= TRIM_TO + IDS_PER_FRAME * 12);
+    try testing.expect(r.entries_final < IDS_PER_FRAME * FRAMES / 2);
 
     // Print allocator metrics for notes (not hard-asserted; environment-dependent)
     std.debug.print(
@@ -161,6 +173,7 @@ test "gui leak: 100 unique IDs/frame x 300 frames leaves 30000 PerIdState entrie
         \\[gui-leak] state_entries_frame_1={d}
         \\[gui-leak] state_entries_frame_300={d}
         \\[gui-leak] state_entries_final={d}
+        \\[gui-leak] state_entries_max_observed={d}
         \\[gui-leak] per_id_state.map.capacity={d}
         \\[gui-leak] live_bytes_before_deinit={d}
         \\[gui-leak] peak_bytes={d}
@@ -174,6 +187,7 @@ test "gui leak: 100 unique IDs/frame x 300 frames leaves 30000 PerIdState entrie
             r.entries_frame_1,
             r.entries_frame_300,
             r.entries_final,
+            r.max_observed,
             r.capacity,
             r.live_after,
             r.peak,

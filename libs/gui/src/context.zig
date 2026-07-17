@@ -6,15 +6,18 @@
 // 相互参照で確認すること。
 //
 // ライフサイクル契約（21.2 案A「契約の番人」+ 21.4 layout）:
-//   beginFrame(w,h): arena.reset → input/id_stack/state.beginFrame → draw_list.reset(w,h)
+//   beginFrame(w,h): arena.reset → input/id_stack/state.beginFrame → per_id_state.beginFrame
+//                    → draw_list.reset(w,h)
 //                    → layout ツリーの暗黙 root を arena 上に生成（当フレームは未 measure/place）
 //   widget 呼び出し: 前フレーム rect_cache で同期 hit-test（当フレーム構築中の layout rect は使わない）
 //   endFrame():      measure → place → rect_cache.clearRetainingCapacity → updateRectCache
 //                    → emitNode（draw cmd 発行）→ frame_active=false
+//                    → focus cleanup → active cleanup → PerIdStateStore.trim（frame boundary のみ）
 //                    hit-test は行わない。新 rect_cache はこの endFrame 完了後に次フレームから参照される。
 //                    arena は触らない（契約の番人）。
 //                    endFrame 後も draw_list / id_stack / state / レイアウトツリーは
 //                    次 beginFrame まで valid。rect キャッシュ（gpa 所有）は次 endFrame まで valid。
+//                    PerIdStateStore の LRU trim は endFrame 末尾のみ（widget 構築中は発火しない）。
 //
 // 同期 hit-test 契約（21.2/21.4 / TASK-131 で明文化）:
 //   widget は呼び出し時に「前フレームの rect キャッシュ」（getNodeRect / rect_cache）で
@@ -238,6 +241,7 @@ pub const Context = struct {
         self.input.beginFrame();
         self.id_stack.clear();
         self.state.beginFrame();
+        self.per_id_state.beginFrame();
         self.composition = .{};
         self.wheel_remaining = .{};
         self.wheel_remaining_seeded = false;
@@ -279,6 +283,13 @@ pub const Context = struct {
         if (self.state.active_id != 0 and !self.state.active_submitted and !self.input.mouse_buttons.left) {
             self.state.active_id = 0;
         }
+        // PerIdStateStore LRU trim（TASK-127）。frame boundary のみ。表示中・操作中 ID を保護。
+        self.per_id_state.trim(.{
+            .active_id = self.state.active_id,
+            .focused_id = self.state.focused_id,
+            .hot_id = self.state.hot_id,
+            .next_hot_id = self.state.next_hot_id,
+        });
         // arena も draw_list もここでは reset しない（契約の番人）。
     }
 
@@ -860,6 +871,52 @@ test "Context: beginFrameAt の時刻、focus claim、ID state persistence" {
     try std.testing.expectEqual(@as(Id, 77), ctx.state.focused_id);
     try std.testing.expectEqual(@as(usize, 2), ctx.perIdState(77).selection.anchor);
     try std.testing.expectEqual(@as(usize, 5), ctx.perIdState(77).selection.extent);
+    ctx.endFrame();
+}
+
+test "Context: endFrame trim は focused 非表示 state を保持する" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.per_id_state.max_entries = 2;
+    ctx.per_id_state.trim_to = 1;
+
+    ctx.beginFrame(320, 200);
+    try std.testing.expect(ctx.claimFocus(50));
+    ctx.perIdState(50).caret = 9;
+    _ = ctx.perIdState(51);
+    ctx.endFrame();
+
+    // frame 2: focus 維持、50 は非表示、新規 ID で上限超過
+    ctx.beginFrame(320, 200);
+    try std.testing.expectEqual(@as(Id, 50), ctx.state.focused_id);
+    _ = ctx.perIdState(60);
+    _ = ctx.perIdState(61);
+    _ = ctx.perIdState(62);
+    ctx.endFrame();
+
+    try std.testing.expect(ctx.per_id_state.get(50) != null);
+    try std.testing.expectEqual(@as(usize, 9), ctx.per_id_state.get(50).?.caret);
+    // 非保護の古い 51 は消える
+    try std.testing.expect(ctx.per_id_state.get(51) == null);
+}
+
+test "Context: 上限未満の非表示→再表示で PerIdState を保持" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(320, 200);
+    ctx.perIdState(88).selection = .{ .anchor = 1, .extent = 4 };
+    ctx.perIdState(88).scroll_x = 16;
+    ctx.endFrame();
+
+    // 非表示 frame
+    ctx.beginFrame(320, 200);
+    ctx.endFrame();
+
+    ctx.beginFrame(320, 200);
+    try std.testing.expectEqual(@as(usize, 1), ctx.perIdState(88).selection.anchor);
+    try std.testing.expectEqual(@as(usize, 4), ctx.perIdState(88).selection.extent);
+    try std.testing.expectEqual(@as(i32, 16), ctx.perIdState(88).scroll_x);
     ctx.endFrame();
 }
 
