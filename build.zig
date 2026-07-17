@@ -164,7 +164,7 @@ fn buildWasmPixie(
     optimize: std.builtin.OptimizeMode,
     opts: WasmBuildOpts,
 ) WasmExeBuild {
-    const shared = SharedModules.init(b, true, false);
+    const shared = SharedModules.init(b, true, false, false);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const pixie_mod = b.createModule(.{
@@ -226,7 +226,7 @@ fn buildWasmSynth(
     const target = b.resolveTargetQuery(query);
 
     // wasm_shared=false → single_threaded=true（wasm_allocator 可）。atomics は target feature で担保。
-    const shared = SharedModules.init(b, true, false);
+    const shared = SharedModules.init(b, true, false, false);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const synth_mod = b.createModule(.{
@@ -344,11 +344,33 @@ pub fn build(b: *std.Build) void {
 
     const install_all = b.option(bool, "install-all", "Install all backends for the target OS") orelse false;
 
+    // 外部消費者向け gamepad opt-in（TASK-111.7）。既定 false。
+    // dep.module("platform") / platform_native_* archive / GameController リンク条件を同一 boolean で駆動。
+    // 内部 exe（main/pixie/examples）は makePlatformModules 側の per-backend opt-in を使う（本 option 非依存）。
+    const enable_gamepad_ext = b.option(
+        bool,
+        "enable_gamepad",
+        "Enable gamepad for external platform module and native archive (default false)",
+    ) orelse false;
+
     // ========================================
     // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
     // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
     // ========================================
-    const shared_modules = SharedModules.init(b, false, false);
+    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext);
+
+    // 外部公開 kit umbrella（TASK-111.7）。SharedModules の既存 instance を再利用して型同一性を保つ。
+    // dep.module("kit") で取得。platform / gui / gamepad 等は kit 経由でも同一 module instance。
+    {
+        const app_runtime_ext: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
+            .root_source_file = b.path("core/app_runtime.zig"),
+        }) };
+        link(app_runtime_ext, shared_modules.platform);
+        const kit_ext: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.addModule("kit", .{
+            .root_source_file = b.path("kit/kit.zig"),
+        }) };
+        wireKitImports(kit_ext, shared_modules.platform, &shared_modules, app_runtime_ext);
+    }
 
     // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）
     const backends = platform.implementedBackends(target_os);
@@ -565,9 +587,11 @@ pub fn build(b: *std.Build) void {
     // per-backend module(makePlatformModules)を使うので無影響。需要が出たら 29.x で対応。
     // ========================================
     if (target_os == .macos) {
-        _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc");
-        _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift");
-        _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal");
+        // enable_gamepad_ext で native archive の VP_ENABLE_GAMEPAD を platform module と揃える（TASK-111.7）。
+        // GameController framework リンクは consumer 側（enable 時に exe で明示）のまま。
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc", enable_gamepad_ext);
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift", enable_gamepad_ext);
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal", enable_gamepad_ext);
     }
 
     // ========================================
@@ -1473,6 +1497,32 @@ pub fn build(b: *std.Build) void {
     test_gfx_step.dependOn(&run_gfx_kb_test.step);
 
     // ========================================
+    // kit テスト（toGuiEvent アダプタ等。TASK-111.7）
+    // kit/kit.zig を root にし、SharedModules の同一 instance を配線する
+    // （named module 経由で test が収集されない vacuous green を避ける。114.2 教訓）。
+    // ========================================
+    const kit_test_app_runtime = b.createModule(.{
+        .root_source_file = b.path("core/app_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kit_test_app_runtime.addImport("platform", shared_modules.platform.mod);
+    const kit_test_root = b.createModule(.{
+        .root_source_file = b.path("kit/kit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    {
+        const kit_tm: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = kit_test_root };
+        const ar_tm: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = kit_test_app_runtime };
+        wireKitImports(kit_tm, shared_modules.platform, &shared_modules, ar_tm);
+    }
+    const kit_test = b.addTest(.{ .root_module = kit_test_root });
+    const run_kit_test = b.addRunArtifact(kit_test);
+    const test_kit_step = b.step("test-kit", "Run kit umbrella unit tests (toGuiEvent adapter)");
+    test_kit_step.dependOn(&run_kit_test.step);
+
+    // ========================================
     // libs/gui テスト (geom / color / draw / font + input / id / state / context)
     // gui.zig を root にすると参照する全ファイルの test がまとめて回る。
     // SharedModules.gui は import 用なので、test 用に専用 module を作る。
@@ -1751,6 +1801,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_text_step);
     test_step.dependOn(test_sprite_step);
     test_step.dependOn(test_gfx_step);
+    test_step.dependOn(test_kit_step);
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_synth_step);
@@ -2173,7 +2224,9 @@ const SharedModules = struct {
     midi: TaggedModule, // core/midi.zig（MIDI facade。TASK-115.1）
 
     /// `wasm_shared`: TASK-73.2 AudioWorklet 用。atomics を有効にするため single_threaded=false。
-    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool) SharedModules {
+    /// `enable_gamepad`: 外部公開 platform module の build_options（TASK-111.7。既定 false）。
+    /// wasm 経路は常に false を渡す。
+    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
         // facade。@cImport("platform.h") のため link_libc + include path を内包。
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
@@ -2181,13 +2234,13 @@ const SharedModules = struct {
             .link_libc = true,
         }) };
         platform_mod.mod.addIncludePath(b.path("platform"));
-        // build_options（TASK-80.2/97.3 opt-in）: 外部消費者（tictactoe 等。dep.module("platform")）
-        // 向けの facade も core/platform.zig を root にするため同じ named import が要る。外部消費者は
-        // opt-in を選べないため既定 false（安全側）。platform_backend は macOS 既定名を仮置き
-        // （外部消費者が自前で platform .o をリンクする想定の薄い stub）。
+        // build_options（TASK-80.2/97.3/111.7 opt-in）: 外部消費者（tictactoe 等。dep.module("platform")）
+        // 向けの facade も core/platform.zig を root にするため同じ named import が要る。
+        // enable_gamepad は `-Denable_gamepad=true` で opt-in（既定 false＝安全側）。
+        // platform_backend は macOS 既定名を仮置き（外部消費者が自前で platform .o をリンクする想定の薄い stub）。
         {
             const opts = b.addOptions();
-            opts.addOption(bool, "enable_gamepad", false);
+            opts.addOption(bool, "enable_gamepad", enable_gamepad);
             opts.addOption(bool, "enable_menu", false);
             opts.addOption([]const u8, "platform_backend", "objc");
             platform_mod.mod.addOptions("build_options", opts);
@@ -2842,12 +2895,15 @@ fn addPlatformNativeLib(
     platform_root: std.Build.LazyPath,
     platform_type: platform.PlatformType,
     name: []const u8,
+    enable_gamepad: bool,
 ) *std.Build.Step.Compile {
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化）。外部消費者向け native archive は
-    // SharedModules の外部公開 "platform" module（build_options.enable_gamepad=false）と対で
-    // GameController framework を一切参照しない .o にする（consumer 側で framework 検索パスを
-    // 解決できないのと同じ理由で、opt-in も consumer 側に委ねない）。
-    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, .{});
+    // 外部消費者向け native archive の gamepad opt-in（TASK-80.2 / TASK-111.7）。
+    // SharedModules 外部公開 "platform" の build_options.enable_gamepad と同一 boolean。
+    // archive 自体は .o のみで GameController framework は含まない（consumer exe 側でリンク）。
+    // enable_gamepad=true のとき .m/.swift に -DVP_ENABLE_GAMEPAD が付き実 backend が有効になる。
+    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, .{
+        .enable_gamepad = enable_gamepad,
+    });
 
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_native_stub.zig"),

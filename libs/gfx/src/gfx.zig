@@ -38,6 +38,7 @@ pub const Camera = camera.Camera;
 
 pub const KeyCode = keyboard.KeyCode;
 pub const KeyInfo = keyboard.KeyInfo;
+pub const KeyboardState = keyboard.KeyboardState;
 pub const getKeyName = keyboard.getKeyName;
 pub const getKeyInfo = keyboard.getKeyInfo;
 pub const isLetterKey = keyboard.isLetterKey;
@@ -51,6 +52,7 @@ pub const getCharFromKey = keyboard.getCharFromKey;
 
 // test-gfx 用: `pub const X = @import("f.zig")` だけでは f.zig の test は集まらない。
 // namespace 全体を test ブロックで参照して収集する（gui.zig と同型）。
+// keyboard（KeyboardState 含む）は dedicated run_gfx_kb_test で実行（二重収集を避ける）。
 test {
     _ = atlas;
     _ = animation;
