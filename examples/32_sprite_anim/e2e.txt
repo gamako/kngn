@@ -6,22 +6,22 @@
 #     VP_HARNESS_OUT=$TMPD zig build run-example_32
 
 step 1
-snapshot fb step-1.png
+snapshot fb
 digest fb
 expect fb crc=BA8FA900
 
 step 59
-snapshot fb step-60.png
+snapshot fb
 digest fb
 expect fb crc=0D5C6C01
 
 step 60
-snapshot fb step-120.png
+snapshot fb
 digest fb
 expect fb crc=D357AA75
 
 step 60
-snapshot fb step-180.png
+snapshot fb
 digest fb
 expect fb crc=6A31348B
 quit

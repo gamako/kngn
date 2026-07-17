@@ -1976,7 +1976,34 @@ void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* item
         // メニューバーはアプリ単位。最後の登録の window を event 配送先にする。
         if (window) g_menu_event_window = window;
 
+        // 手動イベントポンプ（nextEventMatchingMask 直呼び）では finishLaunching が
+        // 呼ばれず、setMainMenu してもメニューバーに装着されない（2026-07-17 実機で
+        // 「native=1 なのにメニューバー非表示」として発覚）。menu 利用アプリに限り
+        // ここで一度だけ launched 状態にする（非 menu アプリの挙動は不変）。
+        static bool s_menu_finish_launching_done = false;
+        if (!s_menu_finish_launching_done) {
+            s_menu_finish_launching_done = true;
+            [NSApp finishLaunching];
+        }
+
         NSMenu* mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+        // AppKit は mainMenu の先頭項目を「アプリ名メニュー」スロットに使う。先頭に
+        // アプリメニューを置かないと、最初の登録メニュー（File）がアプリ名の下に
+        // 飲み込まれて見えなくなる。Quit はアプリ側の未保存確認フローを飛ばさないよう
+        // NSApp terminate: ではなく performClose:（first responder = key window の
+        // 既存 windowShouldClose → quit イベント経路）に流す。
+        {
+            NSMenuItem* app_item = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+            NSMenu* app_menu = [[NSMenu alloc] initWithTitle:@""];
+            NSString* app_name = [[NSProcessInfo processInfo] processName];
+            NSMenuItem* quit_item =
+                [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Quit %@", app_name]
+                                           action:@selector(performClose:)
+                                    keyEquivalent:@"q"];
+            [app_menu addItem:quit_item];
+            [app_item setSubmenu:app_menu];
+            [mainMenu addItem:app_item];
+        }
         if (items && count > 0) {
             for (uint32_t i = 0; i < count; i++) {
                 const PlatformMenuItem* src = &items[i];
