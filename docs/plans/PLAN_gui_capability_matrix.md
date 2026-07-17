@@ -152,6 +152,29 @@ examples/35_gui_gallery/e2e.txt は各 section で digest gallery と path 省�
 4. disabled / semantic / query の共通 API 追加は、横断穴を閉じる変更として記録する。
 5. TASK-121.2 は異常系、TASK-121.3 / 121.4 は shell・設定・リスト画面を引き継ぐ。
 
+## 13. TASK-121.2 異常系カタログへの参照
+
+正常系（本マトリクス + `examples/35_gui_gallery`）の対となる異常系・境界系スイートは次を参照する。
+
+- 計画: `docs/plans/PLAN_gui_torture.md`
+- 実行記録・起票候補: `docs/notes/TASK-121.2_gui_torture.md`
+- example: `examples/37_gui_torture`（probe: `state` / `layout` / `scroll`）
+- bench: `zig build bench-gui-frame`（full Context frame 500/1000 行）
+- leak: `zig build test-gui-leak`（PerIdStateStore 30000 entries）
+
+### 121.2 で発見された Missing（起票候補・概要）
+
+詳細・file:line・再現 script は notes を正とする。
+
+1. Nested ScrollArea の wheel が内側優先にならず outer/inner 同時変化
+2. PerIdStateStore に trim/TTL/上限がなく ID 長期変化で単調増加
+3. TextBuffer / textInputId に最大長 API がない
+4. 改行・CJK・emoji の measure / coverage が default font 依存
+5. popup 長文 item の小画面 outer はみ出し仕様が未明文化
+6. zero-size / overflow container の hit-test・clip・child rect 仕様未定義
+7. drag 中 layout 変更時の rect cache 同期遅延の仕様化
+8. 自動 ID 同一ラベル衝突は現行契約（ドキュメント化候補）
+
 ## AC#5 / AC#6 セルフチェック
 
 - AC#5: §2 に APG URL・living document・版表記なし・30 パターン・取得日、ImGui URL・v1.92.6・取得日を記載。

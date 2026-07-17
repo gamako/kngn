@@ -1,0 +1,189 @@
+//! PerIdStateStore state-leak measurement (TASK-121.2).
+//! 100 unique IDs/frame × 300 frames = 30,000 unique IDs.
+//! libs/gui は変更しない。現行実装は entry を trim しないため state_entries_final=30000 を観測値として固定。
+//!
+//! ホットパス宣言: 300 フレームの計測専用ループ。RT / 通常 GUI 経路には影響しない。
+
+const std = @import("std");
+const gui = @import("gui");
+const testing = std.testing;
+
+const W: u32 = 1024;
+const H: u32 = 768;
+const IDS_PER_FRAME: usize = 100;
+const FRAMES: usize = 300;
+const EXPECTED_FINAL: usize = IDS_PER_FRAME * FRAMES; // 30000
+
+/// Zig 0.16 には CountingAllocator が無いため、live/peak/alloc 回数を数える薄い wrapper。
+const CountingAllocator = struct {
+    parent: std.mem.Allocator,
+    live_bytes: usize = 0,
+    peak_bytes: usize = 0,
+    total_alloc_bytes: usize = 0,
+    alloc_count: usize = 0,
+    free_count: usize = 0,
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        self.total_alloc_bytes += len;
+        self.alloc_count += 1;
+        if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.parent.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len > memory.len) {
+            const d = new_len - memory.len;
+            self.live_bytes += d;
+            self.total_alloc_bytes += d;
+            if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.parent.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (new_len > memory.len) {
+            const d = new_len - memory.len;
+            self.live_bytes += d;
+            self.total_alloc_bytes += d;
+            if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -= memory.len;
+        self.free_count += 1;
+    }
+};
+
+fn runLeakScenario(counter: *CountingAllocator) !struct {
+    entries_frame_1: usize,
+    entries_frame_300: usize,
+    entries_final: usize,
+    capacity: usize,
+    live_after: usize,
+    peak: usize,
+    total_alloc: usize,
+    allocs: usize,
+    frees: usize,
+    live_after_deinit: usize,
+} {
+    const a = counter.allocator();
+    var ctx = gui.Context.init(a, gui.default_font);
+    // deinit later for live-after-deinit measurement
+
+    var entries_frame_1: usize = 0;
+    var entries_frame_300: usize = 0;
+
+    var frame: usize = 0;
+    while (frame < FRAMES) : (frame += 1) {
+        ctx.beginFrame(W, H);
+        var i: usize = 0;
+        while (i < IDS_PER_FRAME) : (i += 1) {
+            // IDs never repeat across frames
+            const id: gui.Id = @as(gui.Id, @intCast(frame * IDS_PER_FRAME + i + 1));
+            // Touch PerIdStateStore (text/selectable path) and layout id path
+            _ = ctx.perIdState(id);
+            var lab: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&lab, "w{d}", .{i}) catch "w";
+            const owned = ctx.allocator().dupe(u8, s) catch s;
+            _ = ctx.selectableLabelId(id, owned, .{});
+        }
+        ctx.endFrame();
+        if (frame == 0) entries_frame_1 = ctx.per_id_state.map.count();
+        if (frame == FRAMES - 1) entries_frame_300 = ctx.per_id_state.map.count();
+    }
+
+    const entries_final = ctx.per_id_state.map.count();
+    const capacity = ctx.per_id_state.map.capacity();
+    const live_after = counter.live_bytes;
+    const peak = counter.peak_bytes;
+    const total_alloc = counter.total_alloc_bytes;
+    const allocs = counter.alloc_count;
+    const frees = counter.free_count;
+
+    ctx.deinit();
+    const live_after_deinit = counter.live_bytes;
+
+    return .{
+        .entries_frame_1 = entries_frame_1,
+        .entries_frame_300 = entries_frame_300,
+        .entries_final = entries_final,
+        .capacity = capacity,
+        .live_after = live_after,
+        .peak = peak,
+        .total_alloc = total_alloc,
+        .allocs = allocs,
+        .frees = frees,
+        .live_after_deinit = live_after_deinit,
+    };
+}
+
+test "gui leak: 100 unique IDs/frame x 300 frames leaves 30000 PerIdState entries" {
+    var parent_da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = parent_da.deinit();
+    var counter: CountingAllocator = .{ .parent = parent_da.allocator() };
+
+    const r = try runLeakScenario(&counter);
+
+    // Regression on entry count (current observed contract: no trim)
+    try testing.expectEqual(@as(usize, IDS_PER_FRAME), r.entries_frame_1);
+    try testing.expectEqual(@as(usize, EXPECTED_FINAL), r.entries_frame_300);
+    try testing.expectEqual(@as(usize, EXPECTED_FINAL), r.entries_final);
+
+    // Print allocator metrics for notes (not hard-asserted; environment-dependent)
+    std.debug.print(
+        \\
+        \\[gui-leak] state_entries_frame_1={d}
+        \\[gui-leak] state_entries_frame_300={d}
+        \\[gui-leak] state_entries_final={d}
+        \\[gui-leak] per_id_state.map.capacity={d}
+        \\[gui-leak] live_bytes_before_deinit={d}
+        \\[gui-leak] peak_bytes={d}
+        \\[gui-leak] total_alloc_bytes={d}
+        \\[gui-leak] alloc_count={d}
+        \\[gui-leak] free_count={d}
+        \\[gui-leak] live_bytes_after_deinit={d}
+        \\
+    ,
+        .{
+            r.entries_frame_1,
+            r.entries_frame_300,
+            r.entries_final,
+            r.capacity,
+            r.live_after,
+            r.peak,
+            r.total_alloc,
+            r.allocs,
+            r.frees,
+            r.live_after_deinit,
+        },
+    );
+
+    // After Context.deinit, store memory should be freed (live may still include parent bookkeeping)
+    try testing.expect(r.live_after_deinit <= r.live_after);
+}

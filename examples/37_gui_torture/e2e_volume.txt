@@ -1,0 +1,26 @@
+# TASK-121.2 volume E2E (500 then 1000 via PAGE_DOWN)
+# 起動: VP_GUI_TORTURE_CASE=volume
+step 4
+digest state
+digest layout
+expect state case=volume
+expect state row_count=500
+expect state constructed_rows=500
+expect state layout_completed=1
+expect state render_completed=1
+expect layout layout_completed=1
+expect layout render_completed=1
+expect layout row_count=500
+snapshot fb
+
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 3
+digest state
+expect state row_count=1000
+expect state constructed_rows=1000
+expect state layout_completed=1
+expect state render_completed=1
+snapshot fb
+quit

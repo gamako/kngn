@@ -479,6 +479,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_34", .path = "examples/34_action_map/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_36", .path = "examples/36_tilemap/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_37", .path = "examples/37_gui_torture/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -1554,6 +1555,21 @@ pub fn build(b: *std.Build) void {
     const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
     test_gui_step.dependOn(&run_gui_test.step);
 
+    // test-gui-leak（TASK-121.2）: PerIdStateStore のユニーク ID 単調増加を計測
+    // （libs/gui は変更しない。entry 数を回帰 assert、allocator bytes は notes 用に出力）
+    const gui_leak_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/gui_leak.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gui_leak_test_mod.addImport("gui", gui_test_root);
+    const gui_leak_test = b.addTest(.{ .root_module = gui_leak_test_mod });
+    const run_gui_leak_test = b.addRunArtifact(gui_leak_test);
+    // 計測行を常に表示（--summary all と併用しやすくする）
+    run_gui_leak_test.has_side_effects = true;
+    const test_gui_leak_step = b.step("test-gui-leak", "Run GUI PerIdStateStore leak measurement (TASK-121.2)");
+    test_gui_leak_step.dependOn(&run_gui_leak_test.step);
+
     // libs/font テスト (geom / color / Font インターフェース + カバレッジ描画路 + BMFont)
     const font_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/font/src/lib.zig"),
@@ -1819,6 +1835,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_kit_step);
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
+    test_step.dependOn(test_gui_leak_step);
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_modular_step);
     test_step.dependOn(test_app_modular_step);
@@ -1974,6 +1991,17 @@ pub fn build(b: *std.Build) void {
     const bench_gui_exe = b.addExecutable(.{ .name = "bench_gui", .root_module = bench_gui_root });
     const bench_gui_step = b.step("bench-gui", "Run GUI render (rect/image/text) micro-benchmark (ReleaseFast)");
     bench_gui_step.dependOn(&b.addRunArtifact(bench_gui_exe).step);
+
+    // bench-gui-frame（TASK-121.2）: beginFrame → widget 構築 → endFrame → gui.render の full Context frame
+    const bench_gui_frame_root = b.createModule(.{
+        .root_source_file = b.path("bench/gui_frame.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_gui_frame_root.addImport("gui", bench_gui_mod);
+    const bench_gui_frame_exe = b.addExecutable(.{ .name = "bench_gui_frame", .root_module = bench_gui_frame_root });
+    const bench_gui_frame_step = b.step("bench-gui-frame", "Run GUI full Context frame benchmark 500/1000 rows (ReleaseFast)");
+    bench_gui_frame_step.dependOn(&b.addRunArtifact(bench_gui_frame_exe).step);
 
     // bench-blit（TASK-54）: pixie の canvas zoom 転送 + チェッカー背景（新旧比較を同時計測）
     const bench_blit_core = b.createModule(.{

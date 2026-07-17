@@ -1,0 +1,14 @@
+# TASK-121.2 layout torture at 100x100
+# 起動: VP_GUI_WIDTH=100 VP_GUI_HEIGHT=100 VP_GUI_TORTURE_CASE=layout
+# expect 値は 2026-07-17 headless replay の実測を焼き込み
+step 3
+digest layout
+expect layout case=layout
+expect layout screen_w=100
+expect layout screen_h=100
+expect layout draw_ok=1
+expect layout overflow=1
+expect layout zero_w=0
+expect layout zero_h=0
+snapshot fb
+quit

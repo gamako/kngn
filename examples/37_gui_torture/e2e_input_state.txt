@@ -1,0 +1,99 @@
+# TASK-121.2 input/state torture
+# 起動: VP_GUI_TORTURE_CASE=input_state
+# 座標は unshifted pad_top=12 時の実測（slider knob @ value0）
+step 4
+digest layout
+expect layout case=input_state
+expect layout slider_x=66
+expect layout slider_y=50
+snapshot fb
+
+# 1) slider active + layout shift (F1) while held
+inject mouse_move 71 58
+step 2
+inject mouse_down left
+step 2
+digest state
+expect state active=slider
+expect state dragging=1
+inject key_down F1
+step 1
+inject key_up F1
+step 2
+digest state
+expect state active=slider
+expect state layout_generation=1
+snapshot fb
+inject mouse_up left
+step 2
+digest state
+expect state active_is_zero=1
+
+# F1 を戻して unshifted 座標へ
+inject key_down F1
+step 1
+inject key_up F1
+step 2
+
+# 2) disappear widget active → hide (F2) → mouse up → active=0
+inject mouse_move 92 86
+step 2
+inject mouse_down left
+step 2
+digest state
+expect state active=disappear
+inject key_down F2
+step 1
+inject key_up F2
+step 2
+digest state
+expect state hide_active_widget=1
+inject mouse_up left
+step 2
+digest state
+expect state active_is_zero=1
+snapshot fb
+
+# restore widgets
+inject key_down F3
+step 1
+inject key_up F3
+step 3
+
+# 3) open popup, behind widget must not hot/active/click
+inject mouse_move 92 182
+step 2
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest state
+expect state popup_open=1
+expect state wants_mouse=1
+# over behind button area while popup open
+inject mouse_move 92 150
+step 2
+digest state
+expect state hot=none
+expect state active=none
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest state
+expect state behind_clicks=0
+snapshot fb
+
+# 4) outside click dismisses without behind click
+inject mouse_move 10 10
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest state
+expect state popup_open=0
+expect state popup_dismissed=1
+expect state behind_clicks=0
+snapshot fb
+quit

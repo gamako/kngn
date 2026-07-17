@@ -1,0 +1,56 @@
+# TASK-121.2 layout torture (1024x768)
+# expect 値は 2026-07-17 headless replay の実測を焼き込み
+step 3
+digest layout
+expect layout case=layout
+expect layout screen_w=1024
+expect layout screen_h=768
+expect layout draw_ok=1
+expect layout zero_w=0
+expect layout zero_h=0
+expect layout splitter0_size=200
+expect layout pane0_w=200
+digest scroll
+expect scroll outer_scroll_y=0
+expect scroll inner_scroll_y=0
+snapshot fb
+
+# drag split0 toward min
+inject mouse_move 204 80
+step 2
+inject mouse_down left
+step 1
+inject mouse_move 40 80
+step 2
+inject mouse_up left
+step 2
+digest layout
+expect layout splitter0_size=36
+expect layout pane0_w=36
+expect layout draw_ok=1
+snapshot fb
+
+# nested scroll: mouse over inner (outer_vp y~248, inner y~272)
+inject mouse_move 150 320
+step 2
+inject scroll 0 -3
+step 2
+digest scroll
+# 現行: 同一 wheel delta で outer/inner が同時に変化する
+expect scroll outer_scroll_y=96
+expect scroll inner_scroll_y=96
+snapshot fb
+
+# second wheel (may leave inner if scrolled)
+inject mouse_move 120 300
+step 1
+inject scroll 0 -2
+step 2
+digest scroll
+expect scroll outer_scroll_y>0
+expect scroll inner_scroll_y>0
+digest layout
+expect layout overflow=1
+expect layout draw_ok=1
+snapshot fb
+quit

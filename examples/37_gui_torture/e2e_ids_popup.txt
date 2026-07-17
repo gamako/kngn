@@ -1,0 +1,39 @@
+# TASK-121.2 ids/popup torture
+# 起動: VP_GUI_TORTURE_CASE=ids_popup
+# expect 値は 2026-07-17 headless replay の実測を焼き込み
+step 4
+digest state
+expect state case=ids_popup
+expect state button_count=100
+expect state same_label_independent=1
+digest layout
+expect layout btn0_x=12
+expect layout btn1_y=60
+snapshot fb
+
+# click btn1 (index 1)
+inject mouse_move 72 72
+step 2
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest state
+expect state clicked_index=1
+snapshot fb
+
+# open corner popup (bottom-right clamp)
+inject mouse_move 90 438
+step 2
+inject mouse_down left
+step 1
+inject mouse_up left
+step 3
+digest state
+expect state popup_open=1
+digest layout
+expect layout popup_fits_x=1
+expect layout popup_fits_y=1
+expect layout popup_clamped=1
+snapshot fb
+quit

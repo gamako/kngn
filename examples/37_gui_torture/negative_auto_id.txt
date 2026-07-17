@@ -1,0 +1,5 @@
+# TASK-121.2 negative: duplicate auto-id buttons → Debug assert non-zero exit
+# Requires VP_GUI_TORTURE_CASE=negative_auto_id and Debug build
+step 2
+digest state
+quit

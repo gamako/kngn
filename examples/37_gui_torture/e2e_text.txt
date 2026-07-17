@@ -1,0 +1,88 @@
+# TASK-121.2 text torture
+# 起動: VP_GUI_TORTURE_CASE=text
+# expect 値は 2026-07-17 headless replay の実測を焼き込み
+step 3
+digest state
+expect state case=text
+expect state text_empty=1
+expect state text_bytes=0
+expect state text_codepoints=0
+expect state utf8_boundary=1
+expect state popup_text_bytes=500
+snapshot fb
+
+# focus empty text input (text_input y=192)
+inject mouse_move 100 200
+step 2
+inject mouse_down left
+inject mouse_up left
+step 1
+digest state
+expect state focused_id!=0
+expect state wants_keyboard=1
+snapshot fb
+
+# load UTF-8 boundary sample, caret stays on boundary
+inject key_down F5
+step 1
+inject key_up F5
+step 2
+digest state
+expect state text_empty=0
+expect state text_codepoints=5
+expect state text_bytes=12
+expect state utf8_boundary=1
+snapshot fb
+
+# load 500 codepoints, End / Shift+Left / Home / Right
+inject key_down F4
+step 1
+inject key_up F4
+step 2
+digest state
+expect state text_codepoints=500
+expect state text_bytes=500
+inject key_down END
+step 1
+inject key_up END
+step 1
+digest state
+expect state caret=500
+inject key_down LEFT shift
+step 1
+inject key_up LEFT
+step 1
+digest state
+# 現行観測: caret=499, selection [499,500]
+expect state caret=499
+expect state selection_start=499
+expect state selection_end=500
+expect state utf8_boundary=1
+inject key_down HOME
+step 1
+inject key_up HOME
+step 1
+digest state
+expect state caret=0
+inject key_down RIGHT
+step 1
+inject key_up RIGHT
+step 1
+digest state
+expect state caret=1
+expect state utf8_boundary=1
+snapshot fb
+
+# open text popup with 500-codepoint item (down/up をフレーム分離)
+inject mouse_move 80 230
+step 2
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest state
+expect state popup_open=1
+expect state popup_text_bytes=500
+digest layout
+snapshot fb
+quit
