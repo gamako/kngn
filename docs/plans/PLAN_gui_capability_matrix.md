@@ -179,3 +179,43 @@ examples/35_gui_gallery/e2e.txt は各 section で digest gallery と path 省�
 
 - AC#5: §2 に APG URL・living document・版表記なし・30 パターン・取得日、ImGui URL・v1.92.6・取得日を記載。
 - AC#6: §7 と §10 に disabled API 不足、PopupItem.enabled / Command.enabled の個別対応、stepgrid editable、focus と semantic role の不足、専用 query API 不足を記載。
+
+## 14. TASK-121.3 観測（設定画面シェル / examples/39_settings_shell）
+
+`examples/39_settings_shell` で左ナビ + 3 フォーム（General / Editor / Audio、合計 36 コントロール）を現有 API のみで構築した結果。`libs/gui` 本体は変更していない。
+
+### 14.1 既存 Missing への証拠追記（重複行は作らない）
+
+| 項目 | 121.3 での観測 |
+|---|---|
+| Tabs | 専用 API なし。左ナビ section 切替を `selectableLabelId` + app 側 section enum で代用。 |
+| Accordion / Disclosure | 専用 widget なし。フォームは常時展開の `ScrollArea` 内フラットリストで代替。 |
+| Combobox / dropdown / select | 専用 widget なし。theme / indent / font / output / buffer は `radioId` 群で代替。 |
+| Meter | 未使用・未実装のまま（Audio の show_meter は checkbox フラグのみ）。 |
+| Spinbutton | 数値は `sliderI32Id` / `sliderF32Id` で代替。 |
+| Tooltip | form description は `labelEx` の固定文で代替。専用 hover tooltip API なし。 |
+| Dialog (Modal) | 本シェルでは不要。モーダル確認 UI は未検証。 |
+
+### 14.2 121.3 で新規に観測したギャップ
+
+1. **`selectableLabelId` に clicked 結果がなく、nav activation に focus 依存の app 側 glue が必要**  
+   `claimFocus` は click 時に走るが「section 選択」セマンティクスではない。app が `focused_id` を section enum に写す。focus が効かない場合は `hot_id` + `mouse_pressed` の click glue が必要（hack）。
+2. **Tabs 相当の selected section semantics が専用 API として存在しない**  
+   選択中背景は外側 `beginBox` の bg で app が描画。`selectableLabel` の selection background はテキスト選択用に残した。
+3. **共通 form row / label-for / field description の composable API が存在しない**  
+   各コントロールは label 付き widget と補助 `labelEx` を手で縦に積む。field と説明の紐付け API はない。
+4. **一般 widget 共通の disabled state API が存在しない**  
+   設定項目の無効化（例: audio off 時に volume を disable）を表現できない。PopupItem/Command の個別 enabled のみ。
+5. **非 text widget の keyboard focus traversal / tab order API が存在しない**  
+   checkbox / toggle / radio / slider は focus を claim しない。E2E の `focused=` 期待のため app が `claimFocus` glue を足す必要がある（hack）。
+6. **focus-visible の共通描画状態 API が存在しない**  
+   keyboard 操作中のフォーカスリング描画を widget 横断で宣言できない。
+7. **3 フォーム 36 コントロールの明示 ID 管理が必要**  
+   自動 ID は使わず section ごとに ID レンジを分離。probe / harness 座標導出が同一 ID 表に依存。
+8. **ScrollArea 長フォームの hit-test は可能だが、scroll 後 rect の再取得が caller 責務**  
+   layout probe を scroll 後に取り直し、座標を再計算する運用が必須（harness に座標変数機能はない）。
+
+### 14.3 121.2 既記録との関係
+
+- Nested ScrollArea wheel・PerIdStateStore 上限・TextBuffer 最大長などは本シェルでは再起票しない。
+- 設定画面は section ごとに独立 ScrollArea 1 本で、nested wheel 問題は再現経路に含めなかった。
