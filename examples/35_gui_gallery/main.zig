@@ -321,8 +321,11 @@ fn renderBasic(ctx: *gui.Context, app: *App) void {
 }
 
 fn renderText(ctx: *gui.Context, app: *App) void {
-    _ = ctx.textInputId(Ids.text_input, app.text, .{ .width = .{ .fixed = 320 }, .placeholder = "empty" });
-    _ = ctx.selectableLabelId(Ids.selectable, "Selectable label (drag)", .{});
+    const input = ctx.textInputId(Ids.text_input, app.text, .{ .width = .{ .fixed = 320 }, .placeholder = "empty" });
+    const selectable = ctx.selectableLabelId(Ids.selectable, "Selectable label (drag)", .{});
+    // Cmd+C/X を実クリップボードへ（TASK-120 の consumer 配線。example_28 と同型）
+    if (input.copy_request) |r| platform.setClipboardText(r.text);
+    if (selectable.copy_request) |r| platform.setClipboardText(r.text);
 }
 
 fn renderValues(ctx: *gui.Context, app: *App) void {
