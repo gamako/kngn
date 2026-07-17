@@ -141,8 +141,9 @@ pub fn pointInInspectorState(point: Vec2f, fb_w: f32, canvas_h: f32, open: bool)
 }
 
 /// 描画側が渡すノード幾何。pos は world 左上。
-/// grid_rows>0 は畳みマクロ箱（TASK-40.7.2）: 本体に TR/303 grid を描くため、ポート数由来の高さに加えて
-/// grid 行数ぶんの高さを nodeSize で確保する（ヒットテスト矩形も同じ高さになり整合）。0 は通常ノード。
+/// grid_rows>0 は本体に step grid を描く箱（畳みマクロ箱 / 選択中の単体 step_seq）:
+/// ポート数由来の高さに加えて grid 行数ぶんを nodeSize で確保する（ヒットテスト矩形も同じ高さで整合）。
+/// 0 = grid なし。1 = drum 単体 on 行。4 = bass 単体 on/accent/slide/pitch。マクロ箱は group metadata 由来。
 pub const NodeGeom = struct {
     handle: Handle,
     pos: Vec2f,
@@ -219,7 +220,7 @@ fn rowCount(g: NodeGeom) f32 {
 }
 
 /// ノードの world サイズ（幅固定・高さはポート数依存＝見切れ防止のため十分な高さ）。
-/// grid_rows>0（畳みマクロ箱）は grid が収まる高さと比べて大きい方を採る。
+/// grid_rows>0（マクロ箱 / 選択中 standalone step_seq）は grid が収まる高さと比べて大きい方を採る。
 pub fn nodeSize(g: NodeGeom) Vec2f {
     const port_h = TITLE_H + PORT_SPACING * rowCount(g) + BODY_PAD;
     if (g.grid_rows == 0) return .{ .x = NODE_W, .y = port_h };
@@ -348,8 +349,9 @@ pub fn hitTestToggle(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
 }
 
 // ----------------------------------------------------------------------------
-// 畳みマクロ箱の TR/303 grid レイアウト定数（TASK-40.7.2）。セル矩形とヒットテストは
-// libs/gui.stepgrid が一元管理し、main.zig が camera 変換前後の adapter を担当する。
+// step grid レイアウト定数（マクロ箱 / 単体 step_seq 共通。TASK-40.7.2 / TASK-110.2）。
+// セル矩形とヒットテストは libs/gui.stepgrid が一元管理し、main.zig が camera 変換前後の
+// adapter を担当する。
 // ----------------------------------------------------------------------------
 pub const GRID_STEPS: u8 = 16;
 pub const GRID_SIDE_PAD: f32 = 10; // 左右マージン（左右ポート dot を避ける）
@@ -357,7 +359,7 @@ pub const GRID_TOP_PAD: f32 = 4; // タイトル下からグリッド先頭ま�
 pub const GRID_CELL_H: f32 = 8; // セル高
 pub const GRID_ROW_GAP: f32 = 2; // 行間
 
-/// stepgrid へ渡す前の box-local grid 幾何。gui を import しない canvas 側でも、描画と
+/// stepgrid へ渡す前の box-local / screen grid 幾何。gui を import しない canvas 側でも、描画と
 /// hit-test が同じ定数を使う adapter の入力を単一化する。
 pub const GridGeometry = struct {
     origin_x: f32,
@@ -379,8 +381,9 @@ pub fn gridBlockHeight(rows: u8) f32 {
     return GRID_TOP_PAD + fr * (GRID_CELL_H + GRID_ROW_GAP);
 }
 
-/// macro box の screen geometry。box-local の呼び出しでは box_pos = (0, 0) を渡す。
-pub fn macroGridGeometry(cam: Camera, box_pos: Vec2f) GridGeometry {
+/// ノード/マクロ箱共通の grid geometry。camera 変換済み origin / cell size / pitch。
+/// box-local の呼び出しでは box_pos = (0, 0)・zoom=1 を渡す。
+pub fn gridGeometry(cam: Camera, box_pos: Vec2f) GridGeometry {
     const top_left = cam.worldToScreen(box_pos);
     const step_pitch = gridStepWidth() * cam.zoom;
     return .{
@@ -673,6 +676,48 @@ test "canvas: nodeSize grows for grid box (grid_rows>0) and matches gridBlockHei
     // 明示式と一致（port 高さより grid 高さが大きいケース）。
     const expect_h = TITLE_H + gridBlockHeight(2) + BODY_PAD;
     try testing.expectApproxEqAbs(expect_h, nodeSize(box).y, 1e-4);
+}
+
+test "canvas: nodeSize contains 1-row inline grid (drum standalone)" {
+    const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1, .grid_rows = 1 };
+    const geom = gridGeometry(.{ .zoom = 1.0 }, g.pos);
+    const last_y = geom.origin_y + geom.cell_h; // row 0 下端
+    try testing.expect(last_y <= g.pos.y + nodeSize(g).y);
+    // port 高さと grid 高さの max（1 行 grid は port 高より低いことが多い）
+    const port_h = TITLE_H + PORT_SPACING * 1.0 + BODY_PAD;
+    const grid_h = TITLE_H + gridBlockHeight(1) + BODY_PAD;
+    try testing.expectApproxEqAbs(@max(port_h, grid_h), nodeSize(g).y, 1e-4);
+}
+
+test "canvas: nodeSize contains 4-row inline grid (bass standalone)" {
+    const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 3, .grid_rows = 4 };
+    const geom = gridGeometry(.{ .zoom = 1.0 }, g.pos);
+    // row 3 下端が node 下端以内
+    const last_y = geom.origin_y + 3.0 * geom.row_pitch + geom.cell_h;
+    try testing.expect(last_y <= g.pos.y + nodeSize(g).y);
+    // bass は n_out=3 の port 高と 4 行 grid 高の max
+    const port_h = TITLE_H + PORT_SPACING * 3.0 + BODY_PAD;
+    const grid_h = TITLE_H + gridBlockHeight(4) + BODY_PAD;
+    try testing.expectApproxEqAbs(@max(port_h, grid_h), nodeSize(g).y, 1e-4);
+}
+
+test "canvas: gridGeometry is shared by macro box and standalone node positions" {
+    const cam = Camera{ .pan = .{ .x = 12, .y = -4 }, .zoom = 1.5 };
+    const pos = Vec2f{ .x = 160, .y = 470 };
+    // 同一 adapter・同一入力なら同一セル矩形（macro / standalone の意味差は呼び出し側のみ）。
+    const a = gridGeometry(cam, pos);
+    const b = gridGeometry(cam, pos);
+    try testing.expectEqual(a.origin_x, b.origin_x);
+    try testing.expectEqual(a.origin_y, b.origin_y);
+    try testing.expectEqual(a.cell_w, b.cell_w);
+    try testing.expectEqual(a.cell_h, b.cell_h);
+    try testing.expectEqual(a.step_pitch, b.step_pitch);
+    try testing.expectEqual(a.row_pitch, b.row_pitch);
+    // 代表セル中心が box 内（standalone 1 行 / macro 3 行とも同じ定数）
+    const cx = a.origin_x + a.cell_w * 0.5;
+    const cy = a.origin_y + a.cell_h * 0.5;
+    try testing.expect(cx > pos.x * cam.zoom + cam.pan.x);
+    try testing.expect(cy > pos.y * cam.zoom + cam.pan.y);
 }
 
 test "canvas: resolveConnection direction rules (self-loop allowed, same-dir rejected)" {

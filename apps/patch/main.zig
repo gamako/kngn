@@ -471,12 +471,24 @@ const App = struct {
     }
 
     /// 実 handle の生ノード列（dyn 由来。合成 handle は含まない）。フレーム毎。
+    /// selected かつ group 非所属の step_seq にだけ inline grid 用 grid_rows を付与する（TASK-110.2）。
     fn buildRawNodes(self: *const App, out: []NodeGeom) usize {
         var n: usize = 0;
         var h: Handle = 0;
         while (h < MAX_MODULES) : (h += 1) {
             if (!self.dyn.slotActive(h)) continue;
-            out[n] = .{ .handle = h, .pos = self.layout[h], .n_in = self.dyn.nIn(h), .n_out = self.dyn.nOut(h) };
+            var g: NodeGeom = .{ .handle = h, .pos = self.layout[h], .n_in = self.dyn.nIn(h), .n_out = self.dyn.nOut(h) };
+            if (self.selected) |sel| switch (sel) {
+                .node => |sh| if (sh == h and self.ledger.group_of[h] == null and self.dyn.kindOf(h) == .step_seq) {
+                    const seq = self.dyn.ptrOfConst(.step_seq, h);
+                    g.grid_rows = switch (seq.kind) {
+                        .drum => 1,
+                        .bass => 4,
+                    };
+                },
+                else => {},
+            };
+            out[n] = g;
             n += 1;
         }
         return n;
@@ -642,6 +654,9 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         if (group.groupIdFromHandle(g.handle)) |gid| {
             drawToggle(dl, cam, g, true); // 畳み箱は常に collapsed 側
             drawMacroGrid(app, dl, cam, g, gid); // 本体に TR/303 grid + playhead（TASK-40.7.2）
+        } else if (g.grid_rows > 0) {
+            // selected standalone step_seq の inline grid（TASK-110.2。マクロ箱経路とは分離）
+            drawInlineStepSeqGrid(app, dl, cam, g);
         }
         var i: u8 = 0;
         while (i < g.n_in) : (i += 1) {
@@ -852,8 +867,7 @@ fn clickableRows(g: group.Group) u8 {
     };
 }
 
-fn macroGridGeometry(cam: Camera, box_pos: Vec2f) stepgrid.Geometry {
-    const g = canvas.macroGridGeometry(cam, box_pos);
+fn toStepgridGeometry(g: canvas.GridGeometry) stepgrid.Geometry {
     return .{
         .origin_x = g.origin_x,
         .origin_y = g.origin_y,
@@ -862,6 +876,11 @@ fn macroGridGeometry(cam: Camera, box_pos: Vec2f) stepgrid.Geometry {
         .step_pitch = g.step_pitch,
         .row_pitch = g.row_pitch,
     };
+}
+
+/// camera 変換済みの共通 grid geometry（macro box / standalone node 共用 adapter）。
+fn gridGeometry(cam: Camera, box_pos: Vec2f) stepgrid.Geometry {
+    return toStepgridGeometry(canvas.gridGeometry(cam, box_pos));
 }
 
 /// 畳み箱本体に TR grid（drum 2 レーン）/ 303 行（on/accent/slide + pitch 段）+ playhead を描く。
@@ -873,7 +892,7 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: 
     // playhead 列: process は現 step 評価後に step++ するので、直近発音した列は (step + STEPS-1) % STEPS。
     const head_seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
     const playhead: u8 = (head_seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
-    const geometry = macroGridGeometry(cam, box.pos);
+    const geometry = gridGeometry(cam, box.pos);
 
     switch (kind) {
         .drum_machine => {
@@ -900,6 +919,30 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: 
     }
 }
 
+/// 選択中 standalone step_seq の inline grid 描画（pattern_db 非経由・atomic load のみ。TASK-110.2）。
+fn drawInlineStepSeqGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom) void {
+    const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, box.handle);
+    const playhead: u8 = (seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
+    const geometry = gridGeometry(cam, box.pos);
+    switch (seq.kind) {
+        .drum => {
+            const rows = [_]stepgrid.DrawRow{
+                .{ .mask = seq.loadOnMask(), .on_color = stepgrid.DEFAULT_ON },
+            };
+            stepgrid.draw(dl, geometry, rows[0..], .{ .playhead = @intCast(playhead) });
+        },
+        .bass => {
+            const rows = [_]stepgrid.DrawRow{
+                .{ .mask = seq.loadOnMask(), .on_color = stepgrid.DEFAULT_ON },
+                .{ .mask = seq.loadAccentMask(), .on_color = stepgrid.DEFAULT_ACCENT },
+                .{ .mask = seq.loadSlideMask(), .on_color = stepgrid.DEFAULT_SLIDE },
+                .{ .pitch = .{ .degrees = seq.pitch_deg[0..], .degree_count = modular.scaleDegreeCount(seq.scale, seq.octaves), .color = stepgrid.DEFAULT_PITCH, .style = .bars } },
+            };
+            stepgrid.draw(dl, geometry, rows[0..], .{ .playhead = @intCast(playhead) });
+        },
+    }
+}
+
 /// world 点がどの collapsed マクロ箱の grid セルに当たるか（クリック可能行のみ）。
 const GridHit = struct { gid: group.GroupId, cell: stepgrid.GridCell };
 fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
@@ -907,10 +950,50 @@ fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
         if (!g.active or !g.collapsed) continue;
         const gid: group.GroupId = @intCast(i);
         const local = world_pt.sub(g.pos);
-        const geometry = macroGridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 });
+        const geometry = gridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 });
         if (stepgrid.hitTest(geometry, local.x, local.y, clickableRows(g))) |cell| return .{ .gid = gid, .cell = cell };
     }
     return null;
+}
+
+/// selected standalone step_seq の inline grid ヒット（mask 行のみ。pitch は対象外。TASK-110.2）。
+const InlineGridHit = struct { handle: Handle, cell: stepgrid.GridCell };
+fn hitInlineStepSeqGrid(app: *const App, world_pt: Vec2f) ?InlineGridHit {
+    const sel = app.selected orelse return null;
+    const h: Handle = switch (sel) {
+        .node => |nh| nh,
+        else => return null,
+    };
+    if (app.ledger.group_of[h] != null) return null;
+    if (app.dyn.kindOf(h) != .step_seq) return null;
+    if (!app.dyn.slotActive(h)) return null;
+    const seq = app.dyn.ptrOfConst(.step_seq, h);
+    const clickable: u8 = switch (seq.kind) {
+        .drum => 1,
+        .bass => 3, // on/accent/slide。pitch(row 3) は表示専用
+    };
+    const local = world_pt.sub(app.layout[h]);
+    const geometry = gridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 });
+    if (stepgrid.hitTest(geometry, local.x, local.y, clickable)) |cell| {
+        return .{ .handle = h, .cell = cell };
+    }
+    return null;
+}
+
+/// standalone step_seq の mask トグル（atomic accessor のみ。pattern_db / publish は触らない）。
+fn toggleInlineStepSeqCell(app: *App, hit: InlineGridHit) void {
+    const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, hit.handle);
+    switch (seq.kind) {
+        .drum => {
+            if (hit.cell.row == 0) seq.toggleOnBit(hit.cell.step);
+        },
+        .bass => switch (hit.cell.row) {
+            0 => seq.toggleOnBit(hit.cell.step),
+            1 => seq.toggleAccentBit(hit.cell.step),
+            2 => seq.toggleSlideBit(hit.cell.step),
+            else => {},
+        },
+    }
 }
 
 fn generatedMacroGroup(app: *const App, gid: group.GroupId) bool {
@@ -1087,6 +1170,15 @@ fn onMouseDown(app: *App) void {
     if (hitMacroGrid(app, mw)) |hit| {
         toggleMacroGridCell(app, hit);
         app.selected = .{ .group = hit.gid };
+        app.drag = .none;
+        return;
+    }
+
+    // selected standalone step_seq の inline grid（TASK-110.2）。port/node drag より前。
+    // ヒット時は mask toggle のみ・selected 維持・node drag を開始しない。
+    if (hitInlineStepSeqGrid(app, mw)) |hit| {
+        toggleInlineStepSeqCell(app, hit);
+        app.selected = .{ .node = hit.handle };
         app.drag = .none;
         return;
     }
