@@ -988,6 +988,8 @@ zig build test-harness          # harness（parser / 実行モデル / 仮想ク
 zig build test-appshell         # libs/appshell（Preferences/WindowState/RecentFiles/DocumentHost）
 zig build test-midi             # core/midi facade + null backend（TASK-115.1）
 zig build test-sound            # libs/sound（WAV decode / SoundPlayer RT ゼロアロケーション。TASK-111.6）
+zig build test-platform-clipboard # clipboard facade round-trip（headless in-memory fallback。TASK-120）
+zig build test-gui-leak         # PerIdStateStore の state leak 計測（ユニーク100 ID×300 frame。TASK-121.2）
 # 入力変換の単体テスト（display/compositor 不要）: test-platform-input / -wayland-input / -windows-input / -convert / test-platform-types
 # テスト実装の規約: ファイル I/O を伴うテストは cwd 固定ファイル名を使わず std.testing.tmpDir(.{}) を使う
 # （@import 連鎖で同じテストが複数テストバイナリに同居し、集約 test の並列実行で固定名を取り合って
@@ -996,6 +998,7 @@ zig build test-sound            # libs/sound（WAV decode / SoundPlayer RT ゼ�
 # マイクロベンチ（性能変更の前後比較。ReleaseFast 固定・display/audio デバイス不要・OS 非依存。TASK-50）
 zig build bench-canvas          # Canvas.composite / compositeStraight の ns/frame・Mpx/s
 zig build bench-synth           # Synth(16voice).render / MasterEffects.process の ns/block・×realtime
+zig build bench-gui-frame       # gui full Context frame（beginFrame→構築→endFrame→render。500/1000行 avg/min/p95。TASK-121.2）
 
 # Pixie エディタの実行（-Dplatform で objc/swift/metal 切替）
 zig build run-pixie
@@ -1019,7 +1022,7 @@ zig build run-example_23        # 23_fullscreen（Window.createFullscreen デモ
 #       16_gui_scroll / 17_gui_toggles / 18_cursor / 19_color_emoji / 20_capture_demo / 21_char_input /
 #       22_gamepad / 23_fullscreen / 24_desktop_mascot / 25_collision_demo / 26_appshell_demo /
 #       27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo / 31_sprite_ex /
-#       32_sprite_anim / 33_camera / 34_action_map / 35_gui_gallery  （image/ は共有アセットで run step なし）
+#       32_sprite_anim / 33_camera / 34_action_map / 35_gui_gallery / 36_tilemap / 37_gui_torture  （image/ は共有アセットで run step なし）
 ```
 
 ---
