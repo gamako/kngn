@@ -167,6 +167,21 @@ pub const SongData = struct {
     }
 };
 
+/// UI が編集した DynGraph parameter の累積 override 表。
+/// Mailbox は latest-wins のため、差分ではなく touched 済みの全件を毎回 publish する。
+pub const MAX_PARAM_OVERRIDES: usize = 64;
+pub const ParamOverride = struct {
+    handle: modular.dyn.Handle = 0,
+    name: []const u8 = "",
+    value: modular.ParamValue = .{ .scalar = 0.0 },
+    touched: bool = false,
+};
+
+pub const ParamBatch = struct {
+    revision: u64 = 0,
+    entries: [MAX_PARAM_OVERRIDES]ParamOverride = [_]ParamOverride{.{}} ** MAX_PARAM_OVERRIDES,
+};
+
 /// GUI(メインスレッド)→ Audio(RT) のリアルタイム操作。GUI は store/publish のみ、
 /// render() 冒頭の applyControls() が load→clamp/finite して各モジュール field へ適用する。
 pub const Controls = struct {
@@ -197,6 +212,8 @@ pub const Controls = struct {
     pattern_db: synth.Mailbox(PatternCommand),
     // TASK-91: SongData（固定長・triple-buffer。pattern_db と同型）
     song_db: synth.Mailbox(SongData),
+    // TASK-110.4: UI→RT の累積 parameter override 表（latest-wins triple buffer）。
+    param_db: synth.Mailbox(ParamBatch),
     // TASK-91: song 再生 on/off（0/1）。開始エッジで RT が position をリセット。
     song_playing: std.atomic.Value(u32),
     // TASK-91: song_goto。gen 変化で row を latch（0xFF_FF_FF_FF = 無効）。
@@ -231,6 +248,7 @@ pub const Controls = struct {
             .ambient_move = synth.AtomicF32.init(AMBIENT_MOVE_DEFAULT),
             .pattern_db = synth.Mailbox(PatternCommand).init(PatternCommand.default()),
             .song_db = synth.Mailbox(SongData).init(SongData.default()),
+            .param_db = synth.Mailbox(ParamBatch).init(.{}),
             .song_playing = std.atomic.Value(u32).init(0),
             .song_goto_row = std.atomic.Value(u32).init(0),
             .song_goto_gen = std.atomic.Value(u64).init(0),
@@ -474,6 +492,11 @@ pub const LofiPatch = struct {
         }
     }
 
+    /// main thread: 累積 override 表を publish する。revision は呼び出し側で管理する。
+    pub fn publishParamBatch(self: *LofiPatch, batch: ParamBatch) void {
+        self.controls.param_db.publish(batch);
+    }
+
     pub fn destroy(self: *LofiPatch) void {
         const allocator = self.allocator;
         self.graph.destroy();
@@ -703,6 +726,14 @@ pub const LofiPatch = struct {
         const mv = clampFinite(c.ambient_move.load(), 0.0, 1.0, AMBIENT_MOVE_DEFAULT);
         if (self.ptr(.lfo, self.ambient_lfo_h)) |ambient_lfo| ambient_lfo.rate_hz = 0.03 + mv * 0.42;
         if (self.ptr(.chord_pad, self.pad_h)) |pad| pad.cutoff_mod_oct = 0.2 + mv * 0.8;
+
+        // Inspector override は generated Controls より後勝ち。毎 block 全 touched entry を
+        // 再適用することで Mailbox の latest-wins による先行編集の drop を防ぐ。
+        const overrides = c.param_db.acquire();
+        for (overrides.entries) |entry| {
+            if (!entry.touched) continue;
+            modular.setParam(self.graph, entry.handle, entry.name, entry.value) catch {};
+        }
     }
 
     /// PatternCommand を StepSeq / lock / evolve / anchor へ反映（RT・alloc/lock なし・固定長コピー）。
@@ -1491,6 +1522,42 @@ test "Controls: swing/sidechain/cutoff change output (bounded & finite)" {
     const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
 
     try testing.expect(crc_base != crc_mod);
+}
+
+test "TASK-110.4: cumulative param override wins after generated Controls" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{
+        .handle = patch.master_vcf_h,
+        .name = "cutoff",
+        .value = .{ .scalar = 2000.0 },
+        .touched = true,
+    };
+    patch.publishParamBatch(batch);
+    var buf: [512 * 2]f32 = undefined;
+    patch.render(&buf, 512, 2);
+    const value = try modular.getParam(patch.graph, patch.master_vcf_h, "cutoff");
+    switch (value) {
+        .scalar => |v| try testing.expectApproxEqAbs(@as(f32, 2000.0), v, 1e-3),
+        .choice => return error.TestUnexpectedResult,
+    }
+
+    // Mailbox payload は差分ではなく累積表なので、先行した cutoff も残る。
+    batch.revision = 2;
+    batch.entries[1] = .{
+        .handle = patch.master_vcf_h,
+        .name = "resonance",
+        .value = .{ .scalar = 0.75 },
+        .touched = true,
+    };
+    patch.publishParamBatch(batch);
+    patch.render(&buf, 512, 2);
+    const cutoff = try modular.getParam(patch.graph, patch.master_vcf_h, "cutoff");
+    const resonance = try modular.getParam(patch.graph, patch.master_vcf_h, "resonance");
+    try testing.expectEqual(@as(f32, 2000.0), cutoff.scalar);
+    try testing.expectEqual(@as(f32, 0.75), resonance.scalar);
 }
 
 test "Controls: muting all tracks lowers output level" {

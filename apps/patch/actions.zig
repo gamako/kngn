@@ -18,6 +18,26 @@ pub const ParseError = error{
     OddExtraTokens,
 };
 
+pub const ParamOverride = struct { handle: usize, name: []const u8, value: f32 };
+
+/// `select_node <handle>` 用の単一 handle parser。
+pub fn parseSelectNode(args: []const u8) ParseError!usize {
+    return parseUsize(args);
+}
+
+/// `set_param <handle> <name> <value>` 用 parser。
+pub fn parseParamOverride(args: []const u8) ParseError!ParamOverride {
+    var it = tokenize(args);
+    const h = it.next() orelse return error.Empty;
+    const handle = std.fmt.parseUnsigned(usize, h, 10) catch return error.InvalidNumber;
+    const name = it.next() orelse return error.Empty;
+    const value_tok = it.next() orelse return error.Empty;
+    const value = std.fmt.parseFloat(f32, value_tok) catch return error.InvalidNumber;
+    if (!std.math.isFinite(value)) return error.InvalidNumber;
+    try expectExhausted(&it);
+    return .{ .handle = handle, .name = name, .value = value };
+}
+
 fn tokenize(args: []const u8) std.mem.TokenIterator(u8, .any) {
     return std.mem.tokenizeAny(u8, args, " \t");
 }
@@ -101,6 +121,27 @@ test "parseUsize: 有効値 / 空 / 不正数値 / 余剰トークン" {
     try testing.expectError(error.InvalidNumber, parseUsize("abc"));
     try testing.expectError(error.InvalidNumber, parseUsize("-1"));
     try testing.expectError(error.TooManyTokens, parseUsize("1 2"));
+}
+
+test "parseSelectNode / parseParamOverride: handle と値" {
+    try testing.expectEqual(@as(usize, 17), try parseSelectNode(" 17 "));
+    const p = try parseParamOverride("17 cutoff 2000");
+    try testing.expectEqual(@as(usize, 17), p.handle);
+    try testing.expectEqualStrings("cutoff", p.name);
+    try testing.expectEqual(@as(f32, 2000), p.value);
+    try testing.expectError(error.Empty, parseParamOverride("17 cutoff"));
+    try testing.expectError(error.InvalidNumber, parseParamOverride("-1 cutoff 2000"));
+    try testing.expectError(error.TooManyTokens, parseParamOverride("17 cutoff 2000 extra"));
+    try testing.expectError(error.InvalidNumber, parseParamOverride("17 cutoff nan"));
+}
+
+test "parseParamOverride: 余白と浮動小数点" {
+    const p = try parseParamOverride(" 3 resonance 0.75 ");
+    try testing.expectEqual(@as(usize, 3), p.handle);
+    try testing.expectEqualStrings("resonance", p.name);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), p.value, 1e-6);
+    try testing.expectError(error.Empty, parseSelectNode(""));
+    try testing.expectError(error.TooManyTokens, parseSelectNode("3 4"));
 }
 
 test "parseTwoUsize: 有効値 / 不正数値 / 余剰トークン" {

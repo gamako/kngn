@@ -34,6 +34,57 @@ pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 4.0;
 pub const CABLE_HIT_SLOP: f32 = 6; // world 単位のケーブル当たり判定しきい値
 
+// Inspector はキャンバス右側に固定配置し、下端の可視化帯とは重ねない。
+pub const INSPECTOR_W: f32 = 280;
+
+// Inspector の slider 行は GUI widget の [label] [track] [value] 構造に合わせる。
+// value_w は最大値文字列（f32 の小数表示）を収める固定予約幅、track_min は短い
+// ラベルでも操作領域を残すための下限。通常の inspector content 幅（260px）では
+// value_w/track_min とも固定値になる。
+pub const INSPECTOR_PARAM_GAP: i32 = 6;
+pub const INSPECTOR_PARAM_VALUE_W: i32 = 64;
+pub const INSPECTOR_PARAM_TRACK_MIN: i32 = 48;
+
+pub const ParamRowLayout = struct {
+    label_w: i32,
+    track_w: i32,
+    value_w: i32,
+
+    pub fn total(self: ParamRowLayout) i32 {
+        return self.label_w + self.track_w + self.value_w + 2 * INSPECTOR_PARAM_GAP;
+    }
+};
+
+/// Inspector content 幅に収まる slider 行の純粋な横方向レイアウトを返す。
+///
+/// label_w は測定済みラベル幅。長いラベルは value_w + track_min + gap を先に
+/// 確保して切り詰め、残りを track に渡す。極端に狭い viewport では value/track
+/// を縮めるが、通常の panel 幅では value_w=64, track_min=48 を維持する。
+pub fn inspectorParamRowLayout(avail: i32, label_w: i32) ParamRowLayout {
+    const width = @max(avail, 0);
+    const gap_w = 2 * INSPECTOR_PARAM_GAP;
+    const value_w = @min(INSPECTOR_PARAM_VALUE_W, @max(0, width - gap_w - INSPECTOR_PARAM_TRACK_MIN));
+    const track_min = @min(INSPECTOR_PARAM_TRACK_MIN, @max(0, width - gap_w - value_w));
+    const label_max = @max(0, width - gap_w - value_w - track_min);
+    const fitted_label = @min(@max(label_w, 0), label_max);
+    const track_w = @max(track_min, width - gap_w - value_w - fitted_label);
+    return .{ .label_w = fitted_label, .track_w = track_w, .value_w = value_w };
+}
+
+pub fn inspectorRect(fb_w: f32, canvas_h: f32) ScreenRect {
+    const w = @min(INSPECTOR_W, @max(0.0, fb_w));
+    return .{ .x = @max(0.0, fb_w - w), .y = 0, .w = w, .h = @max(0.0, canvas_h) };
+}
+
+pub fn canvasViewportWidth(fb_w: f32, canvas_h: f32) f32 {
+    return inspectorRect(fb_w, canvas_h).x;
+}
+
+pub fn pointInInspector(point: Vec2f, fb_w: f32, canvas_h: f32) bool {
+    const r = inspectorRect(fb_w, canvas_h);
+    return point.x >= r.x and point.x <= r.x + r.w and point.y >= r.y and point.y <= r.y + r.h;
+}
+
 /// 描画側が渡すノード幾何。pos は world 左上。
 /// grid_rows>0 は畳みマクロ箱（TASK-40.7.2）: 本体に TR/303 grid を描くため、ポート数由来の高さに加えて
 /// grid 行数ぶんの高さを nodeSize で確保する（ヒットテスト矩形も同じ高さになり整合）。0 は通常ノード。
@@ -707,4 +758,44 @@ test "canvas: viewportContains — fit layout has zero offscreen at representati
         const oc = viewportContains(.{ .pan = .{ .x = 700, .y = 0 }, .zoom = 1.0 }, vw, vh, &nodes, &edges);
         try testing.expect(oc.node > 0 or oc.port > 0 or oc.cable > 0);
     }
+}
+
+test "canvas: inspector は右端固定で canvas viewport と分離される" {
+    const r = inspectorRect(960, 610);
+    try testing.expectEqual(@as(f32, 680), r.x);
+    try testing.expectEqual(@as(f32, 280), r.w);
+    try testing.expectEqual(@as(f32, 610), r.h);
+    try testing.expectEqual(@as(f32, 680), canvasViewportWidth(960, 610));
+    try testing.expect(pointInInspector(.{ .x = 700, .y = 20 }, 960, 610));
+    try testing.expect(!pointInInspector(.{ .x = 679, .y = 20 }, 960, 610));
+    try testing.expect(!pointInInspector(.{ .x = 700, .y = 611 }, 960, 610));
+}
+
+test "canvas: inspector は狭い framebuffer でも負の幅を作らない" {
+    const r = inspectorRect(120, 80);
+    try testing.expectEqual(@as(f32, 0), r.x);
+    try testing.expectEqual(@as(f32, 120), r.w);
+    try testing.expectEqual(@as(f32, 0), canvasViewportWidth(120, 80));
+    try testing.expect(pointInInspector(.{ .x = 0, .y = 0 }, 120, 80));
+}
+
+test "canvas: inspector param row は長いラベルでも value を content 幅内に収める" {
+    const avail = @as(i32, @intFromFloat(INSPECTOR_W)) - 20; // inspector padding 左右
+    const longest_labels = [_]i32{
+        8 * "cutoff_mod_oct (oct)".len,
+        8 * "level_mod_depth".len,
+        8 * "mod_octaves (oct)".len,
+    };
+
+    for (longest_labels) |label_w| {
+        const row = inspectorParamRowLayout(avail, label_w);
+        try testing.expectEqual(INSPECTOR_PARAM_VALUE_W, row.value_w);
+        try testing.expect(row.track_w >= INSPECTOR_PARAM_TRACK_MIN);
+        try testing.expectEqual(avail, row.total());
+        try testing.expect(row.label_w <= label_w);
+    }
+
+    const short = inspectorParamRowLayout(avail, 8 * "base_hz (Hz)".len);
+    try testing.expectEqual(@as(i32, @intCast(8 * "base_hz (Hz)".len)), short.label_w);
+    try testing.expectEqual(avail, short.total());
 }

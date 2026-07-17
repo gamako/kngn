@@ -39,6 +39,7 @@ const SongData = patchmod.SongData;
 const Chain = patchmod.Chain;
 const BASS_DEG_TOTAL: usize = patchmod.BASS_DEG_TOTAL;
 const canvas = @import("canvas.zig");
+const inspector = @import("inspector.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
 const actions = @import("actions.zig");
@@ -318,11 +319,17 @@ const App = struct {
     notation_counter: u32 = 0,
     last_quantized_cmd: ?PatternCommand = null,
     song: SongData = .{},
+    // TASK-110.4: main thread が所有する累積 override 表（Mailbox payload の source）。
+    param_batch: patchmod.ParamBatch = .{},
 
     /// キャンバス有効高（画面下端の可視化帯を除いた領域）。見切れ判定・ヒットテスト・tap 対象選択で共通に使う。
     fn canvasH(self: *const App) f32 {
         const fh: f32 = @floatFromInt(self.fb_h);
         return @max(0.0, fh - VIS_H);
+    }
+
+    fn canvasW(self: *const App) f32 {
+        return canvas.canvasViewportWidth(@floatFromInt(self.fb_w), self.canvasH());
     }
 
     /// 実 handle の生ノード列（dyn 由来。合成 handle は含まない）。フレーム毎。
@@ -833,7 +840,7 @@ fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const
 
 fn updateHover(app: *App) void {
     // 可視化帯の上ではキャンバスの hover を出さない。
-    if (app.mouse.y >= app.canvasH()) {
+    if (canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) or app.mouse.y >= app.canvasH()) {
         app.hover = null;
         return;
     }
@@ -854,6 +861,8 @@ fn updateHover(app: *App) void {
 }
 
 fn onMouseDown(app: *App) void {
+    // Inspector の mouse は GUI Context 側へ渡す。canvas の選択/drag/zoom と競合させない。
+    if (canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) return;
     // パレットは screen 座標で world hit より先に判定（追加/マクロ追加。1 操作 1 publish は
     // addByPaletteIndex/macro.buildDrumMachine 内）。
     const buttons = paletteButtons();
@@ -1000,7 +1009,7 @@ const BASS_OFFSETS = [_]Vec2f{
 /// パレット index からモジュール or マクロを追加（comptime kind ディスパッチ）→ 画面中央付近へ配置 → publish。
 fn addByPaletteIndex(app: *App, ki: u8) !void {
     const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
-    const cx: f32 = @as(f32, @floatFromInt(app.fb_w)) * 0.45 + casc * 18;
+    const cx: f32 = app.canvasW() * 0.45 + casc * 18;
     const cy: f32 = @as(f32, @floatFromInt(app.fb_h)) * 0.4 + casc * 18;
     inline for (PALETTE, 0..) |entry, i| {
         if (i == ki) {
@@ -1042,7 +1051,7 @@ fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
     const zoom = app.camera.zoom;
     const margin: f32 = 16;
     const top_limit: f32 = paletteBottom + margin; // 2段パレット帯の下端より下に置く
-    const fbw: f32 = @floatFromInt(app.fb_w);
+    const fbw: f32 = app.canvasW();
     const fbh: f32 = @floatFromInt(app.fb_h);
     const max_x = @max(margin, fbw - fp.x * zoom - margin);
     const max_y = @max(top_limit, fbh - fp.y * zoom - margin);
@@ -1122,6 +1131,7 @@ fn deleteSelected(app: *App) void {
         switch (it) {
             .node => |h| {
                 // 展開中グループのメンバー個別削除は先に台帳を同期する（メンバー 0 で自動消滅）。
+                purgeParamOverrides(app, h);
                 if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
                 app.dyn.removeModule(h);
                 app.dyn.publish() catch {};
@@ -1139,7 +1149,10 @@ fn deleteSelected(app: *App) void {
                 // グループ削除: メンバー全 removeModule + ledger.free + 1 publish（RT へは 1 回だけ反映）。
                 var h: Handle = 0;
                 while (h < MAX_MODULES) : (h += 1) {
-                    if (app.ledger.group_of[h] != null and app.ledger.group_of[h].? == gid) app.dyn.removeModule(h);
+                    if (app.ledger.group_of[h] != null and app.ledger.group_of[h].? == gid) {
+                        purgeParamOverrides(app, h);
+                        app.dyn.removeModule(h);
+                    }
                 }
                 app.ledger.free(gid);
                 app.dyn.publish() catch {};
@@ -1241,7 +1254,7 @@ fn updateViz(app: *App) void {
     var handles: [TAP_SLOTS]Handle = undefined;
     const sel = itemHandle(app.selected);
     const hov = itemHandle(app.hover);
-    const n = canvas.selectTapPorts(app.camera, @floatFromInt(app.fb_w), app.canvasH(), nodes, sel, hov, &handles);
+    const n = canvas.selectTapPorts(app.camera, app.canvasW(), app.canvasH(), nodes, sel, hov, &handles);
 
     var new_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS;
     // ポート種別ごとに間引き率・reduce を決める（audio=細かい波形 / cv=粗い変調 / gate=粗い peak バー）。
@@ -1456,6 +1469,8 @@ pub fn main(init: std.process.Init) !void {
 
     var dl = gui.DrawList.init(allocator);
     defer dl.deinit();
+    var gui_ctx = gui.Context.init(allocator, gui.default_font);
+    defer gui_ctx.deinit();
 
     // C: master 可視化（spectrogram/oscilloscope/level meter）。comptime サイズが大きいので heap 確保。
     const spec = try allocator.create(Spec);
@@ -1494,6 +1509,7 @@ pub fn main(init: std.process.Init) !void {
         defer fb.unlock();
         app.fb_w = fb.width;
         app.fb_h = fb.height;
+        gui_ctx.beginFrame(fb.width, fb.height);
 
         // C: master タップを読み → mono downmix → spec/osc/meter へ供給。直近ブロックの rms/peak を latch。
         var frame_sumsq: f64 = 0;
@@ -1535,22 +1551,33 @@ pub fn main(init: std.process.Init) !void {
                 .menu_command => {}, // TASK-97.1: 97.2 の App.dispatchCommand 統合前は未消費
                 .mouse_move => |m| {
                     app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                    onMouseMove(&app);
+                    gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
+                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and gui_ctx.state.active_id == 0) onMouseMove(&app);
                 },
                 .mouse_down => |m| {
+                    const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
+                    gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
                     if (m.button == .left) {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        onMouseDown(&app);
+                        if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and gui_ctx.state.active_id == 0) onMouseDown(&app);
                     }
                 },
                 .mouse_up => |m| {
-                    if (m.button == .left) onMouseUp(&app);
+                    const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
+                    gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
+                    if (m.button == .left) {
+                        app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
+                        if (gui_ctx.state.active_id == 0 and !canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) onMouseUp(&app);
+                    }
                 },
                 .mouse_scroll => |s| {
                     app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
-                    const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
-                    app.camera.zoomAt(app.mouse, factor);
-                    updateHover(&app);
+                    gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
+                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) {
+                        const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
+                        app.camera.zoomAt(app.mouse, factor);
+                        updateHover(&app);
+                    }
                 },
             }
         }
@@ -1565,6 +1592,13 @@ pub fn main(init: std.process.Init) !void {
         drawFrame(&app, &dl);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &dl, gui.default_font);
+        const ir = canvas.inspectorRect(@floatFromInt(fb.width), app.canvasH());
+        inspector.draw(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
+            .node => |h| h,
+            else => null,
+        } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app, inspectorChanged);
+        gui_ctx.endFrame();
+        gui.render(target, &gui_ctx.draw_list, gui.default_font);
         // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
         drawVizBand(&app, fb, spec, osc, &meter);
 
@@ -1586,7 +1620,7 @@ fn offscreenOf(app: *const App) canvas.OffscreenCounts {
     const nodes = node_buf[0..app.buildRawNodes(&node_buf)];
     const edges = edge_buf[0..app.buildFlatEdges(&edge_buf)];
     // 見切れ判定の有効領域はキャンバス高（下端の可視化帯を除く）。帯に隠れるノードも「見切れ」に数える。
-    return canvas.viewportContains(app.camera, @floatFromInt(app.fb_w), app.canvasH(), nodes, edges);
+    return canvas.viewportContains(app.camera, app.canvasW(), app.canvasH(), nodes, edges);
 }
 
 fn patchDigest(ctx: *anyopaque, buf: []u8) []const u8 {
@@ -1821,9 +1855,88 @@ fn actionApp(ctx: *anyopaque) *App {
     return @ptrCast(@alignCast(ctx));
 }
 
+fn paramDescFor(kind: modular.ModuleKind, name: []const u8) ?modular.ParamDesc {
+    switch (kind) {
+        inline else => |comptime_kind| {
+            for (modular.descriptors(comptime_kind)) |desc| {
+                if (std.mem.eql(u8, desc.name, name)) return desc;
+            }
+        },
+    }
+    return null;
+}
+
+/// scalar/choice の UI 値を descriptor の ParamValue へ変換し、累積表を publish する。
+fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !void {
+    if (handle >= MAX_MODULES) return error.InvalidHandle;
+    const h: Handle = @intCast(handle);
+    if (!app.dyn.slotActive(h)) return error.InvalidHandle;
+    const kind = app.dyn.kindOf(h) orelse return error.InvalidHandle;
+    const desc = paramDescFor(kind, name) orelse return error.UnknownParam;
+    const value: modular.ParamValue = switch (desc.kind) {
+        .scalar => .{ .scalar = raw },
+        .choice => |choice| blk: {
+            if (!std.math.isFinite(raw) or raw < 0 or @trunc(raw) != raw) return error.WrongValueKind;
+            const index: usize = @intFromFloat(raw);
+            if (index >= choice.options.len) return error.OutOfRange;
+            break :blk .{ .choice = index };
+        },
+    };
+
+    var free: ?usize = null;
+    var found: ?usize = null;
+    for (app.param_batch.entries, 0..) |entry, i| {
+        if (!entry.touched) {
+            if (free == null) free = i;
+        } else if (entry.handle == h and std.mem.eql(u8, entry.name, desc.name)) {
+            found = i;
+            break;
+        }
+    }
+    const index = found orelse free orelse return error.ParamTableFull;
+    app.param_batch.entries[index] = .{ .handle = h, .name = desc.name, .value = value, .touched = true };
+    app.param_batch.revision += 1;
+    app.patch.publishParamBatch(app.param_batch);
+}
+
+fn inspectorChanged(ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8, value: modular.ParamValue) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const raw: f32 = switch (value) {
+        .scalar => |v| v,
+        .choice => |v| @floatFromInt(v),
+    };
+    queueParamOverride(app, handle, name, raw) catch {};
+}
+
+fn purgeParamOverrides(app: *App, handle: ?Handle) void {
+    var changed = false;
+    for (&app.param_batch.entries) |*entry| {
+        if (!entry.touched) continue;
+        if (handle == null or entry.handle == handle.?) {
+            entry.* = .{};
+            changed = true;
+        }
+    }
+    if (changed) {
+        app.param_batch.revision += 1;
+        app.patch.publishParamBatch(app.param_batch);
+    }
+}
+
 fn toHandle(v: usize) error{InvalidHandle}!Handle {
     if (v >= MAX_MODULES) return error.InvalidHandle;
     return @intCast(v);
+}
+
+fn actionSelectNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const h = try toHandle(try actions.parseSelectNode(args));
+    if (!app.dyn.slotActive(h)) return error.InvalidHandle;
+    app.selected = .{ .node = h };
+    app.hover = null;
+    app.drag = .none;
+    return "ok";
 }
 
 /// `modular.ModuleKind` → comptime dispatch で `dyn.add(k, .{})`。`addByPaletteIndex` の
@@ -1889,6 +2002,7 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
     // 展開中グループのメンバー個別削除は先に台帳を同期する（`deleteSelected` の `.node` 分岐と同型）。
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
+    purgeParamOverrides(app, h);
     app.dyn.removeModule(h);
     try app.dyn.publish();
     app.refreshAllExposed();
@@ -1972,6 +2086,7 @@ fn actionSaveGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 
 /// 既存グラフを全消去する（load_graph の「置換」意味論。台帳/選択/hover も併せてリセット）。
 fn clearGraph(app: *App) void {
+    purgeParamOverrides(app, null);
     var h: Handle = 0;
     while (h < MAX_MODULES) : (h += 1) {
         if (!app.dyn.slotActive(h)) continue;
@@ -2044,6 +2159,7 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 /// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
 fn registerPatchActions(app: *App) void {
+    platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode });
     platform.registerAction(.{ .name = "add_node", .ctx = app, .run = actionAddNode });
     platform.registerAction(.{ .name = "remove_node", .ctx = app, .run = actionRemoveNode });
     platform.registerAction(.{ .name = "connect", .ctx = app, .run = actionConnect });
@@ -2115,6 +2231,33 @@ fn registerGraphStateSync(app: *App) void {
         .import_fn = graphNetsyncImport,
     });
 }
+fn selectedParamDigest(app: *const App, buf: []u8) []const u8 {
+    const h = if (app.selected) |item| switch (item) {
+        .node => |node_h| node_h,
+        else => return std.fmt.bufPrint(buf, "\"selected\":null,", .{}) catch buf[0..0],
+    } else return std.fmt.bufPrint(buf, "\"selected\":null,", .{}) catch buf[0..0];
+    const kind = app.dyn.kindOf(h) orelse return std.fmt.bufPrint(buf, "\"selected\":null,", .{}) catch buf[0..0];
+    var off: usize = 0;
+    const head = std.fmt.bufPrint(buf[off..], "\"selected\":{{\"h\":{d},\"kind\":\"{s}\",\"params\":{{", .{ h, @tagName(kind) }) catch return buf[0..0];
+    off += head.len;
+    var first = true;
+    const descs = switch (kind) {
+        inline else => |comptime_kind| modular.descriptors(comptime_kind),
+    };
+    for (descs) |desc| {
+        const value = modular.getParam(app.dyn, h, desc.name) catch continue;
+        const sep: []const u8 = if (first) "" else ",";
+        const piece = switch (value) {
+            .scalar => |v| std.fmt.bufPrint(buf[off..], "{s}\"{s}\":{d:.3}", .{ sep, desc.name, v }) catch return buf[0..0],
+            .choice => |v| std.fmt.bufPrint(buf[off..], "{s}\"{s}\":{d}", .{ sep, desc.name, v }) catch return buf[0..0],
+        };
+        off += piece.len;
+        first = false;
+    }
+    const tail = std.fmt.bufPrint(buf[off..], "}},", .{}) catch return buf[0..0];
+    return buf[0 .. off + tail.len];
+}
+
 fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const p = app.patch;
@@ -2146,7 +2289,8 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch return buf[0..a.len];
     // Ph5 pattern（masks は hex。bass_deg 配列は snapshot 側）+ TASK-91 song 要約。
     // 末尾は 1 つの `}` で JSON を閉じる（1024B 注意）。
-    const c = std.fmt.bufPrint(buf[a.len + b.len ..], "\"patterns\":{{\"kick\":\"{x:0>4}\",\"hat\":\"{x:0>4}\"," ++
+    const selected = selectedParamDigest(app, buf[a.len + b.len ..]);
+    const c = std.fmt.bufPrint(buf[a.len + b.len + selected.len ..], "\"patterns\":{{\"kick\":\"{x:0>4}\",\"hat\":\"{x:0>4}\"," ++
         "\"clap\":\"{x:0>4}\",\"bass_on\":\"{x:0>4}\",\"bass_accent\":\"{x:0>4}\",\"bass_slide\":\"{x:0>4}\"}}," ++
         "\"lock\":[{d},{d},{d},{d}],\"evolve\":{d},\"rev\":{d},\"mut\":{d},\"seed\":{d}," ++
         "\"song\":{{\"playing\":{d},\"row\":{d},\"bar\":{d},\"rows\":{d}}}}}", .{
@@ -2157,7 +2301,7 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         st.mutation_count, st.base_seed,       b01(st.song_playing),
         st.song_row,       st.song_bar_in_row, st.song_rows,
     }) catch return buf[0 .. a.len + b.len];
-    return buf[0 .. a.len + b.len + c.len];
+    return buf[0 .. a.len + b.len + selected.len + c.len];
 }
 
 fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -2250,10 +2394,18 @@ fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!vo
 fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
-    const nf = try gen_actions.parseNameF32(args);
-    try setParamsF32(&app.params, nf.name, nf.value);
-    publishControls(patch, app.params);
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    _ = it.next() orelse return error.Empty;
+    _ = it.next() orelse return error.Empty;
+    if (it.next() != null) {
+        // Additive な 3 引数形式。従来の recipe 用 2 引数形式は下記のまま不変。
+        const p = try actions.parseParamOverride(args);
+        try queueParamOverride(app, p.handle, p.name, p.value);
+    } else {
+        const nf = try gen_actions.parseNameF32(args);
+        try setParamsF32(&app.params, nf.name, nf.value);
+        publishControls(app.patch, app.params);
+    }
     return "ok";
 }
 

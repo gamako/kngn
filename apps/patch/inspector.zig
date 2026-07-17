@@ -1,0 +1,163 @@
+//! 選択中の DynGraph primitive node の parameter inspector。
+//!
+//! ホットパス宣言: descriptor 列挙と slider 評価は frame-rate（main thread）、変更 callback は
+//! slider 操作時のみ（event-rate）。RT へは callback の固定長 Mailbox publish だけを渡し、
+//! このファイルから `params.setParam()` を直接呼ばない。
+
+const std = @import("std");
+const kit = @import("kit");
+const gui = kit.gui;
+const modular = @import("modular");
+const canvas = @import("canvas.zig");
+
+pub const ChangeFn = *const fn (ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8, value: modular.ParamValue) void;
+
+const PANEL_BG = gui.Color.rgba(0x1B, 0x21, 0x29, 0xFF);
+const PANEL_BORDER = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
+const TITLE = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
+const SUBTLE = gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF);
+
+fn idFor(ctx: *const gui.Context, handle: modular.dyn.Handle, index: usize) gui.Id {
+    const key = (@as(u64, handle) << 32) | @as(u64, @intCast(index + 1));
+    return ctx.id_stack.makeInt(key);
+}
+
+fn labelWithUnit(buf: []u8, name: []const u8, unit: []const u8) []const u8 {
+    if (unit.len == 0) return name;
+    return std.fmt.bufPrint(buf, "{s} ({s})", .{ name, unit }) catch name;
+}
+
+/// BitmapFont のコードポイント境界を保ったまま、指定 pixel 幅に収める。
+/// descriptor 名と unit は ASCII だが、Font 契約に合わせて UTF-8 の境界で切る。
+fn truncateLabel(label: []const u8, max_w: i32, font: gui.Font) []const u8 {
+    if (max_w <= 0) return "";
+    if (font.measure(label) <= @as(u32, @intCast(max_w))) return label;
+
+    var end: usize = 0;
+    while (end < label.len) {
+        const cp_len: usize = std.unicode.utf8ByteSequenceLength(label[end]) catch 1;
+        if (end + cp_len > label.len) break;
+        if (font.measure(label[0 .. end + cp_len]) > @as(u32, @intCast(max_w))) break;
+        end += cp_len;
+    }
+    return label[0..end];
+}
+
+fn paramLabel(ctx: *const gui.Context, label: []const u8, avail: i32) []const u8 {
+    const label_w: i32 = @intCast(ctx.font.measure(label));
+    const row = canvas.inspectorParamRowLayout(avail, label_w);
+    return truncateLabel(label, row.label_w, ctx.font);
+}
+
+fn trackWidthWithRightAlignedValue(row: canvas.ParamRowLayout, value_text_w: i32) i32 {
+    // slider widget は値文字列を自然幅で置くため、予約値幅との差分を track へ戻す。
+    // これにより実際の値文字列の終端が row の右端に揃う。
+    return row.track_w + @max(0, row.value_w - value_text_w);
+}
+
+/// 右端固定 panel を Context のレイアウトへ登録し、選択 node の descriptor を slider 化する。
+/// 呼び出し側が `endFrame()` と draw list の render を行う。
+pub fn draw(
+    ctx: *gui.Context,
+    graph: *const modular.DynGraph,
+    selected: ?modular.dyn.Handle,
+    panel: gui.Rect,
+    callback_ctx: *anyopaque,
+    on_change: ChangeFn,
+) void {
+    const screen_w: i32 = @intCast(ctx.screen_w);
+    const screen_h: i32 = @intCast(ctx.screen_h);
+    const panel_x: i32 = @max(0, panel.x);
+    const panel_w: i32 = @intCast(panel.w);
+    const panel_h: i32 = @intCast(panel.h);
+
+    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = screen_w }, .height = .{ .fixed = screen_h } });
+    ctx.beginBox(.{ .width = .{ .fixed = panel_x }, .height = .{ .fixed = panel_h } });
+    ctx.endBox();
+    ctx.beginBox(.{
+        .width = .{ .fixed = panel_w },
+        .height = .{ .fixed = panel_h },
+        .padding = .{ 10, 10, 10, 10 },
+        .gap = 7,
+        .bg = PANEL_BG,
+        .border = .{ .color = PANEL_BORDER, .thickness = 1 },
+        .clip_children = true,
+    });
+    ctx.labelEx("PARAM INSPECTOR", TITLE);
+
+    const h = selected orelse {
+        ctx.labelEx("Select a primitive node", SUBTLE);
+        ctx.endBox();
+        ctx.endBox();
+        return;
+    };
+    const kind = graph.kindOf(h) orelse {
+        ctx.labelEx("Select a primitive node", SUBTLE);
+        ctx.endBox();
+        ctx.endBox();
+        return;
+    };
+    ctx.labelEx(@tagName(kind), SUBTLE);
+
+    // panel の fixed width から padding 左右を除いた content 幅。各 slider はこの
+    // 幅を超えないよう、値列を先に予約してからラベルを切り詰める。
+    const param_avail = @max(0, panel_w - 20);
+
+    const descs = switch (kind) {
+        inline else => |comptime_kind| modular.descriptors(comptime_kind),
+    };
+    if (descs.len == 0) {
+        ctx.labelEx("No editable parameters", SUBTLE);
+        ctx.endBox();
+        ctx.endBox();
+        return;
+    }
+    for (descs, 0..) |desc, index| {
+        const value = modular.getParam(graph, h, desc.name) catch continue;
+        switch (desc.kind) {
+            .scalar => |s| {
+                const raw = switch (value) {
+                    .scalar => |v| v,
+                    .choice => continue,
+                };
+                var current = raw;
+                var label_buf: [96]u8 = undefined;
+                const label = labelWithUnit(&label_buf, desc.name, s.unit);
+                const row = canvas.inspectorParamRowLayout(param_avail, @intCast(ctx.font.measure(label)));
+                const visible_label = paramLabel(ctx, label, param_avail);
+                var value_buf: [32]u8 = undefined;
+                const value_text = std.fmt.bufPrint(&value_buf, "{d:.2}", .{current}) catch "?";
+                const changed = ctx.sliderF32Id(idFor(ctx, h, index), visible_label, &current, .{
+                    .min = s.min,
+                    .max = s.max,
+                    .step = s.step,
+                    .track_w = trackWidthWithRightAlignedValue(row, @intCast(ctx.font.measure(value_text))),
+                });
+                if (changed) on_change(callback_ctx, h, desc.name, .{ .scalar = current });
+            },
+            .choice => |c| {
+                const raw = switch (value) {
+                    .choice => |v| v,
+                    .scalar => continue,
+                };
+                var current: i32 = @intCast(@min(raw, c.options.len - 1));
+                var label_buf: [96]u8 = undefined;
+                const option = c.options[@intCast(current)];
+                const label = std.fmt.bufPrint(&label_buf, "{s} [{s}]", .{ desc.name, option }) catch desc.name;
+                const row = canvas.inspectorParamRowLayout(param_avail, @intCast(ctx.font.measure(label)));
+                const visible_label = paramLabel(ctx, label, param_avail);
+                var value_buf: [32]u8 = undefined;
+                const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{@as(i64, current)}) catch "?";
+                const changed = ctx.sliderI32Id(idFor(ctx, h, index), visible_label, &current, .{
+                    .min = 0,
+                    .max = @intCast(c.options.len - 1),
+                    .step = 1,
+                    .track_w = trackWidthWithRightAlignedValue(row, @intCast(ctx.font.measure(value_text))),
+                });
+                if (changed) on_change(callback_ctx, h, desc.name, .{ .choice = @intCast(current) });
+            },
+        }
+    }
+    ctx.endBox();
+    ctx.endBox();
+}
