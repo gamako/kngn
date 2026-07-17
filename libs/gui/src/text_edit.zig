@@ -167,6 +167,26 @@ pub const SelectionState = struct {
             .home => 0,
             .end => count,
         };
+        self.setExtent(target, shift);
+    }
+
+    /// wordRange と同じ分類で単語境界へ移動する（イベント時のみ）。
+    /// 区切り（ASCII 非 word）は連続して越え、非 Shift では既存選択を collapse する。
+    pub fn moveWord(self: *SelectionState, layout: TextLayout, direction: WordDirection, shift: bool) void {
+        const range = self.normalized();
+        const target = blk: {
+            if (!shift and range.start != range.end) {
+                break :blk if (direction == .left) range.start else range.end;
+            }
+            break :blk switch (direction) {
+                .left => wordBoundaryLeft(layout, self.extent),
+                .right => wordBoundaryRight(layout, self.extent),
+            };
+        };
+        self.setExtent(target, shift);
+    }
+
+    fn setExtent(self: *SelectionState, target: usize, shift: bool) void {
         if (shift) {
             self.extent = target;
         } else {
@@ -178,6 +198,38 @@ pub const SelectionState = struct {
 };
 
 pub const MoveKey = enum { left, right, home, end };
+pub const WordDirection = enum { left, right };
+
+/// Option+← 相当: 直前の単語先頭（区切り列はまとめて越える）。
+fn wordBoundaryLeft(layout: TextLayout, index: usize) usize {
+    if (index == 0) return 0;
+    var i = index - 1;
+    // 区切り上にいるなら区切り列を左へ越える。
+    while (i > 0 and isWordSeparator(codepointAt(layout, i))) : (i -= 1) {}
+    // 単語文字の連続の先頭まで戻る。
+    while (i > 0 and isWordChar(codepointAt(layout, i - 1))) : (i -= 1) {}
+    return i;
+}
+
+/// Option+→ 相当: 次の単語末尾（途中なら現在語の末尾。区切り列はまとめて越える）。
+fn wordBoundaryRight(layout: TextLayout, index: usize) usize {
+    const count = layout.count();
+    if (index >= count) return count;
+    var i = index;
+    // 区切り上にいるなら先に区切りを越えて次語へ。
+    while (i < count and isWordSeparator(codepointAt(layout, i))) : (i += 1) {}
+    // 単語文字の連続の末尾まで進む。
+    while (i < count and isWordChar(codepointAt(layout, i))) : (i += 1) {}
+    return i;
+}
+
+fn isWordChar(cp: u32) bool {
+    return isAsciiWord(cp) or cp > 0x7F;
+}
+
+fn isWordSeparator(cp: u32) bool {
+    return !isWordChar(cp);
+}
 
 /// caller が所有する単一行 UTF-8 buffer。caret/selection は codepoint index を使い、
 /// 実体の ArrayList は UTF-8 byte 列を保持する。
@@ -394,4 +446,53 @@ test "SelectionState: Left/Right/Home/End と Shift selection" {
     try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
     selection.moveCaret(5, .home, false);
     try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
+}
+
+test "TASK-119: SelectionState の word movement と Shift extension" {
+    // "hi, 日本語 ok" = h i , sp 日 本 語 sp o k  (10 codepoints)
+    const text = "hi, 日本語 ok";
+    const layout = try buildTextLayout(testing.allocator, font_mod.default_font, text);
+    defer testing.allocator.free(layout.byte_offsets);
+    defer testing.allocator.free(layout.prefix_widths);
+    const count = layout.count();
+    try testing.expectEqual(@as(usize, 10), count);
+
+    var selection: SelectionState = .{ .anchor = 0, .extent = 0 };
+    // ASCII word 末尾へ
+    selection.moveWord(layout, .right, false);
+    try testing.expectEqual(TextRange{ .start = 2, .end = 2 }, selection.normalized());
+    // 区切り ", " を越えて日本語列の末尾へ
+    selection.moveWord(layout, .right, false);
+    try testing.expectEqual(TextRange{ .start = 7, .end = 7 }, selection.normalized());
+    // 空白を越えて "ok" 末尾へ
+    selection.moveWord(layout, .right, false);
+    try testing.expectEqual(TextRange{ .start = 10, .end = 10 }, selection.normalized());
+    // 末尾で no-op
+    selection.moveWord(layout, .right, false);
+    try testing.expectEqual(TextRange{ .start = 10, .end = 10 }, selection.normalized());
+
+    // 左: "ok" 先頭 → 日本語先頭 → "hi" 先頭 → 先頭 no-op
+    selection.moveWord(layout, .left, false);
+    try testing.expectEqual(TextRange{ .start = 8, .end = 8 }, selection.normalized());
+    selection.moveWord(layout, .left, false);
+    try testing.expectEqual(TextRange{ .start = 4, .end = 4 }, selection.normalized());
+    selection.moveWord(layout, .left, false);
+    try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
+    selection.moveWord(layout, .left, false);
+    try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
+
+    // 非 Shift: 既存選択は端へ collapse（追加移動なし）
+    selection = .{ .anchor = 0, .extent = 5 };
+    selection.moveWord(layout, .right, false);
+    try testing.expectEqual(TextRange{ .start = 5, .end = 5 }, selection.normalized());
+    selection = .{ .anchor = 0, .extent = 5 };
+    selection.moveWord(layout, .left, false);
+    try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
+
+    // Shift+Option: 選択拡張（anchor 固定）
+    selection = .{ .anchor = 2, .extent = 2 };
+    selection.moveWord(layout, .right, true);
+    try testing.expectEqual(TextRange{ .start = 2, .end = 7 }, selection.normalized());
+    selection.moveWord(layout, .left, true);
+    try testing.expectEqual(TextRange{ .start = 2, .end = 4 }, selection.normalized());
 }

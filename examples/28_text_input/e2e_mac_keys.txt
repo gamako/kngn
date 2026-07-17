@@ -1,0 +1,94 @@
+# TASK-118/119 E2E: macOS 標準テキスト操作 + 縦位置 snapshot
+# フォーカス座標: snapshot 実測 first TextInput x=24..343 y=72..96（padding 72,24 / width 320）
+# クリックは枠内左寄り (40, 84) = content 付近。決め打ち禁止のため実測後に確定。
+
+step 2
+
+# --- focus first TextInput ---
+inject mouse_move 40 84
+inject mouse_down left
+inject mouse_up left
+step 2
+assert input focus=1
+
+# --- type "hello world" (11 codepoints / 11 bytes) ---
+inject commit hello world
+step 1
+assert input len=11
+assert input caret=11
+
+# --- Cmd+A 全選択 ---
+inject key_down A cmd
+step 1
+assert input selection=0:11
+
+# --- LEFT collapses to start ---
+inject key_down LEFT
+step 1
+assert input caret=0
+assert input selection=0:0
+
+# --- Cmd+Shift+RIGHT = 行末まで選択 ---
+inject key_down RIGHT cmd shift
+step 1
+assert input selection=0:11
+
+# --- RIGHT collapses to end ---
+inject key_down RIGHT
+step 1
+assert input caret=11
+
+# --- Cmd+LEFT = 行頭 ---
+inject key_down LEFT cmd
+step 1
+assert input caret=0
+
+# --- Option+RIGHT = "hello" 末尾 ---
+inject key_down RIGHT alt
+step 1
+assert input caret=5
+
+# --- Option+Shift+RIGHT = " world" まで拡張 ---
+inject key_down RIGHT alt shift
+step 1
+assert input selection=5:11
+
+# --- RIGHT collapses to end ---
+inject key_down RIGHT
+step 1
+assert input selection=11:11
+assert input caret=11
+
+# 本文入力後 snapshot（縦位置・caret 目視用。パスは呼び出し側が out 配下を指定）
+snapshot fb
+
+# --- composition 中: 移動系・Cmd+A 抑止、状態不変 ---
+inject composition update 0 あ
+step 1
+assert input preedit_active=1
+
+inject key_down LEFT cmd
+inject key_down RIGHT alt shift
+inject key_down LEFT
+inject key_down A cmd
+step 1
+assert input caret=11
+assert input selection=11:11
+
+snapshot fb
+
+# --- composition cancel 後に Cmd+A 全選択 ---
+inject composition cancel
+step 1
+assert input preedit_active=0
+
+inject key_down A cmd
+step 1
+assert input selection=0:11
+
+# --- Cmd+C（選択あり）---
+inject key_down C cmd
+step 1
+assert copy count=1
+
+quit
