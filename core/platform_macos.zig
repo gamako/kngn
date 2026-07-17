@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const types = @import("platform_types");
+const command_types = @import("command_types");
+const build_options = @import("build_options");
 
 const c = @cImport({
     @cInclude("platform.h");
@@ -16,6 +18,17 @@ const c = @cImport({
 // platform.h は旧 C 公開面を維持し、quit cancel はこの backend 専用の追加 ABI として
 // native 実装（objc/swift/metal）が同名 symbol を提供する。
 extern fn platform_cancel_quit(window: *c.PlatformWindow) void;
+
+/// TASK-97.3: メニュー C symbol 参照は enable_menu かつ objc backend のときだけ。
+/// swift/metal は未実装（利用可否 false）。非使用 exe の undefined symbol を構造的に防ぐ。
+const menu_c_abi = build_options.enable_menu and std.mem.eql(u8, build_options.platform_backend, "objc");
+
+const MenuC = if (menu_c_abi) struct {
+    extern fn platform_menu_available() bool;
+    extern fn platform_register_menu(window: ?*c.PlatformWindow, items: [*]const c.PlatformMenuItem, count: u32) void;
+    extern fn platform_update_menu(window: ?*c.PlatformWindow, items: [*]const c.PlatformMenuItem, count: u32) void;
+    extern fn platform_destroy_menu(window: ?*c.PlatformWindow) void;
+} else struct {};
 
 // 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
 const Error = types.Error;
@@ -41,6 +54,7 @@ const GamepadButtons = types.GamepadButtons;
 const GamepadInfo = types.GamepadInfo;
 const GamepadDisconnect = types.GamepadDisconnect;
 const GAMEPAD_NAME_MAX = types.GAMEPAD_NAME_MAX;
+const Command = command_types.Command;
 
 pub fn init() Error!void {
     if (!c.platform_init()) return error.InitFailed;
@@ -297,6 +311,7 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_GAMEPAD_CONNECTED => Event{ .gamepad_connected = makeGamepadInfo(ev) },
                 c.PLATFORM_EVENT_GAMEPAD_DISCONNECTED => Event{ .gamepad_disconnected = makeGamepadDisconnect(ev) },
                 c.PLATFORM_EVENT_COMPOSITION => Event{ .composition_changed = makeCompositionEvent(ev) },
+                c.PLATFORM_EVENT_MENU_COMMAND => Event{ .menu_command = ev.payload.menu.command_id },
                 else => null,
             };
             if (mapped) |event| {
@@ -394,6 +409,104 @@ pub const Window = struct {
             .left_trigger = s.left_trigger,
             .right_trigger = s.right_trigger,
         };
+    }
+
+    // ========================================================================
+    // native menu (TASK-97.3)
+    // ========================================================================
+    //
+    // ホットパス宣言: 登録・状態更新は初期化時/状態変更イベント時のみ。選択はイベント時のみ。
+    // 性能規約の適用対象外。
+
+    pub fn nativeMenuAvailable(self: Window) bool {
+        _ = self;
+        if (comptime !menu_c_abi) return false;
+        return MenuC.platform_menu_available();
+    }
+
+    pub fn registerMenu(self: Window, commands: []const Command) void {
+        if (comptime !menu_c_abi) return;
+        var scratch: MenuScratch = .{};
+        const items = scratch.fill(commands);
+        MenuC.platform_register_menu(self.handle, items.ptr, @intCast(items.len));
+    }
+
+    pub fn updateMenu(self: Window, commands: []const Command) void {
+        if (comptime !menu_c_abi) return;
+        var scratch: MenuScratch = .{};
+        const items = scratch.fill(commands);
+        MenuC.platform_update_menu(self.handle, items.ptr, @intCast(items.len));
+    }
+
+    pub fn destroyMenu(self: Window) void {
+        if (comptime !menu_c_abi) return;
+        MenuC.platform_destroy_menu(self.handle);
+    }
+};
+
+/// Command → PlatformMenuItem 変換用の一時バッファ。
+/// 文字列は呼び出し中のみ有効（backend が copy）。stack 固定長で alloc しない。
+const MENU_SCRATCH_CAP = 64;
+const MENU_STR_CAP = 256;
+
+const MenuScratch = struct {
+    items: [MENU_SCRATCH_CAP]c.PlatformMenuItem = undefined,
+    titles: [MENU_SCRATCH_CAP][MENU_STR_CAP]u8 = undefined,
+    labels: [MENU_SCRATCH_CAP][MENU_STR_CAP]u8 = undefined,
+
+    fn fill(self: *MenuScratch, commands: []const Command) []const c.PlatformMenuItem {
+        if (commands.len > MENU_SCRATCH_CAP) {
+            std.log.warn("platform_macos menu: command count {d} exceeds MENU_SCRATCH_CAP={d}; truncating", .{
+                commands.len,
+                MENU_SCRATCH_CAP,
+            });
+        }
+        const n = @min(commands.len, MENU_SCRATCH_CAP);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const cmd = commands[i];
+            const title_z = copyZUtf8(&self.titles[i], cmd.menu.title);
+            const label_z = copyZUtf8(&self.labels[i], cmd.label);
+            self.items[i] = .{
+                .command_id = cmd.id,
+                .kind = if (cmd.kind == .separator) c.PLATFORM_MENU_KIND_SEPARATOR else c.PLATFORM_MENU_KIND_NORMAL,
+                .top_menu = title_z,
+                .label = label_z,
+                .shortcut_key = if (cmd.shortcut) |sc| @intFromEnum(sc.key) else -1,
+                .shortcut_mods = if (cmd.shortcut) |sc| sc.modifiers.toC() else 0,
+                .enabled = if (cmd.enabled) 1 else 0,
+                .checked = if (cmd.checked) 1 else 0,
+            };
+        }
+        return self.items[0..n];
+    }
+
+    /// UTF-8 安全に NUL 終端へコピーする。バイト上限で切る場合はコードポイント境界へ戻す
+    /// （継続バイト 0b10xxxxxx の途中切断 → ObjC stringWithUTF8String: nil を防ぐ）。
+    fn copyZUtf8(buf: *[MENU_STR_CAP]u8, src: []const u8) [*:0]const u8 {
+        const max = MENU_STR_CAP - 1;
+        const capped = @min(src.len, max);
+        var n = capped;
+        // 末尾の継続バイトを捨てて lead 上へ戻す
+        while (n > 0 and (src[n - 1] & 0xC0) == 0x80) n -= 1;
+        // lead だけ残って不完全な多バイト列なら lead も捨てる
+        if (n > 0) {
+            const lead = src[n - 1];
+            const need: usize = if (lead < 0x80)
+                1
+            else if (lead < 0xE0)
+                2
+            else if (lead < 0xF0)
+                3
+            else if (lead < 0xF8)
+                4
+            else
+                1;
+            if ((n - 1) + need > capped) n -= 1;
+        }
+        @memcpy(buf[0..n], src[0..n]);
+        buf[n] = 0;
+        return buf[0..n :0].ptr;
     }
 };
 

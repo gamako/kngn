@@ -111,6 +111,27 @@ const CmdId = struct {
 const MENU_CMD_CAP = 40;
 const RECENT_CMD_BASE: platform.CommandId = 100;
 
+/// native menu dirty-gate 用（TASK-97.3）。
+/// label / top_menu は全文 hash+len（prefix 切り捨てだと recent path の suffix 差を取りこぼす）。
+/// shortcut は Optional の有無 + key/modifiers を保持する。
+const NativeMenuSnap = struct {
+    id: platform.CommandId,
+    enabled: bool,
+    checked: bool,
+    kind: platform.CommandKind,
+    label_hash: u32 = 0,
+    label_len: usize = 0,
+    title_hash: u32 = 0,
+    title_len: usize = 0,
+    has_shortcut: bool = false,
+    shortcut_key: platform.KeyCode = .A,
+    shortcut_mods: platform.ModifierFlags = .{},
+};
+
+fn hashMenuStr(s: []const u8) u32 {
+    return std.hash.Fnv1a_32.hash(s);
+}
+
 /// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
 const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
 /// ペイン分割（TASK-42）の明示 ID。CONTENT_ROW=横分割の利用可能幅、MAIN_AREA=縦分割の利用可能高 の基準。
@@ -304,6 +325,14 @@ const App = struct {
         self.os_window = win;
         win.setRedrawCallback(self, redrawCb);
         self.refreshTitle();
+        // TASK-97.3: native メニュー（objc + enable_menu）。headless は false → GUI fallback のまま。
+        self.rebuildMenuCommands();
+        if (win.nativeMenuAvailable()) {
+            self.native_menu_active = true;
+            win.registerMenu(self.menuCommandsSlice());
+            self.saveNativeMenuSnapshot();
+            self.native_menu_registered = true;
+        }
     }
 
     fn syncComposition(self: *App, win: *platform.Window) void {
@@ -457,6 +486,12 @@ const App = struct {
     /// 毎フレーム再構築する Command 表（enabled/checked 反映。native updateMenu と同役割）。
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
     menu_command_count: usize = 0,
+    /// native メニューが有効か（onWindowReady で確定。headless/swift/metal は false）。
+    native_menu_active: bool = false,
+    /// native updateMenu dirty-gate 用スナップショット（enabled/checked/id/label）。
+    native_menu_snap: [MENU_CMD_CAP]NativeMenuSnap = undefined,
+    native_menu_snap_count: usize = 0,
+    native_menu_registered: bool = false,
     /// wasm file picker 進行中の FileOp（TASK-73.3 修正1）。
     /// DialogPending のあいだはこの op だけを再試行し、待機中に pending_file_op へ積まれた別要求は破棄する
     /// （例: Cmd+O 待ち中の Cmd+Shift+S が picked path を誤って save_as に食わせない）。
@@ -2262,8 +2297,74 @@ const App = struct {
         return self.menu_commands[0..self.menu_command_count];
     }
 
+    fn saveNativeMenuSnapshot(self: *App) void {
+        const cmds = self.menuCommandsSlice();
+        self.native_menu_snap_count = cmds.len;
+        for (cmds, 0..) |cmd, i| {
+            var snap: NativeMenuSnap = .{
+                .id = cmd.id,
+                .enabled = cmd.enabled,
+                .checked = cmd.checked,
+                .kind = cmd.kind,
+                .label_hash = hashMenuStr(cmd.label),
+                .label_len = cmd.label.len,
+                .title_hash = hashMenuStr(cmd.menu.title),
+                .title_len = cmd.menu.title.len,
+            };
+            if (cmd.shortcut) |sc| {
+                snap.has_shortcut = true;
+                snap.shortcut_key = sc.key;
+                snap.shortcut_mods = sc.modifiers;
+            }
+            self.native_menu_snap[i] = snap;
+        }
+    }
+
+    fn nativeMenuStructureChanged(self: *const App) bool {
+        const cmds = self.menu_commands[0..self.menu_command_count];
+        if (cmds.len != self.native_menu_snap_count) return true;
+        for (cmds, self.native_menu_snap[0..cmds.len]) |cmd, snap| {
+            if (cmd.id != snap.id or cmd.kind != snap.kind) return true;
+            if (cmd.label.len != snap.label_len or hashMenuStr(cmd.label) != snap.label_hash) return true;
+            if (cmd.menu.title.len != snap.title_len or hashMenuStr(cmd.menu.title) != snap.title_hash) return true;
+            if (cmd.shortcut) |sc| {
+                if (!snap.has_shortcut) return true;
+                if (sc.key != snap.shortcut_key) return true;
+                if (sc.modifiers.toC() != snap.shortcut_mods.toC()) return true;
+            } else if (snap.has_shortcut) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn nativeMenuStateChanged(self: *const App) bool {
+        const cmds = self.menu_commands[0..self.menu_command_count];
+        if (cmds.len != self.native_menu_snap_count) return true;
+        for (cmds, self.native_menu_snap[0..cmds.len]) |cmd, snap| {
+            if (cmd.enabled != snap.enabled or cmd.checked != snap.checked) return true;
+        }
+        return false;
+    }
+
+    /// enabled/checked 変化時のみ updateMenu。構造変化時は registerMenu。
+    /// 毎フレームの ObjC ブリッジ呼び出しを dirty-gate で禁止（TASK-97.3 付記）。
+    fn syncNativeMenu(self: *App, win: *platform.Window) void {
+        if (!self.native_menu_active) return;
+        const cmds = self.menuCommandsSlice();
+        if (!self.native_menu_registered or self.nativeMenuStructureChanged()) {
+            win.registerMenu(cmds);
+            self.saveNativeMenuSnapshot();
+            self.native_menu_registered = true;
+        } else if (self.nativeMenuStateChanged()) {
+            win.updateMenu(cmds);
+            self.saveNativeMenuSnapshot();
+        }
+    }
+
     /// GUI fallback 環境のショートカット照合（single-owner = アプリ側。TASK-97.2 plan 4）。
     /// primary accel は cmd または ctrl（既存 handleKey と同じ）。
+    /// native メニュー有効時は keyEquivalent が所有するため呼ばない（AC#2）。
     fn matchMenuShortcut(self: *const App, k: platform.KeyEvent) ?platform.CommandId {
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
@@ -2369,7 +2470,10 @@ const App = struct {
             }
         } else if (k.key == .Q and accel) {
             if (self.os_window) |win| self.requestClose(win);
-        } else if (self.matchMenuShortcut(k)) |cmd_id| {
+        } else if (blk: {
+            // native 有効時は keyEquivalent がショートカットを所有（AC#2）。GUI/headless のみ照合。
+            break :blk if (self.native_menu_active) null else self.matchMenuShortcut(k);
+        }) |cmd_id| {
             // File/Edit ショートカットは Command 表経由（single-owner。GUI メニューと同じ入口）。
             self.dispatchCommand(cmd_id);
         } else if (k.key == .C and accel) {
@@ -4550,16 +4654,21 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     });
 
     // ── 1 段目: menu bar（Command 定義から File/Edit/View。TASK-97.2）──
-    ctx.beginBox(.{
-        .direction = .row,
-        .width = .{ .grow = 1 },
-        .padding = .{ 4, 4, 4, 4 },
-        .gap = 5,
-        .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
-    });
-    app.rebuildMenuCommands();
-    gui.menuBar(ctx, app.menuCommandsSlice(), &app.menu_bar_state);
-    ctx.endBox();
+    // native 有効時は OS メニューバーに任せて GUI fallback 行をスキップ（TASK-97.3）。
+    if (!app.native_menu_active) {
+        ctx.beginBox(.{
+            .direction = .row,
+            .width = .{ .grow = 1 },
+            .padding = .{ 4, 4, 4, 4 },
+            .gap = 5,
+            .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
+        });
+        app.rebuildMenuCommands();
+        gui.menuBar(ctx, app.menuCommandsSlice(), &app.menu_bar_state);
+        ctx.endBox();
+    } else {
+        app.rebuildMenuCommands();
+    }
 
     // ── main area: content row(canvas + 右ペイン) + 任意の下ペイン（TASK-42。縦分割の基準 ID） ──
     ctx.beginBox(.{ .id = MAIN_AREA_ID, .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 0 });
@@ -5109,6 +5218,11 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
 
 fn appDeinit(self: *App) void {
     const gpa = self.gpa;
+    if (self.native_menu_active) {
+        if (self.os_window) |win| win.destroyMenu();
+        self.native_menu_active = false;
+        self.native_menu_registered = false;
+    }
     if (self.recovery == null and !self.host.isDirty()) {
         self.autosave.clear() catch |err| std.log.err("pixie: autosave clear failed: {s}", .{@errorName(err)});
     }
@@ -5157,6 +5271,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         // Command 表をイベント処理前に更新（ショートカット照合・probe 用。checked 反映）。
         self.rebuildMenuCommands();
+        self.syncNativeMenu(win);
 
         while (win.nextEvent()) |ev| {
             if (self.recovery != null or self.host.confirmation() != .none) {
@@ -5212,11 +5327,16 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         try drawAppshellOverlay(&self.ctx, self);
 
         // GUI fallback ドロップダウン（endFrame 後契約。popup.zig と同型）。
-        {
+        // native 有効時はスキップ（OS メニューバーが所有。TASK-97.3）。
+        if (!self.native_menu_active) {
             const menu_res = gui.menuBarPopup(&self.ctx, self.menuCommandsSlice(), &self.menu_bar_state);
             if (menu_res.selected) |id| self.dispatchCommand(id);
             // View トグル後に checked を即反映（同一フレームの probe 用）
             if (menu_res.selected != null) self.rebuildMenuCommands();
+        } else {
+            // View トグル等で checked が変わった場合に dirty-gate 経由で updateMenu
+            self.rebuildMenuCommands();
+            self.syncNativeMenu(win);
         }
 
         // IME 候補窓の基準 caret。rect cache は endFrame 後に確定するため、この時点で供給する。

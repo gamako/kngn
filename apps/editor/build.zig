@@ -128,5 +128,6 @@ pub fn build(b: *std.Build) void {
         .extra = &.{
             .{ .name = "paint", .module = paint },
         },
+        .link_menu = true, // TASK-97.3: pixie standalone も native メニュー opt-in
     });
 }

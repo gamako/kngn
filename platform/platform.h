@@ -214,6 +214,7 @@ typedef enum {
     PLATFORM_EVENT_GAMEPAD_CONNECTED,    // ゲームパッド接続 (TASK-80.1。実消費は TASK-80.2。末尾追加=後方互換)
     PLATFORM_EVENT_GAMEPAD_DISCONNECTED, // ゲームパッド切断
     PLATFORM_EVENT_COMPOSITION,  // IME composition 状態変化 (TASK-79.6.1。末尾追加=後方互換)
+    PLATFORM_EVENT_MENU_COMMAND, // native メニュー選択 (TASK-97.3。末尾追加=後方互換。payload=数値 Command ID)
 } PlatformEventType;
 
 // IME composition phase（TASK-79.6.1。Zig CompositionPhase と値一致）
@@ -407,6 +408,9 @@ typedef struct PlatformEvent {
             uint8_t phase;                // PlatformCompositionPhase
             uint32_t cursor;              // preedit 内 UTF-8 バイトオフセット（caret）
         } composition;                    // TASK-79.6.1。本文は platform_get_composition_snapshot
+        struct {
+            uint32_t command_id;          // app の CommandId（数値）。TASK-97.3
+        } menu;
     } payload;
 } PlatformEvent;
 
@@ -487,6 +491,44 @@ typedef struct PlatformGamepadState {
 // 指定 index のゲームパッド状態を取得する（ポーリング。実装は TASK-80.2）。
 // 戻り値: 接続されていれば true（out_state 書込み済み）、未接続/index範囲外は false。
 bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamepadState* out_state);
+
+// ========================================
+// native メニュー (TASK-97.3。ADR 契約は core/command_types.zig の Command)
+// ========================================
+//
+// C ABI 契約:
+// - 登録は PlatformMenuItem 配列 + count 明示（sentinel 終端は使わない）。
+// - 文字列は UTF-8 NUL 終端で**呼び出し中のみ有効**（backend が copy する）。
+// - 階層は MVP ではトップメニュー 1 段 + 項目のみ（submenu なし。separator は kind で表現）。
+// - メニューバーはアプリ単位のため window 引数は無視し、最後の登録が全体を差し替える。
+// - 実装は macOS objc backend のみ。`#if defined(VP_ENABLE_MENU)` 条件コンパイル
+//   （TASK-80.2 gamepad opt-in と同型）。非使用 exe はメニューシンボル参照ゼロ。
+
+#define PLATFORM_MENU_KIND_NORMAL    0
+#define PLATFORM_MENU_KIND_SEPARATOR 1
+
+typedef struct PlatformMenuItem {
+    uint32_t command_id;       // separator は 0
+    uint8_t kind;              // PLATFORM_MENU_KIND_*
+    const char* top_menu;      // トップメニュー名（例 "File"）。NUL 終端・呼び出し中のみ有効
+    const char* label;         // 項目ラベル。separator は空文字可。NUL 終端・呼び出し中のみ有効
+    int32_t shortcut_key;      // PlatformKeyCode。ショートカット無しは -1
+    uint32_t shortcut_mods;    // PlatformModifierFlags。shortcut_key < 0 のとき無視
+    uint8_t enabled;           // 0/1
+    uint8_t checked;           // 0/1（トグル項目）
+} PlatformMenuItem;
+
+// このビルドで native メニューが利用可能か（VP_ENABLE_MENU かつ objc 実装あり）。
+bool platform_menu_available(void);
+
+// メニューバーを items[0..count) で差し替える（最後の登録が全体）。window は契約上無視。
+void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count);
+
+// 登録済み項目の enabled/checked を command_id 照合で更新する（構造は変えない）。
+void platform_update_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count);
+
+// 登録済みメニューを破棄する（mainMenu を空に戻す）。
+void platform_destroy_menu(PlatformWindow* window);
 
 // ========================================
 // ファイル選択ダイアログ (TASK-24)

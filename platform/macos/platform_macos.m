@@ -220,6 +220,12 @@ static void gamepadDetachWindow(PlatformWindow* window) {
 }
 #endif // VP_ENABLE_GAMEPAD
 
+#if defined(VP_ENABLE_MENU)
+// poll_events / MenuTarget から参照。実体の操作関数はファイル後半の native メニュー節。
+static NSMenu* g_menu_main = nil;
+static PlatformWindow* g_menu_event_window = NULL;
+#endif
+
 // ========================================
 // マウス入力ヘルパー (TASK-21.1)
 // ========================================
@@ -1643,6 +1649,20 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                                            dequeue:YES])) {
             // キーボードイベントをイベントキューに追加
             if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
+#if defined(VP_ENABLE_MENU)
+                // TASK-97.3 AC#2（keyEquivalent 二重発火防止）:
+                // 本ループは key イベントを [NSApp sendEvent:] せず直接 C event queue に積む。
+                // そのため AppKit 標準の sendEvent → mainMenu performKeyEquivalent 経路は通らない。
+                // native メニュー登録中は mainMenu へ明示的に performKeyEquivalent: を呼び、
+                // YES（メニュー項目が消費）なら key_down を積まない。メニュー action は同期で
+                // PLATFORM_EVENT_MENU_COMMAND を queue に積む。これによりアプリ側 key_down の
+                // matchMenuShortcut と二重発火しない（single-owner = keyEquivalent）。
+                if (event.type == NSEventTypeKeyDown && g_menu_main != nil) {
+                    if ([g_menu_main performKeyEquivalent:event]) {
+                        continue;
+                    }
+                }
+#endif
                 PlatformEvent platform_event;
                 memset(&platform_event, 0, sizeof(platform_event));
                 platform_event.type = (event.type == NSEventTypeKeyDown)
@@ -1797,6 +1817,218 @@ bool platform_get_event(PlatformWindow* window, PlatformEvent* event) {
 
     return true;
 }
+
+// ========================================
+// native メニュー (TASK-97.3。NSMenu / target-action)
+// ========================================
+//
+// opt-in（TASK-80.2 gamepad と同型）: `#if defined(VP_ENABLE_MENU)` で条件コンパイルする。
+// ObjC クラス（MenuTarget）は runtime メタデータが生存根になり dead_strip で消えないため
+// flag ゲートが必須。Zig 側は build_options.enable_menu && objc の comptime gate で
+// C symbol 参照を除外し、非使用 exe はメニューシンボル参照ゼロ（nm で確認）。
+// NSMenu は AppKit 既リンクのため追加 framework は不要。
+#if defined(VP_ENABLE_MENU)
+
+@interface MenuTarget : NSObject
+- (void)onMenuCommand:(id)sender;
+@end
+
+@implementation MenuTarget
+- (void)onMenuCommand:(id)sender {
+    NSMenuItem* item = (NSMenuItem*)sender;
+    if (!g_menu_event_window) return;
+    PlatformEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = PLATFORM_EVENT_MENU_COMMAND;
+    ev.payload.menu.command_id = (uint32_t)item.tag;
+    queue_push(&g_menu_event_window->event_queue, &ev);
+}
+@end
+
+static MenuTarget* g_menu_target = nil;
+
+// KeyCode → NSMenuItem.keyEquivalent。物理キーコードは渡せないため文字/unichar へ写す。
+// 変換不能キーは keyEquivalent なし（ショートカット無しのメニュー項目）+ warn。
+static BOOL menuKeyEquivalentForKey(int32_t key, NSString** out_eq) {
+    if (key >= PLATFORM_KEY_A && key <= PLATFORM_KEY_Z) {
+        char c = (char)('a' + (key - PLATFORM_KEY_A));
+        *out_eq = [[NSString alloc] initWithBytes:&c length:1 encoding:NSASCIIStringEncoding];
+        return YES;
+    }
+    if (key >= PLATFORM_KEY_0 && key <= PLATFORM_KEY_9) {
+        char c = (char)('0' + (key - PLATFORM_KEY_0));
+        *out_eq = [[NSString alloc] initWithBytes:&c length:1 encoding:NSASCIIStringEncoding];
+        return YES;
+    }
+    unichar u = 0;
+    switch (key) {
+        case PLATFORM_KEY_ENTER:     u = NSCarriageReturnCharacter; break;
+        case PLATFORM_KEY_ESCAPE:    u = 0x1b; break;
+        case PLATFORM_KEY_BACKSPACE: u = NSBackspaceCharacter; break;
+        case PLATFORM_KEY_DELETE:    u = NSDeleteCharacter; break;
+        case PLATFORM_KEY_TAB:       u = NSTabCharacter; break;
+        case PLATFORM_KEY_LEFT:      u = NSLeftArrowFunctionKey; break;
+        case PLATFORM_KEY_RIGHT:     u = NSRightArrowFunctionKey; break;
+        case PLATFORM_KEY_UP:        u = NSUpArrowFunctionKey; break;
+        case PLATFORM_KEY_DOWN:      u = NSDownArrowFunctionKey; break;
+        case PLATFORM_KEY_F1:  u = NSF1FunctionKey; break;
+        case PLATFORM_KEY_F2:  u = NSF2FunctionKey; break;
+        case PLATFORM_KEY_F3:  u = NSF3FunctionKey; break;
+        case PLATFORM_KEY_F4:  u = NSF4FunctionKey; break;
+        case PLATFORM_KEY_F5:  u = NSF5FunctionKey; break;
+        case PLATFORM_KEY_F6:  u = NSF6FunctionKey; break;
+        case PLATFORM_KEY_F7:  u = NSF7FunctionKey; break;
+        case PLATFORM_KEY_F8:  u = NSF8FunctionKey; break;
+        case PLATFORM_KEY_F9:  u = NSF9FunctionKey; break;
+        case PLATFORM_KEY_F10: u = NSF10FunctionKey; break;
+        case PLATFORM_KEY_F11: u = NSF11FunctionKey; break;
+        case PLATFORM_KEY_F12: u = NSF12FunctionKey; break;
+        case PLATFORM_KEY_F13: u = NSF13FunctionKey; break;
+        case PLATFORM_KEY_F14: u = NSF14FunctionKey; break;
+        case PLATFORM_KEY_F15: u = NSF15FunctionKey; break;
+        case PLATFORM_KEY_F16: u = NSF16FunctionKey; break;
+        case PLATFORM_KEY_F17: u = NSF17FunctionKey; break;
+        case PLATFORM_KEY_F18: u = NSF18FunctionKey; break;
+        case PLATFORM_KEY_F19: u = NSF19FunctionKey; break;
+        case PLATFORM_KEY_F20: u = NSF20FunctionKey; break;
+        default:
+            NSLog(@"[video-proto] menu: unsupported keyEquivalent key=%d (item registered without shortcut)", (int)key);
+            return NO;
+    }
+    *out_eq = [NSString stringWithCharacters:&u length:1];
+    return YES;
+}
+
+static NSEventModifierFlags menuModifierMask(uint32_t mods) {
+    NSEventModifierFlags mask = 0;
+    if (mods & PLATFORM_MOD_SHIFT) mask |= NSEventModifierFlagShift;
+    if (mods & PLATFORM_MOD_CTRL)  mask |= NSEventModifierFlagControl;
+    if (mods & PLATFORM_MOD_ALT)   mask |= NSEventModifierFlagOption;
+    if (mods & PLATFORM_MOD_CMD)   mask |= NSEventModifierFlagCommand;
+    return mask;
+}
+
+static NSMenu* menuFindTopMenu(NSMenu* mainMenu, NSString* title) {
+    for (NSMenuItem* item in mainMenu.itemArray) {
+        if (item.submenu && [item.title isEqualToString:title]) return item.submenu;
+    }
+    return nil;
+}
+
+static NSMenu* menuEnsureTopMenu(NSMenu* mainMenu, NSString* title) {
+    NSMenu* sub = menuFindTopMenu(mainMenu, title);
+    if (sub) return sub;
+    NSMenuItem* top = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+    sub = [[NSMenu alloc] initWithTitle:title];
+    [top setSubmenu:sub];
+    [mainMenu addItem:top];
+    return sub;
+}
+
+static void menuApplyItemState(NSMenuItem* item, const PlatformMenuItem* src) {
+    [item setEnabled:src->enabled != 0];
+    [item setState:(src->checked != 0) ? NSControlStateValueOn : NSControlStateValueOff];
+}
+
+/// UTF-8 → NSString。不正列（途中切断含む）で stringWithUTF8String: が nil を返す場合は
+/// 空文字へ落として項目欠落・不正 NSMenuItem を防ぐ（TASK-97.3 codex 指摘）。
+static NSString* menuNSStringOrEmpty(const char* utf8, const char* field) {
+    if (!utf8 || utf8[0] == '\0') return @"";
+    NSString* s = [NSString stringWithUTF8String:utf8];
+    if (!s) {
+        NSLog(@"[video-proto] menu: invalid UTF-8 in %s — using empty string", field);
+        return @"";
+    }
+    return s;
+}
+
+static NSMenuItem* menuMakeItem(const PlatformMenuItem* src) {
+    if (src->kind == PLATFORM_MENU_KIND_SEPARATOR) {
+        return [NSMenuItem separatorItem];
+    }
+    NSString* label = menuNSStringOrEmpty(src->label, "label");
+    NSString* keyEq = @"";
+    NSEventModifierFlags keyMask = 0;
+    if (src->shortcut_key >= 0) {
+        NSString* eq = nil;
+        if (menuKeyEquivalentForKey(src->shortcut_key, &eq)) {
+            keyEq = eq;
+            keyMask = menuModifierMask(src->shortcut_mods);
+        }
+    }
+    NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:label
+                                                  action:@selector(onMenuCommand:)
+                                           keyEquivalent:keyEq];
+    [item setKeyEquivalentModifierMask:keyMask];
+    [item setTag:(NSInteger)src->command_id];
+    [item setTarget:g_menu_target];
+    menuApplyItemState(item, src);
+    return item;
+}
+
+bool platform_menu_available(void) {
+    return true;
+}
+
+void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count) {
+    @autoreleasepool {
+        if (!g_menu_target) g_menu_target = [[MenuTarget alloc] init];
+        // メニューバーはアプリ単位。最後の登録の window を event 配送先にする。
+        if (window) g_menu_event_window = window;
+
+        NSMenu* mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+        if (items && count > 0) {
+            for (uint32_t i = 0; i < count; i++) {
+                const PlatformMenuItem* src = &items[i];
+                NSString* top = menuNSStringOrEmpty(src->top_menu, "top_menu");
+                if (top.length == 0) {
+                    // 空/不正 UTF-8 のトップ名は "Menu" にフォールバック（項目は捨てない）
+                    if (src->top_menu && src->top_menu[0] != '\0') {
+                        NSLog(@"[video-proto] menu: empty/invalid top_menu — fallback to \"Menu\"");
+                    }
+                    top = @"Menu";
+                }
+                NSMenu* sub = menuEnsureTopMenu(mainMenu, top);
+                [sub addItem:menuMakeItem(src)];
+            }
+        }
+        g_menu_main = mainMenu;
+        [NSApp setMainMenu:mainMenu];
+    }
+}
+
+void platform_update_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count) {
+    (void)window;
+    @autoreleasepool {
+        if (!g_menu_main || !items) return;
+        for (uint32_t i = 0; i < count; i++) {
+            const PlatformMenuItem* src = &items[i];
+            if (src->kind == PLATFORM_MENU_KIND_SEPARATOR) continue;
+            if (src->command_id == 0) continue;
+            // 全トップメニューを走査して tag=command_id の項目を更新
+            for (NSMenuItem* top in g_menu_main.itemArray) {
+                NSMenu* sub = top.submenu;
+                if (!sub) continue;
+                NSMenuItem* found = [sub itemWithTag:(NSInteger)src->command_id];
+                if (found) {
+                    menuApplyItemState(found, src);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void platform_destroy_menu(PlatformWindow* window) {
+    (void)window;
+    @autoreleasepool {
+        g_menu_main = nil;
+        g_menu_event_window = NULL;
+        [NSApp setMainMenu:[[NSMenu alloc] initWithTitle:@""]];
+    }
+}
+
+#endif // VP_ENABLE_MENU
 
 // ========================================
 // ゲームパッド入力 (TASK-80.2。ADR-009)

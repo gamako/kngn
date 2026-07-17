@@ -1986,52 +1986,15 @@ fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, defa
 // （platform module には build_options.platform_backend が付与される）
 // ============================================================
 const PlatformModules = struct {
-    platform: TaggedModule, // ゲームパッド opt-in 無効（既定。main/pixie/synth/modular/patch/大半の example が使う。TASK-80.2 opt-in 化）
-    platform_gamepad: TaggedModule, // ゲームパッド opt-in 有効（GameController framework をリンク。examples/22_gamepad 専用）
+    platform: TaggedModule, // opt-in 無効（既定。main/synth/modular/patch/大半の example。TASK-80.2/97.3）
+    platform_gamepad: TaggedModule, // gamepad opt-in（examples/22_gamepad 専用）
+    platform_menu: TaggedModule, // menu opt-in（pixie 専用。TASK-97.3）
     keyboard: *std.Build.Module, // src/ レガシー（examples 専用。層管理外）
-    kit: TaggedModule, // 公開 umbrella（ADR-007 R4）。apps はこれだけを import する（R5）。platform(opt-in無効) 側を配線
+    kit: TaggedModule, // platform(opt-in無効) 側を配線
+    kit_menu: TaggedModule, // platform_menu 側を配線（pixie 専用）
 };
 
-fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules, wasm_shared: bool) PlatformModules {
-    // ゲームパッド opt-in 無効版（既定）。main/pixie/synth/modular/patch/example_01..21 はこちらを使う
-    // （GameController framework 非リンク・.m/.swift の gamepad コードも条件コンパイルで除外。TASK-80.2 opt-in 化）。
-    const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
-        b,
-        target,
-        b.path("core/platform.zig"),
-        b.path("platform"),
-        backend,
-        common.types.mod,
-        common.command_types.mod,
-        common.harness.mod,
-        false,
-    ) };
-    // ゲームパッド opt-in 有効版。examples/22_gamepad だけがこちらを使う（GameController framework をリンクし、
-    // .m/.swift の gamepad コードも有効化される）。同じ backend/types/harness から作るが build_options が異なるため
-    // 別 Module インスタンスが必要（addOptions は Module 生成時に焼き込まれ、共有 Module では上書きできない）。
-    const platform_gamepad_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
-        b,
-        target,
-        b.path("core/platform.zig"),
-        b.path("platform"),
-        backend,
-        common.types.mod,
-        common.command_types.mod,
-        common.harness.mod,
-        true,
-    ) };
-    // keyboard は KeyCode 型定義を platform_types から借りる（opt-in 無効側の types で十分。
-    // TASK-111.2: platform facade ではなく type-only core のみ依存）。
-    const keyboard_mod = b.createModule(.{
-        .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
-    });
-    keyboard_mod.addImport("platform_types", common.types.mod);
-
-    // kit umbrella（backend 毎。ADR-007 R4）。kit/kit.zig の pub import と 1:1 で揃えること。
-    // pixie/synth/modular/patch はゲームパッド opt-in しないため opt-in 無効側の platform を配線する。
-    const kit: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
-        .root_source_file = b.path("kit/kit.zig"),
-    }) };
+fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const SharedModules, app_runtime: TaggedModule) void {
     link(kit, platform_mod);
     link(kit, common.harness); // kit.control
     link(kit, common.types); // kit.types
@@ -2049,24 +2012,95 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(kit, common.gfx); // kit.gfx（TASK-111.2）
     link(kit, common.appshell); // kit.appshell（TASK-114.1）
     link(kit, common.sound); // kit.sound（TASK-111.6）
+    link(kit, app_runtime);
+}
 
-    // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎。
-    // wasm shared audio（TASK-73.2）は single_threaded=false（atomics を本物にする）。
+fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules, wasm_shared: bool) PlatformModules {
+    // opt-in 無効版（既定）。main/synth/modular/patch/example 大半はこちら。
+    const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
+        b,
+        target,
+        b.path("core/platform.zig"),
+        b.path("platform"),
+        backend,
+        common.types.mod,
+        common.command_types.mod,
+        common.harness.mod,
+        .{},
+    ) };
+    // ゲームパッド opt-in 有効版。examples/22_gamepad 専用。
+    const platform_gamepad_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
+        b,
+        target,
+        b.path("core/platform.zig"),
+        b.path("platform"),
+        backend,
+        common.types.mod,
+        common.command_types.mod,
+        common.harness.mod,
+        .{ .enable_gamepad = true },
+    ) };
+    // native メニュー opt-in 有効版。pixie 専用（TASK-97.3）。build_options が異なるため別 Module。
+    const platform_menu_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
+        b,
+        target,
+        b.path("core/platform.zig"),
+        b.path("platform"),
+        backend,
+        common.types.mod,
+        common.command_types.mod,
+        common.harness.mod,
+        .{ .enable_menu = true },
+    ) };
+    // keyboard は KeyCode 型定義を platform_types から借りる（opt-in 無効側の types で十分。
+    // TASK-111.2: platform facade ではなく type-only core のみ依存）。
+    const keyboard_mod = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
+    });
+    keyboard_mod.addImport("platform_types", common.types.mod);
+
+    // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎・opt-in 毎。
     const app_runtime: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
         .single_threaded = if (backend == .wasm) !wasm_shared else null,
     }) };
     link(app_runtime, platform_mod);
-    link(kit, app_runtime);
+
+    const app_runtime_menu: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
+        .root_source_file = b.path("core/app_runtime.zig"),
+        .target = target,
+        .single_threaded = if (backend == .wasm) !wasm_shared else null,
+    }) };
+    link(app_runtime_menu, platform_menu_mod);
+
+    // kit umbrella（backend 毎。ADR-007 R4）。kit/kit.zig の pub import と 1:1 で揃えること。
+    const kit: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
+        .root_source_file = b.path("kit/kit.zig"),
+    }) };
+    wireKitImports(kit, platform_mod, common, app_runtime);
+
+    // pixie 専用 kit（enable_menu=true の platform を配線）
+    const kit_menu: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
+        .root_source_file = b.path("kit/kit.zig"),
+    }) };
+    wireKitImports(kit_menu, platform_menu_mod, common, app_runtime_menu);
 
     // wasm present の BGRA→RGBA SIMD swizzle（platform_wasm → pixelops）。
     // ADR-007 の core→lib 例外として linkCoreException 経由（素の addImport は不可）。
     if (backend == .wasm) {
         linkCoreException(platform_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
+        linkCoreException(platform_menu_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
     }
 
-    return .{ .platform = platform_mod, .platform_gamepad = platform_gamepad_mod, .keyboard = keyboard_mod, .kit = kit };
+    return .{
+        .platform = platform_mod,
+        .platform_gamepad = platform_gamepad_mod,
+        .platform_menu = platform_menu_mod,
+        .keyboard = keyboard_mod,
+        .kit = kit,
+        .kit_menu = kit_menu,
+    };
 }
 
 // ============================================================
@@ -2093,7 +2127,7 @@ fn addMainExe(
     // src/main.zig は apps/ 配下でないため R5（kit-only）対象外（examples と同じ従来配線）。
     exe.root_module.addImport("platform", pm.platform.mod);
     // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。main は gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
@@ -2146,12 +2180,15 @@ const SharedModules = struct {
             .link_libc = true,
         }) };
         platform_mod.mod.addIncludePath(b.path("platform"));
-        // build_options.enable_gamepad（TASK-80.2 opt-in 化）: 外部消費者（tictactoe 等。dep.module("platform")）
+        // build_options（TASK-80.2/97.3 opt-in）: 外部消費者（tictactoe 等。dep.module("platform")）
         // 向けの facade も core/platform.zig を root にするため同じ named import が要る。外部消費者は
-        // ゲームパッド opt-in を選べないため既定 false（GameController 非リンクの安全側）。
+        // opt-in を選べないため既定 false（安全側）。platform_backend は macOS 既定名を仮置き
+        // （外部消費者が自前で platform .o をリンクする想定の薄い stub）。
         {
             const opts = b.addOptions();
             opts.addOption(bool, "enable_gamepad", false);
+            opts.addOption(bool, "enable_menu", false);
+            opts.addOption([]const u8, "platform_backend", "objc");
             platform_mod.mod.addOptions("build_options", opts);
         }
 
@@ -2539,7 +2576,7 @@ fn addExampleExe(
 
     // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs.needs_gamepad の exe だけ GameController framework
     // リンク + .m/.swift gamepad コード有効化（上の addImport 選択と揃える）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, needs.needs_gamepad);
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_gamepad = needs.needs_gamepad });
     return exe;
 }
 
@@ -2566,12 +2603,12 @@ fn addPixieExe(
         }),
     });
     // apps は kit-only 消費者（R5）。paint は「エディタ族の共有 lib」（kit 非収録・流動）で直 import。
+    // native メニュー opt-in（TASK-97.3）: kit_menu（enable_menu=true）+ -DVP_ENABLE_MENU。
     const root = appRoot(exe, "pixie");
-    link(root, pm.kit);
+    link(root, pm.kit_menu);
     link(root, common.paint);
 
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;
 }
 
@@ -2614,7 +2651,7 @@ fn addPatchExe(
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
     // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
@@ -2650,7 +2687,7 @@ fn addSynthExe(
     linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
 
     // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
@@ -2694,7 +2731,7 @@ fn addCaptureDemoExe(
     linkAudioBackend(exe, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture 用 AVFoundation/CoreMedia/CoreVideo/Foundation/objc も含む
 
     // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, false);
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
@@ -2809,7 +2846,7 @@ fn addPlatformNativeLib(
     // SharedModules の外部公開 "platform" module（build_options.enable_gamepad=false）と対で
     // GameController framework を一切参照しない .o にする（consumer 側で framework 検索パスを
     // 解決できないのと同じ理由で、opt-in も consumer 側に委ねない）。
-    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, false);
+    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, .{});
 
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_native_stub.zig"),
