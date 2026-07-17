@@ -778,8 +778,10 @@ VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=./.e2e/host.port \
 VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=./.e2e/client.port \
   VP_NETSYNC_CONNECT=127.0.0.1:9110 zig build run-pixie &
 
-# client join 完了: awaiting_sync=0 まで再照合
-until scripts/drive --port-file ./.e2e/client.port 'digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+# client join 完了: awaiting_sync=0 まで再照合。
+# ⚠ headless live の host は accept 待ちで netsync pump が止まるため、host にも step を混ぜること
+# （client 単独の until だと join SYNC が永遠に届かない。2026-07-17 実測）。
+until scripts/drive --port-file ./.e2e/host.port 'step 1' >/dev/null; scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
 
 # 共有 layer を1枚増やし、host/client が別 layer を選ぶ（select_layer は local_only）。
 scripts/drive --port-file ./.e2e/host.port 'action add_layer'
