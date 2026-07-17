@@ -153,6 +153,8 @@ const Drag = union(enum) {
 const PaletteEntry = union(enum) {
     primitive: modular.ModuleKind,
     macro_kind: group.MacroKind,
+    /// TASK-133: bass kind の standalone step_seq（既存 `.primitive = .step_seq` は drum のまま）。
+    step_seq_bass: void,
 };
 const PALETTE = [_]PaletteEntry{
     .{ .primitive = .vco },
@@ -165,31 +167,51 @@ const PALETTE = [_]PaletteEntry{
     .{ .primitive = .delay },
     .{ .macro_kind = .drum_machine },
     .{ .macro_kind = .bass_machine },
-    // 2 行目先頭（右側の列は inspector パネルに隠れるため、見える位置に置く）
     .{ .primitive = .step_seq },
     .{ .primitive = .slew },
     .{ .primitive = .sample_hold },
     .{ .primitive = .comparator },
     .{ .primitive = .ring_mod },
     .{ .primitive = .logic },
+    .{ .step_seq_bass = {} },
 };
 const PAL_X0: f32 = 8;
-const PAL_Y: f32 = 6;
-const COLS: usize = 10;
+const PAL_Y: f32 = 2;
 const PAL_W: f32 = 92;
-const PAL_H: f32 = 22;
-const PAL_GAP: f32 = 3;
-const paletteBottom: f32 = PAL_Y + 2.0 * (PAL_H + PAL_GAP);
+const PAL_H: f32 = 18;
+const PAL_GAP: f32 = 2;
+const PAL_COLS_MAX: usize = 10;
 const PAL_BG = gui.Color.rgba(0x2C, 0x32, 0x3C, 0xFF);
 const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
 const MAX_PARAM_EDITS: usize = patchmod.MAX_PARAM_OVERRIDES;
 
-fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
+/// canvas 幅に収まる列数（button.x + button.w <= canvas_w。最大 PAL_COLS_MAX）。
+fn paletteCols(canvas_w: f32) usize {
+    const cell = PAL_W + PAL_GAP;
+    if (canvas_w <= PAL_X0 + PAL_W) return 1;
+    const avail = canvas_w - PAL_X0 - PAL_W;
+    const extra: usize = @intFromFloat(@floor(@max(0.0, avail) / cell));
+    return @min(PAL_COLS_MAX, extra + 1);
+}
+
+fn paletteRowCount(canvas_w: f32) usize {
+    const cols = paletteCols(canvas_w);
+    return (PALETTE.len + cols - 1) / cols;
+}
+
+/// パレット帯の下端（行数は canvas 幅依存。clampMacroPos の上限に使う）。
+fn paletteBottom(canvas_w: f32) f32 {
+    const rows: f32 = @floatFromInt(paletteRowCount(canvas_w));
+    return PAL_Y + rows * (PAL_H + PAL_GAP);
+}
+
+fn paletteButtons(canvas_w: f32) [PALETTE.len]canvas.PaletteButton {
+    const cols = paletteCols(canvas_w);
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
     for (0..PALETTE.len) |i| {
-        const col = i % COLS;
-        const row = i / COLS;
+        const col = i % cols;
+        const row = i / cols;
         const x: f32 = @floatFromInt(col);
         const y: f32 = @floatFromInt(row);
         btns[i] = .{ .kind_index = @intCast(i), .rect = .{
@@ -319,6 +341,8 @@ const App = struct {
     // TASK-123: GUI-local panel visibility。保存・publish・netsync には含めない。
     transport_open: bool = true,
     inspector_open: bool = true,
+    // TASK-125: 両 panel の完全非表示。true の間も *_open は保持し、復帰時に open/closed を復元する。
+    panels_hidden: bool = false,
 
     // TASK-40.8 C: master 出力タップ + 直近ブロックの rms/peak（viz probe 用。GUI スレッド更新）。
     tap: Tap = .{},
@@ -371,16 +395,26 @@ const App = struct {
         return @max(0.0, fh - VIS_H);
     }
 
+    fn transportState(self: *const App) canvas.PanelState {
+        if (self.panels_hidden) return .hidden;
+        return if (self.transport_open) .open else .closed;
+    }
+
+    fn inspectorState(self: *const App) canvas.PanelState {
+        if (self.panels_hidden) return .hidden;
+        return if (self.inspector_open) .open else .closed;
+    }
+
     fn canvasW(self: *const App) f32 {
-        return canvas.canvasViewportWidth(@floatFromInt(self.fb_w), self.canvasH());
+        return canvas.canvasViewportWidthForState(@floatFromInt(self.fb_w), self.canvasH(), self.inspectorState());
     }
 
     fn pointInInspectorPanel(self: *const App) bool {
-        return canvas.pointInInspectorState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.inspector_open);
+        return canvas.pointInInspectorPanelState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.inspectorState());
     }
 
     fn pointInTransportPanel(self: *const App) bool {
-        return canvas.pointInTransportState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.transport_open);
+        return canvas.pointInTransportPanelState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.transportState());
     }
 
     fn editState(self: *App, key: param_view.FieldKey) *param_view.ParamEditState {
@@ -473,7 +507,8 @@ const App = struct {
     }
 
     /// 実 handle の生ノード列（dyn 由来。合成 handle は含まない）。フレーム毎。
-    /// selected かつ group 非所属の step_seq にだけ inline grid 用 grid_rows を付与する（TASK-110.2）。
+    /// selected な step_seq（standalone / 展開中 group member）に inline grid 用 grid_rows を付与する。
+    /// collapsed group の member は mapNodesForCollapsed で箱へ隠れるため従来どおり macro grid のみ（TASK-133）。
     fn buildRawNodes(self: *const App, out: []NodeGeom) usize {
         var n: usize = 0;
         var h: Handle = 0;
@@ -481,7 +516,7 @@ const App = struct {
             if (!self.dyn.slotActive(h)) continue;
             var g: NodeGeom = .{ .handle = h, .pos = self.layout[h], .n_in = self.dyn.nIn(h), .n_out = self.dyn.nOut(h) };
             if (self.selected) |sel| switch (sel) {
-                .node => |sh| if (sh == h and self.ledger.group_of[h] == null and self.dyn.kindOf(h) == .step_seq) {
+                .node => |sh| if (sh == h and self.dyn.kindOf(h) == .step_seq) {
                     const seq = self.dyn.ptrOfConst(.step_seq, h);
                     g.grid_rows = switch (seq.kind) {
                         .drum => 1,
@@ -698,7 +733,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     }
 
     // モジュールパレット（最前面・画面固定）
-    const buttons = paletteButtons();
+    const buttons = paletteButtons(app.canvasW());
     for (buttons) |btn| {
         const rect = gui.Rect{ .x = safeI32(btn.rect.x), .y = safeI32(btn.rect.y), .w = safeU32(btn.rect.w), .h = safeU32(btn.rect.h) };
         const hov = canvas.hitTestPalette(app.mouse, &buttons) == btn.kind_index;
@@ -790,6 +825,7 @@ fn paletteLabel(entry: PaletteEntry) []const u8 {
     return switch (entry) {
         .primitive => |k| @tagName(k),
         .macro_kind => |mk| mk.displayName(),
+        .step_seq_bass => "step_seq(bass)",
     };
 }
 
@@ -958,7 +994,8 @@ fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
     return null;
 }
 
-/// selected standalone step_seq の inline grid ヒット（mask 行のみ。pitch は対象外。TASK-110.2）。
+/// selected step_seq の inline grid ヒット（mask 行のみ。pitch は対象外。
+/// standalone / 展開中 group member 両方。collapsed member は表示されないのでここに来ない。TASK-133）。
 const InlineGridHit = struct { handle: Handle, cell: stepgrid.GridCell };
 fn hitInlineStepSeqGrid(app: *const App, world_pt: Vec2f) ?InlineGridHit {
     const sel = app.selected orelse return null;
@@ -966,7 +1003,6 @@ fn hitInlineStepSeqGrid(app: *const App, world_pt: Vec2f) ?InlineGridHit {
         .node => |nh| nh,
         else => return null,
     };
-    if (app.ledger.group_of[h] != null) return null;
     if (app.dyn.kindOf(h) != .step_seq) return null;
     if (!app.dyn.slotActive(h)) return null;
     const seq = app.dyn.ptrOfConst(.step_seq, h);
@@ -982,8 +1018,39 @@ fn hitInlineStepSeqGrid(app: *const App, world_pt: Vec2f) ?InlineGridHit {
     return null;
 }
 
-/// standalone step_seq の mask トグル（atomic accessor のみ。pattern_db / publish は触らない）。
+fn isGeneratedStepSeq(app: *const App, h: Handle) bool {
+    return h == app.patch.kick_seq_h or
+        h == app.patch.hat_seq_h or
+        h == app.patch.clap_seq_h or
+        h == app.patch.bass_seq_h;
+}
+
+/// inline step_seq の mask トグル。生成 handle は patternEditBase → publishPatternCommand、
+/// standalone は atomic accessor のみ（TASK-133）。
 fn toggleInlineStepSeqCell(app: *App, hit: InlineGridHit) void {
+    if (isGeneratedStepSeq(app, hit.handle)) {
+        var cmd = patternEditBase(app);
+        const mask = bitOf(hit.cell.step);
+        if (hit.handle == app.patch.kick_seq_h) {
+            if (hit.cell.row != 0) return;
+            cmd.kick.on ^= mask;
+        } else if (hit.handle == app.patch.hat_seq_h) {
+            if (hit.cell.row != 0) return;
+            cmd.hat.on ^= mask;
+        } else if (hit.handle == app.patch.clap_seq_h) {
+            if (hit.cell.row != 0) return;
+            cmd.clap.on ^= mask;
+        } else if (hit.handle == app.patch.bass_seq_h) {
+            switch (hit.cell.row) {
+                0 => cmd.bass.on ^= mask,
+                1 => cmd.bass.accent ^= mask,
+                2 => cmd.bass.slide ^= mask,
+                else => return,
+            }
+        } else return;
+        _ = publishPatternCommand(app, cmd);
+        return;
+    }
     const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, hit.handle);
     switch (seq.kind) {
         .drum => {
@@ -1119,8 +1186,8 @@ fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const
 }
 
 fn updateHover(app: *App) void {
-    // 可視化帯の上ではキャンバスの hover を出さない。
-    if (app.pointInInspectorPanel() or app.mouse.y >= app.canvasH()) {
+    // 可視化帯・panel 上ではキャンバスの hover を出さない（hidden 時は panel 判定が常に false）。
+    if (app.pointInInspectorPanel() or app.pointInTransportPanel() or app.mouse.y >= app.canvasH()) {
         app.hover = null;
         return;
     }
@@ -1145,7 +1212,7 @@ fn onMouseDown(app: *App) void {
     if (app.pointInInspectorPanel() or app.pointInTransportPanel()) return;
     // パレットは screen 座標で world hit より先に判定（追加/マクロ追加。1 操作 1 publish は
     // addByPaletteIndex/macro.buildDrumMachine 内）。
-    const buttons = paletteButtons();
+    const buttons = paletteButtons(app.canvasW());
     if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
         addByPaletteIndex(app, ki) catch {}; // PoolFull/TooManyModules は無視（追加せず）
         return;
@@ -1176,7 +1243,7 @@ fn onMouseDown(app: *App) void {
         return;
     }
 
-    // selected standalone step_seq の inline grid（TASK-110.2）。port/node drag より前。
+    // selected step_seq の inline grid（standalone / 展開中 member。TASK-133）。port/node drag より前。
     // ヒット時は mask toggle のみ・selected 維持・node drag を開始しない。
     if (hitInlineStepSeqGrid(app, mw)) |hit| {
         toggleInlineStepSeqCell(app, hit);
@@ -1400,6 +1467,20 @@ fn addByPaletteIndex(app: *App, ki: u8) !void {
                 },
                 // macro は展開時 footprint が既定 fb に収まるよう screen anchor を clamp してから配置する。
                 .macro_kind => |mk| try addMacro(app, mk, .{ .x = cx, .y = cy }),
+                .step_seq_bass => {
+                    const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
+                    const h = try app.dyn.add(.step_seq, .{
+                        .kind = .bass,
+                        .on_mask = 0,
+                        .accent_mask = 0,
+                        .slide_mask = 0,
+                        .scale = .minor_pentatonic,
+                        .octaves = 2,
+                    });
+                    app.layout[h] = pos;
+                    app.selected = .{ .node = h };
+                    try app.dyn.publish();
+                },
             }
             return;
         }
@@ -1426,7 +1507,7 @@ fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec
 fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
     const zoom = app.camera.zoom;
     const margin: f32 = 16;
-    const top_limit: f32 = paletteBottom + margin; // 2段パレット帯の下端より下に置く
+    const top_limit: f32 = paletteBottom(app.canvasW()) + margin; // パレット帯の下端より下に置く
     const fbw: f32 = app.canvasW();
     const fbh: f32 = @floatFromInt(app.fb_h);
     const max_x = @max(margin, fbw - fp.x * zoom - margin);
@@ -1921,6 +2002,12 @@ pub fn main(init: std.process.Init) !void {
                     switch (k.key) {
                         .ESCAPE => running = false,
                         .DELETE, .BACKSPACE => deleteSelected(&app),
+                        .H => {
+                            // TASK-125: modifier なし H のみ。Cmd/Ctrl/Alt/Shift+H は無視。
+                            if (!(k.modifiers.shift or k.modifiers.ctrl or k.modifiers.alt or k.modifiers.cmd)) {
+                                app.panels_hidden = !app.panels_hidden;
+                            }
+                        },
                         else => {},
                     }
                 },
@@ -1980,15 +2067,18 @@ pub fn main(init: std.process.Init) !void {
         drawFrame(&app, &dl);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &dl, gui.default_font);
-        const ir = canvas.inspectorVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.inspector_open);
-        const tr = canvas.transportVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.transport_open);
-        gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
-        transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &transport_model, &app.transport_open, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
-        inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
-            .node => |h| h,
-            else => null,
-        } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app.inspector_open, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
-        gui_ctx.endBox();
+        // TASK-125: hidden 時は panel 描画を呼ばない（ヘッダーも残さない）。
+        if (!app.panels_hidden) {
+            const ir = canvas.inspectorVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.inspector_open);
+            const tr = canvas.transportVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.transport_open);
+            gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
+            transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &transport_model, &app.transport_open, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
+            inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
+                .node => |h| h,
+                else => null,
+            } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app.inspector_open, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
+            gui_ctx.endBox();
+        }
         if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
         gui_ctx.endFrame();
         app.captureParamRows(&gui_ctx);
@@ -2830,9 +2920,12 @@ fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
 
 fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
-    return std.fmt.bufPrint(buf, "transport_open={d} inspector_open={d}", .{
+    return std.fmt.bufPrint(buf, "transport_open={d} inspector_open={d} transport_state={s} inspector_state={s} canvas_w={d}", .{
         @intFromBool(app.transport_open),
         @intFromBool(app.inspector_open),
+        @tagName(app.transportState()),
+        @tagName(app.inspectorState()),
+        @as(i32, @intFromFloat(app.canvasW())),
     }) catch return buf[0..0];
 }
 
