@@ -62,6 +62,7 @@ pub const wordRange = @import("text_edit.zig").wordRange;
 pub const Context = @import("context.zig").Context;
 pub const ButtonResult = @import("context.zig").ButtonResult;
 pub const buttonBehavior = @import("context.zig").buttonBehavior;
+pub const pointHitsVisible = @import("context.zig").pointHitsVisible;
 pub const CachedRect = @import("context.zig").CachedRect;
 
 // Flex レイアウトエンジン（TASK-21.4）

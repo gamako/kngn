@@ -220,8 +220,9 @@ pub fn selectableLabelId(
     if (ctx.rect_cache.get(id)) |cached| {
         const rect = cached.rect;
         const clip = cached.clip;
-        const down = ctx.input.mouse_pressed.left and rect.contains(ctx.input.mouse_pressed_pos) and
-            clip.contains(ctx.input.mouse_pressed_pos);
+        // press 起点のみ可視判定（buttonBehavior と同じ pointHitsVisible）。drag 継続は clip 外でも維持。
+        const down = ctx.input.mouse_pressed.left and
+            context_mod.pointHitsVisible(rect, clip, ctx.input.mouse_pressed_pos);
         if (down) {
             const index = text_edit.hitTest(layout_data, ctx.input.mouse_pressed_pos.x - rect.x);
             const same_click = per_id.last_click_time >= 0 and
@@ -340,9 +341,10 @@ pub fn textInputId(
     var claimed_here = false;
 
     if (ctx.rect_cache.get(id)) |cached| {
+        // press 起点の focus/caret 取得は可視領域のみ（buttonBehavior と同じ契約）。
+        // selection drag 継続は clip 外でも維持（active drag capture）。
         const down = ctx.input.mouse_pressed.left and
-            cached.rect.contains(ctx.input.mouse_pressed_pos) and
-            cached.clip.contains(ctx.input.mouse_pressed_pos);
+            context_mod.pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pressed_pos);
         if (down) {
             claimed_here = true;
             const local_x = ctx.input.mouse_pressed_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;

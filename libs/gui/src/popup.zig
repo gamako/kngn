@@ -58,13 +58,29 @@ pub const PopupResult = struct {
     dismissed: bool = false,
 };
 
-/// 幾何計算の結果。outer は常に screen 矩形内に収まる（不変条件。screen より要求サイズが
-/// 大きい場合は縮小して収める＝スクロールは MVP スコープ外）。
+/// 幾何計算の結果。
+///
+/// 不変条件: `outer` は常に screen 矩形 `[0, screen_w) × [0, screen_h)` 内に収まる。
+/// screen より要求サイズが大きい場合は viewport へ縮小して clip する（水平スクロール・
+/// 文字縮小・折り返しはスコープ外）。長文 item の自然な文字幅は変えず、描画は
+/// `pushClip(outer)` で切り、hit-test は `itemRect`（= 可視部分）に一致させる。
 pub const PopupGeometry = struct {
     outer: Rect,
     pad: i32,
     item_h: i32,
 };
+
+/// item label 群の自然 content 幅（最大 measure）。要求 outer 幅は `content_w + pad*2`。
+/// 極端に長い label でも i32 変換で trap しないよう i64 中間計算する。
+/// draw ループでは再測定しない（popupMenu が 1 回だけ呼ぶ）。
+pub fn measurePopupContentWidth(font: anytype, items: []const PopupItem) i32 {
+    var max_w: i64 = 0;
+    for (items) |it| {
+        const mw: i64 = font.measure(it.label);
+        max_w = @max(max_w, mw);
+    }
+    return std.math.cast(i32, max_w) orelse std.math.maxInt(i32);
+}
 
 /// 要求位置 pos に対しメニュー外枠を計算し、screen 矩形内に収まるようクランプする。
 /// Context 非依存の純粋関数（単体テスト容易）。
@@ -72,8 +88,10 @@ pub const PopupGeometry = struct {
 /// 事前条件（デバッグ assert）: item_count > 0, item_h > 0, pad >= 0, screen_w > 0, screen_h > 0。
 /// content_w は 0 以上を期待するが、万一負値が渡っても @max(content_w, 0) で救う。
 ///
-/// クランプ手順: まず w/h を screen_w/screen_h に収まるよう縮小し（「outer は常に screen
-/// 内」を不変条件にする）、続けて x/y を右/下端→左/上端の順でクランプする。
+/// クランプ手順:
+/// 1. 要求サイズ `requested_w = content_w + pad*2` / `requested_h = count*item_h + pad*2`
+/// 2. `outer.w = min(requested_w, screen_w)` / `outer.h = min(requested_h, screen_h)`（viewport clip）
+/// 3. 位置を右/下端 → 左/上端の順で clamp し outer を screen 内へ収める
 pub fn layoutPopup(
     pos: Vec2,
     item_count: usize,
@@ -98,14 +116,16 @@ pub fn layoutPopup(
     const sw: i64 = screen_w;
     const sh: i64 = screen_h;
 
-    var w: i64 = cw + pad64 * 2;
-    var h: i64 = count64 * item_h64 + pad64 * 2;
-    // 縮小: screen より大きい要求サイズは screen に収める（不変条件: outer <= screen）。
-    if (w > sw) w = sw;
-    if (h > sh) h = sh;
+    // 1. 要求サイズ（自然サイズ）
+    const requested_w: i64 = cw + pad64 * 2;
+    const requested_h: i64 = count64 * item_h64 + pad64 * 2;
+    // 2. viewport clip: screen より大きい要求は screen に収める（折り返し・縮小表示はしない）
+    var w: i64 = @min(requested_w, sw);
+    var h: i64 = @min(requested_h, sh);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
 
+    // 3. 位置 clamp（右/下端 → 左/上端）
     var x: i64 = pos.x;
     var y: i64 = pos.y;
     if (x + w > sw) x = sw - w;
@@ -120,9 +140,12 @@ pub fn layoutPopup(
     };
 }
 
-/// index 番目の項目行の矩形（outer.pad/item_h から算出。outer が縮小されているときは
-/// 末尾の項目ほど outer の下端をはみ出しうる＝呼び出し側は outer でクリップ/hit-test する
-/// ことで見えている範囲とクリックできる範囲を一致させる）。
+/// index 番目の項目行の **可視** 矩形。
+///
+/// 自然な項目矩形（outer 内の content 帯 × item_h）を算出し、`outer` との交差を返す。
+/// outer が viewport 縮小されているとき、末尾項目の自然矩形は outer 下端をはみ出しうるが、
+/// 戻り値は outer 内の表示可能部分だけになる（空なら w=0 or h=0）。
+/// 描画の `pushClip(outer)` と hit-test が同じ可視領域を共有するための単一の正。
 pub fn itemRect(geo: PopupGeometry, index: usize) Rect {
     // layoutPopup と同じ理由（style/index が caller 由来で極端な値になりうる）で
     // i64 中間計算にして i32 演算の overflow trap を避ける。
@@ -131,19 +154,21 @@ pub fn itemRect(geo: PopupGeometry, index: usize) Rect {
     const idx64: i64 = std.math.cast(i64, index) orelse std.math.maxInt(i64);
     const x: i64 = @as(i64, geo.outer.x) + pad64;
     const y: i64 = @as(i64, geo.outer.y) + pad64 + idx64 * item_h64;
+    // 水平: outer 内 content 帯（viewport 縮小後の outer.w に従う。文字幅自体は変えない）
     const w: i64 = @max(@as(i64, geo.outer.w) - pad64 * 2, 0);
-    return .{
+    const natural: Rect = .{
         .x = @intCast(x),
         .y = @intCast(y),
         .w = @intCast(w),
         .h = @intCast(item_h64),
     };
+    // 垂直（および万一の水平）: outer との交差 = 可視部分
+    return Rect.intersect(natural, geo.outer);
 }
 
-/// 点 p がどの項目行にあるかを返す（矩形外・項目間隙は null）。
-/// 先に outer.contains(p) で足切りするため、outer が縮小され末尾の項目行が outer の
-/// 下端をはみ出していても、はみ出した部分（=描画時に pushClip(outer) で見えない部分）は
-/// 決してヒットしない（見えている範囲=クリックできる範囲、の一致を保証する）。
+/// 点 p がどの項目行にあるかを返す（矩形外・項目間隙・outer 外は null）。
+/// `itemRect`（可視部分）のみを判定に使うため、outer clip 外の自然矩形部分は
+/// ヒットしない（見えている範囲 = クリックできる範囲）。
 pub fn hitTestItem(geo: PopupGeometry, item_count: usize, p: Vec2) ?usize {
     if (!geo.outer.contains(p)) return null;
     var i: usize = 0;
@@ -197,10 +222,11 @@ pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
         return .{ .dismissed = true };
     }
 
-    var max_w: i32 = 0;
-    for (items) |it| max_w = @max(max_w, @as(i32, @intCast(ctx.font.measure(it.label))));
+    // item 幅はここで一度だけ測定（draw では再測定しない）。通常サイズでは
+    // outer.w = max_measure + pad*2 となり、viewport 超過時は layoutPopup が screen へ clip。
+    const content_w = measurePopupContentWidth(ctx.font, items);
     const style = ctx.style;
-    const geo = layoutPopup(state.pos, items.len, max_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = layoutPopup(state.pos, items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
 
     const in = &ctx.input;
 
@@ -244,11 +270,15 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
     const line_h: i32 = @intCast(metrics.line_height);
     for (items, 0..) |it, i| {
         const r = itemRect(geo, i);
+        // outer 外に完全に出た項目（viewport 縮小で見えない末尾）はスキップ。
+        // 長文の右側は pushClip(outer) で切られる（文字幅自体は変えない）。
+        if (r.isEmpty()) continue;
         if (hovered_idx != null and hovered_idx.? == i and it.enabled) {
             dl.rectFilled(r, style.bg_hover) catch @panic("popupMenu: OOM");
         }
         const text_col = if (it.enabled) style.text else style.text_subtle;
-        const text_y = r.y + @divTrunc(@as(i32, @intCast(r.h)) - line_h, 2);
+        // 垂直中央は自然 item_h 基準（部分見切れでも行の見た目を崩さない）
+        const text_y = r.y + @divTrunc(geo.item_h - line_h, 2);
         // ctx.labelEx と同じ契約（arena に複製）。popupMenu は endFrame 後に呼ばれるが、
         // arena は次 beginFrame まで有効（Context.beginFrame の reset タイミング参照）
         // なので caller が一時バッファを渡しても安全。
@@ -307,6 +337,56 @@ test "layoutPopup: 画面より大きい要求サイズでも outer は screen �
     try std.testing.expectEqual(@as(i32, 0), geo.outer.y);
 }
 
+test "layoutPopup: 長文 content_w でも viewport が十分なら要求幅どおり" {
+    // content_w=200 → outer.w=208。screen 800 なら縮小しない
+    const geo = layoutPopup(.{ .x = 10, .y = 20 }, 2, 200, 20, 4, 800, 600);
+    try std.testing.expectEqual(@as(i32, 10), geo.outer.x);
+    try std.testing.expectEqual(@as(i32, 20), geo.outer.y);
+    try std.testing.expectEqual(@as(u32, 208), geo.outer.w);
+    try std.testing.expectEqual(@as(u32, 48), geo.outer.h); // 2*20 + 4*2
+}
+
+test "layoutPopup: 小画面では outer.w が viewport 幅へ clip される" {
+    // content_w=200 → 要求 208 > screen 100 → outer.w=100、位置も screen 内
+    const geo = layoutPopup(.{ .x = 50, .y = 50 }, 3, 200, 20, 4, 100, 100);
+    try std.testing.expectEqual(@as(u32, 100), geo.outer.w);
+    try std.testing.expect(@as(i64, geo.outer.x) + geo.outer.w <= 100);
+    try std.testing.expect(@as(i64, geo.outer.y) + geo.outer.h <= 100);
+    try std.testing.expect(geo.outer.x >= 0);
+    try std.testing.expect(geo.outer.y >= 0);
+}
+
+// ── itemRect / hitTestItem: 可視領域契約 ──────────────────────────────
+
+test "itemRect: 通常サイズでは自然矩形（pad 内・full item_h）" {
+    const geo = layoutPopup(.{ .x = 10, .y = 10 }, 3, 40, 20, 4, 800, 600);
+    const r0 = itemRect(geo, 0);
+    try std.testing.expectEqual(@as(i32, 14), r0.x); // 10+4
+    try std.testing.expectEqual(@as(i32, 14), r0.y); // 10+4
+    try std.testing.expectEqual(@as(u32, 40), r0.w);
+    try std.testing.expectEqual(@as(u32, 20), r0.h);
+}
+
+test "itemRect: outer 縮小時は outer との交差（可視部分）を返す" {
+    // screen 高 30 → outer.h=30。item2 自然 y=[44,64) は完全に outer 外 → empty
+    const geo = layoutPopup(.{ .x = 0, .y = 0 }, 3, 40, 20, 4, 800, 30);
+    try std.testing.expectEqual(@as(u32, 30), geo.outer.h);
+    try std.testing.expect(itemRect(geo, 2).isEmpty());
+    // item1 自然 y=[24,44) と outer [0,30) の交差 → y=24,h=6
+    const r1 = itemRect(geo, 1);
+    try std.testing.expectEqual(@as(i32, 24), r1.y);
+    try std.testing.expectEqual(@as(u32, 6), r1.h);
+    try std.testing.expect(!r1.isEmpty());
+}
+
+test "itemRect: 小画面で水平 content 帯が outer 内に収まる" {
+    const geo = layoutPopup(.{ .x = 0, .y = 0 }, 1, 200, 20, 4, 100, 100);
+    const r = itemRect(geo, 0);
+    try std.testing.expectEqual(@as(u32, 100), geo.outer.w);
+    try std.testing.expectEqual(@as(u32, 92), r.w); // 100 - 4*2
+    try std.testing.expect(@as(i64, r.x) + r.w <= @as(i64, geo.outer.x) + geo.outer.w);
+}
+
 // ── hitTestItem: 境界・間隙・矩形外 ──────────────────────────────
 
 test "hitTestItem: 各項目行の内側で一致する index を返す" {
@@ -338,6 +418,23 @@ test "hitTestItem: outer が縮小され末尾項目がはみ出す場合、は�
     // item2 の自然な矩形は y=[44,64) だが outer.h=30 を超えているので outer.contains が
     // 先に false を返し、常に null になる。
     try std.testing.expectEqual(@as(?usize, null), hitTestItem(geo, 3, .{ .x = 10, .y = 50 }));
+}
+
+test "hitTestItem: 部分見切れ item は可視部分だけヒットする" {
+    // item1 可視 y=[24,30)。y=25 は hit、自然矩形内だが outer 外の y=35 は null
+    const geo = layoutPopup(.{ .x = 0, .y = 0 }, 3, 40, 20, 4, 800, 30);
+    try std.testing.expectEqual(@as(?usize, 1), hitTestItem(geo, 3, .{ .x = 10, .y = 25 }));
+    try std.testing.expectEqual(@as(?usize, null), hitTestItem(geo, 3, .{ .x = 10, .y = 35 }));
+}
+
+test "measurePopupContentWidth: max measure を返す" {
+    const items = [_]PopupItem{
+        .{ .label = "ab" }, // 16
+        .{ .label = "abcd" }, // 32
+        .{ .label = "a" }, // 8
+    };
+    const w = measurePopupContentWidth(font_mod.default_font, &items);
+    try std.testing.expectEqual(@as(i32, 32), w);
 }
 
 // ── popupMenu: Context 統合 ──────────────────────────────
@@ -457,6 +554,39 @@ test "popupMenu: 画面端近くで開いてもメニュー矩形が画面内に
     const bg = ctx.draw_list.cmds.items[ctx.draw_list.cmds.items.len - 5].rect_filled.rect;
     try std.testing.expect(@as(i64, bg.x) + bg.w <= 100);
     try std.testing.expect(@as(i64, bg.y) + bg.h <= 100);
+}
+
+test "popupMenu: 長文 item を 100x100 で開いても outer が viewport 内に収まる" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(100, 100);
+    ctx.endFrame();
+
+    // default font advance≈8 → 40 文字で content_w≈320 ≫ 100
+    const long = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const long_items = [_]PopupItem{
+        .{ .label = long },
+        .{ .label = "B" },
+        .{ .label = "C" },
+    };
+    ctx.openPopup(1, .{ .x = 10, .y = 10 });
+    const result = ctx.popupMenu(1, &long_items);
+    try std.testing.expect(result.open);
+
+    // 背景 rect（最初の rect_filled）が [0,100)×[0,100) 内
+    const bg = ctx.draw_list.cmds.items[0].rect_filled.rect;
+    try std.testing.expectEqual(@as(u32, 100), bg.w);
+    try std.testing.expect(@as(i64, bg.x) + bg.w <= 100);
+    try std.testing.expect(@as(i64, bg.y) + bg.h <= 100);
+    try std.testing.expect(bg.x >= 0);
+    try std.testing.expect(bg.y >= 0);
+
+    // 可視 item は hit、outer 外は hit しない
+    const content_w = measurePopupContentWidth(ctx.font, &long_items);
+    const geo = layoutPopup(.{ .x = 10, .y = 10 }, 3, content_w, 20, 4, 100, 100);
+    try std.testing.expectEqual(@as(u32, 100), geo.outer.w);
+    try std.testing.expectEqual(@as(?usize, 0), hitTestItem(geo, 3, .{ .x = 20, .y = 20 }));
+    try std.testing.expectEqual(@as(?usize, null), hitTestItem(geo, 3, .{ .x = 150, .y = 20 }));
 }
 
 test "popupMenu: label に一時バッファを渡しても呼び出し後の書き換えに影響されない（arena dupe）" {

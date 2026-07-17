@@ -14,6 +14,15 @@
 //   buttonBehavior を呼び、結果を同期返却する。endFrame は hit-test をしない。
 //   layout 変化フレームのみ 1 フレーム遅延が出るが、静的レイアウトでは不可視。
 //
+// clip / hit-test 可視契約（TASK-130）:
+//   - cached `clip` は祖先の clip_children を反映した effective clip（描画 pushClip と同じ境界）。
+//   - ノード自身の clip_children は自身ではなく子に適用される。
+//   - clip_children=false の overflow は描画・hit-test ともに許可（親 rect 外でも ancestor clip 内なら可）。
+//   - clip_children=true の範囲外は描画・hit-test ともに不可。
+//   - zero-size effective clip は不可視かつ hit-test 不可。
+//   - 判定は pointHitsVisible(rect, clip, p)。active drag capture は clip 外でも維持し、
+//     release 時の click だけ可視領域内で成立させる。
+//
 // draw 発行順: フレーム中に caller が直接 draw_list へ積んだ cmd の後に layout 分が
 // append される（= レイアウト UI が上に描かれる）。
 
@@ -57,8 +66,10 @@ pub const PopupItem = popup_mod.PopupItem;
 pub const PopupResult = popup_mod.PopupResult;
 pub const stepgrid = stepgrid_mod;
 
-/// rect キャッシュのエントリ。clip は祖先の clip_children を intersect 済みの有効クリップで、
-/// buttonBehavior(ctx, id, rect, clip) にそのまま渡せる（21.5 の widget hit-test 用）。
+/// rect キャッシュのエントリ。
+/// `clip` は祖先の `clip_children` を intersect 済みの effective clip（描画の pushClip 境界と一致）。
+/// ノード自身の `clip_children` はここには入らず、子へ渡す child_clip にだけ効く。
+/// `buttonBehavior` / TextInput / SelectableLabel は `pointHitsVisible(rect, clip, p)` で共有判定する。
 pub const CachedRect = struct { rect: Rect, clip: Rect, measured_w: i32 = 0, measured_h: i32 = 0 };
 
 /// scroll area の begin→end 間で持ち越す内部状態（TASK-46）。begin で前フレーム cache から
@@ -400,8 +411,14 @@ pub const Context = struct {
         layout.appendChild(parent, node);
     }
 
-    /// 明示 ID ノードの {rect, clip} を登録（行きがけ DFS）。clip は祖先の clip_children を
-    /// intersect した有効クリップ（自ノードの clip_children は子にのみ効く）。
+    /// 明示 ID ノードの {rect, clip} を登録（行きがけ DFS）。
+    ///
+    /// `clip` 引数 = 祖先由来の effective clip（このノード自身の描画・hit-test に使う）。
+    /// 子へ渡す clip:
+    ///   - `clip_children=true`  → `intersect(clip, node.rect)`（親 rect 外は不可視・hit 不可）
+    ///   - `clip_children=false` → `clip` のまま（overflow 描画・hit を許可。zero-size 親でも
+    ///     子は ancestor clip 内なら hit 可）
+    /// `emitNode` の pushClip 境界と同じ定義（cached clip ↔ draw clip の対応）。
     fn updateRectCache(self: *Context, node: *const layout.Node, clip: Rect) void {
         if (node.cfg.id != 0) {
             const gop = self.rect_cache.getOrPut(self.gpa, node.cfg.id) catch
@@ -415,9 +432,11 @@ pub const Context = struct {
         while (it) |c| : (it = c.next_sibling) self.updateRectCache(c, child_clip);
     }
 
-    /// draw cmd 発行（行きがけ DFS）: bg → (clip_children なら pushClip) → 子 / leaf →
-    /// popClip → border。border は枠が子の上に乗るよう最後に発行する（自ノードの
-    /// clip_children は子にのみ効くため、border は popClip 後 = 祖先 clip で発行）。
+    /// draw cmd 発行（行きがけ DFS）: bg → (clip_children なら pushClip(node.rect)) → 子 / leaf →
+    /// popClip → border。
+    /// `pushClip(node.rect)` は draw_list が祖先 clip と intersect するため、結果の焼き込み clip は
+    /// `updateRectCache` が子へ渡す `child_clip = intersect(ancestor, node.rect)` と同じ境界になる。
+    /// border は popClip 後（= 祖先 clip）で発行し、子の上に枠が乗る。
     fn emitNode(self: *Context, node: *const layout.Node) void {
         if (node.leaf) |leaf| {
             switch (leaf) {
@@ -453,8 +472,24 @@ pub const ButtonResult = struct {
     held: bool = false,
 };
 
+/// 点が widget の可視 hit 領域内か（`rect ∩ clip` に含まれることと等価）。
+///
+/// - effective clip の外側は描画と同様に hit-test 不可
+/// - zero-size rect / clip（w=0 or h=0）は常に false → hover / press acquire / click なし
+/// - `clip_children=false` の overflow 子は ancestor clip を clip に載せる（親 rect 外でも可）
+/// - ScrollArea 等の部分見切れは viewport clip 内の部分だけ true
+///
+/// buttonBehavior・TextInput・SelectableLabel が共有する単一の正。
+pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
+    return rect.contains(p) and clip.contains(p);
+}
+
 /// Dear ImGui 流の同期 hit-test + button state machine（Description 修正版 v2）。
-/// rect / clip は呼び出し側が渡す（21.2 は layout を持たないため）。
+/// rect / clip は呼び出し側が渡す（前フレーム rect_cache の rect/clip、または手動）。
+///
+/// active drag capture: press で active を取得したあと、clip/rect 外へドラッグしても
+/// active は奪わない。release 時の click は `pointHitsVisible`（= 可視領域内）のときだけ成立。
+/// TextInput 範囲選択・slider・ScrollArea thumb のドラッグを壊さないための契約。
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
     std.debug.assert(ctx.frame_active);
     // モーダル吸収（TASK-79.1）: popup 表示中は背後 widget の hover/hot/active 取得を
@@ -466,7 +501,7 @@ pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResul
     if (ctx.popup_state != null) return .{};
 
     const mp = ctx.input.mouse_pos;
-    const hovered_now = rect.contains(mp) and clip.contains(mp);
+    const hovered_now = pointHitsVisible(rect, clip, mp);
     var result: ButtonResult = .{};
     result.hovered = hovered_now;
 
@@ -478,17 +513,17 @@ pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResul
         ctx.state.this_frame_hovered_any = true;
     }
 
-    // 2. acquire active。press 起点（down した瞬間の座標 = mouse_pressed_pos）が rect 内の
-    //    ときのみ。フレーム最終位置 mouse_pos ではなく起点を使うことで、同フレーム内の
-    //    「外で down → 内へ move」での誤取得を防ぐ（mouse_pressed_pos を持たせた理由）。
+    // 2. acquire active。press 起点（down した瞬間の座標 = mouse_pressed_pos）が
+    //    可視領域内のときのみ。フレーム最終位置 mouse_pos ではなく起点を使うことで、
+    //    同フレーム内の「外で down → 内へ move」での誤取得を防ぐ。
     if (ctx.state.active_id == 0 and ctx.input.mouse_pressed.left) {
-        const pp = ctx.input.mouse_pressed_pos;
-        if (rect.contains(pp) and clip.contains(pp)) {
+        if (pointHitsVisible(rect, clip, ctx.input.mouse_pressed_pos)) {
             ctx.state.active_id = id;
         }
     }
 
-    // 3. hold / release（release edge で active 解除 + up 時に hover 内なら click 確定）
+    // 3. hold / release。active 中は clip 外ドラッグでも held を維持（drag capture）。
+    //    release edge で active 解除 + up 時に可視 hover 内なら click 確定。
     if (ctx.state.active_id == id) {
         result.held = true;
         ctx.state.active_submitted = true; // 張り付き防止: 当フレームに評価された印
@@ -564,6 +599,192 @@ test "buttonBehavior: clip 外なら hover/click しない" {
     try std.testing.expect(!r.hovered);
     try std.testing.expect(!ctx.wantsMouse());
     ctx.endFrame();
+}
+
+// ── TASK-130: zero-size / overflow / partial clip / drag capture ──
+
+test "pointHitsVisible: zero-size clip は常に false" {
+    const rect = Rect{ .x = 0, .y = 0, .w = 24, .h = 24 };
+    const zero_w = Rect{ .x = 0, .y = 0, .w = 0, .h = 100 };
+    const zero_h = Rect{ .x = 0, .y = 0, .w = 100, .h = 0 };
+    try std.testing.expect(!pointHitsVisible(rect, zero_w, .{ .x = 5, .y = 5 }));
+    try std.testing.expect(!pointHitsVisible(rect, zero_h, .{ .x = 5, .y = 5 }));
+    try std.testing.expect(!pointHitsVisible(zero_w, full_clip, .{ .x = 0, .y = 5 }));
+}
+
+test "pointHitsVisible: rect∩clip の部分見切れだけ true" {
+    // ScrollArea 相当: widget rect は [0,100)×[0,40)、viewport clip は [0,100)×[0,20)
+    const rect = Rect{ .x = 0, .y = 0, .w = 100, .h = 40 };
+    const vp_clip = Rect{ .x = 0, .y = 0, .w = 100, .h = 20 };
+    try std.testing.expect(pointHitsVisible(rect, vp_clip, .{ .x = 10, .y = 10 })); // 可視
+    try std.testing.expect(!pointHitsVisible(rect, vp_clip, .{ .x = 10, .y = 30 })); // rect 内だが clip 外
+    try std.testing.expect(!pointHitsVisible(rect, vp_clip, .{ .x = 10, .y = 50 })); // 両方外
+}
+
+test "pointHitsVisible: overflow 許可（clip_children=false）= ancestor clip 内なら親 rect 外でも可" {
+    // 親は zero-size で clip を作らない → 子 clip = screen。子 rect は 24x24 で hit 可。
+    const child = Rect{ .x = 4, .y = 508, .w = 24, .h = 24 };
+    try std.testing.expect(pointHitsVisible(child, full_clip, .{ .x = 10, .y = 520 }));
+    // ancestor clip が狭いと overflow 子もその外は不可
+    const narrow = Rect{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    try std.testing.expect(!pointHitsVisible(child, narrow, .{ .x = 10, .y = 520 }));
+}
+
+test "buttonBehavior: zero-size clip 内では hover/press/click しない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const zero_clip = Rect{ .x = 0, .y = 0, .w = 0, .h = 50 };
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    const r = buttonBehavior(&ctx, 1, btn_rect, zero_clip);
+    try std.testing.expect(!r.hovered);
+    try std.testing.expect(!r.held);
+    try std.testing.expect(!r.clicked);
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.active_id);
+    ctx.endFrame();
+}
+
+test "buttonBehavior: 部分見切れ clip は可視部分だけ hover/click" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const rect = Rect{ .x = 0, .y = 0, .w = 100, .h = 40 };
+    const vp_clip = Rect{ .x = 0, .y = 0, .w = 100, .h = 20 };
+
+    // 可視部分で click 成立
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    try std.testing.expect(buttonBehavior(&ctx, 1, rect, vp_clip).clicked);
+    ctx.endFrame();
+
+    // rect 内だが clip 外では press 不可
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 30, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 30, .button = 0, .modifiers = 0 } });
+    const r = buttonBehavior(&ctx, 2, rect, vp_clip);
+    try std.testing.expect(!r.hovered);
+    try std.testing.expect(!r.held);
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.active_id);
+    ctx.endFrame();
+}
+
+test "buttonBehavior: active drag は clip 外でも capture 維持・clip 外 release は click しない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 1;
+    const rect = Rect{ .x = 0, .y = 0, .w = 100, .h = 50 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 100, .h = 50 };
+
+    // frame1: 可視内 press → active
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    try std.testing.expect(buttonBehavior(&ctx, id, rect, clip).held);
+    try std.testing.expectEqual(id, ctx.state.active_id);
+    ctx.endFrame();
+
+    // frame2: clip 外へ drag → held 維持（capture を失わない）
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 200, .y = 200, .modifiers = 0 } });
+    const mid = buttonBehavior(&ctx, id, rect, clip);
+    try std.testing.expect(mid.held);
+    try std.testing.expect(!mid.hovered);
+    try std.testing.expectEqual(id, ctx.state.active_id);
+    ctx.endFrame();
+
+    // frame3: clip 外で release → click なし・active 解除
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 200, .y = 200, .button = 0, .modifiers = 0 } });
+    const up = buttonBehavior(&ctx, id, rect, clip);
+    try std.testing.expect(!up.clicked);
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.active_id);
+    ctx.endFrame();
+}
+
+test "rect_cache: clip_children=false の zero-size 親でも子 clip は ancestor のまま" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const parent_id: Id = 10;
+    const child_id: Id = 11;
+
+    ctx.beginFrame(800, 600);
+    // zero-size 親（clip_children 既定 false）→ 子は overflow 配置可能
+    ctx.beginBox(.{ .id = parent_id, .width = .{ .fixed = 0 }, .height = .{ .fixed = 0 } });
+    ctx.beginBox(.{ .id = child_id, .width = .{ .fixed = 24 }, .height = .{ .fixed = 24 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const parent = ctx.rect_cache.get(parent_id).?;
+    const child = ctx.rect_cache.get(child_id).?;
+    try std.testing.expectEqual(@as(u32, 0), parent.rect.w);
+    try std.testing.expectEqual(@as(u32, 0), parent.rect.h);
+    try std.testing.expectEqual(@as(u32, 24), child.rect.w);
+    try std.testing.expectEqual(@as(u32, 24), child.rect.h);
+    // 子の clip は screen（親 zero と intersect されていない）
+    try std.testing.expectEqual(@as(u32, 800), child.clip.w);
+    try std.testing.expectEqual(@as(u32, 600), child.clip.h);
+    try std.testing.expect(pointHitsVisible(child.rect, child.clip, .{
+        .x = child.rect.x + 1,
+        .y = child.rect.y + 1,
+    }));
+}
+
+test "rect_cache: clip_children=true の zero-size 親は子 clip が空" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const parent_id: Id = 20;
+    const child_id: Id = 21;
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .id = parent_id,
+        .width = .{ .fixed = 0 },
+        .height = .{ .fixed = 0 },
+        .clip_children = true,
+    });
+    ctx.beginBox(.{ .id = child_id, .width = .{ .fixed = 24 }, .height = .{ .fixed = 24 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const child = ctx.rect_cache.get(child_id).?;
+    try std.testing.expect(child.clip.isEmpty() or child.clip.w == 0 or child.clip.h == 0);
+    try std.testing.expect(!pointHitsVisible(child.rect, child.clip, .{
+        .x = child.rect.x + 1,
+        .y = child.rect.y + 1,
+    }));
+}
+
+test "rect_cache: clip_children=true の部分見切れ子は viewport 交差 clip" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const vp_id: Id = 30;
+    const item_id: Id = 31;
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .id = vp_id,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 20 },
+        .clip_children = true,
+    });
+    // 親より高い子（部分見切れ）
+    ctx.beginBox(.{ .id = item_id, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const item = ctx.rect_cache.get(item_id).?;
+    try std.testing.expectEqual(@as(u32, 40), item.rect.h);
+    // child clip = intersect(screen, parent.rect) → h=20
+    try std.testing.expectEqual(@as(u32, 20), item.clip.h);
+    try std.testing.expect(pointHitsVisible(item.rect, item.clip, .{ .x = item.rect.x + 1, .y = item.rect.y + 1 }));
+    try std.testing.expect(!pointHitsVisible(item.rect, item.clip, .{ .x = item.rect.x + 1, .y = item.rect.y + 30 }));
 }
 
 test "Context.wantsMouse: hover 開始フレームから true" {
