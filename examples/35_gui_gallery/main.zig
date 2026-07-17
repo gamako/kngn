@@ -163,6 +163,9 @@ const App = struct {
     scroll: gui.Vec2f = .{},
     menu: gui.MenuBarState = .{},
     text: *gui.TextBuffer,
+    // Cmd+V のフレームローカル paste（TASK-120 consumer 配線。event loop で set・frame 先頭で clear）
+    paste_buf: [4096]u8 = undefined,
+    paste_text: ?[]const u8 = null,
 
     fn current(self: *const App) Section {
         return @enumFromInt(self.section);
@@ -321,7 +324,7 @@ fn renderBasic(ctx: *gui.Context, app: *App) void {
 }
 
 fn renderText(ctx: *gui.Context, app: *App) void {
-    const input = ctx.textInputId(Ids.text_input, app.text, .{ .width = .{ .fixed = 320 }, .placeholder = "empty" });
+    const input = ctx.textInputId(Ids.text_input, app.text, .{ .width = .{ .fixed = 320 }, .placeholder = "empty", .paste_text = app.paste_text });
     const selectable = ctx.selectableLabelId(Ids.selectable, "Selectable label (drag)", .{});
     // Cmd+C/X を実クリップボードへ（TASK-120 の consumer 配線。example_28 と同型）
     if (input.copy_request) |r| platform.setClipboardText(r.text);
@@ -472,7 +475,14 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, 0xFF_18_1C_24);
         ctx.beginFrame(fb.width, fb.height);
 
+        app.paste_text = null;
         while (window.nextEvent()) |ev| {
+            if (ev == .key_down) {
+                const pk = ev.key_down;
+                if (pk.key == .V and pk.modifiers.cmd and !pk.modifiers.ctrl and !pk.modifiers.alt and !pk.is_repeat) {
+                    app.paste_text = platform.getClipboardText(app.paste_buf[0..]);
+                }
+            }
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| switch (k.key) {
