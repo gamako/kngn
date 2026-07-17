@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
     gamepad_mod.addImport("platform_types", platform_types);
     gfx.addImport("gamepad", gamepad_mod);
     gfx.addImport("platform_types", platform_types);
+    gfx.addImport("gmath", gmath); // TileMap 衝突（TASK-111.5。additive）
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_33_camera",
@@ -103,6 +104,8 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
+            // gfx(action_map) と同一 gamepad instance（TASK-111.8 / 111.5: dual module 回避）
+            .gamepad = gamepad_mod,
         },
     });
 }

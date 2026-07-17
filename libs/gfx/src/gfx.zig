@@ -1,8 +1,8 @@
-//! libs/gfx umbrella（TASK-111.2 / TASK-111.3 / TASK-111.4 / TASK-111.8）。
-//! sprite / fixed_timestep / fps_counter / keyboard / atlas / animation / camera / action_map
+//! libs/gfx umbrella（TASK-111.2 / TASK-111.3 / TASK-111.4 / TASK-111.5 / TASK-111.8）。
+//! sprite / fixed_timestep / fps_counter / keyboard / atlas / animation / camera / action_map / tilemap
 //! を再エクスポートし、kit.gfx の公開面とする。
 //!
-//! atlas / animation / camera / action_map は同一 module 内の相対 import（`@import("atlas.zig")` 等）。
+//! atlas / animation / camera / action_map / tilemap は同一 module 内の相対 import（`@import("atlas.zig")` 等）。
 //! こうすると `zig test` が gfx root 経由で test を収集し、専用 runner を
 //! 増やさずに test-gfx へ接続できる（TASK-111.3/111.4 Claude 設計レビュー付記）。
 //! named module の sprite/helpers は `@import("sprite")` 等で受け取る
@@ -16,6 +16,7 @@ pub const atlas = @import("atlas.zig");
 pub const animation = @import("animation.zig");
 pub const camera = @import("camera.zig");
 pub const action_map = @import("action_map.zig");
+pub const tilemap = @import("tilemap.zig");
 
 pub const Sprite = sprite.Sprite;
 pub const drawSprite = sprite.drawSprite;
@@ -47,6 +48,14 @@ pub const GamepadButtonBinding = action_map.GamepadButtonBinding;
 pub const GamepadStickBinding = action_map.GamepadStickBinding;
 pub const KeyPairBinding = action_map.KeyPairBinding;
 
+pub const TileMap = tilemap.TileMap;
+pub const TileFlags = tilemap.TileFlags;
+pub const TileContact = tilemap.TileContact;
+pub const ResolveResult = tilemap.ResolveResult;
+pub const EmptyTile = tilemap.EmptyTile;
+pub const TileMapError = tilemap.TileMapError;
+pub const QueryIterator = tilemap.QueryIterator;
+
 pub const KeyCode = keyboard.KeyCode;
 pub const KeyInfo = keyboard.KeyInfo;
 pub const KeyboardState = keyboard.KeyboardState;
@@ -69,4 +78,5 @@ test {
     _ = animation;
     _ = camera;
     _ = action_map;
+    _ = tilemap;
 }

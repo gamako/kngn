@@ -78,6 +78,11 @@ pub const SpriteDrawOptions = struct {
     flip_y: bool = false,
     scale: u32 = 1,
     tint: RgbTint = .{},
+    /// true のとき `srcOverOpaque` 経路（dst 不透明前提の straight src-over）。
+    /// 既定 false = 従来の `blendPremul` 経路（既存呼び出しに bit 非影響）。
+    /// ソースが全画素 alpha=255 のとき両経路は bit 一致する（テストで固定）。
+    /// 注: `opaque` は Zig 予約語のため `@"opaque"`。
+    @"opaque": bool = false,
 };
 
 /// フレームバッファにスプライトを描画（クリッピング処理付き）
@@ -172,6 +177,7 @@ pub fn drawSpriteEx(
     const flip_y = opts.flip_y;
     const tint = opts.tint;
     const identity_tint = tint.r == 255 and tint.g == 255 and tint.b == 255;
+    const use_opaque = opts.@"opaque";
 
     var y: u32 = 0;
     while (y < clip.h) : (y += 1) {
@@ -194,12 +200,20 @@ pub fn drawSpriteEx(
                 const dst_chunk: *[4]u32 = framebuffer[dst_row_base + x ..][0..4];
                 const sv: pixelops.Vec16u8 = @bitCast(local_buf);
                 const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
-                dst_chunk.* = @bitCast(pixelops.blendPremul4(dv, sv));
+                if (use_opaque) {
+                    dst_chunk.* = @bitCast(pixelops.srcOverOpaque4(dv, sv));
+                } else {
+                    dst_chunk.* = @bitCast(pixelops.blendPremul4(dv, sv));
+                }
             }
             while (x < clip.w) : (x += 1) {
                 var px = sprite.image.pixels[src_row_base + src_x0 + x];
                 if (!identity_tint) px = applyTint1(px, tint);
-                framebuffer[dst_row_base + x] = pixelops.blendPremul(framebuffer[dst_row_base + x], px);
+                if (use_opaque) {
+                    framebuffer[dst_row_base + x] = pixelops.srcOverOpaque(framebuffer[dst_row_base + x], px);
+                } else {
+                    framebuffer[dst_row_base + x] = pixelops.blendPremul(framebuffer[dst_row_base + x], px);
+                }
             }
             continue;
         }
@@ -228,7 +242,11 @@ pub fn drawSpriteEx(
             const dst_chunk: *[4]u32 = framebuffer[dst_row_base + x ..][0..4];
             const sv: pixelops.Vec16u8 = @bitCast(local_buf);
             const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
-            dst_chunk.* = @bitCast(pixelops.blendPremul4(dv, sv));
+            if (use_opaque) {
+                dst_chunk.* = @bitCast(pixelops.srcOverOpaque4(dv, sv));
+            } else {
+                dst_chunk.* = @bitCast(pixelops.blendPremul4(dv, sv));
+            }
         }
         while (x < clip.w) : (x += 1) {
             const sx: u32 = if (flip_x)
@@ -237,7 +255,11 @@ pub fn drawSpriteEx(
                 src.x + ux;
             var px = sprite.image.pixels[src_row_base + sx];
             if (!identity_tint) px = applyTint1(px, tint);
-            framebuffer[dst_row_base + x] = pixelops.blendPremul(framebuffer[dst_row_base + x], px);
+            if (use_opaque) {
+                framebuffer[dst_row_base + x] = pixelops.srcOverOpaque(framebuffer[dst_row_base + x], px);
+            } else {
+                framebuffer[dst_row_base + x] = pixelops.blendPremul(framebuffer[dst_row_base + x], px);
+            }
             copies_left -= 1;
             if (copies_left == 0) {
                 ux += 1;
@@ -312,7 +334,11 @@ fn drawSpriteExScalarRef(
             var px = s.image.pixels[src_row * img_w + sx];
             if (!identity_tint) px = applyTint1(px, opts.tint);
             const di = (clip.dst_y + y) * fb_width + (clip.dst_x + x);
-            framebuffer[di] = pixelops.blendPremul(framebuffer[di], px);
+            if (opts.@"opaque") {
+                framebuffer[di] = pixelops.srcOverOpaque(framebuffer[di], px);
+            } else {
+                framebuffer[di] = pixelops.blendPremul(framebuffer[di], px);
+            }
         }
     }
 }
@@ -593,4 +619,77 @@ test "applyTint4 matches applyTint1 per lane" {
     for (&expected) |*p| p.* = applyTint1(p.*, tint);
     applyTint4(&buf, tint);
     try testing.expectEqualSlices(u32, &expected, &buf);
+}
+
+test "drawSpriteEx opaque path bit-matches blendPremul for fully opaque src" {
+    // TileFlags.opaque 前提: 全画素 alpha=255 のとき opaque=true/false は bit 一致。
+    const allocator = testing.allocator;
+    const widths = [_]u32{ 1, 3, 4, 5, 7, 8, 11, 16 };
+
+    for (widths) |w| {
+        const fb_w: u32 = w + 4;
+        const fb_h: u32 = 5;
+        var s = try makeTestSprite(allocator, w, 4, 0);
+        defer allocator.free(s.image.pixels);
+        // 全画素 alpha=255 の premul
+        for (s.image.pixels) |*p| {
+            p.* = makePremulPixel(40, 80, 120, 255);
+        }
+        s.x = 1;
+        s.y = 1;
+
+        const fb_blend = try allocator.alloc(u32, fb_w * fb_h);
+        defer allocator.free(fb_blend);
+        const fb_opaque = try allocator.alloc(u32, fb_w * fb_h);
+        defer allocator.free(fb_opaque);
+        @memset(fb_blend, 0xFF303030);
+        @memset(fb_opaque, 0xFF303030);
+
+        drawSpriteEx(fb_blend, fb_w, fb_h, &s, .{ .@"opaque" = false });
+        drawSpriteEx(fb_opaque, fb_w, fb_h, &s, .{ .@"opaque" = true });
+
+        testing.expectEqualSlices(u32, fb_blend, fb_opaque) catch |err| {
+            std.debug.print("opaque bit-match fail width={d}\n", .{w});
+            return err;
+        };
+    }
+}
+
+test "drawSpriteEx opaque SIMD path matches scalar reference" {
+    const allocator = testing.allocator;
+    const fb_w: u32 = 20;
+    const fb_h: u32 = 16;
+    var s = try makeTestSprite(allocator, 11, 9, 0);
+    defer allocator.free(s.image.pixels);
+    for (s.image.pixels, 0..) |*p, i| {
+        p.* = makePremulPixel(
+            @truncate(50 + i),
+            @truncate(80 + i * 2),
+            @truncate(100 + i * 3),
+            255,
+        );
+    }
+
+    const cases = [_]SpriteDrawOptions{
+        .{ .@"opaque" = true },
+        .{ .@"opaque" = true, .scale = 2 },
+        .{ .@"opaque" = true, .flip_x = true },
+        .{ .@"opaque" = true, .flip_y = true, .scale = 2 },
+        .{ .@"opaque" = true, .src = .{ .x = 1, .y = 1, .w = 6, .h = 5 }, .scale = 2 },
+    };
+
+    for (cases) |opts| {
+        s.x = -2;
+        s.y = 1;
+        const fb_simd = try allocator.alloc(u32, fb_w * fb_h);
+        defer allocator.free(fb_simd);
+        const fb_ref = try allocator.alloc(u32, fb_w * fb_h);
+        defer allocator.free(fb_ref);
+        @memset(fb_simd, 0xFF202020);
+        @memset(fb_ref, 0xFF202020);
+
+        drawSpriteEx(fb_simd, fb_w, fb_h, &s, opts);
+        drawSpriteExScalarRef(fb_ref, fb_w, fb_h, &s, opts);
+        try testing.expectEqualSlices(u32, fb_ref, fb_simd);
+    }
 }

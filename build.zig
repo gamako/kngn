@@ -478,6 +478,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_33", .path = "examples/33_camera/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_34", .path = "examples/34_action_map/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_36", .path = "examples/36_tilemap/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -493,7 +494,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.startsWith(u8, example.name, "example_26"),
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
@@ -1497,6 +1498,7 @@ pub fn build(b: *std.Build) void {
     gfx_test_root.addImport("keyboard", gfx_test_keyboard);
     gfx_test_root.addImport("gamepad", gfx_test_gamepad);
     gfx_test_root.addImport("platform_types", shared_modules.types.mod);
+    gfx_test_root.addImport("gmath", shared_modules.gmath.mod); // TileMap（TASK-111.5）
     const gfx_test = b.addTest(.{ .root_module = gfx_test_root });
     const run_gfx_test = b.addRunArtifact(gfx_test);
     const run_gfx_ft_test = b.addRunArtifact(b.addTest(.{ .root_module = gfx_test_ft }));
@@ -2370,6 +2372,7 @@ const SharedModules = struct {
         gfx.mod.addImport("keyboard", keyboard_mod);
         link(gfx, gamepad); // ActionMap の gamepad button/stick 評価（TASK-111.8）
         link(gfx, types); // action_map の MAX_GAMEPADS（type-only core）
+        link(gfx, gmath); // TileMap 衝突クエリ（TASK-111.5）
 
         // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
         // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png に依存。
@@ -2590,7 +2593,7 @@ const ExampleNeeds = struct {
     needs_midi: bool, // TASK-115.1（examples/29_midi_monitor のみ true）
     needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
     needs_sound: bool, // TASK-111.6（examples/30_sound_demo のみ true）
-    needs_kit: bool = false, // TASK-111.2/111.3/111.4/111.8（example_31/32/33/34）/ example_26
+    needs_kit: bool = false, // TASK-111.2/111.3/111.4/111.5/111.8（example_31/32/33/34/36）/ example_26
 };
 
 // ============================================================
