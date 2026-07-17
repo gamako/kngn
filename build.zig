@@ -481,6 +481,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_36", .path = "examples/36_tilemap/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_37", .path = "examples/37_gui_torture/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_39", .path = "examples/39_settings_shell/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_40", .path = "examples/40_list_menu/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -2015,6 +2016,43 @@ pub fn build(b: *std.Build) void {
     const bench_gui_frame_exe = b.addExecutable(.{ .name = "bench_gui_frame", .root_module = bench_gui_frame_root });
     const bench_gui_frame_step = b.step("bench-gui-frame", "Run GUI full Context frame benchmark 500/1000 rows (ReleaseFast)");
     bench_gui_frame_step.dependOn(&b.addRunArtifact(bench_gui_frame_exe).step);
+
+    // bench-gui-list-menu（TASK-121.4）: list/menu shell 500 行 full Context frame（ReleaseFast 固定）
+    // menuBar が command_types を要するため、bench_gui_mod とは別に gui module を組む。
+    const bench_list_menu_cmd = b.createModule(.{
+        .root_source_file = b.path("core/command_types.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_list_menu_cmd.addImport("platform_types", b.createModule(.{
+        .root_source_file = b.path("core/platform_types.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const bench_list_menu_gui = b.createModule(.{
+        .root_source_file = b.path("libs/gui/src/gui.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_list_menu_gui.addImport("font", bench_font_mod);
+    bench_list_menu_gui.addImport("pixelops", bench_pixelops_mod);
+    bench_list_menu_gui.addImport("command_types", bench_list_menu_cmd);
+    const bench_list_menu_ui = b.createModule(.{
+        .root_source_file = b.path("examples/40_list_menu/ui.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_list_menu_ui.addImport("gui", bench_list_menu_gui);
+    const bench_gui_list_menu_root = b.createModule(.{
+        .root_source_file = b.path("bench/gui_list_menu.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_gui_list_menu_root.addImport("gui", bench_list_menu_gui);
+    bench_gui_list_menu_root.addImport("list_menu_ui", bench_list_menu_ui);
+    const bench_gui_list_menu_exe = b.addExecutable(.{ .name = "bench_gui_list_menu", .root_module = bench_gui_list_menu_root });
+    const bench_gui_list_menu_step = b.step("bench-gui-list-menu", "Run GUI list/menu shell full Context frame benchmark 500 rows (ReleaseFast)");
+    bench_gui_list_menu_step.dependOn(&b.addRunArtifact(bench_gui_list_menu_exe).step);
 
     // bench-blit（TASK-54）: pixie の canvas zoom 転送 + チェッカー背景（新旧比較を同時計測）
     const bench_blit_core = b.createModule(.{

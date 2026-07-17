@@ -219,3 +219,37 @@ examples/35_gui_gallery/e2e.txt は各 section で digest gallery と path 省�
 
 - Nested ScrollArea wheel・PerIdStateStore 上限・TextBuffer 最大長などは本シェルでは再起票しない。
 - 設定画面は section ごとに独立 ScrollArea 1 本で、nested wheel 問題は再現経路に含めなかった。
+
+## 15. TASK-121.4 観測（リスト + メニュー shell）
+
+証拠 example: `examples/40_list_menu`（probe: `state` / `layout`、E2E: `e2e.sh` 7 シナリオ、port 9230–9239）。
+bench: `zig build bench-gui-list-menu`（500 行 full Context frame、ReleaseFast、1024×768）。
+libs/gui 本体は変更していない。不足は example 側 custom/hack または Missing として記録する。
+
+### 15.1 観測結果（Missing 完全リスト）
+
+1. **500 行 full Context frame 時間** — 毎フレーム全行を `selectableLabelId` 付きで構築する。`bench-gui-list-menu` で avg/min/p95 を計測（既存 `bench-gui-frame` の 500 行値と対比）。virtualization なし。
+2. **Listbox 専用 semantics なし** — `selectableLabelId` はテキスト選択用であり、単一行 listbox の選択モデルではない。行選択・ハイライトは app 側 state（`selected_row` / `active_row`）で管理。
+3. **List keyboard navigation API なし** — 上下キーによる active row 移動は app が `key_down UP/DOWN` を処理する custom 実装。popup 表示中は list ナビを抑制。
+4. **Checkbox 付き persistent multi-select popup なし** — `PopupItem` に checked 状態がない。filter は `[on]/[off]` ラベル生成 + 項目選択で閉じる API 挙動を app が再オープンして複数選択を再現（`filter_reopen_count`）。
+5. **popup 同時表示数 1 件** — `PopupState` は同時 1 つのみ。menuBar と context/filter は同時保持できない。E2E シナリオ 7 で File menu 表示中に row 右クリックしても `popup_count=1` のまま（観測値: 右クリック後も menu が popup を保持／context は置換しきれない、または次フレームで menu が再確保）。menu と context の重ね合わせは不可。
+6. **Ellipsis 標準 API なし** — 長い filename の省略は app が `font.measure` で幅を見て `...` を付与。独自 rasterizer / `DrawList` 直接操作は行わない。
+7. **Virtualization API なし** — 500 行を毎フレーム全構築・全 layout。スクロールは `beginScrollArea` のみ。
+8. **複数行選択・ドラッグ選択なし** — 本画面は単一選択のみ。probe で `multi_select=0` / `drag_select=0` を明示。
+9. **Toolbar 専用 API なし** — Back / New / Refresh は `buttonId` 列として構築。
+10. **Table / column / tree view なし** — リストは row box + kind label + selectableLabel + detail の手組み。列レイアウト・ツリーは提供されない。
+
+### 15.2 custom / hack 計数（example 側）
+
+| 種別 | 件数 | 内容 |
+|---|---:|---|
+| row hit-test + 単一選択 glue | 1 | 右/左クリックで `getNodeCachedRect` により行選択 |
+| filter popup 再オープン | 1 | 選択後 `filter_open_request` で次フレーム再 open |
+| keyboard 上下ナビ | 1 | `UP`/`DOWN` → `navigateRows` |
+| ellipsis 文字列生成 | 1 | `ellipsize` + frame arena |
+| menu/context 切替制御 | 1 | context 開要求を menuBarPopup 後に適用、right-press を gui へ渡さない |
+| custom draw | 0 | `ctx.custom` / DrawList 直操作 / 独自 rasterizer なし |
+
+### 15.3 サイズ別確認
+
+640×360 / 1024×768 / 1440×900 を別プロセスで起動し `snapshot fb`（path 省略）で目視。padding/gap は幅に応じて調整、固定絶対配置は使わない。
