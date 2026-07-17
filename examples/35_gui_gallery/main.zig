@@ -53,34 +53,34 @@ const MatrixRow = struct {
 };
 
 const BASIC_MATRIX = [_]MatrixRow{
-    .{ .name = "button", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "✓", "N/A", "N/A", "N/A" } },
-    .{ .name = "label", .cells = .{ "✓", "N/A", "N/A", "N/A", "N/A", "✓", "N/A", "N/A", "N/A" } },
+    .{ .name = "button", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "label", .cells = .{ "ok", "N/A", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
 };
 const TEXT_MATRIX = [_]MatrixRow{
-    .{ .name = "selectableLabel", .cells = .{ "✓", "N/A", "drag", "✓", "N/A", "✓", "N/A", "N/A", "✓" } },
-    .{ .name = "textInputId", .cells = .{ "✓", "demo", "demo", "✓", "N/A", "✓", "N/A", "N/A", "✓" } },
+    .{ .name = "selectable", .cells = .{ "ok", "N/A", "drag", "ok", "N/A", "ok", "N/A", "N/A", "ok" } },
+    .{ .name = "textInputId", .cells = .{ "ok", "demo", "demo", "ok", "N/A", "ok", "N/A", "N/A", "ok" } },
 };
 const VALUES_MATRIX = [_]MatrixRow{
-    .{ .name = "slider i32/f32", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "N/A", "✓", "✓", "N/A" } },
-    .{ .name = "checkbox", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "✓", "N/A", "N/A", "N/A" } },
-    .{ .name = "toggle", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "✓", "N/A", "N/A", "N/A" } },
-    .{ .name = "radio", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "✓", "N/A", "N/A", "✓" } },
+    .{ .name = "slider", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
+    .{ .name = "checkbox", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "toggle", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "radio", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "ok" } },
 };
 const COLOR_MATRIX = [_]MatrixRow{
-    .{ .name = "colorSwatch", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "✓" } },
-    .{ .name = "SV / hue", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "N/A", "✓", "✓", "N/A" } },
-    .{ .name = "imageBox", .cells = .{ "✓", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A" } },
+    .{ .name = "colorSwatch", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
+    .{ .name = "SV / hue", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
+    .{ .name = "imageBox", .cells = .{ "ok", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A" } },
 };
 const LAYOUT_MATRIX = [_]MatrixRow{
-    .{ .name = "splitter", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "N/A", "✓", "✓", "N/A" } },
-    .{ .name = "scrollArea", .cells = .{ "✓", "demo", "demo", "N/A", "N/A", "N/A", "✓", "✓", "N/A" } },
+    .{ .name = "splitter", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
+    .{ .name = "scrollArea", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
 };
 const MENUS_MATRIX = [_]MatrixRow{
-    .{ .name = "popup/context", .cells = .{ "✓", "✓", "✓", "N/A", "✓ item", "N/A", "N/A", "N/A", "✓" } },
-    .{ .name = "menuBar", .cells = .{ "✓", "demo", "demo", "N/A", "✓ command", "N/A", "N/A", "N/A", "✓" } },
+    .{ .name = "popup/ctx", .cells = .{ "ok", "ok", "ok", "N/A", "item", "N/A", "N/A", "N/A", "ok" } },
+    .{ .name = "menuBar", .cells = .{ "ok", "demo", "demo", "N/A", "cmd", "N/A", "N/A", "N/A", "ok" } },
 };
 const STEPGRID_MATRIX = [_]MatrixRow{
-    .{ .name = "stepgrid", .cells = .{ "✓", "demo", "demo", "N/A", "partial", "✓", "N/A", "N/A", "✓" } },
+    .{ .name = "stepgrid", .cells = .{ "ok", "demo", "demo", "N/A", "part", "ok", "N/A", "N/A", "ok" } },
 };
 
 const MissingEntry = struct { name: []const u8, target: []const u8 };
@@ -267,7 +267,18 @@ fn matrixFor(section: Section) []const MatrixRow {
 }
 
 fn renderMatrix(ctx: *gui.Context, rows: []const MatrixRow) void {
-    ctx.labelEx("normal hover active focused disabled empty min max none", ctx.style.text_subtle);
+    // 列見出しはセル幅（34px=4文字強）に揃えた略記。正式名は overview の State axis 行を参照。
+    const HEADERS = [_][]const u8{ "norm", "hovr", "actv", "focs", "dsbl", "emp", "min", "max", "none" };
+    ctx.beginBox(.{ .direction = .row, .gap = 2 });
+    ctx.beginBox(.{ .width = .{ .fixed = 104 } });
+    ctx.labelEx("widget", ctx.style.text_subtle);
+    ctx.endBox();
+    for (HEADERS) |h| {
+        ctx.beginBox(.{ .width = .{ .fixed = 34 } });
+        ctx.labelEx(h, ctx.style.text_subtle);
+        ctx.endBox();
+    }
+    ctx.endBox();
     for (rows) |row| {
         ctx.beginBox(.{ .direction = .row, .gap = 2 });
         ctx.beginBox(.{ .width = .{ .fixed = 104 } });
@@ -424,7 +435,7 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
         ctx.endBox();
     } else {
         ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .gap = 16, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) });
-        ctx.beginBox(.{ .width = .{ .fixed = 620 }, .height = .{ .grow = 1 }, .gap = 10 });
+        ctx.beginBox(.{ .width = .{ .fixed = 500 }, .height = .{ .grow = 1 }, .gap = 10 });
         renderSection(ctx, app);
         ctx.endBox();
         ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF) });
