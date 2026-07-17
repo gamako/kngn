@@ -1,0 +1,119 @@
+# TASK-121.1 gallery replay
+# 1024x640 / Debug / gui.default_font / section=overview 初期
+# expect 値は 2026-07-17 headless replay の実測（digest gallery）を焼き込み。
+step 2
+digest gallery
+expect gallery section=overview
+expect gallery index=0
+expect gallery widgets=0
+expect gallery missing=15
+expect gallery schema=v0
+snapshot fb
+
+# overview -> basic
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=basic
+expect gallery index=1
+expect gallery widgets=2
+expect gallery missing=0
+snapshot fb
+
+# basic: hover / active representative
+inject mouse_move 96 112
+step 2
+digest gallery
+expect gallery hot=button
+snapshot fb
+inject mouse_down left
+step 1
+digest gallery
+expect gallery active=button
+snapshot fb
+inject mouse_up left
+step 1
+
+# basic -> text
+inject mouse_move 1000 620
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=text
+expect gallery widgets=2
+snapshot fb
+inject mouse_move 96 112
+inject mouse_down left
+inject mouse_up left
+step 1
+digest gallery
+expect gallery focused=textInputId
+snapshot fb
+inject mouse_move 1000 620
+
+# text -> values
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=values
+expect gallery widgets=4
+snapshot fb
+# values -> color
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=color
+expect gallery widgets=3
+snapshot fb
+# color -> layout
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=layout
+expect gallery widgets=2
+snapshot fb
+# layout -> menus
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=menus
+expect gallery widgets=2
+snapshot fb
+inject mouse_move 180 96
+step 2
+digest gallery
+snapshot fb
+inject mouse_move 1000 620
+# menus -> stepgrid
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=stepgrid
+expect gallery widgets=1
+snapshot fb
+# stepgrid -> missing
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=missing
+expect gallery index=8
+expect gallery widgets=15
+expect gallery missing=15
+snapshot fb
+quit
