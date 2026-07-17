@@ -15,6 +15,9 @@
 //! 入力（keyboard/mouse/scroll）は TASK-28.5.3、pixie/dialog は 28.5.4。本ファイルは quit のみ扱う。
 //! 設計の正は docs/plans/28.5-plan.md §2/§3.2/§3.4-3.6。
 //!
+//! TASK-113.4: `wl_data_device` の offer/receive 実装は行わない stub。
+//! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
+//!
 //! C-interop 規約: wayland/xdg/xkb ヘッダは bare struct（typedef 無し）のため、型は
 //! `c.struct_wl_*`/`c.struct_xdg_*`、関数/enum 定数は C 名そのまま（`c.wl_*`/`c.WL_SHM_FORMAT_*`）。
 //! 最終的な field 型・nullable・listener signature は Linux 実機の compile で確定する（macOS では

@@ -80,6 +80,7 @@ pub fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
         .gamepad_connected, .gamepad_disconnected => null,
         .composition_changed => null,
         .menu_command => null,
+        .file_drop => null,
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -233,4 +234,5 @@ test "toGuiEvent: pixie と同じ無視対象イベントは null" {
         .cursor = 0,
     } }) == null);
     try testing.expect(toGuiEvent(.{ .menu_command = 42 }) == null);
+    try testing.expect(toGuiEvent(.{ .file_drop = platform.makeFileDropEventFromPath("/tmp/a.png").? }) == null);
 }

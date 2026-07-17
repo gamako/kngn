@@ -236,7 +236,12 @@ typedef enum {
     PLATFORM_EVENT_GAMEPAD_DISCONNECTED, // ゲームパッド切断
     PLATFORM_EVENT_COMPOSITION,  // IME composition 状態変化 (TASK-79.6.1。末尾追加=後方互換)
     PLATFORM_EVENT_MENU_COMMAND, // native メニュー選択 (TASK-97.3。末尾追加=後方互換。payload=数値 Command ID)
+    PLATFORM_EVENT_FILE_DROP,    // OS ファイル drag & drop (TASK-113.4。末尾追加=後方互換。inline path)
 } PlatformEventType;
+
+// file drop path 上限（macOS PATH_MAX=1024。超過は reject。TASK-113.4）
+#define PLATFORM_FILE_DROP_PATH_BYTES 1024
+#define PLATFORM_FILE_DROP_MAX_PATHS 1
 
 // IME composition phase（TASK-79.6.1。Zig CompositionPhase と値一致）
 typedef enum {
@@ -432,6 +437,16 @@ typedef struct PlatformEvent {
         struct {
             uint32_t command_id;          // app の CommandId（数値）。TASK-97.3
         } menu;
+        // TASK-113.4: OS ファイル drop。bytes[0..len] が UTF-8 パス本体（NUL 終端は契約しない）。
+        // queue に積まれた PlatformEvent 自体がパス所有者。drag 用の解放関数は追加しない。
+        // count は 0 または 1（MVP は単一ファイル。複数同時 drop はイベント全体を reject）。
+        struct {
+            uint32_t count;
+            struct {
+                uint32_t len;
+                char bytes[PLATFORM_FILE_DROP_PATH_BYTES];
+            } paths[PLATFORM_FILE_DROP_MAX_PATHS];
+        } file_drop;
     } payload;
 } PlatformEvent;
 

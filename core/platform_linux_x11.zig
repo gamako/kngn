@@ -20,6 +20,9 @@
 //!
 //! 入力の純粋な変換（keycode→KeyCode / state→modifiers / EventQueue 合体 / KeyDownSet）は
 //! `platform_linux_input.zig`（@cImport しない純 Zig）に分離し、本ファイルは XEvent から値を取り出して呼ぶだけ。
+//!
+//! TASK-113.4: XDND（X Drag and Drop）の atom 登録・selection 通信は行わない stub。
+//! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
 
 const std = @import("std");
 const types = @import("platform_types");

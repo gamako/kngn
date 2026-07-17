@@ -10,6 +10,10 @@ import GameController
 //        FrameCallback typealias など) は bridging header (-import-objc-header
 //        platform/platform.h) 経由で C ヘッダから自動取得する。
 //
+// TASK-113.4: OS ファイル drag & drop の native 実装は Objective-C backend のみ。
+// 本 Metal backend は file URL drag destination を登録せず、file_drop event を生成しない stub。
+// PlatformEvent の enum/payload 拡張は platform.h 経由で自動追従し、ビルド緑を維持する。
+//
 // ========================================
 // 1級 frame pacing 契約（ADR-005 / TASK-36）
 // ========================================

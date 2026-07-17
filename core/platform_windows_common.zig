@@ -13,6 +13,9 @@
 //! 各 backend ファイルに残す。`Core` は GWLP_USERDATA に格納され WndProc から `*Core` で引かれる。
 //!
 //! 本ファイルは元 `platform_windows.zig`（GDI 一体実装）から **挙動を変えない純粋な移動**として切り出した。
+//!
+//! TASK-113.4: `WM_DROPFILES` の登録・処理は行わない stub。
+//! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
 
 const std = @import("std");
 const win = std.os.windows;

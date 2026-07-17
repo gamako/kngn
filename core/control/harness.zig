@@ -1044,6 +1044,18 @@ fn handleInject(it: *Tok) void {
         } else {
             warnLine("inject composition: phase は update/cancel");
         }
+    } else if (std.mem.eql(u8, kind, "file_drop")) {
+        // TASK-113.4: `inject file_drop <path>`。file_drop token 直後の区切り空白 1 個だけ落とし、
+        // 残り全体を 1 path として扱う（内部空白・末尾空白は保持。引用符は特別扱いしない）。
+        // `;`/改行は既存コマンド区切りなので path 中では使用不可。
+        var path = it.buffer[it.index..];
+        if (path.len > 0 and (path[0] == ' ' or path[0] == '\t')) path = path[1..];
+        if (path.len > 0 and path[path.len - 1] == '\r') path = path[0 .. path.len - 1];
+        it.index = it.buffer.len; // remainder を消費済みにする
+        const drop = types.makeFileDropEventFromPath(path) orelse {
+            return warnLine("inject file_drop: 不正な path（空/NUL/UTF-8/上限超過）");
+        };
+        queue(Event{ .file_drop = drop });
     } else if (std.mem.eql(u8, kind, "gamepad_connect")) {
         const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_connect: index 不正");
         const raw_name = std.mem.trim(u8, it.rest(), " \t"); // 残り全体を name として使う（TASK-22 char と同系統）
@@ -2754,6 +2766,109 @@ test "inject composition: 空 update は許容、cancel は update 前 no-op、c
     const snapshot = getCompositionSnapshot(&buf);
     try testing.expectEqualStrings("あい", snapshot.text);
     try testing.expectEqual(@as(u32, 3), snapshot.cursor);
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+}
+
+test "inject file_drop: 単一 path / スペース保持 / 連続・末尾空白保持" {
+    resetForTest();
+    cmd_buf =
+        \\inject file_drop /tmp/a.png
+        \\step 1
+        \\inject file_drop /tmp/My Image.png
+        \\step 1
+        \\inject file_drop /tmp/trailing  
+        \\step 1
+        \\inject file_drop /tmp/a  b.png
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    var e = nextInjectedEvent().?;
+    try testing.expect(e == .file_drop);
+    try testing.expectEqual(@as(u8, 1), e.file_drop.count);
+    try testing.expectEqualStrings("/tmp/a.png", e.file_drop.paths[0].slice());
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expectEqualStrings("/tmp/My Image.png", e.file_drop.paths[0].slice());
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expectEqualStrings("/tmp/trailing  ", e.file_drop.paths[0].slice());
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+
+    try testing.expect(pollGate(true));
+    e = nextInjectedEvent().?;
+    try testing.expectEqualStrings("/tmp/a  b.png", e.file_drop.paths[0].slice());
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    try testing.expect(!pollGate(true));
+}
+
+test "inject file_drop: 空 path / 不正 UTF-8 / 上限超過は拒否" {
+    resetForTest();
+    cmd_buf =
+        "inject file_drop\n" ++
+        "inject file_drop \n" ++
+        "inject file_drop \xff\n" ++
+        "step 1\nquit";
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    try testing.expect(!pollGate(true));
+
+    // 上限超過（FILE_DROP_PATH_BYTES+1）
+    resetForTest();
+    var script_buf: [48 + types.FILE_DROP_PATH_BYTES + 1]u8 = undefined;
+    const prefix = "inject file_drop ";
+    @memcpy(script_buf[0..prefix.len], prefix);
+    @memset(script_buf[prefix.len..][0 .. types.FILE_DROP_PATH_BYTES + 1], 'x');
+    const mid = prefix.len + types.FILE_DROP_PATH_BYTES + 1;
+    const suffix = "\nstep 1\nquit";
+    @memcpy(script_buf[mid..][0..suffix.len], suffix);
+    cmd_buf = script_buf[0 .. mid + suffix.len];
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+    try testing.expect(!pollGate(true));
+}
+
+test "inject file_drop: 複数 token を複数ファイルとして解釈しない" {
+    resetForTest();
+    cmd_buf =
+        \\inject file_drop /tmp/a.png /tmp/b.png
+        \\step 1
+        \\quit
+    ;
+    try testing.expect(pollGate(true));
+    const e = nextInjectedEvent().?;
+    try testing.expect(e == .file_drop);
+    try testing.expectEqual(@as(u8, 1), e.file_drop.count);
+    try testing.expectEqualStrings("/tmp/a.png /tmp/b.png", e.file_drop.paths[0].slice());
+    try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
+}
+
+test "inject file_drop: live raw record と replay の path bytes 一致" {
+    resetForTest();
+    const raw = "inject file_drop /tmp/My Image.png";
+    // live record は raw request をそのまま保存する契約。replay は同じ行を解釈する。
+    cmd_buf = raw ++ "\nstep 1\nquit";
+    try testing.expect(pollGate(true));
+    const live_ev = nextInjectedEvent().?;
+    try testing.expectEqualStrings("/tmp/My Image.png", live_ev.file_drop.paths[0].slice());
+    const live_bytes = live_ev.file_drop.paths[0].slice();
+
+    resetForTest();
+    cmd_buf = raw ++ "\nstep 1\nquit";
+    try testing.expect(pollGate(true));
+    const replay_ev = nextInjectedEvent().?;
+    try testing.expectEqualStrings(live_bytes, replay_ev.file_drop.paths[0].slice());
+}
+
+test "inject file_drop: harness 無効時は inject queue が空のまま（既存 no-op）" {
+    resetForTest();
+    mode = .disabled;
+    cmd_buf = "";
+    try testing.expect(!pollGate(true));
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 

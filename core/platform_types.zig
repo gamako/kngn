@@ -314,7 +314,44 @@ pub const Event = union(enum) {
     /// ネイティブ/GUI メニューから app の command table へ配送する ID。
     /// **必ず末尾に追加**し、backend の C ABI 変換は 97.3/97.4 で行う。
     menu_command: u32,
+    /// OS ファイル drag & drop（TASK-113.4）。**末尾追加**。path は inline owned bytes。
+    /// 上限は `FILE_DROP_PATH_BYTES`（1024。macOS PATH_MAX）。超過・NUL・不正 UTF-8 は生成しない。
+    file_drop: FileDropEvent,
 };
+
+/// file drop path の inline 上限（macOS PATH_MAX=1024。超過 path は reject）。
+/// Event union に 4KB を入れると全イベントの値コピーが浪費になるため 1024 に抑える。
+pub const FILE_DROP_PATH_BYTES: usize = 1024;
+/// MVP は単一ファイルのみ。将来の複数パス拡張用に配列長を残す。
+pub const FILE_DROP_MAX_PATHS: usize = 1;
+
+pub const FileDropPath = struct {
+    bytes: [FILE_DROP_PATH_BYTES]u8 = [_]u8{0} ** FILE_DROP_PATH_BYTES,
+    len: u32 = 0,
+
+    pub fn slice(self: *const FileDropPath) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const FileDropEvent = struct {
+    paths: [FILE_DROP_MAX_PATHS]FileDropPath = undefined,
+    count: u8 = 0,
+};
+
+/// 単一 path から `FileDropEvent` を作る（harness / macOS facade 共通）。
+/// 空・NUL 含有・不正 UTF-8・`FILE_DROP_PATH_BYTES` 超過は `null`（イベント非生成）。
+pub fn makeFileDropEventFromPath(path: []const u8) ?FileDropEvent {
+    if (path.len == 0) return null;
+    if (path.len > FILE_DROP_PATH_BYTES) return null;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    if (!std.unicode.utf8ValidateSlice(path)) return null;
+    var drop: FileDropEvent = .{ .count = 1, .paths = undefined };
+    drop.paths[0] = .{};
+    @memcpy(drop.paths[0].bytes[0..path.len], path);
+    drop.paths[0].len = @intCast(path.len);
+    return drop;
+}
 
 // ============================================================================
 // MIDI (TASK-115.1。ADR-010)
@@ -608,6 +645,53 @@ test "Event: menu_command は数値 ID をそのまま配送できる" {
         .menu_command => |id| try std.testing.expectEqual(@as(u32, 0x1234), id),
         else => return error.UnexpectedEvent,
     }
+}
+
+test "FileDrop: ASCII path の copy と len" {
+    const drop = makeFileDropEventFromPath("/tmp/a.png").?;
+    try std.testing.expectEqual(@as(u8, 1), drop.count);
+    try std.testing.expectEqualStrings("/tmp/a.png", drop.paths[0].slice());
+}
+
+test "FileDrop: スペースを含む path を保持する" {
+    const drop = makeFileDropEventFromPath("/tmp/My Image.png").?;
+    try std.testing.expectEqualStrings("/tmp/My Image.png", drop.paths[0].slice());
+}
+
+test "FileDrop: UTF-8 path を保持する" {
+    const drop = makeFileDropEventFromPath("/tmp/画像.png").?;
+    try std.testing.expectEqualStrings("/tmp/画像.png", drop.paths[0].slice());
+}
+
+test "FileDrop: 空 path を拒否する" {
+    try std.testing.expect(makeFileDropEventFromPath("") == null);
+}
+
+test "FileDrop: NUL を含む path を拒否する" {
+    try std.testing.expect(makeFileDropEventFromPath("a\x00b.png") == null);
+}
+
+test "FileDrop: 上限長 path を受理する" {
+    var buf: [FILE_DROP_PATH_BYTES]u8 = undefined;
+    @memset(&buf, 'a');
+    const drop = makeFileDropEventFromPath(&buf).?;
+    try std.testing.expectEqual(@as(u32, FILE_DROP_PATH_BYTES), drop.paths[0].len);
+}
+
+test "FileDrop: 上限超過 path を拒否する" {
+    var buf: [FILE_DROP_PATH_BYTES + 1]u8 = undefined;
+    @memset(&buf, 'a');
+    try std.testing.expect(makeFileDropEventFromPath(&buf) == null);
+}
+
+test "Event: file_drop は末尾 variant" {
+    const tags = std.meta.tags(std.meta.Tag(Event));
+    try std.testing.expectEqual(tags[tags.len - 1], .file_drop);
+}
+
+test "FileDrop: count == 1 の固定契約" {
+    const drop = makeFileDropEventFromPath("/tmp/x.png").?;
+    try std.testing.expectEqual(@as(u8, 1), drop.count);
 }
 
 test "MidiEvent: 3 variant は device id と payload を保持する" {

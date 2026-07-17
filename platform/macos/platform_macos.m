@@ -351,7 +351,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
-@interface FramebufferView : NSView <NSTextInputClient> {
+@interface FramebufferView : NSView <NSTextInputClient, NSDraggingDestination> {
     int width;
     int height;
     CADisplayLink* displayLink;
@@ -512,9 +512,55 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         frameCount = 0;
         totalFrameTime = 0.0;
 
+        // TASK-113.4: OS ファイル drag & drop（file URL のみ。objc backend 先行）
+        [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+
         NSLog(@"[%s] Framebuffer initialized: %dx%d", IMPLEMENTATION_TYPE, width, height);
     }
     return self;
+}
+
+// TASK-113.4: NSDraggingDestination（ホットパス: イベント時のみ）
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSPasteboard* pb = [sender draggingPasteboard];
+    NSArray* urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                      options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    if (urls != nil && urls.count >= 1) {
+        return NSDragOperationCopy;
+    }
+    return NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    if (!platformWindow) return NO;
+    NSPasteboard* pb = [sender draggingPasteboard];
+    NSArray* urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                      options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    // MVP は単一ファイルのみ。複数同時 drop はイベント全体を reject。
+    if (urls == nil || urls.count != 1) return NO;
+    NSURL* url = urls[0];
+    if (![url isFileURL]) return NO;
+    NSString* path = [url path];
+    if (path == nil) return NO;
+    NSData* utf8Data = [path dataUsingEncoding:NSUTF8StringEncoding];
+    if (utf8Data == nil) return NO; // 不正 UTF-8（変換不能）
+    NSUInteger len = [utf8Data length];
+    if (len == 0 || len > PLATFORM_FILE_DROP_PATH_BYTES) return NO;
+    const uint8_t* bytes = (const uint8_t*)[utf8Data bytes];
+    // NUL 含有は reject（契約）
+    for (NSUInteger i = 0; i < len; i++) {
+        if (bytes[i] == 0) return NO;
+    }
+
+    PlatformEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = PLATFORM_EVENT_FILE_DROP;
+    ev.payload.file_drop.count = 1;
+    ev.payload.file_drop.paths[0].len = (uint32_t)len;
+    memcpy(ev.payload.file_drop.paths[0].bytes, bytes, len);
+    // inline copy 完了。NSString/NSURL の寿命に依存しない。
+    queue_push(&platformWindow->event_queue, &ev);
+    return YES;
 }
 
 - (void)startDisplayLink {

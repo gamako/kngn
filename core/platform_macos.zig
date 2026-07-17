@@ -144,6 +144,17 @@ inline fn makeCompositionEvent(ev: c.PlatformEvent) CompositionEvent {
     };
 }
 
+/// C `PLATFORM_EVENT_FILE_DROP` → Zig `Event.file_drop`。不正時は null（イベント破棄）。
+fn makeFileDropEvent(ev: c.PlatformEvent) ?Event {
+    const fd = ev.payload.file_drop;
+    if (fd.count != 1) return null;
+    if (fd.paths[0].len > types.FILE_DROP_PATH_BYTES) return null;
+    const len: usize = fd.paths[0].len;
+    const path = fd.paths[0].bytes[0..len];
+    const drop = types.makeFileDropEventFromPath(path) orelse return null;
+    return .{ .file_drop = drop };
+}
+
 inline fn isFacadeSkipEvent(raw: c.PlatformEventType) bool {
     return raw == c.PLATFORM_EVENT_NONE;
 }
@@ -330,6 +341,7 @@ pub const Window = struct {
                 c.PLATFORM_EVENT_GAMEPAD_DISCONNECTED => Event{ .gamepad_disconnected = makeGamepadDisconnect(ev) },
                 c.PLATFORM_EVENT_COMPOSITION => Event{ .composition_changed = makeCompositionEvent(ev) },
                 c.PLATFORM_EVENT_MENU_COMMAND => Event{ .menu_command = ev.payload.menu.command_id },
+                c.PLATFORM_EVENT_FILE_DROP => makeFileDropEvent(ev),
                 else => null,
             };
             if (mapped) |event| {

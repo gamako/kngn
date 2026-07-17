@@ -164,6 +164,7 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
         .gamepad_connected, .gamepad_disconnected => null,
         .composition_changed => null,
         .menu_command => null,
+        .file_drop => null,
         .char_input => |ch| .{
             .char_input = .{
                 .codepoint = ch.codepoint,

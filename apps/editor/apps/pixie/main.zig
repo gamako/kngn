@@ -288,6 +288,7 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
         .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: pixie 未消費（cross-cutting Event 追加。他機能は無改造）
         .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
         .menu_command => null, // TASK-97.2: App.dispatchCommand で消費（gui へは渡さない）
+        .file_drop => null, // TASK-113.4: GUI へ転送しない
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -1463,6 +1464,28 @@ const App = struct {
         if (self.current_path) |old| self.gpa.free(old);
         self.current_path = owned;
         self.setSaveMsg("Loaded: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// OS / harness の file drop を消費する（TASK-113.4）。
+    /// PNG のみ `doOpenPath` へ直結。.pix / その他拡張子は拒否。netsync 中は I/O せず reject。
+    /// ホットパス: イベント時のみ。
+    fn handleFileDrop(self: *App, drop: platform.FileDropEvent) void {
+        if (drop.count != 1) return;
+        const path = drop.paths[0].slice();
+        const ext = std.fs.path.extension(path);
+        if (!std.ascii.eqlIgnoreCase(ext, ".png")) {
+            self.setSaveMsg("Drop rejected: not a PNG ({s})", .{std.fs.path.basename(path)});
+            return;
+        }
+        if (platform.netsyncActive()) {
+            // 既存 PNG open の reject_when_synced と同じメッセージ経路（setSaveMsg）。
+            // remote action へ route しない・I/O しない・canvas 不変。
+            self.setSaveMsg("netsync: open を送信できませんでした（RejectedWhileSynced）", .{});
+            return;
+        }
+        self.doOpenPath(path) catch |err| {
+            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
+        };
     }
 
     /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
@@ -5654,6 +5677,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     self.text_in.appendCodepoint(c.codepoint),
                 .composition_changed => self.composition_dirty = true,
                 .menu_command => |id| self.dispatchCommand(id),
+                .file_drop => |drop| self.handleFileDrop(drop),
                 else => {},
             }
             // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
