@@ -314,6 +314,9 @@ const App = struct {
     drag: Drag = .none,
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
+    // TASK-123: GUI-local panel visibility。保存・publish・netsync には含めない。
+    transport_open: bool = true,
+    inspector_open: bool = true,
 
     // TASK-40.8 C: master 出力タップ + 直近ブロックの rms/peak（viz probe 用。GUI スレッド更新）。
     tap: Tap = .{},
@@ -365,6 +368,14 @@ const App = struct {
 
     fn canvasW(self: *const App) f32 {
         return canvas.canvasViewportWidth(@floatFromInt(self.fb_w), self.canvasH());
+    }
+
+    fn pointInInspectorPanel(self: *const App) bool {
+        return canvas.pointInInspectorState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.inspector_open);
+    }
+
+    fn pointInTransportPanel(self: *const App) bool {
+        return canvas.pointInTransportState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.transport_open);
     }
 
     fn editState(self: *App, key: param_view.FieldKey) *param_view.ParamEditState {
@@ -964,7 +975,7 @@ fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const
 
 fn updateHover(app: *App) void {
     // 可視化帯の上ではキャンバスの hover を出さない。
-    if (canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) or app.mouse.y >= app.canvasH()) {
+    if (app.pointInInspectorPanel() or app.mouse.y >= app.canvasH()) {
         app.hover = null;
         return;
     }
@@ -986,8 +997,7 @@ fn updateHover(app: *App) void {
 
 fn onMouseDown(app: *App) void {
     // Transport/Inspector の mouse は GUI Context 側へ渡す。canvas の選択/drag/zoom と競合させない。
-    if (canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) or
-        canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) return;
+    if (app.pointInInspectorPanel() or app.pointInTransportPanel()) return;
     // パレットは screen 座標で world hit より先に判定（追加/マクロ追加。1 操作 1 publish は
     // addByPaletteIndex/macro.buildDrumMachine 内）。
     const buttons = paletteButtons();
@@ -1612,6 +1622,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "group", .ctx = &app, .ext = "json", .snapshot = null, .digest = groupDigest });
     platform.registerProbe(.{ .name = "viz", .ctx = &app, .ext = "json", .snapshot = vizSnapshot, .digest = vizDigest });
     platform.registerProbe(.{ .name = "modular", .ctx = &app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
+    platform.registerProbe(.{ .name = "panel", .ctx = &app, .ext = "json", .snapshot = null, .digest = panelDigest });
     platform.registerProbe(.{ .name = "params", .ctx = &app, .ext = "json", .snapshot = paramsSnapshot, .digest = paramsDigest });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
@@ -1679,8 +1690,8 @@ pub fn main(init: std.process.Init) !void {
                 .mouse_move => |m| {
                     app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                     gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
-                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
-                        !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                    if (!app.pointInInspectorPanel() and
+                        !app.pointInTransportPanel() and
                         gui_ctx.state.active_id == 0) onMouseMove(&app);
                 },
                 .mouse_down => |m| {
@@ -1688,8 +1699,8 @@ pub fn main(init: std.process.Init) !void {
                     gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
                     if (m.button == .left) {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
-                            !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                        if (!app.pointInInspectorPanel() and
+                            !app.pointInTransportPanel() and
                             gui_ctx.state.active_id == 0) onMouseDown(&app);
                     }
                 },
@@ -1699,16 +1710,14 @@ pub fn main(init: std.process.Init) !void {
                     if (m.button == .left) {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                         if (gui_ctx.state.active_id == 0 and
-                            !canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
-                            !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) onMouseUp(&app);
+                            !app.pointInInspectorPanel() and
+                            !app.pointInTransportPanel()) onMouseUp(&app);
                     }
                 },
                 .mouse_scroll => |s| {
                     app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
                     gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
-                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
-                        !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH()))
-                    {
+                    if (!app.pointInInspectorPanel() and !app.pointInTransportPanel()) {
                         const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
                         app.camera.zoomAt(app.mouse, factor);
                         updateHover(&app);
@@ -1729,14 +1738,14 @@ pub fn main(init: std.process.Init) !void {
         drawFrame(&app, &dl);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &dl, gui.default_font);
-        const ir = canvas.inspectorRect(@floatFromInt(fb.width), app.canvasH());
-        const tr = canvas.transportRect(@floatFromInt(fb.width), app.canvasH());
+        const ir = canvas.inspectorVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.inspector_open);
+        const tr = canvas.transportVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.transport_open);
         gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
-        transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &transport_model, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
+        transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &transport_model, &app.transport_open, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
         inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
             .node => |h| h,
             else => null,
-        } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
+        } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app.inspector_open, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
         gui_ctx.endBox();
         if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
         gui_ctx.endFrame();
@@ -2575,6 +2584,14 @@ fn hasOverride(app: *const App, key: param_view.FieldKey) bool {
 fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
     if (value) |v| return std.fmt.bufPrint(buf, "{d:.2}", .{v}) catch "none";
     return "none";
+}
+
+fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *const App = @ptrCast(@alignCast(ctx));
+    return std.fmt.bufPrint(buf, "transport_open={d} inspector_open={d}", .{
+        @intFromBool(app.transport_open),
+        @intFromBool(app.inspector_open),
+    }) catch return buf[0..0];
 }
 
 fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {

@@ -49,6 +49,11 @@ fn displayValue(display_ctx: *anyopaque, display: DisplayFn, scalar: Scalar) f32
     return display(display_ctx, scalar.key, scalar.field);
 }
 
+fn drawHeader(ctx: *gui.Context, panel_w: i32, open: *bool) void {
+    const label = if (open.*) "[−] TRANSPORT" else "[+] TRANSPORT";
+    if (ctx.buttonId(idFor(ctx, 0), label, .{ .min_w = @max(0, panel_w - 20) }).clicked) open.* = !open.*;
+}
+
 fn drawGlobalSlider(
     ctx: *gui.Context,
     id: gui.Id,
@@ -110,6 +115,7 @@ pub fn draw(
     left_w: i32,
     screen_h: i32,
     model: *const Model,
+    open: *bool,
     display_ctx: *anyopaque,
     display: DisplayFn,
     callback_ctx: *anyopaque,
@@ -133,7 +139,14 @@ pub fn draw(
         .border = .{ .color = PANEL_BORDER, .thickness = 1 },
         .clip_children = true,
     });
-    ctx.labelEx("TRANSPORT", TITLE);
+    const was_open = open.*;
+    drawHeader(ctx, panel_w, open);
+    if (!was_open) {
+        ctx.endBox();
+        ctx.endBox();
+        ctx.endBox();
+        return;
+    }
     ctx.labelEx("global / track controls", SUBTLE);
 
     ctx.beginBox(.{ .direction = .row, .gap = 10, .align_cross = .start });

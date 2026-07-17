@@ -58,6 +58,12 @@ fn trackWidthWithRightAlignedValue(row: canvas.ParamRowLayout, value_text_w: i32
     return row.track_w + @max(0, row.value_w - value_text_w);
 }
 
+fn drawHeader(ctx: *gui.Context, panel_w: i32, open: *bool) void {
+    const label = if (open.*) "[−] PARAM INSPECTOR" else "[+] PARAM INSPECTOR";
+    const id = ctx.id_stack.makeInt(0x494E_5350_0000_0000);
+    if (ctx.buttonId(id, label, .{ .min_w = @max(0, panel_w - 20) }).clicked) open.* = !open.*;
+}
+
 /// 右端 panel 本体を共有 GUI root の 1 子として登録し、選択 node の descriptor を slider 化する。
 /// 呼び出し側が root の `beginBox/endBox`、`endFrame()`、draw list の render を行う。
 pub fn drawPanel(
@@ -65,6 +71,7 @@ pub fn drawPanel(
     graph: *const modular.DynGraph,
     selected: ?modular.dyn.Handle,
     panel: gui.Rect,
+    open: *bool,
     snapshot_ctx: *anyopaque,
     snapshot: SnapshotFn,
     display_ctx: *anyopaque,
@@ -84,7 +91,12 @@ pub fn drawPanel(
         .border = .{ .color = PANEL_BORDER, .thickness = 1 },
         .clip_children = true,
     });
-    ctx.labelEx("PARAM INSPECTOR", TITLE);
+    const was_open = open.*;
+    drawHeader(ctx, panel_w, open);
+    if (!was_open) {
+        ctx.endBox();
+        return;
+    }
 
     const h = selected orelse {
         ctx.labelEx("Select a primitive node", SUBTLE);
@@ -171,6 +183,7 @@ pub fn draw(
     graph: *const modular.DynGraph,
     selected: ?modular.dyn.Handle,
     panel: gui.Rect,
+    open: *bool,
     snapshot_ctx: *anyopaque,
     snapshot: SnapshotFn,
     display_ctx: *anyopaque,
@@ -181,6 +194,6 @@ pub fn draw(
     ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(ctx.screen_w) }, .height = .{ .fixed = @intCast(ctx.screen_h) } });
     ctx.beginBox(.{ .width = .{ .fixed = @max(0, panel.x) }, .height = .{ .fixed = @intCast(panel.h) } });
     ctx.endBox();
-    drawPanel(ctx, graph, selected, panel, snapshot_ctx, snapshot, display_ctx, display, callback_ctx, on_change);
+    drawPanel(ctx, graph, selected, panel, open, snapshot_ctx, snapshot, display_ctx, display, callback_ctx, on_change);
     ctx.endBox();
 }
