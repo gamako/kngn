@@ -1,4 +1,4 @@
-//! apps/patch の scalar パラメータ + grid/303 pattern 直列化（TASK-65 serialize）。
+//! apps/patch の scalar パラメータ + grid/303 pattern 直列化（TASK-65 serialize / TASK-105.4 旧 MDLP）。
 //!
 //! libs/serde の versioned container（TASK-62.2）に 2 chunk を載せる:
 //!   - SPRM: scalar `Params`（tempo/gain/mute 等）。main.zig の具体型を comptime で汎用直列化
@@ -7,6 +7,10 @@
 //!     actions.zig 群と同じ「std のみの小さい純ロジックを app ごとに持つ」既存パターンに揃える）。
 //!   - PTRN: grid/303 pattern（`PatternPayload`。固定 layout・明示 offset。document_io.zig の
 //!     DOCH と同じ流儀）。
+//!
+//! **TASK-105.4**: 正規のプロジェクト保存は `project_io.zig`（VPRJ）。本 file は旧 MDLP の
+//! reader/encoder と PTRN/SPRM layout の単一ソースを維持する。VPRJ の PTRN/SPRM は同一 33B /
+//! フラット Params layout。統合 reader が MDLP magic を検出して本 decode へ委譲する。
 //!
 //! **循環 import 回避**: `Params`/`PatternCommand`（apps/patch/main.zig・lofi.zig 具体型）は
 //! import しない。main.zig 側が `PatternPayload` との変換（`patternToPayload`/`payloadToPatternCommand`）

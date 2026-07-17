@@ -1685,6 +1685,7 @@ pub fn build(b: *std.Build) void {
     modular_app_test_mod.addImport("modular", shared_modules.modular.mod);
     modular_app_test_mod.addImport("synth", shared_modules.synth.mod); // patch が AtomicF32 を使う（chunk B）
     modular_app_test_mod.addImport("dsp", shared_modules.dsp.mod); // patch が FFT で band energy を検証（Ph4）
+    modular_app_test_mod.addImport("serde", shared_modules.serde.mod); // project_io（GENR）経由
     const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
     const run_modular_app_test = b.addRunArtifact(modular_app_test);
     const test_app_modular_step = b.step("test-app-modular", "Run apps/patch LofiPatch tests");
@@ -1724,13 +1725,14 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
-    // apps/patch プロジェクト直列化（TASK-91 MPRJ）。std + serde + pattern_io.PatternPayload。
+    // apps/patch 統合プロジェクト直列化（TASK-105.4 VPRJ）。serde + modular（graph_io）+ group/pattern_io。
     const modular_project_io_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/project_io.zig"),
         .target = target,
         .optimize = optimize,
     });
     modular_project_io_test_mod.addImport("serde", shared_modules.serde.mod);
+    modular_project_io_test_mod.addImport("modular", shared_modules.modular.mod);
     const modular_project_io_test = b.addTest(.{ .root_module = modular_project_io_test_mod });
     const run_modular_project_io_test = b.addRunArtifact(modular_project_io_test);
     test_app_modular_step.dependOn(&run_modular_project_io_test.step);
@@ -2129,6 +2131,7 @@ pub fn build(b: *std.Build) void {
     bench_lofi_patch_mod.addImport("modular", bench_modular_mod);
     bench_lofi_patch_mod.addImport("synth", bench_synth_mod);
     bench_lofi_patch_mod.addImport("dsp", bench_dsp_mod);
+    bench_lofi_patch_mod.addImport("serde", shared_modules.serde.mod);
     const bench_lofi_root = b.createModule(.{
         .root_source_file = b.path("bench/lofi.zig"),
         .target = target,

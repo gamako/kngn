@@ -25,6 +25,7 @@ const modular = @import("modular");
 const synth = @import("synth"); // AtomicF32 / Mailbox（GUI→RT のロックフリー受け渡し）
 const dsp = @import("dsp"); // FFT（band energy 検証・テスト用）/ Noise（変異 PRNG）
 const seedmod = @import("seed.zig");
+const project_io = @import("project_io.zig");
 
 // ----------------------------------------------------------------------------
 // 既定値（= 構築時のパッチ値）。Controls の既定もこれに合わせ、無操作時は従来どおりにする。
@@ -1221,6 +1222,82 @@ pub const LofiPatch = struct {
             2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| self.mutateDrumLane(seq, CLAP_BAND),
             else => if (self.ptr(.step_seq, self.bass_seq_h)) |seq| self.mutateBassLane(seq),
         }
+    }
+
+    /// 生成 role handle の固定順スナップショット（VPRJ GENR。イベント時のみ）。
+    /// render / processBlock の処理順と RT アクセスは変更しない。
+    pub fn snapshotGenRoles(self: *const LofiPatch) project_io.GenRoleHandles {
+        var g: project_io.GenRoleHandles = .{};
+        g.set(.clock, self.clock_h);
+        g.set(.kick_seq, self.kick_seq_h);
+        g.set(.hat_seq, self.hat_seq_h);
+        g.set(.clap_seq, self.clap_seq_h);
+        g.set(.bass_seq, self.bass_seq_h);
+        g.set(.kick, self.kick_h);
+        g.set(.hat, self.hat_h);
+        g.set(.clap, self.clap_h);
+        g.set(.pad_div, self.pad_div_h);
+        g.set(.pad_eu, self.pad_eu_h);
+        g.set(.pad, self.pad_h);
+        g.set(.ambient_turing, self.ambient_turing_h);
+        g.set(.ambient_quant, self.ambient_quant_h);
+        g.set(.ambient_lfo, self.ambient_lfo_h);
+        g.set(.ambient_random, self.ambient_random_h);
+        g.set(.bass_perc, self.bass_perc_h);
+        g.set(.vco, self.vco_h);
+        g.set(.vcf, self.vcf_h);
+        g.set(.vca, self.vca_h);
+        g.set(.nonkick_mixer, self.nonkick_mixer_h);
+        g.set(.sidechain, self.sidechain_h);
+        g.set(.master_mixer, self.master_mixer_h);
+        g.set(.master_vcf, self.master_vcf_h);
+        g.set(.saturator, self.saturator_h);
+        g.set(.bitcrusher, self.bitcrusher_h);
+        g.set(.delay_fx, self.delay_fx_h);
+        g.set(.reverb_fx, self.reverb_fx_h);
+        g.set(.vinyl, self.vinyl_h);
+        g.set(.wow, self.wow_h);
+        g.set(.output, self.output_h);
+        return g;
+    }
+
+    /// GENR remap 後の role handle を適用する（イベント時のみ。invalid は isActive で false）。
+    pub fn applyGenRoles(self: *LofiPatch, g: project_io.GenRoleHandles) void {
+        self.clock_h = g.get(.clock);
+        self.kick_seq_h = g.get(.kick_seq);
+        self.hat_seq_h = g.get(.hat_seq);
+        self.clap_seq_h = g.get(.clap_seq);
+        self.bass_seq_h = g.get(.bass_seq);
+        self.kick_h = g.get(.kick);
+        self.hat_h = g.get(.hat);
+        self.clap_h = g.get(.clap);
+        self.pad_div_h = g.get(.pad_div);
+        self.pad_eu_h = g.get(.pad_eu);
+        self.pad_h = g.get(.pad);
+        self.ambient_turing_h = g.get(.ambient_turing);
+        self.ambient_quant_h = g.get(.ambient_quant);
+        self.ambient_lfo_h = g.get(.ambient_lfo);
+        self.ambient_random_h = g.get(.ambient_random);
+        self.bass_perc_h = g.get(.bass_perc);
+        self.vco_h = g.get(.vco);
+        self.vcf_h = g.get(.vcf);
+        self.vca_h = g.get(.vca);
+        self.nonkick_mixer_h = g.get(.nonkick_mixer);
+        self.sidechain_h = g.get(.sidechain);
+        self.master_mixer_h = g.get(.master_mixer);
+        self.master_vcf_h = g.get(.master_vcf);
+        self.saturator_h = g.get(.saturator);
+        self.bitcrusher_h = g.get(.bitcrusher);
+        self.delay_fx_h = g.get(.delay_fx);
+        self.reverb_fx_h = g.get(.reverb_fx);
+        self.vinyl_h = g.get(.vinyl);
+        self.wow_h = g.get(.wow);
+        self.output_h = g.get(.output);
+    }
+
+    /// 旧形式（GENR 無し）ロード時: role を無効化し isActive ガードで安全に扱う。
+    pub fn invalidateGenRoles(self: *LofiPatch) void {
+        self.applyGenRoles(.{});
     }
 
     /// harness probe 用の生成状態スナップショット（alloc/lock/IO なし・torn 可）。

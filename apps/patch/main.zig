@@ -77,6 +77,9 @@ comptime {
     }
 }
 
+/// recipe / diagnostics の canonical app name（既存 modular recipe 互換。TASK-105.4）。
+const APP_NAME = "modular";
+
 const WIN_W = 960;
 // TASK-40.8: 下部に可視化帯（VIS_H）を足したぶん高くする（キャンバス有効高 = fb_h - VIS_H）。
 const WIN_H = 760;
@@ -1953,7 +1956,7 @@ pub fn main(init: std.process.Init) !void {
     platform.setCommandExecutor(&app.cmd_exec);
     registerPatchActions(&app);
     registerActions(&app);
-    registerGenStateSync(&app);
+    registerIntegratedStateSync(&app);
 
     device.start() catch |err| {
         std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
@@ -2635,24 +2638,14 @@ fn actionDisconnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
 }
 
 // ============================================================================
-// save_graph / load_graph（TASK-65 serialize。probe `patch` と対称の永続化口）。
+// save_graph / load_graph（TASK-105.4: VPRJ 互換 alias。旧 PTCG も読込可）。
 //
-// ホットパス宣言: save/load はイベント時のみ（action 1回につき1回。std.Io のブロッキング file I/O は
-// main thread の pollGate 内で完結する）。RT 経路（DynGraph.processBlock）には一切触れない。
-//
-// スコープ: `graph_io.zig` と同じく生ノード（add/remove/connect/disconnect）のみ。マクロの折り畳み
-// 情報は保存されない。load_graph は「既存グラフの置換」意味論: 現在の全ノードを削除してから復元する
-// （pixie の `open` が canvas 全体を差し替えるのと同じ考え方）。ハンドル番号は保存値をそのまま
-// 再現できるとは限らない（`DynGraph.add` が空き slot から動的採番するため）ので、load 側で
-// 旧 handle→新 handle の対応表を作って EDGE を訳し直す。
+// ホットパス宣言: save/load はイベント時のみ。RT 経路には触れない。
+// save_graph = VPRJ 全体保存（save_project と同内容）。
+// load_graph = VPRJ から graph/Ledger/GENR を適用。PTCG も読込（Ledger 空リセット・GENR 無効化）。
 // ============================================================================
 
-fn actionSaveGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
-    const app = actionApp(ctx);
-    const path = try actions.parsePath(args);
-
-    var node_buf: [MAX_MODULES]graph_io.NodeEntry = undefined;
+fn collectNodesEdges(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edge_buf: *[MAX_EDGES]project_io.EdgeEntry) struct { nodes: []project_io.NodeEntry, edges: []project_io.EdgeEntry } {
     var nn: usize = 0;
     var h: Handle = 0;
     while (h < MAX_MODULES) : (h += 1) {
@@ -2661,19 +2654,164 @@ fn actionSaveGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
         node_buf[nn] = .{ .handle = h, .kind = app.dyn.kindOf(h).?, .x = pos.x, .y = pos.y };
         nn += 1;
     }
-
     var flat_buf: [MAX_EDGES]Edge = undefined;
     const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
-    var edge_buf: [MAX_EDGES]graph_io.EdgeEntry = undefined;
     for (flat, 0..) |e, i| {
         edge_buf[i] = .{ .src_handle = e.src_handle, .src_out = e.src_out, .dst_handle = e.dst_handle, .dst_in = e.dst_in };
     }
+    return .{ .nodes = node_buf[0..nn], .edges = edge_buf[0..flat.len] };
+}
 
-    try graph_io.saveGraph(app.io, path, std.heap.c_allocator, node_buf[0..nn], edge_buf[0..flat.len]);
+fn buildEncodeInput(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edge_buf: *[MAX_EDGES]project_io.EdgeEntry) project_io.EncodeInput {
+    const patch = app.patch;
+    const cmd = stateToCommand(patch.snapshotState());
+    const st = patch.snapshotState();
+    const ne = collectNodesEdges(app, node_buf, edge_buf);
+    return .{
+        .pattern = patternToPayload(cmd),
+        .seed = .{
+            .base_seed = st.base_seed,
+            .notation_seed = app.notation_seed,
+            .notation_counter = app.notation_counter,
+        },
+        .song = songToPayload(app.song),
+        .nodes = ne.nodes,
+        .edges = ne.edges,
+        .ledger = &app.ledger,
+        .genr = patch.snapshotGenRoles(),
+    };
+}
+
+fn actionSaveProjectFile(app: *App, path: []const u8) !void {
+    var node_buf: [MAX_MODULES]project_io.NodeEntry = undefined;
+    var edge_buf: [MAX_EDGES]project_io.EdgeEntry = undefined;
+    const input = buildEncodeInput(app, &node_buf, &edge_buf);
+    try project_io.save(app.io, path, Params, app.params, input, std.heap.c_allocator);
+}
+
+/// 置換意味論の容量: クリア予定の active 分も空きとして数える。
+fn ensureReplaceCapacity(app: *App, nodes: []const project_io.NodeEntry) !void {
+    const free = app.dyn.freeHandleCount();
+    const active = app.dyn.activeCount();
+    if (nodes.len > free + active) return error.TooManyNodesForCapacity;
+    inline for (@typeInfo(modular.ModuleKind).@"enum".fields) |kf| {
+        const k: modular.ModuleKind = @enumFromInt(kf.value);
+        var need: usize = 0;
+        for (nodes) |n| {
+            if (n.kind == k) need += 1;
+        }
+        var active_k: usize = 0;
+        var h: Handle = 0;
+        while (h < MAX_MODULES) : (h += 1) {
+            if (app.dyn.slotActive(h) and app.dyn.kindOf(h) == k) active_k += 1;
+        }
+        if (need > app.dyn.poolFreeCount(k) + active_k) return error.TooManyNodesForCapacity;
+    }
+}
+
+/// clearGraph + publish 後、RT の processBlock が grace を進めるまで待つ（上限付き）。
+fn waitGraphReclaim(app: *App, need_nodes: usize) !void {
+    var spins: usize = 0;
+    while (app.dyn.freeHandleCount() < need_nodes and spins < 200_000) : (spins += 1) {
+        std.atomic.spinLoopHint();
+    }
+    if (app.dyn.freeHandleCount() < need_nodes) return error.TooManyNodesForCapacity;
+}
+
+const GraphApplyResult = struct { nodes_restored: usize, edges_restored: usize };
+
+fn applyGraphReplace(
+    app: *App,
+    nodes: []const project_io.NodeEntry,
+    edges: []const project_io.EdgeEntry,
+    ledger_src: ?*const group.Ledger,
+    genr_src: ?project_io.GenRoleHandles,
+) !GraphApplyResult {
+    try ensureReplaceCapacity(app, nodes);
+    clearGraph(app);
+    try app.dyn.publish();
+    try waitGraphReclaim(app, nodes.len);
+
+    var mapping = [_]?Handle{null} ** MAX_MODULES;
+    var nodes_restored: usize = 0;
+    const genr_old: ?project_io.GenRoleHandles = genr_src;
+    for (nodes) |n| {
+        if (n.handle >= MAX_MODULES) continue;
+        const nh = blk: {
+            if (n.kind == .step_seq) {
+                if (genr_old) |g| {
+                    if (n.handle == g.get(.bass_seq)) {
+                        break :blk app.dyn.add(.step_seq, .{ .kind = .bass }) catch continue;
+                    }
+                    if (n.handle == g.get(.kick_seq) or n.handle == g.get(.hat_seq) or n.handle == g.get(.clap_seq)) {
+                        break :blk app.dyn.add(.step_seq, .{ .kind = .drum }) catch continue;
+                    }
+                }
+            }
+            break :blk addNodeByKind(app, n.kind) catch continue;
+        };
+        app.layout[nh] = .{ .x = n.x, .y = n.y };
+        mapping[n.handle] = nh;
+        nodes_restored += 1;
+    }
+    var edges_restored: usize = 0;
+    for (edges) |e| {
+        if (e.src_handle >= MAX_MODULES or e.dst_handle >= MAX_MODULES) continue;
+        const src = mapping[e.src_handle] orelse continue;
+        const dst = mapping[e.dst_handle] orelse continue;
+        app.dyn.connect(src, e.src_out, dst, e.dst_in) catch continue;
+        edges_restored += 1;
+    }
+    try app.dyn.publish();
+
+    if (ledger_src) |src| {
+        app.ledger = try project_io.remapLedger(src, &mapping);
+        // 復元直後: deriveExposed で整合確認（値はグラフ+membership が一致すれば不変）
+        app.refreshAllExposed();
+    } else {
+        app.ledger = .{};
+    }
+
+    if (genr_src) |g| {
+        app.patch.applyGenRoles(project_io.remapGenr(g, &mapping));
+    } else {
+        app.patch.invalidateGenRoles();
+    }
+
+    // master output は VPRJ chunk 対象外だが、GENR の output role から staging output を復元する
+    // （無いと load 後 silent。旧 PTCG 経路は GENR 無効のため setOutput しない）。
+    if (app.patch.output_h != project_io.INVALID_ROLE_HANDLE and app.dyn.isActive(app.patch.output_h)) {
+        app.dyn.setOutput(app.patch.output_h);
+        try app.dyn.publish();
+    }
+
+    return .{ .nodes_restored = nodes_restored, .edges_restored = edges_restored };
+}
+
+fn applyParamsPattern(app: *App, params: Params, pattern: pattern_io.PatternPayload) void {
+    app.params = params;
+    publishControls(app.patch, app.params);
+    const cmd = payloadToPatternCommand(0, pattern);
+    _ = publishPatternCommand(app, cmd);
+}
+
+fn applySeedSong(app: *App, seed: project_io.SeedPayload, song: project_io.SongPayload) void {
+    app.song = payloadToSong(app.song.rev +% 1, song);
+    app.patch.controls.song_db.publish(app.song);
+    app.notation_seed = seed.notation_seed;
+    app.notation_counter = seed.notation_counter;
+    app.patch.requestSeed(seed.base_seed);
+}
+
+fn actionSaveGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const path = try actions.parsePath(args);
+    try actionSaveProjectFile(app, path);
     return "ok";
 }
 
-/// 既存グラフを全消去する（load_graph の「置換」意味論。台帳/選択/hover も併せてリセット）。
+/// 既存グラフを全消去する（load の「置換」意味論。台帳/選択/hover も併せてリセット）。
 fn clearGraph(app: *App) void {
     purgeParamOverrides(app, null);
     var h: Handle = 0;
@@ -2682,7 +2820,7 @@ fn clearGraph(app: *App) void {
         if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
         app.dyn.removeModule(h);
     }
-    app.ledger = .{}; // グループ台帳も完全リセット（load_graph はマクロ折り畳み情報を持たない）
+    app.ledger = .{};
     app.selected = null;
     app.hover = null;
     app.drag = .none;
@@ -2692,56 +2830,21 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     const app = actionApp(ctx);
     const path = try actions.parsePath(args);
     const gpa = std.heap.c_allocator;
-    var decoded = try graph_io.loadGraph(app.io, gpa, path);
+    var decoded = try project_io.load(app.io, gpa, path, Params);
     defer decoded.deinit(gpa);
 
-    // 容量事前検証（「検証してから壊す」。commitConnect と同方針）: clearGraph() で retired にした
-    // slot は RT が次 publish を consume するまで（RCU grace）この action 呼び出し内では再利用でき
-    // ない。`DynGraph.freeHandleCount()`/`poolFreeCount(k)` は「今 add したら確保できる数」を
-    // 既存の active/retired(未 reclaim) を織り込んで返す（`add()` の reclaim 条件と同一式）ため、
-    // clearGraph 前に読んでも clearGraph 直後の実際の空きと一致する（retire は「active→retired」
-    // であって pool/handle 占有を解放しないため）。
-    // 事前に2種の容量（全体 handle 数 / kind 別 pool 数）を検証し、どちらか超過なら既存グラフを
-    // 破壊せずに拒否する（黙って一部だけ復元して「成功」を返すのを防ぐ。codex 指摘。当初
-    // `MAX_MODULES - activeCount()` という手書き計算だったが、(a) 既存 retired 分を見落とす、
-    // (b) kind 別 pool cap を見ない、の2点で不十分だったため公開 API に置き換えた）。
-    if (decoded.nodes.len > app.dyn.freeHandleCount()) return error.TooManyNodesForCapacity;
-    inline for (@typeInfo(modular.ModuleKind).@"enum".fields) |kf| {
-        const k: modular.ModuleKind = @enumFromInt(kf.value);
-        var need: usize = 0;
-        for (decoded.nodes) |n| {
-            if (n.kind == k) need += 1;
-        }
-        if (need > app.dyn.poolFreeCount(k)) return error.TooManyNodesForCapacity;
-    }
+    if (!decoded.apply_graph) return error.UnsupportedFormat;
 
-    clearGraph(app);
+    const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .vprj) &decoded.ledger else null;
+    const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .vprj) decoded.genr else null;
+    // PTCG: apply_ledger/genr は true だが空/INVALID（decodeFromPtcg）
+    const result = if (decoded.format == .ptcg)
+        try applyGraphReplace(app, decoded.nodes, decoded.edges, null, null)
+    else
+        try applyGraphReplace(app, decoded.nodes, decoded.edges, ledger_ptr, genr_opt);
 
-    // 旧 handle → 新 handle 対応表（DynGraph.add は空き slot から動的採番するため保存値は再現されない）。
-    // add が失敗（TooManyModules/PoolFull）したノードは skip（fail-soft。addByPaletteIndex と同方針）。
-    // 実際に復元できた数を数え、返り値に「要求数/復元数」を出す（部分成功を隠さない。codex 指摘）。
-    var mapping = [_]?Handle{null} ** MAX_MODULES;
-    var nodes_restored: usize = 0;
-    for (decoded.nodes) |n| {
-        if (n.handle >= MAX_MODULES) continue; // 破損/範囲外 handle は skip
-        const nh = addNodeByKind(app, n.kind) catch continue;
-        app.layout[nh] = .{ .x = n.x, .y = n.y };
-        mapping[n.handle] = nh;
-        nodes_restored += 1;
-    }
-    var edges_restored: usize = 0;
-    for (decoded.edges) |e| {
-        if (e.src_handle >= MAX_MODULES or e.dst_handle >= MAX_MODULES) continue;
-        const src = mapping[e.src_handle] orelse continue; // 対応ノードが skip されていたら edge も skip
-        const dst = mapping[e.dst_handle] orelse continue;
-        app.dyn.connect(src, e.src_out, dst, e.dst_in) catch continue; // 型不一致/範囲外は skip（fail-soft）
-        edges_restored += 1;
-    }
-
-    try app.dyn.publish();
-    app.refreshAllExposed();
     return std.fmt.bufPrint(buf, "nodes={d}/{d} edges={d}/{d}", .{
-        nodes_restored, decoded.nodes.len, edges_restored, decoded.edges.len,
+        result.nodes_restored, decoded.nodes.len, result.edges_restored, decoded.edges.len,
     }) catch "ok";
 }
 
@@ -2754,8 +2857,20 @@ fn registerPatchActions(app: *App) void {
     platform.registerAction(.{ .name = "remove_node", .ctx = app, .run = actionRemoveNode });
     platform.registerAction(.{ .name = "connect", .ctx = app, .run = actionConnect });
     platform.registerAction(.{ .name = "disconnect", .ctx = app, .run = actionDisconnect });
-    platform.registerAction(.{ .name = "save_graph", .ctx = app, .run = actionSaveGraph });
-    platform.registerAction(.{ .name = "load_graph", .ctx = app, .run = actionLoadGraph });
+    platform.registerAction(.{
+        .name = "save_graph",
+        .ctx = app,
+        .run = actionSaveGraph,
+        .network_policy = .local_only,
+        .desc = "save integrated VPRJ project (alias of save_project)",
+    });
+    platform.registerAction(.{
+        .name = "load_graph",
+        .ctx = app,
+        .run = actionLoadGraph,
+        .network_policy = .local_only,
+        .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG)",
+    });
 }
 
 fn actionObserveParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -2774,67 +2889,32 @@ fn actionObserveParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
     return std.fmt.bufPrint(buf, "observed_h={d} observed_name={s}", .{ h, canonical_name }) catch "ok";
 }
 
-fn graphNetsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+fn integratedStateSyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app = actionApp(ctx);
-    var node_buf: [MAX_MODULES]graph_io.NodeEntry = undefined;
-    var nn: usize = 0;
-    var h: Handle = 0;
-    while (h < MAX_MODULES) : (h += 1) {
-        if (!app.dyn.slotActive(h)) continue;
-        const pos = app.layout[h];
-        node_buf[nn] = .{ .handle = h, .kind = app.dyn.kindOf(h).?, .x = pos.x, .y = pos.y };
-        nn += 1;
-    }
-    var flat_buf: [MAX_EDGES]Edge = undefined;
-    const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
-    var edge_buf: [MAX_EDGES]graph_io.EdgeEntry = undefined;
-    for (flat, 0..) |e, i| {
-        edge_buf[i] = .{ .src_handle = e.src_handle, .src_out = e.src_out, .dst_handle = e.dst_handle, .dst_in = e.dst_in };
-    }
-    return graph_io.encodeGraph(allocator, node_buf[0..nn], edge_buf[0..flat.len]);
+    var node_buf: [MAX_MODULES]project_io.NodeEntry = undefined;
+    var edge_buf: [MAX_EDGES]project_io.EdgeEntry = undefined;
+    const input = buildEncodeInput(app, &node_buf, &edge_buf);
+    return project_io.encode(Params, allocator, app.params, input);
 }
 
-fn graphNetsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const app = actionApp(ctx);
     const gpa = std.heap.c_allocator;
-    var decoded = try graph_io.decodeGraph(gpa, bytes);
+    var decoded = try project_io.decode(Params, gpa, bytes);
     defer decoded.deinit(gpa);
+    if (decoded.format != .vprj) return error.UnsupportedFormat;
 
-    if (decoded.nodes.len > app.dyn.freeHandleCount()) return error.TooManyNodesForCapacity;
-    inline for (@typeInfo(modular.ModuleKind).@"enum".fields) |kf| {
-        const k: modular.ModuleKind = @enumFromInt(kf.value);
-        var need: usize = 0;
-        for (decoded.nodes) |n| {
-            if (n.kind == k) need += 1;
-        }
-        if (need > app.dyn.poolFreeCount(k)) return error.TooManyNodesForCapacity;
-    }
-
-    clearGraph(app);
-
-    var mapping = [_]?Handle{null} ** MAX_MODULES;
-    for (decoded.nodes) |n| {
-        if (n.handle >= MAX_MODULES) continue;
-        const nh = addNodeByKind(app, n.kind) catch continue;
-        app.layout[nh] = .{ .x = n.x, .y = n.y };
-        mapping[n.handle] = nh;
-    }
-    for (decoded.edges) |e| {
-        if (e.src_handle >= MAX_MODULES or e.dst_handle >= MAX_MODULES) continue;
-        const src = mapping[e.src_handle] orelse continue;
-        const dst = mapping[e.dst_handle] orelse continue;
-        app.dyn.connect(src, e.src_out, dst, e.dst_in) catch continue;
-    }
-
-    try app.dyn.publish();
-    app.refreshAllExposed();
+    // 検証完了後にのみ破壊的適用（capacity は applyGraphReplace 内）
+    _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr);
+    applyParamsPattern(app, decoded.params, decoded.pattern);
+    applySeedSong(app, decoded.seed, decoded.song);
 }
 
-fn registerGraphStateSync(app: *App) void {
+fn registerIntegratedStateSync(app: *App) void {
     platform.registerStateSync(.{
         .ctx = app,
-        .export_fn = graphNetsyncExport,
-        .import_fn = graphNetsyncImport,
+        .export_fn = integratedStateSyncExport,
+        .import_fn = integratedStateSyncImport,
     });
 }
 fn selectedParamDigest(app: *const App, buf: []u8) []const u8 {
@@ -3283,13 +3363,11 @@ fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 }
 
 // ============================================================================
-// save_pattern / load_pattern（TASK-65 serialize。probe `modular` と対称の永続化口）。
+// save_pattern / load_pattern（TASK-105.4: VPRJ 互換 alias。旧 MDLP も読込可）。
 //
-// ホットパス宣言: save/load はイベント時のみ（action 1回につき1回。std.Io のブロッキング file I/O は
-// main thread の pollGate 内で完結する）。RT 経路（LofiPatch.render→graph processBlock）には
-// 一切触れない。保存対象は App.params（scalar）+ 現在の grid/303 pattern（PatternCommand の中身）。
-// load は既存の pattern 編集 action と同じ経路（publishControls / pattern_rev++ → pattern_db.publish）
-// をそのまま辿るため revision の二重採番は起きない。
+// ホットパス宣言: save/load はイベント時のみ。RT 経路には触れない。
+// save_pattern = VPRJ 全体保存（save_project と同内容）。
+// load_pattern = VPRJ/MDLP から SPRM/PTRN のみ適用。
 // ============================================================================
 
 /// 現在の `PatternCommand` を `pattern_io.PatternPayload`（app 非依存の plain struct）へ写す。
@@ -3326,23 +3404,20 @@ fn payloadToPatternCommand(rev: u32, p: pattern_io.PatternPayload) PatternComman
 fn actionSavePattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const path = try gen_actions.parsePath(args);
-    const cmd = stateToCommand(patch.snapshotState());
-    try pattern_io.save(app.io, path, Params, app.params, patternToPayload(cmd), std.heap.c_allocator);
+    try actionSaveProjectFile(app, path);
     return "ok";
 }
 
 fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const path = try gen_actions.parsePath(args);
-    const loaded = try pattern_io.load(app.io, std.heap.c_allocator, path, Params);
-    app.params = loaded.params;
-    publishControls(patch, app.params);
-    const cmd = payloadToPatternCommand(0, loaded.pattern);
-    _ = publishPatternCommand(app, cmd);
+    const gpa = std.heap.c_allocator;
+    var loaded = try project_io.load(app.io, gpa, path, Params);
+    defer loaded.deinit(gpa);
+    if (!loaded.apply_params_pattern) return error.UnsupportedFormat;
+    applyParamsPattern(app, loaded.params, loaded.pattern);
     return "ok";
 }
 
@@ -3558,54 +3633,45 @@ fn payloadToSong(rev: u32, p: project_io.SongPayload) SongData {
     return out;
 }
 
-/// `save_project <path>`: MPRJ（params+pattern+seed+song）。local_only・非記録。
+/// `save_project <path>`: VPRJ 全体（graph+Ledger+pattern+Song+Params+seed+GENR）。local_only・非記録。
 fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const path = try gen_actions.parsePath(args);
-    const cmd = stateToCommand(patch.snapshotState());
-    const st = patch.snapshotState();
-    const seed = project_io.SeedPayload{
-        .base_seed = st.base_seed,
-        .notation_seed = app.notation_seed,
-        .notation_counter = app.notation_counter,
-    };
-    try project_io.save(
-        app.io,
-        path,
-        Params,
-        app.params,
-        patternToPayload(cmd),
-        seed,
-        songToPayload(app.song),
-        std.heap.c_allocator,
-    );
+    try actionSaveProjectFile(app, path);
     return "ok";
 }
 
-/// `load_project <path>`: SongData publish + params publish + seed 復元。local_only・非記録。
+/// `load_project <path>`: VPRJ または旧 MDLP/MPRJ/PTCG を自動判定。local_only・非記録。
 fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const path = try gen_actions.parsePath(args);
-    const loaded = project_io.load(app.io, std.heap.c_allocator, path, Params) catch |err| {
+    const gpa = std.heap.c_allocator;
+    var loaded = project_io.load(app.io, gpa, path, Params) catch |err| {
         if (err == error.FileNotFound) {
             platform.setActionErrorDetail("file_not_found", "check path or use save_project first");
         }
         return err;
     };
-    app.params = loaded.params;
-    publishControls(patch, app.params);
-    const cmd = payloadToPatternCommand(0, loaded.pattern);
-    _ = publishPatternCommand(app, cmd);
-    app.song = payloadToSong(app.song.rev +% 1, loaded.song);
-    patch.controls.song_db.publish(app.song);
-    app.notation_seed = loaded.seed.notation_seed;
-    app.notation_counter = loaded.seed.notation_counter;
-    patch.requestSeed(loaded.seed.base_seed);
-    return "ok";
+    defer loaded.deinit(gpa);
+
+    if (loaded.apply_graph) {
+        const ledger_ptr: ?*const group.Ledger = if (loaded.apply_ledger and loaded.format == .vprj) &loaded.ledger else null;
+        const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .vprj) loaded.genr else null;
+        const result = if (loaded.format == .ptcg)
+            try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null)
+        else
+            try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt);
+        if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern);
+        if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
+        return std.fmt.bufPrint(buf, "format={s} nodes={d}/{d} edges={d}/{d}", .{
+            @tagName(loaded.format), result.nodes_restored, loaded.nodes.len, result.edges_restored, loaded.edges.len,
+        }) catch "ok";
+    }
+
+    if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern);
+    if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
+    return std.fmt.bufPrint(buf, "format={s}", .{@tagName(loaded.format)}) catch "ok";
 }
 
 /// `action render <path> <seconds>`: offline LofiPatch で master を PCM16 WAV に書き出す（TASK-86）。
@@ -3773,7 +3839,7 @@ fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Al
     return recipe.collectNormalEntries(gpa, views_buf[0..n]);
 }
 
-/// `recipe_save <path>`: CommandLog → recipe（app_name="modular"）。記録しない。
+/// `recipe_save <path>`: CommandLog → recipe（app_name=APP_NAME）。記録しない。
 fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -3781,7 +3847,7 @@ fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const path = try gen_actions.parsePath(args);
     const entries = try recipeEntriesFromLog(&app.cmd_log, gpa);
     defer gpa.free(entries);
-    try recipe.save(app.io, path, .{ .app_name = "modular" }, entries, gpa);
+    try recipe.save(app.io, path, .{ .app_name = APP_NAME }, entries, gpa);
     return "ok";
 }
 
@@ -3805,7 +3871,7 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
     };
     defer loaded.deinit();
 
-    recipe.checkAppName(loaded.header.app_name, "modular") catch {
+    recipe.checkAppName(loaded.header.app_name, APP_NAME) catch {
         platform.setActionErrorDetail("app_mismatch", "open with the correct app");
         return error.AppMismatch;
     };
@@ -3846,8 +3912,6 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "set_evolve", .run = actionSetEvolve },
     .{ .name = "toggle_step", .run = actionToggleStep },
     .{ .name = "set_pitch", .run = actionSetPitch },
-    .{ .name = "save_pattern", .run = actionSavePattern },
-    .{ .name = "load_pattern", .run = actionLoadPattern },
     .{ .name = "seed", .run = actionSeed },
     .{ .name = "pattern", .run = actionPattern },
     // TASK-91: Song/Chain/Phrase（recorded）
@@ -3889,8 +3953,20 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = recordedAction("set_evolve") });
     platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = recordedAction("toggle_step") });
     platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = recordedAction("set_pitch") });
-    platform.registerAction(.{ .name = "save_pattern", .ctx = app, .run = recordedAction("save_pattern") });
-    platform.registerAction(.{ .name = "load_pattern", .ctx = app, .run = recordedAction("load_pattern") });
+    platform.registerAction(.{
+        .name = "save_pattern",
+        .ctx = app,
+        .run = actionSavePattern,
+        .network_policy = .local_only,
+        .desc = "save integrated VPRJ project (alias of save_project)",
+    });
+    platform.registerAction(.{
+        .name = "load_pattern",
+        .ctx = app,
+        .run = actionLoadPattern,
+        .network_policy = .local_only,
+        .desc = "load SPRM/PTRN from VPRJ (or legacy MDLP)",
+    });
     platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed") });
     // TASK-93: mini-notation。レシピには記法の生テキストを記録（replay 時 counter 順で再評価→決定的）。
     platform.registerAction(.{ .name = "pattern", .ctx = app, .run = recordedAction("pattern") });
@@ -3907,32 +3983,21 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
     // render（TASK-86）: offline WAV 書き出し。recipe_save と同じ local_only・CommandLog 非記録。
     platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = .local_only });
-    // TASK-91: プロジェクト直列化（save_pattern 同型・local_only・非記録）
-    platform.registerAction(.{ .name = "save_project", .ctx = app, .run = actionSaveProject, .network_policy = .local_only });
-    platform.registerAction(.{ .name = "load_project", .ctx = app, .run = actionLoadProject, .network_policy = .local_only });
-}
-
-fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
-    const app = actionApp(ctx);
-    const patch = app.patch;
-    const cmd = stateToCommand(patch.snapshotState());
-    return pattern_io.encode(Params, allocator, app.params, patternToPayload(cmd));
-}
-
-fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
-    const app = actionApp(ctx);
-    const patch = app.patch;
-    const loaded = try pattern_io.decode(Params, bytes);
-    app.params = loaded.params;
-    publishControls(patch, app.params);
-    const cmd = payloadToPatternCommand(0, loaded.pattern);
-    _ = publishPatternCommand(app, cmd);
-}
-
-fn registerGenStateSync(app: *App) void {
-    platform.registerStateSync(.{
+    // TASK-105.4: 統合プロジェクト直列化（VPRJ）。local_only・非記録。
+    platform.registerAction(.{
+        .name = "save_project",
         .ctx = app,
-        .export_fn = netsyncExport,
-        .import_fn = netsyncImport,
+        .run = actionSaveProject,
+        .network_policy = .local_only,
+        .desc = "save integrated VPRJ project (graph+Ledger+pattern+Song+Params+seed)",
+    });
+    platform.registerAction(.{
+        .name = "load_project",
+        .ctx = app,
+        .run = actionLoadProject,
+        .network_policy = .local_only,
+        .desc = "load VPRJ or legacy MDLP/MPRJ/PTCG",
     });
 }
+
+// (TASK-105.4: pattern/graph の二重 registerStateSync は廃止。integrated のみ)

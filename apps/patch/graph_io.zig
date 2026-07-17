@@ -1,8 +1,16 @@
-//! apps/patch: DynGraph のノード/エッジ構成の直列化（TASK-65 serialize）。
+//! apps/patch: DynGraph のノード/エッジ構成の直列化（TASK-65 serialize / TASK-105.4 旧 PTCG）。
 //!
 //! libs/serde の versioned container（TASK-62.2）に NODE chunk × N（ノード=kind+world 座標）と
 //! EDGE chunk × M（接続）を繰り返し載せる（`libs/paint` の `document_io.zig` が LAYR chunk を
 //! layer 数ぶん繰り返すのと同じ「可変個の小さい chunk を repeated tag で並べる」流儀）。
+//!
+//! **TASK-105.4**: 正規のプロジェクト保存は `project_io.zig`（VPRJ）。本 file は旧 PTCG の
+//! reader/encoder（fixture・統合 reader からの変換）と NODE/EDGE layout の単一ソースを維持する。
+//! 新 path の writer は VPRJ に寄せ、PTCG writer を新しい保存経路から呼ばない。
+//!
+//! **ModuleKind 互換**: enum ordinal は永続化フォーマットの一部。新しい ModuleKind は enum の
+//! 末尾にのみ追加する。既存 tag の並べ替え・削除・名前変更は禁止。未知 ordinal は NODE 単位で
+//! skip（対応 EDGE は load 側 mapping 欠落で自然除外）。
 //!
 //! **スコープ**: 生ノード（`DynGraph.add/removeModule/connect/disconnect`）のみを対象とする。
 //! マクロ（DrumMachine/BassMachine）の折り畳み情報（`group.Ledger`）は対象外
