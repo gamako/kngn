@@ -38,6 +38,7 @@ const stepgrid_mod = @import("stepgrid.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
+pub const Vec2f = input_mod.Vec2f;
 pub const Color = color_mod.Color;
 pub const Id = id_mod.Id;
 pub const IdStack = id_mod.IdStack;
@@ -62,6 +63,7 @@ pub const CachedRect = struct { rect: Rect, clip: Rect, measured_w: i32 = 0, mea
 
 /// scroll area の begin→end 間で持ち越す内部状態（TASK-46）。begin で前フレーム cache から
 /// 算出し scroll_stack に push、end で pop してスクロールバーを構築する。
+/// TASK-126: wheel は begin では適用せず end（LIFO＝内側優先）で消費・伝播する。
 pub const ScrollState = struct {
     bar_thickness: i32,
     track_col: Color,
@@ -76,6 +78,17 @@ pub const ScrollState = struct {
     h_len: i32,
     vthumb_id: Id,
     hthumb_id: Id,
+    /// caller 所有の scroll 量（wheel 適用先）
+    scroll: *Vec2f = undefined,
+    /// 前フレーム viewport rect（ヒット判定用。未確定時は null）
+    viewport_rect: ?Rect = null,
+    max_x: i32 = 0,
+    max_y: i32 = 0,
+    wheel_px: f32 = 32.0,
+    vp_w: i32 = 0,
+    vp_h: i32 = 0,
+    /// 当フレームの viewport layout node（wheel 後に scroll_x/y を反映）
+    viewport_node: ?*layout.Node = null,
 };
 
 pub const Context = struct {
@@ -101,6 +114,10 @@ pub const Context = struct {
     rect_cache: std.AutoHashMapUnmanaged(Id, CachedRect) = .empty,
     /// scroll area の begin→end 間状態スタック（TASK-46。ネスト対応）。arena 不使用（フレーム内 push/pop）。
     scroll_stack: std.ArrayList(ScrollState) = .empty,
+    /// TASK-126: フレーム内の未消費 wheel delta（最初の endScrollArea で input.scroll_delta から seed）。
+    /// 各 ScrollArea は実移動できた分だけ消費し、端到達の残量は外側へ伝播する。
+    wheel_remaining: Vec2f = .{},
+    wheel_remaining_seeded: bool = false,
     /// widget 共通スタイル（TASK-21.5）。caller が直接書き換えてよい（push/pop なし）。
     style: Style,
     /// ポップアップ/コンテキストメニューの開閉状態（TASK-79.1）。MVP は同時に1つのみ。
@@ -203,6 +220,8 @@ pub const Context = struct {
         self.id_stack.clear();
         self.state.beginFrame();
         self.composition = .{};
+        self.wheel_remaining = .{};
+        self.wheel_remaining_seeded = false;
         self.draw_list.reset(screen_w, screen_h);
         // レイアウトツリーの暗黙 root（caller は気にせず beginBox から使う）
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");

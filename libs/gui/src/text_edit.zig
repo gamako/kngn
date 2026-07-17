@@ -310,9 +310,36 @@ pub const TextBuffer = struct {
 
     /// 選択範囲を UTF-8 text で置換し、caret/selection を置換後末尾へ collapse する。
     /// 単一行契約: ASCII 制御文字（0x00-0x1F, 0x7F）と改行は除外。不正 UTF-8 はスキップ。
-    /// 戻り値は buffer が変わったか。
+    /// 戻り値は buffer が変わったか。無制限（max_len=null）版。
     pub fn replaceSelectionWithText(self: *TextBuffer, selection: *SelectionState, text: []const u8) !bool {
+        return replaceSelectionWithTextLimited(self, selection, text, null);
+    }
+
+    /// `max_len` 付き selection replacement。
+    /// - `null`: 無制限（既存 `replaceSelectionWithText` と同等）
+    /// - `0`: 挿入をすべて拒否（buffer/selection 不変）
+    /// - `n`: 選択解除後の基底文字数を差し引いた残り容量まで codepoint を挿入し、超過分は末尾から捨てる
+    /// 既存 buffer が既に max_len 超の場合も自動切り詰めはしない（編集結果にのみ適用）。
+    pub fn replaceSelectionWithTextLimited(
+        self: *TextBuffer,
+        selection: *SelectionState,
+        text: []const u8,
+        max_len: ?usize,
+    ) !bool {
         const range = selection.normalized();
+        const count = codepointCount(self.slice());
+        const sel_len = range.end - range.start;
+        const base = count - sel_len;
+        const remaining: ?usize = if (max_len) |limit|
+            if (base >= limit) @as(usize, 0) else limit - base
+        else
+            null;
+
+        // 残り 0 なら挿入不能 → buffer/selection を触らない（初期超過分の自動切り詰めもしない）
+        if (remaining) |r| {
+            if (r == 0) return false;
+        }
+
         var changed = false;
         if (range.start != range.end) {
             self.deleteRange(range);
@@ -320,6 +347,7 @@ pub const TextBuffer = struct {
             selection.extent = range.start;
             changed = true;
         }
+        var inserted: usize = 0;
         var pos: usize = 0;
         while (pos < text.len) {
             const n = std.unicode.utf8ByteSequenceLength(text[pos]) catch {
@@ -334,12 +362,43 @@ pub const TextBuffer = struct {
             };
             pos += n;
             if (!isPasteInsertableCodepoint(cp)) continue;
+            if (remaining) |r| {
+                if (inserted >= r) break;
+            }
             _ = try self.insertCodepoint(selection.extent, cp);
             selection.anchor += 1;
             selection.extent += 1;
+            inserted += 1;
             changed = true;
         }
         return changed;
+    }
+
+    /// 選択範囲を 1 codepoint で置換（typed char / IME commit 経路）。
+    /// `max_len` 到達時は buffer・caret・selection を変更せず false を返す。
+    pub fn replaceSelectionWithCodepoint(
+        self: *TextBuffer,
+        selection: *SelectionState,
+        cp: u32,
+        max_len: ?usize,
+    ) !bool {
+        if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return error.InvalidCodepoint;
+        const range = selection.normalized();
+        const count = codepointCount(self.slice());
+        const sel_len = range.end - range.start;
+        const base = count - sel_len;
+        if (max_len) |limit| {
+            if (base >= limit) return false;
+        }
+        if (range.start != range.end) {
+            self.deleteRange(range);
+            selection.anchor = range.start;
+            selection.extent = range.start;
+        }
+        _ = try self.insertCodepoint(selection.extent, cp);
+        selection.anchor += 1;
+        selection.extent += 1;
+        return true;
     }
 };
 
@@ -577,4 +636,100 @@ test "TASK-120: cut 相当の deleteRange 後 selection collapse" {
     selection.extent = range.start;
     try testing.expectEqualStrings("ho", buffer.slice());
     try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
+}
+
+test "TASK-128: ASCII max_len 直前・到達・超過" {
+    var buffer = try TextBuffer.init(testing.allocator, "ab");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 2, .extent = 2 };
+    // 直前: max_len=3 で 1 文字挿入可
+    try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, 'c', 3));
+    try testing.expectEqualStrings("abc", buffer.slice());
+    // 到達: これ以上は拒否
+    try testing.expect(!try buffer.replaceSelectionWithCodepoint(&selection, 'd', 3));
+    try testing.expectEqualStrings("abc", buffer.slice());
+    try testing.expectEqual(@as(usize, 3), selection.extent);
+    // 超過 paste は切り詰め
+    try testing.expect(!try buffer.replaceSelectionWithTextLimited(&selection, "XYZ", 3));
+    try testing.expectEqualStrings("abc", buffer.slice());
+}
+
+test "TASK-128: max_len=0 は挿入拒否" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    try testing.expect(!try buffer.replaceSelectionWithCodepoint(&selection, 'A', 0));
+    try testing.expect(!try buffer.replaceSelectionWithTextLimited(&selection, "Hi", 0));
+    try testing.expectEqualStrings("", buffer.slice());
+}
+
+test "TASK-128: max_len=null は無制限（既存同等）" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, 'A', null));
+    try testing.expect(try buffer.replaceSelectionWithTextLimited(&selection, "BC", null));
+    try testing.expectEqualStrings("ABC", buffer.slice());
+}
+
+test "TASK-128: 日本語 UTF-8 3byte は 1 codepoint" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, 'あ', 1));
+    try testing.expectEqualStrings("あ", buffer.slice());
+    try testing.expectEqual(@as(usize, 3), buffer.slice().len);
+    try testing.expect(!try buffer.replaceSelectionWithCodepoint(&selection, 'い', 1));
+    try testing.expectEqualStrings("あ", buffer.slice());
+}
+
+test "TASK-128: 絵文字 UTF-8 4byte は 1 codepoint" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    const grin: u32 = 0x1F600; // 😀
+    try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, grin, 1));
+    try testing.expectEqual(@as(usize, 4), buffer.slice().len);
+    try testing.expect(!try buffer.replaceSelectionWithCodepoint(&selection, 'A', 1));
+    try testing.expectEqual(@as(usize, 4), buffer.slice().len);
+}
+
+test "TASK-128: 選択範囲置換 paste は空いた容量を使う" {
+    var buffer = try TextBuffer.init(testing.allocator, "abcdef");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 1, .extent = 5 }; // "bcde"
+    // base=2 ("a"+"f"), max_len=4 → 残り 2
+    try testing.expect(try buffer.replaceSelectionWithTextLimited(&selection, "XYZ", 4));
+    try testing.expectEqualStrings("aXYf", buffer.slice());
+    try testing.expectEqual(@as(usize, 3), selection.extent);
+}
+
+test "TASK-128: 選択範囲置換 typed char" {
+    var buffer = try TextBuffer.init(testing.allocator, "abcd");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 1, .extent = 3 }; // "bc"
+    try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, 'Z', 3));
+    try testing.expectEqualStrings("aZd", buffer.slice());
+}
+
+test "TASK-128: paste 途中で max_len 到達時は切り詰め" {
+    var buffer = try TextBuffer.init(testing.allocator, "ab");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 2, .extent = 2 };
+    try testing.expect(try buffer.replaceSelectionWithTextLimited(&selection, "CDEF", 4));
+    try testing.expectEqualStrings("abCD", buffer.slice());
+    try testing.expectEqual(@as(usize, 4), selection.extent);
+}
+
+test "TASK-128: 制御文字・改行・不正 UTF-8 と max_len" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    // 制御・改行は除外され、挿入可能 2 文字だけが入る（max_len=2）
+    try testing.expect(try buffer.replaceSelectionWithTextLimited(&selection, "A\nB\x00C", 2));
+    try testing.expectEqualStrings("AB", buffer.slice());
+    // 不正 UTF-8 スキップ後の Z は上限で拒否
+    try testing.expect(!try buffer.replaceSelectionWithTextLimited(&selection, &.{ 0xFF, 'Z' }, 2));
+    try testing.expectEqualStrings("AB", buffer.slice());
+    try testing.expect(std.unicode.utf8ValidateSlice(buffer.slice()));
 }

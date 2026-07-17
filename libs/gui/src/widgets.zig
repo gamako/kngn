@@ -56,6 +56,9 @@ pub const TextInputOpts = struct {
     placeholder: []const u8 = "",
     /// frame-local paste text（app が getClipboardText して渡す。null は paste 無し）。
     paste_text: ?[]const u8 = null,
+    /// TextBuffer の codepoint 数上限。null=無制限、0=挿入拒否、n=最大 n codepoint。
+    /// 既存 buffer の自動切り詰めはしない（編集操作の結果にのみ適用）。
+    max_len: ?usize = null,
 };
 
 pub const TextInputResult = struct {
@@ -387,7 +390,7 @@ pub fn textInputId(
                         // no-op
                     } else if (key.code == 'V') {
                         if (opts.paste_text) |pt| {
-                            const did = text_edit.TextBuffer.replaceSelectionWithText(buffer, &per_id.selection, pt) catch
+                            const did = text_edit.TextBuffer.replaceSelectionWithTextLimited(buffer, &per_id.selection, pt, opts.max_len) catch
                                 @panic("textInput: OOM");
                             changed = changed or did;
                             per_id.caret = per_id.selection.extent;
@@ -480,16 +483,9 @@ pub fn textInputId(
             },
             .char_input => |ch| {
                 if (!isInsertableCodepoint(ch.codepoint)) continue;
-                const selection = per_id.selection.normalized();
-                if (selection.start != selection.end) {
-                    buffer.deleteRange(selection);
-                    per_id.selection.anchor = selection.start;
-                    per_id.selection.extent = selection.start;
-                }
-                _ = buffer.insertCodepoint(per_id.selection.extent, ch.codepoint) catch
+                const did = text_edit.TextBuffer.replaceSelectionWithCodepoint(buffer, &per_id.selection, ch.codepoint, opts.max_len) catch
                     @panic("textInput: OOM");
-                per_id.selection.anchor += 1;
-                per_id.selection.extent += 1;
+                if (!did) continue;
                 per_id.caret = per_id.selection.extent;
                 changed = true;
                 per_id.caret_blink_start_s = ctx.now();
@@ -1437,6 +1433,7 @@ fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Co
 
 /// 縦横スクロール領域を開始する。`id` は viewport の明示 ID（getNodeRect(id)=viewport 矩形）。
 /// `scroll` は呼び出し側保持の f32 スクロール量（x/y）。begin 後に中身の widget を積み、endScrollArea で閉じる。
+/// TASK-126: wheel は begin では適用せず、endScrollArea（LIFO＝内側優先）で消費・端到達伝播する。
 pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOpts) void {
     const content_id = id_mod.hashInt(id, 1);
     const vthumb_id = id_mod.hashInt(id, 2);
@@ -1453,17 +1450,6 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     const max_y: i32 = @max(0, content_h - vp_h);
     const need_v = max_y > 0;
     const need_h = max_x > 0;
-
-    // ホイール: mouse が前フレーム viewport 内のときだけ反映（canvas zoom 等との領域分離）
-    if (vp) |r| {
-        const mp = ctx.input.mouse_pos;
-        const inside = mp.x >= r.x and mp.x < r.x + @as(i32, @intCast(r.w)) and
-            mp.y >= r.y and mp.y < r.y + @as(i32, @intCast(r.h));
-        if (inside) {
-            scroll.x += -ctx.input.scroll_delta.x * opts.wheel_px;
-            scroll.y += -ctx.input.scroll_delta.y * opts.wheel_px;
-        }
-    }
 
     // thumb ドラッグ（前フレーム thumb rect で buttonBehavior、held 中 mouse_delta を scroll へ写像）
     if (need_v) {
@@ -1487,7 +1473,7 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         }
     }
 
-    // f32 のまま clamp
+    // f32 のまま clamp（wheel は end 側で追加適用するため、ここでは thumb 結果のみ）
     scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
     scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
 
@@ -1506,6 +1492,13 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         .h_len = 0,
         .vthumb_id = vthumb_id,
         .hthumb_id = hthumb_id,
+        .scroll = scroll,
+        .viewport_rect = vp,
+        .max_x = max_x,
+        .max_y = max_y,
+        .wheel_px = opts.wheel_px,
+        .vp_w = vp_w,
+        .vp_h = vp_h,
     };
     if (need_v) {
         st.v_len = scrollThumbLen(vp_h, content_h);
@@ -1523,7 +1516,6 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         else
             0;
     }
-    ctx.scroll_stack.append(ctx.gpa, st) catch @panic("beginScrollArea: OOM");
 
     const sx: i32 = @intFromFloat(@round(scroll.x));
     const sy: i32 = @intFromFloat(@round(scroll.y));
@@ -1532,13 +1524,66 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     ctx.beginBox(.{ .direction = .row, .width = opts.width, .height = opts.height, .bg = opts.bg, .border = opts.border });
     ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 } });
     ctx.beginBox(.{ .id = id, .direction = opts.direction, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .clip_children = true, .scroll_x = sx, .scroll_y = sy });
+    st.viewport_node = ctx.layout_current;
     ctx.beginBox(.{ .id = content_id, .direction = opts.direction, .width = opts.content_width, .height = opts.content_height, .padding = opts.padding, .gap = opts.gap, .align_cross = opts.align_cross });
+    ctx.scroll_stack.append(ctx.gpa, st) catch @panic("beginScrollArea: OOM");
+}
+
+/// scroll に未消費 wheel を適用し、実移動できた分だけ delta を消費する（TASK-126）。
+/// 端到達で動けなかった残量は `ctx.wheel_remaining` に残り、外側 ScrollArea へ伝播する。
+fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
+    if (!ctx.wheel_remaining_seeded) {
+        ctx.wheel_remaining = ctx.input.scroll_delta;
+        ctx.wheel_remaining_seeded = true;
+    }
+    const rem = &ctx.wheel_remaining;
+    if (rem.x == 0 and rem.y == 0) return;
+
+    const r = st.viewport_rect orelse return;
+    const mp = ctx.input.mouse_pos;
+    const inside = mp.x >= r.x and mp.x < r.x + @as(i32, @intCast(r.w)) and
+        mp.y >= r.y and mp.y < r.y + @as(i32, @intCast(r.h));
+    if (!inside) return;
+
+    const wp = st.wheel_px;
+    if (wp == 0) return;
+
+    const scroll = st.scroll;
+    const max_x_f: f32 = @floatFromInt(st.max_x);
+    const max_y_f: f32 = @floatFromInt(st.max_y);
+    const req_x = -rem.x * wp;
+    const req_y = -rem.y * wp;
+    const old_x = scroll.x;
+    const old_y = scroll.y;
+    scroll.x = std.math.clamp(scroll.x + req_x, 0, max_x_f);
+    scroll.y = std.math.clamp(scroll.y + req_y, 0, max_y_f);
+    const act_x = scroll.x - old_x;
+    const act_y = scroll.y - old_y;
+
+    // 実移動分だけ delta を消費（wheel_px がネストで異なっても px↔delta 変換で整合）
+    rem.x -= -act_x / wp;
+    rem.y -= -act_y / wp;
+
+    if (st.viewport_node) |node| {
+        node.cfg.scroll_x = @intFromFloat(@round(scroll.x));
+        node.cfg.scroll_y = @intFromFloat(@round(scroll.y));
+    }
+    if (st.need_v and st.max_y > 0) {
+        const travel = st.vp_h - st.v_len;
+        st.v_off = @intFromFloat(@round(scroll.y / max_y_f * @as(f32, @floatFromInt(travel))));
+    }
+    if (st.need_h and st.max_x > 0) {
+        const travel = st.vp_w - st.h_len;
+        st.h_off = @intFromFloat(@round(scroll.x / max_x_f * @as(f32, @floatFromInt(travel))));
+    }
 }
 
 /// scroll area を閉じてスクロールバーを構築する（begin と対で呼ぶ）。
+/// TASK-126: content を閉じた直後に wheel を内側優先で処理し、viewport の scroll に同一フレーム反映する。
 pub fn endScrollArea(ctx: *Context) void {
-    const st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: begin と不対応");
+    var st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: begin と不対応");
     ctx.endBox(); // inner content
+    applyScrollAreaWheel(ctx, &st);
     ctx.endBox(); // viewport
 
     // 横スクロールバー（leftCol 内・viewport の下）
@@ -2332,6 +2377,249 @@ test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラ
     ctx.endFrame();
 
     // frame4: 下へドラッグ → held 中 mouse_delta.y>0 が scroll.y を増やす
+    const before = scroll.y;
+    ctx.beginFrame(300, 300);
+    moveTo(&ctx, tc.x, tc.y + 20);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    try std.testing.expect(scroll.y > before);
+}
+
+fn nestScrollWarmup(ctx: *Context, outer_id: Id, inner_id: Id, mid_id: ?Id, outer: *Vec2f, mid: ?*Vec2f, inner: *Vec2f) void {
+    const opts_o: ScrollAreaOpts = .{ .width = .{ .fixed = 200 }, .height = .{ .fixed = 160 } };
+    const opts_i: ScrollAreaOpts = .{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 80 } };
+    const opts_m: ScrollAreaOpts = .{ .width = .{ .fixed = 180 }, .height = .{ .fixed = 120 } };
+    // 2 frames to populate rect/measured caches
+    var frame: usize = 0;
+    while (frame < 2) : (frame += 1) {
+        ctx.beginFrame(400, 400);
+        ctx.beginScrollArea(outer_id, outer, opts_o);
+        buildFixedContent(ctx, id_mod.hashInt(outer_id, 0xA0), 40, 40);
+        if (mid_id) |mid_sid| {
+            ctx.beginScrollArea(mid_sid, mid.?, opts_m);
+            buildFixedContent(ctx, id_mod.hashInt(mid_sid, 0xA0), 40, 40);
+            ctx.beginScrollArea(inner_id, inner, opts_i);
+            buildFixedContent(ctx, id_mod.hashInt(inner_id, 0xA0), 80, 400);
+            ctx.endScrollArea();
+            buildFixedContent(ctx, id_mod.hashInt(mid_sid, 0xA1), 40, 300);
+            ctx.endScrollArea();
+        } else {
+            ctx.beginScrollArea(inner_id, inner, opts_i);
+            buildFixedContent(ctx, id_mod.hashInt(inner_id, 0xA0), 80, 400);
+            ctx.endScrollArea();
+        }
+        buildFixedContent(ctx, id_mod.hashInt(outer_id, 0xA1), 40, 400);
+        ctx.endScrollArea();
+        ctx.endFrame();
+    }
+}
+
+test "TASK-126: 2段ネスト wheel は inner のみ変化し outer は不変" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const OUTER: Id = 0x12601;
+    const INNER: Id = 0x12602;
+    var outer: Vec2f = .{};
+    var inner: Vec2f = .{};
+    nestScrollWarmup(&ctx, OUTER, INNER, null, &outer, null, &inner);
+
+    const ir = ctx.getNodeRect(INNER).?;
+    const ic = center(ir);
+    const outer_before = outer.y;
+    const inner_before = inner.y;
+
+    ctx.beginFrame(400, 400);
+    moveTo(&ctx, ic.x, ic.y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = ic.x, .y = ic.y, .dx = 0, .dy = -3, .modifiers = 0 } });
+    nestScrollWarmupFrame(&ctx, OUTER, INNER, null, &outer, null, &inner);
+    ctx.endFrame();
+
+    try std.testing.expect(inner.y > inner_before);
+    try std.testing.expectEqual(outer_before, outer.y);
+}
+
+fn nestScrollWarmupFrame(ctx: *Context, outer_id: Id, inner_id: Id, mid_id: ?Id, outer: *Vec2f, mid: ?*Vec2f, inner: *Vec2f) void {
+    const opts_o: ScrollAreaOpts = .{ .width = .{ .fixed = 200 }, .height = .{ .fixed = 160 } };
+    const opts_i: ScrollAreaOpts = .{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 80 } };
+    const opts_m: ScrollAreaOpts = .{ .width = .{ .fixed = 180 }, .height = .{ .fixed = 120 } };
+    ctx.beginScrollArea(outer_id, outer, opts_o);
+    buildFixedContent(ctx, id_mod.hashInt(outer_id, 0xA0), 40, 40);
+    if (mid_id) |mid_sid| {
+        ctx.beginScrollArea(mid_sid, mid.?, opts_m);
+        buildFixedContent(ctx, id_mod.hashInt(mid_sid, 0xA0), 40, 40);
+        ctx.beginScrollArea(inner_id, inner, opts_i);
+        buildFixedContent(ctx, id_mod.hashInt(inner_id, 0xA0), 80, 400);
+        ctx.endScrollArea();
+        buildFixedContent(ctx, id_mod.hashInt(mid_sid, 0xA1), 40, 300);
+        ctx.endScrollArea();
+    } else {
+        ctx.beginScrollArea(inner_id, inner, opts_i);
+        buildFixedContent(ctx, id_mod.hashInt(inner_id, 0xA0), 80, 400);
+        ctx.endScrollArea();
+    }
+    buildFixedContent(ctx, id_mod.hashInt(outer_id, 0xA1), 40, 400);
+    ctx.endScrollArea();
+}
+
+test "TASK-126: 3段ネスト wheel は最深のみ変化（LIFO）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const OUTER: Id = 0x12611;
+    const MID: Id = 0x12612;
+    const INNER: Id = 0x12613;
+    var outer: Vec2f = .{};
+    var mid: Vec2f = .{};
+    var inner: Vec2f = .{};
+    nestScrollWarmup(&ctx, OUTER, INNER, MID, &outer, &mid, &inner);
+
+    const ir = ctx.getNodeRect(INNER).?;
+    const ic = center(ir);
+    const outer_y0 = outer.y;
+    const mid_y0 = mid.y;
+    const inner_y0 = inner.y;
+
+    ctx.beginFrame(400, 400);
+    moveTo(&ctx, ic.x, ic.y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = ic.x, .y = ic.y, .dx = 0, .dy = -2, .modifiers = 0 } });
+    nestScrollWarmupFrame(&ctx, OUTER, INNER, MID, &outer, &mid, &inner);
+    ctx.endFrame();
+
+    try std.testing.expect(inner.y > inner_y0);
+    try std.testing.expectEqual(outer_y0, outer.y);
+    try std.testing.expectEqual(mid_y0, mid.y);
+}
+
+test "TASK-126: inner 端到達後の残量は outer へ伝播" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const OUTER: Id = 0x12621;
+    const INNER: Id = 0x12622;
+    var outer: Vec2f = .{};
+    var inner: Vec2f = .{};
+    nestScrollWarmup(&ctx, OUTER, INNER, null, &outer, null, &inner);
+
+    const ir = ctx.getNodeRect(INNER).?;
+    const ic = center(ir);
+    // inner を下端まで進める
+    inner.y = 10000;
+    ctx.beginFrame(400, 400);
+    nestScrollWarmupFrame(&ctx, OUTER, INNER, null, &outer, null, &inner);
+    ctx.endFrame();
+    const inner_max = inner.y;
+    try std.testing.expect(inner_max > 0);
+
+    const outer_before = outer.y;
+    ctx.beginFrame(400, 400);
+    moveTo(&ctx, ic.x, ic.y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = ic.x, .y = ic.y, .dx = 0, .dy = -3, .modifiers = 0 } });
+    nestScrollWarmupFrame(&ctx, OUTER, INNER, null, &outer, null, &inner);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(inner_max, inner.y);
+    try std.testing.expect(outer.y > outer_before);
+}
+
+test "TASK-126: inner が端でないとき outer は不変" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const OUTER: Id = 0x12631;
+    const INNER: Id = 0x12632;
+    var outer: Vec2f = .{};
+    var inner: Vec2f = .{};
+    nestScrollWarmup(&ctx, OUTER, INNER, null, &outer, null, &inner);
+
+    const ir = ctx.getNodeRect(INNER).?;
+    const ic = center(ir);
+    try std.testing.expectEqual(@as(f32, 0), inner.y);
+
+    const outer_before = outer.y;
+    ctx.beginFrame(400, 400);
+    moveTo(&ctx, ic.x, ic.y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = ic.x, .y = ic.y, .dx = 0, .dy = -1, .modifiers = 0 } });
+    nestScrollWarmupFrame(&ctx, OUTER, INNER, null, &outer, null, &inner);
+    ctx.endFrame();
+
+    try std.testing.expect(inner.y > 0);
+    try std.testing.expectEqual(outer_before, outer.y);
+}
+
+test "TASK-126: viewport 外の wheel はどの ScrollArea も動かない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const OUTER: Id = 0x12641;
+    const INNER: Id = 0x12642;
+    var outer: Vec2f = .{};
+    var inner: Vec2f = .{};
+    nestScrollWarmup(&ctx, OUTER, INNER, null, &outer, null, &inner);
+
+    const outer_y0 = outer.y;
+    const inner_y0 = inner.y;
+    ctx.beginFrame(400, 400);
+    moveTo(&ctx, 390, 390);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = 390, .y = 390, .dx = 0, .dy = -5, .modifiers = 0 } });
+    nestScrollWarmupFrame(&ctx, OUTER, INNER, null, &outer, null, &inner);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(outer_y0, outer.y);
+    try std.testing.expectEqual(inner_y0, inner.y);
+}
+
+test "TASK-126: 非ネスト ScrollArea の wheel / clamp / thumb は従来どおり" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x12651;
+    const CHILD: Id = 0x12652;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 }, .wheel_px = 32.0 };
+
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    const vp = ctx.getNodeRect(SID).?;
+    const c = center(vp);
+    ctx.beginFrame(300, 300);
+    moveTo(&ctx, c.x, c.y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = c.x, .y = c.y, .dx = 0, .dy = -3, .modifiers = 0 } });
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 96), scroll.y, 0.5);
+
+    // clamp
+    scroll.y = 10000;
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.y, 0.5);
+
+    // thumb drag still works
+    const vthumb_id = id_mod.hashInt(SID, 2);
+    scroll.y = 0;
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    const tc = center(ctx.getNodeRect(vthumb_id).?);
+    ctx.beginFrame(300, 300);
+    pressAt(&ctx, tc.x, tc.y);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
     const before = scroll.y;
     ctx.beginFrame(300, 300);
     moveTo(&ctx, tc.x, tc.y + 20);
@@ -3260,4 +3548,166 @@ test "TextInput: composition は focused のみ消費（非 focus は preedit �
     ctx.endBox();
     ctx.endFrame();
     try std.testing.expectEqualStrings("", b.slice());
+}
+
+test "TASK-128: TextInput typed char が上限で拒否" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xD1281;
+    const opts: TextInputOpts = .{ .width = .{ .fixed = 80 }, .max_len = 2 };
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInputOpts(&ctx, id, &buffer, opts);
+    ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
+    ctx.perIdState(id).caret = 2;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 'c', .modifiers = 0 } });
+    const r = ctx.textInputId(id, &buffer, opts);
+    try std.testing.expect(!r.changed);
+    try std.testing.expectEqualStrings("ab", buffer.slice());
+    ctx.endFrame();
+}
+
+test "TASK-128: TextInput 上限未満の typed char は挿入" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "a");
+    defer buffer.deinit();
+    const id: Id = 0xD1282;
+    const opts: TextInputOpts = .{ .width = .{ .fixed = 80 }, .max_len = 3 };
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInputOpts(&ctx, id, &buffer, opts);
+    ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 1 };
+    ctx.perIdState(id).caret = 1;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 'b', .modifiers = 0 } });
+    const r = ctx.textInputId(id, &buffer, opts);
+    try std.testing.expect(r.changed);
+    try std.testing.expectEqualStrings("ab", buffer.slice());
+    ctx.endFrame();
+}
+
+test "TASK-128: TextInput selection replacement は空いた容量を利用" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "abcd");
+    defer buffer.deinit();
+    const id: Id = 0xD1283;
+    const opts: TextInputOpts = .{ .width = .{ .fixed = 80 }, .max_len = 3 };
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInputOpts(&ctx, id, &buffer, opts);
+    ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 3 };
+    ctx.perIdState(id).caret = 3;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 'Z', .modifiers = 0 } });
+    const r = ctx.textInputId(id, &buffer, opts);
+    try std.testing.expect(r.changed);
+    try std.testing.expectEqualStrings("aZd", buffer.slice());
+    ctx.endFrame();
+}
+
+test "TASK-128: TextInput paste が codepoint 単位で切り詰め" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xD1284;
+    const opts: TextInputOpts = .{ .width = .{ .fixed = 80 }, .max_len = 4, .paste_text = "CDEF" };
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInputOpts(&ctx, id, &buffer, .{ .width = .{ .fixed = 80 }, .max_len = 4 });
+    ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
+    ctx.perIdState(id).caret = 2;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = false } });
+    const r = ctx.textInputId(id, &buffer, opts);
+    try std.testing.expect(r.changed);
+    try std.testing.expectEqualStrings("abCD", buffer.slice());
+    ctx.endFrame();
+}
+
+test "TASK-128: composition 中 char_input も上限付き" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "xy");
+    defer buffer.deinit();
+    const id: Id = 0xD1285;
+    const opts: TextInputOpts = .{ .width = .{ .fixed = 80 }, .max_len = 2 };
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInputOpts(&ctx, id, &buffer, opts);
+    ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
+    ctx.perIdState(id).caret = 2;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = '日', .modifiers = 0 } });
+    const r = ctx.textInputId(id, &buffer, opts);
+    try std.testing.expect(!r.changed);
+    try std.testing.expectEqualStrings("xy", buffer.slice());
+    ctx.endFrame();
+    // preedit 自体は max_len で切らない
+    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "あ") >= 1);
+}
+
+test "TASK-128: composition confirm 後 TextBuffer のみ上限内" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "a");
+    defer buffer.deinit();
+    const id: Id = 0xD1286;
+    const opts: TextInputOpts = .{ .width = .{ .fixed = 80 }, .max_len = 2 };
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInputOpts(&ctx, id, &buffer, opts);
+    ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 1 };
+    ctx.perIdState(id).caret = 1;
+
+    // commit 相当: composition 下ろし + char_input 2 つ（2 文字目は上限で拒否）
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{ .active = false, .text = "", .cursor = 0 });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = '日', .modifiers = 0 } });
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = '本', .modifiers = 0 } });
+    _ = ctx.textInputId(id, &buffer, opts);
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("a日", buffer.slice());
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "に"));
+}
+
+test "TASK-128: max_len=null で既存 TextInput 挙動不変" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xD1287;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+    ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
+    ctx.perIdState(id).caret = 2;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 'c', .modifiers = 0 } });
+    const r = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 }, .max_len = null });
+    try std.testing.expect(r.changed);
+    try std.testing.expectEqualStrings("abc", buffer.slice());
+    ctx.endFrame();
+}
+
+fn focusTextInputOpts(ctx: *Context, id: Id, buffer: *TextBuffer, opts: TextInputOpts) void {
+    _ = ctx.textInputId(id, buffer, opts);
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(id).?;
+    ctx.beginFrameAt(240, 120, ctx.now() + 0.1);
+    clickAt(ctx, rect.x + 8, rect.y + 8);
+    _ = ctx.textInputId(id, buffer, opts);
+    ctx.endFrame();
 }
