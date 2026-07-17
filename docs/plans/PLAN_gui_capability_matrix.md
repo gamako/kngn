@@ -169,11 +169,11 @@ examples/35_gui_gallery/e2e.txt は各 section で digest gallery と path 省�
 1. Nested ScrollArea の wheel が内側優先にならず outer/inner 同時変化
 2. PerIdStateStore に trim/TTL/上限がなく ID 長期変化で単調増加
 3. TextBuffer / textInputId に最大長 API がない
-4. 改行・CJK・emoji の measure / coverage が default font 依存
+4. 改行・CJK・emoji の measure / coverage は §17 で default font の観測契約を明文化済み
 5. popup 長文 item の小画面 outer はみ出し仕様が未明文化
 6. zero-size / overflow container の hit-test・clip・child rect 仕様未定義
-7. drag 中 layout 変更時の rect cache 同期遅延の仕様化
-8. 自動 ID 同一ラベル衝突は現行契約（ドキュメント化候補）
+7. drag 中 layout 変更時の rect cache 同期遅延は §16 で現行契約を明文化済み
+8. 自動 ID 同一ラベル衝突は §17 で現行契約と `Id` 版利用規約を明文化済み
 
 ## AC#5 / AC#6 セルフチェック
 
@@ -253,3 +253,165 @@ libs/gui 本体は変更していない。不足は example 側 custom/hack ま�
 ### 15.3 サイズ別確認
 
 640×360 / 1024×768 / 1440×900 を別プロセスで起動し `snapshot fb`（path 省略）で目視。padding/gap は幅に応じて調整、固定絶対配置は使わない。
+
+## 16. TASK-131 レイアウトと入力の時間契約
+
+> **本タスク時点の観測（2026-07-18）**: 以下は libs/gui の現行実装に基づく契約である。
+> TASK-130 等の並行変更で clip / hit-test 境界が変わる場合は、当該タスクの節と本節を併読すること。
+
+### 16.1 フレーム順序
+
+| 段階 | 処理 | 根拠 |
+|---|---|---|
+| `beginFrame` | arena reset、input/id_stack/state 初期化、draw_list reset、layout root 生成（未 measure/place） | `libs/gui/src/context.zig:220-243` |
+| widget 呼び出し | 前フレーム `rect_cache` で同期 hit-test、当フレーム layout tree を構築 | `libs/gui/src/widgets.zig:203-206` |
+| `endFrame` | `layout.measure` → `layout.place` → `rect_cache.clearRetainingCapacity` → `updateRectCache` → `emitNode` → `frame_active=false` | `libs/gui/src/context.zig:245-260` |
+
+`endFrame` は hit-test を行わない。focus 解除・active 張り付き防止は `endFrame` 末尾の state 更新のみ（`context.zig:261-270`）。
+
+### 16.2 rect cache の可視時点
+
+- `updateRectCache` は `endFrame` の measure/place 完了後にのみ走る（`context.zig:256-257`）。
+- 登録対象は `beginBox` で `cfg.id != 0` の明示 ID ノードのみ。`{rect, clip, measured_w, measured_h}` を保存（`context.zig:420-429`）。
+- `getNodeRect` / `getNodeCachedRect` / `getNodeMeasured` は前フレーム確定値を返す。`beginFrame` 直後も更新されない（`context.zig:377-404`）。
+- 初回フレーム・未知 ID・自動採番ノード（`beginBox` の `cfg.id==0`）は null。
+- 同一フレーム内の明示 ID 重複は Debug assert で契約違反（`context.zig:424-425`）。
+
+### 16.3 drag 中の layout 変更
+
+layout 変更を伴う drag では次の 1 フレーム遅延が観測される（現行契約。修正は採用しない）。
+
+```text
+フレーム N:
+  前フレーム rect を読む
+  → buttonBehavior が前フレーム rect で active / held を判定
+  → widget 構築中に layout 変更
+  → endFrame で新 rect を cache に保存・新 layout を描画
+
+フレーム N+1:
+  新 rect cache を読んで hit-test
+```
+
+フレーム N の描画は新 layout、hit-test は旧 layout。通常の static layout・slider drag・scroll では観測しにくい。
+
+### 16.4 採用理由と非採用案
+
+**採用**: 前フレーム rect cache による同期 hit-test を現行契約として維持。
+
+**非採用案**（同一フレーム rect 反映）:
+
+| 案 | 理由 |
+|---|---|
+| A: widget 構築前に layout 確定 | 兄弟 measure・親 sizing に依存し、全 widget 構築前に最終 rect を得られない |
+| B: endFrame 後に hit-test 再実行 | 同期返却 API（`ButtonResult` / `changed`）と衝突。イベント保存・再評価・順序定義が必要 |
+| C: widget ごとに予測 rect | flex/scroll/popup/動的ラベル幅を含む一般 widget に適用不可。layout と hit-test の二重経路 |
+
+実害は限定ケース（drag 中の親 layout 変更、表示切替、release 位置が新旧 rect で不一致）に留まる。
+
+### 16.5 TASK-121.2 E2E 根拠
+
+`examples/37_gui_torture/e2e_input_state.txt` が現行契約の観測値を固定している。
+
+- F1 による layout shift 中も `active=slider`、`dragging=1`、`layout_generation=1` を維持（`e2e_input_state.txt:17-25`）
+- mouse up 後 `active_is_zero=1`（`e2e_input_state.txt:27-30`）
+
+### 16.6 TASK-126 wheel 契約との境界
+
+TASK-126 の scroll wheel は `endScrollArea` 同フレーム反映（内側優先消費・viewport node への scroll offset 適用）という scroll 固有の入力配送契約である（`context.zig:64-66` の `ScrollState` コメント参照）。
+
+任意の layout 変更を同一フレーム hit-test に反映する一般契約とは分離して扱う。wheel と rect cache 遅延は矛盾しない。
+
+## 17. TASK-132 テキスト計測・描画契約
+
+> **本タスク時点の観測（2026-07-18）**: 以下は `gui.default_font`（spleen 8×16 bitmap）を前提とした観測契約である。
+> 別の `Font` 実装を渡した場合の glyph coverage と advance はその実装の契約に依存する。
+
+### 17.1 適用範囲と Font 依存
+
+- 対象: `Font.measure` / `Font.drawTo` / `TextLayout` / label 系 widget / `textInputId`
+- default font: ASCII `32..127` の 8×16 bitmap（`libs/gui/src/font.zig:13-19`, `font.zig:208-215`）
+- font chain / emoji font / glyph fallback は `libs/gui` に存在しない
+
+### 17.2 改行
+
+| 経路 | 挙動 | 根拠 |
+|---|---|---|
+| label / selectableLabel 等（表示） | `\n` は strip されない。1 codepoint として measure 8px。描画は glyph 範囲外のためスキップ、advance は 8px 進む（行送りなし） | `font.zig:18-19`, `font.zig:81-85` |
+| TextInput（編集） | typed char / paste / selection replacement は改行・ASCII 制御文字を挿入しない | `widgets.zig:500`, `widgets.zig:619-621`, `text_edit.zig:377`, `text_edit.zig:418` |
+
+default font は 1 行描画契約（改行による高さ増加なし）。
+
+### 17.3 CJK
+
+valid UTF-8 の CJK は 1 codepoint として処理。
+
+| 項目 | default font | 根拠 |
+|---|---|---|
+| measure | 1 文字 8px | `font.zig:57-61` |
+| TextLayout | 1 codepoint 分の byte offset / prefix_width | `text_edit.zig:54-79` |
+| 描画 | glyph なし（スキップ） | `font.zig:81-85` |
+| advance | glyph なくても 8px | `font.zig:64-71` |
+| fallback | なし | — |
+
+`wordRange` は非 ASCII 連続列を 1 word とする。grapheme cluster / 言語別分割は未実装（`text_edit.zig:112-128`）。
+
+### 17.4 emoji
+
+emoji も valid UTF-8 なら codepoint 単位。default font では CJK と同様に glyph 未描画・advance 8px。
+
+ZWJ sequence / variation selector / skin tone 等は grapheme 単位では処理せず、構成 codepoint ごとに処理する。表示上の 1 emoji と logical width の一致は保証されない。
+
+### 17.5 default font の coverage と fallback
+
+- coverage: ASCII `32..127` の bitmap 立ちビット（`font.zig:101-120`）
+- 非 ASCII: `.notdef` や代替 glyph に置換されず描画スキップ（`font.zig:81-85`）
+- fallback font / font chain: なし
+
+### 17.6 measure / draw advance / ink 幅
+
+default font の `measure`:
+
+- valid UTF-8: codepoint 数 × 8
+- invalid UTF-8: byte 数 × 8
+- missing glyph / newline / CJK / emoji: いずれも advance 8px
+
+`drawTo` も codepoint ごとに 8px 進むため logical measure と描画カーソル幅は一致する。glyph 未描画時があるため **logical width は ink pixel 幅を意味しない**。
+
+layout text leaf: 幅 = `Font.measure`、高さ = `Font.metrics().line_height`（`libs/gui/src/layout.zig:166-169`）。
+
+### 17.7 TextLayout / caret / selection / hit-test
+
+`buildTextLayout` は codepoint ごとに UTF-8 byte offset・logical advance・累積 `prefix_widths` を生成（`text_edit.zig:54-79`）。
+
+- `selectableLabel`: 幅 = `prefix_widths[count]`、高さ = line_height（`widgets.zig:294-298`）
+- `textInputId`: selection / caret / scroll / hit-test は `prefix_widths` 基準（`widgets.zig:351-378`）
+- `.fit` 幅 = `Font.measure` + padding（`widgets.zig:596-600`）
+- ink height = `ascent + descent`（line_height ではない。`widgets.zig:531-533`）
+
+`hitTest` は advance 中点を境界として **codepoint index** を返す（byte offset ではない）（`text_edit.zig:91-100`）。
+
+### 17.8 自動 ID と同一ラベル衝突
+
+label 系自動 ID は `IdStack.make(label)` = 現在 seed + label の hash（`libs/gui/src/id.zig:83-85`）。
+
+該当 API: `button` / `buttonEx` / `selectableLabel` / `sliderI32` / `sliderF32` / `svSquare` / `hueBar` / `checkbox` / `toggle` / `radio`（各 `id_stack.make` 呼び出しは `widgets.zig` 参照）。`colorSwatch` は `makeInt(色値)`。`textInputId` は自動 ID 版なし。
+
+同一 `IdStack` scope 内で同一 label → 同一 ID → `endFrame` の `updateRectCache` で Debug assert（`context.zig:424-425`）。
+
+負系 E2E: `examples/37_gui_torture/negative_auto_id.sh`（非ゼロ終了 + assert/panic 痕跡を期待）。
+
+**利用規約**: 同一ラベル並置は `buttonId` / `selectableLabelId` 等の明示 ID 版、または `id_stack.push(i)` で scope を分ける。
+
+Release build での最後勝ち上書きは契約上の許容動作ではなく、重複 ID を使わないことを前提とする。
+
+### 17.9 利用規約と非対応範囲
+
+| 項目 | 状態 |
+|---|---|
+| 複数行 layout / 折返し | 未対応（1 行契約） |
+| grapheme cluster 処理 | 未対応（codepoint 単位） |
+| glyph fallback / emoji font | 未追加 |
+| 改行の行送り（label 表示） | 未対応（advance のみ） |
+| 自動 ID 同一ラベル | Debug assert で検出（`endFrame` cache 更新時） |
+
+観測 E2E: `examples/37_gui_torture/e2e_text.txt`（ASCII/CJK/emoji/改行入り label、500 codepoints measure、TextInput caret/selection の codepoint 境界）。

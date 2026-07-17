@@ -1,4 +1,9 @@
-//! 単一行テキストのレイアウト、hit-test、選択状態。
+//! 単一行テキストのレイアウト、hit-test、選択状態（TASK-132 契約明文化）。
+//!
+//! 本タスク時点の観測: default font では codepoint 単位の logical advance（通常 8px）で
+//! measure / TextLayout / caret / selection / hit-test を行う。grapheme cluster・複数行・
+//! glyph fallback は未実装。改行は TextBuffer 編集経路では挿入拒否、label 表示では
+//! 1 codepoint 分の advance を持つが行送りはしない。
 //!
 //! ホットパス宣言:
 //! - hitTest と layout 構築の codepoint 走査は widget 呼び出し時の O(codepoint)。
@@ -28,9 +33,10 @@ pub const TextRange = struct {
     end: usize,
 };
 
-/// byte_offsets は codepoint 数 + 1 個、prefix_widths も同じ長さを持つ。
-/// text は wordRange が ASCII / 非 ASCII の規則を判定するための借用 slice である。
-/// byte_offsets と prefix_widths の所有権は buildTextLayout に渡した allocator にある。
+/// codepoint 境界と累積 logical width の対応表。
+/// `byte_offsets[i]` / `prefix_widths[i]` は codepoint index `i` の先頭。
+/// `count()` = codepoint 数。caret / selection / hitTest の index は byte offset ではなく
+/// この codepoint index を使う（UTF-8 継続 byte 内には入らない）。
 pub const TextLayout = struct {
     byte_offsets: []const usize,
     prefix_widths: []const u32,
@@ -42,8 +48,9 @@ pub const TextLayout = struct {
     }
 };
 
-/// UTF-8 の codepoint 境界と各 codepoint の logical advance を構築する。
-/// 正常な UTF-8 は codepoint 単位、不正な UTF-8 は不正位置の 1 byte 単位で進む。
+/// UTF-8 text の codepoint 境界と各 codepoint の logical advance（Font.measure）を構築する。
+/// valid UTF-8 は codepoint 単位、不正 UTF-8 は不正位置の 1 byte 単位で進む（Font 契約と一致）。
+/// default font では各 advance は通常 8px。戻り値の配列は allocator 上に確保される。
 pub fn buildTextLayout(a: Allocator, font: Font, text: []const u8) !TextLayout {
     var count: usize = 0;
     var pos: usize = 0;
@@ -78,7 +85,9 @@ pub fn buildTextLayout(a: Allocator, font: Font, text: []const u8) !TextLayout {
     };
 }
 
-/// glyph advance の中点で境界を選ぶ。範囲外は [0, codepoint 数] に clamp する。
+/// local_x（widget 左上原点）から codepoint index を返す。
+/// 各 codepoint の logical advance（prefix_widths の差分）の中点を境界とする。
+/// 戻り値は byte offset ではなく codepoint index（0..count）。範囲外は [0, count] に clamp。
 pub fn hitTest(layout: TextLayout, local_x: i32) usize {
     const count = layout.count();
     if (count == 0 or local_x <= 0) return 0;
@@ -93,6 +102,7 @@ pub fn hitTest(layout: TextLayout, local_x: i32) usize {
 }
 
 /// codepoint index から元テキストの UTF-8 byte offset へ変換する。
+/// selection の byte slice 抽出（copy 等）に使う。index は codepoint 単位。
 pub fn byteIndex(text: []const u8, index: usize) usize {
     var pos: usize = 0;
     var i: usize = 0;
@@ -102,8 +112,9 @@ pub fn byteIndex(text: []const u8, index: usize) usize {
     return pos;
 }
 
-/// ASCII 英数字/_ の連続、または ASCII 区切りに挟まれた非 ASCII 連続列を返す。
-/// 空白・句読点自身を押した場合は、その codepoint だけを選択する。
+/// ダブルクリック用の単語範囲（codepoint index）。
+/// ASCII 英数字/_ の連続、または ASCII 区切りに挟まれた非 ASCII（CJK/emoji 等）の連続列を
+/// 1 word とする。grapheme cluster / 言語別分割規則は実装しない。
 pub fn wordRange(layout: TextLayout, index: usize) TextRange {
     const count = layout.count();
     if (count == 0 or index >= count) return .{ .start = index, .end = index };
@@ -235,8 +246,10 @@ fn isWordSeparator(cp: u32) bool {
     return !isWordChar(cp);
 }
 
-/// caller が所有する単一行 UTF-8 buffer。caret/selection は codepoint index を使い、
+/// caller が所有する単一行 UTF-8 buffer。caret/selection は codepoint index、
 /// 実体の ArrayList は UTF-8 byte 列を保持する。
+/// 単一行契約: typed char / paste / selection replacement は ASCII 制御文字（0x00-0x1F, 0x7F）
+/// と改行を挿入しない（isInsertableCodepoint / replaceSelectionWithTextLimited 参照）。
 pub const TextBuffer = struct {
     bytes: std.ArrayList(u8),
     alloc: Allocator,

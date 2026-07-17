@@ -1,18 +1,26 @@
 // Context: 入力 + ID stack + interaction state + draw list + arena + font + layout を束ねる。
 // フレームライフサイクル（beginFrame / endFrame）と widget behavior の起点。
 //
+// 本タスク時点の観測（TASK-131）: 以下は 2026-07-18 時点の現行契約である。
+// TASK-130 等の並行変更で clip / hit-test 契約が変わる場合は capability matrix §16 と
+// 相互参照で確認すること。
+//
 // ライフサイクル契約（21.2 案A「契約の番人」+ 21.4 layout）:
 //   beginFrame(w,h): arena.reset → input/id_stack/state.beginFrame → draw_list.reset(w,h)
-//                    → layout ツリーの暗黙 root を arena 上に生成
-//   endFrame():      layout（measure + place）→ rect キャッシュ更新 → draw cmd 発行 →
-//                    frame_active を下ろす。arena は触らない。
-//                    → endFrame 後も draw_list / id_stack / state / レイアウトツリーは
-//                      次 beginFrame まで valid。rect キャッシュ（gpa 所有）は次 endFrame まで valid。
+//                    → layout ツリーの暗黙 root を arena 上に生成（当フレームは未 measure/place）
+//   widget 呼び出し: 前フレーム rect_cache で同期 hit-test（当フレーム構築中の layout rect は使わない）
+//   endFrame():      measure → place → rect_cache.clearRetainingCapacity → updateRectCache
+//                    → emitNode（draw cmd 発行）→ frame_active=false
+//                    hit-test は行わない。新 rect_cache はこの endFrame 完了後に次フレームから参照される。
+//                    arena は触らない（契約の番人）。
+//                    endFrame 後も draw_list / id_stack / state / レイアウトツリーは
+//                    次 beginFrame まで valid。rect キャッシュ（gpa 所有）は次 endFrame まで valid。
 //
-// 同期 hit-test 契約（21.2/21.4 で確定）:
+// 同期 hit-test 契約（21.2/21.4 / TASK-131 で明文化）:
 //   widget は呼び出し時に「前フレームの rect キャッシュ」（getNodeRect / rect_cache）で
-//   buttonBehavior を呼び、結果を同期返却する。endFrame は hit-test をしない。
-//   layout 変化フレームのみ 1 フレーム遅延が出るが、静的レイアウトでは不可視。
+//   buttonBehavior を呼び、ButtonResult を同期返却する。endFrame 後の再 hit-test はない。
+//   layout 変更を伴う drag では描画は新 layout・hit-test は旧 layout となり 1 フレーム遅延する
+//   （観測された現行契約。静的 layout では不可視）。
 //
 // clip / hit-test 可視契約（TASK-130）:
 //   - cached `clip` は祖先の clip_children を反映した effective clip（描画 pushClip と同じ境界）。
@@ -377,24 +385,27 @@ pub const Context = struct {
         self.addLeaf(.{ .custom = .{ .measured = size, .draw_fn = draw_fn, .ctx = ctx_ptr } });
     }
 
-    /// 明示 ID（cfg.id != 0 で登録されたノード）の最終 rect。endFrame で更新され、次の
-    /// endFrame まで有効（beginFrame を跨いだフレーム前半は前フレーム値 = 同期 hit-test 契約）。
-    /// 自動採番ノード・未知 ID・0 は null。
+    /// 明示 ID（cfg.id != 0 で登録されたノード）の最終配置 rect。
+    /// 前フレーム endFrame で確定した値を返す（beginFrame 直後のフレーム前半も更新されない）。
+    /// 次の値は当フレーム endFrame の updateRectCache 完了後に初めて利用可能になる。
+    /// 初回フレーム（キャッシュ未生成）・自動採番ノード（beginBox cfg.id==0）・未知 ID・0 は null。
     pub fn getNodeRect(self: *const Context, id: Id) ?Rect {
         if (id == 0) return null;
         const entry = self.rect_cache.get(id) orelse return null;
         return entry.rect;
     }
 
-    /// 明示 ID widget の前フレーム {rect, clip}。共有 widget が同期 hit-test を
-    /// Context の契約どおりに行うための read-only access。
+    /// 明示 ID widget の前フレーム {rect, clip, measured}。
+    /// clip は祖先 clip_children を intersect した有効クリップ（buttonBehavior にそのまま渡す）。
+    /// getNodeRect と同じく前フレーム値。初回フレーム・自動 ID・未知 ID・0 は null。
     pub fn getNodeCachedRect(self: *const Context, id: Id) ?CachedRect {
         if (id == 0) return null;
         return self.rect_cache.get(id);
     }
 
-    /// 明示 ID ノードの前フレーム measured サイズ（自然サイズ）。scroll 量の clamp に使う。
-    /// getNodeRect と同じく前フレーム値を返す（同期契約）。自動 ID・未知 ID・0 は null。
+    /// 明示 ID ノードの前フレーム measured サイズ（layout.measure の自然サイズ）。
+    /// scroll 量の clamp 等に使う。getNodeRect と同じ前フレーム同期契約。
+    /// 初回フレーム・自動 ID・未知 ID・0 は null。
     pub fn getNodeMeasured(self: *const Context, id: Id) ?Vec2 {
         if (id == 0) return null;
         const entry = self.rect_cache.get(id) orelse return null;
@@ -411,7 +422,8 @@ pub const Context = struct {
         layout.appendChild(parent, node);
     }
 
-    /// 明示 ID ノードの {rect, clip} を登録（行きがけ DFS）。
+    /// 明示 ID ノードの {rect, clip, measured} を登録（行きがけ DFS）。
+    /// endFrame の measure/place 完了後にのみ呼ばれ、当フレーム widget 呼び出し中の hit-test には使われない。
     ///
     /// `clip` 引数 = 祖先由来の effective clip（このノード自身の描画・hit-test に使う）。
     /// 子へ渡す clip:
@@ -419,6 +431,9 @@ pub const Context = struct {
     ///   - `clip_children=false` → `clip` のまま（overflow 描画・hit を許可。zero-size 親でも
     ///     子は ancestor clip 内なら hit 可）
     /// `emitNode` の pushClip 境界と同じ定義（cached clip ↔ draw clip の対応）。
+    /// measured_w/h は layout.measure の結果（scroll clamp 等に使う自然サイズ）。
+    /// 同一フレーム内で明示 ID が重複した場合は Debug assert で契約違反（Release では最後勝ち上書きだが
+    /// 重複 ID は使わないことを前提とする）。
     fn updateRectCache(self: *Context, node: *const layout.Node, clip: Rect) void {
         if (node.cfg.id != 0) {
             const gop = self.rect_cache.getOrPut(self.gpa, node.cfg.id) catch
@@ -485,7 +500,9 @@ pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 }
 
 /// Dear ImGui 流の同期 hit-test + button state machine（Description 修正版 v2）。
-/// rect / clip は呼び出し側が渡す（前フレーム rect_cache の rect/clip、または手動）。
+/// caller が渡した rect / clip に対して当フレームの mouse 状態をその場で評価し、
+/// ButtonResult を同期返却する。endFrame 後の再 hit-test や layout 確定後の遡及評価はない。
+/// rect / clip は通常 widgets の behaviorFromCache が前フレーム rect_cache から供給する。
 ///
 /// active drag capture: press で active を取得したあと、clip/rect 外へドラッグしても
 /// active は奪わない。release 時の click は `pointHitsVisible`（= 可視領域内）のときだけ成立。

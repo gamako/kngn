@@ -1,16 +1,26 @@
 // 基本ウィジェット（TASK-21.5）: Button / ColorSwatch。
 // Label（label / labelEx）は Context 本体（context.zig）が提供する。
 //
-// 同期 hit-test 契約（21.2/21.4）:
+// 本タスク時点の観測（TASK-131/132）: 以下は 2026-07-18 時点の現行契約。
+//
+// 同期 hit-test 契約（21.2/21.4 / TASK-131）:
 //   widget 呼び出し時に「前フレームの rect キャッシュ」で buttonBehavior を行い、
 //   ButtonResult を同期返却する。初回フレーム（キャッシュ未生成）は非ヒット扱い。
 //   描画はレイアウトノードに記録され、endFrame の layout 確定後に発行される。
+//   layout 変更フレームでは描画は新 rect・hit-test は旧 rect（1 フレーム遅延）。
 //   hover 色は state.hot_id（beginFrame で確定、フレーム中不変）を参照する。
 //
-// 自動 ID の重複に注意:
-//   button は label hash + id_stack、colorSwatch は色値 hash + id_stack で ID を作る。
-//   同一スコープに同ラベル / 同色を並べると明示 ID 重複となり endFrame の debug assert が
-//   発火する。buttonId / colorSwatchId か id_stack.push(i) のスコープで回避すること。
+// 自動 ID 契約（TASK-132）:
+//   label 系は IdStack seed + label を hash（button/selectableLabel/slider/checkbox 等）。
+//   colorSwatch は色値 hash + id_stack。textInputId は自動 ID 版を持たず明示 ID 必須。
+//   同一 IdStack scope 内で同一 label を並べると同じ ID になり、endFrame の updateRectCache で
+//   Debug assert が契約違反として検出する（negative_auto_id.sh で固定）。
+//   同一ラベル並置は対応する *Id 版か id_stack.push(i) で scope を分けること。
+//
+// テキスト表示契約（TASK-132 / default font）:
+//   label / selectableLabel 等は改行を除去せず Font に渡す。default font は 1 行描画で
+//   改行 codepoint は glyph 未描画だが advance 8px。CJK/emoji も codepoint 単位で
+//   measure 8px・glyph 未描画・fallback なし。TextInput は単一行（改行/制御文字は挿入拒否）。
 
 const std = @import("std");
 
@@ -105,12 +115,13 @@ pub const SliderF32Opts = struct {
     track_w: ?i32 = null,
 };
 
-/// クリックされたら true（自動 ID: label hash + id_stack）。
+/// クリックされたら true（自動 ID: `IdStack.make(label)`）。
+/// 同一 scope に同 label を並べると ID 衝突する。`buttonId` または `id_stack.push` を使う。
 pub fn button(ctx: *Context, label: []const u8) bool {
     return buttonEx(ctx, label, .{}).clicked;
 }
 
-/// ButtonResult（clicked / hovered / held）を返す版（自動 ID）。
+/// ButtonResult（clicked / hovered / held）を返す版（自動 ID: `IdStack.make(label)`）。
 pub fn buttonEx(ctx: *Context, label: []const u8, opts: ButtonOpts) ButtonResult {
     return buttonId(ctx, ctx.id_stack.make(label), label, opts);
 }
@@ -195,6 +206,8 @@ fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
 }
 
 /// SelectableLabel（read-only）。編集・caret・複数行・折返しは扱わない。
+/// 改行/CJK/emoji を含む text も strip せず Font 契約どおり 1 行で measure/描画する。
+/// 幅は TextLayout.prefix_widths の総幅、高さは Font.metrics().line_height。
 pub fn selectableLabel(ctx: *Context, text: []const u8, opts: SelectableLabelOpts) SelectableLabelResult {
     return selectableLabelId(ctx, ctx.id_stack.make(text), text, opts);
 }
@@ -323,8 +336,10 @@ const SelectableLabelDraw = struct {
     }
 };
 
-/// 単一行 TextInput。編集は event queue の順序を保ったまま focused ID だけが消費する。
-/// composition（IME preedit）も focused ID のみが消費する（TASK-113.3）。
+/// 単一行 TextInput（自動 ID 版なし。呼び出し側が明示 ID を渡す）。
+/// 改行・ASCII 制御文字は TextBuffer へ挿入しない。`.fit` 幅は `Font.measure` + padding。
+/// selection / caret / scroll / hit-test は TextLayout.prefix_widths（logical advance）基準。
+/// 高さは line_height ではなく ascent+descent（ink height。custom font で差が出うる）。
 pub fn textInputId(
     ctx: *Context,
     id: Id,
@@ -761,7 +776,8 @@ const SwatchDraw = struct {
 // active 中は mouse_pos.x を track 可動域へ写像して *value を更新。内部計算は f64。
 // レイアウトは [固定名ラベル] [track] [動的値テキスト] で、track の x は値の桁数に依存しない。
 
-/// i32 スライダー（自動 ID: label hash）。値が変われば true。
+/// i32 スライダー（自動 ID: `IdStack.make(label)`）。値が変われば true。
+/// 同一 scope に同 label がある場合は `sliderI32Id` を使う。
 pub fn sliderI32(ctx: *Context, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
     return sliderI32Id(ctx, ctx.id_stack.make(label), label, value, opts);
 }
@@ -780,7 +796,7 @@ pub fn sliderI32Id(ctx: *Context, id: Id, label: []const u8, value: *i32, opts: 
     return value.* != old;
 }
 
-/// f32 スライダー（自動 ID: label hash）。値が変われば true。
+/// f32 スライダー（自動 ID: `IdStack.make(label)`）。値が変われば true。
 pub fn sliderF32(ctx: *Context, label: []const u8, value: *f32, opts: SliderF32Opts) bool {
     return sliderF32Id(ctx, ctx.id_stack.make(label), label, value, opts);
 }
@@ -937,7 +953,7 @@ pub const HueBarOpts = struct {
     h: ?i32 = null,
 };
 
-/// SV スクエア（自動 ID: label hash）。指定 hue で saturation(x)/value(y) を編集。値が変われば true。
+/// SV スクエア（自動 ID: `IdStack.make(label)`）。指定 hue で saturation(x)/value(y) を編集。値が変われば true。
 pub fn svSquare(ctx: *Context, label: []const u8, hue: f32, s: *f32, v: *f32, opts: SvSquareOpts) bool {
     return svSquareId(ctx, ctx.id_stack.make(label), hue, s, v, opts);
 }
@@ -1019,7 +1035,7 @@ const SvSquareDraw = struct {
     }
 };
 
-/// Hue バー（自動 ID: label hash）。縦方向に hue を編集。hue は常に [0,360)。値が変われば true。
+/// Hue バー（自動 ID: `IdStack.make(label)`）。縦方向に hue を編集。hue は常に [0,360)。値が変われば true。
 pub fn hueBar(ctx: *Context, label: []const u8, h: *f32, opts: HueBarOpts) bool {
     return hueBarId(ctx, ctx.id_stack.make(label), h, opts);
 }

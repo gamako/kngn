@@ -26,6 +26,10 @@ pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;
 pub const default_bitmap_font = @import("font.zig").default_bitmap_font;
 /// 既定フォント（共通 Font インターフェース値）。Context.init / render に渡す。
+/// default_bitmap_font（ASCII 32..127 の 8×16 固定幅ビットマップ）の vtable ラッパ。
+/// 非 ASCII は missing glyph（描画スキップ・advance は 8px）。font chain / fallback はない。
+/// measure は codepoint 数 × 8、drawTo も codepoint ごとに 8px 進む（logical width は一致。
+/// glyph 未描画時も advance は進むため ink 幅とは一致しない）。
 pub const default_font = @import("font.zig").default_font;
 
 pub const render = @import("render.zig").render;
@@ -45,7 +49,10 @@ pub const InteractionState = @import("state.zig").InteractionState;
 pub const PerIdState = @import("state.zig").PerIdState;
 pub const PerIdStateStore = @import("state.zig").PerIdStateStore;
 
-// 単一行 text_edit コア（TASK-113.1）。
+// 単一行 text_edit コア（TASK-113.1 / TASK-132 契約明文化）。
+// TextLayout: codepoint index（0..count）と UTF-8 byte offset / 累積 logical width の対応表。
+// buildTextLayout: Font.measure を codepoint ごとに呼び prefix_widths を構築する。
+// hitTest: prefix_widths の advance 中点で codepoint index を返す（byte offset ではない）。
 pub const TextRange = @import("text_edit.zig").TextRange;
 pub const TextLayout = @import("text_edit.zig").TextLayout;
 pub const SelectionState = @import("text_edit.zig").SelectionState;
