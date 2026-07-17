@@ -165,6 +165,8 @@ const PALETTE = [_]PaletteEntry{
     .{ .primitive = .delay },
     .{ .macro_kind = .drum_machine },
     .{ .macro_kind = .bass_machine },
+    // 2 行目先頭（右側の列は inspector パネルに隠れるため、見える位置に置く）
+    .{ .primitive = .step_seq },
     .{ .primitive = .slew },
     .{ .primitive = .sample_hold },
     .{ .primitive = .comparator },
