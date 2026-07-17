@@ -285,7 +285,7 @@ fn renderMatrix(ctx: *gui.Context, rows: []const MatrixRow) void {
 fn renderOverview(ctx: *gui.Context) void {
     ctx.label("APG: living patterns / ImGui: demo sections / libs/gui: current API");
     ctx.label("State axis: normal hover active focused disabled empty min max none");
-    ctx.label("Use PAGE_DOWN / PAGE_UP to cycle sections.");
+    ctx.label("Use PAGE_DOWN / PAGE_UP (or N / P) to cycle sections.");
     ctx.label("Current implementation is normal + endpoint focused; demo cells are exercised by E2E.");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
@@ -413,7 +413,7 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
     ctx.label("GUI Capability Gallery v0");
     var section_buf: [128]u8 = undefined;
     ctx.labelEx(std.fmt.bufPrint(&section_buf, "section {d}/8: {s} — {s}", .{ app.section, meta.name, meta.detail }) catch "section=?", ctx.style.text_subtle);
-    ctx.labelEx("PAGE_DOWN / PAGE_UP: navigate | ESC / Q: quit", ctx.style.text_subtle);
+    ctx.labelEx("PAGE_DOWN/UP or N/P: navigate | ESC / Q: quit", ctx.style.text_subtle);
     ctx.endBox();
 
     if (app.current() == .menus) {
@@ -462,9 +462,16 @@ pub fn main(init: std.process.Init) !void {
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| switch (k.key) {
-                    .ESCAPE, .Q => running = false,
+                    .ESCAPE => running = false,
                     .PAGE_DOWN => app.changeSection(1),
                     .PAGE_UP => app.changeSection(-1),
+                    // PAGE キーが無いキーボード向け（実機フィードバック 2026-07-17）。
+                    // text 入力に focus がある間は文字入力を優先する。
+                    .Q => if (ctx.state.focused_id == 0) {
+                        running = false;
+                    },
+                    .N => if (ctx.state.focused_id == 0) app.changeSection(1),
+                    .P => if (ctx.state.focused_id == 0) app.changeSection(-1),
                     else => {},
                 },
                 else => {},
