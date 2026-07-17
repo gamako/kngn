@@ -43,3 +43,29 @@ test "patch: box-local macro grid geometry round-trips through stepgrid hit-test
         stepgrid.hitTest(local_geometry, first.x + first.w + 0.25, first.y + first.h * 0.5, 4),
     );
 }
+
+test "patch: generated three-lane grid hits every clap-row cell" {
+    const geometry = asStepgrid(canvas.macroGridGeometry(
+        .{ .zoom = 1.0 },
+        .{ .x = 40, .y = 330 },
+    ));
+
+    var row: u8 = 0;
+    while (row < 3) : (row += 1) {
+        var step: u8 = 0;
+        while (step < stepgrid.STEP_COUNT) : (step += 1) {
+            const rect = geometry.cellRect(row, step);
+            const cell = stepgrid.hitTest(
+                geometry,
+                rect.x + rect.w * 0.5,
+                rect.y + rect.h * 0.5,
+                3,
+            ) orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(stepgrid.GridCell{ .row = row, .step = step }, cell);
+        }
+    }
+
+    const box = canvas.NodeGeom{ .handle = 48, .pos = .{ .x = 40, .y = 330 }, .n_in = 3, .n_out = 3, .grid_rows = 3 };
+    const last = geometry.cellRect(2, stepgrid.STEP_COUNT - 1);
+    try std.testing.expect(last.y + last.h <= box.pos.y + canvas.nodeSize(box).y);
+}

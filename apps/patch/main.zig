@@ -341,6 +341,9 @@ const App = struct {
     // 生成アプリの command/action 状態（action はイベント時のみ）。
     params: Params = .{},
     pattern_rev: u32 = 0,
+    /// main thread が最後に publish した pattern。RT が Mailbox を acquire する前の連続編集でも、
+    /// 次の pattern action が RT snapshot を基底にして先行編集を捨てないために使う。
+    pending_pattern: ?PatternCommand = null,
     sample_rate: u32 = 48000,
     cmd_log: platform.command.CommandLog = .{},
     cmd_exec: platform.command.Executor = undefined,
@@ -825,10 +828,10 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, cam: Camera, nodes
 // ============================================================================
 const StepSeqPtr = *modular.StepSeq;
 
-/// gid の step_seq メンバーを handle 昇順で最大 2 個集める（drum: [seqK, seqH] / bass: [seq]）。
+/// gid の step_seq メンバーを handle 昇順で最大 3 個集める（drum: [seqK, seqH, seqClap] / bass: [seq]）。
 /// active + step_seq + 当該 gid 所属のみ（stale handle を弾く。台帳同期）。
-fn collectStepSeqMembers(app: *const App, gid: group.GroupId) struct { items: [2]Handle, n: usize } {
-    var items: [2]Handle = .{ 0, 0 };
+fn collectStepSeqMembers(app: *const App, gid: group.GroupId) struct { items: [3]Handle, n: usize } {
+    var items: [3]Handle = .{ 0, 0, 0 };
     var n: usize = 0;
     var h: Handle = 0;
     while (h < MAX_MODULES and n < items.len) : (h += 1) {
@@ -841,10 +844,10 @@ fn collectStepSeqMembers(app: *const App, gid: group.GroupId) struct { items: [2
     return .{ .items = items, .n = n };
 }
 
-/// クリック可能な mask 行数（drum=2 レーン、bass=on/accent/slide の 3 行。bass の pitch 段は表示のみ）。
-fn clickableRows(kind: group.MacroKind) u8 {
-    return switch (kind) {
-        .drum_machine => 2,
+/// クリック可能な mask 行数（drum は group metadata の lane 数、bass は on/accent/slide の 3 行）。
+fn clickableRows(g: group.Group) u8 {
+    return switch (g.kind) {
+        .drum_machine => @min(if (g.grid_rows == 0) 2 else g.grid_rows, 3),
         .bass_machine => 3,
     };
 }
@@ -874,14 +877,15 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: 
 
     switch (kind) {
         .drum_machine => {
-            // 2 レーン: row0=seqK.on_mask / row1=seqH.on_mask。
-            var rows: [2]stepgrid.DrawRow = undefined;
+            // 既存パレット macro は 2 レーン、生成 DrumMachine は 3 レーン。
+            var rows: [3]stepgrid.DrawRow = undefined;
             var lane: u8 = 0;
-            while (lane < 2 and lane < seqs.n) : (lane += 1) {
+            const row_count = @min(@as(usize, if (box.grid_rows == 0) 2 else box.grid_rows), seqs.n);
+            while (lane < row_count) : (lane += 1) {
                 const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[lane]);
                 rows[lane] = .{ .mask = seq.loadOnMask(), .on_color = stepgrid.DEFAULT_ON };
             }
-            stepgrid.draw(dl, geometry, rows[0..seqs.n], .{ .playhead = @intCast(playhead) });
+            stepgrid.draw(dl, geometry, rows[0..row_count], .{ .playhead = @intCast(playhead) });
         },
         .bass_machine => {
             const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
@@ -904,16 +908,72 @@ fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
         const gid: group.GroupId = @intCast(i);
         const local = world_pt.sub(g.pos);
         const geometry = macroGridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 });
-        if (stepgrid.hitTest(geometry, local.x, local.y, clickableRows(g.kind))) |cell| return .{ .gid = gid, .cell = cell };
+        if (stepgrid.hitTest(geometry, local.x, local.y, clickableRows(g))) |cell| return .{ .gid = gid, .cell = cell };
     }
     return null;
 }
 
-/// grid セルクリック → 対象 StepSeq の mask ビットを atomic store でトグル（publish 無し＝トポロジ不変）。
+fn generatedMacroGroup(app: *const App, gid: group.GroupId) bool {
+    return app.ledger.memberOf(gid, app.patch.kick_seq_h) or
+        app.ledger.memberOf(gid, app.patch.hat_seq_h) or
+        app.ledger.memberOf(gid, app.patch.clap_seq_h) or
+        app.ledger.memberOf(gid, app.patch.bass_seq_h);
+}
+
+/// RT 未適用の直近 publish を編集基底にする。RT が rev を acquire 済みなら pending を破棄し、
+/// evolve 等の RT authoritative な現在値へ戻す。quantize は呼び出し側が明示的に再設定する。
+fn patternEditBase(app: *App) PatternCommand {
+    const st = app.patch.snapshotState();
+    var base = stateToCommand(st);
+    if (app.pending_pattern) |pending| {
+        if (pending.rev == app.pattern_rev and st.pattern_rev != pending.rev) {
+            base = pending;
+        } else {
+            app.pending_pattern = null;
+        }
+    }
+    base.quantize_bar = false;
+    return base;
+}
+
+/// pattern を publish し、RT 未適用の最新 command を GUI 側へ保持する。
+/// graph topology / RT view は変更せず、次の block 先頭で既存 applyControls() が取り込む。
+fn publishPatternCommand(app: *App, cmd: PatternCommand) PatternCommand {
+    var next = cmd;
+    app.pattern_rev +%= 1;
+    next.rev = app.pattern_rev;
+    app.pending_pattern = next;
+    if (!next.quantize_bar) app.last_quantized_cmd = null;
+    app.patch.controls.pattern_db.publish(next);
+    return next;
+}
+
+/// grid セルクリック → 生成 macro は PatternCommand、既存パレット macro は atomic accessor でトグル。
 fn toggleMacroGridCell(app: *App, hit: GridHit) void {
-    const kind = app.ledger.groups[hit.gid].kind;
+    const group_state = app.ledger.groups[hit.gid];
+    const kind = group_state.kind;
     const seqs = collectStepSeqMembers(app, hit.gid);
     if (seqs.n == 0) return;
+    if (generatedMacroGroup(app, hit.gid)) {
+        var cmd = patternEditBase(app);
+        const mask = bitOf(hit.cell.step);
+        switch (kind) {
+            .drum_machine => switch (hit.cell.row) {
+                0 => cmd.kick.on ^= mask,
+                1 => cmd.hat.on ^= mask,
+                2 => cmd.clap.on ^= mask,
+                else => return,
+            },
+            .bass_machine => switch (hit.cell.row) {
+                0 => cmd.bass.on ^= mask,
+                1 => cmd.bass.accent ^= mask,
+                2 => cmd.bass.slide ^= mask,
+                else => return,
+            },
+        }
+        _ = publishPatternCommand(app, cmd);
+        return;
+    }
     switch (kind) {
         .drum_machine => {
             if (hit.cell.row >= seqs.n) return;
@@ -1140,6 +1200,93 @@ const BASS_OFFSETS = [_]Vec2f{
     .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // env（下段）
     .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // vca（右・中段）
 };
+
+// LofiPatch が起動時に既に所有している生成 graph の展開時レイアウト。
+// ここでは add/connect/publish を行わず、group.Ledger の UI 座標だけを設定する。
+const GENERATED_DRUM_OFFSETS = [_]Vec2f{
+    .{ .x = 150, .y = MACRO_HEADER_BAND }, // kick_seq
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // hat_seq
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 160 }, // clap_seq
+    .{ .x = 330, .y = MACRO_HEADER_BAND }, // kick
+    .{ .x = 330, .y = MACRO_HEADER_BAND + 80 }, // hat
+    .{ .x = 330, .y = MACRO_HEADER_BAND + 160 }, // clap
+};
+const GENERATED_BASS_OFFSETS = [_]Vec2f{
+    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // bass_seq
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 40 }, // bass_perc
+    .{ .x = 150, .y = MACRO_HEADER_BAND }, // vco
+    .{ .x = 330, .y = MACRO_HEADER_BAND + 40 }, // vcf
+    .{ .x = 510, .y = MACRO_HEADER_BAND + 40 }, // vca
+};
+
+/// 生成 macro を既存 handle のまま台帳へ登録する（初期化時のみ）。
+/// DynGraph の topology、publish 済み view、RT view には一切変更を加えない。
+fn registerGeneratedMacro(
+    app: *App,
+    gid: group.GroupId,
+    kind: group.MacroKind,
+    pos: Vec2f,
+    grid_rows: u8,
+    members: []const Handle,
+    offsets: []const Vec2f,
+) void {
+    std.debug.assert(members.len == offsets.len);
+    const g = &app.ledger.groups[gid];
+    g.kind = kind;
+    g.collapsed = true;
+    g.grid_rows = grid_rows;
+    g.pos = pos;
+    for (members, offsets) |h, offset| {
+        std.debug.assert(h < MAX_MODULES and app.dyn.slotActive(h));
+        app.ledger.assign(h, gid);
+        app.layout[h] = pos.add(offset);
+    }
+}
+
+/// LofiPatch の生成 handle を DrumMachine/BassMachine として台帳へ登録する（初期化時のみ）。
+/// 生成 builder を再実行しないため、DynGraph の node 数・handle・topology は不変のまま表示だけが macro 化される。
+fn registerGeneratedMacros(app: *App) void {
+    const drum_gid = app.ledger.alloc() orelse return;
+    const bass_gid = app.ledger.alloc() orelse {
+        app.ledger.free(drum_gid);
+        return;
+    };
+    const drum_members = [_]Handle{
+        app.patch.kick_seq_h,
+        app.patch.hat_seq_h,
+        app.patch.clap_seq_h,
+        app.patch.kick_h,
+        app.patch.hat_h,
+        app.patch.clap_h,
+    };
+    const bass_members = [_]Handle{
+        app.patch.bass_seq_h,
+        app.patch.bass_perc_h,
+        app.patch.vco_h,
+        app.patch.vcf_h,
+        app.patch.vca_h,
+    };
+    registerGeneratedMacro(
+        app,
+        drum_gid,
+        .drum_machine,
+        .{ .x = 40, .y = 330 },
+        3,
+        &drum_members,
+        &GENERATED_DRUM_OFFSETS,
+    );
+    registerGeneratedMacro(
+        app,
+        bass_gid,
+        .bass_machine,
+        .{ .x = 40, .y = 440 },
+        4,
+        &bass_members,
+        &GENERATED_BASS_OFFSETS,
+    );
+    // 共有 clock と外部 mixer/voice 境界を実 graph edge から再導出する。
+    app.refreshAllExposed();
+}
 
 /// パレット index からモジュール or マクロを追加（comptime kind ディスパッチ）→ 画面中央付近へ配置 → publish。
 fn addByPaletteIndex(app: *App, ki: u8) !void {
@@ -1602,6 +1749,7 @@ pub fn main(init: std.process.Init) !void {
         const row = layout_h / 8;
         app.layout[layout_h] = .{ .x = 24 + @as(f32, @floatFromInt(col)) * 140, .y = 52 + @as(f32, @floatFromInt(row)) * 96 };
     }
+    registerGeneratedMacros(&app);
 
     var dl = gui.DrawList.init(allocator);
     defer dl.deinit();
@@ -1857,8 +2005,8 @@ fn groupDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         {
             const sep: []const u8 = if (first_group) "" else ",";
             first_group = false;
-            const piece = std.fmt.bufPrint(buf[off..], "{s}{{\"id\":{d},\"kind\":\"{s}\",\"collapsed\":{d},\"members\":[", .{
-                sep, gid, @tagName(g.kind), @as(u8, if (g.collapsed) 1 else 0),
+            const piece = std.fmt.bufPrint(buf[off..], "{s}{{\"id\":{d},\"kind\":\"{s}\",\"collapsed\":{d},\"grid_rows\":{d},\"members\":[", .{
+                sep, gid, @tagName(g.kind), @as(u8, if (g.collapsed) 1 else 0), g.grid_rows,
             }) catch return errDigest(buf);
             off += piece.len;
         }
@@ -2889,32 +3037,26 @@ const LockTrack = enum { kick, hat, clap, bass };
 fn actionSetLock(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const p = try gen_actions.parseNameBool(args);
     const track = std.meta.stringToEnum(LockTrack, p.name) orelse return error.UnknownTrack;
-    var cmd = stateToCommand(patch.snapshotState());
+    var cmd = patternEditBase(app);
     switch (track) {
         .kick => cmd.kick.lock = p.on,
         .hat => cmd.hat.lock = p.on,
         .clap => cmd.clap.lock = p.on,
         .bass => cmd.bass.lock = p.on,
     }
-    app.pattern_rev += 1;
-    cmd.rev = app.pattern_rev;
-    patch.controls.pattern_db.publish(cmd);
+    _ = publishPatternCommand(app, cmd);
     return "ok";
 }
 
 fn actionSetEvolve(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const on = try gen_actions.parseBool01(args);
-    var cmd = stateToCommand(patch.snapshotState());
+    var cmd = patternEditBase(app);
     cmd.evolve = on;
-    app.pattern_rev += 1;
-    cmd.rev = app.pattern_rev;
-    patch.controls.pattern_db.publish(cmd);
+    _ = publishPatternCommand(app, cmd);
     return "ok";
 }
 
@@ -2923,11 +3065,10 @@ const StepTarget = enum { kick, hat, clap, bass_on, bass_accent, bass_slide };
 fn actionToggleStep(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const p = try gen_actions.parseNameU8(args);
     const target = std.meta.stringToEnum(StepTarget, p.name) orelse return error.UnknownTrack;
     if (p.value >= 16) return error.StepOutOfRange;
-    var cmd = stateToCommand(patch.snapshotState());
+    var cmd = patternEditBase(app);
     const mask = bitOf(p.value);
     switch (target) {
         .kick => cmd.kick.on ^= mask,
@@ -2937,24 +3078,19 @@ fn actionToggleStep(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
         .bass_accent => cmd.bass.accent ^= mask,
         .bass_slide => cmd.bass.slide ^= mask,
     }
-    app.pattern_rev += 1;
-    cmd.rev = app.pattern_rev;
-    patch.controls.pattern_db.publish(cmd);
+    _ = publishPatternCommand(app, cmd);
     return "ok";
 }
 
 fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const p = try gen_actions.parseTwoU8(args); // a=step(0..15) b=deg(0..BASS_DEG_TOTAL-1)
     if (p.a >= 16) return error.StepOutOfRange;
     if (p.b >= BASS_DEG_TOTAL) return error.DegreeOutOfRange;
-    var cmd = stateToCommand(patch.snapshotState());
+    var cmd = patternEditBase(app);
     cmd.bass.deg[p.a] = @intCast(p.b);
-    app.pattern_rev += 1;
-    cmd.rev = app.pattern_rev;
-    patch.controls.pattern_db.publish(cmd);
+    _ = publishPatternCommand(app, cmd);
     return "ok";
 }
 
@@ -3017,9 +3153,8 @@ fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     const loaded = try pattern_io.load(app.io, std.heap.c_allocator, path, Params);
     app.params = loaded.params;
     publishControls(patch, app.params);
-    app.pattern_rev += 1;
-    const cmd = payloadToPatternCommand(app.pattern_rev, loaded.pattern);
-    patch.controls.pattern_db.publish(cmd);
+    const cmd = payloadToPatternCommand(0, loaded.pattern);
+    _ = publishPatternCommand(app, cmd);
     return "ok";
 }
 
@@ -3275,9 +3410,8 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     };
     app.params = loaded.params;
     publishControls(patch, app.params);
-    app.pattern_rev += 1;
-    const cmd = payloadToPatternCommand(app.pattern_rev, loaded.pattern);
-    patch.controls.pattern_db.publish(cmd);
+    const cmd = payloadToPatternCommand(0, loaded.pattern);
+    _ = publishPatternCommand(app, cmd);
     app.song = payloadToSong(app.song.rev +% 1, loaded.song);
     patch.controls.song_db.publish(app.song);
     app.notation_seed = loaded.seed.notation_seed;
@@ -3405,7 +3539,7 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     // P1-3: bar 待ち中（または publish 済みで RT 未 acquire）は last_quantized_cmd を base にし、
     // 連続 pattern で先行 track を潰さない。
     const st = patch.snapshotState();
-    var cmd = stateToCommand(st);
+    var cmd = patternEditBase(app);
     if (app.last_quantized_cmd) |lq| {
         // 我々の最新 quantize がまだ bar 反映前: bar_pending、または applied_rev 未到達
         if (lq.rev == app.pattern_rev and (st.bar_pending or st.pattern_rev != lq.rev)) {
@@ -3430,10 +3564,7 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     }
     // lock されていても明示編集は通す（GUI toggle_step と同挙動）
     cmd.quantize_bar = true;
-    app.pattern_rev += 1;
-    cmd.rev = app.pattern_rev;
-    app.last_quantized_cmd = cmd;
-    patch.controls.pattern_db.publish(cmd);
+    app.last_quantized_cmd = publishPatternCommand(app, cmd);
     return "ok";
 }
 
@@ -3606,9 +3737,8 @@ fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const loaded = try pattern_io.decode(Params, bytes);
     app.params = loaded.params;
     publishControls(patch, app.params);
-    app.pattern_rev += 1;
-    const cmd = payloadToPatternCommand(app.pattern_rev, loaded.pattern);
-    patch.controls.pattern_db.publish(cmd);
+    const cmd = payloadToPatternCommand(0, loaded.pattern);
+    _ = publishPatternCommand(app, cmd);
 }
 
 fn registerGenStateSync(app: *App) void {

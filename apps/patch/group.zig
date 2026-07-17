@@ -64,6 +64,9 @@ pub const Group = struct {
     active: bool = false,
     kind: MacroKind = .drum_machine,
     collapsed: bool = true,
+    /// 0 は kind ごとの既定値（パレット macro の drum=2 / bass=4）を使う。
+    /// 生成 macro は表示 lane 数を明示する（生成 drum=3 / bass=4）。UI ローカルのみ。
+    grid_rows: u8 = 0,
     pos: Vec2f = .{ .x = 0, .y = 0 },
     exposed_in: [MAX_EXPOSED]ExposedPort = [_]ExposedPort{.{}} ** MAX_EXPOSED,
     n_in: u8 = 0,
@@ -283,7 +286,13 @@ pub const Ledger = struct {
         }
         for (self.groups, 0..) |g, i| {
             if (g.active and g.collapsed and n < out.len) {
-                out[n] = .{ .handle = handleOfGroup(@intCast(i)), .pos = g.pos, .n_in = g.n_in, .n_out = g.n_out, .grid_rows = gridRowsForBox(g.kind) };
+                out[n] = .{
+                    .handle = handleOfGroup(@intCast(i)),
+                    .pos = g.pos,
+                    .n_in = g.n_in,
+                    .n_out = g.n_out,
+                    .grid_rows = if (g.grid_rows == 0) gridRowsForBox(g.kind) else g.grid_rows,
+                };
                 n += 1;
             }
         }
@@ -542,6 +551,29 @@ test "group: mapNodesForCollapsed hides members and adds a box when collapsed, s
         const n = s.l.mapNodesForCollapsed(&flat, &out_buf);
         try testing.expectEqual(flat.len, n);
     }
+}
+
+test "group: grid_rows explicit value and kind fallback reach collapsed NodeGeom" {
+    var s = Scenario.init();
+    const flat = [_]NodeGeom{
+        .{ .handle = 10, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 11, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+    };
+    var out: [4]NodeGeom = undefined;
+
+    s.l.groups[s.gid].grid_rows = 3;
+    var n = s.l.mapNodesForCollapsed(&flat, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(u8, 3), out[0].grid_rows);
+
+    s.l.groups[s.gid].grid_rows = 0;
+    s.l.groups[s.gid].kind = .drum_machine;
+    n = s.l.mapNodesForCollapsed(&flat, &out);
+    try testing.expectEqual(@as(u8, 2), out[0].grid_rows);
+
+    s.l.groups[s.gid].kind = .bass_machine;
+    n = s.l.mapNodesForCollapsed(&flat, &out);
+    try testing.expectEqual(@as(u8, 4), out[0].grid_rows);
 }
 
 test "group: buildDisplayEdges maps collapsed boundary to box index, hides internal edges, actual stays real" {
