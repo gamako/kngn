@@ -40,6 +40,7 @@ const Chain = patchmod.Chain;
 const BASS_DEG_TOTAL: usize = patchmod.BASS_DEG_TOTAL;
 const canvas = @import("canvas.zig");
 const inspector = @import("inspector.zig");
+const transport = @import("transport.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
 const actions = @import("actions.zig");
@@ -203,6 +204,7 @@ const CUTOFF_MAX: f32 = 18000.0;
 const Params = struct {
     tempo: f32 = 122.0,
     cutoff_norm: f32 = 1.0,
+    density: f32 = 0.25,
     swing: f32 = 0.0,
     sidechain: f32 = 0.35,
     kick_gain: f32 = 1.0,
@@ -233,6 +235,7 @@ fn publishControls(patch: *LofiPatch, p: Params) void {
     const c = &patch.controls;
     c.tempo_bpm.store(p.tempo);
     c.master_cutoff.store(cutoffHz(p.cutoff_norm));
+    c.density_target.store(p.density);
     c.swing.store(p.swing);
     c.sidechain_amount.store(p.sidechain);
     c.kick_gain.store(p.kick_gain);
@@ -861,8 +864,9 @@ fn updateHover(app: *App) void {
 }
 
 fn onMouseDown(app: *App) void {
-    // Inspector の mouse は GUI Context 側へ渡す。canvas の選択/drag/zoom と競合させない。
-    if (canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) return;
+    // Transport/Inspector の mouse は GUI Context 側へ渡す。canvas の選択/drag/zoom と競合させない。
+    if (canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) or
+        canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) return;
     // パレットは screen 座標で world hit より先に判定（追加/マクロ追加。1 操作 1 publish は
     // addByPaletteIndex/macro.buildDrumMachine 内）。
     const buttons = paletteButtons();
@@ -1552,14 +1556,18 @@ pub fn main(init: std.process.Init) !void {
                 .mouse_move => |m| {
                     app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                     gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
-                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and gui_ctx.state.active_id == 0) onMouseMove(&app);
+                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                        !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                        gui_ctx.state.active_id == 0) onMouseMove(&app);
                 },
                 .mouse_down => |m| {
                     const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
                     gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
                     if (m.button == .left) {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and gui_ctx.state.active_id == 0) onMouseDown(&app);
+                        if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                            !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                            gui_ctx.state.active_id == 0) onMouseDown(&app);
                     }
                 },
                 .mouse_up => |m| {
@@ -1567,13 +1575,17 @@ pub fn main(init: std.process.Init) !void {
                     gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
                     if (m.button == .left) {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        if (gui_ctx.state.active_id == 0 and !canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) onMouseUp(&app);
+                        if (gui_ctx.state.active_id == 0 and
+                            !canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                            !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) onMouseUp(&app);
                     }
                 },
                 .mouse_scroll => |s| {
                     app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
                     gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
-                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH())) {
+                    if (!canvas.pointInInspector(app.mouse, @floatFromInt(app.fb_w), app.canvasH()) and
+                        !canvas.pointInTransport(app.mouse, @floatFromInt(app.fb_w), app.canvasH()))
+                    {
                         const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
                         app.camera.zoomAt(app.mouse, factor);
                         updateHover(&app);
@@ -1593,10 +1605,14 @@ pub fn main(init: std.process.Init) !void {
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &dl, gui.default_font);
         const ir = canvas.inspectorRect(@floatFromInt(fb.width), app.canvasH());
-        inspector.draw(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
+        const tr = canvas.transportRect(@floatFromInt(fb.width), app.canvasH());
+        gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
+        transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &app.params, &app, transportParamChanged, transportMuteChanged);
+        inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
             .node => |h| h,
             else => null,
         } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app, inspectorChanged);
+        gui_ctx.endBox();
         gui_ctx.endFrame();
         gui.render(target, &gui_ctx.draw_list, gui.default_font);
         // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
@@ -2263,21 +2279,19 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const p = app.patch;
     const st = p.snapshotState();
     // 3 ピースに分けて同じ buf へ連結（bufPrint は 1 呼び出し 32 引数上限）。
-    const a = std.fmt.bufPrint(buf, "{{\"playing\":true,\"bpm\":{d:.0},\"clock_phase\":{d:.3},\"density\":{d:.3}," ++
+    const a = std.fmt.bufPrint(buf, "{{\"playing\":true,\"bpm\":{d:.0},\"clock_phase\":{d:.3},\"density\":{d:.3},\"density_target\":{d:.3}," ++
         "\"swing\":{d:.3},\"sidechain\":{d:.3},\"master_cutoff\":{d:.0},\"bass_pitch_cv\":{d:.4}," ++
         "\"steps\":{{\"kick\":{d},\"hat\":{d},\"clap\":{d},\"bass\":{d}}}," ++
         "\"active\":{{\"kick\":{},\"hat\":{},\"clap\":{},\"pad\":{}}}," ++
         "\"gains\":{{\"kick\":{d:.3},\"hat\":{d:.3},\"clap\":{d:.3},\"bass\":{d:.3},\"pad\":{d:.3}}}," ++
         "\"muted\":{{\"kick\":{},\"hat\":{},\"clap\":{},\"bass\":{},\"pad\":{}}},", .{
-        st.bpm,           st.clock_phase,      st.density,
-        st.swing,         st.sidechain_amount, st.master_cutoff,
-        st.bass_pitch_cv, st.kick_step,        st.hat_step,
-        st.clap_step,     st.bass_step,        st.kick_active,
-        st.hat_active,    st.clap_active,      st.pad_active,
-        st.kick_gain,     st.hat_gain,         st.clap_gain,
-        st.bass_gain,     st.pad_gain,         st.kick_muted,
-        st.hat_muted,     st.clap_muted,       st.bass_muted,
-        st.pad_muted,
+        st.bpm,         st.clock_phase,      st.density,       st.density_target,
+        st.swing,       st.sidechain_amount, st.master_cutoff, st.bass_pitch_cv,
+        st.kick_step,   st.hat_step,         st.clap_step,     st.bass_step,
+        st.kick_active, st.hat_active,       st.clap_active,   st.pad_active,
+        st.kick_gain,   st.hat_gain,         st.clap_gain,     st.bass_gain,
+        st.pad_gain,    st.kick_muted,       st.hat_muted,     st.clap_muted,
+        st.bass_muted,  st.pad_muted,
     }) catch return buf[0..0];
     const b = std.fmt.bufPrint(buf[a.len..], "\"ph4\":{{\"kick_click\":{d:.3},\"hat_bright\":{d:.3}," ++
         "\"pad_cutoff\":{d:.0},\"pad_warmth\":{d:.3},\"master_drive\":{d:.3}," ++
@@ -2391,6 +2405,35 @@ fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!vo
     return error.UnknownParam;
 }
 
+fn setParamAndPublish(app: *App, name: []const u8, value: f32) error{UnknownParam}!void {
+    try setParamsF32(&app.params, name, value);
+    if (std.mem.eql(u8, name, "density")) {
+        app.patch.controls.density_target_enabled.store(1, .release);
+    }
+    publishControls(app.patch, app.params);
+}
+
+fn setMuteAndPublish(app: *App, name: []const u8, muted: bool) error{UnknownTrack}!void {
+    switch (std.meta.stringToEnum(MuteTrack, name) orelse return error.UnknownTrack) {
+        .kick => app.params.kick_mute = muted,
+        .hat => app.params.hat_mute = muted,
+        .clap => app.params.clap_mute = muted,
+        .bass => app.params.bass_mute = muted,
+        .pad => app.params.pad_mute = muted,
+    }
+    publishControls(app.patch, app.params);
+}
+
+fn transportParamChanged(ctx: *anyopaque, name: []const u8, value: f32) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    setParamAndPublish(app, name, value) catch {};
+}
+
+fn transportMuteChanged(ctx: *anyopaque, name: []const u8, muted: bool) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    setMuteAndPublish(app, name, muted) catch {};
+}
+
 fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -2403,8 +2446,7 @@ fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         try queueParamOverride(app, p.handle, p.name, p.value);
     } else {
         const nf = try gen_actions.parseNameF32(args);
-        try setParamsF32(&app.params, nf.name, nf.value);
-        publishControls(app.patch, app.params);
+        try setParamAndPublish(app, nf.name, nf.value);
     }
     return "ok";
 }
@@ -2414,17 +2456,8 @@ const MuteTrack = enum { kick, hat, clap, bass, pad };
 fn actionSetMute(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const patch = app.patch;
     const p = try gen_actions.parseNameBool(args);
-    const track = std.meta.stringToEnum(MuteTrack, p.name) orelse return error.UnknownTrack;
-    switch (track) {
-        .kick => app.params.kick_mute = p.on,
-        .hat => app.params.hat_mute = p.on,
-        .clap => app.params.clap_mute = p.on,
-        .bass => app.params.bass_mute = p.on,
-        .pad => app.params.pad_mute = p.on,
-    }
-    publishControls(patch, app.params);
+    try setMuteAndPublish(app, p.name, p.on);
     return "ok";
 }
 

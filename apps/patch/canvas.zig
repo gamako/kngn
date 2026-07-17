@@ -37,6 +37,12 @@ pub const CABLE_HIT_SLOP: f32 = 6; // world 単位のケーブル当たり判定
 // Inspector はキャンバス右側に固定配置し、下端の可視化帯とは重ねない。
 pub const INSPECTOR_W: f32 = 280;
 
+// Transport はパレットの下、Inspector の左、可視化帯の上に固定配置する。
+pub const TRANSPORT_X: f32 = 8;
+pub const TRANSPORT_Y: f32 = 64;
+pub const TRANSPORT_W: f32 = 540;
+pub const TRANSPORT_H: f32 = 250;
+
 // Inspector の slider 行は GUI widget の [label] [track] [value] 構造に合わせる。
 // value_w は最大値文字列（f32 の小数表示）を収める固定予約幅、track_min は短い
 // ラベルでも操作領域を残すための下限。通常の inspector content 幅（260px）では
@@ -83,6 +89,24 @@ pub fn canvasViewportWidth(fb_w: f32, canvas_h: f32) f32 {
 pub fn pointInInspector(point: Vec2f, fb_w: f32, canvas_h: f32) bool {
     const r = inspectorRect(fb_w, canvas_h);
     return point.x >= r.x and point.x <= r.x + r.w and point.y >= r.y and point.y <= r.y + r.h;
+}
+
+/// Transport panel の矩形。狭い framebuffer では canvas viewport 内へ clamp する。
+pub fn transportRect(fb_w: f32, canvas_h: f32) ScreenRect {
+    const viewport_w = canvasViewportWidth(fb_w, canvas_h);
+    const x = @min(TRANSPORT_X, viewport_w);
+    const y = @min(TRANSPORT_Y, @max(canvas_h, 0.0));
+    return .{
+        .x = @max(0.0, x),
+        .y = @max(0.0, y),
+        .w = @max(0.0, @min(TRANSPORT_W, viewport_w - x)),
+        .h = @max(0.0, @min(TRANSPORT_H, @max(0.0, canvas_h - y))),
+    };
+}
+
+pub fn pointInTransport(point: Vec2f, fb_w: f32, canvas_h: f32) bool {
+    const r = transportRect(fb_w, canvas_h);
+    return r.w > 0 and r.h > 0 and pointInScreenRect(point.x, point.y, r);
 }
 
 /// 描画側が渡すノード幾何。pos は world 左上。
@@ -798,4 +822,35 @@ test "canvas: inspector param row は長いラベルでも value を content 幅
     const short = inspectorParamRowLayout(avail, 8 * "base_hz (Hz)".len);
     try testing.expectEqual(@as(i32, @intCast(8 * "base_hz (Hz)".len)), short.label_w);
     try testing.expectEqual(avail, short.total());
+}
+
+test "canvas: transport は inspector と重ならず canvas 内に収まる" {
+    const r = transportRect(960, 610);
+    const inspector = inspectorRect(960, 610);
+    try testing.expect(r.x >= 0 and r.y >= 0 and r.w >= 0 and r.h >= 0);
+    try testing.expect(r.x + r.w <= inspector.x);
+    try testing.expect(r.y + r.h <= 610);
+}
+
+test "canvas: transport は可視化帯と重ならない" {
+    const canvas_h: f32 = 610;
+    const r = transportRect(960, canvas_h);
+    try testing.expect(r.y + r.h <= canvas_h);
+    try testing.expect(!pointInTransport(.{ .x = 10, .y = 610 }, 960, canvas_h));
+    try testing.expect(pointInTransport(.{ .x = r.x, .y = r.y }, 960, canvas_h) or r.w == 0 or r.h == 0);
+}
+
+test "canvas: transport は狭い framebuffer でも負値・範囲外にならない" {
+    const sizes = [_]struct { w: f32, h: f32 }{
+        .{ .w = 0, .h = 0 },
+        .{ .w = 120, .h = 80 },
+        .{ .w = 300, .h = 200 },
+    };
+    for (sizes) |size| {
+        const canvas_h = @max(0.0, size.h - 150.0);
+        const r = transportRect(size.w, canvas_h);
+        try testing.expect(r.x >= 0 and r.y >= 0 and r.w >= 0 and r.h >= 0);
+        try testing.expect(r.x + r.w <= canvasViewportWidth(size.w, canvas_h));
+        try testing.expect(r.y + r.h <= canvas_h);
+    }
 }

@@ -55,9 +55,9 @@ fn trackWidthWithRightAlignedValue(row: canvas.ParamRowLayout, value_text_w: i32
     return row.track_w + @max(0, row.value_w - value_text_w);
 }
 
-/// 右端固定 panel を Context のレイアウトへ登録し、選択 node の descriptor を slider 化する。
-/// 呼び出し側が `endFrame()` と draw list の render を行う。
-pub fn draw(
+/// 右端 panel 本体を共有 GUI root の 1 子として登録し、選択 node の descriptor を slider 化する。
+/// 呼び出し側が root の `beginBox/endBox`、`endFrame()`、draw list の render を行う。
+pub fn drawPanel(
     ctx: *gui.Context,
     graph: *const modular.DynGraph,
     selected: ?modular.dyn.Handle,
@@ -65,15 +65,9 @@ pub fn draw(
     callback_ctx: *anyopaque,
     on_change: ChangeFn,
 ) void {
-    const screen_w: i32 = @intCast(ctx.screen_w);
-    const screen_h: i32 = @intCast(ctx.screen_h);
-    const panel_x: i32 = @max(0, panel.x);
     const panel_w: i32 = @intCast(panel.w);
     const panel_h: i32 = @intCast(panel.h);
 
-    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = screen_w }, .height = .{ .fixed = screen_h } });
-    ctx.beginBox(.{ .width = .{ .fixed = panel_x }, .height = .{ .fixed = panel_h } });
-    ctx.endBox();
     ctx.beginBox(.{
         .width = .{ .fixed = panel_w },
         .height = .{ .fixed = panel_h },
@@ -88,12 +82,10 @@ pub fn draw(
     const h = selected orelse {
         ctx.labelEx("Select a primitive node", SUBTLE);
         ctx.endBox();
-        ctx.endBox();
         return;
     };
     const kind = graph.kindOf(h) orelse {
         ctx.labelEx("Select a primitive node", SUBTLE);
-        ctx.endBox();
         ctx.endBox();
         return;
     };
@@ -108,7 +100,6 @@ pub fn draw(
     };
     if (descs.len == 0) {
         ctx.labelEx("No editable parameters", SUBTLE);
-        ctx.endBox();
         ctx.endBox();
         return;
     }
@@ -159,5 +150,20 @@ pub fn draw(
         }
     }
     ctx.endBox();
+}
+
+/// 旧 caller 向けの単独 root wrapper。統合 app は `drawPanel` を共有 root から呼ぶ。
+pub fn draw(
+    ctx: *gui.Context,
+    graph: *const modular.DynGraph,
+    selected: ?modular.dyn.Handle,
+    panel: gui.Rect,
+    callback_ctx: *anyopaque,
+    on_change: ChangeFn,
+) void {
+    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(ctx.screen_w) }, .height = .{ .fixed = @intCast(ctx.screen_h) } });
+    ctx.beginBox(.{ .width = .{ .fixed = @max(0, panel.x) }, .height = .{ .fixed = @intCast(panel.h) } });
+    ctx.endBox();
+    drawPanel(ctx, graph, selected, panel, callback_ctx, on_change);
     ctx.endBox();
 }

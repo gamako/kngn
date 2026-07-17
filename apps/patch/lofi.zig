@@ -31,6 +31,7 @@ const seedmod = @import("seed.zig");
 // ----------------------------------------------------------------------------
 const DEFAULT_BPM: f32 = 122.0;
 const DEFAULT_SIDECHAIN: f32 = 0.35;
+const DEFAULT_DENSITY_TARGET: f32 = 0.25; // 現行初期 pattern の derived density (16/64)
 const MASTER_CUTOFF_MIN: f32 = 80.0;
 const MASTER_CUTOFF_MAX: f32 = 18000.0; // ≒オープン（既定でほぼ素通し）
 // 各トラックの基準 gain（slider は 0..約1.5 の倍率で掛ける。既定 1.0 で基準＝従来）。
@@ -187,6 +188,10 @@ pub const ParamBatch = struct {
 pub const Controls = struct {
     tempo_bpm: synth.AtomicF32,
     master_cutoff: synth.AtomicF32,
+    // TASK-110.5: derived density とは別の、次 bar から収束させる target。
+    density_target: synth.AtomicF32,
+    // 未操作時は pattern の authoritative 所有モデルを優先し、density 操作後だけ収束を有効化する。
+    density_target_enabled: std.atomic.Value(u32),
     swing: synth.AtomicF32,
     sidechain_amount: synth.AtomicF32,
     kick_gain: synth.AtomicF32,
@@ -227,6 +232,8 @@ pub const Controls = struct {
         return .{
             .tempo_bpm = synth.AtomicF32.init(DEFAULT_BPM),
             .master_cutoff = synth.AtomicF32.init(MASTER_CUTOFF_MAX),
+            .density_target = synth.AtomicF32.init(DEFAULT_DENSITY_TARGET),
+            .density_target_enabled = std.atomic.Value(u32).init(0),
             .swing = synth.AtomicF32.init(0.0),
             .sidechain_amount = synth.AtomicF32.init(DEFAULT_SIDECHAIN),
             .kick_gain = synth.AtomicF32.init(1.0),
@@ -282,6 +289,7 @@ pub const PatchState = struct {
     clap_step: u8,
     bass_step: u8,
     density: f32, // 平均 on 率（popcount/16 を 4 lane 平均）
+    density_target: f32,
     bass_pitch_cv: f32, // bass_seq の現在 pitch（glide 反映）
     kick_active: bool,
     hat_active: bool,
@@ -791,8 +799,70 @@ pub const LofiPatch = struct {
         }
 
         // seed / song 切替 / pending を適用した bar は evolve 変異しない。
-        if (applied_seed or applied_song or applied_pending) return;
-        self.mutatePattern();
+        if (!(applied_seed or applied_song or applied_pending)) self.mutatePattern();
+        // density は pattern の実効 mask を別管理しない。pattern 適用/変異の後、
+        // bar ごとに eligible lane の 1 bit だけを target 方向へ寄せる。
+        self.applyDensityTarget(bar);
+    }
+
+    /// density_target への収束。kick は four-on-floor anchor のため対象外、lock lane も対象外。
+    /// 各 lane は bar ごとに最大 1 bit、選択位置は base seed + bar + lane から決定する。
+    /// ホットパス: bar 境界のみ・固定長 16-bit mask 操作（alloc/lock/IO/panic/超越関数なし）。
+    fn applyDensityTarget(self: *LofiPatch, bar: u64) void {
+        if (self.controls.density_target_enabled.load(.acquire) == 0) return;
+        const target = clampFinite(self.controls.density_target.load(), 0.0, 1.0, DEFAULT_DENSITY_TARGET);
+        const target_count: i32 = @intFromFloat(@round(target * 64.0));
+        var total: i32 = 0;
+        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
+        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
+        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
+        if (self.ptr(.step_seq, self.bass_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
+        if (total == target_count) return;
+
+        // Track order は固定。対象 lane ごとに一回だけ試行し、band の端では no-op とする。
+        const lanes = [_]struct { lane: usize, band: [2]u32 }{
+            .{ .lane = 1, .band = HAT_BAND },
+            .{ .lane = 2, .band = CLAP_BAND },
+            .{ .lane = 3, .band = BASS_BAND },
+        };
+        for (lanes) |entry| {
+            if (total == target_count or self.lock[entry.lane]) continue;
+            const seed = seedmod.splitmix64(self.base_seed ^ 0xD3A5_17E0 ^ (bar *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(entry.lane)));
+            const changed = switch (entry.lane) {
+                1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| densityMove(&seq.on_mask, total < target_count, entry.band, seed) else false,
+                2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| densityMove(&seq.on_mask, total < target_count, entry.band, seed) else false,
+                3 => if (self.ptr(.step_seq, self.bass_seq_h)) |seq| densityMove(&seq.on_mask, total < target_count, entry.band, seed) else false,
+                else => false,
+            };
+            if (changed) total += if (total < target_count) 1 else -1;
+        }
+    }
+
+    /// §4.7 の band 復帰と同じ固定長 mask 操作を density target 向けに使う。
+    /// want_on=true は off bit を、false は on bit を決定的に 1 つだけ変更する。
+    fn densityMove(mask: *u16, want_on: bool, band: [2]u32, seed: u64) bool {
+        const count: u32 = @popCount(mask.*);
+        if (want_on) {
+            if (count >= band[1]) return false;
+            const bit = selectBit(mask.*, false, seed);
+            mask.* |= bit;
+            return true;
+        }
+        if (count <= band[0]) return false;
+        const bit = selectBit(mask.*, true, seed);
+        mask.* &= ~bit;
+        return true;
+    }
+
+    fn selectBit(mask: u16, want_on: bool, seed: u64) u16 {
+        const start: u8 = @truncate(seed & 15);
+        var offset: u8 = 0;
+        while (offset < 16) : (offset += 1) {
+            const step: u8 = (start +% offset) & 15;
+            const bit = bitOf(step);
+            if ((mask & bit != 0) == want_on) return bit;
+        }
+        return 0;
     }
 
     /// 現在の song position の phrase を解決し、変化した track だけ PatternCommand を組み立てて適用。
@@ -1188,6 +1258,7 @@ pub const LofiPatch = struct {
             .clap_step = if (clap_seq) |p| p.loadStep() else 0,
             .bass_step = if (bass_seq) |p| p.loadStep() else 0,
             .density = dens / 4.0,
+            .density_target = clampFinite(self.controls.density_target.load(), 0.0, 1.0, DEFAULT_DENSITY_TARGET),
             .bass_pitch_cv = if (bass_seq) |p| p.cur_pitch else 0,
             .kick_active = if (kick) |p| p.active else false,
             .hat_active = if (hat) |p| p.active else false,
@@ -1501,6 +1572,40 @@ test "Controls: defaults match constructed patch values (no-op baseline)" {
     // 初期 pattern が seed 値で StepSeq に入っている
     try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expectEqual(BASS_ON, testSeq(patch, patch.bass_seq_h).on_mask);
+    try testing.expectEqual(@as(f32, DEFAULT_DENSITY_TARGET), patch.snapshotState().density_target);
+}
+
+test "TASK-110.5: density target converges pattern at bar boundaries" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var frozen = PatternCommand.default();
+    frozen.rev = 1;
+    frozen.evolve = false;
+    patch.controls.pattern_db.publish(frozen);
+    var warmup: [64]f32 = undefined;
+    patch.render(&warmup, 32, 2);
+    const before = patch.snapshotState().density;
+
+    patch.controls.density_target.store(0.35);
+    patch.controls.density_target_enabled.store(1, .release);
+    const after = try renderLong(patch, 4800, 48000 * 8);
+    try testing.expectEqual(@as(f32, 0.35), after.density_target);
+    try testing.expect(after.density > before);
+}
+
+test "TASK-110.5: gain and mute remain independent controls" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    patch.controls.kick_gain.store(0.5);
+    patch.controls.hat_gain.store(0.7);
+    patch.controls.hat_mute.store(1, .release);
+    var buf: [512 * 2]f32 = undefined;
+    patch.render(&buf, 512, 2);
+    const st = patch.snapshotState();
+    try testing.expectApproxEqAbs(@as(f32, KICK_BASE_GAIN * 0.5), st.kick_gain, 1e-6);
+    try testing.expect(st.hat_muted);
+    try testing.expectEqual(@as(f32, 0.7), patch.controls.hat_gain.load());
+    try testing.expectEqual(@as(f32, 0.0), st.hat_gain);
 }
 
 test "Controls: swing/sidechain/cutoff change output (bounded & finite)" {
@@ -1600,11 +1705,13 @@ test "Controls: non-finite values fall back to safe defaults (finite output)" {
     patch.controls.pad_warmth.store(std.math.nan(f32));
     patch.controls.master_warmth.store(std.math.inf(f32));
     patch.controls.ambient_move.store(std.math.nan(f32));
+    patch.controls.density_target.store(std.math.nan(f32));
     _ = try renderStats(patch, buf, frames);
     try testing.expectEqual(@as(f32, DEFAULT_BPM), testClock(patch).bpm);
     try testing.expectEqual(@as(f32, 0.0), testClock(patch).swing);
     try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), testSidechain(patch).amount);
     try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), testMasterVcf(patch).cutoff);
+    try testing.expectEqual(@as(f32, DEFAULT_DENSITY_TARGET), patch.snapshotState().density_target);
     try testing.expectEqual(@as(f32, KICK_CLICK_BASE), testKick(patch).click_gain);
     try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), testHat(patch).brightness);
     try testing.expectEqual(@as(f32, HAT_BASE_DECAY), testHat(patch).decay);
