@@ -687,6 +687,17 @@ pub fn build(b: *std.Build) void {
     const test_platform_menu_step = b.step("test-platform-menu", "Run display-less platform menu facade tests");
     test_platform_menu_step.dependOn(&run_platform_menu_test.step);
 
+    const platform_clipboard_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/platform_clipboard_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    platform_clipboard_test_mod.addImport("platform", shared_modules.platform.mod);
+    const platform_clipboard_test = b.addTest(.{ .root_module = platform_clipboard_test_mod });
+    const run_platform_clipboard_test = b.addRunArtifact(platform_clipboard_test);
+    const test_platform_clipboard_step = b.step("test-platform-clipboard", "Run OS text clipboard facade round-trip tests (TASK-120)");
+    test_platform_clipboard_step.dependOn(&run_platform_clipboard_test.step);
+
     // copilot transport 単体テスト（ConnState state machine / コマンド実行層 / registry OR ゲート / 排他。
     // socket・display 不要。TASK-62.5.2）。root=copilot.zig は harness.zig を import するため
     // harness_test_mod と同じ import/link_libc 構成が要る。"copilot:" filter で copilot のテストのみ
@@ -1856,6 +1867,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_command_step);
     test_step.dependOn(test_command_types_step);
     test_step.dependOn(test_platform_menu_step);
+    test_step.dependOn(test_platform_clipboard_step);
     test_step.dependOn(test_copilot_step);
     test_step.dependOn(test_netsync_step);
     test_step.dependOn(test_audio_null_step);

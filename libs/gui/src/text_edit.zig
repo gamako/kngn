@@ -14,9 +14,13 @@ const id_mod = @import("id.zig");
 pub const Font = font_mod.Font;
 pub const Id = id_mod.Id;
 
+pub const CopyKind = enum { copy, cut };
+
 pub const CopyRequest = struct {
     id: Id,
     text: []const u8,
+    /// 既定は `.copy`（既存呼び出しの後方互換）。
+    kind: CopyKind = .copy,
 };
 
 pub const TextRange = struct {
@@ -303,7 +307,45 @@ pub const TextBuffer = struct {
         if (selection.extent >= count) return;
         self.deleteRange(.{ .start = selection.extent, .end = selection.extent + 1 });
     }
+
+    /// 選択範囲を UTF-8 text で置換し、caret/selection を置換後末尾へ collapse する。
+    /// 単一行契約: ASCII 制御文字（0x00-0x1F, 0x7F）と改行は除外。不正 UTF-8 はスキップ。
+    /// 戻り値は buffer が変わったか。
+    pub fn replaceSelectionWithText(self: *TextBuffer, selection: *SelectionState, text: []const u8) !bool {
+        const range = selection.normalized();
+        var changed = false;
+        if (range.start != range.end) {
+            self.deleteRange(range);
+            selection.anchor = range.start;
+            selection.extent = range.start;
+            changed = true;
+        }
+        var pos: usize = 0;
+        while (pos < text.len) {
+            const n = std.unicode.utf8ByteSequenceLength(text[pos]) catch {
+                pos += 1;
+                continue;
+            };
+            if (pos + n > text.len) break;
+            const piece = text[pos .. pos + n];
+            const cp: u32 = std.unicode.utf8Decode(piece) catch {
+                pos += 1;
+                continue;
+            };
+            pos += n;
+            if (!isPasteInsertableCodepoint(cp)) continue;
+            _ = try self.insertCodepoint(selection.extent, cp);
+            selection.anchor += 1;
+            selection.extent += 1;
+            changed = true;
+        }
+        return changed;
+    }
 };
+
+fn isPasteInsertableCodepoint(cp: u32) bool {
+    return cp >= 0x20 and cp != 0x7F and cp <= 0x10FFFF and !(cp >= 0xD800 and cp <= 0xDFFF);
+}
 
 fn codepointCount(text: []const u8) usize {
     var pos: usize = 0;
@@ -495,4 +537,44 @@ test "TASK-119: SelectionState の word movement と Shift extension" {
     try testing.expectEqual(TextRange{ .start = 2, .end = 7 }, selection.normalized());
     selection.moveWord(layout, .left, true);
     try testing.expectEqual(TextRange{ .start = 2, .end = 4 }, selection.normalized());
+}
+
+test "TASK-120: replaceSelectionWithText ASCII / 日本語 / 空選択 paste" {
+    var buffer = try TextBuffer.init(testing.allocator, "abXYZcd");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 2, .extent = 5 };
+    try testing.expect(try buffer.replaceSelectionWithText(&selection, "あ"));
+    try testing.expectEqualStrings("abあcd", buffer.slice());
+    try testing.expectEqual(TextRange{ .start = 3, .end = 3 }, selection.normalized());
+
+    selection = .{ .anchor = 3, .extent = 3 };
+    try testing.expect(try buffer.replaceSelectionWithText(&selection, "!"));
+    try testing.expectEqualStrings("abあ!cd", buffer.slice());
+    try testing.expectEqual(@as(usize, 4), selection.extent);
+}
+
+test "TASK-120: replaceSelectionWithText は制御文字・改行を除外し不正 UTF-8 で壊れない" {
+    var buffer = try TextBuffer.init(testing.allocator, "X");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 1, .extent = 1 };
+    try testing.expect(try buffer.replaceSelectionWithText(&selection, "A\nB\x00C"));
+    try testing.expectEqualStrings("XABC", buffer.slice());
+
+    selection = .{ .anchor = 4, .extent = 4 };
+    // 不正先頭バイトはスキップ、後続 ASCII は入る
+    _ = try buffer.replaceSelectionWithText(&selection, &.{ 0xFF, 'Z' });
+    try testing.expectEqualStrings("XABCZ", buffer.slice());
+    try testing.expect(std.unicode.utf8ValidateSlice(buffer.slice()));
+}
+
+test "TASK-120: cut 相当の deleteRange 後 selection collapse" {
+    var buffer = try TextBuffer.init(testing.allocator, "hello");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 1, .extent = 4 };
+    const range = selection.normalized();
+    buffer.deleteRange(range);
+    selection.anchor = range.start;
+    selection.extent = range.start;
+    try testing.expectEqualStrings("ho", buffer.slice());
+    try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
 }

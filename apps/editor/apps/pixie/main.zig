@@ -1932,9 +1932,10 @@ const App = struct {
 
     /// renaming 中の key_down を処理する（メインループのイベントポンプから、通常の
     /// `handleKey` の代わりに呼ばれる）。ENTER/KP_ENTER=確定・ESCAPE=取消・
-    /// BACKSPACE/DELETE=1文字削除。それ以外はすべて無視（B/E 等のショートカットが
-    /// タイプ中に誤発火しないようにする。gui への pushEvent もイベントポンプ側で止める）。
+    /// BACKSPACE/DELETE=1文字削除。Cmd+C/X/V はテキスト clipboard（pixel clipboard へ流さない）。
+    /// composition 中の C/X/V は抑止。それ以外はすべて無視。
     fn handleRenameKey(self: *App, k: platform.KeyEvent) void {
+        if (self.handleTextFieldClipboard(k, .rename)) return;
         if (k.key == .ENTER or k.key == .KP_ENTER) {
             self.commitRenameLayer();
         } else if (k.key == .ESCAPE) {
@@ -2006,6 +2007,7 @@ const App = struct {
 
     /// テキスト編集中の key_down を処理する（`handleRenameKey` と対称）。
     fn handleTextEditKey(self: *App, k: platform.KeyEvent) void {
+        if (self.handleTextFieldClipboard(k, .text)) return;
         if (k.key == .ENTER or k.key == .KP_ENTER) {
             self.commitTextEdit();
         } else if (k.key == .ESCAPE) {
@@ -2014,6 +2016,44 @@ const App = struct {
             self.text_in.backspace();
         }
         // その他のキーは無視（ツール切替ショートカット等を遮断）
+    }
+
+    const TextFieldClipboardTarget = enum { rename, text };
+
+    /// rename / text 編集中の Cmd+C/X/V。消費したら true（pixel clipboard・tool shortcut へ流さない）。
+    /// composition（preedit あり）中は C/X/V を抑止して消費扱い。
+    fn handleTextFieldClipboard(self: *App, k: platform.KeyEvent, target: TextFieldClipboardTarget) bool {
+        const accel = k.modifiers.cmd or k.modifiers.ctrl;
+        if (!accel or k.is_repeat) return false;
+        if (k.key != .C and k.key != .X and k.key != .V) return false;
+        if (self.preedit().len > 0) return true; // composition 中は抑止（消費）
+        switch (k.key) {
+            .C => {
+                const text = switch (target) {
+                    .rename => self.rename_in.clipboardCopy(),
+                    .text => self.text_in.clipboardCopy(),
+                };
+                if (text) |t| platform.setClipboardText(t);
+            },
+            .X => {
+                const text = switch (target) {
+                    .rename => self.rename_in.clipboardCut(),
+                    .text => self.text_in.clipboardCut(),
+                };
+                if (text) |t| platform.setClipboardText(t);
+            },
+            .V => {
+                var buf: [96]u8 = undefined; // text_content max; rename は短いので共用で足りる
+                if (platform.getClipboardText(buf[0..])) |t| {
+                    switch (target) {
+                        .rename => self.rename_in.clipboardPaste(t),
+                        .text => self.text_in.clipboardPaste(t),
+                    }
+                }
+            },
+            else => unreachable,
+        }
+        return true;
     }
 
     fn doSelectLayer(self: *App, idx: usize) !void {

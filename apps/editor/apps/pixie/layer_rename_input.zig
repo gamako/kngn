@@ -73,6 +73,48 @@ pub const LayerRenameInput = struct {
     pub fn cancel(self: *LayerRenameInput) void {
         self.active = false;
     }
+
+    /// 編集中の全 text（Cmd+C）。非 active は null。
+    pub fn clipboardCopy(self: *const LayerRenameInput) ?[]const u8 {
+        if (!self.active) return null;
+        return self.text();
+    }
+
+    /// 全 text を返しつつ空にする（Cmd+X）。戻り slice は次の書き込みまで有効。
+    pub fn clipboardCut(self: *LayerRenameInput) ?[]const u8 {
+        if (!self.active) return null;
+        const n = self.len;
+        self.len = 0;
+        return self.buf[0..n];
+    }
+
+    /// 全 text を置換する（Cmd+V）。制御文字・改行は除外。UTF-8 境界で max_len 切り詰め。
+    pub fn clipboardPaste(self: *LayerRenameInput, incoming: []const u8) void {
+        if (!self.active) return;
+        self.len = 0;
+        var pos: usize = 0;
+        while (pos < incoming.len) {
+            const first = incoming[pos];
+            const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+                pos += 1;
+                continue;
+            };
+            if (seq_len > 1) {
+                if (pos + seq_len > incoming.len) break;
+                _ = std.unicode.utf8Decode(incoming[pos .. pos + seq_len]) catch {
+                    pos += 1;
+                    continue;
+                };
+            }
+            const piece = incoming[pos .. pos + seq_len];
+            pos += seq_len;
+            const cp: u32 = if (seq_len == 1) piece[0] else std.unicode.utf8Decode(piece) catch continue;
+            if (cp < 0x20 or cp == 0x7F) continue;
+            if (@as(usize, self.len) + seq_len > max_len) break;
+            @memcpy(self.buf[self.len..][0..seq_len], piece);
+            self.len += @intCast(seq_len);
+        }
+    }
 };
 
 /// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
@@ -196,4 +238,26 @@ test "begin: max_len を超える現在名は UTF-8 境界を壊さず切り詰�
     try testing.expect(r.len <= max_len);
     try testing.expect(std.unicode.utf8ValidateSlice(r.text()));
     try testing.expectEqualStrings("あ" ** 10, r.text());
+}
+
+test "TASK-120: clipboardCopy/Cut/Paste と composition 用 no-op 契約" {
+    var r: LayerRenameInput = .{};
+    try testing.expect(r.clipboardCopy() == null);
+    try testing.expect(r.clipboardCut() == null);
+    r.clipboardPaste("nope");
+    try testing.expectEqual(@as(u8, 0), r.len);
+
+    r.begin(0, "Layer");
+    try testing.expectEqualStrings("Layer", r.clipboardCopy().?);
+    const cut = r.clipboardCut().?;
+    try testing.expectEqualStrings("Layer", cut);
+    try testing.expectEqualStrings("", r.text());
+
+    r.clipboardPaste("新\n名");
+    try testing.expectEqualStrings("新名", r.text());
+
+    // 最大長超過は UTF-8 境界で切る
+    r.clipboardPaste("あ" ** 20);
+    try testing.expectEqual(@as(u8, 30), r.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(r.text()));
 }

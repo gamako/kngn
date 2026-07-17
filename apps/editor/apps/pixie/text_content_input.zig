@@ -83,6 +83,48 @@ pub const TextContentInput = struct {
     pub fn cancel(self: *TextContentInput) void {
         self.active = false;
     }
+
+    /// 編集中の全 text（Cmd+C）。非 active は null。
+    pub fn clipboardCopy(self: *const TextContentInput) ?[]const u8 {
+        if (!self.active) return null;
+        return self.text();
+    }
+
+    /// 全 text を返しつつ空にする（Cmd+X）。戻り slice は次の書き込みまで有効。
+    pub fn clipboardCut(self: *TextContentInput) ?[]const u8 {
+        if (!self.active) return null;
+        const n = self.len;
+        self.len = 0;
+        return self.buf[0..n];
+    }
+
+    /// 全 text を置換する（Cmd+V）。制御文字・改行は除外。UTF-8 境界で max_len 切り詰め。
+    pub fn clipboardPaste(self: *TextContentInput, incoming: []const u8) void {
+        if (!self.active) return;
+        self.len = 0;
+        var pos: usize = 0;
+        while (pos < incoming.len) {
+            const first = incoming[pos];
+            const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+                pos += 1;
+                continue;
+            };
+            if (seq_len > 1) {
+                if (pos + seq_len > incoming.len) break;
+                _ = std.unicode.utf8Decode(incoming[pos .. pos + seq_len]) catch {
+                    pos += 1;
+                    continue;
+                };
+            }
+            const piece = incoming[pos .. pos + seq_len];
+            pos += seq_len;
+            const cp: u32 = if (seq_len == 1) piece[0] else std.unicode.utf8Decode(piece) catch continue;
+            if (cp < 0x20 or cp == 0x7F) continue;
+            if (@as(usize, self.len) + seq_len > max_len) break;
+            @memcpy(self.buf[self.len..][0..seq_len], piece);
+            self.len += @intCast(seq_len);
+        }
+    }
 };
 
 /// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
@@ -209,4 +251,14 @@ test "begin: max_len を超える現在テキストは UTF-8 境界を壊さず�
     try testing.expect(r.len <= max_len);
     try testing.expect(std.unicode.utf8ValidateSlice(r.text()));
     try testing.expectEqualStrings("あ" ** 32, r.text());
+}
+
+test "TASK-120: clipboardCopy/Cut/Paste（text editor）" {
+    var r: TextContentInput = .{};
+    r.begin(0, "Hello");
+    try testing.expectEqualStrings("Hello", r.clipboardCopy().?);
+    try testing.expectEqualStrings("Hello", r.clipboardCut().?);
+    try testing.expectEqualStrings("", r.text());
+    r.clipboardPaste("世界\n!");
+    try testing.expectEqualStrings("世界!", r.text());
 }

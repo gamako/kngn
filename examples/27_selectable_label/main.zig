@@ -93,12 +93,12 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
 
         if (first.copy_request) |r| {
-            platform.clipboardWrite(r.text);
+            platform.setClipboardText(r.text);
             copy_probe.count += 1;
             copy_probe.bytes += r.text.len;
         }
         if (second.copy_request) |r| {
-            platform.clipboardWrite(r.text);
+            platform.setClipboardText(r.text);
             copy_probe.count += 1;
             copy_probe.bytes += r.text.len;
         }

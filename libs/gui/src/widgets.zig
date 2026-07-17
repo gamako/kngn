@@ -33,6 +33,7 @@ pub const Rect = geom.Rect;
 pub const Id = id_mod.Id;
 pub const TextRange = text_edit.TextRange;
 pub const CopyRequest = text_edit.CopyRequest;
+pub const CopyKind = text_edit.CopyKind;
 pub const TextBuffer = text_edit.TextBuffer;
 pub const MoveKey = text_edit.MoveKey;
 
@@ -53,6 +54,8 @@ pub const TextInputOpts = struct {
     /// top, right, bottom, left
     padding: [4]i32 = .{ 4, 8, 4, 8 },
     placeholder: []const u8 = "",
+    /// frame-local paste text（app が getClipboardText して渡す。null は paste 無し）。
+    paste_text: ?[]const u8 = null,
 };
 
 pub const TextInputResult = struct {
@@ -262,7 +265,9 @@ pub fn selectableLabelId(
                     if (selection.start != selection.end) {
                         const start = layout_data.byte_offsets[selection.start];
                         const end = layout_data.byte_offsets[selection.end];
-                        copy_request = .{ .id = id, .text = text[start..end] };
+                        const dup = ctx.allocator().dupe(u8, text[start..end]) catch
+                            @panic("selectableLabel: OOM");
+                        copy_request = .{ .id = id, .text = dup };
                     }
                 }
             },
@@ -376,13 +381,46 @@ pub fn textInputId(
                 const ctrl = key.modifiers & 0x02 != 0;
                 const alt = key.modifiers & 0x04 != 0;
                 const cmd = key.modifiers & 0x08 != 0;
-                if (key.code == 'C' and cmd and !ctrl and !alt and !key.repeat) {
-                    // Cmd+C は composition 中も許可（read-only）。
-                    const selection = per_id.selection.normalized();
-                    if (selection.start != selection.end) {
-                        const start = text_edit.byteIndex(buffer.slice(), selection.start);
-                        const end = text_edit.byteIndex(buffer.slice(), selection.end);
-                        copy_request = .{ .id = id, .text = buffer.slice()[start..end] };
+                if ((key.code == 'C' or key.code == 'X' or key.code == 'V') and cmd and !ctrl and !alt and !key.repeat) {
+                    // composition 中は C/X/V を抑止（保留 queue にも入れない）。
+                    if (composing) {
+                        // no-op
+                    } else if (key.code == 'V') {
+                        if (opts.paste_text) |pt| {
+                            const did = text_edit.TextBuffer.replaceSelectionWithText(buffer, &per_id.selection, pt) catch
+                                @panic("textInput: OOM");
+                            changed = changed or did;
+                            per_id.caret = per_id.selection.extent;
+                            if (did) {
+                                per_id.caret_blink_start_s = ctx.now();
+                                text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+                                    @panic("textInput: OOM");
+                            }
+                        }
+                    } else {
+                        // Cmd+C / Cmd+X
+                        const selection = per_id.selection.normalized();
+                        if (selection.start != selection.end) {
+                            const start = text_edit.byteIndex(buffer.slice(), selection.start);
+                            const end = text_edit.byteIndex(buffer.slice(), selection.end);
+                            const dup = ctx.allocator().dupe(u8, buffer.slice()[start..end]) catch
+                                @panic("textInput: OOM");
+                            copy_request = .{
+                                .id = id,
+                                .text = dup,
+                                .kind = if (key.code == 'X') .cut else .copy,
+                            };
+                            if (key.code == 'X') {
+                                buffer.deleteRange(selection);
+                                per_id.selection.anchor = selection.start;
+                                per_id.selection.extent = selection.start;
+                                per_id.caret = selection.start;
+                                changed = true;
+                                per_id.caret_blink_start_s = ctx.now();
+                                text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
+                                    @panic("textInput: OOM");
+                            }
+                        }
                     }
                 } else if (composing and isCompositionBlockedEditKey(key.code)) {
                     // composition 中は文書を変更する編集・移動キーを無視する。
@@ -572,7 +610,7 @@ fn isInsertableCodepoint(cp: u32) bool {
 }
 
 /// composition 中に TextBuffer を変更してはいけない編集・移動キー（修飾子ではなくキー種別で判定）。
-/// Cmd+A（'A'）も抑止対象。Cmd+C は呼び出し側で先に処理するためここには含めない。
+/// Cmd+A（'A'）も抑止対象。Cmd+C/X/V は呼び出し側で先に処理するためここには含めない。
 fn isCompositionBlockedEditKey(code: u32) bool {
     return code == 259 or code == 261 or code == 263 or code == 264 or code == 269 or code == 270 or code == 'A';
 }
@@ -2991,7 +3029,7 @@ test "TASK-119: composition 中の標準操作 gating" {
     ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
     ctx.perIdState(id).caret = 2;
 
-    // composition 中: 移動・編集・Cmd/Option 変形・Cmd+A は不変。Cmd+C は許可。
+    // composition 中: 移動・編集・Cmd/Option 変形・Cmd+A・Cmd+C/X/V は不変。
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 2 };
     ctx.perIdState(id).caret = 2;
     ctx.beginFrameAt(240, 120, 0.2);
@@ -3004,13 +3042,14 @@ test "TASK-119: composition 中の標準操作 gating" {
     ctx.pushEvent(.{ .key_down = .{ .code = 269, .modifiers = 0, .repeat = false } }); // HOME
     ctx.pushEvent(.{ .key_down = .{ .code = 270, .modifiers = 0, .repeat = false } }); // END
     ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0x08, .repeat = false } }); // Cmd+A 抑止
-    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } }); // Cmd+C 許可
-    const mid = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } }); // Cmd+C 抑止
+    ctx.pushEvent(.{ .key_down = .{ .code = 'X', .modifiers = 0x08, .repeat = false } }); // Cmd+X 抑止
+    ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = false } }); // Cmd+V 抑止
+    const mid = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 }, .paste_text = "ZZ" });
     try std.testing.expectEqualStrings("xy", buffer.slice());
     try std.testing.expectEqual(@as(usize, 2), ctx.perIdState(id).caret);
     try std.testing.expectEqual(TextRange{ .start = 0, .end = 2 }, mid.selection); // Cmd+A で変わらない
-    try std.testing.expect(mid.copy_request != null);
-    try std.testing.expectEqualStrings("xy", mid.copy_request.?.text);
+    try std.testing.expect(mid.copy_request == null);
     ctx.endFrame();
 
     // char_input は composition 中も挿入される
@@ -3028,6 +3067,130 @@ test "TASK-119: composition 中の標準操作 gating" {
     ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0x08, .repeat = false } });
     const all = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     try std.testing.expectEqual(TextRange{ .start = 0, .end = 1 }, all.selection);
+    ctx.endFrame();
+}
+
+test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "hello");
+    defer buffer.deinit();
+    const id: Id = 0xD1201;
+
+    ctx.beginFrameAt(320, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+    ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 5 };
+    ctx.perIdState(id).caret = 5;
+
+    // 選択なし Cmd+C は no-op
+    ctx.beginFrameAt(320, 120, 0.1);
+    ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
+    const none = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(none.copy_request == null);
+    ctx.endFrame();
+
+    // 選択あり Cmd+C
+    ctx.beginFrameAt(320, 120, 0.2);
+    ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 4 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
+    const copied = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(copied.copy_request != null);
+    try std.testing.expectEqual(CopyKind.copy, copied.copy_request.?.kind);
+    try std.testing.expectEqualStrings("ell", copied.copy_request.?.text);
+    try std.testing.expectEqualStrings("hello", buffer.slice());
+    ctx.endFrame();
+
+    // Cmd+X: request + 削除
+    ctx.beginFrameAt(320, 120, 0.3);
+    ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 4 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'X', .modifiers = 0x08, .repeat = false } });
+    const cut = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(cut.copy_request != null);
+    try std.testing.expectEqual(CopyKind.cut, cut.copy_request.?.kind);
+    try std.testing.expectEqualStrings("ell", cut.copy_request.?.text);
+    try std.testing.expectEqualStrings("ho", buffer.slice());
+    try std.testing.expectEqual(TextRange{ .start = 1, .end = 1 }, cut.selection);
+    try std.testing.expect(cut.changed);
+    ctx.endFrame();
+
+    // Cmd+V: selection 置換、caret は末尾
+    ctx.beginFrameAt(320, 120, 0.4);
+    ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 2 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = false } });
+    const pasted = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 }, .paste_text = "あ" });
+    try std.testing.expect(pasted.changed);
+    try std.testing.expectEqualStrings("あ", buffer.slice());
+    try std.testing.expectEqual(TextRange{ .start = 1, .end = 1 }, pasted.selection);
+    ctx.endFrame();
+
+    // repeat key-down は二重実行しない
+    ctx.beginFrameAt(320, 120, 0.5);
+    ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 1 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = true } });
+    const repeated = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 }, .paste_text = "NO" });
+    try std.testing.expect(!repeated.changed);
+    try std.testing.expectEqualStrings("あ", buffer.slice());
+    ctx.endFrame();
+}
+
+test "TASK-120: 非 focus TextInput は clipboard key を消費しない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var a = try TextBuffer.init(std.testing.allocator, "AA");
+    defer a.deinit();
+    var b = try TextBuffer.init(std.testing.allocator, "BB");
+    defer b.deinit();
+    const id_a: Id = 0xD120A;
+    const id_b: Id = 0xD120B;
+
+    ctx.beginFrameAt(320, 160, 0);
+    ctx.beginBox(.{ .direction = .column, .gap = 8 });
+    _ = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.beginFrameAt(320, 160, 0.1);
+    focusTextInput(&ctx, id_a, &a);
+
+    ctx.beginFrameAt(320, 160, 0.2);
+    ctx.perIdState(id_a).selection = .{ .anchor = 0, .extent = 2 };
+    ctx.perIdState(id_b).selection = .{ .anchor = 0, .extent = 2 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'X', .modifiers = 0x08, .repeat = false } });
+    const ra = ctx.textInputId(id_a, &a, .{ .width = .{ .fixed = 80 } });
+    const rb = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(ra.copy_request != null);
+    try std.testing.expectEqualStrings("", a.slice());
+    try std.testing.expect(rb.copy_request == null);
+    try std.testing.expectEqualStrings("BB", b.slice());
+    ctx.endFrame();
+}
+
+test "TASK-120: composition 終了後に C/X/V が再び有効" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xD1202;
+
+    ctx.beginFrameAt(240, 120, 0);
+    focusTextInput(&ctx, id, &buffer);
+    ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 2 };
+    ctx.beginFrameAt(240, 120, 0.1);
+    ctx.setComposition(.{ .active = true, .text = "い", .cursor = 0 });
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
+    const blocked = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(blocked.copy_request == null);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.setComposition(.{});
+    ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 2 };
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
+    const ok = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    try std.testing.expect(ok.copy_request != null);
+    try std.testing.expectEqualStrings("ab", ok.copy_request.?.text);
     ctx.endFrame();
 }
 

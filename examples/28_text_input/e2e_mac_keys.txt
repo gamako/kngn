@@ -91,4 +91,39 @@ inject key_down C cmd
 step 1
 assert copy count=1
 
+# --- Cmd+X → 空、clipboard 残る ---
+inject key_down X cmd
+step 1
+assert input len=0
+assert input caret=0
+assert copy count=2
+
+# --- Cmd+V → headless fallback round-trip で復元 ---
+inject key_down V cmd
+step 1
+assert input len=11
+assert input caret=11
+assert copy count=2
+
+# --- composition 中の C/X/V 抑止（buffer / clipboard request 不変）---
+inject key_down A cmd
+step 1
+assert input selection=0:11
+
+inject composition update 0 い
+step 1
+assert input preedit_active=1
+
+inject key_down C cmd
+inject key_down X cmd
+inject key_down V cmd
+step 1
+assert input len=11
+assert input selection=0:11
+assert copy count=2
+
+inject composition cancel
+step 1
+assert input preedit_active=0
+
 quit

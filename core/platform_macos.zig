@@ -7,6 +7,7 @@
 //! C 値からそれらを構築する変換層と、`Window`/`Framebuffer`・関数群を提供する。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("platform_types");
 const command_types = @import("command_types");
 const build_options = @import("build_options");
@@ -30,6 +31,16 @@ const MenuC = if (menu_c_abi) struct {
     extern fn platform_register_menu(window: ?*c.PlatformWindow, items: [*]const c.PlatformMenuItem, count: u32) void;
     extern fn platform_update_menu(window: ?*c.PlatformWindow, items: [*]const c.PlatformMenuItem, count: u32) void;
     extern fn platform_destroy_menu(window: ?*c.PlatformWindow) void;
+} else struct {};
+
+/// TASK-120: テキスト clipboard C symbol は Objective-C backend のみ。
+/// Swift/Metal は未実装 stub。unit test（`builtin.is_test`）では C symbol を参照しない
+/// （facade の in-memory fallback が担当。リンク時 undefined を防ぐ）。
+const clipboard_c_abi = !builtin.is_test and std.mem.eql(u8, build_options.platform_backend, "objc");
+
+const ClipboardC = if (clipboard_c_abi) struct {
+    extern fn platform_set_clipboard_text(utf8: [*]const u8, len: u32) void;
+    extern fn platform_get_clipboard_text(out: [*]u8, cap: u32, out_len: *u32) bool;
 } else struct {};
 
 // 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
@@ -600,4 +611,24 @@ pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOption
 fn dupePathAndFree(gpa: std.mem.Allocator, p: [*c]u8) std.mem.Allocator.Error![]u8 {
     defer c.platform_free_path(p);
     return try gpa.dupe(u8, std.mem.span(p));
+}
+
+// ============================================================================
+// OS テキストクリップボード (TASK-120)
+// ============================================================================
+
+/// UTF-8 text を OS clipboard へ書く。objc 以外は no-op。
+pub fn setClipboardText(text: []const u8) void {
+    if (comptime !clipboard_c_abi) return;
+    ClipboardC.platform_set_clipboard_text(text.ptr, @intCast(text.len));
+}
+
+/// OS clipboard の UTF-8 text を caller buffer へコピーする。
+/// 未対応 backend・文字列無し・失敗は null。空文字列は `buf[0..0]`。
+pub fn getClipboardText(buf: []u8) ?[]const u8 {
+    if (comptime !clipboard_c_abi) return null;
+    if (buf.len == 0) return null;
+    var out_len: u32 = 0;
+    if (!ClipboardC.platform_get_clipboard_text(buf.ptr, @intCast(buf.len), &out_len)) return null;
+    return buf[0..out_len];
 }

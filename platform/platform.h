@@ -584,4 +584,19 @@ char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts);
 // platform_*_file_dialog() が返したパス文字列を解放する。NULL 安全。
 void platform_free_path(char* path);
 
+// ========================================
+// OS テキストクリップボード (TASK-120)
+// ========================================
+//
+// UTF-8 テキストのみ。画像・RTF・複合形式は対象外。
+// 実装は macOS Objective-C backend（NSPasteboard）。Swift/Metal は Zig facade 側 stub。
+
+// OS clipboard へ UTF-8 テキストを書き込む（len はバイト長。NUL 終端不要）。
+void platform_set_clipboard_text(const char* utf8, uint32_t len);
+
+// OS clipboard から UTF-8 テキストを caller 所有 buffer へ読む。
+// 成功時 true（空文字列含む。*out_len にバイト長）。未対応・文字列無し・失敗は false。
+// cap 超過時は UTF-8 コードポイント境界で切り詰める。
+bool platform_get_clipboard_text(char* out, uint32_t cap, uint32_t* out_len);
+
 #endif // PLATFORM_H

@@ -200,11 +200,20 @@ pub fn main(init: std.process.Init) !void {
         defer fb.unlock();
 
         ctx.beginFrameAt(fb.width, fb.height, platform.getTime());
+        var paste_buf: [4096]u8 = undefined;
+        var paste_text: ?[]const u8 = null;
         while (window.nextEvent()) |ev| {
             if (ev == .quit) running = false;
             if (ev == .composition_changed) {
                 ime.dirty = true;
                 ime.last_phase = ev.composition_changed.phase;
+            }
+            if (ev == .key_down) {
+                const k = ev.key_down;
+                // Cmd+V のときだけ OS clipboard を読む（GUI は platform を import しない）。
+                if (k.key == .V and k.modifiers.cmd and !k.modifiers.ctrl and !k.modifiers.alt and !k.is_repeat) {
+                    paste_text = platform.getClipboardText(paste_buf[0..]);
+                }
             }
             if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
@@ -223,22 +232,24 @@ pub fn main(init: std.process.Init) !void {
         const first = ctx.textInputId(0x2801, &first_buffer, .{
             .width = .{ .fixed = 320 },
             .placeholder = "Type ASCII or 日本語...",
+            .paste_text = paste_text,
         });
         const second = ctx.textInputId(0x2802, &second_buffer, .{
             .width = .{ .fixed = 320 },
             .placeholder = "Second input",
+            .paste_text = paste_text,
         });
-        ctx.labelEx("single-line UTF-8 / Shift selection / Cmd+C", gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
+        ctx.labelEx("single-line UTF-8 / Shift selection / Cmd+C/X/V", gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
         ctx.labelEx("IME: 変換中 preedit は下線付き inline。Enter=確定 / Esc=取消", gui.Color.rgba(0xA0, 0xA8, 0xB8, 0xFF));
         ctx.endBox();
 
         if (first.copy_request) |r| {
-            platform.clipboardWrite(r.text);
+            platform.setClipboardText(r.text);
             copy_probe.count += 1;
             copy_probe.bytes += r.text.len;
         }
         if (second.copy_request) |r| {
-            platform.clipboardWrite(r.text);
+            platform.setClipboardText(r.text);
             copy_probe.count += 1;
             copy_probe.bytes += r.text.len;
         }

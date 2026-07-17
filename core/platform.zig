@@ -533,7 +533,8 @@ pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOption
 }
 
 // ============================================================================
-// System clipboard（TASK-73.3 wasm。native は no-op / 未実装）
+// System clipboard（TASK-73.3 wasm 色 clipboard。native は no-op / 未実装）
+// TASK-120 の setClipboardText/getClipboardText（OS テキスト）とは別経路。混在させない。
 // ============================================================================
 
 /// システム clipboard へ text を書く。backend 未実装時は no-op。
@@ -554,6 +555,66 @@ pub fn clipboardRequestPaste() void {
 pub fn clipboardTakePaste() ?[]const u8 {
     if (comptime @hasDecl(backend, "clipboardTakePaste")) {
         return backend.clipboardTakePaste();
+    }
+    return null;
+}
+
+// ============================================================================
+// OS テキストクリップボード（TASK-120）
+// ============================================================================
+//
+// ホットパス宣言: イベント時のみ（Cmd+C/X/V）。フレーム毎・RT では呼ばない。
+// headless / unit test では固定長 in-memory fallback。通常 native runtime は backend
+//（macOS objc=NSPasteboard）へ委譲する。
+
+const MEMORY_CLIPBOARD_CAP: usize = 4096;
+
+var memory_clipboard: [MEMORY_CLIPBOARD_CAP]u8 = undefined;
+var memory_clipboard_len: usize = 0;
+var memory_clipboard_set: bool = false;
+
+fn useMemoryClipboard() bool {
+    return builtin.is_test or harness.isHeadlessActive();
+}
+
+fn utf8TruncateLen(text: []const u8, max: usize) usize {
+    var n = @min(text.len, max);
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
+    return n;
+}
+
+/// テスト間で in-memory clipboard を初期化する（`builtin.is_test` 時のみ有効）。
+pub fn resetClipboardForTest() void {
+    if (!builtin.is_test) return;
+    memory_clipboard_len = 0;
+    memory_clipboard_set = false;
+}
+
+/// UTF-8 text を OS clipboard へ書く。未対応 backend は no-op。
+pub fn setClipboardText(text: []const u8) void {
+    if (useMemoryClipboard()) {
+        const n = utf8TruncateLen(text, MEMORY_CLIPBOARD_CAP);
+        @memcpy(memory_clipboard[0..n], text[0..n]);
+        memory_clipboard_len = n;
+        memory_clipboard_set = true;
+        return;
+    }
+    if (comptime @hasDecl(backend, "setClipboardText")) {
+        backend.setClipboardText(text);
+    }
+}
+
+/// OS clipboard の UTF-8 text を caller 所有 buffer へコピーする。
+/// null = 未対応 / 未設定 / 失敗。空文字列は `buf[0..0]`。容量超過は UTF-8 境界で切り詰め。
+pub fn getClipboardText(buf: []u8) ?[]const u8 {
+    if (useMemoryClipboard()) {
+        if (!memory_clipboard_set) return null;
+        const n = utf8TruncateLen(memory_clipboard[0..memory_clipboard_len], buf.len);
+        @memcpy(buf[0..n], memory_clipboard[0..n]);
+        return buf[0..n];
+    }
+    if (comptime @hasDecl(backend, "getClipboardText")) {
+        return backend.getClipboardText(buf);
     }
     return null;
 }

@@ -1981,3 +1981,46 @@ char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts) {
 void platform_free_path(char* path) {
     if (path) free(path);
 }
+
+// ========================================
+// OS テキストクリップボード (TASK-120)
+// ========================================
+
+static uint32_t clipboardUtf8TruncateLen(const char* bytes, uint32_t len, uint32_t cap) {
+    uint32_t n = len < cap ? len : cap;
+    while (n > 0 && n < len && (((unsigned char)bytes[n]) & 0xC0) == 0x80) {
+        n--;
+    }
+    return n;
+}
+
+void platform_set_clipboard_text(const char* utf8, uint32_t len) {
+    if (!utf8 && len > 0) return;
+    @autoreleasepool {
+        NSPasteboard* pb = [NSPasteboard generalPasteboard];
+        [pb clearContents];
+        NSString* str = [[NSString alloc] initWithBytes:(utf8 ? utf8 : "")
+                                                 length:len
+                                               encoding:NSUTF8StringEncoding];
+        if (!str) return;
+        [pb setString:str forType:NSPasteboardTypeString];
+    }
+}
+
+bool platform_get_clipboard_text(char* out, uint32_t cap, uint32_t* out_len) {
+    if (out_len) *out_len = 0;
+    if (!out || cap == 0) return false;
+    @autoreleasepool {
+        NSPasteboard* pb = [NSPasteboard generalPasteboard];
+        NSString* str = [pb stringForType:NSPasteboardTypeString];
+        if (!str) return false;
+        NSData* data = [str dataUsingEncoding:NSUTF8StringEncoding];
+        if (!data) return false;
+        const char* bytes = (const char*)[data bytes];
+        const uint32_t len = (uint32_t)[data length];
+        const uint32_t n = clipboardUtf8TruncateLen(bytes, len, cap);
+        memcpy(out, bytes, n);
+        if (out_len) *out_len = n;
+        return true;
+    }
+}

@@ -52,6 +52,7 @@ pub const SelectionState = @import("text_edit.zig").SelectionState;
 pub const MoveKey = @import("text_edit.zig").MoveKey;
 pub const TextBuffer = @import("text_edit.zig").TextBuffer;
 pub const CopyRequest = @import("text_edit.zig").CopyRequest;
+pub const CopyKind = @import("text_edit.zig").CopyKind;
 pub const OrderedTextEvent = @import("input.zig").OrderedTextEvent;
 pub const buildTextLayout = @import("text_edit.zig").buildTextLayout;
 pub const hitTest = @import("text_edit.zig").hitTest;
