@@ -25,6 +25,8 @@ pub const NetworkPolicy = enum {
     undo_own,
     /// 自分の revert を redo（62.3.5）。
     redo_own,
+    /// ephemeral プレゼンス（TASK-103）。COMMIT/PROPOSE/seq を消費せず専用経路へ。
+    ephemeral,
 };
 
 /// action/probe の引数シグネチャ 1 要素（TASK-88.1）。
@@ -450,6 +452,26 @@ test "action_registry: network_policy 既定は reject_when_synced" {
     try testing.expectEqual(NetworkPolicy.reject_when_synced, findAction("n").?.network_policy);
     registerAction(.{ .name = "r", .ctx = &c, .run = testRun, .network_policy = .relay });
     try testing.expectEqual(NetworkPolicy.relay, findAction("r").?.network_policy);
+    registerAction(.{ .name = "e", .ctx = &c, .run = testRun, .network_policy = .ephemeral });
+    try testing.expectEqual(NetworkPolicy.ephemeral, findAction("e").?.network_policy);
+}
+
+test "action_registry: ephemeral は canonicalize せず router へ到達する" {
+    resetForTest();
+    setEnabled(true);
+    var c = TestCtx{};
+    registerAction(.{
+        .name = "presence_point",
+        .ctx = &c,
+        .run = testRun,
+        .network_policy = .ephemeral,
+        .canonicalize = testCanonicalize,
+    });
+    setRouter(testRouter);
+    var buf: [128]u8 = undefined;
+    const out = try routeLocalAction("presence_point", "32 40", &buf);
+    // ephemeral は relay 用 canonicalize を適用しない
+    try testing.expectEqualStrings("routed:presence_point:32 40", out);
 }
 
 test "action_registry: relay の canonicalize は router 前に適用される" {

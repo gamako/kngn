@@ -1091,3 +1091,312 @@ test "formatCanonicalShape round-trip" {
     try testing.expectEqual(ShapeKind.rect, rt.kind);
     try testing.expect(rt.fill);
 }
+
+// ============================================================================
+// TASK-103: presence parsers + PresenceStore（std のみ・platform.getTime は呼び出し側が渡す）
+// ============================================================================
+
+pub const PRESENCE_COORD_MAX: i32 = 255;
+pub const PRESENCE_TTL_MAX: u16 = 10000;
+pub const PRESENCE_MAX_PEERS: usize = 8;
+
+pub const PresenceKind = enum {
+    point,
+    highlight,
+    suggest,
+
+    pub fn defaultTtlMs(self: PresenceKind) u16 {
+        return switch (self) {
+            .point => 1500,
+            .highlight => 2000,
+            .suggest => 1200,
+        };
+    }
+};
+
+pub const PresencePointArgs = struct {
+    peer_id: u32,
+    x: i32,
+    y: i32,
+    ttl_ms: u16,
+};
+
+pub const PresenceHighlightArgs = struct {
+    peer_id: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    ttl_ms: u16,
+};
+
+fn parseCoordToken(tok: []const u8) ParseError!i32 {
+    const v = std.fmt.parseInt(i32, tok, 10) catch return error.InvalidNumber;
+    if (v < 0 or v > PRESENCE_COORD_MAX) return error.ValueOutOfRange;
+    return v;
+}
+
+fn parseTtlToken(tok: []const u8, kind: PresenceKind) ParseError!u16 {
+    const v = std.fmt.parseInt(u32, tok, 10) catch return error.InvalidNumber;
+    if (v > PRESENCE_TTL_MAX) return error.ValueOutOfRange;
+    if (v == 0) return kind.defaultTtlMs();
+    return @intCast(v);
+}
+
+/// `presence_point` args: `[peer=<id>] <x> <y> [ttl_ms]`（peer 省略時 0）。
+pub fn parsePresencePoint(args: []const u8) ParseError!PresencePointArgs {
+    var it = tokenize(args);
+    const t0 = it.next() orelse return error.Empty;
+    var peer_id: u32 = 0;
+    var x_tok: []const u8 = undefined;
+    if (std.mem.startsWith(u8, t0, "peer=")) {
+        peer_id = std.fmt.parseInt(u32, t0["peer=".len..], 10) catch return error.InvalidNumber;
+        x_tok = it.next() orelse return error.Empty;
+    } else {
+        x_tok = t0;
+    }
+    const y_tok = it.next() orelse return error.Empty;
+    const x = try parseCoordToken(x_tok);
+    const y = try parseCoordToken(y_tok);
+    const ttl: u16 = if (it.next()) |tt|
+        try parseTtlToken(tt, .point)
+    else
+        PresenceKind.point.defaultTtlMs();
+    try expectExhausted(&it);
+    return .{ .peer_id = peer_id, .x = x, .y = y, .ttl_ms = ttl };
+}
+
+/// `presence_highlight` args: `[peer=<id>] <x0> <y0> <x1> <y1> [ttl_ms]`。
+pub fn parsePresenceHighlight(args: []const u8) ParseError!PresenceHighlightArgs {
+    var it = tokenize(args);
+    const t0 = it.next() orelse return error.Empty;
+    var peer_id: u32 = 0;
+    var x0_tok: []const u8 = undefined;
+    if (std.mem.startsWith(u8, t0, "peer=")) {
+        peer_id = std.fmt.parseInt(u32, t0["peer=".len..], 10) catch return error.InvalidNumber;
+        x0_tok = it.next() orelse return error.Empty;
+    } else {
+        x0_tok = t0;
+    }
+    const y0_tok = it.next() orelse return error.Empty;
+    const x1_tok = it.next() orelse return error.Empty;
+    const y1_tok = it.next() orelse return error.Empty;
+    const x0 = try parseCoordToken(x0_tok);
+    const y0 = try parseCoordToken(y0_tok);
+    const x1 = try parseCoordToken(x1_tok);
+    const y1 = try parseCoordToken(y1_tok);
+    const ttl: u16 = if (it.next()) |tt|
+        try parseTtlToken(tt, .highlight)
+    else
+        PresenceKind.highlight.defaultTtlMs();
+    try expectExhausted(&it);
+    return .{ .peer_id = peer_id, .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1, .ttl_ms = ttl };
+}
+
+/// `presence_suggest` args: `[peer=<id>] <x> <y> [ttl_ms]`。
+pub fn parsePresenceSuggest(args: []const u8) ParseError!PresencePointArgs {
+    // 座標・TTL 規則は point と同じ（既定 TTL のみ suggest）
+    var it = tokenize(args);
+    const t0 = it.next() orelse return error.Empty;
+    var peer_id: u32 = 0;
+    var x_tok: []const u8 = undefined;
+    if (std.mem.startsWith(u8, t0, "peer=")) {
+        peer_id = std.fmt.parseInt(u32, t0["peer=".len..], 10) catch return error.InvalidNumber;
+        x_tok = it.next() orelse return error.Empty;
+    } else {
+        x_tok = t0;
+    }
+    const y_tok = it.next() orelse return error.Empty;
+    const x = try parseCoordToken(x_tok);
+    const y = try parseCoordToken(y_tok);
+    const ttl: u16 = if (it.next()) |tt|
+        try parseTtlToken(tt, .suggest)
+    else
+        PresenceKind.suggest.defaultTtlMs();
+    try expectExhausted(&it);
+    return .{ .peer_id = peer_id, .x = x, .y = y, .ttl_ms = ttl };
+}
+
+pub const PeerPresence = struct {
+    peer_id: u32 = 0,
+    occupied: bool = false,
+    point_active: bool = false,
+    point_x: i32 = 0,
+    point_y: i32 = 0,
+    point_deadline: f64 = 0,
+    highlight_active: bool = false,
+    hl_x0: i32 = 0,
+    hl_y0: i32 = 0,
+    hl_x1: i32 = 0,
+    hl_y1: i32 = 0,
+    highlight_deadline: f64 = 0,
+    suggest_active: bool = false,
+    suggest_x: i32 = 0,
+    suggest_y: i32 = 0,
+    suggest_deadline: f64 = 0,
+
+    fn anyActive(self: *const PeerPresence) bool {
+        return self.point_active or self.highlight_active or self.suggest_active;
+    }
+};
+
+pub const PresenceStore = struct {
+    peers: [PRESENCE_MAX_PEERS]PeerPresence = [_]PeerPresence{.{}} ** PRESENCE_MAX_PEERS,
+
+    fn slotFor(self: *PresenceStore, peer_id: u32) ?*PeerPresence {
+        for (&self.peers) |*p| {
+            if (p.occupied and p.peer_id == peer_id) return p;
+        }
+        for (&self.peers) |*p| {
+            if (!p.occupied) {
+                p.* = .{ .peer_id = peer_id, .occupied = true };
+                return p;
+            }
+        }
+        // 満杯: 先頭を再利用（MVP。MAX_PEERS=8 と netsync 一致）
+        self.peers[0] = .{ .peer_id = peer_id, .occupied = true };
+        return &self.peers[0];
+    }
+
+    pub fn applyPoint(self: *PresenceStore, a: PresencePointArgs, now: f64) void {
+        const p = self.slotFor(a.peer_id) orelse return;
+        p.point_active = true;
+        p.point_x = a.x;
+        p.point_y = a.y;
+        p.point_deadline = now + @as(f64, @floatFromInt(a.ttl_ms)) / 1000.0;
+    }
+
+    pub fn applyHighlight(self: *PresenceStore, a: PresenceHighlightArgs, now: f64) void {
+        const p = self.slotFor(a.peer_id) orelse return;
+        p.highlight_active = true;
+        p.hl_x0 = a.x0;
+        p.hl_y0 = a.y0;
+        p.hl_x1 = a.x1;
+        p.hl_y1 = a.y1;
+        p.highlight_deadline = now + @as(f64, @floatFromInt(a.ttl_ms)) / 1000.0;
+    }
+
+    pub fn applySuggest(self: *PresenceStore, a: PresencePointArgs, now: f64) void {
+        const p = self.slotFor(a.peer_id) orelse return;
+        p.suggest_active = true;
+        p.suggest_x = a.x;
+        p.suggest_y = a.y;
+        p.suggest_deadline = now + @as(f64, @floatFromInt(a.ttl_ms)) / 1000.0;
+    }
+
+    pub fn expire(self: *PresenceStore, now: f64) void {
+        for (&self.peers) |*p| {
+            if (!p.occupied) continue;
+            if (p.point_active and now >= p.point_deadline) p.point_active = false;
+            if (p.highlight_active and now >= p.highlight_deadline) p.highlight_active = false;
+            if (p.suggest_active and now >= p.suggest_deadline) p.suggest_active = false;
+            if (!p.anyActive()) p.occupied = false;
+        }
+    }
+
+    /// digest: `count=N point=P highlight=H suggest=S [p<id>=x,y ...] [h<id>=... ] [s<id>=...]`
+    pub fn formatDigest(self: *PresenceStore, buf: []u8, now: f64) []const u8 {
+        self.expire(now);
+        var point_n: u32 = 0;
+        var highlight_n: u32 = 0;
+        var suggest_n: u32 = 0;
+        for (&self.peers) |*p| {
+            if (!p.occupied) continue;
+            if (p.point_active) point_n += 1;
+            if (p.highlight_active) highlight_n += 1;
+            if (p.suggest_active) suggest_n += 1;
+        }
+        const total = point_n + highlight_n + suggest_n;
+        var len: usize = 0;
+        const head = std.fmt.bufPrint(buf, "count={d} point={d} highlight={d} suggest={d}", .{ total, point_n, highlight_n, suggest_n }) catch return buf[0..0];
+        len = head.len;
+        for (&self.peers) |*p| {
+            if (!p.occupied) continue;
+            if (p.point_active) {
+                const part = std.fmt.bufPrint(buf[len..], " p{d}={d},{d}", .{ p.peer_id, p.point_x, p.point_y }) catch break;
+                len += part.len;
+            }
+            if (p.highlight_active) {
+                const x0 = @min(p.hl_x0, p.hl_x1);
+                const y0 = @min(p.hl_y0, p.hl_y1);
+                const x1 = @max(p.hl_x0, p.hl_x1);
+                const y1 = @max(p.hl_y0, p.hl_y1);
+                const part = std.fmt.bufPrint(buf[len..], " h{d}={d},{d},{d},{d}", .{ p.peer_id, x0, y0, x1, y1 }) catch break;
+                len += part.len;
+            }
+            if (p.suggest_active) {
+                const part = std.fmt.bufPrint(buf[len..], " s{d}={d},{d}", .{ p.peer_id, p.suggest_x, p.suggest_y }) catch break;
+                len += part.len;
+            }
+        }
+        return buf[0..len];
+    }
+};
+
+test "parsePresencePoint / Highlight / Suggest" {
+    const p = try parsePresencePoint("32 40 1500");
+    try testing.expectEqual(@as(u32, 0), p.peer_id);
+    try testing.expectEqual(@as(i32, 32), p.x);
+    try testing.expectEqual(@as(i32, 40), p.y);
+    try testing.expectEqual(@as(u16, 1500), p.ttl_ms);
+
+    const pr = try parsePresencePoint("peer=1 32 40 1500");
+    try testing.expectEqual(@as(u32, 1), pr.peer_id);
+
+    const def = try parsePresencePoint("10 20");
+    try testing.expectEqual(@as(u16, 1500), def.ttl_ms);
+
+    const h = try parsePresenceHighlight("10 12 40 24 2000");
+    try testing.expectEqual(@as(i32, 10), h.x0);
+    try testing.expectEqual(@as(i32, 24), h.y1);
+
+    const s = try parsePresenceSuggest("48 48");
+    try testing.expectEqual(@as(u16, 1200), s.ttl_ms);
+
+    try testing.expectError(error.ValueOutOfRange, parsePresencePoint("256 0"));
+    try testing.expectError(error.ValueOutOfRange, parsePresencePoint("0 -1"));
+    try testing.expectError(error.ValueOutOfRange, parsePresencePoint("0 0 10001"));
+    try testing.expectError(error.TooManyTokens, parsePresencePoint("1 2 3 4"));
+    try testing.expectError(error.Empty, parsePresencePoint(""));
+    try testing.expectError(error.TooManyTokens, parsePresenceHighlight("1 2 3 4 5 6"));
+}
+
+test "PresenceStore: TTL expire / subtype 独立 / digest" {
+    var store: PresenceStore = .{};
+    store.applyPoint(.{ .peer_id = 1, .x = 32, .y = 40, .ttl_ms = 1500 }, 0.0);
+    store.applyHighlight(.{ .peer_id = 1, .x0 = 10, .y0 = 12, .x1 = 40, .y1 = 24, .ttl_ms = 2000 }, 0.0);
+    store.applySuggest(.{ .peer_id = 1, .x = 48, .y = 48, .ttl_ms = 1200 }, 0.0);
+
+    var buf: [256]u8 = undefined;
+    const d0 = store.formatDigest(&buf, 0.5);
+    try testing.expect(std.mem.indexOf(u8, d0, "count=3") != null);
+    try testing.expect(std.mem.indexOf(u8, d0, "point=1") != null);
+    try testing.expect(std.mem.indexOf(u8, d0, "highlight=1") != null);
+    try testing.expect(std.mem.indexOf(u8, d0, "suggest=1") != null);
+    try testing.expect(std.mem.indexOf(u8, d0, "p1=32,40") != null);
+    try testing.expect(std.mem.indexOf(u8, d0, "h1=10,12,40,24") != null);
+    try testing.expect(std.mem.indexOf(u8, d0, "s1=48,48") != null);
+
+    // suggest だけ消滅（1.2s）
+    const d1 = store.formatDigest(&buf, 1.3);
+    try testing.expect(std.mem.indexOf(u8, d1, "suggest=0") != null);
+    try testing.expect(std.mem.indexOf(u8, d1, "point=1") != null);
+    try testing.expect(std.mem.indexOf(u8, d1, "s1=") == null);
+
+    // 全消滅
+    const d2 = store.formatDigest(&buf, 2.1);
+    try testing.expect(std.mem.indexOf(u8, d2, "count=0") != null);
+    try testing.expect(std.mem.indexOf(u8, d2, "point=0") != null);
+}
+
+test "PresenceStore: peer 無し local と remote peer= が独立 slot" {
+    var store: PresenceStore = .{};
+    store.applyPoint(.{ .peer_id = 0, .x = 1, .y = 1, .ttl_ms = 1500 }, 0);
+    store.applyPoint(.{ .peer_id = 1, .x = 2, .y = 2, .ttl_ms = 1500 }, 0);
+    var buf: [256]u8 = undefined;
+    const d = store.formatDigest(&buf, 0);
+    try testing.expect(std.mem.indexOf(u8, d, "count=2") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "point=2") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "p0=1,1") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "p1=2,2") != null);
+}

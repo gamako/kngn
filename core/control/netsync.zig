@@ -43,7 +43,54 @@ pub const FrameKind = enum(u8) {
     propose_revert = 0x06,
     commit_revert = 0x07,
     peer_info = 0x08,
+    /// ephemeral プレゼンス（TASK-103）。COMMIT/seq 非消費。
+    presence = 0x09,
     _,
+};
+
+/// PRESENCE fixed payload 長（origin_peer + subtype + reserved + ttl + 4×i32）。
+pub const PRESENCE_PAYLOAD_LEN: usize = 24;
+pub const PRESENCE_QUEUE_CAP: usize = 64;
+
+pub const PresenceSubtype = enum(u8) {
+    point = 0x01,
+    highlight = 0x02,
+    suggest = 0x03,
+
+    pub fn defaultTtlMs(self: PresenceSubtype) u16 {
+        return switch (self) {
+            .point => 1500,
+            .highlight => 2000,
+            .suggest => 1200,
+        };
+    }
+
+    pub fn actionName(self: PresenceSubtype) []const u8 {
+        return switch (self) {
+            .point => "presence_point",
+            .highlight => "presence_highlight",
+            .suggest => "presence_suggest",
+        };
+    }
+
+    pub fn fromByte(b: u8) ?PresenceSubtype {
+        return switch (b) {
+            0x01 => .point,
+            0x02 => .highlight,
+            0x03 => .suggest,
+            else => null,
+        };
+    }
+};
+
+pub const PresencePayload = struct {
+    origin_peer: u32,
+    subtype: PresenceSubtype,
+    ttl_ms: u16,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
 };
 
 pub const ActorKind = enum {
@@ -86,11 +133,56 @@ pub const ProtocolError = error{
 
 /// kind 別の payload 上限（超過は protocol error 切断）。
 pub fn maxPayloadForKind(kind: u8) usize {
-    return if (kind == @intFromEnum(FrameKind.sync)) MAX_SYNC_BYTES else MAX_ACTION_FRAME_BYTES;
+    if (kind == @intFromEnum(FrameKind.sync)) return MAX_SYNC_BYTES;
+    if (kind == @intFromEnum(FrameKind.presence)) return PRESENCE_PAYLOAD_LEN;
+    return MAX_ACTION_FRAME_BYTES;
 }
 
 pub fn isKnownKind(kind: u8) bool {
-    return kind >= 0x01 and kind <= 0x08;
+    return kind >= 0x01 and kind <= 0x09;
+}
+
+/// PRESENCE 24B encode（LE）。reserved は常に 0。
+pub fn formatPresencePayload(buf: []u8, p: PresencePayload) ![]const u8 {
+    if (buf.len < PRESENCE_PAYLOAD_LEN) return error.PayloadTooLarge;
+    std.mem.writeInt(u32, buf[0..4], p.origin_peer, .little);
+    buf[4] = @intFromEnum(p.subtype);
+    buf[5] = 0; // reserved
+    std.mem.writeInt(u16, buf[6..8], p.ttl_ms, .little);
+    std.mem.writeInt(i32, buf[8..12], p.x0, .little);
+    std.mem.writeInt(i32, buf[12..16], p.y0, .little);
+    std.mem.writeInt(i32, buf[16..20], p.x1, .little);
+    std.mem.writeInt(i32, buf[20..24], p.y1, .little);
+    return buf[0..PRESENCE_PAYLOAD_LEN];
+}
+
+/// PRESENCE decode。長さ不一致・reserved≠0・未知 subtype・TTL>10000 は ProtocolError。
+/// `ttl_ms==0` は subtype 既定値へ展開する。
+pub fn parsePresencePayload(payload: []const u8) ProtocolError!PresencePayload {
+    if (payload.len != PRESENCE_PAYLOAD_LEN) return error.ProtocolError;
+    if (payload[5] != 0) return error.ProtocolError;
+    const subtype = PresenceSubtype.fromByte(payload[4]) orelse return error.ProtocolError;
+    var ttl = std.mem.readInt(u16, payload[6..8], .little);
+    if (ttl > 10000) return error.ProtocolError;
+    if (ttl == 0) ttl = subtype.defaultTtlMs();
+    return .{
+        .origin_peer = std.mem.readInt(u32, payload[0..4], .little),
+        .subtype = subtype,
+        .ttl_ms = ttl,
+        .x0 = std.mem.readInt(i32, payload[8..12], .little),
+        .y0 = std.mem.readInt(i32, payload[12..16], .little),
+        .x1 = std.mem.readInt(i32, payload[16..20], .little),
+        .y1 = std.mem.readInt(i32, payload[20..24], .little),
+    };
+}
+
+/// harness / remote dispatch 用の args 行を生成する。
+/// point/suggest: `peer=<id> <x> <y> <ttl_ms>` / highlight: `peer=<id> <x0> <y0> <x1> <y1> <ttl_ms>`
+pub fn formatPresenceRemoteArgs(buf: []u8, p: PresencePayload) ![]const u8 {
+    return switch (p.subtype) {
+        .point, .suggest => std.fmt.bufPrint(buf, "peer={d} {d} {d} {d}", .{ p.origin_peer, p.x0, p.y0, p.ttl_ms }),
+        .highlight => std.fmt.bufPrint(buf, "peer={d} {d} {d} {d} {d} {d}", .{ p.origin_peer, p.x0, p.y0, p.x1, p.y1, p.ttl_ms }),
+    };
 }
 
 /// フレームを Writer へ encode（kind + len LE + payload）。
@@ -458,6 +550,177 @@ const OutboundQueue = struct {
         self.freeQueuedLocked();
         self.closed = false;
     }
+
+    /// 非ブロッキング dequeue。空なら null。
+    fn tryDequeue(self: *OutboundQueue, io: Io, out: *OutboundEntry) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.count == 0) return false;
+        out.* = self.slots[self.head];
+        self.slots[self.head] = .{ .inline_frame = .{} };
+        self.head = (self.head + 1) % OUTBOUND_CAP;
+        self.count -= 1;
+        return true;
+    }
+
+    /// writer 起床用（presence enqueue 時に呼ぶ）。
+    fn signal(self: *OutboundQueue, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.cond.signal(io);
+    }
+
+    /// dequeue せずに 1 回待つ。closed かつ空なら false。
+    /// presence signal でも true を返し、呼び出し側がループ先頭で両 queue を再試行する。
+    fn waitForWork(self: *OutboundQueue, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.closed and self.count == 0) return false;
+        if (self.count > 0) return true;
+        self.cond.waitUncancelable(io, &self.mutex);
+        if (self.closed and self.count == 0) return false;
+        return true;
+    }
+
+    fn isClosed(self: *OutboundQueue, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.closed;
+    }
+};
+
+/// PRESENCE 専用 inbound（COMMIT queue と分離。満杯は drop・切断しない）。
+/// peer×subtype で latest-wins（未処理があれば置換）。
+const PresenceInboundQueue = struct {
+    mutex: Io.Mutex = .init,
+    slots: [PRESENCE_QUEUE_CAP]struct {
+        peer_id: u32 = 0,
+        subtype: u8 = 0,
+        data: [PRESENCE_PAYLOAD_LEN]u8 = undefined,
+        occupied: bool = false,
+    } = undefined,
+    count: usize = 0,
+
+    fn clear(self: *PresenceInboundQueue, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (&self.slots) |*s| s.occupied = false;
+        self.count = 0;
+    }
+
+    fn len(self: *PresenceInboundQueue, io: Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.count;
+    }
+
+    /// payload はちょうど 24B。成功 true / 満杯 drop は false（切断しない）。
+    fn enqueueLatestWins(self: *PresenceInboundQueue, io: Io, peer_id: u32, payload: []const u8) bool {
+        if (payload.len != PRESENCE_PAYLOAD_LEN) return false;
+        const subtype = payload[4];
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        // 同一 peer×subtype の未処理があれば置換
+        for (&self.slots) |*s| {
+            if (s.occupied and s.peer_id == peer_id and s.subtype == subtype) {
+                @memcpy(&s.data, payload[0..PRESENCE_PAYLOAD_LEN]);
+                return true;
+            }
+        }
+        if (self.count >= PRESENCE_QUEUE_CAP) return false;
+        for (&self.slots) |*s| {
+            if (!s.occupied) {
+                s.occupied = true;
+                s.peer_id = peer_id;
+                s.subtype = subtype;
+                @memcpy(&s.data, payload[0..PRESENCE_PAYLOAD_LEN]);
+                self.count += 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn dequeue(self: *PresenceInboundQueue, io: Io, out_peer: *u32, out_buf: *[PRESENCE_PAYLOAD_LEN]u8) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (&self.slots) |*s| {
+            if (s.occupied) {
+                out_peer.* = s.peer_id;
+                @memcpy(out_buf, &s.data);
+                s.occupied = false;
+                self.count -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// PRESENCE 専用 outbound（COMMIT outbound と分離。満杯は drop・切断しない）。
+/// subtype で latest-wins。
+const PresenceOutboundQueue = struct {
+    mutex: Io.Mutex = .init,
+    slots: [PRESENCE_QUEUE_CAP]struct {
+        subtype: u8 = 0,
+        data: [PRESENCE_PAYLOAD_LEN]u8 = undefined,
+        occupied: bool = false,
+    } = undefined,
+    count: usize = 0,
+    closed: bool = false,
+
+    fn clear(self: *PresenceOutboundQueue, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (&self.slots) |*s| s.occupied = false;
+        self.count = 0;
+        self.closed = false;
+    }
+
+    fn close(self: *PresenceOutboundQueue, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.closed = true;
+    }
+
+    fn enqueueLatestWins(self: *PresenceOutboundQueue, io: Io, payload: []const u8) bool {
+        if (payload.len != PRESENCE_PAYLOAD_LEN) return false;
+        const subtype = payload[4];
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.closed) return false;
+        for (&self.slots) |*s| {
+            if (s.occupied and s.subtype == subtype) {
+                @memcpy(&s.data, payload[0..PRESENCE_PAYLOAD_LEN]);
+                return true;
+            }
+        }
+        if (self.count >= PRESENCE_QUEUE_CAP) return false;
+        for (&self.slots) |*s| {
+            if (!s.occupied) {
+                s.occupied = true;
+                s.subtype = subtype;
+                @memcpy(&s.data, payload[0..PRESENCE_PAYLOAD_LEN]);
+                self.count += 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn tryDequeue(self: *PresenceOutboundQueue, io: Io, out_buf: *[PRESENCE_PAYLOAD_LEN]u8) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (&self.slots) |*s| {
+            if (s.occupied) {
+                @memcpy(out_buf, &s.data);
+                s.occupied = false;
+                self.count -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 // ============================================================================
@@ -483,6 +746,8 @@ const ConnSlot = struct {
     reader_thread: ?std.Thread = null,
     writer_thread: ?std.Thread = null,
     outbound: OutboundQueue = .{},
+    /// PRESENCE 専用 outbound（満杯 drop・COMMIT と分離。TASK-103）。
+    presence_outbound: PresenceOutboundQueue = .{},
     /// host slots 配列内 index。client は 0。
     slot_index: usize = 0,
     is_client_conn: bool = false,
@@ -530,6 +795,8 @@ var client_slot: ConnSlot = .{};
 var local_peer_id: u32 = 0; // client が host HELLO で受け取る
 
 var inbound: InboundQueue = .{};
+/// PRESENCE 専用 inbound（awaiting_sync gate 外で処理。TASK-103）。
+var presence_inbound: PresenceInboundQueue = .{};
 
 var client_actor_kind: ActorKind = .human;
 /// 既定 label。`undefined` + len だけ先に立てると NUL が HELLO に載り host が切断する（E2E で確認済み）。
@@ -1159,6 +1426,7 @@ pub fn initHost(port: u16) void {
     stop_flag.store(false, .seq_cst);
     defaultClientLabel();
     inbound.clear(io_val);
+    presence_inbound.clear(io_val);
 
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     server = addr.listen(io_val, .{ .reuse_address = true }) catch |err| {
@@ -1208,6 +1476,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     stop_flag.store(false, .seq_cst);
     setClientIdentity(kind, label);
     inbound.clear(io_val);
+    presence_inbound.clear(io_val);
 
     // HELLO encode にも内部保存と同じ切り詰め済み label を使う（201B 以上を素通しすると
     // host 側の label 上限で protocol error 切断になるため、API 境界で clamp する）。
@@ -1232,6 +1501,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     if (label_clamped.len > 0) @memcpy(client_slot.label_buf[0..label_clamped.len], label_clamped);
     client_slot.label_len = label_clamped.len;
     client_slot.outbound.reset(io_val);
+    client_slot.presence_outbound.clear(io_val);
     peers_mutex.unlock(io_val);
 
     client_slot.writer_thread = std.Thread.spawn(.{}, writerMain, .{&client_slot}) catch {
@@ -1293,7 +1563,8 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
 
 /// inbound を drain し PROPOSE/COMMIT/REJECT/ClientJoined を適用する（main thread。毎フレーム可）。
 /// `router_clear_pending` の処理は `isEnabled` 早期 return より前（fail-soft 後も解除する）。
-/// awaiting_sync 中は pending_sync import のみ試し、inbound dequeue ループには入らない。
+/// awaiting_sync 中は pending_sync import のみ試し、COMMIT inbound dequeue ループには入らない。
+/// PRESENCE inbound は awaiting_sync gate 外で常に処理する（TASK-103）。
 pub fn pump() void {
     if (!io_inited) return;
 
@@ -1309,6 +1580,9 @@ pub fn pump() void {
     }
 
     if (!isEnabled()) return;
+
+    // presence は SYNC 待ち中でも適用（document COMMIT とは独立）。
+    pumpPresenceInbound();
 
     // awaiting 中に SYNC を適用しても、同 pump では COMMIT を dequeue しない（次 pump で再開）。
     peers_mutex.lockUncancelable(io_val);
@@ -1329,6 +1603,41 @@ pub fn pump() void {
         } else {
             handleInboundFrame(kind, peer, payload);
         }
+    }
+}
+
+fn pumpPresenceInbound() void {
+    var peer: u32 = 0;
+    var data: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    var dispatch_buf: [256]u8 = undefined;
+    while (presence_inbound.dequeue(io_val, &peer, &data)) {
+        handlePresenceFrame(peer, &data, &dispatch_buf);
+    }
+}
+
+fn handlePresenceFrame(from_peer: u32, payload: []const u8, dispatch_buf: []u8) void {
+    var parsed = parsePresencePayload(payload) catch return;
+    // host 受信: origin を TCP slot peer id で上書き（偽装防止）
+    peers_mutex.lockUncancelable(io_val);
+    const cur_role = role;
+    peers_mutex.unlock(io_val);
+
+    if (cur_role == .host) {
+        parsed.origin_peer = from_peer;
+        var pbuf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+        const wired = formatPresencePayload(&pbuf, parsed) catch return;
+        var args_buf: [128]u8 = undefined;
+        const remote_args = formatPresenceRemoteArgs(&args_buf, parsed) catch return;
+        const name = parsed.subtype.actionName();
+        _ = action_registry.dispatch(name, remote_args, dispatch_buf) catch return;
+        // callback 成功時のみ broadcast（awaiting_sync client 含む）
+        broadcastPresence(wired);
+    } else {
+        // client 受信: payload の origin_peer を信頼（host が設定済み）
+        var args_buf: [128]u8 = undefined;
+        const remote_args = formatPresenceRemoteArgs(&args_buf, parsed) catch return;
+        const name = parsed.subtype.actionName();
+        _ = action_registry.dispatch(name, remote_args, dispatch_buf) catch {};
     }
 }
 
@@ -1794,6 +2103,7 @@ fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const
             .relay => commitAndBroadcast(name, args, buf),
             .local_only => action_registry.dispatch(name, args, buf),
             .reject_when_synced => error.RejectedWhileSynced,
+            .ephemeral => applyLocalPresence(name, args, buf),
             .undo_own => blk: {
                 const exec = shared_executor orelse break :blk error.NoExecutor;
                 const target = exec.findUndoCandidate(.{ .peer = 0 }) orelse break :blk writeNothing(buf, "nothing to undo");
@@ -1813,11 +2123,124 @@ fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const
             .relay => proposeToHost(name, args, buf),
             .local_only => action_registry.dispatch(name, args, buf),
             .reject_when_synced => error.RejectedWhileSynced,
+            .ephemeral => enqueueClientPresence(name, args, buf),
             .undo_own => proposeRevertOwn(buf),
             .redo_own => proposeRedoOwn(buf),
         },
         .disabled => action_registry.dispatch(name, args, buf),
     };
+}
+
+/// host ローカル ephemeral: peer=0 付きで dispatch（COMMIT 非生成）。
+fn applyLocalPresence(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const parsed = try parsePresenceActionToPayload(name, args, 0);
+    var args_buf: [128]u8 = undefined;
+    const remote_args = try formatPresenceRemoteArgs(&args_buf, parsed);
+    return action_registry.dispatch(name, remote_args, buf);
+}
+
+/// client ephemeral: PRESENCE を presence outbound へ積み `"sent"` を返す（PROPOSE 非生成）。
+/// HELLO 完了後なら `awaiting_sync` 中でも送信可。
+fn enqueueClientPresence(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    if (!io_inited) return error.NotConnected;
+    peers_mutex.lockUncancelable(io_val);
+    const ok = role == .client and started and client_slot.state == .active and client_slot.hello_done;
+    peers_mutex.unlock(io_val);
+    if (!ok) return error.NotConnected;
+
+    // origin_peer は client 送信時 0（host が slot peer id で上書き）
+    const parsed = try parsePresenceActionToPayload(name, args, 0);
+    var pbuf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    const payload = try formatPresencePayload(&pbuf, parsed);
+
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    if (role != .client or !started or client_slot.state != .active) return error.NotConnected;
+    _ = client_slot.presence_outbound.enqueueLatestWins(io_val, payload); // 満杯は drop
+    client_slot.outbound.signal(io_val); // writer 起床
+    return std.fmt.bufPrint(buf, "sent", .{}) catch "sent";
+}
+
+/// harness action args → PresencePayload。coords は 0..255、ttl は 0..=10000。
+fn parsePresenceActionToPayload(name: []const u8, args: []const u8, origin_peer: u32) ProtocolError!PresencePayload {
+    const subtype: PresenceSubtype = if (std.mem.eql(u8, name, "presence_point"))
+        .point
+    else if (std.mem.eql(u8, name, "presence_highlight"))
+        .highlight
+    else if (std.mem.eql(u8, name, "presence_suggest"))
+        .suggest
+    else
+        return error.ProtocolError;
+
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    const parseI = struct {
+        fn go(iter: *std.mem.TokenIterator(u8, .any)) ProtocolError!i32 {
+            const tok = iter.next() orelse return error.ProtocolError;
+            return std.fmt.parseInt(i32, tok, 10) catch error.ProtocolError;
+        }
+    }.go;
+    const parseTtl = struct {
+        fn go(iter: *std.mem.TokenIterator(u8, .any), st: PresenceSubtype) ProtocolError!u16 {
+            const tok = iter.next() orelse return st.defaultTtlMs();
+            const v = std.fmt.parseInt(u32, tok, 10) catch return error.ProtocolError;
+            if (v > 10000) return error.ProtocolError;
+            if (iter.next() != null) return error.ProtocolError;
+            return if (v == 0) st.defaultTtlMs() else @intCast(v);
+        }
+    }.go;
+    const inRange = struct {
+        fn go(v: i32) bool {
+            return v >= 0 and v <= 255;
+        }
+    }.go;
+
+    return switch (subtype) {
+        .point, .suggest => blk: {
+            const x = try parseI(&it);
+            const y = try parseI(&it);
+            if (!inRange(x) or !inRange(y)) return error.ProtocolError;
+            const ttl = try parseTtl(&it, subtype);
+            break :blk .{
+                .origin_peer = origin_peer,
+                .subtype = subtype,
+                .ttl_ms = ttl,
+                .x0 = x,
+                .y0 = y,
+                .x1 = 0,
+                .y1 = 0,
+            };
+        },
+        .highlight => blk: {
+            const x0 = try parseI(&it);
+            const y0 = try parseI(&it);
+            const x1 = try parseI(&it);
+            const y1 = try parseI(&it);
+            if (!inRange(x0) or !inRange(y0) or !inRange(x1) or !inRange(y1)) return error.ProtocolError;
+            const ttl = try parseTtl(&it, subtype);
+            break :blk .{
+                .origin_peer = origin_peer,
+                .subtype = subtype,
+                .ttl_ms = ttl,
+                .x0 = x0,
+                .y0 = y0,
+                .x1 = x1,
+                .y1 = y1,
+            };
+        },
+    };
+}
+
+/// active 全 client へ PRESENCE を soft-broadcast（synced 非限定・満杯 drop・切断しない）。
+fn broadcastPresence(payload: []const u8) void {
+    if (!io_inited) return;
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    if (!started or role != .host) return;
+    for (&slots) |*s| {
+        if (s.state != .active) continue;
+        _ = s.presence_outbound.enqueueLatestWins(io_val, payload);
+        s.outbound.signal(io_val);
+    }
 }
 
 /// active かつ synced な全接続の outbound へ fan-out。
@@ -1891,6 +2314,7 @@ pub fn shutdown() void {
     }
 
     inbound.clear(io_val);
+    presence_inbound.clear(io_val);
     peers_mutex.lockUncancelable(io_val);
     role = .disabled;
     started = false;
@@ -1931,6 +2355,7 @@ fn requestCloseSlotLocked(s: *ConnSlot) void {
     if (s.state == .empty or s.state == .closing) return;
     s.state = .closing;
     s.outbound.close(io_val);
+    s.presence_outbound.close(io_val);
     // ## fd close 不変条件
     // fd を使いうる全スレッド（特に writer）を join するまで stream.close してはならない。
     // 他スレッドを起こす手段は outbound.close（condvar）と stream.shutdown(.both) のみ。
@@ -1975,6 +2400,7 @@ fn joinSlot(s: *ConnSlot) void {
         s.socket_open = false;
     }
     s.outbound.reset(io_val);
+    s.presence_outbound.clear(io_val);
     s.state = .empty;
     s.hello_done = false;
     s.synced = false;
@@ -2083,25 +2509,44 @@ fn writerMain(slot: *ConnSlot) void {
     var wbuf: [1024]u8 = undefined;
     var writer = slot.stream.writer(io_val, &wbuf);
     var entry: OutboundEntry = .{ .inline_frame = .{} };
+    var presence_buf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
     while (true) {
-        if (slot.outbound.dequeueWait(io_val, &entry) == null) break;
-        const send_ok = blk: {
-            switch (entry) {
-                .inline_frame => |f| {
-                    encodeFrame(&writer.interface, f.kind, f.data[0..f.len]) catch break :blk false;
-                },
-                .big_frame => |b| {
-                    encodeFrame(&writer.interface, b.kind, b.ptr[0..b.len]) catch break :blk false;
-                },
+        // COMMIT outbound を優先（presence flood で document を飢餓させない）
+        if (slot.outbound.tryDequeue(io_val, &entry)) {
+            const send_ok = blk: {
+                switch (entry) {
+                    .inline_frame => |f| {
+                        encodeFrame(&writer.interface, f.kind, f.data[0..f.len]) catch break :blk false;
+                    },
+                    .big_frame => |b| {
+                        encodeFrame(&writer.interface, b.kind, b.ptr[0..b.len]) catch break :blk false;
+                    },
+                }
+                writer.interface.flush() catch break :blk false;
+                break :blk true;
+            };
+            entry.free();
+            if (!send_ok) {
+                requestCloseSlot(slot);
+                break;
             }
-            writer.interface.flush() catch break :blk false;
-            break :blk true;
-        };
-        entry.free(); // 送出後（成功・失敗とも）big を解放
-        if (!send_ok) {
-            requestCloseSlot(slot);
-            break;
+            continue;
         }
+        if (slot.presence_outbound.tryDequeue(io_val, &presence_buf)) {
+            const send_ok = blk: {
+                encodeFrame(&writer.interface, @intFromEnum(FrameKind.presence), &presence_buf) catch break :blk false;
+                writer.interface.flush() catch break :blk false;
+                break :blk true;
+            };
+            if (!send_ok) {
+                requestCloseSlot(slot);
+                break;
+            }
+            continue;
+        }
+        // 両方空 → outbound cond で待つ（presence enqueue も同 cond を signal）。
+        // dequeue はしない: presence 起床を飲みこまないため waitForWork → ループ先頭で再試行。
+        if (!slot.outbound.waitForWork(io_val)) break;
     }
 }
 
@@ -2166,6 +2611,17 @@ fn readerMain(slot: *ConnSlot) void {
 
         if (kind == @intFromEnum(FrameKind.hello)) break; // duplicate HELLO
 
+        // PRESENCE: 専用 queue へ（検証失敗・満杯は drop。COMMIT queue / 切断に影響しない）
+        if (kind == @intFromEnum(FrameKind.presence)) {
+            if (len == PRESENCE_PAYLOAD_LEN) {
+                // reserved / subtype / TTL の軽検証（本適用は pump）。不正は drop。
+                if (parsePresencePayload(payload)) |_| {
+                    _ = presence_inbound.enqueueLatestWins(io_val, slot.peer_id, payload);
+                } else |_| {}
+            }
+            continue;
+        }
+
         if (!inbound.enqueue(io_val, kind, payload, slot.peer_id)) {
             std.debug.print("[netsync] inbound 満杯 — 接続を切断します\n", .{});
             break;
@@ -2207,6 +2663,7 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
         slot.socket_open = false;
     }
     slot.outbound.reset(io_val);
+    slot.presence_outbound.clear(io_val);
     slot.state = .empty;
     slot.hello_done = false;
     slot.synced = false;
@@ -2298,6 +2755,7 @@ pub fn resetForTest() void {
     awaiting_sync = false;
     freePendingSyncLocked();
     pendingClear();
+    if (io_inited) presence_inbound.clear(io_val);
 }
 
 /// テスト用: slot の synced / snapshot_valid / join_snapshot_seq。
@@ -2413,7 +2871,7 @@ fn waitClientActive(timeout_ms: u64) !void {
 }
 
 test "netsync: codec 全 kind round-trip" {
-    const kinds = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const kinds = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09 };
     for (kinds) |k| {
         var obuf: [512]u8 = undefined;
         var w = Io.Writer.fixed(&obuf);
@@ -2479,6 +2937,9 @@ test "netsync: codec 未知 kind は上限内なら decode 可・maxPayload は 
     try testing.expectEqual(@as(usize, MAX_ACTION_FRAME_BYTES), maxPayloadForKind(0x99));
     try testing.expectEqual(@as(usize, MAX_SYNC_BYTES), maxPayloadForKind(0x04));
     try testing.expectEqual(@as(usize, MAX_ACTION_FRAME_BYTES), maxPayloadForKind(0x01));
+    try testing.expectEqual(@as(usize, PRESENCE_PAYLOAD_LEN), maxPayloadForKind(0x09));
+    try testing.expect(isKnownKind(0x09));
+    try testing.expect(!isKnownKind(0x0A));
 }
 
 test "netsync: codec len 超過は PayloadTooLarge" {
@@ -4919,4 +5380,288 @@ test "netsync: setClientIdentity が VP_NETSYNC_ACTOR/LABEL 相当を保持" {
     const parsed = try parseClientHello(hello);
     try testing.expectEqual(ActorKind.agent, parsed.kind);
     try testing.expectEqualStrings("env-bot", parsed.label);
+}
+
+// ============================================================================
+// TASK-103: PRESENCE ephemeral
+// ============================================================================
+
+test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
+    var buf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    const src: PresencePayload = .{
+        .origin_peer = 7,
+        .subtype = .highlight,
+        .ttl_ms = 2000,
+        .x0 = -3,
+        .y0 = 40,
+        .x1 = 100,
+        .y1 = -20,
+    };
+    const enc = try formatPresencePayload(&buf, src);
+    try testing.expectEqual(@as(usize, 24), enc.len);
+    const dec = try parsePresencePayload(enc);
+    try testing.expectEqual(@as(u32, 7), dec.origin_peer);
+    try testing.expectEqual(PresenceSubtype.highlight, dec.subtype);
+    try testing.expectEqual(@as(u16, 2000), dec.ttl_ms);
+    try testing.expectEqual(@as(i32, -3), dec.x0);
+    try testing.expectEqual(@as(i32, 40), dec.y0);
+    try testing.expectEqual(@as(i32, 100), dec.x1);
+    try testing.expectEqual(@as(i32, -20), dec.y1);
+
+    // ttl=0 → 既定展開
+    var zero = src;
+    zero.ttl_ms = 0;
+    zero.subtype = .point;
+    const enc0 = try formatPresencePayload(&buf, zero);
+    const dec0 = try parsePresencePayload(enc0);
+    try testing.expectEqual(@as(u16, 1500), dec0.ttl_ms);
+
+    // reserved ≠ 0
+    var bad = buf;
+    @memcpy(&bad, enc);
+    bad[5] = 1;
+    try testing.expectError(error.ProtocolError, parsePresencePayload(&bad));
+
+    // 長さ不一致
+    try testing.expectError(error.ProtocolError, parsePresencePayload(enc[0..23]));
+
+    // TTL 超過
+    var over = src;
+    over.ttl_ms = 10001;
+    const enc_over = try formatPresencePayload(&buf, over);
+    try testing.expectError(error.ProtocolError, parsePresencePayload(enc_over));
+
+    // 未知 subtype
+    var unk = buf;
+    @memcpy(&unk, enc);
+    unk[4] = 0x99;
+    try testing.expectError(error.ProtocolError, parsePresencePayload(&unk));
+
+    try testing.expectEqual(@as(usize, 24), maxPayloadForKind(0x09));
+}
+
+test "netsync: 未知 kind 0x0A は読み捨て継続（旧互換）" {
+    // readerMain と同じ分岐: isKnownKind が false なら discardPayload して continue。
+    // ここでは codec 層で「未知 kind の後続フレームが読める」ことを固定する。
+    try testing.expect(!isKnownKind(0x0A));
+    var raw: [5 + 4 + 5 + 3]u8 = undefined;
+    // unknown kind 0x0A len=4
+    raw[0] = 0x0A;
+    std.mem.writeInt(u32, raw[1..5], 4, .little);
+    @memcpy(raw[5..9], "xxxx");
+    // 続く既知 kind PROPOSE 相当
+    raw[9] = 0x02;
+    std.mem.writeInt(u32, raw[10..14], 3, .little);
+    @memcpy(raw[14..17], "abc");
+
+    var r = Io.Reader.fixed(&raw);
+    const k1 = try r.takeByte();
+    try testing.expectEqual(@as(u8, 0x0A), k1);
+    const len1 = try r.takeInt(u32, .little);
+    try discardPayload(&r, len1);
+    var pbuf: [16]u8 = undefined;
+    const frame = try decodeFrame(&r, &pbuf);
+    try testing.expectEqual(@as(u8, 0x02), frame.kind);
+    try testing.expectEqualStrings("abc", frame.payload);
+}
+
+test "netsync: client presence_point は PROPOSE 非生成・seq/pending 不変" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [512]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [256]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return; // HELLO
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            var sync_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_buf[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_buf) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(300); // client が presence を積むまで接続維持
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var ctx: SemCtx = .{};
+    registerSem("presence_point", &ctx, .ephemeral);
+    const caddr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    initClientAs(caddr, .agent, "helper");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (testAwaitingSync() and waited < 2000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+
+    const seq0 = wireSeq();
+    const pend0 = testPendingCount();
+    const prop0 = next_proposal_id;
+    var buf: [64]u8 = undefined;
+    const out = try action_registry.routeLocalAction("presence_point", "32 40 1500", &buf);
+    try testing.expectEqualStrings("sent", out);
+    try testing.expectEqual(seq0, wireSeq());
+    try testing.expectEqual(pend0, testPendingCount());
+    try testing.expectEqual(prop0, next_proposal_id);
+    try testing.expectEqual(@as(u32, 0), ctx.calls); // client はローカル dispatch しない
+}
+
+test "netsync: host presence 受信で callback + broadcast・失敗時は broadcast しない" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    var ctx: SemCtx = .{};
+    registerSem("presence_point", &ctx, .ephemeral);
+
+    var pbuf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    const payload = try formatPresencePayload(&pbuf, .{
+        .origin_peer = 0,
+        .subtype = .point,
+        .ttl_ms = 1500,
+        .x0 = 32,
+        .y0 = 40,
+        .x1 = 0,
+        .y1 = 0,
+    });
+    try testing.expect(presence_inbound.enqueueLatestWins(io_val, 1, payload));
+    const seq0 = wireSeq();
+    pump();
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try testing.expect(std.mem.indexOf(u8, ctx.last_args[0..ctx.last_args_len], "peer=1") != null);
+    try testing.expectEqual(seq0, wireSeq());
+
+    // callback 失敗 → broadcast 経路に入らない（outbound に積まれないことの近似: fail 後 calls 増えない）
+    ctx.fail = true;
+    try testing.expect(presence_inbound.enqueueLatestWins(io_val, 2, payload));
+    pump();
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+}
+
+test "netsync: presence queue latest-wins と満杯 drop" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    var pbuf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    const mk = struct {
+        fn go(buf: *[PRESENCE_PAYLOAD_LEN]u8, x: i32) []const u8 {
+            return formatPresencePayload(buf, .{
+                .origin_peer = 0,
+                .subtype = .point,
+                .ttl_ms = 1500,
+                .x0 = x,
+                .y0 = 0,
+                .x1 = 0,
+                .y1 = 0,
+            }) catch unreachable;
+        }
+    }.go;
+
+    try testing.expect(presence_inbound.enqueueLatestWins(io_val, 1, mk(&pbuf, 10)));
+    try testing.expect(presence_inbound.enqueueLatestWins(io_val, 1, mk(&pbuf, 99))); // replace
+    try testing.expectEqual(@as(usize, 1), presence_inbound.len(io_val));
+    var peer: u32 = 0;
+    var out: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    try testing.expect(presence_inbound.dequeue(io_val, &peer, &out));
+    const parsed = try parsePresencePayload(&out);
+    try testing.expectEqual(@as(i32, 99), parsed.x0);
+
+    // 満杯 drop（切断しない）
+    var i: usize = 0;
+    while (i < PRESENCE_QUEUE_CAP) : (i += 1) {
+        // peer を変えて slot を埋める
+        try testing.expect(presence_inbound.enqueueLatestWins(io_val, @intCast(i + 1), mk(&pbuf, @intCast(i))));
+    }
+    try testing.expect(!presence_inbound.enqueueLatestWins(io_val, 999, mk(&pbuf, 1)));
+    try testing.expectEqual(@as(usize, PRESENCE_QUEUE_CAP), presence_inbound.len(io_val));
+}
+
+test "netsync: awaiting_sync 中も presence 適用・COMMIT は保留" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    // client 役を手動セット（接続なしで pump 経路だけ検証）
+    peers_mutex.lockUncancelable(io_val);
+    role = .client;
+    started = true;
+    awaiting_sync = true;
+    peers_mutex.unlock(io_val);
+    enableRouter();
+
+    var ctx: SemCtx = .{};
+    registerSem("presence_point", &ctx, .ephemeral);
+    registerSem("stroke", &ctx, .relay);
+
+    var pbuf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
+    const presence = try formatPresencePayload(&pbuf, .{
+        .origin_peer = 1,
+        .subtype = .point,
+        .ttl_ms = 1500,
+        .x0 = 5,
+        .y0 = 6,
+        .x1 = 0,
+        .y1 = 0,
+    });
+    try testing.expect(presence_inbound.enqueueLatestWins(io_val, 0, presence));
+
+    // COMMIT を通常 inbound へ
+    var cbuf: [64]u8 = undefined;
+    const commit = try formatCommitPayload(&cbuf, 1, 0, "stroke", "1 2");
+    try testing.expect(inbound.enqueue(io_val, @intFromEnum(FrameKind.commit), commit, 0));
+
+    pump(); // awaiting 中: presence 適用、COMMIT は dequeue しない
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try testing.expect(std.mem.eql(u8, ctx.last_args[0..ctx.last_args_len], "peer=1 5 6 1500") or
+        std.mem.indexOf(u8, ctx.last_args[0..ctx.last_args_len], "peer=1") != null);
+    try testing.expectEqual(@as(usize, 1), inboundLen());
+    try testing.expect(testAwaitingSync());
+}
+
+test "netsync: presence 適用で wire_seq / proposal / pending 不変" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    var ctx: SemCtx = .{};
+    registerSem("presence_highlight", &ctx, .ephemeral);
+    registerSem("presence_suggest", &ctx, .ephemeral);
+
+    const seq0 = wireSeq();
+    const prop0 = next_proposal_id;
+    const pend0 = testPendingCount();
+
+    var buf: [64]u8 = undefined;
+    _ = try action_registry.routeLocalAction("presence_highlight", "10 12 40 24 2000", &buf);
+    _ = try action_registry.routeLocalAction("presence_suggest", "48 48", &buf);
+
+    try testing.expectEqual(seq0, wireSeq());
+    try testing.expectEqual(prop0, next_proposal_id);
+    try testing.expectEqual(pend0, testPendingCount());
+    try testing.expectEqual(@as(u32, 2), ctx.calls);
+}
+
+test "netsync: router ephemeral host/client 分岐" {
+    resetForTest();
+    defer resetForTest();
+    var ctx: SemCtx = .{};
+    registerSem("presence_point", &ctx, .ephemeral);
+    initHost(0);
+    var buf: [64]u8 = undefined;
+    const r = try action_registry.routeLocalAction("presence_point", "1 2", &buf);
+    try testing.expect(std.mem.indexOf(u8, r, "ok:") != null or std.mem.indexOf(u8, r, "peer=") != null);
+    try testing.expectEqual(@as(u64, 0), wireSeq());
 }

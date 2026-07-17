@@ -461,6 +461,8 @@ const App = struct {
     cursor_shape: platform.CursorShape = .default,
     /// Brush footprint 輪郭リングの縁セルキャッシュ（(size,hardness) 変化時のみ再計算）。
     brush_edges: brush_edge_cache.EdgeCache = .{},
+    /// ephemeral プレゼンス状態（TASK-103。Document/CommandLog 非保持）。
+    presence: actions.PresenceStore = .{},
     /// ── ペイン（TASK-42）。pane は fixed px・canvas は grow。幅/高さは毎フレーム利用可能領域へ clamp ──
     right_pane_w: i32 = RIGHT_PANE_DEFAULT,
     right_visible: bool = true,
@@ -2763,6 +2765,12 @@ fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
+/// presence digest（TASK-103）: ephemeral overlay 状態。TTL 期限切れは除去してから出力。
+fn presenceDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.presence.formatDigest(buf, platform.getTime());
+}
+
 /// menu digest（TASK-97.2）: 開閉・項目数・enabled/checked mask・pending_file_op。
 /// `open=<title|none> items=<n> enabled=<hex> checked=<hex> pending=<tag|none>`
 /// enabled/checked は非 separator 項目の出現順ビット（bit0=先頭の item）。
@@ -3525,6 +3533,28 @@ fn actionDiffMark(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
+/// TASK-103: presence_* は recordedAction 非経由・Document/CommandLog/undo 非変更。
+fn actionPresencePoint(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const parsed = try actions.parsePresencePoint(args);
+    app.presence.applyPoint(parsed, platform.getTime());
+    return std.fmt.bufPrint(buf, "ok peer={d} x={d} y={d}", .{ parsed.peer_id, parsed.x, parsed.y }) catch "ok";
+}
+
+fn actionPresenceHighlight(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const parsed = try actions.parsePresenceHighlight(args);
+    app.presence.applyHighlight(parsed, platform.getTime());
+    return std.fmt.bufPrint(buf, "ok peer={d}", .{parsed.peer_id}) catch "ok";
+}
+
+fn actionPresenceSuggest(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const parsed = try actions.parsePresenceSuggest(args);
+    app.presence.applySuggest(parsed, platform.getTime());
+    return std.fmt.bufPrint(buf, "ok peer={d} x={d} y={d}", .{ parsed.peer_id, parsed.x, parsed.y }) catch "ok";
+}
+
 /// `play`: timeline 再生開始（UI Play ボタンと同一処理）。CommandLog 非記録・冪等。
 fn actionPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
@@ -3981,6 +4011,24 @@ const pixie_args_export_sheet: @FieldType(platform.Action, "args") = &.{
     .{ .name = "columns", .kind = "int", .optional = true, .desc = "0=auto ceil(sqrt(n))" },
     .{ .name = "margin", .kind = "int", .optional = true, .desc = "gap between frames in px" },
 };
+// TASK-103: presence
+const pixie_args_presence_point: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "x", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "y", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "ttl_ms", .kind = "int", .min = 0, .max = 10000, .optional = true },
+};
+const pixie_args_presence_highlight: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "x0", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "y0", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "x1", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "y1", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "ttl_ms", .kind = "int", .min = 0, .max = 10000, .optional = true },
+};
+const pixie_args_presence_suggest: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "x", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "y", .kind = "int", .min = 0, .max = 255 },
+    .{ .name = "ttl_ms", .kind = "int", .min = 0, .max = 10000, .optional = true },
+};
 
 fn actionRequestClose(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     try actions.parseNoArgs(args);
@@ -4102,6 +4150,10 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "shape", .ctx = app, .run = recordedAction("shape", .record), .network_policy = .relay, .desc = "draw shape line|rect|ellipse p0 p1 [fill]", .args = pixie_args_shape });
     platform.registerAction(.{ .name = "set_symmetry", .ctx = app, .run = recordedAction("set_symmetry", .record), .network_policy = .relay, .desc = "symmetry off|v|h|quad", .args = pixie_args_set_symmetry });
     platform.registerAction(.{ .name = "set_pixel_perfect", .ctx = app, .run = recordedAction("set_pixel_perfect", .record), .network_policy = .relay, .desc = "pixel-perfect pen 0|1", .args = pixie_args_set_pixel_perfect });
+    // TASK-103: ephemeral presence（recordedAction / CommandLog / undo 非経由）
+    platform.registerAction(.{ .name = "presence_point", .ctx = app, .run = actionPresencePoint, .network_policy = .ephemeral, .desc = "agent cursor / work position", .args = pixie_args_presence_point });
+    platform.registerAction(.{ .name = "presence_highlight", .ctx = app, .run = actionPresenceHighlight, .network_policy = .ephemeral, .desc = "temporary canvas highlight rect", .args = pixie_args_presence_highlight });
+    platform.registerAction(.{ .name = "presence_suggest", .ctx = app, .run = actionPresenceSuggest, .network_policy = .ephemeral, .desc = "assist suggestion marker", .args = pixie_args_presence_suggest });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -4138,6 +4190,90 @@ fn registerStateSync(app: *App) void {
         .export_fn = netsyncExport,
         .import_fn = netsyncImport,
     });
+}
+
+/// peer 固定色（point/highlight 用）。suggest は amber 固定。
+fn presencePeerColor(peer_id: u32) gui.Color {
+    const palette = [_]gui.Color{
+        gui.Color.rgba(0x3B, 0x82, 0xF6, 0xFF), // blue
+        gui.Color.rgba(0x22, 0xC5, 0x5E, 0xFF), // green
+        gui.Color.rgba(0xA8, 0x55, 0xF7, 0xFF), // purple
+        gui.Color.rgba(0xEF, 0x44, 0x44, 0xFF), // red
+        gui.Color.rgba(0x06, 0xB6, 0xD4, 0xFF), // cyan
+        gui.Color.rgba(0xF9, 0x73, 0x16, 0xFF), // orange
+        gui.Color.rgba(0xEC, 0x48, 0x99, 0xFF), // pink
+        gui.Color.rgba(0x84, 0xCC, 0x16, 0xFF), // lime
+    };
+    return palette[peer_id % palette.len];
+}
+
+const PRESENCE_SUGGEST_COLOR = gui.Color.rgba(0xF5, 0x9E, 0x0B, 0xFF); // amber
+
+fn canvasToScreen(canvas_rect: core.Rect, zoom: i32, cx: i32, cy: i32) gui.Vec2 {
+    return .{
+        .x = canvas_rect.x + cx * zoom + @divTrunc(zoom, 2),
+        .y = canvas_rect.y + cy * zoom + @divTrunc(zoom, 2),
+    };
+}
+
+/// TASK-103 presence overlay。フレーム毎・最大 8 peer × 固定小面積。
+fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
+    const canvas_rect = canvas_rect_opt orelse return;
+    const area = app.last_area orelse return;
+    const zoom = app.view_zoom;
+    const now = platform.getTime();
+    app.presence.expire(now);
+
+    const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+    const disp: gui.Rect = .{
+        .x = canvas_rect.x,
+        .y = canvas_rect.y,
+        .w = @intCast(canvas_rect.w * zoom),
+        .h = @intCast(canvas_rect.h * zoom),
+    };
+    const dl = &app.ctx.draw_list;
+    dl.pushClip(disp.intersect(clip_area)) catch return;
+    defer dl.popClip();
+
+    var label_bufs: [actions.PRESENCE_MAX_PEERS][32]u8 = undefined;
+    for (&app.presence.peers, 0..) |*p, i| {
+        if (!p.occupied) continue;
+        const col = presencePeerColor(p.peer_id);
+
+        if (p.highlight_active) {
+            const x0 = @min(p.hl_x0, p.hl_x1);
+            const y0 = @min(p.hl_y0, p.hl_y1);
+            const x1 = @max(p.hl_x0, p.hl_x1);
+            const y1 = @max(p.hl_y0, p.hl_y1);
+            const fill = gui.Color.rgba(col.r, col.g, col.b, 0x55);
+            const rect: gui.Rect = .{
+                .x = canvas_rect.x + x0 * zoom,
+                .y = canvas_rect.y + y0 * zoom,
+                .w = @intCast((x1 - x0 + 1) * zoom),
+                .h = @intCast((y1 - y0 + 1) * zoom),
+            };
+            dl.rectFilled(rect, fill) catch {};
+            dl.rectOutline(rect, col, 2) catch {};
+        }
+
+        if (p.point_active) {
+            const c = canvasToScreen(canvas_rect, zoom, p.point_x, p.point_y);
+            const arm: i32 = @max(4, zoom);
+            dl.line(.{ .x = c.x - arm, .y = c.y }, .{ .x = c.x + arm, .y = c.y }, col, 2) catch {};
+            dl.line(.{ .x = c.x, .y = c.y - arm }, .{ .x = c.x, .y = c.y + arm }, col, 2) catch {};
+            dl.rectFilled(.{ .x = c.x - 2, .y = c.y - 2, .w = 4, .h = 4 }, col) catch {};
+            const label = std.fmt.bufPrint(&label_bufs[i], "agent #{d}", .{p.peer_id}) catch "agent";
+            dl.text(.{ .x = c.x + 6, .y = c.y - 12 }, label, col) catch {};
+        }
+
+        if (p.suggest_active) {
+            const c = canvasToScreen(canvas_rect, zoom, p.suggest_x, p.suggest_y);
+            const r: i32 = @max(3, zoom);
+            dl.rectOutline(.{ .x = c.x - r, .y = c.y - r, .w = @intCast(r * 2), .h = @intCast(r * 2) }, PRESENCE_SUGGEST_COLOR, 2) catch {};
+            dl.rectFilled(.{ .x = c.x - 2, .y = c.y - 2, .w = 4, .h = 4 }, PRESENCE_SUGGEST_COLOR) catch {};
+            dl.text(.{ .x = c.x + 6, .y = c.y + 4 }, "suggest", PRESENCE_SUGGEST_COLOR) catch {};
+        }
+    }
 }
 
 /// canvas_area rect 内に表示領域（CANVAS*zoom 四方）を配置した canvas rect を返す。
@@ -5425,6 +5561,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
     platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title/geometry state" });
+    platform.registerProbe(.{ .name = "presence", .ctx = self, .ext = "txt", .digest = presenceDigest, .desc = "ephemeral presence overlay: count/point/highlight/suggest + per-peer coords" });
     registerActions(self);
     registerStateSync(self);
     return self;
@@ -5780,6 +5917,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, CANVAS_W, CANVAS_H, rect, zoom, area);
             }
         }
+        // TASK-103: presence overlay（canvas blit の直後・bezier/selection より下）
+        drawPresenceOverlay(self, canvas_rect);
         // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる。area で clip）
         if (self.active_kind == .bezier) {
             if (canvas_rect) |rect| if (self.last_area) |area| {
