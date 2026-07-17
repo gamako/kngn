@@ -2622,8 +2622,10 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const live_pending = app.dialog_op orelse app.pending_file_op;
     const pending = if (live_pending) |op| @tagName(op) else "none";
     const last_op = if (app.menu_pending_probe) |op| @tagName(op) else "none";
-    return std.fmt.bufPrint(buf, "open={s} items={d} enabled={X:0>8} checked={X:0>8} pending={s} last_op={s}", .{
-        open, items, enabled_mask, checked_mask, pending, last_op,
+    // native=0|1: OS native メニュー（NSMenu）が有効か（TASK-97.3 hotfix で追加。
+    // headless は常に 0 / objc 実 window + enable_menu ビルドで 1。実機検証の機械 assert 用）。
+    return std.fmt.bufPrint(buf, "open={s} items={d} enabled={X:0>8} checked={X:0>8} pending={s} last_op={s} native={d}", .{
+        open, items, enabled_mask, checked_mask, pending, last_op, @intFromBool(app.native_menu_active),
     }) catch buf[0..0];
 }
 

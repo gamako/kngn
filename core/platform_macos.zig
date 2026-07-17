@@ -412,37 +412,45 @@ pub const Window = struct {
     }
 
     // ========================================================================
-    // native menu (TASK-97.3)
-    // ========================================================================
-    //
-    // ホットパス宣言: 登録・状態更新は初期化時/状態変更イベント時のみ。選択はイベント時のみ。
-    // 性能規約の適用対象外。
-
-    pub fn nativeMenuAvailable(self: Window) bool {
-        _ = self;
-        if (comptime !menu_c_abi) return false;
-        return MenuC.platform_menu_available();
-    }
-
-    pub fn registerMenu(self: Window, commands: []const Command) void {
-        if (comptime !menu_c_abi) return;
-        var scratch: MenuScratch = .{};
-        const items = scratch.fill(commands);
-        MenuC.platform_register_menu(self.handle, items.ptr, @intCast(items.len));
-    }
-
-    pub fn updateMenu(self: Window, commands: []const Command) void {
-        if (comptime !menu_c_abi) return;
-        var scratch: MenuScratch = .{};
-        const items = scratch.fill(commands);
-        MenuC.platform_update_menu(self.handle, items.ptr, @intCast(items.len));
-    }
-
-    pub fn destroyMenu(self: Window) void {
-        if (comptime !menu_c_abi) return;
-        MenuC.platform_destroy_menu(self.handle);
-    }
 };
+
+// ============================================================================
+// native menu (TASK-97.3)
+// ============================================================================
+//
+// ホットパス宣言: 登録・状態更新は初期化時/状態変更イベント時のみ。選択はイベント時のみ。
+// 性能規約の適用対象外。
+//
+// ⚠ facade（core/platform.zig）は `@hasDecl(backend, "nativeMenuAvailable")` で
+// **module-level decl** を探して dispatch する（97.1 契約。doc comment に明記）。
+// Window struct のメソッドにすると comptime 検査が silently false になり、
+// 全ビルド緑のまま native メニューが永遠に無効化される（2026-07-17 実機で発覚した実バグ。
+// headless E2E は fallback が期待値のため検出不能だった）。module-level から動かさないこと。
+
+pub fn nativeMenuAvailable(win: Window) bool {
+    _ = win;
+    if (comptime !menu_c_abi) return false;
+    return MenuC.platform_menu_available();
+}
+
+pub fn registerMenu(win: Window, commands: []const Command) void {
+    if (comptime !menu_c_abi) return;
+    var scratch: MenuScratch = .{};
+    const items = scratch.fill(commands);
+    MenuC.platform_register_menu(win.handle, items.ptr, @intCast(items.len));
+}
+
+pub fn updateMenu(win: Window, commands: []const Command) void {
+    if (comptime !menu_c_abi) return;
+    var scratch: MenuScratch = .{};
+    const items = scratch.fill(commands);
+    MenuC.platform_update_menu(win.handle, items.ptr, @intCast(items.len));
+}
+
+pub fn destroyMenu(win: Window) void {
+    if (comptime !menu_c_abi) return;
+    MenuC.platform_destroy_menu(win.handle);
+}
 
 /// Command → PlatformMenuItem 変換用の一時バッファ。
 /// 文字列は呼び出し中のみ有効（backend が copy）。stack 固定長で alloc しない。
