@@ -398,6 +398,10 @@ pub const KitLibs = struct {
     appshell: ?*std.Build.Module = null,
     /// 流動中の paint は kit 非収録。example/app の root へ direct import する。
     paint: ?*std.Build.Module = null,
+    /// kit.gamepad / kit.gfx(action_map) で共有する gamepad module（TASK-111.8）。
+    /// caller が gfx へ gamepad を配線する場合は**同一インスタンス**を渡すこと。
+    /// null なら buildStandalone が従来どおり自前生成する（既存 consumer 不変）。
+    gamepad: ?*std.Build.Module = null,
 };
 
 /// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
@@ -587,14 +591,18 @@ pub fn buildStandalone(
             kit_mod.addImport("gmath", kl.gmath);
             kit_mod.addImport("gfx", kl.gfx);
             kit_mod.addImport("sound", kl.sound);
-            // gamepad（TASK-80.1）: kit.zig が無条件 import するため、caller の KitLibs には含めず
-            // ここで自前に1つ作って types_mod だけを配線する（platform_types のみに依存する headless
-            // lib のため kl から受け取る必要が無い）。既存の唯一の kit_libs 消費者
-            // （apps/editor/build.zig の pixie standalone）を無改造のまま壊さないための対応。
-            const kit_gamepad_mod = b.createModule(.{
-                .root_source_file = .{ .cwd_relative = b.fmt("{s}/src/gamepad.zig", .{kit_root}) },
-            });
-            kit_gamepad_mod.addImport("platform_types", types_mod);
+            // gamepad（TASK-80.1 / TASK-111.8）: kit.zig が無条件 import する。
+            // caller が kl.gamepad を渡していればそれを共有（gfx/action_map と同一 instance）。
+            // null なら従来どおり自前生成（apps/editor 等の既存 consumer 不変）。
+            const kit_gamepad_mod: *std.Build.Module = if (kl.gamepad) |gp|
+                gp
+            else blk: {
+                const m = b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = b.fmt("{s}/src/gamepad.zig", .{kit_root}) },
+                });
+                m.addImport("platform_types", types_mod);
+                break :blk m;
+            };
             kit_mod.addImport("gamepad", kit_gamepad_mod);
             // recipe（TASK-62.5.8）: kit.zig が無条件 import する（トップ階層 build.zig の
             // `link(kit, common.recipe)` と同じ）。libs/recipe は serde にのみ依存する headless lib。

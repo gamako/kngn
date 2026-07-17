@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // kit 配線: apps/editor/build.zig を手本に、png を 1 instance で共有する（二重化回避）。
+    // kit 配線: examples/33_camera と同型。gfx と kit.gamepad で gamepad module を共有（TASK-111.8）。
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
@@ -53,8 +53,12 @@ pub fn build(b: *std.Build) void {
     sound.addImport("dsp", dsp);
     sound.addImport("synth", synth);
 
-    // kit.gfx（TASK-111.2/111.3/111.4）: atlas/animation/camera は gfx.zig 相対 import のため
-    // 追加 named module は不要（sprite/helpers のみ配線）。
+    // gamepad は 1 instance を gfx(action_map) と kit で共有する。
+    const gamepad_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
+    });
+    gamepad_mod.addImport("platform_types", platform_types);
+
     const gfx_keyboard = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
     });
@@ -77,21 +81,17 @@ pub fn build(b: *std.Build) void {
     gfx.addImport("fixed_timestep", gfx_ft);
     gfx.addImport("fps_counter", gfx_fps);
     gfx.addImport("keyboard", gfx_keyboard);
-    // action_map（gfx 内相対 import）が gamepad + platform_types を要求する（TASK-111.8）
-    const gamepad_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
-    });
-    gamepad_mod.addImport("platform_types", platform_types);
     gfx.addImport("gamepad", gamepad_mod);
     gfx.addImport("platform_types", platform_types);
 
     platform.buildStandalone(b, target, optimize, .{
-        .base_name = "example_33_camera",
+        .base_name = "example_34_action_map",
         .main_source = b.path("main.zig"),
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .png_module = png,
+        .link_gamepad = true,
         .kit_libs = .{
             .platform_types = platform_types,
             .command_types = command_types,
@@ -103,6 +103,7 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
+            .gamepad = gamepad_mod,
         },
     });
 }

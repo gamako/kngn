@@ -476,6 +476,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_31", .path = "examples/31_sprite_ex/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_32", .path = "examples/32_sprite_anim/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_33", .path = "examples/33_camera/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_34", .path = "examples/34_action_map/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
@@ -492,7 +493,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.startsWith(u8, example.name, "example_26"),
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
@@ -1459,7 +1460,8 @@ pub fn build(b: *std.Build) void {
     test_sprite_step.dependOn(&run_sprite_test.step);
 
     // ========================================
-    // libs/gfx テスト（umbrella + 移設 helper。TASK-111.2）
+    // libs/gfx テスト（umbrella + 移設 helper。TASK-111.2/111.8）
+    // atlas/animation/camera/action_map は gfx.zig 相対 import + test { _ = ... } で収集。
     // ========================================
     const gfx_test_keyboard = b.createModule(.{
         .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
@@ -1477,6 +1479,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // action_map が @import("gamepad") するため、test root でも gamepad を共有（types 同一）。
+    const gfx_test_gamepad = b.createModule(.{
+        .root_source_file = b.path("src/gamepad.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gfx_test_gamepad.addImport("platform_types", shared_modules.types.mod);
     const gfx_test_root = b.createModule(.{
         .root_source_file = b.path("libs/gfx/src/gfx.zig"),
         .target = target,
@@ -1486,6 +1495,8 @@ pub fn build(b: *std.Build) void {
     gfx_test_root.addImport("fixed_timestep", gfx_test_ft);
     gfx_test_root.addImport("fps_counter", gfx_test_fps);
     gfx_test_root.addImport("keyboard", gfx_test_keyboard);
+    gfx_test_root.addImport("gamepad", gfx_test_gamepad);
+    gfx_test_root.addImport("platform_types", shared_modules.types.mod);
     const gfx_test = b.addTest(.{ .root_module = gfx_test_root });
     const run_gfx_test = b.addRunArtifact(gfx_test);
     const run_gfx_ft_test = b.addRunArtifact(b.addTest(.{ .root_module = gfx_test_ft }));
@@ -2041,10 +2052,11 @@ fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, defa
 // ============================================================
 const PlatformModules = struct {
     platform: TaggedModule, // opt-in 無効（既定。main/synth/modular/patch/大半の example。TASK-80.2/97.3）
-    platform_gamepad: TaggedModule, // gamepad opt-in（examples/22_gamepad 専用）
+    platform_gamepad: TaggedModule, // gamepad opt-in（examples/22_gamepad / 34_action_map）
     platform_menu: TaggedModule, // menu opt-in（pixie 専用。TASK-97.3）
     keyboard: *std.Build.Module, // src/ レガシー（examples 専用。層管理外）
     kit: TaggedModule, // platform(opt-in無効) 側を配線
+    kit_gamepad: TaggedModule, // platform_gamepad 側を配線（example_34。TASK-111.8）
     kit_menu: TaggedModule, // platform_menu 側を配線（pixie 専用）
 };
 
@@ -2121,6 +2133,13 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     }) };
     link(app_runtime, platform_mod);
 
+    const app_runtime_gamepad: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
+        .root_source_file = b.path("core/app_runtime.zig"),
+        .target = target,
+        .single_threaded = if (backend == .wasm) !wasm_shared else null,
+    }) };
+    link(app_runtime_gamepad, platform_gamepad_mod);
+
     const app_runtime_menu: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
@@ -2134,6 +2153,12 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     }) };
     wireKitImports(kit, platform_mod, common, app_runtime);
 
+    // gamepad opt-in kit（example_34。platform_gamepad と ActionMap が同一 opt-in を共有。TASK-111.8）
+    const kit_gamepad: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
+        .root_source_file = b.path("kit/kit.zig"),
+    }) };
+    wireKitImports(kit_gamepad, platform_gamepad_mod, common, app_runtime_gamepad);
+
     // pixie 専用 kit（enable_menu=true の platform を配線）
     const kit_menu: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
@@ -2144,6 +2169,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     // ADR-007 の core→lib 例外として linkCoreException 経由（素の addImport は不可）。
     if (backend == .wasm) {
         linkCoreException(platform_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
+        linkCoreException(platform_gamepad_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
         linkCoreException(platform_menu_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
     }
 
@@ -2153,6 +2179,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         .platform_menu = platform_menu_mod,
         .keyboard = keyboard_mod,
         .kit = kit,
+        .kit_gamepad = kit_gamepad,
         .kit_menu = kit_menu,
     };
 }
@@ -2331,7 +2358,8 @@ const SharedModules = struct {
             .root_source_file = b.path("libs/gfx/src/fps_counter.zig"),
         });
 
-        // libs/gfx umbrella（TASK-111.2）。named module の sprite/helpers を再エクスポート。kit 収録。
+        // libs/gfx umbrella（TASK-111.2/111.8）。named module の sprite/helpers を再エクスポート。kit 収録。
+        // action_map は gamepad + platform_types（MAX_GAMEPADS）に依存（相対 import の action_map.zig）。
         const gfx: TaggedModule = .{ .layer = .lib, .name = "gfx", .mod = b.createModule(.{
             .root_source_file = b.path("libs/gfx/src/gfx.zig"),
         }) };
@@ -2339,6 +2367,8 @@ const SharedModules = struct {
         gfx.mod.addImport("fixed_timestep", fixed_timestep_mod);
         gfx.mod.addImport("fps_counter", fps_counter_mod);
         gfx.mod.addImport("keyboard", keyboard_mod);
+        link(gfx, gamepad); // ActionMap の gamepad button/stick 評価（TASK-111.8）
+        link(gfx, types); // action_map の MAX_GAMEPADS（type-only core）
 
         // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
         // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png に依存。
@@ -2555,11 +2585,11 @@ const ExampleNeeds = struct {
     needs_font: bool,
     needs_paint: bool = false,
     needs_audio: bool,
-    needs_gamepad: bool, // TASK-80.1（examples/22_gamepad のみ true）
+    needs_gamepad: bool, // TASK-80.1（examples/22_gamepad / 34_action_map）
     needs_midi: bool, // TASK-115.1（examples/29_midi_monitor のみ true）
     needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
     needs_sound: bool, // TASK-111.6（examples/30_sound_demo のみ true）
-    needs_kit: bool = false, // TASK-111.2/111.3/111.4（example_31/32/33）/ example_26
+    needs_kit: bool = false, // TASK-111.2/111.3/111.4/111.8（example_31/32/33/34）/ example_26
 };
 
 // ============================================================
@@ -2589,7 +2619,7 @@ fn addExampleExe(
     });
     // 全 example が platform / keyboard を使う
     // （examples は教材として R5=kit-only の対象外。従来の個別 module 配線を維持する）
-    // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs_gamepad の example（22_gamepad のみ）だけ
+    // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs_gamepad の example（22 / 34）だけ
     // opt-in 有効側の platform module を使う（GameController framework リンク + .m/.swift の
     // gamepad コード有効化）。他の example は既定の opt-in 無効側（既存exe不変）。
     exe.root_module.addImport("platform", if (needs.needs_gamepad) pm.platform_gamepad.mod else pm.platform.mod);
@@ -2617,7 +2647,8 @@ fn addExampleExe(
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
     if (needs.needs_kit) {
-        exe.root_module.addImport("kit", pm.kit.mod);
+        // needs_gamepad の kit example は platform_gamepad を配線した kit_gamepad を使う（TASK-111.8）。
+        exe.root_module.addImport("kit", if (needs.needs_gamepad) pm.kit_gamepad.mod else pm.kit.mod);
     }
     if (std.mem.startsWith(u8, name, "example_26")) {
         exe.root_module.addImport("appshell", common.appshell.mod);

@@ -1,8 +1,8 @@
-//! libs/gfx umbrella（TASK-111.2 / TASK-111.3 / TASK-111.4）。
-//! sprite / fixed_timestep / fps_counter / keyboard / atlas / animation / camera を再エクスポートし、
-//! kit.gfx の公開面とする。
+//! libs/gfx umbrella（TASK-111.2 / TASK-111.3 / TASK-111.4 / TASK-111.8）。
+//! sprite / fixed_timestep / fps_counter / keyboard / atlas / animation / camera / action_map
+//! を再エクスポートし、kit.gfx の公開面とする。
 //!
-//! atlas / animation / camera は同一 module 内の相対 import（`@import("atlas.zig")` 等）。
+//! atlas / animation / camera / action_map は同一 module 内の相対 import（`@import("atlas.zig")` 等）。
 //! こうすると `zig test` が gfx root 経由で test を収集し、専用 runner を
 //! 増やさずに test-gfx へ接続できる（TASK-111.3/111.4 Claude 設計レビュー付記）。
 //! named module の sprite/helpers は `@import("sprite")` 等で受け取る
@@ -15,6 +15,7 @@ pub const keyboard = @import("keyboard");
 pub const atlas = @import("atlas.zig");
 pub const animation = @import("animation.zig");
 pub const camera = @import("camera.zig");
+pub const action_map = @import("action_map.zig");
 
 pub const Sprite = sprite.Sprite;
 pub const drawSprite = sprite.drawSprite;
@@ -35,6 +36,16 @@ pub const AnimationClip = animation.AnimationClip;
 pub const AnimationPlayer = animation.AnimationPlayer;
 
 pub const Camera = camera.Camera;
+
+pub const ActionMap = action_map.ActionMap;
+pub const ActionKind = action_map.ActionKind;
+pub const ActionId = action_map.ActionId;
+pub const Binding = action_map.Binding;
+pub const StickSide = action_map.StickSide;
+pub const StickAxis = action_map.StickAxis;
+pub const GamepadButtonBinding = action_map.GamepadButtonBinding;
+pub const GamepadStickBinding = action_map.GamepadStickBinding;
+pub const KeyPairBinding = action_map.KeyPairBinding;
 
 pub const KeyCode = keyboard.KeyCode;
 pub const KeyInfo = keyboard.KeyInfo;
@@ -57,4 +68,5 @@ test {
     _ = atlas;
     _ = animation;
     _ = camera;
+    _ = action_map;
 }

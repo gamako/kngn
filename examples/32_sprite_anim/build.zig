@@ -77,6 +77,13 @@ pub fn build(b: *std.Build) void {
     gfx.addImport("fixed_timestep", gfx_ft);
     gfx.addImport("fps_counter", gfx_fps);
     gfx.addImport("keyboard", gfx_keyboard);
+    // action_map（gfx 内相対 import）が gamepad + platform_types を要求する（TASK-111.8）
+    const gamepad_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
+    });
+    gamepad_mod.addImport("platform_types", platform_types);
+    gfx.addImport("gamepad", gamepad_mod);
+    gfx.addImport("platform_types", platform_types);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_32_sprite_anim",
