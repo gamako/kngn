@@ -1399,6 +1399,27 @@ pub const Document = struct {
         return null;
     }
 
+    /// 読み取り専用: handle が指す `.paint` Op の `PixelDiff` 列ビュー（TASK-83.2）。
+    /// 借用スライスのみ返し所有権は動かない。呼び出し側は戻り値を保持せず、確定フック内で
+    /// サムネイルへコピーすること。handle 不在・構造 Op・既に undo 済みは null。
+    pub const PaintDiffView = struct {
+        layer_idx: usize,
+        frame_idx: u32,
+        diffs: []const PixelDiff,
+    };
+
+    pub fn paintDiffsForHandle(self: *const Document, handle: u64) ?PaintDiffView {
+        const idx = self.indexOfHandle(handle) orelse return null;
+        const op = &self.undo.undo.items[idx];
+        if (op.* != .paint) return null;
+        const p = op.paint;
+        return .{
+            .layer_idx = p.layer_idx,
+            .frame_idx = p.frame_idx,
+            .diffs = p.diffs,
+        };
+    }
+
     pub const RevertMode = enum {
         /// 逆適用した Op を legacy redo stack へ移す（未記録 op の legacy redo 用）。
         move_to_redo,
@@ -1780,6 +1801,40 @@ fn pushTestPaint(doc: *Document, gpa: Allocator, layer_idx: usize, pixel_idx: u3
     diffs[0] = .{ .idx = pixel_idx, .before = pixels[pixel_idx], .after = color };
     pixels[pixel_idx] = color;
     try doc.pushPaintOp(gpa, layer_idx, diffs);
+}
+
+test "paintDiffsForHandle: paint handle から diffs/layer_idx を借用取得（所有権不変）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 1
+    const h = doc.undo.topHandle().?;
+    const view = doc.paintDiffsForHandle(h) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), view.layer_idx);
+    try testing.expectEqual(@as(u32, 0), view.frame_idx);
+    try testing.expectEqual(@as(usize, 1), view.diffs.len);
+    try testing.expectEqual(@as(u32, 0), view.diffs[0].idx);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), view.diffs[0].after);
+    // 所有権不変: accessor 後も Op が undo に残り、再取得できる
+    try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len);
+    try testing.expect(doc.paintDiffsForHandle(h) != null);
+    try testing.expectEqual(@as(usize, 1), doc.paintDiffsForHandle(h).?.diffs.len);
+}
+
+test "paintDiffsForHandle: 構造 Op / 不存在 handle は null" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    _ = try doc.addLayer(gpa); // handle 1（構造 op）
+    try testing.expect(doc.paintDiffsForHandle(1) == null);
+    try testing.expect(doc.paintDiffsForHandle(999) == null);
+
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFF00FF00); // handle 2
+    try testing.expect(doc.paintDiffsForHandle(2) != null);
+    try testing.expect(doc.revertByHandle(gpa, 2, .discard));
+    try testing.expect(doc.paintDiffsForHandle(2) == null); // undo 済み
 }
 
 test "revertByHandle: 最上位でない .paint op を任意位置逆適用（上の op は残る・対象だけ戻る）" {

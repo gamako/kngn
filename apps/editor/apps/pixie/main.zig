@@ -39,6 +39,7 @@ const cursor_overlay = @import("cursor_overlay.zig");
 const layer_rename_input = @import("layer_rename_input.zig");
 const text_content_input = @import("text_content_input.zig");
 const history_summary = @import("history_summary.zig");
+const history_thumbnail = @import("history_thumbnail.zig");
 
 // レイヤー名の最大長は libs/paint（保存側）と pixie（編集バッファ側）で独立定義しているため
 // （循環 import 回避。詳細は layer_rename_input.zig 冒頭）、乖離しないことを comptime で保証する。
@@ -584,6 +585,9 @@ const App = struct {
     history_count: u32 = 0,
     history_dirty: bool = true,
     history_seen_seq: u64 = 1,
+    /// 履歴行サムネイル固定リング（TASK-83.2。イベント時のみ生成・フレーム毎は blit のみ）。
+    history_thumbs: [platform.command.MAX_CMD_LOG][history_thumbnail.THUMB_PIXELS]u32 = undefined,
+    history_thumb_meta: [platform.command.MAX_CMD_LOG]history_thumbnail.HistoryThumbMeta = @splat(.{}),
     /// capture 開始時に latch した実効パラメータ（canonical args の材料。§5c'）。
     ui_stroke_layer_id: u64 = 1,
     ui_stroke_tool: ToolKind = .pen,
@@ -939,6 +943,72 @@ const App = struct {
         self.cmd_exec.bumpEpoch(.local_user);
         self.cmd_exec.bumpEpoch(.local_agent);
         self.last_seen_handle = self.doc.undo.next_handle;
+        // 旧 document のサムネイルが新 document に残らないよう固定メタを無効化（TASK-83.2）。
+        for (&self.history_thumb_meta) |*m| m.clear();
+        self.markHistoryDirty();
+    }
+
+    /// 履歴確定フック: seq の CommandRecord から visual メタ／paint サムネイルを固定リングへ保存。
+    /// **イベント時のみ**。allocator 不使用。
+    fn captureHistoryVisual(self: *App, seq: u64) void {
+        const rec = self.cmd_log.findBySeq(seq) orelse return;
+        const slot: usize = @intCast(seq % platform.command.MAX_CMD_LOG);
+        var meta: history_thumbnail.HistoryThumbMeta = .{ .seq = seq };
+
+        if (rec.kind == .revert) {
+            meta.kind = @intFromEnum(history_summary.VisualKind.revert);
+            self.history_thumb_meta[slot] = meta;
+            return;
+        }
+
+        if (rec.undo_ref) |ref| {
+            if (self.doc.paintDiffsForHandle(ref)) |view| {
+                const result = history_thumbnail.renderThumb(
+                    self.history_thumbs[slot][0..],
+                    self.doc.width,
+                    view.diffs,
+                );
+                meta.kind = @intFromEnum(history_summary.VisualKind.paint);
+                if (result.changed) {
+                    meta.flags = history_thumbnail.HistoryThumbMeta.FLAG_THUMB;
+                    if (result.bbox) |b| meta.setBBox(b);
+                }
+                self.history_thumb_meta[slot] = meta;
+                return;
+            }
+        }
+
+        // normal だが非 paint / undo_ref なし → [meta]
+        meta.kind = @intFromEnum(history_summary.VisualKind.meta);
+        self.history_thumb_meta[slot] = meta;
+    }
+
+    /// seq_before 以降に append された record をまとめて capture（redo / undo の複数 append 用）。
+    fn captureHistoryVisualsSince(self: *App, seq_before: u64) void {
+        var i: u32 = 0;
+        while (i < self.cmd_log.filled) : (i += 1) {
+            const rec = self.cmd_log.recordAt(i);
+            if (rec.seq >= seq_before) self.captureHistoryVisual(rec.seq);
+        }
+    }
+
+    fn historyVisualMeta(self: *const App, seq: u64) history_summary.VisualMeta {
+        const slot: usize = @intCast(seq % platform.command.MAX_CMD_LOG);
+        const m = self.history_thumb_meta[slot];
+        if (m.seq != seq) return .{};
+        const kind: history_summary.VisualKind = if (m.kind <= @intFromEnum(history_summary.VisualKind.revert))
+            @enumFromInt(m.kind)
+        else
+            .none;
+        const bbox: ?history_summary.BBox = if (m.bbox()) |b|
+            .{ .x0 = b.x0, .y0 = b.y0, .x1 = b.x1, .y1 = b.y1 }
+        else
+            null;
+        return .{
+            .kind = kind,
+            .thumb_present = m.thumbPresent(),
+            .bbox = bbox,
+        };
     }
 
     /// stroke の実効パラメータを解決する（§5c': 明示 k=v > 現在の App 状態）。tool 未指定かつ
@@ -1062,10 +1132,11 @@ const App = struct {
         };
         const undo_ref: ?u64 = if (pushed) self.doc.undo.topHandle() else null;
         var msg_buf: [64]u8 = undefined;
-        _ = self.cmd_exec.recordExecuted("stroke", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
+        const seq = self.cmd_exec.recordExecuted("stroke", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
             std.debug.print("pixie: UI stroke の記録に失敗: {s}\n", .{@errorName(err)});
             return; // 記録失敗 = 未記録 push としてフレーム末尾の bumpEpoch に委ねる（§2b）
         };
+        if (seq) |s| self.captureHistoryVisual(s);
         if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER); // op は user 所有（review 反映）
         self.last_seen_handle = self.doc.undo.next_handle; // 記録された push（§2b の追従点）
     }
@@ -1106,10 +1177,11 @@ const App = struct {
         };
         const undo_ref: ?u64 = if (pushed) self.doc.undo.topHandle() else null;
         var msg_buf: [64]u8 = undefined;
-        _ = self.cmd_exec.recordExecuted("shape", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
+        const seq = self.cmd_exec.recordExecuted("shape", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
             std.debug.print("pixie: UI shape の記録に失敗: {s}\n", .{@errorName(err)});
             return;
         };
+        if (seq) |s| self.captureHistoryVisual(s);
         if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER);
         self.last_seen_handle = self.doc.undo.next_handle;
     }
@@ -1587,6 +1659,7 @@ const App = struct {
         if (self.editingBlocked()) return error.EditingBlocked;
         const undo_before = self.doc.undo.undo.items.len;
         const redo_before = self.doc.undo.redo.items.len;
+        const seq_before = self.cmd_log.next_seq;
         // defer: routeAction が途中失敗しても revert フラグ等の変異は起きうる（next_seq 非依存）
         defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
@@ -1595,6 +1668,7 @@ const App = struct {
         } else {
             self.userUndo();
         }
+        self.captureHistoryVisualsSince(seq_before);
         self.clampTimelineTarget();
         if (undo_before != self.doc.undo.undo.items.len or redo_before != self.doc.undo.redo.items.len) self.markProjectDirty();
     }
@@ -1606,7 +1680,9 @@ const App = struct {
         defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
             var buf: [128]u8 = undefined;
+            const seq_before = self.cmd_log.next_seq;
             _ = try platform.routeAction("redo", "", &buf);
+            self.captureHistoryVisualsSince(seq_before);
         } else {
             self.userRedo();
         }
@@ -1695,6 +1771,7 @@ const App = struct {
         const outcome = self.cmd_exec.redoOne(.local_user, &buf) catch |err| {
             std.debug.print("pixie: redoOne 失敗: {s}\n", .{@errorName(err)});
             self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // PartialRedo でも適用済み分はタグ
+            self.captureHistoryVisualsSince(seq_before); // PartialRedo でも append 済み分を捕捉
             return;
         };
         if (!outcome.happened) {
@@ -1707,9 +1784,11 @@ const App = struct {
             if (self.doc.undo.next_handle > handle_before) {
                 if (self.doc.undo.topHandle()) |h| self.doc.undo.setOwner(h, OP_OWNER_USER);
             }
+            // legacy redo は CommandRecord を生成しない → 新規履歴サムネイルなし
             return;
         }
         self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // 再 dispatch された新 op は user 所有
+        self.captureHistoryVisualsSince(seq_before);
     }
 
     /// CommandLog を後方走査して undo_ref==handle の normal record を返す（userUndo の
@@ -2940,11 +3019,17 @@ fn historyHasHandle(ctx: *anyopaque, ref: u64) bool {
     return app.doc.undo.hasHandle(ref);
 }
 
+fn historyGetVisualMeta(ctx: *anyopaque, seq: u64) history_summary.VisualMeta {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.historyVisualMeta(seq);
+}
+
 fn historyCtx(app: *App) history_summary.HistoryContext {
     return .{
         .ctx = app,
         .hasHandle = historyHasHandle,
         .log = &app.cmd_log,
+        .getVisualMeta = historyGetVisualMeta,
     };
 }
 
@@ -3030,10 +3115,12 @@ fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     try actions.parseNoArgs(args);
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
+    const seq_before = app.cmd_log.next_seq;
     // defer: undoOne が失敗しても record フラグの変異は起きうる（next_seq 非依存のため
     // dirty で拾う。codex 指摘）
     defer app.markHistoryDirty();
     const outcome = try app.cmd_exec.undoOne(.local_agent, buf);
+    app.captureHistoryVisualsSince(seq_before);
     app.clampTimelineTarget();
     return outcome.message;
 }
@@ -3048,9 +3135,11 @@ fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     defer app.markHistoryDirty();
     const outcome = app.cmd_exec.redoOne(.local_agent, buf) catch |err| {
         app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // PartialRedo でも適用済み分はタグ
+        app.captureHistoryVisualsSince(seq_before);
         return err;
     };
     app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 再 dispatch された新 op は agent 所有
+    app.captureHistoryVisualsSince(seq_before);
     app.clampTimelineTarget();
     return outcome.message;
 }
@@ -3664,6 +3753,7 @@ fn recordedAction(comptime name: []const u8, comptime policy: platform.command.R
                 .record_policy = policy,
             }, buf);
             app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 生んだ op は agent 所有（review 反映）
+            if (res.seq) |s| app.captureHistoryVisual(s);
             return res.output;
         }
     }.run;
@@ -3801,6 +3891,7 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         .record_policy = .record,
     }, buf);
     app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 生んだ op は agent 所有（review 反映）
+    if (res.seq) |s| app.captureHistoryVisual(s);
     return res.output;
 }
 
@@ -4432,8 +4523,9 @@ fn historyRowId(idx: u32) gui.Id {
     return HISTORY_PANEL_ID_BASE + @as(gui.Id, idx);
 }
 
-/// 操作履歴パネル（TASK-83 Phase 1）。CommandLog を最新が上の縦リストで表示する。
+/// 操作履歴パネル（TASK-83 Phase 1 + 83.2 サムネイル）。CommandLog を最新が上の縦リストで表示する。
 /// ホットパス宣言: 毎フレーム構築されるが履歴データの再構築は dirty 時のみ（イベント時相当）。
+/// サムネイルは固定バッファの blit のみ（PixelDiff / bbox 再計算 / composite / allocator 禁止）。
 fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
     app.ensureHistoryFresh();
     ctx.label("History");
@@ -4441,13 +4533,35 @@ fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
         ctx.labelEx("(empty)", ctx.style.text_subtle);
         return;
     }
+    const thumb_w: i32 = @intCast(history_thumbnail.THUMB_W);
+    const thumb_h: i32 = @intCast(history_thumbnail.THUMB_H);
     var rev: u32 = app.history_count;
     while (rev > 0) {
         rev -= 1;
         const entry = &app.history_entries[rev];
         var line_buf: [platform.command.MAX_SUMMARY + 48]u8 = undefined;
         const line = formatHistoryLine(entry, &line_buf);
-        ctx.beginBox(.{ .id = historyRowId(rev), .direction = .row, .gap = 2 });
+        ctx.beginBox(.{ .id = historyRowId(rev), .direction = .row, .gap = 2, .align_cross = .center });
+        // [24x24 thumbnail or label][history text]
+        if (entry.visual.thumb_present) {
+            const slot: usize = @intCast(entry.seq % platform.command.MAX_CMD_LOG);
+            const meta = app.history_thumb_meta[slot];
+            if (meta.seq == entry.seq and meta.thumbPresent()) {
+                ctx.imageBox(
+                    historyRowId(rev) + 0x1000,
+                    app.history_thumbs[slot][0..],
+                    thumb_w,
+                    thumb_h,
+                    .{ .border = ctx.style.border },
+                );
+            } else {
+                ctx.labelEx("[meta]", ctx.style.text_subtle);
+            }
+        } else if (std.mem.eql(u8, entry.kind, "revert") or entry.visual.kind == .revert) {
+            ctx.labelEx("[undo]", ctx.style.text_subtle);
+        } else {
+            ctx.labelEx("[meta]", ctx.style.text_subtle);
+        }
         ctx.labelEx(line, historyRowColor(ctx, entry));
         ctx.endBox();
     }

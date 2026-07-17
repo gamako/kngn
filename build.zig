@@ -1249,6 +1249,25 @@ pub fn build(b: *std.Build) void {
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
 
+    // history_thumbnail（TASK-83.2）。PixelDiff → 24×24 bbox サムネイル。paint 名前付き import。
+    const history_thumbnail_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    history_thumbnail_core.addImport("png", shared_modules.png.mod);
+    history_thumbnail_core.addImport("pixelops", shared_modules.pixelops.mod);
+    history_thumbnail_core.addImport("serde", shared_modules.serde.mod);
+    history_thumbnail_core.addImport("font", shared_modules.font.mod);
+    const history_thumbnail_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/history_thumbnail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    history_thumbnail_mod.addImport("paint", history_thumbnail_core);
+    const history_thumbnail_test = b.addTest(.{ .root_module = history_thumbnail_mod });
+    const run_history_thumbnail_test = b.addRunArtifact(history_thumbnail_test);
+    const test_history_thumbnail_step = b.step("test-history-thumbnail", "Run history_thumbnail unit tests (TASK-83.2)");
+    test_history_thumbnail_step.dependOn(&run_history_thumbnail_test.step);
+
     // onion_skin（TASK-45.3）。paint 内の表示専用オニオン合成。
     const onion_skin_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/onion_skin.zig"),
@@ -1348,6 +1367,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_actions_test.step);
     test_core_step.dependOn(&run_diff_test.step);
     test_core_step.dependOn(&run_history_summary_test.step);
+    test_core_step.dependOn(&run_history_thumbnail_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);
     test_core_step.dependOn(&run_text_content_input_test.step);
 

@@ -17,10 +17,33 @@ const testing = std.testing;
 /// harness `DIGEST_BUF_LEN` と同値（history_summary は harness を import しない）。
 pub const DIGEST_BUF_LEN = 1024;
 
+pub const VisualKind = enum {
+    none,
+    paint,
+    meta,
+    revert,
+};
+
+pub const BBox = struct {
+    x0: u16,
+    y0: u16,
+    x1: u16,
+    y1: u16,
+};
+
+/// 履歴行のグラフィカル表示メタ（TASK-83.2）。CommandRecord / thumbnail buffer の借用は持たない。
+pub const VisualMeta = struct {
+    kind: VisualKind = .none,
+    thumb_present: bool = false,
+    bbox: ?BBox = null,
+};
+
 pub const HistoryContext = struct {
     ctx: *anyopaque,
     hasHandle: *const fn (ctx: *anyopaque, ref: u64) bool,
     log: *const command.CommandLog,
+    /// seq から visual metadata を取得（未配線時は none）。
+    getVisualMeta: ?*const fn (ctx: *anyopaque, seq: u64) VisualMeta = null,
 };
 
 /// 履歴 1 件の表示用ビュー。
@@ -45,6 +68,8 @@ pub const HistoryEntry = struct {
     redo_of: ?u64,
     undo_live: ?bool,
     epoch: u64,
+    /// グラフィカル表示メタ（callback からコピー。TASK-83.2）。
+    visual: VisualMeta = .{},
 
     pub fn summary(self: *const HistoryEntry) []const u8 {
         return self.summary_buf[0..self.summary_len];
@@ -131,11 +156,15 @@ pub fn makeHistoryEntry(hctx: HistoryContext, rec: *const command.CommandRecord)
         .redo_of = rec.redo_of,
         .undo_live = null,
         .epoch = rec.epoch,
+        .visual = .{},
     };
     const sum = summarizeRecord(rec, e.summary_buf[0..]);
     e.summary_len = @intCast(sum.len);
     if (rec.undo_ref) |ref| {
         e.undo_live = hctx.hasHandle(hctx.ctx, ref);
+    }
+    if (hctx.getVisualMeta) |get| {
+        e.visual = get(hctx.ctx, rec.seq);
     }
     return e;
 }
@@ -151,12 +180,12 @@ fn tokenSafe(dst: []u8, src: []const u8) []const u8 {
     return dst[0..n];
 }
 
-/// §4b digest。空 log の全文はテストの正。
+/// §4b digest。空 log の全文はテストの正。TASK-83.2: last_thumb / last_bbox を additive 追加。
 pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
     const log = hctx.log;
     if (log.filled == 0) {
         const empty =
-            \\count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=- last_kind=- last_target=- last_redo_of=- last2_tx=- last_summary=- last_reverted=- last_redo_consumed=-
+            \\count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=- last_kind=- last_target=- last_redo_of=- last2_tx=- last_summary=- last_reverted=- last_redo_consumed=- last_thumb=0 last_bbox=none
         ;
         if (empty.len > buf.len) return buf[0..0];
         @memcpy(buf[0..empty.len], empty);
@@ -221,17 +250,25 @@ pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
     var pos: usize = head.len;
     var sum_safe_buf: [command.MAX_SUMMARY]u8 = undefined;
     const sum_safe = tokenSafe(&sum_safe_buf, entry.summary());
-    // 末尾 " last_reverted=0 last_redo_consumed=0" の長さを正とする（値は 0/1 同長）。
-    const tail_reserve = " last_reverted=0 last_redo_consumed=0".len;
+    // 末尾固定フィールド（thumb/bbox 込み）の最悪長を予約（値は 0/1 同長・bbox は最大 5*4+3）。
+    const tail_reserve = " last_reverted=0 last_redo_consumed=0 last_thumb=0 last_bbox=65535,65535,65535,65535".len;
     const sum_room = if (buf.len > pos + tail_reserve) buf.len - pos - tail_reserve else 0;
     const sum_n = @min(sum_safe.len, sum_room);
     if (sum_n > 0) {
         @memcpy(buf[pos..][0..sum_n], sum_safe[0..sum_n]);
         pos += sum_n;
     }
-    const tail = std.fmt.bufPrint(buf[pos..], " last_reverted={d} last_redo_consumed={d}", .{
+
+    var bbox_buf: [48]u8 = undefined;
+    const bbox_str: []const u8 = if (entry.visual.bbox) |b|
+        (std.fmt.bufPrint(&bbox_buf, "{d},{d},{d},{d}", .{ b.x0, b.y0, b.x1, b.y1 }) catch "none")
+    else
+        "none";
+    const tail = std.fmt.bufPrint(buf[pos..], " last_reverted={d} last_redo_consumed={d} last_thumb={d} last_bbox={s}", .{
         @as(u1, if (entry.reverted) 1 else 0),
         @as(u1, if (entry.redo_consumed) 1 else 0),
+        @as(u1, if (entry.visual.thumb_present) 1 else 0),
+        bbox_str,
     }) catch return buf[0..0];
     pos += tail.len;
     return buf[0..pos];
@@ -325,6 +362,17 @@ pub fn appendEntryJson(list: *std.ArrayList(u8), allocator: std.mem.Allocator, e
         var tmp: [24]u8 = undefined;
         try list.appendSlice(allocator, try std.fmt.bufPrint(&tmp, "{d}", .{e.epoch}));
     }
+    // TASK-83.2 additive: thumb / bbox
+    try list.appendSlice(allocator, ",\"thumb\":");
+    try list.appendSlice(allocator, if (e.visual.thumb_present) "true" else "false");
+    try list.appendSlice(allocator, ",\"bbox\":");
+    if (e.visual.bbox) |b| {
+        var tmp: [64]u8 = undefined;
+        const s = try std.fmt.bufPrint(&tmp, "[{d},{d},{d},{d}]", .{ b.x0, b.y0, b.x1, b.y1 });
+        try list.appendSlice(allocator, s);
+    } else {
+        try list.appendSlice(allocator, "null");
+    }
     try list.append(allocator, '}');
 }
 
@@ -399,7 +447,7 @@ test "formatDigest: empty exact" {
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     const got = formatDigest(hctx, &buf);
     const want =
-        \\count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=- last_kind=- last_target=- last_redo_of=- last2_tx=- last_summary=- last_reverted=- last_redo_consumed=-
+        \\count=0 last_seq=0 last_actor=- last_name=- last_undoable=- last_undo_ref=- last_undo_live=- last_tx=- last_kind=- last_target=- last_redo_of=- last2_tx=- last_summary=- last_reverted=- last_redo_consumed=- last_thumb=0 last_bbox=none
     ;
     try testing.expectEqualStrings(want, got);
 }
@@ -420,9 +468,138 @@ test "formatDigest: single stroke keys order + additive tail" {
     const got = formatDigest(hctx, &buf);
     try testing.expect(got.len <= DIGEST_BUF_LEN);
     const want =
-        \\count=1 last_seq=1 last_actor=local_user last_name=stroke last_undoable=1 last_undo_ref=7 last_undo_live=1 last_tx=- last_kind=normal last_target=- last_redo_of=- last2_tx=- last_summary=stroke_pen_#FF0000 last_reverted=0 last_redo_consumed=0
+        \\count=1 last_seq=1 last_actor=local_user last_name=stroke last_undoable=1 last_undo_ref=7 last_undo_live=1 last_tx=- last_kind=normal last_target=- last_redo_of=- last2_tx=- last_summary=stroke_pen_#FF0000 last_reverted=0 last_redo_consumed=0 last_thumb=0 last_bbox=none
     ;
     try testing.expectEqualStrings(want, got);
+}
+
+fn testVisualPaint(ctx: *anyopaque, seq: u64) VisualMeta {
+    _ = ctx;
+    _ = seq;
+    return .{
+        .kind = .paint,
+        .thumb_present = true,
+        .bbox = .{ .x0 = 10, .y0 = 10, .x1 = 40, .y1 = 10 },
+    };
+}
+
+fn testVisualMeta(_: *anyopaque, _: u64) VisualMeta {
+    return .{ .kind = .meta, .thumb_present = false, .bbox = null };
+}
+
+fn testVisualRevert(_: *anyopaque, _: u64) VisualMeta {
+    return .{ .kind = .revert, .thumb_present = false, .bbox = null };
+}
+
+test "formatDigest: paint visual → last_thumb=1 last_bbox" {
+    var log: command.CommandLog = .{};
+    var rec = fillRec("stroke", "tool=pen color=FF0000 10 10 40 10");
+    rec.seq = 1;
+    rec.undo_ref = 1;
+    log.append(rec);
+    var dummy: u8 = 0;
+    const hctx: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleAll,
+        .log = &log,
+        .getVisualMeta = testVisualPaint,
+    };
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const got = formatDigest(hctx, &buf);
+    try testing.expect(std.mem.indexOf(u8, got, "last_thumb=1") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "last_bbox=10,10,40,10") != null);
+    try testing.expect(got.len <= DIGEST_BUF_LEN);
+}
+
+test "formatDigest: meta / revert → last_thumb=0 last_bbox=none" {
+    var log: command.CommandLog = .{};
+    var rec = fillRec("set_color", "FF0000");
+    rec.seq = 1;
+    log.append(rec);
+    var dummy: u8 = 0;
+    const hctx_meta: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleNone,
+        .log = &log,
+        .getVisualMeta = testVisualMeta,
+    };
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const got_meta = formatDigest(hctx_meta, &buf);
+    try testing.expect(std.mem.indexOf(u8, got_meta, "last_thumb=0") != null);
+    try testing.expect(std.mem.indexOf(u8, got_meta, "last_bbox=none") != null);
+
+    var rev = fillRec("stroke", "");
+    rev.seq = 2;
+    rev.kind = .revert;
+    rev.target_seq = 1;
+    log.append(rev);
+    const hctx_rev: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleNone,
+        .log = &log,
+        .getVisualMeta = testVisualRevert,
+    };
+    const got_rev = formatDigest(hctx_rev, &buf);
+    try testing.expect(std.mem.indexOf(u8, got_rev, "last_kind=revert") != null);
+    try testing.expect(std.mem.indexOf(u8, got_rev, "last_thumb=0") != null);
+    try testing.expect(std.mem.indexOf(u8, got_rev, "last_bbox=none") != null);
+}
+
+test "makeHistoryEntry: visual metadata callback is copied" {
+    var rec = fillRec("stroke", "tool=pen color=FF0000 1 1 2 2");
+    rec.seq = 9;
+    rec.undo_ref = 3;
+    var dummy: u8 = 0;
+    const hctx: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleAll,
+        .log = undefined,
+        .getVisualMeta = testVisualPaint,
+    };
+    const e = makeHistoryEntry(hctx, &rec);
+    try testing.expect(e.visual.thumb_present);
+    try testing.expectEqual(VisualKind.paint, e.visual.kind);
+    try testing.expectEqual(@as(u16, 10), e.visual.bbox.?.x0);
+    try testing.expectEqual(@as(u16, 40), e.visual.bbox.?.x1);
+}
+
+test "formatSnapshotJson: thumb and bbox fields" {
+    var log: command.CommandLog = .{};
+    var rec = fillRec("stroke", "tool=pen color=FF0000 1 1 2 2");
+    rec.seq = 3;
+    rec.undo_ref = 1;
+    log.append(rec);
+    var dummy: u8 = 0;
+    const hctx: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleAll,
+        .log = &log,
+        .getVisualMeta = testVisualPaint,
+    };
+    const json = try formatSnapshotJson(hctx, testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"thumb\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"bbox\":[10,10,40,10]") != null);
+}
+
+test "formatDigest: long summary still fits DIGEST_BUF_LEN" {
+    var log: command.CommandLog = .{};
+    var name_buf: [command.MAX_CMD_NAME]u8 = undefined;
+    @memset(&name_buf, 'n');
+    var rec = fillRec(&name_buf, "");
+    rec.seq = 1;
+    log.append(rec);
+    var dummy: u8 = 0;
+    const hctx: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleNone,
+        .log = &log,
+        .getVisualMeta = testVisualPaint,
+    };
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const got = formatDigest(hctx, &buf);
+    try testing.expect(got.len <= DIGEST_BUF_LEN);
+    try testing.expect(std.mem.indexOf(u8, got, "last_thumb=1") != null);
 }
 
 test "formatSnapshotJson: empty and one entry optional nulls" {
@@ -447,6 +624,8 @@ test "formatSnapshotJson: empty and one entry optional nulls" {
     try testing.expect(std.mem.indexOf(u8, one, "\"tx\":null") != null);
     try testing.expect(std.mem.indexOf(u8, one, "\"undo_live\":null") != null);
     try testing.expect(std.mem.indexOf(u8, one, "\"undoable\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "\"thumb\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "\"bbox\":null") != null);
 }
 
 test "formatSnapshotJson: full ring (128) keeps oldest-to-newest order" {
