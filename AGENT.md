@@ -1018,7 +1018,8 @@ zig build run-example_23        # 23_fullscreen（Window.createFullscreen デモ
 #       11_gui_widgets / 12_outline_font / 13_gui_slider / 14_gui_color_picker / 15_audio_tone /
 #       16_gui_scroll / 17_gui_toggles / 18_cursor / 19_color_emoji / 20_capture_demo / 21_char_input /
 #       22_gamepad / 23_fullscreen / 24_desktop_mascot / 25_collision_demo / 26_appshell_demo /
-#       27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo / 31_sprite_ex  （image/ は共有アセットで run step なし）
+#       27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo / 31_sprite_ex /
+#       32_sprite_anim / 33_camera / 34_action_map / 35_gui_gallery  （image/ は共有アセットで run step なし）
 ```
 
 ---
