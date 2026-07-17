@@ -29,12 +29,14 @@ pub const GraphView = dyn.GraphView;
 // TASK-110.3: UI 非依存の parameter descriptor / live field access。
 pub const ParamDesc = params.ParamDesc;
 pub const ParamValue = params.ParamValue;
+pub const ParamSnapshot = params.ParamSnapshot;
 pub const ParamKind = params.ParamKind;
 pub const ScalarDesc = params.ScalarDesc;
 pub const ChoiceDesc = params.ChoiceDesc;
 pub const ParamError = params.Error;
 pub const descriptors = params.descriptors;
 pub const getParam = params.getParam;
+pub const getParamSnapshot = params.getParamSnapshot;
 pub const setParam = params.setParam;
 
 // TASK-40.8 D: per-port tap（ポート別ミニ oscilloscope）。

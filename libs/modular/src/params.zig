@@ -37,6 +37,15 @@ pub const ParamValue = union(enum) {
     choice: usize,
 };
 
+/// GUI が表示する parameter の best-effort snapshot。
+/// `field` は descriptor の source field、`instant` は runtime modulation の直近値。
+/// RT との同期は追加せず、既存 module field の read-only 値だけを返す。
+pub const ParamSnapshot = struct {
+    field: ParamValue,
+    instant: ?ParamValue = null,
+    has_instant: bool = false,
+};
+
 pub const Error = error{
     InvalidHandle,
     InactiveHandle,
@@ -587,6 +596,36 @@ pub fn getParam(graph: *const dyn.DynGraph, h: dyn.Handle, name: []const u8) Err
     };
 }
 
+fn runtimeInstant(graph: *const dyn.DynGraph, kind: dyn.ModuleKind, h: dyn.Handle, name: []const u8) ?ParamValue {
+    return switch (kind) {
+        .vcf => if (std.mem.eql(u8, name, "cutoff")) blk: {
+            const value = graph.ptrOfConst(.vcf, h).applied_cutoff;
+            if (!std.math.isFinite(value) or value < 0.0) break :blk null;
+            break :blk .{ .scalar = value };
+        } else null,
+        .chord_pad => if (std.mem.eql(u8, name, "base_hz")) blk: {
+            const value = graph.ptrOfConst(.chord_pad, h).root_hz;
+            if (!std.math.isFinite(value) or value < 0.0) break :blk null;
+            break :blk .{ .scalar = value };
+        } else if (std.mem.eql(u8, name, "cutoff")) blk: {
+            const value = graph.ptrOfConst(.chord_pad, h).applied_fc;
+            if (!std.math.isFinite(value) or value < 0.0) break :blk null;
+            break :blk .{ .scalar = value };
+        } else null,
+        else => null,
+    };
+}
+
+/// `getParam()` の field 値に、既存 runtime modulation field の instant を添える。
+/// GUI/frame-rate の best-effort read 専用で、RT callback からは呼ばない。
+pub fn getParamSnapshot(graph: *const dyn.DynGraph, h: dyn.Handle, name: []const u8) Error!ParamSnapshot {
+    try checkedHandle(graph, h);
+    const kind = graph.kindOf(h) orelse return Error.InactiveHandle;
+    const field = try getParam(graph, h, name);
+    const instant = runtimeInstant(graph, kind, h, name);
+    return .{ .field = field, .instant = instant, .has_instant = instant != null };
+}
+
 /// Control/event 側専用。active module の non-atomic source field を直接更新するため、
 /// RT が同時に読む状態を別スレッドから直接書き換えず、app 側の既存 Mailbox/atomic/control-rate
 /// 経路で呼び出し側が同期を担保する。ここでは publish/lock/alloc を追加しない。
@@ -684,6 +723,34 @@ test "params: DynGraph dispatch round-trips scalar and every choice without publ
 
     try std.testing.expectEqual(view_gen, graph.currentView().gen);
     try std.testing.expectEqual(rebuilds, graph.rebuildCount());
+}
+
+test "params: snapshots expose only existing runtime modulation fields" {
+    var graph = try dyn.DynGraph.create(std.testing.allocator, 48000);
+    defer graph.destroy();
+    const vcf = try graph.add(.vcf, .{ .cutoff = 1200.0 });
+    const chord = try graph.add(.chord_pad, .{ .base_hz = 130.81, .cutoff = 1400.0 });
+    const kick = try graph.add(.kick, .{});
+    try graph.publish();
+
+    var buf: [1]f32 = undefined;
+    graph.processBlock(&buf, 1, 1);
+
+    const vcf_snapshot = try getParamSnapshot(graph, vcf, "cutoff");
+    try std.testing.expect(vcf_snapshot.has_instant);
+    try std.testing.expectEqual(@as(f32, 1200.0), vcf_snapshot.field.scalar);
+    try std.testing.expectEqual(@as(f32, 1200.0), vcf_snapshot.instant.?.scalar);
+
+    const chord_base = try getParamSnapshot(graph, chord, "base_hz");
+    const chord_cutoff = try getParamSnapshot(graph, chord, "cutoff");
+    try std.testing.expect(chord_base.has_instant);
+    try std.testing.expect(chord_cutoff.has_instant);
+    try std.testing.expectEqual(@as(f32, 130.81), chord_base.instant.?.scalar);
+    try std.testing.expectEqual(@as(f32, 1400.0), chord_cutoff.instant.?.scalar);
+
+    const kick_gain = try getParamSnapshot(graph, kick, "gain");
+    try std.testing.expect(!kick_gain.has_instant);
+    try std.testing.expect(kick_gain.instant == null);
 }
 
 test "params: invalid handles, names, value kinds, and ranges are explicit errors" {

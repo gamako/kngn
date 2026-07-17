@@ -32,17 +32,17 @@ const seedmod = @import("seed.zig");
 const DEFAULT_BPM: f32 = 122.0;
 const DEFAULT_SIDECHAIN: f32 = 0.35;
 const DEFAULT_DENSITY_TARGET: f32 = 0.25; // 現行初期 pattern の derived density (16/64)
-const MASTER_CUTOFF_MIN: f32 = 80.0;
-const MASTER_CUTOFF_MAX: f32 = 18000.0; // ≒オープン（既定でほぼ素通し）
+pub const MASTER_CUTOFF_MIN: f32 = 80.0;
+pub const MASTER_CUTOFF_MAX: f32 = 18000.0; // ≒オープン（既定でほぼ素通し）
 // 各トラックの基準 gain（slider は 0..約1.5 の倍率で掛ける。既定 1.0 で基準＝従来）。
-const KICK_BASE_GAIN: f32 = 0.8;
-const HAT_BASE_GAIN: f32 = 0.28;
-const CLAP_BASE_GAIN: f32 = 0.42;
+pub const KICK_BASE_GAIN: f32 = 0.8;
+pub const HAT_BASE_GAIN: f32 = 0.28;
+pub const CLAP_BASE_GAIN: f32 = 0.42;
 // Ph4: 音色マクロの基準値（Controls 既定もこれに合わせ、無操作時は構築値と一致＝決定的）。
 const KICK_CLICK_BASE: f32 = 0.35;
 const HAT_BASE_BRIGHT: f32 = 1.0;
 const HAT_BASE_DECAY: f32 = 0.045;
-const PAD_BASE_GAIN: f32 = 0.22;
+pub const PAD_BASE_GAIN: f32 = 0.22;
 const PAD_CUTOFF_MIN: f32 = 200.0;
 const PAD_CUTOFF_MAX: f32 = 6000.0;
 const PAD_CUTOFF_DEFAULT: f32 = 1400.0;
@@ -1663,6 +1663,17 @@ test "TASK-110.4: cumulative param override wins after generated Controls" {
     const resonance = try modular.getParam(patch.graph, patch.master_vcf_h, "resonance");
     try testing.expectEqual(@as(f32, 2000.0), cutoff.scalar);
     try testing.expectEqual(@as(f32, 0.75), resonance.scalar);
+
+    // transport が cutoff だけ purge した payload。別 field は残り、cutoff の stale override は復活しない。
+    batch.entries[0] = .{};
+    batch.revision = 3;
+    patch.controls.master_cutoff.store(600.0);
+    patch.publishParamBatch(batch);
+    patch.render(&buf, 512, 2);
+    const after_purge_cutoff = try modular.getParam(patch.graph, patch.master_vcf_h, "cutoff");
+    const after_purge_resonance = try modular.getParam(patch.graph, patch.master_vcf_h, "resonance");
+    try testing.expectEqual(@as(f32, 600.0), after_purge_cutoff.scalar);
+    try testing.expectEqual(@as(f32, 0.75), after_purge_resonance.scalar);
 }
 
 test "Controls: muting all tracks lowers output level" {

@@ -41,6 +41,7 @@ const BASS_DEG_TOTAL: usize = patchmod.BASS_DEG_TOTAL;
 const canvas = @import("canvas.zig");
 const inspector = @import("inspector.zig");
 const transport = @import("transport.zig");
+const param_view = @import("param_view.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
 const actions = @import("actions.zig");
@@ -180,6 +181,7 @@ const paletteBottom: f32 = PAL_Y + 2.0 * (PAL_H + PAL_GAP);
 const PAL_BG = gui.Color.rgba(0x2C, 0x32, 0x3C, 0xFF);
 const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
+const MAX_PARAM_EDITS: usize = patchmod.MAX_PARAM_OVERRIDES;
 
 fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
@@ -198,8 +200,8 @@ fn paletteButtons() [PALETTE.len]canvas.PaletteButton {
     return btns;
 }
 
-const CUTOFF_MIN: f32 = 80.0;
-const CUTOFF_MAX: f32 = 18000.0;
+const CUTOFF_MIN: f32 = patchmod.MASTER_CUTOFF_MIN;
+const CUTOFF_MAX: f32 = patchmod.MASTER_CUTOFF_MAX;
 
 const Params = struct {
     tempo: f32 = 122.0,
@@ -226,9 +228,31 @@ const Params = struct {
     ambient_move: f32 = 0.4,
 };
 
+const FrameParamSnapshot = struct {
+    key: param_view.FieldKey = .{},
+    snapshot: modular.ParamSnapshot = .{ .field = .{ .scalar = 0.0 } },
+    valid: bool = false,
+};
+
+const ParamRowSnapshot = struct {
+    key: param_view.FieldKey = .{},
+    rect: gui.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    valid: bool = false,
+};
+
 fn cutoffHz(norm: f32) f32 {
-    const n = std.math.clamp(norm, 0.0, 1.0);
-    return CUTOFF_MIN * std.math.pow(f32, CUTOFF_MAX / CUTOFF_MIN, n);
+    return param_view.cutoffHz(norm, conversion());
+}
+
+fn conversion() param_view.Conversion {
+    return .{
+        .cutoff_min = CUTOFF_MIN,
+        .cutoff_max = CUTOFF_MAX,
+        .kick_base_gain = patchmod.KICK_BASE_GAIN,
+        .hat_base_gain = patchmod.HAT_BASE_GAIN,
+        .clap_base_gain = patchmod.CLAP_BASE_GAIN,
+        .pad_base_gain = patchmod.PAD_BASE_GAIN,
+    };
 }
 
 fn publishControls(patch: *LofiPatch, p: Params) void {
@@ -324,6 +348,14 @@ const App = struct {
     song: SongData = .{},
     // TASK-110.4: main thread が所有する累積 override 表（Mailbox payload の source）。
     param_batch: patchmod.ParamBatch = .{},
+    // TASK-124: field 単位で transport/inspector が共有する pending 操作値。
+    param_edits: [MAX_PARAM_EDITS]param_view.ParamEditState = [_]param_view.ParamEditState{.{}} ** MAX_PARAM_EDITS,
+    // params probe の observed は既定で transport cutoff canonical field。action observe_param で切替可能。
+    observed_field: param_view.FieldKey = .{},
+    frame_snapshots: [MAX_PARAM_EDITS]FrameParamSnapshot = [_]FrameParamSnapshot{.{}} ** MAX_PARAM_EDITS,
+    frame_snapshot_count: usize = 0,
+    param_rows: [MAX_PARAM_EDITS]ParamRowSnapshot = [_]ParamRowSnapshot{.{}} ** MAX_PARAM_EDITS,
+    param_row_count: usize = 0,
 
     /// キャンバス有効高（画面下端の可視化帯を除いた領域）。見切れ判定・ヒットテスト・tap 対象選択で共通に使う。
     fn canvasH(self: *const App) f32 {
@@ -333,6 +365,95 @@ const App = struct {
 
     fn canvasW(self: *const App) f32 {
         return canvas.canvasViewportWidth(@floatFromInt(self.fb_w), self.canvasH());
+    }
+
+    fn editState(self: *App, key: param_view.FieldKey) *param_view.ParamEditState {
+        var free: ?usize = null;
+        for (&self.param_edits, 0..) |*state, index| {
+            if (state.pending != null and param_view.sameField(state.key, key)) return state;
+            if (free == null and state.pending == null) free = index;
+        }
+        return &self.param_edits[free orelse 0];
+    }
+
+    fn findEditState(self: *const App, key: param_view.FieldKey) ?*const param_view.ParamEditState {
+        for (&self.param_edits) |*state| {
+            if (state.pending != null and param_view.sameField(state.key, key)) return state;
+        }
+        return null;
+    }
+
+    fn beginParamFrame(self: *App) void {
+        self.frame_snapshot_count = 0;
+        for (&self.frame_snapshots) |*entry| entry.valid = false;
+    }
+
+    fn captureParamRows(self: *App, ctx: *const gui.Context) void {
+        self.param_row_count = 0;
+        const h = if (self.selected) |item| switch (item) {
+            .node => |node_h| node_h,
+            else => return,
+        } else return;
+        const kind = self.dyn.kindOf(h) orelse return;
+        const descs = switch (kind) {
+            inline else => |comptime_kind| modular.descriptors(comptime_kind),
+        };
+        for (descs, 0..) |desc, index| {
+            if (self.param_row_count >= self.param_rows.len) break;
+            const rect = ctx.getNodeRect(inspector.paramId(ctx, h, index)) orelse continue;
+            self.param_rows[self.param_row_count] = .{ .key = param_view.fieldKey(h, desc.name), .rect = rect, .valid = true };
+            self.param_row_count += 1;
+        }
+    }
+
+    fn snapshotParam(self: *App, handle: Handle, name: []const u8) ?param_view.ParamSnapshot {
+        const key = param_view.fieldKey(handle, name);
+        for (self.frame_snapshots[0..self.frame_snapshot_count]) |entry| {
+            if (entry.valid and param_view.sameField(entry.key, key)) return .{
+                .field = entry.snapshot.field,
+                .instant = entry.snapshot.instant,
+                .has_instant = entry.snapshot.has_instant,
+            };
+        }
+        if (self.frame_snapshot_count >= self.frame_snapshots.len) return null;
+        const snapshot = modular.getParamSnapshot(self.dyn, handle, name) catch return null;
+        self.frame_snapshots[self.frame_snapshot_count] = .{ .key = key, .snapshot = snapshot, .valid = true };
+        self.frame_snapshot_count += 1;
+        return .{ .field = snapshot.field, .instant = snapshot.instant, .has_instant = snapshot.has_instant };
+    }
+
+    fn releaseParamEdits(self: *App) void {
+        for (&self.param_edits) |*state| state.release();
+    }
+
+    fn advanceParamEdits(self: *App) void {
+        for (&self.param_edits) |*state| {
+            if (state.pending == null or state.dragging) continue;
+            const key = state.key;
+            for (self.frame_snapshots[0..self.frame_snapshot_count]) |entry| {
+                if (entry.valid and param_view.sameField(entry.key, key)) {
+                    state.advance(.{ .field = entry.snapshot.field, .instant = entry.snapshot.instant, .has_instant = entry.snapshot.has_instant });
+                    break;
+                }
+            }
+        }
+    }
+
+    fn drawGhostMarkers(self: *App, dl: *gui.DrawList) void {
+        for (self.param_rows[0..self.param_row_count]) |row| {
+            if (!row.valid) continue;
+            const kind = self.dyn.kindOf(@intCast(row.key.handle)) orelse continue;
+            const desc = paramDescFor(kind, row.key.name) orelse continue;
+            const scalar_desc = switch (desc.kind) {
+                .scalar => |s| s,
+                .choice => continue,
+            };
+            const snapshot = self.snapshotParam(@intCast(row.key.handle), row.key.name) orelse continue;
+            const fraction = param_view.ghostFraction(snapshot, scalar_desc.min, scalar_desc.max) orelse continue;
+            const x = row.rect.x + @as(i32, @intFromFloat(fraction * @as(f32, @floatFromInt(row.rect.w))));
+            const y = row.rect.y + @divTrunc(@as(i32, @intCast(row.rect.h)), 2);
+            dl.line(.{ .x = x, .y = y - 6 }, .{ .x = x, .y = y + 6 }, gui.Color.rgba(0xF0, 0xA0, 0x50, 0xFF), 2) catch {};
+        }
     }
 
     /// 実 handle の生ノード列（dyn 由来。合成 handle は含まない）。フレーム毎。
@@ -1461,6 +1582,7 @@ pub fn main(init: std.process.Init) !void {
     defer patch.destroy();
 
     app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32 };
+    app.observed_field = param_view.keyFor(.cutoff, transportHandles(&app));
     // 生成グラフ全体を canvas に配置する（初期状態は 8 列の折り返し。Drum/Bass の
     // マクロ台帳は既存 canvas 操作に任せ、全モジュールを MAX_MODULES 内で可視化する）。
     var layout_h: Handle = 0;
@@ -1490,6 +1612,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "group", .ctx = &app, .ext = "json", .snapshot = null, .digest = groupDigest });
     platform.registerProbe(.{ .name = "viz", .ctx = &app, .ext = "json", .snapshot = vizSnapshot, .digest = vizDigest });
     platform.registerProbe(.{ .name = "modular", .ctx = &app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
+    platform.registerProbe(.{ .name = "params", .ctx = &app, .ext = "json", .snapshot = paramsSnapshot, .digest = paramsDigest });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
     app.cmd_exec.log = &app.cmd_log;
@@ -1598,6 +1721,8 @@ pub fn main(init: std.process.Init) !void {
         // 生成レイヤ scalar は GUI/action の最新値を制御レートで atomic publish する。
         publishControls(app.patch, app.params);
         updateViz(&app);
+        app.beginParamFrame();
+        const transport_model = transportModel(&app);
 
         @memset(fb.pixels, BG);
         dl.reset(fb.width, fb.height);
@@ -1607,13 +1732,17 @@ pub fn main(init: std.process.Init) !void {
         const ir = canvas.inspectorRect(@floatFromInt(fb.width), app.canvasH());
         const tr = canvas.transportRect(@floatFromInt(fb.width), app.canvasH());
         gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
-        transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &app.params, &app, transportParamChanged, transportMuteChanged);
+        transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &transport_model, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
         inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
             .node => |h| h,
             else => null,
-        } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app, inspectorChanged);
+        } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
         gui_ctx.endBox();
+        if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
         gui_ctx.endFrame();
+        app.captureParamRows(&gui_ctx);
+        app.advanceParamEdits();
+        app.drawGhostMarkers(&gui_ctx.draw_list);
         gui.render(target, &gui_ctx.draw_list, gui.default_font);
         // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
         drawVizBand(&app, fb, spec, osc, &meter);
@@ -1882,6 +2011,80 @@ fn paramDescFor(kind: modular.ModuleKind, name: []const u8) ?modular.ParamDesc {
     return null;
 }
 
+fn canonicalParamName(app: *const App, h: Handle, name: []const u8) ?[]const u8 {
+    const kind = app.dyn.kindOf(h) orelse return null;
+    const descs = switch (kind) {
+        inline else => |comptime_kind| modular.descriptors(comptime_kind),
+    };
+    return param_view.canonicalDescriptorName(descs, name);
+}
+
+fn snapshotParamCallback(ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8) ?param_view.ParamSnapshot {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.snapshotParam(handle, name);
+}
+
+fn displayInspectorValue(ctx: *anyopaque, key: param_view.FieldKey, snapshot: param_view.ParamSnapshot) modular.ParamValue {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return param_view.displayValue(snapshot, app.findEditState(key), key);
+}
+
+fn displayTransportValue(ctx: *anyopaque, key: param_view.FieldKey, field: f32) f32 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (app.findEditState(key)) |state| {
+        if (state.pending) |pending| switch (pending) {
+            .scalar => |value| return value,
+            .choice => {},
+        };
+    }
+    return field;
+}
+
+fn transportHandles(app: *const App) param_view.TransportHandles {
+    return .{
+        .clock = app.patch.clock_h,
+        .master_vcf = app.patch.master_vcf_h,
+        .sidechain = app.patch.sidechain_h,
+        .kick = app.patch.kick_h,
+        .hat = app.patch.hat_h,
+        .clap = app.patch.clap_h,
+        .bass_perc = app.patch.bass_perc_h,
+        .pad = app.patch.pad_h,
+    };
+}
+
+fn scalarFor(app: *App, key: param_view.FieldKey, fallback: f32) transport.Scalar {
+    const snapshot = app.snapshotParam(@intCast(key.handle), key.name) orelse return .{ .key = key, .field = fallback };
+    const field = switch (snapshot.field) {
+        .scalar => |value| value,
+        .choice => fallback,
+    };
+    const instant = if (snapshot.instant) |value| switch (value) {
+        .scalar => |v| v,
+        .choice => null,
+    } else null;
+    return .{ .key = key, .field = field, .instant = instant };
+}
+
+fn transportModel(app: *App) transport.Model {
+    const handles = transportHandles(app);
+    const density_key = param_view.keyFor(.density, handles);
+    const state = app.patch.snapshotState();
+    return .{
+        .tempo = scalarFor(app, param_view.keyFor(.tempo, handles), state.bpm),
+        .cutoff = scalarFor(app, param_view.keyFor(.cutoff, handles), state.master_cutoff),
+        .density = .{ .key = density_key, .field = state.density_target },
+        .swing = scalarFor(app, param_view.keyFor(.swing, handles), state.swing),
+        .sidechain = scalarFor(app, param_view.keyFor(.sidechain, handles), state.sidechain_amount),
+        .kick = .{ .gain = scalarFor(app, param_view.keyFor(.kick_gain, handles), state.kick_gain), .muted = state.kick_muted },
+        .hat = .{ .gain = scalarFor(app, param_view.keyFor(.hat_gain, handles), state.hat_gain), .muted = state.hat_muted },
+        .clap = .{ .gain = scalarFor(app, param_view.keyFor(.clap_gain, handles), state.clap_gain), .muted = state.clap_muted },
+        .bass = .{ .gain = scalarFor(app, param_view.keyFor(.bass_gain, handles), state.bass_gain), .muted = state.bass_muted },
+        .pad = .{ .gain = scalarFor(app, param_view.keyFor(.pad_gain, handles), state.pad_gain), .muted = state.pad_muted },
+        .conversion = conversion(),
+    };
+}
+
 /// scalar/choice の UI 値を descriptor の ParamValue へ変換し、累積表を publish する。
 fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !void {
     if (handle >= MAX_MODULES) return error.InvalidHandle;
@@ -1913,6 +2116,7 @@ fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !voi
     app.param_batch.entries[index] = .{ .handle = h, .name = desc.name, .value = value, .touched = true };
     app.param_batch.revision += 1;
     app.patch.publishParamBatch(app.param_batch);
+    app.editState(param_view.fieldKey(h, desc.name)).begin(param_view.fieldKey(h, desc.name), value);
 }
 
 fn inspectorChanged(ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8, value: modular.ParamValue) void {
@@ -1939,6 +2143,21 @@ fn purgeParamOverrides(app: *App, handle: ?Handle) void {
     }
 }
 
+fn purgeParamOverrideField(app: *App, key: param_view.FieldKey) void {
+    var changed = false;
+    for (&app.param_batch.entries) |*entry| {
+        if (!entry.touched) continue;
+        if (param_view.sameFieldParts(key, entry.handle, entry.name)) {
+            entry.* = .{};
+            changed = true;
+        }
+    }
+    if (changed) {
+        app.param_batch.revision += 1;
+        app.patch.publishParamBatch(app.param_batch);
+    }
+}
+
 fn toHandle(v: usize) error{InvalidHandle}!Handle {
     if (v >= MAX_MODULES) return error.InvalidHandle;
     return @intCast(v);
@@ -1950,9 +2169,21 @@ fn actionSelectNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const h = try toHandle(try actions.parseSelectNode(args));
     if (!app.dyn.slotActive(h)) return error.InvalidHandle;
     app.selected = .{ .node = h };
+    app.observed_field = observedFieldForNode(app, h) orelse .{};
     app.hover = null;
     app.drag = .none;
     return "ok";
+}
+
+fn observedFieldForNode(app: *const App, h: Handle) ?param_view.FieldKey {
+    const kind = app.dyn.kindOf(h) orelse return null;
+    const descs = switch (kind) {
+        inline else => |comptime_kind| modular.descriptors(comptime_kind),
+    };
+    // select_node の追従も action args 由来の slice を保持せず、descriptor static name を使う。
+    if (param_view.canonicalDescriptorName(descs, "cutoff")) |name| return param_view.fieldKey(h, name);
+    if (descs.len > 0) return param_view.fieldKey(h, descs[0].name);
+    return null;
 }
 
 /// `modular.ModuleKind` → comptime dispatch で `dyn.add(k, .{})`。`addByPaletteIndex` の
@@ -2176,12 +2407,29 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。
 fn registerPatchActions(app: *App) void {
     platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode });
+    platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam });
     platform.registerAction(.{ .name = "add_node", .ctx = app, .run = actionAddNode });
     platform.registerAction(.{ .name = "remove_node", .ctx = app, .run = actionRemoveNode });
     platform.registerAction(.{ .name = "connect", .ctx = app, .run = actionConnect });
     platform.registerAction(.{ .name = "disconnect", .ctx = app, .run = actionDisconnect });
     platform.registerAction(.{ .name = "save_graph", .ctx = app, .run = actionSaveGraph });
     platform.registerAction(.{ .name = "load_graph", .ctx = app, .run = actionLoadGraph });
+}
+
+fn actionObserveParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    const raw_handle = it.next() orelse return error.InvalidArguments;
+    const name = it.next() orelse return error.InvalidArguments;
+    if (it.next() != null) return error.InvalidArguments;
+    const h = try toHandle(try std.fmt.parseInt(usize, raw_handle, 10));
+    if (!app.dyn.slotActive(h)) return error.InvalidHandle;
+    const canonical_name = canonicalParamName(app, h, name) orelse {
+        platform.setActionErrorDetail("unknown_param", "use a descriptor name for the selected handle");
+        return error.UnknownParam;
+    };
+    app.observed_field = param_view.fieldKey(h, canonical_name);
+    return std.fmt.bufPrint(buf, "observed_h={d} observed_name={s}", .{ h, canonical_name }) catch "ok";
 }
 
 fn graphNetsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -2272,6 +2520,121 @@ fn selectedParamDigest(app: *const App, buf: []u8) []const u8 {
     }
     const tail = std.fmt.bufPrint(buf[off..], "}},", .{}) catch return buf[0..0];
     return buf[0 .. off + tail.len];
+}
+
+fn defaultObservedField(app: *const App) param_view.FieldKey {
+    return param_view.keyFor(.cutoff, transportHandles(app));
+}
+
+fn observedField(app: *const App) param_view.FieldKey {
+    return if (app.observed_field.invalid()) defaultObservedField(app) else app.observed_field;
+}
+
+fn scalarParamValue(value: modular.ParamValue) ?f32 {
+    return switch (value) {
+        .scalar => |v| v,
+        .choice => null,
+    };
+}
+
+fn editScalarValue(app: *const App, key: param_view.FieldKey) ?f32 {
+    if (app.findEditState(key)) |state| {
+        if (state.pending) |pending| return scalarParamValue(pending);
+    }
+    return null;
+}
+
+fn observedTransportValue(app: *const App, key: param_view.FieldKey) ?f32 {
+    const handles = transportHandles(app);
+    if (param_view.sameField(key, param_view.keyFor(.density, handles))) return app.patch.snapshotState().density_target;
+    const alias = transportAliasForKey(app, key) orelse return null;
+    _ = alias;
+    const snapshot = modular.getParamSnapshot(app.dyn, @intCast(key.handle), key.name) catch return null;
+    const field = scalarParamValue(snapshot.field) orelse return null;
+    return editScalarValue(app, key) orelse field;
+}
+
+fn observedInspectorValue(app: *const App, key: param_view.FieldKey) ?f32 {
+    const selected_h = if (app.selected) |item| switch (item) {
+        .node => |h| h,
+        else => return null,
+    } else return null;
+    if (!param_view.sameField(key, param_view.fieldKey(selected_h, key.name))) return null;
+    const snapshot = modular.getParamSnapshot(app.dyn, selected_h, key.name) catch return null;
+    const field = scalarParamValue(snapshot.field) orelse return null;
+    return editScalarValue(app, key) orelse field;
+}
+
+fn hasOverride(app: *const App, key: param_view.FieldKey) bool {
+    for (app.param_batch.entries) |entry| {
+        if (entry.touched and param_view.sameFieldParts(key, entry.handle, entry.name)) return true;
+    }
+    return false;
+}
+
+fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
+    if (value) |v| return std.fmt.bufPrint(buf, "{d:.2}", .{v}) catch "none";
+    return "none";
+}
+
+fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *const App = @ptrCast(@alignCast(ctx));
+    const key = observedField(app);
+    const snapshot = modular.getParamSnapshot(app.dyn, @intCast(key.handle), key.name) catch return buf[0..0];
+    const field = scalarParamValue(snapshot.field);
+    const instant = if (snapshot.instant) |value| scalarParamValue(value) else null;
+    const transport_value = observedTransportValue(app, key);
+    const inspector_value = observedInspectorValue(app, key);
+    const shown = editScalarValue(app, key) orelse transport_value orelse inspector_value orelse field;
+    const kind = app.dyn.kindOf(@intCast(key.handle)) orelse .vca;
+    const ghost = if (paramDescFor(kind, key.name)) |desc| switch (desc.kind) {
+        .scalar => |s| param_view.ghostFraction(.{ .field = snapshot.field, .instant = snapshot.instant, .has_instant = snapshot.has_instant }, s.min, s.max) != null,
+        .choice => false,
+    } else false;
+    const selected_h: i32 = if (app.selected) |item| switch (item) {
+        .node => |h| @intCast(h),
+        else => -1,
+    } else -1;
+    const selected_kind = if (app.selected) |item| switch (item) {
+        .node => |h| if (app.dyn.kindOf(h)) |k| @tagName(k) else "none",
+        else => "none",
+    } else "none";
+    const edit = app.findEditState(key);
+    var instant_buf: [32]u8 = undefined;
+    var field_buf: [32]u8 = undefined;
+    var transport_buf: [32]u8 = undefined;
+    var inspector_buf: [32]u8 = undefined;
+    var shown_buf: [32]u8 = undefined;
+    const instant_text = optionalF32Text(&instant_buf, instant);
+    const field_text = optionalF32Text(&field_buf, field);
+    const transport_text = optionalF32Text(&transport_buf, transport_value);
+    const inspector_text = optionalF32Text(&inspector_buf, inspector_value);
+    const shown_text = optionalF32Text(&shown_buf, shown);
+    const result = std.fmt.bufPrint(buf, "selected_h={d} selected_kind={s} observed_h={d} observed_name={s} field={s} instant={s} transport={s} inspector={s} shown={s} dragging={d} override={d} ghost={d}", .{ selected_h, selected_kind, key.handle, key.name, field_text, instant_text, transport_text, inspector_text, shown_text, if (edit) |state| @intFromBool(state.dragging) else 0, @intFromBool(hasOverride(app, key)), @intFromBool(ghost) }) catch return buf[0..0];
+    return result;
+}
+
+fn paramsSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *const App = @ptrCast(@alignCast(ctx));
+    const key = observedField(app);
+    var out: [4096]u8 = undefined;
+    var off: usize = 0;
+    const head = std.fmt.bufPrint(out[off..], "{{\"observed_h\":{d},\"observed_name\":\"{s}\",\"rows\":[", .{ key.handle, key.name }) catch return allocator.dupe(u8, "{}");
+    off += head.len;
+    for (app.param_rows[0..app.param_row_count]) |row| {
+        if (!row.valid) continue;
+        const snapshot = modular.getParamSnapshot(app.dyn, @intCast(row.key.handle), row.key.name) catch continue;
+        const field = scalarParamValue(snapshot.field) orelse continue;
+        const shown = editScalarValue(app, row.key) orelse field;
+        const sep: []const u8 = if (off == head.len) "" else ",";
+        const piece = std.fmt.bufPrint(out[off..], "{s}{{\"h\":{d},\"name\":\"{s}\",\"x\":{d},\"y\":{d},\"w\":{d},\"h_px\":{d},\"field\":{d:.2},\"shown\":{d:.2}}}", .{
+            sep, row.key.handle, row.key.name, row.rect.x, row.rect.y, row.rect.w, row.rect.h, field, shown,
+        }) catch break;
+        off += piece.len;
+    }
+    const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch "";
+    off += tail.len;
+    return allocator.dupe(u8, out[0..off]);
 }
 
 fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
@@ -2405,7 +2768,49 @@ fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!vo
     return error.UnknownParam;
 }
 
+fn transportAliasForKey(app: *const App, key: param_view.FieldKey) ?param_view.TransportAlias {
+    const handles = transportHandles(app);
+    inline for (std.meta.fields(param_view.TransportAlias)) |field| {
+        const alias: param_view.TransportAlias = @enumFromInt(field.value);
+        if (param_view.sameField(key, param_view.keyFor(alias, handles))) return alias;
+    }
+    return null;
+}
+
+fn setTransportCanonical(app: *App, key: param_view.FieldKey, value: f32) error{UnknownParam}!void {
+    const alias = transportAliasForKey(app, key) orelse return error.UnknownParam;
+    const c = conversion();
+    switch (alias) {
+        .tempo => app.params.tempo = value,
+        .cutoff => app.params.cutoff_norm = param_view.cutoffNorm(value, c),
+        .density => app.params.density = value,
+        .swing => app.params.swing = value,
+        .sidechain => app.params.sidechain = value,
+        .kick_gain => app.params.kick_gain = param_view.gainToUi(alias, value, c),
+        .hat_gain => app.params.hat_gain = param_view.gainToUi(alias, value, c),
+        .clap_gain => app.params.clap_gain = param_view.gainToUi(alias, value, c),
+        .bass_gain => app.params.bass_gain = value,
+        .pad_gain => app.params.pad_gain = param_view.gainToUi(alias, value, c),
+    }
+    if (alias == .density) app.patch.controls.density_target_enabled.store(1, .release);
+    publishControls(app.patch, app.params);
+    purgeParamOverrideField(app, key);
+    app.editState(key).begin(key, .{ .scalar = value });
+}
+
+fn setTransportAlias(app: *App, alias: param_view.TransportAlias, value: f32) error{UnknownParam}!void {
+    const handles = transportHandles(app);
+    const key = param_view.keyFor(alias, handles);
+    try setTransportCanonical(app, key, param_view.toCanonical(alias, value, conversion()));
+    app.editState(key).release();
+}
+
 fn setParamAndPublish(app: *App, name: []const u8, value: f32) error{UnknownParam}!void {
+    const alias = std.meta.stringToEnum(param_view.TransportAlias, name) orelse blk: {
+        if (std.mem.eql(u8, name, "cutoff_norm")) break :blk param_view.TransportAlias.cutoff;
+        break :blk null;
+    };
+    if (alias) |transport_alias| return setTransportAlias(app, transport_alias, value);
     try setParamsF32(&app.params, name, value);
     if (std.mem.eql(u8, name, "density")) {
         app.patch.controls.density_target_enabled.store(1, .release);
@@ -2424,9 +2829,10 @@ fn setMuteAndPublish(app: *App, name: []const u8, muted: bool) error{UnknownTrac
     publishControls(app.patch, app.params);
 }
 
-fn transportParamChanged(ctx: *anyopaque, name: []const u8, value: f32) void {
+fn transportParamChanged(ctx: *anyopaque, key: param_view.FieldKey, value: f32) void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    setParamAndPublish(app, name, value) catch {};
+    setTransportCanonical(app, key, value) catch {};
+    app.editState(key).dragging = true;
 }
 
 fn transportMuteChanged(ctx: *anyopaque, name: []const u8, muted: bool) void {

@@ -9,15 +9,18 @@ const kit = @import("kit");
 const gui = kit.gui;
 const modular = @import("modular");
 const canvas = @import("canvas.zig");
+const view = @import("param_view.zig");
 
 pub const ChangeFn = *const fn (ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8, value: modular.ParamValue) void;
+pub const DisplayFn = *const fn (ctx: *anyopaque, key: view.FieldKey, snapshot: view.ParamSnapshot) modular.ParamValue;
+pub const SnapshotFn = *const fn (ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8) ?view.ParamSnapshot;
 
 const PANEL_BG = gui.Color.rgba(0x1B, 0x21, 0x29, 0xFF);
 const PANEL_BORDER = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
 const TITLE = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
 const SUBTLE = gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF);
 
-fn idFor(ctx: *const gui.Context, handle: modular.dyn.Handle, index: usize) gui.Id {
+pub fn paramId(ctx: *const gui.Context, handle: modular.dyn.Handle, index: usize) gui.Id {
     const key = (@as(u64, handle) << 32) | @as(u64, @intCast(index + 1));
     return ctx.id_stack.makeInt(key);
 }
@@ -62,6 +65,10 @@ pub fn drawPanel(
     graph: *const modular.DynGraph,
     selected: ?modular.dyn.Handle,
     panel: gui.Rect,
+    snapshot_ctx: *anyopaque,
+    snapshot: SnapshotFn,
+    display_ctx: *anyopaque,
+    display: DisplayFn,
     callback_ctx: *anyopaque,
     on_change: ChangeFn,
 ) void {
@@ -104,7 +111,13 @@ pub fn drawPanel(
         return;
     }
     for (descs, 0..) |desc, index| {
-        const value = modular.getParam(graph, h, desc.name) catch continue;
+        const snapshot_raw = snapshot(snapshot_ctx, h, desc.name) orelse continue;
+        const key = view.fieldKey(h, desc.name);
+        const value = display(display_ctx, key, .{
+            .field = snapshot_raw.field,
+            .instant = snapshot_raw.instant,
+            .has_instant = snapshot_raw.has_instant,
+        });
         switch (desc.kind) {
             .scalar => |s| {
                 const raw = switch (value) {
@@ -118,7 +131,7 @@ pub fn drawPanel(
                 const visible_label = paramLabel(ctx, label, param_avail);
                 var value_buf: [32]u8 = undefined;
                 const value_text = std.fmt.bufPrint(&value_buf, "{d:.2}", .{current}) catch "?";
-                const changed = ctx.sliderF32Id(idFor(ctx, h, index), visible_label, &current, .{
+                const changed = ctx.sliderF32Id(paramId(ctx, h, index), visible_label, &current, .{
                     .min = s.min,
                     .max = s.max,
                     .step = s.step,
@@ -139,7 +152,7 @@ pub fn drawPanel(
                 const visible_label = paramLabel(ctx, label, param_avail);
                 var value_buf: [32]u8 = undefined;
                 const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{@as(i64, current)}) catch "?";
-                const changed = ctx.sliderI32Id(idFor(ctx, h, index), visible_label, &current, .{
+                const changed = ctx.sliderI32Id(paramId(ctx, h, index), visible_label, &current, .{
                     .min = 0,
                     .max = @intCast(c.options.len - 1),
                     .step = 1,
@@ -158,12 +171,16 @@ pub fn draw(
     graph: *const modular.DynGraph,
     selected: ?modular.dyn.Handle,
     panel: gui.Rect,
+    snapshot_ctx: *anyopaque,
+    snapshot: SnapshotFn,
+    display_ctx: *anyopaque,
+    display: DisplayFn,
     callback_ctx: *anyopaque,
     on_change: ChangeFn,
 ) void {
     ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(ctx.screen_w) }, .height = .{ .fixed = @intCast(ctx.screen_h) } });
     ctx.beginBox(.{ .width = .{ .fixed = @max(0, panel.x) }, .height = .{ .fixed = @intCast(panel.h) } });
     ctx.endBox();
-    drawPanel(ctx, graph, selected, panel, callback_ctx, on_change);
+    drawPanel(ctx, graph, selected, panel, snapshot_ctx, snapshot, display_ctx, display, callback_ctx, on_change);
     ctx.endBox();
 }

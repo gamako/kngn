@@ -1,39 +1,73 @@
-//! グローバル / トランスポート操作パネル（TASK-110.5）。
+//! グローバル / トランスポート操作パネル。
 //!
-//! ホットパス宣言: レイアウト・slider 評価は frame-rate、変更 callback は event-rate（main thread）。
-//! このファイルは Controls/モジュールを直接触らず、main の共通 setter に値を渡す。
+//! ホットパス宣言: projection の field 読み出しと slider 評価は frame-rate、変更 callback は
+//! event-rate（main thread）。このファイルは Controls/モジュールを直接触らず canonical key を返す。
 
-const std = @import("std");
 const kit = @import("kit");
 const gui = kit.gui;
+const view = @import("param_view.zig");
 
-pub const ParamChangeFn = *const fn (ctx: *anyopaque, name: []const u8, value: f32) void;
+pub const ParamChangeFn = *const fn (ctx: *anyopaque, key: view.FieldKey, value: f32) void;
 pub const MuteChangeFn = *const fn (ctx: *anyopaque, name: []const u8, muted: bool) void;
+pub const DisplayFn = *const fn (ctx: *anyopaque, key: view.FieldKey, field: f32) f32;
 
 const PANEL_BG = gui.Color.rgba(0x1B, 0x21, 0x29, 0xFF);
 const PANEL_BORDER = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
 const TITLE = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
 const SUBTLE = gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF);
 
+pub const Scalar = struct {
+    key: view.FieldKey,
+    field: f32,
+    instant: ?f32 = null,
+};
+
+pub const Track = struct {
+    gain: Scalar,
+    muted: bool,
+};
+
+pub const Model = struct {
+    tempo: Scalar,
+    cutoff: Scalar,
+    density: Scalar,
+    swing: Scalar,
+    sidechain: Scalar,
+    kick: Track,
+    hat: Track,
+    clap: Track,
+    bass: Track,
+    pad: Track,
+    conversion: view.Conversion,
+};
+
 fn idFor(ctx: *const gui.Context, index: u64) gui.Id {
     return ctx.id_stack.makeInt(0x5452_4E53_0000_0000 | index);
+}
+
+fn displayValue(display_ctx: *anyopaque, display: DisplayFn, scalar: Scalar) f32 {
+    return display(display_ctx, scalar.key, scalar.field);
 }
 
 fn drawGlobalSlider(
     ctx: *gui.Context,
     id: gui.Id,
     label: []const u8,
-    value: f32,
+    alias: view.TransportAlias,
+    scalar: Scalar,
     min: f32,
     max: f32,
     step: f32,
+    conversion: view.Conversion,
+    display_ctx: *anyopaque,
+    display: DisplayFn,
     callback_ctx: *anyopaque,
-    name: []const u8,
     on_change: ParamChangeFn,
 ) void {
-    var current = value;
+    const canonical = displayValue(display_ctx, display, scalar);
+    var current = view.toUi(alias, canonical, conversion);
     if (ctx.sliderF32Id(id, label, &current, .{ .min = min, .max = max, .step = step, .track_w = 92 })) {
-        on_change(callback_ctx, name, current);
+        on_change(callback_ctx, scalar.key, view.toCanonical(alias, current, conversion));
     }
 }
 
@@ -41,25 +75,27 @@ fn drawTrack(
     ctx: *gui.Context,
     id_base: u64,
     label: []const u8,
-    gain: f32,
-    muted: bool,
+    alias: view.TransportAlias,
+    track: Track,
+    conversion: view.Conversion,
+    display_ctx: *anyopaque,
+    display: DisplayFn,
     callback_ctx: *anyopaque,
     on_change: ParamChangeFn,
     on_mute: MuteChangeFn,
 ) void {
     ctx.beginBox(.{ .direction = .row, .gap = 4, .align_cross = .center });
-    var current_gain = gain;
+    const canonical = displayValue(display_ctx, display, track.gain);
+    var current_gain = view.gainToUi(alias, canonical, conversion);
     if (ctx.sliderF32Id(idFor(ctx, id_base), label, &current_gain, .{
         .min = 0.0,
         .max = 1.5,
         .step = 0.01,
         .track_w = 64,
     })) {
-        var name_buf: [24]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "{s}_gain", .{label}) catch label;
-        on_change(callback_ctx, name, current_gain);
+        on_change(callback_ctx, track.gain.key, view.gainToModule(alias, current_gain, conversion));
     }
-    var current_mute = muted;
+    var current_mute = track.muted;
     if (ctx.toggleId(idFor(ctx, id_base + 0x100), "M", &current_mute)) {
         on_mute(callback_ctx, label, current_mute);
     }
@@ -73,7 +109,9 @@ pub fn draw(
     panel: gui.Rect,
     left_w: i32,
     screen_h: i32,
-    params: anytype,
+    model: *const Model,
+    display_ctx: *anyopaque,
+    display: DisplayFn,
     callback_ctx: *anyopaque,
     on_change: ParamChangeFn,
     on_mute: MuteChangeFn,
@@ -101,20 +139,20 @@ pub fn draw(
     ctx.beginBox(.{ .direction = .row, .gap = 10, .align_cross = .start });
     const col_w: i32 = @max(1, @divTrunc(panel_w - 30, 2));
     ctx.beginBox(.{ .width = .{ .fixed = col_w }, .height = .fit, .gap = 3 });
-    drawGlobalSlider(ctx, idFor(ctx, 1), "tempo", params.tempo, 40.0, 220.0, 1.0, callback_ctx, "tempo", on_change);
-    drawGlobalSlider(ctx, idFor(ctx, 2), "cutoff", params.cutoff_norm, 0.0, 1.0, 0.01, callback_ctx, "cutoff_norm", on_change);
-    drawGlobalSlider(ctx, idFor(ctx, 3), "density", params.density, 0.0, 1.0, 0.01, callback_ctx, "density", on_change);
-    drawGlobalSlider(ctx, idFor(ctx, 4), "swing", params.swing, 0.0, 1.0, 0.01, callback_ctx, "swing", on_change);
-    drawGlobalSlider(ctx, idFor(ctx, 5), "sidechain", params.sidechain, 0.0, 1.0, 0.01, callback_ctx, "sidechain", on_change);
+    drawGlobalSlider(ctx, idFor(ctx, 1), "tempo", .tempo, model.tempo, 40.0, 220.0, 1.0, model.conversion, display_ctx, display, callback_ctx, on_change);
+    drawGlobalSlider(ctx, idFor(ctx, 2), "cutoff", .cutoff, model.cutoff, 0.0, 1.0, 0.01, model.conversion, display_ctx, display, callback_ctx, on_change);
+    drawGlobalSlider(ctx, idFor(ctx, 3), "density", .density, model.density, 0.0, 1.0, 0.01, model.conversion, display_ctx, display, callback_ctx, on_change);
+    drawGlobalSlider(ctx, idFor(ctx, 4), "swing", .swing, model.swing, 0.0, 1.0, 0.01, model.conversion, display_ctx, display, callback_ctx, on_change);
+    drawGlobalSlider(ctx, idFor(ctx, 5), "sidechain", .sidechain, model.sidechain, 0.0, 1.0, 0.01, model.conversion, display_ctx, display, callback_ctx, on_change);
     ctx.endBox();
 
     ctx.beginBox(.{ .width = .{ .fixed = col_w }, .height = .fit, .gap = 3 });
     ctx.labelEx("TRACK GAINS / MUTE", SUBTLE);
-    drawTrack(ctx, 10, "kick", params.kick_gain, params.kick_mute, callback_ctx, on_change, on_mute);
-    drawTrack(ctx, 11, "hat", params.hat_gain, params.hat_mute, callback_ctx, on_change, on_mute);
-    drawTrack(ctx, 12, "clap", params.clap_gain, params.clap_mute, callback_ctx, on_change, on_mute);
-    drawTrack(ctx, 13, "bass", params.bass_gain, params.bass_mute, callback_ctx, on_change, on_mute);
-    drawTrack(ctx, 14, "pad", params.pad_gain, params.pad_mute, callback_ctx, on_change, on_mute);
+    drawTrack(ctx, 10, "kick", .kick_gain, model.kick, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
+    drawTrack(ctx, 11, "hat", .hat_gain, model.hat, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
+    drawTrack(ctx, 12, "clap", .clap_gain, model.clap, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
+    drawTrack(ctx, 13, "bass", .bass_gain, model.bass, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
+    drawTrack(ctx, 14, "pad", .pad_gain, model.pad, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
     ctx.endBox();
     ctx.endBox();
     ctx.endBox();

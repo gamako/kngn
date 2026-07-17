@@ -1702,6 +1702,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     patch_tests_mod.addImport("gui", shared_modules.gui.mod);
+    patch_tests_mod.addImport("modular", shared_modules.modular.mod);
     const patch_tests = b.addTest(.{ .root_module = patch_tests_mod });
     const run_patch_tests = b.addRunArtifact(patch_tests);
     const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
