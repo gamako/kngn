@@ -1,0 +1,70 @@
+# TASK-111.9 E2E: 統合ミニゲーム capstone
+# 前提: 640×360 / FixedTimeStep 60Hz / harness 仮想クロック / objc
+# CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取。
+# snapshot fb は path 省略 → $VP_HARNESS_OUT/frame_<n>.png
+# audio: silent=0 のみ（onsets は live smoke で検証。付記 1）
+
+# 初期状態: 空中から落下
+step 1
+digest game
+assert game grounded=0
+expect game state=falling
+
+# 着地
+step 40
+digest game
+assert game grounded=1
+expect game y=322.000
+snapshot fb
+digest fb
+expect fb crc=A3D8BC65
+
+# 水平移動とカメラ追従
+inject key_down RIGHT
+step 110
+digest game
+expect game x>300.0
+expect game cam_x>0.0
+expect game score>0
+
+# ジャンプ
+inject key_down SPACE
+step 1
+digest game
+assert game jump_count=1
+assert game grounded=0
+expect game state=jumping
+expect game y<322.0
+digest audio
+expect audio silent=0
+snapshot fb
+digest fb
+expect fb crc=FB560C38
+
+# Space 解放後も右移動を継続
+inject key_up SPACE
+step 20
+digest game
+expect game y<322.0
+expect game state!=grounded
+
+# 着地と着地 SE
+step 20
+digest game
+assert game landing_count>0
+assert game grounded=1
+expect game state=grounded
+digest audio
+expect audio silent=0
+
+# BGM がループし続けることを確認
+step 80
+digest game
+assert game bgm=1
+digest audio
+expect audio silent=0
+
+snapshot fb
+digest fb
+expect fb crc=D899F470
+quit
