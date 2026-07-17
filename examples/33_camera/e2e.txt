@@ -1,0 +1,48 @@
+# TASK-111.4 E2E: camera pan + follow（決定論 CRC 焼き込み）
+# 前提: 640×360 / 固定背景 / 固定 world / FixedTimeStep 60Hz / harness 仮想クロック
+# CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取（M7）。
+# 実行例:
+#   TMPD=$(mktemp -d)
+#   VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=examples/33_camera/e2e.txt \
+#     VP_HARNESS_OUT=$TMPD zig build run-example_33
+# snapshot は path 省略 → $VP_HARNESS_OUT/frame_<n>.png（repo に PNG を残さない）
+
+# --- 1. 初期表示（市松 + 目印スプライト） ---
+step 1
+snapshot fb
+digest fb
+expect fb crc=11D17951
+
+# --- 2. 手動スクロール（RIGHT 長押し相当） ---
+inject key_down RIGHT
+step 40
+inject key_up RIGHT
+snapshot fb
+digest fb
+expect fb crc=47CA82D8
+
+# --- 3. 境界付近まで移動（RIGHT+DOWN） ---
+inject key_down RIGHT
+inject key_down DOWN
+step 100
+inject key_up RIGHT
+inject key_up DOWN
+snapshot fb
+digest fb
+expect fb crc=B81EB721
+
+# --- 4. 追従有効化後（lerp 進行・スプライトが視野に入る） ---
+inject key_down F
+step 1
+inject key_up F
+step 40
+snapshot fb
+digest fb
+expect fb crc=EE378351
+
+# --- 5. 追従後の安定状態（ターゲットが viewport 中央付近） ---
+step 80
+snapshot fb
+digest fb
+expect fb crc=A775CEB8
+quit
