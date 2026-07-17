@@ -14,7 +14,7 @@
 //!   移設し kit.gfx 経由でも公開する）
 //! - recipe: libs/recipe（CommandRecord 列の save/replay。TASK-62.5.8。std + serde のみ）
 //! - sound: libs/sound（WAV デコード + SE/BGM ミキサー。TASK-111.6。dsp + synth）
-//! - gfx: libs/gfx（sprite / fixed_timestep / fps_counter / keyboard。TASK-111.2）
+//! - gfx: libs/gfx（sprite / fixed_timestep / fps_counter / keyboard / atlas / animation。TASK-111.2/111.3）
 //!
 //! **流動中の lib（modular / paint / viz 等）は載せない**。apps はそれらを「内部・壊れうる」
 //! 前提の直 import で使い、API が固まったら kit へ昇格する（成熟ゲート）。

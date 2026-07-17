@@ -1,0 +1,27 @@
+# TASK-111.3 E2E: 歩行アニメ + 左右往復（決定論 CRC 焼き込み）
+# 前提: 640×360 / 固定背景 / 固定 seed 無しの決定的描画 / harness 仮想クロック
+# 実行例:
+#   TMPD=$(mktemp -d)
+#   VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
+#     VP_HARNESS_OUT=$TMPD zig build run-example_32
+
+step 1
+snapshot fb step-1.png
+digest fb
+expect fb crc=BA8FA900
+
+step 59
+snapshot fb step-60.png
+digest fb
+expect fb crc=0D5C6C01
+
+step 60
+snapshot fb step-120.png
+digest fb
+expect fb crc=D357AA75
+
+step 60
+snapshot fb step-180.png
+digest fb
+expect fb crc=6A31348B
+quit

@@ -2,7 +2,7 @@ const std = @import("std");
 const png = @import("png");
 const pixelops = @import("pixelops");
 
-const PremultipliedImage = png.PremultipliedImage;
+pub const PremultipliedImage = png.PremultipliedImage;
 
 /// スプライト構造体
 /// Premultiplied Alpha形式のPNG画像データと画面座標を保持

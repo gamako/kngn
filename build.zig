@@ -452,6 +452,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_29", .path = "examples/29_midi_monitor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_30", .path = "examples/30_sound_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
             .{ .name = "example_31", .path = "examples/31_sprite_ex/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_32", .path = "examples/32_sprite_anim/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -467,7 +468,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.startsWith(u8, example.name, "example_26"),
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
             if (!needs.needs_audio or audio_supported) {
@@ -2121,7 +2122,7 @@ const SharedModules = struct {
     types: TaggedModule,
     pixelops: TaggedModule,
     gmath: TaggedModule,
-    gfx: TaggedModule, // libs/gfx（sprite/fixed_timestep/fps_counter/keyboard。TASK-111.2。kit 収録）
+    gfx: TaggedModule, // libs/gfx（sprite/ft/fps/keyboard/atlas/animation。TASK-111.2/111.3。kit 収録）
     serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
     appshell: TaggedModule, // libs/appshell（設定 / window / recent files。TASK-114.1）
     recipe: TaggedModule, // libs/recipe（CommandRecord 列 save/replay。TASK-62.5.8。std + serde。kit 収録）
@@ -2465,7 +2466,7 @@ const ExampleNeeds = struct {
     needs_midi: bool, // TASK-115.1（examples/29_midi_monitor のみ true）
     needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
     needs_sound: bool, // TASK-111.6（examples/30_sound_demo のみ true）
-    needs_kit: bool = false, // TASK-111.2（example_31）/ example_26
+    needs_kit: bool = false, // TASK-111.2/111.3（example_31/32）/ example_26
 };
 
 // ============================================================
