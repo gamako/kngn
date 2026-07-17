@@ -9,6 +9,10 @@
 //! - `pub fn init(gpa: Allocator, io: std.Io) !*App`
 //! - `pub fn frame(self: *App, win: *platform.Window, now: f64) bool`（running）
 //! - `pub fn deinit(self: *App) void`
+//!
+//! opt-in（TASK-117）:
+//! - `pub fn windowBootstrap(gpa, io) !platform.WindowOptions` — platform.init 後・Window.create 前
+//! - `pub fn onWindowShutdown(self: *App, win: *platform.Window) void` — destroy 前・deinit 前
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,9 +22,18 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const Self = @This();
 
+        fn createAppWindow(gpa: std.mem.Allocator, io: std.Io) !platform.Window {
+            if (@hasDecl(App, "windowBootstrap")) {
+                const opts = try App.windowBootstrap(gpa, io);
+                return platform.Window.createWithOptions(App.window.w, App.window.h, App.window.title, opts);
+            }
+            return platform.Window.create(App.window.w, App.window.h, App.window.title);
+        }
+
         /// native: `std.process.Init` を受けて pull ループを所有する。
         /// 既存 pixie と同型: `while (running and pollEvents()) { running = frame(...) }`。
         /// frameDelay は呼ばない（pixie は backend の vsync/poll に委ねており従来同等を保つ）。
+        /// shutdown 順序は `onWindowShutdown → App.deinit → Window.destroy`（TASK-117）。
         pub fn runNative(process_init: std.process.Init) !void {
             const gpa = process_init.gpa;
             const io = process_init.io;
@@ -28,11 +41,12 @@ pub fn Runtime(comptime App: type) type {
             try platform.init();
             defer platform.shutdown();
 
-            var win = try platform.Window.create(App.window.w, App.window.h, App.window.title);
+            var win = try createAppWindow(gpa, io);
             defer win.destroy();
 
             const app = try App.init(gpa, io);
             defer app.deinit();
+            defer if (@hasDecl(App, "onWindowShutdown")) app.onWindowShutdown(&win);
 
             // window 生成後の opt-in 配線点（ライブリサイズ redraw callback 等。TASK-23.1 統合）。
             // native のみ: wasm はモーダルループが無く rAF が回り続けるため不要。
@@ -75,7 +89,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
 
-            const win = platform.Window.create(App.window.w, App.window.h, App.window.title) catch {
+            const win = createAppWindow(gpa, io) catch {
                 const msg = "vp_init: Window.create failed";
                 const env = struct {
                     extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
@@ -111,6 +125,7 @@ pub fn Runtime(comptime App: type) type {
             _ = win.pollEvents();
             g_running = app.frame(&win, now_sec) catch false;
             if (!g_running) {
+                if (@hasDecl(App, "onWindowShutdown")) app.onWindowShutdown(&win);
                 app.deinit();
                 win.destroy();
                 platform.shutdown();

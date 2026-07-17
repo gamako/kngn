@@ -262,6 +262,8 @@ extern "user32" fn PeekMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT, w
 extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
 extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.winapi) BOOL;
+extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.winapi) c_int; // プライマリモニタ寸法（TASK-100.1）
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
@@ -419,13 +421,20 @@ pub const Core = struct {
         if (fullscreen) {
             pos_x = 0;
             pos_y = 0;
-        } else if (borderless) {
-            // 装飾なし: client=window。CW_USEDEFAULT のまま（compositor/WM が配置）。
         } else {
-            var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
-            if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
-            outer_w = rect.right - rect.left;
-            outer_h = rect.bottom - rect.top;
+            // TASK-117: 明示位置があれば CreateWindowExW に渡す（無ければ CW_USEDEFAULT）。
+            if (opts.position) |pos| {
+                pos_x = pos.x;
+                pos_y = pos.y;
+            }
+            if (!borderless) {
+                // client area を width×height にするため outer 寸法を算出。
+                var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
+                if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
+                outer_w = rect.right - rect.left;
+                outer_h = rect.bottom - rect.top;
+            }
+            // borderless: client=window。位置未指定時は CW_USEDEFAULT のまま。
         }
 
         const core = alloc.create(Core) catch return error.WindowCreationFailed;
@@ -475,6 +484,21 @@ pub const Core = struct {
         _ = ShowWindow(hwnd, SW_SHOW);
         _ = UpdateWindow(hwnd);
         return core;
+    }
+
+    /// 現在のウィンドウ geometry（TASK-117）。位置=GetWindowRect、サイズ=GetClientRect。
+    pub fn getGeometry(self: *Core) types.WindowGeometry {
+        var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        var cr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        const have_pos = GetWindowRect(self.hwnd, &wr) != 0;
+        const have_size = GetClientRect(self.hwnd, &cr) != 0;
+        return .{
+            .position = if (have_pos) .{ .x = wr.left, .y = wr.top } else null,
+            .size = if (have_size)
+                .{ .width = @intCast(cr.right - cr.left), .height = @intCast(cr.bottom - cr.top) }
+            else
+                .{ .width = self.width, .height = self.height },
+        };
     }
 
     /// TASK-104.1: 透過ウィンドウの present。premultiplied BGRA backing を per-pixel alpha 合成で表示する

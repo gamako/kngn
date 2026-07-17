@@ -309,6 +309,34 @@ const App = struct {
     /// app_runtime が参照する初期ウィンドウ仕様（TASK-73.1）
     pub const window = .{ .w = WINDOW_W, .h = WINDOW_H, .title = "Pixie" };
 
+    /// 起動前に window_state を load して WindowOptions を返す（TASK-117）。
+    /// platform.init 後・Window.create 前。失敗時はデフォルト 780x600。
+    pub fn windowBootstrap(gpa: std.mem.Allocator, io: std.Io) !platform.WindowOptions {
+        const fallback_opts: platform.WindowOptions = .{
+            .position = null,
+            .size = .{ .width = WINDOW_W, .height = WINDOW_H },
+        };
+        const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
+        var data_dir = appshell.paths.openAppDataDir(io, gpa, "pixie", override_path) catch |err| {
+            std.log.err("pixie: window_state data dir open failed: {s}", .{@errorName(err)});
+            return fallback_opts;
+        };
+        defer data_dir.close(io);
+        const fallback_state: appshell.window_state.State = .{
+            .position = null,
+            .size = .{ .width = WINDOW_W, .height = WINDOW_H },
+        };
+        const loaded = appshell.window_state.load(io, data_dir, "window_state.ash", fallback_state) catch |err| {
+            std.log.err("pixie: window_state load failed: {s}", .{@errorName(err)});
+            return fallback_opts;
+        };
+        const resolved = appshell.window_state.resolve(loaded.state, fallback_state, null);
+        return .{
+            .position = if (resolved.position) |p| .{ .x = p.x, .y = p.y } else null,
+            .size = .{ .width = resolved.size.width, .height = resolved.size.height },
+        };
+    }
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io) !*App {
         return appInit(gpa, io);
     }
@@ -333,6 +361,23 @@ const App = struct {
             self.saveNativeMenuSnapshot();
             self.native_menu_registered = true;
         }
+    }
+
+    /// Window.destroy 前・App.deinit 前に呼ぶ（TASK-117）。geometry を window_state へ保存。
+    /// size=0（facade の安全既定 / 取得失敗）は既存 state を温存するため保存スキップ。失敗は log のみ。
+    pub fn onWindowShutdown(self: *App, win: *platform.Window) void {
+        const geo = win.getGeometry();
+        if (geo.size.width == 0 or geo.size.height == 0) {
+            std.log.warn("pixie: window_state save skipped (invalid geometry size={d}x{d})", .{ geo.size.width, geo.size.height });
+            return;
+        }
+        const state: appshell.window_state.State = .{
+            .position = if (geo.position) |p| .{ .x = p.x, .y = p.y } else null,
+            .size = .{ .width = geo.size.width, .height = geo.size.height },
+        };
+        appshell.window_state.save(self.io, self.data_dir, "window_state.ash", state) catch |err| {
+            std.log.err("pixie: window_state save failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn syncComposition(self: *App, win: *platform.Window) void {
@@ -2636,7 +2681,17 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const path = app.host.currentPath() orelse "none";
     const recent0 = if (app.recent.items().len > 0) app.recent.items()[0] else "none";
     const recovery = if (app.recovery != null) "pending" else "none";
-    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} autosave={d} netsync={d} title={s}", .{
+    // TASK-117: geometry を additive で載せる（headless=サイズのみ/pos=none。配線 silent false 検出用）。
+    const geo = if (app.os_window) |win| win.getGeometry() else platform.WindowGeometry{
+        .position = null,
+        .size = .{ .width = 0, .height = 0 },
+    };
+    var pos_buf: [48]u8 = undefined;
+    const pos = if (geo.position) |p|
+        (std.fmt.bufPrint(&pos_buf, "{d},{d}", .{ p.x, p.y }) catch "err")
+    else
+        "none";
+    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} autosave={d} netsync={d} title={s} geom={d}x{d} pos={s}", .{
         @intFromBool(app.host.isDirty()),
         path,
         @tagName(app.host.confirmation()),
@@ -2646,6 +2701,9 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         @intFromBool(activeAutosavePresent(app)),
         @intFromBool(platform.netsyncActive()),
         title,
+        geo.size.width,
+        geo.size.height,
+        pos,
     }) catch buf[0..0];
 }
 
@@ -5212,7 +5270,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
-    platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title state" });
+    platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title/geometry state" });
     registerActions(self);
     registerStateSync(self);
     return self;

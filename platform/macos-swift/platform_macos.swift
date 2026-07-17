@@ -1247,25 +1247,29 @@ class MascotWindow: NSWindow {
 
 @_cdecl("platform_create_window")
 func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false, position: nil)
 }
 
-// TASK-104: options 付きウィンドウ作成。opts==NULL は従来動作。unknown flags / reserved!=0 は NULL。
+// TASK-104 / TASK-117: options 付きウィンドウ作成。opts==NULL は従来動作。unknown flags / reserved!=0 は NULL。
 @_cdecl("platform_create_window_ex")
 func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, opts: UnsafePointer<PlatformWindowOptions>?) -> UnsafeMutableRawPointer? {
     var transparent = false
     var borderless = false
+    var position: (x: Int32, y: Int32)? = nil
     if let opts = opts {
         let flags = opts.pointee.flags
-        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS)
+        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION)
         if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
         transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
         borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
+        if (flags & UInt32(PLATFORM_WINDOW_POSITION)) != 0 {
+            position = (opts.pointee.x, opts.pointee.y)
+        }
     }
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position)
 }
 
-private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool) -> UnsafeMutableRawPointer? {
+private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
@@ -1319,8 +1323,12 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     // setContentView 後に NSTrackingArea を構築
     view.updateTrackingAreas()
 
-    // ウィンドウを表示
-    window.center()
+    // ウィンドウを表示（TASK-117: 明示位置があれば setFrameOrigin、なければ center）
+    if let position = position {
+        window.setFrameOrigin(NSPoint(x: CGFloat(position.x), y: CGFloat(position.y)))
+    } else {
+        window.center()
+    }
     window.makeKeyAndOrderFront(nil)
     // IME: view を first responder にして inputContext / interpretKeyEvents が効くようにする（TASK-79.6.1）
     window.makeFirstResponder(view)
@@ -1337,6 +1345,26 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     let handle = UnsafeMutableRawPointer(Unmanaged.passRetained(platformWindow).toOpaque())
 
     return handle
+}
+
+// TASK-117: 現在のウィンドウ geometry。位置=frame.origin、サイズ=content サイズ。
+@_cdecl("platform_get_window_geometry")
+func platform_get_window_geometry(window: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformWindowGeometry>?) {
+    guard let out = out else { return }
+    out.pointee.x = 0
+    out.pointee.y = 0
+    out.pointee.width = 0
+    out.pointee.height = 0
+    out.pointee.flags = 0
+    guard let window = window else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(window).takeUnretainedValue()
+    let frame = handle.window.frame
+    let content = handle.window.contentRect(forFrameRect: frame)
+    out.pointee.x = Int32(frame.origin.x)
+    out.pointee.y = Int32(frame.origin.y)
+    out.pointee.width = UInt32(lround(Double(content.size.width)))
+    out.pointee.height = UInt32(lround(Double(content.size.height)))
+    out.pointee.flags = UInt32(PLATFORM_GEOMETRY_POSITION_VALID)
 }
 
 // 表示中のウィンドウタイトルを更新する（イベント時のみ）。

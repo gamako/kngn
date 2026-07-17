@@ -27,6 +27,7 @@ pub const Window = backend.Window;
 pub const Framebuffer = backend.Framebuffer;
 pub const init = backend.init;
 pub const shutdown = backend.shutdown;
+pub const getGeometry = backend.getGeometry; // TASK-117
 
 // display 非依存の共通実装（各 backend が platform_linux_common から re-export している）。
 pub const getTime = backend.getTime;

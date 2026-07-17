@@ -122,7 +122,10 @@ pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 pub const CursorShape = types.CursorShape;
-pub const WindowOptions = types.WindowOptions; // TASK-104
+pub const WindowOptions = types.WindowOptions; // TASK-104 / TASK-117
+pub const WindowPosition = types.WindowPosition; // TASK-117
+pub const WindowSize = types.WindowSize; // TASK-117
+pub const WindowGeometry = types.WindowGeometry; // TASK-117
 pub const MAX_GAMEPADS = types.MAX_GAMEPADS;
 pub const GamepadButton = types.GamepadButton;
 pub const GamepadButtons = types.GamepadButtons;
@@ -159,13 +162,16 @@ pub const Framebuffer = struct {
 pub const Window = struct {
     inner: backend.Window,
     headless: bool,
+    /// headless getGeometry 用に作成時サイズを保持する（TASK-117。native は backend 取得）。
+    create_w: u32 = 0,
+    create_h: u32 = 0,
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
         if (harness.isHeadlessActive()) {
             harness.createHeadlessWindow(width, height) catch return error.WindowCreationFailed;
-            return .{ .inner = undefined, .headless = true };
+            return .{ .inner = undefined, .headless = true, .create_w = width, .create_h = height };
         }
-        return .{ .inner = try backend.Window.create(width, height, title), .headless = false };
+        return .{ .inner = try backend.Window.create(width, height, title), .headless = false, .create_w = width, .create_h = height };
     }
 
     /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。video-proto に
@@ -176,31 +182,49 @@ pub const Window = struct {
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
         if (harness.isHeadlessActive()) {
             harness.createHeadlessWindow(1920, 1080) catch return error.WindowCreationFailed;
-            return .{ .inner = undefined, .headless = true };
+            return .{ .inner = undefined, .headless = true, .create_w = 1920, .create_h = 1080 };
         }
         if (@hasDecl(backend.Window, "createFullscreen")) {
-            return .{ .inner = try backend.Window.createFullscreen(title), .headless = false };
+            return .{ .inner = try backend.Window.createFullscreen(title), .headless = false, .create_w = 1920, .create_h = 1080 };
         }
-        return .{ .inner = try backend.Window.create(1920, 1080, title), .headless = false };
+        return .{ .inner = try backend.Window.create(1920, 1080, title), .headless = false, .create_w = 1920, .create_h = 1080 };
     }
 
-    /// 透過 / borderless オプション付きでウィンドウを作成する（TASK-104）。`.{}` は
-    /// 従来 create と同一挙動（後方互換）。backend が `createWithOptions` を実装していれば
-    /// （macOS）それを使い、無ければ透過/borderless 要求時に `error.Unsupported`、無指定なら
-    /// 通常 create へフォールバックする（Linux/Windows backend は無改造）。
+    /// 透過 / borderless / 初期位置・サイズ オプション付きでウィンドウを作成する（TASK-104 / TASK-117）。
+    /// `.{}` は従来 create と同一挙動（後方互換）。`opts.size` 指定時だけ w/h を上書きする。
+    /// backend が `createWithOptions` を実装していればそれを使い、無ければ透過/borderless 要求時に
+    /// `error.Unsupported`、無指定なら通常 create へフォールバックする。
     /// headless（VP_HARNESS_HEADLESS）は options を受理し CPU framebuffer だけで動く
-    /// （表示は無いが fb の alpha を digest 検証できる）。
+    /// （表示は無いが fb の alpha を digest 検証できる。位置は常に null）。
     /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
+        const w = if (opts.size) |s| s.width else width;
+        const h = if (opts.size) |s| s.height else height;
         if (harness.isHeadlessActive()) {
-            harness.createHeadlessWindow(width, height) catch return error.WindowCreationFailed;
-            return .{ .inner = undefined, .headless = true };
+            harness.createHeadlessWindow(w, h) catch return error.WindowCreationFailed;
+            return .{ .inner = undefined, .headless = true, .create_w = w, .create_h = h };
         }
         if (@hasDecl(backend.Window, "createWithOptions")) {
-            return .{ .inner = try backend.Window.createWithOptions(width, height, title, opts), .headless = false };
+            return .{ .inner = try backend.Window.createWithOptions(w, h, title, opts), .headless = false, .create_w = w, .create_h = h };
         }
         if (opts.transparent or opts.borderless) return error.Unsupported;
-        return .{ .inner = try backend.Window.create(width, height, title), .headless = false };
+        return .{ .inner = try backend.Window.create(w, h, title), .headless = false, .create_w = w, .create_h = h };
+    }
+
+    /// 現在のウィンドウ geometry を返す（TASK-117）。エラーを返さず安全な既定値を返す。
+    /// headless は作成時サイズ + position=null。backend 未実装は size=0 + position=null。
+    /// ホットパス宣言: ウィンドウ生成時 / 終了時 shutdown / harness digest 観測時のみ。
+    pub fn getGeometry(self: Window) WindowGeometry {
+        if (self.headless) {
+            return .{
+                .position = null,
+                .size = .{ .width = self.create_w, .height = self.create_h },
+            };
+        }
+        if (comptime @hasDecl(backend, "getGeometry")) {
+            return backend.getGeometry(self.inner);
+        }
+        return .{ .position = null, .size = .{ .width = 0, .height = 0 } };
     }
 
     pub fn destroy(self: Window) void {

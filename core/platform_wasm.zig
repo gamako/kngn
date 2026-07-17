@@ -300,6 +300,17 @@ pub const Window = struct {
         return .{ .width = fb_w, .height = fb_h };
     }
 
+    /// 透過 / borderless / サイズ指定（TASK-117）。wasm は表示位置が無いため position は無視。
+    /// transparent/borderless も DOM canvas では意味が薄いが、サイズ上書きのために受理する。
+    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        _ = opts.transparent;
+        _ = opts.borderless;
+        _ = opts.position;
+        const w = if (opts.size) |s| s.width else width;
+        const h = if (opts.size) |s| s.height else height;
+        return create(w, h, title);
+    }
+
     pub fn destroy(_: Window) void {
         if (pixels_buf.len != 0) {
             gpa.free(pixels_buf);
@@ -375,6 +386,16 @@ pub const Window = struct {
         return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
     }
 };
+
+/// 現在のウィンドウ geometry（TASK-117）。wasm は位置無し・現在 framebuffer サイズ。
+/// module-level（facade `@hasDecl` 契約）。
+pub fn getGeometry(win: Window) types.WindowGeometry {
+    _ = win;
+    return .{
+        .position = null,
+        .size = .{ .width = fb_w, .height = fb_h },
+    };
+}
 
 pub const Framebuffer = struct {
     pixels: []u32,

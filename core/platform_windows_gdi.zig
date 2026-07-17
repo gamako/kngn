@@ -209,3 +209,8 @@ fn makeBitmapInfo(width: u32, height: u32) BITMAPINFO {
         .bmiColors = .{.{ .b = 0, .g = 0, .r = 0, .reserved = 0 }},
     };
 }
+
+/// 現在のウィンドウ geometry（TASK-117）。module-level（facade `@hasDecl` 契約）。
+pub fn getGeometry(window: Window) types.WindowGeometry {
+    return window.core.getGeometry();
+}

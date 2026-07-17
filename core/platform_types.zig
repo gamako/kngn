@@ -14,11 +14,33 @@ pub const Error = error{
     Unsupported,
 };
 
-/// ウィンドウ生成オプション（TASK-104）。既定 `.{}` は現行と同一挙動（不透明・タイトル付き）。
+/// ウィンドウ初期位置（OS 画面座標。TASK-117）。
+pub const WindowPosition = struct {
+    x: i32,
+    y: i32,
+};
+
+/// ウィンドウ content/client サイズ（TASK-117）。
+pub const WindowSize = struct {
+    width: u32,
+    height: u32,
+};
+
+/// 現在のウィンドウ geometry（TASK-117）。
+/// `position == null` は位置取得・適用非対応または取得不能（Wayland/wasm/headless 等）。
+pub const WindowGeometry = struct {
+    position: ?WindowPosition,
+    size: WindowSize,
+};
+
+/// ウィンドウ生成オプション（TASK-104 / TASK-117）。既定 `.{}` は現行と同一挙動（不透明・タイトル付き）。
 /// 透過は per-pixel alpha（premultiplied alpha 前提）。borderless は枠・タイトルバーなし。
+/// `size` 指定時は `Window.createWithOptions` の w/h を上書きする。`position` は対応 backend のみ適用。
 pub const WindowOptions = struct {
     transparent: bool = false,
     borderless: bool = false,
+    position: ?WindowPosition = null,
+    size: ?WindowSize = null,
 };
 
 // ============================================================================
@@ -610,4 +632,33 @@ test "MidiEvent: MIDI 7-bit 境界値 0 と 127 を保持する" {
     try std.testing.expectEqual(@as(MidiDeviceId, std.math.maxInt(MidiDeviceId)), high.note_on.device_id);
     try std.testing.expectEqual(@as(u8, 127), high.note_on.note);
     try std.testing.expectEqual(@as(u8, 127), high.note_on.velocity);
+}
+
+test "WindowOptions: 既定値は後方互換（透明/枠なし/位置サイズなし）" {
+    const opts: WindowOptions = .{};
+    try std.testing.expect(!opts.transparent);
+    try std.testing.expect(!opts.borderless);
+    try std.testing.expect(opts.position == null);
+    try std.testing.expect(opts.size == null);
+}
+
+test "WindowOptions: position/size の optional 値を保持する" {
+    const opts: WindowOptions = .{
+        .position = .{ .x = 40, .y = -10 },
+        .size = .{ .width = 720, .height = 480 },
+    };
+    try std.testing.expectEqual(@as(i32, 40), opts.position.?.x);
+    try std.testing.expectEqual(@as(i32, -10), opts.position.?.y);
+    try std.testing.expectEqual(@as(u32, 720), opts.size.?.width);
+    try std.testing.expectEqual(@as(u32, 480), opts.size.?.height);
+}
+
+test "WindowGeometry: position null 契約（未対応/取得不能）" {
+    const geo: WindowGeometry = .{
+        .position = null,
+        .size = .{ .width = 780, .height = 600 },
+    };
+    try std.testing.expect(geo.position == null);
+    try std.testing.expectEqual(@as(u32, 780), geo.size.width);
+    try std.testing.expectEqual(@as(u32, 600), geo.size.height);
 }

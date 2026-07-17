@@ -209,6 +209,11 @@ pub const Window = struct {
 
         const screen = c.XDefaultScreen(dpy);
         const root = c.XRootWindow(dpy, screen);
+        // TASK-117: 明示位置は client origin（root 座標）。XCreate* の初期座標に渡し、
+        // さらに下で WM_NORMAL_HINTS（PPosition + StaticGravity）を立てて WM に同基準で
+        // 復元させる（reparenting WM の装飾幅ずれ / 位置無視を避ける）。
+        const init_x: c_int = if (opts.position) |p| p.x else 0;
+        const init_y: c_int = if (opts.position) |p| p.y else 0;
 
         var visual: ?*c.Visual = undefined;
         var depth: c_uint = undefined;
@@ -240,7 +245,7 @@ pub const Window = struct {
                 c.KeyPressMask | c.KeyReleaseMask |
                 c.ButtonPressMask | c.ButtonReleaseMask | c.PointerMotionMask;
             const valuemask: c_ulong = c.CWColormap | c.CWBorderPixel | c.CWBackPixel | c.CWEventMask;
-            win = c.XCreateWindow(dpy, root, 0, 0, @intCast(width), @intCast(height), 0, 32, c.InputOutput, vinfo.visual, valuemask, &attrs);
+            win = c.XCreateWindow(dpy, root, init_x, init_y, @intCast(width), @intCast(height), 0, 32, c.InputOutput, vinfo.visual, valuemask, &attrs);
             if (win == 0) return error.WindowCreationFailed; // ここまでで失敗 → 上の errdefer が colormap 解放
             // 32bit drawable には depth 一致の GC が要る（既定 GC は depth 24 で BadMatch になりうる）。
             gc = c.XCreateGC(dpy, win, 0, null) orelse {
@@ -255,7 +260,7 @@ pub const Window = struct {
             const black = c.XBlackPixel(dpy, screen);
             // §2.1: 既定 visual が TrueColor であることを要求（DirectColor 等は colormap 前提で非対応）
             if (visual.?.class != c.TrueColor) return error.WindowCreationFailed;
-            win = c.XCreateSimpleWindow(dpy, root, 0, 0, @intCast(width), @intCast(height), 0, black, black);
+            win = c.XCreateSimpleWindow(dpy, root, init_x, init_y, @intCast(width), @intCast(height), 0, black, black);
             gc = c.XDefaultGC(dpy, screen);
         }
         // 以降（setupBlit / alloc.create 等）の失敗で win/GC/colormap をまとめて解放（透過生成のリーク防止）。
@@ -284,10 +289,18 @@ pub const Window = struct {
             _ = c.XChangeProperty(dpy, win, net_wm_state, c.XA_ATOM, 32, c.PropModeReplace, @ptrCast(&fullscreen_atom), 1);
         } else {
             // resizable（TASK-23）。最小サイズだけ与え、max は与えない（自由リサイズ）。
+            // TASK-117: 明示位置時は PPosition + PWinGravity=StaticGravity を併記し、
+            // 保存（client origin / root 座標）と復元の基準を揃える。
             var hints = std.mem.zeroes(c.XSizeHints);
             hints.flags = c.PMinSize;
             hints.min_width = 1;
             hints.min_height = 1;
+            if (opts.position) |p| {
+                hints.flags |= c.PPosition | c.PWinGravity;
+                hints.x = p.x;
+                hints.y = p.y;
+                hints.win_gravity = c.StaticGravity;
+            }
             _ = c.XSetWMNormalHints(dpy, win, &hints);
         }
 
@@ -560,6 +573,22 @@ pub const Window = struct {
         return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
     }
 };
+
+/// 現在のウィンドウ geometry（TASK-117）。
+/// 位置は client origin の root 座標（XTranslateCoordinates）。失敗時は position=null。
+/// サイズは content（State.width/height）。復元側は WM_NORMAL_HINTS の StaticGravity で同基準。
+/// module-level（facade の `@hasDecl(backend, "getGeometry")` 契約。Window メソッド禁止）。
+pub fn getGeometry(win: Window) types.WindowGeometry {
+    const st = win.state;
+    var root_x: c_int = 0;
+    var root_y: c_int = 0;
+    var child: c.Window = undefined;
+    const ok = c.XTranslateCoordinates(st.display, st.window, c.XDefaultRootWindow(st.display), 0, 0, &root_x, &root_y, &child);
+    return .{
+        .position = if (ok != 0) .{ .x = root_x, .y = root_y } else null,
+        .size = .{ .width = st.width, .height = st.height },
+    };
+}
 
 /// CursorShape → X11 Cursor を生成する（失敗時は 0=None）。default/crosshair は標準カーソルフォント、
 /// hidden は透明 1x1 pixmap カーソル。

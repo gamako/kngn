@@ -1480,6 +1480,16 @@ pub const Window = struct {
     }
 };
 
+/// 現在のウィンドウ geometry（TASK-117）。Wayland は位置 API が無いため position=null、サイズのみ。
+/// module-level（facade の `@hasDecl(backend, "getGeometry")` 契約。Window メソッド禁止）。
+pub fn getGeometry(win: Window) types.WindowGeometry {
+    const st = win.state;
+    return .{
+        .position = null,
+        .size = .{ .width = st.width, .height = st.height },
+    };
+}
+
 // ---- system cursor（TASK-75.3）----
 // wl_cursor_theme / cursor_surface は遅延構築。default/crosshair は default theme の名前付きカーソル、
 // hidden は set_cursor(surface=null)。HiDPI(output scale) は M1 非対応（scale=1・size=24 固定）。

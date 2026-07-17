@@ -235,15 +235,20 @@ pub const Window = struct {
         return .{ .handle = w };
     }
 
-    /// 透過 / borderless オプション付きでウィンドウを作成する（TASK-104）。facade の
-    /// Window.createWithOptions が `@hasDecl` でこれを検出して使う。unknown flags は
+    /// 透過 / borderless / 初期位置オプション付きでウィンドウを作成する（TASK-104 / TASK-117）。
+    /// facade の Window.createWithOptions が `@hasDecl` でこれを検出して使う。unknown flags は
     /// C 側が NULL を返す（→ WindowCreationFailed）。透過は premultiplied alpha 前提。
     /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
         var flags: u32 = 0;
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
         if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
-        var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0 };
+        var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0, .x = 0, .y = 0 };
+        if (opts.position) |pos| {
+            copts.flags |= c.PLATFORM_WINDOW_POSITION;
+            copts.x = pos.x;
+            copts.y = pos.y;
+        }
         const w = c.platform_create_window_ex(
             @intCast(width),
             @intCast(height),
@@ -431,6 +436,34 @@ pub fn nativeMenuAvailable(win: Window) bool {
     _ = win;
     if (comptime !menu_c_abi) return false;
     return MenuC.platform_menu_available();
+}
+
+// ============================================================================
+// window geometry (TASK-117)
+// ============================================================================
+//
+// ホットパス宣言: ウィンドウ生成時 / 終了時 shutdown / harness digest 観測時のみ。
+//
+// ⚠ getGeometry も nativeMenuAvailable と同じく **module-level decl** 必須。
+// Window struct メソッドにすると facade の `@hasDecl(backend, "getGeometry")` が
+// silently false になり、常に 0x0/null を返す（TASK-97.3 と同型の配線バグ）。
+
+pub fn getGeometry(win: Window) types.WindowGeometry {
+    var geo: c.PlatformWindowGeometry = .{
+        .x = 0,
+        .y = 0,
+        .width = 0,
+        .height = 0,
+        .flags = 0,
+    };
+    c.platform_get_window_geometry(win.handle, &geo);
+    return .{
+        .position = if ((geo.flags & c.PLATFORM_GEOMETRY_POSITION_VALID) != 0)
+            .{ .x = geo.x, .y = geo.y }
+        else
+            null,
+        .size = .{ .width = geo.width, .height = geo.height },
+    };
 }
 
 pub fn registerMenu(win: Window, commands: []const Command) void {

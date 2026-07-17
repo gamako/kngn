@@ -46,20 +46,41 @@ void platform_enter_fullscreen(PlatformWindow* window);
 // performWindowDragWithEvent:）。詳細設計は docs/plans/transparent-window-plan.md。
 
 // ウィンドウ生成オプション（bit flags）。opts==NULL は既定（不透明・タイトル付き）と同義。
+// x/y は PLATFORM_WINDOW_POSITION が立っているときだけ参照する（未設定時は center 等の従来配置）。
 typedef struct PlatformWindowOptions {
     uint32_t flags;     // PLATFORM_WINDOW_* の OR
-    uint32_t reserved;  // 将来拡張用（0 埋め）
+    uint32_t reserved;  // 将来拡張用（0 埋め。非 0 は NULL）
+    int32_t x;          // OS 画面座標（TASK-117）
+    int32_t y;
 } PlatformWindowOptions;
 
 #define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // fb の alpha を honor（背後が透ける）
 #define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // タイトルバー・枠なし（borderless）
+#define PLATFORM_WINDOW_POSITION    (1u << 2)  // x/y を初期位置として適用（TASK-117）
+
+// 現在のウィンドウ geometry（TASK-117）。サイズは content/client、位置は OS 画面座標。
+// flags に PLATFORM_GEOMETRY_POSITION_VALID が無いとき x/y は未定義（位置非対応/取得不能）。
+typedef struct PlatformWindowGeometry {
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t flags; // PLATFORM_GEOMETRY_* の OR
+} PlatformWindowGeometry;
+
+#define PLATFORM_GEOMETRY_POSITION_VALID (1u << 0)
 
 // options 付きでウィンドウを作成する（既存 platform_create_window の拡張版）。
 // opts==NULL は既定動作（platform_create_window と同義）。unknown flags / reserved!=0 は
 // NULL を返す（silent 無視しない。facade 側で error.Unsupported に変換される）。
+// 関数シグネチャは不変。位置指定は PLATFORM_WINDOW_POSITION が立っている場合だけ参照する。
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts);
+
+// 現在のウィンドウ geometry を取得する（TASK-117）。window/out が NULL なら no-op。
+// 失敗時も out をゼロ埋めし、クラッシュしない（position は VALID 無し）。
+void platform_get_window_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
 
 // 表示中のウィンドウタイトルを更新する（イベント時のみ）。
 void platform_set_title(PlatformWindow* window, const char* title);

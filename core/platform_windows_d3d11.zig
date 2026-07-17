@@ -506,3 +506,8 @@ fn setMaxFrameLatency(device: *ID3D11Device) void {
     defer _ = dxgi_dev.lpVtbl.Release(dxgi_dev);
     _ = dxgi_dev.lpVtbl.SetMaximumFrameLatency(dxgi_dev, 1);
 }
+
+/// 現在のウィンドウ geometry（TASK-117）。module-level（facade `@hasDecl` 契約）。
+pub fn getGeometry(window: Window) @import("platform_types").WindowGeometry {
+    return window.core.getGeometry();
+}

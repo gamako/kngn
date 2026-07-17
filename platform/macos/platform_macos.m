@@ -1389,17 +1389,23 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
     return platform_create_window_ex(width, height, title, callback, userdata, NULL);
 }
 
-// TASK-104: options 付きウィンドウ作成。opts==NULL は従来動作。
+// TASK-104 / TASK-117: options 付きウィンドウ作成。opts==NULL は従来動作。
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts) {
     // unknown flags / reserved!=0 は NULL（silent 無視しない。facade が error.Unsupported へ）
-    BOOL transparent = NO, borderless = NO;
+    BOOL transparent = NO, borderless = NO, has_position = NO;
+    int pos_x = 0, pos_y = 0;
     if (opts) {
-        const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS;
+        const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS | PLATFORM_WINDOW_POSITION;
         if ((opts->flags & ~known) != 0 || opts->reserved != 0) return NULL;
         transparent = (opts->flags & PLATFORM_WINDOW_TRANSPARENT) != 0;
         borderless = (opts->flags & PLATFORM_WINDOW_BORDERLESS) != 0;
+        if ((opts->flags & PLATFORM_WINDOW_POSITION) != 0) {
+            has_position = YES;
+            pos_x = opts->x;
+            pos_y = opts->y;
+        }
     }
 
     PlatformWindow* platformWindow = (PlatformWindow*)malloc(sizeof(PlatformWindow));
@@ -1468,8 +1474,12 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         // setContentView 後に updateTrackingAreas を呼ぶ (view の bounds が確定したタイミングで TrackingArea を構築)
         [platformWindow->view updateTrackingAreas];
 
-        // ウィンドウを表示
-        [platformWindow->window center];
+        // ウィンドウを表示（TASK-117: 明示位置があれば setFrameOrigin、なければ center）
+        if (has_position) {
+            [platformWindow->window setFrameOrigin:NSMakePoint(pos_x, pos_y)];
+        } else {
+            [platformWindow->window center];
+        }
         [platformWindow->window makeKeyAndOrderFront:nil];
         // IME: view を first responder にして inputContext / interpretKeyEvents が効くようにする（TASK-79.6.1）
         [platformWindow->window makeFirstResponder:platformWindow->view];
@@ -1485,6 +1495,27 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
 #endif
 
     return platformWindow;
+}
+
+// TASK-117: 現在のウィンドウ geometry。位置=frame.origin、サイズ=content サイズ。
+void platform_get_window_geometry(PlatformWindow* platformWindow, PlatformWindowGeometry* out) {
+    if (!out) return;
+    out->x = 0;
+    out->y = 0;
+    out->width = 0;
+    out->height = 0;
+    out->flags = 0;
+    if (!platformWindow || !platformWindow->window) return;
+    @autoreleasepool {
+        NSWindow* w = platformWindow->window;
+        NSRect frame = [w frame];
+        NSRect content = [w contentRectForFrameRect:frame];
+        out->x = (int32_t)frame.origin.x;
+        out->y = (int32_t)frame.origin.y;
+        out->width = (uint32_t)lround(content.size.width);
+        out->height = (uint32_t)lround(content.size.height);
+        out->flags = PLATFORM_GEOMETRY_POSITION_VALID;
+    }
 }
 
 // 表示中のウィンドウタイトルを更新する（イベント時のみ）。
