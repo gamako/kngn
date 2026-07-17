@@ -522,8 +522,9 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
 // - 文字列は UTF-8 NUL 終端で**呼び出し中のみ有効**（backend が copy する）。
 // - 階層は MVP ではトップメニュー 1 段 + 項目のみ（submenu なし。separator は kind で表現）。
 // - メニューバーはアプリ単位のため window 引数は無視し、最後の登録が全体を差し替える。
-// - 実装は macOS objc backend のみ。`#if defined(VP_ENABLE_MENU)` 条件コンパイル
-//   （TASK-80.2 gamepad opt-in と同型）。非使用 exe はメニューシンボル参照ゼロ。
+// - 実装は macOS objc/swift/metal backend。`#if defined(VP_ENABLE_MENU)` 条件コンパイル
+//   （TASK-80.2 gamepad opt-in と同型。共有 TU は platform_macos_menu.m。TASK-122）。
+//   非使用 exe はメニューシンボル参照ゼロ。
 
 #define PLATFORM_MENU_KIND_NORMAL    0
 #define PLATFORM_MENU_KIND_SEPARATOR 1
@@ -539,7 +540,7 @@ typedef struct PlatformMenuItem {
     uint8_t checked;           // 0/1（トグル項目）
 } PlatformMenuItem;
 
-// このビルドで native メニューが利用可能か（VP_ENABLE_MENU かつ objc 実装あり）。
+// このビルドで native メニューが利用可能か（VP_ENABLE_MENU かつ macOS native 実装あり）。
 bool platform_menu_available(void);
 
 // メニューバーを items[0..count) で差し替える（最後の登録が全体）。window は契約上無視。

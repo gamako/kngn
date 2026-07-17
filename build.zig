@@ -2106,7 +2106,8 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.harness.mod,
         .{ .enable_gamepad = true },
     ) };
-    // native メニュー opt-in 有効版。pixie 専用（TASK-97.3）。build_options が異なるため別 Module。
+    // native メニュー opt-in 有効版。pixie 専用（TASK-97.3/122。macOS objc/swift/metal 共通）。
+    // build_options が異なるため別 Module。
     const platform_menu_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
         target,
@@ -2690,7 +2691,8 @@ fn addPixieExe(
         }),
     });
     // apps は kit-only 消費者（R5）。paint は「エディタ族の共有 lib」（kit 非収録・流動）で直 import。
-    // native メニュー opt-in（TASK-97.3）: kit_menu（enable_menu=true）+ -DVP_ENABLE_MENU。
+    // native メニュー opt-in（TASK-97.3/122）: kit_menu（enable_menu=true）+ 共有 menu.m（-DVP_ENABLE_MENU）。
+    // macOS objc/swift/metal 共通。enable_menu 既定 false は変更しない。
     const root = appRoot(exe, "pixie");
     link(root, pm.kit_menu);
     link(root, common.paint);
@@ -2944,7 +2946,9 @@ fn addPlatformNativeLib(
         .optimize = optimize,
         .link_libc = true,
     });
-    lib_mod.addObjectFile(compiled.obj_file);
+    for (compiled.obj_files) |obj| {
+        lib_mod.addObjectFile(obj);
+    }
     // framework / Swift ランタイム / framework・library 検索パスは static lib ビルド時に
     // 解決できず（`unable to find framework` になる）、検索パスは consumer へ伝播もしない。
     // よってここは .o を archive することに徹し、リンク設定は consumer の exe 側で適用する
@@ -2955,7 +2959,9 @@ fn addPlatformNativeLib(
         .linkage = .static,
         .root_module = lib_mod,
     });
-    lib.step.dependOn(&compiled.compile_step.step);
+    for (compiled.compile_steps) |step| {
+        lib.step.dependOn(&step.step);
+    }
     // consumer の @cImport("platform.h") 用に header を install（linkLibrary の
     // installed-headers-include-tree 経路の健全性も確保）。
     lib.installHeader(b.path("platform/platform.h"), "platform.h");

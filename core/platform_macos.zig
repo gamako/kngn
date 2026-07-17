@@ -19,9 +19,11 @@ const c = @cImport({
 // native 実装（objc/swift/metal）が同名 symbol を提供する。
 extern fn platform_cancel_quit(window: *c.PlatformWindow) void;
 
-/// TASK-97.3: メニュー C symbol 参照は enable_menu かつ objc backend のときだけ。
-/// swift/metal は未実装（利用可否 false）。非使用 exe の undefined symbol を構造的に防ぐ。
-const menu_c_abi = build_options.enable_menu and std.mem.eql(u8, build_options.platform_backend, "objc");
+/// TASK-122: メニュー C symbol 参照は enable_menu かつ macOS native backend
+///（objc/swift/metal）のときだけ。非使用 exe の undefined symbol を構造的に防ぐ。
+const menu_c_abi = build_options.enable_menu and (std.mem.eql(u8, build_options.platform_backend, "objc") or
+    std.mem.eql(u8, build_options.platform_backend, "swift") or
+    std.mem.eql(u8, build_options.platform_backend, "metal"));
 
 const MenuC = if (menu_c_abi) struct {
     extern fn platform_menu_available() bool;

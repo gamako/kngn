@@ -248,10 +248,14 @@ pub fn setupExecutableForPlatform(
             const sdk = sdk_paths orelse @panic("macOS backend には SDK パスが必要です（build.zig の OS 分岐を確認）");
 
             const compiled = compilePlatformLayer(b, platform_type, optimize, platform_root, features);
-            exe.root_module.addObjectFile(compiled.obj_file);
+            for (compiled.obj_files) |obj| {
+                exe.root_module.addObjectFile(obj);
+            }
             exe.root_module.link_libc = true;
             exe.root_module.addIncludePath(platform_root);
-            exe.step.dependOn(&compiled.compile_step.step);
+            for (compiled.compile_steps) |step| {
+                exe.step.dependOn(&step.step);
+            }
 
             macos.linkMacOSFrameworks(b, exe, sdk, features.enable_gamepad);
 
@@ -356,8 +360,9 @@ pub const StandaloneSpec = struct {
     /// `-DVP_ENABLE_GAMEPAD` を渡して GameController framework をリンクする。既定 false
     /// （既存 standalone exe は不変）。opt-in するのは examples/22_gamepad のみ。
     link_gamepad: bool = false,
-    /// native メニュー（NSMenu。macOS objc のみ実装。TASK-97.3）。true なら
-    /// `build_options.enable_menu` + `-DVP_ENABLE_MENU`。既定 false。opt-in は pixie のみ。
+    /// native メニュー（NSMenu。macOS objc/swift/metal 共通。TASK-122）。true なら
+    /// `build_options.enable_menu` + 共有 `platform_macos_menu.m`（`-DVP_ENABLE_MENU`）。
+    /// 既定 false。opt-in は pixie のみ。
     link_menu: bool = false,
     /// png module（libs/png）。**呼び出し側が png を作って `extra` に png 依存モジュール（sprite/core 等）を
     /// 渡す場合は、その同じ png をここにも渡すこと**。harness（platform→harness→png）と extra 側で png module が
@@ -692,8 +697,10 @@ fn addStandaloneRunStep(b: *std.Build, name: []const u8, description: []const u8
 }
 
 pub const PlatformCompileResult = struct {
-    compile_step: *std.Build.Step.Run,
-    obj_file: std.Build.LazyPath,
+    /// backend 本体 +（enable_menu 時）共有 menu TU。1 つ以上。
+    compile_steps: []const *std.Build.Step.Run,
+    /// compile_steps と同順の .o。
+    obj_files: []const std.Build.LazyPath,
 };
 
 /// プラットフォーム層を `.o` にコンパイルする。
@@ -701,8 +708,9 @@ pub const PlatformCompileResult = struct {
 /// `platform_root` は `platform/` ディレクトリへの LazyPath。
 /// 親プロジェクトからは `b.path("platform")`、examples からは
 /// `b.path("../../platform")` を渡す。
-/// `features`: true のフラグだけ .o コンパイルに `-DVP_ENABLE_*` を渡す（TASK-80.2/97.3 opt-in）。
-/// .m ソース側は `#if defined(VP_ENABLE_GAMEPAD)` / `#if defined(VP_ENABLE_MENU)` で条件コンパイルする。
+/// `features`: true のフラグだけ .o コンパイルに `-DVP_ENABLE_*` を渡す（TASK-80.2/97.3/122 opt-in）。
+/// enable_menu=true のとき共有 `platform_macos_menu.m` を追加コンパイルして返す。
+/// .m/.swift ソース側は `#if defined(VP_ENABLE_GAMEPAD)` / `#if defined(VP_ENABLE_MENU)` で条件コンパイルする。
 pub fn compilePlatformLayer(
     b: *std.Build,
     platform_type: PlatformType,
@@ -720,6 +728,64 @@ pub fn compilePlatformLayer(
     };
 }
 
+fn objcOptFlag(optimize: std.builtin.OptimizeMode) []const u8 {
+    return switch (optimize) {
+        .Debug => "-O0",
+        .ReleaseSafe => "-O2",
+        .ReleaseFast => "-O3",
+        .ReleaseSmall => "-Os",
+    };
+}
+
+/// enable_menu 時だけ共有 menu TU をコンパイルする（TASK-122）。
+fn buildMenuObject(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+) struct { *std.Build.Step.Run, std.Build.LazyPath } {
+    const compile_cmd = b.addSystemCommand(&.{
+        "clang",
+        "-x",
+        "objective-c",
+    });
+    compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
+    compile_cmd.addArg("-DVP_ENABLE_MENU");
+    compile_cmd.addArgs(&.{
+        "-fobjc-arc",
+        objcOptFlag(optimize),
+        "-c",
+        "-o",
+    });
+    const obj_path = compile_cmd.addOutputFileArg("platform_macos_menu.o");
+    compile_cmd.addFileArg(platform_root.path(b, "macos/platform_macos_menu.m"));
+    return .{ compile_cmd, obj_path };
+}
+
+fn makeCompileResult(
+    b: *std.Build,
+    main_step: *std.Build.Step.Run,
+    main_obj: std.Build.LazyPath,
+    features: PlatformFeatures,
+    optimize: std.builtin.OptimizeMode,
+    platform_root: std.Build.LazyPath,
+) PlatformCompileResult {
+    if (!features.enable_menu) {
+        const steps = b.allocator.alloc(*std.Build.Step.Run, 1) catch @panic("OOM");
+        steps[0] = main_step;
+        const objs = b.allocator.alloc(std.Build.LazyPath, 1) catch @panic("OOM");
+        objs[0] = main_obj;
+        return .{ .compile_steps = steps, .obj_files = objs };
+    }
+    const menu = buildMenuObject(b, optimize, platform_root);
+    const steps = b.allocator.alloc(*std.Build.Step.Run, 2) catch @panic("OOM");
+    steps[0] = main_step;
+    steps[1] = menu[0];
+    const objs = b.allocator.alloc(std.Build.LazyPath, 2) catch @panic("OOM");
+    objs[0] = main_obj;
+    objs[1] = menu[1];
+    return .{ .compile_steps = steps, .obj_files = objs };
+}
+
 fn buildObjC(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
@@ -734,22 +800,18 @@ fn buildObjC(
     compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
     // ゲームパッド opt-in（TASK-80.2）。platform_macos.m の `#if defined(VP_ENABLE_GAMEPAD)` を有効化する。
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
-    // native メニュー opt-in（TASK-97.3）。platform_macos.m の `#if defined(VP_ENABLE_MENU)` を有効化する。
+    // native メニュー opt-in（TASK-97.3/122）。bridge + poll 消費に `-DVP_ENABLE_MENU`。
+    // NSMenu 本体は共有 platform_macos_menu.m（makeCompileResult が追加）。
     if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
     compile_cmd.addArgs(&.{
         "-fobjc-arc",
-        switch (optimize) {
-            .Debug => "-O0",
-            .ReleaseSafe => "-O2",
-            .ReleaseFast => "-O3",
-            .ReleaseSmall => "-Os",
-        },
+        objcOptFlag(optimize),
         "-c",
         "-o",
     });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_objc.o");
     compile_cmd.addFileArg(platform_root.path(b, "macos/platform_macos.m"));
-    return .{ .compile_step = compile_cmd, .obj_file = obj_path };
+    return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
 }
 
 fn buildSwift(
@@ -778,14 +840,14 @@ fn buildSwift(
     // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く
     // （後に置くと `-import-objc-header` が `-DVP_ENABLE_GAMEPAD` を誤って path として消費してしまう）。
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
-    // menu は objc のみ実装。swift へ -DVP_ENABLE_MENU を渡しても no-op（メニューコード無し）。
+    // native メニュー opt-in（TASK-122）。bridge + poll 消費。本体は共有 menu.m。
     if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
     compile_cmd.addFileArg(platform_root.path(b, "macos-swift/platform_macos.swift"));
-    return .{ .compile_step = compile_cmd, .obj_file = obj_path };
+    return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
 }
 
 fn buildMetal(
@@ -815,11 +877,12 @@ fn buildMetal(
     // ゲームパッド opt-in（TASK-80.2）。platform_macos_metal.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
     // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く。
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
+    // native メニュー opt-in（TASK-122）。bridge + poll 消費。本体は共有 menu.m。
     if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");
     compile_cmd.addFileArg(platform_root.path(b, "macos-metal/platform_macos_metal.swift"));
-    return .{ .compile_step = compile_cmd, .obj_file = obj_path };
+    return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
 }

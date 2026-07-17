@@ -444,6 +444,32 @@ func gamepadDetachWindow(_ handle: PlatformWindowHandle) {
 }
 #endif // VP_ENABLE_GAMEPAD
 
+// ========================================
+// native メニュー bridge (TASK-122)
+// ========================================
+//
+// 共有 platform_macos_menu.m が NSMenu 本体を持ち、本 backend は EventQueue への
+// MENU_COMMAND 積込みと keyEquivalent 消費判定の呼び出しだけを担う。
+#if VP_ENABLE_MENU
+
+@_silgen_name("platform_menu_consume_key_equivalent")
+func platform_menu_consume_key_equivalent(_ ns_event: UnsafeMutableRawPointer?) -> Bool
+
+@_silgen_name("platform_menu_window_will_destroy")
+func platform_menu_window_will_destroy(_ window: UnsafeMutableRawPointer?)
+
+@_cdecl("platform_menu_enqueue_command")
+func platform_menu_enqueue_command(_ window: UnsafeMutableRawPointer?, _ command_id: UInt32) {
+    guard let window = window else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(window).takeUnretainedValue()
+    var ev = PlatformEvent()
+    ev.type = PLATFORM_EVENT_MENU_COMMAND
+    ev.payload.menu.command_id = command_id
+    _ = handle.event_queue.push(ev)
+}
+
+#endif // VP_ENABLE_MENU
+
 // composition preedit 固定バッファ容量（UTF-8。TASK-79.6.1）
 private let compositionUtf8Cap = 1024
 
@@ -1460,6 +1486,11 @@ func platform_run(platformWindow: UnsafeMutableRawPointer?) -> Void {
 func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
 
+    #if VP_ENABLE_MENU
+    // menu: 解放前に配送先を外し、遅延 MenuTarget action の UAF を防ぐ (TASK-122 r2)
+    platform_menu_window_will_destroy(platformWindow)
+    #endif
+
     // ハンドルからPlatformWindowHandleを復元してリリース
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeRetainedValue()
     #if VP_ENABLE_GAMEPAD
@@ -1506,6 +1537,16 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
         // キーボードイベントをイベントキューに追加
         if event.type == .keyDown || event.type == .keyUp {
+            #if VP_ENABLE_MENU
+            // TASK-97.3 AC#2 / TASK-122: keyEquivalent 二重発火防止。
+            // 共有 menu TU へ performKeyEquivalent を委譲し、消費時は key_down を積まず
+            // inputContext にも渡さない（objc と同意味論）。
+            if event.type == .keyDown {
+                if platform_menu_consume_key_equivalent(Unmanaged.passUnretained(event).toOpaque()) {
+                    continue
+                }
+            }
+            #endif
             var platform_event = PlatformEvent()
             platform_event.type = (event.type == .keyDown) ? PLATFORM_EVENT_KEY_DOWN : PLATFORM_EVENT_KEY_UP
             platform_event.payload.keyboard.key = mapKeyCodeToPlatform(event.keyCode)
