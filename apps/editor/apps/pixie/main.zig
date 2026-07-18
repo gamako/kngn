@@ -1423,6 +1423,24 @@ const App = struct {
         return .done;
     }
 
+    /// デコード済み PNG を指定 layer へ左上クロップ/パディングで書き込み、preview と cel へ同期する。
+    /// undo push は一切しない（呼び出し側が `.layer_add` 等の Op 単位を決める）。
+    /// canvas / PNG は canonical BGRA 0xAARRGGBB 同一レイアウトなので変換不要。
+    fn copyDecodedPngToLayer(self: *App, layer_idx: usize, img: *const png.PNGImage) void {
+        const layer = self.canvas.layerPixels(layer_idx);
+        @memset(layer, 0);
+        const iw: usize = img.width;
+        const rows = @min(@as(usize, img.height), @as(usize, CANVAS_H));
+        const cols = @min(iw, @as(usize, CANVAS_W));
+        for (0..rows) |y| {
+            @memcpy(layer[y * CANVAS_W ..][0..cols], img.pixels[y * iw ..][0..cols]);
+        }
+        self.syncPreviewCanvas();
+        // active_view は cel のコピー。saveDocument は cel_pool を直列化するため、
+        // layer 直書き後に cel へ書き戻す（TASK-95。undo Op は呼び出し側の責務）。
+        self.doc.commitActiveLayerToCel(self.gpa, layer_idx);
+    }
+
     /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
     /// 進行中 stroke 中は破棄。undo/redo はクリアし、current_path を開いたファイルに更新。
     /// 指定パスから直接読み込む（ダイアログ不使用。`doOpen` の共通実装 + action `open <path>` 用）。
@@ -1440,35 +1458,35 @@ const App = struct {
 
         // PNG はフラット形式として読み込み、layer0 だけの新規ドキュメントへ置き換える。
         self.resetCanvasToSingleLayer();
-
-        // 左上クロップ/パディング: layer0 を透明クリアし、収まる範囲を行ごとに memcpy。
-        // png の出力は canonical BGRA 0xAARRGGBB で canvas と同一レイアウトなので変換不要。
-        const layer0 = self.canvas.layerPixels(0);
-        @memset(layer0, 0);
-        const iw: usize = img.width;
-        const rows = @min(@as(usize, img.height), @as(usize, CANVAS_H));
-        const cols = @min(iw, @as(usize, CANVAS_W));
-        for (0..rows) |y| {
-            @memcpy(layer0[y * CANVAS_W ..][0..cols], img.pixels[y * iw ..][0..cols]);
-        }
-        self.syncPreviewCanvas();
-        // active_view は cel のコピー。saveDocument は cel_pool を直列化するため、
-        // layer0 直書き後に cel へ書き戻す（TASK-95。undo Op は reset 済みで不要）。
         // selected_frame は resetToSingleBlankLayer で 0 に確定済み。
-        self.doc.commitActiveLayerToCel(self.gpa, 0);
-
-        // load はドキュメント差し替えなので undo/redo 履歴を破棄（recorder は stroke 非進行中）。
-        // `resetCanvasToSingleLayer`（= `doc.resetToSingleBlankLayer`）が既に doc.undo を
-        // リセット済みなので、ここで重複して行う必要はない（TASK-45.1）。
+        // load はドキュメント差し替えなので undo 不要（reset が doc.undo を破棄済み。TASK-45.1）。
+        self.copyDecodedPngToLayer(0, &img);
 
         if (self.current_path) |old| self.gpa.free(old);
         self.current_path = owned;
         self.setSaveMsg("Loaded: {s}", .{std.fs.path.basename(path)});
     }
 
-    /// OS / harness の file drop を消費する（TASK-113.4）。
-    /// PNG のみ `doOpenPath` へ直結。.pix / その他拡張子は拒否。netsync 中は I/O せず reject。
-    /// ホットパス: イベント時のみ。
+    /// 現ドキュメントへ PNG を新レイヤーとして挿入する（TASK-134）。
+    /// decode 先行（失敗時は document 不変）。`doAddLayer` が push する `.layer_add` 1 件を undo 単位にし、
+    /// 画素は cel へ同期してから返す（undo で layer 構造 + 画素を一体除去）。`pushPaintOp` は呼ばない。
+    /// `current_path` は変更しない。ホットパス: イベント時のみ。
+    fn doImportPngAsLayer(self: *App, path: []const u8) !void {
+        // 不変条件: decode 失敗時は document を一切変更しない。
+        var img = try png.decodePNGFile(self.io, self.gpa, path);
+        defer img.deinit(self.gpa);
+
+        _ = try self.doAddLayer();
+        // doAddLayer → Document.addLayer が新 layer を選択する（Canvas.insertLayer 経由で
+        // canvas.selected_layer も同期済み）。
+        const layer_idx = self.canvas.selected_layer;
+        self.copyDecodedPngToLayer(layer_idx, &img);
+        self.setSaveMsg("Inserted: {s}", .{std.fs.path.basename(path)});
+    }
+
+    /// OS / harness の file drop を消費する（TASK-113.4 / TASK-134）。
+    /// PNG のみ `doImportPngAsLayer` へ直結（現ドキュメントへ新レイヤー挿入。.pix / その他は拒否）。
+    /// netsync 中は I/O せず reject。ホットパス: イベント時のみ。
     fn handleFileDrop(self: *App, drop: platform.FileDropEvent) void {
         if (drop.count != 1) return;
         const path = drop.paths[0].slice();
@@ -1483,8 +1501,8 @@ const App = struct {
             self.setSaveMsg("netsync: open を送信できませんでした（RejectedWhileSynced）", .{});
             return;
         }
-        self.doOpenPath(path) catch |err| {
-            self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
+        self.doImportPngAsLayer(path) catch |err| {
+            self.setSaveMsg("Import failed: {s}", .{@errorName(err)});
         };
     }
 
