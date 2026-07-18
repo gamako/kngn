@@ -1,70 +1,73 @@
-# TASK-111.9 E2E: 統合ミニゲーム capstone
+# TASK-111.9 / TASK-137 E2E: 統合ミニゲーム capstone（登坂プレイアビリティ）
 # 前提: 640×360 / FixedTimeStep 60Hz / harness 仮想クロック / objc
 # CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取。
 # snapshot fb は path 省略 → $VP_HARNESS_OUT/frame_<n>.png
-# audio: silent=0 のみ（onsets は live smoke で検証。付記 1）
+# audio: silent=0 のみ（onsets は live smoke で検証）
+# 足場（TASK-137）: 床 top=336(y=322) / P1 top=272(y=258) / P2 top=208(y=194) / P3 top=144(y=130)。
+# JUMP_V=-8.0。左→右の階段状足場を弧ジャンプで1段ずつ登る（step 数は着地に十分な余裕を持たせる）。
 
 # 初期状態: 空中から落下
 step 1
-digest game
 assert game grounded=0
 expect game state=falling
 
-# 着地
+# 床へ着地
 step 40
-digest game
 assert game grounded=1
 expect game y=322.000
 snapshot fb
 digest fb
-expect fb crc=A3D8BC65
+expect fb crc=BF6186EB
 
-# 水平移動とカメラ追従
+# 右移動 → 床コイン取得（score>0）
 inject key_down RIGHT
-step 110
-digest game
-expect game x>300.0
-expect game cam_x>0.0
+step 66
+assert game grounded=1
 expect game score>0
 
-# ジャンプ
+# jump1 → 第1足場 P1 に着地（足場到達 AC）
 inject key_down SPACE
 step 1
-digest game
-assert game jump_count=1
-assert game grounded=0
-expect game state=jumping
-expect game y<322.0
-digest audio
-expect audio silent=0
-snapshot fb
-digest fb
-expect fb crc=FB560C38
-
-# Space 解放後も右移動を継続
 inject key_up SPACE
-step 20
-digest game
-expect game y<322.0
-expect game state!=grounded
-
-# 着地と着地 SE
-step 20
-digest game
-assert game landing_count>0
+step 34
 assert game grounded=1
+expect game y=258.000
 expect game state=grounded
 digest audio
 expect audio silent=0
+snapshot fb
+digest fb
+expect fb crc=633CAEB5
 
-# BGM がループし続けることを確認
-step 80
-digest game
+# P1 上を右へ → jump2 → 第2足場 P2 に着地
+step 26
+inject key_down SPACE
+step 1
+inject key_up SPACE
+step 34
+assert game grounded=1
+expect game y=194.000
+
+# P2 上を右へ → jump3 → 第3足場 P3（上段）に着地
+step 42
+inject key_down SPACE
+step 1
+inject key_up SPACE
+step 34
+assert game grounded=1
+expect game y=130.000
+expect game cam_x>0.0
+
+# P3 上を右へ → 頂上コイン取得（score が 300 まで伸びる = 全コイン回収で登坂完遂）
+step 18
+assert game grounded=1
+expect game score>200
+assert game jump_count=3
+assert game landing_count=4
 assert game bgm=1
 digest audio
 expect audio silent=0
-
 snapshot fb
 digest fb
-expect fb crc=D899F470
+expect fb crc=6032827C
 quit

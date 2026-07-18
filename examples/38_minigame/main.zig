@@ -39,7 +39,7 @@ const PLAYER_H: f32 = 14;
 const MOVE_SPEED: f32 = 2.5;
 const GRAVITY: f32 = 0.35;
 const MAX_FALL: f32 = 6.0;
-const JUMP_V: f32 = -5.5;
+const JUMP_V: f32 = -8.0;
 
 const COIN_W: f32 = 12;
 const COIN_H: f32 = 8;
@@ -186,14 +186,16 @@ pub fn main() !void {
     var cam = gfx.Camera.init(.{ .x = 0, .y = 0 }, 1);
     cam.clampToWorld(viewport, world_bounds);
 
-    // コイン: bottom = 足場/床 top、x は足場 world 範囲内（付記 2 で座標修正）
-    // 床 top y=336 / 第1足場 (256..415) top=272 / 第2足場 (528..687) top=208
+    // コイン: bottom = 足場/床 top、x は足場 world 範囲内。登坂の導線として床→P1→P3 に配置する
+    // （TASK-137）。床 top y=336 / P1 top=272 (world256..416) / P3 top=144 (world640..784)。
+    // coin1(床) は段差右の離陸ゾーン(world208..256)に置き、初期右移動での得点源にする
+    // （e2e の score>0 assert を支える）。coin2=P1 上・coin3=P3 上（頂上報酬）。
     var game = Game{
         .body = .{ .x = 64, .y = 160, .w = PLAYER_W, .h = PLAYER_H },
         .coins = .{
-            .{ .rect = .{ .x = 320, .y = 328, .w = COIN_W, .h = COIN_H } },
-            .{ .rect = .{ .x = 336, .y = 264, .w = COIN_W, .h = COIN_H } },
-            .{ .rect = .{ .x = 600, .y = 200, .w = COIN_W, .h = COIN_H } },
+            .{ .rect = .{ .x = 220, .y = 328, .w = COIN_W, .h = COIN_H } },
+            .{ .rect = .{ .x = 330, .y = 264, .w = COIN_W, .h = COIN_H } },
+            .{ .rect = .{ .x = 700, .y = 136, .w = COIN_W, .h = COIN_H } },
         },
     };
 
@@ -679,13 +681,18 @@ fn buildMapTiles() [MAP_W * MAP_H]u16 {
         setTile(&tiles, x, 18, 1);
     }
 
-    // 浮遊足場
+    // 浮遊足場（TASK-137: 左→右へ登る階段状。真上重なりを避け横ギャップ ≈2〜3 タイルにして
+    // 弧を描くジャンプで1段ずつ乗れるようにする。resolveAabb は上昇中に天井 tile へ当たると
+    // hit_ceiling で止まるため、足場は真上でなく横へずらして配置する。縦は各4タイル=64px。
+    // 段差 overhang(x9..12) の右に離陸スペースを残すため P1 は x16 始まり。
+    // P1 row17(top272) x16..25 world256..416 / P2 row13(top208) x28..37 world448..592
+    // / P3 row9(top144) x40..49 world640..784。
     x = 16;
     while (x <= 25) : (x += 1) setTile(&tiles, x, 17, 2);
-    x = 33;
-    while (x <= 42) : (x += 1) setTile(&tiles, x, 13, 2);
-    x = 51;
-    while (x <= 60) : (x += 1) setTile(&tiles, x, 9, 2);
+    x = 28;
+    while (x <= 37) : (x += 1) setTile(&tiles, x, 13, 2);
+    x = 40;
+    while (x <= 49) : (x += 1) setTile(&tiles, x, 9, 2);
 
     return tiles;
 }
