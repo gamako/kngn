@@ -831,12 +831,14 @@ fn buildSwift(
         "-disable-autolinking-runtime-compatibility",
         "-disable-autolinking-runtime-compatibility-concurrency",
         "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+        // TASK-140: 共有+backend の 2 .swift を単一 .o にまとめる（-c -o は複数入力で複数出力になるため WMO 必須）。
+        "-whole-module-optimization",
         "-framework",
         "Cocoa",
         "-framework",
         "QuartzCore",
     });
-    // ゲームパッド opt-in（TASK-80.2）。platform_macos.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
+    // ゲームパッド opt-in（TASK-80.2）。共有 platform_macos_shared.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
     // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く
     // （後に置くと `-import-objc-header` が `-DVP_ENABLE_GAMEPAD` を誤って path として消費してしまう）。
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
@@ -846,7 +848,9 @@ fn buildSwift(
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
-    compile_cmd.addFileArg(platform_root.path(b, "macos-swift/platform_macos.swift"));
+    // TASK-140: 共有 .swift と backend 固有 .swift を同一 swiftc 呼び出しでコンパイル（1 .o）。
+    compile_cmd.addFileArg(platform_root.path(b, "macos-shared/platform_macos_shared.swift"));
+    compile_cmd.addFileArg(platform_root.path(b, "macos-swift/platform_macos_swift.swift"));
     return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
 }
 
@@ -867,6 +871,8 @@ fn buildMetal(
         "-disable-autolinking-runtime-compatibility",
         "-disable-autolinking-runtime-compatibility-concurrency",
         "-disable-autolinking-runtime-compatibility-dynamic-replacements",
+        // TASK-140: 共有+backend の 2 .swift を単一 .o にまとめる（-c -o は複数入力で複数出力になるため WMO 必須）。
+        "-whole-module-optimization",
         "-framework",
         "Cocoa",
         "-framework",
@@ -874,7 +880,7 @@ fn buildMetal(
         "-framework",
         "MetalKit",
     });
-    // ゲームパッド opt-in（TASK-80.2）。platform_macos_metal.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
+    // ゲームパッド opt-in（TASK-80.2）。共有 platform_macos_shared.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
     // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く。
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
     // native メニュー opt-in（TASK-122）。bridge + poll 消費。本体は共有 menu.m。
@@ -883,6 +889,8 @@ fn buildMetal(
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");
+    // TASK-140: 共有 .swift と backend 固有 .swift を同一 swiftc 呼び出しでコンパイル（1 .o）。
+    compile_cmd.addFileArg(platform_root.path(b, "macos-shared/platform_macos_shared.swift"));
     compile_cmd.addFileArg(platform_root.path(b, "macos-metal/platform_macos_metal.swift"));
     return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
 }

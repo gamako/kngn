@@ -13,8 +13,9 @@ video-proto-main/
 ├── platform/           # macOS のネイティブ実装（C ABI。platform.h + 各実装）
 │   ├── platform.h     # プリミティブAPI定義（C ABI。内部実装用）
 │   ├── macos/         # Objective-C実装（CALayer）
-│   ├── macos-swift/   # Swift実装（CADisplayLink）
-│   └── macos-metal/   # Metal実装（GPU）
+│   ├── macos-shared/  # swift/metal 共有実装（EventQueue/入力/IME/window C ABI/@_cdecl。TASK-140）
+│   ├── macos-swift/   # Swift実装（CADisplayLink + CALayer present のみ）
+│   └── macos-metal/   # Metal実装（GPU renderer + drawable present のみ）
 ├── core/              # L1 薄い base（platform に依存 / libs に依存しない）。ADR-007 R1
 │   ├── platform.zig   # platform facade（builtin.os.tag で backend を分岐）
 │   ├── platform_types.zig      # 共有型（KeyCode / Event 等の単一ソース。type-only module）
@@ -165,7 +166,7 @@ clone 後にリンクが壊れた場合は `cd examples/<NAME> && ln -sf ../../b
 | 実装            | ファイル                                          | レンダリング  | 状態                  |
 | --------------- | ------------------------------------------------- | ------------- | --------------------- |
 | **Objective-C** | `platform/macos/platform_macos.m`                 | CALayer       | ✅ 完全動作           |
-| **Swift**       | `platform/macos-swift/platform_macos.swift`       | CADisplayLink | ✅ 完全動作           |
+| **Swift**       | `platform/macos-swift/platform_macos_swift.swift`（共通部は `platform/macos-shared/platform_macos_shared.swift`。TASK-140） | CADisplayLink | ✅ 完全動作           |
 | **Metal**       | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU     | ✅ 1級 frame pacing 対応（TASK-36） |
 | **X11 (Linux)** | `core/platform_linux_x11.zig`（純 Zig / Xlib 直接）  | XShm/XPutImage | ✅ window+blit+入力（TASK-28.2/28.3） |
 | **Wayland (Linux)** | `core/platform_linux_wayland.zig`（純 Zig / wl_shm 直接）  | wl_shm (xdg-shell) | ✅ window+blit+入力（TASK-28.5。Linux 実機検証済み） |
