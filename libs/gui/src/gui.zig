@@ -104,6 +104,20 @@ pub const TextInputOpts = @import("widgets.zig").TextInputOpts;
 pub const TextInputResult = @import("widgets.zig").TextInputResult;
 pub const textInputId = @import("widgets.zig").textInputId;
 
+// PanelHost — dock-slot パネルシステム（TASK-147）。
+pub const PanelHost = @import("panel_host.zig").PanelHost;
+pub const Panel = @import("panel_host.zig").Panel;
+pub const PanelBuildFn = @import("panel_host.zig").PanelBuildFn;
+pub const Slot = @import("panel_host.zig").Slot;
+pub const SlotOptions = @import("panel_host.zig").SlotOptions;
+pub const Options = @import("panel_host.zig").Options;
+pub const Hit = @import("panel_host.zig").Hit;
+pub const PersistSlotField = @import("panel_host.zig").PersistSlotField;
+pub const PersistPanelField = @import("panel_host.zig").PersistPanelField;
+pub const PersistKey = @import("panel_host.zig").PersistKey;
+pub const PersistValue = @import("panel_host.zig").PersistValue;
+pub const Persistence = @import("panel_host.zig").Persistence;
+
 // 16-step grid（純幾何/描画 + Flex row widget。TASK-105.1）。
 pub const stepgrid = @import("context.zig").stepgrid;
 
@@ -158,4 +172,5 @@ test {
     _ = @import("popup.zig");
     _ = @import("menu.zig");
     _ = @import("stepgrid.zig");
+    _ = @import("panel_host.zig");
 }
