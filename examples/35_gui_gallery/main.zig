@@ -36,16 +36,26 @@ const SectionMeta = struct {
 };
 
 const SECTIONS = [_]SectionMeta{
-    .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = 14 },
+    .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = 13 },
     .{ .name = "basic", .detail = "button / label", .widgets = 2, .missing = 0 },
     .{ .name = "text", .detail = "selectableLabel / textInputId", .widgets = 2, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
-    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip", .widgets = 4, .missing = 0 },
+    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible", .widgets = 5, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
-    .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 14, .missing = 14 },
+    .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 13, .missing = 13 },
 };
+
+/// overview 表示用: demo section（overview/missing 以外）の widgets 合計。
+fn semanticWidgetTotal() u32 {
+    var n: u32 = 0;
+    for (SECTIONS) |s| {
+        if (std.mem.eql(u8, s.name, "overview") or std.mem.eql(u8, s.name, "missing")) continue;
+        n += s.widgets;
+    }
+    return n;
+}
 
 const MatrixRow = struct {
     name: []const u8,
@@ -76,6 +86,7 @@ const LAYOUT_MATRIX = [_]MatrixRow{
     .{ .name = "scrollArea", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
     .{ .name = "iconButton", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
     .{ .name = "tooltip", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
+    .{ .name = "collapsible", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
 };
 const MENUS_MATRIX = [_]MatrixRow{
     .{ .name = "popup/ctx", .cells = .{ "ok", "ok", "ok", "N/A", "item", "N/A", "N/A", "N/A", "ok" } },
@@ -87,7 +98,6 @@ const STEPGRID_MATRIX = [_]MatrixRow{
 
 const MissingEntry = struct { name: []const u8, target: []const u8 };
 const MISSING = [_]MissingEntry{
-    .{ .name = "Accordion", .target = "121.3" },
     .{ .name = "Alert / Message Dialog", .target = "121.2" },
     .{ .name = "Breadcrumb", .target = "121.3" },
     .{ .name = "Carousel", .target = "Phase 2" },
@@ -122,6 +132,8 @@ const Ids = struct {
     const scroll: gui.Id = 0x3541;
     const icon_pen: gui.Id = 0x3542;
     const icon_brush: gui.Id = 0x3543;
+    const collapsible: gui.Id = 0x3544;
+    const collapsible_child: gui.Id = 0x3545;
     const popup_trigger: gui.Id = 0x3550;
     const popup: gui.Id = 0x3551;
     const grid: gui.Id = 0x3560;
@@ -202,6 +214,7 @@ const App = struct {
     value: f32 = 0.8,
     splitter_size: i32 = 250,
     scroll: gui.Vec2f = .{},
+    collapsible_open: bool = false,
     menu: gui.MenuBarState = .{},
     text: *gui.TextBuffer,
     // Cmd+V のフレームローカル paste（TASK-120 consumer 配線。event loop で set・frame 先頭で clear）
@@ -245,6 +258,8 @@ const App = struct {
             Ids.splitter => "splitter",
             Ids.scroll => "scrollArea",
             Ids.icon_pen, Ids.icon_brush => "iconButton",
+            Ids.collapsible => "collapsible",
+            Ids.collapsible_child => "button",
             Ids.popup_trigger, Ids.popup => "popup",
             else => if (self.current() == .menus) "menuBar" else "none",
         };
@@ -346,8 +361,10 @@ fn renderOverview(ctx: *gui.Context) void {
     ctx.label("Current implementation is normal + endpoint focused; demo cells are exercised by E2E.");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
-    ctx.label("Existing API: 16 semantic widgets");
-    ctx.label("Missing placeholders: 14");
+    var api_buf: [48]u8 = undefined;
+    ctx.label(std.fmt.bufPrint(&api_buf, "Existing API: {d} semantic widgets", .{semanticWidgetTotal()}) catch "Existing API: ?");
+    var miss_buf: [40]u8 = undefined;
+    ctx.label(std.fmt.bufPrint(&miss_buf, "Missing placeholders: {d}", .{MISSING.len}) catch "Missing placeholders: ?");
     ctx.label("Context: normal / demo / gaps");
     ctx.endBox();
     ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
@@ -406,9 +423,19 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     _ = ctx.iconButtonId(Ids.icon_pen, &ICON_PEN, true);
     ctx.tooltip("Pen (P)");
     _ = ctx.iconButtonId(Ids.icon_brush, &ICON_BRUSH, false);
-    ctx.tooltip("Brush (B) — long tooltip text for edge clamp demo");
+    ctx.tooltip("Brush (B) — long tooltip text for display check");
     ctx.labelEx("selected / normal + tooltip", ctx.style.text_subtle);
     ctx.endBox();
+
+    // Collapsible: dynamic title（ツール名連動）+ body child（open/closed で画面差）
+    var title_buf: [48]u8 = undefined;
+    const tool_name: []const u8 = if (app.radio_brush) "Brush" else "Pen";
+    const title = std.fmt.bufPrint(&title_buf, "Tool Options — {s}", .{tool_name}) catch "Tool Options";
+    if (ctx.beginCollapsible(Ids.collapsible, title, &app.collapsible_open)) {
+        ctx.label("body is built only while open");
+        if (ctx.buttonId(Ids.collapsible_child, "Apply option", .{ .min_w = 120 }).clicked) app.clicks += 1;
+        ctx.endCollapsible();
+    }
 
     ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
     ctx.beginBox(.{ .width = .{ .fixed = 250 }, .height = .{ .grow = 1 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });

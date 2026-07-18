@@ -1418,6 +1418,117 @@ const RadioGlyph = struct {
     }
 };
 
+// ============================================================
+// Collapsible（折りたたみセクション。TASK-145.3）
+// ============================================================
+// 契約: if (ctx.beginCollapsible(id, title, &open)) { ...body...; ctx.endCollapsible(); }
+// header は begin 内で必ず endBox。open のときだけ body column を開き、end は body の endBox のみ。
+// 閉時に endCollapsible を呼ぶと親 box を誤 pop する — caller は if 契約を厳守すること。
+
+/// beginCollapsible が開いた body の深さ（debug 契約検査用。単一スレッド想定）。
+threadlocal var collapsible_body_depth: u32 = 0;
+
+const collapsible_glyph_px: i32 = 12;
+
+/// header/glyph/title はフレーム毎（小面積）。閉時は body の layout node・child widget・hit-test を一切構築しない。
+/// 開閉状態は caller 所有 `*bool`（ScrollArea の scroll と同規約。PerIdStateStore 不使用）。
+/// 戻り値 true のときだけ body を構築し、必ず `endCollapsible` で閉じること。
+pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) bool {
+    std.debug.assert(id != 0);
+    const result = behaviorFromCache(ctx, id);
+    if (result.clicked) open.* = !open.*;
+
+    const style = ctx.style;
+    const hot = ctx.state.hot_id == id;
+    const bg = if (result.held) style.bg_active else if (hot) style.bg_hover else style.bg;
+    const border_color = if (hot) style.border_hover else style.border;
+    const pad = style.button_padding;
+
+    // header: row box（glyph + title）。id は header 全体が hit 領域。
+    ctx.beginBox(.{
+        .id = id,
+        .direction = .row,
+        .gap = style.checkbox_gap,
+        .align_cross = .center,
+        .padding = pad,
+        .bg = bg,
+        .border = makeBorder(border_color, style.button_border),
+    });
+    const data = ctx.allocator().create(CollapsibleGlyph) catch @panic("collapsible: OOM");
+    data.* = .{ .open = open.*, .fg = style.text };
+    ctx.custom(.{ .x = collapsible_glyph_px, .y = collapsible_glyph_px }, CollapsibleGlyph.draw, data);
+    ctx.labelEx(title, style.text);
+    ctx.endBox(); // header は begin 内で必ず閉じる
+
+    if (!open.*) return false;
+
+    // open のときだけ body column を開く（endCollapsible が閉じる）
+    ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 0, 0, 0, pad[3] + collapsible_glyph_px + style.checkbox_gap } });
+    collapsible_body_depth += 1;
+    return true;
+}
+
+/// body の endBox（フレーム毎だが O(1)。`beginCollapsible` が true のときだけ呼ぶ）。
+/// closed 時に呼ぶと親 box を誤 pop する — 契約違反。
+pub fn endCollapsible(ctx: *Context) void {
+    std.debug.assert(collapsible_body_depth > 0);
+    collapsible_body_depth -= 1;
+    ctx.endBox();
+}
+
+/// 開閉三角。closed=右向き / open=下向き。不透明 rectFilled run のみ（alpha blend なし）。
+const CollapsibleGlyph = struct {
+    open: bool,
+    fg: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const CollapsibleGlyph = @ptrCast(@alignCast(ctx_ptr));
+        const w: i32 = @intCast(rect.w);
+        const h: i32 = @intCast(rect.h);
+        if (w <= 0 or h <= 0) return;
+        // 内側に 2px マージンした三角形領域
+        const m: i32 = 2;
+        const iw = w - 2 * m;
+        const ih = h - 2 * m;
+        if (iw < 3 or ih < 3) return;
+        const ox = rect.x + m;
+        const oy = rect.y + m;
+
+        if (self.open) {
+            // 下向き: 上辺が広く下へ収束
+            var row: i32 = 0;
+            while (row < ih) : (row += 1) {
+                const t = @divTrunc(row * iw, ih); // 0..iw
+                const half = @divTrunc(t, 2);
+                const x0 = half;
+                const x1 = iw - half;
+                if (x1 <= x0) continue;
+                dl.rectFilled(.{
+                    .x = ox + x0,
+                    .y = oy + row,
+                    .w = @intCast(x1 - x0),
+                    .h = 1,
+                }, self.fg) catch @panic("collapsible: OOM");
+            }
+        } else {
+            // 右向き: 左辺が広く右へ収束
+            const half = @divTrunc(ih, 2);
+            var row: i32 = 0;
+            while (row < ih) : (row += 1) {
+                // 上半は row に比例して幅増、下半は対称
+                const dist = if (row <= half) row else (ih - 1 - row);
+                const run = @max(1, @divTrunc((dist + 1) * iw, half + 1));
+                dl.rectFilled(.{
+                    .x = ox,
+                    .y = oy + row,
+                    .w = @intCast(@min(run, iw)),
+                    .h = 1,
+                }, self.fg) catch @panic("collapsible: OOM");
+            }
+        }
+    }
+};
+
 /// 中心(cx,cy)・半径 radius の塗り円をスキャンライン（各行 1px 高さの rectFilled 帯）で描く。
 /// render に円プリミティブが無いための局所ヘルパ。
 fn fillDisc(dl: *DrawList, cx: f32, cy: f32, radius: f32, col: Color) void {
@@ -2306,6 +2417,241 @@ test "iconButton: 自動 ID 経路で mouse down-up が clicked" {
     clickAt(&ctx, c.x, c.y);
     try std.testing.expect(ctx.iconButton(&test_icon_center, false));
     ctx.endFrame();
+}
+
+// ── Collapsible tests（TASK-145.3）──────────────────────────
+
+const COLLAPSE_ID: Id = 0x145301;
+const COLLAPSE_CHILD: Id = 0x145302;
+
+test "collapsible: open=true 初期で header+body が構築される" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open: bool = true;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        _ = ctx.buttonId(COLLAPSE_CHILD, "inner", .{});
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_ID) != null);
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_CHILD) != null);
+    try std.testing.expect(open);
+}
+
+test "collapsible: header click で *open が反転する" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open: bool = true;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(COLLAPSE_ID).?);
+
+    ctx.beginFrame(800, 600);
+    clickAt(&ctx, c.x, c.y);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expect(!open);
+
+    ctx.beginFrame(800, 600);
+    clickAt(&ctx, c.x, c.y);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expect(open);
+}
+
+test "collapsible: closed では caller body が実行されない（built_count）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open: bool = false;
+    var built_count: u32 = 0;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        built_count += 1;
+        _ = ctx.buttonId(COLLAPSE_CHILD, "inner", .{});
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(u32, 0), built_count);
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_ID) != null); // header は在る
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_CHILD) == null);
+}
+
+test "collapsible: open child は closed frame の endFrame 後 getNodeRect==null" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open: bool = true;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        _ = ctx.buttonId(COLLAPSE_CHILD, "inner", .{});
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_CHILD) != null);
+
+    open = false;
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        _ = ctx.buttonId(COLLAPSE_CHILD, "inner", .{});
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_CHILD) == null);
+}
+
+test "collapsible: closed で旧 child rect 位置の click は無効" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open: bool = true;
+    var child_clicks: u32 = 0;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        if (ctx.buttonId(COLLAPSE_CHILD, "inner", .{}).clicked) child_clicks += 1;
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    const child_c = center(ctx.getNodeRect(COLLAPSE_CHILD).?);
+
+    open = false;
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        if (ctx.buttonId(COLLAPSE_CHILD, "inner", .{}).clicked) child_clicks += 1;
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+
+    // 旧 child 位置を click しても child は未構築 → clicked 増えない
+    ctx.beginFrame(800, 600);
+    clickAt(&ctx, child_c.x, child_c.y);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
+        if (ctx.buttonId(COLLAPSE_CHILD, "inner", .{}).clicked) child_clicks += 1;
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(u32, 0), child_clicks);
+}
+
+test "collapsible: dynamic title が frame ごとに更新される" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open: bool = true;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "TitleA", &open)) {
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    // label は text cmd。TitleA が含まれる
+    var found_a = false;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleA")) found_a = true;
+    }
+    try std.testing.expect(found_a);
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(COLLAPSE_ID, "TitleB", &open)) {
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    var found_b = false;
+    var found_a2 = false;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleB")) found_b = true;
+        if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleA")) found_a2 = true;
+    }
+    try std.testing.expect(found_b);
+    try std.testing.expect(!found_a2);
+}
+
+test "collapsible: nested open/closed で beginBox/endBox balance が維持される" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var outer: bool = true;
+    var inner: bool = false;
+
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(0x145310, "Outer", &outer)) {
+        if (ctx.beginCollapsible(0x145311, "Inner", &inner)) {
+            _ = ctx.buttonId(0x145312, "deep", .{});
+            ctx.endCollapsible();
+        }
+        _ = ctx.buttonId(0x145313, "mid", .{});
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    // outer open / inner closed: mid は在り deep は無い。depth は 0 に戻る
+    try std.testing.expect(ctx.getNodeRect(0x145313) != null);
+    try std.testing.expect(ctx.getNodeRect(0x145312) == null);
+    try std.testing.expectEqual(@as(u32, 0), collapsible_body_depth);
+
+    inner = true;
+    ctx.beginFrame(800, 600);
+    if (ctx.beginCollapsible(0x145310, "Outer", &outer)) {
+        if (ctx.beginCollapsible(0x145311, "Inner", &inner)) {
+            _ = ctx.buttonId(0x145312, "deep", .{});
+            ctx.endCollapsible();
+        }
+        _ = ctx.buttonId(0x145313, "mid", .{});
+        ctx.endCollapsible();
+    }
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(0x145312) != null);
+    try std.testing.expectEqual(@as(u32, 0), collapsible_body_depth);
+}
+
+test "collapsible: glyph の right/down が pixel で区別できる" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open_a: bool = false;
+    var open_b: bool = true;
+
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    if (ctx.beginCollapsible(1, "A", &open_a)) ctx.endCollapsible();
+    if (ctx.beginCollapsible(2, "B", &open_b)) ctx.endCollapsible();
+    ctx.endBox();
+    ctx.endFrame();
+
+    var pixels: [200 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font);
+
+    const ra = ctx.getNodeRect(1).?;
+    const rb = ctx.getNodeRect(2).?;
+    const pad = ctx.style.button_padding;
+    // glyph は row + align_cross.center のため、content 高さ内で垂直中央
+    const content_ha: i32 = @as(i32, @intCast(ra.h)) - pad[0] - pad[2];
+    const content_hb: i32 = @as(i32, @intCast(rb.h)) - pad[0] - pad[2];
+    const ga_x: i32 = ra.x + pad[3];
+    const ga_y: i32 = ra.y + pad[0] + @divTrunc(content_ha - collapsible_glyph_px, 2);
+    const gb_x: i32 = rb.x + pad[3];
+    const gb_y: i32 = rb.y + pad[0] + @divTrunc(content_hb - collapsible_glyph_px, 2);
+    const fg: u32 = @bitCast(ctx.style.text);
+    const mid: i32 = @divTrunc(collapsible_glyph_px, 2);
+
+    // closed(right): 左端中段に fg / open(down): 上辺中央に fg
+    const closed_left = pixels[@as(u32, @intCast(ga_y + mid)) * 200 + @as(u32, @intCast(ga_x + 2))];
+    const open_top = pixels[@as(u32, @intCast(gb_y + 2)) * 200 + @as(u32, @intCast(gb_x + mid))];
+    try std.testing.expectEqual(fg, closed_left);
+    try std.testing.expectEqual(fg, open_top);
+    // right は右端が細い・down は下端が細い → 少なくとも一方は非 fg
+    const closed_right = pixels[@as(u32, @intCast(ga_y + mid)) * 200 + @as(u32, @intCast(ga_x + collapsible_glyph_px - 2))];
+    const open_bottom = pixels[@as(u32, @intCast(gb_y + collapsible_glyph_px - 2)) * 200 + @as(u32, @intCast(gb_x + mid))];
+    try std.testing.expect(closed_right != fg or open_bottom != fg);
 }
 
 test "colorSwatch: 不透明は bg+枠のみ、半透明は checker+blend で発行される" {

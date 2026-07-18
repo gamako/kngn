@@ -196,6 +196,9 @@ pub const Context = struct {
     pub const toggleId = widgets.toggleId;
     pub const radio = widgets.radio;
     pub const radioId = widgets.radioId;
+    // Collapsible（TASK-145.3）
+    pub const beginCollapsible = widgets.beginCollapsible;
+    pub const endCollapsible = widgets.endCollapsible;
     // read-only text selection（TASK-113.1）
     pub const selectableLabel = widgets.selectableLabel;
     pub const selectableLabelId = widgets.selectableLabelId;

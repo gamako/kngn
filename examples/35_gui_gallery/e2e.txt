@@ -6,7 +6,7 @@ digest gallery
 expect gallery section=overview
 expect gallery index=0
 expect gallery widgets=0
-expect gallery missing=14
+expect gallery missing=13
 expect gallery schema=v0
 snapshot fb
 
@@ -80,7 +80,7 @@ inject key_up PAGE_DOWN
 step 1
 digest gallery
 expect gallery section=layout
-expect gallery widgets=4
+expect gallery widgets=5
 snapshot fb
 # layout: iconButton hover 500ms → tooltip（beginFrame は frame_index/60 → step 32 ≈ 0.53s）
 # pen center ≈ (144,124): outer pad16 + header64 + gap16 + content pad16 + icon pad4
@@ -90,7 +90,7 @@ step 32
 digest gallery
 expect gallery hot=iconButton
 snapshot fb
-# brush center ≈ (184,124) 長文 tip（layoutPopup クランプ経路）
+# brush center ≈ (184,124) 長文 tip の表示確認（画面端クランプは context.zig 単体テストで担保）
 inject mouse_move 184 124
 step 32
 digest gallery
@@ -102,6 +102,28 @@ step 2
 digest gallery
 expect gallery hot=none
 snapshot fb
+# collapsible header（icon row の下 ≈ y=160, x=120）: hover / click で body 出現 / 再 click で消灯
+inject mouse_move 120 160
+step 2
+digest gallery
+expect gallery hot=collapsible
+snapshot fb
+inject mouse_down left
+step 1
+digest gallery
+expect gallery active=collapsible
+snapshot fb
+inject mouse_up left
+step 1
+# open 後 body（Apply option）が見える
+snapshot fb
+# 再 click で close
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+snapshot fb
+inject mouse_move 1000 620
 # layout -> menus
 inject key_down PAGE_DOWN
 step 1
@@ -133,7 +155,7 @@ step 1
 digest gallery
 expect gallery section=missing
 expect gallery index=8
-expect gallery widgets=14
-expect gallery missing=14
+expect gallery widgets=13
+expect gallery missing=13
 snapshot fb
 quit
