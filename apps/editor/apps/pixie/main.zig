@@ -97,6 +97,9 @@ const PanelNames = struct {
     pub const layers = "Layers";
     pub const timeline = "Timeline";
 };
+
+/// `digest panels` 用の 1 パネル分 rect（y/h）。
+const PanelProbeRect = struct { y: i32, h: i32 };
 const SAVE_MSG_DURATION: f64 = 3.0;
 // 範囲選択のマーチングアンツ（TASK-44）。phase 速度（units/sec）と周期（=2*DASH。selection_overlay の DASH=4）。
 const MARCH_SPEED: f64 = 12.0;
@@ -209,6 +212,18 @@ const LAYER_THUMB_H: i32 = 24;
 const LAYER_THUMB_CELL: usize = 4; // サムネ内チェッカーのセル px
 /// タイムライン UI（TASK-45.2）
 const TIMELINE_SCROLL_ID: gui.Id = 0xC0FFEE07;
+/// Layers 専用スクロール（TASK-148.3）。旧 RIGHT_SCROLL_ID の後継。
+const LAYERS_SCROLL_ID: gui.Id = 0xC0FFEE08;
+/// Layers ScrollArea の最小高 = レイヤー 1 行分（thumb 律速。固定 80/180 は使わない）。
+const LAYERS_VIEWPORT_ROW_MIN: i32 = LAYER_THUMB_H;
+/// chrome（Collapsible 見出し + toolbar）の初回フォールバック。以降は panelRect − scroll rect で実測。
+const LAYERS_CHROME_FALLBACK: i32 = 50;
+/// Text Layer UI を Layers scroll 内に含むときの概算高（実測が無い初回用）。
+const LAYERS_TEXT_UI_FALLBACK: i32 = 130;
+/// PanelHost right slot の縦 padding 合計（slot build の padding top+bottom = 4+4）。
+const PANEL_SLOT_PAD_V: i32 = 8;
+/// PanelHost slot 内 panel 間 gap。
+const PANEL_SLOT_GAP: i32 = 4;
 const TIMELINE_PANEL_ID_BASE: gui.Id = 0xA440_0000;
 const TIMELINE_HEADER_ID_BASE: gui.Id = 0xA441_0000;
 const TIMELINE_CELL_ID_BASE: gui.Id = 0xA442_0000;
@@ -538,6 +553,21 @@ const App = struct {
     panels: [6]gui.Panel = undefined,
     panel_host: gui.PanelHost = undefined,
     preferences: appshell.preferences.Preferences = undefined,
+    /// Layers 専用スクロール（TASK-148.3）
+    layers_scroll: gui.Vec2f = .{},
+    /// Layers ScrollArea の固定 viewport 高（内容量ベース。初回は 1 行分）。
+    layers_viewport_h: i32 = LAYERS_VIEWPORT_ROW_MIN,
+    /// `digest panels` 用: 前フレーム確定後に cachePanelsProbe が書く。
+    panels_probe_fb_h: i32 = 0,
+    panels_probe_bottom: i32 = 0,
+    panels_probe_ok: bool = false,
+    panels_probe_color: ?PanelProbeRect = null,
+    panels_probe_palette: ?PanelProbeRect = null,
+    panels_probe_tool: ?PanelProbeRect = null,
+    panels_probe_layers: ?PanelProbeRect = null,
+    /// Tool Options 動的タイトル用バッファ（Panel.title が指す。stable name は別）
+    tool_options_title_buf: [64]u8 = undefined,
+    tool_options_title_len: usize = 0,
     /// タイムライン UI 状態（TASK-45.2）
     timeline_scroll: gui.Vec2f = .{},
     timeline_playing: bool = false,
@@ -2735,6 +2765,113 @@ const App = struct {
         try self.preferences.save(self.io, self.data_dir, "preferences.ash");
     }
 
+    /// Tool Options の表示専用タイトルを毎フレーム更新（stable name は変えず Panel.title のみ）。
+    fn syncToolOptionsTitle(self: *App) void {
+        const written = std.fmt.bufPrint(&self.tool_options_title_buf, "Tool Options - {s}", .{self.active_kind.name()}) catch {
+            self.tool_options_title_len = 0;
+            if (self.findPanel(PanelNames.tool_options)) |p| p.title = null;
+            return;
+        };
+        self.tool_options_title_len = written.len;
+        if (self.findPanel(PanelNames.tool_options)) |p| {
+            p.title = self.tool_options_title_buf[0..self.tool_options_title_len];
+        }
+    }
+
+    /// Layers scroll 内の自然コンテンツ高（行数×行高 + Text Layer UI）。
+    fn layersNaturalContentHeight(self: *const App) i32 {
+        const n: i32 = @intCast(self.canvas.layers.items.len);
+        if (n <= 0) return LAYERS_VIEWPORT_ROW_MIN;
+        const gap: i32 = 2; // beginScrollArea gap
+        const pad_v: i32 = 4; // scroll padding top+bottom
+        var h = n * LAYER_THUMB_H + (n - 1) * gap + pad_v;
+        const idx = self.canvas.selected_layer;
+        if (idx < self.canvas.layers.items.len and self.canvas.layers.items[idx].kind == .text) {
+            h += LAYERS_TEXT_UI_FALLBACK;
+        }
+        return h;
+    }
+
+    /// Layers の Collapsible 見出し + toolbar 高。前フレーム panelRect − scroll rect で実測。
+    fn measureLayersChrome(self: *const App, ctx: *const gui.Context) i32 {
+        if (self.panel_host.panelRect(ctx, PanelNames.layers)) |pr| {
+            if (ctx.getNodeRect(LAYERS_SCROLL_ID)) |vp| {
+                const chrome = @as(i32, @intCast(pr.h)) - @as(i32, @intCast(vp.h));
+                if (chrome >= 20) return chrome;
+            }
+        }
+        return LAYERS_CHROME_FALLBACK;
+    }
+
+    /// Layers ScrollArea の固定高。
+    ///
+    /// 方針（TASK-148.3 Critical 修正）: Tool Options 等の他セクション natural 高を優先し、
+    /// Layers viewport は `clamp(内容 natural 高, 1 行分, 残り高)` に抑える。
+    /// レイヤー 1 枚なら 1 行分だけ確保し、余りを Tool Options に回す。
+    ///
+    /// Degradation: 全セクション open + 窓が狭いと残り高が 1 行未満になり得る。その場合は
+    /// Layers を 1 行まで縮め、それでも足りなければ従来どおり下端クリップを許容する
+    /// （完全救済は将来の PanelHost 側スクロール。pixie 単体では割り切る）。
+    fn updateLayersViewportHeight(self: *App, ctx: *const gui.Context) void {
+        const right = self.panel_host.slotRect(ctx, .right) orelse return;
+        var others: i32 = 0;
+        var other_count: i32 = 0;
+        for ([_][]const u8{ PanelNames.color, PanelNames.palette, PanelNames.tool_options }) |name| {
+            if (!self.isPanelVisible(name)) continue;
+            if (self.panel_host.panelRect(ctx, name)) |r| {
+                others += @intCast(r.h);
+                other_count += 1;
+            } else {
+                // 初回等: 他 panel rect が無い → 内容量ベースの最小（1 行〜natural）を仮置き
+                const natural = self.layersNaturalContentHeight();
+                self.layers_viewport_h = std.math.clamp(natural, LAYERS_VIEWPORT_ROW_MIN, natural);
+                return;
+            }
+        }
+        const layers_on = self.isPanelVisible(PanelNames.layers);
+        const visible_n = other_count + @as(i32, @intFromBool(layers_on));
+        const gaps: i32 = if (visible_n > 1) (visible_n - 1) * PANEL_SLOT_GAP else 0;
+        const layers_chrome = self.measureLayersChrome(ctx);
+        const slot_h: i32 = @intCast(right.h);
+        const remain = slot_h - PANEL_SLOT_PAD_V - gaps - others - layers_chrome;
+        const natural = self.layersNaturalContentHeight();
+        // remain が極端に小さくても 1 行は確保（下端クリップは許容。上記 Degradation）
+        const max_h = @max(LAYERS_VIEWPORT_ROW_MIN, remain);
+        self.layers_viewport_h = std.math.clamp(natural, LAYERS_VIEWPORT_ROW_MIN, max_h);
+    }
+
+    /// endFrame 後に呼ぶ。`digest panels` 用に右スロット各 panel の y/h と fb_h を記録。
+    fn cachePanelsProbe(self: *App) void {
+        self.panels_probe_fb_h = @intCast(self.ctx.screen_h);
+        self.panels_probe_color = if (self.panel_host.panelRect(&self.ctx, PanelNames.color)) |r|
+            .{ .y = r.y, .h = @intCast(r.h) }
+        else
+            null;
+        self.panels_probe_palette = if (self.panel_host.panelRect(&self.ctx, PanelNames.palette)) |r|
+            .{ .y = r.y, .h = @intCast(r.h) }
+        else
+            null;
+        self.panels_probe_tool = if (self.panel_host.panelRect(&self.ctx, PanelNames.tool_options)) |r|
+            .{ .y = r.y, .h = @intCast(r.h) }
+        else
+            null;
+        self.panels_probe_layers = if (self.panel_host.panelRect(&self.ctx, PanelNames.layers)) |r|
+            .{ .y = r.y, .h = @intCast(r.h) }
+        else
+            null;
+        var bottom: i32 = 0;
+        for ([_]?PanelProbeRect{
+            self.panels_probe_color,
+            self.panels_probe_palette,
+            self.panels_probe_tool,
+            self.panels_probe_layers,
+        }) |maybe| {
+            if (maybe) |r| bottom = @max(bottom, r.y + r.h);
+        }
+        self.panels_probe_bottom = bottom;
+        self.panels_probe_ok = bottom > 0 and bottom <= self.panels_probe_fb_h;
+    }
+
     /// Command 表から id を検索（separator は対象外）。dispatchCommand の最終防御用。
     fn findMenuCommand(self: *const App, id: platform.CommandId) ?platform.Command {
         if (id == 0) return null;
@@ -3260,6 +3397,32 @@ fn timelineDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         app.doc.layers.items.len,
         @intFromBool(app.onion_enabled),
     }) catch buf[0..0];
+}
+
+/// panels digest（TASK-148.3）: 右スロット各セクションの前フレーム rect と fb_h。
+/// 形式: `fb_h=<n> bottom=<n> ok=<0|1> Color_y=<n> Color_h=<n> ...`（非表示はキー省略）
+/// `expect panels ok=1` でレイアウト崩壊を機械 assert する。
+fn panelsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    var len: usize = 0;
+    len += (std.fmt.bufPrint(buf[len..], "fb_h={d} bottom={d} ok={d}", .{
+        app.panels_probe_fb_h,
+        app.panels_probe_bottom,
+        @intFromBool(app.panels_probe_ok),
+    }) catch return buf[0..0]).len;
+    if (app.panels_probe_color) |r| {
+        len += (std.fmt.bufPrint(buf[len..], " Color_y={d} Color_h={d}", .{ r.y, r.h }) catch return buf[0..len]).len;
+    }
+    if (app.panels_probe_palette) |r| {
+        len += (std.fmt.bufPrint(buf[len..], " Palette_y={d} Palette_h={d}", .{ r.y, r.h }) catch return buf[0..len]).len;
+    }
+    if (app.panels_probe_tool) |r| {
+        len += (std.fmt.bufPrint(buf[len..], " Tool_y={d} Tool_h={d}", .{ r.y, r.h }) catch return buf[0..len]).len;
+    }
+    if (app.panels_probe_layers) |r| {
+        len += (std.fmt.bufPrint(buf[len..], " Layers_y={d} Layers_h={d}", .{ r.y, r.h }) catch return buf[0..len]).len;
+    }
+    return buf[0..len];
 }
 fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     var buf: [128]u8 = undefined;
@@ -5024,6 +5187,7 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32, cw: usize, ch: usize) v
 }
 
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
+    // toolbar は scroll 外（常に操作可能。TASK-148.3）
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
     // TASK-94 Phase C: netsync 中は routeAction（#id）、solo は do* 直呼び。
     if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) {
@@ -5043,6 +5207,16 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     }
     ctx.endBox();
 
+    app.updateLayersViewportHeight(ctx);
+    ctx.beginScrollArea(LAYERS_SCROLL_ID, &app.layers_scroll, .{
+        .width = .{ .grow = 1 },
+        .height = .{ .fixed = app.layers_viewport_h },
+        .padding = .{ 0, 2, 0, 2 },
+        .gap = 2,
+        .content_width = .{ .grow = 1 },
+        .content_height = .fit,
+    });
+
     var rev = app.canvas.layers.items.len;
     while (rev > 0) {
         rev -= 1;
@@ -5061,11 +5235,6 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
 
         // レイヤー名表示（TASK-79.3）。renaming 中の対象行だけ確定前バッファ+カーソルを表示する。
-        // どちらも `truncateForDisplay` で表示専用に切り詰める（保存名自体は変えない）: buttonId/
-        // beginBox の width は min_w を「下限」としてしか扱えず、テキストが長いと際限なく箱が
-        // 広がる。右ペイン幅 200px からサムネ/可視トグル/opacity slider を差し引くと名前欄の
-        // 実質予算は 70〜90px 程度しかなく、無制限だと opacity slider 等がスクロール viewport
-        // 外へ押し出され操作不能になりうるため。
         if (app.rename_in.active and app.rename_in.layer_idx == idx) {
             const shown = truncateForDisplay(ctx.allocator(), app.rename_in.text(), LAYER_NAME_DISPLAY_MAX);
             ctx.beginBox(.{
@@ -5094,7 +5263,6 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         } else {
             const shown = truncateForDisplay(ctx.allocator(), layer.name(), LAYER_NAME_DISPLAY_MAX);
             if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
-                // select_layer は .local_only（per-peer view）→ netsync 中もローカル do*
                 app.doSelectLayer(idx) catch {};
             }
         }
@@ -5109,24 +5277,20 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         }
         ctx.endBox(); // row
 
-        // 右クリックでこの行のレイヤーを選択しコンテキストメニューを開く（TASK-79.2）。
-        // 行矩形は「前フレームの rect_cache」（既存 widget と同じ同期 hit-test 契約。
-        // context.zig 冒頭の契約コメント参照）。openPopup は endFrame 前でも呼べる
-        // （endFrame 後を要求するのは描画+hit-test を行う popupMenu 側のみ。popup.zig 参照）。
-        // レイヤーパネルは PanelHost 右 slot（clip_children=true）配下にある。
-        // 行 rect 単体だけでは slot 外（クリップ済み）を誤ヒットし得るため、右 slot 矩形にも
-        // 収まっていることを確認する（148.3 で Layers 専用 ScrollArea + cached clip に置換予定）。
+        // 右クリック: 行 rect + 祖先 clip（ScrollArea viewport）の両方で判定（TASK-148.3）。
         if (ctx.input.mouse_pressed.right) {
-            if (ctx.getNodeRect(row_id)) |r| {
+            if (ctx.getNodeCachedRect(row_id)) |cached| {
                 const p = ctx.input.mouse_pressed_pos;
-                const in_viewport = if (app.panel_host.slotRect(ctx, .right)) |vp| vp.contains(p) else true;
-                if (in_viewport and r.contains(p)) {
+                if (cached.clip.contains(p) and cached.rect.contains(p)) {
                     app.doSelectLayer(idx) catch {};
                     ctx.openPopup(LAYER_CTX_MENU_ID, p);
                 }
             }
         }
     }
+
+    try buildTextLayerPanel(ctx, app);
+    ctx.endScrollArea();
 }
 
 fn historyActorAbbrev(entry: *const history_summary.HistoryEntry, buf: []u8) []const u8 {
@@ -5481,8 +5645,10 @@ fn panelBuildColor(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(user_data));
     // HSV。palette grid より前に write-back（選択変更の上書き事故回避）
     ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
-    _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 120 });
-    _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 120 });
+    // 780x600 既定で Color + Tool Options（Brush スライダー / Bezier anchors 含む）が
+    // status bar 上に収まるよう SV を圧縮（TASK-148.3 Critical）
+    _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 80 });
+    _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 80 });
     ctx.endBox();
     _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
     _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
@@ -5573,7 +5739,7 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
     if (toolIconButton(ctx, 13, icons.sym_q, app.symmetry == .quad, "Symmetry Q (no shortcut)")) app.uiSetSymmetry(.quad);
     ctx.endBox();
 
-    ctx.labelEx("(Alt+click = temp eyedrop)", ctx.style.text_subtle);
+    ctx.labelEx("Alt+click: eyedrop", ctx.style.text_subtle);
     var keep_transp = app.blend_mode == .over;
     if (ctx.toggle("Keep Transp", &keep_transp)) {
         app.blend_mode = if (keep_transp) .over else .replace;
@@ -5593,6 +5759,13 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
         _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
         _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
     }
+    if (app.active_kind == .bezier) {
+        const n = app.bezier_editor.path.anchors.items.len;
+        ctx.labelEx(
+            std.fmt.allocPrint(ctx.allocator(), "anchors: {d}", .{n}) catch "anchors: ?",
+            ctx.style.text_subtle,
+        );
+    }
     if (app.active_kind == .fill) {
         _ = ctx.sliderI32Id(0xFEED_0001, "Tol", &app.fill_tolerance_i32, .{ .min = 0, .max = 255, .track_w = 90 });
     }
@@ -5601,7 +5774,6 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
 fn panelBuildLayers(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(user_data));
     try buildLayerPanel(ctx, app);
-    try buildTextLayerPanel(ctx, app);
 }
 
 fn panelBuildTimeline(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
@@ -5642,6 +5814,9 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.rebuildMenuCommands();
     }
 
+    // Tool Options 見出しを現在ツールに合わせて更新（Panel.title。stable name は不変）
+    app.syncToolOptionsTitle();
+
     // ── PanelHost: left/center/right/bottom（center は空 box。canvas blit は centerRect）──
     try app.panel_host.build(ctx);
 
@@ -5651,7 +5826,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
     app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
 
-    // ── status bar ──
+    // ── status bar（cursor → zoom → layer → frame → saveMsg。TASK-148.3）──
     ctx.beginBox(.{
         .direction = .row,
         .width = .{ .grow = 1 },
@@ -5674,19 +5849,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         break :blk "cursor: -";
     };
     ctx.labelEx(cursor_txt, ctx.style.text_subtle);
-    {
-        const c = app.palette.current();
-        // canonical BGRA(0xAARRGGBB) から #RRGGBB 用に明示抽出。
-        const r: u8 = @truncate(c >> 16);
-        const g: u8 = @truncate(c >> 8);
-        const b: u8 = @truncate(c);
-        ctx.labelEx(
-            try std.fmt.allocPrint(arena, "color: #{X:0>2}{X:0>2}{X:0>2} ({d})", .{ r, g, b, app.palette.colors.items.len }),
-            ctx.style.text_subtle,
-        );
-    }
     ctx.labelEx(
-        try std.fmt.allocPrint(arena, "tool: {s}", .{app.active_kind.name()}),
+        try std.fmt.allocPrint(arena, "zoom: {d}%", .{app.view_zoom * 100}),
         ctx.style.text_subtle,
     );
     ctx.labelEx(
@@ -5697,30 +5861,6 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         try std.fmt.allocPrint(arena, "frame: {d}/{d}", .{ app.doc.selected_frame + 1, app.doc.frames.items.len }),
         ctx.style.text_subtle,
     );
-    ctx.labelEx(
-        try std.fmt.allocPrint(arena, "zoom: {d}%", .{app.view_zoom * 100}),
-        ctx.style.text_subtle,
-    );
-    if (app.active_kind == .brush or app.active_kind == .bezier) {
-        ctx.labelEx(
-            try std.fmt.allocPrint(arena, "brush: sz={d} op={d} hard={d:.2}", .{
-                app.brush.size, app.brush.opacity, app.brush_hardness_f32,
-            }),
-            ctx.style.text_subtle,
-        );
-    }
-    if (app.active_kind == .fill) {
-        ctx.labelEx(
-            try std.fmt.allocPrint(arena, "fill: tol={d}", .{app.fill.tolerance}),
-            ctx.style.text_subtle,
-        );
-    }
-    if (app.active_kind == .bezier and app.bezier_editor.isEditing()) {
-        ctx.labelEx(
-            try std.fmt.allocPrint(arena, "anchors: {d}", .{app.bezier_editor.path.anchors.items.len}),
-            ctx.style.text_subtle,
-        );
-    }
     if (app.saveMsg()) |msg| ctx.label(msg);
     ctx.endBox();
 
@@ -6041,7 +6181,8 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .panels = .{
             .{ .name = PanelNames.history, .slot = .left, .build = panelBuildHistory, .user_data = undefined },
             .{ .name = PanelNames.color, .slot = .right, .build = panelBuildColor, .user_data = undefined },
-            .{ .name = PanelNames.palette, .slot = .right, .build = panelBuildPalette, .user_data = undefined },
+            // 既定は閉じる: Color + Tool Options 全コントロールと Layers 1 行が 780x600 に並立する余地
+            .{ .name = PanelNames.palette, .slot = .right, .open = false, .build = panelBuildPalette, .user_data = undefined },
             .{ .name = PanelNames.tool_options, .slot = .right, .build = panelBuildToolOptions, .user_data = undefined },
             .{ .name = PanelNames.layers, .slot = .right, .build = panelBuildLayers, .user_data = undefined },
             .{ .name = PanelNames.timeline, .slot = .bottom, .visible = false, .build = panelBuildTimeline, .user_data = undefined },
@@ -6097,6 +6238,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "diff", .ctx = self, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" });
     // TASK-45.4: timeline 再生状態（digest のみ・snapshot=null）
     platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
+    platform.registerProbe(.{ .name = "panels", .ctx = self, .ext = "txt", .digest = panelsDigest, .desc = "right-slot panel rects: fb_h/bottom/ok + Color/Palette/Tool/Layers y,h" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
     platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title/geometry state" });
@@ -6228,6 +6370,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         try buildUi(&self.ctx, self, canvas_rect);
         self.ctx.endFrame();
+        self.cachePanelsProbe();
         // endFrame が GUI の draw command を確定した後に追加し、確認 UI を最前面へ置く。
         try drawAppshellOverlay(&self.ctx, self);
 
