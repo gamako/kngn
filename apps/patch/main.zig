@@ -360,6 +360,9 @@ const App = struct {
     mouse: Vec2f = .{ .x = 0, .y = 0 },
     hover: ?Item = null,
     selected: ?Item = null,
+    /// TASK-149.2: Inspector 用 drill-down target（canvas selected とは独立）。
+    /// group 選択時は member 選択で埋まり、node 選択時は selected node と一致。
+    inspector_target: ?Handle = null,
     drag: Drag = .none,
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
@@ -577,6 +580,86 @@ const App = struct {
         return "open";
     }
 
+    /// selected と整合するよう inspector_target を毎フレーム同期（stale は null）。
+    fn syncInspectorTarget(self: *App) void {
+        if (self.inspector_target) |t| {
+            if (t >= MAX_MODULES or !self.dyn.slotActive(t)) {
+                self.inspector_target = null;
+            }
+        }
+        if (self.selected) |item| {
+            switch (item) {
+                .node => |h| {
+                    // primitive 選択は target をその handle に固定。
+                    self.inspector_target = h;
+                },
+                .group => |gid| {
+                    // group 選択: target は当該 group の active member のときだけ維持。
+                    if (self.inspector_target) |t| {
+                        if (t >= group.GROUP_HANDLE_BASE or self.ledger.group_of[t] != gid or !self.dyn.slotActive(t)) {
+                            self.inspector_target = null;
+                        }
+                    }
+                },
+                .port, .cable => self.inspector_target = null,
+            }
+        } else {
+            self.inspector_target = null;
+        }
+    }
+
+    /// descriptor を表示する実 handle（params モード）。member list 中は null。
+    fn inspectorParamHandle(self: *const App) ?Handle {
+        if (self.selected) |item| {
+            switch (item) {
+                .node => |h| return if (self.dyn.slotActive(h)) h else null,
+                .group => return self.inspector_target,
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// group の active member を handle 昇順で out へ（alloc なし）。
+    fn collectGroupMembers(self: *const App, gid: group.GroupId, out: []inspector.MemberInfo) usize {
+        var n: usize = 0;
+        var h: Handle = 0;
+        while (h < MAX_MODULES and n < out.len) : (h += 1) {
+            if (self.ledger.group_of[h] != gid) continue;
+            if (!self.dyn.slotActive(h)) continue;
+            const kind = self.dyn.kindOf(h) orelse continue;
+            out[n] = .{ .handle = h, .kind_name = @tagName(kind) };
+            n += 1;
+        }
+        return n;
+    }
+
+    fn inspectorView(self: *const App, member_buf: []inspector.MemberInfo) inspector.View {
+        if (self.selected) |item| {
+            switch (item) {
+                .node => |h| {
+                    if (self.dyn.slotActive(h)) return .{ .params = h };
+                    return .empty;
+                },
+                .group => |gid| {
+                    if (gid >= group.MAX_GROUPS or !self.ledger.groups[gid].active) return .empty;
+                    if (self.inspector_target) |t| {
+                        if (t < group.GROUP_HANDLE_BASE and self.ledger.group_of[t] == gid and self.dyn.slotActive(t)) {
+                            return .{ .params = t };
+                        }
+                    }
+                    const n = self.collectGroupMembers(gid, member_buf);
+                    return .{ .group_members = .{
+                        .group_name = self.ledger.groups[gid].kind.displayName(),
+                        .members = member_buf[0..n],
+                    } };
+                },
+                else => return .empty,
+            }
+        }
+        return .empty;
+    }
+
     fn editState(self: *App, key: param_view.FieldKey) *param_view.ParamEditState {
         var free: ?usize = null;
         for (&self.param_edits, 0..) |*state, index| {
@@ -600,16 +683,18 @@ const App = struct {
 
     fn captureParamRows(self: *App, ctx: *const gui.Context) void {
         self.param_row_count = 0;
-        const h = if (self.selected) |item| switch (item) {
-            .node => |node_h| node_h,
-            else => return,
-        } else return;
+        // ghost marker は scalar row のみ（choice radio は除外）。
+        const h = self.inspectorParamHandle() orelse return;
         const kind = self.dyn.kindOf(h) orelse return;
         const descs = switch (kind) {
             inline else => |comptime_kind| modular.descriptors(comptime_kind),
         };
         for (descs, 0..) |desc, index| {
             if (self.param_row_count >= self.param_rows.len) break;
+            switch (desc.kind) {
+                .scalar => {},
+                .choice => continue,
+            }
             const rect = ctx.getNodeRect(inspector.paramId(ctx, h, index)) orelse continue;
             self.param_rows[self.param_row_count] = .{ .key = param_view.fieldKey(h, desc.name), .rect = rect, .valid = true };
             self.param_row_count += 1;
@@ -2601,6 +2686,7 @@ pub fn main(init: std.process.Init) !void {
             // 生成レイヤ scalar は GUI/action の最新値を制御レートで atomic publish する。
             publishControls(app.patch, app.params);
             updateViz(&app);
+            app.syncInspectorTarget();
             app.beginParamFrame();
 
             @memset(fb.pixels, BG);
@@ -4617,12 +4703,9 @@ fn observedTransportValue(app: *const App, key: param_view.FieldKey) ?f32 {
 }
 
 fn observedInspectorValue(app: *const App, key: param_view.FieldKey) ?f32 {
-    const selected_h = if (app.selected) |item| switch (item) {
-        .node => |h| h,
-        else => return null,
-    } else return null;
-    if (!param_view.sameField(key, param_view.fieldKey(selected_h, key.name))) return null;
-    const snapshot = modular.getParamSnapshot(app.dyn, selected_h, key.name) catch return null;
+    const target_h = app.inspectorParamHandle() orelse return null;
+    if (!param_view.sameField(key, param_view.fieldKey(target_h, key.name))) return null;
+    const snapshot = modular.getParamSnapshot(app.dyn, target_h, key.name) catch return null;
     const field = scalarParamValue(snapshot.field) orelse return null;
     return editScalarValue(app, key) orelse field;
 }
@@ -4670,16 +4753,23 @@ fn buildTransportPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     transport.drawBody(ctx, &model, app.transportBodyAvail(), app, displayTransportValue, app, transportParamChanged, transportMuteChanged);
 }
 
+fn inspectorMemberSelected(ctx: *anyopaque, handle: modular.dyn.Handle) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    // canvas selection / group collapsed / RT は触らない。target のみ。
+    if (handle >= MAX_MODULES or !app.dyn.slotActive(handle)) return;
+    app.inspector_target = handle;
+    // observe も drill-down 対象へ（params digest の choice 確認用）。
+    app.observed_field = observedFieldForNode(app, handle) orelse app.observed_field;
+}
+
 fn buildInspectorPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(user_data));
-    const selected: ?modular.dyn.Handle = if (app.selected) |item| switch (item) {
-        .node => |h| h,
-        else => null,
-    } else null;
+    var member_buf: [MAX_MODULES]inspector.MemberInfo = undefined;
+    const view_state = app.inspectorView(&member_buf);
     inspector.drawBody(
         ctx,
         app.dyn,
-        selected,
+        view_state,
         app.inspectorBodyAvail(),
         app,
         snapshotParamCallback,
@@ -4687,6 +4777,8 @@ fn buildInspectorPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
         displayInspectorValue,
         app,
         inspectorChanged,
+        app,
+        inspectorMemberSelected,
     );
 }
 
@@ -4774,6 +4866,71 @@ fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "ok panel_toggle {s}={d}", .{ name_raw, @intFromBool(visible) }) catch error.BufferTooSmall;
 }
 
+const ChoiceDigestInfo = struct {
+    name: []const u8,
+    index: i32,
+    option: []const u8,
+
+    const none: ChoiceDigestInfo = .{ .name = "none", .index = -1, .option = "none" };
+};
+
+/// target handle の choice パラメータ情報（digest 用）。observed が choice なら優先し、なければ先頭 choice。
+fn targetChoiceInfo(app: *const App, target: Handle) ChoiceDigestInfo {
+    const kind = app.dyn.kindOf(target) orelse return ChoiceDigestInfo.none;
+    const descs = switch (kind) {
+        inline else => |comptime_kind| modular.descriptors(comptime_kind),
+    };
+    const observed = observedField(app);
+    // 1) observed がこの target の choice ならそれを優先
+    if (param_view.sameFieldParts(observed, target, observed.name)) {
+        if (paramDescFor(kind, observed.name)) |desc| switch (desc.kind) {
+            .choice => |c| {
+                const snap = modular.getParamSnapshot(app.dyn, target, desc.name) catch return ChoiceDigestInfo.none;
+                const idx: usize = switch (snap.field) {
+                    .choice => |v| @min(v, c.options.len -| 1),
+                    .scalar => return ChoiceDigestInfo.none,
+                };
+                // pending があれば表示値
+                const shown_idx: usize = blk: {
+                    if (app.findEditState(param_view.fieldKey(target, desc.name))) |st| {
+                        if (st.pending) |p| switch (p) {
+                            .choice => |v| break :blk @min(v, c.options.len -| 1),
+                            .scalar => {},
+                        };
+                    }
+                    break :blk idx;
+                };
+                return .{ .name = desc.name, .index = @intCast(shown_idx), .option = c.options[shown_idx] };
+            },
+            .scalar => {},
+        };
+    }
+    // 2) first choice descriptor
+    for (descs) |desc| {
+        switch (desc.kind) {
+            .choice => |c| {
+                const snap = modular.getParamSnapshot(app.dyn, target, desc.name) catch continue;
+                const idx: usize = switch (snap.field) {
+                    .choice => |v| @min(v, c.options.len -| 1),
+                    .scalar => continue,
+                };
+                const shown_idx: usize = blk: {
+                    if (app.findEditState(param_view.fieldKey(target, desc.name))) |st| {
+                        if (st.pending) |p| switch (p) {
+                            .choice => |v| break :blk @min(v, c.options.len -| 1),
+                            .scalar => {},
+                        };
+                    }
+                    break :blk idx;
+                };
+                return .{ .name = desc.name, .index = @intCast(shown_idx), .option = c.options[shown_idx] };
+            },
+            .scalar => {},
+        }
+    }
+    return ChoiceDigestInfo.none;
+}
+
 fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
     const key = observedField(app);
@@ -4790,12 +4947,20 @@ fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     } else false;
     const selected_h: i32 = if (app.selected) |item| switch (item) {
         .node => |h| @intCast(h),
+        .group => |gid| @intCast(group.handleOfGroup(gid)),
         else => -1,
     } else -1;
     const selected_kind = if (app.selected) |item| switch (item) {
         .node => |h| if (app.dyn.kindOf(h)) |k| @tagName(k) else "none",
+        .group => |gid| if (gid < group.MAX_GROUPS and app.ledger.groups[gid].active) @tagName(app.ledger.groups[gid].kind) else "none",
         else => "none",
     } else "none";
+    const target_h: i32 = if (app.inspector_target) |t| @intCast(t) else -1;
+    const target_kind: []const u8 = if (app.inspector_target) |t|
+        if (app.dyn.kindOf(t)) |k| @tagName(k) else "none"
+    else
+        "none";
+    const choice = if (app.inspectorParamHandle()) |th| targetChoiceInfo(app, th) else ChoiceDigestInfo.none;
     const edit = app.findEditState(key);
     var instant_buf: [32]u8 = undefined;
     var field_buf: [32]u8 = undefined;
@@ -4807,16 +4972,49 @@ fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const transport_text = optionalF32Text(&transport_buf, transport_value);
     const inspector_text = optionalF32Text(&inspector_buf, inspector_value);
     const shown_text = optionalF32Text(&shown_buf, shown);
-    const result = std.fmt.bufPrint(buf, "selected_h={d} selected_kind={s} observed_h={d} observed_name={s} field={s} instant={s} transport={s} inspector={s} shown={s} dragging={d} override={d} ghost={d}", .{ selected_h, selected_kind, key.handle, key.name, field_text, instant_text, transport_text, inspector_text, shown_text, if (edit) |state| @intFromBool(state.dragging) else 0, @intFromBool(hasOverride(app, key)), @intFromBool(ghost) }) catch return buf[0..0];
+    // 既存キーは維持し、inspector_target / choice 情報を追加のみ。
+    const result = std.fmt.bufPrint(buf, "selected_h={d} selected_kind={s} inspector_target={d} target_kind={s} choice_name={s} choice_index={d} choice_option={s} observed_h={d} observed_name={s} field={s} instant={s} transport={s} inspector={s} shown={s} dragging={d} override={d} ghost={d}", .{
+        selected_h,
+        selected_kind,
+        target_h,
+        target_kind,
+        choice.name,
+        choice.index,
+        choice.option,
+        key.handle,
+        key.name,
+        field_text,
+        instant_text,
+        transport_text,
+        inspector_text,
+        shown_text,
+        if (edit) |state| @intFromBool(state.dragging) else 0,
+        @intFromBool(hasOverride(app, key)),
+        @intFromBool(ghost),
+    }) catch return buf[0..0];
     return result;
 }
 
 fn paramsSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
     const key = observedField(app);
+    const target_h: i32 = if (app.inspector_target) |t| @intCast(t) else -1;
+    const target_kind: []const u8 = if (app.inspector_target) |t|
+        if (app.dyn.kindOf(t)) |k| @tagName(k) else "none"
+    else
+        "none";
+    const choice = if (app.inspectorParamHandle()) |th| targetChoiceInfo(app, th) else ChoiceDigestInfo.none;
     var out: [4096]u8 = undefined;
     var off: usize = 0;
-    const head = std.fmt.bufPrint(out[off..], "{{\"observed_h\":{d},\"observed_name\":\"{s}\",\"rows\":[", .{ key.handle, key.name }) catch return allocator.dupe(u8, "{}");
+    const head = std.fmt.bufPrint(out[off..], "{{\"observed_h\":{d},\"observed_name\":\"{s}\",\"inspector_target\":{d},\"target_kind\":\"{s}\",\"choice_name\":\"{s}\",\"choice_index\":{d},\"choice_option\":\"{s}\",\"rows\":[", .{
+        key.handle,
+        key.name,
+        target_h,
+        target_kind,
+        choice.name,
+        choice.index,
+        choice.option,
+    }) catch return allocator.dupe(u8, "{}");
     off += head.len;
     for (app.param_rows[0..app.param_row_count]) |row| {
         if (!row.valid) continue;
