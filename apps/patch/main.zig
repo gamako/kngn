@@ -460,9 +460,14 @@ const App = struct {
 
     // TASK-106.4: 固定長 undo payload（CommandLog.undo_ref = gen）。~1.16MiB のため heap（Windows 1MB stack 回避）。
     undo_store: *patch_undo.PatchUndoStore,
-    /// inspector slider release 時に set_param へ渡す before-state（drag 中に埋める）。
+    /// Local GUI release が set_param に渡す before-state。param 名でキー付けし、
+    /// actionSetParam は受信 args の param 名が一致するときだけ消費する（remote COMMIT の別
+    /// param 適用が pending を奪わない）。単一 Optional: 同時複数 drag は無く 1 本分のみ。
+    /// 既知限界: 自分の pending 中に他 peer が同じ param 名を変更した場合、before が僅かに
+    /// 古くなるだけで破壊はしない（消費は名前一致時のみ・不一致なら現在値 before にフォールバック）。
     pending_param_undo_before: ?patch_undo.ParamValueSnap = null,
-    /// inspector drag 開始時の before 捕捉（release で pending_param_undo_before へ移す）。
+    /// Inspector (mode=1) / Transport (mode=0) drag 開始時の before 捕捉。
+    /// release で pending_param_undo_before へ移し routeUiAction("set_param") する。
     /// 単一 Optional: 同時に複数 slider を drag する UI は無く、1 本分のみ保持する制約。
     slider_drag_before: ?patch_undo.ParamValueSnap = null,
 
@@ -794,40 +799,57 @@ const App = struct {
             state.release();
             if (!was_dragging) continue;
             if (before) |b| {
-                // Inspector slider: NodeId 形式で set_param（queueParamOverride 経路）。
-                if (b.mode != 1 or state.key.invalid()) continue;
-                const final_raw: f32 = blk: {
-                    if (state.pending) |pv| break :blk switch (pv) {
+                if (b.mode == 1) {
+                    // Inspector slider: NodeId 形式で set_param（queueParamOverride 経路）。
+                    if (state.key.invalid()) continue;
+                    const final_raw: f32 = blk: {
+                        if (state.pending) |pv| break :blk switch (pv) {
+                            .scalar => |v| v,
+                            .choice => |idx| @floatFromInt(idx),
+                        };
+                        const snap = modular.getParam(self.dyn, @intCast(state.key.handle), state.key.name) catch break :blk @as(f32, @bitCast(b.value_bits));
+                        break :blk switch (snap) {
+                            .scalar => |v| v,
+                            .choice => |idx| @floatFromInt(idx),
+                        };
+                    };
+                    self.pending_param_undo_before = b;
+                    var args_buf: [128]u8 = undefined;
+                    const args = std.fmt.bufPrint(&args_buf, "#{d} {s} {d}", .{ b.node_id, b.name(), final_raw }) catch {
+                        self.pending_param_undo_before = null;
+                        continue;
+                    };
+                    // recordedAction 経由で CommandLog へ 1 record + notePatchUndo。
+                    routeUiAction(self, "set_param", args);
+                } else if (b.mode == 0) {
+                    // Transport slider: alias 名 2 トークン + before（UI 値）を pending 経由で渡す。
+                    const alias = transportAliasForKey(self, state.key) orelse continue;
+                    if (!std.mem.eql(u8, b.name(), @tagName(alias))) continue;
+                    const pv = state.pending orelse continue;
+                    const raw_canonical: f32 = switch (pv) {
                         .scalar => |v| v,
                         .choice => |idx| @floatFromInt(idx),
                     };
-                    const snap = modular.getParam(self.dyn, @intCast(state.key.handle), state.key.name) catch break :blk @as(f32, @bitCast(b.value_bits));
-                    break :blk switch (snap) {
-                        .scalar => |v| v,
-                        .choice => |idx| @floatFromInt(idx),
+                    const ui = param_view.toUi(alias, raw_canonical, conversion());
+                    self.pending_param_undo_before = b;
+                    var args_buf: [128]u8 = undefined;
+                    const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ @tagName(alias), ui }) catch {
+                        self.pending_param_undo_before = null;
+                        continue;
                     };
-                };
-                self.pending_param_undo_before = b;
-                var args_buf: [128]u8 = undefined;
-                const args = std.fmt.bufPrint(&args_buf, "#{d} {s} {d}", .{ b.node_id, b.name(), final_raw }) catch {
-                    self.pending_param_undo_before = null;
-                    continue;
-                };
-                // recordedAction 経由で CommandLog へ 1 record。
-                routeUiAction(self, "set_param", args);
+                    routeUiAction(self, "set_param", args);
+                }
             } else if (state.pending) |pv| {
-                // Transport slider: alias 名 2 トークン形式（setParamAndPublish 経路と一致）。
-                // density は FieldKey.handle==INVALID でも alias 経由で記録する（invalid() で落とさない）。
+                // before 未捕捉の Transport（保険）。live before は既に新値なので undoable にならない可能性がある。
                 const alias = transportAliasForKey(self, state.key) orelse continue;
                 const raw_canonical: f32 = switch (pv) {
                     .scalar => |v| v,
                     .choice => |idx| @floatFromInt(idx),
                 };
-                // pending は canonical。setParamAndPublish は UI 値を期待するので toUi で戻す。
                 const ui = param_view.toUi(alias, raw_canonical, conversion());
                 var args_buf: [128]u8 = undefined;
                 const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ @tagName(alias), ui }) catch continue;
-                recordGuiAction(self, "set_param", args);
+                routeUiAction(self, "set_param", args);
             }
         }
     }
@@ -3548,6 +3570,7 @@ fn doUndo(app: *App) void {
             std.debug.print("patch: undoOne failed: {s}\n", .{@errorName(err)});
         };
     }
+    resyncUiAfterHistoryChange(app);
 }
 
 fn doRedo(app: *App) void {
@@ -3561,12 +3584,14 @@ fn doRedo(app: *App) void {
             std.debug.print("patch: redoOne failed: {s}\n", .{@errorName(err)});
         };
     }
+    resyncUiAfterHistoryChange(app);
 }
 
 fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     if (args.len != 0) return error.UnexpectedArgs;
     const app = actionApp(ctx);
     const outcome = try app.cmd_exec.undoOne(.local_user, buf);
+    resyncUiAfterHistoryChange(app);
     return outcome.message;
 }
 
@@ -3574,7 +3599,43 @@ fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     if (args.len != 0) return error.UnexpectedArgs;
     const app = actionApp(ctx);
     const outcome = try app.cmd_exec.redoOne(.local_user, buf);
+    resyncUiAfterHistoryChange(app);
     return outcome.message;
+}
+
+/// undo/redo 後に UI-only 参照（selection/hover/inspector/param edit）を document と再整合する。
+/// graph snapshot には含めない状態。イベント時のみ。
+fn resyncUiAfterHistoryChange(app: *App) void {
+    if (app.selected) |it| {
+        if (!itemStillValid(app, it)) app.selected = null;
+    }
+    if (app.hover) |it| {
+        if (!itemStillValid(app, it)) app.hover = null;
+    }
+    // syncInspectorTarget / refreshAllExposed は毎フレーム経路にもあるが、
+    // undo 直後の同一フレーム内で probe/digest が読む可能性があるためここで即時再同期する。
+    app.syncInspectorTarget();
+    for (&app.param_edits) |*state| {
+        if (state.key.invalid()) continue;
+        if (state.key.handle >= MAX_MODULES) continue;
+        if (!app.dyn.slotActive(@intCast(state.key.handle))) state.* = .{};
+    }
+    app.refreshAllExposed();
+}
+
+fn itemStillValid(app: *const App, it: Item) bool {
+    return switch (it) {
+        .node => |h| h < MAX_MODULES and app.dyn.slotActive(h),
+        .group => |gid| gid < group.MAX_GROUPS and app.ledger.groups[gid].active,
+        .port => |pr| blk: {
+            const real = app.ledger.resolvePort(pr) orelse break :blk false;
+            break :blk real.handle < MAX_MODULES and app.dyn.slotActive(real.handle);
+        },
+        .cable => |cr| blk: {
+            if (cr.dst_handle >= MAX_MODULES or !app.dyn.slotActive(cr.dst_handle)) break :blk false;
+            break :blk edgeForInput(app, cr.dst_handle, cr.dst_in) != null;
+        },
+    };
 }
 
 fn actionApp(ctx: *anyopaque) *App {
@@ -4881,8 +4942,18 @@ fn formatHistoryCmdLine(rec: *const platform.command.CommandRecord, buf: []u8) [
     const actor = actorLabel(rec.actor, &actor_buf);
     return switch (rec.kind) {
         .normal => blk: {
-            const badge = normalHistoryBadge(rec.name());
+            const badge = if (rec.reverted)
+                "[undone]"
+            else
+                normalHistoryBadge(rec.name());
             const args = rec.args();
+            if (rec.redo_of) |src| {
+                if (args.len == 0) {
+                    break :blk std.fmt.bufPrint(buf, "#{d} {s} {s} redo_of=#{d} {s}", .{ rec.seq, actor, rec.name(), src, badge }) catch "#?";
+                }
+                const max_args = @min(args.len, 40);
+                break :blk std.fmt.bufPrint(buf, "#{d} {s} {s} {s} redo_of=#{d} {s}", .{ rec.seq, actor, rec.name(), args[0..max_args], src, badge }) catch "#?";
+            }
             if (args.len == 0) {
                 break :blk std.fmt.bufPrint(buf, "#{d} {s} {s} {s}", .{ rec.seq, actor, rec.name(), badge }) catch "#?";
             }
@@ -4895,6 +4966,14 @@ fn formatHistoryCmdLine(rec: *const platform.command.CommandRecord, buf: []u8) [
             }
             break :blk std.fmt.bufPrint(buf, "#{d} {s} undo [meta/revert]", .{ rec.seq, actor }) catch "#?";
         },
+    };
+}
+
+/// History 行色（pixie と同様: reverted=subtle / revert=meta 色 / normal=本文）。
+fn historyCmdRowColor(ctx: *const gui.Context, rec: *const platform.command.CommandRecord) gui.Color {
+    return switch (rec.kind) {
+        .revert => gui.Color.rgba(0x88, 0x9A, 0xB0, 0xFF),
+        .normal => if (rec.reverted) ctx.style.text_subtle else gui.Color.rgba(0xD0, 0xD6, 0xDE, 0xFF),
     };
 }
 
@@ -4969,14 +5048,18 @@ fn buildHistoryPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     } else {
         var line_buf: [HISTORY_LINE_CAP]u8 = undefined;
         for (lines_buf[0..n_lines]) |entry| {
-            const text: []const u8 = if (entry.is_meta)
-                formatHistoryMetaLine(app.metaAt(entry.src_index), &line_buf)
-            else
-                formatHistoryCmdLine(app.cmd_log.recordAt(entry.src_index), &line_buf);
-            // 各行 fixed 幅 label（wrap なし・見切れは scroll）。
-            ctx.beginBox(.{ .width = .{ .fixed = @max(1, content_w - 12) }, .height = .fit });
-            ctx.labelEx(text, gui.Color.rgba(0xD0, 0xD6, 0xDE, 0xFF));
-            ctx.endBox();
+            if (entry.is_meta) {
+                const text = formatHistoryMetaLine(app.metaAt(entry.src_index), &line_buf);
+                ctx.beginBox(.{ .width = .{ .fixed = @max(1, content_w - 12) }, .height = .fit });
+                ctx.labelEx(text, gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF));
+                ctx.endBox();
+            } else {
+                const rec = app.cmd_log.recordAt(entry.src_index);
+                const text = formatHistoryCmdLine(rec, &line_buf);
+                ctx.beginBox(.{ .width = .{ .fixed = @max(1, content_w - 12) }, .height = .fit });
+                ctx.labelEx(text, historyCmdRowColor(ctx, rec));
+                ctx.endBox();
+            }
         }
     }
     ctx.endScrollArea();
@@ -5109,12 +5192,8 @@ fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "ok panel_toggle {s}={d}", .{ name_raw, @intFromBool(visible) }) catch error.BufferTooSmall;
 }
 
-/// GUI 操作を CommandLog へ記録する（dispatch なし。既存変更経路の後に呼ぶ）。
-fn recordGuiAction(app: *App, name: []const u8, args: []const u8) void {
-    var buf: [8]u8 = undefined;
-    _ = app.cmd_exec.recordExecuted(name, args, .{ .actor = .local_user }, null, &buf) catch {};
-}
-
+/// GUI 操作の undoable 記録は `routeUiAction` → `recordedAction` / `notePatchUndo` 経路を使う。
+/// 表示専用の `recordExecuted(..., undo_ref=null)` は TASK-150 で廃止した。
 const ChoiceDigestInfo = struct {
     name: []const u8,
     index: i32,
@@ -5421,6 +5500,30 @@ fn transportAliasForKey(app: *const App, key: param_view.FieldKey) ?param_view.T
     return null;
 }
 
+/// Transport alias の現在 UI 値（`setParamAndPublish` / undo restore と同一空間）。
+fn transportUiValue(app: *const App, alias: param_view.TransportAlias) f32 {
+    return switch (alias) {
+        .tempo => app.params.tempo,
+        .cutoff => app.params.cutoff_norm,
+        .density => app.params.density,
+        .swing => app.params.swing,
+        .sidechain => app.params.sidechain,
+        .kick_gain => app.params.kick_gain,
+        .hat_gain => app.params.hat_gain,
+        .clap_gain => app.params.clap_gain,
+        .bass_gain => app.params.bass_gain,
+        .pad_gain => app.params.pad_gain,
+    };
+}
+
+fn captureTransportParamBefore(app: *App, alias: param_view.TransportAlias) patch_undo.ParamValueSnap {
+    var s = patch_undo.ParamValueSnap{ .mode = 0 };
+    s.setName(@tagName(alias));
+    s.value_kind = 0;
+    s.value_bits = @bitCast(transportUiValue(app, alias));
+    return s;
+}
+
 fn setTransportCanonical(app: *App, key: param_view.FieldKey, value: f32) error{UnknownParam}!void {
     const alias = transportAliasForKey(app, key) orelse return error.UnknownParam;
     const c = conversion();
@@ -5475,6 +5578,12 @@ fn setMuteAndPublish(app: *App, name: []const u8, muted: bool) error{UnknownTrac
 
 fn transportParamChanged(ctx: *anyopaque, key: param_view.FieldKey, value: f32) void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    // drag 開始時のみ before（UI 値）を捕捉。release で set_param + notePatchUndo へ渡す。
+    if (app.slider_drag_before == null) {
+        if (transportAliasForKey(app, key)) |alias| {
+            app.slider_drag_before = captureTransportParamBefore(app, alias);
+        }
+    }
     setTransportCanonical(app, key, value) catch {};
     // drag 中は pending 更新のみ。CommandLog は release 時に 1 record（coalesce）。
     const es = app.editState(key);
@@ -5486,10 +5595,19 @@ fn transportParamChanged(ctx: *anyopaque, key: param_view.FieldKey, value: f32) 
 
 fn transportMuteChanged(ctx: *anyopaque, name: []const u8, muted: bool) void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    setMuteAndPublish(app, name, muted) catch {};
+    // 直接 publish + 表示専用 record は廃止。set_mute action が before capture + notePatchUndo。
     var args_buf: [32]u8 = undefined;
     const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ name, @intFromBool(muted) }) catch return;
-    recordGuiAction(app, "set_mute", args);
+    routeUiAction(app, "set_mute", args);
+}
+
+/// pending_param_undo_before を param 名一致のときだけ消費して返す。
+/// 不一致なら null（pending は残す）→ 呼び出し側は現在値 before にフォールバックする。
+fn takePendingParamUndoBefore(app: *App, param_name: []const u8) ?patch_undo.ParamValueSnap {
+    const pending = app.pending_param_undo_before orelse return null;
+    if (!std.mem.eql(u8, pending.name(), param_name)) return null;
+    app.pending_param_undo_before = null;
+    return pending;
 }
 
 fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -5498,13 +5616,13 @@ fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     var it = std.mem.tokenizeAny(u8, args, " \t");
     _ = it.next() orelse return error.Empty;
     _ = it.next() orelse return error.Empty;
-    const pending = app.pending_param_undo_before;
-    app.pending_param_undo_before = null;
+    // pending は param 名一致時のみ消費する（冒頭で無差別 clear しない）。
+    // remote COMMIT の別 param が local release の pending を奪う cross-talk を防ぐ。
     if (it.next() != null) {
         const p = try actions.parseParamOverride(args);
         const h = try resolveNodeRef(app, p.ref, true);
         const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
-        const before_snap = pending orelse blk: {
+        const before_snap = takePendingParamUndoBefore(app, cname) orelse blk: {
             var s = patch_undo.ParamValueSnap{ .mode = 1, .node_id = (nodeIdOf(app, h) orelse NodeId.fromRaw(0)).raw() };
             s.setName(cname);
             const cur = modular.getParam(app.dyn, h, cname) catch break :blk null;
@@ -5531,29 +5649,19 @@ fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         }
     } else {
         const nf = try gen_actions.parseNameF32(args);
-        const before_snap = pending orelse blk: {
+        // Prefer pending from slider; for harness capture live transport aliases as UI values.
+        const alias = std.meta.stringToEnum(param_view.TransportAlias, nf.name) orelse
+            (if (std.mem.eql(u8, nf.name, "cutoff_norm")) param_view.TransportAlias.cutoff else null);
+        // pending 照合キーは alias 正規名（cutoff_norm → cutoff）。不一致なら pending を残す。
+        const pending_key: []const u8 = if (alias) |a| @tagName(a) else nf.name;
+        const before_snap = takePendingParamUndoBefore(app, pending_key) orelse blk: {
             var s = patch_undo.ParamValueSnap{ .mode = 0 };
             s.setName(nf.name);
-            // best-effort: read transport via params struct fields is complex; use 0 sentinel
-            // Prefer pending from slider; for harness capture live transport aliases.
-            const alias = std.meta.stringToEnum(param_view.TransportAlias, nf.name) orelse
-                (if (std.mem.eql(u8, nf.name, "cutoff_norm")) param_view.TransportAlias.cutoff else null);
             if (alias) |a| {
-                const st = app.patch.snapshotState();
-                const v: f32 = switch (a) {
-                    .tempo => st.bpm,
-                    .cutoff => st.master_cutoff,
-                    .density => st.density_target,
-                    .swing => st.swing,
-                    .sidechain => st.sidechain_amount,
-                    .kick_gain => st.kick_gain,
-                    .hat_gain => st.hat_gain,
-                    .clap_gain => st.clap_gain,
-                    .bass_gain => st.bass_gain,
-                    .pad_gain => st.pad_gain,
-                };
                 s.value_kind = 0;
-                s.value_bits = @bitCast(v);
+                s.value_bits = @bitCast(transportUiValue(app, a));
+                // cutoff_norm 別名で来た場合も restore 名を "cutoff" に揃える（setParamAndPublish）。
+                if (a == .cutoff) s.setName("cutoff");
                 break :blk s;
             }
             break :blk null;
