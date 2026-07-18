@@ -521,7 +521,7 @@ pub const LofiPatch = struct {
     fn wire(self: *LofiPatch) !void {
         const g = self.graph;
         const base = seedmod.DEFAULT_BASE_SEED;
-        const treg = seedmod.deriveU32(base, .ambient_turing_register);
+        const treg = seedmod.deriveU32(base, .ambient_turing_register) & 0xFFFF;
         const n_clock = try g.add(.clock, .{ .bpm = DEFAULT_BPM, .ppqn = 4, .swing = 0.0 });
         const n_kick_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = KICK_ON });
         const n_hat_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = HAT_ON });
@@ -1020,7 +1020,9 @@ pub const LofiPatch = struct {
 
         // --- 生成 RNG ---
         self.mut_noise.state = seedmod.deriveU32(base, .mutate);
-        const treg = seedmod.deriveU32(base, .ambient_turing_register);
+        // anchor_register param 契約は 0..65535（16 bit）。deriveU32 は全幅 u32 なので mask する。
+        // （未 mask だと VPRJ NPRM validate が OutOfRange になり save→load が壊れる）
+        const treg = seedmod.deriveU32(base, .ambient_turing_register) & 0xFFFF;
         if (self.ptr(.random, self.ambient_random_h)) |ambient_random| {
             ambient_random.noise.state = seedmod.deriveU32(base, .ambient_random);
             ambient_random.prev_gate = false;
@@ -2366,6 +2368,113 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
     try testing.expectEqual(@as(u64, 42), patch.base_seed);
     try testing.expectEqual(@as(u16, 0x5555), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
+}
+
+test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
+    // VPRJ load 相当: 同一 bar に requestSeed + quantize_bar pattern。
+    // applyBaseSeed が default anchor に戻した後、pending が保存 mask を後勝ち適用する。
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const pre_frames: u64 = 48000;
+    const post_frames: u64 = 48000 * 4;
+
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    var freeze = PatternCommand.default();
+    freeze.rev = 1;
+    freeze.evolve = false;
+    publishPattern(patch, freeze);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    var rendered: u64 = 0;
+    while (rendered < pre_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+
+    // 保存 pattern（E2E / AC と同値）を quantize_bar で staging + seed 42
+    patch.requestSeed(42);
+    var saved = PatternCommand.default();
+    saved.rev = 2;
+    saved.evolve = false;
+    saved.quantize_bar = true;
+    saved.kick.on = 0x1981;
+    saved.hat.on = 0x1050;
+    saved.clap.on = 0xc444;
+    saved.bass.on = 0x4949;
+    publishPattern(patch, saved);
+
+    // 境界前: seed 未適用・pattern は pending
+    rendered = 0;
+    while (rendered < 24000) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, patch.base_seed);
+    try testing.expect(patch.pending_bar_cmd != null);
+
+    // 境界後: seed=42 かつ保存 mask が復元（default 1111/4444/1010/4949 ではない）
+    rendered = 0;
+    while (rendered < post_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+    try testing.expectEqual(@as(u64, 42), patch.base_seed);
+    try testing.expectEqual(@as(u16, 0x1981), testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x1050), testSeq(patch, patch.hat_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0xc444), testSeq(patch, patch.clap_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x4949), testSeq(patch, patch.bass_seq_h).on_mask);
+    try testing.expect(patch.pending_bar_cmd == null);
+    try testing.expect(!patch.evolve);
+}
+
+test "TASK-151: evolve=ON load bar keeps saved masks (pending skips mutate)" {
+    // 計画 §7: evolve=ON でも load 直後 1 bar は applied_pending ゲートで mutate せず保存 mask を壊さない。
+    const sr: f32 = 48000;
+    const chunk: u32 = 4800;
+    const pre_frames: u64 = 48000;
+    // 1 bar だけ跨ぐ（2 bar 目以降の mutate 再開は対象外）
+    const one_bar_frames: u64 = 48000 + 24000;
+
+    const patch = try LofiPatch.create(testing.allocator, sr);
+    defer patch.destroy();
+    var warm = PatternCommand.default();
+    warm.rev = 1;
+    warm.evolve = true;
+    publishPattern(patch, warm);
+
+    const buf = try testing.allocator.alloc(f32, chunk * 2);
+    defer testing.allocator.free(buf);
+
+    var rendered: u64 = 0;
+    while (rendered < pre_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+
+    patch.requestSeed(42);
+    var saved = PatternCommand.default();
+    saved.rev = 2;
+    saved.evolve = true;
+    saved.quantize_bar = true;
+    saved.kick.on = 0x1981;
+    saved.hat.on = 0x1050;
+    saved.clap.on = 0xc444;
+    saved.bass.on = 0x4949;
+    publishPattern(patch, saved);
+
+    rendered = 0;
+    while (rendered < one_bar_frames) : (rendered += chunk) {
+        patch.render(buf, chunk, 2);
+    }
+
+    try testing.expectEqual(@as(u64, 42), patch.base_seed);
+    try testing.expect(patch.evolve);
+    try testing.expectEqual(@as(u16, 0x1981), testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x1050), testSeq(patch, patch.hat_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0xc444), testSeq(patch, patch.clap_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x4949), testSeq(patch, patch.bass_seq_h).on_mask);
+    try testing.expect(patch.pending_bar_cmd == null);
+    // applyBaseSeed が mutation_count を 0 に戻し、当該 bar は applied_pending で mutate スキップ
+    try testing.expectEqual(@as(u32, 0), patch.mutation_count);
 }
 
 test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {

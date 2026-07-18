@@ -4119,11 +4119,20 @@ fn applyGraphReplace(
     return .{ .nodes_restored = nodes_restored, .edges_restored = edges_restored };
 }
 
-fn applyParamsPattern(app: *App, params: Params, pattern: pattern_io.PatternPayload) void {
+/// params + pattern を publish する。
+/// `quantize_bar=true`: 同一 load で seed も適用される場合に必須（seed の anchor リセットに pattern が潰されないよう、
+/// bar 境界で seed→pending_bar_cmd の後勝ち適用）。VPRJ/MPRJ load / SYNC が該当。
+/// `quantize_bar=false`: pattern-only（load_pattern）。即時適用（従来どおり）。
+/// 呼び出し側が `loaded.apply_seed_song` を渡すのは「pattern と seed が同居するフォーマットだけ量子化」の意図借用。
+/// `apply_params_pattern=true` かつ `apply_seed_song=false` の組合せは現行フォーマットに存在しない。
+fn applyParamsPattern(app: *App, params: Params, pattern: pattern_io.PatternPayload, quantize_bar: bool) void {
     app.params = params;
     publishControls(app.patch, app.params);
-    const cmd = payloadToPatternCommand(0, pattern);
-    _ = publishPatternCommand(app, cmd);
+    var cmd = payloadToPatternCommand(0, pattern);
+    cmd.quantize_bar = quantize_bar;
+    const published = publishPatternCommand(app, cmd);
+    // load の quantized pattern を last_quantized_cmd に載せ、stale mini-notation の再利用を防ぐ。
+    if (quantize_bar) app.last_quantized_cmd = published;
 }
 
 fn applySeedSong(app: *App, seed: project_io.SeedPayload, song: project_io.SongPayload) void {
@@ -4391,7 +4400,8 @@ fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     // 検証完了後にのみ破壊的適用（capacity は applyGraphReplace 内）
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr, nprm_opt, decoded.node_id_refs, decoded.next_node_id);
-    applyParamsPattern(app, decoded.params, decoded.pattern);
+    // TASK-151: SYNC も VPRJ load と同じく pattern を pending（quantize_bar）で staging → seed 後勝ち。
+    applyParamsPattern(app, decoded.params, decoded.pattern, true);
     applySeedSong(app, decoded.seed, decoded.song);
 }
 
@@ -5069,7 +5079,8 @@ fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     var loaded = try project_io.load(app.io, gpa, path, Params);
     defer loaded.deinit(gpa);
     if (!loaded.apply_params_pattern) return error.UnsupportedFormat;
-    applyParamsPattern(app, loaded.params, loaded.pattern);
+    // pattern-only: seed 無しのため即時適用（quantize_bar=false）。
+    applyParamsPattern(app, loaded.params, loaded.pattern, false);
     return "ok";
 }
 
@@ -5336,14 +5347,16 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
             try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null, loaded.node_id_refs, loaded.next_node_id)
         else
             try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt, nprm_opt, loaded.node_id_refs, loaded.next_node_id);
-        if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern);
+        // TASK-151: apply_seed_song を quantize_bar 代理にする（同居フォーマットのみ後勝ち量子化。doc は applyParamsPattern）。
+        if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern, loaded.apply_seed_song);
         if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
         return std.fmt.bufPrint(buf, "format={s} nodes={d}/{d} edges={d}/{d}", .{
             @tagName(loaded.format), result.nodes_restored, loaded.nodes.len, result.edges_restored, loaded.edges.len,
         }) catch "ok";
     }
 
-    if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern);
+    // 同上: apply_seed_song → quantize_bar（現行フォーマットに pattern-only+seed なしの組合せは無い）。
+    if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern, loaded.apply_seed_song);
     if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
     return std.fmt.bufPrint(buf, "format={s}", .{@tagName(loaded.format)}) catch "ok";
 }
