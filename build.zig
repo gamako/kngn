@@ -769,7 +769,10 @@ pub fn build(b: *std.Build) void {
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
-    // MIDI facade/null backend 単体テスト（OS 非依存。TASK-115.1・ADR-010）。
+    // MIDI facade/null/CoreMIDI backend 単体テスト（TASK-115.1/115.2・ADR-010）。
+    // macOS では facade が midi_macos を相対 import するため CoreMIDI を link する。
+    // また root を midi_macos.zig にした専用 addTest で native 側 test を確実に実行する
+    // （root を跨いだ間接 import の test は収集されない実測知見。capture 系と同方針）。
     const midi_test_mod = b.createModule(.{
         .root_source_file = b.path("core/midi.zig"),
         .target = target,
@@ -778,6 +781,7 @@ pub fn build(b: *std.Build) void {
     });
     midi_test_mod.addImport("platform_types", shared_modules.types.mod);
     midi_test_mod.addImport("harness", shared_modules.harness.mod);
+    if (target_os == .macos) linkMidiMacFrameworks(b, midi_test_mod, sdk_paths.?);
     const midi_test = b.addTest(.{ .root_module = midi_test_mod });
     const midi_null_test_mod = b.createModule(.{
         .root_source_file = b.path("core/midi_null.zig"),
@@ -786,9 +790,21 @@ pub fn build(b: *std.Build) void {
     });
     midi_null_test_mod.addImport("platform_types", shared_modules.types.mod);
     const midi_null_test = b.addTest(.{ .root_module = midi_null_test_mod });
-    const test_midi_step = b.step("test-midi", "Run MIDI facade/null backend unit tests (TASK-115.1)");
+    const test_midi_step = b.step("test-midi", "Run MIDI facade/null/CoreMIDI backend unit tests (TASK-115.1/115.2)");
     test_midi_step.dependOn(&b.addRunArtifact(midi_test).step);
     test_midi_step.dependOn(&b.addRunArtifact(midi_null_test).step);
+    if (target_os == .macos) {
+        const midi_macos_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/midi_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        midi_macos_test_mod.addImport("platform_types", shared_modules.types.mod);
+        linkMidiMacFrameworks(b, midi_macos_test_mod, sdk_paths.?);
+        const midi_macos_test = b.addTest(.{ .root_module = midi_macos_test_mod });
+        test_midi_step.dependOn(&b.addRunArtifact(midi_macos_test).step);
+    }
 
     // wasm platform の DOM→MouseButton / KeyCode 写像（native でも実行。extern env はテスト経路から未参照）。
     const platform_wasm_test_mod = b.createModule(.{
@@ -2761,7 +2777,11 @@ fn addExampleExe(
     // gamepad は platform_types のみに依存する backend 非依存 lib（TASK-80.1）。common（SharedModules）から
     // 直接 addImport する（kit を使わない examples の既存慣習に揃える）。
     if (needs.needs_gamepad) exe.root_module.addImport("gamepad", common.gamepad.mod);
-    if (needs.needs_midi) exe.root_module.addImport("midi", common.midi.mod);
+    if (needs.needs_midi) {
+        exe.root_module.addImport("midi", common.midi.mod);
+        // CoreMIDI 等の system framework は needs_midi の exe にのみ opt-in link（audio と同型）。
+        linkMidiBackend(exe, target.result.os.tag);
+    }
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
     if (needs.needs_kit) {
@@ -2976,6 +2996,32 @@ fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) 
         .windows => exe.root_module.linkSystemLibrary("ole32", .{}),
         else => @panic("audio backend is only available on macOS / Linux / Windows"),
     }
+}
+
+// ============================================================
+// ヘルパー: MIDI を使う exe に CoreMIDI 等を OS 別にリンクする（TASK-115.2）。
+// midi module は @cImport せず extern fn なので、リンクは exe 側で行う。
+// audio の linkAudioBackend と同じ opt-in 位置づけ。needs_midi の example のみ呼ぶ。
+// setupExecutableForPlatform が SDK framework 検索パスを付ける前提。
+// ============================================================
+fn linkMidiBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
+    switch (target_os) {
+        .macos => {
+            exe.root_module.linkFramework("CoreMIDI", .{});
+            exe.root_module.linkFramework("CoreFoundation", .{});
+        },
+        // 115.2 は macOS のみ。他 OS は null backend で framework 不要。
+        else => {},
+    }
+}
+
+// test-midi（素の addTest）向け: SDK framework/library 検索パスを明示して CoreMIDI を link。
+// linkCaptureMacFrameworks と同型（platform.setupExecutableForPlatform を経由しない）。
+fn linkMidiMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos.MacOSSDKPaths) void {
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path}) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_paths.sdk_path}) });
+    mod.linkFramework("CoreMIDI", .{});
+    mod.linkFramework("CoreFoundation", .{});
 }
 
 // ============================================================

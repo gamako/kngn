@@ -1,7 +1,7 @@
-//! MIDI facade（TASK-115.1・ADR-010）。
+//! MIDI facade（TASK-115.1/115.2・ADR-010）。
 //!
-//! `builtin.os.tag` による実機 backend 選択の継ぎ目を持つが、115.1 では全 OS を null
-//! backend に固定する。harness が有効なときは native backend を開かず、共有 harness
+//! `builtin.os.tag` による実機 backend 選択の継ぎ目。macOS は CoreMIDI（TASK-115.2）、
+//! 他 OS は null backend。harness が有効なときは native backend を開かず、共有 harness
 //! module の synthetic FIFO を main thread からポーリングする。
 
 const std = @import("std");
@@ -9,11 +9,12 @@ const builtin = @import("builtin");
 const types = @import("platform_types");
 const harness = @import("harness");
 
-// TASK-115.1 では全対象 OS が null。後続 backend はこの comptime 選択点を置き換える。
+// macOS = CoreMIDI（TASK-115.2）。他 OS / wasm は null。後続 backend はこの comptime 選択点を置き換える。
 const backend = if (builtin.cpu.arch.isWasm())
     @import("midi_null.zig")
 else switch (builtin.os.tag) {
-    .macos, .linux, .windows => @import("midi_null.zig"),
+    .macos => @import("midi_macos.zig"),
+    .linux, .windows => @import("midi_null.zig"),
     else => @import("midi_null.zig"),
 };
 
@@ -58,11 +59,12 @@ pub fn open(allocator: std.mem.Allocator) Error!Device {
     return .{ .inner = try backend.open(allocator), .harness_owned = false };
 }
 
-test "midi facade: harness 無効時は null backend に委譲し close 後も空" {
+test "midi facade: harness 無効時は native/null backend を開き close 後も空" {
     if (harness.isEnabled() or harness.isHeadlessActive()) return error.SkipZigTest;
 
     var device = try open(std.testing.allocator);
-    try std.testing.expectEqual(@as(?MidiEvent, null), device.pollMidi());
+    // 実機が同時に送っていなければ null。close 後は facade が inner を外して常に null。
+    _ = device.pollMidi();
     device.close();
     try std.testing.expectEqual(@as(?MidiEvent, null), device.pollMidi());
 }
