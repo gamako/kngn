@@ -407,6 +407,10 @@ const App = struct {
     // TASK-106.2: 安定 NodeId（relay/保存/digest）。runtime Handle とは分離・単調・再利用なし。
     next_node_id: u64 = 1,
     handle_to_id: [MAX_MODULES]?graph_io.NodeId = [_]?graph_io.NodeId{null} ** MAX_MODULES,
+    // TASK-106.1: host が最後に pattern_state で配った mutation_count（変化検出用）。
+    last_pattern_state_mut: u32 = 0,
+    // TASK-106.1: 直前 frame の peer 数。増加時は join 強制 pattern_state 配信。
+    last_broadcast_peer_count: usize = 0,
 
     // TASK-136: File メニュー（native NSMenu / GUI fallback）+ dialog 経由 save/load。
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
@@ -2436,6 +2440,9 @@ pub fn main(init: std.process.Init) !void {
         }
         // dialog は framebuffer unlock 後の安全点（platform.h 契約。TASK-136）。
         if (app.running) app.runPendingMenuFileOp();
+        // TASK-106.1: evolve authority と host pattern_state 配信（main thread イベント境界のみ）。
+        updateEvolveAuthority(&app);
+        maybeBroadcastPatternState(&app);
         platform.frameDelay(16_000_000);
     }
     std.debug.print("apps/patch: done.\n", .{});
@@ -3552,72 +3559,87 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 }
 
 /// graph relay action を一括登録する（TASK-106.2）。`.relay` + canonicalize。undoable なし。
+/// network_policy は `gen_actions.PATCH_NETWORK_POLICIES` が単一ソース。
 fn registerPatchActions(app: *App) void {
-    platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode, .network_policy = .local_only });
-    platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam, .network_policy = .local_only });
+    platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode, .network_policy = patchPolicy("select_node") });
+    platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam, .network_policy = patchPolicy("observe_param") });
     platform.registerAction(.{
         .name = "add_node",
         .ctx = app,
         .run = recordedGraphAction("add_node"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("add_node"),
         .canonicalize = canonicalizeAddNode,
     });
     platform.registerAction(.{
         .name = "remove_node",
         .ctx = app,
         .run = recordedGraphAction("remove_node"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("remove_node"),
         .canonicalize = canonicalizeRemoveNode,
     });
     platform.registerAction(.{
         .name = "connect",
         .ctx = app,
         .run = recordedGraphAction("connect"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("connect"),
         .canonicalize = canonicalizeConnect,
     });
     platform.registerAction(.{
         .name = "disconnect",
         .ctx = app,
         .run = recordedGraphAction("disconnect"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("disconnect"),
         .canonicalize = canonicalizeDisconnect,
     });
     platform.registerAction(.{
         .name = "move_node",
         .ctx = app,
         .run = recordedGraphAction("move_node"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("move_node"),
         .canonicalize = canonicalizeMoveNode,
     });
     platform.registerAction(.{
         .name = "add_macro",
         .ctx = app,
         .run = recordedGraphAction("add_macro"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("add_macro"),
         .canonicalize = canonicalizeAddMacro,
     });
     platform.registerAction(.{
         .name = "remove_macro",
         .ctx = app,
         .run = recordedGraphAction("remove_macro"),
-        .network_policy = .relay,
+        .network_policy = patchPolicy("remove_macro"),
         .canonicalize = canonicalizeRemoveMacro,
     });
     platform.registerAction(.{
         .name = "save_graph",
         .ctx = app,
         .run = actionSaveGraph,
-        .network_policy = .local_only,
+        .network_policy = patchPolicy("save_graph"),
         .desc = "save integrated VPRJ project (alias of save_project)",
     });
     platform.registerAction(.{
         .name = "load_graph",
         .ctx = app,
         .run = actionLoadGraph,
-        .network_policy = .local_only,
-        .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG)",
+        .network_policy = patchPolicy("load_graph"),
+        .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG); reject while synced",
     });
+}
+
+fn toPlatformPolicy(tag: gen_actions.NetworkPolicyTag) platform.NetworkPolicy {
+    return switch (tag) {
+        .relay => .relay,
+        .local_only => .local_only,
+        .reject_when_synced => .reject_when_synced,
+    };
+}
+
+fn patchPolicy(comptime name: []const u8) platform.NetworkPolicy {
+    // gen_actions.policyOf を comptime で確実に解決する（表欠落はビルド時エラー）。
+    const tag = comptime gen_actions.policyOf(name) orelse @compileError("missing PATCH_NETWORK_POLICIES entry: " ++ name);
+    return toPlatformPolicy(tag);
 }
 
 fn recordedGraphAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
@@ -4111,14 +4133,35 @@ fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     _ = it.next() orelse return error.Empty;
     _ = it.next() orelse return error.Empty;
     if (it.next() != null) {
-        // Additive な 3 引数形式。従来の recipe 用 2 引数形式は下記のまま不変。
+        // Additive な 3 引数形式: `#<NodeId>|handle <name> <value>`。
+        // wire 適用は NodeRef + canonical name + value のみ（selected/observed 非参照）。
         const p = try actions.parseParamOverride(args);
-        try queueParamOverride(app, p.handle, p.name, p.value);
+        const h = try resolveNodeRef(app, p.ref, true);
+        const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
+        try queueParamOverride(app, h, cname, p.value);
     } else {
         const nf = try gen_actions.parseNameF32(args);
         try setParamAndPublish(app, nf.name, nf.value);
     }
     return "ok";
+}
+
+fn canonicalizeSetParam(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    _ = it.next() orelse return error.Empty;
+    _ = it.next() orelse return error.Empty;
+    if (it.next() == null) {
+        // transport: `<name> <value>`（NodeId なし）
+        const nf = try gen_actions.parseNameF32(args);
+        return std.fmt.bufPrint(scratch, "{s} {d}", .{ nf.name, nf.value }) catch return error.ArgsTooLong;
+    }
+    const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
+    const p = try actions.parseParamOverride(args);
+    const id = try nodeRefToId(app, p.ref, forbid);
+    const h = try resolveNodeRef(app, .{ .id = id }, false);
+    const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
+    return actions.formatParamOverride(scratch, id, cname, p.value) catch return error.ArgsTooLong;
 }
 
 const MuteTrack = enum { kick, hat, clap, bass, pad };
@@ -4157,6 +4200,79 @@ fn actionSetEvolve(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     cmd.evolve = on;
     _ = publishPatternCommand(app, cmd);
     return "ok";
+}
+
+/// TASK-106.1: host evolve 結果の内部 snapshot。quantize_bar=false で即 publish。
+fn actionPatternState(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const p = try gen_actions.parsePatternState(args);
+    var cmd = patternEditBase(app);
+    cmd.kick = .{ .on = p.kick_on, .lock = p.kick_lock };
+    cmd.hat = .{ .on = p.hat_on, .lock = p.hat_lock };
+    cmd.clap = .{ .on = p.clap_on, .lock = p.clap_lock };
+    cmd.bass = .{
+        .on = p.bass_on,
+        .accent = p.bass_accent,
+        .slide = p.bass_slide,
+        .deg = p.bass_deg,
+        .lock = p.bass_lock,
+    };
+    cmd.evolve = p.evolve;
+    cmd.quantize_bar = false;
+    _ = publishPatternCommand(app, cmd);
+    app.patch.controls.remote_mutation_count.store(p.mutation_count, .release);
+    // host が自 COMMIT を適用した場合も broadcast 済 mutation を揃える。
+    if (platform.netsyncIsHost()) app.last_pattern_state_mut = p.mutation_count;
+    return "ok";
+}
+
+/// netsync 無効 or host → mutate 可。client → pattern_state 受信のみ。
+fn updateEvolveAuthority(app: *App) void {
+    const host = !platform.netsyncActive() or platform.netsyncIsHost();
+    app.patch.controls.evolve_host_authority.store(@intFromBool(host), .release);
+}
+
+/// host main thread: mutation_count 変化、または peer 増加（join）時に pattern_state を COMMIT 配信。
+fn maybeBroadcastPatternState(app: *App) void {
+    if (!platform.netsyncActive() or !platform.netsyncIsHost()) {
+        app.last_broadcast_peer_count = 0;
+        return;
+    }
+    const peers = platform.netsyncPeerCount();
+    const peer_joined = peers > app.last_broadcast_peer_count;
+    app.last_broadcast_peer_count = peers;
+
+    const st = app.patch.snapshotState();
+    const mut_changed = st.mutation_count != app.last_pattern_state_mut;
+    if (!mut_changed and !peer_joined) return;
+
+    const args_payload = gen_actions.PatternStateArgs{
+        .kick_on = st.kick_on,
+        .hat_on = st.hat_on,
+        .clap_on = st.clap_on,
+        .bass_on = st.bass_on,
+        .bass_accent = st.bass_accent,
+        .bass_slide = st.bass_slide,
+        .kick_lock = st.lock[0],
+        .hat_lock = st.lock[1],
+        .clap_lock = st.lock[2],
+        .bass_lock = st.lock[3],
+        .evolve = st.evolve,
+        .mutation_count = st.mutation_count,
+        .bass_deg = st.bass_deg,
+    };
+    var args_buf: [512]u8 = undefined;
+    const args = gen_actions.formatPatternState(&args_buf, args_payload) catch {
+        std.debug.print("[patch] pattern_state format failed\n", .{});
+        return;
+    };
+    var out_buf: [64]u8 = undefined;
+    _ = platform.commitHostAction("pattern_state", args, &out_buf) catch |err| {
+        std.debug.print("[patch] pattern_state broadcast failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    app.last_pattern_state_mut = st.mutation_count;
 }
 
 const StepTarget = enum { kick, hat, clap, bass_on, bass_accent, bass_slide };
@@ -4655,15 +4771,18 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 }
 
 /// CommandLog の kind=normal を seq 順で Entry 化（TASK-62.5.8）。name/args は log 借用。
+/// TASK-106.1: 内部 snapshot `pattern_state` は意味的 recipe から除外する。
 fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
     var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
     var n: usize = 0;
     var i: u32 = 0;
     while (i < log.filled) : (i += 1) {
         const rec = log.recordAt(i);
+        const name = rec.name();
+        if (std.mem.eql(u8, name, "pattern_state")) continue;
         views_buf[n] = .{
             .is_normal = rec.kind == .normal,
-            .name = rec.name(),
+            .name = name,
             .args = rec.args(),
         };
         n += 1;
@@ -4746,6 +4865,7 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "set_pitch", .run = actionSetPitch },
     .{ .name = "seed", .run = actionSeed },
     .{ .name = "pattern", .run = actionPattern },
+    .{ .name = "pattern_state", .run = actionPatternState },
     // TASK-91: Song/Chain/Phrase（recorded）
     .{ .name = "phrase_capture", .run = actionPhraseCapture },
     .{ .name = "chain_set", .run = actionChainSet },
@@ -4786,57 +4906,72 @@ fn recordedAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, 
 
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。記録 wrapper 経由。
+/// network_policy は `gen_actions.PATCH_NETWORK_POLICIES` が単一ソース（TASK-106.1）。
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "set_param", .ctx = app, .run = recordedAction("set_param") });
-    platform.registerAction(.{ .name = "set_mute", .ctx = app, .run = recordedAction("set_mute") });
-    platform.registerAction(.{ .name = "set_lock", .ctx = app, .run = recordedAction("set_lock") });
-    platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = recordedAction("set_evolve") });
-    platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = recordedAction("toggle_step") });
-    platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = recordedAction("set_pitch") });
+    platform.registerAction(.{
+        .name = "set_param",
+        .ctx = app,
+        .run = recordedAction("set_param"),
+        .network_policy = patchPolicy("set_param"),
+        .canonicalize = canonicalizeSetParam,
+    });
+    platform.registerAction(.{ .name = "set_mute", .ctx = app, .run = recordedAction("set_mute"), .network_policy = patchPolicy("set_mute") });
+    platform.registerAction(.{ .name = "set_lock", .ctx = app, .run = recordedAction("set_lock"), .network_policy = patchPolicy("set_lock") });
+    platform.registerAction(.{ .name = "set_evolve", .ctx = app, .run = recordedAction("set_evolve"), .network_policy = patchPolicy("set_evolve") });
+    platform.registerAction(.{ .name = "toggle_step", .ctx = app, .run = recordedAction("toggle_step"), .network_policy = patchPolicy("toggle_step") });
+    platform.registerAction(.{ .name = "set_pitch", .ctx = app, .run = recordedAction("set_pitch"), .network_policy = patchPolicy("set_pitch") });
     platform.registerAction(.{
         .name = "save_pattern",
         .ctx = app,
         .run = actionSavePattern,
-        .network_policy = .local_only,
+        .network_policy = patchPolicy("save_pattern"),
         .desc = "save integrated VPRJ project (alias of save_project)",
     });
     platform.registerAction(.{
         .name = "load_pattern",
         .ctx = app,
         .run = actionLoadPattern,
-        .network_policy = .local_only,
-        .desc = "load SPRM/PTRN from VPRJ (or legacy MDLP)",
+        .network_policy = patchPolicy("load_pattern"),
+        .desc = "load SPRM/PTRN from VPRJ (or legacy MDLP); reject while synced",
     });
-    platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed") });
+    platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed"), .network_policy = patchPolicy("seed") });
     // TASK-93: mini-notation。レシピには記法の生テキストを記録（replay 時 counter 順で再評価→決定的）。
-    platform.registerAction(.{ .name = "pattern", .ctx = app, .run = recordedAction("pattern") });
+    platform.registerAction(.{ .name = "pattern", .ctx = app, .run = recordedAction("pattern"), .network_policy = patchPolicy("pattern") });
+    // TASK-106.1: host 内部 snapshot。非 relay → client PROPOSE は汎用 not relayable。
+    platform.registerAction(.{
+        .name = "pattern_state",
+        .ctx = app,
+        .run = recordedAction("pattern_state"),
+        .network_policy = patchPolicy("pattern_state"),
+        .desc = "host-internal pattern snapshot (not for client propose)",
+    });
     // TASK-91: Song/Chain/Phrase（recorded。seed+recipe 決定性に整合）
-    platform.registerAction(.{ .name = "phrase_capture", .ctx = app, .run = recordedAction("phrase_capture") });
-    platform.registerAction(.{ .name = "chain_set", .ctx = app, .run = recordedAction("chain_set") });
-    platform.registerAction(.{ .name = "song_row", .ctx = app, .run = recordedAction("song_row") });
-    platform.registerAction(.{ .name = "song_len", .ctx = app, .run = recordedAction("song_len") });
-    platform.registerAction(.{ .name = "song_loop", .ctx = app, .run = recordedAction("song_loop") });
-    platform.registerAction(.{ .name = "song_play", .ctx = app, .run = recordedAction("song_play") });
-    platform.registerAction(.{ .name = "song_goto", .ctx = app, .run = recordedAction("song_goto") });
-    // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
-    platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only });
-    platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only });
-    // render（TASK-86）: offline WAV 書き出し。recipe_save と同じ local_only・CommandLog 非記録。
-    platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = .local_only });
-    // TASK-105.4: 統合プロジェクト直列化（VPRJ）。local_only・非記録。
+    platform.registerAction(.{ .name = "phrase_capture", .ctx = app, .run = recordedAction("phrase_capture"), .network_policy = patchPolicy("phrase_capture") });
+    platform.registerAction(.{ .name = "chain_set", .ctx = app, .run = recordedAction("chain_set"), .network_policy = patchPolicy("chain_set") });
+    platform.registerAction(.{ .name = "song_row", .ctx = app, .run = recordedAction("song_row"), .network_policy = patchPolicy("song_row") });
+    platform.registerAction(.{ .name = "song_len", .ctx = app, .run = recordedAction("song_len"), .network_policy = patchPolicy("song_len") });
+    platform.registerAction(.{ .name = "song_loop", .ctx = app, .run = recordedAction("song_loop"), .network_policy = patchPolicy("song_loop") });
+    platform.registerAction(.{ .name = "song_play", .ctx = app, .run = recordedAction("song_play"), .network_policy = patchPolicy("song_play") });
+    platform.registerAction(.{ .name = "song_goto", .ctx = app, .run = recordedAction("song_goto"), .network_policy = patchPolicy("song_goto") });
+    // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。
+    platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = patchPolicy("recipe_save") });
+    platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = patchPolicy("recipe_replay") });
+    // render: session 中は reject（offline 複製が host 変異ストリームを再現できない）。solo は可。
+    platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = patchPolicy("render") });
+    // TASK-105.4: 統合プロジェクト直列化（VPRJ）。非記録。
     platform.registerAction(.{
         .name = "save_project",
         .ctx = app,
         .run = actionSaveProject,
-        .network_policy = .local_only,
+        .network_policy = patchPolicy("save_project"),
         .desc = "save integrated VPRJ project (graph+Ledger+pattern+Song+Params+seed)",
     });
     platform.registerAction(.{
         .name = "load_project",
         .ctx = app,
         .run = actionLoadProject,
-        .network_policy = .local_only,
-        .desc = "load VPRJ or legacy MDLP/MPRJ/PTCG",
+        .network_policy = patchPolicy("load_project"),
+        .desc = "load VPRJ or legacy MDLP/MPRJ/PTCG; reject while synced",
     });
 }
 

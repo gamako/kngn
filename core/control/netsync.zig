@@ -1869,7 +1869,10 @@ fn maxJoinSnapshotSeq() u64 {
 }
 
 /// host ローカル .relay: executor 直（actor=.peer(0), remote_commit）→ COMMIT broadcast。
+/// TASK-106.1: host-generated `pattern_state` もこの facade 経由（app は platform.commitHostAction）。
 pub fn commitAndBroadcast(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    // action frame 上限（name + 空白 + args）を超える payload は broadcast しない。
+    if (name.len + 1 + args.len > MAX_ACTION_FRAME_BYTES) return error.PayloadTooLarge;
     const seq = allocateCommitSeq();
     const out = try applyWireCommit(name, args, 0, seq, null, buf);
     noteWireSeq(seq);
@@ -3685,6 +3688,42 @@ test "netsync: host PROPOSE 再検証 REJECT（non-relay・未知）" {
     const p2 = try parseRejectPayload(r2.payload);
     try testing.expectEqual(@as(u32, 4), p2.proposal_id);
     try testing.expectEqualStrings("not relayable", p2.reason);
+}
+
+test "netsync: pattern_state client PROPOSE は not relayable で REJECT（TASK-106.1）" {
+    resetForTest();
+    defer resetForTest();
+    var ctx: SemCtx = .{};
+    registerSem("pattern_state", &ctx, .reject_when_synced);
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "eve");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [128]u8 = undefined;
+    const bad = try formatProposePayload(&pbuf, 9, "pattern_state", "1111 2222");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), bad);
+    try writer.interface.flush();
+
+    var waited: u64 = 0;
+    while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
+    pump();
+
+    var rbuf: [256]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [128]u8 = undefined;
+    const r1 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.reject), r1.kind);
+    const p1 = try parseRejectPayload(r1.payload);
+    try testing.expectEqual(@as(u32, 9), p1.proposal_id);
+    try testing.expectEqualStrings("not relayable", p1.reason);
+    try testing.expectEqual(@as(u32, 0), ctx.calls);
 }
 
 test "netsync: PROPOSE→COMMIT round-trip（remote_commit で CommandRecord が増える）" {

@@ -228,6 +228,10 @@ pub const Controls = struct {
     // TASK-62.5.7: main→RT の pending seed（次 bar 境界で latch）。gen が変わったら pending を読む。
     pending_seed: std.atomic.Value(u64),
     pending_seed_gen: std.atomic.Value(u64),
+    // TASK-106.1: evolve 実行権（1=host/offline が mutate+density、0=client は pattern_state 受信のみ）
+    evolve_host_authority: std.atomic.Value(u32),
+    // TASK-106.1: client digest 用。host の pattern_state が載せた mutation_count。
+    remote_mutation_count: std.atomic.Value(u32),
 
     pub fn init() Controls {
         return .{
@@ -262,6 +266,8 @@ pub const Controls = struct {
             .song_goto_gen = std.atomic.Value(u64).init(0),
             .pending_seed = std.atomic.Value(u64).init(seedmod.DEFAULT_BASE_SEED),
             .pending_seed_gen = std.atomic.Value(u64).init(0),
+            .evolve_host_authority = std.atomic.Value(u32).init(1),
+            .remote_mutation_count = std.atomic.Value(u32).init(0),
         };
     }
 };
@@ -800,10 +806,12 @@ pub const LofiPatch = struct {
         }
 
         // seed / song 切替 / pending を適用した bar は evolve 変異しない。
-        if (!(applied_seed or applied_song or applied_pending)) self.mutatePattern();
+        // TASK-106.1: mutate / density は host authority のときだけ（client は pattern_state で収束）。
+        const host_auth = self.controls.evolve_host_authority.load(.acquire) != 0;
+        if (host_auth and !(applied_seed or applied_song or applied_pending)) self.mutatePattern();
         // density は pattern の実効 mask を別管理しない。pattern 適用/変異の後、
         // bar ごとに eligible lane の 1 bit だけを target 方向へ寄せる。
-        self.applyDensityTarget(bar);
+        if (host_auth) self.applyDensityTarget(bar);
     }
 
     /// density_target への収束。kick は four-on-floor anchor のため対象外、lock lane も対象外。
@@ -1371,7 +1379,11 @@ pub const LofiPatch = struct {
             .lock = self.lock,
             .evolve = self.evolve,
             .pattern_rev = self.applied_rev,
-            .mutation_count = self.mutation_count,
+            // TASK-106.1: client netsync 中は host から受信した remote mutation_count を digest に出す。
+            .mutation_count = if (self.controls.evolve_host_authority.load(.acquire) != 0)
+                self.mutation_count
+            else
+                self.controls.remote_mutation_count.load(.acquire),
             .ambient_move = if (ambient_lfo) |p| p.rate_hz else 0,
             .ambient_register = if (ambient_turing) |p| p.register else 0,
             .ambient_root_cv = if (ambient_quant) |p| p.last_out else 0,
@@ -2712,4 +2724,72 @@ test "TASK-91: song_len=0 play stops immediately at bar boundary" {
         patch.render(buf, 4800, 2);
     }
     try testing.expect(!patch.song_playing);
+}
+
+// ----------------------------------------------------------------------------
+// TASK-106.1: evolve authority / pattern_state immediate apply
+// ----------------------------------------------------------------------------
+
+test "TASK-106.1: client evolve authority skips mutate (mutation_count stays 0)" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    // evolve ON だが client authority → mutate/density しない
+    var evo = PatternCommand.default();
+    evo.rev = 1;
+    evo.evolve = true;
+    publishPattern(patch, evo);
+    patch.controls.evolve_host_authority.store(0, .release);
+
+    const buf = try testing.allocator.alloc(f32, 4800 * 2);
+    defer testing.allocator.free(buf);
+    var rendered: u64 = 0;
+    while (rendered < 48000 * 8) : (rendered += 4800) {
+        patch.render(buf, 4800, 2);
+    }
+    try testing.expectEqual(@as(u32, 0), patch.mutation_count);
+    try testing.expect(patch.evolve);
+}
+
+test "TASK-106.1: host pattern_state snapshot applies immediately (quantize_bar=false)" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    // client authority: 自 mutate なし。remote snapshot を即反映。
+    patch.controls.evolve_host_authority.store(0, .release);
+    var freeze = PatternCommand.default();
+    freeze.rev = 1;
+    freeze.evolve = true;
+    freeze.kick.on = 0x0001;
+    freeze.quantize_bar = false;
+    publishPattern(patch, freeze);
+
+    var buf: [256]f32 = undefined;
+    patch.render(&buf, 128, 2);
+    try testing.expectEqual(@as(u16, 0x0001), testSeq(patch, patch.kick_seq_h).on_mask);
+
+    var snap = PatternCommand.default();
+    snap.rev = 2;
+    snap.evolve = true;
+    snap.kick.on = 0xABCD;
+    snap.hat.on = 0x1111;
+    snap.clap.on = 0x2222;
+    snap.bass.on = 0x3333;
+    snap.bass.accent = 0x4444;
+    snap.bass.slide = 0x5555;
+    snap.bass.deg = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0 };
+    snap.kick.lock = true;
+    snap.quantize_bar = false;
+    publishPattern(patch, snap);
+    patch.controls.remote_mutation_count.store(7, .release);
+
+    patch.render(&buf, 128, 2);
+    try testing.expectEqual(@as(u16, 0xABCD), testSeq(patch, patch.kick_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x1111), testSeq(patch, patch.hat_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x2222), testSeq(patch, patch.clap_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x3333), testSeq(patch, patch.bass_seq_h).on_mask);
+    try testing.expectEqual(@as(u16, 0x4444), testSeq(patch, patch.bass_seq_h).accent_mask);
+    try testing.expectEqual(@as(u16, 0x5555), testSeq(patch, patch.bass_seq_h).slide_mask);
+    try testing.expectEqualSlices(i8, &snap.bass.deg, &testSeq(patch, patch.bass_seq_h).pitch_deg);
+    try testing.expect(patch.lock[0]);
+    try testing.expectEqual(@as(u32, 7), patch.snapshotState().mutation_count);
+    try testing.expect(patch.pending_bar_cmd == null);
 }

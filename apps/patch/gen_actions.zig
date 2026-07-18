@@ -204,6 +204,179 @@ pub fn parseSongRow(args: []const u8) ParseError!SongRowArgs {
 }
 
 // ============================================================================
+// TASK-106.1: pattern_state 固定 wire format（host evolve snapshot）
+//
+// トークン列（空白区切り・固定 28 要素）:
+//   kick_on hat_on clap_on bass_on bass_accent bass_slide
+//   kick_lock hat_lock clap_lock bass_lock evolve mutation_count
+//   deg0 .. deg15
+// masks は u16 の 4 桁 hex。lock/evolve は 0|1。mutation_count は u32 10 進。
+// deg は i8 10 進。4096B action frame 上限内に収まる。
+// ============================================================================
+
+pub const PatternStateArgs = struct {
+    kick_on: u16,
+    hat_on: u16,
+    clap_on: u16,
+    bass_on: u16,
+    bass_accent: u16,
+    bass_slide: u16,
+    kick_lock: bool,
+    hat_lock: bool,
+    clap_lock: bool,
+    bass_lock: bool,
+    evolve: bool,
+    mutation_count: u32,
+    bass_deg: [16]i8,
+};
+
+fn parseHexU16(tok: []const u8) ParseError!u16 {
+    if (tok.len == 0) return error.InvalidNumber;
+    return std.fmt.parseUnsigned(u16, tok, 16) catch return error.InvalidNumber;
+}
+
+fn parseBool01Tok(tok: []const u8) ParseError!bool {
+    if (std.mem.eql(u8, tok, "0")) return false;
+    if (std.mem.eql(u8, tok, "1")) return true;
+    return error.UnknownBool;
+}
+
+fn parseI8Tok(tok: []const u8) ParseError!i8 {
+    return std.fmt.parseInt(i8, tok, 10) catch return error.InvalidNumber;
+}
+
+/// `pattern_state` wire args を固定形式で decode。
+pub fn parsePatternState(args: []const u8) ParseError!PatternStateArgs {
+    var it = tokenize(args);
+    const kick_on = try parseHexU16(it.next() orelse return error.Empty);
+    const hat_on = try parseHexU16(it.next() orelse return error.Empty);
+    const clap_on = try parseHexU16(it.next() orelse return error.Empty);
+    const bass_on = try parseHexU16(it.next() orelse return error.Empty);
+    const bass_accent = try parseHexU16(it.next() orelse return error.Empty);
+    const bass_slide = try parseHexU16(it.next() orelse return error.Empty);
+    const kick_lock = try parseBool01Tok(it.next() orelse return error.Empty);
+    const hat_lock = try parseBool01Tok(it.next() orelse return error.Empty);
+    const clap_lock = try parseBool01Tok(it.next() orelse return error.Empty);
+    const bass_lock = try parseBool01Tok(it.next() orelse return error.Empty);
+    const evolve = try parseBool01Tok(it.next() orelse return error.Empty);
+    const mut_tok = it.next() orelse return error.Empty;
+    const mutation_count = std.fmt.parseUnsigned(u32, mut_tok, 10) catch return error.InvalidNumber;
+    var bass_deg: [16]i8 = undefined;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        bass_deg[i] = try parseI8Tok(it.next() orelse return error.Empty);
+    }
+    try expectExhausted(&it);
+    return .{
+        .kick_on = kick_on,
+        .hat_on = hat_on,
+        .clap_on = clap_on,
+        .bass_on = bass_on,
+        .bass_accent = bass_accent,
+        .bass_slide = bass_slide,
+        .kick_lock = kick_lock,
+        .hat_lock = hat_lock,
+        .clap_lock = clap_lock,
+        .bass_lock = bass_lock,
+        .evolve = evolve,
+        .mutation_count = mutation_count,
+        .bass_deg = bass_deg,
+    };
+}
+
+/// `pattern_state` wire args を固定形式で encode（masks=4 桁 hex 小文字）。
+pub fn formatPatternState(buf: []u8, p: PatternStateArgs) error{TooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>4} {x:0>4} {x:0>4} {x:0>4} {x:0>4} {x:0>4} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d}", .{
+        p.kick_on,
+        p.hat_on,
+        p.clap_on,
+        p.bass_on,
+        p.bass_accent,
+        p.bass_slide,
+        @intFromBool(p.kick_lock),
+        @intFromBool(p.hat_lock),
+        @intFromBool(p.clap_lock),
+        @intFromBool(p.bass_lock),
+        @intFromBool(p.evolve),
+        p.mutation_count,
+        p.bass_deg[0],
+        p.bass_deg[1],
+        p.bass_deg[2],
+        p.bass_deg[3],
+        p.bass_deg[4],
+        p.bass_deg[5],
+        p.bass_deg[6],
+        p.bass_deg[7],
+        p.bass_deg[8],
+        p.bass_deg[9],
+        p.bass_deg[10],
+        p.bass_deg[11],
+        p.bass_deg[12],
+        p.bass_deg[13],
+        p.bass_deg[14],
+        p.bass_deg[15],
+    }) catch return error.TooLong;
+}
+
+// ============================================================================
+// TASK-106.1: network_policy 表（register + 単体テストの単一ソース。std のみ）
+// ============================================================================
+
+/// platform.NetworkPolicy と同義のタグ（kit/platform 非依存で共有するため別 enum）。
+pub const NetworkPolicyTag = enum { relay, local_only, reject_when_synced };
+
+pub const PolicyEntry = struct {
+    name: []const u8,
+    policy: NetworkPolicyTag,
+};
+
+/// patch 全登録 action の network_policy（TASK-106.1）。register* と回帰テストが参照する。
+pub const PATCH_NETWORK_POLICIES = [_]PolicyEntry{
+    .{ .name = "select_node", .policy = .local_only },
+    .{ .name = "observe_param", .policy = .local_only },
+    .{ .name = "add_node", .policy = .relay },
+    .{ .name = "remove_node", .policy = .relay },
+    .{ .name = "connect", .policy = .relay },
+    .{ .name = "disconnect", .policy = .relay },
+    .{ .name = "move_node", .policy = .relay },
+    .{ .name = "add_macro", .policy = .relay },
+    .{ .name = "remove_macro", .policy = .relay },
+    .{ .name = "save_graph", .policy = .local_only },
+    .{ .name = "load_graph", .policy = .reject_when_synced },
+    .{ .name = "set_param", .policy = .relay },
+    .{ .name = "set_mute", .policy = .relay },
+    .{ .name = "set_lock", .policy = .relay },
+    .{ .name = "set_evolve", .policy = .relay },
+    .{ .name = "toggle_step", .policy = .relay },
+    .{ .name = "set_pitch", .policy = .relay },
+    .{ .name = "save_pattern", .policy = .local_only },
+    .{ .name = "load_pattern", .policy = .reject_when_synced },
+    .{ .name = "seed", .policy = .relay },
+    .{ .name = "pattern", .policy = .relay },
+    .{ .name = "pattern_state", .policy = .reject_when_synced },
+    .{ .name = "phrase_capture", .policy = .relay },
+    .{ .name = "chain_set", .policy = .relay },
+    .{ .name = "song_row", .policy = .relay },
+    .{ .name = "song_len", .policy = .relay },
+    .{ .name = "song_loop", .policy = .relay },
+    .{ .name = "song_play", .policy = .relay },
+    .{ .name = "song_goto", .policy = .relay },
+    .{ .name = "recipe_save", .policy = .local_only },
+    .{ .name = "recipe_replay", .policy = .reject_when_synced },
+    .{ .name = "render", .policy = .reject_when_synced },
+    .{ .name = "save_project", .policy = .local_only },
+    .{ .name = "load_project", .policy = .reject_when_synced },
+};
+
+pub fn policyOf(name: []const u8) ?NetworkPolicyTag {
+    // inline for + comptime eql でビルド時 lookup も成立させる（通常 for だと comptime で null になりうる）。
+    inline for (PATCH_NETWORK_POLICIES) |e| {
+        if (std.mem.eql(u8, e.name, name)) return e.policy;
+    }
+    return null;
+}
+
+// ============================================================================
 // TASK-93: mini-notation パーサ + 評価器（std のみ・固定容量・alloc なし・決定的）
 //
 // 文法（空白区切りトークン列）:
@@ -904,4 +1077,83 @@ test "parseBool01 / parseU8 for song_loop / song_play / song_len / song_goto" {
     try testing.expectEqual(false, try parseBool01("0"));
     try testing.expectEqual(@as(u8, 8), try parseU8("8"));
     try testing.expectEqual(@as(u8, 0), try parseU8("0"));
+}
+
+test "pattern_state: round-trip / 余剰トークン / 非 hex / 4096B 上限" {
+    const sample = PatternStateArgs{
+        .kick_on = 0x1111,
+        .hat_on = 0x2222,
+        .clap_on = 0x3333,
+        .bass_on = 0x4444,
+        .bass_accent = 0x5555,
+        .bass_slide = 0x6666,
+        .kick_lock = true,
+        .hat_lock = false,
+        .clap_lock = true,
+        .bass_lock = false,
+        .evolve = true,
+        .mutation_count = 42,
+        .bass_deg = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    };
+    var buf: [512]u8 = undefined;
+    const encoded = try formatPatternState(&buf, sample);
+    try testing.expect(encoded.len < 4096);
+    const decoded = try parsePatternState(encoded);
+    try testing.expectEqual(sample.kick_on, decoded.kick_on);
+    try testing.expectEqual(sample.hat_on, decoded.hat_on);
+    try testing.expectEqual(sample.clap_on, decoded.clap_on);
+    try testing.expectEqual(sample.bass_on, decoded.bass_on);
+    try testing.expectEqual(sample.bass_accent, decoded.bass_accent);
+    try testing.expectEqual(sample.bass_slide, decoded.bass_slide);
+    try testing.expectEqual(sample.kick_lock, decoded.kick_lock);
+    try testing.expectEqual(sample.hat_lock, decoded.hat_lock);
+    try testing.expectEqual(sample.clap_lock, decoded.clap_lock);
+    try testing.expectEqual(sample.bass_lock, decoded.bass_lock);
+    try testing.expectEqual(sample.evolve, decoded.evolve);
+    try testing.expectEqual(sample.mutation_count, decoded.mutation_count);
+    try testing.expectEqualSlices(i8, &sample.bass_deg, &decoded.bass_deg);
+
+    try testing.expectError(error.Empty, parsePatternState(""));
+    try testing.expectError(error.InvalidNumber, parsePatternState("zzzz 0000 0000 0000 0000 0000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
+    try testing.expectError(error.TooManyTokens, parsePatternState("1111 2222 3333 4444 5555 6666 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 extra"));
+    // deg 不足
+    try testing.expectError(error.Empty, parsePatternState("1111 2222 3333 4444 5555 6666 0 0 0 0 1 0 0 0 0"));
+}
+
+test "pattern_state: parseBool01Tok 不正値は UnknownBool" {
+    // lock/evolve 欄が 0|1 以外
+    try testing.expectError(error.UnknownBool, parsePatternState("1111 2222 3333 4444 5555 6666 2 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
+    try testing.expectError(error.UnknownBool, parsePatternState("1111 2222 3333 4444 5555 6666 0 true 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
+    try testing.expectError(error.UnknownBool, parsePatternState("1111 2222 3333 4444 5555 6666 0 0 0 0 yes 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
+}
+
+test "TASK-106.1 policy table: relay / reject_when_synced / local_only buckets" {
+    const relays = [_][]const u8{
+        "add_node",  "remove_node",    "connect",   "disconnect", "move_node",   "add_macro", "remove_macro",
+        "set_param", "set_mute",       "set_lock",  "set_evolve", "toggle_step", "set_pitch", "seed",
+        "pattern",   "phrase_capture", "chain_set", "song_row",   "song_len",    "song_loop", "song_play",
+        "song_goto",
+    };
+    for (relays) |name| {
+        try testing.expectEqual(NetworkPolicyTag.relay, policyOf(name).?);
+    }
+
+    const rejects = [_][]const u8{ "load_graph", "load_pattern", "load_project", "recipe_replay", "render", "pattern_state" };
+    for (rejects) |name| {
+        try testing.expectEqual(NetworkPolicyTag.reject_when_synced, policyOf(name).?);
+    }
+
+    const locals = [_][]const u8{ "select_node", "observe_param", "save_graph", "save_pattern", "save_project", "recipe_save" };
+    for (locals) |name| {
+        try testing.expectEqual(NetworkPolicyTag.local_only, policyOf(name).?);
+    }
+
+    // 表に無い名前は null
+    try testing.expect(policyOf("no_such_action") == null);
+    // 全エントリが一意
+    for (PATCH_NETWORK_POLICIES, 0..) |a, i| {
+        for (PATCH_NETWORK_POLICIES[i + 1 ..]) |b| {
+            try testing.expect(!std.mem.eql(u8, a.name, b.name));
+        }
+    }
 }

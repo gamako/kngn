@@ -671,6 +671,19 @@ pub const registerStateSync = netsync.registerStateSync;
 /// netsync session が有効か（host/client 接続中）。キーボード undo/redo の経路切替用（TASK-62.3.5）。
 pub const netsyncActive = netsync.isEnabled;
 
+/// このプロセスが netsync host か（TASK-106.1 pattern_state 配信判定）。
+pub const netsyncIsHost = netsync.isHost;
+
+/// 接続中 peer 数（host=active client 数 / client=自分のみ）。generic 透過 facade。
+pub const netsyncPeerCount = netsync.peerCount;
+
+/// host-generated internal action を COMMIT broadcast する（name+args 透過・framework 非解釈）。
+/// host 以外 / netsync 無効時は `error.NotHost`。RT thread からは呼ばない（main thread イベント境界のみ）。
+pub fn commitHostAction(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    if (!netsync.isEnabled() or !netsync.isHost()) return error.NotHost;
+    return netsync.commitAndBroadcast(name, args, buf);
+}
+
 /// action を netsync router 経由で実行（router 未設定時は dispatch 等価）。
 pub const routeAction = harness.action_registry.routeLocalAction;
 
