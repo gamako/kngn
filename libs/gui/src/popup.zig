@@ -287,6 +287,37 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
     }
 }
 
+/// tooltip overlay 描画（TASK-145.2）。
+/// `layoutPopup` のクランプ規則で画面内に収め、popupMenu と同じく DrawList に
+/// rectFilled / rectOutline / textEx を積む。text は caller が frame arena 上に複製済みであること
+/// （Context.tooltip が dupe する）。screen_w/h が 0 なら no-op（layoutPopup の assert 回避）。
+/// 位置: anchor 下端 + 4px（はみ出しは layoutPopup が clamp）。
+pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
+    if (ctx.screen_w == 0 or ctx.screen_h == 0) return;
+    const style = ctx.style;
+    const pad = style.popup_padding;
+    const metrics = ctx.font.metrics();
+    const line_h: i32 = @intCast(metrics.line_height);
+    if (line_h <= 0) return;
+    const content_w: i32 = @intCast(ctx.font.measure(text));
+    const pos: Vec2 = .{
+        .x = anchor.x,
+        .y = anchor.y + @as(i32, @intCast(anchor.h)) + 4,
+    };
+    const geo = layoutPopup(pos, 1, content_w, line_h, pad, ctx.screen_w, ctx.screen_h);
+
+    const dl = &ctx.draw_list;
+    dl.pushClip(geo.outer) catch @panic("tooltip: OOM");
+    defer dl.popClip();
+    dl.rectFilled(geo.outer, style.bg) catch @panic("tooltip: OOM");
+    dl.rectOutline(geo.outer, style.border, 1) catch @panic("tooltip: OOM");
+
+    const r = itemRect(geo, 0);
+    if (r.isEmpty()) return;
+    const text_y = r.y + @divTrunc(geo.item_h - line_h, 2);
+    dl.textEx(.{ .x = r.x + 4, .y = text_y }, text, style.text, null) catch @panic("tooltip: OOM");
+}
+
 // ============================================================
 // Tests
 // ============================================================

@@ -6,7 +6,7 @@ digest gallery
 expect gallery section=overview
 expect gallery index=0
 expect gallery widgets=0
-expect gallery missing=15
+expect gallery missing=14
 expect gallery schema=v0
 snapshot fb
 
@@ -80,7 +80,27 @@ inject key_up PAGE_DOWN
 step 1
 digest gallery
 expect gallery section=layout
-expect gallery widgets=3
+expect gallery widgets=4
+snapshot fb
+# layout: iconButton hover 500ms → tooltip（beginFrame は frame_index/60 → step 32 ≈ 0.53s）
+# pen center ≈ (144,124): outer pad16 + header64 + gap16 + content pad16 + icon pad4
+#   x: 16+16 + "iconButton:"(11*8=88) + gap8 + half icon_w(16) = 144
+inject mouse_move 144 124
+step 32
+digest gallery
+expect gallery hot=iconButton
+snapshot fb
+# brush center ≈ (184,124) 長文 tip（layoutPopup クランプ経路）
+inject mouse_move 184 124
+step 32
+digest gallery
+expect gallery hot=iconButton
+snapshot fb
+# leave → tooltip 消灯
+inject mouse_move 1000 620
+step 2
+digest gallery
+expect gallery hot=none
 snapshot fb
 # layout -> menus
 inject key_down PAGE_DOWN
@@ -113,7 +133,7 @@ step 1
 digest gallery
 expect gallery section=missing
 expect gallery index=8
-expect gallery widgets=15
-expect gallery missing=15
+expect gallery widgets=14
+expect gallery missing=14
 snapshot fb
 quit

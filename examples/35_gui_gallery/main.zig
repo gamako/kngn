@@ -36,15 +36,15 @@ const SectionMeta = struct {
 };
 
 const SECTIONS = [_]SectionMeta{
-    .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = 15 },
+    .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = 14 },
     .{ .name = "basic", .detail = "button / label", .widgets = 2, .missing = 0 },
     .{ .name = "text", .detail = "selectableLabel / textInputId", .widgets = 2, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
-    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton", .widgets = 3, .missing = 0 },
+    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip", .widgets = 4, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
-    .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 15, .missing = 15 },
+    .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 14, .missing = 14 },
 };
 
 const MatrixRow = struct {
@@ -75,6 +75,7 @@ const LAYOUT_MATRIX = [_]MatrixRow{
     .{ .name = "splitter", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
     .{ .name = "scrollArea", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
     .{ .name = "iconButton", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
+    .{ .name = "tooltip", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
 };
 const MENUS_MATRIX = [_]MatrixRow{
     .{ .name = "popup/ctx", .cells = .{ "ok", "ok", "ok", "N/A", "item", "N/A", "N/A", "N/A", "ok" } },
@@ -98,7 +99,6 @@ const MISSING = [_]MissingEntry{
     .{ .name = "Spinbutton", .target = "121.3" },
     .{ .name = "Table", .target = "121.4" },
     .{ .name = "Tabs", .target = "121.3" },
-    .{ .name = "Tooltip", .target = "121.3 / Phase 2" },
     .{ .name = "Tree View", .target = "121.4" },
     .{ .name = "Treegrid", .target = "Phase 2" },
 };
@@ -347,7 +347,7 @@ fn renderOverview(ctx: *gui.Context) void {
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
     ctx.label("Existing API: 16 semantic widgets");
-    ctx.label("Missing placeholders: 15");
+    ctx.label("Missing placeholders: 14");
     ctx.label("Context: normal / demo / gaps");
     ctx.endBox();
     ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
@@ -400,11 +400,14 @@ fn renderColor(ctx: *gui.Context, app: *App) void {
 fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
     // iconButton: selected (pen) / normal (brush) — app 側 16x16 1bit 資産
+    // tooltip は直前 interactive widget に付く（TASK-145.2）。hover 500ms で overlay。
     ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
     ctx.label("iconButton:");
     _ = ctx.iconButtonId(Ids.icon_pen, &ICON_PEN, true);
+    ctx.tooltip("Pen (P)");
     _ = ctx.iconButtonId(Ids.icon_brush, &ICON_BRUSH, false);
-    ctx.labelEx("selected / normal", ctx.style.text_subtle);
+    ctx.tooltip("Brush (B) — long tooltip text for edge clamp demo");
+    ctx.labelEx("selected / normal + tooltip", ctx.style.text_subtle);
     ctx.endBox();
 
     ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });

@@ -146,6 +146,23 @@ pub const Context = struct {
     /// null = 閉じている。非 null 時は buttonBehavior が背後 widget の hover/active 取得を
     /// 抑止する（モーダル吸収。詳細は buttonBehavior の doc comment / popup.zig 参照）。
     popup_state: ?PopupState = null,
+    // ── tooltip（TASK-145.2）。PerIdStateStore 不使用・同時 1 候補。
+    // フレーム跨ぎ: hover 追跡（id / 開始時刻 / rect）。frame-local は beginFrame で reset。
+    /// 継続 hover 中の widget id（0 = 未追跡）。
+    tooltip_hover_id: Id = 0,
+    /// 継続 hover 開始時刻（`now()` / beginFrameAt 仮想時刻）。
+    tooltip_hover_start_s: f64 = 0,
+    /// 継続 hover 開始時の rect（移動したら断絶扱い）。
+    tooltip_hover_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// 当フレームに tooltip() が hover 対象を refresh したか（未構築 stale 抑止用）。
+    tooltip_hover_refreshed: bool = false,
+    /// 直前 interactive widget（behaviorFromCache が更新。frame-local）。
+    tooltip_last_id: Id = 0,
+    tooltip_last_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    tooltip_last_hovered: bool = false,
+    /// 当フレーム endFrame で発行する候補（frame arena 上の text。未成立は null）。
+    tooltip_candidate_text: ?[]const u8 = null,
+    tooltip_candidate_anchor: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// IME composition（preedit）の frame-local 状態。beginFrame で空に戻り、
     /// アプリが widget 呼び出し前に setComposition で毎フレーム設定する（TASK-113.3）。
     composition: input_mod.CompositionState = .{},
@@ -248,6 +265,13 @@ pub const Context = struct {
         self.composition = .{};
         self.wheel_remaining = .{};
         self.wheel_remaining_seeded = false;
+        // tooltip frame-local（継続 hover の id/start/rect は跨ぎ保持）
+        self.tooltip_last_id = 0;
+        self.tooltip_last_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        self.tooltip_last_hovered = false;
+        self.tooltip_hover_refreshed = false;
+        self.tooltip_candidate_text = null;
+        self.tooltip_candidate_anchor = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         self.draw_list.reset(screen_w, screen_h);
         // レイアウトツリーの暗黙 root（caller は気にせず beginBox から使う）
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");
@@ -274,6 +298,14 @@ pub const Context = struct {
             self.rect_cache.clearRetainingCapacity();
             self.updateRectCache(root, screen_rect);
             self.emitNode(root);
+        }
+        // tooltip overlay: layout UI の後・frame_active=false 前（popupMenu より下。popup は endFrame 後）。
+        if (self.tooltip_candidate_text) |text| {
+            popup_mod.drawTooltipOverlay(self, text, self.tooltip_candidate_anchor);
+        }
+        // 当フレームに対象が refresh されなければ timer clear（hidden widget の stale 抑止）
+        if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
+            self.tooltip_hover_id = 0;
         }
         self.frame_active = false;
         // TextInput 等の focus widget が当フレームの外側クリックを claim しなかった
@@ -345,9 +377,48 @@ pub const Context = struct {
         return self.now_s;
     }
 
+    /// tooltip 遅延（秒）。beginFrameAt 仮想時刻で決定的にテストする。
+    pub const tooltip_delay_s: f64 = 0.5;
+
+    /// 直前 interactive widget を記録（behaviorFromCache から additive に呼ばれる）。
+    /// rect cache 未生成でも hovered=false で記録し、tooltip() が no-op できるようにする。
+    pub fn noteLastInteractive(self: *Context, id: Id, rect: Rect, hovered: bool) void {
+        std.debug.assert(self.frame_active);
+        self.tooltip_last_id = id;
+        self.tooltip_last_rect = rect;
+        self.tooltip_last_hovered = hovered;
+    }
+
+    /// 直前に評価した interactive widget にツールチップを付ける。
+    /// 当フレーム非 hover なら no-op。同 id・同 rect の継続時間が `tooltip_delay_s` 以上で
+    /// endFrame 末尾に overlay 候補を立てる。text は frame arena に複製する。
+    pub fn tooltip(self: *Context, text: []const u8) void {
+        std.debug.assert(self.frame_active);
+        if (!self.tooltip_last_hovered or self.tooltip_last_id == 0) return;
+
+        const id = self.tooltip_last_id;
+        const rect = self.tooltip_last_rect;
+        if (id != self.tooltip_hover_id or !tooltipRectEq(rect, self.tooltip_hover_rect)) {
+            self.tooltip_hover_id = id;
+            self.tooltip_hover_rect = rect;
+            self.tooltip_hover_start_s = self.now();
+        }
+        self.tooltip_hover_refreshed = true;
+
+        if (self.now() - self.tooltip_hover_start_s < tooltip_delay_s) return;
+
+        const dup = self.allocator().dupe(u8, text) catch @panic("tooltip: OOM");
+        self.tooltip_candidate_text = dup;
+        self.tooltip_candidate_anchor = rect;
+    }
+
     pub fn perIdState(self: *Context, id: Id) *state_mod.PerIdState {
         std.debug.assert(id != 0);
         return self.per_id_state.getOrPut(self.gpa, id);
+    }
+
+    fn tooltipRectEq(a: Rect, b: Rect) bool {
+        return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
     }
 
     // ──────────────────────────────────────────────
@@ -1227,4 +1298,217 @@ test "label: 既定色が style.text に追従する" {
     ctx.endFrame();
 
     try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].text.color);
+}
+
+// ──────────────────────────────────────────────
+// tooltip（TASK-145.2）
+// ──────────────────────────────────────────────
+
+fn tooltipHasText(ctx: *const Context, expected: []const u8) bool {
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text and std.mem.eql(u8, cmd.text.text, expected)) return true;
+    }
+    return false;
+}
+
+fn tooltipOverlayBgRect(ctx: *const Context, tip: []const u8) ?Rect {
+    // endFrame 後: … layout cmds … then tooltip: rect_filled, rect_outline, text
+    var i: usize = 0;
+    while (i < ctx.draw_list.cmds.items.len) : (i += 1) {
+        const cmd = ctx.draw_list.cmds.items[i];
+        if (cmd == .text and std.mem.eql(u8, cmd.text.text, tip)) {
+            if (i >= 2 and ctx.draw_list.cmds.items[i - 2] == .rect_filled) {
+                return ctx.draw_list.cmds.items[i - 2].rect_filled.rect;
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+fn hoverButtonWithTip(ctx: *Context, id: Id, label: []const u8, tip: []const u8, now_s: f64) void {
+    ctx.beginFrameAt(800, 600, now_s);
+    const r = ctx.getNodeRect(id) orelse Rect{ .x = 0, .y = 0, .w = 48, .h = 24 };
+    const cx = r.x + @as(i32, @intCast(r.w / 2));
+    const cy = r.y + @as(i32, @intCast(r.h / 2));
+    ctx.pushEvent(.{ .mouse_move = .{ .x = cx, .y = cy, .modifiers = 0 } });
+    _ = ctx.buttonId(id, label, .{});
+    ctx.tooltip(tip);
+    ctx.endFrame();
+}
+
+test "tooltip: 初回 hover では非表示" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "hello tip", 0.0);
+    try std.testing.expect(!tooltipHasText(&ctx, "hello tip"));
+}
+
+test "tooltip: 0.0→0.4→0.5 の 500ms 境界（未満非表示・到達で表示）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.0);
+    try std.testing.expect(!tooltipHasText(&ctx, "tip"));
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.4);
+    try std.testing.expect(!tooltipHasText(&ctx, "tip"));
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "tip"));
+}
+
+test "tooltip: overlay は draw list 末尾に text を追加する" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+    const before_tip_len = blk: {
+        hoverButtonWithTip(&ctx, 1, "Btn", "tail tip", 0.0);
+        break :blk ctx.draw_list.cmds.items.len;
+    };
+    hoverButtonWithTip(&ctx, 1, "Btn", "tail tip", 0.5);
+    const cmds = ctx.draw_list.cmds.items;
+    try std.testing.expect(cmds.len > before_tip_len);
+    try std.testing.expect(cmds[cmds.len - 1] == .text);
+    try std.testing.expectEqualStrings("tail tip", cmds[cmds.len - 1].text.text);
+}
+
+test "tooltip: leave 後の次 frame で overlay が消える" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "gone", 0.0);
+    hoverButtonWithTip(&ctx, 1, "Btn", "gone", 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "gone"));
+
+    // leave: 外へ move
+    ctx.beginFrameAt(800, 600, 0.6);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 700, .y = 500, .modifiers = 0 } });
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.tooltip("gone");
+    ctx.endFrame();
+    try std.testing.expect(!tooltipHasText(&ctx, "gone"));
+}
+
+test "tooltip: 画面端で outer が screen 内にクランプされる" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const tip = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"; // 長文で右端クランプ誘発
+
+    // 右下寄りにボタンを置く
+    ctx.beginFrameAt(200, 80, 0.0);
+    ctx.beginBox(.{ .direction = .column });
+    ctx.beginBox(.{ .height = .{ .fixed = 50 }, .width = .{ .fixed = 150 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row });
+    ctx.beginBox(.{ .width = .{ .fixed = 150 } });
+    ctx.endBox();
+    _ = ctx.buttonId(1, "E", .{});
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const r = ctx.getNodeRect(1).?;
+    const cx = r.x + @as(i32, @intCast(r.w / 2));
+    const cy = r.y + @as(i32, @intCast(r.h / 2));
+
+    ctx.beginFrameAt(200, 80, 0.0);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = cx, .y = cy, .modifiers = 0 } });
+    ctx.beginBox(.{ .direction = .column });
+    ctx.beginBox(.{ .height = .{ .fixed = 50 }, .width = .{ .fixed = 150 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row });
+    ctx.beginBox(.{ .width = .{ .fixed = 150 } });
+    ctx.endBox();
+    _ = ctx.buttonId(1, "E", .{});
+    ctx.tooltip(tip);
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.beginFrameAt(200, 80, 0.5);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = cx, .y = cy, .modifiers = 0 } });
+    ctx.beginBox(.{ .direction = .column });
+    ctx.beginBox(.{ .height = .{ .fixed = 50 }, .width = .{ .fixed = 150 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row });
+    ctx.beginBox(.{ .width = .{ .fixed = 150 } });
+    ctx.endBox();
+    _ = ctx.buttonId(1, "E", .{});
+    ctx.tooltip(tip);
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const bg = tooltipOverlayBgRect(&ctx, tip).?;
+    try std.testing.expect(bg.x >= 0);
+    try std.testing.expect(bg.y >= 0);
+    try std.testing.expect(@as(i64, bg.x) + bg.w <= 200);
+    try std.testing.expect(@as(i64, bg.y) + bg.h <= 80);
+}
+
+test "tooltip: leave 後の再 hover は timer を引き継がない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "re", 0.0);
+    hoverButtonWithTip(&ctx, 1, "Btn", "re", 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "re"));
+
+    // leave
+    ctx.beginFrameAt(800, 600, 1.0);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 700, .y = 500, .modifiers = 0 } });
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.tooltip("re");
+    ctx.endFrame();
+    try std.testing.expect(!tooltipHasText(&ctx, "re"));
+
+    // 再 hover: 即表示されず、delay 未満は非表示
+    hoverButtonWithTip(&ctx, 1, "Btn", "re", 1.0);
+    try std.testing.expect(!tooltipHasText(&ctx, "re"));
+    hoverButtonWithTip(&ctx, 1, "Btn", "re", 1.4);
+    try std.testing.expect(!tooltipHasText(&ctx, "re"));
+    hoverButtonWithTip(&ctx, 1, "Btn", "re", 1.5);
+    try std.testing.expect(tooltipHasText(&ctx, "re"));
+}
+
+test "tooltip: 当フレーム未構築なら stale overlay が出ない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "stale", 0.0);
+    hoverButtonWithTip(&ctx, 1, "Btn", "stale", 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "stale"));
+
+    // 対象 widget を構築せず empty frame
+    ctx.beginFrameAt(800, 600, 0.6);
+    ctx.beginBox(.{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(!tooltipHasText(&ctx, "stale"));
+    try std.testing.expectEqual(@as(Id, 0), ctx.tooltip_hover_id);
 }

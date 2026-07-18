@@ -286,9 +286,17 @@ const IconButtonDraw = struct {
 
 /// 前フレームの rect キャッシュで同期 hit-test。キャッシュ未生成（初回フレーム・
 /// 前フレーム非表示）の widget は非ヒット扱い（21.2/21.4 契約）。
+/// TASK-145.2: 直前 widget 情報を Context へ additive に記録（戻り値・hit-test 挙動は不変）。
+/// tooltip は `result.hovered`（buttonBehavior 生値）を使い、state.hot_id は見ない。
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
-    const cached = ctx.rect_cache.get(id) orelse return .{};
-    return context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+    const cached = ctx.rect_cache.get(id) orelse {
+        // cache 未生成でも直前 widget として記録（hovered=false）。tooltip は no-op できる。
+        ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
+        return .{};
+    };
+    const result = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+    ctx.noteLastInteractive(id, cached.rect, result.hovered);
+    return result;
 }
 
 /// SelectableLabel（read-only）。編集・caret・複数行・折返しは扱わない。
