@@ -1759,6 +1759,17 @@ pub fn build(b: *std.Build) void {
     const run_modular_cmd_seed_test = b.addRunArtifact(modular_cmd_seed_test);
     test_app_modular_step.dependOn(&run_modular_cmd_seed_test.step);
 
+    // TASK-106.4: patch undo CommandAdapter 契約（pattern/ring/epoch。main 非依存）
+    const patch_undo_cmd_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/patch/undo_cmd_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    patch_undo_cmd_test_mod.addImport("command", command_test_mod);
+    const patch_undo_cmd_test = b.addTest(.{ .root_module = patch_undo_cmd_test_mod });
+    const run_patch_undo_cmd_test = b.addRunArtifact(patch_undo_cmd_test);
+    test_app_modular_step.dependOn(&run_patch_undo_cmd_test.step);
+
     // apps/patch 純ロジックテスト集約 root（canvas: camera 変換 / hit-test / 見切れ検出 + group: グループ台帳 /
     // expose 導出 / 表示写像。display/audio 不要。TASK-40.6.2 / 40.7.1）
     const patch_tests_mod = b.createModule(.{

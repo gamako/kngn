@@ -41,7 +41,7 @@ canonicalize hook（`action_registry` 既存契約）が router 前に `#id` へ
 
 ## undo
 
-構造 action は relay するが `undoable=false`（106.4 まで逆操作形式を別設計）。pixie TASK-94 構造 op MVP と同方針。
+TASK-106.4 で固定長 `PatchUndoEntry` + `CommandAdapter` による逆操作を追加（詳細は `docs/notes/TASK-106.4_undo.md`）。
 
 ## digest
 

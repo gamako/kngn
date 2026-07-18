@@ -41,6 +41,7 @@ host/client の bar 位相は同期しない。発音開始の完全一致は要
   - peer 数が増えた（join 検出。新規 client が次変異を待たず最新 pattern を受け取れる）
 - client は `pattern_state` → `pattern_db.publish` + `remote_mutation_count`（digest `mut` に反映）
 - `pattern_state` は recipe 抽出から除外（意味的 action 列の汚染防止）
+- TASK-106.4: `pattern_state` は undo 対象外（host 生成の収束用状態。ユーザー intent ではない）
 
 bar 境界順序は不変: **seed → song → pending_bar_cmd → mutate → density**
 

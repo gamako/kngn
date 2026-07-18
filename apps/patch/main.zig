@@ -52,6 +52,7 @@ const pattern_io = @import("pattern_io.zig");
 const project_io = @import("project_io.zig");
 const wav = @import("wav.zig");
 const seedmod = @import("seed.zig");
+const patch_undo = @import("undo.zig");
 
 const DynGraph = modular.DynGraph;
 const PortKind = modular.PortKind;
@@ -193,12 +194,14 @@ const MAX_PARAM_EDITS: usize = patchmod.MAX_PARAM_OVERRIDES;
 // ── File メニュー（TASK-136）──────────────────────────────────────────────
 // GUI fallback 行の高さ（box padding 4+4 + button ≈24）。native 時は OS メニューバーのため 0。
 const MENU_GUI_H: f32 = 32;
-const MENU_CMD_CAP: usize = 8;
+const MENU_CMD_CAP: usize = 16;
 const MenuFileOp = enum { save_project, open_project };
 const CmdId = struct {
     pub const save_project: platform.CommandId = 1;
     pub const open_project: platform.CommandId = 2;
     pub const quit: platform.CommandId = 3;
+    pub const undo: platform.CommandId = 4;
+    pub const redo: platform.CommandId = 5;
 };
 
 /// canvas 幅に収まる列数（button.x + button.w <= canvas_w。最大 PAL_COLS_MAX）。
@@ -339,6 +342,8 @@ fn b01(v: bool) u8 {
     return if (v) 1 else 0;
 }
 
+/// TASK-106.4: inspector slider の drag 開始時 before 値を保持し、release 時に 1 つの
+/// undoable な set_param として記録する（drag 中の連続 override は記録しない）。
 const App = struct {
     /// 生成レイヤと DynGraph の唯一の所有者。patch 自体は heap 上で固定し、RT userdata から動かさない。
     patch: *LofiPatch,
@@ -411,6 +416,14 @@ const App = struct {
     last_pattern_state_mut: u32 = 0,
     // TASK-106.1: 直前 frame の peer 数。増加時は join 強制 pattern_state 配信。
     last_broadcast_peer_count: usize = 0,
+
+    // TASK-106.4: 固定長 undo payload（CommandLog.undo_ref = gen）。~1.16MiB のため heap（Windows 1MB stack 回避）。
+    undo_store: *patch_undo.PatchUndoStore,
+    /// inspector slider release 時に set_param へ渡す before-state（drag 中に埋める）。
+    pending_param_undo_before: ?patch_undo.ParamValueSnap = null,
+    /// inspector drag 開始時の before 捕捉（release で pending_param_undo_before へ移す）。
+    /// 単一 Optional: 同時に複数 slider を drag する UI は無く、1 本分のみ保持する制約。
+    slider_drag_before: ?patch_undo.ParamValueSnap = null,
 
     // TASK-136: File メニュー（native NSMenu / GUI fallback）+ dialog 経由 save/load。
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
@@ -518,7 +531,36 @@ const App = struct {
     }
 
     fn releaseParamEdits(self: *App) void {
-        for (&self.param_edits) |*state| state.release();
+        const before = self.slider_drag_before;
+        self.slider_drag_before = null;
+        var committed = false;
+        for (&self.param_edits) |*state| {
+            const was_dragging = state.dragging;
+            state.release();
+            if (committed or !was_dragging) continue;
+            if (before) |b| {
+                if (b.mode != 1 or state.key.invalid()) continue;
+                const final_raw: f32 = blk: {
+                    if (state.pending) |pv| break :blk switch (pv) {
+                        .scalar => |v| v,
+                        .choice => |idx| @floatFromInt(idx),
+                    };
+                    const snap = modular.getParam(self.dyn, @intCast(state.key.handle), state.key.name) catch break :blk @as(f32, @bitCast(b.value_bits));
+                    break :blk switch (snap) {
+                        .scalar => |v| v,
+                        .choice => |idx| @floatFromInt(idx),
+                    };
+                };
+                self.pending_param_undo_before = b;
+                var args_buf: [128]u8 = undefined;
+                const args = std.fmt.bufPrint(&args_buf, "#{d} {s} {d}", .{ b.node_id, b.name(), final_raw }) catch {
+                    self.pending_param_undo_before = null;
+                    continue;
+                };
+                routeUiAction(self, "set_param", args);
+                committed = true;
+            }
+        }
     }
 
     fn advanceParamEdits(self: *App) void {
@@ -655,6 +697,22 @@ const App = struct {
             }
         }.go;
         put(self, &n, .{
+            .id = CmdId.undo,
+            .label = "Undo",
+            .menu = .{ .title = "Edit", .order = 100 },
+            .shortcut = .{ .key = .Z, .modifiers = accel_mod },
+            .execution_policy = .undo,
+        });
+        var redo_mod = accel_mod;
+        redo_mod.shift = true;
+        put(self, &n, .{
+            .id = CmdId.redo,
+            .label = "Redo",
+            .menu = .{ .title = "Edit", .order = 101 },
+            .shortcut = .{ .key = .Z, .modifiers = redo_mod },
+            .execution_policy = .redo,
+        });
+        put(self, &n, .{
             .id = CmdId.save_project,
             .label = "Save Project",
             .menu = .{ .title = "File", .order = 100 },
@@ -692,6 +750,8 @@ const App = struct {
         const cmd = self.findMenuCommand(id) orelse return;
         if (!cmd.enabled) return;
         switch (id) {
+            CmdId.undo => doUndo(self),
+            CmdId.redo => doRedo(self),
             CmdId.save_project => {
                 self.pending_menu_op = .save_project;
                 self.menu_last_op = .save_project;
@@ -1192,26 +1252,30 @@ fn isGeneratedStepSeq(app: *const App, h: Handle) bool {
 /// standalone は atomic accessor のみ（TASK-133）。
 fn toggleInlineStepSeqCell(app: *App, hit: InlineGridHit) void {
     if (isGeneratedStepSeq(app, hit.handle)) {
-        var cmd = patternEditBase(app);
-        const mask = bitOf(hit.cell.step);
-        if (hit.handle == app.patch.kick_seq_h) {
-            if (hit.cell.row != 0) return;
-            cmd.kick.on ^= mask;
-        } else if (hit.handle == app.patch.hat_seq_h) {
-            if (hit.cell.row != 0) return;
-            cmd.hat.on ^= mask;
-        } else if (hit.handle == app.patch.clap_seq_h) {
-            if (hit.cell.row != 0) return;
-            cmd.clap.on ^= mask;
-        } else if (hit.handle == app.patch.bass_seq_h) {
-            switch (hit.cell.row) {
-                0 => cmd.bass.on ^= mask,
-                1 => cmd.bass.accent ^= mask,
-                2 => cmd.bass.slide ^= mask,
-                else => return,
-            }
-        } else return;
-        _ = publishPatternCommand(app, cmd);
+        const target: ?[]const u8 = blk: {
+            if (hit.handle == app.patch.kick_seq_h) {
+                if (hit.cell.row != 0) break :blk null;
+                break :blk "kick";
+            } else if (hit.handle == app.patch.hat_seq_h) {
+                if (hit.cell.row != 0) break :blk null;
+                break :blk "hat";
+            } else if (hit.handle == app.patch.clap_seq_h) {
+                if (hit.cell.row != 0) break :blk null;
+                break :blk "clap";
+            } else if (hit.handle == app.patch.bass_seq_h) {
+                break :blk switch (hit.cell.row) {
+                    0 => "bass_on",
+                    1 => "bass_accent",
+                    2 => "bass_slide",
+                    else => null,
+                };
+            } else break :blk null;
+        };
+        if (target) |name| {
+            var args_buf: [32]u8 = undefined;
+            const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ name, hit.cell.step }) catch return;
+            routeUiAction(app, "toggle_step", args);
+        }
         return;
     }
     const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, hit.handle);
@@ -1270,23 +1334,25 @@ fn toggleMacroGridCell(app: *App, hit: GridHit) void {
     const seqs = collectStepSeqMembers(app, hit.gid);
     if (seqs.n == 0) return;
     if (generatedMacroGroup(app, hit.gid)) {
-        var cmd = patternEditBase(app);
-        const mask = bitOf(hit.cell.step);
-        switch (kind) {
+        const target: ?[]const u8 = switch (kind) {
             .drum_machine => switch (hit.cell.row) {
-                0 => cmd.kick.on ^= mask,
-                1 => cmd.hat.on ^= mask,
-                2 => cmd.clap.on ^= mask,
-                else => return,
+                0 => "kick",
+                1 => "hat",
+                2 => "clap",
+                else => null,
             },
             .bass_machine => switch (hit.cell.row) {
-                0 => cmd.bass.on ^= mask,
-                1 => cmd.bass.accent ^= mask,
-                2 => cmd.bass.slide ^= mask,
-                else => return,
+                0 => "bass_on",
+                1 => "bass_accent",
+                2 => "bass_slide",
+                else => null,
             },
+        };
+        if (target) |name| {
+            var args_buf: [32]u8 = undefined;
+            const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ name, hit.cell.step }) catch return;
+            routeUiAction(app, "toggle_step", args);
         }
-        _ = publishPatternCommand(app, cmd);
         return;
     }
     switch (kind) {
@@ -1794,12 +1860,25 @@ fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
 }
 
 /// wire `add_macro` 用: world 座標をそのまま group.pos に使う（clamp なし。peer 決定性のため）。
-fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f) !void {
+/// NodeId は常に `allocNodeId` の単調採番（redo も fresh id。pixie 同型）。
+fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f, out_ids: *[patch_undo.MAX_MACRO_MEMBERS]u64, out_n: *u8) !void {
+    const assignIds = struct {
+        fn go(a: *App, members: []const Handle, out: *[patch_undo.MAX_MACRO_MEMBERS]u64, on: *u8) void {
+            on.* = 0;
+            for (members) |m| {
+                _ = allocNodeId(a, m);
+                if (on.* < patch_undo.MAX_MACRO_MEMBERS) {
+                    out[on.*] = nodeIdOf(a, m).?.raw();
+                    on.* += 1;
+                }
+            }
+        }
+    }.go;
     switch (kind) {
         .drum_machine => {
             const h = try macro.buildDrumMachine(app.dyn);
             const members = [_]Handle{ h.cdiv, h.seq_k, h.seq_h, h.kick, h.hat, h.mix };
-            for (members) |m| _ = allocNodeId(app, m);
+            assignIds(app, &members, out_ids, out_n);
             const gid = app.ledger.alloc() orelse {
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
@@ -1814,7 +1893,7 @@ fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f) !void {
         .bass_machine => {
             const h = try macro.buildBassMachine(app.dyn);
             const members = [_]Handle{ h.seq, h.vco, h.vcf, h.env, h.vca };
-            for (members) |m| _ = allocNodeId(app, m);
+            assignIds(app, &members, out_ids, out_n);
             const gid = app.ledger.alloc() orelse {
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
@@ -2202,7 +2281,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer patch.destroy();
 
-    app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32 };
+    const undo_store = patch_undo.PatchUndoStore.create(allocator) catch |err| {
+        std.debug.print("PatchUndoStore.create failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer undo_store.destroy();
+
+    app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32, .undo_store = undo_store };
     app.observed_field = param_view.keyFor(.cutoff, transportHandles(&app));
     // 生成グラフ全体を canvas に配置する（初期状態は 8 列の折り返し。Drum/Bass の
     // マクロ台帳は既存 canvas 操作に任せ、全モジュールを MAX_MODULES 内で可視化する）。
@@ -2250,6 +2335,8 @@ pub fn main(init: std.process.Init) !void {
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
     app.cmd_exec.log = &app.cmd_log;
+    // TASK-106.4: undo 逆適用アダプタ。
+    app.cmd_exec.adapter = .{ .ctx = &app, .canUndo = patchCanUndo, .applyUndo = patchApplyUndo, .summarize = patchSummarize };
     platform.setCommandExecutor(&app.cmd_exec);
     registerPatchActions(&app);
     registerActions(&app);
@@ -2314,6 +2401,13 @@ pub fn main(init: std.process.Init) !void {
                                     app.menu_bar_state.open_title = null;
                                 } else {
                                     app.running = false;
+                                }
+                            },
+                            .Z => {
+                                const primary = if (builtin.os.tag == .macos) k.modifiers.cmd else k.modifiers.ctrl;
+                                if (primary) {
+                                    if (k.modifiers.shift) doRedo(&app) else doUndo(&app);
+                                    continue;
                                 }
                             },
                             .DELETE, .BACKSPACE => deleteSelected(&app),
@@ -2742,6 +2836,422 @@ fn vizSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 // マクロ（DrumMachine/BassMachine）の action 化は別議論として見送る。
 // ============================================================================
 
+// ============================================================================
+// TASK-106.4: undo payload capture / CommandAdapter / inverse apply
+// ホットパス: イベント時のみ（action dispatch / Cmd+Z）。RT 経路には触れない。
+// ============================================================================
+
+fn patternToSnap(cmd: PatternCommand) patch_undo.PatternSnap {
+    return .{
+        .rev = cmd.rev,
+        .evolve = cmd.evolve,
+        .kick_on = cmd.kick.on,
+        .kick_lock = cmd.kick.lock,
+        .hat_on = cmd.hat.on,
+        .hat_lock = cmd.hat.lock,
+        .clap_on = cmd.clap.on,
+        .clap_lock = cmd.clap.lock,
+        .bass_on = cmd.bass.on,
+        .bass_accent = cmd.bass.accent,
+        .bass_slide = cmd.bass.slide,
+        .bass_deg = cmd.bass.deg,
+        .bass_lock = cmd.bass.lock,
+        .quantize_bar = cmd.quantize_bar,
+    };
+}
+
+fn snapToPattern(s: patch_undo.PatternSnap) PatternCommand {
+    return .{
+        .rev = 0,
+        .evolve = s.evolve,
+        .kick = .{ .on = s.kick_on, .lock = s.kick_lock },
+        .hat = .{ .on = s.hat_on, .lock = s.hat_lock },
+        .clap = .{ .on = s.clap_on, .lock = s.clap_lock },
+        .bass = .{
+            .on = s.bass_on,
+            .accent = s.bass_accent,
+            .slide = s.bass_slide,
+            .deg = s.bass_deg,
+            .lock = s.bass_lock,
+        },
+        .quantize_bar = false,
+    };
+}
+
+fn songToSnap(song: SongData) patch_undo.SongSnap {
+    var out: patch_undo.SongSnap = .{
+        .rev = song.rev,
+        .phrases_kick = song.phrases_kick,
+        .phrases_hat = song.phrases_hat,
+        .phrases_clap = song.phrases_clap,
+        .row_count = song.row_count,
+        .loop = song.loop,
+    };
+    for (song.phrases_bass, 0..) |ph, i| {
+        out.phrases_bass[i] = .{ .on = ph.on, .accent = ph.accent, .slide = ph.slide, .deg = ph.deg };
+    }
+    for (song.chains, 0..) |ch, i| {
+        out.chains[i] = .{ .entries = ch.entries, .len = ch.len };
+    }
+    for (song.rows, 0..) |row, i| {
+        out.rows[i] = .{ .kick = row.kick, .hat = row.hat, .clap = row.clap, .bass = row.bass };
+    }
+    return out;
+}
+
+fn snapToSong(s: patch_undo.SongSnap) SongData {
+    var out: SongData = .{
+        .rev = 0,
+        .phrases_kick = s.phrases_kick,
+        .phrases_hat = s.phrases_hat,
+        .phrases_clap = s.phrases_clap,
+        .row_count = s.row_count,
+        .loop = s.loop,
+    };
+    for (s.phrases_bass, 0..) |ph, i| {
+        out.phrases_bass[i] = .{ .on = ph.on, .accent = ph.accent, .slide = ph.slide, .deg = ph.deg };
+    }
+    for (s.chains, 0..) |ch, i| {
+        out.chains[i] = .{ .entries = ch.entries, .len = ch.len };
+    }
+    for (s.rows, 0..) |row, i| {
+        out.rows[i] = .{ .kick = row.kick, .hat = row.hat, .clap = row.clap, .bass = row.bass };
+    }
+    return out;
+}
+
+fn notePatchUndo(app: *App, payload: patch_undo.PatchUndoPayload) void {
+    const ref = app.undo_store.push(payload);
+    app.cmd_exec.noteUndo(ref);
+}
+
+fn notePatternUndoIfChanged(app: *App, before: patch_undo.PatternSnap, after_cmd: PatternCommand) void {
+    const after = patternToSnap(after_cmd);
+    if (patch_undo.patternContentEql(before, after)) return;
+    notePatchUndo(app, .{ .pattern = patch_undo.patternForStore(before) });
+}
+
+fn noteSongUndoIfChanged(app: *App, before: patch_undo.SongSnap, after: SongData) void {
+    const after_snap = songToSnap(after);
+    if (patch_undo.songContentEql(before, after_snap)) return;
+    notePatchUndo(app, .{ .song = patch_undo.songForStore(before) });
+}
+
+fn restoreNodeId(app: *App, h: Handle, id: NodeId) void {
+    std.debug.assert(h < MAX_MODULES);
+    std.debug.assert(app.handle_to_id[h] == null);
+    app.handle_to_id[h] = id;
+    if (id.raw() >= app.next_node_id) app.next_node_id = id.raw() + 1;
+    if (app.next_node_id == 0) app.next_node_id = 1;
+}
+
+fn kindFromTag(tag: u8) ?modular.ModuleKind {
+    inline for (@typeInfo(modular.ModuleKind).@"enum".fields) |f| {
+        if (f.value == tag) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
+fn captureNodeParamsInto(app: *App, h: Handle, snap: *patch_undo.NodeSnap) void {
+    const kind = app.dyn.kindOf(h) orelse return;
+    snap.kind_tag = @intFromEnum(kind);
+    const descs = switch (kind) {
+        inline else => |ck| modular.descriptors(ck),
+    };
+    var pn: u8 = 0;
+    for (descs) |desc| {
+        if (pn >= patch_undo.MAX_UNDO_PARAMS) break;
+        const value = modular.getParam(app.dyn, h, desc.name) catch continue;
+        snap.params[pn].setName(desc.name);
+        switch (value) {
+            .scalar => |v| {
+                snap.params[pn].value_kind = 0;
+                snap.params[pn].value = @bitCast(v);
+            },
+            .choice => |idx| {
+                snap.params[pn].value_kind = 1;
+                snap.params[pn].value = @intCast(idx);
+            },
+        }
+        pn += 1;
+    }
+    snap.param_count = pn;
+}
+
+fn applyNodeParamsFrom(app: *App, h: Handle, snap: *const patch_undo.NodeSnap) void {
+    var i: u8 = 0;
+    while (i < snap.param_count) : (i += 1) {
+        const p = snap.params[i];
+        const value: modular.ParamValue = switch (p.value_kind) {
+            0 => .{ .scalar = @bitCast(p.value) },
+            1 => .{ .choice = @intCast(p.value) },
+            else => continue,
+        };
+        modular.setParam(app.dyn, h, p.name(), value) catch {};
+    }
+}
+
+fn genRoleOfHandle(app: *const App, h: Handle) u8 {
+    const roles = app.patch.snapshotGenRoles();
+    inline for (@typeInfo(project_io.GenRole).@"enum".fields) |f| {
+        const role: project_io.GenRole = @enumFromInt(f.value);
+        if (roles.get(role) == h) return @intCast(f.value);
+    }
+    return 0xFF;
+}
+
+fn captureIncidentEdges(app: *const App, h: Handle, out: *[patch_undo.MAX_UNDO_EDGES]patch_undo.EdgeSnap) u8 {
+    var flat_buf: [MAX_EDGES]Edge = undefined;
+    const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
+    var n: u8 = 0;
+    for (flat) |e| {
+        if (e.src_handle != h and e.dst_handle != h) continue;
+        if (n >= patch_undo.MAX_UNDO_EDGES) break;
+        const sid = nodeIdOf(app, e.src_handle) orelse continue;
+        const did = nodeIdOf(app, e.dst_handle) orelse continue;
+        out[n] = .{ .src_id = sid.raw(), .src_out = e.src_out, .dst_id = did.raw(), .dst_in = e.dst_in };
+        n += 1;
+    }
+    return n;
+}
+
+fn edgeSnapForInput(app: *const App, dst_h: Handle, dst_in: usize) ?patch_undo.EdgeSnap {
+    if (dst_in > 255) return null;
+    const e = edgeForInput(app, dst_h, @intCast(dst_in)) orelse return null;
+    const sid = nodeIdOf(app, e.src_handle) orelse return null;
+    const did = nodeIdOf(app, e.dst_handle) orelse return null;
+    return .{ .src_id = sid.raw(), .src_out = e.src_out, .dst_id = did.raw(), .dst_in = e.dst_in };
+}
+
+fn reconnectEdgeSnap(app: *App, edge: patch_undo.EdgeSnap) void {
+    const src = handleOfNodeId(app, NodeId.fromRaw(edge.src_id)) orelse return;
+    const dst = handleOfNodeId(app, NodeId.fromRaw(edge.dst_id)) orelse return;
+    app.dyn.disconnect(dst, edge.dst_in);
+    app.dyn.connect(src, edge.src_out, dst, edge.dst_in) catch {};
+}
+
+fn removeNodeByHandleForUndo(app: *App, h: Handle) void {
+    if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
+    purgeParamOverrides(app, h);
+    app.dyn.removeModule(h);
+    clearNodeIdMapping(app, h);
+}
+
+fn patchNodeExists(ctx: *anyopaque, id: u64) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return handleOfNodeId(app, NodeId.fromRaw(id)) != null;
+}
+
+fn patchCanUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const ref = rec.undo_ref orelse return false;
+    const entry = app.undo_store.get(ref) orelse return false;
+    return patch_undo.canUndoPayload(entry.payload, .{
+        .ctx = app,
+        .exists = patchNodeExists,
+        .free_handles = app.dyn.freeHandleCount(),
+    });
+}
+
+fn patchSummarize(ctx: *anyopaque, rec: *const platform.command.CommandRecord, buf: []u8) []const u8 {
+    _ = ctx;
+    const n = @min(buf.len, rec.name().len);
+    @memcpy(buf[0..n], rec.name()[0..n]);
+    // sanitize non-printable
+    for (buf[0..n]) |*c| {
+        if (c.* < 0x20 or c.* > 0x7E) c.* = '?';
+    }
+    return buf[0..n];
+}
+
+fn patchApplyUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const ref = rec.undo_ref orelse return;
+    const entry = app.undo_store.get(ref) orelse return;
+    switch (entry.payload) {
+        .pattern => |s| {
+            _ = publishPatternCommand(app, snapToPattern(s));
+        },
+        .song => |s| {
+            app.song = snapToSong(s);
+            publishSong(app, app.patch);
+        },
+        .seed => |s| {
+            app.notation_seed = s.notation_seed;
+            app.notation_counter = s.notation_counter;
+            app.patch.requestSeed(s.base_seed);
+        },
+        .mute => |s| {
+            if (s.track < std.meta.fields(MuteTrack).len) {
+                const name = @tagName(@as(MuteTrack, @enumFromInt(s.track)));
+                setMuteAndPublish(app, name, s.was_muted) catch {};
+            }
+        },
+        .param => |s| {
+            if (s.mode == 0) {
+                const v: f32 = @bitCast(s.value_bits);
+                setParamAndPublish(app, s.name(), v) catch {};
+            } else {
+                const h = handleOfNodeId(app, NodeId.fromRaw(s.node_id)) orelse return;
+                const raw: f32 = if (s.value_kind == 0) @bitCast(s.value_bits) else @floatFromInt(s.value_bits);
+                queueParamOverride(app, h, s.name(), raw) catch {};
+            }
+        },
+        .add_node => |s| {
+            const h = handleOfNodeId(app, NodeId.fromRaw(s.id)) orelse return;
+            const clear_selected = if (app.selected) |it| refsHandleForRemoval(app, it, h) else false;
+            const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
+            removeNodeByHandleForUndo(app, h);
+            app.dyn.publish() catch {};
+            app.refreshAllExposed();
+            if (clear_selected) app.selected = null;
+            if (clear_hover) app.hover = null;
+        },
+        .remove_node => |s| {
+            applyUndoRemoveNode(app, s);
+        },
+        .connect => |s| {
+            const dst = handleOfNodeId(app, NodeId.fromRaw(s.new_edge.dst_id)) orelse return;
+            app.dyn.disconnect(dst, s.new_edge.dst_in);
+            var ri: u8 = 0;
+            while (ri < s.replaced_count) : (ri += 1) reconnectEdgeSnap(app, s.replaced[ri]);
+            app.dyn.publish() catch {};
+            app.refreshAllExposed();
+        },
+        .disconnect => |s| {
+            reconnectEdgeSnap(app, s.edge);
+            app.dyn.publish() catch {};
+            app.refreshAllExposed();
+        },
+        .move_node => |s| {
+            const h = handleOfNodeId(app, NodeId.fromRaw(s.id)) orelse return;
+            app.layout[h] = .{ .x = s.x, .y = s.y };
+        },
+        .add_macro => |s| {
+            applyUndoAddMacro(app, s);
+        },
+        .remove_macro => |s| {
+            applyUndoRemoveMacro(app, s);
+        },
+    }
+}
+
+fn applyUndoRemoveNode(app: *App, s: patch_undo.RemoveNodeSnap) void {
+    waitGraphReclaim(app, 1) catch return;
+    const kind = kindFromTag(s.node.kind_tag) orelse return;
+    const h = blk: {
+        if (kind == .step_seq and s.node.gen_role != 0xFF) {
+            // bass_seq role uses bass init
+            const role: project_io.GenRole = @enumFromInt(s.node.gen_role);
+            if (role == .bass_seq) break :blk app.dyn.add(.step_seq, stepSeqBassInit) catch return;
+        }
+        break :blk addNodeByKind(app, kind) catch return;
+    };
+    app.layout[h] = .{ .x = s.node.x, .y = s.node.y };
+    restoreNodeId(app, h, NodeId.fromRaw(s.node.id));
+    applyNodeParamsFrom(app, h, &s.node);
+    if (s.group_id != 0xFF and s.group_id < group.MAX_GROUPS and app.ledger.groups[s.group_id].active) {
+        app.ledger.assign(h, s.group_id);
+    }
+    if (s.node.gen_role != 0xFF) {
+        var roles = app.patch.snapshotGenRoles();
+        roles.set(@enumFromInt(s.node.gen_role), h);
+        app.patch.applyGenRoles(roles);
+    }
+    var ei: u8 = 0;
+    while (ei < s.edge_count) : (ei += 1) reconnectEdgeSnap(app, s.edges[ei]);
+    app.dyn.publish() catch {};
+    app.refreshAllExposed();
+}
+
+fn applyUndoAddMacro(app: *App, s: patch_undo.AddMacroSnap) void {
+    var mi: u8 = 0;
+    while (mi < s.member_count) : (mi += 1) {
+        const h = handleOfNodeId(app, NodeId.fromRaw(s.members[mi])) orelse continue;
+        removeNodeByHandleForUndo(app, h);
+    }
+    if (s.group_id != 0xFF and s.group_id < group.MAX_GROUPS) app.ledger.free(s.group_id);
+    app.dyn.publish() catch {};
+    app.refreshAllExposed();
+    app.selected = null;
+    app.hover = null;
+}
+
+fn applyUndoRemoveMacro(app: *App, s: patch_undo.RemoveMacroSnap) void {
+    waitGraphReclaim(app, s.member_count) catch return;
+    const mk: group.MacroKind = @enumFromInt(s.kind);
+    const gid = app.ledger.alloc() orelse return;
+    app.ledger.groups[gid].kind = mk;
+    app.ledger.groups[gid].pos = .{ .x = s.x, .y = s.y };
+    app.ledger.groups[gid].collapsed = s.collapsed;
+    app.ledger.groups[gid].grid_rows = s.grid_rows;
+    var mi: u8 = 0;
+    while (mi < s.member_count) : (mi += 1) {
+        const ns = s.members[mi];
+        const kind = kindFromTag(ns.kind_tag) orelse continue;
+        const h = blk: {
+            if (kind == .step_seq and ns.gen_role != 0xFF) {
+                const role: project_io.GenRole = @enumFromInt(ns.gen_role);
+                if (role == .bass_seq) break :blk app.dyn.add(.step_seq, stepSeqBassInit) catch continue;
+            }
+            break :blk addNodeByKind(app, kind) catch continue;
+        };
+        app.layout[h] = .{ .x = ns.x, .y = ns.y };
+        restoreNodeId(app, h, NodeId.fromRaw(ns.id));
+        applyNodeParamsFrom(app, h, &ns);
+        app.ledger.assign(h, gid);
+        if (ns.gen_role != 0xFF) {
+            var roles = app.patch.snapshotGenRoles();
+            roles.set(@enumFromInt(ns.gen_role), h);
+            app.patch.applyGenRoles(roles);
+        }
+    }
+    var ei: u8 = 0;
+    while (ei < s.edge_count) : (ei += 1) reconnectEdgeSnap(app, s.edges[ei]);
+    app.dyn.publish() catch {};
+    app.refreshAllExposed();
+}
+
+fn doUndo(app: *App) void {
+    var buf: [128]u8 = undefined;
+    if (platform.netsyncActive()) {
+        _ = platform.routeAction("undo", "", &buf) catch |err| {
+            std.debug.print("patch: undo failed: {s}\n", .{@errorName(err)});
+        };
+    } else {
+        _ = app.cmd_exec.undoOne(.local_user, &buf) catch |err| {
+            std.debug.print("patch: undoOne failed: {s}\n", .{@errorName(err)});
+        };
+    }
+}
+
+fn doRedo(app: *App) void {
+    var buf: [128]u8 = undefined;
+    if (platform.netsyncActive()) {
+        _ = platform.routeAction("redo", "", &buf) catch |err| {
+            std.debug.print("patch: redo failed: {s}\n", .{@errorName(err)});
+        };
+    } else {
+        _ = app.cmd_exec.redoOne(.local_user, &buf) catch |err| {
+            std.debug.print("patch: redoOne failed: {s}\n", .{@errorName(err)});
+        };
+    }
+}
+
+fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    if (args.len != 0) return error.UnexpectedArgs;
+    const app = actionApp(ctx);
+    const outcome = try app.cmd_exec.undoOne(.local_user, buf);
+    return outcome.message;
+}
+
+fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    if (args.len != 0) return error.UnexpectedArgs;
+    const app = actionApp(ctx);
+    const outcome = try app.cmd_exec.redoOne(.local_user, buf);
+    return outcome.message;
+}
+
 fn actionApp(ctx: *anyopaque) *App {
     return @ptrCast(@alignCast(ctx));
 }
@@ -2867,11 +3377,34 @@ fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !voi
 
 fn inspectorChanged(ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8, value: modular.ParamValue) void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    // drag 開始時のみ before を捕捉（release で set_param へ渡す）
+    if (app.slider_drag_before == null) {
+        var s = patch_undo.ParamValueSnap{
+            .mode = 1,
+            .node_id = (nodeIdOf(app, handle) orelse NodeId.fromRaw(0)).raw(),
+        };
+        s.setName(name);
+        const cur = modular.getParam(app.dyn, handle, name) catch null;
+        if (cur) |c| {
+            switch (c) {
+                .scalar => |v| {
+                    s.value_kind = 0;
+                    s.value_bits = @bitCast(v);
+                },
+                .choice => |idx| {
+                    s.value_kind = 1;
+                    s.value_bits = @intCast(idx);
+                },
+            }
+            app.slider_drag_before = s;
+        }
+    }
     const raw: f32 = switch (value) {
         .scalar => |v| v,
-        .choice => |v| @floatFromInt(v),
+        .choice => |idx| @floatFromInt(idx),
     };
     queueParamOverride(app, handle, name, raw) catch {};
+    app.editState(param_view.fieldKey(handle, name)).dragging = true;
 }
 
 fn purgeParamOverrides(app: *App, handle: ?Handle) void {
@@ -3072,9 +3605,16 @@ fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     const h = try addNodeByKindName(app, p.kind);
     errdefer app.dyn.removeModule(h);
     app.layout[h] = .{ .x = p.x, .y = p.y };
-    // publish 成功後にのみ NodeId を消費（失敗時は id を進めない）。
     try app.dyn.publish();
+    // redo も通常再実行: 全 peer が allocNodeId の単調採番で一致（COMMIT 全順序）。
     const id = allocNodeId(app, h);
+    const kind = app.dyn.kindOf(h).?;
+    notePatchUndo(app, .{ .add_node = .{
+        .id = id.raw(),
+        .kind_tag = @intFromEnum(kind),
+        .x = p.x,
+        .y = p.y,
+    } });
     return std.fmt.bufPrint(buf, "ok id=#{d}", .{id.raw()}) catch "ok";
 }
 
@@ -3109,10 +3649,22 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const app = actionApp(ctx);
     const ref = try actions.parseNodeRef(args);
     const h = try resolveNodeRef(app, ref, true);
-    // 削除で stale になる selected/hover を、まだ edge が残っている削除前に判定しておく。
+    const id = nodeIdOf(app, h) orelse return error.UnknownNodeId;
+    const kind = app.dyn.kindOf(h) orelse return error.InvalidHandle;
+    var snap: patch_undo.RemoveNodeSnap = .{};
+    snap.node.id = id.raw();
+    snap.node.kind_tag = @intFromEnum(kind);
+    snap.node.x = app.layout[h].x;
+    snap.node.y = app.layout[h].y;
+    snap.node.gen_role = genRoleOfHandle(app, h);
+    captureNodeParamsInto(app, h, &snap.node);
+    snap.edge_count = captureIncidentEdges(app, h, &snap.edges);
+    if (app.ledger.group_of[h]) |gid| {
+        snap.group_id = gid;
+        snap.group_kind = @intFromEnum(app.ledger.groups[gid].kind);
+    }
     const clear_selected = if (app.selected) |it| refsHandleForRemoval(app, it, h) else false;
     const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
-    // 展開中グループのメンバー個別削除は先に台帳を同期する（`deleteSelected` の `.node` 分岐と同型）。
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
     purgeParamOverrides(app, h);
     app.dyn.removeModule(h);
@@ -3121,6 +3673,7 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     app.refreshAllExposed();
     if (clear_selected) app.selected = null;
     if (clear_hover) app.hover = null;
+    notePatchUndo(app, .{ .remove_node = snap });
     return "ok";
 }
 
@@ -3136,16 +3689,37 @@ fn actionConnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     const sk = app.dyn.outKindOf(src_h, p.src_out) orelse return error.InvalidPort;
     const dk = app.dyn.inKindOf(dst_h, p.dst_in) orelse return error.InvalidPort;
     if (sk != dk) return error.PortKindMismatch;
-    // 任意 detach（drag-off 元）を同一 COMMIT 内で処理
+    var conn: patch_undo.ConnectSnap = .{};
+    if (edgeSnapForInput(app, dst_h, p.dst_in)) |old| {
+        conn.replaced[0] = old;
+        conn.replaced_count = 1;
+    }
     if (p.detach_dst) |dref| {
         const din = p.detach_in orelse return error.InvalidArguments;
         const dh = try resolveNodeRef(app, dref, true);
-        if (!(dh == dst_h and din == p.dst_in)) app.dyn.disconnect(dh, din);
+        if (!(dh == dst_h and din == p.dst_in)) {
+            if (edgeSnapForInput(app, dh, din)) |det| {
+                if (conn.replaced_count < conn.replaced.len) {
+                    conn.replaced[conn.replaced_count] = det;
+                    conn.replaced_count += 1;
+                }
+            }
+            app.dyn.disconnect(dh, din);
+        }
     }
-    app.dyn.disconnect(dst_h, p.dst_in); // 検証後の置換（宛先が既接続でも安全に上書き）
-    try app.dyn.connect(src_h, p.src_out, dst_h, p.dst_in);
+    const src_id = nodeIdOf(app, src_h) orelse return error.UnknownNodeId;
+    const dst_id = nodeIdOf(app, dst_h) orelse return error.UnknownNodeId;
+    conn.new_edge = .{
+        .src_id = src_id.raw(),
+        .src_out = @intCast(p.src_out),
+        .dst_id = dst_id.raw(),
+        .dst_in = @intCast(p.dst_in),
+    };
+    app.dyn.disconnect(dst_h, @intCast(p.dst_in));
+    try app.dyn.connect(src_h, @intCast(p.src_out), dst_h, @intCast(p.dst_in));
     try app.dyn.publish();
     app.refreshAllExposed();
+    notePatchUndo(app, .{ .connect = conn });
     return "ok";
 }
 
@@ -3156,9 +3730,11 @@ fn actionDisconnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const dst_h = try resolveNodeRef(app, p.dst, true);
     if (!app.dyn.slotActive(dst_h)) return error.InvalidHandle;
     if (app.dyn.inKindOf(dst_h, p.dst_in) == null) return error.InvalidPort;
+    const old = edgeSnapForInput(app, dst_h, p.dst_in);
     app.dyn.disconnect(dst_h, p.dst_in);
     try app.dyn.publish();
     app.refreshAllExposed();
+    if (old) |e| notePatchUndo(app, .{ .disconnect = .{ .edge = e } });
     return "ok";
 }
 
@@ -3167,7 +3743,13 @@ fn actionMoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     const app = actionApp(ctx);
     const p = try actions.parseMoveNode(args);
     const h = try resolveNodeRef(app, p.ref, true);
+    const id = nodeIdOf(app, h) orelse return error.UnknownNodeId;
+    const ox = app.layout[h].x;
+    const oy = app.layout[h].y;
     app.layout[h] = .{ .x = p.x, .y = p.y };
+    if (ox != p.x or oy != p.y) {
+        notePatchUndo(app, .{ .move_node = .{ .id = id.raw(), .x = ox, .y = oy } });
+    }
     return "ok";
 }
 
@@ -3175,9 +3757,9 @@ fn actionAddMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     const app = actionApp(ctx);
     const p = try actions.parseAddMacro(args);
     const mk = std.meta.stringToEnum(group.MacroKind, p.kind) orelse return error.UnknownKind;
-    // screen anchor は world 座標として解釈（wire は world。UI は clamp 後に渡す）。
-    try addMacroAtWorld(app, mk, .{ .x = p.x, .y = p.y });
-    // 成功応答: kind + member #id 一覧（直近に追加された group）
+    var out_ids: [patch_undo.MAX_MACRO_MEMBERS]u64 = undefined;
+    var out_n: u8 = 0;
+    try addMacroAtWorld(app, mk, .{ .x = p.x, .y = p.y }, &out_ids, &out_n);
     const gid = blk: {
         if (app.selected) |it| switch (it) {
             .group => |g| break :blk g,
@@ -3185,20 +3767,25 @@ fn actionAddMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         };
         return error.MacroAddFailed;
     };
+    var snap: patch_undo.AddMacroSnap = .{
+        .kind = patch_undo.macroKindTag(mk),
+        .x = p.x,
+        .y = p.y,
+        .group_id = gid,
+        .member_count = out_n,
+    };
+    @memcpy(snap.members[0..out_n], out_ids[0..out_n]);
+    notePatchUndo(app, .{ .add_macro = snap });
+
     var off: usize = 0;
     const head = std.fmt.bufPrint(buf[off..], "ok kind={s} members=", .{@tagName(mk)}) catch return "ok";
     off += head.len;
     var first = true;
-    var h: Handle = 0;
-    while (h < MAX_MODULES) : (h += 1) {
-        if (app.ledger.group_of[h]) |g| {
-            if (g == gid) {
-                const id = nodeIdOf(app, h) orelse continue;
-                const piece = std.fmt.bufPrint(buf[off..], "{s}#{d}", .{ if (first) "" else ",", id.raw() }) catch break;
-                off += piece.len;
-                first = false;
-            }
-        }
+    var mi: u8 = 0;
+    while (mi < snap.member_count) : (mi += 1) {
+        const piece = std.fmt.bufPrint(buf[off..], "{s}#{d}", .{ if (first) "" else ",", snap.members[mi] }) catch break;
+        off += piece.len;
+        first = false;
     }
     return buf[0..off];
 }
@@ -3207,7 +3794,6 @@ fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     _ = buf;
     const app = actionApp(ctx);
     const p = try actions.parseRemoveMacro(args);
-    // 全 member を解決し、同一 group に属することを確認してから一括削除 + 1 publish
     var handles: [actions.MAX_REMOVE_MACRO_MEMBERS]Handle = undefined;
     var n: usize = 0;
     var gid: ?group.GroupId = null;
@@ -3222,6 +3808,43 @@ fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
         n += 1;
     }
     const group_id = gid orelse return error.NotInMacro;
+    const gstate = app.ledger.groups[group_id];
+    var snap: patch_undo.RemoveMacroSnap = .{
+        .kind = @intFromEnum(gstate.kind),
+        .x = gstate.pos.x,
+        .y = gstate.pos.y,
+        .collapsed = gstate.collapsed,
+        .grid_rows = gstate.grid_rows,
+        .group_id = group_id,
+    };
+    // Collect edges involving any member
+    var flat_buf: [MAX_EDGES]Edge = undefined;
+    const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
+    var member_set = [_]bool{false} ** MAX_MODULES;
+    for (handles[0..n]) |h| member_set[h] = true;
+    for (flat) |e| {
+        if (!member_set[e.src_handle] and !member_set[e.dst_handle]) continue;
+        if (snap.edge_count >= patch_undo.MAX_UNDO_EDGES) break;
+        const sid = nodeIdOf(app, e.src_handle) orelse continue;
+        const did = nodeIdOf(app, e.dst_handle) orelse continue;
+        snap.edges[snap.edge_count] = .{ .src_id = sid.raw(), .src_out = e.src_out, .dst_id = did.raw(), .dst_in = e.dst_in };
+        snap.edge_count += 1;
+    }
+    for (handles[0..n]) |h| {
+        if (snap.member_count >= patch_undo.MAX_MACRO_MEMBERS) break;
+        const id = nodeIdOf(app, h) orelse continue;
+        const kind = app.dyn.kindOf(h) orelse continue;
+        var ns: patch_undo.NodeSnap = .{
+            .id = id.raw(),
+            .kind_tag = @intFromEnum(kind),
+            .x = app.layout[h].x,
+            .y = app.layout[h].y,
+            .gen_role = genRoleOfHandle(app, h),
+        };
+        captureNodeParamsInto(app, h, &ns);
+        snap.members[snap.member_count] = ns;
+        snap.member_count += 1;
+    }
     for (handles[0..n]) |h| {
         purgeParamOverrides(app, h);
         app.ledger.unassign(h);
@@ -3233,6 +3856,7 @@ fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     app.refreshAllExposed();
     app.selected = null;
     app.hover = null;
+    notePatchUndo(app, .{ .remove_macro = snap });
     return "ok";
 }
 
@@ -3655,7 +4279,7 @@ fn recordedGraphAction(comptime name: []const u8) *const fn (*anyopaque, []const
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             const res = try app.cmd_exec.executeAction(name, args, .{
-                .actor = .local_agent,
+                .actor = .local_user,
                 .record_policy = .record,
             }, buf);
             return res.output;
@@ -4140,16 +4764,70 @@ fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     var it = std.mem.tokenizeAny(u8, args, " \t");
     _ = it.next() orelse return error.Empty;
     _ = it.next() orelse return error.Empty;
+    const pending = app.pending_param_undo_before;
+    app.pending_param_undo_before = null;
     if (it.next() != null) {
-        // Additive な 3 引数形式: `#<NodeId>|handle <name> <value>`。
-        // wire 適用は NodeRef + canonical name + value のみ（selected/observed 非参照）。
         const p = try actions.parseParamOverride(args);
         const h = try resolveNodeRef(app, p.ref, true);
         const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
+        const before_snap = pending orelse blk: {
+            var s = patch_undo.ParamValueSnap{ .mode = 1, .node_id = (nodeIdOf(app, h) orelse NodeId.fromRaw(0)).raw() };
+            s.setName(cname);
+            const cur = modular.getParam(app.dyn, h, cname) catch break :blk null;
+            switch (cur) {
+                .scalar => |v| {
+                    s.value_kind = 0;
+                    s.value_bits = @bitCast(v);
+                },
+                .choice => |idx| {
+                    s.value_kind = 1;
+                    s.value_bits = @intCast(idx);
+                },
+            }
+            break :blk s;
+        };
         try queueParamOverride(app, h, cname, p.value);
+        if (before_snap) |bs| {
+            const same = switch (bs.value_kind) {
+                0 => @as(f32, @bitCast(bs.value_bits)) == p.value,
+                1 => @as(f32, @floatFromInt(bs.value_bits)) == p.value,
+                else => false,
+            };
+            if (!same) notePatchUndo(app, .{ .param = bs });
+        }
     } else {
         const nf = try gen_actions.parseNameF32(args);
+        const before_snap = pending orelse blk: {
+            var s = patch_undo.ParamValueSnap{ .mode = 0 };
+            s.setName(nf.name);
+            // best-effort: read transport via params struct fields is complex; use 0 sentinel
+            // Prefer pending from slider; for harness capture live transport aliases.
+            const alias = std.meta.stringToEnum(param_view.TransportAlias, nf.name) orelse
+                (if (std.mem.eql(u8, nf.name, "cutoff_norm")) param_view.TransportAlias.cutoff else null);
+            if (alias) |a| {
+                const st = app.patch.snapshotState();
+                const v: f32 = switch (a) {
+                    .tempo => st.bpm,
+                    .cutoff => st.master_cutoff,
+                    .density => st.density_target,
+                    .swing => st.swing,
+                    .sidechain => st.sidechain_amount,
+                    .kick_gain => st.kick_gain,
+                    .hat_gain => st.hat_gain,
+                    .clap_gain => st.clap_gain,
+                    .bass_gain => st.bass_gain,
+                    .pad_gain => st.pad_gain,
+                };
+                s.value_kind = 0;
+                s.value_bits = @bitCast(v);
+                break :blk s;
+            }
+            break :blk null;
+        };
         try setParamAndPublish(app, nf.name, nf.value);
+        if (before_snap) |bs| {
+            if (@as(f32, @bitCast(bs.value_bits)) != nf.value) notePatchUndo(app, .{ .param = bs });
+        }
     }
     return "ok";
 }
@@ -4178,7 +4856,18 @@ fn actionSetMute(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     _ = buf;
     const app = actionApp(ctx);
     const p = try gen_actions.parseNameBool(args);
+    const track = std.meta.stringToEnum(MuteTrack, p.name) orelse return error.UnknownTrack;
+    const was = switch (track) {
+        .kick => app.params.kick_mute,
+        .hat => app.params.hat_mute,
+        .clap => app.params.clap_mute,
+        .bass => app.params.bass_mute,
+        .pad => app.params.pad_mute,
+    };
     try setMuteAndPublish(app, p.name, p.on);
+    if (was != p.on) {
+        notePatchUndo(app, .{ .mute = .{ .track = @intFromEnum(track), .was_muted = was } });
+    }
     return "ok";
 }
 
@@ -4187,6 +4876,7 @@ const LockTrack = enum { kick, hat, clap, bass };
 fn actionSetLock(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = patternToSnap(patternEditBase(app));
     const p = try gen_actions.parseNameBool(args);
     const track = std.meta.stringToEnum(LockTrack, p.name) orelse return error.UnknownTrack;
     var cmd = patternEditBase(app);
@@ -4196,17 +4886,20 @@ fn actionSetLock(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
         .clap => cmd.clap.lock = p.on,
         .bass => cmd.bass.lock = p.on,
     }
-    _ = publishPatternCommand(app, cmd);
+    const published = publishPatternCommand(app, cmd);
+    notePatternUndoIfChanged(app, before, published);
     return "ok";
 }
 
 fn actionSetEvolve(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = patternToSnap(patternEditBase(app));
     const on = try gen_actions.parseBool01(args);
     var cmd = patternEditBase(app);
     cmd.evolve = on;
-    _ = publishPatternCommand(app, cmd);
+    const published = publishPatternCommand(app, cmd);
+    notePatternUndoIfChanged(app, before, published);
     return "ok";
 }
 
@@ -4288,6 +4981,7 @@ const StepTarget = enum { kick, hat, clap, bass_on, bass_accent, bass_slide };
 fn actionToggleStep(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = patternToSnap(patternEditBase(app));
     const p = try gen_actions.parseNameU8(args);
     const target = std.meta.stringToEnum(StepTarget, p.name) orelse return error.UnknownTrack;
     if (p.value >= 16) return error.StepOutOfRange;
@@ -4301,19 +4995,22 @@ fn actionToggleStep(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
         .bass_accent => cmd.bass.accent ^= mask,
         .bass_slide => cmd.bass.slide ^= mask,
     }
-    _ = publishPatternCommand(app, cmd);
+    const published = publishPatternCommand(app, cmd);
+    notePatternUndoIfChanged(app, before, published);
     return "ok";
 }
 
 fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const p = try gen_actions.parseTwoU8(args); // a=step(0..15) b=deg(0..BASS_DEG_TOTAL-1)
+    const before = patternToSnap(patternEditBase(app));
+    const p = try gen_actions.parseTwoU8(args);
     if (p.a >= 16) return error.StepOutOfRange;
     if (p.b >= BASS_DEG_TOTAL) return error.DegreeOutOfRange;
     var cmd = patternEditBase(app);
     cmd.bass.deg[p.a] = @intCast(p.b);
-    _ = publishPatternCommand(app, cmd);
+    const published = publishPatternCommand(app, cmd);
+    notePatternUndoIfChanged(app, before, published);
     return "ok";
 }
 
@@ -4383,8 +5080,21 @@ fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     const app = actionApp(ctx);
     const patch = app.patch;
     const n = try gen_actions.parseU64(args);
+    const st = patch.snapshotState();
+    const before = patch_undo.SeedSnap{
+        .base_seed = st.base_seed,
+        .notation_seed = app.notation_seed,
+        .notation_counter = app.notation_counter,
+    };
+    if (before.base_seed == n and before.notation_seed == n) {
+        // still update notation_seed for consistency; no undo if identical intent
+        app.notation_seed = n;
+        patch.requestSeed(n);
+        return "ok";
+    }
     app.notation_seed = n;
     patch.requestSeed(n);
+    notePatchUndo(app, .{ .seed = before });
     return "ok";
 }
 
@@ -4403,11 +5113,11 @@ fn actionPhraseCapture(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]
     _ = buf;
     const app = actionApp(ctx);
     const patch = app.patch;
+    const before = songToSnap(app.song);
     const idx = gen_actions.parseU8(args) catch {
         platform.setActionErrorDetail("bad_args", "usage: phrase_capture <idx 0..31>");
         return error.BadArgs;
     };
-    // bass pool 上限 32 に合わせる（4 track 同 idx のため）
     if (idx >= patchmod.MAX_BASS_PHRASES) {
         platform.setActionErrorDetail("index_out_of_range", "phrase idx must be 0..31");
         return error.IndexOutOfRange;
@@ -4423,6 +5133,7 @@ fn actionPhraseCapture(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]
         .deg = st.bass_deg,
     };
     publishSong(app, patch);
+    noteSongUndoIfChanged(app, before, app.song);
     return "ok";
 }
 
@@ -4431,6 +5142,7 @@ fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     _ = buf;
     const app = actionApp(ctx);
     const patch = app.patch;
+    const before = songToSnap(app.song);
     const parsed = gen_actions.parseChainSet(args) catch {
         platform.setActionErrorDetail("bad_args", "usage: chain_set <chain_idx> <phrase_idx...>");
         return error.BadArgs;
@@ -4441,7 +5153,6 @@ fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     }
     var i: u8 = 0;
     while (i < parsed.len) : (i += 1) {
-        // drum pool 64 / bass 32。chain は共有なので 0..63 を許容（bass 解決時 OOB は RT で現行維持）
         if (parsed.phrases[i] >= patchmod.MAX_DRUM_PHRASES) {
             platform.setActionErrorDetail("index_out_of_range", "phrase_idx must be 0..63");
             return error.IndexOutOfRange;
@@ -4452,6 +5163,7 @@ fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     @memcpy(ch.entries[0..parsed.len], parsed.phrases[0..parsed.len]);
     app.song.chains[parsed.chain_idx] = ch;
     publishSong(app, patch);
+    noteSongUndoIfChanged(app, before, app.song);
     return "ok";
 }
 
@@ -4459,6 +5171,7 @@ fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 fn actionSongRow(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = songToSnap(app.song);
     const patch = app.patch;
     const parsed = gen_actions.parseSongRow(args) catch {
         platform.setActionErrorDetail("bad_args", "usage: song_row <row> <kick> <hat> <clap> <bass>");
@@ -4481,6 +5194,7 @@ fn actionSongRow(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
         .bass = parsed.bass,
     };
     publishSong(app, patch);
+    noteSongUndoIfChanged(app, before, app.song);
     return "ok";
 }
 
@@ -4488,6 +5202,7 @@ fn actionSongRow(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 fn actionSongLen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = songToSnap(app.song);
     const patch = app.patch;
     const n = gen_actions.parseU8(args) catch {
         platform.setActionErrorDetail("bad_args", "usage: song_len <0..64>");
@@ -4499,6 +5214,7 @@ fn actionSongLen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     }
     app.song.row_count = n;
     publishSong(app, patch);
+    noteSongUndoIfChanged(app, before, app.song);
     return "ok";
 }
 
@@ -4506,6 +5222,7 @@ fn actionSongLen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 fn actionSongLoop(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = songToSnap(app.song);
     const patch = app.patch;
     const on = gen_actions.parseBool01(args) catch {
         platform.setActionErrorDetail("bad_args", "usage: song_loop <0|1>");
@@ -4513,6 +5230,7 @@ fn actionSongLoop(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     };
     app.song.loop = on;
     publishSong(app, patch);
+    noteSongUndoIfChanged(app, before, app.song);
     return "ok";
 }
 
@@ -4727,6 +5445,7 @@ const PatternTrack = enum { kick, hat, clap, bass };
 fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
+    const before = patternToSnap(patternEditBase(app));
     const patch = app.patch;
     const pa = gen_actions.parsePatternArgs(args) catch {
         platform.setActionErrorDetail("invalid_notation", "usage: pattern <kick|hat|clap|bass> <notation>");
@@ -4774,7 +5493,9 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     }
     // lock されていても明示編集は通す（GUI toggle_step と同挙動）
     cmd.quantize_bar = true;
-    app.last_quantized_cmd = publishPatternCommand(app, cmd);
+    const published = publishPatternCommand(app, cmd);
+    app.last_quantized_cmd = published;
+    notePatternUndoIfChanged(app, before, published);
     return "ok";
 }
 
@@ -4856,7 +5577,7 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
 // command model 統合（TASK-62.5.7: 記録のみ。pixie 62.5.3 の最小版）
 //
 // App が CommandLog + Executor を所有し、registerAction 経由の harness/copilot action を
-// executeAction(actor=.local_agent) で dispatch + 記録する。undo/transaction/probe 統合はしない。
+// executeAction(actor=.local_user) で dispatch + 記録する（TASK-106.4: GUI と harness/MCP を同一 undo 対象に統一）。
 // ============================================================================
 
 const ActionEntry = struct {
@@ -4904,7 +5625,7 @@ fn recordedAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, 
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             const res = try app.cmd_exec.executeAction(name, args, .{
-                .actor = .local_agent,
+                .actor = .local_user,
                 .record_policy = .record,
             }, buf);
             return res.output;
@@ -4916,6 +5637,8 @@ fn recordedAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, 
 /// `registerAction` 自体が no-op なので通常実行に影響しない）。記録 wrapper 経由。
 /// network_policy は `gen_actions.PATCH_NETWORK_POLICIES` が単一ソース（TASK-106.1）。
 fn registerActions(app: *App) void {
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own, .desc = "undo last local undoable action" });
+    platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own, .desc = "redo last local revert" });
     platform.registerAction(.{
         .name = "set_param",
         .ctx = app,
