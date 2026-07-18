@@ -195,7 +195,7 @@ const MAX_PARAM_EDITS: usize = patchmod.MAX_PARAM_OVERRIDES;
 // ── File メニュー（TASK-136）──────────────────────────────────────────────
 // GUI fallback 行の高さ（box padding 4+4 + button ≈24）。native 時は OS メニューバーのため 0。
 const MENU_GUI_H: f32 = 32;
-const MENU_CMD_CAP: usize = 16;
+const MENU_CMD_CAP: usize = 24;
 const MenuFileOp = enum { save_project, open_project };
 const CmdId = struct {
     pub const save_project: platform.CommandId = 1;
@@ -203,6 +203,23 @@ const CmdId = struct {
     pub const quit: platform.CommandId = 3;
     pub const undo: platform.CommandId = 4;
     pub const redo: platform.CommandId = 5;
+    pub const toggle_history: platform.CommandId = 6;
+};
+
+// TASK-149.3: History 表示用 local-only meta ring（CommandLog に入らない操作）。
+const MAX_META_EVENTS: usize = 64;
+const META_SUMMARY_CAP: usize = 96;
+const HISTORY_LINE_CAP: usize = 160;
+const HISTORY_SCROLL_ID: gui.Id = 0x1493_0001;
+const MetaEvent = struct {
+    /// 追加時点の cmd_log 最新 seq（0=コマンド未記録）。merge 表示の順序キー。
+    after_seq: u64 = 0,
+    summary_buf: [META_SUMMARY_CAP]u8 = undefined,
+    summary_len: u8 = 0,
+
+    fn summary(self: *const MetaEvent) []const u8 {
+        return self.summary_buf[0..self.summary_len];
+    }
 };
 
 /// canvas 幅に収まる列数（button.x + button.w <= canvas_w。最大 PAL_COLS_MAX）。
@@ -375,8 +392,14 @@ const App = struct {
     canvas_rect: canvas.ScreenRect = .{ .x = 0, .y = 0, .w = WIN_W, .h = WIN_H - VIS_H },
     // TASK-125: H キー全 hide。slot visible の一時 override。解除時に pre_hide_* を復元し open は保持。
     panels_hidden: bool = false,
+    pre_hide_left_visible: bool = true,
     pre_hide_right_visible: bool = true,
     pre_hide_bottom_visible: bool = true,
+    // TASK-149.3: History panel ScrollArea と local-only meta ring。
+    history_scroll: gui.Vec2f = .{},
+    meta_events: [MAX_META_EVENTS]MetaEvent = [_]MetaEvent{.{}} ** MAX_META_EVENTS,
+    meta_head: u32 = 0,
+    meta_filled: u32 = 0,
     // appshell Preferences（panel/slot 永続化。VP_APPSHELL_DIR 対応）。
     prefs: appshell.preferences.Preferences = undefined,
     prefs_dir: ?std.Io.Dir = null,
@@ -520,12 +543,15 @@ const App = struct {
 
     fn togglePanelsHidden(self: *App) void {
         if (!self.panels_hidden) {
+            self.pre_hide_left_visible = self.panel_host.slotVisible(.left);
             self.pre_hide_right_visible = self.panel_host.slotVisible(.right);
             self.pre_hide_bottom_visible = self.panel_host.slotVisible(.bottom);
+            self.panel_host.setSlotVisible(.left, false);
             self.panel_host.setSlotVisible(.right, false);
             self.panel_host.setSlotVisible(.bottom, false);
             self.panels_hidden = true;
         } else {
+            self.panel_host.setSlotVisible(.left, self.pre_hide_left_visible);
             self.panel_host.setSlotVisible(.right, self.pre_hide_right_visible);
             self.panel_host.setSlotVisible(.bottom, self.pre_hide_bottom_visible);
             self.panels_hidden = false;
@@ -538,6 +564,46 @@ const App = struct {
         _ = self.panel_host.setPanelVisible(name, !p.visible);
         self.prefs_dirty = true;
         return true;
+    }
+
+    fn pushMetaEvent(self: *App, summary: []const u8) void {
+        const after: u64 = if (self.cmd_log.filled > 0) self.cmd_log.recordAt(self.cmd_log.filled - 1).seq else 0;
+        var e: MetaEvent = .{ .after_seq = after };
+        const n = @min(summary.len, e.summary_buf.len);
+        @memcpy(e.summary_buf[0..n], summary[0..n]);
+        e.summary_len = @intCast(n);
+        self.meta_events[self.meta_head] = e;
+        self.meta_head = (self.meta_head + 1) % @as(u32, MAX_META_EVENTS);
+        if (self.meta_filled < MAX_META_EVENTS) self.meta_filled += 1;
+    }
+
+    fn metaAt(self: *const App, i: u32) *const MetaEvent {
+        // i: 0 = 最古 … filled-1 = 最新
+        const idx = (self.meta_head + MAX_META_EVENTS - self.meta_filled + i) % MAX_META_EVENTS;
+        return &self.meta_events[idx];
+    }
+
+    fn historyBodyAvail(self: *const App) i32 {
+        if (self.panel_host.panelRect(self.gui_ctx, "History")) |r| {
+            return @max(1, @as(i32, @intCast(r.w)) - 16);
+        }
+        return @max(1, self.panel_host.slotExtent(.left) - 24);
+    }
+
+    fn historyBodyHeight(self: *const App) i32 {
+        if (self.panel_host.panelRect(self.gui_ctx, "History")) |r| {
+            return @max(40, @as(i32, @intCast(r.h)) - 28);
+        }
+        return 200;
+    }
+
+    fn historyCount(self: *const App) u32 {
+        return self.cmd_log.filled + self.meta_filled;
+    }
+
+    fn historyLatestSeq(self: *const App) i64 {
+        if (self.cmd_log.filled == 0) return -1;
+        return @intCast(self.cmd_log.recordAt(self.cmd_log.filled - 1).seq);
     }
 
     fn syncCanvasRect(self: *App) void {
@@ -720,12 +786,15 @@ const App = struct {
     fn releaseParamEdits(self: *App) void {
         const before = self.slider_drag_before;
         self.slider_drag_before = null;
-        var committed = false;
+        // entry ごとに記録する。1 操作 = 1 record の coalesce は dragging→release で既に担保
+        // （drag 中の中間値は pending 更新のみで CommandLog に載せない）。
+        // 旧 committed 共有ガードは「同一呼び出し内の別 slot の記録を黙って落とす」誤動作だった。
         for (&self.param_edits) |*state| {
             const was_dragging = state.dragging;
             state.release();
-            if (committed or !was_dragging) continue;
+            if (!was_dragging) continue;
             if (before) |b| {
+                // Inspector slider: NodeId 形式で set_param（queueParamOverride 経路）。
                 if (b.mode != 1 or state.key.invalid()) continue;
                 const final_raw: f32 = blk: {
                     if (state.pending) |pv| break :blk switch (pv) {
@@ -744,8 +813,21 @@ const App = struct {
                     self.pending_param_undo_before = null;
                     continue;
                 };
+                // recordedAction 経由で CommandLog へ 1 record。
                 routeUiAction(self, "set_param", args);
-                committed = true;
+            } else if (state.pending) |pv| {
+                // Transport slider: alias 名 2 トークン形式（setParamAndPublish 経路と一致）。
+                // density は FieldKey.handle==INVALID でも alias 経由で記録する（invalid() で落とさない）。
+                const alias = transportAliasForKey(self, state.key) orelse continue;
+                const raw_canonical: f32 = switch (pv) {
+                    .scalar => |v| v,
+                    .choice => |idx| @floatFromInt(idx),
+                };
+                // pending は canonical。setParamAndPublish は UI 値を期待するので toUi で戻す。
+                const ui = param_view.toUi(alias, raw_canonical, conversion());
+                var args_buf: [128]u8 = undefined;
+                const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ @tagName(alias), ui }) catch continue;
+                recordGuiAction(self, "set_param", args);
             }
         }
     }
@@ -917,6 +999,17 @@ const App = struct {
             .label = "Quit",
             .menu = .{ .title = "File", .order = 103 },
         });
+        // TASK-149.3: View → History（Cmd/Ctrl+Shift+H。modifier 無し H の全 hide と分離）。
+        var hist_mod = accel_mod;
+        hist_mod.shift = true;
+        const hist_checked = if (self.findPanel("History")) |p| p.visible else false;
+        put(self, &n, .{
+            .id = CmdId.toggle_history,
+            .label = "History",
+            .menu = .{ .title = "View", .order = 100 },
+            .shortcut = .{ .key = .H, .modifiers = hist_mod },
+            .checked = hist_checked,
+        });
         self.menu_command_count = n;
     }
 
@@ -948,6 +1041,10 @@ const App = struct {
                 self.menu_last_op = .open_project;
             },
             CmdId.quit => self.running = false,
+            CmdId.toggle_history => {
+                _ = self.togglePanelByName("History");
+                if (self.prefs_dirty) persistPanelPrefs(self);
+            },
             else => {},
         }
     }
@@ -2509,15 +2606,16 @@ pub fn main(init: std.process.Init) !void {
     var gui_ctx = gui.Context.init(allocator, gui.default_font);
     defer gui_ctx.deinit();
 
-    // TASK-149.1: PanelHost registry — Transport=bottom, Inspector=right。
+    // TASK-149.1/149.3: PanelHost registry — History=left, Transport=bottom, Inspector=right。
     var panels = [_]gui.Panel{
+        .{ .name = "History", .slot = .left, .build = buildHistoryPanel, .user_data = &app },
         .{ .name = "Transport", .slot = .bottom, .build = buildTransportPanel, .user_data = &app },
         .{ .name = "Inspector", .slot = .right, .build = buildInspectorPanel, .user_data = &app },
     };
     var panel_host = try gui.PanelHost.init(panels[0..], .{
+        .left = .{ .extent = 220, .min_extent = 140, .max_extent = 400 },
         .right = .{ .extent = 280, .min_extent = 160, .max_extent = 480 },
         .bottom = .{ .extent = 250, .min_extent = 120, .max_extent = 400 },
-        .left = .{ .visible = false, .extent = 200, .min_extent = 120, .max_extent = 400 },
         .min_center_width = 200,
         .min_center_height = 160,
     });
@@ -2532,6 +2630,11 @@ pub fn main(init: std.process.Init) !void {
         app.prefs_dir = dir;
         _ = app.prefs.load(app.io, dir, "preferences.ash") catch {};
         panel_host.restore(panelPersistence(&app));
+        // TASK-149.3 移行: 旧 prefs が left.visible=false（149.1 時代）だと History が永久に出ない。
+        // History panel が visible なら left slot を有効化（個別 OFF は panel_toggle history）。
+        if (app.panelVisible("History")) {
+            panel_host.setSlotVisible(.left, true);
+        }
     } else |err| {
         std.debug.print("apps/patch: preferences dir open failed: {s}\n", .{@errorName(err)});
     }
@@ -4418,14 +4521,14 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 fn registerPatchActions(app: *App) void {
     platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode, .network_policy = patchPolicy("select_node") });
     platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam, .network_policy = patchPolicy("observe_param") });
-    // TASK-149.1: panel visible トグル（local_only。recipe/CommandLog には載せない）。
+    // TASK-149.1/149.3: panel visible トグル（local_only。recipe/CommandLog 非記録→meta ring）。
     platform.registerAction(.{
         .name = "panel_toggle",
         .ctx = app,
         .run = actionPanelToggle,
         .network_policy = .local_only,
         .args = &.{.{ .name = "name", .kind = "string" }},
-        .desc = "toggle panel visible (transport|inspector)",
+        .desc = "toggle panel visible (transport|inspector|history)",
     });
     platform.registerAction(.{
         .name = "add_node",
@@ -4725,8 +4828,8 @@ fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
 fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
     const host = app.panel_host;
-    // 新キーに加え、TASK-123/125 互換の transport_state/inspector_state を併記（フィールド追加のみ）。
-    return std.fmt.bufPrint(buf, "transport_visible={d} inspector_visible={d} transport_open={d} inspector_open={d} transport_state={s} inspector_state={s} panels_hidden={d} right_extent={d} bottom_extent={d} center_x={d} center_y={d} center_w={d} center_h={d} canvas_w={d} canvas_h={d}", .{
+    // 既存キー維持 + TASK-149.3 history_* を追加のみ。
+    return std.fmt.bufPrint(buf, "transport_visible={d} inspector_visible={d} transport_open={d} inspector_open={d} transport_state={s} inspector_state={s} panels_hidden={d} history_visible={d} history_open={d} history_count={d} history_latest_seq={d} history_scroll_y={d} left_extent={d} right_extent={d} bottom_extent={d} center_x={d} center_y={d} center_w={d} center_h={d} canvas_w={d} canvas_h={d}", .{
         @intFromBool(app.panelVisible("Transport")),
         @intFromBool(app.panelVisible("Inspector")),
         @intFromBool(app.panelOpen("Transport")),
@@ -4734,6 +4837,12 @@ fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         app.panelStateName("Transport"),
         app.panelStateName("Inspector"),
         @intFromBool(app.panels_hidden),
+        @intFromBool(app.panelVisible("History")),
+        @intFromBool(app.panelOpen("History")),
+        app.historyCount(),
+        app.historyLatestSeq(),
+        @as(i32, @intFromFloat(app.history_scroll.y)),
+        host.slotExtent(.left),
         host.slotExtent(.right),
         host.slotExtent(.bottom),
         @as(i32, @intFromFloat(app.canvas_rect.x)),
@@ -4745,7 +4854,134 @@ fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch return buf[0..0];
 }
 
-// ── PanelHost body callbacks + Preferences adapter（TASK-149.1）────────────
+// ── PanelHost body callbacks + Preferences adapter（TASK-149.1/149.3）────────
+
+fn actorLabel(actor: platform.command.ActorId, buf: []u8) []const u8 {
+    return switch (actor) {
+        .local_user => "user",
+        .local_agent => "agent",
+        .system => "system",
+        .peer => |n| std.fmt.bufPrint(buf, "peer#{d}", .{n}) catch "peer",
+    };
+}
+
+/// recipeEntriesFromLog と履歴 badge の単一ソース。除外名を増やすときはここだけ触る。
+fn isRecipeEligibleCommandName(name: []const u8) bool {
+    // TASK-106.1: 内部 snapshot。意味的 recipe に含めない。
+    if (std.mem.eql(u8, name, "pattern_state")) return false;
+    return true;
+}
+
+fn normalHistoryBadge(name: []const u8) []const u8 {
+    return if (isRecipeEligibleCommandName(name)) "[recipe]" else "[internal]";
+}
+
+fn formatHistoryCmdLine(rec: *const platform.command.CommandRecord, buf: []u8) []const u8 {
+    var actor_buf: [24]u8 = undefined;
+    const actor = actorLabel(rec.actor, &actor_buf);
+    return switch (rec.kind) {
+        .normal => blk: {
+            const badge = normalHistoryBadge(rec.name());
+            const args = rec.args();
+            if (args.len == 0) {
+                break :blk std.fmt.bufPrint(buf, "#{d} {s} {s} {s}", .{ rec.seq, actor, rec.name(), badge }) catch "#?";
+            }
+            const max_args = @min(args.len, 48);
+            break :blk std.fmt.bufPrint(buf, "#{d} {s} {s} {s} {s}", .{ rec.seq, actor, rec.name(), args[0..max_args], badge }) catch "#?";
+        },
+        .revert => blk: {
+            if (rec.target_seq) |t| {
+                break :blk std.fmt.bufPrint(buf, "#{d} {s} undo #{d} [meta/revert]", .{ rec.seq, actor, t }) catch "#?";
+            }
+            break :blk std.fmt.bufPrint(buf, "#{d} {s} undo [meta/revert]", .{ rec.seq, actor }) catch "#?";
+        },
+    };
+}
+
+fn formatHistoryMetaLine(meta: *const MetaEvent, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "— user {s} [local_only]", .{meta.summary()}) catch "—";
+}
+
+/// History 行の merge 表示用（cmd + meta）。fixed stack、per-frame alloc なし。
+const HistoryDisplayLine = struct {
+    primary_seq: u64,
+    is_meta: bool,
+    /// meta なら meta ring index（0=oldest）、cmd なら recordAt index。
+    src_index: u32,
+};
+
+fn buildHistoryDisplayLines(app: *const App, out: []HistoryDisplayLine) usize {
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < app.cmd_log.filled and n < out.len) : (i += 1) {
+        const rec = app.cmd_log.recordAt(i);
+        out[n] = .{ .primary_seq = rec.seq, .is_meta = false, .src_index = i };
+        n += 1;
+    }
+    i = 0;
+    while (i < app.meta_filled and n < out.len) : (i += 1) {
+        const m = app.metaAt(i);
+        // after_seq の直後に差し込む（同じ primary なら meta を後＝表示上は上側に寄りやすいよう is_meta で tie-break）。
+        out[n] = .{ .primary_seq = m.after_seq, .is_meta = true, .src_index = i };
+        n += 1;
+    }
+    // 新しい順: primary_seq desc、同 seq なら meta を cmd より新（上）に。
+    std.mem.sort(HistoryDisplayLine, out[0..n], {}, struct {
+        fn less(_: void, a: HistoryDisplayLine, b: HistoryDisplayLine) bool {
+            if (a.primary_seq != b.primary_seq) return a.primary_seq > b.primary_seq;
+            if (a.is_meta != b.is_meta) return a.is_meta and !b.is_meta;
+            return a.src_index > b.src_index;
+        }
+    }.less);
+    return n;
+}
+
+fn buildHistoryPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    const body_w = app.historyBodyAvail();
+    const body_h = app.historyBodyHeight();
+    const pad: i32 = 4;
+    const outer_w = @max(1, body_w);
+    const content_w = @max(1, outer_w - pad * 2);
+
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .fixed = outer_w },
+        .height = .{ .fixed = body_h },
+        .padding = .{ pad, pad, pad, pad },
+        .gap = 2,
+    });
+
+    // ScrollArea: viewport 固定幅・固定高、content は fit（grow-in-fit 回避）。
+    ctx.beginScrollArea(HISTORY_SCROLL_ID, &app.history_scroll, .{
+        .width = .{ .fixed = content_w },
+        .height = .{ .fixed = @max(20, body_h - pad * 2) },
+        .padding = .{ 2, 2, 2, 2 },
+        .gap = 1,
+        .bg = gui.Color.rgba(0x14, 0x18, 0x1E, 0xFF),
+        .bar_thickness = 8,
+    });
+
+    var lines_buf: [platform.command.MAX_CMD_LOG + MAX_META_EVENTS]HistoryDisplayLine = undefined;
+    const n_lines = buildHistoryDisplayLines(app, &lines_buf);
+    if (n_lines == 0) {
+        ctx.labelEx("(no history)", gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF));
+    } else {
+        var line_buf: [HISTORY_LINE_CAP]u8 = undefined;
+        for (lines_buf[0..n_lines]) |entry| {
+            const text: []const u8 = if (entry.is_meta)
+                formatHistoryMetaLine(app.metaAt(entry.src_index), &line_buf)
+            else
+                formatHistoryCmdLine(app.cmd_log.recordAt(entry.src_index), &line_buf);
+            // 各行 fixed 幅 label（wrap なし・見切れは scroll）。
+            ctx.beginBox(.{ .width = .{ .fixed = @max(1, content_w - 12) }, .height = .fit });
+            ctx.labelEx(text, gui.Color.rgba(0xD0, 0xD6, 0xDE, 0xFF));
+            ctx.endBox();
+        }
+    }
+    ctx.endScrollArea();
+    ctx.endBox();
+}
 
 fn buildTransportPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(user_data));
@@ -4829,18 +5065,21 @@ fn persistPanelPrefs(app: *App) void {
     // H 全 hide は slot の一時 override。persist 前に pre-hide 値へ戻し、終了後に再適用する。
     const was_hidden = app.panels_hidden;
     if (was_hidden) {
+        app.panel_host.setSlotVisible(.left, app.pre_hide_left_visible);
         app.panel_host.setSlotVisible(.right, app.pre_hide_right_visible);
         app.panel_host.setSlotVisible(.bottom, app.pre_hide_bottom_visible);
     }
     app.panel_host.persist(panelPersistence(app)) catch |err| {
         std.debug.print("apps/patch: panel persist failed: {s}\n", .{@errorName(err)});
         if (was_hidden) {
+            app.panel_host.setSlotVisible(.left, false);
             app.panel_host.setSlotVisible(.right, false);
             app.panel_host.setSlotVisible(.bottom, false);
         }
         return;
     };
     if (was_hidden) {
+        app.panel_host.setSlotVisible(.left, false);
         app.panel_host.setSlotVisible(.right, false);
         app.panel_host.setSlotVisible(.bottom, false);
     }
@@ -4854,16 +5093,26 @@ fn persistPanelPrefs(app: *App) void {
 fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const name_raw = std.mem.trim(u8, args, " \t");
-    // harness は小文字名（transport / inspector）。PanelHost name は PascalCase。
+    // harness は小文字名。PanelHost name は PascalCase。local_only（CommandLog 非記録→meta ring）。
     const panel_name: []const u8 = blk: {
         if (std.mem.eql(u8, name_raw, "transport") or std.mem.eql(u8, name_raw, "Transport")) break :blk "Transport";
         if (std.mem.eql(u8, name_raw, "inspector") or std.mem.eql(u8, name_raw, "Inspector")) break :blk "Inspector";
+        if (std.mem.eql(u8, name_raw, "history") or std.mem.eql(u8, name_raw, "History")) break :blk "History";
         return error.InvalidArgument;
     };
     if (!app.togglePanelByName(panel_name)) return error.InvalidArgument;
     if (app.prefs_dirty) persistPanelPrefs(app);
     const visible = app.panelVisible(panel_name);
+    var sum_buf: [64]u8 = undefined;
+    const sum = std.fmt.bufPrint(&sum_buf, "panel_toggle {s}={d}", .{ name_raw, @intFromBool(visible) }) catch "panel_toggle";
+    app.pushMetaEvent(sum);
     return std.fmt.bufPrint(buf, "ok panel_toggle {s}={d}", .{ name_raw, @intFromBool(visible) }) catch error.BufferTooSmall;
+}
+
+/// GUI 操作を CommandLog へ記録する（dispatch なし。既存変更経路の後に呼ぶ）。
+fn recordGuiAction(app: *App, name: []const u8, args: []const u8) void {
+    var buf: [8]u8 = undefined;
+    _ = app.cmd_exec.recordExecuted(name, args, .{ .actor = .local_user }, null, &buf) catch {};
 }
 
 const ChoiceDigestInfo = struct {
@@ -5227,12 +5476,20 @@ fn setMuteAndPublish(app: *App, name: []const u8, muted: bool) error{UnknownTrac
 fn transportParamChanged(ctx: *anyopaque, key: param_view.FieldKey, value: f32) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     setTransportCanonical(app, key, value) catch {};
-    app.editState(key).dragging = true;
+    // drag 中は pending 更新のみ。CommandLog は release 時に 1 record（coalesce）。
+    const es = app.editState(key);
+    if (es.pending == null) es.begin(key, .{ .scalar = value }) else {
+        es.pending = .{ .scalar = value };
+        es.dragging = true;
+    }
 }
 
 fn transportMuteChanged(ctx: *anyopaque, name: []const u8, muted: bool) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     setMuteAndPublish(app, name, muted) catch {};
+    var args_buf: [32]u8 = undefined;
+    const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ name, @intFromBool(muted) }) catch return;
+    recordGuiAction(app, "set_mute", args);
 }
 
 fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -5790,6 +6047,7 @@ fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     const app = actionApp(ctx);
     const path = try gen_actions.parsePath(args);
     try actionSaveProjectFile(app, path);
+    app.pushMetaEvent("save_project");
     return "ok";
 }
 
@@ -5817,6 +6075,7 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
         // TASK-151: apply_seed_song を quantize_bar 代理にする（同居フォーマットのみ後勝ち量子化。doc は applyParamsPattern）。
         if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern, loaded.apply_seed_song);
         if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
+        app.pushMetaEvent("load_project");
         return std.fmt.bufPrint(buf, "format={s} nodes={d}/{d} edges={d}/{d}", .{
             @tagName(loaded.format), result.nodes_restored, loaded.nodes.len, result.edges_restored, loaded.edges.len,
         }) catch "ok";
@@ -5825,6 +6084,7 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     // 同上: apply_seed_song → quantize_bar（現行フォーマットに pattern-only+seed なしの組合せは無い）。
     if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern, loaded.apply_seed_song);
     if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
+    app.pushMetaEvent("load_project");
     return std.fmt.bufPrint(buf, "format={s}", .{@tagName(loaded.format)}) catch "ok";
 }
 
@@ -5980,7 +6240,7 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 }
 
 /// CommandLog の kind=normal を seq 順で Entry 化（TASK-62.5.8）。name/args は log 借用。
-/// TASK-106.1: 内部 snapshot `pattern_state` は意味的 recipe から除外する。
+/// 除外判定は `isRecipeEligibleCommandName`（履歴 badge と共有）。
 fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
     var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
     var n: usize = 0;
@@ -5988,7 +6248,7 @@ fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Al
     while (i < log.filled) : (i += 1) {
         const rec = log.recordAt(i);
         const name = rec.name();
-        if (std.mem.eql(u8, name, "pattern_state")) continue;
+        if (!isRecipeEligibleCommandName(name)) continue;
         views_buf[n] = .{
             .is_normal = rec.kind == .normal,
             .name = name,
@@ -6008,6 +6268,7 @@ fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const entries = try recipeEntriesFromLog(&app.cmd_log, gpa);
     defer gpa.free(entries);
     try recipe.save(app.io, path, .{ .app_name = APP_NAME }, entries, gpa);
+    app.pushMetaEvent("recipe_save");
     return "ok";
 }
 
