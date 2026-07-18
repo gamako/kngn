@@ -554,6 +554,18 @@ pub fn parseShape(args: []const u8, canvas_w: i32, canvas_h: i32) ParseError!Sha
 /// キャンバスサイズ（resize / new W H）。上限は呼び出し側の共通 validator が適用する。
 pub const CanvasSize = struct { w: u32, h: u32 };
 
+/// キャンバスサイズ上限（各辺 ≤4096・総画素 ≤16M）。action / .pix / netsync / GUI で共有（TASK-144.1）。
+pub const MAX_CANVAS_EDGE: u32 = 4096;
+pub const MAX_CANVAS_PIXELS: usize = 16 * 1024 * 1024;
+
+/// キャンバスサイズ上限検証（各辺 ≤4096・総画素 ≤16M）。0 / 乗算 overflow / 上限超過を拒否。
+pub fn validateCanvasSize(w: u32, h: u32) error{ InvalidSize, SizeOverflow, CanvasTooLarge }!void {
+    if (w == 0 or h == 0) return error.InvalidSize;
+    if (w > MAX_CANVAS_EDGE or h > MAX_CANVAS_EDGE) return error.CanvasTooLarge;
+    const n = std.math.mul(usize, w, h) catch return error.SizeOverflow;
+    if (n > MAX_CANVAS_PIXELS) return error.CanvasTooLarge;
+}
+
 /// `resize W H` 相当: 引数厳密 2・符号なし整数。0 は ValueOutOfRange。
 pub fn parseCanvasSize(args: []const u8) ParseError!CanvasSize {
     var it = tokenize(args);
@@ -1127,6 +1139,25 @@ test "parseCanvasSize / parseNew: 受理と拒否（TASK-144.1）" {
     try testing.expectError(error.ValueOutOfRange, parseNew("16 0"));
     try testing.expectError(error.InvalidNumber, parseNew("-1 16"));
     try testing.expectError(error.InvalidNumber, parseNew("nope 16"));
+}
+
+test "validateCanvasSize: 境界（TASK-144.2）" {
+    // (a) 最小
+    try validateCanvasSize(1, 1);
+    // (b) 辺上限ちょうど（4096×4096 = 16M 総画素ちょうど）
+    try validateCanvasSize(MAX_CANVAS_EDGE, MAX_CANVAS_EDGE);
+    try testing.expectEqual(@as(usize, MAX_CANVAS_PIXELS), @as(usize, MAX_CANVAS_EDGE) * @as(usize, MAX_CANVAS_EDGE));
+    // (c) 辺上限超過
+    try testing.expectError(error.CanvasTooLarge, validateCanvasSize(MAX_CANVAS_EDGE + 1, 1));
+    try testing.expectError(error.CanvasTooLarge, validateCanvasSize(1, MAX_CANVAS_EDGE + 1));
+    // (d) 0
+    try testing.expectError(error.InvalidSize, validateCanvasSize(0, 1));
+    try testing.expectError(error.InvalidSize, validateCanvasSize(1, 0));
+    // (e) 総画素 > 16M（辺は上限内）
+    try testing.expectError(error.CanvasTooLarge, validateCanvasSize(MAX_CANVAS_EDGE, MAX_CANVAS_EDGE + 1));
+    // (f) 極大入力: 辺上限で先に CanvasTooLarge（現行定数では u32×u32 の SizeOverflow は到達不能な防御分岐）
+    try testing.expectError(error.CanvasTooLarge, validateCanvasSize(std.math.maxInt(u32), 1));
+    try testing.expectError(error.CanvasTooLarge, validateCanvasSize(std.math.maxInt(u32), std.math.maxInt(u32)));
 }
 
 test "resolveAnchor: 偶数サイズの mid/center" {

@@ -66,9 +66,6 @@ const WINDOW_H: u32 = 600;
 /// 起動時既定キャンバスサイズ（実行時サイズは `doc.width` / `doc.height`）。
 const DEFAULT_CANVAS_W: u32 = 256;
 const DEFAULT_CANVAS_H: u32 = 256;
-/// キャンバスサイズ上限（action / .pix / netsync で共有。TASK-144.1）。
-const MAX_CANVAS_EDGE: u32 = 4096;
-const MAX_CANVAS_PIXELS: usize = 16 * 1024 * 1024;
 // ビューポート（TASK-39）: ズームは整数倍のランタイム値。既定 2x で従来の見た目を維持。
 const ZOOM_MIN: i32 = 1;
 const ZOOM_MAX: i32 = 32;
@@ -89,14 +86,6 @@ const SAVE_MSG_DURATION: f64 = 3.0;
 const MARCH_SPEED: f64 = 12.0;
 const MARCH_PERIOD: f64 = 8.0;
 
-/// キャンバスサイズ上限（各辺 ≤4096・総画素 ≤16M）。action / .pix / netsync で共有。
-fn validateCanvasSize(w: u32, h: u32) error{ InvalidSize, SizeOverflow, CanvasTooLarge }!void {
-    if (w == 0 or h == 0) return error.InvalidSize;
-    if (w > MAX_CANVAS_EDGE or h > MAX_CANVAS_EDGE) return error.CanvasTooLarge;
-    const n = std.math.mul(usize, w, h) catch return error.SizeOverflow;
-    if (n > MAX_CANVAS_PIXELS) return error.CanvasTooLarge;
-}
-
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
 const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project, export_seq, export_sheet, confirm_save_as };
@@ -111,6 +100,8 @@ const CmdId = struct {
     pub const open_project: platform.CommandId = 4;
     pub const save_project: platform.CommandId = 5;
     pub const new_document: platform.CommandId = 14;
+    pub const new_size: platform.CommandId = 15;
+    pub const resize_canvas: platform.CommandId = 16;
     pub const export_seq: platform.CommandId = 6;
     pub const export_sheet: platform.CommandId = 7;
     pub const save_palette: platform.CommandId = 8;
@@ -120,6 +111,37 @@ const CmdId = struct {
     pub const toggle_panel: platform.CommandId = 12;
     pub const toggle_timeline: platform.CommandId = 13;
 };
+
+/// TASK-144.2: New Size / Resize Canvas モーダル。TextBuffer は App 寿命で所有し、
+/// `size_dialog != null` のときだけ表示（storage へのポインタ）。
+const SizeDialogMode = enum { new_size, resize };
+const SizeDialogState = struct {
+    mode: SizeDialogMode,
+    width_buf: gui.TextBuffer,
+    height_buf: gui.TextBuffer,
+    err_len: usize = 0,
+    err_buf: [128]u8 = undefined,
+
+    fn setError(self: *SizeDialogState, msg: []const u8) void {
+        const n = @min(msg.len, self.err_buf.len);
+        @memcpy(self.err_buf[0..n], msg[0..n]);
+        self.err_len = n;
+    }
+
+    fn clearError(self: *SizeDialogState) void {
+        self.err_len = 0;
+    }
+
+    fn errorMsg(self: *const SizeDialogState) ?[]const u8 {
+        if (self.err_len == 0) return null;
+        return self.err_buf[0..self.err_len];
+    }
+};
+const SIZE_DIALOG_ID_BASE: gui.Id = 0xA450_0000;
+const SIZE_DIALOG_W_ID: gui.Id = SIZE_DIALOG_ID_BASE + 1;
+const SIZE_DIALOG_H_ID: gui.Id = SIZE_DIALOG_ID_BASE + 2;
+const SIZE_DIALOG_OK_ID: gui.Id = SIZE_DIALOG_ID_BASE + 3;
+const SIZE_DIALOG_CANCEL_ID: gui.Id = SIZE_DIALOG_ID_BASE + 4;
 
 const MENU_CMD_CAP = 40;
 const RECENT_CMD_BASE: platform.CommandId = 100;
@@ -293,10 +315,18 @@ fn buttonToU8(b: platform.MouseButton) u8 {
 
 /// platform.Event → gui.InputEvent。GUI に関係しない quit は null。
 /// key の負値（platform KeyCode.UNKNOWN = -1）は捨てる（libs/gui は u32 code 前提）。
+/// `pass_char_input`: size_dialog 表示中のみ true（通常は char_input を GUI へ流さない）。
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
+    return toGuiEventEx(ev, false);
+}
+
+fn toGuiEventEx(ev: platform.Event, pass_char_input: bool) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
-        .char_input => null,
+        .char_input => |ch| if (pass_char_input)
+            .{ .char_input = .{ .codepoint = ch.codepoint, .modifiers = ch.modifiers.toC() } }
+        else
+            null,
         .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: pixie 未消費（cross-cutting Event 追加。他機能は無改造）
         .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
         .menu_command => null, // TASK-97.2: App.dispatchCommand で消費（gui へは渡さない）
@@ -533,6 +563,10 @@ const App = struct {
     png_import_pending: bool = false,
     /// `new W H` 確認フロー用（hostNewDocument が消費。TASK-144.1）。
     pending_new_size: ?struct { w: u32, h: u32 } = null,
+    /// TASK-144.2: サイズダイアログ本体（TextBuffer は appInit/appDeinit で管理）。
+    size_dialog_storage: SizeDialogState = undefined,
+    /// null=閉じ。open 中は `&size_dialog_storage`（毎フレーム再生成しない）。
+    size_dialog: ?*SizeDialogState = null,
     title_cache: [std.fs.max_path_bytes + 64]u8 = undefined,
     title_cache_len: usize = 0,
     /// パレットの .gpl 保存先（gpa 所有。PNG の current_path とは別管理）。
@@ -794,7 +828,7 @@ const App = struct {
     fn doResize(self: *App, new_w: u32, new_h: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (platform.netsyncActive()) return error.RejectedWhileSynced;
-        try validateCanvasSize(new_w, new_h);
+        try actions.validateCanvasSize(new_w, new_h);
         if (self.doc.layers.items[self.doc.selected_layer].kind != .text) {
             self.doc.commitActiveLayerToCel(self.gpa, self.doc.selected_layer);
         }
@@ -815,7 +849,7 @@ const App = struct {
     fn doNew(self: *App, new_w: u32, new_h: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (platform.netsyncActive()) return error.RejectedWhileSynced;
-        try validateCanvasSize(new_w, new_h);
+        try actions.validateCanvasSize(new_w, new_h);
         var new_doc = try core.Document.init(self.gpa, new_w, new_h);
         errdefer new_doc.deinit();
         const preserved_next_handle = self.doc.undo.next_handle;
@@ -832,6 +866,82 @@ const App = struct {
         self.sel_in.discardFloat(self.gpa);
         self.loadPaletteFromDoc();
         self.syncPreviewCanvas();
+    }
+
+    fn replaceSizeDialogBuf(buf: *gui.TextBuffer, text: []const u8) !void {
+        buf.bytes.clearRetainingCapacity();
+        try buf.bytes.appendSlice(buf.alloc, text);
+    }
+
+    /// TASK-144.2: New Size / Resize Canvas ダイアログを開く（command は open のみ）。
+    fn openSizeDialog(self: *App, mode: SizeDialogMode) void {
+        // reentrant open 二重防御（dispatchCommand 先頭ガードと対称）。
+        if (self.size_dialog != null) return;
+        if (self.recovery != null or self.host.confirmation() != .none) return;
+        if (platform.netsyncActive()) return;
+        var wbuf: [16]u8 = undefined;
+        var hbuf: [16]u8 = undefined;
+        const ws = std.fmt.bufPrint(&wbuf, "{d}", .{self.doc.width}) catch return;
+        const hs = std.fmt.bufPrint(&hbuf, "{d}", .{self.doc.height}) catch return;
+        replaceSizeDialogBuf(&self.size_dialog_storage.width_buf, ws) catch return;
+        replaceSizeDialogBuf(&self.size_dialog_storage.height_buf, hs) catch return;
+        self.size_dialog_storage.mode = mode;
+        self.size_dialog_storage.clearError();
+        self.size_dialog = &self.size_dialog_storage;
+    }
+
+    fn closeSizeDialog(self: *App) void {
+        self.size_dialog = null;
+    }
+
+    /// OK: parse → validate → doResize/doNew（確認経路）。失敗時は dialog を維持。
+    fn confirmSizeDialog(self: *App) void {
+        const dlg = self.size_dialog orelse return;
+        dlg.clearError();
+        var args_buf: [48]u8 = undefined;
+        const args = std.fmt.bufPrint(&args_buf, "{s} {s}", .{ dlg.width_buf.slice(), dlg.height_buf.slice() }) catch {
+            dlg.setError("InvalidSize");
+            return;
+        };
+        const sz = actions.parseCanvasSize(args) catch |err| {
+            dlg.setError(@errorName(err));
+            return;
+        };
+        actions.validateCanvasSize(sz.w, sz.h) catch |err| {
+            dlg.setError(@errorName(err));
+            return;
+        };
+        if (self.editingBlocked()) {
+            dlg.setError("EditingBlocked");
+            return;
+        }
+        if (platform.netsyncActive()) {
+            dlg.setError("RejectedWhileSynced");
+            return;
+        }
+        switch (dlg.mode) {
+            .resize => {
+                self.doResize(sz.w, sz.h) catch |err| {
+                    dlg.setError(@errorName(err));
+                    return;
+                };
+                self.closeSizeDialog();
+            },
+            .new_size => {
+                self.pending_new_size = .{ .w = sz.w, .h = sz.h };
+                const result = self.requestNewDocument() catch |err| {
+                    self.pending_new_size = null;
+                    dlg.setError(@errorName(err));
+                    return;
+                };
+                if (result == .canceled) {
+                    self.pending_new_size = null;
+                    return;
+                }
+                // confirmation / applied のいずれも dialog を閉じる（overlay と同時に開かない）
+                self.closeSizeDialog();
+            },
+        }
     }
 
     /// netsync 中に editingBlocked なら、ローカル編集（capture / bezier / select ドラッグ）を
@@ -2473,6 +2583,11 @@ const App = struct {
     /// Undo/Redo は既存 doUndo/doRedo（ハイブリッド userUndo + netsync route）を維持し、
     /// 結果と undo 記録を変えない。
     fn dispatchCommand(self: *App, id: platform.CommandId) void {
+        // TASK-144.2: size_dialog 中は他メニューコマンドを通さない（recovery/confirmation の
+        // 早期 continue と同じ「開いている間は横取り」方針。native keyEquivalent / menuBarPopup
+        // 経由の reentrant open・confirmation 二重表示・layer 操作を防ぐ）。
+        // Esc/Enter は key_down 経路で処理され、ここは通らない。
+        if (self.size_dialog != null) return;
         // stale event / disabled 項目の最終防御: 共通入口で Command 表の存在 + enabled を
         // 再検証する。GUI click / shortcut は各自チェック済みだが、native/harness の
         // menu_command イベントは ID をそのまま運ぶため、状態更新後の stale event でも
@@ -2487,6 +2602,8 @@ const App = struct {
         }
         switch (id) {
             CmdId.new_document => _ = self.requestNewDocument() catch |err| self.setSaveMsg("New failed: {s}", .{@errorName(err)}),
+            CmdId.new_size => self.openSizeDialog(.new_size),
+            CmdId.resize_canvas => self.openSizeDialog(.resize),
             CmdId.open => {
                 self.pending_file_op = .open;
                 self.menu_pending_probe = .open;
@@ -2561,7 +2678,13 @@ const App = struct {
             }
         }.go;
 
-        put(self, &n, .{ .id = CmdId.new_document, .label = "New", .menu = .{ .title = "File", .order = 99 } });
+        put(self, &n, .{ .id = CmdId.new_document, .label = "New", .menu = .{ .title = "File", .order = 98 } });
+        put(self, &n, .{
+            .id = CmdId.new_size,
+            .label = "New Size...",
+            .menu = .{ .title = "File", .order = 99 },
+            .enabled = !platform.netsyncActive(),
+        });
         put(self, &n, .{ .id = CmdId.open, .label = "Open", .menu = .{ .title = "File", .order = 100 }, .shortcut = .{ .key = .O, .modifiers = accel_mod } });
         put(self, &n, .{ .id = CmdId.save, .label = "Save", .menu = .{ .title = "File", .order = 101 }, .shortcut = .{ .key = .S, .modifiers = accel_mod } });
         put(self, &n, .{ .id = CmdId.save_as, .label = "Save As", .menu = .{ .title = "File", .order = 102 }, .shortcut = .{ .key = .S, .modifiers = accel_shift } });
@@ -2592,6 +2715,12 @@ const App = struct {
 
         put(self, &n, .{ .id = CmdId.undo, .label = "Undo", .menu = .{ .title = "Edit", .order = 200 }, .shortcut = .{ .key = .Z, .modifiers = accel_mod }, .execution_policy = .undo });
         put(self, &n, .{ .id = CmdId.redo, .label = "Redo", .menu = .{ .title = "Edit", .order = 201 }, .shortcut = .{ .key = .Z, .modifiers = accel_shift }, .execution_policy = .redo });
+        put(self, &n, .{
+            .id = CmdId.resize_canvas,
+            .label = "Resize Canvas...",
+            .menu = .{ .title = "Edit", .order = 202 },
+            .enabled = !platform.netsyncActive(),
+        });
 
         put(self, &n, .{ .id = CmdId.toggle_panel, .label = "Panel", .menu = .{ .title = "View", .order = 300 }, .checked = self.right_visible });
         put(self, &n, .{ .id = CmdId.toggle_timeline, .label = "Timeline", .menu = .{ .title = "View", .order = 301 }, .checked = self.bottom_visible });
@@ -4130,12 +4259,12 @@ const pixie_args_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path" },
 };
 const pixie_args_canvas_size: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE) },
-    .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE) },
+    .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE) },
+    .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE) },
 };
 const pixie_args_new: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE), .optional = true },
-    .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE), .optional = true },
+    .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE), .optional = true },
+    .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE), .optional = true },
 };
 const appshell_args_optional_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path", .optional = true },
@@ -4209,7 +4338,7 @@ fn actionNewDocument(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
             return std.fmt.bufPrint(buf, "ok new={s}", .{@tagName(result)}) catch error.BufferTooSmall;
         },
         .sized => |sz| {
-            try validateCanvasSize(sz.w, sz.h);
+            try actions.validateCanvasSize(sz.w, sz.h);
             app.pending_new_size = .{ .w = sz.w, .h = sz.h };
             const result = app.requestNewDocument() catch |err| {
                 app.pending_new_size = null;
@@ -4223,7 +4352,7 @@ fn actionNewDocument(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 
 fn actionResize(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const sz = try actions.parseCanvasSize(args);
-    try validateCanvasSize(sz.w, sz.h);
+    try actions.validateCanvasSize(sz.w, sz.h);
     const app = actionApp(ctx);
     try app.doResize(sz.w, sz.h);
     return std.fmt.bufPrint(buf, "ok resize={d}x{d}", .{ sz.w, sz.h }) catch error.BufferTooSmall;
@@ -4346,10 +4475,10 @@ fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try app.checkEditingAllowed();
     const sz = try core.document_io.peekCanvasSize(bytes);
-    try validateCanvasSize(sz.w, sz.h);
+    try actions.validateCanvasSize(sz.w, sz.h);
     var new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
     errdefer new_doc.deinit();
-    try validateCanvasSize(new_doc.width, new_doc.height);
+    try actions.validateCanvasSize(new_doc.width, new_doc.height);
     const preserved_next_handle = app.doc.undo.next_handle;
     app.doc.deinit();
     app.doc = new_doc;
@@ -5469,6 +5598,53 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     if (app.saveMsg()) |msg| ctx.label(msg);
     ctx.endBox();
 
+    // ── TASK-144.2: サイズダイアログ（root 末尾 = 通常 UI より後に layout 発行 = 前面）──
+    // absolute 非対応のため canvas 領域相当の grow box で dim+panel を重ねるのではなく、
+    // root 末尾にフル幅の modal 帯を置き、panel を中央寄せする（確認 overlay と同時非表示は
+    // openSizeDialog 側でガード）。
+    if (app.size_dialog) |dlg| {
+        ctx.beginBox(.{
+            .direction = .column,
+            .width = .{ .grow = 1 },
+            .padding = .{ 24, 24, 24, 24 },
+            .gap = 12,
+            .align_cross = .center,
+            .bg = gui.Color.rgba(0x10, 0x12, 0x18, 0xE0),
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), .thickness = 2 },
+        });
+        const title: []const u8 = switch (dlg.mode) {
+            .new_size => "New Canvas Size",
+            .resize => "Resize Canvas",
+        };
+        ctx.label(title);
+        ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
+        ctx.label("W");
+        _ = ctx.textInputId(SIZE_DIALOG_W_ID, &dlg.width_buf, .{
+            .width = .{ .fixed = 100 },
+            .max_len = 10,
+            .placeholder = "width",
+        });
+        ctx.label("H");
+        _ = ctx.textInputId(SIZE_DIALOG_H_ID, &dlg.height_buf, .{
+            .width = .{ .fixed = 100 },
+            .max_len = 10,
+            .placeholder = "height",
+        });
+        ctx.endBox();
+        if (dlg.errorMsg()) |err| {
+            ctx.labelEx(err, gui.Color.rgba(0xFF, 0x80, 0x80, 0xFF));
+        }
+        ctx.beginBox(.{ .direction = .row, .gap = 12 });
+        if (ctx.buttonId(SIZE_DIALOG_OK_ID, "OK", .{ .min_w = 72 }).clicked) {
+            app.confirmSizeDialog();
+        }
+        if (ctx.buttonId(SIZE_DIALOG_CANCEL_ID, "Cancel", .{ .min_w = 72 }).clicked) {
+            app.closeSizeDialog();
+        }
+        ctx.endBox();
+        ctx.endBox();
+    }
+
     ctx.endBox(); // root
 }
 
@@ -5555,10 +5731,10 @@ fn loadProjectPath(app: *App, path: []const u8) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .unlimited);
     defer app.gpa.free(bytes);
     const sz = try core.document_io.peekCanvasSize(bytes);
-    try validateCanvasSize(sz.w, sz.h);
+    try actions.validateCanvasSize(sz.w, sz.h);
     var new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
     errdefer new_doc.deinit();
-    try validateCanvasSize(new_doc.width, new_doc.height);
+    try actions.validateCanvasSize(new_doc.width, new_doc.height);
     const preserved_next_handle = app.doc.undo.next_handle;
     app.doc.deinit();
     app.doc = new_doc;
@@ -5625,7 +5801,7 @@ fn recoverAutosave(app: *App) !void {
     const candidate = &(app.recovery orelse return error.NoRecoveryPending);
     var decoded = try core.document_io.decodeDocument(candidate.envelope.snapshot, app.gpa);
     errdefer decoded.deinit();
-    try validateCanvasSize(decoded.width, decoded.height);
+    try actions.validateCanvasSize(decoded.width, decoded.height);
     try app.host.adoptRecovered(candidate.envelope.original_path);
     try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
     app.doc.deinit();
@@ -5709,6 +5885,11 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     var recovery = try appshell.autosave.scan(gpa, io, autosave_dir);
     errdefer if (recovery) |*candidate| candidate.deinit();
 
+    var size_w_buf = try gui.TextBuffer.init(gpa, "");
+    errdefer size_w_buf.deinit();
+    var size_h_buf = try gui.TextBuffer.init(gpa, "");
+    errdefer size_h_buf.deinit();
+
     // ここから infallible（所有は App へ移動。成功 return 時は上記 errdefer は発火しない）
     self.* = .{
         .io = io,
@@ -5730,6 +5911,12 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .recent = recent,
         .autosave = autosave_controller,
         .recovery = recovery,
+        .size_dialog_storage = .{
+            .mode = .resize,
+            .width_buf = size_w_buf,
+            .height_buf = size_h_buf,
+        },
+        .size_dialog = null,
     };
 
     self.host = appshell.document_host.DocumentHost.init(gpa, .{
@@ -5790,6 +5977,9 @@ fn appDeinit(self: *App) void {
     if (self.palette_path) |p| gpa.free(p);
     if (self.clipboard) |*cb| cb.deinit(gpa);
     if (self.diff_base) |b| gpa.free(b);
+    self.size_dialog = null;
+    self.size_dialog_storage.width_buf.deinit();
+    self.size_dialog_storage.height_buf.deinit();
     self.sel_in.deinit(gpa);
     self.bezier_editor.deinit(gpa);
     self.preview_rec.deinit(gpa);
@@ -5841,11 +6031,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 // key_down を専用ハンドラへ回し、char_input で確定文字を追記する（TASK-22
                 // char_input の初消費）。key_up は常に通す（Space パン modifier 等の held
                 // 状態を編集中に取りこぼさないため。codex レビュー指摘 2026-07-05）。
+                // TASK-144.2: size_dialog 中は shortcut を流さず Esc=cancel / Enter=OK。
                 .key_down => |k| if (self.rename_in.active)
                     self.handleRenameKey(k)
                 else if (self.text_in.active)
                     self.handleTextEditKey(k)
-                else
+                else if (self.size_dialog != null) {
+                    if (k.key == .ESCAPE) self.closeSizeDialog() else if (k.key == .ENTER or k.key == .KP_ENTER) self.confirmSizeDialog();
+                } else
                     self.handleKey(k),
                 .key_up => |k| self.handleKeyUp(k),
                 .char_input => |c| if (self.rename_in.active)
@@ -5860,8 +6053,16 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
             // での干渉を避ける。rename_in/text_in はここで破棄されないため、他行の右クリックで
             // 新たな編集が始まれば単に上書きされるだけでクラッシュはしない）。
+            // size_dialog 中は char_input を GUI へ渡し、Enter/Esc は上で消費済みなので再送しない。
             if (!self.rename_in.active and !self.text_in.active) {
-                if (toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
+                const pass_char = self.size_dialog != null;
+                const skip_dialog_confirm_keys = if (self.size_dialog != null) switch (ev) {
+                    .key_down => |k| k.key == .ESCAPE or k.key == .ENTER or k.key == .KP_ENTER,
+                    else => false,
+                } else false;
+                if (!skip_dialog_confirm_keys) {
+                    if (toGuiEventEx(ev, pass_char)) |ge| self.ctx.pushEvent(ge);
+                }
             }
         }
 
@@ -5930,7 +6131,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         // ── ビューポート: ホイールズーム（カーソル中心）/ パン（Space+左 or middle ドラッグ）──
         // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。
-        const panning = updateViewport(self, &self.ctx, canvas_rect);
+        // TASK-144.2: size_dialog 中は viewport 操作も止める。
+        const panning = if (self.size_dialog != null) false else updateViewport(self, &self.ctx, canvas_rect);
         // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
         // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果）。
         canvas_rect = canvasBlitRect(&self.ctx, self);
@@ -5941,7 +6143,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         // text_params からの再ラスタライズ結果」という不変条件を守るため（eyedropper は
         // 本来読み取りのみで実害は無いが、分岐追加のミスリスクよりシンプルさを優先し
         // 丸ごと止める設計判断。text layer 選択中は色スポイトも一時的に使えない）。
-        if (!panning and !self.selectedLayerIsText()) {
+        // TASK-144.2: size_dialog != null でも同様にブロック。
+        if (!panning and !self.selectedLayerIsText() and self.size_dialog == null) {
             const in = &self.ctx.input;
             // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
             // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
