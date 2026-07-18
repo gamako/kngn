@@ -41,6 +41,9 @@ pub const Panel = struct {
     open: bool = true,
     build: PanelBuildFn,
     user_data: *anyopaque,
+    /// 表示専用タイトル（null なら name を表示）。ID・永続化キーは常に name 基準なので、
+    /// 「Tool Options — Brush」のような動的タイトルはここを毎フレーム差し替えてよい。
+    title: ?[]const u8 = null,
 };
 
 pub const SlotOptions = struct {
@@ -595,7 +598,7 @@ pub const PanelHost = struct {
         });
         defer ctx.endBox();
 
-        if (ctx.beginCollapsible(collapse_id, panel.name, &panel.open)) {
+        if (ctx.beginCollapsible(collapse_id, panel.title orelse panel.name, &panel.open)) {
             // error 時も endCollapsible を必ず呼び、collapsible_body_depth / layout を壊さない
             panel.build(ctx, panel.user_data) catch |err| {
                 ctx.endCollapsible();
@@ -1143,3 +1146,42 @@ const PersistStore = struct {
         };
     }
 };
+
+test "PanelHost: title は表示専用で ID/永続化は name 基準のまま" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+    var panels = [_]Panel{
+        .{ .name = "Tool Options", .slot = .right, .build = noopBuild, .user_data = &dummy, .title = "Tool Options — Brush" },
+    };
+    var host = try PanelHost.init(panels[0..], .{});
+    try frame(&host, &ctx, 800, 600);
+    try frame(&host, &ctx, 800, 600);
+
+    // name 基準の rect/操作が title 設定後も機能する（ID は name から生成）
+    try std.testing.expect(host.panelRect(&ctx, "Tool Options") != null);
+    try std.testing.expect(host.setPanelOpen("Tool Options", false));
+    panels[0].title = "Tool Options — Fill"; // 毎フレーム差し替え可
+    try frame(&host, &ctx, 800, 600);
+    try frame(&host, &ctx, 800, 600);
+    // title を変えても open 状態（name 基準 ID）が保持される
+    try std.testing.expect(!panels[0].open);
+
+    // 永続化キーも name 基準（title は persist に現れない）
+    var store = PersistStore{};
+    try host.persist(store.persistence());
+    var found_name = false;
+    var found_title = false;
+    for (store.entries[0..store.len]) |e| {
+        switch (e.key) {
+            .panel => |p| {
+                const n = p.name_buf[0..p.name_len];
+                if (std.mem.eql(u8, n, "Tool Options")) found_name = true;
+                if (std.mem.startsWith(u8, n, "Tool Options —")) found_title = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_name);
+    try std.testing.expect(!found_title);
+}
