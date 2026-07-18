@@ -450,6 +450,26 @@ typedef struct PlatformEvent {
     } payload;
 } PlatformEvent;
 
+// TASK-135: file_drop イベントの struct 充填を objc/swift/metal で共有する contract ヘルパー。
+// Swift の C importer は入れ子配列を持つ匿名構造体（file_drop.paths[].bytes）をフィールドとして
+// import できないため、Swift/Metal backend はこの C ヘルパー経由でしか file_drop を構築できない。
+// objc backend も同じ関数を使い、契約（単一 file・空/上限超/NUL は reject）を単一ソース化する。
+// utf8[0..len) を検証し、成功時 ev を FILE_DROP で埋めて true、reject 時 false（ev 不変）を返す。
+// 呼び出し側は ev をゼロ初期化して渡す（Swift の PlatformEvent() / objc の memset。string.h 非依存）。
+static inline bool platform_fill_file_drop_event(PlatformEvent* ev, const char* utf8, uint32_t len) {
+    if (len == 0 || len > PLATFORM_FILE_DROP_PATH_BYTES) return false;
+    for (uint32_t i = 0; i < len; i++) {
+        if (utf8[i] == 0) return false; // NUL 含有は reject（契約）
+    }
+    ev->type = PLATFORM_EVENT_FILE_DROP;
+    ev->payload.file_drop.count = 1;
+    ev->payload.file_drop.paths[0].len = len;
+    for (uint32_t i = 0; i < len; i++) {
+        ev->payload.file_drop.paths[0].bytes[i] = utf8[i];
+    }
+    return true;
+}
+
 // IME composition snapshot のメタ（本文は caller の buf へ UTF-8 で書く。TASK-79.6.1）
 typedef struct PlatformCompositionMeta {
     uint32_t revision;

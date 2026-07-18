@@ -545,19 +545,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     NSData* utf8Data = [path dataUsingEncoding:NSUTF8StringEncoding];
     if (utf8Data == nil) return NO; // 不正 UTF-8（変換不能）
     NSUInteger len = [utf8Data length];
-    if (len == 0 || len > PLATFORM_FILE_DROP_PATH_BYTES) return NO;
-    const uint8_t* bytes = (const uint8_t*)[utf8Data bytes];
-    // NUL 含有は reject（契約）
-    for (NSUInteger i = 0; i < len; i++) {
-        if (bytes[i] == 0) return NO;
-    }
+    if (len > UINT32_MAX) return NO;
 
+    // 長さ/NUL 検証・struct 充填は共有ヘルパー（objc/swift/metal 単一ソース。TASK-135）。
     PlatformEvent ev;
     memset(&ev, 0, sizeof(ev));
-    ev.type = PLATFORM_EVENT_FILE_DROP;
-    ev.payload.file_drop.count = 1;
-    ev.payload.file_drop.paths[0].len = (uint32_t)len;
-    memcpy(ev.payload.file_drop.paths[0].bytes, bytes, len);
+    if (!platform_fill_file_drop_event(&ev, (const char*)[utf8Data bytes], (uint32_t)len)) return NO;
     // inline copy 完了。NSString/NSURL の寿命に依存しない。
     queue_push(&platformWindow->event_queue, &ev);
     return YES;

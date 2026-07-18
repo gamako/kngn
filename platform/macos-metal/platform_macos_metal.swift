@@ -10,9 +10,10 @@ import GameController
 //        FrameCallback typealias など) は bridging header (-import-objc-header
 //        platform/platform.h) 経由で C ヘッダから自動取得する。
 //
-// TASK-113.4: OS ファイル drag & drop の native 実装は Objective-C backend のみ。
-// 本 Metal backend は file URL drag destination を登録せず、file_drop event を生成しない stub。
-// PlatformEvent の enum/payload 拡張は platform.h 経由で自動追従し、ビルド緑を維持する。
+// TASK-113.4 / TASK-135: OS ファイル drag & drop（file URL のみ）を objc backend と同一契約で実装。
+// MetalFramebufferView が NSDraggingDestination を実装し、単一 file URL を PLATFORM_EVENT_FILE_DROP
+// として event_queue へ inline copy で投入する（複数/非ファイル/空/上限超/NUL は reject）。
+// struct 充填は platform.h の共有ヘルパー platform_fill_file_drop_event（objc/swift/metal 単一ソース）。
 //
 // ========================================
 // 1級 frame pacing 契約（ADR-005 / TASK-36）
@@ -881,10 +882,45 @@ class MetalFramebufferView: MTKView, NSTextInputClient {
         super.init(frame: frame, device: metalDevice)
 
         // デリゲートは後で設定
+        // TASK-135: OS ファイル drag & drop（file URL のみ。objc backend 先行の横展開）
+        self.registerForDraggedTypes([.fileURL])
     }
 
     required init(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    // MARK: - NSDraggingDestination / file drop (TASK-135。ホットパス: イベント時のみ)
+    // objc backend（platform/macos/platform_macos.m）と同一契約。struct 充填・長さ/NUL 検証は
+    // platform.h の共有ヘルパー platform_fill_file_drop_event。
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        let pb = sender.draggingPasteboard
+        let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        if let urls = urls, urls.count >= 1 {
+            return .copy
+        }
+        return []
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        guard let handle = platformWindow else { return false }
+        let pb = sender.draggingPasteboard
+        // MVP は単一ファイルのみ。複数同時 drop はイベント全体を reject。
+        guard let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+              urls.count == 1 else { return false }
+        let url = urls[0]
+        guard url.isFileURL else { return false }
+        guard let data = url.path.data(using: .utf8), data.count <= Int(UInt32.max) else { return false }
+        var ev = PlatformEvent()
+        let ok = data.withUnsafeBytes { raw -> Bool in
+            let base = raw.bindMemory(to: CChar.self).baseAddress
+            return platform_fill_file_drop_event(&ev, base, UInt32(data.count))
+        }
+        guard ok else { return false }
+        // inline copy 完了。NSURL/String の寿命に依存しない。
+        handle.event_queue.push(ev)
+        return true
     }
 
     // MARK: - NSTextInputClient / IME (TASK-79.6.1)
