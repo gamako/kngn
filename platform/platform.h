@@ -486,6 +486,12 @@ uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, ui
 // backend は firstRectForCharacterRange の問い合わせ時に backing scale を適用する。
 void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y, int32_t w, int32_t h);
 
+// テキスト編集ウィジェットのフォーカス有無を platform へ伝える（TASK-142）。
+// active=false の間は keyDown を inputContext(IME) へ渡さないので、IME 有効中でも
+// 修飾なし英字キーが marked text に吸われず facade key_down が届く（ショートカット維持）。
+// 未呼び出しのアプリは従来どおり常時 IME 経路（後方互換）。false 遷移時は保留 composition を破棄する。
+void platform_set_text_input_active(PlatformWindow* window, bool active);
+
 // イベント取得API（1つずつ）
 // ウィンドウのイベントキューから1つイベントを取得する
 // イベントがあればtrue、ないならfalseを返す

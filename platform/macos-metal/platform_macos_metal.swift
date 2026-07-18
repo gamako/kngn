@@ -864,6 +864,9 @@ class MetalFramebufferView: MTKView, NSTextInputClient {
     // IME composition 状態 (TASK-79.6.1)
     private var markedTextStorage = NSMutableString()
     private var imeSelectedRange = NSRange(location: 0, length: 0)
+    // テキスト入力フォーカス制御 (TASK-142)。imeControlled=false の間は従来どおり常時 IME 経路。
+    private var imeControlled = false
+    private var imeActive = false
     private var compositionUtf8 = [UInt8](repeating: 0, count: compositionUtf8Cap)
     private var compositionLen: UInt32 = 0
     private var compositionRevision: UInt32 = 0
@@ -1074,6 +1077,23 @@ class MetalFramebufferView: MTKView, NSTextInputClient {
 
     func hasMarkedText() -> Bool {
         return markedTextStorage.length > 0
+    }
+
+    // TASK-142: keyDown を IME(inputContext) へ渡すべきか。未制御=従来どおり常時 true。
+    func imeRouteEnabled() -> Bool {
+        return imeControlled ? imeActive : true
+    }
+
+    // TASK-142: テキスト編集フォーカスの有無を app から受ける。実効経路が YES→NO へ変わるとき
+    // （未制御=常時 YES からの初回 inactive も含む）保留 composition を破棄する。
+    func setTextInputActive(_ active: Bool) {
+        let wasRouting = imeRouteEnabled()      // 変更前の実効経路（未制御なら true）
+        imeControlled = true
+        imeActive = active                      // 変更後の実効経路 = active
+        if wasRouting && !active {
+            unmarkText()                        // markedText クリア + CANCEL phase（空なら no-op）
+            inputContext?.discardMarkedText()   // IME の変換セッションも破棄（候補窓を閉じる）
+        }
     }
 
     func markedRange() -> NSRange {
@@ -1708,14 +1728,16 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             if event.type == .keyDown {
                 let hadMarked = handle.metalView.hasMarkedText()
                 let hasInputContext = handle.metalView.inputContext != nil
+                // TASK-142: text input を制御しているなら active のときだけ IME へ渡す（未制御=常時）。
+                let routeToIme = handle.metalView.imeRouteEnabled()
                 var handled = false
-                if let inputContext = handle.metalView.inputContext {
+                if routeToIme, let inputContext = handle.metalView.inputContext {
                     handled = inputContext.handleEvent(event)
                 }
                 let hasMarked = handle.metalView.hasMarkedText()
                 let commandModified = (platform_event.payload.keyboard.modifiers & (UInt32(PLATFORM_MOD_CMD.rawValue) | UInt32(PLATFORM_MOD_CTRL.rawValue))) != 0
-                let tombstone = hasInputContext && !commandModified && (hadMarked || hasMarked) && token.map { handle.event_queue.markNone($0) } == true
-                keyTrace("handleEvent bool=\(handled) marked=\(hadMarked)->\(hasMarked) tombstone=\(tombstone)")
+                let tombstone = routeToIme && hasInputContext && !commandModified && (hadMarked || hasMarked) && token.map { handle.event_queue.markNone($0) } == true
+                keyTrace("handleEvent bool=\(handled) marked=\(hadMarked)->\(hasMarked) route=\(routeToIme) tombstone=\(tombstone)")
             }
 
             // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
@@ -1761,6 +1783,14 @@ func platform_set_composition_rect(platformWindow: UnsafeMutableRawPointer?, x: 
     guard let platformWindow = platformWindow else { return }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     handle.metalView.setCompositionRectPixels(x: x, y: y, w: w, h: h)
+}
+
+// TASK-142: テキスト入力フォーカスの有無を platform へ伝える（objc と同意味論）。
+@_cdecl("platform_set_text_input_active")
+func platform_set_text_input_active(platformWindow: UnsafeMutableRawPointer?, active: Bool) {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.metalView.setTextInputActive(active)
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

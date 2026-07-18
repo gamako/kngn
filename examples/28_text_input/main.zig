@@ -196,6 +196,9 @@ pub fn main(init: std.process.Init) !void {
     });
 
     var running = true;
+    // TASK-142: 初回 pollEvents 前に「編集フォーカス無し」を宣言しておく（起動直後の keyDown が
+    // 従来の route-always で IME に吸われる隙間を塞ぐ）。以後は毎フレーム末尾で focus に追従する。
+    window.setTextInputActive(false);
     main_loop: while (running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
@@ -300,5 +303,9 @@ pub fn main(init: std.process.Init) !void {
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font);
         window.present();
+
+        // TASK-142: テキスト欄が focus されているときだけ keyDown を IME へ渡す。空きをクリックして
+        // focus を外すと（wantsKeyboard()==false）、IME 有効中でもキーがショートカットとして届く。
+        window.setTextInputActive(ctx.wantsKeyboard());
     }
 }

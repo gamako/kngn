@@ -464,6 +464,22 @@ pub const Window = struct {
             self.inner.setCompositionRect(x, y, w, h);
         }
     }
+
+    /// TASK-142: テキスト編集ウィジェットのフォーカス有無を platform へ伝える汎用プリミティブ
+    /// （SDL の StartTextInput/StopTextInput 相当。`setCompositionRect` と対になる）。
+    /// active=false の間は IME/composition を経路から外すので、IME 有効中でも修飾なし英字キーが
+    /// ショートカットとして届く。**冪等**なので consumer は毎フレーム focus 状態に追従して呼んでよい
+    /// （実効経路が変わらなければ副作用なし。変わるときのみ composition 破棄等が走る）。headless は no-op。
+    /// 将来の Linux/Windows 実装も「毎フレーム安全な冪等 setter（内部で変化検出）」であること。
+    /// backend 実装は `@hasDecl` gate で opt-in: 現在は macOS（objc/swift/metal）のみ実装。
+    /// Linux(XIM/ibus/text-input-v3)・Windows(IMM/WM_IME) は IME composition 実装時にこのメソッドを
+    /// backend Window に足せば、facade も consumer も無改修で有効化される（未実装 backend は no-op）。
+    pub fn setTextInputActive(self: Window, active: bool) void {
+        if (self.headless) return;
+        if (comptime @hasDecl(backend.Window, "setTextInputActive")) {
+            self.inner.setTextInputActive(active);
+        }
+    }
 };
 
 pub fn init() Error!void {

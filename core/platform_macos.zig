@@ -43,6 +43,14 @@ const ClipboardC = if (clipboard_c_abi) struct {
     extern fn platform_get_clipboard_text(out: [*]u8, cap: u32, out_len: *u32) bool;
 } else struct {};
 
+/// TASK-142: text input focus 制御の C symbol は macOS の 3 backend（objc/swift/metal）が実装する。
+/// unit test では C symbol を参照しない（リンク時 undefined を防ぐ）。
+const text_input_c_abi = !builtin.is_test;
+
+const TextInputC = if (text_input_c_abi) struct {
+    extern fn platform_set_text_input_active(window: ?*c.PlatformWindow, active: bool) void;
+} else struct {};
+
 // 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
 const Error = types.Error;
 const KeyCode = types.KeyCode;
@@ -376,6 +384,13 @@ pub const Window = struct {
     /// IME 候補窓の caret 基準 rect を framebuffer pixel で供給する（イベント時のみ）。
     pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
         c.platform_set_composition_rect(self.handle, x, y, w, h);
+    }
+
+    /// TASK-142: テキスト編集ウィジェットのフォーカス有無を platform へ伝える（冪等。consumer は
+    /// 毎フレーム focus に追従して呼んでよく、実効経路が変わるときのみ composition 破棄が走る）。
+    /// objc/swift/metal の 3 backend で実効（active=false の間は keyDown を IME へ渡さない）。
+    pub fn setTextInputActive(self: Window, active: bool) void {
+        if (comptime text_input_c_abi) TextInputC.platform_set_text_input_active(self.handle, active);
     }
 
     pub fn getEventStats(self: Window) EventStats {

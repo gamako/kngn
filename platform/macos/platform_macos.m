@@ -393,6 +393,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     // IME composition 状態 (TASK-79.6.1)。本文は snapshot API、変化は PLATFORM_EVENT_COMPOSITION。
     NSMutableString* markedText;
     NSRange imeSelectedRange; // markedText 内の選択（UTF-16 単位）
+
+    // テキスト入力フォーカス制御 (TASK-142)。imeControlled=NO の間は従来どおり常時 IME 経路
+    // （後方互換）。app が platform_set_text_input_active を一度でも呼ぶと controlled=YES になり、
+    // 以後は imeActive のときだけ keyDown を inputContext へ渡す。
+    BOOL imeControlled;
+    BOOL imeActive;
     char compositionUtf8[COMPOSITION_UTF8_CAP];
     uint32_t compositionLen;
     uint32_t compositionRevision;
@@ -461,6 +467,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         redrawUserdata = NULL;
         markedText = [[NSMutableString alloc] init];
         imeSelectedRange = NSMakeRange(0, 0);
+        imeControlled = NO;   // TASK-142: 未制御=従来どおり常時 IME 経路
+        imeActive = NO;
         compositionLen = 0;
         compositionRevision = 0;
         compositionCursor = 0;
@@ -1001,6 +1009,23 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 - (BOOL)hasMarkedText {
     return markedText.length > 0;
+}
+
+// TASK-142: keyDown を IME(inputContext) へ渡すべきか。未制御=従来どおり常時 YES。
+- (BOOL)imeRouteEnabled {
+    return imeControlled ? imeActive : YES;
+}
+
+// TASK-142: テキスト編集フォーカスの有無を app から受ける。実効経路が YES→NO へ変わるとき
+// （未制御=常時 YES からの初回 inactive も含む）保留 composition を破棄する。
+- (void)setTextInputActive:(BOOL)active {
+    BOOL wasRouting = [self imeRouteEnabled];     // 変更前の実効経路（未制御なら YES）
+    imeControlled = YES;
+    imeActive = active;                           // 変更後の実効経路 = active
+    if (wasRouting && !active) {
+        [self unmarkText];                        // markedText クリア + CANCEL phase（空なら no-op）
+        [[self inputContext] discardMarkedText];  // IME の変換セッションも破棄（候補窓を閉じる）
+    }
 }
 
 - (NSRange)markedRange {
@@ -1765,13 +1790,17 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                     const BOOL hadMarked = [view hasMarkedText];
                     BOOL handled = NO;
                     const BOOL hasInputContext = [view inputContext] != nil;
-                    if (hasInputContext) {
+                    // TASK-142: app が text input を制御しているなら active のときだけ IME へ渡す。
+                    // 未制御（imeControlled==NO）は従来どおり常時渡す（後方互換）。渡さない場合は
+                    // insertText/setMarkedText が発火せず、物理 key_down が tombstone されず生き残る。
+                    const BOOL routeToIme = [view imeRouteEnabled];
+                    if (hasInputContext && routeToIme) {
                         handled = [[view inputContext] handleEvent:event];
                     }
                     const BOOL hasMarked = [view hasMarkedText];
                     const BOOL commandModified = (platform_event.payload.keyboard.modifiers & (PLATFORM_MOD_CMD | PLATFORM_MOD_CTRL)) != 0;
-                    const BOOL tombstone = token.valid && hasInputContext && !commandModified && (hadMarked || hasMarked) && queue_mark_none(&platformWindow->event_queue, token);
-                    key_trace("handleEvent bool=%d marked=%d->%d tombstone=%d", handled, hadMarked, hasMarked, tombstone);
+                    const BOOL tombstone = token.valid && hasInputContext && routeToIme && !commandModified && (hadMarked || hasMarked) && queue_mark_none(&platformWindow->event_queue, token);
+                    key_trace("handleEvent bool=%d marked=%d->%d route=%d tombstone=%d", handled, hadMarked, hasMarked, routeToIme, tombstone);
                 }
 
                 // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
@@ -1872,6 +1901,14 @@ uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, ui
 void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y, int32_t w, int32_t h) {
     if (!window || !window->view) return;
     [window->view setCompositionRectPixelsX:x y:y w:w h:h];
+}
+
+// TASK-142: テキスト入力フォーカスの有無を platform へ伝える。一度でも呼ぶと以後 controlled 化し、
+// active のときだけ keyDown を IME(inputContext) へ渡す（未呼び出しアプリは従来どおり常時渡す）。
+// active==false への遷移では保留中の composition を破棄する（MacVim の abandonMarkedText 相当）。
+void platform_set_text_input_active(PlatformWindow* window, bool active) {
+    if (!window || !window->view) return;
+    [window->view setTextInputActive:(active ? YES : NO)];
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

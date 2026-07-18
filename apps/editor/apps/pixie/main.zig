@@ -396,6 +396,9 @@ const App = struct {
         self.redraw_win = win.*;
         self.os_window = win;
         win.setRedrawCallback(self, redrawCb);
+        // TASK-142: 起動直後は「テキスト編集フォーカス無し」を宣言（初回 pollEvents 前の keyDown が
+        // 従来の route-always で IME に吸われる隙間を塞ぐ）。以後は毎フレーム編集状態に追従する。
+        win.setTextInputActive(false);
         self.refreshTitle();
         // TASK-122: native メニュー（macOS native backend + enable_menu）。headless は false → GUI fallback のまま。
         self.rebuildMenuCommands();
@@ -6091,6 +6094,10 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             self.rebuildMenuCommands();
             self.syncNativeMenu(win);
         }
+
+        // TASK-142: テキスト編集（本文入力 or レイヤー名 rename）がアクティブな間だけ keyDown を
+        // IME へ渡す。非アクティブ時は IME 有効中でも修飾なしキーがツール/ショートカットとして届く。
+        win.setTextInputActive(self.text_in.active or self.rename_in.active);
 
         // IME 候補窓の基準 caret。rect cache は endFrame 後に確定するため、この時点で供給する。
         // preedit の有無でゲートしない: IME は composition 開始打鍵の handleEvent 中（= app が

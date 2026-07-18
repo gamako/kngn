@@ -552,6 +552,9 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "gallery", .ctx = &app, .ext = "txt", .digest = galleryDigest, .desc = "GUI capability gallery section/state matrix" });
 
     var running = true;
+    // TASK-142: 起動直後はテキスト編集フォーカス無し = IME 非経路（n/p/q 等のショートカットを
+    // IME 有効中でも受け取れる）。毎フレーム末尾で focus 状態に追従して更新する。
+    window.setTextInputActive(false);
     main_loop: while (running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
@@ -592,5 +595,9 @@ pub fn main(init: std.process.Init) !void {
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font);
         window.present();
+
+        // TASK-142: このフレームで確定した focus に IME 経路を追従させる（テキスト欄 focus 時のみ
+        // keyDown を IME へ渡す）。次フレームの keyDown 判定に反映される。
+        window.setTextInputActive(ctx.wantsKeyboard());
     }
 }
