@@ -266,13 +266,23 @@ caller が「キャンバス領域」「ステータスバー」等の widget re
 
 ---
 
-## 制限事項 (libs/gui MVP では非対応)
+## 制限事項
 
-- Flex layout: wrap、absolute positioning、justify_content (start のみ)
-- 線描画: 太さ > 1 のアンチエイリアス
-- フォント: ASCII のみ (CJK は将来課題)
-- スタイル: push/pop によるスコープ管理 (Context.style 直接書き換えで MVP は十分)
-- text field、scroll view、dropdown 等の複合 widget (pixie MVP では不要)
+> この節は libs/gui MVP (TASK-21) 当時の制限一覧を出発点に、その後の実装で解消した項目を反映して更新している (2026-07-18)。
+
+### 解消済み (MVP 当時は非対応だったが実装された)
+
+- **text field**: `textInputId` (`widgets.zig`) + `text_edit.zig` (選択 / caret / word 移動 / コピー / IME preedit)。example 28_text_input。TASK-113 ファミリー。
+- **scroll view**: `beginScrollArea` / `endScrollArea` (縦横スクロール + スクロールバー、wheel 端到達伝播)。example 16_gui_scroll。TASK-46 / 126。
+- **CJK フォント (部分的)**: `gui.Context.init` に `libs/font` の `OutlineFont.asFont()` を注入すれば日本語を描画できる (TASK-116 で機構を確立、example_21 / 28 で実証)。**ただし `gui.default_font` は今も ASCII bitmap (spleen)** で、注入しない caller (pixie / synth / patch の各アプリ) では非 ASCII が欠落表示になる → 実アプリへの展開は別タスク。
+
+### 未対応 (現在も非対応)
+
+- **Flex layout の拡張**: wrap (折り返し) / absolute positioning (フロー外の座標指定配置) / justify_content (`start` のみ。`center` / `end` / `space-between` 等は非対応 → 右寄せは `grow` の空箱を挟んで表現)
+- **線描画**: 太さ > 1 のアンチエイリアス
+- **CJK フォントの既定化**: `gui.default_font` 自体は ASCII bitmap のまま (上記「解消済み・部分的」参照)
+- **スタイルの push/pop スコープ管理**: Dear ImGui の `PushStyleColor` / `PopStyleColor` 相当の「局所的にスタイルを一時上書きして抜けると復帰する」スタック機構。現状は `Context.style` の直接書き換えのみ
+- **dropdown / combo box (専用 widget)**: `popup.zig` + `menu.zig` (menuBar / menuBarPopup) でドロップダウン型ポップアップメニューは実装済みだが、値選択用の combo box widget は未提供 (この基盤で組める)
 
 これらは別タスクとして必要になった時点で着手する。
 
