@@ -34,21 +34,11 @@ pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 4.0;
 pub const CABLE_HIT_SLOP: f32 = 6; // world 単位のケーブル当たり判定しきい値
 
-// Inspector はキャンバス右側に固定配置し、下端の可視化帯とは重ねない。
-pub const INSPECTOR_W: f32 = 280;
-
-// Transport はパレットの下、Inspector の左、可視化帯の上に固定配置する。
-pub const TRANSPORT_X: f32 = 8;
-pub const TRANSPORT_Y: f32 = 64;
-pub const TRANSPORT_W: f32 = 540;
-pub const TRANSPORT_H: f32 = 250;
-// Panel 外周の padding を含む title bar の可視高。GUI の header button はこの矩形内に収める。
-pub const PANEL_HEADER_H: f32 = 44;
-
 // Inspector の slider 行は GUI widget の [label] [track] [value] 構造に合わせる。
 // value_w は最大値文字列（f32 の小数表示）を収める固定予約幅、track_min は短い
 // ラベルでも操作領域を残すための下限。通常の inspector content 幅（260px）では
 // value_w/track_min とも固定値になる。
+// 外形（right/bottom slot）は PanelHost が所有する（TASK-149.1）。
 pub const INSPECTOR_PARAM_GAP: i32 = 6;
 pub const INSPECTOR_PARAM_VALUE_W: i32 = 64;
 pub const INSPECTOR_PARAM_TRACK_MIN: i32 = 48;
@@ -77,106 +67,6 @@ pub fn inspectorParamRowLayout(avail: i32, label_w: i32) ParamRowLayout {
     const fitted_label = @min(@max(label_w, 0), label_max);
     const track_w = @max(track_min, width - gap_w - value_w - fitted_label);
     return .{ .label_w = fitted_label, .track_w = track_w, .value_w = value_w };
-}
-
-/// Panel の 3 状態（TASK-125）。open/closed は body の開閉、hidden はヘッダーも含め完全非表示。
-pub const PanelState = enum { open, closed, hidden };
-
-pub fn inspectorRect(fb_w: f32, canvas_h: f32) ScreenRect {
-    const w = @min(INSPECTOR_W, @max(0.0, fb_w));
-    return .{ .x = @max(0.0, fb_w - w), .y = 0, .w = w, .h = @max(0.0, canvas_h) };
-}
-
-pub fn canvasViewportWidth(fb_w: f32, canvas_h: f32) f32 {
-    return inspectorRect(fb_w, canvas_h).x;
-}
-
-/// inspector が hidden のときは framebuffer 全幅を canvas 有効幅にする（TASK-125）。
-pub fn canvasViewportWidthForState(fb_w: f32, canvas_h: f32, inspector: PanelState) f32 {
-    return switch (inspector) {
-        .open, .closed => canvasViewportWidth(fb_w, canvas_h),
-        .hidden => @max(0.0, fb_w),
-    };
-}
-
-pub fn pointInInspector(point: Vec2f, fb_w: f32, canvas_h: f32) bool {
-    const r = inspectorRect(fb_w, canvas_h);
-    return point.x >= r.x and point.x <= r.x + r.w and point.y >= r.y and point.y <= r.y + r.h;
-}
-
-/// Transport panel の矩形。狭い framebuffer では canvas viewport 内へ clamp する。
-pub fn transportRect(fb_w: f32, canvas_h: f32) ScreenRect {
-    const viewport_w = canvasViewportWidth(fb_w, canvas_h);
-    const x = @min(TRANSPORT_X, viewport_w);
-    const y = @min(TRANSPORT_Y, @max(canvas_h, 0.0));
-    return .{
-        .x = @max(0.0, x),
-        .y = @max(0.0, y),
-        .w = @max(0.0, @min(TRANSPORT_W, viewport_w - x)),
-        .h = @max(0.0, @min(TRANSPORT_H, @max(0.0, canvas_h - y))),
-    };
-}
-
-pub fn transportVisibleRect(fb_w: f32, canvas_h: f32, open: bool) ScreenRect {
-    const r = transportRect(fb_w, canvas_h);
-    if (open) return r;
-    return .{ .x = r.x, .y = r.y, .w = r.w, .h = @min(r.h, PANEL_HEADER_H) };
-}
-
-/// 状態ベースの transport 可視矩形。hidden はゼロ矩形（TASK-125）。
-pub fn transportVisibleRectForState(fb_w: f32, canvas_h: f32, state: PanelState) ScreenRect {
-    return switch (state) {
-        .open => transportVisibleRect(fb_w, canvas_h, true),
-        .closed => transportVisibleRect(fb_w, canvas_h, false),
-        .hidden => .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    };
-}
-
-pub fn transportHeaderRect(fb_w: f32, canvas_h: f32) ScreenRect {
-    return transportVisibleRect(fb_w, canvas_h, false);
-}
-
-pub fn pointInTransport(point: Vec2f, fb_w: f32, canvas_h: f32) bool {
-    return pointInTransportState(point, fb_w, canvas_h, true);
-}
-
-pub fn pointInTransportState(point: Vec2f, fb_w: f32, canvas_h: f32, open: bool) bool {
-    const r = transportVisibleRect(fb_w, canvas_h, open);
-    return r.w > 0 and r.h > 0 and pointInScreenRect(point.x, point.y, r);
-}
-
-pub fn pointInTransportPanelState(point: Vec2f, fb_w: f32, canvas_h: f32, state: PanelState) bool {
-    const r = transportVisibleRectForState(fb_w, canvas_h, state);
-    return r.w > 0 and r.h > 0 and pointInScreenRect(point.x, point.y, r);
-}
-
-pub fn inspectorVisibleRect(fb_w: f32, canvas_h: f32, open: bool) ScreenRect {
-    const r = inspectorRect(fb_w, canvas_h);
-    if (open) return r;
-    return .{ .x = r.x, .y = r.y, .w = r.w, .h = @min(r.h, PANEL_HEADER_H) };
-}
-
-/// 状態ベースの inspector 可視矩形。hidden はゼロ矩形（TASK-125）。
-pub fn inspectorVisibleRectForState(fb_w: f32, canvas_h: f32, state: PanelState) ScreenRect {
-    return switch (state) {
-        .open => inspectorVisibleRect(fb_w, canvas_h, true),
-        .closed => inspectorVisibleRect(fb_w, canvas_h, false),
-        .hidden => .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    };
-}
-
-pub fn inspectorHeaderRect(fb_w: f32, canvas_h: f32) ScreenRect {
-    return inspectorVisibleRect(fb_w, canvas_h, false);
-}
-
-pub fn pointInInspectorState(point: Vec2f, fb_w: f32, canvas_h: f32, open: bool) bool {
-    const r = inspectorVisibleRect(fb_w, canvas_h, open);
-    return r.w > 0 and r.h > 0 and pointInScreenRect(point.x, point.y, r);
-}
-
-pub fn pointInInspectorPanelState(point: Vec2f, fb_w: f32, canvas_h: f32, state: PanelState) bool {
-    const r = inspectorVisibleRectForState(fb_w, canvas_h, state);
-    return r.w > 0 and r.h > 0 and pointInScreenRect(point.x, point.y, r);
 }
 
 /// 描画側が渡すノード幾何。pos は world 左上。
@@ -899,27 +789,8 @@ test "canvas: viewportContains — fit layout has zero offscreen at representati
     }
 }
 
-test "canvas: inspector は右端固定で canvas viewport と分離される" {
-    const r = inspectorRect(960, 610);
-    try testing.expectEqual(@as(f32, 680), r.x);
-    try testing.expectEqual(@as(f32, 280), r.w);
-    try testing.expectEqual(@as(f32, 610), r.h);
-    try testing.expectEqual(@as(f32, 680), canvasViewportWidth(960, 610));
-    try testing.expect(pointInInspector(.{ .x = 700, .y = 20 }, 960, 610));
-    try testing.expect(!pointInInspector(.{ .x = 679, .y = 20 }, 960, 610));
-    try testing.expect(!pointInInspector(.{ .x = 700, .y = 611 }, 960, 610));
-}
-
-test "canvas: inspector は狭い framebuffer でも負の幅を作らない" {
-    const r = inspectorRect(120, 80);
-    try testing.expectEqual(@as(f32, 0), r.x);
-    try testing.expectEqual(@as(f32, 120), r.w);
-    try testing.expectEqual(@as(f32, 0), canvasViewportWidth(120, 80));
-    try testing.expect(pointInInspector(.{ .x = 0, .y = 0 }, 120, 80));
-}
-
 test "canvas: inspector param row は長いラベルでも value を content 幅内に収める" {
-    const avail = @as(i32, @intFromFloat(INSPECTOR_W)) - 20; // inspector padding 左右
+    const avail: i32 = 260; // 典型的な Inspector content 幅（PanelHost right extent − padding）
     const longest_labels = [_]i32{
         8 * "cutoff_mod_oct (oct)".len,
         8 * "level_mod_depth".len,
@@ -937,93 +808,4 @@ test "canvas: inspector param row は長いラベルでも value を content 幅
     const short = inspectorParamRowLayout(avail, 8 * "base_hz (Hz)".len);
     try testing.expectEqual(@as(i32, @intCast(8 * "base_hz (Hz)".len)), short.label_w);
     try testing.expectEqual(avail, short.total());
-}
-
-test "canvas: transport は inspector と重ならず canvas 内に収まる" {
-    const r = transportRect(960, 610);
-    const inspector = inspectorRect(960, 610);
-    try testing.expect(r.x >= 0 and r.y >= 0 and r.w >= 0 and r.h >= 0);
-    try testing.expect(r.x + r.w <= inspector.x);
-    try testing.expect(r.y + r.h <= 610);
-}
-
-test "canvas: transport は可視化帯と重ならない" {
-    const canvas_h: f32 = 610;
-    const r = transportRect(960, canvas_h);
-    try testing.expect(r.y + r.h <= canvas_h);
-    try testing.expect(!pointInTransport(.{ .x = 10, .y = 610 }, 960, canvas_h));
-    try testing.expect(pointInTransport(.{ .x = r.x, .y = r.y }, 960, canvas_h) or r.w == 0 or r.h == 0);
-}
-
-test "canvas: transport は狭い framebuffer でも負値・範囲外にならない" {
-    const sizes = [_]struct { w: f32, h: f32 }{
-        .{ .w = 0, .h = 0 },
-        .{ .w = 120, .h = 80 },
-        .{ .w = 300, .h = 200 },
-    };
-    for (sizes) |size| {
-        const canvas_h = @max(0.0, size.h - 150.0);
-        const r = transportRect(size.w, canvas_h);
-        try testing.expect(r.x >= 0 and r.y >= 0 and r.w >= 0 and r.h >= 0);
-        try testing.expect(r.x + r.w <= canvasViewportWidth(size.w, canvas_h));
-        try testing.expect(r.y + r.h <= canvas_h);
-    }
-}
-
-test "canvas: closed transport は title bar だけを可視化し body を解放する" {
-    const open = transportRect(960, 610);
-    const closed = transportVisibleRect(960, 610, false);
-    try testing.expectEqual(open.x, closed.x);
-    try testing.expectEqual(open.y, closed.y);
-    try testing.expectEqual(open.w, closed.w);
-    try testing.expectEqual(PANEL_HEADER_H, closed.h);
-    try testing.expect(pointInTransportState(.{ .x = closed.x + 1, .y = closed.y + PANEL_HEADER_H - 1 }, 960, 610, false));
-    try testing.expect(pointInTransportState(.{ .x = closed.x + 1, .y = closed.y + PANEL_HEADER_H }, 960, 610, false));
-    try testing.expect(!pointInTransportState(.{ .x = closed.x + 1, .y = closed.y + PANEL_HEADER_H + 1 }, 960, 610, false));
-    try testing.expect(pointInTransportState(.{ .x = closed.x + 1, .y = closed.y + PANEL_HEADER_H + 1 }, 960, 610, true));
-}
-
-test "canvas: closed inspector は title bar だけを入力対象にする" {
-    const open = inspectorRect(960, 610);
-    const closed = inspectorVisibleRect(960, 610, false);
-    try testing.expectEqual(open.x, closed.x);
-    try testing.expectEqual(open.w, closed.w);
-    try testing.expectEqual(PANEL_HEADER_H, closed.h);
-    try testing.expect(pointInInspectorState(.{ .x = closed.x + 1, .y = PANEL_HEADER_H - 1 }, 960, 610, false));
-    try testing.expect(pointInInspectorState(.{ .x = closed.x + 1, .y = PANEL_HEADER_H }, 960, 610, false));
-    try testing.expect(!pointInInspectorState(.{ .x = closed.x + 1, .y = PANEL_HEADER_H + 1 }, 960, 610, false));
-    try testing.expect(pointInInspectorState(.{ .x = closed.x + 1, .y = PANEL_HEADER_H + 1 }, 960, 610, true));
-}
-
-test "canvas: closed panel geometry remains bounded on narrow framebuffer" {
-    const sizes = [_]struct { w: f32, h: f32 }{
-        .{ .w = 0, .h = 0 },
-        .{ .w = 120, .h = 80 },
-        .{ .w = 300, .h = 200 },
-    };
-    for (sizes) |size| {
-        const canvas_h = @max(0.0, size.h - 150.0);
-        const transport = transportVisibleRect(size.w, canvas_h, false);
-        const inspector = inspectorVisibleRect(size.w, canvas_h, false);
-        try testing.expect(transport.x >= 0 and transport.y >= 0 and transport.w >= 0 and transport.h >= 0);
-        try testing.expect(inspector.x >= 0 and inspector.y >= 0 and inspector.w >= 0 and inspector.h >= 0);
-        try testing.expect(transport.x + transport.w <= canvasViewportWidth(size.w, canvas_h));
-        try testing.expect(inspector.x + inspector.w <= size.w);
-        try testing.expect(transport.y + transport.h <= canvas_h or transport.h == 0);
-        try testing.expect(inspector.y + inspector.h <= canvas_h or inspector.h == 0);
-    }
-}
-
-test "canvas: hidden panels are zero rects and restore full canvas width" {
-    const transport = transportVisibleRectForState(960, 610, .hidden);
-    const inspector = inspectorVisibleRectForState(960, 610, .hidden);
-    try testing.expectEqual(@as(f32, 0), transport.w);
-    try testing.expectEqual(@as(f32, 0), transport.h);
-    try testing.expectEqual(@as(f32, 0), inspector.w);
-    try testing.expectEqual(@as(f32, 0), inspector.h);
-    try testing.expect(!pointInTransportPanelState(.{ .x = 20, .y = 80 }, 960, 610, .hidden));
-    try testing.expect(!pointInInspectorPanelState(.{ .x = 900, .y = 20 }, 960, 610, .hidden));
-    try testing.expectEqual(@as(f32, 960), canvasViewportWidthForState(960, 610, .hidden));
-    try testing.expectEqual(@as(f32, 680), canvasViewportWidthForState(960, 610, .open));
-    try testing.expectEqual(@as(f32, 680), canvasViewportWidthForState(960, 610, .closed));
 }

@@ -2,6 +2,10 @@
 //!
 //! ホットパス宣言: projection の field 読み出しと slider 評価は frame-rate、変更 callback は
 //! event-rate（main thread）。このファイルは Controls/モジュールを直接触らず canonical key を返す。
+//! 外形・header・open は PanelHost が所有し、ここでは body のみを構築する（TASK-149.1）。
+//!
+//! Collapsible body は width=.fit のため、body 内の grow は 0 に潰れる（layout 契約）。
+//! 外側 box / 2 カラムは呼び出し側が測った body_w を .fixed で注入する。
 
 const kit = @import("kit");
 const gui = kit.gui;
@@ -11,10 +15,9 @@ pub const ParamChangeFn = *const fn (ctx: *anyopaque, key: view.FieldKey, value:
 pub const MuteChangeFn = *const fn (ctx: *anyopaque, name: []const u8, muted: bool) void;
 pub const DisplayFn = *const fn (ctx: *anyopaque, key: view.FieldKey, field: f32) f32;
 
-const PANEL_BG = gui.Color.rgba(0x1B, 0x21, 0x29, 0xFF);
-const PANEL_BORDER = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
-const TITLE = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
 const SUBTLE = gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF);
+const BODY_PAD: i32 = 6;
+const COL_GAP: i32 = 10;
 
 pub const Scalar = struct {
     key: view.FieldKey,
@@ -47,11 +50,6 @@ fn idFor(ctx: *const gui.Context, index: u64) gui.Id {
 
 fn displayValue(display_ctx: *anyopaque, display: DisplayFn, scalar: Scalar) f32 {
     return display(display_ctx, scalar.key, scalar.field);
-}
-
-fn drawHeader(ctx: *gui.Context, panel_w: i32, open: *bool) void {
-    const label = if (open.*) "[−] TRANSPORT" else "[+] TRANSPORT";
-    if (ctx.buttonId(idFor(ctx, 0), label, .{ .min_w = @max(0, panel_w - 20) }).clicked) open.* = !open.*;
 }
 
 fn drawGlobalSlider(
@@ -107,50 +105,36 @@ fn drawTrack(
     ctx.endBox();
 }
 
-/// 左ペイン（transport + 余白）を共有 GUI root の 1 子として構築する。
-/// `panel` は screen 座標の transportRect、`left_w` は inspector 左端。
-pub fn draw(
+/// PanelHost callback から呼ばれる body のみ。header / open / 外形は PanelHost が所有する。
+/// `body_w` は panel rect 由来の外側幅（padding 込み）。fit 親内 grow collapse を避けるため .fixed で構築する。
+pub fn drawBody(
     ctx: *gui.Context,
-    panel: gui.Rect,
-    left_w: i32,
-    screen_h: i32,
     model: *const Model,
-    open: *bool,
+    body_w: i32,
     display_ctx: *anyopaque,
     display: DisplayFn,
     callback_ctx: *anyopaque,
     on_change: ParamChangeFn,
     on_mute: MuteChangeFn,
 ) void {
-    const panel_w: i32 = @intCast(panel.w);
-    const panel_h: i32 = @intCast(panel.h);
-    ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = @max(0, left_w) }, .height = .{ .fixed = @max(0, screen_h) } });
-    ctx.beginBox(.{ .width = .{ .fixed = @max(0, panel.y) }, .height = .{ .fixed = @max(0, panel.y) } });
-    ctx.endBox();
-    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @max(0, left_w) }, .height = .{ .fixed = @max(0, panel_h) } });
-    ctx.beginBox(.{ .width = .{ .fixed = @max(0, panel.x) }, .height = .{ .fixed = @max(0, panel_h) } });
-    ctx.endBox();
+    const outer_w = @max(1, body_w);
+    const content_w = @max(1, outer_w - BODY_PAD * 2);
+    const col_w = @max(1, @divTrunc(content_w - COL_GAP, 2));
+
     ctx.beginBox(.{
-        .width = .{ .fixed = @max(0, panel_w) },
-        .height = .{ .fixed = @max(0, panel_h) },
-        .padding = .{ 10, 10, 10, 10 },
+        .direction = .column,
+        .width = .{ .fixed = outer_w },
         .gap = 5,
-        .bg = PANEL_BG,
-        .border = .{ .color = PANEL_BORDER, .thickness = 1 },
-        .clip_children = true,
+        .padding = .{ BODY_PAD, BODY_PAD, BODY_PAD, BODY_PAD },
     });
-    const was_open = open.*;
-    drawHeader(ctx, panel_w, open);
-    if (!was_open) {
-        ctx.endBox();
-        ctx.endBox();
-        ctx.endBox();
-        return;
-    }
     ctx.labelEx("global / track controls", SUBTLE);
 
-    ctx.beginBox(.{ .direction = .row, .gap = 10, .align_cross = .start });
-    const col_w: i32 = @max(1, @divTrunc(panel_w - 30, 2));
+    ctx.beginBox(.{
+        .direction = .row,
+        .gap = COL_GAP,
+        .align_cross = .start,
+        .width = .{ .fixed = content_w },
+    });
     ctx.beginBox(.{ .width = .{ .fixed = col_w }, .height = .fit, .gap = 3 });
     drawGlobalSlider(ctx, idFor(ctx, 1), "tempo", .tempo, model.tempo, 40.0, 220.0, 1.0, model.conversion, display_ctx, display, callback_ctx, on_change);
     drawGlobalSlider(ctx, idFor(ctx, 2), "cutoff", .cutoff, model.cutoff, 0.0, 1.0, 0.01, model.conversion, display_ctx, display, callback_ctx, on_change);
@@ -166,8 +150,6 @@ pub fn draw(
     drawTrack(ctx, 12, "clap", .clap_gain, model.clap, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
     drawTrack(ctx, 13, "bass", .bass_gain, model.bass, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
     drawTrack(ctx, 14, "pad", .pad_gain, model.pad, model.conversion, display_ctx, display, callback_ctx, on_change, on_mute);
-    ctx.endBox();
-    ctx.endBox();
     ctx.endBox();
     ctx.endBox();
     ctx.endBox();

@@ -3,6 +3,7 @@
 //! ホットパス宣言: descriptor 列挙と slider 評価は frame-rate（main thread）、変更 callback は
 //! slider 操作時のみ（event-rate）。RT へは callback の固定長 Mailbox publish だけを渡し、
 //! このファイルから `params.setParam()` を直接呼ばない。
+//! 外形・header・open は PanelHost が所有し、ここでは body のみを構築する（TASK-149.1）。
 
 const std = @import("std");
 const kit = @import("kit");
@@ -15,9 +16,6 @@ pub const ChangeFn = *const fn (ctx: *anyopaque, handle: modular.dyn.Handle, nam
 pub const DisplayFn = *const fn (ctx: *anyopaque, key: view.FieldKey, snapshot: view.ParamSnapshot) modular.ParamValue;
 pub const SnapshotFn = *const fn (ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8) ?view.ParamSnapshot;
 
-const PANEL_BG = gui.Color.rgba(0x1B, 0x21, 0x29, 0xFF);
-const PANEL_BORDER = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
-const TITLE = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
 const SUBTLE = gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF);
 
 pub fn paramId(ctx: *const gui.Context, handle: modular.dyn.Handle, index: usize) gui.Id {
@@ -58,20 +56,14 @@ fn trackWidthWithRightAlignedValue(row: canvas.ParamRowLayout, value_text_w: i32
     return row.track_w + @max(0, row.value_w - value_text_w);
 }
 
-fn drawHeader(ctx: *gui.Context, panel_w: i32, open: *bool) void {
-    const label = if (open.*) "[−] PARAM INSPECTOR" else "[+] PARAM INSPECTOR";
-    const id = ctx.id_stack.makeInt(0x494E_5350_0000_0000);
-    if (ctx.buttonId(id, label, .{ .min_w = @max(0, panel_w - 20) }).clicked) open.* = !open.*;
-}
-
-/// 右端 panel 本体を共有 GUI root の 1 子として登録し、選択 node の descriptor を slider 化する。
-/// 呼び出し側が root の `beginBox/endBox`、`endFrame()`、draw list の render を行う。
-pub fn drawPanel(
+/// PanelHost callback から呼ばれる body のみ。header / open / 外形は PanelHost が所有する。
+/// `body_w` は panel rect 由来の外側幅。Collapsible body は width=.fit のため grow は使えず .fixed で構築する。
+/// スライダー行の content 幅は body_w − 左右 padding。
+pub fn drawBody(
     ctx: *gui.Context,
     graph: *const modular.DynGraph,
     selected: ?modular.dyn.Handle,
-    panel: gui.Rect,
-    open: *bool,
+    body_w: i32,
     snapshot_ctx: *anyopaque,
     snapshot: SnapshotFn,
     display_ctx: *anyopaque,
@@ -79,24 +71,16 @@ pub fn drawPanel(
     callback_ctx: *anyopaque,
     on_change: ChangeFn,
 ) void {
-    const panel_w: i32 = @intCast(panel.w);
-    const panel_h: i32 = @intCast(panel.h);
+    const pad: i32 = 6;
+    const outer_w = @max(1, body_w);
+    const avail = @max(0, outer_w - pad * 2);
 
     ctx.beginBox(.{
-        .width = .{ .fixed = panel_w },
-        .height = .{ .fixed = panel_h },
-        .padding = .{ 10, 10, 10, 10 },
+        .direction = .column,
+        .width = .{ .fixed = outer_w },
         .gap = 7,
-        .bg = PANEL_BG,
-        .border = .{ .color = PANEL_BORDER, .thickness = 1 },
-        .clip_children = true,
+        .padding = .{ pad, pad, pad, pad },
     });
-    const was_open = open.*;
-    drawHeader(ctx, panel_w, open);
-    if (!was_open) {
-        ctx.endBox();
-        return;
-    }
 
     const h = selected orelse {
         ctx.labelEx("Select a primitive node", SUBTLE);
@@ -109,10 +93,6 @@ pub fn drawPanel(
         return;
     };
     ctx.labelEx(@tagName(kind), SUBTLE);
-
-    // panel の fixed width から padding 左右を除いた content 幅。各 slider はこの
-    // 幅を超えないよう、値列を先に予約してからラベルを切り詰める。
-    const param_avail = @max(0, panel_w - 20);
 
     const descs = switch (kind) {
         inline else => |comptime_kind| modular.descriptors(comptime_kind),
@@ -139,8 +119,8 @@ pub fn drawPanel(
                 var current = raw;
                 var label_buf: [96]u8 = undefined;
                 const label = labelWithUnit(&label_buf, desc.name, s.unit);
-                const row = canvas.inspectorParamRowLayout(param_avail, @intCast(ctx.font.measure(label)));
-                const visible_label = paramLabel(ctx, label, param_avail);
+                const row = canvas.inspectorParamRowLayout(avail, @intCast(ctx.font.measure(label)));
+                const visible_label = paramLabel(ctx, label, avail);
                 var value_buf: [32]u8 = undefined;
                 const value_text = std.fmt.bufPrint(&value_buf, "{d:.2}", .{current}) catch "?";
                 const changed = ctx.sliderF32Id(paramId(ctx, h, index), visible_label, &current, .{
@@ -160,8 +140,8 @@ pub fn drawPanel(
                 var label_buf: [96]u8 = undefined;
                 const option = c.options[@intCast(current)];
                 const label = std.fmt.bufPrint(&label_buf, "{s} [{s}]", .{ desc.name, option }) catch desc.name;
-                const row = canvas.inspectorParamRowLayout(param_avail, @intCast(ctx.font.measure(label)));
-                const visible_label = paramLabel(ctx, label, param_avail);
+                const row = canvas.inspectorParamRowLayout(avail, @intCast(ctx.font.measure(label)));
+                const visible_label = paramLabel(ctx, label, avail);
                 var value_buf: [32]u8 = undefined;
                 const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{@as(i64, current)}) catch "?";
                 const changed = ctx.sliderI32Id(paramId(ctx, h, index), visible_label, &current, .{
@@ -174,26 +154,5 @@ pub fn drawPanel(
             },
         }
     }
-    ctx.endBox();
-}
-
-/// 旧 caller 向けの単独 root wrapper。統合 app は `drawPanel` を共有 root から呼ぶ。
-pub fn draw(
-    ctx: *gui.Context,
-    graph: *const modular.DynGraph,
-    selected: ?modular.dyn.Handle,
-    panel: gui.Rect,
-    open: *bool,
-    snapshot_ctx: *anyopaque,
-    snapshot: SnapshotFn,
-    display_ctx: *anyopaque,
-    display: DisplayFn,
-    callback_ctx: *anyopaque,
-    on_change: ChangeFn,
-) void {
-    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(ctx.screen_w) }, .height = .{ .fixed = @intCast(ctx.screen_h) } });
-    ctx.beginBox(.{ .width = .{ .fixed = @max(0, panel.x) }, .height = .{ .fixed = @intCast(panel.h) } });
-    ctx.endBox();
-    drawPanel(ctx, graph, selected, panel, open, snapshot_ctx, snapshot, display_ctx, display, callback_ctx, on_change);
     ctx.endBox();
 }

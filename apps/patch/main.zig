@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
 const platform = kit.platform;
 const gui = kit.gui;
+const appshell = kit.appshell;
 const stepgrid = gui.stepgrid;
 const modular = @import("modular");
 const audio = kit.audio;
@@ -218,14 +219,18 @@ fn paletteRowCount(canvas_w: f32) usize {
     return (PALETTE.len + cols - 1) / cols;
 }
 
-/// パレット帯の下端（行数は canvas 幅依存。clampMacroPos の上限に使う）。
-fn paletteBottom(canvas_w: f32, y0: f32) f32 {
-    const rows: f32 = @floatFromInt(paletteRowCount(canvas_w));
-    return y0 + rows * (PAL_H + PAL_GAP);
+/// パレット帯の下端（screen 絶対座標。行数は center 幅依存。clampMacroPos の上限に使う）。
+fn paletteBottom(app: *const App) f32 {
+    const rows: f32 = @floatFromInt(paletteRowCount(app.canvasW()));
+    return app.canvas_rect.y + PAL_Y + rows * (PAL_H + PAL_GAP);
 }
 
-fn paletteButtons(canvas_w: f32, y0: f32) [PALETTE.len]canvas.PaletteButton {
+/// center rect 基準のモジュールパレット（screen 絶対座標）。
+fn paletteButtons(app: *const App) [PALETTE.len]canvas.PaletteButton {
+    const canvas_w = app.canvasW();
     const cols = paletteCols(canvas_w);
+    const ox = app.canvas_rect.x;
+    const oy = app.canvas_rect.y + PAL_Y;
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
     for (0..PALETTE.len) |i| {
         const col = i % cols;
@@ -233,8 +238,8 @@ fn paletteButtons(canvas_w: f32, y0: f32) [PALETTE.len]canvas.PaletteButton {
         const x: f32 = @floatFromInt(col);
         const y: f32 = @floatFromInt(row);
         btns[i] = .{ .kind_index = @intCast(i), .rect = .{
-            .x = PAL_X0 + x * (PAL_W + PAL_GAP),
-            .y = y0 + y * (PAL_H + PAL_GAP),
+            .x = ox + PAL_X0 + x * (PAL_W + PAL_GAP),
+            .y = oy + y * (PAL_H + PAL_GAP),
             .w = PAL_W,
             .h = PAL_H,
         } };
@@ -358,11 +363,21 @@ const App = struct {
     drag: Drag = .none,
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
-    // TASK-123: GUI-local panel visibility。保存・publish・netsync には含めない。
-    transport_open: bool = true,
-    inspector_open: bool = true,
-    // TASK-125: 両 panel の完全非表示。true の間も *_open は保持し、復帰時に open/closed を復元する。
+    // TASK-149.1: PanelHost が Transport(bottom)/Inspector(right) の外形・open/visible の正。
+    // ポインタは main の stack 上 host/panels/gui_ctx を指す（App より長く生きる）。
+    panel_host: *gui.PanelHost = undefined,
+    panels: []gui.Panel = &.{},
+    gui_ctx: *gui.Context = undefined,
+    /// PanelHost center rect（screen 絶対座標）。描画・hit・palette・camera の共通原点。
+    canvas_rect: canvas.ScreenRect = .{ .x = 0, .y = 0, .w = WIN_W, .h = WIN_H - VIS_H },
+    // TASK-125: H キー全 hide。slot visible の一時 override。解除時に pre_hide_* を復元し open は保持。
     panels_hidden: bool = false,
+    pre_hide_right_visible: bool = true,
+    pre_hide_bottom_visible: bool = true,
+    // appshell Preferences（panel/slot 永続化。VP_APPSHELL_DIR 対応）。
+    prefs: appshell.preferences.Preferences = undefined,
+    prefs_dir: ?std.Io.Dir = null,
+    prefs_dirty: bool = false,
 
     // TASK-40.8 C: master 出力タップ + 直近ブロックの rms/peak（viz probe 用。GUI スレッド更新）。
     tap: Tap = .{},
@@ -439,40 +454,127 @@ const App = struct {
         return if (self.native_menu_active) 0 else MENU_GUI_H;
     }
 
-    fn paletteY0(self: *const App) f32 {
-        return PAL_Y + self.menuTopH();
-    }
-
     fn pointInMenuBar(self: *const App) bool {
         return !self.native_menu_active and self.mouse.y < self.menuTopH();
     }
 
-    /// キャンバス有効高（画面下端の可視化帯を除いた領域）。見切れ判定・ヒットテスト・tap 対象選択で共通に使う。
+    /// PanelHost center の幅（canvas viewport）。見切れ判定・hit・tap・palette で共通。
+    fn canvasW(self: *const App) f32 {
+        return @max(0.0, self.canvas_rect.w);
+    }
+
+    /// PanelHost center の高さ（canvas viewport）。
     fn canvasH(self: *const App) f32 {
+        return @max(0.0, self.canvas_rect.h);
+    }
+
+    /// 画面下端可視化帯の y 開始（絶対座標。VIS_H は PanelHost の外）。
+    fn vizBandY0(self: *const App) f32 {
         const fh: f32 = @floatFromInt(self.fb_h);
         return @max(0.0, fh - VIS_H);
     }
 
-    fn transportState(self: *const App) canvas.PanelState {
-        if (self.panels_hidden) return .hidden;
-        return if (self.transport_open) .open else .closed;
+    /// screen 絶対 → center ローカル（camera 空間）。
+    fn toCanvasLocal(self: *const App, screen: Vec2f) Vec2f {
+        return .{ .x = screen.x - self.canvas_rect.x, .y = screen.y - self.canvas_rect.y };
     }
 
-    fn inspectorState(self: *const App) canvas.PanelState {
-        if (self.panels_hidden) return .hidden;
-        return if (self.inspector_open) .open else .closed;
+    /// center ローカル → screen 絶対。
+    fn fromCanvasLocal(self: *const App, local: Vec2f) Vec2f {
+        return .{ .x = local.x + self.canvas_rect.x, .y = local.y + self.canvas_rect.y };
     }
 
-    fn canvasW(self: *const App) f32 {
-        return canvas.canvasViewportWidthForState(@floatFromInt(self.fb_w), self.canvasH(), self.inspectorState());
+    fn mouseWorld(self: *const App) Vec2f {
+        return self.camera.screenToWorld(self.toCanvasLocal(self.mouse));
     }
 
-    fn pointInInspectorPanel(self: *const App) bool {
-        return canvas.pointInInspectorPanelState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.inspectorState());
+    fn worldToAbs(self: *const App, w: Vec2f) Vec2f {
+        return self.fromCanvasLocal(self.camera.worldToScreen(w));
     }
 
-    fn pointInTransportPanel(self: *const App) bool {
-        return canvas.pointInTransportPanelState(self.mouse, @floatFromInt(self.fb_w), self.canvasH(), self.transportState());
+    fn findPanel(self: *const App, name: []const u8) ?*gui.Panel {
+        for (self.panels) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return p;
+        }
+        return null;
+    }
+
+    fn panelOpen(self: *const App, name: []const u8) bool {
+        return if (self.findPanel(name)) |p| p.open else false;
+    }
+
+    fn panelVisible(self: *const App, name: []const u8) bool {
+        return if (self.findPanel(name)) |p| p.visible else false;
+    }
+
+    /// PanelHost hit が center のときのみ canvas 操作を許可（panel/splitter/outside は遮断）。
+    fn allowsCanvasInput(self: *const App) bool {
+        if (self.pointInMenuBar()) return false;
+        if (self.gui_ctx.state.active_id != 0) return false;
+        const pt = gui.Vec2{ .x = @intFromFloat(self.mouse.x), .y = @intFromFloat(self.mouse.y) };
+        return self.panel_host.hitTest(self.gui_ctx, pt) == .center;
+    }
+
+    fn togglePanelsHidden(self: *App) void {
+        if (!self.panels_hidden) {
+            self.pre_hide_right_visible = self.panel_host.slotVisible(.right);
+            self.pre_hide_bottom_visible = self.panel_host.slotVisible(.bottom);
+            self.panel_host.setSlotVisible(.right, false);
+            self.panel_host.setSlotVisible(.bottom, false);
+            self.panels_hidden = true;
+        } else {
+            self.panel_host.setSlotVisible(.right, self.pre_hide_right_visible);
+            self.panel_host.setSlotVisible(.bottom, self.pre_hide_bottom_visible);
+            self.panels_hidden = false;
+        }
+        self.prefs_dirty = true;
+    }
+
+    fn togglePanelByName(self: *App, name: []const u8) bool {
+        const p = self.findPanel(name) orelse return false;
+        _ = self.panel_host.setPanelVisible(name, !p.visible);
+        self.prefs_dirty = true;
+        return true;
+    }
+
+    fn syncCanvasRect(self: *App) void {
+        if (self.panel_host.centerRect(self.gui_ctx)) |r| {
+            self.canvas_rect = .{
+                .x = @floatFromInt(r.x),
+                .y = @floatFromInt(r.y),
+                .w = @floatFromInt(r.w),
+                .h = @floatFromInt(r.h),
+            };
+        }
+    }
+
+    /// Inspector body 外側幅（panel rect − 余白）。初回は right slot extent ベース。
+    /// Collapsible body は fit のため、drawBody へ .fixed 注入する（grow-in-fit collapse 回避）。
+    fn inspectorBodyAvail(self: *const App) i32 {
+        if (self.panel_host.panelRect(self.gui_ctx, "Inspector")) |r| {
+            return @max(1, @as(i32, @intCast(r.w)) - 16);
+        }
+        return @max(1, self.panel_host.slotExtent(.right) - 24);
+    }
+
+    /// Transport body 外側幅（panel rect − 余白）。bottom の extent は高さなので
+    /// 初回 fallback は slotRect または fb 幅概算。
+    fn transportBodyAvail(self: *const App) i32 {
+        if (self.panel_host.panelRect(self.gui_ctx, "Transport")) |r| {
+            return @max(1, @as(i32, @intCast(r.w)) - 16);
+        }
+        if (self.panel_host.slotRect(self.gui_ctx, .bottom)) |r| {
+            return @max(1, @as(i32, @intCast(r.w)) - 24);
+        }
+        return @max(1, @as(i32, @intCast(self.fb_w)) - 40);
+    }
+
+    /// 旧 TASK-123/125 digest キー互換: !visible→hidden / visible&&!open→closed / else open。
+    fn panelStateName(self: *const App, name: []const u8) []const u8 {
+        const p = self.findPanel(name) orelse return "hidden";
+        if (!p.visible) return "hidden";
+        if (!p.open) return "closed";
+        return "open";
     }
 
     fn editState(self: *App, key: param_view.FieldKey) *param_view.ParamEditState {
@@ -887,13 +989,13 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     const r = cam.portScreenRadius();
 
     // ケーブル（ノードの下）。visual（写像済み）端点で描画し、選択/hover 判定は actual（実 CableRef）で行う
-    // （合成 handle は描画座標の中だけで使う）。
+    // （合成 handle は描画座標の中だけで使う）。座標は center origin を加えた screen 絶対。
     for (dedges) |de| {
         const e = de.visual;
         const sg = findNode(nodes, e.src_handle) orelse continue;
         const dg = findNode(nodes, e.dst_handle) orelse continue;
-        const a = cam.worldToScreen(canvas.outPortPos(sg, e.src_out));
-        const b = cam.worldToScreen(canvas.inPortPos(dg, e.dst_in));
+        const a = app.worldToAbs(canvas.outPortPos(sg, e.src_out));
+        const b = app.worldToAbs(canvas.inPortPos(dg, e.dst_in));
         const kind = portKindOut(app, e.src_handle, e.src_out);
         const thick: u32 = if (cableItemMatches(app.selected, de.actual) or cableItemMatches(app.hover, de.actual)) 3 else 2;
         dl.line(vec2i(a), vec2i(b), portColor(kind), thick) catch {};
@@ -902,7 +1004,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     // ノード + ポート（畳み箱＝合成 handle はタイトル/ポート種別を台帳経由で解決。box handle は dyn へ
     // 直接渡さない＝§3.1 の閉じ込め）。
     for (nodes) |g| {
-        const tl = cam.worldToScreen(g.pos);
+        const tl = app.worldToAbs(g.pos);
         const sz = canvas.nodeSize(g).scale(cam.zoom);
         const rect = toRect(tl, sz);
         dl.rectFilled(rect, NODE_BG) catch {};
@@ -912,22 +1014,22 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         dl.rectOutline(rect, border, if (selected) 2 else 1) catch {};
         dl.text(.{ .x = rect.x + 6, .y = rect.y + 4 }, nodeTitle(app, g.handle), TITLE_COL) catch {};
         if (group.groupIdFromHandle(g.handle)) |gid| {
-            drawToggle(dl, cam, g, true); // 畳み箱は常に collapsed 側
-            drawMacroGrid(app, dl, cam, g, gid); // 本体に TR/303 grid + playhead（TASK-40.7.2）
+            drawToggle(app, dl, g, true); // 畳み箱は常に collapsed 側
+            drawMacroGrid(app, dl, g, gid); // 本体に TR/303 grid + playhead（TASK-40.7.2）
         } else if (g.grid_rows > 0) {
             // selected standalone step_seq の inline grid（TASK-110.2。マクロ箱経路とは分離）
-            drawInlineStepSeqGrid(app, dl, cam, g);
+            drawInlineStepSeqGrid(app, dl, g);
         }
         var i: u8 = 0;
         while (i < g.n_in) : (i += 1) {
-            const p = cam.worldToScreen(canvas.inPortPos(g, i));
+            const p = app.worldToAbs(canvas.inPortPos(g, i));
             const kind = portKindIn(app, g.handle, i);
             fillCircle(dl, p, r, portColor(kind));
             if (hoverPort(app, g.handle, true, i)) dl.rectOutline(portBox(p, r), HOVER_COL, 1) catch {};
         }
         i = 0;
         while (i < g.n_out) : (i += 1) {
-            const p = cam.worldToScreen(canvas.outPortPos(g, i));
+            const p = app.worldToAbs(canvas.outPortPos(g, i));
             const kind = portKindOut(app, g.handle, i);
             // A: 出力ポート丸を活性度で明滅（peak-hold + decay。RT 影響ゼロ）。活性時は halo を先に、その上に明るい dot。
             const lvl = outPortLevel(app, g.handle, i);
@@ -941,7 +1043,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     // 展開中グループの薄い枠（矩形+タイトル+トグル）。中身の grid 描画は 40.7.2。
     for (app.ledger.groups, 0..) |gr, gi| {
         if (!gr.active or gr.collapsed) continue;
-        drawExpandedGroupFrame(app, dl, cam, nodes, @intCast(gi), gr);
+        drawExpandedGroupFrame(app, dl, nodes, @intCast(gi), gr);
     }
 
     // D: tap 中ポートのミニ oscilloscope（ノード直下）。
@@ -955,8 +1057,8 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         }
     }
 
-    // モジュールパレット（最前面・画面固定）。GUI menu 行があるときはその下へずらす（TASK-136）。
-    const buttons = paletteButtons(app.canvasW(), app.paletteY0());
+    // モジュールパレット（center rect 基準オーバーレイ。PanelHost panel にはしない）。
+    const buttons = paletteButtons(app);
     for (buttons) |btn| {
         const rect = gui.Rect{ .x = safeI32(btn.rect.x), .y = safeI32(btn.rect.y), .w = safeU32(btn.rect.w), .h = safeU32(btn.rect.h) };
         const hov = canvas.hitTestPalette(app.mouse, &buttons) == btn.kind_index;
@@ -966,11 +1068,11 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     }
 }
 
-/// origin ポートの screen 位置（node が消えていれば null）。pending cable 描画用。
+/// origin ポートの screen 絶対位置（node が消えていれば null）。pending cable 描画用。
 fn portScreenPos(app: *const App, nodes: []const NodeGeom, p: PortRef) ?Vec2f {
     const g = findNode(nodes, p.handle) orelse return null;
     const wp = if (p.is_input) canvas.inPortPos(g, p.index) else canvas.outPortPos(g, p.index);
-    return app.camera.worldToScreen(wp);
+    return app.worldToAbs(wp);
 }
 
 fn cableItemMatches(item: ?Item, actual: CableRef) bool {
@@ -1053,9 +1155,9 @@ fn paletteLabel(entry: PaletteEntry) []const u8 {
 }
 
 /// 折り畳みトグル [±] を描画する（g は箱 or 枠ヘッダーの NodeGeom。collapsed で表示ラベルを切替）。
-fn drawToggle(dl: *gui.DrawList, cam: Camera, g: NodeGeom, collapsed: bool) void {
-    const tl = cam.worldToScreen(canvas.togglePos(g));
-    const size = canvas.TOGGLE_SIZE * cam.zoom;
+fn drawToggle(app: *const App, dl: *gui.DrawList, g: NodeGeom, collapsed: bool) void {
+    const tl = app.worldToAbs(canvas.togglePos(g));
+    const size = canvas.TOGGLE_SIZE * app.camera.zoom;
     const rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(size), .h = safeU32(size) };
     dl.rectFilled(rect, PAL_BG) catch {};
     dl.rectOutline(rect, BORDER_COL, 1) catch {};
@@ -1064,7 +1166,7 @@ fn drawToggle(dl: *gui.DrawList, cam: Camera, g: NodeGeom, collapsed: bool) void
 
 /// 展開中グループの薄い枠（現在のメンバー配置の bbox 外周）+ ヘッダー（タイトル+トグル、group.pos アンカー）。
 /// 中身（TR grid 等）の描画は 40.7.2。
-fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, cam: Camera, nodes: []const NodeGeom, gid: group.GroupId, gr: group.Group) void {
+fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const NodeGeom, gid: group.GroupId, gr: group.Group) void {
     var bbox_min = Vec2f{ .x = std.math.floatMax(f32), .y = std.math.floatMax(f32) };
     var bbox_max = Vec2f{ .x = -std.math.floatMax(f32), .y = -std.math.floatMax(f32) };
     var any = false;
@@ -1081,21 +1183,21 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, cam: Camera, nodes
     }
     if (any) {
         const margin: f32 = 10;
-        const tl = cam.worldToScreen(.{ .x = bbox_min.x - margin, .y = bbox_min.y - margin });
-        const br = cam.worldToScreen(.{ .x = bbox_max.x + margin, .y = bbox_max.y + margin });
+        const tl = app.worldToAbs(.{ .x = bbox_min.x - margin, .y = bbox_min.y - margin });
+        const br = app.worldToAbs(.{ .x = bbox_max.x + margin, .y = bbox_max.y + margin });
         const rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(br.x - tl.x), .h = safeU32(br.y - tl.y) };
         dl.rectOutline(rect, HOVER_COL, 1) catch {};
     }
 
     const header = NodeGeom{ .handle = group.handleOfGroup(gid), .pos = gr.pos, .n_in = 0, .n_out = 0 };
-    const htl = cam.worldToScreen(header.pos);
-    const hsz = canvas.nodeSize(header).scale(cam.zoom);
+    const htl = app.worldToAbs(header.pos);
+    const hsz = canvas.nodeSize(header).scale(app.camera.zoom);
     const hrect = toRect(htl, hsz);
     const hsel = itemIsHandle(app.selected, header.handle);
     dl.rectFilled(hrect, NODE_BG) catch {};
     dl.rectOutline(hrect, if (hsel) SEL_COL else BORDER_COL, if (hsel) 2 else 1) catch {};
     dl.text(.{ .x = hrect.x + 6, .y = hrect.y + 4 }, gr.kind.displayName(), TITLE_COL) catch {};
-    drawToggle(dl, cam, header, false);
+    drawToggle(app, dl, header, false);
 }
 
 // ============================================================================
@@ -1144,8 +1246,16 @@ fn gridGeometry(cam: Camera, box_pos: Vec2f) stepgrid.Geometry {
     return toStepgridGeometry(canvas.gridGeometry(cam, box_pos));
 }
 
+/// 描画用: center origin を加えた screen 絶対 grid geometry。
+fn absGridGeometry(app: *const App, box_pos: Vec2f) stepgrid.Geometry {
+    var g = gridGeometry(app.camera, box_pos);
+    g.origin_x += app.canvas_rect.x;
+    g.origin_y += app.canvas_rect.y;
+    return g;
+}
+
 /// 畳み箱本体に TR grid（drum 2 レーン）/ 303 行（on/accent/slide + pitch 段）+ playhead を描く。
-fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: group.GroupId) void {
+fn drawMacroGrid(app: *App, dl: *gui.DrawList, box: NodeGeom, gid: group.GroupId) void {
     const kind = app.ledger.groups[gid].kind;
     const seqs = collectStepSeqMembers(app, gid);
     if (seqs.n == 0) return;
@@ -1153,7 +1263,7 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: 
     // playhead 列: process は現 step 評価後に step++ するので、直近発音した列は (step + STEPS-1) % STEPS。
     const head_seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
     const playhead: u8 = (head_seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
-    const geometry = gridGeometry(cam, box.pos);
+    const geometry = absGridGeometry(app, box.pos);
 
     switch (kind) {
         .drum_machine => {
@@ -1181,10 +1291,10 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom, gid: 
 }
 
 /// 選択中 standalone step_seq の inline grid 描画（pattern_db 非経由・atomic load のみ。TASK-110.2）。
-fn drawInlineStepSeqGrid(app: *App, dl: *gui.DrawList, cam: Camera, box: NodeGeom) void {
+fn drawInlineStepSeqGrid(app: *App, dl: *gui.DrawList, box: NodeGeom) void {
     const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, box.handle);
     const playhead: u8 = (seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
-    const geometry = gridGeometry(cam, box.pos);
+    const geometry = absGridGeometry(app, box.pos);
     switch (seq.kind) {
         .drum => {
             const rows = [_]stepgrid.DrawRow{
@@ -1415,8 +1525,8 @@ fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const
 }
 
 fn updateHover(app: *App) void {
-    // 可視化帯・panel 上ではキャンバスの hover を出さない（hidden 時は panel 判定が常に false）。
-    if (app.pointInInspectorPanel() or app.pointInTransportPanel() or app.mouse.y >= app.canvasH()) {
+    // panel / splitter / outside / 可視化帯上ではキャンバスの hover を出さない。
+    if (!app.allowsCanvasInput()) {
         app.hover = null;
         return;
     }
@@ -1424,7 +1534,7 @@ fn updateHover(app: *App) void {
     var edge_buf: [MAX_EDGES]group.DisplayEdge = undefined;
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
     const dedges = edge_buf[0..app.buildDisplayEdges(&edge_buf)];
-    const mw = app.camera.screenToWorld(app.mouse);
+    const mw = app.mouseWorld();
     if (canvas.hitTestPort(mw, nodes)) |pr| {
         app.hover = .{ .port = pr };
     } else if (canvas.hitTestNode(mw, nodes)) |h| {
@@ -1467,8 +1577,9 @@ fn selectNodeFromOkIdResponse(app: *App, resp: []const u8) void {
 /// パレット index → add_node / add_macro action（world 座標付き）。
 fn routePaletteAdd(app: *App, ki: u8) void {
     const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
+    // center ローカル座標（camera 空間）で配置点を決める。
     const cx: f32 = app.canvasW() * 0.45 + casc * 18;
-    const cy: f32 = @as(f32, @floatFromInt(app.fb_h)) * 0.4 + casc * 18;
+    const cy: f32 = app.canvasH() * 0.4 + casc * 18;
     if (ki >= PALETTE.len) return;
     var resp_buf: [512]u8 = undefined;
     switch (PALETTE[ki]) {
@@ -1563,21 +1674,15 @@ fn routeDisconnect(app: *App, dst_h: Handle, dst_in: u8) void {
 }
 
 fn onMouseDown(app: *App) void {
-    // Transport/Inspector の mouse は GUI Context 側へ渡す。canvas の選択/drag/zoom と競合させない。
-    if (app.pointInInspectorPanel() or app.pointInTransportPanel()) return;
-    // パレットは screen 座標で world hit より先に判定（TASK-106.2: action route 経由）。
-    const buttons = paletteButtons(app.canvasW(), app.paletteY0());
+    // panel / splitter / outside の mouse は GUI Context 側へ渡す。canvas と競合させない。
+    if (!app.allowsCanvasInput()) return;
+    // パレットは screen 絶対座標で world hit より先に判定（TASK-106.2: action route 経由）。
+    const buttons = paletteButtons(app);
     if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
         routePaletteAdd(app, ki);
         return;
     }
-    // 下端の可視化帯上のクリックはキャンバス操作にしない（選択/pan/配線を開始しない）。
-    if (app.mouse.y >= app.canvasH()) {
-        app.selected = null;
-        app.drag = .none;
-        return;
-    }
-    const mw = app.camera.screenToWorld(app.mouse);
+    const mw = app.mouseWorld();
 
     // 折り畳みトグル [±] はノード本体のクリックより優先する（畳み箱 / 展開枠ヘッダーの両方）。
     if (hitToggle(app, mw)) |gid| {
@@ -1646,7 +1751,7 @@ fn onMouseDown(app: *App) void {
         app.selected = .{ .cable = actual };
     } else {
         app.selected = null;
-        app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.mouse } };
+        app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.toCanvasLocal(app.mouse) } };
     }
 }
 
@@ -1761,7 +1866,7 @@ fn registerGeneratedMacros(app: *App) void {
 fn addByPaletteIndex(app: *App, ki: u8) !void {
     const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
     const cx: f32 = app.canvasW() * 0.45 + casc * 18;
-    const cy: f32 = @as(f32, @floatFromInt(app.fb_h)) * 0.4 + casc * 18;
+    const cy: f32 = app.canvasH() * 0.4 + casc * 18;
     inline for (PALETTE, 0..) |entry, i| {
         if (i == ki) {
             switch (entry) {
@@ -1808,11 +1913,12 @@ fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec
 /// footprint を screen サイズ（world × zoom）に換算し、右下が fb 内に収まるよう anchor(screen) を clamp
 /// してから world 座標へ（codex #4 と同型）。footprint が fb より広くても max が下限を割らないよう @max で保護。
 fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
+    // anchor は center ローカル screen 座標。
     const zoom = app.camera.zoom;
     const margin: f32 = 16;
-    const top_limit: f32 = paletteBottom(app.canvasW(), app.paletteY0()) + margin; // パレット帯の下端より下に置く
+    const top_limit: f32 = (paletteBottom(app) - app.canvas_rect.y) + margin; // パレット帯下端（ローカル）
     const fbw: f32 = app.canvasW();
-    const fbh: f32 = @floatFromInt(app.fb_h);
+    const fbh: f32 = app.canvasH();
     const max_x = @max(margin, fbw - fp.x * zoom - margin);
     const max_y = @max(top_limit, fbh - fp.y * zoom - margin);
     const sx = std.math.clamp(anchor.x, margin, max_x);
@@ -1992,14 +2098,16 @@ fn onMouseMove(app: *App) void {
     switch (app.drag) {
         .none => updateHover(app),
         .pan => |p| {
-            app.camera.pan = p.start_pan.add(app.mouse.sub(p.start_mouse));
+            // pan/start_mouse は center ローカル screen 座標。
+            const local = app.toCanvasLocal(app.mouse);
+            app.camera.pan = p.start_pan.add(local.sub(p.start_mouse));
         },
         .node => |nd| {
-            const mw = app.camera.screenToWorld(app.mouse);
+            const mw = app.mouseWorld();
             app.layout[nd.handle] = mw.add(nd.grab_offset);
         },
         .group => |gd| {
-            const mw = app.camera.screenToWorld(app.mouse);
+            const mw = app.mouseWorld();
             app.ledger.groups[gd.gid].pos = mw.add(gd.grab_offset);
         },
         .cable => {}, // pending は app.mouse を使って毎フレーム描画（状態更新なし）
@@ -2136,7 +2244,7 @@ fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
         if (app.tap_ports[slot] < 0) continue;
         const dh = app.tap_display[slot];
         const g = findNode(nodes, dh) orelse continue;
-        const tl = app.camera.worldToScreen(g.pos);
+        const tl = app.worldToAbs(g.pos);
         const sz = canvas.nodeSize(g).scale(app.camera.zoom);
         const lr = canvas.miniScopeRect(tl, sz);
         const rect = gui.Rect{ .x = safeI32(lr.x), .y = safeI32(lr.y), .w = safeU32(lr.w), .h = safeU32(lr.h) };
@@ -2210,7 +2318,8 @@ const FREQ_LABELS = [_]FreqLabel{
 
 fn drawVizBand(app: *const App, fb: platform.Framebuffer, spec: *const Spec, osc: *const Scope, meter: *const scope.LevelMeter) void {
     const fb_w = fb.width;
-    const band_y0: usize = @intFromFloat(app.canvasH());
+    // VIS_H は画面最下端固定。PanelHost center とは独立。
+    const band_y0: usize = @intFromFloat(app.vizBandY0());
     if (band_y0 >= fb.height) return;
     // 帯下地: 行連続なので単一 @memset（全画素ループを書かない）。
     const start = band_y0 * fb_w;
@@ -2315,6 +2424,33 @@ pub fn main(init: std.process.Init) !void {
     var gui_ctx = gui.Context.init(allocator, gui.default_font);
     defer gui_ctx.deinit();
 
+    // TASK-149.1: PanelHost registry — Transport=bottom, Inspector=right。
+    var panels = [_]gui.Panel{
+        .{ .name = "Transport", .slot = .bottom, .build = buildTransportPanel, .user_data = &app },
+        .{ .name = "Inspector", .slot = .right, .build = buildInspectorPanel, .user_data = &app },
+    };
+    var panel_host = try gui.PanelHost.init(panels[0..], .{
+        .right = .{ .extent = 280, .min_extent = 160, .max_extent = 480 },
+        .bottom = .{ .extent = 250, .min_extent = 120, .max_extent = 400 },
+        .left = .{ .visible = false, .extent = 200, .min_extent = 120, .max_extent = 400 },
+        .min_center_width = 200,
+        .min_center_height = 160,
+    });
+    app.panel_host = &panel_host;
+    app.panels = panels[0..];
+    app.gui_ctx = &gui_ctx;
+
+    // appshell Preferences（panel/slot 永続化）。
+    app.prefs = appshell.preferences.Preferences.init(allocator);
+    const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |v| std.mem.span(v) else null;
+    if (appshell.paths.openAppDataDir(app.io, allocator, "patch", override_path)) |dir| {
+        app.prefs_dir = dir;
+        _ = app.prefs.load(app.io, dir, "preferences.ash") catch {};
+        panel_host.restore(panelPersistence(&app));
+    } else |err| {
+        std.debug.print("apps/patch: preferences dir open failed: {s}\n", .{@errorName(err)});
+    }
+
     // C: master 可視化（spectrogram/oscilloscope/level meter）。comptime サイズが大きいので heap 確保。
     const spec = try allocator.create(Spec);
     defer allocator.destroy(spec);
@@ -2414,7 +2550,7 @@ pub fn main(init: std.process.Init) !void {
                             .H => {
                                 // TASK-125: modifier なし H のみ。Cmd/Ctrl/Alt/Shift+H は無視。
                                 if (!(k.modifiers.shift or k.modifiers.ctrl or k.modifiers.alt or k.modifiers.cmd)) {
-                                    app.panels_hidden = !app.panels_hidden;
+                                    app.togglePanelsHidden();
                                 }
                             },
                             else => {},
@@ -2429,20 +2565,15 @@ pub fn main(init: std.process.Init) !void {
                     .mouse_move => |m| {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                         gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
-                        if (!app.pointInMenuBar() and
-                            !app.pointInInspectorPanel() and
-                            !app.pointInTransportPanel() and
-                            gui_ctx.state.active_id == 0) onMouseMove(&app);
+                        // drag 中は panel 上でも追従（node/pan を panel 境界で切らない）。開始は allowsCanvasInput。
+                        if (app.drag != .none or app.allowsCanvasInput()) onMouseMove(&app);
                     },
                     .mouse_down => |m| {
                         const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
                         gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
                         if (m.button == .left) {
                             app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                            if (!app.pointInMenuBar() and
-                                !app.pointInInspectorPanel() and
-                                !app.pointInTransportPanel() and
-                                gui_ctx.state.active_id == 0) onMouseDown(&app);
+                            if (app.allowsCanvasInput()) onMouseDown(&app);
                         }
                     },
                     .mouse_up => |m| {
@@ -2450,18 +2581,16 @@ pub fn main(init: std.process.Init) !void {
                         gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
                         if (m.button == .left) {
                             app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                            if (!app.pointInMenuBar() and
-                                gui_ctx.state.active_id == 0 and
-                                !app.pointInInspectorPanel() and
-                                !app.pointInTransportPanel()) onMouseUp(&app);
+                            // cable/node drag の commit は panel 上でも受け付ける（開始は center のみ）。
+                            if (app.drag != .none or app.allowsCanvasInput()) onMouseUp(&app);
                         }
                     },
                     .mouse_scroll => |s| {
                         app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
                         gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
-                        if (!app.pointInMenuBar() and !app.pointInInspectorPanel() and !app.pointInTransportPanel()) {
+                        if (app.allowsCanvasInput()) {
                             const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
-                            app.camera.zoomAt(app.mouse, factor);
+                            app.camera.zoomAt(app.toCanvasLocal(app.mouse), factor);
                             updateHover(&app);
                         }
                     },
@@ -2473,16 +2602,22 @@ pub fn main(init: std.process.Init) !void {
             publishControls(app.patch, app.params);
             updateViz(&app);
             app.beginParamFrame();
-            const transport_model = transportModel(&app);
 
             @memset(fb.pixels, BG);
             dl.reset(fb.width, fb.height);
             drawFrame(&app, &dl);
             const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
             gui.render(target, &dl, gui.default_font);
-            // TASK-136: column = [optional menu row] + panels。menu 分だけ panels を content-relative にずらす。
+
+            // menu → PanelHost content（VIS_H より上）→ VIS_H の描画順。
             const mtop_i: i32 = @intFromFloat(app.menuTopH());
-            gui_ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
+            const vis_h_i: i32 = VIS_H;
+            const content_h_i: i32 = @max(0, @as(i32, @intCast(fb.height)) - mtop_i - vis_h_i);
+            gui_ctx.beginBox(.{
+                .direction = .column,
+                .width = .{ .fixed = @intCast(fb.width) },
+                .height = .{ .fixed = @intCast(fb.height) },
+            });
             if (!app.native_menu_active) {
                 gui_ctx.beginBox(.{
                     .direction = .row,
@@ -2495,30 +2630,24 @@ pub fn main(init: std.process.Init) !void {
                 gui.menuBar(&gui_ctx, app.menuCommandsSlice(), &app.menu_bar_state);
                 gui_ctx.endBox();
             }
-            // TASK-125: hidden 時は panel 描画を呼ばない（ヘッダーも残さない）。
-            if (!app.panels_hidden) {
-                var ir = canvas.inspectorVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.inspector_open);
-                var tr = canvas.transportVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.transport_open);
-                if (mtop_i > 0) {
-                    const mtop_f: f32 = @floatFromInt(mtop_i);
-                    ir.y = @max(0.0, ir.y - mtop_f);
-                    tr.y = @max(0.0, tr.y - mtop_f);
-                    const content_h = @max(0.0, app.canvasH() - mtop_f);
-                    ir.h = @min(ir.h, @max(0.0, content_h - ir.y));
-                    tr.h = @min(tr.h, @max(0.0, content_h - tr.y));
-                }
-                const content_h_i: i32 = @max(0, @as(i32, @intCast(fb.height)) - mtop_i);
-                gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = content_h_i } });
-                transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), content_h_i, &transport_model, &app.transport_open, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
-                inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
-                    .node => |h| h,
-                    else => null,
-                } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app.inspector_open, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
+            gui_ctx.beginBox(.{
+                .direction = .column,
+                .width = .{ .grow = 1 },
+                .height = .{ .fixed = content_h_i },
+            });
+            panel_host.build(&gui_ctx) catch |err| {
+                std.debug.print("apps/patch: PanelHost.build failed: {s}\n", .{@errorName(err)});
+            };
+            gui_ctx.endBox();
+            // VIS_H 分のスペーサ（PanelHost が帯と重ならないよう content を上に限定）。
+            if (vis_h_i > 0) {
+                gui_ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = vis_h_i } });
                 gui_ctx.endBox();
             }
             gui_ctx.endBox();
             if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
             gui_ctx.endFrame();
+            app.syncCanvasRect();
             if (!app.native_menu_active) {
                 const menu_res = gui.menuBarPopup(&gui_ctx, app.menuCommandsSlice(), &app.menu_bar_state);
                 if (menu_res.selected) |id| app.dispatchCommand(id);
@@ -2539,6 +2668,13 @@ pub fn main(init: std.process.Init) !void {
         maybeBroadcastPatternState(&app);
         platform.frameDelay(16_000_000);
     }
+    // panel/slot 状態を Preferences へ保存（終了時）。
+    persistPanelPrefs(&app);
+    if (app.prefs_dir) |*dir| {
+        dir.close(app.io);
+        app.prefs_dir = null;
+    }
+    app.prefs.deinit();
     std.debug.print("apps/patch: done.\n", .{});
 }
 
@@ -4196,6 +4332,15 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 fn registerPatchActions(app: *App) void {
     platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode, .network_policy = patchPolicy("select_node") });
     platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam, .network_policy = patchPolicy("observe_param") });
+    // TASK-149.1: panel visible トグル（local_only。recipe/CommandLog には載せない）。
+    platform.registerAction(.{
+        .name = "panel_toggle",
+        .ctx = app,
+        .run = actionPanelToggle,
+        .network_policy = .local_only,
+        .args = &.{.{ .name = "name", .kind = "string" }},
+        .desc = "toggle panel visible (transport|inspector)",
+    });
     platform.registerAction(.{
         .name = "add_node",
         .ctx = app,
@@ -4496,13 +4641,137 @@ fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
 
 fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
-    return std.fmt.bufPrint(buf, "transport_open={d} inspector_open={d} transport_state={s} inspector_state={s} canvas_w={d}", .{
-        @intFromBool(app.transport_open),
-        @intFromBool(app.inspector_open),
-        @tagName(app.transportState()),
-        @tagName(app.inspectorState()),
+    const host = app.panel_host;
+    // 新キーに加え、TASK-123/125 互換の transport_state/inspector_state を併記（フィールド追加のみ）。
+    return std.fmt.bufPrint(buf, "transport_visible={d} inspector_visible={d} transport_open={d} inspector_open={d} transport_state={s} inspector_state={s} panels_hidden={d} right_extent={d} bottom_extent={d} center_x={d} center_y={d} center_w={d} center_h={d} canvas_w={d} canvas_h={d}", .{
+        @intFromBool(app.panelVisible("Transport")),
+        @intFromBool(app.panelVisible("Inspector")),
+        @intFromBool(app.panelOpen("Transport")),
+        @intFromBool(app.panelOpen("Inspector")),
+        app.panelStateName("Transport"),
+        app.panelStateName("Inspector"),
+        @intFromBool(app.panels_hidden),
+        host.slotExtent(.right),
+        host.slotExtent(.bottom),
+        @as(i32, @intFromFloat(app.canvas_rect.x)),
+        @as(i32, @intFromFloat(app.canvas_rect.y)),
+        @as(i32, @intFromFloat(app.canvas_rect.w)),
+        @as(i32, @intFromFloat(app.canvas_rect.h)),
         @as(i32, @intFromFloat(app.canvasW())),
+        @as(i32, @intFromFloat(app.canvasH())),
     }) catch return buf[0..0];
+}
+
+// ── PanelHost body callbacks + Preferences adapter（TASK-149.1）────────────
+
+fn buildTransportPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    const model = transportModel(app);
+    transport.drawBody(ctx, &model, app.transportBodyAvail(), app, displayTransportValue, app, transportParamChanged, transportMuteChanged);
+}
+
+fn buildInspectorPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    const selected: ?modular.dyn.Handle = if (app.selected) |item| switch (item) {
+        .node => |h| h,
+        else => null,
+    } else null;
+    inspector.drawBody(
+        ctx,
+        app.dyn,
+        selected,
+        app.inspectorBodyAvail(),
+        app,
+        snapshotParamCallback,
+        app,
+        displayInspectorValue,
+        app,
+        inspectorChanged,
+    );
+}
+
+fn formatPersistKey(buf: []u8, key: gui.PersistKey) []const u8 {
+    return switch (key) {
+        .slot => |s| std.fmt.bufPrint(buf, "slot.{s}.{s}", .{ @tagName(s.slot), @tagName(s.field) }) catch "",
+        .panel => |p| std.fmt.bufPrint(buf, "panel.{s}.{s}", .{ p.name, @tagName(p.field) }) catch "",
+    };
+}
+
+fn panelPrefsRead(ud: *anyopaque, key: gui.PersistKey) ?gui.PersistValue {
+    const app: *App = @ptrCast(@alignCast(ud));
+    var key_buf: [96]u8 = undefined;
+    const k = formatPersistKey(&key_buf, key);
+    if (k.len == 0) return null;
+    return switch (key) {
+        .slot => |s| switch (s.field) {
+            .visible => if (app.prefs.getBool(k)) |v| .{ .boolean = v } else null,
+            .extent => if (app.prefs.getI64(k)) |v| .{ .integer = v } else null,
+        },
+        .panel => |p| switch (p.field) {
+            .visible, .open => if (app.prefs.getBool(k)) |v| .{ .boolean = v } else null,
+        },
+    };
+}
+
+fn panelPrefsWrite(ud: *anyopaque, key: gui.PersistKey, value: gui.PersistValue) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ud));
+    var key_buf: [96]u8 = undefined;
+    const k = formatPersistKey(&key_buf, key);
+    if (k.len == 0) return;
+    switch (value) {
+        .boolean => |v| try app.prefs.setBool(k, v),
+        .integer => |v| try app.prefs.setI64(k, v),
+    }
+}
+
+fn panelPersistence(app: *App) gui.Persistence {
+    return .{
+        .user_data = app,
+        .read = panelPrefsRead,
+        .write = panelPrefsWrite,
+    };
+}
+
+fn persistPanelPrefs(app: *App) void {
+    const dir = app.prefs_dir orelse return;
+    // H 全 hide は slot の一時 override。persist 前に pre-hide 値へ戻し、終了後に再適用する。
+    const was_hidden = app.panels_hidden;
+    if (was_hidden) {
+        app.panel_host.setSlotVisible(.right, app.pre_hide_right_visible);
+        app.panel_host.setSlotVisible(.bottom, app.pre_hide_bottom_visible);
+    }
+    app.panel_host.persist(panelPersistence(app)) catch |err| {
+        std.debug.print("apps/patch: panel persist failed: {s}\n", .{@errorName(err)});
+        if (was_hidden) {
+            app.panel_host.setSlotVisible(.right, false);
+            app.panel_host.setSlotVisible(.bottom, false);
+        }
+        return;
+    };
+    if (was_hidden) {
+        app.panel_host.setSlotVisible(.right, false);
+        app.panel_host.setSlotVisible(.bottom, false);
+    }
+    app.prefs.save(app.io, dir, "preferences.ash") catch |err| {
+        std.debug.print("apps/patch: preferences save failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    app.prefs_dirty = false;
+}
+
+fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const name_raw = std.mem.trim(u8, args, " \t");
+    // harness は小文字名（transport / inspector）。PanelHost name は PascalCase。
+    const panel_name: []const u8 = blk: {
+        if (std.mem.eql(u8, name_raw, "transport") or std.mem.eql(u8, name_raw, "Transport")) break :blk "Transport";
+        if (std.mem.eql(u8, name_raw, "inspector") or std.mem.eql(u8, name_raw, "Inspector")) break :blk "Inspector";
+        return error.InvalidArgument;
+    };
+    if (!app.togglePanelByName(panel_name)) return error.InvalidArgument;
+    if (app.prefs_dirty) persistPanelPrefs(app);
+    const visible = app.panelVisible(panel_name);
+    return std.fmt.bufPrint(buf, "ok panel_toggle {s}={d}", .{ name_raw, @intFromBool(visible) }) catch error.BufferTooSmall;
 }
 
 fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
