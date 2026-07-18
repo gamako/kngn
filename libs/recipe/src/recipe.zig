@@ -347,6 +347,57 @@ test "file I/O: save→load 往復" {
     try testing.expectEqualStrings("42", loaded.entries[0].args);
 }
 
+test "duplicate HEAD → DuplicateHeader" {
+    const gpa = testing.allocator;
+    var w = try serde.Writer.init(gpa, magic, format_version);
+    defer w.deinit();
+    try w.addChunk(TAG_HEAD, "pixie");
+    try w.addChunk(TAG_HEAD, "modular");
+    const bytes = try w.finish();
+    defer gpa.free(bytes);
+    try testing.expectError(error.DuplicateHeader, decode(gpa, bytes));
+}
+
+test "corrupt ENTR payload → CorruptEntry" {
+    const gpa = testing.allocator;
+
+    // payload 全体が短すぎる
+    {
+        var w = try serde.Writer.init(gpa, magic, format_version);
+        defer w.deinit();
+        try w.addChunk(TAG_HEAD, "pixie");
+        const entr = [_]u8{ 5, 'c' };
+        try w.addChunk(TAG_ENTR, &entr);
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        try testing.expectError(error.CorruptEntry, decode(gpa, bytes));
+    }
+
+    // name_len と実 payload 長が不一致
+    {
+        var w = try serde.Writer.init(gpa, magic, format_version);
+        defer w.deinit();
+        try w.addChunk(TAG_HEAD, "pixie");
+        const entr = [_]u8{ 10, 'c', 'l', 'e', 'a', 'r', 0, 0 };
+        try w.addChunk(TAG_ENTR, &entr);
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        try testing.expectError(error.CorruptEntry, decode(gpa, bytes));
+    }
+
+    // args_len と実 payload 長が不一致
+    {
+        var w = try serde.Writer.init(gpa, magic, format_version);
+        defer w.deinit();
+        try w.addChunk(TAG_HEAD, "pixie");
+        const entr = [_]u8{ 5, 'c', 'l', 'e', 'a', 'r', 10, 0 };
+        try w.addChunk(TAG_ENTR, &entr);
+        const bytes = try w.finish();
+        defer gpa.free(bytes);
+        try testing.expectError(error.CorruptEntry, decode(gpa, bytes));
+    }
+}
+
 test "HEAD が先頭でない / 欠落 → MissingHeader" {
     const gpa = testing.allocator;
 

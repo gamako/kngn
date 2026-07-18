@@ -3642,6 +3642,14 @@ fn patchPolicy(comptime name: []const u8) platform.NetworkPolicy {
     return toPlatformPolicy(tag);
 }
 
+/// graph relay action の CommandLog 記録ラッパー（TASK-106.2/106.3）。
+///
+/// 保存契約: `platform.routeAction` の canonicalize 後 args（NodeId は `#<id>` 形式）が
+/// `CommandRecord.args` にそのまま入る。`recordedGraphAction` 内で再 canonicalize はしない
+/// （remote COMMIT は host 側 canonicalize 済み wire args を受け取るため）。
+///
+/// fresh replay 前提: NodeId 採番は起動時 active handle 昇順の初期割当と、publish 成功後の
+/// 単調増分（削除後も再利用なし）により、同じ操作列なら同じ `#id` が再現される。
 fn recordedGraphAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
     return &struct {
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
