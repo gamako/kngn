@@ -22,6 +22,8 @@
 
 const std = @import("std");
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 pub const EyedropperInput = struct {
     picking: bool = false,
@@ -29,7 +31,7 @@ pub const EyedropperInput = struct {
     /// 1 フレーム分の入力スナップショット（canvas_input.Frame と同型）。
     pub const Frame = struct {
         canvas_rect: ?core.Rect,
-        zoom: i32,
+        zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         pressed_left: bool, // gate 済み（canvas area 内・widget 非 active 時のみ true）
@@ -40,7 +42,7 @@ pub const EyedropperInput = struct {
     pub fn update(self: *EyedropperInput, frame: Frame) ?core.Vec2 {
         if (!self.picking) {
             if (frame.canvas_rect) |rect| {
-                if (frame.pressed_left and displayContains(rect, frame.zoom, frame.mouse_pressed_pos)) {
+                if (frame.pressed_left and zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos)) {
                     self.picking = true;
                 }
             }
@@ -48,15 +50,9 @@ pub const EyedropperInput = struct {
         if (!self.picking) return null;
         if (frame.released_left) self.picking = false;
         const rect = frame.canvas_rect orelse return null;
-        return core.screenToCanvas(frame.mouse_pos, rect, frame.zoom);
+        return zoom_mod.screenToCanvas(frame.mouse_pos, rect, frame.zoom);
     }
 };
-
-/// window 座標が canvas 表示領域（zoom 倍後）内か（canvas_input.zig の displayContains と同型）。
-fn displayContains(rect: core.Rect, zoom: i32, p: core.Vec2) bool {
-    return p.x >= rect.x and p.y >= rect.y and
-        p.x < rect.x + rect.w * zoom and p.y < rect.y + rect.h * zoom;
-}
 
 // ============================================================
 // Tests
@@ -68,7 +64,7 @@ test "EyedropperInput: canvas 内 press で picking 開始し座標を返す" {
     var ei: EyedropperInput = .{};
     const cp = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 3, .y = 4 },
         .mouse_pressed_pos = .{ .x = 3, .y = 4 },
         .pressed_left = true,
@@ -82,7 +78,7 @@ test "EyedropperInput: 表示領域外の press では picking を開始しな�
     var ei: EyedropperInput = .{};
     const cp = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 100 },
         .mouse_pressed_pos = .{ .x = 100, .y = 100 },
         .pressed_left = true,
@@ -96,7 +92,7 @@ test "EyedropperInput: held 中は move 追従で毎フレーム座標を返す"
     var ei: EyedropperInput = .{};
     _ = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .pressed_left = true,
@@ -104,7 +100,7 @@ test "EyedropperInput: held 中は move 追従で毎フレーム座標を返す"
     });
     const cp = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 5, .y = 6 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .pressed_left = false,
@@ -118,7 +114,7 @@ test "EyedropperInput: canvas 外への drag は null を返すが picking は�
     var ei: EyedropperInput = .{};
     _ = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 2, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
         .pressed_left = true,
@@ -127,7 +123,7 @@ test "EyedropperInput: canvas 外への drag は null を返すが picking は�
     // canvas 外へドラッグ（move）→ 座標は null だが picking は継続
     const outside = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
         .pressed_left = false,
@@ -138,7 +134,7 @@ test "EyedropperInput: canvas 外への drag は null を返すが picking は�
     // canvas 外で release → 終了（座標は null）
     const released = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = -50 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
         .pressed_left = false,
@@ -152,7 +148,7 @@ test "EyedropperInput: canvas 内での release で座標を返しつつ picking
     var ei: EyedropperInput = .{};
     _ = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 1, .y = 1 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
         .pressed_left = true,
@@ -160,7 +156,7 @@ test "EyedropperInput: canvas 内での release で座標を返しつつ picking
     });
     const cp = ei.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 9, .y = 9 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
         .pressed_left = false,
@@ -174,7 +170,7 @@ test "EyedropperInput: canvas_rect 未確定（初回フレーム）では picki
     var ei: EyedropperInput = .{};
     const cp = ei.update(.{
         .canvas_rect = null,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 1, .y = 1 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
         .pressed_left = true,

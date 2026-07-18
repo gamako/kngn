@@ -7,6 +7,8 @@
 
 const gui = @import("kit").gui;
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 const DASH: i32 = 4; // dash 1 区間の長さ（screen px）
 const WHITE = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
@@ -14,23 +16,24 @@ const BLACK = gui.Color.rgba(0x00, 0x00, 0x00, 0xFF);
 
 /// 選択矩形（canvas 座標）をマーチングアンツ枠として描く。sel が null なら何もしない。
 /// canvas_rect は canvasBlitRect の戻り（rect.w/h は canvas ピクセル数）、zoom は表示倍率。
-pub fn draw(ctx: *gui.Context, sel: ?core.Rect, canvas_rect: core.Rect, zoom: i32, clip_area: gui.Rect, phase: i32) void {
+pub fn draw(ctx: *gui.Context, sel: ?core.Rect, canvas_rect: core.Rect, zoom: Zoom, clip_area: gui.Rect, phase: i32) void {
     const rect = sel orelse return;
     const dl = &ctx.draw_list;
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,
-        .w = @intCast(canvas_rect.w * zoom),
-        .h = @intCast(canvas_rect.h * zoom),
+        .w = @intCast(zoom.displayExtent(@intCast(canvas_rect.w))),
+        .h = @intCast(zoom.displayExtent(@intCast(canvas_rect.h))),
     };
     dl.pushClip(disp.intersect(clip_area)) catch @panic("selection_overlay: OOM");
     defer dl.popClip();
 
-    // selection の screen 矩形（外周）
-    const sx = canvas_rect.x + rect.x * zoom;
-    const sy = canvas_rect.y + rect.y * zoom;
-    const sw = rect.w * zoom;
-    const sh = rect.h * zoom;
+    // selection の screen 矩形（外周）。1px 未満は clamp
+    const sr = zoom_mod.canvasRectToScreen(canvas_rect, rect, zoom);
+    const sx = sr.x;
+    const sy = sr.y;
+    const sw = sr.w;
+    const sh = sr.h;
 
     dashH(dl, sx, sy, sw, phase); // 上辺
     dashH(dl, sx, sy + sh - 1, sw, phase); // 下辺

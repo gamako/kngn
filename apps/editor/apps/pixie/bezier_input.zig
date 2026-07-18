@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 pub const BezierInput = struct {
     last_click_t: f64 = -1,
@@ -16,7 +18,7 @@ pub const BezierInput = struct {
     /// 1 フレーム分の入力スナップショット（canvas_input.Frame と同型 + time）。
     pub const Frame = struct {
         canvas_rect: ?core.Rect,
-        zoom: i32,
+        zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         mouse_released_pos: core.Vec2,
@@ -39,9 +41,9 @@ pub const BezierInput = struct {
         opacity: u8,
     ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
-        editor.hit_radius = 6.0 / @as(f32, @floatFromInt(frame.zoom)); // screen 6px 相当
+        editor.hit_radius = 6.0 / frame.zoom.scaleF32(); // screen 6px 相当
 
-        if (frame.pressed_left and displayContains(rect, frame.zoom, frame.mouse_pressed_pos)) {
+        if (frame.pressed_left and zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos)) {
             const dt = frame.time - self.last_click_t;
             const dx = frame.mouse_pressed_pos.x - self.last_click.x;
             const dy = frame.mouse_pressed_pos.y - self.last_click.y;
@@ -52,7 +54,7 @@ pub const BezierInput = struct {
                 self.in_drag = false;
                 return editor.rasterizeCommit(canvas, rec, gpa, dab, color, opacity);
             }
-            const cp = core.screenToCanvasF(frame.mouse_pressed_pos, rect, frame.zoom);
+            const cp = zoom_mod.screenToCanvasF(frame.mouse_pressed_pos, rect, frame.zoom);
             editor.update(gpa, .{ .pointer_down = cp });
             editor.preview_point = null; // ドラッグ中は仮点を出さない
             self.in_drag = true;
@@ -62,31 +64,25 @@ pub const BezierInput = struct {
 
         if (self.in_drag) {
             if (frame.released_left) {
-                const released = core.screenToCanvasF(frame.mouse_released_pos, rect, frame.zoom);
+                const released = zoom_mod.screenToCanvasF(frame.mouse_released_pos, rect, frame.zoom);
                 editor.update(gpa, .{ .pointer_move = released });
                 editor.update(gpa, .{ .pointer_up = released });
                 self.in_drag = false;
             } else {
-                const cp = core.screenToCanvasF(frame.mouse_pos, rect, frame.zoom);
+                const cp = zoom_mod.screenToCanvasF(frame.mouse_pos, rect, frame.zoom);
                 editor.update(gpa, .{ .pointer_move = cp });
             }
         }
         // hover プレビュー（非ドラッグ・編集中: カーソルを次アンカーの仮点に追従。canvas 外は消す）
         if (!self.in_drag and editor.isEditing()) {
-            editor.preview_point = if (displayContains(rect, frame.zoom, frame.mouse_pos))
-                core.screenToCanvasF(frame.mouse_pos, rect, frame.zoom)
+            editor.preview_point = if (zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pos))
+                zoom_mod.screenToCanvasF(frame.mouse_pos, rect, frame.zoom)
             else
                 null;
         }
         return null;
     }
 };
-
-/// window 座標が canvas 表示領域（ZOOM 倍後）内か（canvas_input.displayContains と同一規約）。
-fn displayContains(rect: core.Rect, zoom: i32, p: core.Vec2) bool {
-    return p.x >= rect.x and p.y >= rect.y and
-        p.x < rect.x + rect.w * zoom and p.y < rect.y + rect.h * zoom;
-}
 
 // ============================================================
 // Tests
@@ -102,7 +98,7 @@ fn frameAt(x: i32, y: i32, pressed: bool, released: bool, t: f64) BezierInput.Fr
 fn frameAtSplit(px: i32, py: i32, mx: i32, my: i32, rx: i32, ry: i32, pressed: bool, released: bool, t: f64) BezierInput.Frame {
     return .{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = mx, .y = my },
         .mouse_pressed_pos = .{ .x = px, .y = py },
         .mouse_released_pos = .{ .x = rx, .y = ry },

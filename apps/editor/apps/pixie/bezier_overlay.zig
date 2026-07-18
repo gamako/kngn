@@ -8,6 +8,8 @@
 const std = @import("std");
 const gui = @import("kit").gui;
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 const CURVE_COLOR = gui.Color.rgba(0x40, 0xC0, 0xFF, 0xFF); // シアン
 const HANDLE_COLOR = gui.Color.rgba(0xFF, 0xC0, 0x40, 0xFF); // オレンジ
@@ -17,7 +19,7 @@ const SELECTED_COLOR = gui.Color.rgba(0xFF, 0xE0, 0x00, 0xFF); // 黄（選択�
 /// 編集中パスのプレビューを描く（path 空なら何もしない）。
 /// clip_area（canvas area rect）と canvas 表示矩形の交差で clip する。ズームで表示矩形が
 /// area を超えても、右ペイン/メニューへ overlay が侵食しない（TASK-39）。
-pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core.Rect, zoom: i32, clip_area: gui.Rect) void {
+pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core.Rect, zoom: Zoom, clip_area: gui.Rect) void {
     const path = &editor.path;
     if (path.anchors.items.len == 0) return;
 
@@ -25,8 +27,8 @@ pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,
-        .w = @intCast(canvas_rect.w * zoom),
-        .h = @intCast(canvas_rect.h * zoom),
+        .w = @intCast(zoom.displayExtent(@intCast(canvas_rect.w))),
+        .h = @intCast(zoom.displayExtent(@intCast(canvas_rect.h))),
     };
     dl.pushClip(disp.intersect(clip_area)) catch @panic("bezier_overlay: OOM");
     defer dl.popClip();
@@ -61,12 +63,9 @@ fn isSel(selected: ?core.PathHit, idx: usize, kind: core.path.HitKind) bool {
     return if (selected) |s| (s.idx == idx and s.kind == kind) else false;
 }
 
-fn toWin(p: core.Vec2f, rect: core.Rect, zoom: i32) gui.Vec2 {
-    const z: f32 = @floatFromInt(zoom);
-    return .{
-        .x = rect.x + @as(i32, @intFromFloat(@round(p.x * z))),
-        .y = rect.y + @as(i32, @intFromFloat(@round(p.y * z))),
-    };
+fn toWin(p: core.Vec2f, rect: core.Rect, zoom: Zoom) gui.Vec2 {
+    const s = zoom_mod.canvasPointToScreen(rect, p, zoom);
+    return .{ .x = s.x, .y = s.y };
 }
 
 fn centered(c: gui.Vec2, size: i32) gui.Rect {

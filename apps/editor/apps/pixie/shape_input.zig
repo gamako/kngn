@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 pub const ShapeKind = enum { line, rect, ellipse };
 
@@ -21,7 +23,7 @@ pub const ShapeInput = struct {
 
     pub const Frame = struct {
         canvas_rect: ?core.Rect,
-        zoom: i32,
+        zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         mouse_released_pos: core.Vec2,
@@ -41,9 +43,9 @@ pub const ShapeInput = struct {
         const rect = frame.canvas_rect orelse return null;
 
         if (self.state == .idle and frame.pressed_left and
-            displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
+            zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
         {
-            const cp = core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
+            const cp = zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
             self.anchor = cp;
             self.cur = cp;
             self.state = .dragging;
@@ -51,7 +53,7 @@ pub const ShapeInput = struct {
 
         if (self.state == .dragging) {
             const pos = if (frame.released_left) frame.mouse_released_pos else frame.mouse_pos;
-            self.cur = core.screenToCanvasRaw(pos, rect, frame.zoom);
+            self.cur = zoom_mod.screenToCanvasRaw(pos, rect, frame.zoom);
             if (frame.released_left) {
                 self.state = .idle;
                 return commitShape(self, canvas, rec, gpa, color);
@@ -103,11 +105,6 @@ pub const ShapeInput = struct {
     }
 };
 
-fn displayContains(rect: core.Rect, zoom: i32, p: core.Vec2) bool {
-    return p.x >= rect.x and p.y >= rect.y and
-        p.x < rect.x + rect.w * zoom and p.y < rect.y + rect.h * zoom;
-}
-
 // ============================================================
 // Tests
 // ============================================================
@@ -118,7 +115,7 @@ const RECT0 = core.Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
 fn mkFrame(px: i32, py: i32, mx: i32, my: i32, pressed: bool, released: bool) ShapeInput.Frame {
     return .{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = mx, .y = my },
         .mouse_pressed_pos = .{ .x = px, .y = py },
         .mouse_released_pos = .{ .x = mx, .y = my },

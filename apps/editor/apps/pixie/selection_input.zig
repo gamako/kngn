@@ -16,6 +16,8 @@
 
 const std = @import("std");
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 pub const SelectionInput = struct {
     state: State = .idle,
@@ -38,7 +40,7 @@ pub const SelectionInput = struct {
 
     pub const Frame = struct {
         canvas_rect: ?core.Rect,
-        zoom: i32,
+        zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         mouse_released_pos: core.Vec2,
@@ -78,9 +80,9 @@ pub const SelectionInput = struct {
 
         // press 起点: 未開始かつ canvas 表示領域内で押下 → marquee or moving を開始
         if (self.state == .idle and frame.pressed_left and
-            displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
+            zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
         {
-            const cp = core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
+            const cp = zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
             self.anchor = cp;
             self.cur = cp;
             const inside = if (canvas.selection) |sel| sel.contains(cp.x, cp.y) else false;
@@ -95,7 +97,7 @@ pub const SelectionInput = struct {
 
         if (self.state != .idle) {
             const pos = if (frame.released_left) frame.mouse_released_pos else frame.mouse_pos;
-            self.cur = core.screenToCanvasRaw(pos, rect, frame.zoom);
+            self.cur = zoom_mod.screenToCanvasRaw(pos, rect, frame.zoom);
             if (frame.released_left) {
                 const prev = self.state;
                 self.state = .idle;
@@ -206,12 +208,6 @@ pub const SelectionInput = struct {
     }
 };
 
-/// window 座標が canvas 表示領域（ZOOM 倍後）内か（canvas_input.displayContains と同一規約）。
-fn displayContains(rect: core.Rect, zoom: i32, p: core.Vec2) bool {
-    return p.x >= rect.x and p.y >= rect.y and
-        p.x < rect.x + rect.w * zoom and p.y < rect.y + rect.h * zoom;
-}
-
 // ============================================================
 // Tests
 // ============================================================
@@ -230,7 +226,7 @@ fn mkFrame(px: i32, py: i32, mx: i32, my: i32, pressed: bool, released: bool) Se
 fn mkFrameSplit(px: i32, py: i32, mx: i32, my: i32, rx: i32, ry: i32, pressed: bool, released: bool) SelectionInput.Frame {
     return .{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = mx, .y = my },
         .mouse_pressed_pos = .{ .x = px, .y = py },
         .mouse_released_pos = .{ .x = rx, .y = ry },

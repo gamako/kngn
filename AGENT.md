@@ -65,10 +65,11 @@ video-proto-main/
 
 > **層構成（ADR-007）**: `apps → kit → libs → core → platform` の一方向依存を build.zig の
 > モジュールグラフ（`Layer` タグ + `link()` 検査）で強制する。逆流・層飛ばし・apps の非許可直 import は
-> **build 構成時に panic で停止**する。例外は次の 3 つのみ（いずれも `linkCoreException` で明示）:
+> **build 構成時に panic で停止**する。例外は次の 4 つのみ（`linkCoreException` / `linkAppException` で明示）:
 > `harness(core/control) → png(libs/png)`（snapshot fb の PNG encode / crc32）、
 > `harness → dsp`（digest audio のスペクトル解析。TASK-92）、
-> `platform → pixelops`（wasm present の BGRA→RGBA SIMD swizzle。TASK-73.1）。
+> `platform → pixelops`（wasm present の BGRA→RGBA SIMD swizzle。TASK-73.1）、
+> `pixie(apps) → pixelops`（縮小 blit の SIMD ブレンド共有。TASK-153.2）。
 > 移行は R8 の遅延方針で、未移設ファイルは `src/` に残す。
 
 ## クイックスタート

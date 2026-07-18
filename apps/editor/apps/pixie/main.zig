@@ -27,6 +27,9 @@ const actions = @import("actions.zig");
 const icons = @import("icons.zig");
 const diff = @import("diff.zig");
 const blit = @import("blit.zig");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
+const minimap_mod = @import("minimap.zig");
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
@@ -67,10 +70,7 @@ const WINDOW_H: u32 = 600;
 /// 起動時既定キャンバスサイズ（実行時サイズは `doc.width` / `doc.height`）。
 const DEFAULT_CANVAS_W: u32 = 256;
 const DEFAULT_CANVAS_H: u32 = 256;
-// ビューポート（TASK-39）: ズームは整数倍のランタイム値。既定 2x で従来の見た目を維持。
-const ZOOM_MIN: i32 = 1;
-const ZOOM_MAX: i32 = 32;
-const ZOOM_DEFAULT: i32 = 2;
+// ビューポート（TASK-153.2）: rational Zoom（1/4..1/2 + 整数 1..32）。既定 2x。
 
 /// パンドラッグの開始入力種別（開始時に latch。Cmd が move に載らない backend でも完走させる）
 const PanKind = enum { space_left, middle, cmd_left };
@@ -518,8 +518,8 @@ const App = struct {
     /// paste/move のブロック配置方法（既定 over=透明を保持＝下の絵を残す）。右ペインのトグルで切替（TASK-44）。
     blend_mode: core.selection.Blend = .over,
     active_kind: ToolKind = .pen,
-    /// ── ビューポート（TASK-153.1）。view_zoom は整数倍、cam_cx/cy は表示領域中心が指す連続キャンバス座標 ──
-    view_zoom: i32 = ZOOM_DEFAULT,
+    /// ── ビューポート（TASK-153.1/153.2）。view_zoom は rational Zoom、cam_cx/cy は表示領域中心が指す連続キャンバス座標 ──
+    view_zoom: Zoom = Zoom.default(),
     /// キャンバス左上端基準の連続キャンバス座標（表示領域中心がこの点を指す）。初期は文書中心。
     cam_cx: f32 = @as(f32, @floatFromInt(DEFAULT_CANVAS_W)) / 2.0,
     cam_cy: f32 = @as(f32, @floatFromInt(DEFAULT_CANVAS_H)) / 2.0,
@@ -536,7 +536,10 @@ const App = struct {
     pan_anchor_cam_y: f32 = 0,
     /// KP_ADD/KP_SUBTRACT の保留ズーム段数。updateViewport がカーソル位置で zoomAround 適用する。
     pending_zoom_delta: i32 = 0,
-    /// ── ソフトオーバーレイ（ツールグリフ + ブラシ footprint 輪郭リング。TASK-75.4）──
+    /// ── ミニマップ（TASK-153.3）。編集イベント時のみサムネ再生成。ドラッグでカメラ移動 ──
+    minimap: minimap_mod.MiniMapCache = .{},
+    minimap_drag_active: bool = false,
+    /// ソフトオーバーレイ（ツールグリフ + ブラシ footprint 輪郭リング。TASK-75.4）──
     /// hover 中の生スクリーン座標（ツールバッジの錨点）。in_canvas かつ非 busy の時だけ Some
     /// （updateCursorAndHover が毎フレーム設定）。
     hover_screen: ?core.Vec2 = null,
@@ -770,19 +773,19 @@ const App = struct {
         self.active_kind = next;
     }
 
-    /// ズーム倍率を [ZOOM_MIN, ZOOM_MAX] に clamp し、カメラを文書中心へリセット（0/F 用）。
-    fn setZoomCentered(self: *App, z: i32) void {
-        self.view_zoom = std.math.clamp(z, ZOOM_MIN, ZOOM_MAX);
+    /// ズームを設定し、カメラを文書中心へリセット（0/F 用）。
+    fn setZoomCentered(self: *App, z: Zoom) void {
+        self.view_zoom = z;
         self.cam_cx = @as(f32, @floatFromInt(self.doc.width)) / 2.0;
         self.cam_cy = @as(f32, @floatFromInt(self.doc.height)) / 2.0;
     }
 
     /// 画面注視点 (fx,fy) を不動点に zoom を変更する（scroll / +/- 用）。
     /// カーソルが表示領域外なら表示中心を注視点とする。clamp は canvasBlitRect が行う。
-    fn zoomAround(self: *App, z: i32, fx: i32, fy: i32) void {
-        const new_zoom = std.math.clamp(z, ZOOM_MIN, ZOOM_MAX);
+    fn zoomAround(self: *App, z: Zoom, fx: i32, fy: i32) void {
+        const new_zoom = z;
         const old_zoom = self.view_zoom;
-        if (new_zoom == old_zoom) return;
+        if (new_zoom.eql(old_zoom)) return;
         const area = self.last_area orelse {
             self.view_zoom = new_zoom;
             return;
@@ -791,8 +794,8 @@ const App = struct {
         const in_area = fx >= area.x and fy >= area.y and fx < area.x + area.w and fy < area.y + area.h;
         const fxf: f32 = if (in_area) @floatFromInt(fx) else c.sx;
         const fyf: f32 = if (in_area) @floatFromInt(fy) else c.sy;
-        const oz: f32 = @floatFromInt(old_zoom);
-        const nz: f32 = @floatFromInt(new_zoom);
+        const oz = old_zoom.scaleF32();
+        const nz = new_zoom.scaleF32();
         const focus_cx = self.cam_cx + (fxf - c.sx) / oz;
         const focus_cy = self.cam_cy + (fyf - c.sy) / oz;
         self.cam_cx = focus_cx - (fxf - c.sx) / nz;
@@ -800,12 +803,10 @@ const App = struct {
         self.view_zoom = new_zoom;
     }
 
-    /// canvas が表示領域に収まる最大整数倍へ（Fit）。カメラは中央リセット。last_area 未確定時は無処理。
+    /// canvas が表示領域に収まる最大倍率へ（Fit。1 未満は 1/2..1/4）。カメラは中央リセット。
     fn fitZoom(self: *App) void {
         const area = self.last_area orelse return;
-        const fz_x = @divFloor(area.w, @as(i32, @intCast(self.doc.width)));
-        const fz_y = @divFloor(area.h, @as(i32, @intCast(self.doc.height)));
-        self.setZoomCentered(@min(fz_x, fz_y));
+        self.setZoomCentered(Zoom.fit(area.w, area.h, self.doc.width, self.doc.height));
     }
 
     fn setSaveMsg(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -845,6 +846,7 @@ const App = struct {
         self.host.markDirty();
         self.autosave.markDirty(platform.getTime());
         self.refreshTitle();
+        self.minimap.invalidate();
     }
 
     fn clearProjectAfterSave(self: *App) void {
@@ -900,6 +902,7 @@ const App = struct {
             self.gpa.free(b);
             self.diff_base = null;
         }
+        self.minimap.invalidate();
     }
 
     /// 内容保持リサイズ（TASK-144.1）。GUI/action の唯一の入口。
@@ -1066,7 +1069,7 @@ const App = struct {
     /// `brush_edges.refresh()`（Brush.footprint() 経由で buildDab を再実行する）が Brush ストローク中に
     /// 呼ばれることも無くなり、「footprint は down 時に latch・stroke 中不変」という既存契約を壊さない。
     fn isPointerBusy(self: *const App) bool {
-        return self.input.capturing or self.sel_in.state != .idle or self.shape_in.state != .idle or self.bez_in.in_drag or self.pan_active or self.eye_in.picking;
+        return self.input.capturing or self.sel_in.state != .idle or self.shape_in.state != .idle or self.bez_in.in_drag or self.pan_active or self.minimap_drag_active or self.eye_in.picking;
     }
 
     /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
@@ -3164,7 +3167,7 @@ const App = struct {
         } else if (k.key == .C) {
             self.doClear() catch {};
         } else if (k.key == .@"0") {
-            self.setZoomCentered(1); // 100% (1x) 中央リセット
+            self.setZoomCentered(Zoom.one()); // 100% (1x) 中央リセット
         } else if (k.key == .F) {
             self.fitZoom();
         } else if (k.key == .KP_ADD) {
@@ -3216,23 +3219,27 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     else
         std.fmt.bufPrint(buf[len..], " sel=none", .{}) catch return buf[0..len];
     len += sel_part.len;
-    // viewport 観測値（TASK-153.1）。top-level key=value。layers より前に置き trunc でも harness が拾えるようにする。
+    // viewport 観測値（TASK-153.1/153.2/153.3）。top-level key=value。layers より前に置き trunc でも harness が拾えるようにする。
+    // `zoom=` は TASK-153.1 互換キー: den==1 なら整数倍率、den>1（縮小）なら sentinel `0`。
+    // rational 詳細は zoom_num / zoom_den / zoom_pct を併記（追加のみ規約）。
     {
         const doc_w = app.doc.width;
         const doc_h = app.doc.height;
         const zoom = app.view_zoom;
+        const zoom_compat: u32 = if (zoom.den == 1) zoom.num else 0;
         if (app.last_area) |a| {
             const origin = displayOrigin(app, a);
-            const vp = std.fmt.bufPrint(buf[len..], " doc_w={d} doc_h={d} area_x={d} area_y={d} area_w={d} area_h={d} zoom={d} origin_x={d} origin_y={d} cam_cx={d:.3} cam_cy={d:.3}", .{
-                doc_w, doc_h, a.x, a.y, a.w, a.h, zoom, origin.x, origin.y, app.cam_cx, app.cam_cy,
+            const mm = minimapDigestFields(app, a);
+            const vp = std.fmt.bufPrint(buf[len..], " doc_w={d} doc_h={d} area_x={d} area_y={d} area_w={d} area_h={d} zoom={d} zoom_num={d} zoom_den={d} zoom_pct={d} origin_x={d} origin_y={d} cam_cx={d:.3} cam_cy={d:.3}{s}", .{
+                doc_w, doc_h, a.x, a.y, a.w, a.h, zoom_compat, zoom.num, zoom.den, zoom.pct(), origin.x, origin.y, app.cam_cx, app.cam_cy, mm,
             }) catch {
                 truncated = true;
                 return actions.finishDigestWithTrunc(buf, len, truncated);
             };
             len += vp.len;
         } else {
-            const vp = std.fmt.bufPrint(buf[len..], " doc_w={d} doc_h={d} zoom={d} cam_cx={d:.3} cam_cy={d:.3}", .{
-                doc_w, doc_h, zoom, app.cam_cx, app.cam_cy,
+            const vp = std.fmt.bufPrint(buf[len..], " doc_w={d} doc_h={d} zoom={d} zoom_num={d} zoom_den={d} zoom_pct={d} cam_cx={d:.3} cam_cy={d:.3} minimap=off minimap_rect=none visible_rect=none viewport_rect=none", .{
+                doc_w, doc_h, zoom_compat, zoom.num, zoom.den, zoom.pct(), app.cam_cx, app.cam_cy,
             }) catch {
                 truncated = true;
                 return actions.finishDigestWithTrunc(buf, len, truncated);
@@ -4859,11 +4866,9 @@ fn presencePeerColor(peer_id: u32) gui.Color {
 
 const PRESENCE_SUGGEST_COLOR = gui.Color.rgba(0xF5, 0x9E, 0x0B, 0xFF); // amber
 
-fn canvasToScreen(canvas_rect: core.Rect, zoom: i32, cx: i32, cy: i32) gui.Vec2 {
-    return .{
-        .x = canvas_rect.x + cx * zoom + @divTrunc(zoom, 2),
-        .y = canvas_rect.y + cy * zoom + @divTrunc(zoom, 2),
-    };
+fn canvasToScreen(canvas_rect: core.Rect, zoom: Zoom, cx: i32, cy: i32) gui.Vec2 {
+    const c = zoom_mod.canvasCellCenterToScreen(canvas_rect.x, canvas_rect.y, cx, cy, zoom);
+    return .{ .x = c.x, .y = c.y };
 }
 
 /// TASK-103 presence overlay。フレーム毎・最大 8 peer × 固定小面積。
@@ -4878,8 +4883,8 @@ fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,
-        .w = @intCast(canvas_rect.w * zoom),
-        .h = @intCast(canvas_rect.h * zoom),
+        .w = @intCast(zoom.displayExtent(@intCast(canvas_rect.w))),
+        .h = @intCast(zoom.displayExtent(@intCast(canvas_rect.h))),
     };
     const dl = &app.ctx.draw_list;
     dl.pushClip(disp.intersect(clip_area)) catch return;
@@ -4896,11 +4901,13 @@ fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
             const x1 = @max(p.hl_x0, p.hl_x1);
             const y1 = @max(p.hl_y0, p.hl_y1);
             const fill = gui.Color.rgba(col.r, col.g, col.b, 0x55);
+            const cell = core.Rect{ .x = x0, .y = y0, .w = x1 - x0 + 1, .h = y1 - y0 + 1 };
+            const sr = zoom_mod.canvasRectToScreen(canvas_rect, cell, zoom);
             const rect: gui.Rect = .{
-                .x = canvas_rect.x + x0 * zoom,
-                .y = canvas_rect.y + y0 * zoom,
-                .w = @intCast((x1 - x0 + 1) * zoom),
-                .h = @intCast((y1 - y0 + 1) * zoom),
+                .x = sr.x,
+                .y = sr.y,
+                .w = @intCast(sr.w),
+                .h = @intCast(sr.h),
             };
             dl.rectFilled(rect, fill) catch {};
             dl.rectOutline(rect, col, 2) catch {};
@@ -4908,7 +4915,7 @@ fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
 
         if (p.point_active) {
             const c = canvasToScreen(canvas_rect, zoom, p.point_x, p.point_y);
-            const arm: i32 = @max(4, zoom);
+            const arm: i32 = @max(4, @as(i32, @intFromFloat(@ceil(zoom.scaleF32()))));
             dl.line(.{ .x = c.x - arm, .y = c.y }, .{ .x = c.x + arm, .y = c.y }, col, 2) catch {};
             dl.line(.{ .x = c.x, .y = c.y - arm }, .{ .x = c.x, .y = c.y + arm }, col, 2) catch {};
             dl.rectFilled(.{ .x = c.x - 2, .y = c.y - 2, .w = 4, .h = 4 }, col) catch {};
@@ -4918,7 +4925,7 @@ fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
 
         if (p.suggest_active) {
             const c = canvasToScreen(canvas_rect, zoom, p.suggest_x, p.suggest_y);
-            const r: i32 = @max(3, zoom);
+            const r: i32 = @max(3, @as(i32, @intFromFloat(@ceil(zoom.scaleF32()))));
             dl.rectOutline(.{ .x = c.x - r, .y = c.y - r, .w = @intCast(r * 2), .h = @intCast(r * 2) }, PRESENCE_SUGGEST_COLOR, 2) catch {};
             dl.rectFilled(.{ .x = c.x - 2, .y = c.y - 2, .w = 4, .h = 4 }, PRESENCE_SUGGEST_COLOR) catch {};
             dl.text(.{ .x = c.x + 6, .y = c.y + 4 }, "suggest", PRESENCE_SUGGEST_COLOR) catch {};
@@ -4938,12 +4945,12 @@ fn areaCenterF(area: core.Rect) struct { sx: f32, sy: f32 } {
 /// origin ∈ [a - canvas*z + 1, a + area_size - 1]
 fn displayOrigin(app: *const App, area: core.Rect) struct { x: i32, y: i32 } {
     const z = app.view_zoom;
-    const zf: f32 = @floatFromInt(z);
+    const zf = z.scaleF32();
     const c = areaCenterF(area);
     var ox: i32 = @intFromFloat(@round(c.sx - app.cam_cx * zf));
     var oy: i32 = @intFromFloat(@round(c.sy - app.cam_cy * zf));
-    const vw = @as(i32, @intCast(app.doc.width)) * z;
-    const vh = @as(i32, @intCast(app.doc.height)) * z;
+    const vw = z.displayExtent(app.doc.width);
+    const vh = z.displayExtent(app.doc.height);
     ox = std.math.clamp(ox, area.x - vw + 1, area.x + area.w - 1);
     oy = std.math.clamp(oy, area.y - vh + 1, area.y + area.h - 1);
     return .{ .x = ox, .y = oy };
@@ -4951,7 +4958,7 @@ fn displayOrigin(app: *const App, area: core.Rect) struct { x: i32, y: i32 } {
 
 /// 整数表示原点から cam_cx/cy を再導出する（clamp 後の状態整合）。
 fn syncCameraFromOrigin(app: *App, area: core.Rect, ox: i32, oy: i32) void {
-    const zf: f32 = @floatFromInt(app.view_zoom);
+    const zf = app.view_zoom.scaleF32();
     const c = areaCenterF(area);
     app.cam_cx = (c.sx - @as(f32, @floatFromInt(ox))) / zf;
     app.cam_cy = (c.sy - @as(f32, @floatFromInt(oy))) / zf;
@@ -4970,6 +4977,97 @@ fn canvasBlitRect(ctx: *const gui.Context, app: *App) ?core.Rect {
     const origin = displayOrigin(app, area);
     syncCameraFromOrigin(app, area, origin.x, origin.y);
     return .{ .x = origin.x, .y = origin.y, .w = @intCast(app.doc.width), .h = @intCast(app.doc.height) };
+}
+
+/// canvas digest 用ミニマップ観測フィールド（追加のみ）。
+fn minimapDigestFields(app: *App, area: core.Rect) []const u8 {
+    // 静的バッファ（digest は同期・単一呼び出し）。1024 予算の一部。
+    const Buf = struct {
+        var bytes: [192]u8 = undefined;
+    };
+    const cw = app.doc.width;
+    const ch = app.doc.height;
+    const z = app.view_zoom;
+    const vis = minimap_mod.visibleRect(app.cam_cx, app.cam_cy, area.w, area.h, z, cw, ch);
+    const vx0: i32 = @intFromFloat(@floor(vis.x0));
+    const vy0: i32 = @intFromFloat(@floor(vis.y0));
+    const vw: i32 = @max(0, @as(i32, @intFromFloat(@ceil(vis.x1))) - vx0);
+    const vh: i32 = @max(0, @as(i32, @intFromFloat(@ceil(vis.y1))) - vy0);
+    if (!minimap_mod.shouldShow(z, cw, ch, area.w, area.h)) {
+        return std.fmt.bufPrint(&Buf.bytes, " minimap=off minimap_rect=none visible_rect={d},{d},{d},{d} viewport_rect=none", .{
+            vx0, vy0, vw, vh,
+        }) catch " minimap=off minimap_rect=none visible_rect=none viewport_rect=none";
+    }
+    const tw: u32 = if (app.minimap.width > 0) app.minimap.width else minimap_mod.thumbSize(cw, ch).w;
+    const th: u32 = if (app.minimap.height > 0) app.minimap.height else minimap_mod.thumbSize(cw, ch).h;
+    const mm = minimap_mod.layoutRect(area, tw, th);
+    const vp = minimap_mod.mapVisibleToViewport(vis, cw, ch, mm);
+    return std.fmt.bufPrint(&Buf.bytes, " minimap=on minimap_rect={d},{d},{d},{d} visible_rect={d},{d},{d},{d} viewport_rect={d},{d},{d},{d}", .{
+        mm.x, mm.y, mm.w, mm.h, vx0, vy0, vw, vh, vp.x, vp.y, vp.w, vp.h,
+    }) catch " minimap=on minimap_rect=none visible_rect=none viewport_rect=none";
+}
+
+/// 現フレームのミニマップ配置（表示条件を満たすときのみ）。
+fn currentMinimapRect(app: *const App, area: core.Rect) ?core.Rect {
+    const cw = app.doc.width;
+    const ch = app.doc.height;
+    if (!minimap_mod.shouldShow(app.view_zoom, cw, ch, area.w, area.h)) return null;
+    const tw: u32 = if (app.minimap.width > 0) app.minimap.width else minimap_mod.thumbSize(cw, ch).w;
+    const th: u32 = if (app.minimap.height > 0) app.minimap.height else minimap_mod.thumbSize(cw, ch).h;
+    return minimap_mod.layoutRect(area, tw, th);
+}
+
+/// ミニマップ click/drag → カメラ移動。updateViewport より前に呼ぶ。
+/// 戻り値 true = 入力を消費（通常 pan/stroke と排他）。
+fn updateMinimapInput(app: *App, ctx: *const gui.Context) bool {
+    const in = &ctx.input;
+    const area = app.last_area orelse {
+        app.minimap_drag_active = false;
+        return false;
+    };
+    const mm = currentMinimapRect(app, area) orelse {
+        app.minimap_drag_active = false;
+        return false;
+    };
+    const popup_open = ctx.hasOpenPopup();
+    const cw = app.doc.width;
+    const ch = app.doc.height;
+
+    if (!app.minimap_drag_active) {
+        if (!popup_open and in.mouse_pressed.left and !app.pan_active and !app.isPointerBusy()) {
+            const p = in.mouse_pressed_pos;
+            if (minimap_mod.contains(mm, p.x, p.y)) {
+                app.minimap_drag_active = true;
+                const cam = minimap_mod.screenToCameraCenter(p.x, p.y, mm, cw, ch);
+                app.cam_cx = cam.cx;
+                app.cam_cy = cam.cy;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // drag 中
+    if (in.mouse_buttons.left) {
+        const cam = minimap_mod.screenToCameraCenter(in.mouse_pos.x, in.mouse_pos.y, mm, cw, ch);
+        app.cam_cx = cam.cx;
+        app.cam_cy = cam.cy;
+        return true;
+    }
+    app.minimap_drag_active = false;
+    return false;
+}
+
+/// キャッシュ更新 + fb へミニマップ描画。
+fn drawMinimapOverlay(app: *App, fb: []u32, fb_w: u32, fb_h: u32, area: core.Rect) void {
+    const mm = currentMinimapRect(app, area) orelse return;
+    const cw = app.doc.width;
+    const ch = app.doc.height;
+    const composite = app.canvas.compositeStraight();
+    app.minimap.ensure(composite, cw, ch) catch return;
+    const vis = minimap_mod.visibleRect(app.cam_cx, app.cam_cy, area.w, area.h, app.view_zoom, cw, ch);
+    const vp = minimap_mod.mapVisibleToViewport(vis, cw, ch, mm);
+    minimap_mod.draw(fb, fb_w, fb_h, &app.minimap, mm, vp, area);
 }
 
 /// ビューポートのズーム/パン入力を処理する（endFrame 後・canvas 入力前に呼ぶ）。
@@ -4996,14 +5094,14 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
     // scroll_delta.y > 0 = 上スクロール = ズームイン（backend により符号が逆なら調整）。
     if (in_area and in.scroll_delta.y != 0 and !popup_open) {
         const step: i32 = if (in.scroll_delta.y > 0) 1 else -1;
-        app.zoomAround(app.view_zoom + step, in.mouse_pos.x, in.mouse_pos.y);
+        app.zoomAround(app.view_zoom.stepped(step), in.mouse_pos.x, in.mouse_pos.y);
     }
 
     // ── KP_ADD/KP_SUBTRACT の保留ズーム（カーソル軸。area 外なら中央）──
     if (app.pending_zoom_delta != 0 and !popup_open) {
         const delta = app.pending_zoom_delta;
         app.pending_zoom_delta = 0;
-        app.zoomAround(app.view_zoom + delta, in.mouse_pos.x, in.mouse_pos.y);
+        app.zoomAround(app.view_zoom.stepped(delta), in.mouse_pos.x, in.mouse_pos.y);
     } else if (popup_open) {
         app.pending_zoom_delta = 0;
     }
@@ -5042,7 +5140,7 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
             .cmd_left => in.mouse_buttons.left,
         };
         if (pan_held) {
-            const zf: f32 = @floatFromInt(app.view_zoom);
+            const zf = app.view_zoom.scaleF32();
             const dx = @as(f32, @floatFromInt(in.mouse_pos.x - app.pan_anchor_mouse.x));
             const dy = @as(f32, @floatFromInt(in.mouse_pos.y - app.pan_anchor_mouse.y));
             // 画面移動量を zoom で割り、カメラを逆方向へ更新
@@ -5069,7 +5167,7 @@ fn updateCursorAndHover(app: *App, window: platform.Window, ctx: *const gui.Cont
     const mouse = core.Vec2{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y };
     // 表示領域全体ではなく、カメラ由来 canvas_rect 上の画素に乗っているか（screenToCanvas 成功）で判定。
     const hover_cell = if (canvas_rect) |rect|
-        core.screenToCanvas(mouse, rect, app.view_zoom)
+        zoom_mod.screenToCanvas(mouse, rect, app.view_zoom)
     else
         null;
     const in_canvas = hover_cell != null;
@@ -5838,7 +5936,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // cursor の canvas 座標（表示領域外は "-"）。rect は前フレーム値（同期 hit-test 契約と同じ）
     const cursor_txt = blk: {
         if (canvas_rect) |rect| {
-            if (core.screenToCanvas(
+            if (zoom_mod.screenToCanvas(
                 .{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y },
                 rect,
                 app.view_zoom,
@@ -5850,7 +5948,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     };
     ctx.labelEx(cursor_txt, ctx.style.text_subtle);
     ctx.labelEx(
-        try std.fmt.allocPrint(arena, "zoom: {d}%", .{app.view_zoom * 100}),
+        try std.fmt.allocPrint(arena, "zoom: {d}%", .{app.view_zoom.pct()}),
         ctx.style.text_subtle,
     );
     ctx.labelEx(
@@ -6224,6 +6322,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     self.pen.color = self.palette.current();
     self.brush.color = self.palette.current();
     self.fill.color = self.palette.current();
+    self.minimap = minimap_mod.MiniMapCache.init(gpa);
 
     self.cmd_exec = platform.command.Executor.init(.{ .ctx = self, .run = dispatchPixieAction });
     self.cmd_exec.log = &self.cmd_log;
@@ -6272,6 +6371,7 @@ fn appDeinit(self: *App) void {
     if (self.palette_path) |p| gpa.free(p);
     if (self.clipboard) |*cb| cb.deinit(gpa);
     if (self.diff_base) |b| gpa.free(b);
+    self.minimap.deinit();
     self.size_dialog = null;
     self.size_dialog_storage.width_buf.deinit();
     self.size_dialog_storage.height_buf.deinit();
@@ -6428,10 +6528,12 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             };
         }
 
+        // ── ミニマップ入力（updateViewport より前・通常 pan/stroke と排他。TASK-153.3）──
+        const minimap_busy = if (self.size_dialog != null) false else updateMinimapInput(self, &self.ctx);
         // ── ビューポート: ホイールズーム（zoom-to-cursor）/ パン（Space+左 / middle / Cmd+左）──
         // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。
         // TASK-144.2: size_dialog 中は viewport 操作も止める。
-        const panning = if (self.size_dialog != null) false else updateViewport(self, &self.ctx);
+        const panning = if (self.size_dialog != null or minimap_busy) false else updateViewport(self, &self.ctx);
         // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
         // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果。O(1)）。
         canvas_rect = canvasBlitRect(&self.ctx, self);
@@ -6443,15 +6545,20 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         // 本来読み取りのみで実害は無いが、分岐追加のミスリスクよりシンプルさを優先し
         // 丸ごと止める設計判断。text layer 選択中は色スポイトも一時的に使えない）。
         // TASK-144.2: size_dialog != null でも同様にブロック。
-        if (!panning and !self.selectedLayerIsText() and self.size_dialog == null) {
+        if (!panning and !minimap_busy and !self.selectedLayerIsText() and self.size_dialog == null) {
             const in = &self.ctx.input;
             // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
             // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
             // pressed_left のみ落として update は通し、release を届けて完走させる（capturing 張り付き防止）。
+            // ミニマップ矩形上の press は updateMinimapInput が消費済みだが、念のためここでも除外する。
             const pressed_left_gated = in.mouse_pressed.left and gate: {
                 const p = in.mouse_pressed_pos;
                 const in_area = if (self.last_area) |a|
                     (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h)
+                else
+                    false;
+                const on_minimap = if (self.last_area) |a|
+                    if (currentMinimapRect(self, a)) |mm| minimap_mod.contains(mm, p.x, p.y) else false
                 else
                     false;
                 // active_id==0 = どの widget/splitter も press を取っていない（hover だけの wantsMouse は
@@ -6459,7 +6566,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 // !hasOpenPopup() = レイヤー右クリックメニュー（TASK-79.2）表示中は新規 stroke を
                 // 開始しない（popup は active_id を 0 のまま保つため、上の条件だけでは防げない。
                 // popup.zig の wantsMouse() が popup_state を OR しているのと同じ理由）。
-                break :gate in_area and self.ctx.state.active_id == 0 and !self.ctx.hasOpenPopup();
+                break :gate in_area and !on_minimap and self.ctx.state.active_id == 0 and !self.ctx.hasOpenPopup();
             };
             if (self.active_kind == .bezier and !self.input.capturing) {
                 const frame: bezier_input.BezierInput.Frame = .{
@@ -6555,14 +6662,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 if (canvas_rect) |rect| {
                     if (pd_opt != null) {
                         // release で確定（同一フレーム press+release は begin から。up は released_pos）
-                        if (!was_capturing) self.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
-                        self.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom));
+                        if (!was_capturing) self.uiStrokeBegin(zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
+                        self.uiStrokeAppend(zoom_mod.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom));
                     } else if (!was_capturing and self.input.capturing) {
                         // capture 開始（down=pressed_pos + 同フレーム move=mouse_pos）
-                        self.uiStrokeBegin(core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
-                        self.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
+                        self.uiStrokeBegin(zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
+                        self.uiStrokeAppend(zoom_mod.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
                     } else if (self.input.capturing) {
-                        self.uiStrokeAppend(core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
+                        self.uiStrokeAppend(zoom_mod.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
                     }
                 }
                 if (pd_opt) |pd| {
@@ -6605,12 +6712,12 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 const zoom = self.view_zoom;
                 const cw = self.doc.width;
                 const ch = self.doc.height;
-                // 表示矩形（screen px 実寸。canvasBlitRect の rect.w/h は canvas px なので zoom 倍）
+                // 表示矩形（screen px 実寸。displayExtent = ceil(canvas * num / den)）
                 const screen_rect: core.Rect = .{
                     .x = rect.x,
                     .y = rect.y,
-                    .w = @as(i32, @intCast(cw)) * zoom,
-                    .h = @as(i32, @intCast(ch)) * zoom,
+                    .w = zoom.displayExtent(cw),
+                    .h = zoom.displayExtent(ch),
                 };
                 blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
                 const base_composite = self.resolveDisplayComposite(self.gpa);
@@ -6619,7 +6726,9 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     core.onion_skin.build(&self.doc, base_composite, self.doc.selected_frame, cnt, self.onion_buf, self.onion_scratch);
                     break :blk self.onion_buf;
                 } else base_composite;
-                blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, cw, ch, rect, zoom, area);
+                blit.blitCanvasZoomZ(fb.pixels, fb.width, fb.height, display_composite, cw, ch, rect, zoom, area);
+                // ミニマップ（canvas blit 直後・他 overlay より下。TASK-153.3）
+                drawMinimapOverlay(self, fb.pixels, fb.width, fb.height, area);
             }
         }
         // TASK-103: presence overlay（canvas blit の直後・bezier/selection より下）

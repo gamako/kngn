@@ -6,6 +6,8 @@
 
 const gui = @import("kit").gui;
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 const shape_input = @import("shape_input.zig");
 
 const PREVIEW = gui.Color.rgba(0x40, 0xC0, 0xFF, 0xE0);
@@ -15,7 +17,7 @@ pub fn draw(
     ctx: *gui.Context,
     si: *const shape_input.ShapeInput,
     canvas_rect: core.Rect,
-    zoom: i32,
+    zoom: Zoom,
     clip_area: gui.Rect,
 ) void {
     const prev = si.previewPoints() orelse return;
@@ -23,8 +25,8 @@ pub fn draw(
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,
-        .w = @intCast(canvas_rect.w * zoom),
-        .h = @intCast(canvas_rect.h * zoom),
+        .w = @intCast(zoom.displayExtent(@intCast(canvas_rect.w))),
+        .h = @intCast(zoom.displayExtent(@intCast(canvas_rect.h))),
     };
     dl.pushClip(disp.intersect(clip_area)) catch @panic("shape_overlay: OOM");
     defer dl.popClip();
@@ -32,17 +34,17 @@ pub fn draw(
     const PlotCtx = struct {
         dl: *gui.DrawList,
         canvas_rect: core.Rect,
-        zoom: i32,
+        zoom: Zoom,
         fn plot(c: *anyopaque, x: i32, y: i32) void {
             const self: *@This() = @ptrCast(@alignCast(c));
-            const sx = self.canvas_rect.x + x * self.zoom;
-            const sy = self.canvas_rect.y + y * self.zoom;
-            // zoom 倍のセルを 1 矩形で塗る（輪郭プレビュー）
+            const cell = core.Rect{ .x = x, .y = y, .w = 1, .h = 1 };
+            const sr = zoom_mod.canvasRectToScreen(self.canvas_rect, cell, self.zoom);
+            // セル表示矩形（1px 未満は clamp 済み）
             self.dl.rectFilled(.{
-                .x = sx,
-                .y = sy,
-                .w = @intCast(self.zoom),
-                .h = @intCast(self.zoom),
+                .x = sr.x,
+                .y = sr.y,
+                .w = @intCast(sr.w),
+                .h = @intCast(sr.h),
             }, PREVIEW) catch @panic("shape_overlay: OOM");
         }
     };

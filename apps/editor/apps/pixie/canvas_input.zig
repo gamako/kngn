@@ -13,6 +13,8 @@
 
 const std = @import("std");
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 
 pub const CanvasInput = struct {
     capturing: bool = false,
@@ -23,7 +25,7 @@ pub const CanvasInput = struct {
     pub const Frame = struct {
         /// canvas 表示領域（rect.w/h は canvas ピクセル数）。初回フレームなど未確定なら null。
         canvas_rect: ?core.Rect,
-        zoom: i32,
+        zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         mouse_released_pos: core.Vec2,
@@ -45,23 +47,23 @@ pub const CanvasInput = struct {
 
         // press 起点 capture: 未 capture かつ canvas 表示領域内で押下 → 開始 + 始点描画
         if (!self.capturing and frame.pressed_left and
-            displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
+            zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
         {
             self.capturing = true;
             self.stroke_tool = active_tool; // latch（進行中 stroke はこの Tool で描く）
-            const cp = core.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
+            const cp = zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
             _ = self.stroke_tool.onEvent(canvas, rec, gpa, .{ .down = .{ .x = cp.x, .y = cp.y } });
         }
 
         // capturing 中は現在位置まで継続。release フレームは確定（旧 strokeTo→endStroke 相当）。
         if (self.capturing) {
             if (frame.released_left) {
-                const cp = core.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom);
+                const cp = zoom_mod.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom);
                 const cmd = self.stroke_tool.onEvent(canvas, rec, gpa, .{ .up = .{ .x = cp.x, .y = cp.y } });
                 self.capturing = false;
                 return cmd;
             }
-            const cp = core.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom);
+            const cp = zoom_mod.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom);
             _ = self.stroke_tool.onEvent(canvas, rec, gpa, .{ .move = .{ .x = cp.x, .y = cp.y } });
         }
         return null;
@@ -73,12 +75,6 @@ pub const CanvasInput = struct {
         self.capturing = false;
     }
 };
-
-/// window 座標が canvas 表示領域（ZOOM 倍後）内か（旧 main.blitRectContains 相当）。
-fn displayContains(rect: core.Rect, zoom: i32, p: core.Vec2) bool {
-    return p.x >= rect.x and p.y >= rect.y and
-        p.x < rect.x + rect.w * zoom and p.y < rect.y + rect.h * zoom;
-}
 
 // ============================================================
 // Tests
@@ -122,7 +118,7 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
     // press のみ（移動なし）。同フレームで down→move(同座標) が走る
     var cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -136,7 +132,7 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
     // release（次フレーム、同座標）→ 確定
     cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -158,7 +154,7 @@ test "canvas_input: 同フレーム down→move（押下即ドラッグ）で初
     // press 位置 (0,0)、だが同フレームで mouse は (5,0) まで動いている
     const cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 5, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -176,7 +172,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
 
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 2, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
         .mouse_released_pos = .{ .x = 2, .y = 2 },
@@ -186,7 +182,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
     // canvas 外へドラッグ（move）
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
         .mouse_released_pos = .{ .x = 2, .y = 2 },
@@ -196,7 +192,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
     // canvas 外で release → 確定
     const cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = -50 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
         .mouse_released_pos = .{ .x = 100, .y = -50 },
@@ -217,7 +213,7 @@ test "canvas_input: 表示領域外の press では capture を開始しない" 
 
     const cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 100 },
         .mouse_pressed_pos = .{ .x = 100, .y = 100 }, // rect 外
         .mouse_released_pos = .{ .x = 100, .y = 100 },
@@ -235,7 +231,7 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
     // down で Pen を latch
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -246,7 +242,7 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
     var eraser: core.Eraser = .{};
     const cmd = h.ci.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 3, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 3, .y = 0 },
@@ -266,7 +262,7 @@ test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フ
 
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -275,7 +271,7 @@ test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フ
     });
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 5, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -284,7 +280,7 @@ test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フ
     });
     const cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 50, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 10, .y = 0 },
@@ -304,7 +300,7 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
 
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -314,7 +310,7 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
     try std.testing.expect(h.ci.capturing);
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 3, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -331,7 +327,7 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
     // cancel 後の release は確定しない（capturing=false）
     const noop = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 3, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
         .mouse_released_pos = .{ .x = 3, .y = 0 },
@@ -344,7 +340,7 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
     // 新しい press で capture 再開できる
     _ = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 1, .y = 1 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
         .mouse_released_pos = .{ .x = 0, .y = 0 },
@@ -354,7 +350,7 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
     try std.testing.expect(h.ci.capturing);
     const cmd = h.update(.{
         .canvas_rect = RECT0,
-        .zoom = 1,
+        .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 1, .y = 1 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
         .mouse_released_pos = .{ .x = 1, .y = 1 },

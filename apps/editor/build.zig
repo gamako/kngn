@@ -137,6 +137,8 @@ pub fn build(b: *std.Build) void {
         },
         .extra = &.{
             .{ .name = "paint", .module = paint },
+            // apps → pixelops 例外（ルート build.zig の linkAppException と同趣旨。TASK-153.2）
+            .{ .name = "pixelops", .module = pixelops },
         },
         .link_menu = true, // TASK-97.3: pixie standalone も native メニュー opt-in
     });

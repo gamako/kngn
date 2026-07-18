@@ -75,6 +75,7 @@ fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason:
 /// app → kit 収録 lib の直 import 例外。app 内ファイルが pure-test root を兼ねる場合
 /// （apps/patch/lofi.zig の synth/dsp）に限り、テスト module を platform 非依存に保つため
 /// named 直 import を許す。kit と同一 module インスタンスなので型同一性は保たれる。
+/// 追加: apps/editor/apps/pixie → pixelops（縮小 blit SIMD。TASK-153.2）。
 fn linkAppException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .app and dep.layer == .lib);
@@ -177,6 +178,8 @@ fn buildWasmPixie(
         const root = TaggedModule{ .mod = pixie_mod, .layer = .app, .name = "pixie" };
         link(root, pm.kit);
         link(root, shared.paint);
+        // apps → pixelops の明示例外（linkAppException。ADR-007 層例外リスト 4 つ目）
+        linkAppException(root, shared.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops（縮小 blit の SIMD ブレンド共有。TASK-153.2）");
     }
 
     const exe = b.addExecutable(.{
@@ -1263,8 +1266,43 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     blit_test_mod.addImport("paint", blit_core);
+    blit_test_mod.addImport("pixelops", shared_modules.pixelops.mod);
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
+
+    // pixie zoom（TASK-153.2）。rational Zoom + 座標変換。paint 名前付き import。
+    const zoom_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    zoom_core.addImport("png", shared_modules.png.mod);
+    zoom_core.addImport("pixelops", shared_modules.pixelops.mod);
+    zoom_core.addImport("serde", shared_modules.serde.mod);
+    zoom_core.addImport("font", shared_modules.font.mod);
+    const zoom_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/zoom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zoom_test_mod.addImport("paint", zoom_core);
+    const zoom_test = b.addTest(.{ .root_module = zoom_test_mod });
+    const run_zoom_test = b.addRunArtifact(zoom_test);
+
+    // pixie minimap（TASK-153.3）。キャッシュ・写像純ロジック。
+    const minimap_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    minimap_core.addImport("png", shared_modules.png.mod);
+    minimap_core.addImport("pixelops", shared_modules.pixelops.mod);
+    minimap_core.addImport("serde", shared_modules.serde.mod);
+    minimap_core.addImport("font", shared_modules.font.mod);
+    const minimap_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/minimap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    minimap_test_mod.addImport("paint", minimap_core);
+    const minimap_test = b.addTest(.{ .root_module = minimap_test_mod });
+    const run_minimap_test = b.addRunArtifact(minimap_test);
 
     // history_thumbnail（TASK-83.2）。PixelDiff → 24×24 bbox サムネイル。paint 名前付き import。
     const history_thumbnail_core = b.createModule(.{
@@ -1379,6 +1417,8 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_eyedropper_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
+    test_core_step.dependOn(&run_zoom_test.step);
+    test_core_step.dependOn(&run_minimap_test.step);
     test_core_step.dependOn(&run_onion_skin_test.step);
     test_core_step.dependOn(&run_brush_edge_cache_test.step);
     test_core_step.dependOn(&run_actions_test.step);
@@ -2120,6 +2160,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_blit_mod.addImport("paint", bench_blit_core);
+    bench_blit_mod.addImport("pixelops", bench_pixelops_mod);
     const bench_blit_root = b.createModule(.{
         .root_source_file = b.path("bench/blit.zig"),
         .target = target,
@@ -2834,6 +2875,8 @@ fn addPixieExe(
     const root = appRoot(exe, "pixie");
     link(root, pm.kit_menu);
     link(root, common.paint);
+    // apps → pixelops の明示例外（linkAppException。ADR-007 層例外リスト 4 つ目）
+    linkAppException(root, common.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops（縮小 blit の SIMD ブレンド共有。TASK-153.2）");
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;

@@ -16,6 +16,8 @@
 
 const gui = @import("kit").gui;
 const core = @import("paint");
+const zoom_mod = @import("zoom.zig");
+const Zoom = zoom_mod.Zoom;
 const edge_cache_mod = @import("brush_edge_cache.zig");
 
 pub const EdgeCache = edge_cache_mod.EdgeCache;
@@ -58,7 +60,7 @@ pub fn drawRing(
     cache: *const EdgeCache,
     hover_cell: core.Vec2,
     canvas_rect: core.Rect,
-    zoom: i32,
+    zoom: Zoom,
     clip_area: gui.Rect,
     color_a: gui.Color,
     color_b: gui.Color,
@@ -67,21 +69,21 @@ pub fn drawRing(
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,
-        .w = @intCast(canvas_rect.w * zoom),
-        .h = @intCast(canvas_rect.h * zoom),
+        .w = @intCast(zoom.displayExtent(@intCast(canvas_rect.w))),
+        .h = @intCast(zoom.displayExtent(@intCast(canvas_rect.h))),
     };
     dl.pushClip(disp.intersect(clip_area)) catch @panic("cursor_overlay: OOM");
     defer dl.popClip();
 
-    const ox = canvas_rect.x + hover_cell.x * zoom;
-    const oy = canvas_rect.y + hover_cell.y * zoom;
-    for (cache.points()) |p| {
-        const col = if (@mod(@as(i32, p.dx) + @as(i32, p.dy), 2) == 0) color_a else color_b;
+    for (cache.points()) |pt| {
+        const col = if (@mod(@as(i32, pt.dx) + @as(i32, pt.dy), 2) == 0) color_a else color_b;
+        const cell = core.Rect{ .x = hover_cell.x + pt.dx, .y = hover_cell.y + pt.dy, .w = 1, .h = 1 };
+        const sr = zoom_mod.canvasRectToScreen(canvas_rect, cell, zoom);
         dl.rectFilled(.{
-            .x = ox + @as(i32, p.dx) * zoom,
-            .y = oy + @as(i32, p.dy) * zoom,
-            .w = @intCast(zoom),
-            .h = @intCast(zoom),
+            .x = sr.x,
+            .y = sr.y,
+            .w = @intCast(sr.w),
+            .h = @intCast(sr.h),
         }, col) catch @panic("cursor_overlay: OOM");
     }
 }
