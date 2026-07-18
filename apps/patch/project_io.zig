@@ -1,16 +1,19 @@
-//! apps/patch 統合プロジェクト直列化（TASK-105.4 / TASK-143）。
+//! apps/patch 統合プロジェクト直列化（TASK-105.4 / TASK-143 / TASK-106.2）。
 //!
-//! libs/serde の versioned container に次の chunk を載せる（magic = `VPRJ`、schema_version=1）:
+//! libs/serde の versioned container に次の chunk を載せる（magic = `VPRJ`、schema_version=2）:
 //!   - SPRM: scalar Params（既存 MPRJ フラットパッカー）
 //!   - PTRN: grid/303 pattern（PatternPayload 33B）
 //!   - SEED: base_seed + notation_seed + notation_counter（20B）
 //!   - SONG: Phrase/Chain/Song（1890B）
 //!   - NODE×N / EDGE×M: 生グラフ（既存 PTCG の 11B/6B layout）
 //!   - NPRM: per-node DSP parameter（descriptor name + scalar/choice。任意 chunk）
+//!   - NIDM: next_node_id（schema 2。TASK-106.2）
+//!   - NREF: saved_handle ↔ NodeId 対応（schema 2。TASK-106.2）
 //!   - LEDG: group.Ledger 全体（固定長）
 //!   - GENR: LofiPatch 生成 role → 保存 handle 対応（統合形式のみ）
 //!
 //! writer は VPRJ のみ。reader は VPRJ + 旧 MDLP / MPRJ / PTCG を自動判定する。
+//! schema 1（NIDM/NREF 無し）は node 出現順の決定的 fallback 採番。
 //!
 //! **ModuleKind 互換**: enum ordinal は永続化の一部。新 kind は末尾追加のみ。
 //! 並べ替え・削除・名前変更は禁止。未知 ordinal は NODE 単位で skip（PTCG 互換）。
@@ -31,7 +34,9 @@ const group = @import("group.zig");
 pub const magic: u32 = @as(u32, 'V') | (@as(u32, 'P') << 8) | (@as(u32, 'R') << 16) | (@as(u32, 'J') << 24);
 /// 旧 MPRJ magic（読込互換のみ。writer は使わない）。
 pub const mprj_magic: u32 = @as(u32, 'M') | (@as(u32, 'P') << 8) | (@as(u32, 'R') << 16) | (@as(u32, 'J') << 24);
-pub const schema_version: u16 = 1;
+/// schema 2 = NIDM/NREF（TASK-106.2）。読込は 1 も受理（fallback 採番）。
+pub const schema_version: u16 = 2;
+pub const schema_version_v1: u16 = 1;
 
 const TAG_SPRM: [4]u8 = "SPRM".*;
 const TAG_PTRN: [4]u8 = "PTRN".*;
@@ -40,6 +45,8 @@ const TAG_SONG: [4]u8 = "SONG".*;
 const TAG_NODE: [4]u8 = "NODE".*;
 const TAG_EDGE: [4]u8 = "EDGE".*;
 const TAG_NPRM: [4]u8 = "NPRM".*;
+const TAG_NIDM: [4]u8 = "NIDM".*;
+const TAG_NREF: [4]u8 = "NREF".*;
 const TAG_LEDG: [4]u8 = "LEDG".*;
 const TAG_GENR: [4]u8 = "GENR".*;
 
@@ -50,6 +57,14 @@ pub const MAX_NPRM_NODES: usize = group.GROUP_HANDLE_BASE;
 pub const MAX_PARAMS_PER_NODE: usize = 64;
 pub const VALUE_KIND_SCALAR: u8 = 0;
 pub const VALUE_KIND_CHOICE: u8 = 1;
+
+pub const NodeId = graph_io.NodeId;
+
+/// NREF の 1 エントリ（保存時 runtime handle ↔ 安定 NodeId）。
+pub const NodeIdRef = struct {
+    saved_handle: u16,
+    id: NodeId,
+};
 
 pub const FormatKind = enum { vprj, mdlp, mprj, ptcg };
 
@@ -69,8 +84,11 @@ pub const DecodeError = error{
     CorruptLedger,
     CorruptGenr,
     CorruptNprm,
+    CorruptNidm,
+    CorruptNref,
     DuplicateChunk,
     DuplicateNprmParamName,
+    DuplicateNodeId,
     UnsupportedSchemaVersion,
     UnsupportedNprmVersion,
     NonFiniteField,
@@ -817,6 +835,99 @@ comptime {
     }
 }
 
+// ── NIDM / NREF（TASK-106.2）────────────────────────────────────────────────
+
+const NIDM_SIZE: usize = 8;
+const NREF_ENTRY_SIZE: usize = 10; // handle u16 + id u64
+
+fn packNidm(next_node_id: u64, out: *[NIDM_SIZE]u8) void {
+    std.mem.writeInt(u64, out[0..8], next_node_id, .little);
+}
+
+fn unpackNidm(payload: []const u8) DecodeError!u64 {
+    if (payload.len != NIDM_SIZE) return error.CorruptNidm;
+    const next = std.mem.readInt(u64, payload[0..8], .little);
+    if (next == 0) return error.CorruptNidm;
+    return next;
+}
+
+fn nrefPayloadSize(refs: []const NodeIdRef) usize {
+    return 2 + refs.len * NREF_ENTRY_SIZE;
+}
+
+fn packNref(refs: []const NodeIdRef, out: []u8) void {
+    std.debug.assert(out.len >= nrefPayloadSize(refs));
+    std.mem.writeInt(u16, out[0..2], @intCast(refs.len), .little);
+    var off: usize = 2;
+    for (refs) |r| {
+        std.mem.writeInt(u16, out[off..][0..2], r.saved_handle, .little);
+        std.mem.writeInt(u64, out[off + 2 ..][0..8], r.id.raw(), .little);
+        off += NREF_ENTRY_SIZE;
+    }
+}
+
+fn unpackNref(gpa: std.mem.Allocator, payload: []const u8) ![]NodeIdRef {
+    if (payload.len < 2) return error.CorruptNref;
+    const count = std.mem.readInt(u16, payload[0..2], .little);
+    if (payload.len != 2 + @as(usize, count) * NREF_ENTRY_SIZE) return error.CorruptNref;
+    if (count > MAX_NPRM_NODES) return error.CorruptNref;
+    const refs = try gpa.alloc(NodeIdRef, count);
+    errdefer gpa.free(refs);
+    var off: usize = 2;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const h = std.mem.readInt(u16, payload[off..][0..2], .little);
+        const id_raw = std.mem.readInt(u64, payload[off + 2 ..][0..8], .little);
+        if (id_raw == 0) return error.CorruptNref;
+        refs[i] = .{ .saved_handle = h, .id = NodeId.fromRaw(id_raw) };
+        off += NREF_ENTRY_SIZE;
+    }
+    return refs;
+}
+
+/// NREF と nodes / next_node_id の整合を検証する。
+pub fn validateNodeIdRefs(nodes: []const NodeEntry, refs: []const NodeIdRef, next_node_id: u64) DecodeError!void {
+    if (next_node_id == 0) return error.CorruptNidm;
+    var seen_handle = [_]bool{false} ** MAX_NPRM_NODES;
+    for (nodes) |n| {
+        if (n.handle < MAX_NPRM_NODES) seen_handle[n.handle] = true;
+    }
+    var used_saved = [_]bool{false} ** MAX_NPRM_NODES;
+    var id_slots: [MAX_NPRM_NODES]u64 = [_]u64{0} ** MAX_NPRM_NODES;
+    var id_n: usize = 0;
+    var max_id: u64 = 0;
+    for (refs) |r| {
+        if (r.id.raw() == 0) return error.CorruptNref;
+        if (r.saved_handle >= MAX_NPRM_NODES or !seen_handle[r.saved_handle]) return error.CorruptNref;
+        if (used_saved[r.saved_handle]) return error.CorruptNref; // bijection: saved_handle 二重使用禁止
+        used_saved[r.saved_handle] = true;
+        var j: usize = 0;
+        while (j < id_n) : (j += 1) {
+            if (id_slots[j] == r.id.raw()) return error.DuplicateNodeId;
+        }
+        if (id_n >= MAX_NPRM_NODES) return error.CorruptNref;
+        id_slots[id_n] = r.id.raw();
+        id_n += 1;
+        if (r.id.raw() > max_id) max_id = r.id.raw();
+    }
+    // 全 node に対応する ref が必要（空グラフは refs 空で可）
+    if (refs.len != nodes.len) return error.CorruptNref;
+    if (next_node_id <= max_id) return error.CorruptNidm;
+}
+
+/// schema 1 / PTCG: node 出現順で NodeId を採番し、refs と next を返す（caller が free）。
+pub fn buildFallbackNodeIdRefs(gpa: std.mem.Allocator, nodes: []const NodeEntry) !struct { refs: []NodeIdRef, next: u64 } {
+    const refs = try gpa.alloc(NodeIdRef, nodes.len);
+    errdefer gpa.free(refs);
+    var ids_buf: [MAX_NPRM_NODES]NodeId = undefined;
+    std.debug.assert(nodes.len <= MAX_NPRM_NODES);
+    const next = graph_io.assignFallbackNodeIds(nodes, ids_buf[0..nodes.len]);
+    for (nodes, 0..) |n, i| {
+        refs[i] = .{ .saved_handle = n.handle, .id = ids_buf[i] };
+    }
+    return .{ .refs = refs, .next = next };
+}
+
 // ── encode / decode ──────────────────────────────────────────────────────────
 
 pub fn Decoded(comptime P: type) type {
@@ -829,6 +940,9 @@ pub fn Decoded(comptime P: type) type {
         nodes: []NodeEntry,
         edges: []EdgeEntry,
         node_params: []NodeParamRecord,
+        /// saved_handle → NodeId（nodes と同順とは限らない。gpa 所有）。
+        node_id_refs: []NodeIdRef,
+        next_node_id: u64,
         ledger: group.Ledger,
         genr: GenRoleHandles,
         /// 部分形式で「このフィールド群を適用すべきか」
@@ -842,6 +956,8 @@ pub fn Decoded(comptime P: type) type {
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             freeNodeParamRecords(gpa, self.node_params);
             self.node_params = &.{};
+            gpa.free(self.node_id_refs);
+            self.node_id_refs = &.{};
             gpa.free(self.nodes);
             gpa.free(self.edges);
         }
@@ -855,6 +971,8 @@ pub const EncodeInput = struct {
     nodes: []const NodeEntry,
     edges: []const EdgeEntry,
     node_params: []const NodeParamRecord = &.{},
+    node_id_refs: []const NodeIdRef = &.{},
+    next_node_id: u64 = 1,
     ledger: *const group.Ledger,
     genr: GenRoleHandles,
 };
@@ -896,6 +1014,16 @@ pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, input: Encode
     defer gpa.free(nprm_buf);
     packNprm(input.node_params, nprm_buf);
     try w.addChunk(TAG_NPRM, nprm_buf);
+
+    var nidm_buf: [NIDM_SIZE]u8 = undefined;
+    packNidm(input.next_node_id, &nidm_buf);
+    try w.addChunk(TAG_NIDM, &nidm_buf);
+
+    const nref_size = nrefPayloadSize(input.node_id_refs);
+    const nref_buf = try gpa.alloc(u8, nref_size);
+    defer gpa.free(nref_buf);
+    packNref(input.node_id_refs, nref_buf);
+    try w.addChunk(TAG_NREF, nref_buf);
 
     var lbuf: [LEDG_SIZE]u8 = undefined;
     packLedger(input.ledger, &lbuf);
@@ -944,6 +1072,8 @@ fn emptyDecoded(comptime P: type, format: FormatKind) Decoded(P) {
         .nodes = &.{},
         .edges = &.{},
         .node_params = &.{},
+        .node_id_refs = &.{},
+        .next_node_id = 1,
         .ledger = .{},
         .genr = .{},
         .apply_params_pattern = false,
@@ -958,12 +1088,15 @@ fn emptyDecoded(comptime P: type, format: FormatKind) Decoded(P) {
 fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Decoded(P) {
     const container = try serde.Container.parse(bytes, magic);
     if (container.schemaVersion() > schema_version) return error.UnsupportedSchemaVersion;
+    const file_schema = container.schemaVersion();
 
     var seen_sprm = false;
     var seen_ptrn = false;
     var seen_seed = false;
     var seen_song = false;
     var seen_nprm = false;
+    var seen_nidm = false;
+    var seen_nref = false;
     var seen_ledg = false;
     var seen_genr = false;
     var sprm: ?[]const u8 = null;
@@ -971,6 +1104,8 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
     var seed_c: ?[]const u8 = null;
     var song_c: ?[]const u8 = null;
     var nprm_c: ?[]const u8 = null;
+    var nidm_c: ?[]const u8 = null;
+    var nref_c: ?[]const u8 = null;
     var ledg_c: ?[]const u8 = null;
     var genr_c: ?[]const u8 = null;
 
@@ -1001,6 +1136,14 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
             if (seen_nprm) return error.DuplicateChunk;
             seen_nprm = true;
             nprm_c = chunk.payload;
+        } else if (std.mem.eql(u8, &chunk.tag, &TAG_NIDM)) {
+            if (seen_nidm) return error.DuplicateChunk;
+            seen_nidm = true;
+            nidm_c = chunk.payload;
+        } else if (std.mem.eql(u8, &chunk.tag, &TAG_NREF)) {
+            if (seen_nref) return error.DuplicateChunk;
+            seen_nref = true;
+            nref_c = chunk.payload;
         } else if (std.mem.eql(u8, &chunk.tag, &TAG_LEDG)) {
             if (seen_ledg) return error.DuplicateChunk;
             seen_ledg = true;
@@ -1044,6 +1187,28 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
     }
     errdefer freeNodeParamRecords(gpa, node_params);
 
+    var node_id_refs: []NodeIdRef = &.{};
+    var next_node_id: u64 = 1;
+    errdefer if (node_id_refs.len > 0) gpa.free(node_id_refs);
+    if (nidm_c != null or nref_c != null) {
+        // 片方だけは不正
+        const nidm_payload = nidm_c orelse return error.CorruptNidm;
+        const nref_payload = nref_c orelse return error.CorruptNref;
+        next_node_id = try unpackNidm(nidm_payload);
+        node_id_refs = try unpackNref(gpa, nref_payload);
+        try validateNodeIdRefs(owned_nodes, node_id_refs, next_node_id);
+    } else if (file_schema >= schema_version) {
+        // schema 2+ で NIDM/NREF 欠落は空グラフのみ許容
+        if (owned_nodes.len != 0) return error.CorruptNidm;
+        next_node_id = 1;
+        node_id_refs = &.{};
+    } else {
+        // schema 1: 決定的 fallback
+        const fb = try buildFallbackNodeIdRefs(gpa, owned_nodes);
+        node_id_refs = fb.refs;
+        next_node_id = fb.next;
+    }
+
     return .{
         .format = .vprj,
         .params = try unpackFrom(P, sprm_b),
@@ -1053,6 +1218,8 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
         .nodes = owned_nodes,
         .edges = owned_edges,
         .node_params = node_params,
+        .node_id_refs = node_id_refs,
+        .next_node_id = next_node_id,
         .ledger = try unpackLedger(ledg_b),
         .genr = try unpackGenr(genr_b),
         .apply_params_pattern = true,
@@ -1109,6 +1276,9 @@ fn decodeFromPtcg(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !
     out.edges = graph.edges;
     graph.nodes = &.{};
     graph.edges = &.{};
+    const fb = try buildFallbackNodeIdRefs(gpa, out.nodes);
+    out.node_id_refs = fb.refs;
+    out.next_node_id = fb.next;
     out.apply_graph = true;
     out.apply_ledger = true; // 空 Ledger へリセット
     out.apply_genr = true; // invalidate
@@ -1157,6 +1327,19 @@ const TestParams = struct {
     idx: usize = 0,
 };
 
+const sample_nodes = [_]NodeEntry{
+    .{ .handle = 0, .kind = .vco, .x = 10, .y = 20 },
+    .{ .handle = 1, .kind = .output, .x = 100, .y = 0 },
+};
+const sample_edges = [_]EdgeEntry{
+    .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+};
+const sample_nrefs = [_]NodeIdRef{
+    .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
+    .{ .saved_handle = 1, .id = NodeId.fromRaw(2) },
+};
+var sample_ledger: group.Ledger = .{};
+
 fn sampleInput() EncodeInput {
     return .{
         .pattern = .{
@@ -1175,14 +1358,11 @@ fn sampleInput() EncodeInput {
             song.loop = true;
             break :blk song;
         },
-        .nodes = &.{
-            .{ .handle = 0, .kind = .vco, .x = 10, .y = 20 },
-            .{ .handle = 1, .kind = .output, .x = 100, .y = 0 },
-        },
-        .edges = &.{
-            .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
-        },
-        .ledger = &group.Ledger{},
+        .nodes = &sample_nodes,
+        .edges = &sample_edges,
+        .node_id_refs = &sample_nrefs,
+        .next_node_id = 3,
+        .ledger = &sample_ledger,
         .genr = blk: {
             var g: GenRoleHandles = .{};
             g.set(.clock, 0);
@@ -1230,6 +1410,9 @@ test "VPRJ encode/decode: full field round-trip" {
     try testing.expectEqual(group.MacroKind.drum_machine, got.ledger.groups[gid].kind);
     try testing.expectEqual(@as(u16, 0), got.genr.get(.clock));
     try testing.expectEqual(@as(u16, 1), got.genr.get(.output));
+    try testing.expectEqual(@as(usize, 2), got.node_id_refs.len);
+    try testing.expectEqual(input.node_id_refs[0].id, got.node_id_refs[0].id);
+    try testing.expectEqual(input.next_node_id, got.next_node_id);
 }
 
 test "VPRJ encode→decode→encode: canonical bytes bit-identical" {
@@ -1247,6 +1430,8 @@ test "VPRJ encode→decode→encode: canonical bytes bit-identical" {
         .nodes = decoded.nodes,
         .edges = decoded.edges,
         .node_params = decoded.node_params,
+        .node_id_refs = decoded.node_id_refs,
+        .next_node_id = decoded.next_node_id,
         .ledger = &decoded.ledger,
         .genr = decoded.genr,
     });
@@ -1510,6 +1695,16 @@ fn appendLedgGenr(w: *serde.Writer, input: EncodeInput) !void {
     try w.addChunk(TAG_GENR, &gbuf);
 }
 
+fn appendNidmNref(w: *serde.Writer, input: EncodeInput) !void {
+    var nidm_buf: [NIDM_SIZE]u8 = undefined;
+    packNidm(input.next_node_id, &nidm_buf);
+    try w.addChunk(TAG_NIDM, &nidm_buf);
+    var nref_buf: [2 + MAX_NPRM_NODES * NREF_ENTRY_SIZE]u8 = undefined;
+    const nref_size = nrefPayloadSize(input.node_id_refs);
+    packNref(input.node_id_refs, nref_buf[0..nref_size]);
+    try w.addChunk(TAG_NREF, nref_buf[0..nref_size]);
+}
+
 /// NPRM fixture 用: 非デフォルト寄りかつ validateParam が受理する scalar。
 /// 整数バック field では mid が分数になりうるので @trunc 候補を優先する。
 fn scalarFixtureValue(kind: graph_io.ModuleKind, name: []const u8, s: modular.ScalarDesc) f32 {
@@ -1622,6 +1817,12 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
     input.nodes = nodes.items;
     input.edges = &.{};
     input.node_params = records.items;
+    var refs_buf: [MAX_NPRM_NODES]NodeIdRef = undefined;
+    for (nodes.items, 0..) |n, i| {
+        refs_buf[i] = .{ .saved_handle = n.handle, .id = NodeId.fromRaw(@as(u64, @intCast(i)) + 1) };
+    }
+    input.node_id_refs = refs_buf[0..nodes.items.len];
+    input.next_node_id = @as(u64, @intCast(nodes.items.len)) + 1;
 
     try validateNodeParams(input.nodes, input.node_params);
 
@@ -1641,6 +1842,8 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
         .nodes = got.nodes,
         .edges = got.edges,
         .node_params = got.node_params,
+        .node_id_refs = got.node_id_refs,
+        .next_node_id = got.next_node_id,
         .ledger = &got.ledger,
         .genr = got.genr,
     });
@@ -1651,7 +1854,8 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
 test "NPRM absent: legacy VPRJ keeps apply_node_params=false" {
     const gpa = testing.allocator;
     const input = sampleInput();
-    var w = try serde.Writer.init(gpa, magic, schema_version);
+    // schema 1（NIDM/NREF 無し）= fallback 採番
+    var w = try serde.Writer.init(gpa, magic, schema_version_v1);
     defer w.deinit();
     try appendRequiredChunks(&w, input);
     // NPRM 無し
@@ -1668,6 +1872,8 @@ test "NPRM absent: legacy VPRJ keeps apply_node_params=false" {
     try testing.expectEqual(@as(usize, 1), got.edges.len);
     try testing.expect(got.apply_ledger);
     try testing.expect(got.apply_genr);
+    try testing.expectEqual(@as(u64, 1), got.node_id_refs[0].id.raw());
+    try testing.expectEqual(@as(u64, 3), got.next_node_id);
 }
 
 test "NPRM unknown name / descriptor count mismatch: decode ok, validate skips unknown" {
@@ -1685,6 +1891,8 @@ test "NPRM unknown name / descriptor count mismatch: decode ok, validate skips u
     input.nodes = &nodes;
     input.edges = &.{};
     input.node_params = &records;
+    input.node_id_refs = &.{.{ .saved_handle = 0, .id = NodeId.fromRaw(1) }};
+    input.next_node_id = 2;
     const bytes = try encode(TestParams, gpa, .{}, input);
     defer gpa.free(bytes);
     var got = try decode(TestParams, gpa, bytes);
@@ -1699,7 +1907,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
 
     // duplicate NPRM
     {
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         var nprm: [4]u8 = undefined;
@@ -1714,7 +1922,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
     }
     // unsupported version
     {
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         var nprm: [4]u8 = undefined;
@@ -1728,7 +1936,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
     }
     // short payload
     {
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         try w.addChunk(TAG_NPRM, &[_]u8{ 1, 0 }); // only 2 bytes
@@ -1744,7 +1952,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
             .{ .name = "gain", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 0.6)) },
         };
         const rec = [_]NodeParamRecord{.{ .saved_handle = 0, .params = &dup }};
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         const nprm_size = nprmPayloadSize(&rec);
@@ -1762,7 +1970,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
         const nan_bits: u32 = @bitCast(std.math.nan(f32));
         const bad = [_]NodeParam{.{ .name = "gain", .value_kind = VALUE_KIND_SCALAR, .value = nan_bits }};
         const rec = [_]NodeParamRecord{.{ .saved_handle = 0, .params = &bad }};
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         const nprm_size = nprmPayloadSize(&rec);
@@ -1780,7 +1988,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
         const inf_bits: u32 = @bitCast(std.math.inf(f32));
         const bad = [_]NodeParam{.{ .name = "gain", .value_kind = VALUE_KIND_SCALAR, .value = inf_bits }};
         const rec = [_]NodeParamRecord{.{ .saved_handle = 0, .params = &bad }};
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         const nprm_size = nprmPayloadSize(&rec);
@@ -1825,7 +2033,7 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
             .{ .saved_handle = 3, .params = &p0 },
             .{ .saved_handle = 3, .params = &p1 },
         };
-        var w = try serde.Writer.init(gpa, magic, schema_version);
+        var w = try serde.Writer.init(gpa, magic, schema_version_v1);
         defer w.deinit();
         try appendRequiredChunks(&w, input);
         const nprm_size = nprmPayloadSize(&rec);
@@ -1837,5 +2045,69 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
         const bytes = try w.finish();
         defer gpa.free(bytes);
         try testing.expectError(error.CorruptNprm, decode(TestParams, gpa, bytes));
+    }
+}
+
+test "NIDM/NREF: round-trip + corrupt duplicate/zero/unknown/next" {
+    const gpa = testing.allocator;
+    const input = sampleInput();
+    const bytes = try encode(TestParams, gpa, .{}, input);
+    defer gpa.free(bytes);
+    var got = try decode(TestParams, gpa, bytes);
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), got.node_id_refs.len);
+    try testing.expectEqual(@as(u64, 1), got.node_id_refs[0].id.raw());
+    try testing.expectEqual(@as(u64, 3), got.next_node_id);
+
+    // id=0
+    try testing.expectError(error.CorruptNref, validateNodeIdRefs(input.nodes, &.{
+        .{ .saved_handle = 0, .id = .invalid },
+        .{ .saved_handle = 1, .id = NodeId.fromRaw(2) },
+    }, 3));
+    // duplicate id
+    try testing.expectError(error.DuplicateNodeId, validateNodeIdRefs(input.nodes, &.{
+        .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
+        .{ .saved_handle = 1, .id = NodeId.fromRaw(1) },
+    }, 3));
+    // unknown handle
+    try testing.expectError(error.CorruptNref, validateNodeIdRefs(input.nodes, &.{
+        .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
+        .{ .saved_handle = 9, .id = NodeId.fromRaw(2) },
+    }, 3));
+    // duplicate saved_handle（bijection 穴）
+    try testing.expectError(error.CorruptNref, validateNodeIdRefs(input.nodes, &.{
+        .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
+        .{ .saved_handle = 0, .id = NodeId.fromRaw(2) },
+    }, 3));
+    // next <= max
+    try testing.expectError(error.CorruptNidm, validateNodeIdRefs(&sample_nodes, &sample_nrefs, 2));
+}
+
+test "NREF corrupt via decode: duplicate id / duplicate handle (leak-free)" {
+    const gpa = testing.allocator;
+
+    // duplicate NodeId
+    {
+        var input = sampleInput();
+        const bad_refs = [_]NodeIdRef{
+            .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
+            .{ .saved_handle = 1, .id = NodeId.fromRaw(1) },
+        };
+        input.node_id_refs = &bad_refs;
+        const bytes = try encode(TestParams, gpa, .{}, input);
+        defer gpa.free(bytes);
+        try testing.expectError(error.DuplicateNodeId, decode(TestParams, gpa, bytes));
+    }
+    // duplicate saved_handle
+    {
+        var input = sampleInput();
+        const bad_refs = [_]NodeIdRef{
+            .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
+            .{ .saved_handle = 0, .id = NodeId.fromRaw(2) },
+        };
+        input.node_id_refs = &bad_refs;
+        const bytes = try encode(TestParams, gpa, .{}, input);
+        defer gpa.free(bytes);
+        try testing.expectError(error.CorruptNref, decode(TestParams, gpa, bytes));
     }
 }

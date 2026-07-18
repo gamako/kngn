@@ -404,6 +404,10 @@ const App = struct {
     param_rows: [MAX_PARAM_EDITS]ParamRowSnapshot = [_]ParamRowSnapshot{.{}} ** MAX_PARAM_EDITS,
     param_row_count: usize = 0,
 
+    // TASK-106.2: 安定 NodeId（relay/保存/digest）。runtime Handle とは分離・単調・再利用なし。
+    next_node_id: u64 = 1,
+    handle_to_id: [MAX_MODULES]?graph_io.NodeId = [_]?graph_io.NodeId{null} ** MAX_MODULES,
+
     // TASK-136: File メニュー（native NSMenu / GUI fallback）+ dialog 経由 save/load。
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
     menu_command_count: usize = 0,
@@ -1362,14 +1366,139 @@ fn updateHover(app: *App) void {
     }
 }
 
+fn routeUiAction(app: *App, name: []const u8, args: []const u8) void {
+    var buf: [512]u8 = undefined;
+    _ = routeUiActionInto(app, name, args, &buf);
+}
+
+/// `out_buf` に応答を書き、その slice を返す（失敗時 null。`proposed` / `ok id=#N` 等）。
+fn routeUiActionInto(app: *App, name: []const u8, args: []const u8, out_buf: []u8) ?[]const u8 {
+    _ = app;
+    return platform.routeAction(name, args, out_buf) catch |err| {
+        std.debug.print("patch: routeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+        return null;
+    };
+}
+
+/// `ok id=#N` 応答なら NodeId → handle を解決して selected を設定（client の `proposed` は無視）。
+fn selectNodeFromOkIdResponse(app: *App, resp: []const u8) void {
+    const prefix = "ok id=#";
+    if (!std.mem.startsWith(u8, resp, prefix)) return;
+    var end: usize = 0;
+    const digits = resp[prefix.len..];
+    while (end < digits.len and digits[end] >= '0' and digits[end] <= '9') : (end += 1) {}
+    if (end == 0) return;
+    const id_raw = std.fmt.parseUnsigned(u64, digits[0..end], 10) catch return;
+    if (handleOfNodeId(app, NodeId.fromRaw(id_raw))) |h| {
+        app.selected = .{ .node = h };
+    }
+}
+
+/// パレット index → add_node / add_macro action（world 座標付き）。
+fn routePaletteAdd(app: *App, ki: u8) void {
+    const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
+    const cx: f32 = app.canvasW() * 0.45 + casc * 18;
+    const cy: f32 = @as(f32, @floatFromInt(app.fb_h)) * 0.4 + casc * 18;
+    if (ki >= PALETTE.len) return;
+    var resp_buf: [512]u8 = undefined;
+    switch (PALETTE[ki]) {
+        .primitive => |kind| {
+            const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
+            var args_buf: [128]u8 = undefined;
+            const args = std.fmt.bufPrint(&args_buf, "{s} {d} {d}", .{ @tagName(kind), pos.x, pos.y }) catch return;
+            const resp = routeUiActionInto(app, "add_node", args, &resp_buf) orelse return;
+            selectNodeFromOkIdResponse(app, resp);
+        },
+        .macro_kind => |mk| {
+            // clamp 後の world を wire に載せる（peer 間で同一座標）
+            const anchor: Vec2f = .{ .x = cx, .y = cy };
+            // footprint は kind 固定 OFFSETS で概算（members 未確定のため header のみ近似）
+            const fp = switch (mk) {
+                .drum_machine => Vec2f{ .x = 450 + 80, .y = MACRO_HEADER_BAND + 120 },
+                .bass_machine => Vec2f{ .x = 450 + 80, .y = MACRO_HEADER_BAND + 120 },
+            };
+            const pos = clampMacroPos(app, anchor, fp);
+            var args_buf: [128]u8 = undefined;
+            const args = std.fmt.bufPrint(&args_buf, "{s} {d} {d}", .{ @tagName(mk), pos.x, pos.y }) catch return;
+            // solo/host: actionAddMacro 内で selected=.group を設定。client proposed は未選択のまま。
+            _ = routeUiActionInto(app, "add_macro", args, &resp_buf);
+        },
+        .step_seq_bass => {
+            const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
+            var args_buf: [128]u8 = undefined;
+            // wire トークン `step_seq_bass`（drum の `step_seq` と分離。全 peer 同一 COMMIT args）。
+            const args = std.fmt.bufPrint(&args_buf, "step_seq_bass {d} {d}", .{ pos.x, pos.y }) catch return;
+            const resp = routeUiActionInto(app, "add_node", args, &resp_buf) orelse return;
+            selectNodeFromOkIdResponse(app, resp);
+        },
+    }
+}
+
+fn onMouseUp(app: *App) void {
+    if (app.drag == .cable) {
+        const pend = app.drag.cable;
+        var node_buf: [MAX_MODULES]NodeGeom = undefined;
+        const nodes = node_buf[0..app.buildNodes(&node_buf)];
+        const mw = app.camera.screenToWorld(app.mouse);
+        if (canvas.hitTestPort(mw, nodes)) |target_raw| {
+            if (app.ledger.resolvePort(pend.origin)) |origin_real| {
+                if (app.ledger.resolvePort(target_raw)) |target_real| {
+                    routeCommitConnect(app, origin_real, target_real, pend.detach);
+                }
+            }
+        } else if (pend.detach) |d| {
+            routeDisconnect(app, d.dst_handle, d.dst_in);
+        }
+    } else if (app.drag == .node) {
+        const nd = app.drag.node;
+        const pos = app.layout[nd.handle];
+        if (nodeIdOf(app, nd.handle)) |id| {
+            var args_buf: [128]u8 = undefined;
+            const args = std.fmt.bufPrint(&args_buf, "#{d} {d} {d}", .{ id.raw(), pos.x, pos.y }) catch {
+                app.drag = .none;
+                return;
+            };
+            routeUiAction(app, "move_node", args);
+        }
+    }
+    app.drag = .none;
+}
+
+/// 接続を全事前検証してから 1 publish で確定する。drag-off の旧接続(detach)も同じ commit で処理し、
+/// 「1 操作=最大 1 publish」「無効/失敗時は既存接続を壊さない」を守る（切断を先行させない）。
+/// a/b/detach は常に実 PortRef/CableRef（呼び出し側が resolvePort 済み。合成 handle はここに来ない）。
+/// TASK-106.2: UI は routeCommitConnect → `connect` action。同等ロジックは `actionConnect` に集約。
+fn routeCommitConnect(app: *App, a: PortRef, b: PortRef, detach: ?CableRef) void {
+    const rc = canvas.resolveConnection(a, b) orelse return;
+    const src = rc.src;
+    const dst = rc.dst;
+    const src_id = nodeIdOf(app, src.handle) orelse return;
+    const dst_id = nodeIdOf(app, dst.handle) orelse return;
+    var args_buf: [192]u8 = undefined;
+    const args = blk: {
+        if (detach) |d| {
+            const did = nodeIdOf(app, d.dst_handle) orelse break :blk actions.formatConnect(&args_buf, src_id.raw(), src.index, dst_id.raw(), dst.index) catch return;
+            break :blk actions.formatConnectWithDetach(&args_buf, src_id.raw(), src.index, dst_id.raw(), dst.index, did.raw(), d.dst_in) catch return;
+        }
+        break :blk actions.formatConnect(&args_buf, src_id.raw(), src.index, dst_id.raw(), dst.index) catch return;
+    };
+    routeUiAction(app, "connect", args);
+}
+
+fn routeDisconnect(app: *App, dst_h: Handle, dst_in: u8) void {
+    const id = nodeIdOf(app, dst_h) orelse return;
+    var args_buf: [64]u8 = undefined;
+    const args = actions.formatDisconnect(&args_buf, id.raw(), dst_in) catch return;
+    routeUiAction(app, "disconnect", args);
+}
+
 fn onMouseDown(app: *App) void {
     // Transport/Inspector の mouse は GUI Context 側へ渡す。canvas の選択/drag/zoom と競合させない。
     if (app.pointInInspectorPanel() or app.pointInTransportPanel()) return;
-    // パレットは screen 座標で world hit より先に判定（追加/マクロ追加。1 操作 1 publish は
-    // addByPaletteIndex/macro.buildDrumMachine 内）。
+    // パレットは screen 座標で world hit より先に判定（TASK-106.2: action route 経由）。
     const buttons = paletteButtons(app.canvasW(), app.paletteY0());
     if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
-        addByPaletteIndex(app, ki) catch {}; // PoolFull/TooManyModules は無視（追加せず）
+        routePaletteAdd(app, ki);
         return;
     }
     // 下端の可視化帯上のクリックはキャンバス操作にしない（選択/pan/配線を開始しない）。
@@ -1449,52 +1578,6 @@ fn onMouseDown(app: *App) void {
         app.selected = null;
         app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.mouse } };
     }
-}
-
-fn onMouseUp(app: *App) void {
-    if (app.drag == .cable) {
-        const pend = app.drag.cable;
-        var node_buf: [MAX_MODULES]NodeGeom = undefined;
-        const nodes = node_buf[0..app.buildNodes(&node_buf)];
-        const mw = app.camera.screenToWorld(app.mouse);
-        if (canvas.hitTestPort(mw, nodes)) |target_raw| {
-            // origin/target は as-hit のまま保持していた可能性がある（合成 handle）ので、commitConnect の
-            // 前段で resolvePort して実 PortRef へ解決する（合成 handle を dyn/commitConnect へ渡さない）。
-            if (app.ledger.resolvePort(pend.origin)) |origin_real| {
-                if (app.ledger.resolvePort(target_raw)) |target_real| {
-                    commitConnect(app, origin_real, target_real, pend.detach);
-                }
-            }
-        } else if (pend.detach) |d| {
-            // 空きへドロップ = drag-off 切断（1 publish）。origin だけの pending は何もしない。
-            app.dyn.disconnect(d.dst_handle, d.dst_in);
-            app.dyn.publish() catch {};
-            app.refreshAllExposed();
-        }
-    }
-    app.drag = .none;
-}
-
-/// 接続を全事前検証してから 1 publish で確定する。drag-off の旧接続(detach)も同じ commit で処理し、
-/// 「1 操作=最大 1 publish」「無効/失敗時は既存接続を壊さない」を守る（切断を先行させない）。
-/// a/b/detach は常に実 PortRef/CableRef（呼び出し側が resolvePort 済み。合成 handle はここに来ない）。
-fn commitConnect(app: *App, a: PortRef, b: PortRef, detach: ?CableRef) void {
-    const rc = canvas.resolveConnection(a, b) orelse return; // 方向不正（out-out/in-in）→ 何もしない（旧接続維持）
-    const src = rc.src;
-    const dst = rc.dst;
-    // 事前検証: active / index 範囲 / 種別一致（dyn accessor は範囲外で null を返す）。落ちれば旧接続維持。
-    if (!app.dyn.slotActive(src.handle) or !app.dyn.slotActive(dst.handle)) return;
-    const sk = app.dyn.outKindOf(src.handle, src.index) orelse return;
-    const dk = app.dyn.inKindOf(dst.handle, dst.index) orelse return;
-    if (sk != dk) return; // 種別不一致は拒否（旧接続維持）
-    // 全 OK。ここから destructive: drag-off 元入力を外し（宛先と異なるとき）、宛先が既接続なら置換、connect、1 publish。
-    if (detach) |d| {
-        if (!(d.dst_handle == dst.handle and d.dst_in == dst.index)) app.dyn.disconnect(d.dst_handle, d.dst_in);
-    }
-    if (edgeForInput(app, dst.handle, dst.index) != null) app.dyn.disconnect(dst.handle, dst.index);
-    app.dyn.connect(src.handle, src.index, dst.handle, dst.index) catch {};
-    app.dyn.publish() catch {};
-    app.refreshAllExposed(); // 境界が変わりうるので expose を再導出（イベント時のみ）
 }
 
 /// マクロ展開時のメンバー相対配置（group.pos 基準の world offset）。y は展開ヘッダー（group.pos に
@@ -1617,24 +1700,19 @@ fn addByPaletteIndex(app: *App, ki: u8) !void {
                     const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
                     const h = try app.dyn.add(kind, .{});
                     app.layout[h] = pos;
-                    app.selected = .{ .node = h };
                     try app.dyn.publish();
+                    _ = allocNodeId(app, h);
+                    app.selected = .{ .node = h };
                 },
                 // macro は展開時 footprint が既定 fb に収まるよう screen anchor を clamp してから配置する。
                 .macro_kind => |mk| try addMacro(app, mk, .{ .x = cx, .y = cy }),
                 .step_seq_bass => {
                     const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
-                    const h = try app.dyn.add(.step_seq, .{
-                        .kind = .bass,
-                        .on_mask = 0,
-                        .accent_mask = 0,
-                        .slide_mask = 0,
-                        .scale = .minor_pentatonic,
-                        .octaves = 2,
-                    });
+                    const h = try app.dyn.add(.step_seq, stepSeqBassInit);
                     app.layout[h] = pos;
-                    app.selected = .{ .node = h };
                     try app.dyn.publish();
+                    _ = allocNodeId(app, h);
+                    app.selected = .{ .node = h };
                 },
             }
             return;
@@ -1680,98 +1758,147 @@ fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
         .drum_machine => {
             const h = try macro.buildDrumMachine(app.dyn); // 失敗時は何も残らない（macro.zig 側の rollback）
             const members = [_]Handle{ h.cdiv, h.seq_k, h.seq_h, h.kick, h.hat, h.mix };
+            for (members) |m| _ = allocNodeId(app, m);
             const gid = app.ledger.alloc() orelse {
                 // 台帳枯渇（MAX_GROUPS 上限。極めて稀）: 公開済みメンバーを畳んで戻す（1 publish）。
-                for (members) |m| app.dyn.removeModule(m);
+                for (members) |m| {
+                    clearNodeIdMapping(app, m);
+                    app.dyn.removeModule(m);
+                }
                 app.dyn.publish() catch {};
                 return;
             };
             const pos = clampMacroPos(app, anchor, macroFootprint(app, &members, &DRUM_OFFSETS));
-            const g = &app.ledger.groups[gid];
-            g.kind = .drum_machine;
-            g.collapsed = true;
-            g.pos = pos;
-            for (members, DRUM_OFFSETS) |m, off| {
-                app.ledger.assign(m, gid);
-                app.layout[m] = pos.add(off);
-            }
-            // テンプレ明示 expose（§3.2: clock in = cdiv.in0(gate) / audio out = mix.out0(audio)）。
-            g.exposed_in[0] = .{ .member = h.cdiv, .port = 0, .is_input = true };
-            group.setLabel(&g.exposed_in[0], "clock");
-            g.n_in = 1;
-            g.template_n_in = 1;
-            g.exposed_out[0] = .{ .member = h.mix, .port = 0, .is_input = false };
-            group.setLabel(&g.exposed_out[0], "audio");
-            g.n_out = 1;
-            g.template_n_out = 1;
-            app.selected = .{ .group = gid };
+            finishDrumMacroLedger(app, gid, h, pos, &members);
         },
         .bass_machine => {
             const h = try macro.buildBassMachine(app.dyn);
             const members = [_]Handle{ h.seq, h.vco, h.vcf, h.env, h.vca };
+            for (members) |m| _ = allocNodeId(app, m);
             const gid = app.ledger.alloc() orelse {
-                for (members) |m| app.dyn.removeModule(m);
+                for (members) |m| {
+                    clearNodeIdMapping(app, m);
+                    app.dyn.removeModule(m);
+                }
                 app.dyn.publish() catch {};
                 return;
             };
             const pos = clampMacroPos(app, anchor, macroFootprint(app, &members, &BASS_OFFSETS));
-            const g = &app.ledger.groups[gid];
-            g.kind = .bass_machine;
-            g.collapsed = true;
-            g.pos = pos;
-            for (members, BASS_OFFSETS) |m, off| {
-                app.ledger.assign(m, gid);
-                app.layout[m] = pos.add(off);
-            }
-            // テンプレ明示 expose（§3.3: clock in = seq.in0(gate) / audio out = vca.out0(audio)）。
-            g.exposed_in[0] = .{ .member = h.seq, .port = 0, .is_input = true };
-            group.setLabel(&g.exposed_in[0], "clock");
-            g.n_in = 1;
-            g.template_n_in = 1;
-            g.exposed_out[0] = .{ .member = h.vca, .port = 0, .is_input = false };
-            group.setLabel(&g.exposed_out[0], "audio");
-            g.n_out = 1;
-            g.template_n_out = 1;
-            app.selected = .{ .group = gid };
+            finishBassMacroLedger(app, gid, h, pos, &members);
         },
     }
 }
 
-/// 選択中のノード/ケーブル/グループを削除（Delete/Backspace）。
+/// wire `add_macro` 用: world 座標をそのまま group.pos に使う（clamp なし。peer 決定性のため）。
+fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f) !void {
+    switch (kind) {
+        .drum_machine => {
+            const h = try macro.buildDrumMachine(app.dyn);
+            const members = [_]Handle{ h.cdiv, h.seq_k, h.seq_h, h.kick, h.hat, h.mix };
+            for (members) |m| _ = allocNodeId(app, m);
+            const gid = app.ledger.alloc() orelse {
+                for (members) |m| {
+                    clearNodeIdMapping(app, m);
+                    app.dyn.removeModule(m);
+                }
+                app.dyn.publish() catch {};
+                platform.setActionErrorDetail("too_many_nodes", "macro ledger full");
+                return error.TooManyNodes;
+            };
+            finishDrumMacroLedger(app, gid, h, pos, &members);
+        },
+        .bass_machine => {
+            const h = try macro.buildBassMachine(app.dyn);
+            const members = [_]Handle{ h.seq, h.vco, h.vcf, h.env, h.vca };
+            for (members) |m| _ = allocNodeId(app, m);
+            const gid = app.ledger.alloc() orelse {
+                for (members) |m| {
+                    clearNodeIdMapping(app, m);
+                    app.dyn.removeModule(m);
+                }
+                app.dyn.publish() catch {};
+                platform.setActionErrorDetail("too_many_nodes", "macro ledger full");
+                return error.TooManyNodes;
+            };
+            finishBassMacroLedger(app, gid, h, pos, &members);
+        },
+    }
+}
+
+fn finishDrumMacroLedger(app: *App, gid: group.GroupId, h: macro.DrumMachineHandles, pos: Vec2f, members: *const [6]Handle) void {
+    const g = &app.ledger.groups[gid];
+    g.kind = .drum_machine;
+    g.collapsed = true;
+    g.pos = pos;
+    for (members.*, DRUM_OFFSETS) |m, off| {
+        app.ledger.assign(m, gid);
+        app.layout[m] = pos.add(off);
+    }
+    g.exposed_in[0] = .{ .member = h.cdiv, .port = 0, .is_input = true };
+    group.setLabel(&g.exposed_in[0], "clock");
+    g.n_in = 1;
+    g.template_n_in = 1;
+    g.exposed_out[0] = .{ .member = h.mix, .port = 0, .is_input = false };
+    group.setLabel(&g.exposed_out[0], "audio");
+    g.n_out = 1;
+    g.template_n_out = 1;
+    app.selected = .{ .group = gid };
+}
+
+fn finishBassMacroLedger(app: *App, gid: group.GroupId, h: macro.BassMachineHandles, pos: Vec2f, members: *const [5]Handle) void {
+    const g = &app.ledger.groups[gid];
+    g.kind = .bass_machine;
+    g.collapsed = true;
+    g.pos = pos;
+    for (members.*, BASS_OFFSETS) |m, off| {
+        app.ledger.assign(m, gid);
+        app.layout[m] = pos.add(off);
+    }
+    g.exposed_in[0] = .{ .member = h.seq, .port = 0, .is_input = true };
+    group.setLabel(&g.exposed_in[0], "clock");
+    g.n_in = 1;
+    g.template_n_in = 1;
+    g.exposed_out[0] = .{ .member = h.vca, .port = 0, .is_input = false };
+    group.setLabel(&g.exposed_out[0], "audio");
+    g.n_out = 1;
+    g.template_n_out = 1;
+    app.selected = .{ .group = gid };
+}
+
+/// 選択中のノード/ケーブル/グループを削除（Delete/Backspace）。TASK-106.2: action route 経由。
 fn deleteSelected(app: *App) void {
     if (app.selected) |it| {
         switch (it) {
             .node => |h| {
-                // 展開中グループのメンバー個別削除は先に台帳を同期する（メンバー 0 で自動消滅）。
-                purgeParamOverrides(app, h);
-                if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
-                app.dyn.removeModule(h);
-                app.dyn.publish() catch {};
-                app.refreshAllExposed();
-                app.selected = null;
-                app.hover = null;
+                const id = nodeIdOf(app, h) orelse return;
+                var args_buf: [32]u8 = undefined;
+                const args = actions.formatNodeId(&args_buf, id.raw()) catch return;
+                routeUiAction(app, "remove_node", args);
             },
             .cable => |cr| {
-                app.dyn.disconnect(cr.dst_handle, cr.dst_in);
-                app.dyn.publish() catch {};
-                app.refreshAllExposed();
-                app.selected = null;
+                routeDisconnect(app, cr.dst_handle, cr.dst_in);
             },
             .group => |gid| {
-                // グループ削除: メンバー全 removeModule + ledger.free + 1 publish（RT へは 1 回だけ反映）。
+                // remove_macro: member #id 一覧
+                var args_buf: [512]u8 = undefined;
+                var off: usize = 0;
+                var first = true;
                 var h: Handle = 0;
                 while (h < MAX_MODULES) : (h += 1) {
-                    if (app.ledger.group_of[h] != null and app.ledger.group_of[h].? == gid) {
-                        purgeParamOverrides(app, h);
-                        app.dyn.removeModule(h);
+                    if (app.ledger.group_of[h]) |g| {
+                        if (g == gid) {
+                            const id = nodeIdOf(app, h) orelse continue;
+                            const piece = if (first)
+                                std.fmt.bufPrint(args_buf[off..], "#{d}", .{id.raw()}) catch break
+                            else
+                                std.fmt.bufPrint(args_buf[off..], " #{d}", .{id.raw()}) catch break;
+                            off += piece.len;
+                            first = false;
+                        }
                     }
                 }
-                app.ledger.free(gid);
-                app.dyn.publish() catch {};
-                // 削除グループのメンバーと境界接続していた別グループの auto expose が stale に残らないよう再導出。
-                app.refreshAllExposed();
-                app.selected = null;
-                app.hover = null;
+                if (off == 0) return;
+                routeUiAction(app, "remove_macro", args_buf[0..off]);
             },
             .port => {},
         }
@@ -2083,6 +2210,8 @@ pub fn main(init: std.process.Init) !void {
         app.layout[layout_h] = .{ .x = 24 + @as(f32, @floatFromInt(col)) * 140, .y = 52 + @as(f32, @floatFromInt(row)) * 96 };
     }
     registerGeneratedMacros(&app);
+    // 初期 graph の runtime handle 昇順で決定的に NodeId を割当（TASK-106.2）。
+    assignInitialNodeIds(&app);
 
     // TASK-136: native menu（headless は false → GUI fallback）。
     app.rebuildMenuCommands();
@@ -2329,37 +2458,61 @@ fn offscreenOf(app: *const App) canvas.OffscreenCounts {
 
 fn patchDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    var node_buf: [MAX_MODULES]NodeGeom = undefined;
-    var edge_buf: [MAX_EDGES]Edge = undefined;
-    const nodes = node_buf[0..app.buildRawNodes(&node_buf)];
-    const edges = edge_buf[0..app.buildFlatEdges(&edge_buf)];
-    const oc = offscreenOf(app);
-    const view = app.dyn.currentView();
+    var sn_buf: [MAX_MODULES]graph_io.StableNode = undefined;
+    var se_buf: [MAX_EDGES]graph_io.StableEdge = undefined;
+    const topo = collectStableTopology(app, &sn_buf, &se_buf);
+    const fmt = graph_io.formatStableTopologyInto(buf, topo.nodes, topo.edges, topo.output_id);
+    return actions.finishDigestWithTrunc(buf, fmt.len, fmt.truncated);
+}
 
-    var off: usize = 0;
-    const head = std.fmt.bufPrint(buf[off..], "{{\"nodes\":[", .{}) catch return errDigest(buf);
-    off += head.len;
-    for (nodes, 0..) |n, i| {
-        const sep: []const u8 = if (i == 0) "" else ",";
-        const kn = if (app.dyn.kindOf(n.handle)) |k| @tagName(k) else "?";
-        const piece = std.fmt.bufPrint(buf[off..], "{s}{{\"h\":{d},\"kind\":\"{s}\",\"nin\":{d},\"nout\":{d}}}", .{ sep, n.handle, kn, n.n_in, n.n_out }) catch return errDigest(buf);
-        off += piece.len;
+fn collectStableTopology(
+    app: *const App,
+    sn_buf: *[MAX_MODULES]graph_io.StableNode,
+    se_buf: *[MAX_EDGES]graph_io.StableEdge,
+) struct { nodes: []graph_io.StableNode, edges: []graph_io.StableEdge, output_id: u64 } {
+    var nn: usize = 0;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) continue;
+        const id = nodeIdOf(app, h) orelse continue;
+        const pos = app.layout[h];
+        sn_buf[nn] = .{
+            .id = id,
+            .kind = app.dyn.kindOf(h).?,
+            .x = pos.x,
+            .y = pos.y,
+        };
+        nn += 1;
     }
-    const mid = std.fmt.bufPrint(buf[off..], "],\"edges\":[", .{}) catch return errDigest(buf);
-    off += mid.len;
-    for (edges, 0..) |e, i| {
-        const sep: []const u8 = if (i == 0) "" else ",";
-        const piece = std.fmt.bufPrint(buf[off..], "{s}[{d},{d},{d},{d}]", .{ sep, e.src_handle, e.src_out, e.dst_handle, e.dst_in }) catch return errDigest(buf);
-        off += piece.len;
+    var flat_buf: [MAX_EDGES]Edge = undefined;
+    const flat = flat_buf[0..app.buildFlatEdges(&flat_buf)];
+    var en: usize = 0;
+    for (flat) |e| {
+        const sid = nodeIdOf(app, e.src_handle) orelse continue;
+        const did = nodeIdOf(app, e.dst_handle) orelse continue;
+        se_buf[en] = .{ .src_id = sid, .src_out = e.src_out, .dst_id = did, .dst_in = e.dst_in };
+        en += 1;
     }
-    const tail = std.fmt.bufPrint(buf[off..], "],\"output\":{d},\"cam\":{{\"zoom\":{d:.3},\"pan\":[{d:.1},{d:.1}]}}," ++
-        "\"fb_size\":[{d},{d}],\"offscreen\":{{\"node\":{d},\"port\":{d},\"cable\":{d}}}}}", .{
-        view.output, app.camera.zoom, app.camera.pan.x, app.camera.pan.y,
-        app.fb_w,    app.fb_h,        oc.node,          oc.port,
-        oc.cable,
-    }) catch return errDigest(buf);
-    off += tail.len;
-    return buf[0..off];
+    std.mem.sort(graph_io.StableNode, sn_buf[0..nn], {}, struct {
+        fn less(_: void, a: graph_io.StableNode, b: graph_io.StableNode) bool {
+            return a.id.raw() < b.id.raw();
+        }
+    }.less);
+    std.mem.sort(graph_io.StableEdge, se_buf[0..en], {}, struct {
+        fn less(_: void, a: graph_io.StableEdge, b: graph_io.StableEdge) bool {
+            if (a.src_id.raw() != b.src_id.raw()) return a.src_id.raw() < b.src_id.raw();
+            if (a.src_out != b.src_out) return a.src_out < b.src_out;
+            if (a.dst_id.raw() != b.dst_id.raw()) return a.dst_id.raw() < b.dst_id.raw();
+            return a.dst_in < b.dst_in;
+        }
+    }.less);
+
+    const view = app.dyn.currentView();
+    const output_id: u64 = if (view.output >= 0 and view.output < MAX_MODULES)
+        if (nodeIdOf(app, @intCast(view.output))) |oid| oid.raw() else 0
+    else
+        0;
+    return .{ .nodes = sn_buf[0..nn], .edges = se_buf[0..en], .output_id = output_id };
 }
 
 fn errDigest(buf: []u8) []const u8 {
@@ -2389,28 +2542,32 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
+/// snapshot patch: digest の 1024B 制限と独立に、全 nodes/edges + layout を raw JSON で返す。
 fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
+    var sn_buf: [MAX_MODULES]graph_io.StableNode = undefined;
+    var se_buf: [MAX_EDGES]graph_io.StableEdge = undefined;
+    const topo = collectStableTopology(app, &sn_buf, &se_buf);
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    // topology 本体は `}` なしで組み立て、layout を差し込んで閉じる。
+    try graph_io.appendStableTopologyJson(&list, allocator, topo.nodes, topo.edges, topo.output_id);
+    // 末尾の `}` を落として layout を追記
+    if (list.items.len == 0 or list.items[list.items.len - 1] != '}') return error.OutOfMemory;
+    list.items.len -= 1;
+    try list.appendSlice(allocator, ",\"layout\":[");
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     const nodes = node_buf[0..app.buildRawNodes(&node_buf)];
-    // digest（1024B 以内）に layout 座標を足した詳細スナップショット。
-    var dbuf: [1024]u8 = undefined;
-    const d = patchDigest(ctx, &dbuf);
-    const body = if (d.len > 0 and d[d.len - 1] == '}') d[0 .. d.len - 1] else d;
-    var out: [2048]u8 = undefined;
-    var off: usize = 0;
-    {
-        const piece = std.fmt.bufPrint(out[off..], "{s},\"layout\":[", .{body}) catch return allocator.dupe(u8, d);
-        off += piece.len;
-    }
     for (nodes, 0..) |n, i| {
-        const sep: []const u8 = if (i == 0) "" else ",";
-        const piece = std.fmt.bufPrint(out[off..], "{s}{{\"h\":{d},\"x\":{d:.1},\"y\":{d:.1}}}", .{ sep, n.handle, n.pos.x, n.pos.y }) catch return allocator.dupe(u8, d);
-        off += piece.len;
+        if (i != 0) try list.append(allocator, ',');
+        var tmp: [96]u8 = undefined;
+        const piece = try std.fmt.bufPrint(&tmp, "{{\"h\":{d},\"x\":{d:.1},\"y\":{d:.1}}}", .{ n.handle, n.pos.x, n.pos.y });
+        try list.appendSlice(allocator, piece);
     }
-    const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch return allocator.dupe(u8, d);
-    off += tail.len;
-    return allocator.dupe(u8, out[0..off]);
+    try list.appendSlice(allocator, "]}");
+    return try list.toOwnedSlice(allocator);
 }
 
 // ============================================================================
@@ -2745,6 +2902,110 @@ fn toHandle(v: usize) error{InvalidHandle}!Handle {
     return @intCast(v);
 }
 
+const NodeId = graph_io.NodeId;
+
+fn allocNodeId(app: *App, h: Handle) NodeId {
+    std.debug.assert(h < MAX_MODULES);
+    std.debug.assert(app.handle_to_id[h] == null);
+    const raw = app.next_node_id;
+    app.next_node_id += 1;
+    const id = NodeId.fromRaw(raw);
+    app.handle_to_id[h] = id;
+    return id;
+}
+
+fn clearNodeIdMapping(app: *App, h: Handle) void {
+    if (h < MAX_MODULES) app.handle_to_id[h] = null;
+}
+
+fn clearAllNodeIdMappings(app: *App) void {
+    @memset(&app.handle_to_id, null);
+}
+
+fn nodeIdOf(app: *const App, h: Handle) ?NodeId {
+    if (h >= MAX_MODULES) return null;
+    return app.handle_to_id[h];
+}
+
+fn handleOfNodeId(app: *const App, id: NodeId) ?Handle {
+    if (id == .invalid) return null;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (app.handle_to_id[h]) |hid| {
+            if (hid == id) return h;
+        }
+    }
+    return null;
+}
+
+/// 初期 graph: active handle 昇順で決定的採番。
+fn assignInitialNodeIds(app: *App) void {
+    clearAllNodeIdMappings(app);
+    app.next_node_id = 1;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) continue;
+        _ = allocNodeId(app, h);
+    }
+}
+
+fn restoreNodeIdsFromRefs(app: *App, mapping: []const ?Handle, refs: []const project_io.NodeIdRef, next: u64) void {
+    clearAllNodeIdMappings(app);
+    var max_id: u64 = 0;
+    for (refs) |r| {
+        if (r.saved_handle >= MAX_MODULES) continue;
+        const nh = mapping[r.saved_handle] orelse continue;
+        app.handle_to_id[nh] = r.id;
+        if (r.id.raw() > max_id) max_id = r.id.raw();
+    }
+    app.next_node_id = @max(next, max_id + 1);
+    if (app.next_node_id == 0) app.next_node_id = 1;
+}
+
+/// NodeRef → runtime Handle。netsync 中の bare handle / group synthetic / stale id を拒否。
+fn resolveNodeRef(app: *const App, ref: actions.NodeRef, require_id_during_netsync: bool) !Handle {
+    if (require_id_during_netsync and actions.nodeRefRejectDuringNetsync(ref, platform.netsyncActive())) {
+        platform.setActionErrorDetail("id_required", "use #<id> from digest patch during netsync");
+        return error.IdRequired;
+    }
+    switch (ref) {
+        .id => |raw| {
+            const id = NodeId.fromRaw(raw);
+            const h = handleOfNodeId(app, id) orelse {
+                platform.setActionErrorDetail("unknown_node_id", "stale or unknown #<id>");
+                return error.UnknownNodeId;
+            };
+            if (!app.dyn.slotActive(h)) {
+                platform.setActionErrorDetail("unknown_node_id", "stale or unknown #<id>");
+                return error.UnknownNodeId;
+            }
+            return h;
+        },
+        .handle => |hv| {
+            if (hv >= group.GROUP_HANDLE_BASE) {
+                platform.setActionErrorDetail("group_handle_not_wireable", "use member #<id> not group synthetic handle");
+                return error.GroupHandleNotWireable;
+            }
+            const h = try toHandle(hv);
+            if (!app.dyn.slotActive(h)) return error.InvalidHandle;
+            return h;
+        },
+    }
+}
+
+fn nodeRefToId(app: *const App, ref: actions.NodeRef, forbid_handle: bool) !u64 {
+    if (forbid_handle and ref == .handle) {
+        platform.setActionErrorDetail("id_required", "use #<id> from digest patch during netsync");
+        return error.IdRequired;
+    }
+    const h = try resolveNodeRef(app, ref, false);
+    const id = nodeIdOf(app, h) orelse {
+        platform.setActionErrorDetail("unknown_node_id", "node has no stable id");
+        return error.UnknownNodeId;
+    };
+    return id.raw();
+}
+
 fn actionSelectNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -2768,6 +3029,17 @@ fn observedFieldForNode(app: *const App, h: Handle) ?param_view.FieldKey {
     return null;
 }
 
+/// palette / wire 共通の bass step_seq 初期値（solo `addByPaletteIndex` と同一。TASK-106.2 P1-1）。
+/// drum 版 `step_seq` は `ModuleKind` 既定（`.kind=.drum` 等の `.{}`）で palette と一致。
+const stepSeqBassInit = modular.StepSeq{
+    .kind = .bass,
+    .on_mask = 0,
+    .accent_mask = 0,
+    .slide_mask = 0,
+    .scale = .minor_pentatonic,
+    .octaves = 2,
+};
+
 /// `modular.ModuleKind` → comptime dispatch で `dyn.add(k, .{})`。`addByPaletteIndex` の
 /// `inline for` と同型の「runtime enum → comptime 呼び出し」パターン（`switch (kind) { inline else
 /// => |k| ... }` は各 tag ごとに comptime 特殊化された分岐を生成し、分岐内の `k` は comptime 値になる）。
@@ -2778,8 +3050,11 @@ fn addNodeByKind(app: *App, kind: modular.ModuleKind) !Handle {
     };
 }
 
-/// kind 名（`modular.ModuleKind` の tag 名。31種、パレットの15種より広い）→ `addNodeByKind`。
+/// kind 名（`ModuleKind` tag 名、または wire alias `step_seq_bass`）→ add。
 fn addNodeByKindName(app: *App, name: []const u8) !Handle {
+    if (std.mem.eql(u8, name, "step_seq_bass")) {
+        return app.dyn.add(.step_seq, stepSeqBassInit);
+    }
     const kind = std.meta.stringToEnum(modular.ModuleKind, name) orelse return error.UnknownKind;
     return addNodeByKind(app, kind);
 }
@@ -2788,11 +3063,12 @@ fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     const app = actionApp(ctx);
     const p = try actions.parseAddNode(args);
     const h = try addNodeByKindName(app, p.kind);
-    if (p.x) |x| {
-        if (p.y) |y| app.layout[h] = .{ .x = x, .y = y };
-    }
+    errdefer app.dyn.removeModule(h);
+    app.layout[h] = .{ .x = p.x, .y = p.y };
+    // publish 成功後にのみ NodeId を消費（失敗時は id を進めない）。
     try app.dyn.publish();
-    return std.fmt.bufPrint(buf, "handle={d}", .{h}) catch "ok";
+    const id = allocNodeId(app, h);
+    return std.fmt.bufPrint(buf, "ok id=#{d}", .{id.raw()}) catch "ok";
 }
 
 /// item が削除対象 handle `h` を参照しているか（remove 後 stale になる selected/hover の判定）。
@@ -2824,8 +3100,8 @@ fn refsHandleForRemoval(app: *const App, it: Item, h: Handle) bool {
 fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const h = try toHandle(try actions.parseUsize(args));
-    if (!app.dyn.slotActive(h)) return error.InvalidHandle;
+    const ref = try actions.parseNodeRef(args);
+    const h = try resolveNodeRef(app, ref, true);
     // 削除で stale になる selected/hover を、まだ edge が残っている削除前に判定しておく。
     const clear_selected = if (app.selected) |it| refsHandleForRemoval(app, it, h) else false;
     const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
@@ -2833,6 +3109,7 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
     purgeParamOverrides(app, h);
     app.dyn.removeModule(h);
+    clearNodeIdMapping(app, h);
     try app.dyn.publish();
     app.refreshAllExposed();
     if (clear_selected) app.selected = null;
@@ -2845,15 +3122,21 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
 fn actionConnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const p = try actions.parseFourUsize(args);
-    const src_h = try toHandle(p.a);
-    const dst_h = try toHandle(p.c);
+    const p = try actions.parseConnect(args);
+    const src_h = try resolveNodeRef(app, p.src, true);
+    const dst_h = try resolveNodeRef(app, p.dst, true);
     if (!app.dyn.slotActive(src_h) or !app.dyn.slotActive(dst_h)) return error.InvalidHandle;
-    const sk = app.dyn.outKindOf(src_h, p.b) orelse return error.InvalidPort;
-    const dk = app.dyn.inKindOf(dst_h, p.d) orelse return error.InvalidPort;
+    const sk = app.dyn.outKindOf(src_h, p.src_out) orelse return error.InvalidPort;
+    const dk = app.dyn.inKindOf(dst_h, p.dst_in) orelse return error.InvalidPort;
     if (sk != dk) return error.PortKindMismatch;
-    app.dyn.disconnect(dst_h, p.d); // 検証後の置換（宛先が既接続でも安全に上書き）
-    try app.dyn.connect(src_h, p.b, dst_h, p.d);
+    // 任意 detach（drag-off 元）を同一 COMMIT 内で処理
+    if (p.detach_dst) |dref| {
+        const din = p.detach_in orelse return error.InvalidArguments;
+        const dh = try resolveNodeRef(app, dref, true);
+        if (!(dh == dst_h and din == p.dst_in)) app.dyn.disconnect(dh, din);
+    }
+    app.dyn.disconnect(dst_h, p.dst_in); // 検証後の置換（宛先が既接続でも安全に上書き）
+    try app.dyn.connect(src_h, p.src_out, dst_h, p.dst_in);
     try app.dyn.publish();
     app.refreshAllExposed();
     return "ok";
@@ -2862,15 +3145,87 @@ fn actionConnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
 fn actionDisconnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    const p = try actions.parseTwoUsize(args);
-    const dst_h = try toHandle(p.a);
+    const p = try actions.parseDisconnect(args);
+    const dst_h = try resolveNodeRef(app, p.dst, true);
     if (!app.dyn.slotActive(dst_h)) return error.InvalidHandle;
-    // 入力 port の範囲を検証（connect と同じ fail-fast。存在しない dst_in への typo を握りつぶさない。
-    // `inKindOf` は範囲外/非 active で null を返す）。
-    if (app.dyn.inKindOf(dst_h, p.b) == null) return error.InvalidPort;
-    app.dyn.disconnect(dst_h, p.b);
+    if (app.dyn.inKindOf(dst_h, p.dst_in) == null) return error.InvalidPort;
+    app.dyn.disconnect(dst_h, p.dst_in);
     try app.dyn.publish();
     app.refreshAllExposed();
+    return "ok";
+}
+
+fn actionMoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const p = try actions.parseMoveNode(args);
+    const h = try resolveNodeRef(app, p.ref, true);
+    app.layout[h] = .{ .x = p.x, .y = p.y };
+    return "ok";
+}
+
+fn actionAddMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const p = try actions.parseAddMacro(args);
+    const mk = std.meta.stringToEnum(group.MacroKind, p.kind) orelse return error.UnknownKind;
+    // screen anchor は world 座標として解釈（wire は world。UI は clamp 後に渡す）。
+    try addMacroAtWorld(app, mk, .{ .x = p.x, .y = p.y });
+    // 成功応答: kind + member #id 一覧（直近に追加された group）
+    const gid = blk: {
+        if (app.selected) |it| switch (it) {
+            .group => |g| break :blk g,
+            else => {},
+        };
+        return error.MacroAddFailed;
+    };
+    var off: usize = 0;
+    const head = std.fmt.bufPrint(buf[off..], "ok kind={s} members=", .{@tagName(mk)}) catch return "ok";
+    off += head.len;
+    var first = true;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (app.ledger.group_of[h]) |g| {
+            if (g == gid) {
+                const id = nodeIdOf(app, h) orelse continue;
+                const piece = std.fmt.bufPrint(buf[off..], "{s}#{d}", .{ if (first) "" else ",", id.raw() }) catch break;
+                off += piece.len;
+                first = false;
+            }
+        }
+    }
+    return buf[0..off];
+}
+
+fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    const p = try actions.parseRemoveMacro(args);
+    // 全 member を解決し、同一 group に属することを確認してから一括削除 + 1 publish
+    var handles: [actions.MAX_REMOVE_MACRO_MEMBERS]Handle = undefined;
+    var n: usize = 0;
+    var gid: ?group.GroupId = null;
+    var i: usize = 0;
+    while (i < p.count) : (i += 1) {
+        const h = try resolveNodeRef(app, p.members[i], true);
+        const g = app.ledger.group_of[h] orelse return error.NotInMacro;
+        if (gid) |want| {
+            if (g != want) return error.MixedMacroMembers;
+        } else gid = g;
+        handles[n] = h;
+        n += 1;
+    }
+    const group_id = gid orelse return error.NotInMacro;
+    for (handles[0..n]) |h| {
+        purgeParamOverrides(app, h);
+        app.ledger.unassign(h);
+        app.dyn.removeModule(h);
+        clearNodeIdMapping(app, h);
+    }
+    app.ledger.free(group_id);
+    try app.dyn.publish();
+    app.refreshAllExposed();
+    app.selected = null;
+    app.hover = null;
     return "ok";
 }
 
@@ -2947,12 +3302,19 @@ fn buildEncodeInput(
     edge_buf: *[MAX_EDGES]project_io.EdgeEntry,
     nprm_buf: *[MAX_MODULES]project_io.NodeParamRecord,
     param_bufs: *[MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam,
+    nref_buf: *[MAX_MODULES]project_io.NodeIdRef,
 ) project_io.EncodeInput {
     const patch = app.patch;
     const cmd = stateToCommand(patch.snapshotState());
     const st = patch.snapshotState();
     const ne = collectNodesEdges(app, node_buf, edge_buf);
     const nprm = collectNodeParams(app, nprm_buf, param_bufs);
+    var rn: usize = 0;
+    for (ne.nodes) |n| {
+        const id = nodeIdOf(app, n.handle) orelse NodeId.fromRaw(0);
+        nref_buf[rn] = .{ .saved_handle = n.handle, .id = id };
+        rn += 1;
+    }
     return .{
         .pattern = patternToPayload(cmd),
         .seed = .{
@@ -2964,6 +3326,8 @@ fn buildEncodeInput(
         .nodes = ne.nodes,
         .edges = ne.edges,
         .node_params = nprm,
+        .node_id_refs = nref_buf[0..rn],
+        .next_node_id = app.next_node_id,
         .ledger = &app.ledger,
         .genr = patch.snapshotGenRoles(),
     };
@@ -2974,7 +3338,8 @@ fn actionSaveProjectFile(app: *App, path: []const u8) !void {
     var edge_buf: [MAX_EDGES]project_io.EdgeEntry = undefined;
     var nprm_buf: [MAX_MODULES]project_io.NodeParamRecord = undefined;
     var param_bufs: [MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam = undefined;
-    const input = buildEncodeInput(app, &node_buf, &edge_buf, &nprm_buf, &param_bufs);
+    var nref_buf: [MAX_MODULES]project_io.NodeIdRef = undefined;
+    const input = buildEncodeInput(app, &node_buf, &edge_buf, &nprm_buf, &param_bufs, &nref_buf);
     try project_io.save(app.io, path, Params, app.params, input, std.heap.c_allocator);
 }
 
@@ -3016,10 +3381,16 @@ fn applyGraphReplace(
     ledger_src: ?*const group.Ledger,
     genr_src: ?project_io.GenRoleHandles,
     node_params: ?[]const project_io.NodeParamRecord,
+    node_id_refs: ?[]const project_io.NodeIdRef,
+    next_node_id: ?u64,
 ) !GraphApplyResult {
     // 不正 NPRM は clearGraph 前に reject（graph を破壊しない）
     if (node_params) |records| {
         try project_io.validateNodeParams(nodes, records);
+    }
+    if (node_id_refs) |refs| {
+        const next = next_node_id orelse return error.CorruptNidm;
+        try project_io.validateNodeIdRefs(nodes, refs, next);
     }
 
     try ensureReplaceCapacity(app, nodes);
@@ -3094,6 +3465,19 @@ fn applyGraphReplace(
         app.patch.invalidateGenRoles();
     }
 
+    // stable NodeId: NREF があれば復元、無ければ決定的 fallback
+    if (node_id_refs) |refs| {
+        restoreNodeIdsFromRefs(app, &mapping, refs, next_node_id orelse 1);
+    } else {
+        var ids_buf: [MAX_MODULES]NodeId = undefined;
+        const next = graph_io.assignFallbackNodeIds(nodes, ids_buf[0..nodes.len]);
+        var refs_buf: [MAX_MODULES]project_io.NodeIdRef = undefined;
+        for (nodes, 0..) |n, i| {
+            refs_buf[i] = .{ .saved_handle = n.handle, .id = ids_buf[i] };
+        }
+        restoreNodeIdsFromRefs(app, &mapping, refs_buf[0..nodes.len], next);
+    }
+
     // master output は VPRJ chunk 対象外だが、GENR の output role から staging output を復元する
     // （無いと load 後 silent。旧 PTCG 経路は GENR 無効のため setOutput しない）。
     if (app.patch.output_h != project_io.INVALID_ROLE_HANDLE and app.dyn.isActive(app.patch.output_h)) {
@@ -3137,6 +3521,8 @@ fn clearGraph(app: *App) void {
         app.dyn.removeModule(h);
     }
     app.ledger = .{};
+    clearAllNodeIdMappings(app);
+    // next_node_id は load/SYNC 側が restore する（clear 単体では単調性を壊さない）
     app.selected = null;
     app.hover = null;
     app.drag = .none;
@@ -3156,24 +3542,68 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     // PTCG: apply_ledger/genr は true だが空/INVALID（decodeFromPtcg）
     const result = if (decoded.format == .ptcg)
-        try applyGraphReplace(app, decoded.nodes, decoded.edges, null, null, null)
+        try applyGraphReplace(app, decoded.nodes, decoded.edges, null, null, null, decoded.node_id_refs, decoded.next_node_id)
     else
-        try applyGraphReplace(app, decoded.nodes, decoded.edges, ledger_ptr, genr_opt, nprm_opt);
+        try applyGraphReplace(app, decoded.nodes, decoded.edges, ledger_ptr, genr_opt, nprm_opt, decoded.node_id_refs, decoded.next_node_id);
 
     return std.fmt.bufPrint(buf, "nodes={d}/{d} edges={d}/{d}", .{
         result.nodes_restored, decoded.nodes.len, result.edges_restored, decoded.edges.len,
     }) catch "ok";
 }
 
-/// 6 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
-/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+/// graph relay action を一括登録する（TASK-106.2）。`.relay` + canonicalize。undoable なし。
 fn registerPatchActions(app: *App) void {
-    platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode });
-    platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam });
-    platform.registerAction(.{ .name = "add_node", .ctx = app, .run = actionAddNode });
-    platform.registerAction(.{ .name = "remove_node", .ctx = app, .run = actionRemoveNode });
-    platform.registerAction(.{ .name = "connect", .ctx = app, .run = actionConnect });
-    platform.registerAction(.{ .name = "disconnect", .ctx = app, .run = actionDisconnect });
+    platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode, .network_policy = .local_only });
+    platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam, .network_policy = .local_only });
+    platform.registerAction(.{
+        .name = "add_node",
+        .ctx = app,
+        .run = recordedGraphAction("add_node"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeAddNode,
+    });
+    platform.registerAction(.{
+        .name = "remove_node",
+        .ctx = app,
+        .run = recordedGraphAction("remove_node"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeRemoveNode,
+    });
+    platform.registerAction(.{
+        .name = "connect",
+        .ctx = app,
+        .run = recordedGraphAction("connect"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeConnect,
+    });
+    platform.registerAction(.{
+        .name = "disconnect",
+        .ctx = app,
+        .run = recordedGraphAction("disconnect"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeDisconnect,
+    });
+    platform.registerAction(.{
+        .name = "move_node",
+        .ctx = app,
+        .run = recordedGraphAction("move_node"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeMoveNode,
+    });
+    platform.registerAction(.{
+        .name = "add_macro",
+        .ctx = app,
+        .run = recordedGraphAction("add_macro"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeAddMacro,
+    });
+    platform.registerAction(.{
+        .name = "remove_macro",
+        .ctx = app,
+        .run = recordedGraphAction("remove_macro"),
+        .network_policy = .relay,
+        .canonicalize = canonicalizeRemoveMacro,
+    });
     platform.registerAction(.{
         .name = "save_graph",
         .ctx = app,
@@ -3188,6 +3618,86 @@ fn registerPatchActions(app: *App) void {
         .network_policy = .local_only,
         .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG)",
     });
+}
+
+fn recordedGraphAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
+    return &struct {
+        fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const res = try app.cmd_exec.executeAction(name, args, .{
+                .actor = .local_agent,
+                .record_policy = .record,
+            }, buf);
+            return res.output;
+        }
+    }.run;
+}
+
+fn canonicalizeAddNode(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    _ = ctx;
+    const p = try actions.parseAddNode(args);
+    return actions.formatAddNode(scratch, p.kind, p.x, p.y) catch return error.ArgsTooLong;
+}
+
+fn canonicalizeRemoveNode(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
+    const ref = try actions.parseNodeRef(args);
+    const id = try nodeRefToId(app, ref, forbid);
+    return actions.formatNodeId(scratch, id) catch return error.ArgsTooLong;
+}
+
+fn canonicalizeMoveNode(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
+    const p = try actions.parseMoveNode(args);
+    const id = try nodeRefToId(app, p.ref, forbid);
+    return actions.formatMoveNode(scratch, id, p.x, p.y) catch return error.ArgsTooLong;
+}
+
+fn canonicalizeDisconnect(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
+    const p = try actions.parseDisconnect(args);
+    const id = try nodeRefToId(app, p.dst, forbid);
+    return actions.formatDisconnect(scratch, id, p.dst_in) catch return error.ArgsTooLong;
+}
+
+fn canonicalizeConnect(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
+    const p = try actions.parseConnect(args);
+    const src_id = try nodeRefToId(app, p.src, forbid);
+    const dst_id = try nodeRefToId(app, p.dst, forbid);
+    if (p.detach_dst) |dref| {
+        const din = p.detach_in orelse return error.InvalidArguments;
+        const did = try nodeRefToId(app, dref, forbid);
+        return actions.formatConnectWithDetach(scratch, src_id, p.src_out, dst_id, p.dst_in, did, din) catch return error.ArgsTooLong;
+    }
+    return actions.formatConnect(scratch, src_id, p.src_out, dst_id, p.dst_in) catch return error.ArgsTooLong;
+}
+
+fn canonicalizeAddMacro(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    _ = ctx;
+    const p = try actions.parseAddMacro(args);
+    return actions.formatAddMacro(scratch, p.kind, p.x, p.y) catch return error.ArgsTooLong;
+}
+
+fn canonicalizeRemoveMacro(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
+    const p = try actions.parseRemoveMacro(args);
+    var off: usize = 0;
+    var i: usize = 0;
+    while (i < p.count) : (i += 1) {
+        const id = try nodeRefToId(app, p.members[i], forbid);
+        const piece = if (i == 0)
+            std.fmt.bufPrint(scratch[off..], "#{d}", .{id}) catch return error.ArgsTooLong
+        else
+            std.fmt.bufPrint(scratch[off..], " #{d}", .{id}) catch return error.ArgsTooLong;
+        off += piece.len;
+    }
+    return scratch[0..off];
 }
 
 fn actionObserveParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -3212,7 +3722,8 @@ fn integratedStateSyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anye
     var edge_buf: [MAX_EDGES]project_io.EdgeEntry = undefined;
     var nprm_buf: [MAX_MODULES]project_io.NodeParamRecord = undefined;
     var param_bufs: [MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam = undefined;
-    const input = buildEncodeInput(app, &node_buf, &edge_buf, &nprm_buf, &param_bufs);
+    var nref_buf: [MAX_MODULES]project_io.NodeIdRef = undefined;
+    const input = buildEncodeInput(app, &node_buf, &edge_buf, &nprm_buf, &param_bufs, &nref_buf);
     return project_io.encode(Params, allocator, app.params, input);
 }
 
@@ -3225,7 +3736,7 @@ fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
 
     // 検証完了後にのみ破壊的適用（capacity は applyGraphReplace 内）
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
-    _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr, nprm_opt);
+    _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr, nprm_opt, decoded.node_id_refs, decoded.next_node_id);
     applyParamsPattern(app, decoded.params, decoded.pattern);
     applySeedSong(app, decoded.seed, decoded.song);
 }
@@ -3980,9 +4491,9 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
         const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .vprj) loaded.genr else null;
         const nprm_opt: ?[]const project_io.NodeParamRecord = if (loaded.apply_node_params) loaded.node_params else null;
         const result = if (loaded.format == .ptcg)
-            try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null)
+            try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null, loaded.node_id_refs, loaded.next_node_id)
         else
-            try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt, nprm_opt);
+            try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt, nprm_opt, loaded.node_id_refs, loaded.next_node_id);
         if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern);
         if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
         return std.fmt.bufPrint(buf, "format={s} nodes={d}/{d} edges={d}/{d}", .{
@@ -4243,6 +4754,14 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "song_loop", .run = actionSongLoop },
     .{ .name = "song_play", .run = actionSongPlay },
     .{ .name = "song_goto", .run = actionSongGoto },
+    // TASK-106.2: graph relay（executor / COMMIT 経路）
+    .{ .name = "add_node", .run = actionAddNode },
+    .{ .name = "remove_node", .run = actionRemoveNode },
+    .{ .name = "connect", .run = actionConnect },
+    .{ .name = "disconnect", .run = actionDisconnect },
+    .{ .name = "move_node", .run = actionMoveNode },
+    .{ .name = "add_macro", .run = actionAddMacro },
+    .{ .name = "remove_macro", .run = actionRemoveMacro },
 };
 
 fn dispatchModularAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {

@@ -33,6 +33,169 @@ const modular = @import("modular");
 pub const Handle = u16;
 pub const ModuleKind = modular.ModuleKind;
 
+/// 安定 node 参照（TASK-106.2）。runtime `DynGraph.Handle` とは分離。
+/// `0 = invalid`、単調増加・再利用なし（pixie `LayerId` と同型）。
+pub const NodeId = enum(u64) {
+    invalid = 0,
+    _,
+
+    pub fn raw(self: NodeId) u64 {
+        return @intFromEnum(self);
+    }
+
+    pub fn fromRaw(v: u64) NodeId {
+        return @enumFromInt(v);
+    }
+};
+
+/// stable export 用 node（equality / digest。runtime handle は載せない）。
+pub const StableNode = struct {
+    id: NodeId,
+    kind: ModuleKind,
+    x: f32,
+    y: f32,
+};
+
+/// stable export 用 edge（NodeId ベース。ソートキーは src_id, src_out, dst_id, dst_in）。
+pub const StableEdge = struct {
+    src_id: NodeId,
+    src_out: u8,
+    dst_id: NodeId,
+    dst_in: u8,
+};
+
+pub const StableGraph = struct {
+    nodes: []StableNode,
+    edges: []StableEdge,
+    output_id: ?NodeId = null,
+
+    pub fn deinit(self: *StableGraph, gpa: std.mem.Allocator) void {
+        gpa.free(self.nodes);
+        gpa.free(self.edges);
+    }
+};
+
+fn lessStableNode(ctx: void, a: StableNode, b: StableNode) bool {
+    _ = ctx;
+    return a.id.raw() < b.id.raw();
+}
+
+fn lessStableEdge(ctx: void, a: StableEdge, b: StableEdge) bool {
+    _ = ctx;
+    if (a.src_id.raw() != b.src_id.raw()) return a.src_id.raw() < b.src_id.raw();
+    if (a.src_out != b.src_out) return a.src_out < b.src_out;
+    if (a.dst_id.raw() != b.dst_id.raw()) return a.dst_id.raw() < b.dst_id.raw();
+    return a.dst_in < b.dst_in;
+}
+
+/// nodes/edges を NodeId 昇順・edge キー順にソートした canonical export を返す（caller が free）。
+/// `handle_to_id[h]` が null の active 相当 entry は skip（呼び出し側が割当済みを渡す前提）。
+pub fn canonicalizeStableGraph(
+    gpa: std.mem.Allocator,
+    nodes: []const StableNode,
+    edges: []const StableEdge,
+    output_id: ?NodeId,
+) !StableGraph {
+    const n_out = try gpa.dupe(StableNode, nodes);
+    errdefer gpa.free(n_out);
+    const e_out = try gpa.dupe(StableEdge, edges);
+    errdefer gpa.free(e_out);
+    std.mem.sort(StableNode, n_out, {}, lessStableNode);
+    std.mem.sort(StableEdge, e_out, {}, lessStableEdge);
+    return .{ .nodes = n_out, .edges = e_out, .output_id = output_id };
+}
+
+/// 旧 NodeEntry 並び（出現順）から決定的に NodeId を採番する（schema 1 / PTCG fallback）。
+/// 戻り値の ids[i] は nodes[i] に対応。next = max+1（空なら 1）。
+pub fn assignFallbackNodeIds(nodes: []const NodeEntry, ids_out: []NodeId) u64 {
+    std.debug.assert(ids_out.len >= nodes.len);
+    var next: u64 = 1;
+    for (nodes, 0..) |_, i| {
+        ids_out[i] = NodeId.fromRaw(next);
+        next += 1;
+    }
+    return next;
+}
+
+/// stable topology JSON（digest / snapshot 共通本体）。
+/// 形式: `{"nodes":[{"id":N,"kind":"...","x":..,"y":..},...],"edges":[[sid,so,did,di],...],"output":OID}`
+/// `nodes`/`edges` は呼び出し側でソート済みであること。
+pub fn appendStableTopologyJson(
+    list: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    nodes: []const StableNode,
+    edges: []const StableEdge,
+    output_id: u64,
+) !void {
+    try list.appendSlice(gpa, "{\"nodes\":[");
+    for (nodes, 0..) |n, i| {
+        if (i != 0) try list.append(gpa, ',');
+        var tmp: [128]u8 = undefined;
+        const piece = try std.fmt.bufPrint(&tmp, "{{\"id\":{d},\"kind\":\"{s}\",\"x\":{d:.1},\"y\":{d:.1}}}", .{
+            n.id.raw(), @tagName(n.kind), n.x, n.y,
+        });
+        try list.appendSlice(gpa, piece);
+    }
+    try list.appendSlice(gpa, "],\"edges\":[");
+    for (edges, 0..) |e, i| {
+        if (i != 0) try list.append(gpa, ',');
+        var tmp: [64]u8 = undefined;
+        const piece = try std.fmt.bufPrint(&tmp, "[{d},{d},{d},{d}]", .{
+            e.src_id.raw(), e.src_out, e.dst_id.raw(), e.dst_in,
+        });
+        try list.appendSlice(gpa, piece);
+    }
+    var tail: [48]u8 = undefined;
+    const t = try std.fmt.bufPrint(&tail, "],\"output\":{d}}}", .{output_id});
+    try list.appendSlice(gpa, t);
+}
+
+/// 固定バッファ版（digest 用）。収まらなければ truncated=true（書き込みは途中まで）。
+pub fn formatStableTopologyInto(
+    buf: []u8,
+    nodes: []const StableNode,
+    edges: []const StableEdge,
+    output_id: u64,
+) struct { len: usize, truncated: bool } {
+    var off: usize = 0;
+    var truncated = false;
+    const head = std.fmt.bufPrint(buf[off..], "{{\"nodes\":[", .{}) catch return .{ .len = 0, .truncated = true };
+    off += head.len;
+    for (nodes, 0..) |n, i| {
+        const sep: []const u8 = if (i == 0) "" else ",";
+        const piece = std.fmt.bufPrint(buf[off..], "{s}{{\"id\":{d},\"kind\":\"{s}\",\"x\":{d:.1},\"y\":{d:.1}}}", .{
+            sep, n.id.raw(), @tagName(n.kind), n.x, n.y,
+        }) catch {
+            truncated = true;
+            break;
+        };
+        off += piece.len;
+    }
+    if (!truncated) {
+        const mid = std.fmt.bufPrint(buf[off..], "],\"edges\":[", .{}) catch {
+            return .{ .len = off, .truncated = true };
+        };
+        off += mid.len;
+        for (edges, 0..) |e, i| {
+            const sep: []const u8 = if (i == 0) "" else ",";
+            const piece = std.fmt.bufPrint(buf[off..], "{s}[{d},{d},{d},{d}]", .{
+                sep, e.src_id.raw(), e.src_out, e.dst_id.raw(), e.dst_in,
+            }) catch {
+                truncated = true;
+                break;
+            };
+            off += piece.len;
+        }
+    }
+    if (!truncated) {
+        const tail = std.fmt.bufPrint(buf[off..], "],\"output\":{d}}}", .{output_id}) catch {
+            return .{ .len = off, .truncated = true };
+        };
+        off += tail.len;
+    }
+    return .{ .len = off, .truncated = truncated };
+}
+
 /// 'PTCG'（patch graph）の little-endian u32。serde の expected_magic に渡す。
 pub const magic: u32 = @as(u32, 'P') | (@as(u32, 'T') << 8) | (@as(u32, 'C') << 16) | (@as(u32, 'G') << 24);
 pub const schema_version: u16 = 1;
@@ -293,4 +456,115 @@ test "file I/O: save→load round-trip" {
     try testing.expectEqual(@as(usize, 1), got.nodes.len);
     try testing.expectEqual(nodes[0], got.nodes[0]);
     try testing.expectEqual(@as(usize, 0), got.edges.len);
+}
+
+test "stable export: runtime handle が違っても NodeId ベースで一致" {
+    const gpa = testing.allocator;
+    // 同じ topology・異なる runtime handle
+    const a_nodes = [_]StableNode{
+        .{ .id = NodeId.fromRaw(2), .kind = .vcf, .x = 100, .y = 0 },
+        .{ .id = NodeId.fromRaw(1), .kind = .vco, .x = 0, .y = 0 },
+    };
+    const a_edges = [_]StableEdge{
+        .{ .src_id = NodeId.fromRaw(1), .src_out = 0, .dst_id = NodeId.fromRaw(2), .dst_in = 0 },
+    };
+    const b_nodes = [_]StableNode{
+        .{ .id = NodeId.fromRaw(1), .kind = .vco, .x = 0, .y = 0 },
+        .{ .id = NodeId.fromRaw(2), .kind = .vcf, .x = 100, .y = 0 },
+    };
+    const b_edges = [_]StableEdge{
+        .{ .src_id = NodeId.fromRaw(1), .src_out = 0, .dst_id = NodeId.fromRaw(2), .dst_in = 0 },
+    };
+    var ga = try canonicalizeStableGraph(gpa, &a_nodes, &a_edges, NodeId.fromRaw(2));
+    defer ga.deinit(gpa);
+    var gb = try canonicalizeStableGraph(gpa, &b_nodes, &b_edges, NodeId.fromRaw(2));
+    defer gb.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), ga.nodes.len);
+    try testing.expectEqual(ga.nodes[0].id, gb.nodes[0].id);
+    try testing.expectEqual(ga.nodes[1].id, gb.nodes[1].id);
+    try testing.expectEqual(ga.edges[0], gb.edges[0]);
+    try testing.expectEqual(ga.output_id, gb.output_id);
+}
+
+test "stable export: 入力順が違っても canonical 一致 / fallback 採番" {
+    const gpa = testing.allocator;
+    const edges_a = [_]StableEdge{
+        .{ .src_id = NodeId.fromRaw(2), .src_out = 0, .dst_id = NodeId.fromRaw(3), .dst_in = 1 },
+        .{ .src_id = NodeId.fromRaw(1), .src_out = 0, .dst_id = NodeId.fromRaw(2), .dst_in = 0 },
+    };
+    const edges_b = [_]StableEdge{
+        .{ .src_id = NodeId.fromRaw(1), .src_out = 0, .dst_id = NodeId.fromRaw(2), .dst_in = 0 },
+        .{ .src_id = NodeId.fromRaw(2), .src_out = 0, .dst_id = NodeId.fromRaw(3), .dst_in = 1 },
+    };
+    var ga = try canonicalizeStableGraph(gpa, &.{}, &edges_a, null);
+    defer ga.deinit(gpa);
+    var gb = try canonicalizeStableGraph(gpa, &.{}, &edges_b, null);
+    defer gb.deinit(gpa);
+    try testing.expectEqualSlices(StableEdge, ga.edges, gb.edges);
+
+    const legacy = [_]NodeEntry{
+        .{ .handle = 7, .kind = .vco, .x = 0, .y = 0 },
+        .{ .handle = 3, .kind = .output, .x = 1, .y = 1 },
+    };
+    var ids: [2]NodeId = undefined;
+    const next = assignFallbackNodeIds(&legacy, &ids);
+    try testing.expectEqual(@as(u64, 1), ids[0].raw());
+    try testing.expectEqual(@as(u64, 2), ids[1].raw());
+    try testing.expectEqual(@as(u64, 3), next);
+}
+
+test "stable topology JSON: id 昇順・kind/x/y・output・trunc" {
+    const gpa = testing.allocator;
+    const nodes = [_]StableNode{
+        .{ .id = NodeId.fromRaw(1), .kind = .vco, .x = 10, .y = 20 },
+        .{ .id = NodeId.fromRaw(2), .kind = .output, .x = 100, .y = 0 },
+    };
+    const edges = [_]StableEdge{
+        .{ .src_id = NodeId.fromRaw(1), .src_out = 0, .dst_id = NodeId.fromRaw(2), .dst_in = 0 },
+    };
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendStableTopologyJson(&list, gpa, &nodes, &edges, 2);
+    const full = list.items;
+    try testing.expect(std.mem.indexOf(u8, full, "\"id\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "\"kind\":\"vco\"") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "\"x\":10.0") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "[1,0,2,0]") != null);
+    try testing.expect(std.mem.endsWith(u8, full, "\"output\":2}"));
+    // camera/fb は含めない
+    try testing.expect(std.mem.indexOf(u8, full, "camera") == null);
+    try testing.expect(std.mem.indexOf(u8, full, "fb") == null);
+
+    // 小バッファ → truncated
+    var tiny: [32]u8 = undefined;
+    const fmt = formatStableTopologyInto(&tiny, &nodes, &edges, 2);
+    try testing.expect(fmt.truncated);
+
+    // 十分なバッファ → 非 trunc・ArrayList と bit 一致
+    var big: [512]u8 = undefined;
+    const fmt2 = formatStableTopologyInto(&big, &nodes, &edges, 2);
+    try testing.expect(!fmt2.truncated);
+    try testing.expectEqualStrings(full, big[0..fmt2.len]);
+}
+
+test "stable topology snapshot-sized: 多 node でも JSON 完全（trunc なし）" {
+    const gpa = testing.allocator;
+    var nodes: [30]StableNode = undefined;
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        nodes[i] = .{
+            .id = NodeId.fromRaw(@intCast(i + 1)),
+            .kind = .vco,
+            .x = @floatFromInt(i),
+            .y = 0,
+        };
+    }
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendStableTopologyJson(&list, gpa, &nodes, &.{}, 1);
+    try testing.expect(list.items.len > 1024); // digest 上限を超えるサイズでも完全
+    try testing.expect(list.items[0] == '{');
+    try testing.expect(list.items[list.items.len - 1] == '}');
+    try testing.expect(std.mem.indexOf(u8, list.items, "\"id\":30") != null);
+    try testing.expect(std.mem.indexOf(u8, list.items, " trunc=") == null);
 }

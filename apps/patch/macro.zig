@@ -408,3 +408,22 @@ test "macro: DrumMachine×2 + BassMachine fit within step_seq cap (poolCap 4→8
     // step_seq が cap8 なので 5 個使っても余りがある。
     try testing.expectEqual(modular.dyn.poolCap(.step_seq) - 5, g.poolFreeCount(.step_seq));
 }
+
+test "wire kind step_seq / step_seq_bass: nOut は drum=1 / bass=3" {
+    // main.addNodeByKindName の alias 契約: step_seq=.{}（drum）、step_seq_bass=bass init。
+    var g = try DynGraph.create(testing.allocator, 48000);
+    defer g.destroy();
+    const drum = try g.add(.step_seq, .{});
+    const bass = try g.add(.step_seq, .{
+        .kind = .bass,
+        .on_mask = 0,
+        .accent_mask = 0,
+        .slide_mask = 0,
+        .scale = .minor_pentatonic,
+        .octaves = 2,
+    });
+    try testing.expectEqual(@as(u8, 1), g.nOut(drum));
+    try testing.expectEqual(@as(u8, 3), g.nOut(bass));
+    try testing.expect(g.ptrOfConst(.step_seq, drum).kind == .drum);
+    try testing.expect(g.ptrOfConst(.step_seq, bass).kind == .bass);
+}

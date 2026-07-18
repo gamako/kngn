@@ -1883,6 +1883,11 @@ pub fn proposeToHost(name: []const u8, args: []const u8, buf: []u8) anyerror![]c
 }
 
 fn proposeToHostWithMeta(name: []const u8, args: []const u8, redo_of: ?u64, buf: []u8) anyerror![]const u8 {
+    // SYNC 完了前の PROPOSE は未適用 graph を参照しうるため拒否（TASK-106.2）。
+    if (awaiting_sync) {
+        action_registry.setActionErrorDetail("session_not_ready", "wait for awaiting_sync=0 before relay actions");
+        return error.SessionNotReady;
+    }
     if (pending_count >= PENDING_CAP) return error.PendingQueueFull;
     next_proposal_id += 1;
     const id = next_proposal_id;
@@ -3555,6 +3560,11 @@ test "netsync: router client 5 policy 分岐" {
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
+            // 空 SYNC で awaiting_sync を解除してから PROPOSE を待つ（TASK-106.2）
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
             // PROPOSE を1件読んで捨てる（client relay 用）
             _ = decodeFrame(&reader.interface, &pbuf) catch {};
             sleepMs(200);
@@ -3573,6 +3583,12 @@ test "netsync: router client 5 policy 分岐" {
     const caddr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     initClientAs(caddr, .human, "pol");
     try waitClientActive(2000);
+    var waited_sync: u64 = 0;
+    while (testAwaitingSync() and waited_sync < 2000) : (waited_sync += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expect(!testAwaitingSync());
 
     var buf: [128]u8 = undefined;
     const pr = try action_registry.routeLocalAction("c_relay", "x", &buf);
@@ -3805,6 +3821,11 @@ test "netsync: proposal_id 単調増加" {
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
+            // 空 SYNC で awaiting_sync を解除（TASK-106.2）
+            var sync_pl: [8]u8 = undefined;
+            std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
+            writer.interface.flush() catch return;
             _ = decodeFrame(&reader.interface, &pbuf) catch {};
             _ = decodeFrame(&reader.interface, &pbuf) catch {};
             sleepMs(100);
@@ -3817,6 +3838,12 @@ test "netsync: proposal_id 単調増加" {
     registerSem("stroke", &ctx, .relay);
     initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .human, "pid");
     try waitClientActive(2000);
+    var waited_sync: u64 = 0;
+    while (testAwaitingSync() and waited_sync < 2000) : (waited_sync += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expect(!testAwaitingSync());
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("proposed 1", try proposeToHost("stroke", "a", &buf));
     try testing.expectEqualStrings("proposed 2", try proposeToHost("stroke", "b", &buf));
@@ -4137,6 +4164,20 @@ test "netsync: export 0 byte は切断" {
     var waited: u64 = 0;
     while (peerCount() != 0 and waited < 2000) : (waited += 10) sleepMs(10);
     try testing.expectEqual(@as(usize, 0), peerCount());
+}
+
+test "netsync: awaiting_sync 中の PROPOSE は session_not_ready" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    peers_mutex.lockUncancelable(io_val);
+    role = .client;
+    started = true;
+    awaiting_sync = true;
+    peers_mutex.unlock(io_val);
+
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.SessionNotReady, proposeToHost("add_node", "vco 0 0", &buf));
 }
 
 test "netsync: client SYNC import と awaiting_sync 中 COMMIT 保留" {
