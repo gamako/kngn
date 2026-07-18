@@ -1,7 +1,7 @@
 //! Pixie MVP: libs/gui UI + Pen/Eraser/DB16 パレット/Undo/PNG 保存
 //!
-//! - レイアウト: menu bar / row(canvas, right pane) / timeline placeholder / status bar
-//!   の 4 段 Flex（毎フレーム fb サイズから再フロー。リサイズ対応自体は TASK-23）
+//! - レイアウト: menu bar / PanelHost(left=History, center=canvas, right=Color/Palette/
+//!   Tool Options/Layers, bottom=Timeline) / status bar（TASK-148.1）
 //! - canvas 入力: press 起点 capture（canvas_input.zig の状態機械）。stroke 中は GUI 上に
 //!   逸れても継続（座標は clamp なし変換 + ピクセル側 clip）
 //! - Tool / Undo: core の Tool(Pen/Eraser) / StrokeRecorder / UndoStack（TASK-21.7 で core 化）
@@ -24,6 +24,7 @@ const png = kit.png;
 const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
 const canvas_input = @import("canvas_input.zig");
 const actions = @import("actions.zig");
+const icons = @import("icons.zig");
 const diff = @import("diff.zig");
 const blit = @import("blit.zig");
 const palette_mod = @import("palette.zig");
@@ -77,13 +78,25 @@ const PanKind = enum { space_left, middle, cmd_left };
 // チェッカー定数の単一ソースは blit.zig（TASK-54 で移動）
 const CHECKER_LIGHT = blit.CHECKER_LIGHT;
 const CHECKER_DARK = blit.CHECKER_DARK;
-// ペイン分割（TASK-42）: 右/下ペインのリサイズ + 表示非表示。pane は fixed px・canvas は grow。
+// PanelHost スロット寸法の既定（TASK-148.1。旧 TASK-42 の right/bottom pane 定数を継承）。
 const RIGHT_PANE_DEFAULT: i32 = 200;
 const RIGHT_PANE_MIN: i32 = 120;
+const LEFT_PANE_DEFAULT: i32 = 200;
+const LEFT_PANE_MIN: i32 = 120;
 const BOTTOM_PANE_DEFAULT: i32 = 120;
 const BOTTOM_PANE_MIN: i32 = 80;
 const CANVAS_MIN: i32 = 120; // pane リサイズ時に canvas へ残す最小辺
 const SPLITTER_T: i32 = 6; // 境界帯の太さ
+
+/// PanelHost の安定 panel name（Preferences / Collapsible / View メニューで共用）。
+const PanelNames = struct {
+    pub const history = "History";
+    pub const color = "Color";
+    pub const palette = "Palette";
+    pub const tool_options = "Tool Options";
+    pub const layers = "Layers";
+    pub const timeline = "Timeline";
+};
 const SAVE_MSG_DURATION: f64 = 3.0;
 // 範囲選択のマーチングアンツ（TASK-44）。phase 速度（units/sec）と周期（=2*DASH。selection_overlay の DASH=4）。
 const MARCH_SPEED: f64 = 12.0;
@@ -111,8 +124,12 @@ const CmdId = struct {
     pub const load_palette: platform.CommandId = 9;
     pub const undo: platform.CommandId = 10;
     pub const redo: platform.CommandId = 11;
-    pub const toggle_panel: platform.CommandId = 12;
+    pub const toggle_history: platform.CommandId = 12;
     pub const toggle_timeline: platform.CommandId = 13;
+    pub const toggle_color: platform.CommandId = 17;
+    pub const toggle_palette: platform.CommandId = 18;
+    pub const toggle_tool_options: platform.CommandId = 19;
+    pub const toggle_layers: platform.CommandId = 20;
 };
 
 /// TASK-144.2: New Size / Resize Canvas モーダル。TextBuffer は App 寿命で所有し、
@@ -170,14 +187,6 @@ fn hashMenuStr(s: []const u8) u32 {
     return std.hash.Fnv1a_32.hash(s);
 }
 
-/// canvas 領域の明示 ID（getNodeRect での外部参照用。自動 ID は不可）
-const CANVAS_AREA_ID: gui.Id = 0xC0FFEE01;
-/// ペイン分割（TASK-42）の明示 ID。CONTENT_ROW=横分割の利用可能幅、MAIN_AREA=縦分割の利用可能高 の基準。
-const CONTENT_ROW_ID: gui.Id = 0xC0FFEE02;
-const MAIN_AREA_ID: gui.Id = 0xC0FFEE03;
-const SPLIT_RIGHT_ID: gui.Id = 0xC0FFEE04;
-const SPLIT_BOTTOM_ID: gui.Id = 0xC0FFEE05;
-const RIGHT_SCROLL_ID: gui.Id = 0xC0FFEE06; // 右ペイン縦スクロール領域（TASK-46）
 const LAYER_PANEL_ID_BASE: gui.Id = 0xA430_0000;
 const LAYER_ROW_ID_BASE: gui.Id = 0xA430_1000;
 const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
@@ -192,6 +201,8 @@ const LAYER_ROW_PART_ROW: gui.Id = 4;
 const LAYER_ROW_PART_IME: gui.Id = 5;
 /// 履歴パネル（TASK-83 Phase 1）の明示 ID 群。
 const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
+/// ツール／対称アイコン明示 ID（TASK-148.2）。オフセット 0..13 を固定割当。
+const TOOL_ICON_ID_BASE: gui.Id = 0xA148_2000;
 // レイヤーパネルのサムネイル（raw layer をチェッカー下地へ最近傍縮小・等倍 blit）
 const LAYER_THUMB_W: i32 = 24;
 const LAYER_THUMB_H: i32 = 24;
@@ -414,8 +425,13 @@ const App = struct {
     }
 
     /// Window.destroy 前・App.deinit 前に呼ぶ（TASK-117）。geometry を window_state へ保存。
-    /// size=0（facade の安全既定 / 取得失敗）は既存 state を温存するため保存スキップ。失敗は log のみ。
+    /// PanelHost の可視/寸法も Preferences へ永続化（TASK-148.1）。
+    /// size=0（facade の安全既定 / 取得失敗）は既存 state を温存するため window_state 保存スキップ。
+    /// Preferences は geometry 成否に関わらず persist+save を試みる。失敗は log のみ。
     pub fn onWindowShutdown(self: *App, win: *platform.Window) void {
+        self.persistPanels() catch |err| {
+            std.log.err("pixie: preferences save failed: {s}", .{@errorName(err)});
+        };
         const geo = win.getGeometry();
         if (geo.size.width == 0 or geo.size.height == 0) {
             std.log.warn("pixie: window_state save skipped (invalid geometry size={d}x{d})", .{ geo.size.width, geo.size.height });
@@ -518,13 +534,10 @@ const App = struct {
     brush_edges: brush_edge_cache.EdgeCache = .{},
     /// ephemeral プレゼンス状態（TASK-103。Document/CommandLog 非保持）。
     presence: actions.PresenceStore = .{},
-    /// ── ペイン（TASK-42）。pane は fixed px・canvas は grow。幅/高さは毎フレーム利用可能領域へ clamp ──
-    right_pane_w: i32 = RIGHT_PANE_DEFAULT,
-    right_visible: bool = true,
-    /// 右ペインの縦スクロール量（TASK-46。横は content_width=grow で不要）
-    right_scroll: gui.Vec2f = .{},
-    bottom_pane_h: i32 = BOTTOM_PANE_DEFAULT,
-    bottom_visible: bool = false,
+    /// ── PanelHost（TASK-148.1）。left/right/bottom + center。Preferences で永続化 ──
+    panels: [6]gui.Panel = undefined,
+    panel_host: gui.PanelHost = undefined,
+    preferences: appshell.preferences.Preferences = undefined,
     /// タイムライン UI 状態（TASK-45.2）
     timeline_scroll: gui.Vec2f = .{},
     timeline_playing: bool = false,
@@ -2677,10 +2690,49 @@ const App = struct {
             },
             CmdId.undo => self.doUndo() catch {},
             CmdId.redo => self.doRedo() catch {},
-            CmdId.toggle_panel => self.right_visible = !self.right_visible,
-            CmdId.toggle_timeline => self.bottom_visible = !self.bottom_visible,
+            CmdId.toggle_history => _ = self.togglePanelVisible(PanelNames.history),
+            CmdId.toggle_color => _ = self.togglePanelVisible(PanelNames.color),
+            CmdId.toggle_palette => _ = self.togglePanelVisible(PanelNames.palette),
+            CmdId.toggle_tool_options => _ = self.togglePanelVisible(PanelNames.tool_options),
+            CmdId.toggle_layers => _ = self.togglePanelVisible(PanelNames.layers),
+            CmdId.toggle_timeline => _ = self.togglePanelVisible(PanelNames.timeline),
             else => {},
         }
+    }
+
+    fn findPanel(self: *App, name: []const u8) ?*gui.Panel {
+        for (&self.panels) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return p;
+        }
+        return null;
+    }
+
+    fn isPanelVisible(self: *const App, name: []const u8) bool {
+        for (&self.panels) |p| {
+            if (std.mem.eql(u8, p.name, name)) return p.visible;
+        }
+        return false;
+    }
+
+    /// View メニュー / panel_toggle 共通。可視を反転し Preferences へ即保存する。
+    /// 未知 name は null。成功時は新しい visible を返す。
+    fn togglePanelVisible(self: *App, name: []const u8) ?bool {
+        const p = self.findPanel(name) orelse return null;
+        const new_vis = !p.visible;
+        _ = self.panel_host.setPanelVisible(name, new_vis);
+        self.persistPanels() catch |err| {
+            std.log.err("pixie: preferences save failed: {s}", .{@errorName(err)});
+        };
+        return new_vis;
+    }
+
+    fn panelPersistence(self: *App) gui.Persistence {
+        return .{ .user_data = self, .read = panelPersistRead, .write = panelPersistWrite };
+    }
+
+    fn persistPanels(self: *App) !void {
+        try self.panel_host.persist(self.panelPersistence());
+        try self.preferences.save(self.io, self.data_dir, "preferences.ash");
     }
 
     /// Command 表から id を検索（separator は対象外）。dispatchCommand の最終防御用。
@@ -2693,7 +2745,7 @@ const App = struct {
         return null;
     }
 
-    /// 現在の app 状態から Command 表を再構築（checked = Panel/Timeline 表示状態）。
+    /// 現在の app 状態から Command 表を再構築（checked = 各 panel 表示状態）。
     fn rebuildMenuCommands(self: *App) void {
         const accel_mod: platform.ModifierFlags = if (builtin.os.tag == .macos)
             .{ .cmd = true }
@@ -2757,8 +2809,12 @@ const App = struct {
             .enabled = !platform.netsyncActive(),
         });
 
-        put(self, &n, .{ .id = CmdId.toggle_panel, .label = "Panel", .menu = .{ .title = "View", .order = 300 }, .checked = self.right_visible });
-        put(self, &n, .{ .id = CmdId.toggle_timeline, .label = "Timeline", .menu = .{ .title = "View", .order = 301 }, .checked = self.bottom_visible });
+        put(self, &n, .{ .id = CmdId.toggle_history, .label = "History", .menu = .{ .title = "View", .order = 300 }, .checked = self.isPanelVisible(PanelNames.history), .shortcut = .{ .key = .H, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_color, .label = "Color", .menu = .{ .title = "View", .order = 301 }, .checked = self.isPanelVisible(PanelNames.color), .shortcut = .{ .key = .C, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_palette, .label = "Palette", .menu = .{ .title = "View", .order = 302 }, .checked = self.isPanelVisible(PanelNames.palette), .shortcut = .{ .key = .P, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_tool_options, .label = "Tool Options", .menu = .{ .title = "View", .order = 303 }, .checked = self.isPanelVisible(PanelNames.tool_options), .shortcut = .{ .key = .O, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_layers, .label = "Layers", .menu = .{ .title = "View", .order = 304 }, .checked = self.isPanelVisible(PanelNames.layers), .shortcut = .{ .key = .L, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_timeline, .label = "Timeline", .menu = .{ .title = "View", .order = 305 }, .checked = self.isPanelVisible(PanelNames.timeline), .shortcut = .{ .key = .T, .modifiers = accel_shift } });
 
         self.menu_command_count = n;
     }
@@ -4373,6 +4429,9 @@ const pixie_args_presence_suggest: @FieldType(platform.Action, "args") = &.{
     .{ .name = "y", .kind = "int", .min = 0, .max = 255 },
     .{ .name = "ttl_ms", .kind = "int", .min = 0, .max = 10000, .optional = true },
 };
+const pixie_args_panel_toggle: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "name", .kind = "enum", .values = &.{ "history", "color", "palette", "tool_options", "layers", "timeline" } },
+};
 
 fn actionRequestClose(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     try actions.parseNoArgs(args);
@@ -4460,6 +4519,61 @@ fn actionDiscardRecovery(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
     return "ok discard_recovery";
 }
 
+fn panelNameFromToggle(name: actions.PanelToggleName) []const u8 {
+    return switch (name) {
+        .history => PanelNames.history,
+        .color => PanelNames.color,
+        .palette => PanelNames.palette,
+        .tool_options => PanelNames.tool_options,
+        .layers => PanelNames.layers,
+        .timeline => PanelNames.timeline,
+    };
+}
+
+/// `panel_toggle <name>`: UI 状態のみ変更（local_only・undo 非対象。TASK-148.1）。
+fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const name = try actions.parsePanelToggle(args);
+    const app = actionApp(ctx);
+    const panel_name = panelNameFromToggle(name);
+    const new_vis = app.togglePanelVisible(panel_name) orelse return error.InvalidArgument;
+    return std.fmt.bufPrint(buf, "ok panel_toggle {s}={d}", .{ @tagName(name), @intFromBool(new_vis) }) catch error.BufferTooSmall;
+}
+
+fn panelPersistKeyBuf(key: gui.PersistKey, buf: *[128]u8) []const u8 {
+    return switch (key) {
+        .slot => |s| std.fmt.bufPrint(buf, "pixie.panel.slot.{s}.{s}", .{ @tagName(s.slot), @tagName(s.field) }) catch buf[0..0],
+        .panel => |p| std.fmt.bufPrint(buf, "pixie.panel.{s}.{s}", .{ p.name, @tagName(p.field) }) catch buf[0..0],
+    };
+}
+
+fn panelPersistRead(ud: *anyopaque, key: gui.PersistKey) ?gui.PersistValue {
+    const app: *App = @ptrCast(@alignCast(ud));
+    var key_buf: [128]u8 = undefined;
+    const pref_key = panelPersistKeyBuf(key, &key_buf);
+    if (pref_key.len == 0) return null;
+    return switch (key) {
+        .slot => |s| switch (s.field) {
+            .visible => if (app.preferences.getBool(pref_key)) |v| .{ .boolean = v } else null,
+            .extent => if (app.preferences.getI64(pref_key)) |v| .{ .integer = v } else null,
+        },
+        .panel => |p| switch (p.field) {
+            .visible => if (app.preferences.getBool(pref_key)) |v| .{ .boolean = v } else null,
+            .open => if (app.preferences.getBool(pref_key)) |v| .{ .boolean = v } else null,
+        },
+    };
+}
+
+fn panelPersistWrite(ud: *anyopaque, key: gui.PersistKey, value: gui.PersistValue) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ud));
+    var key_buf: [128]u8 = undefined;
+    const pref_key = panelPersistKeyBuf(key, &key_buf);
+    if (pref_key.len == 0) return error.NoSpaceLeft;
+    switch (value) {
+        .boolean => |v| try app.preferences.setBool(pref_key, v),
+        .integer => |v| try app.preferences.setI64(pref_key, v),
+    }
+}
+
 /// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
 /// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
 /// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
@@ -4521,6 +4635,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "presence_point", .ctx = app, .run = actionPresencePoint, .network_policy = .ephemeral, .desc = "agent cursor / work position", .args = pixie_args_presence_point });
     platform.registerAction(.{ .name = "presence_highlight", .ctx = app, .run = actionPresenceHighlight, .network_policy = .ephemeral, .desc = "temporary canvas highlight rect", .args = pixie_args_presence_highlight });
     platform.registerAction(.{ .name = "presence_suggest", .ctx = app, .run = actionPresenceSuggest, .network_policy = .ephemeral, .desc = "assist suggestion marker", .args = pixie_args_presence_suggest });
+    // TASK-148.1: panel 表示トグル（UI 状態のみ・undo 非対象）
+    platform.registerAction(.{ .name = "panel_toggle", .ctx = app, .run = actionPanelToggle, .network_policy = .local_only, .desc = "toggle panel visibility", .args = pixie_args_panel_toggle });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -4681,9 +4797,10 @@ fn syncCameraFromOrigin(app: *App, area: core.Rect, ox: i32, oy: i32) void {
 /// canvas_area 内にカメラ由来の表示原点で canvas rect を配置する。
 /// 連続原点を整数へ丸めた後に clamp し、cam_cx/cy を表示原点から再導出する。
 /// 毎フレーム app.last_area も更新する（Fit ズーム計算用）。
-/// 返す core.Rect の w/h は canvas ピクセル数（screenToCanvas* の契約）。初回フレームは null。
+/// 返す core.Rect の w/h は canvas ピクセル数（screenToCanvas* の契約）。初回フレームは null
+/// （PanelHost.centerRect が前フレーム cache を参照するため）。
 fn canvasBlitRect(ctx: *const gui.Context, app: *App) ?core.Rect {
-    const area_node = ctx.getNodeRect(CANVAS_AREA_ID) orelse return null;
+    const area_node = app.panel_host.centerRect(ctx) orelse return null;
     const area: core.Rect = .{ .x = area_node.x, .y = area_node.y, .w = @intCast(area_node.w), .h = @intCast(area_node.h) };
     app.last_area = area;
 
@@ -4907,7 +5024,6 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32, cw: usize, ch: usize) v
 }
 
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
-    ctx.label("Layers");
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
     // TASK-94 Phase C: netsync 中は routeAction（#id）、solo は do* 直呼び。
     if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) {
@@ -4997,16 +5113,13 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         // 行矩形は「前フレームの rect_cache」（既存 widget と同じ同期 hit-test 契約。
         // context.zig 冒頭の契約コメント参照）。openPopup は endFrame 前でも呼べる
         // （endFrame 後を要求するのは描画+hit-test を行う popupMenu 側のみ。popup.zig 参照）。
-        // レイヤーパネルは右ペインの縦スクロール領域（RIGHT_SCROLL_ID, clip_children=true）配下
-        // にあるため、行 rect 単体だけでは「スクロールでクリップされ実際には見えていない部分」を
-        // 誤ヒットし得る（codex レビュー指摘 2026-07-05）。RIGHT_SCROLL_ID のビューポート矩形
-        // （beginScrollArea が clip_children 付きで登録する viewport box の rect）にも収まっている
-        // ことを追加で確認する（既存 widget の buttonBehavior(rect, clip) と同じ「祖先 clip を
-        // hit-test に使う」契約を、手動 hit-test でも踏襲する）。
+        // レイヤーパネルは PanelHost 右 slot（clip_children=true）配下にある。
+        // 行 rect 単体だけでは slot 外（クリップ済み）を誤ヒットし得るため、右 slot 矩形にも
+        // 収まっていることを確認する（148.3 で Layers 専用 ScrollArea + cached clip に置換予定）。
         if (ctx.input.mouse_pressed.right) {
             if (ctx.getNodeRect(row_id)) |r| {
                 const p = ctx.input.mouse_pressed_pos;
-                const in_viewport = if (ctx.getNodeRect(RIGHT_SCROLL_ID)) |vp| vp.contains(p) else true;
+                const in_viewport = if (app.panel_host.slotRect(ctx, .right)) |vp| vp.contains(p) else true;
                 if (in_viewport and r.contains(p)) {
                     app.doSelectLayer(idx) catch {};
                     ctx.openPopup(LAYER_CTX_MENU_ID, p);
@@ -5050,7 +5163,6 @@ fn historyRowId(idx: u32) gui.Id {
 /// サムネイルは固定バッファの blit のみ（PixelDiff / bbox 再計算 / composite / allocator 禁止）。
 fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
     app.ensureHistoryFresh();
-    ctx.label("History");
     if (app.history_count == 0) {
         ctx.labelEx("(empty)", ctx.style.text_subtle);
         return;
@@ -5360,28 +5472,150 @@ fn buildTimelinePanel(ctx: *gui.Context, app: *App) !void {
     }
 }
 
+fn panelBuildHistory(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    buildHistoryPanel(ctx, app);
+}
+
+fn panelBuildColor(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    // HSV。palette grid より前に write-back（選択変更の上書き事故回避）
+    ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
+    _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 120 });
+    _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 120 });
+    ctx.endBox();
+    _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
+    _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+    _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+    app.edit_h = @min(app.edit_h, 360 - 1e-3); // hueBar と同じ [0,360) 契約
+    app.applyEditColor();
+}
+
+fn panelBuildPalette(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    {
+        var idx: usize = 0;
+        while (idx < app.palette.colors.items.len) {
+            ctx.beginBox(.{ .direction = .row, .gap = 3 });
+            var col: u32 = 0;
+            while (col < 4 and idx < app.palette.colors.items.len) : (col += 1) {
+                const swatch_id: gui.Id = 0x1000 + @as(gui.Id, idx);
+                if (ctx.colorSwatchId(swatch_id, .{
+                    .color = guiColor(app.palette.colors.items[idx]),
+                    .selected = idx == app.palette.selected,
+                    .size = 22,
+                }).clicked) {
+                    app.palette.select(idx);
+                    app.repl_source = app.palette.current();
+                    if (app.active_kind == .eraser) app.setActiveKind(.pen);
+                }
+                idx += 1;
+            }
+            ctx.endBox();
+        }
+    }
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (ctx.buttonEx("+", .{ .min_w = 28 }).clicked) {
+        app.palette.addColor(app.gpa, app.palette.current()) catch {};
+    }
+    if (ctx.buttonEx("-", .{ .min_w = 28 }).clicked) {
+        app.palette.removeSelected();
+        app.edit_synced_for = null;
+        app.repl_source = null;
+    }
+    if (ctx.buttonEx("Repl", .{ .min_w = 36 }).clicked) {
+        if (platform.netsyncActive()) {
+            app.setSaveMsg("netsync: Repl unavailable (use replace_color with #id)", .{});
+        } else {
+            const to: u32 = @bitCast(gui.Color.fromHsv(app.edit_h, app.edit_s, app.edit_v));
+            const from = app.repl_source orelse app.palette.current();
+            _ = app.doReplaceColor(app.canvas.selected_layer, from, to) catch {};
+            app.palette.setSelectedColor(to);
+            app.pen.color = to;
+            app.brush.color = to;
+            app.fill.color = to;
+            app.edit_synced_for = null;
+            app.repl_source = to;
+        }
+    }
+    ctx.endBox();
+}
+
+fn toolIconButton(ctx: *gui.Context, id_off: gui.Id, icon: gui.IconBitmap, selected: bool, tip: []const u8) bool {
+    const res = ctx.iconButtonId(TOOL_ICON_ID_BASE + id_off, icon, selected);
+    ctx.tooltip(tip);
+    return res.clicked;
+}
+
+fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    // 4 列アイコングリッド（TASK-148.2）
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (toolIconButton(ctx, 0, icons.pen, app.active_kind == .pen, "Pen (B)")) app.setActiveKind(.pen);
+    if (toolIconButton(ctx, 1, icons.eraser, app.active_kind == .eraser, "Eraser (E)")) app.setActiveKind(.eraser);
+    if (toolIconButton(ctx, 2, icons.brush, app.active_kind == .brush, "Brush (no shortcut)")) app.setActiveKind(.brush);
+    if (toolIconButton(ctx, 3, icons.bezier, app.active_kind == .bezier, "Bezier (P)")) app.setActiveKind(.bezier);
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (toolIconButton(ctx, 4, icons.select, app.active_kind == .select, "Select (M)")) app.setActiveKind(.select);
+    if (toolIconButton(ctx, 5, icons.fill, app.active_kind == .fill, "Fill (G)")) app.setActiveKind(.fill);
+    if (toolIconButton(ctx, 6, icons.eyedrop, app.active_kind == .eyedropper, "Eyedrop (I)")) app.setActiveKind(.eyedropper);
+    if (toolIconButton(ctx, 7, icons.line, app.active_kind == .line, "Line (no shortcut)")) app.setActiveKind(.line);
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (toolIconButton(ctx, 8, icons.rect, app.active_kind == .rect, "Rect (no shortcut)")) app.setActiveKind(.rect);
+    if (toolIconButton(ctx, 9, icons.ellipse, app.active_kind == .ellipse, "Ellipse (no shortcut)")) app.setActiveKind(.ellipse);
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    if (toolIconButton(ctx, 10, icons.sym_off, app.symmetry == .off, "Symmetry Off (no shortcut)")) app.uiSetSymmetry(.off);
+    if (toolIconButton(ctx, 11, icons.sym_v, app.symmetry == .vertical, "Symmetry V (no shortcut)")) app.uiSetSymmetry(.vertical);
+    if (toolIconButton(ctx, 12, icons.sym_h, app.symmetry == .horizontal, "Symmetry H (no shortcut)")) app.uiSetSymmetry(.horizontal);
+    if (toolIconButton(ctx, 13, icons.sym_q, app.symmetry == .quad, "Symmetry Q (no shortcut)")) app.uiSetSymmetry(.quad);
+    ctx.endBox();
+
+    ctx.labelEx("(Alt+click = temp eyedrop)", ctx.style.text_subtle);
+    var keep_transp = app.blend_mode == .over;
+    if (ctx.toggle("Keep Transp", &keep_transp)) {
+        app.blend_mode = if (keep_transp) .over else .replace;
+    }
+    if (app.active_kind == .rect or app.active_kind == .ellipse) {
+        var fill_on = app.shape_in.fill;
+        if (ctx.toggle("Shape Fill", &fill_on)) {
+            app.shape_in.fill = fill_on;
+        }
+    }
+    var pp_on = app.pixel_perfect;
+    if (ctx.toggle("Pixel Perfect", &pp_on)) {
+        app.uiSetPixelPerfect(pp_on);
+    }
+    if (app.active_kind == .brush or app.active_kind == .bezier) {
+        _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
+        _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
+        _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
+    }
+    if (app.active_kind == .fill) {
+        _ = ctx.sliderI32Id(0xFEED_0001, "Tol", &app.fill_tolerance_i32, .{ .min = 0, .max = 255, .track_w = 90 });
+    }
+}
+
+fn panelBuildLayers(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    try buildLayerPanel(ctx, app);
+    try buildTextLayerPanel(ctx, app);
+}
+
+fn panelBuildTimeline(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(user_data));
+    try buildTimelinePanel(ctx, app);
+}
+
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
     app.syncEditHsv();
-    // 右ペイン非表示時は HSV widget が無く applyEditColor がブロック内で呼ばれない（TASK-42）。
-    // Pal Load 等で current が変わっても pen/brush.color が旧色のままになるのを防ぐためここで同期する
-    // （visible 時は従来どおり HSV slider 更新後・palette grid より前のブロック内で呼ぶ）。
-    if (!app.right_visible) app.applyEditColor();
-
-    // ペイン幅/高さを前フレーム rect の「利用可能領域」へ clamp（TASK-42）。
-    // 基準は CONTENT_ROW（横分割の全幅）/ MAIN_AREA（縦分割の全高）。CANVAS_AREA は pane 差引後の
-    // 残りなので max 基準に使えない。max は splitter にも渡し、ウィンドウ縮小時も canvas を CANVAS_MIN 残す。
-    var right_max: i32 = RIGHT_PANE_DEFAULT;
-    if (ctx.getNodeRect(CONTENT_ROW_ID)) |row| {
-        right_max = @max(RIGHT_PANE_MIN, @as(i32, @intCast(row.w)) - SPLITTER_T - CANVAS_MIN);
-    }
-    app.right_pane_w = std.math.clamp(app.right_pane_w, RIGHT_PANE_MIN, right_max);
-    var bottom_max: i32 = BOTTOM_PANE_DEFAULT;
-    if (ctx.getNodeRect(MAIN_AREA_ID)) |m| {
-        bottom_max = @max(BOTTOM_PANE_MIN, @as(i32, @intCast(m.h)) - SPLITTER_T - CANVAS_MIN);
-    }
-    app.bottom_pane_h = std.math.clamp(app.bottom_pane_h, BOTTOM_PANE_MIN, bottom_max);
+    // Color panel 非表示時は HSV widget が無く applyEditColor が callback 内で呼ばれない。
+    // Pal Load 等で current が変わっても pen/brush.color が旧色のままになるのを防ぐ。
+    if (!app.isPanelVisible(PanelNames.color)) app.applyEditColor();
 
     ctx.beginBox(.{
         .direction = .column,
@@ -5408,199 +5642,16 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.rebuildMenuCommands();
     }
 
-    // ── main area: content row(canvas + 右ペイン) + 任意の下ペイン（TASK-42。縦分割の基準 ID） ──
-    ctx.beginBox(.{ .id = MAIN_AREA_ID, .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 0 });
+    // ── PanelHost: left/center/right/bottom（center は空 box。canvas blit は centerRect）──
+    try app.panel_host.build(ctx);
 
-    // content row: canvas(grow) + [splitter + right pane]。gap=0 で splitter を境界帯にする（横分割の基準 ID）。
-    ctx.beginBox(.{ .id = CONTENT_ROW_ID, .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 0 });
+    // Brush/Fill UI 状態 → ツール（毎フレーム clamp。Tool Options 非表示でも値は保持同期）
+    app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
+    app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
+    app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
+    app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
 
-    // canvas area: 明示 ID・中身空（blit は endFrame 後に別パスで行う）。bg なし（canvas を上塗りしない）。
-    ctx.beginBox(.{ .id = CANVAS_AREA_ID, .width = .{ .grow = 1 }, .height = .{ .grow = 1 } });
-    ctx.endBox();
-
-    if (app.right_visible) {
-        _ = ctx.splitter(SPLIT_RIGHT_ID, .vertical, &app.right_pane_w, .{ .thickness = SPLITTER_T, .min = RIGHT_PANE_MIN, .max = right_max, .invert = true });
-        // right pane: Color / Palette / Tool / Layers を縦スクロール領域に入れる（TASK-46）。
-        // content_width=grow で content を viewport 幅いっぱい（横スクロール不要）、高さは fit で縦スクロール。
-        ctx.beginScrollArea(RIGHT_SCROLL_ID, &app.right_scroll, .{
-            .width = .{ .fixed = app.right_pane_w },
-            .height = .{ .grow = 1 },
-            .padding = .{ 8, 8, 8, 8 },
-            .gap = 6,
-            .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
-            .content_width = .{ .grow = 1 },
-        });
-        // ── カラーエディタ（HSV）。grid より前に write-back する（選択変更の上書き事故回避） ──
-        ctx.label("Color");
-        ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
-        _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 120 });
-        _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 120 });
-        ctx.endBox();
-        _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
-        _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
-        _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
-        app.edit_h = @min(app.edit_h, 360 - 1e-3); // hueBar と同じ [0,360) 契約
-        app.applyEditColor(); // 編集中 HSV → 選択スウォッチ色 + pen.color（grid クリックより前）
-
-        // ── 編集可能パレット（可変長スウォッチ + 追加/削除） ──
-        ctx.label("Palette");
-        {
-            var idx: usize = 0;
-            while (idx < app.palette.colors.items.len) {
-                ctx.beginBox(.{ .direction = .row, .gap = 3 });
-                var col: u32 = 0;
-                while (col < 4 and idx < app.palette.colors.items.len) : (col += 1) {
-                    const swatch_id: gui.Id = 0x1000 + @as(gui.Id, idx);
-                    if (ctx.colorSwatchId(swatch_id, .{
-                        .color = guiColor(app.palette.colors.items[idx]),
-                        .selected = idx == app.palette.selected,
-                        .size = 22,
-                    }).clicked) {
-                        app.palette.select(idx); // HSV は次フレームで再同期
-                        app.repl_source = app.palette.current(); // Repl の from を選択時点色に固定（TASK-89）
-                        if (app.active_kind == .eraser) app.setActiveKind(.pen); // 色は pen 用（brush/bezier は維持）
-                    }
-                    idx += 1;
-                }
-                ctx.endBox();
-            }
-        }
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("+", .{ .min_w = 28 }).clicked) {
-            app.palette.addColor(app.gpa, app.palette.current()) catch {};
-        }
-        if (ctx.buttonEx("-", .{ .min_w = 28 }).clicked) {
-            app.palette.removeSelected();
-            // 非末尾削除で index が詰まると selected が同値のまま別色を指す。
-            // edit_synced_for を無効化し、次フレームで現 current 色から HSV 再同期する
-            // （さもないと applyEditColor が旧 HSV で新色を上書きする）。
-            app.edit_synced_for = null;
-            app.repl_source = null;
-        }
-        // TASK-89: 選択スウォッチ選択時色 → 現在 HSV 編集色に canvas 置換 + swatch 更新
-        // netsync 中は peer の selected が違うと diverge するため拒否（fill と同型ガード。TASK-94 Phase C）
-        if (ctx.buttonEx("Repl", .{ .min_w = 36 }).clicked) {
-            if (platform.netsyncActive()) {
-                app.setSaveMsg("netsync: Repl unavailable (use replace_color with #id)", .{});
-            } else {
-                const to: u32 = @bitCast(gui.Color.fromHsv(app.edit_h, app.edit_s, app.edit_v));
-                const from = app.repl_source orelse app.palette.current();
-                _ = app.doReplaceColor(app.canvas.selected_layer, from, to) catch {};
-                app.palette.setSelectedColor(to);
-                app.pen.color = to;
-                app.brush.color = to;
-                app.fill.color = to;
-                app.edit_synced_for = null;
-                app.repl_source = to;
-            }
-        }
-        ctx.endBox();
-
-        ctx.label("Tool");
-        // 7 ツールは右ペイン幅に収めるため 2 個ずつ折り返す（TASK-68 で Eyedrop 追加・奇数個なので最終行は単独）
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Pen", .{ .selected = app.active_kind == .pen, .min_w = 56 }).clicked) app.setActiveKind(.pen);
-        if (ctx.buttonEx("Eraser", .{ .selected = app.active_kind == .eraser, .min_w = 56 }).clicked) app.setActiveKind(.eraser);
-        ctx.endBox();
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Brush", .{ .selected = app.active_kind == .brush, .min_w = 56 }).clicked) app.setActiveKind(.brush);
-        if (ctx.buttonEx("Bezier", .{ .selected = app.active_kind == .bezier, .min_w = 56 }).clicked) app.setActiveKind(.bezier);
-        ctx.endBox();
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Select", .{ .selected = app.active_kind == .select, .min_w = 56 }).clicked) app.setActiveKind(.select);
-        if (ctx.buttonEx("Fill", .{ .selected = app.active_kind == .fill, .min_w = 56 }).clicked) app.setActiveKind(.fill);
-        ctx.endBox();
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Eyedrop", .{ .selected = app.active_kind == .eyedropper, .min_w = 56 }).clicked) app.setActiveKind(.eyedropper);
-        ctx.endBox();
-        // TASK-90: Line / Rect / Ellipse
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Line", .{ .selected = app.active_kind == .line, .min_w = 56 }).clicked) app.setActiveKind(.line);
-        if (ctx.buttonEx("Rect", .{ .selected = app.active_kind == .rect, .min_w = 56 }).clicked) app.setActiveKind(.rect);
-        ctx.endBox();
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Ellipse", .{ .selected = app.active_kind == .ellipse, .min_w = 56 }).clicked) app.setActiveKind(.ellipse);
-        ctx.endBox();
-        ctx.labelEx("(Alt+click = temp eyedrop)", ctx.style.text_subtle);
-        // paste/move のブロック配置トグル（gui.toggle スイッチ。TASK-48）。
-        // ON=透明を保持(src-over・下の絵を残す) / OFF=上書き(replace)。
-        var keep_transp = app.blend_mode == .over;
-        if (ctx.toggle("Keep Transp", &keep_transp)) {
-            app.blend_mode = if (keep_transp) .over else .replace;
-        }
-        // TASK-90: shape fill / pixel_perfect / symmetry
-        if (app.active_kind == .rect or app.active_kind == .ellipse) {
-            var fill_on = app.shape_in.fill;
-            if (ctx.toggle("Shape Fill", &fill_on)) {
-                app.shape_in.fill = fill_on;
-            }
-        }
-        // TASK-90 + TASK-94 Phase C: netsync 中は routeAction、solo は do* 直呼び
-        var pp_on = app.pixel_perfect;
-        if (ctx.toggle("Pixel Perfect", &pp_on)) {
-            app.uiSetPixelPerfect(pp_on);
-        }
-        // symmetry: Off / V / H / Quad を 1 行ボタン
-        ctx.label("Symmetry");
-        ctx.beginBox(.{ .direction = .row, .gap = 4 });
-        if (ctx.buttonEx("Off", .{ .selected = app.symmetry == .off, .min_w = 36 }).clicked) {
-            app.uiSetSymmetry(.off);
-        }
-        if (ctx.buttonEx("V", .{ .selected = app.symmetry == .vertical, .min_w = 28 }).clicked) {
-            app.uiSetSymmetry(.vertical);
-        }
-        if (ctx.buttonEx("H", .{ .selected = app.symmetry == .horizontal, .min_w = 28 }).clicked) {
-            app.uiSetSymmetry(.horizontal);
-        }
-        if (ctx.buttonEx("Q", .{ .selected = app.symmetry == .quad, .min_w = 28 }).clicked) {
-            app.uiSetSymmetry(.quad);
-        }
-        ctx.endBox();
-        // Brush/Bezier 選択時に Size/Opacity/Hardness の Slider を表示（bezier も同じブラシ設定で描く）
-        if (app.active_kind == .brush or app.active_kind == .bezier) {
-            _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
-            _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
-            _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
-        }
-        // UI 状態 → Brush（毎フレーム clamp/変換。型差吸収）
-        app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
-        app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
-        app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
-
-        // Fill 選択時に色許容差(Tol)の Slider を表示（TASK-76）
-        if (app.active_kind == .fill) {
-            _ = ctx.sliderI32Id(0xFEED_0001, "Tol", &app.fill_tolerance_i32, .{ .min = 0, .max = 255, .track_w = 90 });
-        }
-        // UI 状態 → Fill（毎フレーム clamp/変換。型差吸収）
-        app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
-
-        try buildLayerPanel(ctx, app);
-        try buildTextLayerPanel(ctx, app); // TASK-79.5: 選択中レイヤーが text kind の時のみ表示
-        buildHistoryPanel(ctx, app);
-        ctx.endScrollArea(); // right pane (縦スクロール)
-    } // right_visible
-
-    ctx.endBox(); // content row
-
-    // ── 下ペイン（タイムライン枠。中身は Phase5。TASK-42 はリサイズ/トグル枠のみ） ──
-    if (app.bottom_visible) {
-        _ = ctx.splitter(SPLIT_BOTTOM_ID, .horizontal, &app.bottom_pane_h, .{ .thickness = SPLITTER_T, .min = BOTTOM_PANE_MIN, .max = bottom_max, .invert = true });
-        ctx.beginBox(.{
-            .direction = .column,
-            .width = .{ .grow = 1 },
-            .height = .{ .fixed = app.bottom_pane_h },
-            .padding = .{ 4, 6, 4, 6 },
-            .gap = 4,
-            .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
-            .clip_children = true,
-        });
-        try buildTimelinePanel(ctx, app);
-        ctx.endBox(); // bottom pane
-    }
-
-    ctx.endBox(); // main area
-
-    // ── 4 段目: status bar ──
+    // ── status bar ──
     ctx.beginBox(.{
         .direction = .row,
         .width = .{ .grow = 1 },
@@ -5986,6 +6037,16 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .recent = recent,
         .autosave = autosave_controller,
         .recovery = recovery,
+        .preferences = appshell.preferences.Preferences.init(gpa),
+        .panels = .{
+            .{ .name = PanelNames.history, .slot = .left, .build = panelBuildHistory, .user_data = undefined },
+            .{ .name = PanelNames.color, .slot = .right, .build = panelBuildColor, .user_data = undefined },
+            .{ .name = PanelNames.palette, .slot = .right, .build = panelBuildPalette, .user_data = undefined },
+            .{ .name = PanelNames.tool_options, .slot = .right, .build = panelBuildToolOptions, .user_data = undefined },
+            .{ .name = PanelNames.layers, .slot = .right, .build = panelBuildLayers, .user_data = undefined },
+            .{ .name = PanelNames.timeline, .slot = .bottom, .visible = false, .build = panelBuildTimeline, .user_data = undefined },
+        },
+        .panel_host = undefined,
         .size_dialog_storage = .{
             .mode = .resize,
             .width_buf = size_w_buf,
@@ -5993,6 +6054,22 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         },
         .size_dialog = null,
     };
+    errdefer self.preferences.deinit();
+
+    _ = self.preferences.load(io, data_dir, "preferences.ash") catch |err| {
+        std.log.err("pixie: preferences load failed: {s}", .{@errorName(err)});
+    };
+
+    self.panel_host = try gui.PanelHost.init(self.panels[0..], .{
+        .left = .{ .extent = LEFT_PANE_DEFAULT, .min_extent = LEFT_PANE_MIN, .max_extent = 800 },
+        .right = .{ .extent = RIGHT_PANE_DEFAULT, .min_extent = RIGHT_PANE_MIN, .max_extent = 800 },
+        .bottom = .{ .extent = BOTTOM_PANE_DEFAULT, .min_extent = BOTTOM_PANE_MIN, .max_extent = 600 },
+        .splitter_thickness = SPLITTER_T,
+        .min_center_width = CANVAS_MIN,
+        .min_center_height = CANVAS_MIN,
+    });
+    for (&self.panels) |*p| p.user_data = self;
+    self.panel_host.restore(self.panelPersistence());
 
     self.host = appshell.document_host.DocumentHost.init(gpa, .{
         .ctx = self,
@@ -6045,6 +6122,7 @@ fn appDeinit(self: *App) void {
     if (self.recovery) |*candidate| candidate.deinit();
     self.autosave.deinit();
     self.recent.deinit();
+    self.preferences.deinit();
     self.autosave_dir.close(self.io);
     self.data_dir.close(self.io);
     if (self.current_path) |p| gpa.free(p);

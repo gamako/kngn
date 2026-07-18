@@ -32,6 +32,7 @@ pub const ParseError = error{
     UnknownShape,
     UnknownSymmetry,
     UnknownAnchor,
+    UnknownPanel,
 };
 
 /// layer 参照（TASK-94 Phase B）: `#<id>`（安定 handle）または bare 数値（index・後方互換）。
@@ -650,6 +651,25 @@ pub fn parseNoArgs(args: []const u8) ParseError!void {
     if (std.mem.trim(u8, args, " \t").len != 0) return error.TooManyTokens;
 }
 
+/// `panel_toggle` の対象パネル名（harness action 用。PanelHost の安定 name とは別の短い ID）。
+pub const PanelToggleName = enum {
+    history,
+    color,
+    palette,
+    tool_options,
+    layers,
+    timeline,
+};
+
+/// `panel_toggle <name>` 用: 1 トークン。未知名・空・余剰はエラー。
+pub fn parsePanelToggle(args: []const u8) ParseError!PanelToggleName {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const name = std.meta.stringToEnum(PanelToggleName, tok) orelse return error.UnknownPanel;
+    try expectExhausted(&it);
+    return name;
+}
+
 /// `goto_frame <idx>` 用: frame index の1トークン（u32）。
 pub fn parseGotoFrame(args: []const u8) ParseError!u32 {
     var it = tokenize(args);
@@ -952,6 +972,15 @@ test "parseNoArgs: 空は許容 / 余剰トークンは拒否" {
     try parseNoArgs("");
     try parseNoArgs("   ");
     try testing.expectError(error.TooManyTokens, parseNoArgs("typo"));
+}
+
+test "parsePanelToggle: 有効名 / 空 / 未知名 / 余剰トークン" {
+    try testing.expectEqual(PanelToggleName.history, try parsePanelToggle("history"));
+    try testing.expectEqual(PanelToggleName.tool_options, try parsePanelToggle("tool_options"));
+    try testing.expectEqual(PanelToggleName.timeline, try parsePanelToggle("  timeline  "));
+    try testing.expectError(error.Empty, parsePanelToggle(""));
+    try testing.expectError(error.UnknownPanel, parsePanelToggle("inspector"));
+    try testing.expectError(error.TooManyTokens, parsePanelToggle("history extra"));
 }
 
 test "parseGotoFrame: 有効値 / Empty / InvalidNumber / TooManyTokens" {
