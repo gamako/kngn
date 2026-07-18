@@ -2158,11 +2158,11 @@ fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, defa
 const PlatformModules = struct {
     platform: TaggedModule, // opt-in 無効（既定。main/synth/modular/patch/大半の example。TASK-80.2/97.3）
     platform_gamepad: TaggedModule, // gamepad opt-in（examples/22_gamepad / 34_action_map）
-    platform_menu: TaggedModule, // menu opt-in（pixie 専用。TASK-97.3）
+    platform_menu: TaggedModule, // menu opt-in 用（pixie/patch 共用。TASK-97.3/136）
     keyboard: *std.Build.Module, // src/ レガシー（examples 専用。層管理外）
     kit: TaggedModule, // platform(opt-in無効) 側を配線
     kit_gamepad: TaggedModule, // platform_gamepad 側を配線（example_34。TASK-111.8）
-    kit_menu: TaggedModule, // platform_menu 側を配線（pixie 専用）
+    kit_menu: TaggedModule, // menu opt-in 用（pixie/patch 共用）
 };
 
 fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const SharedModules, app_runtime: TaggedModule) void {
@@ -2211,7 +2211,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.harness.mod,
         .{ .enable_gamepad = true },
     ) };
-    // native メニュー opt-in 有効版。pixie 専用（TASK-97.3/122。macOS objc/swift/metal 共通）。
+    // native メニュー opt-in 有効版（TASK-97.3/122/136。macOS objc/swift/metal 共通。pixie/patch 共用）。
     // build_options が異なるため別 Module。
     const platform_menu_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
@@ -2265,7 +2265,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     }) };
     wireKitImports(kit_gamepad, platform_gamepad_mod, common, app_runtime_gamepad);
 
-    // pixie 専用 kit（enable_menu=true の platform を配線）
+    // menu opt-in kit（enable_menu=true の platform を配線。pixie/patch 共用）
     const kit_menu: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
     }) };
@@ -2835,8 +2835,9 @@ fn addPatchExe(
     });
     // apps は kit-only 消費者（R5）。platform/gui/audio/synth/dsp は kit.* で参照。
     // modular / 可視化（libs/viz）は流動中で kit 非収録のため直 import。
+    // native メニュー opt-in（TASK-136）: kit_menu（enable_menu=true）+ 共有 menu.m（pixie と共用）。
     const root = appRoot(exe, "patch");
-    link(root, pm.kit);
+    link(root, pm.kit_menu);
     link(root, common.modular); // 動的グラフエンジン（dsp 依存のみ。macro.zig も参照）
     link(root, common.spectrogram); // TASK-40.8: 信号可視化（master scope/spectrogram/level meter）
     link(root, common.scope);
@@ -2845,8 +2846,8 @@ fn addPatchExe(
     linkAppException(root, common.dsp, "apps/patch/lofi.zig が生成レイヤを直接利用（FFT band energy 検証）");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
 
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
+    // ゲームパッド opt-in 無効（TASK-80.2）。native メニュー opt-in（TASK-136）。
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;
 }
 

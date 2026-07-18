@@ -20,6 +20,7 @@
 //! ESC/閉じるで終了。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
 const platform = kit.platform;
 const gui = kit.gui;
@@ -189,6 +190,17 @@ const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
 const MAX_PARAM_EDITS: usize = patchmod.MAX_PARAM_OVERRIDES;
 
+// ── File メニュー（TASK-136）──────────────────────────────────────────────
+// GUI fallback 行の高さ（box padding 4+4 + button ≈24）。native 時は OS メニューバーのため 0。
+const MENU_GUI_H: f32 = 32;
+const MENU_CMD_CAP: usize = 8;
+const MenuFileOp = enum { save_project, open_project };
+const CmdId = struct {
+    pub const save_project: platform.CommandId = 1;
+    pub const open_project: platform.CommandId = 2;
+    pub const quit: platform.CommandId = 3;
+};
+
 /// canvas 幅に収まる列数（button.x + button.w <= canvas_w。最大 PAL_COLS_MAX）。
 fn paletteCols(canvas_w: f32) usize {
     const cell = PAL_W + PAL_GAP;
@@ -204,12 +216,12 @@ fn paletteRowCount(canvas_w: f32) usize {
 }
 
 /// パレット帯の下端（行数は canvas 幅依存。clampMacroPos の上限に使う）。
-fn paletteBottom(canvas_w: f32) f32 {
+fn paletteBottom(canvas_w: f32, y0: f32) f32 {
     const rows: f32 = @floatFromInt(paletteRowCount(canvas_w));
-    return PAL_Y + rows * (PAL_H + PAL_GAP);
+    return y0 + rows * (PAL_H + PAL_GAP);
 }
 
-fn paletteButtons(canvas_w: f32) [PALETTE.len]canvas.PaletteButton {
+fn paletteButtons(canvas_w: f32, y0: f32) [PALETTE.len]canvas.PaletteButton {
     const cols = paletteCols(canvas_w);
     var btns: [PALETTE.len]canvas.PaletteButton = undefined;
     for (0..PALETTE.len) |i| {
@@ -219,7 +231,7 @@ fn paletteButtons(canvas_w: f32) [PALETTE.len]canvas.PaletteButton {
         const y: f32 = @floatFromInt(row);
         btns[i] = .{ .kind_index = @intCast(i), .rect = .{
             .x = PAL_X0 + x * (PAL_W + PAL_GAP),
-            .y = PAL_Y + y * (PAL_H + PAL_GAP),
+            .y = y0 + y * (PAL_H + PAL_GAP),
             .w = PAL_W,
             .h = PAL_H,
         } };
@@ -391,6 +403,28 @@ const App = struct {
     frame_snapshot_count: usize = 0,
     param_rows: [MAX_PARAM_EDITS]ParamRowSnapshot = [_]ParamRowSnapshot{.{}} ** MAX_PARAM_EDITS,
     param_row_count: usize = 0,
+
+    // TASK-136: File メニュー（native NSMenu / GUI fallback）+ dialog 経由 save/load。
+    menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
+    menu_command_count: usize = 0,
+    menu_bar_state: gui.MenuBarState = .{},
+    native_menu_active: bool = false,
+    pending_menu_op: ?MenuFileOp = null,
+    menu_last_op: ?MenuFileOp = null,
+    running: bool = true,
+
+    /// GUI fallback メニュー行の高さ。native 有効時は OS メニューバーに任せて 0。
+    fn menuTopH(self: *const App) f32 {
+        return if (self.native_menu_active) 0 else MENU_GUI_H;
+    }
+
+    fn paletteY0(self: *const App) f32 {
+        return PAL_Y + self.menuTopH();
+    }
+
+    fn pointInMenuBar(self: *const App) bool {
+        return !self.native_menu_active and self.mouse.y < self.menuTopH();
+    }
 
     /// キャンバス有効高（画面下端の可視化帯を除いた領域）。見切れ判定・ヒットテスト・tap 対象選択で共通に使う。
     fn canvasH(self: *const App) f32 {
@@ -597,6 +631,124 @@ const App = struct {
             if (g.active) self.ledger.deriveExposed(@intCast(i), flat);
         }
     }
+
+    // ── File メニュー（TASK-136）──────────────────────────────────────────
+    fn rebuildMenuCommands(self: *App) void {
+        const accel_mod: platform.ModifierFlags = if (builtin.os.tag == .macos)
+            .{ .cmd = true }
+        else
+            .{ .ctrl = true };
+        var n: usize = 0;
+        const put = struct {
+            fn go(app: *App, idx: *usize, cmd: platform.Command) void {
+                if (idx.* >= MENU_CMD_CAP) return;
+                app.menu_commands[idx.*] = cmd;
+                idx.* += 1;
+            }
+        }.go;
+        put(self, &n, .{
+            .id = CmdId.save_project,
+            .label = "Save Project",
+            .menu = .{ .title = "File", .order = 100 },
+            .shortcut = .{ .key = .S, .modifiers = accel_mod },
+        });
+        put(self, &n, .{
+            .id = CmdId.open_project,
+            .label = "Open Project",
+            .menu = .{ .title = "File", .order = 101 },
+            .shortcut = .{ .key = .O, .modifiers = accel_mod },
+        });
+        put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 102 } });
+        put(self, &n, .{
+            .id = CmdId.quit,
+            .label = "Quit",
+            .menu = .{ .title = "File", .order = 103 },
+        });
+        self.menu_command_count = n;
+    }
+
+    fn menuCommandsSlice(self: *App) []const platform.Command {
+        return self.menu_commands[0..self.menu_command_count];
+    }
+
+    fn findMenuCommand(self: *const App, id: platform.CommandId) ?platform.Command {
+        if (id == 0) return null;
+        for (self.menu_commands[0..self.menu_command_count]) |cmd| {
+            if (cmd.kind == .separator) continue;
+            if (cmd.id == id) return cmd;
+        }
+        return null;
+    }
+
+    fn dispatchCommand(self: *App, id: platform.CommandId) void {
+        const cmd = self.findMenuCommand(id) orelse return;
+        if (!cmd.enabled) return;
+        switch (id) {
+            CmdId.save_project => {
+                self.pending_menu_op = .save_project;
+                self.menu_last_op = .save_project;
+            },
+            CmdId.open_project => {
+                self.pending_menu_op = .open_project;
+                self.menu_last_op = .open_project;
+            },
+            CmdId.quit => self.running = false,
+            else => {},
+        }
+    }
+
+    /// GUI fallback 環境のショートカット照合（native メニュー有効時は keyEquivalent が所有）。
+    fn matchMenuShortcut(self: *const App, k: platform.KeyEvent) ?platform.CommandId {
+        const accel = k.modifiers.cmd or k.modifiers.ctrl;
+        for (self.menu_commands[0..self.menu_command_count]) |cmd| {
+            if (cmd.kind == .separator) continue;
+            if (!cmd.enabled) continue;
+            const sc = cmd.shortcut orelse continue;
+            if (sc.key != k.key) continue;
+            const want_accel = sc.modifiers.cmd or sc.modifiers.ctrl;
+            if (want_accel != accel) continue;
+            if (sc.modifiers.shift != k.modifiers.shift) continue;
+            if (sc.modifiers.alt != k.modifiers.alt) continue;
+            return cmd.id;
+        }
+        return null;
+    }
+
+    /// 拡張子欠落時に `.vprj` を付加（dialog 戻り path。caller が free）。
+    fn ensureVprjExt(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+        if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".vprj")) {
+            return gpa.dupe(u8, path);
+        }
+        return std.fmt.allocPrint(gpa, "{s}.vprj", .{path});
+    }
+
+    /// framebuffer unlock 後の安全点で pending File 操作を実行（dialog は lock 中禁止）。
+    fn runPendingMenuFileOp(self: *App) void {
+        const op = self.pending_menu_op orelse return;
+        self.pending_menu_op = null;
+        const gpa = std.heap.c_allocator;
+        switch (op) {
+            .save_project => {
+                const maybe = platform.saveFileDialog(gpa, self.io, .{
+                    .default_name = "untitled.vprj",
+                    .allowed_ext = "vprj",
+                }) catch return; // DialogFailed（headless）等は無視して RT 継続
+                const path = maybe orelse return;
+                defer gpa.free(path);
+                const final_path = ensureVprjExt(gpa, path) catch return;
+                defer gpa.free(final_path);
+                actionSaveProjectFile(self, final_path) catch {};
+            },
+            .open_project => {
+                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "vprj" }) catch return;
+                const path = maybe orelse return;
+                defer gpa.free(path);
+                // actionLoadProject と同じ経路（args = path）を呼ぶ。
+                var buf: [256]u8 = undefined;
+                _ = actionLoadProject(self, path, &buf) catch {};
+            },
+        }
+    }
 };
 
 // RT audio callback: dyn.processBlock のみ（同期/alloc/lock/IO/panic なし）。facade が audio probe を自動 tap。
@@ -735,8 +887,8 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         }
     }
 
-    // モジュールパレット（最前面・画面固定）
-    const buttons = paletteButtons(app.canvasW());
+    // モジュールパレット（最前面・画面固定）。GUI menu 行があるときはその下へずらす（TASK-136）。
+    const buttons = paletteButtons(app.canvasW(), app.paletteY0());
     for (buttons) |btn| {
         const rect = gui.Rect{ .x = safeI32(btn.rect.x), .y = safeI32(btn.rect.y), .w = safeU32(btn.rect.w), .h = safeU32(btn.rect.h) };
         const hov = canvas.hitTestPalette(app.mouse, &buttons) == btn.kind_index;
@@ -1215,7 +1367,7 @@ fn onMouseDown(app: *App) void {
     if (app.pointInInspectorPanel() or app.pointInTransportPanel()) return;
     // パレットは screen 座標で world hit より先に判定（追加/マクロ追加。1 操作 1 publish は
     // addByPaletteIndex/macro.buildDrumMachine 内）。
-    const buttons = paletteButtons(app.canvasW());
+    const buttons = paletteButtons(app.canvasW(), app.paletteY0());
     if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
         addByPaletteIndex(app, ki) catch {}; // PoolFull/TooManyModules は無視（追加せず）
         return;
@@ -1510,7 +1662,7 @@ fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec
 fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
     const zoom = app.camera.zoom;
     const margin: f32 = 16;
-    const top_limit: f32 = paletteBottom(app.canvasW()) + margin; // パレット帯の下端より下に置く
+    const top_limit: f32 = paletteBottom(app.canvasW(), app.paletteY0()) + margin; // パレット帯の下端より下に置く
     const fbw: f32 = app.canvasW();
     const fbh: f32 = @floatFromInt(app.fb_h);
     const max_x = @max(margin, fbw - fp.x * zoom - margin);
@@ -1893,6 +2045,9 @@ pub fn main(init: std.process.Init) !void {
     var window = try platform.Window.create(WIN_W, WIN_H, "patch canvas (modular)");
     defer window.destroy();
 
+    // TASK-136: native menu facade は Window.create 直後に手動で 1 回（app_runtime へは移行しない）。
+    // app は直後に stack 確定するので、menu 登録は app 初期化後に行う。
+
     // audio: open で sample rate を確定 → LofiPatch 構築 → 初期 publish → その後 start（初手から発音）。
     // RT callback は start 後にのみ発火するので、start 前に app を確定させれば安全（app は stack 固定・非ムーブ）。
     var app: App = undefined;
@@ -1929,6 +2084,14 @@ pub fn main(init: std.process.Init) !void {
     }
     registerGeneratedMacros(&app);
 
+    // TASK-136: native menu（headless は false → GUI fallback）。
+    app.rebuildMenuCommands();
+    if (window.nativeMenuAvailable()) {
+        app.native_menu_active = true;
+        window.registerMenu(app.menuCommandsSlice());
+    }
+    defer if (app.native_menu_active) window.destroyMenu();
+
     var dl = gui.DrawList.init(allocator);
     defer dl.deinit();
     var gui_ctx = gui.Context.init(allocator, gui.default_font);
@@ -1950,6 +2113,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "modular", .ctx = &app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
     platform.registerProbe(.{ .name = "panel", .ctx = &app, .ext = "json", .snapshot = null, .digest = panelDigest });
     platform.registerProbe(.{ .name = "params", .ctx = &app, .ext = "json", .snapshot = paramsSnapshot, .digest = paramsDigest });
+    platform.registerProbe(.{ .name = "menu", .ctx = &app, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending/last_op/native" });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
     app.cmd_exec.log = &app.cmd_log;
@@ -1967,132 +2131,182 @@ pub fn main(init: std.process.Init) !void {
 
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
-    var running = true;
-    main_loop: while (running and window.pollEvents()) {
-        const fb = window.lockFramebuffer() orelse continue :main_loop;
-        defer fb.unlock();
-        app.fb_w = fb.width;
-        app.fb_h = fb.height;
-        gui_ctx.beginFrame(fb.width, fb.height);
+    main_loop: while (app.running and window.pollEvents()) {
+        {
+            const fb = window.lockFramebuffer() orelse continue :main_loop;
+            defer fb.unlock();
+            app.fb_w = fb.width;
+            app.fb_h = fb.height;
+            gui_ctx.beginFrame(fb.width, fb.height);
 
-        // C: master タップを読み → mono downmix → spec/osc/meter へ供給。直近ブロックの rms/peak を latch。
-        var frame_sumsq: f64 = 0;
-        var frame_n: usize = 0;
-        var frame_peak: f32 = 0;
-        while (true) {
-            const n = app.tap.read(&stereo);
-            if (n < 2) break;
-            const frames = n / 2;
-            dsp.downmixStereoToMono(stereo[0 .. frames * 2], mono[0..frames]);
-            spec.feed(mono[0..frames]);
-            osc.feed(mono[0..frames]);
-            meter.feed(mono[0..frames]);
-            for (mono[0..frames]) |s| {
-                frame_sumsq += @as(f64, s) * @as(f64, s);
-                frame_peak = @max(frame_peak, @abs(s));
+            // C: master タップを読み → mono downmix → spec/osc/meter へ供給。直近ブロックの rms/peak を latch。
+            var frame_sumsq: f64 = 0;
+            var frame_n: usize = 0;
+            var frame_peak: f32 = 0;
+            while (true) {
+                const n = app.tap.read(&stereo);
+                if (n < 2) break;
+                const frames = n / 2;
+                dsp.downmixStereoToMono(stereo[0 .. frames * 2], mono[0..frames]);
+                spec.feed(mono[0..frames]);
+                osc.feed(mono[0..frames]);
+                meter.feed(mono[0..frames]);
+                for (mono[0..frames]) |s| {
+                    frame_sumsq += @as(f64, s) * @as(f64, s);
+                    frame_peak = @max(frame_peak, @abs(s));
+                }
+                frame_n += frames;
             }
-            frame_n += frames;
-        }
-        if (frame_n > 0) {
-            app.master_rms = @floatCast(@sqrt(frame_sumsq / @as(f64, @floatFromInt(frame_n))));
-            app.master_peak = frame_peak;
-        }
+            if (frame_n > 0) {
+                app.master_rms = @floatCast(@sqrt(frame_sumsq / @as(f64, @floatFromInt(frame_n))));
+                app.master_peak = frame_peak;
+            }
 
-        while (window.nextEvent()) |ev| {
-            switch (ev) {
-                .quit => running = false,
-                .key_down => |k| {
-                    switch (k.key) {
-                        .ESCAPE => running = false,
-                        .DELETE, .BACKSPACE => deleteSelected(&app),
-                        .H => {
-                            // TASK-125: modifier なし H のみ。Cmd/Ctrl/Alt/Shift+H は無視。
-                            if (!(k.modifiers.shift or k.modifiers.ctrl or k.modifiers.alt or k.modifiers.cmd)) {
-                                app.panels_hidden = !app.panels_hidden;
+            app.rebuildMenuCommands();
+
+            while (window.nextEvent()) |ev| {
+                switch (ev) {
+                    .quit => app.running = false,
+                    .key_down => |k| {
+                        // GUI fallback: メニューショートカット（Cmd/Ctrl+S/O）。native 時は OS が所有。
+                        if (!app.native_menu_active) {
+                            if (app.matchMenuShortcut(k)) |cmd_id| {
+                                app.dispatchCommand(cmd_id);
+                                continue;
                             }
-                        },
-                        else => {},
-                    }
-                },
-                .key_up => {},
-                .char_input => {},
-                .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 app 未消費（cross-cutting Event 追加）
-                .composition_changed => {}, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-                .menu_command => {}, // TASK-97.1: 97.2 の App.dispatchCommand 統合前は未消費
-                .file_drop => {}, // TASK-113.4: patch 未消費
-                .mouse_move => |m| {
-                    app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                    gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
-                    if (!app.pointInInspectorPanel() and
-                        !app.pointInTransportPanel() and
-                        gui_ctx.state.active_id == 0) onMouseMove(&app);
-                },
-                .mouse_down => |m| {
-                    const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
-                    gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
-                    if (m.button == .left) {
+                        }
+                        switch (k.key) {
+                            .ESCAPE => {
+                                if (!app.native_menu_active and app.menu_bar_state.open_title != null) {
+                                    app.menu_bar_state.open_title = null;
+                                } else {
+                                    app.running = false;
+                                }
+                            },
+                            .DELETE, .BACKSPACE => deleteSelected(&app),
+                            .H => {
+                                // TASK-125: modifier なし H のみ。Cmd/Ctrl/Alt/Shift+H は無視。
+                                if (!(k.modifiers.shift or k.modifiers.ctrl or k.modifiers.alt or k.modifiers.cmd)) {
+                                    app.panels_hidden = !app.panels_hidden;
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                    .key_up => {},
+                    .char_input => {},
+                    .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 app 未消費（cross-cutting Event 追加）
+                    .composition_changed => {}, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
+                    .menu_command => |id| app.dispatchCommand(id),
+                    .file_drop => {}, // TASK-113.4: patch 未消費
+                    .mouse_move => |m| {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        if (!app.pointInInspectorPanel() and
-                            !app.pointInTransportPanel() and
-                            gui_ctx.state.active_id == 0) onMouseDown(&app);
-                    }
-                },
-                .mouse_up => |m| {
-                    const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
-                    gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
-                    if (m.button == .left) {
-                        app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        if (gui_ctx.state.active_id == 0 and
+                        gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
+                        if (!app.pointInMenuBar() and
                             !app.pointInInspectorPanel() and
-                            !app.pointInTransportPanel()) onMouseUp(&app);
-                    }
-                },
-                .mouse_scroll => |s| {
-                    app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
-                    gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
-                    if (!app.pointInInspectorPanel() and !app.pointInTransportPanel()) {
-                        const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
-                        app.camera.zoomAt(app.mouse, factor);
-                        updateHover(&app);
-                    }
-                },
+                            !app.pointInTransportPanel() and
+                            gui_ctx.state.active_id == 0) onMouseMove(&app);
+                    },
+                    .mouse_down => |m| {
+                        const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
+                        gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
+                        if (m.button == .left) {
+                            app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
+                            if (!app.pointInMenuBar() and
+                                !app.pointInInspectorPanel() and
+                                !app.pointInTransportPanel() and
+                                gui_ctx.state.active_id == 0) onMouseDown(&app);
+                        }
+                    },
+                    .mouse_up => |m| {
+                        const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
+                        gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
+                        if (m.button == .left) {
+                            app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
+                            if (!app.pointInMenuBar() and
+                                gui_ctx.state.active_id == 0 and
+                                !app.pointInInspectorPanel() and
+                                !app.pointInTransportPanel()) onMouseUp(&app);
+                        }
+                    },
+                    .mouse_scroll => |s| {
+                        app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
+                        gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
+                        if (!app.pointInMenuBar() and !app.pointInInspectorPanel() and !app.pointInTransportPanel()) {
+                            const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
+                            app.camera.zoomAt(app.mouse, factor);
+                            updateHover(&app);
+                        }
+                    },
+                }
             }
-        }
 
-        // A/D: 活性度更新 + tap 対象の選択・publish（描画の直前・イベント反映後）。
-        // 生成レイヤ scalar は GUI/action の最新値を制御レートで atomic publish する。
-        publishControls(app.patch, app.params);
-        updateViz(&app);
-        app.beginParamFrame();
-        const transport_model = transportModel(&app);
+            // A/D: 活性度更新 + tap 対象の選択・publish（描画の直前・イベント反映後）。
+            // 生成レイヤ scalar は GUI/action の最新値を制御レートで atomic publish する。
+            publishControls(app.patch, app.params);
+            updateViz(&app);
+            app.beginParamFrame();
+            const transport_model = transportModel(&app);
 
-        @memset(fb.pixels, BG);
-        dl.reset(fb.width, fb.height);
-        drawFrame(&app, &dl);
-        const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &dl, gui.default_font);
-        // TASK-125: hidden 時は panel 描画を呼ばない（ヘッダーも残さない）。
-        if (!app.panels_hidden) {
-            const ir = canvas.inspectorVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.inspector_open);
-            const tr = canvas.transportVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.transport_open);
-            gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
-            transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), @intCast(fb.height), &transport_model, &app.transport_open, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
-            inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
-                .node => |h| h,
-                else => null,
-            } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app.inspector_open, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
+            @memset(fb.pixels, BG);
+            dl.reset(fb.width, fb.height);
+            drawFrame(&app, &dl);
+            const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
+            gui.render(target, &dl, gui.default_font);
+            // TASK-136: column = [optional menu row] + panels。menu 分だけ panels を content-relative にずらす。
+            const mtop_i: i32 = @intFromFloat(app.menuTopH());
+            gui_ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = @intCast(fb.height) } });
+            if (!app.native_menu_active) {
+                gui_ctx.beginBox(.{
+                    .direction = .row,
+                    .width = .{ .grow = 1 },
+                    .height = .{ .fixed = mtop_i },
+                    .padding = .{ 4, 4, 4, 4 },
+                    .gap = 5,
+                    .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
+                });
+                gui.menuBar(&gui_ctx, app.menuCommandsSlice(), &app.menu_bar_state);
+                gui_ctx.endBox();
+            }
+            // TASK-125: hidden 時は panel 描画を呼ばない（ヘッダーも残さない）。
+            if (!app.panels_hidden) {
+                var ir = canvas.inspectorVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.inspector_open);
+                var tr = canvas.transportVisibleRect(@floatFromInt(fb.width), app.canvasH(), app.transport_open);
+                if (mtop_i > 0) {
+                    const mtop_f: f32 = @floatFromInt(mtop_i);
+                    ir.y = @max(0.0, ir.y - mtop_f);
+                    tr.y = @max(0.0, tr.y - mtop_f);
+                    const content_h = @max(0.0, app.canvasH() - mtop_f);
+                    ir.h = @min(ir.h, @max(0.0, content_h - ir.y));
+                    tr.h = @min(tr.h, @max(0.0, content_h - tr.y));
+                }
+                const content_h_i: i32 = @max(0, @as(i32, @intCast(fb.height)) - mtop_i);
+                gui_ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = @intCast(fb.width) }, .height = .{ .fixed = content_h_i } });
+                transport.draw(&gui_ctx, .{ .x = safeI32(tr.x), .y = safeI32(tr.y), .w = safeU32(tr.w), .h = safeU32(tr.h) }, safeI32(ir.x), content_h_i, &transport_model, &app.transport_open, &app, displayTransportValue, &app, transportParamChanged, transportMuteChanged);
+                inspector.drawPanel(&gui_ctx, app.dyn, if (app.selected) |item| switch (item) {
+                    .node => |h| h,
+                    else => null,
+                } else null, .{ .x = safeI32(ir.x), .y = safeI32(ir.y), .w = safeU32(ir.w), .h = safeU32(ir.h) }, &app.inspector_open, &app, snapshotParamCallback, &app, displayInspectorValue, &app, inspectorChanged);
+                gui_ctx.endBox();
+            }
             gui_ctx.endBox();
-        }
-        if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
-        gui_ctx.endFrame();
-        app.captureParamRows(&gui_ctx);
-        app.advanceParamEdits();
-        app.drawGhostMarkers(&gui_ctx.draw_list);
-        gui.render(target, &gui_ctx.draw_list, gui.default_font);
-        // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
-        drawVizBand(&app, fb, spec, osc, &meter);
+            if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
+            gui_ctx.endFrame();
+            if (!app.native_menu_active) {
+                const menu_res = gui.menuBarPopup(&gui_ctx, app.menuCommandsSlice(), &app.menu_bar_state);
+                if (menu_res.selected) |id| app.dispatchCommand(id);
+            }
+            app.captureParamRows(&gui_ctx);
+            app.advanceParamEdits();
+            app.drawGhostMarkers(&gui_ctx.draw_list);
+            gui.render(target, &gui_ctx.draw_list, gui.default_font);
+            // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
+            drawVizBand(&app, fb, spec, osc, &meter);
 
-        window.present();
+            window.present();
+        }
+        // dialog は framebuffer unlock 後の安全点（platform.h 契約。TASK-136）。
+        if (app.running) app.runPendingMenuFileOp();
         platform.frameDelay(16_000_000);
     }
     std.debug.print("apps/patch: done.\n", .{});
@@ -2150,6 +2364,29 @@ fn patchDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 
 fn errDigest(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{{\"error\":\"digest overflow\"}}", .{}) catch buf[0..0];
+}
+
+/// menu digest（TASK-136）: 開閉・項目数・enabled/checked mask・pending/last_op/native。
+/// `open=<title|none> items=<n> enabled=<hex> checked=<hex> pending=<op|none> last_op=<op|none> native=<0|1>`
+fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const open = if (app.menu_bar_state.open_title) |t| t else "none";
+    var enabled_mask: u32 = 0;
+    var checked_mask: u32 = 0;
+    var items: u32 = 0;
+    for (app.menu_commands[0..app.menu_command_count]) |cmd| {
+        if (cmd.kind == .separator) continue;
+        if (items >= 32) break;
+        const bit: u32 = @as(u32, 1) << @intCast(items);
+        if (cmd.enabled) enabled_mask |= bit;
+        if (cmd.checked) checked_mask |= bit;
+        items += 1;
+    }
+    const pending = if (app.pending_menu_op) |op| @tagName(op) else "none";
+    const last_op = if (app.menu_last_op) |op| @tagName(op) else "none";
+    return std.fmt.bufPrint(buf, "open={s} items={d} enabled={X:0>8} checked={X:0>8} pending={s} last_op={s} native={d}", .{
+        open, items, enabled_mask, checked_mask, pending, last_op, @intFromBool(app.native_menu_active),
+    }) catch buf[0..0];
 }
 
 fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
