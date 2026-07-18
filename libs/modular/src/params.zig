@@ -59,6 +59,8 @@ const Binding = struct {
     desc: ParamDesc,
     get: *const fn (*const anyopaque) ParamValue,
     set: *const fn (*anyopaque, ParamValue) Error!void,
+    /// set と同一の受理判定（instance 不要）。set は必ずこれを呼んでから書く。
+    validate: *const fn (ParamValue) Error!void,
 };
 
 fn scalarDesc(name: []const u8, min: f32, max: f32, default: f32, step: f32, unit: []const u8) ParamDesc {
@@ -113,17 +115,22 @@ fn scalarBinding(comptime T: type, comptime field_name: []const u8, comptime des
             return .{ .scalar = numericRead(F, @field(self.*, field_name)) };
         }
 
-        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
-            const self: *T = @ptrCast(@alignCast(ctx));
+        fn validate(value: ParamValue) Error!void {
             const raw = switch (value) {
                 .scalar => |v| v,
                 .choice => return Error.WrongValueKind,
             };
             if (!std.math.isFinite(raw) or raw < limits.min or raw > limits.max) return Error.OutOfRange;
-            @field(self.*, field_name) = numericWrite(F, raw) orelse return Error.OutOfRange;
+            _ = numericWrite(F, raw) orelse return Error.OutOfRange;
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(self.*, field_name) = numericWrite(F, value.scalar).?;
         }
     };
-    return .{ .desc = desc, .get = Impl.get, .set = Impl.set };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
 fn nestedScalarBinding(comptime T: type, comptime outer: []const u8, comptime inner: []const u8, comptime desc: ParamDesc) Binding {
@@ -143,17 +150,22 @@ fn nestedScalarBinding(comptime T: type, comptime outer: []const u8, comptime in
             return .{ .scalar = numericRead(F, @field(@field(self.*, outer), inner)) };
         }
 
-        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
-            const self: *T = @ptrCast(@alignCast(ctx));
+        fn validate(value: ParamValue) Error!void {
             const raw = switch (value) {
                 .scalar => |v| v,
                 .choice => return Error.WrongValueKind,
             };
             if (!std.math.isFinite(raw) or raw < limits.min or raw > limits.max) return Error.OutOfRange;
-            @field(@field(self.*, outer), inner) = numericWrite(F, raw) orelse return Error.OutOfRange;
+            _ = numericWrite(F, raw) orelse return Error.OutOfRange;
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(@field(self.*, outer), inner) = numericWrite(F, value.scalar).?;
         }
     };
-    return .{ .desc = desc, .get = Impl.get, .set = Impl.set };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
 fn enumBinding(comptime T: type, comptime field_name: []const u8, comptime desc: ParamDesc) Binding {
@@ -179,17 +191,21 @@ fn enumBinding(comptime T: type, comptime field_name: []const u8, comptime desc:
             return .{ .choice = @intFromEnum(@field(self.*, field_name)) };
         }
 
-        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
-            const self: *T = @ptrCast(@alignCast(ctx));
+        fn validate(value: ParamValue) Error!void {
             const index = switch (value) {
                 .choice => |v| v,
                 .scalar => return Error.WrongValueKind,
             };
             if (index >= choice.options.len) return Error.ChoiceIndexOutOfRange;
-            @field(self.*, field_name) = @enumFromInt(index);
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(self.*, field_name) = @enumFromInt(value.choice);
         }
     };
-    return .{ .desc = desc, .get = Impl.get, .set = Impl.set };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
 fn nestedEnumBinding(comptime T: type, comptime outer: []const u8, comptime inner: []const u8, comptime desc: ParamDesc) Binding {
@@ -217,17 +233,21 @@ fn nestedEnumBinding(comptime T: type, comptime outer: []const u8, comptime inne
             return .{ .choice = @intFromEnum(@field(@field(self.*, outer), inner)) };
         }
 
-        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
-            const self: *T = @ptrCast(@alignCast(ctx));
+        fn validate(value: ParamValue) Error!void {
             const index = switch (value) {
                 .choice => |v| v,
                 .scalar => return Error.WrongValueKind,
             };
             if (index >= choice.options.len) return Error.ChoiceIndexOutOfRange;
-            @field(@field(self.*, outer), inner) = @enumFromInt(index);
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(@field(self.*, outer), inner) = @enumFromInt(value.choice);
         }
     };
-    return .{ .desc = desc, .get = Impl.get, .set = Impl.set };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
 fn nestedBoolBinding(comptime T: type, comptime outer: []const u8, comptime inner: []const u8, comptime desc: ParamDesc) Binding {
@@ -251,17 +271,21 @@ fn nestedBoolBinding(comptime T: type, comptime outer: []const u8, comptime inne
             return .{ .choice = if (@field(@field(self.*, outer), inner)) 1 else 0 };
         }
 
-        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
-            const self: *T = @ptrCast(@alignCast(ctx));
+        fn validate(value: ParamValue) Error!void {
             const index = switch (value) {
                 .choice => |v| v,
                 .scalar => return Error.WrongValueKind,
             };
             if (index >= choice.options.len) return Error.ChoiceIndexOutOfRange;
-            @field(@field(self.*, outer), inner) = index == 1;
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(@field(self.*, outer), inner) = value.choice == 1;
         }
     };
-    return .{ .desc = desc, .get = Impl.get, .set = Impl.set };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
 fn boolBinding(comptime T: type, comptime field_name: []const u8, comptime desc: ParamDesc) Binding {
@@ -283,17 +307,21 @@ fn boolBinding(comptime T: type, comptime field_name: []const u8, comptime desc:
             return .{ .choice = if (@field(self.*, field_name)) 1 else 0 };
         }
 
-        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
-            const self: *T = @ptrCast(@alignCast(ctx));
+        fn validate(value: ParamValue) Error!void {
             const index = switch (value) {
                 .choice => |v| v,
                 .scalar => return Error.WrongValueKind,
             };
             if (index >= choice.options.len) return Error.ChoiceIndexOutOfRange;
-            @field(self.*, field_name) = index == 1;
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(self.*, field_name) = value.choice == 1;
         }
     };
-    return .{ .desc = desc, .get = Impl.get, .set = Impl.set };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
 const osc_options = [_][]const u8{ "sine", "saw", "square", "triangle" };
@@ -637,6 +665,21 @@ pub fn setParam(graph: *dyn.DynGraph, h: dyn.Handle, name: []const u8, value: Pa
     };
 }
 
+fn validateForKind(comptime k: dyn.ModuleKind, name: []const u8, value: ParamValue) Error!void {
+    for (bindings(k)) |binding| {
+        if (std.mem.eql(u8, binding.desc.name, name)) return binding.validate(value);
+    }
+    return Error.UnknownParam;
+}
+
+/// 実 module インスタンス無しで `setParam` と同一の受理判定を行う（NPRM clearGraph 前検証用）。
+/// WrongValueKind / OutOfRange（非有限・range 外・整数バックの非整数）/ ChoiceIndexOutOfRange / UnknownParam。
+pub fn validateParam(kind: dyn.ModuleKind, name: []const u8, value: ParamValue) Error!void {
+    return switch (kind) {
+        inline else => |comptime_kind| validateForKind(comptime_kind, name, value),
+    };
+}
+
 test "params: every ModuleKind has valid, unique descriptors" {
     inline for (std.enums.values(dyn.ModuleKind)) |kind| {
         const list = descriptors(kind);
@@ -768,6 +811,62 @@ test "params: invalid handles, names, value kinds, and ranges are explicit error
 
     graph.removeModule(h);
     try std.testing.expectError(Error.InactiveHandle, getParam(graph, h, "gain"));
+}
+
+fn expectSetValidateAgree(graph: *dyn.DynGraph, h: dyn.Handle, kind: dyn.ModuleKind, name: []const u8, value: ParamValue) !void {
+    const set_result = setParam(graph, h, name, value);
+    const val_result = validateParam(kind, name, value);
+    if (set_result) |_| {
+        try val_result;
+    } else |set_err| {
+        try std.testing.expectError(set_err, val_result);
+    }
+}
+
+test "params: validateParam agrees with setParam for all kinds/descriptors" {
+    var graph = try dyn.DynGraph.create(std.testing.allocator, 48000);
+    defer graph.destroy();
+
+    var comparisons: usize = 0;
+    inline for (std.enums.values(dyn.ModuleKind)) |kind| {
+        const h = try graph.add(kind, .{});
+        for (descriptors(kind)) |desc| {
+            switch (desc.kind) {
+                .scalar => |s| {
+                    const mid = s.min + (s.max - s.min) * 0.5;
+                    const samples = [_]ParamValue{
+                        .{ .scalar = s.min },
+                        .{ .scalar = s.max },
+                        .{ .scalar = mid },
+                        .{ .scalar = mid + 0.5 },
+                        .{ .scalar = std.math.nan(f32) },
+                        .{ .choice = 0 }, // WrongValueKind
+                    };
+                    for (samples) |value| {
+                        try expectSetValidateAgree(graph, h, kind, desc.name, value);
+                        comparisons += 1;
+                    }
+                },
+                .choice => |c| {
+                    var index: usize = 0;
+                    while (index < c.options.len) : (index += 1) {
+                        try expectSetValidateAgree(graph, h, kind, desc.name, .{ .choice = index });
+                        comparisons += 1;
+                    }
+                    try expectSetValidateAgree(graph, h, kind, desc.name, .{ .choice = c.options.len });
+                    comparisons += 1;
+                    try expectSetValidateAgree(graph, h, kind, desc.name, .{ .scalar = 0.0 });
+                    comparisons += 1;
+                },
+            }
+        }
+        // 次 kind 用に slot を空ける（pool 枯渇回避）
+        graph.removeModule(h);
+    }
+    // 組合せ数の下限（descriptor 増減で変わりうるが 0 ではないこと）
+    try std.testing.expect(comparisons > 100);
+    // テスト報告用に件数を固定ログ（失敗時の再現用）
+    std.debug.print("validateParam/setParam comparisons={d}\n", .{comparisons});
 }
 
 test "params: dirty-gated coefficient updates observe source fields on the next block" {

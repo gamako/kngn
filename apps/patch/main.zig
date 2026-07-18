@@ -2899,11 +2899,60 @@ fn collectNodesEdges(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, ed
     return .{ .nodes = node_buf[0..nn], .edges = edge_buf[0..flat.len] };
 }
 
-fn buildEncodeInput(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edge_buf: *[MAX_EDGES]project_io.EdgeEntry) project_io.EncodeInput {
+/// active node の descriptor source field を NPRM 用に収集（instant は保存しない）。
+/// `param_bufs` は各 node の parameter 値 scratch（name は descriptor 静的文字列を指す）。
+fn collectNodeParams(
+    app: *App,
+    record_buf: *[MAX_MODULES]project_io.NodeParamRecord,
+    param_bufs: *[MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam,
+) []project_io.NodeParamRecord {
+    var rn: usize = 0;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (!app.dyn.slotActive(h)) continue;
+        const kind = app.dyn.kindOf(h).?;
+        const descs = switch (kind) {
+            inline else => |comptime_kind| modular.descriptors(comptime_kind),
+        };
+        var pn: usize = 0;
+        for (descs) |desc| {
+            std.debug.assert(pn < project_io.MAX_PARAMS_PER_NODE);
+            const value = modular.getParam(app.dyn, h, desc.name) catch continue;
+            param_bufs[rn][pn] = switch (value) {
+                .scalar => |v| .{
+                    .name = desc.name,
+                    .value_kind = project_io.VALUE_KIND_SCALAR,
+                    .value = @bitCast(v),
+                },
+                .choice => |idx| .{
+                    .name = desc.name,
+                    .value_kind = project_io.VALUE_KIND_CHOICE,
+                    .value = @intCast(idx),
+                },
+            };
+            pn += 1;
+        }
+        record_buf[rn] = .{
+            .saved_handle = h,
+            .params = param_bufs[rn][0..pn],
+        };
+        rn += 1;
+    }
+    return record_buf[0..rn];
+}
+
+fn buildEncodeInput(
+    app: *App,
+    node_buf: *[MAX_MODULES]project_io.NodeEntry,
+    edge_buf: *[MAX_EDGES]project_io.EdgeEntry,
+    nprm_buf: *[MAX_MODULES]project_io.NodeParamRecord,
+    param_bufs: *[MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam,
+) project_io.EncodeInput {
     const patch = app.patch;
     const cmd = stateToCommand(patch.snapshotState());
     const st = patch.snapshotState();
     const ne = collectNodesEdges(app, node_buf, edge_buf);
+    const nprm = collectNodeParams(app, nprm_buf, param_bufs);
     return .{
         .pattern = patternToPayload(cmd),
         .seed = .{
@@ -2914,6 +2963,7 @@ fn buildEncodeInput(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edg
         .song = songToPayload(app.song),
         .nodes = ne.nodes,
         .edges = ne.edges,
+        .node_params = nprm,
         .ledger = &app.ledger,
         .genr = patch.snapshotGenRoles(),
     };
@@ -2922,7 +2972,9 @@ fn buildEncodeInput(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edg
 fn actionSaveProjectFile(app: *App, path: []const u8) !void {
     var node_buf: [MAX_MODULES]project_io.NodeEntry = undefined;
     var edge_buf: [MAX_EDGES]project_io.EdgeEntry = undefined;
-    const input = buildEncodeInput(app, &node_buf, &edge_buf);
+    var nprm_buf: [MAX_MODULES]project_io.NodeParamRecord = undefined;
+    var param_bufs: [MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam = undefined;
+    const input = buildEncodeInput(app, &node_buf, &edge_buf, &nprm_buf, &param_bufs);
     try project_io.save(app.io, path, Params, app.params, input, std.heap.c_allocator);
 }
 
@@ -2963,7 +3015,13 @@ fn applyGraphReplace(
     edges: []const project_io.EdgeEntry,
     ledger_src: ?*const group.Ledger,
     genr_src: ?project_io.GenRoleHandles,
+    node_params: ?[]const project_io.NodeParamRecord,
 ) !GraphApplyResult {
+    // 不正 NPRM は clearGraph 前に reject（graph を破壊しない）
+    if (node_params) |records| {
+        try project_io.validateNodeParams(nodes, records);
+    }
+
     try ensureReplaceCapacity(app, nodes);
     clearGraph(app);
     try app.dyn.publish();
@@ -2991,6 +3049,27 @@ fn applyGraphReplace(
         mapping[n.handle] = nh;
         nodes_restored += 1;
     }
+
+    // NPRM: node 再生成後・最終 publish 前に source field を適用（型デフォルトの 1-block transient 回避）
+    if (node_params) |records| {
+        for (records) |rec| {
+            if (rec.saved_handle >= MAX_MODULES) continue;
+            const nh = mapping[rec.saved_handle] orelse continue;
+            for (rec.params) |p| {
+                const value: modular.ParamValue = switch (p.value_kind) {
+                    project_io.VALUE_KIND_SCALAR => .{ .scalar = @bitCast(p.value) },
+                    project_io.VALUE_KIND_CHOICE => .{ .choice = @intCast(p.value) },
+                    else => continue,
+                };
+                modular.setParam(app.dyn, nh, p.name, value) catch |err| {
+                    // validate 済みなので本来到達不能。グラフを空のまま放置しない。
+                    std.log.warn("applyGraphReplace: setParam skipped h={d} name={s} err={s}", .{ nh, p.name, @errorName(err) });
+                    continue;
+                };
+            }
+        }
+    }
+
     var edges_restored: usize = 0;
     for (edges) |e| {
         if (e.src_handle >= MAX_MODULES or e.dst_handle >= MAX_MODULES) continue;
@@ -3074,11 +3153,12 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 
     const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .vprj) &decoded.ledger else null;
     const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .vprj) decoded.genr else null;
+    const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     // PTCG: apply_ledger/genr は true だが空/INVALID（decodeFromPtcg）
     const result = if (decoded.format == .ptcg)
-        try applyGraphReplace(app, decoded.nodes, decoded.edges, null, null)
+        try applyGraphReplace(app, decoded.nodes, decoded.edges, null, null, null)
     else
-        try applyGraphReplace(app, decoded.nodes, decoded.edges, ledger_ptr, genr_opt);
+        try applyGraphReplace(app, decoded.nodes, decoded.edges, ledger_ptr, genr_opt, nprm_opt);
 
     return std.fmt.bufPrint(buf, "nodes={d}/{d} edges={d}/{d}", .{
         result.nodes_restored, decoded.nodes.len, result.edges_restored, decoded.edges.len,
@@ -3130,7 +3210,9 @@ fn integratedStateSyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anye
     const app = actionApp(ctx);
     var node_buf: [MAX_MODULES]project_io.NodeEntry = undefined;
     var edge_buf: [MAX_EDGES]project_io.EdgeEntry = undefined;
-    const input = buildEncodeInput(app, &node_buf, &edge_buf);
+    var nprm_buf: [MAX_MODULES]project_io.NodeParamRecord = undefined;
+    var param_bufs: [MAX_MODULES][project_io.MAX_PARAMS_PER_NODE]project_io.NodeParam = undefined;
+    const input = buildEncodeInput(app, &node_buf, &edge_buf, &nprm_buf, &param_bufs);
     return project_io.encode(Params, allocator, app.params, input);
 }
 
@@ -3142,7 +3224,8 @@ fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     if (decoded.format != .vprj) return error.UnsupportedFormat;
 
     // 検証完了後にのみ破壊的適用（capacity は applyGraphReplace 内）
-    _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr);
+    const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
+    _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr, nprm_opt);
     applyParamsPattern(app, decoded.params, decoded.pattern);
     applySeedSong(app, decoded.seed, decoded.song);
 }
@@ -3895,10 +3978,11 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     if (loaded.apply_graph) {
         const ledger_ptr: ?*const group.Ledger = if (loaded.apply_ledger and loaded.format == .vprj) &loaded.ledger else null;
         const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .vprj) loaded.genr else null;
+        const nprm_opt: ?[]const project_io.NodeParamRecord = if (loaded.apply_node_params) loaded.node_params else null;
         const result = if (loaded.format == .ptcg)
-            try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null)
+            try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null)
         else
-            try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt);
+            try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt, nprm_opt);
         if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern);
         if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
         return std.fmt.bufPrint(buf, "format={s} nodes={d}/{d} edges={d}/{d}", .{

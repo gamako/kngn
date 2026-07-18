@@ -38,6 +38,7 @@ pub const descriptors = params.descriptors;
 pub const getParam = params.getParam;
 pub const getParamSnapshot = params.getParamSnapshot;
 pub const setParam = params.setParam;
+pub const validateParam = params.validateParam;
 
 // TASK-40.8 D: per-port tap（ポート別ミニ oscilloscope）。
 pub const TapConfig = graph_core.TapConfig;
