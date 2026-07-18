@@ -1487,6 +1487,8 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
                                                                styleMask:styleMask
                                                                  backing:NSBackingStoreBuffered
                                                                    defer:NO];
+        // TASK-139: window tabbing を無効化（保存 defaults / システム設定に依存させず描画領域を full height に保つ）
+        [platformWindow->window setTabbingMode:NSWindowTabbingModeDisallowed];
 
         [platformWindow->window setTitle:[NSString stringWithUTF8String:title]];
 

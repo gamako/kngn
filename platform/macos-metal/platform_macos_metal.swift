@@ -1447,6 +1447,8 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     let window: NSWindow = borderless
         ? MascotWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
         : NSWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
+    // TASK-139: window tabbing を無効化（保存 defaults / システム設定に依存させず描画領域を full height に保つ）
+    window.tabbingMode = .disallowed
 
     // タイトルを設定
     window.title = String(cString: title)
