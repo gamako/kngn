@@ -1068,6 +1068,86 @@ test "任意サイズ round-trip（document_io 自体は size 非依存。256 �
     try testing.expectEqualSlices(u32, doc.activeCanvas().layerPixels(0), loaded.activeCanvas().layerPixels(0));
 }
 
+/// resize 後 Document と encode→decode 結果の構造・画素・リンク関係を比較する（CelId 値は再採番され得る）。
+fn expectResizePixRoundTrip(src: *Document, gpa: Allocator) !void {
+    const bytes = try encodeDocument(src, gpa);
+    defer gpa.free(bytes);
+    var loaded = try decodeDocument(bytes, gpa);
+    defer loaded.deinit();
+
+    try testing.expectEqual(src.width, loaded.width);
+    try testing.expectEqual(src.height, loaded.height);
+    try testing.expectEqual(src.layers.items.len, loaded.layers.items.len);
+    try testing.expectEqual(src.frames.items.len, loaded.frames.items.len);
+
+    const nframes = src.frames.items.len;
+    for (0..src.layers.items.len) |li| {
+        for (0..nframes) |fi| {
+            const a = src.gridGet(li, @intCast(fi));
+            const b = loaded.gridGet(li, @intCast(fi));
+            try testing.expectEqual(a == null, b == null);
+            if (a) |aid| {
+                const bid = b.?;
+                try testing.expectEqualSlices(u32, src.cel_pool.items[aid].?.pixels, loaded.cel_pool.items[bid].?.pixels);
+                try testing.expectEqual(src.cel_pool.items[aid].?.refcount, loaded.cel_pool.items[bid].?.refcount);
+            }
+            // 同一 layer 内の共有リンク（同 CelId）が decode 後も同値になること
+            for (fi + 1..nframes) |fj| {
+                const same_src = blk: {
+                    const x = src.gridGet(li, @intCast(fi));
+                    const y = src.gridGet(li, @intCast(fj));
+                    break :blk x != null and y != null and x.? == y.?;
+                };
+                const same_dst = blk: {
+                    const x = loaded.gridGet(li, @intCast(fi));
+                    const y = loaded.gridGet(li, @intCast(fj));
+                    break :blk x != null and y != null and x.? == y.?;
+                };
+                try testing.expectEqual(same_src, same_dst);
+            }
+        }
+    }
+    // active_view も新サイズで一致
+    try testing.expectEqual(src.active_view.width, loaded.active_view.width);
+    try testing.expectEqual(src.active_view.height, loaded.active_view.height);
+    try testing.expectEqual(src.active_view.layers.items.len, loaded.active_view.layers.items.len);
+    for (src.active_view.layers.items, loaded.active_view.layers.items) |sa, la| {
+        try testing.expectEqualSlices(u32, sa.pixels, la.pixels);
+    }
+}
+
+test "Document.resize → encode/decode round-trip（縮小・拡大・multi-layer/frame/linked-cel。TASK-144.1）" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    _ = try doc.addLayer(gpa); // layer1 に ensureCelAt で cel が先に付く
+    try doc.addFrame(gpa, 1);
+
+    const cel0 = doc.createCel(gpa, 0, 0);
+    doc.cel_pool.items[cel0].?.pixels[0] = 0xFFFF0000; // (0,0)
+    doc.cel_pool.items[cel0].?.pixels[5] = 0xFF00FF00; // (1,1)
+    try doc.linkCel(gpa, 0, 1, 0); // frame1 → 同一 CelId
+    const cel1 = doc.createCel(gpa, 1, 0);
+    doc.cel_pool.items[cel1].?.pixels[0] = 0xFF0000FF;
+    doc.resyncActiveView(gpa);
+
+    try testing.expectEqual(cel0, doc.gridGet(0, 1).?);
+    try testing.expect(doc.cel_pool.items[cel0].?.refcount >= 2);
+
+    // 縮小: 左上 2x2 保持
+    try doc.resize(gpa, 2, 2);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
+    try testing.expectEqual(@as(u32, 0xFF00FF00), doc.cel_pool.items[cel0].?.pixels[3]); // (1,1)
+    try expectResizePixRoundTrip(&doc, gpa);
+
+    // 拡大: 元内容を左上保持・新領域 0
+    try doc.resize(gpa, 6, 5);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
+    try testing.expectEqual(@as(u32, 0), doc.cel_pool.items[cel0].?.pixels[2]);
+    try expectResizePixRoundTrip(&doc, gpa);
+}
+
 // TASK-95: PNG open 相当（reset → active_view 直書き → commitActiveLayerToCel）後に
 // saveDocument → loadDocument で pixels が bit 一致すること（cel 未書き戻しだと空 .pix になる）。
 test "TASK-95: reset + layerPixels 直書き + commitActiveLayerToCel → save/load pixels bit 一致" {

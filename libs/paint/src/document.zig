@@ -1301,6 +1301,82 @@ pub const Document = struct {
         self.resyncActiveView(gpa);
     }
 
+    /// キャンバスサイズ変更（内容保持・左上基準クロップ/パディング）。
+    /// イベント時のみ（アクション/メニュー確定）。フレーム毎・RT ではない。
+    ///
+    /// - `new_w==0` / `new_h==0` / `new_w*new_h` overflow → 状態不変で recoverable error。
+    /// - 同サイズ → no-op。
+    /// - build-new-before-swap: 新 cel_pool / active_view を完全構築してから一括置換。
+    ///   **swap 前**の構築失敗時は新リソースのみ解放し Document を壊さない。
+    ///   swap 後の `resyncActiveView` の OOM は既存経路同様 `@panic`（ADR-006 方針）。
+    /// - CelId / layer / frame 参照関係は維持。live Cel のピクセル配列のみ新サイズ確保。
+    /// - 置換後に `resyncActiveView` → 旧リソース解放 → undo 履歴クリア（旧 PixelDiff.idx 無効化）。
+    pub fn resize(self: *Document, gpa: Allocator, new_w: u32, new_h: u32) error{ InvalidSize, SizeOverflow, OutOfMemory }!void {
+        if (new_w == 0 or new_h == 0) return error.InvalidSize;
+        const new_n = std.math.mul(usize, new_w, new_h) catch return error.SizeOverflow;
+        // 画素配列のバイト数も overflow しないこと（u32×u32 は 64-bit usize に収まるが ×4 で溢れる）
+        _ = std.math.mul(usize, new_n, @sizeOf(u32)) catch return error.SizeOverflow;
+        if (self.width == new_w and self.height == new_h) return;
+
+        const old_w = self.width;
+        const old_h = self.height;
+        const copy_w: usize = @min(old_w, new_w);
+        const copy_h: usize = @min(old_h, new_h);
+
+        var new_pool: std.ArrayList(?Cel) = .empty;
+        var pool_transferred = false;
+        errdefer if (!pool_transferred) {
+            for (new_pool.items) |maybe| if (maybe) |cel| gpa.free(cel.pixels);
+            new_pool.deinit(gpa);
+        };
+        try new_pool.ensureTotalCapacity(gpa, self.cel_pool.items.len);
+        for (self.cel_pool.items) |maybe_old| {
+            if (maybe_old) |old_cel| {
+                const pixels = try gpa.alloc(u32, new_n);
+                errdefer gpa.free(pixels);
+                @memset(pixels, 0);
+                var y: usize = 0;
+                while (y < copy_h) : (y += 1) {
+                    const src_off = y * old_w;
+                    const dst_off = y * new_w;
+                    @memcpy(pixels[dst_off..][0..copy_w], old_cel.pixels[src_off..][0..copy_w]);
+                }
+                new_pool.appendAssumeCapacity(.{ .pixels = pixels, .refcount = old_cel.refcount });
+            } else {
+                new_pool.appendAssumeCapacity(null);
+            }
+        }
+
+        var new_view = try Canvas.init(gpa, new_w, new_h);
+        var view_transferred = false;
+        errdefer if (!view_transferred) new_view.deinit();
+        new_view.system_font = self.active_view.system_font;
+
+        // ここから infallible（新リソース所有を Document へ移す）
+        const old_pool = self.cel_pool;
+        const old_view = self.active_view;
+        self.width = new_w;
+        self.height = new_h;
+        self.cel_pool = new_pool;
+        pool_transferred = true;
+        self.active_view = new_view;
+        view_transferred = true;
+
+        self.resyncActiveView(gpa);
+
+        for (old_pool.items) |maybe| if (maybe) |cel| gpa.free(cel.pixels);
+        {
+            var pool = old_pool;
+            pool.deinit(gpa);
+        }
+        {
+            var view = old_view;
+            view.deinit();
+        }
+
+        self.undo.clearHistoryPreservingHandles(gpa);
+    }
+
     /// PNG open 用: doc/active_view を「1layer・1frame・1cel(空)」状態へ縮める。
     /// `active_view` は再init せず既存構造を縮める（plan 4.2節の制約準拠）。undo/redo も破棄する。
     pub fn resetToSingleBlankLayer(self: *Document, gpa: Allocator) void {
@@ -2191,4 +2267,107 @@ test "shouldAdvance: 追いつき無し（0.35s 経過でも 1 tick で 1 frame�
     // f64 の 0.1 は非有限小数なので境界ちょうどではなく 0.5× / 1.5× で固定する。
     try testing.expect(!shouldAdvance(last_after + interval * 0.5, last_after, interval));
     try testing.expect(shouldAdvance(last_after + interval * 1.5, last_after, interval));
+}
+
+// ── Document.resize（TASK-144.1）────────────────────────────────────────
+
+test "Document.resize: 4x3→2x2 左上保持 / 4x3→6x5 新領域0 / undo depth 0" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 3);
+    defer doc.deinit();
+
+    // cel を確保して既知パターンを書く（行 major: y*w+x）
+    _ = doc.createCel(gpa, 0, 0);
+    const px = doc.cel_pool.items[0].?.pixels;
+    px[0] = 0xFF000001; // (0,0)
+    px[1] = 0xFF000002; // (1,0)
+    px[4] = 0xFF000003; // (0,1)
+    px[5] = 0xFF000004; // (1,1)
+    px[8] = 0xFF000005; // (0,2) — crop で落ちる
+    doc.resyncActiveView(gpa);
+    doc.undo.push(gpa, testVisOp(0));
+    try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len);
+
+    try doc.resize(gpa, 2, 2);
+    try testing.expectEqual(@as(u32, 2), doc.width);
+    try testing.expectEqual(@as(u32, 2), doc.height);
+    try testing.expectEqual(@as(u32, 2), doc.active_view.width);
+    try testing.expectEqual(@as(u32, 2), doc.active_view.height);
+    try testing.expectEqual(@as(usize, 4), doc.active_view.composite_cache.len);
+    try testing.expectEqual(@as(usize, 0), doc.undo.undo.items.len);
+    try testing.expectEqual(@as(usize, 0), doc.undo.redo.items.len);
+
+    const shrunk = doc.cel_pool.items[0].?.pixels;
+    try testing.expectEqual(@as(usize, 4), shrunk.len);
+    try testing.expectEqual(@as(u32, 0xFF000001), shrunk[0]);
+    try testing.expectEqual(@as(u32, 0xFF000002), shrunk[1]);
+    try testing.expectEqual(@as(u32, 0xFF000003), shrunk[2]);
+    try testing.expectEqual(@as(u32, 0xFF000004), shrunk[3]);
+    try testing.expectEqual(@as(u32, 0xFF000001), doc.active_view.layerPixels(0)[0]);
+
+    try doc.resize(gpa, 6, 5);
+    try testing.expectEqual(@as(u32, 6), doc.width);
+    try testing.expectEqual(@as(u32, 5), doc.height);
+    const grown = doc.cel_pool.items[0].?.pixels;
+    try testing.expectEqual(@as(usize, 30), grown.len);
+    try testing.expectEqual(@as(u32, 0xFF000001), grown[0]);
+    try testing.expectEqual(@as(u32, 0xFF000002), grown[1]);
+    try testing.expectEqual(@as(u32, 0), grown[2]); // 新領域
+    try testing.expectEqual(@as(u32, 0xFF000003), grown[6]); // y=1
+    try testing.expectEqual(@as(u32, 0xFF000004), grown[7]);
+    try testing.expectEqual(@as(u32, 0), grown[12]); // y=2 は旧 2x2 に無い → 0
+    try testing.expectEqual(@as(usize, 30), doc.active_view.composite_cache.len);
+}
+
+test "Document.resize: multi-layer/frame/linked-cel 参照保持 / 同サイズ no-op / 0・overflow で不変" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, 4, 4);
+    defer doc.deinit();
+
+    _ = try doc.addLayer(gpa); // layer1 に ensureCelAt で cel が先に付く点に注意
+    try doc.addFrame(gpa, 1);
+    const cel0 = doc.createCel(gpa, 0, 0);
+    doc.cel_pool.items[cel0].?.pixels[0] = 0xFFFF0000;
+    doc.cel_pool.items[cel0].?.pixels[5] = 0xFF00FF00;
+    try doc.linkCel(gpa, 0, 1, 0); // frame1 → 同じ CelId
+    const cel1 = doc.createCel(gpa, 1, 0);
+    doc.cel_pool.items[cel1].?.pixels[0] = 0xFF0000FF;
+    doc.resyncActiveView(gpa);
+
+    try testing.expectEqual(cel0, doc.gridGet(0, 1).?);
+    try testing.expect(cel0 != cel1);
+    const ref_before = doc.cel_pool.items[cel0].?.refcount;
+
+    // 不正サイズ: 状態不変
+    const w_before = doc.width;
+    const h_before = doc.height;
+    const pool_len_before = doc.cel_pool.items.len;
+    const red_before = doc.cel_pool.items[cel0].?.pixels[0];
+    try testing.expectEqual(@as(u32, 0xFFFF0000), red_before);
+    try testing.expectError(error.InvalidSize, doc.resize(gpa, 0, 16));
+    try testing.expectError(error.InvalidSize, doc.resize(gpa, 16, 0));
+    try testing.expectError(error.SizeOverflow, doc.resize(gpa, std.math.maxInt(u32), std.math.maxInt(u32)));
+    try testing.expectEqual(w_before, doc.width);
+    try testing.expectEqual(h_before, doc.height);
+    try testing.expectEqual(pool_len_before, doc.cel_pool.items.len);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
+
+    // 同サイズ no-op（ポインタ維持）
+    const px_ptr = doc.cel_pool.items[cel0].?.pixels.ptr;
+    try doc.resize(gpa, 4, 4);
+    try testing.expect(doc.cel_pool.items[cel0].?.pixels.ptr == px_ptr);
+
+    try doc.resize(gpa, 2, 2);
+    try testing.expectEqual(cel0, doc.gridGet(0, 0).?);
+    try testing.expectEqual(cel0, doc.gridGet(0, 1).?);
+    try testing.expectEqual(cel1, doc.gridGet(1, 0).?);
+    try testing.expectEqual(ref_before, doc.cel_pool.items[cel0].?.refcount);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
+    // (1,1) = idx 5 on 4x4 → (1,1) = idx 3 on 2x2
+    try testing.expectEqual(@as(u32, 0xFF00FF00), doc.cel_pool.items[cel0].?.pixels[3]);
+    try testing.expectEqual(@as(u32, 0xFF0000FF), doc.cel_pool.items[cel1].?.pixels[0]);
+    try testing.expectEqual(@as(usize, 2), doc.layers.items.len);
+    try testing.expectEqual(@as(usize, 2), doc.frames.items.len);
+    try testing.expectEqual(@as(u32, 2), doc.active_view.width);
+    try testing.expectEqual(@as(usize, 2), doc.active_view.layers.items.len);
 }

@@ -551,6 +551,38 @@ pub fn parseShape(args: []const u8, canvas_w: i32, canvas_h: i32) ParseError!Sha
     return .{ .kind = kind, .p0 = p0, .p1 = p1, .fill = fill };
 }
 
+/// キャンバスサイズ（resize / new W H）。上限は呼び出し側の共通 validator が適用する。
+pub const CanvasSize = struct { w: u32, h: u32 };
+
+/// `resize W H` 相当: 引数厳密 2・符号なし整数。0 は ValueOutOfRange。
+pub fn parseCanvasSize(args: []const u8) ParseError!CanvasSize {
+    var it = tokenize(args);
+    const w_tok = it.next() orelse return error.Empty;
+    const h_tok = it.next() orelse return error.Empty;
+    const w = std.fmt.parseUnsigned(u32, w_tok, 10) catch return error.InvalidNumber;
+    const h = std.fmt.parseUnsigned(u32, h_tok, 10) catch return error.InvalidNumber;
+    if (w == 0 or h == 0) return error.ValueOutOfRange;
+    try expectExhausted(&it);
+    return .{ .w = w, .h = h };
+}
+
+/// `new` / `new W H`。0 引数 = 現サイズ blank reset（後方互換）。2 引数 = 指定サイズ新規。
+pub const NewArgs = union(enum) {
+    reset_current,
+    sized: CanvasSize,
+};
+
+pub fn parseNew(args: []const u8) ParseError!NewArgs {
+    var it = tokenize(args);
+    const w_tok = it.next() orelse return .reset_current;
+    const h_tok = it.next() orelse return error.Empty;
+    const w = std.fmt.parseUnsigned(u32, w_tok, 10) catch return error.InvalidNumber;
+    const h = std.fmt.parseUnsigned(u32, h_tok, 10) catch return error.InvalidNumber;
+    if (w == 0 or h == 0) return error.ValueOutOfRange;
+    try expectExhausted(&it);
+    return .{ .sized = .{ .w = w, .h = h } };
+}
+
 /// `set_symmetry <off|v|h|quad>`
 pub fn parseSymmetry(args: []const u8) ParseError!SymmetryMode {
     var it = tokenize(args);
@@ -1062,6 +1094,39 @@ test "parseShape: 座標 / アンカー / fill / エラー" {
     // 端点 inclusive（w-1,h-1）は受理
     const edge = try parseShape("line 0,0 15,15", 16, 16);
     try testing.expectEqual(Point{ .x = 15, .y = 15 }, edge.p1);
+}
+
+test "parseCanvasSize / parseNew: 受理と拒否（TASK-144.1）" {
+    const sz = try parseCanvasSize("32 16");
+    try testing.expectEqual(@as(u32, 32), sz.w);
+    try testing.expectEqual(@as(u32, 16), sz.h);
+
+    try testing.expectError(error.Empty, parseCanvasSize(""));
+    try testing.expectError(error.Empty, parseCanvasSize("32"));
+    try testing.expectError(error.TooManyTokens, parseCanvasSize("32 16 extra"));
+    try testing.expectError(error.ValueOutOfRange, parseCanvasSize("0 16"));
+    try testing.expectError(error.ValueOutOfRange, parseCanvasSize("16 0"));
+    try testing.expectError(error.InvalidNumber, parseCanvasSize("-1 16"));
+    try testing.expectError(error.InvalidNumber, parseCanvasSize("abc 16"));
+    try testing.expectError(error.InvalidNumber, parseCanvasSize("32 xyz"));
+    try testing.expectError(error.InvalidNumber, parseCanvasSize("4294967296 16"));
+
+    const n0 = try parseNew("");
+    try testing.expect(n0 == .reset_current);
+    const n0w = try parseNew("   ");
+    try testing.expect(n0w == .reset_current);
+
+    const n2 = try parseNew("32 16");
+    try testing.expect(n2 == .sized);
+    try testing.expectEqual(@as(u32, 32), n2.sized.w);
+    try testing.expectEqual(@as(u32, 16), n2.sized.h);
+
+    try testing.expectError(error.Empty, parseNew("32"));
+    try testing.expectError(error.TooManyTokens, parseNew("32 16 extra"));
+    try testing.expectError(error.ValueOutOfRange, parseNew("0 16"));
+    try testing.expectError(error.ValueOutOfRange, parseNew("16 0"));
+    try testing.expectError(error.InvalidNumber, parseNew("-1 16"));
+    try testing.expectError(error.InvalidNumber, parseNew("nope 16"));
 }
 
 test "resolveAnchor: 偶数サイズの mid/center" {

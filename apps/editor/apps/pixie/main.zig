@@ -63,8 +63,12 @@ comptime {
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
-const CANVAS_W: u32 = 256;
-const CANVAS_H: u32 = 256;
+/// 起動時既定キャンバスサイズ（実行時サイズは `doc.width` / `doc.height`）。
+const DEFAULT_CANVAS_W: u32 = 256;
+const DEFAULT_CANVAS_H: u32 = 256;
+/// キャンバスサイズ上限（action / .pix / netsync で共有。TASK-144.1）。
+const MAX_CANVAS_EDGE: u32 = 4096;
+const MAX_CANVAS_PIXELS: usize = 16 * 1024 * 1024;
 // ビューポート（TASK-39）: ズームは整数倍のランタイム値。既定 2x で従来の見た目を維持。
 const ZOOM_MIN: i32 = 1;
 const ZOOM_MAX: i32 = 32;
@@ -84,6 +88,14 @@ const SAVE_MSG_DURATION: f64 = 3.0;
 // 範囲選択のマーチングアンツ（TASK-44）。phase 速度（units/sec）と周期（=2*DASH。selection_overlay の DASH=4）。
 const MARCH_SPEED: f64 = 12.0;
 const MARCH_PERIOD: f64 = 8.0;
+
+/// キャンバスサイズ上限（各辺 ≤4096・総画素 ≤16M）。action / .pix / netsync で共有。
+fn validateCanvasSize(w: u32, h: u32) error{ InvalidSize, SizeOverflow, CanvasTooLarge }!void {
+    if (w == 0 or h == 0) return error.InvalidSize;
+    if (w > MAX_CANVAS_EDGE or h > MAX_CANVAS_EDGE) return error.CanvasTooLarge;
+    const n = std.math.mul(usize, w, h) catch return error.SizeOverflow;
+    if (n > MAX_CANVAS_PIXELS) return error.CanvasTooLarge;
+}
 
 /// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
 /// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
@@ -519,6 +531,8 @@ const App = struct {
     recovery: ?appshell.autosave.Candidate = null,
     pending_png_path: ?[]u8 = null,
     png_import_pending: bool = false,
+    /// `new W H` 確認フロー用（hostNewDocument が消費。TASK-144.1）。
+    pending_new_size: ?struct { w: u32, h: u32 } = null,
     title_cache: [std.fs.max_path_bytes + 64]u8 = undefined,
     title_cache_len: usize = 0,
     /// パレットの .gpl 保存先（gpa 所有。PNG の current_path とは別管理）。
@@ -675,8 +689,8 @@ const App = struct {
     /// canvas が表示領域に収まる最大整数倍へ（Fit）。pan は中央へリセット。last_area 未確定時は無処理。
     fn fitZoom(self: *App) void {
         const area = self.last_area orelse return;
-        const fz_x = @divFloor(area.w, @as(i32, @intCast(CANVAS_W)));
-        const fz_y = @divFloor(area.h, @as(i32, @intCast(CANVAS_H)));
+        const fz_x = @divFloor(area.w, @as(i32, @intCast(self.doc.width)));
+        const fz_y = @divFloor(area.h, @as(i32, @intCast(self.doc.height)));
         self.zoomTo(@min(fz_x, fz_y));
         self.pan_x = 0;
         self.pan_y = 0;
@@ -733,6 +747,91 @@ const App = struct {
 
     fn editingBlocked(self: *const App) bool {
         return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle or self.shape_in.state != .idle;
+    }
+
+    /// Document サイズ変更後に recorder / preview / onion / diff_base を新サイズへ再構築する。
+    /// loadProjectPath / netsyncImport / doResize / doNew が共有する（dangling pointer 防止）。
+    fn rebuildRuntimeForDocSize(self: *App) !void {
+        const w = self.doc.width;
+        const h = self.doc.height;
+        const n = @as(usize, w) * @as(usize, h);
+
+        var new_recorder = try core.StrokeRecorder.init(self.gpa, w, h);
+        errdefer new_recorder.deinit(self.gpa);
+        new_recorder.pixel_perfect = self.recorder.pixel_perfect;
+        new_recorder.symmetry = self.recorder.symmetry;
+
+        var new_preview = try core.Canvas.init(self.gpa, w, h);
+        errdefer new_preview.deinit();
+
+        var new_preview_rec = try core.StrokeRecorder.init(self.gpa, w, h);
+        errdefer new_preview_rec.deinit(self.gpa);
+
+        const new_onion = try self.gpa.alloc(u32, n);
+        errdefer self.gpa.free(new_onion);
+        const new_scratch = try self.gpa.alloc(u32, n);
+        errdefer self.gpa.free(new_scratch);
+
+        self.recorder.deinit(self.gpa);
+        self.recorder = new_recorder;
+        self.preview_canvas.deinit();
+        self.preview_canvas = new_preview;
+        self.preview_rec.deinit(self.gpa);
+        self.preview_rec = new_preview_rec;
+
+        self.gpa.free(self.onion_buf);
+        self.onion_buf = new_onion;
+        self.gpa.free(self.onion_scratch);
+        self.onion_scratch = new_scratch;
+
+        if (self.diff_base) |b| {
+            self.gpa.free(b);
+            self.diff_base = null;
+        }
+    }
+
+    /// 内容保持リサイズ（TASK-144.1）。GUI/action の唯一の入口。
+    fn doResize(self: *App, new_w: u32, new_h: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (platform.netsyncActive()) return error.RejectedWhileSynced;
+        try validateCanvasSize(new_w, new_h);
+        if (self.doc.layers.items[self.doc.selected_layer].kind != .text) {
+            self.doc.commitActiveLayerToCel(self.gpa, self.doc.selected_layer);
+        }
+        try self.doc.resize(self.gpa, new_w, new_h);
+        self.invalidateHistoryAfterDocReset();
+        self.canvas = self.doc.activeCanvas();
+        try self.rebuildRuntimeForDocSize();
+        self.doc.resyncActiveView(self.gpa);
+        self.clampTimelineTarget();
+        self.canvas.clearSelection();
+        self.sel_in.discardFloat(self.gpa);
+        self.syncPreviewCanvas();
+        self.markProjectDirty();
+    }
+
+    /// 指定サイズの blank Document へ置換（TASK-144.1）。GUI/action の唯一の入口。
+    /// project path / PNG / autosave のクリアは hostNewDocument 側の規則に任せる。
+    fn doNew(self: *App, new_w: u32, new_h: u32) !void {
+        if (self.editingBlocked()) return error.EditingBlocked;
+        if (platform.netsyncActive()) return error.RejectedWhileSynced;
+        try validateCanvasSize(new_w, new_h);
+        var new_doc = try core.Document.init(self.gpa, new_w, new_h);
+        errdefer new_doc.deinit();
+        const preserved_next_handle = self.doc.undo.next_handle;
+        self.doc.deinit();
+        self.doc = new_doc;
+        self.doc.undo.next_handle = preserved_next_handle;
+        self.invalidateHistoryAfterDocReset();
+        self.canvas = self.doc.activeCanvas();
+        try self.rebuildRuntimeForDocSize();
+        self.doc.resyncActiveView(self.gpa);
+        self.clampTimelineTarget();
+        self.applySystemFont();
+        self.canvas.clearSelection();
+        self.sel_in.discardFloat(self.gpa);
+        self.loadPaletteFromDoc();
+        self.syncPreviewCanvas();
     }
 
     /// netsync 中に editingBlocked なら、ローカル編集（capture / bezier / select ドラッグ）を
@@ -1304,7 +1403,7 @@ const App = struct {
     /// 遷移は bezier cancel も sel_in フロート破棄も不要＝`setActiveKind` のガード外処理を再現する
     /// 必要が無い。codex レビュー指摘 2026-07-05）。
     fn pickColor(self: *App, x: i32, y: i32) void {
-        const idx = @as(usize, @intCast(y)) * CANVAS_W + @as(usize, @intCast(x));
+        const idx = @as(usize, @intCast(y)) * self.canvas.width + @as(usize, @intCast(x));
         const sampled = self.canvas.compositeStraight()[idx];
         if (sampled & 0xFF000000 == 0) return; // 透明部は無視
         self.doSetColorHex(0xFF000000 | (sampled & 0x00FFFFFF));
@@ -1386,7 +1485,7 @@ const App = struct {
     /// 暗黙に介入しないため）。editingBlocked チェックは無い（既存 doSave/doSaveAs に無いのでそのまま）。
     fn doSaveTo(self: *App, path: []const u8) !void {
         const flat = self.canvas.compositeStraight();
-        try core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa);
+        try core.savePNG(self.io, path, flat, self.canvas.width, self.canvas.height, self.gpa);
         self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
     }
 
@@ -1412,7 +1511,7 @@ const App = struct {
         };
         const path = maybe orelse return .done; // キャンセル: サイレント no-op
         const flat = self.canvas.compositeStraight();
-        core.savePNG(self.io, path, flat, CANVAS_W, CANVAS_H, self.gpa) catch |err| {
+        core.savePNG(self.io, path, flat, self.canvas.width, self.canvas.height, self.gpa) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             self.gpa.free(path); // 失敗時はダイアログ戻り値を解放・旧 current_path は触らない
             return .done;
@@ -1430,10 +1529,10 @@ const App = struct {
         const layer = self.canvas.layerPixels(layer_idx);
         @memset(layer, 0);
         const iw: usize = img.width;
-        const rows = @min(@as(usize, img.height), @as(usize, CANVAS_H));
-        const cols = @min(iw, @as(usize, CANVAS_W));
+        const rows = @min(@as(usize, img.height), @as(usize, self.canvas.height));
+        const cols = @min(iw, @as(usize, self.canvas.width));
         for (0..rows) |y| {
-            @memcpy(layer[y * CANVAS_W ..][0..cols], img.pixels[y * iw ..][0..cols]);
+            @memcpy(layer[y * self.canvas.width ..][0..cols], img.pixels[y * iw ..][0..cols]);
         }
         self.syncPreviewCanvas();
         // active_view は cel のコピー。saveDocument は cel_pool を直列化するため、
@@ -1602,7 +1701,7 @@ const App = struct {
 
     /// .pix プロジェクトを読み込んでドキュメントを差し替える（レイヤー構造保持）。
     /// 進行中 stroke/編集中は破棄。undo/redo はクリア、selection/float 破棄、current_project_path 更新。
-    /// MVP は 256x256 以外を拒否する（layer 復元前にサイズ検査）。任意サイズは resize フェーズ（TASK-39）へ。
+    /// サイズは peekCanvasSize + 共通上限 validator（各辺≤4096・総画素≤16M）で検証する（TASK-144.1）。
     fn doOpenProject(self: *App) FileOpResult {
         if (self.editingBlocked()) return .done;
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "pix" }) catch |err| {
@@ -2362,7 +2461,7 @@ const App = struct {
         }
         if (self.active_kind == .select and self.sel_in.state == .moving) {
             self.syncPreviewCanvas();
-            _ = self.sel_in.renderMovePreview(self.preview_canvas.layerPixels(self.canvas.selected_layer), CANVAS_W, CANVAS_H, self.blend_mode);
+            _ = self.sel_in.renderMovePreview(self.preview_canvas.layerPixels(self.canvas.selected_layer), self.canvas.width, self.canvas.height, self.blend_mode);
             return self.preview_canvas.compositeStraight();
         }
         return self.canvas.compositeStraight();
@@ -2749,8 +2848,8 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     var len: usize = 0;
     var truncated = false;
     const head = std.fmt.bufPrint(buf[len..], "{d}x{d} layers={d} selected={d} comp={X:0>8}", .{
-        CANVAS_W,
-        CANVAS_H,
+        app.doc.width,
+        app.doc.height,
         app.canvas.layers.items.len,
         app.canvas.selected_layer,
         png.crc32(std.mem.sliceAsBytes(app.canvas.compositeStraight())),
@@ -2795,7 +2894,7 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 /// canvas snapshot: visible layer を合成したフラット透明 PNG。
 fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    return core.encodePNG(app.canvas.compositeStraight(), CANVAS_W, CANVAS_H, allocator);
+    return core.encodePNG(app.canvas.compositeStraight(), app.doc.width, app.doc.height, allocator);
 }
 
 /// undo digest/snapshot: undo/redo スタックの深さ（JSON 1行）。undo で depth が減る。
@@ -2934,7 +3033,7 @@ fn diffDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }
     const base = app.diff_base.?;
     const cur = app.canvas.compositeStraight();
-    const r = diff.computeDiff(app.gpa, base, cur, CANVAS_W, CANVAS_H) catch return buf[0..0];
+    const r = diff.computeDiff(app.gpa, base, cur, app.doc.width, app.doc.height) catch return buf[0..0];
     if (r.changed == 0) {
         return std.fmt.bufPrint(buf, "changed=0 bbox=none from=none to=none", .{}) catch buf[0..0];
     }
@@ -3009,8 +3108,17 @@ fn paletteDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 
 /// compositeStraight を diff_base へコピー（未確保なら alloc）。借用スライスは保持しない。
 fn copyCompositeToDiffBase(app: *App) !void {
-    const n = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
-    const dst = if (app.diff_base) |b| b else blk: {
+    const n = @as(usize, app.doc.width) * @as(usize, app.doc.height);
+    const dst = if (app.diff_base) |b| blk: {
+        if (b.len != n) {
+            app.gpa.free(b);
+            app.diff_base = null;
+            const nb = try app.gpa.alloc(u32, n);
+            app.diff_base = nb;
+            break :blk nb;
+        }
+        break :blk b;
+    } else blk: {
         const b = try app.gpa.alloc(u32, n);
         app.diff_base = b;
         break :blk b;
@@ -3365,7 +3473,7 @@ fn actionShape(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8
     _ = buf;
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
-    const parsed = try actions.parseShape(args, @intCast(CANVAS_W), @intCast(CANVAS_H));
+    const parsed = try actions.parseShape(args, @intCast(app.doc.width), @intCast(app.doc.height));
     try app.doShape(parsed.kind, parsed.p0, parsed.p1, parsed.fill);
     return "ok";
 }
@@ -4021,6 +4129,14 @@ const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
 const pixie_args_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path" },
 };
+const pixie_args_canvas_size: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE) },
+    .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE) },
+};
+const pixie_args_new: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE), .optional = true },
+    .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(MAX_CANVAS_EDGE), .optional = true },
+};
 const appshell_args_optional_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path", .optional = true },
 };
@@ -4085,10 +4201,32 @@ fn actionRequestClose(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
 }
 
 fn actionNewDocument(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    try actions.parseNoArgs(args);
     const app = actionApp(ctx);
-    const result = try app.requestNewDocument();
-    return std.fmt.bufPrint(buf, "ok new={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+    const parsed = try actions.parseNew(args);
+    switch (parsed) {
+        .reset_current => {
+            const result = try app.requestNewDocument();
+            return std.fmt.bufPrint(buf, "ok new={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+        },
+        .sized => |sz| {
+            try validateCanvasSize(sz.w, sz.h);
+            app.pending_new_size = .{ .w = sz.w, .h = sz.h };
+            const result = app.requestNewDocument() catch |err| {
+                app.pending_new_size = null;
+                return err;
+            };
+            if (result == .canceled) app.pending_new_size = null;
+            return std.fmt.bufPrint(buf, "ok new={s} size={d}x{d}", .{ @tagName(result), sz.w, sz.h }) catch error.BufferTooSmall;
+        },
+    }
+}
+
+fn actionResize(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const sz = try actions.parseCanvasSize(args);
+    try validateCanvasSize(sz.w, sz.h);
+    const app = actionApp(ctx);
+    try app.doResize(sz.w, sz.h);
+    return std.fmt.bufPrint(buf, "ok resize={d}x{d}", .{ sz.w, sz.h }) catch error.BufferTooSmall;
 }
 
 fn actionOpenProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -4160,7 +4298,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "save", .ctx = app, .run = recordedAction("save", .record), .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "open", .ctx = app, .run = recordedAction("open", .record), .args = pixie_args_path });
     platform.registerAction(.{ .name = "request_close", .ctx = app, .run = actionRequestClose, .network_policy = .local_only, .args = pixie_args_none });
-    platform.registerAction(.{ .name = "new", .ctx = app, .run = actionNewDocument, .network_policy = .local_only, .args = pixie_args_none });
+    platform.registerAction(.{ .name = "new", .ctx = app, .run = actionNewDocument, .network_policy = .reject_when_synced, .args = pixie_args_new });
+    platform.registerAction(.{ .name = "resize", .ctx = app, .run = actionResize, .network_policy = .reject_when_synced, .desc = "resize canvas keeping top-left content", .args = pixie_args_canvas_size });
     platform.registerAction(.{ .name = "open_project", .ctx = app, .run = actionOpenProject, .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "confirm_save", .ctx = app, .run = actionConfirmSave, .network_policy = .local_only, .args = appshell_args_optional_path });
     platform.registerAction(.{ .name = "confirm_discard", .ctx = app, .run = actionConfirmDiscard, .network_policy = .local_only, .args = pixie_args_none });
@@ -4207,15 +4346,19 @@ fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try app.checkEditingAllowed();
     const sz = try core.document_io.peekCanvasSize(bytes);
-    if (sz.w != CANVAS_W or sz.h != CANVAS_H) return error.UnsupportedCanvasSize;
-    const new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
+    try validateCanvasSize(sz.w, sz.h);
+    var new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
+    errdefer new_doc.deinit();
+    try validateCanvasSize(new_doc.width, new_doc.height);
     const preserved_next_handle = app.doc.undo.next_handle;
     app.doc.deinit();
     app.doc = new_doc;
+    new_doc = undefined;
     app.doc.undo.next_handle = preserved_next_handle;
     app.invalidateHistoryAfterDocReset();
     app.doc.resyncActiveView(app.gpa);
     app.canvas = app.doc.activeCanvas();
+    try app.rebuildRuntimeForDocSize();
     app.clampTimelineTarget();
     app.applySystemFont();
     app.loadPaletteFromDoc();
@@ -4328,12 +4471,12 @@ fn canvasBlitRect(ctx: *const gui.Context, app: *App) ?core.Rect {
     const zoom = app.view_zoom;
     const aw: i32 = @intCast(area.w);
     const ah: i32 = @intCast(area.h);
-    const vw: i32 = @as(i32, @intCast(CANVAS_W)) * zoom;
-    const vh: i32 = @as(i32, @intCast(CANVAS_H)) * zoom;
+    const vw: i32 = @as(i32, @intCast(app.doc.width)) * zoom;
+    const vh: i32 = @as(i32, @intCast(app.doc.height)) * zoom;
 
     const rx = axisPlace(area.x, aw, vw, &app.pan_x);
     const ry = axisPlace(area.y, ah, vh, &app.pan_y);
-    return .{ .x = rx, .y = ry, .w = @intCast(CANVAS_W), .h = @intCast(CANVAS_H) };
+    return .{ .x = rx, .y = ry, .w = @intCast(app.doc.width), .h = @intCast(app.doc.height) };
 }
 
 /// 1 軸の表示原点を決め、pan を clamp して書き戻す。
@@ -4389,8 +4532,8 @@ fn updateViewport(app: *App, ctx: *const gui.Context, canvas_rect: ?core.Rect) b
                 // zoom 前のカーソル下 canvas 位置（f32, セル内位置を保持）
                 const cfx = (mx - @as(f32, @floatFromInt(cr.x))) / oz;
                 const cfy = (my - @as(f32, @floatFromInt(cr.y))) / oz;
-                const vw_new: i32 = @as(i32, @intCast(CANVAS_W)) * new_zoom;
-                const vh_new: i32 = @as(i32, @intCast(CANVAS_H)) * new_zoom;
+                const vw_new: i32 = @as(i32, @intCast(app.doc.width)) * new_zoom;
+                const vh_new: i32 = @as(i32, @intCast(app.doc.height)) * new_zoom;
                 const half_x = @divFloor(a.w - vw_new, 2);
                 const half_y = @divFloor(a.h - vh_new, 2);
                 // 望ましい表示原点 = カーソル位置 - canvas位置*新zoom。pan = 原点 - (area原点 + half)
@@ -4509,16 +4652,14 @@ fn truncateForDisplay(alloc: std.mem.Allocator, name: []const u8, max_total_char
     return std.fmt.allocPrint(alloc, "{s}..", .{name[0..end]}) catch name[0..end];
 }
 
-/// raw layer pixels（CANVAS_W×CANVAS_H, straight BGRA 0xAARRGGBB）を THUMB へ縮小し、
+/// raw layer pixels（`cw`×`ch` = doc.width×doc.height, straight BGRA 0xAARRGGBB）を THUMB へ縮小し、
 /// チェッカー下地へ src-over して不透明サムネを作る（透明部はチェッカーが見える）。
 /// 各サムネ画素は元領域の **alpha 重み付き平均（premultiplied 平均）** にして、1px の細線も
 /// 薄く残し内容が分かるようにする（最近傍だと細線が抜け落ちる）。opacity は反映しない（生の内容を表示）。
 /// buf.len == LAYER_THUMB_W * LAYER_THUMB_H 前提。
-fn fillLayerThumb(buf: []u32, layer_pixels: []const u32) void {
+fn fillLayerThumb(buf: []u32, layer_pixels: []const u32, cw: usize, ch: usize) void {
     const tw: usize = @intCast(LAYER_THUMB_W);
     const th: usize = @intCast(LAYER_THUMB_H);
-    const cw: usize = CANVAS_W;
-    const ch: usize = CANVAS_H;
     var ty: usize = 0;
     while (ty < th) : (ty += 1) {
         const sy0 = ty * ch / th;
@@ -4595,7 +4736,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
 
         // サムネイル: raw layer をチェッカー下地へ縮小合成。選択中は枠を明色に。
         const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("layer thumb: OOM");
-        fillLayerThumb(thumb, layer.pixels);
+        fillLayerThumb(thumb, layer.pixels, app.doc.width, app.doc.height);
         const thumb_border = if (idx == app.canvas.selected_layer) ctx.style.border_hover else ctx.style.border;
         ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
 
@@ -4801,14 +4942,16 @@ fn buildTextLayerPanel(ctx: *gui.Context, app: *App) !void {
     }
 
     var x_i32: i32 = layer.text_params.x;
-    if (ctx.sliderI32Id(TEXT_PANEL_ID_BASE + 3, "X", &x_i32, .{ .min = 0, .max = @as(i32, @intCast(CANVAS_W)) - 1, .track_w = 80 })) {
+    const max_x: i32 = @max(@as(i32, @intCast(app.canvas.width)), 1) - 1;
+    if (ctx.sliderI32Id(TEXT_PANEL_ID_BASE + 3, "X", &x_i32, .{ .min = 0, .max = max_x, .track_w = 80 })) {
         var params = layer.text_params;
         params.x = x_i32;
         app.doSetTextParams(idx, params) catch {};
     }
 
     var y_i32: i32 = layer.text_params.y;
-    if (ctx.sliderI32Id(TEXT_PANEL_ID_BASE + 4, "Y", &y_i32, .{ .min = 0, .max = @as(i32, @intCast(CANVAS_H)) - 1, .track_w = 80 })) {
+    const max_y: i32 = @max(@as(i32, @intCast(app.canvas.height)), 1) - 1;
+    if (ctx.sliderI32Id(TEXT_PANEL_ID_BASE + 4, "Y", &y_i32, .{ .min = 0, .max = max_y, .track_w = 80 })) {
         var params = layer.text_params;
         params.y = y_i32;
         app.doSetTextParams(idx, params) catch {};
@@ -4956,7 +5099,7 @@ fn buildTimelinePanel(ctx: *gui.Context, app: *App) !void {
         while (fi < app.doc.frames.items.len) : (fi += 1) {
             const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("timeline thumb: OOM");
             if (app.doc.gridGet(li, fi)) |cel_id| {
-                if (app.doc.celPixels(cel_id)) |pixels| fillLayerThumb(thumb, pixels);
+                if (app.doc.celPixels(cel_id)) |pixels| fillLayerThumb(thumb, pixels, app.doc.width, app.doc.height);
             } else {
                 fillEmptyThumb(thumb);
             }
@@ -5374,7 +5517,12 @@ fn hostNewDocument(ctx: *anyopaque) !void {
         try app.autosave.setPath(null);
         return;
     }
-    app.resetCanvasToSingleLayer();
+    if (app.pending_new_size) |sz| {
+        app.pending_new_size = null;
+        try app.doNew(sz.w, sz.h);
+    } else {
+        app.resetCanvasToSingleLayer();
+    }
     if (app.current_path) |old| app.gpa.free(old);
     app.current_path = null;
     try app.setProjectPath(null);
@@ -5404,14 +5552,22 @@ fn hostSaveDocument(ctx: *anyopaque, path: []const u8) !void {
 
 fn loadProjectPath(app: *App, path: []const u8) !void {
     if (app.editingBlocked()) return error.EditingBlocked;
-    const new_doc = try core.document_io.loadDocument(app.io, app.gpa, path, CANVAS_W, CANVAS_H);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .unlimited);
+    defer app.gpa.free(bytes);
+    const sz = try core.document_io.peekCanvasSize(bytes);
+    try validateCanvasSize(sz.w, sz.h);
+    var new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
+    errdefer new_doc.deinit();
+    try validateCanvasSize(new_doc.width, new_doc.height);
     const preserved_next_handle = app.doc.undo.next_handle;
     app.doc.deinit();
     app.doc = new_doc;
+    new_doc = undefined;
     app.doc.undo.next_handle = preserved_next_handle;
     app.invalidateHistoryAfterDocReset();
     app.doc.resyncActiveView(app.gpa);
     app.canvas = app.doc.activeCanvas();
+    try app.rebuildRuntimeForDocSize();
     app.clampTimelineTarget();
     app.applySystemFont();
     app.canvas.clearSelection();
@@ -5456,6 +5612,7 @@ fn finishHostResult(app: *App, result: appshell.document_host.Result) void {
         app.pending_png_path = null;
         app.png_import_pending = false;
     }
+    if (result == .canceled) app.pending_new_size = null;
     app.syncProjectState();
     if (app.png_import_pending and result == .applied) {
         app.png_import_pending = false;
@@ -5468,6 +5625,7 @@ fn recoverAutosave(app: *App) !void {
     const candidate = &(app.recovery orelse return error.NoRecoveryPending);
     var decoded = try core.document_io.decodeDocument(candidate.envelope.snapshot, app.gpa);
     errdefer decoded.deinit();
+    try validateCanvasSize(decoded.width, decoded.height);
     try app.host.adoptRecovered(candidate.envelope.original_path);
     try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
     app.doc.deinit();
@@ -5476,6 +5634,7 @@ fn recoverAutosave(app: *App) !void {
     app.invalidateHistoryAfterDocReset();
     app.doc.resyncActiveView(app.gpa);
     app.canvas = app.doc.activeCanvas();
+    try app.rebuildRuntimeForDocSize();
     app.clampTimelineTarget();
     app.applySystemFont();
     app.canvas.clearSelection();
@@ -5515,22 +5674,22 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     var ctx = gui.Context.init(gpa, gui.default_font);
     errdefer ctx.deinit();
 
-    var doc = try core.Document.init(gpa, CANVAS_W, CANVAS_H);
+    var doc = try core.Document.init(gpa, DEFAULT_CANVAS_W, DEFAULT_CANVAS_H);
     errdefer doc.deinit();
 
-    var recorder = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H);
+    var recorder = try core.StrokeRecorder.init(gpa, DEFAULT_CANVAS_W, DEFAULT_CANVAS_H);
     errdefer recorder.deinit(gpa);
 
-    var preview_canvas = try core.Canvas.init(gpa, CANVAS_W, CANVAS_H);
+    var preview_canvas = try core.Canvas.init(gpa, DEFAULT_CANVAS_W, DEFAULT_CANVAS_H);
     errdefer preview_canvas.deinit();
 
-    var preview_rec = try core.StrokeRecorder.init(gpa, CANVAS_W, CANVAS_H);
+    var preview_rec = try core.StrokeRecorder.init(gpa, DEFAULT_CANVAS_W, DEFAULT_CANVAS_H);
     errdefer preview_rec.deinit(gpa);
 
     var palette = try palette_mod.Palette.initDb16(gpa);
     errdefer palette.deinit(gpa);
 
-    const canvas_pixel_count = @as(usize, CANVAS_W) * @as(usize, CANVAS_H);
+    const canvas_pixel_count = @as(usize, DEFAULT_CANVAS_W) * @as(usize, DEFAULT_CANVAS_H);
     const onion_buf = try gpa.alloc(u32, canvas_pixel_count);
     errdefer gpa.free(onion_buf);
     const onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
@@ -5942,12 +6101,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         if (canvas_rect) |rect| {
             if (self.last_area) |area| {
                 const zoom = self.view_zoom;
+                const cw = self.doc.width;
+                const ch = self.doc.height;
                 // 表示矩形（screen px 実寸。canvasBlitRect の rect.w/h は canvas px なので zoom 倍）
                 const screen_rect: core.Rect = .{
                     .x = rect.x,
                     .y = rect.y,
-                    .w = @as(i32, @intCast(CANVAS_W)) * zoom,
-                    .h = @as(i32, @intCast(CANVAS_H)) * zoom,
+                    .w = @as(i32, @intCast(cw)) * zoom,
+                    .h = @as(i32, @intCast(ch)) * zoom,
                 };
                 blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
                 const base_composite = self.resolveDisplayComposite(self.gpa);
@@ -5956,7 +6117,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     core.onion_skin.build(&self.doc, base_composite, self.doc.selected_frame, cnt, self.onion_buf, self.onion_scratch);
                     break :blk self.onion_buf;
                 } else base_composite;
-                blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, CANVAS_W, CANVAS_H, rect, zoom, area);
+                blit.blitCanvasZoom(fb.pixels, fb.width, fb.height, display_composite, cw, ch, rect, zoom, area);
             }
         }
         // TASK-103: presence overlay（canvas blit の直後・bezier/selection より下）
