@@ -49,6 +49,11 @@ const text_input_c_abi = !builtin.is_test;
 
 const TextInputC = if (text_input_c_abi) struct {
     extern fn platform_set_text_input_active(window: ?*c.PlatformWindow, active: bool) void;
+    extern fn platform_set_text_input_document_access(
+        window: ?*c.PlatformWindow,
+        callbacks: ?*const c.PlatformTextInputDocumentCallbacks,
+        userdata: ?*anyopaque,
+    ) void;
 } else struct {};
 
 // 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
@@ -62,6 +67,9 @@ const CharEvent = types.CharEvent;
 const CompositionEvent = types.CompositionEvent;
 const CompositionPhase = types.CompositionPhase;
 const CompositionSnapshot = types.CompositionSnapshot;
+const TextInputRange = types.TextInputRange;
+const TextInputSubstring = types.TextInputSubstring;
+const TEXT_INPUT_RANGE_NOT_FOUND = types.TEXT_INPUT_RANGE_NOT_FOUND;
 const MouseEvent = types.MouseEvent;
 const ScrollEvent = types.ScrollEvent;
 const Event = types.Event;
@@ -179,6 +187,34 @@ test "macOS facade NONE skip: FIFO 順を保ったまま wrap 境界を越える
     try std.testing.expectEqual(@as(usize, 1), index);
 }
 
+test "TASK-79.6.3: document access trampoline 登録・解除（unit test は C 非リンク）" {
+    var dummy: u8 = 0;
+    const win: Window = .{ .handle = undefined };
+    const cbs = TextInputDocumentCallbacks{
+        .getSelectedRange = struct {
+            fn f(_: *anyopaque) ?TextInputRange {
+                return .{ .location = 0, .length = 0 };
+            }
+        }.f,
+        .getSubstring = struct {
+            fn f(_: *anyopaque, _: TextInputRange) ?TextInputSubstring {
+                return null;
+            }
+        }.f,
+        .replaceText = struct {
+            fn f(_: *anyopaque, _: TextInputRange, _: []const u8) bool {
+                return false;
+            }
+        }.f,
+    };
+    try std.testing.expect(!textInputDocumentAccessRegisteredForTest());
+    win.setTextInputDocumentAccess(@ptrCast(&dummy), cbs);
+    try std.testing.expect(textInputDocumentAccessRegisteredForTest());
+    try std.testing.expectEqual(TEXT_INPUT_RANGE_NOT_FOUND, textInputRangeNotFoundForTest());
+    win.setTextInputDocumentAccess(@ptrCast(&dummy), null);
+    try std.testing.expect(!textInputDocumentAccessRegisteredForTest());
+}
+
 /// C の `gamepad.name`（32byte+NUL固定バッファ）を `GamepadInfo.name_buf` へコピーする（TASK-80.2）。
 /// `strlen` 相当で NUL 終端までを有効長とし、`GAMEPAD_NAME_MAX` を超える分は切り詰める
 /// （backend 側が既に切り詰め済みのため通常は発生しない。防御的にここでも境界を守る）。
@@ -236,6 +272,86 @@ fn macosRedrawTrampoline(userdata: ?*anyopaque) callconv(.c) void {
     _ = userdata;
     const cb = redraw_trampoline.cb orelse return;
     cb(redraw_trampoline.ctx);
+}
+
+// ============================================================================
+// IME document access トランポリン（TASK-79.6.3）
+// ============================================================================
+//
+// C ABI callback は callconv(.c)。Zig consumer の関数ポインタを module-level に保持し、
+// C trampoline から同期呼び出しする。単一ウィンドウ前提（redraw と同型）。
+
+pub const TextInputDocumentCallbacks = types.TextInputDocumentCallbacks;
+
+var doc_access_trampoline: struct {
+    userdata: *anyopaque = undefined,
+    callbacks: ?TextInputDocumentCallbacks = null,
+} = .{};
+
+fn docAccessGetSelectedRange(userdata: ?*anyopaque, out_range: ?*c.PlatformTextInputRange) callconv(.c) bool {
+    _ = userdata;
+    const out = out_range orelse return false;
+    const cbs = doc_access_trampoline.callbacks orelse return false;
+    const range = cbs.getSelectedRange(doc_access_trampoline.userdata) orelse return false;
+    out.* = .{ .location = range.location, .length = range.length };
+    return true;
+}
+
+fn docAccessGetSubstring(
+    userdata: ?*anyopaque,
+    proposed_range: c.PlatformTextInputRange,
+    out_utf8: ?*?[*]const u8,
+    out_len: ?*u32,
+    out_actual_range: ?*c.PlatformTextInputRange,
+) callconv(.c) bool {
+    _ = userdata;
+    const utf8_slot = out_utf8 orelse return false;
+    const len_slot = out_len orelse return false;
+    const actual_slot = out_actual_range orelse return false;
+    const cbs = doc_access_trampoline.callbacks orelse return false;
+    const proposed: TextInputRange = .{ .location = proposed_range.location, .length = proposed_range.length };
+    const sub = cbs.getSubstring(doc_access_trampoline.userdata, proposed) orelse return false;
+    // 空 slice の .ptr は未定義になり得るため、長さ 0 は静的空バッファを返す。
+    utf8_slot.* = if (sub.utf8.len == 0) @ptrCast(&empty_doc_utf8) else sub.utf8.ptr;
+    len_slot.* = @intCast(sub.utf8.len);
+    actual_slot.* = .{ .location = sub.actual_range.location, .length = sub.actual_range.length };
+    return true;
+}
+
+fn docAccessReplaceText(
+    userdata: ?*anyopaque,
+    replacement_range: c.PlatformTextInputRange,
+    utf8: ?[*]const u8,
+    len: u32,
+) callconv(.c) bool {
+    _ = userdata;
+    const cbs = doc_access_trampoline.callbacks orelse return false;
+    const range: TextInputRange = .{ .location = replacement_range.location, .length = replacement_range.length };
+    const slice: []const u8 = if (utf8) |p| p[0..len] else &.{};
+    return cbs.replaceText(doc_access_trampoline.userdata, range, slice);
+}
+
+const doc_access_c_callbacks = c.PlatformTextInputDocumentCallbacks{
+    .get_selected_range = docAccessGetSelectedRange,
+    .get_substring = docAccessGetSubstring,
+    .replace_text = docAccessReplaceText,
+};
+
+/// 空 substring 用の安定ポインタ（スタック一時を返さない）。
+const empty_doc_utf8: [1]u8 = .{0};
+
+/// 単体テスト用: document access が facade に登録されているか。
+pub fn textInputDocumentAccessRegisteredForTest() bool {
+    return doc_access_trampoline.callbacks != null;
+}
+
+/// 単体テスト用: NOT_FOUND sentinel（C ABI と一致）。
+pub fn textInputRangeNotFoundForTest() u64 {
+    return TEXT_INPUT_RANGE_NOT_FOUND;
+}
+
+fn clearDocumentAccess() void {
+    doc_access_trampoline = .{};
 }
 
 // ============================================================================
@@ -318,6 +434,11 @@ pub const Window = struct {
     }
 
     pub fn destroy(self: Window) void {
+        // document access 解除（dangling userdata 防止。pending range は native 側でも破棄）。
+        if (comptime text_input_c_abi) {
+            TextInputC.platform_set_text_input_document_access(self.handle, null, null);
+        }
+        clearDocumentAccess();
         c.platform_destroy_window(self.handle);
     }
 
@@ -391,6 +512,28 @@ pub const Window = struct {
     /// objc/swift/metal の 3 backend で実効（active=false の間は keyDown を IME へ渡さない）。
     pub fn setTextInputActive(self: Window, active: bool) void {
         if (comptime text_input_c_abi) TextInputC.platform_set_text_input_active(self.handle, active);
+    }
+
+    /// TASK-79.6.3: IME document access（再変換用）。`callbacks == null` で登録解除。
+    /// 単一 window 前提。headless / unit test では C を呼ばず登録状態だけ保持する。
+    /// native へ渡す C userdata は常に null（Zig trampoline が module-level 状態を見る単一
+    /// window 設計のため。consumer userdata は doc_access_trampoline 側に保持する）。
+    pub fn setTextInputDocumentAccess(
+        self: Window,
+        userdata: *anyopaque,
+        callbacks: ?TextInputDocumentCallbacks,
+    ) void {
+        if (callbacks) |cbs| {
+            doc_access_trampoline = .{ .userdata = userdata, .callbacks = cbs };
+            if (comptime text_input_c_abi) {
+                TextInputC.platform_set_text_input_document_access(self.handle, &doc_access_c_callbacks, null);
+            }
+        } else {
+            clearDocumentAccess();
+            if (comptime text_input_c_abi) {
+                TextInputC.platform_set_text_input_document_access(self.handle, null, null);
+            }
+        }
     }
 
     pub fn getEventStats(self: Window) EventStats {

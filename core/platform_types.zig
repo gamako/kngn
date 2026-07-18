@@ -276,6 +276,33 @@ pub const CompositionSnapshot = struct {
     cursor: u32,
 };
 
+/// IME document access の UTF-16 code unit range（TASK-79.6.3）。
+/// `location == TEXT_INPUT_RANGE_NOT_FOUND` は NSNotFound 相当。
+pub const TEXT_INPUT_RANGE_NOT_FOUND: u64 = std.math.maxInt(u64);
+
+pub const TextInputRange = struct {
+    location: u64,
+    length: u64,
+
+    pub fn isNotFound(self: TextInputRange) bool {
+        return self.location == TEXT_INPUT_RANGE_NOT_FOUND;
+    }
+};
+
+/// `getSubstring` が返す借用 UTF-8 と実際に切り出した UTF-16 range。
+pub const TextInputSubstring = struct {
+    utf8: []const u8,
+    actual_range: TextInputRange,
+};
+
+/// IME document access の Zig callback 束（TASK-79.6.3）。
+/// C trampoline から同期呼び出し。getSubstring の utf8 は callback 復帰まで有効。
+pub const TextInputDocumentCallbacks = struct {
+    getSelectedRange: *const fn (*anyopaque) ?TextInputRange,
+    getSubstring: *const fn (*anyopaque, TextInputRange) ?TextInputSubstring,
+    replaceText: *const fn (*anyopaque, TextInputRange, []const u8) bool,
+};
+
 /// マウスイベント。座標は window 座標 (window contentRect 左上原点・logical 単位)。
 /// framebuffer / canvas への変換は caller の責任。
 pub const MouseEvent = struct {
@@ -745,4 +772,12 @@ test "WindowGeometry: position null 契約（未対応/取得不能）" {
     try std.testing.expect(geo.position == null);
     try std.testing.expectEqual(@as(u32, 780), geo.size.width);
     try std.testing.expectEqual(@as(u32, 600), geo.size.height);
+}
+
+test "TASK-79.6.3: TextInputRange NOT_FOUND sentinel は UINT64_MAX" {
+    try std.testing.expectEqual(std.math.maxInt(u64), TEXT_INPUT_RANGE_NOT_FOUND);
+    const nf: TextInputRange = .{ .location = TEXT_INPUT_RANGE_NOT_FOUND, .length = 0 };
+    try std.testing.expect(nf.isNotFound());
+    const ok: TextInputRange = .{ .location = 0, .length = 3 };
+    try std.testing.expect(!ok.isNotFound());
 }

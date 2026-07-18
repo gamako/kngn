@@ -492,6 +492,52 @@ void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y,
 // 未呼び出しのアプリは従来どおり常時 IME 経路（後方互換）。false 遷移時は保留 composition を破棄する。
 void platform_set_text_input_active(PlatformWindow* window, bool active);
 
+// ========================================
+// IME document access（TASK-79.6.3。確定済みテキストの再変換）
+// ========================================
+//
+// NSTextInputClient の selectedRange / attributedSubstring / insertText(replacementRange:) が
+// 参照する document を app が供給する。range は **UTF-16 code unit** 単位（NSString/NSRange と同契約）。
+// location == UINT64_MAX は NSNotFound sentinel。
+//
+// callback は **同期呼び出し専用**。get_substring が返す UTF-8 ポインタは当該 callback 復帰まで
+// 有効な借用（native は復帰直後に NSString へコピーする）。callback 未登録時は従来どおり
+// selectedRange=NSNotFound / attributedSubstring=nil / insertText→char_input を維持する。
+
+typedef struct PlatformTextInputRange {
+    uint64_t location;
+    uint64_t length;
+} PlatformTextInputRange;
+
+typedef bool (*PlatformTextInputGetSelectedRangeFn)(
+    void* userdata,
+    PlatformTextInputRange* out_range);
+
+typedef bool (*PlatformTextInputGetSubstringFn)(
+    void* userdata,
+    PlatformTextInputRange proposed_range,
+    const uint8_t** out_utf8,
+    uint32_t* out_len,
+    PlatformTextInputRange* out_actual_range);
+
+typedef bool (*PlatformTextInputReplaceTextFn)(
+    void* userdata,
+    PlatformTextInputRange replacement_range,
+    const uint8_t* utf8,
+    uint32_t len);
+
+typedef struct PlatformTextInputDocumentCallbacks {
+    PlatformTextInputGetSelectedRangeFn get_selected_range;
+    PlatformTextInputGetSubstringFn get_substring;
+    PlatformTextInputReplaceTextFn replace_text;
+} PlatformTextInputDocumentCallbacks;
+
+// callbacks==NULL で登録解除（pending replacement range も破棄）。単一 window 前提。
+void platform_set_text_input_document_access(
+    PlatformWindow* window,
+    const PlatformTextInputDocumentCallbacks* callbacks,
+    void* userdata);
+
 // イベント取得API（1つずつ）
 // ウィンドウのイベントキューから1つイベントを取得する
 // イベントがあればtrue、ないならfalseを返す

@@ -413,7 +413,186 @@ pub const TextBuffer = struct {
         selection.extent += 1;
         return true;
     }
+
+    // ----------------------------------------------------------
+    // UTF-16 document adapter（TASK-79.6.3。IME reconversion）
+    // ----------------------------------------------------------
+
+    /// document 全体の UTF-16 code unit 数。
+    pub fn utf16Length(self: *const TextBuffer) u64 {
+        return utf16LengthOf(self.slice());
+    }
+
+    /// codepoint index → UTF-16 code unit offset。
+    pub fn codepointIndexToUtf16(self: *const TextBuffer, index: usize) u64 {
+        return codepointIndexToUtf16Offset(self.slice(), index);
+    }
+
+    /// 現在の selection を UTF-16 range で返す。
+    pub fn selectedRangeUtf16(self: *const TextBuffer, selection: SelectionState) Utf16Range {
+        const range = selection.normalized();
+        const start = codepointIndexToUtf16Offset(self.slice(), range.start);
+        const end = codepointIndexToUtf16Offset(self.slice(), range.end);
+        return .{ .location = start, .length = end - start };
+    }
+
+    /// proposed UTF-16 range を document へ clamp し、scalar 境界の actual range と UTF-8 slice を返す。
+    /// - `location == doc`（末尾 caret）は空 slice + actual `{location=doc,length=0}`（再変換の主経路）。
+    /// - `location == doc, length > 0` も末尾へ clamp した空 range（Apple intersection と同型）。
+    /// - `location > doc` は完全範囲外として null。空 document の (0,0) は空 slice。
+    pub fn substringForUtf16Range(self: *const TextBuffer, proposed: Utf16Range) ?Utf16Substring {
+        const text = self.slice();
+        const actual = clampUtf16RangeToScalars(text, proposed) orelse return null;
+        const start_cp = utf16OffsetToCodepointIndex(text, actual.location) orelse return null;
+        const end_cp = utf16OffsetToCodepointIndex(text, actual.location + actual.length) orelse return null;
+        const byte_start = byteIndex(text, start_cp);
+        const byte_end = byteIndex(text, end_cp);
+        return .{
+            .utf8 = text[byte_start..byte_end],
+            .actual_range = actual,
+        };
+    }
+
+    /// UTF-16 replacement range で置換。範囲外・scalar 途中・不正 UTF-8 は拒否して buffer 不変。
+    /// 成功時 selection は置換後末尾へ collapse（`replaceSelectionWithTextLimited` と同契約）。
+    pub fn replaceUtf16RangeLimited(
+        self: *TextBuffer,
+        selection: *SelectionState,
+        range: Utf16Range,
+        text: []const u8,
+        max_len: ?usize,
+    ) !bool {
+        if (!std.unicode.utf8ValidateSlice(text)) return false;
+        const cp_range = validateUtf16RangeForReplace(self.slice(), range) orelse return false;
+        selection.anchor = cp_range.start;
+        selection.extent = cp_range.end;
+        return replaceSelectionWithTextLimited(self, selection, text, max_len);
+    }
+
+    /// document access / TextInput 共通: 置換後に caret を selection.extent へ collapse。
+    pub fn replaceUtf16RangeAndCollapseCaret(
+        self: *TextBuffer,
+        selection: *SelectionState,
+        caret: *usize,
+        range: Utf16Range,
+        text: []const u8,
+        max_len: ?usize,
+    ) !bool {
+        const did = try self.replaceUtf16RangeLimited(selection, range, text, max_len);
+        if (did) caret.* = selection.extent;
+        return did;
+    }
 };
+
+/// UTF-16 code unit range（NSRange / PlatformTextInputRange と同型の意味）。
+pub const Utf16Range = struct {
+    location: u64,
+    length: u64,
+};
+
+pub const Utf16Substring = struct {
+    utf8: []const u8,
+    actual_range: Utf16Range,
+};
+
+fn utf16UnitsForCodepoint(cp: u32) u64 {
+    return if (cp >= 0x10000) 2 else 1;
+}
+
+fn decodeAt(text: []const u8, pos: usize) struct { cp: u32, bytes: usize } {
+    const n = codepointByteLength(text, pos);
+    if (n == 1) return .{ .cp = text[pos], .bytes = 1 };
+    const cp = std.unicode.utf8Decode(text[pos .. pos + n]) catch return .{ .cp = text[pos], .bytes = 1 };
+    return .{ .cp = cp, .bytes = n };
+}
+
+fn utf16LengthOf(text: []const u8) u64 {
+    var pos: usize = 0;
+    var units: u64 = 0;
+    while (pos < text.len) {
+        const d = decodeAt(text, pos);
+        units += utf16UnitsForCodepoint(d.cp);
+        pos += d.bytes;
+    }
+    return units;
+}
+
+fn codepointIndexToUtf16Offset(text: []const u8, index: usize) u64 {
+    var pos: usize = 0;
+    var cp_i: usize = 0;
+    var utf16: u64 = 0;
+    while (pos < text.len and cp_i < index) {
+        const d = decodeAt(text, pos);
+        utf16 += utf16UnitsForCodepoint(d.cp);
+        pos += d.bytes;
+        cp_i += 1;
+    }
+    return utf16;
+}
+
+/// UTF-16 offset → codepoint index。mid-surrogate または範囲外は null。
+fn utf16OffsetToCodepointIndex(text: []const u8, offset: u64) ?usize {
+    var pos: usize = 0;
+    var cp_i: usize = 0;
+    var utf16: u64 = 0;
+    while (pos < text.len) {
+        if (utf16 == offset) return cp_i;
+        const d = decodeAt(text, pos);
+        const units = utf16UnitsForCodepoint(d.cp);
+        if (offset > utf16 and offset < utf16 + units) return null;
+        utf16 += units;
+        pos += d.bytes;
+        cp_i += 1;
+    }
+    if (utf16 == offset) return cp_i;
+    return null;
+}
+
+/// offset が mid-surrogate なら pair 先頭へ下げる。範囲外は doc 末尾。
+fn alignUtf16OffsetDown(text: []const u8, offset: u64) u64 {
+    const doc = utf16LengthOf(text);
+    if (offset >= doc) return doc;
+    if (utf16OffsetToCodepointIndex(text, offset) != null) return offset;
+    // mid-surrogate → 1 下げて pair 先頭
+    return offset -| 1;
+}
+
+/// offset が mid-surrogate なら pair 末尾へ上げる。
+fn alignUtf16OffsetUp(text: []const u8, offset: u64) u64 {
+    const doc = utf16LengthOf(text);
+    if (offset >= doc) return doc;
+    if (utf16OffsetToCodepointIndex(text, offset) != null) return offset;
+    return @min(offset + 1, doc);
+}
+
+/// substring 用: document へ clamp + scalar 境界へ調整。
+/// `location > doc` のみ完全範囲外（null）。`location == doc` は末尾の空 range として受理
+/// （`validateUtf16RangeForReplace` の `>` 判定と整合。再変換時の末尾 caret クエリ用）。
+fn clampUtf16RangeToScalars(text: []const u8, proposed: Utf16Range) ?Utf16Range {
+    const doc = utf16LengthOf(text);
+    if (doc == 0) {
+        if (proposed.location == 0) return .{ .location = 0, .length = 0 };
+        return null;
+    }
+    if (proposed.location > doc) return null;
+    var start = proposed.location;
+    var end = proposed.location +| proposed.length;
+    if (end > doc) end = doc;
+    start = alignUtf16OffsetDown(text, start);
+    end = alignUtf16OffsetUp(text, end);
+    if (end < start) end = start;
+    return .{ .location = start, .length = end - start };
+}
+
+/// replacement 用: 範囲外・mid-scalar は拒否。
+fn validateUtf16RangeForReplace(text: []const u8, range: Utf16Range) ?TextRange {
+    const doc = utf16LengthOf(text);
+    const end_off = range.location +| range.length;
+    if (range.location > doc or end_off > doc) return null;
+    const start_cp = utf16OffsetToCodepointIndex(text, range.location) orelse return null;
+    const end_cp = utf16OffsetToCodepointIndex(text, end_off) orelse return null;
+    return .{ .start = @min(start_cp, end_cp), .end = @max(start_cp, end_cp) };
+}
 
 fn isPasteInsertableCodepoint(cp: u32) bool {
     return cp >= 0x20 and cp != 0x7F and cp <= 0x10FFFF and !(cp >= 0xD800 and cp <= 0xDFFF);
@@ -745,4 +924,131 @@ test "TASK-128: 制御文字・改行・不正 UTF-8 と max_len" {
     try testing.expect(!try buffer.replaceSelectionWithTextLimited(&selection, &.{ 0xFF, 'Z' }, 2));
     try testing.expectEqualStrings("AB", buffer.slice());
     try testing.expect(std.unicode.utf8ValidateSlice(buffer.slice()));
+}
+
+test "TASK-79.6.3: UTF-16 offset ASCII / BMP 日本語" {
+    var buffer = try TextBuffer.init(testing.allocator, "AあB");
+    defer buffer.deinit();
+    // A=1, あ=1, B=1 → total 3 UTF-16 units, 3 codepoints
+    try testing.expectEqual(@as(u64, 3), buffer.utf16Length());
+    try testing.expectEqual(@as(u64, 0), buffer.codepointIndexToUtf16(0));
+    try testing.expectEqual(@as(u64, 1), buffer.codepointIndexToUtf16(1));
+    try testing.expectEqual(@as(u64, 2), buffer.codepointIndexToUtf16(2));
+    try testing.expectEqual(@as(u64, 3), buffer.codepointIndexToUtf16(3));
+    const sel: SelectionState = .{ .anchor = 1, .extent = 2 };
+    const r = buffer.selectedRangeUtf16(sel);
+    try testing.expectEqual(@as(u64, 1), r.location);
+    try testing.expectEqual(@as(u64, 1), r.length);
+}
+
+test "TASK-79.6.3: UTF-16 offset 補助平面 emoji（surrogate pair）" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, 0x1F600, null)); // 😀
+    try testing.expectEqual(@as(u64, 2), buffer.utf16Length());
+    try testing.expectEqual(@as(u64, 0), buffer.codepointIndexToUtf16(0));
+    try testing.expectEqual(@as(u64, 2), buffer.codepointIndexToUtf16(1));
+    // mid-surrogate は substring で clamp、replacement は拒否
+    const mid = buffer.substringForUtf16Range(.{ .location = 1, .length = 1 }) orelse unreachable;
+    try testing.expectEqual(@as(u64, 0), mid.actual_range.location);
+    try testing.expectEqual(@as(u64, 2), mid.actual_range.length);
+    try testing.expectEqualStrings("😀", mid.utf8);
+    try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 1, .length = 1 }, "X", null));
+    try testing.expectEqualStrings("😀", buffer.slice());
+}
+
+test "TASK-79.6.3: substring actual range と空 document" {
+    var empty = try TextBuffer.init(testing.allocator, "");
+    defer empty.deinit();
+    const e = empty.substringForUtf16Range(.{ .location = 0, .length = 0 }) orelse unreachable;
+    try testing.expectEqualStrings("", e.utf8);
+    try testing.expect(empty.substringForUtf16Range(.{ .location = 1, .length = 0 }) == null);
+
+    var buffer = try TextBuffer.init(testing.allocator, "漢字");
+    defer buffer.deinit();
+    // clamp 超過 length
+    const sub = buffer.substringForUtf16Range(.{ .location = 1, .length = 99 }) orelse unreachable;
+    try testing.expectEqual(@as(u64, 1), sub.actual_range.location);
+    try testing.expectEqual(@as(u64, 1), sub.actual_range.length);
+    try testing.expectEqualStrings("字", sub.utf8);
+    try testing.expect(buffer.substringForUtf16Range(.{ .location = 10, .length = 1 }) == null);
+}
+
+test "TASK-79.6.3: substring 末尾 caret（location == doc, length == 0）は空 range" {
+    var buffer = try TextBuffer.init(testing.allocator, "AB");
+    defer buffer.deinit();
+    try testing.expectEqual(@as(u64, 2), buffer.utf16Length());
+    const at_end = buffer.substringForUtf16Range(.{ .location = 2, .length = 0 }) orelse unreachable;
+    try testing.expectEqualStrings("", at_end.utf8);
+    try testing.expectEqual(@as(u64, 2), at_end.actual_range.location);
+    try testing.expectEqual(@as(u64, 0), at_end.actual_range.length);
+}
+
+test "TASK-79.6.3: substring location == doc で length > 0 は末尾へ clamp した空 range" {
+    // 仕様: location == doc は受理し、end を doc に clamp → 空 range（完全範囲外の location > doc のみ null）。
+    var buffer = try TextBuffer.init(testing.allocator, "AB");
+    defer buffer.deinit();
+    const clamped = buffer.substringForUtf16Range(.{ .location = 2, .length = 5 }) orelse unreachable;
+    try testing.expectEqualStrings("", clamped.utf8);
+    try testing.expectEqual(@as(u64, 2), clamped.actual_range.location);
+    try testing.expectEqual(@as(u64, 0), clamped.actual_range.length);
+    try testing.expect(buffer.substringForUtf16Range(.{ .location = 3, .length = 0 }) == null);
+}
+
+test "TASK-79.6.3: replacement 適用・selection collapse・max_len・拒否" {
+    var buffer = try TextBuffer.init(testing.allocator, "ab漢字cd");
+    defer buffer.deinit();
+    var selection: SelectionState = .{ .anchor = 0, .extent = 0 };
+    var caret: usize = 0;
+    // "漢字" = codepoints 2..4 = utf16 2..4
+    try testing.expect(try buffer.replaceUtf16RangeAndCollapseCaret(
+        &selection,
+        &caret,
+        .{ .location = 2, .length = 2 },
+        "XY",
+        null,
+    ));
+    try testing.expectEqualStrings("abXYcd", buffer.slice());
+    try testing.expectEqual(TextRange{ .start = 4, .end = 4 }, selection.normalized());
+    try testing.expectEqual(@as(usize, 4), caret);
+
+    // 範囲外拒否
+    try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 0, .length = 99 }, "Z", null));
+    try testing.expectEqualStrings("abXYcd", buffer.slice());
+
+    // 不正 UTF-8 拒否
+    try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 2, .length = 0 }, &.{0xFF}, null));
+    try testing.expectEqualStrings("abXYcd", buffer.slice());
+
+    // max_len: 既に上限なら挿入拒否
+    selection = .{ .anchor = 6, .extent = 6 };
+    try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 6, .length = 0 }, "!", 6));
+    try testing.expectEqualStrings("abXYcd", buffer.slice());
+}
+
+test "TASK-79.6.3: 空 document への replacement と caret 先頭/末尾" {
+    var buffer = try TextBuffer.init(testing.allocator, "");
+    defer buffer.deinit();
+    var selection: SelectionState = .{};
+    var caret: usize = 0;
+    try testing.expect(try buffer.replaceUtf16RangeAndCollapseCaret(
+        &selection,
+        &caret,
+        .{ .location = 0, .length = 0 },
+        "あ",
+        null,
+    ));
+    try testing.expectEqualStrings("あ", buffer.slice());
+    try testing.expectEqual(@as(usize, 1), caret);
+    // 末尾挿入
+    try testing.expect(try buffer.replaceUtf16RangeAndCollapseCaret(
+        &selection,
+        &caret,
+        .{ .location = 1, .length = 0 },
+        "B",
+        null,
+    ));
+    try testing.expectEqualStrings("あB", buffer.slice());
+    try testing.expectEqual(@as(usize, 2), caret);
 }

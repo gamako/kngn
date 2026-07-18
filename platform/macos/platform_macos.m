@@ -406,6 +406,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     NSRect compositionRectPixels; // framebuffer pixel・content 左上原点
     BOOL compositionRectSet;
 
+    // IME document access (TASK-79.6.3)。callback 未登録時は従来どおり NSNotFound/nil/char_input。
+    PlatformTextInputDocumentCallbacks docAccessCallbacks;
+    void* docAccessUserdata;
+    BOOL docAccessEnabled;
+    BOOL hasPendingReplacement;
+    NSRange pendingReplacement;
+
     // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
     BOOL transparentMode;      // YES で CGImage を premultiplied alpha 化し fb の alpha を honor
     BOOL clickThrough;         // YES で透明画素上のクリックを背後へ抜けさせる（per-pixel）
@@ -438,6 +445,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 // composition snapshot（platform_get_composition_snapshot から呼ぶ）
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta;
 - (void)setCompositionRectPixelsX:(int32_t)x y:(int32_t)y w:(int32_t)w h:(int32_t)h;
+
+// IME document access (TASK-79.6.3)。callbacks==NULL で解除。
+- (void)setTextInputDocumentAccess:(const PlatformTextInputDocumentCallbacks*)callbacks userdata:(void*)ud;
 
 // 透過ウィンドウ関連 (TASK-104)
 - (void)setTransparentMode:(BOOL)on;
@@ -475,6 +485,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         memset(compositionUtf8, 0, sizeof(compositionUtf8));
         compositionRectPixels = NSZeroRect;
         compositionRectSet = NO;
+        memset(&docAccessCallbacks, 0, sizeof(docAccessCallbacks));
+        docAccessUserdata = NULL;
+        docAccessEnabled = NO;
+        hasPendingReplacement = NO;
+        pendingReplacement = NSMakeRange(NSNotFound, 0);
         transparentMode = NO;   // TASK-104: 既定は不透明（従来挙動と bit 一致）
         clickThrough = NO;
         clickThroughState = NO; // 初期 ignoresMouseEvents=NO と一致
@@ -951,9 +966,38 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 }
 
+- (void)clearPendingReplacement {
+    hasPendingReplacement = NO;
+    pendingReplacement = NSMakeRange(NSNotFound, 0);
+}
+
+- (void)setTextInputDocumentAccess:(const PlatformTextInputDocumentCallbacks*)callbacks userdata:(void*)ud {
+    if (callbacks && callbacks->get_selected_range && callbacks->get_substring && callbacks->replace_text) {
+        docAccessCallbacks = *callbacks;
+        docAccessUserdata = ud;
+        docAccessEnabled = YES;
+    } else {
+        memset(&docAccessCallbacks, 0, sizeof(docAccessCallbacks));
+        docAccessUserdata = NULL;
+        docAccessEnabled = NO;
+        [self clearPendingReplacement];
+    }
+}
+
+- (NSRange)resolveReplacementRange:(NSRange)replacementRange {
+    if (replacementRange.location != NSNotFound) return replacementRange;
+    if (hasPendingReplacement) return pendingReplacement;
+    if (docAccessEnabled && docAccessCallbacks.get_selected_range) {
+        PlatformTextInputRange pr;
+        memset(&pr, 0, sizeof(pr));
+        if (docAccessCallbacks.get_selected_range(docAccessUserdata, &pr) && pr.location != UINT64_MAX) {
+            return NSMakeRange((NSUInteger)pr.location, (NSUInteger)pr.length);
+        }
+    }
+    return NSMakeRange(NSNotFound, 0);
+}
+
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
-    // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
-    (void)replacementRange;
     key_trace("insertText");
     NSString* str = [string isKindOfClass:[NSAttributedString class]]
         ? [(NSAttributedString*)string string]
@@ -966,17 +1010,39 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         compositionCursor = 0;
         [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_COMMIT];
     }
+
+    if (docAccessEnabled && docAccessCallbacks.replace_text) {
+        NSRange useRange = [self resolveReplacementRange:replacementRange];
+        [self clearPendingReplacement];
+        if (useRange.location == NSNotFound) return;
+        // UTF-8 変換失敗は拒否（buffer 不変・char_input も出さない）
+        if (!str) str = @"";
+        NSData* data = [str dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO];
+        if (!data && str.length > 0) return;
+        const uint8_t* utf8 = data ? (const uint8_t*)[data bytes] : (const uint8_t*)"";
+        uint32_t len = data ? (uint32_t)[data length] : 0;
+        PlatformTextInputRange rr = {
+            .location = (uint64_t)useRange.location,
+            .length = (uint64_t)useRange.length,
+        };
+        docAccessCallbacks.replace_text(docAccessUserdata, rr, utf8, len);
+        return;
+    }
+
+    [self clearPendingReplacement];
     [self pushCharInputsFromString:str];
 }
 
 - (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange {
-    // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
-    (void)replacementRange;
     key_trace("setMarkedText");
     NSString* str = [string isKindOfClass:[NSAttributedString class]]
         ? [(NSAttributedString*)string string]
         : (NSString*)string;
     if (!str) str = @"";
+    if (replacementRange.location != NSNotFound) {
+        hasPendingReplacement = YES;
+        pendingReplacement = replacementRange;
+    }
     BOOL wasEmpty = (markedText.length == 0);
     [markedText setString:str];
     imeSelectedRange = selectedRange;
@@ -987,6 +1053,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (markedText.length == 0) {
         compositionLen = 0;
         compositionCursor = 0;
+        [self clearPendingReplacement];
         if (!wasEmpty) {
             [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_CANCEL];
         }
@@ -999,11 +1066,15 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (void)unmarkText {
-    if (markedText.length == 0) return;
+    if (markedText.length == 0) {
+        [self clearPendingReplacement];
+        return;
+    }
     [markedText setString:@""];
     imeSelectedRange = NSMakeRange(0, 0);
     compositionLen = 0;
     compositionCursor = 0;
+    [self clearPendingReplacement];
     [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_CANCEL];
 }
 
@@ -1025,6 +1096,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (wasRouting && !active) {
         [self unmarkText];                        // markedText クリア + CANCEL phase（空なら no-op）
         [[self inputContext] discardMarkedText];  // IME の変換セッションも破棄（候補窓を閉じる）
+        [self clearPendingReplacement];
     }
 }
 
@@ -1034,7 +1106,16 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (NSRange)selectedRange {
-    if (markedText.length == 0) return NSMakeRange(NSNotFound, 0);
+    if (markedText.length == 0) {
+        if (docAccessEnabled && docAccessCallbacks.get_selected_range) {
+            PlatformTextInputRange pr;
+            memset(&pr, 0, sizeof(pr));
+            if (docAccessCallbacks.get_selected_range(docAccessUserdata, &pr) && pr.location != UINT64_MAX) {
+                return NSMakeRange((NSUInteger)pr.location, (NSUInteger)pr.length);
+            }
+        }
+        return NSMakeRange(NSNotFound, 0);
+    }
     return imeSelectedRange;
 }
 
@@ -1043,7 +1124,30 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (NSAttributedString*)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
-    if (markedText.length == 0) return nil;
+    if (markedText.length == 0) {
+        if (!docAccessEnabled || !docAccessCallbacks.get_substring) return nil;
+        if (range.location == NSNotFound) return nil;
+        PlatformTextInputRange proposed = {
+            .location = (uint64_t)range.location,
+            .length = (uint64_t)range.length,
+        };
+        const uint8_t* utf8 = NULL;
+        uint32_t len = 0;
+        PlatformTextInputRange actual = {0, 0};
+        if (!docAccessCallbacks.get_substring(docAccessUserdata, proposed, &utf8, &len, &actual)) {
+            return nil;
+        }
+        if (actualRange) {
+            *actualRange = NSMakeRange((NSUInteger)actual.location, (NSUInteger)actual.length);
+        }
+        if (len == 0) {
+            return [[NSAttributedString alloc] initWithString:@""];
+        }
+        if (!utf8) return nil;
+        NSString* s = [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
+        if (!s) return nil;
+        return [[NSAttributedString alloc] initWithString:s];
+    }
     NSRange full = NSMakeRange(0, markedText.length);
     NSRange clipped = NSIntersectionRange(full, range);
     if (clipped.length == 0) return nil;
@@ -1909,6 +2013,15 @@ void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y,
 void platform_set_text_input_active(PlatformWindow* window, bool active) {
     if (!window || !window->view) return;
     [window->view setTextInputActive:(active ? YES : NO)];
+}
+
+void platform_set_text_input_document_access(
+    PlatformWindow* window,
+    const PlatformTextInputDocumentCallbacks* callbacks,
+    void* userdata
+) {
+    if (!window || !window->view) return;
+    [window->view setTextInputDocumentAccess:callbacks userdata:userdata];
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

@@ -551,6 +551,13 @@ class FramebufferView: NSView, NSTextInputClient {
     private var compositionRectPixels = NSRect.zero
     private var compositionRectSet = false
 
+    // IME document access (TASK-79.6.3)
+    private var docAccessCallbacks = PlatformTextInputDocumentCallbacks()
+    private var docAccessUserdata: UnsafeMutableRawPointer?
+    private var docAccessEnabled = false
+    private var hasPendingReplacement = false
+    private var pendingReplacement = NSRange(location: NSNotFound, length: 0)
+
     // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
     private var transparentMode: Bool = false  // true で CGImage を premultiplied alpha 化し fb の alpha を honor
     private var clickThrough: Bool = false     // true で透明画素上のクリックを背後へ抜けさせる（per-pixel）
@@ -737,8 +744,6 @@ class FramebufferView: NSView, NSTextInputClient {
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {
-        // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
-        _ = replacementRange
         keyTrace("insertText")
         let str: String
         if let attr = string as? NSAttributedString {
@@ -756,12 +761,28 @@ class FramebufferView: NSView, NSTextInputClient {
             compositionCursor = 0
             pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_COMMIT.rawValue))
         }
+
+        if docAccessEnabled, let replaceFn = docAccessCallbacks.replace_text {
+            let useRange = resolveReplacementRange(replacementRange)
+            clearPendingReplacement()
+            guard useRange.location != NSNotFound else { return }
+            // 不正 UTF-8 は拒否（String(decoding:) による置換は行わない）
+            guard let data = str.data(using: .utf8) else { return }
+            var rr = PlatformTextInputRange()
+            rr.location = UInt64(useRange.location)
+            rr.length = UInt64(useRange.length)
+            data.withUnsafeBytes { raw in
+                let ptr = raw.bindMemory(to: UInt8.self).baseAddress
+                _ = replaceFn(docAccessUserdata, rr, ptr, UInt32(data.count))
+            }
+            return
+        }
+
+        clearPendingReplacement()
         pushCharInputs(from: str)
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        // replacementRange: 79.6.2+ で扱う（char_input に置換情報が無い現契約の既知の穴）。
-        _ = replacementRange
         keyTrace("setMarkedText")
         let str: String
         if let attr = string as? NSAttributedString {
@@ -770,6 +791,10 @@ class FramebufferView: NSView, NSTextInputClient {
             str = s
         } else {
             str = ""
+        }
+        if replacementRange.location != NSNotFound {
+            hasPendingReplacement = true
+            pendingReplacement = replacementRange
         }
         let wasEmpty = markedTextStorage.length == 0
         markedTextStorage.setString(str)
@@ -781,6 +806,7 @@ class FramebufferView: NSView, NSTextInputClient {
         if markedTextStorage.length == 0 {
             compositionLen = 0
             compositionCursor = 0
+            clearPendingReplacement()
             if !wasEmpty {
                 pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
             }
@@ -793,11 +819,15 @@ class FramebufferView: NSView, NSTextInputClient {
     }
 
     func unmarkText() {
-        guard markedTextStorage.length > 0 else { return }
+        if markedTextStorage.length == 0 {
+            clearPendingReplacement()
+            return
+        }
         markedTextStorage.setString("")
         imeSelectedRange = NSRange(location: 0, length: 0)
         compositionLen = 0
         compositionCursor = 0
+        clearPendingReplacement()
         pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
     }
 
@@ -819,7 +849,44 @@ class FramebufferView: NSView, NSTextInputClient {
         if wasRouting && !active {
             unmarkText()                        // markedText クリア + CANCEL phase（空なら no-op）
             inputContext?.discardMarkedText()   // IME の変換セッションも破棄（候補窓を閉じる）
+            clearPendingReplacement()
         }
+    }
+
+    func clearPendingReplacement() {
+        hasPendingReplacement = false
+        pendingReplacement = NSRange(location: NSNotFound, length: 0)
+    }
+
+    func setTextInputDocumentAccess(
+        callbacks: UnsafePointer<PlatformTextInputDocumentCallbacks>?,
+        userdata: UnsafeMutableRawPointer?
+    ) {
+        if let callbacks,
+           callbacks.pointee.get_selected_range != nil,
+           callbacks.pointee.get_substring != nil,
+           callbacks.pointee.replace_text != nil {
+            docAccessCallbacks = callbacks.pointee
+            docAccessUserdata = userdata
+            docAccessEnabled = true
+        } else {
+            docAccessCallbacks = PlatformTextInputDocumentCallbacks()
+            docAccessUserdata = nil
+            docAccessEnabled = false
+            clearPendingReplacement()
+        }
+    }
+
+    func resolveReplacementRange(_ replacementRange: NSRange) -> NSRange {
+        if replacementRange.location != NSNotFound { return replacementRange }
+        if hasPendingReplacement { return pendingReplacement }
+        if docAccessEnabled, let getSel = docAccessCallbacks.get_selected_range {
+            var pr = PlatformTextInputRange()
+            if getSel(docAccessUserdata, &pr), pr.location != UInt64.max {
+                return NSRange(location: Int(pr.location), length: Int(pr.length))
+            }
+        }
+        return NSRange(location: NSNotFound, length: 0)
     }
 
     func markedRange() -> NSRange {
@@ -828,7 +895,15 @@ class FramebufferView: NSView, NSTextInputClient {
     }
 
     func selectedRange() -> NSRange {
-        if markedTextStorage.length == 0 { return NSRange(location: NSNotFound, length: 0) }
+        if markedTextStorage.length == 0 {
+            if docAccessEnabled, let getSel = docAccessCallbacks.get_selected_range {
+                var pr = PlatformTextInputRange()
+                if getSel(docAccessUserdata, &pr), pr.location != UInt64.max {
+                    return NSRange(location: Int(pr.location), length: Int(pr.length))
+                }
+            }
+            return NSRange(location: NSNotFound, length: 0)
+        }
         return imeSelectedRange
     }
 
@@ -837,7 +912,26 @@ class FramebufferView: NSView, NSTextInputClient {
     }
 
     func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        if markedTextStorage.length == 0 { return nil }
+        if markedTextStorage.length == 0 {
+            guard docAccessEnabled, let getSub = docAccessCallbacks.get_substring else { return nil }
+            guard range.location != NSNotFound else { return nil }
+            var proposed = PlatformTextInputRange()
+            proposed.location = UInt64(range.location)
+            proposed.length = UInt64(range.length)
+            var utf8Ptr: UnsafePointer<UInt8>? = nil
+            var len: UInt32 = 0
+            var actual = PlatformTextInputRange()
+            guard getSub(docAccessUserdata, proposed, &utf8Ptr, &len, &actual) else { return nil }
+            actualRange?.pointee = NSRange(location: Int(actual.location), length: Int(actual.length))
+            if len == 0 {
+                return NSAttributedString(string: "")
+            }
+            guard let utf8Ptr else { return nil }
+            let data = Data(bytes: utf8Ptr, count: Int(len))
+            // 不正 UTF-8 は nil（置換しない）
+            guard let s = String(data: data, encoding: .utf8) else { return nil }
+            return NSAttributedString(string: s)
+        }
         let full = NSRange(location: 0, length: markedTextStorage.length)
         let clipped = NSIntersectionRange(full, range)
         if clipped.length == 0 { return nil }
@@ -1686,6 +1780,18 @@ func platform_set_text_input_active(platformWindow: UnsafeMutableRawPointer?, ac
     guard let platformWindow = platformWindow else { return }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     handle.view.setTextInputActive(active)
+}
+
+// TASK-79.6.3: IME document access
+@_cdecl("platform_set_text_input_document_access")
+func platform_set_text_input_document_access(
+    platformWindow: UnsafeMutableRawPointer?,
+    callbacks: UnsafePointer<PlatformTextInputDocumentCallbacks>?,
+    userdata: UnsafeMutableRawPointer?
+) {
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    handle.view.setTextInputDocumentAccess(callbacks: callbacks, userdata: userdata)
 }
 
 // イベントキューカウンタの snapshot 取得 (TASK-21.1)

@@ -141,6 +141,49 @@ fn notifyCompositionRect(window: platform.Window, state: *ImeState, rect: ?Compo
     state.composition_rect = next;
 }
 
+/// focused TextInput の document を IME へ供給する bridge（TASK-79.6.3）。
+const DocBridge = struct {
+    buffer: *gui.TextBuffer,
+    selection: *gui.SelectionState,
+    caret: *usize,
+    max_len: ?usize = null,
+
+    fn getSelectedRange(ud: *anyopaque) ?platform.TextInputRange {
+        const self: *DocBridge = @ptrCast(@alignCast(ud));
+        const r = self.buffer.selectedRangeUtf16(self.selection.*);
+        return .{ .location = r.location, .length = r.length };
+    }
+
+    fn getSubstring(ud: *anyopaque, proposed: platform.TextInputRange) ?platform.TextInputSubstring {
+        const self: *DocBridge = @ptrCast(@alignCast(ud));
+        const sub = self.buffer.substringForUtf16Range(.{
+            .location = proposed.location,
+            .length = proposed.length,
+        }) orelse return null;
+        return .{
+            .utf8 = sub.utf8,
+            .actual_range = .{ .location = sub.actual_range.location, .length = sub.actual_range.length },
+        };
+    }
+
+    fn replaceText(ud: *anyopaque, range: platform.TextInputRange, utf8: []const u8) bool {
+        const self: *DocBridge = @ptrCast(@alignCast(ud));
+        return self.buffer.replaceUtf16RangeAndCollapseCaret(
+            self.selection,
+            self.caret,
+            .{ .location = range.location, .length = range.length },
+            utf8,
+            self.max_len,
+        ) catch false;
+    }
+};
+
+const doc_callbacks = platform.TextInputDocumentCallbacks{
+    .getSelectedRange = DocBridge.getSelectedRange,
+    .getSubstring = DocBridge.getSubstring,
+    .replaceText = DocBridge.replaceText,
+};
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
@@ -199,6 +242,8 @@ pub fn main(init: std.process.Init) !void {
     // TASK-142: 初回 pollEvents 前に「編集フォーカス無し」を宣言しておく（起動直後の keyDown が
     // 従来の route-always で IME に吸われる隙間を塞ぐ）。以後は毎フレーム末尾で focus に追従する。
     window.setTextInputActive(false);
+    var doc_bridge: DocBridge = undefined;
+    var doc_bridge_active = false;
     main_loop: while (running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
@@ -306,6 +351,47 @@ pub fn main(init: std.process.Init) !void {
 
         // TASK-142: テキスト欄が focus されているときだけ keyDown を IME へ渡す。空きをクリックして
         // focus を外すと（wantsKeyboard()==false）、IME 有効中でもキーがショートカットとして届く。
-        window.setTextInputActive(ctx.wantsKeyboard());
+        // TASK-79.6.3: document access も同一タイミングで切替え（次の pollEvents までに完了）。
+        // 毎フレーム再登録は意図的: PerIdStateStore の rehash で *PerIdState が無効化されうるため、
+        // focus 変化時のみに最適化すると selection/caret ポインタが dangling になる。
+        const wants = ctx.wantsKeyboard();
+        window.setTextInputActive(wants);
+        if (wants) {
+            switch (focused_id) {
+                0x2801 => {
+                    const per = ctx.perIdState(0x2801);
+                    doc_bridge = .{
+                        .buffer = &first_buffer,
+                        .selection = &per.selection,
+                        .caret = &per.caret,
+                        .max_len = null,
+                    };
+                    window.setTextInputDocumentAccess(@ptrCast(&doc_bridge), doc_callbacks);
+                    doc_bridge_active = true;
+                },
+                0x2802 => {
+                    const per = ctx.perIdState(0x2802);
+                    doc_bridge = .{
+                        .buffer = &second_buffer,
+                        .selection = &per.selection,
+                        .caret = &per.caret,
+                        .max_len = null,
+                    };
+                    window.setTextInputDocumentAccess(@ptrCast(&doc_bridge), doc_callbacks);
+                    doc_bridge_active = true;
+                },
+                else => {
+                    if (doc_bridge_active) {
+                        var dummy: u8 = 0;
+                        window.setTextInputDocumentAccess(@ptrCast(&dummy), null);
+                        doc_bridge_active = false;
+                    }
+                },
+            }
+        } else if (doc_bridge_active) {
+            var dummy: u8 = 0;
+            window.setTextInputDocumentAccess(@ptrCast(&dummy), null);
+            doc_bridge_active = false;
+        }
     }
 }

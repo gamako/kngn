@@ -107,6 +107,10 @@ pub const CharEvent = types.CharEvent;
 pub const CompositionPhase = types.CompositionPhase;
 pub const CompositionEvent = types.CompositionEvent;
 pub const CompositionSnapshot = types.CompositionSnapshot;
+pub const TextInputRange = types.TextInputRange;
+pub const TextInputSubstring = types.TextInputSubstring;
+pub const TextInputDocumentCallbacks = types.TextInputDocumentCallbacks;
+pub const TEXT_INPUT_RANGE_NOT_FOUND = types.TEXT_INPUT_RANGE_NOT_FOUND;
 pub const MouseButton = types.MouseButton;
 pub const MouseButtons = types.MouseButtons;
 pub const MouseEvent = types.MouseEvent;
@@ -239,6 +243,12 @@ pub const Window = struct {
         if (self.headless) {
             harness.destroyHeadlessWindow();
             return;
+        }
+        // document access 登録解除（dangling userdata。backend が実装していれば）。
+        if (comptime @hasDecl(backend.Window, "setTextInputDocumentAccess")) {
+            // userdata は解除時に読まれないが、型上 *anyopaque が必要なのでダミーを渡す。
+            var dummy: u8 = 0;
+            self.inner.setTextInputDocumentAccess(@ptrCast(&dummy), null);
         }
         self.inner.clearRedrawCallback();
         self.inner.destroy();
@@ -478,6 +488,19 @@ pub const Window = struct {
         if (self.headless) return;
         if (comptime @hasDecl(backend.Window, "setTextInputActive")) {
             self.inner.setTextInputActive(active);
+        }
+    }
+
+    /// TASK-79.6.3: IME document access（確定テキストの再変換）。`callbacks == null` で登録解除。
+    /// headless / 非対応 backend は no-op。window destroy 時に facade 側も解除する。
+    pub fn setTextInputDocumentAccess(
+        self: Window,
+        userdata: *anyopaque,
+        callbacks: ?TextInputDocumentCallbacks,
+    ) void {
+        if (self.headless) return;
+        if (comptime @hasDecl(backend.Window, "setTextInputDocumentAccess")) {
+            self.inner.setTextInputDocumentAccess(userdata, callbacks);
         }
     }
 };

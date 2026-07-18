@@ -32,3 +32,31 @@ test "platform geometry facade: headless 未設定サイズの既定は 0" {
     try std.testing.expectEqual(@as(u32, 0), window.create_w);
     try std.testing.expectEqual(@as(u32, 0), window.create_h);
 }
+
+test "TASK-79.6.3: document access facade は headless で no-op・未登録" {
+    var window = platform.Window{ .inner = undefined, .headless = true };
+    var dummy: u8 = 0;
+    const cbs = platform.TextInputDocumentCallbacks{
+        .getSelectedRange = struct {
+            fn f(_: *anyopaque) ?platform.TextInputRange {
+                return .{ .location = 0, .length = 0 };
+            }
+        }.f,
+        .getSubstring = struct {
+            fn f(_: *anyopaque, _: platform.TextInputRange) ?platform.TextInputSubstring {
+                return null;
+            }
+        }.f,
+        .replaceText = struct {
+            fn f(_: *anyopaque, _: platform.TextInputRange, _: []const u8) bool {
+                return false;
+            }
+        }.f,
+    };
+    // headless は登録しない（legacy path = 未登録 = char_input 経路維持）
+    window.setTextInputDocumentAccess(@ptrCast(&dummy), cbs);
+    window.setTextInputDocumentAccess(@ptrCast(&dummy), null);
+    try std.testing.expect(@hasDecl(platform.Window, "setTextInputDocumentAccess"));
+    try std.testing.expectEqual(platform.TEXT_INPUT_RANGE_NOT_FOUND, std.math.maxInt(u64));
+    try std.testing.expect((platform.TextInputRange{ .location = platform.TEXT_INPUT_RANGE_NOT_FOUND, .length = 0 }).isNotFound());
+}
