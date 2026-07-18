@@ -80,7 +80,7 @@ inject key_up PAGE_DOWN
 step 1
 digest gallery
 expect gallery section=layout
-expect gallery widgets=2
+expect gallery widgets=3
 snapshot fb
 # layout -> menus
 inject key_down PAGE_DOWN

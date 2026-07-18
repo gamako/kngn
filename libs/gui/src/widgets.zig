@@ -198,6 +198,92 @@ pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
     return result;
 }
 
+// ── iconButton（TASK-145.1）────────────────────────────────
+// 16x16 1bit アイコン付き選択トグルボタン。描画は custom leaf（ColorSwatch 半透明経路と同型）。
+// 1bit mask を各行の連続 set bit ごとに不透明 rectFilled run へ変換（透明 pixel は書かない）。
+// selected は枠厚のみ（button_border_selected）。背景は held>hot>normal = bg_active>bg_hover>bg。
+
+/// 16 行の 1bit アイコン。各 `u16` が 1 行、bit15=左端・bit0=右端。
+pub const IconBitmap = []const u16;
+
+const icon_px: i32 = 16;
+
+/// クリックされたら true（自動 ID: icon 内容 hash + id_stack）。
+/// 同一 scope に同 icon を並べると ID 衝突する。`iconButtonId` または `id_stack.push` を使う。
+pub fn iconButton(ctx: *Context, icon: IconBitmap, selected: bool) bool {
+    return iconButtonId(ctx, iconAutoId(ctx, icon), icon, selected).clicked;
+}
+
+/// 明示 ID 版。ツールバー等で同 icon を並べる場合や rect を外部参照する場合に使う。
+pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) ButtonResult {
+    std.debug.assert(icon.len == 16);
+    const result = behaviorFromCache(ctx, id);
+    const style = ctx.style;
+    const hot = ctx.state.hot_id == id;
+    const bg = if (result.held) style.bg_active else if (hot) style.bg_hover else style.bg;
+    const border_color = if (hot) style.border_hover else style.border;
+    const thickness = if (selected) style.button_border_selected else style.button_border;
+    const pad = style.button_padding;
+    const w = icon_px + pad[1] + pad[3];
+    const h = icon_px + pad[0] + pad[2];
+    ctx.beginBox(.{
+        .id = id,
+        .width = .{ .fixed = w },
+        .height = .{ .fixed = h },
+        .padding = pad,
+        .bg = bg,
+        .border = makeBorder(border_color, thickness),
+    });
+    const data = ctx.allocator().create(IconButtonDraw) catch @panic("iconButton: OOM");
+    @memcpy(&data.rows, icon[0..16]);
+    data.fg = style.text;
+    ctx.custom(.{ .x = icon_px, .y = icon_px }, IconButtonDraw.draw, data);
+    ctx.endBox();
+    return result;
+}
+
+fn iconAutoId(ctx: *Context, icon: IconBitmap) Id {
+    std.debug.assert(icon.len == 16);
+    // bitmap 内容を FNV で 1 値に畳み、makeInt で id_stack スコープを乗せる。
+    const seed = id_mod.fnv1a(0, std.mem.sliceAsBytes(icon));
+    return ctx.id_stack.makeInt(seed);
+}
+
+/// 半透明 swatch と同型: arena 上に確保し endFrame の custom leaf で消費。
+const IconButtonDraw = struct {
+    rows: [16]u16,
+    fg: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const IconButtonDraw = @ptrCast(@alignCast(ctx_ptr));
+        // 1bit mask → 行ごとの連続 set bit を横長 rectFilled run に。透明は書かない。
+        var row: i32 = 0;
+        while (row < 16) : (row += 1) {
+            const bits = self.rows[@intCast(row)];
+            var x: i32 = 0;
+            while (x < 16) {
+                const bit_on = (bits & (@as(u16, 1) << @intCast(15 - x))) != 0;
+                if (!bit_on) {
+                    x += 1;
+                    continue;
+                }
+                var x2 = x + 1;
+                while (x2 < 16) {
+                    if ((bits & (@as(u16, 1) << @intCast(15 - x2))) == 0) break;
+                    x2 += 1;
+                }
+                dl.rectFilled(.{
+                    .x = rect.x + x,
+                    .y = rect.y + row,
+                    .w = @intCast(x2 - x),
+                    .h = 1,
+                }, self.fg) catch @panic("iconButton: OOM");
+                x = x2;
+            }
+        }
+    }
+};
+
 /// 前フレームの rect キャッシュで同期 hit-test。キャッシュ未生成（初回フレーム・
 /// 前フレーム非表示）の widget は非ヒット扱い（21.2/21.4 契約）。
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
@@ -1993,6 +2079,225 @@ test "button: held フレームは bg_active、hover フレームは bg_hover �
     ctx.endFrame();
     try std.testing.expect(!res);
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+}
+
+// ── iconButton tests（TASK-145.1）──────────────────────────
+
+/// テスト用 16x16: 中央 2x2 のみ set（row 7-8, col 7-8）。bit15=左端。
+const test_icon_center: [16]u16 = blk: {
+    var rows: [16]u16 = .{0} ** 16;
+    // col 7,8 → bit (15-7)=8, (15-8)=7
+    const mid: u16 = (@as(u16, 1) << 8) | (@as(u16, 1) << 7);
+    rows[7] = mid;
+    rows[8] = mid;
+    break :blk rows;
+};
+
+/// テスト用: 左上 1px のみ set（run 変換と左右向きの確認用）。
+const test_icon_tl: [16]u16 = blk: {
+    var rows: [16]u16 = .{0} ** 16;
+    rows[0] = @as(u16, 1) << 15; // bit15 = 左端
+    break :blk rows;
+};
+
+test "iconButtonId: 初回 frame で rect cache が生成される" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    try std.testing.expect(ctx.getNodeRect(0x1451) == null);
+    _ = ctx.iconButtonId(0x1451, &test_icon_center, false);
+    ctx.endFrame();
+
+    const r = ctx.getNodeRect(0x1451).?;
+    const pad = ctx.style.button_padding;
+    try std.testing.expectEqual(@as(u32, @intCast(16 + pad[1] + pad[3])), r.w);
+    try std.testing.expectEqual(@as(u32, @intCast(16 + pad[0] + pad[2])), r.h);
+}
+
+test "iconButton: selected と non-selected の枠厚が pixel で区別できる" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    _ = ctx.iconButtonId(1, &test_icon_center, true);
+    _ = ctx.iconButtonId(2, &test_icon_center, false);
+    ctx.endBox();
+    ctx.endFrame();
+
+    var pixels: [200 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font);
+
+    const sel = ctx.getNodeRect(1).?;
+    const unsel = ctx.getNodeRect(2).?;
+    const border_u: u32 = @bitCast(ctx.style.border);
+    const bg_u: u32 = @bitCast(ctx.style.bg);
+    const ys: u32 = @intCast(sel.y + @as(i32, @intCast(sel.h / 2)));
+    const yu: u32 = @intCast(unsel.y + @as(i32, @intCast(unsel.h / 2)));
+
+    // selected（厚さ2）: x+1 も枠色 / 非 selected（厚さ1）: x+1 は bg
+    try std.testing.expectEqual(border_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
+    try std.testing.expectEqual(bg_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x + 1))]);
+}
+
+test "iconButton: hot は bg_hover、held は bg_active" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(0x1452).?);
+
+    // hover 1 フレーム目: hot_id 未昇格 → bg
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, c.x, c.y);
+    _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+
+    // hover 継続 → bg_hover
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, c.x, c.y);
+    _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+
+    // press → held → bg_active
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, c.x, c.y);
+    const res = ctx.iconButtonId(0x1452, &test_icon_center, false);
+    ctx.endFrame();
+    try std.testing.expect(res.held);
+    try std.testing.expect(!res.clicked);
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+}
+
+test "iconButton: mouse down-up で clicked" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.iconButtonId(0x1453, &test_icon_center, false);
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(0x1453).?);
+
+    ctx.beginFrame(800, 600);
+    clickAt(&ctx, c.x, c.y);
+    try std.testing.expect(ctx.iconButtonId(0x1453, &test_icon_center, false).clicked);
+    ctx.endFrame();
+}
+
+test "iconButton: set bit は foreground、clear bit は背景のまま" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(80, 40);
+    _ = ctx.iconButtonId(1, &test_icon_tl, false);
+    ctx.endFrame();
+
+    var pixels: [80 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 80, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font);
+
+    const r = ctx.getNodeRect(1).?;
+    const pad = ctx.style.button_padding;
+    // icon leaf は padding 内側の (pad.left, pad.top) 起点。左上 1px が set。
+    const ix: u32 = @intCast(r.x + pad[3]);
+    const iy: u32 = @intCast(r.y + pad[0]);
+    const fg_u: u32 = @bitCast(ctx.style.text);
+    const bg_u: u32 = @bitCast(ctx.style.bg);
+    try std.testing.expectEqual(fg_u, pixels[iy * 80 + ix]);
+    // 右隣 (clear) は背景
+    try std.testing.expectEqual(bg_u, pixels[iy * 80 + ix + 1]);
+    // 下隣 (clear) は背景
+    try std.testing.expectEqual(bg_u, pixels[(iy + 1) * 80 + ix]);
+}
+
+test "iconButton: clip_children 外は click しない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var out: ButtonResult = .{};
+
+    const build = struct {
+        fn f(c: *Context, result: *ButtonResult) void {
+            // viewport 20px 高・clip あり。spacer 40px の下に icon → clip 外。
+            c.beginBox(.{
+                .width = .{ .fixed = 80 },
+                .height = .{ .fixed = 20 },
+                .clip_children = true,
+                .direction = .column,
+            });
+            c.beginBox(.{ .height = .{ .fixed = 40 } });
+            c.endBox();
+            result.* = c.iconButtonId(0x1454, &test_icon_center, false);
+            c.endBox();
+        }
+    }.f;
+
+    ctx.beginFrame(100, 100);
+    build(&ctx, &out);
+    ctx.endFrame();
+
+    const cached = ctx.getNodeCachedRect(0x1454).?;
+    const c = center(cached.rect);
+    try std.testing.expect(!context_mod.pointHitsVisible(cached.rect, cached.clip, .{ .x = c.x, .y = c.y }));
+
+    ctx.beginFrame(100, 100);
+    clickAt(&ctx, c.x, c.y);
+    build(&ctx, &out);
+    ctx.endFrame();
+    try std.testing.expect(!out.clicked);
+    try std.testing.expect(!out.hovered);
+    try std.testing.expect(!out.held);
+}
+
+test "iconButton: 明示 ID 2 個で片方だけ click" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var res: [2]ButtonResult = undefined;
+
+    const build = struct {
+        fn f(c: *Context, out: *[2]ButtonResult) void {
+            c.beginBox(.{ .direction = .row, .gap = 4 });
+            out[0] = c.iconButtonId(10, &test_icon_center, false);
+            out[1] = c.iconButtonId(11, &test_icon_center, false);
+            c.endBox();
+        }
+    }.f;
+
+    ctx.beginFrame(800, 600);
+    build(&ctx, &res);
+    ctx.endFrame();
+
+    const c1 = center(ctx.getNodeRect(11).?);
+    ctx.beginFrame(800, 600);
+    clickAt(&ctx, c1.x, c1.y);
+    build(&ctx, &res);
+    ctx.endFrame();
+    try std.testing.expect(!res[0].clicked);
+    try std.testing.expect(res[1].clicked);
+}
+
+// 自動 ID 版 iconButton の smoke（iconButtonId 経路とは別経路の AC#1 被覆）。
+test "iconButton: 自動 ID 経路で mouse down-up が clicked" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    try std.testing.expect(!ctx.iconButton(&test_icon_center, false));
+    ctx.endFrame();
+    const id = iconAutoId(&ctx, &test_icon_center);
+    const c = center(ctx.getNodeRect(id).?);
+
+    ctx.beginFrame(800, 600);
+    clickAt(&ctx, c.x, c.y);
+    try std.testing.expect(ctx.iconButton(&test_icon_center, false));
+    ctx.endFrame();
 }
 
 test "colorSwatch: 不透明は bg+枠のみ、半透明は checker+blend で発行される" {

@@ -157,6 +157,9 @@ pub const Context = struct {
     pub const colorSwatch = widgets.colorSwatch;
     pub const colorSwatchEx = widgets.colorSwatchEx;
     pub const colorSwatchId = widgets.colorSwatchId;
+    // iconButton（TASK-145.1）
+    pub const iconButton = widgets.iconButton;
+    pub const iconButtonId = widgets.iconButtonId;
     // Slider（TASK-21.9）
     pub const sliderI32 = widgets.sliderI32;
     pub const sliderI32Id = widgets.sliderI32Id;

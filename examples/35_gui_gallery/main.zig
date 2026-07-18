@@ -41,7 +41,7 @@ const SECTIONS = [_]SectionMeta{
     .{ .name = "text", .detail = "selectableLabel / textInputId", .widgets = 2, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
-    .{ .name = "layout", .detail = "splitter / scrollArea", .widgets = 2, .missing = 0 },
+    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton", .widgets = 3, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
     .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 15, .missing = 15 },
@@ -74,6 +74,7 @@ const COLOR_MATRIX = [_]MatrixRow{
 const LAYOUT_MATRIX = [_]MatrixRow{
     .{ .name = "splitter", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
     .{ .name = "scrollArea", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
+    .{ .name = "iconButton", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
 };
 const MENUS_MATRIX = [_]MatrixRow{
     .{ .name = "popup/ctx", .cells = .{ "ok", "ok", "ok", "N/A", "item", "N/A", "N/A", "N/A", "ok" } },
@@ -119,6 +120,8 @@ const Ids = struct {
     const image: gui.Id = 0x3533;
     const splitter: gui.Id = 0x3540;
     const scroll: gui.Id = 0x3541;
+    const icon_pen: gui.Id = 0x3542;
+    const icon_brush: gui.Id = 0x3543;
     const popup_trigger: gui.Id = 0x3550;
     const popup: gui.Id = 0x3551;
     const grid: gui.Id = 0x3560;
@@ -133,6 +136,44 @@ const image_pixels = [_]u32{
     0xFF4A90E2, 0xFF20242C, 0xFFE0C050, 0xFF20242C, 0xFFE0C050, 0xFF20242C, 0xFF4A90E2, 0xFF20242C,
     0xFF20242C, 0xFFE0C050, 0xFF20242C, 0xFF4A90E2, 0xFF20242C, 0xFF4A90E2, 0xFF20242C, 0xFFE0C050,
     0xFFE0C050, 0xFF20242C, 0xFF4A90E2, 0xFF20242C, 0xFF4A90E2, 0xFF20242C, 0xFFE0C050, 0xFF20242C,
+};
+
+// app 側 16x16 1bit icon 資産（gui には置かない。bit15=左端）
+const ICON_PEN: [16]u16 = .{
+    0b0000000000000000,
+    0b0000000000011000,
+    0b0000000000111100,
+    0b0000000001111000,
+    0b0000000011110000,
+    0b0000000111100000,
+    0b0000001111000000,
+    0b0000011110000000,
+    0b0000111100000000,
+    0b0001111000000000,
+    0b0011110000000000,
+    0b0111100000000000,
+    0b1111000000000000,
+    0b1110000000000000,
+    0b1100000000000000,
+    0b0000000000000000,
+};
+const ICON_BRUSH: [16]u16 = .{
+    0b0000000110000000,
+    0b0000001111000000,
+    0b0000011111100000,
+    0b0000011111100000,
+    0b0000001111000000,
+    0b0000000110000000,
+    0b0000000110000000,
+    0b0000000110000000,
+    0b0000000110000000,
+    0b0000000110000000,
+    0b0000000110000000,
+    0b0000001111000000,
+    0b0000011111100000,
+    0b0000111111110000,
+    0b0000011111100000,
+    0b0000000000000000,
 };
 
 const popup_items = [_]gui.PopupItem{
@@ -203,6 +244,7 @@ const App = struct {
             Ids.image => "imageBox",
             Ids.splitter => "splitter",
             Ids.scroll => "scrollArea",
+            Ids.icon_pen, Ids.icon_brush => "iconButton",
             Ids.popup_trigger, Ids.popup => "popup",
             else => if (self.current() == .menus) "menuBar" else "none",
         };
@@ -356,6 +398,15 @@ fn renderColor(ctx: *gui.Context, app: *App) void {
 }
 
 fn renderLayout(ctx: *gui.Context, app: *App) void {
+    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
+    // iconButton: selected (pen) / normal (brush) — app 側 16x16 1bit 資産
+    ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
+    ctx.label("iconButton:");
+    _ = ctx.iconButtonId(Ids.icon_pen, &ICON_PEN, true);
+    _ = ctx.iconButtonId(Ids.icon_brush, &ICON_BRUSH, false);
+    ctx.labelEx("selected / normal", ctx.style.text_subtle);
+    ctx.endBox();
+
     ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
     ctx.beginBox(.{ .width = .{ .fixed = 250 }, .height = .{ .grow = 1 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
     ctx.label("left pane");
@@ -369,6 +420,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         ctx.label(std.fmt.bufPrint(&buf, "content row {d}", .{i}) catch "content row ?");
     }
     ctx.endScrollArea();
+    ctx.endBox();
     ctx.endBox();
 }
 

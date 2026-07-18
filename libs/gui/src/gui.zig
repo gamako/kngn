@@ -86,6 +86,7 @@ pub const Style = @import("style.zig").Style;
 pub const defaultStyle = @import("style.zig").defaultStyle;
 pub const ButtonOpts = @import("widgets.zig").ButtonOpts;
 pub const SwatchOpts = @import("widgets.zig").SwatchOpts;
+pub const IconBitmap = @import("widgets.zig").IconBitmap;
 pub const SliderI32Opts = @import("widgets.zig").SliderI32Opts;
 pub const SliderF32Opts = @import("widgets.zig").SliderF32Opts;
 pub const SvSquareOpts = @import("widgets.zig").SvSquareOpts;
