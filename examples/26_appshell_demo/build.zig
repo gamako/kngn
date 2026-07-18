@@ -33,6 +33,10 @@ pub fn build(b: *std.Build) void {
     paint.addImport("pixelops", pixelops);
     paint.addImport("font", font);
     paint.addImport("serde", serde);
+    // KitLibs.gfx 必須（後から追加されたフィールド。未指定だと build.zig が失敗する）
+    const gfx = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" } });
+    gfx.addImport("png", png);
+    gfx.addImport("pixelops", pixelops);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_26_appshell_demo",
@@ -50,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .dsp = dsp,
             .synth = synth,
             .gmath = gmath,
+            .gfx = gfx,
             .sound = sound,
             .serde = serde,
             .appshell = appshell,

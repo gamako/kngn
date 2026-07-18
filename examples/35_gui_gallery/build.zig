@@ -9,12 +9,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const png = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
-    });
-    const pixelops = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
-    });
+    // gui と platform/harness が command_types.zig を共有するため kit_libs 経由で
+    // 同一 module instance を渡す（二重 module 化で「file exists in modules」を防ぐ）。
     const platform_types = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
     });
@@ -23,6 +19,12 @@ pub fn build(b: *std.Build) void {
     });
     command_types.addImport("platform_types", platform_types);
 
+    const png = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
+    });
+    const pixelops = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
+    });
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
@@ -36,6 +38,28 @@ pub fn build(b: *std.Build) void {
     gui.addImport("pixelops", pixelops);
     gui.addImport("command_types", command_types);
 
+    // kit_libs 必須フィールド（main は kit を使わないが command_types 共有のため供給）
+    const dsp = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
+    });
+    const synth = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
+    });
+    synth.addImport("dsp", dsp);
+    const gmath = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
+    });
+    const sound = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" },
+    });
+    sound.addImport("dsp", dsp);
+    sound.addImport("synth", synth);
+    const gfx = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" },
+    });
+    gfx.addImport("png", png);
+    gfx.addImport("pixelops", pixelops);
+
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_35_gui_gallery",
         .main_source = b.path("main.zig"),
@@ -44,5 +68,17 @@ pub fn build(b: *std.Build) void {
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .png_module = png,
         .extra = &.{.{ .name = "gui", .module = gui }},
+        .kit_libs = .{
+            .platform_types = platform_types,
+            .command_types = command_types,
+            .gui = gui,
+            .png = png,
+            .font = font,
+            .dsp = dsp,
+            .synth = synth,
+            .gmath = gmath,
+            .gfx = gfx,
+            .sound = sound,
+        },
     });
 }
