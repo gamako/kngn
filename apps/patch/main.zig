@@ -595,10 +595,18 @@ const App = struct {
         return @max(1, self.panel_host.slotExtent(.left) - 24);
     }
 
+    /// History ScrollArea の外側高さ。
+    ///
+    /// left slot は `height=.grow` で実高を持つが、History wrap は fit のため
+    /// `panelRect` は内容高（注入した固定高）に縮む。その値を再注入すると最小高（~2 行）に
+    /// 張り付く鶏卵になる。正は前フレームの **left slotRect** 実高 − chrome。
     fn historyBodyHeight(self: *const App) i32 {
-        if (self.panel_host.panelRect(self.gui_ctx, "History")) |r| {
-            return @max(40, @as(i32, @intCast(r.h)) - 28);
+        // slot pad(4×2) + Collapsible header + gap/余白。pixie Layers chrome と同クラスの概算。
+        const chrome: i32 = 44;
+        if (self.panel_host.slotRect(self.gui_ctx, .left)) |sr| {
+            return @max(40, @as(i32, @intCast(sr.h)) - chrome);
         }
+        // 初回フレーム等: slot rect 未確定時の仮置き（次フレームで slot 実高へ収束）。
         return 200;
     }
 
