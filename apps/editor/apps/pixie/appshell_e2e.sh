@@ -29,7 +29,7 @@ make_script() {
 run_case() {
     local name=$1 app_dir=$2 script=$3
     mkdir -p "$app_dir" "$OUT/$name"
-    VP_APPSHELL_DIR="$app_dir" VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT="$script" VP_HARNESS_OUT="$OUT/$name" "$APP" >"$OUT/$name/app.log" 2>&1
+    VP_APPSHELL_DIR="$app_dir" VP_HEADLESS=1 VP_HARNESS_SCRIPT="$script" VP_HARNESS_OUT="$OUT/$name" "$APP" >"$OUT/$name/app.log" 2>&1
 }
 
 # Quit: Cancel then Discard.
@@ -86,7 +86,7 @@ recovery_app="$APPS/recovery"
 crash_script="$OUT/recovery-crash.txt"
 make_script "$crash_script" 'step 3' 'action stroke 30 30 80 80' 'digest canvas' 'step 1000000000'
 mkdir -p "$recovery_app" "$OUT/recovery-crash"
-VP_APPSHELL_DIR="$recovery_app" VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT="$crash_script" VP_HARNESS_OUT="$OUT/recovery-crash" "$APP" >"$OUT/recovery-crash/app.log" 2>&1 &
+VP_APPSHELL_DIR="$recovery_app" VP_HEADLESS=1 VP_HARNESS_SCRIPT="$crash_script" VP_HARNESS_OUT="$OUT/recovery-crash" "$APP" >"$OUT/recovery-crash/app.log" 2>&1 &
 crash_pid=$!
 autosave_file=
 for _ in $(seq 1 200); do
@@ -112,7 +112,7 @@ test -z "$(find "$recovery_app/autosave" -name '*.autosave' -print -quit 2>/dev/
 
 # Second candidate: explicit Discard recovery.
 mkdir -p "$OUT/recovery-crash-2"
-VP_APPSHELL_DIR="$recovery_app" VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT="$crash_script" VP_HARNESS_OUT="$OUT/recovery-crash-2" "$APP" >"$OUT/recovery-crash-2/app.log" 2>&1 &
+VP_APPSHELL_DIR="$recovery_app" VP_HEADLESS=1 VP_HARNESS_SCRIPT="$crash_script" VP_HARNESS_OUT="$OUT/recovery-crash-2" "$APP" >"$OUT/recovery-crash-2/app.log" 2>&1 &
 crash_pid=$!
 autosave_file=
 for _ in $(seq 1 200); do
@@ -137,20 +137,19 @@ if test "${VP_E2E_NETSYNC:-1}" = 1; then
     drive="$ROOT/zig-out/bin/drive"
     host_port="$E2E/host.port"
     client_port="$E2E/client.port"
-    VP_APPSHELL_DIR="$APPS/netsync-host" VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE="$host_port" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9130 "$APP" >"$OUT/netsync-host.log" 2>&1 &
+    VP_APPSHELL_DIR="$APPS/netsync-host" VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE="$host_port" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9130 "$APP" >"$OUT/netsync-host.log" 2>&1 &
     host_pid=$!
-    VP_APPSHELL_DIR="$APPS/netsync-client" VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE="$client_port" VP_NETSYNC_CONNECT=127.0.0.1:9130 "$APP" >"$OUT/netsync-client.log" 2>&1 &
+    VP_APPSHELL_DIR="$APPS/netsync-client" VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE="$client_port" VP_NETSYNC_CONNECT=127.0.0.1:9130 "$APP" >"$OUT/netsync-client.log" 2>&1 &
     client_pid=$!
     for _ in $(seq 1 100); do
         test -f "$host_port" && test -f "$client_port" && break
         sleep 0.05
     done
     if test -x "$drive" && test -f "$host_port" && test -f "$client_port"; then
-        # headless live の host は accept 待ちで pump が止まるため、join SYNC を進めるには
-        # host にも step を混ぜる（client 単独の until だと SYNC が永遠に届かない。2026-07-17 実測）。
-        until "$drive" --port-file "$host_port" 'step 1' >/dev/null 2>&1; "$drive" --port-file "$client_port" 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+        # free-run LISTEN: host は自走するので step 注入不要。await で一接続保持して join 完了を待つ。
+        "$drive" --port-file "$client_port" 'await netsync awaiting_sync=0 600' >/dev/null
         "$drive" --port-file "$host_port" 'action stroke 10 10 20 10' >/dev/null
-        # 仮想時間を autosave 閾値（1 秒 = 60 frame）より十分進めても session 中は autosave されないこと
+        # free-run では step は frame barrier（N present 待ち）。autosave 閾値相当の 120 frame を待つ。
         "$drive" --port-file "$host_port" 'step 120' >/dev/null
         "$drive" --port-file "$host_port" 'digest appshell' | grep -q 'autosave=0'
         "$drive" --port-file "$host_port" quit >/dev/null

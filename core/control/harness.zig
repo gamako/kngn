@@ -7,11 +7,12 @@
 //! を実現する。env 未設定なら全 API は no-op（既存挙動と完全一致）。
 //!
 //! ## トランスポート（コマンドの来る経路）
-//! - **replay（file）**: `VP_HARNESS_SCRIPT=<file>` を全部読み、step で仮想フレーム前進、EOF/quit で auto-exit。
-//! - **live（TCP loopback）**: `VP_HARNESS_LIVE=1`（ephemeral）または `VP_HARNESS_PORT=<n>`（固定）で
-//!   `127.0.0.1` に listen。driver が1接続=1リクエスト（複数コマンド可）=1レスポンスで叩く。状態はプロセスに残る。
-//! - **スクリプト形式 == ライブ protocol**: パーサ・実行モデルは共通。差分は「コマンド source（file/socket）」と
-//!   「step がコマンド到着まで block する（live は pollGate が accept/read 待機。実表示では pump 付き）」点のみ。
+//! - **replay（file）**: `VP_HARNESS_SCRIPT=<file>` を全部読み、常に manual clock。step で仮想フレーム前進、EOF/quit で auto-exit。
+//! - **listen（TCP loopback）**: `VP_HARNESS_LISTEN[=port]` で `127.0.0.1` に listen。
+//!   値なし／空／`0` は ephemeral、正の値は固定 port。既定は free-run clock（アプリ自走 + 非 blocking drain）。
+//!   `VP_HARNESS_MANUAL_CLOCK=1` を併用すると旧 step-driven（blocking accept/read）相当。
+//! - **スクリプト形式 == listen protocol**: パーサ・実行モデルは共通。差分は source（file/socket）と
+//!   clock mode（manual は gate で駆動、free-run は frame barrier / await で待つ）点のみ。
 //!
 //! ## レスポンス sink と framing
 //! digest/snapshot のコア payload は共通。framing は sink が決める:
@@ -81,7 +82,10 @@ const LUFS_FLOOR: f32 = -99.0; // 無音・窓不足時の LUFS 床値
 // module-level state（単一プロセス・単一ウィンドウ前提の debug facility）
 // ============================================================================
 const Mode = enum { disabled, replay, live };
+/// clock ownership（TASK-164）。replay は常に manual。LISTEN 既定は free_run、MANUAL_CLOCK=1 で manual。
+const ClockMode = enum { manual, free_run };
 var mode: Mode = .disabled;
+var clock_mode: ClockMode = .manual;
 var initialized = false;
 
 // コマンド source（replay=script 全体 / live=現在のリクエスト）を指す共通バッファ
@@ -153,16 +157,13 @@ var have_frame = false;
 // 直近の EventStats（present で push される）
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
 
-// headless window state（TASK-32.4 P4: VP_HARNESS_HEADLESS=1 のとき facade が backend を
-// 一切呼ばず、この module-level buffer だけを Window として扱う。既存の単一 window 前提を踏襲）。
+// null runtime query（TASK-165: platform が VP_HEADLESS を確定し、互換 query として公開）。
+// 一次 framebuffer は platform_null.Window が所有。harness は観測 hook のみ。
 var config_parsed = false;
 var pending_script_path: ?[]const u8 = null;
-var pending_live_requested = false;
-var headless_requested = false;
+var pending_listen_raw: ?[]const u8 = null; // env 値（存在時）。port 解釈は startTransport
+var pending_manual_clock = false;
 var headless_active = false;
-var headless_pixels: []u32 = &.{};
-var headless_w: u32 = 0;
-var headless_h: u32 = 0;
 
 // synthetic capture source（TASK-49.5）: harness 内蔵の偽 mic/camera。camera.zig/audio.zig への
 // facade 配線は無く、このモジュール内（`capture` コマンド + `capture` probe）で完結する。
@@ -185,8 +186,15 @@ var io_val: std.Io = undefined;
 var server: net.Server = undefined;
 var live_stream: net.Stream = undefined;
 var live_req_open = false;
+var live_stream_owned = false; // accept 済みのときだけ close する（テストの擬似 request 対策）
 var req_bytes: []u8 = &.{}; // 現在のリクエスト（finish 時に free）
 var resp_buf: std.ArrayList(u8) = .empty;
+
+// free-run: accept 後・request 完成前の非 blocking 読取（manual の blocking receiver と分離）
+var freerun_reading = false;
+var freerun_acc: std.ArrayList(u8) = .empty;
+/// test-only: free-run 空 drain が listener に対して行った poll(timeout=0) 回数。
+var test_poll_zero_count: usize = 0;
 
 // record（live コマンドログ）
 var record_path: ?[]const u8 = null;
@@ -220,6 +228,11 @@ var onset_win: [ONSET_FFT_N]f32 = undefined;
 
 pub fn isEnabled() bool {
     return mode != .disabled;
+}
+
+/// manual clock（replay / LISTEN+MANUAL_CLOCK）か。virtual getTime / frameDelay no-op / blocking gate の判定。
+pub fn isManualClock() bool {
+    return isEnabled() and clock_mode == .manual;
 }
 
 /// 外部 control-plane（copilot。TASK-62.5.2）が probe registry 登録を有効化するフラグ。
@@ -392,34 +405,84 @@ pub const registerAction = action_registry.registerAction;
 pub const findAction = action_registry.findAction;
 pub const setActionErrorDetail = action_registry.setActionErrorDetail;
 
-/// headless 判定の純粋ロジック（env I/O から分離。単体テスト用）。
-/// `VP_HARNESS_HEADLESS` 単独指定（script も live も無し）は無効（false = 通常実行）。
-fn decideHeadless(requested: bool, script_path: ?[]const u8, live_requested: bool) bool {
-    return requested and (script_path != null or live_requested);
+/// `VP_HARNESS_LISTEN` 値の純解釈（I/O 無し・単体テスト用）。
+/// - null = env 未設定（listen しない）
+/// - 空 / "0" = ephemeral（port=0, ok）
+/// - 正の整数 = 固定 port
+/// - それ以外 = invalid（transport 無効化）
+const ListenPortParse = struct {
+    requested: bool,
+    port: u16 = 0,
+    valid: bool = true,
+};
+
+fn parseListenPortValue(raw: ?[]const u8) ListenPortParse {
+    const s = raw orelse return .{ .requested = false };
+    const trimmed = std.mem.trim(u8, s, " \t");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "0")) {
+        return .{ .requested = true, .port = 0, .valid = true };
+    }
+    const port = std.fmt.parseInt(u16, trimmed, 10) catch {
+        return .{ .requested = true, .port = 0, .valid = false };
+    };
+    if (port == 0) return .{ .requested = true, .port = 0, .valid = true };
+    return .{ .requested = true, .port = port, .valid = true };
+}
+
+/// SCRIPT / LISTEN / MANUAL_CLOCK の排他・clock 既定（純関数・単体テスト用）。
+const TransportDecision = struct {
+    enable: bool,
+    clock: ClockMode,
+    listen_port: u16 = 0,
+    reason_disabled: ?[]const u8 = null,
+};
+
+fn decideTransport(script: bool, listen: ListenPortParse, manual_clock: bool) TransportDecision {
+    if (!script and !listen.requested) {
+        if (manual_clock) {
+            return .{ .enable = false, .clock = .manual, .reason_disabled = "MANUAL_CLOCK requires LISTEN" };
+        }
+        return .{ .enable = false, .clock = .manual };
+    }
+    if (script and listen.requested) {
+        return .{ .enable = false, .clock = .manual, .reason_disabled = "SCRIPT and LISTEN mutually exclusive" };
+    }
+    if (listen.requested and !listen.valid) {
+        return .{ .enable = false, .clock = .manual, .reason_disabled = "invalid LISTEN port" };
+    }
+    if (script) {
+        // MANUAL_CLOCK on SCRIPT は無視（常に manual）
+        return .{ .enable = true, .clock = .manual };
+    }
+    // listen
+    const clock: ClockMode = if (manual_clock) .manual else .free_run;
+    return .{ .enable = true, .clock = clock, .listen_port = listen.port };
 }
 
 /// platform.init() の最初に1度だけ呼ぶ。env を読むだけで I/O 副作用（script 読込・listen）は起こさない
-/// （TASK-32.4 P4: headless 判定を `backend.init()` の要否より前に確定させるため `startTransport()` と
+/// （TASK-32.4 P4: transport 判定を `backend.init()` の要否より前に確定させるため `startTransport()` と
 /// 二段階に分割した。詳細はタスク plan §3.1）。
+/// headless（`VP_HEADLESS`）は platform が確定し `setHeadlessActive` で渡す（本関数では読まない。TASK-165）。
 pub fn parseConfig() void {
     if (config_parsed) return;
     config_parsed = true;
 
     pending_script_path = getEnv("VP_HARNESS_SCRIPT");
-    pending_live_requested = getEnv("VP_HARNESS_LIVE") != null or getEnv("VP_HARNESS_PORT") != null;
+    pending_listen_raw = getEnv("VP_HARNESS_LISTEN");
+    pending_manual_clock = if (getEnv("VP_HARNESS_MANUAL_CLOCK")) |v| std.mem.eql(u8, v, "1") else false;
     if (getEnv("VP_HARNESS_OUT")) |d| out_dir = d;
-
-    headless_requested = getEnv("VP_HARNESS_HEADLESS") != null;
-    headless_active = decideHeadless(headless_requested, pending_script_path, pending_live_requested);
-    if (headless_requested and !headless_active) {
-        std.debug.print("[harness] VP_HARNESS_HEADLESS は VP_HARNESS_SCRIPT か VP_HARNESS_LIVE/PORT と併用が必要です。無視します（通常実行）。\n", .{});
-    }
 
     capture_synthetic_requested = getEnv("VP_HARNESS_CAPTURE_SYNTHETIC") != null;
 }
 
-/// headless 判定（`parseConfig()` 後に確定。env 由来で transport の成否に依存しない）。
-/// facade が `backend.init()` を呼ぶか・Window を backend 実体にするかの分岐に使う。
+/// platform が `VP_HEADLESS=1` を確定したあと呼ぶ互換 setter（TASK-165）。
+/// audio/midi/capture 等が `isHeadlessActive()` で参照する。wasm stub は no-op。
+pub fn setHeadlessActive(active: bool) void {
+    headless_active = active;
+}
+
+/// null runtime 判定（platform が `setHeadlessActive` で設定。env の SoT は `VP_HEADLESS`）。
+/// facade が Window を null backend にするかの分岐と、audio/midi の native 回避に使う。
 pub fn isHeadlessActive() bool {
     return headless_active;
 }
@@ -440,28 +503,30 @@ pub fn isHeadlessActive() bool {
 /// 有効化条件は既存 audio 出力と同じ規約を踏襲する: harness の env 読み（`parseConfig()`）は
 /// `platform.init()` 経由でのみ走るため、`platform.init()` を呼ばない capture-only アプリでは
 /// 本関数は常に `false` を返す（`examples/15_audio_tone` 等の audio-only アプリが
-/// `VP_HARNESS_HEADLESS` を解釈できないのと同じ既知の制約）。
+/// `VP_HEADLESS` を解釈できないのと同じ既知の制約）。
 pub fn isCaptureSyntheticActive() bool {
     return capture_synthetic_requested and isEnabled();
 }
 
-/// platform.init() が（非 headless 時は `backend.init()` の後に）1度だけ呼ぶ。
+/// platform.init() が（非 null runtime 時は `native_backend.init()` の後に）1度だけ呼ぶ。
 /// script 読込 / live listen の実 I/O はここに閉じる（`parseConfig()` との分割は plan §3.1 参照）。
 pub fn startTransport() void {
     if (initialized) return;
     initialized = true;
 
     const script_path = pending_script_path;
-    const live_requested = pending_live_requested;
-    if (script_path == null and !live_requested) return; // env 未設定 → 完全パススルー
-
-    if (script_path != null and live_requested) {
-        std.debug.print("[harness] VP_HARNESS_SCRIPT と live(VP_HARNESS_LIVE/PORT) は同時指定不可。harness を無効化します。\n", .{});
+    const listen = parseListenPortValue(pending_listen_raw);
+    const decision = decideTransport(script_path != null, listen, pending_manual_clock);
+    if (!decision.enable) {
+        if (decision.reason_disabled) |why| {
+            std.debug.print("[harness] {s}。harness を無効化します。\n", .{why});
+        }
         return;
     }
 
     threaded = std.Io.Threaded.init(gpa, .{});
     io_val = threaded.io();
+    clock_mode = decision.clock;
 
     if (script_path) |path| {
         script_bytes = std.Io.Dir.cwd().readFileAlloc(io_val, path, gpa, .unlimited) catch |err| {
@@ -470,31 +535,57 @@ pub fn startTransport() void {
         };
         cmd_buf = script_bytes;
         mode = .replay;
+        clock_mode = .manual;
         action_registry.setEnabled(true);
         std.debug.print("[harness] replay 有効: script={s} out={s}\n", .{ path, out_dir });
         return;
     }
 
-    // live
-    const req_port: u16 = if (getEnv("VP_HARNESS_PORT")) |pe| (std.fmt.parseInt(u16, pe, 10) catch 0) else 0;
-    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(req_port) };
+    // listen（TCP）
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(decision.listen_port) };
     server = addr.listen(io_val, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[harness] live listen 失敗: {s}\n", .{@errorName(err)});
+        std.debug.print("[harness] listen 失敗: {s}\n", .{@errorName(err)});
         return; // disabled のまま
     };
     record_path = getEnv("VP_HARNESS_RECORD");
     mode = .live;
     action_registry.setEnabled(true);
     const chosen = server.socket.address.getPort();
-    std.debug.print("[harness] live 有効: 127.0.0.1:{d} out={s}\n", .{ chosen, out_dir });
+    const clock_label: []const u8 = if (clock_mode == .manual) "manual" else "free-run";
+    std.debug.print("[harness] listen 有効 ({s}): 127.0.0.1:{d} out={s}\n", .{ clock_label, chosen, out_dir });
     writePortFile(chosen);
 }
 
+const CmpOp = enum { eq, ne, gt, lt };
+const Cmp = struct { op: CmpOp, key: []const u8, value: []const u8 };
+const ExpectExpr = struct {
+    probe: []const u8,
+    form: union(enum) {
+        cmp: Cmp,
+        contains: []const u8,
+    },
+};
+
+/// free-run / await の継続待機（1 接続を保持したまま frame boundary で再開）。
+const PendingWait = union(enum) {
+    none,
+    frame_barrier: struct { target_frame: u64 },
+    predicate: struct {
+        expr: ExpectExpr,
+        expr_text: []const u8,
+        start_frame: u64,
+        timeout_frames: usize,
+    },
+};
+var pending_wait: PendingWait = .none;
+
 /// フレーム進行の同期点。1 フレーム分の進行を許可するとき true。
-/// quit / EOF(replay) / window closed(native_continue=false) / accept 失敗(live) で false。
-/// live ではコマンド到着まで accept/read 待機する（= step 待ちで block）。`pump != null` のとき
-/// 待機中も native compositor event pump を短周期で回す（Wayland ANR 回避。TASK-32.6）。
+/// quit / EOF(replay) / window closed(native_continue=false) / accept 失敗(live manual) で false。
+/// free-run では常に true（アプリ自走。agent 不在でも止まらない）— quit/native close のみ false。
 pub fn pollGate(native_continue: bool) bool {
+    if (mode == .live and clock_mode == .free_run) {
+        return pollGateFreeRun(native_continue);
+    }
     return pollGateWithPump(native_continue, null);
 }
 
@@ -505,6 +596,9 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
         replayExitIfFailed();
         return false;
     }
+    // await predicate: 不成立なら 1 フレーム駆動して再評価（manual/replay）
+    if (resolvePendingWaitManual()) |gate| return gate;
+
     if (steps_remaining > 0) {
         steps_remaining -= 1;
         return true;
@@ -556,10 +650,295 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
             handleExpect(&it, false);
         } else if (std.mem.eql(u8, cmd, "assert")) {
             handleExpect(&it, true);
+        } else if (std.mem.eql(u8, cmd, "await")) {
+            if (handleAwait(&it)) return true; // predicate pending → 1 フレーム駆動
         } else {
             warnLine("不明なコマンド");
         }
     }
+}
+
+/// free-run gate: 非 blocking drain。空時は listener poll(0) 1 回のみ。NativePump は呼ばない。
+pub fn pollGateFreeRun(native_continue: bool) bool {
+    if (quit_requested or !native_continue) {
+        if (live_req_open) finishLiveRequest();
+        if (freerun_reading) abortFreeRunRead();
+        return false;
+    }
+
+    // pending wait の解決（frame barrier / await）
+    switch (pending_wait) {
+        .none => {},
+        .frame_barrier => |b| {
+            if (frame_index >= b.target_frame) {
+                pending_wait = .none;
+                // 続きのコマンドへ
+            } else {
+                return true; // アプリ自走を待つ
+            }
+        },
+        .predicate => {
+            switch (evalPendingPredicate()) {
+                .pass => {
+                    reportAwait(true, pendingPredicateExprText(), null);
+                    pending_wait = .none;
+                },
+                .fail => {
+                    reportAwait(false, pendingPredicateExprText(), pendingPredicateActual());
+                    pending_wait = .none;
+                },
+                .pending => return true,
+            }
+        },
+    }
+
+    // アクティブ request のコマンドを進める（step/await で pending になったら戻る）
+    if (live_req_open) {
+        if (!runFreeRunCommands()) return false; // quit
+        if (pending_wait != .none) return true;
+        if (cursor >= cmd_buf.len) {
+            finishLiveRequest();
+        } else {
+            return true; // 通常ここには来ない（runFreeRunCommands が尽くすか pending）
+        }
+    }
+
+    drainFreeRunTransport();
+    // drain で request が完成していれば同フレームで処理
+    if (live_req_open) {
+        if (!runFreeRunCommands()) return false;
+        if (pending_wait != .none) return true;
+        if (cursor >= cmd_buf.len) finishLiveRequest();
+    }
+    return true;
+}
+
+/// free-run のコマンド実行。false = quit。pending_wait 設定時は true で戻る（呼び出し側が frame 継続）。
+fn runFreeRunCommands() bool {
+    while (cursor < cmd_buf.len) {
+        const raw = nextLine() orelse continue;
+        var line = std.mem.trimStart(u8, raw, " \t");
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0 or line[0] == '#') continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        const cmd = it.next() orelse continue;
+        if (std.mem.eql(u8, cmd, "step")) {
+            const n = parseUsize(it.next()) orelse 1;
+            if (n == 0) continue;
+            pending_wait = .{ .frame_barrier = .{ .target_frame = frame_index + n } };
+            return true;
+        } else if (std.mem.eql(u8, cmd, "quit")) {
+            quit_requested = true;
+            finishLiveRequest();
+            return false;
+        } else if (std.mem.eql(u8, cmd, "inject")) {
+            handleInject(&it);
+        } else if (std.mem.eql(u8, cmd, "snapshot")) {
+            handleSnapshot(&it);
+        } else if (std.mem.eql(u8, cmd, "digest")) {
+            handleDigest(&it);
+        } else if (std.mem.eql(u8, cmd, "action")) {
+            handleAction(&it);
+        } else if (std.mem.eql(u8, cmd, "capture")) {
+            handleCapture(&it);
+        } else if (std.mem.eql(u8, cmd, "expect")) {
+            handleExpect(&it, false);
+        } else if (std.mem.eql(u8, cmd, "assert")) {
+            handleExpect(&it, true);
+        } else if (std.mem.eql(u8, cmd, "await")) {
+            if (handleAwait(&it)) return true;
+        } else {
+            warnLine("不明なコマンド");
+        }
+    }
+    return true;
+}
+
+/// free-run 非 blocking drain。空なら listener へ poll(0) をちょうど 1 回。
+fn drainFreeRunTransport() void {
+    if (freerun_reading) {
+        tryReadFreeRunRequest();
+        return;
+    }
+    if (live_req_open) return;
+
+    switch (pollFdReady(server.socket.handle)) {
+        .ready => {
+            const stream = server.accept(io_val) catch |err| {
+                std.debug.print("[harness] accept 失敗: {s}\n", .{@errorName(err)});
+                return;
+            };
+            live_stream = stream;
+            freerun_reading = true;
+            freerun_acc.clearRetainingCapacity();
+            resp_buf.clearRetainingCapacity();
+            tryReadFreeRunRequest();
+        },
+        .not_ready, .err => {},
+    }
+}
+
+const PollReady = enum { ready, not_ready, err };
+
+fn pollFdReady(fd: net.Socket.Handle) PollReady {
+    switch (comptime builtin.os.tag) {
+        .windows => {
+            // Windows: 非 blocking 契約は別 API。free-run unit test は POSIX 前提で Skip。
+            // accept を試行すると block し得るため、空 drain では not_ready 扱い。
+            test_poll_zero_count += 1;
+            return .not_ready;
+        },
+        else => {
+            test_poll_zero_count += 1;
+            var pfds = [_]posix.pollfd{.{
+                .fd = fd,
+                .events = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP,
+                .revents = 0,
+            }};
+            const n = posix.poll(&pfds, 0) catch return .err;
+            if (n == 0) return .not_ready;
+            const revents = pfds[0].revents;
+            if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return .err;
+            if (revents & (posix.POLL.IN | posix.POLL.HUP) != 0) return .ready;
+            return .not_ready;
+        },
+    }
+}
+
+fn tryReadFreeRunRequest() void {
+    const fd = live_stream.socket.handle;
+    switch (pollFdReady(fd)) {
+        .not_ready => return,
+        .err => {
+            abortFreeRunRead();
+            return;
+        },
+        .ready => {},
+    }
+    var rbuf: [4096]u8 = undefined;
+    var bufs = [_][]u8{rbuf[0..]};
+    const n = io_val.vtable.netRead(io_val.userdata, fd, bufs[0..]) catch {
+        abortFreeRunRead();
+        return;
+    };
+    if (n == 0) {
+        // peer half-close → request 完成
+        const bytes = freerun_acc.toOwnedSlice(gpa) catch {
+            abortFreeRunRead();
+            return;
+        };
+        freerun_reading = false;
+        req_bytes = bytes;
+        cmd_buf = bytes;
+        cursor = 0;
+        line_no = 0;
+        live_req_open = true;
+        live_stream_owned = true;
+        recordRequest(bytes);
+        return;
+    }
+    const limit: usize = 1 << 20;
+    if (freerun_acc.items.len + n > limit) {
+        appendResp("error: request too large\n");
+        // レスポンスを返して閉じる
+        freerun_reading = false;
+        live_req_open = true;
+        live_stream_owned = true;
+        req_bytes = &.{};
+        cmd_buf = "";
+        cursor = 0;
+        finishLiveRequest();
+        return;
+    }
+    freerun_acc.appendSlice(gpa, rbuf[0..n]) catch {
+        abortFreeRunRead();
+        return;
+    };
+}
+
+fn abortFreeRunRead() void {
+    if (freerun_reading) {
+        live_stream.close(io_val);
+        freerun_reading = false;
+    }
+    freerun_acc.clearRetainingCapacity();
+}
+
+/// manual 経路の pending await 解決。`null` = 続行、`Some(bool)` = 即 return。
+fn resolvePendingWaitManual() ?bool {
+    switch (pending_wait) {
+        .none => return null,
+        .frame_barrier => {
+            // manual では frame_barrier を使わない（steps_remaining）
+            pending_wait = .none;
+            return null;
+        },
+        .predicate => {
+            switch (evalPendingPredicate()) {
+                .pass => {
+                    reportAwait(true, pendingPredicateExprText(), null);
+                    pending_wait = .none;
+                    return null; // コマンドループへ
+                },
+                .fail => {
+                    reportAwait(false, pendingPredicateExprText(), pendingPredicateActual());
+                    pending_wait = .none;
+                    return null;
+                },
+                .pending => return true, // 1 フレーム駆動
+            }
+        },
+    }
+}
+
+const PredicateEval = enum { pass, fail, pending };
+
+fn evalPendingPredicate() PredicateEval {
+    const p = switch (pending_wait) {
+        .predicate => |x| x,
+        else => return .fail,
+    };
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    switch (digestPayload(p.expr.probe, &buf)) {
+        .unavailable => {
+            // unavailable は成立扱いにしない
+            if (p.timeout_frames == 0 or frame_index >= p.start_frame + p.timeout_frames) {
+                pending_pred_actual_buf_set("unavailable");
+                return .fail;
+            }
+            return .pending;
+        },
+        .ok => |payload| {
+            if (evalExpect(payload, p.expr)) return .pass;
+            if (p.timeout_frames == 0 or frame_index >= p.start_frame + p.timeout_frames) {
+                pending_pred_actual_buf_set(payload);
+                return .fail;
+            }
+            return .pending;
+        },
+    }
+}
+
+// predicate fail 時の actual 表示用（digest payload は stack。短い理由を保持）
+var pending_pred_actual_storage: [DIGEST_BUF_LEN]u8 = undefined;
+var pending_pred_actual_len: usize = 0;
+
+fn pending_pred_actual_buf_set(s: []const u8) void {
+    const n = @min(s.len, pending_pred_actual_storage.len);
+    @memcpy(pending_pred_actual_storage[0..n], s[0..n]);
+    pending_pred_actual_len = n;
+}
+
+fn pendingPredicateExprText() []const u8 {
+    return switch (pending_wait) {
+        .predicate => |p| p.expr_text,
+        else => "",
+    };
+}
+
+fn pendingPredicateActual() ?[]const u8 {
+    if (pending_pred_actual_len == 0) return null;
+    return pending_pred_actual_storage[0..pending_pred_actual_len];
 }
 
 /// 当該フレームの注入イベントを1つ返す。尽きたら（次フレーム用に reset して）null。
@@ -676,46 +1055,6 @@ pub fn onAudioSamples(samples: []const f32, frames: u32, channels: u32, sample_r
 }
 
 // ============================================================================
-// headless window（TASK-32.4 P4: display 無しの facade window。backend を一切呼ばない）
-//
-/// ホットパス宣言: `createHeadlessWindow` は Window.create 時（初期化時のみ）に w*h の
-/// framebuffer を確保する。フレーム毎に走るのは呼び出し元（facade lockFramebuffer/present）の
-/// 既存 onLock/onPresent（@memcpy のみ・per-pixel 演算の新設なし）。
-// ============================================================================
-
-/// headless framebuffer の view（facade の Framebuffer が公開 pixels/width/height に詰め替える）。
-pub const HeadlessFramebufferView = struct { pixels: []u32, width: u32, height: u32 };
-
-/// facade の `Window.create` が headless 時に呼ぶ。単一 window 前提（既存の module-level 設計を踏襲）。
-/// w*h の CPU framebuffer を確保する（初回は alloc、以降はサイズ一致なら再利用・不一致なら再確保）。
-/// alloc 失敗時は `error.OutOfMemory`（native 経路の `Window.create` が `Error!Window` を返すのと
-/// 対称に、facade 側で `error.WindowCreationFailed` へ畳めるよう panic ではなく伝播する）。
-pub fn createHeadlessWindow(width: u32, height: u32) std.mem.Allocator.Error!void {
-    const n = @as(usize, width) * @as(usize, height);
-    if (headless_pixels.len != n) {
-        if (headless_pixels.len > 0) gpa.free(headless_pixels);
-        headless_pixels = &.{};
-        headless_pixels = try gpa.alloc(u32, n);
-    }
-    @memset(headless_pixels, 0);
-    headless_w = width;
-    headless_h = height;
-}
-
-/// headless framebuffer を lock する（native と異なり retry-able な null は無く常に成功）。
-pub fn headlessLock() HeadlessFramebufferView {
-    return .{ .pixels = headless_pixels, .width = headless_w, .height = headless_h };
-}
-
-/// facade の `Window.destroy()` が headless 時に呼ぶ（buffer 解放。テストの独立性にも使う）。
-pub fn destroyHeadlessWindow() void {
-    if (headless_pixels.len > 0) gpa.free(headless_pixels);
-    headless_pixels = &.{};
-    headless_w = 0;
-    headless_h = 0;
-}
-
-// ============================================================================
 // live transport
 // ============================================================================
 
@@ -803,6 +1142,7 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
         };
         live_stream = stream;
         live_req_open = true;
+        live_stream_owned = true;
         resp_buf.clearRetainingCapacity();
 
         const bytes = if (use_poll) blk: {
@@ -837,11 +1177,15 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
 /// 現在のリクエストを終了する: response を flush し stream を閉じ、バッファを片付ける。
 fn finishLiveRequest() void {
     if (!live_req_open) return;
-    var wbuf: [4096]u8 = undefined;
-    var writer = live_stream.writer(io_val, &wbuf);
-    writer.interface.writeAll(resp_buf.items) catch {};
-    writer.interface.flush() catch {};
-    live_stream.close(io_val);
+    pending_wait = .none;
+    if (live_stream_owned) {
+        var wbuf: [4096]u8 = undefined;
+        var writer = live_stream.writer(io_val, &wbuf);
+        writer.interface.writeAll(resp_buf.items) catch {};
+        writer.interface.flush() catch {};
+        live_stream.close(io_val);
+        live_stream_owned = false;
+    }
     live_req_open = false;
     if (req_bytes.len > 0) {
         gpa.free(req_bytes);
@@ -1861,16 +2205,6 @@ fn formatMidiPayload(buf: []u8) []u8 {
 // JSON（stats）は 1 トークンに glue され漏れないので `contains` を使う。中身非解釈の不変条件は維持。
 // ============================================================================
 
-const CmpOp = enum { eq, ne, gt, lt };
-const Cmp = struct { op: CmpOp, key: []const u8, value: []const u8 };
-const ExpectExpr = struct {
-    probe: []const u8,
-    form: union(enum) {
-        cmp: Cmp,
-        contains: []const u8,
-    },
-};
-
 /// `expect`/`assert` の引数トークン列を式へ parse する純関数（module-level 状態に触らない=単体テスト可能）。
 /// 余剰トークン・op 欠落・key/value 空・contains の substr 欠落・substr 余剰は null（= fail-fast, AC#3）。
 fn parseExpectExpr(it: *Tok) ?ExpectExpr {
@@ -1977,6 +2311,91 @@ fn handleExpect(it: *Tok, is_assert: bool) void {
             const pass = evalExpect(payload, expr);
             reportExpect(kind, pass, expr_text, if (pass) null else payload, is_assert);
         },
+    }
+}
+
+/// `await <probe> <key><op><value> [timeout]`。expect と同じ predicate。timeout は frame budget（0=1回）。
+/// 戻り true = predicate 未成立で待機開始（呼び出し側が frame を進める / 接続を保持）。
+fn handleAwait(it: *Tok) bool {
+    const expr_text = std.mem.trim(u8, it.rest(), " \t");
+    const parsed = parseAwaitExpr(it) orelse {
+        reportAwait(false, expr_text, "invalid syntax");
+        return false;
+    };
+    // 即時 1 回評価
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const pass = switch (digestPayload(parsed.expr.probe, &buf)) {
+        .unavailable => false,
+        .ok => |payload| evalExpect(payload, parsed.expr),
+    };
+    if (pass) {
+        reportAwait(true, expr_text, null);
+        return false;
+    }
+    if (parsed.timeout_frames == 0) {
+        const actual: ?[]const u8 = switch (digestPayload(parsed.expr.probe, &buf)) {
+            .unavailable => |r| r,
+            .ok => |payload| payload,
+        };
+        reportAwait(false, expr_text, actual);
+        return false;
+    }
+    pending_wait = .{ .predicate = .{
+        .expr = parsed.expr,
+        .expr_text = expr_text,
+        .start_frame = frame_index,
+        .timeout_frames = parsed.timeout_frames,
+    } };
+    pending_pred_actual_len = 0;
+    return true;
+}
+
+const AwaitParsed = struct {
+    expr: ExpectExpr,
+    timeout_frames: usize,
+};
+
+/// await 引数の純 parse。optional trailing timeout（usize）。余剰・不正は null。
+fn parseAwaitExpr(it: *Tok) ?AwaitParsed {
+    var probe = it.next() orelse return null;
+    if (std.mem.eql(u8, probe, "digest")) {
+        probe = it.next() orelse return null;
+    }
+    const t2 = it.next() orelse return null;
+    const expr: ExpectExpr = if (std.mem.eql(u8, t2, "contains")) blk: {
+        const sub = it.next() orelse return null;
+        break :blk .{ .probe = probe, .form = .{ .contains = sub } };
+    } else blk: {
+        const cmp = parseCmpToken(t2) orelse return null;
+        break :blk .{ .probe = probe, .form = .{ .cmp = cmp } };
+    };
+    var timeout_frames: usize = 0;
+    if (it.next()) |tok| {
+        timeout_frames = parseUsize(tok) orelse return null;
+        if (it.next() != null) return null;
+    }
+    return .{ .expr = expr, .timeout_frames = timeout_frames };
+}
+
+fn reportAwait(pass: bool, expr_text: []const u8, actual: ?[]const u8) void {
+    if (mode == .live) {
+        appendResp(if (pass) "ok " else "fail ");
+        appendResp(expr_text);
+        if (!pass) {
+            if (actual) |a| {
+                appendResp(" actual=");
+                appendResp(a);
+            }
+        }
+        appendResp("\n");
+    } else if (pass) {
+        std.debug.print("[harness] await ok line {d}: {s}\n", .{ line_no, expr_text });
+    } else if (actual) |a| {
+        std.debug.print("[harness] await FAILED line {d}: {s} actual={s}\n", .{ line_no, expr_text, a });
+        expect_failures += 1;
+    } else {
+        std.debug.print("[harness] await FAILED line {d}: {s}\n", .{ line_no, expr_text });
+        expect_failures += 1;
     }
 }
 
@@ -2597,11 +3016,13 @@ const testing = std.testing;
 
 fn resetForTest() void {
     mode = .replay; // EOF 時の挙動を replay として確定（テストは file source 相当）
+    clock_mode = .manual;
     cmd_buf = "";
     cursor = 0;
     line_no = 0;
     steps_remaining = 0;
     quit_requested = false;
+    pending_wait = .none;
     expect_failures = 0;
     frame_index = 0;
     inject_count = 0;
@@ -2643,6 +3064,12 @@ fn resetForTest() void {
     if (synth_audio) |dev| dev.close();
     synth_audio = null;
     capture_synthetic_requested = false;
+    headless_active = false;
+    freerun_reading = false;
+    freerun_acc.clearRetainingCapacity();
+    test_poll_zero_count = 0;
+    pending_pred_actual_len = 0;
+    live_stream_owned = false;
 }
 
 test "parseKey: 名前→KeyCode（大小無視・数字）" {
@@ -3990,16 +4417,17 @@ test "capabilities: pollGate 経由（digest capabilities コマンド）でも�
 }
 
 // ============================================================================
-// headless（TASK-32.4 P4）tests
+// null runtime query（TASK-165）— 一次 buffer は platform_null。ここは互換 setter/query のみ。
 // ============================================================================
 
-test "decideHeadless: SCRIPT/LIVE 併用時のみ true、単独指定・未要求は false" {
-    try testing.expect(!decideHeadless(false, null, false)); // 何も無し
-    try testing.expect(!decideHeadless(true, null, false)); // HEADLESS 単独 → 無視
-    try testing.expect(decideHeadless(true, "script.txt", false)); // HEADLESS + SCRIPT
-    try testing.expect(decideHeadless(true, null, true)); // HEADLESS + LIVE
-    try testing.expect(decideHeadless(true, "script.txt", true)); // 両方（後段の矛盾判定は別）
-    try testing.expect(!decideHeadless(false, "script.txt", true)); // HEADLESS 未要求なら無関係
+test "setHeadlessActive / isHeadlessActive: platform 互換 query" {
+    resetForTest();
+    defer resetForTest();
+    try testing.expect(!isHeadlessActive());
+    setHeadlessActive(true);
+    try testing.expect(isHeadlessActive());
+    setHeadlessActive(false);
+    try testing.expect(!isHeadlessActive());
 }
 
 // ============================================================================
@@ -4754,29 +5182,18 @@ test "gamepad probe: digest コマンド経由（headless replay の self-check 
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "gamepad connected=1 "));
 }
 
-test "headless window: create→lock→onLock/onPresent で fb 捕捉、サイズ変更で再確保" {
+test "harness onLock/onPresent: 観測 copy は platform buffer 借用から frame_pixels へ" {
     resetForTest();
-    defer destroyHeadlessWindow();
+    defer resetForTest();
 
-    try createHeadlessWindow(2, 2);
-    var view = headlessLock();
-    try testing.expectEqual(@as(u32, 2), view.width);
-    try testing.expectEqual(@as(u32, 2), view.height);
-    try testing.expectEqual(@as(usize, 4), view.pixels.len);
-
-    for (view.pixels) |*p| p.* = 0xFF112233;
-    onLock(view.pixels, view.width, view.height);
+    var pixels = [_]u32{ 0xFF112233, 0xFF112233, 0xFF112233, 0xFF112233 };
+    onLock(&pixels, 2, 2);
     onPresent();
     try testing.expect(have_frame);
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[0]);
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[3]);
-
-    // サイズ変更で再確保される（前回の内容を引きずらない: create 直後は 0 クリア）
-    try createHeadlessWindow(3, 1);
-    view = headlessLock();
-    try testing.expectEqual(@as(usize, 3), view.pixels.len);
-    try testing.expectEqual(@as(u32, 0), view.pixels[0]);
 }
+
 
 fn testSleepMs(ms: u64) void {
     const sec: i64 = @intCast(ms / 1000);
@@ -4791,12 +5208,15 @@ fn initLiveServerForTest() !u16 {
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
     server = try addr.listen(io_val, .{ .reuse_address = true });
     mode = .live;
+    clock_mode = .manual; // 既存 live pump テストは blocking 契約
     cmd_buf = "";
     cursor = 0;
     line_no = 0;
     steps_remaining = 0;
     quit_requested = false;
+    pending_wait = .none;
     live_req_open = false;
+    freerun_reading = false;
     req_bytes = &.{};
     resp_buf.clearRetainingCapacity();
     return server.socket.address.getPort();
@@ -5046,6 +5466,215 @@ test "netsync probe: 無効時は未登録 / host 有効時 expect role=host" {
     expect_failures = 0;
     try testing.expect(pollGate(true));
     try testing.expectEqual(@as(usize, 0), expect_failures);
+}
+
+// ============================================================================
+// TASK-164: free-run clock / LISTEN / await
+// ============================================================================
+
+test "parseListenPortValue: absent/empty/0/fixed/invalid" {
+    try testing.expect(!parseListenPortValue(null).requested);
+    {
+        const p = parseListenPortValue("");
+        try testing.expect(p.requested);
+        try testing.expect(p.valid);
+        try testing.expectEqual(@as(u16, 0), p.port);
+    }
+    {
+        const p = parseListenPortValue("0");
+        try testing.expect(p.requested and p.valid);
+        try testing.expectEqual(@as(u16, 0), p.port);
+    }
+    {
+        const p = parseListenPortValue("9110");
+        try testing.expect(p.requested and p.valid);
+        try testing.expectEqual(@as(u16, 9110), p.port);
+    }
+    {
+        const p = parseListenPortValue("abc");
+        try testing.expect(p.requested);
+        try testing.expect(!p.valid);
+    }
+}
+
+test "decideTransport: SCRIPT/LISTEN/MANUAL_CLOCK exclusivity and clock defaults" {
+    const ephemeral = ListenPortParse{ .requested = true, .port = 0, .valid = true };
+    const none = ListenPortParse{ .requested = false };
+    const bad = ListenPortParse{ .requested = true, .port = 0, .valid = false };
+
+    {
+        const d = decideTransport(false, none, false);
+        try testing.expect(!d.enable);
+    }
+    {
+        const d = decideTransport(false, none, true);
+        try testing.expect(!d.enable);
+        try testing.expect(d.reason_disabled != null);
+    }
+    {
+        const d = decideTransport(true, ephemeral, false);
+        try testing.expect(!d.enable);
+    }
+    {
+        const d = decideTransport(false, bad, false);
+        try testing.expect(!d.enable);
+    }
+    {
+        const d = decideTransport(true, none, false);
+        try testing.expect(d.enable);
+        try testing.expect(d.clock == .manual);
+    }
+    {
+        const d = decideTransport(true, none, true); // MANUAL_CLOCK on SCRIPT ignored
+        try testing.expect(d.enable);
+        try testing.expect(d.clock == .manual);
+    }
+    {
+        const d = decideTransport(false, ephemeral, false);
+        try testing.expect(d.enable);
+        try testing.expect(d.clock == .free_run);
+    }
+    {
+        const d = decideTransport(false, ephemeral, true);
+        try testing.expect(d.enable);
+        try testing.expect(d.clock == .manual);
+    }
+}
+
+test "free-run: empty drain does poll(0) exactly once and returns true" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    resetForTest();
+    _ = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+    clock_mode = .free_run;
+    test_poll_zero_count = 0;
+
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expectEqual(@as(usize, 1), test_poll_zero_count);
+    try testing.expect(!live_req_open);
+    try testing.expect(!freerun_reading);
+}
+
+test "step dual: manual uses steps_remaining, free-run uses frame barrier" {
+    // manual
+    resetForTest();
+    cmd_buf = "step 3\nquit";
+    clock_mode = .manual;
+    try testing.expect(pollGate(true)); // frame 1, steps_remaining=2
+    try testing.expectEqual(@as(usize, 2), steps_remaining);
+    try testing.expect(pending_wait == .none);
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(usize, 1), steps_remaining);
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(usize, 0), steps_remaining);
+    try testing.expect(!pollGate(true)); // quit
+
+    // free-run barrier（live server + in-memory request）
+    if (builtin.os.tag == .windows) return;
+
+    resetForTest();
+    _ = initLiveServerForTest() catch return;
+    defer deinitLiveServerForTest();
+    clock_mode = .free_run;
+    // 直接 request を載せる（socket 経由せず barrier だけ検証）
+    req_bytes = try gpa.dupe(u8, "step 2\n");
+    cmd_buf = req_bytes;
+    cursor = 0;
+    live_req_open = true;
+    frame_index = 10;
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expect(pending_wait == .frame_barrier);
+    try testing.expectEqual(@as(u64, 12), pending_wait.frame_barrier.target_frame);
+    // 未到達
+    frame_index = 11;
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expect(pending_wait == .frame_barrier);
+    // 到達 → コマンド尽きて finish（req_bytes は finishLiveRequest が free）
+    frame_index = 12;
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expect(pending_wait == .none);
+    try testing.expect(!live_req_open);
+}
+
+test "await: timeout 0 checks once; positive waits across frames (manual)" {
+    resetForTest();
+    // present 前: fb unavailable → timeout 0 は即 fail（quit しない＝replayExitIfFailed 回避）
+    cmd_buf = "await fb crc=DEADBEEF 0\nstep 1\n";
+    expect_failures = 0;
+    try testing.expect(pollGate(true)); // await fail + step
+    try testing.expectEqual(@as(usize, 1), expect_failures);
+    try testing.expect(pending_wait == .none);
+
+    resetForTest();
+    var pixels = [_]u32{0xFF0000FF} ** 4;
+    onLock(&pixels, 2, 2);
+    onPresent(); // frame_index=1, have_frame
+    // 不一致 + timeout 1: 即 fail せず pending → 1 frame 後に fail
+    cmd_buf = "await fb crc=00000000 1\nstep 1\n";
+    try testing.expect(pollGate(true)); // start await → pending → return true
+    try testing.expect(pending_wait == .predicate);
+    // frame を進めて deadline 到達
+    onPresent(); // frame_index=2; start was 1; timeout 1 → deadline=2
+    try testing.expect(pollGate(true)); // fail await + step
+    try testing.expect(pending_wait == .none);
+    try testing.expect(expect_failures >= 1);
+}
+
+test "await: timeout 0 pass when predicate already true" {
+    resetForTest();
+    var pixels = [_]u32{0xFF112233} ** 4;
+    onLock(&pixels, 2, 2);
+    onPresent();
+    var digbuf: [DIGEST_BUF_LEN]u8 = undefined;
+    const payload = formatFbPayload(&digbuf);
+    // crc= を payload から抜く
+    const crc_tok = blk: {
+        var it = std.mem.tokenizeAny(u8, payload, " \t");
+        while (it.next()) |t| {
+            if (std.mem.startsWith(u8, t, "crc=")) break :blk t;
+        }
+        return error.SkipZigTest;
+    };
+    var script_buf: [128]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "await fb {s} 0\nstep 1\n", .{crc_tok});
+    const owned = try gpa.dupe(u8, script);
+    defer gpa.free(owned);
+    cmd_buf = owned;
+    expect_failures = 0;
+    try testing.expect(pollGate(true)); // await ok → step
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+}
+
+test "parseAwaitExpr: optional timeout and surplus reject" {
+    {
+        var it = std.mem.tokenizeAny(u8, "fb crc=ABC", " \t");
+        const a = parseAwaitExpr(&it).?;
+        try testing.expectEqual(@as(usize, 0), a.timeout_frames);
+        try testing.expectEqualStrings("fb", a.expr.probe);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "audio silent=0 5", " \t");
+        const a = parseAwaitExpr(&it).?;
+        try testing.expectEqual(@as(usize, 5), a.timeout_frames);
+    }
+    {
+        var it = std.mem.tokenizeAny(u8, "fb crc=ABC 1 extra", " \t");
+        try testing.expect(parseAwaitExpr(&it) == null);
+    }
+}
+
+test "free-run execution model: agent 不在でも毎フレーム true" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    resetForTest();
+    _ = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+    clock_mode = .free_run;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try testing.expect(pollGateFreeRun(true));
+    }
+    try testing.expect(!quit_requested);
 }
 
 // ============================================================================

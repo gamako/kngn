@@ -435,7 +435,7 @@ pub fn build(b: *std.Build) void {
                 addRunStep(
                     b,
                     "run-example_20",
-                    "Run 20_capture_demo example (uses -Dplatform option; set VP_HARNESS_CAPTURE_SYNTHETIC=1 + VP_HARNESS_HEADLESS=1 for headless synthetic mic/camera verification)",
+                    "Run 20_capture_demo example (uses -Dplatform option; set VP_HARNESS_CAPTURE_SYNTHETIC=1 + VP_HEADLESS=1 for headless synthetic mic/camera verification)",
                     capture_demo_exe,
                     b.args,
                 );
@@ -693,6 +693,20 @@ pub fn build(b: *std.Build) void {
     const run_platform_menu_test = b.addRunArtifact(platform_menu_test);
     const test_platform_menu_step = b.step("test-platform-menu", "Run display-less platform menu facade tests");
     test_platform_menu_step.dependOn(&run_platform_menu_test.step);
+
+    // null backend 単体（TASK-165）。display / native .o 不要。platform_types + command_types のみ。
+    const platform_null_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/platform_null.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    platform_null_test_mod.addImport("platform_types", shared_modules.types.mod);
+    platform_null_test_mod.addImport("command_types", shared_modules.command_types.mod);
+    const platform_null_test = b.addTest(.{ .root_module = platform_null_test_mod });
+    const run_platform_null_test = b.addRunArtifact(platform_null_test);
+    const test_platform_null_step = b.step("test-platform-null", "Run platform_null (VP_HEADLESS) unit tests (TASK-165)");
+    test_platform_null_step.dependOn(&run_platform_null_test.step);
 
     const platform_clipboard_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_clipboard_test.zig"),
@@ -1960,6 +1974,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_command_step);
     test_step.dependOn(test_command_types_step);
     test_step.dependOn(test_platform_menu_step);
+    test_step.dependOn(test_platform_null_step);
     test_step.dependOn(test_platform_clipboard_step);
     test_step.dependOn(test_copilot_step);
     test_step.dependOn(test_netsync_step);

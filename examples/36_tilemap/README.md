@@ -29,7 +29,7 @@ cd examples/36_tilemap && zig build run
 
 ```bash
 TMPD=$(mktemp -d)
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_HARNESS_SCRIPT=examples/36_tilemap/e2e.txt \
 VP_HARNESS_OUT=$TMPD \
 zig build run-example_36
@@ -45,7 +45,7 @@ zig build run-example_36
 TMPD=$(mktemp -d)
 MEASURE=$TMPD/measure.txt
 sed '/^expect fb crc=/d' examples/36_tilemap/e2e.txt > "$MEASURE"
-VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT="$MEASURE" VP_HARNESS_OUT="$TMPD" \
+VP_HEADLESS=1 VP_HARNESS_SCRIPT="$MEASURE" VP_HARNESS_OUT="$TMPD" \
   zig build run-example_36 2>&1 | tee "$TMPD/replay.log"
 rg 'crc=' "$TMPD/replay.log"
 ```

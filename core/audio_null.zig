@@ -1,6 +1,6 @@
 //! Null audio output device (L1 オーディオ出力プリミティブ・TASK-32.4 P4)
 //!
-//! headless harness（`VP_HARNESS_HEADLESS=1`）用の実デバイス無し出力。純 Zig・OS 非依存
+//! headless harness（`VP_HEADLESS=1`）用の実デバイス無し出力。純 Zig・OS 非依存
 //! （`@cImport` しない。audio_linux/audio_windows と同じ ABI 戦略）。`start()` で再生スレッド
 //! (`std.Thread`) を spawn し、実時間ペーシング（period 分の時間だけ sleep）で render callback を
 //! pull する（audio_linux の push-thread パターン踏襲。実デバイスと同じ「別スレッドが実時間で

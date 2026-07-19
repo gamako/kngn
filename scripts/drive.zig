@@ -1,12 +1,12 @@
-//! drive: ヘッドレス検証 harness の live トランスポート（TCP loopback）driver CLI（TASK-32.2）。
+//! drive: ヘッドレス検証 harness の listen トランスポート（TCP loopback）driver CLI（TASK-32.2 / TASK-164）。
 //!
-//! 背景起動したアプリ（`VP_HARNESS_LIVE=1` / `VP_HARNESS_PORT=<n>` で listen 中）へ、1接続=1リクエスト
+//! 背景起動したアプリ（`VP_HARNESS_LISTEN[=port]` で listen 中）へ、1接続=1リクエスト
 //! =1レスポンスでコマンドを投げる。状態はアプリプロセス側に残る（接続は使い捨て）。
 //!
 //! 使い方:
 //!   drive --port 54321 'inject key_down A; step 3; digest fb'
 //!   drive --port-file /tmp/vp.port 'step 1; digest fb'
-//!   （--port / --port-file 省略時は env VP_HARNESS_PORT / VP_HARNESS_PORT_FILE を参照）
+//!   （--port / --port-file 省略時は env VP_HARNESS_LISTEN（正の port）/ VP_HARNESS_PORT_FILE を参照）
 //!
 //! コマンド文字列は残り引数を空白連結したもの。harness 側は `;` / 改行で複数コマンドに分割する。
 //! 送信後に write 側を half-close し、レスポンス（digest テキスト / snapshot パス）を stdout に出して終了する。
@@ -42,14 +42,17 @@ pub fn main(init: std.process.Init) !void {
     }
     if (cmd.items.len == 0) return die("コマンド文字列がありません（例: drive --port-file /tmp/vp.port 'step 1; digest fb'）\n");
 
-    // port 解決: --port > --port-file > env VP_HARNESS_PORT > env VP_HARNESS_PORT_FILE
+    // port 解決: --port > --port-file > env VP_HARNESS_LISTEN（正の値）> env VP_HARNESS_PORT_FILE
     const port: u16 = port_opt orelse blk: {
         if (port_file) |pf| break :blk try readPortFile(io, gpa, pf);
-        if (init.environ_map.get("VP_HARNESS_PORT")) |pe| {
-            break :blk std.fmt.parseInt(u16, pe, 10) catch return die("VP_HARNESS_PORT の値が不正です\n");
+        if (init.environ_map.get("VP_HARNESS_LISTEN")) |pe| {
+            const trimmed = std.mem.trim(u8, pe, " \t");
+            if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "0")) {
+                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN の値が不正です\n");
+            }
         }
         if (init.environ_map.get("VP_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
-        return die("port が不明です（--port / --port-file / VP_HARNESS_PORT / VP_HARNESS_PORT_FILE のいずれかを指定）\n");
+        return die("port が不明です（--port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE のいずれかを指定）\n");
     };
 
     // 接続 → 送信 → write half-close → レスポンス受信 → stdout

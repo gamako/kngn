@@ -14,7 +14,7 @@ cd "$ROOT"
 echo "[negative_auto_id] running Debug headless negative case..."
 set +e
 VP_GUI_TORTURE_CASE=negative_auto_id \
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_HARNESS_SCRIPT="$SCRIPT_DIR/negative_auto_id.txt" \
 VP_HARNESS_OUT="$OUT" \
 direnv exec "$VP_ROOT" zig build run-example_37 -Doptimize=Debug \

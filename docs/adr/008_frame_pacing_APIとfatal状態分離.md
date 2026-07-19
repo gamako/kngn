@@ -193,7 +193,7 @@ pub fn waitFrame(self: Window, timeout_ns: u64) WaitResult;
    （`onLock`/`onLockMiss` 相当を `FrameResult`/`WaitResult` の分岐に対応させる）。**harness 有効時、
    `wait`/`timeout` は実時間待ちせず即座に判定する**（仮想クロックと整合し、replay 決定論を守る）。
    ここで「即座に判定する」の中身は headless（P4）と非 headless（native window 併用）で異なる:
-   - **headless**（`VP_HARNESS_HEADLESS=1`）: backend 自体を呼ばない null window のため、frame slot は
+   - **headless**（`VP_HEADLESS=1`）: backend 自体を呼ばない null window のため、frame slot は
      常に即 available（`.framebuffer`/`.ready` 固定）。
    - **非 headless**（native window + replay/live 併用）: `beginFrame`/`waitFrame` は native backend の
      lock 結果をそのまま尊重しつつ、**実時間の sleep/dispatch 待ちだけを行わない**（= 判定は即座だが、

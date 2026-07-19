@@ -18,7 +18,7 @@ digest fb
 expect fb crc=DF9AE909
 quit
 EOF
-VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=/tmp/ex31.txt VP_HARNESS_OUT=/tmp zig build run-example_31
+VP_HEADLESS=1 VP_HARNESS_SCRIPT=/tmp/ex31.txt VP_HARNESS_OUT=/tmp zig build run-example_31
 ```
 
 固定 CRC（640×360・Release 既定・決定的配置）: `DF9AE909`

@@ -21,7 +21,7 @@ cd examples/32_sprite_anim && zig build run
 
 ```bash
 TMPD=$(mktemp -d)
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
   VP_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
   VP_HARNESS_OUT=$TMPD \
   zig build run-example_32

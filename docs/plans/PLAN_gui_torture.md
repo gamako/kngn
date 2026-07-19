@@ -41,7 +41,7 @@
 
 ```bash
 # 通常系 E2E（例: layout）
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_GUI_TORTURE_CASE=layout \
 VP_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout.txt \
 VP_HARNESS_OUT=$(mktemp -d) \
@@ -49,7 +49,7 @@ zig build run-example_37
 
 # 100x100 は別プロセス
 VP_GUI_WIDTH=100 VP_GUI_HEIGHT=100 VP_GUI_TORTURE_CASE=layout \
-VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout_100x100.txt \
+VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout_100x100.txt \
 VP_HARNESS_OUT=$(mktemp -d) zig build run-example_37
 
 # 負系

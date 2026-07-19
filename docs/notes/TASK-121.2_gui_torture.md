@@ -50,7 +50,7 @@ live_bytes_after_deinit=0
 
 ### 5. headless E2E（全カテゴリ）
 
-いずれも `VP_HARNESS_HEADLESS=1`、`VP_HARNESS_OUT=$(mktemp -d)`、exit **0**。
+いずれも `VP_HEADLESS=1`、`VP_HARNESS_OUT=$(mktemp -d)`、exit **0**。
 
 | script | env | exit |
 |---|---|---:|

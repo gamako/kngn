@@ -47,9 +47,15 @@ pub fn isEnabled() bool {
     return false;
 }
 
+pub fn isManualClock() bool {
+    return false;
+}
+
 pub fn isHeadlessActive() bool {
     return false;
 }
+
+pub fn setHeadlessActive(_: bool) void {}
 
 pub fn isCaptureSyntheticActive() bool {
     return false;
@@ -66,6 +72,10 @@ pub fn pollGate(native_continue: bool) bool {
 }
 
 pub fn pollGateWithPump(native_continue: bool, _: ?NativePump) bool {
+    return native_continue;
+}
+
+pub fn pollGateFreeRun(native_continue: bool) bool {
     return native_continue;
 }
 
@@ -94,18 +104,6 @@ pub fn now() f64 {
 }
 
 pub fn onAudioSamples(_: []const f32, _: u32, _: u32, _: u32) void {}
-
-pub const HeadlessFramebufferView = struct { pixels: []u32, width: u32, height: u32 };
-
-pub fn createHeadlessWindow(_: u32, _: u32) std.mem.Allocator.Error!void {
-    return error.OutOfMemory;
-}
-
-pub fn headlessLock() HeadlessFramebufferView {
-    return .{ .pixels = &.{}, .width = 0, .height = 0 };
-}
-
-pub fn destroyHeadlessWindow() void {}
 
 pub fn registerProbe(_: Probe) void {}
 

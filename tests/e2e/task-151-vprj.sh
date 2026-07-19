@@ -21,7 +21,7 @@ start_patch() {
   mkdir -p "$out_dir"
   rm -f "$port_file"
   # extra args are NAME=value env assignments (e.g. VP_NETSYNC_HOST=1)
-  env VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE="$port_file" VP_HARNESS_OUT="$out_dir" "$@" \
+  env VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE="$port_file" VP_HARNESS_OUT="$out_dir" "$@" \
     direnv exec "$MAIN" zig build run-patch >"$out_dir/app.log" 2>&1 &
   echo $!
 }

@@ -3,7 +3,7 @@
 # CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取。
 # 実行例:
 #   TMPD=$(mktemp -d)
-#   VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=examples/36_tilemap/e2e.txt \
+#   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/36_tilemap/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_36
 # snapshot は path 省略 → $VP_HARNESS_OUT/frame_<n>.png（repo に PNG を残さない）
 

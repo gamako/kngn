@@ -18,7 +18,7 @@
 //!
 //! ## headless（実デバイス無し）駆動（TASK-32.4 P4）
 //!
-//! `VP_HARNESS_HEADLESS=1` 時は `backend`（実 OS デバイス）の代わりに `audio_null.zig` の
+//! `VP_HEADLESS=1` 時は `backend`（実 OS デバイス）の代わりに `audio_null.zig` の
 //! null デバイスを開く（実デバイス無し・純 Zig・実時間 pull スレッド）。`AudioDevice.inner` を
 //! tagged union（`native`/`null_dev`）にして分岐するだけで、公開 `Error`/`Config`/`EffectiveConfig`/
 //! `RenderCallback` は一切変えない（`NullBackend(backend)` が backend の型をエイリアスするため）。
@@ -126,7 +126,7 @@ pub const AudioDevice = struct {
 ///     （実デバイス無し・実時間 pull スレッド）。
 ///
 /// `isHeadlessActive()` を `isEnabled()` より先に判定するのは意図的: headless は
-/// `VP_HARNESS_HEADLESS` の env 存在だけで決まり、script 読込失敗等で transport が
+/// platform が確定した `VP_HEADLESS=1`（`harness.setHeadlessActive`）で決まり、script 読込失敗等で transport が
 /// 最終的に `.disabled` になっても真になり得る（`platform.zig` の `backend.init()` 自体を
 /// スキップする判断と対）。ここで `isEnabled()` を先に見ると、その edge case で
 /// headless 指定なのに実オーディオデバイスを開いてしまう不整合が起きる。

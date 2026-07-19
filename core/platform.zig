@@ -18,13 +18,15 @@
 //!   - `getTime`    = 仮想クロック
 //! env `VP_HARNESS_SCRIPT` 未設定なら全フックは即パススルー（既存挙動と完全一致）。
 //!
-//! ## 完全 display-less（TASK-32.4 P4）
+//! ## 完全 display-less（TASK-165: platform/null backend）
 //!
-//! `VP_HARNESS_HEADLESS=1`（+ SCRIPT か LIVE 併用）のとき、`Window` は backend を一切呼ばず
-//! harness 所有の CPU framebuffer だけで動く（`platform.init()` も `backend.init()` をスキップする）。
+//! `VP_HEADLESS=1` のとき facade が runtime で `platform_null` を選び、native backend の
+//! `init`/display 接続を一切しない。一次 framebuffer は null `Window` が所有し、harness は
+//! 観測 copy（`onLock`/`onPresent`）だけを行う。SCRIPT/LIVE は任意（単独の display-less 起動可）。
 //! `Framebuffer` は facade 独自の struct（`pixels/width/height` + `unlock()`）で、内部に
-//! backend fb（native）か headless（harness buffer）かの tagged union を持つ。caller が使うのは
-//! `fb.pixels/.width/.height/.unlock()` のみなのでソース互換（apps/synth 等の既存コード無改造）。
+//! native / null の tagged union を持つ。caller が使うのは `fb.pixels/.width/.height/.unlock()`
+//! のみなのでソース互換（apps/synth 等の既存コード無改造）。wasm は compile-time 分岐のまま
+//! DOM canvas backend を維持し、null runtime union の対象外とする。
 //!
 //! ## canonical pixel format（全 OS 共通・TASK-28.6）
 //!
@@ -49,7 +51,7 @@ const netsync = harness.netsync;
 // 付与するため（外部公開 module も含む）、全 caller で安全に参照できる。
 const build_options = @import("build_options");
 
-const backend = if (builtin.cpu.arch.isWasm())
+const native_backend = if (builtin.cpu.arch.isWasm())
     @import("platform_wasm.zig")
 else switch (builtin.os.tag) {
     .macos => @import("platform_macos.zig"),
@@ -58,8 +60,21 @@ else switch (builtin.os.tag) {
     else => @compileError("video-proto: unsupported OS for platform backend: " ++ @tagName(builtin.os.tag)),
 };
 
+/// null runtime は native OS のみ（wasm は DOM canvas の compile-time branch を維持。TASK-165）。
+const null_runtime_supported = !builtin.cpu.arch.isWasm();
+const null_backend = if (null_runtime_supported) @import("platform_null.zig") else struct {};
+
+/// `VP_HEADLESS=1` で確定した runtime 選択（`platform.init` 先頭で設定。wasm は常に false）。
+var runtime_null: bool = false;
+
+fn envHeadlessOne() bool {
+    if (comptime !null_runtime_supported) return false;
+    const v = std.c.getenv("VP_HEADLESS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 fn nativePumpPoll(ctx: *anyopaque) bool {
-    const inner: *backend.Window = @ptrCast(@alignCast(ctx));
+    const inner: *native_backend.Window = @ptrCast(@alignCast(ctx));
     return inner.pollEvents();
 }
 
@@ -143,95 +158,110 @@ pub const GamepadState = types.GamepadState;
 pub const GamepadInfo = types.GamepadInfo;
 pub const GamepadDisconnect = types.GamepadDisconnect;
 
-/// Locked framebuffer view（facade 独自型。TASK-32.4 P4）。
+/// Locked framebuffer view（facade 独自型。TASK-32.4 P4 / TASK-165）。
 /// caller が使うのは `pixels/width/height/unlock()` のみなので backend 直の型と source 互換。
-/// 内部は「native（backend 実体）」か「headless（harness 所有 buffer）」かの tagged union。
+/// 内部は「native（compile-time backend）」か「null（VP_HEADLESS）」かの tagged union。
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
     source: Source,
 
-    const Source = union(enum) {
-        native: backend.Framebuffer,
-        headless: void,
+    const Source = if (null_runtime_supported) union(enum) {
+        native: native_backend.Framebuffer,
+        null_fb: null_backend.Framebuffer,
+    } else union(enum) {
+        native: native_backend.Framebuffer,
     };
 
     pub fn unlock(self: Framebuffer) void {
-        switch (self.source) {
-            .native => |fb| fb.unlock(),
-            .headless => {}, // harness buffer は lock 概念が無い（present まで caller が直接触る）
+        if (comptime null_runtime_supported) {
+            switch (self.source) {
+                .native => |fb| fb.unlock(),
+                .null_fb => |fb| fb.unlock(),
+            }
+        } else {
+            self.source.native.unlock();
         }
     }
 };
 
 /// Window facade。harness 有効時のみ 4 フックを差し込む。harness 無効時は backend への即パススルー。
-/// **headless 時（TASK-32.4 P4）**は `inner` を一切使わず（`undefined` のまま）、harness 所有の
-/// CPU framebuffer だけで動く（`backend.init()` 自体が呼ばれないため `inner` は触れない）。
+/// **null runtime（TASK-165）**は `inner` が `null_backend.Window` を持ち、一次 framebuffer を所有する。
 pub const Window = struct {
-    inner: backend.Window,
-    headless: bool,
-    /// headless getGeometry 用に作成時サイズを保持する（TASK-117。native は backend 取得）。
-    create_w: u32 = 0,
-    create_h: u32 = 0,
+    inner: Inner,
+
+    const Inner = if (null_runtime_supported) union(enum) {
+        native: native_backend.Window,
+        null_win: null_backend.Window,
+    } else union(enum) {
+        native: native_backend.Window,
+    };
+
+    fn isNull(self: Window) bool {
+        if (comptime !null_runtime_supported) return false;
+        return self.inner == .null_win;
+    }
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        if (harness.isHeadlessActive()) {
-            harness.createHeadlessWindow(width, height) catch return error.WindowCreationFailed;
-            return .{ .inner = undefined, .headless = true, .create_w = width, .create_h = height };
+        if (comptime null_runtime_supported) {
+            if (runtime_null) {
+                return .{ .inner = .{ .null_win = try null_backend.Window.create(width, height, title) } };
+            }
         }
-        return .{ .inner = try backend.Window.create(width, height, title), .headless = false, .create_w = width, .create_h = height };
+        return .{ .inner = .{ .native = try native_backend.Window.create(width, height, title) } };
     }
 
     /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。video-proto に
-    /// OS レベルのフルスクリーン切替 API が無かったため追加）。`backend.Window` が
+    /// OS レベルのフルスクリーン切替 API が無かったため追加）。`native_backend.Window` が
     /// `createFullscreen` を実装していれば（Linux x11/wayland）それを使い、無ければ
     /// 固定サイズの通常ウィンドウへフォールバックする（macOS/Windows backend は無改造）。
     /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        if (harness.isHeadlessActive()) {
-            harness.createHeadlessWindow(1920, 1080) catch return error.WindowCreationFailed;
-            return .{ .inner = undefined, .headless = true, .create_w = 1920, .create_h = 1080 };
+        if (comptime null_runtime_supported) {
+            if (runtime_null) {
+                return .{ .inner = .{ .null_win = try null_backend.Window.createFullscreen(title) } };
+            }
         }
-        if (@hasDecl(backend.Window, "createFullscreen")) {
-            return .{ .inner = try backend.Window.createFullscreen(title), .headless = false, .create_w = 1920, .create_h = 1080 };
+        if (@hasDecl(native_backend.Window, "createFullscreen")) {
+            return .{ .inner = .{ .native = try native_backend.Window.createFullscreen(title) } };
         }
-        return .{ .inner = try backend.Window.create(1920, 1080, title), .headless = false, .create_w = 1920, .create_h = 1080 };
+        return .{ .inner = .{ .native = try native_backend.Window.create(1920, 1080, title) } };
     }
 
     /// 透過 / borderless / 初期位置・サイズ オプション付きでウィンドウを作成する（TASK-104 / TASK-117）。
     /// `.{}` は従来 create と同一挙動（後方互換）。`opts.size` 指定時だけ w/h を上書きする。
     /// backend が `createWithOptions` を実装していればそれを使い、無ければ透過/borderless 要求時に
     /// `error.Unsupported`、無指定なら通常 create へフォールバックする。
-    /// headless（VP_HARNESS_HEADLESS）は options を受理し CPU framebuffer だけで動く
+    /// null runtime（`VP_HEADLESS=1`）は options を受理し CPU framebuffer だけで動く
     /// （表示は無いが fb の alpha を digest 検証できる。位置は常に null）。
     /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
-        if (harness.isHeadlessActive()) {
-            harness.createHeadlessWindow(w, h) catch return error.WindowCreationFailed;
-            return .{ .inner = undefined, .headless = true, .create_w = w, .create_h = h };
+        if (comptime null_runtime_supported) {
+            if (runtime_null) {
+                return .{ .inner = .{ .null_win = try null_backend.Window.createWithOptions(w, h, title, opts) } };
+            }
         }
-        if (@hasDecl(backend.Window, "createWithOptions")) {
-            return .{ .inner = try backend.Window.createWithOptions(w, h, title, opts), .headless = false, .create_w = w, .create_h = h };
+        if (@hasDecl(native_backend.Window, "createWithOptions")) {
+            return .{ .inner = .{ .native = try native_backend.Window.createWithOptions(w, h, title, opts) } };
         }
         if (opts.transparent or opts.borderless) return error.Unsupported;
-        return .{ .inner = try backend.Window.create(w, h, title), .headless = false, .create_w = w, .create_h = h };
+        return .{ .inner = .{ .native = try native_backend.Window.create(w, h, title) } };
     }
 
     /// 現在のウィンドウ geometry を返す（TASK-117）。エラーを返さず安全な既定値を返す。
-    /// headless は作成時サイズ + position=null。backend 未実装は size=0 + position=null。
+    /// null は作成時サイズ + position=null。backend 未実装は size=0 + position=null。
     /// ホットパス宣言: ウィンドウ生成時 / 終了時 shutdown / harness digest 観測時のみ。
     pub fn getGeometry(self: Window) WindowGeometry {
-        if (self.headless) {
-            return .{
-                .position = null,
-                .size = .{ .width = self.create_w, .height = self.create_h },
-            };
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                return null_backend.getGeometry(self.inner.null_win);
+            }
         }
-        if (comptime @hasDecl(backend, "getGeometry")) {
-            return backend.getGeometry(self.inner);
+        if (comptime @hasDecl(native_backend, "getGeometry")) {
+            return native_backend.getGeometry(self.inner.native);
         }
         return .{ .position = null, .size = .{ .width = 0, .height = 0 } };
     }
@@ -240,70 +270,88 @@ pub const Window = struct {
         // callback clear は public setRedrawCallback に null を通さず、facade/backend の
         // private clear 経路で行う（TASK-23.1 実装メモ）。destroy 後の遅延 setFrameSize 防御。
         redraw_guard = .{};
-        if (self.headless) {
-            harness.destroyHeadlessWindow();
-            return;
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                self.inner.null_win.destroy();
+                return;
+            }
         }
         // document access 登録解除（dangling userdata。backend が実装していれば）。
-        if (comptime @hasDecl(backend.Window, "setTextInputDocumentAccess")) {
+        if (comptime @hasDecl(native_backend.Window, "setTextInputDocumentAccess")) {
             // userdata は解除時に読まれないが、型上 *anyopaque が必要なのでダミーを渡す。
             var dummy: u8 = 0;
-            self.inner.setTextInputDocumentAccess(@ptrCast(&dummy), null);
+            self.inner.native.setTextInputDocumentAccess(@ptrCast(&dummy), null);
         }
-        self.inner.clearRedrawCallback();
-        self.inner.destroy();
+        self.inner.native.clearRedrawCallback();
+        self.inner.native.destroy();
     }
 
     /// OS の close/quit 要求を consumer がキャンセルし、window を継続する。
-    /// ホットパス宣言: quit/close イベント時のみ。headless は no-op。
+    /// ホットパス宣言: quit/close イベント時のみ。null runtime は no-op。
     pub fn cancelQuit(self: Window) void {
-        if (self.headless) return;
-        if (@hasDecl(backend.Window, "cancelQuit")) self.inner.cancelQuit();
+        if (self.isNull()) return;
+        if (@hasDecl(native_backend.Window, "cancelQuit")) self.inner.native.cancelQuit();
     }
 
     pub fn pollEvents(self: Window) bool {
-        // netsync.pump は headless の pollGate 早期 return より前（全経路・毎フレーム。TASK-62.3.2）。
+        // netsync.pump は harness gate 早期 return より前（全経路・毎フレーム。TASK-62.3.2）。
         // queue 空なら即 return。env 未設定時も started ガードでパススルー。
         netsync.pump();
-        if (self.headless) return harness.pollGate(true); // native window closed 相当が無いので常に continue
-        var inner = self.inner;
-        const native = inner.pollEvents();
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                // null に native compositor pump は渡さない。harness 無効時は常に continue。
+                if (!harness.isEnabled()) return true;
+                return harness.pollGate(true);
+            }
+        }
+        var native_win = self.inner.native;
+        const native = native_win.pollEvents();
         if (!harness.isEnabled()) {
             // 通常 UX の毎フレーム末尾で copilot transport を進める（disabled 時は即 return の no-op。
             // harness 有効時は排他により copilot は必ず disabled なので、このパスに置くだけで足りる）。
             copilot.pump();
             return native;
         }
-        const pump = harness.NativePump{
-            .ptr = @ptrCast(&inner),
-            .pollFn = nativePumpPoll,
-        };
-        return harness.pollGateWithPump(native, pump);
+        // manual/replay: blocking gate + NativePump。free-run: 非 blocking drain（pump なし）。
+        if (harness.isManualClock()) {
+            const pump = harness.NativePump{
+                .ptr = @ptrCast(&native_win),
+                .pollFn = nativePumpPoll,
+            };
+            return harness.pollGateWithPump(native, pump);
+        }
+        return harness.pollGateFreeRun(native);
     }
 
     pub fn nextEvent(self: Window) ?Event {
-        if (self.headless) return harness.nextInjectedEvent(); // native pump が無いので注入イベントのみ
-        if (!harness.isEnabled()) return self.inner.nextEvent();
+        if (self.isNull()) return harness.nextInjectedEvent(); // native pump が無いので注入イベントのみ
+        if (!harness.isEnabled()) return self.inner.native.nextEvent();
         // 注入イベントを優先。尽きたら native を drain して quit のみ通す。
         if (harness.nextInjectedEvent()) |ev| return ev;
-        while (self.inner.nextEvent()) |ev| {
+        while (self.inner.native.nextEvent()) |ev| {
             if (harness.filterNativeEvent(ev)) |keep| return keep;
         }
         return null;
     }
 
     pub fn getEventStats(self: Window) EventStats {
-        if (self.headless) return .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
-        return self.inner.getEventStats();
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) return self.inner.null_win.getEventStats();
+        }
+        return self.inner.native.getEventStats();
     }
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
-        if (self.headless) {
-            const view = harness.headlessLock();
-            harness.onLock(view.pixels, view.width, view.height);
-            return .{ .pixels = view.pixels, .width = view.width, .height = view.height, .source = .headless };
+        // ホットパス宣言: native/null とも backend buffer の view 返却 + harness 有効時の onLock 記録のみ。
+        // フレーム毎の新規確保・per-pixel 処理は行わない（観測 copy は present 時の onPresent）。
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                const fb = self.inner.null_win.lockFramebuffer() orelse return null;
+                if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height);
+                return .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height, .source = .{ .null_fb = fb } };
+            }
         }
-        const fb = self.inner.lockFramebuffer() orelse {
+        const fb = self.inner.native.lockFramebuffer() orelse {
             if (harness.isEnabled()) harness.onLockMiss();
             return null;
         };
@@ -312,80 +360,77 @@ pub const Window = struct {
     }
 
     pub fn present(self: Window) void {
-        if (self.headless) {
-            // stats probe 用に EventStats(ゼロ値) を push してから fb 捕捉（onPresent で frame 確定）。
-            // headless は isHeadlessActive() 経由でのみ生成されるため実質常に harness 有効だが、
-            // native 経路と対称に isEnabled() ガードを揃えておく。
-            if (harness.isEnabled()) {
-                harness.onStats(self.getEventStats());
-                harness.onPresent();
-            }
-            return;
-        }
+        // ホットパス宣言: harness 有効時は onStats→onPresent（観測 owned copy）の後に backend present。
+        // null present は no-op。フレーム毎の新規確保・per-pixel 処理は行わない。
         if (harness.isEnabled()) {
-            // stats probe 用に EventStats を push してから fb 捕捉（onPresent で frame 確定）。
-            harness.onStats(self.inner.getEventStats());
+            harness.onStats(self.getEventStats());
             harness.onPresent();
         }
-        self.inner.present();
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                self.inner.null_win.present();
+                return;
+            }
+        }
+        self.inner.native.present();
     }
 
     /// カーソル形状を設定する（システムカーソル。TASK-75.1）。
     /// ホットパス宣言: ツール切替等の**イベント時のみ**呼ぶ想定（フレーム毎/RT ではない。
-    /// 性能規約の対象外）。headless 時（表示先が無い＝VP_HARNESS_HEADLESS）は no-op（AC#3）。
+    /// 性能規約の対象外）。null runtime（表示先が無い＝VP_HEADLESS）は no-op（AC#3）。
     /// probe が観測する値ではない（副作用が表示にしか出ない）ため harness 側のフック追加は不要。
     pub fn setCursor(self: Window, shape: CursorShape) void {
-        if (self.headless) return;
-        self.inner.setCursor(shape);
+        if (self.isNull()) return;
+        self.inner.native.setCursor(shape);
     }
 
     /// 表示中の OS ウィンドウタイトルを更新する。状態遷移時のみ呼ぶ。
-    /// headless と未対応 backend は no-op とし、framebuffer を変更しない。
+    /// null と未対応 backend は no-op とし、framebuffer を変更しない。
     pub fn setTitle(self: Window, title: [:0]const u8) void {
-        if (self.headless) return;
-        if (@hasDecl(backend.Window, "setTitle")) self.inner.setTitle(title);
+        if (self.isNull()) return;
+        if (@hasDecl(native_backend.Window, "setTitle")) self.inner.native.setTitle(title);
     }
 
     /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。
-    /// アプリは掴む領域で mouse_down を受けたら呼ぶ。backend 未対応・headless は no-op。
+    /// アプリは掴む領域で mouse_down を受けたら呼ぶ。backend 未対応・null は no-op。
     /// ホットパス宣言: mouse_down 起点のイベント時のみ。
     pub fn beginDrag(self: Window) void {
-        if (self.headless) return;
-        if (@hasDecl(backend.Window, "beginDrag")) self.inner.beginDrag();
+        if (self.isNull()) return;
+        if (@hasDecl(native_backend.Window, "beginDrag")) self.inner.native.beginDrag();
     }
 
-    /// 常に最前面（always-on-top）を設定する（TASK-104）。backend 未対応・headless は no-op。イベント時のみ。
+    /// 常に最前面（always-on-top）を設定する（TASK-104）。backend 未対応・null は no-op。イベント時のみ。
     pub fn setAlwaysOnTop(self: Window, on: bool) void {
-        if (self.headless) return;
-        if (@hasDecl(backend.Window, "setAlwaysOnTop")) self.inner.setAlwaysOnTop(on);
+        if (self.isNull()) return;
+        if (@hasDecl(native_backend.Window, "setAlwaysOnTop")) self.inner.native.setAlwaysOnTop(on);
     }
 
     /// クリック透過（per-pixel。透明画素上のクリックを背後へ抜けさせる）を設定する（TASK-104）。
-    /// backend 未対応・headless は no-op。イベント時のみ。
+    /// backend 未対応・null は no-op。イベント時のみ。
     pub fn setClickThrough(self: Window, on: bool) void {
-        if (self.headless) return;
-        if (@hasDecl(backend.Window, "setClickThrough")) self.inner.setClickThrough(on);
+        if (self.isNull()) return;
+        if (@hasDecl(native_backend.Window, "setClickThrough")) self.inner.native.setClickThrough(on);
     }
 
     /// 終了メニューをポップアップする（TASK-104。選択時に window の event queue に quit を積む）。
-    /// backend 未対応・headless は no-op。イベント時のみ。
+    /// backend 未対応・null は no-op。イベント時のみ。
     pub fn showQuitMenu(self: Window) void {
-        if (self.headless) return;
-        if (@hasDecl(backend.Window, "showQuitMenu")) self.inner.showQuitMenu();
+        if (self.isNull()) return;
+        if (@hasDecl(native_backend.Window, "showQuitMenu")) self.inner.native.showQuitMenu();
     }
 
     /// OS のモーダルループ（ライブリサイズ等）中に backend が 1 フレームの描画を app へ要求する
     /// opt-in 登録（TASK-23.1）。未登録時は backend が何も呼ばず従来挙動。
-    /// harness 有効時（VP_HARNESS_*）および headless 時は登録自体をしない（no-op）。
+    /// harness 有効時（VP_HARNESS_*）および null runtime 時は登録自体をしない（no-op）。
     /// 再入ガードは facade の `redrawWrapper` に集約（コールバック中の再コールバックを遮断）。
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: RedrawFn) void {
-        if (self.headless or harness.isEnabled()) return;
+        if (self.isNull() or harness.isEnabled()) return;
         redraw_guard = .{ .ctx = ctx, .cb = cb, .in_callback = false };
-        self.inner.setRedrawCallback(@ptrCast(&redraw_guard), redrawWrapper);
+        self.inner.native.setRedrawCallback(@ptrCast(&redraw_guard), redrawWrapper);
     }
 
     /// 指定 index のゲームパッド状態を取得する（ポーリング主軸。ADR-009 / TASK-80.1・80.2）。
-    /// harness 有効時（headless 含む）は facade の 5 つ目のチョークポイントとして
+    /// harness 有効時（null runtime 含む）は facade の 5 つ目のチョークポイントとして
     /// `harness.getGamepadState` へ委譲し、`inject gamepad_connect/button/axis` の注入 state を返す
     /// （実 backend の有無・opt-in 状態に関わらず synthetic state を返す。TASK-80.1 の決定を継承）。
     /// 非 harness 時は macOS かつ `build_options.enable_gamepad`（TASK-80.2 opt-in 化。audio の
@@ -403,7 +448,7 @@ pub const Window = struct {
         if (harness.isEnabled() or harness.isHeadlessActive()) return harness.getGamepadState(index);
         if (builtin.os.tag != .macos) return null; // Linux/Windows backend は当面未実装（TASK-80.2 は macOS のみ）
         if (!build_options.enable_gamepad) return null; // opt-in 無効（TASK-80.2 opt-in 化）
-        return self.inner.getGamepadState(index);
+        return self.inner.native.getGamepadState(index);
     }
 
     // ========================================================================
@@ -412,40 +457,40 @@ pub const Window = struct {
 
     /// この backend が native menu API を提供するかを返す。
     ///
-    /// backend は module-level の任意 decl で実装する。未実装 backend と headless は
+    /// backend は module-level の任意 decl で実装する。未実装 backend と null は
     /// 常に false。Command の slice は register/update 呼び出し中だけ有効でよく、
     /// backend が必要な分を copy する。
     pub fn nativeMenuAvailable(self: Window) bool {
-        if (self.headless) return false;
-        if (comptime @hasDecl(backend, "nativeMenuAvailable")) {
-            return backend.nativeMenuAvailable(self.inner);
+        if (self.isNull()) return false;
+        if (comptime @hasDecl(native_backend, "nativeMenuAvailable")) {
+            return native_backend.nativeMenuAvailable(self.inner.native);
         }
         return false;
     }
 
-    /// native menu を登録する。未実装 backend / headless では no-op。
+    /// native menu を登録する。未実装 backend / null では no-op。
     /// macOS のように app 単位のメニューバーを持つ backend では、window は契約上
     /// 無視して最後の登録が全体を差し替える。Windows 等は window 単位で扱う。
     pub fn registerMenu(self: Window, commands: []const Command) void {
-        if (self.headless) return;
-        if (comptime @hasDecl(backend, "registerMenu")) {
-            backend.registerMenu(self.inner, commands);
+        if (self.isNull()) return;
+        if (comptime @hasDecl(native_backend, "registerMenu")) {
+            native_backend.registerMenu(self.inner.native, commands);
         }
     }
 
-    /// 登録済み native menu の enabled/checked 等を更新する。未実装 backend / headless は no-op。
+    /// 登録済み native menu の enabled/checked 等を更新する。未実装 backend / null は no-op。
     pub fn updateMenu(self: Window, commands: []const Command) void {
-        if (self.headless) return;
-        if (comptime @hasDecl(backend, "updateMenu")) {
-            backend.updateMenu(self.inner, commands);
+        if (self.isNull()) return;
+        if (comptime @hasDecl(native_backend, "updateMenu")) {
+            native_backend.updateMenu(self.inner.native, commands);
         }
     }
 
-    /// 登録済み native menu を破棄する。未実装 backend / headless は no-op。
+    /// 登録済み native menu を破棄する。未実装 backend / null は no-op。
     pub fn destroyMenu(self: Window) void {
-        if (self.headless) return;
-        if (comptime @hasDecl(backend, "destroyMenu")) {
-            backend.destroyMenu(self.inner);
+        if (self.isNull()) return;
+        if (comptime @hasDecl(native_backend, "destroyMenu")) {
+            native_backend.destroyMenu(self.inner.native);
         }
     }
 
@@ -453,7 +498,7 @@ pub const Window = struct {
     pub const supportsNativeMenus = nativeMenuAvailable;
 
     /// IME composition preedit 本文を buf へ書く（TASK-79.6.1）。
-    /// headless / 非対応 backend は常に空（text 0 長・revision/cursor 0）。
+    /// null / 非対応 backend は常に空（text 0 長・revision/cursor 0）。
     ///
     /// **latest-wins 契約（親 TASK-79.6 codex 収束）**: snapshot は常に「現在の」未確定状態。
     /// 同一 poll 内の複数 `composition_changed` は最新 snapshot に潰れる。event の `revision` は
@@ -462,16 +507,18 @@ pub const Window = struct {
     /// ホットパス宣言: イベント時のみ（描画前の preedit 読み。フレーム毎全画素でも RT でもない）。
     pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
         if (harness.isEnabled()) return harness.getCompositionSnapshot(buf);
-        if (self.headless) return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
-        return self.inner.getCompositionSnapshot(buf);
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) return self.inner.null_win.getCompositionSnapshot(buf);
+        }
+        return self.inner.native.getCompositionSnapshot(buf);
     }
 
     /// IME 候補窓の caret 基準 rect を framebuffer pixel・content 左上原点で供給する。
-    /// headless / 未対応 backend は no-op。レイアウト変化時などイベント時のみ呼ぶ。
+    /// null / 未対応 backend は no-op。レイアウト変化時などイベント時のみ呼ぶ。
     pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
-        if (self.headless) return;
-        if (comptime @hasDecl(backend.Window, "setCompositionRect")) {
-            self.inner.setCompositionRect(x, y, w, h);
+        if (self.isNull()) return;
+        if (comptime @hasDecl(native_backend.Window, "setCompositionRect")) {
+            self.inner.native.setCompositionRect(x, y, w, h);
         }
     }
 
@@ -479,47 +526,52 @@ pub const Window = struct {
     /// （SDL の StartTextInput/StopTextInput 相当。`setCompositionRect` と対になる）。
     /// active=false の間は IME/composition を経路から外すので、IME 有効中でも修飾なし英字キーが
     /// ショートカットとして届く。**冪等**なので consumer は毎フレーム focus 状態に追従して呼んでよい
-    /// （実効経路が変わらなければ副作用なし。変わるときのみ composition 破棄等が走る）。headless は no-op。
+    /// （実効経路が変わらなければ副作用なし。変わるときのみ composition 破棄等が走る）。null は no-op。
     /// 将来の Linux/Windows 実装も「毎フレーム安全な冪等 setter（内部で変化検出）」であること。
     /// backend 実装は `@hasDecl` gate で opt-in: 現在は macOS（objc/swift/metal）のみ実装。
     /// Linux(XIM/ibus/text-input-v3)・Windows(IMM/WM_IME) は IME composition 実装時にこのメソッドを
     /// backend Window に足せば、facade も consumer も無改修で有効化される（未実装 backend は no-op）。
     pub fn setTextInputActive(self: Window, active: bool) void {
-        if (self.headless) return;
-        if (comptime @hasDecl(backend.Window, "setTextInputActive")) {
-            self.inner.setTextInputActive(active);
+        if (self.isNull()) return;
+        if (comptime @hasDecl(native_backend.Window, "setTextInputActive")) {
+            self.inner.native.setTextInputActive(active);
         }
     }
 
     /// TASK-79.6.3: IME document access（確定テキストの再変換）。`callbacks == null` で登録解除。
-    /// headless / 非対応 backend は no-op。window destroy 時に facade 側も解除する。
+    /// null / 非対応 backend は no-op。window destroy 時に facade 側も解除する。
     pub fn setTextInputDocumentAccess(
         self: Window,
         userdata: *anyopaque,
         callbacks: ?TextInputDocumentCallbacks,
     ) void {
-        if (self.headless) return;
-        if (comptime @hasDecl(backend.Window, "setTextInputDocumentAccess")) {
-            self.inner.setTextInputDocumentAccess(userdata, callbacks);
+        if (self.isNull()) return;
+        if (comptime @hasDecl(native_backend.Window, "setTextInputDocumentAccess")) {
+            self.inner.native.setTextInputDocumentAccess(userdata, callbacks);
         }
     }
 };
 
 pub fn init() Error!void {
-    // headless 判定を先に確定させる（env 読取のみ・副作用無し）。headless なら backend.init() 自体を
-    // スキップする（display 接続を一切しない。TASK-32.4 P4）。非 headless は従来通り backend→transport の順を保つ。
+    // VP_HEADLESS を harness.parseConfig より前に確定（TASK-165）。値が "1" のときだけ null runtime。
     // copilot は TASK-62.5.2 §3b の順序: harness.parseConfig → copilot.parseConfig → backend init →
     // harness.startTransport → copilot.startTransport（排他は env 存在ベースで parseConfig 時点に確定）。
+    runtime_null = envHeadlessOne();
+    harness.setHeadlessActive(runtime_null);
     harness.parseConfig();
     copilot.parseConfig();
-    if (!harness.isHeadlessActive()) {
-        try backend.init();
+    if (runtime_null) {
+        if (comptime null_runtime_supported) {
+            try null_backend.init();
+        }
+    } else {
+        try native_backend.init();
     }
     harness.startTransport();
     copilot.startTransport();
     // netsync session → copilot operate 拒否（callback は initFromEnv の enableRouter より前に登録）。
     netsync.setSessionStateCallback(copilot.setNetsyncSessionActive);
-    // netsync は headless 分岐でも起動（env 未設定なら initFromEnv 即 return。TASK-62.3.2）。
+    // netsync は null runtime 分岐でも起動（env 未設定なら initFromEnv 即 return。TASK-62.3.2）。
     netsync.initFromEnv();
     // 観測 probe（TASK-62.3.4）。有効時のみ。netsync→harness 逆依存を避けるため platform から登録。
     if (netsync.isEnabled()) {
@@ -541,39 +593,44 @@ pub fn shutdown() void {
     copilot.forgetSharedExecutor();
     netsync.shutdown(); // main thread で setRouter(null)。disabled 時は no-op
     copilot.stopTransport(); // 接続中 stream → listener の順に close（disabled 時は no-op）
-    if (harness.isHeadlessActive()) return; // backend.init() を呼んでいないので shutdown も呼ばない
-    backend.shutdown();
+    if (runtime_null) {
+        if (comptime null_runtime_supported) null_backend.shutdown();
+        return;
+    }
+    native_backend.shutdown();
 }
 
 pub fn getTime() f64 {
-    // isHeadlessActive() も見るのは意図的: headless は backend.init() 自体をスキップしているため、
-    // script 読込失敗等で transport が最終的に `.disabled`（isEnabled()==false）になっても
-    // backend.getTime() を呼んではいけない（未初期化 backend 参照になる）。仮想クロックは
-    // backend に依存せず常に安全に呼べる。
-    if (harness.isEnabled() or harness.isHeadlessActive()) return harness.now();
-    return backend.getTime();
+    // manual clock（replay / LISTEN+MANUAL_CLOCK）のみ仮想クロック。free-run は backend 実時刻
+    // （clock ownership と control channel の分離。TASK-164）。
+    if (harness.isManualClock()) return harness.now();
+    if (runtime_null) {
+        if (comptime null_runtime_supported) return null_backend.getTime();
+        return 0;
+    }
+    return native_backend.getTime();
 }
 
 /// Dock アイコン / メニューバーの表示を切替える（TASK-104。アプリ全体・window 非依存）。
-/// visible=false で常駐アプリらしくする（macOS=accessory policy）。backend 未対応・headless は no-op。
+/// visible=false で常駐アプリらしくする（macOS=accessory policy）。backend 未対応・null は no-op。
 /// ホットパス宣言: 初期化/イベント時のみ。
 pub fn setDockVisible(visible: bool) void {
-    if (harness.isHeadlessActive()) return;
-    if (@hasDecl(backend, "setDockVisible")) backend.setDockVisible(visible);
+    if (runtime_null) return;
+    if (@hasDecl(native_backend, "setDockVisible")) native_backend.setDockVisible(visible);
 }
 
-/// ファイル保存ダイアログ。headless 時は backend が未初期化（native panel / zenity を呼べない）ため
-/// 即 `error.DialogFailed` を返す（TASK-32.4 P4）。
+/// ファイル保存ダイアログ。null runtime 時は backend が未初期化（native panel / zenity を呼べない）ため
+/// 即 `error.DialogFailed` を返す（TASK-165）。
 pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    if (harness.isHeadlessActive()) return error.DialogFailed;
-    return backend.saveFileDialog(gpa, io, opts);
+    if (runtime_null) return error.DialogFailed;
+    return native_backend.saveFileDialog(gpa, io, opts);
 }
 
-/// ファイルを開くダイアログ。headless 時は即 `error.DialogFailed`（`saveFileDialog` と同じ理由）。
+/// ファイルを開くダイアログ。null runtime 時は即 `error.DialogFailed`（`saveFileDialog` と同じ理由）。
 /// wasm では非同期: 未 pick 時 `error.DialogPending`（次 frame で再試行。TASK-73.3）。
 pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    if (harness.isHeadlessActive()) return error.DialogFailed;
-    return backend.openFileDialog(gpa, io, opts);
+    if (runtime_null) return error.DialogFailed;
+    return native_backend.openFileDialog(gpa, io, opts);
 }
 
 // ============================================================================
@@ -583,22 +640,22 @@ pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOption
 
 /// システム clipboard へ text を書く。backend 未実装時は no-op。
 pub fn clipboardWrite(text: []const u8) void {
-    if (comptime @hasDecl(backend, "clipboardWrite")) {
-        backend.clipboardWrite(text);
+    if (comptime @hasDecl(native_backend, "clipboardWrite")) {
+        native_backend.clipboardWrite(text);
     }
 }
 
 /// システム clipboard の text を非同期要求。backend 未実装時は no-op。
 pub fn clipboardRequestPaste() void {
-    if (comptime @hasDecl(backend, "clipboardRequestPaste")) {
-        backend.clipboardRequestPaste();
+    if (comptime @hasDecl(native_backend, "clipboardRequestPaste")) {
+        native_backend.clipboardRequestPaste();
     }
 }
 
 /// 届いていれば text を返し消費する。未着・未実装は null。
 pub fn clipboardTakePaste() ?[]const u8 {
-    if (comptime @hasDecl(backend, "clipboardTakePaste")) {
-        return backend.clipboardTakePaste();
+    if (comptime @hasDecl(native_backend, "clipboardTakePaste")) {
+        return native_backend.clipboardTakePaste();
     }
     return null;
 }
@@ -608,7 +665,7 @@ pub fn clipboardTakePaste() ?[]const u8 {
 // ============================================================================
 //
 // ホットパス宣言: イベント時のみ（Cmd+C/X/V）。フレーム毎・RT では呼ばない。
-// headless / unit test では固定長 in-memory fallback。通常 native runtime は backend
+// null runtime / unit test では固定長 in-memory fallback。通常 native runtime は backend
 //（macOS objc=NSPasteboard）へ委譲する。
 
 const MEMORY_CLIPBOARD_CAP: usize = 4096;
@@ -618,7 +675,7 @@ var memory_clipboard_len: usize = 0;
 var memory_clipboard_set: bool = false;
 
 fn useMemoryClipboard() bool {
-    return builtin.is_test or harness.isHeadlessActive();
+    return builtin.is_test or runtime_null;
 }
 
 fn utf8TruncateLen(text: []const u8, max: usize) usize {
@@ -643,8 +700,8 @@ pub fn setClipboardText(text: []const u8) void {
         memory_clipboard_set = true;
         return;
     }
-    if (comptime @hasDecl(backend, "setClipboardText")) {
-        backend.setClipboardText(text);
+    if (comptime @hasDecl(native_backend, "setClipboardText")) {
+        native_backend.setClipboardText(text);
     }
 }
 
@@ -657,8 +714,8 @@ pub fn getClipboardText(buf: []u8) ?[]const u8 {
         @memcpy(buf[0..n], memory_clipboard[0..n]);
         return buf[0..n];
     }
-    if (comptime @hasDecl(backend, "getClipboardText")) {
-        return backend.getClipboardText(buf);
+    if (comptime @hasDecl(native_backend, "getClipboardText")) {
+        return native_backend.getClipboardText(buf);
     }
     return null;
 }
@@ -766,14 +823,10 @@ pub fn sleep(nanoseconds: u64) void {
     sleep_impl.call(nanoseconds);
 }
 
-/// フレーム毎の main loop ウェイト（TASK-32.4 P4）。harness 有効時（headless に限らず replay/live とも）は
-/// **no-op**（フレーム進行は `pollGate` が gate し、時刻は仮想クロックなので実時間 sleep は純粋な待ち損＝
-/// replay 速度の律速要因）。harness 無効時は `sleep()` と同じ。main/examples の frame-wait 呼び出しは
-/// これに置き換える（`sleep()` 自体はフレームウェイト以外の用途向けに残す）。
+/// フレーム毎の main loop ウェイト（TASK-32.4 P4 / TASK-164）。
+/// manual clock（replay / LISTEN+MANUAL_CLOCK）のときだけ **no-op**（仮想クロック + pollGate が
+/// フレーム進行を決めるため実時間 sleep は待ち損）。free-run と harness 無効時は `sleep()` と同じ。
 pub fn frameDelay(nanoseconds: u64) void {
-    // isHeadlessActive() も見る（getTime()/audio.open() と同じ理由）。headless 指定時に transport が
-    // 最終的に disabled でも実時間 sleep で main loop を止めない（pollGate が既に false を返し
-    // ループを終える構成なので実害は薄いが、判定を統一しておく）。
-    if (harness.isEnabled() or harness.isHeadlessActive()) return;
+    if (harness.isManualClock()) return;
     sleep(nanoseconds);
 }

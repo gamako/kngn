@@ -2,7 +2,7 @@
 # 前提: 640×360 / 固定背景 / 固定 seed 無しの決定的描画 / harness 仮想クロック
 # 実行例:
 #   TMPD=$(mktemp -d)
-#   VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
+#   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_32
 
 step 1

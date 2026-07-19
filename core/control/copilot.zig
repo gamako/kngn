@@ -19,7 +19,7 @@
 //! 関数は呼ばない。
 //!
 //! ## 排他（1 プロセス 1 control transport）
-//! `VP_HARNESS_*`（SCRIPT/LIVE/PORT/HEADLESS）の env が存在すれば `VP_COPILOT_*` は warn して無視
+//! `VP_HARNESS_*`（SCRIPT/LISTEN/VP_HEADLESS）の env が存在すれば `VP_COPILOT_*` は warn して無視
 //! （判定は env 存在ベースで `parseConfig()` 時点に確定・決定論。harness の listen 成否には依存しない）。
 //!
 //! ## 接続モデル（非ブロッキング state machine）
@@ -135,9 +135,8 @@ pub fn parseConfig() void {
     if (!requested) return;
 
     const harness_env_present = getEnv("VP_HARNESS_SCRIPT") != null or
-        getEnv("VP_HARNESS_LIVE") != null or
-        getEnv("VP_HARNESS_PORT") != null or
-        getEnv("VP_HARNESS_HEADLESS") != null;
+        getEnv("VP_HARNESS_LISTEN") != null or
+        getEnv("VP_HEADLESS") != null;
     if (!decideEnabled(requested, harness_env_present)) {
         std.debug.print("[copilot] VP_HARNESS_* が有効なため VP_COPILOT_* を無視します（1プロセス1 control transport）\n", .{});
         return;

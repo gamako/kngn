@@ -442,7 +442,7 @@ zig build test-patch           # apps/patch 純幾何（camera/hit-test/見切�
 ヘッドレス AC 確認（macOS 実機で発音、live で audio digest）:
 
 ```bash
-VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-patch &     # 背景起動
+VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-patch &     # 背景起動
 scripts/drive --port-file /tmp/vp.port 'digest audio'                        # → silent=0 / rms>0 を確認
 scripts/drive --port-file /tmp/vp.port 'quit'
 ```
@@ -458,11 +458,11 @@ AI がアプリの出力を手軽に確認するための仕組み。`core/platf
 - **P1（TASK-32.1, 実装済み）**: file replay + 組み込み `fb` probe（framebuffer→PNG / 1行 digest）+ 仮想クロック。
 - **P2（TASK-32.2, 実装済み）**: live 制御（TCP loopback + driver CLI `scripts/drive`）/ 組み込み `audio`・`stats` probe / record→replay。
 - **P3（TASK-32.3, 実装済み）**: custom probe レジストリ。app が `platform.registerProbe(...)` で probe を opt-in 登録（pixie=`canvas`/`undo`/`tool`, synth=`voices`/`patch`）。詳細は下記「custom probe の足し方」。
-- **P4（TASK-32.4, 実装済み）**: 完全 display-less。`VP_HARNESS_HEADLESS=1`（+ SCRIPT か LIVE 併用）で
-  `platform.init()` が `backend.init()` 自体を呼ばず、facade+harness 層の「null window」（backend 非依存の
-  CPU framebuffer）だけで動く。純 SSH（`DISPLAY`/`WAYLAND_DISPLAY` 無し）・macOS のウィンドウ点滅無しで
-  replay/live が回る。あわせて `audio_null.zig`（実デバイス無しの null 出力デバイス。実時間 pull スレッド）で
-  `audio` probe も実デバイス無しで駆動でき、`platform.frameDelay()`（harness 有効時 no-op）で main loop の
+- **P4（TASK-32.4 → TASK-165, 実装済み）**: 完全 display-less。`VP_HEADLESS=1` で
+  `platform.init()` が native `backend.init()` 自体を呼ばず、runtime で `platform_null`（CPU framebuffer
+  所有の null window）を選ぶ。SCRIPT/LISTEN は任意（単独の display-less 起動可）。harness は観測 copy
+  （`onLock`/`onPresent`）のみ。あわせて `audio_null.zig`（実デバイス無しの null 出力デバイス。実時間 pull スレッド）で
+  `audio` probe も実デバイス無しで駆動でき、`platform.frameDelay()`（manual clock 時 no-op）で main loop の
   sleep による replay 速度律速も解消した。詳細は下記「完全 display-less（P4）」節。
   - 注: `fb` probe は**手動描画 API の CPU フレームバッファ**を捕捉する backend 非依存実装なので、**objc / swift / metal いずれでも `snapshot fb` は撮れる**（Metal も同じ CPU バッファを供給し、実測で objc と fb crc が bit 一致）。
 - **P4 スコープ外**: Metal の GPU drawable 読み戻し（描画後の合成サーフェスの readback）。理由は上記の CPU
@@ -485,7 +485,9 @@ inject key_down S cmd shift # 末尾に shift/ctrl/alt/cmd を 0 個以上（順
 inject mouse_move 100 120  # mouse_move <x> <y> [修飾子...]
 inject mouse_down left alt # mouse_down/up <left|right|middle> [修飾子...]
 inject scroll 0 -3 ctrl    # scroll <dx> <dy> [修飾子...]
-step 5                     # 5 フレーム進める（省略時 1）
+step 5                     # manual/replay: 5 フレーム駆動 / free-run: 5 present の frame barrier
+await fb crc=8702DD71 60   # await <probe> <key><op><value> [timeout]（timeout=frame budget。0=1回照合）
+await audio silent=0       # free-run は接続保持して自走待ち、manual はフレーム駆動して待つ
 snapshot fb  /tmp/out.png  # 直近 present フレームを PNG 保存（省略時 $VP_HARNESS_OUT/frame_<n>.png）
 snapshot audio /tmp/a.wav  # 直近の audio tap を PCM16 WAV 保存（省略時 audio_<n>.wav）
 snapshot stats /tmp/s.json # stats を JSON 保存（省略時 stats_<n>.json）
@@ -555,9 +557,10 @@ zig build test-harness   # 単体テスト（parser/実行モデル/仮想クロ
 
 ```bash
 zig build drive                                   # 一度だけ zig-out/bin/drive を生成（zig build でも入る）
-VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port VP_HARNESS_OUT=/tmp \
+VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port VP_HARNESS_OUT=/tmp \
   VP_HARNESS_RECORD=/tmp/live.txt zig build run-synth &        # 背景起動（ephemeral port を /tmp/vp.port に出力）
-# 固定 port は VP_HARNESS_PORT=<n>。ポートは stderr にも出る。
+# 固定 port は VP_HARNESS_LISTEN=<n>。ポートは stderr にも出る。
+# 旧 step-driven 相当は VP_HARNESS_MANUAL_CLOCK=1 を併用。
 scripts/drive --port-file /tmp/vp.port 'inject key_down A; step 5; digest fb'   # → fb ... を stdout に返す
 scripts/drive --port-file /tmp/vp.port 'digest audio'                          # → audio rms=.. f0=.. ..
 scripts/drive --port-file /tmp/vp.port 'snapshot fb /tmp/out.png'              # → /tmp/out.png
@@ -568,40 +571,45 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
 
 | env | 役割 |
 |---|---|
-| `VP_HARNESS_SCRIPT=<file>` | **replay** 有効化（file トランスポート） |
-| `VP_HARNESS_LIVE=1` | **live** 有効化（ephemeral port で listen） |
-| `VP_HARNESS_PORT=<n>` | live を固定 port で有効化 |
+| `VP_HARNESS_SCRIPT=<file>` | **replay** 有効化（file トランスポート。常に manual clock） |
+| `VP_HARNESS_LISTEN[=port]` | **listen** 有効化（TCP loopback。値なし／空／`0`=ephemeral、正の値=固定 port。既定は free-run） |
+| `VP_HARNESS_MANUAL_CLOCK=1` | LISTEN に従属。socket を旧 step-driven（blocking）相当の manual clock にする |
 | `VP_HARNESS_PORT_FILE=<file>` | 選ばれた port の出力先（省略時 `$VP_HARNESS_OUT/harness.port`） |
-| `VP_HARNESS_RECORD=<file>` | live 受信コマンドを追記（→ `VP_HARNESS_SCRIPT` で replay 可能） |
+| `VP_HARNESS_RECORD=<file>` | listen 受信コマンドを追記（→ `VP_HARNESS_SCRIPT` で replay 可能） |
 | `VP_HARNESS_OUT=<dir>` | snapshot 省略 path / port file の既定ディレクトリ |
-| `VP_HARNESS_HEADLESS=1` | **完全 display-less**（P4）。SCRIPT か LIVE/PORT との併用が必須（単独指定は warn して無視＝通常実行）。詳細は下記「完全 display-less（P4）」節 |
+| `VP_HEADLESS=1` | **完全 display-less**（TASK-165）。`platform.init` が null backend を選ぶ。SCRIPT/LISTEN は任意（単独起動可）。詳細は下記「完全 display-less（P4）」節 |
 
-> SCRIPT と LIVE/PORT の同時指定はエラーで無効化（1プロセス1トランスポート）。env 未設定なら全フック即パススルー。
+> SCRIPT と LISTEN の同時指定はエラーで無効化（1プロセス1トランスポート）。LISTEN なしの MANUAL_CLOCK 単独も無効。env 未設定なら全フック即パススルー。
 
-### 完全 display-less（P4, TASK-32.4）
+> **Windows の free-run LISTEN は未対応（既知の制約）**: free-run の非ブロッキング accept は現状 POSIX の
+> `poll(0)` 実装のみで、Windows 分岐は常に `not_ready`（接続を accept しない silent no-op。port file と
+> listen ログは出るが drive が繋がらない）。**Windows では `VP_HARNESS_MANUAL_CLOCK=1` を併用**して旧
+> step-driven（blocking accept）経路を使うこと。mac/Linux は free-run 既定でよい（Windows の非ブロッキング
+> accept 実装は将来対応）。
 
-`VP_HARNESS_HEADLESS=1`（+ `VP_HARNESS_SCRIPT` か `VP_HARNESS_LIVE`/`PORT` の併用）で、`platform.init()` が
-`backend.init()` 自体を呼ばない（X11/Wayland の display 接続や macOS の WindowServer 接続を一切行わない）。
-`Window` は harness 所有の CPU framebuffer（`w*h` の `u32` バッファ）だけで動き、`lockFramebuffer`/`present`
-は既存の `fb` probe 捕捉フック（`onLock`/`onPresent`）をそのまま再利用する。**backend 別の offscreen 実装
-（X11 Pixmap 等）は採用していない**（facade+harness 層に閉じた「null window」方式。理由は「P4 スコープ外」
-節と同じく CPU framebuffer 捕捉モデルのため、backend を触っても得るものが無いこと）。
+### 完全 display-less（P4 → TASK-165）
 
-- **純 SSH（`DISPLAY`/`WAYLAND_DISPLAY` 無し）で replay/live がそのまま回る**（display 接続が無いため）。
+`VP_HEADLESS=1` で、`platform.init()` が native `backend.init()` 自体を呼ばない（X11/Wayland の display
+接続や macOS の WindowServer 接続を一切行わない）。runtime で `core/platform_null.zig` を選び、
+`Window` が一次 CPU framebuffer（`w*h` の `u32` バッファ）を所有する。harness は `onLock`/`onPresent`
+で観測 copy するだけ（一次 buffer は持たない）。SCRIPT/LISTEN は任意で、transport 無しの display-less
+起動も可能。**backend 別の offscreen 実装（X11 Pixmap 等）は採用していない**。
+
+- **純 SSH（`DISPLAY`/`WAYLAND_DISPLAY` 無し）で replay/listen がそのまま回る**（display 接続が無いため）。
 - **audio も実デバイス無しで駆動できる**: `core/audio_null.zig`（純 Zig・OS 非依存の null 出力デバイス）が
   `audio_linux`/`audio_windows` と同じ push-thread パターン（実時間 pull スレッド）で render callback を
   駆動し、`harness.onAudioSamples()` へ流す。`audio` probe（`digest audio`/`snapshot audio`）が実 sink 不在
   でも成立する。
-- **replay 速度律速の解消**: `platform.frameDelay(nanoseconds)`（harness 有効時は no-op、無効時は
-  `platform.sleep()` と同じ）を main loop の frame-wait に使う。仮想クロック + `pollGate` がフレーム進行を
-  決めるため、real-time sleep は待ち損でしかない。`src/main.zig` / `apps/synth/main.zig` /
+- **replay 速度律速の解消**: `platform.frameDelay(nanoseconds)`（manual clock 時は no-op、free-run / harness
+  無効時は `platform.sleep()` と同じ）を main loop の frame-wait に使う。manual では仮想クロック + `pollGate` が
+  フレーム進行を決めるため real-time sleep は待ち損。`src/main.zig` / `apps/synth/main.zig` /
   examples `01,02,03,04,05,12` は置換済み（`examples/15_audio_tone` の 3 秒 sleep はアプリの寿命そのもの
   なので対象外）。
 - **fb crc は headless でも非 headless と bit 一致**（実測確認済み。headless は描画内容を一切変えない）。
 - 既知の限界: `audio-only` で `platform.init()` を呼ばないアプリ（`examples/15_audio_tone` 等）は
-  `harness.parseConfig()` が走らないため `VP_HARNESS_HEADLESS` を解釈できない（headless 判定は
-  `platform.init()` 起点）。もっとも harness 自体は frame loop（`window.pollEvents()`）駆動が前提であり、
-  window を持たないアプリは元々 replay スクリプトで駆動できない（`step` 相当の同期点が無い）ため実害は無い。
+  `VP_HEADLESS` を解釈できない（判定は `platform.init()` 起点）。もっとも harness 自体は frame loop
+  （`window.pollEvents()`）駆動が前提であり、window を持たないアプリは元々 replay スクリプトで駆動できない
+  （`step` 相当の同期点が無い）ため実害は無い。
 - 実機検証済み（2026-07-04）: **Linux（Ubuntu・VPN 経由の純 SSH）**で x11/wayland build 緑、
   `DISPLAY`/`WAYLAND_DISPLAY` を unset した純 SSH で headless replay 動作（fb crc が mac と bit 一致）、
   sink 不在でも `audio_null` が発音（`digest audio` f0≈262Hz・silent=0）。**Windows 実機**で
@@ -670,12 +678,19 @@ action 固有のコードを一切足さない**（中身非パースの不変�
 - **`desc`（capabilities 列挙用の説明文。TASK-62.4。省略可）は probe と同じ規則でサニタイズされる**: `"` / `\` / ASCII 制御文字を含む、または 200 bytes 超は warn + 空文字化（登録自体は成功）。
 - **`args`（TASK-88.1。省略可）も probe と同じ規則でサニタイズされる**: name/kind/values/pattern/desc の禁止文字 + 長さ上限違反時は warn + args 全体を null（登録自体は成功。null=JSON から args 省略 / 空 slice=`"args":[]` は区別される）。pixie は全登録 action にシグネチャを付与（`stroke`=variadic 座標列 / `set_tool`=enum / `set_color`=hex pattern / path 系 等）。
 
-- **実行モデル**: 非 step（inject/snapshot/digest/action）は即実行（inject は当該フレームに注入、snapshot/digest は直近 present 済みフレーム / audio tap を読む）。`step N` が pollEvents を N 回だけ true にしてフレームを進める。live では未消費コマンドが尽きると `pollEvents` が **次の接続を accept/read 待機**（= step 待ちで block）。**live 実表示**では待機中も facade 経由で native `pollEvents()` を短周期（~16ms timeout）で pump し、Wayland ping / macOS window 更新を維持する（TASK-32.6）。**headless live**（`VP_HARNESS_HEADLESS=1`）は compositor 未接続のため pump callback は渡さず、従来通り blocking accept/read。
-- **仮想クロック**: harness 有効時 `getTime()` = `frame_index/60`（getTime 利用アプリの replay を決定論化）。
-- **制約**: 実ウィンドウ生成は `VP_HARNESS_HEADLESS` 未指定時のみ必須（display 必須。macOS は通常 OK、
-  Linux は Xvfb/実セッション）。**`VP_HARNESS_HEADLESS=1` で完全 display-less**（P4, TASK-32.4 実装済み。
+- **実行モデル**: 非 step（inject/snapshot/digest/action/await 即時成立時）は即実行。`step N` は
+  **manual/replay** では pollEvents を N 回 true にしてフレームを駆動し、**free-run** では
+  `frame_index >= X+N` の barrier でアプリの present を待つ。`await` は expect と同じ predicate を
+  frame budget で再評価する（timeout 0=1回）。listen free-run では未消費コマンドが無くてもアプリは
+  自走し、空 drain は listener `poll(0)` 1 回のみ。**manual LISTEN**（`VP_HARNESS_MANUAL_CLOCK=1`）では
+  従来どおり次接続の accept/read で block。**実表示 + manual** では待機中も facade 経由で native
+  `pollEvents()` を短周期 pump（TASK-32.6）。**free-run では NativePump を使わない**（二重 poll 回避）。
+  **headless** は compositor 未接続のため pump callback は渡さない。
+- **仮想クロック**: manual clock 時のみ `getTime()` = `frame_index/60`。free-run は backend 実時刻。
+- **制約**: 実ウィンドウ生成は `VP_HEADLESS` 未指定時のみ必須（display 必須。macOS は通常 OK、
+  Linux は Xvfb/実セッション）。**`VP_HEADLESS=1` で完全 display-less**（P4, TASK-165 実装済み。
   詳細は上記「完全 display-less（P4）」節）。`audio` は RT スレッド実時間依存なので record→replay で
-  digest の bit 一致は非保証（`fb` は仮想クロックで bit 決定論。headless でも同様に bit 決定論で、実測で
+  digest の bit 一致は非保証（`fb` は manual 仮想クロックで bit 決定論。headless でも同様に bit 決定論で、実測で
   headless と非 headless の fb crc も bit 一致）。**ただし audio を伴うアプリ（run-modular / run-patch）は
   fb crc も非決定**（ポート活性 glow・ミニスコープ・可視化帯など RT 実時間依存の描画があり、main 同士の
   連続実行でも crc 不一致を実測。2026-07-15）→ fb crc を回帰オラクルにせず、(a) grid/UI 領域に限定した
@@ -693,12 +708,12 @@ harness live TCP の 1 client として attach し、capabilities から MCP too
 ```bash
 zig build mcp                    # → zig-out/bin/vp-mcp
 # アプリを headless live で起動したうえで:
-VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
 zig-out/bin/vp-mcp --port-file /tmp/vp.port
 # または scripts/mcp --port-file /tmp/vp.port
 ```
 
-- **引数**: `--port` / `--port-file`（drive と同じ優先順位 + env `VP_HARNESS_PORT`/`VP_HARNESS_PORT_FILE`）+ `--out <dir>`（snapshot 出力先。省略時 `$TMPDIR/vp-mcp-<port>`。起動時に絶対化 + mkdir）
+- **引数**: `--port` / `--port-file`（drive と同じ優先順位 + env `VP_HARNESS_LISTEN`（正の値）/`VP_HARNESS_PORT_FILE`）+ `--out <dir>`（snapshot 出力先。省略時 `$TMPDIR/vp-mcp-<port>`。起動時に絶対化 + mkdir）
 - **起動時**: `digest capabilities` を 1 回取り、`"truncated":true` なら起動失敗。tool 表は以後固定（アプリ再起動追従なし）
 - **MCP**: protocolVersion `2025-06-18` 固定 / initialize → notifications/initialized ゲート / tools/list・tools/call・ping / stdout は JSON-RPC のみ（ログは stderr）
 - **tools**: probe → `digest_<name>` / `snapshot_<name>`（path 引数なし。vp-mcp が `--out` 配下の絶対 path を注入）/ action → `<name>`（衝突時 `a_<name>`）
@@ -775,15 +790,13 @@ action 系の上限は `MAX_ACTION_FRAME_BYTES`（4096）。SYNC は big-entry�
 ```bash
 # 起動（port file 出現待ちだけ sleep 可。netsync=9110、port file は workspace の .e2e）
 mkdir -p .e2e
-VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=./.e2e/host.port \
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/host.port \
   VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
-VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE=./.e2e/client.port \
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/client.port \
   VP_NETSYNC_CONNECT=127.0.0.1:9110 zig build run-pixie &
 
-# client join 完了: awaiting_sync=0 まで再照合。
-# ⚠ headless live の host は accept 待ちで netsync pump が止まるため、host にも step を混ぜること
-# （client 単独の until だと join SYNC が永遠に届かない。2026-07-17 実測）。
-until scripts/drive --port-file ./.e2e/host.port 'step 1' >/dev/null; scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+# client join 完了: free-run では host への step 注入不要。await で一接続保持して待つ。
+scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
 
 # 共有 layer を1枚増やし、host/client が別 layer を選ぶ（select_layer は local_only）。
 scripts/drive --port-file ./.e2e/host.port 'action add_layer'

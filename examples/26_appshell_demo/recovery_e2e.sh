@@ -58,7 +58,7 @@ APP_BIN="$PREFIX/bin/example_26_appshell_demo"
 test -x "$APP_BIN"
 
 VP_APPSHELL_DIR="$APP_DIR" \
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_HARNESS_SCRIPT="$CRASH_SCRIPT" \
 VP_HARNESS_OUT="$OUT_DIR/crash" \
 "$APP_BIN" >"$CRASH_LOG" 2>&1 &
@@ -81,7 +81,7 @@ set -e
 test "$crash_status" -ne 0
 
 VP_APPSHELL_DIR="$APP_DIR" \
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_HARNESS_SCRIPT="$RECOVER_SCRIPT" \
 VP_HARNESS_OUT="$OUT_DIR/recover" \
 "$APP_BIN" >"$RECOVER_LOG" 2>&1
@@ -96,7 +96,7 @@ residual=$(find "$APP_DIR/autosave" -type f -name '*.autosave' -print -quit 2>/d
 test -z "$residual"
 
 VP_APPSHELL_DIR="$APP_DIR" \
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_HARNESS_SCRIPT="$SAVE_SCRIPT" \
 VP_HARNESS_OUT="$OUT_DIR/save" \
 "$APP_BIN" >"$SAVE_LOG" 2>&1
@@ -105,7 +105,7 @@ residual=$(find "$APP_DIR/autosave" -type f -name '*.autosave' -print -quit 2>/d
 test -z "$residual"
 
 VP_APPSHELL_DIR="$APP_DIR" \
-VP_HARNESS_HEADLESS=1 \
+VP_HEADLESS=1 \
 VP_HARNESS_SCRIPT="$DISCARD_SCRIPT" \
 VP_HARNESS_OUT="$OUT_DIR/discard" \
 "$APP_BIN" >"$DISCARD_LOG" 2>&1

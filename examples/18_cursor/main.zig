@@ -7,7 +7,7 @@
 //!   - 0: hidden（非表示）
 //!
 //! 実際のOSカーソル形状はframebufferに写らないため、状態ごとに背景色も変える。これにより
-//! headless replay（VP_HARNESS_HEADLESS）でも「setCursor呼び出しを含む状態遷移がクラッシュせず
+//! headless replay（VP_HEADLESS）でも「setCursor呼び出しを含む状態遷移がクラッシュせず
 //! 動作する」ことを fb digest で確認できる（AC#3 の自動化可能な範囲）。OSカーソルの実際の見た目
 //! （矢印/十字/非表示）は手動目視で確認する（AC#2。ヘッドレスでは検証不可）。
 //!

@@ -2,7 +2,7 @@
 # float 値は probe 実装後に実測焼き込み（手計算と一致確認済み）。
 # 実行例:
 #   TMPD=$(mktemp -d)
-#   VP_HARNESS_HEADLESS=1 VP_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
+#   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_34
 # snapshot は path 省略 → $VP_HARNESS_OUT/frame_<n>.png
 

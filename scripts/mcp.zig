@@ -1,6 +1,6 @@
-//! vp-mcp: harness live TCP ↔ stdio MCP server（TASK-88.2）。
+//! vp-mcp: harness listen TCP ↔ stdio MCP server（TASK-88.2）。
 //!
-//! 起動済みアプリ（`VP_HARNESS_LIVE=1`）へ attach し、capabilities から MCP tools を動的生成する。
+//! 起動済みアプリ（`VP_HARNESS_LISTEN`）へ attach し、capabilities から MCP tools を動的生成する。
 //! 純 std + `std.Io.net` のみ（platform/audio 非依存・module import なし）。
 //!
 //! 使い方:
@@ -55,11 +55,14 @@ pub fn main(init: std.process.Init) !void {
 
     const port: u16 = port_opt orelse blk: {
         if (port_file) |pf| break :blk try readPortFile(io, gpa, pf);
-        if (init.environ_map.get("VP_HARNESS_PORT")) |pe| {
-            break :blk std.fmt.parseInt(u16, pe, 10) catch return die("VP_HARNESS_PORT の値が不正です\n");
+        if (init.environ_map.get("VP_HARNESS_LISTEN")) |pe| {
+            const trimmed = std.mem.trim(u8, pe, " \t");
+            if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "0")) {
+                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN の値が不正です\n");
+            }
         }
         if (init.environ_map.get("VP_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
-        return die("port が不明です（--port / --port-file / VP_HARNESS_PORT / VP_HARNESS_PORT_FILE のいずれかを指定）\n");
+        return die("port が不明です（--port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE のいずれかを指定）\n");
     };
 
     const out_arg = out_opt orelse blk: {
