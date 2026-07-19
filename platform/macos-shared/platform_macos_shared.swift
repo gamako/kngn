@@ -717,7 +717,12 @@ final class PlatformIMEState {
         } else {
             str = ""
         }
-        if replacementRange.location != NSNotFound {
+        // TASK-159: 有効な replacementRange は同一 marked session で一度だけ latch する。
+        // 候補窓操作中の後続 setMarkedText（NSNotFound、または caret/零長の別 range）で
+        // pending を上書きすると、確定 insertText が純挿入になり元テキストが二重化する。
+        // クリアは unmarkText / insertText 完了 / cancel(!wasEmpty の空 mark) /
+        // setTextInputActive(false) / document access 解除のみ。
+        if replacementRange.location != NSNotFound && !hasPendingReplacement {
             hasPendingReplacement = true
             pendingReplacement = replacementRange
         }
@@ -731,8 +736,10 @@ final class PlatformIMEState {
         if markedTextStorage.length == 0 {
             compositionLen = 0
             compositionCursor = 0
-            clearPendingReplacement()
+            // 空 mark: 既存 session の cancel のみ pending 破棄。
+            // wasEmpty（range だけ先に latch するパターン）では保持する。
             if !wasEmpty {
+                clearPendingReplacement()
                 pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
             }
             return
@@ -803,8 +810,13 @@ final class PlatformIMEState {
     }
 
     func resolveReplacementRange(_ replacementRange: NSRange) -> NSRange {
-        if replacementRange.location != NSNotFound { return replacementRange }
+        // 優先順: 明示（length>0）→ pending → 明示（length==0 / caret）→ selected。
+        // TASK-159: insertText が caret 零長を明示しても、再変換 latch 済み pending を優先する。
+        if replacementRange.location != NSNotFound && replacementRange.length > 0 {
+            return replacementRange
+        }
         if hasPendingReplacement { return pendingReplacement }
+        if replacementRange.location != NSNotFound { return replacementRange }
         if docAccessEnabled, let getSel = docAccessCallbacks.get_selected_range {
             var pr = PlatformTextInputRange()
             if getSel(docAccessUserdata, &pr), pr.location != UInt64.max {
