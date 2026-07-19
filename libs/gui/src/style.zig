@@ -35,6 +35,9 @@ pub const Style = struct {
     button_padding: [4]i32 = .{ 4, 8, 4, 8 },
     button_border: i32 = 1,
     button_border_selected: i32 = 2,
+    /// selected 時の塗り（held/hover より優先度低。深い青で normal と高コントラスト、
+    /// かつ held(bg_active=明るい青) と区別できる別トーン。TASK-155）
+    button_bg_selected: Color = Color.rgba(0x24, 0x48, 0x7A, 0xFF),
     // Slider（TASK-21.9）。サイズ系は i32、描画時に u32 へ cast。
     slider_track_w: i32 = 120,
     slider_track_h: i32 = 6,
@@ -86,4 +89,7 @@ test "defaultStyle: text は白（21.4 までの label 既定色と互換）" {
     try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.text);
     try std.testing.expect(s.swatch_border_selected > s.swatch_border);
     try std.testing.expect(s.button_border_selected > s.button_border);
+    // selected 背景は深い青（normal と高コントラスト・held(bg_active) とは別トーンで区別可能。TASK-155）
+    try std.testing.expectEqual(Color.rgba(0x24, 0x48, 0x7A, 0xFF), s.button_bg_selected);
+    try std.testing.expect(!std.meta.eql(s.bg_active, s.button_bg_selected));
 }

@@ -86,7 +86,8 @@ pub const ButtonOpts = struct {
     min_w: i32 = 0,
     /// null なら style.button_padding
     padding: ?[4]i32 = null,
-    /// 選択中表示（太枠 = style.button_border_selected）。ツール選択のトグル表示用
+    /// 選択中表示（accent 背景 + 太枠）。ツール選択のトグル表示用。
+    /// 描画優先: held > hover > selected > normal（TASK-155）。
     selected: bool = false,
 };
 
@@ -132,8 +133,16 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    const bg = if (result.held) style.bg_active else if (hot) style.bg_hover else style.bg;
-    const border_color = if (hot) style.border_hover else style.border;
+    // held > hover > selected > normal（TASK-155: selected に accent 塗りを足す）
+    const bg = if (result.held)
+        style.bg_active
+    else if (hot)
+        style.bg_hover
+    else if (opts.selected)
+        style.button_bg_selected
+    else
+        style.bg;
+    const border_color = if (hot or opts.selected) style.border_hover else style.border;
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
     const pad = opts.padding orelse style.button_padding;
     // min_w 指定時は固定幅フォント（measure = 8×len）前提で呼び出し時に幅を確定できる
@@ -201,7 +210,8 @@ pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
 // ── iconButton（TASK-145.1）────────────────────────────────
 // 16x16 1bit アイコン付き選択トグルボタン。描画は custom leaf（ColorSwatch 半透明経路と同型）。
 // 1bit mask を各行の連続 set bit ごとに不透明 rectFilled run へ変換（透明 pixel は書かない）。
-// selected は枠厚のみ（button_border_selected）。背景は held>hot>normal = bg_active>bg_hover>bg。
+// selected は accent 背景 + 太枠（button_bg_selected / button_border_selected + border_hover）。
+// 背景優先: held > hot > selected > normal = bg_active > bg_hover > button_bg_selected > bg（TASK-155）。
 
 /// 16 行の 1bit アイコン。各 `u16` が 1 行、bit15=左端・bit0=右端。
 pub const IconBitmap = []const u16;
@@ -220,8 +230,16 @@ pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) But
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    const bg = if (result.held) style.bg_active else if (hot) style.bg_hover else style.bg;
-    const border_color = if (hot) style.border_hover else style.border;
+    // held > hover > selected > normal（buttonId と同じ契約）
+    const bg = if (result.held)
+        style.bg_active
+    else if (hot)
+        style.bg_hover
+    else if (selected)
+        style.button_bg_selected
+    else
+        style.bg;
+    const border_color = if (hot or selected) style.border_hover else style.border;
     const thickness = if (selected) style.button_border_selected else style.button_border;
     const pad = style.button_padding;
     const w = icon_px + pad[1] + pad[3];
@@ -2117,7 +2135,7 @@ test "colorSwatch: selected の太枠が pixel で判別できる（AC#4）" {
     try std.testing.expectEqual(fill_u, pixels[my_sel * 100 + @as(u32, @intCast(unsel.x + 1))]);
 }
 
-test "button: selected の太枠が pixel で判別できる（AC#4）" {
+test "button: selected の太枠と accent 背景が pixel で判別できる（TASK-155）" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2135,13 +2153,18 @@ test "button: selected の太枠が pixel で判別できる（AC#4）" {
 
     const sel = ctx.getNodeRect(ctx.id_stack.make("Pen")).?;
     const unsel = ctx.getNodeRect(ctx.id_stack.make("Eraser")).?;
+    const border_hover_u: u32 = @bitCast(ctx.style.border_hover);
     const border_u: u32 = @bitCast(ctx.style.border);
     const bg_u: u32 = @bitCast(ctx.style.bg);
+    const sel_bg_u: u32 = @bitCast(ctx.style.button_bg_selected);
     const ys: u32 = @intCast(sel.y + @as(i32, @intCast(sel.h / 2)));
     const yu: u32 = @intCast(unsel.y + @as(i32, @intCast(unsel.h / 2)));
 
-    // selected（厚さ2）: x+1 も枠色 / 非 selected（厚さ1）: x+1 は bg
-    try std.testing.expectEqual(border_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
+    // selected: 太枠(border_hover)×2 + accent 塗り / 非 selected: 通常枠×1 + bg
+    try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x))]);
+    try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
+    try std.testing.expectEqual(sel_bg_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 2))]);
+    try std.testing.expectEqual(border_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x))]);
     try std.testing.expectEqual(bg_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x + 1))]);
 }
 
@@ -2234,7 +2257,7 @@ test "iconButtonId: 初回 frame で rect cache が生成される" {
     try std.testing.expectEqual(@as(u32, @intCast(16 + pad[0] + pad[2])), r.h);
 }
 
-test "iconButton: selected と non-selected の枠厚が pixel で区別できる" {
+test "iconButton: selected と non-selected の枠・背景が pixel で区別できる（TASK-155）" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2252,13 +2275,18 @@ test "iconButton: selected と non-selected の枠厚が pixel で区別でき�
 
     const sel = ctx.getNodeRect(1).?;
     const unsel = ctx.getNodeRect(2).?;
+    const border_hover_u: u32 = @bitCast(ctx.style.border_hover);
     const border_u: u32 = @bitCast(ctx.style.border);
     const bg_u: u32 = @bitCast(ctx.style.bg);
+    const sel_bg_u: u32 = @bitCast(ctx.style.button_bg_selected);
     const ys: u32 = @intCast(sel.y + @as(i32, @intCast(sel.h / 2)));
     const yu: u32 = @intCast(unsel.y + @as(i32, @intCast(unsel.h / 2)));
 
-    // selected（厚さ2）: x+1 も枠色 / 非 selected（厚さ1）: x+1 は bg
-    try std.testing.expectEqual(border_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
+    // selected: 太枠(border_hover)×2 + accent 塗り / 非 selected: 通常枠×1 + bg
+    try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x))]);
+    try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
+    try std.testing.expectEqual(sel_bg_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 2))]);
+    try std.testing.expectEqual(border_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x))]);
     try std.testing.expectEqual(bg_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x + 1))]);
 }
 

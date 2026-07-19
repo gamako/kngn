@@ -2806,6 +2806,17 @@ const App = struct {
         return LAYERS_CHROME_FALLBACK;
     }
 
+    /// Layers body 外側幅（panel wrap の前フレーム rect.w − 余白）。
+    /// Collapsible body は width=.fit のため .fixed 注入する（grow-in-fit collapse 回避。TASK-155 / TASK-149.1 踏襲）。
+    /// 高さの panelRect 再注入はしない（内容高に縮む鶏卵。幅のみ読む）。
+    fn layersBodyAvail(self: *const App, ctx: *const gui.Context) i32 {
+        if (self.panel_host.panelRect(ctx, PanelNames.layers)) |r| {
+            return @max(1, @as(i32, @intCast(r.w)) - 16);
+        }
+        // 初回フレーム等: rect 未確定 → right slot extent ベース
+        return @max(1, self.panel_host.slotExtent(.right) - 24);
+    }
+
     /// Layers ScrollArea の固定高。
     ///
     /// 方針（TASK-148.3 Critical 修正）: Tool Options 等の他セクション natural 高を優先し、
@@ -5285,8 +5296,21 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32, cw: usize, ch: usize) v
 }
 
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
+    // Collapsible body は fit のため、panel wrap 前フレーム幅を .fixed 注入（TASK-155 / TASK-149.1）。
+    const outer_w = app.layersBodyAvail(ctx);
+    const body_pad: i32 = 2;
+    const content_w = @max(1, outer_w - body_pad * 2);
+
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .fixed = outer_w },
+        .gap = 4,
+        .padding = .{ body_pad, body_pad, body_pad, body_pad },
+    });
+    defer ctx.endBox();
+
     // toolbar は scroll 外（常に操作可能。TASK-148.3）
-    ctx.beginBox(.{ .direction = .row, .gap = 4 });
+    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = content_w }, .gap = 4 });
     // TASK-94 Phase C: netsync 中は routeAction（#id）、solo は do* 直呼び。
     if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) {
         if (platform.netsyncActive()) app.routeUi("add_layer", "") else _ = app.doAddLayer() catch {};
@@ -5306,8 +5330,9 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.endBox();
 
     app.updateLayersViewportHeight(ctx);
+    // ScrollArea viewport は content 幅に固定し、row が body 実幅へ伸びるよう content_width=.grow を維持。
     ctx.beginScrollArea(LAYERS_SCROLL_ID, &app.layers_scroll, .{
-        .width = .{ .grow = 1 },
+        .width = .{ .fixed = content_w },
         .height = .{ .fixed = app.layers_viewport_h },
         .padding = .{ 0, 2, 0, 2 },
         .gap = 2,
@@ -5320,16 +5345,30 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         rev -= 1;
         const idx = rev;
         const layer = app.canvas.layers.items[idx];
-        // 1 行 = [サムネイル][選択 L{d}][visible][opacity slider]。行高はサムネイル(24px)律速。
-        // 横一列で 200px 幅に収め、行を低く保って縦方向に多くの layer を見せる。
+        // 1 行 = [サムネイル][名前][V/H][opacity slider]。行高はサムネイル(24px)律速。
+        // width=.grow で ScrollArea content 実幅いっぱいへ伸ばし、選択背景が行全体に乗る（TASK-155）。
         // 明示 ID（row_id）を付けて rect_cache に登録する（右クリックのヒットテスト用。TASK-79.2）。
         const row_id = layerWidgetId(idx, LAYER_ROW_PART_ROW);
-        ctx.beginBox(.{ .id = row_id, .direction = .row, .gap = 3, .align_cross = .center });
+        const selected = idx == app.canvas.selected_layer;
+        const row_bg: ?gui.Color = if (selected) ctx.style.button_bg_selected else null;
+        const row_border: ?gui.Border = if (selected)
+            .{ .color = ctx.style.border_hover, .thickness = 1 }
+        else
+            null;
+        ctx.beginBox(.{
+            .id = row_id,
+            .direction = .row,
+            .width = .{ .grow = 1 },
+            .gap = 3,
+            .align_cross = .center,
+            .bg = row_bg,
+            .border = row_border,
+        });
 
         // サムネイル: raw layer をチェッカー下地へ縮小合成。選択中は枠を明色に。
         const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("layer thumb: OOM");
         fillLayerThumb(thumb, layer.pixels, app.doc.width, app.doc.height);
-        const thumb_border = if (idx == app.canvas.selected_layer) ctx.style.border_hover else ctx.style.border;
+        const thumb_border = if (selected) ctx.style.border_hover else ctx.style.border;
         ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
 
         // レイヤー名表示（TASK-79.3）。renaming 中の対象行だけ確定前バッファ+カーソルを表示する。
@@ -5360,10 +5399,11 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
             ctx.endBox();
         } else {
             const shown = truncateForDisplay(ctx.allocator(), layer.name(), LAYER_NAME_DISPLAY_MAX);
-            if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = idx == app.canvas.selected_layer, .min_w = 28 }).clicked) {
+            if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = selected, .min_w = 28 }).clicked) {
                 app.doSelectLayer(idx) catch {};
             }
         }
+        // V=visible ON（selected accent）/ H=hidden OFF（通常背景）。状態は色+文字の両方で判別（TASK-155）。
         const vis_label: []const u8 = if (layer.visible) "V" else "H";
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
             if (platform.netsyncActive()) app.routeUiLayerVisible(idx, !layer.visible) else app.doToggleLayerVisible(idx);
