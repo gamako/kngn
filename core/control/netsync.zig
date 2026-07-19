@@ -820,6 +820,34 @@ var next_proposal_id: u32 = 0;
 
 var shared_executor: ?*command.Executor = null;
 
+/// TASK-163: COMMIT 適用成功後の汎用 post-apply hook（opaque ctx + raw name/args/actor/seq のみ）。
+/// framework は history/PaintDiff/Pixie を解釈しない。未登録時は no-op（bit 同一）。
+pub const PostApplyContext = struct {
+    name: []const u8,
+    args: []const u8,
+    origin_peer: u32,
+    seq: u64,
+};
+pub const PostApplyHook = *const fn (ctx: *anyopaque, applied: PostApplyContext) void;
+var post_apply_hook: ?PostApplyHook = null;
+var post_apply_ctx: ?*anyopaque = null;
+
+pub fn setPostApplyHook(ctx: ?*anyopaque, hook: ?PostApplyHook) void {
+    post_apply_ctx = ctx;
+    post_apply_hook = hook;
+}
+
+fn callPostApplyHook(name: []const u8, args: []const u8, origin_peer: u32, seq: u64) void {
+    const hook = post_apply_hook orelse return;
+    const ctx = post_apply_ctx orelse return;
+    hook(ctx, .{
+        .name = name,
+        .args = args,
+        .origin_peer = origin_peer,
+        .seq = seq,
+    });
+}
+
 /// session 開始/終了の通知（copilot operate 拒否用。platform が登録。netsync→copilot 逆 import なし）。
 /// **main thread のみ**（enableRouter / clearRouterMain / pump の router_clear。wire_session と同地点）。
 pub const SessionStateCallback = *const fn (active: bool) void;
@@ -1808,9 +1836,14 @@ fn applyWireCommit(name: []const u8, args: []const u8, origin_peer: u32, seq: u6
             .source = .{ .remote_commit = .{ .seq = seq, .pending_local_meta = pending_meta } },
             .record_policy = .record,
         }, buf);
+        // TASK-163: execute 成功かつ record/seq 確定後に post-apply hook を 1 回だけ。
+        // TASK-162 の chunk も 1 COMMIT=1 execute のままここを通る（二重 capture なし）。
+        if (res.seq) |applied_seq| {
+            callPostApplyHook(name, args, origin_peer, applied_seq);
+        }
         return res.output;
     }
-    // executor 未設定: 62.3.2 fallback（記録なし）
+    // executor 未設定: 62.3.2 fallback（記録なし）— hook も呼ばない
     return action_registry.dispatch(name, args, buf);
 }
 
@@ -2793,6 +2826,13 @@ pub fn testAwaitingSync() bool {
 
 /// テスト用: client pending queue 件数（PROPOSE/PROPOSE_REVERT 待ち）。
 pub fn testPendingCount() usize {
+    return pending_count;
+}
+
+/// client の outbound proposal 待ち件数（read-only。TASK-162 chunk drain 用）。
+/// digest の `pending` と同値。host / netsync 無効時は 0。
+pub fn pendingProposalCount() usize {
+    if (!isEnabled() or !isClient()) return 0;
     return pending_count;
 }
 

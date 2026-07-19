@@ -754,6 +754,11 @@ pub const netsyncActive = netsync.isEnabled;
 /// このプロセスが netsync host か（TASK-106.1 pattern_state 配信判定）。
 pub const netsyncIsHost = netsync.isHost;
 
+/// client の outbound proposal 待ち件数（TASK-162 chunk drain。host/無効時は 0）。
+pub const netsyncPendingProposalCount = netsync.pendingProposalCount;
+/// client proposal 待ち行列容量（TASK-162: release 時一括 PROPOSE の上限判定）。
+pub const netsyncPendingCap = netsync.PENDING_CAP;
+
 /// 接続中 peer 数（host=active client 数 / client=自分のみ）。generic 透過 facade。
 pub const netsyncPeerCount = netsync.peerCount;
 
@@ -762,6 +767,14 @@ pub const netsyncPeerCount = netsync.peerCount;
 pub fn commitHostAction(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     if (!netsync.isEnabled() or !netsync.isHost()) return error.NotHost;
     return netsync.commitAndBroadcast(name, args, buf);
+}
+
+/// TASK-163: netsync COMMIT 適用後の汎用 post-apply hook（opaque ctx + raw 情報のみ）。
+/// 未登録 / netsync 無効時は no-op。App 解放前に `setNetsyncPostApplyHook(null, null)` で解除する。
+pub const NetsyncPostApplyContext = netsync.PostApplyContext;
+pub const NetsyncPostApplyHook = netsync.PostApplyHook;
+pub fn setNetsyncPostApplyHook(ctx: ?*anyopaque, hook: ?NetsyncPostApplyHook) void {
+    netsync.setPostApplyHook(ctx, hook);
 }
 
 /// action を netsync router 経由で実行（router 未設定時は dispatch 等価）。

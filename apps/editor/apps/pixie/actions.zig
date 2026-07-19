@@ -280,6 +280,31 @@ pub const Point = struct { x: i32, y: i32 };
 /// stroke action の点列上限（呼び出し側がこのサイズの固定長スタックバッファを用意する）。
 pub const MAX_STROKE_POINTS: usize = 256;
 
+/// netsync relay 用 wire 点列の 1 chunk 上限（TASK-162）。
+/// `MAX_STROKE_POINTS` より小さく、worst-case 座標でも `MAX_CMD_ARGS`/action frame（4096B）に収まるよう
+/// 128 を採る（brush head + `segment=continuation` + i32 最悪座標 × N + commit framing）。
+/// 下の comptime は std のみのため 4096 リテラルで自己検査。実定数との drift guard は
+/// `apps/editor/apps/pixie/main.zig` が `platform.command.MAX_CMD_ARGS` に対して持つ。
+pub const RELAY_STROKE_CHUNK_POINTS: usize = 128;
+
+comptime {
+    // commit framing: 12B header + "stroke " + args。propose は 4B+name でより緩い。
+    const commit_framing = 12 + "stroke ".len;
+    const worst_head =
+        "layer=#18446744073709551615 tool=brush color=FFFFFF size=64 opacity=255 hardness=255 segment=continuation".len;
+    const worst_point = " -2147483648 -2147483648".len;
+    const worst_args = worst_head + RELAY_STROKE_CHUNK_POINTS * worst_point;
+    if (commit_framing + worst_args > 4096) {
+        @compileError("RELAY_STROKE_CHUNK_POINTS is too large for MAX_ACTION_FRAME_BYTES");
+    }
+    if (worst_args > 4096) {
+        @compileError("RELAY_STROKE_CHUNK_POINTS is too large for MAX_CMD_ARGS");
+    }
+    if (RELAY_STROKE_CHUNK_POINTS > MAX_STROKE_POINTS) {
+        @compileError("RELAY_STROKE_CHUNK_POINTS must fit parseStroke's MAX_STROKE_POINTS buffer");
+    }
+}
+
 /// "x0 y0 x1 y1 ..." → `buf` に詰めて borrowed slice を返す（allocator を取らない・所有権移動なし）。
 /// 偶数個必須（奇数個は `error.OddPointCount`）。0個は `error.Empty`。`buf.len` 超過は `error.TooManyPoints`。
 pub fn parseStrokePoints(args: []const u8, buf: []Point) ParseError![]Point {
@@ -308,6 +333,10 @@ pub fn parseStrokePoints(args: []const u8, buf: []Point) ParseError![]Point {
 /// stroke で latch できるツール（bezier/select 等の独立経路ツールは対象外）。
 pub const StrokeTool = enum { pen, eraser, brush };
 
+/// relay chunk の境界メタ（TASK-162）。省略時 / `first` = 通常 stroke（始点 stamp）。
+/// `continuation` = 前 chunk 終点の carry から始まり、始点は stamp しない。
+pub const StrokeSegment = enum { first, continuation };
+
 /// brush size の上限（`paint.Brush.MAX_SIZE` と同値。actions.zig は std のみのため独立定義し、
 /// 乖離は main.zig の comptime 検査で防ぐ）。
 pub const MAX_BRUSH_SIZE: u32 = 64;
@@ -320,6 +349,7 @@ pub const StrokeParams = struct {
     size: ?u32 = null, // 1..MAX_BRUSH_SIZE
     opacity: ?u8 = null, // 0..255
     hardness: ?u8 = null, // 0..255（Brush.hardness_q と同スケール）
+    segment: ?StrokeSegment = null, // null/first = 通常。continuation = no-stamp 始点
 };
 
 pub const StrokeArgs = struct { params: StrokeParams, points: []Point };
@@ -355,6 +385,9 @@ pub fn parseStroke(args: []const u8, buf: []Point) ParseError!StrokeArgs {
             } else if (std.mem.eql(u8, key, "hardness")) {
                 if (params.hardness != null) return error.DuplicateKey;
                 params.hardness = std.fmt.parseUnsigned(u8, val, 10) catch return error.InvalidNumber;
+            } else if (std.mem.eql(u8, key, "segment")) {
+                if (params.segment != null) return error.DuplicateKey;
+                params.segment = std.meta.stringToEnum(StrokeSegment, val) orelse return error.UnknownKey;
             } else {
                 return error.UnknownKey;
             }
@@ -387,12 +420,15 @@ pub const EffectiveStroke = struct {
     size: u32,
     opacity: u8,
     hardness: u8,
+    /// TASK-162: `first` は wire に出さない（後方互換）。`continuation` のみ明示する。
+    segment: StrokeSegment = .first,
 };
 
 /// canonical な自己完結 stroke args を生成する（TASK-62.5.3 §5c'。UI 記録と agent 経路が共有）。
 /// ツールに意味のある key を**ちょうど一度だけ**含む: pen=tool,color / eraser=tool /
 /// brush=tool,color,size,opacity,hardness。`parseStroke` で round-trip 可能（記録された全
 /// stroke record が状態非依存に再実行できる）。buf に収まらなければ `error.TooLong`。
+/// TASK-162: `segment=continuation` は continuation chunk のみ追記（`first`/省略は従来と同じ）。
 pub fn formatCanonicalStroke(buf: []u8, eff: EffectiveStroke, points: []const Point) error{TooLong}![]const u8 {
     var len: usize = 0;
     const head = switch (eff.tool) {
@@ -403,6 +439,10 @@ pub fn formatCanonicalStroke(buf: []u8, eff: EffectiveStroke, points: []const Po
         }) catch return error.TooLong,
     };
     len += head.len;
+    if (eff.segment == .continuation) {
+        const seg = std.fmt.bufPrint(buf[len..], " segment=continuation", .{}) catch return error.TooLong;
+        len += seg.len;
+    }
     for (points) |p| {
         const part = std.fmt.bufPrint(buf[len..], " {d} {d}", .{ p.x, p.y }) catch return error.TooLong;
         len += part.len;
@@ -1098,6 +1138,63 @@ test "parseStroke: layer ref は optional で round-trip、legacy は省略を�
     try testing.expectEqual(LayerRef{ .id = 42 }, with_layer.params.layer.?);
     const legacy = try parseStroke("1 2", &points);
     try testing.expect(legacy.params.layer == null);
+}
+
+test "parseStroke/formatCanonicalStroke: segment=continuation round-trip（省略は first）" {
+    var buf: [MAX_STROKE_POINTS]Point = undefined;
+    const legacy = try parseStroke("tool=pen color=FF0000 1 2 3 4", &buf);
+    try testing.expect(legacy.params.segment == null);
+
+    const cont = try parseStroke("layer=#7 tool=pen color=FF0000 segment=continuation 10 10 20 20", &buf);
+    try testing.expectEqual(StrokeSegment.continuation, cont.params.segment.?);
+    try testing.expectEqual(@as(usize, 2), cont.points.len);
+
+    try testing.expectError(error.DuplicateKey, parseStroke("segment=first segment=continuation 1 1", &buf));
+    try testing.expectError(error.UnknownKey, parseStroke("segment=middle 1 1", &buf));
+
+    var out: [512]u8 = undefined;
+    const first_args = try formatCanonicalStroke(&out, .{
+        .layer_id = 7,
+        .tool = .pen,
+        .color = 0xFFFF0000,
+        .size = 1,
+        .opacity = 255,
+        .hardness = 255,
+        .segment = .first,
+    }, cont.points);
+    try testing.expectEqualStrings("layer=#7 tool=pen color=FF0000 10 10 20 20", first_args);
+
+    const cont_args = try formatCanonicalStroke(&out, .{
+        .layer_id = 7,
+        .tool = .pen,
+        .color = 0xFFFF0000,
+        .size = 1,
+        .opacity = 255,
+        .hardness = 255,
+        .segment = .continuation,
+    }, cont.points);
+    try testing.expectEqualStrings("layer=#7 tool=pen color=FF0000 segment=continuation 10 10 20 20", cont_args);
+    const rt = try parseStroke(cont_args, &buf);
+    try testing.expectEqual(StrokeSegment.continuation, rt.params.segment.?);
+}
+
+test "RELAY_STROKE_CHUNK_POINTS: worst-case brush continuation が 4096 内" {
+    var pts: [RELAY_STROKE_CHUNK_POINTS]Point = undefined;
+    for (&pts, 0..) |*p, i| {
+        p.* = .{ .x = std.math.minInt(i32), .y = if (i % 2 == 0) std.math.maxInt(i32) else std.math.minInt(i32) };
+    }
+    var out: [4096]u8 = undefined;
+    const args = try formatCanonicalStroke(&out, .{
+        .layer_id = std.math.maxInt(u64),
+        .tool = .brush,
+        .color = 0xFFFFFFFF,
+        .size = MAX_BRUSH_SIZE,
+        .opacity = 255,
+        .hardness = 255,
+        .segment = .continuation,
+    }, &pts);
+    try testing.expect(args.len <= 4096);
+    try testing.expect(args.len + "stroke ".len + 12 <= 4096);
 }
 
 // ── TASK-90 パーサ ─────────────────────────────────────────

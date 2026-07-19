@@ -133,6 +133,13 @@ pub const StrokeRecorder = struct {
         self.pp_hist_len = 0;
     }
 
+    /// continuation chunk 用: `begin` 相当 + `last` だけ設定し、始点は stamp しない（TASK-162）。
+    /// 画素ループは走らない。chunk action 開始時のイベント境界のみ。
+    pub fn beginAt(self: *StrokeRecorder, layer_idx: usize, color: u32, x: i32, y: i32) void {
+        self.begin(layer_idx, color);
+        self.last = .{ .x = x, .y = y };
+    }
+
     /// 1 画素の塗り + diff 記録（対称・pixel_perfect なしの素の path）。
     fn plotOne(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
         if (x < 0 or y < 0) return;
@@ -287,6 +294,37 @@ pub const StrokeRecorder = struct {
         self.last = .{ .x = x, .y = y };
     }
 
+    /// continuation 境界用: `lineTo` と同経路だが始点 (`last`) は塗らない（TASK-162）。
+    pub fn lineToContinue(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32) void {
+        std.debug.assert(self.mode == .replace);
+        const x0 = self.last.x;
+        const y0 = self.last.y;
+        if (x0 == x and y0 == y) return;
+        var cx = x0;
+        var cy = y0;
+        const dx: u32 = @abs(x - x0);
+        const dy: u32 = @abs(y - y0);
+        const sx: i32 = if (x0 < x) 1 else -1;
+        const sy: i32 = if (y0 < y) 1 else -1;
+        var err: i32 = @as(i32, @intCast(dx)) - @as(i32, @intCast(dy));
+        var first = true;
+        while (true) {
+            if (!first) self.point(canvas, gpa, cx, cy);
+            first = false;
+            if (cx == x and cy == y) break;
+            const e2 = 2 * err;
+            if (e2 > -@as(i32, @intCast(dy))) {
+                err -= @as(i32, @intCast(dy));
+                cx += sx;
+            }
+            if (e2 < @as(i32, @intCast(dx))) {
+                err += @as(i32, @intCast(dx));
+                cy += sy;
+            }
+        }
+        self.last = .{ .x = x, .y = y };
+    }
+
     /// stroke を確定する。変更ピクセルが無ければ null（redo を保持するため）。
     /// 非 null の場合、diffs の所有権は返す PaintDiff へ移る（呼び出し側が
     /// `Document.pushPaintOp` へそのまま渡す。TASK-45.1）。
@@ -318,6 +356,12 @@ pub const StrokeRecorder = struct {
         self.opacity = opacity;
         self.pp_active = false; // brush では pixel_perfect 無効
         self.sym_active = self.symmetry;
+    }
+
+    /// continuation chunk 用: `brushBegin` + `last` のみ。始点 dab は stamp しない（TASK-162）。
+    pub fn brushBeginAt(self: *StrokeRecorder, layer_idx: usize, color: u32, opacity: u8, x: i32, y: i32) void {
+        self.brushBegin(layer_idx, color, opacity);
+        self.last = .{ .x = x, .y = y };
     }
 
     fn scaleU8(a: u8, b: u8) u8 {
@@ -390,6 +434,37 @@ pub const StrokeRecorder = struct {
         var err: i32 = @as(i32, @intCast(dx)) - @as(i32, @intCast(dy));
         while (true) {
             self.stampWithSymmetry(canvas, gpa, cx, cy, dab);
+            if (cx == x and cy == y) break;
+            const e2 = 2 * err;
+            if (e2 > -@as(i32, @intCast(dy))) {
+                err -= @as(i32, @intCast(dy));
+                cx += sx;
+            }
+            if (e2 < @as(i32, @intCast(dx))) {
+                err += @as(i32, @intCast(dx));
+                cy += sy;
+            }
+        }
+        self.last = .{ .x = x, .y = y };
+    }
+
+    /// continuation 境界用: `stampLineTo` と同経路だが始点 dab は stamp しない（TASK-162）。
+    pub fn stampLineToContinue(self: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, x: i32, y: i32, dab: Dab) void {
+        std.debug.assert(self.mode == .brush);
+        const x0 = self.last.x;
+        const y0 = self.last.y;
+        if (x0 == x and y0 == y) return;
+        var cx = x0;
+        var cy = y0;
+        const dx: u32 = @abs(x - x0);
+        const dy: u32 = @abs(y - y0);
+        const sx: i32 = if (x0 < x) 1 else -1;
+        const sy: i32 = if (y0 < y) 1 else -1;
+        var err: i32 = @as(i32, @intCast(dx)) - @as(i32, @intCast(dy));
+        var first = true;
+        while (true) {
+            if (!first) self.stampWithSymmetry(canvas, gpa, cx, cy, dab);
+            first = false;
             if (cx == x and cy == y) break;
             const e2 = 2 * err;
             if (e2 > -@as(i32, @intCast(dy))) {
@@ -527,6 +602,21 @@ fn countColored(e: *TestEditor, color: u32) usize {
         if (p == color) n += 1;
     }
     return n;
+}
+
+test "StrokeRecorder.beginAt+lineToContinue: 始点は stamp せず線分だけ描く（TASK-162）" {
+    var e = try TestEditor.init(std.testing.allocator, 16, 16);
+    defer e.deinit();
+
+    e.rec.beginAt(0, BLACK, 0, 0);
+    e.rec.lineToContinue(&e.canvas, e.gpa, 5, 0);
+    if (e.rec.finish(e.gpa)) |pd| {
+        e.last_diffs = pd.diffs;
+    }
+    // 始点 (0,0) は塗らず 1..5 の 5px
+    try std.testing.expectEqual(@as(usize, 5), countColored(&e, BLACK));
+    try std.testing.expectEqual(@as(u32, 0), e.pixels()[0]); // (0,0) 未塗布
+    try std.testing.expectEqual(BLACK, e.pixels()[5]); // (5,0)
 }
 
 test "stroke: 対角線で欠けピクセルが無い（Bresenham 期待数 = max(dx,dy)+1）" {

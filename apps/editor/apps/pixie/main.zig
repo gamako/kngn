@@ -64,6 +64,21 @@ comptime {
         @compileError("MAX_BRUSH_SIZE mismatch between actions.zig and paint.Brush");
     }
 }
+// TASK-162: RELAY_STROKE_CHUNK_POINTS の worst-case args が実 MAX_CMD_ARGS に収まること
+// （actions.zig は std のみのため 4096 リテラルで自己検査。ここが drift guard）。
+comptime {
+    const commit_framing = 12 + "stroke ".len;
+    const worst_head =
+        "layer=#18446744073709551615 tool=brush color=FFFFFF size=64 opacity=255 hardness=255 segment=continuation".len;
+    const worst_point = " -2147483648 -2147483648".len;
+    const worst_args = worst_head + actions.RELAY_STROKE_CHUNK_POINTS * worst_point;
+    if (worst_args > platform.command.MAX_CMD_ARGS) {
+        @compileError("RELAY_STROKE_CHUNK_POINTS too large for platform.command.MAX_CMD_ARGS");
+    }
+    if (commit_framing + worst_args > platform.command.MAX_CMD_ARGS) {
+        @compileError("RELAY_STROKE_CHUNK_POINTS too large for action frame (MAX_CMD_ARGS)");
+    }
+}
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
@@ -378,6 +393,13 @@ fn toGuiEventEx(ev: platform.Event, pass_char_input: bool) ?gui.InputEvent {
 }
 
 /// アプリ状態（イベント処理と UI 構築の両方から触る）
+/// TASK-162: relay wire 用の 1 chunk（点列コピー所有。canonical 化は release 時）。
+const RelayStrokeChunk = struct {
+    pts: [actions.RELAY_STROKE_CHUNK_POINTS]actions.Point = undefined,
+    len: usize = 0,
+    continuation: bool = false,
+};
+
 const App = struct {
     /// app_runtime が参照する初期ウィンドウ仕様（TASK-73.1）
     pub const window = .{ .w = WINDOW_W, .h = WINDOW_H, .title = "Pixie" };
@@ -704,6 +726,15 @@ const App = struct {
     ui_stroke_size: u32 = 4,
     ui_stroke_opacity: u8 = 255,
     ui_stroke_hardness: u8 = 255,
+
+    /// TASK-162: netsync relay 専用の wire 点列チャンク（solo は ui_stroke_* のみ。preview は別経路）。
+    /// release 時に全 chunk を同期 PROPOSE するため、跨フレームの send queue は持たない。
+    relay_stroke: bool = false,
+    relay_active_pts: [actions.RELAY_STROKE_CHUNK_POINTS]actions.Point = undefined,
+    relay_active_len: usize = 0,
+    relay_active_continuation: bool = false,
+    /// finalization 済み chunk（drag 中 flush + release 最終分）。要素はコピー所有。
+    relay_chunks: std.ArrayListUnmanaged(RelayStrokeChunk) = .empty,
 
     /// 選択中レイヤーが text kind か（テキストレイヤーへの直接 raster 編集を防ぐガード。
     /// TASK-79.5）。text layer の pixels は「TextParams からの再ラスタライズ結果」という
@@ -1285,6 +1316,16 @@ const App = struct {
         }
     }
 
+    /// TASK-163: netsync `applyWireCommit` post-apply → 既存 `captureHistoryVisual`。
+    /// solo の recordedStroke/recordedAction 経路とは発火点が違うので二重 capture しない。
+    fn netsyncPostApplyHook(ctx: *anyopaque, applied: platform.NetsyncPostApplyContext) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        _ = applied.name;
+        _ = applied.args;
+        _ = applied.origin_peer;
+        self.captureHistoryVisual(applied.seq);
+    }
+
     fn historyVisualMeta(self: *const App, seq: u64) history_summary.VisualMeta {
         const slot: usize = @intCast(seq % platform.command.MAX_CMD_LOG);
         const m = self.history_thumb_meta[slot];
@@ -1357,6 +1398,7 @@ const App = struct {
         };
         var canonical = eff;
         canonical.layer_id = try app.resolveStrokeLayerId(parsed.params.layer);
+        canonical.segment = parsed.params.segment orelse .first;
         return actions.formatCanonicalStroke(scratch, canonical, parsed.points) catch return error.ArgsTooLong;
     }
 
@@ -1370,10 +1412,21 @@ const App = struct {
         self.ui_stroke_size = self.brush.size;
         self.ui_stroke_opacity = self.brush.opacity;
         self.ui_stroke_hardness = self.brush.hardness_q;
-        self.uiStrokeAppend(p);
+        // TASK-162: netsync 中は relay chunking（overflow しない）。solo は従来固定配列。
+        self.relay_stroke = platform.netsyncActive();
+        if (self.relay_stroke) {
+            self.relayResetCapture();
+            self.relayChunkAppend(p);
+        } else {
+            self.uiStrokeAppend(p);
+        }
     }
 
     fn uiStrokeAppend(self: *App, p: core.Vec2) void {
+        if (self.relay_stroke) {
+            self.relayChunkAppend(p);
+            return;
+        }
         if (self.ui_stroke_overflow) return;
         if (self.ui_stroke_len > 0) {
             const last = self.ui_stroke_pts[self.ui_stroke_len - 1];
@@ -1390,6 +1443,161 @@ const App = struct {
     fn uiStrokeDiscard(self: *App) void {
         self.ui_stroke_len = 0;
         self.ui_stroke_overflow = false;
+        if (self.relay_stroke) {
+            self.relayResetCapture();
+            self.relay_stroke = false;
+        }
+    }
+
+    fn relayResetCapture(self: *App) void {
+        self.relay_active_len = 0;
+        self.relay_active_continuation = false;
+        self.relay_chunks.clearRetainingCapacity();
+    }
+
+    fn relayChunkAppend(self: *App, p: core.Vec2) void {
+        const pt: actions.Point = .{ .x = p.x, .y = p.y };
+        if (self.relay_active_len > 0) {
+            const last = self.relay_active_pts[self.relay_active_len - 1];
+            if (last.x == pt.x and last.y == pt.y) return;
+        }
+        if (self.relay_active_len >= actions.RELAY_STROKE_CHUNK_POINTS) {
+            self.relayFlushActiveChunk() catch {
+                std.debug.print("pixie: relay chunk flush OOM — subsequent points may be dropped\n", .{});
+                return;
+            };
+            // flush 後 active は carry 1 点。同一点なら追加しない。
+            if (self.relay_active_len > 0) {
+                const last = self.relay_active_pts[self.relay_active_len - 1];
+                if (last.x == pt.x and last.y == pt.y) return;
+            }
+        }
+        self.relay_active_pts[self.relay_active_len] = pt;
+        self.relay_active_len += 1;
+    }
+
+    fn relayFlushActiveChunk(self: *App) !void {
+        if (self.relay_active_len == 0) return;
+        // continuation で carry のみ（新点なし）は送らない。
+        if (self.relay_active_continuation and self.relay_active_len == 1) {
+            return;
+        }
+        var chunk: RelayStrokeChunk = .{
+            .len = self.relay_active_len,
+            .continuation = self.relay_active_continuation,
+        };
+        @memcpy(chunk.pts[0..self.relay_active_len], self.relay_active_pts[0..self.relay_active_len]);
+        const carry = self.relay_active_pts[self.relay_active_len - 1];
+        try self.relay_chunks.append(self.gpa, chunk);
+        self.relay_active_pts[0] = carry;
+        self.relay_active_len = 1;
+        self.relay_active_continuation = true;
+    }
+
+    /// release 時: 最終 active を chunk 化し、全 chunk の canonical args を `out` に構築する。
+    /// 成功時は `relay_chunks` を空にし、caller が rewind 後に `relaySendCanonicalChunks` する。
+    /// 失敗時は false（preview rewind 禁止）。構築途中の `out` は空に戻す。chunks は触らない
+    /// （caller が abandon する）。
+    fn relayBuildCanonicalChunks(self: *App, out: *std.ArrayListUnmanaged([]u8)) bool {
+        // 最終 active を flush（carry のみ continuation はスキップ）
+        if (self.relay_active_len > 0) {
+            if (!(self.relay_active_continuation and self.relay_active_len == 1)) {
+                var chunk: RelayStrokeChunk = .{
+                    .len = self.relay_active_len,
+                    .continuation = self.relay_active_continuation,
+                };
+                @memcpy(chunk.pts[0..self.relay_active_len], self.relay_active_pts[0..self.relay_active_len]);
+                self.relay_chunks.append(self.gpa, chunk) catch {
+                    self.setSaveMsg("netsync: stroke chunk OOM", .{});
+                    return false;
+                };
+            }
+            self.relay_active_len = 0;
+        }
+        if (self.relay_chunks.items.len == 0) return true;
+
+        // client: pending FIFO に全 chunk を一度に載せられるか（跨 frame drain しないため事前検査）
+        if (!platform.netsyncIsHost()) {
+            const pending = platform.netsyncPendingProposalCount();
+            const avail = if (pending < platform.netsyncPendingCap)
+                platform.netsyncPendingCap - pending
+            else
+                0;
+            if (self.relay_chunks.items.len > avail) {
+                self.setSaveMsg("netsync: stroke too long ({d} chunks > pending avail {d})", .{
+                    self.relay_chunks.items.len,
+                    avail,
+                });
+                return false;
+            }
+        }
+
+        const tool: actions.StrokeTool = switch (self.ui_stroke_tool) {
+            .pen => .pen,
+            .eraser => .eraser,
+            .brush => .brush,
+            else => return false,
+        };
+        const eff: actions.EffectiveStroke = .{
+            .layer_id = self.ui_stroke_layer_id,
+            .tool = tool,
+            .color = self.ui_stroke_color,
+            .size = self.ui_stroke_size,
+            .opacity = self.ui_stroke_opacity,
+            .hardness = self.ui_stroke_hardness,
+        };
+
+        const freeOut = struct {
+            fn call(app: *App, list: *std.ArrayListUnmanaged([]u8)) void {
+                for (list.items) |a| app.gpa.free(a);
+                list.clearRetainingCapacity();
+            }
+        }.call;
+
+        for (self.relay_chunks.items) |chunk| {
+            var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
+            var eff_seg = eff;
+            eff_seg.segment = if (chunk.continuation) .continuation else .first;
+            const canon = actions.formatCanonicalStroke(&canon_buf, eff_seg, chunk.pts[0..chunk.len]) catch {
+                freeOut(self, out);
+                self.setSaveMsg("netsync: stroke args too long", .{});
+                return false;
+            };
+            const owned = self.gpa.dupe(u8, canon) catch {
+                freeOut(self, out);
+                self.setSaveMsg("netsync: stroke args OOM", .{});
+                return false;
+            };
+            out.append(self.gpa, owned) catch {
+                self.gpa.free(owned);
+                freeOut(self, out);
+                self.setSaveMsg("netsync: stroke queue OOM", .{});
+                return false;
+            };
+        }
+        self.relay_chunks.clearRetainingCapacity();
+        return true;
+    }
+
+    /// release 直後: 構築済み canonical args を順序通りすべて routeAction（COMMIT を待たない）。
+    /// client は PROPOSE を連続 enqueue（pending cap は build 前に検査済み）。
+    fn relaySendCanonicalChunks(self: *App, args_list: []const []u8) void {
+        for (args_list, 0..) |args, i| {
+            var out_buf: [256]u8 = undefined;
+            _ = platform.routeAction("stroke", args, &out_buf) catch |err| {
+                std.debug.print("pixie: netsync UI stroke chunk {d}/{d} routeAction 失敗: {s}\n", .{
+                    i + 1,
+                    args_list.len,
+                    @errorName(err),
+                });
+                self.setSaveMsg("netsync: stroke chunk {d}/{d} 送信失敗（{s}）— 以降は未送", .{
+                    i + 1,
+                    args_list.len,
+                    @errorName(err),
+                });
+                return;
+            };
+        }
     }
 
     /// UI stroke の確定点で CommandRecord を記録する（§5c。actor=local_user・canonical args。
@@ -1498,49 +1706,6 @@ const App = struct {
         var out_buf: [256]u8 = undefined;
         _ = platform.routeAction("shape", canon, &out_buf) catch |err| {
             std.debug.print("pixie: netsync UI shape routeAction 失敗: {s}\n", .{@errorName(err)});
-        };
-    }
-
-    /// netsync 中 UI stroke 確定: 巻き戻し → canonical args で routeAction("stroke")。
-    /// solo の recordUiStroke と対になる経路（actor は wire の origin peer。TASK-94 Phase C-1）。
-    fn relayUiStroke(self: *App) void {
-        const len = self.ui_stroke_len;
-        const overflow = self.ui_stroke_overflow;
-        const tool_kind = self.ui_stroke_tool;
-        const color = self.ui_stroke_color;
-        const size = self.ui_stroke_size;
-        const opacity = self.ui_stroke_opacity;
-        const hardness = self.ui_stroke_hardness;
-        // 点列は discard 前に canon 化するため、slice を先に取る（discard は len を 0 にするだけ）。
-        const pts = self.ui_stroke_pts[0..len];
-        self.uiStrokeDiscard();
-        if (len == 0) return;
-        if (overflow) {
-            std.debug.print("pixie: netsync UI stroke を skip（{d} 点超過。preview は巻き戻し済み）\n", .{actions.MAX_STROKE_POINTS});
-            return;
-        }
-        const tool: actions.StrokeTool = switch (tool_kind) {
-            .pen => .pen,
-            .eraser => .eraser,
-            .brush => .brush,
-            else => return,
-        };
-        var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
-        const canon = actions.formatCanonicalStroke(&canon_buf, .{
-            .layer_id = self.ui_stroke_layer_id,
-            .tool = tool,
-            .color = color,
-            .size = size,
-            .opacity = opacity,
-            .hardness = hardness,
-        }, pts) catch {
-            std.debug.print("pixie: netsync UI stroke を skip（canonical args 超過）\n", .{});
-            return;
-        };
-        var out_buf: [256]u8 = undefined;
-        _ = platform.routeAction("stroke", canon, &out_buf) catch |err| {
-            std.debug.print("pixie: netsync UI stroke routeAction 失敗: {s}\n", .{@errorName(err)});
-            self.setSaveMsg("netsync: stroke を送信できませんでした（{s}）", .{@errorName(err)});
         };
     }
 
@@ -3957,6 +4122,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
 
     // 実効パラメータの解決と latch。fill（tool= 無し + active_kind==.fill）のみ legacy 経路。
     var tool: core.Tool = undefined;
+    var stroke_tool: ?actions.StrokeTool = null;
     const saved_pen_color = app.pen.color;
     const saved_brush_color = app.brush.color;
     const saved_brush_size = app.brush.size;
@@ -3970,6 +4136,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
         app.brush.hardness_q = saved_brush_hardness;
     }
     if (app.resolveEffectiveStroke(parsed.params)) |eff| {
+        stroke_tool = eff.tool;
         switch (eff.tool) {
             .pen => {
                 app.pen.color = eff.color;
@@ -3991,16 +4158,52 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
         tool = app.activeTool();
     }
 
-    _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .down = .{ .x = pts[0].x, .y = pts[0].y } });
+    const is_continuation = (parsed.params.segment orelse .first) == .continuation;
     var cmd: ?core.PaintDiff = null;
-    if (pts.len == 1) {
-        cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = pts[0].x, .y = pts[0].y } });
+    if (is_continuation) {
+        // TASK-162: 始点 no-stamp。fill legacy は segment を付けない前提。
+        const st = stroke_tool orelse return error.UnsupportedTool;
+        switch (st) {
+            .pen => app.recorder.beginAt(target_layer, app.pen.color, pts[0].x, pts[0].y),
+            .eraser => app.recorder.beginAt(target_layer, core.tool.ERASER_COLOR, pts[0].x, pts[0].y),
+            .brush => {
+                const dab = app.brush.footprint();
+                app.recorder.brushBeginAt(target_layer, app.brush.color, app.brush.opacity, pts[0].x, pts[0].y);
+                if (pts.len >= 2) {
+                    for (pts[1..], 0..) |p, i| {
+                        if (i == 0) {
+                            app.recorder.stampLineToContinue(app.canvas, app.gpa, p.x, p.y, dab);
+                        } else {
+                            app.recorder.stampLineTo(app.canvas, app.gpa, p.x, p.y, dab);
+                        }
+                    }
+                }
+                cmd = app.recorder.brushFinish(app.canvas, app.gpa);
+                if (cmd) |pd| try app.doc.pushPaintOp(app.gpa, pd.layer_idx, pd.diffs);
+                return "ok";
+            },
+        }
+        if (pts.len >= 2) {
+            for (pts[1..], 0..) |p, i| {
+                if (i == 0) {
+                    app.recorder.lineToContinue(app.canvas, app.gpa, p.x, p.y);
+                } else {
+                    app.recorder.lineTo(app.canvas, app.gpa, p.x, p.y);
+                }
+            }
+        }
+        cmd = app.recorder.finish(app.gpa);
     } else {
-        for (pts[1..], 0..) |p, i| {
-            if (i == pts.len - 2) {
-                cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = p.x, .y = p.y } });
-            } else {
-                _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .move = .{ .x = p.x, .y = p.y } });
+        _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .down = .{ .x = pts[0].x, .y = pts[0].y } });
+        if (pts.len == 1) {
+            cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = pts[0].x, .y = pts[0].y } });
+        } else {
+            for (pts[1..], 0..) |p, i| {
+                if (i == pts.len - 2) {
+                    cmd = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .up = .{ .x = p.x, .y = p.y } });
+                } else {
+                    _ = tool.onEvent(app.canvas, &app.recorder, app.gpa, .{ .move = .{ .x = p.x, .y = p.y } });
+                }
             }
         }
     }
@@ -6368,6 +6571,8 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     self.cmd_exec.log = &self.cmd_log;
     self.cmd_exec.adapter = .{ .ctx = self, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo, .summarize = adapterSummarize };
     platform.setCommandExecutor(&self.cmd_exec);
+    // TASK-163: remote COMMIT 適用後の history thumbnail capture（opaque hook）。
+    platform.setNetsyncPostApplyHook(self, App.netsyncPostApplyHook);
 
     platform.registerProbe(.{ .name = "canvas", .ctx = self, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
     platform.registerProbe(.{ .name = "undo", .ctx = self, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
@@ -6389,6 +6594,9 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
 
 fn appDeinit(self: *App) void {
     const gpa = self.gpa;
+    // TASK-163: App 解放前に hook 解除（Executor teardown 契約と同型）。
+    platform.setNetsyncPostApplyHook(null, null);
+    self.relay_chunks.deinit(gpa);
     if (self.native_menu_active) {
         if (self.os_window) |win| win.destroyMenu();
         self.native_menu_active = false;
@@ -6718,8 +6926,30 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     // solo は従来どおり pushPaintOp + recordUiStroke。
                     switch (actions.uiPaintCommitPath(platform.netsyncActive(), self.uiStrokeRelaysViaAction())) {
                         .relay => {
-                            self.rewindPaintDiff(pd);
-                            self.relayUiStroke();
+                            // TASK-162: 全 chunk canonical 成功後に一度だけ rewind → 全 PROPOSE を同期送出。
+                            // 跨フレーム drain は持たない（連続ストロークで未送 chunk 破棄を構造的に排除）。
+                            var canons: std.ArrayListUnmanaged([]u8) = .empty;
+                            defer {
+                                for (canons.items) |a| self.gpa.free(a);
+                                canons.deinit(self.gpa);
+                            }
+                            if (self.relayBuildCanonicalChunks(&canons)) {
+                                self.rewindPaintDiff(pd);
+                                self.relay_stroke = false;
+                                self.relay_active_len = 0;
+                                self.ui_stroke_len = 0;
+                                self.ui_stroke_overflow = false;
+                                self.relaySendCanonicalChunks(canons.items);
+                            } else {
+                                // preflight 失敗（chunk 数 > pending cap=netsyncPendingCap、または
+                                // pending 飽和）: preview を **rewind** して host と分岐させない。
+                                // ストローク自体は失われるが、silent な canvas 分岐（未送信の
+                                // 幽霊ピクセルが自 peer だけに残り undo 不可・恒久不一致）よりは安全。
+                                self.rewindPaintDiff(pd);
+                                self.relayResetCapture();
+                                self.relay_stroke = false;
+                                self.setSaveMsg("netsync: stroke too long to relay (dropped)", .{});
+                            }
                         },
                         .rewind_discard => {
                             self.rewindPaintDiff(pd);
