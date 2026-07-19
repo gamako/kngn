@@ -26,11 +26,31 @@ import GameController
 
 let EVENT_QUEUE_SIZE = 256
 let keyTraceEnabled = ProcessInfo.processInfo.environment["VP_KEY_TRACE"] == "1"
+// TASK-159 診断: IME / document access の実測トレース（既定 OFF。VP_IME_TRACE=1 で有効）。
+let imeTraceEnabled = ProcessInfo.processInfo.environment["VP_IME_TRACE"] == "1"
 
 func keyTrace(_ message: String) {
     guard keyTraceEnabled else { return }
     let line = Data("[key-trace] \(message)\n".utf8)
     FileHandle.standardError.write(line)
+}
+
+func imeTrace(_ message: String) {
+    guard imeTraceEnabled else { return }
+    let line = Data("[ime-trace] \(message)\n".utf8)
+    FileHandle.standardError.write(line)
+}
+
+func imeRangeDesc(_ r: NSRange) -> String {
+    if r.location == NSNotFound {
+        return "{NSNotFound,\(r.length)}"
+    }
+    return "{\(r.location),\(r.length)}"
+}
+
+func imePreview(_ s: String, limit: Int = 20) -> String {
+    if s.count <= limit { return s }
+    return String(s.prefix(limit)) + "…"
 }
 
 struct EventQueueToken {
@@ -669,7 +689,6 @@ final class PlatformIMEState {
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {
-        keyTrace("insertText")
         let str: String
         if let attr = string as? NSAttributedString {
             str = attr.string
@@ -678,6 +697,7 @@ final class PlatformIMEState {
         } else {
             str = ""
         }
+        keyTrace("insertText")
         let hadMarked = markedTextStorage.length > 0
         if hadMarked {
             markedTextStorage.setString("")
@@ -688,14 +708,15 @@ final class PlatformIMEState {
         }
 
         if docAccessEnabled, let replaceFn = docAccessCallbacks.replace_text {
-            let useRange = resolveReplacementRange(replacementRange)
-            clearPendingReplacement()
-            guard useRange.location != NSNotFound else { return }
+            let resolved = resolveReplacementRangeDetailed(replacementRange)
+            imeTrace("insertText text=\"\(imePreview(str))\" explicit=\(imeRangeDesc(replacementRange)) path=\(resolved.path) final=\(imeRangeDesc(resolved.range)) pending_before_clear=\(hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none")")
+            clearPendingReplacement(reason: "insertText")
+            guard resolved.range.location != NSNotFound else { return }
             // 不正 UTF-8 は拒否（String(decoding:) による置換は行わない）
             guard let data = str.data(using: .utf8) else { return }
             var rr = PlatformTextInputRange()
-            rr.location = UInt64(useRange.location)
-            rr.length = UInt64(useRange.length)
+            rr.location = UInt64(resolved.range.location)
+            rr.length = UInt64(resolved.range.length)
             data.withUnsafeBytes { raw in
                 let ptr = raw.bindMemory(to: UInt8.self).baseAddress
                 _ = replaceFn(docAccessUserdata, rr, ptr, UInt32(data.count))
@@ -703,7 +724,8 @@ final class PlatformIMEState {
             return
         }
 
-        clearPendingReplacement()
+        imeTrace("insertText text=\"\(imePreview(str))\" explicit=\(imeRangeDesc(replacementRange)) path=char_input (no docAccess)")
+        clearPendingReplacement(reason: "insertText_char_input")
         pushCharInputs(from: str)
     }
 
@@ -717,15 +739,24 @@ final class PlatformIMEState {
         } else {
             str = ""
         }
-        // TASK-159: 有効な replacementRange は同一 marked session で一度だけ latch する。
-        // 候補窓操作中の後続 setMarkedText（NSNotFound、または caret/零長の別 range）で
-        // pending を上書きすると、確定 insertText が純挿入になり元テキストが二重化する。
-        // クリアは unmarkText / insertText 完了 / cancel(!wasEmpty の空 mark) /
-        // setTextInputActive(false) / document access 解除のみ。
+        let pendingBefore = hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none"
+        // TASK-159: 有効な replacementRange は同一 reconversion/composition で一度だけ latch する。
+        // 後続の NSNotFound / caret 零長では上書きしない。
+        //
+        // pending 破棄条件（空 setMarkedText は cancel ではない — 日本語 IM 再変換は
+        // setMarkedText(" ", range) → setMarkedText("") → setMarkedText(候補) → insertText
+        // の列で来る。空 mark で pending を消すと insertText が caret 純挿入になり二重化する）:
+        //   - insertText で消費した直後
+        //   - unmarkText（ESC 等）
+        //   - setTextInputActive(false) / document access 解除 / window destroy 経路
+        // 安全弁: 新規の有効 replacementRange は hasPending==false のときだけ latch
+        // （消費・破棄後の次セッション開始）。空 mark や NSNotFound 更新では破棄しない。
         if replacementRange.location != NSNotFound && !hasPendingReplacement {
             hasPendingReplacement = true
             pendingReplacement = replacementRange
         }
+        let pendingAfter = hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none"
+        imeTrace("setMarkedText text=\"\(imePreview(str))\" selected=\(imeRangeDesc(selectedRange)) replacement=\(imeRangeDesc(replacementRange)) pending \(pendingBefore)->\(pendingAfter)")
         let wasEmpty = markedTextStorage.length == 0
         markedTextStorage.setString(str)
         imeSelectedRange = selectedRange
@@ -736,12 +767,9 @@ final class PlatformIMEState {
         if markedTextStorage.length == 0 {
             compositionLen = 0
             compositionCursor = 0
-            // 空 mark: 既存 session の cancel のみ pending 破棄。
-            // wasEmpty（range だけ先に latch するパターン）では保持する。
-            if !wasEmpty {
-                clearPendingReplacement()
-                pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
-            }
+            // TASK-159: 空 mark は preedit 表示のクリアのみ。pending は保持する。
+            // CANCEL phase も出さない（真の cancel は unmarkText）。
+            imeTrace("setMarkedText empty-mark keep pending=\(hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none") wasEmpty=\(wasEmpty)")
             return
         }
         let phase: UInt8 = wasEmpty
@@ -751,15 +779,16 @@ final class PlatformIMEState {
     }
 
     func unmarkText() {
+        imeTrace("unmarkText markedLen=\(markedTextStorage.length) pending=\(hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none")")
         if markedTextStorage.length == 0 {
-            clearPendingReplacement()
+            clearPendingReplacement(reason: "unmarkText_already_empty")
             return
         }
         markedTextStorage.setString("")
         imeSelectedRange = NSRange(location: 0, length: 0)
         compositionLen = 0
         compositionCursor = 0
-        clearPendingReplacement()
+        clearPendingReplacement(reason: "unmarkText")
         pushCompositionPhase(UInt8(PLATFORM_COMPOSITION_PHASE_CANCEL.rawValue))
     }
 
@@ -779,13 +808,16 @@ final class PlatformIMEState {
         imeControlled = true
         imeActive = active                      // 変更後の実効経路 = active
         if wasRouting && !active {
-            unmarkText()                        // markedText クリア + CANCEL phase（空なら no-op）
+            unmarkText()                        // markedText クリア + CANCEL phase + pending 破棄
             hostView?.inputContext?.discardMarkedText()   // IME の変換セッションも破棄（候補窓を閉じる）
-            clearPendingReplacement()
+            clearPendingReplacement(reason: "setTextInputActive_false")
         }
     }
 
-    func clearPendingReplacement() {
+    func clearPendingReplacement(reason: String = "unspecified") {
+        if hasPendingReplacement || imeTraceEnabled {
+            imeTrace("clearPending reason=\(reason) was=\(hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none")")
+        }
         hasPendingReplacement = false
         pendingReplacement = NSRange(location: NSNotFound, length: 0)
     }
@@ -805,25 +837,34 @@ final class PlatformIMEState {
             docAccessCallbacks = PlatformTextInputDocumentCallbacks()
             docAccessUserdata = nil
             docAccessEnabled = false
-            clearPendingReplacement()
+            clearPendingReplacement(reason: "docAccess_disabled")
         }
     }
 
     func resolveReplacementRange(_ replacementRange: NSRange) -> NSRange {
+        return resolveReplacementRangeDetailed(replacementRange).range
+    }
+
+    /// insertText 用: 解決 range と経路名（explicit_len/pending/explicit_zero/selected/none）。
+    private func resolveReplacementRangeDetailed(_ replacementRange: NSRange) -> (range: NSRange, path: String) {
         // 優先順: 明示（length>0）→ pending → 明示（length==0 / caret）→ selected。
         // TASK-159: insertText が caret 零長を明示しても、再変換 latch 済み pending を優先する。
         if replacementRange.location != NSNotFound && replacementRange.length > 0 {
-            return replacementRange
+            return (replacementRange, "explicit_len")
         }
-        if hasPendingReplacement { return pendingReplacement }
-        if replacementRange.location != NSNotFound { return replacementRange }
+        if hasPendingReplacement {
+            return (pendingReplacement, "pending")
+        }
+        if replacementRange.location != NSNotFound {
+            return (replacementRange, "explicit_zero")
+        }
         if docAccessEnabled, let getSel = docAccessCallbacks.get_selected_range {
             var pr = PlatformTextInputRange()
             if getSel(docAccessUserdata, &pr), pr.location != UInt64.max {
-                return NSRange(location: Int(pr.location), length: Int(pr.length))
+                return (NSRange(location: Int(pr.location), length: Int(pr.length)), "selected")
             }
         }
-        return NSRange(location: NSNotFound, length: 0)
+        return (NSRange(location: NSNotFound, length: 0), "none")
     }
 
     func markedRange() -> NSRange {
@@ -832,16 +873,23 @@ final class PlatformIMEState {
     }
 
     func selectedRange() -> NSRange {
+        let result: NSRange
         if markedTextStorage.length == 0 {
             if docAccessEnabled, let getSel = docAccessCallbacks.get_selected_range {
                 var pr = PlatformTextInputRange()
                 if getSel(docAccessUserdata, &pr), pr.location != UInt64.max {
-                    return NSRange(location: Int(pr.location), length: Int(pr.length))
+                    result = NSRange(location: Int(pr.location), length: Int(pr.length))
+                    imeTrace("selectedRange (doc) -> \(imeRangeDesc(result))")
+                    return result
                 }
             }
-            return NSRange(location: NSNotFound, length: 0)
+            result = NSRange(location: NSNotFound, length: 0)
+            imeTrace("selectedRange (empty) -> \(imeRangeDesc(result))")
+            return result
         }
-        return imeSelectedRange
+        result = imeSelectedRange
+        imeTrace("selectedRange (marked) -> \(imeRangeDesc(result))")
+        return result
     }
 
     func validAttributesForMarkedText() -> [NSAttributedString.Key] {
@@ -850,41 +898,67 @@ final class PlatformIMEState {
 
     func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
         if markedTextStorage.length == 0 {
-            guard docAccessEnabled, let getSub = docAccessCallbacks.get_substring else { return nil }
-            guard range.location != NSNotFound else { return nil }
+            guard docAccessEnabled, let getSub = docAccessCallbacks.get_substring else {
+                imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) -> nil (no docAccess)")
+                return nil
+            }
+            guard range.location != NSNotFound else {
+                imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) -> nil (NSNotFound)")
+                return nil
+            }
             var proposed = PlatformTextInputRange()
             proposed.location = UInt64(range.location)
             proposed.length = UInt64(range.length)
             var utf8Ptr: UnsafePointer<UInt8>? = nil
             var len: UInt32 = 0
             var actual = PlatformTextInputRange()
-            guard getSub(docAccessUserdata, proposed, &utf8Ptr, &len, &actual) else { return nil }
-            actualRange?.pointee = NSRange(location: Int(actual.location), length: Int(actual.length))
+            guard getSub(docAccessUserdata, proposed, &utf8Ptr, &len, &actual) else {
+                imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) -> nil (callback false)")
+                return nil
+            }
+            let actualNS = NSRange(location: Int(actual.location), length: Int(actual.length))
+            actualRange?.pointee = actualNS
             if len == 0 {
+                imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) actual=\(imeRangeDesc(actualNS)) text=\"\" len=0")
                 return NSAttributedString(string: "")
             }
-            guard let utf8Ptr else { return nil }
+            guard let utf8Ptr else {
+                imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) -> nil (null utf8)")
+                return nil
+            }
             let data = Data(bytes: utf8Ptr, count: Int(len))
             // 不正 UTF-8 は nil（置換しない）
-            guard let s = String(data: data, encoding: .utf8) else { return nil }
+            guard let s = String(data: data, encoding: .utf8) else {
+                imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) -> nil (bad utf8)")
+                return nil
+            }
+            imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) actual=\(imeRangeDesc(actualNS)) text=\"\(imePreview(s))\" len=\(s.count)")
             return NSAttributedString(string: s)
         }
         let full = NSRange(location: 0, length: markedTextStorage.length)
         let clipped = NSIntersectionRange(full, range)
-        if clipped.length == 0 { return nil }
+        if clipped.length == 0 {
+            imeTrace("attributedSubstring (marked) proposed=\(imeRangeDesc(range)) -> nil (empty clip)")
+            return nil
+        }
         actualRange?.pointee = clipped
         let sub = markedTextStorage.substring(with: clipped)
+        imeTrace("attributedSubstring (marked) proposed=\(imeRangeDesc(range)) actual=\(imeRangeDesc(clipped)) text=\"\(imePreview(sub))\" len=\(sub.count)")
         return NSAttributedString(string: sub)
     }
 
     func characterIndex(for point: NSPoint) -> Int {
+        imeTrace("characterIndex point=(\(point.x),\(point.y)) -> NSNotFound")
         _ = point
         return NSNotFound
     }
 
     func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
         actualRange?.pointee = range
-        guard let hostView = hostView else { return .zero }
+        guard let hostView = hostView else {
+            imeTrace("firstRect range=\(imeRangeDesc(range)) -> .zero (no hostView)")
+            return .zero
+        }
         let bounds = hostView.bounds
         let width = fbWidth
         let height = fbHeight
@@ -910,6 +984,7 @@ final class PlatformIMEState {
         if let win = hostView.window {
             r = win.convertToScreen(r)
         }
+        imeTrace("firstRect range=\(imeRangeDesc(range)) -> (\(r.origin.x),\(r.origin.y),\(r.size.width),\(r.size.height))")
         return r
     }
 

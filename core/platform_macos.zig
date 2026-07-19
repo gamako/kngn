@@ -232,6 +232,7 @@ inline fn makeGamepadDisconnect(ev: c.PlatformEvent) GamepadDisconnect {
 }
 
 var key_trace_state: ?bool = null;
+var ime_trace_state: ?bool = null;
 
 fn keyTraceEnabled() bool {
     if (key_trace_state) |enabled| return enabled;
@@ -240,6 +241,16 @@ fn keyTraceEnabled() bool {
     else
         false;
     key_trace_state = enabled;
+    return enabled;
+}
+
+fn imeTraceEnabled() bool {
+    if (ime_trace_state) |enabled| return enabled;
+    const enabled = if (std.c.getenv("VP_IME_TRACE")) |value|
+        std.mem.eql(u8, std.mem.span(value), "1")
+    else
+        false;
+    ime_trace_state = enabled;
     return enabled;
 }
 
@@ -292,8 +303,14 @@ fn docAccessGetSelectedRange(userdata: ?*anyopaque, out_range: ?*c.PlatformTextI
     _ = userdata;
     const out = out_range orelse return false;
     const cbs = doc_access_trampoline.callbacks orelse return false;
-    const range = cbs.getSelectedRange(doc_access_trampoline.userdata) orelse return false;
+    const range = cbs.getSelectedRange(doc_access_trampoline.userdata) orelse {
+        if (imeTraceEnabled()) std.debug.print("[ime-trace] doc.get_selected_range -> null\n", .{});
+        return false;
+    };
     out.* = .{ .location = range.location, .length = range.length };
+    if (imeTraceEnabled()) {
+        std.debug.print("[ime-trace] doc.get_selected_range -> {{{d},{d}}}\n", .{ range.location, range.length });
+    }
     return true;
 }
 
@@ -310,11 +327,27 @@ fn docAccessGetSubstring(
     const actual_slot = out_actual_range orelse return false;
     const cbs = doc_access_trampoline.callbacks orelse return false;
     const proposed: TextInputRange = .{ .location = proposed_range.location, .length = proposed_range.length };
-    const sub = cbs.getSubstring(doc_access_trampoline.userdata, proposed) orelse return false;
+    const sub = cbs.getSubstring(doc_access_trampoline.userdata, proposed) orelse {
+        if (imeTraceEnabled()) {
+            std.debug.print("[ime-trace] doc.get_substring proposed={{{d},{d}}} -> null\n", .{ proposed.location, proposed.length });
+        }
+        return false;
+    };
     // 空 slice の .ptr は未定義になり得るため、長さ 0 は静的空バッファを返す。
     utf8_slot.* = if (sub.utf8.len == 0) @ptrCast(&empty_doc_utf8) else sub.utf8.ptr;
     len_slot.* = @intCast(sub.utf8.len);
     actual_slot.* = .{ .location = sub.actual_range.location, .length = sub.actual_range.length };
+    if (imeTraceEnabled()) {
+        const preview_len = @min(sub.utf8.len, 20);
+        std.debug.print("[ime-trace] doc.get_substring proposed={{{d},{d}}} actual={{{d},{d}}} len={d} text=\"{s}\"\n", .{
+            proposed.location,
+            proposed.length,
+            sub.actual_range.location,
+            sub.actual_range.length,
+            sub.utf8.len,
+            sub.utf8[0..preview_len],
+        });
+    }
     return true;
 }
 
@@ -328,7 +361,18 @@ fn docAccessReplaceText(
     const cbs = doc_access_trampoline.callbacks orelse return false;
     const range: TextInputRange = .{ .location = replacement_range.location, .length = replacement_range.length };
     const slice: []const u8 = if (utf8) |p| p[0..len] else &.{};
-    return cbs.replaceText(doc_access_trampoline.userdata, range, slice);
+    const ok = cbs.replaceText(doc_access_trampoline.userdata, range, slice);
+    if (imeTraceEnabled()) {
+        const preview_len = @min(slice.len, 20);
+        std.debug.print("[ime-trace] doc.replace_text range={{{d},{d}}} len={d} text=\"{s}\" ok={}\n", .{
+            range.location,
+            range.length,
+            slice.len,
+            slice[0..preview_len],
+            ok,
+        });
+    }
+    return ok;
 }
 
 const doc_access_c_callbacks = c.PlatformTextInputDocumentCallbacks{

@@ -9,6 +9,7 @@
 #include "macos/platform_macos_menu.h"
 #endif
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
@@ -88,6 +89,7 @@ static bool queue_mark_none(EventQueue* q, EventQueueToken token);
 @end
 
 static bool g_key_trace_enabled = false;
+static bool g_ime_trace_enabled = false;
 
 static void key_trace(const char* fmt, ...) {
     if (!g_key_trace_enabled) return;
@@ -97,6 +99,37 @@ static void key_trace(const char* fmt, ...) {
     vfprintf(stderr, fmt, args);
     fputc('\n', stderr);
     va_end(args);
+}
+
+// TASK-159 診断: IME / document access の実測トレース（既定 OFF。VP_IME_TRACE=1 で有効）。
+static void ime_trace(const char* fmt, ...) {
+    if (!g_ime_trace_enabled) return;
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[ime-trace] ");
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
+    va_end(args);
+}
+
+static void ime_range_desc(NSRange r, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (r.location == NSNotFound) {
+        snprintf(out, cap, "{NSNotFound,%lu}", (unsigned long)r.length);
+    } else {
+        snprintf(out, cap, "{%lu,%lu}", (unsigned long)r.location, (unsigned long)r.length);
+    }
+}
+
+static void ime_preview_utf8(const char* s, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (!s) { out[0] = '\0'; return; }
+    // 先頭 20 文字程度（UTF-8 バイトを粗く制限。診断用）。
+    size_t n = strlen(s);
+    if (n > 60) n = 60;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, s, n);
+    out[n] = '\0';
 }
 
 // ========================================
@@ -966,7 +999,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 }
 
-- (void)clearPendingReplacement {
+- (void)clearPendingReplacementWithReason:(const char*)reason {
+    char was[64];
+    if (hasPendingReplacement) ime_range_desc(pendingReplacement, was, sizeof(was));
+    else snprintf(was, sizeof(was), "none");
+    if (hasPendingReplacement || g_ime_trace_enabled) {
+        ime_trace("clearPending reason=%s was=%s", reason ? reason : "unspecified", was);
+    }
     hasPendingReplacement = NO;
     pendingReplacement = NSMakeRange(NSNotFound, 0);
 }
@@ -980,7 +1019,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         memset(&docAccessCallbacks, 0, sizeof(docAccessCallbacks));
         docAccessUserdata = NULL;
         docAccessEnabled = NO;
-        [self clearPendingReplacement];
+        [self clearPendingReplacementWithReason:"docAccess_disabled"];
     }
 }
 
@@ -1002,6 +1041,20 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     return NSMakeRange(NSNotFound, 0);
 }
 
+- (const char*)resolveReplacementPath:(NSRange)replacementRange {
+    if (replacementRange.location != NSNotFound && replacementRange.length > 0) return "explicit_len";
+    if (hasPendingReplacement) return "pending";
+    if (replacementRange.location != NSNotFound) return "explicit_zero";
+    if (docAccessEnabled && docAccessCallbacks.get_selected_range) {
+        PlatformTextInputRange pr;
+        memset(&pr, 0, sizeof(pr));
+        if (docAccessCallbacks.get_selected_range(docAccessUserdata, &pr) && pr.location != UINT64_MAX) {
+            return "selected";
+        }
+    }
+    return "none";
+}
+
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
     key_trace("insertText");
     NSString* str = [string isKindOfClass:[NSAttributedString class]]
@@ -1017,8 +1070,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 
     if (docAccessEnabled && docAccessCallbacks.replace_text) {
+        const char* path = [self resolveReplacementPath:replacementRange];
         NSRange useRange = [self resolveReplacementRange:replacementRange];
-        [self clearPendingReplacement];
+        char ex[64], fin[64], pend[64], prev[80];
+        ime_range_desc(replacementRange, ex, sizeof(ex));
+        ime_range_desc(useRange, fin, sizeof(fin));
+        if (hasPendingReplacement) ime_range_desc(pendingReplacement, pend, sizeof(pend));
+        else snprintf(pend, sizeof(pend), "none");
+        ime_preview_utf8(str ? [str UTF8String] : "", prev, sizeof(prev));
+        ime_trace("insertText text=\"%s\" explicit=%s path=%s final=%s pending_before_clear=%s",
+                  prev, ex, path, fin, pend);
+        [self clearPendingReplacementWithReason:"insertText"];
         if (useRange.location == NSNotFound) return;
         // UTF-8 変換失敗は拒否（buffer 不変・char_input も出さない）
         if (!str) str = @"";
@@ -1034,7 +1096,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         return;
     }
 
-    [self clearPendingReplacement];
+    char ex2[64], prev2[80];
+    ime_range_desc(replacementRange, ex2, sizeof(ex2));
+    ime_preview_utf8(str ? [str UTF8String] : "", prev2, sizeof(prev2));
+    ime_trace("insertText text=\"%s\" explicit=%s path=char_input (no docAccess)", prev2, ex2);
+    [self clearPendingReplacementWithReason:"insertText_char_input"];
     [self pushCharInputsFromString:str];
 }
 
@@ -1044,15 +1110,31 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         ? [(NSAttributedString*)string string]
         : (NSString*)string;
     if (!str) str = @"";
-    // TASK-159: 有効な replacementRange は同一 marked session で一度だけ latch する。
-    // 候補窓操作中の後続 setMarkedText（NSNotFound、または caret/零長の別 range）で
-    // pending を上書きすると、確定 insertText が純挿入になり元テキストが二重化する。
-    // クリアは unmarkText / insertText 完了 / cancel(!wasEmpty の空 mark) /
-    // setTextInputActive:NO / document access 解除のみ。
+    char before[64], after[64], repl[64], sel[64], prev[80];
+    if (hasPendingReplacement) ime_range_desc(pendingReplacement, before, sizeof(before));
+    else snprintf(before, sizeof(before), "none");
+    // TASK-159: 有効な replacementRange は同一 reconversion/composition で一度だけ latch する。
+    // 後続の NSNotFound / caret 零長では上書きしない。
+    //
+    // pending 破棄条件（空 setMarkedText は cancel ではない — 日本語 IM 再変換は
+    // setMarkedText(" ", range) → setMarkedText("") → setMarkedText(候補) → insertText
+    // の列で来る。空 mark で pending を消すと insertText が caret 純挿入になり二重化する）:
+    //   - insertText で消費した直後
+    //   - unmarkText（ESC 等）
+    //   - setTextInputActive:NO / document access 解除 / window destroy 経路
+    // 安全弁: 新規の有効 replacementRange は hasPending==NO のときだけ latch
+    // （消費・破棄後の次セッション開始）。空 mark や NSNotFound 更新では破棄しない。
     if (replacementRange.location != NSNotFound && !hasPendingReplacement) {
         hasPendingReplacement = YES;
         pendingReplacement = replacementRange;
     }
+    if (hasPendingReplacement) ime_range_desc(pendingReplacement, after, sizeof(after));
+    else snprintf(after, sizeof(after), "none");
+    ime_range_desc(replacementRange, repl, sizeof(repl));
+    ime_range_desc(selectedRange, sel, sizeof(sel));
+    ime_preview_utf8([str UTF8String], prev, sizeof(prev));
+    ime_trace("setMarkedText text=\"%s\" selected=%s replacement=%s pending %s->%s",
+              prev, sel, repl, before, after);
     BOOL wasEmpty = (markedText.length == 0);
     [markedText setString:str];
     imeSelectedRange = selectedRange;
@@ -1063,12 +1145,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (markedText.length == 0) {
         compositionLen = 0;
         compositionCursor = 0;
-        // 空 mark: 既存 session の cancel のみ pending 破棄。
-        // wasEmpty（range だけ先に latch するパターン）では保持する。
-        if (!wasEmpty) {
-            [self clearPendingReplacement];
-            [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_CANCEL];
-        }
+        // TASK-159: 空 mark は preedit 表示のクリアのみ。pending は保持する。
+        // CANCEL phase も出さない（真の cancel は unmarkText）。
+        char keep[64];
+        if (hasPendingReplacement) ime_range_desc(pendingReplacement, keep, sizeof(keep));
+        else snprintf(keep, sizeof(keep), "none");
+        ime_trace("setMarkedText empty-mark keep pending=%s wasEmpty=%d", keep, wasEmpty);
         return;
     }
     uint8_t phase = wasEmpty
@@ -1078,15 +1160,19 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (void)unmarkText {
+    char pend[64];
+    if (hasPendingReplacement) ime_range_desc(pendingReplacement, pend, sizeof(pend));
+    else snprintf(pend, sizeof(pend), "none");
+    ime_trace("unmarkText markedLen=%lu pending=%s", (unsigned long)markedText.length, pend);
     if (markedText.length == 0) {
-        [self clearPendingReplacement];
+        [self clearPendingReplacementWithReason:"unmarkText_already_empty"];
         return;
     }
     [markedText setString:@""];
     imeSelectedRange = NSMakeRange(0, 0);
     compositionLen = 0;
     compositionCursor = 0;
-    [self clearPendingReplacement];
+    [self clearPendingReplacementWithReason:"unmarkText"];
     [self pushCompositionPhase:PLATFORM_COMPOSITION_PHASE_CANCEL];
 }
 
@@ -1106,9 +1192,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     imeControlled = YES;
     imeActive = active;                           // 変更後の実効経路 = active
     if (wasRouting && !active) {
-        [self unmarkText];                        // markedText クリア + CANCEL phase（空なら no-op）
+        [self unmarkText];                        // markedText クリア + CANCEL phase + pending 破棄
         [[self inputContext] discardMarkedText];  // IME の変換セッションも破棄（候補窓を閉じる）
-        [self clearPendingReplacement];
+        [self clearPendingReplacementWithReason:"setTextInputActive_false"];
     }
 }
 
@@ -1123,11 +1209,22 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             PlatformTextInputRange pr;
             memset(&pr, 0, sizeof(pr));
             if (docAccessCallbacks.get_selected_range(docAccessUserdata, &pr) && pr.location != UINT64_MAX) {
-                return NSMakeRange((NSUInteger)pr.location, (NSUInteger)pr.length);
+                NSRange r = NSMakeRange((NSUInteger)pr.location, (NSUInteger)pr.length);
+                char desc[64];
+                ime_range_desc(r, desc, sizeof(desc));
+                ime_trace("selectedRange (doc) -> %s", desc);
+                return r;
             }
         }
-        return NSMakeRange(NSNotFound, 0);
+        NSRange r = NSMakeRange(NSNotFound, 0);
+        char desc[64];
+        ime_range_desc(r, desc, sizeof(desc));
+        ime_trace("selectedRange (empty) -> %s", desc);
+        return r;
     }
+    char desc[64];
+    ime_range_desc(imeSelectedRange, desc, sizeof(desc));
+    ime_trace("selectedRange (marked) -> %s", desc);
     return imeSelectedRange;
 }
 
@@ -1136,9 +1233,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (NSAttributedString*)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    char prop[64];
+    ime_range_desc(range, prop, sizeof(prop));
     if (markedText.length == 0) {
-        if (!docAccessEnabled || !docAccessCallbacks.get_substring) return nil;
-        if (range.location == NSNotFound) return nil;
+        if (!docAccessEnabled || !docAccessCallbacks.get_substring) {
+            ime_trace("attributedSubstring proposed=%s -> nil (no docAccess)", prop);
+            return nil;
+        }
+        if (range.location == NSNotFound) {
+            ime_trace("attributedSubstring proposed=%s -> nil (NSNotFound)", prop);
+            return nil;
+        }
         PlatformTextInputRange proposed = {
             .location = (uint64_t)range.location,
             .length = (uint64_t)range.length,
@@ -1147,27 +1252,51 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         uint32_t len = 0;
         PlatformTextInputRange actual = {0, 0};
         if (!docAccessCallbacks.get_substring(docAccessUserdata, proposed, &utf8, &len, &actual)) {
+            ime_trace("attributedSubstring proposed=%s -> nil (callback false)", prop);
             return nil;
         }
+        NSRange actualNS = NSMakeRange((NSUInteger)actual.location, (NSUInteger)actual.length);
         if (actualRange) {
-            *actualRange = NSMakeRange((NSUInteger)actual.location, (NSUInteger)actual.length);
+            *actualRange = actualNS;
         }
+        char act[64], prev[80];
+        ime_range_desc(actualNS, act, sizeof(act));
         if (len == 0) {
+            ime_trace("attributedSubstring proposed=%s actual=%s text=\"\" len=0", prop, act);
             return [[NSAttributedString alloc] initWithString:@""];
         }
-        if (!utf8) return nil;
+        if (!utf8) {
+            ime_trace("attributedSubstring proposed=%s -> nil (null utf8)", prop);
+            return nil;
+        }
         NSString* s = [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
-        if (!s) return nil;
+        if (!s) {
+            ime_trace("attributedSubstring proposed=%s -> nil (bad utf8)", prop);
+            return nil;
+        }
+        ime_preview_utf8([s UTF8String], prev, sizeof(prev));
+        ime_trace("attributedSubstring proposed=%s actual=%s text=\"%s\" len=%lu",
+                  prop, act, prev, (unsigned long)s.length);
         return [[NSAttributedString alloc] initWithString:s];
     }
     NSRange full = NSMakeRange(0, markedText.length);
     NSRange clipped = NSIntersectionRange(full, range);
-    if (clipped.length == 0) return nil;
+    if (clipped.length == 0) {
+        ime_trace("attributedSubstring (marked) proposed=%s -> nil (empty clip)", prop);
+        return nil;
+    }
     if (actualRange) *actualRange = clipped;
-    return [[NSAttributedString alloc] initWithString:[markedText substringWithRange:clipped]];
+    NSString* sub = [markedText substringWithRange:clipped];
+    char act[64], prev[80];
+    ime_range_desc(clipped, act, sizeof(act));
+    ime_preview_utf8([sub UTF8String], prev, sizeof(prev));
+    ime_trace("attributedSubstring (marked) proposed=%s actual=%s text=\"%s\" len=%lu",
+              prop, act, prev, (unsigned long)sub.length);
+    return [[NSAttributedString alloc] initWithString:sub];
 }
 
 - (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    ime_trace("characterIndex point=(%.1f,%.1f) -> NSNotFound", point.x, point.y);
     (void)point;
     return NSNotFound;
 }
@@ -1198,6 +1327,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (self.window) {
         r = [self.window convertRectToScreen:r];
     }
+    char desc[64];
+    ime_range_desc(range, desc, sizeof(desc));
+    ime_trace("firstRect range=%s -> (%.1f,%.1f,%.1f,%.1f)", desc, r.origin.x, r.origin.y, r.size.width, r.size.height);
     return r;
 }
 
@@ -1559,6 +1691,8 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
 bool platform_init(void) {
     const char* trace = getenv("VP_KEY_TRACE");
     g_key_trace_enabled = trace && strcmp(trace, "1") == 0;
+    const char* ime = getenv("VP_IME_TRACE");
+    g_ime_trace_enabled = ime && strcmp(ime, "1") == 0;
     return true;
 }
 
