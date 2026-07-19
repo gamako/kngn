@@ -1755,13 +1755,27 @@ fn routeUiAction(app: *App, name: []const u8, args: []const u8) void {
     _ = routeUiActionInto(app, name, args, &buf);
 }
 
-/// `out_buf` に応答を書き、その slice を返す（失敗時 null。`proposed` / `ok id=#N` 等）。
+/// GUI → action 入口。`out_buf` に応答を書き、その slice を返す（失敗時 null）。
+///
+/// - netsync 中: `platform.routeAction`（PROPOSE/COMMIT・canonicalize は registry 経路）。
+/// - それ以外: `cmd_exec.executeAction` を直接呼ぶ。
+///   harness 無効時は `registerAction` が no-op で registry が空のため、`routeAction`→dispatch
+///   は UnknownAction になる（実機 Critical）。Executor は app 所有・harness 非依存。
 fn routeUiActionInto(app: *App, name: []const u8, args: []const u8, out_buf: []u8) ?[]const u8 {
-    _ = app;
-    return platform.routeAction(name, args, out_buf) catch |err| {
-        std.debug.print("patch: routeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+    if (platform.netsyncActive()) {
+        return platform.routeAction(name, args, out_buf) catch |err| {
+            std.debug.print("patch: routeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+            return null;
+        };
+    }
+    const res = app.cmd_exec.executeAction(name, args, .{
+        .actor = .local_user,
+        .record_policy = .record,
+    }, out_buf) catch |err| {
+        std.debug.print("patch: executeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
         return null;
     };
+    return res.output;
 }
 
 /// `ok id=#N` 応答なら NodeId → handle を解決して selected を設定（client の `proposed` は無視）。

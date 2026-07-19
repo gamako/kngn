@@ -12,6 +12,9 @@ const MockPatch = struct {
     pattern: undo.PatternSnap = .{},
     tempo: f32 = 122.0,
     kick_mute: bool = false,
+    /// add_node / move_node の簡易状態（非 harness Executor 直行経路の回帰用）。
+    node_count: u32 = 0,
+    last_move_id: u64 = 0,
     last_name: []const u8 = "",
 
     fn run(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -59,6 +62,27 @@ const MockPatch = struct {
             }
             return write(buf, "ok");
         }
+        if (std.mem.eql(u8, name, "add_node")) {
+            // GUI palette / routeUiActionInto 非 netsync 分岐相当: registry 無しで Executor 直行。
+            self.node_count += 1;
+            const id: u64 = self.node_count;
+            const ref = self.store.push(.{ .add_node = .{ .id = id, .kind_tag = 0, .x = 0, .y = 0 } });
+            self.exec.noteUndo(ref);
+            return std.fmt.bufPrint(buf, "ok id=#{d}", .{id}) catch "ok";
+        }
+        if (std.mem.eql(u8, name, "move_node")) {
+            // "#{id} x y"
+            var it = std.mem.tokenizeAny(u8, args, " \t");
+            const id_tok = it.next() orelse return error.Empty;
+            if (id_tok.len < 2 or id_tok[0] != '#') return error.InvalidNumber;
+            const id = try std.fmt.parseUnsigned(u64, id_tok[1..], 10);
+            _ = it.next() orelse return error.Empty;
+            _ = it.next() orelse return error.Empty;
+            self.last_move_id = id;
+            const ref = self.store.push(.{ .move_node = .{ .id = id, .x = 0, .y = 0 } });
+            self.exec.noteUndo(ref);
+            return write(buf, "ok");
+        }
         if (std.mem.eql(u8, name, "noop_pattern")) {
             return write(buf, "ok");
         }
@@ -88,6 +112,12 @@ const MockPatch = struct {
             },
             .mute => |s| {
                 if (s.track == 0) self.kick_mute = s.was_muted;
+            },
+            .add_node => {
+                if (self.node_count > 0) self.node_count -= 1;
+            },
+            .move_node => |s| {
+                self.last_move_id = s.id; // restore marker only
             },
             else => {},
         }
@@ -331,4 +361,46 @@ test "pending param before is not consumed by mismatched param name" {
     try testing.expect(slot.pending == null);
     try testing.expectEqualStrings("tempo", taken_a.?.name());
     try testing.expectEqual(@as(f32, 122.0), @as(f32, @bitCast(taken_a.?.value_bits)));
+}
+
+// main.zig `routeUiActionInto` の非 netsync 分岐相当: registry / router 無しで
+// `Executor.executeAction` 直行が add_node / set_param / move_node を成功させ CommandLog に記録する。
+// harness 無効時 registerAction が no-op でも GUI が UnknownAction にならない契約を固定する。
+test "non-harness routeUiAction path: Executor executeAction without registry" {
+    var app: MockPatch = .{};
+    var log: command.CommandLog = .{};
+    var exec: command.Executor = undefined;
+    wireExec(&app, &log, &exec);
+
+    var buf: [64]u8 = undefined;
+
+    // add_node
+    const add_res = try exec.executeAction("add_node", "vca 10 20", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    try testing.expect(std.mem.startsWith(u8, add_res.output, "ok id=#"));
+    try testing.expectEqual(@as(u32, 1), app.node_count);
+    try testing.expect(log.latest().?.undoable);
+    try testing.expectEqualStrings("add_node", log.latest().?.name());
+
+    // set_param
+    app.tempo = 122.0;
+    _ = try exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    try testing.expectEqual(@as(f32, 140.0), app.tempo);
+    try testing.expectEqualStrings("set_param", log.latest().?.name());
+    try testing.expect(log.latest().?.undoable);
+
+    // move_node
+    _ = try exec.executeAction("move_node", "#1 50 60", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    try testing.expectEqual(@as(u64, 1), app.last_move_id);
+    try testing.expectEqualStrings("move_node", log.latest().?.name());
+    try testing.expect(log.latest().?.undoable);
+
+    // CommandLog に 3 件（いずれも registry を経由していない）
+    try testing.expectEqual(@as(u32, 3), log.filled);
+
+    // undo で move → set_param → add_node
+    _ = try exec.undoOne(.local_user, &buf);
+    _ = try exec.undoOne(.local_user, &buf);
+    try testing.expectEqual(@as(f32, 122.0), app.tempo);
+    _ = try exec.undoOne(.local_user, &buf);
+    try testing.expectEqual(@as(u32, 0), app.node_count);
 }
