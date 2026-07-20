@@ -326,9 +326,14 @@ pub const Window = struct {
     pub fn nextEvent(self: Window) ?Event {
         if (self.isNull()) return harness.nextInjectedEvent(); // native pump が無いので注入イベントのみ
         if (!harness.isEnabled()) return self.inner.native.nextEvent();
-        // 注入イベントを優先。尽きたら native を drain して quit のみ通す。
+        // 注入イベントを優先。尽きたら native を drain する。
+        // manual/replay: 注入駆動なので native は quit のみ通す（実クリック等は無視）。
+        // free-run: 実 display をユーザーが操作するので native 入力を app へ通す（TASK-164 の核心
+        //   ＝人が実 window を操作しつつ agent が LISTEN で横から inject/action する共同操作）。
         if (harness.nextInjectedEvent()) |ev| return ev;
+        const pass_native = !harness.isManualClock();
         while (self.inner.native.nextEvent()) |ev| {
+            if (pass_native) return ev;
             if (harness.filterNativeEvent(ev)) |keep| return keep;
         }
         return null;
