@@ -1251,6 +1251,13 @@ pub const ChordPad = struct {
     applied_lp_sr: f32 = -1.0,
     applied_root_cv: f32 = 0.0,
     root_cv_init: bool = false,
+    // TASK-115.3: descriptor 非公開の MIDI runtime state（グラフ topology は不変）。
+    // main/RT が note 境界で書き、process は固定状態判定のみ（毎サンプルの @exp2/atomic を新設しない）。
+    midi_active: bool = false,
+    midi_gate: bool = false,
+    midi_root_hz: f32 = 130.81,
+    midi_velocity: f32 = 1.0,
+    midi_root_applied: bool = false,
 
     const done_eps: f32 = 1e-4;
     const root_eps: f32 = 1e-4;
@@ -1262,6 +1269,31 @@ pub const ChordPad = struct {
 
     pub fn spec(self: *ChordPad) NodeSpec {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
+    }
+
+    /// note event / block 境界専用。MIDI note → Hz を事前計算して root override を有効化する（RT・alloc なし）。
+    pub fn applyMidiNote(self: *ChordPad, note: u8, velocity: f32) void {
+        const n: f32 = @floatFromInt(note);
+        const hz = 440.0 * @exp2((n - 69.0) / 12.0);
+        self.midi_root_hz = if (std.math.isFinite(hz)) std.math.clamp(hz, 1.0, 20000.0) else self.base_hz;
+        self.midi_velocity = if (std.math.isFinite(velocity)) std.math.clamp(velocity, 0.0, 1.0) else 1.0;
+        const entering = !self.midi_active;
+        self.midi_gate = true;
+        self.midi_active = true;
+        self.midi_root_applied = false; // 次 process で dirty-gate 再計算
+        // ambient→MIDI の gate source 切替時のみ prev を落とす（legato 中の root 更新では再 attack しない）。
+        if (entering) self.prev_gate = false;
+    }
+
+    /// 全 MIDI ノート解放時。gate を落として release へ移行し、以降は ambient pitch_cv 経路へ戻る。
+    pub fn clearMidi(self: *ChordPad) void {
+        const leaving = self.midi_active;
+        self.midi_gate = false;
+        self.midi_active = false;
+        self.midi_root_applied = false;
+        self.root_cv_init = false; // ambient root を次サンプルで再評価
+        // MIDI→ambient 切替時も prev を落とし、ambient gate high なら次 process で rising edge を出す。
+        if (leaving) self.prev_gate = false;
     }
 
     /// 実フィルタ係数（tan）を dirty-gated で更新。base cutoff と modulation の唯一の choke point。
@@ -1319,9 +1351,16 @@ pub const ChordPad = struct {
 
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *ChordPad = @ptrCast(@alignCast(ctx));
-        // pitch_cv(任意)で root を駆動（連続生成のアンビエント和声）。値変化時のみ @exp2 再計算（dirty-gate）。
-        // 信号規約上 pitch_cv=0 は基準音なので、未接続判定は値ではなく Io.connected[] で行う。
-        if (optInput(io, 1)) |pcv_raw| {
+        // MIDI active 中は ambient pitch_cv より MIDI root を優先（Hz は note 境界で事前計算済み）。
+        if (self.midi_active) {
+            if (!self.midi_root_applied or @abs(self.midi_root_hz - self.root_hz) > root_eps) {
+                self.root_hz = self.midi_root_hz;
+                self.recomputeFreqs();
+                self.midi_root_applied = true;
+            }
+        } else if (optInput(io, 1)) |pcv_raw| {
+            // pitch_cv(任意)で root を駆動（連続生成のアンビエント和声）。値変化時のみ @exp2 再計算（dirty-gate）。
+            // 信号規約上 pitch_cv=0 は基準音なので、未接続判定は値ではなく Io.connected[] で行う。
             const pcv = if (std.math.isFinite(pcv_raw)) std.math.clamp(pcv_raw, -4.0, 4.0) else 0.0;
             if (!self.root_cv_init or @abs(pcv - self.applied_root_cv) > root_eps) {
                 self.root_hz = self.base_hz * @exp2(pcv);
@@ -1339,7 +1378,8 @@ pub const ChordPad = struct {
                 self.applyLp(io.sample_rate, self.base_fc * @exp2(m * self.cutoff_mod_oct));
             }
         }
-        const g = signal.gateHigh(io.inputs[0]);
+        // MIDI active 中は MIDI gate、それ以外は入力 gate（ambient Euclid）。
+        const g = if (self.midi_active) self.midi_gate else signal.gateHigh(io.inputs[0]);
         if (g and !self.prev_gate) self.attacking = true; // (再)トリガで swell
         self.prev_gate = g;
         if (self.attacking) {
@@ -1361,7 +1401,8 @@ pub const ChordPad = struct {
         }
         sum *= 1.0 / 3.0;
         const driven = dsp.softClip(sum * self.drive_mul); // warmth で軽い飽和（係数は事前計算）
-        var y = self.lp.process(driven) * self.env * self.gain;
+        const vel = if (self.midi_active) self.midi_velocity else 1.0;
+        var y = self.lp.process(driven) * self.env * self.gain * vel;
         // level modulation(任意・aux)。アンビエント S&H 由来の控えめな呼吸（毎サンプル軽量）。
         if (optInput(io, 3)) |a_raw| {
             const a = if (std.math.isFinite(a_raw)) a_raw else 0.0;
@@ -2625,4 +2666,91 @@ test "ChordPad: finite under non-finite CV inputs" {
         drive(&ChordPad.vtable, &p, &.{ 1.0, nan, inf, nan }, &.{ true, true, true, true }, &o, 48000);
         try testing.expect(std.math.isFinite(o[0]));
     }
+}
+
+test "ChordPad: MIDI root overrides ambient pitch_cv" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    // ambient +1oct を接続しつつ MIDI note 69 (A4=440Hz) を優先。
+    p.applyMidiNote(69, 1.0);
+    drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    try testing.expect(p.midi_active);
+    try testing.expectApproxEqAbs(@as(f32, 440.0), p.root_hz, 1e-1);
+    try testing.expect(std.math.isFinite(o[0]));
+}
+
+test "ChordPad: MIDI note_off releases and returns to ambient root" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    p.applyMidiNote(60, 0.8);
+    drive(&ChordPad.vtable, &p, &.{ 0.0, 0.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    const midi_hz = p.root_hz;
+    try testing.expect(midi_hz > 200.0); // C4 付近
+    p.clearMidi();
+    // clear 後に ambient pitch_cv=+1oct へ戻る（root_cv_init 再評価）。
+    drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+    try testing.expect(!p.midi_active);
+    try testing.expectApproxEqAbs(@as(f32, 261.62), p.root_hz, 1e-1);
+    // release 経路: gate low で env が減衰（有限）。
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
+        try testing.expect(std.math.isFinite(o[0]));
+    }
+}
+
+test "ChordPad: MIDI root recompute is dirty-gated (constant midi_root_hz)" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    p.applyMidiNote(64, 1.0);
+    drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
+    const f0 = p.freqs[0];
+    const applied = p.midi_root_applied;
+    try testing.expect(applied);
+    var i: u32 = 0;
+    while (i < 500) : (i += 1) {
+        drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
+    }
+    try testing.expect(p.midi_root_applied);
+    try testing.expectEqual(f0, p.freqs[0]); // 変化なし → recomputeFreqs 再実行なし
+}
+
+test "ChordPad: MIDI note-on attacks even when ambient gate was already high" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    // ambient gate high で prev_gate=true にする
+    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000);
+    try testing.expect(p.prev_gate);
+    try testing.expect(p.attacking or p.env > 0);
+    // MIDI へ切替: prev_gate が落ち、次 process で rising edge → attack
+    p.applyMidiNote(60, 1.0);
+    try testing.expect(!p.prev_gate);
+    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000); // ambient gate は無視、MIDI gate
+    try testing.expect(p.midi_active);
+    try testing.expect(p.attacking);
+    try testing.expect(p.env > 0);
+}
+
+test "ChordPad: clearMidi re-attacks when ambient gate is high" {
+    var p = ChordPad{};
+    ChordPad.updateParams(&p, 48000);
+    var o: [1]f32 = undefined;
+    p.applyMidiNote(60, 1.0);
+    drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
+    try testing.expect(p.prev_gate); // MIDI gate high
+    // 少し sustain 側へ進める
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
+    }
+    p.clearMidi();
+    try testing.expect(!p.prev_gate);
+    try testing.expect(!p.midi_active);
+    // ambient gate high → rising edge で再 attack
+    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000);
+    try testing.expect(p.attacking);
 }

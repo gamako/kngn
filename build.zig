@@ -2976,6 +2976,8 @@ fn addPatchExe(
     linkAppException(root, common.synth, "apps/patch/lofi.zig が生成レイヤを直接利用（SampleTap / AtomicF32）");
     linkAppException(root, common.dsp, "apps/patch/lofi.zig が生成レイヤを直接利用（FFT band energy 検証）");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
+    // TASK-115.3: kit.midi（CoreMIDI）を run-patch から使用するため opt-in link。
+    linkMidiBackend(exe, target.result.os.tag);
 
     // ゲームパッド opt-in 無効（TASK-80.2）。native メニュー opt-in（TASK-136）。
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });

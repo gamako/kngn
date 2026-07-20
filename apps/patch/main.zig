@@ -29,6 +29,7 @@ const stepgrid = gui.stepgrid;
 const modular = @import("modular");
 const audio = kit.audio;
 const synth = kit.synth; // SampleTap（Audio→GUI 出力タップ。C の master 可視化）
+const midi = kit.midi;
 const dsp = kit.dsp; // mono downmix
 const spectrogram = @import("spectrogram");
 const scope = @import("scope");
@@ -80,6 +81,107 @@ comptime {
     if (group.MAX_OUT_PORTS != MAX_OUT) {
         @compileError("group.MAX_OUT_PORTS must equal modular.signal.MAX_OUT");
     }
+}
+
+// ----------------------------------------------------------------------------
+// TASK-115.3: 固定 MIDI CC → GenRole/descriptor マッピング（学習 UI なし MVP）
+// ----------------------------------------------------------------------------
+const MidiParamTarget = struct {
+    role: project_io.GenRole,
+    param: []const u8,
+};
+
+const MidiCcBinding = struct {
+    controller: u8,
+    label: []const u8,
+    targets: []const MidiParamTarget,
+    curve: patchmod.MidiCcCurve,
+    min: f32,
+    max: f32,
+};
+
+const MIDI_CC_MAP = [_]MidiCcBinding{
+    .{
+        .controller = 1,
+        .label = "tempo",
+        .targets = &[_]MidiParamTarget{.{ .role = .clock, .param = "bpm" }},
+        .curve = .linear,
+        .min = 60.0,
+        .max = 180.0,
+    },
+    .{
+        .controller = 7,
+        .label = "master_gain",
+        .targets = &[_]MidiParamTarget{.{ .role = .master_mixer, .param = "gain" }},
+        .curve = .linear,
+        .min = 0.0,
+        .max = 1.5,
+    },
+    .{
+        .controller = 16,
+        .label = "pad_warmth",
+        .targets = &[_]MidiParamTarget{.{ .role = .pad, .param = "warmth" }},
+        .curve = .linear,
+        .min = 0.0,
+        .max = 1.0,
+    },
+    .{
+        .controller = 71,
+        .label = "sidechain",
+        .targets = &[_]MidiParamTarget{.{ .role = .sidechain, .param = "amount" }},
+        .curve = .linear,
+        .min = 0.0,
+        .max = 1.0,
+    },
+    .{
+        .controller = 74,
+        .label = "cutoff",
+        .targets = &[_]MidiParamTarget{.{ .role = .master_vcf, .param = "cutoff" }},
+        .curve = .exponential,
+        .min = 80.0,
+        .max = 18000.0,
+    },
+};
+
+comptime {
+    // controller 重複禁止。descriptor 対応は midiBindingDescriptorsExist() で実行時確認。
+    for (MIDI_CC_MAP, 0..) |a, i| {
+        for (MIDI_CC_MAP[i + 1 ..]) |b| {
+            if (a.controller == b.controller) @compileError("MIDI_CC_MAP: duplicate controller");
+        }
+    }
+}
+
+fn midiRoleKind(role: project_io.GenRole) modular.ModuleKind {
+    return switch (role) {
+        .clock => .clock,
+        .pad => .chord_pad,
+        .sidechain => .sidechain,
+        .master_mixer => .mixer,
+        .master_vcf => .vcf,
+        else => .clock, // 表に無い role は到達しない（MIDI_CC_MAP の target のみ）。
+    };
+}
+
+fn midiBindingDescriptorsExist() bool {
+    // 全 target が既知 descriptor を指す（plan §8）。
+    for (MIDI_CC_MAP) |binding| {
+        for (binding.targets) |t| {
+            const kind = midiRoleKind(t.role);
+            const descs: []const modular.ParamDesc = switch (kind) {
+                inline else => |k| modular.descriptors(k),
+            };
+            var found = false;
+            for (descs) |d| {
+                if (std.mem.eql(u8, d.name, t.param)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+    }
+    return true;
 }
 
 /// recipe / diagnostics の canonical app name（既存 modular recipe 互換。TASK-105.4）。
@@ -454,6 +556,8 @@ const App = struct {
     song: SongData = .{},
     // TASK-110.4: main thread が所有する累積 override 表（Mailbox payload の source）。
     param_batch: patchmod.ParamBatch = .{},
+    // TASK-115.3: 固定 CC 表の直近 raw 値（未受信は null。digest midi_map 用）。
+    midi_cc_raw: [MIDI_CC_MAP.len]?u8 = [_]?u8{null} ** MIDI_CC_MAP.len,
     // TASK-124: field 単位で Inspector が共有する pending 操作値。
     param_edits: [MAX_PARAM_EDITS]param_view.ParamEditState = [_]param_view.ParamEditState{.{}} ** MAX_PARAM_EDITS,
     // params probe の observed は既定で master VCF cutoff。action observe_param で切替可能。
@@ -1113,6 +1217,117 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
     }));
     app.patch.render(buf, frames, channels);
     if (channels == 2) app.tap.write(buf);
+}
+
+// ----------------------------------------------------------------------------
+// TASK-115.3: main-thread MIDI drain（イベント時のみ。Executor/CommandLog 非経由）
+// ----------------------------------------------------------------------------
+
+fn handleForGenRole(app: *const App, role: project_io.GenRole) ?Handle {
+    const h = app.patch.snapshotGenRoles().get(role);
+    if (h == project_io.INVALID_ROLE_HANDLE) return null;
+    if (!app.dyn.isActive(h)) return null;
+    return h;
+}
+
+fn midiTargetActive(app: *const App, role: project_io.GenRole, param: []const u8) bool {
+    const h = handleForGenRole(app, role) orelse return false;
+    const kind = app.dyn.kindOf(h) orelse return false;
+    return paramDescFor(kind, param) != null;
+}
+
+/// CC → ParamBatch 更新。CommandLog / History / undo / recipe には一切触らない。
+fn applyMidiCc(app: *App, controller: u8, value: u8) void {
+    const v: u8 = @min(value, 127);
+    for (MIDI_CC_MAP, 0..) |binding, bi| {
+        if (binding.controller != controller) continue;
+        app.midi_cc_raw[bi] = v;
+        const mapped = patchmod.mapMidiCcValue(v, binding.curve, binding.min, binding.max);
+        var published = false;
+        for (binding.targets) |target| {
+            const h = handleForGenRole(app, target.role) orelse continue;
+            const kind = app.dyn.kindOf(h) orelse continue;
+            const desc = paramDescFor(kind, target.param) orelse continue;
+            if (desc.kind != .scalar) continue;
+            modular.validateParam(kind, desc.name, .{ .scalar = mapped }) catch continue;
+
+            var free: ?usize = null;
+            var found: ?usize = null;
+            for (app.param_batch.entries, 0..) |entry, i| {
+                if (!entry.touched) {
+                    if (free == null) free = i;
+                } else if (entry.handle == h and std.mem.eql(u8, entry.name, desc.name)) {
+                    found = i;
+                    break;
+                }
+            }
+            const index = found orelse free orelse continue;
+            app.param_batch.entries[index] = .{
+                .handle = h,
+                .name = desc.name,
+                .value = .{ .scalar = mapped },
+                .touched = true,
+            };
+            published = true;
+        }
+        if (published) {
+            app.param_batch.revision += 1;
+            app.patch.publishParamBatch(app.param_batch);
+        }
+        return;
+    }
+}
+
+/// main thread: MIDI FIFO を drain し note→NoteQueue / CC→ParamBatch へ振り分ける。
+/// Executor.executeAction を通さない（CommandLog/recipe 非記録）。
+fn drainMidiEvents(app: *App, device: *midi.Device) void {
+    while (device.pollMidi()) |ev| {
+        switch (ev) {
+            .note_on => |n| {
+                const vel = @as(f32, @floatFromInt(n.velocity)) / 127.0;
+                app.patch.sendMidiNoteOn(n.note, vel);
+            },
+            .note_off => |n| app.patch.sendMidiNoteOff(n.note),
+            .cc => |c| applyMidiCc(app, c.controller, c.value),
+        }
+    }
+}
+
+fn midiMapDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    var off: usize = 0;
+    const head = std.fmt.bufPrint(buf[off..], "map_version=1", .{}) catch return buf[0..0];
+    off += head.len;
+    for (MIDI_CC_MAP, 0..) |binding, bi| {
+        const raw: u8 = app.midi_cc_raw[bi] orelse 0; // ccN_value = raw CC 0..127（mapped Hz/BPM ではない）
+        // 1 CC 1 target（MVP）。将来 multi-target でも先頭 target を digest の代表にする。
+        const t0 = binding.targets[0];
+        const active: u8 = if (midiTargetActive(app, t0.role, t0.param)) 1 else 0;
+        const curve_s: []const u8 = switch (binding.curve) {
+            .linear => "linear",
+            .exponential => "exponential",
+        };
+        const piece = std.fmt.bufPrint(buf[off..], " cc{d}_label={s} cc{d}_role={s} cc{d}_param={s} cc{d}_curve={s} cc{d}_min={d} cc{d}_max={d} cc{d}_value={d} cc{d}_active={d}", .{
+            binding.controller,
+            binding.label,
+            binding.controller,
+            @tagName(t0.role),
+            binding.controller,
+            t0.param,
+            binding.controller,
+            curve_s,
+            binding.controller,
+            binding.min,
+            binding.controller,
+            binding.max,
+            binding.controller,
+            raw,
+            binding.controller,
+            active,
+        }) catch return buf[0..off];
+        off += piece.len;
+    }
+    return buf[0..off];
 }
 
 // ============================================================================
@@ -2831,6 +3046,7 @@ pub fn main(init: std.process.Init) !void {
 
     app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32, .undo_store = undo_store };
     app.observed_field = defaultObservedField(&app);
+    std.debug.assert(midiBindingDescriptorsExist());
     // 生成グラフ全体を canvas に配置する（初期状態は 8 列の折り返し。Drum/Bass の
     // マクロ台帳は既存 canvas 操作に任せ、全モジュールを MAX_MODULES 内で可視化する）。
     var layout_h: Handle = 0;
@@ -2912,6 +3128,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "panel", .ctx = &app, .ext = "json", .snapshot = null, .digest = panelDigest });
     platform.registerProbe(.{ .name = "params", .ctx = &app, .ext = "json", .snapshot = paramsSnapshot, .digest = paramsDigest });
     platform.registerProbe(.{ .name = "menu", .ctx = &app, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending/last_op/native" });
+    platform.registerProbe(.{ .name = "midi_map", .ctx = &app, .ext = "txt", .snapshot = null, .digest = midiMapDigest, .desc = "fixed MIDI CC map v1" });
     // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
     app.cmd_exec.log = &app.cmd_log;
@@ -2921,6 +3138,13 @@ pub fn main(init: std.process.Init) !void {
     registerPatchActions(&app);
     registerActions(&app);
     registerIntegratedStateSync(&app);
+
+    // TASK-115.3: MIDI device（harness 時は synthetic FIFO。native は CoreMIDI）。
+    var midi_device = midi.open(allocator) catch |err| {
+        std.debug.print("midi.open failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer midi_device.close();
 
     device.start() catch |err| {
         std.debug.print("audio.start failed: {s}\n", .{@errorName(err)});
@@ -2932,6 +3156,8 @@ pub fn main(init: std.process.Init) !void {
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
     main_loop: while (app.running and window.pollEvents()) {
+        // イベント時のみ: MIDI FIFO drain（空なら即 return。フレーム毎の常時走査ではない）。
+        drainMidiEvents(&app, &midi_device);
         {
             const fb = window.lockFramebuffer() orelse continue :main_loop;
             defer fb.unlock();

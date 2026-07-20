@@ -257,6 +257,25 @@ fn clampFinite(v: f32, lo: f32, hi: f32, fallback: f32) f32 {
     return std.math.clamp(v, lo, hi);
 }
 
+/// TASK-115.3: MIDI CC 0..127 → descriptor 範囲。main thread / テスト用（RT では呼ばない）。
+pub const MidiCcCurve = enum { linear, exponential };
+
+pub fn mapMidiCcValue(raw: u8, curve: MidiCcCurve, min: f32, max: f32) f32 {
+    const t = @as(f32, @floatFromInt(@min(raw, 127))) / 127.0;
+    const mapped: f32 = switch (curve) {
+        .linear => min + (max - min) * t,
+        .exponential => blk: {
+            if (!(min > 0.0 and max > 0.0)) break :blk min + (max - min) * t;
+            break :blk min * std.math.pow(f32, max / min, t);
+        },
+    };
+    if (!std.math.isFinite(mapped)) return min;
+    // 浮動小数誤差で端が僅かに外れるのを防ぐ
+    const lo = @min(min, max);
+    const hi = @max(min, max);
+    return std.math.clamp(mapped, lo, hi);
+}
+
 /// Mixer per-input から旧 trackGain 相当の実効 gain（mute 時 0、それ以外 base×input_gain）。
 fn effectiveMixerTrackGain(mixer: ?*const modular.Mixer, slot: usize, base: f32) f32 {
     const m = mixer orelse return 0;
@@ -401,6 +420,15 @@ pub const LofiPatch = struct {
     /// play/goto 直後の初回 bar を bar 境界を待たず強制 apply する（plan: 初回 bar は必ず切替扱い）
     song_force_apply: bool,
 
+    // TASK-115.3: MIDI note → ChordPad（既存 NoteQueue 再利用。cache-line 分離は ring.zig 側）。
+    note_queue: synth.NoteQueue(256, 16) = .{},
+    note_panic_seen: u32 = 0,
+    /// monophonic last-note priority 用の固定長 held 表（RT 所有・alloc なし）。
+    midi_held: [128]bool = [_]bool{false} ** 128,
+    midi_age: [128]u32 = [_]u32{0} ** 128,
+    midi_age_clock: u32 = 0,
+    midi_current_note: ?u8 = null,
+
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) !*LofiPatch {
         const self = try allocator.create(LofiPatch);
         errdefer allocator.destroy(self);
@@ -458,6 +486,12 @@ pub const LofiPatch = struct {
             .song_last_phrase = .{ PHRASE_NONE, PHRASE_NONE, PHRASE_NONE, PHRASE_NONE },
             .applied_song_goto_gen = 0,
             .song_force_apply = false,
+            .note_queue = .{},
+            .note_panic_seen = 0,
+            .midi_held = [_]bool{false} ** 128,
+            .midi_age = [_]u32{0} ** 128,
+            .midi_age_clock = 0,
+            .midi_current_note = null,
         };
 
         self.graph = try modular.DynGraph.create(allocator, sample_rate);
@@ -488,6 +522,19 @@ pub const LofiPatch = struct {
     /// main thread: 累積 override 表を publish する。revision は呼び出し側で管理する。
     pub fn publishParamBatch(self: *LofiPatch, batch: ParamBatch) void {
         self.controls.param_db.publish(batch);
+    }
+
+    /// main thread（イベント時のみ）: MIDI note_on → 既存 NoteQueue。velocity は 0..1。
+    /// 満杯間際は NoteQueue が間引く。CommandLog/recipe 経路は通さない。
+    pub fn sendMidiNoteOn(self: *LofiPatch, note: u8, velocity: f32) void {
+        _ = self.note_queue.sendNoteOn(note, velocity);
+    }
+
+    /// main thread（イベント時のみ）: MIDI note_off。送れなければ panic で stuck note を防止。
+    pub fn sendMidiNoteOff(self: *LofiPatch, note: u8) void {
+        if (!self.note_queue.sendNoteOff(note)) {
+            self.note_queue.panicAllNotesOff();
+        }
     }
 
     pub fn destroy(self: *LofiPatch) void {
@@ -681,6 +728,7 @@ pub const LofiPatch = struct {
 
     /// RT callback から呼ぶ（alloc/lock/IO/panic なし）。interleaved 出力へ書く。
     pub fn render(self: *LofiPatch, buf: []f32, frames: u32, channels: u32) void {
+        self.drainMidiNotes(); // block 冒頭: NoteQueue drain のみ（新設 per-sample loop なし）
         self.applyControls();
         // TASK-91: play/goto 直後の初回 bar を processBlock 前に 1 回だけ apply（bar 境界待ちをしない）。
         // 固定長・alloc なし。force 消費後は通常の maybeEvolve bar 境界経路のみ。
@@ -690,6 +738,74 @@ pub const LofiPatch = struct {
         }
         self.graph.processBlock(buf, frames, channels);
         self.maybeEvolve(); // 小節境界を跨いだら 1 小節 1 回だけ前景を変異
+    }
+
+    /// RT block 冒頭: NoteQueue を drain し ChordPad MIDI state へ反映（alloc/lock/IO/panic なし）。
+    /// 順序は libs/synth Synth.render と同じ: 先に ring を空にしてから panic を消費する。
+    /// panic 後に残 note_on を適用すると stuck になるため、panic は drain 完了後に全解除する。
+    fn drainMidiNotes(self: *LofiPatch) void {
+        while (self.note_queue.pop()) |ev| {
+            switch (ev) {
+                .note_on => |n| self.applyHeldNoteOn(n.note, n.velocity),
+                .note_off => |n| self.applyHeldNoteOff(n.note),
+            }
+        }
+        if (self.note_queue.takePanic(&self.note_panic_seen)) {
+            self.clearAllMidiHeld();
+        }
+    }
+
+    fn clearAllMidiHeld(self: *LofiPatch) void {
+        @memset(&self.midi_held, false);
+        @memset(&self.midi_age, 0);
+        self.midi_age_clock = 0;
+        self.midi_current_note = null;
+        if (self.ptr(.chord_pad, self.pad_h)) |pad| pad.clearMidi();
+    }
+
+    fn applyHeldNoteOn(self: *LofiPatch, note: u8, velocity: f32) void {
+        const n: u8 = @min(note, 127);
+        self.midi_held[n] = true;
+        self.midi_age_clock +%= 1;
+        self.midi_age[n] = self.midi_age_clock;
+        self.midi_current_note = n;
+        if (self.ptr(.chord_pad, self.pad_h)) |pad| {
+            pad.applyMidiNote(n, velocity);
+        }
+    }
+
+    fn applyHeldNoteOff(self: *LofiPatch, note: u8) void {
+        const n: u8 = @min(note, 127);
+        self.midi_held[n] = false;
+        const cur = self.midi_current_note orelse {
+            self.syncChordPadFromHeld();
+            return;
+        };
+        if (cur != n) return; // 他ノートの off は current を変えない
+        // last-note priority: 残 held のうち最新 age を選ぶ。無ければ release。
+        var best_note: ?u8 = null;
+        var best_age: u32 = 0;
+        var i: u8 = 0;
+        while (i < 128) : (i += 1) {
+            if (!self.midi_held[i]) continue;
+            const age = self.midi_age[i];
+            if (best_note == null or age > best_age) {
+                best_note = i;
+                best_age = age;
+            }
+        }
+        self.midi_current_note = best_note;
+        self.syncChordPadFromHeld();
+    }
+
+    fn syncChordPadFromHeld(self: *LofiPatch) void {
+        const pad = self.ptr(.chord_pad, self.pad_h) orelse return;
+        if (self.midi_current_note) |n| {
+            // velocity は直近 note_on のものを ChordPad が保持。root のみ更新。
+            pad.applyMidiNote(n, pad.midi_velocity);
+        } else {
+            pad.clearMidi();
+        }
     }
 
     /// GUI が store/publish した Controls を各モジュール field へ反映（RT 単一スレッド）。
@@ -3044,4 +3160,132 @@ test "TASK-160.2: seed CRC / mutation sequence stays deterministic" {
     try testing.expectEqual(sa.clap_on, sb.clap_on);
     try testing.expectEqual(sa.bass_on, sb.bass_on);
     try testing.expect(sa.mutation_count > 0);
+}
+
+// ----------------------------------------------------------------------------
+// TASK-115.3: MIDI note routing（NoteQueue → held → ChordPad）。CommandLog/recipe 非経由。
+// ----------------------------------------------------------------------------
+
+test "TASK-115.3: NoteQueue(256,16) reuses synth NoteQueue type" {
+    // cache-line 分離は libs/synth/src/ring.zig の既存テストが固定。ここでは型再利用のみ確認。
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    const Q = synth.NoteQueue(256, 16);
+    try testing.expect(@TypeOf(patch.note_queue) == Q);
+}
+
+test "TASK-115.3: note_on/note_off FIFO and last-note priority" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var buf: [128]f32 = undefined;
+
+    patch.sendMidiNoteOn(60, 1.0);
+    patch.sendMidiNoteOn(64, 0.5);
+    patch.render(&buf, 64, 2);
+    try testing.expectEqual(@as(?u8, 64), patch.midi_current_note);
+    try testing.expect(patch.midi_held[60]);
+    try testing.expect(patch.midi_held[64]);
+    const pad = testPad(patch);
+    try testing.expect(pad.midi_active);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), pad.midi_velocity, 1e-6);
+
+    // 現在ノート(64)を離す → 60 に戻る
+    patch.sendMidiNoteOff(64);
+    patch.render(&buf, 64, 2);
+    try testing.expectEqual(@as(?u8, 60), patch.midi_current_note);
+    try testing.expect(pad.midi_active);
+
+    // 全解放 → MIDI clear / ambient 復帰
+    patch.sendMidiNoteOff(60);
+    patch.render(&buf, 64, 2);
+    try testing.expectEqual(@as(?u8, null), patch.midi_current_note);
+    try testing.expect(!pad.midi_active);
+}
+
+test "TASK-115.3: note_off overflow triggers panicAllNotesOff" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    // capacity 256 を note_off で満杯にしてからさらに off → panic
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        try testing.expect(patch.note_queue.sendNoteOff(@truncate(i)));
+    }
+    try testing.expect(!patch.note_queue.sendNoteOff(0)); // 満杯確認
+    patch.sendMidiNoteOff(0); // push 失敗 → panicAllNotesOff
+    var buf: [64]f32 = undefined;
+    patch.midi_held[60] = true;
+    patch.midi_current_note = 60;
+    if (patch.ptr(.chord_pad, patch.pad_h)) |pad| pad.applyMidiNote(60, 1.0);
+    patch.render(&buf, 32, 2);
+    try testing.expectEqual(@as(?u8, null), patch.midi_current_note);
+    try testing.expect(!testPad(patch).midi_active);
+}
+
+test "TASK-115.3: panic after queued note_on does not leave stuck note" {
+    // overflow 時キューに note_on が残っていても、drain→panic（Synth と同順）で最終的に全解除。
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    // note_on を reserve 枠手前まで積む（capacity 256, off_reserve 16 → note_on は used+16>=256 で拒否）
+    var i: usize = 0;
+    while (i < 240) : (i += 1) {
+        try testing.expect(patch.note_queue.sendNoteOn(@truncate(i % 128), 1.0));
+    }
+    // 残りを note_off で埋めて満杯にし、さらに off → panic
+    i = 0;
+    while (i < 16) : (i += 1) {
+        try testing.expect(patch.note_queue.sendNoteOff(@truncate(i)));
+    }
+    try testing.expect(!patch.note_queue.sendNoteOff(99));
+    patch.sendMidiNoteOff(99); // panic
+    var buf: [64]f32 = undefined;
+    patch.render(&buf, 32, 2);
+    try testing.expectEqual(@as(?u8, null), patch.midi_current_note);
+    try testing.expect(!testPad(patch).midi_active);
+    var n: u8 = 0;
+    while (n < 128) : (n += 1) {
+        try testing.expect(!patch.midi_held[n]);
+    }
+    // 次 block の新規 note は通常どおり受理される
+    patch.sendMidiNoteOn(72, 0.8);
+    patch.render(&buf, 32, 2);
+    try testing.expectEqual(@as(?u8, 72), patch.midi_current_note);
+    try testing.expect(testPad(patch).midi_active);
+}
+
+test "TASK-115.3: MIDI note path does not touch ParamBatch/recipe surface" {
+    // 構造契約: sendMidiNote* は NoteQueue のみ。ParamBatch revision は不変。
+    // CommandLog/Executor は LofiPatch が import すらしない（recipe 非記録の固定）。
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    const before = patch.controls.param_db.acquire().revision;
+    patch.sendMidiNoteOn(60, 1.0);
+    patch.sendMidiNoteOff(60);
+    try testing.expectEqual(before, patch.controls.param_db.acquire().revision);
+}
+
+test "TASK-115.3: multi-target ParamBatch publishes in one revision" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var batch = ParamBatch{};
+    batch.revision = 7;
+    batch.entries[0] = .{ .handle = patch.clock_h, .name = "bpm", .value = .{ .scalar = 60.0 }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.master_vcf_h, .name = "cutoff", .value = .{ .scalar = 80.0 }, .touched = true };
+    patch.publishParamBatch(batch);
+    var buf: [128]f32 = undefined;
+    patch.render(&buf, 64, 2);
+    try testing.expectEqual(@as(f32, 60.0), testClock(patch).bpm);
+    try testing.expectEqual(@as(f32, 80.0), testMasterVcf(patch).cutoff);
+    try testing.expectEqual(@as(u64, 7), patch.controls.param_db.acquire().revision);
+}
+
+test "TASK-115.3: mapMidiCcValue linear/exponential boundaries" {
+    try testing.expectApproxEqAbs(@as(f32, 60.0), mapMidiCcValue(0, .linear, 60.0, 180.0), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 180.0), mapMidiCcValue(127, .linear, 60.0, 180.0), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 80.0), mapMidiCcValue(0, .exponential, 80.0, 18000.0), 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 18000.0), mapMidiCcValue(127, .exponential, 80.0, 18000.0), 1e-1);
+    // 中間値は範囲内
+    const mid = mapMidiCcValue(64, .exponential, 80.0, 18000.0);
+    try testing.expect(mid > 80.0 and mid < 18000.0);
+    const lin_mid = mapMidiCcValue(64, .linear, 0.0, 1.5);
+    try testing.expect(lin_mid >= 0.0 and lin_mid <= 1.5);
 }
