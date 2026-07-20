@@ -333,13 +333,15 @@ static bool queue_mark_none(EventQueue* q, EventQueueToken token) {
     return true;
 }
 
-// NSEvent の locationInWindow を view 内の左上原点座標へ変換 (floor 整数化)。
-static void event_location_to_platform_coords(NSEvent* event, NSView* view, int32_t* out_x, int32_t* out_y) {
+// NSEvent の locationInWindow を view 内の左上原点・raw physical pixel へ変換 (floor 整数化)。
+// scale は current native backing scale。負値・ウィンドウ外も clamp しない（従来どおり）。
+static void event_location_to_platform_raw_coords(NSEvent* event, NSView* view, CGFloat scale, int32_t* out_x, int32_t* out_y) {
     NSPoint windowPt = event.locationInWindow;
     NSPoint viewPt = [view convertPoint:windowPt fromView:nil];
     CGFloat viewHeight = view.bounds.size.height;
-    *out_x = (int32_t)floor(viewPt.x);
-    *out_y = (int32_t)floor(viewHeight - viewPt.y);  // Y フリップ
+    CGFloat s = (scale > 0.0) ? scale : 1.0;
+    *out_x = (int32_t)floor(viewPt.x * s);
+    *out_y = (int32_t)floor((viewHeight - viewPt.y) * s);  // Y フリップ
 }
 
 // 現在押下中のボタン bitmask (& 0x07 で X1/X2 を除外)。
@@ -385,8 +387,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 // カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
 @interface FramebufferView : NSView <NSTextInputClient, NSDraggingDestination> {
-    int width;
-    int height;
+    int width;   // framebuffer pixel width（.logical では logical と同値）
+    int height;  // framebuffer pixel height
+    int logicalWidth;
+    int logicalHeight;
+    BOOL physicalMode;
+    CGFloat contentScale;        // latched（lock で commit 済み。present / lock snapshot 用）
+    CGFloat pendingContentScale; // 検出済み current negotiated scale（metrics query / 入力 raw 用）
+    uint64_t scaleEpoch;         // latched epoch。buffer/scale と原子的にだけ +1
+    BOOL hasPendingResize;
+    int pendingLogicalWidth;
+    int pendingLogicalHeight;
     CADisplayLink* displayLink;
     FrameCallback callback;
     void* userdata;
@@ -454,7 +465,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
-     platformWindow:(PlatformWindow*)pw;
+     platformWindow:(PlatformWindow*)pw
+       physicalMode:(BOOL)physical;
 - (void)startDisplayLink;
 - (void)stopDisplayLink;
 - (void)displayLinkFired:(CADisplayLink*)link;
@@ -488,17 +500,50 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)refreshClickThrough;
 - (NSEvent *)takeLastMouseDownEvent;
 
+// TASK-156.1: scale latch / metrics
+// fillMetrics:forQuery: YES=current query（pending scale）、NO=latched snapshot（lock 後）
+- (void)fillMetrics:(PlatformFramebufferMetrics*)out forQuery:(BOOL)forQuery;
+- (void)applyLatchedMetricsIfNeeded;
+- (CGFloat)nativeEventScale;
+- (void)refreshPendingContentScale;
+
 @end
 
 @implementation FramebufferView
 
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
-     platformWindow:(PlatformWindow*)pw {
+     platformWindow:(PlatformWindow*)pw
+       physicalMode:(BOOL)physical {
     self = [super initWithFrame:frame];
     if (self) {
-        width = w;
-        height = h;
+        physicalMode = physical;
+        logicalWidth = w;
+        logicalHeight = h;
+        hasPendingResize = NO;
+        pendingLogicalWidth = w;
+        pendingLogicalHeight = h;
+        scaleEpoch = 0;
+        // 初期 scale: window 未接続なので mainScreen。未取得・非対応は 1.0。
+        CGFloat scale = 1.0;
+        NSScreen* screen = [NSScreen mainScreen];
+        if (screen) {
+            scale = screen.backingScaleFactor;
+            if (scale <= 0.0) scale = 1.0;
+        }
+        contentScale = scale;
+        pendingContentScale = scale;
+
+        int fw = w;
+        int fh = h;
+        if (physicalMode) {
+            fw = (int)lround((double)w * (double)scale);
+            fh = (int)lround((double)h * (double)scale);
+            if (fw < 1) fw = 1;
+            if (fh < 1) fh = 1;
+        }
+        width = fw;
+        height = fh;
         callback = cb;
         userdata = ud;
         platformWindow = pw;
@@ -529,8 +574,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         lastMouseDownEvent = nil;
 
         // ダブルバッファを確保（ページアラインメント推奨）
-        buffer0 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
-        buffer1 = (uint32_t*)calloc(width * height, sizeof(uint32_t));
+        // .logical: 従来どおり logical_w * logical_h。.physical のみ物理寸法。
+        buffer0 = (uint32_t*)calloc((size_t)width * (size_t)height, sizeof(uint32_t));
+        buffer1 = (uint32_t*)calloc((size_t)width * (size_t)height, sizeof(uint32_t));
         currentBuffer = buffer0;
         displayBuffer = buffer1;
 
@@ -541,7 +587,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         provider0 = CGDataProviderCreateWithData(
             NULL,
             buffer0,
-            width * height * sizeof(uint32_t),
+            (size_t)width * (size_t)height * sizeof(uint32_t),
             NULL
         );
 
@@ -549,19 +595,24 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         provider1 = CGDataProviderCreateWithData(
             NULL,
             buffer1,
-            width * height * sizeof(uint32_t),
+            (size_t)width * (size_t)height * sizeof(uint32_t),
             NULL
         );
 
         // レイヤーバックドビューに設定
         [self setWantsLayer:YES];
 
-        // コンテンツレイヤーを作成
+        // コンテンツレイヤーを作成（frame は常に logical points）
         contentLayer = [CALayer layer];
-        contentLayer.frame = CGRectMake(0, 0, width, height);
+        contentLayer.frame = CGRectMake(0, 0, logicalWidth, logicalHeight);
         contentLayer.opaque = YES;
         contentLayer.geometryFlipped = YES;  // Y軸反転を一度だけ設定
         [self.layer addSublayer:contentLayer];
+        contentLayer.magnificationFilter = kCAFilterNearest;
+        contentLayer.minificationFilter = kCAFilterNearest;
+        if (physicalMode) {
+            contentLayer.contentsScale = contentScale;
+        }
 
         // パフォーマンス測定の初期化
         lastFrameTime = CFAbsoluteTimeGetCurrent();
@@ -571,7 +622,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         // TASK-113.4: OS ファイル drag & drop（file URL のみ。objc backend 先行）
         [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
-        NSLog(@"[%s] Framebuffer initialized: %dx%d", IMPLEMENTATION_TYPE, width, height);
+        NSLog(@"[%s] Framebuffer initialized: logical=%dx%d fb=%dx%d scale=%.2f physical=%d",
+              IMPLEMENTATION_TYPE, logicalWidth, logicalHeight, width, height, contentScale, physicalMode ? 1 : 0);
     }
     return self;
 }
@@ -837,7 +889,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 // 新サイズへフレームバッファ/プロバイダを two-phase で再確保する。
 // 新リソースの確保に成功してから旧リソースを破棄する（失敗時は旧サイズを維持）。
-// 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
+// .logical: 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
+// .physical の pending apply は applyLatchedMetricsIfNeeded が物理寸法で呼ぶ。
 - (BOOL)resizeBuffersTo:(int)w height:(int)h {
     if (!buffer0 || !buffer1) return NO; // init 途中（super の setFrameSize）では何もしない
     if (w < 1) w = 1;
@@ -879,8 +932,104 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     displayBuffer = buffer1;
     width = w;
     height = h;
-    contentLayer.frame = CGRectMake(0, 0, w, h);
+    if (!physicalMode) {
+        // .logical: framebuffer == logical。layer frame も同寸法（従来どおり）。
+        logicalWidth = w;
+        logicalHeight = h;
+        contentLayer.frame = CGRectMake(0, 0, w, h);
+    }
     return YES;
+}
+
+// TASK-156.1: pending logical size / scale を lock 境界で latch。
+// scale_epoch は buffer 再確保・scale 適用が成功したときだけ +1（OOM 時は旧 3 値+旧 epoch を維持）。
+- (void)refreshPendingContentScale {
+    if (!self.window) return;
+    CGFloat live = self.window.backingScaleFactor;
+    if (live <= 0.0) live = 1.0;
+    pendingContentScale = live;
+}
+
+- (void)applyLatchedMetricsIfNeeded {
+    // lock 時に live backingScaleFactor を再確認（通知取りこぼし対策）。epoch はまだ増やさない。
+    [self refreshPendingContentScale];
+
+    const CGFloat newScale = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
+    const BOOL scaleChanging = fabs(newScale - contentScale) > 1e-6;
+
+    if (!physicalMode) {
+        // .logical: buffer 寸法は触らず。scale が変わったときだけ epoch と latched scale を原子 commit。
+        if (scaleChanging) {
+            contentScale = newScale;
+            scaleEpoch += 1;
+        }
+        return;
+    }
+
+    int lw = hasPendingResize ? pendingLogicalWidth : logicalWidth;
+    int lh = hasPendingResize ? pendingLogicalHeight : logicalHeight;
+    if (lw < 1) lw = 1;
+    if (lh < 1) lh = 1;
+    int fw = (int)lround((double)lw * (double)newScale);
+    int fh = (int)lround((double)lh * (double)newScale);
+    if (fw < 1) fw = 1;
+    if (fh < 1) fh = 1;
+
+    const BOOL sizeChanging = (fw != width || fh != height || lw != logicalWidth || lh != logicalHeight);
+    if (!sizeChanging && !scaleChanging) {
+        hasPendingResize = NO;
+        return;
+    }
+
+    if (sizeChanging) {
+        if (![self resizeBuffersTo:fw height:fh]) {
+            // OOM: 旧 buffer / 旧 latched scale / 旧 epoch を維持（pending は残して次 lock で再試行）
+            return;
+        }
+    }
+    // 成功時のみ logical・latched scale・epoch をまとめて commit
+    logicalWidth = lw;
+    logicalHeight = lh;
+    if (scaleChanging) scaleEpoch += 1;
+    contentScale = newScale;
+    hasPendingResize = NO;
+    contentLayer.frame = CGRectMake(0, 0, logicalWidth, logicalHeight);
+    contentLayer.contentsScale = contentScale;
+}
+
+// forQuery=YES: current negotiated（pending scale）。lock 前の contentScale()/入力正規化用。
+// forQuery=NO: latched snapshot（buffer/scale/epoch が同一 frame に属する）。lock_ex 用。
+- (void)fillMetrics:(PlatformFramebufferMetrics*)out forQuery:(BOOL)forQuery {
+    if (!out) return;
+    if (forQuery) [self refreshPendingContentScale];
+    out->logical_width = (uint32_t)logicalWidth;
+    out->logical_height = (uint32_t)logicalHeight;
+    out->framebuffer_width = (uint32_t)width;
+    out->framebuffer_height = (uint32_t)height;
+    const CGFloat scale = forQuery ? pendingContentScale : contentScale;
+    out->content_scale = (float)((scale > 0.0) ? scale : 1.0);
+    out->scale_epoch = scaleEpoch;
+}
+
+- (CGFloat)nativeEventScale {
+    [self refreshPendingContentScale];
+    return (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
+}
+
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    CGFloat s = 1.0;
+    if (self.window) {
+        s = self.window.backingScaleFactor;
+        if (s <= 0.0) s = 1.0;
+    }
+    // pending のみ更新。epoch / latched scale / buffer は次の lock 成功時に原子 commit。
+    if (fabs(s - pendingContentScale) > 1e-6) {
+        pendingContentScale = s;
+        if (physicalMode && redrawCallback) {
+            redrawCallback(redrawUserdata);
+        }
+    }
 }
 
 // NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
@@ -888,6 +1037,20 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 // AppKit の live-resize tracking run loop 中でも CATransaction commit により画面反映される）。
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
+    if (physicalMode) {
+        int nw = (int)newSize.width;
+        int nh = (int)newSize.height;
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        if (nw != logicalWidth || nh != logicalHeight) {
+            pendingLogicalWidth = nw;
+            pendingLogicalHeight = nh;
+            hasPendingResize = YES;
+            // buffer は次 lock で apply。redraw で app に lock を促す。
+            if (redrawCallback) redrawCallback(redrawUserdata);
+        }
+        return;
+    }
     const int old_w = width;
     const int old_h = height;
     if ([self resizeBuffersTo:(int)newSize.width height:(int)newSize.height]) {
@@ -1459,7 +1622,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)enqueueMouseEvent:(PlatformEventType)type withButton:(PlatformMouseButton)btn from:(NSEvent*)event {
     if (!platformWindow) return;
     int32_t x, y;
-    event_location_to_platform_coords(event, self, &x, &y);
+    event_location_to_platform_raw_coords(event, self, [self nativeEventScale], &x, &y);
     PlatformEvent ev;
     ev.type = type;
     ev.payload.mouse.x = x;
@@ -1477,7 +1640,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)scrollWheel:(NSEvent *)event {
     if (!platformWindow) return;
     int32_t x, y;
-    event_location_to_platform_coords(event, self, &x, &y);
+    CGFloat scale = [self nativeEventScale];
+    event_location_to_platform_raw_coords(event, self, scale, &x, &y);
 
     BOOL is_precise = event.hasPreciseScrollingDeltas;
     float dx = (float)event.scrollingDeltaX;
@@ -1486,6 +1650,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         dx *= SCROLL_LINE_TO_POINTS;
         dy *= SCROLL_LINE_TO_POINTS;
     }
+    // raw physical unit（facade が latched scale で論理化）
+    dx *= (float)scale;
+    dy *= (float)scale;
 
     PlatformEvent ev;
     ev.type = PLATFORM_EVENT_MOUSE_SCROLL;
@@ -1712,18 +1879,20 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
     return platform_create_window_ex(width, height, title, callback, userdata, NULL);
 }
 
-// TASK-104 / TASK-117: options 付きウィンドウ作成。opts==NULL は従来動作。
+// TASK-104 / TASK-117 / TASK-156.1: options 付きウィンドウ作成。opts==NULL は従来動作。
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts) {
     // unknown flags / reserved!=0 は NULL（silent 無視しない。facade が error.Unsupported へ）
-    BOOL transparent = NO, borderless = NO, has_position = NO;
+    BOOL transparent = NO, borderless = NO, has_position = NO, physical = NO;
     int pos_x = 0, pos_y = 0;
     if (opts) {
-        const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS | PLATFORM_WINDOW_POSITION;
+        const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS |
+                               PLATFORM_WINDOW_POSITION | PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL;
         if ((opts->flags & ~known) != 0 || opts->reserved != 0) return NULL;
         transparent = (opts->flags & PLATFORM_WINDOW_TRANSPARENT) != 0;
         borderless = (opts->flags & PLATFORM_WINDOW_BORDERLESS) != 0;
+        physical = (opts->flags & PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) != 0;
         if ((opts->flags & PLATFORM_WINDOW_POSITION) != 0) {
             has_position = YES;
             pos_x = opts->x;
@@ -1787,7 +1956,8 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
                                                               height:height
                                                             callback:callback
                                                              userdata:userdata
-                                                     platformWindow:platformWindow];
+                                                     platformWindow:platformWindow
+                                                       physicalMode:physical];
         QuitWindowDelegate* quitDelegate = [[QuitWindowDelegate alloc] init];
         quitDelegate.platformWindow = platformWindow;
         platformWindow->quit_delegate = quitDelegate;
@@ -2080,15 +2250,34 @@ double platform_get_time(void) {
     return (double)ns / 1e9;
 }
 
-// フレームバッファへのアクセスを開始
+// フレームバッファへのアクセスを開始（既存 wrapper。lock_ex の width/height 投影）
 uint32_t* platform_lock_framebuffer(PlatformWindow* platformWindow, int* out_width, int* out_height) {
-    if (!platformWindow) return NULL;
+    PlatformFramebufferMetrics metrics;
+    uint32_t* px = platform_lock_framebuffer_ex(platformWindow, &metrics);
+    if (!px) return NULL;
+    if (out_width) *out_width = (int)metrics.framebuffer_width;
+    if (out_height) *out_height = (int)metrics.framebuffer_height;
+    return px;
+}
 
+bool platform_get_framebuffer_metrics(PlatformWindow* platformWindow, PlatformFramebufferMetrics* out) {
+    if (!platformWindow || !out) return false;
     FramebufferView* view = platformWindow->view;
+    if (!view) return false;
+    // current query: pending/current negotiated scale を即座に反映（lock 前の入力正規化用）
+    [view fillMetrics:out forQuery:YES];
+    return true;
+}
 
-    // アクセサメソッドを使用してバッファにアクセス
-    if (out_width) *out_width = [view getWidth];
-    if (out_height) *out_height = [view getHeight];
+uint32_t* platform_lock_framebuffer_ex(PlatformWindow* platformWindow, PlatformFramebufferMetrics* out) {
+    if (!platformWindow) return NULL;
+    FramebufferView* view = platformWindow->view;
+    if (!view) return NULL;
+
+    // pending scale/size を latch（成功時のみ buffer/scale/epoch を原子 commit）
+    [view applyLatchedMetricsIfNeeded];
+    // latched snapshot（4 fields が同一 frame に属する）
+    if (out) [view fillMetrics:out forQuery:NO];
 
     // currentBufferを返す（ユーザーが書き込むバッファ）
     return [view getCurrentBuffer];

@@ -1562,6 +1562,10 @@ pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    logical_size: types.WindowSize,
+    framebuffer_size: types.WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
     state: *State,
 
     pub fn unlock(self: Framebuffer) void {
@@ -1582,10 +1586,15 @@ fn freeBufferIndex(st: *State) ?usize {
 
 fn lockAt(st: *State, i: usize) Framebuffer {
     st.locked_index = i;
+    const size: types.WindowSize = .{ .width = st.width, .height = st.height };
     return .{
         .pixels = st.buffers[i].pixels,
         .width = st.width,
         .height = st.height,
+        .logical_size = size,
+        .framebuffer_size = size,
+        .content_scale = 1.0,
+        .scale_epoch = 0,
         .state = st,
     };
 }

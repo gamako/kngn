@@ -1061,10 +1061,12 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
     var position: (x: Int32, y: Int32)? = nil
     if let opts = opts {
         let flags = opts.pointee.flags
-        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION)
+        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)
         if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
         transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
         borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
+        // TASK-156.1: PHYSICAL flag は受理するが P1 の Swift/Metal buffer は scale=1 のまま（P5 送り）
+        _ = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
         if (flags & UInt32(PLATFORM_WINDOW_POSITION)) != 0 {
             position = (opts.pointee.x, opts.pointee.y)
         }
@@ -1436,19 +1438,54 @@ func platform_get_time() -> Double {
 
 @_cdecl("platform_lock_framebuffer")
 func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_width: UnsafeMutablePointer<Int32>?, out_height: UnsafeMutablePointer<Int32>?) -> UnsafeMutablePointer<UInt32>? {
-    guard let platformWindow = platformWindow else { return nil }
-
-    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
-
-    // サイズを返す（live サイズ。resize-safe）
+    var metrics = PlatformFramebufferMetrics(
+        logical_width: 0,
+        logical_height: 0,
+        framebuffer_width: 0,
+        framebuffer_height: 0,
+        content_scale: 1.0,
+        scale_epoch: 0
+    )
+    guard let px = platform_lock_framebuffer_ex(platformWindow: platformWindow, out: &metrics) else { return nil }
     if let out_width = out_width {
-        out_width.pointee = Int32(handle.backendView.width)
+        out_width.pointee = Int32(metrics.framebuffer_width)
     }
     if let out_height = out_height {
-        out_height.pointee = Int32(handle.backendView.height)
+        out_height.pointee = Int32(metrics.framebuffer_height)
     }
+    return px
+}
 
-    // 現在の書込バッファを返す
+// TASK-156.1: scale=1 stub（Swift/Metal の物理 buffer は P5）。logical == framebuffer。
+@_cdecl("platform_get_framebuffer_metrics")
+func platform_get_framebuffer_metrics(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformFramebufferMetrics>?) -> Bool {
+    guard let platformWindow = platformWindow, let out = out else { return false }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let w = UInt32(handle.backendView.width)
+    let h = UInt32(handle.backendView.height)
+    out.pointee.logical_width = w
+    out.pointee.logical_height = h
+    out.pointee.framebuffer_width = w
+    out.pointee.framebuffer_height = h
+    out.pointee.content_scale = 1.0
+    out.pointee.scale_epoch = 0
+    return true
+}
+
+@_cdecl("platform_lock_framebuffer_ex")
+func platform_lock_framebuffer_ex(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformFramebufferMetrics>?) -> UnsafeMutablePointer<UInt32>? {
+    guard let platformWindow = platformWindow else { return nil }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    let w = UInt32(handle.backendView.width)
+    let h = UInt32(handle.backendView.height)
+    if let out = out {
+        out.pointee.logical_width = w
+        out.pointee.logical_height = h
+        out.pointee.framebuffer_width = w
+        out.pointee.framebuffer_height = h
+        out.pointee.content_scale = 1.0
+        out.pointee.scale_epoch = 0
+    }
     return handle.currentFramebuffer
 }
 

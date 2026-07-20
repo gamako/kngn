@@ -439,6 +439,7 @@ pub const Window = struct {
         var flags: u32 = 0;
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
         if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
+        if (opts.fb_mode == .physical) flags |= c.PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL;
         var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0, .x = 0, .y = 0 };
         if (opts.position) |pos| {
             copts.flags |= c.PLATFORM_WINDOW_POSITION;
@@ -595,16 +596,44 @@ pub const Window = struct {
     }
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
-        var w: c_int = 0;
-        var h: c_int = 0;
-        const px = c.platform_lock_framebuffer(self.handle, &w, &h) orelse return null;
-        const len = @as(usize, @intCast(w)) * @as(usize, @intCast(h));
+        var metrics: c.PlatformFramebufferMetrics = .{
+            .logical_width = 0,
+            .logical_height = 0,
+            .framebuffer_width = 0,
+            .framebuffer_height = 0,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
+        };
+        const px = c.platform_lock_framebuffer_ex(self.handle, &metrics) orelse return null;
+        const fw = metrics.framebuffer_width;
+        const fh = metrics.framebuffer_height;
+        const len = @as(usize, fw) * @as(usize, fh);
         return .{
             .pixels = px[0..len],
-            .width = @intCast(w),
-            .height = @intCast(h),
+            .width = fw,
+            .height = fh,
+            .logical_size = .{ .width = metrics.logical_width, .height = metrics.logical_height },
+            .framebuffer_size = .{ .width = fw, .height = fh },
+            .content_scale = metrics.content_scale,
+            .scale_epoch = metrics.scale_epoch,
             .window_handle = self.handle,
         };
+    }
+
+    /// 現在の negotiated logical size（TASK-156.1）。frame 中の描画は Framebuffer snapshot を使う。
+    pub fn logicalSize(self: Window) types.WindowSize {
+        const m = getMetrics(self) orelse return .{ .width = 0, .height = 0 };
+        return .{ .width = m.logical_width, .height = m.logical_height };
+    }
+
+    pub fn framebufferSize(self: Window) types.WindowSize {
+        const m = getMetrics(self) orelse return .{ .width = 0, .height = 0 };
+        return .{ .width = m.framebuffer_width, .height = m.framebuffer_height };
+    }
+
+    pub fn contentScale(self: Window) f32 {
+        const m = getMetrics(self) orelse return 1.0;
+        return if (m.content_scale > 0) m.content_scale else 1.0;
     }
 
     pub fn present(self: Window) void {
@@ -788,12 +817,29 @@ pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    logical_size: types.WindowSize,
+    framebuffer_size: types.WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
     window_handle: *c.PlatformWindow,
 
     pub fn unlock(self: Framebuffer) void {
         c.platform_unlock_framebuffer(self.window_handle);
     }
 };
+
+fn getMetrics(win: Window) ?c.PlatformFramebufferMetrics {
+    var metrics: c.PlatformFramebufferMetrics = .{
+        .logical_width = 0,
+        .logical_height = 0,
+        .framebuffer_width = 0,
+        .framebuffer_height = 0,
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    };
+    if (!c.platform_get_framebuffer_metrics(win.handle, &metrics)) return null;
+    return metrics;
+}
 
 // ============================================================================
 // ファイル選択ダイアログ (TASK-24)

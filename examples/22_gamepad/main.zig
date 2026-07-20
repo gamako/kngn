@@ -55,7 +55,7 @@ pub fn main() !void {
     try platform.init();
     defer platform.shutdown();
 
-    const window = try platform.Window.create(WINDOW_W, WINDOW_H, "22 - Gamepad Input (stub, ADR-009)");
+    var window = try platform.Window.create(WINDOW_W, WINDOW_H, "22 - Gamepad Input (stub, ADR-009)");
     defer window.destroy();
 
     var point_x: f32 = (WINDOW_W - POINT_SIZE) / 2;

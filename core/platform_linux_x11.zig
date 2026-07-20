@@ -445,10 +445,15 @@ pub const Window = struct {
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
         const st = self.state;
+        const size: types.WindowSize = .{ .width = st.width, .height = st.height };
         return .{
             .pixels = st.backing,
             .width = st.width,
             .height = st.height,
+            .logical_size = size,
+            .framebuffer_size = size,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
             .state = st,
         };
     }
@@ -619,6 +624,10 @@ pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    logical_size: types.WindowSize,
+    framebuffer_size: types.WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
     state: *State,
 
     pub fn unlock(self: Framebuffer) void {

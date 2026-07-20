@@ -146,10 +146,12 @@ pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 pub const CursorShape = types.CursorShape;
-pub const WindowOptions = types.WindowOptions; // TASK-104 / TASK-117
+pub const WindowOptions = types.WindowOptions; // TASK-104 / TASK-117 / TASK-156.1
 pub const WindowPosition = types.WindowPosition; // TASK-117
 pub const WindowSize = types.WindowSize; // TASK-117
 pub const WindowGeometry = types.WindowGeometry; // TASK-117
+pub const FramebufferMode = types.FramebufferMode; // TASK-156.1
+pub const FramebufferSnapshot = types.FramebufferSnapshot; // TASK-156.1
 pub const MAX_GAMEPADS = types.MAX_GAMEPADS;
 pub const GamepadButton = types.GamepadButton;
 pub const GamepadButtons = types.GamepadButtons;
@@ -158,13 +160,19 @@ pub const GamepadState = types.GamepadState;
 pub const GamepadInfo = types.GamepadInfo;
 pub const GamepadDisconnect = types.GamepadDisconnect;
 
-/// Locked framebuffer view（facade 独自型。TASK-32.4 P4 / TASK-165）。
-/// caller が使うのは `pixels/width/height/unlock()` のみなので backend 直の型と source 互換。
+/// Locked framebuffer view（facade 独自型。TASK-32.4 P4 / TASK-165 / TASK-156.1）。
+/// caller が使うのは `pixels/width/height/unlock()` に加え、同一フレームの不変 snapshot
+/// （`logical_size` / `framebuffer_size` / `content_scale` / `scale_epoch`）。
+/// `width`/`height` は `framebuffer_size` の後方互換 alias。
 /// 内部は「native（compile-time backend）」か「null（VP_HEADLESS）」かの tagged union。
 pub const Framebuffer = struct {
     pixels: []u32,
-    width: u32,
-    height: u32,
+    width: u32, // == framebuffer_size.width
+    height: u32, // == framebuffer_size.height
+    logical_size: WindowSize,
+    framebuffer_size: WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
     source: Source,
 
     const Source = if (null_runtime_supported) union(enum) {
@@ -186,10 +194,61 @@ pub const Framebuffer = struct {
     }
 };
 
+fn snapshotFromBackendFb(fb: anytype) FramebufferSnapshot {
+    const Fb = @TypeOf(fb);
+    if (@hasField(Fb, "logical_size")) {
+        return .{
+            .logical_size = fb.logical_size,
+            .framebuffer_size = fb.framebuffer_size,
+            .content_scale = fb.content_scale,
+            .scale_epoch = fb.scale_epoch,
+        };
+    }
+    return .{
+        .logical_size = .{ .width = fb.width, .height = fb.height },
+        .framebuffer_size = .{ .width = fb.width, .height = fb.height },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    };
+}
+
+/// native mouse/scroll の raw physical 座標を latched scale で論理 pt へ in-place 正規化する（TASK-156.1）。
+/// harness 注入 Event は通さない。scale<=0 は 1.0 に補正。
+/// 単体テスト（platform_clipboard_test 等）からも呼べるよう pub。
+pub fn normalizeEventWithScale(scale_in: f32, event: Event) Event {
+    const scale: f32 = if (scale_in > 0) scale_in else 1.0;
+    if (scale == 1.0) return event;
+    var ev = event;
+    switch (ev) {
+        .mouse_move, .mouse_down, .mouse_up => |*m| {
+            m.x = @intFromFloat(@floor(@as(f32, @floatFromInt(m.x)) / scale));
+            m.y = @intFromFloat(@floor(@as(f32, @floatFromInt(m.y)) / scale));
+        },
+        .mouse_scroll => |*s| {
+            s.x = @intFromFloat(@floor(@as(f32, @floatFromInt(s.x)) / scale));
+            s.y = @intFromFloat(@floor(@as(f32, @floatFromInt(s.y)) / scale));
+            s.dx /= scale;
+            s.dy /= scale;
+        },
+        else => {},
+    }
+    return ev;
+}
+
 /// Window facade。harness 有効時のみ 4 フックを差し込む。harness 無効時は backend への即パススルー。
 /// **null runtime（TASK-165）**は `inner` が `null_backend.Window` を持ち、一次 framebuffer を所有する。
+/// TASK-156.1: `lockFramebuffer`/`nextEvent` は latched snapshot 保持のため `*Window` 受け取り。
+/// ループ契約: `pollEvents` → `lockFramebuffer` → `nextEvent`（native 入力は latch scale で正規化）。
 pub const Window = struct {
     inner: Inner,
+    /// 直近 `lockFramebuffer` で latch した frame snapshot（入力正規化の唯一の scale 源）。
+    latched_snapshot: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 0, .height = 0 },
+        .framebuffer_size = .{ .width = 0, .height = 0 },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    },
+    has_latched: bool = false,
 
     const Inner = if (null_runtime_supported) union(enum) {
         native: native_backend.Window,
@@ -201,6 +260,56 @@ pub const Window = struct {
     fn isNull(self: Window) bool {
         if (comptime !null_runtime_supported) return false;
         return self.inner == .null_win;
+    }
+
+    /// 現在の negotiated logical size（frame 中の描画・入力には `Framebuffer.logical_size` を使う）。
+    pub fn logicalSize(self: *const Window) WindowSize {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                if (@hasDecl(null_backend.Window, "logicalSize")) return self.inner.null_win.logicalSize();
+                return .{ .width = self.inner.null_win.width, .height = self.inner.null_win.height };
+            }
+        }
+        if (@hasDecl(native_backend.Window, "logicalSize")) return self.inner.native.logicalSize();
+        const geo = self.getGeometry();
+        return geo.size;
+    }
+
+    /// 現在の negotiated framebuffer size（frame 中は `Framebuffer.framebuffer_size` を使う）。
+    pub fn framebufferSize(self: *const Window) WindowSize {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                if (@hasDecl(null_backend.Window, "framebufferSize")) return self.inner.null_win.framebufferSize();
+                return .{ .width = self.inner.null_win.width, .height = self.inner.null_win.height };
+            }
+        }
+        if (@hasDecl(native_backend.Window, "framebufferSize")) return self.inner.native.framebufferSize();
+        return self.logicalSize();
+    }
+
+    /// 現在の negotiated content scale（frame 中は `Framebuffer.content_scale` を使う）。
+    pub fn contentScale(self: *const Window) f32 {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                if (@hasDecl(null_backend.Window, "contentScale")) return self.inner.null_win.contentScale();
+                return 1.0;
+            }
+        }
+        if (@hasDecl(native_backend.Window, "contentScale")) return self.inner.native.contentScale();
+        return 1.0;
+    }
+
+    fn eventScale(self: *const Window) f32 {
+        if (self.has_latched) {
+            const s = self.latched_snapshot.content_scale;
+            return if (s > 0) s else 1.0;
+        }
+        const s = self.contentScale();
+        return if (s > 0) s else 1.0;
+    }
+
+    fn normalizeNativeEvent(self: *Window, event: Event) Event {
+        return normalizeEventWithScale(self.eventScale(), event);
     }
 
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
@@ -323,9 +432,14 @@ pub const Window = struct {
         return harness.pollGateFreeRun(native);
     }
 
-    pub fn nextEvent(self: Window) ?Event {
+    pub fn nextEvent(self: *Window) ?Event {
+        // ホットパス宣言: イベント時のみ。native mouse/scroll は latched scale で scalar 除算するだけ。
+        // harness 注入は既に論理値なので normalization を通さない。
         if (self.isNull()) return harness.nextInjectedEvent(); // native pump が無いので注入イベントのみ
-        if (!harness.isEnabled()) return self.inner.native.nextEvent();
+        if (!harness.isEnabled()) {
+            const ev = self.inner.native.nextEvent() orelse return null;
+            return self.normalizeNativeEvent(ev);
+        }
         // 注入イベントを優先。尽きたら native を drain する。
         // manual/replay: 注入駆動なので native は quit のみ通す（実クリック等は無視）。
         // free-run: 実 display をユーザーが操作するので native 入力を app へ通す（TASK-164 の核心
@@ -333,8 +447,9 @@ pub const Window = struct {
         if (harness.nextInjectedEvent()) |ev| return ev;
         const pass_native = !harness.isManualClock();
         while (self.inner.native.nextEvent()) |ev| {
-            if (pass_native) return ev;
-            if (harness.filterNativeEvent(ev)) |keep| return keep;
+            const normalized = self.normalizeNativeEvent(ev);
+            if (pass_native) return normalized;
+            if (harness.filterNativeEvent(normalized)) |keep| return keep;
         }
         return null;
     }
@@ -346,22 +461,47 @@ pub const Window = struct {
         return self.inner.native.getEventStats();
     }
 
-    pub fn lockFramebuffer(self: Window) ?Framebuffer {
-        // ホットパス宣言: native/null とも backend buffer の view 返却 + harness 有効時の onLock 記録のみ。
-        // フレーム毎の新規確保・per-pixel 処理は行わない（観測 copy は present 時の onPresent）。
+    pub fn lockFramebuffer(self: *Window) ?Framebuffer {
+        // ホットパス宣言: native/null とも backend buffer の view 返却 + snapshot latch + harness 有効時の onLock 記録のみ。
+        // フレーム毎の新規確保・per-pixel 処理・変換コピーは行わない（観測 copy は present 時の onPresent）。
+        // pending scale/size の再確保は backend の lock 境界（初期化/scale・resize 時のみ）。
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
                 const fb = self.inner.null_win.lockFramebuffer() orelse return null;
+                const snap = snapshotFromBackendFb(fb);
+                self.latched_snapshot = snap;
+                self.has_latched = true;
                 if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height);
-                return .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height, .source = .{ .null_fb = fb } };
+                return .{
+                    .pixels = fb.pixels,
+                    .width = snap.framebuffer_size.width,
+                    .height = snap.framebuffer_size.height,
+                    .logical_size = snap.logical_size,
+                    .framebuffer_size = snap.framebuffer_size,
+                    .content_scale = snap.content_scale,
+                    .scale_epoch = snap.scale_epoch,
+                    .source = .{ .null_fb = fb },
+                };
             }
         }
         const fb = self.inner.native.lockFramebuffer() orelse {
             if (harness.isEnabled()) harness.onLockMiss();
             return null;
         };
+        const snap = snapshotFromBackendFb(fb);
+        self.latched_snapshot = snap;
+        self.has_latched = true;
         if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height);
-        return .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height, .source = .{ .native = fb } };
+        return .{
+            .pixels = fb.pixels,
+            .width = snap.framebuffer_size.width,
+            .height = snap.framebuffer_size.height,
+            .logical_size = snap.logical_size,
+            .framebuffer_size = snap.framebuffer_size,
+            .content_scale = snap.content_scale,
+            .scale_epoch = snap.scale_epoch,
+            .source = .{ .native = fb },
+        };
     }
 
     pub fn present(self: Window) void {
@@ -847,4 +987,80 @@ pub fn sleep(nanoseconds: u64) void {
 pub fn frameDelay(nanoseconds: u64) void {
     if (harness.isManualClock()) return;
     sleep(nanoseconds);
+}
+
+// ============================================================================
+// TASK-156.1 unit tests（入力正規化・snapshot 契約。display 不要）
+// ============================================================================
+
+test "TASK-156.1: normalizeEventWithScale floor divide（scale=2 raw→logical）" {
+    const raw_move: Event = .{ .mouse_move = .{
+        .x = 20,
+        .y = 10,
+        .button = .none,
+        .buttons = .{},
+        .modifiers = .{},
+    } };
+    const logical = normalizeEventWithScale(2.0, raw_move);
+    try std.testing.expectEqual(@as(i32, 10), logical.mouse_move.x);
+    try std.testing.expectEqual(@as(i32, 5), logical.mouse_move.y);
+
+    const neg: Event = .{ .mouse_down = .{
+        .x = -3,
+        .y = 7,
+        .button = .left,
+        .buttons = .{ .left = true },
+        .modifiers = .{},
+    } };
+    const neg_l = normalizeEventWithScale(2.0, neg);
+    try std.testing.expectEqual(@as(i32, -2), neg_l.mouse_down.x); // floor(-3/2)=floor(-1.5)=-2
+    try std.testing.expectEqual(@as(i32, 3), neg_l.mouse_down.y);
+
+    const scroll: Event = .{ .mouse_scroll = .{
+        .x = 40,
+        .y = 20,
+        .dx = 4.0,
+        .dy = -6.0,
+        .is_precise = true,
+        .buttons = .{},
+        .modifiers = .{},
+    } };
+    const scroll_l = normalizeEventWithScale(2.0, scroll);
+    try std.testing.expectEqual(@as(i32, 20), scroll_l.mouse_scroll.x);
+    try std.testing.expectEqual(@as(i32, 10), scroll_l.mouse_scroll.y);
+    try std.testing.expectEqual(@as(f32, 2.0), scroll_l.mouse_scroll.dx);
+    try std.testing.expectEqual(@as(f32, -3.0), scroll_l.mouse_scroll.dy);
+}
+
+test "TASK-156.1: normalizeEventWithScale scale=1 と scale<=0 は恒等/補正" {
+    const ev: Event = .{ .mouse_move = .{
+        .x = 11,
+        .y = 22,
+        .button = .none,
+        .buttons = .{},
+        .modifiers = .{},
+    } };
+    const same = normalizeEventWithScale(1.0, ev);
+    try std.testing.expectEqual(@as(i32, 11), same.mouse_move.x);
+    const fixed = normalizeEventWithScale(0.0, ev);
+    try std.testing.expectEqual(@as(i32, 11), fixed.mouse_move.x);
+}
+
+test "TASK-156.1: FramebufferSnapshot の logical/physical 寸法契約" {
+    const logical: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 800, .height = 600 },
+        .framebuffer_size = .{ .width = 800, .height = 600 },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    };
+    try std.testing.expectEqual(logical.logical_size.width, logical.framebuffer_size.width);
+
+    const physical: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 800, .height = 600 },
+        .framebuffer_size = .{ .width = 1600, .height = 1200 },
+        .content_scale = 2.0,
+        .scale_epoch = 1,
+    };
+    try std.testing.expectEqual(@as(u32, 1600), physical.framebuffer_size.width);
+    try std.testing.expectEqual(@as(u32, 800), physical.logical_size.width);
 }

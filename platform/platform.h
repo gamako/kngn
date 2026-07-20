@@ -57,6 +57,7 @@ typedef struct PlatformWindowOptions {
 #define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // fb の alpha を honor（背後が透ける）
 #define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // タイトルバー・枠なし（borderless）
 #define PLATFORM_WINDOW_POSITION    (1u << 2)  // x/y を初期位置として適用（TASK-117）
+#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt-in 物理 fb（TASK-156.1）。未設定=.logical
 
 // 現在のウィンドウ geometry（TASK-117）。サイズは content/client、位置は OS 画面座標。
 // flags に PLATFORM_GEOMETRY_POSITION_VALID が無いとき x/y は未定義（位置非対応/取得不能）。
@@ -160,6 +161,23 @@ double platform_get_time(void);
 //   - device lost / window 破棄などの fatal は NULL とは別経路で扱う方針（詳細は docs/adr/005）。
 // 注意: platform_unlock_framebuffer()を呼ぶまでバッファを保持
 uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int* out_height);
+
+// TASK-156.1: logical/framebuffer size + content_scale + scale_epoch の current/latched metrics。
+// platform_lock_framebuffer_ex が lock + scale latch + metrics copy の原子単位。
+// 既存 platform_lock_framebuffer は ex の width/height 投影 wrapper（signature 不変）。
+typedef struct PlatformFramebufferMetrics {
+    uint32_t logical_width;
+    uint32_t logical_height;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    float content_scale;
+    uint64_t scale_epoch;
+} PlatformFramebufferMetrics;
+
+bool platform_get_framebuffer_metrics(
+    PlatformWindow* window, PlatformFramebufferMetrics* out);
+uint32_t* platform_lock_framebuffer_ex(
+    PlatformWindow* window, PlatformFramebufferMetrics* out);
 
 // フレームバッファへのアクセスを終了
 // platform_lock_framebuffer()とペアで使用

@@ -343,10 +343,15 @@ pub const Window = struct {
     pub fn lockFramebuffer(_: Window) ?Framebuffer {
         applyPendingResize();
         if (pixels_buf.len == 0) return null;
+        const size: types.WindowSize = .{ .width = fb_w, .height = fb_h };
         return .{
             .pixels = pixels_buf,
             .width = fb_w,
             .height = fb_h,
+            .logical_size = size,
+            .framebuffer_size = size,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
         };
     }
 
@@ -401,6 +406,10 @@ pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    logical_size: types.WindowSize,
+    framebuffer_size: types.WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
 
     pub fn unlock(_: Framebuffer) void {}
 };

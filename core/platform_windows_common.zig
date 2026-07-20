@@ -706,6 +706,10 @@ pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    logical_size: types.WindowSize,
+    framebuffer_size: types.WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
     state: *Core,
 
     pub fn unlock(self: Framebuffer) void {

@@ -369,7 +369,7 @@ pub fn main() !void {
     try platform.init();
     defer platform.shutdown();
 
-    const window = try platform.Window.create(WIN_W, WIN_H, "20_capture_demo - mic viz + camera canvas");
+    var window = try platform.Window.create(WIN_W, WIN_H, "20_capture_demo - mic viz + camera canvas");
     defer window.destroy();
 
     // データソース選択: VP_HARNESS_CAPTURE_SYNTHETIC=1 + harness 有効時のみ synthetic

@@ -387,10 +387,15 @@ pub const Window = struct {
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
         const core = self.core;
+        const size: @import("platform_types").WindowSize = .{ .width = core.width, .height = core.height };
         return .{
             .pixels = core.backing,
             .width = core.width,
             .height = core.height,
+            .logical_size = size,
+            .framebuffer_size = size,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
             .state = core,
         };
     }

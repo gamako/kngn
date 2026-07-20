@@ -172,7 +172,7 @@ pub fn main() !void {
     try platform.init();
     defer platform.shutdown();
 
-    const window = try platform.Window.create(WINDOW_W, WINDOW_H, "07 - Mouse Input");
+    var window = try platform.Window.create(WINDOW_W, WINDOW_H, "07 - Mouse Input");
     defer window.destroy();
 
     // 描画状態 (線描画は累積、hover/cross は単発)

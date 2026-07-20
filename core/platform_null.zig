@@ -115,6 +115,10 @@ pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    logical_size: types.WindowSize,
+    framebuffer_size: types.WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
 
     pub fn unlock(self: Framebuffer) void {
         _ = self;
@@ -145,6 +149,8 @@ pub const Window = struct {
 
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
         _ = title;
+        // scale 非対応: .physical も contentScale=1 / logical==framebuffer で受理（Unsupported にしない）。
+        _ = opts.fb_mode;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
         return allocBuffer(w, h);
@@ -169,8 +175,29 @@ pub const Window = struct {
         return .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
     }
 
+    pub fn logicalSize(self: Window) types.WindowSize {
+        return .{ .width = self.width, .height = self.height };
+    }
+
+    pub fn framebufferSize(self: Window) types.WindowSize {
+        return .{ .width = self.width, .height = self.height };
+    }
+
+    pub fn contentScale(_: Window) f32 {
+        return 1.0;
+    }
+
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
-        return .{ .pixels = self.pixels, .width = self.width, .height = self.height };
+        const size: types.WindowSize = .{ .width = self.width, .height = self.height };
+        return .{
+            .pixels = self.pixels,
+            .width = self.width,
+            .height = self.height,
+            .logical_size = size,
+            .framebuffer_size = size,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
+        };
     }
 
     pub fn present(self: Window) void {
@@ -291,4 +318,34 @@ test "null window: options.size 優先、poll/nextEvent/stats/no-op I/F" {
     try testing.expectEqual(@as(usize, 0), snap.text.len);
     try testing.expect(win.getGamepadState(0) == null);
     try testing.expect(getTime() >= 0);
+}
+
+test "TASK-156.1: null .physical は Unsupported でなく scale=1 / 同一寸法で受理" {
+    var win = try Window.createWithOptions(800, 600, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+    try testing.expectEqual(@as(f32, 1.0), win.contentScale());
+    try testing.expectEqual(@as(u32, 800), win.logicalSize().width);
+    try testing.expectEqual(@as(u32, 800), win.framebufferSize().width);
+    const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
+    defer fb.unlock();
+    try testing.expectEqual(fb.logical_size.width, fb.framebuffer_size.width);
+    try testing.expectEqual(fb.width, fb.framebuffer_size.width);
+    try testing.expectEqual(@as(f32, 1.0), fb.content_scale);
+    try testing.expectEqual(@as(u64, 0), fb.scale_epoch);
+}
+
+test "TASK-156.1: null .logical の width/height/pixels CRC 経路は snapshot 付きでも寸法不変" {
+    var win = try Window.create(4, 2, "t");
+    defer win.destroy();
+    const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
+    defer fb.unlock();
+    try testing.expectEqual(@as(u32, 4), fb.width);
+    try testing.expectEqual(@as(u32, 2), fb.height);
+    try testing.expectEqual(fb.logical_size.width, fb.framebuffer_size.width);
+    for (fb.pixels) |*p| p.* = 0xFFAABBCC;
+    win.present();
+    const fb2 = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
+    defer fb2.unlock();
+    try testing.expectEqual(@as(u32, 0xFFAABBCC), fb2.pixels[0]);
+    try testing.expectEqual(@as(u32, 0xFFAABBCC), fb2.pixels[7]);
 }

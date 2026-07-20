@@ -33,7 +33,22 @@ pub const WindowGeometry = struct {
     size: WindowSize,
 };
 
-/// ウィンドウ生成オプション（TASK-104 / TASK-117）。既定 `.{}` は現行と同一挙動（不透明・タイトル付き）。
+/// framebuffer 解像度モード（TASK-156.1 / ADR-011 R1）。既定 `.logical` = 現状維持。
+/// `.physical` は opt-in（論理座標のまま物理 px の fb を確保）。
+pub const FramebufferMode = enum {
+    logical,
+    physical,
+};
+
+/// `lockFramebuffer` が返す 1 フレーム分の scale/size snapshot（TASK-156.1 / ADR-011 R2）。
+pub const FramebufferSnapshot = struct {
+    logical_size: WindowSize,
+    framebuffer_size: WindowSize,
+    content_scale: f32,
+    scale_epoch: u64,
+};
+
+/// ウィンドウ生成オプション（TASK-104 / TASK-117 / TASK-156.1）。既定 `.{}` は現行と同一挙動（不透明・タイトル付き・logical fb）。
 /// 透過は per-pixel alpha（premultiplied alpha 前提）。borderless は枠・タイトルバーなし。
 /// `size` 指定時は `Window.createWithOptions` の w/h を上書きする。`position` は対応 backend のみ適用。
 pub const WindowOptions = struct {
@@ -41,6 +56,7 @@ pub const WindowOptions = struct {
     borderless: bool = false,
     position: ?WindowPosition = null,
     size: ?WindowSize = null,
+    fb_mode: FramebufferMode = .logical,
 };
 
 // ============================================================================
@@ -745,12 +761,40 @@ test "MidiEvent: MIDI 7-bit 境界値 0 と 127 を保持する" {
     try std.testing.expectEqual(@as(u8, 127), high.note_on.velocity);
 }
 
-test "WindowOptions: 既定値は後方互換（透明/枠なし/位置サイズなし）" {
+test "WindowOptions: 既定値は後方互換（透明/枠なし/位置サイズなし/logical fb）" {
     const opts: WindowOptions = .{};
     try std.testing.expect(!opts.transparent);
     try std.testing.expect(!opts.borderless);
     try std.testing.expect(opts.position == null);
     try std.testing.expect(opts.size == null);
+    try std.testing.expectEqual(FramebufferMode.logical, opts.fb_mode);
+}
+
+test "FramebufferMode: 既定は logical、physical は opt-in" {
+    try std.testing.expectEqual(FramebufferMode.logical, (WindowOptions{}).fb_mode);
+    const phys: WindowOptions = .{ .fb_mode = .physical };
+    try std.testing.expectEqual(FramebufferMode.physical, phys.fb_mode);
+}
+
+test "FramebufferSnapshot: logical では logical==framebuffer、physical scale=2 は 2 倍寸法" {
+    const logical: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 800, .height = 600 },
+        .framebuffer_size = .{ .width = 800, .height = 600 },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    };
+    try std.testing.expectEqual(logical.logical_size.width, logical.framebuffer_size.width);
+    try std.testing.expectEqual(logical.logical_size.height, logical.framebuffer_size.height);
+
+    const physical: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 800, .height = 600 },
+        .framebuffer_size = .{ .width = 1600, .height = 1200 },
+        .content_scale = 2.0,
+        .scale_epoch = 1,
+    };
+    try std.testing.expectEqual(@as(u32, 800), physical.logical_size.width);
+    try std.testing.expectEqual(@as(u32, 1600), physical.framebuffer_size.width);
+    try std.testing.expectEqual(@as(f32, 2.0), physical.content_scale);
 }
 
 test "WindowOptions: position/size の optional 値を保持する" {
