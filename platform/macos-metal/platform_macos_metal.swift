@@ -123,6 +123,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var lastFrameTime: CFAbsoluteTime
     private var frameCount: Int
     private var totalFrameTime: Double
+    // FPS ログは VP_METAL_FPS_LOG=1 のときのみ（既定=無出力。TASK-158）
+    private let fpsLogEnabled: Bool
 
     init(device: MTLDevice, width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
         self.device = device
@@ -135,6 +137,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         self.lastFrameTime = CFAbsoluteTimeGetCurrent()
         self.frameCount = 0
         self.totalFrameTime = 0.0
+        // env は初期化時に1回だけ読む（フレーム毎の getenv を避ける）
+        self.fpsLogEnabled = ProcessInfo.processInfo.environment["VP_METAL_FPS_LOG"] == "1"
 
         super.init()
 
@@ -264,6 +268,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     // 60 フレームごとに FPS をログ出力（fifo pacing の検証用に ~60fps 張り付きを観測できる）。
+    // 出力は fpsLogEnabled（VP_METAL_FPS_LOG=1）のときのみ。計測ロジック自体は常時走らせる。
     private func updatePerfStats() {
         frameCount += 1
         let now = CFAbsoluteTimeGetCurrent()
@@ -273,7 +278,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         if frameCount % 60 == 0 {
             let avgFrameTime = totalFrameTime / 60.0
             let fps = avgFrameTime > 0 ? 1.0 / avgFrameTime : 0
-            NSLog("[\(IMPLEMENTATION_TYPE)] FPS: \(String(format: "%.1f", fps)) | Avg Frame: \(String(format: "%.2f", avgFrameTime * 1000.0))ms")
+            if fpsLogEnabled {
+                NSLog("[\(IMPLEMENTATION_TYPE)] FPS: \(String(format: "%.1f", fps)) | Avg Frame: \(String(format: "%.2f", avgFrameTime * 1000.0))ms")
+            }
             totalFrameTime = 0.0
         }
     }

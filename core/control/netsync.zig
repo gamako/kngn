@@ -1510,9 +1510,35 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     // host 側の label 上限で protocol error 切断になるため、API 境界で clamp する）。
     const label_clamped = client_label_buf[0..client_label_len];
 
-    const stream = addr.connect(io_val, .{ .mode = .stream }) catch |err| {
-        std.debug.print("[netsync] client 接続失敗: {s}（netsync 無効のまま起動継続）\n", .{@errorName(err)});
-        return; // fail-soft
+    // TASK-166: host listen 前の ConnectionRefused を指数 backoff で短くリトライする
+    // （手動 2 window 起動の「数秒待つ」を吸収。init 時のみ・RT/フレーム経路には入らない）。
+    // 試行最大 6 回・待ち 100/200/400/800/1600 ms（合計 ~3.1s）。上限到達後は既存と同じ fail-soft。
+    // 判断: ConnectionRefused / Timeout は起動レースの典型なのでリトライ対象。
+    // AddressUnavailable / HostUnreachable / AccessDenied 等の恒久エラーは即 fail-soft
+    // （待っても直らないため、上限までの待ちをユーザーに課さない）。
+    const backoff_ms = [_]u64{ 100, 200, 400, 800, 1600 };
+    const stream = blk: {
+        var attempt: usize = 0;
+        while (true) {
+            if (addr.connect(io_val, .{ .mode = .stream })) |s| break :blk s else |err| {
+                const retryable = switch (err) {
+                    error.ConnectionRefused, error.Timeout => true,
+                    else => false,
+                };
+                if (!retryable or attempt >= backoff_ms.len) {
+                    std.debug.print("[netsync] client 接続失敗: {s}（netsync 無効のまま起動継続）\n", .{@errorName(err)});
+                    return; // fail-soft
+                }
+                const ms = backoff_ms[attempt];
+                attempt += 1;
+                std.debug.print("[netsync] client 接続リトライ {d}/{d}: {s}（{d}ms 後）\n", .{ attempt, backoff_ms.len, @errorName(err), ms });
+                const req = std.posix.timespec{
+                    .sec = @intCast(ms / 1000),
+                    .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+                };
+                _ = std.c.nanosleep(&req, null);
+            }
+        }
     };
 
     peers_mutex.lockUncancelable(io_val);
@@ -3252,6 +3278,60 @@ test "netsync: host 未起動 fail-soft" {
     initClient(addr);
     try testing.expect(!isEnabled());
     try testing.expect(!isClient());
+}
+
+// TASK-166: client を先に init → 数百 ms 後に host が listen してもリトライで接続成立する。
+// 同一プロセスは host/client どちらか一方の role のみなので、遅延 dumb host スレッドで listen する。
+test "netsync: client ConnectionRefused をリトライし遅延 host で接続成立" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+
+    // 空き port を確保して即閉じる（遅延 host が同じ port で listen）。
+    const probe_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var probe = try probe_addr.listen(io_val, .{ .reuse_address = true });
+    const port = probe.socket.address.getPort();
+    probe.deinit(io_val);
+
+    const DelayedHost = struct {
+        fn run(p: u16) void {
+            ensureIo();
+            // client の初回〜2 回目リトライを跨ぐ（backoff 100+200=300ms 付近で accept 可能に）。
+            sleepMs(300);
+            const a = net.IpAddress{ .ip4 = net.Ip4Address.loopback(p) };
+            var srv = a.listen(io_val, .{ .reuse_address = true }) catch return;
+            defer srv.deinit(io_val);
+            const stream = srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [128]u8 = undefined;
+            const hello = decodeFrame(&reader.interface, &pbuf) catch return;
+            if (hello.kind != @intFromEnum(FrameKind.hello)) return;
+            var wbuf: [128]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 1) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            writer.interface.flush() catch return;
+            while (true) {
+                _ = reader.interface.takeByte() catch break;
+            }
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, DelayedHost.run, .{port});
+    defer {
+        resetForTest();
+        ht.join();
+    }
+
+    const caddr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    initClientAs(caddr, .human, "retry-client");
+    try testing.expect(isEnabled());
+    try testing.expect(isClient());
+    try waitClientActive(3000);
+    // SYNC 無し dumb host のため awaiting_sync は立ったまま（接続成立自体が AC）。
+    try testing.expect(awaiting_sync);
 }
 
 test "netsync: shutdown 二重呼び出し安全" {

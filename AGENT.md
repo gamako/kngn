@@ -981,6 +981,10 @@ script 自体がレシピの代替ではない。
 # すべてのプラットフォーム版をビルド（example / platform のビルド回帰確認にも使う）
 zig build -Dinstall-all=true
 
+# modular/patch 同時モジュール数上限（TASK-146。既定 48 = 現行 bit 同一。範囲 48..=4096）
+# zig build -Dmax-modules=96 build-patch   # exe ビルドのみ（run-patch は起動までする）
+# zig build -Dmax-modules=96 test-modular test-app-modular test-patch
+
 # すべてのテストを実行（集約。全 test-* を束ねる）
 zig build test
 

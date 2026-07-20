@@ -165,7 +165,9 @@ fn buildWasmPixie(
     optimize: std.builtin.OptimizeMode,
     opts: WasmBuildOpts,
 ) WasmExeBuild {
-    const shared = SharedModules.init(b, true, false, false);
+    const wasm_max_opts = b.addOptions();
+    wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule());
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const pixie_mod = b.createModule(.{
@@ -229,7 +231,9 @@ fn buildWasmSynth(
     const target = b.resolveTargetQuery(query);
 
     // wasm_shared=false → single_threaded=true（wasm_allocator 可）。atomics は target feature で担保。
-    const shared = SharedModules.init(b, true, false, false);
+    const wasm_max_opts = b.addOptions();
+    wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule());
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const synth_mod = b.createModule(.{
@@ -356,11 +360,30 @@ pub fn build(b: *std.Build) void {
         "Enable gamepad for external platform module and native archive (default false)",
     ) orelse false;
 
+    // modular/patch 同時モジュール数上限（TASK-146）。既定 48 = 現行 bit 同一。
+    // 下限: 既定 lofi パッチ + マクロが載る数。上限: u16 handle / メモリの常識的範囲。
+    // Options の Module は 1 回だけ createModule し、全 consumer が addImport で共有する
+    // （addOptions は内部で毎回 createModule するため同一 options.zig が 2 root になり compile error）。
+    const max_modules_option = b.option(
+        usize,
+        "max-modules",
+        "modular同時モジュール数上限(既定48)",
+    ) orelse 48;
+    if (max_modules_option < 48) {
+        @panic("-Dmax-modules must be >= 48 (default lofi patch + macros require at least 48)");
+    }
+    if (max_modules_option > 4096) {
+        @panic("-Dmax-modules must be <= 4096");
+    }
+    const max_modules_opts = b.addOptions();
+    max_modules_opts.addOption(usize, "max_modules", max_modules_option);
+    const max_modules_mod = max_modules_opts.createModule();
+
     // ========================================
     // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
     // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
     // ========================================
-    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext);
+    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod);
 
     // 外部公開 kit umbrella（TASK-111.7）。SharedModules の既存 instance を再利用して型同一性を保つ。
     // dep.module("kit") で取得。platform / gui / gamepad 等は kit 経由でも同一 module instance。
@@ -1742,6 +1765,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     modular_test_mod.addImport("dsp", shared_modules.dsp.mod);
+    modular_test_mod.addImport("build_options", max_modules_mod);
     const modular_test = b.addTest(.{ .root_module = modular_test_mod });
     const run_modular_test = b.addRunArtifact(modular_test);
     const test_modular_step = b.step("test-modular", "Run libs/modular unit tests");
@@ -1804,6 +1828,8 @@ pub fn build(b: *std.Build) void {
     });
     modular_project_io_test_mod.addImport("serde", shared_modules.serde.mod);
     modular_project_io_test_mod.addImport("modular", shared_modules.modular.mod);
+    // group.zig が build_options.max_modules を読む（相対 import・同一 module。TASK-146）
+    modular_project_io_test_mod.addImport("build_options", max_modules_mod);
     const modular_project_io_test = b.addTest(.{ .root_module = modular_project_io_test_mod });
     const run_modular_project_io_test = b.addRunArtifact(modular_project_io_test);
     test_app_modular_step.dependOn(&run_modular_project_io_test.step);
@@ -1850,6 +1876,8 @@ pub fn build(b: *std.Build) void {
     });
     patch_tests_mod.addImport("gui", shared_modules.gui.mod);
     patch_tests_mod.addImport("modular", shared_modules.modular.mod);
+    // group.zig が build_options.max_modules を読む（相対 import・同一 module。TASK-146）
+    patch_tests_mod.addImport("build_options", max_modules_mod);
     const patch_tests = b.addTest(.{ .root_module = patch_tests_mod });
     const run_patch_tests = b.addRunArtifact(patch_tests);
     const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
@@ -2195,6 +2223,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_modular_mod.addImport("dsp", bench_dsp_mod);
+    bench_modular_mod.addImport("build_options", max_modules_mod);
     const bench_modular_root = b.createModule(.{
         .root_source_file = b.path("bench/modular.zig"),
         .target = target,
@@ -2441,11 +2470,16 @@ const SharedModules = struct {
     gamepad: TaggedModule, // src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する headless lib。kit 収録）
     sound: TaggedModule, // libs/sound（WAV デコード + SE/BGM ミキサー。TASK-111.6。dsp + synth。kit 収録）
     midi: TaggedModule, // core/midi.zig（MIDI facade。TASK-115.1）
+    /// modular/patch の -Dmax-modules（TASK-146）。group.zig / addPatchExe が参照。
+    max_modules: usize,
+    /// 共有 build_options Module（max_modules）。createModule は 1 回だけ。全 consumer が addImport。
+    max_modules_mod: *std.Build.Module,
 
     /// `wasm_shared`: TASK-73.2 AudioWorklet 用。atomics を有効にするため single_threaded=false。
     /// `enable_gamepad`: 外部公開 platform module の build_options（TASK-111.7。既定 false）。
-    /// wasm 経路は常に false を渡す。
-    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool) SharedModules {
+    /// `max_modules` / `max_modules_mod`: modular 同時モジュール数上限（TASK-146。既定 48）。
+    /// wasm 経路は enable_gamepad=false・max_modules=48 を渡す。
+    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
         // facade。@cImport("platform.h") のため link_libc + include path を内包。
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
@@ -2704,9 +2738,11 @@ const SharedModules = struct {
 
         // modular (L3): モジュラー・グラフエンジン（TASK-40）。dsp のみに依存。
         // 流動中のため kit 非収録（apps が直 import: app_direct_ok）。
+        // build_options.max_modules で同時モジュール数上限を comptime 注入（TASK-146）。
         const modular: TaggedModule = .{ .layer = .lib, .name = "modular", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/modular/src/modular.zig"),
         }) };
+        modular.mod.addImport("build_options", max_modules_mod);
         link(modular, dsp);
 
         // paint（旧 apps/editor/core。R6 で libs へ格上げ）: Canvas/Tool/Undo/Selection/PNG I/O。
@@ -2762,6 +2798,8 @@ const SharedModules = struct {
             .gamepad = gamepad,
             .sound = sound,
             .midi = midi,
+            .max_modules = max_modules,
+            .max_modules_mod = max_modules_mod,
         };
     }
 };
@@ -2926,6 +2964,9 @@ fn addPatchExe(
     // apps は kit-only 消費者（R5）。platform/gui/audio/synth/dsp は kit.* で参照。
     // modular / 可視化（libs/viz）は流動中で kit 非収録のため直 import。
     // native メニュー opt-in（TASK-136）: kit_menu（enable_menu=true）+ 共有 menu.m（pixie と共用）。
+    // group.zig が build_options.max_modules を読む（相対 import・同一 module。TASK-146）。
+    // modular と同一 Module instance を共有（二重 options.zig root を避ける）。
+    exe.root_module.addImport("build_options", common.max_modules_mod);
     const root = appRoot(exe, "patch");
     link(root, pm.kit_menu);
     link(root, common.modular); // 動的グラフエンジン（dsp 依存のみ。macro.zig も参照）

@@ -32,7 +32,8 @@ const MAX_IN = signal.MAX_IN;
 const MAX_OUT = signal.MAX_OUT;
 
 /// handle / instance / View 幅・port stride の基準。
-pub const MAX_MODULES = 48;
+/// `-Dmax-modules=N`（build_options.max_modules）で変更可能。既定 48（TASK-146）。
+pub const MAX_MODULES: usize = @import("build_options").max_modules;
 /// signal バッファ長（ポート id 固定割当 slot*MAX_OUT）。
 pub const MAX_PORTS: usize = @as(usize, MAX_MODULES) * MAX_OUT;
 
@@ -112,8 +113,11 @@ pub fn KindType(comptime k: ModuleKind) type {
 
 /// kind → プール容量（安いモジュール多め / delay・reverb は少数。合計は handle 空間より大きくてよいが
 /// active 総数は MAX_MODULES 上限）。
+///
+/// TASK-146: 既定 cap を `MAX_MODULES/48` で比例スケール。既定 N=48 では
+/// `base * 48 / 48 == base` となり現行値と完全一致（bit 同一）。N 増時は FX 系も含め底上げ。
 pub fn poolCap(comptime k: ModuleKind) usize {
-    return switch (k) {
+    const base: usize = switch (k) {
         .vco, .vca, .env_gen => 12,
         // step_seq は 4→8（TASK-40.7.2: DrumMachine×2=4 + BassMachine=1 で cap4 が尽きるため。小型 struct で Pools 増は微小）。
         .vcf, .mixer, .lfo, .step_seq => 8,
@@ -123,6 +127,8 @@ pub fn poolCap(comptime k: ModuleKind) usize {
         .slew, .sample_hold, .comparator, .logic => 6,
         .ring_mod => 4,
     };
+    // 既定48では scale=1。`@max(base, …)` は N<48 を build で拒否済みのため実質 base * N/48。
+    return @max(base, base * MAX_MODULES / 48);
 }
 
 /// 型別固定プール（明示フィールド。comptime tuple 生成は避け compile 安全・可読優先）。DSP 状態常駐（publish 非対象）。
@@ -1028,9 +1034,11 @@ test "dyn(f): 単一接続 / 種別一致 / サイクル遅延 / エラー区別
 test "dyn(f2a): pool 枯渇は PoolFull（handle 空間に余裕があっても）" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    // output pool cap=2。使い切ると 3 本目は PoolFull（handle はまだ大量に空いている）。
-    _ = try g.add(.output, .{});
-    _ = try g.add(.output, .{});
+    // output pool を使い切る（既定 cap=2。-Dmax-modules で比例スケール。TASK-146）。
+    // handle 空間に余裕があるうちに PoolFull になることを確認。
+    const cap = poolCap(.output);
+    var i: usize = 0;
+    while (i < cap) : (i += 1) _ = try g.add(.output, .{});
     try testing.expectError(Error.PoolFull, g.add(.output, .{}));
     try testing.expect(g.activeCount() < MAX_MODULES);
 }
@@ -1131,21 +1139,53 @@ test "dyn(f2d): TASK-107 の5種を FailingAllocator 下で複数 block 処理�
 test "dyn(f2b): handle 空間枯渇は TooManyModules（pool に余裕があっても）" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    // 総容量が MAX_MODULES を超える kind 群（vco12+vca12+env_gen12+vcf8+mixer8=52 >= 48）で
-    // handle 空間ちょうど MAX_MODULES を埋める。各 kind は pool を使い切らない配分にする。
-    const plan = [_]struct { k: ModuleKind, n: usize }{
-        .{ .k = .vco, .n = 12 },
-        .{ .k = .vca, .n = 12 },
-        .{ .k = .env_gen, .n = 12 },
-        .{ .k = .vcf, .n = 8 },
-        .{ .k = .mixer, .n = 4 }, // 12+12+12+8+4 = 48 = MAX_MODULES
-    };
-    inline for (plan) |p| {
-        var i: usize = 0;
-        while (i < p.n) : (i += 1) _ = try g.add(p.k, .{});
+    // mixer は pool の半分だけ使い、残り handle を他 kind で埋める（-Dmax-modules 任意 N 対応。TASK-146）。
+    // 既定 N=48 では mixer_n=4, poolCap(mixer)=8 で旧テストと同型。
+    const mixer_n = poolCap(.mixer) / 2;
+    var mi: usize = 0;
+    while (mi < mixer_n) : (mi += 1) _ = try g.add(.mixer, .{});
+    var left = MAX_MODULES - mixer_n;
+    // poolCap は comptime kind 必須。各 kind を個別ブロックで埋める。
+    {
+        const take = @min(left, poolCap(.vco));
+        var j: usize = 0;
+        while (j < take) : (j += 1) _ = try g.add(.vco, .{});
+        left -= take;
     }
+    {
+        const take = @min(left, poolCap(.vca));
+        var j: usize = 0;
+        while (j < take) : (j += 1) _ = try g.add(.vca, .{});
+        left -= take;
+    }
+    {
+        const take = @min(left, poolCap(.env_gen));
+        var j: usize = 0;
+        while (j < take) : (j += 1) _ = try g.add(.env_gen, .{});
+        left -= take;
+    }
+    {
+        const take = @min(left, poolCap(.vcf));
+        var j: usize = 0;
+        while (j < take) : (j += 1) _ = try g.add(.vcf, .{});
+        left -= take;
+    }
+    {
+        const take = @min(left, poolCap(.lfo));
+        var j: usize = 0;
+        while (j < take) : (j += 1) _ = try g.add(.lfo, .{});
+        left -= take;
+    }
+    {
+        const take = @min(left, poolCap(.step_seq));
+        var j: usize = 0;
+        while (j < take) : (j += 1) _ = try g.add(.step_seq, .{});
+        left -= take;
+    }
+    try testing.expectEqual(@as(usize, 0), left);
     try testing.expectEqual(@as(usize, MAX_MODULES), g.activeCount());
-    // handle 空間が満杯 → pool にまだ余裕がある mixer(cap=8, 4 使用) でも TooManyModules。
+    try testing.expect(g.poolFreeCount(.mixer) > 0);
+    // handle 空間が満杯 → pool にまだ余裕がある mixer でも TooManyModules。
     try testing.expectError(Error.TooManyModules, g.add(.mixer, .{}));
 }
 
@@ -1189,19 +1229,22 @@ test "dyn(d): RT ゼロアロケーション — processBlock/publish が self.a
 test "dyn(i): poolFreeCount/freeHandleCount — add 前の空き数が add の実確保可能数と一致する（reclaim 込み）" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    try testing.expectEqual(poolCap(.output), g.poolFreeCount(.output));
+    const cap = poolCap(.output);
+    try testing.expectEqual(cap, g.poolFreeCount(.output));
     try testing.expectEqual(@as(usize, MAX_MODULES), g.freeHandleCount());
 
     _ = try g.add(.output, .{});
-    try testing.expectEqual(poolCap(.output) - 1, g.poolFreeCount(.output));
+    try testing.expectEqual(cap - 1, g.poolFreeCount(.output));
     try testing.expectEqual(@as(usize, MAX_MODULES - 1), g.freeHandleCount());
 
-    // pool 枯渇時は 0（TooManyModules/PoolFull と整合）。
-    const o2 = try g.add(.output, .{}); // cap=2
+    // pool 枯渇時は 0（TooManyModules/PoolFull と整合）。-Dmax-modules で cap が変わる（TASK-146）。
+    var last: Handle = 0;
+    var i: usize = 1; // 既に 1 本追加済み
+    while (i < cap) : (i += 1) last = try g.add(.output, .{});
     try testing.expectEqual(@as(usize, 0), g.poolFreeCount(.output));
 
     // remove 直後（publish/consume 前）は grace 未達 = まだ「使用中」扱い（reclaim されない）。
-    g.removeModule(o2);
+    g.removeModule(last);
     try testing.expectEqual(@as(usize, 0), g.poolFreeCount(.output));
 
     // publish + processBlock で consumed_gen が retire_gen に追いつく → reclaim 相当で空きが戻る。

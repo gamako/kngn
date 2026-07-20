@@ -172,13 +172,18 @@ const PTRN_SIZE: usize = 33;
 const SEED_SIZE: usize = 20;
 const SONG_SIZE: usize = 1890;
 const GENR_SIZE: usize = GenRole.count * 2;
-// LEDG: group_of[48]u8 + groups[8] * (16 header + 8*13*2 exposed) = 48 + 8*224 = 1840
+// LEDG: group_of[GROUP_HANDLE_BASE]u8 + groups[MAX_GROUPS] * (16 header + 8*13*2 exposed)
+// 既定 N=48 では 48 + 8*224 = 1840。N は -Dmax-modules で可変（TASK-146）。
 const LEDG_GROUP_SIZE: usize = 224;
 const LEDG_SIZE: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE;
 
 comptime {
     if (GenRole.count != 30) @compileError("GENR role count changed; update schema or tests");
-    if (LEDG_SIZE != 1840) @compileError("LEDG size mismatch");
+    // 公式の自己整合 + 既定 N=48 の既知サイズ固定（N 可変時は公式のみ）。
+    if (LEDG_SIZE != group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE)
+        @compileError("LEDG size formula mismatch");
+    if (group.GROUP_HANDLE_BASE == 48 and LEDG_SIZE != 1840)
+        @compileError("LEDG size mismatch for default N=48");
 }
 
 // ── scalar Params パッカー ───────────────────────────────────────────────────

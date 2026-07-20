@@ -24,11 +24,16 @@ pub const MAX_GROUPS = 8;
 pub const GroupId = u8;
 pub const MAX_EXPOSED = 8;
 
-/// == libs/modular/src/dyn.zig の MAX_MODULES。group.zig は modular 非依存のため定数を複製する
-/// （canvas.Handle は u16 なので 48..55 は実 handle 空間と衝突しない）。main.zig 側で
-/// `comptime { if (group.GROUP_HANDLE_BASE != modular.dyn.MAX_MODULES) @compileError(...) }` により
+/// == libs/modular/src/dyn.zig の MAX_MODULES。group.zig は modular を import しないため
+/// 同じ build_options.max_modules を読む（modular 依存ではない。TASK-146）。
+/// canvas.Handle は u16 なので GROUP_HANDLE_BASE..BASE+MAX_GROUPS は実 handle 空間と衝突しない。
+/// main.zig 側で `comptime { if (group.GROUP_HANDLE_BASE != modular.dyn.MAX_MODULES) @compileError(...) }` により
 /// 数値の食い違いを検出する。
-pub const GROUP_HANDLE_BASE = 48;
+pub const GROUP_HANDLE_BASE: usize = @import("build_options").max_modules;
+
+/// == modular.signal.MAX_OUT。port id = handle * MAX_OUT_PORTS + out_index。
+/// group.zig は modular 非依存のため複製（resolveExposedPort 用）。
+pub const MAX_OUT_PORTS: u32 = 4;
 
 /// 40.7.1: drum_machine / 40.7.2: bass_machine を追加。台帳・expose 導出・表示写像は kind 非依存で共通。
 pub const MacroKind = enum {
@@ -98,11 +103,32 @@ pub fn gridRowsForBox(kind: MacroKind) u8 {
 
 /// gid ⇔ 合成 handle の変換（両側境界。OOB を閉じる）。
 pub fn handleOfGroup(gid: GroupId) Handle {
-    return GROUP_HANDLE_BASE + @as(Handle, gid);
+    return @intCast(GROUP_HANDLE_BASE + @as(usize, gid));
 }
 pub fn groupIdFromHandle(h: Handle) ?GroupId {
     if (h < GROUP_HANDLE_BASE or h >= GROUP_HANDLE_BASE + MAX_GROUPS) return null;
-    return @intCast(h - GROUP_HANDLE_BASE);
+    return @intCast(@as(usize, h) - GROUP_HANDLE_BASE);
+}
+
+/// display handle（実 or 合成箱）を実 global 出力 port id（handle*MAX_OUT_PORTS+out）へ解決。
+/// out0 を代表とする。解決不能（出力なし/非 active/合成箱の expose なし）は -1。
+///
+/// `dyn_check` は `slotActive(Handle) bool` と `nOut(Handle) u8` を持つ duck-typed 値
+/// （DynGraph 実型を import せず modular 非依存を保つ。TASK-171）。
+///
+/// TASK-170 契約: 戻り値（実 port id）と display handle は別軸。
+/// ①合成箱 handle 不変でも exposed_out[0] の member/port が変われば戻り値が変わる。
+/// ②別 display handle が同じ実 member/port を指せば戻り値は同じになりうる。
+pub fn resolveExposedPort(ledger: *const Ledger, dyn_check: anytype, dh: Handle) i32 {
+    if (groupIdFromHandle(dh)) |gid| {
+        const g = ledger.groups[gid];
+        if (g.n_out == 0) return -1;
+        const ref = g.exposed_out[0];
+        if (!dyn_check.slotActive(ref.member) or dyn_check.nOut(ref.member) <= ref.port) return -1;
+        return @intCast(@as(u32, ref.member) * MAX_OUT_PORTS + ref.port);
+    }
+    if (!dyn_check.slotActive(dh) or dyn_check.nOut(dh) == 0) return -1;
+    return @intCast(@as(u32, dh) * MAX_OUT_PORTS); // out0
 }
 
 /// handle→所属 GroupId。**Ph7 は 1 レベル限定**（Group に parent 無し。将来ネストは Group.parent 追加で
@@ -397,6 +423,56 @@ test "group: groupIdFromHandle boundary (both ends) and handleOfGroup round-trip
         const gid: GroupId = @intCast(i);
         try testing.expectEqual(gid, groupIdFromHandle(handleOfGroup(gid)).?);
     }
+}
+
+/// resolveExposedPort 用ダミー（DynGraph 無し。slotActive 常 true / nOut 常 >0）。
+const DynAlwaysOk = struct {
+    fn slotActive(_: @This(), _: Handle) bool {
+        return true;
+    }
+    fn nOut(_: @This(), _: Handle) u8 {
+        return 4;
+    }
+};
+
+// TASK-171 ケース A: 合成 handle と実 member handle が同じ exposed 実 port を指す → 戻り値一致
+// （display handle が違っても実 port ID が同じなら updateViz は republish しない契約の単体相当）。
+test "group: resolveExposedPort same real port via synthetic and member handle" {
+    var l = Ledger{};
+    const gid = l.alloc().?;
+    l.assign(15, gid);
+    var g = &l.groups[gid];
+    g.n_out = 1;
+    g.exposed_out[0] = .{ .member = 15, .port = 0, .is_input = false };
+
+    const dyn = DynAlwaysOk{};
+    const via_group = resolveExposedPort(&l, dyn, handleOfGroup(gid));
+    const via_member = resolveExposedPort(&l, dyn, 15);
+    try testing.expect(via_group >= 0);
+    try testing.expectEqual(via_group, via_member);
+    try testing.expectEqual(@as(i32, @intCast(15 * MAX_OUT_PORTS)), via_group);
+}
+
+// TASK-171 ケース B: 同じ合成 handle のまま exposed_out[0] を差し替え → 戻り値が変わる
+// （handle 不変でも実 port ID 変化を検出できる契約）。
+test "group: resolveExposedPort changes when exposed_out member/port swaps on same handle" {
+    var l = Ledger{};
+    const gid = l.alloc().?;
+    l.assign(15, gid);
+    l.assign(13, gid);
+    var g = &l.groups[gid];
+    g.n_out = 1;
+    g.exposed_out[0] = .{ .member = 15, .port = 0, .is_input = false };
+
+    const dyn = DynAlwaysOk{};
+    const dh = handleOfGroup(gid);
+    const before = resolveExposedPort(&l, dyn, dh);
+    try testing.expectEqual(@as(i32, @intCast(15 * MAX_OUT_PORTS)), before);
+
+    g.exposed_out[0] = .{ .member = 13, .port = 0, .is_input = false };
+    const after = resolveExposedPort(&l, dyn, dh);
+    try testing.expectEqual(@as(i32, @intCast(13 * MAX_OUT_PORTS)), after);
+    try testing.expect(before != after);
 }
 
 test "group: alloc/assign/free lifecycle + auto-vanish on last unassign" {

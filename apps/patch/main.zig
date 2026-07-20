@@ -77,6 +77,9 @@ comptime {
     if (group.GROUP_HANDLE_BASE != MAX_MODULES) {
         @compileError("group.GROUP_HANDLE_BASE must equal modular.dyn.MAX_MODULES");
     }
+    if (group.MAX_OUT_PORTS != MAX_OUT) {
+        @compileError("group.MAX_OUT_PORTS must equal modular.signal.MAX_OUT");
+    }
 }
 
 /// recipe / diagnostics の canonical app name（既存 modular recipe 互換。TASK-105.4）。
@@ -2489,19 +2492,10 @@ fn itemHandle(item: ?Item) ?Handle {
 /// 変わる（updateViz は republish する）。②別の display handle が同じ実 member/port を expose していれば
 /// 戻り値は同じになりうる（updateViz は republish しない）。updateViz の変化検出は
 /// `new_ports[]（この関数の戻り値）!= app.tap_ports[]` で行い、slot 温存（handle 一致）とは別に判定する。
-/// 専用の回帰テストは、この関数が App/DynGraph/group.Ledger の実インスタンスに依存するため未整備
-/// （main.zig は現状 unit test root を持たない。canvas.zig の selectTapPortsStable 側は
-/// table test で「handle 安定化」だけを検証済み。TASK-170 の follow-up 候補）。
+/// 本体は `group.resolveExposedPort`（TASK-171 で App 非依存に抽出し test-patch で固定）。
 fn resolveTapPort(app: *const App, dh: Handle) i32 {
-    if (group.groupIdFromHandle(dh)) |gid| {
-        const g = app.ledger.groups[gid];
-        if (g.n_out == 0) return -1;
-        const ref = g.exposed_out[0];
-        if (!app.dyn.slotActive(ref.member) or app.dyn.nOut(ref.member) <= ref.port) return -1;
-        return @intCast(@as(u32, ref.member) * MAX_OUT + ref.port);
-    }
-    if (!app.dyn.slotActive(dh) or app.dyn.nOut(dh) == 0) return -1;
-    return @intCast(@as(u32, dh) * MAX_OUT); // out0
+    // app.dyn は *DynGraph（既にポインタ）。&app.dyn は ** になり duck-typed method 解決が失敗する。
+    return group.resolveExposedPort(&app.ledger, app.dyn, dh);
 }
 
 /// display handle の出力ポート i の活性度（合成箱は exposed_out[i] の実メンバー活性度へ解決）。

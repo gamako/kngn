@@ -179,6 +179,12 @@ const SIZE_DIALOG_W_ID: gui.Id = SIZE_DIALOG_ID_BASE + 1;
 const SIZE_DIALOG_H_ID: gui.Id = SIZE_DIALOG_ID_BASE + 2;
 const SIZE_DIALOG_OK_ID: gui.Id = SIZE_DIALOG_ID_BASE + 3;
 const SIZE_DIALOG_CANCEL_ID: gui.Id = SIZE_DIALOG_ID_BASE + 4;
+/// status bar の zoom%/cursor 可変スロット（TASK-154）。layout 予約用の明示 ID。
+/// 実テキストは updateViewport 後に drawStatusBarLive が描く。
+const STATUS_BAR_ID_BASE: gui.Id = 0xA451_0000;
+const STATUS_CURSOR_ID: gui.Id = STATUS_BAR_ID_BASE + 1;
+const STATUS_ZOOM_ID: gui.Id = STATUS_BAR_ID_BASE + 2;
+const STATUS_BAR_BG = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF);
 
 const MENU_CMD_CAP = 40;
 const RECENT_CMD_BASE: platform.CommandId = 100;
@@ -6139,6 +6145,9 @@ fn panelBuildTimeline(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
 
 /// UI ツリー構築（widget の同期 hit-test もここで走る）
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
+    // canvas_rect は旧く status bar cursor 用だったが、TASK-154 で drawStatusBarLive へ移した。
+    // シグネチャは呼び出し互換のため残し、未使用を明示する。
+    _ = canvas_rect;
     // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
     app.syncEditHsv();
     // Color panel 非表示時は HSV widget が無く applyEditColor が callback 内で呼ばれない。
@@ -6183,32 +6192,33 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
 
     // ── status bar（cursor → zoom → layer → frame → saveMsg。TASK-148.3）──
+    // cursor/zoom は updateViewport 前の旧値になるため、buildUi では layout 用プレースホルダ
+    // （固定幅 box + 明示 ID）だけ置き、実テキストは endFrame 後・updateViewport 後の
+    // drawStatusBarLive で描く（TASK-154。drawAppshellOverlay と同型の低レベル直接描画）。
     ctx.beginBox(.{
         .direction = .row,
         .width = .{ .grow = 1 },
         .padding = .{ 2, 6, 2, 6 },
         .gap = 16,
-        .bg = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF),
+        .bg = STATUS_BAR_BG,
     });
     const arena = ctx.allocator();
-    // cursor の canvas 座標（表示領域外は "-"）。rect は前フレーム値（同期 hit-test 契約と同じ）
-    const cursor_txt = blk: {
-        if (canvas_rect) |rect| {
-            if (zoom_mod.screenToCanvas(
-                .{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y },
-                rect,
-                app.view_zoom,
-            )) |cp| {
-                break :blk try std.fmt.allocPrint(arena, "cursor: ({d}, {d})", .{ cp.x, cp.y });
-            }
-        }
-        break :blk "cursor: -";
-    };
-    ctx.labelEx(cursor_txt, ctx.style.text_subtle);
-    ctx.labelEx(
-        try std.fmt.allocPrint(arena, "zoom: {d}%", .{app.view_zoom.pct()}),
-        ctx.style.text_subtle,
-    );
+    const ink_h = gui.fontInkHeight(ctx.font);
+    // 最大表示幅を予約（座標 4 桁・zoom 最大 3200%。実テキストは後から上書き）。
+    const cursor_slot_w: i32 = @intCast(ctx.font.measure("cursor: (9999, 9999)"));
+    const zoom_slot_w: i32 = @intCast(ctx.font.measure("zoom: 3200%"));
+    ctx.beginBox(.{
+        .id = STATUS_CURSOR_ID,
+        .width = .{ .fixed = cursor_slot_w },
+        .height = .{ .fixed = ink_h },
+    });
+    ctx.endBox();
+    ctx.beginBox(.{
+        .id = STATUS_ZOOM_ID,
+        .width = .{ .fixed = zoom_slot_w },
+        .height = .{ .fixed = ink_h },
+    });
+    ctx.endBox();
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "layer: {d}/{d}", .{ app.canvas.selected_layer + 1, app.canvas.layers.items.len }),
         ctx.style.text_subtle,
@@ -6373,6 +6383,40 @@ fn loadProjectPath(app: *App, path: []const u8) !void {
     app.loadPaletteFromDoc();
     app.syncPreviewCanvas();
     try app.setProjectPath(path);
+}
+
+/// status bar の zoom%/cursor を updateViewport 適用後の値で直接描画する（TASK-154）。
+/// endFrame 後・canvas_rect 再計算後に呼ぶ。getNodeRect は当フレーム endFrame 済みなので最新 layout。
+/// draw_list.text は文字列を所有しないため、payload は frame arena へ dupe する
+/// （次 beginFrame の arena.reset まで有効。labelEx と同じ契約）。
+fn drawStatusBarLive(ctx: *gui.Context, app: *const App, canvas_rect: ?core.Rect) !void {
+    const col = ctx.style.text_subtle;
+    const arena = ctx.allocator();
+    if (ctx.getNodeRect(STATUS_CURSOR_ID)) |r| {
+        var buf: [64]u8 = undefined;
+        const raw: []const u8 = blk: {
+            if (canvas_rect) |rect| {
+                if (zoom_mod.screenToCanvas(
+                    .{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y },
+                    rect,
+                    app.view_zoom,
+                )) |cp| {
+                    break :blk std.fmt.bufPrint(&buf, "cursor: ({d}, {d})", .{ cp.x, cp.y }) catch "cursor: -";
+                }
+            }
+            break :blk "cursor: -";
+        };
+        const txt = try arena.dupe(u8, raw);
+        try ctx.draw_list.rectFilled(r, STATUS_BAR_BG);
+        try ctx.draw_list.text(.{ .x = r.x, .y = r.y }, txt, col);
+    }
+    if (ctx.getNodeRect(STATUS_ZOOM_ID)) |r| {
+        var buf: [32]u8 = undefined;
+        const raw = std.fmt.bufPrint(&buf, "zoom: {d}%", .{app.view_zoom.pct()}) catch "zoom: ?%";
+        const txt = try arena.dupe(u8, raw);
+        try ctx.draw_list.rectFilled(r, STATUS_BAR_BG);
+        try ctx.draw_list.text(.{ .x = r.x, .y = r.y }, txt, col);
+    }
 }
 
 fn drawAppshellOverlay(ctx: *gui.Context, app: *const App) !void {
@@ -6802,6 +6846,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
         // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果。O(1)）。
         canvas_rect = canvasBlitRect(&self.ctx, self);
+        // TASK-154: status bar zoom%/cursor を新 zoom/pan で上書き描画（buildUi 時点の旧値を使わない）。
+        try drawStatusBarLive(&self.ctx, self, canvas_rect);
 
         // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
         // TASK-79.5: 選択中レイヤーが text kind の間は、この分岐全体（bezier/select/
