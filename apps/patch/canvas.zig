@@ -576,12 +576,16 @@ pub fn selectTapPortsStable(
         }
     }
 
-    // 3. 空き slot への充填。
+    // 3. 空き slot への充填。`locked` は「この呼び出し内で新規に割り当てた slot」だけに立てる
+    // （step1 で温存された既存 slot は locked にしない＝引き続き満杯時置換の victim になれる。
+    // 例: 容量1で旧 hover を新 selected が置換するケースはこの経路を通る）。
+    var locked: [MAX_TAP_CANDIDATES]bool = [_]bool{false} ** MAX_TAP_CANDIDATES;
     var ci: usize = 0;
-    for (out) |*o| {
-        if (o.* != null) continue;
-        if (ci >= ncand) break;
+    for (out, 0..) |*o, idx| {
+        if (o.* != null) continue; // step1 で温存済み（locked にはしない）
+        if (ci >= ncand) continue;
         o.* = candidates[ci];
+        locked[idx] = true; // 新規充填。直後の反復で同じ slot を再度置換しない
         ci += 1;
     }
 
@@ -589,6 +593,7 @@ pub fn selectTapPortsStable(
     while (ci < ncand) {
         var victim: ?usize = null;
         for (out, 0..) |o, idx| {
+            if (locked[idx]) continue;
             const h = o orelse continue;
             if (selected != null and h == selected.?) continue;
             if (hover != null and h == hover.?) continue;
@@ -597,6 +602,7 @@ pub fn selectTapPortsStable(
         }
         const v = victim orelse break; // 置換対象なし（cap が selected+hover で埋まっている等）
         out[v] = candidates[ci];
+        locked[v] = true; // 直後の反復で同じ slot を再度 victim にしない
         ci += 1;
     }
 }
@@ -986,7 +992,44 @@ test "canvas: selectTapPortsStable — 容量1で旧 hover を新 selected が�
     var out: [1]?Handle = undefined;
     // 今回 selected=handle1（新規）、hover=null（旧 hover は外れた）。
     selectTapPortsStable(cam, 800, 400, &nodes, 1, null, &prev, &out);
-    try testing.expectEqual(@as(?Handle, 1), out[0]); // 旧 handle0 を置換して selected が入る
+    try testing.expectEqual(@as(?Handle, 1), out[0]); // 旧 handle0 を置換して選択が入る
+}
+
+test "canvas: selectTapPortsStable — 満杯時に selected と hover を両方置換する（同一 slot 二重上書きの回帰防止）" {
+    // 前回 slot0/slot1 を占有していた A・B は今回どちらも selected/hover ではない（=置換可能な
+    // 最低優先度）。selected=C・hover=D が両方新規候補で、容量が2しかない（空き slot 0個）ため
+    // 両方とも満杯時置換（step4）を通る。1つ目の置換で使った slot をすぐ2つ目の victim に選び直して
+    // しまうと、2つ目の slot（B）が手つかずのまま残り、1つ目の置換結果（C）まで消えてしまう回帰が
+    // あった（codex レビューで検出。`locked` による同一 slot 再選出防止で修正済み）。
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 }, // A（旧・非選択非hover）
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 }, // B（旧・非選択非hover）
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 }, // C（新・selected）
+        .{ .handle = 3, .pos = .{ .x = 700, .y = 60 }, .n_in = 1, .n_out = 1 }, // D（新・hover）
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    var prev = [_]?Handle{ 0, 1 }; // 前回: slot0=A, slot1=B（両方今回も isTapCandidate を満たす）
+    var out: [2]?Handle = undefined;
+    selectTapPortsStable(cam, 800, 400, &nodes, 2, 3, &prev, &out);
+    // A・B はどちらも selected/hover ではないため両方置換対象になり、C（selected）・D（hover）が
+    // それぞれ別の slot へ正しく入る（二重上書きで C か D の片方が消えることがない）。
+    var has_selected = false;
+    var has_hover = false;
+    for (out) |m| {
+        if (m) |h| {
+            if (h == 2) has_selected = true;
+            if (h == 3) has_hover = true;
+        }
+    }
+    try testing.expect(has_selected);
+    try testing.expect(has_hover);
+    // A・B（旧候補）はどちらも残っていない（両方置換された）。
+    for (out) |m| {
+        if (m) |h| {
+            try testing.expect(h != 0);
+            try testing.expect(h != 1);
+        }
+    }
 }
 
 test "canvas: selectTapPortsStable と resolveTapPort 相当（handle 変化と port ID 変化の分離）" {

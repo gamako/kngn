@@ -2483,6 +2483,15 @@ fn itemHandle(item: ?Item) ?Handle {
 
 /// display handle（実 or 合成箱）を実 global 出力 port id（handle*MAX_OUT+out）へ解決。out0 を代表とする。
 /// 解決不能（出力なし/非 active/合成箱の expose なし）は -1。合成 handle を dyn へ渡さない規約を守る。
+///
+/// TASK-170 の tap slot 安定化契約: この関数の戻り値（実 port id）と display handle（安定化キー）は
+/// 意図的に別軸である。①合成箱の handle が同じでも `exposed_out[0]` の member/port が変われば戻り値が
+/// 変わる（updateViz は republish する）。②別の display handle が同じ実 member/port を expose していれば
+/// 戻り値は同じになりうる（updateViz は republish しない）。updateViz の変化検出は
+/// `new_ports[]（この関数の戻り値）!= app.tap_ports[]` で行い、slot 温存（handle 一致）とは別に判定する。
+/// 専用の回帰テストは、この関数が App/DynGraph/group.Ledger の実インスタンスに依存するため未整備
+/// （main.zig は現状 unit test root を持たない。canvas.zig の selectTapPortsStable 側は
+/// table test で「handle 安定化」だけを検証済み。TASK-170 の follow-up 候補）。
 fn resolveTapPort(app: *const App, dh: Handle) i32 {
     if (group.groupIdFromHandle(dh)) |gid| {
         const g = app.ledger.groups[gid];
