@@ -166,7 +166,8 @@ pub fn measure(node: *Node, default_font: Font) void {
             .text => |t| {
                 const f = t.font orelse default_font;
                 node.measured_w = @intCast(f.measure(t.str));
-                node.measured_h = @intCast(f.metrics().line_height);
+                // line_height（line gap 含む）ではなく論理 ink 高さ（TASK-167）。
+                node.measured_h = font_mod.fontInkHeight(f);
             },
             .custom => |c| {
                 node.measured_w = @max(0, c.measured.x);
@@ -288,7 +289,7 @@ pub fn place(node: *Node, rect: Rect) void {
 
 const test_font = font_mod.default_font;
 
-// width/height ともに既定と異なる override 用テストフォント（advance=16, line_height=24）。
+// width/height ともに既定と異なる override 用テストフォント（advance=16, line_height=24, ink=24）。
 const override_dummy: u8 = 0;
 const override_vt: Font.VTable = .{
     .measure = struct {
@@ -306,6 +307,25 @@ const override_vt: Font.VTable = .{
     }.f,
 };
 const override_font: Font = .{ .ptr = &override_dummy, .vtable = &override_vt };
+
+// line_gap 付き（ink=18 < line_height=24）。TASK-167 の text leaf 高さ検証用。
+const gap_dummy: u8 = 0;
+const gap_vt: Font.VTable = .{
+    .measure = struct {
+        fn f(_: *const anyopaque, text: []const u8) u32 {
+            return 8 * @as(u32, @intCast(text.len));
+        }
+    }.f,
+    .drawTo = struct {
+        fn f(_: *const anyopaque, _: geom.RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect) void {}
+    }.f,
+    .metrics = struct {
+        fn f(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 24, .ascent = 14, .descent = 4 };
+        }
+    }.f,
+};
+const gap_font: Font = .{ .ptr = &gap_dummy, .vtable = &gap_vt };
 
 test "measure: row の fit（gap + padding 込み）" {
     var root: Node = .{ .cfg = .{ .direction = .row, .padding = .{ 2, 3, 4, 5 }, .gap = 7 } };
@@ -363,11 +383,11 @@ test "measure: ネストした fit が子から伝播する" {
     try std.testing.expectEqual(@as(i32, 44), outer.measured_h);
 }
 
-test "measure: text leaf は font 由来（8×len, glyph_h）" {
+test "measure: text leaf は font 由来（8×len, ink=ascent+descent）" {
     var t: Node = .{ .leaf = .{ .text = .{ .str = "Hello", .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .font = null } } };
     measure(&t, test_font);
     try std.testing.expectEqual(@as(i32, 40), t.measured_w);
-    try std.testing.expectEqual(@as(i32, 16), t.measured_h);
+    try std.testing.expectEqual(@as(i32, 16), t.measured_h); // bitmap: 12+4
 }
 
 test "measure: leaf override font が width/height 両方に効く" {
@@ -376,13 +396,55 @@ test "measure: leaf override font が width/height 両方に効く" {
             .text = .{
                 .str = "ab",
                 .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
-                .font = override_font, // advance=16, line_height=24
+                .font = override_font, // advance=16, ink=24
             },
         },
     };
     measure(&t, test_font);
     try std.testing.expectEqual(@as(i32, 32), t.measured_w); // 16 * 2（override の advance）
-    try std.testing.expectEqual(@as(i32, 24), t.measured_h); // override の line_height
+    try std.testing.expectEqual(@as(i32, 24), t.measured_h); // override の ink（20+4）
+}
+
+test "TASK-167: text leaf は line_gap を高さに含めない（ink=18）" {
+    var t: Node = .{
+        .leaf = .{
+            .text = .{
+                .str = "Hi",
+                .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+                .font = gap_font, // line_height=24, ascent=14, descent=4 → ink=18
+            },
+        },
+    };
+    measure(&t, test_font);
+    try std.testing.expectEqual(@as(i32, 16), t.measured_w);
+    try std.testing.expectEqual(@as(i32, 18), t.measured_h);
+}
+
+test "TASK-167: text leaf は固定高 parent の align_cross=.center で中央配置" {
+    // parent h=40, text ink=18 → center y = (40-18)/2 = 11
+    var root: Node = .{
+        .cfg = .{
+            .direction = .row,
+            .width = .{ .fixed = 100 },
+            .height = .{ .fixed = 40 },
+            .align_cross = .center,
+        },
+    };
+    var t: Node = .{
+        .leaf = .{
+            .text = .{
+                .str = "Hi",
+                .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+                .font = gap_font,
+            },
+        },
+    };
+    appendChild(&root, &t);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 40 });
+    try std.testing.expectEqual(@as(i32, 18), t.measured_h);
+    try std.testing.expectEqual(@as(u32, 18), t.rect.h);
+    try std.testing.expectEqual(@as(i32, 11), t.rect.y);
 }
 
 test "place: fixed + percent + grow(1:2) の混合配分" {

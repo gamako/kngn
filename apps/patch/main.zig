@@ -1188,7 +1188,13 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         const hovered = itemIsHandle(app.hover, g.handle);
         const border = if (selected) SEL_COL else if (hovered) HOVER_COL else BORDER_COL;
         dl.rectOutline(rect, border, if (selected) 2 else 1) catch {};
-        dl.text(.{ .x = rect.x + 6, .y = rect.y + 4 }, nodeTitle(app, g.handle), TITLE_COL) catch {};
+        // タイトル帯（TITLE_H * zoom）内で ink 高さ基準の縦中央（TASK-167）。
+        {
+            const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * cam.zoom));
+            const text_h = gui.fontInkHeight(app.gui_ctx.font);
+            const text_y = gui.centeredTextY(rect.y, title_band_h, text_h);
+            dl.text(.{ .x = rect.x + 6, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL) catch {};
+        }
         if (group.groupIdFromHandle(g.handle)) |gid| {
             drawToggle(app, dl, g, true); // 畳み箱は常に collapsed 側
             drawMacroGrid(app, dl, g, gid); // 本体に TR/303 grid + playhead（TASK-40.7.2）
@@ -1240,7 +1246,12 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         const hov = canvas.hitTestPalette(app.mouse, &buttons) == btn.kind_index;
         dl.rectFilled(rect, if (hov) PAL_BG_HOVER else PAL_BG) catch {};
         dl.rectOutline(rect, BORDER_COL, 1) catch {};
-        dl.text(.{ .x = rect.x + 6, .y = rect.y + 5 }, paletteLabel(PALETTE[btn.kind_index]), TITLE_COL) catch {};
+        // palette 行高 PAL_H 内で ink 中央（TASK-167）。
+        {
+            const text_h = gui.fontInkHeight(app.gui_ctx.font);
+            const text_y = gui.centeredTextY(rect.y, @as(i32, @intFromFloat(PAL_H)), text_h);
+            dl.text(.{ .x = rect.x + 6, .y = text_y }, paletteLabel(PALETTE[btn.kind_index]), TITLE_COL) catch {};
+        }
     }
 }
 
@@ -1337,7 +1348,12 @@ fn drawToggle(app: *const App, dl: *gui.DrawList, g: NodeGeom, collapsed: bool) 
     const rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(size), .h = safeU32(size) };
     dl.rectFilled(rect, PAL_BG) catch {};
     dl.rectOutline(rect, BORDER_COL, 1) catch {};
-    dl.text(.{ .x = rect.x + 3, .y = rect.y + 2 }, if (collapsed) "+" else "-", TITLE_COL) catch {};
+    // トグル正方形内で ink 中央（TASK-167）。
+    {
+        const text_h = gui.fontInkHeight(app.gui_ctx.font);
+        const text_y = gui.centeredTextY(rect.y, @as(i32, @intCast(rect.h)), text_h);
+        dl.text(.{ .x = rect.x + 3, .y = text_y }, if (collapsed) "+" else "-", TITLE_COL) catch {};
+    }
 }
 
 /// 展開中グループの薄い枠（現在のメンバー配置の bbox 外周）+ ヘッダー（タイトル+トグル、group.pos アンカー）。
@@ -1372,7 +1388,13 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const Nod
     const hsel = itemIsHandle(app.selected, header.handle);
     dl.rectFilled(hrect, NODE_BG) catch {};
     dl.rectOutline(hrect, if (hsel) SEL_COL else BORDER_COL, if (hsel) 2 else 1) catch {};
-    dl.text(.{ .x = hrect.x + 6, .y = hrect.y + 4 }, gr.kind.displayName(), TITLE_COL) catch {};
+    // 展開グループヘッダも TITLE_H 帯で ink 中央（TASK-167）。
+    {
+        const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * app.camera.zoom));
+        const text_h = gui.fontInkHeight(app.gui_ctx.font);
+        const text_y = gui.centeredTextY(hrect.y, title_band_h, text_h);
+        dl.text(.{ .x = hrect.x + 6, .y = text_y }, gr.kind.displayName(), TITLE_COL) catch {};
+    }
     drawToggle(app, dl, header, false);
 }
 

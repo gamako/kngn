@@ -33,6 +33,7 @@ const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const text_edit = @import("text_edit.zig");
 const state_mod = @import("state.zig");
+const font_mod = @import("font.zig");
 pub const Vec2f = input_mod.Vec2f;
 
 pub const Context = context_mod.Context;
@@ -319,7 +320,7 @@ fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
 
 /// SelectableLabel（read-only）。編集・caret・複数行・折返しは扱わない。
 /// 改行/CJK/emoji を含む text も strip せず Font 契約どおり 1 行で measure/描画する。
-/// 幅は TextLayout.prefix_widths の総幅、高さは Font.metrics().line_height。
+/// 幅は TextLayout.prefix_widths の総幅、高さは Font の論理 ink（ascent+descent。TASK-167）。
 pub fn selectableLabel(ctx: *Context, text: []const u8, opts: SelectableLabelOpts) SelectableLabelResult {
     return selectableLabelId(ctx, ctx.id_stack.make(text), text, opts);
 }
@@ -405,7 +406,7 @@ pub fn selectableLabelId(
     }
 
     const width = layout_data.prefix_widths[count];
-    const line_height = ctx.font.metrics().line_height;
+    const ink_h = font_mod.fontInkHeight(ctx.font);
     const draw_data = ctx.allocator().create(SelectableLabelDraw) catch
         @panic("selectableLabel: OOM");
     draw_data.* = .{
@@ -418,9 +419,9 @@ pub fn selectableLabelId(
     ctx.beginBox(.{
         .id = id,
         .width = .{ .fixed = @intCast(width) },
-        .height = .{ .fixed = @intCast(line_height) },
+        .height = .{ .fixed = ink_h },
     });
-    ctx.custom(.{ .x = @intCast(width), .y = @intCast(line_height) }, SelectableLabelDraw.draw, draw_data);
+    ctx.custom(.{ .x = @intCast(width), .y = ink_h }, SelectableLabelDraw.draw, draw_data);
     ctx.endBox();
 
     return .{ .selection = draw_data.selection, .copy_request = copy_request };
@@ -642,8 +643,8 @@ pub fn textInputId(
 
     const width = resolveTextInputWidth(ctx, buffer.slice(), opts);
     const metrics = ctx.font.metrics();
-    // line_height（line_gap 含む）ではなく ascent+descent を content 高さに使う（TASK-118）。
-    const ink_height: i32 = @max(0, metrics.ascent + metrics.descent);
+    // line_height（line_gap 含む）ではなく ascent+descent を content 高さに使う（TASK-118/167）。
+    const ink_height: i32 = font_mod.inkHeight(metrics);
     const height = ink_height + opts.padding[0] + opts.padding[2];
     const content_height = ink_height;
     const vertical_offset: i32 = @max(0, @divTrunc(content_height - ink_height, 2));
@@ -1858,7 +1859,6 @@ pub fn endScrollArea(ctx: *Context) void {
 // Tests
 // ============================================================
 
-const font_mod = @import("font.zig");
 const render_mod = @import("render.zig");
 
 fn testCtx() Context {
@@ -3934,6 +3934,124 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
     try std.testing.expect(saw_selection);
     try std.testing.expect(saw_caret);
     try std.testing.expect(saw_underline);
+}
+
+test "TASK-167: selectableLabel は ink 高さと selection/text の y を一致させる" {
+    // line_height=24, ink=18 の gap font。box/selection/text がすべて ink 基準。
+    const GapLike = struct {
+        fn measure(_: *const anyopaque, text: []const u8) u32 {
+            return 8 * @as(u32, @intCast(text.len));
+        }
+        fn drawTo(
+            _: *const anyopaque,
+            _: font_mod.RenderTarget,
+            _: font_mod.Vec2,
+            _: []const u8,
+            _: Color,
+            _: Rect,
+        ) void {}
+        fn metrics(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 24, .ascent = 14, .descent = 4 };
+        }
+        const vtable: font_mod.Font.VTable = .{
+            .measure = measure,
+            .drawTo = drawTo,
+            .metrics = metrics,
+        };
+        const font: font_mod.Font = .{ .ptr = undefined, .vtable = &vtable };
+    };
+
+    var ctx = Context.init(std.testing.allocator, GapLike.font);
+    defer ctx.deinit();
+    const id: Id = 0xD1671;
+    const ink: i32 = 18;
+
+    ctx.beginFrameAt(320, 80, 0);
+    _ = selectableLabelId(&ctx, id, "hello", .{});
+    ctx.endFrame();
+
+    const node = ctx.getNodeRect(id).?;
+    try std.testing.expectEqual(ink, @as(i32, @intCast(node.h)));
+    try std.testing.expectEqual(@as(u32, 40), node.w); // 5 * 8
+
+    // selection を付けて text/selection の y・h を確認
+    ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 5 };
+    ctx.beginFrameAt(320, 80, 0.1);
+    _ = selectableLabelId(&ctx, id, "hello", .{});
+    ctx.endFrame();
+
+    var saw_text = false;
+    var saw_sel = false;
+    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+        .text => |t| {
+            if (std.mem.eql(u8, t.text, "hello")) {
+                try std.testing.expectEqual(node.y, t.pos.y);
+                saw_text = true;
+            }
+        },
+        .rect_filled => |rf| {
+            if (rf.rect.h == @as(u32, @intCast(ink)) and rf.rect.y == node.y and rf.rect.w > 1) {
+                saw_sel = true;
+            }
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_text);
+    try std.testing.expect(saw_sel);
+}
+
+test "TASK-167: button 内 label は ink 高さを持ち line_gap を含めない" {
+    const GapLike = struct {
+        fn measure(_: *const anyopaque, text: []const u8) u32 {
+            return 8 * @as(u32, @intCast(text.len));
+        }
+        fn drawTo(
+            _: *const anyopaque,
+            _: font_mod.RenderTarget,
+            _: font_mod.Vec2,
+            _: []const u8,
+            _: Color,
+            _: Rect,
+        ) void {}
+        fn metrics(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 24, .ascent = 14, .descent = 4 };
+        }
+        const vtable: font_mod.Font.VTable = .{
+            .measure = measure,
+            .drawTo = drawTo,
+            .metrics = metrics,
+        };
+        const font: font_mod.Font = .{ .ptr = undefined, .vtable = &vtable };
+    };
+
+    var ctx = Context.init(std.testing.allocator, GapLike.font);
+    defer ctx.deinit();
+    const id: Id = 0xD1672;
+    // default button_padding は style 由来。content = ink=18、box = pad_v + 18
+    const pad = ctx.style.button_padding; // [top, right, bottom, left]
+    const ink: i32 = 18;
+    const expected_h: i32 = pad[0] + ink + pad[2];
+
+    ctx.beginFrameAt(240, 80, 0);
+    _ = buttonId(&ctx, id, "Go", .{});
+    ctx.endFrame();
+
+    const node = ctx.getNodeRect(id).?;
+    try std.testing.expectEqual(expected_h, @as(i32, @intCast(node.h)));
+
+    // text command y = box.y + pad_top（label が fit で中央揃えになる前の leaf 配置は
+    // box が column/row default に依存。button は label を直接置く row-like fit box）。
+    var saw = false;
+    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+        .text => |t| {
+            if (std.mem.eql(u8, t.text, "Go")) {
+                try std.testing.expectEqual(node.y + pad[0], t.pos.y);
+                saw = true;
+            }
+        },
+        else => {},
+    };
+    try std.testing.expect(saw);
 }
 
 test "TASK-119: TextInput Cmd/Option navigation" {

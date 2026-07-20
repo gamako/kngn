@@ -21,7 +21,7 @@ pub const BitmapFont = struct {
     glyph_h: u8,
     glyphs: []const u8,
     /// baseline 位置（line box 上端から）。spleen 8x16 のおおよその値。
-    /// 現状 gui レイアウトは line_height のみ使用し baseline/ascent は未使用だが、
+    /// GUI の text 高さ・縦中央揃えは ascent+descent（`inkHeight`）を使う（TASK-167）。
     /// 共通 Metrics 契約（ascent+descent <= line_height）を満たす値を持たせる。
     ascent: i32 = 12,
     descent: i32 = 4,
@@ -215,6 +215,31 @@ pub const default_bitmap_font: BitmapFont = .{
 pub const default_font: Font = default_bitmap_font.asFont();
 
 // ============================================================
+// TASK-167: 論理 ink 高さ・縦中央揃え helper
+// ============================================================
+
+/// Font 契約の論理 ascent+descent 高さ（ink box）。`line_height` の line gap は含まない。
+/// 実測 glyph bbox ではなく Metrics 上の論理箱。GUI の text leaf / selectableLabel /
+/// TextInput / popup の縦サイズと中央揃えに使う（TASK-167 / TASK-118）。
+/// bitmap default（ascent=12, descent=4）では 16 となり従来の line_height と一致する。
+pub fn inkHeight(metrics: Metrics) i32 {
+    return @max(0, metrics.ascent + metrics.descent);
+}
+
+/// `font.metrics()` から `inkHeight` を得る薄いラッパ。
+pub fn fontInkHeight(font: Font) i32 {
+    return inkHeight(font.metrics());
+}
+
+/// 指定 row 内で text（高さ `text_h`）を縦中央にした y（line box 上端 = Font.drawTo の pos.y）。
+/// `row_h < text_h` のときは offset 0（`row_y`）を返す（負のずれを出さない）。
+/// DrawList 直書き経路（patch node title 等）向け。layout 経路は text leaf 高さ自体を
+/// ink に揃えるので通常は不要。
+pub fn centeredTextY(row_y: i32, row_h: i32, text_h: i32) i32 {
+    return row_y + @max(0, @divTrunc(row_h - text_h, 2));
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -264,4 +289,29 @@ test "drawTo: ASCII グリフが描画される（共通カバレッジ描画路
         if (p != 0xFF000000) any_set = true;
     }
     try std.testing.expect(any_set);
+}
+
+test "TASK-167: inkHeight は default bitmap で 16（ascent+descent）" {
+    const m = default_font.metrics();
+    try std.testing.expectEqual(@as(i32, 16), inkHeight(m));
+    try std.testing.expectEqual(@as(i32, 16), fontInkHeight(default_font));
+    try std.testing.expectEqual(@as(i32, 16), @as(i32, @intCast(m.line_height)));
+}
+
+test "TASK-167: inkHeight は line_gap 付き metrics で ascent+descent のみ" {
+    const m = Metrics{ .line_height = 24, .ascent = 14, .descent = 4 };
+    try std.testing.expectEqual(@as(i32, 18), inkHeight(m));
+    // 負の ascent/descent 合算は 0 にクランプ
+    try std.testing.expectEqual(@as(i32, 0), inkHeight(.{ .line_height = 10, .ascent = -2, .descent = -3 }));
+}
+
+test "TASK-167: centeredTextY は row 内で整数中央・負 offset なし" {
+    // item_h=20, text_h=18 → offset 1
+    try std.testing.expectEqual(@as(i32, 11), centeredTextY(10, 20, 18));
+    // 等しい → offset 0
+    try std.testing.expectEqual(@as(i32, 5), centeredTextY(5, 16, 16));
+    // text の方が高い → offset 0（負にしない）
+    try std.testing.expectEqual(@as(i32, 0), centeredTextY(0, 10, 18));
+    // 奇数差は floor 切り捨て: (21-18)/2 = 1
+    try std.testing.expectEqual(@as(i32, 1), centeredTextY(0, 21, 18));
 }

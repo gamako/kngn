@@ -325,12 +325,15 @@ fn drawInlineComposition(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect)
     const d: *const InlineCompositionDraw = @ptrCast(@alignCast(ctx_ptr));
     const committed_w: i32 = @intCast(d.font.measure(d.committed));
     const preedit_w: i32 = @intCast(d.font.measure(d.preedit));
-    dl.textEx(.{ .x = rect.x, .y = rect.y }, d.committed, d.color, d.font) catch @panic("composition text: OOM");
-    dl.textEx(.{ .x = rect.x + committed_w, .y = rect.y }, d.preedit, d.preedit_color, d.font) catch @panic("composition preedit: OOM");
+    // custom leaf 高さは ink 基準。text/underline/caret を同じ y 基準で揃える（TASK-167）。
     const metrics = d.font.metrics();
+    const ink_h = gui.inkHeight(metrics);
+    const text_y = gui.centeredTextY(rect.y, @as(i32, @intCast(rect.h)), ink_h);
+    dl.textEx(.{ .x = rect.x, .y = text_y }, d.committed, d.color, d.font) catch @panic("composition text: OOM");
+    dl.textEx(.{ .x = rect.x + committed_w, .y = text_y }, d.preedit, d.preedit_color, d.font) catch @panic("composition preedit: OOM");
     const start_x = rect.x + committed_w;
-    // 下線は baseline 直下（ascent+2）。行ボックス最下端だと descent 下に浮く（実機指摘）。
-    const underline_y = @min(rect.y + @as(i32, @intCast(metrics.ascent)) + 2, rect.y + @as(i32, @intCast(metrics.line_height)) - 1);
+    // 下線は baseline 直下（ascent+2）。ink 箱下端でクランプ（line_height ではなく ink）。
+    const underline_y = @min(text_y + metrics.ascent + 2, text_y + ink_h - 1);
     dl.line(.{
         .x = start_x,
         .y = underline_y,
@@ -340,9 +343,9 @@ fn drawInlineComposition(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect)
     }, d.preedit_color, 1) catch @panic("composition underline: OOM");
     const cursor_prefix = d.preedit[0..@min(d.cursor, d.preedit.len)];
     const cursor_x = start_x + @as(i32, @intCast(d.font.measure(cursor_prefix)));
-    dl.line(.{ .x = cursor_x, .y = rect.y + 2 }, .{
+    dl.line(.{ .x = cursor_x, .y = text_y + 2 }, .{
         .x = cursor_x,
-        .y = rect.y + @as(i32, @intCast(metrics.line_height)) - 2,
+        .y = text_y + ink_h - 2,
     }, d.preedit_color, 1) catch @panic("composition caret: OOM");
 }
 
@@ -5591,7 +5594,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
                     .color = ctx.style.text,
                     .preedit_color = gui.Color.rgba(0x66, 0xCC, 0xFF, 0xFF),
                 };
-                ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = @intCast(ctx.font.metrics().line_height) }, drawInlineComposition, draw_ctx);
+                ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = gui.fontInkHeight(ctx.font) }, drawInlineComposition, draw_ctx);
             } else {
                 var cursor_buf: [96]u8 = undefined;
                 const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
@@ -5739,7 +5742,7 @@ fn buildTextLayerPanel(ctx: *gui.Context, app: *App) !void {
                 .color = ctx.style.text,
                 .preedit_color = gui.Color.rgba(0x66, 0xCC, 0xFF, 0xFF),
             };
-            ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = @intCast(ctx.font.metrics().line_height) }, drawInlineComposition, draw_ctx);
+            ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = gui.fontInkHeight(ctx.font) }, drawInlineComposition, draw_ctx);
         } else {
             var cursor_buf: [160]u8 = undefined;
             const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
@@ -6762,7 +6765,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     .x = r.x + 4 + caret_x_offset,
                     .y = r.y + 2,
                     .w = 1,
-                    .h = @intCast(self.ctx.font.metrics().line_height),
+                    .h = @intCast(gui.fontInkHeight(self.ctx.font)),
                 };
                 if (self.composition_rect == null or
                     self.composition_rect.?.x != rect.x or

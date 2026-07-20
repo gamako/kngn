@@ -27,6 +27,7 @@ const std = @import("std");
 const context_mod = @import("context.zig");
 const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
+const font_mod = @import("font.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
@@ -266,8 +267,8 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
     dl.rectFilled(geo.outer, style.bg) catch @panic("popupMenu: OOM");
     dl.rectOutline(geo.outer, style.border, 1) catch @panic("popupMenu: OOM");
 
-    const metrics = ctx.font.metrics();
-    const line_h: i32 = @intCast(metrics.line_height);
+    // text 高さは logical ink（ascent+descent）。item_h / hit-test / 外枠は style 維持（TASK-167）。
+    const text_h = font_mod.fontInkHeight(ctx.font);
     for (items, 0..) |it, i| {
         const r = itemRect(geo, i);
         // outer 外に完全に出た項目（viewport 縮小で見えない末尾）はスキップ。
@@ -278,7 +279,7 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
         }
         const text_col = if (it.enabled) style.text else style.text_subtle;
         // 垂直中央は自然 item_h 基準（部分見切れでも行の見た目を崩さない）
-        const text_y = r.y + @divTrunc(geo.item_h - line_h, 2);
+        const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
         // ctx.labelEx と同じ契約（arena に複製）。popupMenu は endFrame 後に呼ばれるが、
         // arena は次 beginFrame まで有効（Context.beginFrame の reset タイミング参照）
         // なので caller が一時バッファを渡しても安全。
@@ -296,15 +297,17 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
     if (ctx.screen_w == 0 or ctx.screen_h == 0) return;
     const style = ctx.style;
     const pad = style.popup_padding;
-    const metrics = ctx.font.metrics();
-    const line_h: i32 = @intCast(metrics.line_height);
-    if (line_h <= 0) return;
+    // popup と同じ item_h 契約 + ink 中央揃え（TASK-167）。
+    const item_h = style.popup_item_h;
+    if (item_h <= 0) return;
+    const text_h = font_mod.fontInkHeight(ctx.font);
+    if (text_h <= 0) return;
     const content_w: i32 = @intCast(ctx.font.measure(text));
     const pos: Vec2 = .{
         .x = anchor.x,
         .y = anchor.y + @as(i32, @intCast(anchor.h)) + 4,
     };
-    const geo = layoutPopup(pos, 1, content_w, line_h, pad, ctx.screen_w, ctx.screen_h);
+    const geo = layoutPopup(pos, 1, content_w, item_h, pad, ctx.screen_w, ctx.screen_h);
 
     const dl = &ctx.draw_list;
     dl.pushClip(geo.outer) catch @panic("tooltip: OOM");
@@ -314,7 +317,7 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
 
     const r = itemRect(geo, 0);
     if (r.isEmpty()) return;
-    const text_y = r.y + @divTrunc(geo.item_h - line_h, 2);
+    const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
     dl.textEx(.{ .x = r.x + 4, .y = text_y }, text, style.text, null) catch @panic("tooltip: OOM");
 }
 
@@ -322,7 +325,6 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
 // Tests
 // ============================================================
 
-const font_mod = @import("font.zig");
 const color_mod = @import("color.zig");
 const Color = color_mod.Color;
 
@@ -677,4 +679,112 @@ test "openPopup: 展開直前の active_id/hot_id を解除する" {
     try std.testing.expectEqual(@as(context_mod.Id, 0), ctx.state.active_id);
     try std.testing.expectEqual(@as(context_mod.Id, 0), ctx.state.hot_id);
     try std.testing.expectEqual(@as(context_mod.Id, 0), ctx.state.next_hot_id);
+}
+
+// ── TASK-167: ink 基準の text y ────────────────────────────────
+
+/// line_height=24, ascent=14, descent=4 → ink=18。popup_item_h=20 なら text_y = item_top + 1。
+const GapLike = struct {
+    fn measure(_: *const anyopaque, text: []const u8) u32 {
+        return 8 * @as(u32, @intCast(text.len));
+    }
+    fn drawTo(
+        _: *const anyopaque,
+        _: font_mod.RenderTarget,
+        _: font_mod.Vec2,
+        _: []const u8,
+        _: Color,
+        _: geom.Rect,
+    ) void {}
+    fn metrics(_: *const anyopaque) font_mod.Metrics {
+        return .{ .line_height = 24, .ascent = 14, .descent = 4 };
+    }
+    const vtable: font_mod.Font.VTable = .{
+        .measure = measure,
+        .drawTo = drawTo,
+        .metrics = metrics,
+    };
+    const font: font_mod.Font = .{ .ptr = undefined, .vtable = &vtable };
+};
+
+test "TASK-167: popup text_y は ink 中央（item_h=20, ink=18 → +1）" {
+    var ctx = Context.init(std.testing.allocator, GapLike.font);
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+
+    const items = [_]PopupItem{ .{ .label = "A" }, .{ .label = "B" } };
+    ctx.openPopup(1, .{ .x = 10, .y = 10 });
+    const result = ctx.popupMenu(1, &items);
+    try std.testing.expect(result.open);
+
+    const pad = ctx.style.popup_padding; // 4
+    const item_h = ctx.style.popup_item_h; // 20
+    const ink: i32 = 18;
+    try std.testing.expectEqual(ink, font_mod.fontInkHeight(ctx.font));
+
+    // 外枠高さは item_h 基準のまま（2*20 + 2*4 = 48）
+    const expected_outer_h: u32 = @intCast(2 * item_h + 2 * pad);
+    var saw_bg = false;
+    var text_count: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |rf| {
+            // 最初の背景は outer（h == expected_outer_h）
+            if (!saw_bg and rf.rect.h == expected_outer_h) {
+                try std.testing.expectEqual(@as(i32, 10), rf.rect.x);
+                try std.testing.expectEqual(@as(i32, 10), rf.rect.y);
+                saw_bg = true;
+            }
+        },
+        .text => |t| {
+            // item i top = outer.y + pad + i*item_h = 10+4 + i*20
+            // text_y = top + (20-18)/2 = top + 1
+            const expected_y: i32 = 10 + pad + @as(i32, @intCast(text_count)) * item_h + 1;
+            try std.testing.expectEqual(expected_y, t.pos.y);
+            text_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_bg);
+    try std.testing.expectEqual(@as(usize, 2), text_count);
+
+    // hit-test / itemRect は item_h 契約のまま（外枠不変）
+    const content_w: i32 = @intCast(ctx.font.measure("B"));
+    const geo = layoutPopup(.{ .x = 10, .y = 10 }, 2, content_w, item_h, pad, 800, 600);
+    try std.testing.expectEqual(expected_outer_h, geo.outer.h);
+    try std.testing.expectEqual(@as(u32, 20), itemRect(geo, 0).h);
+    try std.testing.expectEqual(@as(?usize, 0), hitTestItem(geo, 2, .{ .x = 14, .y = 14 }));
+    try std.testing.expectEqual(@as(?usize, 1), hitTestItem(geo, 2, .{ .x = 14, .y = 34 }));
+}
+
+test "TASK-167: tooltip text_y も popup と同じ item_h/ink 中央" {
+    var ctx = Context.init(std.testing.allocator, GapLike.font);
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+
+    const anchor = geom.Rect{ .x = 50, .y = 50, .w = 40, .h = 20 };
+    drawTooltipOverlay(&ctx, "tip", anchor);
+
+    const pad = ctx.style.popup_padding;
+    const item_h = ctx.style.popup_item_h;
+    // layout: pos = (50, 50+20+4=74), outer.h = item_h + 2*pad
+    const expected_outer_h: u32 = @intCast(item_h + 2 * pad);
+    var saw_text = false;
+    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |rf| {
+            if (rf.rect.h == expected_outer_h) {
+                try std.testing.expectEqual(@as(i32, 50), rf.rect.x);
+                try std.testing.expectEqual(@as(i32, 74), rf.rect.y);
+            }
+        },
+        .text => |t| {
+            // item top = 74 + pad, text_y = top + 1
+            try std.testing.expectEqual(@as(i32, 74 + pad + 1), t.pos.y);
+            try std.testing.expectEqualStrings("tip", t.text);
+            saw_text = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_text);
 }
