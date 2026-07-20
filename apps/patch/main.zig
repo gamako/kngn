@@ -1203,7 +1203,12 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
             const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * cam.zoom));
             const text_h = gui.fontInkHeight(app.gui_ctx.font);
             const text_y = gui.centeredTextY(rect.y, title_band_h, text_h);
+            // トグル分の title_x_pad がノード幅を圧迫しても、隣接ノードへ文字が溢れないよう
+            // ノード自身の rect でクリップする（実機フィードバックで発覚した回帰の暫定対処。
+            // 恒久対応はノード表示全体の見直しで検討）。
+            dl.pushClip(rect) catch {};
             dl.text(.{ .x = rect.x + title_x_pad, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL) catch {};
+            dl.popClip();
         }
         if (group.groupIdFromHandle(g.handle)) |gid| {
             drawToggle(app, dl, g, true); // 畳み箱は常に collapsed 側
