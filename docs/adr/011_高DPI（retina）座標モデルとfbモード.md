@@ -3,7 +3,8 @@
 **Status:** 承認済み
 **Date:** 2026-07-20
 **Category:** platform / gui / gfx・座標系・描画パイプライン
-**関連タスク:** TASK-156（高 DPI 対応）/ TASK-157（objc の滲み）/ TASK-167（gui アウトラインフォント）
+**関連タスク:** TASK-156（高 DPI 対応。P1-P5 を 156.1-156.5 に分割）/ TASK-157（objc の滲み＝P0）/
+TASK-167（gui テキスト縦センタリング。**Done**。R5 のフォント物理 px 化は 167 とは別の新規＝156.3）
 
 ## 背景・問題
 
@@ -115,9 +116,10 @@ render は現状 1:1 描画（`render.zig:17-28`）なので、次の**変換規
   `.physical` でも動くが、**nearest 拡大でくっきりにはならない**。crisp が要る UI は**アウトライン
   デフォルトフォント**に切り替える（推奨・R4 のテキスト crisp 化の本命）。
 
-∴ **TASK-167 は「縦センタリング」だけでなく「上記 Font API（論理 measure / 物理 raster・glyph cache）と
-アウトラインデフォルトフォント」まで含む依存タスクとして再定義**する（B1=2x ビットマップは任意 scale に
-弱く却下）。
+∴ **TASK-167（縦センタリング）は既に Done** で、これは行内縦中央揃えのみをカバーする。R5 の
+**フォント物理 px 化（上記 Font API＝論理 measure / 物理 raster・glyph cache・アウトラインデフォルト
+フォント）は 167 とは別の新規タスク（P3＝156.3）**として起こす（B1=2x ビットマップは任意 scale に
+弱く却下）。既存のフォント基盤（TASK-25 ファミリー: OutlineFont / AA カバレッジ / Font IF）に乗る。
 
 ### R6. ゲーム系は camera に scale を混ぜず「論理 viewport → 物理 target 変換」を別契約にする
 
@@ -203,7 +205,7 @@ cache 増分の範囲に収める（青天井の一時確保を作らない）�
 - **P2**: gui の変換規則 — `gui.render` に scale 注入 + **半開区間の丸め・clip・image・line thickness**
   （R4。既存 drawLine thickness バグの修正を含む）。
 - **P3**: フォント — 論理 measure / 物理 raster の分離 + アウトラインフォント物理 px ラスタライズ
-  （R5・TASK-167 拡張）。
+  （R5・新規 156.3。167 完了とは別）。
 - **P4**: アプリ切替 — pixie（canvas 継ぎ目）/ patch（viz 帯・R7）/ `gfx.camera`（論理 viewport→物理
   target 変換・R6）を `.physical` へ。
 - **P5**: swift / metal → Linux（x11/wayland）/ Windows（gdi/d3d11）横展開 + 性能回帰（R10）。
@@ -227,5 +229,5 @@ cache 増分の範囲に収める（青天井の一時確保を作らない）�
   （論理描画→nearest 拡大 + ラベルは拡大後にアウトライン後描画）。
 - ゲーム作者: `.logical` で従来どおり（レトロは自前バックバッファ nearest 拡大が引き続き自然）、
   `.physical` + `contentScale()` + 描画 transform で高解像度 crisp も選べる。
-- TASK-167 は R5 の前提として拡張定義（物理 px ラスタライズ API を含む）し、156 に取り込む。
+- TASK-167（縦センタリング）は Done。R5 のフォント物理 px 化は新規 156.3 として起こす（167 とは別）。
 - 既存バグ（`gui.render` が line thickness を渡していない）を P2 の前提として先に修正する。
