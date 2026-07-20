@@ -9,6 +9,10 @@ const builtin = @import("builtin");
 const gui = @import("gui");
 const font = @import("font");
 
+/// ノード用の小タイトルフォントの px サイズ（TASK-170）。通常 GUI の 16px より小さくし、
+/// パッチキャンバスのノードタイトルを読みやすい密度に保つ。
+const TITLE_FONT_PX: f32 = 11;
+
 /// GUI Context へ注入する system OutlineFont の所有束。
 /// App/ローカルの最終配置先に置き、`load` は pointer receiver でその場に詰めること。
 pub const GuiFont = struct {
@@ -16,9 +20,11 @@ pub const GuiFont = struct {
     bytes: ?[]u8 = null,
     face: ?font.FontFace = null,
     outline: ?font.OutlineFont = null,
+    /// ノードタイトル等、小さいサイズが要る用途向け（TASK-170）。同じ face を再利用し二重ロードしない。
+    outline_small: ?font.OutlineFont = null,
 
-    /// system text face を読み、self 上に bytes/face/outline を構築する。
-    /// 未検出・失敗時は outline=null のまま警告を出し、`asFont` が default_font へ落ちる（AC3）。
+    /// system text face を読み、self 上に bytes/face/outline(/outline_small) を構築する。
+    /// 未検出・失敗時は outline=null のまま警告を出し、`asFont`/`asTitleFont` が default_font へ落ちる（AC3）。
     pub fn load(self: *GuiFont, io: std.Io, gpa: std.mem.Allocator) void {
         self.gpa = gpa;
         // wasm には native システムフォントパスが無い（旧 loadSystemTextFontBytes の
@@ -32,6 +38,7 @@ pub const GuiFont = struct {
         self.face = loaded.face;
         // `&self.face.?` は最終配置済み self 内の安定アドレス（move 後に取らない）。
         self.outline = font.OutlineFont.init(gpa, &self.face.?, 16);
+        self.outline_small = font.OutlineFont.init(gpa, &self.face.?, TITLE_FONT_PX);
     }
 
     /// OutlineFont があればその借用 Font、無ければ `gui.default_font`。
@@ -40,13 +47,22 @@ pub const GuiFont = struct {
         return gui.default_font;
     }
 
+    /// ノードタイトル用の小さい OutlineFont があればその借用 Font、無ければ `gui.default_font`
+    /// （TASK-170。asFont と同じ fallback 契約）。
+    pub fn asTitleFont(self: *GuiFont) gui.Font {
+        if (self.outline_small) |*o| return o.asFont();
+        return gui.default_font;
+    }
+
     /// canvas 用に同じ bytes を参照（二重ロード回避）。所有は GuiFont。
     pub fn systemBytes(self: *const GuiFont) ?[]const u8 {
         return self.bytes;
     }
 
-    /// Context.deinit の後に呼ぶこと。順序: outline.deinit → free(bytes)。
+    /// Context.deinit の後に呼ぶこと。順序: outline(_small).deinit → free(bytes)。
     pub fn deinit(self: *GuiFont) void {
+        if (self.outline_small) |*o| o.deinit();
+        self.outline_small = null;
         if (self.outline) |*o| o.deinit();
         self.outline = null;
         self.face = null;

@@ -396,6 +396,9 @@ const App = struct {
     panel_host: *gui.PanelHost = undefined,
     panels: []gui.Panel = &.{},
     gui_ctx: *gui.Context = undefined,
+    /// ノードタイトル用の小フォント（TASK-170。kit.GuiFont が所有する OutlineFont の借用 view。
+    /// 未ロード時は gui.default_font にフォールバック）。
+    title_font: gui.Font = gui.default_font,
     /// PanelHost center rect（screen 絶対座標）。描画・hit・palette・camera の共通原点。
     canvas_rect: canvas.ScreenRect = .{ .x = 0, .y = 0, .w = WIN_W, .h = WIN_H - VIS_H },
     // TASK-125: H キー全 hide。slot visible の一時 override。解除時に pre_hide_* を復元し open は保持。
@@ -1201,13 +1204,15 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
                 }
             }
             const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * cam.zoom));
-            const text_h = gui.fontInkHeight(app.gui_ctx.font);
+            // TASK-170: ノードタイトルは小フォント（title_font）で描く。ink centering も同じ
+            // 小フォントのメトリクスに揃える（textEx 渡しの font と centering 計算の font を一致させる）。
+            const text_h = gui.fontInkHeight(app.title_font);
             const text_y = gui.centeredTextY(rect.y, title_band_h, text_h);
             // トグル分の title_x_pad がノード幅を圧迫しても、隣接ノードへ文字が溢れないよう
             // ノード自身の rect でクリップする（実機フィードバックで発覚した回帰の暫定対処。
             // 恒久対応はノード表示全体の見直しで検討）。
             dl.pushClip(rect) catch {};
-            dl.text(.{ .x = rect.x + title_x_pad, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL) catch {};
+            dl.textEx(.{ .x = rect.x + title_x_pad, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL, app.title_font) catch {};
             dl.popClip();
         }
         if (group.groupIdFromHandle(g.handle)) |gid| {
@@ -1243,8 +1248,10 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         drawExpandedGroupFrame(app, dl, nodes, @intCast(gi), gr);
     }
 
-    // D: tap 中ポートのミニ oscilloscope（ノード直下）。
+    // D: tap 中ポートのミニ oscilloscope（ノード内側下端の帯。TASK-170）。
     drawMiniScopes(app, dl, nodes);
+    // TASK-170: 主要パラメータ値のコンパクト表示（同じ帯の scope 右側）。tap 有無に関係なく毎フレーム。
+    drawNodeParamValues(app, dl, nodes);
 
     // pending cable（接続 drag 中: origin ポート → カーソル）
     if (app.drag == .cable) {
@@ -1403,12 +1410,12 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const Nod
     const hsel = itemIsHandle(app.selected, header.handle);
     dl.rectFilled(hrect, NODE_BG) catch {};
     dl.rectOutline(hrect, if (hsel) SEL_COL else BORDER_COL, if (hsel) 2 else 1) catch {};
-    // 展開グループヘッダも TITLE_H 帯で ink 中央（TASK-167）。
+    // 展開グループヘッダも TITLE_H 帯で ink 中央（TASK-167）。TASK-170: 通常ノードと同じ小フォント。
     {
         const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * app.camera.zoom));
-        const text_h = gui.fontInkHeight(app.gui_ctx.font);
+        const text_h = gui.fontInkHeight(app.title_font);
         const text_y = gui.centeredTextY(hrect.y, title_band_h, text_h);
-        dl.text(.{ .x = hrect.x + 6, .y = text_y }, gr.kind.displayName(), TITLE_COL) catch {};
+        dl.textEx(.{ .x = hrect.x + 6, .y = text_y }, gr.kind.displayName(), TITLE_COL, app.title_font) catch {};
     }
     drawToggle(app, dl, header, false);
 }
@@ -2457,6 +2464,7 @@ fn onMouseMove(app: *App) void {
 // TASK-40.8 A/D: ポート活性度の更新 + tap 対象の選択・publish。
 // ============================================================================
 const MINI_BG = gui.Color.rgba(0x0A, 0x0E, 0x12, 0xFF);
+const VALUE_COL = gui.Color.rgba(0x90, 0x98, 0xA0, 0xFF); // TASK-170: パラメータ値のコンパクト表示色
 // ミニスコープの表示サンプル数（間引き後）。トリガ探索の余地（残り窓）を残すため TAP_RING より小さくする。
 // 128 点(間引き後)≒10.6ms は 110Hz(周期 9ms)なら 1 周期以上を探索範囲に含みロックできる。
 const MINI_DISP: usize = 128;
@@ -2585,7 +2593,7 @@ fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
         const g = findNode(nodes, dh) orelse continue;
         const tl = app.worldToAbs(g.pos);
         const sz = canvas.nodeSize(g).scale(app.camera.zoom);
-        const lr = canvas.miniScopeRect(tl, sz);
+        const lr = canvas.miniScopeRect(tl, sz, app.camera.zoom);
         const rect = gui.Rect{ .x = safeI32(lr.x), .y = safeI32(lr.y), .w = safeU32(lr.w), .h = safeU32(lr.h) };
         const kind = portKindOut(app, dh, 0);
         const col = portColor(kind);
@@ -2601,6 +2609,73 @@ fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
             drawMiniTrace(dl, rect, kind, win[start .. start + disp], col);
         }
     }
+}
+
+/// 主要パラメータ値のコンパクト表示（値のみ・パラメータ名は付けない。TASK-170）。
+/// n_out>0 のノードに常時確保済みのミニスコープ帯（nodeSize 参照）の内部・scope rect の右側へ描く。
+/// 合成/畳みグループ handle（DynGraph の実 handle ではない）は対象外。tap の有無に関係なく毎フレーム
+/// 全ノードを対象にする（GUI フレーム毎処理。ノード数程度のオーダーで RT 経路には触れない）。
+/// 文字列は per-frame arena（`app.gui_ctx.allocator()`）で確保し、長い値はノード自身の rect でクリップ
+/// して隣接ノードへ溢れないようにする（TASK-160.2 follow-up と同じ手法）。
+fn drawNodeParamValues(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
+    for (nodes) |g| {
+        if (g.n_out == 0) continue;
+        if (group.groupIdFromHandle(g.handle) != null) continue; // 合成 handle は値表示なし
+        const kind = app.dyn.kindOf(g.handle) orelse continue;
+        const descs = switch (kind) {
+            inline else => |comptime_kind| modular.descriptors(comptime_kind),
+        };
+        const desc = param_view.primaryDescriptor(descs) orelse continue;
+        const value = modular.getParam(app.dyn, g.handle, desc.name) catch continue;
+        const text = formatParamValueCompact(app.gui_ctx.allocator(), desc, value) orelse continue;
+        if (text.len == 0) continue;
+
+        const tl = app.worldToAbs(g.pos);
+        const sz = canvas.nodeSize(g).scale(app.camera.zoom);
+        const scope_rect = canvas.miniScopeRect(tl, sz, app.camera.zoom);
+        const node_rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(sz.x), .h = safeU32(sz.y) };
+        const text_h = gui.fontInkHeight(app.title_font);
+        const text_y = gui.centeredTextY(safeI32(scope_rect.y), safeI32(scope_rect.h), text_h);
+        const value_x = safeI32(scope_rect.x + scope_rect.w) + 4;
+
+        dl.pushClip(node_rect) catch {};
+        dl.textEx(.{ .x = value_x, .y = text_y }, text, VALUE_COL, app.title_font) catch {};
+        dl.popClip();
+    }
+}
+
+/// ParamValue を値のみのコンパクト文字列へ整形する（パラメータ名は付けない）。
+/// scalar は ScalarDesc.step から桁数を決める（固定小数点1桁決め打ちにしない）。
+/// choice は ChoiceDesc.options[idx] をそのまま使う（範囲外・finite でない値は null=非表示）。
+fn formatParamValueCompact(alloc: std.mem.Allocator, desc: modular.ParamDesc, value: modular.ParamValue) ?[]const u8 {
+    return switch (value) {
+        .scalar => |v| blk: {
+            if (!std.math.isFinite(v)) break :blk null;
+            const unit = switch (desc.kind) {
+                .scalar => |sd| sd.unit,
+                .choice => "",
+            };
+            const decimals: u8 = switch (desc.kind) {
+                .scalar => |sd| decimalsForStep(sd.step),
+                .choice => 0,
+            };
+            break :blk (switch (decimals) {
+                0 => std.fmt.allocPrint(alloc, "{d:.0}{s}", .{ v, unit }),
+                1 => std.fmt.allocPrint(alloc, "{d:.1}{s}", .{ v, unit }),
+                else => std.fmt.allocPrint(alloc, "{d:.2}{s}", .{ v, unit }),
+            }) catch null;
+        },
+        .choice => |idx| switch (desc.kind) {
+            .choice => |cd| if (idx < cd.options.len) cd.options[idx] else null,
+            .scalar => null,
+        },
+    };
+}
+
+fn decimalsForStep(step: f32) u8 {
+    if (!std.math.isFinite(step) or step >= 1.0) return 0;
+    if (step >= 0.1) return 1;
+    return 2;
 }
 
 /// ミニスコープのトレース。audio は中央線基準(-1..1)の polyline、cv は下基準(0..1)の polyline、
@@ -2767,6 +2842,7 @@ pub fn main(init: std.process.Init) !void {
     defer gui_ctx.deinit();
     gui_font.load(init.io, allocator);
     gui_ctx.font = gui_font.asFont();
+    app.title_font = gui_font.asTitleFont();
 
     // TASK-149.1/149.3/160.3: PanelHost registry — History=left, Inspector=right（Transport 撤去）。
     var panels = [_]gui.Panel{
@@ -4015,9 +4091,8 @@ fn observedFieldForNode(app: *const App, h: Handle) ?param_view.FieldKey {
         inline else => |comptime_kind| modular.descriptors(comptime_kind),
     };
     // select_node の追従も action args 由来の slice を保持せず、descriptor static name を使う。
-    if (param_view.canonicalDescriptorName(descs, "cutoff")) |name| return param_view.fieldKey(h, name);
-    if (descs.len > 0) return param_view.fieldKey(h, descs[0].name);
-    return null;
+    const d = param_view.primaryDescriptor(descs) orelse return null;
+    return param_view.fieldKey(h, d.name);
 }
 
 /// palette / wire 共通の bass step_seq 初期値（solo `addByPaletteIndex` と同一。TASK-106.2 P1-1）。

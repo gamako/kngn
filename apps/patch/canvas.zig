@@ -150,11 +150,13 @@ fn rowCount(g: NodeGeom) f32 {
 
 /// ノードの world サイズ（幅固定・高さはポート数依存＝見切れ防止のため十分な高さ）。
 /// grid_rows>0（マクロ箱 / 選択中 standalone step_seq）は grid が収まる高さと比べて大きい方を採る。
+/// TASK-170: n_out>0 のノードは、ミニスコープ/パラメータ値の帯（MINI_H+MINI_GAP）を高さへ常時加算する
+/// （tap の有無で高さを変えない＝drag 中の cable 追従を不安定にしないため。tap されていない時は空帯）。
 pub fn nodeSize(g: NodeGeom) Vec2f {
     const port_h = TITLE_H + PORT_SPACING * rowCount(g) + BODY_PAD;
-    if (g.grid_rows == 0) return .{ .x = NODE_W, .y = port_h };
-    const grid_h = TITLE_H + gridBlockHeight(g.grid_rows) + BODY_PAD;
-    return .{ .x = NODE_W, .y = @max(port_h, grid_h) };
+    const base_h = if (g.grid_rows == 0) port_h else @max(port_h, TITLE_H + gridBlockHeight(g.grid_rows) + BODY_PAD);
+    const band: f32 = if (g.n_out > 0) MINI_H + MINI_GAP else 0;
+    return .{ .x = NODE_W, .y = base_h + band };
 }
 
 /// 入力ポート i の world 中心（左辺）。
@@ -401,18 +403,22 @@ fn distPointSegment(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
 // 表示は 1 ノード 1 窓（out0 を代表）。ノード矩形の直下に screen 固定サイズで置き、ノード位置に追従する。
 // modular / dyn 非依存（global port id 解決は main.zig 側の責務）。
 // ============================================================================
-pub const MINI_W: f32 = 64; // screen 固定幅
-pub const MINI_H: f32 = 28; // screen 固定高
-pub const MINI_GAP: f32 = 4; // ノード下端との間隔
+pub const MINI_W: f32 = 64; // world 単位（TASK-170: screen 固定 px から world 単位へ変更。ノードの
+// 他の幾何(NODE_W 等)と同じ scale 前提に揃え、nodeSize() へ帯として組み込めるようにする）
+pub const MINI_H: f32 = 28; // world 単位
+pub const MINI_GAP: f32 = 4; // world 単位（ノード下端 - スコープ帯上端の内側マージン）
 pub const MINI_ZOOM_MIN: f32 = 0.5; // これ未満の zoom では非表示（視認不能な窓のため RT tap を払わない）
 
-/// ノード（screen 左上・screen サイズ）の直下に置くミニスコープ矩形（screen 座標）。
-pub fn miniScopeRect(node_tl_screen: Vec2f, node_size_screen: Vec2f) ScreenRect {
+/// ノード内側・下端に置くミニスコープ矩形（screen 座標）。TASK-170: ノード枠外ではなく枠内（下端から
+/// band=MINI_H+MINI_GAP 分だけ上）に描くよう変更。`node_tl_screen`/`node_size_screen` は呼び出し側で
+/// zoom 適用済み（screen 座標）、`MINI_W`/`MINI_H`/`MINI_GAP` は world 単位定数のためここで `zoom` を
+/// 乗じる（二重 scale/未 scale を避けるためこの関数内でのみ乗算する契約）。
+pub fn miniScopeRect(node_tl_screen: Vec2f, node_size_screen: Vec2f, zoom: f32) ScreenRect {
     return .{
         .x = node_tl_screen.x,
-        .y = node_tl_screen.y + node_size_screen.y + MINI_GAP,
-        .w = MINI_W,
-        .h = MINI_H,
+        .y = node_tl_screen.y + node_size_screen.y - (MINI_H + MINI_GAP) * zoom,
+        .w = MINI_W * zoom,
+        .h = MINI_H * zoom,
     };
 }
 
@@ -431,16 +437,15 @@ pub fn findTriggerStart(samples: []const f32, disp: usize) usize {
     return newest;
 }
 
-/// tap 候補か: 出力ポートを持ち、out0 が viewport 内、かつミニスコープ矩形が viewport 内に完全収容される
-/// （下帯や画面端に隠れる窓には RT tap を張らない＝表示されないのに tap cost を払わない。vh はキャンバス有効高）。
+/// tap 候補か: 出力ポートを持ち、ノード矩形が viewport と交差する（TASK-170: ミニスコープはノード内側に
+/// 描くようになったため、完全内包ではなく「ノード自体が viewport と交差するか」のみを見る。下端付近で
+/// 一部だけ見えているノードも対象にする。vh はキャンバス有効高）。
 fn isTapCandidate(cam: Camera, vw: f32, vh: f32, g: NodeGeom) bool {
     if (g.n_out == 0) return false;
-    const p = cam.worldToScreen(outPortPos(g, 0));
-    if (!(p.x >= 0 and p.x <= vw and p.y >= 0 and p.y <= vh)) return false;
+    if (cam.zoom < MINI_ZOOM_MIN) return false;
     const tl = cam.worldToScreen(g.pos);
     const sz = nodeSize(g).scale(cam.zoom);
-    const r = miniScopeRect(tl, sz);
-    return r.x >= 0 and r.x + r.w <= vw and r.y >= 0 and r.y + r.h <= vh;
+    return tl.x < vw and tl.x + sz.x > 0 and tl.y < vh and tl.y + sz.y > 0;
 }
 
 fn containsHandle(list: []const Handle, h: Handle) bool {
@@ -640,8 +645,8 @@ test "canvas: nodeSize grows for grid box (grid_rows>0) and matches gridBlockHei
     const plain = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 };
     const box = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1, .grid_rows = 2 };
     try testing.expect(nodeSize(box).y > nodeSize(plain).y); // grid 行ぶん拡張
-    // 明示式と一致（port 高さより grid 高さが大きいケース）。
-    const expect_h = TITLE_H + gridBlockHeight(2) + BODY_PAD;
+    // 明示式と一致（port 高さより grid 高さが大きいケース）。TASK-170: n_out>0 の帯(MINI_H+MINI_GAP)込み。
+    const expect_h = TITLE_H + gridBlockHeight(2) + BODY_PAD + MINI_H + MINI_GAP;
     try testing.expectApproxEqAbs(expect_h, nodeSize(box).y, 1e-4);
 }
 
@@ -650,10 +655,10 @@ test "canvas: nodeSize contains 1-row inline grid (drum standalone)" {
     const geom = gridGeometry(.{ .zoom = 1.0 }, g.pos);
     const last_y = geom.origin_y + geom.cell_h; // row 0 下端
     try testing.expect(last_y <= g.pos.y + nodeSize(g).y);
-    // port 高さと grid 高さの max（1 行 grid は port 高より低いことが多い）
+    // port 高さと grid 高さの max（1 行 grid は port 高より低いことが多い）+ TASK-170 の n_out>0 帯。
     const port_h = TITLE_H + PORT_SPACING * 1.0 + BODY_PAD;
     const grid_h = TITLE_H + gridBlockHeight(1) + BODY_PAD;
-    try testing.expectApproxEqAbs(@max(port_h, grid_h), nodeSize(g).y, 1e-4);
+    try testing.expectApproxEqAbs(@max(port_h, grid_h) + MINI_H + MINI_GAP, nodeSize(g).y, 1e-4);
 }
 
 test "canvas: nodeSize contains 4-row inline grid (bass standalone)" {
@@ -662,10 +667,10 @@ test "canvas: nodeSize contains 4-row inline grid (bass standalone)" {
     // row 3 下端が node 下端以内
     const last_y = geom.origin_y + 3.0 * geom.row_pitch + geom.cell_h;
     try testing.expect(last_y <= g.pos.y + nodeSize(g).y);
-    // bass は n_out=3 の port 高と 4 行 grid 高の max
+    // bass は n_out=3 の port 高と 4 行 grid 高の max + TASK-170 の n_out>0 帯。
     const port_h = TITLE_H + PORT_SPACING * 3.0 + BODY_PAD;
     const grid_h = TITLE_H + gridBlockHeight(4) + BODY_PAD;
-    try testing.expectApproxEqAbs(@max(port_h, grid_h), nodeSize(g).y, 1e-4);
+    try testing.expectApproxEqAbs(@max(port_h, grid_h) + MINI_H + MINI_GAP, nodeSize(g).y, 1e-4);
 }
 
 test "canvas: gridGeometry is shared by macro box and standalone node positions" {
@@ -726,14 +731,34 @@ test "canvas: hitTestPalette inside/outside" {
     try testing.expectEqual(@as(?u8, null), hitTestPalette(.{ .x = 500, .y = 30 }, &buttons));
 }
 
-test "canvas: miniScopeRect sits directly below the node" {
+test "canvas: miniScopeRect sits inside the node's bottom edge (TASK-170)" {
     const tl = Vec2f{ .x = 100, .y = 50 };
-    const sz = Vec2f{ .x = 120, .y = 60 };
-    const r = miniScopeRect(tl, sz);
+    const zoom: f32 = 1.0;
+    // n_out>0 のノードは nodeSize() が既に帯込みなので、そのまま sz として渡す。
+    const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 };
+    const sz = nodeSize(g).scale(zoom);
+    const r = miniScopeRect(tl, sz, zoom);
     try testing.expectApproxEqAbs(tl.x, r.x, 1e-4);
-    try testing.expectApproxEqAbs(tl.y + sz.y + MINI_GAP, r.y, 1e-4);
-    try testing.expectApproxEqAbs(MINI_W, r.w, 1e-4);
-    try testing.expectApproxEqAbs(MINI_H, r.h, 1e-4);
+    try testing.expectApproxEqAbs(tl.y + sz.y - (MINI_H + MINI_GAP) * zoom, r.y, 1e-4);
+    try testing.expectApproxEqAbs(MINI_W * zoom, r.w, 1e-4);
+    try testing.expectApproxEqAbs(MINI_H * zoom, r.h, 1e-4);
+    // ノードの内側（下端からはみ出さない）に収まること。
+    try testing.expect(r.y >= tl.y);
+    try testing.expect(r.y + r.h <= tl.y + sz.y + 1e-4);
+    try testing.expect(r.x + r.w <= tl.x + sz.x + 1e-4);
+}
+
+test "canvas: miniScopeRect stays within node bounds across zoom range (0.25/0.5/4.0)" {
+    const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 };
+    const tl = Vec2f{ .x = 200, .y = 150 };
+    for ([_]f32{ 0.25, 0.5, 4.0 }) |zoom| {
+        const sz = nodeSize(g).scale(zoom);
+        const r = miniScopeRect(tl, sz, zoom);
+        try testing.expect(r.x >= tl.x - 1e-3);
+        try testing.expect(r.x + r.w <= tl.x + sz.x + 1e-3);
+        try testing.expect(r.y >= tl.y - 1e-3);
+        try testing.expect(r.y + r.h <= tl.y + sz.y + 1e-3);
+    }
 }
 
 test "canvas: selectTapPorts — priority selected>hover>order, cap, zoom gate, n_out filter" {

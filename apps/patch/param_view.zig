@@ -41,6 +41,17 @@ pub fn canonicalDescriptorName(descs: []const modular.ParamDesc, name: []const u
     return null;
 }
 
+/// kind 別の「主要パラメータ」descriptor を選ぶ（cutoff 優先・無ければ先頭）。TASK-170。
+/// main.zig の observedFieldForNode（Inspector 追従）と drawNodeParamValues（ノード内値表示）が共有する。
+pub fn primaryDescriptor(descs: []const modular.ParamDesc) ?modular.ParamDesc {
+    if (descs.len == 0) return null;
+    const name = canonicalDescriptorName(descs, "cutoff") orelse descs[0].name;
+    for (descs) |desc| {
+        if (std.mem.eql(u8, desc.name, name)) return desc;
+    }
+    return descs[0];
+}
+
 /// SPRM `cutoff_norm` ↔ Master VCF Hz の互換変換（load_pattern / offline の one-shot bridge 用）。
 pub const CutoffRange = struct {
     min: f32,
