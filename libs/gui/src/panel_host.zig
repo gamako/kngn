@@ -51,6 +51,8 @@ pub const SlotOptions = struct {
     extent: i32,
     min_extent: i32,
     max_extent: i32,
+    /// true なら slot 内を縦 ScrollArea で包み、自然高 overflow を scrollbar で扱う。
+    scrollable: bool = false,
 };
 
 pub const Options = struct {
@@ -110,11 +112,15 @@ pub const InitError = error{
     PanelInCenterSlot,
 };
 
+const Vec2f = @import("input.zig").Vec2f;
+
 const SlotState = struct {
     visible: bool,
     extent: i32,
     min_extent: i32,
     max_extent: i32,
+    scrollable: bool,
+    scroll: Vec2f = .{},
 };
 
 /// IdStack と同じ string hash（root seed → label）。allocator 不要。
@@ -152,6 +158,9 @@ pub const PanelHost = struct {
     id_slot_left: Id = idKind("slot/left"),
     id_slot_right: Id = idKind("slot/right"),
     id_slot_bottom: Id = idKind("slot/bottom"),
+    id_slot_scroll_left: Id = idKind("slot/scroll/left"),
+    id_slot_scroll_right: Id = idKind("slot/scroll/right"),
+    id_slot_scroll_bottom: Id = idKind("slot/scroll/bottom"),
     id_split_left: Id = idKind("splitter/left"),
     id_split_right: Id = idKind("splitter/right"),
     id_split_bottom: Id = idKind("splitter/bottom"),
@@ -312,8 +321,8 @@ pub const PanelHost = struct {
         for (self.panels) |p| {
             if (!p.visible) continue;
             if (!self.slotActiveConst(p.slot)) continue;
-            if (ctx.getNodeRect(panelWrapId(p.name))) |r| {
-                if (r.contains(point)) {
+            if (ctx.getNodeCachedRect(panelWrapId(p.name))) |cached| {
+                if (context_mod.pointHitsVisible(cached.rect, cached.clip, point)) {
                     return .{ .panel = .{ .slot = p.slot, .index = self.panelIndexInSlot(p.name, p.slot) } };
                 }
             }
@@ -381,6 +390,8 @@ pub const PanelHost = struct {
             .extent = std.math.clamp(o.extent, min_e, max_e),
             .min_extent = min_e,
             .max_extent = max_e,
+            .scrollable = o.scrollable,
+            .scroll = .{},
         };
     }
 
@@ -418,6 +429,15 @@ pub const PanelHost = struct {
             .right => self.id_slot_right,
             .bottom => self.id_slot_bottom,
             .center => self.id_center,
+        };
+    }
+
+    fn slotScrollId(self: *const PanelHost, slot: Slot) Id {
+        return switch (slot) {
+            .left => self.id_slot_scroll_left,
+            .right => self.id_slot_scroll_right,
+            .bottom => self.id_slot_scroll_bottom,
+            .center => unreachable,
         };
     }
 
@@ -562,7 +582,8 @@ pub const PanelHost = struct {
     }
 
     fn buildSlot(self: *PanelHost, ctx: *Context, slot: Slot) anyerror!void {
-        const st = self.slotStateConst(slot).?;
+        const st_ptr = self.slotStatePtr(slot).?;
+        const st = st_ptr.*;
         const width: layout.Sizing = if (slot == .bottom) .{ .grow = 1 } else .{ .fixed = st.extent };
         const height: layout.Sizing = if (slot == .bottom) .{ .fixed = st.extent } else .{ .grow = 1 };
 
@@ -571,12 +592,31 @@ pub const PanelHost = struct {
             .direction = .column,
             .width = width,
             .height = height,
-            .gap = 4,
+            .gap = if (st.scrollable) 0 else 4,
             .padding = .{ 4, 4, 4, 4 },
             .bg = Color.rgba(0x20, 0x24, 0x2C, 0xFF),
             .clip_children = true,
         });
         defer ctx.endBox();
+
+        if (st.scrollable) {
+            ctx.beginScrollArea(self.slotScrollId(slot), &st_ptr.scroll, .{
+                .width = .{ .grow = 1 },
+                .height = .{ .grow = 1 },
+                .direction = .column,
+                .gap = 4,
+                .content_width = .{ .grow = 1 },
+                .content_height = .fit,
+            });
+            defer ctx.endScrollArea();
+
+            for (self.panels) |*panel| {
+                if (panel.slot != slot) continue;
+                if (!panel.visible) continue;
+                try self.buildPanel(ctx, panel);
+            }
+            return;
+        }
 
         for (self.panels) |*panel| {
             if (panel.slot != slot) continue;
@@ -1067,6 +1107,158 @@ test "PanelHost: left/right 同条件なら比例圧縮で同量" {
     try frame(&host, &ctx, 400, 300);
     try frame(&host, &ctx, 400, 300);
     try std.testing.expectEqual(host.left.extent, host.right.extent);
+}
+
+fn wheelAt(ctx: *Context, x: i32, y: i32, dy: f32) void {
+    moveTo(ctx, x, y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = x, .y = y, .dx = 0, .dy = dy, .modifiers = 0 } });
+}
+
+fn tallBuild(ctx: *Context, user_data: *anyopaque) anyerror!void {
+    const h_ptr: *usize = @ptrCast(@alignCast(user_data));
+    const h: i32 = @intCast(h_ptr.*);
+    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = h } });
+    ctx.endBox();
+}
+
+fn bottomMarkerBuild(ctx: *Context, user_data: *anyopaque) anyerror!void {
+    _ = user_data;
+    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(0x168B07, "bottom", .{});
+    ctx.endBox();
+}
+
+test "PanelHost: scrollable slot — content overflow で scrollbar と offset clamp" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var tall_h: usize = 120;
+    var panels = [_]Panel{
+        .{ .name = "Top", .slot = .right, .build = tallBuild, .user_data = @ptrCast(&tall_h) },
+        .{ .name = "Bottom", .slot = .right, .build = tallBuild, .user_data = @ptrCast(&tall_h) },
+    };
+    var host = try PanelHost.init(panels[0..], .{
+        .right = .{ .extent = 180, .min_extent = 120, .max_extent = 400, .scrollable = true },
+    });
+
+    try frame(&host, &ctx, 400, 180);
+    try frame(&host, &ctx, 400, 180);
+    host.right.scroll.y = 9999;
+    try frame(&host, &ctx, 400, 180);
+
+    const scroll_id = host.id_slot_scroll_right;
+    const vthumb_id = id_mod.hashInt(scroll_id, 2);
+    try std.testing.expect(ctx.getNodeRect(vthumb_id) != null);
+    try std.testing.expect(host.right.scroll.y > 0);
+    const top = host.panelRect(&ctx, "Top").?;
+    const bottom = host.panelRect(&ctx, "Bottom").?;
+    try std.testing.expect(top.y < bottom.y);
+}
+
+test "PanelHost: scrollable slot — wheel で下側 panel が viewport 内へ入る" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var tall_h: usize = 100;
+    var panels = [_]Panel{
+        .{ .name = "Top", .slot = .right, .build = tallBuild, .user_data = @ptrCast(&tall_h) },
+        .{ .name = "Bottom", .slot = .right, .build = bottomMarkerBuild, .user_data = undefined },
+    };
+    var host = try PanelHost.init(panels[0..], .{
+        .right = .{ .extent = 180, .min_extent = 120, .max_extent = 400, .scrollable = true },
+    });
+    try frame(&host, &ctx, 400, 160);
+    try frame(&host, &ctx, 400, 160);
+
+    const slot = host.slotRect(&ctx, .right).?;
+    const scroll_id = host.id_slot_scroll_right;
+    const vp = ctx.getNodeRect(scroll_id).?;
+    const before = host.panelRect(&ctx, "Bottom").?;
+    try std.testing.expect(before.y + @as(i32, @intCast(before.h)) > slot.y + @as(i32, @intCast(slot.h)));
+
+    ctx.beginFrame(400, 160);
+    wheelAt(&ctx, vp.x + 10, vp.y + 10, -5);
+    try host.build(&ctx);
+    ctx.endFrame();
+    try frame(&host, &ctx, 400, 160);
+
+    const after = host.panelRect(&ctx, "Bottom").?;
+    try std.testing.expect(after.y < before.y);
+    try std.testing.expect(after.y + @as(i32, @intCast(after.h)) <= slot.y + @as(i32, @intCast(slot.h)) + 2);
+}
+
+test "PanelHost: non-scrollable slot は scrollable 回帰なし（scrollbar 無し）" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var tall_h: usize = 120;
+    var panels = [_]Panel{
+        .{ .name = "Top", .slot = .right, .build = tallBuild, .user_data = @ptrCast(&tall_h) },
+        .{ .name = "Bottom", .slot = .right, .build = tallBuild, .user_data = @ptrCast(&tall_h) },
+    };
+    var host = try PanelHost.init(panels[0..], .{
+        .right = .{ .extent = 180, .min_extent = 120, .max_extent = 400, .scrollable = false },
+    });
+    try frame(&host, &ctx, 400, 160);
+    try frame(&host, &ctx, 400, 160);
+
+    const scroll_id = host.id_slot_scroll_right;
+    const vthumb_id = id_mod.hashInt(scroll_id, 2);
+    try std.testing.expect(ctx.getNodeRect(vthumb_id) == null);
+    try std.testing.expectEqual(@as(f32, 0), host.right.scroll.y);
+}
+
+test "PanelHost: scrollable slot — clip 外 panel は hitTest されない" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var tall_h: usize = 140;
+    var panels = [_]Panel{
+        .{ .name = "Top", .slot = .right, .build = tallBuild, .user_data = @ptrCast(&tall_h) },
+        .{ .name = "Bottom", .slot = .right, .build = bottomMarkerBuild, .user_data = undefined },
+    };
+    var host = try PanelHost.init(panels[0..], .{
+        .right = .{ .extent = 180, .min_extent = 120, .max_extent = 400, .scrollable = true },
+    });
+    try frame(&host, &ctx, 400, 140);
+    try frame(&host, &ctx, 400, 140);
+
+    const bottom = host.panelRect(&ctx, "Bottom").?;
+    const bc = centerOf(bottom);
+    try std.testing.expect(host.hitTest(&ctx, .{ .x = bc.x, .y = bc.y }) != .panel);
+
+    const scroll_id = host.id_slot_scroll_right;
+    const vp = ctx.getNodeRect(scroll_id).?;
+    ctx.beginFrame(400, 140);
+    wheelAt(&ctx, vp.x + 10, vp.y + 10, -8);
+    try host.build(&ctx);
+    ctx.endFrame();
+    try frame(&host, &ctx, 400, 140);
+
+    const bottom_after = host.panelRect(&ctx, "Bottom").?;
+    const ac = centerOf(bottom_after);
+    const hit = host.hitTest(&ctx, .{ .x = ac.x, .y = ac.y });
+    try std.testing.expect(hit == .panel);
+    try std.testing.expect(hit.panel.slot == .right);
+    try std.testing.expectEqual(@as(usize, 1), hit.panel.index);
+}
+
+test "PanelHost: scrollable slot — panel build error 後も次フレームへ進める" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+    var panels = [_]Panel{
+        .{ .name = "Boom", .slot = .right, .build = erroringBuild, .user_data = &dummy },
+        .{ .name = "Tools", .slot = .left, .build = noopBuild, .user_data = &dummy },
+    };
+    var host = try PanelHost.init(panels[0..], .{
+        .right = .{ .extent = 200, .min_extent = 120, .max_extent = 400, .scrollable = true },
+    });
+
+    ctx.beginFrame(400, 300);
+    try std.testing.expectError(error.PanelBuildFailed, host.build(&ctx));
+    ctx.endFrame();
+
+    panels[0].build = noopBuild;
+    try frame(&host, &ctx, 400, 300);
+    try std.testing.expect(host.centerRect(&ctx) != null);
+    try std.testing.expect(host.panelRect(&ctx, "Boom") != null);
 }
 
 // ── in-memory persistence for tests ──────────────────────────

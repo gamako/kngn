@@ -587,6 +587,7 @@ const App = struct {
     panels_probe_fb_h: i32 = 0,
     panels_probe_bottom: i32 = 0,
     panels_probe_ok: bool = false,
+    panels_probe_slot: ?PanelProbeRect = null,
     panels_probe_color: ?PanelProbeRect = null,
     panels_probe_palette: ?PanelProbeRect = null,
     panels_probe_tool: ?PanelProbeRect = null,
@@ -2990,8 +2991,7 @@ const App = struct {
     /// レイヤー 1 枚なら 1 行分だけ確保し、余りを Tool Options に回す。
     ///
     /// Degradation: 全セクション open + 窓が狭いと残り高が 1 行未満になり得る。その場合は
-    /// Layers を 1 行まで縮め、それでも足りなければ従来どおり下端クリップを許容する
-    /// （完全救済は将来の PanelHost 側スクロール。pixie 単体では割り切る）。
+    /// Layers を 1 行まで縮め、不足分は PanelHost 右 slot 外側 ScrollArea で下端へ到達する。
     fn updateLayersViewportHeight(self: *App, ctx: *const gui.Context) void {
         const right = self.panel_host.slotRect(ctx, .right) orelse return;
         var others: i32 = 0;
@@ -3049,7 +3049,15 @@ const App = struct {
             if (maybe) |r| bottom = @max(bottom, r.y + r.h);
         }
         self.panels_probe_bottom = bottom;
-        self.panels_probe_ok = bottom > 0 and bottom <= self.panels_probe_fb_h;
+        self.panels_probe_slot = if (self.panel_host.slotRect(&self.ctx, .right)) |r|
+            .{ .y = r.y, .h = @intCast(r.h) }
+        else
+            null;
+        // ok = 右 slot 自体が framebuffer 内に収まっていること（panel 自然高の raw overflow は許容）。
+        self.panels_probe_ok = if (self.panels_probe_slot) |sr|
+            sr.y >= 0 and sr.y + sr.h <= self.panels_probe_fb_h
+        else
+            false;
     }
 
     /// Command 表から id を検索（separator は対象外）。dispatchCommand の最終防御用。
@@ -3584,8 +3592,8 @@ fn timelineDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 }
 
 /// panels digest（TASK-148.3）: 右スロット各セクションの前フレーム rect と fb_h。
-/// 形式: `fb_h=<n> bottom=<n> ok=<0|1> Color_y=<n> Color_h=<n> ...`（非表示はキー省略）
-/// `expect panels ok=1` でレイアウト崩壊を機械 assert する。
+/// 形式: `fb_h=<n> bottom=<n> ok=<0|1> RightSlot_y=<n> RightSlot_h=<n> Color_y=<n> ...`
+/// `expect panels ok=1` は右 slot 境界が framebuffer 内であること（自然 content の raw overflow は許容）。
 fn panelsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var len: usize = 0;
@@ -3594,6 +3602,9 @@ fn panelsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         app.panels_probe_bottom,
         @intFromBool(app.panels_probe_ok),
     }) catch return buf[0..0]).len;
+    if (app.panels_probe_slot) |r| {
+        len += (std.fmt.bufPrint(buf[len..], " RightSlot_y={d} RightSlot_h={d}", .{ r.y, r.h }) catch return buf[0..len]).len;
+    }
     if (app.panels_probe_color) |r| {
         len += (std.fmt.bufPrint(buf[len..], " Color_y={d} Color_h={d}", .{ r.y, r.h }) catch return buf[0..len]).len;
     }
@@ -6547,7 +6558,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
 
     self.panel_host = try gui.PanelHost.init(self.panels[0..], .{
         .left = .{ .extent = LEFT_PANE_DEFAULT, .min_extent = LEFT_PANE_MIN, .max_extent = 800 },
-        .right = .{ .extent = RIGHT_PANE_DEFAULT, .min_extent = RIGHT_PANE_MIN, .max_extent = 800 },
+        .right = .{ .extent = RIGHT_PANE_DEFAULT, .min_extent = RIGHT_PANE_MIN, .max_extent = 800, .scrollable = true },
         .bottom = .{ .extent = BOTTOM_PANE_DEFAULT, .min_extent = BOTTOM_PANE_MIN, .max_extent = 600 },
         .splitter_thickness = SPLITTER_T,
         .min_center_width = CANVAS_MIN,
@@ -6585,7 +6596,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "diff", .ctx = self, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" });
     // TASK-45.4: timeline 再生状態（digest のみ・snapshot=null）
     platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
-    platform.registerProbe(.{ .name = "panels", .ctx = self, .ext = "txt", .digest = panelsDigest, .desc = "right-slot panel rects: fb_h/bottom/ok + Color/Palette/Tool/Layers y,h" });
+    platform.registerProbe(.{ .name = "panels", .ctx = self, .ext = "txt", .digest = panelsDigest, .desc = "right-slot panel rects: fb_h/bottom/ok/RightSlot + Color/Palette/Tool/Layers y,h" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
     platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title/geometry state" });
