@@ -2976,9 +2976,12 @@ const App = struct {
     /// Layers body 外側幅（panel wrap の前フレーム rect.w − 余白）。
     /// Collapsible body は width=.fit のため .fixed 注入する（grow-in-fit collapse 回避。TASK-155 / TASK-149.1 踏襲）。
     /// 高さの panelRect 再注入はしない（内容高に縮む鶏卵。幅のみ読む）。
+    /// 余白は 24px（TASK-168 で PanelHost 右slotが scrollable 化し、外側 ScrollArea の viewport が
+    /// 1 段深くなった分の実クリップ余裕を含む。16px のままだと Layers 自身の内側スクロールバー
+    /// （幅 8px）が実クリップの外側にはみ出し、描画されなくなる実測バグがあった）。
     fn layersBodyAvail(self: *const App, ctx: *const gui.Context) i32 {
         if (self.panel_host.panelRect(ctx, PanelNames.layers)) |r| {
-            return @max(1, @as(i32, @intCast(r.w)) - 16);
+            return @max(1, @as(i32, @intCast(r.w)) - 24);
         }
         // 初回フレーム等: rect 未確定 → right slot extent ベース
         return @max(1, self.panel_host.slotExtent(.right) - 24);

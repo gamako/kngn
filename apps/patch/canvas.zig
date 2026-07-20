@@ -316,6 +316,16 @@ pub fn macroToggleAboveGrid(r: MacroToggleRect) bool {
     return r.y + r.h <= TITLE_H + GRID_TOP_PAD - 0.5;
 }
 
+/// evolve + lock(n レーン分) トグル帯がタイトル帯左端から占有する幅（box-local）。
+/// タイトルテキストの描画 x をこの分だけ右へ逃がし、トグルとの視覚的な重なりを防ぐ
+/// （TASK-160.2 実装直後の実機フィードバックで発覚: トグルとタイトル文字が同じ x 帯に
+/// 描画され判読不能だった。n=0 なら 0 を返しテキストは従来どおり）。
+pub fn macroToggleReservedWidth(n: u8) f32 {
+    if (n == 0) return 0;
+    const e = macroEvolveToggleRect();
+    return e.x + e.w + MACRO_MUT_TOGGLE_GAP + @as(f32, @floatFromInt(n)) * (MACRO_MUT_TOGGLE_W + MACRO_MUT_TOGGLE_GAP);
+}
+
 /// stepgrid へ渡す前の box-local / screen grid 幾何。gui を import しない canvas 側でも、描画と
 /// hit-test が同じ定数を使う adapter の入力を単一化する。
 pub const GridGeometry = struct {

@@ -1189,11 +1189,21 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         const border = if (selected) SEL_COL else if (hovered) HOVER_COL else BORDER_COL;
         dl.rectOutline(rect, border, if (selected) 2 else 1) catch {};
         // タイトル帯（TITLE_H * zoom）内で ink 高さ基準の縦中央（TASK-167）。
+        // マクロ箱の evolve/lock トグル（TASK-160.2）はタイトル帯左端に描くため、その分だけ
+        // テキスト開始 x を右へ逃がして重なりを防ぐ（実機フィードバックで発覚した見た目の不具合）。
         {
+            var title_x_pad: i32 = 6;
+            if (group.groupIdFromHandle(g.handle)) |title_gid| {
+                const seqs = collectStepSeqMembers(app, title_gid);
+                if (macroHasGeneratedSeqs(app, seqs.items[0..seqs.n])) {
+                    const reserved = canvas.macroToggleReservedWidth(@intCast(seqs.n));
+                    title_x_pad += @intFromFloat(@round(reserved * cam.zoom));
+                }
+            }
             const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * cam.zoom));
             const text_h = gui.fontInkHeight(app.gui_ctx.font);
             const text_y = gui.centeredTextY(rect.y, title_band_h, text_h);
-            dl.text(.{ .x = rect.x + 6, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL) catch {};
+            dl.text(.{ .x = rect.x + title_x_pad, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL) catch {};
         }
         if (group.groupIdFromHandle(g.handle)) |gid| {
             drawToggle(app, dl, g, true); // 畳み箱は常に collapsed 側
