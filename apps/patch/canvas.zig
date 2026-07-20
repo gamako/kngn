@@ -408,6 +408,9 @@ pub const MINI_W: f32 = 64; // world 単位（TASK-170: screen 固定 px から 
 pub const MINI_H: f32 = 28; // world 単位
 pub const MINI_GAP: f32 = 4; // world 単位（ノード下端 - スコープ帯上端の内側マージン）
 pub const MINI_ZOOM_MIN: f32 = 0.5; // これ未満の zoom では非表示（視認不能な窓のため RT tap を払わない）
+/// selectTapPortsStable の候補一時バッファ上限（TASK-170）。呼び出し側の TAP_SLOTS(16) を
+/// 十分に超える固定値。canvas.zig は modular/dyn 非依存のため TAP_SLOTS を直接 import しない。
+const MAX_TAP_CANDIDATES: usize = 32;
 
 /// ノード内側・下端に置くミニスコープ矩形（screen 座標）。TASK-170: ノード枠外ではなく枠内（下端から
 /// band=MINI_H+MINI_GAP 分だけ上）に描くよう変更。`node_tl_screen`/`node_size_screen` は呼び出し側で
@@ -493,6 +496,109 @@ pub fn selectTapPorts(
         }
     }
     return n;
+}
+
+fn keptElsewhere(slots: []const ?Handle, h: Handle) bool {
+    for (slots) |m| {
+        if (m) |x| {
+            if (x == h) return true;
+        }
+    }
+    return false;
+}
+
+/// TASK-170: 安定版 tap 対象選択。`prev`（前回の各 slot の display handle。空きは null）のうち
+/// 今フレームも `isTapCandidate` を満たすものは**同じ slot 番号のまま**維持し、無関係な hover/selected
+/// の変化で巻き添えリセットしない（TASK-170 の実機フィードバックで発覚した回帰の根治）。
+/// 空いた slot だけ selected > hover > nodes 走査順の優先度で新規候補を割り当てる。候補が余っていて
+/// 空き slot が無い場合は、温存 slot のうち selected でも hover でもないものを 1 つずつ解放して
+/// 割り当てる（未割当候補が尽きるか、置換可能な slot が尽きるまで繰り返す）。
+/// `prev`/`out` は同じ長さ（呼び出し側の TAP_SLOTS 相当）。`out` は `prev` と別バッファでも同一でも良い。
+pub fn selectTapPortsStable(
+    cam: Camera,
+    vw: f32,
+    vh: f32,
+    nodes: []const NodeGeom,
+    selected: ?Handle,
+    hover: ?Handle,
+    prev: []const ?Handle,
+    out: []?Handle,
+) void {
+    std.debug.assert(out.len == prev.len);
+    const cap = out.len;
+    if (cap == 0) return;
+    if (cam.zoom < MINI_ZOOM_MIN) {
+        for (out) |*o| o.* = null;
+        return;
+    }
+
+    // 1. 既存 slot の温存判定（slot 番号を維持する）。
+    for (prev, 0..) |maybe_h, idx| {
+        out[idx] = null;
+        if (maybe_h) |h| {
+            if (findNode(nodes, h)) |g| {
+                if (isTapCandidate(cam, vw, vh, g)) out[idx] = h;
+            }
+        }
+    }
+
+    // 2. 優先順位付き候補リスト（既に温存された handle は除く。cap で切る）。
+    // canvas.zig は modular/dyn 非依存のため MAX_MODULES を import せず、呼び出し側の
+    // TAP_SLOTS(16) を十分に超える固定上限を使う（cap を超えて書き込まないことは下の assert で保証）。
+    std.debug.assert(cap <= MAX_TAP_CANDIDATES);
+    var candidates: [MAX_TAP_CANDIDATES]Handle = undefined;
+    var ncand: usize = 0;
+    if (selected) |sh| {
+        if (findNode(nodes, sh)) |g| {
+            if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, sh) and ncand < cap) {
+                candidates[ncand] = sh;
+                ncand += 1;
+            }
+        }
+    }
+    if (hover) |hh| {
+        if (findNode(nodes, hh)) |g| {
+            if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, hh) and
+                !containsHandle(candidates[0..ncand], hh) and ncand < cap)
+            {
+                candidates[ncand] = hh;
+                ncand += 1;
+            }
+        }
+    }
+    for (nodes) |g| {
+        if (ncand >= cap) break;
+        if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, g.handle) and
+            !containsHandle(candidates[0..ncand], g.handle))
+        {
+            candidates[ncand] = g.handle;
+            ncand += 1;
+        }
+    }
+
+    // 3. 空き slot への充填。
+    var ci: usize = 0;
+    for (out) |*o| {
+        if (o.* != null) continue;
+        if (ci >= ncand) break;
+        o.* = candidates[ci];
+        ci += 1;
+    }
+
+    // 4. 満杯時の置換（未割当候補が尽きるか、置換可能な slot が尽きるまで繰り返す）。
+    while (ci < ncand) {
+        var victim: ?usize = null;
+        for (out, 0..) |o, idx| {
+            const h = o orelse continue;
+            if (selected != null and h == selected.?) continue;
+            if (hover != null and h == hover.?) continue;
+            victim = idx;
+            break;
+        }
+        const v = victim orelse break; // 置換対象なし（cap が selected+hover で埋まっている等）
+        out[v] = candidates[ci];
+        ci += 1;
+    }
 }
 
 // ============================================================================
@@ -823,6 +929,91 @@ test "canvas: selectTapPorts — offscreen node (out0 outside viewport) is not t
     const n = selectTapPorts(.{ .zoom = 1.0 }, 800, 400, &nodes, null, null, &out);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(Handle, 0), out[0]);
+}
+
+// ============================================================================
+// selectTapPortsStable（TASK-170）: hover/selected の切替で既存 slot が無関係に巻き添えリセット
+// されないことを固定する table test 群。
+// ============================================================================
+
+test "canvas: selectTapPortsStable —既存 slot は候補のままなら維持される（hover 切替の巻き添えなし）" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 },
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    // 前回: slot0=handle0（例えば以前 hover していたノード）。
+    var prev = [_]?Handle{ 0, null, null };
+    var out: [3]?Handle = undefined;
+    // 今回 hover が handle2 に変わっても、handle0 は今も候補（isTapCandidate を満たす）なので
+    // slot0 のまま維持され、handle2 は空き slot（slot1）へ新規追加される。
+    selectTapPortsStable(cam, 800, 400, &nodes, null, 2, &prev, &out);
+    try testing.expectEqual(@as(?Handle, 0), out[0]); // 維持
+    try testing.expectEqual(@as(?Handle, 2), out[1]); // 新規（hover）
+}
+
+test "canvas: selectTapPortsStable — selected と hover が同時に新規候補でも両方表示される" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 },
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    var prev = [_]?Handle{ null, null, null };
+    var out: [3]?Handle = undefined;
+    selectTapPortsStable(cam, 800, 400, &nodes, 1, 2, &prev, &out);
+    var has1 = false;
+    var has2 = false;
+    for (out) |m| {
+        if (m) |h| {
+            if (h == 1) has1 = true;
+            if (h == 2) has2 = true;
+        }
+    }
+    try testing.expect(has1);
+    try testing.expect(has2);
+}
+
+test "canvas: selectTapPortsStable — 容量1で旧 hover を新 selected が置換する" {
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    // 前回: slot0 = handle0（旧 hover が占有していた想定）。容量1のテスト用バッファ。
+    var prev = [_]?Handle{0};
+    var out: [1]?Handle = undefined;
+    // 今回 selected=handle1（新規）、hover=null（旧 hover は外れた）。
+    selectTapPortsStable(cam, 800, 400, &nodes, 1, null, &prev, &out);
+    try testing.expectEqual(@as(?Handle, 1), out[0]); // 旧 handle0 を置換して selected が入る
+}
+
+test "canvas: selectTapPortsStable と resolveTapPort 相当（handle 変化と port ID 変化の分離）" {
+    // selectTapPortsStable 自体は port ID を解決しない（呼び出し側=main.zig の責務）ため、
+    // ここでは「handle の安定化」と「実 port ID の変化検出」が別軸であることを、
+    // slot の handle 遷移パターンで固定する（handle が変わるケース／変わらないケースの両方を
+    // selectTapPortsStable のレベルで確認し、実 port ID 側の republish 判定は main.zig の
+    // updateViz が new_ports[]!=tap_ports[] で行う契約を plan として明記済み）。
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    // ケース A: handle が変わらない（同じノードが選択され続ける）→ slot0 は同じ handle を維持。
+    {
+        var prev = [_]?Handle{0};
+        var out: [1]?Handle = undefined;
+        selectTapPortsStable(cam, 800, 400, &nodes, 0, null, &prev, &out);
+        try testing.expectEqual(@as(?Handle, 0), out[0]);
+    }
+    // ケース B: handle が変わる（selected が別ノードへ移る）→ slot0 の handle は新しい方に変わる。
+    {
+        var prev = [_]?Handle{0};
+        var out: [1]?Handle = undefined;
+        selectTapPortsStable(cam, 800, 400, &nodes, 1, null, &prev, &out);
+        try testing.expectEqual(@as(?Handle, 1), out[0]);
+    }
 }
 
 test "canvas: viewportContains — fit layout has zero offscreen at representative zoom" {

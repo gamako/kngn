@@ -2525,39 +2525,46 @@ fn updateViz(app: *App) void {
         }
     }
 
-    // D: tap 対象選択（viewport 内・上限 TAP_SLOTS・優先度）→ port 割当が変わった時だけ publish。
+    // D: tap 対象選択（安定版。TASK-170）。既存 slot（tap_ports>=0 のもの）は今フレームも候補なら
+    // 同じ slot 番号のまま温存し、無関係な hover/selected の変化で巻き添えリセットしない。
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
-    var handles: [TAP_SLOTS]Handle = undefined;
     const sel = itemHandle(app.selected);
     const hov = itemHandle(app.hover);
-    const n = canvas.selectTapPorts(app.camera, app.canvasW(), app.canvasH(), nodes, sel, hov, &handles);
+
+    var prev: [TAP_SLOTS]?Handle = undefined;
+    for (0..TAP_SLOTS) |s| prev[s] = if (app.tap_ports[s] >= 0) app.tap_display[s] else null;
+    var handles: [TAP_SLOTS]?Handle = undefined;
+    canvas.selectTapPortsStable(app.camera, app.canvasW(), app.canvasH(), nodes, sel, hov, &prev, &handles);
 
     var new_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS;
     // ポート種別ごとに間引き率・reduce を決める（audio=細かい波形 / cv=粗い変調 / gate=粗い peak バー）。
     var new_decim: [TAP_SLOTS]u32 = [_]u32{modular.graph_core.TAP_DECIM} ** TAP_SLOTS;
     var new_peak: [TAP_SLOTS]bool = [_]bool{false} ** TAP_SLOTS;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        new_ports[i] = resolveTapPort(app, handles[i]);
-        if (new_ports[i] < 0) continue;
-        switch (portKindOut(app, handles[i], 0)) {
+    for (0..TAP_SLOTS) |s| {
+        const dh = handles[s] orelse continue;
+        new_ports[s] = resolveTapPort(app, dh);
+        if (new_ports[s] < 0) continue;
+        switch (portKindOut(app, dh, 0)) {
             .audio => {
-                new_decim[i] = modular.graph_core.TAP_DECIM;
-                new_peak[i] = false;
+                new_decim[s] = modular.graph_core.TAP_DECIM;
+                new_peak[s] = false;
             },
             .cv => {
-                new_decim[i] = modular.graph_core.TAP_DECIM_SLOW;
-                new_peak[i] = false;
+                new_decim[s] = modular.graph_core.TAP_DECIM_SLOW;
+                new_peak[s] = false;
             },
             .gate => {
-                new_decim[i] = modular.graph_core.TAP_DECIM_SLOW;
-                new_peak[i] = true;
+                new_decim[s] = modular.graph_core.TAP_DECIM_SLOW;
+                new_peak[s] = true;
             },
         }
     }
 
-    // 変化検出は port 割当のみで足りる（decim/peak は port の種別に従属＝port 不変なら不変）。
+    // 変化検出は slot 単位で「実 global port ID（new_ports）」が変わったかで判定する（TASK-170）。
+    // slot 温存の安定化キーは display handle だが、republish/tap_slot_seq 更新のトリガーは実 port ID
+    // の方に分離する（handle が変わっても実 port ID が同じなら republish しない。handle が同じでも
+    // 合成ノードの exposed port 変更等で実 port ID が変われば republish する）。
     var changed = false;
     var s: usize = 0;
     while (s < TAP_SLOTS) : (s += 1) {
@@ -2575,19 +2582,28 @@ fn updateViz(app: *App) void {
         app.tap_ports = new_ports;
         app.dyn.publishTapConfig(.{ .seq = app.tap_seq, .ports = new_ports, .decim = new_decim, .peak = new_peak });
     }
-    // 描画用 display handle と本数は毎フレーム更新（ノード drag に座標追従。publish とは独立）。
+    // 描画用 display handle は毎フレーム更新（ノード drag に座標追従。publish とは独立）。
+    // TASK-170: slot に穴を許容する（連続 0..tap_count 前提をやめる）。
+    var count: usize = 0;
     s = 0;
-    while (s < n) : (s += 1) app.tap_display[s] = handles[s];
-    app.tap_count = n;
+    while (s < TAP_SLOTS) : (s += 1) {
+        if (handles[s]) |dh| {
+            app.tap_display[s] = dh;
+            count += 1;
+        }
+    }
+    app.tap_count = count;
 }
 
-/// tap 中の各ポートのミニ oscilloscope をノード直下に描く（フレーム毎・≤16 個 × 64×28px）。
+/// tap 中の各ポートのミニ oscilloscope をノード内側下端の帯に描く（フレーム毎・≤16 個 × 64×28px）。
 /// applied_seq gate: RT が当該 slot の port 割当を反映済みでなければトレースを描かない（旧 port 混入防止）。
+/// TASK-170: slot 安定化で穴が生じうるため `slot < TAP_SLOTS` 全域を走査する（`tap_count` は
+/// 連続前提の bound には使わない。digest/snapshot 側の既存ループと同じ規約）。
 fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
     const applied = app.dyn.tapAppliedSeq();
     var win: [TAP_RING]f32 = undefined;
     var slot: usize = 0;
-    while (slot < app.tap_count) : (slot += 1) {
+    while (slot < TAP_SLOTS) : (slot += 1) {
         if (app.tap_ports[slot] < 0) continue;
         const dh = app.tap_display[slot];
         const g = findNode(nodes, dh) orelse continue;
