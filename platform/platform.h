@@ -672,11 +672,12 @@ char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts);
 void platform_free_path(char* path);
 
 // ========================================
-// OS テキストクリップボード (TASK-120)
+// OS テキストクリップボード (TASK-120 / TASK-161)
 // ========================================
 //
 // UTF-8 テキストのみ。画像・RTF・複合形式は対象外。
-// 実装は macOS Objective-C backend（NSPasteboard）。Swift/Metal は Zig facade 側 stub。
+// 実装は macOS の 3 backend（objc / swift / metal）が NSPasteboard を提供する。
+// （objc: platform_macos.m / swift+metal: platform_macos_shared.swift。backend 排他リンク。）
 
 // OS clipboard へ UTF-8 テキストを書き込む（len はバイト長。NUL 終端不要）。
 void platform_set_clipboard_text(const char* utf8, uint32_t len);

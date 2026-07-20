@@ -33,10 +33,14 @@ const MenuC = if (menu_c_abi) struct {
     extern fn platform_destroy_menu(window: ?*c.PlatformWindow) void;
 } else struct {};
 
-/// TASK-120: テキスト clipboard C symbol は Objective-C backend のみ。
-/// Swift/Metal は未実装 stub。unit test（`builtin.is_test`）では C symbol を参照しない
+/// TASK-120 / TASK-161: テキスト clipboard C symbol は macOS の 3 backend（objc/swift/metal）が実装する。
+/// unit test（`builtin.is_test`）では C symbol を参照しない
 /// （facade の in-memory fallback が担当。リンク時 undefined を防ぐ）。
-const clipboard_c_abi = !builtin.is_test and std.mem.eql(u8, build_options.platform_backend, "objc");
+/// Linux/Windows および macOS 未対応 backend では false。
+const clipboard_c_abi = !builtin.is_test and builtin.os.tag == .macos and
+    (std.mem.eql(u8, build_options.platform_backend, "objc") or
+        std.mem.eql(u8, build_options.platform_backend, "swift") or
+        std.mem.eql(u8, build_options.platform_backend, "metal"));
 
 const ClipboardC = if (clipboard_c_abi) struct {
     extern fn platform_set_clipboard_text(utf8: [*]const u8, len: u32) void;
@@ -831,7 +835,7 @@ fn dupePathAndFree(gpa: std.mem.Allocator, p: [*c]u8) std.mem.Allocator.Error![]
 // OS テキストクリップボード (TASK-120)
 // ============================================================================
 
-/// UTF-8 text を OS clipboard へ書く。objc 以外は no-op。
+/// UTF-8 text を OS clipboard へ書く。macOS 3 backend（objc/swift/metal）以外は no-op。
 pub fn setClipboardText(text: []const u8) void {
     if (comptime !clipboard_c_abi) return;
     ClipboardC.platform_set_clipboard_text(text.ptr, @intCast(text.len));
@@ -839,6 +843,7 @@ pub fn setClipboardText(text: []const u8) void {
 
 /// OS clipboard の UTF-8 text を caller buffer へコピーする。
 /// 未対応 backend・文字列無し・失敗は null。空文字列は `buf[0..0]`。
+/// macOS 3 backend は NSPasteboard を実装（TASK-161）。
 pub fn getClipboardText(buf: []u8) ?[]const u8 {
     if (comptime !clipboard_c_abi) return null;
     if (buf.len == 0) return null;

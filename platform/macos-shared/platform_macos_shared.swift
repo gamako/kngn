@@ -1621,3 +1621,65 @@ func platform_open_file_dialog(opts: UnsafePointer<PlatformOpenDialogOptions>?) 
 func platform_free_path(path: UnsafeMutablePointer<CChar>?) -> Void {
     if let path = path { free(path) }
 }
+
+// ========================================
+// OS テキストクリップボード (TASK-120 / TASK-161)
+// ========================================
+// objc (platform_macos.m) と bit 同一意味論:
+// UTF-8 境界切り詰め / clearContents→setString / 空文字 / null ガード。
+
+/// cap 超過時に UTF-8 コードポイント境界まで後退する（objc clipboardUtf8TruncateLen と同一）。
+private func clipboardUtf8TruncateLen(_ bytes: UnsafePointer<UInt8>, _ len: UInt32, _ cap: UInt32) -> UInt32 {
+    var n = min(len, cap)
+    while n > 0 && n < len && (bytes[Int(n)] & 0xC0) == 0x80 {
+        n -= 1
+    }
+    return n
+}
+
+/// OS clipboard へ UTF-8 テキストを書く。len はバイト長（NUL 終端不要）。
+/// utf8==nil && len>0 は即 return。不正 UTF-8 は clear 後に return（set しない）。
+@_cdecl("platform_set_clipboard_text")
+func platform_set_clipboard_text(_ utf8: UnsafePointer<CChar>?, _ len: UInt32) {
+    if utf8 == nil && len > 0 { return }
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    let str: String?
+    if len == 0 {
+        str = ""
+    } else if let utf8 = utf8 {
+        // String(decoding:as:) は置換文字になるので使わない（不正 UTF-8 は nil→return）
+        str = String(bytes: UnsafeRawBufferPointer(start: UnsafeRawPointer(utf8), count: Int(len)), encoding: .utf8)
+    } else {
+        return
+    }
+    guard let str = str else { return }
+    pb.setString(str, forType: .string)
+}
+
+/// OS clipboard から UTF-8 テキストを caller buffer へ読む。
+/// 成功時 true（空文字列含む）。文字列無し・失敗は false。cap 超過は UTF-8 境界で切り詰め。
+@_cdecl("platform_get_clipboard_text")
+func platform_get_clipboard_text(
+    _ out: UnsafeMutablePointer<CChar>?,
+    _ cap: UInt32,
+    _ outLen: UnsafeMutablePointer<UInt32>?
+) -> Bool {
+    outLen?.pointee = 0
+    guard let out = out, cap > 0 else { return false }
+    guard let str = NSPasteboard.general.string(forType: .string) else { return false }
+    guard let data = str.data(using: .utf8) else { return false }
+    return data.withUnsafeBytes { rawBuffer -> Bool in
+        guard let base = rawBuffer.baseAddress else {
+            outLen?.pointee = 0
+            return true // 空データ = 空文字成功
+        }
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        let len = UInt32(data.count)
+        let n = clipboardUtf8TruncateLen(bytes, len, cap)
+        // CChar↔UInt8 符号差は UnsafeMutableRawPointer 経由で回避
+        UnsafeMutableRawPointer(out).copyMemory(from: bytes, byteCount: Int(n))
+        outLen?.pointee = n
+        return true
+    }
+}
