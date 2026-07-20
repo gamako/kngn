@@ -906,7 +906,9 @@ test "params: invalid handles, names, value kinds, and ranges are explicit error
     const h = try graph.add(.vca, .{});
     const logic = try graph.add(.logic, .{});
 
-    try std.testing.expectError(Error.InvalidHandle, getParam(graph, 100, "gain"));
+    // -Dmax-modules で MAX_MODULES が変わっても常に範囲外であることを保証する（TASK-146: 固定値 100 は
+    // N>100 で有効 handle 範囲に入ってしまい error.InactiveHandle に化けていた）。
+    try std.testing.expectError(Error.InvalidHandle, getParam(graph, @intCast(dyn.MAX_MODULES), "gain"));
     try std.testing.expectError(Error.InactiveHandle, getParam(graph, 2, "gain"));
     try std.testing.expectError(Error.UnknownParam, getParam(graph, h, "missing"));
     try std.testing.expectError(Error.WrongValueKind, setParam(graph, h, "gain", .{ .choice = 0 }));
