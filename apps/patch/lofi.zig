@@ -195,23 +195,13 @@ pub const Controls = struct {
     density_target_enabled: std.atomic.Value(u32),
     swing: synth.AtomicF32,
     sidechain_amount: synth.AtomicF32,
-    kick_gain: synth.AtomicF32,
-    hat_gain: synth.AtomicF32,
-    clap_gain: synth.AtomicF32,
-    bass_gain: synth.AtomicF32,
-    kick_mute: std.atomic.Value(u32),
-    hat_mute: std.atomic.Value(u32),
-    clap_mute: std.atomic.Value(u32),
-    bass_mute: std.atomic.Value(u32),
     // Ph4: 音色マクロ
     kick_punch: synth.AtomicF32,
     hat_bright: synth.AtomicF32,
     hat_decay: synth.AtomicF32,
-    pad_gain: synth.AtomicF32,
     pad_cutoff: synth.AtomicF32,
     pad_warmth: synth.AtomicF32,
     master_warmth: synth.AtomicF32,
-    pad_mute: std.atomic.Value(u32),
     // Ph5: アンビエント連続生成の操作量（LFO rate + cutoff 深さに写像）
     ambient_move: synth.AtomicF32,
     // Ph5: grid/303 pattern（整合的に差し替えるため Mailbox(triple-buffer)。GUI=producer / RT=consumer）
@@ -241,22 +231,12 @@ pub const Controls = struct {
             .density_target_enabled = std.atomic.Value(u32).init(0),
             .swing = synth.AtomicF32.init(0.0),
             .sidechain_amount = synth.AtomicF32.init(DEFAULT_SIDECHAIN),
-            .kick_gain = synth.AtomicF32.init(1.0),
-            .hat_gain = synth.AtomicF32.init(1.0),
-            .clap_gain = synth.AtomicF32.init(1.0),
-            .bass_gain = synth.AtomicF32.init(1.0),
-            .kick_mute = std.atomic.Value(u32).init(0),
-            .hat_mute = std.atomic.Value(u32).init(0),
-            .clap_mute = std.atomic.Value(u32).init(0),
-            .bass_mute = std.atomic.Value(u32).init(0),
             .kick_punch = synth.AtomicF32.init(1.0),
             .hat_bright = synth.AtomicF32.init(HAT_BASE_BRIGHT),
             .hat_decay = synth.AtomicF32.init(HAT_BASE_DECAY),
-            .pad_gain = synth.AtomicF32.init(1.0),
             .pad_cutoff = synth.AtomicF32.init(PAD_CUTOFF_DEFAULT),
             .pad_warmth = synth.AtomicF32.init(PAD_WARMTH_DEFAULT),
             .master_warmth = synth.AtomicF32.init(MASTER_WARMTH_DEFAULT),
-            .pad_mute = std.atomic.Value(u32).init(0),
             .ambient_move = synth.AtomicF32.init(AMBIENT_MOVE_DEFAULT),
             .pattern_db = synth.Mailbox(PatternCommand).init(PatternCommand.default()),
             .song_db = synth.Mailbox(SongData).init(SongData.default()),
@@ -277,10 +257,11 @@ fn clampFinite(v: f32, lo: f32, hi: f32, fallback: f32) f32 {
     return std.math.clamp(v, lo, hi);
 }
 
-/// gain 倍率 × mute（mute なら 0）。非有限は 1.0 に丸める。
-fn trackGain(gain: *const synth.AtomicF32, mute: *const std.atomic.Value(u32)) f32 {
-    if (mute.load(.acquire) != 0) return 0.0;
-    return clampFinite(gain.load(), 0.0, 2.0, 1.0);
+/// Mixer per-input から旧 trackGain 相当の実効 gain（mute 時 0、それ以外 base×input_gain）。
+fn effectiveMixerTrackGain(mixer: ?*const modular.Mixer, slot: usize, base: f32) f32 {
+    const m = mixer orelse return 0;
+    if (m.input_mute[slot]) return 0.0;
+    return base * m.input_gain[slot];
 }
 
 inline fn bitOf(s: u8) u16 {
@@ -403,8 +384,7 @@ pub const LofiPatch = struct {
     mutation_count: u32,
     applied_rev: u32, // 適用済みの pattern revision
     anchor: PatternCommand, // 復帰先（= 直近にユーザーが publish した pattern。迷子防止）
-    lock: [4]bool, // kick,hat,clap,bass（トラック単位の凍結）
-    evolve: bool, // 自己進化の全体トグル
+    // evolve/lock の authoritative state は各 StepSeq（TASK-160.2）。
     // TASK-62.5.7: 適用済み base seed / pending gen（RT 所有。digest は base_seed を読む）
     base_seed: u64,
     applied_seed_gen: u64,
@@ -468,8 +448,6 @@ pub const LofiPatch = struct {
             .mutation_count = 0,
             .applied_rev = def.rev, // 既定(rev 0)は構築時に直接セット済み＝適用不要
             .anchor = def,
-            .lock = .{ false, false, false, false },
-            .evolve = true,
             .base_seed = base,
             .applied_seed_gen = 0,
             .pending_bar_cmd = null,
@@ -527,9 +505,9 @@ pub const LofiPatch = struct {
         const n_hat_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = HAT_ON });
         const n_clap_seq = try g.add(.step_seq, .{ .kind = .drum, .on_mask = CLAP_ON });
         const n_bass_seq = try g.add(.step_seq, .{ .kind = .bass, .on_mask = BASS_ON, .accent_mask = BASS_ACCENT, .slide_mask = BASS_SLIDE, .pitch_deg = BASS_DEG, .scale = BASS_SCALE, .octaves = BASS_OCTAVES });
-        const n_kick = try g.add(.kick, .{});
-        const n_hat = try g.add(.hat, .{});
-        const n_clap = try g.add(.clap, .{});
+        const n_kick = try g.add(.kick, .{ .gain = KICK_BASE_GAIN });
+        const n_hat = try g.add(.hat, .{ .gain = HAT_BASE_GAIN });
+        const n_clap = try g.add(.clap, .{ .gain = CLAP_BASE_GAIN });
         const n_pad_div = try g.add(.clock_divider, .{ .div = 16 });
         const n_pad_eu = try g.add(.euclid, .{ .steps = 2, .pulses = 1, .rotation = 0 });
         const n_pad = try g.add(.chord_pad, .{ .gain = PAD_BASE_GAIN, .cutoff = PAD_CUTOFF_DEFAULT, .warmth = PAD_WARMTH_DEFAULT });
@@ -547,7 +525,7 @@ pub const LofiPatch = struct {
             .max = 1.0,
             .noise = .{ .state = seedmod.deriveU32(base, .ambient_random) },
         });
-        const n_bass_perc = try g.add(.perc_env, .{ .decay = 0.18 });
+        const n_bass_perc = try g.add(.perc_env, .{ .decay = 0.18, .peak = 1.0 });
         const n_vco = try g.add(.vco, .{ .osc = .{ .waveform = .triangle }, .base_hz = 65.41 });
         const n_vcf = try g.add(.vcf, .{ .cutoff = 600, .resonance = 0.9, .mode = .lowpass, .mod_octaves = 1.0 });
         const n_vca = try g.add(.vca, .{ .gain = 0.7 });
@@ -642,6 +620,51 @@ pub const LofiPatch = struct {
         self.vinyl_h = n_vinyl;
         self.wow_h = n_wow;
         self.output_h = n_output;
+        self.applyMixerLabels();
+        // TASK-160.2: mutation metadata + evolve ON（PatternCommand 既定）+ density を mask から初期化。
+        self.initStepSeqMutationMeta();
+    }
+
+    /// StepSeq の mutation_kind / density_band / evolve / density を生成ロールへ初期化。
+    fn initStepSeqMutationMeta(self: *LofiPatch) void {
+        const def = PatternCommand.default();
+        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| {
+            configureStepSeqMutation(seq, .kick, KICK_BAND, def.evolve, def.kick.lock, seq.on_mask);
+        }
+        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| {
+            configureStepSeqMutation(seq, .hat, HAT_BAND, def.evolve, def.hat.lock, seq.on_mask);
+        }
+        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| {
+            configureStepSeqMutation(seq, .clap, CLAP_BAND, def.evolve, def.clap.lock, seq.on_mask);
+        }
+        if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
+            configureStepSeqMutation(seq, .bass, BASS_BAND, def.evolve, def.bass.lock, seq.on_mask);
+        }
+    }
+
+    fn configureStepSeqMutation(
+        seq: *modular.StepSeq,
+        kind: modular.StepSeq.MutationKind,
+        band: [2]u32,
+        evolve: bool,
+        lock: bool,
+        mask: u16,
+    ) void {
+        seq.mutation_kind = kind;
+        seq.density_band = band;
+        seq.evolve = evolve;
+        seq.lock = lock;
+        seq.density = modular.StepSeq.densityFromMask(mask, band);
+    }
+
+    /// Mixer 入力ラベル（表示専用。NPRM 非保存。wire / GENR remap 後に再設定）。
+    fn applyMixerLabels(self: *LofiPatch) void {
+        if (self.ptr(.mixer, self.nonkick_mixer_h)) |m| {
+            m.input_labels = .{ "hat", "clap", "bass", "pad" };
+        }
+        if (self.ptr(.mixer, self.master_mixer_h)) |m| {
+            m.input_labels = .{ "kick", "sidechain", "in2", "in3" };
+        }
     }
 
     /// 制御レート用の handle 解決。retire 済み handle は null として呼び出し側で no-op にする。
@@ -713,26 +736,16 @@ pub const LofiPatch = struct {
                 if (self.song_playing) self.song_force_apply = true;
             }
         }
-        // scalar controls
-        if (self.ptr(.clock, self.clock_h)) |clock| {
-            clock.bpm = clampFinite(c.tempo_bpm.load(), 40.0, 220.0, DEFAULT_BPM);
-            clock.swing = clampFinite(c.swing.load(), 0.0, 1.0, 0.0);
-        }
-        if (self.ptr(.sidechain, self.sidechain_h)) |sidechain| sidechain.amount = clampFinite(c.sidechain_amount.load(), 0.0, 1.0, DEFAULT_SIDECHAIN);
-        if (self.ptr(.vcf, self.master_vcf_h)) |master_vcf| master_vcf.cutoff = clampFinite(c.master_cutoff.load(), MASTER_CUTOFF_MIN, MASTER_CUTOFF_MAX, MASTER_CUTOFF_MAX);
+        // scalar controls — tone macros only（TASK-160.3）。
+        // tempo/bpm/swing/sidechain/cutoff は graph descriptor + param_db が正（Controls から上書きしない）。
         if (self.ptr(.kick, self.kick_h)) |kick| {
-            kick.gain = KICK_BASE_GAIN * trackGain(&c.kick_gain, &c.kick_mute);
             kick.click_gain = KICK_CLICK_BASE * clampFinite(c.kick_punch.load(), 0.0, 2.0, 1.0);
         }
         if (self.ptr(.hat, self.hat_h)) |hat| {
-            hat.gain = HAT_BASE_GAIN * trackGain(&c.hat_gain, &c.hat_mute);
             hat.brightness = clampFinite(c.hat_bright.load(), 0.3, 2.5, HAT_BASE_BRIGHT);
             hat.decay = clampFinite(c.hat_decay.load(), 0.01, 0.2, HAT_BASE_DECAY);
         }
-        if (self.ptr(.clap, self.clap_h)) |clap| clap.gain = CLAP_BASE_GAIN * trackGain(&c.clap_gain, &c.clap_mute);
-        if (self.ptr(.perc_env, self.bass_perc_h)) |bass_perc| bass_perc.peak = trackGain(&c.bass_gain, &c.bass_mute);
         if (self.ptr(.chord_pad, self.pad_h)) |pad| {
-            pad.gain = PAD_BASE_GAIN * trackGain(&c.pad_gain, &c.pad_mute);
             pad.cutoff = clampFinite(c.pad_cutoff.load(), PAD_CUTOFF_MIN, PAD_CUTOFF_MAX, PAD_CUTOFF_DEFAULT);
             pad.warmth = clampFinite(c.pad_warmth.load(), 0.0, 1.0, PAD_WARMTH_DEFAULT);
         }
@@ -751,20 +764,42 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// PatternCommand を StepSeq / lock / evolve / anchor へ反映（RT・alloc/lock なし・固定長コピー）。
+    /// PatternCommand を StepSeq mask / evolve / lock / anchor へ反映（RT・alloc/lock なし・固定長コピー）。
+    /// evolve/lock の authoritative は各 StepSeq（TASK-160.2）。set_evolve は全 4 つへ同一値を書く。
+    /// on_mask が変わった lane は density を mask から再同期し、bar 境界の密度収束が編集を即壊さないようにする。
     fn applyPatternCommand(self: *LofiPatch, cmd: PatternCommand) void {
         self.anchor = cmd;
-        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| seq.on_mask = cmd.kick.on;
-        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.on_mask = cmd.hat.on;
-        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| seq.on_mask = cmd.clap.on;
+        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| {
+            const prev = seq.on_mask;
+            seq.on_mask = cmd.kick.on;
+            if (prev != cmd.kick.on) seq.density = modular.StepSeq.densityFromMask(cmd.kick.on, seq.density_band);
+            seq.evolve = cmd.evolve;
+            seq.lock = cmd.kick.lock;
+        }
+        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| {
+            const prev = seq.on_mask;
+            seq.on_mask = cmd.hat.on;
+            if (prev != cmd.hat.on) seq.density = modular.StepSeq.densityFromMask(cmd.hat.on, seq.density_band);
+            seq.evolve = cmd.evolve;
+            seq.lock = cmd.hat.lock;
+        }
+        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| {
+            const prev = seq.on_mask;
+            seq.on_mask = cmd.clap.on;
+            if (prev != cmd.clap.on) seq.density = modular.StepSeq.densityFromMask(cmd.clap.on, seq.density_band);
+            seq.evolve = cmd.evolve;
+            seq.lock = cmd.clap.lock;
+        }
         if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
+            const prev = seq.on_mask;
             seq.on_mask = cmd.bass.on;
+            if (prev != cmd.bass.on) seq.density = modular.StepSeq.densityFromMask(cmd.bass.on, seq.density_band);
             seq.accent_mask = cmd.bass.accent;
             seq.slide_mask = cmd.bass.slide;
             seq.pitch_deg = cmd.bass.deg;
+            seq.evolve = cmd.evolve;
+            seq.lock = cmd.bass.lock;
         }
-        self.lock = .{ cmd.kick.lock, cmd.hat.lock, cmd.clap.lock, cmd.bass.lock };
-        self.evolve = cmd.evolve;
     }
 
     /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら、
@@ -805,73 +840,23 @@ pub const LofiPatch = struct {
             applied_pending = true;
         }
 
-        // seed / song 切替 / pending を適用した bar は evolve 変異しない。
+        // seed / song 切替 / pending を適用した bar は evolve 変異も density 収束もしない。
         // TASK-106.1: mutate / density は host authority のときだけ（client は pattern_state で収束）。
         const host_auth = self.controls.evolve_host_authority.load(.acquire) != 0;
-        if (host_auth and !(applied_seed or applied_song or applied_pending)) self.mutatePattern();
-        // density は pattern の実効 mask を別管理しない。pattern 適用/変異の後、
-        // bar ごとに eligible lane の 1 bit だけを target 方向へ寄せる。
-        if (host_auth) self.applyDensityTarget(bar);
+        if (host_auth and !(applied_seed or applied_song or applied_pending)) {
+            self.mutatePattern();
+            // density は各 StepSeq.density へ bar ごとに 1 bit 収束（Controls.density_target 非依存。TASK-160.2）。
+            self.applyDensityTargets(bar);
+        }
     }
 
-    /// density_target への収束。kick は four-on-floor anchor のため対象外、lock lane も対象外。
-    /// 各 lane は bar ごとに最大 1 bit、選択位置は base seed + bar + lane から決定する。
+    /// 各 StepSeq の density/band へ独立収束。kick 含む 4 レーン。lock lane は StepSeq 側で skip。
     /// ホットパス: bar 境界のみ・固定長 16-bit mask 操作（alloc/lock/IO/panic/超越関数なし）。
-    fn applyDensityTarget(self: *LofiPatch, bar: u64) void {
-        if (self.controls.density_target_enabled.load(.acquire) == 0) return;
-        const target = clampFinite(self.controls.density_target.load(), 0.0, 1.0, DEFAULT_DENSITY_TARGET);
-        const target_count: i32 = @intFromFloat(@round(target * 64.0));
-        var total: i32 = 0;
-        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
-        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
-        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
-        if (self.ptr(.step_seq, self.bass_seq_h)) |seq| total += @intCast(@popCount(seq.on_mask));
-        if (total == target_count) return;
-
-        // Track order は固定。対象 lane ごとに一回だけ試行し、band の端では no-op とする。
-        const lanes = [_]struct { lane: usize, band: [2]u32 }{
-            .{ .lane = 1, .band = HAT_BAND },
-            .{ .lane = 2, .band = CLAP_BAND },
-            .{ .lane = 3, .band = BASS_BAND },
-        };
-        for (lanes) |entry| {
-            if (total == target_count or self.lock[entry.lane]) continue;
-            const seed = seedmod.splitmix64(self.base_seed ^ 0xD3A5_17E0 ^ (bar *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(entry.lane)));
-            const changed = switch (entry.lane) {
-                1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| densityMove(&seq.on_mask, total < target_count, entry.band, seed) else false,
-                2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| densityMove(&seq.on_mask, total < target_count, entry.band, seed) else false,
-                3 => if (self.ptr(.step_seq, self.bass_seq_h)) |seq| densityMove(&seq.on_mask, total < target_count, entry.band, seed) else false,
-                else => false,
-            };
-            if (changed) total += if (total < target_count) 1 else -1;
-        }
-    }
-
-    /// §4.7 の band 復帰と同じ固定長 mask 操作を density target 向けに使う。
-    /// want_on=true は off bit を、false は on bit を決定的に 1 つだけ変更する。
-    fn densityMove(mask: *u16, want_on: bool, band: [2]u32, seed: u64) bool {
-        const count: u32 = @popCount(mask.*);
-        if (want_on) {
-            if (count >= band[1]) return false;
-            const bit = selectBit(mask.*, false, seed);
-            mask.* |= bit;
-            return true;
-        }
-        if (count <= band[0]) return false;
-        const bit = selectBit(mask.*, true, seed);
-        mask.* &= ~bit;
-        return true;
-    }
-
-    fn selectBit(mask: u16, want_on: bool, seed: u64) u16 {
-        const start: u8 = @truncate(seed & 15);
-        var offset: u8 = 0;
-        while (offset < 16) : (offset += 1) {
-            const step: u8 = (start +% offset) & 15;
-            const bit = bitOf(step);
-            if ((mask & bit != 0) == want_on) return bit;
-        }
-        return 0;
+    fn applyDensityTargets(self: *LofiPatch, bar: u64) void {
+        if (self.ptr(.step_seq, self.kick_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
+        if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
+        if (self.ptr(.step_seq, self.clap_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
+        if (self.ptr(.step_seq, self.bass_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
     }
 
     /// 現在の song position の phrase を解決し、変化した track だけ PatternCommand を組み立てて適用。
@@ -912,13 +897,14 @@ pub const LofiPatch = struct {
         var applied = false;
         if (any_change) {
             // 現行 pattern を base に、変化 track だけ pool から上書き（空 chain = 現行維持）
+            const locks = self.readStepSeqLocks();
             var cmd: PatternCommand = .{
                 .rev = self.applied_rev,
-                .evolve = self.evolve,
-                .kick = .{ .lock = self.lock[0] },
-                .hat = .{ .lock = self.lock[1] },
-                .clap = .{ .lock = self.lock[2] },
-                .bass = .{ .lock = self.lock[3] },
+                .evolve = self.readStepSeqEvolve(),
+                .kick = .{ .lock = locks[0] },
+                .hat = .{ .lock = locks[1] },
+                .clap = .{ .lock = locks[2] },
+                .bass = .{ .lock = locks[3] },
             };
             if (self.ptr(.step_seq, self.kick_seq_h)) |seq| cmd.kick.on = seq.on_mask;
             if (self.ptr(.step_seq, self.hat_seq_h)) |seq| cmd.hat.on = seq.on_mask;
@@ -1060,8 +1046,8 @@ pub const LofiPatch = struct {
             .slide = def.bass.slide,
             .deg = def.bass.deg,
         });
-        self.lock = .{ def.kick.lock, def.hat.lock, def.clap.lock, def.bass.lock };
-        self.evolve = def.evolve;
+        // evolve/lock/density を default pattern 相当へ（mutation_kind/band は維持）。
+        self.initStepSeqMutationMeta();
         self.anchor = def;
         self.mutation_count = 0;
 
@@ -1106,81 +1092,25 @@ pub const LofiPatch = struct {
         return @min(v, 15);
     }
 
-    /// mask の中で set されている step を 1 つランダムに返す（無ければ s をそのまま返す）。
-    fn randomOnStep(self: *LofiPatch, mask: u16, fallback: u8) u8 {
-        const count: u32 = @popCount(mask);
-        if (count == 0) return fallback;
-        var k: u32 = @intFromFloat(self.rand01() * @as(f32, @floatFromInt(count)));
-        if (k >= count) k = count - 1;
-        var s: u8 = 0;
-        while (s < 16) : (s += 1) {
-            if (mask & bitOf(s) != 0) {
-                if (k == 0) return s;
-                k -= 1;
-            }
-        }
-        return fallback;
-    }
-
-    /// drum lane: 1 cell トグル。密度バンドを外れる方向はスキップ、max 超過時は move（別 cell を off）。
-    fn mutateDrumLane(self: *LofiPatch, seq: *modular.StepSeq, band: [2]u32) void {
-        const s = self.randStep();
-        const b = bitOf(s);
-        const count: u32 = @popCount(seq.on_mask);
-        if (seq.on_mask & b != 0) {
-            if (count > band[0]) seq.on_mask &= ~b; // off（min 維持）
-        } else if (count < band[1]) {
-            seq.on_mask |= b; // on
-        } else {
-            const off = self.randomOnStep(seq.on_mask, s); // max → move（count 一定）
-            seq.on_mask &= ~bitOf(off);
-            seq.on_mask |= b;
-        }
-    }
-
-    /// bass lane: 1 パラメータ（on/off・pitch±1・accent・slide のどれか）を変異。
-    fn mutateBassLane(self: *LofiPatch, seq: *modular.StepSeq) void {
-        const s = self.randStep();
-        const b = bitOf(s);
-        const action = self.rand01();
-        if (action < 0.4) {
-            const count: u32 = @popCount(seq.on_mask);
-            if (seq.on_mask & b != 0) {
-                if (count > BASS_BAND[0]) seq.on_mask &= ~b;
-            } else if (count < BASS_BAND[1]) {
-                seq.on_mask |= b;
-            }
-        } else if (action < 0.7) {
-            const total: i32 = @intCast(modular.scaleDegreeCount(seq.scale, seq.octaves));
-            var d: i32 = seq.pitch_deg[s];
-            d += if (self.rand01() < 0.5) @as(i32, 1) else -1;
-            seq.pitch_deg[s] = @intCast(std.math.clamp(d, 0, total - 1));
-        } else if (action < 0.85) {
-            seq.accent_mask ^= b;
-        } else {
-            seq.slide_mask ^= b;
-        }
-    }
-
     /// 復帰: eligible な lane の 1 step を anchor へ戻す（迷子防止。§4.7）。
     /// on-mask は density バンドを守る（バンドを割る方向の復帰はスキップ）。accent/slide/deg は密度非依存。
     fn recoverOneStep(self: *LofiPatch, lane: usize) void {
         const s = self.randStep();
         const b = bitOf(s);
         switch (lane) {
-            0 => if (self.ptr(.step_seq, self.kick_seq_h)) |seq| recoverOn(&seq.on_mask, self.anchor.kick.on, b, KICK_BAND),
-            1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| recoverOn(&seq.on_mask, self.anchor.hat.on, b, HAT_BAND),
-            2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| recoverOn(&seq.on_mask, self.anchor.clap.on, b, CLAP_BAND),
+            0 => if (self.ptr(.step_seq, self.kick_seq_h)) |seq| seq.recoverOn(self.anchor.kick.on, b),
+            1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.recoverOn(self.anchor.hat.on, b),
+            2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| seq.recoverOn(self.anchor.clap.on, b),
             else => {
                 // bass も「1 小節 1 パラメータ」を守るため、戻す要素を 1 つだけ選ぶ。
                 const which = self.rand01();
                 if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
                     if (which < 0.5) {
-                        recoverOn(&seq.on_mask, self.anchor.bass.on, b, BASS_BAND);
+                        seq.recoverOn(self.anchor.bass.on, b);
                     } else if (which < 0.7) {
-                        copyBit(&seq.accent_mask, self.anchor.bass.accent, b);
+                        modular.StepSeq.copyBit(&seq.accent_mask, self.anchor.bass.accent, b);
                     } else if (which < 0.85) {
-                        copyBit(&seq.slide_mask, self.anchor.bass.slide, b);
+                        modular.StepSeq.copyBit(&seq.slide_mask, self.anchor.bass.slide, b);
                     } else {
                         seq.pitch_deg[s] = self.anchor.bass.deg[s];
                     }
@@ -1189,33 +1119,17 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// on-mask の 1 bit を anchor へ寄せる。ただし density バンドを割るならスキップ。
-    fn recoverOn(dst: *u16, src: u16, b: u16, band: [2]u32) void {
-        const want_on = src & b != 0;
-        const is_on = dst.* & b != 0;
-        if (want_on == is_on) return;
-        const count: u32 = @popCount(dst.*);
-        if (want_on) {
-            if (count < band[1]) dst.* |= b;
-        } else {
-            if (count > band[0]) dst.* &= ~b;
-        }
-    }
-
-    fn copyBit(dst: *u16, src: u16, b: u16) void {
-        if (src & b != 0) dst.* |= b else dst.* &= ~b;
-    }
-
-    /// 1 小節につき最大 1 パラメータ変異。evolve(全体) かつ !lock(トラック) の lane だけが対象。
+    /// 1 小節につき最大 1 パラメータ変異。evolve && !lock の lane だけが対象（per-StepSeq）。
     fn mutatePattern(self: *LofiPatch) void {
-        if (!self.evolve) return; // 自己進化 off（手動シーケンサ）
-        // eligible lane を集める（lock していないトラックだけ）
         var elig: [4]usize = undefined;
         var n: usize = 0;
-        for (0..4) |i| {
-            if (!self.lock[i]) {
-                elig[n] = i;
-                n += 1;
+        const handles = [_]modular.dyn.Handle{ self.kick_seq_h, self.hat_seq_h, self.clap_seq_h, self.bass_seq_h };
+        for (handles, 0..) |h, i| {
+            if (self.ptr(.step_seq, h)) |seq| {
+                if (seq.evolve and !seq.lock) {
+                    elig[n] = i;
+                    n += 1;
+                }
             }
         }
         if (n == 0) return;
@@ -1227,11 +1141,41 @@ pub const LofiPatch = struct {
             return;
         }
         switch (pick) {
-            0 => if (self.ptr(.step_seq, self.kick_seq_h)) |seq| self.mutateDrumLane(seq, KICK_BAND),
-            1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| self.mutateDrumLane(seq, HAT_BAND),
-            2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| self.mutateDrumLane(seq, CLAP_BAND),
-            else => if (self.ptr(.step_seq, self.bass_seq_h)) |seq| self.mutateBassLane(seq),
+            0 => if (self.ptr(.step_seq, self.kick_seq_h)) |seq| seq.mutateDrum(&self.mut_noise),
+            1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.mutateDrum(&self.mut_noise),
+            2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| seq.mutateDrum(&self.mut_noise),
+            else => if (self.ptr(.step_seq, self.bass_seq_h)) |seq| seq.mutateBass(&self.mut_noise),
         }
+    }
+
+    /// set_evolve は全 4 StepSeq へ同一値を書く前提。snapshot / song は kick を代表値にする。
+    fn readStepSeqEvolve(self: *const LofiPatch) bool {
+        if (self.ptrConst(.step_seq, self.kick_seq_h)) |seq| return seq.evolve;
+        return true;
+    }
+
+    fn readStepSeqLocks(self: *const LofiPatch) [4]bool {
+        return .{
+            if (self.ptrConst(.step_seq, self.kick_seq_h)) |s| s.lock else false,
+            if (self.ptrConst(.step_seq, self.hat_seq_h)) |s| s.lock else false,
+            if (self.ptrConst(.step_seq, self.clap_seq_h)) |s| s.lock else false,
+            if (self.ptrConst(.step_seq, self.bass_seq_h)) |s| s.lock else false,
+        };
+    }
+
+    /// 4 StepSeq.density の平均（probe 表示用）。
+    fn averageStepSeqDensity(self: *const LofiPatch) f32 {
+        var sum: f32 = 0;
+        var n: f32 = 0;
+        inline for (.{ self.kick_seq_h, self.hat_seq_h, self.clap_seq_h, self.bass_seq_h }) |h| {
+            if (self.ptrConst(.step_seq, h)) |seq| {
+                const d = if (std.math.isFinite(seq.density)) std.math.clamp(seq.density, 0.0, 1.0) else DEFAULT_DENSITY_TARGET;
+                sum += d;
+                n += 1;
+            }
+        }
+        if (n == 0) return DEFAULT_DENSITY_TARGET;
+        return sum / n;
     }
 
     /// 生成 role handle の固定順スナップショット（VPRJ GENR。イベント時のみ）。
@@ -1303,6 +1247,7 @@ pub const LofiPatch = struct {
         self.vinyl_h = g.get(.vinyl);
         self.wow_h = g.get(.wow);
         self.output_h = g.get(.output);
+        self.applyMixerLabels();
     }
 
     /// 旧形式（GENR 無し）ロード時: role を無効化し isActive ガードで安全に扱う。
@@ -1322,13 +1267,14 @@ pub const LofiPatch = struct {
         const clap = self.ptrConst(.clap, self.clap_h);
         const sidechain = self.ptrConst(.sidechain, self.sidechain_h);
         const master_vcf = self.ptrConst(.vcf, self.master_vcf_h);
-        const bass_perc = self.ptrConst(.perc_env, self.bass_perc_h);
         const pad = self.ptrConst(.chord_pad, self.pad_h);
         const saturator = self.ptrConst(.saturator, self.saturator_h);
         const output = self.ptrConst(.output, self.output_h);
         const ambient_lfo = self.ptrConst(.lfo, self.ambient_lfo_h);
         const ambient_turing = self.ptrConst(.turing, self.ambient_turing_h);
         const ambient_quant = self.ptrConst(.quantizer, self.ambient_quant_h);
+        const master_mix = self.ptrConst(.mixer, self.master_mixer_h);
+        const nonkick_mix = self.ptrConst(.mixer, self.nonkick_mixer_h);
         const spt = if (clock) |p| p.samples_per_tick else 0;
         const phase: f32 = if (spt > 0) @floatCast(clock.?.phase_samples / spt) else 0;
         const dens = (if (kick_seq) |p| onFrac(p.on_mask) else 0.0) +
@@ -1345,7 +1291,7 @@ pub const LofiPatch = struct {
             .clap_step = if (clap_seq) |p| p.loadStep() else 0,
             .bass_step = if (bass_seq) |p| p.loadStep() else 0,
             .density = dens / 4.0,
-            .density_target = clampFinite(self.controls.density_target.load(), 0.0, 1.0, DEFAULT_DENSITY_TARGET),
+            .density_target = self.averageStepSeqDensity(),
             .bass_pitch_cv = if (bass_seq) |p| p.cur_pitch else 0,
             .kick_active = if (kick) |p| p.active else false,
             .hat_active = if (hat) |p| p.active else false,
@@ -1353,21 +1299,21 @@ pub const LofiPatch = struct {
             .swing = if (clock) |p| p.swing else 0,
             .sidechain_amount = if (sidechain) |p| p.amount else DEFAULT_SIDECHAIN,
             .master_cutoff = if (master_vcf) |p| p.cutoff else MASTER_CUTOFF_MAX,
-            .kick_gain = if (kick) |p| p.gain else 0,
-            .hat_gain = if (hat) |p| p.gain else 0,
-            .clap_gain = if (clap) |p| p.gain else 0,
-            .bass_gain = if (bass_perc) |p| p.peak else 0,
-            .kick_muted = self.controls.kick_mute.load(.acquire) != 0,
-            .hat_muted = self.controls.hat_mute.load(.acquire) != 0,
-            .clap_muted = self.controls.clap_mute.load(.acquire) != 0,
-            .bass_muted = self.controls.bass_mute.load(.acquire) != 0,
+            .kick_gain = effectiveMixerTrackGain(master_mix, 0, KICK_BASE_GAIN),
+            .hat_gain = effectiveMixerTrackGain(nonkick_mix, 0, HAT_BASE_GAIN),
+            .clap_gain = effectiveMixerTrackGain(nonkick_mix, 1, CLAP_BASE_GAIN),
+            .bass_gain = effectiveMixerTrackGain(nonkick_mix, 2, 1.0),
+            .kick_muted = if (master_mix) |m| m.input_mute[0] else false,
+            .hat_muted = if (nonkick_mix) |m| m.input_mute[0] else false,
+            .clap_muted = if (nonkick_mix) |m| m.input_mute[1] else false,
+            .bass_muted = if (nonkick_mix) |m| m.input_mute[2] else false,
             .kick_click_gain = if (kick) |p| p.click_gain else 0,
             .hat_brightness = if (hat) |p| p.brightness else 0,
-            .pad_gain = if (pad) |p| p.gain else 0,
+            .pad_gain = effectiveMixerTrackGain(nonkick_mix, 3, PAD_BASE_GAIN),
             .pad_cutoff = if (pad) |p| p.cutoff else PAD_CUTOFF_DEFAULT,
             .pad_warmth = if (pad) |p| p.warmth else PAD_WARMTH_DEFAULT,
             .pad_active = if (pad) |p| p.attacking or p.env > 1e-3 else false,
-            .pad_muted = self.controls.pad_mute.load(.acquire) != 0,
+            .pad_muted = if (nonkick_mix) |m| m.input_mute[3] else false,
             .master_drive = if (saturator) |p| p.drive else 0,
             .pre_clip_peak = if (output) |p| p.pre_clip_peak else 0,
             .clip_rate = if (output) |p| p.clipRate() else 0,
@@ -1378,8 +1324,8 @@ pub const LofiPatch = struct {
             .bass_accent = if (bass_seq) |p| p.accent_mask else 0,
             .bass_slide = if (bass_seq) |p| p.slide_mask else 0,
             .bass_deg = if (bass_seq) |p| p.pitch_deg else [_]i8{0} ** 16,
-            .lock = self.lock,
-            .evolve = self.evolve,
+            .lock = self.readStepSeqLocks(),
+            .evolve = self.readStepSeqEvolve(),
             .pattern_rev = self.applied_rev,
             // TASK-106.1: client netsync 中は host から受信した remote mutation_count を digest に出す。
             .mutation_count = if (self.controls.evolve_host_authority.load(.acquire) != 0)
@@ -1556,24 +1502,10 @@ test "LofiPatch: offline renderToWav is deterministic (2x bit-identical) and non
     try testing.expect(nonzero);
 }
 
-/// actionRender と同じ状態複製: 非デフォルト scalar Controls + pattern（rev 強制 apply）。
+/// actionRender と同じ状態複製: 非デフォルト tone macros + graph ParamBatch + pattern（rev 強制 apply）。
 fn setupActionLikeEditState(patch: *LofiPatch) void {
-    // publishControls 相当（非デフォルト params）
+    // publishControls 相当（tone macros）。track gain/mute + tempo/cutoff 等は ParamBatch。
     const c = &patch.controls;
-    c.tempo_bpm.store(140.0);
-    c.master_cutoff.store(4000.0);
-    c.swing.store(0.15);
-    c.sidechain_amount.store(0.5);
-    c.kick_gain.store(0.8);
-    c.hat_gain.store(0.6);
-    c.clap_gain.store(0.7);
-    c.bass_gain.store(0.9);
-    c.pad_gain.store(0.5);
-    c.kick_mute.store(0, .release);
-    c.hat_mute.store(0, .release);
-    c.clap_mute.store(0, .release);
-    c.bass_mute.store(0, .release);
-    c.pad_mute.store(0, .release);
     c.kick_punch.store(1.2);
     c.hat_bright.store(1.1);
     c.hat_decay.store(0.06);
@@ -1581,6 +1513,19 @@ fn setupActionLikeEditState(patch: *LofiPatch) void {
     c.pad_warmth.store(0.4);
     c.master_warmth.store(0.3);
     c.ambient_move.store(0.55);
+
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.clock_h, .name = "bpm", .value = .{ .scalar = 140.0 }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.clock_h, .name = "swing", .value = .{ .scalar = 0.15 }, .touched = true };
+    batch.entries[2] = .{ .handle = patch.master_vcf_h, .name = "cutoff", .value = .{ .scalar = 4000.0 }, .touched = true };
+    batch.entries[3] = .{ .handle = patch.sidechain_h, .name = "amount", .value = .{ .scalar = 0.5 }, .touched = true };
+    batch.entries[4] = .{ .handle = patch.master_mixer_h, .name = "in0_gain", .value = .{ .scalar = 0.8 }, .touched = true };
+    batch.entries[5] = .{ .handle = patch.nonkick_mixer_h, .name = "in0_gain", .value = .{ .scalar = 0.6 }, .touched = true };
+    batch.entries[6] = .{ .handle = patch.nonkick_mixer_h, .name = "in1_gain", .value = .{ .scalar = 0.7 }, .touched = true };
+    batch.entries[7] = .{ .handle = patch.nonkick_mixer_h, .name = "in2_gain", .value = .{ .scalar = 0.9 }, .touched = true };
+    batch.entries[8] = .{ .handle = patch.nonkick_mixer_h, .name = "in3_gain", .value = .{ .scalar = 0.5 }, .touched = true };
+    patch.publishParamBatch(batch);
 
     // stateToCommand + cmd.rev = offline.applied_rev +% 1 相当
     var cmd = PatternCommand.default();
@@ -1663,43 +1608,58 @@ test "Controls: defaults match constructed patch values (no-op baseline)" {
     // 初期 pattern が seed 値で StepSeq に入っている
     try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expectEqual(BASS_ON, testSeq(patch, patch.bass_seq_h).on_mask);
-    try testing.expectEqual(@as(f32, DEFAULT_DENSITY_TARGET), patch.snapshotState().density_target);
+    // density_target = 4 StepSeq.density の平均（mask から初期化）
+    const expect_avg =
+        modular.StepSeq.densityFromMask(KICK_ON, KICK_BAND) +
+        modular.StepSeq.densityFromMask(HAT_ON, HAT_BAND) +
+        modular.StepSeq.densityFromMask(CLAP_ON, CLAP_BAND) +
+        modular.StepSeq.densityFromMask(BASS_ON, BASS_BAND);
+    try testing.expectApproxEqAbs(expect_avg / 4.0, patch.snapshotState().density_target, 1e-5);
 }
 
 test "TASK-110.5: density target converges pattern at bar boundaries" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    var frozen = PatternCommand.default();
-    frozen.rev = 1;
-    frozen.evolve = false;
-    patch.controls.pattern_db.publish(frozen);
+    // evolve ON（density 収束に必要）。mutate も走るが density=1 で帯上限へ寄せる。
+    var warm = PatternCommand.default();
+    warm.rev = 1;
+    warm.evolve = true;
+    patch.controls.pattern_db.publish(warm);
     var warmup: [64]f32 = undefined;
     patch.render(&warmup, 32, 2);
     const before = patch.snapshotState().density;
 
-    patch.controls.density_target.store(0.35);
-    patch.controls.density_target_enabled.store(1, .release);
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    inline for (.{ patch.kick_seq_h, patch.hat_seq_h, patch.clap_seq_h, patch.bass_seq_h }, 0..) |h, i| {
+        batch.entries[i] = .{ .handle = h, .name = "density", .value = .{ .scalar = 1.0 }, .touched = true };
+    }
+    patch.publishParamBatch(batch);
     const after = try renderLong(patch, 4800, 48000 * 8);
-    try testing.expectEqual(@as(f32, 0.35), after.density_target);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), after.density_target, 1e-5);
     try testing.expect(after.density > before);
 }
 
 test "TASK-110.5: gain and mute remain independent controls" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    patch.controls.kick_gain.store(0.5);
-    patch.controls.hat_gain.store(0.7);
-    patch.controls.hat_mute.store(1, .release);
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.master_mixer_h, .name = "in0_gain", .value = .{ .scalar = 0.5 }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.nonkick_mixer_h, .name = "in0_gain", .value = .{ .scalar = 0.7 }, .touched = true };
+    batch.entries[2] = .{ .handle = patch.nonkick_mixer_h, .name = "in0_mute", .value = .{ .choice = 1 }, .touched = true };
+    patch.publishParamBatch(batch);
     var buf: [512 * 2]f32 = undefined;
     patch.render(&buf, 512, 2);
     const st = patch.snapshotState();
     try testing.expectApproxEqAbs(@as(f32, KICK_BASE_GAIN * 0.5), st.kick_gain, 1e-6);
     try testing.expect(st.hat_muted);
-    try testing.expectEqual(@as(f32, 0.7), patch.controls.hat_gain.load());
+    const hat_gain = try modular.getParam(patch.graph, patch.nonkick_mixer_h, "in0_gain");
+    try testing.expectEqual(@as(f32, 0.7), hat_gain.scalar);
     try testing.expectEqual(@as(f32, 0.0), st.hat_gain);
 }
 
-test "Controls: swing/sidechain/cutoff change output (bounded & finite)" {
+test "param_db: swing/sidechain/cutoff change output (bounded & finite)" {
     const frames: u32 = 24000;
     const buf = try testing.allocator.alloc(f32, frames * 2);
     defer testing.allocator.free(buf);
@@ -1711,9 +1671,12 @@ test "Controls: swing/sidechain/cutoff change output (bounded & finite)" {
 
     const mod = try LofiPatch.create(testing.allocator, 48000);
     defer mod.destroy();
-    mod.controls.swing.store(0.5);
-    mod.controls.sidechain_amount.store(0.9);
-    mod.controls.master_cutoff.store(800.0);
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = mod.clock_h, .name = "swing", .value = .{ .scalar = 0.5 }, .touched = true };
+    batch.entries[1] = .{ .handle = mod.sidechain_h, .name = "amount", .value = .{ .scalar = 0.9 }, .touched = true };
+    batch.entries[2] = .{ .handle = mod.master_vcf_h, .name = "cutoff", .value = .{ .scalar = 800.0 }, .touched = true };
+    mod.publishParamBatch(batch);
     _ = try renderStats(mod, buf, frames);
     const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
 
@@ -1755,7 +1718,8 @@ test "TASK-110.4: cumulative param override wins after generated Controls" {
     try testing.expectEqual(@as(f32, 2000.0), cutoff.scalar);
     try testing.expectEqual(@as(f32, 0.75), resonance.scalar);
 
-    // transport が cutoff だけ purge した payload。別 field は残り、cutoff の stale override は復活しない。
+    // cutoff だけ purge。Controls.master_cutoff はもう graph を上書きしない（TASK-160.3）。
+    // モジュール field は直前の setParam 値（2000）のまま、resonance override は残る。
     batch.entries[0] = .{};
     batch.revision = 3;
     patch.controls.master_cutoff.store(600.0);
@@ -1763,7 +1727,7 @@ test "TASK-110.4: cumulative param override wins after generated Controls" {
     patch.render(&buf, 512, 2);
     const after_purge_cutoff = try modular.getParam(patch.graph, patch.master_vcf_h, "cutoff");
     const after_purge_resonance = try modular.getParam(patch.graph, patch.master_vcf_h, "resonance");
-    try testing.expectEqual(@as(f32, 600.0), after_purge_cutoff.scalar);
+    try testing.expectEqual(@as(f32, 2000.0), after_purge_cutoff.scalar);
     try testing.expectEqual(@as(f32, 0.75), after_purge_resonance.scalar);
 }
 
@@ -1779,30 +1743,32 @@ test "Controls: muting all tracks lowers output level" {
 
     const off = try LofiPatch.create(testing.allocator, 48000);
     defer off.destroy();
-    off.controls.kick_mute.store(1, .release);
-    off.controls.hat_mute.store(1, .release);
-    off.controls.clap_mute.store(1, .release);
-    off.controls.bass_mute.store(1, .release);
-    off.controls.pad_mute.store(1, .release);
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = off.master_mixer_h, .name = "in0_mute", .value = .{ .choice = 1 }, .touched = true };
+    batch.entries[1] = .{ .handle = off.nonkick_mixer_h, .name = "in0_mute", .value = .{ .choice = 1 }, .touched = true };
+    batch.entries[2] = .{ .handle = off.nonkick_mixer_h, .name = "in1_mute", .value = .{ .choice = 1 }, .touched = true };
+    batch.entries[3] = .{ .handle = off.nonkick_mixer_h, .name = "in2_mute", .value = .{ .choice = 1 }, .touched = true };
+    batch.entries[4] = .{ .handle = off.nonkick_mixer_h, .name = "in3_mute", .value = .{ .choice = 1 }, .touched = true };
+    off.publishParamBatch(batch);
     const s_off = try renderStats(off, buf, frames);
     try testing.expect(s_off.rms < s_on.rms);
 }
 
-test "Controls: non-finite values fall back to safe defaults (finite output)" {
+test "Controls: non-finite tone macros fall back; graph scalars ignore dead Controls" {
     const frames: u32 = 4800;
     const buf = try testing.allocator.alloc(f32, frames * 2);
     defer testing.allocator.free(buf);
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
+    // 旧 transport Controls は applyControls から外したので、non-finite でも graph 初期値を壊さない。
     patch.controls.tempo_bpm.store(std.math.nan(f32));
     patch.controls.master_cutoff.store(std.math.inf(f32));
     patch.controls.swing.store(std.math.inf(f32));
     patch.controls.sidechain_amount.store(std.math.nan(f32));
-    patch.controls.bass_gain.store(std.math.nan(f32));
     patch.controls.kick_punch.store(std.math.nan(f32));
     patch.controls.hat_bright.store(std.math.inf(f32));
     patch.controls.hat_decay.store(std.math.nan(f32));
-    patch.controls.pad_gain.store(std.math.inf(f32));
     patch.controls.pad_cutoff.store(std.math.nan(f32));
     patch.controls.pad_warmth.store(std.math.nan(f32));
     patch.controls.master_warmth.store(std.math.inf(f32));
@@ -1813,7 +1779,13 @@ test "Controls: non-finite values fall back to safe defaults (finite output)" {
     try testing.expectEqual(@as(f32, 0.0), testClock(patch).swing);
     try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), testSidechain(patch).amount);
     try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), testMasterVcf(patch).cutoff);
-    try testing.expectEqual(@as(f32, DEFAULT_DENSITY_TARGET), patch.snapshotState().density_target);
+    // Controls.density_target は mutation 非依存。snapshot は StepSeq.density 平均。
+    const expect_avg =
+        modular.StepSeq.densityFromMask(KICK_ON, KICK_BAND) +
+        modular.StepSeq.densityFromMask(HAT_ON, HAT_BAND) +
+        modular.StepSeq.densityFromMask(CLAP_ON, CLAP_BAND) +
+        modular.StepSeq.densityFromMask(BASS_ON, BASS_BAND);
+    try testing.expectApproxEqAbs(expect_avg / 4.0, patch.snapshotState().density_target, 1e-5);
     try testing.expectEqual(@as(f32, KICK_CLICK_BASE), testKick(patch).click_gain);
     try testing.expectEqual(@as(f32, HAT_BASE_BRIGHT), testHat(patch).brightness);
     try testing.expectEqual(@as(f32, HAT_BASE_DECAY), testHat(patch).decay);
@@ -1980,7 +1952,10 @@ test "Ph5: ambient layer contributes energy (pad on vs muted differs)" {
 
     const off = try LofiPatch.create(testing.allocator, 48000);
     defer off.destroy();
-    off.controls.pad_mute.store(1, .release);
+    var mute_batch = ParamBatch{};
+    mute_batch.revision = 1;
+    mute_batch.entries[0] = .{ .handle = off.nonkick_mixer_h, .name = "in3_mute", .value = .{ .choice = 1 }, .touched = true };
+    off.publishParamBatch(mute_batch);
     const s_off = try renderStats(off, buf, frames);
     const crc_off = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
 
@@ -2000,12 +1975,98 @@ test "Ph5: tone macros (kick punch / pad gain / master warmth / ambient move) ch
     const mod = try LofiPatch.create(testing.allocator, 48000);
     defer mod.destroy();
     mod.controls.kick_punch.store(0.0);
-    mod.controls.pad_gain.store(0.0);
+    var pad_batch = ParamBatch{};
+    pad_batch.revision = 1;
+    pad_batch.entries[0] = .{ .handle = mod.nonkick_mixer_h, .name = "in3_gain", .value = .{ .scalar = 0.0 }, .touched = true };
+    mod.publishParamBatch(pad_batch);
     mod.controls.master_warmth.store(1.0);
     mod.controls.ambient_move.store(1.0);
     _ = try renderStats(mod, buf, frames);
     const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
     try testing.expect(crc_base != crc_mod);
+}
+
+test "TASK-160.1: track gain/mute reflected via Mixer" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.master_mixer_h, .name = "in0_gain", .value = .{ .scalar = 0.5 }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.nonkick_mixer_h, .name = "in0_gain", .value = .{ .scalar = 0.6 }, .touched = true };
+    batch.entries[2] = .{ .handle = patch.nonkick_mixer_h, .name = "in1_gain", .value = .{ .scalar = 0.7 }, .touched = true };
+    batch.entries[3] = .{ .handle = patch.nonkick_mixer_h, .name = "in2_gain", .value = .{ .scalar = 0.8 }, .touched = true };
+    batch.entries[4] = .{ .handle = patch.nonkick_mixer_h, .name = "in3_gain", .value = .{ .scalar = 0.4 }, .touched = true };
+    batch.entries[5] = .{ .handle = patch.nonkick_mixer_h, .name = "in1_mute", .value = .{ .choice = 1 }, .touched = true };
+    patch.publishParamBatch(batch);
+    var buf: [256 * 2]f32 = undefined;
+    patch.render(&buf, 256, 2);
+    const st = patch.snapshotState();
+    try testing.expectApproxEqAbs(@as(f32, KICK_BASE_GAIN * 0.5), st.kick_gain, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, HAT_BASE_GAIN * 0.6), st.hat_gain, 1e-6);
+    try testing.expectEqual(@as(f32, 0.0), st.clap_gain);
+    try testing.expect(st.clap_muted);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), st.bass_gain, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, PAD_BASE_GAIN * 0.4), st.pad_gain, 1e-6);
+    try testing.expect(!st.kick_muted);
+    try testing.expect(!st.hat_muted);
+    try testing.expect(!st.bass_muted);
+    try testing.expect(!st.pad_muted);
+    // source module base gains remain fixed
+    try testing.expectEqual(@as(f32, KICK_BASE_GAIN), testKick(patch).gain);
+    try testing.expectEqual(@as(f32, CLAP_BASE_GAIN), patch.ptr(.clap, patch.clap_h).?.gain);
+    try testing.expectEqual(@as(f32, PAD_BASE_GAIN), testPad(patch).gain);
+}
+
+test "TASK-160.1: muting one track does not affect others" {
+    const frames: u32 = 24000;
+    const buf = try testing.allocator.alloc(f32, frames * 2);
+    defer testing.allocator.free(buf);
+
+    const base = try LofiPatch.create(testing.allocator, 48000);
+    defer base.destroy();
+    const s_base = try renderStats(base, buf, frames);
+
+    const muted = try LofiPatch.create(testing.allocator, 48000);
+    defer muted.destroy();
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = muted.master_mixer_h, .name = "in0_mute", .value = .{ .choice = 1 }, .touched = true };
+    muted.publishParamBatch(batch);
+    const s_muted = try renderStats(muted, buf, frames);
+    try testing.expect(s_muted.rms < s_base.rms);
+    const st = muted.snapshotState();
+    try testing.expect(st.kick_muted);
+    try testing.expect(!st.hat_muted);
+    try testing.expect(!st.clap_muted);
+    try testing.expect(!st.bass_muted);
+    try testing.expect(!st.pad_muted);
+    try testing.expectApproxEqAbs(@as(f32, HAT_BASE_GAIN), st.hat_gain, 1e-6);
+}
+
+test "TASK-160.1: Mixer per-input setParam roundtrip (NPRM path)" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    try modular.setParam(patch.graph, patch.master_mixer_h, "in0_gain", .{ .scalar = 0.33 });
+    try modular.setParam(patch.graph, patch.master_mixer_h, "in0_mute", .{ .choice = 1 });
+    try modular.setParam(patch.graph, patch.nonkick_mixer_h, "in3_gain", .{ .scalar = 1.25 });
+    try modular.setParam(patch.graph, patch.nonkick_mixer_h, "in2_mute", .{ .choice = 1 });
+
+    const g0 = try modular.getParam(patch.graph, patch.master_mixer_h, "in0_gain");
+    const m0 = try modular.getParam(patch.graph, patch.master_mixer_h, "in0_mute");
+    const g3 = try modular.getParam(patch.graph, patch.nonkick_mixer_h, "in3_gain");
+    const m2 = try modular.getParam(patch.graph, patch.nonkick_mixer_h, "in2_mute");
+    try testing.expectEqual(@as(f32, 0.33), g0.scalar);
+    try testing.expectEqual(@as(usize, 1), m0.choice);
+    try testing.expectEqual(@as(f32, 1.25), g3.scalar);
+    try testing.expectEqual(@as(usize, 1), m2.choice);
+
+    // labels are runtime metadata（wire で設定、NPRM 非保存）
+    const master = patch.ptrConst(.mixer, patch.master_mixer_h).?;
+    const nonkick = patch.ptrConst(.mixer, patch.nonkick_mixer_h).?;
+    try testing.expectEqualStrings("kick", master.input_labels[0]);
+    try testing.expectEqualStrings("sidechain", master.input_labels[1]);
+    try testing.expectEqualStrings("hat", nonkick.input_labels[0]);
+    try testing.expectEqualStrings("pad", nonkick.input_labels[3]);
 }
 
 test "Ph5: master headroom — softClip rarely intervenes over a long render" {
@@ -2170,8 +2231,8 @@ fn expectGenLayerEqual(a: *const LofiPatch, b: *const LofiPatch) !void {
     try testing.expectEqual(a.base_seed, b.base_seed);
     try testing.expectEqual(a.mutation_count, b.mutation_count);
     try testing.expectEqual(a.last_bar, b.last_bar);
-    try testing.expectEqual(a.evolve, b.evolve);
-    try testing.expectEqual(a.lock, b.lock);
+    try testing.expectEqual(a.readStepSeqEvolve(), b.readStepSeqEvolve());
+    try testing.expectEqual(a.readStepSeqLocks(), b.readStepSeqLocks());
 
     const a_clock = a.ptrConst(.clock, a.clock_h).?;
     const b_clock = b.ptrConst(.clock, b.clock_h).?;
@@ -2230,6 +2291,11 @@ fn expectStepSeqGenEqual(a: *const modular.StepSeq, b: *const modular.StepSeq) !
     try testing.expectEqual(a.target_pitch, b.target_pitch);
     try testing.expectEqual(a.gliding, b.gliding);
     try testing.expectEqual(a.accent_held, b.accent_held);
+    try testing.expectEqual(a.evolve, b.evolve);
+    try testing.expectEqual(a.lock, b.lock);
+    try testing.expectEqual(a.density, b.density);
+    try testing.expectEqual(a.mutation_kind, b.mutation_kind);
+    try testing.expectEqual(a.density_band, b.density_band);
 }
 
 test "seed: mid-run applyBaseSeed matches fresh create gen-layer state field-wise" {
@@ -2424,7 +2490,7 @@ test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
     try testing.expectEqual(@as(u16, 0xc444), testSeq(patch, patch.clap_seq_h).on_mask);
     try testing.expectEqual(@as(u16, 0x4949), testSeq(patch, patch.bass_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
-    try testing.expect(!patch.evolve);
+    try testing.expect(!patch.readStepSeqEvolve());
 }
 
 test "TASK-151: evolve=ON load bar keeps saved masks (pending skips mutate)" {
@@ -2467,7 +2533,7 @@ test "TASK-151: evolve=ON load bar keeps saved masks (pending skips mutate)" {
     }
 
     try testing.expectEqual(@as(u64, 42), patch.base_seed);
-    try testing.expect(patch.evolve);
+    try testing.expect(patch.readStepSeqEvolve());
     try testing.expectEqual(@as(u16, 0x1981), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expectEqual(@as(u16, 0x1050), testSeq(patch, patch.hat_seq_h).on_mask);
     try testing.expectEqual(@as(u16, 0xc444), testSeq(patch, patch.clap_seq_h).on_mask);
@@ -2856,7 +2922,7 @@ test "TASK-106.1: client evolve authority skips mutate (mutation_count stays 0)"
         patch.render(buf, 4800, 2);
     }
     try testing.expectEqual(@as(u32, 0), patch.mutation_count);
-    try testing.expect(patch.evolve);
+    try testing.expect(patch.readStepSeqEvolve());
 }
 
 test "TASK-106.1: host pattern_state snapshot applies immediately (quantize_bar=false)" {
@@ -2898,7 +2964,84 @@ test "TASK-106.1: host pattern_state snapshot applies immediately (quantize_bar=
     try testing.expectEqual(@as(u16, 0x4444), testSeq(patch, patch.bass_seq_h).accent_mask);
     try testing.expectEqual(@as(u16, 0x5555), testSeq(patch, patch.bass_seq_h).slide_mask);
     try testing.expectEqualSlices(i8, &snap.bass.deg, &testSeq(patch, patch.bass_seq_h).pitch_deg);
-    try testing.expect(patch.lock[0]);
+    try testing.expect(testSeq(patch, patch.kick_seq_h).lock);
     try testing.expectEqual(@as(u32, 7), patch.snapshotState().mutation_count);
     try testing.expect(patch.pending_bar_cmd == null);
+}
+
+// ----------------------------------------------------------------------------
+// TASK-160.2: per-StepSeq evolve/lock/density
+// ----------------------------------------------------------------------------
+
+test "TASK-160.2: four StepSeqs have independent density" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.kick_seq_h, .name = "density", .value = .{ .scalar = 0.1 }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.hat_seq_h, .name = "density", .value = .{ .scalar = 0.3 }, .touched = true };
+    batch.entries[2] = .{ .handle = patch.clap_seq_h, .name = "density", .value = .{ .scalar = 0.7 }, .touched = true };
+    batch.entries[3] = .{ .handle = patch.bass_seq_h, .name = "density", .value = .{ .scalar = 0.9 }, .touched = true };
+    patch.publishParamBatch(batch);
+    var buf: [128]f32 = undefined;
+    patch.render(&buf, 64, 2);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), testSeq(patch, patch.kick_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), testSeq(patch, patch.hat_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.7), testSeq(patch, patch.clap_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.9), testSeq(patch, patch.bass_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), patch.snapshotState().density_target, 1e-5);
+}
+
+test "TASK-160.2: changing one track density does not affect others" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    const hat_before = testSeq(patch, patch.hat_seq_h).density;
+    const clap_before = testSeq(patch, patch.clap_seq_h).density;
+    const bass_before = testSeq(patch, patch.bass_seq_h).density;
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.kick_seq_h, .name = "density", .value = .{ .scalar = 0.95 }, .touched = true };
+    patch.publishParamBatch(batch);
+    var buf: [128]f32 = undefined;
+    patch.render(&buf, 64, 2);
+    try testing.expectApproxEqAbs(@as(f32, 0.95), testSeq(patch, patch.kick_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(hat_before, testSeq(patch, patch.hat_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(clap_before, testSeq(patch, patch.clap_seq_h).density, 1e-6);
+    try testing.expectApproxEqAbs(bass_before, testSeq(patch, patch.bass_seq_h).density, 1e-6);
+}
+
+test "TASK-160.2: lock/evolve via setParam on StepSeq" {
+    const patch = try LofiPatch.create(testing.allocator, 48000);
+    defer patch.destroy();
+    var batch = ParamBatch{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.kick_seq_h, .name = "evolve", .value = .{ .choice = 0 }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.hat_seq_h, .name = "lock", .value = .{ .choice = 1 }, .touched = true };
+    patch.publishParamBatch(batch);
+    var buf: [128]f32 = undefined;
+    patch.render(&buf, 64, 2);
+    try testing.expect(!testSeq(patch, patch.kick_seq_h).evolve);
+    try testing.expect(testSeq(patch, patch.hat_seq_h).lock);
+    // NPRM-style roundtrip
+    try modular.setParam(patch.graph, patch.bass_seq_h, "density", .{ .scalar = 0.55 });
+    try testing.expectEqual(@as(f32, 0.55), (try modular.getParam(patch.graph, patch.bass_seq_h, "density")).scalar);
+    try modular.setParam(patch.graph, patch.bass_seq_h, "evolve", .{ .choice = 0 });
+    try modular.setParam(patch.graph, patch.bass_seq_h, "lock", .{ .choice = 1 });
+    try testing.expectEqual(@as(usize, 0), (try modular.getParam(patch.graph, patch.bass_seq_h, "evolve")).choice);
+    try testing.expectEqual(@as(usize, 1), (try modular.getParam(patch.graph, patch.bass_seq_h, "lock")).choice);
+}
+
+test "TASK-160.2: seed CRC / mutation sequence stays deterministic" {
+    const a = try LofiPatch.create(testing.allocator, 48000);
+    defer a.destroy();
+    const b = try LofiPatch.create(testing.allocator, 48000);
+    defer b.destroy();
+    const sa = try renderLong(a, 4800, 48000 * 6);
+    const sb = try renderLong(b, 4800, 48000 * 6);
+    try testing.expectEqual(sa.mutation_count, sb.mutation_count);
+    try testing.expectEqual(sa.kick_on, sb.kick_on);
+    try testing.expectEqual(sa.hat_on, sb.hat_on);
+    try testing.expectEqual(sa.clap_on, sb.clap_on);
+    try testing.expectEqual(sa.bass_on, sb.bass_on);
+    try testing.expect(sa.mutation_count > 0);
 }

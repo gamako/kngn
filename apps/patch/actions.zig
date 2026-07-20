@@ -364,6 +364,9 @@ test "parseParamOverride: #<NodeId> / #0 / Inf / 空 name" {
     try testing.expectError(error.InvalidNumber, parseParamOverride("#1 cutoff nan"));
     try testing.expectError(error.Empty, parseParamOverride("#1"));
     try testing.expectError(error.TooManyTokens, parseParamOverride("#1 cutoff 1 extra"));
+    // TASK-160.3: 旧 Transport alias 2 トークンは 3 トークン必須のため拒否
+    try testing.expectError(error.InvalidNumber, parseParamOverride("tempo 140"));
+    try testing.expectError(error.InvalidNumber, parseParamOverride("cutoff 0.5"));
 }
 
 test "parseParamOverride: 余白と浮動小数点" {

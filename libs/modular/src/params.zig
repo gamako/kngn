@@ -324,6 +324,89 @@ fn boolBinding(comptime T: type, comptime field_name: []const u8, comptime desc:
     return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
+/// `[N]f32` 配列フィールドの index 番目へスカラー binding。
+fn arrayScalarBinding(comptime T: type, comptime field_name: []const u8, comptime index: usize, comptime desc: ParamDesc) Binding {
+    comptime if (!@hasField(T, field_name)) @compileError("parameter field does not exist: " ++ field_name);
+    const Arr = @TypeOf(@field(T{}, field_name));
+    const arr_info = @typeInfo(Arr);
+    comptime {
+        if (arr_info != .array) @compileError("arrayScalarBinding requires an array field");
+        if (index >= arr_info.array.len) @compileError("arrayScalarBinding index out of range");
+    }
+    const F = arr_info.array.child;
+    comptime switch (desc.kind) {
+        .scalar => {},
+        .choice => @compileError("scalar binding requires a scalar descriptor"),
+    };
+
+    const limits = desc.kind.scalar;
+    const Impl = struct {
+        fn get(ctx: *const anyopaque) ParamValue {
+            const self: *const T = @ptrCast(@alignCast(ctx));
+            return .{ .scalar = numericRead(F, @field(self.*, field_name)[index]) };
+        }
+
+        fn validate(value: ParamValue) Error!void {
+            const raw = switch (value) {
+                .scalar => |v| v,
+                .choice => return Error.WrongValueKind,
+            };
+            if (!std.math.isFinite(raw) or raw < limits.min or raw > limits.max) return Error.OutOfRange;
+            _ = numericWrite(F, raw) orelse return Error.OutOfRange;
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(self.*, field_name)[index] = numericWrite(F, value.scalar).?;
+        }
+    };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
+}
+
+/// `[N]bool` 配列フィールドの index 番目へ off/on choice binding。
+fn arrayBoolBinding(comptime T: type, comptime field_name: []const u8, comptime index: usize, comptime desc: ParamDesc) Binding {
+    comptime if (!@hasField(T, field_name)) @compileError("parameter field does not exist: " ++ field_name);
+    const Arr = @TypeOf(@field(T{}, field_name));
+    const arr_info = @typeInfo(Arr);
+    comptime {
+        if (arr_info != .array) @compileError("arrayBoolBinding requires an array field");
+        if (index >= arr_info.array.len) @compileError("arrayBoolBinding index out of range");
+        if (arr_info.array.child != bool) @compileError("arrayBoolBinding requires a bool array");
+    }
+    comptime switch (desc.kind) {
+        .choice => {},
+        .scalar => @compileError("boolean binding requires a choice descriptor"),
+    };
+
+    const choice = desc.kind.choice;
+    comptime {
+        if (choice.options.len != 2 or !std.mem.eql(u8, choice.options[0], "off") or !std.mem.eql(u8, choice.options[1], "on"))
+            @compileError("boolean choices must be off/on");
+    }
+    const Impl = struct {
+        fn get(ctx: *const anyopaque) ParamValue {
+            const self: *const T = @ptrCast(@alignCast(ctx));
+            return .{ .choice = if (@field(self.*, field_name)[index]) 1 else 0 };
+        }
+
+        fn validate(value: ParamValue) Error!void {
+            const index_v = switch (value) {
+                .choice => |v| v,
+                .scalar => return Error.WrongValueKind,
+            };
+            if (index_v >= choice.options.len) return Error.ChoiceIndexOutOfRange;
+        }
+
+        fn set(ctx: *anyopaque, value: ParamValue) Error!void {
+            try validate(value);
+            const self: *T = @ptrCast(@alignCast(ctx));
+            @field(self.*, field_name)[index] = value.choice == 1;
+        }
+    };
+    return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
+}
+
 const osc_options = [_][]const u8{ "sine", "saw", "square", "triangle" };
 const lfo_options = [_][]const u8{ "sine", "triangle", "saw" };
 const filter_options = [_][]const u8{ "lowpass", "highpass", "bandpass", "notch" };
@@ -353,6 +436,14 @@ const vcf_bindings = [_]Binding{
 };
 const mixer_bindings = [_]Binding{
     scalarBinding(modules.Mixer, "gain", scalarDesc("gain", 0.0, 4.0, 1.0, 0.01, "")),
+    arrayScalarBinding(modules.Mixer, "input_gain", 0, scalarDesc("in0_gain", 0.0, 2.0, 1.0, 0.01, "")),
+    arrayScalarBinding(modules.Mixer, "input_gain", 1, scalarDesc("in1_gain", 0.0, 2.0, 1.0, 0.01, "")),
+    arrayScalarBinding(modules.Mixer, "input_gain", 2, scalarDesc("in2_gain", 0.0, 2.0, 1.0, 0.01, "")),
+    arrayScalarBinding(modules.Mixer, "input_gain", 3, scalarDesc("in3_gain", 0.0, 2.0, 1.0, 0.01, "")),
+    arrayBoolBinding(modules.Mixer, "input_mute", 0, choiceDesc("in0_mute", &bool_options, 0)),
+    arrayBoolBinding(modules.Mixer, "input_mute", 1, choiceDesc("in1_mute", &bool_options, 0)),
+    arrayBoolBinding(modules.Mixer, "input_mute", 2, choiceDesc("in2_mute", &bool_options, 0)),
+    arrayBoolBinding(modules.Mixer, "input_mute", 3, choiceDesc("in3_mute", &bool_options, 0)),
 };
 const output_bindings = [_]Binding{
     scalarBinding(modules.Output, "gain", scalarDesc("gain", 0.0, 4.0, 1.0, 0.01, "")),
@@ -383,6 +474,9 @@ const step_seq_bindings = [_]Binding{
     scalarBinding(modules.StepSeq, "root_semitone", scalarDesc("root_semitone", -48.0, 48.0, 0.0, 1.0, "st")),
     scalarBinding(modules.StepSeq, "octaves", scalarDesc("octaves", 1.0, 8.0, 2.0, 1.0, "")),
     scalarBinding(modules.StepSeq, "glide_rate", scalarDesc("glide_rate", 0.0, 100.0, 6.0, 0.1, "oct/s")),
+    boolBinding(modules.StepSeq, "evolve", choiceDesc("evolve", &bool_options, 0)),
+    boolBinding(modules.StepSeq, "lock", choiceDesc("lock", &bool_options, 0)),
+    scalarBinding(modules.StepSeq, "density", scalarDesc("density", 0.0, 1.0, 0.25, 0.01, "")),
 };
 const lfo_bindings = [_]Binding{
     scalarBinding(modules.Lfo, "rate_hz", scalarDesc("rate_hz", 0.0, 100.0, 0.1, 0.01, "Hz")),
@@ -554,13 +648,23 @@ fn descriptorTable(comptime k: dyn.ModuleKind) []const ParamDesc {
         .vca => &[_]ParamDesc{vca_bindings[0].desc},
         .env_gen => &[_]ParamDesc{ env_gen_bindings[0].desc, env_gen_bindings[1].desc, env_gen_bindings[2].desc, env_gen_bindings[3].desc },
         .vcf => &[_]ParamDesc{ vcf_bindings[0].desc, vcf_bindings[1].desc, vcf_bindings[2].desc, vcf_bindings[3].desc },
-        .mixer => &[_]ParamDesc{mixer_bindings[0].desc},
+        .mixer => &[_]ParamDesc{
+            mixer_bindings[0].desc,
+            mixer_bindings[1].desc,
+            mixer_bindings[2].desc,
+            mixer_bindings[3].desc,
+            mixer_bindings[4].desc,
+            mixer_bindings[5].desc,
+            mixer_bindings[6].desc,
+            mixer_bindings[7].desc,
+            mixer_bindings[8].desc,
+        },
         .output => &[_]ParamDesc{ output_bindings[0].desc, output_bindings[1].desc, output_bindings[2].desc },
         .clock => &[_]ParamDesc{ clock_bindings[0].desc, clock_bindings[1].desc, clock_bindings[2].desc },
         .clock_divider => &[_]ParamDesc{clock_divider_bindings[0].desc},
         .euclid => &[_]ParamDesc{ euclid_bindings[0].desc, euclid_bindings[1].desc, euclid_bindings[2].desc },
         .quantizer => &[_]ParamDesc{ quantizer_bindings[0].desc, quantizer_bindings[1].desc, quantizer_bindings[2].desc, quantizer_bindings[3].desc },
-        .step_seq => &[_]ParamDesc{ step_seq_bindings[0].desc, step_seq_bindings[1].desc, step_seq_bindings[2].desc, step_seq_bindings[3].desc },
+        .step_seq => &[_]ParamDesc{ step_seq_bindings[0].desc, step_seq_bindings[1].desc, step_seq_bindings[2].desc, step_seq_bindings[3].desc, step_seq_bindings[4].desc, step_seq_bindings[5].desc, step_seq_bindings[6].desc },
         .lfo => &[_]ParamDesc{ lfo_bindings[0].desc, lfo_bindings[1].desc },
         .kick => &[_]ParamDesc{ kick_bindings[0].desc, kick_bindings[1].desc, kick_bindings[2].desc, kick_bindings[3].desc, kick_bindings[4].desc, kick_bindings[5].desc, kick_bindings[6].desc, kick_bindings[7].desc, kick_bindings[8].desc, kick_bindings[9].desc },
         .hat => &[_]ParamDesc{ hat_bindings[0].desc, hat_bindings[1].desc, hat_bindings[2].desc, hat_bindings[3].desc, hat_bindings[4].desc, hat_bindings[5].desc },
@@ -811,6 +915,129 @@ test "params: invalid handles, names, value kinds, and ranges are explicit error
 
     graph.removeModule(h);
     try std.testing.expectError(Error.InactiveHandle, getParam(graph, h, "gain"));
+}
+
+test "params: Mixer inX_mute is off/on choice; gain defaults/range/roundtrip" {
+    const descs = descriptors(.mixer);
+    try std.testing.expectEqual(@as(usize, 9), descs.len);
+
+    inline for (.{ "in0_mute", "in1_mute", "in2_mute", "in3_mute" }) |mute_name| {
+        const desc = blk: {
+            for (descs) |d| {
+                if (std.mem.eql(u8, d.name, mute_name)) break :blk d;
+            }
+            return error.TestUnexpectedResult;
+        };
+        switch (desc.kind) {
+            .choice => |c| {
+                try std.testing.expectEqual(@as(usize, 2), c.options.len);
+                try std.testing.expectEqualStrings("off", c.options[0]);
+                try std.testing.expectEqualStrings("on", c.options[1]);
+                try std.testing.expectEqual(@as(usize, 0), c.default);
+            },
+            .scalar => return error.TestUnexpectedResult,
+        }
+    }
+
+    inline for (.{ "in0_gain", "in1_gain", "in2_gain", "in3_gain" }) |gain_name| {
+        const desc = blk: {
+            for (descs) |d| {
+                if (std.mem.eql(u8, d.name, gain_name)) break :blk d;
+            }
+            return error.TestUnexpectedResult;
+        };
+        switch (desc.kind) {
+            .scalar => |s| {
+                try std.testing.expectEqual(@as(f32, 0.0), s.min);
+                try std.testing.expectEqual(@as(f32, 2.0), s.max);
+                try std.testing.expectEqual(@as(f32, 1.0), s.default);
+                try std.testing.expectEqual(@as(f32, 0.01), s.step);
+            },
+            .choice => return error.TestUnexpectedResult,
+        }
+    }
+
+    var graph = try dyn.DynGraph.create(std.testing.allocator, 48000);
+    defer graph.destroy();
+    const h = try graph.add(.mixer, .{});
+
+    try setParam(graph, h, "in0_gain", .{ .scalar = 0.25 });
+    try setParam(graph, h, "in2_mute", .{ .choice = 1 });
+    const gain = try getParam(graph, h, "in0_gain");
+    const mute = try getParam(graph, h, "in2_mute");
+    try std.testing.expectEqual(@as(f32, 0.25), gain.scalar);
+    try std.testing.expectEqual(@as(usize, 1), mute.choice);
+
+    try std.testing.expectError(Error.OutOfRange, setParam(graph, h, "in1_gain", .{ .scalar = 2.5 }));
+    try std.testing.expectError(Error.WrongValueKind, setParam(graph, h, "in0_mute", .{ .scalar = 1.0 }));
+
+    const mix = graph.ptrOfConst(.mixer, h);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), mix.input_gain[0], 1e-6);
+    try std.testing.expect(mix.input_mute[2]);
+}
+
+test "params: StepSeq evolve/lock/density descriptor defaults and roundtrip" {
+    const descs = descriptors(.step_seq);
+    try std.testing.expectEqual(@as(usize, 7), descs.len);
+
+    const evolve_desc = blk: {
+        for (descs) |d| {
+            if (std.mem.eql(u8, d.name, "evolve")) break :blk d;
+        }
+        return error.TestUnexpectedResult;
+    };
+    switch (evolve_desc.kind) {
+        .choice => |c| {
+            try std.testing.expectEqualStrings("off", c.options[0]);
+            try std.testing.expectEqualStrings("on", c.options[1]);
+            try std.testing.expectEqual(@as(usize, 0), c.default);
+        },
+        .scalar => return error.TestUnexpectedResult,
+    }
+    const lock_desc = blk: {
+        for (descs) |d| {
+            if (std.mem.eql(u8, d.name, "lock")) break :blk d;
+        }
+        return error.TestUnexpectedResult;
+    };
+    switch (lock_desc.kind) {
+        .choice => |c| try std.testing.expectEqual(@as(usize, 0), c.default),
+        .scalar => return error.TestUnexpectedResult,
+    }
+    const dens_desc = blk: {
+        for (descs) |d| {
+            if (std.mem.eql(u8, d.name, "density")) break :blk d;
+        }
+        return error.TestUnexpectedResult;
+    };
+    switch (dens_desc.kind) {
+        .scalar => |s| {
+            try std.testing.expectEqual(@as(f32, 0.0), s.min);
+            try std.testing.expectEqual(@as(f32, 1.0), s.max);
+            try std.testing.expectEqual(@as(f32, 0.25), s.default);
+            try std.testing.expectEqual(@as(f32, 0.01), s.step);
+        },
+        .choice => return error.TestUnexpectedResult,
+    }
+
+    var graph = try dyn.DynGraph.create(std.testing.allocator, 48000);
+    defer graph.destroy();
+    const h = try graph.add(.step_seq, .{});
+
+    try setParam(graph, h, "evolve", .{ .choice = 1 });
+    try setParam(graph, h, "lock", .{ .choice = 1 });
+    try setParam(graph, h, "density", .{ .scalar = 0.42 });
+    try std.testing.expectEqual(@as(usize, 1), (try getParam(graph, h, "evolve")).choice);
+    try std.testing.expectEqual(@as(usize, 1), (try getParam(graph, h, "lock")).choice);
+    try std.testing.expectEqual(@as(f32, 0.42), (try getParam(graph, h, "density")).scalar);
+
+    const seq = graph.ptrOfConst(.step_seq, h);
+    try std.testing.expect(seq.evolve);
+    try std.testing.expect(seq.lock);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), seq.density, 1e-6);
+
+    try std.testing.expectError(Error.OutOfRange, setParam(graph, h, "density", .{ .scalar = 1.5 }));
+    try std.testing.expectError(Error.WrongValueKind, setParam(graph, h, "evolve", .{ .scalar = 1.0 }));
 }
 
 fn expectSetValidateAgree(graph: *dyn.DynGraph, h: dyn.Handle, kind: dyn.ModuleKind, name: []const u8, value: ParamValue) !void {

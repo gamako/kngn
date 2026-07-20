@@ -42,7 +42,6 @@ const Chain = patchmod.Chain;
 const BASS_DEG_TOTAL: usize = patchmod.BASS_DEG_TOTAL;
 const canvas = @import("canvas.zig");
 const inspector = @import("inspector.zig");
-const transport = @import("transport.zig");
 const param_view = @import("param_view.zig");
 const group = @import("group.zig");
 const macro = @import("macro.zig");
@@ -268,6 +267,8 @@ const CUTOFF_MIN: f32 = patchmod.MASTER_CUTOFF_MIN;
 const CUTOFF_MAX: f32 = patchmod.MASTER_CUTOFF_MAX;
 
 const Params = struct {
+    // TASK-160.3: 以下 tempo〜mute は SPRM v1 互換の deprecated storage。
+    // live graph の正は NPRM descriptor / param_db。Transport UI からは読み書きしない。
     tempo: f32 = 122.0,
     cutoff_norm: f32 = 1.0,
     density: f32 = 0.25,
@@ -304,38 +305,18 @@ const ParamRowSnapshot = struct {
     valid: bool = false,
 };
 
+fn cutoffRange() param_view.CutoffRange {
+    return .{ .min = CUTOFF_MIN, .max = CUTOFF_MAX };
+}
+
 fn cutoffHz(norm: f32) f32 {
-    return param_view.cutoffHz(norm, conversion());
+    return param_view.cutoffHz(norm, cutoffRange());
 }
 
-fn conversion() param_view.Conversion {
-    return .{
-        .cutoff_min = CUTOFF_MIN,
-        .cutoff_max = CUTOFF_MAX,
-        .kick_base_gain = patchmod.KICK_BASE_GAIN,
-        .hat_base_gain = patchmod.HAT_BASE_GAIN,
-        .clap_base_gain = patchmod.CLAP_BASE_GAIN,
-        .pad_base_gain = patchmod.PAD_BASE_GAIN,
-    };
-}
-
+/// tone macros のみ Controls へ publish（TASK-160.3）。
+/// tempo/cutoff/swing/sidechain/density/gain/mute は graph descriptor（NPRM / param_db）が正。
 fn publishControls(patch: *LofiPatch, p: Params) void {
     const c = &patch.controls;
-    c.tempo_bpm.store(p.tempo);
-    c.master_cutoff.store(cutoffHz(p.cutoff_norm));
-    c.density_target.store(p.density);
-    c.swing.store(p.swing);
-    c.sidechain_amount.store(p.sidechain);
-    c.kick_gain.store(p.kick_gain);
-    c.hat_gain.store(p.hat_gain);
-    c.clap_gain.store(p.clap_gain);
-    c.bass_gain.store(p.bass_gain);
-    c.pad_gain.store(p.pad_gain);
-    c.kick_mute.store(@intFromBool(p.kick_mute), .release);
-    c.hat_mute.store(@intFromBool(p.hat_mute), .release);
-    c.clap_mute.store(@intFromBool(p.clap_mute), .release);
-    c.bass_mute.store(@intFromBool(p.bass_mute), .release);
-    c.pad_mute.store(@intFromBool(p.pad_mute), .release);
     c.kick_punch.store(p.kick_punch);
     c.hat_bright.store(p.hat_bright);
     c.hat_decay.store(p.hat_decay);
@@ -343,6 +324,33 @@ fn publishControls(patch: *LofiPatch, p: Params) void {
     c.pad_warmth.store(p.pad_warmth);
     c.master_warmth.store(p.master_warmth);
     c.ambient_move.store(p.ambient_move);
+}
+
+/// SPRM / Params の旧 transport 系 field を graph param_db へ one-shot 反映。
+/// load_pattern（NPRM 無し）と offline render 用。フル VPRJ load では NPRM が正なので呼ばない。
+/// Params は deprecated storage（live の authoritative source ではない）。
+fn publishDeprecatedGraphFromParams(patch: *LofiPatch, p: Params) void {
+    var batch: patchmod.ParamBatch = .{};
+    batch.revision = 1;
+    batch.entries[0] = .{ .handle = patch.clock_h, .name = "bpm", .value = .{ .scalar = p.tempo }, .touched = true };
+    batch.entries[1] = .{ .handle = patch.clock_h, .name = "swing", .value = .{ .scalar = p.swing }, .touched = true };
+    batch.entries[2] = .{ .handle = patch.master_vcf_h, .name = "cutoff", .value = .{ .scalar = cutoffHz(p.cutoff_norm) }, .touched = true };
+    batch.entries[3] = .{ .handle = patch.sidechain_h, .name = "amount", .value = .{ .scalar = p.sidechain }, .touched = true };
+    batch.entries[4] = .{ .handle = patch.kick_seq_h, .name = "density", .value = .{ .scalar = p.density }, .touched = true };
+    batch.entries[5] = .{ .handle = patch.hat_seq_h, .name = "density", .value = .{ .scalar = p.density }, .touched = true };
+    batch.entries[6] = .{ .handle = patch.clap_seq_h, .name = "density", .value = .{ .scalar = p.density }, .touched = true };
+    batch.entries[7] = .{ .handle = patch.bass_seq_h, .name = "density", .value = .{ .scalar = p.density }, .touched = true };
+    batch.entries[8] = .{ .handle = patch.master_mixer_h, .name = "in0_gain", .value = .{ .scalar = p.kick_gain }, .touched = true };
+    batch.entries[9] = .{ .handle = patch.nonkick_mixer_h, .name = "in0_gain", .value = .{ .scalar = p.hat_gain }, .touched = true };
+    batch.entries[10] = .{ .handle = patch.nonkick_mixer_h, .name = "in1_gain", .value = .{ .scalar = p.clap_gain }, .touched = true };
+    batch.entries[11] = .{ .handle = patch.nonkick_mixer_h, .name = "in2_gain", .value = .{ .scalar = p.bass_gain }, .touched = true };
+    batch.entries[12] = .{ .handle = patch.nonkick_mixer_h, .name = "in3_gain", .value = .{ .scalar = p.pad_gain }, .touched = true };
+    batch.entries[13] = .{ .handle = patch.master_mixer_h, .name = "in0_mute", .value = .{ .choice = @intFromBool(p.kick_mute) }, .touched = true };
+    batch.entries[14] = .{ .handle = patch.nonkick_mixer_h, .name = "in0_mute", .value = .{ .choice = @intFromBool(p.hat_mute) }, .touched = true };
+    batch.entries[15] = .{ .handle = patch.nonkick_mixer_h, .name = "in1_mute", .value = .{ .choice = @intFromBool(p.clap_mute) }, .touched = true };
+    batch.entries[16] = .{ .handle = patch.nonkick_mixer_h, .name = "in2_mute", .value = .{ .choice = @intFromBool(p.bass_mute) }, .touched = true };
+    batch.entries[17] = .{ .handle = patch.nonkick_mixer_h, .name = "in3_mute", .value = .{ .choice = @intFromBool(p.pad_mute) }, .touched = true };
+    patch.publishParamBatch(batch);
 }
 
 fn stateToCommand(st: PatchState) PatternCommand {
@@ -383,7 +391,7 @@ const App = struct {
     drag: Drag = .none,
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
-    // TASK-149.1: PanelHost が Transport(bottom)/Inspector(right) の外形・open/visible の正。
+    // TASK-149.1/160.3: PanelHost が History(left)/Inspector(right) の外形・open/visible の正。
     // ポインタは main の stack 上 host/panels/gui_ctx を指す（App より長く生きる）。
     panel_host: *gui.PanelHost = undefined,
     panels: []gui.Panel = &.{},
@@ -394,7 +402,6 @@ const App = struct {
     panels_hidden: bool = false,
     pre_hide_left_visible: bool = true,
     pre_hide_right_visible: bool = true,
-    pre_hide_bottom_visible: bool = true,
     // TASK-149.3: History panel ScrollArea と local-only meta ring。
     history_scroll: gui.Vec2f = .{},
     meta_events: [MAX_META_EVENTS]MetaEvent = [_]MetaEvent{.{}} ** MAX_META_EVENTS,
@@ -441,9 +448,9 @@ const App = struct {
     song: SongData = .{},
     // TASK-110.4: main thread が所有する累積 override 表（Mailbox payload の source）。
     param_batch: patchmod.ParamBatch = .{},
-    // TASK-124: field 単位で transport/inspector が共有する pending 操作値。
+    // TASK-124: field 単位で Inspector が共有する pending 操作値。
     param_edits: [MAX_PARAM_EDITS]param_view.ParamEditState = [_]param_view.ParamEditState{.{}} ** MAX_PARAM_EDITS,
-    // params probe の observed は既定で transport cutoff canonical field。action observe_param で切替可能。
+    // params probe の observed は既定で master VCF cutoff。action observe_param で切替可能。
     observed_field: param_view.FieldKey = .{},
     frame_snapshots: [MAX_PARAM_EDITS]FrameParamSnapshot = [_]FrameParamSnapshot{.{}} ** MAX_PARAM_EDITS,
     frame_snapshot_count: usize = 0,
@@ -466,7 +473,7 @@ const App = struct {
     /// 既知限界: 自分の pending 中に他 peer が同じ param 名を変更した場合、before が僅かに
     /// 古くなるだけで破壊はしない（消費は名前一致時のみ・不一致なら現在値 before にフォールバック）。
     pending_param_undo_before: ?patch_undo.ParamValueSnap = null,
-    /// Inspector (mode=1) / Transport (mode=0) drag 開始時の before 捕捉。
+    /// Inspector (mode=1) drag 開始時の before 捕捉。
     /// release で pending_param_undo_before へ移し routeUiAction("set_param") する。
     /// 単一 Optional: 同時に複数 slider を drag する UI は無く、1 本分のみ保持する制約。
     slider_drag_before: ?patch_undo.ParamValueSnap = null,
@@ -550,15 +557,12 @@ const App = struct {
         if (!self.panels_hidden) {
             self.pre_hide_left_visible = self.panel_host.slotVisible(.left);
             self.pre_hide_right_visible = self.panel_host.slotVisible(.right);
-            self.pre_hide_bottom_visible = self.panel_host.slotVisible(.bottom);
             self.panel_host.setSlotVisible(.left, false);
             self.panel_host.setSlotVisible(.right, false);
-            self.panel_host.setSlotVisible(.bottom, false);
             self.panels_hidden = true;
         } else {
             self.panel_host.setSlotVisible(.left, self.pre_hide_left_visible);
             self.panel_host.setSlotVisible(.right, self.pre_hide_right_visible);
-            self.panel_host.setSlotVisible(.bottom, self.pre_hide_bottom_visible);
             self.panels_hidden = false;
         }
         self.prefs_dirty = true;
@@ -637,18 +641,6 @@ const App = struct {
             return @max(1, @as(i32, @intCast(r.w)) - 16);
         }
         return @max(1, self.panel_host.slotExtent(.right) - 24);
-    }
-
-    /// Transport body 外側幅（panel rect − 余白）。bottom の extent は高さなので
-    /// 初回 fallback は slotRect または fb 幅概算。
-    fn transportBodyAvail(self: *const App) i32 {
-        if (self.panel_host.panelRect(self.gui_ctx, "Transport")) |r| {
-            return @max(1, @as(i32, @intCast(r.w)) - 16);
-        }
-        if (self.panel_host.slotRect(self.gui_ctx, .bottom)) |r| {
-            return @max(1, @as(i32, @intCast(r.w)) - 24);
-        }
-        return @max(1, @as(i32, @intCast(self.fb_w)) - 40);
     }
 
     /// 旧 TASK-123/125 digest キー互換: !visible→hidden / visible&&!open→closed / else open。
@@ -829,35 +821,7 @@ const App = struct {
                     };
                     // recordedAction 経由で CommandLog へ 1 record + notePatchUndo。
                     routeUiAction(self, "set_param", args);
-                } else if (b.mode == 0) {
-                    // Transport slider: alias 名 2 トークン + before（UI 値）を pending 経由で渡す。
-                    const alias = transportAliasForKey(self, state.key) orelse continue;
-                    if (!std.mem.eql(u8, b.name(), @tagName(alias))) continue;
-                    const pv = state.pending orelse continue;
-                    const raw_canonical: f32 = switch (pv) {
-                        .scalar => |v| v,
-                        .choice => |idx| @floatFromInt(idx),
-                    };
-                    const ui = param_view.toUi(alias, raw_canonical, conversion());
-                    self.pending_param_undo_before = b;
-                    var args_buf: [128]u8 = undefined;
-                    const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ @tagName(alias), ui }) catch {
-                        self.pending_param_undo_before = null;
-                        continue;
-                    };
-                    routeUiAction(self, "set_param", args);
                 }
-            } else if (state.pending) |pv| {
-                // before 未捕捉の Transport（保険）。live before は既に新値なので undoable にならない可能性がある。
-                const alias = transportAliasForKey(self, state.key) orelse continue;
-                const raw_canonical: f32 = switch (pv) {
-                    .scalar => |v| v,
-                    .choice => |idx| @floatFromInt(idx),
-                };
-                const ui = param_view.toUi(alias, raw_canonical, conversion());
-                var args_buf: [128]u8 = undefined;
-                const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ @tagName(alias), ui }) catch continue;
-                routeUiAction(self, "set_param", args);
             }
         }
     }
@@ -1467,6 +1431,7 @@ fn absGridGeometry(app: *const App, box_pos: Vec2f) stepgrid.Geometry {
 }
 
 /// 畳み箱本体に TR grid（drum 2 レーン）/ 303 行（on/accent/slide + pitch 段）+ playhead を描く。
+/// タイトル帯に evolve（全体）/ lock（per-lane）トグルを描く（生成マクロのみ。TASK-160.2）。
 fn drawMacroGrid(app: *App, dl: *gui.DrawList, box: NodeGeom, gid: group.GroupId) void {
     const kind = app.ledger.groups[gid].kind;
     const seqs = collectStepSeqMembers(app, gid);
@@ -1476,6 +1441,8 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, box: NodeGeom, gid: group.GroupId
     const head_seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
     const playhead: u8 = (head_seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
     const geometry = absGridGeometry(app, box.pos);
+
+    drawMacroMutationToggles(app, dl, box, seqs.items[0..seqs.n]);
 
     switch (kind) {
         .drum_machine => {
@@ -1498,6 +1465,107 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, box: NodeGeom, gid: group.GroupId
                 .{ .pitch = .{ .degrees = seq.pitch_deg[0..], .degree_count = modular.scaleDegreeCount(seq.scale, seq.octaves), .color = stepgrid.DEFAULT_PITCH, .style = .bars } },
             };
             stepgrid.draw(dl, geometry, rows[0..], .{ .playhead = @intCast(playhead) });
+        },
+    }
+}
+
+const EVOLVE_ON_COL = gui.Color.rgba(0x60, 0xC0, 0x90, 0xFF);
+const EVOLVE_OFF_COL = gui.Color.rgba(0x40, 0x48, 0x52, 0xFF);
+const LOCK_ON_COL = gui.Color.rgba(0xE0, 0x90, 0x50, 0xFF);
+const LOCK_OFF_COL = gui.Color.rgba(0x40, 0x48, 0x52, 0xFF);
+
+fn drawMacroMutationToggles(app: *App, dl: *gui.DrawList, box: NodeGeom, seq_handles: []const Handle) void {
+    if (!macroHasGeneratedSeqs(app, seq_handles)) return;
+    const zoom = app.camera.zoom;
+    const origin = app.worldToAbs(box.pos);
+    const e = canvas.macroEvolveToggleRect();
+    const head: StepSeqPtr = app.dyn.ptrOf(.step_seq, seq_handles[0]);
+    const er = gui.Rect{
+        .x = @intFromFloat(origin.x + e.x * zoom),
+        .y = @intFromFloat(origin.y + e.y * zoom),
+        .w = @intFromFloat(e.w * zoom),
+        .h = @intFromFloat(e.h * zoom),
+    };
+    dl.rectFilled(er, if (head.evolve) EVOLVE_ON_COL else EVOLVE_OFF_COL) catch {};
+
+    var lane: u8 = 0;
+    while (lane < seq_handles.len) : (lane += 1) {
+        const lr = canvas.macroLockToggleRect(lane);
+        const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seq_handles[lane]);
+        const rect = gui.Rect{
+            .x = @intFromFloat(origin.x + lr.x * zoom),
+            .y = @intFromFloat(origin.y + lr.y * zoom),
+            .w = @intFromFloat(lr.w * zoom),
+            .h = @intFromFloat(lr.h * zoom),
+        };
+        dl.rectFilled(rect, if (seq.lock) LOCK_ON_COL else LOCK_OFF_COL) catch {};
+    }
+}
+
+fn macroHasGeneratedSeqs(app: *const App, seq_handles: []const Handle) bool {
+    for (seq_handles) |h| {
+        if (!isGeneratedStepSeq(app, h)) return false;
+    }
+    return seq_handles.len > 0;
+}
+
+const MacroToggleHit = union(enum) {
+    evolve: void,
+    lock: u8, // lane index into collectStepSeqMembers order
+};
+
+const MacroMutationHit = struct {
+    gid: group.GroupId,
+    hit: MacroToggleHit,
+};
+
+fn hitMacroMutationToggle(app: *const App, world_pt: Vec2f) ?MacroMutationHit {
+    for (app.ledger.groups, 0..) |g, i| {
+        if (!g.active or !g.collapsed) continue;
+        const gid: group.GroupId = @intCast(i);
+        const seqs = collectStepSeqMembers(app, gid);
+        if (!macroHasGeneratedSeqs(app, seqs.items[0..seqs.n])) continue;
+        const local = world_pt.sub(g.pos);
+        const er = canvas.macroEvolveToggleRect();
+        if (local.x >= er.x and local.x < er.x + er.w and local.y >= er.y and local.y < er.y + er.h) {
+            return .{ .gid = gid, .hit = .evolve };
+        }
+        var lane: u8 = 0;
+        while (lane < seqs.n) : (lane += 1) {
+            const lr = canvas.macroLockToggleRect(lane);
+            if (local.x >= lr.x and local.x < lr.x + lr.w and local.y >= lr.y and local.y < lr.y + lr.h) {
+                return .{ .gid = gid, .hit = .{ .lock = lane } };
+            }
+        }
+    }
+    return null;
+}
+
+fn trackNameForGeneratedSeq(app: *const App, h: Handle) ?[]const u8 {
+    if (h == app.patch.kick_seq_h) return "kick";
+    if (h == app.patch.hat_seq_h) return "hat";
+    if (h == app.patch.clap_seq_h) return "clap";
+    if (h == app.patch.bass_seq_h) return "bass";
+    return null;
+}
+
+fn applyMacroMutationToggle(app: *App, hit: MacroMutationHit) void {
+    const seqs = collectStepSeqMembers(app, hit.gid);
+    switch (hit.hit) {
+        .evolve => {
+            const head: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
+            var buf: [8]u8 = undefined;
+            const args = std.fmt.bufPrint(&buf, "{d}", .{@as(u8, @intFromBool(!head.evolve))}) catch return;
+            routeUiAction(app, "set_evolve", args);
+        },
+        .lock => |lane| {
+            if (lane >= seqs.n) return;
+            const h = seqs.items[lane];
+            const name = trackNameForGeneratedSeq(app, h) orelse return;
+            const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, h);
+            var buf: [32]u8 = undefined;
+            const args = std.fmt.bufPrint(&buf, "{s} {d}", .{ name, @as(u8, @intFromBool(!seq.lock)) }) catch return;
+            routeUiAction(app, "set_lock", args);
         },
     }
 }
@@ -1915,6 +1983,14 @@ fn onMouseDown(app: *App) void {
         app.ledger.groups[gid].collapsed = !app.ledger.groups[gid].collapsed;
         app.selected = .{ .group = gid };
         app.hover = null;
+        app.drag = .none;
+        return;
+    }
+
+    // 生成マクロの evolve/lock トグル（step cell より優先・非衝突矩形。TASK-160.2）。
+    if (hitMacroMutationToggle(app, mw)) |hit| {
+        applyMacroMutationToggle(app, hit);
+        app.selected = .{ .group = hit.gid };
         app.drag = .none;
         return;
     }
@@ -2623,7 +2699,7 @@ pub fn main(init: std.process.Init) !void {
     defer undo_store.destroy();
 
     app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32, .undo_store = undo_store };
-    app.observed_field = param_view.keyFor(.cutoff, transportHandles(&app));
+    app.observed_field = defaultObservedField(&app);
     // 生成グラフ全体を canvas に配置する（初期状態は 8 列の折り返し。Drum/Bass の
     // マクロ台帳は既存 canvas 操作に任せ、全モジュールを MAX_MODULES 内で可視化する）。
     var layout_h: Handle = 0;
@@ -2655,16 +2731,15 @@ pub fn main(init: std.process.Init) !void {
     gui_font.load(init.io, allocator);
     gui_ctx.font = gui_font.asFont();
 
-    // TASK-149.1/149.3: PanelHost registry — History=left, Transport=bottom, Inspector=right。
+    // TASK-149.1/149.3/160.3: PanelHost registry — History=left, Inspector=right（Transport 撤去）。
     var panels = [_]gui.Panel{
         .{ .name = "History", .slot = .left, .build = buildHistoryPanel, .user_data = &app },
-        .{ .name = "Transport", .slot = .bottom, .build = buildTransportPanel, .user_data = &app },
         .{ .name = "Inspector", .slot = .right, .build = buildInspectorPanel, .user_data = &app },
     };
     var panel_host = try gui.PanelHost.init(panels[0..], .{
         .left = .{ .extent = 220, .min_extent = 140, .max_extent = 400 },
         .right = .{ .extent = 280, .min_extent = 160, .max_extent = 480 },
-        .bottom = .{ .extent = 250, .min_extent = 120, .max_extent = 400 },
+        .bottom = .{ .visible = false, .extent = 0, .min_extent = 0, .max_extent = 1 },
         .min_center_width = 200,
         .min_center_height = 160,
     });
@@ -3462,14 +3537,11 @@ fn patchApplyUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) v
             }
         },
         .param => |s| {
-            if (s.mode == 0) {
-                const v: f32 = @bitCast(s.value_bits);
-                setParamAndPublish(app, s.name(), v) catch {};
-            } else {
-                const h = handleOfNodeId(app, NodeId.fromRaw(s.node_id)) orelse return;
-                const raw: f32 = if (s.value_kind == 0) @bitCast(s.value_bits) else @floatFromInt(s.value_bits);
-                queueParamOverride(app, h, s.name(), raw) catch {};
-            }
+            // mode=0 は旧 Transport alias（TASK-160.3 で廃止）。無視して NodeId 形式のみ復元。
+            if (s.mode != 1) return;
+            const h = handleOfNodeId(app, NodeId.fromRaw(s.node_id)) orelse return;
+            const raw: f32 = if (s.value_kind == 0) @bitCast(s.value_bits) else @floatFromInt(s.value_bits);
+            queueParamOverride(app, h, s.name(), raw) catch {};
         },
         .add_node => |s| {
             const h = handleOfNodeId(app, NodeId.fromRaw(s.id)) orelse return;
@@ -3698,62 +3770,6 @@ fn displayInspectorValue(ctx: *anyopaque, key: param_view.FieldKey, snapshot: pa
     return param_view.displayValue(snapshot, app.findEditState(key), key);
 }
 
-fn displayTransportValue(ctx: *anyopaque, key: param_view.FieldKey, field: f32) f32 {
-    const app: *App = @ptrCast(@alignCast(ctx));
-    if (app.findEditState(key)) |state| {
-        if (state.pending) |pending| switch (pending) {
-            .scalar => |value| return value,
-            .choice => {},
-        };
-    }
-    return field;
-}
-
-fn transportHandles(app: *const App) param_view.TransportHandles {
-    return .{
-        .clock = app.patch.clock_h,
-        .master_vcf = app.patch.master_vcf_h,
-        .sidechain = app.patch.sidechain_h,
-        .kick = app.patch.kick_h,
-        .hat = app.patch.hat_h,
-        .clap = app.patch.clap_h,
-        .bass_perc = app.patch.bass_perc_h,
-        .pad = app.patch.pad_h,
-    };
-}
-
-fn scalarFor(app: *App, key: param_view.FieldKey, fallback: f32) transport.Scalar {
-    const snapshot = app.snapshotParam(@intCast(key.handle), key.name) orelse return .{ .key = key, .field = fallback };
-    const field = switch (snapshot.field) {
-        .scalar => |value| value,
-        .choice => fallback,
-    };
-    const instant = if (snapshot.instant) |value| switch (value) {
-        .scalar => |v| v,
-        .choice => null,
-    } else null;
-    return .{ .key = key, .field = field, .instant = instant };
-}
-
-fn transportModel(app: *App) transport.Model {
-    const handles = transportHandles(app);
-    const density_key = param_view.keyFor(.density, handles);
-    const state = app.patch.snapshotState();
-    return .{
-        .tempo = scalarFor(app, param_view.keyFor(.tempo, handles), state.bpm),
-        .cutoff = scalarFor(app, param_view.keyFor(.cutoff, handles), state.master_cutoff),
-        .density = .{ .key = density_key, .field = state.density_target },
-        .swing = scalarFor(app, param_view.keyFor(.swing, handles), state.swing),
-        .sidechain = scalarFor(app, param_view.keyFor(.sidechain, handles), state.sidechain_amount),
-        .kick = .{ .gain = scalarFor(app, param_view.keyFor(.kick_gain, handles), state.kick_gain), .muted = state.kick_muted },
-        .hat = .{ .gain = scalarFor(app, param_view.keyFor(.hat_gain, handles), state.hat_gain), .muted = state.hat_muted },
-        .clap = .{ .gain = scalarFor(app, param_view.keyFor(.clap_gain, handles), state.clap_gain), .muted = state.clap_muted },
-        .bass = .{ .gain = scalarFor(app, param_view.keyFor(.bass_gain, handles), state.bass_gain), .muted = state.bass_muted },
-        .pad = .{ .gain = scalarFor(app, param_view.keyFor(.pad_gain, handles), state.pad_gain), .muted = state.pad_muted },
-        .conversion = conversion(),
-    };
-}
-
 /// scalar/choice の UI 値を descriptor の ParamValue へ変換し、累積表を publish する。
 fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !void {
     if (handle >= MAX_MODULES) return error.InvalidHandle;
@@ -3825,21 +3841,6 @@ fn purgeParamOverrides(app: *App, handle: ?Handle) void {
     for (&app.param_batch.entries) |*entry| {
         if (!entry.touched) continue;
         if (handle == null or entry.handle == handle.?) {
-            entry.* = .{};
-            changed = true;
-        }
-    }
-    if (changed) {
-        app.param_batch.revision += 1;
-        app.patch.publishParamBatch(app.param_batch);
-    }
-}
-
-fn purgeParamOverrideField(app: *App, key: param_view.FieldKey) void {
-    var changed = false;
-    for (&app.param_batch.entries) |*entry| {
-        if (!entry.touched) continue;
-        if (param_view.sameFieldParts(key, entry.handle, entry.name)) {
             entry.* = .{};
             changed = true;
         }
@@ -4616,7 +4617,7 @@ fn registerPatchActions(app: *App) void {
         .run = actionPanelToggle,
         .network_policy = .local_only,
         .args = &.{.{ .name = "name", .kind = "string" }},
-        .desc = "toggle panel visible (transport|inspector|history)",
+        .desc = "toggle panel visible (inspector|history)",
     });
     platform.registerAction(.{
         .name = "add_node",
@@ -4862,7 +4863,9 @@ fn selectedParamDigest(app: *const App, buf: []u8) []const u8 {
 }
 
 fn defaultObservedField(app: *const App) param_view.FieldKey {
-    return param_view.keyFor(.cutoff, transportHandles(app));
+    // Master VCF cutoff（Inspector 経路の既定 observe）。
+    const name = param_view.canonicalDescriptorName(modular.descriptors(.vcf), "cutoff") orelse "cutoff";
+    return param_view.fieldKey(app.patch.master_vcf_h, name);
 }
 
 fn observedField(app: *const App) param_view.FieldKey {
@@ -4881,16 +4884,6 @@ fn editScalarValue(app: *const App, key: param_view.FieldKey) ?f32 {
         if (state.pending) |pending| return scalarParamValue(pending);
     }
     return null;
-}
-
-fn observedTransportValue(app: *const App, key: param_view.FieldKey) ?f32 {
-    const handles = transportHandles(app);
-    if (param_view.sameField(key, param_view.keyFor(.density, handles))) return app.patch.snapshotState().density_target;
-    const alias = transportAliasForKey(app, key) orelse return null;
-    _ = alias;
-    const snapshot = modular.getParamSnapshot(app.dyn, @intCast(key.handle), key.name) catch return null;
-    const field = scalarParamValue(snapshot.field) orelse return null;
-    return editScalarValue(app, key) orelse field;
 }
 
 fn observedInspectorValue(app: *const App, key: param_view.FieldKey) ?f32 {
@@ -4916,13 +4909,10 @@ fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
 fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
     const host = app.panel_host;
-    // 既存キー維持 + TASK-149.3 history_* を追加のみ。
-    return std.fmt.bufPrint(buf, "transport_visible={d} inspector_visible={d} transport_open={d} inspector_open={d} transport_state={s} inspector_state={s} panels_hidden={d} history_visible={d} history_open={d} history_count={d} history_latest_seq={d} history_scroll_y={d} left_extent={d} right_extent={d} bottom_extent={d} center_x={d} center_y={d} center_w={d} center_h={d} canvas_w={d} canvas_h={d}", .{
-        @intFromBool(app.panelVisible("Transport")),
+    // TASK-160.3: Transport / bottom slot キーを削除。History + Inspector のみ。
+    return std.fmt.bufPrint(buf, "inspector_visible={d} inspector_open={d} inspector_state={s} panels_hidden={d} history_visible={d} history_open={d} history_count={d} history_latest_seq={d} history_scroll_y={d} left_extent={d} right_extent={d} bottom_extent={d} center_x={d} center_y={d} center_w={d} center_h={d} canvas_w={d} canvas_h={d}", .{
         @intFromBool(app.panelVisible("Inspector")),
-        @intFromBool(app.panelOpen("Transport")),
         @intFromBool(app.panelOpen("Inspector")),
-        app.panelStateName("Transport"),
         app.panelStateName("Inspector"),
         @intFromBool(app.panels_hidden),
         @intFromBool(app.panelVisible("History")),
@@ -5093,12 +5083,6 @@ fn buildHistoryPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     ctx.endBox();
 }
 
-fn buildTransportPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
-    const app: *App = @ptrCast(@alignCast(user_data));
-    const model = transportModel(app);
-    transport.drawBody(ctx, &model, app.transportBodyAvail(), app, displayTransportValue, app, transportParamChanged, transportMuteChanged);
-}
-
 fn inspectorMemberSelected(ctx: *anyopaque, handle: modular.dyn.Handle) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     // canvas selection / group collapsed / RT は触らない。target のみ。
@@ -5177,21 +5161,18 @@ fn persistPanelPrefs(app: *App) void {
     if (was_hidden) {
         app.panel_host.setSlotVisible(.left, app.pre_hide_left_visible);
         app.panel_host.setSlotVisible(.right, app.pre_hide_right_visible);
-        app.panel_host.setSlotVisible(.bottom, app.pre_hide_bottom_visible);
     }
     app.panel_host.persist(panelPersistence(app)) catch |err| {
         std.debug.print("apps/patch: panel persist failed: {s}\n", .{@errorName(err)});
         if (was_hidden) {
             app.panel_host.setSlotVisible(.left, false);
             app.panel_host.setSlotVisible(.right, false);
-            app.panel_host.setSlotVisible(.bottom, false);
         }
         return;
     };
     if (was_hidden) {
         app.panel_host.setSlotVisible(.left, false);
         app.panel_host.setSlotVisible(.right, false);
-        app.panel_host.setSlotVisible(.bottom, false);
     }
     app.prefs.save(app.io, dir, "preferences.ash") catch |err| {
         std.debug.print("apps/patch: preferences save failed: {s}\n", .{@errorName(err)});
@@ -5205,7 +5186,6 @@ fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     const name_raw = std.mem.trim(u8, args, " \t");
     // harness は小文字名。PanelHost name は PascalCase。local_only（CommandLog 非記録→meta ring）。
     const panel_name: []const u8 = blk: {
-        if (std.mem.eql(u8, name_raw, "transport") or std.mem.eql(u8, name_raw, "Transport")) break :blk "Transport";
         if (std.mem.eql(u8, name_raw, "inspector") or std.mem.eql(u8, name_raw, "Inspector")) break :blk "Inspector";
         if (std.mem.eql(u8, name_raw, "history") or std.mem.eql(u8, name_raw, "History")) break :blk "History";
         return error.InvalidArgument;
@@ -5292,9 +5272,8 @@ fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const snapshot = modular.getParamSnapshot(app.dyn, @intCast(key.handle), key.name) catch return buf[0..0];
     const field = scalarParamValue(snapshot.field);
     const instant = if (snapshot.instant) |value| scalarParamValue(value) else null;
-    const transport_value = observedTransportValue(app, key);
     const inspector_value = observedInspectorValue(app, key);
-    const shown = editScalarValue(app, key) orelse transport_value orelse inspector_value orelse field;
+    const shown = editScalarValue(app, key) orelse inspector_value orelse field;
     const kind = app.dyn.kindOf(@intCast(key.handle)) orelse .vca;
     const ghost = if (paramDescFor(kind, key.name)) |desc| switch (desc.kind) {
         .scalar => |s| param_view.ghostFraction(.{ .field = snapshot.field, .instant = snapshot.instant, .has_instant = snapshot.has_instant }, s.min, s.max) != null,
@@ -5319,16 +5298,14 @@ fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const edit = app.findEditState(key);
     var instant_buf: [32]u8 = undefined;
     var field_buf: [32]u8 = undefined;
-    var transport_buf: [32]u8 = undefined;
     var inspector_buf: [32]u8 = undefined;
     var shown_buf: [32]u8 = undefined;
     const instant_text = optionalF32Text(&instant_buf, instant);
     const field_text = optionalF32Text(&field_buf, field);
-    const transport_text = optionalF32Text(&transport_buf, transport_value);
     const inspector_text = optionalF32Text(&inspector_buf, inspector_value);
     const shown_text = optionalF32Text(&shown_buf, shown);
-    // 既存キーは維持し、inspector_target / choice 情報を追加のみ。
-    const result = std.fmt.bufPrint(buf, "selected_h={d} selected_kind={s} inspector_target={d} target_kind={s} choice_name={s} choice_index={d} choice_option={s} observed_h={d} observed_name={s} field={s} instant={s} transport={s} inspector={s} shown={s} dragging={d} override={d} ghost={d}", .{
+    // TASK-160.3: transport= キー削除。Inspector 経路のみ。
+    const result = std.fmt.bufPrint(buf, "selected_h={d} selected_kind={s} inspector_target={d} target_kind={s} choice_name={s} choice_index={d} choice_option={s} observed_h={d} observed_name={s} field={s} instant={s} inspector={s} shown={s} dragging={d} override={d} ghost={d}", .{
         selected_h,
         selected_kind,
         target_h,
@@ -5340,7 +5317,6 @@ fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         key.name,
         field_text,
         instant_text,
-        transport_text,
         inspector_text,
         shown_text,
         if (edit) |state| @intFromBool(state.dragging) else 0,
@@ -5497,7 +5473,8 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
 // main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
 // action が触れる状態伝播は既存の RT-safe cross-thread hand-off をそのまま使うだけで、RT 経路
 // （`LofiPatch.render`→graph `processBlock`）へ新たな同期/alloc/lock/panic は一切追加しない:
-//   - scalar param / mute: `publishControls`（atomic store。GUI が毎フレーム呼ぶ既存コードと同一）。
+//   - graph param: `queueParamOverride` → param_db Mailbox。
+//   - tone macros: `publishControls`（atomic store）。
 //   - pattern 編集(lock/evolve/step/pitch): `patch.snapshotState()` で最新 pattern を読み
 //     `stateToCommand` で編集用 base に変換 → 該当 field を書換 → `app.pattern_rev` を1回だけ increment
 //     → `patch.controls.pattern_db.publish(cmd)`（triple-buffer Mailbox。GUI の「1 フレームで edited=true
@@ -5507,125 +5484,27 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
 // 解決は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と同じ分離方針）。
 // ============================================================================
 
-/// `Params` の f32 field へ comptime dispatch で書き込む（`set_param` 汎用 setter）。
-fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!void {
-    inline for (@typeInfo(Params).@"struct".fields) |f| {
-        if (f.type == f32 and std.mem.eql(u8, f.name, name)) {
-            @field(p, f.name) = value;
-            return;
-        }
-    }
-    return error.UnknownParam;
-}
-
-fn transportAliasForKey(app: *const App, key: param_view.FieldKey) ?param_view.TransportAlias {
-    const handles = transportHandles(app);
-    inline for (std.meta.fields(param_view.TransportAlias)) |field| {
-        const alias: param_view.TransportAlias = @enumFromInt(field.value);
-        if (param_view.sameField(key, param_view.keyFor(alias, handles))) return alias;
-    }
-    return null;
-}
-
-/// Transport alias の現在 UI 値（`setParamAndPublish` / undo restore と同一空間）。
-fn transportUiValue(app: *const App, alias: param_view.TransportAlias) f32 {
-    return switch (alias) {
-        .tempo => app.params.tempo,
-        .cutoff => app.params.cutoff_norm,
-        .density => app.params.density,
-        .swing => app.params.swing,
-        .sidechain => app.params.sidechain,
-        .kick_gain => app.params.kick_gain,
-        .hat_gain => app.params.hat_gain,
-        .clap_gain => app.params.clap_gain,
-        .bass_gain => app.params.bass_gain,
-        .pad_gain => app.params.pad_gain,
-    };
-}
-
-fn captureTransportParamBefore(app: *App, alias: param_view.TransportAlias) patch_undo.ParamValueSnap {
-    var s = patch_undo.ParamValueSnap{ .mode = 0 };
-    s.setName(@tagName(alias));
-    s.value_kind = 0;
-    s.value_bits = @bitCast(transportUiValue(app, alias));
-    return s;
-}
-
-fn setTransportCanonical(app: *App, key: param_view.FieldKey, value: f32) error{UnknownParam}!void {
-    const alias = transportAliasForKey(app, key) orelse return error.UnknownParam;
-    const c = conversion();
-    switch (alias) {
-        .tempo => app.params.tempo = value,
-        .cutoff => app.params.cutoff_norm = param_view.cutoffNorm(value, c),
-        .density => app.params.density = value,
-        .swing => app.params.swing = value,
-        .sidechain => app.params.sidechain = value,
-        .kick_gain => app.params.kick_gain = param_view.gainToUi(alias, value, c),
-        .hat_gain => app.params.hat_gain = param_view.gainToUi(alias, value, c),
-        .clap_gain => app.params.clap_gain = param_view.gainToUi(alias, value, c),
-        .bass_gain => app.params.bass_gain = value,
-        .pad_gain => app.params.pad_gain = param_view.gainToUi(alias, value, c),
-    }
-    if (alias == .density) app.patch.controls.density_target_enabled.store(1, .release);
-    publishControls(app.patch, app.params);
-    purgeParamOverrideField(app, key);
-    app.editState(key).begin(key, .{ .scalar = value });
-}
-
-fn setTransportAlias(app: *App, alias: param_view.TransportAlias, value: f32) error{UnknownParam}!void {
-    const handles = transportHandles(app);
-    const key = param_view.keyFor(alias, handles);
-    try setTransportCanonical(app, key, param_view.toCanonical(alias, value, conversion()));
-    app.editState(key).release();
-}
-
-fn setParamAndPublish(app: *App, name: []const u8, value: f32) error{UnknownParam}!void {
-    const alias = std.meta.stringToEnum(param_view.TransportAlias, name) orelse blk: {
-        if (std.mem.eql(u8, name, "cutoff_norm")) break :blk param_view.TransportAlias.cutoff;
-        break :blk null;
-    };
-    if (alias) |transport_alias| return setTransportAlias(app, transport_alias, value);
-    try setParamsF32(&app.params, name, value);
-    if (std.mem.eql(u8, name, "density")) {
-        app.patch.controls.density_target_enabled.store(1, .release);
-    }
-    publishControls(app.patch, app.params);
-}
-
 fn setMuteAndPublish(app: *App, name: []const u8, muted: bool) error{UnknownTrack}!void {
-    switch (std.meta.stringToEnum(MuteTrack, name) orelse return error.UnknownTrack) {
+    const track = std.meta.stringToEnum(MuteTrack, name) orelse return error.UnknownTrack;
+    switch (track) {
         .kick => app.params.kick_mute = muted,
         .hat => app.params.hat_mute = muted,
         .clap => app.params.clap_mute = muted,
         .bass => app.params.bass_mute = muted,
         .pad => app.params.pad_mute = muted,
     }
-    publishControls(app.patch, app.params);
+    const target = trackMixerMuteTarget(app, track);
+    queueParamOverride(app, target.handle, target.name, if (muted) 1.0 else 0.0) catch {};
 }
 
-fn transportParamChanged(ctx: *anyopaque, key: param_view.FieldKey, value: f32) void {
-    const app: *App = @ptrCast(@alignCast(ctx));
-    // drag 開始時のみ before（UI 値）を捕捉。release で set_param + notePatchUndo へ渡す。
-    if (app.slider_drag_before == null) {
-        if (transportAliasForKey(app, key)) |alias| {
-            app.slider_drag_before = captureTransportParamBefore(app, alias);
-        }
-    }
-    setTransportCanonical(app, key, value) catch {};
-    // drag 中は pending 更新のみ。CommandLog は release 時に 1 record（coalesce）。
-    const es = app.editState(key);
-    if (es.pending == null) es.begin(key, .{ .scalar = value }) else {
-        es.pending = .{ .scalar = value };
-        es.dragging = true;
-    }
-}
-
-fn transportMuteChanged(ctx: *anyopaque, name: []const u8, muted: bool) void {
-    const app: *App = @ptrCast(@alignCast(ctx));
-    // 直接 publish + 表示専用 record は廃止。set_mute action が before capture + notePatchUndo。
-    var args_buf: [32]u8 = undefined;
-    const args = std.fmt.bufPrint(&args_buf, "{s} {d}", .{ name, @intFromBool(muted) }) catch return;
-    routeUiAction(app, "set_mute", args);
+fn trackMixerMuteTarget(app: *const App, track: MuteTrack) struct { handle: usize, name: []const u8 } {
+    return switch (track) {
+        .kick => .{ .handle = app.patch.master_mixer_h, .name = "in0_mute" },
+        .hat => .{ .handle = app.patch.nonkick_mixer_h, .name = "in0_mute" },
+        .clap => .{ .handle = app.patch.nonkick_mixer_h, .name = "in1_mute" },
+        .bass => .{ .handle = app.patch.nonkick_mixer_h, .name = "in2_mute" },
+        .pad => .{ .handle = app.patch.nonkick_mixer_h, .name = "in3_mute" },
+    };
 }
 
 /// pending_param_undo_before を param 名一致のときだけ消費して返す。
@@ -5640,77 +5519,41 @@ fn takePendingParamUndoBefore(app: *App, param_name: []const u8) ?patch_undo.Par
 fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    var it = std.mem.tokenizeAny(u8, args, " \t");
-    _ = it.next() orelse return error.Empty;
-    _ = it.next() orelse return error.Empty;
-    // pending は param 名一致時のみ消費する（冒頭で無差別 clear しない）。
-    // remote COMMIT の別 param が local release の pending を奪う cross-talk を防ぐ。
-    if (it.next() != null) {
-        const p = try actions.parseParamOverride(args);
-        const h = try resolveNodeRef(app, p.ref, true);
-        const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
-        const before_snap = takePendingParamUndoBefore(app, cname) orelse blk: {
-            var s = patch_undo.ParamValueSnap{ .mode = 1, .node_id = (nodeIdOf(app, h) orelse NodeId.fromRaw(0)).raw() };
-            s.setName(cname);
-            const cur = modular.getParam(app.dyn, h, cname) catch break :blk null;
-            switch (cur) {
-                .scalar => |v| {
-                    s.value_kind = 0;
-                    s.value_bits = @bitCast(v);
-                },
-                .choice => |idx| {
-                    s.value_kind = 1;
-                    s.value_bits = @intCast(idx);
-                },
-            }
-            break :blk s;
-        };
-        try queueParamOverride(app, h, cname, p.value);
-        if (before_snap) |bs| {
-            const same = switch (bs.value_kind) {
-                0 => @as(f32, @bitCast(bs.value_bits)) == p.value,
-                1 => @as(f32, @floatFromInt(bs.value_bits)) == p.value,
-                else => false,
-            };
-            if (!same) notePatchUndo(app, .{ .param = bs });
-        }
-    } else {
-        const nf = try gen_actions.parseNameF32(args);
-        // Prefer pending from slider; for harness capture live transport aliases as UI values.
-        const alias = std.meta.stringToEnum(param_view.TransportAlias, nf.name) orelse
-            (if (std.mem.eql(u8, nf.name, "cutoff_norm")) param_view.TransportAlias.cutoff else null);
-        // pending 照合キーは alias 正規名（cutoff_norm → cutoff）。不一致なら pending を残す。
-        const pending_key: []const u8 = if (alias) |a| @tagName(a) else nf.name;
-        const before_snap = takePendingParamUndoBefore(app, pending_key) orelse blk: {
-            var s = patch_undo.ParamValueSnap{ .mode = 0 };
-            s.setName(nf.name);
-            if (alias) |a| {
+    // TASK-160.3: `#NodeId|handle + descriptor + value` のみ（旧 Transport alias 2 トークンは拒否）。
+    const p = try actions.parseParamOverride(args);
+    const h = try resolveNodeRef(app, p.ref, true);
+    const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
+    const before_snap = takePendingParamUndoBefore(app, cname) orelse blk: {
+        var s = patch_undo.ParamValueSnap{ .mode = 1, .node_id = (nodeIdOf(app, h) orelse NodeId.fromRaw(0)).raw() };
+        s.setName(cname);
+        const cur = modular.getParam(app.dyn, h, cname) catch break :blk null;
+        switch (cur) {
+            .scalar => |v| {
                 s.value_kind = 0;
-                s.value_bits = @bitCast(transportUiValue(app, a));
-                // cutoff_norm 別名で来た場合も restore 名を "cutoff" に揃える（setParamAndPublish）。
-                if (a == .cutoff) s.setName("cutoff");
-                break :blk s;
-            }
-            break :blk null;
-        };
-        try setParamAndPublish(app, nf.name, nf.value);
-        if (before_snap) |bs| {
-            if (@as(f32, @bitCast(bs.value_bits)) != nf.value) notePatchUndo(app, .{ .param = bs });
+                s.value_bits = @bitCast(v);
+            },
+            .choice => |idx| {
+                s.value_kind = 1;
+                s.value_bits = @intCast(idx);
+            },
         }
+        break :blk s;
+    };
+    try queueParamOverride(app, h, cname, p.value);
+    if (before_snap) |bs| {
+        const same = switch (bs.value_kind) {
+            0 => @as(f32, @bitCast(bs.value_bits)) == p.value,
+            1 => @as(f32, @floatFromInt(bs.value_bits)) == p.value,
+            else => false,
+        };
+        if (!same) notePatchUndo(app, .{ .param = bs });
     }
     return "ok";
 }
 
 fn canonicalizeSetParam(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    var it = std.mem.tokenizeAny(u8, args, " \t");
-    _ = it.next() orelse return error.Empty;
-    _ = it.next() orelse return error.Empty;
-    if (it.next() == null) {
-        // transport: `<name> <value>`（NodeId なし）
-        const nf = try gen_actions.parseNameF32(args);
-        return std.fmt.bufPrint(scratch, "{s} {d}", .{ nf.name, nf.value }) catch return error.ArgsTooLong;
-    }
+    // TASK-160.3: NodeId 形式のみ（2 トークン Transport alias は拒否）。
     const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
     const p = try actions.parseParamOverride(args);
     const id = try nodeRefToId(app, p.ref, forbid);
@@ -5940,6 +5783,8 @@ fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     if (!loaded.apply_params_pattern) return error.UnsupportedFormat;
     // pattern-only: seed 無しのため即時適用（quantize_bar=false）。
     applyParamsPattern(app, loaded.params, loaded.pattern, false);
+    // NPRM が無いので SPRM 旧 transport field を graph へ one-shot 反映。
+    publishDeprecatedGraphFromParams(app.patch, app.params);
     return "ok";
 }
 
@@ -6261,6 +6106,7 @@ fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     // live.base_seed は digest と同じ best-effort torn read（新規同期を足さない）。
     offline.resetWithSeed(live.base_seed);
     publishControls(offline, app.params);
+    publishDeprecatedGraphFromParams(offline, app.params);
     // snapshot pattern を offline に載せ、rev をずらして必ず apply させる。
     var cmd = stateToCommand(live.snapshotState());
     cmd.rev = offline.applied_rev +% 1;

@@ -287,6 +287,34 @@ pub const GRID_SIDE_PAD: f32 = 10; // 左右マージン（左右ポート dot �
 pub const GRID_TOP_PAD: f32 = 4; // タイトル下からグリッド先頭までの余白
 pub const GRID_CELL_H: f32 = 8; // セル高
 pub const GRID_ROW_GAP: f32 = 2; // 行間
+/// マクロ箱タイトル帯の evolve/lock トグル（step grid と非衝突。TASK-160.2）。
+pub const MACRO_MUT_TOGGLE_W: f32 = 12;
+pub const MACRO_MUT_TOGGLE_H: f32 = 10;
+pub const MACRO_MUT_TOGGLE_GAP: f32 = 4;
+
+pub const MacroToggleRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
+/// box-local: evolve トグル矩形（タイトル帯左端。collapse [±] と非衝突）。
+pub fn macroEvolveToggleRect() MacroToggleRect {
+    return .{
+        .x = GRID_SIDE_PAD,
+        .y = (TITLE_H - MACRO_MUT_TOGGLE_H) * 0.5,
+        .w = MACRO_MUT_TOGGLE_W,
+        .h = MACRO_MUT_TOGGLE_H,
+    };
+}
+
+/// box-local: lane 番目の lock トグル（evolve の右に横並び）。
+pub fn macroLockToggleRect(lane: u8) MacroToggleRect {
+    const e = macroEvolveToggleRect();
+    const x = e.x + e.w + MACRO_MUT_TOGGLE_GAP + @as(f32, @floatFromInt(lane)) * (MACRO_MUT_TOGGLE_W + MACRO_MUT_TOGGLE_GAP);
+    return .{ .x = x, .y = e.y, .w = MACRO_MUT_TOGGLE_W, .h = MACRO_MUT_TOGGLE_H };
+}
+
+/// トグル帯が step grid 原点より上にあること（衝突しない）を保証する判定。
+pub fn macroToggleAboveGrid(r: MacroToggleRect) bool {
+    return r.y + r.h <= TITLE_H + GRID_TOP_PAD - 0.5;
+}
 
 /// stepgrid へ渡す前の box-local / screen grid 幾何。gui を import しない canvas 側でも、描画と
 /// hit-test が同じ定数を使う adapter の入力を単一化する。

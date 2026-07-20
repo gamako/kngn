@@ -123,7 +123,7 @@ pub const SeedSnap = struct {
 };
 
 pub const ParamValueSnap = struct {
-    /// 0 = transport (name only), 1 = node override
+    /// 0 = legacy transport alias（TASK-160.3 で廃止・undo 復元は no-op）、1 = node override
     mode: u8 = 0,
     node_id: u64 = 0,
     name_buf: [MAX_UNDO_NAME]u8 = undefined,

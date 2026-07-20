@@ -30,17 +30,21 @@ const MockPatch = struct {
             return write(buf, "ok");
         }
         if (std.mem.eql(u8, name, "set_param")) {
-            // "<name> <value>" — Transport alias のみ（tempo）。
+            // TASK-160.3: "#<id> <name> <value>" のみ（旧 Transport alias 2 トークンは拒否）。
             var it = std.mem.tokenizeAny(u8, args, " \t");
+            const id_tok = it.next() orelse return error.Empty;
             const pname = it.next() orelse return error.Empty;
             const pval_s = it.next() orelse return error.Empty;
+            if (it.next() != null) return error.TooManyTokens;
+            if (id_tok.len < 2 or id_tok[0] != '#') return error.InvalidNumber;
+            _ = try std.fmt.parseUnsigned(u64, id_tok[1..], 10);
             const pval = try std.fmt.parseFloat(f32, pval_s);
-            if (!std.mem.eql(u8, pname, "tempo")) return error.UnknownParam;
+            if (!std.mem.eql(u8, pname, "bpm")) return error.UnknownParam;
             const before = self.tempo;
             self.tempo = pval;
             if (before != pval) {
-                var snap = undo.ParamValueSnap{ .mode = 0 };
-                snap.setName("tempo");
+                var snap = undo.ParamValueSnap{ .mode = 1, .node_id = 1 };
+                snap.setName("bpm");
                 snap.value_kind = 0;
                 snap.value_bits = @bitCast(before);
                 const ref = self.store.push(.{ .param = snap });
@@ -106,7 +110,7 @@ const MockPatch = struct {
         switch (entry.payload) {
             .pattern => |s| self.pattern = s,
             .param => |s| {
-                if (std.mem.eql(u8, s.name(), "tempo")) {
+                if (std.mem.eql(u8, s.name(), "bpm")) {
                     self.tempo = @bitCast(s.value_bits);
                 }
             },
@@ -184,7 +188,7 @@ test "pattern toggle_step undo redo restores snap" {
     try testing.expectEqual(@as(u16, 1), app.pattern.kick_on);
 }
 
-test "transport set_param tempo undo redo restores value" {
+test "set_param #id bpm undo redo restores value" {
     var app: MockPatch = .{};
     var log: command.CommandLog = .{};
     var exec: command.Executor = undefined;
@@ -192,7 +196,7 @@ test "transport set_param tempo undo redo restores value" {
 
     var buf: [64]u8 = undefined;
     app.tempo = 122.0;
-    _ = try exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user }, &buf);
+    _ = try exec.executeAction("set_param", "#1 bpm 140", .{ .actor = .local_user }, &buf);
     try testing.expectEqual(@as(f32, 140.0), app.tempo);
     try testing.expect(log.latest().?.undoable);
 
@@ -201,6 +205,16 @@ test "transport set_param tempo undo redo restores value" {
 
     _ = try exec.redoOne(.local_user, &buf);
     try testing.expectEqual(@as(f32, 140.0), app.tempo);
+}
+
+test "set_param rejects legacy 2-token transport alias" {
+    var app: MockPatch = .{};
+    var log: command.CommandLog = .{};
+    var exec: command.Executor = undefined;
+    wireExec(&app, &log, &exec);
+
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.Empty, exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user }, &buf));
 }
 
 test "set_mute undo redo restores mute flag" {
@@ -230,7 +244,7 @@ test "same-value set_param is not undoable" {
 
     var buf: [64]u8 = undefined;
     app.tempo = 122.0;
-    _ = try exec.executeAction("set_param", "tempo 122", .{ .actor = .local_user }, &buf);
+    _ = try exec.executeAction("set_param", "#1 bpm 122", .{ .actor = .local_user }, &buf);
     try testing.expect(!log.latest().?.undoable);
 }
 
@@ -242,7 +256,7 @@ test "non-undoable camera action does not block prior undo" {
 
     var buf: [64]u8 = undefined;
     app.tempo = 122.0;
-    _ = try exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user }, &buf);
+    _ = try exec.executeAction("set_param", "#1 bpm 140", .{ .actor = .local_user }, &buf);
     _ = try exec.executeAction("camera_pan", "", .{ .actor = .local_user }, &buf);
     try testing.expect(!log.latest().?.undoable);
 
@@ -302,7 +316,7 @@ test "undo marks normal record reverted and appends revert kind" {
     wireExec(&app, &log, &exec);
 
     var buf: [64]u8 = undefined;
-    _ = try exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user }, &buf);
+    _ = try exec.executeAction("set_param", "#1 bpm 140", .{ .actor = .local_user }, &buf);
     const edit_seq = log.latest().?.seq;
     _ = try exec.undoOne(.local_user, &buf);
 
@@ -322,7 +336,7 @@ test "redo appends normal record with redo_of" {
     wireExec(&app, &log, &exec);
 
     var buf: [64]u8 = undefined;
-    _ = try exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user }, &buf);
+    _ = try exec.executeAction("set_param", "#1 bpm 140", .{ .actor = .local_user }, &buf);
     const edit_seq = log.latest().?.seq;
     _ = try exec.undoOne(.local_user, &buf);
     _ = try exec.redoOne(.local_user, &buf);
@@ -342,10 +356,10 @@ test "history row class mapping" {
 }
 
 test "pending param before is not consumed by mismatched param name" {
-    // pending に param A (tempo) の before を積んだ状態で param B (cutoff) が来ても消費されない。
+    // pending に param A (bpm) の before を積んだ状態で param B (cutoff) が来ても消費されない。
     var slot: PendingParamUndo = .{};
-    var before_a = undo.ParamValueSnap{ .mode = 0 };
-    before_a.setName("tempo");
+    var before_a = undo.ParamValueSnap{ .mode = 1, .node_id = 1 };
+    before_a.setName("bpm");
     before_a.value_kind = 0;
     before_a.value_bits = @bitCast(@as(f32, 122.0));
     slot.pending = before_a;
@@ -353,13 +367,13 @@ test "pending param before is not consumed by mismatched param name" {
     const taken_b = slot.takeIfNameMatches("cutoff");
     try testing.expect(taken_b == null);
     try testing.expect(slot.pending != null);
-    try testing.expectEqualStrings("tempo", slot.pending.?.name());
+    try testing.expectEqualStrings("bpm", slot.pending.?.name());
     try testing.expectEqual(@as(f32, 122.0), @as(f32, @bitCast(slot.pending.?.value_bits)));
 
-    const taken_a = slot.takeIfNameMatches("tempo");
+    const taken_a = slot.takeIfNameMatches("bpm");
     try testing.expect(taken_a != null);
     try testing.expect(slot.pending == null);
-    try testing.expectEqualStrings("tempo", taken_a.?.name());
+    try testing.expectEqualStrings("bpm", taken_a.?.name());
     try testing.expectEqual(@as(f32, 122.0), @as(f32, @bitCast(taken_a.?.value_bits)));
 }
 
@@ -383,7 +397,7 @@ test "non-harness routeUiAction path: Executor executeAction without registry" {
 
     // set_param
     app.tempo = 122.0;
-    _ = try exec.executeAction("set_param", "tempo 140", .{ .actor = .local_user, .record_policy = .record }, &buf);
+    _ = try exec.executeAction("set_param", "#1 bpm 140", .{ .actor = .local_user, .record_policy = .record }, &buf);
     try testing.expectEqual(@as(f32, 140.0), app.tempo);
     try testing.expectEqualStrings("set_param", log.latest().?.name());
     try testing.expect(log.latest().?.undoable);

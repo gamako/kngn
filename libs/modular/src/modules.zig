@@ -210,6 +210,12 @@ pub const Vcf = struct {
 // ----------------------------------------------------------------------------
 pub const Mixer = struct {
     gain: f32 = 1.0,
+    /// per-input 倍率（0..2。default 1 = 素通し）。RT は plain field を読むだけ。
+    input_gain: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
+    /// per-input mute。true ならその入力を 0 として加算。
+    input_mute: [4]bool = .{ false, false, false, false },
+    /// 表示専用ラベル（descriptor canonical name には使わない。NPRM 非保存）。
+    input_labels: [4][]const u8 = .{ "in0", "in1", "in2", "in3" },
 
     const in_kinds = [_]PortKind{ .audio, .audio, .audio, .audio };
     const out_kinds = [_]PortKind{.audio};
@@ -222,7 +228,11 @@ pub const Mixer = struct {
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Mixer = @ptrCast(@alignCast(ctx));
         var sum: f32 = 0;
-        for (io.inputs) |x| sum += x; // 未接続入力は 0
+        // 未接続入力は 0。mute → 0、それ以外は input * input_gain。alloc/lock/atomic/panic/超越なし。
+        for (io.inputs, 0..) |x, i| {
+            if (self.input_mute[i]) continue;
+            sum += x * self.input_gain[i];
+        }
         io.outputs[0] = sum * self.gain;
     }
 };
@@ -460,6 +470,8 @@ pub const Quantizer = struct {
 // ----------------------------------------------------------------------------
 pub const StepSeq = struct {
     pub const Kind = enum { drum, bass };
+    /// §4.7 track-kind（port 構成の Kind とは別。runtime metadata・descriptor 非公開）。
+    pub const MutationKind = enum { kick, hat, clap, bass };
     pub const STEPS: u8 = 16;
 
     kind: Kind = .drum,
@@ -472,6 +484,15 @@ pub const StepSeq = struct {
     root_semitone: i32 = 0,
     octaves: u8 = 2,
     glide_rate: f32 = 6.0, // slide 中の pitch_cv 変化速度（oct/秒）
+    /// 自己進化 on/off（descriptor。lofi wire は true をセットして現行既定を維持）。
+    evolve: bool = false,
+    /// トラック単位の凍結（descriptor）。
+    lock: bool = false,
+    /// 正規化密度ターゲット 0..1（descriptor）。band へ写像して bar 境界で 1 bit 収束。
+    density: f32 = 0.25,
+    /// runtime metadata（descriptor 非公開）。
+    mutation_kind: MutationKind = .kick,
+    density_band: [2]u32 = .{ 0, 16 },
 
     // runtime
     step: u8 = 0,
@@ -500,6 +521,158 @@ pub const StepSeq = struct {
 
     inline fn bitSet(mask: u16, s: u8) bool {
         return (mask >> @as(u4, @intCast(s & 15))) & 1 == 1;
+    }
+
+    inline fn bitOf(s: u8) u16 {
+        return @as(u16, 1) << @as(u4, @intCast(s & 15));
+    }
+
+    /// density を band 内 target count へ写像（event-rate）。
+    pub fn targetCount(self: *const StepSeq) u32 {
+        const band = self.density_band;
+        const dens = if (std.math.isFinite(self.density)) std.math.clamp(self.density, 0.0, 1.0) else 0.25;
+        if (band[1] <= band[0]) return band[0];
+        const span: f32 = @floatFromInt(band[1] - band[0]);
+        return @intFromFloat(@round(@as(f32, @floatFromInt(band[0])) + dens * span));
+    }
+
+    /// 初期 mask から density を逆算（即時変化を避ける）。band_max==band_min は 0。
+    pub fn densityFromMask(mask: u16, band: [2]u32) f32 {
+        if (band[1] <= band[0]) return 0.0;
+        const count: u32 = @popCount(mask);
+        const clamped = std.math.clamp(count, band[0], band[1]);
+        const span: f32 = @floatFromInt(band[1] - band[0]);
+        return @as(f32, @floatFromInt(clamped - band[0])) / span;
+    }
+
+    fn mutRand01(noise: *dsp.Noise) f32 {
+        return (noise.next() + 1.0) * 0.5;
+    }
+
+    fn mutRandStep(noise: *dsp.Noise) u8 {
+        const v: u8 = @intFromFloat(mutRand01(noise) * 16.0);
+        return @min(v, 15);
+    }
+
+    fn mutRandomOnStep(noise: *dsp.Noise, mask: u16, fallback: u8) u8 {
+        const count: u32 = @popCount(mask);
+        if (count == 0) return fallback;
+        var k: u32 = @intFromFloat(mutRand01(noise) * @as(f32, @floatFromInt(count)));
+        if (k >= count) k = count - 1;
+        var s: u8 = 0;
+        while (s < 16) : (s += 1) {
+            if (mask & bitOf(s) != 0) {
+                if (k == 0) return s;
+                k -= 1;
+            }
+        }
+        return fallback;
+    }
+
+    /// drum lane: 1 cell トグル。密度バンドを外れる方向はスキップ、max 超過時は move。
+    /// ホットパス: bar 境界（event-rate）のみ。RT process は不変。noise は共有 mut_noise。
+    pub fn mutateDrum(self: *StepSeq, noise: *dsp.Noise) void {
+        const band = self.density_band;
+        const s = mutRandStep(noise);
+        const b = bitOf(s);
+        const count: u32 = @popCount(self.on_mask);
+        if (self.on_mask & b != 0) {
+            if (count > band[0]) self.on_mask &= ~b;
+        } else if (count < band[1]) {
+            self.on_mask |= b;
+        } else {
+            const off = mutRandomOnStep(noise, self.on_mask, s);
+            self.on_mask &= ~bitOf(off);
+            self.on_mask |= b;
+        }
+    }
+
+    /// bass lane: 1 パラメータ（on/off・pitch±1・accent・slide）を変異。
+    pub fn mutateBass(self: *StepSeq, noise: *dsp.Noise) void {
+        const band = self.density_band;
+        const s = mutRandStep(noise);
+        const b = bitOf(s);
+        const action = mutRand01(noise);
+        if (action < 0.4) {
+            const count: u32 = @popCount(self.on_mask);
+            if (self.on_mask & b != 0) {
+                if (count > band[0]) self.on_mask &= ~b;
+            } else if (count < band[1]) {
+                self.on_mask |= b;
+            }
+        } else if (action < 0.7) {
+            const total: i32 = @intCast(scaleDegreeCount(self.scale, self.octaves));
+            var d: i32 = self.pitch_deg[s];
+            d += if (mutRand01(noise) < 0.5) @as(i32, 1) else -1;
+            self.pitch_deg[s] = @intCast(std.math.clamp(d, 0, total - 1));
+        } else if (action < 0.85) {
+            self.accent_mask ^= b;
+        } else {
+            self.slide_mask ^= b;
+        }
+    }
+
+    /// on-mask の 1 bit を anchor へ寄せる。density バンドを割るならスキップ。
+    pub fn recoverOn(self: *StepSeq, src: u16, step_bit: u16) void {
+        const band = self.density_band;
+        const want_on = src & step_bit != 0;
+        const is_on = self.on_mask & step_bit != 0;
+        if (want_on == is_on) return;
+        const count: u32 = @popCount(self.on_mask);
+        if (want_on) {
+            if (count < band[1]) self.on_mask |= step_bit;
+        } else {
+            if (count > band[0]) self.on_mask &= ~step_bit;
+        }
+    }
+
+    pub fn copyBit(dst: *u16, src: u16, b: u16) void {
+        if (src & b != 0) dst.* |= b else dst.* &= ~b;
+    }
+
+    /// bar 境界で density 目標へ 1 bit 収束（lock / evolve=off 時 no-op）。
+    /// ホットパス: event-rate のみ。alloc/lock/IO/panic/超越関数なし。
+    pub fn applyDensityStep(self: *StepSeq, bar: u64, base_seed: u64) void {
+        if (self.lock or !self.evolve) return;
+        const band = self.density_band;
+        const target: i32 = @intCast(self.targetCount());
+        const count: i32 = @intCast(@popCount(self.on_mask));
+        if (count == target) return;
+        const lane: u64 = @intFromEnum(self.mutation_kind);
+        const seed = densitySplitmix64(base_seed ^ 0xD3A5_17E0 ^ (bar *% 0x9E3779B97F4A7C15) ^ lane);
+        _ = densityMove(&self.on_mask, count < target, band, seed);
+    }
+
+    fn densitySplitmix64(x: u64) u64 {
+        var z = x +% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+
+    fn densityMove(mask: *u16, want_on: bool, band: [2]u32, seed: u64) bool {
+        const count: u32 = @popCount(mask.*);
+        if (want_on) {
+            if (count >= band[1]) return false;
+            const bit = selectBit(mask.*, false, seed);
+            mask.* |= bit;
+            return true;
+        }
+        if (count <= band[0]) return false;
+        const bit = selectBit(mask.*, true, seed);
+        mask.* &= ~bit;
+        return true;
+    }
+
+    fn selectBit(mask: u16, want_on: bool, seed: u64) u16 {
+        const start: u8 = @truncate(seed & 15);
+        var offset: u8 = 0;
+        while (offset < 16) : (offset += 1) {
+            const step: u8 = (start +% offset) & 15;
+            const bit = bitOf(step);
+            if ((mask & bit != 0) == want_on) return bit;
+        }
+        return 0;
     }
 
     // --- pattern mask / playhead step の atomic アクセサ（TASK-40.7.2）---
@@ -1640,6 +1813,43 @@ test "Mixer: sums inputs and applies gain" {
     try testing.expectApproxEqAbs(@as(f32, 3.0), out[0], 1e-6); // (1+2+3+0)*0.5
 }
 
+test "Mixer applies per-input gain individually" {
+    var mix = Mixer{
+        .gain = 1.0,
+        .input_gain = .{ 0.5, 2.0, 1.0, 0.0 },
+    };
+    var out: [1]f32 = undefined;
+    drive(&Mixer.vtable, &mix, &.{ 2.0, 3.0, 4.0, 10.0 }, &.{ true, true, true, true }, &out, 48000);
+    // 2*0.5 + 3*2.0 + 4*1.0 + 10*0.0 = 1+6+4+0 = 11
+    try testing.expectApproxEqAbs(@as(f32, 11.0), out[0], 1e-6);
+}
+
+test "Mixer: muted input alone becomes silent" {
+    var mix = Mixer{
+        .gain = 1.0,
+        .input_mute = .{ true, false, false, false },
+    };
+    var out: [1]f32 = undefined;
+    drive(&Mixer.vtable, &mix, &.{ 1.0, 0.0, 0.0, 0.0 }, &.{ true, true, true, true }, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
+
+    mix.input_mute = .{ false, true, false, false };
+    drive(&Mixer.vtable, &mix, &.{ 0.0, 2.0, 0.0, 0.0 }, &.{ true, true, true, true }, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
+
+    mix.input_mute = .{ false, false, false, false };
+    drive(&Mixer.vtable, &mix, &.{ 1.0, 2.0, 0.0, 0.0 }, &.{ true, true, true, true }, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), out[0], 1e-6);
+}
+
+test "Mixer: unconnected input stays 0" {
+    var mix = Mixer{ .gain = 1.0, .input_gain = .{ 2.0, 2.0, 2.0, 2.0 } };
+    var out: [1]f32 = undefined;
+    // グラフは未接続入力を 0 で渡す（connected フラグは Mixer が読まない）
+    drive(&Mixer.vtable, &mix, &.{ 1.0, 0.0, 0.0, 0.0 }, &.{ true, false, false, false }, &out, 48000);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-6); // 1*2 + 0 + 0 + 0
+}
+
 test "Output: center pan splits equal, soft clip bounds to <1" {
     var o = Output{ .gain = 1.0, .pan = 0.0, .soft_clip = false };
     var out: [2]f32 = undefined;
@@ -2284,6 +2494,72 @@ test "StepSeq: toggling on_mask via atomic store changes which step fires (GUI�
     // step 0,1 を空回し
     while (seq.loadStep() != 2) _ = stepClock(&seq, &out);
     try testing.expect(stepClock(&seq, &out) > 0.5); // step 2 が now on
+}
+
+test "StepSeq: density maps to target count in band" {
+    var seq = StepSeq{ .kind = .drum, .density_band = .{ 2, 8 }, .density = 0.0 };
+    try testing.expectEqual(@as(u32, 2), seq.targetCount());
+    seq.density = 1.0;
+    try testing.expectEqual(@as(u32, 8), seq.targetCount());
+    seq.density = 0.5;
+    try testing.expectEqual(@as(u32, 5), seq.targetCount());
+    // band_max == band_min
+    seq.density_band = .{ 4, 4 };
+    try testing.expectEqual(@as(u32, 4), seq.targetCount());
+    try testing.expectApproxEqAbs(@as(f32, 0.0), StepSeq.densityFromMask(0x1111, .{ 4, 4 }), 1e-6);
+    // 0x1111 popcount=4, band {3,5} → (4-3)/(5-3)=0.5
+    try testing.expectApproxEqAbs(@as(f32, 0.5), StepSeq.densityFromMask(0x1111, .{ 3, 5 }), 1e-6);
+}
+
+test "StepSeq: drum/bass mutation is deterministic for shared noise seed" {
+    var noise_a = dsp.Noise{ .state = 0x4D555431 };
+    var noise_b = dsp.Noise{ .state = 0x4D555431 };
+    var a = StepSeq{ .kind = .drum, .on_mask = 0x1111, .density_band = .{ 3, 5 }, .mutation_kind = .kick };
+    var b = StepSeq{ .kind = .drum, .on_mask = 0x1111, .density_band = .{ 3, 5 }, .mutation_kind = .kick };
+    var i: u32 = 0;
+    while (i < 32) : (i += 1) {
+        a.mutateDrum(&noise_a);
+        b.mutateDrum(&noise_b);
+        try testing.expectEqual(a.on_mask, b.on_mask);
+        try testing.expectEqual(noise_a.state, noise_b.state);
+    }
+    var bn_a = dsp.Noise{ .state = 0xBA55FEED };
+    var bn_b = dsp.Noise{ .state = 0xBA55FEED };
+    var ba = StepSeq{ .kind = .bass, .on_mask = 0x4949, .density_band = .{ 2, 8 }, .mutation_kind = .bass, .octaves = 2 };
+    var bb = StepSeq{ .kind = .bass, .on_mask = 0x4949, .density_band = .{ 2, 8 }, .mutation_kind = .bass, .octaves = 2 };
+    i = 0;
+    while (i < 32) : (i += 1) {
+        ba.mutateBass(&bn_a);
+        bb.mutateBass(&bn_b);
+        try testing.expectEqual(ba.on_mask, bb.on_mask);
+        try testing.expectEqual(ba.accent_mask, bb.accent_mask);
+        try testing.expectEqual(ba.slide_mask, bb.slide_mask);
+        try testing.expectEqualSlices(i8, &ba.pitch_deg, &bb.pitch_deg);
+    }
+}
+
+test "StepSeq: applyDensityStep converges one bit toward density; lock/evolve gate" {
+    var seq = StepSeq{
+        .kind = .drum,
+        .on_mask = 0x0001, // 1 bit
+        .density = 1.0,
+        .density_band = .{ 1, 4 },
+        .mutation_kind = .clap,
+        .evolve = true,
+    };
+    const before = @popCount(seq.on_mask);
+    seq.applyDensityStep(3, 0);
+    try testing.expectEqual(before + 1, @popCount(seq.on_mask));
+
+    seq.lock = true;
+    const locked_mask = seq.on_mask;
+    seq.applyDensityStep(4, 0);
+    try testing.expectEqual(locked_mask, seq.on_mask);
+
+    seq.lock = false;
+    seq.evolve = false;
+    seq.applyDensityStep(5, 0);
+    try testing.expectEqual(locked_mask, seq.on_mask);
 }
 
 test "Lfo: deterministic, bounded, advances by rate" {

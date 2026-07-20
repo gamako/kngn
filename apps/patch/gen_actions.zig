@@ -39,9 +39,9 @@ fn expectExhausted(it: *std.mem.TokenIterator(u8, .any)) ParseError!void {
 
 pub const NameF32 = struct { name: []const u8, value: f32 };
 
-/// "<name> <value>" の2トークン（`set_param` 汎用 f32 setter 用）。
-/// NaN/Inf は `error.NonFinite` で拒否する（fail-fast。非有限値を Controls(atomic) 経由で RT へ
-/// 渡すのを入口で止める。synth の parseNameF32 と対称）。
+/// "<name> <value>" の2トークン（汎用 f32 setter。mute/lock 等の兄弟パーサと同型）。
+/// TASK-160.3: `set_param` 本体は NodeId 3 トークンのみ受け付ける。本関数は他 action / テスト用。
+/// NaN/Inf は `error.NonFinite` で拒否する（fail-fast）。
 pub fn parseNameF32(args: []const u8) ParseError!NameF32 {
     var it = tokenize(args);
     const name = it.next() orelse return error.Empty;

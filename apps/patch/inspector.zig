@@ -63,6 +63,32 @@ fn labelWithUnit(buf: []u8, name: []const u8, unit: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s} ({s})", .{ name, unit }) catch name;
 }
 
+/// Mixer の `inX_gain` / `inX_mute` を `input_labels[X]` 付き表示名へ。frame-local buf、alloc なし。
+/// canonical 名以外・非 Mixer は null（呼び出し側が descriptor name を使う）。
+fn mixerParamDisplayName(buf: []u8, mixer: *const modular.Mixer, name: []const u8) ?[]const u8 {
+    // "in0_gain" / "in0_mute"（長さ 8）
+    if (name.len != 8) return null;
+    if (name[0] != 'i' or name[1] != 'n') return null;
+    if (name[2] < '0' or name[2] > '3') return null;
+    const slot: usize = @intCast(name[2] - '0');
+    const label = mixer.input_labels[slot];
+    if (std.mem.eql(u8, name[3..], "_gain")) {
+        return std.fmt.bufPrint(buf, "{s} gain", .{label}) catch null;
+    }
+    if (std.mem.eql(u8, name[3..], "_mute")) {
+        return std.fmt.bufPrint(buf, "{s} mute", .{label}) catch null;
+    }
+    return null;
+}
+
+/// descriptor canonical name → Inspector 表示名。set_param/NPRM は常に canonical。
+fn paramDisplayName(buf: []u8, graph: *const modular.DynGraph, kind: modular.ModuleKind, h: modular.dyn.Handle, name: []const u8) []const u8 {
+    if (kind == .mixer) {
+        if (mixerParamDisplayName(buf, graph.ptrOfConst(.mixer, h), name)) |display| return display;
+    }
+    return name;
+}
+
 /// BitmapFont のコードポイント境界を保ったまま、指定 pixel 幅に収める。
 fn truncateLabel(label: []const u8, max_w: i32, font: gui.Font) []const u8 {
     if (max_w <= 0) return "";
@@ -128,8 +154,10 @@ fn drawParams(
                     .choice => continue,
                 };
                 var current = raw;
+                var name_buf: [64]u8 = undefined;
+                const display_name = paramDisplayName(&name_buf, graph, kind, h, desc.name);
                 var label_buf: [96]u8 = undefined;
-                const label = labelWithUnit(&label_buf, desc.name, s.unit);
+                const label = labelWithUnit(&label_buf, display_name, s.unit);
                 const row = canvas.inspectorParamRowLayout(avail, @intCast(ctx.font.measure(label)));
                 const visible_label = paramLabel(ctx, label, avail);
                 var value_buf: [32]u8 = undefined;
@@ -148,13 +176,15 @@ fn drawParams(
                     .scalar => continue,
                 };
                 const current: usize = @min(raw, c.options.len -| 1);
+                var name_buf: [64]u8 = undefined;
+                const display_name = paramDisplayName(&name_buf, graph, kind, h, desc.name);
                 // パラメータ名ラベル + option ごとの radio（.fixed 幅の column 内）。
                 ctx.beginBox(.{
                     .direction = .column,
                     .width = .{ .fixed = @max(1, avail) },
                     .gap = 3,
                 });
-                ctx.labelEx(desc.name, SUBTLE);
+                ctx.labelEx(display_name, SUBTLE);
                 ctx.beginBox(.{
                     .direction = .column,
                     .width = .{ .fixed = @max(1, avail) },
