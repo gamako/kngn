@@ -510,9 +510,14 @@ fn keptElsewhere(slots: []const ?Handle, h: Handle) bool {
 /// TASK-170: 安定版 tap 対象選択。`prev`（前回の各 slot の display handle。空きは null）のうち
 /// 今フレームも `isTapCandidate` を満たすものは**同じ slot 番号のまま**維持し、無関係な hover/selected
 /// の変化で巻き添えリセットしない（TASK-170 の実機フィードバックで発覚した回帰の根治）。
-/// 空いた slot だけ selected > hover > nodes 走査順の優先度で新規候補を割り当てる。候補が余っていて
-/// 空き slot が無い場合は、温存 slot のうち selected でも hover でもないものを 1 つずつ解放して
-/// 割り当てる（未割当候補が尽きるか、置換可能な slot が尽きるまで繰り返す）。
+///
+/// **置換できるのは selected/hover のみ**（v2 修正。codex レビューで検出: 通常候補〈走査順のみで
+/// 選ばれる優先度の低い候補〉にも置換権を与えると、候補数が cap を超える環境で「今フレーム A・B が
+/// 通常候補 C・D に置換され、次フレームは C・D が A・B に置換され…」というフレーム間の永久
+/// ローテーションが起き、tap config の republish/RT リング reset が毎フレーム走ってしまう）。
+/// 空いた slot は selected > hover > nodes 走査順の優先度で新規候補を割り当てるが、**空き slot が無い
+/// 場合に既存の温存 slot を明け渡させて良いのは selected/hover だけ**（selected でも hover でもない
+/// 通常候補は、空きが無ければそのフレームでは表示されず脱落する＝安定第一）。
 /// `prev`/`out` は同じ長さ（呼び出し側の TAP_SLOTS 相当）。`out` は `prev` と別バッファでも同一でも良い。
 pub fn selectTapPortsStable(
     cam: Camera,
@@ -542,55 +547,63 @@ pub fn selectTapPortsStable(
         }
     }
 
-    // 2. 優先順位付き候補リスト（既に温存された handle は除く。cap で切る）。
-    // canvas.zig は modular/dyn 非依存のため MAX_MODULES を import せず、呼び出し側の
-    // TAP_SLOTS(16) を十分に超える固定上限を使う（cap を超えて書き込まないことは下の assert で保証）。
+    // 2a. 優先候補（selected/hover のみ。既に温存された handle は除く）。最大2件。
     std.debug.assert(cap <= MAX_TAP_CANDIDATES);
-    var candidates: [MAX_TAP_CANDIDATES]Handle = undefined;
-    var ncand: usize = 0;
+    var priority: [2]Handle = undefined;
+    var nprio: usize = 0;
     if (selected) |sh| {
         if (findNode(nodes, sh)) |g| {
-            if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, sh) and ncand < cap) {
-                candidates[ncand] = sh;
-                ncand += 1;
+            if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, sh)) {
+                priority[nprio] = sh;
+                nprio += 1;
             }
         }
     }
     if (hover) |hh| {
         if (findNode(nodes, hh)) |g| {
             if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, hh) and
-                !containsHandle(candidates[0..ncand], hh) and ncand < cap)
+                !containsHandle(priority[0..nprio], hh))
             {
-                candidates[ncand] = hh;
-                ncand += 1;
+                priority[nprio] = hh;
+                nprio += 1;
             }
         }
     }
+
+    // 2b. 通常候補（nodes 走査順。優先候補・温存済み handle は除く。cap で切る）。
+    var plain: [MAX_TAP_CANDIDATES]Handle = undefined;
+    var nplain: usize = 0;
     for (nodes) |g| {
-        if (ncand >= cap) break;
+        if (nprio + nplain >= cap) break;
         if (isTapCandidate(cam, vw, vh, g) and !keptElsewhere(out, g.handle) and
-            !containsHandle(candidates[0..ncand], g.handle))
+            !containsHandle(priority[0..nprio], g.handle) and !containsHandle(plain[0..nplain], g.handle))
         {
-            candidates[ncand] = g.handle;
-            ncand += 1;
+            plain[nplain] = g.handle;
+            nplain += 1;
         }
     }
 
-    // 3. 空き slot への充填。`locked` は「この呼び出し内で新規に割り当てた slot」だけに立てる
-    // （step1 で温存された既存 slot は locked にしない＝引き続き満杯時置換の victim になれる。
-    // 例: 容量1で旧 hover を新 selected が置換するケースはこの経路を通る）。
+    // 3. 空き slot への充填（優先候補 → 通常候補の順）。`locked` は「この呼び出し内で新規に
+    // 割り当てた slot」だけに立てる（step1 で温存された既存 slot は locked にしない＝引き続き
+    // 満杯時置換〈優先候補のみ〉の victim になれる。容量1で旧 hover を新 selected が置換する
+    // ケースはこの経路を通る）。
     var locked: [MAX_TAP_CANDIDATES]bool = [_]bool{false} ** MAX_TAP_CANDIDATES;
-    var ci: usize = 0;
+    var pi: usize = 0; // priority index
+    var qi: usize = 0; // plain index
     for (out, 0..) |*o, idx| {
         if (o.* != null) continue; // step1 で温存済み（locked にはしない）
-        if (ci >= ncand) continue;
-        o.* = candidates[ci];
+        if (pi < nprio) {
+            o.* = priority[pi];
+            pi += 1;
+        } else if (qi < nplain) {
+            o.* = plain[qi];
+            qi += 1;
+        } else continue;
         locked[idx] = true; // 新規充填。直後の反復で同じ slot を再度置換しない
-        ci += 1;
     }
 
-    // 4. 満杯時の置換（未割当候補が尽きるか、置換可能な slot が尽きるまで繰り返す）。
-    while (ci < ncand) {
+    // 4. 満杯時の置換（**優先候補のみ**。未割当の通常候補は空きが無ければ脱落する＝安定第一）。
+    while (pi < nprio) {
         var victim: ?usize = null;
         for (out, 0..) |o, idx| {
             if (locked[idx]) continue;
@@ -601,9 +614,9 @@ pub fn selectTapPortsStable(
             break;
         }
         const v = victim orelse break; // 置換対象なし（cap が selected+hover で埋まっている等）
-        out[v] = candidates[ci];
+        out[v] = priority[pi];
         locked[v] = true; // 直後の反復で同じ slot を再度 victim にしない
-        ci += 1;
+        pi += 1;
     }
 }
 
@@ -1030,6 +1043,34 @@ test "canvas: selectTapPortsStable — 満杯時に selected と hover を両方
             try testing.expect(h != 1);
         }
     }
+}
+
+test "canvas: selectTapPortsStable — selected/hover 無しで通常候補が cap を超えても既存 slot を置換しない（フレーム間ローテーション回帰防止）" {
+    // v1 修正（同一 slot 二重上書き防止）だけでは、selected/hover が無い状態で候補数が cap を
+    // 超えると「今フレーム A・B → C・D、次フレーム C・D → A・B …」という永久ローテーションが
+    // 残っていた（codex 2回目レビューで検出）。通常候補（selected でも hover でもないもの）には
+    // 置換権を与えず、空き slot が無ければそのフレームでは脱落させることで、既存 slot は
+    // selected/hover が変化しない限り安定させる。
+    const nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 }, // A
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 }, // B
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 }, // C（通常候補。selected/hover ではない）
+        .{ .handle = 3, .pos = .{ .x = 700, .y = 60 }, .n_in = 1, .n_out = 1 }, // D（同上）
+    };
+    const cam = Camera{ .zoom = 1.0 };
+    var prev = [_]?Handle{ 0, 1 }; // 前回: slot0=A, slot1=B
+    var out: [2]?Handle = undefined;
+    // selected=null, hover=null。C・D は通常候補だが空き slot が無いので置換されない。
+    selectTapPortsStable(cam, 800, 400, &nodes, null, null, &prev, &out);
+    try testing.expectEqual(@as(?Handle, 0), out[0]);
+    try testing.expectEqual(@as(?Handle, 1), out[1]);
+
+    // 「次フレーム」を模して out をそのまま prev として再度呼んでも、結果は不変（ローテーションしない）。
+    var prev2 = out;
+    var out2: [2]?Handle = undefined;
+    selectTapPortsStable(cam, 800, 400, &nodes, null, null, &prev2, &out2);
+    try testing.expectEqual(@as(?Handle, 0), out2[0]);
+    try testing.expectEqual(@as(?Handle, 1), out2[1]);
 }
 
 test "canvas: selectTapPortsStable と resolveTapPort 相当（handle 変化と port ID 変化の分離）" {
