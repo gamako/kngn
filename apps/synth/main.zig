@@ -73,6 +73,8 @@ const App = struct {
     fxp: FxParams = .{},
     device: audio.AudioDevice,
     ctx: gui.Context,
+    /// GUI 用 system OutlineFont（TASK-138。未検出時は default_font）。
+    gui_font: kit.GuiFont = .{},
     spec: *Spec,
     osc: *Scope,
     meter: scope.LevelMeter = .{},
@@ -312,6 +314,11 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     };
     errdefer app.ctx.deinit();
 
+    // App 最終配置後に GuiFont を in-place load → ctx.font を再ポイント（TASK-138）。
+    app.gui_font.load(io, gpa);
+    errdefer app.gui_font.deinit();
+    app.ctx.font = app.gui_font.asFont();
+
     const device = audio.open(gpa, .{
         .sample_rate = 48000,
         .buffer_frames = 512,
@@ -348,6 +355,7 @@ fn appDeinit(self: *App) void {
     self.device.stop();
     self.device.close();
     self.ctx.deinit();
+    self.gui_font.deinit();
     self.gpa.destroy(self.osc);
     self.gpa.destroy(self.spec);
     self.gpa.destroy(self);

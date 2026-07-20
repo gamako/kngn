@@ -21,7 +21,6 @@ const app_runtime = kit.app_runtime;
 const appshell = kit.appshell;
 const core = @import("paint");
 const png = kit.png;
-const fontmod = kit.font; // system font ランタイム読込（TASK-82。examples/12・21 と同じ消費方式）
 const canvas_input = @import("canvas_input.zig");
 const actions = @import("actions.zig");
 const icons = @import("icons.zig");
@@ -503,9 +502,8 @@ const App = struct {
     doc: core.Document,
     /// アクティブフレームの Canvas（doc.activeCanvas()）。既存参照の churn 最小化のため *Canvas を保持。
     canvas: *core.Canvas = undefined,
-    /// system font（TASK-82）バイト列。所有は App（init で読込・deinit で解放）。
-    /// 見つからない/parse 失敗/wasm では `null` のままで、`text_render` 側が embedded ASCII へフォールバック。
-    system_font_bytes: ?[]u8 = null,
+    /// GUI / canvas 共有の system OutlineFont（TASK-138。所有は App。未検出時は default_font）。
+    gui_font: kit.GuiFont = .{},
     recorder: core.StrokeRecorder,
     /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
     preview_canvas: core.Canvas,
@@ -746,7 +744,7 @@ const App = struct {
             self.canvas.layers.items[self.canvas.selected_layer].kind == .text;
     }
 
-    /// `system_font_bytes`（TASK-82）を `doc.active_view` へ反映する。新しい Document
+    /// `gui_font.systemBytes()`（TASK-138 / 旧 TASK-82）を `doc.active_view` へ反映する。新しい Document
     /// インスタンス（`core.Document.init`/`document_io.loadDocument` が返す）は
     /// `active_view.system_font` が既定 `null` で始まるため、Document を新規作成/差し替えた直後は
     /// 必ず呼ぶ必要がある（`main()` 起動時 + `doOpenProject`）。`preview_canvas` は
@@ -755,7 +753,7 @@ const App = struct {
     /// 編集可能ビュー」は `doc.active_view` の1個のみになった（`resyncActiveView` は
     /// `system_font` を一切触らないため、ここで一度設定すれば保持され続ける。plan 4.2節）。
     fn applySystemFont(self: *App) void {
-        self.doc.active_view.system_font = self.system_font_bytes;
+        self.doc.active_view.system_font = self.gui_font.systemBytes();
     }
 
     /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
@@ -6451,9 +6449,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
 
     // fallible 資源は literal 前に段階化 + errdefer（変更前 main の ctx 先行 defer を復元し、
     // さらに doc/recorder/preview/palette/onion も同等以上の保証にする。literal は移動のみ）。
-    const system_font_bytes = fontmod.loadSystemTextFontBytes(io, gpa);
-    errdefer if (system_font_bytes) |b| gpa.free(b);
-
+    // GuiFont は自己参照ポインタのため literal 後に in-place load（TASK-138）。
     var ctx = gui.Context.init(gpa, gui.default_font);
     errdefer ctx.deinit();
 
@@ -6510,7 +6506,6 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .pen = .{ .color = 0 },
         .brush = .{ .color = 0 },
         .fill = .{ .color = 0 },
-        .system_font_bytes = system_font_bytes,
         .onion_buf = onion_buf,
         .onion_scratch = onion_scratch,
         .data_dir = data_dir,
@@ -6537,6 +6532,11 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .size_dialog = null,
     };
     errdefer self.preferences.deinit();
+
+    // App 最終配置後に GuiFont を in-place load → ctx.font を再ポイント（自己参照寿命）。
+    self.gui_font.load(io, gpa);
+    errdefer self.gui_font.deinit();
+    self.ctx.font = self.gui_font.asFont();
 
     _ = self.preferences.load(io, data_dir, "preferences.ash") catch |err| {
         std.log.err("pixie: preferences load failed: {s}", .{@errorName(err)});
@@ -6633,7 +6633,7 @@ fn appDeinit(self: *App) void {
     self.recorder.deinit(gpa);
     self.doc.deinit();
     self.ctx.deinit();
-    if (self.system_font_bytes) |b| gpa.free(b);
+    self.gui_font.deinit();
     gpa.destroy(self);
 }
 

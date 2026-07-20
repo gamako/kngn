@@ -2647,8 +2647,13 @@ pub fn main(init: std.process.Init) !void {
 
     var dl = gui.DrawList.init(allocator);
     defer dl.deinit();
+    // GuiFont は stack 最終配置。defer を gui_ctx より先に登録し、LIFO で ctx→font の順に解放（TASK-138）。
+    var gui_font: kit.GuiFont = .{};
+    defer gui_font.deinit();
     var gui_ctx = gui.Context.init(allocator, gui.default_font);
     defer gui_ctx.deinit();
+    gui_font.load(init.io, allocator);
+    gui_ctx.font = gui_font.asFont();
 
     // TASK-149.1/149.3: PanelHost registry — History=left, Transport=bottom, Inspector=right。
     var panels = [_]gui.Panel{
@@ -2840,7 +2845,7 @@ pub fn main(init: std.process.Init) !void {
             dl.reset(fb.width, fb.height);
             drawFrame(&app, &dl);
             const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-            gui.render(target, &dl, gui.default_font);
+            gui.render(target, &dl, gui_ctx.font);
 
             // menu → PanelHost content（VIS_H より上）→ VIS_H の描画順。
             const mtop_i: i32 = @intFromFloat(app.menuTopH());
@@ -2888,7 +2893,7 @@ pub fn main(init: std.process.Init) !void {
             app.captureParamRows(&gui_ctx);
             app.advanceParamEdits();
             app.drawGhostMarkers(&gui_ctx.draw_list);
-            gui.render(target, &gui_ctx.draw_list, gui.default_font);
+            gui.render(target, &gui_ctx.draw_list, gui_ctx.font);
             // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
             drawVizBand(&app, fb, spec, osc, &meter);
 

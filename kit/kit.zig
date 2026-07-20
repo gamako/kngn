@@ -30,6 +30,7 @@ pub const audio = @import("audio");
 pub const gui = @import("gui");
 pub const png = @import("png");
 pub const font = @import("font");
+pub const GuiFont = @import("gui_font.zig").GuiFont;
 pub const dsp = @import("dsp");
 pub const synth = @import("synth");
 pub const gamepad = @import("gamepad");
@@ -103,6 +104,12 @@ pub fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 // ============================================================================
 const std = @import("std");
 const testing = std.testing;
+
+// gui_font.zig の test ブロックを取り込む（pub const GuiFont = @import(...).GuiFont だけでは
+// Zig が sibling file の test を収集しない。libs/gui と同型の ref パターン）。
+test {
+    _ = @import("gui_font.zig");
+}
 
 test "toGuiEvent: mouse move/down/up/scroll の値と modifier" {
     const shift = platform.ModifierFlags{ .shift = true };
