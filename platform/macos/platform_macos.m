@@ -581,7 +581,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         displayBuffer = buffer1;
 
         // CGオブジェクトを初期化時に作成（再利用するため）
-        colorSpace = CGColorSpaceCreateDeviceRGB();
+        // EXPERIMENT: DeviceRGB は広色域ディスプレイで毎フレーム ColorSync 変換を誘発する
+        // （.physical で実測。sample プロファイルで vImage 色変換が支配的と判明）。
+        // 実際の画面の色空間に合わせて変換を回避できるか試す。
+        NSColorSpace *screenCS = [NSScreen mainScreen].colorSpace;
+        colorSpace = screenCS ? CGColorSpaceRetain(screenCS.CGColorSpace) : CGColorSpaceCreateDeviceRGB();
 
         // buffer0用のCGDataProviderを作成
         provider0 = CGDataProviderCreateWithData(
