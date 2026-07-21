@@ -496,7 +496,7 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
     self.meter.draw(fb.pixels, fb.width, fb.height, METER_X0, VIS_Y0, METER_W, VIS_H);
     drawSpecLabels(fb, self.spec);
     const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-    gui.render(target, &self.ctx.draw_list, self.ctx.font);
+    gui.render(target, &self.ctx.draw_list, self.ctx.font, 1.0);
 
     window.present();
     platform.frameDelay(16_000_000); // ~16ms（約 60fps）。wasm では rAF 律速なので実質 no-op 相当

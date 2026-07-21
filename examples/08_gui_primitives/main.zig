@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
         try draw_list.text(.{ .x = 10, .y = 296 }, "image blit:", gui.Color.rgba(0xAA, 0xAA, 0xAA, 0xFF));
         try draw_list.text(.{ .x = 10, .y = 308 }, "clip demo:", gui.Color.rgba(0xAA, 0xAA, 0xAA, 0xFF));
 
-        gui.render(target, &draw_list, gui.default_font);
+        gui.render(target, &draw_list, gui.default_font, 1.0);
 
         window.present();
     }

@@ -167,7 +167,7 @@ pub fn main() !void {
         } else if (app.host.confirmation() != .none) {
             try drawConfirmation(&draw_list, &app);
         }
-        gui.render(target, &draw_list, gui.default_font);
+        gui.render(target, &draw_list, gui.default_font, 1.0);
         window.present();
         platform.frameDelay(16_666_666);
     }

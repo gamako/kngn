@@ -2117,7 +2117,7 @@ test "colorSwatch: selected の太枠が pixel で判別できる（AC#4）" {
     var pixels: [100 * 30]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 100, .height = 30 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(1).?;
     const unsel = ctx.getNodeRect(2).?;
@@ -2149,7 +2149,7 @@ test "button: selected の太枠と accent 背景が pixel で判別できる（
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(ctx.id_stack.make("Pen")).?;
     const unsel = ctx.getNodeRect(ctx.id_stack.make("Eraser")).?;
@@ -2271,7 +2271,7 @@ test "iconButton: selected と non-selected の枠・背景が pixel で区別�
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(1).?;
     const unsel = ctx.getNodeRect(2).?;
@@ -2349,7 +2349,7 @@ test "iconButton: set bit は foreground、clear bit は背景のまま" {
     var pixels: [80 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 80, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const r = ctx.getNodeRect(1).?;
     const pad = ctx.style.button_padding;
@@ -2656,7 +2656,7 @@ test "collapsible: glyph の right/down が pixel で区別できる" {
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const ra = ctx.getNodeRect(1).?;
     const rb = ctx.getNodeRect(2).?;
@@ -3415,7 +3415,7 @@ test "checkbox: ON/OFF で glyph 内側中心のピクセルが変わる（AC）
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const on = ctx.getNodeRect(0xA1).?;
     const off = ctx.getNodeRect(0xA2).?;
@@ -3443,7 +3443,7 @@ test "toggle: ON/OFF で knob 位置と track 色が変わる（AC）" {
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const style = ctx.style;
     const side = @max(1, style.switch_h - 2 * ToggleGlyph.margin);
@@ -3480,7 +3480,7 @@ test "radio: selected の中心ドットが accent・非 selected は box 内部
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font);
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(0x4A01).?;
     const uns = ctx.getNodeRect(0x4A02).?;

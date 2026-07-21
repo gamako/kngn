@@ -4,13 +4,13 @@
 //   ctx.beginFrame(fb_w, fb_h);
 //   // pushEvent → widget（前フレーム rect で同期 hit-test）→ beginBox/label/endBox
 //   ctx.endFrame(); // layout 確定 + draw cmd 発行 + rect キャッシュ更新
-//   gui.render(target, &ctx.draw_list, ctx.font);
+//   gui.render(target, &ctx.draw_list, ctx.font, 1.0);
 //
 // DrawList 単体（レイアウトなし）の低レベル利用も可:
 //   var dl = gui.DrawList.init(gpa);
 //   dl.reset(fb_w, fb_h);
 //   try dl.rectFilled(...);
-//   gui.render(target, &dl, gui.default_font);
+//   gui.render(target, &dl, gui.default_font, 1.0);
 
 pub const Rect = @import("geom.zig").Rect;
 pub const Vec2 = @import("geom.zig").Vec2;

@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
         ui.buildUi(&app);
         ctx.endFrame();
         // no popup overlays for bench (closed state)
-        gui.render(target, &ctx.draw_list, ctx.font);
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
     }
 
     var samples: [ITERS]u64 = undefined;
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.beginFrame(W, H);
         ui.buildUi(&app);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font);
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         acc +%= pixels[i % pixels.len];

@@ -72,7 +72,7 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, pixels: []u32, rows: usize) !
         ctx.beginFrame(W, H);
         buildRows(&ctx, &labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font);
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
     }
 
     var samples: [ITERS]u64 = undefined;
@@ -83,7 +83,7 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, pixels: []u32, rows: usize) !
         ctx.beginFrame(W, H);
         buildRows(&ctx, &labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font);
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         // DCE guard: observe rendered pixels + draw list length

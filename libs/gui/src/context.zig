@@ -7,7 +7,7 @@
 //
 // ライフサイクル契約（21.2 案A「契約の番人」+ 21.4 layout）:
 //   beginFrame(w,h): arena.reset → input/id_stack/state.beginFrame → per_id_state.beginFrame
-//                    → draw_list.reset(w,h)
+//                    → draw_list.reset(w,h)  ※ w/h は論理サイズ（物理 fb ではない）
 //                    → layout ツリーの暗黙 root を arena 上に生成（当フレームは未 measure/place）
 //   widget 呼び出し: 前フレーム rect_cache で同期 hit-test（当フレーム構築中の layout rect は使わない）
 //   endFrame():      measure → place → rect_cache.clearRetainingCapacity → updateRectCache
@@ -243,6 +243,8 @@ pub const Context = struct {
         return self.arena.allocator();
     }
 
+    /// screen_w/screen_h は論理サイズ（DrawList root clip / layout root）。
+    /// 物理 framebuffer 寸法ではない。scale は gui.render(..., scale) で適用する。
     pub fn beginFrame(self: *Context, screen_w: u32, screen_h: u32) void {
         const frame_time = @as(f64, @floatFromInt(self.frame_index)) / 60.0;
         self.frame_index += 1;
@@ -250,6 +252,7 @@ pub const Context = struct {
     }
 
     /// 実時間または harness 仮想時刻を明示してフレームを開始する。
+    /// screen_w/screen_h は論理サイズ（beginFrame と同じ契約）。
     pub fn beginFrameAt(self: *Context, screen_w: u32, screen_h: u32, now_s: f64) void {
         self.beginFrameAtInternal(screen_w, screen_h, now_s);
     }
@@ -1031,6 +1034,20 @@ test "buttonBehavior: active 中は別 widget が hot を奪わない" {
     _ = buttonBehavior(&ctx, id_a, rect_a, full_clip);
     _ = buttonBehavior(&ctx, id_b, rect_b, full_clip);
     try std.testing.expectEqual(@as(Id, 0), ctx.state.next_hot_id);
+    ctx.endFrame();
+}
+
+test "Context.beginFrame: screen_w/h are logical root clip size" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(320, 240);
+    try std.testing.expectEqual(@as(u32, 320), ctx.screen_w);
+    try std.testing.expectEqual(@as(u32, 240), ctx.screen_h);
+    const root = ctx.draw_list.clip_stack.items[0];
+    try std.testing.expectEqual(@as(u32, 320), root.w);
+    try std.testing.expectEqual(@as(u32, 240), root.h);
+    try std.testing.expectEqual(@as(i32, 320), ctx.layout_root.?.cfg.width.fixed);
+    try std.testing.expectEqual(@as(i32, 240), ctx.layout_root.?.cfg.height.fixed);
     ctx.endFrame();
 }
 

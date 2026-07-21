@@ -3278,7 +3278,7 @@ pub fn main(init: std.process.Init) !void {
             dl.reset(fb.width, fb.height);
             drawFrame(&app, &dl);
             const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-            gui.render(target, &dl, gui_ctx.font);
+            gui.render(target, &dl, gui_ctx.font, 1.0);
 
             // menu → PanelHost content（VIS_H より上）→ VIS_H の描画順。
             const mtop_i: i32 = @intFromFloat(app.menuTopH());
@@ -3326,7 +3326,7 @@ pub fn main(init: std.process.Init) !void {
             app.captureParamRows(&gui_ctx);
             app.advanceParamEdits();
             app.drawGhostMarkers(&gui_ctx.draw_list);
-            gui.render(target, &gui_ctx.draw_list, gui_ctx.font);
+            gui.render(target, &gui_ctx.draw_list, gui_ctx.font, 1.0);
             // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
             drawVizBand(&app, fb, spec, osc, &meter);
 

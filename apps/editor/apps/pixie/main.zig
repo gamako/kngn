@@ -7173,6 +7173,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
             &self.ctx.draw_list,
             self.ctx.font,
+            1.0,
         );
         win.present();
     } // ← ここで framebuffer unlock

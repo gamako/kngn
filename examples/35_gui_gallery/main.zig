@@ -593,7 +593,7 @@ pub fn main(init: std.process.Init) !void {
         _ = gui.menuBarPopup(&ctx, &commands, &app.menu);
         _ = ctx.popupMenu(Ids.popup, &popup_items);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &ctx.draw_list, ctx.font);
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         window.present();
 
         // TASK-142: このフレームで確定した focus に IME 経路を追従させる（テキスト欄 focus 時のみ

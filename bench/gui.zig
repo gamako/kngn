@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
 
         const iters: usize = 300;
         // warmup
-        gui.render(target, &dl, gui.default_font);
+        gui.render(target, &dl, gui.default_font, 1.0);
 
         var total_ns: u64 = 0;
         var min_ns: u64 = std.math.maxInt(u64);
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
         var i: usize = 0;
         while (i < iters) : (i += 1) {
             const start = std.Io.Clock.Timestamp.now(io, .awake);
-            gui.render(target, &dl, gui.default_font);
+            gui.render(target, &dl, gui.default_font, 1.0);
             const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
             // DCE 対策: 被計測関数の出力（描画先ピクセル）そのものを観測する
             acc +%= pixels[i % pixels.len];

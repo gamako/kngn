@@ -37,6 +37,7 @@ pub const DrawList = struct {
     }
 
     /// 毎フレーム最初に呼ぶこと。root clip = Rect{0,0,w,h} を設定する。
+    /// w/h は論理サイズ（物理 framebuffer 寸法ではない。scale は render() 側で適用）。
     pub fn reset(self: *DrawList, w: u32, h: u32) void {
         self.cmds.clearRetainingCapacity();
         self.clip_stack.clearRetainingCapacity();
@@ -94,7 +95,7 @@ pub const DrawList = struct {
     }
 
     /// pixels は DrawList より長く生かした caller 所有の slice を指すこと。
-    /// assert: pixels.len == src_w * src_h, rect.w == src_w, rect.h == src_h
+    /// assert: pixels.len == src_w * src_h。destination rect は source と異寸でもよい（nearest）。
     pub fn image(
         self: *DrawList,
         rect: Rect,
@@ -103,7 +104,6 @@ pub const DrawList = struct {
         src_h: u32,
     ) Allocator.Error!void {
         std.debug.assert(pixels.len == @as(usize, src_w) * @as(usize, src_h));
-        std.debug.assert(rect.w == src_w and rect.h == src_h);
         try self.cmds.append(self.alloc, .{ .image = .{
             .rect = rect,
             .pixels = pixels,
@@ -131,7 +131,7 @@ pub const DrawList = struct {
 // Tests
 // ============================================================
 
-test "DrawList: reset clears cmds and sets root clip" {
+test "DrawList: reset clears cmds and sets root clip (logical size)" {
     var dl = DrawList.init(std.testing.allocator);
     defer dl.deinit();
 
@@ -143,6 +143,17 @@ test "DrawList: reset clears cmds and sets root clip" {
     try std.testing.expectEqual(@as(i32, 0), root.y);
     try std.testing.expectEqual(@as(u32, 800), root.w);
     try std.testing.expectEqual(@as(u32, 600), root.h);
+}
+
+test "DrawList.image: destination may differ from source size" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    const img = [_]u32{ 0xFF0000FF, 0xFF00FF00, 0xFFFF0000, 0xFFFFFFFF };
+    try dl.image(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, &img, 2, 2);
+    try std.testing.expectEqual(@as(u32, 16), dl.cmds.items[0].image.rect.w);
+    try std.testing.expectEqual(@as(u32, 2), dl.cmds.items[0].image.src_w);
+    try std.testing.expectEqual(@as(u32, 2), dl.cmds.items[0].image.src_h);
 }
 
 test "DrawList: rectFilled bakes in clip" {

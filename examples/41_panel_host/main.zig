@@ -480,7 +480,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &ctx.draw_list, ctx.font);
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         window.present();
     }
 }
