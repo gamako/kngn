@@ -29,6 +29,7 @@ const blit = @import("blit.zig");
 const zoom_mod = @import("zoom.zig");
 const Zoom = zoom_mod.Zoom;
 const minimap_mod = @import("minimap.zig");
+const ScreenTransform = kit.gfx.ScreenTransform;
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
@@ -414,10 +415,12 @@ const App = struct {
 
     /// 起動前に window_state を load して WindowOptions を返す（TASK-117）。
     /// platform.init 後・Window.create 前。失敗時はデフォルト 780x600。
+    /// TASK-156.4: fb_mode=.physical（HiDPI crisp UI + canvas nearest）。
     pub fn windowBootstrap(gpa: std.mem.Allocator, io: std.Io) !platform.WindowOptions {
         const fallback_opts: platform.WindowOptions = .{
             .position = null,
             .size = .{ .width = WINDOW_W, .height = WINDOW_H },
+            .fb_mode = .physical,
         };
         const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
         var data_dir = appshell.paths.openAppDataDir(io, gpa, "pixie", override_path) catch |err| {
@@ -437,6 +440,7 @@ const App = struct {
         return .{
             .position = if (resolved.position) |p| .{ .x = p.x, .y = p.y } else null,
             .size = .{ .width = resolved.size.width, .height = resolved.size.height },
+            .fb_mode = .physical,
         };
     }
 
@@ -5293,16 +5297,37 @@ fn updateMinimapInput(app: *App, ctx: *const gui.Context) bool {
     return false;
 }
 
+/// paint.Rect（i32）→ ScreenTransform → 物理 paint.Rect（TASK-156.4）。
+/// scale 規則は gfx.ScreenTransform に一元化。ここは f32 整数値の i32 変換のみ。
+fn logicalPaintRectToPhysical(r: core.Rect, scale: f32) core.Rect {
+    const cam = ScreenTransform.logicalRectToPhysical(.{
+        .x = @floatFromInt(r.x),
+        .y = @floatFromInt(r.y),
+        .w = @floatFromInt(r.w),
+        .h = @floatFromInt(r.h),
+    }, scale);
+    return .{
+        .x = @intFromFloat(cam.x),
+        .y = @intFromFloat(cam.y),
+        .w = @intFromFloat(cam.w),
+        .h = @intFromFloat(cam.h),
+    };
+}
+
 /// キャッシュ更新 + fb へミニマップ描画。
-fn drawMinimapOverlay(app: *App, fb: []u32, fb_w: u32, fb_h: u32, area: core.Rect) void {
-    const mm = currentMinimapRect(app, area) orelse return;
+/// `area` は論理 canvas area。物理 fb へは ScreenTransform で floor 変換した rect を渡す（TASK-156.4）。
+fn drawMinimapOverlay(app: *App, fb: []u32, fb_w: u32, fb_h: u32, area: core.Rect, content_scale: f32) void {
+    const mm_logical = currentMinimapRect(app, area) orelse return;
     const cw = app.doc.width;
     const ch = app.doc.height;
     const composite = app.canvas.compositeStraight();
     app.minimap.ensure(composite, cw, ch) catch return;
     const vis = minimap_mod.visibleRect(app.cam_cx, app.cam_cy, area.w, area.h, app.view_zoom, cw, ch);
-    const vp = minimap_mod.mapVisibleToViewport(vis, cw, ch, mm);
-    minimap_mod.draw(fb, fb_w, fb_h, &app.minimap, mm, vp, area);
+    const vp_logical = minimap_mod.mapVisibleToViewport(vis, cw, ch, mm_logical);
+    const mm = logicalPaintRectToPhysical(mm_logical, content_scale);
+    const vp = logicalPaintRectToPhysical(vp_logical, content_scale);
+    const area_phys = logicalPaintRectToPhysical(area, content_scale);
+    minimap_mod.draw(fb, fb_w, fb_h, &app.minimap, mm, vp, area_phys);
 }
 
 /// ビューポートのズーム/パン入力を処理する（endFrame 後・canvas 入力前に呼ぶ）。
@@ -6712,7 +6737,15 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         const fb = win.lockFramebuffer() orelse return;
         defer fb.unlock();
 
-        self.ctx.beginFrame(fb.width, fb.height);
+        // TASK-156.4: レイアウト/入力は論理サイズ、raw fb は物理。同一 Framebuffer snapshot の scale のみ使用。
+        const logical_w = fb.logical_size.width;
+        const logical_h = fb.logical_size.height;
+        const content_scale = fb.content_scale;
+        // 物理 target 寸法（fb.width/height は framebuffer_size の alias）
+        const phys_w = fb.width;
+        const phys_h = fb.height;
+
+        self.ctx.beginFrame(logical_w, logical_h);
 
         // Command 表をイベント処理前に更新（ショートカット照合・probe 用。checked 反映）。
         self.rebuildMenuCommands();
@@ -7039,29 +7072,30 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         updateCursorAndHover(self, win.*, &self.ctx, canvas_rect);
 
         // ── 描画: bg → チェッカー背景 → canvas blit(α src-over) → GUI（上に重ねる） ──
+        // 物理 fb を clear。canvas は論理 Zoom rect → 物理 nearest（TASK-156.4）。
         @memset(fb.pixels, COLOR_WINDOW_BG);
         if (canvas_rect) |rect| {
             if (self.last_area) |area| {
                 const zoom = self.view_zoom;
                 const cw = self.doc.width;
                 const ch = self.doc.height;
-                // 表示矩形（screen px 実寸。displayExtent = ceil(canvas * num / den)）
+                // 論理表示矩形（displayExtent = ceil(canvas * num / den)）
                 const screen_rect: core.Rect = .{
                     .x = rect.x,
                     .y = rect.y,
                     .w = zoom.displayExtent(cw),
                     .h = zoom.displayExtent(ch),
                 };
-                blit.drawCheckerboard(fb.pixels, fb.width, fb.height, screen_rect, area);
+                blit.drawCheckerboardPhysical(fb.pixels, phys_w, phys_h, screen_rect, area, content_scale);
                 const base_composite = self.resolveDisplayComposite(self.gpa);
                 const display_composite: []const u32 = if (self.onion_enabled and self.doc.frames.items.len > 1) blk: {
                     const cnt = @min(self.onion_count, core.onion_skin.max_count);
                     core.onion_skin.build(&self.doc, base_composite, self.doc.selected_frame, cnt, self.onion_buf, self.onion_scratch);
                     break :blk self.onion_buf;
                 } else base_composite;
-                blit.blitCanvasZoomZ(fb.pixels, fb.width, fb.height, display_composite, cw, ch, rect, zoom, area);
+                blit.blitCanvasZoomPhysical(fb.pixels, phys_w, phys_h, display_composite, cw, ch, rect, zoom, area, content_scale);
                 // ミニマップ（canvas blit 直後・他 overlay より下。TASK-153.3）
-                drawMinimapOverlay(self, fb.pixels, fb.width, fb.height, area);
+                drawMinimapOverlay(self, fb.pixels, phys_w, phys_h, area, content_scale);
             }
         }
         // TASK-103: presence overlay（canvas blit の直後・bezier/selection より下）
@@ -7169,11 +7203,12 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 }
             }
         }
+        // GUI DrawList は論理座標のまま。scale は render 出口で注入（TASK-156.2/156.4）。
         gui.render(
-            .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height },
+            .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h },
             &self.ctx.draw_list,
             self.ctx.font,
-            1.0,
+            content_scale,
         );
         win.present();
     } // ← ここで framebuffer unlock

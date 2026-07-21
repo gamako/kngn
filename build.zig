@@ -2215,6 +2215,30 @@ pub fn build(b: *std.Build) void {
     const bench_blit_step = b.step("bench-blit", "Run pixie canvas blit/checker micro-benchmark (ReleaseFast)");
     bench_blit_step.dependOn(&b.addRunArtifact(bench_blit_exe).step);
 
+    // bench-viz（TASK-156.4）: Spec/Scope/Meter 論理 bitmap + image scale 転送
+    const bench_viz_spec = b.createModule(.{
+        .root_source_file = b.path("libs/viz/src/spectrogram.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_viz_spec.addImport("dsp", bench_dsp_mod);
+    const bench_viz_scope = b.createModule(.{
+        .root_source_file = b.path("libs/viz/src/scope.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_viz_root = b.createModule(.{
+        .root_source_file = b.path("bench/viz.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_viz_root.addImport("gui", bench_gui_mod);
+    bench_viz_root.addImport("spectrogram", bench_viz_spec);
+    bench_viz_root.addImport("scope", bench_viz_scope);
+    const bench_viz_exe = b.addExecutable(.{ .name = "bench_viz", .root_module = bench_viz_root });
+    const bench_viz_step = b.step("bench-viz", "Run patch viz bitmap/image scale micro-benchmark (ReleaseFast)");
+    bench_viz_step.dependOn(&b.addRunArtifact(bench_viz_exe).step);
+
     // bench-modular（TASK-61）: DynGraph.processBlock の gen スキップ効果を計測。
     // modular は dsp のみ依存（test-modular と同じ）。ReleaseFast 固定で独立生成。
     const bench_modular_mod = b.createModule(.{

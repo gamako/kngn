@@ -15,8 +15,11 @@ pub const keyboard = @import("keyboard");
 pub const atlas = @import("atlas.zig");
 pub const animation = @import("animation.zig");
 pub const camera = @import("camera.zig");
+pub const screen_transform = @import("screen_transform.zig");
 pub const action_map = @import("action_map.zig");
 pub const tilemap = @import("tilemap.zig");
+
+pub const ScreenTransform = screen_transform.ScreenTransform;
 
 pub const Sprite = sprite.Sprite;
 pub const drawSprite = sprite.drawSprite;
@@ -77,6 +80,7 @@ test {
     _ = atlas;
     _ = animation;
     _ = camera;
+    _ = screen_transform;
     _ = action_map;
     _ = tilemap;
 }

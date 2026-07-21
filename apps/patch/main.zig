@@ -2953,9 +2953,10 @@ fn drawMiniTrace(dl: *gui.DrawList, rect: gui.Rect, kind: PortKind, samples: []c
 }
 
 // ============================================================================
-// C: master 出力の可視化帯（画面下端）。spectrogram / oscilloscope / level meter を直描き。
-// 帯下地は @memset の一括塗り（不透明・行連続＝新設の全画素ループを書かない。性能規約）。
-// spec/osc/meter.draw は apps/synth の既存実装の流用（新規全画素ループ無し）。フレーム毎。
+// C: master 出力の可視化帯（画面下端）。TASK-156.4: 2 層描画。
+// 層 A: 論理解像度固定 bitmap に Spec/Scope/Meter を描き、DrawList.image で nearest 拡大。
+// 層 B: ラベル・目盛りを gui_ctx.draw_list に論理座標で追加し、gui.render(scale) で物理 px 後描画。
+// 中間 bitmap は起動時に一度だけ確保（frame 毎 allocation 無し）。comptime Spec/Scope 寸法は不変。
 // ============================================================================
 const FreqLabel = struct { hz: f32, text: []const u8 };
 const FREQ_LABELS = [_]FreqLabel{
@@ -2963,42 +2964,50 @@ const FREQ_LABELS = [_]FreqLabel{
     .{ .hz = 1000, .text = "1kHz" },
     .{ .hz = 10000, .text = "10kHz" },
 };
+/// 可視化帯の論理 bitmap 幅（起動時固定。resize でも作り直さない。TASK-156.4）。
+const VIZ_BITMAP_W: u32 = WIN_W;
 
-fn drawVizBand(app: *const App, fb: platform.Framebuffer, spec: *const Spec, osc: *const Scope, meter: *const scope.LevelMeter) void {
-    const fb_w = fb.width;
-    // VIS_H は画面最下端固定。PanelHost center とは独立。
-    const band_y0: usize = @intFromFloat(app.vizBandY0());
-    if (band_y0 >= fb.height) return;
-    // 帯下地: 行連続なので単一 @memset（全画素ループを書かない）。
-    const start = band_y0 * fb_w;
-    const end = fb.height * fb_w;
-    if (start < end and end <= fb.pixels.len) @memset(fb.pixels[start..end], VIS_BG);
+/// 層 A: 論理 bitmap に背景 + Spec/Scope/Meter（ラベル無し）。
+fn drawVizBitmap(
+    viz_pixels: []u32,
+    spec: *const Spec,
+    osc: *const Scope,
+    meter: *const scope.LevelMeter,
+) void {
+    std.debug.assert(viz_pixels.len >= VIZ_BITMAP_W * VIS_H);
+    // 帯下地: 行連続 @memset（全画素ループを書かない）。
+    @memset(viz_pixels[0 .. VIZ_BITMAP_W * VIS_H], VIS_BG);
+    const draw_y: usize = VIS_LABEL_H;
+    // y=0..VIS_LABEL_H は背景のみ。描画領域は y=VIS_LABEL_H..VIS_H。
+    spec.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, SPEC_X0, draw_y);
+    osc.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, SCOPE_X0, draw_y);
+    meter.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, METER_X0, draw_y, METER_W, VIS_DRAW_H);
+}
 
-    const draw_y = band_y0 + VIS_LABEL_H;
-    spec.draw(fb.pixels, fb_w, fb.height, SPEC_X0, draw_y);
-    osc.draw(fb.pixels, fb_w, fb.height, SCOPE_X0, draw_y);
-    meter.draw(fb.pixels, fb_w, fb.height, METER_X0, draw_y, METER_W, VIS_DRAW_H);
-
-    // ラベル（帯上端の 16px 行）。
-    const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb_w, .height = fb.height };
-    const clip: gui.Rect = .{ .x = 0, .y = 0, .w = @intCast(fb_w), .h = @intCast(fb.height) };
+/// 層 B: ラベル・周波数目盛りを論理座標で DrawList へ（gui.render が scale 適用・P3 font）。
+fn drawVizLabels(app: *const App, dl: *gui.DrawList, spec: *const Spec) void {
+    const band_y0: i32 = @intFromFloat(app.vizBandY0());
+    if (band_y0 < 0) return;
     const label_col = gui.Color.rgba(0xC8, 0xD0, 0xD8, 0xFF);
-    const ly: i32 = @intCast(band_y0 + 3);
-    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = ly }, "SPECTROGRAM", label_col, clip, 1.0);
-    gui.default_bitmap_font.drawTo(target, .{ .x = SCOPE_X0, .y = ly }, "SCOPE (master)", label_col, clip, 1.0);
-    gui.default_bitmap_font.drawTo(target, .{ .x = @intCast(METER_X0), .y = ly }, "LVL", label_col, clip, 1.0);
+    const tick_col = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    const ly: i32 = band_y0 + 3;
+    // 静的文字列は DrawList より長く生きる。
+    dl.text(.{ .x = SPEC_X0, .y = ly }, "SPECTROGRAM", label_col) catch {};
+    dl.text(.{ .x = SCOPE_X0, .y = ly }, "SCOPE (master)", label_col) catch {};
+    dl.text(.{ .x = @intCast(METER_X0), .y = ly }, "LVL", label_col) catch {};
 
-    // spectrogram の周波数目盛り。
-    const tick_col: u32 = 0xFFFFFFFF;
+    const draw_y: i32 = band_y0 + VIS_LABEL_H;
     for (FREQ_LABELS) |fl| {
         const off = spec.rowOffsetForFreq(fl.hz) orelse continue;
-        const tick_y = draw_y + off;
-        if (tick_y >= fb.height) continue;
-        var tx: usize = SPEC_X0;
-        while (tx < SPEC_X0 + 6) : (tx += 1) {
-            if (tx < fb_w) fb.pixels[tick_y * fb_w + tx] = tick_col;
-        }
-        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = @intCast(tick_y) }, fl.text, label_col, clip, 1.0);
+        const tick_y: i32 = draw_y + @as(i32, @intCast(off));
+        // 目盛り線（論理 6px。render が thickness を scale）
+        dl.line(
+            .{ .x = SPEC_X0, .y = tick_y },
+            .{ .x = SPEC_X0 + 6, .y = tick_y },
+            tick_col,
+            1,
+        ) catch {};
+        dl.text(.{ .x = SPEC_X0 + 8, .y = tick_y }, fl.text, label_col) catch {};
     }
 }
 
@@ -3009,7 +3018,10 @@ pub fn main(init: std.process.Init) !void {
     try platform.init();
     defer platform.shutdown();
 
-    var window = try platform.Window.create(WIN_W, WIN_H, "patch canvas (modular)");
+    // TASK-156.4: .physical fb（HiDPI）。レイアウトは logical_size、描画出口で content_scale。
+    var window = try platform.Window.createWithOptions(WIN_W, WIN_H, "patch canvas (modular)", .{
+        .fb_mode = .physical,
+    });
     defer window.destroy();
 
     // TASK-136: native menu facade は Window.create 直後に手動で 1 回（app_runtime へは移行しない）。
@@ -3120,6 +3132,9 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.destroy(osc);
     osc.* = .{};
     var meter = scope.LevelMeter{};
+    // TASK-156.4: 論理解像度の viz 中間 bitmap（起動時 1 回。frame 毎 alloc 無し。App に埋め込まない）。
+    const viz_pixels = try allocator.alloc(u32, VIZ_BITMAP_W * VIS_H);
+    defer allocator.free(viz_pixels);
 
     platform.registerProbe(.{ .name = "patch", .ctx = &app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
     platform.registerProbe(.{ .name = "group", .ctx = &app, .ext = "json", .snapshot = null, .digest = groupDigest });
@@ -3161,9 +3176,15 @@ pub fn main(init: std.process.Init) !void {
         {
             const fb = window.lockFramebuffer() orelse continue :main_loop;
             defer fb.unlock();
-            app.fb_w = fb.width;
-            app.fb_h = fb.height;
-            gui_ctx.beginFrame(fb.width, fb.height);
+            // TASK-156.4: layout/input は論理、RenderTarget は物理。同一 snapshot の scale のみ使用。
+            const logical_w = fb.logical_size.width;
+            const logical_h = fb.logical_size.height;
+            const content_scale = fb.content_scale;
+            const phys_w = fb.width;
+            const phys_h = fb.height;
+            app.fb_w = logical_w;
+            app.fb_h = logical_h;
+            gui_ctx.beginFrame(logical_w, logical_h);
 
             // C: master タップを読み → mono downmix → spec/osc/meter へ供給。直近ブロックの rms/peak を latch。
             var frame_sumsq: f64 = 0;
@@ -3275,19 +3296,42 @@ pub fn main(init: std.process.Init) !void {
             app.beginParamFrame();
 
             @memset(fb.pixels, BG);
-            dl.reset(fb.width, fb.height);
+            dl.reset(logical_w, logical_h);
             drawFrame(&app, &dl);
-            const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-            gui.render(target, &dl, gui_ctx.font, 1.0);
 
-            // menu → PanelHost content（VIS_H より上）→ VIS_H の描画順。
+            // 層 A: 論理 viz bitmap → DrawList.image（1 回目 render で nearest 拡大）。
+            // PanelHost は content_h = logical_h - menu - VIS_H で VIS_H 帯に描かない前提
+            // （スペーサで帯領域を確保。popup が帯へ侵入しないことを snapshot で確認）。
+            drawVizBitmap(viz_pixels, spec, osc, &meter);
+            const band_y0_i: i32 = @intFromFloat(app.vizBandY0());
+            const band_bg_col = gui.Color.rgba(0x0A, 0x0E, 0x12, 0xFF);
+            // ウィンドウ幅 > VIZ_BITMAP_W でも帯全域は全幅 VIS_BG。
+            if (band_y0_i >= 0) {
+                dl.rectFilled(.{
+                    .x = 0,
+                    .y = band_y0_i,
+                    .w = @intCast(logical_w),
+                    .h = VIS_H,
+                }, band_bg_col) catch {};
+                dl.image(.{
+                    .x = 0,
+                    .y = band_y0_i,
+                    .w = @intCast(VIZ_BITMAP_W),
+                    .h = VIS_H,
+                }, viz_pixels[0 .. VIZ_BITMAP_W * VIS_H], VIZ_BITMAP_W, VIS_H) catch {};
+            }
+
+            const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h };
+            gui.render(target, &dl, gui_ctx.font, content_scale);
+
+            // menu → PanelHost content（VIS_H より上）→ VIS_H スペーサ。論理サイズ基準。
             const mtop_i: i32 = @intFromFloat(app.menuTopH());
             const vis_h_i: i32 = VIS_H;
-            const content_h_i: i32 = @max(0, @as(i32, @intCast(fb.height)) - mtop_i - vis_h_i);
+            const content_h_i: i32 = @max(0, @as(i32, @intCast(logical_h)) - mtop_i - vis_h_i);
             gui_ctx.beginBox(.{
                 .direction = .column,
-                .width = .{ .fixed = @intCast(fb.width) },
-                .height = .{ .fixed = @intCast(fb.height) },
+                .width = .{ .fixed = @intCast(logical_w) },
+                .height = .{ .fixed = @intCast(logical_h) },
             });
             if (!app.native_menu_active) {
                 gui_ctx.beginBox(.{
@@ -3326,9 +3370,9 @@ pub fn main(init: std.process.Init) !void {
             app.captureParamRows(&gui_ctx);
             app.advanceParamEdits();
             app.drawGhostMarkers(&gui_ctx.draw_list);
-            gui.render(target, &gui_ctx.draw_list, gui_ctx.font, 1.0);
-            // 可視化帯は最後に直描き（下地 @memset で canvas 内容を上書き＝帯が常に最前面）。
-            drawVizBand(&app, fb, spec, osc, &meter);
+            // 層 B: ラベルを 2 回目 render の末尾に（層 A の nearest 拡大の後・物理 font）。
+            drawVizLabels(&app, &gui_ctx.draw_list, spec);
+            gui.render(target, &gui_ctx.draw_list, gui_ctx.font, content_scale);
 
             window.present();
         }

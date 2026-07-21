@@ -57,14 +57,19 @@ fn percentile95(sorted: []const u64) u64 {
     return sorted[rank - 1];
 }
 
-fn runScenario(io: std.Io, gpa: std.mem.Allocator, pixels: []u32, rows: usize) !void {
+fn runScenario(io: std.Io, gpa: std.mem.Allocator, rows: usize, scale: f32) !void {
     var labels = try RowLabels.init(gpa, rows);
     defer labels.deinit(gpa);
 
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
 
-    const target = gui.RenderTarget{ .pixels = pixels, .width = W, .height = H };
+    const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * scale));
+    const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(H)) * scale));
+    const pixels = try gpa.alloc(u32, pw * ph);
+    defer gpa.free(pixels);
+    @memset(pixels, 0);
+    const target = gui.RenderTarget{ .pixels = pixels, .width = pw, .height = ph };
 
     // warmup
     var w: usize = 0;
@@ -72,7 +77,7 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, pixels: []u32, rows: usize) !
         ctx.beginFrame(W, H);
         buildRows(&ctx, &labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, &ctx.draw_list, ctx.font, scale);
     }
 
     var samples: [ITERS]u64 = undefined;
@@ -83,7 +88,7 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, pixels: []u32, rows: usize) !
         ctx.beginFrame(W, H);
         buildRows(&ctx, &labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, &ctx.draw_list, ctx.font, scale);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         // DCE guard: observe rendered pixels + draw list length
@@ -99,10 +104,11 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, pixels: []u32, rows: usize) !
     const min_ns = samples[0];
     const p95 = percentile95(samples[0..]);
 
-    std.debug.print("gui.frame rows={d:<4} viewport={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns\n", .{
+    std.debug.print("gui.frame rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns\n", .{
         rows,
-        W,
-        H,
+        scale,
+        pw,
+        ph,
         WARMUP,
         ITERS,
         avg,
@@ -117,13 +123,12 @@ pub fn main(init: std.process.Init) !void {
     const gpa = debug_allocator.allocator();
     const io = init.io;
 
-    const pixels = try gpa.alloc(u32, W * H);
-    defer gpa.free(pixels);
-    @memset(pixels, 0);
-
-    std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, {d}x{d}) ===\n", .{ W, H });
-    std.debug.print("measure: beginFrame + widget build + endFrame + gui.render\n", .{});
-    try runScenario(io, gpa, pixels, 500);
-    try runScenario(io, gpa, pixels, 1000);
+    std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, logical {d}x{d}) ===\n", .{ W, H });
+    std.debug.print("measure: beginFrame + widget build + endFrame + gui.render (scale matrix)\n", .{});
+    // TASK-156.4: scale 1x / 1.5x / 2x × rows 500/1000
+    for ([_]f32{ 1.0, 1.5, 2.0 }) |s| {
+        try runScenario(io, gpa, 500, s);
+        try runScenario(io, gpa, 1000, s);
+    }
     std.debug.print("\n", .{});
 }

@@ -210,7 +210,9 @@ pub fn fillThumb(buf: []u32, tw: u32, th: u32, src: []const u32, cw: u32, ch: u3
 }
 
 /// キャッシュ済みサムネイルを fb へコピーし、枠とビューポート矩形を描く。
-/// clip = canvas area。毎フレーム・小面積のみ。
+/// `mm` / `viewport` / `clip` は**物理** destination（呼び出し側が logicalRect を floor 変換済み）。
+/// thumb → physical mm は整数 accumulator nearest。1x（mm 寸法==cache）は 1:1 コピー。
+/// 毎フレーム・小面積のみ。frame 内 allocation 無し。
 pub fn draw(
     fb: []u32,
     fb_w: u32,
@@ -221,23 +223,66 @@ pub fn draw(
     clip: core.Rect,
 ) void {
     if (cache.pixels.len == 0 or cache.width == 0 or cache.height == 0) return;
+    if (mm.w <= 0 or mm.h <= 0) return;
     const x0: i32 = @max(@max(mm.x, clip.x), 0);
     const y0: i32 = @max(@max(mm.y, clip.y), 0);
     const x1: i32 = @min(@min(mm.x + mm.w, clip.x + clip.w), @as(i32, @intCast(fb_w)));
     const y1: i32 = @min(@min(mm.y + mm.h, clip.y + clip.h), @as(i32, @intCast(fb_h)));
     if (x0 >= x1 or y0 >= y1) return;
 
-    var fy = y0;
-    while (fy < y1) : (fy += 1) {
-        const sy: usize = @intCast(fy - mm.y);
-        if (sy >= cache.height) continue;
-        const src_row = cache.pixels[sy * cache.width ..][0..cache.width];
-        const dst_row = fb[@as(usize, @intCast(fy)) * fb_w ..];
-        var fx = x0;
-        while (fx < x1) : (fx += 1) {
-            const sx: usize = @intCast(fx - mm.x);
-            if (sx >= cache.width) continue;
-            dst_row[@intCast(fx)] = src_row[sx];
+    const src_w: i32 = @intCast(cache.width);
+    const src_h: i32 = @intCast(cache.height);
+    const dst_w: i32 = mm.w;
+    const dst_h: i32 = mm.h;
+
+    // 1:1（scale=1 で mm==thumb 寸法）: 行連続 memcpy
+    if (dst_w == src_w and dst_h == src_h) {
+        var fy = y0;
+        while (fy < y1) : (fy += 1) {
+            const sy: usize = @intCast(fy - mm.y);
+            if (sy >= cache.height) continue;
+            const src_row = cache.pixels[sy * cache.width ..][0..cache.width];
+            const dst_row = fb[@as(usize, @intCast(fy)) * fb_w ..];
+            const lo: usize = @intCast(x0);
+            const hi: usize = @intCast(x1);
+            const s0: usize = @intCast(x0 - mm.x);
+            @memcpy(dst_row[lo..hi], src_row[s0 .. s0 + (hi - lo)]);
+        }
+    } else {
+        // nearest: sx = floor((fx-mm.x) * src_w / dst_w)、run 書き込み。
+        // floor 逆写像の edge が進まない場合があるので、index が変わるまでスキャン。
+        var fy = y0;
+        while (fy < y1) {
+            const ly: i32 = fy - mm.y;
+            const sy: i32 = @divFloor(ly * src_h, dst_h);
+            var row_end: i32 = fy + 1;
+            while (row_end < y1 and @divFloor((row_end - mm.y) * src_h, dst_h) == sy) : (row_end += 1) {}
+            if (sy < 0 or sy >= src_h) {
+                fy = row_end;
+                continue;
+            }
+            const src_row = cache.pixels[@as(usize, @intCast(sy)) * cache.width ..][0..cache.width];
+            var row = fy;
+            while (row < row_end) : (row += 1) {
+                const dst_row = fb[@as(usize, @intCast(row)) * fb_w ..];
+                var fx = x0;
+                while (fx < x1) {
+                    const lx: i32 = fx - mm.x;
+                    const sx: i32 = @divFloor(lx * src_w, dst_w);
+                    var run_end: i32 = fx + 1;
+                    while (run_end < x1 and @divFloor((run_end - mm.x) * src_w, dst_w) == sx) : (run_end += 1) {}
+                    if (sx < 0 or sx >= src_w) {
+                        fx = run_end;
+                        continue;
+                    }
+                    const color = src_row[@intCast(sx)];
+                    const lo: usize = @intCast(fx);
+                    const hi: usize = @intCast(run_end);
+                    @memset(dst_row[lo..hi], color);
+                    fx = run_end;
+                }
+            }
+            fy = row_end;
         }
     }
 
@@ -358,4 +403,113 @@ test "layoutRect: 右下 MARGIN" {
     try testing.expectEqual(@as(i32, 40 + 200 - 60 - MARGIN), r.y);
     try testing.expectEqual(@as(i32, 80), r.w);
     try testing.expectEqual(@as(i32, 60), r.h);
+}
+
+test "draw: scale=1 は 1:1 転送（thumb→mm）" {
+    // 6x5 にして枠線（外周）の内側を検証する。
+    var cache = MiniMapCache{
+        .pixels = undefined,
+        .width = 6,
+        .height = 5,
+        .source_width = 6,
+        .source_height = 5,
+        .dirty = false,
+        .allocator = undefined,
+        .owned = false,
+    };
+    var thumb: [6 * 5]u32 = undefined;
+    for (&thumb, 0..) |*p, i| p.* = 0xFF000000 | @as(u32, @intCast(i + 1));
+    cache.pixels = &thumb;
+    const fbw: u32 = 20;
+    const fbh: u32 = 16;
+    var fb = [_]u32{0xFFAAAAAA} ** (20 * 16);
+    const mm: core.Rect = .{ .x = 2, .y = 3, .w = 6, .h = 5 };
+    // viewport を内部に置き、枠線がテスト画素を潰さないようにする
+    const vp: core.Rect = .{ .x = 4, .y = 5, .w = 2, .h = 1 };
+    const clip: core.Rect = .{ .x = 0, .y = 0, .w = 20, .h = 16 };
+    draw(&fb, fbw, fbh, &cache, mm, vp, clip);
+    // 内側 (sx=2,sy=2) → thumb index 2+2*6=14 → color 0xFF00000F、fb 位置 (4,5)
+    // ただし vp outline が (4,5) を通る → (sx=1,sy=1)=index 7 の (3,4) を見る
+    try testing.expectEqual(@as(u32, 0xFF000008), fb[4 * 20 + 3]); // sx=1,sy=1 → i=7+1=8
+    try testing.expectEqual(@as(u32, 0xFF00000E), fb[5 * 20 + 3]); // sx=1,sy=2 → i=13+1=14
+    try testing.expectEqual(@as(u32, 0xFF000009), fb[4 * 20 + 4]); // sx=2,sy=1 → i=8+1=9
+}
+
+test "draw: scale=2 nearest（thumb 2x2 → mm 8x8、内側ブロック）" {
+    var cache = MiniMapCache{
+        .pixels = undefined,
+        .width = 2,
+        .height = 2,
+        .source_width = 2,
+        .source_height = 2,
+        .dirty = false,
+        .allocator = undefined,
+        .owned = false,
+    };
+    var thumb = [_]u32{ 0xFF111111, 0xFF222222, 0xFF333333, 0xFF444444 };
+    cache.pixels = &thumb;
+    const fbw: u32 = 16;
+    const fbh: u32 = 16;
+    var fb = [_]u32{0} ** (16 * 16);
+    // 8x8 物理 dest → 各 src が 4x4。枠は外周 1px、内側で nearest を検証。
+    const mm: core.Rect = .{ .x = 0, .y = 0, .w = 8, .h = 8 };
+    const vp: core.Rect = .{ .x = 3, .y = 3, .w = 2, .h = 2 };
+    const clip = mm;
+    draw(&fb, fbw, fbh, &cache, mm, vp, clip);
+    // src(0,0)=0xFF111111 → phys [0,4)×[0,4)。内側 (2,2)
+    try testing.expectEqual(@as(u32, 0xFF111111), fb[2 + 2 * 16]);
+    // src(1,0)=0xFF222222 → [4,8)×[0,4)。内側 (6,2)
+    try testing.expectEqual(@as(u32, 0xFF222222), fb[6 + 2 * 16]);
+    // src(0,1)=0xFF333333 → [0,4)×[4,8)。内側 (2,6)
+    try testing.expectEqual(@as(u32, 0xFF333333), fb[2 + 6 * 16]);
+    // src(1,1)=0xFF444444 → [4,8)×[4,8)。内側 (6,6)
+    try testing.expectEqual(@as(u32, 0xFF444444), fb[6 + 6 * 16]);
+}
+
+test "draw: physical clip で枠内のみ" {
+    var cache = MiniMapCache{
+        .pixels = undefined,
+        .width = 8,
+        .height = 8,
+        .source_width = 8,
+        .source_height = 8,
+        .dirty = false,
+        .allocator = undefined,
+        .owned = false,
+    };
+    var thumb = [_]u32{0xFFABCDEF} ** 64;
+    cache.pixels = &thumb;
+    var fb = [_]u32{0xFF000000} ** (20 * 20);
+    const mm: core.Rect = .{ .x = 2, .y = 2, .w = 8, .h = 8 };
+    const vp: core.Rect = .{ .x = 4, .y = 4, .w = 2, .h = 2 };
+    // clip は mm の左半分
+    const clip: core.Rect = .{ .x = 2, .y = 2, .w = 4, .h = 8 };
+    draw(&fb, 20, 20, &cache, mm, vp, clip);
+    // clip 内・枠外の内側
+    try testing.expectEqual(@as(u32, 0xFFABCDEF), fb[4 * 20 + 3]);
+    // clip 外（mm 右）は未塗り
+    try testing.expectEqual(@as(u32, 0xFF000000), fb[4 * 20 + 8]);
+}
+
+test "MiniMapCache.ensure: document サイズ変更は再生成・frame 外 alloc のみ" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var cache = MiniMapCache.init(gpa);
+    defer cache.deinit();
+    var src_a = [_]u32{0xFF101010} ** (8 * 8);
+    try cache.ensure(&src_a, 8, 8);
+    const w1 = cache.width;
+    const h1 = cache.height;
+    try testing.expect(!cache.dirty);
+    // 同一サイズ: 再 alloc 無し（dirty のまま false）
+    try cache.ensure(&src_a, 8, 8);
+    try testing.expectEqual(w1, cache.width);
+    try testing.expectEqual(h1, cache.height);
+    // サイズ変更: 再生成
+    var src_b = [_]u32{0xFF202020} ** (16 * 12);
+    try cache.ensure(&src_b, 16, 12);
+    try testing.expect(cache.width != 0 and cache.height != 0);
+    try testing.expectEqual(@as(u32, 16), cache.source_width);
+    try testing.expectEqual(@as(u32, 12), cache.source_height);
 }

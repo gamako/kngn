@@ -104,5 +104,60 @@ pub fn main(init: std.process.Init) !void {
         std.mem.doNotOptimizeAway(acc);
         std.debug.print("checker.{s}  avg={d:>9} ns  min={d:>9} ns\n", .{ variant, total / iters, min_ns });
     }
+
+    // TASK-156.4: physical canvas blit の scale matrix（1x / 1.5x / 2x）
+    {
+        const scales = [_]f32{ 1.0, 1.5, 2.0 };
+        const z = blit.Zoom.fromInteger(2);
+        const rect = core.Rect{ .x = 20, .y = 45, .w = @intCast(CANVAS_W), .h = @intCast(CANVAS_H) };
+        // scale=2 時の物理 fb は 2 倍寸法
+        const phys_fb_w: u32 = FB_W * 2;
+        const phys_fb_h: u32 = FB_H * 2;
+        const phys_fb = try gpa.alloc(u32, phys_fb_w * phys_fb_h);
+        defer gpa.free(phys_fb);
+        for (phys_fb) |*p| p.* = 0xFF808080;
+        std.debug.print("--- physical blit scale matrix (zoom=2, blocky) ---\n", .{});
+        for (scales) |s| {
+            const use_w: u32 = if (s > 1.0) phys_fb_w else FB_W;
+            const use_h: u32 = if (s > 1.0) phys_fb_h else FB_H;
+            const use_fb = if (s > 1.0) phys_fb else fb;
+            var total: u64 = 0;
+            var min_ns: u64 = std.math.maxInt(u64);
+            var acc: u32 = 0;
+            const iters: usize = 200;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const start = std.Io.Clock.Timestamp.now(io, .awake);
+                blit.blitCanvasZoomPhysical(use_fb, use_w, use_h, comp_blocky, CANVAS_W, CANVAS_H, rect, z, clip, s);
+                const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+                acc +%= use_fb[i % use_fb.len];
+                total += ns;
+                min_ns = @min(min_ns, ns);
+            }
+            std.mem.doNotOptimizeAway(acc);
+            std.debug.print("blit.physical.blocky scale={d:.1}  avg={d:>9} ns  min={d:>9} ns\n", .{ s, total / iters, min_ns });
+        }
+        // checker physical
+        for (scales) |s| {
+            const use_w: u32 = if (s > 1.0) phys_fb_w else FB_W;
+            const use_h: u32 = if (s > 1.0) phys_fb_h else FB_H;
+            const use_fb = if (s > 1.0) phys_fb else fb;
+            var total: u64 = 0;
+            var min_ns: u64 = std.math.maxInt(u64);
+            var acc: u32 = 0;
+            const iters: usize = 500;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const start = std.Io.Clock.Timestamp.now(io, .awake);
+                blit.drawCheckerboardPhysical(use_fb, use_w, use_h, screen_rect, clip, s);
+                const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+                acc +%= use_fb[i % use_fb.len];
+                total += ns;
+                min_ns = @min(min_ns, ns);
+            }
+            std.mem.doNotOptimizeAway(acc);
+            std.debug.print("checker.physical scale={d:.1}  avg={d:>9} ns  min={d:>9} ns\n", .{ s, total / iters, min_ns });
+        }
+    }
     std.debug.print("\n", .{});
 }

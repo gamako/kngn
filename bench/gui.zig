@@ -41,35 +41,46 @@ pub fn main(init: std.process.Init) !void {
         p.* = (alpha << 24) | (state & 0x00FF_FFFF);
     }
 
-    std.debug.print("\n=== GUI render benchmark (ReleaseFast, target {d}x{d}) ===\n", .{ W, H });
+    std.debug.print("\n=== GUI render benchmark (ReleaseFast, logical target {d}x{d}) ===\n", .{ W, H });
+    // TASK-156.4: scale matrix 1x / 1.5x / 2x（物理 target 寸法 = logical * scale の floor）
+    const scales = [_]f32{ 1.0, 1.5, 2.0 };
     for ([_]Scenario{ .rect_opaque, .rect_translucent, .image_blit, .text_draw }) |sc| {
         var dl = gui.DrawList.init(gpa);
         defer dl.deinit();
         dl.reset(W, H);
         try buildScene(&dl, sc, img);
 
-        const iters: usize = 300;
-        // warmup
-        gui.render(target, &dl, gui.default_font, 1.0);
+        for (scales) |s| {
+            const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * s));
+            const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(H)) * s));
+            const phys = try gpa.alloc(u32, pw * ph);
+            defer gpa.free(phys);
+            const phys_target = gui.RenderTarget{ .pixels = phys, .width = pw, .height = ph };
 
-        var total_ns: u64 = 0;
-        var min_ns: u64 = std.math.maxInt(u64);
-        var acc: u32 = 0;
-        var i: usize = 0;
-        while (i < iters) : (i += 1) {
-            const start = std.Io.Clock.Timestamp.now(io, .awake);
-            gui.render(target, &dl, gui.default_font, 1.0);
-            const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
-            // DCE 対策: 被計測関数の出力（描画先ピクセル）そのものを観測する
-            acc +%= pixels[i % pixels.len];
-            total_ns += ns;
-            min_ns = @min(min_ns, ns);
+            const iters: usize = 200;
+            // warmup
+            gui.render(phys_target, &dl, gui.default_font, s);
+
+            var total_ns: u64 = 0;
+            var min_ns: u64 = std.math.maxInt(u64);
+            var acc: u32 = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const start = std.Io.Clock.Timestamp.now(io, .awake);
+                gui.render(phys_target, &dl, gui.default_font, s);
+                const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+                acc +%= phys[i % phys.len];
+                total_ns += ns;
+                min_ns = @min(min_ns, ns);
+            }
+            std.mem.doNotOptimizeAway(acc);
+
+            const avg = total_ns / iters;
+            std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns\n", .{ @tagName(sc), s, avg, min_ns });
         }
-        std.mem.doNotOptimizeAway(acc);
-
-        const avg = total_ns / iters;
-        std.debug.print("gui.{s:<16} iters={d}  avg={d:>9} ns  min={d:>9} ns\n", .{ @tagName(sc), iters, avg, min_ns });
     }
+    // 互換: scale=1 単独行も残す（target は論理=物理）
+    _ = target;
     std.debug.print("\n", .{});
 }
 
