@@ -149,8 +149,8 @@ pub fn main(init: std.process.Init) !void {
                 const f = o.asFont();
                 const lh: i32 = @intCast(f.metrics().line_height);
 
-                f.drawTo(target, .{ .x = 8, .y = 8 }, "char_input demo: type ASCII / BACKSPACE / ENTER / ESC quit", gray, clip);
-                f.drawTo(target, .{ .x = 8, .y = 8 + lh }, "(IME: 変換→確定で日本語。preedit 下線は 79.6.2。inject commit 可)", gray, clip);
+                f.drawTo(target, .{ .x = 8, .y = 8 }, "char_input demo: type ASCII / BACKSPACE / ENTER / ESC quit", gray, clip, 1.0);
+                f.drawTo(target, .{ .x = 8, .y = 8 + lh }, "(IME: 変換→確定で日本語。preedit 下線は 79.6.2。inject commit 可)", gray, clip, 1.0);
 
                 // 入力テキスト（'\n' で行分割）。末尾に静的キャレット '_'（blink しない＝決定的）。
                 const text_top: i32 = 8 + lh * 2;
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
                 var last_y: i32 = text_top;
                 var it = std.mem.splitScalar(u8, state.buf[0..state.len], '\n');
                 while (it.next()) |line| {
-                    f.drawTo(target, .{ .x = 8, .y = y }, line, green, clip);
+                    f.drawTo(target, .{ .x = 8, .y = y }, line, green, clip, 1.0);
                     last_line = line;
                     last_y = y;
                     y += lh;
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
                 var caret_x: i32 = 8 + @as(i32, @intCast(f.measure(last_line)));
                 if (state.preedit_len > 0) {
                     const preedit = state.preedit[0..state.preedit_len];
-                    f.drawTo(target, .{ .x = caret_x, .y = last_y }, preedit, cyan, clip);
+                    f.drawTo(target, .{ .x = caret_x, .y = last_y }, preedit, cyan, clip, 1.0);
                     const preedit_w: i32 = @intCast(f.measure(preedit));
                     // 下線は baseline 直下（ascent+2）。行ボックス最下端（lh-2）だと descent+gap の
                     // 下に浮いて見える（実機指摘 2026-07-17）。行内に収まるよう lh-1 で clamp。
@@ -179,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
                     const cursor_prefix = preedit[0..@min(state.preedit_cursor, preedit.len)];
                     caret_x += @intCast(f.measure(cursor_prefix));
                 }
-                f.drawTo(target, .{ .x = caret_x, .y = last_y }, "_", green, clip);
+                f.drawTo(target, .{ .x = caret_x, .y = last_y }, "_", green, clip, 1.0);
                 // rect は preedit の有無に関係なく常に caret を指す（composition 開始打鍵の
                 // handleEvent 時点で正しい位置が既に供給されているように。実機指摘 2026-07-17）。
                 {
@@ -198,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
                 // 直近の codepoint / modifier（非 ASCII でも受信を数値で確認できる）。
                 var dbg: [80]u8 = undefined;
                 const dbg_str = std.fmt.bufPrint(&dbg, "last: U+{X:0>4}  mods=0x{X}  bytes={d}", .{ state.last_cp, state.last_mods, state.len }) catch "last: ?";
-                f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 28 }, dbg_str, cyan, clip);
+                f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 28 }, dbg_str, cyan, clip, 1.0);
             }
 
             window.present();

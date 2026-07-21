@@ -103,22 +103,22 @@ pub fn main(init: std.process.Init) !void {
             const target = fontmod.RenderTarget{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
             const clip = fontmod.Rect{ .x = 0, .y = 0, .w = fb.width, .h = fb.height };
 
-            if (fonts[0]) |*big| big.asFont().drawTo(target, .{ .x = 24, .y = 24 }, "Outline Font (TTF)", white, clip);
-            if (fonts[1]) |*mid| mid.asFont().drawTo(target, .{ .x = 24, .y = 96 }, "The quick brown fox jumps over the lazy dog.", cyan, clip);
-            if (fonts[0]) |*big| big.asFont().drawTo(target, .{ .x = 24, .y = 230 }, "こんにちは 世界 ABC 123", white, clip);
+            if (fonts[0]) |*big| big.asFont().drawTo(target, .{ .x = 24, .y = 24 }, "Outline Font (TTF)", white, clip, 1.0);
+            if (fonts[1]) |*mid| mid.asFont().drawTo(target, .{ .x = 24, .y = 96 }, "The quick brown fox jumps over the lazy dog.", cyan, clip, 1.0);
+            if (fonts[0]) |*big| big.asFont().drawTo(target, .{ .x = 24, .y = 230 }, "こんにちは 世界 ABC 123", white, clip, 1.0);
             if (fonts[2]) |*small| {
-                small.asFont().drawTo(target, .{ .x = 24, .y = 150 }, "abcdefghijklmnopqrstuvwxyz 0123456789 !?@#&", white, clip);
-                small.asFont().drawTo(target, .{ .x = 24, .y = 180 }, "ESC to quit. Glyphs are rasterized on demand and cached.", cyan, clip);
-                small.asFont().drawTo(target, .{ .x = 24, .y = 300 }, "日本語: ひらがな カタカナ 漢字（CFF/.ttc）", cyan, clip);
+                small.asFont().drawTo(target, .{ .x = 24, .y = 150 }, "abcdefghijklmnopqrstuvwxyz 0123456789 !?@#&", white, clip, 1.0);
+                small.asFont().drawTo(target, .{ .x = 24, .y = 180 }, "ESC to quit. Glyphs are rasterized on demand and cached.", cyan, clip, 1.0);
+                small.asFont().drawTo(target, .{ .x = 24, .y = 300 }, "日本語: ひらがな カタカナ 漢字（CFF/.ttc）", cyan, clip, 1.0);
             }
 
             // 可変フォント段: 同一 face から wght 100/400/700/900（fvar/avar/gvar/HVAR 経路）
             if (var_face != null) {
-                if (fonts[2]) |*small| small.asFont().drawTo(target, .{ .x = 24, .y = 340 }, "Variable font (fvar/gvar): wght 100 / 400 / 700 / 900", cyan, clip);
+                if (fonts[2]) |*small| small.asFont().drawTo(target, .{ .x = 24, .y = 340 }, "Variable font (fvar/gvar): wght 100 / 400 / 700 / 900", cyan, clip, 1.0);
                 const labels = [_][]const u8{ "Thin 100", "Regular 400", "Bold 700", "Black 900" };
                 var vy: i32 = 370;
                 for (&var_fonts, labels) |*of, label| {
-                    if (of.*) |*o| o.asFont().drawTo(target, .{ .x = 24, .y = vy }, label, white, clip);
+                    if (of.*) |*o| o.asFont().drawTo(target, .{ .x = 24, .y = vy }, label, white, clip, 1.0);
                     vy += 52;
                 }
             }

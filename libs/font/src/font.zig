@@ -49,7 +49,7 @@ pub const Font = struct {
 
     pub const VTable = struct {
         measure: *const fn (ptr: *const anyopaque, text: []const u8) u32,
-        drawTo: *const fn (ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void,
+        drawTo: *const fn (ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void,
         metrics: *const fn (ptr: *const anyopaque) Metrics,
     };
 
@@ -57,8 +57,9 @@ pub const Font = struct {
         return self.vtable.measure(self.ptr, text);
     }
 
-    pub fn drawTo(self: Font, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
-        self.vtable.drawTo(self.ptr, target, pos, text, col, clip);
+    /// scale: 論理 font px → 物理描画の倍率（1.0 = 論理=物理）。measure/metrics は論理のまま。
+    pub fn drawTo(self: Font, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
+        self.vtable.drawTo(self.ptr, target, pos, text, col, clip, scale);
     }
 
     pub fn metrics(self: Font) Metrics {
@@ -373,7 +374,9 @@ test "Font: vtable 経由で measure/metrics が呼べる" {
         fn m(_: *const anyopaque, text: []const u8) u32 {
             return @intCast(text.len);
         }
-        fn d(_: *const anyopaque, _: RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect) void {}
+        fn d(_: *const anyopaque, _: RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect, scale: f32) void {
+            _ = scale;
+        }
         fn me(_: *const anyopaque) Metrics {
             return .{ .line_height = 10, .ascent = 8, .descent = 2 };
         }
@@ -574,7 +577,8 @@ test "Font 契約: drawTo はグリフ単位でカラー(blitRGBA)とモノク�
         fn m(_: *const anyopaque, text: []const u8) u32 {
             return @intCast(text.len * 2);
         }
-        fn d(_: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+        fn d(_: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
+            _ = scale;
             var x = pos.x;
             for (text) |ch| {
                 switch (ch) {
@@ -596,7 +600,7 @@ test "Font 契約: drawTo はグリフ単位でカラー(blitRGBA)とモノク�
 
     var px_red = [_]u32{0xFF000000} ** (8 * 4);
     const t_red = RenderTarget{ .pixels = &px_red, .width = 8, .height = 4 };
-    ColorGlyphFont.font.drawTo(t_red, .{ .x = 0, .y = 0 }, "MC", Color.rgba(0xFF, 0x00, 0x00, 0xFF), clip);
+    ColorGlyphFont.font.drawTo(t_red, .{ .x = 0, .y = 0 }, "MC", Color.rgba(0xFF, 0x00, 0x00, 0xFF), clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), px_red[0]); // 'M'(0,0) は col=赤 で tint
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), px_red[1]); // 'M'(1,0)
     try std.testing.expectEqual(@as(u32, 0xFF00FF00), px_red[2]); // 'C'(2,0) は col 無視・ビットマップの緑のまま
@@ -605,7 +609,7 @@ test "Font 契約: drawTo はグリフ単位でカラー(blitRGBA)とモノク�
     // col を変えても 'C'(カラー) 側の出力は不変（構造的に col 非適用。'M' 側は追従して変わる）
     var px_blue = [_]u32{0xFF000000} ** (8 * 4);
     const t_blue = RenderTarget{ .pixels = &px_blue, .width = 8, .height = 4 };
-    ColorGlyphFont.font.drawTo(t_blue, .{ .x = 0, .y = 0 }, "MC", Color.rgba(0x00, 0x00, 0xFF, 0xFF), clip);
+    ColorGlyphFont.font.drawTo(t_blue, .{ .x = 0, .y = 0 }, "MC", Color.rgba(0x00, 0x00, 0xFF, 0xFF), clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), px_blue[0]); // 'M' は青に追従
     try std.testing.expectEqual(@as(u32, 0xFF00FF00), px_blue[2]); // 'C' は緑のまま（col 変更の影響なし）
 }

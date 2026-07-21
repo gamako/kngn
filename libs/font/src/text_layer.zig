@@ -56,7 +56,7 @@ pub fn renderTextLayer(alloc: std.mem.Allocator, of: *OutlineFont, text: []const
     @memset(pixels, 0);
     const target = RenderTarget{ .pixels = pixels, .width = w, .height = h };
     const clip = Rect{ .x = 0, .y = 0, .w = w, .h = h };
-    of.drawToStraight(target, .{ .x = 0, .y = 0 }, text, col, clip);
+    of.drawToStraight(target, .{ .x = 0, .y = 0 }, text, col, clip, 1.0);
     return .{ .pixels = pixels, .width = w, .height = h };
 }
 

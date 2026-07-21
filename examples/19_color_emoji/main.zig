@@ -148,14 +148,14 @@ pub fn main(init: std.process.Init) !void {
             const target = RenderTarget{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
             const clip = Rect{ .x = 0, .y = 0, .w = fb.width, .h = fb.height };
 
-            if (text_big) |*big| big.asFont().drawTo(target, .{ .x = 20, .y = 16 }, "Color Emoji (sbix) Demo", cyan, clip);
+            if (text_big) |*big| big.asFont().drawTo(target, .{ .x = 20, .y = 16 }, "Color Emoji (sbix) Demo", cyan, clip, 1.0);
             if (text_small) |*small| {
-                small.asFont().drawTo(target, .{ .x = 20, .y = 56 }, "Single default-presentation codepoint only (no VS16/ZWJ/skin tone/flags). ESC to quit.", gray, clip);
+                small.asFont().drawTo(target, .{ .x = 20, .y = 56 }, "Single default-presentation codepoint only (no VS16/ZWJ/skin tone/flags). ESC to quit.", gray, clip, 1.0);
             }
 
             // ── 混在描画（ASCII/日本語/絵文字 を同一行にインライン表示） ──
             if (text_mid) |*mid| {
-                if (text_small) |*small| small.asFont().drawTo(target, .{ .x = 20, .y = 84 }, "Mixed inline (ASCII + Japanese + emoji, single row):", gray, clip);
+                if (text_small) |*small| small.asFont().drawTo(target, .{ .x = 20, .y = 84 }, "Mixed inline (ASCII + Japanese + emoji, single row):", gray, clip, 1.0);
                 var cx: f32 = 20;
                 const row_y = 108;
                 const segs = [_]struct { text: []const u8, is_emoji: bool }{
@@ -169,24 +169,24 @@ pub fn main(init: std.process.Init) !void {
                     const xi: i32 = @intFromFloat(@round(cx));
                     if (seg.is_emoji) {
                         if (emoji_fonts[0]) |*e24| {
-                            e24.asFont().drawTo(target, .{ .x = xi, .y = row_y }, seg.text, white, clip);
+                            e24.asFont().drawTo(target, .{ .x = xi, .y = row_y }, seg.text, white, clip, 1.0);
                             cx += @floatFromInt(e24.measure(seg.text));
                         } else {
-                            mid.asFont().drawTo(target, .{ .x = xi, .y = row_y }, "[emoji]", white, clip);
+                            mid.asFont().drawTo(target, .{ .x = xi, .y = row_y }, "[emoji]", white, clip, 1.0);
                             cx += @floatFromInt(mid.measure("[emoji]"));
                         }
                     } else {
-                        mid.asFont().drawTo(target, .{ .x = xi, .y = row_y }, seg.text, white, clip);
+                        mid.asFont().drawTo(target, .{ .x = xi, .y = row_y }, seg.text, white, clip, 1.0);
                         cx += @floatFromInt(mid.measure(seg.text));
                     }
                 }
 
-                mid.asFont().drawTo(target, .{ .x = 20, .y = 170 }, "The quick brown fox jumps over the lazy dog. 0123456789", white, clip);
-                mid.asFont().drawTo(target, .{ .x = 20, .y = 200 }, "\u{65E5}\u{672C}\u{8A9E}: \u{3053}\u{3093}\u{306B}\u{3061}\u{306F}\u{4E16}\u{754C} \u{3044}\u{308D}\u{306F} ABC123", white, clip); // 日本語: こんにちは世界 いろは ABC123
+                mid.asFont().drawTo(target, .{ .x = 20, .y = 170 }, "The quick brown fox jumps over the lazy dog. 0123456789", white, clip, 1.0);
+                mid.asFont().drawTo(target, .{ .x = 20, .y = 200 }, "\u{65E5}\u{672C}\u{8A9E}: \u{3053}\u{3093}\u{306B}\u{3061}\u{306F}\u{4E16}\u{754C} \u{3044}\u{308D}\u{306F} ABC123", white, clip, 1.0); // 日本語: こんにちは世界 いろは ABC123
             }
 
             // ── 絵文字ストライク・サイズ比較（共有 baseline ガイド線で origin 整合を目視） ──
-            if (text_small) |*small| small.asFont().drawTo(target, .{ .x = 20, .y = 250 }, "Emoji strike sizes 24 / 48 / 96px (shared baseline guide line):", gray, clip);
+            if (text_small) |*small| small.asFont().drawTo(target, .{ .x = 20, .y = 250 }, "Emoji strike sizes 24 / 48 / 96px (shared baseline guide line):", gray, clip, 1.0);
 
             const baseline_row_y: i32 = 420;
             const emoji_x = [_]i32{ 40, 220, 480 };
@@ -196,11 +196,11 @@ pub fn main(init: std.process.Init) !void {
                     have_any_emoji = true;
                     const m = e.metrics();
                     const pos_y = baseline_row_y - m.ascent;
-                    e.asFont().drawTo(target, .{ .x = x, .y = pos_y }, target_emoji_cp, white, clip);
+                    e.asFont().drawTo(target, .{ .x = x, .y = pos_y }, target_emoji_cp, white, clip, 1.0);
                     if (text_small) |*small| {
                         var buf: [16]u8 = undefined;
                         const label = std.fmt.bufPrint(&buf, "{d}px", .{@as(u32, @intFromFloat(px))}) catch "?px";
-                        small.asFont().drawTo(target, .{ .x = x, .y = baseline_row_y + 12 }, label, gray, clip);
+                        small.asFont().drawTo(target, .{ .x = x, .y = baseline_row_y + 12 }, label, gray, clip, 1.0);
                     }
                 }
             }
@@ -213,6 +213,7 @@ pub fn main(init: std.process.Init) !void {
                     "Apple Color Emoji unavailable (not found, or sbix/cmap unsupported) -- color emoji rendering skipped (see stderr log). Expected on non-macOS.",
                     gray,
                     clip,
+                    1.0,
                 );
             }
 

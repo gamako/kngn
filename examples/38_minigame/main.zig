@@ -519,9 +519,9 @@ fn drawHud(
     const white = kit.font.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
     const cyan = kit.font.Color.rgba(0xAA, 0xDD, 0xFF, 0xFF);
 
-    font.asFont().drawTo(target, .{ .x = 8, .y = 6 }, score_text, white, clip);
-    font.asFont().drawTo(target, .{ .x = 8, .y = 22 }, fps_text, cyan, clip);
-    font.asFont().drawTo(target, .{ .x = 8, .y = 38 }, "A/D MOVE  SPACE JUMP", cyan, clip);
+    font.asFont().drawTo(target, .{ .x = 8, .y = 6 }, score_text, white, clip, 1.0);
+    font.asFont().drawTo(target, .{ .x = 8, .y = 22 }, fps_text, cyan, clip, 1.0);
+    font.asFont().drawTo(target, .{ .x = 8, .y = 38 }, "A/D MOVE  SPACE JUMP", cyan, clip, 1.0);
 }
 
 fn warmFontCache(font: *kit.font.OutlineFont) void {
@@ -530,9 +530,9 @@ fn warmFontCache(font: *kit.font.OutlineFont) void {
     const target = kit.font.RenderTarget{ .pixels = &scratch, .width = 64, .height = 64 };
     const clip = kit.font.Rect{ .x = 0, .y = 0, .w = 64, .h = 64 };
     const white = kit.font.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    font.asFont().drawTo(target, .{ .x = 0, .y = 0 }, "SCORE 000", white, clip);
-    font.asFont().drawTo(target, .{ .x = 0, .y = 16 }, "FPS 60", white, clip);
-    font.asFont().drawTo(target, .{ .x = 0, .y = 32 }, "A/D MOVE  SPACE JUMP", white, clip);
+    font.asFont().drawTo(target, .{ .x = 0, .y = 0 }, "SCORE 000", white, clip, 1.0);
+    font.asFont().drawTo(target, .{ .x = 0, .y = 16 }, "FPS 60", white, clip, 1.0);
+    font.asFont().drawTo(target, .{ .x = 0, .y = 32 }, "A/D MOVE  SPACE JUMP", white, clip, 1.0);
 }
 
 fn drawCoin(

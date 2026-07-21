@@ -86,29 +86,29 @@ pub fn main() !void {
             // 左上: FPS / dt (シアン)
             var fps_buf: [32]u8 = undefined;
             const fps_str = std.fmt.bufPrint(&fps_buf, "FPS: {d}", .{fps_cached}) catch "FPS: ?";
-            f.drawTo(target, .{ .x = 8, .y = 8 }, fps_str, cyan, clip);
+            f.drawTo(target, .{ .x = 8, .y = 8 }, fps_str, cyan, clip, 1.0);
 
             var ms_buf: [32]u8 = undefined;
             const ms_str = std.fmt.bufPrint(&ms_buf, "MS:  {d:.2}", .{dt * 1000.0}) catch "MS:  ?";
-            f.drawTo(target, .{ .x = 8, .y = 8 + lh }, ms_str, cyan, clip);
+            f.drawTo(target, .{ .x = 8, .y = 8 + lh }, ms_str, cyan, clip, 1.0);
 
             // 中央: Hello, World! (白)
             const greeting = "Hello, World!";
             const tw_i32: i32 = @intCast(f.measure(greeting));
             const cx: i32 = @divFloor(fbw_i32 - tw_i32, 2);
             const cy: i32 = @divFloor(fbh_i32 - lh, 2);
-            f.drawTo(target, .{ .x = cx, .y = cy }, greeting, white, clip);
+            f.drawTo(target, .{ .x = cx, .y = cy }, greeting, white, clip, 1.0);
 
             // 改行デモ (薄いオレンジ): drawTo は 1 行ランなので呼び出し側で \n 分割（行レイアウトは上位責務）。
             var line_y: i32 = 80;
             var lines = std.mem.splitScalar(u8, "Multi-line\ndemo line 2\nline 3", '\n');
             while (lines.next()) |line| : (line_y += lh) {
-                f.drawTo(target, .{ .x = 8, .y = line_y }, line, orange, clip);
+                f.drawTo(target, .{ .x = 8, .y = line_y }, line, orange, clip, 1.0);
             }
 
             // 下部: 入力エコー (getCharFromKey の対応範囲は A-Z / 0-9)
-            f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 40 }, "Type letters/digits (BACKSPACE delete, ESC quit):", gray, clip);
-            f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 20 }, input_buf[0..input_len], green, clip);
+            f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 40 }, "Type letters/digits (BACKSPACE delete, ESC quit):", gray, clip, 1.0);
+            f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 20 }, input_buf[0..input_len], green, clip, 1.0);
 
             window.present();
         }

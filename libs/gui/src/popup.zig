@@ -695,6 +695,7 @@ const GapLike = struct {
         _: []const u8,
         _: Color,
         _: geom.Rect,
+        _: f32,
     ) void {}
     fn metrics(_: *const anyopaque) font_mod.Metrics {
         return .{ .line_height = 24, .ascent = 14, .descent = 4 };

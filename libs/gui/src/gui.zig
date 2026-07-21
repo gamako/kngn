@@ -31,6 +31,8 @@ pub const default_bitmap_font = @import("font.zig").default_bitmap_font;
 /// measure は codepoint 数 × 8、drawTo も codepoint ごとに 8px 進む（logical width は一致。
 /// glyph 未描画時も advance は進むため ink 幅とは一致しない）。
 pub const default_font = @import("font.zig").default_font;
+/// 埋め込み Press Start 2P の OutlineFont（遅延初期化・論理 16px）。bitmap の `default_font` とは別。
+pub const defaultOutlineFont = @import("font.zig").defaultOutlineFont;
 /// 論理 ink 高さ（ascent+descent）と row 内縦中央 y。DrawList 直書き向けにも公開（TASK-167）。
 pub const inkHeight = @import("font.zig").inkHeight;
 pub const fontInkHeight = @import("font.zig").fontInkHeight;

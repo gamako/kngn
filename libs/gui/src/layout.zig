@@ -298,7 +298,7 @@ const override_vt: Font.VTable = .{
         }
     }.f,
     .drawTo = struct {
-        fn f(_: *const anyopaque, _: geom.RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect) void {}
+        fn f(_: *const anyopaque, _: geom.RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect, _: f32) void {}
     }.f,
     .metrics = struct {
         fn f(_: *const anyopaque) font_mod.Metrics {
@@ -317,7 +317,7 @@ const gap_vt: Font.VTable = .{
         }
     }.f,
     .drawTo = struct {
-        fn f(_: *const anyopaque, _: geom.RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect) void {}
+        fn f(_: *const anyopaque, _: geom.RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect, _: f32) void {}
     }.f,
     .metrics = struct {
         fn f(_: *const anyopaque) font_mod.Metrics {

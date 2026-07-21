@@ -15,7 +15,7 @@ pub const Font = font_mod.Font;
 
 /// font = 既定フォント。各 text cmd が font override を持てばそちらを優先する。
 /// scale: 論理 DrawList → 物理 target の変換係数（1.0 = 論理=物理、fast path）。
-/// `.text` は P3 まで論理座標のまま（Font.drawTo は scale 非対応）。
+/// `.text` は scale==1.0 で論理座標のまま、scale!=1.0 で pos/clip を物理化し Font.drawTo へ scale を渡す。
 pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scale: f32) void {
     std.debug.assert(target.pixels.len == @as(usize, target.width) * @as(usize, target.height));
     std.debug.assert(std.math.isFinite(scale) and scale > 0);
@@ -26,7 +26,7 @@ pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scal
                 .rect_filled => |c| if (!c.clip.isEmpty()) drawRectFilled(target, c.rect, c.color, c.clip),
                 .rect_outline => |c| if (!c.clip.isEmpty()) drawRectOutline(target, c.rect, c.color, c.thickness, c.clip),
                 .line => |c| if (!c.clip.isEmpty()) drawLine(target, c.p0, c.p1, c.color, c.thickness, c.clip),
-                .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip),
+                .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip, 1.0),
                 .image => |c| if (!c.clip.isEmpty()) drawImage(target, c.rect, c.pixels, c.src_w, c.src_h, c.clip),
             }
         }
@@ -66,8 +66,19 @@ pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scal
                     );
                 }
             },
-            // P3: text は論理座標のまま
-            .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip),
+            .text => |c| {
+                const phys_clip = scaleRect(c.clip, scale);
+                if (!phys_clip.isEmpty()) {
+                    (c.font orelse font).drawTo(
+                        target,
+                        scalePoint(c.pos, scale),
+                        c.text,
+                        c.color,
+                        phys_clip,
+                        scale,
+                    );
+                }
+            },
             .image => |c| {
                 const phys_clip = scaleRect(c.clip, scale);
                 if (!phys_clip.isEmpty()) {
@@ -902,4 +913,170 @@ test "scaleThickness: round and min 1" {
     try std.testing.expectEqual(@as(u32, 2), scaleThickness(1, 1.5)); // round(1.5)=2
     try std.testing.expectEqual(@as(u32, 3), scaleThickness(2, 1.5)); // round(3.0)=3
     try std.testing.expectEqual(@as(u32, 1), scaleThickness(1, 0.4)); // round(0.4)=0 → max(1)
+}
+
+// ── TASK-156.3 text scale dispatch ────────────────────────────────────────────
+
+test "TASK-156.3: render text scale==1.0 は元 pos/clip と scale=1.0 を渡す" {
+    const Spy = struct {
+        var last_pos: Vec2 = .{ .x = -1, .y = -1 };
+        var last_clip: Rect = .{ .x = -1, .y = -1, .w = 0, .h = 0 };
+        var last_scale: f32 = -1;
+        var calls: u32 = 0;
+        fn m(_: *const anyopaque, _: []const u8) u32 {
+            return 0;
+        }
+        fn d(_: *const anyopaque, _: RenderTarget, pos: Vec2, _: []const u8, _: Color, clip: Rect, scale: f32) void {
+            last_pos = pos;
+            last_clip = clip;
+            last_scale = scale;
+            calls += 1;
+        }
+        fn me(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 16, .ascent = 12, .descent = 4 };
+        }
+        const dummy: u8 = 0;
+        const vt: Font.VTable = .{ .measure = m, .drawTo = d, .metrics = me };
+        const font: Font = .{ .ptr = &dummy, .vtable = &vt };
+    };
+    Spy.calls = 0;
+
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(100, 100);
+    const logical_clip = Rect{ .x = 5, .y = 6, .w = 40, .h = 30 };
+    try dl.pushClip(logical_clip);
+    try dl.text(.{ .x = 10, .y = 20 }, "hi", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+
+    var px = [_]u32{0} ** (100 * 100);
+    const target = RenderTarget{ .pixels = &px, .width = 100, .height = 100 };
+    render(target, &dl, Spy.font, 1.0);
+
+    try std.testing.expectEqual(@as(u32, 1), Spy.calls);
+    try std.testing.expectEqual(@as(i32, 10), Spy.last_pos.x);
+    try std.testing.expectEqual(@as(i32, 20), Spy.last_pos.y);
+    try std.testing.expectEqual(logical_clip.x, Spy.last_clip.x);
+    try std.testing.expectEqual(logical_clip.y, Spy.last_clip.y);
+    try std.testing.expectEqual(logical_clip.w, Spy.last_clip.w);
+    try std.testing.expectEqual(logical_clip.h, Spy.last_clip.h);
+    try std.testing.expectEqual(@as(f32, 1.0), Spy.last_scale);
+}
+
+test "TASK-156.3: render text scale==2.0 は scalePoint/scaleRect 後の値と scale=2.0" {
+    const Spy = struct {
+        var last_pos: Vec2 = .{ .x = -1, .y = -1 };
+        var last_clip: Rect = .{ .x = -1, .y = -1, .w = 0, .h = 0 };
+        var last_scale: f32 = -1;
+        var calls: u32 = 0;
+        fn m(_: *const anyopaque, _: []const u8) u32 {
+            return 0;
+        }
+        fn d(_: *const anyopaque, _: RenderTarget, pos: Vec2, _: []const u8, _: Color, clip: Rect, scale: f32) void {
+            last_pos = pos;
+            last_clip = clip;
+            last_scale = scale;
+            calls += 1;
+        }
+        fn me(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 16, .ascent = 12, .descent = 4 };
+        }
+        const dummy: u8 = 0;
+        const vt: Font.VTable = .{ .measure = m, .drawTo = d, .metrics = me };
+        const font: Font = .{ .ptr = &dummy, .vtable = &vt };
+    };
+    Spy.calls = 0;
+
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(100, 100);
+    const logical_pos = Vec2{ .x = 10, .y = 20 };
+    const logical_clip = Rect{ .x = 5, .y = 6, .w = 40, .h = 30 };
+    try dl.pushClip(logical_clip);
+    try dl.text(logical_pos, "hi", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+
+    var px = [_]u32{0} ** (200 * 200);
+    const target = RenderTarget{ .pixels = &px, .width = 200, .height = 200 };
+    const s: f32 = 2.0;
+    render(target, &dl, Spy.font, s);
+
+    const expect_pos = scalePoint(logical_pos, s);
+    const expect_clip = scaleRect(logical_clip, s);
+    try std.testing.expectEqual(@as(u32, 1), Spy.calls);
+    try std.testing.expectEqual(expect_pos.x, Spy.last_pos.x);
+    try std.testing.expectEqual(expect_pos.y, Spy.last_pos.y);
+    try std.testing.expectEqual(expect_clip.x, Spy.last_clip.x);
+    try std.testing.expectEqual(expect_clip.y, Spy.last_clip.y);
+    try std.testing.expectEqual(expect_clip.w, Spy.last_clip.w);
+    try std.testing.expectEqual(expect_clip.h, Spy.last_clip.h);
+    try std.testing.expectEqual(@as(f32, 2.0), Spy.last_scale);
+}
+
+test "TASK-156.3: render text 空 clip では drawTo を呼ばない" {
+    const Spy = struct {
+        var calls: u32 = 0;
+        fn m(_: *const anyopaque, _: []const u8) u32 {
+            return 0;
+        }
+        fn d(_: *const anyopaque, _: RenderTarget, _: Vec2, _: []const u8, _: Color, _: Rect, _: f32) void {
+            calls += 1;
+        }
+        fn me(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 16, .ascent = 12, .descent = 4 };
+        }
+        const dummy: u8 = 0;
+        const vt: Font.VTable = .{ .measure = m, .drawTo = d, .metrics = me };
+        const font: Font = .{ .ptr = &dummy, .vtable = &vt };
+    };
+    Spy.calls = 0;
+
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(100, 100);
+    try dl.pushClip(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+    try dl.text(.{ .x = 0, .y = 0 }, "hi", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+
+    var px = [_]u32{0} ** (100 * 100);
+    const target = RenderTarget{ .pixels = &px, .width = 100, .height = 100 };
+    render(target, &dl, Spy.font, 1.0);
+    try std.testing.expectEqual(@as(u32, 0), Spy.calls);
+    render(target, &dl, Spy.font, 2.0);
+    try std.testing.expectEqual(@as(u32, 0), Spy.calls);
+}
+
+test "TASK-156.3: text clip の scale 規則は rect と一致" {
+    const scales = [_]f32{ 1.5, 2.0 };
+    for (scales) |s| {
+        const logical = Rect{ .x = 4, .y = 5, .w = 6, .h = 7 };
+        // rect 経路と同じ scaleRect
+        const via_rect = scaleRect(logical, s);
+
+        const Spy = struct {
+            var last_clip: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            fn m(_: *const anyopaque, _: []const u8) u32 {
+                return 0;
+            }
+            fn d(_: *const anyopaque, _: RenderTarget, _: Vec2, _: []const u8, _: Color, clip: Rect, _: f32) void {
+                last_clip = clip;
+            }
+            fn me(_: *const anyopaque) font_mod.Metrics {
+                return .{ .line_height = 16, .ascent = 12, .descent = 4 };
+            }
+            const dummy: u8 = 0;
+            const vt: Font.VTable = .{ .measure = m, .drawTo = d, .metrics = me };
+            const font: Font = .{ .ptr = &dummy, .vtable = &vt };
+        };
+
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(100, 100);
+        try dl.pushClip(logical);
+        try dl.text(.{ .x = 0, .y = 0 }, "x", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        var px = [_]u32{0} ** (200 * 200);
+        const target = RenderTarget{ .pixels = &px, .width = 200, .height = 200 };
+        render(target, &dl, Spy.font, s);
+        try std.testing.expectEqual(via_rect.x, Spy.last_clip.x);
+        try std.testing.expectEqual(via_rect.y, Spy.last_clip.y);
+        try std.testing.expectEqual(via_rect.w, Spy.last_clip.w);
+        try std.testing.expectEqual(via_rect.h, Spy.last_clip.h);
+    }
 }

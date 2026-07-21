@@ -66,9 +66,9 @@ pub const BitmapFont = struct {
         const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
         return self.measure(text_str);
     }
-    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect) void {
+    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect, scale: f32) void {
         const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
-        self.drawTo(target, pos, text_str, col, clip);
+        self.drawTo(target, pos, text_str, col, clip, scale);
     }
     fn metricsImpl(ptr: *const anyopaque) Metrics {
         const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
@@ -103,7 +103,9 @@ pub const BitmapFont = struct {
         return total;
     }
 
-    pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect) void {
+    /// scale は受け取るが BDF ランタイム bitmap は今回再スケールしない。
+    pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect, scale: f32) void {
+        _ = scale;
         const def = self.defaultAdvance();
         const ascent: i32 = @intCast(@min(self.ascent, self.line_height));
         var cx = pos.x;
@@ -859,12 +861,12 @@ test "drawTo: pixel placement & clipping (left/top corner)" {
 
     // ascent=4(=bbox 4 + yoff 0), height=4, yoff=0 → baseline=0+4, glyph top=4-4=0。4x4 全塗り。
     var fb: [16]u32 = @splat(0);
-    font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A", white, clip, 1.0);
     for (fb) |p| try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), p);
 
     // pos(-2,-2): glyph は fb 座標 x,y ∈ [-2,1] を占める → 左上 2x2 のみ in-bounds。
     var fb2: [16]u32 = @splat(0);
-    font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = -2, .y = -2 }, "A", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = -2, .y = -2 }, "A", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0 * 4 + 0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0 * 4 + 1]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[1 * 4 + 0]);
@@ -873,13 +875,13 @@ test "drawTo: pixel placement & clipping (left/top corner)" {
 
     // 完全画面外: クラッシュしない
     var fb3: [16]u32 = @splat(0);
-    font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = 100, .y = 100 }, "A", white, clip);
-    font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = -100, .y = -100 }, "A", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = 100, .y = 100 }, "A", white, clip, 1.0);
+    font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = -100, .y = -100 }, "A", white, clip, 1.0);
     for (fb3) |p| try std.testing.expectEqual(@as(u32, 0), p);
 
     // 右下 partial offscreen: (3,3) のみ
     var fb4: [16]u32 = @splat(0);
-    font.asFont().drawTo(.{ .pixels = &fb4, .width = 4, .height = 4 }, .{ .x = 3, .y = 3 }, "A", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb4, .width = 4, .height = 4 }, .{ .x = 3, .y = 3 }, "A", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb4[3 * 4 + 3]);
 }
 
@@ -906,7 +908,7 @@ test "drawTo: 1 行ラン（\\n は改行せず通常 codepoint 扱い）" {
 
     // "AA": 同一行に 2 dot（baseline=0+1, top=1-1=0 → row 0）。2 行目には行かない。
     var fb: [16]u32 = @splat(0);
-    font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "AA", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "AA", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[1]);
     try std.testing.expectEqual(@as(u32, 0), fb[4]); // 2 行目は空（単一行ラン）
@@ -914,7 +916,7 @@ test "drawTo: 1 行ラン（\\n は改行せず通常 codepoint 扱い）" {
 
     // "A\nA": \n は欠落 glyph 扱い（改行しない）。両 dot とも row 0。
     var fb2: [16]u32 = @splat(0);
-    font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A\nA", white, clip);
+    font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A\nA", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0]); // row 0 に描かれる
     try std.testing.expectEqual(@as(u32, 0), fb2[4]); // 2 行目には行かない
 }

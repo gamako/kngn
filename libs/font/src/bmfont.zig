@@ -157,9 +157,9 @@ pub const BMFont = struct {
         const self: *const BMFont = @ptrCast(@alignCast(ptr));
         return self.measure(text);
     }
-    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
         const self: *const BMFont = @ptrCast(@alignCast(ptr));
-        self.drawTo(target, pos, text, col, clip);
+        self.drawTo(target, pos, text, col, clip, scale);
     }
     fn metricsImpl(ptr: *const anyopaque) Metrics {
         const self: *const BMFont = @ptrCast(@alignCast(ptr));
@@ -187,7 +187,9 @@ pub const BMFont = struct {
         return total;
     }
 
-    pub fn drawTo(self: BMFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+    /// scale は受け取るが今回は atlas を再スケールしない（物理 nearest 拡大は別タスク）。
+    pub fn drawTo(self: BMFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
+        _ = scale;
         var pen_x = pos.x;
         if (std.unicode.Utf8View.init(text)) |view| {
             var it = view.iterator();
@@ -423,7 +425,7 @@ test "BMFont.drawTo: A チャネルを coverage に、col で tint・配置" {
     const red = Color.rgba(0xFF, 0x00, 0x00, 0xFF);
 
     // 'A': src(0,0,2,2) 全 alpha=255 → dst=(pen0 + xoffset0, pos.y2 + yoffset1)=(0,3) に 2x2 の赤。
-    bm.drawTo(target, .{ .x = 0, .y = 2 }, "A", red, clip);
+    bm.drawTo(target, .{ .x = 0, .y = 2 }, "A", red, clip, 1.0);
     const at = @as(Color, @bitCast(px[3 * W + 0]));
     try testing.expectEqual(@as(u8, 0xFF), at.r);
     try testing.expectEqual(@as(u8, 0x00), at.g);
@@ -439,7 +441,7 @@ test "BMFont.drawTo: 欠落グリフは描画せず advance 0（measure と一�
     var px = [_]u32{0xFF000000} ** (W * W);
     const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    bm.drawTo(target, .{ .x = 0, .y = 0 }, "C", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    bm.drawTo(target, .{ .x = 0, .y = 0 }, "C", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     for (px) |p| try testing.expectEqual(@as(u32, 0xFF000000), p); // 何も描かれない
 }
 
@@ -547,7 +549,7 @@ test "BMFont.load: 埋め込み PNG を decode→parse（png 実経路・AC#2）
     var px = [_]u32{0xFF000000} ** (W * W);
     const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    bm.drawTo(target, .{ .x = 0, .y = 0 }, "A", Color.rgba(0x00, 0xFF, 0x00, 0xFF), clip);
+    bm.drawTo(target, .{ .x = 0, .y = 0 }, "A", Color.rgba(0x00, 0xFF, 0x00, 0xFF), clip, 1.0);
     // baseline_y=pos.y+ascent=0+3、glyph top=pos.y+yoffset=0 → (0,0) に緑。
     try testing.expectEqual(@as(u8, 0xFF), @as(Color, @bitCast(px[0])).g);
 }

@@ -187,7 +187,7 @@ fn drawSpecLabels(fb: platform.Framebuffer, spec: *const Spec) void {
         var tx: usize = SPEC_X0;
         while (tx < SPEC_X0 + 6) : (tx += 1) putFb(fb, tx, tick_y, tick_col);
         const ty = std.math.clamp(@as(i32, @intCast(tick_y)) - 8, ty_min, ty_max);
-        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = ty }, fl.text, label_col, clip);
+        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = ty }, fl.text, label_col, clip, 1.0);
     }
 
     // dB カラースケール凡例(帯の下 y=420..440): "-60dB" [横グラデ] "0dB"
@@ -196,7 +196,7 @@ fn drawSpecLabels(fb: platform.Framebuffer, spec: *const Spec) void {
     const bar_w: usize = 160;
     const bar_y = leg_y + 2;
     const bar_h: usize = 10;
-    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = leg_y }, "-60dB", label_col, clip);
+    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = leg_y }, "-60dB", label_col, clip, 1.0);
     var lx: usize = 0;
     while (lx < bar_w) : (lx += 1) {
         const v: u8 = @intCast(lx * 255 / (bar_w - 1));
@@ -204,7 +204,7 @@ fn drawSpecLabels(fb: platform.Framebuffer, spec: *const Spec) void {
         var ly: usize = 0;
         while (ly < bar_h) : (ly += 1) putFb(fb, bar_x0 + lx, bar_y + ly, c);
     }
-    gui.default_bitmap_font.drawTo(target, .{ .x = bar_x0 + bar_w + 6, .y = leg_y }, "0dB", label_col, clip);
+    gui.default_bitmap_font.drawTo(target, .{ .x = bar_x0 + bar_w + 6, .y = leg_y }, "0dB", label_col, clip, 1.0);
 }
 
 const WAVE_NAMES = [_][]const u8{ "sine", "saw", "square", "triangle" };

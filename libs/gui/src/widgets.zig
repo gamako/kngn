@@ -3853,6 +3853,7 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
             _: []const u8,
             _: Color,
             _: Rect,
+            _: f32,
         ) void {}
         fn metrics(_: *const anyopaque) font_mod.Metrics {
             // ink=18, line_height=24 → 旧実装なら box=32、新実装は box=26
@@ -3949,6 +3950,7 @@ test "TASK-167: selectableLabel は ink 高さと selection/text の y を一致
             _: []const u8,
             _: Color,
             _: Rect,
+            _: f32,
         ) void {}
         fn metrics(_: *const anyopaque) font_mod.Metrics {
             return .{ .line_height = 24, .ascent = 14, .descent = 4 };
@@ -4012,6 +4014,7 @@ test "TASK-167: button 内 label は ink 高さを持ち line_gap を含めな�
             _: []const u8,
             _: Color,
             _: Rect,
+            _: f32,
         ) void {}
         fn metrics(_: *const anyopaque) font_mod.Metrics {
             return .{ .line_height = 24, .ascent = 14, .descent = 4 };

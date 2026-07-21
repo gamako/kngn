@@ -168,8 +168,15 @@ const CachedGlyph = struct {
     bitmap: ?raster.Bitmap, // null = 空グリフ（space 等）
     left: i32, // ペン x からの device オフセット
     top: i32, // baseline からの device オフセット（上が負）
-    advance: f32, // px
+    advance: f32, // 物理 px（key の physical_px_q に対応）
     oom: bool = false, // negative cache（ラスタライズ OOM/過大）
+};
+
+/// outline glyph cache key: GID × 物理 font size（1/64px 量子化）。
+/// f32 scale の微小揺らぎによる cache 分裂を防ぎつつ sub-pixel coverage 差を保持する。
+const PhysicalGlyphKey = struct {
+    gid: u16,
+    physical_px_q: u32,
 };
 
 /// sbix カラーグリフのキャッシュ済み RGBA ビットマップ（TASK-26.3）。outline の `CachedGlyph`
@@ -192,7 +199,7 @@ pub const OutlineFont = struct {
     face: *const FontFace,
     px: f32,
     scale: f32,
-    cache: std.AutoHashMapUnmanaged(u16, CachedGlyph) = .empty,
+    cache: std.AutoHashMapUnmanaged(PhysicalGlyphKey, CachedGlyph) = .empty,
     cache_bytes: usize = 0,
     cache_cap: usize = 4 * 1024 * 1024,
     /// 直近の drawTo でラスタライズ OOM/過大・カラーキャッシュの容量超過が起きたか
@@ -489,10 +496,10 @@ pub const OutlineFont = struct {
         const self: *const OutlineFont = @ptrCast(@alignCast(ptr));
         return self.measure(text);
     }
-    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
         // interior mutability（キャッシュ遅延充填）。thread-confined 前提で @constCast。
         const self: *OutlineFont = @ptrCast(@alignCast(@constCast(ptr)));
-        self.drawTo(target, pos, text, col, clip);
+        self.drawTo(target, pos, text, col, clip, scale);
     }
     fn metricsImpl(ptr: *const anyopaque) Metrics {
         const self: *const OutlineFont = @ptrCast(@alignCast(ptr));
@@ -536,8 +543,9 @@ pub const OutlineFont = struct {
     /// per-pixel 転写は既存 `font.blitCoverage`（モノクロ）/ `font.blitRGBA`（カラー、TASK-26.3）
     /// に委譲しており、ここで新規の全画素ループは書かない。カラーグリフの cache lookup は
     /// O(1)（hashmap get）で、decode/resize はキャッシュミス時のみ（`getColorGlyph` 参照）。
-    pub fn drawTo(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
-        self.drawGlyphs(target, pos, text, col, clip, false);
+    /// `draw_scale`: 論理 font px → 物理描画倍率。outline AA 再ラスタは cache miss 時のみ。
+    pub fn drawTo(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, draw_scale: f32) void {
+        self.drawGlyphs(target, pos, text, col, clip, draw_scale, false);
     }
 
     /// `drawTo` の透明レイヤー版（TASK-79.4）。AA 縁のカバレッジ・カラーグリフのアルファを
@@ -546,17 +554,35 @@ pub const OutlineFont = struct {
     /// `drawTo` と完全に共有し（`drawGlyphs`）、per-glyph の blit だけ straight 版に出し分ける。
     /// per-glyph 転写は `font.blitCoverageStraight`（モノクロ）/ `font.blitRGBAStraight`（カラー）に
     /// 委譲（ここで新規の全画素ループは書かない。ホットパス性質は `drawTo` と同じ）。
-    pub fn drawToStraight(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
-        self.drawGlyphs(target, pos, text, col, clip, true);
+    pub fn drawToStraight(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, draw_scale: f32) void {
+        self.drawGlyphs(target, pos, text, col, clip, draw_scale, true);
+    }
+
+    /// 描画 scale から物理 font size の 1/64px 量子化キーを導出する。
+    fn physicalPxQ(self: *const OutlineFont, draw_scale: f32) u32 {
+        const s = if (std.math.isFinite(draw_scale) and draw_scale > 0) draw_scale else 1.0;
+        const q = @round(self.px * s * 64.0);
+        if (!std.math.isFinite(q) or q < 1.0) return 1;
+        if (q >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+        return @intFromFloat(q);
+    }
+
+    fn effectiveScaleFromQ(self: *const OutlineFont, physical_px_q: u32) f32 {
+        const raster_px = @as(f32, @floatFromInt(physical_px_q)) / 64.0;
+        return raster_px / self.px;
     }
 
     /// `drawTo`/`drawToStraight` 共有の glyph walk（TASK-79.4 でリファクタ抽出）。comptime
     /// `straight` で per-glyph blit だけを出し分け、キャッシュ充填・advance 計算等の挙動は完全に
     /// 共有する（重複コード排除。`drawTo` 側の既存テストが無改変で通ることで回帰無しを担保）。
-    fn drawGlyphs(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, comptime straight: bool) void {
+    fn drawGlyphs(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, draw_scale: f32, comptime straight: bool) void {
         self.last_oom = false;
+        const physical_px_q = self.physicalPxQ(draw_scale);
+        const effective = self.effectiveScaleFromQ(physical_px_q);
         const m = self.metrics();
-        const baseline_y = pos.y +| m.ascent; // 飽和加算（極端 pos.y で trap しない）
+        // 物理 baseline: floor(logical_ascent * effective_scale)
+        const physical_ascent: i32 = @intFromFloat(@floor(@as(f32, @floatFromInt(m.ascent)) * effective));
+        const baseline_y = pos.y +| physical_ascent; // 飽和加算（極端 pos.y で trap しない）
         var cx: f32 = @floatFromInt(pos.x);
         var it = CodepointIter.init(text);
         while (it.next()) |cp| {
@@ -564,6 +590,7 @@ pub const OutlineFont = struct {
             const gid = self.gidOf(cp);
             // カラーグリフ優先（sbix。col は無視して RGBA をそのまま転写）。
             // 無ければ（sbix 無効・当該 GID に bitmap 無し・decode 失敗等）モノクロ outline へ。
+            // sbix は本タスクでは scale 非対応（論理サイズのまま。key も GID のみ）。
             if (self.getColorGlyph(gid)) |cg| {
                 const bx = @as(i32, @intFromFloat(@round(cx))) +| cg.left;
                 const by = baseline_y +| cg.top;
@@ -572,11 +599,11 @@ pub const OutlineFont = struct {
                 } else {
                     font.blitRGBA(target, bx, by, cg.pixels, cg.w, cg.h, clip);
                 }
-                cx += self.advancePx(gid); // advance は hmtx 経由（色/モノクロ問わず不変）
+                cx += self.advancePx(gid); // advance は hmtx 経由（色/モノクロ問わず論理。sbix は scale 非対応）
                 continue;
             }
-            const cg = self.getCached(gid) catch {
-                cx += self.advancePx(gid); // 描画はスキップ、送りだけ進める
+            const cg = self.getCached(gid, physical_px_q) catch {
+                cx += self.advancePx(gid) * effective; // 描画はスキップ、物理送りだけ進める
                 continue;
             };
             if (cg.bitmap) |bm| {
@@ -592,23 +619,25 @@ pub const OutlineFont = struct {
         }
     }
 
-    fn getCached(self: *OutlineFont, gid: u16) Error!CachedGlyph {
-        if (self.cache.get(gid)) |g| {
+    fn getCached(self: *OutlineFont, gid: u16, physical_px_q: u32) Error!CachedGlyph {
+        const key = PhysicalGlyphKey{ .gid = gid, .physical_px_q = physical_px_q };
+        if (self.cache.get(key)) |g| {
             if (g.oom) {
                 self.last_oom = true; // tombstone ヒットでも診断を立て続ける
                 return error.OutOfMemory;
             }
             return g;
         }
-        const cg = self.buildGlyph(gid) catch |e| switch (e) {
+        const cg = self.buildGlyph(gid, physical_px_q) catch |e| switch (e) {
             error.OutOfMemory => {
                 self.last_oom = true;
                 // tombstone（再試行地獄を防ぐ）。put 失敗は無視（次回再試行）。
-                self.cache.put(self.alloc, gid, .{
+                const effective = self.effectiveScaleFromQ(physical_px_q);
+                self.cache.put(self.alloc, key, .{
                     .bitmap = null,
                     .left = 0,
                     .top = 0,
-                    .advance = self.advancePx(gid),
+                    .advance = self.advancePx(gid) * effective,
                     .oom = true,
                 }) catch {};
                 return error.OutOfMemory;
@@ -618,10 +647,10 @@ pub const OutlineFont = struct {
         // 単一グリフが cap を超える場合は描画断念。bitmap を破棄し oom tombstone として記録
         // （leak/ cap 無効化を防ぎ、描画不能を last_oom で診断する。空グリフと区別する）。
         if (cg.bitmap) |bm| {
-            if (@sizeOf(CachedGlyph) + bm.data.len > self.cache_cap) {
+            if (@sizeOf(PhysicalGlyphKey) + @sizeOf(CachedGlyph) + bm.data.len > self.cache_cap) {
                 self.alloc.free(bm.data);
                 self.last_oom = true;
-                self.cache.put(self.alloc, gid, .{
+                self.cache.put(self.alloc, key, .{
                     .bitmap = null,
                     .left = 0,
                     .top = 0,
@@ -631,9 +660,9 @@ pub const OutlineFont = struct {
                 return error.OutOfMemory;
             }
         }
-        const entry_bytes = @sizeOf(CachedGlyph) + if (cg.bitmap) |bm| bm.data.len else 0;
+        const entry_bytes = @sizeOf(PhysicalGlyphKey) + @sizeOf(CachedGlyph) + if (cg.bitmap) |bm| bm.data.len else 0;
         if (self.cache_bytes + entry_bytes > self.cache_cap) self.clearCache();
-        self.cache.put(self.alloc, gid, cg) catch |e| {
+        self.cache.put(self.alloc, key, cg) catch |e| {
             if (cg.bitmap) |bm| self.alloc.free(bm.data);
             self.last_oom = true; // キャッシュ登録自体の OOM も診断（描画はスキップされる）
             return e;
@@ -642,8 +671,12 @@ pub const OutlineFont = struct {
         return cg;
     }
 
-    fn buildGlyph(self: *OutlineFont, gid: u16) Error!CachedGlyph {
-        const adv = self.advancePx(gid);
+    fn buildGlyph(self: *OutlineFont, gid: u16, physical_px_q: u32) Error!CachedGlyph {
+        // cache miss 時のみ: 物理 px で sfnt 変換を導出し AA ラスタライズする。
+        const raster_px = @as(f32, @floatFromInt(physical_px_q)) / 64.0;
+        const effective = raster_px / self.px;
+        const s = self.face.sfnt.scaleForPixelSize(raster_px);
+        const adv = self.advancePx(gid) * effective;
         var ol = (switch (self.face.source) {
             .glyf => |*g| g.outlineVaried(
                 self.alloc,
@@ -684,7 +717,6 @@ pub const OutlineFont = struct {
             };
         }
 
-        const s = self.scale;
         const x0 = @floor(xmin * s);
         const y1 = @ceil(ymax * s);
         const w_f = @ceil(xmax * s) - x0 + 1;
@@ -1109,7 +1141,7 @@ test "OutlineFont: 合成完全 TTF を end-to-end（cmap→glyf→raster→draw
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
 
     var any: bool = false;
     for (px_buf) |p| if (p != 0xFF000000) {
@@ -1131,7 +1163,7 @@ test "OutlineFont: drawTo 後にグリフがキャッシュされる" {
     var px_buf = [_]u32{0} ** (W * W);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.cache.count() >= 1); // 'A' の gid がキャッシュされた
     try testing.expect(of.cache_bytes > 0);
 
@@ -1151,7 +1183,7 @@ test "OutlineFont: cache.put OOM 経路でも last_oom=true" {
     var of = OutlineFont.init(fba.allocator(), &face, 64);
     defer of.deinit();
 
-    try testing.expectError(error.OutOfMemory, of.getCached(2)); // space glyph: bitmap なし → cache.put で OOM
+    try testing.expectError(error.OutOfMemory, of.getCached(2, of.physicalPxQ(1.0))); // space glyph: bitmap なし → cache.put で OOM
     try testing.expect(of.last_oom);
     try testing.expectEqual(@as(u32, 0), of.cache.count());
 }
@@ -1186,7 +1218,7 @@ test "OutlineFont: asFont 経由（Font インターフェース）で measure/m
     var px_buf = [_]u32{0xFF000000} ** (W * W);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    f.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    f.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.cache.count() >= 1);
 }
 
@@ -1217,14 +1249,14 @@ test "OutlineFont.drawToStraight: 透明レイヤーへ描いてから不透明�
     defer of_direct.deinit();
     var px_direct = [_]u32{bg} ** (W * H);
     const t_direct = RenderTarget{ .pixels = &px_direct, .width = W, .height = H };
-    of_direct.drawTo(t_direct, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of_direct.drawTo(t_direct, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
     // 透明レイヤーへ描画（独立キャッシュ）→ bg へ手動合成
     var of_layer = OutlineFont.init(a, &face, 64);
     defer of_layer.deinit();
     var px_layer = [_]u32{0x00000000} ** (W * H);
     const t_layer = RenderTarget{ .pixels = &px_layer, .width = W, .height = H };
-    of_layer.drawToStraight(t_layer, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of_layer.drawToStraight(t_layer, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
     var px_composited: [W * H]u32 = undefined;
     for (px_layer, 0..) |p, i| px_composited[i] = pixelops.srcOverOpaque(bg, p);
@@ -1265,15 +1297,15 @@ test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重な
     defer of_direct.deinit();
     var px_direct = [_]u32{bg} ** (W * H);
     const t_direct = RenderTarget{ .pixels = &px_direct, .width = W, .height = H };
-    of_direct.drawTo(t_direct, pos1, "A", col, clip);
-    of_direct.drawTo(t_direct, pos2, "A", col, clip);
+    of_direct.drawTo(t_direct, pos1, "A", col, clip, 1.0);
+    of_direct.drawTo(t_direct, pos2, "A", col, clip, 1.0);
 
     var of_layer = OutlineFont.init(a, &face, 64);
     defer of_layer.deinit();
     var px_layer = [_]u32{0x00000000} ** (W * H);
     const t_layer = RenderTarget{ .pixels = &px_layer, .width = W, .height = H };
-    of_layer.drawToStraight(t_layer, pos1, "A", col, clip);
-    of_layer.drawToStraight(t_layer, pos2, "A", col, clip);
+    of_layer.drawToStraight(t_layer, pos1, "A", col, clip, 1.0);
+    of_layer.drawToStraight(t_layer, pos2, "A", col, clip, 1.0);
 
     var px_composited: [W * H]u32 = undefined;
     for (px_layer, 0..) |p, i| px_composited[i] = pixelops.srcOverOpaque(bg, p);
@@ -1303,13 +1335,13 @@ test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重な
     defer of_pos1.deinit();
     var px_pos1 = [_]u32{bg} ** (W * H);
     const t_pos1 = RenderTarget{ .pixels = &px_pos1, .width = W, .height = H };
-    of_pos1.drawTo(t_pos1, pos1, "A", col, clip);
+    of_pos1.drawTo(t_pos1, pos1, "A", col, clip, 1.0);
 
     var of_pos2 = OutlineFont.init(a, &face, 64);
     defer of_pos2.deinit();
     var px_pos2 = [_]u32{bg} ** (W * H);
     const t_pos2 = RenderTarget{ .pixels = &px_pos2, .width = W, .height = H };
-    of_pos2.drawTo(t_pos2, pos2, "A", col, clip);
+    of_pos2.drawTo(t_pos2, pos2, "A", col, clip, 1.0);
 
     var overlap_found = false;
     for (px_pos1, px_pos2) |p1, p2| {
@@ -1556,11 +1588,11 @@ test "CJK: cache hit は count/bytes 不変（再ラスタライズなし）" {
     var px_buf = [_]u32{0} ** (W * W);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     const count1 = of.cache.count();
     const bytes1 = of.cache_bytes;
     try testing.expect(count1 >= 1 and bytes1 > 0);
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expectEqual(count1, of.cache.count()); // 再ラスタライズされていない
     try testing.expectEqual(bytes1, of.cache_bytes);
 }
@@ -1579,19 +1611,20 @@ test "CJK: cache 上限到達で eviction（破綻せず描画継続）" {
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
 
     // 'A' を 1 つ描いて 1 グリフ分のサイズを把握 → cap をそれちょうどに設定して次の挿入で eviction
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
-    const gid_a = of.gidOf(0x41);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    const q = of.physicalPxQ(1.0);
+    const key_a = PhysicalGlyphKey{ .gid = of.gidOf(0x41), .physical_px_q = q };
     try testing.expectEqual(@as(u32, 1), of.cache.count());
-    try testing.expect(of.cache.contains(gid_a)); // 'A' がキャッシュ済み
+    try testing.expect(of.cache.contains(key_a)); // 'A' がキャッシュ済み
     of.cache_cap = of.cache_bytes; // 次の新規挿入で超過 → clearCache
     // 別グリフ(U+20000=gid2)を描画 → eviction が起きるが破綻しない
-    of.drawTo(target, .{ .x = 40, .y = 4 }, "\u{20000}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 40, .y = 4 }, "\u{20000}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.cache_bytes <= of.cache_cap); // 上限内
     try testing.expect(!of.last_oom); // 単一グリフは cap 内なので OOM 扱いではない
     // eviction で 'A' は消え、新グリフ(U+20000)だけが残る（clearCache→再挿入の直接証明）
     try testing.expectEqual(@as(u32, 1), of.cache.count());
-    try testing.expect(!of.cache.contains(gid_a)); // 旧 gid は消えた
-    try testing.expect(of.cache.contains(of.gidOf(0x20000))); // 新 gid のみ
+    try testing.expect(!of.cache.contains(key_a)); // 旧 key は消えた
+    try testing.expect(of.cache.contains(.{ .gid = of.gidOf(0x20000), .physical_px_q = q })); // 新 key のみ
 }
 
 test "CJK: ASCII + BMP 超え混在描画は破綻しない" {
@@ -1605,7 +1638,7 @@ test "CJK: ASCII + BMP 超え混在描画は破綻しない" {
     var px_buf = [_]u32{0xFF000000} ** (W * 80);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = 80 };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = 80 };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A\u{20000}A\u{20000}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A\u{20000}A\u{20000}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     // measure は 4 codepoint × advance 64 = 256
     try testing.expectEqual(@as(u32, 256), of.measure("A\u{20000}A\u{20000}"));
     var any = false;
@@ -1632,7 +1665,7 @@ test "OutlineFont: 合成 CFF(.otf) を end-to-end（cff→charstring→raster�
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
 
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
@@ -1762,7 +1795,7 @@ test "TASK-26.3: カラーグリフ描画は PNG と bit 一致し col を無視
     var px1 = [_]u32{0xFF000000} ** (W * H);
     const target1 = RenderTarget{ .pixels = &px1, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target1, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target1, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
 
     // baseline_y = 4+48 = 52, left=0, top=-(0+2)=-2 → by=50, bx=4
     try testing.expectEqual(@as(u32, 0xFFFF0000), px1[50 * W + 4]);
@@ -1774,7 +1807,7 @@ test "TASK-26.3: カラーグリフ描画は PNG と bit 一致し col を無視
     // col を変えても出力 bit 不変（カラーグリフは col 無視）
     var px2 = [_]u32{0xFF000000} ** (W * H);
     const target2 = RenderTarget{ .pixels = &px2, .width = W, .height = H };
-    of.drawTo(target2, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0x00, 0x00, 0x00, 0xFF), clip);
+    of.drawTo(target2, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0x00, 0x00, 0x00, 0xFF), clip, 1.0);
     try testing.expectEqualSlices(u32, &px1, &px2);
 }
 
@@ -1799,7 +1832,7 @@ test "TASK-26.3: モノクロ('A')とカラー(絵文字)混在描画は col の
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     const col = Color.rgba(0x11, 0x22, 0x33, 0xFF); // パレットと衝突しない識別用色
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A\u{1F600}", col, clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A\u{1F600}", col, clip, 1.0);
 
     // 絵文字（'A' の advance 64 だけ右にずれる）は col に関わらず PNG のまま
     try testing.expectEqual(@as(u32, 0xFFFF0000), px_buf[50 * W + 4 + 64]);
@@ -1869,7 +1902,7 @@ test "TASK-26.3: strike ppem != px は nearest-neighbor でスケールし origi
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0, 0, 0, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0, 0, 0, 0xFF), clip, 1.0);
 
     // baseline_y=52, scaled h=4, left=0, top=-(0+4)=-4 → by=48, bx=4
     const bx = 4;
@@ -1905,7 +1938,7 @@ test "TASK-26.3: originOffsetX/Y は bitmap 下端基準で配置に反映され
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0, 0, 0, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0, 0, 0, 0xFF), clip, 1.0);
 
     // baseline_y=52, left=round(3*1)=3, top=-(round(-5*1)+2)=-(-5+2)=3 → bx=7, by=55
     try testing.expectEqual(@as(u32, 0xFFFF0000), px_buf[55 * W + 7]);
@@ -1930,7 +1963,7 @@ test "TASK-26.3: 全 strike に bitmap 無しは outline へフォールバッ�
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     const gid = of.gidOf(0x1F600);
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
 
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
@@ -1940,7 +1973,7 @@ test "TASK-26.3: 全 strike に bitmap 無しは outline へフォールバッ�
     try testing.expect(of.color_cache.get(gid).?.failed);
 
     const count1 = of.color_cache.count();
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expectEqual(count1, of.color_cache.count()); // 再デコードされず tombstone のまま
 }
 
@@ -1964,7 +1997,7 @@ test "TASK-26.3: 空バイト列/不正PNGバイト列は outline へフォー�
         var px_buf = [_]u32{0xFF000000} ** (W * H);
         const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
         const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-        of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+        of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
 
         var any = false;
         for (px_buf) |p| if (p != 0xFF000000) {
@@ -1996,7 +2029,7 @@ test "TASK-26.3: 選択 strike に bitmap 無くても別 strike にあれば使
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     const col = Color.rgba(0x10, 0x20, 0x30, 0xFF); // 背景/PNG 色と衝突しない識別用色
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", col, clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", col, clip, 1.0);
 
     // scale=16/64=0.25 → 2x2 が 1x1 に縮小。ascent=ceil(48*16/64)=12 → baseline_y=16。
     // left=round(0*0.25)=0, top=-(round(0*0.25)+1)=-1 → by=15, bx=4。
@@ -2029,7 +2062,7 @@ test "TASK-26.3: sbix 構造破壊(findGlyph の InvalidFont)は sbix_broken を
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     // U+1F601(gid3) の findGlyph が InvalidFont → sbix_broken=true、outline(三角形)で描画継続
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.sbix_broken);
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
@@ -2058,7 +2091,7 @@ test "TASK-26.3: FontFace は破損 sbix テーブル(構造破壊)を null に�
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip); // outline のみで描画可
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0); // outline のみで描画可
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
@@ -2085,7 +2118,7 @@ test "TASK-26.3: 単一カラーエントリが cap 超過なら tombstone + las
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
 
     try testing.expect(of.last_oom);
     const gid = of.gidOf(0x1F600);
@@ -2119,13 +2152,13 @@ test "TASK-26.3: カラーキャッシュ総量超過で clearColorCache が発�
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
 
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     const gid_a = of.gidOf(0x1F600);
     try testing.expectEqual(@as(u32, 1), of.color_cache.count());
     try testing.expect(of.color_cache.contains(gid_a));
 
     of.color_cache_cap = of.color_cache_bytes; // 次の新規挿入で超過 → clearColorCache
-    of.drawTo(target, .{ .x = 40, .y = 4 }, "\u{1F601}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 40, .y = 4 }, "\u{1F601}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     const gid_b = of.gidOf(0x1F601);
     try testing.expectEqual(@as(u32, 1), of.color_cache.count()); // 1 エントリ目は消え 2 エントリ目のみ残る
     try testing.expect(!of.color_cache.contains(gid_a));
@@ -2167,7 +2200,7 @@ test "TASK-26.4: dupe は参照先の bitmap で描画され、origin も参照�
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     // U+1F601 は cmap format12 経由で gid3(dupe) に解決される（buildEmojiTestFontRaw の cmap 定義）。
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0, 0, 0, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0, 0, 0, 0xFF), clip, 1.0);
 
     // 参照先(gid2)の origin（x=3,y=-5）が採用される: baseline_y=52, left=round(3*1)=3,
     // top=-(round(-5*1)+2)=3 → bx=7, by=55（"originOffsetX/Y" テストと同じ座標。
@@ -2512,7 +2545,7 @@ test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
     var px_def = [_]u32{0xFF000000} ** (W * W);
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    of_def.drawTo(.{ .pixels = &px_def, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of_def.drawTo(.{ .pixels = &px_def, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
     // (b) setAxis max → 公開経路で外形変化
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
@@ -2520,7 +2553,7 @@ test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
     try testing.expectApproxEqAbs(@as(f32, 1), of_var.axis_norm[0], 0.01);
 
     var px_var = [_]u32{0xFF000000} ** (W * W);
-    of_var.drawTo(.{ .pixels = &px_var, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of_var.drawTo(.{ .pixels = &px_var, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
     // raster が default と異なる
     try testing.expect(!std.mem.eql(u32, &px_def, &px_var));
@@ -2735,8 +2768,8 @@ test "TASK-25.15.1: fvar あり norm=0 と完全非可変経路の描画 bit 一
     const target_v = RenderTarget{ .pixels = &px_var, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    of_static.drawTo(target_s, .{ .x = 4, .y = 4 }, "A", col, clip);
-    of_var.drawTo(target_v, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of_static.drawTo(target_s, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
+    of_var.drawTo(target_v, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
     try testing.expectEqualSlices(u32, &px_static, &px_var);
 }
 
@@ -2791,7 +2824,7 @@ test "TASK-25.15.1: setAxis 後 clearCache（axes_generation 増加）" {
     var px_buf = [_]u32{0} ** (W * W);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.cache.count() >= 1);
 
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
@@ -3017,9 +3050,9 @@ test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
     try of.resetAxes();
-    of.drawTo(.{ .pixels = &px_before, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of.drawTo(.{ .pixels = &px_before, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
     try of.setAxis(&wght, 900);
-    of.drawTo(.{ .pixels = &px_after, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip);
+    of.drawTo(.{ .pixels = &px_after, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
     try testing.expect(!std.mem.eql(u32, &px_before, &px_after));
 }
 
@@ -3041,7 +3074,7 @@ test "TASK-25.15.2: HVAR advance が measure/draw 送りと一致" {
     // draw の送り: 'A' + space。space は delta 0 → 64。合計 144
     try testing.expectEqual(@as(u32, 144), of.measure("A "));
     // CachedGlyph.advance も cache 経由
-    const cg = try of.getCached(1);
+    const cg = try of.getCached(1, of.physicalPxQ(1.0));
     try testing.expectApproxEqAbs(@as(f32, 80), cg.advance, 0.01);
 }
 
@@ -3269,7 +3302,7 @@ test "TASK-25.15.3: USE_MY_METRICS ありは component advance / 無しは compo
     try testing.expectApproxEqAbs(@as(f32, 40), of.advance_cache.?[3], 0.01);
     try testing.expectEqual(@as(u32, 40), of.measure("B"));
     // draw CachedGlyph.advance も一致
-    const cg_a = try of.getCached(2);
+    const cg_a = try of.getCached(2, of.physicalPxQ(1.0));
     try testing.expectApproxEqAbs(@as(f32, 100), cg_a.advance, 0.01);
 }
 
@@ -3283,7 +3316,7 @@ test "TASK-25.15.3: 点マッチ composite は公開経路 InvalidFont・低層 
     // 公開経路 buildGlyph
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
-    try testing.expectError(error.InvalidFont, of.getCached(4));
+    try testing.expectError(error.InvalidFont, of.getCached(4, of.physicalPxQ(1.0)));
 }
 
 test "TASK-25.15.3: named instance 一括設定 + norm0 で default 一致" {
@@ -3364,7 +3397,7 @@ test "TASK-25.15.3: composite 描画 snapshot（軸変更でピクセル変化�
     defer of.deinit();
     const W = 80;
     var px = [_]u32{0xFF000000} ** (W * W);
-    of.drawTo(.{ .pixels = &px, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .x = 0, .y = 0, .w = W, .h = W });
+    of.drawTo(.{ .pixels = &px, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .x = 0, .y = 0, .w = W, .h = W }, 1.0);
     var any = false;
     for (px) |p| {
         if (p != 0xFF000000) any = true;
@@ -3390,7 +3423,7 @@ test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック�
     const gid = of.gidOf(0x1F600);
 
     // 1 回目: decode 失敗 → outline(三角形) へフォールバックし failed tombstone を記録。
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.color_cache.get(gid).?.failed);
     const count_after_1st = of.color_cache.count();
 
@@ -3398,7 +3431,163 @@ test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック�
     // count も不変（同一 key の再挿入ではなく最初の get(gid).failed==true で即 return し
     // buildColorGlyph の decode 経路自体を通らないことの直接証拠。count 不変のみだと
     // 同一 key 上書きでも成立してしまうため failed の再確認も併せて行う。codex 指摘反映）。
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.color_cache.get(gid).?.failed);
     try testing.expectEqual(count_after_1st, of.color_cache.count());
+}
+
+// ============================================================
+// TASK-156.3: physical px scale / PhysicalGlyphKey
+// ============================================================
+
+test "TASK-156.3: physicalPxQ は 1/64px 量子化・最小 1" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+
+    // 16 * 1.0 * 64 = 1024
+    try testing.expectEqual(@as(u32, 1024), of.physicalPxQ(1.0));
+    // 16 * 2.0 * 64 = 2048
+    try testing.expectEqual(@as(u32, 2048), of.physicalPxQ(2.0));
+    // 微小差は同一 key に丸まる（16 * 1.00001 * 64 ≈ 1024.01024 → round 1024）
+    try testing.expectEqual(of.physicalPxQ(1.0), of.physicalPxQ(1.00001));
+    // scale 差が 1/64px を超えると別 key（16 * (1 + 1/1024) * 64 = 1024 + 1）
+    try testing.expectEqual(@as(u32, 1025), of.physicalPxQ(1.0 + 1.0 / 1024.0));
+    // 非正・非有限は 1.0 扱い相当（physicalPxQ 内で s=1.0）
+    try testing.expectEqual(of.physicalPxQ(1.0), of.physicalPxQ(0.0));
+    try testing.expectEqual(of.physicalPxQ(1.0), of.physicalPxQ(std.math.nan(f32)));
+}
+
+test "TASK-156.3: measure/metrics は draw scale 非依存・advance_cache 不変" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+
+    const m0 = of.metrics();
+    const w0 = of.measure("A");
+    const had_adv_cache = of.advance_cache != null;
+
+    const W = 128;
+    var px = [_]u32{0xFF000000} ** (W * W);
+    const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 2.0);
+
+    try testing.expectEqual(m0.line_height, of.metrics().line_height);
+    try testing.expectEqual(m0.ascent, of.metrics().ascent);
+    try testing.expectEqual(m0.descent, of.metrics().descent);
+    try testing.expectEqual(w0, of.measure("A"));
+    // 非可変フォントは advance_cache を確保しない（draw scale でも不変）
+    try testing.expectEqual(had_adv_cache, of.advance_cache != null);
+}
+
+test "TASK-156.3: 同一 GID の scale=1/2 は別 key で共存し、再描画で count 不変" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+
+    const W = 128;
+    var px = [_]u32{0xFF000000} ** (W * W);
+    const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
+    of.drawTo(target, .{ .x = 40, .y = 4 }, "A", col, clip, 2.0);
+    try testing.expectEqual(@as(u32, 2), of.cache.count());
+    const gid = of.gidOf(0x41);
+    try testing.expect(of.cache.contains(.{ .gid = gid, .physical_px_q = of.physicalPxQ(1.0) }));
+    try testing.expect(of.cache.contains(.{ .gid = gid, .physical_px_q = of.physicalPxQ(2.0) }));
+
+    // 同一 scale の 2 回目は entry 増えない
+    const bytes = of.cache_bytes;
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
+    of.drawTo(target, .{ .x = 40, .y = 4 }, "A", col, clip, 2.0);
+    try testing.expectEqual(@as(u32, 2), of.cache.count());
+    try testing.expectEqual(bytes, of.cache_bytes);
+
+    // scale=2 の bitmap は scale=1 より大きい
+    const cg1 = of.cache.get(.{ .gid = gid, .physical_px_q = of.physicalPxQ(1.0) }).?;
+    const cg2 = of.cache.get(.{ .gid = gid, .physical_px_q = of.physicalPxQ(2.0) }).?;
+    try testing.expect(cg1.bitmap != null and cg2.bitmap != null);
+    const b1 = cg1.bitmap.?;
+    const b2 = cg2.bitmap.?;
+    try testing.expect(b2.w * b2.h > b1.w * b1.h);
+    // 物理 advance も約 2 倍
+    try testing.expectApproxEqAbs(cg1.advance * 2.0, cg2.advance, 0.01);
+}
+
+test "TASK-156.3: 1/64px 量子化範囲内の scale 差は同一 key" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+
+    const W = 80;
+    var px = [_]u32{0xFF000000} ** (W * W);
+    const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", col, clip, 1.00001);
+    try testing.expectEqual(@as(u32, 1), of.cache.count());
+}
+
+test "TASK-156.3: scale 別 oversized tombstone が再試行を抑止" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+
+    // 極小 cap で任意の実グリフを oversized 扱いにする
+    of.cache_cap = @sizeOf(PhysicalGlyphKey) + @sizeOf(CachedGlyph) + 1;
+
+    const W = 80;
+    var px = [_]u32{0xFF000000} ** (W * W);
+    const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    try testing.expect(of.last_oom);
+    const key = PhysicalGlyphKey{ .gid = of.gidOf(0x41), .physical_px_q = of.physicalPxQ(1.0) };
+    try testing.expect(of.cache.get(key).?.oom);
+
+    of.last_oom = false;
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    try testing.expect(of.last_oom); // tombstone ヒットでも診断継続
+    try testing.expectEqual(@as(u32, 1), of.cache.count()); // 再試行で entry が増えない
+}
+
+test "TASK-156.3: cache_bytes は常に cache_cap 以下" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+    of.cache_cap = 4096;
+
+    const W = 256;
+    var px = [_]u32{0xFF000000} ** (W * W);
+    const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
+    // 複数 scale で複数 entry を詰め込む
+    const scales = [_]f32{ 1.0, 1.5, 2.0, 2.5, 3.0 };
+    for (scales) |s| {
+        of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, s);
+        try testing.expect(of.cache_bytes <= of.cache_cap);
+    }
 }

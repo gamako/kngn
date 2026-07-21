@@ -2984,9 +2984,9 @@ fn drawVizBand(app: *const App, fb: platform.Framebuffer, spec: *const Spec, osc
     const clip: gui.Rect = .{ .x = 0, .y = 0, .w = @intCast(fb_w), .h = @intCast(fb.height) };
     const label_col = gui.Color.rgba(0xC8, 0xD0, 0xD8, 0xFF);
     const ly: i32 = @intCast(band_y0 + 3);
-    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = ly }, "SPECTROGRAM", label_col, clip);
-    gui.default_bitmap_font.drawTo(target, .{ .x = SCOPE_X0, .y = ly }, "SCOPE (master)", label_col, clip);
-    gui.default_bitmap_font.drawTo(target, .{ .x = @intCast(METER_X0), .y = ly }, "LVL", label_col, clip);
+    gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0, .y = ly }, "SPECTROGRAM", label_col, clip, 1.0);
+    gui.default_bitmap_font.drawTo(target, .{ .x = SCOPE_X0, .y = ly }, "SCOPE (master)", label_col, clip, 1.0);
+    gui.default_bitmap_font.drawTo(target, .{ .x = @intCast(METER_X0), .y = ly }, "LVL", label_col, clip, 1.0);
 
     // spectrogram の周波数目盛り。
     const tick_col: u32 = 0xFFFFFFFF;
@@ -2998,7 +2998,7 @@ fn drawVizBand(app: *const App, fb: platform.Framebuffer, spec: *const Spec, osc
         while (tx < SPEC_X0 + 6) : (tx += 1) {
             if (tx < fb_w) fb.pixels[tick_y * fb_w + tx] = tick_col;
         }
-        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = @intCast(tick_y) }, fl.text, label_col, clip);
+        gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = @intCast(tick_y) }, fl.text, label_col, clip, 1.0);
     }
 }
 

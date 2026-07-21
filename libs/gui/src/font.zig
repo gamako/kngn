@@ -41,9 +41,9 @@ pub const BitmapFont = struct {
         const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
         return self.measure(text);
     }
-    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
+    fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
         const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
-        self.drawTo(target, pos, text, col, clip);
+        self.drawTo(target, pos, text, col, clip, scale);
     }
     fn metricsImpl(ptr: *const anyopaque) Metrics {
         const self: *const BitmapFont = @ptrCast(@alignCast(ptr));
@@ -61,26 +61,47 @@ pub const BitmapFont = struct {
         return 8 * countCodepoints(text);
     }
 
-    pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect) void {
-        var cx = pos.x;
+    /// scale: 論理 8×glyph_h → 物理の nearest 拡大倍率（1.0 は既存画素と完全一致）。
+    /// measure/metrics は論理 8×16 のまま。
+    pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
+        const s = if (std.math.isFinite(scale) and scale > 0) scale else 1.0;
+        if (s == 1.0) {
+            // 既存整数経路（scale=1.0 決定論を保証）
+            var cx = pos.x;
+            if (std.unicode.Utf8View.init(text)) |view| {
+                var it = view.iterator();
+                while (it.nextCodepoint()) |cp| {
+                    self.drawCodepoint(target, cp, cx, pos.y, col, clip, 1.0);
+                    cx += 8;
+                }
+            } else |_| {
+                for (text) |b| {
+                    self.drawCodepoint(target, b, cx, pos.y, col, clip, 1.0);
+                    cx += 8;
+                }
+            }
+            return;
+        }
+        var cx: f32 = @floatFromInt(pos.x);
         if (std.unicode.Utf8View.init(text)) |view| {
             var it = view.iterator();
             while (it.nextCodepoint()) |cp| {
-                self.drawCodepoint(target, cp, cx, pos.y, col, clip);
-                cx += 8;
+                if (!std.math.isFinite(cx) or cx > 2.0e9) break;
+                self.drawCodepoint(target, cp, @intFromFloat(@round(cx)), pos.y, col, clip, s);
+                cx += 8.0 * s;
             }
         } else |_| {
-            // 不正 UTF-8 はバイト単位 fallback（各バイトを 1 コードポイント扱い）
             for (text) |b| {
-                self.drawCodepoint(target, b, cx, pos.y, col, clip);
-                cx += 8;
+                if (!std.math.isFinite(cx) or cx > 2.0e9) break;
+                self.drawCodepoint(target, b, @intFromFloat(@round(cx)), pos.y, col, clip, s);
+                cx += 8.0 * s;
             }
         }
     }
 
-    fn drawCodepoint(self: BitmapFont, target: RenderTarget, cp: u21, x: i32, y: i32, col: Color, clip: Rect) void {
+    fn drawCodepoint(self: BitmapFont, target: RenderTarget, cp: u21, x: i32, y: i32, col: Color, clip: Rect, scale: f32) void {
         if (cp >= 32 and cp <= 127) {
-            drawGlyph(self, target, @intCast(cp - 32), x, y, col, clip);
+            drawGlyph(self, target, @intCast(cp - 32), x, y, col, clip, scale);
         }
         // 範囲外コードポイントは欠落グリフ＝描画スキップ（advance は呼び出し側で進める）
     }
@@ -100,24 +121,85 @@ fn countCodepoints(text: []const u8) u32 {
 
 /// 毎フレーム（テキスト描画）走るホットパス。グリフ矩形の clip はループ外 1 回
 /// （fnt.clipCoverage）、内側は無検査で立ちビットを blend（TASK-58）。
-fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i32, col: Color, clip: Rect) void {
-    const cc = fnt.clipCoverage(target, x, y, 8, font.glyph_h, clip) orelse return;
+/// scale==1.0 は既存の 1:1 blit。それ以外は source 列/行ごとに
+/// `[floor(i*s), floor((i+1)*s))` の nearest 拡大（エッジ floor で seamless）。
+fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i32, col: Color, clip: Rect, scale: f32) void {
     const base = @as(usize, glyph_idx) * @as(usize, font.glyph_h);
-    var row = cc.cy0;
-    while (row < cc.cy1) : (row += 1) {
+    if (scale == 1.0) {
+        const cc = fnt.clipCoverage(target, x, y, 8, font.glyph_h, clip) orelse return;
+        var row = cc.cy0;
+        while (row < cc.cy1) : (row += 1) {
+            const row_bits = font.glyphs[base + row];
+            // clipCoverage の保証により y+row / x+cx は非負かつ target 内
+            const py: u32 = @intCast(y + @as(i32, @intCast(row)));
+            const dst_base = py * target.width;
+            var cx = cc.cx0;
+            while (cx < cc.cx1) : (cx += 1) {
+                const bit_pos: u3 = @intCast(7 - cx);
+                if ((row_bits >> bit_pos) & 1 != 0) {
+                    const px: u32 = @intCast(x + @as(i32, @intCast(cx)));
+                    const idx = dst_base + px;
+                    // 立ちビット = カバレッジ 255（実効 α = col.a）
+                    const dst: Color = @bitCast(target.pixels[idx]);
+                    target.pixels[idx] = @bitCast(Color.blend(dst, col));
+                }
+            }
+        }
+        return;
+    }
+
+    // nearest 拡大: エッジ表をグリフ単位で一度だけ構築（per-pixel float 禁止）
+    const gw: u32 = 8;
+    const gh: u32 = font.glyph_h;
+    var x_edges: [9]i32 = undefined;
+    var y_edges: [17]i32 = undefined; // glyph_h <= 16
+    std.debug.assert(gh <= 16);
+    var i: u32 = 0;
+    while (i <= gw) : (i += 1) {
+        x_edges[i] = @intFromFloat(@floor(@as(f32, @floatFromInt(i)) * scale));
+    }
+    i = 0;
+    while (i <= gh) : (i += 1) {
+        y_edges[i] = @intFromFloat(@floor(@as(f32, @floatFromInt(i)) * scale));
+    }
+    const phys_w: u32 = @intCast(@max(0, x_edges[gw] - x_edges[0]));
+    const phys_h: u32 = @intCast(@max(0, y_edges[gh] - y_edges[0]));
+    if (phys_w == 0 or phys_h == 0) return;
+    const cc = fnt.clipCoverage(target, x + x_edges[0], y + y_edges[0], phys_w, phys_h, clip) orelse return;
+
+    var row: u32 = 0;
+    while (row < gh) : (row += 1) {
+        const y0 = y_edges[row] - y_edges[0];
+        const y1 = y_edges[row + 1] - y_edges[0];
+        if (y0 >= y1) continue;
+        // 物理行範囲と clip の交差
+        const ry0 = @max(y0, cc.cy0);
+        const ry1 = @min(y1, cc.cy1);
+        if (ry0 >= ry1) continue;
+
         const row_bits = font.glyphs[base + row];
-        // clipCoverage の保証により y+row / x+cx は非負かつ target 内
-        const py: u32 = @intCast(y + @as(i32, @intCast(row)));
-        const dst_base = py * target.width;
-        var cx = cc.cx0;
-        while (cx < cc.cx1) : (cx += 1) {
-            const bit_pos: u3 = @intCast(7 - cx);
-            if ((row_bits >> bit_pos) & 1 != 0) {
-                const px: u32 = @intCast(x + @as(i32, @intCast(cx)));
-                const idx = dst_base + px;
-                // 立ちビット = カバレッジ 255（実効 α = col.a）
-                const dst: Color = @bitCast(target.pixels[idx]);
-                target.pixels[idx] = @bitCast(Color.blend(dst, col));
+        var col_i: u32 = 0;
+        while (col_i < gw) : (col_i += 1) {
+            const bit_pos: u3 = @intCast(7 - col_i);
+            if ((row_bits >> bit_pos) & 1 == 0) continue;
+            const x0 = x_edges[col_i] - x_edges[0];
+            const x1 = x_edges[col_i + 1] - x_edges[0];
+            if (x0 >= x1) continue;
+            const rx0 = @max(x0, cc.cx0);
+            const rx1 = @min(x1, cc.cx1);
+            if (rx0 >= rx1) continue;
+
+            var py = ry0;
+            while (py < ry1) : (py += 1) {
+                const ty: u32 = @intCast(y + y_edges[0] + @as(i32, @intCast(py)));
+                const dst_base = ty * target.width;
+                var px = rx0;
+                while (px < rx1) : (px += 1) {
+                    const tx: u32 = @intCast(x + x_edges[0] + @as(i32, @intCast(px)));
+                    const idx = dst_base + tx;
+                    const dst: Color = @bitCast(target.pixels[idx]);
+                    target.pixels[idx] = @bitCast(Color.blend(dst, col));
+                }
             }
         }
     }
@@ -212,7 +294,34 @@ pub const default_bitmap_font: BitmapFont = .{
 };
 
 /// gui 既定フォント。共通 `Font` インターフェース値として公開する。
+/// （BitmapFont のまま維持。Outline 既定は `defaultOutlineFont()` を使う。）
 pub const default_font: Font = default_bitmap_font.asFont();
+
+// ── default OutlineFont（Press Start 2P 埋め込み TTF、遅延初期化）──
+// GUI メインスレッド専用・プロセス寿命（deinit 不要）。face のアドレスは初期化後不変。
+const outline_font_mod = @import("font").OutlineFont;
+const FontFace = @import("font").FontFace;
+
+var default_outline_state: struct {
+    initialized: bool = false,
+    face: FontFace = undefined,
+    outline: outline_font_mod = undefined,
+} = .{};
+
+/// 埋め込み Press Start 2P の OutlineFont（論理 16px）。初回呼び出しで遅延初期化。
+/// AC4 の crisp 描画検証・明示選択用。`default_font`（bitmap）は置換しない。
+pub fn defaultOutlineFont() Font {
+    if (!default_outline_state.initialized) {
+        default_outline_state.face = FontFace.init(@import("font").default_font_bytes) catch unreachable;
+        default_outline_state.outline = outline_font_mod.init(
+            std.heap.page_allocator,
+            &default_outline_state.face,
+            16,
+        );
+        default_outline_state.initialized = true;
+    }
+    return default_outline_state.outline.asFont();
+}
 
 // ============================================================
 // TASK-167: 論理 ink 高さ・縦中央揃え helper
@@ -283,12 +392,93 @@ test "drawTo: ASCII グリフが描画される（共通カバレッジ描画路
     const t = RenderTarget{ .pixels = &px, .width = 64, .height = 16 };
     const clip = Rect{ .x = 0, .y = 0, .w = 64, .h = 16 };
     // "!" は set bit を持つので何かしら塗られる
-    default_font.drawTo(t, .{ .x = 0, .y = 0 }, "!", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip);
+    default_font.drawTo(t, .{ .x = 0, .y = 0 }, "!", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     var any_set = false;
     for (px) |p| {
         if (p != 0xFF000000) any_set = true;
     }
     try std.testing.expect(any_set);
+}
+
+test "TASK-156.3: BitmapFont scale=1.0 は既存画素と完全一致" {
+    var px_a = [_]u32{0xFF000000} ** (32 * 16);
+    var px_b = [_]u32{0xFF000000} ** (32 * 16);
+    const t_a = RenderTarget{ .pixels = &px_a, .width = 32, .height = 16 };
+    const t_b = RenderTarget{ .pixels = &px_b, .width = 32, .height = 16 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 32, .h = 16 };
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    // 直接 1.0 経路と default_font 経由
+    default_bitmap_font.drawTo(t_a, .{ .x = 0, .y = 0 }, "Hi!", col, clip, 1.0);
+    default_font.drawTo(t_b, .{ .x = 0, .y = 0 }, "Hi!", col, clip, 1.0);
+    try std.testing.expectEqualSlices(u32, &px_a, &px_b);
+}
+
+test "TASK-156.3: BitmapFont nearest 拡大 scale=2.0 は 2x2 ブロック" {
+    var px1 = [_]u32{0xFF000000} ** (16 * 16);
+    var px2 = [_]u32{0xFF000000} ** (32 * 32);
+    const t1 = RenderTarget{ .pixels = &px1, .width = 16, .height = 16 };
+    const t2 = RenderTarget{ .pixels = &px2, .width = 32, .height = 32 };
+    const clip1 = Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
+    const clip2 = Rect{ .x = 0, .y = 0, .w = 32, .h = 32 };
+    const col = Color.rgba(0xFF, 0x00, 0x00, 0xFF);
+    default_bitmap_font.drawTo(t1, .{ .x = 0, .y = 0 }, "!", col, clip1, 1.0);
+    default_bitmap_font.drawTo(t2, .{ .x = 0, .y = 0 }, "!", col, clip2, 2.0);
+    // 1x の各 set pixel が 2x2 ブロックになる
+    var row: u32 = 0;
+    while (row < 16) : (row += 1) {
+        var col_i: u32 = 0;
+        while (col_i < 8) : (col_i += 1) {
+            const src = px1[row * 16 + col_i];
+            const expected = src;
+            try std.testing.expectEqual(expected, px2[(row * 2) * 32 + col_i * 2]);
+            try std.testing.expectEqual(expected, px2[(row * 2) * 32 + col_i * 2 + 1]);
+            try std.testing.expectEqual(expected, px2[(row * 2 + 1) * 32 + col_i * 2]);
+            try std.testing.expectEqual(expected, px2[(row * 2 + 1) * 32 + col_i * 2 + 1]);
+        }
+    }
+}
+
+test "TASK-156.3: BitmapFont measure/metrics は scale 非依存" {
+    const m = default_bitmap_font.metrics();
+    try std.testing.expectEqual(@as(u32, 16), m.line_height);
+    try std.testing.expectEqual(@as(u32, 24), default_bitmap_font.measure("ABC"));
+    // draw しても measure は論理のまま
+    var px = [_]u32{0xFF000000} ** (64 * 32);
+    const t = RenderTarget{ .pixels = &px, .width = 64, .height = 32 };
+    default_bitmap_font.drawTo(t, .{ .x = 0, .y = 0 }, "ABC", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .x = 0, .y = 0, .w = 64, .h = 32 }, 2.0);
+    try std.testing.expectEqual(@as(u32, 24), default_bitmap_font.measure("ABC"));
+    try std.testing.expectEqual(m.ascent, default_bitmap_font.metrics().ascent);
+}
+
+test "TASK-156.3: defaultOutlineFont は論理 16px metrics と ASCII 非透明画素" {
+    const f = defaultOutlineFont();
+    const m = f.metrics();
+    try std.testing.expectEqual(@as(u32, 16), m.line_height);
+    try std.testing.expect(m.ascent > 0);
+    try std.testing.expect(m.ascent + m.descent <= @as(i32, @intCast(m.line_height)));
+
+    var px = [_]u32{0xFF000000} ** (128 * 32);
+    const t = RenderTarget{ .pixels = &px, .width = 128, .height = 32 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 128, .h = 32 };
+    f.drawTo(t, .{ .x = 2, .y = 2 }, "Hi! ABC", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    var any: bool = false;
+    for (px) |p| {
+        if (p != 0xFF000000) any = true;
+    }
+    try std.testing.expect(any);
+
+    // scale=2.0 でも描画でき、scale 差で異なる解像度が cache される
+    @memset(&px, 0xFF000000);
+    f.drawTo(t, .{ .x = 2, .y = 2 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 2.0);
+    any = false;
+    for (px) |p| {
+        if (p != 0xFF000000) any = true;
+    }
+    try std.testing.expect(any);
+
+    // 2 回目呼び出しは同一 Font（遅延初期化済み）
+    const f2 = defaultOutlineFont();
+    try std.testing.expect(f.ptr == f2.ptr);
 }
 
 test "TASK-167: inkHeight は default bitmap で 16（ascent+descent）" {
