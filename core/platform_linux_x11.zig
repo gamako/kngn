@@ -37,6 +37,7 @@ const c = @cImport({
     @cInclude("X11/Xatom.h"); // XA_ATOM（createFullscreen の _NET_WM_STATE 設定用。TASK-100）
     @cInclude("X11/XKBlib.h"); // XkbSetDetectableAutoRepeat
     @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair（system cursor。TASK-75.3）
+    @cInclude("X11/Xresource.h"); // Xrm API（Xft.dpi → content_scale。TASK-156.5 Stage 2）
     @cInclude("X11/extensions/XShm.h");
     @cInclude("X11/extensions/shape.h"); // クリック透過の input shape（TASK-104.2）
     @cInclude("sys/ipc.h");
@@ -49,6 +50,61 @@ const EventStats = types.EventStats;
 const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
 const MouseEvent = types.MouseEvent;
+const FramebufferMode = types.FramebufferMode;
+const WindowSize = types.WindowSize;
+
+// ============================================================================
+// TASK-156.5 Stage 2: 高 DPI 共通ヘルパー（plan「共通パターン」。単体テスト対象）
+// ホットパス宣言: 初期化時 / イベント時のみ（フレーム毎・RT ではない）。
+// ============================================================================
+
+/// 入力正規化用の実スケール（query 用。lock 前・都度再取得）。fb_mode に非依存。
+fn effectiveContentScale(raw_scale: f32) f32 {
+    return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
+}
+
+/// objc の (int)lround((double)px * (double)scale) と数値一致させる。
+/// 有限値 [1, u32最大] にクランプする（1未満→1、u32最大超過→u32最大）。
+fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
+    const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
+    const v: f64 = @round(@as(f64, @floatFromInt(logical_px)) * s);
+    if (!std.math.isFinite(v) or v < 1.0) return 1;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// framebuffer 物理サイズ。.logical は常に logical そのもの（R9 の構造的保証はここに集約）。
+fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
+    if (fb_mode == .logical) return logical;
+    return .{
+        .width = roundToPhysicalPx(logical.width, scale),
+        .height = roundToPhysicalPx(logical.height, scale),
+    };
+}
+
+/// Xft.dpi（X resource）から content_scale を取得する。失敗は fail-soft で 1.0。
+/// Xft.dpi はディスプレイ全体のグローバル値（per-monitor DPI ではない）。起動時固定。
+fn queryXftContentScale(dpy: *c.Display) f32 {
+    c.XrmInitialize();
+    const rms = c.XResourceManagerString(dpy) orelse return 1.0;
+    const db = c.XrmGetStringDatabase(rms);
+    if (db == null) return 1.0;
+    defer c.XrmDestroyDatabase(db);
+
+    var type_ret: [*c]u8 = undefined;
+    var value: c.XrmValue = undefined;
+    if (c.XrmGetResource(db, "Xft.dpi", "Xft.Dpi", &type_ret, &value) == 0) return 1.0;
+    if (value.addr == null or value.size == 0) return 1.0;
+
+    const addr: [*]const u8 = @ptrCast(value.addr);
+    const raw: []const u8 = addr[0..value.size];
+    const text = std.mem.trim(u8, raw, " \t\r\n\x00");
+    if (text.len == 0) return 1.0;
+    const dpi = std.fmt.parseFloat(f64, text) catch return 1.0;
+    if (!(dpi > 0) or !std.math.isFinite(dpi)) return 1.0;
+    const scale: f32 = @floatCast(dpi / 96.0);
+    return effectiveContentScale(scale);
+}
 
 comptime {
     // 本ファイルは x11 実装。dispatcher(platform_linux.zig)が build_options.platform_backend=="x11"
@@ -120,8 +176,22 @@ const State = struct {
     display: *c.Display,
     window: c.Window,
     gc: c.GC,
+    /// 論理サイズ（アプリ/gui 座標。create 引数・独立保持。lround 逆算に依存しない）。
+    logical_width: u32,
+    logical_height: u32,
+    /// 物理 / framebuffer / window 実ピクセル寸法（blit・present・ConfigureNotify の単位）。
+    /// `.logical` では logical と同値、`.physical` では `roundToPhysicalPx(logical, scale)`。
+    physical_width: u32,
+    physical_height: u32,
+    /// 後方互換 alias: 既存 blit 経路が参照する framebuffer 寸法 == physical_*。
     width: u32,
     height: u32,
+    fb_mode: FramebufferMode,
+    /// query 用（入力 raw 化・`contentScale()`）。X11 は runtime 変更非対応のため latched と同値のまま。
+    pending_content_scale: f32,
+    /// latched（`lockFramebuffer` snapshot）。起動時に確定し以後不変（scale_epoch は 0 のまま）。
+    content_scale: f32,
+    scale_epoch: u64,
     wm_delete: c.Atom,
     // resize（TASK-23）で setupBlit を再実行するため、作成時の visual/depth を保持する。
     visual: ?*c.Visual,
@@ -218,6 +288,13 @@ pub const Window = struct {
         const init_x: c_int = if (opts.position) |p| p.x else 0;
         const init_y: c_int = if (opts.position) |p| p.y else 0;
 
+        // TASK-156.5 Stage 2: Xft.dpi → content_scale（失敗は 1.0）。fb_mode に関わらず実スケールを保持。
+        const scale = queryXftContentScale(dpy);
+        const logical: WindowSize = .{ .width = width, .height = height };
+        const fb_size = effectiveFramebufferSize(opts.fb_mode, logical, scale);
+        const win_w = fb_size.width;
+        const win_h = fb_size.height;
+
         var visual: ?*c.Visual = undefined;
         var depth: c_uint = undefined;
         var win: c.Window = undefined;
@@ -248,7 +325,8 @@ pub const Window = struct {
                 c.KeyPressMask | c.KeyReleaseMask |
                 c.ButtonPressMask | c.ButtonReleaseMask | c.PointerMotionMask;
             const valuemask: c_ulong = c.CWColormap | c.CWBorderPixel | c.CWBackPixel | c.CWEventMask;
-            win = c.XCreateWindow(dpy, root, init_x, init_y, @intCast(width), @intCast(height), 0, 32, c.InputOutput, vinfo.visual, valuemask, &attrs);
+            // `.physical` 時は物理px寸法で window を作る（X11 に OS 自動拡大は無い）。
+            win = c.XCreateWindow(dpy, root, init_x, init_y, @intCast(win_w), @intCast(win_h), 0, 32, c.InputOutput, vinfo.visual, valuemask, &attrs);
             if (win == 0) return error.WindowCreationFailed; // ここまでで失敗 → 上の errdefer が colormap 解放
             // 32bit drawable には depth 一致の GC が要る（既定 GC は depth 24 で BadMatch になりうる）。
             gc = c.XCreateGC(dpy, win, 0, null) orelse {
@@ -263,7 +341,7 @@ pub const Window = struct {
             const black = c.XBlackPixel(dpy, screen);
             // §2.1: 既定 visual が TrueColor であることを要求（DirectColor 等は colormap 前提で非対応）
             if (visual.?.class != c.TrueColor) return error.WindowCreationFailed;
-            win = c.XCreateSimpleWindow(dpy, root, init_x, init_y, @intCast(width), @intCast(height), 0, black, black);
+            win = c.XCreateSimpleWindow(dpy, root, init_x, init_y, @intCast(win_w), @intCast(win_h), 0, black, black);
             gc = c.XDefaultGC(dpy, screen);
         }
         // 以降（setupBlit / alloc.create 等）の失敗で win/GC/colormap をまとめて解放（透過生成のリーク防止）。
@@ -328,8 +406,16 @@ pub const Window = struct {
             .display = dpy,
             .window = win,
             .gc = gc,
-            .width = width,
-            .height = height,
+            .logical_width = width,
+            .logical_height = height,
+            .physical_width = win_w,
+            .physical_height = win_h,
+            .width = win_w,
+            .height = win_h,
+            .fb_mode = opts.fb_mode,
+            .pending_content_scale = scale,
+            .content_scale = scale,
+            .scale_epoch = 0,
             .wm_delete = wm_delete,
             .visual = visual,
             .depth = depth,
@@ -359,7 +445,8 @@ pub const Window = struct {
 
         // blit セットアップ（XShm 可なら shm、不可/失敗なら XPutImage）。
         // visual 分類で direct/fallback を決め、st.backing（caller が書く canonical BGRA）も確定する。
-        try setupBlit(st, visual, depth, width, height);
+        // `.physical` では物理px寸法で確保する。
+        try setupBlit(st, visual, depth, win_w, win_h);
 
         // blit 準備が成功してから map（失敗時に一瞬 map されるのを防ぐ）
         _ = c.XMapWindow(dpy, win);
@@ -404,9 +491,11 @@ pub const Window = struct {
                 c.ConfigureNotify => {
                     // 自由リサイズ（TASK-23）。新サイズで blit を two-phase 再確保する。
                     // pollEvents はフレーム境界（lock 外）で呼ばれるので再確保は安全。
+                    // ConfigureNotify の width/height は window 実ピクセル寸法
+                    // （`.logical`=論理寸法で作成、`.physical`=物理寸法で作成）なのでそのまま physical。
                     const cw: u32 = @intCast(ev.xconfigure.width);
                     const ch: u32 = @intCast(ev.xconfigure.height);
-                    resizeBlit(st, cw, ch);
+                    applyConfigureSize(st, cw, ch);
                 },
                 c.Expose => {}, // present は毎フレーム呼ばれるので no-op
                 c.KeyPress => handleKeyPress(st, &ev.xkey),
@@ -445,17 +534,38 @@ pub const Window = struct {
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
         const st = self.state;
-        const size: types.WindowSize = .{ .width = st.width, .height = st.height };
+        // X11 は runtime scale 変更非対応のため latch は起動時値のまま（apply は恒等）。
+        // query/latched の 2 モード構造は他 backend と揃えて維持する。
+        const scale = effectiveContentScale(st.content_scale);
+        const logical: WindowSize = .{ .width = st.logical_width, .height = st.logical_height };
+        const fb_size: WindowSize = .{ .width = st.physical_width, .height = st.physical_height };
         return .{
             .pixels = st.backing,
-            .width = st.width,
-            .height = st.height,
-            .logical_size = size,
-            .framebuffer_size = size,
-            .content_scale = 1.0,
-            .scale_epoch = 0,
+            .width = st.physical_width,
+            .height = st.physical_height,
+            .logical_size = logical,
+            .framebuffer_size = fb_size,
+            .content_scale = scale,
+            .scale_epoch = st.scale_epoch,
             .state = st,
         };
+    }
+
+    /// 現在の negotiated logical size（TASK-156.5 Stage 2）。frame 中の描画は Framebuffer snapshot を使う。
+    pub fn logicalSize(self: Window) WindowSize {
+        const st = self.state;
+        return .{ .width = st.logical_width, .height = st.logical_height };
+    }
+
+    /// 現在の negotiated framebuffer size（物理px。`.logical` では logical と同値）。
+    pub fn framebufferSize(self: Window) WindowSize {
+        const st = self.state;
+        return .{ .width = st.physical_width, .height = st.physical_height };
+    }
+
+    /// 現在の negotiated content scale（`.logical`/`.physical` 問わず実 Xft.dpi 由来。失敗時 1.0）。
+    pub fn contentScale(self: Window) f32 {
+        return effectiveContentScale(self.state.pending_content_scale);
     }
 
     pub fn present(self: Window) void {
@@ -584,7 +694,7 @@ pub const Window = struct {
 
 /// 現在のウィンドウ geometry（TASK-117）。
 /// 位置は client origin の root 座標（XTranslateCoordinates）。失敗時は position=null。
-/// サイズは content（State.width/height）。復元側は WM_NORMAL_HINTS の StaticGravity で同基準。
+/// サイズは **論理** content（`logical_width/height`）。復元側は WM_NORMAL_HINTS の StaticGravity で同基準。
 /// module-level（facade の `@hasDecl(backend, "getGeometry")` 契約。Window メソッド禁止）。
 pub fn getGeometry(win: Window) types.WindowGeometry {
     const st = win.state;
@@ -594,7 +704,7 @@ pub fn getGeometry(win: Window) types.WindowGeometry {
     const ok = c.XTranslateCoordinates(st.display, st.window, c.XDefaultRootWindow(st.display), 0, 0, &root_x, &root_y, &child);
     return .{
         .position = if (ok != 0) .{ .x = root_x, .y = root_y } else null,
-        .size = .{ .width = st.width, .height = st.height },
+        .size = .{ .width = st.logical_width, .height = st.logical_height },
     };
 }
 
@@ -722,13 +832,29 @@ fn setButton(st: *State, mb: MouseButton, down: bool) void {
 }
 
 /// MouseEvent を組む。buttons は内部追跡（post-state）、modifiers は state mask（mouse は修飾が変化しない）。
+/// 座標は raw physical（facade が latched content_scale で論理へ正規化）。
+/// X11 契約: `.logical` → `native × content_scale`、`.physical` → `native`（乗算なし）。
 fn mouseEvent(st: *State, x: c_int, y: c_int, button: MouseButton, state: u32) MouseEvent {
+    const raw = nativeToRawPhysical(st, x, y);
     return .{
-        .x = @intCast(x),
-        .y = @intCast(y),
+        .x = raw.x,
+        .y = raw.y,
         .button = button,
         .buttons = st.buttons,
         .modifiers = input.stateToModifiers(state),
+    };
+}
+
+/// X11 native（window 実ピクセル座標）→ raw physical event 座標。
+fn nativeToRawPhysical(st: *const State, native_x: c_int, native_y: c_int) struct { x: i32, y: i32 } {
+    if (st.fb_mode == .physical) {
+        return .{ .x = native_x, .y = native_y };
+    }
+    // `.logical`: window は論理寸法 → native は論理値。facade 正規化と対になる raw physical へ乗算。
+    const s = effectiveContentScale(st.pending_content_scale);
+    return .{
+        .x = @intFromFloat(@floor(@as(f64, @floatFromInt(native_x)) * @as(f64, s))),
+        .y = @intFromFloat(@floor(@as(f64, @floatFromInt(native_y)) * @as(f64, s))),
     };
 }
 
@@ -738,9 +864,10 @@ fn handleButtonPress(st: *State, e: *c.XButtonEvent) void {
         setButton(st, mb, true); // post-state（押下を含む）にしてから event を作る
         st.enqueue(.{ .mouse_down = mouseEvent(st, e.x, e.y, mb, @intCast(e.state)) });
     } else if (input.wheelDelta(button)) |d| {
+        const raw = nativeToRawPhysical(st, e.x, e.y);
         st.enqueue(.{ .mouse_scroll = .{
-            .x = @intCast(e.x),
-            .y = @intCast(e.y),
+            .x = raw.x,
+            .y = raw.y,
             .dx = d.dx,
             .dy = d.dy,
             .is_precise = false,
@@ -1036,11 +1163,37 @@ fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
     if (!b.direct and b.backing.len != 0) alloc.free(b.backing);
 }
 
+/// ConfigureNotify の window 実ピクセル寸法を logical/physical に反映して blit を再確保する。
+/// ホットパス宣言: リサイズイベント時のみ。
+fn applyConfigureSize(st: *State, new_phys_w: u32, new_phys_h: u32) void {
+    if (new_phys_w == 0 or new_phys_h == 0) return;
+    if (new_phys_w == st.physical_width and new_phys_h == st.physical_height) return;
+
+    // Configure 寸法は常に window 実ピクセル = physical / framebuffer。
+    const new_logical_w: u32 = if (st.fb_mode == .logical) new_phys_w else blk: {
+        const s = effectiveContentScale(st.content_scale);
+        const v = @round(@as(f64, @floatFromInt(new_phys_w)) / @as(f64, s));
+        break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
+    };
+    const new_logical_h: u32 = if (st.fb_mode == .logical) new_phys_h else blk: {
+        const s = effectiveContentScale(st.content_scale);
+        const v = @round(@as(f64, @floatFromInt(new_phys_h)) / @as(f64, s));
+        break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
+    };
+
+    resizeBlit(st, new_phys_w, new_phys_h);
+    // resizeBlit 成功時のみ physical が更新される。失敗時は旧サイズ維持なので logical も触らない。
+    if (st.physical_width == new_phys_w and st.physical_height == new_phys_h) {
+        st.logical_width = new_logical_w;
+        st.logical_height = new_logical_h;
+    }
+}
+
 /// ConfigureNotify で呼ぶ。新サイズで setupBlit を試し、成功したら旧 blit を解放して
-/// st.width/height を更新する。失敗（OOM 等）時は旧 blit を復元して旧サイズを維持する（window を壊さない）。
+/// physical/width/height を更新する。失敗（OOM 等）時は旧 blit を復元して旧サイズを維持する（window を壊さない）。
 fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
     if (new_w == 0 or new_h == 0) return; // 最小化/ゼロは無視
-    if (new_w == st.width and new_h == st.height) return;
+    if (new_w == st.physical_width and new_h == st.physical_height) return;
 
     var old = captureBlit(st);
     // setupBlit は st の blit フィールドを新リソースで上書きする（失敗時は内部の failBlit が
@@ -1049,6 +1202,8 @@ fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
         restoreBlit(st, old);
         return;
     };
+    st.physical_width = new_w;
+    st.physical_height = new_h;
     st.width = new_w;
     st.height = new_h;
     st.ct_region_valid = false; // TASK-104.2: サイズ変更で click-through input shape を再計算させる（旧マスクは stale）
@@ -1072,4 +1227,46 @@ fn convert(st: *State) void {
             row[x] = conv.packPixel(src[x], st.r_shift, st.g_shift, st.b_shift);
         }
     }
+}
+
+// ============================================================================
+// TASK-156.5 Stage 2 / R9: 共通ヘルパーの構造的ユニットテスト（display 不要）
+// Linux + `-Dplatform=x11` で本モジュールがテスト root に含まれるとき実行される。
+// ============================================================================
+
+test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず logical を返す" {
+    const logical: WindowSize = .{ .width = 800, .height = 600 };
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 };
+    for (scales) |s| {
+        const fb = effectiveFramebufferSize(.logical, logical, s);
+        try std.testing.expectEqual(logical.width, fb.width);
+        try std.testing.expectEqual(logical.height, fb.height);
+    }
+}
+
+test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を適用する" {
+    const logical: WindowSize = .{ .width = 800, .height = 600 };
+    const fb2 = effectiveFramebufferSize(.physical, logical, 2.0);
+    try std.testing.expectEqual(@as(u32, 1600), fb2.width);
+    try std.testing.expectEqual(@as(u32, 1200), fb2.height);
+
+    const fb15 = effectiveFramebufferSize(.physical, logical, 1.5);
+    try std.testing.expectEqual(@as(u32, 1200), fb15.width);
+    try std.testing.expectEqual(@as(u32, 900), fb15.height);
+}
+
+test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ" {
+    try std.testing.expectEqual(@as(u32, 1), roundToPhysicalPx(0, 2.0)); // 0*2→0 → clamp to 1
+    try std.testing.expectEqual(@as(u32, 1600), roundToPhysicalPx(800, 2.0));
+    try std.testing.expectEqual(@as(u32, 1200), roundToPhysicalPx(800, 1.5));
+    try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, 0.0)); // invalid scale → 1.0
+    try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, std.math.nan(f32)));
+}
+
+test "TASK-156.5: effectiveContentScale は非正・非有限を 1.0 に補正" {
+    try std.testing.expectEqual(@as(f32, 2.0), effectiveContentScale(2.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.inf(f32)));
 }
