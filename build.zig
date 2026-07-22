@@ -167,7 +167,7 @@ fn buildWasmPixie(
 ) WasmExeBuild {
     const wasm_max_opts = b.addOptions();
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule());
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target.result.os.tag);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const pixie_mod = b.createModule(.{
@@ -233,7 +233,7 @@ fn buildWasmSynth(
     // wasm_shared=false → single_threaded=true（wasm_allocator 可）。atomics は target feature で担保。
     const wasm_max_opts = b.addOptions();
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule());
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), base_target.result.os.tag);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const synth_mod = b.createModule(.{
@@ -383,7 +383,7 @@ pub fn build(b: *std.Build) void {
     // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
     // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
     // ========================================
-    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod);
+    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target_os);
 
     // 外部公開 kit umbrella（TASK-111.7）。SharedModules の既存 instance を再利用して型同一性を保つ。
     // dep.module("kit") で取得。platform / gui / gamepad 等は kit 経由でも同一 module instance。
@@ -613,11 +613,11 @@ pub fn build(b: *std.Build) void {
     //
     // 既知の制限（Linux 外部消費は未対応）: 29.1 の公開モデル（facade module + native .o archive）は
     // macOS backend(Obj-C/Swift を別コンパイル)前提の形。Linux で外部パッケージとして
-    // `dep.module("platform")` を使うと、(1) facade が platform_linux.zig を選び
-    // `@import("build_options")`(platform_backend) を要求するが公開 module には付いていない、
-    // (2) X11 の include / `linkSystemLibrary("X11"/"Xext")` が無い、(3) Linux backend は純 Zig で
-    // 別 .o archive 不要、のため成立しない。対応するなら公開 module を backend-aware にする
-    // （Linux 既定 x11 の build_options + X11 link を付与）必要がある。自プロジェクトの内部ビルドは
+    // `dep.module("platform")` を使うと、(1) facade が platform_linux.zig を選び、
+    // `@import("build_options")`(platform_backend) は SharedModules.init が OS 既定値（x11）を
+    // 付与するので解決できる（TASK-172）が、(2) X11 の include / `linkSystemLibrary("X11"/"Xext")`
+    // が無い、(3) Linux backend は純 Zig で別 .o archive 不要、のため依然成立しない。対応するなら
+    // 公開 module を backend-aware にする（X11 link を付与）必要がある。自プロジェクトの内部ビルドは
     // per-backend module(makePlatformModules)を使うので無影響。需要が出たら 29.x で対応。
     // ========================================
     if (target_os == .macos) {
@@ -1065,6 +1065,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("libs/appshell/src/appshell.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true, // paths.zig の std.c.getenv 用
     });
     appshell_test_mod.addImport("serde", shared_modules.serde.mod);
     const appshell_test = b.addTest(.{ .root_module = appshell_test_mod });
@@ -2462,7 +2463,7 @@ fn addMainExe(
 // ADR-007: 各共有 module は層タグ（TaggedModule）付きで生成し、配線は link() を通す。
 // ============================================================
 const SharedModules = struct {
-    platform: TaggedModule, // 外部公開用 facade（backend build_options 無し。dep.module("platform")・test 用）
+    platform: TaggedModule, // 外部公開用 facade（platform_backend は OS 既定値を付与。dep.module("platform")・test 用。TASK-172）
     keyboard: *std.Build.Module, // src/ レガシーヘルパー（examples 専用。層管理外）
     sprite: *std.Build.Module, // 同上
     fixed_timestep: *std.Build.Module, // 同上
@@ -2503,7 +2504,11 @@ const SharedModules = struct {
     /// `enable_gamepad`: 外部公開 platform module の build_options（TASK-111.7。既定 false）。
     /// `max_modules` / `max_modules_mod`: modular 同時モジュール数上限（TASK-146。既定 48）。
     /// wasm 経路は enable_gamepad=false・max_modules=48 を渡す。
-    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module) SharedModules {
+    /// `target_os`: platform_backend の既定値算出用（TASK-172）。外部消費者は自前 .o をリンクするため
+    /// この値自体は無視されるが、内部 test（test-platform-menu 等）が `platform.Window` 型を参照すると
+    /// core/platform_linux.zig 等の OS dispatcher が build_options.platform_backend を検査するため、
+    /// ホスト OS に対応しない固定値（旧: "objc" 固定）だと Linux/Windows で `@compileError` になる。
+    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target_os: std.Target.Os.Tag) SharedModules {
         // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
         // facade。@cImport("platform.h") のため link_libc + include path を内包。
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
@@ -2514,12 +2519,13 @@ const SharedModules = struct {
         // build_options（TASK-80.2/97.3/111.7 opt-in）: 外部消費者（tictactoe 等。dep.module("platform")）
         // 向けの facade も core/platform.zig を root にするため同じ named import が要る。
         // enable_gamepad は `-Denable_gamepad=true` で opt-in（既定 false＝安全側）。
-        // platform_backend は macOS 既定名を仮置き（外部消費者が自前で platform .o をリンクする想定の薄い stub）。
+        // platform_backend は当該 OS の既定 backend 名（外部消費者が自前で platform .o をリンクする想定の
+        // 薄い stub なので実体には影響しないが、内部 test の @compileError 回避に OS 整合が要る。TASK-172）。
         {
             const opts = b.addOptions();
             opts.addOption(bool, "enable_gamepad", enable_gamepad);
             opts.addOption(bool, "enable_menu", false);
-            opts.addOption([]const u8, "platform_backend", "objc");
+            opts.addOption([]const u8, "platform_backend", platform.backendName(platform.defaultBackend(target_os)));
             platform_mod.mod.addOptions("build_options", opts);
         }
 

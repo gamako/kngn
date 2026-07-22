@@ -26,12 +26,23 @@ pub fn openAppDataDir(
 }
 
 /// アプリデータディレクトリ内の autosave 用ディレクトリを作成して開く。
+///
+/// `autosave.scan` がこの関数の戻り値（autosave directory）に対して `iterate()` を呼ぶため
+/// `.iterate = true` で開く（TASK-172）。`std.Io.Dir.OpenOptions.iterate` の doc comment 通り
+/// 「iterate=false で開いた Dir を iterate するのは Illegal Behavior」で、これを怠ると:
+///   - Linux: 非 iterate open は O_PATH fd になり、`dirReadLinux` の `posixSeekTo` が
+///     BADF で **panic**（programmer bug 扱い。catch できない）。
+///   - Windows: `FILE_LIST_DIRECTORY` 権限無しで開かれ、`NtQueryDirectoryFile` が
+///     `error.AccessDenied` を返す（catch は可能だが scan は失敗する）。
+///   - macOS/BSD: `O_PATH`相当が無く常にフル機能で開かれるため検出不能（無自覚に動いてしまう）。
+/// macOS だけで動作確認しても顕在化しないため、Dir を開く際は「後で iterate するか」を
+/// 呼び出し側で判定し、この関数のように必ず `.iterate = true` を明示すること。
 pub fn openAutosaveDir(io: std.Io, app_data_dir: std.Io.Dir) !std.Io.Dir {
     app_data_dir.createDirPath(io, "autosave") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
-    return app_data_dir.openDir(io, "autosave", .{});
+    return app_data_dir.openDir(io, "autosave", .{ .iterate = true });
 }
 
 /// 文書 path から、ファイル名に安全な安定 autosave ID を生成する。

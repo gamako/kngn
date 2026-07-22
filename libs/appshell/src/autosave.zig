@@ -179,7 +179,7 @@ test "envelope round-trip and fixed fixture" {
 }
 
 test "idle timer threshold, reset, duplicate suppression, and clear" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var controller = try Controller.init(std.testing.allocator, std.testing.io, tmp.dir, null);
     defer controller.deinit();
@@ -202,7 +202,7 @@ test "idle timer threshold, reset, duplicate suppression, and clear" {
 }
 
 test "malformed and version-mismatched envelopes are rejected by scan" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try file_safety.writeAtomicToDir(std.testing.io, tmp.dir, "bad.autosave", "bad", .{});
     try file_safety.writeAtomicToDir(std.testing.io, tmp.dir, "future.autosave", &.{ 'A', 'S', 'V', '1', 2, 0 }, .{});
