@@ -18,6 +18,14 @@
 //! TASK-113.4: `wl_data_device` の offer/receive 実装は行わない stub。
 //! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
 //!
+//! TASK-156.5 Stage 3（HiDPI / `.physical`）:
+//! - `wl_output` bind + scale / `wl_surface.enter|leave` で content_scale を追跡（イベント時のみ）。
+//! - registry bind は初期化時のみ。pending → `lockFramebuffer` 境界で latch（`scale_epoch` 増分）。
+//! - `.physical` 時のみ shm を物理px確保 + `wl_surface_set_buffer_scale`（compositor v3+。未満は no-op）。
+//! - 入力 raw physical = surface-local × content_scale（fb_mode 非依存。buffer_scale は使わない）。
+//! - ホットパス宣言: scale 検出・resize・lock 境界 commit はイベント時のみ / registry bind は初期化時のみ
+//!   （フレーム毎・RT ではない）。
+//!
 //! C-interop 規約: wayland/xdg/xkb ヘッダは bare struct（typedef 無し）のため、型は
 //! `c.struct_wl_*`/`c.struct_xdg_*`、関数/enum 定数は C 名そのまま（`c.wl_*`/`c.WL_SHM_FORMAT_*`）。
 //! 最終的な field 型・nullable・listener signature は Linux 実機の compile で確定する（macOS では
@@ -46,6 +54,8 @@ const EventStats = types.EventStats;
 const MouseButton = types.MouseButton;
 const MouseButtons = types.MouseButtons;
 const ModifierFlags = types.ModifierFlags;
+const FramebufferMode = types.FramebufferMode;
+const WindowSize = types.WindowSize;
 
 comptime {
     if (!std.mem.eql(u8, build_options.platform_backend, "wayland")) {
@@ -60,6 +70,146 @@ pub const saveFileDialog = common.saveFileDialog;
 pub const openFileDialog = common.openFileDialog;
 
 const alloc = std.heap.c_allocator;
+
+// ============================================================================
+// TASK-156.5 Stage 3: 高 DPI 共通ヘルパー（plan「共通パターン」。X11 Stage 2 と bit 一致。単体テスト対象）
+// ホットパス宣言: 初期化時 / イベント時のみ（フレーム毎・RT ではない）。
+// ============================================================================
+
+/// 入力正規化用の実スケール（query 用。lock 前・都度再取得）。fb_mode に非依存。
+fn effectiveContentScale(raw_scale: f32) f32 {
+    return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
+}
+
+/// objc の (int)lround((double)px * (double)scale) と数値一致させる。
+/// 有限値 [1, u32最大] にクランプする（1未満→1、u32最大超過→u32最大）。
+fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
+    const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
+    const v: f64 = @round(@as(f64, @floatFromInt(logical_px)) * s);
+    if (!std.math.isFinite(v) or v < 1.0) return 1;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// framebuffer 物理サイズ。.logical は常に logical そのもの（R9 の構造的保証はここに集約）。
+fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
+    if (fb_mode == .logical) return logical;
+    return .{
+        .width = roundToPhysicalPx(logical.width, scale),
+        .height = roundToPhysicalPx(logical.height, scale),
+    };
+}
+
+/// `.physical` の buffer 確保に使う scale。compositor（wl_surface）v3 未満は protocol error 回避のため 1.0。
+fn framebufferSizeScale(st: *const State) f32 {
+    if (st.fb_mode != .physical or st.compositor_version < 3) return 1.0;
+    return effectiveContentScale(st.pending_content_scale);
+}
+
+/// `wl_surface_set_buffer_scale` に渡す整数 scale（`.logical` / compositor v3 未満は 1）。
+fn bufferScaleInt(st: *const State) i32 {
+    if (st.fb_mode != .physical or st.compositor_version < 3) return 1;
+    const s = effectiveContentScale(st.content_scale);
+    const v = @round(@as(f64, s));
+    if (!(v >= 1.0) or !std.math.isFinite(v)) return 1;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(i32)))) return std.math.maxInt(i32);
+    return @intFromFloat(v);
+}
+
+/// 論理 content 寸法から `st.width`/`st.height`（物理 fb）を再計算する。
+fn refreshPhysicalSizeFromLogical(st: *State) void {
+    const logical: WindowSize = .{ .width = st.logical_width, .height = st.logical_height };
+    const fb = effectiveFramebufferSize(st.fb_mode, logical, framebufferSizeScale(st));
+    st.width = fb.width;
+    st.height = fb.height;
+}
+
+/// output enter 集合から pending_content_scale を再評価する（イベント時のみ）。
+/// 規則: enter 済みのうち scale 最大。同点は最初に enter した方（値は同点なので max の初出で足りる）。
+fn recomputePendingContentScale(st: *State) void {
+    if (st.entered_count == 0) {
+        st.pending_content_scale = 1.0;
+        return;
+    }
+    var best: i32 = 0;
+    var found = false;
+    var i: u8 = 0;
+    while (i < st.entered_count) : (i += 1) {
+        const idx = st.entered_indices[i];
+        if (idx >= max_outputs) continue;
+        if (!st.outputs[idx].active) continue;
+        const sc = st.outputs[idx].scale;
+        if (!found or sc > best) {
+            best = sc;
+            found = true;
+        }
+    }
+    st.pending_content_scale = if (found and best > 0) @floatFromInt(best) else 1.0;
+}
+
+/// pending → latched。scale/物理寸法が変われば `scale_epoch` を増やす（次 lock 境界。イベント時のみ相当）。
+fn applyLatchedMetricsIfNeeded(st: *State) void {
+    const new_scale = effectiveContentScale(st.pending_content_scale);
+    const old_scale = effectiveContentScale(st.content_scale);
+    const prev_w = st.width;
+    const prev_h = st.height;
+    st.content_scale = new_scale;
+    refreshPhysicalSizeFromLogical(st);
+    if (new_scale != old_scale or st.width != prev_w or st.height != prev_h) {
+        st.scale_epoch +%= 1;
+        st.ct_region_valid = false;
+        st.buffer_scale_dirty = true;
+    }
+}
+
+/// Wayland surface-local（論理相当）→ raw physical event 座標。fb_mode 非依存で常に × content_scale。
+fn nativeToRawPhysical(st: *const State, native_x: i32, native_y: i32) struct { x: i32, y: i32 } {
+    const s = effectiveContentScale(st.pending_content_scale);
+    return .{
+        .x = @intFromFloat(@floor(@as(f64, @floatFromInt(native_x)) * @as(f64, s))),
+        .y = @intFromFloat(@floor(@as(f64, @floatFromInt(native_y)) * @as(f64, s))),
+    };
+}
+
+/// registry name / wl_output* から slot index を探す。
+fn findOutputByName(st: *State, name: u32) ?u8 {
+    for (&st.outputs, 0..) |*o, i| {
+        if (o.active and o.name == name) return @intCast(i);
+    }
+    return null;
+}
+
+fn findOutputByPtr(st: *State, output: ?*c.struct_wl_output) ?u8 {
+    if (output == null) return null;
+    for (&st.outputs, 0..) |*o, i| {
+        if (o.active and o.output == output) return @intCast(i);
+    }
+    return null;
+}
+
+fn removeEnteredIndex(st: *State, idx: u8) void {
+    var i: u8 = 0;
+    while (i < st.entered_count) : (i += 1) {
+        if (st.entered_indices[i] == idx) {
+            var j = i;
+            while (j + 1 < st.entered_count) : (j += 1) {
+                st.entered_indices[j] = st.entered_indices[j + 1];
+            }
+            st.entered_count -= 1;
+            return;
+        }
+    }
+}
+
+fn destroyOutputSlot(st: *State, idx: u8) void {
+    if (idx >= max_outputs) return;
+    const o = &st.outputs[idx];
+    if (!o.active) return;
+    removeEnteredIndex(st, idx);
+    if (o.output) |out| c.wl_output_destroy(out);
+    o.* = .{};
+    recomputePendingContentScale(st);
+}
 
 // ============================================================================
 // POSIX syscalls（libc。link_libc 済み）。X11 backend の extern 宣言方針に倣う。
@@ -96,6 +246,19 @@ const MAP_FAILED_INT: usize = @bitCast(@as(isize, -1));
 // wl_shm format（protocol 上 uint32_t）。translate-c の enum 定数は c_int なので u32 へ揃える。
 const FMT_XRGB8888: u32 = @intCast(c.WL_SHM_FORMAT_XRGB8888);
 const FMT_ARGB8888: u32 = @intCast(c.WL_SHM_FORMAT_ARGB8888);
+
+/// TASK-156.5 Stage 3: 固定長 output / enter 集合（動的確保しない。ホットパス regulation 準拠）。
+const max_outputs: u8 = 8;
+const max_entered: u8 = 8;
+
+/// 1 本の wl_output（registry global）。scale は protocol v2+ の scale イベント。v1 bind は scale=1 固定。
+const OutputSlot = struct {
+    active: bool = false,
+    name: u32 = 0, // registry global name（global_remove 照合用）
+    version: u32 = 1,
+    output: ?*c.struct_wl_output = null,
+    scale: i32 = 1,
+};
 
 // ============================================================================
 // init / shutdown（プロセス単一の Display）
@@ -210,12 +373,33 @@ const State = struct {
     scroll_disc: wlinput.ScrollAccumulator = .{},
     scroll_cont: wlinput.ScrollAccumulator = .{},
 
+    /// 論理 content 寸法（surface-local / xdg configure / CSD 配置の単位。create 引数・独立保持）。
+    logical_width: u32 = 0,
+    logical_height: u32 = 0,
+    /// 物理 / framebuffer 寸法（shm buffer・present damage_buffer の単位）。
+    /// `.logical` では logical と同値、`.physical`（かつ compositor v3+）では `roundToPhysicalPx`。
+    /// 後方互換 alias: 既存 blit 経路が参照する framebuffer 寸法。
     width: u32,
     height: u32,
+    fb_mode: FramebufferMode = .logical,
+    /// query 用（入力 raw 化・`contentScale()`）。wl_output.scale / surface enter|leave で更新。
+    pending_content_scale: f32 = 1.0,
+    /// latched（`lockFramebuffer` snapshot）。pending と分離し runtime 変更に対応。
+    content_scale: f32 = 1.0,
+    scale_epoch: u64 = 0,
+    /// present 前に `wl_surface_set_buffer_scale` を再発行する必要があるか。
+    buffer_scale_dirty: bool = true,
+
+    /// wl_output 集合（固定長）。registry bind / global_remove で管理。
+    outputs: [max_outputs]OutputSlot = [_]OutputSlot{.{}} ** max_outputs,
+    /// content surface が現在乗っている output の outputs[] index（enter 順）。
+    entered_indices: [max_entered]u8 = [_]u8{0} ** max_entered,
+    entered_count: u8 = 0,
+
     compositor_version: u32 = 1,
 
     // resize（TASK-23）。toplevelConfigure が suggested を pending に記録し、xdgSurfaceConfigure(ack)
-    // で st.width/height へ適用する（0 は「サイズ指定なし」で無視）。buffer 実体は lockFramebuffer が
+    // で logical_* へ適用する（0 は「サイズ指定なし」で無視）。buffer 実体は lockFramebuffer が
     // free buffer を選んだ時に lazy 再確保する（busy buffer には触らない）。
     pending_width: u32 = 0,
     pending_height: u32 = 0,
@@ -294,13 +478,137 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.struct_wl_registry, name: u32
         const v = @min(version, 2);
         st.deco_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zxdg_decoration_manager_v1_interface, v));
         st.deco_manager_version = v;
+    } else if (std.mem.eql(u8, ifn, "wl_output")) {
+        // TASK-156.5 Stage 3: 上限 version 4。scale/done は protocol v2+（v1 bind は scale=1 固定）。
+        // ホットパス宣言: 初期化時（および hotplug 時の registry イベント）のみ。
+        var slot: ?u8 = null;
+        for (&st.outputs, 0..) |*o, i| {
+            if (!o.active) {
+                slot = @intCast(i);
+                break;
+            }
+        }
+        if (slot) |idx| {
+            const v = @min(version, 4);
+            const out: ?*c.struct_wl_output = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, v));
+            if (out) |o| {
+                st.outputs[idx] = .{
+                    .active = true,
+                    .name = name,
+                    .version = v,
+                    .output = o,
+                    .scale = 1,
+                };
+                _ = c.wl_output_add_listener(o, &output_listener, st);
+            }
+        }
+        // 枠が満杯なら追加 output は無視（固定長。fail-soft）。
     }
 }
 
 fn registryGlobalRemove(data: ?*anyopaque, registry: ?*c.struct_wl_registry, name: u32) callconv(.c) void {
-    _ = data;
     _ = registry;
-    _ = name; // MVP: globals の動的削除には対応しない
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // TASK-156.5 Stage 3: output 切断時は object 破棄 + enter 集合から除去 + scale 再評価。
+    // ホットパス宣言: イベント時のみ。
+    if (findOutputByName(st, name)) |idx| {
+        destroyOutputSlot(st, idx);
+    }
+}
+
+fn outputGeometry(
+    data: ?*anyopaque,
+    output: ?*c.struct_wl_output,
+    x: i32,
+    y: i32,
+    physical_width: i32,
+    physical_height: i32,
+    subpixel: i32,
+    make: [*c]const u8,
+    model: [*c]const u8,
+    transform: i32,
+) callconv(.c) void {
+    _ = data;
+    _ = output;
+    _ = x;
+    _ = y;
+    _ = physical_width;
+    _ = physical_height;
+    _ = subpixel;
+    _ = make;
+    _ = model;
+    _ = transform;
+}
+
+fn outputMode(data: ?*anyopaque, output: ?*c.struct_wl_output, flags: u32, width: i32, height: i32, refresh: i32) callconv(.c) void {
+    _ = data;
+    _ = output;
+    _ = flags;
+    _ = width;
+    _ = height;
+    _ = refresh;
+}
+
+fn outputDone(data: ?*anyopaque, output: ?*c.struct_wl_output) callconv(.c) void {
+    _ = data;
+    _ = output; // scale は scale イベントで即反映（atomic 束ねは不要。整数 scale のみ）。
+}
+
+fn outputScale(data: ?*anyopaque, output: ?*c.struct_wl_output, factor: i32) callconv(.c) void {
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // ホットパス宣言: イベント時のみ。
+    if (findOutputByPtr(st, output)) |idx| {
+        // bind version < 2 ではこのイベント自体が来ない想定。来ても scale を反映する。
+        st.outputs[idx].scale = if (factor > 0) factor else 1;
+        // enter 済みなら pending を再評価（未 enter は初回 enter まで 1.0 のまま）。
+        var i: u8 = 0;
+        while (i < st.entered_count) : (i += 1) {
+            if (st.entered_indices[i] == idx) {
+                recomputePendingContentScale(st);
+                break;
+            }
+        }
+    }
+}
+
+/// wl_output v4 の name イベント。表示名は未使用（null listener crash 回避の no-op）。
+fn outputName(data: ?*anyopaque, output: ?*c.struct_wl_output, name: [*c]const u8) callconv(.c) void {
+    _ = data;
+    _ = output;
+    _ = name;
+}
+
+/// wl_output v4 の description イベント。表示名は未使用（null listener crash 回避の no-op）。
+/// 実機（sway）で geometry/mode/done/scale/name に加えこのイベントも送られ、listener 未設定だと
+/// `listener function for opcode 5 of wl_output is NULL` で libwayland-client が abort する（実測）。
+fn outputDescription(data: ?*anyopaque, output: ?*c.struct_wl_output, description: [*c]const u8) callconv(.c) void {
+    _ = data;
+    _ = output;
+    _ = description;
+}
+
+fn surfaceEnter(data: ?*anyopaque, surface: ?*c.struct_wl_surface, output: ?*c.struct_wl_output) callconv(.c) void {
+    _ = surface;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // ホットパス宣言: イベント時のみ。メイン content surface のみ listener 登録済み。
+    const idx = findOutputByPtr(st, output) orelse return;
+    var i: u8 = 0;
+    while (i < st.entered_count) : (i += 1) {
+        if (st.entered_indices[i] == idx) return; // 既に enter 済み
+    }
+    if (st.entered_count >= max_entered) return;
+    st.entered_indices[st.entered_count] = idx;
+    st.entered_count += 1;
+    recomputePendingContentScale(st);
+}
+
+fn surfaceLeave(data: ?*anyopaque, surface: ?*c.struct_wl_surface, output: ?*c.struct_wl_output) callconv(.c) void {
+    _ = surface;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // ホットパス宣言: イベント時のみ。
+    const idx = findOutputByPtr(st, output) orelse return;
+    removeEnteredIndex(st, idx);
+    recomputePendingContentScale(st);
 }
 
 fn shmFormat(data: ?*anyopaque, shm: ?*c.struct_wl_shm, format: u32) callconv(.c) void {
@@ -344,19 +652,25 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
     // （buffers 未確保）は適用せず requested size を維持する（create 中は従来挙動）。
     // buffer 実体は lockFramebuffer が free buffer を lazy 再確保する（busy buffer には触らない）。
     // CSD 時は compositor の suggested size は window geometry 基準なので content へ変換する（TASK-28.5.6）。
+    // TASK-156.5: configure 寸法は常に論理（surface-local）。物理 fb は refreshPhysicalSizeFromLogical。
     if (st.pending_resize and st.buffers[0].buffer != null) {
         st.pending_resize = false;
         if (st.pending_width != 0 and st.pending_height != 0) {
             const prev_w = st.width;
             const prev_h = st.height;
+            var logical_w: u32 = undefined;
+            var logical_h: u32 = undefined;
             if (st.deco_state == .csd) {
                 const cs = csd.geometryToContent(@intCast(st.pending_width), @intCast(st.pending_height), .csd, st.maximized);
-                st.width = @intCast(cs.w);
-                st.height = @intCast(cs.h);
+                logical_w = @intCast(cs.w);
+                logical_h = @intCast(cs.h);
             } else {
-                st.width = st.pending_width;
-                st.height = st.pending_height;
+                logical_w = st.pending_width;
+                logical_h = st.pending_height;
             }
+            st.logical_width = logical_w;
+            st.logical_height = logical_h;
+            refreshPhysicalSizeFromLogical(st);
             // TASK-104.3: サイズが変わったら click-through input region を再計算させる（旧 bbox は stale）。
             if (st.width != prev_w or st.height != prev_h) st.ct_region_valid = false;
         }
@@ -618,6 +932,7 @@ fn setButton(st: *State, mb: MouseButton, down: bool) void {
 }
 
 /// MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は現在の xkb modifier。
+/// 座標は raw physical（`pointer_x/y`。facade が latched content_scale で論理へ正規化）。
 fn mouseEvent(st: *State, button: MouseButton) types.MouseEvent {
     return .{
         .x = st.pointer_x,
@@ -647,8 +962,10 @@ fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface:
     st.ptr_focus = focus;
     switch (focus) {
         .content => {
-            st.pointer_x = lx;
-            st.pointer_y = ly;
+            // TASK-156.5: surface-local → raw physical（常に × content_scale。装飾は変換不要）。
+            const raw = nativeToRawPhysical(st, lx, ly);
+            st.pointer_x = raw.x;
+            st.pointer_y = raw.y;
             // TASK-75.3: content に入った瞬間の serial を保持し、現在の cursor_shape を適用する
             // （compositor は enter ごとに client の set_cursor を要求する）。
             st.pointer_enter_serial = serial;
@@ -657,7 +974,7 @@ fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface:
         },
         .deco => |part| {
             st.have_pointer_enter = false; // 装飾上は content カーソルを出さない
-            st.deco_local_x = lx;
+            st.deco_local_x = lx; // 装飾は surface-local のまま（app へ流さない）
             st.deco_local_y = ly;
             // 装飾へ移った瞬間、content 側で蓄積途中の scroll を持ち越さない（plan）。
             st.scroll_disc = .{};
@@ -695,8 +1012,9 @@ fn ptrMotion(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, sx: c.wl_
     const ly = wlinput.fixedToI32(sy);
     switch (st.ptr_focus) {
         .content => {
-            st.pointer_x = lx;
-            st.pointer_y = ly;
+            const raw = nativeToRawPhysical(st, lx, ly);
+            st.pointer_x = raw.x;
+            st.pointer_y = raw.y;
             st.queue.enqueue(.{ .mouse_move = mouseEvent(st, .none) });
         },
         .deco => |part| {
@@ -732,8 +1050,8 @@ fn ptrButton(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, time: u
 
 /// 装飾上の左押下を hitTest して move/resize/ボタンへ配線する（xdg_toplevel_move/resize は serial 必須）。
 fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
-    const cw: i32 = @intCast(st.width);
-    const ch: i32 = @intCast(st.height);
+    const cw: i32 = @intCast(st.logical_width);
+    const ch: i32 = @intCast(st.logical_height);
     const target = csd.hitTest(part, st.deco_local_x, st.deco_local_y, cw, ch, st.maximized);
     const tl = st.toplevel orelse return;
     const seat = st.seat orelse return;
@@ -758,32 +1076,86 @@ fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
 /// present で 1 回だけ走る（毎フレームの全画素ループにはしない＝性能規約の SIMD 3点セット対象外）。
 /// 静止画マスコット前提。silhouette が変わる用途では setClickThrough の再呼び出しで invalidate する。
 /// buf.pixels は canonical BGRA（u32 0xAARRGGBB）で alpha は上位 8bit。commit は呼び出し側 present が行う。
+/// TASK-156.5: input region は surface-local（論理）座標。`.physical` 時は論理格子で不透明判定し
+/// （scale×scale の物理画素のいずれかが opaque なら opaque）、論理座標で region を積む。
 fn refreshInputRegion(st: *State, buf: *ShmBuffer, surface: *c.struct_wl_surface) void {
     if (st.ct_region_valid) return; // 設定済みなら走査しない（毎フレーム全画素ループを避ける）
     const compositor = st.compositor orelse return;
-    const w: i32 = @intCast(st.width);
-    const h: i32 = @intCast(st.height);
+    const scale_i = bufferScaleInt(st);
+    const lw: i32 = @intCast(st.logical_width);
+    const lh: i32 = @intCast(st.logical_height);
+    const bw: i32 = @intCast(st.width);
+    const bh: i32 = @intCast(st.height);
     const px = buf.pixels;
-    if (px.len < @as(usize, @intCast(w)) * @as(usize, @intCast(h))) return;
+    if (px.len < @as(usize, @intCast(bw)) * @as(usize, @intCast(bh))) return;
 
     const region = c.wl_compositor_create_region(compositor) orelse return; // 失敗時は valid を立てず次 present で再試行
 
-    // 各行の不透明画素ラン（alpha>0 の連続区間）を 1px 高の矩形として region に足す（per-row spans）。
-    // bbox 単一矩形だと丸い絵の透明な四隅が抜けないため、輪郭に沿った near-per-pixel の入力領域にする。
-    // wl_region は矩形和なので複数 add で OK。不透明画素が皆無なら空 region（全面 click-through）。
-    var y: i32 = 0;
-    while (y < h) : (y += 1) {
-        const row = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
-        var x: i32 = 0;
-        while (x < w) {
-            // 不透明画素まで進める
-            if ((px[row + @as(usize, @intCast(x))] >> 24) == 0) {
-                x += 1;
-                continue;
+    if (scale_i <= 1) {
+        // 論理==物理: 既存の per-row physical spans をそのまま surface-local に積む。
+        var y: i32 = 0;
+        while (y < bh) : (y += 1) {
+            const row = @as(usize, @intCast(y)) * @as(usize, @intCast(bw));
+            var x: i32 = 0;
+            while (x < bw) {
+                if ((px[row + @as(usize, @intCast(x))] >> 24) == 0) {
+                    x += 1;
+                    continue;
+                }
+                const run_start = x;
+                while (x < bw and (px[row + @as(usize, @intCast(x))] >> 24) != 0) : (x += 1) {}
+                c.wl_region_add(region, run_start, y, x - run_start, 1);
             }
-            const run_start = x;
-            while (x < w and (px[row + @as(usize, @intCast(x))] >> 24) != 0) : (x += 1) {}
-            c.wl_region_add(region, run_start, y, x - run_start, 1); // [run_start, x) の 1px 高矩形
+        }
+    } else {
+        // 論理格子: 各論理画素の scale×scale ブロックに不透明が1つでもあれば 1x1 を積む。
+        var ly: i32 = 0;
+        while (ly < lh) : (ly += 1) {
+            var lx: i32 = 0;
+            while (lx < lw) {
+                var is_opaque = false;
+                var dy: i32 = 0;
+                while (dy < scale_i and !is_opaque) : (dy += 1) {
+                    const py = ly * scale_i + dy;
+                    if (py >= bh) break;
+                    const row = @as(usize, @intCast(py)) * @as(usize, @intCast(bw));
+                    var dx: i32 = 0;
+                    while (dx < scale_i) : (dx += 1) {
+                        const px_x = lx * scale_i + dx;
+                        if (px_x >= bw) break;
+                        if ((px[row + @as(usize, @intCast(px_x))] >> 24) != 0) {
+                            is_opaque = true;
+                            break;
+                        }
+                    }
+                }
+                if (!is_opaque) {
+                    lx += 1;
+                    continue;
+                }
+                const run_start = lx;
+                while (lx < lw) {
+                    var run_opaque = false;
+                    var dy2: i32 = 0;
+                    while (dy2 < scale_i and !run_opaque) : (dy2 += 1) {
+                        const py = ly * scale_i + dy2;
+                        if (py >= bh) break;
+                        const row = @as(usize, @intCast(py)) * @as(usize, @intCast(bw));
+                        var dx2: i32 = 0;
+                        while (dx2 < scale_i) : (dx2 += 1) {
+                            const px_x = lx * scale_i + dx2;
+                            if (px_x >= bw) break;
+                            if ((px[row + @as(usize, @intCast(px_x))] >> 24) != 0) {
+                                run_opaque = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!run_opaque) break;
+                    lx += 1;
+                }
+                c.wl_region_add(region, run_start, ly, lx - run_start, 1);
+            }
         }
     }
 
@@ -837,14 +1209,16 @@ fn ptrFrame(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer) callconv(.c) void {
         },
     }
     // discrete(notch) を優先、無ければ continuous を fallback。frame ごとに 1 mouse_scroll。
+    // TASK-156.5: 座標・delta とも content_scale を乗算（facade が latched scale で論理へ戻す）。
     const disc = st.scroll_disc.take();
     const cont = st.scroll_cont.take();
     const d = disc orelse cont orelse return;
+    const s = effectiveContentScale(st.pending_content_scale);
     st.queue.enqueue(.{ .mouse_scroll = .{
         .x = st.pointer_x,
         .y = st.pointer_y,
-        .dx = d.dx,
-        .dy = d.dy,
+        .dx = d.dx * s,
+        .dy = d.dy * s,
         .is_precise = false,
         .buttons = st.buttons,
         .modifiers = st.modifiers,
@@ -865,6 +1239,19 @@ const toplevel_listener = std.mem.zeroInit(c.struct_xdg_toplevel_listener, .{
 });
 const buffer_listener = std.mem.zeroInit(c.struct_wl_buffer_listener, .{ .release = &bufferRelease });
 const frame_listener = std.mem.zeroInit(c.struct_wl_callback_listener, .{ .done = &frameDone });
+// TASK-156.5 Stage 3: output / surface enter-leave（zeroInit で v3+ preferred_buffer_* 等を null のまま）。
+const output_listener = std.mem.zeroInit(c.struct_wl_output_listener, .{
+    .geometry = &outputGeometry,
+    .mode = &outputMode,
+    .done = &outputDone,
+    .scale = &outputScale,
+    .name = &outputName, // v4。未使用だが null のままにしない（既存 seat/pointer と同方針）
+    .description = &outputDescription, // v4。実機で geometry/mode/done/scale/name に続き送られてくる（実測）
+});
+const surface_listener = std.mem.zeroInit(c.struct_wl_surface_listener, .{
+    .enter = &surfaceEnter,
+    .leave = &surfaceLeave,
+});
 
 // 入力 listener（zeroInit で未知 field を null 初期化しつつ、bound version が送りうる event は全て設定）。
 const seat_listener = std.mem.zeroInit(c.struct_wl_seat_listener, .{
@@ -916,16 +1303,16 @@ fn syncDecorations(st: *State) void {
             // CSD 構築失敗（subcompositor 不在 / proxy 作成失敗 / OOM）→ 装飾なしへフォールバック。
             // geometry は content のまま（装飾込み geometry を発行して subsurface が欠ける不整合を避ける。codex 指摘 #2）。
             st.deco_state = .none;
-            const cw: i32 = @intCast(st.width);
-            const ch: i32 = @intCast(st.height);
+            const cw: i32 = @intCast(st.logical_width);
+            const ch: i32 = @intCast(st.logical_height);
             setWindowGeometry(st, csd.windowGeometry(cw, ch, .none, false));
             if (st.surface) |s| c.wl_surface_commit(s);
         }
     } else if (st.csd_built) {
         // csd→ssd/none 遷移: CSD を破棄し window geometry を content へ戻す。
         destroyCsd(st);
-        const cw: i32 = @intCast(st.width);
-        const ch: i32 = @intCast(st.height);
+        const cw: i32 = @intCast(st.logical_width);
+        const ch: i32 = @intCast(st.logical_height);
         setWindowGeometry(st, csd.windowGeometry(cw, ch, .none, false));
         if (st.surface) |s| c.wl_surface_commit(s);
     }
@@ -964,8 +1351,8 @@ fn ensureCsdCreated(st: *State) bool {
 
 /// 現在の content 寸法+maximized で全 subsurface を配置・描画し、window geometry を発行して親を 1 回 commit。
 fn layoutCsd(st: *State) void {
-    const cw: i32 = @intCast(st.width);
-    const ch: i32 = @intCast(st.height);
+    const cw: i32 = @intCast(st.logical_width);
+    const ch: i32 = @intCast(st.logical_height);
     const lay = csd.layout(cw, ch, st.maximized);
     for (&st.csd_surfaces) |*cs| {
         const surf = cs.surface orelse continue;
@@ -1018,7 +1405,7 @@ fn drawCsdPart(st: *State, cs: *CsdSurface, w: i32, h: i32, content_w: i32) void
 /// 無条件 redraw はしない。plan）。lx/ly は title-local 座標。
 fn updateHover(st: *State, lx: i32, ly: i32) void {
     if (!st.csd_built) return;
-    const cw: i32 = @intCast(st.width);
+    const cw: i32 = @intCast(st.logical_width);
     const nh = csd.hoverButtonAt(lx, ly, cw);
     if (nh == st.hover_button) return;
     st.hover_button = nh;
@@ -1028,8 +1415,8 @@ fn updateHover(st: *State, lx: i32, ly: i32) void {
 /// title subsurface だけを現在の hover で再描画する（位置不変=親 commit 不要。desync で即時反映）。
 fn redrawTitle(st: *State) void {
     if (!st.csd_built) return;
-    const cw: i32 = @intCast(st.width);
-    const ch: i32 = @intCast(st.height);
+    const cw: i32 = @intCast(st.logical_width);
+    const ch: i32 = @intCast(st.logical_height);
     const lay = csd.layout(cw, ch, st.maximized);
     if (lay.title.empty()) return;
     drawCsdPart(st, &st.csd_surfaces[0], lay.title.w, lay.title.h, cw); // index 0 = title
@@ -1130,8 +1517,25 @@ pub const Window = struct {
         const dpy = g_display orelse return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
+        // TASK-156.5 Stage 3: 初期 scale は enter 前フォールバック 1.0。物理寸法は fb_mode に従う。
+        const logical: WindowSize = .{ .width = width, .height = height };
+        const init_fb = effectiveFramebufferSize(opts.fb_mode, logical, 1.0);
+
         const st = alloc.create(State) catch return error.WindowCreationFailed;
-        st.* = .{ .display = dpy, .width = width, .height = height, .transparent = opts.transparent, .borderless = opts.borderless };
+        st.* = .{
+            .display = dpy,
+            .logical_width = width,
+            .logical_height = height,
+            .width = init_fb.width,
+            .height = init_fb.height,
+            .fb_mode = opts.fb_mode,
+            .pending_content_scale = 1.0,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
+            .buffer_scale_dirty = true,
+            .transparent = opts.transparent,
+            .borderless = opts.borderless,
+        };
         errdefer {
             teardown(st);
             alloc.destroy(st);
@@ -1163,6 +1567,8 @@ pub const Window = struct {
 
         // surface → xdg_surface → toplevel。
         st.surface = c.wl_compositor_create_surface(st.compositor) orelse return error.WindowCreationFailed;
+        // TASK-156.5: content surface の enter/leave で output 集合を追跡（CSD subsurface には付けない）。
+        _ = c.wl_surface_add_listener(st.surface, &surface_listener, st);
         st.xdg_surface = c.xdg_wm_base_get_xdg_surface(st.wm_base, st.surface) orelse return error.WindowCreationFailed;
         _ = c.xdg_surface_add_listener(st.xdg_surface, &xdg_surface_listener, st);
         st.toplevel = c.xdg_surface_get_toplevel(st.xdg_surface) orelse return error.WindowCreationFailed;
@@ -1225,9 +1631,11 @@ pub const Window = struct {
         // fullscreen: 初回 configure の suggested size（実際の出力解像度）を setupBuffers 前に
         // 手動で反映する。通常の resize 適用（xdgSurfaceConfigure）は buffers 確保後のみ有効な
         // ガードのため、create 中はそのままでは（プレースホルダ 1x1 のまま）捨てられてしまう。
+        // TASK-156.5: suggested は論理寸法として保持し、物理 fb は refreshPhysicalSizeFromLogical。
         if (fullscreen and st.pending_resize and st.pending_width != 0 and st.pending_height != 0) {
-            st.width = st.pending_width;
-            st.height = st.pending_height;
+            st.logical_width = st.pending_width;
+            st.logical_height = st.pending_height;
+            refreshPhysicalSizeFromLogical(st);
         }
 
         // configure 後に shm ダブルバッファを確保。
@@ -1353,6 +1761,10 @@ pub const Window = struct {
         const st = self.state;
         if (!st.configured or st.closing or st.locked_index != null) return null;
 
+        // TASK-156.5 Stage 3: pending scale/size を latch（runtime scale 変更の commit 点）。
+        // ホットパス宣言: lock 境界のみ（フレーム毎の全画素ループではない）。
+        applyLatchedMetricsIfNeeded(st);
+
         // frame callback 律速（AC#6 改訂方針）: 直近 present の wl_surface.frame done が未到着なら
         // この frame を skip して vsync に律速する。これで sleep の無い busy loop の caller
         // （例: example_07）でも commit を撃ちまくらず compositor を飽和させない。frame done は
@@ -1382,21 +1794,46 @@ pub const Window = struct {
         return null;
     }
 
+    /// 現在の negotiated logical size（TASK-156.5 Stage 3）。frame 中の描画は Framebuffer snapshot を使う。
+    pub fn logicalSize(self: Window) WindowSize {
+        const st = self.state;
+        return .{ .width = st.logical_width, .height = st.logical_height };
+    }
+
+    /// 現在の negotiated framebuffer size（物理px。`.logical` では logical と同値）。
+    pub fn framebufferSize(self: Window) WindowSize {
+        const st = self.state;
+        return .{ .width = st.width, .height = st.height };
+    }
+
+    /// 現在の negotiated content scale（`.logical`/`.physical` 問わず実 output scale。未 enter 時 1.0）。
+    pub fn contentScale(self: Window) f32 {
+        return effectiveContentScale(self.state.pending_content_scale);
+    }
+
     pub fn present(self: Window) void {
         const st = self.state;
         if (!st.configured or st.closing) return;
         const i = st.locked_index orelse return;
         const buf = &st.buffers[i];
         const surface = st.surface.?;
-        const w: i32 = @intCast(st.width);
-        const h: i32 = @intCast(st.height);
+        const buf_w: i32 = @intCast(st.width);
+        const buf_h: i32 = @intCast(st.height);
+        const surf_w: i32 = @intCast(st.logical_width);
+        const surf_h: i32 = @intCast(st.logical_height);
+
+        // TASK-156.5: set_buffer_scale は次の attach/commit より前（protocol 要求）。compositor v3 未満は呼ばない。
+        if (st.compositor_version >= 3 and st.buffer_scale_dirty) {
+            c.wl_surface_set_buffer_scale(surface, bufferScaleInt(st));
+            st.buffer_scale_dirty = false;
+        }
 
         c.wl_surface_attach(surface, buf.buffer, 0, 0);
-        // damage_buffer は wl_surface v4+。古い compositor では wl_surface_damage に fallback。
+        // damage_buffer は wl_surface v4+（buffer 座標）。古い compositor では surface-local damage に fallback。
         if (st.compositor_version >= 4) {
-            c.wl_surface_damage_buffer(surface, 0, 0, w, h);
+            c.wl_surface_damage_buffer(surface, 0, 0, buf_w, buf_h);
         } else {
-            c.wl_surface_damage(surface, 0, 0, w, h);
+            c.wl_surface_damage(surface, 0, 0, surf_w, surf_h);
         }
 
         // frame callback は内部 pacing のみ。pending 中は多重登録しない（callback リーク防止）。
@@ -1485,11 +1922,12 @@ pub const Window = struct {
 
 /// 現在のウィンドウ geometry（TASK-117）。Wayland は位置 API が無いため position=null、サイズのみ。
 /// module-level（facade の `@hasDecl(backend, "getGeometry")` 契約。Window メソッド禁止）。
+/// TASK-156.5: size は論理 content 寸法（surface-local）。
 pub fn getGeometry(win: Window) types.WindowGeometry {
     const st = win.state;
     return .{
         .position = null,
-        .size = .{ .width = st.width, .height = st.height },
+        .size = .{ .width = st.logical_width, .height = st.logical_height },
     };
 }
 
@@ -1586,15 +2024,17 @@ fn freeBufferIndex(st: *State) ?usize {
 
 fn lockAt(st: *State, i: usize) Framebuffer {
     st.locked_index = i;
-    const size: types.WindowSize = .{ .width = st.width, .height = st.height };
+    const logical: types.WindowSize = .{ .width = st.logical_width, .height = st.logical_height };
+    const fb_size: types.WindowSize = .{ .width = st.width, .height = st.height };
+    const scale = effectiveContentScale(st.content_scale);
     return .{
         .pixels = st.buffers[i].pixels,
         .width = st.width,
         .height = st.height,
-        .logical_size = size,
-        .framebuffer_size = size,
-        .content_scale = 1.0,
-        .scale_epoch = 0,
+        .logical_size = logical,
+        .framebuffer_size = fb_size,
+        .content_scale = scale,
+        .scale_epoch = st.scale_epoch,
         .state = st,
     };
 }
@@ -1757,6 +2197,14 @@ fn teardown(st: *State) void {
     st.xkb_state = null;
     st.xkb_keymap = null;
     st.xkb_context = null;
+    // TASK-156.5 Stage 3: wl_output を破棄（enter 集合もクリア）。
+    for (&st.outputs) |*o| {
+        if (o.active) {
+            if (o.output) |out| c.wl_output_destroy(out);
+            o.* = .{};
+        }
+    }
+    st.entered_count = 0;
     // system cursor（TASK-75.3）: cursor_surface は compositor より前、theme の buffer は shm 由来なので
     // shm より前に破棄する（この teardown 順序は下の compositor/shm 破棄より上）。
     if (st.cursor_surface) |s| c.wl_surface_destroy(s);
@@ -1786,4 +2234,46 @@ fn teardown(st: *State) void {
     st.shm = null;
     st.compositor = null;
     st.registry = null;
+}
+
+// ============================================================================
+// TASK-156.5 Stage 3 / R9: 共通ヘルパーの構造的ユニットテスト（display / compositor 不要）
+// Linux + `-Dplatform=wayland` で本モジュールがテスト root に含まれるとき実行される。
+// ============================================================================
+
+test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず logical を返す" {
+    const logical: WindowSize = .{ .width = 800, .height = 600 };
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 };
+    for (scales) |s| {
+        const fb = effectiveFramebufferSize(.logical, logical, s);
+        try std.testing.expectEqual(logical.width, fb.width);
+        try std.testing.expectEqual(logical.height, fb.height);
+    }
+}
+
+test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を適用する" {
+    const logical: WindowSize = .{ .width = 800, .height = 600 };
+    const fb2 = effectiveFramebufferSize(.physical, logical, 2.0);
+    try std.testing.expectEqual(@as(u32, 1600), fb2.width);
+    try std.testing.expectEqual(@as(u32, 1200), fb2.height);
+
+    const fb15 = effectiveFramebufferSize(.physical, logical, 1.5);
+    try std.testing.expectEqual(@as(u32, 1200), fb15.width);
+    try std.testing.expectEqual(@as(u32, 900), fb15.height);
+}
+
+test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ" {
+    try std.testing.expectEqual(@as(u32, 1), roundToPhysicalPx(0, 2.0)); // 0*2→0 → clamp to 1
+    try std.testing.expectEqual(@as(u32, 1600), roundToPhysicalPx(800, 2.0));
+    try std.testing.expectEqual(@as(u32, 1200), roundToPhysicalPx(800, 1.5));
+    try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, 0.0)); // invalid scale → 1.0
+    try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, std.math.nan(f32)));
+}
+
+test "TASK-156.5: effectiveContentScale は非正・非有限を 1.0 に補正" {
+    try std.testing.expectEqual(@as(f32, 2.0), effectiveContentScale(2.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.inf(f32)));
 }
