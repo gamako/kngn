@@ -100,6 +100,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var callback: FrameCallback?
     private var userdata: UnsafeMutableRawPointer?
 
+    // drawableSizeWillChange → view 側の pending 記録のみ（resource 再確保は次 lock）。
+    weak var metricsOwner: MetalFramebufferView?
+
     // ========================================
     // Triple-slot frame ring（ADR-005 1級 frame pacing / inflight ownership）
     // ========================================
@@ -188,8 +191,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // TASK-156.5: pending 新寸法/scale の記録のみ。CPU buffer/texture 再確保は次 lock。
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        // 描画サイズ変更時の処理（特になし）
+        metricsOwner?.notePendingDrawableChange(size: size)
     }
 
     // MTKView の正規 draw サイクル。drawable / renderPassDescriptor の取得・present は
@@ -322,9 +326,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         view.draw()
     }
 
-    // TASK-23: 新サイズへ slot buffers/textures を two-phase で再確保する。
-    // 単位は logical points（mouse 座標と同一。drawableSize=pixels ではない。texture は drawable へ
-    // upscale されるので Retina 挙動は従来どおり）。setFrameSize（イベントポンプ中）から呼ばれ、
+    // TASK-23 / TASK-156.5: 新サイズへ slot buffers/textures を two-phase で再確保する。
+    // 単位は framebuffer pixels（.physical では物理寸法。.logical では logical=fb）。
+    // setFrameSize（.logical）/ applyLatchedMetricsIfNeeded（.physical）から呼ばれ、
     // present(submitFrame) とは同一メインスレッドで直列なので非並行。
     // - 旧 CPU buffer: submitFrame で texture.replace により同期コピー済み → GPU は非同期参照しない → 解放安全。
     // - 旧 texture: inflight command buffer が ARC で完了まで保持 → 配列から外しても安全。
@@ -381,6 +385,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 // カスタムMTKView + NSTextInputClient（TASK-79.6.1 IME）
 class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     private var metalRenderer: MetalRenderer?
+
+    // TASK-156.5: logical / framebuffer 分離 + scale latch（objc Framebuffer と同型）
+    private var logicalWidth: Int = 1
+    private var logicalHeight: Int = 1
+    private var physicalMode: Bool = false
+    private var contentScale: CGFloat = 1.0
+    private var pendingContentScale: CGFloat = 1.0
+    private var scaleEpoch: UInt64 = 0
+    private var hasPendingResize = false
+    private var pendingLogicalWidth: Int = 1
+    private var pendingLogicalHeight: Int = 1
 
     // マウスイベント用 (TASK-21.1)。back-ref 設定時に imeState へも伝播する。
     weak var platformWindow: PlatformWindowHandle? {
@@ -523,23 +538,153 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    func setupRenderer(width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
+    func setupRenderer(width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
+        physicalMode = physical
+        logicalWidth = max(1, w)
+        logicalHeight = max(1, h)
+        pendingLogicalWidth = logicalWidth
+        pendingLogicalHeight = logicalHeight
+        hasPendingResize = false
+        scaleEpoch = 0
+        // 初期 scale: window 未接続なので mainScreen。未取得・非対応は 1.0。
+        var scale: CGFloat = 1.0
+        if let screen = NSScreen.main {
+            let s = screen.backingScaleFactor
+            if s > 0 { scale = s }
+        }
+        contentScale = scale
+        pendingContentScale = scale
+        let (fw, fh) = effectiveFramebufferSize(
+            physicalMode: physical,
+            logicalWidth: logicalWidth,
+            logicalHeight: logicalHeight,
+            scale: scale
+        )
+
         guard let device = self.device else { return }
-        metalRenderer = MetalRenderer(device: device, width: width, height: height, callback: callback, userdata: userdata)
-        self.delegate = metalRenderer
+        let renderer = MetalRenderer(device: device, width: fw, height: fh, callback: callback, userdata: userdata)
+        renderer.metricsOwner = self
+        metalRenderer = renderer
+        self.delegate = renderer
         // IME firstRect の pixel→bounds 換算に使う fb サイズを反映（TASK-140）
-        imeState.updateFramebufferSize(width: width, height: height)
+        imeState.updateFramebufferSize(width: fw, height: fh)
+        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer metrics: logical=\(logicalWidth)x\(logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
     }
 
-    // NSView がリサイズ時に呼ぶ。renderer の fb を新しい logical サイズへ再確保する（TASK-23）。
-    // MTKView の drawableSize は別途自動更新され、texture は drawable へ upscale される。
-    // サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。
-    // callback 内 present は presentManual → view.draw() で同期。manual モードは isPaused=true）。
+    // TASK-156.5: mtkView drawableSizeWillChange からの pending 記録（resource は触らない）。
+    func notePendingDrawableChange(size: CGSize) {
+        _ = size
+        refreshPendingContentScale()
+        // 寸法の pending は setFrameSize（logical points）が一次情報源。
+        // ここでは scale の取りこぼし対策のみ（applyLatched が次 lock で再確認する）。
+    }
+
+    func refreshPendingContentScale() {
+        guard let win = window else { return }
+        var live = win.backingScaleFactor
+        if live <= 0 { live = 1.0 }
+        pendingContentScale = live
+    }
+
+    func applyLatchedMetricsIfNeeded() {
+        refreshPendingContentScale()
+
+        let newScale = effectiveContentScale(pendingContentScale)
+        let scaleChanging = abs(newScale - contentScale) > 1e-6
+
+        if !physicalMode {
+            if scaleChanging {
+                contentScale = newScale
+                scaleEpoch &+= 1
+            }
+            return
+        }
+
+        guard let renderer = metalRenderer else { return }
+
+        var lw = hasPendingResize ? pendingLogicalWidth : logicalWidth
+        var lh = hasPendingResize ? pendingLogicalHeight : logicalHeight
+        if lw < 1 { lw = 1 }
+        if lh < 1 { lh = 1 }
+        let fw = roundToPhysicalPx(lw, scale: newScale)
+        let fh = roundToPhysicalPx(lh, scale: newScale)
+
+        let sizeChanging = (fw != renderer.getWidth() || fh != renderer.getHeight() || lw != logicalWidth || lh != logicalHeight)
+        if !sizeChanging && !scaleChanging {
+            hasPendingResize = false
+            return
+        }
+
+        if sizeChanging {
+            if !renderer.resize(width: fw, height: fh) {
+                // OOM / texture 失敗: 旧状態維持。pending は残して次 lock で再試行。
+                return
+            }
+            platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
+            imeState.updateFramebufferSize(width: renderer.getWidth(), height: renderer.getHeight())
+        }
+        logicalWidth = lw
+        logicalHeight = lh
+        if scaleChanging { scaleEpoch &+= 1 }
+        contentScale = newScale
+        hasPendingResize = false
+    }
+
+    func fillMetrics(_ out: UnsafeMutablePointer<PlatformFramebufferMetrics>, forQuery: Bool) {
+        if forQuery { refreshPendingContentScale() }
+        let fw = metalRenderer?.getWidth() ?? 0
+        let fh = metalRenderer?.getHeight() ?? 0
+        out.pointee.logical_width = UInt32(logicalWidth)
+        out.pointee.logical_height = UInt32(logicalHeight)
+        out.pointee.framebuffer_width = UInt32(fw)
+        out.pointee.framebuffer_height = UInt32(fh)
+        let scale = forQuery ? pendingContentScale : contentScale
+        out.pointee.content_scale = Float(effectiveContentScale(scale))
+        out.pointee.scale_epoch = scaleEpoch
+    }
+
+    func nativeEventScale() -> CGFloat {
+        refreshPendingContentScale()
+        return effectiveContentScale(pendingContentScale)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        var s: CGFloat = 1.0
+        if let win = window {
+            s = win.backingScaleFactor
+            if s <= 0 { s = 1.0 }
+        }
+        if abs(s - pendingContentScale) > 1e-6 {
+            pendingContentScale = s
+            if physicalMode, let cb = redrawCallback {
+                cb(redrawUserdata)
+            }
+        }
+    }
+
+    // NSView がリサイズ時に呼ぶ。.physical は pending のみ、.logical は即 resize（objc と同型）。
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        if physicalMode {
+            var nw = Int(newSize.width)
+            var nh = Int(newSize.height)
+            if nw < 1 { nw = 1 }
+            if nh < 1 { nh = 1 }
+            if nw != logicalWidth || nh != logicalHeight {
+                pendingLogicalWidth = nw
+                pendingLogicalHeight = nh
+                hasPendingResize = true
+                if let cb = redrawCallback {
+                    cb(redrawUserdata)
+                }
+            }
+            return
+        }
         guard let renderer = metalRenderer else { return }
         if renderer.resize(width: Int(newSize.width), height: Int(newSize.height)) {
-            // TASK-140: 再確保後の新書込バッファを handle へ反映する（次 lock/present が正しい buffer を指す）。
+            logicalWidth = renderer.getWidth()
+            logicalHeight = renderer.getHeight()
             platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
             imeState.updateFramebufferSize(width: renderer.getWidth(), height: renderer.getHeight())
             if let cb = redrawCallback {
@@ -645,7 +790,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 
     private func enqueueMouseEvent(type: PlatformEventType, button: PlatformMouseButton, from event: NSEvent) {
         guard let handle = platformWindow else { return }
-        let (x, y) = eventLocationToPlatformCoords(event, self)
+        let (x, y) = eventLocationToPlatformCoords(event, self, scale: nativeEventScale())
         var ev = PlatformEvent()
         ev.type = type
         ev.payload.mouse.x = x
@@ -659,7 +804,8 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let handle = platformWindow else { return }
-        let (x, y) = eventLocationToPlatformCoords(event, self)
+        let scale = nativeEventScale()
+        let (x, y) = eventLocationToPlatformCoords(event, self, scale: scale)
         let isPrecise = event.hasPreciseScrollingDeltas
         var dx = Float(event.scrollingDeltaX)
         var dy = Float(event.scrollingDeltaY)
@@ -667,6 +813,9 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
             dx *= SCROLL_LINE_TO_POINTS
             dy *= SCROLL_LINE_TO_POINTS
         }
+        // raw physical unit（facade が latched scale で論理化）
+        dx *= Float(scale)
+        dy *= Float(scale)
         var ev = PlatformEvent()
         ev.type = PLATFORM_EVENT_MOUSE_SCROLL
         ev.payload.scroll.x = x
@@ -776,7 +925,8 @@ func makePlatformBackendView(
     height: Int,
     callback: FrameCallback?,
     userdata: UnsafeMutableRawPointer?,
-    transparent: Bool
+    transparent: Bool,
+    physical: Bool
 ) -> (any PlatformBackendView)? {
     // Metal用ビューを作成
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
@@ -801,8 +951,8 @@ func makePlatformBackendView(
     // なので必須の挙動変更ではないが、ADR-005 の 1級 backend 契約を明文化する。
     (metalView.layer as? CAMetalLayer)?.displaySyncEnabled = true
 
-    // レンダラーをセットアップ
-    metalView.setupRenderer(width: width, height: height, callback: callback, userdata: userdata)
+    // レンダラーをセットアップ（.physical 時は物理サイズで CPU buffer / texture を確保）
+    metalView.setupRenderer(width: width, height: height, callback: callback, userdata: userdata, physical: physical)
 
     return metalView
 }

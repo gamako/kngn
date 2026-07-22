@@ -158,13 +158,38 @@ class EventQueue {
 // non-precise scroll の line→points 変換係数 (経験則)
 let SCROLL_LINE_TO_POINTS: Float = 16.0
 
-// NSEvent.locationInWindow を view 内の左上原点座標へ変換 (floor 整数化)。
-func eventLocationToPlatformCoords(_ event: NSEvent, _ view: NSView) -> (Int32, Int32) {
+// TASK-156.5 Stage 1: 共通スケールヘルパー（objc / ADR-011 と同型）。
+// 入力正規化用の実スケール（query 用。fb_mode に非依存）。
+func effectiveContentScale(_ rawScale: CGFloat) -> CGFloat {
+    return (rawScale > 0 && rawScale.isFinite) ? rawScale : 1.0
+}
+
+/// objc の `(int)lround((double)px * (double)scale)` と数値一致。
+/// 有限値 [1, UInt32.max] にクランプする。
+func roundToPhysicalPx(_ logicalPx: Int, scale: CGFloat) -> Int {
+    let s = Double(effectiveContentScale(scale))
+    let v = (Double(logicalPx) * s).rounded()
+    if !v.isFinite || v < 1.0 { return 1 }
+    if v > Double(UInt32.max) { return Int(UInt32.max) }
+    return Int(v)
+}
+
+/// framebuffer 物理サイズ。.logical は常に logical そのもの。
+func effectiveFramebufferSize(physicalMode: Bool, logicalWidth: Int, logicalHeight: Int, scale: CGFloat) -> (Int, Int) {
+    if !physicalMode { return (max(1, logicalWidth), max(1, logicalHeight)) }
+    return (roundToPhysicalPx(logicalWidth, scale: scale), roundToPhysicalPx(logicalHeight, scale: scale))
+}
+
+// NSEvent.locationInWindow を view 内の左上原点・raw physical pixel へ変換 (floor 整数化)。
+// scale は current native backing scale（content_scale）。.logical でも実 scale を乗算する
+// （objc `event_location_to_platform_raw_coords` と同契約。facade が正規化する）。
+func eventLocationToPlatformCoords(_ event: NSEvent, _ view: NSView, scale: CGFloat) -> (Int32, Int32) {
     let windowPt = event.locationInWindow
     let viewPt = view.convert(windowPt, from: nil)
     let viewHeight = view.bounds.size.height
-    let x = Int32(floor(viewPt.x))
-    let y = Int32(floor(viewHeight - viewPt.y))  // Y フリップ
+    let s = effectiveContentScale(scale)
+    let x = Int32(floor(viewPt.x * s))
+    let y = Int32(floor((viewHeight - viewPt.y) * s))  // Y フリップ
     return (x, y)
 }
 
@@ -362,6 +387,12 @@ protocol PlatformBackendView: AnyObject {
     func setTextInputDocumentAccess(callbacks: UnsafePointer<PlatformTextInputDocumentCallbacks>?, userdata: UnsafeMutableRawPointer?)
     func hasMarkedText() -> Bool
     func imeRouteEnabled() -> Bool
+    // TASK-156.5 Stage 1: scale latch / metrics（objc fillMetrics / applyLatched / nativeEventScale と同型）
+    // forQuery=true: current negotiated（pending scale）。lock 前の contentScale()/入力正規化用。
+    // forQuery=false: latched snapshot（buffer/scale/epoch が同一 frame に属する）。lock_ex 用。
+    func fillMetrics(_ out: UnsafeMutablePointer<PlatformFramebufferMetrics>, forQuery: Bool)
+    func applyLatchedMetricsIfNeeded()
+    func nativeEventScale() -> CGFloat
 }
 
 // PlatformWindowの不透明型として NSObject を継承（参照カウントのため）
@@ -1050,14 +1081,15 @@ func platform_init() -> Bool {
 
 @_cdecl("platform_create_window")
 func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false, position: nil)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false, position: nil, physical: false)
 }
 
-// TASK-104 / TASK-117: options 付きウィンドウ作成。opts==NULL は従来動作。unknown flags / reserved!=0 は NULL。
+// TASK-104 / TASK-117 / TASK-156.5: options 付きウィンドウ作成。opts==NULL は従来動作。unknown flags / reserved!=0 は NULL。
 @_cdecl("platform_create_window_ex")
 func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, opts: UnsafePointer<PlatformWindowOptions>?) -> UnsafeMutableRawPointer? {
     var transparent = false
     var borderless = false
+    var physical = false
     var position: (x: Int32, y: Int32)? = nil
     if let opts = opts {
         let flags = opts.pointee.flags
@@ -1065,18 +1097,17 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
         if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
         transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
         borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
-        // TASK-156.1: PHYSICAL flag は受理するが P1 の Swift/Metal buffer は scale=1 のまま（P5 送り）
-        _ = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
+        physical = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
         if (flags & UInt32(PLATFORM_WINDOW_POSITION)) != 0 {
             position = (opts.pointee.x, opts.pointee.y)
         }
     }
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, physical: physical)
 }
 
 // ウィンドウ生成の共有骨格。backend 固有の view 生成は makePlatformBackendView() ファクトリへ委譲する
 // （各 backend ファイルが定義）。window レベルの style / 透過 / 位置決めは共通。
-private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?) -> UnsafeMutableRawPointer? {
+private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, physical: Bool) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
@@ -1112,14 +1143,15 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
         window.isMovable = true
     }
 
-    // backend 固有 view を生成（CALayer / Metal）。透過モード等の view 側設定はファクトリ内で行う。
+    // backend 固有 view を生成（CALayer / Metal）。透過・physical 等の view 側設定はファクトリ内で行う。
     guard let backendView = makePlatformBackendView(
         frame: frame,
         width: Int(width),
         height: Int(height),
         callback: callback,
         userdata: userdata,
-        transparent: transparent
+        transparent: transparent,
+        physical: physical
     ) else {
         return nil
     }
@@ -1456,19 +1488,12 @@ func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_wid
     return px
 }
 
-// TASK-156.1: scale=1 stub（Swift/Metal の物理 buffer は P5）。logical == framebuffer。
+// TASK-156.5 Stage 1: query 用 metrics（pending scale を都度再取得）。
 @_cdecl("platform_get_framebuffer_metrics")
 func platform_get_framebuffer_metrics(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformFramebufferMetrics>?) -> Bool {
     guard let platformWindow = platformWindow, let out = out else { return false }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
-    let w = UInt32(handle.backendView.width)
-    let h = UInt32(handle.backendView.height)
-    out.pointee.logical_width = w
-    out.pointee.logical_height = h
-    out.pointee.framebuffer_width = w
-    out.pointee.framebuffer_height = h
-    out.pointee.content_scale = 1.0
-    out.pointee.scale_epoch = 0
+    handle.backendView.fillMetrics(out, forQuery: true)
     return true
 }
 
@@ -1476,15 +1501,15 @@ func platform_get_framebuffer_metrics(platformWindow: UnsafeMutableRawPointer?, 
 func platform_lock_framebuffer_ex(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformFramebufferMetrics>?) -> UnsafeMutablePointer<UInt32>? {
     guard let platformWindow = platformWindow else { return nil }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
-    let w = UInt32(handle.backendView.width)
-    let h = UInt32(handle.backendView.height)
+    // pending scale/size を latch（成功時のみ buffer/scale/epoch を原子 commit）
+    handle.backendView.applyLatchedMetricsIfNeeded()
+    // latched snapshot（4 fields が同一 frame に属する）
     if let out = out {
-        out.pointee.logical_width = w
-        out.pointee.logical_height = h
-        out.pointee.framebuffer_width = w
-        out.pointee.framebuffer_height = h
-        out.pointee.content_scale = 1.0
-        out.pointee.scale_epoch = 0
+        handle.backendView.fillMetrics(out, forQuery: false)
+    }
+    // currentBuffer を返す（objc getCurrentBuffer と同型。latch 後の書込バッファ）
+    if let live = handle.backendView.initialFramebuffer {
+        handle.currentFramebuffer = live
     }
     return handle.currentFramebuffer
 }

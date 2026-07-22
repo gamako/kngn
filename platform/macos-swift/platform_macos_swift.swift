@@ -13,8 +13,17 @@ let IMPLEMENTATION_TYPE = "CALayer Optimized (Swift)"
 
 // カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
 class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
-    var width: Int
-    var height: Int
+    var width: Int   // framebuffer pixel width（.logical では logical と同値）
+    var height: Int  // framebuffer pixel height
+    private var logicalWidth: Int
+    private var logicalHeight: Int
+    private let physicalMode: Bool
+    private var contentScale: CGFloat        // latched（lock で commit 済み）
+    private var pendingContentScale: CGFloat // 検出済み current negotiated scale
+    private var scaleEpoch: UInt64 = 0
+    private var hasPendingResize = false
+    private var pendingLogicalWidth: Int
+    private var pendingLogicalHeight: Int
     private var displayLink: CADisplayLink?
     private var callback: FrameCallback?
     private var userdata: UnsafeMutableRawPointer?
@@ -64,14 +73,33 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     private var clickThroughState: Bool = false // 直近設定した ignoresMouseEvents 値（変化時のみ再設定）
     private var lastMouseDownEvent: NSEvent?    // 直近の左ボタン mouse-down（beginDrag 用。one-shot 消費）
 
-    init(frame: NSRect, width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
-        self.width = width
-        self.height = height
+    init(frame: NSRect, width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
+        self.physicalMode = physical
+        self.logicalWidth = max(1, w)
+        self.logicalHeight = max(1, h)
+        self.pendingLogicalWidth = self.logicalWidth
+        self.pendingLogicalHeight = self.logicalHeight
+        // 初期 scale: window 未接続なので mainScreen。未取得・非対応は 1.0。
+        var scale: CGFloat = 1.0
+        if let screen = NSScreen.main {
+            let s = screen.backingScaleFactor
+            if s > 0 { scale = s }
+        }
+        self.contentScale = scale
+        self.pendingContentScale = scale
+        let (fw, fh) = effectiveFramebufferSize(
+            physicalMode: physical,
+            logicalWidth: self.logicalWidth,
+            logicalHeight: self.logicalHeight,
+            scale: scale
+        )
+        self.width = fw
+        self.height = fh
         self.callback = callback
         self.userdata = userdata
 
         // ダブルバッファを確保（calloc = ゼロ初期化 + OOM は nil。objc 版と同型）
-        let bufferSize = width * height
+        let bufferSize = fw * fh
         guard let raw0 = calloc(bufferSize, MemoryLayout<UInt32>.size),
               let raw1 = calloc(bufferSize, MemoryLayout<UInt32>.size) else {
             fatalError("FramebufferView: OOM allocating framebuffers")
@@ -108,21 +136,26 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
         // IME 状態に host view / fb サイズを渡す（firstRect の換算に使う。TASK-140）
         imeState.hostView = self
-        imeState.updateFramebufferSize(width: width, height: height)
+        imeState.updateFramebufferSize(width: fw, height: fh)
 
         // レイヤーバックドビューに設定
         self.wantsLayer = true
 
-        // コンテンツレイヤーを作成
-        self.contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+        // コンテンツレイヤーを作成（frame は常に logical points）
+        self.contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(self.logicalWidth), height: CGFloat(self.logicalHeight))
         self.contentLayer.isOpaque = true
         self.contentLayer.isGeometryFlipped = true  // Y軸反転を一度だけ設定
+        self.contentLayer.magnificationFilter = .nearest
+        self.contentLayer.minificationFilter = .nearest
+        if physical {
+            self.contentLayer.contentsScale = scale
+        }
         self.layer?.addSublayer(self.contentLayer)
 
         // TASK-135: OS ファイル drag & drop（file URL のみ。objc backend 先行の横展開）
         self.registerForDraggedTypes([.fileURL])
 
-        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer initialized: \(width)x\(height)")
+        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer initialized: logical=\(self.logicalWidth)x\(self.logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
     }
 
     required init?(coder: NSCoder) {
@@ -468,7 +501,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
     private func enqueueMouseEvent(type: PlatformEventType, button: PlatformMouseButton, from event: NSEvent) {
         guard let handle = platformWindow else { return }
-        let (x, y) = eventLocationToPlatformCoords(event, self)
+        let (x, y) = eventLocationToPlatformCoords(event, self, scale: nativeEventScale())
         var ev = PlatformEvent()
         ev.type = type
         ev.payload.mouse.x = x
@@ -482,7 +515,8 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let handle = platformWindow else { return }
-        let (x, y) = eventLocationToPlatformCoords(event, self)
+        let scale = nativeEventScale()
+        let (x, y) = eventLocationToPlatformCoords(event, self, scale: scale)
         let isPrecise = event.hasPreciseScrollingDeltas
         var dx = Float(event.scrollingDeltaX)
         var dy = Float(event.scrollingDeltaY)
@@ -490,6 +524,9 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             dx *= SCROLL_LINE_TO_POINTS
             dy *= SCROLL_LINE_TO_POINTS
         }
+        // raw physical unit（facade が latched scale で論理化）
+        dx *= Float(scale)
+        dy *= Float(scale)
         var ev = PlatformEvent()
         ev.type = PLATFORM_EVENT_MOUSE_SCROLL
         ev.payload.scroll.x = x
@@ -539,14 +576,15 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
     }
 
-    // TASK-23 / TASK-23.1: 新サイズへ two-phase でバッファを再確保する。
+    // TASK-23 / TASK-156.5: 新サイズへ two-phase でバッファを再確保する。
+    // 単位は framebuffer pixels（.physical では物理寸法。.logical では logical=fb）。
     // TASK-55 で provider が buffer を **no-copy 参照**するため、旧 buffer の解放前に
     // 「layer.contents の参照を切る → 旧 provider を解放する」順序が必須（objc 版と同順序）。
-    // 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
+    // lock 中には呼ばれない（イベントポンプ中 / applyLatched から発火）。
     // 戻り値: サイズが実際に変わって再確保した場合 true。変化なし / OOM / provider 失敗は
     // false（旧サイズ維持・redraw callback 非発火。allocate trap は使わない）。
     @discardableResult
-    func resizeBuffers(width w0: Int, height h0: Int) -> Bool {
+    func resizeBuffersTo(width w0: Int, height h0: Int) -> Bool {
         let w = max(1, w0)
         let h = max(1, h0)
         if w == width && h == height { return false } // 変化なし
@@ -587,15 +625,124 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         displayBuffer = buffer1
         width = w
         height = h
-        contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+        if !physicalMode {
+            // .logical: framebuffer == logical。layer frame も同寸法（従来どおり）。
+            logicalWidth = w
+            logicalHeight = h
+            contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+        }
         return true
     }
 
+    // TASK-156.5: pending logical size / scale を lock 境界で latch（objc と同型）。
+    func refreshPendingContentScale() {
+        guard let win = window else { return }
+        var live = win.backingScaleFactor
+        if live <= 0 { live = 1.0 }
+        pendingContentScale = live
+    }
+
+    func applyLatchedMetricsIfNeeded() {
+        // lock 時に live backingScaleFactor を再確認（通知取りこぼし対策）
+        refreshPendingContentScale()
+
+        let newScale = effectiveContentScale(pendingContentScale)
+        let scaleChanging = abs(newScale - contentScale) > 1e-6
+
+        if !physicalMode {
+            // .logical: buffer 寸法は触らず。scale が変わったときだけ epoch と latched scale を原子 commit。
+            if scaleChanging {
+                contentScale = newScale
+                scaleEpoch &+= 1
+            }
+            return
+        }
+
+        var lw = hasPendingResize ? pendingLogicalWidth : logicalWidth
+        var lh = hasPendingResize ? pendingLogicalHeight : logicalHeight
+        if lw < 1 { lw = 1 }
+        if lh < 1 { lh = 1 }
+        let fw = roundToPhysicalPx(lw, scale: newScale)
+        let fh = roundToPhysicalPx(lh, scale: newScale)
+
+        let sizeChanging = (fw != width || fh != height || lw != logicalWidth || lh != logicalHeight)
+        if !sizeChanging && !scaleChanging {
+            hasPendingResize = false
+            return
+        }
+
+        if sizeChanging {
+            if !resizeBuffersTo(width: fw, height: fh) {
+                // OOM: 旧 buffer / 旧 latched scale / 旧 epoch を維持（pending は残して次 lock で再試行）
+                return
+            }
+            platformWindow?.currentFramebuffer = currentBuffer
+            imeState.updateFramebufferSize(width: width, height: height)
+        }
+        // 成功時のみ logical・latched scale・epoch をまとめて commit
+        logicalWidth = lw
+        logicalHeight = lh
+        if scaleChanging { scaleEpoch &+= 1 }
+        contentScale = newScale
+        hasPendingResize = false
+        contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(logicalWidth), height: CGFloat(logicalHeight))
+        contentLayer.contentsScale = contentScale
+    }
+
+    func fillMetrics(_ out: UnsafeMutablePointer<PlatformFramebufferMetrics>, forQuery: Bool) {
+        if forQuery { refreshPendingContentScale() }
+        out.pointee.logical_width = UInt32(logicalWidth)
+        out.pointee.logical_height = UInt32(logicalHeight)
+        out.pointee.framebuffer_width = UInt32(width)
+        out.pointee.framebuffer_height = UInt32(height)
+        let scale = forQuery ? pendingContentScale : contentScale
+        out.pointee.content_scale = Float(effectiveContentScale(scale))
+        out.pointee.scale_epoch = scaleEpoch
+    }
+
+    func nativeEventScale() -> CGFloat {
+        refreshPendingContentScale()
+        return effectiveContentScale(pendingContentScale)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        var s: CGFloat = 1.0
+        if let win = window {
+            s = win.backingScaleFactor
+            if s <= 0 { s = 1.0 }
+        }
+        // pending のみ更新。epoch / latched scale / buffer は次の lock 成功時に原子 commit。
+        if abs(s - pendingContentScale) > 1e-6 {
+            pendingContentScale = s
+            if physicalMode, let cb = redrawCallback {
+                cb(redrawUserdata)
+            }
+        }
+    }
+
     // NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
-    // resizeBuffers 成功（実サイズ変化）のときだけ redraw callback を発火する（TASK-23.1）。
+    // .physical は pending のみ記録し次 lock で commit（objc と同型）。
+    // .logical は即 resize。成功時だけ redraw callback を発火する（TASK-23.1）。
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        if resizeBuffers(width: Int(newSize.width), height: Int(newSize.height)) {
+        if physicalMode {
+            var nw = Int(newSize.width)
+            var nh = Int(newSize.height)
+            if nw < 1 { nw = 1 }
+            if nh < 1 { nh = 1 }
+            if nw != logicalWidth || nh != logicalHeight {
+                pendingLogicalWidth = nw
+                pendingLogicalHeight = nh
+                hasPendingResize = true
+                // buffer は次 lock で apply。redraw で app に lock を促す。
+                if let cb = redrawCallback {
+                    cb(redrawUserdata)
+                }
+            }
+            return
+        }
+        if resizeBuffersTo(width: Int(newSize.width), height: Int(newSize.height)) {
             // TASK-140: 再確保後の新書込バッファを handle へ反映する（次 lock/present が正しい buffer を指す）。
             platformWindow?.currentFramebuffer = currentBuffer
             imeState.updateFramebufferSize(width: width, height: height)
@@ -642,14 +789,16 @@ func makePlatformBackendView(
     height: Int,
     callback: FrameCallback?,
     userdata: UnsafeMutableRawPointer?,
-    transparent: Bool
+    transparent: Bool,
+    physical: Bool
 ) -> (any PlatformBackendView)? {
     let view = FramebufferView(
         frame: frame,
         width: width,
         height: height,
         callback: callback,
-        userdata: userdata
+        userdata: userdata,
+        physical: physical
     )
     if transparent {
         view.setTransparentMode(true) // CGImage を premultiplied alpha 化
