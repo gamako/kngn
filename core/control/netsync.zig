@@ -122,6 +122,19 @@ pub const PeerView = struct {
     label: []const u8,
 };
 
+/// peer origin 解決結果（TASK-83 Phase 2）。`label` は呼び出し元 `label_buf` へのコピー。
+pub const PeerOriginView = struct {
+    peer_id: u32,
+    kind: ActorKind,
+    label: []const u8,
+    active: bool,
+};
+
+/// host 自身（peer_id=0）の固定 identity。`VP_NETSYNC_HOST_ACTOR` 等の env は設けない。
+pub const HOST_PEER_ID: u32 = 0;
+pub const HOST_ACTOR_KIND: ActorKind = .human;
+pub const HOST_LABEL: []const u8 = "host";
+
 pub const Role = enum { disabled, host, client };
 const SlotState = enum { empty, hello_pending, active, closing };
 
@@ -724,7 +737,7 @@ const PresenceOutboundQueue = struct {
 };
 
 // ============================================================================
-// Connection slot
+// Connection slot / peer catalog（client 側）
 // ============================================================================
 
 const ConnSlot = struct {
@@ -753,6 +766,18 @@ const ConnSlot = struct {
     is_client_conn: bool = false,
 };
 
+/// client 用固定長 peer catalog（host(1) + 最大 client 数）。host は slots[] + 固定 host identity。
+const MAX_PEER_CATALOG: usize = MAX_PEERS + 1;
+
+const PeerCatalogEntry = struct {
+    occupied: bool = false,
+    active: bool = false,
+    peer_id: u32 = 0,
+    kind: ActorKind = .human,
+    label_buf: [MAX_LABEL_LEN]u8 = undefined,
+    label_len: usize = 0,
+};
+
 /// join 時 state 同期アダプタ（単一スロット）。
 /// `export_fn` は **0 byte を返してはならない**（空は「snapshot なし」予約マーカー。未登録時のみ空 SYNC）。
 pub const StateSync = struct {
@@ -769,10 +794,16 @@ pub const StateSync = struct {
 // 次のフィールドの読み書きはすべて `peers_mutex` 下で行う（イベント時のみの経路）:
 //   role / started / local_peer_id / next_peer_id / router_clear_pending /
 //   slots[*].state および slot の peer メタ（peer_id/kind/label/hello_done/socket_open）/
-//   client_slot の同種フィールド
+//   client_slot の同種フィールド /
+//   peer_catalog[*] / peer_metadata_revision
 // `stop_flag` のみ atomic。`have_server` / acceptor_thread は main（init/shutdown）専有。
 // wire_seq / next_proposal_id / last_rejected_* / last_applied_seq / shared_executor は main thread 専有
 // （pump / router / setSharedExecutor。reader は触らない）。
+// reader thread は wire frame 受信・inbound enqueue が主だが、HELLO 処理（`handleHello`）は
+// 既存どおり reader thread 上で peers_mutex を取って直接 slot/catalog を書く（join/leave 時の
+// peer_catalog 登録・PEER_INFO 配布・peer_metadata_revision 更新を含む）。他 peer 由来の
+// PEER_INFO 反映（`handlePeerInfo`）と origin 解決（`resolvePeerOrigin`）は main thread
+// （pump 経由）。いずれも同じ `peers_mutex` で保護される。
 // outbound キューは独自 mutex を持ち、ロック順序は **peers_mutex → outbound.mutex**（逆順禁止）。
 
 var role: Role = .disabled;
@@ -793,6 +824,11 @@ var next_peer_id: u32 = 1; // 0 = host 予約
 
 var client_slot: ConnSlot = .{};
 var local_peer_id: u32 = 0; // client が host HELLO で受け取る
+
+/// client 側 peer catalog（host は未使用）。leave は active=false tombstone として kind/label を保持。
+var peer_catalog: [MAX_PEER_CATALOG]PeerCatalogEntry = [_]PeerCatalogEntry{.{}} ** MAX_PEER_CATALOG;
+/// module 全体で 1 本の peer metadata revision（entry 単位 revision は持たない。TASK-83 Phase 2）。
+var peer_metadata_revision: u64 = 0;
 
 var inbound: InboundQueue = .{};
 /// PRESENCE 専用 inbound（awaiting_sync gate 外で処理。TASK-103）。
@@ -940,7 +976,7 @@ fn pendingRemoveProposal(proposal_id: u32) void {
 pub const NetsyncStats = struct {
     role: Role = .disabled,
     peers: usize = 0,
-    /// 接続中の agent 種別 peer 数（host=peer テーブル / client=自分のみ。PEER_INFO 未配布）。
+    /// 接続中の agent 種別 peer 数（host=slots[] / client=catalog の active agent）。
     agents: usize = 0,
     peer_id: u32 = 0,
     last_seq: u64 = 0,
@@ -969,9 +1005,19 @@ pub fn gatherStats() NetsyncStats {
                     if (s.actor_kind == .agent) st.agents += 1;
                 }
             }
-        } else if (role == .client and client_slot.state == .active) {
-            st.peers = 1;
-            if (client_slot.actor_kind == .agent) st.agents = 1;
+        } else if (role == .client) {
+            // PEER_INFO 反映後は catalog の active 全件。未着信でも HELLO 直後に self を入れる。
+            for (&peer_catalog) |*e| {
+                if (e.occupied and e.active) {
+                    st.peers += 1;
+                    if (e.kind == .agent) st.agents += 1;
+                }
+            }
+            // catalog 空（HELLO 前）のフォールバック: 従来どおり自 slot
+            if (st.peers == 0 and client_slot.state == .active) {
+                st.peers = 1;
+                if (client_slot.actor_kind == .agent) st.agents = 1;
+            }
         }
     }
     peers_mutex.unlock(io_val);
@@ -982,6 +1028,141 @@ pub fn gatherStats() NetsyncStats {
     st.last_seq = if (st.role == .host) wire_seq else last_applied_seq;
     st.last_reject = last_rejected_proposal;
     return st;
+}
+
+/// ASCII 制御文字を `_` に置換し、最大 `out.len`（通常 MAX_LABEL_LEN=200）に切り詰める。
+pub fn sanitizePeerLabel(out: []u8, label: []const u8) []const u8 {
+    const n = @min(label.len, out.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c = label[i];
+        out[i] = if (c < 0x20 or c == 0x7f) '_' else c;
+    }
+    return out[0..n];
+}
+
+fn actorKindToPeerInfoByte(k: ActorKind) u8 {
+    return switch (k) {
+        .human => PEER_INFO_KIND_HUMAN,
+        .agent => PEER_INFO_KIND_AGENT,
+    };
+}
+
+fn peerInfoByteToActorKind(b: u8) ?ActorKind {
+    return switch (b) {
+        PEER_INFO_KIND_HUMAN => .human,
+        PEER_INFO_KIND_AGENT => .agent,
+        else => null,
+    };
+}
+
+fn clearPeerCatalogLocked() void {
+    for (&peer_catalog) |*e| e.* = .{};
+}
+
+/// peers_mutex 保持下。同一 peer_id は更新。空き無ければ最古 inactive tombstone を再利用。
+/// active entry は evict しない（満杯かつ inactive 無しなら false）。
+fn upsertPeerCatalogLocked(peer_id: u32, kind: ActorKind, label: []const u8, active: bool) bool {
+    var free_i: ?usize = null;
+    var oldest_inactive: ?usize = null;
+    for (&peer_catalog, 0..) |*e, i| {
+        if (e.occupied and e.peer_id == peer_id) {
+            e.kind = kind;
+            e.active = active;
+            const n = @min(label.len, MAX_LABEL_LEN);
+            if (n > 0) @memcpy(e.label_buf[0..n], label[0..n]);
+            e.label_len = n;
+            return true;
+        }
+        if (!e.occupied) {
+            if (free_i == null) free_i = i;
+        } else if (!e.active) {
+            if (oldest_inactive == null) oldest_inactive = i;
+        }
+    }
+    const slot_i = free_i orelse oldest_inactive orelse return false;
+    const e = &peer_catalog[slot_i];
+    e.* = .{
+        .occupied = true,
+        .active = active,
+        .peer_id = peer_id,
+        .kind = kind,
+    };
+    const n = @min(label.len, MAX_LABEL_LEN);
+    if (n > 0) @memcpy(e.label_buf[0..n], label[0..n]);
+    e.label_len = n;
+    return true;
+}
+
+fn markPeerCatalogLeftLocked(peer_id: u32) bool {
+    for (&peer_catalog) |*e| {
+        if (e.occupied and e.peer_id == peer_id) {
+            e.active = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn enqueuePeerInfoLocked(slot: *ConnSlot, peer_id: u32, kind_byte: u8, label: []const u8) bool {
+    var pbuf: [5 + MAX_LABEL_LEN]u8 = undefined;
+    const payload = formatPeerInfo(&pbuf, peer_id, kind_byte, label) catch return false;
+    return slot.outbound.enqueue(io_val, @intFromEnum(FrameKind.peer_info), payload);
+}
+
+/// peer_id → kind/label 解決（main thread 想定。label は `label_buf` へコピー）。
+/// host の peer_id=0 は固定 HOST identity。未解決は null。
+pub fn resolvePeerOrigin(peer_id: u32, label_buf: []u8) ?PeerOriginView {
+    if (!io_inited) return null;
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    if (!started or role == .disabled) return null;
+
+    if (role == .host) {
+        if (peer_id == HOST_PEER_ID) {
+            const lab = sanitizePeerLabel(label_buf, HOST_LABEL);
+            return .{
+                .peer_id = HOST_PEER_ID,
+                .kind = HOST_ACTOR_KIND,
+                .label = lab,
+                .active = true,
+            };
+        }
+        for (&slots) |*s| {
+            if (s.state != .active or s.peer_id != peer_id) continue;
+            const raw = s.label_buf[0..s.label_len];
+            const lab = sanitizePeerLabel(label_buf, raw);
+            return .{
+                .peer_id = peer_id,
+                .kind = s.actor_kind,
+                .label = lab,
+                .active = true,
+            };
+        }
+        return null;
+    }
+
+    // client: local catalog（PEER_INFO 未着信は null。self は HELLO 時に catalog へ入れる）
+    for (&peer_catalog) |*e| {
+        if (!e.occupied or e.peer_id != peer_id) continue;
+        const raw = e.label_buf[0..e.label_len];
+        const lab = sanitizePeerLabel(label_buf, raw);
+        return .{
+            .peer_id = peer_id,
+            .kind = e.kind,
+            .label = lab,
+            .active = e.active,
+        };
+    }
+    return null;
+}
+
+/// peer catalog / slot metadata の粗粒度 revision（履歴キャッシュ再構築トリガ）。
+pub fn peerMetadataRevision() u64 {
+    if (!io_inited) return 0;
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    return peer_metadata_revision;
 }
 
 const reject_reason_token_max = 64;
@@ -1106,9 +1287,8 @@ fn sanitizeJsonToken(out: []u8, s: []const u8) []const u8 {
 }
 
 /// snapshot JSON 1 オブジェクト。
-/// `peers` は `[{peer_id,kind,label},...]`（host=peer テーブル全件 / client=自分のみ）。
-/// **既知制約（PEER_INFO 未配布）**: client は他 peer の kind/label を知らないため配列は自 slot のみ。
-/// 配布は TASK-83 Phase 2（62.5 plan §6）。`log` は全 command 配列（executor 不在時は []）。
+/// `peers` は `[{peer_id,kind,label},...]`（host=slots[] 全件 / client=catalog の active 全件）。
+/// `log[].origin` は従来どおり数字/タグのみ（kind/label 化しない。digest netsync 公開契約）。
 /// **main thread 専用**。
 pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     const st = gatherStats();
@@ -1332,8 +1512,11 @@ pub fn peerCount() usize {
         for (&slots) |*s| {
             if (s.state == .active) n += 1;
         }
-    } else if (role == .client and client_slot.state == .active) {
-        n = 1;
+    } else if (role == .client) {
+        for (&peer_catalog) |*e| {
+            if (e.occupied and e.active) n += 1;
+        }
+        if (n == 0 and client_slot.state == .active) n = 1;
     }
     return n;
 }
@@ -1358,8 +1541,22 @@ pub fn getPeer(i: usize, label_buf: []u8) ?PeerView {
             }
             seen += 1;
         }
-    } else if (role == .client and client_slot.state == .active) {
-        if (i == 0) {
+    } else if (role == .client) {
+        for (&peer_catalog) |*e| {
+            if (!e.occupied or !e.active) continue;
+            if (seen == i) {
+                const n = @min(e.label_len, label_buf.len);
+                if (n > 0) @memcpy(label_buf[0..n], e.label_buf[0..n]);
+                return .{
+                    .peer_id = e.peer_id,
+                    .kind = e.kind,
+                    .label = label_buf[0..n],
+                };
+            }
+            seen += 1;
+        }
+        // catalog 空（HELLO 前）フォールバック
+        if (seen == 0 and i == 0 and client_slot.state == .active) {
             const n = @min(client_slot.label_len, label_buf.len);
             if (n > 0) @memcpy(label_buf[0..n], client_slot.label_buf[0..n]);
             return .{
@@ -1710,10 +1907,35 @@ fn handleInboundFrame(kind: u8, from_peer: u32, payload: []const u8) void {
         .commit => handleCommit(payload),
         .commit_revert => handleCommitRevert(payload),
         .reject => handleReject(payload),
+        .peer_info => handlePeerInfo(payload),
         .sync => {
             std.debug.print("[netsync] unexpected SYNC on host path — ignore\n", .{});
         },
         else => {},
+    }
+}
+
+/// client 側: PEER_INFO を catalog へ反映（main thread / pump）。host は無視。
+/// malformed / 未知 kind / 短小 payload は状態不変。未知 peer への LEFT は無視。
+fn handlePeerInfo(payload: []const u8) void {
+    const parsed = parsePeerInfo(payload) catch return;
+
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    if (role != .client or !started) return;
+
+    if (parsed.kind == PEER_INFO_KIND_LEFT) {
+        if (markPeerCatalogLeftLocked(parsed.peer_id)) {
+            peer_metadata_revision +%= 1;
+        }
+        return;
+    }
+
+    const kind = peerInfoByteToActorKind(parsed.kind) orelse return;
+    var lab_buf: [MAX_LABEL_LEN]u8 = undefined;
+    const lab = sanitizePeerLabel(&lab_buf, parsed.label);
+    if (upsertPeerCatalogLocked(parsed.peer_id, kind, lab, true)) {
+        peer_metadata_revision +%= 1;
     }
 }
 
@@ -2493,6 +2715,7 @@ fn failSoftDisableClientLocked() void {
     local_peer_id = 0;
     awaiting_sync = false;
     freePendingSyncLocked();
+    clearPeerCatalogLocked();
     requestRouterClear();
 }
 
@@ -2698,10 +2921,26 @@ fn readerMain(slot: *ConnSlot) void {
 
 /// reader 終了時: writer を起こして join し、その後にだけ fd を close してスロットを empty へ戻す。
 /// 順序: outbound.close → shutdown → writer join → stream.close（1 回）→ slot reset。
+/// host 側 peer leave 時は残存 client へ PEER_INFO LEFT を配布する（TASK-83 Phase 2）。
 fn cleanupAfterReader(slot: *ConnSlot) void {
     const was_client = slot.is_client_conn;
 
+    // leave 配布用に peer メタを退避（slot empty 化前）
+    var leave_peer_id: u32 = 0;
+    var leave_label_buf: [MAX_LABEL_LEN]u8 = undefined;
+    var leave_label_len: usize = 0;
+    var do_leave_broadcast = false;
+
     peers_mutex.lockUncancelable(io_val);
+    // HELLO 完了済み peer の leave のみ LEFT 配布（host 側）
+    if (!was_client and slot.hello_done and slot.peer_id != 0) {
+        leave_peer_id = slot.peer_id;
+        leave_label_len = slot.label_len;
+        if (leave_label_len > 0) {
+            @memcpy(leave_label_buf[0..leave_label_len], slot.label_buf[0..leave_label_len]);
+        }
+        do_leave_broadcast = true;
+    }
     if (slot.state != .empty and slot.state != .closing) {
         slot.state = .closing;
         slot.outbound.close(io_val);
@@ -2736,6 +2975,17 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
     slot.peer_id = 0;
     slot.label_len = 0;
     slot.reader_thread = null;
+
+    // 残存 active client へ LEFT（leaving slot は既に empty）。outbound ロック順: peers_mutex → outbound。
+    if (do_leave_broadcast and role == .host) {
+        const lab = leave_label_buf[0..leave_label_len];
+        for (&slots) |*s| {
+            if (s.state != .active) continue;
+            _ = enqueuePeerInfoLocked(s, leave_peer_id, PEER_INFO_KIND_LEFT, lab);
+        }
+        peer_metadata_revision +%= 1;
+    }
+
     // client 切断後は同 mutex 下で netsync を fail-soft 無効化。router 解除は pump へ委譲。
     if (was_client) {
         role = .disabled;
@@ -2743,6 +2993,7 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
         local_peer_id = 0;
         awaiting_sync = false;
         freePendingSyncLocked();
+        clearPeerCatalogLocked();
         requestRouterClear();
     }
     peers_mutex.unlock(io_val);
@@ -2763,6 +3014,10 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
         slot.peer_id = pid;
         local_peer_id = pid;
         slot.state = .active;
+        // 自分を catalog 先頭相当として登録（host からの self PEER_INFO は送られない）。
+        const self_lab = slot.label_buf[0..slot.label_len];
+        _ = upsertPeerCatalogLocked(pid, slot.actor_kind, self_lab, true);
+        peer_metadata_revision +%= 1;
         return;
     }
 
@@ -2791,6 +3046,32 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
     if (!slot.outbound.enqueue(io_val, @intFromEnum(FrameKind.hello), resp)) {
         return error.ProtocolError;
     }
+
+    // PEER_INFO 配布（SYNC より先に同一 outbound FIFO。ClientJoined → pump → SYNC）:
+    // 1. 新規へ host identity
+    // 2. 新規へ既存 active 全 peer
+    // 3. 既存 active 全員へ新規 peer
+    const new_label = slot.label_buf[0..slot.label_len];
+    const new_kind_b = actorKindToPeerInfoByte(slot.actor_kind);
+    if (!enqueuePeerInfoLocked(slot, HOST_PEER_ID, actorKindToPeerInfoByte(HOST_ACTOR_KIND), HOST_LABEL)) {
+        return error.ProtocolError;
+    }
+    for (&slots) |*s| {
+        if (s == slot or s.state != .active) continue;
+        const lab = s.label_buf[0..s.label_len];
+        if (!enqueuePeerInfoLocked(slot, s.peer_id, actorKindToPeerInfoByte(s.actor_kind), lab)) {
+            return error.ProtocolError;
+        }
+    }
+    for (&slots) |*s| {
+        if (s == slot or s.state != .active) continue;
+        if (!enqueuePeerInfoLocked(s, pid, new_kind_b, new_label)) {
+            // fail-soft: 該当接続のみ切断（既存方針）
+            requestCloseSlotLocked(s);
+        }
+    }
+    peer_metadata_revision +%= 1;
+
     // ClientJoined を inbound 直列キューへ（pump が SYNC を送る）。mutex 保持中だが inbound は別 mutex。
     var joined: [8]u8 = undefined;
     std.mem.writeInt(u32, joined[0..4], pid, .little);
@@ -2818,7 +3099,16 @@ pub fn resetForTest() void {
     awaiting_sync = false;
     freePendingSyncLocked();
     pendingClear();
-    if (io_inited) presence_inbound.clear(io_val);
+    if (io_inited) {
+        presence_inbound.clear(io_val);
+        peers_mutex.lockUncancelable(io_val);
+        clearPeerCatalogLocked();
+        peer_metadata_revision = 0;
+        peers_mutex.unlock(io_val);
+    } else {
+        clearPeerCatalogLocked();
+        peer_metadata_revision = 0;
+    }
 }
 
 /// テスト用: slot の synced / snapshot_valid / join_snapshot_seq。
@@ -2913,14 +3203,27 @@ fn pumpUntilAllSynced(timeout_ms: u64) !void {
 }
 
 /// raw client が HELLO の次に受ける空 SYNC を1件読む。
+/// 途中の PEER_INFO（join 配布）は読み捨てる（TASK-83 Phase 2）。
 fn expectEmptySync(stream: net.Stream) !void {
-    var rbuf: [256]u8 = undefined;
+    var rbuf: [512]u8 = undefined;
     var reader = stream.reader(io_val, &rbuf);
-    var pbuf: [128]u8 = undefined;
-    const frame = try decodeFrame(&reader.interface, &pbuf);
-    try testing.expectEqual(@intFromEnum(FrameKind.sync), frame.kind);
-    const parsed = try parseSyncPayload(frame.payload);
-    try testing.expectEqual(@as(usize, 0), parsed.state.len);
+    var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    while (true) {
+        const frame = try decodeFrame(&reader.interface, &pbuf);
+        if (frame.kind == @intFromEnum(FrameKind.peer_info)) continue;
+        try testing.expectEqual(@intFromEnum(FrameKind.sync), frame.kind);
+        const parsed = try parseSyncPayload(frame.payload);
+        try testing.expectEqual(@as(usize, 0), parsed.state.len);
+        return;
+    }
+}
+
+/// PEER_INFO を読み捨てて次の非 peer_info フレームを返す（raw client テスト用）。
+fn decodeSkippingPeerInfo(r: *Io.Reader, buf: []u8) !Frame {
+    while (true) {
+        const frame = try decodeFrame(r, buf);
+        if (frame.kind != @intFromEnum(FrameKind.peer_info)) return frame;
+    }
 }
 
 fn waitClientActive(timeout_ms: u64) !void {
@@ -3083,6 +3386,386 @@ test "netsync: PEER_INFO codec round-trip と検証（codec のみ。配布は T
     var long: [MAX_LABEL_LEN + 1]u8 = undefined;
     @memset(&long, 'x');
     try testing.expectError(error.LabelTooLong, formatPeerInfo(&buf, 1, PEER_INFO_KIND_HUMAN, &long));
+}
+
+// ---------------------------------------------------------------------------
+// TASK-83 Phase 2: peer catalog / PEER_INFO 配布 / resolvePeerOrigin
+// ---------------------------------------------------------------------------
+
+test "netsync: sanitizePeerLabel 制御文字置換と 200B 切り詰め" {
+    var out: [MAX_LABEL_LEN]u8 = undefined;
+    const s1 = sanitizePeerLabel(&out, "a\x01b\nc");
+    try testing.expectEqualStrings("a_b_c", s1);
+
+    var long: [250]u8 = undefined;
+    @memset(&long, 'z');
+    const s2 = sanitizePeerLabel(&out, &long);
+    try testing.expectEqual(@as(usize, MAX_LABEL_LEN), s2.len);
+    try testing.expect(s2[0] == 'z');
+}
+
+test "netsync: client catalog insert/update/LEFT tombstone/reuse" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    peers_mutex.lockUncancelable(io_val);
+    role = .client;
+    started = true;
+    peers_mutex.unlock(io_val);
+
+    // host + self + remote
+    var pbuf: [5 + MAX_LABEL_LEN]u8 = undefined;
+    const host_p = try formatPeerInfo(&pbuf, 0, PEER_INFO_KIND_HUMAN, "host");
+    handlePeerInfo(host_p);
+    const self_p = try formatPeerInfo(&pbuf, 1, PEER_INFO_KIND_AGENT, "bot");
+    handlePeerInfo(self_p);
+    const rem_p = try formatPeerInfo(&pbuf, 2, PEER_INFO_KIND_HUMAN, "alice");
+    handlePeerInfo(rem_p);
+
+    var lbuf: [MAX_LABEL_LEN]u8 = undefined;
+    const r0 = resolvePeerOrigin(0, &lbuf).?;
+    try testing.expectEqual(ActorKind.human, r0.kind);
+    try testing.expectEqualStrings("host", r0.label);
+    try testing.expect(r0.active);
+    const r1 = resolvePeerOrigin(1, &lbuf).?;
+    try testing.expectEqual(ActorKind.agent, r1.kind);
+    try testing.expectEqualStrings("bot", r1.label);
+    try testing.expectEqual(@as(?PeerOriginView, null), resolvePeerOrigin(99, &lbuf));
+
+    const rev_before_left = peerMetadataRevision();
+    const left_p = try formatPeerInfo(&pbuf, 2, PEER_INFO_KIND_LEFT, "alice");
+    handlePeerInfo(left_p);
+    try testing.expect(peerMetadataRevision() > rev_before_left);
+    const r2 = resolvePeerOrigin(2, &lbuf).?;
+    try testing.expect(!r2.active);
+    try testing.expectEqualStrings("alice", r2.label); // tombstone keeps label
+
+    // 未知 peer LEFT は無視（revision 不変）
+    const rev_unk = peerMetadataRevision();
+    const left_unk = try formatPeerInfo(&pbuf, 77, PEER_INFO_KIND_LEFT, "x");
+    handlePeerInfo(left_unk);
+    try testing.expectEqual(rev_unk, peerMetadataRevision());
+
+    // update existing
+    const self_upd = try formatPeerInfo(&pbuf, 1, PEER_INFO_KIND_AGENT, "bot2");
+    handlePeerInfo(self_upd);
+    try testing.expectEqualStrings("bot2", resolvePeerOrigin(1, &lbuf).?.label);
+
+    // tombstone 再利用: catalog を active で埋め、inactive を再利用
+    peers_mutex.lockUncancelable(io_val);
+    // peer 2 は inactive tombstone。active で MAX_PEER_CATALOG-1 を埋め、残りは tombstone 再利用。
+    var pid: u32 = 10;
+    var filled: usize = 0;
+    for (&peer_catalog) |*e| {
+        if (e.occupied and e.active) filled += 1;
+    }
+    while (filled < MAX_PEER_CATALOG) : ({
+        pid += 1;
+        filled += 1;
+    }) {
+        // 空き or inactive を埋める
+        const ok = upsertPeerCatalogLocked(pid, .human, "fill", true);
+        if (!ok) break;
+    }
+    // 全て active のとき新規は失敗
+    const all_active_fail = upsertPeerCatalogLocked(9999, .human, "nope", true);
+    // peer2 tombstone を残していない可能性があるので、1 つ inactive にして再利用を確認
+    _ = markPeerCatalogLeftLocked(10);
+    try testing.expect(upsertPeerCatalogLocked(8888, .agent, "reuse", true));
+    peers_mutex.unlock(io_val);
+    _ = all_active_fail;
+    try testing.expectEqualStrings("reuse", resolvePeerOrigin(8888, &lbuf).?.label);
+}
+
+test "netsync: resolvePeerOrigin host fixed identity と slots" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    var lbuf: [MAX_LABEL_LEN]u8 = undefined;
+    const host_v = resolvePeerOrigin(0, &lbuf).?;
+    try testing.expectEqual(HOST_ACTOR_KIND, host_v.kind);
+    try testing.expectEqualStrings(HOST_LABEL, host_v.label);
+    try testing.expect(host_v.active);
+    try testing.expectEqual(@as(?PeerOriginView, null), resolvePeerOrigin(1, &lbuf));
+
+    const port = listeningPort().?;
+    var stream = try rawHelloConnectAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .agent, "copilot");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+
+    const peer_v = resolvePeerOrigin(1, &lbuf).?;
+    try testing.expectEqual(ActorKind.agent, peer_v.kind);
+    try testing.expectEqualStrings("copilot", peer_v.label);
+    try testing.expect(peerMetadataRevision() > 0);
+}
+
+test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規）" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    ensureIo();
+
+    // client A: expectEmptySync は PEER_INFO を skip するので、rawHelloConnect の一時 reader が
+    // host PEER_INFO をバッファごと破棄しても SYNC 到達判定は壊れない。
+    var a = try rawHelloConnectAs(addr, .human, "alice");
+    defer a.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(a);
+
+    // client B: HELLO と後続 PEER_INFO を**同一 reader**で読む。
+    // rawHelloConnectAs は HELLO 用に一時 reader を作り破棄するため、TCP が HELLO+PEER_INFO を
+    // 同一 read に載せると PEER_INFO が rbuf 内に残ったまま捨てられる。次の reader では
+    // host(0) が欠け alice(1) が先に見える flaky になる（負荷時に再現。固定 sleep では直らない）。
+    const b = try addr.connect(io_val, .{ .mode = .stream });
+    defer b.close(io_val);
+    {
+        var wbuf: [256]u8 = undefined;
+        var writer = b.writer(io_val, &wbuf);
+        var hbuf: [128]u8 = undefined;
+        const hello = try formatClientHello(&hbuf, .agent, "bot");
+        try encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), hello);
+        try writer.interface.flush();
+    }
+    var brbuf: [512]u8 = undefined;
+    var breader = b.reader(io_val, &brbuf);
+    var bpbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+
+    {
+        const f = try decodeFrame(&breader.interface, &bpbuf);
+        try testing.expectEqual(@intFromEnum(FrameKind.hello), f.kind);
+        try testing.expectEqual(@as(u32, 2), try parseHostHello(f.payload));
+    }
+    try waitPeers(2, 2000);
+
+    // PEER_INFO host → PEER_INFO alice（outbound FIFO 順。同一 reader で決定的に検証）
+    {
+        const f1 = try decodeFrame(&breader.interface, &bpbuf);
+        try testing.expectEqual(@intFromEnum(FrameKind.peer_info), f1.kind);
+        const p1 = try parsePeerInfo(f1.payload);
+        try testing.expectEqual(@as(u32, 0), p1.peer_id);
+        try testing.expectEqual(PEER_INFO_KIND_HUMAN, p1.kind);
+        try testing.expectEqualStrings(HOST_LABEL, p1.label);
+
+        const f2 = try decodeFrame(&breader.interface, &bpbuf);
+        try testing.expectEqual(@intFromEnum(FrameKind.peer_info), f2.kind);
+        const p2 = try parsePeerInfo(f2.payload);
+        try testing.expectEqual(@as(u32, 1), p2.peer_id);
+        try testing.expectEqualStrings("alice", p2.label);
+    }
+
+    // A への「新規 bot」PEER_INFO は expectEmptySync 後に届くので単独 reader で可
+    {
+        var rbuf: [512]u8 = undefined;
+        var reader = a.reader(io_val, &rbuf);
+        var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+        const f = try decodeFrame(&reader.interface, &pbuf);
+        try testing.expectEqual(@intFromEnum(FrameKind.peer_info), f.kind);
+        const p = try parsePeerInfo(f.payload);
+        try testing.expectEqual(@as(u32, 2), p.peer_id);
+        try testing.expectEqual(PEER_INFO_KIND_AGENT, p.kind);
+        try testing.expectEqualStrings("bot", p.label);
+    }
+
+    try pumpUntilAllSynced(2000);
+    // B は同一 reader を継続（expectEmptySync は新 reader を作るため使わない）
+    {
+        const f = try decodeSkippingPeerInfo(&breader.interface, &bpbuf);
+        try testing.expectEqual(@intFromEnum(FrameKind.sync), f.kind);
+        const parsed = try parseSyncPayload(f.payload);
+        try testing.expectEqual(@as(usize, 0), parsed.state.len);
+    }
+}
+
+test "netsync: leave 時 LEFT 配布" {
+    resetForTest();
+    defer resetForTest();
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+
+    var a = try rawHelloConnect(addr, "stay");
+    defer a.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(a);
+
+    var b = try rawHelloConnect(addr, "leave-me");
+    try waitPeers(2, 2000);
+    try pumpUntilAllSynced(2000);
+    // drain A's PEER_INFO about b + B's SYNC path
+    {
+        var rbuf: [512]u8 = undefined;
+        var reader = a.reader(io_val, &rbuf);
+        var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+        _ = try decodeFrame(&reader.interface, &pbuf); // PEER_INFO b
+    }
+    try expectEmptySync(b);
+    b.close(io_val);
+
+    // wait for leave cleanup
+    var waited: u64 = 0;
+    while (peerCount() > 1 and waited < 3000) : (waited += 10) sleepMs(10);
+    try testing.expectEqual(@as(usize, 1), peerCount());
+
+    var rbuf: [512]u8 = undefined;
+    var reader = a.reader(io_val, &rbuf);
+    var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    const f = try decodeFrame(&reader.interface, &pbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.peer_info), f.kind);
+    const left = try parsePeerInfo(f.payload);
+    try testing.expectEqual(PEER_INFO_KIND_LEFT, left.kind);
+    try testing.expectEqual(@as(u32, 2), left.peer_id);
+}
+
+test "netsync: client が PEER_INFO を catalog に反映し getPeer/gatherStats が拡張" {
+    resetForTest();
+    defer resetForTest();
+
+    ensureIo();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var srv = try addr.listen(io_val, .{ .reuse_address = true });
+    defer srv.deinit(io_val);
+    const port = srv.socket.address.getPort();
+
+    const Host = struct {
+        fn run(listen_srv: *net.Server) void {
+            ensureIo();
+            const stream = listen_srv.accept(io_val) catch return;
+            defer stream.close(io_val);
+            var rbuf: [256]u8 = undefined;
+            var reader = stream.reader(io_val, &rbuf);
+            var pbuf: [512]u8 = undefined;
+            _ = decodeFrame(&reader.interface, &pbuf) catch return;
+            var wbuf: [512]u8 = undefined;
+            var writer = stream.writer(io_val, &wbuf);
+            var hbuf: [64]u8 = undefined;
+            const resp = formatHostHello(&hbuf, 7) catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
+            // PEER_INFO host + remote before SYNC
+            var ibuf: [5 + MAX_LABEL_LEN]u8 = undefined;
+            const pi_host = formatPeerInfo(&ibuf, 0, PEER_INFO_KIND_HUMAN, "host") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.peer_info), pi_host) catch return;
+            const pi_rem = formatPeerInfo(&ibuf, 3, PEER_INFO_KIND_AGENT, "other") catch return;
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.peer_info), pi_rem) catch return;
+            const sync_bytes = buildSyncPayload(0, "S") catch return;
+            defer gpa.free(sync_bytes);
+            encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), sync_bytes) catch return;
+            writer.interface.flush() catch return;
+            sleepMs(80);
+        }
+    };
+    const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
+    defer ht.join();
+
+    var sctx: SyncCtx = .{};
+    registerStateSync(.{ .ctx = &sctx, .export_fn = syncExport, .import_fn = syncImport });
+    initClientAs(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, .agent, "me");
+    try waitClientActive(2000);
+    var waited: u64 = 0;
+    while (awaiting_sync and waited < 3000) : (waited += 5) {
+        pump();
+        sleepMs(5);
+    }
+    try testing.expect(!awaiting_sync);
+    // PEER_INFO を処理
+    pump();
+    sleepMs(5);
+    pump();
+
+    var lbuf: [MAX_LABEL_LEN]u8 = undefined;
+    try testing.expectEqualStrings("host", resolvePeerOrigin(0, &lbuf).?.label);
+    try testing.expectEqualStrings("me", resolvePeerOrigin(7, &lbuf).?.label);
+    try testing.expectEqual(ActorKind.agent, resolvePeerOrigin(7, &lbuf).?.kind);
+    try testing.expectEqualStrings("other", resolvePeerOrigin(3, &lbuf).?.label);
+
+    const st = gatherStats();
+    try testing.expectEqual(Role.client, st.role);
+    try testing.expect(st.peers >= 3);
+    try testing.expect(st.agents >= 2);
+
+    // getPeer 列挙
+    var found_host = false;
+    var found_self = false;
+    var i: usize = 0;
+    while (getPeer(i, &lbuf)) |p| : (i += 1) {
+        if (p.peer_id == 0) found_host = true;
+        if (p.peer_id == 7) found_self = true;
+    }
+    try testing.expect(found_host);
+    try testing.expect(found_self);
+
+    const snap = try formatSnapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"peer_id\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"label\":\"host\"") != null);
+}
+
+test "netsync: malformed PEER_INFO は状態不変" {
+    resetForTest();
+    defer resetForTest();
+    ensureIo();
+    peers_mutex.lockUncancelable(io_val);
+    role = .client;
+    started = true;
+    peers_mutex.unlock(io_val);
+
+    var pbuf: [5 + MAX_LABEL_LEN]u8 = undefined;
+    const ok = try formatPeerInfo(&pbuf, 1, PEER_INFO_KIND_HUMAN, "ok");
+    handlePeerInfo(ok);
+    const rev = peerMetadataRevision();
+
+    handlePeerInfo(&[_]u8{ 1, 0, 0, 0 }); // short
+    var bad_kind: [5]u8 = .{ 1, 0, 0, 0, 2 };
+    handlePeerInfo(&bad_kind);
+    try testing.expectEqual(rev, peerMetadataRevision());
+    var lbuf: [MAX_LABEL_LEN]u8 = undefined;
+    try testing.expectEqualStrings("ok", resolvePeerOrigin(1, &lbuf).?.label);
+}
+
+test "netsync: formatLogDigestTail origin は数字/タグのまま（回帰）" {
+    resetForTest();
+    defer resetForTest();
+
+    // shared executor + log に peer actor を載せる
+    var log: command.CommandLog = .{};
+    var rec: command.CommandRecord = .{
+        .seq = 1,
+        .actor = .{ .peer = 3 },
+        .kind = .normal,
+        .name_len = 6,
+        .args_len = 0,
+        .undoable = true,
+        .transaction_id = null,
+    };
+    @memcpy(rec.name_buf[0..6], "stroke");
+    log.append(rec);
+
+    const Dummy = struct {
+        fn run(_: *anyopaque, _: []const u8, _: []const u8, buf: []u8) anyerror![]const u8 {
+            return buf[0..0];
+        }
+    };
+    var dummy: u8 = 0;
+    var exec = command.Executor.init(.{ .ctx = &dummy, .run = Dummy.run });
+    exec.log = &log;
+    shared_executor = &exec;
+    defer shared_executor = null;
+
+    var buf: [256]u8 = undefined;
+    const tail = formatLogDigestTail(&buf);
+    // origin は "3"（数字）であり "agent:..." 等ではない
+    try testing.expect(std.mem.indexOf(u8, tail, "1:3:stroke") != null);
+    try testing.expect(std.mem.indexOf(u8, tail, "agent") == null);
+    try testing.expect(std.mem.indexOf(u8, tail, "human") == null);
+
+    // formatSnapshot の log[].origin も同様
+    initHost(0); // io 有効化
+    const snap = try formatSnapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"origin\":\"3\"") != null);
 }
 
 test "netsync: loopback HELLO 握手成功" {
@@ -3373,7 +4056,8 @@ test "netsync: broadcast fan-out" {
         var rbuf: [256]u8 = undefined;
         var reader = streams[i].reader(io_val, &rbuf);
         var pbuf: [128]u8 = undefined;
-        const frame = try decodeFrame(&reader.interface, &pbuf);
+        // 後から join した peer の PEER_INFO が SYNC 後に残ることがある
+        const frame = try decodeSkippingPeerInfo(&reader.interface, &pbuf);
         try testing.expectEqual(@intFromEnum(FrameKind.commit), frame.kind);
         try testing.expectEqualStrings("seq-test", frame.payload);
     }
@@ -3416,8 +4100,19 @@ test "netsync: inbound 満杯で切断" {
         sleepMs(10);
         waited += 10;
     }
-    // 切断後の read は EOF / エラー
-    try testing.expect(std.meta.isError(reader.interface.takeByte()));
+    // 切断後の read は EOF / エラー（残バッファがあれば読み捨て）。
+    // join PEER_INFO 追加後、reader 再生成で socket を取り直す（同一 reader の stale 回避）。
+    var rbuf2: [128]u8 = undefined;
+    var reader2 = s.reader(io_val, &rbuf2);
+    var saw_err = false;
+    var drain_i: usize = 0;
+    while (drain_i < 64) : (drain_i += 1) {
+        _ = reader2.interface.takeByte() catch {
+            saw_err = true;
+            break;
+        };
+    }
+    try testing.expect(saw_err);
 }
 
 test "netsync: HELLO 前の SYNC は切断（読み捨て継続しない）" {
@@ -3586,6 +4281,12 @@ fn rawHelloConnect(addr: net.IpAddress, label: []const u8) !net.Stream {
     return rawHelloConnectAs(addr, .human, label);
 }
 
+/// host HELLO 応答まで読んで stream を返す。
+///
+/// **注意（PEER_INFO 以降を読むとき）**: 本関数は HELLO 用に一時 `Stream.reader` を作り破棄する。
+/// host が HELLO 直後に PEER_INFO を同一 TCP セグメントで送ると、未消費の PEER_INFO が
+/// 一時 rbuf ごと失われ、呼び出し側が新 reader で読むと順序が飛んだように見える。
+/// PEER_INFO の順序検証などは HELLO から同一 reader を保持すること（join 配布順序テスト参照）。
 fn rawHelloConnectAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) !net.Stream {
     ensureIo();
     const s = try addr.connect(io_val, .{ .mode = .stream });
@@ -4290,10 +4991,11 @@ test "netsync: export 登録時 SYNC に state が載り snapshot_valid" {
     defer stream.close(io_val);
     try waitPeers(1, 2000);
     try pumpUntilAllSynced(2000);
-    var rbuf: [256]u8 = undefined;
+    var rbuf: [512]u8 = undefined;
     var reader = stream.reader(io_val, &rbuf);
-    var pbuf: [128]u8 = undefined;
-    const f = try decodeFrame(&reader.interface, &pbuf);
+    var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
+    // PEER_INFO (host) が SYNC より先に並ぶ
+    const f = try decodeSkippingPeerInfo(&reader.interface, &pbuf);
     try testing.expectEqual(@intFromEnum(FrameKind.sync), f.kind);
     const p = try parseSyncPayload(f.payload);
     try testing.expectEqualStrings("DOC42", p.state);

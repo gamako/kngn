@@ -829,11 +829,39 @@ scripts/drive --port-file ./.e2e/client.port 'quit'
 | 項目 | 内容 |
 |---|---|
 | digest | 1 行 k=v（live 応答は `netsync ` 接頭）: `role=<host\|client> peers=<n> agents=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none> [log=<seq:origin:name,...>]` |
-| snapshot | JSON 1 オブジェクト: `peers` 配列 `[{peer_id,kind,label}]` + `agents` + `log` 全件（`ext=json`）。client の peers は自分のみ（PEER_INFO 未配布の既知制約） |
+| snapshot | JSON 1 オブジェクト: `peers` 配列 `[{peer_id,kind,label}]` + `agents` + `log` 全件（`ext=json`）。host=slots[] 全件 / client=PEER_INFO catalog の active 全件（host 自身・自分・他 peer を含む） |
 | last_seq | host = wire commit カウンタ / client = 最後に適用した COMMIT の seq |
 | reject_reason | ASCII whitespace・制御文字を `_` 置換、64B 切り詰め |
-| log 要約 | 末尾数件。revert は `seq:origin:revert->target` |
-| agents | 接続中の `kind=agent` peer 数（host=peer テーブル / client=自分） |
+| log 要約 | 末尾数件。revert は `seq:origin:revert->target`。**`origin` は従来どおり数字/タグのみ**（peer は peer_id 数字。kind/label は混入しない公開契約） |
+| agents | 接続中の `kind=agent` peer 数（host=slots[] / client=catalog の active agent） |
+
+### PEER_INFO 配布と peer origin（TASK-83 Phase 2）
+
+- **wire**: frame kind `0x08`、payload = `u32 LE peer_id ++ u8 kind ++ label`（kind: 0=human, 1=agent, 0xFF=left）。protocol version は 1 のまま。
+- **join 時（host `handleHello`）**: 新規 client へ (1) host 固定 identity（peer_id=0, kind=human, label=`"host"`）(2) 既存 active 全 peer の PEER_INFO。既存 active client へは新規 peer の PEER_INFO。いずれも ClientJoined→SYNC より先に同一 outbound FIFO へ積む。
+- **leave 時**: 残存 client へ `PEER_INFO_KIND_LEFT` + 直前 label。client catalog は entry を消さず `active=false` tombstone として kind/label を保持（離脱後も履歴表示が残る）。
+- **client catalog**: 固定長 `MAX_PEERS+1`。満杯時は inactive tombstone のみ再利用（active は evict しない）。module 全体で 1 本の `peer_metadata_revision`（entry 単位 revision は持たない）。
+- **origin 解決 API**: `resolvePeerOrigin` / `peerMetadataRevision`（platform facade 経由）。**`digest netsync` の `log=` / snapshot `log[].origin` は数字/タグのまま変更しない**（label に `:` が含まれ得るため公開契約を壊さない）。履歴 UI と `digest history` の additive `last_origin_kind`/`last_origin_label` が kind/label 表示の正。
+- **host 自身**: peer_id=0 は固定 identity（`HOST_ACTOR_KIND=.human`, `HOST_LABEL="host"`）。host 用 env（`VP_NETSYNC_HOST_ACTOR` 等）は設けない。
+- **旧 peer 互換**: PEER_INFO 未着信時は履歴表示 `#<peer_id>` fallback（フリーズしない）。
+
+#### 履歴パネル origin 表示の E2E 確認（2 プロセス）
+
+```bash
+mkdir -p .e2e /tmp/task-83-phase2
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/host.port \
+  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/client.port \
+  VP_NETSYNC_CONNECT=127.0.0.1:9110 VP_NETSYNC_ACTOR=agent VP_NETSYNC_LABEL=bot \
+  zig build run-pixie &
+scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
+scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
+scripts/drive --port-file ./.e2e/client.port 'action stroke 20 20 70 20'
+until scripts/drive --port-file ./.e2e/host.port 'digest history' | grep -q 'last_origin_kind=agent.*last_origin_label=bot'; do sleep 0.05; done
+# host 履歴に AI:bot、client 履歴に H:host、client 自身行に ★
+scripts/drive --port-file ./.e2e/host.port 'quit'
+scripts/drive --port-file ./.e2e/client.port 'quit'
+```
 
 ### session 中の undo/redo（TASK-62.3.5）
 

@@ -908,8 +908,14 @@ pub const netsyncPendingProposalCount = netsync.pendingProposalCount;
 /// client proposal 待ち行列容量（TASK-162: release 時一括 PROPOSE の上限判定）。
 pub const netsyncPendingCap = netsync.PENDING_CAP;
 
-/// 接続中 peer 数（host=active client 数 / client=自分のみ）。generic 透過 facade。
+/// 接続中 peer 数（host=active client 数 / client=catalog の active 数）。generic 透過 facade。
 pub const netsyncPeerCount = netsync.peerCount;
+
+/// peer origin 解決（TASK-83 Phase 2）。apps は netsync 実装型を直接 import しない。
+pub const NetsyncPeerOriginView = netsync.PeerOriginView;
+pub const netsyncResolvePeerOrigin = netsync.resolvePeerOrigin;
+pub const netsyncPeerMetadataRevision = netsync.peerMetadataRevision;
+pub const netsyncLocalPeerId = netsync.localPeerId;
 
 /// host-generated internal action を COMMIT broadcast する（name+args 透過・framework 非解釈）。
 /// host 以外 / netsync 無効時は `error.NotHost`。RT thread からは呼ばない（main thread イベント境界のみ）。

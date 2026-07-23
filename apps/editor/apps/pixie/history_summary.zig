@@ -38,18 +38,35 @@ pub const VisualMeta = struct {
     bbox: ?BBox = null,
 };
 
+/// peer origin の解決結果 kind（netsync ActorKind を apps 層で再表現。TASK-83 Phase 2）。
+pub const ActorOriginKind = enum { unknown, human, agent };
+
+pub const ActorOriginResult = struct {
+    kind: ActorOriginKind = .unknown,
+    label_len: usize = 0,
+};
+
+/// peer_id → kind/label。label は `label_buf` へ書き、`label_len` で長さを返す。
+pub const ResolvePeerOriginFn =
+    *const fn (ctx: *anyopaque, peer_id: u32, label_buf: []u8) ActorOriginResult;
+
+/// actor label の最大長（netsync MAX_LABEL_LEN と同値。history は netsync を import しない）。
+pub const MAX_ACTOR_LABEL: usize = 200;
+
 pub const HistoryContext = struct {
     ctx: *anyopaque,
     hasHandle: *const fn (ctx: *anyopaque, ref: u64) bool,
     log: *const command.CommandLog,
     /// seq から visual metadata を取得（未配線時は none）。
     getVisualMeta: ?*const fn (ctx: *anyopaque, seq: u64) VisualMeta = null,
+    /// peer origin 解決（netsync 無効時は null。TASK-83 Phase 2）。
+    resolvePeerOrigin: ?ResolvePeerOriginFn = null,
 };
 
 /// 履歴 1 件の表示用ビュー。
 ///
 /// `name` / `actor` / `kind` は借用 slice（`name` は `CommandRecord.name_buf` への参照、
-/// `actor`/`kind` は `@tagName` の静的文字列）。`summary_buf` のみ inline copy で寿命が自立する。
+/// `actor`/`kind` は `@tagName` の静的文字列）。`summary_buf` / `origin_label_buf` は inline copy。
 /// `CommandLog` の変異（`append` による ring 上書き）を跨いで `HistoryEntry` を保持してはならない。
 /// イベント時に `makeHistoryEntry` で再構築すること。
 pub const HistoryEntry = struct {
@@ -70,9 +87,17 @@ pub const HistoryEntry = struct {
     epoch: u64,
     /// グラフィカル表示メタ（callback からコピー。TASK-83.2）。
     visual: VisualMeta = .{},
+    /// peer origin（`.peer` のみ。resolver 未配線/未解決は unknown。TASK-83 Phase 2）。
+    origin_kind: ActorOriginKind = .unknown,
+    origin_label_buf: [MAX_ACTOR_LABEL]u8 = undefined,
+    origin_label_len: u8 = 0,
 
     pub fn summary(self: *const HistoryEntry) []const u8 {
         return self.summary_buf[0..self.summary_len];
+    }
+
+    pub fn originLabel(self: *const HistoryEntry) []const u8 {
+        return self.origin_label_buf[0..self.origin_label_len];
     }
 };
 
@@ -157,6 +182,8 @@ pub fn makeHistoryEntry(hctx: HistoryContext, rec: *const command.CommandRecord)
         .undo_live = null,
         .epoch = rec.epoch,
         .visual = .{},
+        .origin_kind = .unknown,
+        .origin_label_len = 0,
     };
     const sum = summarizeRecord(rec, e.summary_buf[0..]);
     e.summary_len = @intCast(sum.len);
@@ -165,6 +192,19 @@ pub fn makeHistoryEntry(hctx: HistoryContext, rec: *const command.CommandRecord)
     }
     if (hctx.getVisualMeta) |get| {
         e.visual = get(hctx.ctx, rec.seq);
+    }
+    // peer origin: CommandLog 変異を跨がない inline copy（resolver null / 未解決は unknown のまま）
+    if (e.actor_peer) |pid| {
+        if (hctx.resolvePeerOrigin) |resolve| {
+            var lbuf: [MAX_ACTOR_LABEL]u8 = undefined;
+            const res = resolve(hctx.ctx, pid, &lbuf);
+            e.origin_kind = res.kind;
+            if (res.kind != .unknown and res.label_len > 0) {
+                const n = @min(res.label_len, MAX_ACTOR_LABEL);
+                @memcpy(e.origin_label_buf[0..n], lbuf[0..n]);
+                e.origin_label_len = @intCast(n);
+            }
+        }
     }
     return e;
 }
@@ -271,6 +311,23 @@ pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
         bbox_str,
     }) catch return buf[0..0];
     pos += tail.len;
+
+    // TASK-83 Phase 2 additive: origin 解決済みのときだけ末尾に kind/label を追加。
+    // resolver null / 未解決なら既存出力と bit 一致。
+    if (entry.origin_kind != .unknown) {
+        const kind_tok: []const u8 = switch (entry.origin_kind) {
+            .human => "human",
+            .agent => "agent",
+            .unknown => unreachable,
+        };
+        var lab_safe: [MAX_ACTOR_LABEL]u8 = undefined;
+        const lab_tok = tokenSafe(&lab_safe, entry.originLabel());
+        const origin_tail = std.fmt.bufPrint(buf[pos..], " last_origin_kind={s} last_origin_label={s}", .{
+            kind_tok,
+            lab_tok,
+        }) catch return buf[0..pos]; // 収まらなければ additive を落とす（既存 tail は保持）
+        pos += origin_tail.len;
+    }
     return buf[0..pos];
 }
 
@@ -372,6 +429,17 @@ pub fn appendEntryJson(list: *std.ArrayList(u8), allocator: std.mem.Allocator, e
         try list.appendSlice(allocator, s);
     } else {
         try list.appendSlice(allocator, "null");
+    }
+    // TASK-83 Phase 2 additive: origin_kind / origin_label（解決済みのみ。actor/actor_peer は不変）
+    if (e.origin_kind != .unknown) {
+        try list.appendSlice(allocator, ",\"origin_kind\":");
+        try appendJsonStr(list, allocator, switch (e.origin_kind) {
+            .human => "human",
+            .agent => "agent",
+            .unknown => unreachable,
+        });
+        try list.appendSlice(allocator, ",\"origin_label\":");
+        try appendJsonStr(list, allocator, e.originLabel());
     }
     try list.append(allocator, '}');
 }
@@ -719,4 +787,108 @@ test "formatDigest: reverted and redo_consumed" {
     try testing.expect(std.mem.indexOf(u8, got, "last_reverted=0") != null);
     try testing.expect(std.mem.indexOf(u8, got, "last_redo_consumed=1") != null);
     try testing.expect(std.mem.indexOf(u8, got, "last_target=5") != null);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-83 Phase 2: peer origin resolve / additive digest·snapshot
+// ---------------------------------------------------------------------------
+
+const TestOriginMap = struct {
+    peer_id: u32 = 0,
+    kind: ActorOriginKind = .unknown,
+    label: []const u8 = "",
+};
+
+fn testResolvePeerOrigin(ctx: *anyopaque, peer_id: u32, label_buf: []u8) ActorOriginResult {
+    const m: *const TestOriginMap = @ptrCast(@alignCast(ctx));
+    if (peer_id != m.peer_id or m.kind == .unknown) return .{};
+    const n = @min(m.label.len, label_buf.len);
+    if (n > 0) @memcpy(label_buf[0..n], m.label[0..n]);
+    return .{ .kind = m.kind, .label_len = n };
+}
+
+test "makeHistoryEntry: resolver result is inline-copied" {
+    var rec = fillRec("stroke", "tool=pen color=FF0000 1 1 2 2");
+    rec.seq = 4;
+    rec.actor = .{ .peer = 3 };
+    var map: TestOriginMap = .{ .peer_id = 3, .kind = .agent, .label = "bot" };
+    const hctx: HistoryContext = .{
+        .ctx = &map,
+        .hasHandle = testHasHandleNone,
+        .log = undefined,
+        .resolvePeerOrigin = testResolvePeerOrigin,
+    };
+    const e = makeHistoryEntry(hctx, &rec);
+    try testing.expectEqual(@as(?u32, 3), e.actor_peer);
+    try testing.expectEqual(ActorOriginKind.agent, e.origin_kind);
+    try testing.expectEqualStrings("bot", e.originLabel());
+}
+
+test "formatDigest/snapshot: resolver null keeps legacy bit identity" {
+    var log: command.CommandLog = .{};
+    var rec = fillRec("stroke", "tool=pen color=FF0000 1 1 2 2");
+    rec.seq = 1;
+    rec.undo_ref = 7;
+    rec.actor = .{ .peer = 2 };
+    log.append(rec);
+    var dummy: u8 = 0;
+    const hctx: HistoryContext = .{
+        .ctx = &dummy,
+        .hasHandle = testHasHandleAll,
+        .log = &log,
+        // resolvePeerOrigin = null（netsync 無効）
+    };
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const got = formatDigest(hctx, &buf);
+    try testing.expect(std.mem.indexOf(u8, got, "last_origin_kind=") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "last_origin_label=") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "last_actor=peer") != null);
+
+    const json = try formatSnapshotJson(hctx, testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"origin_kind\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"actor_peer\":2") != null);
+}
+
+test "formatDigest: additive last_origin_kind/label when resolved" {
+    var log: command.CommandLog = .{};
+    var rec = fillRec("stroke", "tool=pen color=00FF00 1 1 2 2");
+    rec.seq = 2;
+    rec.actor = .{ .peer = 5 };
+    log.append(rec);
+    var map: TestOriginMap = .{ .peer_id = 5, .kind = .agent, .label = "bot" };
+    const hctx: HistoryContext = .{
+        .ctx = &map,
+        .hasHandle = testHasHandleNone,
+        .log = &log,
+        .resolvePeerOrigin = testResolvePeerOrigin,
+    };
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    const got = formatDigest(hctx, &buf);
+    try testing.expect(std.mem.indexOf(u8, got, "last_origin_kind=agent") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "last_origin_label=bot") != null);
+
+    const json = try formatSnapshotJson(hctx, testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"origin_kind\":\"agent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"origin_label\":\"bot\"") != null);
+    // 既存 actor / actor_peer は維持
+    try testing.expect(std.mem.indexOf(u8, json, "\"actor\":\"peer\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"actor_peer\":5") != null);
+}
+
+test "makeHistoryEntry: unresolved peer stays unknown (no additive)" {
+    var rec = fillRec("set_tool", "pen");
+    rec.seq = 1;
+    rec.actor = .{ .peer = 9 };
+    var map: TestOriginMap = .{ .peer_id = 1, .kind = .human, .label = "other" }; // 不一致
+    const hctx: HistoryContext = .{
+        .ctx = &map,
+        .hasHandle = testHasHandleNone,
+        .log = undefined,
+        .resolvePeerOrigin = testResolvePeerOrigin,
+    };
+    const e = makeHistoryEntry(hctx, &rec);
+    try testing.expectEqual(ActorOriginKind.unknown, e.origin_kind);
+    try testing.expectEqual(@as(u8, 0), e.origin_label_len);
 }

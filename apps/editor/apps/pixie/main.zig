@@ -728,6 +728,8 @@ const App = struct {
     history_count: u32 = 0,
     history_dirty: bool = true,
     history_seen_seq: u64 = 1,
+    /// netsync peer catalog/slot metadata revision（変化時に履歴キャッシュ全置換。TASK-83 Phase 2）。
+    history_seen_peer_revision: u64 = 0,
     /// 履歴行サムネイル固定リング（TASK-83.2。イベント時のみ生成・フレーム毎は blit のみ）。
     history_thumbs: [platform.command.MAX_CMD_LOG][history_thumbnail.THUMB_PIXELS]u32 = undefined,
     history_thumb_meta: [platform.command.MAX_CMD_LOG]history_thumbnail.HistoryThumbMeta = @splat(.{}),
@@ -2217,11 +2219,14 @@ const App = struct {
             self.history_entries[i].name = "";
         }
         self.history_seen_seq = self.cmd_log.next_seq;
+        self.history_seen_peer_revision = platform.netsyncPeerMetadataRevision();
         self.history_dirty = false;
     }
 
     fn ensureHistoryFresh(self: *App) void {
-        if (!self.history_dirty and self.history_seen_seq == self.cmd_log.next_seq) return;
+        const peer_rev = platform.netsyncPeerMetadataRevision();
+        if (!self.history_dirty and self.history_seen_seq == self.cmd_log.next_seq and
+            self.history_seen_peer_revision == peer_rev) return;
         self.rebuildHistoryEntries();
     }
 
@@ -3795,12 +3800,25 @@ fn historyGetVisualMeta(ctx: *anyopaque, seq: u64) history_summary.VisualMeta {
     return app.historyVisualMeta(seq);
 }
 
+fn historyResolvePeerOrigin(ctx: *anyopaque, peer_id: u32, label_buf: []u8) history_summary.ActorOriginResult {
+    _ = ctx;
+    const view = platform.netsyncResolvePeerOrigin(peer_id, label_buf) orelse return .{};
+    return .{
+        .kind = switch (view.kind) {
+            .human => .human,
+            .agent => .agent,
+        },
+        .label_len = view.label.len,
+    };
+}
+
 fn historyCtx(app: *App) history_summary.HistoryContext {
     return .{
         .ctx = app,
         .hasHandle = historyHasHandle,
         .log = &app.cmd_log,
         .getVisualMeta = historyGetVisualMeta,
+        .resolvePeerOrigin = if (platform.netsyncActive()) historyResolvePeerOrigin else null,
     };
 }
 
@@ -5685,24 +5703,45 @@ fn historyActorAbbrev(entry: *const history_summary.HistoryEntry, buf: []u8) []c
     if (std.mem.eql(u8, entry.actor, "local_agent")) return "ai";
     if (std.mem.eql(u8, entry.actor, "system")) return "sys";
     if (entry.actor_peer) |id| {
+        // 解決済み + 非空 label → H:<label> / AI:<label>。未解決・空 label は #<id>。
+        if (entry.origin_kind != .unknown and entry.origin_label_len > 0) {
+            const prefix: []const u8 = switch (entry.origin_kind) {
+                .human => "H",
+                .agent => "AI",
+                .unknown => unreachable,
+            };
+            return std.fmt.bufPrint(buf, "{s}:{s}", .{ prefix, entry.originLabel() }) catch "#?";
+        }
         return std.fmt.bufPrint(buf, "#{d}", .{id}) catch "peer";
     }
     return "peer";
 }
 
-fn historyRowColor(ctx: *gui.Context, entry: *const history_summary.HistoryEntry) gui.Color {
+/// 自分の wire op か（netsync 有効時のみ。host=peer_id 0 / client=HELLO 割当 id）。
+fn isOwnHistoryEntry(app: *const App, entry: *const history_summary.HistoryEntry) bool {
+    _ = app;
+    if (!platform.netsyncActive()) return false;
+    const peer = entry.actor_peer orelse return false;
+    return peer == platform.netsyncLocalPeerId();
+}
+
+/// 表示優先順位: reverted（グレー）> redo_consumed（淡色）> own-op（通常色 + 背景）> 通常。
+fn historyRowColor(ctx: *gui.Context, entry: *const history_summary.HistoryEntry, is_own: bool) gui.Color {
+    _ = is_own;
     if (entry.reverted) return ctx.style.text_subtle;
     if (entry.redo_consumed) return gui.Color.rgba(0x68, 0x70, 0x78, 0xFF);
     return ctx.style.text;
 }
 
-fn formatHistoryLine(entry: *const history_summary.HistoryEntry, buf: []u8) []const u8 {
-    var actor_buf: [16]u8 = undefined;
+fn formatHistoryLine(entry: *const history_summary.HistoryEntry, buf: []u8, is_own: bool) []const u8 {
+    var actor_buf: [history_summary.MAX_ACTOR_LABEL + 8]u8 = undefined;
     const actor = historyActorAbbrev(entry, &actor_buf);
+    // 行頭に ★（own wire op のみ。reverted/redo_consumed でも記号は付け、色優先は color/bg 側）
+    const star: []const u8 = if (is_own) "★ " else "";
     if (entry.tx != null) {
-        return std.fmt.bufPrint(buf, "#{d} {s} T {s}", .{ entry.seq, actor, entry.summary() }) catch "";
+        return std.fmt.bufPrint(buf, "{s}#{d} {s} T {s}", .{ star, entry.seq, actor, entry.summary() }) catch "";
     }
-    return std.fmt.bufPrint(buf, "#{d} {s} {s}", .{ entry.seq, actor, entry.summary() }) catch "";
+    return std.fmt.bufPrint(buf, "{s}#{d} {s} {s}", .{ star, entry.seq, actor, entry.summary() }) catch "";
 }
 
 fn historyRowId(idx: u32) gui.Id {
@@ -5724,9 +5763,22 @@ fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
     while (rev > 0) {
         rev -= 1;
         const entry = &app.history_entries[rev];
-        var line_buf: [platform.command.MAX_SUMMARY + 48]u8 = undefined;
-        const line = formatHistoryLine(entry, &line_buf);
-        ctx.beginBox(.{ .id = historyRowId(rev), .direction = .row, .gap = 2, .align_cross = .center });
+        const is_own = isOwnHistoryEntry(app, entry);
+        // own 背景は reverted/redo_consumed より下位（色優先順位に合わせ背景も抑止）
+        const own_bg: ?gui.Color = if (is_own and !entry.reverted and !entry.redo_consumed)
+            ctx.style.button_bg_selected
+        else
+            null;
+        var line_buf: [platform.command.MAX_SUMMARY + history_summary.MAX_ACTOR_LABEL + 64]u8 = undefined;
+        const line = formatHistoryLine(entry, &line_buf, is_own);
+        ctx.beginBox(.{
+            .id = historyRowId(rev),
+            .direction = .row,
+            .width = .{ .grow = 1 },
+            .gap = 2,
+            .align_cross = .center,
+            .bg = own_bg,
+        });
         // [24x24 thumbnail or label][history text]
         if (entry.visual.thumb_present) {
             const slot: usize = @intCast(entry.seq % platform.command.MAX_CMD_LOG);
@@ -5747,7 +5799,7 @@ fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
         } else {
             ctx.labelEx("[meta]", ctx.style.text_subtle);
         }
-        ctx.labelEx(line, historyRowColor(ctx, entry));
+        ctx.labelEx(line, historyRowColor(ctx, entry, is_own));
         ctx.endBox();
     }
 }
