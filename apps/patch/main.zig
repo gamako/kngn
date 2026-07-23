@@ -509,6 +509,9 @@ const App = struct {
     title_font: gui.Font = gui.default_font,
     /// PanelHost center rect（screen 絶対座標）。描画・hit・palette・camera の共通原点。
     canvas_rect: canvas.ScreenRect = .{ .x = 0, .y = 0, .w = WIN_W, .h = WIN_H - VIS_H },
+    /// TASK-173.2: 起動時 1-shot auto-layout 済みフラグ。
+    /// centerRect は前フレーム endFrame 後に非 null になるため、メインループ内で初回適用する。
+    initial_layout_done: bool = false,
     // TASK-125: H キー全 hide。slot visible の一時 override。解除時に pre_hide_* を復元し open は保持。
     panels_hidden: bool = false,
     pre_hide_left_visible: bool = true,
@@ -3062,15 +3065,7 @@ pub fn main(init: std.process.Init) !void {
     app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32, .undo_store = undo_store };
     app.observed_field = defaultObservedField(&app);
     std.debug.assert(midiBindingDescriptorsExist());
-    // 生成グラフ全体を canvas に配置する（初期状態は 8 列の折り返し。Drum/Bass の
-    // マクロ台帳は既存 canvas 操作に任せ、全モジュールを MAX_MODULES 内で可視化する）。
-    var layout_h: Handle = 0;
-    while (layout_h < MAX_MODULES) : (layout_h += 1) {
-        if (!app.dyn.slotActive(layout_h)) continue;
-        const col = layout_h % 8;
-        const row = layout_h / 8;
-        app.layout[layout_h] = .{ .x = 24 + @as(f32, @floatFromInt(col)) * 140, .y = 52 + @as(f32, @floatFromInt(row)) * 96 };
-    }
+    // 初期配置は main loop 内で centerRect 有効化後に runAutoLayout で焼き込む（TASK-173.2）。
     registerGeneratedMacros(&app);
     // 初期 graph の runtime handle 昇順で決定的に NodeId を割当（TASK-106.2）。
     assignInitialNodeIds(&app);
@@ -3125,6 +3120,7 @@ pub fn main(init: std.process.Init) !void {
     } else |err| {
         std.debug.print("apps/patch: preferences dir open failed: {s}\n", .{@errorName(err)});
     }
+    // 起動時 auto-layout は main loop 内（centerRect が非 null になった初回）で 1-shot 適用（TASK-173.2）。
 
     // C: master 可視化（spectrogram/oscilloscope/level meter）。comptime サイズが大きいので heap 確保。
     const spec = try allocator.create(Spec);
@@ -3372,6 +3368,14 @@ pub fn main(init: std.process.Init) !void {
             if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
             gui_ctx.endFrame();
             app.syncCanvasRect();
+            // TASK-173.2: GUI rect cache が有効になった最初のフレームで auto-layout を焼き込む。
+            // （init 時点の centerRect は常に null → canvas がフル幅のままになりパレット重なりが再発する）
+            if (!app.initial_layout_done) {
+                if (app.panel_host.centerRect(app.gui_ctx)) |_| {
+                    runAutoLayout(&app);
+                    app.initial_layout_done = true;
+                }
+            }
             if (!app.native_menu_active) {
                 const menu_res = gui.menuBarPopup(&gui_ctx, app.menuCommandsSlice(), &app.menu_bar_state);
                 if (menu_res.selected) |id| app.dispatchCommand(id);
@@ -5103,15 +5107,10 @@ fn registerPatchActions(app: *App) void {
     });
 }
 
-/// `auto_layout`: 表示ノード（mapNodesForCollapsed）と表示辺（buildDisplayEdges visual）に対し
-/// Sugiyama 系レイヤードレイアウトを適用する。合成 handle は groups[gid].pos のみへ書き、
-/// App.layout[] には実 handle だけを書く。展開中マクロのヘッダーはメンバー bbox に追従。
-/// ホットパス: イベント時のみ。camera fit / undo は行わない。
-fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = args;
-    _ = buf;
-    const app = actionApp(ctx);
-
+/// 表示グラフに Sugiyama 系レイヤードレイアウトを適用する（action / 起動時初期配置の共有本体）。
+/// 合成 handle は groups[gid].pos のみへ書き、App.layout[] には実 handle だけを書く。
+/// ホットパス: イベント時のみ / 初期化時のみ。camera fit / undo は行わない。
+fn runAutoLayout(app: *App) void {
     var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
     const n_nodes = app.buildNodes(&node_buf);
 
@@ -5166,6 +5165,13 @@ fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
         &app.ledger,
         origin_y,
     );
+}
+
+/// `auto_layout`: runAutoLayout の薄いラッパー。camera fit / undo は行わない。
+fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = args;
+    _ = buf;
+    runAutoLayout(actionApp(ctx));
     return "ok";
 }
 
