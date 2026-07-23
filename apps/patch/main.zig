@@ -55,6 +55,7 @@ const project_io = @import("project_io.zig");
 const wav = @import("wav.zig");
 const seedmod = @import("seed.zig");
 const patch_undo = @import("undo.zig");
+const selection = @import("selection.zig");
 
 const DynGraph = modular.DynGraph;
 const PortKind = modular.PortKind;
@@ -215,6 +216,9 @@ const NODE_BG = gui.Color.rgba(0x24, 0x2A, 0x33, 0xFF);
 const BORDER_COL = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
 const HOVER_COL = gui.Color.rgba(0x90, 0xA0, 0xB0, 0xFF);
 const SEL_COL = gui.Color.rgba(0xE0, 0xC0, 0x50, 0xFF);
+/// ラバーバンド矩形（TASK-173.3）: 半透明青塗り + 青枠。
+const RECT_SEL_FILL = gui.Color.rgba(0x40, 0x80, 0xE0, 0x40);
+const RECT_SEL_OUTLINE = gui.Color.rgba(0x50, 0xA0, 0xF0, 0xFF);
 const TITLE_COL = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
 const GRID_COL = gui.Color.rgba(0x1A, 0x20, 0x28, 0xFF);
 
@@ -259,6 +263,8 @@ const Drag = union(enum) {
     // 掴んだ場合）。commit（mouse_up）で dyn/commitConnect へ渡す前に resolvePort で実 PortRef へ解決する。
     // detach は接続済み入力を掴んだときのみ設定され、その時点で resolvePort 済み＝常に実 CableRef。
     cable: struct { origin: PortRef, detach: ?CableRef = null },
+    /// 空白キャンバス左ドラッグの矩形選択（TASK-173.3）。additive=Shift/Cmd 押下時は集合へ追加。
+    rect_select: struct { start_world: Vec2f, additive: bool },
 };
 
 // モジュールパレット（画面固定・pan/zoom 非依存）。クリックで primitive は add(kind,.{})、macro は
@@ -493,6 +499,9 @@ const App = struct {
     mouse: Vec2f = .{ .x = 0, .y = 0 },
     hover: ?Item = null,
     selected: ?Item = null,
+    /// TASK-173.3: 複数ノード選択集合（実 handle + group 合成 handle）。App.selected と独立。
+    multi_selected: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]bool =
+        [_]bool{false} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS),
     /// TASK-149.2: Inspector 用 drill-down target（canvas selected とは独立）。
     /// group 選択時は member 選択で埋まり、node 選択時は selected node と一致。
     inspector_target: ?Handle = null,
@@ -1411,7 +1420,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         const sz = canvas.nodeSize(g).scale(cam.zoom);
         const rect = toRect(tl, sz);
         dl.rectFilled(rect, NODE_BG) catch {};
-        const selected = itemIsHandle(app.selected, g.handle);
+        const selected = itemIsHandle(app.selected, g.handle) or selection.contains(&app.multi_selected, g.handle);
         const hovered = itemIsHandle(app.hover, g.handle);
         const border = if (selected) SEL_COL else if (hovered) HOVER_COL else BORDER_COL;
         dl.rectOutline(rect, border, if (selected) 2 else 1) catch {};
@@ -1483,6 +1492,22 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         if (portScreenPos(app, nodes, origin)) |op| {
             dl.line(vec2i(op), vec2i(app.mouse), PENDING_COL, 2) catch {};
         }
+    }
+
+    // ラバーバンド矩形（TASK-173.3）: 半透明青塗り + 青枠（ドラッグ中のみ）。
+    if (app.drag == .rect_select) {
+        const rs = app.drag.rect_select;
+        const wr = canvas.normalizeWorldRect(rs.start_world, app.mouseWorld());
+        const tl = app.worldToAbs(.{ .x = wr.x, .y = wr.y });
+        const br = app.worldToAbs(.{ .x = wr.x + wr.w, .y = wr.y + wr.h });
+        const rect = gui.Rect{
+            .x = safeI32(tl.x),
+            .y = safeI32(tl.y),
+            .w = safeU32(br.x - tl.x),
+            .h = safeU32(br.y - tl.y),
+        };
+        dl.rectFilled(rect, RECT_SEL_FILL) catch {};
+        dl.rectOutline(rect, RECT_SEL_OUTLINE, 1) catch {};
     }
 
     // モジュールパレット（center rect 基準オーバーレイ。PanelHost panel にはしない）。
@@ -1631,7 +1656,7 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const Nod
     const htl = app.worldToAbs(header.pos);
     const hsz = canvas.nodeSize(header).scale(app.camera.zoom);
     const hrect = toRect(htl, hsz);
-    const hsel = itemIsHandle(app.selected, header.handle);
+    const hsel = itemIsHandle(app.selected, header.handle) or selection.contains(&app.multi_selected, header.handle);
     dl.rectFilled(hrect, NODE_BG) catch {};
     dl.rectOutline(hrect, if (hsel) SEL_COL else BORDER_COL, if (hsel) 2 else 1) catch {};
     // 展開グループヘッダも TITLE_H 帯で ink 中央（TASK-167）。TASK-170: 通常ノードと同じ小フォント。
@@ -2203,6 +2228,18 @@ fn onMouseUp(app: *App) void {
             };
             routeUiAction(app, "move_node", args);
         }
+    } else if (app.drag == .rect_select) {
+        // 矩形選択確定: buildNodes の表示ノード bbox と正面積交差する handle を集合へ反映。
+        const rs = app.drag.rect_select;
+        const sel_rect = canvas.normalizeWorldRect(rs.start_world, app.mouseWorld());
+        if (!rs.additive) selection.clear(&app.multi_selected);
+        var node_buf: [MAX_MODULES]NodeGeom = undefined;
+        const nodes = node_buf[0..app.buildNodes(&node_buf)];
+        for (nodes) |g| {
+            if (canvas.rectsIntersectPositive(sel_rect, canvas.nodeWorldBBox(g))) {
+                selection.set(&app.multi_selected, g.handle, true);
+            }
+        }
     }
     app.drag = .none;
 }
@@ -2235,7 +2272,22 @@ fn routeDisconnect(app: *App, dst_h: Handle, dst_in: u8) void {
     routeUiAction(app, "disconnect", args);
 }
 
-fn onMouseDown(app: *App) void {
+/// Shift または Cmd（macOS の multi-select 修飾。TASK-173.3）。
+fn multiSelectModifier(m: platform.ModifierFlags) bool {
+    return m.shift or m.cmd;
+}
+
+/// multi_selected が空のとき、現在の app.selected の node/group を集合へ取り込む（Shift/Cmd トグル前処理）。
+fn seedMultiFromSelectedIfEmpty(app: *App) void {
+    if (!selection.empty(&app.multi_selected)) return;
+    if (app.selected) |it| switch (it) {
+        .node => |h| selection.set(&app.multi_selected, h, true),
+        .group => |gid| selection.set(&app.multi_selected, group.handleOfGroup(gid), true),
+        else => {},
+    };
+}
+
+fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
     // panel / splitter / outside の mouse は GUI Context 側へ渡す。canvas と競合させない。
     if (!app.allowsCanvasInput()) return;
     // パレットは screen 絶対座標で world hit より先に判定（TASK-106.2: action route 経由）。
@@ -2245,11 +2297,13 @@ fn onMouseDown(app: *App) void {
         return;
     }
     const mw = app.mouseWorld();
+    const multi_mod = multiSelectModifier(modifiers);
 
     // 折り畳みトグル [±] はノード本体のクリックより優先する（畳み箱 / 展開枠ヘッダーの両方）。
     if (hitToggle(app, mw)) |gid| {
         app.ledger.groups[gid].collapsed = !app.ledger.groups[gid].collapsed;
         app.selected = .{ .group = gid };
+        selection.clear(&app.multi_selected);
         app.hover = null;
         app.drag = .none;
         return;
@@ -2259,6 +2313,7 @@ fn onMouseDown(app: *App) void {
     if (hitMacroMutationToggle(app, mw)) |hit| {
         applyMacroMutationToggle(app, hit);
         app.selected = .{ .group = hit.gid };
+        selection.clear(&app.multi_selected);
         app.drag = .none;
         return;
     }
@@ -2268,6 +2323,7 @@ fn onMouseDown(app: *App) void {
     if (hitMacroGrid(app, mw)) |hit| {
         toggleMacroGridCell(app, hit);
         app.selected = .{ .group = hit.gid };
+        selection.clear(&app.multi_selected);
         app.drag = .none;
         return;
     }
@@ -2277,6 +2333,7 @@ fn onMouseDown(app: *App) void {
     if (hitInlineStepSeqGrid(app, mw)) |hit| {
         toggleInlineStepSeqCell(app, hit);
         app.selected = .{ .node = hit.handle };
+        selection.clear(&app.multi_selected);
         app.drag = .none;
         return;
     }
@@ -2288,6 +2345,7 @@ fn onMouseDown(app: *App) void {
     if (canvas.hitTestPort(mw, nodes)) |pr| {
         // pr は as-hit の PortRef（畳み箱ポートなら合成 handle）。選択/pending 描画にはそのまま使い
         // （box のポート dot をハイライトするため）、実接続の判定・変更にだけ resolvePort を通す。
+        selection.clear(&app.multi_selected);
         app.selected = .{ .port = pr };
         if (app.ledger.resolvePort(pr)) |real| {
             if (real.is_input) {
@@ -2303,25 +2361,50 @@ fn onMouseDown(app: *App) void {
         }
         app.drag = .{ .cable = .{ .origin = pr } }; // 出力 or 未接続入力から pending 開始
     } else if (canvas.hitTestNode(mw, nodes)) |h| {
-        if (group.groupIdFromHandle(h)) |gid| {
+        if (multi_mod) {
+            // Shift/Cmd: 集合へトグル。drag は開始しない。
+            seedMultiFromSelectedIfEmpty(app);
+            selection.toggle(&app.multi_selected, h);
+            if (group.groupIdFromHandle(h)) |gid| {
+                app.selected = .{ .group = gid };
+            } else {
+                app.selected = .{ .node = h };
+            }
+            app.drag = .none;
+        } else if (group.groupIdFromHandle(h)) |gid| {
             // 畳み箱本体のドラッグ: ledger.groups[gid].pos を更新し、app.layout には触らない
             // （合成 handle を app.layout[h] へ絶対に index しない）。
+            selection.clear(&app.multi_selected);
             app.selected = .{ .group = gid };
             app.drag = .{ .group = .{ .gid = gid, .grab_offset = app.ledger.groups[gid].pos.sub(mw) } };
         } else {
+            selection.clear(&app.multi_selected);
             app.selected = .{ .node = h };
             const npos = app.layout[h];
             app.drag = .{ .node = .{ .handle = h, .grab_offset = npos.sub(mw) } };
         }
     } else if (hitGroupHeader(app, mw)) |gid| {
-        // 展開枠ヘッダー本体のクリック: 選択のみ（40.7.1 はドラッグ非対応）。
-        app.selected = .{ .group = gid };
+        // 展開枠ヘッダー本体のクリック: 選択のみ（40.7.1 はドラッグ非対応）。Shift/Cmd でトグル。
+        const gh = group.handleOfGroup(gid);
+        if (multi_mod) {
+            seedMultiFromSelectedIfEmpty(app);
+            selection.toggle(&app.multi_selected, gh);
+            app.selected = .{ .group = gid };
+        } else {
+            selection.clear(&app.multi_selected);
+            app.selected = .{ .group = gid };
+        }
         app.drag = .none;
     } else if (hitTestDisplayCable(mw, nodes, dedges)) |actual| {
+        selection.clear(&app.multi_selected);
         app.selected = .{ .cable = actual };
     } else {
-        app.selected = null;
-        app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.toCanvasLocal(app.mouse) } };
+        // 空白左ドラッグ = 矩形選択。pan は中央ボタンへ移行（TASK-173.3）。
+        if (!multi_mod) {
+            selection.clear(&app.multi_selected);
+            app.selected = null;
+        }
+        app.drag = .{ .rect_select = .{ .start_world = mw, .additive = multi_mod } };
     }
 }
 
@@ -2392,6 +2475,7 @@ fn registerGeneratedMacro(
 fn registerGeneratedMacros(app: *App) void {
     const drum_gid = app.ledger.alloc() orelse return;
     const bass_gid = app.ledger.alloc() orelse {
+        selection.set(&app.multi_selected, group.handleOfGroup(drum_gid), false);
         app.ledger.free(drum_gid);
         return;
     };
@@ -2509,6 +2593,7 @@ fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
                 // 台帳枯渇（MAX_GROUPS 上限。極めて稀）: 公開済みメンバーを畳んで戻す（1 publish）。
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
+                    selection.set(&app.multi_selected, m, false);
                     app.dyn.removeModule(m);
                 }
                 app.dyn.publish() catch {};
@@ -2524,6 +2609,7 @@ fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
             const gid = app.ledger.alloc() orelse {
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
+                    selection.set(&app.multi_selected, m, false);
                     app.dyn.removeModule(m);
                 }
                 app.dyn.publish() catch {};
@@ -2558,6 +2644,7 @@ fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f, out_ids: *[patc
             const gid = app.ledger.alloc() orelse {
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
+                    selection.set(&app.multi_selected, m, false);
                     app.dyn.removeModule(m);
                 }
                 app.dyn.publish() catch {};
@@ -2573,6 +2660,7 @@ fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f, out_ids: *[patc
             const gid = app.ledger.alloc() orelse {
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
+                    selection.set(&app.multi_selected, m, false);
                     app.dyn.removeModule(m);
                 }
                 app.dyn.publish() catch {};
@@ -2681,6 +2769,7 @@ fn onMouseMove(app: *App) void {
             app.ledger.groups[gd.gid].pos = mw.add(gd.grab_offset);
         },
         .cable => {}, // pending は app.mouse を使って毎フレーム描画（状態更新なし）
+        .rect_select => {}, // 矩形は drawFrame が mouseWorld で描く（状態更新なし）
     }
 }
 
@@ -3260,30 +3349,41 @@ pub fn main(init: std.process.Init) !void {
                     .file_drop => {}, // TASK-113.4: patch 未消費
                     .mouse_move => |m| {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                        gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = 0 } });
+                        gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } });
                         // drag 中は panel 上でも追従（node/pan を panel 境界で切らない）。開始は allowsCanvasInput。
                         if (app.drag != .none or app.allowsCanvasInput()) onMouseMove(&app);
                     },
                     .mouse_down => |m| {
                         const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
-                        gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
+                        gui_ctx.pushEvent(.{ .mouse_down = .{ .x = m.x, .y = m.y, .button = button, .modifiers = m.modifiers.toC() } });
+                        app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                         if (m.button == .left) {
-                            app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                            if (app.allowsCanvasInput()) onMouseDown(&app);
+                            if (app.allowsCanvasInput()) onMouseDown(&app, m.modifiers);
+                        } else if (m.button == .middle) {
+                            // 中央ボタン: hit-test cascade を経由せず pan 開始（allowsCanvasInput ゲート）。
+                            if (app.allowsCanvasInput()) {
+                                app.drag = .{ .pan = .{
+                                    .start_pan = app.camera.pan,
+                                    .start_mouse = app.toCanvasLocal(app.mouse),
+                                } };
+                            }
                         }
+                        // 右ボタンはキャンバス側で何もしない（将来コンテキストメニュー予約）。
                     },
                     .mouse_up => |m| {
                         const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
-                        gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = 0 } });
+                        gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = m.modifiers.toC() } });
+                        app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                         if (m.button == .left) {
-                            app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
-                            // cable/node drag の commit は panel 上でも受け付ける（開始は center のみ）。
+                            // cable/node/rect_select の commit は panel 上でも受け付ける（開始は center のみ）。
                             if (app.drag != .none or app.allowsCanvasInput()) onMouseUp(&app);
+                        } else if (m.button == .middle) {
+                            if (app.drag == .pan) app.drag = .none;
                         }
                     },
                     .mouse_scroll => |s| {
                         app.mouse = .{ .x = @floatFromInt(s.x), .y = @floatFromInt(s.y) };
-                        gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = 0 } });
+                        gui_ctx.pushEvent(.{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } });
                         if (app.allowsCanvasInput()) {
                             const factor: f32 = if (s.dy > 0) 1.1 else if (s.dy < 0) 1.0 / 1.1 else 1.0;
                             app.camera.zoomAt(app.toCanvasLocal(app.mouse), factor);
@@ -3897,6 +3997,8 @@ fn reconnectEdgeSnap(app: *App, edge: patch_undo.EdgeSnap) void {
 fn removeNodeByHandleForUndo(app: *App, h: Handle) void {
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
     purgeParamOverrides(app, h);
+    // handle 再利用で stale multi 選択が引き継がれないよう、remove 前に落とす（TASK-173.3）。
+    selection.set(&app.multi_selected, h, false);
     app.dyn.removeModule(h);
     clearNodeIdMapping(app, h);
 }
@@ -4031,7 +4133,10 @@ fn applyUndoAddMacro(app: *App, s: patch_undo.AddMacroSnap) void {
         const h = handleOfNodeId(app, NodeId.fromRaw(s.members[mi])) orelse continue;
         removeNodeByHandleForUndo(app, h);
     }
-    if (s.group_id != 0xFF and s.group_id < group.MAX_GROUPS) app.ledger.free(s.group_id);
+    if (s.group_id != 0xFF and s.group_id < group.MAX_GROUPS) {
+        selection.set(&app.multi_selected, group.handleOfGroup(s.group_id), false);
+        app.ledger.free(s.group_id);
+    }
     app.dyn.publish() catch {};
     app.refreshAllExposed();
     app.selected = null;
@@ -4431,7 +4536,10 @@ fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     const app = actionApp(ctx);
     const p = try actions.parseAddNode(args);
     const h = try addNodeByKindName(app, p.kind);
-    errdefer app.dyn.removeModule(h);
+    errdefer {
+        selection.set(&app.multi_selected, h, false);
+        app.dyn.removeModule(h);
+    }
     app.layout[h] = .{ .x = p.x, .y = p.y };
     try app.dyn.publish();
     // redo も通常再実行: 全 peer が allocNodeId の単調採番で一致（COMMIT 全順序）。
@@ -4495,6 +4603,8 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
     purgeParamOverrides(app, h);
+    // handle 再利用で stale multi 選択が引き継がれないよう、remove 前に落とす（TASK-173.3）。
+    selection.set(&app.multi_selected, h, false);
     app.dyn.removeModule(h);
     clearNodeIdMapping(app, h);
     try app.dyn.publish();
@@ -4676,9 +4786,11 @@ fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     for (handles[0..n]) |h| {
         purgeParamOverrides(app, h);
         app.ledger.unassign(h);
+        selection.set(&app.multi_selected, h, false);
         app.dyn.removeModule(h);
         clearNodeIdMapping(app, h);
     }
+    selection.set(&app.multi_selected, group.handleOfGroup(group_id), false);
     app.ledger.free(group_id);
     try app.dyn.publish();
     app.refreshAllExposed();
@@ -4986,11 +5098,13 @@ fn clearGraph(app: *App) void {
     while (h < MAX_MODULES) : (h += 1) {
         if (!app.dyn.slotActive(h)) continue;
         if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
+        selection.set(&app.multi_selected, h, false);
         app.dyn.removeModule(h);
     }
     app.ledger = .{};
     clearAllNodeIdMappings(app);
     // next_node_id は load/SYNC 側が restore する（clear 単体では単調性を壊さない）
+    selection.clear(&app.multi_selected);
     app.selected = null;
     app.hover = null;
     app.drag = .none;

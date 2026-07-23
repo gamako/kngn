@@ -10,4 +10,5 @@ comptime {
     _ = @import("grid_test.zig");
     _ = @import("param_view.zig");
     _ = @import("undo.zig");
+    _ = @import("selection.zig");
 }

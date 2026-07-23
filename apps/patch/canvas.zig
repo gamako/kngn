@@ -104,11 +104,37 @@ pub const CableRef = struct {
 
 pub const ScreenRect = struct { x: f32, y: f32, w: f32, h: f32 };
 
+/// world 座標の軸平行矩形（w/h は非負を前提。normalizeWorldRect が保証）。
+pub const WorldRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
 /// モジュールパレットのボタン（screen 座標・pan/zoom 非依存）。
 pub const PaletteButton = struct {
     kind_index: u8,
     rect: ScreenRect,
 };
+
+/// 2 点から正規化 world 矩形（正方向ドラッグ / 逆方向ドラッグどちらでも w,h >= 0）。
+pub fn normalizeWorldRect(a: Vec2f, b: Vec2f) WorldRect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    const x1 = @max(a.x, b.x);
+    const y1 = @max(a.y, b.y);
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+/// 表示ノードの world bbox（pos + nodeSize）。
+pub fn nodeWorldBBox(g: NodeGeom) WorldRect {
+    const sz = nodeSize(g);
+    return .{ .x = g.pos.x, .y = g.pos.y, .w = sz.x, .h = sz.y };
+}
+
+/// 正の面積を持つ部分交差（完全内包・部分交差は hit、境界接触のみ・zero-size は miss）。
+pub fn rectsIntersectPositive(a: WorldRect, b: WorldRect) bool {
+    if (a.w <= 0 or a.h <= 0 or b.w <= 0 or b.h <= 0) return false;
+    const ix = @min(a.x + a.w, b.x + b.w) - @max(a.x, b.x);
+    const iy = @min(a.y + a.h, b.y + b.h) - @max(a.y, b.y);
+    return ix > 0 and iy > 0;
+}
 
 /// 2 ポートからケーブルの src(出力)/dst(入力) を決める。一方が出力・他方が入力のときのみ有効。
 /// 同方向（out-out / in-in、同一 PortRef 含む）は null。同一ノードの out→in（別ポート＝self-loop）は許可
@@ -1146,4 +1172,50 @@ test "canvas: inspector param row は長いラベルでも value を content 幅
     const short = inspectorParamRowLayout(avail, 8 * "base_hz (Hz)".len);
     try testing.expectEqual(@as(i32, @intCast(8 * "base_hz (Hz)".len)), short.label_w);
     try testing.expectEqual(avail, short.total());
+}
+
+// ============================================================================
+// 矩形選択（TASK-173.3）: 正規化・交差判定
+// ============================================================================
+
+test "canvas: normalizeWorldRect forward and reverse drag" {
+    const a = Vec2f{ .x = 10, .y = 20 };
+    const b = Vec2f{ .x = 40, .y = 50 };
+    const fwd = normalizeWorldRect(a, b);
+    try testing.expectApproxEqAbs(@as(f32, 10), fwd.x, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 20), fwd.y, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 30), fwd.w, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 30), fwd.h, 1e-5);
+    const rev = normalizeWorldRect(b, a);
+    try testing.expectApproxEqAbs(fwd.x, rev.x, 1e-5);
+    try testing.expectApproxEqAbs(fwd.y, rev.y, 1e-5);
+    try testing.expectApproxEqAbs(fwd.w, rev.w, 1e-5);
+    try testing.expectApproxEqAbs(fwd.h, rev.h, 1e-5);
+}
+
+test "canvas: rectsIntersectPositive containment / partial / miss / edge / zero-size" {
+    const node = WorldRect{ .x = 100, .y = 100, .w = 120, .h = 80 };
+    // 完全内包
+    try testing.expect(rectsIntersectPositive(WorldRect{ .x = 90, .y = 90, .w = 200, .h = 200 }, node));
+    try testing.expect(rectsIntersectPositive(node, WorldRect{ .x = 110, .y = 110, .w = 20, .h = 20 }));
+    // 部分交差
+    try testing.expect(rectsIntersectPositive(WorldRect{ .x = 200, .y = 120, .w = 50, .h = 50 }, node));
+    // 非交差
+    try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 300, .y = 300, .w = 10, .h = 10 }, node));
+    // 境界接触のみ（面積 0）→ miss
+    try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 220, .y = 100, .w = 10, .h = 80 }, node));
+    try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 100, .y = 180, .w = 120, .h = 10 }, node));
+    // zero-size → miss
+    try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 100, .y = 100, .w = 0, .h = 80 }, node));
+    try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 150, .y = 140, .w = 0, .h = 0 }, node));
+}
+
+test "canvas: nodeWorldBBox matches nodeSize" {
+    const g = NodeGeom{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 2, .n_out = 1 };
+    const bb = nodeWorldBBox(g);
+    const sz = nodeSize(g);
+    try testing.expectApproxEqAbs(g.pos.x, bb.x, 1e-5);
+    try testing.expectApproxEqAbs(g.pos.y, bb.y, 1e-5);
+    try testing.expectApproxEqAbs(sz.x, bb.w, 1e-5);
+    try testing.expectApproxEqAbs(sz.y, bb.h, 1e-5);
 }
