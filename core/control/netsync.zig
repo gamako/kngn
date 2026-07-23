@@ -1532,11 +1532,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
                 const ms = backoff_ms[attempt];
                 attempt += 1;
                 std.debug.print("[netsync] client 接続リトライ {d}/{d}: {s}（{d}ms 後）\n", .{ attempt, backoff_ms.len, @errorName(err), ms });
-                const req = std.posix.timespec{
-                    .sec = @intCast(ms / 1000),
-                    .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-                };
-                _ = std.c.nanosleep(&req, null);
+                std.Io.sleep(io_val, .fromMilliseconds(@intCast(ms)), .awake) catch {};
             }
         }
     };
@@ -2882,11 +2878,7 @@ pub fn testSetJoinSnapshotSeq(peer_id: u32, seq: u64) bool {
 const testing = std.testing;
 
 fn sleepMs(ms: u64) void {
-    const req = std.posix.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&req, null);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
 fn waitPeers(n: usize, timeout_ms: u64) !void {
