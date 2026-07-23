@@ -45,6 +45,7 @@ const canvas = @import("canvas.zig");
 const inspector = @import("inspector.zig");
 const param_view = @import("param_view.zig");
 const group = @import("group.zig");
+const layout_mod = @import("layout.zig");
 const macro = @import("macro.zig");
 const actions = @import("actions.zig");
 const gen_actions = @import("gen_actions.zig");
@@ -5091,6 +5092,81 @@ fn registerPatchActions(app: *App) void {
         .network_policy = patchPolicy("load_graph"),
         .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG); reject while synced",
     });
+    // TASK-173.1: 表示グラフの全再レイアウト（local_only・引数なし・undo/履歴化なし）
+    platform.registerAction(.{
+        .name = "auto_layout",
+        .ctx = app,
+        .run = actionAutoLayout,
+        .network_policy = .local_only,
+        .args = &.{},
+        .desc = "Sugiyama layered layout of display graph (real nodes + collapsed boxes)",
+    });
+}
+
+/// `auto_layout`: 表示ノード（mapNodesForCollapsed）と表示辺（buildDisplayEdges visual）に対し
+/// Sugiyama 系レイヤードレイアウトを適用する。合成 handle は groups[gid].pos のみへ書き、
+/// App.layout[] には実 handle だけを書く。展開中マクロのヘッダーはメンバー bbox に追従。
+/// ホットパス: イベント時のみ。camera fit / undo は行わない。
+fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = args;
+    _ = buf;
+    const app = actionApp(ctx);
+
+    var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
+    const n_nodes = app.buildNodes(&node_buf);
+
+    var dedge_buf: [MAX_EDGES]group.DisplayEdge = undefined;
+    const n_dedges = app.buildDisplayEdges(&dedge_buf);
+    var edge_buf: [MAX_EDGES]Edge = undefined;
+    var ei: usize = 0;
+    while (ei < n_dedges) : (ei += 1) {
+        edge_buf[ei] = dedge_buf[ei].visual;
+    }
+
+    // order key: 実ノードは view.order 添字。collapsed group は所属メンバーの最小 order key。
+    const view = app.dyn.currentView();
+    var handle_order: [MAX_MODULES]?u32 = [_]?u32{null} ** MAX_MODULES;
+    var k: usize = 0;
+    while (k < view.node_count) : (k += 1) {
+        handle_order[view.order[k]] = @intCast(k);
+    }
+
+    var order_keys: [MAX_MODULES + group.MAX_GROUPS]u32 = undefined;
+    var i: usize = 0;
+    while (i < n_nodes) : (i += 1) {
+        const ng = node_buf[i];
+        if (group.groupIdFromHandle(ng.handle)) |gid| {
+            var min_key: u32 = std.math.maxInt(u32);
+            var found = false;
+            for (app.ledger.group_of, 0..) |go, h| {
+                if (go == null or go.? != gid) continue;
+                if (handle_order[h]) |ok| {
+                    if (!found or ok < min_key) {
+                        min_key = ok;
+                        found = true;
+                    }
+                }
+            }
+            order_keys[i] = if (found) min_key else std.math.maxInt(u32);
+        } else {
+            order_keys[i] = handle_order[ng.handle] orelse std.math.maxInt(u32);
+        }
+    }
+
+    // パレット帯を避ける origin_y（clampMacroPos と同型: paletteBottom + margin → world Y）
+    const margin: f32 = 16;
+    const top_limit_local = (paletteBottom(app) - app.canvas_rect.y) + margin;
+    const origin_y = app.camera.screenToWorld(.{ .x = 0, .y = top_limit_local }).y;
+
+    layout_mod.apply(
+        node_buf[0..n_nodes],
+        edge_buf[0..n_dedges],
+        order_keys[0..n_nodes],
+        app.layout[0..],
+        &app.ledger,
+        origin_y,
+    );
+    return "ok";
 }
 
 fn toPlatformPolicy(tag: gen_actions.NetworkPolicyTag) platform.NetworkPolicy {
