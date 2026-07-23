@@ -16,6 +16,13 @@
 //!
 //! TASK-113.4: `WM_DROPFILES` の登録・処理は行わない stub。
 //! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
+//!
+//! TASK-156.5 Stage 4（HiDPI / `.physical`）:
+//! - `SetThreadDpiAwarenessContext(PMv2)` を `.physical` window 生成時だけ一時適用（`.logical` は起動時 awareness のまま）。
+//! - 実 awareness（`GetWindowDpiAwarenessContext`）で入力 raw 化と content_scale を分岐（fb_mode 決め打ちではない）。
+//! - `.logical`+PMv2 縮退時は content_scale=1.0 強制（R9 寸法契約）。
+//! - WM_SIZE / WM_DPICHANGED は pending のみ → `lockFramebuffer` 境界で一括 commit。
+//! - ホットパス宣言: 初期化時 / イベント時 / lock 境界のみ（フレーム毎・RT ではない）。
 
 const std = @import("std");
 const win = std.os.windows;
@@ -32,6 +39,8 @@ const ModifierFlags = types.ModifierFlags;
 const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;
 const DialogError = types.DialogError;
+const FramebufferMode = types.FramebufferMode;
+const WindowSize = types.WindowSize;
 
 const HWND = win.HWND;
 const HINSTANCE = win.HINSTANCE;
@@ -168,9 +177,11 @@ const WM_MBUTTONDOWN: UINT = 0x0207;
 const WM_MBUTTONUP: UINT = 0x0208;
 const WM_MOUSEWHEEL: UINT = 0x020A;
 const WM_MOUSEHWHEEL: UINT = 0x020E;
+const WM_DPICHANGED: UINT = 0x02E0; // per-monitor DPI 変更（主に PMv2 window。TASK-156.5 Stage 4）
 
 const KF_REPEAT_BIT: usize = 0x40000000; // lParam bit30: 直前に押下されていた（リピート）
 const KF_EXTENDED_BIT: usize = 0x01000000; // lParam bit24: 拡張キー（右 Ctrl/Alt, テンキー Enter 等）
+const SWP_NOZORDER: UINT = 0x0004;
 
 // commdlg OPENFILENAME Flags
 const OFN_OVERWRITEPROMPT: DWORD = 0x00000002;
@@ -277,9 +288,68 @@ extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "user32" fn UnregisterClassW(lpClassName: LPCWSTR, hInstance: ?HINSTANCE) callconv(.winapi) BOOL;
 
+// TASK-156.5 Stage 4: DPI awareness / per-monitor scale（Win10 1607+。失敗時は no-op フォールバック）
+// DPI_AWARENESS_CONTEXT は opaque handle（*anyopaque。ABI 上は HANDLE 相当）
+pub const DPI_AWARENESS_CONTEXT = ?*anyopaque;
+// winuser.h: #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
+
+extern "user32" fn GetThreadDpiAwarenessContext() callconv(.winapi) DPI_AWARENESS_CONTEXT;
+extern "user32" fn SetThreadDpiAwarenessContext(dpiContext: DPI_AWARENESS_CONTEXT) callconv(.winapi) DPI_AWARENESS_CONTEXT; // 戻り値=直前の context。失敗時 null
+extern "user32" fn GetWindowDpiAwarenessContext(hwnd: HWND) callconv(.winapi) DPI_AWARENESS_CONTEXT;
+extern "user32" fn AreDpiAwarenessContextsEqual(dpiContextA: DPI_AWARENESS_CONTEXT, dpiContextB: DPI_AWARENESS_CONTEXT) callconv(.winapi) BOOL;
+extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) UINT;
+extern "user32" fn GetDpiForSystem() callconv(.winapi) UINT;
+extern "user32" fn AdjustWindowRectExForDpi(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD, dpi: UINT) callconv(.winapi) BOOL;
+
 extern "comdlg32" fn GetSaveFileNameW(unnamedParam1: *OPENFILENAMEW) callconv(.winapi) BOOL;
 extern "comdlg32" fn GetOpenFileNameW(unnamedParam1: *OPENFILENAMEW) callconv(.winapi) BOOL;
 extern "comdlg32" fn CommDlgExtendedError() callconv(.winapi) DWORD;
+
+// ============================================================================
+// TASK-156.5 Stage 4: 高 DPI 共通ヘルパー（X11 Stage 2 / Wayland Stage 3 と bit 一致。単体テスト対象）
+// ホットパス宣言: 初期化時 / イベント時 / lock 境界のみ（フレーム毎・RT ではない）。
+// ============================================================================
+
+/// 入力正規化用の実スケール（query 用。lock 前・都度再取得）。fb_mode に非依存。
+pub fn effectiveContentScale(raw_scale: f32) f32 {
+    return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
+}
+
+/// objc の (int)lround((double)px * (double)scale) と数値一致させる。
+/// 有限値 [1, u32最大] にクランプする（1未満→1、u32最大超過→u32最大）。
+pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
+    const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
+    const v: f64 = @round(@as(f64, @floatFromInt(logical_px)) * s);
+    if (!std.math.isFinite(v) or v < 1.0) return 1;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// framebuffer 物理サイズ。.logical は常に logical そのもの（R9 の構造的保証はここに集約）。
+pub fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
+    if (fb_mode == .logical) return logical;
+    return .{
+        .width = roundToPhysicalPx(logical.width, scale),
+        .height = roundToPhysicalPx(logical.height, scale),
+    };
+}
+
+/// DPI 値（96 = 100%）→ content_scale。0 / 非有限は 1.0。
+fn scaleFromDpi(dpi: UINT) f32 {
+    if (dpi == 0) return 1.0;
+    const s: f32 = @as(f32, @floatFromInt(dpi)) / 96.0;
+    return effectiveContentScale(s);
+}
+
+fn isPmv2Context(ctx: DPI_AWARENESS_CONTEXT) bool {
+    return AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0;
+}
+
+/// `.physical` window 生成中に切り替えた thread awareness を init 時点の context へ戻す。
+fn restoreThreadDpiAwareness() void {
+    _ = SetThreadDpiAwarenessContext(g_startup_dpi_awareness);
+}
 
 // ============================================================================
 // init / shutdown（プロセス単一のウィンドウクラス + QPC 周波数）
@@ -289,6 +359,8 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VideoProtoWindowClass
 var g_hinstance: ?HINSTANCE = null;
 var g_class_registered: bool = false;
 var g_qpc_freq: f64 = 1.0;
+/// platform.init() 時点の thread DPI awareness（`.logical` window 生成はこれを保つ。TASK-156.5 Stage 4）。
+var g_startup_dpi_awareness: DPI_AWARENESS_CONTEXT = null;
 
 pub fn init() Error!void {
     if (g_class_registered) return;
@@ -296,6 +368,10 @@ pub fn init() Error!void {
     const hinst = GetModuleHandleW(null) orelse return error.InitFailed;
     // GetModuleHandleW(null) は HMODULE。HINSTANCE と同一表現。
     g_hinstance = @ptrCast(hinst);
+
+    // TASK-156.5 Stage 4: 起動時（何も触っていない）thread awareness を保存。
+    // `.logical` 生成はこの context のまま、`.physical` のみ一時的に PMv2 へ切り替える。
+    g_startup_dpi_awareness = GetThreadDpiAwarenessContext();
 
     var wc = std.mem.zeroes(WNDCLASSEXW);
     wc.cbSize = @sizeOf(WNDCLASSEXW);
@@ -334,8 +410,29 @@ pub fn getTime() f64 {
 
 pub const Core = struct {
     hwnd: HWND,
+    /// framebuffer / backing の実寸法（物理px。`.logical` では logical と同値）。
+    /// present（StretchDIBits / swap chain）は常にこの寸法を使う。
     width: u32,
     height: u32,
+    /// 独立保持する論理サイズ（`physical/scale` の逆算に依存しない。lround は非可逆）。
+    logical_width: u32,
+    logical_height: u32,
+
+    // TASK-156.5 Stage 4: HiDPI / `.physical`
+    fb_mode: FramebufferMode,
+    /// window 生成直後に `GetWindowDpiAwarenessContext` で確定した実 awareness が PMv2 か。
+    /// 入力座標変換分岐の正（fb_mode 決め打ちではない）。
+    is_pmv2: bool,
+    /// query 用（入力 raw 化・`contentScale()`）。WM_DPICHANGED で更新。
+    pending_content_scale: f32,
+    /// latched（`lockFramebuffer` snapshot）。pending → lock 境界で commit。
+    content_scale: f32,
+    scale_epoch: u64,
+    /// WM_SIZE / WM_DPICHANGED 由来の pending client 寸法（window 実ピクセル）。
+    /// `.logical` では logical==fb、`.physical`(PMv2) では physical。lock 境界で commit。
+    pending_client_w: u32,
+    pending_client_h: u32,
+    metrics_dirty: bool,
 
     // canonical BGRA framebuffer（caller が書く。lockFramebuffer が返す。present が直接読む）。
     backing: []u32,
@@ -347,7 +444,7 @@ pub const Core = struct {
 
     // 入力 post-state
     buttons: MouseButtons, // 現在押下中のマウスボタン集合
-    last_x: i32, // 直近のマウス client 座標（focus/capture 喪失時の synthetic mouse_up 用）
+    last_x: i32, // 直近のマウス raw physical 座標（focus/capture 喪失時の synthetic mouse_up 用）
     last_y: i32,
 
     // ライブリサイズ再描画 (TASK-23.1)。未登録時は null。destroy で clear。
@@ -412,13 +509,36 @@ pub const Core = struct {
         // タスクバー非表示（マスコット向け）。透過フラグは present 経路の分岐に使う。
         // 透過は WS_POPUP（枠なし）に統一する。titled + layered は UpdateLayeredWindow の psize
         // （window 全体サイズ）が client サイズと食い違い、タイトルバー分の欠落 / WM_SIZE 縮小が起きるため。
+        // TASK-156.5 Stage 4: width/height 引数は論理サイズ。`.physical` は PMv2 下で物理 client 寸法に変換。
         const borderless = opts.borderless or opts.transparent;
         const style: DWORD = if (fullscreen or borderless) BORDERLESS_STYLE else WINDOW_STYLE;
         var ex_style: DWORD = 0;
         if (opts.transparent) ex_style |= WS_EX_LAYERED;
         if (borderless) ex_style |= WS_EX_TOOLWINDOW; // 枠なし/透過はタスクバー非表示（マスコット向け）
-        var outer_w: c_int = @intCast(width);
-        var outer_h: c_int = @intCast(height);
+
+        const logical_w = width;
+        const logical_h = height;
+        const fb_mode = opts.fb_mode;
+
+        // `.physical`: 生成呼び出し中だけ thread awareness を PMv2 に一時切替。失敗は no-op フォールバック。
+        // `.logical`: 起動時 awareness のまま（context 切り替えなし）。
+        var create_as_pmv2 = false;
+        if (fb_mode == .physical) {
+            // Set 失敗（戻り値 null）でも Create は続行。thread が実際に PMv2 かで物理寸法の可否を判定。
+            _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            create_as_pmv2 = isPmv2Context(GetThreadDpiAwarenessContext());
+        }
+
+        // 初期 scale 推定（生成前）。`.physical`+PMv2 のみ物理 client に使う。生成後 GetDpiForWindow で確定。
+        var create_scale: f32 = 1.0;
+        if (create_as_pmv2) {
+            create_scale = scaleFromDpi(GetDpiForSystem());
+        }
+        const client_w: u32 = if (create_as_pmv2) roundToPhysicalPx(logical_w, create_scale) else logical_w;
+        const client_h: u32 = if (create_as_pmv2) roundToPhysicalPx(logical_h, create_scale) else logical_h;
+
+        var outer_w: c_int = @intCast(client_w);
+        var outer_h: c_int = @intCast(client_h);
         var pos_x: c_int = CW_USEDEFAULT;
         var pos_y: c_int = CW_USEDEFAULT;
         if (fullscreen) {
@@ -431,27 +551,63 @@ pub const Core = struct {
                 pos_y = pos.y;
             }
             if (!borderless) {
-                // client area を width×height にするため outer 寸法を算出。
-                var rect = RECT{ .left = 0, .top = 0, .right = @intCast(width), .bottom = @intCast(height) };
-                if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) return error.WindowCreationFailed;
+                // client area を client_w×client_h にするため outer 寸法を算出。
+                // `.physical`(PMv2) は DPI 考慮版、それ以外は従来の AdjustWindowRectEx。
+                var rect = RECT{ .left = 0, .top = 0, .right = @intCast(client_w), .bottom = @intCast(client_h) };
+                if (create_as_pmv2) {
+                    const dpi: UINT = blk: {
+                        const d = GetDpiForSystem();
+                        break :blk if (d == 0) 96 else d;
+                    };
+                    if (AdjustWindowRectExForDpi(&rect, WINDOW_STYLE, 0, ex_style, dpi) == 0) {
+                        restoreThreadDpiAwareness();
+                        return error.WindowCreationFailed;
+                    }
+                } else {
+                    if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) {
+                        restoreThreadDpiAwareness();
+                        return error.WindowCreationFailed;
+                    }
+                }
                 outer_w = rect.right - rect.left;
                 outer_h = rect.bottom - rect.top;
             }
             // borderless: client=window。位置未指定時は CW_USEDEFAULT のまま。
         }
 
-        const core = alloc.create(Core) catch return error.WindowCreationFailed;
+        const core = alloc.create(Core) catch {
+            restoreThreadDpiAwareness();
+            return error.WindowCreationFailed;
+        };
         errdefer alloc.destroy(core);
 
-        const px_count = std.math.mul(usize, width, height) catch return error.WindowCreationFailed;
-        const backing = alloc.alloc(u32, px_count) catch return error.WindowCreationFailed;
+        // 初期 backing は論理寸法ベースの fb 寸法（`.physical`+PMv2 なら物理）。生成後に確定 scale で必要なら再確保。
+        const init_fb = effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, if (create_as_pmv2) create_scale else 1.0);
+        const px_count = std.math.mul(usize, init_fb.width, init_fb.height) catch {
+            restoreThreadDpiAwareness();
+            return error.WindowCreationFailed;
+        };
+        const backing = alloc.alloc(u32, px_count) catch {
+            restoreThreadDpiAwareness();
+            return error.WindowCreationFailed;
+        };
         errdefer alloc.free(backing);
         @memset(backing, 0);
 
         core.* = .{
             .hwnd = undefined,
-            .width = width,
-            .height = height,
+            .width = init_fb.width,
+            .height = init_fb.height,
+            .logical_width = logical_w,
+            .logical_height = logical_h,
+            .fb_mode = fb_mode,
+            .is_pmv2 = false, // Create 後に確定
+            .pending_content_scale = 1.0,
+            .content_scale = 1.0,
+            .scale_epoch = 0,
+            .pending_client_w = init_fb.width,
+            .pending_client_h = init_fb.height,
+            .metrics_dirty = false,
             .backing = backing,
             .closing = false,
             .quit_delivered = false,
@@ -477,8 +633,98 @@ pub const Core = struct {
             null,
             g_hinstance,
             null,
-        ) orelse return error.WindowCreationFailed;
+        ) orelse {
+            restoreThreadDpiAwareness();
+            return error.WindowCreationFailed;
+        };
         core.hwnd = hwnd;
+
+        // `.physical` で一時切替した thread awareness を起動時 context へ復元。
+        restoreThreadDpiAwareness();
+
+        // 実 window awareness を確定し content_scale / fb 寸法を確定する（ホットパス宣言: 初期化時のみ）。
+        const win_ctx = GetWindowDpiAwarenessContext(hwnd);
+        const is_pmv2 = isPmv2Context(win_ctx);
+        core.is_pmv2 = is_pmv2;
+
+        var scale: f32 = 1.0;
+        if (fb_mode == .physical) {
+            if (is_pmv2) {
+                scale = scaleFromDpi(GetDpiForWindow(hwnd));
+            } else {
+                // PMv2 確定不可 → scale 検出不可。物理==論理の no-op フォールバック（hard error にしない）。
+                scale = 1.0;
+            }
+        } else {
+            // `.logical`
+            if (is_pmv2) {
+                // 起動時デフォルトが既に PMv2 の稀な環境: この window に限り content_scale=1.0（R1 同型）。
+                scale = 1.0;
+            } else {
+                // 典型ケース（OS 仮想化）: 実 DPI 由来 scale を報告（入力 raw = native×scale）。
+                scale = scaleFromDpi(GetDpiForWindow(hwnd));
+            }
+        }
+        core.pending_content_scale = scale;
+        core.content_scale = scale;
+
+        // 確定 scale に基づく framebuffer 寸法。`.physical` で生成時推定と差があれば window/backing を合わせる。
+        const final_fb = effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, scale);
+        if (final_fb.width != core.width or final_fb.height != core.height) {
+            core.resizeBacking(final_fb.width, final_fb.height);
+            // OOM 時は旧サイズ維持（window は残す）。
+        }
+        // `.physical`+PMv2: 生成時 GetDpiForSystem 推定と GetDpiForWindow 確定がずれたら client を物理寸法へ補正。
+        if (fb_mode == .physical and is_pmv2 and !fullscreen and !borderless) {
+            var cr0 = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            if (GetClientRect(hwnd, &cr0) != 0) {
+                const cur_w: u32 = @intCast(@max(cr0.right - cr0.left, 0));
+                const cur_h: u32 = @intCast(@max(cr0.bottom - cr0.top, 0));
+                if (cur_w != final_fb.width or cur_h != final_fb.height) {
+                    const dpi: UINT = blk: {
+                        const d = GetDpiForWindow(hwnd);
+                        break :blk if (d == 0) 96 else d;
+                    };
+                    var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    if (GetWindowRect(hwnd, &wr) != 0) {
+                        var rect = RECT{
+                            .left = 0,
+                            .top = 0,
+                            .right = @intCast(final_fb.width),
+                            .bottom = @intCast(final_fb.height),
+                        };
+                        if (AdjustWindowRectExForDpi(&rect, style, 0, ex_style, dpi) != 0) {
+                            const ow = rect.right - rect.left;
+                            const oh = rect.bottom - rect.top;
+                            _ = SetWindowPos(hwnd, null, wr.left, wr.top, ow, oh, SWP_NOZORDER | SWP_NOACTIVATE);
+                        }
+                    }
+                }
+            }
+        }
+        // 実際の client 矩形を pending に反映（OS が少し違う寸法にした場合に備える）。
+        var cr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        if (GetClientRect(hwnd, &cr) != 0) {
+            const cw: u32 = @intCast(@max(cr.right - cr.left, 1));
+            const ch: u32 = @intCast(@max(cr.bottom - cr.top, 1));
+            core.pending_client_w = cw;
+            core.pending_client_h = ch;
+            // client が確定している場合、backing を client に合わせる
+            // （effectiveFramebufferSize と OS client の 1px 差を吸収。`.logical` も client=logical 契約）。
+            if (cw != core.width or ch != core.height) {
+                core.resizeBacking(cw, ch);
+            }
+            // `.physical` の logical は独立保持（引数の論理値）。client との差は scale の丸め。
+            // `.logical` の logical は client 寸法そのもの。
+            if (fb_mode == .logical) {
+                core.logical_width = cw;
+                core.logical_height = ch;
+            }
+        } else {
+            core.pending_client_w = core.width;
+            core.pending_client_h = core.height;
+        }
+        core.metrics_dirty = false;
 
         // wndProc が Core を引けるよう GWLP_USERDATA に格納（CreateWindowExW 中の早期メッセージは
         // userdata 未設定 → DefWindowProcW に落ちるだけで、入力イベントは発生しない）。
@@ -487,6 +733,50 @@ pub const Core = struct {
         _ = ShowWindow(hwnd, SW_SHOW);
         _ = UpdateWindow(hwnd);
         return core;
+    }
+
+    /// pending（WM_SIZE / WM_DPICHANGED）→ latched を一括 commit する（TASK-156.5 Stage 4）。
+    /// gdi/d3d11 の `lockFramebuffer` 先頭から呼ぶ。ホットパス宣言: lock 境界のみ。
+    pub fn applyLatchedMetricsIfNeeded(self: *Core) void {
+        if (!self.metrics_dirty) return;
+
+        const new_scale = effectiveContentScale(self.pending_content_scale);
+        const old_scale = effectiveContentScale(self.content_scale);
+        const cw = self.pending_client_w;
+        const ch = self.pending_client_h;
+        if (cw == 0 or ch == 0) {
+            self.metrics_dirty = false;
+            return;
+        }
+
+        // client 寸法は window 実ピクセル = framebuffer。
+        // `.logical`: client = logical = fb。`.physical`: client = physical = fb、logical は逆算。
+        const new_logical_w: u32 = if (self.fb_mode == .logical) cw else blk: {
+            const s = new_scale;
+            const v = @round(@as(f64, @floatFromInt(cw)) / @as(f64, s));
+            break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
+        };
+        const new_logical_h: u32 = if (self.fb_mode == .logical) ch else blk: {
+            const s = new_scale;
+            const v = @round(@as(f64, @floatFromInt(ch)) / @as(f64, s));
+            break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
+        };
+
+        const old_w = self.width;
+        const old_h = self.height;
+        if (cw != self.width or ch != self.height) {
+            self.resizeBacking(cw, ch);
+            // OOM 等で backing が更新できなければ dirty を残して次回 lock で再試行。
+            if (self.width != cw or self.height != ch) return;
+        }
+
+        self.logical_width = new_logical_w;
+        self.logical_height = new_logical_h;
+        self.content_scale = new_scale;
+        if (new_scale != old_scale or self.width != old_w or self.height != old_h) {
+            self.scale_epoch +%= 1;
+        }
+        self.metrics_dirty = false;
     }
 
     /// 現在のウィンドウ geometry（TASK-117）。位置=GetWindowRect、サイズ=GetClientRect。
@@ -622,8 +912,9 @@ pub const Core = struct {
         }
     }
 
-    /// WM_SIZE で client area が変わった時に CPU backing を two-phase 再確保する（TASK-23）。
+    /// CPU backing を two-phase 再確保する（TASK-23 / TASK-156.5 Stage 4）。
     /// 新確保に成功してから旧を解放（OOM 時は旧サイズ維持）。最小化/ゼロ/同サイズは no-op。
+    /// WM_SIZE からは直接呼ばず pending 経由で `applyLatchedMetricsIfNeeded`（lock 境界）が呼ぶ。
     /// presentation resource（swap chain / DIB 等）の追従は各 backend が present 時に core 寸法と
     /// 比較して行う（GDI は StretchDIBits が stateless、D3D11 は present 内で lazy に ResizeBuffers）。
     fn resizeBacking(self: *Core, w: u32, h: u32) void {
@@ -735,17 +1026,46 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_SIZE => {
-            // 自由リサイズ（TASK-23）。最小化(SIZE_MINIMIZED)以外で client area の新寸法へ backing を再確保。
-            // lparam: LOWORD=client width, HIWORD=client height。pollEvents（lock 外）で処理されるので安全。
+            // 自由リサイズ（TASK-23 / TASK-156.5 Stage 4）。
+            // 最小化以外: pending client 寸法のみ記録し、backing/scale の commit は次 lock 境界
+            // （applyLatchedMetricsIfNeeded）。lparam: LOWORD=client width, HIWORD=client height。
+            // `.logical`: client=logical=fb。`.physical`(PMv2): client=physical=fb（logical は lock 時に逆算）。
             // サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。WM_TIMER は不採用）。
             if (wparam != SIZE_MINIMIZED) {
                 const lw: u32 = @truncate(@as(usize, @bitCast(lparam)));
-                const old_w = core.width;
-                const old_h = core.height;
-                core.resizeBacking(lw & 0xFFFF, (lw >> 16) & 0xFFFF);
-                if ((core.width != old_w or core.height != old_h)) {
-                    if (core.redraw_fn) |f| f(core.redraw_ctx);
+                const new_w = lw & 0xFFFF;
+                const new_h = (lw >> 16) & 0xFFFF;
+                if (new_w != 0 and new_h != 0) {
+                    const old_w = if (core.metrics_dirty) core.pending_client_w else core.width;
+                    const old_h = if (core.metrics_dirty) core.pending_client_h else core.height;
+                    core.pending_client_w = new_w;
+                    core.pending_client_h = new_h;
+                    core.metrics_dirty = true;
+                    if (new_w != old_w or new_h != old_h) {
+                        if (core.redraw_fn) |f| f(core.redraw_ctx);
+                    }
                 }
+            }
+            return 0;
+        },
+        WM_DPICHANGED => {
+            // TASK-156.5 Stage 4: 新 DPI を pending に記録し、OS 推奨矩形へ SetWindowPos。
+            // 実 resize/scale 確定は次 lock（WM_SIZE も同境界）。主に `.physical`(PMv2) window が受信。
+            // wParam: LOWORD=dpiX, HIWORD=dpiY（通常同値）。lParam: RECT* 推奨 window 矩形。
+            const wp: usize = @bitCast(wparam);
+            const dpi_x: UINT = @truncate(wp & 0xFFFF);
+            // `.logical`+PMv2 縮退 window は content_scale を 1.0 固定（実 DPI 無視）。
+            if (!(core.fb_mode == .logical and core.is_pmv2)) {
+                core.pending_content_scale = scaleFromDpi(dpi_x);
+                core.metrics_dirty = true;
+            }
+            if (lparam != 0) {
+                const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                const sx = suggested.left;
+                const sy = suggested.top;
+                const sw = suggested.right - suggested.left;
+                const sh = suggested.bottom - suggested.top;
+                _ = SetWindowPos(core.hwnd, null, sx, sy, sw, sh, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             return 0;
         },
@@ -886,7 +1206,21 @@ fn hiShort(lparam: LPARAM) i32 {
     return @as(i16, @bitCast(@as(u16, @truncate(u >> 16))));
 }
 
-/// client 座標 (x,y) の MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は GetKeyState。
+/// Win32 native client 座標 → raw physical event 座標（TASK-156.5 Stage 4）。
+/// - 実 awareness が PMv2 でない: OS 仮想化済み論理値 → `native × content_scale`
+/// - 実 awareness が PMv2: native は既に物理（`.logical`+PMv2 縮退では scale=1.0 なので同値）
+fn nativeToRawPhysical(core: *const Core, native_x: i32, native_y: i32) struct { x: i32, y: i32 } {
+    if (core.is_pmv2) {
+        return .{ .x = native_x, .y = native_y };
+    }
+    const s = effectiveContentScale(core.pending_content_scale);
+    return .{
+        .x = @intFromFloat(@floor(@as(f64, @floatFromInt(native_x)) * @as(f64, s))),
+        .y = @intFromFloat(@floor(@as(f64, @floatFromInt(native_y)) * @as(f64, s))),
+    };
+}
+
+/// raw physical 座標 (x,y) の MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は GetKeyState。
 /// 直近座標も更新する（focus/capture 喪失時の synthetic mouse_up が位置を引けるように）。
 fn mouseEventAt(core: *Core, x: i32, y: i32, button: MouseButton) MouseEvent {
     core.last_x = x;
@@ -901,20 +1235,20 @@ fn mouseEventAt(core: *Core, x: i32, y: i32, button: MouseButton) MouseEvent {
 }
 
 fn handleMotion(core: *Core, lparam: LPARAM) void {
-    core.enqueue(.{ .mouse_move = mouseEventAt(core, loShort(lparam), hiShort(lparam), .none) });
+    const raw = nativeToRawPhysical(core, loShort(lparam), hiShort(lparam));
+    core.enqueue(.{ .mouse_move = mouseEventAt(core, raw.x, raw.y, .none) });
 }
 
 fn handleButton(core: *Core, mb: MouseButton, down: bool, lparam: LPARAM) void {
     const had_any = anyButton(core.buttons);
     setButton(core, mb, down); // post-state にしてから event を作る
-    const x = loShort(lparam);
-    const y = hiShort(lparam);
+    const raw = nativeToRawPhysical(core, loShort(lparam), hiShort(lparam));
     if (down) {
         // ドラッグがウィンドウ外へ出ても move を受け取れるよう capture（X11 と違い Win32 は明示）。
         if (!had_any) _ = SetCapture(core.hwnd);
-        core.enqueue(.{ .mouse_down = mouseEventAt(core, x, y, mb) });
+        core.enqueue(.{ .mouse_down = mouseEventAt(core, raw.x, raw.y, mb) });
     } else {
-        core.enqueue(.{ .mouse_up = mouseEventAt(core, x, y, mb) });
+        core.enqueue(.{ .mouse_up = mouseEventAt(core, raw.x, raw.y, mb) });
         if (!anyButton(core.buttons)) _ = ReleaseCapture();
     }
 }
@@ -939,15 +1273,16 @@ fn releaseHeldButtons(core: *Core) void {
 fn handleWheel(core: *Core, hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizontal: bool) void {
     const wp: usize = @bitCast(wparam);
     const delta: i32 = @as(i16, @bitCast(@as(u16, @truncate(wp >> 16)))); // HIWORD(wParam) signed
-    // wheel の座標は screen 座標なので client へ変換する。
+    // wheel の座標は screen 座標なので client へ変換し、さらに raw physical 化する。
     var pt = POINT{ .x = loShort(lparam), .y = hiShort(lparam) };
     _ = ScreenToClient(hwnd, &pt);
-    core.last_x = pt.x;
-    core.last_y = pt.y;
+    const raw = nativeToRawPhysical(core, pt.x, pt.y);
+    core.last_x = raw.x;
+    core.last_y = raw.y;
     const d = input.wheelDelta(delta, horizontal);
     core.enqueue(.{ .mouse_scroll = .{
-        .x = pt.x,
-        .y = pt.y,
+        .x = raw.x,
+        .y = raw.y,
         .dx = d.dx,
         .dy = d.dy,
         .is_precise = false,
@@ -1063,4 +1398,45 @@ fn utf16zToUtf8(gpa: std.mem.Allocator, buf: []const u16) (DialogError || std.me
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.DialogFailed,
     };
+}
+
+// ============================================================================
+// TASK-156.5 Stage 4: R9 構造的ユニットテスト（X11 Stage 2 と bit 一致）
+// ============================================================================
+
+test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず logical を返す" {
+    const logical: WindowSize = .{ .width = 800, .height = 600 };
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 };
+    for (scales) |s| {
+        const fb = effectiveFramebufferSize(.logical, logical, s);
+        try std.testing.expectEqual(logical.width, fb.width);
+        try std.testing.expectEqual(logical.height, fb.height);
+    }
+}
+
+test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を適用する" {
+    const logical: WindowSize = .{ .width = 800, .height = 600 };
+    const fb2 = effectiveFramebufferSize(.physical, logical, 2.0);
+    try std.testing.expectEqual(@as(u32, 1600), fb2.width);
+    try std.testing.expectEqual(@as(u32, 1200), fb2.height);
+
+    const fb15 = effectiveFramebufferSize(.physical, logical, 1.5);
+    try std.testing.expectEqual(@as(u32, 1200), fb15.width);
+    try std.testing.expectEqual(@as(u32, 900), fb15.height);
+}
+
+test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ" {
+    try std.testing.expectEqual(@as(u32, 1), roundToPhysicalPx(0, 2.0)); // 0*2→0 → clamp to 1
+    try std.testing.expectEqual(@as(u32, 1600), roundToPhysicalPx(800, 2.0));
+    try std.testing.expectEqual(@as(u32, 1200), roundToPhysicalPx(800, 1.5));
+    try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, 0.0)); // invalid scale → 1.0
+    try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, std.math.nan(f32)));
+}
+
+test "TASK-156.5: effectiveContentScale は非正・非有限を 1.0 に補正" {
+    try std.testing.expectEqual(@as(f32, 2.0), effectiveContentScale(2.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.inf(f32)));
 }

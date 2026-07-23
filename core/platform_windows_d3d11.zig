@@ -385,17 +385,37 @@ pub const Window = struct {
         return self.core.getEventStats();
     }
 
+    /// 現在の negotiated logical size（TASK-156.5 Stage 4）。frame 中の描画は Framebuffer snapshot を使う。
+    pub fn logicalSize(self: Window) @import("platform_types").WindowSize {
+        const core = self.core;
+        return .{ .width = core.logical_width, .height = core.logical_height };
+    }
+
+    /// 現在の negotiated framebuffer size（物理px。`.logical` では logical と同値）。
+    pub fn framebufferSize(self: Window) @import("platform_types").WindowSize {
+        const core = self.core;
+        return .{ .width = core.width, .height = core.height };
+    }
+
+    /// 現在の negotiated content scale（query 用。pending。lock 前の入力正規化と一致）。
+    pub fn contentScale(self: Window) f32 {
+        return common.effectiveContentScale(self.core.pending_content_scale);
+    }
+
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
         const core = self.core;
-        const size: @import("platform_types").WindowSize = .{ .width = core.width, .height = core.height };
+        // TASK-156.5 Stage 4: pending（WM_SIZE / WM_DPICHANGED）を latch。ホットパス宣言: lock 境界のみ。
+        core.applyLatchedMetricsIfNeeded();
+        const logical: @import("platform_types").WindowSize = .{ .width = core.logical_width, .height = core.logical_height };
+        const fb_size: @import("platform_types").WindowSize = .{ .width = core.width, .height = core.height };
         return .{
             .pixels = core.backing,
             .width = core.width,
             .height = core.height,
-            .logical_size = size,
-            .framebuffer_size = size,
-            .content_scale = 1.0,
-            .scale_epoch = 0,
+            .logical_size = logical,
+            .framebuffer_size = fb_size,
+            .content_scale = common.effectiveContentScale(core.content_scale),
+            .scale_epoch = core.scale_epoch,
             .state = core,
         };
     }
