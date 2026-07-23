@@ -5219,6 +5219,15 @@ fn registerPatchActions(app: *App) void {
         .args = &.{},
         .desc = "Sugiyama layered layout of display graph (real nodes + collapsed boxes)",
     });
+    // TASK-173.4: 選択表示ノードのみトポロジー無視グリッド（local_only・引数なし）
+    platform.registerAction(.{
+        .name = "auto_layout_selected",
+        .ctx = app,
+        .run = actionAutoLayoutSelected,
+        .network_policy = .local_only,
+        .args = &.{},
+        .desc = "simple grid pack of selected display nodes (topology ignored)",
+    });
 }
 
 /// 表示グラフに Sugiyama 系レイヤードレイアウトを適用する（action / 起動時初期配置の共有本体）。
@@ -5286,6 +5295,66 @@ fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     _ = args;
     _ = buf;
     runAutoLayout(actionApp(ctx));
+    return "ok";
+}
+
+/// multi_selected を最優先し、空なら App.selected の .node/.group を単体対象にする。
+/// 表示 nodes に存在する handle だけを out へ書き、件数を返す（.port/.cable/null は 0）。
+fn collectSelectedLayoutTargets(app: *const App, nodes: []const NodeGeom, out: []Handle) usize {
+    var n: usize = 0;
+    if (!selection.empty(&app.multi_selected)) {
+        for (nodes) |ng| {
+            if (!selection.contains(&app.multi_selected, ng.handle)) continue;
+            if (n >= out.len) break;
+            out[n] = ng.handle;
+            n += 1;
+        }
+        return n;
+    }
+    if (app.selected) |it| switch (it) {
+        .node => |h| {
+            if (findNode(nodes, h) == null) return 0;
+            if (out.len == 0) return 0;
+            out[0] = h;
+            return 1;
+        },
+        .group => |gid| {
+            const h = group.handleOfGroup(gid);
+            if (findNode(nodes, h) == null) return 0;
+            if (out.len == 0) return 0;
+            out[0] = h;
+            return 1;
+        },
+        .port, .cable => return 0,
+    };
+    return 0;
+}
+
+/// 選択表示ノードのみ単純グリッド配置（TASK-173.4）。0 件は empty_selection、1 件は no-op 成功。
+/// ホットパス: action 呼び出し時のみ。camera fit / undo / ヘッダー追従は行わない。
+fn runAutoLayoutSelected(app: *App) anyerror!void {
+    var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
+    const n_nodes = app.buildNodes(&node_buf);
+    var targets: [MAX_MODULES + group.MAX_GROUPS]Handle = undefined;
+    const n_targets = collectSelectedLayoutTargets(app, node_buf[0..n_nodes], targets[0..]);
+    if (n_targets == 0) {
+        platform.setActionErrorDetail("empty_selection", "select one or more display nodes");
+        return error.EmptySelection;
+    }
+    if (n_targets == 1) return;
+    layout_mod.applySelectedGrid(
+        node_buf[0..n_nodes],
+        targets[0..n_targets],
+        app.layout[0..],
+        &app.ledger,
+    );
+}
+
+/// `auto_layout_selected`: runAutoLayoutSelected の薄いラッパー。
+fn actionAutoLayoutSelected(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = args;
+    _ = buf;
+    try runAutoLayoutSelected(actionApp(ctx));
     return "ok";
 }
 

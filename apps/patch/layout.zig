@@ -4,7 +4,8 @@
 //! 実ノードは layout[handle]、畳みマクロ箱は ledger.groups[gid].pos、展開中マクロのヘッダーは
 //! メンバー bbox に追従させる。
 //!
-//! ホットパス宣言: auto_layout action 呼び出し時のみ（イベント時）。フレーム毎描画・RT 経路には触れない。
+//! ホットパス宣言: auto_layout / auto_layout_selected action 呼び出し時のみ（イベント時）。
+//! フレーム毎描画・RT 経路には触れない。
 //! platform / gui / modular を import しない純 Zig（canvas / group のみ。test-patch で単体テスト可）。
 
 const std = @import("std");
@@ -26,6 +27,131 @@ pub const ROW_GAP: f32 = 24;
 pub const EXPANDED_HEADER_MARGIN: f32 = 10;
 
 const MAX_NODES: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS;
+
+/// 選択表示ノードだけをトポロジー無視の単純グリッドへ再配置する（TASK-173.4）。
+///
+/// - `nodes`: 表示ノード全体（対象のみ pos を更新。未選択は不変）
+/// - `target_handles`: 再配置対象 handle（表示ノードとの照合済み想定）
+/// - `layout` / `ledger`: 対象限定の書き戻し（合成 handle は groups[gid].pos のみ）
+///
+/// 0〜1 件は no-op。`repositionExpandedHeaders` は呼ばない（未選択ヘッダーを動かさない）。
+/// ホットパス: action 呼び出し時のみ。edges / order_keys は参照しない。
+pub fn applySelectedGrid(
+    nodes: []NodeGeom,
+    target_handles: []const Handle,
+    layout: []Vec2f,
+    ledger: *group.Ledger,
+) void {
+    std.debug.assert(layout.len >= group.GROUP_HANDLE_BASE);
+    if (target_handles.len == 0) return;
+
+    // 対象 index 収集（表示 nodes 内で handle 一致したものだけ）
+    var target_idx: [MAX_NODES]u16 = undefined;
+    var tn: usize = 0;
+    for (nodes, 0..) |ng, i| {
+        if (!containsHandle(target_handles, ng.handle)) continue;
+        if (tn >= MAX_NODES) break;
+        target_idx[tn] = @intCast(i);
+        tn += 1;
+    }
+    if (tn <= 1) return; // 0 件（表示に無い）/ 1 件は no-op
+
+    // アンカー = 対象 bbox 左上、行バケット用 max_h
+    var anchor_x: f32 = nodes[target_idx[0]].pos.x;
+    var anchor_y: f32 = nodes[target_idx[0]].pos.y;
+    var max_h: f32 = canvas.nodeSize(nodes[target_idx[0]]).y;
+    var ti: usize = 1;
+    while (ti < tn) : (ti += 1) {
+        const ng = nodes[target_idx[ti]];
+        const sz = canvas.nodeSize(ng);
+        anchor_x = @min(anchor_x, ng.pos.x);
+        anchor_y = @min(anchor_y, ng.pos.y);
+        max_h = @max(max_h, sz.y);
+    }
+    const row_stride = max_h + ROW_GAP;
+
+    // 決定的ソート: row_bucket 昇順 → pos.x 昇順 → handle 昇順
+    const sort_ctx = SelectedSortCtx{
+        .nodes = nodes,
+        .anchor_y = anchor_y,
+        .row_stride = row_stride,
+    };
+    std.mem.sort(u16, target_idx[0..tn], sort_ctx, SelectedSortCtx.less);
+
+    // セルサイズ = 対象の最大幅・最大高
+    var cell_w: f32 = 0;
+    var cell_h: f32 = 0;
+    ti = 0;
+    while (ti < tn) : (ti += 1) {
+        const sz = canvas.nodeSize(nodes[target_idx[ti]]);
+        cell_w = @max(cell_w, sz.x);
+        cell_h = @max(cell_h, sz.y);
+    }
+
+    // cols = ceil(sqrt(n))、rows は ceil(n/cols) 相当で配置
+    const cols_f = @ceil(@sqrt(@as(f32, @floatFromInt(tn))));
+    const cols: usize = @max(@as(usize, @intFromFloat(cols_f)), 1);
+
+    ti = 0;
+    while (ti < tn) : (ti += 1) {
+        const col = ti % cols;
+        const row = ti / cols;
+        const ni = target_idx[ti];
+        nodes[ni].pos = .{
+            .x = anchor_x + @as(f32, @floatFromInt(col)) * (cell_w + COL_GAP),
+            .y = anchor_y + @as(f32, @floatFromInt(row)) * (cell_h + ROW_GAP),
+        };
+    }
+
+    writeBackTargets(nodes, target_handles, layout, ledger);
+}
+
+const SelectedSortCtx = struct {
+    nodes: []const NodeGeom,
+    anchor_y: f32,
+    row_stride: f32,
+
+    fn rowBucket(ctx: SelectedSortCtx, ni: u16) i32 {
+        const y = ctx.nodes[ni].pos.y;
+        return @intFromFloat(@floor((y - ctx.anchor_y) / ctx.row_stride));
+    }
+
+    fn less(ctx: SelectedSortCtx, a: u16, b: u16) bool {
+        const ra = ctx.rowBucket(a);
+        const rb = ctx.rowBucket(b);
+        if (ra != rb) return ra < rb;
+        const xa = ctx.nodes[a].pos.x;
+        const xb = ctx.nodes[b].pos.x;
+        if (xa != xb) return xa < xb;
+        return ctx.nodes[a].handle < ctx.nodes[b].handle;
+    }
+};
+
+fn containsHandle(handles: []const Handle, h: Handle) bool {
+    for (handles) |th| {
+        if (th == h) return true;
+    }
+    return false;
+}
+
+/// 対象 handle だけ writeBack（未選択の layout / group.pos は触らない）。
+fn writeBackTargets(
+    nodes: []const NodeGeom,
+    target_handles: []const Handle,
+    layout: []Vec2f,
+    ledger: *group.Ledger,
+) void {
+    for (nodes) |ng| {
+        if (!containsHandle(target_handles, ng.handle)) continue;
+        if (group.groupIdFromHandle(ng.handle)) |gid| {
+            if (gid < group.MAX_GROUPS and ledger.groups[gid].active) {
+                ledger.groups[gid].pos = ng.pos;
+            }
+        } else if (ng.handle < layout.len) {
+            layout[ng.handle] = ng.pos;
+        }
+    }
+}
 
 /// 表示グラフをレイヤードレイアウトし、layout / ledger へ書き戻す。
 ///
@@ -562,4 +688,278 @@ test "layout: caller origin_y is used as rank0 top Y" {
     try testing.expectApproxEqAbs(caller_origin_y, nodes[1].pos.y, 1e-4);
     try testing.expect(nodes[0].pos.y >= caller_origin_y);
     try testing.expect(nodes[1].pos.y >= caller_origin_y);
+}
+
+// ============================================================================
+// applySelectedGrid（TASK-173.4）
+// ============================================================================
+
+test "layout selected: empty targets leave nodes/layout/ledger unchanged" {
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 10, .y = 20 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 30, .y = 40 }, .n_in = 1, .n_out = 0 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 1, .y = 2 }} ** group.GROUP_HANDLE_BASE;
+    layout_arr[0] = .{ .x = 10, .y = 20 };
+    layout_arr[1] = .{ .x = 30, .y = 40 };
+    var ledger: group.Ledger = .{};
+    ledger.groups[0] = .{ .active = true, .collapsed = true, .pos = .{ .x = 99, .y = 88 } };
+    const nodes_before = nodes;
+    const layout_before = layout_arr;
+    const gpos_before = ledger.groups[0].pos;
+
+    applySelectedGrid(&nodes, &.{}, &layout_arr, &ledger);
+
+    try testing.expectEqual(nodes_before[0].pos.x, nodes[0].pos.x);
+    try testing.expectEqual(nodes_before[0].pos.y, nodes[0].pos.y);
+    try testing.expectEqual(nodes_before[1].pos.x, nodes[1].pos.x);
+    try testing.expectEqual(nodes_before[1].pos.y, nodes[1].pos.y);
+    try testing.expectEqual(layout_before[0].x, layout_arr[0].x);
+    try testing.expectEqual(layout_before[1].y, layout_arr[1].y);
+    try testing.expectEqual(gpos_before.x, ledger.groups[0].pos.x);
+    try testing.expectEqual(gpos_before.y, ledger.groups[0].pos.y);
+}
+
+test "layout selected: single target is no-op" {
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 55, .y = 66 }, .n_in = 0, .n_out = 0 },
+        .{ .handle = 1, .pos = .{ .x = 100, .y = 200 }, .n_in = 0, .n_out = 0 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    layout_arr[0] = .{ .x = 55, .y = 66 };
+    layout_arr[1] = .{ .x = 100, .y = 200 };
+    var ledger: group.Ledger = .{};
+    const pos0 = nodes[0].pos;
+    const pos1 = nodes[1].pos;
+
+    applySelectedGrid(&nodes, &.{0}, &layout_arr, &ledger);
+
+    try testing.expectApproxEqAbs(pos0.x, nodes[0].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(pos0.y, nodes[0].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(pos1.x, nodes[1].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(pos1.y, nodes[1].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(55, layout_arr[0].x, 1e-4);
+    try testing.expectApproxEqAbs(100, layout_arr[1].x, 1e-4);
+}
+
+test "layout selected: multi grid keeps anchor, max cell size, and gaps" {
+    // 3 選択 + 1 未選択。cols = ceil(sqrt(3)) = 2。
+    // 位置: A(100,50), B(180,55), C(120,200) → anchor=(100,50)
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 100, .y = 50 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 180, .y = 55 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 120, .y = 200 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 3, .pos = .{ .x = 900, .y = 900 }, .n_in = 0, .n_out = 0 }, // unselected
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+    const unsel_before = nodes[3].pos;
+    layout_arr[3] = unsel_before;
+
+    applySelectedGrid(&nodes, &.{ 0, 1, 2 }, &layout_arr, &ledger);
+
+    const cell_w = canvas.NODE_W; // 全 node 同幅
+    const cell_h = canvas.nodeSize(nodes[0]).y; // n_out=1 は同高
+    // ソート後: row0 は A then B、row1 は C → 配置 index 0=A, 1=B, 2=C
+    try testing.expectApproxEqAbs(100, nodes[0].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(50, nodes[0].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(100 + cell_w + COL_GAP, nodes[1].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(50, nodes[1].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(100, nodes[2].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(50 + cell_h + ROW_GAP, nodes[2].pos.y, 1e-4);
+    // layout 書き戻し
+    try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[0].x, 1e-4);
+    try testing.expectApproxEqAbs(nodes[1].pos.x, layout_arr[1].x, 1e-4);
+    try testing.expectApproxEqAbs(nodes[2].pos.y, layout_arr[2].y, 1e-4);
+    // 未選択不変
+    try testing.expectApproxEqAbs(unsel_before.x, nodes[3].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(unsel_before.y, nodes[3].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(unsel_before.x, layout_arr[3].x, 1e-4);
+}
+
+test "layout selected: sort order is row_bucket then x then handle" {
+    // 同一 row バケット内: x が同じなら handle 昇順。Y 差が row_stride 未満で同 bucket。
+    var nodes = [_]NodeGeom{
+        .{ .handle = 5, .pos = .{ .x = 200, .y = 10 }, .n_in = 0, .n_out = 0 },
+        .{ .handle = 3, .pos = .{ .x = 100, .y = 12 }, .n_in = 0, .n_out = 0 },
+        .{ .handle = 7, .pos = .{ .x = 100, .y = 11 }, .n_in = 0, .n_out = 0 }, // same x as 3, higher handle
+        .{ .handle = 1, .pos = .{ .x = 50, .y = 300 }, .n_in = 0, .n_out = 0 }, // lower row bucket later → row1
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+
+    applySelectedGrid(&nodes, &.{ 5, 3, 7, 1 }, &layout_arr, &ledger);
+
+    // cols = ceil(sqrt(4)) = 2。row0: handle3 (x=100), handle7 (x=100,h>3), handle5 (x=200)
+    // wait: sort is x then handle. So row0: (100,h3), (100,h7), (200,h5) — that's 3 in row0 before
+    // row_bucket for h1 is higher so it goes last.
+    // With 4 items and cols=2: index0=h3, index1=h7, index2=h5, index3=h1
+    const cell_w = canvas.NODE_W;
+    const cell_h = canvas.nodeSize(nodes[1]).y; // any — same size
+    const ax: f32 = 50; // min x is h1's 50... wait min of ALL targets
+    // anchor_x = min(50,100,100,200)=50, anchor_y=min(10,12,11,300)=10
+    try testing.expectApproxEqAbs(50, nodes[1].pos.x, 1e-3); // handle 3 at index 0?
+    // Actually after sort order of indices by (bucket,x,handle):
+    // h3: bucket0, x100
+    // h7: bucket0, x100
+    // h5: bucket0, x200
+    // h1: bucket for y=300
+    // Place:
+    // [0]=h3 at (50, 10)
+    // [1]=h7 at (50+cell_w+COL_GAP, 10)
+    // [2]=h5 at (50, 10+cell_h+ROW_GAP)
+    // [3]=h1 at (50+cell_w+COL_GAP, 10+cell_h+ROW_GAP)
+    _ = ax;
+    try testing.expectApproxEqAbs(50, findNode(&nodes, 3).?.pos.x, 1e-3);
+    try testing.expectApproxEqAbs(10, findNode(&nodes, 3).?.pos.y, 1e-3);
+    try testing.expectApproxEqAbs(50 + cell_w + COL_GAP, findNode(&nodes, 7).?.pos.x, 1e-3);
+    try testing.expectApproxEqAbs(10, findNode(&nodes, 7).?.pos.y, 1e-3);
+    try testing.expectApproxEqAbs(50, findNode(&nodes, 5).?.pos.x, 1e-3);
+    try testing.expectApproxEqAbs(10 + cell_h + ROW_GAP, findNode(&nodes, 5).?.pos.y, 1e-3);
+    try testing.expectApproxEqAbs(50 + cell_w + COL_GAP, findNode(&nodes, 1).?.pos.x, 1e-3);
+    try testing.expectApproxEqAbs(10 + cell_h + ROW_GAP, findNode(&nodes, 1).?.pos.y, 1e-3);
+}
+
+test "layout selected: unselected node and layout sentinel stay fixed" {
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 0 },
+        .{ .handle = 1, .pos = .{ .x = 200, .y = 0 }, .n_in = 0, .n_out = 0 },
+        .{ .handle = 2, .pos = .{ .x = 400, .y = 400 }, .n_in = 0, .n_out = 0 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 77, .y = 88 }} ** group.GROUP_HANDLE_BASE;
+    layout_arr[0] = .{ .x = 0, .y = 0 };
+    layout_arr[1] = .{ .x = 200, .y = 0 };
+    layout_arr[2] = .{ .x = 400, .y = 400 };
+    const sentinel = layout_arr[10];
+    var ledger: group.Ledger = .{};
+
+    applySelectedGrid(&nodes, &.{ 0, 1 }, &layout_arr, &ledger);
+
+    try testing.expectApproxEqAbs(400, nodes[2].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(400, nodes[2].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(400, layout_arr[2].x, 1e-4);
+    try testing.expectApproxEqAbs(sentinel.x, layout_arr[10].x, 1e-4);
+    try testing.expectApproxEqAbs(sentinel.y, layout_arr[10].y, 1e-4);
+}
+
+test "layout selected: real node vs collapsed group writeback separation" {
+    const gid: group.GroupId = 1;
+    const box_h = group.handleOfGroup(gid);
+    var nodes = [_]NodeGeom{
+        .{ .handle = 4, .pos = .{ .x = 10, .y = 20 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = box_h, .pos = .{ .x = 300, .y = 20 }, .n_in = 1, .n_out = 0, .grid_rows = 2 },
+        .{ .handle = 8, .pos = .{ .x = 800, .y = 800 }, .n_in = 0, .n_out = 0 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 5, .y = 5 }} ** group.GROUP_HANDLE_BASE;
+    layout_arr[4] = .{ .x = 10, .y = 20 };
+    layout_arr[8] = .{ .x = 800, .y = 800 };
+    var ledger: group.Ledger = .{};
+    ledger.groups[gid] = .{ .active = true, .collapsed = true, .pos = .{ .x = 300, .y = 20 } };
+    const layout8_before = layout_arr[8];
+    const layout0_before = layout_arr[0];
+
+    applySelectedGrid(&nodes, &.{ 4, box_h }, &layout_arr, &ledger);
+
+    try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[4].x, 1e-4);
+    try testing.expectApproxEqAbs(nodes[0].pos.y, layout_arr[4].y, 1e-4);
+    try testing.expectApproxEqAbs(nodes[1].pos.x, ledger.groups[gid].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(nodes[1].pos.y, ledger.groups[gid].pos.y, 1e-4);
+    // 未選択 real handle と無関係スロット不変
+    try testing.expectApproxEqAbs(layout8_before.x, layout_arr[8].x, 1e-4);
+    try testing.expectApproxEqAbs(layout0_before.x, layout_arr[0].x, 1e-4);
+    try testing.expectApproxEqAbs(800, nodes[2].pos.x, 1e-4);
+}
+
+test "layout selected: synthetic handle never mutates layout array" {
+    const gid: group.GroupId = 0;
+    const box_h = group.handleOfGroup(gid);
+    var nodes = [_]NodeGeom{
+        .{ .handle = box_h, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 0, .grid_rows = 2 },
+        .{ .handle = group.handleOfGroup(1), .pos = .{ .x = 200, .y = 0 }, .n_in = 0, .n_out = 0, .grid_rows = 2 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 3, .y = 4 }} ** group.GROUP_HANDLE_BASE;
+    const before = layout_arr;
+    var ledger: group.Ledger = .{};
+    ledger.groups[0] = .{ .active = true, .collapsed = true, .pos = .{ .x = 0, .y = 0 } };
+    ledger.groups[1] = .{ .active = true, .collapsed = true, .pos = .{ .x = 200, .y = 0 } };
+
+    applySelectedGrid(&nodes, &.{ box_h, group.handleOfGroup(1) }, &layout_arr, &ledger);
+
+    for (before, layout_arr) |b, a| {
+        try testing.expectEqual(b.x, a.x);
+        try testing.expectEqual(b.y, a.y);
+    }
+    try testing.expectApproxEqAbs(nodes[0].pos.x, ledger.groups[0].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(nodes[1].pos.x, ledger.groups[1].pos.x, 1e-4);
+}
+
+test "layout selected: moving expanded members leaves unselected header unchanged" {
+    const gid: group.GroupId = 0;
+    var nodes = [_]NodeGeom{
+        .{ .handle = 10, .pos = .{ .x = 100, .y = 100 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 11, .pos = .{ .x = 250, .y = 100 }, .n_in = 1, .n_out = 0 },
+        .{ .handle = 20, .pos = .{ .x = 500, .y = 500 }, .n_in = 0, .n_out = 0 }, // unselected outside
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+    const header_before = Vec2f{ .x = 90, .y = 60 };
+    ledger.groups[gid] = .{
+        .active = true,
+        .collapsed = false,
+        .pos = header_before,
+        .kind = .drum_machine,
+    };
+    ledger.assign(10, gid);
+    ledger.assign(11, gid);
+
+    applySelectedGrid(&nodes, &.{ 10, 11 }, &layout_arr, &ledger);
+
+    // repositionExpandedHeaders を呼ばないのでヘッダー不変
+    try testing.expectApproxEqAbs(header_before.x, ledger.groups[gid].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(header_before.y, ledger.groups[gid].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(500, nodes[2].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(500, nodes[2].pos.y, 1e-4);
+}
+
+test "layout selected: selected rectangles do not overlap" {
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 3 },
+        .{ .handle = 1, .pos = .{ .x = 5, .y = 5 }, .n_in = 2, .n_out = 2 },
+        .{ .handle = 2, .pos = .{ .x = 10, .y = 10 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 3, .pos = .{ .x = 15, .y = 15 }, .n_in = 0, .n_out = 0 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+
+    applySelectedGrid(&nodes, &.{ 0, 1, 2, 3 }, &layout_arr, &ledger);
+
+    var i: usize = 0;
+    while (i < nodes.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < nodes.len) : (j += 1) {
+            try testing.expect(!rectsOverlap(nodes[i], nodes[j]));
+        }
+    }
+}
+
+test "layout selected: topology-agnostic — same positions yield same result" {
+    // 接続の有無に依存しない（edges を受け取らない API）。同じ初期位置なら結果同一。
+    var a = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 40 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 200, .y = 50 }, .n_in = 1, .n_out = 0 },
+        .{ .handle = 2, .pos = .{ .x = 60, .y = 180 }, .n_in = 0, .n_out = 0 },
+    };
+    var b = a;
+    var la = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var lb = la;
+    var ledger_a: group.Ledger = .{};
+    var ledger_b: group.Ledger = .{};
+
+    applySelectedGrid(&a, &.{ 0, 1, 2 }, &la, &ledger_a);
+    applySelectedGrid(&b, &.{ 0, 1, 2 }, &lb, &ledger_b);
+
+    for (a, b) |na, nb| {
+        try testing.expectApproxEqAbs(na.pos.x, nb.pos.x, 1e-4);
+        try testing.expectApproxEqAbs(na.pos.y, nb.pos.y, 1e-4);
+    }
 }
