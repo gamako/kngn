@@ -2099,6 +2099,13 @@ pub fn build(b: *std.Build) void {
     const bench_yuyv_step = b.step("bench-yuyv", "Run YUYV to BGRA micro-benchmark (ReleaseFast)");
     bench_yuyv_step.dependOn(&b.addRunArtifact(bench_yuyv_exe).step);
 
+    // bench-gui/-gui-frame/-blit/-viz が共有するピークメモリ計測 allocator（TASK-156.5 R10）
+    const bench_peak_allocator_mod = b.createModule(.{
+        .root_source_file = b.path("bench/peak_allocator.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
     // bench 用に dsp/synth を ReleaseFast で独立生成（shared_modules の共有インスタンスは
     // 通常ビルドの optimize を引き継ぐため使わない）
     const bench_dsp_mod = b.createModule(.{
@@ -2137,6 +2144,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_gui_root.addImport("gui", bench_gui_mod);
+    bench_gui_root.addImport("peak_allocator", bench_peak_allocator_mod);
     const bench_gui_exe = b.addExecutable(.{ .name = "bench_gui", .root_module = bench_gui_root });
     const bench_gui_step = b.step("bench-gui", "Run GUI render (rect/image/text) micro-benchmark (ReleaseFast)");
     bench_gui_step.dependOn(&b.addRunArtifact(bench_gui_exe).step);
@@ -2148,6 +2156,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_gui_frame_root.addImport("gui", bench_gui_mod);
+    bench_gui_frame_root.addImport("peak_allocator", bench_peak_allocator_mod);
     const bench_gui_frame_exe = b.addExecutable(.{ .name = "bench_gui_frame", .root_module = bench_gui_frame_root });
     const bench_gui_frame_step = b.step("bench-gui-frame", "Run GUI full Context frame benchmark 500/1000 rows (ReleaseFast)");
     bench_gui_frame_step.dependOn(&b.addRunArtifact(bench_gui_frame_exe).step);
@@ -2212,6 +2221,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_blit_root.addImport("blit", bench_blit_mod);
     bench_blit_root.addImport("paint", bench_blit_core);
+    bench_blit_root.addImport("peak_allocator", bench_peak_allocator_mod);
     const bench_blit_exe = b.addExecutable(.{ .name = "bench_blit", .root_module = bench_blit_root });
     const bench_blit_step = b.step("bench-blit", "Run pixie canvas blit/checker micro-benchmark (ReleaseFast)");
     bench_blit_step.dependOn(&b.addRunArtifact(bench_blit_exe).step);
@@ -2236,6 +2246,7 @@ pub fn build(b: *std.Build) void {
     bench_viz_root.addImport("gui", bench_gui_mod);
     bench_viz_root.addImport("spectrogram", bench_viz_spec);
     bench_viz_root.addImport("scope", bench_viz_scope);
+    bench_viz_root.addImport("peak_allocator", bench_peak_allocator_mod);
     const bench_viz_exe = b.addExecutable(.{ .name = "bench_viz", .root_module = bench_viz_root });
     const bench_viz_step = b.step("bench-viz", "Run patch viz bitmap/image scale micro-benchmark (ReleaseFast)");
     bench_viz_step.dependOn(&b.addRunArtifact(bench_viz_exe).step);

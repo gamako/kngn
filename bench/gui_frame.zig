@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const gui = @import("gui");
+const peak_allocator = @import("peak_allocator");
 
 const W: u32 = 1024;
 const H: u32 = 768;
@@ -57,7 +58,9 @@ fn percentile95(sorted: []const u64) u64 {
     return sorted[rank - 1];
 }
 
-fn runScenario(io: std.Io, gpa: std.mem.Allocator, rows: usize, scale: f32) !void {
+fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows: usize, scale: f32) !void {
+    const gpa = tracker.allocator();
+    tracker.reset();
     var labels = try RowLabels.init(gpa, rows);
     defer labels.deinit(gpa);
 
@@ -104,7 +107,7 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, rows: usize, scale: f32) !voi
     const min_ns = samples[0];
     const p95 = percentile95(samples[0..]);
 
-    std.debug.print("gui.frame rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns\n", .{
+    std.debug.print("gui.frame rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
         rows,
         scale,
         pw,
@@ -114,21 +117,23 @@ fn runScenario(io: std.Io, gpa: std.mem.Allocator, rows: usize, scale: f32) !voi
         avg,
         min_ns,
         p95,
+        tracker.peak_bytes,
     });
 }
 
 pub fn main(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
+    var tracker = peak_allocator.PeakTrackingAllocator.init(debug_allocator.allocator());
     const io = init.io;
 
     std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, logical {d}x{d}) ===\n", .{ W, H });
     std.debug.print("measure: beginFrame + widget build + endFrame + gui.render (scale matrix)\n", .{});
     // TASK-156.4: scale 1x / 1.5x / 2x × rows 500/1000
+    // peak_bytes（TASK-156.5 R10）: runScenario 内で reset() してから測るシナリオ単体のピーク確保量
     for ([_]f32{ 1.0, 1.5, 2.0 }) |s| {
-        try runScenario(io, gpa, 500, s);
-        try runScenario(io, gpa, 1000, s);
+        try runScenario(io, &tracker, 500, s);
+        try runScenario(io, &tracker, 1000, s);
     }
     std.debug.print("\n", .{});
 }

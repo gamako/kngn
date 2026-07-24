@@ -5,6 +5,7 @@
 const std = @import("std");
 const blit = @import("blit");
 const core = @import("paint");
+const peak_allocator = @import("peak_allocator");
 
 const CANVAS_W: u32 = 256;
 const CANVAS_H: u32 = 256;
@@ -14,7 +15,8 @@ const FB_H: u32 = 600;
 pub fn main(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
+    var tracker = peak_allocator.PeakTrackingAllocator.init(debug_allocator.allocator());
+    const gpa = tracker.allocator();
     const io = init.io;
 
     const fb = try gpa.alloc(u32, FB_W * FB_H);
@@ -106,6 +108,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // TASK-156.4: physical canvas blit の scale matrix（1x / 1.5x / 2x）
+    // peak_bytes（TASK-156.5 R10）: `phys_fb` は 1.5x/2.0x で固定 2x サイズを共有再利用するため
+    // （既存 TASK-156.4 のタイミング計測方式。scale ごとに確保し直さない）、per-scale の内訳ではなく
+    // このセクション全体（=worst case である 2x 分の物理 fb 確保を含む）の単一ピーク値になる。
+    tracker.reset();
     {
         const scales = [_]f32{ 1.0, 1.5, 2.0 };
         const z = blit.Zoom.fromInteger(2);
@@ -158,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
             std.mem.doNotOptimizeAway(acc);
             std.debug.print("checker.physical scale={d:.1}  avg={d:>9} ns  min={d:>9} ns\n", .{ s, total / iters, min_ns });
         }
+        std.debug.print("blit.physical peak_bytes={d} (section-wide worst case; phys_fb {d}x{d} shared across 1.5x/2.0x)\n", .{ tracker.peak_bytes, phys_fb_w, phys_fb_h });
     }
     std.debug.print("\n", .{});
 }

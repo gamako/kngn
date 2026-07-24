@@ -165,6 +165,11 @@ var pending_listen_raw: ?[]const u8 = null; // env 値（存在時）。port 解
 var pending_manual_clock = false;
 var headless_active = false;
 
+// present 毎の frame copy をスキップする計測専用モード（TASK-156.5 R10。VP_HARNESS_SKIP_FRAME_COPY env）。
+// 既定 false で従来と bit 一致。有効時は `fb`/`canvas` 等の snapshot/digest が無効値になるが、
+// `digest stats` の frame カウンタは引き続き増分するため fps 計測には使える。
+var skip_frame_copy = false;
+
 // synthetic capture source（TASK-49.5）: harness 内蔵の偽 mic/camera。camera.zig/audio.zig への
 // facade 配線は無く、このモジュール内（`capture` コマンド + `capture` probe）で完結する。
 var capture_synthetic_requested = false; // VP_HARNESS_CAPTURE_SYNTHETIC env
@@ -473,6 +478,7 @@ pub fn parseConfig() void {
     if (getEnv("VP_HARNESS_OUT")) |d| out_dir = d;
 
     capture_synthetic_requested = getEnv("VP_HARNESS_CAPTURE_SYNTHETIC") != null;
+    skip_frame_copy = if (getEnv("VP_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
 }
 
 /// platform が `VP_HEADLESS=1` を確定したあと呼ぶ互換 setter（TASK-165）。
@@ -1010,7 +1016,14 @@ pub fn onStats(s: EventStats) void {
 }
 
 /// present 時にフレームを owned copy して確定し、frame_index を進める。
+/// `VP_HARNESS_SKIP_FRAME_COPY=1`（計測専用モード）時は copy をスキップし frame_index のみ進める
+/// （fb/canvas 等の snapshot/digest は無効値になるが、fps 計測に使う `digest stats` の frame は増分する）。
 pub fn onPresent() void {
+    if (skip_frame_copy) {
+        lock_valid = false;
+        frame_index += 1;
+        return;
+    }
     const n = @as(usize, lock_w) * @as(usize, lock_h);
     if (lock_valid and n > 0 and lock_pixels.len >= n) {
         if (frame_pixels.len < n) {
@@ -3064,6 +3077,7 @@ fn resetForTest() void {
     if (synth_audio) |dev| dev.close();
     synth_audio = null;
     capture_synthetic_requested = false;
+    skip_frame_copy = false;
     headless_active = false;
     freerun_reading = false;
     freerun_acc.clearRetainingCapacity();
@@ -3448,6 +3462,23 @@ test "仮想クロック: getTime = frame_index/60、present で進む" {
     try testing.expectEqual(@as(f64, 2.0 / 60.0), now());
     try testing.expect(have_frame);
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[0]);
+}
+
+test "skip_frame_copy: 有効時は frame_index のみ進み、@memcpy はスキップされる（TASK-156.5 R10）" {
+    resetForTest();
+    skip_frame_copy = true;
+    defer skip_frame_copy = false;
+    const px = [_]u32{0xFF445566};
+    onLock(&px, 1, 1);
+    onPresent();
+    try testing.expectEqual(@as(u64, 1), frame_index);
+    try testing.expectEqual(@as(f64, 1.0 / 60.0), now());
+    // フレームは owned copy されないため have_frame は立たない。
+    try testing.expect(!have_frame);
+    onLock(&px, 1, 1);
+    onPresent();
+    try testing.expectEqual(@as(u64, 2), frame_index);
+    try testing.expect(!have_frame);
 }
 
 test "lock miss: null lock 後の present は stale を再コピーしない" {

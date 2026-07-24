@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const gui = @import("gui");
+const peak_allocator = @import("peak_allocator");
 
 const W: u32 = 780;
 const H: u32 = 600;
@@ -20,7 +21,8 @@ const Scenario = enum {
 pub fn main(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
+    var tracker = peak_allocator.PeakTrackingAllocator.init(debug_allocator.allocator());
+    const gpa = tracker.allocator();
     const io = init.io;
 
     const pixels = try gpa.alloc(u32, W * H);
@@ -51,6 +53,8 @@ pub fn main(init: std.process.Init) !void {
         try buildScene(&dl, sc, img);
 
         for (scales) |s| {
+            // peak_bytes（TASK-156.5 R10）: この scale の物理 target 確保からのピーク
+            tracker.reset();
             const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * s));
             const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(H)) * s));
             const phys = try gpa.alloc(u32, pw * ph);
@@ -76,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
             std.mem.doNotOptimizeAway(acc);
 
             const avg = total_ns / iters;
-            std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns\n", .{ @tagName(sc), s, avg, min_ns });
+            std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}\n", .{ @tagName(sc), s, avg, min_ns, tracker.peak_bytes });
         }
     }
     // 互換: scale=1 単独行も残す（target は論理=物理）
