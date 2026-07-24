@@ -639,10 +639,15 @@ pub const Core = struct {
         };
         core.hwnd = hwnd;
 
-        // `.physical` で一時切替した thread awareness を起動時 context へ復元。
-        restoreThreadDpiAwareness();
-
         // 実 window awareness を確定し content_scale / fb 寸法を確定する（ホットパス宣言: 初期化時のみ）。
+        // 注意: thread awareness の復元（restoreThreadDpiAwareness）は、この後に続く
+        // GetClientRect/GetWindowRect/SetWindowPos（生成直後の寸法確認・補正）が**すべて終わってから**
+        // 行う。これらの API は「呼び出し元スレッドの DPI awareness」次第で返す/解釈する座標が
+        // 変わる（呼び出し元が非対応に戻っていると、対応先のウィンドウの物理px座標を「非対応向けに
+        // 仮想化（scale で割った）値」として返してしまう）。早すぎる復元は、生成直後の実サイズ確認が
+        // 常に scale 分の１に縮んで見える誤読を引き起こし、不要な補正 SetWindowPos を誘発する
+        // （実測で確認済み。GetDpiForWindow/GetWindowDpiAwarenessContext 自体は常に真の値を返すため
+        // 影響を受けない）。
         const win_ctx = GetWindowDpiAwarenessContext(hwnd);
         const is_pmv2 = isPmv2Context(win_ctx);
         core.is_pmv2 = is_pmv2;
@@ -726,6 +731,10 @@ pub const Core = struct {
         }
         core.metrics_dirty = false;
 
+        // `.physical` で一時切替した thread awareness を起動時 context へ復元する
+        // （上記の寸法確認・補正がすべて終わった後。早すぎる復元を避ける理由は上のコメント参照）。
+        restoreThreadDpiAwareness();
+
         // wndProc が Core を引けるよう GWLP_USERDATA に格納（CreateWindowExW 中の早期メッセージは
         // userdata 未設定 → DefWindowProcW に落ちるだけで、入力イベントは発生しない）。
         _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(core)));
@@ -779,18 +788,20 @@ pub const Core = struct {
         self.metrics_dirty = false;
     }
 
-    /// 現在のウィンドウ geometry（TASK-117）。位置=GetWindowRect、サイズ=GetClientRect。
+    /// 現在のウィンドウ geometry（TASK-117）。位置=GetWindowRect。
+    /// サイズ=論理サイズ（`self.logical_width/height`。TASK-156.5 Stage 4）。
+    /// **物理px（`GetClientRect`/`self.width/height`）を返してはいけない**——呼び出し元（pixie の
+    /// `window_state` 永続化等）は `getGeometry().size` を次回起動の `WindowOptions.size`
+    /// （＝論理サイズとして解釈される値）にそのまま渡す設計のため、ここで物理px を返すと
+    /// `.physical` window で「保存→次回起動時に論理値として誤読→さらにスケール倍→保存…」の
+    /// 無限増殖（scale^N）を引き起こす（X11 の `getGeometry` が既に同じ理由で論理サイズ返却に
+    /// 修正済み。Windows は Stage 4 でこの移植を欠落させていた）。
     pub fn getGeometry(self: *Core) types.WindowGeometry {
         var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        var cr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         const have_pos = GetWindowRect(self.hwnd, &wr) != 0;
-        const have_size = GetClientRect(self.hwnd, &cr) != 0;
         return .{
             .position = if (have_pos) .{ .x = wr.left, .y = wr.top } else null,
-            .size = if (have_size)
-                .{ .width = @intCast(cr.right - cr.left), .height = @intCast(cr.bottom - cr.top) }
-            else
-                .{ .width = self.width, .height = self.height },
+            .size = .{ .width = self.logical_width, .height = self.logical_height },
         };
     }
 
