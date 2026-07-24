@@ -975,6 +975,67 @@ script 自体がレシピの代替ではない。
 
 > 監査の詳細（既知ギャップ一覧と根拠 file:line）は backlog TASK-50〜61 の description を参照。
 
+### アプリ側フレームレートの実測（マイクロベンチと併せて必須）
+
+マイクロベンチは presentation 経路（CGImage/ColorSync 等）のコストを一切含まない。**アプリが描画から
+`present()` submit までを回す実フレームレートを必ず併せて測る**（TASK-156.4→156.6 の回帰＝マイクロベンチ
+全緑のまま実機で半減を見落とした実例）。free-run（実時間クロック）で `digest stats` の `frame` 差分を取る:
+
+```bash
+VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/x.port VP_HARNESS_SKIP_FRAME_COPY=1 \
+  zig build run-pixie -Doptimize=ReleaseFast &
+until [ -s /tmp/x.port ]; do sleep 0.1; done         # port file 出現待ち
+sleep 5                                              # warmup
+scripts/drive --port-file /tmp/x.port 'digest stats'  # 1回目
+sleep 10
+scripts/drive --port-file /tmp/x.port 'digest stats'  # 2回目。frame 差分 ÷ 経過秒 = fps
+scripts/drive --port-file /tmp/x.port 'quit'          # 終了は必ず quit（pkill しない）
+```
+
+- `frame` は **`present()` の呼び出し回数**（ADR-002/005 のとおり present は非ブロッキング submit）。
+  compositor が実際に表示した回数ではない。同 JSON の `virtual_fps` は仮想クロック由来の固定値なので**見ない**。
+- `VP_HARNESS_SKIP_FRAME_COPY=1` は harness の present 毎 copy を除外する計測専用モードで、**同じ実行では
+  `digest fb` が取れない**（fb 寸法は skip 無しの別実行で確認する）。
+
+**fps を比較するときは次の3条件を必ず揃える**（TASK-156.7 でこれを揃えず誤った結論を出した）:
+
+1. **最適化モード**: `zig build run-*` の既定は **Debug**。pixie / objc / retina / fb 3024x1744 の実測では
+   Debug 27.9fps に対し ReleaseFast 101fps（約 3.6 倍）。**60fps を要求するインタラクティブ確認・性能計測は
+   必ず `-Doptimize=ReleaseFast`**（倍率はアプリ・条件で変わるので毎回測る）。
+2. **fb 実寸**: `digest fb` の `WxH` を記録する（pixie は永続 window_state でサイズが変わる）。
+3. **display の有無**: `VP_HEADLESS=1` は present コストが無く fb も 1x なので、on-screen の `.physical` 2x とは
+   桁が違う（同 window で headless 1x ≒ 1020fps vs on-screen 2x ≒ 101fps）。混ぜて比較しない。
+
+**fps が出ない原因は描画コストと限らない**: apps/patch（objc / macOS / ReleaseFast / fb 1920x1520）は 2x でも
+描画 work は 5.9ms（sleep を外すと 169.3fps）だが、main loop の固定 `platform.frameDelay(16_000_000)` により
+実測 41.8fps になる。固定 sleep は作業時間を引かないので理想式でも `1/(5.9+16)ms ≒ 45.7fps` が上限で、実測 41.8fps
+との差は sleep のオーバースリープ等（deadline ベースに直しても `nanosleep` の約2ms 超過が残り 53.5fps）。
+pacing の正しい手本は `examples/04_fixed_timestep`（残り時間だけ sleep）。恒久修正は TASK-176。
+
+フレーム内の区間別内訳は `sample` より**区間計測**（フレーム本体の各段に `getTime()` を差し込む）が確実
+（`sample` では `@memset` 等がインライン帰属して「未特定」になる）。恒久機能化は TASK-175。
+
+### `.physical`（HiDPI）のフレーム予算で分かっていること（TASK-156.7 実測・2026-07-25）
+
+pixie / objc / ReleaseFast / fb 3024x1744（5.27Mpx）の区間計測（appFrameInner 内・300 フレーム平均）:
+全画素 clear 5.55ms / `gui.render` 1.85 / canvas blit 1.55 / checker 0.73 / buildUi+endFrame 0.12
+（区間合計 9.80ms。同条件の appFrameInner 全体は 10.43ms で差 0.63ms が present 等の未計測分。
+実 fps は別条件＝SKIP_FRAME_COPY=1 で 101fps）。**最大項は blit ではなく全画素 clear**。
+
+- **全画素 u32 fill を書くときは `@memset` を疑う**: aarch64-macos / zig 0.16 / ReleaseFast の実測では、
+  byte 反復しない u32 パターン（`COLOR_WINDOW_BG` 等）の `@memset` は libc memset に落ちずスカラー 4byte
+  ストアループになる（21.1MB で 1.66ms=12.7GB/s。clang の u32 ループ 0.64ms・`memset_pattern4` 0.42ms）。
+  1 行 `@memset` + 残り行 `@memcpy` に置き換える実験で **metal の clear 区間が 1.87→0.40ms**。
+- **objc/swift（CALayer + present 毎 CGImage）では fb 全ページの初回書き込みに約 4.3ms/frame 余分にかかる**
+  （metal には無い。4.3ms は行 `@memcpy` 実験時の clear 区間 objc 4.72ms − metal 0.40ms から。同一 memset の
+  1回目/2回目差分では 5.38−2.30=3.1ms）。**機序は未確定**（compositor との buffer ownership / COW /
+  ページ共有などが候補）。
+  観測事実は: 同一 memset の 2 回目は 5.38→2.30ms に落ちる / metal は 1 回目から 1.87ms /
+  `CGColorSpaceCreateDeviceRGB()` に戻すとこのコストは消えるが ColorSync 変換で 98.9→41.1fps に落ちる
+  （＝TASK-156.6 の修正を外すのは不可。変換コストは appFrameInner の外で払われるため区間計測に出ない）。
+- これは pixie / objc / 2x の 1 点測定であり、ADR-011 R10 が要求する性能マトリクス（1x/1.5x/2x ×
+  gui/font/canvas/viz × frame time + peak memory）の代わりにはならない。詳細は backlog TASK-156.7 の notes。
+
 ## よく使うコマンド
 
 ```bash
@@ -1021,6 +1082,9 @@ zig build bench-gui-frame       # gui full Context frame（beginFrame→構築�
 
 # Pixie エディタの実行（-Dplatform で objc/swift/metal 切替）
 zig build run-pixie
+# 注: 既定は Debug。retina の .physical 2x では体感が落ちる（実測 27.9fps。詳細は「性能規約」節）。
+#     滑らかさを見る / 性能を測るときは ReleaseFast:
+zig build run-pixie -Doptimize=ReleaseFast
 
 # Synth アプリの実行（PC キーボード演奏。A..K = C4..C5、ESC で終了）
 zig build run-synth
