@@ -111,7 +111,11 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         self.displayBuffer = self.buffer1
 
         // CGオブジェクトを初期化
-        self.colorSpace = CGColorSpaceCreateDeviceRGB()
+        // TASK-156.6 の教訓（objc .physical で実測・修正済み）: DeviceRGB は広色域ディスプレイで
+        // 毎フレーム ColorSync 変換を誘発し fps を大きく落とす（.physical で顕著）。
+        // 実際の画面の色空間に合わせて変換を回避する（objc の platform_macos.m と同型）。
+        let screenCS = NSScreen.main?.colorSpace
+        self.colorSpace = screenCS?.cgColorSpace ?? CGColorSpaceCreateDeviceRGB()
 
         // no-copy provider（objc 版 CGDataProviderCreateWithData と同型。TASK-55）。
         // バッファは view が所有するため releaseData は no-op。
