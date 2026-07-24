@@ -264,6 +264,7 @@ const Drag = union(enum) {
     // detach は接続済み入力を掴んだときのみ設定され、その時点で resolvePort 済み＝常に実 CableRef。
     cable: struct { origin: PortRef, detach: ?CableRef = null },
     /// 空白キャンバス左ドラッグの矩形選択（TASK-173.3）。additive=Shift/Cmd 押下時は集合へ追加。
+    /// Option(Alt) 押下時はこの variant にならず `.pan` になる（トラックパッド向けの pan 代替手段）。
     rect_select: struct { start_world: Vec2f, additive: bool },
 };
 
@@ -2398,8 +2399,12 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
     } else if (hitTestDisplayCable(mw, nodes, dedges)) |actual| {
         selection.clear(&app.multi_selected);
         app.selected = .{ .cable = actual };
+    } else if (modifiers.alt) {
+        // Option(Alt)+空白左ドラッグ = pan（中央ボタンと同じ経路。トラックパッドに物理中ボタンが無い
+        // Mac 向けの代替手段）。選択状態には触れない（中央ボタン pan と同じ規約）。
+        app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.toCanvasLocal(app.mouse) } };
     } else {
-        // 空白左ドラッグ = 矩形選択。pan は中央ボタンへ移行（TASK-173.3）。
+        // 空白左ドラッグ = 矩形選択。pan は中央ボタン or Option+左ドラッグへ移行（TASK-173.3）。
         if (!multi_mod) {
             selection.clear(&app.multi_selected);
             app.selected = null;
