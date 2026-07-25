@@ -193,6 +193,8 @@ const WIN_H = 760;
 const BG: u32 = 0xFF12161B;
 
 // ---- 可視化帯（C: master scope/spectrogram/level meter）。画面下端の固定帯。----
+/// 目標フレーム周期（60fps）。pacing は deadline ベース（TASK-176）。
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
 const VIS_H = 150; // 帯の高さ（キャンバス有効領域 = fb_h - VIS_H）
 const VIS_LABEL_H = 16; // 帯上端のラベル行
 const VIS_MARGIN = 6; // 帯内の下端余白
@@ -3171,6 +3173,12 @@ pub fn main(init: std.process.Init) !void {
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
     main_loop: while (app.running and window.pollEvents()) {
+        // TASK-176: deadline ベース pacing。**lockFramebuffer が null で continue する経路でも
+        // 1 回だけ待つ**よう loop body 先頭で defer 登録する（旧: 末尾の固定 frameDelay(16ms) は
+        // lock miss 時に通らず busy loop になっていた）。defer は LIFO なので内側ブロックの
+        // fb.unlock() より後に走る＝framebuffer lock 中に sleep しない。
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
         // イベント時のみ: MIDI FIFO drain（空なら即 return。フレーム毎の常時走査ではない）。
         drainMidiEvents(&app, &midi_device);
         {
@@ -3381,7 +3389,7 @@ pub fn main(init: std.process.Init) !void {
         // TASK-106.1: evolve authority と host pattern_state 配信（main thread イベント境界のみ）。
         updateEvolveAuthority(&app);
         maybeBroadcastPatternState(&app);
-        platform.frameDelay(16_000_000);
+        // pacing は loop body 先頭の defer（framePaceUntil）が担う（TASK-176）。
     }
     // panel/slot 状態を Preferences へ保存（終了時）。
     persistPanelPrefs(&app);

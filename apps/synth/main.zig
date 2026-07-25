@@ -33,6 +33,8 @@ const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 // 可視化帯(y 300〜420, h 120)を横に分割: スペクトログラム / オシロスコープ / レベルメータ。
 const WIN_W = 1080;
 const WIN_H = 520;
+/// 目標フレーム周期（60fps）。pacing は deadline ベース（TASK-176）。
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
 const SPEC_X0 = 20;
 const SPEC_Y0 = 300;
 const SPEC_W = 680;
@@ -90,8 +92,8 @@ const App = struct {
         appDeinit(self);
     }
     pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
-        _ = now;
-        return appFrame(self, win);
+        // `now` は app_runtime が pollEvents 後に取得したフレーム起点。pacing の deadline 基準に使う（TASK-176）。
+        return appFrame(self, win, now);
     }
 };
 
@@ -361,13 +363,13 @@ fn appDeinit(self: *App) void {
     self.gpa.destroy(self);
 }
 
-fn appFrame(self: *App, window: *platform.Window) !bool {
+fn appFrame(self: *App, window: *platform.Window, frame_t0: f64) !bool {
     var running = true;
-    const fb = window.lockFramebuffer() orelse {
-        // frame slot 無し（retry 可）。native はほぼ常に non-null。
-        platform.frameDelay(16_000_000);
-        return true;
-    };
+    // TASK-176: deadline ベース pacing。**lockFramebuffer が null の早期 return 経路でも 1 回だけ待つ**よう
+    // lock より前に defer 登録する。defer は LIFO なので fb.unlock() の後に走る
+    // ＝framebuffer lock 中に sleep しない（buffer ownership 契約との整合）。
+    defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+    const fb = window.lockFramebuffer() orelse return true; // frame slot 無し（retry 可）
     defer fb.unlock();
 
     self.ctx.beginFrame(fb.width, fb.height);
@@ -499,7 +501,7 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
     gui.render(target, &self.ctx.draw_list, self.ctx.font, 1.0);
 
     window.present();
-    platform.frameDelay(16_000_000); // ~16ms（約 60fps）。wasm では rAF 律速なので実質 no-op 相当
+    // pacing は関数先頭の defer（framePaceUntil）が担う（TASK-176。wasm では rAF 律速で実質 no-op）。
     return running;
 }
 

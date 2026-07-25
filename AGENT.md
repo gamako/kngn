@@ -1006,11 +1006,25 @@ scripts/drive --port-file /tmp/x.port 'quit'          # 終了は必ず quit（p
 3. **display の有無**: `VP_HEADLESS=1` は present コストが無く fb も 1x なので、on-screen の `.physical` 2x とは
    桁が違う（同 window で headless 1x ≒ 1020fps vs on-screen 2x ≒ 101fps）。混ぜて比較しない。
 
-**fps が出ない原因は描画コストと限らない**: apps/patch（objc / macOS / ReleaseFast / fb 1920x1520）は 2x でも
-描画 work は 5.9ms（sleep を外すと 169.3fps）だが、main loop の固定 `platform.frameDelay(16_000_000)` により
-実測 41.8fps になる。固定 sleep は作業時間を引かないので理想式でも `1/(5.9+16)ms ≒ 45.7fps` が上限で、実測 41.8fps
-との差は sleep のオーバースリープ等（deadline ベースに直しても `nanosleep` の約2ms 超過が残り 53.5fps）。
-pacing の正しい手本は `examples/04_fixed_timestep`（残り時間だけ sleep）。恒久修正は TASK-176。
+**fps が出ない原因は描画コストと限らない（frame pacing。TASK-176）**: 固定 sleep（`platform.frameDelay(16ms)`）は
+フレーム作業時間を引かないので `fps = 1/(work + 16ms + OS の timer slack)` になる（apps/patch は 2x でも描画 work
+5.9ms なのに実測 41.8fps だった）。**apps は `platform.framePaceUntil(frame_t0 + 1.0/60.0)` を使う**
+（deadline ベース + overshoot 学習。実測 patch objc 41.8→60.1fps / patch metal 37.0→60.4fps / synth 44.2→58.7fps）:
+
+- フレーム起点 `frame_t0` は loop 先頭（または `app_runtime` が `frame(win, now)` で渡す `now`）で取り、
+  **`defer platform.framePaceUntil(...)` を `lockFramebuffer` より前に登録**する。こうすると
+  `lockFramebuffer()==null` の早期 return / `continue` 経路でも 1 回だけ待ち（busy loop にならない）、
+  defer の LIFO により `fb.unlock()` の後に待つ（framebuffer lock 中に sleep しない）。
+- **OS の相対/絶対 sleep はどちらも要求時間を超過する**（macOS は timer slack が要求の約 20%: 16.67ms 要求で
+  平均 3.4ms 超過＝49.8fps。`mach_wait_until` の絶対時刻でも同じ）。`framePaceUntil` は実測 overshoot を
+  EWMA で学習して要求から差し引く（busy-wait はしない）。純ロジックは `core/frame_pacing.zig`（`test-frame-pacing`）。
+- 契約は「**caller 側は固定周期を足さず deadline の残余だけ待つ**」。backend が vsync 等で待った時間は
+  フレーム起点からの経過に含まれ remaining から引かれるので、1 級 backend（metal/D3D11/Wayland）でも
+  周期は目標近傍に収まる。**「backend が先に待つ」は保証ではない**: metal の実測では present はブロックせず
+  caller 側が平均 9.6ms 待って 60.4fps を作っていた（実 OS 待機 p95 11.0ms / sleep 呼び出しは 1 フレーム 1 回）。
+- `frameDelay`（固定 sleep）は互換のため残るが**新規コードでは使わない**。examples の固定呼び出しは TASK-177 で移行予定。
+- pacing の正しい手本: `apps/patch/main.zig` / `apps/synth/main.zig`（`examples/04_fixed_timestep` は deadline を
+  自前計算する古い書き方で、TASK-177 で `framePaceUntil` へ寄せる）。
 
 フレーム内の区間別内訳は `sample` より**区間計測**（フレーム本体の各段に `getTime()` を差し込む）が確実
 （`sample` では `@memset` 等がインライン帰属して「未特定」になる）。恒久機能化は TASK-175。

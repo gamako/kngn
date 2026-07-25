@@ -698,6 +698,8 @@ pub const Window = struct {
 };
 
 pub fn init() Error!void {
+    // frame pacing の学習状態（TASK-176）。プロセス再初期化で異常値を持ち越さない。
+    pacer.reset();
     // VP_HEADLESS を harness.parseConfig より前に確定（TASK-165）。値が "1" のときだけ null runtime。
     // copilot は TASK-62.5.2 §3b の順序: harness.parseConfig → copilot.parseConfig → backend init →
     // harness.startTransport → copilot.startTransport（排他は env 存在ベースで parseConfig 時点に確定）。
@@ -732,6 +734,8 @@ pub fn init() Error!void {
 }
 
 pub fn shutdown() void {
+    // frame pacing の OS リソース（Windows の waitable timer handle）を閉じる（TASK-176）。
+    if (comptime builtin.os.tag == .windows) windows_wait.deinit();
     // app_runtime の defer は登録順と逆に実行されるため App.deinit が先に走る。
     // 借用先の App 解放後に netsync/copilot が executor を deref しないよう、先に借用を drop する。
     netsync.forgetSharedExecutor();
@@ -981,12 +985,179 @@ pub fn sleep(nanoseconds: u64) void {
     sleep_impl.call(nanoseconds);
 }
 
+// ── 高精度 sleep（TASK-176。framePaceUntil 専用） ─────────────────────────────
+// 各 OS の最も精度の高い待ちを使う。いずれも要求超過分は EWMA 補正が吸収するので、
+// プリミティブの差は「学習後のジッタ幅」に出る。失敗時は既存 `sleep()` へ落ちる。
+
+const darwin_wait = if (builtin.os.tag == .macos) struct {
+    const TimebaseInfo = extern struct { numer: u32, denom: u32 };
+    extern "c" fn mach_absolute_time() u64;
+    extern "c" fn mach_timebase_info(info: *TimebaseInfo) c_int;
+    extern "c" fn mach_wait_until(deadline: u64) c_int;
+
+    var timebase: TimebaseInfo = .{ .numer = 0, .denom = 0 };
+
+    /// ns → mach tick。timebase は初回のみ取得しキャッシュする。
+    fn ticks(nanoseconds: u64) ?u64 {
+        if (timebase.numer == 0 or timebase.denom == 0) {
+            if (mach_timebase_info(&timebase) != 0) return null;
+            if (timebase.numer == 0 or timebase.denom == 0) return null;
+        }
+        return nanoseconds *| @as(u64, timebase.denom) / @as(u64, timebase.numer);
+    }
+
+    fn call(nanoseconds: u64) void {
+        const t = ticks(nanoseconds) orelse return sleep(nanoseconds);
+        if (mach_wait_until(mach_absolute_time() +| t) != 0) sleep(nanoseconds);
+    }
+} else struct {};
+
+const linux_wait = if (builtin.os.tag == .linux) struct {
+    /// `clock_nanosleep(CLOCK_MONOTONIC, ABSTIME)`。getTime() は MONOTONIC_RAW なので
+    /// **待ち時点で CLOCK_MONOTONIC を読み**、そこへ相対 request を足した絶対時刻を渡す
+    /// （clock domain を混ぜない）。EINTR は残り時間で再試行する。
+    fn call(nanoseconds: u64) void {
+        var target: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &target) != 0) return sleep(nanoseconds);
+        const add_sec: i64 = @intCast(nanoseconds / 1_000_000_000);
+        const add_nsec: i64 = @intCast(nanoseconds % 1_000_000_000);
+        target.sec += add_sec;
+        target.nsec += add_nsec;
+        if (target.nsec >= 1_000_000_000) {
+            target.sec += 1;
+            target.nsec -= 1_000_000_000;
+        }
+        // `clock_nanosleep` は POSIX 契約どおり **errno を設定せずエラー番号を戻り値で返す**。
+        // EINTR は同じ絶対 target で再試行（絶対指定なので残り時間の再計算は不要）。
+        var attempts: u8 = 0;
+        while (attempts < 8) : (attempts += 1) {
+            const rc = std.c.clock_nanosleep(.MONOTONIC, .{ .ABSTIME = true }, &target, null);
+            if (rc == 0) return;
+            if (rc != @intFromEnum(std.c.E.INTR)) return sleep(nanoseconds);
+        }
+        // EINTR が続いて上限に達した場合: **残り時間を計り直して相対 sleep で埋める**
+        // （ここで return すると deadline 前に早期復帰して pacing が外れる）。
+        var now: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &now) != 0) return;
+        const remain_sec = target.sec - now.sec;
+        const remain_nsec = target.nsec - now.nsec;
+        const remain_ns: i128 = @as(i128, remain_sec) * 1_000_000_000 + @as(i128, remain_nsec);
+        if (remain_ns > 0) sleep(@intCast(@min(remain_ns, @as(i128, nanoseconds))));
+    }
+} else struct {};
+
+const windows_wait = if (builtin.os.tag == .windows) struct {
+    const HANDLE = *anyopaque;
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
+    const TIMER_ALL_ACCESS: u32 = 0x1F0003;
+    const INFINITE: u32 = 0xFFFFFFFF;
+
+    extern "kernel32" fn CreateWaitableTimerExW(
+        lpTimerAttributes: ?*anyopaque,
+        lpTimerName: ?[*:0]const u16,
+        dwFlags: u32,
+        dwDesiredAccess: u32,
+    ) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetWaitableTimer(
+        hTimer: HANDLE,
+        lpDueTime: *const i64,
+        lPeriod: i32,
+        pfnCompletionRoutine: ?*anyopaque,
+        lpArgToCompletionRoutine: ?*anyopaque,
+        fResume: i32,
+    ) callconv(.winapi) i32;
+    extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
+
+    /// 高精度 timer → 通常 timer → `Sleep(ms)` の 3 段 fallback。handle は初回生成しキャッシュする。
+    var timer: ?HANDLE = null;
+    var timer_tried = false;
+
+    fn handle() ?HANDLE {
+        if (timer) |h| return h;
+        if (timer_tried) return null;
+        timer_tried = true;
+        timer = CreateWaitableTimerExW(null, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS) orelse
+            CreateWaitableTimerExW(null, null, 0, TIMER_ALL_ACCESS);
+        return timer;
+    }
+
+    fn call(nanoseconds: u64) void {
+        const h = handle() orelse return sleep(nanoseconds);
+        // 負値 = 相対（100ns 単位）。0 になる短さなら待たない。
+        const hundred_ns: i64 = @intCast(@min(nanoseconds / 100, @as(u64, @intCast(std.math.maxInt(i64)))));
+        if (hundred_ns == 0) return;
+        const due: i64 = -hundred_ns;
+        if (SetWaitableTimer(h, &due, 0, null, null, 0) == 0) return sleep(nanoseconds);
+        _ = WaitForSingleObject(h, INFINITE);
+    }
+
+    fn deinit() void {
+        if (timer) |h| {
+            _ = CloseHandle(h);
+            timer = null;
+        }
+        timer_tried = false;
+    }
+} else struct {};
+
+/// OS ごとの高精度 sleep（`framePaceUntil` 専用。wasm は no-op）。
+fn sleepPrecise(nanoseconds: u64) void {
+    if (comptime builtin.cpu.arch.isWasm()) return;
+    switch (comptime builtin.os.tag) {
+        .macos => darwin_wait.call(nanoseconds),
+        .linux => linux_wait.call(nanoseconds),
+        .windows => windows_wait.call(nanoseconds),
+        else => sleep(nanoseconds),
+    }
+}
+
 /// フレーム毎の main loop ウェイト（TASK-32.4 P4 / TASK-164）。
 /// manual clock（replay / LISTEN+MANUAL_CLOCK）のときだけ **no-op**（仮想クロック + pollGate が
 /// フレーム進行を決めるため実時間 sleep は待ち損）。free-run と harness 無効時は `sleep()` と同じ。
+///
+/// **注意（TASK-176）**: これは「フレーム作業時間を引かない固定 sleep」なので、周期の目標値を渡しても
+/// 実 fps は `1/(work + nanoseconds + OS の timer slack)` になる（実測: apps/patch で 60fps 目標に対し
+/// 41.8fps）。新規コードでは `framePaceUntil` を使う。examples の固定呼び出しは TASK-177 で移行予定。
 pub fn frameDelay(nanoseconds: u64) void {
     if (harness.isManualClock()) return;
     sleep(nanoseconds);
+}
+
+// ============================================================================
+// frame pacing（deadline + overshoot 補正。TASK-176）
+//
+// フレーム毎に 1 回呼ぶ「目標時刻まで待つ」pacing。固定 sleep（frameDelay）と違い作業時間を差し引く。
+// OS の相対/絶対 sleep はいずれも要求時間を超過する（macOS は timer slack が要求の約 20%: 16.67ms 要求で
+// 平均 3.4ms 超過＝49.8fps）。**絶対時刻 sleep でも解消しない**ため、実測 overshoot を EWMA で学習して
+// 要求から差し引く（実測: 平均誤差 -0.10ms = 60.4fps。busy-wait なし）。
+//
+// ホットパス宣言: フレーム毎（1 フレーム 1 回）。全画素ループ・RT（毎サンプル）経路ではない。
+// ============================================================================
+
+/// pacing の純ロジック（判断・EWMA 学習・定数）は `core/frame_pacing.zig`（OS 非依存・単体テスト対象）。
+const frame_pacing = @import("frame_pacing.zig");
+
+/// main thread 専有の pacing 学習状態。RT スレッドからは触らない。
+var pacer: frame_pacing.Pacer = .{};
+
+/// 時計と高精度 sleep を注入した pacing 実行器（comptime 注入なので間接呼び出しにならない）。
+const PaceDriver = frame_pacing.Driver(getTime, sleepPrecise);
+
+/// 目標時刻（`getTime()` と同じ単調時計・秒）に向けてフレームを **best-effort で pacing** する。
+/// フレーム毎に 1 回だけ呼ぶ（`frameDelay` の置き換え）。
+///
+/// 厳密な deadline 保証ではない: 平均周期は目標に一致するが、個々のフレームは最大
+/// `frame_pacing.MARGIN_NS`(200µs) 早く return しうるし、OS の timer slack 由来のジッタ（macOS 実測 p95 約 2ms）
+/// は残る。deadline が過去 / 非有限なら即 return。
+///
+/// manual clock（replay / LISTEN+MANUAL_CLOCK）では **完全 no-op**（OS 時計も読まず学習状態も触らない）。
+///
+/// 1 級 backend（Metal / D3D11-DXGI / Wayland）との関係: backend が vsync 等で待った時間はフレーム起点からの
+/// 経過に含まれるため remaining から差し引かれ、追加待ちは残余のみになる（present が非ブロックなら
+/// caller 側の待ちが残る＝二重待ちしないことの保証ではない）。
+pub fn framePaceUntil(deadline_seconds: f64) void {
+    PaceDriver.pace(&pacer, deadline_seconds, harness.isManualClock());
 }
 
 // ============================================================================

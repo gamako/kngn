@@ -810,6 +810,20 @@ pub fn build(b: *std.Build) void {
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
+    // frame pacing の純ロジック（TASK-176）。OS / display / platform 非依存（imports なし）。
+    // root を跨いだ間接 import の test は収集されないため、専用 addTest で確実に実行する
+    // （core/platform.zig を root にすると native backend の extern を link する必要が出るため、
+    //   純ロジックだけを core/frame_pacing.zig に切り出してこの step で回す）。
+    const frame_pacing_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("core/frame_pacing.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_frame_pacing_step = b.step("test-frame-pacing", "Run frame pacing (deadline + overshoot EWMA) unit tests (TASK-176)");
+    test_frame_pacing_step.dependOn(&b.addRunArtifact(frame_pacing_test).step);
+
     // MIDI facade/null/CoreMIDI backend 単体テスト（TASK-115.1/115.2・ADR-010）。
     // macOS では facade が midi_macos を相対 import するため CoreMIDI を link する。
     // また root を midi_macos.zig にした専用 addTest で native 側 test を確実に実行する
@@ -1973,6 +1987,7 @@ pub fn build(b: *std.Build) void {
     //     カバーされる。`-Dinstall-all=true` は main/pixie も全 backend install する用途。
     // ========================================
     const test_step = b.step("test", "Run all unit/integration tests");
+    test_step.dependOn(test_frame_pacing_step);
     test_step.dependOn(test_png_roundtrip_step);
     test_step.dependOn(test_core_step);
     test_step.dependOn(test_png_format_step);
