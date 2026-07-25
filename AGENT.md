@@ -1011,7 +1011,10 @@ scripts/drive --port-file /tmp/x.port 'quit'          # 終了は必ず quit（p
 5.9ms なのに実測 41.8fps だった）。**apps は `platform.framePaceUntil(frame_t0 + 1.0/60.0)` を使う**
 （deadline ベース + overshoot 学習。実測 patch objc 41.8→60.1fps / patch metal 37.0→60.4fps / synth 44.2→58.7fps）:
 
-- フレーム起点 `frame_t0` は loop 先頭（または `app_runtime` が `frame(win, now)` で渡す `now`）で取り、
+- **`core/app_runtime.zig`（`Runtime(App)`）を使うアプリは runtime が pacing を所有する**（TASK-180。pixie/synth。
+  周期は既定 1/60 で、App が `pub const frame_period_s: f64` を持てば上書き・`0` で pacing 無効）。
+  アプリ側で `framePaceUntil` を呼ぶ必要はない。
+- **自前 main loop のアプリ**（`apps/patch`）は自分で呼ぶ: フレーム起点 `frame_t0` を loop 先頭で取り、
   **`defer platform.framePaceUntil(...)` を `lockFramebuffer` より前に登録**する。こうすると
   `lockFramebuffer()==null` の早期 return / `continue` 経路でも 1 回だけ待ち（busy loop にならない）、
   defer の LIFO により `fb.unlock()` の後に待つ（framebuffer lock 中に sleep しない）。
@@ -1023,8 +1026,9 @@ scripts/drive --port-file /tmp/x.port 'quit'          # 終了は必ず quit（p
   周期は目標近傍に収まる。**「backend が先に待つ」は保証ではない**: metal の実測では present はブロックせず
   caller 側が平均 9.6ms 待って 60.4fps を作っていた（実 OS 待機 p95 11.0ms / sleep 呼び出しは 1 フレーム 1 回）。
 - `frameDelay`（固定 sleep）は互換のため残るが**新規コードでは使わない**。examples の固定呼び出しは TASK-177 で移行予定。
-- pacing の正しい手本: `apps/patch/main.zig` / `apps/synth/main.zig`（`examples/04_fixed_timestep` は deadline を
-  自前計算する古い書き方で、TASK-177 で `framePaceUntil` へ寄せる）。
+- pacing の手本: **自前ループ** = `apps/patch/main.zig`（loop body 先頭の defer）/ **Runtime 経由** =
+  `core/app_runtime.zig`（消費者 pixie・synth は自分では呼ばない）。`examples/04_fixed_timestep` は deadline を
+  自前計算する古い書き方で、TASK-177 で `framePaceUntil` へ寄せる。
 
 フレーム内の区間別内訳は `sample` より**区間計測**（フレーム本体の各段に `getTime()` を差し込む）が確実
 （`sample` では `@memset` 等がインライン帰属して「未特定」になる）。恒久機能化は TASK-175。

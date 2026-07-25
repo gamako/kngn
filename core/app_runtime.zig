@@ -13,6 +13,7 @@
 //! opt-in（TASK-117）:
 //! - `pub fn windowBootstrap(gpa, io) !platform.WindowOptions` — platform.init 後・Window.create 前
 //! - `pub fn onWindowShutdown(self: *App, win: *platform.Window) void` — destroy 前・deinit 前
+//! - `pub const frame_period_s: f64` — native ループの目標周期（既定 1/60。`0` で pacing 無効。TASK-180）
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,6 +22,11 @@ const platform = @import("platform");
 pub fn Runtime(comptime App: type) type {
     return struct {
         const Self = @This();
+
+        /// 目標フレーム周期（秒）。既定 60fps。App が `pub const frame_period_s: f64` を持てば上書きし、
+        /// `0`（以下）なら pacing 無効＝自走（deadline が現在時刻以前になり `framePaceUntil` が即 return する）。
+        /// native ループのみに効く（wasm は rAF 律速なので pacing しない）。
+        const frame_period_s: f64 = if (@hasDecl(App, "frame_period_s")) App.frame_period_s else 1.0 / 60.0;
 
         fn createAppWindow(gpa: std.mem.Allocator, io: std.Io) !platform.Window {
             if (@hasDecl(App, "windowBootstrap")) {
@@ -32,7 +38,11 @@ pub fn Runtime(comptime App: type) type {
 
         /// native: `std.process.Init` を受けて pull ループを所有する。
         /// 既存 pixie と同型: `while (running and pollEvents()) { running = frame(...) }`。
-        /// frameDelay は呼ばない（pixie は backend の vsync/poll に委ねており従来同等を保つ）。
+        /// **frame pacing は runtime が所有する**（TASK-180）: 各周回で `framePaceUntil(t0 + frame_period_s)` を
+        /// `defer` で 1 回呼ぶ（`app.frame` が error / running=false を返した経路でも 1 回だけ待つ）。
+        /// 周期は `frame_period_s`（既定 60fps。`App.frame_period_s` で上書き・`0` で pacing 無効）。
+        /// deadline の基準は `app.frame` へ渡す `now` と**同一の `t0`**（二重待ちにならない）。
+        /// harness の manual clock（replay）では `framePaceUntil` が no-op なので replay 速度は落ちない。
         /// shutdown 順序は `onWindowShutdown → App.deinit → Window.destroy`（TASK-117）。
         pub fn runNative(process_init: std.process.Init) !void {
             const gpa = process_init.gpa;
@@ -54,7 +64,10 @@ pub fn Runtime(comptime App: type) type {
 
             var running = true;
             while (running and win.pollEvents()) {
-                running = try app.frame(&win, platform.getTime());
+                // フレーム起点。`app.frame` の `now` と pacing の deadline で同じ値を使う。
+                const t0 = platform.getTime();
+                defer platform.framePaceUntil(t0 + frame_period_s);
+                running = try app.frame(&win, t0);
             }
         }
 
