@@ -21,6 +21,7 @@ subsystems have their own documents, so read the one you need.
 | [docs/netsync.md](docs/netsync.md) | Networked concurrent editing: the frame format, `NetworkPolicy`, peer info distribution, undo during a session, and the two-process procedure |
 | [docs/modular.md](docs/modular.md) | The modular synthesis layer: the graph engine, the generation model, the patch canvas, mini-notation, and offline rendering |
 | [docs/audio-and-synth.md](docs/audio-and-synth.md) | The audio layers, the real-time contract, and the prerequisites for producing sound on Linux |
+| [docs/capture.md](docs/capture.md) | Capture input: the unified control plane for microphones and cameras, the separated data plane, permissions, and the synthetic source |
 | [docs/determinism-and-recipes.md](docs/determinism-and-recipes.md) | The seed and determinism convention, and the recipe format |
 | [docs/editor.md](docs/editor.md) | The editor family: `libs/paint`, `libs/gui`, and the pixel editor |
 | [docs/platform-verification.md](docs/platform-verification.md) | Building and verifying on Linux and Windows: Xvfb, a headless Wayland compositor, synthesising input, and the Windows symlink limitation |
