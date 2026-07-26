@@ -6,83 +6,83 @@ const macos = @import("build_helpers/macos.zig");
 const APP_NAME = "video_proto";
 
 // ============================================================
-// ADR-007 R1: 層タグと依存配線検査
+// ADR-007 R1: layer tags and dependency wiring checks
 //
-// apps → (kit) → libs → core → platform の一方向依存を build graph で強制する。
-// 共有 module（SharedModules / PlatformModules）の配線は必ず link() /
-// linkCoreException() / linkAppException() を経由すること。素の addImport は
-//   - exe/test/bench の module-internal な root への配線（層をまたぐ共有 module ではない）
-//   - examples/ と src/ レガシーヘルパー（keyboard/sprite/text 等）の配線
-//     （R5 の kit-only 強制は apps/ のみが対象。examples は教材として従来配線を維持）
-// に限って許す。
+// Enforce one-way dependency apps → (kit) → libs → core → platform in the build graph.
+// Shared modules (SharedModules / PlatformModules) must always go through link() /
+// linkCoreException() / linkAppException(). Bare addImport is allowed only for
+//   - wiring exe/test/bench to a module-internal root (not a cross-layer shared module)
+//   - wiring examples/ and legacy src/ helpers (keyboard/sprite/text, etc.)
+//     (R5 kit-only enforcement targets apps/ only; examples keep legacy wiring as teaching material)
+// the cases above.
 //
-// 違反は std.debug.panic（= build 構成時エラー）で止まる。さらに module root が各層の
-// ディレクトリ内にあるため、配線されていない層のファイルへの相対 @import は
-// 「import of file outside module path」で compile error になる（物理隔離）。
+// Violations stop via std.debug.panic (= build-configuration error). Module roots live in
+// each layer's directory, so a relative @import into an unwired layer becomes
+// an "import of file outside module path" compile error (physical isolation).
 // ============================================================
 
 const Layer = enum(u8) {
-    // L0 platform/（native .o / C ABI）は Zig module ではないためここには現れない。
-    core = 1, // L1 薄い base: core/（platform facade + audio facade + control）
-    lib = 2, // L2-L3 移植可能 libs: libs/（headless。platform 実装に依存しない）
-    kit = 3, // 公開 umbrella: kit/（R4）
-    app = 4, // L4 終端消費者: apps/
+    // L0 platform/ (native .o / C ABI) is not a Zig module, so it does not appear here.
+    core = 1, // L1 thin base: core/ (platform facade + audio facade + control)
+    lib = 2, // L2-L3 portable libs: libs/ (headless; no dependency on platform implementations)
+    kit = 3, // Public umbrella: kit/ (R4)
+    app = 4, // L4 terminal consumers: apps/
 };
 
 const TaggedModule = struct {
     mod: *std.Build.Module,
     layer: Layer,
-    /// import 名（consumer 側の `@import("<name>")`）。
+    /// Import name (the consumer's `@import("<name>")`).
     name: []const u8,
-    /// 流動 lib の apps 直 import 許可（ADR-007 成熟ゲート: kit 非収録だが、apps が
-    /// 「内部・壊れうる」前提で直 import してよい: modular / paint / spectrogram / scope）。
-    /// kit 収録 lib と core は false のまま。
+    /// Allow apps to import a flux lib directly (ADR-007 maturity gate: not in kit, but apps may
+    /// direct-import it as "internal / may break": modular / paint / spectrogram / scope).
+    /// Kit-listed libs and core stay false.
     app_direct_ok: bool = false,
-    /// type-only module（platform_types）。libs が core から参照してよい唯一の形（ADR-007 未決#1 の確定）。
+    /// Type-only module (platform_types). The only core form libs may reference (see ADR-007).
     type_only: bool = false,
 };
 
-/// 層検査つき配線。違反は build 構成時に panic で止める。
+/// Layer-checked wiring. Violations panic at build configuration time.
 fn link(consumer: TaggedModule, dep: TaggedModule) void {
     const ok = switch (consumer.layer) {
-        // apps は kit のみ（R5）。流動 lib（app_direct_ok）だけ「内部・壊れうる」直 import 可。
+        // apps may use kit only (R5). Flux libs (app_direct_ok) alone may be direct-imported as "internal / may break".
         .app => dep.layer == .kit or (dep.layer == .lib and dep.app_direct_ok),
-        // kit は core と安定 libs を再エクスポートする（R4）。
+        // kit re-exports core and stable libs (R4).
         .kit => dep.layer == .core or dep.layer == .lib,
-        // libs は libs 同士 + type-only な core module（platform_types）のみ（R2）。
+        // libs may use other libs plus type-only core modules (platform_types) only (R2).
         .lib => dep.layer == .lib or (dep.layer == .core and dep.type_only),
-        // core は core 同士のみ（例外 harness→png / harness→dsp / platform→pixelops は linkCoreException 経由）。
+        // core may use other core only (exceptions harness→png / harness→dsp / platform→pixelops go through linkCoreException).
         .core => dep.layer == .core,
     };
     if (!ok) std.debug.panic(
-        "ADR-007 R1 依存方向違反: {s}({s}) → {s}({s})。apps→kit→libs→core の一方向のみ許可。",
+        "ADR-007 R1 dependency direction violation: {s}({s}) → {s}({s}). Only one-way apps→kit→libs→core is allowed.",
         .{ consumer.name, @tagName(consumer.layer), dep.name, @tagName(dep.layer) },
     );
     consumer.mod.addImport(dep.name, dep.mod);
 }
 
-/// core → libs の明示例外。現状:
-///   - harness(core/control) → png(libs/png)（snapshot fb の PNG encode / crc32）
-///   - harness(core/control) → dsp（digest audio のスペクトル解析 band/centroid/onset。TASK-92）
-///   - platform(core) → pixelops(libs/pixelops)（wasm present の BGRA→RGBA SIMD swizzle。TASK-73.1）
-/// 新たな例外を足す場合は ADR-007 の改訂を伴うこと。
+/// Explicit core → libs exceptions. Current set:
+///   - harness(core/control) → png(libs/png) (PNG encode / crc32 for snapshot fb)
+///   - harness(core/control) → dsp (digest audio spectrum analysis: band/centroid/onset)
+///   - platform(core) → pixelops(libs/pixelops) (BGRA→RGBA SIMD swizzle for wasm present)
+/// Adding a new exception requires revising ADR-007.
 fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .core and dep.layer == .lib);
     consumer.mod.addImport(dep.name, dep.mod);
 }
 
-/// app → kit 収録 lib の直 import 例外。app 内ファイルが pure-test root を兼ねる場合
-/// （apps/patch/lofi.zig の synth/dsp）に限り、テスト module を platform 非依存に保つため
-/// named 直 import を許す。kit と同一 module インスタンスなので型同一性は保たれる。
-/// 追加: apps/editor/apps/pixie → pixelops（縮小 blit SIMD。TASK-153.2）。
+/// app → lib direct-import exceptions. The full set is the linkAppException call sites:
+///   - apps/editor/apps/pixie → pixelops (downscale blit SIMD)
+///   - example_26 → paint; apps/patch/lofi.zig → synth / dsp
+/// Same module instance as kit, so type identity holds.
 fn linkAppException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .app and dep.layer == .lib);
     consumer.mod.addImport(dep.name, dep.mod);
 }
 
-/// app exe の root module を層タグ付きで包む（link() の consumer にする）。
+/// Wrap an app exe root module with a layer tag (as a link() consumer).
 fn appRoot(exe: *std.Build.Step.Compile, name: []const u8) TaggedModule {
     return .{ .mod = exe.root_module, .layer = .app, .name = name };
 }
@@ -112,7 +112,7 @@ const WebStaticInstalls = struct {
     }
 };
 
-/// HTML/JS + ホスティング設定雛形を zig-out/web/ へ install。
+/// Install HTML/JS + hosting config templates into zig-out/web/.
 fn installWebStaticAssets(b: *std.Build) WebStaticInstalls {
     return .{
         .html = b.addInstallFile(b.path("web/index.html"), "web/index.html"),
@@ -140,10 +140,10 @@ fn addPackageWebStep(
     static_assets.dependOnAll(package_step);
 }
 
-/// wasm32-wasi 専用ビルド（TASK-73.1 pixie + TASK-73.2 synth audio）。
-/// pixie は従来どおり non-shared / single_threaded（ブラウザ回帰を出さない）。
-/// synth のみ shared memory + atomics（AudioWorklet 2nd Instance）。
-/// root は wasm_root.zig（main 無し）にし、wasi command/_start 経路を避ける（reactor=export 駆動）。
+/// wasm32-wasi-only build (pixie + synth audio).
+/// pixie stays non-shared / single_threaded (no browser regressions).
+/// Only synth uses shared memory + atomics (AudioWorklet 2nd Instance).
+/// Root is wasm_root.zig (no main) to avoid the wasi command/_start path (reactor = export-driven).
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     const pixie = buildWasmPixie(b, target, optimize, .{ .build_step_name = "build-pixie" });
     const synth = buildWasmSynth(b, target, optimize, .{ .build_step_name = "build-synth-wasm" });
@@ -153,9 +153,9 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 }
 
 const WasmBuildOpts = struct {
-    /// true のとき `zig build`（install step）に wasm install を束ねる。
+    /// When true, fold the wasm install into `zig build` (the install step).
     default_install: bool = true,
-    /// null のとき専用 build step を張らない（package-web 経由の cross-compile 用）。
+    /// When null, do not create a dedicated build step (for cross-compile via package-web).
     build_step_name: ?[]const u8,
 };
 
@@ -180,8 +180,8 @@ fn buildWasmPixie(
         const root = TaggedModule{ .mod = pixie_mod, .layer = .app, .name = "pixie" };
         link(root, pm.kit);
         link(root, shared.paint);
-        // apps → pixelops の明示例外（linkAppException。ADR-007 層例外リスト 4 つ目）
-        linkAppException(root, shared.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops（縮小 blit の SIMD ブレンド共有。TASK-153.2）");
+        // Explicit apps → pixelops exception (linkAppException call site)
+        linkAppException(root, shared.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops (shared SIMD blend for downscale blit)");
     }
 
     const exe = b.addExecutable(.{
@@ -207,21 +207,21 @@ fn buildWasmPixie(
     return .{ .exe = exe, .install = wasm_install };
 }
 
-/// synth wasm: SharedArrayBuffer + atomics + dual Instance（main + AudioWorklet）。
-/// notes: pixie は non-shared のまま。audio を使う app だけ shared 化する（回帰最小化）。
+/// synth wasm: SharedArrayBuffer + atomics + dual Instance (main + AudioWorklet).
+/// notes: pixie stays non-shared. Only apps that use audio go shared (minimize regressions).
 ///
-/// single_threaded=true を維持する理由（TASK-73.2 notes）:
-/// - zig 0.16 の `std.heap.wasm_allocator` は multi-thread 未実装
-/// - ただし target に `+atomics` があれば single_threaded でも i32.atomic.* が生成される
-///   （/tmp/task-73.2 atom PoC で single/multi の atomic 命令が一致することを確認）
-/// - Zig Thread は spawn しない（JS 側 main + AudioWorklet の 2 Instance が共有 memory を触る）
+/// Why single_threaded=true is kept:
+/// - zig 0.16 `std.heap.wasm_allocator` has no multi-thread implementation
+/// - but with `+atomics` on the target, single_threaded still emits i32.atomic.*
+///   (single- and multi-threaded atomic instructions match)
+/// - Zig Thread is not spawned (JS-side main + AudioWorklet Instances share memory)
 fn buildWasmSynth(
     b: *std.Build,
     base_target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     opts: WasmBuildOpts,
 ) WasmExeBuild {
-    // atomics + bulk_memory を足した target（shared memory 必須）
+    // Target with atomics + bulk_memory added (shared memory required)
     const query = std.Target.Query{
         .cpu_arch = .wasm32,
         .os_tag = base_target.result.os.tag, // wasi
@@ -230,7 +230,7 @@ fn buildWasmSynth(
     };
     const target = b.resolveTargetQuery(query);
 
-    // wasm_shared=false → single_threaded=true（wasm_allocator 可）。atomics は target feature で担保。
+    // wasm_shared=false → single_threaded=true (wasm_allocator ok). atomics come from the target feature.
     const wasm_max_opts = b.addOptions();
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
     const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), base_target.result.os.tag);
@@ -256,7 +256,7 @@ fn buildWasmSynth(
         .optimize = optimize,
         .single_threaded = true,
     });
-    // worklet が Instance 毎に __stack_pointer Global を差し替える（PoC a）
+    // The worklet swaps the __stack_pointer Global per Instance
     root_mod.export_symbol_names = &.{"__stack_pointer"};
 
     const exe = b.addExecutable(.{
@@ -268,10 +268,10 @@ fn buildWasmSynth(
     exe.shared_memory = true;
     exe.import_memory = true;
     exe.export_memory = false;
-    // 16 MiB initial / 64 MiB max（FB 1080×520 + audio stack/scratch + synth 状態）
+    // 16 MiB initial / 64 MiB max (FB 1080×520 + audio stack/scratch + synth state)
     exe.initial_memory = 16 * 1024 * 1024;
     exe.max_memory = 64 * 1024 * 1024;
-    // MasterEffects(65536) は ~0.5MiB+。init で値返し一時がスタックに乗るため余裕を取る。
+    // MasterEffects(65536) is ~0.5MiB+. Leave headroom for init temporaries on the stack.
     exe.stack_size = 2 * 1024 * 1024;
     exe.root_module.addImport("synth_app", synth_mod);
 
@@ -285,7 +285,7 @@ fn buildWasmSynth(
     return .{ .exe = exe, .install = wasm_install };
 }
 
-/// native ターゲットから wasm web 配布物を cross-compile して zig-out/web/ へ集約（TASK-73.4）。
+/// Cross-compile wasm web artifacts from the native target into zig-out/web/.
 fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     const wasi_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -305,7 +305,7 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void 
 
 pub fn build(b: *std.Build) void {
     // ========================================
-    // プロジェクト特有のセットアップ
+    // Project-specific setup
     // ========================================
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -313,16 +313,16 @@ pub fn build(b: *std.Build) void {
     const is_wasm = target.result.cpu.arch.isWasm();
 
     // ========================================
-    // wasm 専用ブランチ（TASK-73.1: wasm32-wasi）
-    // wasi でも既存 native backend ループは使わず専用経路。pixie のみ。
+    // wasm-only branch (wasm32-wasi)
+    // Even under wasi, skip the native backend loop and use the dedicated path. pixie only.
     // ========================================
     if (is_wasm) {
         buildWasm(b, target, optimize);
         return;
     }
 
-    // backend 選択。有効値は OS で変わる（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）。
-    // 省略時は OS のデフォルト。OS/backend 不整合は assertBackendForOs で build エラー。
+    // Backend selection. Valid values depend on the OS (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11).
+    // When omitted, use the OS default. OS/backend mismatch is a build error via assertBackendForOs.
     const platform_option = b.option(
         platform.PlatformType,
         "platform",
@@ -330,8 +330,8 @@ pub fn build(b: *std.Build) void {
     ) orelse platform.defaultBackend(target_os);
     platform.assertBackendForOs(platform_option, target_os);
 
-    // SDK / Toolchain パスは macOS backend のみ必要（Linux には xcrun が無いので解決しない）。
-    // 指定なしなら xcrun で自動検出。
+    // SDK / toolchain paths are needed only for macOS backends (Linux has no xcrun, so they are not resolved).
+    // When unspecified, auto-detect via xcrun.
     const swift_toolchain_path = b.option(
         []const u8,
         "swift-toolchain-path",
@@ -351,23 +351,23 @@ pub fn build(b: *std.Build) void {
 
     const install_all = b.option(bool, "install-all", "Install all backends for the target OS") orelse false;
 
-    // 外部消費者向け gamepad opt-in（TASK-111.7）。既定 false。
-    // dep.module("platform") / platform_native_* archive / GameController リンク条件を同一 boolean で駆動。
-    // 内部 exe（main/pixie/examples）は makePlatformModules 側の per-backend opt-in を使う（本 option 非依存）。
+    // Gamepad opt-in for external consumers. Default false.
+    // The same boolean drives dep.module("platform") / platform_native_* archive / GameController link conditions.
+    // Internal exes (main/pixie/examples) use per-backend opt-in in makePlatformModules (independent of this option).
     const enable_gamepad_ext = b.option(
         bool,
         "enable_gamepad",
         "Enable gamepad for external platform module and native archive (default false)",
     ) orelse false;
 
-    // modular/patch 同時モジュール数上限（TASK-146）。既定 48 = 現行 bit 同一。
-    // 下限: 既定 lofi パッチ + マクロが載る数。上限: u16 handle / メモリの常識的範囲。
-    // Options の Module は 1 回だけ createModule し、全 consumer が addImport で共有する
-    // （addOptions は内部で毎回 createModule するため同一 options.zig が 2 root になり compile error）。
+    // modular/patch concurrent module limit. Default 48 = bit-identical with the current default.
+    // Lower bound: enough for the default lofi patch + macros. Upper bound: u16 handle / a sensible memory range.
+    // Create the Options Module once via createModule; all consumers share it through addImport
+    // (addOptions creates a Module each call, so the same options.zig would become 2 roots and compile-error).
     const max_modules_option = b.option(
         usize,
         "max-modules",
-        "modular同時モジュール数上限(既定48)",
+        "Max concurrent modular modules (default 48)",
     ) orelse 48;
     if (max_modules_option < 48) {
         @panic("-Dmax-modules must be >= 48 (default lofi patch + macros require at least 48)");
@@ -380,13 +380,13 @@ pub fn build(b: *std.Build) void {
     const max_modules_mod = max_modules_opts.createModule();
 
     // ========================================
-    // 共有モジュール (OS/backend 非依存。main + examples + pixie + synth で共有)
-    // 29.1 の外部公開 module（platform/png/font/gui）も内包する。
+    // Shared modules (OS/backend-independent; shared by main + examples + pixie + synth)
+    // Also includes the external public modules (platform/png/font/gui).
     // ========================================
     const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target_os);
 
-    // 外部公開 kit umbrella（TASK-111.7）。SharedModules の既存 instance を再利用して型同一性を保つ。
-    // dep.module("kit") で取得。platform / gui / gamepad 等は kit 経由でも同一 module instance。
+    // External public kit umbrella. Reuses SharedModules instances so type identity holds.
+    // Obtained via dep.module("kit"). platform / gui / gamepad etc. are the same module instances through kit.
     {
         const app_runtime_ext: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
             .root_source_file = b.path("core/app_runtime.zig"),
@@ -398,18 +398,18 @@ pub fn build(b: *std.Build) void {
         wireKitImports(kit_ext, shared_modules.platform, &shared_modules, app_runtime_ext);
     }
 
-    // 対象 OS で実装済みの backend 群（macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11）
+    // Backend set implemented for the target OS (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
 
-    // audio (L1 出力) backend: macOS(AudioToolbox) / Linux(ALSA) / Windows(WASAPI)。
-    // synth アプリ / example_15(audio) の生成可否（判定は standalone と共有 helper に集約）。
+    // audio (L1 output) backend: macOS(AudioToolbox) / Linux(ALSA) / Windows(WASAPI).
+    // Whether synth / example_15(audio) are generated (decision shared with the standalone helper).
     const audio_supported = platform.audioSupported(target_os);
 
     // ========================================
-    // main / pixie / synth / examples を backend ごとに生成
-    // （platform / keyboard は backend ごとに module graph を分ける = build_options.platform_backend を付与）
-    // audio を使う synth / example_15 は macOS/Linux/Windows（audio backend が OS 分岐）。platform native lib は macOS のみ。
+    // Generate main / pixie / synth / examples per backend
+    // (platform / keyboard get a per-backend module graph = build_options.platform_backend).
+    // synth / example_15 that need audio: macOS/Linux/Windows (audio backend is OS-branched). platform native lib is macOS only.
     // ========================================
     var default_main: ?*std.Build.Step.Compile = null;
     var default_pixie: ?*std.Build.Step.Compile = null;
@@ -420,22 +420,22 @@ pub fn build(b: *std.Build) void {
         const is_default = (be == platform_option);
         const pm = makePlatformModules(b, target, be, &shared_modules, false);
 
-        // ----- メインアプリケーション -----
+        // ----- Main application -----
         const main_exe = addMainExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, APP_NAME, be, default_be), &pm);
         if (is_default) default_main = main_exe;
         if (install_all) b.installArtifact(main_exe);
         addRunStep(b, b.fmt("run-{s}", .{platform.backendName(be)}), b.fmt("Run the {s} version", .{platform.backendName(be)}), main_exe, b.args);
 
-        // ----- Pixie エディタ (apps/editor/apps/pixie) -----
+        // ----- Pixie editor (apps/editor/apps/pixie) -----
         const pixie_exe = addPixieExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "pixie", be, default_be), &shared_modules, &pm);
         if (is_default) default_pixie = pixie_exe;
-        // install-all で pixie もビルド回帰対象にする（非対話のコンパイル検証手段）
+        // Under install-all, also build pixie as a compile-regression target (non-interactive)
         if (install_all) b.installArtifact(pixie_exe);
         addRunStep(b, b.fmt("run-pixie-{s}", .{platform.backendName(be)}), b.fmt("Run Pixie editor ({s})", .{platform.backendName(be)}), pixie_exe, b.args);
 
-        // ----- Synth アプリ (apps/synth) — PC キーボード演奏 MVP (TASK-27.5)。audio backend は macOS/Linux/Windows -----
+        // ----- Synth app (apps/synth) — PC-keyboard performance MVP. audio backend: macOS/Linux/Windows -----
         if (audio_supported) {
-            // ----- Patch アプリ (apps/patch) — パッチキャンバス UI + ライブ再配線 (TASK-40.6.2/40.6.3)。audio 対応 OS -----
+            // ----- Patch app (apps/patch) — patch-canvas UI + live rewiring. audio-capable OSes -----
             const patch_exe = addPatchExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "patch", be, default_be), &shared_modules, &pm);
             if (is_default) default_patch = patch_exe;
             if (install_all) b.installArtifact(patch_exe);
@@ -446,13 +446,13 @@ pub fn build(b: *std.Build) void {
             if (install_all) b.installArtifact(synth_exe);
             addRunStep(b, b.fmt("run-synth-{s}", .{platform.backendName(be)}), b.fmt("Run synth app ({s})", .{platform.backendName(be)}), synth_exe, b.args);
 
-            // ----- 20_capture_demo (examples/20_capture_demo) — mic 波形/FFT可視化 + camera→canvas デモ
-            // (TASK-49.6)。camera/audio の capture 拡張は audio backend 対応 OS でのみ実用的なため
-            // audio_supported ゲート内に置く（他 example と異なり ExampleNeeds テーブルではなく
-            // 専用 helper で配線: camera/harness/capture_synthetic を直 import するため。examples は
-            // R5=kit-only 対象外。build.zig 冒頭コメント参照）。
+            // ----- 20_capture_demo (examples/20_capture_demo) — mic waveform/FFT viz + camera→canvas demo.
+            // camera/audio capture extensions are practical only on audio-capable OSes, so
+            // keep it inside the audio_supported gate (unlike other examples it is not in the ExampleNeeds table;
+            // wired via a dedicated helper because it direct-imports camera/harness/capture_synthetic. examples are
+            // outside R5=kit-only; see the build.zig header comment).
             const capture_demo_exe = addCaptureDemoExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "example_20", be, default_be), &shared_modules, &pm);
-            // examples は install-all とは独立に常に全 backend を install（既存 example と同じ方針）。
+            // examples always install for every backend, independent of install-all (same policy as existing examples).
             b.installArtifact(capture_demo_exe);
             if (is_default) {
                 addRunStep(
@@ -465,10 +465,10 @@ pub fn build(b: *std.Build) void {
             }
         }
 
-        // ----- サンプルプログラム -----
-        // 各 example が必要とするモジュールを宣言的に指定する。
-        // 全要素は同じフィールド集合（name / path / needs_*）を持たせて anonymous struct 型を
-        // 揃えること（inline for で型不一致を避けるため）。
+        // ----- Sample programs -----
+        // Declare the modules each example needs.
+        // Every entry must share the same field set (name / path / needs_*) so anonymous struct types
+        // match (avoids type mismatch in inline for).
         inline for (.{
             .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
@@ -527,15 +527,15 @@ pub fn build(b: *std.Build) void {
                 .needs_sound = example.needs_sound,
                 .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.startsWith(u8, example.name, "example_26"),
             };
-            // audio example は audio 対応 OS（macOS/Linux/Windows）のみ。それ以外の example は全 OS。
+            // audio examples: audio-capable OSes only (macOS/Linux/Windows). All other examples: every OS.
             if (!needs.needs_audio or audio_supported) {
                 const ex_exe = addExampleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, example.name, be, default_be), example.path, &shared_modules, &pm, needs);
-                // window を持たず stdout に出力するツール（example_06 ベンチ / example_15 音声トーン）は
-                // Windows でも console subsystem を保つ（setupExecutableForPlatform の GUI subsystem を上書き）。
+                // Tools with no window that write to stdout (example_06 bench / example_15 audio tone)
+                // keep the console subsystem on Windows too (override setupExecutableForPlatform GUI subsystem).
                 if (target_os == .windows and comptime (std.mem.eql(u8, example.name, "example_06") or
                     std.mem.eql(u8, example.name, "example_15"))) ex_exe.subsystem = .Console;
-                // examples は install-all とは独立に常に全 backend を install する
-                // （platform 層 / example のビルド回帰を毎 `zig build` で検出する従来挙動を踏襲）。
+                // examples always install for every backend, independent of install-all
+                // (keeps the existing behaviour of catching platform-layer / example compile regressions on every `zig build`).
                 b.installArtifact(ex_exe);
                 if (is_default) {
                     addRunStep(
@@ -550,32 +550,32 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // デフォルト backend を `run` / 既定 install に紐づける。
-    // install-all のときは上のループで全 backend を install 済みなので二重 install しない。
+    // Bind the default backend to `run` / the default install.
+    // Under install-all the loop above already installed every backend, so skip a second install.
     if (!install_all) b.installArtifact(default_main.?);
     addRunStep(b, "run", "Run the app (uses -Dplatform option)", default_main.?, b.args);
     addRunStep(b, "run-pixie", "Run Pixie editor (uses -Dplatform option)", default_pixie.?, b.args);
 
-    // ビルドのみ（実行しない）。当該 exe だけを install する step。
-    // `zig build`（引数なし）は全 installArtifact をビルドしてしまうので、単体ビルド用に分ける。
+    // Build-only (do not run). A step that installs just that exe.
+    // Bare `zig build` builds every installArtifact, so split out single-target build steps.
     addBuildStep(b, "build-main", "Build the app only (uses -Dplatform option)", default_main.?);
     addBuildStep(b, "build-pixie", "Build Pixie editor only (uses -Dplatform option)", default_pixie.?);
 
-    // synth は audio 対応 OS（macOS/Linux/Windows）のみ生成。非対応 OS では default_synth=null で step を張らない。
+    // synth is generated only on audio-capable OSes (macOS/Linux/Windows). On others default_synth=null and no step is created.
     if (default_synth) |ds| {
         addRunStep(b, "run-synth", "Run synth app (uses -Dplatform option)", ds, b.args);
         addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
     }
 
-    // patch canvas も audio 対応 OS のみ生成（40.6.3 で発音するため。default_patch は非対応 OS で null）。
+    // patch canvas is also audio-capable OSes only (it makes sound; default_patch is null otherwise).
     if (default_patch) |dp| {
         addRunStep(b, "run-patch", "Run patch canvas (uses -Dplatform option)", dp, b.args);
         addBuildStep(b, "build-patch", "Build patch canvas only (uses -Dplatform option)", dp);
     }
 
-    // ----- 検証 harness の live driver CLI（TASK-32.2）-----
-    // 純 std + std.Io.net の単独 exe（platform/audio 非依存）。常に install して compile 回帰も兼ねる。
-    // `scripts/drive` wrapper が `zig-out/bin/drive` を直接 exec する。
+    // ----- Live harness driver CLI -----
+    // Standalone exe of pure std + std.Io.net (no platform/audio). Always install so it doubles as compile regression.
+    // The `scripts/drive` wrapper execs `zig-out/bin/drive` directly.
     const drive_exe = b.addExecutable(.{
         .name = "drive",
         .root_module = b.createModule(.{
@@ -587,9 +587,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(drive_exe);
     addBuildStep(b, "drive", "Build the live harness driver CLI (zig-out/bin/drive)", drive_exe);
 
-    // ----- MCP server CLI（TASK-88.2）-----
-    // 純 std + std.Io.net の単独 exe（platform/audio 非依存）。drive と同型。
-    // `scripts/mcp` wrapper が `zig-out/bin/vp-mcp` を直接 exec する。
+    // ----- MCP server CLI -----
+    // Standalone exe of pure std + std.Io.net (no platform/audio). Same shape as drive.
+    // The `scripts/mcp` wrapper execs `zig-out/bin/vp-mcp` directly.
     const mcp_exe = b.addExecutable(.{
         .name = "vp-mcp",
         .root_module = b.createModule(.{
@@ -601,38 +601,38 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(mcp_exe);
     addBuildStep(b, "mcp", "Build the MCP server CLI (zig-out/bin/vp-mcp)", mcp_exe);
 
-    // ----- wasm web 配布パッケージ（TASK-73.4）-----
-    // native ターゲットから cross-compile して zig-out/web/ へ集約。開発時の web/ 配置は不変。
+    // ----- wasm web distribution package -----
+    // Cross-compile from the native target into zig-out/web/. The web/ layout used in development is unchanged.
     packageWebFromNative(b, optimize);
 
     // ========================================
-    // platform native object archive lib（外部パッケージ向け。TASK-29.1）— macOS のみ
-    // facade module(addModule "platform") と責務分離。外部は dep.artifact("platform_native_<plat>")
-    // を linkLibrary する。.o の archive のみで、framework/Swift ランタイム/検索パスは
-    // consumer の exe 側で適用する（29.2 の C 方式）。
+    // platform native object archive lib (for external packages) — macOS only
+    // Separated from the facade module (addModule "platform"). Externals linkLibrary
+    // dep.artifact("platform_native_<plat>"). Archive of .o only; framework / Swift runtime / search paths
+    // are applied on the consumer exe side (C-style approach: vendor the macos/swift build helpers onto the exe).
     //
-    // 既知の制限（Linux 外部消費は未対応）: 29.1 の公開モデル（facade module + native .o archive）は
-    // macOS backend(Obj-C/Swift を別コンパイル)前提の形。Linux で外部パッケージとして
-    // `dep.module("platform")` を使うと、(1) facade が platform_linux.zig を選び、
-    // `@import("build_options")`(platform_backend) は SharedModules.init が OS 既定値（x11）を
-    // 付与するので解決できる（TASK-172）が、(2) X11 の include / `linkSystemLibrary("X11"/"Xext")`
-    // が無い、(3) Linux backend は純 Zig で別 .o archive 不要、のため依然成立しない。対応するなら
-    // 公開 module を backend-aware にする（X11 link を付与）必要がある。自プロジェクトの内部ビルドは
-    // per-backend module(makePlatformModules)を使うので無影響。需要が出たら 29.x で対応。
+    // Known limit (Linux external consumption unsupported): the public model (facade module + native .o archive)
+    // assumes a macOS backend (Obj-C/Swift compiled separately). Using `dep.module("platform")` as an external
+    // package on Linux: (1) the facade selects platform_linux.zig, and
+    // `@import("build_options")`(platform_backend) resolves because SharedModules.init stamps the OS default (x11),
+    // but (2) there is no X11 include / `linkSystemLibrary("X11"/"Xext")`, and (3) the Linux backend is pure Zig
+    // so a separate .o archive is unnecessary — so it still does not work. Fixing it would require making the
+    // public module backend-aware (add the X11 link). This project's internal builds use per-backend
+    // modules (makePlatformModules), so they are unaffected. Address when demand appears.
     // ========================================
     if (target_os == .macos) {
-        // enable_gamepad_ext で native archive の VP_ENABLE_GAMEPAD を platform module と揃える（TASK-111.7）。
-        // GameController framework リンクは consumer 側（enable 時に exe で明示）のまま。
+        // enable_gamepad_ext aligns VP_ENABLE_GAMEPAD on the native archive with the platform module.
+        // GameController framework linking stays on the consumer side (explicit on the exe when enabled).
         _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc", enable_gamepad_ext);
         _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift", enable_gamepad_ext);
         _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal", enable_gamepad_ext);
     }
 
     // ========================================
-    // テスト群（platform を import しない純テスト。OS/backend 非依存）
+    // Test suite (pure tests that do not import platform. OS/backend-independent)
     // ========================================
 
-    // PNG round-trip テスト (io_png.zig のテスト + png で検証)
+    // PNG round-trip tests (io_png.zig tests + verify with png)
     const io_png_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/io_png.zig"),
         .target = target,
@@ -644,7 +644,7 @@ pub fn build(b: *std.Build) void {
     const test_png_roundtrip_step = b.step("test-png-roundtrip", "Run PNG encode/decode round-trip tests");
     test_png_roundtrip_step.dependOn(&run_png_roundtrip_test.step);
 
-    // PNG エンコーダ単体テスト（golden byte 一致 + scanline 順。decoder 非依存。TASK-33）
+    // PNG encoder unit tests (golden byte match + scanline order; decoder-independent)
     const png_encode_mod = b.createModule(.{
         .root_source_file = b.path("libs/png/src/encode.zig"),
         .target = target,
@@ -653,24 +653,24 @@ pub fn build(b: *std.Build) void {
     const png_encode_test = b.addTest(.{ .root_module = png_encode_mod });
     test_png_roundtrip_step.dependOn(&b.addRunArtifact(png_encode_test).step);
 
-    // harness 単体テスト（parser / 実行モデル / 仮想クロック。display 不要・backend 非依存。TASK-32.1）
+    // harness unit tests (parser / execution model / virtual clock. no display; backend-independent)
     const harness_test_mod = b.createModule(.{
         .root_source_file = b.path("core/control/harness.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // harness.init() は libc getenv を使う（init を呼ぶテストでも通るように）
+        .link_libc = true, // harness.init() uses libc getenv (so tests that call init also pass)
     });
-    harness_test_mod.addImport("png", shared_modules.png.mod); // harness が encodePNG/crc32 を使う
-    harness_test_mod.addImport("platform_types", shared_modules.types.mod); // harness が Event/EventStats 等を使う
+    harness_test_mod.addImport("png", shared_modules.png.mod); // harness uses encodePNG/crc32
+    harness_test_mod.addImport("platform_types", shared_modules.types.mod); // harness uses Event/EventStats etc.
     harness_test_mod.addImport("command_types", shared_modules.command_types.mod);
-    harness_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod); // harness の `capture` コマンド/probe が使う（TASK-49.5）
-    harness_test_mod.addImport("dsp", shared_modules.dsp.mod); // TASK-92: digest audio スペクトル解析（band/centroid/onset）
+    harness_test_mod.addImport("capture_synthetic", shared_modules.capture_synthetic.mod); // used by harness `capture` command/probe
+    harness_test_mod.addImport("dsp", shared_modules.dsp.mod); // digest audio spectrum analysis (band/centroid/onset)
     const harness_test = b.addTest(.{ .root_module = harness_test_mod });
     const run_harness_test = b.addRunArtifact(harness_test);
-    const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / 実行モデル / 仮想クロック)");
+    const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / execution model / virtual clock)");
     test_harness_step.dependOn(&run_harness_test.step);
 
-    // vp-mcp 単体テスト（schema 変換・直列化・fail 抽出・衝突解決・contract。std のみ。TASK-88.2）
+    // vp-mcp unit tests (schema convert / serialize / fail extract / collision resolve / contract; std only)
     const mcp_test_mod = b.createModule(.{
         .root_source_file = b.path("scripts/mcp.zig"),
         .target = target,
@@ -681,7 +681,7 @@ pub fn build(b: *std.Build) void {
     const test_mcp_step = b.step("test-mcp", "Run vp-mcp unit tests (schema / serialize / fail / contract)");
     test_mcp_step.dependOn(&run_mcp_test.step);
 
-    // command model 単体テスト（型 + executor + no-op recorder。std のみ・platform/harness 非依存。TASK-62.5.1）
+    // command model unit tests (types + executor + no-op recorder; std only; no platform/harness)
     const command_test_mod = b.createModule(.{
         .root_source_file = b.path("core/control/command.zig"),
         .target = target,
@@ -693,7 +693,7 @@ pub fn build(b: *std.Build) void {
     const test_command_step = b.step("test-command", "Run command model unit tests (types / executor / undo-redo / no-op recorder)");
     test_command_step.dependOn(&run_command_test.step);
 
-    // TASK-97.1: menu Command の type-only model と App.dispatchCommand adapter。
+    // menu Command type-only model and App.dispatchCommand adapter.
     const command_types_test_mod = b.createModule(.{
         .root_source_file = b.path("core/command_types.zig"),
         .target = target,
@@ -717,7 +717,7 @@ pub fn build(b: *std.Build) void {
     const test_platform_menu_step = b.step("test-platform-menu", "Run display-less platform menu facade tests");
     test_platform_menu_step.dependOn(&run_platform_menu_test.step);
 
-    // null backend 単体（TASK-165）。display / native .o 不要。platform_types + command_types のみ。
+    // null backend unit tests. no display / native .o. platform_types + command_types only.
     const platform_null_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_null.zig"),
         .target = target,
@@ -728,7 +728,7 @@ pub fn build(b: *std.Build) void {
     platform_null_test_mod.addImport("command_types", shared_modules.command_types.mod);
     const platform_null_test = b.addTest(.{ .root_module = platform_null_test_mod });
     const run_platform_null_test = b.addRunArtifact(platform_null_test);
-    const test_platform_null_step = b.step("test-platform-null", "Run platform_null (VP_HEADLESS) unit tests (TASK-165)");
+    const test_platform_null_step = b.step("test-platform-null", "Run platform_null (VP_HEADLESS) unit tests");
     test_platform_null_step.dependOn(&run_platform_null_test.step);
 
     const platform_clipboard_test_mod = b.createModule(.{
@@ -739,18 +739,18 @@ pub fn build(b: *std.Build) void {
     platform_clipboard_test_mod.addImport("platform", shared_modules.platform.mod);
     const platform_clipboard_test = b.addTest(.{ .root_module = platform_clipboard_test_mod });
     const run_platform_clipboard_test = b.addRunArtifact(platform_clipboard_test);
-    const test_platform_clipboard_step = b.step("test-platform-clipboard", "Run OS text clipboard facade round-trip tests (TASK-120)");
+    const test_platform_clipboard_step = b.step("test-platform-clipboard", "Run OS text clipboard facade round-trip tests");
     test_platform_clipboard_step.dependOn(&run_platform_clipboard_test.step);
 
-    // copilot transport 単体テスト（ConnState state machine / コマンド実行層 / registry OR ゲート / 排他。
-    // socket・display 不要。TASK-62.5.2）。root=copilot.zig は harness.zig を import するため
-    // harness_test_mod と同じ import/link_libc 構成が要る。"copilot:" filter で copilot のテストのみ
-    // 実行する（import された harness/command のテストは test-harness / test-command が担う。二重実行を避ける）。
+    // copilot transport unit tests (ConnState state machine / command execution / registry OR gate / exclusion.
+    // no socket/display). root=copilot.zig imports harness.zig, so
+    // it needs the same import/link_libc shape as harness_test_mod. The "copilot:" filter runs only copilot tests
+    // (imported harness/command tests stay with test-harness / test-command; avoid double-running).
     const copilot_test_mod = b.createModule(.{
         .root_source_file = b.path("core/control/copilot.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // copilot/harness とも libc getenv を使う
+        .link_libc = true, // both copilot/harness use libc getenv
     });
     copilot_test_mod.addImport("png", shared_modules.png.mod);
     copilot_test_mod.addImport("platform_types", shared_modules.types.mod);
@@ -761,8 +761,8 @@ pub fn build(b: *std.Build) void {
     const test_copilot_step = b.step("test-copilot", "Run copilot transport unit tests (ConnState / command layer / registry OR gate)");
     test_copilot_step.dependOn(&run_copilot_test.step);
 
-    // netsync transport 単体テスト（action_registry + frame codec + loopback HELLO/queue。
-    // display 不要。TASK-62.3.1）。root=netsync.zig は action_registry.zig を相対 import する。
+    // netsync transport unit tests (action_registry + frame codec + loopback HELLO/queue.
+    // no display). root=netsync.zig relative-imports action_registry.zig.
     const netsync_test_mod = b.createModule(.{
         .root_source_file = b.path("core/control/netsync.zig"),
         .target = target,
@@ -775,7 +775,7 @@ pub fn build(b: *std.Build) void {
     const test_netsync_step = b.step("test-netsync", "Run netsync transport unit tests (codec / HELLO / loopback queues)");
     test_netsync_step.dependOn(&run_netsync_test.step);
 
-    // action_registry 単体も test-netsync に含める（filter 無しの別 artifact）。
+    // Also fold action_registry unit tests into test-netsync (separate artifact, no filter).
     const action_registry_test_mod = b.createModule(.{
         .root_source_file = b.path("core/control/action_registry.zig"),
         .target = target,
@@ -784,22 +784,22 @@ pub fn build(b: *std.Build) void {
     const action_registry_test = b.addTest(.{ .root_module = action_registry_test_mod });
     test_netsync_step.dependOn(&b.addRunArtifact(action_registry_test).step);
 
-    // audio_null 単体テスト（headless の実デバイス無し出力。RT ゼロアロケーション / pull ループ。
-    // display・実オーディオデバイス不要・OS 非依存。TASK-32.4 P4）
+    // audio_null unit tests (headless output with no real device. RT zero-alloc / pull loop.
+    // no display / real audio device; OS-independent)
     const audio_null_test_mod = b.createModule(.{
         .root_source_file = b.path("core/audio_null.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // sleep ペーシングに std.c.nanosleep を使う（platform.sleep と同じ実装）
+        .link_libc = true, // sleep pacing uses std.c.nanosleep (same implementation as platform.sleep)
     });
     const audio_null_test = b.addTest(.{ .root_module = audio_null_test_mod });
     const run_audio_null_test = b.addRunArtifact(audio_null_test);
     const test_audio_null_step = b.step("test-audio-null", "Run audio_null (headless null device) unit tests");
     test_audio_null_step.dependOn(&run_audio_null_test.step);
 
-    // 共有型 module（platform_types）の単体テスト（ModifierFlags round-trip 等）。
-    // TASK-32.2 で platform_types を named module 化したため、source-include で拾われなくなった分を
-    // 独立 step として明示的にカバーする。
+    // Shared types module (platform_types) unit tests (ModifierFlags round-trip etc.).
+    // platform_types is a named module, so it is no longer picked up via source-include;
+    // cover it explicitly as a dedicated step.
     const platform_types_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("core/platform_types.zig"),
@@ -810,10 +810,10 @@ pub fn build(b: *std.Build) void {
     const test_platform_types_step = b.step("test-platform-types", "Run platform_types unit tests (shared type definitions)");
     test_platform_types_step.dependOn(&b.addRunArtifact(platform_types_test).step);
 
-    // frame pacing の純ロジック（TASK-176）。OS / display / platform 非依存（imports なし）。
-    // root を跨いだ間接 import の test は収集されないため、専用 addTest で確実に実行する
-    // （core/platform.zig を root にすると native backend の extern を link する必要が出るため、
-    //   純ロジックだけを core/frame_pacing.zig に切り出してこの step で回す）。
+    // Pure frame-pacing logic. OS / display / platform independent (no imports).
+    // Tests behind a cross-root indirect import are not collected, so run them via a dedicated addTest
+    // (rooting at core/platform.zig would require linking native-backend externs, so
+    //   the pure logic lives in core/frame_pacing.zig and this step runs it).
     const frame_pacing_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("core/frame_pacing.zig"),
@@ -821,13 +821,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const test_frame_pacing_step = b.step("test-frame-pacing", "Run frame pacing (deadline + overshoot EWMA) unit tests (TASK-176)");
+    const test_frame_pacing_step = b.step("test-frame-pacing", "Run frame pacing (deadline + overshoot EWMA) unit tests");
     test_frame_pacing_step.dependOn(&b.addRunArtifact(frame_pacing_test).step);
 
-    // MIDI facade/null/CoreMIDI backend 単体テスト（TASK-115.1/115.2・ADR-010）。
-    // macOS では facade が midi_macos を相対 import するため CoreMIDI を link する。
-    // また root を midi_macos.zig にした専用 addTest で native 側 test を確実に実行する
-    // （root を跨いだ間接 import の test は収集されない実測知見。capture 系と同方針）。
+    // MIDI facade/null/CoreMIDI backend unit tests (ADR-010).
+    // On macOS the facade relative-imports midi_macos, so CoreMIDI is linked.
+    // A dedicated addTest rooted at midi_macos.zig also runs the native-side tests
+    // (cross-root indirect-import tests are not collected; same policy as capture).
     const midi_test_mod = b.createModule(.{
         .root_source_file = b.path("core/midi.zig"),
         .target = target,
@@ -845,7 +845,7 @@ pub fn build(b: *std.Build) void {
     });
     midi_null_test_mod.addImport("platform_types", shared_modules.types.mod);
     const midi_null_test = b.addTest(.{ .root_module = midi_null_test_mod });
-    const test_midi_step = b.step("test-midi", "Run MIDI facade/null/CoreMIDI backend unit tests (TASK-115.1/115.2)");
+    const test_midi_step = b.step("test-midi", "Run MIDI facade/null/CoreMIDI backend unit tests");
     test_midi_step.dependOn(&b.addRunArtifact(midi_test).step);
     test_midi_step.dependOn(&b.addRunArtifact(midi_null_test).step);
     if (target_os == .macos) {
@@ -861,7 +861,7 @@ pub fn build(b: *std.Build) void {
         test_midi_step.dependOn(&b.addRunArtifact(midi_macos_test).step);
     }
 
-    // wasm platform の DOM→MouseButton / KeyCode 写像（native でも実行。extern env はテスト経路から未参照）。
+    // wasm platform DOM→MouseButton / KeyCode mapping (runs on native too; extern env unused on the test path).
     const platform_wasm_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_wasm.zig"),
         .target = target,
@@ -870,16 +870,16 @@ pub fn build(b: *std.Build) void {
     platform_wasm_test_mod.addImport("platform_types", shared_modules.types.mod);
     platform_wasm_test_mod.addImport("pixelops", shared_modules.pixelops.mod);
     const platform_wasm_test = b.addTest(.{ .root_module = platform_wasm_test_mod });
-    const test_platform_wasm_step = b.step("test-platform-wasm", "Run platform_wasm DOM→MouseButton / KeyCode unit tests (TASK-73.1)");
+    const test_platform_wasm_step = b.step("test-platform-wasm", "Run platform_wasm DOM→MouseButton / KeyCode unit tests");
     test_platform_wasm_step.dependOn(&b.addRunArtifact(platform_wasm_test).step);
 
-    // capture 入力基盤（TASK-49.1/49.5）単体テスト。display/実デバイス不要・OS 非依存。
-    // capture_types（TripleBuffer 往復・不変条件・DeviceInfo/CaptureError 構造）+ camera facade
-    // （camera_stub.zig を relative import で内包。harness 分岐 + stub 委譲）+ audio.zig の
-    // capture 拡張（audio_capture_stub.zig を relative import で内包。既存出力 backend の switch は
-    // 参照されない限り分析されない Zig の lazy analysis により、AudioToolbox 等のリンクは不要
-    // ＝実測確認済み）+ capture_synthetic（harness 内蔵 synthetic capture source。TASK-49.5）の
-    // 4本を1 step に束ねる。
+    // Capture input foundation unit tests. no display/real device; OS-independent.
+    // Bundles capture_types (TripleBuffer round-trip / invariants / DeviceInfo/CaptureError) + camera facade
+    // (relative-imports camera_stub.zig; harness branch + stub delegate) + audio.zig
+    // capture extension (relative-imports audio_capture_stub.zig; existing output-backend switch is
+    // not analyzed unless referenced — Zig lazy analysis means no AudioToolbox etc. link is needed)
+    // + capture_synthetic (harness-built-in synthetic capture source)
+    // — four roots in one step.
     const capture_types_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("core/capture_types.zig"),
@@ -887,33 +887,33 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const test_capture_types_step = b.step("test-capture-types", "Run capture_types / camera facade / audio capture extension unit tests (TASK-49.1)");
+    const test_capture_types_step = b.step("test-capture-types", "Run capture_types / camera facade / audio capture extension unit tests");
     test_capture_types_step.dependOn(&b.addRunArtifact(capture_types_test).step);
 
-    // camera.zig facade（macOS: camera_macos.zig / 他OS: camera_stub.zig を relative import で
-    // 内包。TASK-49.2）。harness を使うため harness_test_mod と同じ理由で link_libc=true にする
-    // （camera_macos.zig の objc_runtime 経由 std.c.nanosleep/getenv にも同じ理由で必要）。
+    // camera.zig facade (relative-imports camera_macos.zig on macOS / camera_stub.zig elsewhere).
+    // Uses harness, so link_libc=true for the same reason as harness_test_mod
+    // (also needed for std.c.nanosleep/getenv via objc_runtime in camera_macos.zig).
     const camera_test_mod = b.createModule(.{
         .root_source_file = b.path("core/camera.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // harness.init() 系が libc getenv を使う + macOS: objc_runtime の nanosleep
+        .link_libc = true, // harness.init() path uses libc getenv + macOS: objc_runtime nanosleep
     });
     camera_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     camera_test_mod.addImport("harness", shared_modules.harness.mod);
-    camera_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: camera_macos.zig が named import で参照（TASK-49.6）
+    camera_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: camera_macos.zig references via named import
     const camera_test = b.addTest(.{ .root_module = camera_test_mod });
-    // TASK-49.2: macOS は camera_macos.zig が AVFoundation(ObjC専用API)を objc_runtime 経由で
-    // 叩くため、テスト実行はしない（設定検証のみ自動）が compile+link には必要な framework 一式を
-    // 明示リンクする（他OS は camera_stub.zig のまま追加不要）。
+    // On macOS camera_macos.zig drives AVFoundation (ObjC-only APIs) via objc_runtime, so
+    // tests are not executed here (config check only is automatic) but compile+link still needs the full
+    // framework set linked explicitly (other OSes stay on camera_stub.zig with no extras).
     if (target.result.os.tag == .macos) linkCaptureMacFrameworks(b, camera_test_mod, sdk_paths.?);
     test_capture_types_step.dependOn(&b.addRunArtifact(camera_test).step);
 
-    // core/audio.zig（capture 拡張含む全体）。既存出力 backend（audio_macos 等）への `switch` は
-    // 残るが、出力側の関数は本テストのどの test からも呼ばれないため Zig の lazy analysis で
-    // 未参照のまま留まる（実測確認済み）。capture 側は macOS で実 backend
-    // （`audio_macos.zig` の `capture` 名前空間。TASK-49.2）を経由するため link_libc=true
-    // （objc_runtime 経由 std.c.nanosleep/getenv）が必要。
+    // core/audio.zig (whole file including capture extension). The `switch` on existing output backends
+    // (audio_macos etc.) remains, but no test here calls output-side functions, so Zig lazy analysis
+    // leaves them unreferenced. Capture on macOS goes through the real backend
+    // (`capture` namespace in `audio_macos.zig`), so link_libc=true
+    // (std.c.nanosleep/getenv via objc_runtime) is required.
     const audio_capture_test_mod = b.createModule(.{
         .root_source_file = b.path("core/audio.zig"),
         .target = target,
@@ -922,33 +922,33 @@ pub fn build(b: *std.Build) void {
     });
     audio_capture_test_mod.addImport("harness", shared_modules.harness.mod);
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
-    audio_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: audio_macos.zig が named import で参照（TASK-49.6）
+    audio_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: audio_macos.zig references via named import
     if (target.result.os.tag == .linux) audio_capture_test_mod.linkSystemLibrary("alsa", .{});
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
-    // TASK-49.2: macOS の mic capture（AUHAL input）は AudioToolbox/CoreAudio + 権限確認の
-    // AVFoundation(ObjC)を使うため framework を明示リンクする（他OS は audio_capture_stub.zig の
-    // まま追加不要）。
+    // On macOS mic capture (AUHAL input) uses AudioToolbox/CoreAudio + permission-check
+    // AVFoundation (ObjC), so frameworks are linked explicitly (other OSes stay on audio_capture_stub.zig
+    // with no extras).
     if (target.result.os.tag == .macos) linkCaptureMacFrameworks(b, audio_capture_test_mod, sdk_paths.?);
     test_capture_types_step.dependOn(&b.addRunArtifact(audio_capture_test).step);
 
-    // TASK-49.2 実測知見: `zig test` は「root file 自身の test」のみを収集・実行し、root file が
-    // 相対 `@import` する別ファイル（`camera_macos.zig`/`audio_macos.zig` 等）側の test は
-    // 収集されない（root=camera.zig/audio.zig の `camera_test`/`audio_capture_test` はコンパイル
-    // ＝リンクは通るが、それらのファイル内の test は実行数に現れないことを実測確認済み）。
-    // よって `capture_synthetic_test` と同じ方針で、root を直接そのファイルにした専用 addTest を
-    // macOS のみ追加し、`copyBgraRows`/`mapAuthStatus`/config 検証等の自動テストを実際に実行させる。
-    // `objc_runtime.zig`（msgSend/stack block。最も壊れやすい部分）は camera_macos.zig/
-    // audio_macos.zig の双方から相対 import されるため、それらの root test に載って間接的に
-    // 実行される（実測確認済み: root file 自身の「直接の」相対 import は収集対象になる。上記の
-    // 「収集されない」制約は root を跨いだ2段階の間接 import にのみ働く）。ただし依存関係を
-    // 前提にせず明示的に検証できるよう、root を直接 core/objc_runtime.zig にした専用 addTest も
-    // 追加する（codex レビュー指摘）。
+    // `zig test` collects/runs only tests on the root file itself; tests in files the root
+    // relative-`@import`s (`camera_macos.zig`/`audio_macos.zig` etc.) are
+    // not collected (root=camera.zig/audio.zig `camera_test`/`audio_capture_test` compile
+    // and link, but tests inside those files do not appear in the run count).
+    // So, same policy as `capture_synthetic_test`: add dedicated addTest rooted directly at those files
+    // on macOS only, so `copyBgraRows`/`mapAuthStatus`/config checks etc. actually run.
+    // `objc_runtime.zig` (msgSend/stack block; the most fragile part) is relative-imported from both
+    // camera_macos.zig and audio_macos.zig, so it runs indirectly via those root tests
+    // (a root file's direct relative imports are collected; the
+    // "not collected" rule applies only to two-hop cross-root indirect imports). Still, to verify
+    // without relying on that dependency, also add a dedicated addTest
+    // rooted directly at core/objc_runtime.zig.
     if (target_os == .macos) {
         const objc_runtime_test_mod = b.createModule(.{
             .root_source_file = b.path("core/objc_runtime.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true, // std.c.nanosleep/getenv 用
+            .link_libc = true, // for std.c.nanosleep/getenv
         });
         linkCaptureMacFrameworks(b, objc_runtime_test_mod, sdk_paths.?);
         const objc_runtime_test = b.addTest(.{ .root_module = objc_runtime_test_mod });
@@ -958,10 +958,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("core/camera_macos.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true, // objc_runtime 経由の std.c.nanosleep/getenv 用
+            .link_libc = true, // for std.c.nanosleep/getenv via objc_runtime
         });
         camera_macos_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
-        camera_macos_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // TASK-49.6: 相対→named import 化
+        camera_macos_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // relative → named import
         linkCaptureMacFrameworks(b, camera_macos_test_mod, sdk_paths.?);
         const camera_macos_test = b.addTest(.{ .root_module = camera_macos_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(camera_macos_test).step);
@@ -973,7 +973,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         audio_macos_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
-        audio_macos_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // TASK-49.6: 相対→named import 化
+        audio_macos_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // relative → named import
         linkCaptureMacFrameworks(b, audio_macos_capture_test_mod, sdk_paths.?);
         const audio_macos_capture_test = b.addTest(.{ .root_module = audio_macos_capture_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_macos_capture_test).step);
@@ -1002,9 +1002,9 @@ pub fn build(b: *std.Build) void {
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_linux_capture_test).step);
     }
 
-    // core/capture_synthetic.zig（harness 内蔵 synthetic capture source。TASK-49.5）。
-    // capture_types にのみ依存（camera/audio facade への配線は無い）。audio 生成スレッドの
-    // std.c.nanosleep 用に link_libc=true（core/audio_null.zig の test と同じ理由）。
+    // core/capture_synthetic.zig (harness-built-in synthetic capture source).
+    // Depends only on capture_types (no wiring into camera/audio facades). link_libc=true for
+    // std.c.nanosleep on the audio generation thread (same reason as the core/audio_null.zig test).
     const capture_synthetic_test_mod = b.createModule(.{
         .root_source_file = b.path("core/capture_synthetic.zig"),
         .target = target,
@@ -1015,19 +1015,19 @@ pub fn build(b: *std.Build) void {
     const capture_synthetic_test = b.addTest(.{ .root_module = capture_synthetic_test_mod });
     test_capture_types_step.dependOn(&b.addRunArtifact(capture_synthetic_test).step);
 
-    // canvas.zig 単体テスト
+    // canvas.zig unit tests
     const canvas_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/canvas.zig"),
         .target = target,
         .optimize = optimize,
     });
-    canvas_test_mod.addImport("pixelops", shared_modules.pixelops.mod); // blend.zig facade 経由（TASK-51）
-    canvas_test_mod.addImport("font", shared_modules.font.mod); // text_render.zig 経由（TASK-79.5）
+    canvas_test_mod.addImport("pixelops", shared_modules.pixelops.mod); // via blend.zig facade
+    canvas_test_mod.addImport("font", shared_modules.font.mod); // via text_render.zig
     const canvas_test = b.addTest(.{ .root_module = canvas_test_mod });
     const run_canvas_test = b.addRunArtifact(canvas_test);
     test_png_roundtrip_step.dependOn(&run_canvas_test.step);
 
-    // blend.zig 単体テスト（pixelops への facade 疎通。ブレンド本体のテストは test-pixelops）
+    // blend.zig unit tests (facade plumbing to pixelops; blend body tests live in test-pixelops)
     const blend_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/blend.zig"),
         .target = target,
@@ -1038,7 +1038,7 @@ pub fn build(b: *std.Build) void {
     const run_blend_test = b.addRunArtifact(blend_test);
     test_png_roundtrip_step.dependOn(&run_blend_test.step);
 
-    // libs/pixelops 単体テスト（premul/straight blend の SIMD vs scalar 一致・div255 恒等・clipBlit 境界）
+    // libs/pixelops unit tests (SIMD vs scalar premul/straight blend; div255 identity; clipBlit edges)
     const pixelops_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("libs/pixelops/src/lib.zig"),
@@ -1050,7 +1050,7 @@ pub fn build(b: *std.Build) void {
     const test_pixelops_step = b.step("test-pixelops", "Run libs/pixelops blend/div255/clip-hoist tests");
     test_pixelops_step.dependOn(&run_pixelops_test.step);
 
-    // libs/gmath 単体テスト（Vec2 / Rect / scalar / 衝突。platform 非依存。TASK-111.1）
+    // libs/gmath unit tests (Vec2 / Rect / scalar / collision; platform-independent)
     const gmath_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("libs/gmath/src/lib.zig"),
@@ -1062,7 +1062,7 @@ pub fn build(b: *std.Build) void {
     const test_gmath_step = b.step("test-gmath", "Run libs/gmath unit tests");
     test_gmath_step.dependOn(&run_gmath_test.step);
 
-    // libs/serde 単体テスト（versioned container の round-trip / 破損検出 / 前方互換 / 固定 fixture。TASK-62.2）
+    // libs/serde unit tests (versioned-container round-trip / corruption / forward compat / fixed fixtures)
     const serde_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("libs/serde/src/serde.zig"),
@@ -1074,12 +1074,12 @@ pub fn build(b: *std.Build) void {
     const test_serde_step = b.step("test-serde", "Run libs/serde versioned container tests");
     test_serde_step.dependOn(&run_serde_test.step);
 
-    // libs/appshell 単体テスト（設定 / window state / recent files。TASK-114.1）
+    // libs/appshell unit tests (settings / window state / recent files)
     const appshell_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/appshell/src/appshell.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // paths.zig の std.c.getenv 用
+        .link_libc = true, // for std.c.getenv in paths.zig
     });
     appshell_test_mod.addImport("serde", shared_modules.serde.mod);
     const appshell_test = b.addTest(.{ .root_module = appshell_test_mod });
@@ -1087,7 +1087,7 @@ pub fn build(b: *std.Build) void {
     const test_appshell_step = b.step("test-appshell", "Run libs/appshell persistence tests");
     test_appshell_step.dependOn(&run_appshell_test.step);
 
-    // libs/recipe 単体テスト（CommandRecord 列 save/load。TASK-62.5.8。serde に依存）
+    // libs/recipe unit tests (CommandRecord-sequence save/load; depends on serde)
     const recipe_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/recipe/src/recipe.zig"),
         .target = target,
@@ -1099,8 +1099,8 @@ pub fn build(b: *std.Build) void {
     const test_recipe_step = b.step("test-recipe", "Run libs/recipe save/load / collect / app_name tests");
     test_recipe_step.dependOn(&run_recipe_test.step);
 
-    // editor/core テスト (undo: stroke 記録 + undo/redo + PNG round-trip, tool: Tool ゴールデン)
-    // + pixie canvas_input (入力状態機械: capture / 外 release / 外継続 / stroke 中無視)
+    // editor/core tests (undo: stroke record + undo/redo + PNG round-trip; tool: Tool golden)
+    // + pixie canvas_input (input state machine: capture / outside release / outside continue / ignore during stroke)
     const core_undo_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/undo.zig"),
         .target = target,
@@ -1108,7 +1108,7 @@ pub fn build(b: *std.Build) void {
     });
     core_undo_mod.addImport("png", shared_modules.png.mod);
     core_undo_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_undo_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_undo_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_undo_test = b.addTest(.{ .root_module = core_undo_mod });
     const run_core_undo_test = b.addRunArtifact(core_undo_test);
 
@@ -1119,12 +1119,12 @@ pub fn build(b: *std.Build) void {
     });
     core_tool_mod.addImport("png", shared_modules.png.mod);
     core_tool_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_tool_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_tool_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_tool_test = b.addTest(.{ .root_module = core_tool_mod });
     const run_core_tool_test = b.addRunArtifact(core_tool_test);
 
-    // 塗りつぶし（バケツ）flood fill + Fill Tool（TASK-76）。tool.zig と同様 png/pixelops が要る
-    // （PNG round-trip テスト + canvas.zig 経由の pixelops）。
+    // Flood fill + Fill Tool. Needs png/pixelops like tool.zig
+    // (PNG round-trip tests + pixelops via canvas.zig).
     const core_fill_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/fill.zig"),
         .target = target,
@@ -1132,11 +1132,11 @@ pub fn build(b: *std.Build) void {
     });
     core_fill_mod.addImport("png", shared_modules.png.mod);
     core_fill_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_fill_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_fill_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_fill_test = b.addTest(.{ .root_module = core_fill_mod });
     const run_core_fill_test = b.addRunArtifact(core_fill_test);
 
-    // シェイプラスタライズ（TASK-90）。std のみの純関数（canvas 非依存）。
+    // Shape rasterize. Pure std-only function (no canvas).
     const core_shape_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/shape.zig"),
         .target = target,
@@ -1145,8 +1145,8 @@ pub fn build(b: *std.Build) void {
     const core_shape_test = b.addTest(.{ .root_module = core_shape_mod });
     const run_core_shape_test = b.addRunArtifact(core_shape_test);
 
-    // ベジェ/ベクターパス（TASK-21.13）。bezier=pure。path/path_editor は相対 import 先（undo/path の test）が
-    // png を使うため import 要（Zig は同一モジュール内 @import 先の test もコンパイルする）。
+    // Bezier/vector path. bezier=pure. path/path_editor need the import because relative-import targets
+    // (undo/path tests) use png (Zig also compiles tests in same-module @import targets).
     const core_bezier_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/bezier.zig"),
         .target = target,
@@ -1162,7 +1162,7 @@ pub fn build(b: *std.Build) void {
     });
     core_path_mod.addImport("png", shared_modules.png.mod);
     core_path_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_path_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_path_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_path_test = b.addTest(.{ .root_module = core_path_mod });
     const run_core_path_test = b.addRunArtifact(core_path_test);
 
@@ -1173,12 +1173,12 @@ pub fn build(b: *std.Build) void {
     });
     core_path_editor_mod.addImport("png", shared_modules.png.mod);
     core_path_editor_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_path_editor_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_path_editor_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_path_editor_test = b.addTest(.{ .root_module = core_path_editor_mod });
     const run_core_path_editor_test = b.addRunArtifact(core_path_editor_test);
 
-    // Document / document_io（TASK-63）。document_io.zig root で document.zig の test も含む。
-    // serde(container) / png(exportPngSequence の decode 検証) / pixelops(canvas 経由) が要る。
+    // Document / document_io. document_io.zig root also includes document.zig tests.
+    // Needs serde(container) / png(exportPngSequence decode check) / pixelops(via canvas).
     const core_document_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/document_io.zig"),
         .target = target,
@@ -1187,7 +1187,7 @@ pub fn build(b: *std.Build) void {
     core_document_mod.addImport("serde", shared_modules.serde.mod);
     core_document_mod.addImport("png", shared_modules.png.mod);
     core_document_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_document_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_document_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_document_test = b.addTest(.{ .root_module = core_document_mod });
     const run_core_document_test = b.addRunArtifact(core_document_test);
 
@@ -1200,14 +1200,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     canvas_input_core.addImport("pixelops", shared_modules.pixelops.mod);
-    canvas_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    canvas_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png
     canvas_input_core.addImport("serde", shared_modules.serde.mod);
-    canvas_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    canvas_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig
     canvas_input_mod.addImport("paint", canvas_input_core);
     const canvas_input_test = b.addTest(.{ .root_module = canvas_input_mod });
     const run_canvas_input_test = b.addRunArtifact(canvas_input_test);
 
-    // 範囲選択 core（TASK-44）。@import("undo.zig") 経由で undo の png 使用テストもコンパイルされるため png 要。
+    // Selection core. Needs png because @import("undo.zig") also compiles undo's png-using tests.
     const core_selection_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/selection.zig"),
         .target = target,
@@ -1215,11 +1215,11 @@ pub fn build(b: *std.Build) void {
     });
     core_selection_mod.addImport("png", shared_modules.png.mod);
     core_selection_mod.addImport("pixelops", shared_modules.pixelops.mod);
-    core_selection_mod.addImport("font", shared_modules.font.mod); // canvas.zig → text_render.zig 経由（TASK-79.5）
+    core_selection_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
     const core_selection_test = b.addTest(.{ .root_module = core_selection_mod });
     const run_core_selection_test = b.addRunArtifact(core_selection_test);
 
-    // 範囲選択の入力アダプタ（TASK-44）。core を名前付き import（canvas_input と同型・png 不要）
+    // Selection input adapter. Named-import core (same shape as canvas_input; no png)
     const selection_input_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1229,14 +1229,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     selection_input_core.addImport("pixelops", shared_modules.pixelops.mod);
-    selection_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    selection_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png
     selection_input_core.addImport("serde", shared_modules.serde.mod);
-    selection_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    selection_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig
     selection_input_mod.addImport("paint", selection_input_core);
     const selection_input_test = b.addTest(.{ .root_module = selection_input_mod });
     const run_selection_input_test = b.addRunArtifact(selection_input_test);
 
-    // シェイプ入力アダプタ（TASK-90）。core を名前付き import（selection_input と同型）
+    // Shape input adapter. Named-import core (same shape as selection_input)
     const shape_input_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1253,7 +1253,7 @@ pub fn build(b: *std.Build) void {
     const shape_input_test = b.addTest(.{ .root_module = shape_input_mod });
     const run_shape_input_test = b.addRunArtifact(shape_input_test);
 
-    // ベジェ入力アダプタ（TASK-21.13）。core を名前付き import（canvas_input と同型）
+    // Bezier input adapter. Named-import core (same shape as canvas_input)
     const bezier_input_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1263,14 +1263,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bezier_input_core.addImport("pixelops", shared_modules.pixelops.mod);
-    bezier_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    bezier_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png
     bezier_input_core.addImport("serde", shared_modules.serde.mod);
-    bezier_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    bezier_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig
     bezier_input_mod.addImport("paint", bezier_input_core);
     const bezier_input_test = b.addTest(.{ .root_module = bezier_input_mod });
     const run_bezier_input_test = b.addRunArtifact(bezier_input_test);
 
-    // スポイトの入力アダプタ（TASK-68）。core を名前付き import（selection_input/bezier_input と同型）
+    // Eyedropper input adapter. Named-import core (same shape as selection_input/bezier_input)
     const eyedropper_input_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1280,14 +1280,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     eyedropper_input_core.addImport("pixelops", shared_modules.pixelops.mod);
-    eyedropper_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    eyedropper_input_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png
     eyedropper_input_core.addImport("serde", shared_modules.serde.mod);
-    eyedropper_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    eyedropper_input_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig
     eyedropper_input_mod.addImport("paint", eyedropper_input_core);
     const eyedropper_input_test = b.addTest(.{ .root_module = eyedropper_input_mod });
     const run_eyedropper_input_test = b.addRunArtifact(eyedropper_input_test);
 
-    // ブラシ footprint 縁セルキャッシュ（TASK-75.4）。gui/kit 非依存の純ロジック。core を名前付き import（canvas_input と同型）
+    // Brush footprint edge-cell cache. Pure logic; no gui/kit. Named-import core (same shape as canvas_input)
     const brush_edge_cache_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1297,21 +1297,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     brush_edge_cache_core.addImport("pixelops", shared_modules.pixelops.mod);
-    brush_edge_cache_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png（TASK-63）
+    brush_edge_cache_core.addImport("png", shared_modules.png.mod); // paint.zig → document_io/io_png
     brush_edge_cache_core.addImport("serde", shared_modules.serde.mod);
-    brush_edge_cache_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    brush_edge_cache_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig
     brush_edge_cache_mod.addImport("paint", brush_edge_cache_core);
     const brush_edge_cache_test = b.addTest(.{ .root_module = brush_edge_cache_mod });
     const run_brush_edge_cache_test = b.addRunArtifact(brush_edge_cache_test);
 
-    // pixie blit（canvas zoom 転送 + チェッカー。TASK-54）。core を名前付き import（canvas_input と同型）
+    // pixie blit (canvas zoom transfer + checker). Named-import core (same shape as canvas_input)
     const blit_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
     blit_core.addImport("png", shared_modules.png.mod);
     blit_core.addImport("pixelops", shared_modules.pixelops.mod);
-    blit_core.addImport("serde", shared_modules.serde.mod); // paint.zig → document_io（TASK-63）
-    blit_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    blit_core.addImport("serde", shared_modules.serde.mod); // paint.zig → document_io
+    blit_core.addImport("font", shared_modules.font.mod); // paint.zig → canvas.zig → text_render.zig
     const blit_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
         .target = target,
@@ -1322,7 +1322,7 @@ pub fn build(b: *std.Build) void {
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
 
-    // pixie zoom（TASK-153.2）。rational Zoom + 座標変換。paint 名前付き import。
+    // pixie zoom. rational Zoom + coordinate transforms. Named-import paint.
     const zoom_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1339,7 +1339,7 @@ pub fn build(b: *std.Build) void {
     const zoom_test = b.addTest(.{ .root_module = zoom_test_mod });
     const run_zoom_test = b.addRunArtifact(zoom_test);
 
-    // pixie minimap（TASK-153.3）。キャッシュ・写像純ロジック。
+    // pixie minimap. Cache / mapping pure logic.
     const minimap_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1356,7 +1356,7 @@ pub fn build(b: *std.Build) void {
     const minimap_test = b.addTest(.{ .root_module = minimap_test_mod });
     const run_minimap_test = b.addRunArtifact(minimap_test);
 
-    // history_thumbnail（TASK-83.2）。PixelDiff → 24×24 bbox サムネイル。paint 名前付き import。
+    // history_thumbnail. PixelDiff → 24×24 bbox thumbnail. Named-import paint.
     const history_thumbnail_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1372,10 +1372,10 @@ pub fn build(b: *std.Build) void {
     history_thumbnail_mod.addImport("paint", history_thumbnail_core);
     const history_thumbnail_test = b.addTest(.{ .root_module = history_thumbnail_mod });
     const run_history_thumbnail_test = b.addRunArtifact(history_thumbnail_test);
-    const test_history_thumbnail_step = b.step("test-history-thumbnail", "Run history_thumbnail unit tests (TASK-83.2)");
+    const test_history_thumbnail_step = b.step("test-history-thumbnail", "Run history_thumbnail unit tests");
     test_history_thumbnail_step.dependOn(&run_history_thumbnail_test.step);
 
-    // onion_skin（TASK-45.3）。paint 内の表示専用オニオン合成。
+    // onion_skin. Display-only onion composite inside paint.
     const onion_skin_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/onion_skin.zig"),
         .target = target,
@@ -1388,7 +1388,7 @@ pub fn build(b: *std.Build) void {
     const onion_skin_test = b.addTest(.{ .root_module = onion_skin_test_mod });
     const run_onion_skin_test = b.addRunArtifact(onion_skin_test);
 
-    // pixie palette（モデル + GIMP .gpl）。pure（std のみ・import 不要）。
+    // pixie palette (model + GIMP .gpl). pure (std only; no imports).
     const palette_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/editor/apps/pixie/palette.zig"),
@@ -1398,7 +1398,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_palette_test = b.addRunArtifact(palette_test);
 
-    // pixie action の純パーサ（TASK-64）。std のみ・App/kit 非依存で import 不要。
+    // pixie action pure parser. std only; no App/kit; no imports.
     const actions_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/editor/apps/pixie/actions.zig"),
@@ -1408,7 +1408,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_actions_test = b.addRunArtifact(actions_test);
 
-    // pixie 視覚差分（TASK-87）。std のみ・App/kit 非依存で import 不要。
+    // pixie visual diff. std only; no App/kit; no imports.
     const diff_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/editor/apps/pixie/diff.zig"),
@@ -1418,7 +1418,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_diff_test = b.addRunArtifact(diff_test);
 
-    // history summary schema（TASK-62.5.5）。kit.platform.command 型を使うため default backend の kit を配線。
+    // history summary schema. Wires default-backend kit because it uses kit.platform.command types.
     const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
     const history_summary_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/history_summary.zig"),
@@ -1428,10 +1428,10 @@ pub fn build(b: *std.Build) void {
     history_summary_mod.addImport("kit", history_summary_pm.kit.mod);
     const history_summary_test = b.addTest(.{ .root_module = history_summary_mod });
     const run_history_summary_test = b.addRunArtifact(history_summary_test);
-    const test_history_summary_step = b.step("test-history-summary", "Run history_summary schema unit tests (TASK-62.5.5)");
+    const test_history_summary_step = b.step("test-history-summary", "Run history_summary schema unit tests");
     test_history_summary_step.dependOn(&run_history_summary_test.step);
 
-    // レイヤー名インライン編集の入力状態機械（TASK-79.3）。std のみ・paint/App/kit 非依存で import 不要。
+    // Layer-name inline-edit input state machine. std only; no paint/App/kit; no imports.
     const layer_rename_input_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/editor/apps/pixie/layer_rename_input.zig"),
@@ -1441,8 +1441,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_layer_rename_input_test = b.addRunArtifact(layer_rename_input_test);
 
-    // テキストレイヤー内容編集の入力状態機械（TASK-79.5）。layer_rename_input.zig と同じ設計
-    // パターンの独立実装。std のみ・paint/App/kit 非依存で import 不要。
+    // Text-layer content-edit input state machine. Independent implementation of the same design
+    // pattern as layer_rename_input.zig. std only; no paint/App/kit; no imports.
     const text_content_input_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/editor/apps/pixie/text_content_input.zig"),
@@ -1481,7 +1481,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_text_content_input_test.step);
 
     // ========================================
-    // PNG デコーダー format.zig テスト
+    // PNG decoder format.zig tests
     // ========================================
     const png_format_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1495,8 +1495,8 @@ pub fn build(b: *std.Build) void {
     test_png_format_step.dependOn(&run_png_format_test.step);
 
     // ========================================
-    // platform_linux_input.zig テスト（X11 入力の純粋変換: keycode/modifier/EventQueue/KeyDownSet）
-    // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.3）
+    // platform_linux_input.zig tests (pure X11 input convert: keycode/modifier/EventQueue/KeyDownSet)
+    // Pure Zig (no @cImport), so it runs OS-independently on the host too
     // ========================================
     const platform_input_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_linux_input.zig"),
@@ -1510,8 +1510,8 @@ pub fn build(b: *std.Build) void {
     test_platform_input_step.dependOn(&run_platform_input_test.step);
 
     // ========================================
-    // platform_linux_convert.zig テスト（X11 pixel 変換の純粋ロジック: packPixel/maskShift/classifyVisual）
-    // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.6 / AC#4）
+    // platform_linux_convert.zig tests (pure X11 pixel convert: packPixel/maskShift/classifyVisual)
+    // Pure Zig (no @cImport), so it runs OS-independently on the host too
     // ========================================
     const platform_convert_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1525,8 +1525,8 @@ pub fn build(b: *std.Build) void {
     test_platform_convert_step.dependOn(&run_platform_convert_test.step);
 
     // ========================================
-    // platform_wayland_input.zig テスト（Wayland 入力の純粋変換: evdev+8/BTN_*/wl_fixed/xkb modifier/
-    // axis scroll/scroll coalesce/repeat timing）。純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-28.5.3）
+    // platform_wayland_input.zig tests (pure Wayland input convert: evdev+8/BTN_*/wl_fixed/xkb modifier/
+    // axis scroll/scroll coalesce/repeat timing). Pure Zig (no @cImport), so it runs OS-independently on the host too
     // ========================================
     const platform_wayland_input_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_wayland_input.zig"),
@@ -1540,8 +1540,8 @@ pub fn build(b: *std.Build) void {
     test_platform_wayland_input_step.dependOn(&run_platform_wayland_input_test.step);
 
     // ========================================
-    // platform_wayland_csd.zig テスト（Wayland CSD 装飾の純ロジック: レイアウト/ヒットテスト/
-    // window geometry ⇄ content サイズ変換/装飾描画）。純 Zig（@cImport なし）なので host でも回る（TASK-28.5.6）
+    // platform_wayland_csd.zig tests (pure Wayland CSD decoration logic: layout/hit-test/
+    // window geometry ⇄ content size convert/decoration draw). Pure Zig (no @cImport), so it runs on the host too
     // ========================================
     const platform_wayland_csd_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_wayland_csd.zig"),
@@ -1554,8 +1554,8 @@ pub fn build(b: *std.Build) void {
     test_platform_wayland_csd_step.dependOn(&run_platform_wayland_csd_test.step);
 
     // ========================================
-    // platform_windows_input.zig テスト（Windows 入力の純粋変換: VK→KeyCode/modifier(post-state)/wheel 符号）
-    // 純 Zig（@cImport なし）なので OS 非依存で host でも回る（TASK-31 / AC#3）
+    // platform_windows_input.zig tests (pure Windows input convert: VK→KeyCode/modifier(post-state)/wheel sign)
+    // Pure Zig (no @cImport), so it runs OS-independently on the host too
     // ========================================
     const platform_windows_input_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_windows_input.zig"),
@@ -1569,21 +1569,21 @@ pub fn build(b: *std.Build) void {
     test_platform_windows_input_step.dependOn(&run_platform_windows_input_test.step);
 
     // ========================================
-    // text.zig テスト (BDF パーサ + 描画)
+    // text.zig tests (BDF parser + draw)
     // ========================================
     const text_test_mod = b.createModule(.{
         .root_source_file = b.path("src/text.zig"),
         .target = target,
         .optimize = optimize,
     });
-    text_test_mod.addImport("font", shared_modules.font.mod); // text.zig が共通 Font IF を利用
+    text_test_mod.addImport("font", shared_modules.font.mod); // text.zig uses the shared Font IF
     const text_test = b.addTest(.{ .root_module = text_test_mod });
     const run_text_test = b.addRunArtifact(text_test);
     const test_text_step = b.step("test-text", "Run BDF parser and text rendering tests");
     test_text_step.dependOn(&run_text_test.step);
 
     // ========================================
-    // libs/gfx/src/sprite.zig テスト (blend / drawSprite / drawSpriteEx)
+    // libs/gfx/src/sprite.zig tests (blend / drawSprite / drawSpriteEx)
     // ========================================
     const sprite_test_png = b.createModule(.{
         .root_source_file = b.path("libs/png/src/lib.zig"),
@@ -1605,8 +1605,8 @@ pub fn build(b: *std.Build) void {
     test_sprite_step.dependOn(&run_sprite_test.step);
 
     // ========================================
-    // libs/gfx テスト（umbrella + 移設 helper。TASK-111.2/111.8）
-    // atlas/animation/camera/action_map は gfx.zig 相対 import + test { _ = ... } で収集。
+    // libs/gfx tests (umbrella + moved helpers)
+    // atlas/animation/camera/action_map are collected via gfx.zig relative import + test { _ = ... }.
     // ========================================
     const gfx_test_keyboard = b.createModule(.{
         .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
@@ -1624,7 +1624,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // action_map が @import("gamepad") するため、test root でも gamepad を共有（types 同一）。
+    // action_map @import("gamepad"), so the test root also shares gamepad (same types).
     const gfx_test_gamepad = b.createModule(.{
         .root_source_file = b.path("src/gamepad.zig"),
         .target = target,
@@ -1642,7 +1642,7 @@ pub fn build(b: *std.Build) void {
     gfx_test_root.addImport("keyboard", gfx_test_keyboard);
     gfx_test_root.addImport("gamepad", gfx_test_gamepad);
     gfx_test_root.addImport("platform_types", shared_modules.types.mod);
-    gfx_test_root.addImport("gmath", shared_modules.gmath.mod); // TileMap（TASK-111.5）
+    gfx_test_root.addImport("gmath", shared_modules.gmath.mod); // TileMap
     const gfx_test = b.addTest(.{ .root_module = gfx_test_root });
     const run_gfx_test = b.addRunArtifact(gfx_test);
     const run_gfx_ft_test = b.addRunArtifact(b.addTest(.{ .root_module = gfx_test_ft }));
@@ -1655,9 +1655,9 @@ pub fn build(b: *std.Build) void {
     test_gfx_step.dependOn(&run_gfx_kb_test.step);
 
     // ========================================
-    // kit テスト（toGuiEvent アダプタ等。TASK-111.7）
-    // kit/kit.zig を root にし、SharedModules の同一 instance を配線する
-    // （named module 経由で test が収集されない vacuous green を避ける。114.2 教訓）。
+    // kit tests (toGuiEvent adapter etc.)
+    // Root at kit/kit.zig and wire the same SharedModules instances
+    // (avoids vacuous green when tests are not collected through a named module).
     // ========================================
     const kit_test_app_runtime = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
@@ -1681,9 +1681,9 @@ pub fn build(b: *std.Build) void {
     test_kit_step.dependOn(&run_kit_test.step);
 
     // ========================================
-    // libs/gui テスト (geom / color / draw / font + input / id / state / context)
-    // gui.zig を root にすると参照する全ファイルの test がまとめて回る。
-    // SharedModules.gui は import 用なので、test 用に専用 module を作る。
+    // libs/gui tests (geom / color / draw / font + input / id / state / context)
+    // Rooting at gui.zig runs tests from every referenced file together.
+    // SharedModules.gui is for imports; build a dedicated module for tests.
     // ========================================
     const gui_test_root = b.createModule(.{
         .root_source_file = b.path("libs/gui/src/gui.zig"),
@@ -1698,8 +1698,8 @@ pub fn build(b: *std.Build) void {
     const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
     test_gui_step.dependOn(&run_gui_test.step);
 
-    // test-gui-leak（TASK-121.2）: PerIdStateStore のユニーク ID 単調増加を計測
-    // （libs/gui は変更しない。entry 数を回帰 assert、allocator bytes は notes 用に出力）
+    // test-gui-leak: measure PerIdStateStore unique-ID monotonic growth
+    // (do not change libs/gui. Assert entry count for regression; print allocator bytes for notes)
     const gui_leak_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/gui_leak.zig"),
         .target = target,
@@ -1708,25 +1708,25 @@ pub fn build(b: *std.Build) void {
     gui_leak_test_mod.addImport("gui", gui_test_root);
     const gui_leak_test = b.addTest(.{ .root_module = gui_leak_test_mod });
     const run_gui_leak_test = b.addRunArtifact(gui_leak_test);
-    // 計測行を常に表示（--summary all と併用しやすくする）
+    // Always show measurement lines (easier with --summary all)
     run_gui_leak_test.has_side_effects = true;
-    const test_gui_leak_step = b.step("test-gui-leak", "Run GUI PerIdStateStore leak measurement (TASK-121.2)");
+    const test_gui_leak_step = b.step("test-gui-leak", "Run GUI PerIdStateStore leak measurement");
     test_gui_leak_step.dependOn(&run_gui_leak_test.step);
 
-    // libs/font テスト (geom / color / Font インターフェース + カバレッジ描画路 + BMFont)
+    // libs/font tests (geom / color / Font IF + coverage draw path + BMFont)
     const font_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/font/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    font_test_mod.addImport("png", shared_modules.png.mod); // bmfont.zig が利用
-    font_test_mod.addImport("pixelops", shared_modules.pixelops.mod); // color.zig が利用（TASK-51）
+    font_test_mod.addImport("png", shared_modules.png.mod); // used by bmfont.zig
+    font_test_mod.addImport("pixelops", shared_modules.pixelops.mod); // used by color.zig
     const font_test = b.addTest(.{ .root_module = font_test_mod });
     const run_font_test = b.addRunArtifact(font_test);
     const test_font_step = b.step("test-font", "Run libs/font unit tests");
     test_font_step.dependOn(&run_font_test.step);
 
-    // libs/synth テスト (SPSC リング / NoteQueue / atomic パラメータ / 出力タップ)
+    // libs/synth tests (SPSC ring / NoteQueue / atomic params / output tap)
     const synth_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/synth/src/synth.zig"),
         .target = target,
@@ -1738,7 +1738,7 @@ pub fn build(b: *std.Build) void {
     const test_synth_step = b.step("test-synth", "Run libs/synth unit tests");
     test_synth_step.dependOn(&run_synth_test.step);
 
-    // libs/sound テスト（WAV デコード / SoundPlayer SE+BGM / RT ゼロアロケーション。TASK-111.6）
+    // libs/sound tests (WAV decode / SoundPlayer SE+BGM / RT zero-alloc)
     const sound_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/sound/src/sound.zig"),
         .target = target,
@@ -1751,7 +1751,7 @@ pub fn build(b: *std.Build) void {
     const test_sound_step = b.step("test-sound", "Run libs/sound unit tests");
     test_sound_step.dependOn(&run_sound_test.step);
 
-    // apps/synth action の純パーサ（TASK-65）。std のみ・App/kit/dsp 非依存で import 不要。
+    // apps/synth action pure parser. std only; no App/kit/dsp; no imports.
     const synth_actions_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/synth/actions.zig"),
@@ -1762,7 +1762,7 @@ pub fn build(b: *std.Build) void {
     const run_synth_actions_test = b.addRunArtifact(synth_actions_test);
     test_synth_step.dependOn(&run_synth_actions_test.step);
 
-    // apps/synth 音色/FX パラメータ直列化（TASK-65 serialize）。std + serde のみ・App/kit 非依存。
+    // apps/synth voice/FX param serialize. std + serde only; no App/kit.
     const synth_patch_io_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/synth/patch_io.zig"),
         .target = target,
@@ -1773,7 +1773,7 @@ pub fn build(b: *std.Build) void {
     const run_synth_patch_io_test = b.addRunArtifact(synth_patch_io_test);
     test_synth_step.dependOn(&run_synth_patch_io_test.step);
 
-    // libs/modular テスト（グラフエンジン: topo / cycle 遅延辺 / 単一接続 / per-sample / 可変 frames / 長時間レンダー）
+    // libs/modular tests (graph engine: topo / cycle delay edges / single connection / per-sample / variable frames / long render)
     const modular_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/modular/src/modular.zig"),
         .target = target,
@@ -1786,22 +1786,22 @@ pub fn build(b: *std.Build) void {
     const test_modular_step = b.step("test-modular", "Run libs/modular unit tests");
     test_modular_step.dependOn(&run_modular_test.step);
 
-    // apps/patch 生成レイヤテスト（LofiPatch の offline render: 非無音/有限/決定的 CRC）。
+    // apps/patch generative-layer tests (LofiPatch offline render: non-silent/finite/deterministic CRC).
     const modular_app_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/lofi.zig"),
         .target = target,
         .optimize = optimize,
     });
     modular_app_test_mod.addImport("modular", shared_modules.modular.mod);
-    modular_app_test_mod.addImport("synth", shared_modules.synth.mod); // patch が AtomicF32 を使う（chunk B）
-    modular_app_test_mod.addImport("dsp", shared_modules.dsp.mod); // patch が FFT で band energy を検証（Ph4）
-    modular_app_test_mod.addImport("serde", shared_modules.serde.mod); // project_io（GENR）経由
+    modular_app_test_mod.addImport("synth", shared_modules.synth.mod); // patch uses AtomicF32
+    modular_app_test_mod.addImport("dsp", shared_modules.dsp.mod); // patch verifies band energy via FFT
+    modular_app_test_mod.addImport("serde", shared_modules.serde.mod); // via project_io (GENR)
     const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
     const run_modular_app_test = b.addRunArtifact(modular_app_test);
     const test_app_modular_step = b.step("test-app-modular", "Run apps/patch LofiPatch tests");
     test_app_modular_step.dependOn(&run_modular_app_test.step);
 
-    // apps/patch generation action の純パーサ（TASK-65）。std のみ。
+    // apps/patch generation action pure parser. std only.
     const modular_actions_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/patch/gen_actions.zig"),
@@ -1812,7 +1812,7 @@ pub fn build(b: *std.Build) void {
     const run_modular_actions_test = b.addRunArtifact(modular_actions_test);
     test_app_modular_step.dependOn(&run_modular_actions_test.step);
 
-    // apps/patch WAV writer（TASK-86）。std のみ・ストリーミング PCM16 RIFF/WAVE。
+    // apps/patch WAV writer. std only; streaming PCM16 RIFF/WAVE.
     const modular_wav_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/patch/wav.zig"),
@@ -1823,8 +1823,8 @@ pub fn build(b: *std.Build) void {
     const run_modular_wav_test = b.addRunArtifact(modular_wav_test);
     test_app_modular_step.dependOn(&run_modular_wav_test.step);
 
-    // apps/patch scalar params + grid/303 pattern 直列化（TASK-65 serialize）。std + serde のみ・
-    // App/kit/modular 非依存（PatternPayload は plain struct。main.zig 側で PatternCommand と変換）。
+    // apps/patch scalar params + grid/303 pattern serialize. std + serde only;
+    // no App/kit/modular (PatternPayload is a plain struct; main.zig converts to/from PatternCommand).
     const modular_pattern_io_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/pattern_io.zig"),
         .target = target,
@@ -1835,7 +1835,7 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
-    // apps/patch 統合プロジェクト直列化（TASK-105.4 VPRJ）。serde + modular（graph_io）+ group/pattern_io。
+    // apps/patch integrated project serialize (VPRJ). serde + modular (graph_io) + group/pattern_io.
     const modular_project_io_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/project_io.zig"),
         .target = target,
@@ -1843,13 +1843,13 @@ pub fn build(b: *std.Build) void {
     });
     modular_project_io_test_mod.addImport("serde", shared_modules.serde.mod);
     modular_project_io_test_mod.addImport("modular", shared_modules.modular.mod);
-    // group.zig が build_options.max_modules を読む（相対 import・同一 module。TASK-146）
+    // group.zig reads build_options.max_modules (relative import; same module)
     modular_project_io_test_mod.addImport("build_options", max_modules_mod);
     const modular_project_io_test = b.addTest(.{ .root_module = modular_project_io_test_mod });
     const run_modular_project_io_test = b.addRunArtifact(modular_project_io_test);
     test_app_modular_step.dependOn(&run_modular_project_io_test.step);
 
-    // apps/patch seed derive（TASK-62.5.7）。std のみ。
+    // apps/patch seed derive. std only.
     const modular_seed_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/patch/seed.zig"),
@@ -1860,7 +1860,7 @@ pub fn build(b: *std.Build) void {
     const run_modular_seed_test = b.addRunArtifact(modular_seed_test);
     test_app_modular_step.dependOn(&run_modular_seed_test.step);
 
-    // apps/patch CommandRecord 配線契約（TASK-62.5.7）。command は std のみ・既存 API 利用。
+    // apps/patch CommandRecord wiring contract. command is std only; uses existing APIs.
     const modular_cmd_seed_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/cmd_seed_test.zig"),
         .target = target,
@@ -1871,7 +1871,7 @@ pub fn build(b: *std.Build) void {
     const run_modular_cmd_seed_test = b.addRunArtifact(modular_cmd_seed_test);
     test_app_modular_step.dependOn(&run_modular_cmd_seed_test.step);
 
-    // TASK-106.4: patch undo CommandAdapter 契約（pattern/ring/epoch。main 非依存）
+    // patch undo CommandAdapter contract (pattern/ring/epoch; no main)
     const patch_undo_cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/undo_cmd_test.zig"),
         .target = target,
@@ -1882,8 +1882,8 @@ pub fn build(b: *std.Build) void {
     const run_patch_undo_cmd_test = b.addRunArtifact(patch_undo_cmd_test);
     test_app_modular_step.dependOn(&run_patch_undo_cmd_test.step);
 
-    // apps/patch 純ロジックテスト集約 root（canvas: camera 変換 / hit-test / 見切れ検出 + group: グループ台帳 /
-    // expose 導出 / 表示写像。display/audio 不要。TASK-40.6.2 / 40.7.1）
+    // apps/patch pure-logic test aggregate root (canvas: camera transform / hit-test / clip detect + group: group ledger /
+    // expose derivation / display mapping. no display/audio)
     const patch_tests_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/tests.zig"),
         .target = target,
@@ -1891,14 +1891,14 @@ pub fn build(b: *std.Build) void {
     });
     patch_tests_mod.addImport("gui", shared_modules.gui.mod);
     patch_tests_mod.addImport("modular", shared_modules.modular.mod);
-    // group.zig が build_options.max_modules を読む（相対 import・同一 module。TASK-146）
+    // group.zig reads build_options.max_modules (relative import; same module)
     patch_tests_mod.addImport("build_options", max_modules_mod);
     const patch_tests = b.addTest(.{ .root_module = patch_tests_mod });
     const run_patch_tests = b.addRunArtifact(patch_tests);
     const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
     test_patch_step.dependOn(&run_patch_tests.step);
 
-    // apps/patch action の純パーサ（TASK-65）。std のみ・App/kit/modular 非依存で import 不要。
+    // apps/patch action pure parser. std only; no App/kit/modular; no imports.
     const patch_actions_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/patch/actions.zig"),
@@ -1909,8 +1909,8 @@ pub fn build(b: *std.Build) void {
     const run_patch_actions_test = b.addRunArtifact(patch_actions_test);
     test_patch_step.dependOn(&run_patch_actions_test.step);
 
-    // apps/patch ノード/エッジ構成の直列化（TASK-65 serialize）。std + serde + modular（ModuleKind の
-    // 単一ソース）のみ・App/kit/canvas 非依存。
+    // apps/patch node/edge topology serialize. std + serde + modular (ModuleKind
+    // single source) only; no App/kit/canvas.
     const patch_graph_io_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/graph_io.zig"),
         .target = target,
@@ -1922,7 +1922,7 @@ pub fn build(b: *std.Build) void {
     const run_patch_graph_io_test = b.addRunArtifact(patch_graph_io_test);
     test_patch_step.dependOn(&run_patch_graph_io_test.step);
 
-    // apps/patch マクロ builder テスト（DrumMachine テンプレ: preflight/rollback/決定性/発音回帰。TASK-40.7.1）
+    // apps/patch macro builder tests (DrumMachine template: preflight/rollback/determinism/sound regression)
     const patch_macro_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/macro.zig"),
         .target = target,
@@ -1934,7 +1934,7 @@ pub fn build(b: *std.Build) void {
     const test_macro_step = b.step("test-macro", "Run apps/patch macro (DrumMachine template) tests");
     test_macro_step.dependOn(&run_patch_macro_test.step);
 
-    // src/dsp テスト (Oscillator / Envelope / Filter / Mixer)
+    // src/dsp tests (Oscillator / Envelope / Filter / Mixer)
     const dsp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/dsp/dsp.zig"),
         .target = target,
@@ -1945,8 +1945,8 @@ pub fn build(b: *std.Build) void {
     const test_dsp_step = b.step("test-dsp", "Run src/dsp unit tests");
     test_dsp_step.dependOn(&run_dsp_test.step);
 
-    // src/gamepad.zig テスト（getButtonName/justPressed/justReleased/applyDeadzone。TASK-80.1）。
-    // platform_types のみに依存する headless lib（display/backend 不要）。
+    // src/gamepad.zig tests (getButtonName/justPressed/justReleased/applyDeadzone).
+    // Headless lib depending only on platform_types (no display/backend).
     const gamepad_test_mod = b.createModule(.{
         .root_source_file = b.path("src/gamepad.zig"),
         .target = target,
@@ -1958,7 +1958,7 @@ pub fn build(b: *std.Build) void {
     const test_gamepad_step = b.step("test-gamepad", "Run src/gamepad unit tests (ADR-009)");
     test_gamepad_step.dependOn(&run_gamepad_test.step);
 
-    // apps/synth スペクトログラム解析テスト (FFT 列ロジック)
+    // apps/synth spectrogram analysis tests (FFT column logic)
     const spec_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/viz/src/spectrogram.zig"),
         .target = target,
@@ -1970,7 +1970,7 @@ pub fn build(b: *std.Build) void {
     const test_spec_step = b.step("test-spectrogram", "Run apps/synth spectrogram tests");
     test_spec_step.dependOn(&run_spec_test.step);
 
-    // apps/synth オシロスコープ / レベルメータ解析テスト (TASK-27.16, dsp 非依存)
+    // apps/synth oscilloscope / level-meter analysis tests (dsp-independent)
     const scope_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/viz/src/scope.zig"),
         .target = target,
@@ -1982,9 +1982,9 @@ pub fn build(b: *std.Build) void {
     test_scope_step.dependOn(&run_scope_test.step);
 
     // ========================================
-    // 集約 test ステップ (全 test-* を束ねる)
-    // 注: ここはテスト実行のみ。example の build 回帰は通常の `zig build`（examples は常に全 backend install）で
-    //     カバーされる。`-Dinstall-all=true` は main/pixie も全 backend install する用途。
+    // Aggregate test step (bundles every test-*)
+    // Note: this runs tests only. Example build regression is covered by ordinary `zig build` (examples always install every backend).
+    //     `-Dinstall-all=true` also installs main/pixie for every backend.
     // ========================================
     const test_step = b.step("test", "Run all unit/integration tests");
     test_step.dependOn(test_frame_pacing_step);
@@ -2034,23 +2034,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_sound_step);
 
     // ========================================
-    // マイクロベンチ（TASK-50）。純ロジック計測（display / audio デバイス不要・OS 非依存）。
-    // optimize は ReleaseFast 固定: -Doptimize には従わない（Debug 計測事故の防止。
-    // 前後比較の基準を常に同一最適化レベルに保つ）。
+    // Micro-benchmarks. Pure-logic measurement (no display / audio device; OS-independent).
+    // optimize is fixed to ReleaseFast: ignores -Doptimize (prevents Debug measurement accidents.
+    // Keeps before/after comparisons on the same optimization level).
     // ========================================
     const bench_canvas_root = b.createModule(.{
         .root_source_file = b.path("bench/canvas.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    // bench 用 pixelops も ReleaseFast 固定で独立生成（共有インスタンスに引きずられない）
+    // Also build bench pixelops independently at ReleaseFast (do not inherit a shared instance)
     const bench_pixelops_mod = b.createModule(.{
         .root_source_file = b.path("libs/pixelops/src/lib.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    // bench 用 png/font も ReleaseFast 固定で独立生成（bench_canvas_core が canvas.zig →
-    // text_render.zig 経由で font を要するため、bench_gui 用の定義より前に前詰めする。TASK-79.5）。
+    // Also build bench png/font independently at ReleaseFast (bench_canvas_core needs font via
+    // canvas.zig → text_render.zig, so hoist them before the bench_gui definitions).
     const bench_png_mod = b.createModule(.{
         .root_source_file = b.path("libs/png/src/lib.zig"),
         .target = target,
@@ -2069,14 +2069,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_canvas_core.addImport("pixelops", bench_pixelops_mod);
-    bench_canvas_core.addImport("font", bench_font_mod); // text_render.zig 経由（TASK-79.5）
+    bench_canvas_core.addImport("font", bench_font_mod); // via text_render.zig
     bench_canvas_root.addImport("editor_canvas", bench_canvas_core);
     const bench_canvas_exe = b.addExecutable(.{ .name = "bench_canvas", .root_module = bench_canvas_root });
     const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
     bench_canvas_step.dependOn(&b.addRunArtifact(bench_canvas_exe).step);
 
-    // bench-sprite（TASK-111.2）: drawSprite / drawSpriteEx の plain/flip/2x/tint を計測。
-    // display/audio 非依存。前後比較は ReleaseFast 固定で notes に記録する。
+    // bench-sprite: measure drawSprite / drawSpriteEx plain/flip/2x/tint.
+    // No display/audio. Before/after comparisons stay on ReleaseFast.
     const bench_sprite_mod = b.createModule(.{
         .root_source_file = b.path("libs/gfx/src/sprite.zig"),
         .target = target,
@@ -2094,8 +2094,8 @@ pub fn build(b: *std.Build) void {
     const bench_sprite_step = b.step("bench-sprite", "Run sprite drawSprite/drawSpriteEx micro-benchmark (ReleaseFast)");
     bench_sprite_step.dependOn(&b.addRunArtifact(bench_sprite_exe).step);
 
-    // bench-yuyv（TASK-49.3）: V4L2 YUYV→BGRA の純粋な色変換を計測する。
-    // camera backend は libc の ioctl/mmap を使うが、ベンチは純関数だけを呼ぶためデバイス不要。
+    // bench-yuyv: measure pure V4L2 YUYV→BGRA color conversion.
+    // The camera backend uses libc ioctl/mmap, but the bench only calls the pure function so no device is needed.
     const bench_yuyv_root = b.createModule(.{
         .root_source_file = b.path("bench/yuyv.zig"),
         .target = target,
@@ -2114,15 +2114,15 @@ pub fn build(b: *std.Build) void {
     const bench_yuyv_step = b.step("bench-yuyv", "Run YUYV to BGRA micro-benchmark (ReleaseFast)");
     bench_yuyv_step.dependOn(&b.addRunArtifact(bench_yuyv_exe).step);
 
-    // bench-gui/-gui-frame/-blit/-viz が共有するピークメモリ計測 allocator（TASK-156.5 R10）
+    // Peak-memory measuring allocator shared by bench-gui/-gui-frame/-blit/-viz
     const bench_peak_allocator_mod = b.createModule(.{
         .root_source_file = b.path("bench/peak_allocator.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
 
-    // bench 用に dsp/synth を ReleaseFast で独立生成（shared_modules の共有インスタンスは
-    // 通常ビルドの optimize を引き継ぐため使わない）
+    // Build dsp/synth for benches independently at ReleaseFast (do not use shared_modules instances,
+    // which inherit the ordinary build's optimize)
     const bench_dsp_mod = b.createModule(.{
         .root_source_file = b.path("src/dsp/dsp.zig"),
         .target = target,
@@ -2144,8 +2144,8 @@ pub fn build(b: *std.Build) void {
     const bench_synth_step = b.step("bench-synth", "Run Synth.render / MasterEffects.process micro-benchmark (ReleaseFast)");
     bench_synth_step.dependOn(&b.addRunArtifact(bench_synth_exe).step);
 
-    // bench-gui（TASK-58）: rect_filled / image / text の描画を public API 経由で計測
-    // （bench_png_mod/bench_font_mod は上の bench_canvas_core 用に前詰め済み。TASK-79.5）
+    // bench-gui: measure rect_filled / image / text draw via the public API
+    // (bench_png_mod/bench_font_mod were hoisted above for bench_canvas_core)
     const bench_gui_mod = b.createModule(.{
         .root_source_file = b.path("libs/gui/src/gui.zig"),
         .target = target,
@@ -2164,7 +2164,7 @@ pub fn build(b: *std.Build) void {
     const bench_gui_step = b.step("bench-gui", "Run GUI render (rect/image/text) micro-benchmark (ReleaseFast)");
     bench_gui_step.dependOn(&b.addRunArtifact(bench_gui_exe).step);
 
-    // bench-gui-frame（TASK-121.2）: beginFrame → widget 構築 → endFrame → gui.render の full Context frame
+    // bench-gui-frame: full Context frame beginFrame → widget build → endFrame → gui.render
     const bench_gui_frame_root = b.createModule(.{
         .root_source_file = b.path("bench/gui_frame.zig"),
         .target = target,
@@ -2176,8 +2176,8 @@ pub fn build(b: *std.Build) void {
     const bench_gui_frame_step = b.step("bench-gui-frame", "Run GUI full Context frame benchmark 500/1000 rows (ReleaseFast)");
     bench_gui_frame_step.dependOn(&b.addRunArtifact(bench_gui_frame_exe).step);
 
-    // bench-gui-list-menu（TASK-121.4）: list/menu shell 500 行 full Context frame（ReleaseFast 固定）
-    // menuBar が command_types を要するため、bench_gui_mod とは別に gui module を組む。
+    // bench-gui-list-menu: list/menu shell 500-row full Context frame (ReleaseFast fixed)
+    // menuBar needs command_types, so build a separate gui module from bench_gui_mod.
     const bench_list_menu_cmd = b.createModule(.{
         .root_source_file = b.path("core/command_types.zig"),
         .target = target,
@@ -2213,7 +2213,7 @@ pub fn build(b: *std.Build) void {
     const bench_gui_list_menu_step = b.step("bench-gui-list-menu", "Run GUI list/menu shell full Context frame benchmark 500 rows (ReleaseFast)");
     bench_gui_list_menu_step.dependOn(&b.addRunArtifact(bench_gui_list_menu_exe).step);
 
-    // bench-blit（TASK-54）: pixie の canvas zoom 転送 + チェッカー背景（新旧比較を同時計測）
+    // bench-blit: pixie canvas zoom transfer + checker background (measure old/new together)
     const bench_blit_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
         .target = target,
@@ -2221,7 +2221,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_blit_core.addImport("png", bench_png_mod);
     bench_blit_core.addImport("pixelops", bench_pixelops_mod);
-    bench_blit_core.addImport("font", bench_font_mod); // paint.zig → canvas.zig → text_render.zig（TASK-79.5）
+    bench_blit_core.addImport("font", bench_font_mod); // paint.zig → canvas.zig → text_render.zig
     const bench_blit_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/blit.zig"),
         .target = target,
@@ -2241,7 +2241,7 @@ pub fn build(b: *std.Build) void {
     const bench_blit_step = b.step("bench-blit", "Run pixie canvas blit/checker micro-benchmark (ReleaseFast)");
     bench_blit_step.dependOn(&b.addRunArtifact(bench_blit_exe).step);
 
-    // bench-viz（TASK-156.4）: Spec/Scope/Meter 論理 bitmap + image scale 転送
+    // bench-viz: Spec/Scope/Meter logical bitmap + image scale transfer
     const bench_viz_spec = b.createModule(.{
         .root_source_file = b.path("libs/viz/src/spectrogram.zig"),
         .target = target,
@@ -2266,8 +2266,8 @@ pub fn build(b: *std.Build) void {
     const bench_viz_step = b.step("bench-viz", "Run patch viz bitmap/image scale micro-benchmark (ReleaseFast)");
     bench_viz_step.dependOn(&b.addRunArtifact(bench_viz_exe).step);
 
-    // bench-modular（TASK-61）: DynGraph.processBlock の gen スキップ効果を計測。
-    // modular は dsp のみ依存（test-modular と同じ）。ReleaseFast 固定で独立生成。
+    // bench-modular: measure DynGraph.processBlock gen-skip effect.
+    // modular depends only on dsp (same as test-modular). Built independently at ReleaseFast.
     const bench_modular_mod = b.createModule(.{
         .root_source_file = b.path("libs/modular/src/modular.zig"),
         .target = target,
@@ -2285,8 +2285,8 @@ pub fn build(b: *std.Build) void {
     const bench_modular_step = b.step("bench-modular", "Run DynGraph.processBlock micro-benchmark (ReleaseFast)");
     bench_modular_step.dependOn(&b.addRunArtifact(bench_modular_exe).step);
 
-    // bench-lofi（TASK-105.2）: LofiPatch.render の DynGraph 載せ替え前後を同一条件で比較。
-    // patch は pure-test root と同じく modular/synth/dsp のみを必要とする。
+    // bench-lofi: compare LofiPatch.render before/after DynGraph swap under the same conditions.
+    // patch needs only modular/synth/dsp, same as the pure-test root.
     const bench_lofi_patch_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/lofi.zig"),
         .target = target,
@@ -2308,25 +2308,25 @@ pub fn build(b: *std.Build) void {
 }
 
 // ============================================================
-// exe / run-step 名: デフォルト backend は無印、他は "_<backend>" サフィックス
-// （macOS: objc=無印 / swift / metal, Linux: x11=無印, Windows: gdi=無印 / d3d11）
+// exe / run-step names: default backend has no suffix; others get "_<backend>"
+// (macOS: objc=bare / swift / metal, Linux: x11=bare, Windows: gdi=bare / d3d11)
 // ============================================================
 fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, default_be: platform.PlatformType) []const u8 {
     return if (be == default_be) base else b.fmt("{s}_{s}", .{ base, platform.backendName(be) });
 }
 
 // ============================================================
-// backend ごとの platform / keyboard module を作る
-// （platform module には build_options.platform_backend が付与される）
+// Build per-backend platform / keyboard modules
+// (platform module gets build_options.platform_backend)
 // ============================================================
 const PlatformModules = struct {
-    platform: TaggedModule, // opt-in 無効（既定。main/synth/modular/patch/大半の example。TASK-80.2/97.3）
-    platform_gamepad: TaggedModule, // gamepad opt-in（examples/22_gamepad / 34_action_map）
-    platform_menu: TaggedModule, // menu opt-in 用（pixie/patch 共用。TASK-97.3/136）
-    keyboard: *std.Build.Module, // src/ レガシー（examples 専用。層管理外）
-    kit: TaggedModule, // platform(opt-in無効) 側を配線
-    kit_gamepad: TaggedModule, // platform_gamepad 側を配線（example_34。TASK-111.8）
-    kit_menu: TaggedModule, // menu opt-in 用（pixie/patch 共用）
+    platform: TaggedModule, // opt-in off (default; main/synth/modular/patch/most examples)
+    platform_gamepad: TaggedModule, // gamepad opt-in (examples/22_gamepad / 34_action_map)
+    platform_menu: TaggedModule, // for menu opt-in (shared by pixie/patch)
+    keyboard: *std.Build.Module, // legacy src/ (examples only; outside layer management)
+    kit: TaggedModule, // wire the platform (opt-in off) side
+    kit_gamepad: TaggedModule, // wire the platform_gamepad side (example_34)
+    kit_menu: TaggedModule, // for menu opt-in (shared by pixie/patch)
 };
 
 fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const SharedModules, app_runtime: TaggedModule) void {
@@ -2340,18 +2340,18 @@ fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const 
     link(kit, common.font);
     link(kit, common.dsp);
     link(kit, common.synth);
-    link(kit, common.gamepad); // kit.gamepad（TASK-80.1）
-    link(kit, common.midi); // kit.midi（TASK-115.1）
-    link(kit, common.recipe); // kit.recipe（TASK-62.5.8）
-    link(kit, common.gmath); // kit.gmath（TASK-111.1）
-    link(kit, common.gfx); // kit.gfx（TASK-111.2）
-    link(kit, common.appshell); // kit.appshell（TASK-114.1）
-    link(kit, common.sound); // kit.sound（TASK-111.6）
+    link(kit, common.gamepad); // kit.gamepad
+    link(kit, common.midi); // kit.midi
+    link(kit, common.recipe); // kit.recipe
+    link(kit, common.gmath); // kit.gmath
+    link(kit, common.gfx); // kit.gfx
+    link(kit, common.appshell); // kit.appshell
+    link(kit, common.sound); // kit.sound
     link(kit, app_runtime);
 }
 
 fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules, wasm_shared: bool) PlatformModules {
-    // opt-in 無効版（既定）。main/synth/modular/patch/example 大半はこちら。
+    // opt-in-off edition (default). main/synth/modular/patch/most examples use this.
     const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
         target,
@@ -2363,7 +2363,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.harness.mod,
         .{},
     ) };
-    // ゲームパッド opt-in 有効版。examples/22_gamepad 専用。
+    // Gamepad opt-in-on edition. examples/22_gamepad only.
     const platform_gamepad_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
         target,
@@ -2375,8 +2375,8 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.harness.mod,
         .{ .enable_gamepad = true },
     ) };
-    // native メニュー opt-in 有効版（TASK-97.3/122/136。macOS objc/swift/metal 共通。pixie/patch 共用）。
-    // build_options が異なるため別 Module。
+    // Native menu opt-in-on edition (shared across macOS objc/swift/metal; shared by pixie/patch).
+    // Separate Module because build_options differ.
     const platform_menu_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
         target,
@@ -2388,14 +2388,14 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.harness.mod,
         .{ .enable_menu = true },
     ) };
-    // keyboard は KeyCode 型定義を platform_types から借りる（opt-in 無効側の types で十分。
-    // TASK-111.2: platform facade ではなく type-only core のみ依存）。
+    // keyboard borrows KeyCode type defs from platform_types (opt-in-off types are enough;
+    // depends on type-only core only, not the platform facade).
     const keyboard_mod = b.createModule(.{
         .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
     });
     keyboard_mod.addImport("platform_types", common.types.mod);
 
-    // app_runtime（TASK-73）: frame-driven runtime。platform に依存するため backend 毎・opt-in 毎。
+    // app_runtime: frame-driven runtime. Depends on platform, so one per backend and per opt-in.
     const app_runtime: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
@@ -2417,30 +2417,30 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     }) };
     link(app_runtime_menu, platform_menu_mod);
 
-    // kit umbrella（backend 毎。ADR-007 R4）。kit/kit.zig の pub import と 1:1 で揃えること。
+    // kit umbrella (per backend; ADR-007 R4). Keep 1:1 with pub imports in kit/kit.zig.
     const kit: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
     }) };
     wireKitImports(kit, platform_mod, common, app_runtime);
 
-    // gamepad opt-in kit（example_34。platform_gamepad と ActionMap が同一 opt-in を共有。TASK-111.8）
+    // gamepad opt-in kit (example_34; platform_gamepad and ActionMap share the same opt-in)
     const kit_gamepad: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
     }) };
     wireKitImports(kit_gamepad, platform_gamepad_mod, common, app_runtime_gamepad);
 
-    // menu opt-in kit（enable_menu=true の platform を配線。pixie/patch 共用）
+    // menu opt-in kit (wires enable_menu=true platform; shared by pixie/patch)
     const kit_menu: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
     }) };
     wireKitImports(kit_menu, platform_menu_mod, common, app_runtime_menu);
 
-    // wasm present の BGRA→RGBA SIMD swizzle（platform_wasm → pixelops）。
-    // ADR-007 の core→lib 例外として linkCoreException 経由（素の addImport は不可）。
+    // BGRA→RGBA SIMD swizzle for wasm present (platform_wasm → pixelops).
+    // ADR-007 core→lib exception via linkCoreException (bare addImport is not allowed).
     if (backend == .wasm) {
-        linkCoreException(platform_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
-        linkCoreException(platform_gamepad_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
-        linkCoreException(platform_menu_mod, common.pixelops, "wasm present の BGRA→RGBA SIMD swizzle（TASK-73.1）");
+        linkCoreException(platform_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
+        linkCoreException(platform_gamepad_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
+        linkCoreException(platform_menu_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
     }
 
     return .{
@@ -2455,7 +2455,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
 }
 
 // ============================================================
-// ヘルパー: メインアプリの exe を 1 backend 分セットアップ
+// Helper: set up the main-app exe for one backend
 // ============================================================
 fn addMainExe(
     b: *std.Build,
@@ -2475,26 +2475,26 @@ fn addMainExe(
             .optimize = optimize,
         }),
     });
-    // src/main.zig は apps/ 配下でないため R5（kit-only）対象外（examples と同じ従来配線）。
+    // src/main.zig is not under apps/, so it is outside R5 (kit-only); same legacy wiring as examples.
     exe.root_module.addImport("platform", pm.platform.mod);
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。main は gamepad を使わないため既存exe不変）。
+    // Gamepad opt-in off (main does not use gamepad; keeps existing exes unchanged).
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
 // ============================================================
-// 共有モジュール (OS/backend 非依存)。29.1 の外部公開 module（addModule）も内包。
-// 我々の exe / example は backend ごとの PlatformModules.platform を使うため、ここの platform/keyboard は
-// 主に外部公開（dep.module("platform")）と test 用。
-// ADR-007: 各共有 module は層タグ（TaggedModule）付きで生成し、配線は link() を通す。
+// Shared modules (OS/backend-independent). Also includes external public modules (addModule).
+// Our exes / examples use per-backend PlatformModules.platform, so platform/keyboard here are
+// mainly for external consumers (dep.module("platform")) and tests.
+// ADR-007: each shared module is created with a layer tag (TaggedModule) and wired through link().
 // ============================================================
 const SharedModules = struct {
-    platform: TaggedModule, // 外部公開用 facade（platform_backend は OS 既定値を付与。dep.module("platform")・test 用。TASK-172）
-    keyboard: *std.Build.Module, // src/ レガシーヘルパー（examples 専用。層管理外）
-    sprite: *std.Build.Module, // 同上
-    fixed_timestep: *std.Build.Module, // 同上
-    fps_counter: *std.Build.Module, // 同上
-    text: *std.Build.Module, // 同上
+    platform: TaggedModule, // External public facade (platform_backend gets the OS default; for dep.module("platform") and tests)
+    keyboard: *std.Build.Module, // Legacy src/ helpers (examples only; outside layer management)
+    sprite: *std.Build.Module, // Same as above
+    fixed_timestep: *std.Build.Module, // Same as above
+    fps_counter: *std.Build.Module, // Same as above
+    text: *std.Build.Module, // Same as above
     png: TaggedModule,
     font: TaggedModule,
     gui: TaggedModule,
@@ -2507,46 +2507,46 @@ const SharedModules = struct {
     types: TaggedModule,
     pixelops: TaggedModule,
     gmath: TaggedModule,
-    gfx: TaggedModule, // libs/gfx（sprite/ft/fps/keyboard/atlas/animation/camera。TASK-111.2/111.3/111.4。kit 収録）
-    serde: TaggedModule, // libs/serde（versioned container 直列化基盤。TASK-62.2。std のみ）
-    appshell: TaggedModule, // libs/appshell（設定 / window / recent files。TASK-114.1）
-    recipe: TaggedModule, // libs/recipe（CommandRecord 列 save/replay。TASK-62.5.8。std + serde。kit 収録）
-    paint: TaggedModule, // 旧 apps/editor/core（ADR-007 R6 で libs/paint へ格上げ）
-    spectrogram: TaggedModule, // libs/viz（旧 apps/synth/spectrogram.zig）
-    scope: TaggedModule, // libs/viz（旧 apps/synth/scope.zig）
-    capture_types: TaggedModule, // capture 入力基盤の共有型（TASK-49.1。platform_types と同じ type-only）
-    camera: TaggedModule, // カメラ L1 facade（TASK-49.1。audio と同格の core layer primitive）
-    capture_synthetic: TaggedModule, // harness 内蔵 synthetic capture source（TASK-49.5。facade 配線は無い）
-    objc_runtime: TaggedModule, // Objective-C ランタイム FFI（TASK-49.2。camera/audio 両方が link する共有 module。TASK-49.6 で named module 化）
-    gamepad: TaggedModule, // src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する headless lib。kit 収録）
-    sound: TaggedModule, // libs/sound（WAV デコード + SE/BGM ミキサー。TASK-111.6。dsp + synth。kit 収録）
-    midi: TaggedModule, // core/midi.zig（MIDI facade。TASK-115.1）
-    /// modular/patch の -Dmax-modules（TASK-146）。group.zig / addPatchExe が参照。
+    gfx: TaggedModule, // libs/gfx (sprite/ft/fps/keyboard/atlas/animation/camera; kit-listed)
+    serde: TaggedModule, // libs/serde (versioned-container serialization; std only)
+    appshell: TaggedModule, // libs/appshell (settings / window / recent files)
+    recipe: TaggedModule, // libs/recipe (CommandRecord-sequence save/replay; std + serde; kit-listed)
+    paint: TaggedModule, // Former apps/editor/core (promoted to libs/paint under ADR-007 R6)
+    spectrogram: TaggedModule, // libs/viz (former apps/synth/spectrogram.zig)
+    scope: TaggedModule, // libs/viz (former apps/synth/scope.zig)
+    capture_types: TaggedModule, // Shared capture-input types (type-only, same pattern as platform_types)
+    camera: TaggedModule, // Camera L1 facade (core layer primitive at the same rank as audio)
+    capture_synthetic: TaggedModule, // Harness-built-in synthetic capture source (no facade wiring)
+    objc_runtime: TaggedModule, // Objective-C runtime FFI (shared module linked by both camera and audio; named module)
+    gamepad: TaggedModule, // src/gamepad.zig (gamepad input helper; headless lib depending only on platform_types; kit-listed)
+    sound: TaggedModule, // libs/sound (WAV decode + SE/BGM mixer; dsp + synth; kit-listed)
+    midi: TaggedModule, // core/midi.zig (MIDI facade)
+    /// modular/patch -Dmax-modules. Referenced by group.zig / addPatchExe.
     max_modules: usize,
-    /// 共有 build_options Module（max_modules）。createModule は 1 回だけ。全 consumer が addImport。
+    /// Shared build_options Module (max_modules). createModule once; all consumers addImport.
     max_modules_mod: *std.Build.Module,
 
-    /// `wasm_shared`: TASK-73.2 AudioWorklet 用。atomics を有効にするため single_threaded=false。
-    /// `enable_gamepad`: 外部公開 platform module の build_options（TASK-111.7。既定 false）。
-    /// `max_modules` / `max_modules_mod`: modular 同時モジュール数上限（TASK-146。既定 48）。
-    /// wasm 経路は enable_gamepad=false・max_modules=48 を渡す。
-    /// `target_os`: platform_backend の既定値算出用（TASK-172）。外部消費者は自前 .o をリンクするため
-    /// この値自体は無視されるが、内部 test（test-platform-menu 等）が `platform.Window` 型を参照すると
-    /// core/platform_linux.zig 等の OS dispatcher が build_options.platform_backend を検査するため、
-    /// ホスト OS に対応しない固定値（旧: "objc" 固定）だと Linux/Windows で `@compileError` になる。
+    /// `wasm_shared`: for AudioWorklet. single_threaded=false so atomics are enabled.
+    /// `enable_gamepad`: build_options for the external public platform module (default false).
+    /// `max_modules` / `max_modules_mod`: concurrent modular module limit (default 48).
+    /// The wasm path passes enable_gamepad=false and max_modules=48.
+    /// `target_os`: used to compute the platform_backend default. External consumers link their own .o, so
+    /// the value itself is ignored by them, but internal tests (test-platform-menu etc.) that touch `platform.Window`
+    /// pull in OS dispatchers such as core/platform_linux.zig which check build_options.platform_backend;
+    /// a host-OS-mismatched fixed value (e.g. hard-coded "objc") causes `@compileError` on Linux/Windows.
     fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target_os: std.Target.Os.Tag) SharedModules {
-        // TASK-29.1: 外部公開 module（addModule）。dep.module("platform") で取得可能。
-        // facade。@cImport("platform.h") のため link_libc + include path を内包。
+        // External public module (addModule). Available via dep.module("platform").
+        // Facade. Carries link_libc + include path for @cImport("platform.h").
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
             .root_source_file = b.path("core/platform.zig"),
             .link_libc = true,
         }) };
         platform_mod.mod.addIncludePath(b.path("platform"));
-        // build_options（TASK-80.2/97.3/111.7 opt-in）: 外部消費者（tictactoe 等。dep.module("platform")）
-        // 向けの facade も core/platform.zig を root にするため同じ named import が要る。
-        // enable_gamepad は `-Denable_gamepad=true` で opt-in（既定 false＝安全側）。
-        // platform_backend は当該 OS の既定 backend 名（外部消費者が自前で platform .o をリンクする想定の
-        // 薄い stub なので実体には影響しないが、内部 test の @compileError 回避に OS 整合が要る。TASK-172）。
+        // build_options (gamepad/menu/gamepad-ext opt-in): the facade for external consumers (tictactoe etc.; dep.module("platform"))
+        // also roots at core/platform.zig, so the same named import is required.
+        // enable_gamepad opts in with `-Denable_gamepad=true` (default false = safe side).
+        // platform_backend is the OS default backend name (a thin stub assuming external consumers link their own
+        // platform .o, so it does not affect the real backend; OS alignment is still required to avoid @compileError in internal tests).
         {
             const opts = b.addOptions();
             opts.addOption(bool, "enable_gamepad", enable_gamepad);
@@ -2555,26 +2555,26 @@ const SharedModules = struct {
             platform_mod.mod.addOptions("build_options", opts);
         }
 
-        // TASK-29.1: 外部公開 module。dep.module("png")。
+        // External public module. dep.module("png").
         const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = b.addModule("png", .{
             .root_source_file = b.path("libs/png/src/lib.zig"),
         }) };
 
-        // libs/pixelops: ピクセルブレンド共有プリミティブ（premul/straight blend + div255 +
-        // clip-hoist。TASK-51）。sprite / paint blend / font Color.blend が委譲する。
+        // libs/pixelops: shared pixel-blend primitives (premul/straight blend + div255 +
+        // clip-hoist). sprite / paint blend / font Color.blend delegate here.
         const pixelops: TaggedModule = .{ .layer = .lib, .name = "pixelops", .mod = b.createModule(.{
             .root_source_file = b.path("libs/pixelops/src/lib.zig"),
         }) };
 
-        // libs/gmath: platform-independent f32 game math and collision primitives (TASK-111.1).
+        // libs/gmath: platform-independent f32 game math and collision primitives.
         // It is a stable L2-L3 library and is publicly exposed through kit.gmath.
         const gmath: TaggedModule = .{ .layer = .lib, .name = "gmath", .mod = b.addModule("gmath", .{
             .root_source_file = b.path("libs/gmath/src/lib.zig"),
         }) };
 
-        // libs/serde: versioned container 直列化基盤（TASK-62.2）。std のみ依存（link 不要）。
-        // 流動 lib のため kit 非収録・apps 直 import 許可（app_direct_ok=true）。第一 adopter は
-        // pixie Document(TASK-63)。外部公開しないので createModule（addModule ではない）。
+        // libs/serde: versioned-container serialization (std only; no link needed).
+        // Flux lib: not in kit; apps may direct-import (app_direct_ok=true). First adopter is
+        // pixie Document. Not published externally, so createModule (not addModule).
         const serde: TaggedModule = .{ .layer = .lib, .name = "serde", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/serde/src/serde.zig"),
         }) };
@@ -2584,42 +2584,42 @@ const SharedModules = struct {
         }) };
         link(appshell, serde);
 
-        // libs/recipe: CommandRecord 列の save/replay（TASK-62.5.8）。std + serde のみ。
-        // kit 収録（apps は kit.recipe 経由。R5）。core 非依存。
+        // libs/recipe: CommandRecord-sequence save/replay (std + serde only).
+        // Kit-listed (apps go through kit.recipe; R5). No core dependency.
         const recipe: TaggedModule = .{ .layer = .lib, .name = "recipe", .mod = b.createModule(.{
             .root_source_file = b.path("libs/recipe/src/recipe.zig"),
         }) };
         link(recipe, serde);
 
-        // 共有型 module（platform_types）: KeyCode/Event/EventStats 等の単一ソース。
-        // type-only（ADR-007 未決#1 の確定: libs が core から参照してよい唯一の module）。
-        // platform module(facade+backends) と harness module が **同一インスタンス** を import して
-        // 型同一性を保つ（Event/EventStats を harness↔platform 間で受け渡すため。TASK-32.2）。
+        // Shared types module (platform_types): single source for KeyCode/Event/EventStats etc.
+        // Type-only (the only core module libs may reference; see ADR-007).
+        // platform (facade+backends) and harness import the **same instance** so
+        // type identity holds (Event/EventStats cross harness↔platform).
         const types: TaggedModule = .{ .layer = .core, .name = "platform_types", .type_only = true, .mod = b.createModule(.{
             .root_source_file = b.path("core/platform_types.zig"),
         }) };
         link(platform_mod, types);
 
-        // keyboard は KeyCode を platform_types から借りる（TASK-111.2: libs/gfx。type-only core のみ）。
-        // examples 専用の named module 名 `keyboard` は維持（consumer の import 文不変）。
+        // keyboard borrows KeyCode from platform_types (libs/gfx; type-only core only).
+        // Keep the examples-only named module name `keyboard` (consumer import statements unchanged).
         const keyboard_mod = b.createModule(.{
             .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
         });
         keyboard_mod.addImport("platform_types", types.mod);
 
-        // メニュー/command の共有型。platform_types と同じく type-only で、libs/gui と
-        // platform facade が同一インスタンスを参照する。adapter は core 実行契約なので
-        // 別の通常 core module として facade にだけ配線する。
+        // Shared menu/command types. Type-only like platform_types; libs/gui and
+        // the platform facade share one instance. The adapter is a core execution contract, so
+        // it is wired only into the facade as a separate ordinary core module.
         const command_types: TaggedModule = .{ .layer = .core, .name = "command_types", .type_only = true, .mod = b.createModule(.{
             .root_source_file = b.path("core/command_types.zig"),
         }) };
         link(command_types, types);
         link(platform_mod, command_types);
 
-        // src/gamepad.zig: ゲームパッド入力ヘルパー（TASK-80.1。ADR-009）。platform_types のみに
-        // 依存する headless lib（layer=.lib）。ADR-007 R2「libs が type-only core module を直接
-        // 参照してよい唯一の形」の初適用（`link()` の `.lib => dep.layer==.core and dep.type_only` 分岐）。
-        // keyboard は TASK-111.2 で libs/gfx へ移設し kit.gfx 経由でも公開する。
+        // src/gamepad.zig: gamepad input helper (ADR-009). Headless lib depending only on
+        // platform_types (layer=.lib). First use of ADR-007 R2 ("libs may direct-reference a type-only
+        // core module") — the `link()` branch `.lib => dep.layer==.core and dep.type_only`.
+        // keyboard also moved into libs/gfx and is published via kit.gfx.
         const gamepad: TaggedModule = .{ .layer = .lib, .name = "gamepad", .mod = b.createModule(.{
             .root_source_file = b.path("src/gamepad.zig"),
         }) };
@@ -2638,8 +2638,8 @@ const SharedModules = struct {
             .root_source_file = b.path("libs/gfx/src/fps_counter.zig"),
         });
 
-        // libs/gfx umbrella（TASK-111.2/111.8）。named module の sprite/helpers を再エクスポート。kit 収録。
-        // action_map は gamepad + platform_types（MAX_GAMEPADS）に依存（相対 import の action_map.zig）。
+        // libs/gfx umbrella. Re-exports named sprite/helpers modules. Kit-listed.
+        // action_map depends on gamepad + platform_types (MAX_GAMEPADS) via relative import of action_map.zig.
         const gfx: TaggedModule = .{ .layer = .lib, .name = "gfx", .mod = b.createModule(.{
             .root_source_file = b.path("libs/gfx/src/gfx.zig"),
         }) };
@@ -2647,172 +2647,172 @@ const SharedModules = struct {
         gfx.mod.addImport("fixed_timestep", fixed_timestep_mod);
         gfx.mod.addImport("fps_counter", fps_counter_mod);
         gfx.mod.addImport("keyboard", keyboard_mod);
-        link(gfx, gamepad); // ActionMap の gamepad button/stick 評価（TASK-111.8）
-        link(gfx, types); // action_map の MAX_GAMEPADS（type-only core）
-        link(gfx, gmath); // TileMap 衝突クエリ（TASK-111.5）
+        link(gfx, gamepad); // ActionMap gamepad button/stick evaluation
+        link(gfx, types); // action_map MAX_GAMEPADS (type-only core)
+        link(gfx, gmath); // TileMap collision queries
 
-        // libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義（gui より下層）
-        // BMFont ローダ(bmfont.zig)が PNG アトラスを decode するため png に依存。
-        // TASK-29.1: 外部公開 module。dep.module("font")。png に依存。
+        // libs/font: shared font abstraction + canonical pixel/geom primitives (below gui)
+        // BMFont loader (bmfont.zig) depends on png to decode the PNG atlas.
+        // External public module. dep.module("font"). Depends on png.
         const font: TaggedModule = .{ .layer = .lib, .name = "font", .mod = b.addModule("font", .{
             .root_source_file = b.path("libs/font/src/lib.zig"),
         }) };
         link(font, png);
-        link(font, pixelops); // color.zig の Color.blend が委譲（TASK-51）
+        link(font, pixelops); // Color.blend in color.zig delegates here
 
-        // src/text.zig は共通 Font IF（libs/font）の実装を提供するため font に依存（TASK-25.14）。
+        // src/text.zig depends on font because it implements the shared Font IF (libs/font).
         const text_mod = b.createModule(.{
             .root_source_file = b.path("src/text.zig"),
         });
         text_mod.addImport("font", font.mod);
 
-        // TASK-29.1: 外部公開 module。dep.module("gui")。font に依存。
+        // External public module. dep.module("gui"). Depends on font.
         const gui: TaggedModule = .{ .layer = .lib, .name = "gui", .mod = b.addModule("gui", .{
             .root_source_file = b.path("libs/gui/src/gui.zig"),
         }) };
         link(gui, font);
-        link(gui, pixelops); // render.zig の drawImage SIMD（TASK-58）
+        link(gui, pixelops); // drawImage SIMD in render.zig
         link(gui, command_types);
 
-        // objc_runtime (L1): Objective-C ランタイム最小 FFI ヘルパー（TASK-49.2）。camera_macos.zig
-        // （camera module）と audio_macos.zig（audio module。マイク権限確認）の両方が使うため、
-        // named module として1個だけ作り両方に link する。`capture_types` と異なり型同一性が
-        // 理由ではなく、「同一ファイルは2つの異なる module に属せない」という Zig の制約が本質
-        // （camera/audio 双方が相対 `@import("objc_runtime.zig")` していたため、両 module を同一
-        // exe に同時 link すると衝突していた。TASK-49.6: mic+camera を同時に使う初のデモで発覚。
-        // 詳細は core/objc_runtime.zig の doc comment 参照）。std.c.nanosleep（権限確認の
-        // ブロッキング待機）を使うため link_libc=true。
+        // objc_runtime (L1): minimal Objective-C runtime FFI helper. Used by both camera_macos.zig
+        // (camera module) and audio_macos.zig (audio module; mic permission checks), so
+        // create one named module and link it into both. Unlike `capture_types`, the reason is not type
+        // identity but Zig's rule that "the same file cannot belong to two different modules"
+        // (both camera and audio used to relative-`@import("objc_runtime.zig")`, which collided when
+        // both modules were linked into one exe; see the doc comment on core/objc_runtime.zig).
+        // link_libc=true because it uses std.c.nanosleep (blocking wait for permission
+        // checks).
         const objc_runtime: TaggedModule = .{ .layer = .core, .name = "objc_runtime", .mod = b.createModule(.{
             .root_source_file = b.path("core/objc_runtime.zig"),
             .link_libc = true,
         }) };
 
-        // audio (L1 オーディオ出力): platform バックエンド非依存。@cImport しないので
-        // 通常の createModule でよい（audio system lib は exe 側で OS 別にリンク:
-        // macOS=AudioToolbox / Linux=asound / Windows=ole32(WASAPI)。linkAudioBackend 参照）。
+        // audio (L1 audio output): independent of the platform backend. No @cImport, so
+        // an ordinary createModule is enough (audio system libs are linked per-OS on the exe side:
+        // macOS=AudioToolbox / Linux=asound / Windows=ole32(WASAPI); see linkAudioBackend).
         const audio: TaggedModule = .{ .layer = .core, .name = "audio", .mod = b.createModule(.{
             .root_source_file = b.path("core/audio.zig"),
         }) };
 
-        // harness（core/control。ヘッドレス検証 = 制御＋観測プレーン）: platform facade と
-        // audio facade が共有する **単一インスタンス**。module-level state（audio tap 等）を
-        // 1 exe 内で共有させるため、同じ harness を platform module(per-backend,
-        // makePlatformModules→createPlatformModule) と audio module の両方に注入する (TASK-32.2)。
-        // harness は png(encodePNG/crc32) に依存し getenv で link_libc。
-        // wasm では harness_wasm.zig（no-op stub）に差し替え、png/capture_synthetic/dsp を張らない（TASK-73.1）。
+        // harness (core/control; headless verification = control + observation plane): the **single
+        // instance** shared by the platform facade and the audio facade. To share module-level state (audio tap etc.)
+        // within one exe, inject the same harness into both the platform module (per-backend,
+        // makePlatformModules→createPlatformModule) and the audio module.
+        // harness depends on png (encodePNG/crc32) and link_libc for getenv.
+        // Under wasm, swap in harness_wasm.zig (no-op stub) and do not wire png/capture_synthetic/dsp.
         const harness: TaggedModule = .{
             .layer = .core,
             .name = "harness",
             .mod = b.createModule(.{
                 .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
                 .link_libc = !is_wasm,
-                // wasm non-shared (pixie): single_threaded。shared audio (synth): multi（atomics）。
+                // wasm non-shared (pixie): single_threaded. shared audio (synth): multi (atomics).
                 .single_threaded = if (is_wasm) !wasm_shared else null,
             }),
         };
-        // command adapter は harness が保持する command module を facade が再 export する。
+        // The command adapter re-exports the command module held by harness from the facade.
         link(harness, command_types);
         if (!is_wasm) {
-            linkCoreException(harness, png, "snapshot fb の PNG encode / crc32。ADR-007 R1 の例外");
+            linkCoreException(harness, png, "PNG encode / crc32 for snapshot fb (ADR-007 R1 exception)");
         }
         link(harness, types);
-        // 公開 platform module（addModule "platform"）も harness 経由になるため伝播。
+        // The public platform module (addModule "platform") also goes through harness, so it propagates.
         link(platform_mod, harness);
-        // audio facade（core/audio.zig）が `@import("harness")` で onAudioSamples を呼ぶ。
+        // The audio facade (core/audio.zig) calls onAudioSamples via `@import("harness")`.
         link(audio, harness);
 
-        // MIDI facade（L1）。115.1 は全 OS で midi_null を選び、harness 時だけ synthetic FIFO を読む。
-        // platform_types と harness は named module の同一インスタンスを共有する。
+        // MIDI facade (L1). macOS selects CoreMIDI; other OSes select midi_null; under harness, read the synthetic FIFO.
+        // platform_types and harness share the same named-module instance.
         const midi: TaggedModule = .{ .layer = .core, .name = "midi", .mod = b.createModule(.{
             .root_source_file = b.path("core/midi.zig"),
         }) };
         link(midi, types);
         link(midi, harness);
-        // macOS: audio_macos.zig の capture(マイク) 拡張が objc_runtime 経由で権限確認を叩く。
-        // wasm では audio_web が objc を触らないが、import 配線は無害（未参照なら解析されない）。
+        // macOS: audio_macos.zig capture (mic) extension hits permission checks via objc_runtime.
+        // Under wasm, audio_web never touches objc; the import wiring is harmless (unreferenced = not analyzed).
         if (!is_wasm) link(audio, objc_runtime);
 
-        // capture 入力基盤の共有型（TASK-49.1）: control plane 共通型 + data plane 型
-        // （DeviceInfo/PermissionState/CaptureError/AudioInFrame/PixelFormat/VideoFrame/TripleBuffer）。
-        // platform_types と同じ type-only module。camera/audio の両方が同一インスタンスを link する
-        // 必要がある（Zig の相対 import は module ごとに別インスタンスの型になるため、型同一性が
-        // 要る共有型は named module 化が必須。詳細は docs/plans/capture-foundation-plan.md 8章）。
+        // Shared capture-input types: control-plane common types + data-plane types
+        // (DeviceInfo/PermissionState/CaptureError/AudioInFrame/PixelFormat/VideoFrame/TripleBuffer).
+        // Type-only module like platform_types. Both camera and audio must link the same instance
+        // (Zig relative imports yield per-module type instances, so shared types that need identity
+        // must be a named module; see docs/capture.md).
         const capture_types: TaggedModule = .{ .layer = .core, .name = "capture_types", .type_only = true, .mod = b.createModule(.{
             .root_source_file = b.path("core/capture_types.zig"),
         }) };
-        // audio facade（core/audio.zig）の capture 拡張が `@import("capture_types")` で使う。
+        // Used by the audio facade (core/audio.zig) capture extension via `@import("capture_types")`.
         link(audio, capture_types);
 
-        // camera (L1 カメラ入力): audio と同格の core layer primitive（TASK-49.1）。49.1 時点は
-        // 全 OS 共通の明示 stub（camera_stub.zig）を経由し、harness の isCaptureSyntheticActive()
-        // 継ぎ目を持つ。TASK-49.2〜.4 が builtin.os.tag 分岐の実 backend へ置き換える。
+        // camera (L1 camera input): core layer primitive at the same rank as audio.
+        // Dispatches by builtin.os.tag to camera_macos / camera_v4l2 / camera_stub, and shares
+        // the harness isCaptureSyntheticActive() seam.
         const camera: TaggedModule = .{ .layer = .core, .name = "camera", .mod = b.createModule(.{
             .root_source_file = b.path("core/camera.zig"),
         }) };
         link(camera, capture_types);
-        link(camera, harness); // isCaptureSyntheticActive() 継ぎ目
-        if (!is_wasm) link(camera, objc_runtime); // macOS: camera_macos.zig が objc_runtime 経由で AVFoundation を叩く
+        link(camera, harness); // isCaptureSyntheticActive() seam
+        if (!is_wasm) link(camera, objc_runtime); // macOS: camera_macos.zig drives AVFoundation via objc_runtime
 
-        // capture_synthetic (L1): harness 内蔵の synthetic capture source（偽 mic/camera。
-        // TASK-49.5）。camera/audio facade への配線は無く、harness の組み込み `capture`
-        // コマンド/probe だけが消費する（`isCaptureSyntheticActive()` の doc comment 参照）。
-        // capture_types にのみ依存。std.c.nanosleep（audio 生成スレッドの実時間ペーシング）用に
-        // link_libc=true（std.Thread.spawn 自体の要件ではなく POSIX sleep 側の理由。
-        // core/audio_null.zig と同じ事情）。
+        // capture_synthetic (L1): harness-built-in synthetic capture source (fake mic/camera).
+        // No wiring into camera/audio facades; only the harness built-in `capture`
+        // command/probe consumes it (see the `isCaptureSyntheticActive()` doc comment).
+        // Depends only on capture_types. link_libc=true for std.c.nanosleep (real-time pacing of the
+        // audio generation thread — a POSIX sleep requirement, not a std.Thread.spawn one;
+        // same situation as core/audio_null.zig).
         const capture_synthetic: TaggedModule = .{ .layer = .core, .name = "capture_synthetic", .mod = b.createModule(.{
             .root_source_file = b.path("core/capture_synthetic.zig"),
             .link_libc = true,
         }) };
         link(capture_synthetic, capture_types);
-        // harness.zig が `@import("capture_synthetic")` で使う（`capture` コマンド/probe）。
-        // wasm stub は capture_synthetic 非依存なので張らない（TASK-73.1）。
+        // harness.zig uses it via `@import("capture_synthetic")` (`capture` command/probe).
+        // The wasm stub does not depend on capture_synthetic, so do not wire it.
         if (!is_wasm) link(harness, capture_synthetic);
 
-        // dsp (L2): Oscillator / Envelope / Filter / Mixer。純 Zig。
-        // （物理位置は src/dsp のまま。libs/audio への移動は R8 日和見で後続タスクにて）
+        // dsp (L2): Oscillator / Envelope / Filter / Mixer. Pure Zig.
+        // (Still physically under src/dsp; move into libs/audio is opportunistic under R8.)
         const dsp: TaggedModule = .{ .layer = .lib, .name = "dsp", .mod = b.createModule(.{
             .root_source_file = b.path("src/dsp/dsp.zig"),
         }) };
-        // TASK-92: digest audio の band/centroid/onset が magnitudeSpectrum を使う。
-        // harness は dsp 定義後に link（png と同様 linkCoreException。ADR-007 追記済み）。
-        // wasm stub は dsp 非依存なので張らない。
-        if (!is_wasm) linkCoreException(harness, dsp, "digest audio のスペクトル解析（band/centroid/onset）");
+        // digest audio band/centroid/onset uses magnitudeSpectrum.
+        // Link harness after dsp is defined (linkCoreException, same as png; recorded in ADR-007).
+        // The wasm stub does not depend on dsp, so do not wire it.
+        if (!is_wasm) linkCoreException(harness, dsp, "digest audio spectrum analysis (band/centroid/onset)");
 
-        // synth (L3): Voice/VoicePool/Patch/Synth + GUI⇔Audio 受け渡し機構。dsp に依存。
+        // synth (L3): Voice/VoicePool/Patch/Synth + GUI↔Audio handoff. Depends on dsp.
         const synth: TaggedModule = .{ .layer = .lib, .name = "synth", .mod = b.createModule(.{
             .root_source_file = b.path("libs/synth/src/synth.zig"),
         }) };
         link(synth, dsp);
 
-        // sound (L3): WAV デコード + SE ワンショット / BGM ループミキサー（TASK-111.6）。
-        // dsp（equalPowerPan）と synth（SpscRing / AtomicF32）に依存。kit 収録。
+        // sound (L3): WAV decode + SE one-shot / BGM loop mixer.
+        // Depends on dsp (equalPowerPan) and synth (SpscRing / AtomicF32). Kit-listed.
         const sound: TaggedModule = .{ .layer = .lib, .name = "sound", .mod = b.createModule(.{
             .root_source_file = b.path("libs/sound/src/sound.zig"),
         }) };
         link(sound, dsp);
         link(sound, synth);
 
-        // modular (L3): モジュラー・グラフエンジン（TASK-40）。dsp のみに依存。
-        // 流動中のため kit 非収録（apps が直 import: app_direct_ok）。
-        // build_options.max_modules で同時モジュール数上限を comptime 注入（TASK-146）。
+        // modular (L3): modular graph engine. Depends only on dsp.
+        // In flux, so not in kit (apps direct-import via app_direct_ok).
+        // Concurrent module limit injected at comptime via build_options.max_modules.
         const modular: TaggedModule = .{ .layer = .lib, .name = "modular", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/modular/src/modular.zig"),
         }) };
         modular.mod.addImport("build_options", max_modules_mod);
         link(modular, dsp);
 
-        // paint（旧 apps/editor/core。R6 で libs へ格上げ）: Canvas/Tool/Undo/Selection/PNG I/O。
-        // 「エディタ族の共有 lib」で汎用 kit には載せない（pixie 等の該当 app だけが直 import）。
+        // paint (former apps/editor/core; promoted to libs under R6): Canvas/Tool/Undo/Selection/PNG I/O.
+        // Editor-family shared lib; not on the general kit (only matching apps such as pixie direct-import).
         const paint: TaggedModule = .{ .layer = .lib, .name = "paint", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/paint/src/paint.zig"),
         }) };
-        link(paint, png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
-        link(paint, pixelops); // blend.zig が委譲 (TASK-51)
-        link(paint, serde); // document_io.zig が versioned container(libs/serde) に委譲 (TASK-63)
-        link(paint, font); // canvas.zig → text_render.zig がテキストラスタライズに委譲 (TASK-79.5)
+        link(paint, png); // io_png.zig delegates to the PNG codec (libs/png)
+        link(paint, pixelops); // blend.zig delegates here
+        link(paint, serde); // document_io.zig delegates to the versioned container (libs/serde)
+        link(paint, font); // canvas.zig → text_render.zig delegates text rasterization
 
-        // libs/viz（旧 apps/synth の可視化。synth/modular/patch の 3 app が共有するため
-        // R6 の「再利用 vs 終端」で libs へ。流動中のため kit 非収録）。
+        // libs/viz (former apps/synth visualization. Shared by the synth/modular/patch apps, so
+        // moved to libs under R6 "reuse vs terminal". In flux, so not in kit).
         const spectrogram: TaggedModule = .{ .layer = .lib, .name = "spectrogram", .app_direct_ok = true, .mod = b.createModule(.{
             .root_source_file = b.path("libs/viz/src/spectrogram.zig"),
         }) };
@@ -2870,16 +2870,16 @@ const ExampleNeeds = struct {
     needs_font: bool,
     needs_paint: bool = false,
     needs_audio: bool,
-    needs_gamepad: bool, // TASK-80.1（examples/22_gamepad / 34_action_map）
-    needs_midi: bool, // TASK-115.1（examples/29_midi_monitor のみ true）
-    needs_gmath: bool, // TASK-111.1（examples/25_collision_demo のみ true）
-    needs_sound: bool, // TASK-111.6（examples/30_sound_demo のみ true）
-    needs_kit: bool = false, // TASK-111.2/111.3/111.4/111.5/111.8/111.9（example_31/32/33/34/36/38）/ example_26
+    needs_gamepad: bool, // examples/22_gamepad / 34_action_map
+    needs_midi: bool, // true only for examples/29_midi_monitor
+    needs_gmath: bool, // true only for examples/25_collision_demo
+    needs_sound: bool, // true only for examples/30_sound_demo
+    needs_kit: bool = false, // example_31/32/33/34/36/38 / example_26
 };
 
 // ============================================================
-// ヘルパー: example の exe を 1 backend 分セットアップ
-// platform / keyboard は backend ごとの pm から、その他の共有 module は common から取る。
+// Helper: set up an example exe for one backend
+// platform / keyboard come from the per-backend pm; other shared modules from common.
 // ============================================================
 fn addExampleExe(
     b: *std.Build,
@@ -2902,11 +2902,11 @@ fn addExampleExe(
             .optimize = optimize,
         }),
     });
-    // 全 example が platform / keyboard を使う
-    // （examples は教材として R5=kit-only の対象外。従来の個別 module 配線を維持する）
-    // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs_gamepad の example（22 / 34）だけ
-    // opt-in 有効側の platform module を使う（GameController framework リンク + .m/.swift の
-    // gamepad コード有効化）。他の example は既定の opt-in 無効側（既存exe不変）。
+    // Every example uses platform / keyboard
+    // (examples are teaching material outside R5=kit-only; keep legacy per-module wiring)
+    // Gamepad opt-in: only needs_gamepad examples (22 / 34) use the
+    // opt-in-enabled platform module (GameController framework link + enable gamepad code in .m/.swift).
+    // Other examples use the default opt-in-disabled side (existing exes unchanged).
     exe.root_module.addImport("platform", if (needs.needs_gamepad) pm.platform_gamepad.mod else pm.platform.mod);
     exe.root_module.addImport("keyboard", pm.keyboard);
     if (needs.needs_sprite) exe.root_module.addImport("sprite", common.sprite);
@@ -2917,47 +2917,47 @@ fn addExampleExe(
     if (needs.needs_png) exe.root_module.addImport("png", common.png.mod);
     if (needs.needs_font) exe.root_module.addImport("font", common.font.mod);
     if (needs.needs_paint) {
-        // paint は kit 非収録の流動 lib。Layer.app_direct_ok=true のため example root から直 import 可。
-        linkAppException(appRoot(exe, name), common.paint, "example_26 doodle の direct paint import");
+        // paint is a flux lib not in kit. Layer.app_direct_ok=true, so example roots may direct-import it.
+        linkAppException(appRoot(exe, name), common.paint, "example_26 doodle direct paint import");
     }
     if (needs.needs_audio) {
         exe.root_module.addImport("audio", common.audio.mod);
-        // L1 オーディオ出力の system ライブラリ（needs_audio の exe にのみ付与。OS 別）。
+        // L1 audio-output system libraries (only on needs_audio exes; per OS).
         linkAudioBackend(exe, target.result.os.tag);
     }
-    // gamepad は platform_types のみに依存する backend 非依存 lib（TASK-80.1）。common（SharedModules）から
-    // 直接 addImport する（kit を使わない examples の既存慣習に揃える）。
+    // gamepad is a backend-independent lib depending only on platform_types. Direct-addImport from
+    // common (SharedModules) (matches the existing examples convention of not using kit).
     if (needs.needs_gamepad) exe.root_module.addImport("gamepad", common.gamepad.mod);
     if (needs.needs_midi) {
         exe.root_module.addImport("midi", common.midi.mod);
-        // CoreMIDI 等の system framework は needs_midi の exe にのみ opt-in link（audio と同型）。
+        // CoreMIDI and other system frameworks are opt-in linked only on needs_midi exes (same shape as audio).
         linkMidiBackend(exe, target.result.os.tag);
     }
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
     if (needs.needs_kit) {
-        // needs_gamepad の kit example は platform_gamepad を配線した kit_gamepad を使う（TASK-111.8）。
+        // needs_gamepad kit examples use kit_gamepad wired to platform_gamepad.
         exe.root_module.addImport("kit", if (needs.needs_gamepad) pm.kit_gamepad.mod else pm.kit.mod);
     }
     if (std.mem.startsWith(u8, name, "example_26")) {
         exe.root_module.addImport("appshell", common.appshell.mod);
     }
 
-    // build_options: 起動時バナーで platform 名 / build mode を表示する用途。
-    // 任意の example が `@import("build_options").platform_name` で参照可能。
-    // （platform module 側の build_options.platform_backend とは別 module スコープ）
+    // build_options: for showing platform name / build mode in the startup banner.
+    // Any example may read `@import("build_options").platform_name`.
+    // (Separate module scope from build_options.platform_backend on the platform module)
     const opts = b.addOptions();
     opts.addOption([]const u8, "platform_name", platform.backendName(platform_type));
     exe.root_module.addOptions("build_options", opts);
 
-    // ゲームパッド opt-in（TASK-80.2 opt-in 化）: needs.needs_gamepad の exe だけ GameController framework
-    // リンク + .m/.swift gamepad コード有効化（上の addImport 選択と揃える）。
+    // Gamepad opt-in: only needs.needs_gamepad exes get GameController framework
+    // link + .m/.swift gamepad code enabled (aligned with the addImport choice above).
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_gamepad = needs.needs_gamepad });
     return exe;
 }
 
 // ============================================================
-// ヘルパー: pixie exe を 1 backend 分セットアップ
+// Helper: set up a pixie exe for one backend
 // ============================================================
 fn addPixieExe(
     b: *std.Build,
@@ -2978,25 +2978,25 @@ fn addPixieExe(
             .optimize = optimize,
         }),
     });
-    // apps は kit-only 消費者（R5）。paint は「エディタ族の共有 lib」（kit 非収録・流動）で直 import。
-    // native メニュー opt-in（TASK-97.3/122）: kit_menu（enable_menu=true）+ 共有 menu.m（-DVP_ENABLE_MENU）。
-    // macOS objc/swift/metal 共通。enable_menu 既定 false は変更しない。
+    // apps are kit-only consumers (R5). paint is an editor-family shared lib (not in kit; in flux) and is direct-imported.
+    // Native menu opt-in: kit_menu (enable_menu=true) + shared menu.m (-DVP_ENABLE_MENU).
+    // Shared across macOS objc/swift/metal. Do not change the enable_menu default of false.
     const root = appRoot(exe, "pixie");
     link(root, pm.kit_menu);
     link(root, common.paint);
-    // apps → pixelops の明示例外（linkAppException。ADR-007 層例外リスト 4 つ目）
-    linkAppException(root, common.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops（縮小 blit の SIMD ブレンド共有。TASK-153.2）");
+    // Explicit apps → pixelops exception (linkAppException call site)
+    linkAppException(root, common.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops (shared SIMD blend for downscale blit)");
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;
 }
 
 // ============================================================
-// ヘルパー: patch app exe を 1 backend 分セットアップ（apps/patch。TASK-40.6.2/40.6.3/40.7.1）
-// platform + gui + modular（動的グラフエンジン）+ audio（40.6.3 ライブ再配線で発音）。
-// canvas.zig/group.zig/macro.zig は main.zig からの相対 @import（同一 module）で取り込む
-// （apps/patch/main.zig が lofi.zig を相対 import する構成。macro.zig の
-// @import("modular") はこの exe.root_module に登録済みの "modular" named import をそのまま解決できる）。
+// Helper: set up a patch app exe for one backend (apps/patch)
+// platform + gui + modular (dynamic graph engine) + audio (live rewiring makes sound).
+// canvas.zig/group.zig/macro.zig are pulled in via relative @import from main.zig (same module)
+// (apps/patch/main.zig relative-imports lofi.zig. macro.zig's
+// @import("modular") resolves the "modular" named import already registered on this exe.root_module).
 // ============================================================
 fn addPatchExe(
     b: *std.Build,
@@ -3017,31 +3017,31 @@ fn addPatchExe(
             .optimize = optimize,
         }),
     });
-    // apps は kit-only 消費者（R5）。platform/gui/audio/synth/dsp は kit.* で参照。
-    // modular / 可視化（libs/viz）は流動中で kit 非収録のため直 import。
-    // native メニュー opt-in（TASK-136）: kit_menu（enable_menu=true）+ 共有 menu.m（pixie と共用）。
-    // group.zig が build_options.max_modules を読む（相対 import・同一 module。TASK-146）。
-    // modular と同一 Module instance を共有（二重 options.zig root を避ける）。
+    // apps are kit-only consumers (R5). platform/gui/audio/synth/dsp via kit.*.
+    // modular / viz (libs/viz) are in flux and not in kit, so direct-import.
+    // Native menu opt-in: kit_menu (enable_menu=true) + shared menu.m (shared with pixie).
+    // group.zig reads build_options.max_modules (relative import; same module).
+    // Share the same Module instance as modular (avoid a second options.zig root).
     exe.root_module.addImport("build_options", common.max_modules_mod);
     const root = appRoot(exe, "patch");
     link(root, pm.kit_menu);
-    link(root, common.modular); // 動的グラフエンジン（dsp 依存のみ。macro.zig も参照）
-    link(root, common.spectrogram); // TASK-40.8: 信号可視化（master scope/spectrogram/level meter）
+    link(root, common.modular); // Dynamic graph engine (dsp-only dependency; also referenced by macro.zig)
+    link(root, common.spectrogram); // Signal visualization (master scope/spectrogram/level meter)
     link(root, common.scope);
-    link(root, common.serde); // graph_io.zig（TASK-65 serialize: ノード/エッジ構成の versioned container 直列化）
-    linkAppException(root, common.synth, "apps/patch/lofi.zig が生成レイヤを直接利用（SampleTap / AtomicF32）");
-    linkAppException(root, common.dsp, "apps/patch/lofi.zig が生成レイヤを直接利用（FFT band energy 検証）");
+    link(root, common.serde); // graph_io.zig (serialize: versioned-container serialization of node/edge topology)
+    linkAppException(root, common.synth, "apps/patch/lofi.zig uses the generative layer directly (SampleTap / AtomicF32)");
+    linkAppException(root, common.dsp, "apps/patch/lofi.zig uses the generative layer directly (FFT band energy checks)");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
-    // TASK-115.3: kit.midi（CoreMIDI）を run-patch から使用するため opt-in link。
+    // Opt-in link so run-patch can use kit.midi (CoreMIDI).
     linkMidiBackend(exe, target.result.os.tag);
 
-    // ゲームパッド opt-in 無効（TASK-80.2）。native メニュー opt-in（TASK-136）。
+    // Gamepad opt-in off. Native menu opt-in on.
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;
 }
 
 // ============================================================
-// ヘルパー: synth app exe を 1 backend 分セットアップ（macOS/Linux/Windows。audio system lib を link）
+// Helper: set up a synth app exe for one backend (macOS/Linux/Windows; links the audio system lib)
 // ============================================================
 fn addSynthExe(
     b: *std.Build,
@@ -3062,29 +3062,29 @@ fn addSynthExe(
             .optimize = optimize,
         }),
     });
-    // apps は kit-only 消費者（R5）。platform/audio/synth/dsp/gui は kit.* で参照。
-    // 可視化（libs/viz。流動中で kit 非収録）+ serde（TASK-65 serialize: patch_io.zig が直 import）だけ直 import。
+    // apps are kit-only consumers (R5). platform/audio/synth/dsp/gui via kit.*.
+    // Direct-import only viz (libs/viz; in flux, not in kit) + serde (serialize: patch_io.zig direct-imports it).
     const root = appRoot(exe, "synth");
     link(root, pm.kit);
     link(root, common.spectrogram);
     link(root, common.scope);
-    link(root, common.serde); // patch_io.zig（音色/FX パラメータの versioned container 直列化）
-    linkAudioBackend(exe, target.result.os.tag); // L1 オーディオ出力（macOS=AudioToolbox / Linux=asound / Windows=ole32）
+    link(root, common.serde); // patch_io.zig (versioned-container serialization of voice/FX params)
+    linkAudioBackend(exe, target.result.os.tag); // L1 audio output (macOS=AudioToolbox / Linux=asound / Windows=ole32)
 
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    // Gamepad opt-in off (this app does not use gamepad; keeps existing exes unchanged).
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
 // ============================================================================
-// ヘルパー: 20_capture_demo exe を 1 backend 分セットアップ（examples/20_capture_demo。TASK-49.6）。
+// Helper: set up the 20_capture_demo exe for one backend (examples/20_capture_demo).
 //
-// R5(kit-only) は apps/ のみが対象で examples は対象外（build.zig 冒頭コメント）なので、他 example
-// と同じ「直 addImport」配線を使う（appRoot/link() は使わない）。camera/audio/capture_synthetic
-// （いずれも core layer）を直接消費するのは、headless 検証に harness 内蔵の synthetic capture
-// source（core/capture_synthetic.zig。TASK-49.5。camera.zig/audio.zig facade へは配線されていない
-// 独立モジュール）への直 import が必須なため（apps 層からは R5 で到達できない）。
-// camera.zig/audio.zig の facade API 自体は本タスクで変更しない（consume に徹する）。
+// R5 (kit-only) covers apps/ only; examples are outside it (see build.zig header), so use the same
+// direct-addImport wiring as other examples (no appRoot/link()). Directly consuming camera/audio/capture_synthetic
+// (all core layer) is required because headless verification must direct-import the harness-built-in synthetic
+// capture source (core/capture_synthetic.zig; an independent module not wired into the camera.zig/audio.zig
+// facades) — unreachable from the apps layer under R5.
+// The camera.zig/audio.zig facade APIs themselves are consumed as-is (not modified here).
 // ============================================================================
 fn addCaptureDemoExe(
     b: *std.Build,
@@ -3106,39 +3106,39 @@ fn addCaptureDemoExe(
         }),
     });
     exe.root_module.addImport("platform", pm.platform.mod);
-    exe.root_module.addImport("harness", common.harness.mod); // isCaptureSyntheticActive() 判定用
-    exe.root_module.addImport("camera", common.camera.mod); // カメラ実 capture（macOS 実装 / 他OS stub。TASK-49.2）
-    exe.root_module.addImport("audio", common.audio.mod); // マイク実 capture 拡張（audio.zig 経由。TASK-49.2）
-    exe.root_module.addImport("capture_synthetic", common.capture_synthetic.mod); // harness 内蔵 synthetic source（TASK-49.5。VP_HARNESS_CAPTURE_SYNTHETIC=1 時のみ使用）
+    exe.root_module.addImport("harness", common.harness.mod); // for isCaptureSyntheticActive()
+    exe.root_module.addImport("camera", common.camera.mod); // Real camera capture (macOS implementation / stub elsewhere)
+    exe.root_module.addImport("audio", common.audio.mod); // Real mic capture extension (via audio.zig)
+    exe.root_module.addImport("capture_synthetic", common.capture_synthetic.mod); // Harness-built-in synthetic source (only when VP_HARNESS_CAPTURE_SYNTHETIC=1)
     exe.root_module.addImport("spectrogram", common.spectrogram.mod);
     exe.root_module.addImport("scope", common.scope.mod);
-    exe.root_module.addImport("synth", common.synth.mod); // SampleTap（mic capture callback → メインスレッド可視化のロックフリー受け渡し）
-    linkAudioBackend(exe, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture 用 AVFoundation/CoreMedia/CoreVideo/Foundation/objc も含む
+    exe.root_module.addImport("synth", common.synth.mod); // SampleTap (lock-free mic-capture-callback → main-thread visualization handoff)
+    linkAudioBackend(exe, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture AVFoundation/CoreMedia/CoreVideo/Foundation/objc
 
-    // ゲームパッド opt-in 無効（TASK-80.2 opt-in 化。このアプリは gamepad を使わないため既存exe不変）。
+    // Gamepad opt-in off (this app does not use gamepad; keeps existing exes unchanged).
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
 }
 
 // ============================================================
-// ヘルパー: audio を使う exe に L1 出力の system ライブラリを OS 別にリンクする。
-// audio module は @cImport せず extern fn なので、リンクは exe 側で行う
-// （macOS=AudioToolbox framework / Linux=ALSA libasound）。libc は backend setup 側で有効化済み。
+// Helper: link L1-output system libraries per OS onto exes that use audio.
+// The audio module uses extern fn without @cImport, so linking is done on the exe side
+// (macOS=AudioToolbox framework / Linux=ALSA libasound). libc is already enabled by backend setup.
 //
-// Linux は pkg-config 名 "alsa"（.pc は alsa-lib-dev が提供）を渡す。これで pkg-config が
-// `-lasound` と lib パスの両方を解決する。ライブラリ名 "asound" を直接渡すと .pc が無く、
-// zig は既存の -L（X11 等）しか探さず libasound.so を見つけられない（Linux 実ビルドで確認）。
+// On Linux pass the pkg-config name "alsa" (provided by alsa-lib-dev). That resolves both
+// `-lasound` and the lib path. Passing the library name "asound" directly finds no .pc, and
+// zig only searches existing -L paths (X11 etc.), so it cannot find libasound.so (confirmed on a real Linux build).
 // ============================================================
 fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {
-        // capture（mic AUHAL input / camera AVFoundation。TASK-49.2）の framework も併せてリンク
-        // する。呼び出し側の全 exe は `platform.setupExecutableForPlatform` を同じ関数内で呼んで
-        // おり、そちらが `-F <sdk>/System/Library/Frameworks` / `-L <sdk>/usr/lib` の検索パスを
-        // 設定する（`build_helpers/macos.zig` の `addMacOSSDKSearchPaths`）ため、ここでは
-        // `linkFramework`/`linkSystemLibrary` の呼び出しだけで足りる（build graph 構築順序は
-        // 実際のリンク時の解決に影響しない）。codex レビュー指摘: capture を実使用する将来の
-        // アプリ（TASK-49.6 想定）がこの関数を素通しした時にリンク不足で壊れないようにする
-        // 予防的追加（現時点でこれらの framework を実際に使う exe はまだ無い＝害が無い）。
+        // Also link capture frameworks (mic AUHAL input / camera AVFoundation).
+        // Every caller also calls `platform.setupExecutableForPlatform` in the same function,
+        // which sets the `-F <sdk>/System/Library/Frameworks` / `-L <sdk>/usr/lib` search paths
+        // (`addMacOSSDKSearchPaths` in `build_helpers/macos.zig`), so here
+        // `linkFramework`/`linkSystemLibrary` calls alone are enough (build-graph construction order does not
+        // affect link-time resolution). Also linked so future apps that consume capture
+        // and pass through this helper do not fail from missing frameworks.
+        // Preventive addition (no exe currently uses these frameworks — harmless).
         .macos => {
             exe.root_module.linkFramework("AudioToolbox", .{});
             exe.root_module.linkFramework("CoreAudio", .{});
@@ -3149,18 +3149,18 @@ fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) 
             exe.root_module.linkSystemLibrary("objc", .{});
         },
         .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
-        // WASAPI は COM 経由。CoCreateInstance/CoInitializeEx/CoTaskMemFree が ole32 にある
-        // （IAudioClient 等は COM で取得するので直接リンク不要。Event API は kernel32=自動リンク）。
+        // WASAPI goes through COM. CoCreateInstance/CoInitializeEx/CoTaskMemFree live in ole32
+        // (IAudioClient etc. are obtained via COM so no direct link; Event API is kernel32=auto-linked).
         .windows => exe.root_module.linkSystemLibrary("ole32", .{}),
         else => @panic("audio backend is only available on macOS / Linux / Windows"),
     }
 }
 
 // ============================================================
-// ヘルパー: MIDI を使う exe に CoreMIDI 等を OS 別にリンクする（TASK-115.2）。
-// midi module は @cImport せず extern fn なので、リンクは exe 側で行う。
-// audio の linkAudioBackend と同じ opt-in 位置づけ。needs_midi の example のみ呼ぶ。
-// setupExecutableForPlatform が SDK framework 検索パスを付ける前提。
+// Helper: link CoreMIDI etc. per OS onto exes that use MIDI.
+// The midi module uses extern fn without @cImport, so linking is done on the exe side.
+// Same opt-in placement as audio's linkAudioBackend. Called only for needs_midi examples.
+// Assumes setupExecutableForPlatform has attached the SDK framework search paths.
 // ============================================================
 fn linkMidiBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {
@@ -3168,13 +3168,13 @@ fn linkMidiBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) v
             exe.root_module.linkFramework("CoreMIDI", .{});
             exe.root_module.linkFramework("CoreFoundation", .{});
         },
-        // 115.2 は macOS のみ。他 OS は null backend で framework 不要。
+        // macOS only. Other OSes use the null backend and need no framework.
         else => {},
     }
 }
 
-// test-midi（素の addTest）向け: SDK framework/library 検索パスを明示して CoreMIDI を link。
-// linkCaptureMacFrameworks と同型（platform.setupExecutableForPlatform を経由しない）。
+// For test-midi (bare addTest): explicitly set SDK framework/library search paths and link CoreMIDI.
+// Same shape as linkCaptureMacFrameworks (does not go through platform.setupExecutableForPlatform).
 fn linkMidiMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos.MacOSSDKPaths) void {
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path}) });
     mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_paths.sdk_path}) });
@@ -3183,11 +3183,11 @@ fn linkMidiMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos
 }
 
 // ============================================================
-// capture（mic AUHAL input / camera AVFoundation。TASK-49.2）専用 test 用の framework リンク。
-// nix の zig は SDK を自動検出しないため framework/library 検索パスを明示する
-// （`build_helpers/macos.zig` の `addMacOSSDKSearchPaths` と同じ理由・同じパス）。
-// `linkAudioBackend` と異なり、こちらは `platform.setupExecutableForPlatform` を経由しない
-// 素の `b.addTest` 向けなので検索パス自体もここで明示する必要がある。
+// Framework link for capture-only tests (mic AUHAL input / camera AVFoundation).
+// nix's zig does not auto-detect the SDK, so framework/library search paths are stated explicitly
+// (same reason and paths as `addMacOSSDKSearchPaths` in `build_helpers/macos.zig`).
+// Unlike `linkAudioBackend`, this targets bare `b.addTest` that does not go through
+// `platform.setupExecutableForPlatform`, so the search paths themselves must be stated here.
 // ============================================================
 fn linkCaptureMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos.MacOSSDKPaths) void {
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path}) });
@@ -3202,7 +3202,7 @@ fn linkCaptureMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: ma
 }
 
 // ============================================================
-// 一般的な run ステップ追加ヘルパー
+// Generic helper to add a run step
 // ============================================================
 fn addRunStep(
     b: *std.Build,
@@ -3212,19 +3212,19 @@ fn addRunStep(
     args: ?[]const []const u8,
 ) void {
     const run_cmd = b.addRunArtifact(exe);
-    // 注: あえて b.getInstallStep() に依存させない。getInstallStep は全 installArtifact
-    // （example 全 backend を含む）を束ねるため、依存させると run-* が全 example を
-    // 芋づる式にビルドしてしまう。run には当該 exe のコンパイルだけで十分なので、
-    // addRunArtifact が自動で張る exe ビルド依存に留める（cache から直接実行）。
+    // Note: deliberately do not depend on b.getInstallStep(). getInstallStep bundles every installArtifact
+    // (including every example backend), so depending on it would make run-* build every example
+    // as a side effect. A run only needs that exe compiled, so stay with the exe-build dependency
+    // that addRunArtifact attaches automatically (run straight from cache).
     if (args) |a| run_cmd.addArgs(a);
     const run_step = b.step(name, description);
     run_step.dependOn(&run_cmd.step);
 }
 
 // ============================================================
-// ビルドのみ（実行しない）の step 追加ヘルパー
-// 当該 exe だけを install（= ビルド）する。getInstallStep には依存させないので
-// 他の exe / example を巻き込まない（run-* と同じ理由）。
+// Helper to add a build-only (do not run) step
+// Installs (= builds) only that exe. Does not depend on getInstallStep, so
+// it does not pull in other exes / examples (same reason as run-*).
 // ============================================================
 fn addBuildStep(
     b: *std.Build,
@@ -3237,13 +3237,13 @@ fn addBuildStep(
 }
 
 // ============================================================
-// ヘルパー: platform native 層を static lib (object archive) として公開 (TASK-29.1)
+// Helper: publish the platform native layer as a static lib (object archive)
 //
-// 外部パッケージは `dep.artifact("platform_native_<plat>")` を linkLibrary する。
-// facade は `dep.module("platform")`。compilePlatformLayer の .o を最小 stub module に
-// addObjectFile して archive するだけに徹する。framework / Swift ランタイム / 検索パスは
-// static lib ビルド時に解決できず（検索パスは consumer へ伝播もしない）、consumer の exe 側で
-// 適用する（29.2 の C 方式: macos/swift build_helper を vendoring して exe に適用）。
+// External packages linkLibrary `dep.artifact("platform_native_<plat>")`.
+// Facade is `dep.module("platform")`. Only addObjectFile the compilePlatformLayer .o onto a minimal stub
+// module and archive it. framework / Swift runtime / search paths
+// cannot be resolved at static-lib build time (search paths also do not propagate to the consumer), so the
+// consumer exe applies them (C-style: vendor macos/swift build helpers onto the exe).
 // ============================================================
 fn addPlatformNativeLib(
     b: *std.Build,
@@ -3254,10 +3254,10 @@ fn addPlatformNativeLib(
     name: []const u8,
     enable_gamepad: bool,
 ) *std.Build.Step.Compile {
-    // 外部消費者向け native archive の gamepad opt-in（TASK-80.2 / TASK-111.7）。
-    // SharedModules 外部公開 "platform" の build_options.enable_gamepad と同一 boolean。
-    // archive 自体は .o のみで GameController framework は含まない（consumer exe 側でリンク）。
-    // enable_gamepad=true のとき .m/.swift に -DVP_ENABLE_GAMEPAD が付き実 backend が有効になる。
+    // Gamepad opt-in for the external-consumer native archive.
+    // Same boolean as build_options.enable_gamepad on the SharedModules public "platform".
+    // The archive is .o only and does not include the GameController framework (consumer exe links it).
+    // When enable_gamepad=true, -DVP_ENABLE_GAMEPAD is passed to .m/.swift and the real backend is enabled.
     const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, .{
         .enable_gamepad = enable_gamepad,
     });
@@ -3271,10 +3271,10 @@ fn addPlatformNativeLib(
     for (compiled.obj_files) |obj| {
         lib_mod.addObjectFile(obj);
     }
-    // framework / Swift ランタイム / framework・library 検索パスは static lib ビルド時に
-    // 解決できず（`unable to find framework` になる）、検索パスは consumer へ伝播もしない。
-    // よってここは .o を archive することに徹し、リンク設定は consumer の exe 側で適用する
-    // （29.2 の C 方式: macos.linkMacOSFrameworks / swift.linkSwiftRuntime を vendoring）。
+    // framework / Swift runtime / framework·library search paths cannot be resolved at static-lib build time
+    // (`unable to find framework`), and search paths do not propagate to the consumer.
+    // So this only archives the .o; link settings are applied on the consumer exe
+    // (C-style: vendor macos.linkMacOSFrameworks / swift.linkSwiftRuntime).
 
     const lib = b.addLibrary(.{
         .name = name,
@@ -3284,8 +3284,8 @@ fn addPlatformNativeLib(
     for (compiled.compile_steps) |step| {
         lib.step.dependOn(&step.step);
     }
-    // consumer の @cImport("platform.h") 用に header を install（linkLibrary の
-    // installed-headers-include-tree 経路の健全性も確保）。
+    // Install the header for the consumer's @cImport("platform.h") (also keeps the
+    // linkLibrary installed-headers-include-tree path healthy).
     lib.installHeader(b.path("platform/platform.h"), "platform.h");
     b.installArtifact(lib);
     return lib;
