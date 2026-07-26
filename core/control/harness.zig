@@ -1,43 +1,43 @@
-//! ヘッドレス検証 harness（TASK-32: P1 file replay + fb probe / P2 live TCP + audio・stats probe）
+//! The headless verification harness: file replay plus the fb probe, and live TCP plus the audio and stats probes.
 //!
-//! 目的: 既存アプリを無改造で、`src/platform.zig`(facade) のフックだけで
-//!   - 入力注入（key/mouse/scroll）
-//!   - 仮想クロック（getTime = frame_index/60）
-//!   - probe（`fb` PNG/digest, `audio` WAV/digest, `stats` JSON）
-//! を実現する。env 未設定なら全 API は no-op（既存挙動と完全一致）。
+//! The purpose: to give an existing application, unmodified and through the hooks in `src/platform.zig` (the facade), all of
+//!   - input injection (keys, the mouse, scrolling)
+//!   - a virtual clock (getTime = frame_index/60)
+//!   - probes (`fb` as PNG or a digest, `audio` as WAV or a digest, `stats` as JSON)
+//! With the environment unset, every API is a no-op (matching existing behaviour exactly).
 //!
-//! ## トランスポート（コマンドの来る経路）
-//! - **replay（file）**: `VP_HARNESS_SCRIPT=<file>` を全部読み、常に manual clock。step で仮想フレーム前進、EOF/quit で auto-exit。
-//! - **listen（TCP loopback）**: `VP_HARNESS_LISTEN[=port]` で `127.0.0.1` に listen。
-//!   値なし／空／`0` は ephemeral、正の値は固定 port。既定は free-run clock（アプリ自走 + 非 blocking drain）。
-//!   `VP_HARNESS_MANUAL_CLOCK=1` を併用すると旧 step-driven（blocking accept/read）相当。
-//! - **スクリプト形式 == listen protocol**: パーサ・実行モデルは共通。差分は source（file/socket）と
-//!   clock mode（manual は gate で駆動、free-run は frame barrier / await で待つ）点のみ。
+//! ## The transports (where a command comes from)
+//! - **replay (a file)**: `VP_HARNESS_SCRIPT=<file>` is read in full, always on a manual clock. step advances a virtual frame, and EOF or quit exits automatically.
+//! - **listen (TCP loopback)**: `VP_HARNESS_LISTEN[=port]` listens on `127.0.0.1`.
+//!   No value, an empty value or `0` means ephemeral, and a positive value a fixed port. The default is the free-run clock (the application runs itself, with a non-blocking drain).
+//!   Adding `VP_HARNESS_MANUAL_CLOCK=1` gives the equivalent of the older step-driven behaviour (a blocking accept and read).
+//! - **The script format == the listen protocol**: the parser and the execution model are shared. They differ only in the source (a file or a socket) and
+//!   the clock mode (manual is driven by the gate, while free-run waits on a frame barrier or an await).
 //!
-//! ## レスポンス sink と framing
-//! digest/snapshot のコア payload は共通。framing は sink が決める:
-//!   - replay: stderr に `[harness] digest <probe> <payload>` / `[harness] snapshot <probe> -> <path> (<info>)`（P1 と byte 一致）
-//!   - live  : 接続へ prefix なしの protocol 行 `<probe> <payload>` / `<path>` を返す
+//! ## The response sink and the framing
+//! The core payload of a digest or a snapshot is shared; the sink decides the framing:
+//!   - replay: to stderr, `[harness] digest <probe> <payload>` / `[harness] snapshot <probe> -> <path> (<info>)`
+//!   - live  : to the connection, an unprefixed protocol line `<probe> <payload>` / `<path>`
 //!
-//! ## record↔replay 対称
-//! live 受信コマンドを `VP_HARNESS_RECORD=<file>` に追記すれば、それを `VP_HARNESS_SCRIPT` に渡して replay できる
-//! （文法・状態遷移の対称。`fb` は仮想クロックで bit 決定論、`audio` は RT 実時間依存で bit 一致は非保証）。
+//! ## record and replay are symmetrical
+//! Appending the commands received live to `VP_HARNESS_RECORD=<file>` gives a file that can be passed to `VP_HARNESS_SCRIPT` and replayed
+//! (the grammar and the state transitions are symmetrical. `fb` is bit-deterministic under the virtual clock, while `audio` depends on real time in the RT thread and is not guaranteed bit-identical).
 //!
-//! ## 依存と非依存
-//! - import は `std` / `platform_types.zig`(共有型) / `png`(エンコーダ+crc32) / `dsp`(FFT・スペクトル解析) のみ。
-//!   backend(platform_macos/linux*) と audio backend には依存しない。audio サンプルは `audio.zig` facade が
-//!   `onAudioSamples()` で push する（依存方向 audio→harness）。
-//! - facade フックは io を持たないため、ファイル I/O / TCP は harness が自前の `std.Io.Threaded` io で行う。
+//! ## What it depends on, and what it does not
+//! - The imports are `std`, `platform_types.zig` (the shared types), `png` (the encoder plus crc32) and `dsp` (the FFT and spectrum analysis), and nothing else.
+//!   It depends on neither a backend (platform_macos, platform_linux*) nor an audio backend. Audio samples are pushed in by the `audio.zig` facade
+//!   through `onAudioSamples()` (so the dependency runs audio→harness).
+//! - The facade hooks carry no io, so file IO and TCP are done by harness through its own `std.Io.Threaded` io.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const types = @import("platform_types");
 const png = @import("png");
-const dsp = @import("dsp"); // TASK-92: magnitudeSpectrum（band/centroid/onset）。RT 経路では呼ばない
-const capture_synthetic = @import("capture_synthetic"); // synthetic capture source（TASK-49.5）
-pub const action_registry = @import("action_registry.zig"); // TASK-62.3.1: Action/registry 分離
-pub const netsync = @import("netsync.zig"); // TASK-62.3.2: PROPOSE/COMMIT/REJECT（同一 action_registry インスタンス共有）
+const dsp = @import("dsp"); // magnitudeSpectrum (band, centroid, onset). Never called on a real-time path
+const capture_synthetic = @import("capture_synthetic"); // the synthetic capture source
+pub const action_registry = @import("action_registry.zig"); // the Action and registry split
+pub const netsync = @import("netsync.zig"); // PROPOSE/COMMIT/REJECT (sharing the one action_registry instance)
 
 const Event = types.Event;
 const KeyCode = types.KeyCode;
@@ -64,59 +64,59 @@ const net = std.Io.net;
 const gpa = std.heap.page_allocator;
 const Tok = std.mem.TokenIterator(u8, .any);
 
-/// harness 有効時の仮想フレームレート（getTime=frame/60 と整合する固定値。実性能計測ではない）。
+/// The virtual frame rate while harness is enabled (a fixed value consistent with getTime=frame/60; it is not a performance measurement).
 const VIRTUAL_FPS: f64 = 60.0;
 
-// audio tap（latest-wins SPSC）。producer=RT スレッドが head を進めて書く（満杯でも上書き）、
-// consumer=メインスレッドが「直近窓」を non-destructive に peek する。
-const AUDIO_CAP: usize = 1 << 16; // interleaved f32 サンプル数（48kHz stereo で ~0.68s）
+// The audio tap (a latest-wins SPSC queue). The producer, the RT thread, advances head and writes (overwriting even when full);
+// the consumer, the main thread, peeks non-destructively at the most recent window.
+const AUDIO_CAP: usize = 1 << 16; // the number of interleaved f32 samples (about 0.68s of 48kHz stereo)
 const AUDIO_MASK: usize = AUDIO_CAP - 1;
-const ANALYZE_FRAMES: usize = 4096; // digest 解析窓（mono frames。既存 rms/peak/f0 用。変更禁止）
-const EXT_FRAMES: usize = 32768; // TASK-92 拡張解析窓（LUFS 400ms@48k=19200 を収容。最大 ~0.68s）
-const EXT_FFT_N: usize = 4096; // band/centroid 用 FFT 点数
-const ONSET_FFT_N: usize = 2048; // onset 用 FFT 点数
-const ONSET_HOP: usize = 1024; // onset 用 hop
-const LUFS_FLOOR: f32 = -99.0; // 無音・窓不足時の LUFS 床値
+const ANALYZE_FRAMES: usize = 4096; // the digest analysis window (in mono frames; for the existing rms, peak and f0 — do not change it)
+const EXT_FRAMES: usize = 32768; // the extended analysis window (large enough for LUFS's 400ms@48k=19200; at most about 0.68s)
+const EXT_FFT_N: usize = 4096; // the FFT size for band and centroid
+const ONSET_FFT_N: usize = 2048; // the FFT size for onset detection
+const ONSET_HOP: usize = 1024; // the hop for onset detection
+const LUFS_FLOOR: f32 = -99.0; // the LUFS floor for silence, and for too short a window
 
 // ============================================================================
-// module-level state（単一プロセス・単一ウィンドウ前提の debug facility）
+// module-level state (a debug facility assuming a single process and a single window)
 // ============================================================================
 const Mode = enum { disabled, replay, live };
-/// clock ownership（TASK-164）。replay は常に manual。LISTEN 既定は free_run、MANUAL_CLOCK=1 で manual。
+/// Clock ownership. replay is always manual. LISTEN defaults to free_run, and MANUAL_CLOCK=1 makes it manual.
 const ClockMode = enum { manual, free_run };
 var mode: Mode = .disabled;
 var clock_mode: ClockMode = .manual;
 var initialized = false;
 
-// コマンド source（replay=script 全体 / live=現在のリクエスト）を指す共通バッファ
+// The shared buffer holding the command source (replay = the whole script; live = the current request)
 var cmd_buf: []const u8 = "";
 var cursor: usize = 0;
 var line_no: usize = 0;
 var steps_remaining: usize = 0;
 var quit_requested = false;
 
-// expect/assert（TASK-78）+ action（TASK-62.1）の失敗カウンタ（**replay 専用**。live は使わない=
-// 合否はレスポンス行のみ）。replay 終了時に >0 なら非0 exit する（AC#1）。resetForTest でゼロクリアする。
+// The failure counter for expect and assert, plus action (**replay only**; live does not use it, since
+// there the outcome is the response line alone). At the end of a replay, >0 exits non-zero. resetForTest clears it.
 var expect_failures: usize = 0;
 
-// replay 用 script bytes（プロセス寿命まで保持。page_allocator）
+// The script bytes for a replay (held for the life of the process; page_allocator)
 var script_bytes: []const u8 = "";
 
 // frame
 var frame_index: u64 = 0;
 
-// 出力先（snapshot path 省略時）。env 文字列はプロセス寿命まで有効。
+// Where output goes when a snapshot path is omitted. The environment string is valid for the life of the process.
 var out_dir: []const u8 = ".";
 var port_file_buf: [1024]u8 = undefined;
 
-// 当該フレームの注入イベント（pollGate で積み、nextEvent で drain）
+// This frame's injected events (queued by pollGate and drained by nextEvent)
 var inject_buf: [256]Event = undefined;
 var inject_count: usize = 0;
 var inject_read: usize = 0;
 
-// MIDI synthetic FIFO/state（TASK-115.1・ADR-010）。Window Event queue とは独立させ、
-// midi facade の pollMidi() だけが FIFO を読む。state は注入時点で更新し、app の drain 前でも
-// `digest midi` が最後の論理状態を観測できるようにする。
+// The synthetic MIDI FIFO and state. Kept independent of the Window event queue, so that
+// only the midi facade's pollMidi() reads the FIFO. The state is updated at injection time, so that
+// `digest midi` can observe the last logical state even before the application drains it.
 const MIDI_FIFO_CAP: usize = 256;
 var midi_buf: [MIDI_FIFO_CAP]MidiEvent = undefined;
 var midi_count: usize = 0;
@@ -125,16 +125,16 @@ var midi_pressed: [16]u8 = [_]u8{0} ** 16;
 var midi_cc_values: [128]u8 = [_]u8{0} ** 128;
 var midi_cc_set: [128]bool = [_]bool{false} ** 128;
 
-// マウス状態（move/down/up/scroll の一貫したイベント構築用）
+// The mouse state (for building consistent move, down, up and scroll events)
 var mouse_x: i32 = 0;
 var mouse_y: i32 = 0;
 var mouse_buttons: MouseButtons = .{};
 
-// ゲームパッド状態（TASK-80.1。ADR-009）。inject gamepad_connect/disconnect/button/axis で更新し、
-// facade の Window.getGamepadState / 組み込み probe `gamepad` が読む。null = 未接続。
+// The gamepad state. Updated by inject gamepad_connect, gamepad_disconnect, gamepad_button and gamepad_axis,
+// and read by the facade's Window.getGamepadState and by the built-in `gamepad` probe. null = not connected.
 var gamepad_states: [MAX_GAMEPADS]?GamepadState = [_]?GamepadState{null} ** MAX_GAMEPADS;
 
-// synthetic IME composition（TASK-79.6.2）。本文は latest-wins snapshot、イベントは状態変化通知。
+// A synthetic IME composition. The text is a latest-wins snapshot, and the events notify of a state change.
 const COMPOSITION_CAP: usize = 1024;
 var composition_text: [COMPOSITION_CAP]u8 = undefined;
 var composition_len: usize = 0;
@@ -142,48 +142,48 @@ var composition_cursor: usize = 0;
 var composition_revision: u32 = 0;
 var composition_active = false;
 
-// lockFramebuffer で記録する現在のフレームバッファ view（present/unlock まで有効）
+// The current framebuffer view recorded by lockFramebuffer (valid until present or unlock)
 var lock_pixels: []const u32 = &.{};
 var lock_w: u32 = 0;
 var lock_h: u32 = 0;
 var lock_valid = false;
 
-// 直近 present 済みフレーム（owned copy・growable reuse）
+// The most recently presented frame (an owned copy, whose buffer is reused as it grows)
 var frame_pixels: []u32 = &.{};
 var frame_w: u32 = 0;
 var frame_h: u32 = 0;
 var have_frame = false;
 
-// 直近の EventStats（present で push される）
+// The most recent EventStats (pushed by present)
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
 
-// null runtime query（TASK-165: platform が VP_HEADLESS を確定し、互換 query として公開）。
-// 一次 framebuffer は platform_null.Window が所有。harness は観測 hook のみ。
+// The null runtime query (platform settles VP_HEADLESS and exposes it as a compatibility query).
+// The primary framebuffer is owned by platform_null.Window; harness only hooks observation.
 var config_parsed = false;
 var pending_script_path: ?[]const u8 = null;
-var pending_listen_raw: ?[]const u8 = null; // env 値（存在時）。port 解釈は startTransport
+var pending_listen_raw: ?[]const u8 = null; // The environment value, when present. Interpreting the port is startTransport's job
 var pending_manual_clock = false;
 var headless_active = false;
 
-// present 毎の frame copy をスキップする計測専用モード（TASK-156.5 R10。VP_HARNESS_SKIP_FRAME_COPY env）。
-// 既定 false で従来と bit 一致。有効時は `fb`/`canvas` 等の snapshot/digest が無効値になるが、
-// `digest stats` の frame カウンタは引き続き増分するため fps 計測には使える。
+// A measurement-only mode that skips the frame copy on each present (the VP_HARNESS_SKIP_FRAME_COPY variable).
+// The default is false, matching the old behaviour bit for bit. While it is on, the snapshot and digest of `fb`, `canvas` and
+// friends hold meaningless values, but `digest stats`'s frame counter still increments, so it remains usable for measuring fps.
 var skip_frame_copy = false;
 
-// synthetic capture source（TASK-49.5）: harness 内蔵の偽 mic/camera。camera.zig/audio.zig への
-// facade 配線は無く、このモジュール内（`capture` コマンド + `capture` probe）で完結する。
+// The synthetic capture source: a fake mic and camera built into harness. There is no facade wiring into
+// camera.zig or audio.zig; it is self-contained within this module (the `capture` command plus the `capture` probe).
 var capture_synthetic_requested = false; // VP_HARNESS_CAPTURE_SYNTHETIC env
 var synth_video: ?capture_synthetic.SyntheticVideoDevice = null;
 var synth_audio: ?capture_synthetic.SyntheticAudioDevice = null;
 
-// custom probe registry（app が opt-in 登録。framework は中身を解釈せず raw+digest をルートするだけ）
-// 単一プロセスの debug facility なので固定長 module-level 配列で十分（動的確保なし）。
+// The custom probe registry (an application registers by opting in; the framework does not interpret the contents and merely routes the raw bytes and the digest)
+// Being a single-process debug facility, a fixed-length module-level array is enough (there is no dynamic allocation).
 const MAX_PROBES = 16;
-pub const DIGEST_BUF_LEN = 1024; // custom digest callback に渡す共通バッファ長（copilot も同契約で使う）
+pub const DIGEST_BUF_LEN = 1024; // The length of the shared buffer handed to a custom digest callback (copilot uses the same contract)
 var probes: [MAX_PROBES]Probe = undefined;
 var probe_count: usize = 0;
 
-// io（0.16 は std.fs blocking API が無く std.Io 経由のみ）。file 読み書きと TCP の両方に使う。
+// io (0.16 has no blocking std.fs API, only what goes through std.Io). Used for both file access and TCP.
 var threaded: std.Io.Threaded = undefined;
 var io_val: std.Io = undefined;
 
@@ -191,21 +191,21 @@ var io_val: std.Io = undefined;
 var server: net.Server = undefined;
 var live_stream: net.Stream = undefined;
 var live_req_open = false;
-var live_stream_owned = false; // accept 済みのときだけ close する（テストの擬似 request 対策）
-var req_bytes: []u8 = &.{}; // 現在のリクエスト（finish 時に free）
+var live_stream_owned = false; // close only once it has been accepted (which guards against a test's simulated request)
+var req_bytes: []u8 = &.{}; // The current request (freed when it finishes)
 var resp_buf: std.ArrayList(u8) = .empty;
 
-// free-run: accept 後・request 完成前の非 blocking 読取（manual の blocking receiver と分離）
+// free-run: the non-blocking read after an accept and before the request is complete (kept apart from manual's blocking receiver)
 var freerun_reading = false;
 var freerun_acc: std.ArrayList(u8) = .empty;
-/// test-only: free-run 空 drain が listener に対して行った poll(timeout=0) 回数。
+/// test-only: how many times a free-run empty drain called poll(timeout=0) on the listener.
 var test_poll_zero_count: usize = 0;
 
-// record（live コマンドログ）
+// record (the log of live commands)
 var record_path: ?[]const u8 = null;
 var record_buf: std.ArrayList(u8) = .empty;
 
-// live fd poll の timeout（ms）。テストのみ短縮上書き可（フレーキー回避）。
+// The timeout (in ms) of a live fd poll. Only a test may shorten it, to avoid a flaky result.
 var test_live_poll_timeout_ms: ?i32 = null;
 const live_poll_timeout_default_ms: i32 = 16;
 
@@ -214,10 +214,10 @@ var audio_buf: [AUDIO_CAP]f32 = undefined;
 var audio_head: std.atomic.Value(usize) = .init(0);
 var audio_channels: std.atomic.Value(u32) = .init(0);
 var audio_rate: std.atomic.Value(u32) = .init(0);
-var audio_scratch: [AUDIO_CAP]f32 = undefined; // peek 先（メインスレッド）
-var audio_mono: [ANALYZE_FRAMES]f32 = undefined; // downmix scratch（メインスレッド・既存 analyzeAudio）
-var audio_mono_ext: [EXT_FRAMES]f32 = undefined; // TASK-92 拡張解析 downmix（メインスレッド）
-// FFT scratch（digest 要求時のみ。RT 非接触。module-level で alloc 回避）
+var audio_scratch: [AUDIO_CAP]f32 = undefined; // where to peek (the main thread)
+var audio_mono: [ANALYZE_FRAMES]f32 = undefined; // the downmix scratch (the main thread; the existing analyzeAudio)
+var audio_mono_ext: [EXT_FRAMES]f32 = undefined; // the downmix for the extended analysis (the main thread)
+// the FFT scratch (only when a digest is asked for; never touched by the RT thread. Module-level, to avoid an allocation)
 var ext_fft_re: [EXT_FFT_N]f32 = undefined;
 var ext_fft_im: [EXT_FFT_N]f32 = undefined;
 var ext_mags: [EXT_FFT_N / 2]f32 = undefined;
@@ -228,40 +228,40 @@ var onset_mags_prev: [ONSET_FFT_N / 2]f32 = undefined;
 var onset_win: [ONSET_FFT_N]f32 = undefined;
 
 // ============================================================================
-// 公開: 初期化 / hook API（platform.zig facade から呼ばれる）
+// public: initialisation and the hook API (called from the platform.zig facade)
 // ============================================================================
 
 pub fn isEnabled() bool {
     return mode != .disabled;
 }
 
-/// manual clock（replay / LISTEN+MANUAL_CLOCK）か。virtual getTime / frameDelay no-op / blocking gate の判定。
+/// Whether the clock is manual (replay, or LISTEN with MANUAL_CLOCK). What decides a virtual getTime, a no-op frameDelay, and a blocking gate.
 pub fn isManualClock() bool {
     return isEnabled() and clock_mode == .manual;
 }
 
-/// 外部 control-plane（copilot。TASK-62.5.2）が probe registry 登録を有効化するフラグ。
-/// action 側は `action_registry.setEnabled`（OR 条件）へ転送する（TASK-62.3.1）。
-/// 依存は copilot→harness の一方向で、harness から copilot の関数は呼ばない。
+/// The flag by which an external control plane (copilot) enables registration in the probe registry.
+/// The action side forwards to `action_registry.setEnabled` (an OR condition).
+/// The dependency runs one way, copilot→harness; harness never calls a copilot function.
 var external_registry_enabled = false;
 
-/// 外部 transport（copilot 等）が probe/action registry の登録ゲートを開く。
-/// - probe: `registerProbe` の有効判定が `isEnabled() or このフラグ`。
-/// - action: `v==true` のときだけ `action_registry.setEnabled(true)` へ転送。
-///   `false` は action_registry に伝えない（無効化は `action_registry.resetForTest` 必須）。
+/// An external transport (copilot, say) opens the registration gate of the probe and action registries.
+/// - probe: `registerProbe`'s test becomes `isEnabled() or this flag`.
+/// - action: only `v==true` forwards to `action_registry.setEnabled(true)`.
+///   `false` is never passed on to action_registry (disabling requires `action_registry.resetForTest`).
 pub fn setExternalRegistryEnabled(v: bool) void {
     external_registry_enabled = v;
     if (v) action_registry.setEnabled(true);
 }
 
-/// probe registry の登録ゲート（harness 有効 or 外部 transport 有効）。
-/// action のゲートは `action_registry.enabled` のみ（registerProbe のゲートはここに残す）。
+/// The registration gate of the probe registry (harness enabled, or an external transport enabled).
+/// The action gate is `action_registry.enabled` alone (registerProbe's gate stays here).
 fn registryEnabled() bool {
     return isEnabled() or external_registry_enabled;
 }
 
-/// live 実表示時に harness が accept/read 待機中に呼ぶ native event pump callback。
-/// `pollFn` が `false` を返したら window close / compositor disconnect として live wait を中断する。
+/// The native event pump callback harness calls while waiting on an accept or a read, with a real display and live.
+/// When `pollFn` returns `false` the live wait is broken off, as a window close or a compositor disconnect.
 pub const NativePump = struct {
     ptr: *anyopaque,
     pollFn: *const fn (*anyopaque) bool,
@@ -271,53 +271,53 @@ pub const NativePump = struct {
     }
 };
 
-/// action/probe 共通の args シグネチャ型（TASK-88.1。action_registry が単一ソース）。
+/// The args signature type shared by actions and probes (action_registry is the single source).
 pub const ArgSpec = action_registry.ArgSpec;
 
-/// app が register する custom probe。**framework は中身を解釈しない**:
-/// snapshot が返す raw バイト列をそのまま file へ書き、digest が返す1行を既存 sink へ流すだけ。
-/// 各 probe の意味づけ（PNG 化 / JSON 整形 等）は全て app 側 callback に閉じる。
+/// A custom probe an application registers. **The framework does not interpret its contents**:
+/// it writes the raw bytes snapshot returns straight to a file, and passes the one line digest returns to the existing sink.
+/// All the meaning of a probe (turning it into a PNG, formatting JSON) is closed inside the application's callback.
 pub const Probe = struct {
-    /// probe 名（snapshot/digest コマンドの引数。fb/audio/stats/capabilities/capture は予約名で登録不可）。
+    /// The probe name (the argument of a snapshot or digest command. fb, audio, stats, capabilities and capture are reserved and cannot be registered).
     name: []const u8,
-    /// callback に渡す不透明コンテキスト（app の状態へのポインタ）。
+    /// The opaque context handed to the callback (a pointer to the application's state).
     ctx: *anyopaque,
-    /// path 省略時の既定拡張子（"png" / "json" / "txt" 等）。
+    /// The default extension used when a path is omitted ("png", "json", "txt" and so on).
     ext: []const u8 = "bin",
-    /// raw バイト列を allocator で確保して返す。harness が file へ書き同じ allocator で free。
-    /// null なら snapshot 非対応。
+    /// Returns raw bytes allocated with allocator. harness writes them to a file and frees them with the same allocator.
+    /// null means snapshot is unsupported.
     snapshot: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
-    /// 1行テキストを buf（DIGEST_BUF_LEN バイト）に書いて返す。改行は含めない。null なら digest 非対応。
+    /// Writes one line of text into buf (DIGEST_BUF_LEN bytes) and returns it, with no newline in it. null means digest is unsupported.
     digest: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
-    /// capabilities 列挙（TASK-62.4）用の説明文（省略可）。登録時に `sanitizeDesc` で
-    /// 禁止文字（`"`/`\`/ASCII 制御文字）・200 bytes 超をチェックし、違反時は空文字へ落とす
-    /// （中身の意味解釈ではなく capabilities JSON の wire framing 保護）。
+    /// The description for the capabilities listing (optional). At registration `sanitizeDesc` checks for
+    /// forbidden characters (`"`, `\`, ASCII control characters) and for over 200 bytes, and empties it on a violation
+    /// (this protects the wire framing of the capabilities JSON; it is not an interpretation of the contents).
     desc: []const u8 = "",
-    /// args シグネチャ（TASK-88.1。省略可・後方互換）。Action と同じ契約:
-    /// **null=未指定（JSON に args 無し）/ 空 slice=引数なし明示**。現状の probe は全て null のまま。
+    /// The args signature (optional, backwards compatible). The same contract as Action's:
+    /// **null = unspecified (no args in the JSON) / an empty slice = explicitly no arguments**. Every probe today leaves it null.
     args: ?[]const ArgSpec = null,
 };
 
-/// custom probe を登録する。app は `platform.registerProbe(...)` 経由で `platform.init()` 後に呼ぶ。
-/// - harness 無効時（env 未設定）は **no-op**（registry を一切触らない＝通常実行の回帰ゼロ）。
-/// - 同名は上書き。fb/audio/stats/capabilities/capture は予約名で拒否。registry 満杯はスキップ（いずれも warn）。
+/// Registers a custom probe. An application calls it through `platform.registerProbe(...)` after `platform.init()`.
+/// - With harness disabled (the environment unset) this is a **no-op** (it does not touch the registry at all, so a normal run has zero regression).
+/// - The same name overwrites. fb, audio, stats, capabilities and capture are reserved and rejected. A full registry is skipped (each with a warning).
 pub fn registerProbe(p: Probe) void {
     if (!registryEnabled()) return;
     if (isReservedProbeName(p.name)) {
-        std.debug.print("[harness] registerProbe: 予約名 '{s}' は登録できません\n", .{p.name});
+        std.debug.print("[harness] registerProbe: the reserved name '{s}' cannot be registered\n", .{p.name});
         return;
     }
     for (probes[0..probe_count]) |*existing| {
         if (std.mem.eql(u8, existing.name, p.name)) {
             var mp = p;
-            mp.desc = sanitizeDesc("probe", p.name, p.desc); // 実際に保存する直前にのみ sanitize（満杯 skip 時に無用な warn を出さない）
+            mp.desc = sanitizeDesc("probe", p.name, p.desc); // Sanitise only right before actually storing it (so a skip on a full registry emits no pointless warning)
             mp.args = sanitizeArgs("probe", p.name, p.args);
-            existing.* = mp; // 同名上書き
+            existing.* = mp; // the same name overwrites
             return;
         }
     }
     if (probe_count >= MAX_PROBES) {
-        std.debug.print("[harness] registerProbe: registry 満杯（{d}）。'{s}' をスキップ\n", .{ MAX_PROBES, p.name });
+        std.debug.print("[harness] registerProbe: the registry is full ({d}); skipping '{s}'\n", .{ MAX_PROBES, p.name });
         return;
     }
     var mp = p;
@@ -333,9 +333,9 @@ fn isReservedProbeName(name: []const u8) bool {
         std.mem.eql(u8, name, "gamepad") or std.mem.eql(u8, name, "midi");
 }
 
-/// JSON 文字列へ未エスケープで埋め込むと破損する文字（`"` / `\` / ASCII 制御文字 `0x00..0x1F`。
-/// tab や NUL も含む）を含むかを判定する。`sanitizeDesc`（登録時）と capabilities の entry
-/// 組み立て（format 時、name/ext の防御的チェック）の両方が共有する。
+/// Decides whether a string holds a character that would corrupt a JSON string if embedded unescaped (`"`, `\`,
+/// or an ASCII control character `0x00..0x1F`, tab and NUL included). Shared by `sanitizeDesc` (at registration)
+/// and by assembling a capabilities entry (at format time, as a defensive check on name and ext).
 fn containsUnsafeJsonChar(s: []const u8) bool {
     for (s) |c| {
         if (c == '"' or c == '\\' or c < 0x20) return true;
@@ -343,9 +343,9 @@ fn containsUnsafeJsonChar(s: []const u8) bool {
     return false;
 }
 
-/// capabilities 列挙用の desc を登録時にサニタイズする。禁止文字を含む、または 200 bytes 超の
-/// desc は warn を出し空文字を返す（登録自体は成功させ desc だけ無効化。JSON buffer 安全性のための
-/// wire framing 保護であり、desc の意味解釈ではない）。
+/// Sanitises a desc for the capabilities listing at registration time. A desc holding a forbidden character, or over
+/// 200 bytes, is warned about and returned as an empty string (registration itself still succeeds and only desc is
+/// invalidated. This protects the wire framing for the sake of the JSON buffer's safety; it does not interpret desc's meaning).
 const MAX_DESC_LEN = 200;
 const MAX_ARG_NAME_LEN = 32;
 const MAX_ARG_KIND_LEN = 32;
@@ -354,22 +354,22 @@ const MAX_ARG_PATTERN_LEN = 100;
 fn sanitizeDesc(kind: []const u8, name: []const u8, desc: []const u8) []const u8 {
     if (desc.len == 0) return desc;
     if (desc.len > MAX_DESC_LEN or containsUnsafeJsonChar(desc)) {
-        std.debug.print("[harness] {s} desc for '{s}' は無効化されました（禁止文字 or 200 bytes 超）\n", .{ kind, name });
+        std.debug.print("[harness] {s} desc for '{s}' was disabled (a forbidden character, or over 200 bytes)\n", .{ kind, name });
         return "";
     }
     return desc;
 }
 
-/// probe args シグネチャの登録時サニタイズ（TASK-88.1。action_registry 側と同規則・重複定義維持）。
-/// 違反時は warn + args 全体を null（登録自体は成功）。
+/// Sanitises a probe's args signature at registration (the same rule as action_registry's; the duplicate definition is deliberate).
+/// On a violation it warns and drops args as a whole to null (registration itself still succeeds).
 fn sanitizeArgs(kind: []const u8, name: []const u8, args: ?[]const ArgSpec) ?[]const ArgSpec {
     const specs = args orelse return null;
     for (specs) |s| {
-        // NaN/Inf は JSON 数値として emit できない（常に valid JSON の契約を壊す）ため登録時に拒否
+        // NaN and Inf cannot be emitted as a JSON number (they would break the always-valid-JSON contract), so they are rejected at registration
         if ((s.min != null and !std.math.isFinite(s.min.?)) or
             (s.max != null and !std.math.isFinite(s.max.?)))
         {
-            std.debug.print("[harness] {s} args for {s} は無効化されました（min/max が非有限）\n", .{ kind, name });
+            std.debug.print("[harness] {s} args for {s} was disabled (min or max is not finite)\n", .{ kind, name });
             return null;
         }
         if (s.name.len > MAX_ARG_NAME_LEN or containsUnsafeJsonChar(s.name) or
@@ -377,12 +377,12 @@ fn sanitizeArgs(kind: []const u8, name: []const u8, args: ?[]const ArgSpec) ?[]c
             s.pattern.len > MAX_ARG_PATTERN_LEN or containsUnsafeJsonChar(s.pattern) or
             s.desc.len > MAX_DESC_LEN or containsUnsafeJsonChar(s.desc))
         {
-            std.debug.print("[harness] {s} args for '{s}' は無効化されました（禁止文字 or 長さ上限超過）\n", .{ kind, name });
+            std.debug.print("[harness] {s} args for '{s}' was disabled (a forbidden character, or over the length limit)\n", .{ kind, name });
             return null;
         }
         for (s.values) |v| {
             if (v.len > MAX_ARG_VALUE_LEN or containsUnsafeJsonChar(v)) {
-                std.debug.print("[harness] {s} args for '{s}' は無効化されました（禁止文字 or 長さ上限超過）\n", .{ kind, name });
+                std.debug.print("[harness] {s} args for '{s}' was disabled (a forbidden character, or over the length limit)\n", .{ kind, name });
                 return null;
             }
         }
@@ -390,7 +390,7 @@ fn sanitizeArgs(kind: []const u8, name: []const u8, args: ?[]const ArgSpec) ?[]c
     return specs;
 }
 
-/// 登録済み custom probe の name lookup（copilot 等の外部 control-plane も使う。TASK-62.5.2 で pub 化）。
+/// Looks a registered custom probe up by name (an external control plane such as copilot uses it too, which is why it is pub).
 pub fn findProbe(name: []const u8) ?*Probe {
     for (probes[0..probe_count]) |*p| {
         if (std.mem.eql(u8, p.name, name)) return p;
@@ -399,22 +399,22 @@ pub fn findProbe(name: []const u8) ?*Probe {
 }
 
 // ============================================================================
-// custom action（TASK-62.1 → TASK-62.3.1 で action_registry.zig へ移送）
+// custom actions (moved out into action_registry.zig)
 // ============================================================================
 
-/// Action / NetworkPolicy / registerAction / findAction は `action_registry` へ移送済み。
-/// 既存 caller（copilot・harness テスト）向けに re-export する。
+/// Action, NetworkPolicy, registerAction and findAction have moved to `action_registry`.
+/// They are re-exported here for the existing callers (copilot, and the harness tests).
 pub const Action = action_registry.Action;
 pub const NetworkPolicy = action_registry.NetworkPolicy;
 pub const registerAction = action_registry.registerAction;
 pub const findAction = action_registry.findAction;
 pub const setActionErrorDetail = action_registry.setActionErrorDetail;
 
-/// `VP_HARNESS_LISTEN` 値の純解釈（I/O 無し・単体テスト用）。
-/// - null = env 未設定（listen しない）
-/// - 空 / "0" = ephemeral（port=0, ok）
-/// - 正の整数 = 固定 port
-/// - それ以外 = invalid（transport 無効化）
+/// The pure interpretation of a `VP_HARNESS_LISTEN` value (no IO; for unit testing).
+/// - null = the variable is unset (do not listen)
+/// - empty or "0" = ephemeral (port=0, ok)
+/// - a positive integer = a fixed port
+/// - anything else = invalid (which disables the transport)
 const ListenPortParse = struct {
     requested: bool,
     port: u16 = 0,
@@ -434,7 +434,7 @@ fn parseListenPortValue(raw: ?[]const u8) ListenPortParse {
     return .{ .requested = true, .port = port, .valid = true };
 }
 
-/// SCRIPT / LISTEN / MANUAL_CLOCK の排他・clock 既定（純関数・単体テスト用）。
+/// The mutual exclusion of SCRIPT, LISTEN and MANUAL_CLOCK, and the clock default (a pure function; for unit testing).
 const TransportDecision = struct {
     enable: bool,
     clock: ClockMode,
@@ -456,7 +456,7 @@ fn decideTransport(script: bool, listen: ListenPortParse, manual_clock: bool) Tr
         return .{ .enable = false, .clock = .manual, .reason_disabled = "invalid LISTEN port" };
     }
     if (script) {
-        // MANUAL_CLOCK on SCRIPT は無視（常に manual）
+        // MANUAL_CLOCK is ignored alongside SCRIPT (which is always manual)
         return .{ .enable = true, .clock = .manual };
     }
     // listen
@@ -464,10 +464,10 @@ fn decideTransport(script: bool, listen: ListenPortParse, manual_clock: bool) Tr
     return .{ .enable = true, .clock = clock, .listen_port = listen.port };
 }
 
-/// platform.init() の最初に1度だけ呼ぶ。env を読むだけで I/O 副作用（script 読込・listen）は起こさない
-/// （TASK-32.4 P4: transport 判定を `backend.init()` の要否より前に確定させるため `startTransport()` と
-/// 二段階に分割した。詳細はタスク plan §3.1）。
-/// headless（`VP_HEADLESS`）は platform が確定し `setHeadlessActive` で渡す（本関数では読まない。TASK-165）。
+/// Called exactly once at the very start of platform.init(). It only reads the environment and causes no IO side effect (it neither reads the script nor listens)
+/// (it is split into two stages with `startTransport()` so that the transport decision is settled before
+/// whether `backend.init()` is needed).
+/// headless (`VP_HEADLESS`) is settled by platform and passed in through `setHeadlessActive` (this function does not read it).
 pub fn parseConfig() void {
     if (config_parsed) return;
     config_parsed = true;
@@ -481,41 +481,41 @@ pub fn parseConfig() void {
     skip_frame_copy = if (getEnv("VP_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
 }
 
-/// platform が `VP_HEADLESS=1` を確定したあと呼ぶ互換 setter（TASK-165）。
-/// audio/midi/capture 等が `isHeadlessActive()` で参照する。wasm stub は no-op。
+/// The compatibility setter platform calls once it has settled `VP_HEADLESS=1`.
+/// audio, midi, capture and the rest consult it through `isHeadlessActive()`. The wasm stub is a no-op.
 pub fn setHeadlessActive(active: bool) void {
     headless_active = active;
 }
 
-/// null runtime 判定（platform が `setHeadlessActive` で設定。env の SoT は `VP_HEADLESS`）。
-/// facade が Window を null backend にするかの分岐と、audio/midi の native 回避に使う。
+/// The null runtime test (platform sets it through `setHeadlessActive`; the source of truth in the environment is `VP_HEADLESS`).
+/// Used to decide whether the facade makes a Window a null backend, and to keep audio and midi off the native path.
 pub fn isHeadlessActive() bool {
     return headless_active;
 }
 
-/// capture（マイク/カメラ）の synthetic source 有効判定（TASK-49.5）。
-/// `VP_HARNESS_CAPTURE_SYNTHETIC` env かつ harness が有効（replay/live）のときのみ `true`。
-/// 既定（env 未設定）では常に `false`（回帰ゼロ）。
+/// Whether the synthetic capture source (a mic or a camera) is enabled.
+/// `true` only when the `VP_HARNESS_CAPTURE_SYNTHETIC` variable is set and harness is enabled (replay or live).
+/// By default (the variable unset) it is always `false` (zero regression).
 ///
-/// **注意（重要な限定）**: `core/camera.zig`/`core/audio.zig` は本タスクでは変更していないため、
-/// この関数が `true` を返しても `camera.open()`/`audio.openCapture()` は引き続き
-/// `error.Unsupported` を返す（49.1 のプレースホルダ分岐がそのまま残る）。本タスクの synthetic
-/// capture は `core/capture_synthetic.zig` + harness 組み込みの `capture` コマンド/probe として
-/// **このモジュール内で完結**しており、facade への配線は別タスクに委ねる
-/// （`docs/plans/capture-foundation-plan.md` 5章の「1行差し替え」は当初案だったが、`camera.zig`
-/// 側の公開 `VideoDevice` 型が具象 alias のため単純な差し替えでは済まないと判明し、TASK-49.5 の
-/// codex レビューでスコープ外と確定した）。
+/// **A caution, and an important limitation**: `core/camera.zig` and `core/audio.zig` are untouched here, so even when
+/// this function returns `true`, `camera.open()` and `audio.openCapture()` still return
+/// `error.Unsupported` (the placeholder branch remains as it is). The synthetic
+/// capture here is `core/capture_synthetic.zig` plus the `capture` command and probe built into harness, and is
+/// **self-contained within this module**; wiring it into the facade is left to another piece of work
+/// (the "one-line substitution" of `docs/plans/capture-foundation-plan.md` chapter 5 was the original idea, but the
+/// public `VideoDevice` type on `camera.zig`'s side is a concrete alias, so a simple substitution turned out not to be
+/// enough, and the review settled it as out of scope).
 ///
-/// 有効化条件は既存 audio 出力と同じ規約を踏襲する: harness の env 読み（`parseConfig()`）は
-/// `platform.init()` 経由でのみ走るため、`platform.init()` を呼ばない capture-only アプリでは
-/// 本関数は常に `false` を返す（`examples/15_audio_tone` 等の audio-only アプリが
-/// `VP_HEADLESS` を解釈できないのと同じ既知の制約）。
+/// The condition for enabling it follows the same rule as the existing audio output: harness's environment read
+/// (`parseConfig()`) runs only through `platform.init()`, so in a capture-only application that never calls
+/// `platform.init()` this function always returns `false` (the same known limitation as an audio-only application
+/// being unable to interpret `VP_HEADLESS`).
 pub fn isCaptureSyntheticActive() bool {
     return capture_synthetic_requested and isEnabled();
 }
 
-/// platform.init() が（非 null runtime 時は `native_backend.init()` の後に）1度だけ呼ぶ。
-/// script 読込 / live listen の実 I/O はここに閉じる（`parseConfig()` との分割は plan §3.1 参照）。
+/// Called exactly once by platform.init() (after `native_backend.init()`, on a non-null runtime).
+/// The real IO of reading the script and of a live listen is confined here (on the split from `parseConfig()`, see above).
 pub fn startTransport() void {
     if (initialized) return;
     initialized = true;
@@ -525,7 +525,7 @@ pub fn startTransport() void {
     const decision = decideTransport(script_path != null, listen, pending_manual_clock);
     if (!decision.enable) {
         if (decision.reason_disabled) |why| {
-            std.debug.print("[harness] {s}。harness を無効化します。\n", .{why});
+            std.debug.print("[harness] {s}. Disabling harness.\n", .{why});
         }
         return;
     }
@@ -536,29 +536,29 @@ pub fn startTransport() void {
 
     if (script_path) |path| {
         script_bytes = std.Io.Dir.cwd().readFileAlloc(io_val, path, gpa, .unlimited) catch |err| {
-            std.debug.print("[harness] script 読み込み失敗 {s}: {s}\n", .{ path, @errorName(err) });
-            return; // disabled のまま
+            std.debug.print("[harness] failed to read the script {s}: {s}\n", .{ path, @errorName(err) });
+            return; // left disabled
         };
         cmd_buf = script_bytes;
         mode = .replay;
         clock_mode = .manual;
         action_registry.setEnabled(true);
-        std.debug.print("[harness] replay 有効: script={s} out={s}\n", .{ path, out_dir });
+        std.debug.print("[harness] replay enabled: script={s} out={s}\n", .{ path, out_dir });
         return;
     }
 
-    // listen（TCP）
+    // listen (TCP)
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(decision.listen_port) };
     server = addr.listen(io_val, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[harness] listen 失敗: {s}\n", .{@errorName(err)});
-        return; // disabled のまま
+        std.debug.print("[harness] listen failed: {s}\n", .{@errorName(err)});
+        return; // left disabled
     };
     record_path = getEnv("VP_HARNESS_RECORD");
     mode = .live;
     action_registry.setEnabled(true);
     const chosen = server.socket.address.getPort();
     const clock_label: []const u8 = if (clock_mode == .manual) "manual" else "free-run";
-    std.debug.print("[harness] listen 有効 ({s}): 127.0.0.1:{d} out={s}\n", .{ clock_label, chosen, out_dir });
+    std.debug.print("[harness] listen enabled ({s}): 127.0.0.1:{d} out={s}\n", .{ clock_label, chosen, out_dir });
     writePortFile(chosen);
 }
 
@@ -572,7 +572,7 @@ const ExpectExpr = struct {
     },
 };
 
-/// free-run / await の継続待機（1 接続を保持したまま frame boundary で再開）。
+/// Continuing to wait for free-run or an await (holding one connection and resuming at a frame boundary).
 const PendingWait = union(enum) {
     none,
     frame_barrier: struct { target_frame: u64 },
@@ -585,9 +585,9 @@ const PendingWait = union(enum) {
 };
 var pending_wait: PendingWait = .none;
 
-/// フレーム進行の同期点。1 フレーム分の進行を許可するとき true。
-/// quit / EOF(replay) / window closed(native_continue=false) / accept 失敗(live manual) で false。
-/// free-run では常に true（アプリ自走。agent 不在でも止まらない）— quit/native close のみ false。
+/// The synchronisation point of frame progress. True when one frame's worth of progress is allowed.
+/// False on quit, on EOF (replay), on the window closing (native_continue=false), or on a failed accept (live manual).
+/// Under free-run it is always true (the application runs itself and does not stop even with no agent present) — only quit and a native close give false.
 pub fn pollGate(native_continue: bool) bool {
     if (mode == .live and clock_mode == .free_run) {
         return pollGateFreeRun(native_continue);
@@ -596,13 +596,13 @@ pub fn pollGate(native_continue: bool) bool {
 }
 
 pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
-    // 早期 return（window close 等で native_continue=false / 既に quit 済み）でも、記帳済みの
-    // expect 失敗を exit code へ落とす（TASK-78。replay 終了 3 経路の 1 つ。live/通常実行では no-op）。
+    // Even on an early return (native_continue=false from a window close, or having already quit), let the
+    // recorded expect failures reach the exit code (one of the three replay exit paths; a no-op for live and a normal run).
     if (quit_requested or !native_continue) {
         replayExitIfFailed();
         return false;
     }
-    // await predicate: 不成立なら 1 フレーム駆動して再評価（manual/replay）
+    // the await predicate: when it does not hold, drive one frame and re-evaluate (manual and replay)
     if (resolvePendingWaitManual()) |gate| return gate;
 
     if (steps_remaining > 0) {
@@ -613,20 +613,20 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
         if (cursor >= cmd_buf.len) {
             switch (mode) {
                 .replay, .disabled => {
-                    replayExitIfFailed(); // EOF（replay 終了経路）
+                    replayExitIfFailed(); // EOF (a replay exit path)
                     return false;
                 },
                 .live => {
                     finishLiveRequest();
                     if (quit_requested) return false;
-                    if (!acceptLiveRequest(pump)) return false; // accept 失敗 = 終了
+                    if (!acceptLiveRequest(pump)) return false; // a failed accept means the end
                     continue;
                 },
             }
         }
         const raw = nextLine() orelse continue;
-        // 先頭空白のみ除去。行末スペースは `inject commit` 等が保持するため残す（TASK-79.6.1 codex D）。
-        // 行末 \r のみ落とす（record→replay 対称: commit 本文の前後空白を失わない）。
+        // Strip leading whitespace only. Trailing spaces are kept, because `inject commit` and friends preserve them.
+        // Drop only a trailing CR (keeping record and replay symmetrical: the whitespace around a commit's text is not lost).
         var line = std.mem.trimStart(u8, raw, " \t");
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (line.len == 0 or line[0] == '#') continue;
@@ -640,7 +640,7 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
         } else if (std.mem.eql(u8, cmd, "quit")) {
             quit_requested = true;
             if (mode == .live) finishLiveRequest();
-            replayExitIfFailed(); // quit（replay 終了経路。live は finishLiveRequest 後で no-op）
+            replayExitIfFailed(); // quit (a replay exit path; for live this is a no-op after finishLiveRequest)
             return false;
         } else if (std.mem.eql(u8, cmd, "inject")) {
             handleInject(&it);
@@ -657,14 +657,14 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
         } else if (std.mem.eql(u8, cmd, "assert")) {
             handleExpect(&it, true);
         } else if (std.mem.eql(u8, cmd, "await")) {
-            if (handleAwait(&it)) return true; // predicate pending → 1 フレーム駆動
+            if (handleAwait(&it)) return true; // the predicate is pending → drive one frame
         } else {
-            warnLine("不明なコマンド");
+            warnLine("unknown command");
         }
     }
 }
 
-/// free-run gate: 非 blocking drain。空時は listener poll(0) 1 回のみ。NativePump は呼ばない。
+/// The free-run gate: a non-blocking drain. When empty it does one listener poll(0) only, and never calls NativePump.
 pub fn pollGateFreeRun(native_continue: bool) bool {
     if (quit_requested or !native_continue) {
         if (live_req_open) finishLiveRequest();
@@ -672,15 +672,15 @@ pub fn pollGateFreeRun(native_continue: bool) bool {
         return false;
     }
 
-    // pending wait の解決（frame barrier / await）
+    // resolving a pending wait (a frame barrier or an await)
     switch (pending_wait) {
         .none => {},
         .frame_barrier => |b| {
             if (frame_index >= b.target_frame) {
                 pending_wait = .none;
-                // 続きのコマンドへ
+                // on to the next command
             } else {
-                return true; // アプリ自走を待つ
+                return true; // wait for the application to run itself
             }
         },
         .predicate => {
@@ -698,19 +698,19 @@ pub fn pollGateFreeRun(native_continue: bool) bool {
         },
     }
 
-    // アクティブ request のコマンドを進める（step/await で pending になったら戻る）
+    // Advance the active request's commands (returning once step or await makes it pending)
     if (live_req_open) {
         if (!runFreeRunCommands()) return false; // quit
         if (pending_wait != .none) return true;
         if (cursor >= cmd_buf.len) {
             finishLiveRequest();
         } else {
-            return true; // 通常ここには来ない（runFreeRunCommands が尽くすか pending）
+            return true; // It does not normally reach here (either runFreeRunCommands exhausts it, or it is pending)
         }
     }
 
     drainFreeRunTransport();
-    // drain で request が完成していれば同フレームで処理
+    // If the drain completed a request, handle it in the same frame
     if (live_req_open) {
         if (!runFreeRunCommands()) return false;
         if (pending_wait != .none) return true;
@@ -719,7 +719,7 @@ pub fn pollGateFreeRun(native_continue: bool) bool {
     return true;
 }
 
-/// free-run のコマンド実行。false = quit。pending_wait 設定時は true で戻る（呼び出し側が frame 継続）。
+/// Running commands under free-run. false = quit. With pending_wait set it returns true (and the caller carries the frame on).
 fn runFreeRunCommands() bool {
     while (cursor < cmd_buf.len) {
         const raw = nextLine() orelse continue;
@@ -754,13 +754,13 @@ fn runFreeRunCommands() bool {
         } else if (std.mem.eql(u8, cmd, "await")) {
             if (handleAwait(&it)) return true;
         } else {
-            warnLine("不明なコマンド");
+            warnLine("unknown command");
         }
     }
     return true;
 }
 
-/// free-run 非 blocking drain。空なら listener へ poll(0) をちょうど 1 回。
+/// The free-run non-blocking drain. When empty it polls the listener exactly once with poll(0).
 fn drainFreeRunTransport() void {
     if (freerun_reading) {
         tryReadFreeRunRequest();
@@ -771,7 +771,7 @@ fn drainFreeRunTransport() void {
     switch (pollFdReady(server.socket.handle)) {
         .ready => {
             const stream = server.accept(io_val) catch |err| {
-                std.debug.print("[harness] accept 失敗: {s}\n", .{@errorName(err)});
+                std.debug.print("[harness] accept failed: {s}\n", .{@errorName(err)});
                 return;
             };
             live_stream = stream;
@@ -789,8 +789,8 @@ const PollReady = enum { ready, not_ready, err };
 fn pollFdReady(fd: net.Socket.Handle) PollReady {
     switch (comptime builtin.os.tag) {
         .windows => {
-            // Windows: 非 blocking 契約は別 API。free-run unit test は POSIX 前提で Skip。
-            // accept を試行すると block し得るため、空 drain では not_ready 扱い。
+            // Windows: the non-blocking contract is a different API. The free-run unit test assumes POSIX and is skipped.
+            // Attempting an accept could block, so an empty drain treats it as not_ready.
             test_poll_zero_count += 1;
             return .not_ready;
         },
@@ -828,7 +828,7 @@ fn tryReadFreeRunRequest() void {
         return;
     };
     if (n == 0) {
-        // peer half-close → request 完成
+        // the peer's half-close → the request is complete
         const bytes = freerun_acc.toOwnedSlice(gpa) catch {
             abortFreeRunRead();
             return;
@@ -846,7 +846,7 @@ fn tryReadFreeRunRequest() void {
     const limit: usize = 1 << 20;
     if (freerun_acc.items.len + n > limit) {
         appendResp("error: request too large\n");
-        // レスポンスを返して閉じる
+        // return the response and close
         freerun_reading = false;
         live_req_open = true;
         live_stream_owned = true;
@@ -870,12 +870,12 @@ fn abortFreeRunRead() void {
     freerun_acc.clearRetainingCapacity();
 }
 
-/// manual 経路の pending await 解決。`null` = 続行、`Some(bool)` = 即 return。
+/// Resolving a pending await on the manual path. `null` = carry on, `Some(bool)` = return at once.
 fn resolvePendingWaitManual() ?bool {
     switch (pending_wait) {
         .none => return null,
         .frame_barrier => {
-            // manual では frame_barrier を使わない（steps_remaining）
+            // manual does not use frame_barrier (it uses steps_remaining)
             pending_wait = .none;
             return null;
         },
@@ -884,14 +884,14 @@ fn resolvePendingWaitManual() ?bool {
                 .pass => {
                     reportAwait(true, pendingPredicateExprText(), null);
                     pending_wait = .none;
-                    return null; // コマンドループへ
+                    return null; // on to the command loop
                 },
                 .fail => {
                     reportAwait(false, pendingPredicateExprText(), pendingPredicateActual());
                     pending_wait = .none;
                     return null;
                 },
-                .pending => return true, // 1 フレーム駆動
+                .pending => return true, // drive one frame
             }
         },
     }
@@ -907,7 +907,7 @@ fn evalPendingPredicate() PredicateEval {
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     switch (digestPayload(p.expr.probe, &buf)) {
         .unavailable => {
-            // unavailable は成立扱いにしない
+            // unavailable does not count as holding
             if (p.timeout_frames == 0 or frame_index >= p.start_frame + p.timeout_frames) {
                 pending_pred_actual_buf_set("unavailable");
                 return .fail;
@@ -925,7 +925,7 @@ fn evalPendingPredicate() PredicateEval {
     }
 }
 
-// predicate fail 時の actual 表示用（digest payload は stack。短い理由を保持）
+// For showing actual when a predicate fails (the digest payload is on the stack, so a short reason is kept)
 var pending_pred_actual_storage: [DIGEST_BUF_LEN]u8 = undefined;
 var pending_pred_actual_len: usize = 0;
 
@@ -947,7 +947,7 @@ fn pendingPredicateActual() ?[]const u8 {
     return pending_pred_actual_storage[0..pending_pred_actual_len];
 }
 
-/// 当該フレームの注入イベントを1つ返す。尽きたら（次フレーム用に reset して）null。
+/// Returns one of this frame's injected events, or null once they are exhausted (resetting for the next frame).
 pub fn nextInjectedEvent() ?Event {
     if (inject_read < inject_count) {
         const ev = inject_buf[inject_read];
@@ -959,7 +959,7 @@ pub fn nextInjectedEvent() ?Event {
     return null;
 }
 
-/// 当該フレームの synthetic MIDI event を1件返す。FIFO が尽きたら次フレーム用に reset する。
+/// Returns one synthetic MIDI event for this frame, resetting for the next frame once the FIFO is exhausted.
 pub fn nextMidiEvent() ?MidiEvent {
     if (midi_read < midi_count) {
         const ev = midi_buf[midi_read];
@@ -971,7 +971,7 @@ pub fn nextMidiEvent() ?MidiEvent {
     return null;
 }
 
-/// harness 注入 composition の latest-wins snapshot。commit/cancel 後も最新 revision を返す。
+/// The latest-wins snapshot of the composition harness injected. It returns the newest revision even after a commit or a cancel.
 pub fn getCompositionSnapshot(buf: []u8) CompositionSnapshot {
     const n = @min(composition_len, buf.len);
     @memcpy(buf[0..n], composition_text[0..n]);
@@ -982,7 +982,7 @@ pub fn getCompositionSnapshot(buf: []u8) CompositionSnapshot {
     };
 }
 
-/// native(OS) イベントの取捨。replay 決定性のため quit のみ通し、他の OS 入力は捨てる。
+/// Filtering native (OS) events. For replay determinism only quit passes, and every other OS input is dropped.
 pub fn filterNativeEvent(ev: Event) ?Event {
     return switch (ev) {
         .quit => ev,
@@ -990,14 +990,14 @@ pub fn filterNativeEvent(ev: Event) ?Event {
     };
 }
 
-/// facade `Window.getGamepadState` の5つ目のチョークポイント（TASK-80.1）。index 範囲外は null。
-/// イベント時のみ更新される state を読むだけ（alloc/lock 無し。ホットパスではない。ADR-009 参照）。
+/// The fifth choke point of the facade's `Window.getGamepadState`. An index out of range gives null.
+/// It only reads state that is updated at event time (no allocation, no lock; this is not a hot path. See ADR-009).
 pub fn getGamepadState(index: u8) ?GamepadState {
     if (index >= gamepad_states.len) return null;
     return gamepad_states[index];
 }
 
-/// lockFramebuffer 成功時に現在の pixels/寸法を記録する（present で owned copy するため）。
+/// Records the current pixels and dimensions when lockFramebuffer succeeds (present takes the owned copy).
 pub fn onLock(pixels: []const u32, w: u32, h: u32) void {
     lock_pixels = pixels;
     lock_w = w;
@@ -1005,19 +1005,19 @@ pub fn onLock(pixels: []const u32, w: u32, h: u32) void {
     lock_valid = true;
 }
 
-/// lockFramebuffer が null を返したとき。stale pixel を present で再コピーしないよう無効化する。
+/// Called when lockFramebuffer returns null. It invalidates the view so present does not re-copy stale pixels.
 pub fn onLockMiss() void {
     lock_valid = false;
 }
 
-/// present 直前に呼ぶ。最新の EventStats を `stats` probe 用に保持する。
+/// Called just before present. It keeps the newest EventStats for the `stats` probe.
 pub fn onStats(s: EventStats) void {
     last_stats = s;
 }
 
-/// present 時にフレームを owned copy して確定し、frame_index を進める。
-/// `VP_HARNESS_SKIP_FRAME_COPY=1`（計測専用モード）時は copy をスキップし frame_index のみ進める
-/// （fb/canvas 等の snapshot/digest は無効値になるが、fps 計測に使う `digest stats` の frame は増分する）。
+/// Called at present: takes the owned copy of the frame to settle it, and advances frame_index.
+/// With `VP_HARNESS_SKIP_FRAME_COPY=1` (the measurement-only mode) the copy is skipped and only frame_index advances
+/// (the snapshot and digest of fb, canvas and friends hold meaningless values, but `digest stats`'s frame, used for measuring fps, still increments).
 pub fn onPresent() void {
     if (skip_frame_copy) {
         lock_valid = false;
@@ -1029,7 +1029,7 @@ pub fn onPresent() void {
         if (frame_pixels.len < n) {
             if (frame_pixels.len > 0) gpa.free(frame_pixels);
             frame_pixels = gpa.alloc(u32, n) catch {
-                warnLine("frame buffer alloc 失敗");
+                warnLine("failed to allocate the frame buffer");
                 lock_valid = false;
                 frame_index += 1;
                 return;
@@ -1040,18 +1040,18 @@ pub fn onPresent() void {
         frame_h = lock_h;
         have_frame = true;
     }
-    lock_valid = false; // 次フレームは改めて onLock が必要
+    lock_valid = false; // the next frame needs its own onLock
     frame_index += 1;
 }
 
-/// 仮想クロック（frame 駆動）。getTime を使うアプリの replay を決定論にする。
+/// The virtual clock (driven by frames). It makes the replay of an application that uses getTime deterministic.
 pub fn now() f64 {
     return @as(f64, @floatFromInt(frame_index)) / VIRTUAL_FPS;
 }
 
-/// audio facade(`src/audio.zig`) の render trampoline から **RT スレッドで** 呼ばれる。
-/// **alloc/lock/IO/panic 禁止**。samples は interleaved（frames*channels）。
-/// latest-wins: 満杯でも head を進めて上書きする（取りこぼし可。probe は直近窓を見る）。
+/// Called **on the RT thread** from the render trampoline of the audio facade (`src/audio.zig`).
+/// **No allocation, lock, IO or panic.** samples are interleaved (frames*channels).
+/// latest-wins: even when full it advances head and overwrites (so samples can be dropped; a probe looks at the most recent window).
 pub fn onAudioSamples(samples: []const f32, frames: u32, channels: u32, sample_rate: u32) void {
     if (mode == .disabled) return;
     _ = frames;
@@ -1059,8 +1059,8 @@ pub fn onAudioSamples(samples: []const f32, frames: u32, channels: u32, sample_r
     audio_rate.store(sample_rate, .monotonic);
     var head = audio_head.load(.monotonic);
     for (samples) |s| {
-        // slot は consumer の peek と並行し得る。latest-wins で torn を許容するが、Zig 上の data race UB を
-        // 避けるため `.unordered`（aligned f32 では実質プレーン load/store・no-fence）で読み書きする。
+        // A slot can be peeked at by the consumer concurrently. Torn reads are tolerated under latest-wins, but to
+        // avoid data race UB in Zig terms it is read and written `.unordered` (on an aligned f32 that is effectively a plain load or store, with no fence).
         @atomicStore(f32, &audio_buf[head & AUDIO_MASK], s, .unordered);
         head +%= 1;
     }
@@ -1080,8 +1080,8 @@ fn runNativePump(pump: ?NativePump) bool {
     return p.poll();
 }
 
-/// fd が readable になるまで poll し、timeout ごとに native pump を回す。
-/// `false` = pump が window close を報告、または fd エラー。
+/// Polls until the fd is readable, running the native pump on each timeout.
+/// `false` = the pump reported a window close, or the fd errored.
 fn waitFdReadable(fd: net.Socket.Handle, pump: ?NativePump) bool {
     switch (comptime builtin.os.tag) {
         .windows => unreachable,
@@ -1104,7 +1104,7 @@ fn waitFdReadablePosix(fd: net.Socket.Handle, pump: ?NativePump) bool {
         }
         const revents = pfds[0].revents;
         if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return false;
-        // POLLHUP は half-close 後の残データ読み取りに使う（IN と同時/単独どちらも read 試行）。
+        // POLLHUP is used to read the data left after a half-close (a read is attempted whether it comes with IN or alone).
         if (revents & (posix.POLL.IN | posix.POLL.HUP) != 0) return true;
     }
 }
@@ -1137,8 +1137,8 @@ fn readLiveRequestBody(stream: net.Stream, pump: ?NativePump) ReadLiveRequestErr
     return acc.toOwnedSlice(gpa) catch error.ReadFailed;
 }
 
-/// 1接続を accept し、リクエスト全体（client の half-close まで）を読み込んで cmd_buf に載せる。
-/// 戻り false = accept 不能（server 終了）→ アプリ終了。
+/// Accepts one connection and reads the whole request (up to the client's half-close) into cmd_buf.
+/// A false return = the accept is impossible (the server has finished) → so the application exits.
 fn acceptLiveRequest(pump: ?NativePump) bool {
     const use_poll = pump != null and builtin.os.tag != .windows;
 
@@ -1146,11 +1146,11 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
         const stream = if (use_poll) blk: {
             if (!waitListenerReadable(pump)) return false;
             break :blk server.accept(io_val) catch |err| {
-                std.debug.print("[harness] accept 失敗: {s}\n", .{@errorName(err)});
+                std.debug.print("[harness] accept failed: {s}\n", .{@errorName(err)});
                 return false;
             };
         } else server.accept(io_val) catch |err| {
-            std.debug.print("[harness] accept 失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("[harness] accept failed: {s}\n", .{@errorName(err)});
             return false;
         };
         live_stream = stream;
@@ -1164,7 +1164,7 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
                     ReadLiveRequestError.RequestTooLarge => appendResp("error: request too large\n"),
                     else => appendResp("error: request read failed\n"),
                 }
-                std.debug.print("[harness] request read 失敗: {s}\n", .{@errorName(err)});
+                std.debug.print("[harness] failed to read the request: {s}\n", .{@errorName(err)});
                 finishLiveRequest();
                 continue;
             };
@@ -1172,7 +1172,7 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
             var rbuf: [4096]u8 = undefined;
             var reader = stream.reader(io_val, &rbuf);
             break :blk reader.interface.allocRemaining(gpa, std.Io.Limit.limited(1 << 20)) catch |err| {
-                std.debug.print("[harness] request read 失敗: {s}\n", .{@errorName(err)});
+                std.debug.print("[harness] failed to read the request: {s}\n", .{@errorName(err)});
                 appendResp("error: request read failed\n");
                 finishLiveRequest();
                 continue;
@@ -1187,7 +1187,7 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
     }
 }
 
-/// 現在のリクエストを終了する: response を flush し stream を閉じ、バッファを片付ける。
+/// Finishes the current request: flushes the response, closes the stream and tidies the buffers.
 fn finishLiveRequest() void {
     if (!live_req_open) return;
     pending_wait = .none;
@@ -1212,15 +1212,15 @@ fn appendResp(s: []const u8) void {
     resp_buf.appendSlice(gpa, s) catch {};
 }
 
-/// live で受信した raw リクエストを record file に追記する（コメント境界 + raw + 末尾 newline）。
-/// crash 耐性のため毎回 record_buf 全体を書き直す（debug 用途・コマンド量は小）。
+/// Appends a raw request received live to the record file (a comment boundary, the raw text, then a trailing newline).
+/// The whole of record_buf is rewritten every time, for crash resilience (this is for debugging and the volume of commands is small).
 fn recordRequest(bytes: []const u8) void {
     const path = record_path orelse return;
     record_buf.appendSlice(gpa, "# --- live request ---\n") catch return;
     record_buf.appendSlice(gpa, bytes) catch return;
     if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') record_buf.appendSlice(gpa, "\n") catch return;
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = record_buf.items }) catch |err| {
-        std.debug.print("[harness] record 書き込み失敗 {s}: {s}\n", .{ path, @errorName(err) });
+        std.debug.print("[harness] failed to write the record {s}: {s}\n", .{ path, @errorName(err) });
     };
 }
 
@@ -1229,15 +1229,15 @@ fn writePortFile(port: u16) void {
     var pbuf: [16]u8 = undefined;
     const txt = std.fmt.bufPrint(&pbuf, "{d}\n", .{port}) catch return;
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = txt }) catch |err| {
-        std.debug.print("[harness] port file 書き込み失敗 {s}: {s}\n", .{ path, @errorName(err) });
+        std.debug.print("[harness] failed to write the port file {s}: {s}\n", .{ path, @errorName(err) });
     };
 }
 
 // ============================================================================
-// response sink（framing は mode で分岐）
+// the response sink (the framing branches on the mode)
 // ============================================================================
 
-/// digest 結果を出力する。`<probe> <payload>`（live）/ `[harness] digest <probe> <payload>`（replay）。
+/// Emits a digest result: `<probe> <payload>` (live) or `[harness] digest <probe> <payload>` (replay).
 fn emitDigest(probe: []const u8, payload: []const u8) void {
     if (mode == .live) {
         appendResp(probe);
@@ -1249,7 +1249,7 @@ fn emitDigest(probe: []const u8, payload: []const u8) void {
     }
 }
 
-/// snapshot 結果を出力する。`<path>`（live）/ `[harness] snapshot <probe> -> <path> (<info>)`（replay）。
+/// Emits a snapshot result: `<path>` (live) or `[harness] snapshot <probe> -> <path> (<info>)` (replay).
 fn emitSnapshot(probe: []const u8, path: []const u8, info: []const u8) void {
     if (mode == .live) {
         appendResp(path);
@@ -1260,60 +1260,60 @@ fn emitSnapshot(probe: []const u8, path: []const u8, info: []const u8) void {
 }
 
 // ============================================================================
-// コマンド処理
+// handling a command
 // ============================================================================
 
 fn handleInject(it: *Tok) void {
     const kind = it.next() orelse {
-        warnLine("inject: 種別不足");
+        warnLine("inject: the kind is missing");
         return;
     };
     if (std.mem.eql(u8, kind, "key_down") or std.mem.eql(u8, kind, "key_up")) {
         const name = it.next() orelse {
-            warnLine("inject key: KEY 不足");
+            warnLine("inject key: KEY is missing");
             return;
         };
         const kc = parseKey(name) orelse {
-            warnLine("inject key: 不明なキー");
+            warnLine("inject key: unknown key");
             return;
         };
-        const extras = parseKeyExtras(it) orelse return warnLine("inject: 不明な修飾子または repeat");
+        const extras = parseKeyExtras(it) orelse return warnLine("inject: unknown modifier or repeat");
         const ke = KeyEvent{ .key = kc, .is_repeat = extras.repeat, .modifiers = extras.modifiers };
         queue(if (std.mem.eql(u8, kind, "key_down")) Event{ .key_down = ke } else Event{ .key_up = ke });
     } else if (std.mem.eql(u8, kind, "mouse_move")) {
-        const x = parseI32(it.next()) orelse return warnLine("inject mouse_move: 座標不正");
-        const y = parseI32(it.next()) orelse return warnLine("inject mouse_move: 座標不正");
-        // modifiers を座標 state 更新より前に parse（未知 modifier で fail-fast する際に mouse_x/y を汚さない）
-        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        const x = parseI32(it.next()) orelse return warnLine("inject mouse_move: invalid coordinate");
+        const y = parseI32(it.next()) orelse return warnLine("inject mouse_move: invalid coordinate");
+        // Parse the modifiers before updating the coordinate state (so failing fast on an unknown modifier does not dirty mouse_x or mouse_y)
+        const mods = parseModifiers(it) orelse return warnLine("inject: unknown modifier");
         mouse_x = x;
         mouse_y = y;
         queue(Event{ .mouse_move = .{ .x = x, .y = y, .button = .none, .buttons = mouse_buttons, .modifiers = mods } });
     } else if (std.mem.eql(u8, kind, "mouse_down") or std.mem.eql(u8, kind, "mouse_up")) {
-        const btn = parseButton(it.next()) orelse return warnLine("inject mouse: 不明なボタン");
+        const btn = parseButton(it.next()) orelse return warnLine("inject mouse: unknown button");
         const down = std.mem.eql(u8, kind, "mouse_down");
-        // modifiers を setButton より前に parse（未知 modifier で fail-fast する際に mouse_buttons を汚さない）
-        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        // Parse the modifiers before setButton (so failing fast on an unknown modifier does not dirty mouse_buttons)
+        const mods = parseModifiers(it) orelse return warnLine("inject: unknown modifier");
         setButton(&mouse_buttons, btn, down);
         const ev = MouseEvent{ .x = mouse_x, .y = mouse_y, .button = btn, .buttons = mouse_buttons, .modifiers = mods };
         queue(if (down) Event{ .mouse_down = ev } else Event{ .mouse_up = ev });
     } else if (std.mem.eql(u8, kind, "scroll")) {
-        const dx = parseF32(it.next()) orelse return warnLine("inject scroll: 量不正");
-        const dy = parseF32(it.next()) orelse return warnLine("inject scroll: 量不正");
-        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        const dx = parseF32(it.next()) orelse return warnLine("inject scroll: invalid amount");
+        const dy = parseF32(it.next()) orelse return warnLine("inject scroll: invalid amount");
+        const mods = parseModifiers(it) orelse return warnLine("inject: unknown modifier");
         queue(Event{ .mouse_scroll = .{ .x = mouse_x, .y = mouse_y, .dx = dx, .dy = dy, .is_precise = false, .buttons = mouse_buttons, .modifiers = mods } });
     } else if (std.mem.eql(u8, kind, "char")) {
-        // 確定テキスト文字を注入（TASK-22）。arg は「単一文字リテラル」か「0x/U+ 始まりの16進 codepoint」。
-        // 単一数字（例 5）は文字 '5'(=53) 扱い＝制御文字との曖昧回避（decimal codepoint は非対応）。
-        const arg = it.next() orelse return warnLine("inject char: 引数不足");
-        const cp = parseCodepoint(arg) orelse return warnLine("inject char: codepoint/文字 不正");
-        const mods = parseModifiers(it) orelse return warnLine("inject: 不明な修飾子");
+        // Inject a settled text character. The argument is either a single character literal, or a hex codepoint starting with 0x or U+.
+        // A single digit (5, say) counts as the character '5' (=53), which avoids ambiguity with a control character (a decimal codepoint is unsupported).
+        const arg = it.next() orelse return warnLine("inject char: the argument is missing");
+        const cp = parseCodepoint(arg) orelse return warnLine("inject char: invalid codepoint or character");
+        const mods = parseModifiers(it) orelse return warnLine("inject: unknown modifier");
         queue(Event{ .char_input = .{ .codepoint = cp, .modifiers = mods } });
     } else if (std.mem.eql(u8, kind, "midi")) {
-        const event_kind = it.next() orelse return warnLine("inject midi: event 種別不足");
+        const event_kind = it.next() orelse return warnLine("inject midi: the event kind is missing");
         if (std.mem.eql(u8, event_kind, "note_on") or std.mem.eql(u8, event_kind, "note_off")) {
-            const note = parseMidiValue(it.next()) orelse return warnLine("inject midi note: note は0..127");
-            const velocity = parseMidiValue(it.next()) orelse return warnLine("inject midi note: velocity は0..127");
-            if (it.next() != null) return warnLine("inject midi note: 引数過多");
+            const note = parseMidiValue(it.next()) orelse return warnLine("inject midi note: note must be 0..127");
+            const velocity = parseMidiValue(it.next()) orelse return warnLine("inject midi note: velocity must be 0..127");
+            if (it.next() != null) return warnLine("inject midi note: too many arguments");
             const event: MidiEvent = if (std.mem.eql(u8, event_kind, "note_on") and velocity != 0)
                 .{ .note_on = .{ .device_id = 0, .note = note, .velocity = velocity } }
             else
@@ -1321,56 +1321,56 @@ fn handleInject(it: *Tok) void {
             if (!queueMidi(event)) return;
             applyMidiState(event);
         } else if (std.mem.eql(u8, event_kind, "cc")) {
-            const controller = parseMidiValue(it.next()) orelse return warnLine("inject midi cc: controller は0..127");
-            const value = parseMidiValue(it.next()) orelse return warnLine("inject midi cc: value は0..127");
-            if (it.next() != null) return warnLine("inject midi cc: 引数過多");
+            const controller = parseMidiValue(it.next()) orelse return warnLine("inject midi cc: controller must be 0..127");
+            const value = parseMidiValue(it.next()) orelse return warnLine("inject midi cc: value must be 0..127");
+            if (it.next() != null) return warnLine("inject midi cc: too many arguments");
             const event: MidiEvent = .{ .cc = .{ .device_id = 0, .controller = controller, .value = value } };
             if (!queueMidi(event)) return;
             applyMidiState(event);
         } else {
-            return warnLine("inject midi: 不明な event");
+            return warnLine("inject midi: unknown event");
         }
     } else if (std.mem.eql(u8, kind, "commit")) {
-        // IME 確定テキスト列を注入（TASK-79.6.1）。残りの行を UTF-8 とみなし codepoint 分解して
-        // char_input を連続 queue（実 IME の insertText と同じ消費経路）。modifiers は空。
+        // Inject a sequence of settled IME text. The rest of the line is taken as UTF-8, decomposed into codepoints, and
+        // queued as consecutive char_input events (the same consumption path as a real IME's insertText). The modifiers are empty.
         //
-        // 空白: `it.rest()` は先頭 delimiter を全部飛ばすため、トークン直後の raw を使う。
-        // next() 後の index は "commit" 直後（区切り空白上）。区切りは 1 個だけ落とし、
-        // その後ろは空白込みでそのまま注入（record→replay 対称。codex 修正 D）。
+        // Whitespace: `it.rest()` skips every leading delimiter, so the raw text right after the token is used instead.
+        // The index after next() sits just past "commit" (on the separating space). Exactly one separator is dropped,
+        // and everything after it is injected as it stands, whitespace included (keeping record and replay symmetrical).
         var text = it.buffer[it.index..];
         if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
         if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
         if (text.len == 0) {
-            if (!composition_active) return warnLine("inject commit: update 前は no-op");
+            if (!composition_active) return warnLine("inject commit: a no-op before an update");
             clearComposition(.commit);
             return;
         }
 
         const has_composition = composition_active;
 
-        // Pass 1: 全量検証してから Pass 2 で queue（途中失敗で部分注入しない。codex 修正 C）。
-        if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject commit: 不正 UTF-8");
+        // Pass 1 validates the whole lot, and pass 2 queues it (so a failure part way through injects nothing partially).
+        if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject commit: invalid UTF-8");
         {
             var i: usize = 0;
             while (i < text.len) {
                 const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
-                    return warnLine("inject commit: 不正 UTF-8");
+                    return warnLine("inject commit: invalid UTF-8");
                 };
                 const cp = std.unicode.utf8Decode(text[i..][0..seq_len]) catch {
-                    return warnLine("inject commit: 不正 UTF-8");
+                    return warnLine("inject commit: invalid UTF-8");
                 };
-                // parseCodepoint と同フィルタ（印字可能スカラーのみ。制御/surrogate/範囲外は拒否）。
+                // The same filter as parseCodepoint's (printable scalars only; control characters, surrogates and out-of-range values are rejected).
                 if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) or cp < 0x20 or cp == 0x7f) {
-                    return warnLine("inject commit: 非印字 codepoint");
+                    return warnLine("inject commit: non-printable codepoint");
                 }
                 i += seq_len;
             }
         }
-        // composition 中だけ commit event を出し snapshot を空にする。bare commit は
-        // TASK-79.6.1 の後方互換契約どおり、composition 状態を変更せず char_input のみ積む。
+        // Emit a commit event, and empty the snapshot, only while a composition is in progress. A bare commit
+        // leaves the composition state alone and queues char_input only, per the backwards-compatibility contract.
         if (has_composition) clearComposition(.commit);
 
-        // Pass 2: 検証済みのみ queue
+        // Pass 2 queues only what was validated
         {
             var i: usize = 0;
             while (i < text.len) {
@@ -1381,13 +1381,13 @@ fn handleInject(it: *Tok) void {
             }
         }
     } else if (std.mem.eql(u8, kind, "composition")) {
-        const phase = it.next() orelse return warnLine("inject composition: phase 不足");
+        const phase = it.next() orelse return warnLine("inject composition: the phase is missing");
         if (std.mem.eql(u8, phase, "update")) {
-            const cursor_arg = parseUsize(it.next()) orelse return warnLine("inject composition update: cursor 不正");
+            const cursor_arg = parseUsize(it.next()) orelse return warnLine("inject composition update: invalid cursor");
             var text = it.buffer[it.index..];
             if (text.len > 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
             if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
-            if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject composition update: 不正 UTF-8");
+            if (!std.unicode.utf8ValidateSlice(text)) return warnLine("inject composition update: invalid UTF-8");
             const n = utf8SafePrefixLen(text, COMPOSITION_CAP);
             @memcpy(composition_text[0..n], text[0..n]);
             composition_len = n;
@@ -1396,57 +1396,57 @@ fn handleInject(it: *Tok) void {
             composition_active = true;
             enqueueComposition(phase_value);
         } else if (std.mem.eql(u8, phase, "cancel")) {
-            if (!composition_active) return warnLine("inject composition cancel: update 前は no-op");
+            if (!composition_active) return warnLine("inject composition cancel: a no-op before an update");
             clearComposition(.cancel);
         } else {
-            warnLine("inject composition: phase は update/cancel");
+            warnLine("inject composition: phase must be update or cancel");
         }
     } else if (std.mem.eql(u8, kind, "file_drop")) {
-        // TASK-113.4: `inject file_drop <path>`。file_drop token 直後の区切り空白 1 個だけ落とし、
-        // 残り全体を 1 path として扱う（内部空白・末尾空白は保持。引用符は特別扱いしない）。
-        // `;`/改行は既存コマンド区切りなので path 中では使用不可。
+        // `inject file_drop <path>`. Exactly one separating space after the file_drop token is dropped, and
+        // the whole remainder is taken as one path (whitespace inside it and at the end is kept, and quotes get no special treatment).
+        // `;` and a newline are the existing command separators, so they cannot appear in a path.
         var path = it.buffer[it.index..];
         if (path.len > 0 and (path[0] == ' ' or path[0] == '\t')) path = path[1..];
         if (path.len > 0 and path[path.len - 1] == '\r') path = path[0 .. path.len - 1];
-        it.index = it.buffer.len; // remainder を消費済みにする
+        it.index = it.buffer.len; // mark the remainder as consumed
         const drop = types.makeFileDropEventFromPath(path) orelse {
-            return warnLine("inject file_drop: 不正な path（空/NUL/UTF-8/上限超過）");
+            return warnLine("inject file_drop: invalid path (empty, a NUL, bad UTF-8, or over the limit)");
         };
         queue(Event{ .file_drop = drop });
     } else if (std.mem.eql(u8, kind, "gamepad_connect")) {
-        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_connect: index 不正");
-        const raw_name = std.mem.trim(u8, it.rest(), " \t"); // 残り全体を name として使う（TASK-22 char と同系統）
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_connect: invalid index");
+        const raw_name = std.mem.trim(u8, it.rest(), " \t"); // use the whole remainder as the name (of a kind with char)
         var info = GamepadInfo{ .index = idx };
         const n = @min(raw_name.len, GAMEPAD_NAME_MAX);
         @memcpy(info.name_buf[0..n], raw_name[0..n]);
         info.name_len = @intCast(n);
-        gamepad_states[idx] = .{}; // 既定 state（全ボタン off / stick 0 / trigger 0）
+        gamepad_states[idx] = .{}; // the default state (every button off, sticks at 0, triggers at 0)
         queue(Event{ .gamepad_connected = info });
     } else if (std.mem.eql(u8, kind, "gamepad_disconnect")) {
-        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_disconnect: index 不正");
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_disconnect: invalid index");
         gamepad_states[idx] = null;
         queue(Event{ .gamepad_disconnected = .{ .index = idx } });
     } else if (std.mem.eql(u8, kind, "gamepad_button")) {
-        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_button: index 不正");
-        const btn = parseGamepadButton(it.next()) orelse return warnLine("inject gamepad_button: 不明なボタン");
-        const v = parseUsize(it.next()) orelse return warnLine("inject gamepad_button: 値不正（0|1）");
-        if (v != 0 and v != 1) return warnLine("inject gamepad_button: 値は0か1");
-        if (gamepad_states[idx] == null) return warnLine("inject gamepad_button: pad 未接続");
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_button: invalid index");
+        const btn = parseGamepadButton(it.next()) orelse return warnLine("inject gamepad_button: unknown button");
+        const v = parseUsize(it.next()) orelse return warnLine("inject gamepad_button: invalid value (0|1)");
+        if (v != 0 and v != 1) return warnLine("inject gamepad_button: the value must be 0 or 1");
+        if (gamepad_states[idx] == null) return warnLine("inject gamepad_button: the pad is not connected");
         gamepad_states[idx].?.buttons.set(btn, v == 1);
     } else if (std.mem.eql(u8, kind, "gamepad_axis")) {
-        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_axis: index 不正");
-        const axis = it.next() orelse return warnLine("inject gamepad_axis: axis 不足");
-        const v = parseF32(it.next()) orelse return warnLine("inject gamepad_axis: 値不正");
-        if (gamepad_states[idx] == null) return warnLine("inject gamepad_axis: pad 未接続");
-        if (!setGamepadAxis(&gamepad_states[idx].?, axis, v)) return warnLine("inject gamepad_axis: 不明な axis または値域外");
+        const idx = parseGamepadIndex(it.next()) orelse return warnLine("inject gamepad_axis: invalid index");
+        const axis = it.next() orelse return warnLine("inject gamepad_axis: axis is missing");
+        const v = parseF32(it.next()) orelse return warnLine("inject gamepad_axis: invalid value");
+        if (gamepad_states[idx] == null) return warnLine("inject gamepad_axis: the pad is not connected");
+        if (!setGamepadAxis(&gamepad_states[idx].?, axis, v)) return warnLine("inject gamepad_axis: unknown axis, or out of range");
     } else {
-        warnLine("inject: 不明な種別");
+        warnLine("inject: unknown kind");
     }
 }
 
 const KeyExtras = struct { modifiers: ModifierFlags, repeat: bool };
 
-/// key 注入だけは modifier に加えて `repeat` トークンを受け付ける。
+/// Injecting a key is the one case that accepts a `repeat` token as well as the modifiers.
 fn parseKeyExtras(it: *Tok) ?KeyExtras {
     var result: KeyExtras = .{ .modifiers = .{}, .repeat = false };
     while (it.next()) |tok| {
@@ -1497,21 +1497,21 @@ fn clampUtf8Offset(text: []const u8, offset: usize) usize {
     return n;
 }
 
-/// gamepad index トークンを parse する（0..MAX_GAMEPADS-1 のみ有効）。
+/// Parses a gamepad index token (only 0..MAX_GAMEPADS-1 is valid).
 fn parseGamepadIndex(tok: ?[]const u8) ?u8 {
     const v = parseUsize(tok) orelse return null;
     if (v >= MAX_GAMEPADS) return null;
     return @intCast(v);
 }
 
-/// MIDI の 7-bit 値を parse する。clamp はせず、範囲外を reject する。
+/// Parses a MIDI 7-bit value. It does not clamp, but rejects anything out of range.
 fn parseMidiValue(tok: ?[]const u8) ?u8 {
     const v = parseUsize(tok) orelse return null;
     if (v > 127) return null;
     return @intCast(v);
 }
 
-/// gamepad button 名トークンを parse する（大小無視。GamepadButton の宣言名と一致）。
+/// Parses a gamepad button name token (case-insensitive, matching GamepadButton's declared names).
 fn parseGamepadButton(tok: ?[]const u8) ?GamepadButton {
     const name = tok orelse return null;
     var buf: [24]u8 = undefined;
@@ -1520,11 +1520,11 @@ fn parseGamepadButton(tok: ?[]const u8) ?GamepadButton {
     return std.meta.stringToEnum(GamepadButton, buf[0..name.len]);
 }
 
-/// `inject gamepad_axis` の axis 名 + 値を state へ反映する。
-/// 値域は raw 値契約を守るため reject（clamp しない）: stick(left_x/left_y/right_x/right_y) は
-/// [-1,1]、trigger(left_trigger/right_trigger) は [0,1]。不明 axis 名 or 値域外は false（state 不変）。
-/// NaN/inf は `v < lo or v > hi` の比較が両方 false になり素通りしてしまうため、先頭で明示的に
-/// reject する（codex レビューで発見。fail-fast の抜け穴を塞ぐ）。
+/// Reflects `inject gamepad_axis`'s axis name and value into the state.
+/// The range is rejected rather than clamped, to keep the raw-value contract: a stick (left_x, left_y, right_x, right_y) is
+/// [-1,1], and a trigger (left_trigger, right_trigger) is [0,1]. An unknown axis name, or a value out of range, gives false (leaving the state unchanged).
+/// NaN and inf would pass straight through, both comparisons in `v < lo or v > hi` being false, so they are
+/// rejected explicitly up front (which closes that hole in the fail-fast behaviour).
 fn setGamepadAxis(state: *GamepadState, axis: []const u8, v: f32) bool {
     if (!std.math.isFinite(v)) return false;
     var buf: [16]u8 = undefined;
@@ -1553,8 +1553,8 @@ fn setGamepadAxis(state: *GamepadState, axis: []const u8, v: f32) bool {
     return true;
 }
 
-/// `inject char` の引数を UTF-32 codepoint へ。0x.. / U+.. は16進、それ以外は単一 UTF-8 文字として
-/// その codepoint を返す（2文字以上・不正 UTF-8 は null）。decimal は非対応（単一数字を文字扱いにするため）。
+/// Turns `inject char`'s argument into a UTF-32 codepoint. 0x.. and U+.. are hex, and anything else is taken as a single
+/// UTF-8 character whose codepoint is returned (two or more characters, or invalid UTF-8, gives null). Decimal is unsupported (so a single digit counts as a character).
 fn parseCodepoint(tok: []const u8) ?u32 {
     if (tok.len == 0) return null;
     const hex: ?[]const u8 = if (std.mem.startsWith(u8, tok, "0x") or std.mem.startsWith(u8, tok, "0X"))
@@ -1567,29 +1567,29 @@ fn parseCodepoint(tok: []const u8) ?u32 {
         if (h.len == 0) return null;
         break :blk std.fmt.parseInt(u32, h, 16) catch return null;
     } else blk: {
-        // 単一 UTF-8 文字（token 全体がちょうど1 codepoint のときだけ採用）。
+        // A single UTF-8 character (accepted only when the whole token is exactly one codepoint).
         const seq_len = std.unicode.utf8ByteSequenceLength(tok[0]) catch return null;
         if (seq_len != tok.len) return null;
         break :blk std.unicode.utf8Decode(tok) catch return null;
     };
-    // native backend が実際に出す「印字可能な Unicode スカラー値」に限定する（codex 指摘）:
-    // surrogate(0xD800-0xDFFF)・範囲外(>0x10FFFF)・制御文字(<0x20 / 0x7f) は replay で作れないよう拒否。
+    // Limited to the "printable Unicode scalar values" a native backend actually produces:
+    // a surrogate (0xD800-0xDFFF), out of range (>0x10FFFF), or a control character (<0x20 or 0x7f) is rejected, since a replay cannot produce one.
     if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return null;
     if (cp < 0x20 or cp == 0x7f) return null;
     return cp;
 }
 
 fn handleSnapshot(it: *Tok) void {
-    const probe = it.next() orelse return warnLine("snapshot: probe 名不足");
+    const probe = it.next() orelse return warnLine("snapshot: the probe name is missing");
     const path_arg = it.next();
     var path_buf: [1024]u8 = undefined;
 
     if (std.mem.eql(u8, probe, "fb")) {
-        if (!have_frame) return warnLine("snapshot fb: present 前（フレーム未確定）→ skip");
-        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/frame_{d}.png", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        if (!have_frame) return warnLine("snapshot fb: before a present (the frame is unsettled) -> skip");
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/frame_{d}.png", .{ out_dir, frame_index }) catch return warnLine("snapshot: failed to build the path"));
         const n = @as(usize, frame_w) * @as(usize, frame_h);
         png.savePNG(io_val, path, frame_pixels[0..n], frame_w, frame_h, gpa) catch |err| {
-            std.debug.print("[harness] snapshot fb 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            std.debug.print("[harness] snapshot fb failed {s}: {s}\n", .{ path, @errorName(err) });
             return;
         };
         var info_buf: [32]u8 = undefined;
@@ -1599,73 +1599,73 @@ fn handleSnapshot(it: *Tok) void {
         const channels = audio_channels.load(.monotonic);
         const rate = audio_rate.load(.monotonic);
         const n = peekRecentAudio(&audio_scratch);
-        if (n == 0 or channels == 0) return warnLine("snapshot audio: サンプル無し → skip");
-        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/audio_{d}.wav", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        if (n == 0 or channels == 0) return warnLine("snapshot audio: no samples -> skip");
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/audio_{d}.wav", .{ out_dir, frame_index }) catch return warnLine("snapshot: failed to build the path"));
         writeWav(io_val, path, audio_scratch[0..n], channels, rate, gpa) catch |err| {
-            std.debug.print("[harness] snapshot audio 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            std.debug.print("[harness] snapshot audio failed {s}: {s}\n", .{ path, @errorName(err) });
             return;
         };
         var info_buf: [32]u8 = undefined;
         const info = std.fmt.bufPrint(&info_buf, "{d} samples", .{n}) catch "?";
         emitSnapshot("audio", path, info);
     } else if (std.mem.eql(u8, probe, "stats")) {
-        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/stats_{d}.json", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/stats_{d}.json", .{ out_dir, frame_index }) catch return warnLine("snapshot: failed to build the path"));
         var json_buf: [512]u8 = undefined;
         const json = formatStatsPayload(&json_buf);
         std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = json }) catch |err| {
-            std.debug.print("[harness] snapshot stats 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            std.debug.print("[harness] snapshot stats failed {s}: {s}\n", .{ path, @errorName(err) });
             return;
         };
         emitSnapshot("stats", path, "json");
     } else if (std.mem.eql(u8, probe, "capabilities")) {
-        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/capabilities_{d}.json", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/capabilities_{d}.json", .{ out_dir, frame_index }) catch return warnLine("snapshot: failed to build the path"));
         const json = formatCapabilitiesPayload(&capabilities_buf);
         std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = json }) catch |err| {
-            std.debug.print("[harness] snapshot capabilities 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            std.debug.print("[harness] snapshot capabilities failed {s}: {s}\n", .{ path, @errorName(err) });
             return;
         };
         emitSnapshot("capabilities", path, "json");
     } else if (std.mem.eql(u8, probe, "capture")) {
         if (synth_video) |*dev| {
             const frame = dev.renderFrame(frame_index);
-            const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/capture_{d}.png", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+            const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/capture_{d}.png", .{ out_dir, frame_index }) catch return warnLine("snapshot: failed to build the path"));
             png.savePNG(io_val, path, frame.pixels, frame.width, frame.height, gpa) catch |err| {
-                std.debug.print("[harness] snapshot capture 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+                std.debug.print("[harness] snapshot capture failed {s}: {s}\n", .{ path, @errorName(err) });
                 return;
             };
             var info_buf: [32]u8 = undefined;
             const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ frame.width, frame.height }) catch "?";
             emitSnapshot("capture", path, info);
         } else {
-            warnLine("snapshot capture: video 未 open → skip");
+            warnLine("snapshot capture: video is not open -> skip");
         }
     } else if (std.mem.eql(u8, probe, "gamepad")) {
-        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/gamepad_{d}.txt", .{ out_dir, frame_index }) catch return warnLine("snapshot: path 生成失敗"));
+        const path = path_arg orelse (std.fmt.bufPrint(&path_buf, "{s}/gamepad_{d}.txt", .{ out_dir, frame_index }) catch return warnLine("snapshot: failed to build the path"));
         var buf: [DIGEST_BUF_LEN]u8 = undefined;
         const payload = formatGamepadPayload(&buf);
         std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = payload }) catch |err| {
-            std.debug.print("[harness] snapshot gamepad 失敗 {s}: {s}\n", .{ path, @errorName(err) });
+            std.debug.print("[harness] snapshot gamepad failed {s}: {s}\n", .{ path, @errorName(err) });
             return;
         };
         emitSnapshot("gamepad", path, "txt");
     } else if (findProbe(probe)) |p| {
         snapshotCustom(p, path_arg, &path_buf);
     } else {
-        warnLine("snapshot: 未知の probe");
+        warnLine("snapshot: unknown probe");
     }
 }
 
-/// custom probe の snapshot をルートする（中身非解釈）: callback の raw bytes を file へ書き、同 allocator で free。
+/// Routes a custom probe's snapshot (without interpreting it): writes the callback's raw bytes to a file and frees them with the same allocator.
 fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
-    const snap = p.snapshot orelse return warnLine("snapshot: この probe は snapshot 非対応");
+    const snap = p.snapshot orelse return warnLine("snapshot: this probe does not support snapshot");
     const bytes = snap(p.ctx, gpa) catch |err| {
-        std.debug.print("[harness] snapshot {s} 失敗: {s}\n", .{ p.name, @errorName(err) });
+        std.debug.print("[harness] snapshot {s} failed: {s}\n", .{ p.name, @errorName(err) });
         return;
     };
     defer gpa.free(bytes);
-    const path = path_arg orelse (std.fmt.bufPrint(path_buf, "{s}/{s}_{d}.{s}", .{ out_dir, p.name, frame_index, p.ext }) catch return warnLine("snapshot: path 生成失敗"));
+    const path = path_arg orelse (std.fmt.bufPrint(path_buf, "{s}/{s}_{d}.{s}", .{ out_dir, p.name, frame_index, p.ext }) catch return warnLine("snapshot: failed to build the path"));
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = bytes }) catch |err| {
-        std.debug.print("[harness] snapshot {s} 失敗 {s}: {s}\n", .{ p.name, path, @errorName(err) });
+        std.debug.print("[harness] snapshot {s} failed {s}: {s}\n", .{ p.name, path, @errorName(err) });
         return;
     };
     var info_buf: [32]u8 = undefined;
@@ -1674,26 +1674,26 @@ fn snapshotCustom(p: *const Probe, path_arg: ?[]const u8, path_buf: []u8) void {
 }
 
 // ============================================================================
-// capabilities probe（登録済み probe・action の内省列挙。TASK-62.4）
+// the capabilities probe (introspective listing of the registered probes and actions)
 //
-// ホットパス宣言: イベント/接続時のみ（digest/snapshot コマンド処理時に固定長 registry
-// （最大 probe 16 + action 16 + 組み込み 6 = 38 件）を1回走査するだけ。フレーム毎・毎サンプルでは
-// 走らない）。RT 共有状態には触れない（main スレッドの固定長 registry 読みのみ）。
+// Hot path declaration: at event time or connection time only (handling a digest or snapshot command scans the
+// fixed-length registry once: MAX_PROBES custom probes + MAX_ACTIONS actions + the built-ins below). Never per frame or per sample.
+// It touches no state shared with the RT thread (only a fixed-length registry read on the main thread).
 //
-// 中身非解釈の不変条件: name/ext/desc と snapshot/digest の**有無**（callback が non-null か）を
-// 登録情報からそのまま転記するだけ。callback 自体は絶対に呼ばない。
+// The invariant of not interpreting the contents: it transcribes name, ext and desc, and **whether** snapshot and digest
+// exist (whether the callback is non-null), straight from the registration. It never calls a callback itself.
 // ============================================================================
 
-/// capabilities JSON の組み立て先（単一プロセス debug facility の再利用スクラッチ。
-/// audio_scratch/port_file_buf と同型で単一 main スレッド逐次実行のため競合なし）。
+/// Where the capabilities JSON is assembled (a reusable scratch for a single-process debug facility;
+/// the same shape as audio_scratch and port_file_buf, and free of contention, running sequentially on the one main thread).
 var capabilities_buf: [16 * 1024]u8 = undefined;
 
-/// `formatCapabilitiesPayload` が「常に valid JSON を返す」契約を満たすために要求する最小 buf 長。
-/// これ未満の buf を渡すのは呼び出し側のバグなので assert で落とす（capabilities_buf・テストの
-/// 明示的な buf は常にこれ以上）。
+/// The minimum buf length `formatCapabilitiesPayload` requires in order to meet its "always returns valid JSON" contract.
+/// Passing a buf below this is a caller bug, so an assert brings it down (capabilities_buf, and the explicit
+/// buffers in the tests, are always at least this large).
 const MIN_CAPABILITIES_BUF_LEN = 128;
-/// 末尾のクロージング専用に予約するバイト数。最大想定クロージング文字列
-/// `],"actions":[],"truncated":true}`（34B）に対し余裕を持たせる。
+/// The bytes reserved for the closing sequence alone. It leaves room over the largest closing string
+/// expected, `],"actions":[],"truncated":true}` (34B).
 const CAPABILITIES_RESERVED_TAIL = 64;
 
 const CapabilityBuiltin = struct {
@@ -1705,20 +1705,20 @@ const CapabilityBuiltin = struct {
 };
 const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "fb", .ext = "png", .desc = "framebuffer PNG/digest" },
-    .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms・peak・f0・silent / band・centroid・onsets・lufs" },
-    .{ .name = "stats", .ext = "json", .desc = "EventStats + 仮想fps JSON" },
-    .{ .name = "capabilities", .ext = "json", .desc = "登録済み probe・action の内省列挙" },
+    .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms, peak, f0, silent / band, centroid, onsets, lufs" },
+    .{ .name = "stats", .ext = "json", .desc = "EventStats + virtual fps JSON" },
+    .{ .name = "capabilities", .ext = "json", .desc = "introspective listing of the registered probes and actions" },
     .{ .name = "capture", .ext = "png", .desc = "synthetic mic/camera capture: video PNG snapshot + video/audio state digest" },
     .{ .name = "gamepad", .ext = "txt", .desc = "gamepad state: connected mask + per-pad buttons/sticks/triggers" },
     .{ .name = "midi", .ext = "txt", .snapshot = false, .digest = true, .desc = "MIDI state: device 0 pressed-note bitset + controller values" },
 };
 
-/// `s` を `buf[len.*..limit)` に収まる場合のみ書き込む。収まらなければ何も書かず false を返す
-/// （書きかけの半端なバイト列を残さない）。**`len`/`limit` は常に `buf` 全体を基準にした絶対
-/// オフセット**として扱う（呼び出し元で `buf` 自体をスライスして渡さないこと。`len` がフェーズを
-/// またいで大きい `limit`（tail 領域）まで進むことがあるため、`buf` を切り詰めた別スライスと
-/// 座標系が食い違うと `limit - len` が負に振れて overflow panic する。実装中に実際にこの形の
-/// バグを踏んだので、契約として明記する）。
+/// Writes `s` into `buf[len.*..limit)` only if it fits. If it does not it writes nothing and returns false
+/// (so no half-written byte sequence is left behind). **`len` and `limit` are always absolute
+/// offsets relative to the whole of `buf`** (so do not slice `buf` itself at the call site: `len` can advance across a
+/// phase as far as a larger `limit`, the tail region, and if the coordinate system disagrees with a truncated slice of
+/// `buf` then `limit - len` swings negative and panics on overflow. This shape of bug happened
+/// during implementation, so it is stated here as a contract).
 fn appendRaw(buf: []u8, limit: usize, len: *usize, s: []const u8) bool {
     if (limit < len.* or limit - len.* < s.len) return false;
     @memcpy(buf[len.*..][0..s.len], s);
@@ -1726,8 +1726,8 @@ fn appendRaw(buf: []u8, limit: usize, len: *usize, s: []const u8) bool {
     return true;
 }
 
-/// 1 個の ArgSpec を JSON object として追記する（非デフォルト値のみ emit。TASK-88.1）。
-/// 中身非解釈: 登録済み文字列をそのまま転記するだけ。
+/// Appends one ArgSpec as a JSON object (emitting non-default values only).
+/// Without interpreting the contents: it transcribes the registered strings as they are.
 fn appendArgSpecEntry(buf: []u8, limit: usize, len: *usize, s: ArgSpec) bool {
     if (containsUnsafeJsonChar(s.name) or containsUnsafeJsonChar(s.kind) or
         containsUnsafeJsonChar(s.pattern) or containsUnsafeJsonChar(s.desc)) return false;
@@ -1767,7 +1767,7 @@ fn appendArgSpecEntry(buf: []u8, limit: usize, len: *usize, s: ArgSpec) bool {
     return appendRaw(buf, limit, len, "}");
 }
 
-/// `args != null` のときだけ `,"args":[...]` を追記する（null は呼び出し側でスキップ＝従来 bit 一致）。
+/// Appends `,"args":[...]` only when `args != null` (the caller skips null, keeping it bit-identical to before).
 fn appendArgsField(buf: []u8, limit: usize, len: *usize, args: []const ArgSpec) bool {
     if (!appendRaw(buf, limit, len, ",\"args\":[")) return false;
     for (args, 0..) |s, i| {
@@ -1777,10 +1777,10 @@ fn appendArgsField(buf: []u8, limit: usize, len: *usize, args: []const ArgSpec) 
     return appendRaw(buf, limit, len, "]");
 }
 
-/// 1 probe エントリを `buf[0..limit)`（`len` 経由）へ追記する。name/ext に JSON を破損させる
-/// 文字が含まれる、またはエントリが収まらない場合は何も書かず false を返す（呼び出し元が
-/// truncated フラグを立てる）。中身非解釈: 値をそのまま転記するだけで callback は呼ばない。
-/// `args != null` のときのみ `"args":[...]` を追記（TASK-88.1。フィールド追加のみ）。
+/// Appends one probe entry into `buf[0..limit)` (through `len`). When name or ext holds a character that would
+/// corrupt the JSON, or the entry does not fit, it writes nothing and returns false (and the caller raises the
+/// truncated flag). Without interpreting the contents: it transcribes the values and never calls a callback.
+/// Appends `"args":[...]` only when `args != null` (a field addition only).
 fn appendProbeEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, ext: []const u8, has_snapshot: bool, has_digest: bool, desc: []const u8, args: ?[]const ArgSpec) bool {
     if (containsUnsafeJsonChar(name) or containsUnsafeJsonChar(ext) or containsUnsafeJsonChar(desc)) return false;
     var scratch: [768]u8 = undefined;
@@ -1792,8 +1792,8 @@ fn appendProbeEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, ext:
     return appendRaw(buf, limit, len, "}");
 }
 
-/// `appendProbeEntry` の action 版（`ext`/`snapshot`/`digest` フィールドが無い）。
-/// `args != null` のときのみ `"args":[...]` を追記（TASK-88.1。null は従来と bit 一致）。
+/// The action version of `appendProbeEntry` (with no `ext`, `snapshot` or `digest` field).
+/// Appends `"args":[...]` only when `args != null` (null stays bit-identical to before).
 fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, desc: []const u8, args: ?[]const ArgSpec) bool {
     if (containsUnsafeJsonChar(name) or containsUnsafeJsonChar(desc)) return false;
     var scratch: [768]u8 = undefined;
@@ -1805,14 +1805,14 @@ fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, des
     return appendRaw(buf, limit, len, "}");
 }
 
-/// 登録済み probe（組み込み7件 + custom 登録順）・action（登録順）を JSON 1行で列挙する。
-/// **常に valid JSON を返す**契約（`buf.len >= MIN_CAPABILITIES_BUF_LEN` が前提）。容量超過や
-/// name/ext の不正文字でエントリを省略した場合は末尾に `"truncated":true` を付与する。
+/// Lists the registered probes (the seven built in, then the custom ones in registration order) and actions (in registration order) as one line of JSON.
+/// The contract is that it **always returns valid JSON** (assuming `buf.len >= MIN_CAPABILITIES_BUF_LEN`). When an entry is
+/// left out because of the capacity, or because of an invalid character in name or ext, `"truncated":true` is appended at the end.
 fn formatCapabilitiesPayload(buf: []u8) []const u8 {
     std.debug.assert(buf.len >= MIN_CAPABILITIES_BUF_LEN);
-    // content_limit: エントリ/区切りを書いてよい範囲。buf.len: クロージング（"]" 等）を書いてよい範囲
-    // （末尾 CAPABILITIES_RESERVED_TAIL 分の余裕）。`len` は常に buf 全体基準の絶対オフセットなので、
-    // フェーズによって limit を使い分けても座標系は矛盾しない（appendRaw 参照）。
+    // content_limit: the range entries and separators may be written in. buf.len: the range the closing ("]" and so on) may be written in
+    // (with the trailing CAPABILITIES_RESERVED_TAIL as the margin). `len` is always an absolute offset relative to the whole
+    // of buf, so using a different limit per phase does not make the coordinate system inconsistent (see appendRaw).
     const content_limit = buf.len - CAPABILITIES_RESERVED_TAIL;
     var len: usize = 0;
     var truncated = false;
@@ -1821,7 +1821,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
     var first = true;
     probes_blk: {
         for (CAPABILITY_BUILTINS) |b| {
-            const saved_len = len; // entry 追記が失敗したら区切り "," ごとロールバックする（trailing comma 防止）
+            const saved_len = len; // If appending an entry fails, roll back the separator "," along with it (which prevents a trailing comma)
             if (!first and !appendRaw(buf, content_limit, &len, ",")) {
                 len = saved_len;
                 truncated = true;
@@ -1849,11 +1849,11 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
             first = false;
         }
     }
-    _ = appendRaw(buf, buf.len, &len, "]"); // RESERVED_TAIL 予約分があるので必ず入る
+    _ = appendRaw(buf, buf.len, &len, "]"); // it always fits, thanks to the RESERVED_TAIL reservation
 
-    // "actions" セクションの開始自体が content_limit に収まらない可能性があるため戻り値を確認する
-    // （収まらなければ probes 側で打ち切った場合と同じ扱いに倒す。codex レビューで発見。
-    // これを確認せず進めると `,"actions":[` を書けないまま後段の `]` だけ追記して invalid JSON になる）。
+    // The start of the "actions" section may itself not fit within content_limit, so the return value is checked
+    // (and if it does not fit, this falls to the same treatment as having truncated on the probes side. Carrying on
+    // without checking would append only the later `]` while never writing `,"actions":[`, giving invalid JSON).
     if (!truncated and appendRaw(buf, content_limit, &len, ",\"actions\":[")) {
         first = true;
         actions_blk: {
@@ -1874,10 +1874,10 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 first = false;
             }
         }
-        _ = appendRaw(buf, buf.len, &len, "]"); // RESERVED_TAIL 予約分があるので必ず入る
+        _ = appendRaw(buf, buf.len, &len, "]"); // it always fits, thanks to the RESERVED_TAIL reservation
     } else {
         truncated = true;
-        _ = appendRaw(buf, buf.len, &len, ",\"actions\":[]"); // probes 側で打ち切った、または "actions":[ 自体が収まらない
+        _ = appendRaw(buf, buf.len, &len, ",\"actions\":[]"); // either it truncated on the probes side, or "actions":[ itself did not fit
     }
 
     if (truncated) _ = appendRaw(buf, buf.len, &len, ",\"truncated\":true");
@@ -1885,23 +1885,23 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-/// `formatCapabilitiesPayload` の pub wrapper（copilot の `digest capabilities` が使う。TASK-62.5.2）。
+/// The pub wrapper around `formatCapabilitiesPayload` (used by copilot's `digest capabilities`).
 pub fn capabilitiesPayload(buf: []u8) []const u8 {
     return formatCapabilitiesPayload(buf);
 }
 
-/// digest 1行 payload の取得結果。`unavailable` は取得できない理由（静的文字列）を保持し、
-/// digest コマンドの warn と expect/assert の `actual=` 表示の両方で診断性を保つ（TASK-78）。
+/// The result of fetching a one-line digest payload. `unavailable` holds the reason it could not be fetched (a static string),
+/// which keeps it diagnosable both in the digest command's warning and in expect's and assert's `actual=` display.
 const DigestResult = union(enum) {
     ok: []const u8,
     unavailable: []const u8,
 };
 
-/// probe 名から digest の1行 payload を返す（`digest` コマンドと `expect`/`assert` が共有）。
-/// buf は payload の書き込み先。fb/stats/audio/custom いずれも収まるよう caller は `DIGEST_BUF_LEN` を渡す
-/// （`capabilities` は渡された `buf` を使わず専用の `capabilities_buf`(16KB) を使う。custom probe/action
-/// callback 向けの `DIGEST_BUF_LEN=1024` 契約とは別枠のため）。
-/// 中身非解釈の不変条件は維持（framework は payload の意味を解釈しない）。
+/// Returns the one-line digest payload for a probe name (shared by the `digest` command and by `expect` and `assert`).
+/// buf is where the payload is written. The caller passes `DIGEST_BUF_LEN` so that fb, stats, audio and a custom probe all fit
+/// (`capabilities` does not use the `buf` it is given and uses its own `capabilities_buf` (16KB) instead, being separate from
+/// the `DIGEST_BUF_LEN=1024` contract meant for custom probe and action callbacks).
+/// The invariant of not interpreting the contents holds (the framework does not interpret the payload's meaning).
 fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
     if (std.mem.eql(u8, probe, "fb")) {
         if (!have_frame) return .{ .unavailable = "fb not presented" };
@@ -1927,7 +1927,7 @@ fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
 }
 
 fn handleDigest(it: *Tok) void {
-    const probe = it.next() orelse return warnLine("digest: probe 名不足");
+    const probe = it.next() orelse return warnLine("digest: the probe name is missing");
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     switch (digestPayload(probe, &buf)) {
         .ok => |payload| emitDigest(probe, payload),
@@ -1936,19 +1936,19 @@ fn handleDigest(it: *Tok) void {
 }
 
 // ============================================================================
-// action（probe 対称の高レベル操作。TASK-62.1）
+// action (the high-level operation symmetrical with a probe)
 //
-// 文法（replay/live 共通）: action <name> [args...]
-//   args は <name> の後の残り行 raw テキスト（trim 済み・再トークン化しない = 中身非解釈）。
-//   framework は name lookup と run() 呼び出しのみ行う（probe と同じ不変条件）。
+// The grammar (shared by replay and live): action <name> [args...]
+//   args is the raw remainder of the line after <name> (already trimmed, never re-tokenised = the contents are not interpreted).
+//   The framework only looks the name up and calls run() (the same invariant as a probe).
 //
-// 失敗（名前欠落・未知 action・run() エラー）は expect/assert（TASK-78）と同じ `expect_failures`
-// カウンタに相乗りする（記帳して続行。assert 相当の即時 abort は無い）。EOF/quit/早期 return の
-// 既存3経路（replayExitIfFailed）にタダ乗りするため、新規 exit 経路は追加しない。
+// A failure (a missing name, an unknown action, an error from run()) rides on the same `expect_failures`
+// counter as expect and assert (recorded, then carrying on; there is no immediate abort as with assert). It rides for free on the
+// three existing exit paths (EOF, quit, an early return — see replayExitIfFailed), so no new exit path is added.
 // ============================================================================
 
-/// `action` コマンド本体。`routeLocalAction` → 結果 emit のみ（args の解釈・再トークン化はしない）。
-/// reportAction の wire 整形・expect_failures 記帳は不変（TASK-62.3.1）。
+/// The body of the `action` command. `routeLocalAction`, then emitting the result, and nothing else (it neither interprets nor re-tokenises args).
+/// reportAction's wire formatting and its recording into expect_failures are unchanged.
 fn handleAction(it: *Tok) void {
     const name = it.next() orelse "";
     if (name.len == 0) return reportAction(false, "?", "missing action name");
@@ -1961,8 +1961,8 @@ fn handleAction(it: *Tok) void {
     reportAction(true, name, result);
 }
 
-/// `msg` を最初の `\r`/`\n` の手前で切る（callback が誤って複数行を返しても wire framing を守る。
-/// 特に live の `fail ` 行頭スキャンを次行に誤爆させないための防御実装。中身の解釈ではない）。
+/// Cuts `msg` at the first CR or LF (which keeps the wire framing even if a callback wrongly returns several lines.
+/// It is above all the defence that stops live's leading-`fail ` scan from misfiring on the following line. It is not an interpretation of the contents).
 fn firstLine(msg: []const u8) []const u8 {
     const nl = std.mem.indexOfScalar(u8, msg, '\n');
     const cr = std.mem.indexOfScalar(u8, msg, '\r');
@@ -1970,20 +1970,20 @@ fn firstLine(msg: []const u8) []const u8 {
     return msg[0..cut];
 }
 
-/// structured error の末尾サフィックス（未セット時は空 = 従来 bit 一致。TASK-62.5.9）。
-/// ` code=<c> next=<n>`（先頭 space 付き）。next は空白可の残り全体。
+/// The trailing suffix of a structured error (empty when none is set, keeping it bit-identical to before).
+/// ` code=<c> next=<n>` (with a leading space). next is the whole remainder and may contain whitespace.
 fn actionErrorDetailSuffix(buf: []u8) []const u8 {
     const d = action_registry.actionErrorDetail() orelse return "";
     return std.fmt.bufPrint(buf, " code={s} next={s}", .{ d.code, d.next }) catch "";
 }
 
-/// action の合否を emit し、失敗を記帳する（replay=stderr / live=resp_buf）。
-/// - replay 成功: `[harness] action <name> ok <msg>` / 失敗: `[harness] action <name> FAILED <msg>`
-/// - live 成功  : `<name> <msg>`（bare。digest と同じ流儀） / 失敗: `fail <name> <msg>`（drive の
-///   行頭スキャンに乗せるための接頭辞）
-/// - 失敗時、app が `setActionErrorDetail` 済みなら末尾に ` code=<c> next=<n>` を追記（TASK-62.5.9。
-///   未セット時は従来形式と bit 一致。行頭 `fail ` 不変 → scripts/drive の行頭スキャン無改修）
-/// - 失敗時のみ `mode == .replay` なら `expect_failures` を加算する（assert 相当の即時 abort は無い）。
+/// Emits an action's outcome and records a failure (replay=stderr / live=resp_buf).
+/// - replay success: `[harness] action <name> ok <msg>` / failure: `[harness] action <name> FAILED <msg>`
+/// - live success  : `<name> <msg>` (bare, in the same style as a digest) / failure: `fail <name> <msg>` (the prefix
+///   that puts it on drive's leading-token scan)
+/// - On a failure, when the application has called `setActionErrorDetail`, ` code=<c> next=<n>` is appended
+///   (with none set it is bit-identical to the old format. The leading `fail ` never changes, so scripts/drive's leading-token scan needs no change)
+/// - Only on a failure, and only when `mode == .replay`, `expect_failures` is incremented (there is no immediate abort as with assert).
 fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
     const line = firstLine(msg);
     var detail_buf: [action_registry.MAX_ERROR_CODE_LEN + action_registry.MAX_ERROR_NEXT_LEN + 16]u8 = undefined;
@@ -2013,49 +2013,49 @@ fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
 }
 
 // ============================================================================
-// synthetic capture source（偽 mic/camera。TASK-49.5）
+// the synthetic capture source (a fake mic and camera)
 //
-// 文法（replay/live 共通）:
-//   capture video open <w> <h> [fps]   # synthetic カメラを開く（既 open 済みなら閉じてから開き直す）
-//   capture video close                # synthetic カメラを閉じる
-//   capture audio open [sr] [ch] [hz]  # synthetic マイクを開いて即 start（既 open 済みなら開き直す）
-//   capture audio close                # synthetic マイクを閉じる（stop+join+close）
+// The grammar (shared by replay and live):
+//   capture video open <w> <h> [fps]   # open the synthetic camera (closing and reopening it if it is already open)
+//   capture video close                # close the synthetic camera
+//   capture audio open [sr] [ch] [hz]  # open the synthetic mic and start it at once (reopening it if it is already open)
+//   capture audio close                # close the synthetic mic (stop, join, close)
 //
-// `isCaptureSyntheticActive()`（`VP_HARNESS_CAPTURE_SYNTHETIC` env + harness 有効時のみ true）が
-// false の間はすべて fail-fast（warnLine のみ・状態変化なし。既存 `inject` の未知トークン処理と同じ
-// 思想）。camera.zig/audio.zig への facade 配線は無い（`isCaptureSyntheticActive()` の doc comment
-// 参照）。実装は `core/capture_synthetic.zig` に委譲し、ここでは harness state（`synth_video`/
-// `synth_audio`）の所有・コマンドパース・probe payload 組み立てのみを行う。
+// While `isCaptureSyntheticActive()` (true only with the `VP_HARNESS_CAPTURE_SYNTHETIC` variable set and harness enabled) is
+// false, everything fails fast (a warnLine only, with no state change; the same thinking as the existing handling of an
+// unknown `inject` token). There is no facade wiring into camera.zig or audio.zig (see `isCaptureSyntheticActive()`'s doc
+// comment). The implementation is delegated to `core/capture_synthetic.zig`, and what happens here is only owning the
+// harness state (`synth_video`, `synth_audio`), parsing the commands, and assembling the probe payload.
 //
-// ホットパス宣言: イベント時のみ（コマンド処理時に1回。フレーム毎・毎サンプルではない）。
+// Hot path declaration: at event time only (once per command handled; neither per frame nor per sample).
 // ============================================================================
 
 fn handleCapture(it: *Tok) void {
-    if (!isCaptureSyntheticActive()) return warnLine("capture: VP_HARNESS_CAPTURE_SYNTHETIC 未設定または harness 無効のため使用不可");
-    const domain = it.next() orelse return warnLine("capture: video|audio 不足");
+    if (!isCaptureSyntheticActive()) return warnLine("capture: unavailable, VP_HARNESS_CAPTURE_SYNTHETIC being unset or harness disabled");
+    const domain = it.next() orelse return warnLine("capture: video|audio is missing");
     if (std.mem.eql(u8, domain, "video")) {
         handleCaptureVideo(it);
     } else if (std.mem.eql(u8, domain, "audio")) {
         handleCaptureAudio(it);
     } else {
-        warnLine("capture: 不明な種別（video|audio）");
+        warnLine("capture: unknown kind (video|audio)");
     }
 }
 
 fn handleCaptureVideo(it: *Tok) void {
-    const verb = it.next() orelse return warnLine("capture video: open|close 不足");
+    const verb = it.next() orelse return warnLine("capture video: open|close is missing");
     if (std.mem.eql(u8, verb, "open")) {
-        const w = parseUsize(it.next()) orelse return warnLine("capture video open: width 不正");
-        const h = parseUsize(it.next()) orelse return warnLine("capture video open: height 不正");
+        const w = parseUsize(it.next()) orelse return warnLine("capture video open: invalid width");
+        const h = parseUsize(it.next()) orelse return warnLine("capture video open: invalid height");
         const fps = parseUsize(it.next()) orelse 30;
         if (synth_video) |*dev| dev.close();
         synth_video = capture_synthetic.openVideo(gpa, .{
-            .width = std.math.cast(u32, w) orelse return warnLine("capture video open: width 過大"),
-            .height = std.math.cast(u32, h) orelse return warnLine("capture video open: height 過大"),
-            .frame_rate = std.math.cast(u32, fps) orelse return warnLine("capture video open: fps 過大"),
+            .width = std.math.cast(u32, w) orelse return warnLine("capture video open: width is too large"),
+            .height = std.math.cast(u32, h) orelse return warnLine("capture video open: height is too large"),
+            .frame_rate = std.math.cast(u32, fps) orelse return warnLine("capture video open: fps is too large"),
         }) catch |err| {
             synth_video = null;
-            std.debug.print("[harness] capture video open 失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("[harness] capture video open failed: {s}\n", .{@errorName(err)});
             return;
         };
     } else if (std.mem.eql(u8, verb, "close")) {
@@ -2063,10 +2063,10 @@ fn handleCaptureVideo(it: *Tok) void {
             dev.close();
             synth_video = null;
         } else {
-            warnLine("capture video close: 未 open");
+            warnLine("capture video close: not open");
         }
     } else {
-        warnLine("capture video: 不明な操作（open|close）");
+        warnLine("capture video: unknown operation (open|close)");
     }
 }
 
@@ -2076,7 +2076,7 @@ fn noopCaptureAudioCallback(frame: capture_synthetic.AudioInFrame, userdata: ?*a
 }
 
 fn handleCaptureAudio(it: *Tok) void {
-    const verb = it.next() orelse return warnLine("capture audio: open|close 不足");
+    const verb = it.next() orelse return warnLine("capture audio: open|close is missing");
     if (std.mem.eql(u8, verb, "open")) {
         const sr = parseUsize(it.next()) orelse 48000;
         const ch = parseUsize(it.next()) orelse 1;
@@ -2086,16 +2086,16 @@ fn handleCaptureAudio(it: *Tok) void {
             synth_audio = null;
         }
         var dev = capture_synthetic.openAudio(gpa, .{
-            .sample_rate = std.math.cast(u32, sr) orelse return warnLine("capture audio open: sample_rate 過大"),
-            .channels = std.math.cast(u32, ch) orelse return warnLine("capture audio open: channels 過大"),
+            .sample_rate = std.math.cast(u32, sr) orelse return warnLine("capture audio open: sample_rate is too large"),
+            .channels = std.math.cast(u32, ch) orelse return warnLine("capture audio open: channels is too large"),
             .frequency_hz = hz,
             .capture_callback = noopCaptureAudioCallback,
         }) catch |err| {
-            std.debug.print("[harness] capture audio open 失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("[harness] capture audio open failed: {s}\n", .{@errorName(err)});
             return;
         };
         dev.start() catch |err| {
-            std.debug.print("[harness] capture audio start 失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("[harness] capture audio start failed: {s}\n", .{@errorName(err)});
             dev.close();
             return;
         };
@@ -2105,15 +2105,15 @@ fn handleCaptureAudio(it: *Tok) void {
             dev.close();
             synth_audio = null;
         } else {
-            warnLine("capture audio close: 未 open");
+            warnLine("capture audio close: not open");
         }
     } else {
-        warnLine("capture audio: 不明な操作（open|close）");
+        warnLine("capture audio: unknown operation (open|close)");
     }
 }
 
-/// `capture` probe の digest payload（top-level key=value。expect/assert で照合可能）。
-/// video/audio いずれも未 open なら該当フィールドは 0 を返す（key は常に存在させる）。
+/// The `capture` probe's digest payload (top-level key=value, so expect and assert can match on it).
+/// When either video or audio is not open, the fields concerned return 0 (the keys always exist).
 fn formatCapturePayload(buf: []u8) []u8 {
     const v_open: u8 = @intFromBool(synth_video != null);
     const v_w: u32 = if (synth_video) |d| d.width else 0;
@@ -2127,20 +2127,20 @@ fn formatCapturePayload(buf: []u8) []u8 {
 }
 
 // ============================================================================
-// gamepad probe（組み込み。TASK-80.1。ADR-009）
+// the gamepad probe (built in)
 //
-// ホットパス宣言: digest/snapshot コマンド処理時のみ（イベント時のみ。フレーム毎ではない）。
+// Hot path declaration: only while handling a digest or snapshot command (at event time only, not per frame).
 // ============================================================================
 
-/// `v` が数値上 0（`-0.0` 含む）なら正の `0.0` に正規化する。float format の `-0.0000` 表記ゆれを防ぎ
-/// `expect`/`digest` を安定させる（ADR-009「harness state モデル」節）。
+/// Normalises `v` to a positive `0.0` when it is numerically 0 (`-0.0` included). This prevents the `-0.0000` variation in
+/// the float formatting and keeps `expect` and `digest` stable (see the "harness state model" section of ADR-009).
 fn normalizeZero(v: f32) f32 {
     return if (v == 0) 0 else v;
 }
 
 /// `connected=<bitmask> p<idx>_buttons=<hex8> p<idx>_lx=.. p<idx>_ly=.. p<idx>_rx=.. p<idx>_ry=.. p<idx>_lt=.. p<idx>_rt=..`
-/// （接続中の pad のみ列挙。top-level key=value を保つため pad ごとに `p<idx>_` prefix。float は固定4桁+
-/// 負ゼロ正規化）。
+/// (Only the connected pads are listed. To keep it top-level key=value, each pad gets a `p<idx>_` prefix. Floats are a fixed 4 digits with
+/// negative zero normalised.)
 fn formatGamepadPayload(buf: []u8) []u8 {
     var len: usize = 0;
     var mask: u32 = 0;
@@ -2164,10 +2164,10 @@ fn formatGamepadPayload(buf: []u8) []u8 {
 }
 
 // ============================================================================
-// MIDI probe（組み込み。TASK-115.1・ADR-010）
+// the MIDI probe (built in)
 //
-// ホットパス宣言: digest コマンド処理時のみ（イベント時のみ）。固定長 state を走査するだけで、
-// フレーム毎・RT 経路ではない。
+// Hot path declaration: only while handling a digest command (at event time only). It merely scans fixed-length state,
+// and is on neither a per-frame nor a real-time path.
 // ============================================================================
 
 fn appendMidiHexByte(buf: []u8, len: *usize, value: u8) bool {
@@ -2206,45 +2206,45 @@ fn formatMidiPayload(buf: []u8) []u8 {
 }
 
 // ============================================================================
-// expect / assert（アサーション層。TASK-78）
+// expect and assert (the assertion layer)
 //
-// 文法（replay/live 共通）:
+// The grammar (shared by replay and live):
 //   expect <probe> <key><op><value>     op ∈ {= != > <}
 //   expect <probe> contains <substr>
-//   assert ...（expect と同評価。replay では失敗で即 exit 1）
-//   先頭の `digest` トークン（`expect digest fb ...`）はエイリアスで読み飛ばす。
+//   assert ... (evaluated as expect is; under replay a failure exits 1 at once)
+//   A leading `digest` token (`expect digest fb ...`) is an alias and is skipped.
 //
-// 評価対象は digest 1行 payload の **top-level `key=value`**（空白区切り）。ネスト（`l0{..}`）や
-// JSON（stats）は 1 トークンに glue され漏れないので `contains` を使う。中身非解釈の不変条件は維持。
+// What is evaluated is the **top-level `key=value`** of the one-line digest payload (separated by whitespace). Nesting (`l0{..}`) and
+// JSON (stats) are glued into one token and never leak out, so use `contains` for those. The invariant of not interpreting the contents holds.
 // ============================================================================
 
-/// `expect`/`assert` の引数トークン列を式へ parse する純関数（module-level 状態に触らない=単体テスト可能）。
-/// 余剰トークン・op 欠落・key/value 空・contains の substr 欠落・substr 余剰は null（= fail-fast, AC#3）。
+/// The pure function parsing `expect`'s and `assert`'s argument tokens into an expression (it touches no module-level state, so it is unit testable).
+/// A surplus token, a missing op, an empty key or value, a missing substr for contains, or a surplus substr, all give null (failing fast).
 fn parseExpectExpr(it: *Tok) ?ExpectExpr {
     var probe = it.next() orelse return null;
     if (std.mem.eql(u8, probe, "digest")) {
-        probe = it.next() orelse return null; // `expect digest fb ...` エイリアス
+        probe = it.next() orelse return null; // the `expect digest fb ...` alias
     }
     const t2 = it.next() orelse return null;
     if (std.mem.eql(u8, t2, "contains")) {
-        const sub = it.next() orelse return null; // substr 必須
-        if (it.next() != null) return null; // 余剰トークン
+        const sub = it.next() orelse return null; // substr is required
+        if (it.next() != null) return null; // a surplus token
         return .{ .probe = probe, .form = .{ .contains = sub } };
     }
     const cmp = parseCmpToken(t2) orelse return null;
-    if (it.next() != null) return null; // 余剰トークン
+    if (it.next() != null) return null; // a surplus token
     return .{ .probe = probe, .form = .{ .cmp = cmp } };
 }
 
-/// `key<op>value` 単一トークンを分割する。op ∈ {= != > <}。先頭から最初の `!`/`=`/`<`/`>` を op 開始とする。
-/// key/value いずれか空・op 記号無し・`!` の直後が `=` でない場合は null（不正構文）。
+/// Splits the single token `key<op>value`. op is one of {= != > <}. The op starts at the first `!`, `=`, `<` or `>` from the front.
+/// An empty key or value, no op symbol, or a `!` not followed by `=`, gives null (invalid syntax).
 fn parseCmpToken(tok: []const u8) ?Cmp {
     var i: usize = 0;
     while (i < tok.len) : (i += 1) {
         const c = tok[i];
         if (c == '=' or c == '<' or c == '>' or c == '!') break;
     }
-    if (i == 0 or i >= tok.len) return null; // key 空 or op 記号無し
+    if (i == 0 or i >= tok.len) return null; // an empty key, or no op symbol
     var op: CmpOp = undefined;
     var vstart: usize = undefined;
     switch (tok[i]) {
@@ -2261,21 +2261,21 @@ fn parseCmpToken(tok: []const u8) ?Cmp {
             vstart = i + 1;
         },
         '!' => {
-            if (i + 1 >= tok.len or tok[i + 1] != '=') return null; // `!` 単独は不正
+            if (i + 1 >= tok.len or tok[i + 1] != '=') return null; // a bare `!` is invalid
             op = .ne;
             vstart = i + 2;
         },
         else => unreachable,
     }
     const value = tok[vstart..];
-    if (value.len == 0) return null; // value 空
+    if (value.len == 0) return null; // an empty value
     return .{ .op = op, .key = tok[0..i], .value = value };
 }
 
-/// digest payload（1行）から top-level `key=value` の value を抽出する純関数。
-/// 空白（` \t`）のみで token 化し `key ++ "="` で始まる最初のトークンの `=` 以降を返す。
-/// `tok[key.len]=='='` を要求することで prefix 衝突（`f` が `frames=`/`f0=` を誤マッチ）を防ぐ。
-/// ネスト（`l0{..}`）や JSON は空白を含まず 1 トークンに glue されるので拾われない。
+/// The pure function extracting a top-level `key=value`'s value from a digest payload (one line).
+/// It tokenises on whitespace (` \t`) alone and returns everything after the `=` of the first token starting with `key ++ "="`.
+/// Requiring `tok[key.len]=='='` prevents a prefix collision (`f` wrongly matching `frames=` or `f0=`).
+/// Nesting (`l0{..}`) and JSON hold no whitespace and are glued into one token, so they are never picked up.
 fn findKeyValue(payload: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeAny(u8, payload, " \t");
     while (it.next()) |tok| {
@@ -2286,8 +2286,8 @@ fn findKeyValue(payload: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// actual を op で expected と比較する純関数。
-/// `>`/`<` は両辺 f64 parse 必須（不能は fail）。`=`/`!=` は両辺 f64 parse 可能なら数値、それ以外は文字列一致。
+/// The pure function comparing actual with expected under an op.
+/// `>` and `<` require both sides to parse as f64 (failing if they cannot). `=` and `!=` compare numerically when both sides parse as f64, and as strings otherwise.
 fn compareValues(actual: []const u8, op: CmpOp, expected: []const u8) bool {
     const af: ?f64 = std.fmt.parseFloat(f64, actual) catch null;
     const ef: ?f64 = std.fmt.parseFloat(f64, expected) catch null;
@@ -2299,23 +2299,23 @@ fn compareValues(actual: []const u8, op: CmpOp, expected: []const u8) bool {
     };
 }
 
-/// payload（digest 1行）に対し式を評価する純関数。true=pass。key 不在は fail。
+/// The pure function evaluating an expression against a payload (one digest line). true=pass. A missing key is a fail.
 fn evalExpect(payload: []const u8, expr: ExpectExpr) bool {
     switch (expr.form) {
         .contains => |sub| return std.mem.indexOf(u8, payload, sub) != null,
         .cmp => |c| {
-            const actual = findKeyValue(payload, c.key) orelse return false; // key 不在 = fail
+            const actual = findKeyValue(payload, c.key) orelse return false; // a missing key = a fail
             return compareValues(actual, c.op, c.value);
         },
     }
 }
 
-/// `expect`/`assert` コマンド本体。probe の digest payload を取り式を評価し、合否を emit + 記帳する。
-/// - replay: 失敗は `expect_failures` に記帳。assert は即 `replayExitIfFailed()`（fail-fast abort）。
-/// - live  : プロセスを終了せず `ok`/`fail` 行を返すだけ（記帳しない）。∴ live では expect と assert は同挙動。
+/// The body of the `expect` and `assert` commands. It takes the probe's digest payload, evaluates the expression, and emits and records the outcome.
+/// - replay: a failure is recorded into `expect_failures`. assert calls `replayExitIfFailed()` at once (a fail-fast abort).
+/// - live  : it does not end the process and merely returns an `ok` or `fail` line (recording nothing). Hence under live, expect and assert behave the same.
 fn handleExpect(it: *Tok, is_assert: bool) void {
     const kind: []const u8 = if (is_assert) "assert" else "expect";
-    const expr_text = std.mem.trim(u8, it.rest(), " \t"); // 診断表示用（parse 前に確保。cmd_buf への slice）
+    const expr_text = std.mem.trim(u8, it.rest(), " \t"); // For the diagnostic display (captured before the parse; a slice into cmd_buf)
     const expr = parseExpectExpr(it) orelse return reportExpect(kind, false, expr_text, "invalid syntax", is_assert);
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     switch (digestPayload(expr.probe, &buf)) {
@@ -2327,15 +2327,15 @@ fn handleExpect(it: *Tok, is_assert: bool) void {
     }
 }
 
-/// `await <probe> <key><op><value> [timeout]`。expect と同じ predicate。timeout は frame budget（0=1回）。
-/// 戻り true = predicate 未成立で待機開始（呼び出し側が frame を進める / 接続を保持）。
+/// `await <probe> <key><op><value> [timeout]`. The same predicate as expect's. timeout is a frame budget (0 = evaluate once).
+/// A true return = the predicate did not hold and the wait has begun (so the caller advances the frame, or holds the connection).
 fn handleAwait(it: *Tok) bool {
     const expr_text = std.mem.trim(u8, it.rest(), " \t");
     const parsed = parseAwaitExpr(it) orelse {
         reportAwait(false, expr_text, "invalid syntax");
         return false;
     };
-    // 即時 1 回評価
+    // evaluate once, immediately
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     const pass = switch (digestPayload(parsed.expr.probe, &buf)) {
         .unavailable => false,
@@ -2368,7 +2368,7 @@ const AwaitParsed = struct {
     timeout_frames: usize,
 };
 
-/// await 引数の純 parse。optional trailing timeout（usize）。余剰・不正は null。
+/// The pure parse of await's arguments, with an optional trailing timeout (usize). A surplus or invalid token gives null.
 fn parseAwaitExpr(it: *Tok) ?AwaitParsed {
     var probe = it.next() orelse return null;
     if (std.mem.eql(u8, probe, "digest")) {
@@ -2412,8 +2412,8 @@ fn reportAwait(pass: bool, expr_text: []const u8, actual: ?[]const u8) void {
     }
 }
 
-/// 合否を emit（replay=stderr / live=resp_buf）し、replay の失敗を記帳する。
-/// actual は失敗時のみ意味を持つ（payload か unavailable 理由。pass 時は null）。
+/// Emits the outcome (replay=stderr / live=resp_buf) and records a replay failure.
+/// actual is meaningful only on a failure (either the payload or the reason it is unavailable; null on a pass).
 fn reportExpect(kind: []const u8, pass: bool, expr_text: []const u8, actual: ?[]const u8, is_assert: bool) void {
     if (mode == .live) {
         appendResp(if (pass) "ok " else "fail ");
@@ -2435,15 +2435,15 @@ fn reportExpect(kind: []const u8, pass: bool, expr_text: []const u8, actual: ?[]
 
     if (!pass and mode == .replay) {
         expect_failures += 1;
-        if (is_assert) replayExitIfFailed(); // assert は即 abort
+        if (is_assert) replayExitIfFailed(); // assert aborts at once
     }
 }
 
-/// replay 終了時: 失敗があれば summary を出して非0 exit する。
-/// **mode gate を関数内に閉じる**ので live / 通常実行（disabled）では常に no-op（process.exit を呼ばない）。
+/// At the end of a replay: if there were failures, print a summary and exit non-zero.
+/// **The mode gate is closed inside the function**, so for live and for a normal run (disabled) it is always a no-op (it never calls process.exit).
 fn replayExitIfFailed() void {
     if (mode == .replay and expect_failures > 0) {
-        std.debug.print("[harness] 検証失敗: {d} 件（expect/assert/action）\n", .{expect_failures});
+        std.debug.print("[harness] verification failures: {d} (expect/assert/action)\n", .{expect_failures});
         std.process.exit(1);
     }
 }
@@ -2452,7 +2452,7 @@ fn replayExitIfFailed() void {
 // fb probe payload
 // ============================================================================
 
-/// `<w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]`（上位3色）を buf に書いて返す。
+/// Writes `<w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]` (the top three colours) into buf and returns it.
 fn formatFbPayload(buf: []u8) []u8 {
     const n = @as(usize, frame_w) * @as(usize, frame_h);
     const px = frame_pixels[0..n];
@@ -2471,7 +2471,7 @@ fn formatFbPayload(buf: []u8) []u8 {
         if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
     }
     if (ok) {
-        // tie-break を明示（count 降順、同数は color 昇順）。hashmap iterator 順に依存させない。
+        // Make the tie-break explicit (descending count, and ascending colour when equal). Do not let it depend on the hashmap iterator order.
         const cmp = struct {
             fn better(a: Top, b: Top) bool {
                 return a.count > b.count or (a.count == b.count and a.color < b.color);
@@ -2508,24 +2508,24 @@ fn formatFbPayload(buf: []u8) []u8 {
 }
 
 // ============================================================================
-// audio probe（tap drain + 解析 + WAV）
+// the audio probe (draining the tap, the analysis, and WAV)
 // ============================================================================
 
-/// 直近 `dst.len`（最大 AUDIO_CAP）サンプルを non-destructive に取り出す。tail を動かさない
-/// （digest と snapshot が同じ直近窓を見られるよう peek にする）。戻り = 取り出した数。
+/// Takes the most recent `dst.len` samples (at most AUDIO_CAP) non-destructively, without moving tail
+/// (a peek, so that a digest and a snapshot see the same recent window). The return value is how many were taken.
 fn peekRecentAudio(dst: []f32) usize {
     const head = audio_head.load(.acquire);
     const want = @min(dst.len, @min(AUDIO_CAP, head));
     const start = head -% want;
     var i: usize = 0;
-    // producer の `.unordered` store と対称に `.unordered` load（torn を許容しつつ data race UB を回避）。
+    // An `.unordered` load, symmetrical with the producer's `.unordered` store (tolerating a torn read while avoiding data race UB).
     while (i < want) : (i += 1) dst[i] = @atomicLoad(f32, &audio_buf[(start +% i) & AUDIO_MASK], .unordered);
     return want;
 }
 
 const AudioStats = struct { rms: f32, peak: f32, f0: f32, silent: bool, frames: usize };
 
-/// TASK-92 拡張解析結果（既存 AudioStats と独立。additive キー用）。
+/// The result of the extended analysis (independent of the existing AudioStats; for the additive keys).
 const AudioExtStats = struct {
     band_low: f32,
     band_mid: f32,
@@ -2544,15 +2544,15 @@ const audio_ext_zero = AudioExtStats{
     .lufs = LUFS_FLOOR,
 };
 
-/// interleaved サンプルの直近 min(frames, mono_scratch.len) frames を mono downmix して RMS/peak/f0/silent を計算する。
-/// 純ロジック（単体テスト可能）。mono_scratch は呼び出し側が渡す（hidden global を持たない）。
-/// **TASK-92: 本関数と AudioStats・ANALYZE_FRAMES は変更しない**（既存キー bit 安定）。
+/// Downmixes the most recent min(frames, mono_scratch.len) frames of interleaved samples to mono and computes RMS, peak, f0 and silent.
+/// Pure logic (unit testable). mono_scratch is passed in by the caller (there is no hidden global).
+/// **This function, AudioStats and ANALYZE_FRAMES do not change** (keeping the existing keys bit-stable).
 fn analyzeAudio(interleaved: []const f32, channels: u32, sample_rate: u32, mono_scratch: []f32) AudioStats {
     if (channels == 0 or interleaved.len < channels) return .{ .rms = 0, .peak = 0, .f0 = 0, .silent = true, .frames = 0 };
     const ch: usize = channels;
     const total_frames = interleaved.len / ch;
     const w = @min(total_frames, mono_scratch.len);
-    const off = total_frames - w; // 直近 w frames
+    const off = total_frames - w; // the most recent w frames
     var i: usize = 0;
     while (i < w) : (i += 1) {
         var acc: f32 = 0;
@@ -2575,9 +2575,9 @@ fn analyzeAudio(interleaved: []const f32, channels: u32, sample_rate: u32, mono_
     return .{ .rms = rms, .peak = peak, .f0 = f0, .silent = silent, .frames = w };
 }
 
-/// TASK-92: band/centroid/onsets/lufs。digest 要求時（イベント時）のみ呼ばれる。RT 経路非接触。
-/// 純ロジック（単体テスト直呼び可）。mono_scratch は呼び出し側が渡す（最大 EXT_FRAMES）。
-/// sample_rate==0 / channels==0 / 窓 0 → 全ゼロ + lufs 床値。窓不足は縮退計算（0 なら床値）。
+/// band, centroid, onsets and lufs. Called only when a digest is asked for (at event time). It never touches a real-time path.
+/// Pure logic (a unit test can call it directly). mono_scratch is passed in by the caller (up to EXT_FRAMES).
+/// sample_rate==0, channels==0, or a window of 0 → all zeros plus the lufs floor. Too short a window degrades the computation (and gives the floor at 0).
 fn analyzeAudioExt(interleaved: []const f32, channels: u32, sample_rate: u32, mono_scratch: []f32) AudioExtStats {
     if (channels == 0 or sample_rate == 0 or interleaved.len < channels) return audio_ext_zero;
     const ch: usize = channels;
@@ -2608,19 +2608,19 @@ fn analyzeAudioExt(interleaved: []const f32, channels: u32, sample_rate: u32, mo
     };
 }
 
-/// 直近 4096 フレーム（不足はゼロ詰め）に Hann+magnitudeSpectrum を掛け、
-/// band_low(20–250) / band_mid(250–2000) / band_high(2000–Nyquist) の正規化エネルギー比と
-/// spectral centroid [Hz] を返す。全帯域エネルギー 0 なら全て 0。
+/// Applies a Hann window and magnitudeSpectrum to the most recent 4096 frames (zero-padded when there are fewer), and returns
+/// the normalised energy ratios band_low(20–250), band_mid(250–2000) and band_high(2000–Nyquist), plus
+/// the spectral centroid in Hz. When the energy across every band is 0, they are all 0.
 fn computeBandCentroid(mono: []const f32, sample_rate: f32) struct { low: f32, mid: f32, high: f32, centroid: f32 } {
     if (mono.len == 0 or sample_rate <= 0) return .{ .low = 0, .mid = 0, .high = 0, .centroid = 0 };
 
-    // 直近 min(len, 4096) をバッファ末尾に置き、先頭はゼロ詰め
+    // Put the most recent min(len, 4096) at the end of the buffer and zero-pad the front
     @memset(ext_fft_re[0..], 0);
     const n_copy = @min(mono.len, EXT_FFT_N);
     const src_off = mono.len - n_copy;
     const dst_off = EXT_FFT_N - n_copy;
     @memcpy(ext_fft_re[dst_off..][0..n_copy], mono[src_off..][0..n_copy]);
-    // magnitudeSpectrum は samples をコピーして Hann するので、samples 用に re を snapshot
+    // magnitudeSpectrum copies samples and applies Hann to them, so re is snapshotted for samples' sake
     var samples: [EXT_FFT_N]f32 = undefined;
     @memcpy(samples[0..], ext_fft_re[0..]);
     dsp.magnitudeSpectrum(samples[0..], ext_fft_re[0..], ext_fft_im[0..], ext_mags[0..]);
@@ -2660,14 +2660,14 @@ fn computeBandCentroid(mono: []const f32, sample_rate: f32) struct { low: f32, m
     };
 }
 
-/// hop=1024 / FFT=2048 のスペクトラルフラックス（正差分和）列を作り、
-/// threshold=mean+1.5σ 超えのローカルピーク数を数える（決定的・固定係数）。
-/// 連続して閾値を超えるプラトーは先頭ピークのみ数える（同一 onset の多重カウント防止）。
+/// Builds the spectral flux sequence (the sum of positive differences) at hop=1024 and FFT=2048, and
+/// counts the local peaks above threshold=mean+1.5σ (deterministically, with fixed coefficients).
+/// A plateau that stays above the threshold counts its first peak only (which prevents counting one onset several times).
 fn countOnsets(mono: []const f32, sample_rate: f32) u32 {
     _ = sample_rate;
     if (mono.len < ONSET_FFT_N) return 0;
 
-    // 最大 hop 数: (EXT_FRAMES - ONSET_FFT_N) / ONSET_HOP + 1 ≤ 31
+    // the maximum number of hops: (EXT_FRAMES - ONSET_FFT_N) / ONSET_HOP + 1 ≤ 31
     const max_hops = (EXT_FRAMES - ONSET_FFT_N) / ONSET_HOP + 1;
     var flux: [max_hops]f64 = undefined;
     var n_flux: usize = 0;
@@ -2711,14 +2711,14 @@ fn countOnsets(mono: []const f32, sample_rate: f32) u32 {
     while (i < n_flux) : (i += 1) {
         if (flux[i] <= thresh) continue;
         const left_ok = (i == 0) or (flux[i] >= flux[i - 1]);
-        const right_ok = (i + 1 >= n_flux) or (flux[i] > flux[i + 1]); // 右は厳密 > でプラトーを1回だけ
+        const right_ok = (i + 1 >= n_flux) or (flux[i] > flux[i + 1]); // the right-hand side is a strict > so a plateau counts once
         if (left_ok and right_ok) count += 1;
     }
     return count;
 }
 
-/// BS.1770 K-weighting（high-shelf + high-pass の 2 biquad。係数は sample_rate から設計式で算出）
-/// → 直近 400ms の mean-square → -0.691 + 10·log10(ms)。mono 1ch 扱い。無音は床値 -99.0。
+/// BS.1770 K-weighting (two biquads, a high shelf plus a high pass; the coefficients are derived from sample_rate by the design formulas)
+/// → the mean square of the most recent 400ms → -0.691 + 10·log10(ms). Treated as mono, 1 channel. Silence gives the floor of -99.0.
 fn computeLufsMomentary(mono: []const f32, sample_rate: u32) f32 {
     if (mono.len == 0 or sample_rate == 0) return LUFS_FLOOR;
     const sr: f64 = @floatFromInt(sample_rate);
@@ -2726,7 +2726,7 @@ fn computeLufsMomentary(mono: []const f32, sample_rate: u32) f32 {
     if (win_n == 0) return LUFS_FLOOR;
     const off = mono.len - win_n;
 
-    // Stage 1: high-shelf（ITU-R BS.1770 アナログ原型 → bilinear）
+    // Stage 1: the high shelf (the ITU-R BS.1770 analogue prototype → bilinear)
     // f0=1681.974... Hz, G=3.999... dB, Q=0.707175...
     const hs = kWeightShelfCoeffs(sr);
     // Stage 2: high-pass f0=38.135... Hz, Q=0.500327...
@@ -2758,7 +2758,7 @@ fn computeLufsMomentary(mono: []const f32, sample_rate: u32) f32 {
 
 const BiquadCoeffs = struct { b0: f64, b1: f64, b2: f64, a1: f64, a2: f64 };
 
-/// BS.1770 pre-filter（high shelf）係数。sample_rate 依存（48k 決め打ち禁止）。
+/// The coefficients of the BS.1770 pre-filter (a high shelf). They depend on sample_rate (never hard-code 48k).
 fn kWeightShelfCoeffs(sample_rate: f64) BiquadCoeffs {
     const f0 = 1681.974450955533;
     const G = 3.999843853973347;
@@ -2776,7 +2776,7 @@ fn kWeightShelfCoeffs(sample_rate: f64) BiquadCoeffs {
     };
 }
 
-/// BS.1770 RLB-weighting（high-pass）係数。sample_rate 依存。
+/// The coefficients of BS.1770 RLB-weighting (a high pass). They depend on sample_rate.
 fn kWeightHpCoeffs(sample_rate: f64) BiquadCoeffs {
     const f0 = 38.13547087602444;
     const Q = 0.5003270373238773;
@@ -2791,7 +2791,7 @@ fn kWeightHpCoeffs(sample_rate: f64) BiquadCoeffs {
     };
 }
 
-/// 自己相関で基本周波数を推定する（50–2000Hz）。clean tone に強い。検出不能/無音は 0。
+/// Estimates the fundamental frequency by autocorrelation (50–2000Hz). It is strong on a clean tone. Undetectable or silent gives 0.
 fn estimateF0(mono: []const f32, sample_rate: u32) f32 {
     const n = mono.len;
     if (n < 64 or sample_rate == 0) return 0;
@@ -2834,7 +2834,7 @@ fn formatAudioPayload(buf: []u8) []u8 {
     const channels = audio_channels.load(.monotonic);
     const rate = audio_rate.load(.monotonic);
     const n = peekRecentAudio(&audio_scratch);
-    // キー集合は分岐間で一致させる（expect の key 不在失敗を防ぐ）。TASK-92 additive。
+    // Keep the key set identical between the branches (which prevents expect failing on a missing key).
     if (n == 0 or channels == 0) {
         return std.fmt.bufPrint(buf, "rms=0.0000 peak=0.0000 f0=0.0 silent=1 frames=0 band_low=0.0000 band_mid=0.0000 band_high=0.0000 centroid=0 onsets=0 lufs=-99.0", .{}) catch buf[0..0];
     }
@@ -2847,7 +2847,7 @@ fn formatAudioPayload(buf: []u8) []u8 {
     }) catch buf[0..0];
 }
 
-/// PCM16 little-endian RIFF/WAVE を encode する（純ロジック・単体テスト可能）。
+/// Encodes PCM16 little-endian RIFF/WAVE (pure logic, unit testable).
 fn encodeWav(interleaved: []const f32, channels: u32, sample_rate: u32, allocator: std.mem.Allocator) ![]u8 {
     const num_samples = interleaved.len;
     const data_size: u32 = @intCast(num_samples * 2);
@@ -2905,7 +2905,7 @@ fn formatStatsPayload(buf: []u8) []u8 {
 
 fn queue(ev: Event) void {
     if (inject_count >= inject_buf.len) {
-        warnLine("inject queue 溢れ: drop");
+        warnLine("the inject queue overflowed: dropping");
         return;
     }
     inject_buf[inject_count] = ev;
@@ -2914,7 +2914,7 @@ fn queue(ev: Event) void {
 
 fn queueMidi(ev: MidiEvent) bool {
     if (midi_count >= midi_buf.len) {
-        warnLine("midi FIFO 溢れ: drop");
+        warnLine("the midi FIFO overflowed: dropping");
         return false;
     }
     midi_buf[midi_count] = ev;
@@ -2933,7 +2933,7 @@ fn applyMidiState(ev: MidiEvent) void {
     }
 }
 
-/// 次の1コマンドを返す。区切りは `\n` または `;`（1引数で `'inject A; step 3; digest fb'` と書けるように）。
+/// Returns the next single command. The separators are a newline and `;` (so that `'inject A; step 3; digest fb'` can be written as one argument).
 fn nextLine() ?[]const u8 {
     if (cursor >= cmd_buf.len) return null;
     const start = cursor;
@@ -2968,10 +2968,10 @@ fn parseButton(tok: ?[]const u8) ?MouseButton {
     return std.meta.stringToEnum(MouseButton, buf[0..name.len]);
 }
 
-/// 残りトークンを shift/ctrl/alt/cmd（大小無視）に照合してフラグを立てる。
-/// 未知トークンが 1 つでもあれば null を返す（caller が warn してそのイベントを捨てる = fail-fast。
-/// parseKey/parseButton と同じ「不正トークン→null、warn は caller」の慣習）。
-/// 残り 0 トークンなら空 ModifierFlags（非 null）。
+/// Matches the remaining tokens against shift, ctrl, alt and cmd (case-insensitive) and raises the flags.
+/// If even one token is unknown it returns null (and the caller warns and drops that event, failing fast.
+/// The same convention as parseKey's and parseButton's: an invalid token gives null and the caller warns).
+/// With 0 tokens remaining it gives empty ModifierFlags (which is non-null).
 fn parseModifiers(it: *Tok) ?ModifierFlags {
     var m = ModifierFlags{};
     while (it.next()) |tok| {
@@ -3015,20 +3015,20 @@ fn warnLine(msg: []const u8) void {
     }
 }
 
-/// 環境変数を読む。0.16 std には libc 非依存の getenv が無いため libc getenv を使う
-/// （platform module は常に link_libc）。
+/// Reads an environment variable. 0.16's std has no libc-independent getenv, so libc getenv is used
+/// (the platform module always links libc).
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
 }
 
 // ============================================================================
-// tests（display 不要・絶対値 assert で誤実装を落とす）
+// tests (no display needed; absolute-value asserts to catch a wrong implementation)
 // ============================================================================
 const testing = std.testing;
 
 fn resetForTest() void {
-    mode = .replay; // EOF 時の挙動を replay として確定（テストは file source 相当）
+    mode = .replay; // Settle the behaviour at EOF as a replay would (the tests amount to a file source)
     clock_mode = .manual;
     cmd_buf = "";
     cursor = 0;
@@ -3066,12 +3066,12 @@ fn resetForTest() void {
     audio_rate = .init(0);
     probe_count = 0;
     external_registry_enabled = false;
-    // action registry は分離モジュール（TASK-62.3.1）。reset 後に setEnabled(true) して
-    // 旧挙動（mode=.replay で registerAction 可）をテスト既定として保つ。
+    // The action registry is a separate module. After the reset, setEnabled(true) keeps
+    // the older behaviour (registerAction working with mode=.replay) as the tests' default.
     action_registry.resetForTest();
     action_registry.setEnabled(true);
-    // synthetic capture source（TASK-49.5）: 前のテストの残留状態（video の pixel buffer・audio の
-    // 生成スレッド）を確実に片付けてからクリーンな状態で始める（テスト間リークを防ぐ）。
+    // The synthetic capture source: tidy away any state left over from the previous test (video's pixel buffer, audio's
+    // generating thread) for certain, and start clean (which prevents a leak between tests).
     if (synth_video) |*dev| dev.close();
     synth_video = null;
     if (synth_audio) |dev| dev.close();
@@ -3086,7 +3086,7 @@ fn resetForTest() void {
     live_stream_owned = false;
 }
 
-test "parseKey: 名前→KeyCode（大小無視・数字）" {
+test "parseKey: a name to a KeyCode (case-insensitive, and digits)" {
     try testing.expectEqual(KeyCode.A, parseKey("a").?);
     try testing.expectEqual(KeyCode.A, parseKey("A").?);
     try testing.expectEqual(KeyCode.ESCAPE, parseKey("escape").?);
@@ -3095,14 +3095,14 @@ test "parseKey: 名前→KeyCode（大小無視・数字）" {
     try testing.expectEqual(@as(?KeyCode, null), parseKey("nope"));
 }
 
-test "parseButton: 名前→MouseButton" {
+test "parseButton: a name to a MouseButton" {
     try testing.expectEqual(MouseButton.left, parseButton("left").?);
     try testing.expectEqual(MouseButton.right, parseButton("RIGHT").?);
     try testing.expectEqual(MouseButton.middle, parseButton("Middle").?);
     try testing.expectEqual(@as(?MouseButton, null), parseButton("x"));
 }
 
-test "parseModifiers: 0個=空 / 単一 / 複数（大小無視）/ 未知=null" {
+test "parseModifiers: none means empty, one, several (case-insensitive), and unknown means null" {
     {
         var it = std.mem.tokenizeAny(u8, "", " \t");
         const m = parseModifiers(&it).?;
@@ -3114,7 +3114,7 @@ test "parseModifiers: 0個=空 / 単一 / 複数（大小無視）/ 未知=null"
         try testing.expect(m.cmd and !m.shift and !m.ctrl and !m.alt);
     }
     {
-        var it = std.mem.tokenizeAny(u8, "Cmd SHIFT", " \t"); // 大小混在
+        var it = std.mem.tokenizeAny(u8, "Cmd SHIFT", " \t"); // mixed case
         const m = parseModifiers(&it).?;
         try testing.expect(m.cmd and m.shift and !m.ctrl and !m.alt);
     }
@@ -3128,12 +3128,12 @@ test "parseModifiers: 0個=空 / 単一 / 複数（大小無視）/ 未知=null"
         try testing.expectEqual(@as(?ModifierFlags, null), parseModifiers(&it));
     }
     {
-        var it = std.mem.tokenizeAny(u8, "cmd bogus", " \t"); // 認識済みが先でも未知が混ざれば null
+        var it = std.mem.tokenizeAny(u8, "cmd bogus", " \t"); // even with a recognised one first, one unknown mixed in gives null
         try testing.expectEqual(@as(?ModifierFlags, null), parseModifiers(&it));
     }
 }
 
-test "parseKeyExtras: repeat は key_down の token として配送される" {
+test "parseKeyExtras: repeat is delivered as a token of key_down" {
     var it = std.mem.tokenizeAny(u8, "cmd repeat", " \t");
     const extras = parseKeyExtras(&it).?;
     try testing.expect(extras.repeat);
@@ -3142,7 +3142,7 @@ test "parseKeyExtras: repeat は key_down の token として配送される" {
     try testing.expectEqual(@as(?KeyExtras, null), parseKeyExtras(&bad));
 }
 
-test "inject composition: update/commit/cancel の latest-wins 状態契約" {
+test "inject composition: the latest-wins state contract of update, commit and cancel" {
     resetForTest();
     cmd_buf =
         "inject composition update 4 あい\n" ++
@@ -3152,7 +3152,7 @@ test "inject composition: update/commit/cancel の latest-wins 状態契約" {
         "step 1\nquit";
     try testing.expect(pollGate(true));
 
-    // start/update/commit/char の順序を保持する。
+    // The order of start, update, commit and char is preserved.
     const start = nextInjectedEvent().?;
     try testing.expect(start == .composition_changed and start.composition_changed.phase == .start);
     const update = nextInjectedEvent().?;
@@ -3171,7 +3171,7 @@ test "inject composition: update/commit/cancel の latest-wins 状態契約" {
     try testing.expectEqual(@as(u32, 0), snapshot.cursor);
 }
 
-test "inject commit: bare commit は composition_changed なしで char_input を配送" {
+test "inject commit: a bare commit delivers char_input with no composition_changed" {
     resetForTest();
     cmd_buf =
         "inject commit AB\n" ++
@@ -3191,7 +3191,7 @@ test "inject commit: bare commit は composition_changed なしで char_input �
     try testing.expectEqual(@as(u32, 0), snapshot.cursor);
 }
 
-test "inject composition: 空 update は許容、cancel は update 前 no-op、cursor は UTF-8 境界へ clamp" {
+test "inject composition: an empty update is allowed, cancel is a no-op before an update, and cursor is clamped to a UTF-8 boundary" {
     resetForTest();
     cmd_buf =
         "inject composition cancel\n" ++
@@ -3210,7 +3210,7 @@ test "inject composition: 空 update は許容、cancel は update 前 no-op、c
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
-test "inject file_drop: 単一 path / スペース保持 / 連続・末尾空白保持" {
+test "inject file_drop: a single path, spaces kept, and consecutive and trailing whitespace kept" {
     resetForTest();
     cmd_buf =
         \\inject file_drop /tmp/a.png
@@ -3247,7 +3247,7 @@ test "inject file_drop: 単一 path / スペース保持 / 連続・末尾空白
     try testing.expect(!pollGate(true));
 }
 
-test "inject file_drop: 空 path / 不正 UTF-8 / 上限超過は拒否" {
+test "inject file_drop: an empty path, invalid UTF-8, and going over the limit are rejected" {
     resetForTest();
     cmd_buf =
         "inject file_drop\n" ++
@@ -3258,7 +3258,7 @@ test "inject file_drop: 空 path / 不正 UTF-8 / 上限超過は拒否" {
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
     try testing.expect(!pollGate(true));
 
-    // 上限超過（FILE_DROP_PATH_BYTES+1）
+    // over the limit (FILE_DROP_PATH_BYTES+1)
     resetForTest();
     var script_buf: [48 + types.FILE_DROP_PATH_BYTES + 1]u8 = undefined;
     const prefix = "inject file_drop ";
@@ -3273,7 +3273,7 @@ test "inject file_drop: 空 path / 不正 UTF-8 / 上限超過は拒否" {
     try testing.expect(!pollGate(true));
 }
 
-test "inject file_drop: 複数 token を複数ファイルとして解釈しない" {
+test "inject file_drop: several tokens are not read as several files" {
     resetForTest();
     cmd_buf =
         \\inject file_drop /tmp/a.png /tmp/b.png
@@ -3288,10 +3288,10 @@ test "inject file_drop: 複数 token を複数ファイルとして解釈しな�
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
-test "inject file_drop: live raw record と replay の path bytes 一致" {
+test "inject file_drop: the path bytes of a live raw record and of a replay match" {
     resetForTest();
     const raw = "inject file_drop /tmp/My Image.png";
-    // live record は raw request をそのまま保存する契約。replay は同じ行を解釈する。
+    // The contract is that a live record stores the raw request as it stands, and that a replay interprets the same line.
     cmd_buf = raw ++ "\nstep 1\nquit";
     try testing.expect(pollGate(true));
     const live_ev = nextInjectedEvent().?;
@@ -3305,7 +3305,7 @@ test "inject file_drop: live raw record と replay の path bytes 一致" {
     try testing.expectEqualStrings(live_bytes, replay_ev.file_drop.paths[0].slice());
 }
 
-test "inject file_drop: harness 無効時は inject queue が空のまま（既存 no-op）" {
+test "inject file_drop: with harness disabled the inject queue stays empty (the existing no-op)" {
     resetForTest();
     mode = .disabled;
     cmd_buf = "";
@@ -3313,7 +3313,7 @@ test "inject file_drop: harness 無効時は inject queue が空のまま（既�
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
-test "inject modifiers: 全6経路で反映 / 無指定は空" {
+test "inject modifiers: reflected on all six paths, and empty when unspecified" {
     resetForTest();
     cmd_buf =
         \\inject key_down S cmd
@@ -3342,43 +3342,43 @@ test "inject modifiers: 全6経路で反映 / 無指定は空" {
     try testing.expect(e.key_down.modifiers.cmd and !e.key_down.modifiers.shift and !e.key_down.modifiers.ctrl and !e.key_down.modifiers.alt);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // key_up A shift（key_up 分岐）
+    // key_up A shift (the key_up branch)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .key_up and e.key_up.key == .A and e.key_up.modifiers.shift and !e.key_up.modifiers.cmd);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // key_down S cmd shift（複数）
+    // key_down S cmd shift (several)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .key_down and e.key_down.modifiers.cmd and e.key_down.modifiers.shift and !e.key_down.modifiers.ctrl);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // mouse_move 10 20 ctrl（mouse_move 分岐・座標維持）
+    // mouse_move 10 20 ctrl (the mouse_move branch, keeping the coordinates)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .mouse_move and e.mouse_move.x == 10 and e.mouse_move.y == 20 and e.mouse_move.modifiers.ctrl);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // mouse_down left alt（button/buttons 維持）
+    // mouse_down left alt (keeping button and buttons)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .mouse_down and e.mouse_down.button == .left and e.mouse_down.buttons.left and e.mouse_down.modifiers.alt);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // mouse_up right cmd（mouse_up 分岐）
+    // mouse_up right cmd (the mouse_up branch)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .mouse_up and e.mouse_up.button == .right and e.mouse_up.modifiers.cmd);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // scroll 0 -3 ctrl（dx/dy 維持）
+    // scroll 0 -3 ctrl (keeping dx and dy)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .mouse_scroll and e.mouse_scroll.dx == 0 and e.mouse_scroll.dy == -3 and e.mouse_scroll.modifiers.ctrl);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // key_down A（修飾子無し → 全 false）
+    // key_down A (no modifiers → all false)
     try testing.expect(pollGate(true));
     e = nextInjectedEvent().?;
     try testing.expect(e == .key_down and e.key_down.key == .A);
@@ -3389,7 +3389,7 @@ test "inject modifiers: 全6経路で反映 / 無指定は空" {
     try testing.expect(!pollGate(true));
 }
 
-test "inject modifiers: 未知 modifier は fail-fast（注入されず state も汚さない）" {
+test "inject modifiers: an unknown modifier fails fast (nothing is injected and the state is not dirtied)" {
     resetForTest();
     cmd_buf =
         \\inject mouse_down left bogus
@@ -3401,13 +3401,13 @@ test "inject modifiers: 未知 modifier は fail-fast（注入されず state �
         \\quit
     ;
 
-    // frame 1: 3 件とも fail-fast で queue されない
+    // frame 1: all 3 fail fast and are not queued
     try testing.expect(pollGate(true));
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
-    // mouse_down left bogus は setButton されない（button state 汚染なし）
+    // mouse_down left bogus does not reach setButton (so the button state is not dirtied)
     try testing.expect(!mouse_buttons.left);
 
-    // frame 2: 正常な mouse_down left。座標は mouse_move 10 20 bogus で汚れず初期値(0,0)のまま
+    // frame 2: a valid mouse_down left. The coordinates were not dirtied by mouse_move 10 20 bogus and stay at their initial (0,0)
     try testing.expect(pollGate(true));
     const e = nextInjectedEvent().?;
     try testing.expect(e == .mouse_down and e.mouse_down.button == .left and e.mouse_down.buttons.left);
@@ -3417,7 +3417,7 @@ test "inject modifiers: 未知 modifier は fail-fast（注入されず state �
     try testing.expect(!pollGate(true));
 }
 
-test "実行モデル: inject→nextEvent FIFO / step がフレームを gate" {
+test "the execution model: inject to nextEvent is FIFO, and step gates the frame" {
     resetForTest();
     cmd_buf =
         \\inject key_down A
@@ -3426,7 +3426,7 @@ test "実行モデル: inject→nextEvent FIFO / step がフレームを gate" {
         \\step 2
         \\quit
     ;
-    // frame 1: step 1（直前に inject 2 件積む）
+    // frame 1: step 1 (with 2 injections queued just before)
     try testing.expect(pollGate(true));
     const e0 = nextInjectedEvent().?;
     try testing.expect(e0 == .key_down and e0.key_down.key == .A);
@@ -3434,23 +3434,23 @@ test "実行モデル: inject→nextEvent FIFO / step がフレームを gate" {
     try testing.expect(e1 == .mouse_down and e1.mouse_down.button == .left and e1.mouse_down.buttons.left);
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // frame 2,3: step 2（注入なし）
+    // frames 2 and 3: step 2 (with no injections)
     try testing.expect(pollGate(true));
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
     try testing.expect(pollGate(true));
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 
-    // quit → 終了
+    // quit → the end
     try testing.expect(!pollGate(true));
 }
 
-test "実行モデル: native_continue=false で停止" {
+test "the execution model: native_continue=false stops it" {
     resetForTest();
     cmd_buf = "step 5\n";
     try testing.expect(!pollGate(false));
 }
 
-test "仮想クロック: getTime = frame_index/60、present で進む" {
+test "the virtual clock: getTime = frame_index/60, advancing on a present" {
     resetForTest();
     try testing.expectEqual(@as(f64, 0.0), now());
     const px = [_]u32{0xFF112233};
@@ -3464,7 +3464,7 @@ test "仮想クロック: getTime = frame_index/60、present で進む" {
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[0]);
 }
 
-test "skip_frame_copy: 有効時は frame_index のみ進み、@memcpy はスキップされる（TASK-156.5 R10）" {
+test "skip_frame_copy: while it is on, only frame_index advances and the @memcpy is skipped" {
     resetForTest();
     skip_frame_copy = true;
     defer skip_frame_copy = false;
@@ -3473,7 +3473,7 @@ test "skip_frame_copy: 有効時は frame_index のみ進み、@memcpy はスキ
     onPresent();
     try testing.expectEqual(@as(u64, 1), frame_index);
     try testing.expectEqual(@as(f64, 1.0 / 60.0), now());
-    // フレームは owned copy されないため have_frame は立たない。
+    // The frame is not copied as owned, so have_frame is not raised.
     try testing.expect(!have_frame);
     onLock(&px, 1, 1);
     onPresent();
@@ -3481,7 +3481,7 @@ test "skip_frame_copy: 有効時は frame_index のみ進み、@memcpy はスキ
     try testing.expect(!have_frame);
 }
 
-test "lock miss: null lock 後の present は stale を再コピーしない" {
+test "a lock miss: a present after a null lock does not re-copy stale pixels" {
     resetForTest();
     const px = [_]u32{0xFFAABBCC};
     onLock(&px, 1, 1);
@@ -3494,7 +3494,7 @@ test "lock miss: null lock 後の present は stale を再コピーしない" {
     try testing.expectEqual(@as(u64, 2), frame_index);
 }
 
-test "snapshot/digest: present 前は skip（io/フレーム未確定でも安全）" {
+test "snapshot and digest: skipped before a present (safe even with the io or the frame unsettled)" {
     resetForTest();
     cmd_buf =
         \\snapshot fb /tmp/should_not_write.png
@@ -3505,7 +3505,7 @@ test "snapshot/digest: present 前は skip（io/フレーム未確定でも安�
     try testing.expect(!have_frame);
 }
 
-test "fb payload: 既知 pixels → crc/top を絶対値 assert" {
+test "the fb payload: known pixels, asserting crc and top against absolute values" {
     resetForTest();
     // 2x2: 3px = 0xFF000000, 1px = 0xFF0000FF
     var px = [_]u32{ 0xFF000000, 0xFF000000, 0xFF000000, 0xFF0000FF };
@@ -3519,15 +3519,15 @@ test "fb payload: 既知 pixels → crc/top を絶対値 assert" {
     var buf: [256]u8 = undefined;
     const payload = formatFbPayload(&buf);
     try testing.expectEqualStrings(expected, payload);
-    // frame_pixels はテスト所有なので harness に解放させない
+    // frame_pixels belongs to the test, so harness must not free it
     frame_pixels = &.{};
 }
 
-test "audio ring: latest-wins で直近 capacity のみ peek できる" {
+test "the audio ring: latest-wins, so only the most recent capacity can be peeked at" {
     resetForTest();
-    mode = .replay; // disabled 以外
+    mode = .replay; // anything but disabled
     audio_head = .init(0);
-    // capacity を超える書き込み: 0,1,2,...,AUDIO_CAP+99 を1サンプルずつ
+    // writing past the capacity: 0,1,2,...,AUDIO_CAP+99, one sample at a time
     var v: usize = 0;
     const overflow = AUDIO_CAP + 100;
     while (v < overflow) : (v += 1) {
@@ -3537,14 +3537,14 @@ test "audio ring: latest-wins で直近 capacity のみ peek できる" {
     var dst: [8]f32 = undefined;
     const n = peekRecentAudio(&dst);
     try testing.expectEqual(@as(usize, 8), n);
-    // 直近 8 サンプル = overflow-8 .. overflow-1
+    // the most recent 8 samples = overflow-8 .. overflow-1
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         try testing.expectEqual(@as(f32, @floatFromInt(overflow - 8 + i)), dst[i]);
     }
 }
 
-test "analyzeAudio: silence / 定数 / 440Hz sine を絶対値 assert" {
+test "analyzeAudio: silence, a constant, and a 440Hz sine, asserted against absolute values" {
     var mono: [4096]f32 = undefined;
 
     // silence
@@ -3554,7 +3554,7 @@ test "analyzeAudio: silence / 定数 / 440Hz sine を絶対値 assert" {
     try testing.expectApproxEqAbs(@as(f32, 0), a0.rms, 1e-6);
     try testing.expectEqual(@as(f32, 0), a0.f0);
 
-    // 振幅 0.5 の 440Hz sine（mono, 48000Hz, 4800 サンプル = 0.1s）
+    // a 440Hz sine of amplitude 0.5 (mono, 48000Hz, 4800 samples = 0.1s)
     const sr: f32 = 48000;
     const freq: f32 = 440;
     var sine: [4800]f32 = undefined;
@@ -3564,19 +3564,19 @@ test "analyzeAudio: silence / 定数 / 440Hz sine を絶対値 assert" {
     }
     const a1 = analyzeAudio(&sine, 1, 48000, &mono);
     try testing.expect(!a1.silent);
-    try testing.expectApproxEqAbs(@as(f32, 0.5), a1.peak, 0.02); // 振幅 0.5
+    try testing.expectApproxEqAbs(@as(f32, 0.5), a1.peak, 0.02); // amplitude 0.5
     try testing.expectApproxEqAbs(@as(f32, 0.3536), a1.rms, 0.02); // 0.5/√2
     try testing.expectApproxEqAbs(@as(f32, 440), a1.f0, 5.0); // ±5Hz
 }
 
-/// 既知 sine を mono バッファへ埋める（振幅 amp・周波数 freq_hz・sr）。
+/// Fills a mono buffer with a known sine (of amplitude amp, frequency freq_hz, at sr).
 fn fillSine(dst: []f32, amp: f32, freq_hz: f32, sample_rate: f32) void {
     for (dst, 0..) |*s, i| {
         s.* = amp * @sin(2.0 * std.math.pi * freq_hz * @as(f32, @floatFromInt(i)) / sample_rate);
     }
 }
 
-test "analyzeAudioExt: 440Hz sine — band_mid 支配・centroid≈440・onsets=0" {
+test "analyzeAudioExt: a 440Hz sine — band_mid dominates, centroid is about 440, onsets=0" {
     var mono_ext: [EXT_FRAMES]f32 = undefined;
     var sine: [4800]f32 = undefined;
     fillSine(&sine, 0.5, 440, 48000);
@@ -3586,7 +3586,7 @@ test "analyzeAudioExt: 440Hz sine — band_mid 支配・centroid≈440・onsets=
     try testing.expectEqual(@as(u32, 0), ext.onsets);
 }
 
-test "analyzeAudioExt: 100Hz → band_low 支配 / 6kHz → band_high 支配" {
+test "analyzeAudioExt: 100Hz makes band_low dominate, and 6kHz makes band_high dominate" {
     var mono_ext: [EXT_FRAMES]f32 = undefined;
     var low: [4800]f32 = undefined;
     fillSine(&low, 0.5, 100, 48000);
@@ -3599,24 +3599,24 @@ test "analyzeAudioExt: 100Hz → band_low 支配 / 6kHz → band_high 支配" {
     try testing.expect(e_high.band_high > 0.9);
 }
 
-test "analyzeAudioExt: 997Hz sine 振幅 0.5 の LUFS ≈ -9.1" {
-    // BS.1770 K-weighting は 997Hz でわずかに boost があり、
-    // amp=0.5 連続 sine の momentary は ≈-9.07（unweighted 理論 -9.72 より約 +0.65 dB）。
-    // plan の「K≈0dB → -9.7」は近似。実装は標準設計式に忠実。
+test "analyzeAudioExt: the LUFS of a 997Hz sine at amplitude 0.5 is about -9.1" {
+    // BS.1770 K-weighting boosts 997Hz slightly, so the momentary value of a
+    // continuous sine at amp=0.5 is about -9.07 (roughly +0.65 dB over the unweighted theoretical -9.72).
+    // "K≈0dB → -9.7" is an approximation; the implementation is faithful to the standard design formulas.
     var mono_ext: [EXT_FRAMES]f32 = undefined;
-    // 400ms @48k = 19200 サンプル以上（momentary 窓を満杯にする）
+    // 400ms @48k = 19200 samples or more (which fills the momentary window)
     var sine: [24000]f32 = undefined;
     fillSine(&sine, 0.5, 997, 48000);
     const ext = analyzeAudioExt(&sine, 1, 48000, &mono_ext);
     try testing.expectApproxEqAbs(@as(f32, -9.1), ext.lufs, 0.5);
 }
 
-test "analyzeAudioExt: 無音→バースト×3 で onsets=3" {
+test "analyzeAudioExt: silence then 3 bursts gives onsets=3" {
     var mono_ext: [EXT_FRAMES]f32 = undefined;
     const sr: usize = 48000;
     const burst_n = sr * 50 / 1000; // 50ms
     const gap_n = sr * 150 / 1000; // 150ms
-    // leading silence + 3 bursts + 2 gaps + trailing silence（終端プラトーを避ける）
+    // leading silence + 3 bursts + 2 gaps + trailing silence (which avoids a plateau at the end)
     const total = 4096 + 3 * burst_n + 2 * gap_n + 4096;
     var buf: [32768]f32 = undefined;
     try testing.expect(total <= buf.len);
@@ -3624,7 +3624,7 @@ test "analyzeAudioExt: 無音→バースト×3 で onsets=3" {
     var pos: usize = 4096; // leading silence
     var b: usize = 0;
     while (b < 3) : (b += 1) {
-        // 広帯域に近い決定的バースト（LCG ノイズ）。純 sine は位相で flux が割れ閾値を外しやすい。
+        // A deterministic burst close to broadband (LCG noise). A pure sine splits the flux by phase and easily misses the threshold.
         var rng: u32 = 0xA341316C +% @as(u32, @intCast(b)) *% 0x9E3779B9;
         var j: usize = 0;
         while (j < burst_n) : (j += 1) {
@@ -3639,7 +3639,7 @@ test "analyzeAudioExt: 無音→バースト×3 で onsets=3" {
     try testing.expectEqual(@as(u32, 3), ext.onsets);
 }
 
-test "analyzeAudioExt: 無音は新キー 0 / lufs=-99.0" {
+test "analyzeAudioExt: silence gives 0 for the new keys and lufs=-99.0" {
     var mono_ext: [EXT_FRAMES]f32 = undefined;
     var sil = [_]f32{0} ** 4096;
     const ext = analyzeAudioExt(&sil, 1, 48000, &mono_ext);
@@ -3651,7 +3651,7 @@ test "analyzeAudioExt: 無音は新キー 0 / lufs=-99.0" {
     try testing.expectEqual(@as(f32, LUFS_FLOOR), ext.lufs);
 }
 
-test "analyzeAudioExt: sample_rate=0 / channels=0 は床値ガード" {
+test "analyzeAudioExt: sample_rate=0 and channels=0 are guarded to the floor" {
     var mono_ext: [EXT_FRAMES]f32 = undefined;
     var sine: [256]f32 = undefined;
     fillSine(&sine, 0.5, 440, 48000);
@@ -3662,14 +3662,14 @@ test "analyzeAudioExt: sample_rate=0 / channels=0 は床値ガード" {
     try testing.expectEqual(@as(f32, LUFS_FLOOR), e1.lufs);
 }
 
-test "formatAudioPayload: 既存キー prefix が従来と bit 一致（回帰）+ 新キー存在 + 1024B 以内" {
+test "formatAudioPayload: the prefix of existing keys is bit-identical to before, the new keys are present, and it stays within 1024B" {
     resetForTest();
     mode = .replay;
     audio_head = .init(0);
     audio_channels = .init(0);
     audio_rate = .init(0);
 
-    // 空バッファ: 無音分岐。既存キー部分は従来と bit 一致し、新キーが続く。
+    // An empty buffer: the silent branch. The part with the existing keys stays bit-identical to before, and the new keys follow.
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     const empty = formatAudioPayload(&buf);
     try testing.expect(std.mem.startsWith(u8, empty, "rms=0.0000 peak=0.0000 f0=0.0 silent=1 frames=0"));
@@ -3681,7 +3681,7 @@ test "formatAudioPayload: 既存キー prefix が従来と bit 一致（回帰�
     try testing.expect(std.mem.indexOf(u8, empty, "lufs=-99.0") != null);
     try testing.expect(empty.len < DIGEST_BUF_LEN);
 
-    // 440Hz sine を ring に流し、既存キー prefix が analyzeAudio と bit 一致 + 新キー additive。
+    // Push a 440Hz sine through the ring: the prefix of existing keys is bit-identical to analyzeAudio's and the new keys are additive.
     var sine: [4800]f32 = undefined;
     fillSine(&sine, 0.5, 440, 48000);
     onAudioSamples(&sine, 4800, 1, 48000);
@@ -3693,9 +3693,9 @@ test "formatAudioPayload: 既存キー prefix が従来と bit 一致（回帰�
     try testing.expect(std.mem.indexOf(u8, payload, "lufs=") != null);
     try testing.expect(payload.len < DIGEST_BUF_LEN);
 
-    // 既存キー部分だけを analyzeAudio の format と bit 比較（新キーを削った prefix = 回帰ゼロ）
+    // Compare only the part with the existing keys, bit for bit, against analyzeAudio's format (the prefix with the new keys removed = zero regression)
     var mono: [ANALYZE_FRAMES]f32 = undefined;
-    // formatAudioPayload と同じ直近窓（ring に入れた sine 全体）で legacy を組み立てる
+    // Build the legacy form over the same recent window as formatAudioPayload's (the whole sine put into the ring)
     const st = analyzeAudio(&sine, 1, 48000, &mono);
     var legacy: [128]u8 = undefined;
     const legacy_s = try std.fmt.bufPrint(&legacy, "rms={d:.4} peak={d:.4} f0={d:.1} silent={d} frames={d}", .{
@@ -3704,7 +3704,7 @@ test "formatAudioPayload: 既存キー prefix が従来と bit 一致（回帰�
     try testing.expect(std.mem.startsWith(u8, payload, legacy_s));
 }
 
-test "encodeWav: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 assert" {
+test "encodeWav: the byte offsets of the PCM16 RIFF/WAVE header, asserted against absolute values" {
     const interleaved = [_]f32{ 0, 0, 0, 0 }; // 4 samples, 2ch → 2 frames
     const bytes = try encodeWav(&interleaved, 2, 48000, testing.allocator);
     defer testing.allocator.free(bytes);
@@ -3725,7 +3725,7 @@ test "encodeWav: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 assert" {
     try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[40..44], .little)); // data_size
 }
 
-test "stats payload: JSON 1行（frame/virtual_fps/EventStats）" {
+test "the stats payload: one line of JSON (frame, virtual_fps, EventStats)" {
     resetForTest();
     frame_index = 12;
     last_stats = .{ .mouse_move_merge_count = 3, .mouse_scroll_merge_count = 1, .event_drop_count = 0 };
@@ -3743,13 +3743,13 @@ fn testProbeDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "value={d}", .{c.value}) catch buf[0..0];
 }
 
-test "custom probe: register + digest routing（generic・framework 非パース・live framing）" {
-    resetForTest(); // mode=.replay（disabled 以外 → register 有効）
+test "a custom probe: register plus digest routing (generic, unparsed by the framework, live framing)" {
+    resetForTest(); // mode=.replay (anything but disabled → registration is enabled)
     var c = TestProbeCtx{ .value = 42 };
     registerProbe(.{ .name = "test", .ctx = &c, .ext = "bin", .digest = testProbeDigest });
     try testing.expectEqual(@as(usize, 1), probe_count);
 
-    // live framing: prefix なし `test value=42\n`
+    // live framing: no prefix, "test value=42" followed by a newline
     mode = .live;
     resp_buf.clearRetainingCapacity();
     defer resp_buf.clearRetainingCapacity();
@@ -3759,7 +3759,7 @@ test "custom probe: register + digest routing（generic・framework 非パース
     probe_count = 0;
 }
 
-test "custom probe: disabled 時 registerProbe は no-op（回帰ゼロ）" {
+test "a custom probe: while disabled registerProbe is a no-op (zero regression)" {
     resetForTest();
     mode = .disabled;
     probe_count = 0;
@@ -3768,38 +3768,38 @@ test "custom probe: disabled 時 registerProbe は no-op（回帰ゼロ）" {
     try testing.expectEqual(@as(usize, 0), probe_count);
 }
 
-test "custom probe: 同名は上書き / 予約名は拒否 / 満杯は skip" {
+test "a custom probe: the same name overwrites, a reserved name is rejected, and a full registry is skipped" {
     resetForTest();
     probe_count = 0;
     var c1 = TestProbeCtx{ .value = 1 };
     var c2 = TestProbeCtx{ .value = 2 };
     registerProbe(.{ .name = "p", .ctx = &c1, .digest = testProbeDigest });
-    registerProbe(.{ .name = "p", .ctx = &c2, .digest = testProbeDigest }); // 同名上書き
+    registerProbe(.{ .name = "p", .ctx = &c2, .digest = testProbeDigest }); // the same name overwrites
     try testing.expectEqual(@as(usize, 1), probe_count);
     const got: *TestProbeCtx = @ptrCast(@alignCast(findProbe("p").?.ctx));
     try testing.expectEqual(@as(u32, 2), got.value);
 
-    // 予約名は登録されない
+    // a reserved name is not registered
     registerProbe(.{ .name = "fb", .ctx = &c1, .digest = testProbeDigest });
     registerProbe(.{ .name = "audio", .ctx = &c1, .digest = testProbeDigest });
     registerProbe(.{ .name = "stats", .ctx = &c1, .digest = testProbeDigest });
-    registerProbe(.{ .name = "capture", .ctx = &c1, .digest = testProbeDigest }); // TASK-49.5 で追加した予約名
-    registerProbe(.{ .name = "gamepad", .ctx = &c1, .digest = testProbeDigest }); // TASK-80.1 で追加した予約名
+    registerProbe(.{ .name = "capture", .ctx = &c1, .digest = testProbeDigest }); // the reserved name added for the synthetic capture source
+    registerProbe(.{ .name = "gamepad", .ctx = &c1, .digest = testProbeDigest }); // the reserved name added for the gamepad probe
     try testing.expectEqual(@as(usize, 1), probe_count);
 
-    // 満杯（MAX_PROBES 到達）まで詰め、超過分は skip される（既存 "p" + 新規ユニーク名で埋める）
+    // Pack it full (up to MAX_PROBES) and the excess is skipped (filling with the existing "p" plus new unique names)
     const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "q", "r" };
     for (names) |nm| registerProbe(.{ .name = nm, .ctx = &c1, .digest = testProbeDigest });
-    try testing.expectEqual(@as(usize, MAX_PROBES), probe_count); // 16 で頭打ち（17 個目以降は skip）
+    try testing.expectEqual(@as(usize, MAX_PROBES), probe_count); // it tops out at 16 (the 17th and beyond are skipped)
     probe_count = 0;
 }
 
-test "live framing: digest/snapshot が response buffer に prefix なしで積まれる" {
+test "live framing: a digest and a snapshot go onto the response buffer without a prefix" {
     resetForTest();
     mode = .live;
     resp_buf.clearRetainingCapacity();
     defer resp_buf.clearRetainingCapacity();
-    // fb digest をライブで emit
+    // emit an fb digest live
     var px = [_]u32{0xFF010203};
     frame_pixels = px[0..];
     frame_w = 1;
@@ -3808,7 +3808,7 @@ test "live framing: digest/snapshot が response buffer に prefix なしで積�
     var buf: [256]u8 = undefined;
     emitDigest("fb", formatFbPayload(&buf));
     emitSnapshot("audio", "/tmp/a.wav", "10 samples");
-    // response は "fb ...\n/tmp/a.wav\n"
+    // the response is "fb ..." then "/tmp/a.wav", each followed by a newline
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fb 1x1 crc="));
     try testing.expect(std.mem.endsWith(u8, resp_buf.items, "/tmp/a.wav\n"));
     try testing.expect(std.mem.indexOf(u8, resp_buf.items, "[harness]") == null);
@@ -3816,10 +3816,10 @@ test "live framing: digest/snapshot が response buffer に prefix なしで積�
 }
 
 // ============================================================================
-// expect / assert（アサーション層。TASK-78）tests
+// expect and assert (the assertion layer) tests
 // ============================================================================
 
-test "parseExpectExpr: 正常系（cmp 4演算子 / contains / digest エイリアス / 負数小数）" {
+test "parseExpectExpr: the valid cases (the four comparison operators, contains, the digest alias, and a negative fraction)" {
     {
         var it = std.mem.tokenizeAny(u8, "fb crc=ABCD1234", " \t");
         const e = parseExpectExpr(&it).?;
@@ -3848,14 +3848,14 @@ test "parseExpectExpr: 正常系（cmp 4演算子 / contains / digest エイリ�
         try testing.expectEqual(CmpOp.lt, e.form.cmp.op);
     }
     {
-        // 負数・小数 value（op より後は全部 value）
+        // a negative and a fractional value (everything after the op is the value)
         var it = std.mem.tokenizeAny(u8, "audio rms>-0.5", " \t");
         const e = parseExpectExpr(&it).?;
         try testing.expectEqualStrings("rms", e.form.cmp.key);
         try testing.expectEqualStrings("-0.5", e.form.cmp.value);
     }
     {
-        // `expect digest fb ...` エイリアス（第2トークン digest を読み飛ばす）
+        // the `expect digest fb ...` alias (the second token, digest, is skipped)
         var it = std.mem.tokenizeAny(u8, "digest fb crc=ABCD", " \t");
         const e = parseExpectExpr(&it).?;
         try testing.expectEqualStrings("fb", e.probe);
@@ -3869,19 +3869,19 @@ test "parseExpectExpr: 正常系（cmp 4演算子 / contains / digest エイリ�
     }
 }
 
-test "parseExpectExpr: 異常系は null（fail-fast: op 欠落・空・余剰・! 単独）" {
+test "parseExpectExpr: the invalid cases give null (failing fast on a missing op, an empty value, a surplus token, or a bare !)" {
     const bad = [_][]const u8{
-        "fb crcABCD", // op 記号無し
-        "fb", // 式無し
-        "", // probe 無し
-        "fb =5", // key 空
-        "fb crc=", // value 空
-        "fb crc!5", // `!` 単独（`=` が続かない）
-        "fb crc=A extra", // 余剰トークン
-        "fb contains", // substr 欠落
-        "fb contains a b", // substr 余剰
-        "digest", // エイリアス後に probe 無し
-        "digest fb", // エイリアス後 probe だけで式無し
+        "fb crcABCD", // no op symbol
+        "fb", // no expression
+        "", // no probe
+        "fb =5", // an empty key
+        "fb crc=", // an empty value
+        "fb crc!5", // a bare `!` (with no `=` following)
+        "fb crc=A extra", // a surplus token
+        "fb contains", // a missing substr
+        "fb contains a b", // a surplus substr
+        "digest", // no probe after the alias
+        "digest fb", // only a probe after the alias, with no expression
     };
     for (bad) |s| {
         var it = std.mem.tokenizeAny(u8, s, " \t");
@@ -3889,59 +3889,59 @@ test "parseExpectExpr: 異常系は null（fail-fast: op 欠落・空・余剰�
     }
 }
 
-test "findKeyValue: top-level 抽出 / prefix 衝突防止 / ネスト・JSON 非抽出" {
+test "findKeyValue: extracting at the top level, preventing a prefix collision, and not extracting from nesting or JSON" {
     const audio = "rms=0.5000 peak=0.7000 f0=440.0 silent=0 frames=4096";
     try testing.expectEqualStrings("0.5000", findKeyValue(audio, "rms").?);
     try testing.expectEqualStrings("440.0", findKeyValue(audio, "f0").?);
     try testing.expectEqualStrings("4096", findKeyValue(audio, "frames").?);
     try testing.expectEqualStrings("0", findKeyValue(audio, "silent").?);
-    // prefix 衝突: "f" は f0=/frames= を誤マッチしない（tok[key.len]=='=' 要求）
+    // a prefix collision: "f" does not wrongly match f0= or frames= (thanks to requiring tok[key.len]=='=')
     try testing.expect(findKeyValue(audio, "f") == null);
     try testing.expect(findKeyValue(audio, "nope") == null);
 
-    // ネスト（canvas 風）: top-level layers/comp は拾える、内側 crc/nz は漏れない
+    // nesting (canvas-like): the top-level layers and comp are picked up, and the inner crc and nz do not leak
     const canvas = "32x32 layers=2 selected=0 comp=DEADBEEF l0{v=1,op=1.00,crc=CAFEBABE,nz=42}";
     try testing.expectEqualStrings("2", findKeyValue(canvas, "layers").?);
     try testing.expectEqualStrings("DEADBEEF", findKeyValue(canvas, "comp").?);
-    try testing.expect(findKeyValue(canvas, "nz") == null); // ネスト key は漏れない
-    try testing.expect(findKeyValue(canvas, "crc") == null); // 内側 crc は top-level comp とは別
+    try testing.expect(findKeyValue(canvas, "nz") == null); // a nested key does not leak
+    try testing.expect(findKeyValue(canvas, "crc") == null); // the inner crc is distinct from the top-level comp
 
-    // JSON（stats 風）: `key=` 形でないので拾わない → contains を使う想定
+    // JSON (stats-like): it is not in `key=` form so it is not picked up → the intent is to use contains
     const json = "{\"frame\":123,\"virtual_fps\":60.0}";
     try testing.expect(findKeyValue(json, "frame") == null);
 }
 
-test "compareValues: 数値/文字列/大小の切り替え" {
-    // 数値 =（0.5 ≒ 0.5000）
+test "compareValues: switching between numeric, string and ordering comparison" {
+    // numeric = (0.5 ≒ 0.5000)
     try testing.expect(compareValues("0.5000", .eq, "0.5"));
     try testing.expect(!compareValues("0.5000", .eq, "0.6"));
-    // 文字列 =（crc hex は非数値 → 完全一致）
+    // string = (a crc hex is non-numeric → an exact match)
     try testing.expect(compareValues("ABCD1234", .eq, "ABCD1234"));
     try testing.expect(!compareValues("ABCD1234", .eq, "ABCD9999"));
     // !=
     try testing.expect(compareValues("ABCD", .ne, "DCBA"));
-    try testing.expect(!compareValues("5", .ne, "5.0")); // 数値等価 → != は false
-    // > <（両辺数値必須）
+    try testing.expect(!compareValues("5", .ne, "5.0")); // numerically equal → so != is false
+    // > and < (both sides must be numeric)
     try testing.expect(compareValues("4096", .gt, "4000"));
     try testing.expect(!compareValues("4096", .gt, "5000"));
     try testing.expect(compareValues("440.0", .lt, "500"));
-    // > < で非数値は fail（両辺 f64 必須）
+    // > and < fail on a non-numeric value (both sides must be f64)
     try testing.expect(!compareValues("ABCD", .gt, "0"));
     try testing.expect(!compareValues("5", .lt, "xyz"));
 }
 
-test "evalExpect: cmp / contains / key 不在" {
+test "evalExpect: a comparison, contains, and a missing key" {
     const audio = "rms=0.5000 peak=0.7000 f0=440.0 silent=0 frames=4096";
     try testing.expect(evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .eq, .key = "silent", .value = "0" } } }));
     try testing.expect(evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .gt, .key = "rms", .value = "0" } } }));
-    try testing.expect(!evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .gt, .key = "nope", .value = "0" } } })); // key 不在 = fail
+    try testing.expect(!evalExpect(audio, .{ .probe = "audio", .form = .{ .cmp = .{ .op = .gt, .key = "nope", .value = "0" } } })); // a missing key = a fail
     try testing.expect(evalExpect(audio, .{ .probe = "audio", .form = .{ .contains = "f0=440.0" } }));
     try testing.expect(!evalExpect(audio, .{ .probe = "audio", .form = .{ .contains = "nonexistent" } }));
 }
 
-test "expect replay: expect_failures が 成功=据置 / 失敗=+1 / 未知probe=+1（EOF 未到達で exit 回避）" {
+test "expect under replay: expect_failures holds on success, and rises by one on a failure and on an unknown probe (avoiding the exit by never reaching EOF)" {
     resetForTest(); // mode=.replay
-    // 既知 fb フレーム（2x2）を用意して crc を確定
+    // Prepare a known fb frame (2x2) to settle the crc
     var px = [_]u32{ 0xFF000000, 0xFF000000, 0xFF000000, 0xFF0000FF };
     frame_pixels = px[0..];
     frame_w = 2;
@@ -3951,22 +3951,22 @@ test "expect replay: expect_failures が 成功=据置 / 失敗=+1 / 未知probe
     const crc = png.crc32(std.mem.sliceAsBytes(px[0..4]));
 
     var sbuf: [256]u8 = undefined;
-    // 正 crc(pass)→step / 偽 crc(fail)→step / 未知 probe(fail)→step。
-    // **EOF/quit に到達させない**（step で止め、最後は pollGate を呼ばない）ことで replayExitIfFailed の exit を踏まない。
+    // A correct crc (pass) → step / a wrong crc (fail) → step / an unknown probe (fail) → step.
+    // **Do not let it reach EOF or quit** (stop at step, and do not call pollGate at the end), which avoids replayExitIfFailed's exit.
     cmd_buf = std.fmt.bufPrint(&sbuf, "expect fb crc={X:0>8}\nstep 1\nexpect fb crc=00000000\nstep 1\nexpect nosuch x=1\nstep 1\n", .{crc}) catch unreachable;
     cursor = 0;
 
-    try testing.expect(pollGate(true)); // frame1: 正 crc(pass) → step
+    try testing.expect(pollGate(true)); // frame1: the correct crc (pass) → step
     try testing.expectEqual(@as(usize, 0), expect_failures);
-    try testing.expect(pollGate(true)); // frame2: 偽 crc(fail) → step
+    try testing.expect(pollGate(true)); // frame2: a wrong crc (fail) → step
     try testing.expectEqual(@as(usize, 1), expect_failures);
-    try testing.expect(pollGate(true)); // frame3: 未知 probe(fail) → step
+    try testing.expect(pollGate(true)); // frame3: an unknown probe (fail) → step
     try testing.expectEqual(@as(usize, 2), expect_failures);
-    // ここで pollGate を再度呼ぶと EOF → replayExitIfFailed で exit(1) するので**呼ばない**。
-    expect_failures = 0; // 次テストへの漏れ防止（明示。resetForTest も後続で行う）
+    // Calling pollGate again here would hit EOF and exit(1) through replayExitIfFailed, so **it is not called**.
+    expect_failures = 0; // Preventing a leak into the next test (explicitly; resetForTest follows as well)
 }
 
-test "expect live: ok/fail 行が resp_buf に積まれる / live は記帳せず assert も exit しない" {
+test "expect under live: the ok and fail lines go onto resp_buf, live records nothing, and assert does not exit either" {
     resetForTest();
     mode = .live;
     resp_buf.clearRetainingCapacity();
@@ -3989,7 +3989,7 @@ test "expect live: ok/fail 行が resp_buf に積まれる / live は記帳せ�
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "ok fb crc="));
     resp_buf.clearRetainingCapacity();
 
-    // fail（actual= 付き）。live なので expect_failures は増えない
+    // a fail (with actual= attached). Being live, expect_failures does not rise
     {
         var it = std.mem.tokenizeAny(u8, "fb crc=00000000", " \t");
         handleExpect(&it, false);
@@ -3998,7 +3998,7 @@ test "expect live: ok/fail 行が resp_buf に積まれる / live は記帳せ�
     try testing.expectEqual(@as(usize, 0), expect_failures);
     resp_buf.clearRetainingCapacity();
 
-    // assert + 未知 probe も live では exit せず fail 行 + 理由のみ
+    // assert with an unknown probe does not exit under live either, and gives only a fail line plus the reason
     {
         var it = std.mem.tokenizeAny(u8, "nosuch x=1", " \t");
         handleExpect(&it, true);
@@ -4008,7 +4008,7 @@ test "expect live: ok/fail 行が resp_buf に積まれる / live は記帳せ�
 }
 
 // ============================================================================
-// action（probe 対称の高レベル操作。TASK-62.1）tests
+// action (the high-level operation symmetrical with a probe) tests
 // ============================================================================
 
 const TestActionCtx = struct {
@@ -4036,38 +4036,38 @@ fn testActionErr(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return error.Boom;
 }
 
-test "firstLine: 最初の \\r/\\n の手前で切る（無ければ全体・callback の複数行返却を防御）" {
+test "firstLine: cuts at the first CR or LF (returning the whole thing when there is none, defending against a callback returning several lines)" {
     try testing.expectEqualStrings("abc", firstLine("abc\ndef"));
     try testing.expectEqualStrings("abc", firstLine("abc\r\ndef"));
     try testing.expectEqualStrings("abc", firstLine("abc"));
     try testing.expectEqualStrings("", firstLine("\nabc"));
 }
 
-test "registerAction: disabled 時 no-op（回帰ゼロ）" {
+test "registerAction: a no-op while disabled (zero regression)" {
     resetForTest();
     mode = .disabled;
-    action_registry.resetForTest(); // enabled=false（harness.resetForTest はテスト既定で setEnabled する）
+    action_registry.resetForTest(); // enabled=false (harness.resetForTest calls setEnabled as the tests' default)
     var c = TestActionCtx{};
     registerAction(.{ .name = "x", .ctx = &c, .run = testActionRun });
     try testing.expectEqual(@as(usize, 0), action_registry.actionCount());
 }
 
-test "registerAction: 同名上書き / 不正名（空・空白・;・改行）拒否 / 満杯 skip" {
+test "registerAction: the same name overwrites, an invalid name (empty, whitespace, ;, a newline) is rejected, and a full registry is skipped" {
     resetForTest();
     var c1 = TestActionCtx{};
     var c2 = TestActionCtx{};
     registerAction(.{ .name = "a", .ctx = &c1, .run = testActionRun });
-    registerAction(.{ .name = "a", .ctx = &c2, .run = testActionRun }); // 同名上書き
+    registerAction(.{ .name = "a", .ctx = &c2, .run = testActionRun }); // the same name overwrites
     try testing.expectEqual(@as(usize, 1), action_registry.actionCount());
     try testing.expectEqual(@as(*anyopaque, &c2), findAction("a").?.ctx);
 
-    registerAction(.{ .name = "", .ctx = &c1, .run = testActionRun }); // 空名
-    registerAction(.{ .name = "b c", .ctx = &c1, .run = testActionRun }); // 空白混入
-    registerAction(.{ .name = "b;c", .ctx = &c1, .run = testActionRun }); // ; 混入
-    registerAction(.{ .name = "b\nc", .ctx = &c1, .run = testActionRun }); // 改行混入
-    try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // いずれも拒否され増えない
+    registerAction(.{ .name = "", .ctx = &c1, .run = testActionRun }); // an empty name
+    registerAction(.{ .name = "b c", .ctx = &c1, .run = testActionRun }); // whitespace mixed in
+    registerAction(.{ .name = "b;c", .ctx = &c1, .run = testActionRun }); // a `;` mixed in
+    registerAction(.{ .name = "b\nc", .ctx = &c1, .run = testActionRun }); // a newline mixed in
+    try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // all are rejected and the count does not rise
 
-    // 満杯 skip: "a" + MAX_ACTIONS 件以上を登録しても MAX_ACTIONS(=48) で頭打ち
+    // a full registry is skipped: registering "a" plus MAX_ACTIONS or more still tops out at MAX_ACTIONS (=48)
     var name_bufs: [action_registry.MAX_ACTIONS + 4][8]u8 = undefined;
     for (&name_bufs, 0..) |*nb, i| {
         const nm = std.fmt.bufPrint(nb, "act{d}", .{i}) catch unreachable;
@@ -4076,7 +4076,7 @@ test "registerAction: 同名上書き / 不正名（空・空白・;・改行）
     try testing.expectEqual(@as(usize, action_registry.MAX_ACTIONS), action_registry.actionCount());
 }
 
-test "action dispatch: raw args 透過（再トークン化しない・連続空白/JSON風ペイロード保持）" {
+test "action dispatch: raw args pass through (never re-tokenised, keeping consecutive whitespace and a JSON-like payload)" {
     resetForTest();
     var c = TestActionCtx{};
     registerAction(.{ .name = "foo", .ctx = &c, .run = testActionRun });
@@ -4091,16 +4091,16 @@ test "action dispatch: raw args 透過（再トークン化しない・連続空
 
     try testing.expect(pollGate(true));
     try testing.expectEqual(@as(usize, 1), c.calls);
-    try testing.expectEqualStrings("1 2  3", c.lastArgs()); // 連続空白が潰れない = 再トークン化していない
+    try testing.expectEqualStrings("1 2  3", c.lastArgs()); // consecutive whitespace is not collapsed = it was not re-tokenised
 
     try testing.expect(pollGate(true));
     try testing.expectEqual(@as(usize, 2), c.calls);
-    try testing.expectEqualStrings("key=val {\"a\":1,\"b\":2}", c.lastArgs()); // JSON風ペイロードもそのまま
+    try testing.expectEqualStrings("key=val {\"a\":1,\"b\":2}", c.lastArgs()); // a JSON-like payload comes through as it stands too
 
     try testing.expect(!pollGate(true)); // quit
 }
 
-test "action: 未知 action / 名前欠落 / run()エラー は記帳（expect_failures 加算・EOF未到達で exit回避）" {
+test "action: an unknown action, a missing name and an error from run() are recorded (incrementing expect_failures, avoiding the exit by never reaching EOF)" {
     resetForTest();
     var c = TestActionCtx{};
     registerAction(.{ .name = "boom", .ctx = &c, .run = testActionErr });
@@ -4114,17 +4114,17 @@ test "action: 未知 action / 名前欠落 / run()エラー は記帳（expect_f
         \\step 1
     ;
 
-    try testing.expect(pollGate(true)); // 未知 action
+    try testing.expect(pollGate(true)); // an unknown action
     try testing.expectEqual(@as(usize, 1), expect_failures);
-    try testing.expect(pollGate(true)); // 名前欠落
+    try testing.expect(pollGate(true)); // a missing name
     try testing.expectEqual(@as(usize, 2), expect_failures);
-    try testing.expect(pollGate(true)); // run() エラー（クラッシュしない）
+    try testing.expect(pollGate(true)); // an error from run() (it does not crash)
     try testing.expectEqual(@as(usize, 3), expect_failures);
-    // ここで pollGate を再度呼ぶと EOF → replayExitIfFailed で exit(1) するので**呼ばない**。
-    expect_failures = 0; // 次テストへの漏れ防止
+    // Calling pollGate again here would hit EOF and exit(1) through replayExitIfFailed, so **it is not called**.
+    expect_failures = 0; // preventing a leak into the next test
 }
 
-test "action live: 成功は bare `<name> <msg>`、失敗は `fail <name> <msg>`（drive 検知）/ live は記帳しない" {
+test "action under live: success is a bare `<name> <msg>` and failure is `fail <name> <msg>` (which drive detects), and live records nothing" {
     resetForTest();
     mode = .live;
     resp_buf.clearRetainingCapacity();
@@ -4145,7 +4145,7 @@ test "action live: 成功は bare `<name> <msg>`、失敗は `fail <name> <msg>`
         handleAction(&it);
     }
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail nosuch unknown action"));
-    try testing.expectEqual(@as(usize, 0), expect_failures); // live は記帳しない
+    try testing.expectEqual(@as(usize, 0), expect_failures); // live does not record
 }
 
 fn testActionErrWithDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -4165,7 +4165,7 @@ fn testActionErrMaybeDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerr
     return error.Boom;
 }
 
-test "action structured error: live 失敗行に code=/next= 追記 / 未セット時は従来 bit 一致 / fail 行頭不変" {
+test "an action's structured error: code= and next= are appended to a live failure line, it is bit-identical to before when unset, and the leading fail never changes" {
     resetForTest();
     mode = .live;
     resp_buf.clearRetainingCapacity();
@@ -4179,12 +4179,12 @@ test "action structured error: live 失敗行に code=/next= 追記 / 未セッ�
         var it = std.mem.tokenizeAny(u8, "boom", " \t");
         handleAction(&it);
     }
-    // 行頭 `fail ` 不変 → scripts/drive の fail 行頭スキャン回帰（AC#2）
+    // the leading `fail ` never changes → a regression check on scripts/drive's leading-`fail ` scan
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail boom "));
     try testing.expectEqualStrings("fail boom Boom code=file_not_found next=check path or use save first\n", resp_buf.items);
     resp_buf.clearRetainingCapacity();
 
-    // detail 未セット時は従来形式と bit 一致（code=/next= を一切付けない）
+    // with no detail set it is bit-identical to the old format (no code= or next= at all)
     {
         var it = std.mem.tokenizeAny(u8, "plain", " \t");
         handleAction(&it);
@@ -4192,10 +4192,10 @@ test "action structured error: live 失敗行に code=/next= 追記 / 未セッ�
     try testing.expectEqualStrings("fail plain Boom\n", resp_buf.items);
     try testing.expect(std.mem.indexOf(u8, resp_buf.items, "code=") == null);
     try testing.expect(std.mem.indexOf(u8, resp_buf.items, "next=") == null);
-    try testing.expectEqual(@as(usize, 0), expect_failures); // live は記帳しない
+    try testing.expectEqual(@as(usize, 0), expect_failures); // live does not record
 }
 
-test "action structured error: dispatch 毎クリアで前回 detail が次の失敗に漏れない" {
+test "an action's structured error: clearing on every dispatch stops the previous detail leaking into the next failure" {
     resetForTest();
     mode = .live;
     resp_buf.clearRetainingCapacity();
@@ -4218,7 +4218,7 @@ test "action structured error: dispatch 毎クリアで前回 detail が次の�
     try testing.expectEqualStrings("fail maybe Boom\n", resp_buf.items);
 }
 
-test "action structured error: next の空白保持 / sanitize（改行→_）" {
+test "an action's structured error: next keeps its whitespace, and sanitising turns a newline into _" {
     resetForTest();
     mode = .live;
     resp_buf.clearRetainingCapacity();
@@ -4243,10 +4243,10 @@ test "action structured error: next の空白保持 / sanitize（改行→_）" 
     try testing.expectEqualStrings("fail x Bad code=a_b_c next=use add_layer or 0..N-1\n", resp_buf.items);
 }
 
-test "action structured error: replay/live 両 wire の suffix 形式（未セットは空）" {
+test "an action's structured error: the suffix form on both the replay and live wires (empty when unset)" {
     resetForTest();
     var sbuf: [128]u8 = undefined;
-    // 未セット → 空（従来 bit 一致の根拠）
+    // none set → empty (the grounds for it being bit-identical to before)
     try testing.expectEqualStrings("", actionErrorDetailSuffix(&sbuf));
 
     action_registry.setActionErrorDetail("file_not_found", "check path or use save first");
@@ -4254,14 +4254,14 @@ test "action structured error: replay/live 両 wire の suffix 形式（未セ�
     try testing.expectEqualStrings(" code=file_not_found next=check path or use save first", suf);
 
     // live: `fail <name> <msg>` + suffix / replay: `[harness] action <name> FAILED <msg>` + suffix
-    // （同一 suffix を両 sink が共有。reportAction が組み立てる）
+    // (both sinks share the one suffix, which reportAction assembles)
     try testing.expect(std.mem.endsWith(u8, "fail boom Boom code=file_not_found next=check path or use save first", suf));
     try testing.expect(std.mem.endsWith(u8, "[harness] action boom FAILED Boom code=file_not_found next=check path or use save first", suf));
-    try testing.expect(std.mem.startsWith(u8, "fail boom Boom", "fail ")); // drive 行頭スキャン
+    try testing.expect(std.mem.startsWith(u8, "fail boom Boom", "fail ")); // drive's leading-token scan
 }
 
 // ============================================================================
-// capabilities probe（登録済み probe・action の内省列挙。TASK-62.4）tests
+// the capabilities probe (introspective listing of the registered probes and actions) tests
 // ============================================================================
 
 fn testProbeSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -4269,22 +4269,22 @@ fn testProbeSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u
     return allocator.dupe(u8, "snap");
 }
 
-/// capabilities JSON をパースし `std.json.Parsed(std.json.Value)` を返す（呼び出し側が `deinit()`）。
+/// Parses the capabilities JSON and returns a `std.json.Parsed(std.json.Value)` (the caller calls `deinit()`).
 fn parseCapabilities(payload: []const u8) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
 }
 
-test "capabilities: 予約名で登録拒否" {
+test "capabilities: registration is refused for a reserved name" {
     resetForTest();
     var c = TestProbeCtx{ .value = 1 };
     registerProbe(.{ .name = "capabilities", .ctx = &c, .digest = testProbeDigest });
     try testing.expectEqual(@as(usize, 0), probe_count);
 }
 
-test "capabilities: custom probe/action 0件 → 組み込み7 probe + actions:[]" {
+test "capabilities: with no custom probe or action, the 7 built-in probes plus actions:[]" {
     resetForTest();
     var buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
-    _ = &buf; // 使わない（capabilities_buf を直接使う）
+    _ = &buf; // unused (capabilities_buf is used directly)
     const payload = formatCapabilitiesPayload(&capabilities_buf);
 
     var parsed = try parseCapabilities(payload);
@@ -4302,22 +4302,22 @@ test "capabilities: custom probe/action 0件 → 組み込み7 probe + actions:[
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
 }
 
-test "capabilities: custom probe/action がフィールド値・登録順で現れる" {
+test "capabilities: a custom probe and action appear with their field values, in registration order" {
     resetForTest();
     var c1 = TestProbeCtx{ .value = 1 };
     var c2 = TestProbeCtx{ .value = 2 };
     registerProbe(.{ .name = "p1", .ctx = &c1, .ext = "png", .desc = "d1", .digest = testProbeDigest }); // digest-only
-    registerProbe(.{ .name = "p2", .ctx = &c2, .ext = "json", .snapshot = testProbeSnapshot }); // snapshot-only・desc省略
+    registerProbe(.{ .name = "p2", .ctx = &c2, .ext = "json", .snapshot = testProbeSnapshot }); // snapshot-only, with desc omitted
     var ac1 = TestActionCtx{};
     var ac2 = TestActionCtx{};
     registerAction(.{ .name = "a1", .ctx = &ac1, .run = testActionRun, .desc = "ad1" });
-    registerAction(.{ .name = "a2", .ctx = &ac2, .run = testActionRun }); // desc省略
+    registerAction(.{ .name = "a2", .ctx = &ac2, .run = testActionRun }); // desc omitted
 
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();
     const root = parsed.value.object;
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 9), probes_arr.len); // 組み込み7 + custom2
+    try testing.expectEqual(@as(usize, 9), probes_arr.len); // the 7 built in plus the 2 custom
 
     const p1 = probes_arr[7].object;
     try testing.expectEqualStrings("p1", p1.get("name").?.string);
@@ -4341,7 +4341,7 @@ test "capabilities: custom probe/action がフィールド値・登録順で現�
     try testing.expectEqualStrings("", actions_arr[1].object.get("desc").?.string);
 }
 
-test "capabilities: desc 規約違反（禁止文字・200 bytes 超）は登録時に空文字化" {
+test "capabilities: a desc breaking the rules (a forbidden character, or over 200 bytes) is emptied at registration" {
     resetForTest();
     var c = TestProbeCtx{ .value = 1 };
     registerProbe(.{ .name = "badp", .ctx = &c, .digest = testProbeDigest, .desc = "bad\"desc" });
@@ -4356,28 +4356,28 @@ test "capabilities: desc 規約違反（禁止文字・200 bytes 超）は登録
     try testing.expectEqual(@as(usize, 0), findAction("bada").?.desc.len);
 }
 
-test "capabilities: name の不正文字（\" / 制御文字）はエントリを省略し truncated=true（手前の正常エントリは残る）" {
+test "capabilities: an invalid character in name (a \" or a control character) leaves the entry out and gives truncated=true (the valid entries before it survive)" {
     resetForTest();
     var c1 = TestProbeCtx{ .value = 1 };
     var c2 = TestProbeCtx{ .value = 2 };
-    registerProbe(.{ .name = "good1", .ctx = &c1, .digest = testProbeDigest }); // 正常（先に登録）
-    registerProbe(.{ .name = "bad\"name", .ctx = &c2, .digest = testProbeDigest }); // " を含む
-    try testing.expectEqual(@as(usize, 2), probe_count); // 登録自体は成立する
+    registerProbe(.{ .name = "good1", .ctx = &c1, .digest = testProbeDigest }); // valid (registered first)
+    registerProbe(.{ .name = "bad\"name", .ctx = &c2, .digest = testProbeDigest }); // holds a `"`
+    try testing.expectEqual(@as(usize, 2), probe_count); // the registration itself does succeed
 
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 8), probes_arr.len); // 組み込み7 + good1（bad は省略）
+    try testing.expectEqual(@as(usize, 8), probes_arr.len); // the 7 built in plus good1 (bad is left out)
     try testing.expectEqualStrings("good1", probes_arr[7].object.get("name").?.string);
 }
 
-test "capabilities: action 名の制御文字（NUL。isValidActionName は通過するが JSON では不正）はエントリ省略+truncated" {
+test "capabilities: a control character in an action name (a NUL, which passes isValidActionName but is invalid in JSON) leaves the entry out and gives truncated" {
     resetForTest();
     var ac = TestActionCtx{};
     registerAction(.{ .name = "bad\x00name", .ctx = &ac, .run = testActionRun });
-    try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // registerAction 自体は成立する
+    try testing.expectEqual(@as(usize, 1), action_registry.actionCount()); // registerAction itself does succeed
 
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();
@@ -4386,7 +4386,7 @@ test "capabilities: action 名の制御文字（NUL。isValidActionName は通�
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
 }
 
-test "capabilities: ext の不正文字（tab）もエントリを省略し truncated=true" {
+test "capabilities: an invalid character in ext (a tab) also leaves the entry out and gives truncated=true" {
     resetForTest();
     var c = TestProbeCtx{ .value = 1 };
     registerProbe(.{ .name = "p", .ctx = &c, .ext = "bad\text", .digest = testProbeDigest });
@@ -4395,10 +4395,10 @@ test "capabilities: ext の不正文字（tab）もエントリを省略し trun
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
-    try testing.expectEqual(@as(usize, 7), root.get("probes").?.array.items.len); // 組み込み7のみ（p は省略）
+    try testing.expectEqual(@as(usize, 7), root.get("probes").?.array.items.len); // the 7 built in only (p is left out)
 }
 
-test "capabilities: MIN_CAPABILITIES_BUF_LEN ちょうどの buf でもフェイルセーフで valid JSON + truncated=true" {
+test "capabilities: even a buf of exactly MIN_CAPABILITIES_BUF_LEN gives valid JSON plus truncated=true, by the fail-safe" {
     resetForTest();
     var small_buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
     const payload = formatCapabilitiesPayload(&small_buf);
@@ -4411,24 +4411,24 @@ test "capabilities: MIN_CAPABILITIES_BUF_LEN ちょうどの buf でもフェイ
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
 }
 
-test "capabilities: buf 境界の全数チェック（probes は収まるが `,\"actions\":[` が収まらない等の境界も含め常に valid JSON）" {
-    // codex レビューで発見された実バグ（"actions" セクション開始の追記失敗を無視し invalid JSON になる）の
-    // 回帰テスト。ピンポイントの magic number ではなく MIN_CAPABILITIES_BUF_LEN から広い範囲を1バイト刻みで
-    // 網羅し、どの buf サイズでも必ず valid JSON になることを固定する。
+test "capabilities: an exhaustive check of the buf boundaries (always valid JSON, including the boundary where probes fit but `,\"actions\":[` does not)" {
+    // A regression test for the real bug the review found (ignoring a failed append of the "actions" section start and
+    // producing invalid JSON). Rather than one pinpoint magic number, it sweeps a wide range from MIN_CAPABILITIES_BUF_LEN
+    // one byte at a time, pinning that every buf size gives valid JSON.
     resetForTest();
     var big_buf: [MIN_CAPABILITIES_BUF_LEN + 700]u8 = undefined;
     var n: usize = MIN_CAPABILITIES_BUF_LEN;
     while (n <= big_buf.len) : (n += 1) {
         const payload = formatCapabilitiesPayload(big_buf[0..n]);
         var parsed = parseCapabilities(payload) catch |err| {
-            std.debug.print("buf len={d} で invalid JSON: {s}\npayload={s}\n", .{ n, @errorName(err), payload });
+            std.debug.print("invalid JSON at buf len={d}: {s}\npayload={s}\n", .{ n, @errorName(err), payload });
             return err;
         };
         parsed.deinit();
     }
 }
 
-test "capabilities: digestPayload 経由（digest capabilities）でも同じ JSON が得られる" {
+test "capabilities: the same JSON comes back through digestPayload (digest capabilities) too" {
     resetForTest();
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     switch (digestPayload("capabilities", &buf)) {
@@ -4441,17 +4441,17 @@ test "capabilities: digestPayload 経由（digest capabilities）でも同じ JS
     }
 }
 
-test "capabilities: pollGate 経由（digest capabilities コマンド）でも例外なく処理される" {
+test "capabilities: it is handled without exception through pollGate (the digest capabilities command) too" {
     resetForTest();
     cmd_buf = "digest capabilities";
-    try testing.expect(!pollGate(true)); // EOF → replay 終了（expect_failures=0 なので exit しない）
+    try testing.expect(!pollGate(true)); // EOF → the replay ends (and does not exit, expect_failures being 0)
 }
 
 // ============================================================================
-// null runtime query（TASK-165）— 一次 buffer は platform_null。ここは互換 setter/query のみ。
+// the null runtime query — the primary buffer is platform_null's. Only the compatibility setter and query live here.
 // ============================================================================
 
-test "setHeadlessActive / isHeadlessActive: platform 互換 query" {
+test "setHeadlessActive and isHeadlessActive: the platform compatibility query" {
     resetForTest();
     defer resetForTest();
     try testing.expect(!isHeadlessActive());
@@ -4462,10 +4462,10 @@ test "setHeadlessActive / isHeadlessActive: platform 互換 query" {
 }
 
 // ============================================================================
-// synthetic capture source（TASK-49.5）tests
+// the synthetic capture source tests
 // ============================================================================
 
-test "isCaptureSyntheticActive: 既定（env 未設定）では harness の有効/無効に関わらず false" {
+test "isCaptureSyntheticActive: by default (the environment unset) it is false whether harness is enabled or not" {
     resetForTest(); // mode=.replay
     defer resetForTest();
     try testing.expect(!isCaptureSyntheticActive());
@@ -4473,7 +4473,7 @@ test "isCaptureSyntheticActive: 既定（env 未設定）では harness の有�
     try testing.expect(!isCaptureSyntheticActive());
 }
 
-test "isCaptureSyntheticActive: requested かつ harness 有効（replay/live）のときのみ true" {
+test "isCaptureSyntheticActive: true only when it is requested and harness is enabled (replay or live)" {
     resetForTest(); // mode=.replay
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4481,13 +4481,13 @@ test "isCaptureSyntheticActive: requested かつ harness 有効（replay/live）
     mode = .live;
     try testing.expect(isCaptureSyntheticActive());
     mode = .disabled;
-    try testing.expect(!isCaptureSyntheticActive()); // requested でも harness 無効なら false
+    try testing.expect(!isCaptureSyntheticActive()); // false even when requested, if harness is disabled
 }
 
-test "capture コマンド: synthetic 無効時は fail-fast（warn のみ、状態変化なし）" {
+test "the capture command: while synthetic is disabled it fails fast (a warning only, with no state change)" {
     resetForTest();
     defer resetForTest();
-    // capture_synthetic_requested は既定 false のまま = synthetic 無効
+    // capture_synthetic_requested stays at its default of false = synthetic is disabled
     cmd_buf = "capture video open 8 8\ncapture audio open\nquit";
     while (pollGate(true)) {}
     try testing.expect(synth_video == null);
@@ -4496,7 +4496,7 @@ test "capture コマンド: synthetic 無効時は fail-fast（warn のみ、状
     try testing.expectEqualStrings("video_open=0 video_w=0 video_h=0 video_frame=0 audio_open=0 audio_frames=0 audio_peak=0.0000", formatCapturePayload(&buf));
 }
 
-test "capture video: video_frame は harness の仮想クロック(frame_index)に連動する（present で進む）" {
+test "capture video: video_frame follows harness's virtual clock (frame_index), advancing on a present" {
     resetForTest();
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4504,9 +4504,9 @@ test "capture video: video_frame は harness の仮想クロック(frame_index)�
     while (pollGate(true)) {}
     try testing.expect(synth_video != null);
 
-    // frame_index は `step` コマンド自体ではなく app の onPresent() 呼び出しで進む契約
-    // （仮想クロック節参照）。ここでは app 無しで直接3フレーム分 present し、仮想クロックが
-    // 進んだことと `capture` probe の `video_frame` がそれに連動することを確認する。
+    // The contract is that frame_index advances on the application's onPresent() call, not on the `step` command itself
+    // (see the virtual clock section). Here, with no application, three frames are presented directly and the virtual clock is
+    // confirmed to have advanced, along with the `capture` probe's `video_frame` following it.
     const px = [_]u32{0xFF000000};
     var i: usize = 0;
     while (i < 3) : (i += 1) {
@@ -4522,7 +4522,7 @@ test "capture video: video_frame は harness の仮想クロック(frame_index)�
     synth_video = null;
 }
 
-test "capture video open: 状態が digest に反映される（close 前）" {
+test "capture video open: the state is reflected in the digest (before the close)" {
     resetForTest();
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4532,7 +4532,7 @@ test "capture video open: 状態が digest に反映される（close 前）" {
     try testing.expectEqualStrings("video_open=1 video_w=16 video_h=8 video_frame=0 audio_open=0 audio_frames=0 audio_peak=0.0000", formatCapturePayload(&buf));
 }
 
-test "capture video open: width/height=0 は ConfigFailed で synth_video は null のまま" {
+test "capture video open: width or height of 0 gives ConfigFailed and leaves synth_video null" {
     resetForTest();
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4541,7 +4541,7 @@ test "capture video open: width/height=0 は ConfigFailed で synth_video は nu
     try testing.expect(synth_video == null);
 }
 
-test "capture video open: 2回目の open は前の device を閉じてから開き直す（リーク無し）" {
+test "capture video open: a second open closes the previous device before reopening (with no leak)" {
     resetForTest();
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4551,7 +4551,7 @@ test "capture video open: 2回目の open は前の device を閉じてから開
     try testing.expectEqual(@as(u32, 4), synth_video.?.width);
 }
 
-test "capture video: snapshot は video 未 open なら skip（present 前 fb skip と同じ思想）" {
+test "capture video: a snapshot is skipped while video is not open (the same thinking as skipping fb before a present)" {
     resetForTest();
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4560,7 +4560,7 @@ test "capture video: snapshot は video 未 open なら skip（present 前 fb sk
     try testing.expect(synth_video == null);
 }
 
-test "capture audio: open→close で probe 状態がリセットされる（実時間検証は capture_synthetic.zig 側の単体テストで実施）" {
+test "capture audio: an open then a close resets the probe state (the real-time check lives in capture_synthetic.zig's own unit test)" {
     resetForTest();
     defer resetForTest();
     capture_synthetic_requested = true;
@@ -4571,11 +4571,11 @@ test "capture audio: open→close で probe 状態がリセットされる（実
     const payload = formatCapturePayload(&buf);
     try testing.expect(std.mem.indexOf(u8, payload, "audio_open=1") != null);
 
-    resetForTest(); // クリーンアップ（stop+join+close）が安全に終わることを確認
+    resetForTest(); // Confirm that the cleanup (stop, join, close) finishes safely
     try testing.expect(synth_audio == null);
 }
 
-test "capabilities: capture probe が組み込み一覧に含まれる" {
+test "capabilities: the capture probe is in the built-in list" {
     resetForTest();
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();
@@ -4592,7 +4592,7 @@ test "capabilities: capture probe が組み込み一覧に含まれる" {
     try testing.expect(found);
 }
 
-test "capabilities: gamepad probe が組み込み一覧に含まれる" {
+test "capabilities: the gamepad probe is in the built-in list" {
     resetForTest();
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();
@@ -4609,7 +4609,7 @@ test "capabilities: gamepad probe が組み込み一覧に含まれる" {
     try testing.expect(found);
 }
 
-test "capabilities: midi probe は digest 専用で組み込み一覧に含まれる" {
+test "capabilities: the midi probe is digest-only and is in the built-in list" {
     resetForTest();
     var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
     defer parsed.deinit();
@@ -4627,14 +4627,14 @@ test "capabilities: midi probe は digest 専用で組み込み一覧に含ま�
 }
 
 // ============================================================================
-// capabilities args シグネチャ（TASK-88.1）tests
+// the capabilities args signature tests
 // ============================================================================
 
-test "capabilities: args=null の action/probe → JSON が従来と文字列一致（args フィールド無し）" {
+test "capabilities: an action or probe with args=null gives JSON matching the old form string for string (with no args field)" {
     resetForTest();
     var c = TestProbeCtx{ .value = 1 };
     var ac = TestActionCtx{};
-    // .args 省略（= null）で登録
+    // registered with .args omitted (= null)
     registerProbe(.{ .name = "pnull", .ctx = &c, .ext = "txt", .desc = "pd", .digest = testProbeDigest });
     registerAction(.{ .name = "anull", .ctx = &ac, .run = testActionRun, .desc = "ad" });
 
@@ -4642,10 +4642,10 @@ test "capabilities: args=null の action/probe → JSON が従来と文字列一
     const payload0 = formatCapabilitiesPayload(&capabilities_buf);
     @memcpy(saved[0..payload0.len], payload0);
     const payload = saved[0..payload0.len];
-    // 文字列レベルで "args" キーが一切出ない（フィールド追加のみ方針の回帰ゼロ）
+    // the "args" key does not appear at all, even at the string level (zero regression for the field-addition-only policy)
     try testing.expect(std.mem.indexOf(u8, payload, "\"args\"") == null);
 
-    // エントリ形が従来どおり name/desc（+ probe は ext/snapshot/digest）のみ
+    // the entry shape is name and desc as before (plus ext, snapshot and digest for a probe)
     var parsed = try parseCapabilities(payload);
     defer parsed.deinit();
     const probes_arr = parsed.value.object.get("probes").?.array.items;
@@ -4657,7 +4657,7 @@ test "capabilities: args=null の action/probe → JSON が従来と文字列一
     try testing.expectEqualStrings("ad", a.get("desc").?.string);
     try testing.expect(a.get("args") == null);
 
-    // 明示 .args=null も省略時と bit 一致
+    // an explicit .args=null is bit-identical to omitting it
     resetForTest();
     registerProbe(.{ .name = "pnull", .ctx = &c, .ext = "txt", .desc = "pd", .digest = testProbeDigest, .args = null });
     registerAction(.{ .name = "anull", .ctx = &ac, .run = testActionRun, .desc = "ad", .args = null });
@@ -4665,7 +4665,7 @@ test "capabilities: args=null の action/probe → JSON が従来と文字列一
     try testing.expectEqualStrings(payload, payload2);
 }
 
-test "capabilities: args 付き action → 非デフォルトフィールドのみ emit" {
+test "capabilities: an action with args emits the non-default fields only" {
     resetForTest();
     var ac = TestActionCtx{};
     const specs = [_]ArgSpec{
@@ -4707,10 +4707,10 @@ test "capabilities: args 付き action → 非デフォルトフィールドの�
     try testing.expect(t0.get("min") == null);
     try testing.expect(t0.get("max") == null);
     try testing.expect(t0.get("pattern") == null);
-    try testing.expect(t0.get("variadic") == null); // false は省略
+    try testing.expect(t0.get("variadic") == null); // false is left out
 
     const t1 = args_arr[1].object;
-    // JSON 数値は整数リテラルだと .integer になりうる（0/255）
+    // a JSON number can be .integer when it is an integer literal (0 and 255)
     const min_f: f64 = switch (t1.get("min").?) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
@@ -4732,7 +4732,7 @@ test "capabilities: args 付き action → 非デフォルトフィールドの�
     try testing.expect(t2.get("desc") == null);
 }
 
-test "capabilities: 空 slice → args:[] が現れ null と区別される" {
+test "capabilities: an empty slice makes args:[] appear, distinguishing it from null" {
     resetForTest();
     var ac = TestActionCtx{};
     const empty: []const ArgSpec = &.{};
@@ -4747,41 +4747,41 @@ test "capabilities: 空 slice → args:[] が現れ null と区別される" {
     try testing.expectEqual(@as(usize, 0), a.get("args").?.array.items.len);
 }
 
-test "capabilities: args サニタイズ違反（kind 制御文字 / values に \" / pattern 100B 超）→ warn + args 消失・登録成功" {
+test "capabilities: an args sanitising violation (a control character in kind, a \" in values, a pattern over 100B) warns and drops args, while the registration succeeds" {
     resetForTest();
     var ac = TestActionCtx{};
     var c = TestProbeCtx{ .value = 1 };
 
-    // kind に制御文字
+    // a control character in kind
     const bad_kind = [_]ArgSpec{.{ .name = "x", .kind = "in\tt" }};
     registerAction(.{ .name = "bk", .ctx = &ac, .run = testActionRun, .args = &bad_kind });
     try testing.expect(findAction("bk") != null);
     try testing.expect(findAction("bk").?.args == null);
 
-    // values に "
+    // a `"` in values
     const bad_val = [_]ArgSpec{.{ .name = "x", .kind = "enum", .values = &.{"a\"b"} }};
     registerAction(.{ .name = "bv", .ctx = &ac, .run = testActionRun, .args = &bad_val });
     try testing.expect(findAction("bv") != null);
     try testing.expect(findAction("bv").?.args == null);
 
-    // pattern 100B 超
+    // a pattern over 100B
     const long_pat = [_]u8{'p'} ** (MAX_ARG_PATTERN_LEN + 1);
     const bad_pat = [_]ArgSpec{.{ .name = "x", .kind = "string", .pattern = &long_pat }};
     registerAction(.{ .name = "bp", .ctx = &ac, .run = testActionRun, .args = &bad_pat });
     try testing.expect(findAction("bp") != null);
     try testing.expect(findAction("bp").?.args == null);
 
-    // probe 側も同規則
+    // the same rule on the probe side
     const bad_probe = [_]ArgSpec{.{ .name = "x", .kind = "in\tt" }};
     registerProbe(.{ .name = "bp2", .ctx = &c, .digest = testProbeDigest, .args = &bad_probe });
     try testing.expect(findProbe("bp2") != null);
     try testing.expect(findProbe("bp2").?.args == null);
 
-    // capabilities JSON にも args が載らない（消失後）
+    // args does not reach the capabilities JSON either (once it is gone)
     const payload = formatCapabilitiesPayload(&capabilities_buf);
     try testing.expect(std.mem.indexOf(u8, payload, "\"args\"") == null);
 
-    // min/max の非有限値（NaN/Inf は JSON 数値にならない）→ args 消失・登録成功（codex P2）
+    // a non-finite min or max (NaN and Inf are not JSON numbers) → args is gone and the registration succeeds
     const nan_min = [_]ArgSpec{.{ .name = "x", .kind = "int", .min = std.math.nan(f64) }};
     registerAction(.{ .name = "bnan", .ctx = &ac, .run = testActionRun, .args = &nan_min });
     try testing.expect(findAction("bnan") != null);
@@ -4792,10 +4792,10 @@ test "capabilities: args サニタイズ違反（kind 制御文字 / values に 
     try testing.expect(findProbe("binf").?.args == null);
 }
 
-test "capabilities: 大量 args で buf 溢れても既存 truncated 機構で valid JSON を維持" {
+test "capabilities: even when a great many args overflow the buf, the existing truncated mechanism keeps the JSON valid" {
     resetForTest();
     var ac = TestActionCtx{};
-    // 長大 desc 付き ArgSpec を多数載せ、entry が content_limit に収まらない経路を踏む
+    // Load on many ArgSpecs with a huge desc, to take the path where an entry does not fit within content_limit
     const long_desc = [_]u8{'d'} ** 200;
     var many: [40]ArgSpec = undefined;
     for (&many) |*s| {
@@ -4803,21 +4803,21 @@ test "capabilities: 大量 args で buf 溢れても既存 truncated 機構で v
     }
     registerAction(.{ .name = "huge", .ctx = &ac, .run = testActionRun, .args = &many });
 
-    // 小さめ buf で capabilities を組み立て → 必ず valid JSON
+    // Assemble capabilities with a smallish buf → it must be valid JSON
     var small: [MIN_CAPABILITIES_BUF_LEN + 200]u8 = undefined;
     const payload = formatCapabilitiesPayload(&small);
     var parsed = try parseCapabilities(payload);
     defer parsed.deinit();
-    // truncated か、収まったかのどちらでも JSON として valid であればよい
+    // Whether it truncated or it fitted, all that matters is that it is valid JSON
     _ = parsed.value.object.get("probes");
     _ = parsed.value.object.get("actions");
 }
 
 // ============================================================================
-// MIDI（TASK-115.1・ADR-010）tests
+// MIDI tests
 // ============================================================================
 
-test "MIDI inject: note/cc/note-off の FIFO 順序と state 更新" {
+test "MIDI inject: the FIFO order of note, cc and note-off, and the state update" {
     resetForTest();
     cmd_buf =
         "inject midi note_on 60 100\n" ++
@@ -4849,7 +4849,7 @@ test "MIDI inject: note/cc/note-off の FIFO 順序と state 更新" {
     try testing.expectEqualStrings("60", digest[cc_pos + 7 * 2 ..][0..2]);
 }
 
-test "MIDI inject: note_on velocity 0 は note_off に正規化される" {
+test "MIDI inject: a note_on with velocity 0 is normalised to a note_off" {
     resetForTest();
     cmd_buf = "inject midi note_on 9 0\nstep 1";
     try testing.expect(pollGate(true));
@@ -4866,7 +4866,7 @@ test "MIDI inject: note_on velocity 0 は note_off に正規化される" {
     try testing.expect(std.mem.indexOf(u8, digest, "note_count=0") != null);
 }
 
-test "MIDI inject: 範囲外・未知 event・引数不足は queue/state を変更しない" {
+test "MIDI inject: out of range, an unknown event, and a missing argument leave the queue and state unchanged" {
     resetForTest();
     cmd_buf =
         "inject midi note_on 60 100\n" ++
@@ -4889,7 +4889,7 @@ test "MIDI inject: 範囲外・未知 event・引数不足は queue/state を変
     try testing.expect(std.mem.indexOf(u8, digest, "cc_count=0") != null);
 }
 
-test "MIDI digest: 空状態は固定順序・固定長で 1024B 未満" {
+test "MIDI digest: the empty state is a fixed order and a fixed length, under 1024B" {
     resetForTest();
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     const digest = switch (digestPayload("midi", &buf)) {
@@ -4901,7 +4901,7 @@ test "MIDI digest: 空状態は固定順序・固定長で 1024B 未満" {
     try testing.expect(std.mem.indexOf(u8, digest, " cc_count=0 cc=") != null);
     try testing.expectEqual(@as(usize, 256), digest[digest.len - 256 ..].len);
 
-    // 0/127 note と controller 0/127 を昇順 wire order で出す。
+    // Emit note 0 and 127, and controller 0 and 127, in ascending wire order.
     midi_pressed[0] |= 1;
     midi_pressed[15] |= 0x80;
     midi_cc_values[0] = 0;
@@ -4920,7 +4920,7 @@ test "MIDI digest: 空状態は固定順序・固定長で 1024B 未満" {
     try testing.expectEqualStrings("7F", ordered[cc_pos + 127 * 2 ..][0..2]);
 }
 
-test "MIDI reset: state と FIFO が空になる" {
+test "MIDI reset: the state and the FIFO become empty" {
     resetForTest();
     cmd_buf = "inject midi note_on 1 1\ninject midi cc 2 3\nstep 1";
     try testing.expect(pollGate(true));
@@ -4936,19 +4936,19 @@ test "MIDI reset: state と FIFO が空になる" {
 }
 
 // ============================================================================
-// gamepad（TASK-80.1。ADR-009）tests
+// gamepad tests
 // ============================================================================
 
-test "gamepad: 未接続時は getGamepadState が全 index で null" {
+test "gamepad: with none connected getGamepadState is null for every index" {
     resetForTest();
     var i: u8 = 0;
     while (i < MAX_GAMEPADS) : (i += 1) {
         try testing.expectEqual(@as(?GamepadState, null), getGamepadState(i));
     }
-    try testing.expectEqual(@as(?GamepadState, null), getGamepadState(MAX_GAMEPADS)); // 範囲外
+    try testing.expectEqual(@as(?GamepadState, null), getGamepadState(MAX_GAMEPADS)); // out of range
 }
 
-test "inject gamepad_connect/disconnect: state 更新 + Event 発火 + digest の connected ビット" {
+test "inject gamepad_connect and gamepad_disconnect: the state update, the event firing, and the digest's connected bit" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 0 TestPad
@@ -4965,7 +4965,7 @@ test "inject gamepad_connect/disconnect: state 更新 + Event 発火 + digest �
     try testing.expect(e == .gamepad_connected);
     try testing.expectEqual(@as(u8, 0), e.gamepad_connected.index);
     try testing.expectEqualStrings("TestPad", e.gamepad_connected.name());
-    try testing.expect(std.meta.eql(getGamepadState(0).?, GamepadState{})); // 既定 state（全0）
+    try testing.expect(std.meta.eql(getGamepadState(0).?, GamepadState{})); // the default state (all zeros)
 
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     try testing.expectEqualStrings(
@@ -4983,7 +4983,7 @@ test "inject gamepad_connect/disconnect: state 更新 + Event 発火 + digest �
     try testing.expect(!pollGate(true));
 }
 
-test "inject gamepad_button/gamepad_axis: 接続済み pad の state を更新する" {
+test "inject gamepad_button and gamepad_axis: they update a connected pad's state" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 0
@@ -5005,7 +5005,7 @@ test "inject gamepad_button/gamepad_axis: 接続済み pad の state を更新�
     try testing.expectApproxEqAbs(@as(f32, 1.0), st.right_trigger, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.0), st.right_stick.x, 1e-6);
 
-    // 別ボタンを off にしても他ボタンは無変更（bit 独立性）
+    // turning another button off leaves the other buttons unchanged (the bits are independent)
     cmd_buf = "inject gamepad_button 0 a 0\nstep 1\nquit";
     cursor = 0;
     try testing.expect(pollGate(true));
@@ -5014,7 +5014,7 @@ test "inject gamepad_button/gamepad_axis: 接続済み pad の state を更新�
     try testing.expect(st2.buttons.isSet(.start));
 }
 
-test "inject gamepad_button/gamepad_axis: 未接続 pad への操作は fail-fast（state 不変・注入なし）" {
+test "inject gamepad_button and gamepad_axis: operating on an unconnected pad fails fast (the state is unchanged and nothing is injected)" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_button 0 a 1
@@ -5026,7 +5026,7 @@ test "inject gamepad_button/gamepad_axis: 未接続 pad への操作は fail-fas
     try testing.expectEqual(@as(?GamepadState, null), getGamepadState(0));
 }
 
-test "inject gamepad_button: 不明ボタン名・値不正（0/1以外）は拒否" {
+test "inject gamepad_button: an unknown button name, and an invalid value (anything but 0 or 1), are rejected" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 0
@@ -5037,10 +5037,10 @@ test "inject gamepad_button: 不明ボタン名・値不正（0/1以外）は拒
     ;
     try testing.expect(pollGate(true));
     const st = getGamepadState(0).?;
-    try testing.expect(!st.buttons.isSet(.a)); // どちらも拒否され state は既定のまま
+    try testing.expect(!st.buttons.isSet(.a)); // both are rejected and the state stays at its default
 }
 
-test "inject gamepad_axis: 値域外（stick|trigger）は拒否（state 不変）" {
+test "inject gamepad_axis: out of range (for a stick or a trigger) is rejected (leaving the state unchanged)" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 0
@@ -5056,8 +5056,8 @@ test "inject gamepad_axis: 値域外（stick|trigger）は拒否（state 不変�
     try testing.expectEqual(@as(f32, 0), st.left_trigger);
 }
 
-test "inject gamepad_axis: NaN/inf は素通りせず拒否（codex レビューで発見した抜け穴の回帰）" {
-    // `v < lo or v > hi` は NaN では両方 false になり素通りしうるため、明示 reject が必要。
+test "inject gamepad_axis: NaN and inf are rejected rather than passing through (a regression check on the hole the review found)" {
+    // `v < lo or v > hi` can let a NaN through, both sides being false, so an explicit reject is needed.
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 0
@@ -5074,7 +5074,7 @@ test "inject gamepad_axis: NaN/inf は素通りせず拒否（codex レビュー
     try testing.expectEqual(@as(f32, 0), st.left_trigger);
 }
 
-test "setGamepadAxis: NaN/inf は直接呼び出しでも false（state 不変）" {
+test "setGamepadAxis: NaN and inf give false even on a direct call (leaving the state unchanged)" {
     var st = GamepadState{};
     try testing.expect(!setGamepadAxis(&st, "left_x", std.math.nan(f32)));
     try testing.expect(!setGamepadAxis(&st, "right_trigger", std.math.inf(f32)));
@@ -5082,7 +5082,7 @@ test "setGamepadAxis: NaN/inf は直接呼び出しでも false（state 不変�
     try testing.expectEqual(@as(f32, 0), st.right_trigger);
 }
 
-test "inject gamepad_connect/gamepad_button/gamepad_disconnect: index 範囲外は拒否" {
+test "inject gamepad_connect, gamepad_button and gamepad_disconnect: an index out of range is rejected" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 99
@@ -5096,9 +5096,9 @@ test "inject gamepad_connect/gamepad_button/gamepad_disconnect: index 範囲外�
     while (i < MAX_GAMEPADS) : (i += 1) try testing.expectEqual(@as(?GamepadState, null), getGamepadState(i));
 }
 
-test "inject commit: UTF-8 文字列を codepoint 分解して char_input 連続 queue（TASK-79.6.1）" {
+test "inject commit: a UTF-8 string is decomposed into codepoints and queued as consecutive char_input events" {
     resetForTest();
-    // こんにちは = U+3053 U+3093 U+306B U+3061 U+306F（5 codepoints）
+    // the Japanese fixture below = U+3053 U+3093 U+306B U+3061 U+306F (5 codepoints)
     cmd_buf =
         \\inject composition update 0 x
         \\inject commit こんにちは
@@ -5122,7 +5122,7 @@ test "inject commit: UTF-8 文字列を codepoint 分解して char_input 連続
     try testing.expect(!pollGate(true));
 }
 
-test "inject commit: 空テキスト / 不正 UTF-8 は fail-fast（注入なし）" {
+test "inject commit: empty text and invalid UTF-8 fail fast (injecting nothing)" {
     resetForTest();
     cmd_buf =
         \\inject commit
@@ -5135,9 +5135,9 @@ test "inject commit: 空テキスト / 不正 UTF-8 は fail-fast（注入なし
     try testing.expect(!pollGate(true));
 }
 
-test "inject commit: 不正 UTF-8 は途中まで注入せずゼロ件（codex 修正 C）" {
+test "inject commit: invalid UTF-8 injects nothing at all rather than part way through" {
     resetForTest();
-    // 先頭 'A' は valid だが後続 0xFF で不正。Pass1 全量検証で拒否し、A も queue しない。
+    // The leading 'A' is valid but the 0xFF after it is not. Pass 1's whole-input validation rejects it, so not even A is queued.
     cmd_buf = "inject composition update 0 x\ninject commit A\xffZ\nstep 1\nquit";
     try testing.expect(pollGate(true));
     try testing.expect(nextInjectedEvent().? == .composition_changed);
@@ -5145,10 +5145,10 @@ test "inject commit: 不正 UTF-8 は途中まで注入せずゼロ件（codex �
     try testing.expect(!pollGate(true));
 }
 
-test "inject commit: 区切り後の前後空白を保持（codex 修正 D / record→replay 対称）" {
+test "inject commit: the whitespace around the text after the separator is kept (keeping record and replay symmetrical)" {
     resetForTest();
-    // `commit` 直後の区切り 1 空白の後ろ: " a b "（先頭スペース + a + スペース + b + 末尾スペース）
-    // → 5 codepoints。行末スペースは line の左 trim のみ方針で保持。
+    // After the one separating space right after `commit`: " a b " (a leading space, a, a space, b, a trailing space)
+    // → 5 codepoints. The trailing space survives, the policy being to trim the line on the left only.
     cmd_buf = "inject composition update 0 x\ninject commit  a b \nstep 1\nquit";
     try testing.expect(pollGate(true));
     try testing.expect(nextInjectedEvent().? == .composition_changed);
@@ -5162,7 +5162,7 @@ test "inject commit: 区切り後の前後空白を保持（codex 修正 D / rec
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
-test "inject commit: ASCII 混在も char_input 連続（inject char と同経路）" {
+test "inject commit: mixed-in ASCII also gives consecutive char_input events (the same path as inject char)" {
     resetForTest();
     cmd_buf =
         \\inject composition update 0 x
@@ -5180,7 +5180,7 @@ test "inject commit: ASCII 混在も char_input 連続（inject char と同経�
     try testing.expectEqual(@as(?Event, null), nextInjectedEvent());
 }
 
-test "gamepad probe digest: 複数 pad 接続時は connected ビットマスクと p<idx>_ prefix が両立する" {
+test "the gamepad probe digest: with several pads connected the connected bitmask and the p<idx>_ prefix coexist" {
     resetForTest();
     cmd_buf =
         \\inject gamepad_connect 0
@@ -5194,17 +5194,17 @@ test "gamepad probe digest: 複数 pad 接続時は connected ビットマスク
     const payload = formatGamepadPayload(&buf);
     try testing.expect(std.mem.startsWith(u8, payload, "connected=5 ")); // pad0(bit0)+pad2(bit2) = 0b101 = 5
     try testing.expect(std.mem.indexOf(u8, payload, "p0_buttons=") != null);
-    try testing.expect(std.mem.indexOf(u8, payload, "p1_buttons=") == null); // pad1 は未接続
+    try testing.expect(std.mem.indexOf(u8, payload, "p1_buttons=") == null); // pad1 is not connected
     try testing.expect(std.mem.indexOf(u8, payload, "p2_ry=-1.0000") != null);
 }
 
-test "gamepad probe: digest コマンド経由（headless replay の self-check 経路）でも同じ payload が得られる" {
+test "the gamepad probe: the same payload comes back through the digest command too (the self-check path of a headless replay)" {
     resetForTest(); // mode=.replay
     cmd_buf = "inject gamepad_connect 0\nstep 1\nquit";
-    try testing.expect(pollGate(true)); // inject 消費 + step
-    try testing.expect(!pollGate(true)); // quit → 終了
+    try testing.expect(pollGate(true)); // consume the injections, then step
+    try testing.expect(!pollGate(true)); // quit → the end
 
-    // digest のルーティング自体は live framing で確認（既存 "custom probe: register + digest routing" と同型）。
+    // The routing of a digest itself is checked through live framing (in the same shape as the existing "custom probe: register + digest routing").
     mode = .live;
     resp_buf.clearRetainingCapacity();
     defer resp_buf.clearRetainingCapacity();
@@ -5213,7 +5213,7 @@ test "gamepad probe: digest コマンド経由（headless replay の self-check 
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "gamepad connected=1 "));
 }
 
-test "harness onLock/onPresent: 観測 copy は platform buffer 借用から frame_pixels へ" {
+test "harness onLock and onPresent: the observation copy goes from the borrowed platform buffer into frame_pixels" {
     resetForTest();
     defer resetForTest();
 
@@ -5238,7 +5238,7 @@ fn initLiveServerForTest() !u16 {
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
     server = try addr.listen(io_val, .{ .reuse_address = true });
     mode = .live;
-    clock_mode = .manual; // 既存 live pump テストは blocking 契約
+    clock_mode = .manual; // the existing live pump test relies on the blocking contract
     cmd_buf = "";
     cursor = 0;
     line_no = 0;
@@ -5261,7 +5261,7 @@ fn deinitLiveServerForTest() void {
     cursor = 0;
 }
 
-test "pollGateWithPump: null pump は pollGate と同じ（replay）" {
+test "pollGateWithPump: a null pump behaves as pollGate does (under replay)" {
     const runSequence = struct {
         fn run(use_with_pump: bool) [2]bool {
             resetForTest();
@@ -5275,7 +5275,7 @@ test "pollGateWithPump: null pump は pollGate と同じ（replay）" {
     try testing.expectEqual(runSequence(false), runSequence(true));
 }
 
-test "pollGateWithPump: replay では fake pump が呼ばれない" {
+test "pollGateWithPump: under replay the fake pump is not called" {
     resetForTest();
     cmd_buf = "step 1\nquit";
     var pump_count: usize = 0;
@@ -5295,7 +5295,7 @@ test "pollGateWithPump: replay では fake pump が呼ばれない" {
     try testing.expectEqual(@as(usize, 0), pump_count);
 }
 
-test "pollGateWithPump: fake pump false で live accept 待機を中断" {
+test "pollGateWithPump: a false from the fake pump breaks off the live accept wait" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     resetForTest();
@@ -5314,7 +5314,7 @@ test "pollGateWithPump: fake pump false で live accept 待機を中断" {
     try testing.expect(!pollGateWithPump(true, pump));
 }
 
-test "live pump: accept 待機中に fake pump が呼ばれる" {
+test "the live pump: the fake pump is called while waiting on an accept" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     resetForTest();
@@ -5358,7 +5358,7 @@ test "live pump: accept 待機中に fake pump が呼ばれる" {
     try testing.expect(pump_count >= 3);
 }
 
-test "live pump: request read 中も fake pump が呼ばれる" {
+test "the live pump: the fake pump is called while reading a request too" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     resetForTest();
@@ -5404,7 +5404,7 @@ test "live pump: request read 中も fake pump が呼ばれる" {
     try testing.expect(pump_count >= 3);
 }
 
-test "live pump: request 1 MiB 超過後も次接続を accept できる" {
+test "the live pump: the next connection can still be accepted after a request goes over 1 MiB" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     resetForTest();
@@ -5460,10 +5460,10 @@ test "live pump: request 1 MiB 超過後も次接続を accept できる" {
     try testing.expect(pollGateWithPump(true, always_pump));
 }
 
-test "netsync probe: 無効時は未登録 / host 有効時 expect role=host" {
+test "the netsync probe: unregistered while disabled, and expect role=host on an enabled host" {
     resetForTest();
     defer resetForTest();
-    // 無効時（register 前）capabilities に netsync は出ない
+    // while disabled (before the register), netsync does not appear in capabilities
     try testing.expect(findProbe("netsync") == null);
     {
         var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
@@ -5499,7 +5499,7 @@ test "netsync probe: 無効時は未登録 / host 有効時 expect role=host" {
 }
 
 // ============================================================================
-// TASK-164: free-run clock / LISTEN / await
+// the free-run clock, LISTEN and await
 // ============================================================================
 
 test "parseListenPortValue: absent/empty/0/fixed/invalid" {
@@ -5600,14 +5600,14 @@ test "step dual: manual uses steps_remaining, free-run uses frame barrier" {
     try testing.expectEqual(@as(usize, 0), steps_remaining);
     try testing.expect(!pollGate(true)); // quit
 
-    // free-run barrier（live server + in-memory request）
+    // the free-run barrier (a live server plus an in-memory request)
     if (builtin.os.tag == .windows) return;
 
     resetForTest();
     _ = initLiveServerForTest() catch return;
     defer deinitLiveServerForTest();
     clock_mode = .free_run;
-    // 直接 request を載せる（socket 経由せず barrier だけ検証）
+    // Load the request directly (checking the barrier alone, without going through a socket)
     req_bytes = try gpa.dupe(u8, "step 2\n");
     cmd_buf = req_bytes;
     cursor = 0;
@@ -5616,11 +5616,11 @@ test "step dual: manual uses steps_remaining, free-run uses frame barrier" {
     try testing.expect(pollGateFreeRun(true));
     try testing.expect(pending_wait == .frame_barrier);
     try testing.expectEqual(@as(u64, 12), pending_wait.frame_barrier.target_frame);
-    // 未到達
+    // not reached
     frame_index = 11;
     try testing.expect(pollGateFreeRun(true));
     try testing.expect(pending_wait == .frame_barrier);
-    // 到達 → コマンド尽きて finish（req_bytes は finishLiveRequest が free）
+    // reached → the commands run out and it finishes (finishLiveRequest frees req_bytes)
     frame_index = 12;
     try testing.expect(pollGateFreeRun(true));
     try testing.expect(pending_wait == .none);
@@ -5629,7 +5629,7 @@ test "step dual: manual uses steps_remaining, free-run uses frame barrier" {
 
 test "await: timeout 0 checks once; positive waits across frames (manual)" {
     resetForTest();
-    // present 前: fb unavailable → timeout 0 は即 fail（quit しない＝replayExitIfFailed 回避）
+    // before a present: fb is unavailable → so timeout 0 fails at once (without quitting, which avoids replayExitIfFailed)
     cmd_buf = "await fb crc=DEADBEEF 0\nstep 1\n";
     expect_failures = 0;
     try testing.expect(pollGate(true)); // await fail + step
@@ -5640,11 +5640,11 @@ test "await: timeout 0 checks once; positive waits across frames (manual)" {
     var pixels = [_]u32{0xFF0000FF} ** 4;
     onLock(&pixels, 2, 2);
     onPresent(); // frame_index=1, have_frame
-    // 不一致 + timeout 1: 即 fail せず pending → 1 frame 後に fail
+    // a mismatch plus timeout 1: it does not fail at once but goes pending → and fails one frame later
     cmd_buf = "await fb crc=00000000 1\nstep 1\n";
     try testing.expect(pollGate(true)); // start await → pending → return true
     try testing.expect(pending_wait == .predicate);
-    // frame を進めて deadline 到達
+    // advance the frame to reach the deadline
     onPresent(); // frame_index=2; start was 1; timeout 1 → deadline=2
     try testing.expect(pollGate(true)); // fail await + step
     try testing.expect(pending_wait == .none);
@@ -5658,7 +5658,7 @@ test "await: timeout 0 pass when predicate already true" {
     onPresent();
     var digbuf: [DIGEST_BUF_LEN]u8 = undefined;
     const payload = formatFbPayload(&digbuf);
-    // crc= を payload から抜く
+    // pull crc= out of the payload
     const crc_tok = blk: {
         var it = std.mem.tokenizeAny(u8, payload, " \t");
         while (it.next()) |t| {
@@ -5694,7 +5694,7 @@ test "parseAwaitExpr: optional timeout and surplus reject" {
     }
 }
 
-test "free-run execution model: agent 不在でも毎フレーム true" {
+test "the free-run execution model: true every frame even with no agent present" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     resetForTest();
     _ = initLiveServerForTest() catch return error.SkipZigTest;
@@ -5708,12 +5708,12 @@ test "free-run execution model: agent 不在でも毎フレーム true" {
 }
 
 // ============================================================================
-// copilot（第3 control-plane。TASK-62.5.2）の namespace 再エクスポート。
-// facade が `@import("harness").copilot` で届くようにするためだけの 1 行で、
-// harness から copilot の関数は呼ばない（意味的依存は copilot→harness の一方向）。
+// The namespace re-export of copilot (the third control plane).
+// It is a single line purely so that the facade reaches it as `@import("harness").copilot`;
+// harness never calls a copilot function (the semantic dependency runs one way, copilot→harness).
 // ============================================================================
 pub const copilot = @import("copilot.zig");
 
-// command model（TASK-62.5.1/62.5.3）の namespace 再エクスポート。copilot と同じく型の単一
-// instance 共有のため（facade が `@import("harness").command` で届く。command.zig は std のみ）。
+// The namespace re-export of the command model. As with copilot, this shares the one
+// instance of the types (so the facade reaches it as `@import("harness").command`; command.zig is std only).
 pub const command = @import("command.zig");
