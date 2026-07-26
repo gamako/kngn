@@ -13,9 +13,9 @@ pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 
-/// font = 既定フォント。各 text cmd が font override を持てばそちらを優先する。
-/// scale: 論理 DrawList → 物理 target の変換係数（1.0 = 論理=物理、fast path）。
-/// `.text` は scale==1.0 で論理座標のまま、scale!=1.0 で pos/clip を物理化し Font.drawTo へ scale を渡す。
+/// font = default font. Each text cmd may carry a font override that takes priority.
+/// scale: conversion factor from logical DrawList → physical target (1.0 = logical=physical, fast path).
+/// `.text` keeps logical coordinates when scale==1.0; when scale!=1.0 it physicalizes pos/clip and passes scale to Font.drawTo.
 pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scale: f32) void {
     std.debug.assert(target.pixels.len == @as(usize, target.width) * @as(usize, target.height));
     std.debug.assert(std.math.isFinite(scale) and scale > 0);
@@ -91,7 +91,7 @@ pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scal
 
 // ── scale helpers ─────────────────────────────────────────────────────────────
 
-/// 両エッジ floor: physical.x = floor(x*s), physical.w = max(0, floor((x+w)*s) - physical.x)
+/// Both edges floor: physical.x = floor(x*s), physical.w = max(0, floor((x+w)*s) - physical.x)
 fn scaleRect(rect: Rect, scale: f32) Rect {
     const x0 = floorI32(@as(f32, @floatFromInt(rect.x)) * scale);
     const y0 = floorI32(@as(f32, @floatFromInt(rect.y)) * scale);
@@ -129,7 +129,7 @@ fn blendPixel(dst: u32, src: Color) u32 {
     return @bitCast(Color.blend(dst_col, src));
 }
 
-/// rect, clip, target の三方向で intersection を取り描画域を返す。
+/// Intersect rect, clip, and target on three axes and return the drawable region.
 fn clipRect(rect: Rect, clip: Rect, target: RenderTarget) Rect {
     const target_rect = Rect{ .x = 0, .y = 0, .w = target.width, .h = target.height };
     return Rect.intersect(Rect.intersect(rect, clip), target_rect);
@@ -137,9 +137,9 @@ fn clipRect(rect: Rect, clip: Rect, target: RenderTarget) Rect {
 
 // ── draw primitives ───────────────────────────────────────────────────────────
 
-/// 毎フレーム（GUI 全域再描画）走るホットパス。clip 交差はループ外（clipRect）。
-/// 不透明色（GUI 塗りの大半）は行ごとの @memset 一括書き込み（TASK-58。
-/// Color.blend(dst, a=255 src) == src なので blend 経路と bit 同値）。
+/// Hot path that runs every frame (full GUI redraw). Clip intersection is outside the loop (clipRect).
+/// Opaque colors (most GUI fills) write a whole row with @memset
+/// (Color.blend(dst, a=255 src) == src, so bit-identical to the blend path).
 fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect) void {
     const bounds = clipRect(rect, clip, target);
     if (bounds.isEmpty()) return;
@@ -182,15 +182,15 @@ fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32,
         const bot_y: i32 = y + @as(i32, @intCast(h - bot_h));
         drawRectFilled(target, .{ .x = x, .y = bot_y, .w = w, .h = bot_h }, col, clip);
 
-        // Middle: left and right sides only（左右が重ならないようにクランプ）
+        // Middle: left and right sides only (clamp so left and right do not overlap)
         const mid_y: i32 = y + @as(i32, @intCast(top_h));
         const mid_h = h - top_h - bot_h;
         if (mid_h > 0) {
             const left_w = @min(t, w);
             drawRectFilled(target, .{ .x = x, .y = mid_y, .w = left_w, .h = mid_h }, col, clip);
             if (w > t) {
-                // 右帯は左帯の右端より手前に食い込まないようにする
-                // （t < w < 2t のとき左右帯が重なり半透明 outline が二重ブレンドされるのを防ぐ）
+                // Keep the right band from overlapping past the left band's right edge
+                // (when t < w < 2t, overlapping left/right bands would double-blend a translucent outline)
                 const left_end: i32 = x + @as(i32, @intCast(left_w));
                 const right_start: i32 = @max(x + @as(i32, @intCast(w - t)), left_end);
                 const right_end: i32 = x + @as(i32, @intCast(w));
@@ -203,13 +203,13 @@ fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32,
     }
 }
 
-/// Bresenham 中心線 + 主軸判定で非主軸方向へ thickness span を描く。
-/// t==1 は既存 Bresenham と一致。clip/target bounds はコマンド開始時に一度計算し span を clamp。
+/// Draw a thickness span off the non-major axis via Bresenham centerline + major-axis test.
+/// t==1 matches existing Bresenham. clip/target bounds are computed once at command start and clamp each span.
 fn drawLine(target: RenderTarget, p0: Vec2, p1: Vec2, col: Color, thickness: u32, clip: Rect) void {
     const t: u32 = if (thickness == 0) 1 else thickness;
     const offset: i32 = @intCast(t / 2);
 
-    // 中心線の AABB を thickness 分広げた領域と clip/target の交差 = 描画可能 bounds
+    // Drawable bounds = intersection of the centerline AABB expanded by thickness with clip/target
     const min_x = @min(p0.x, p1.x) - offset;
     const max_x = @max(p0.x, p1.x) + offset + @as(i32, @intCast(t)); // exclusive-ish upper for AABB
     const min_y = @min(p0.y, p1.y) - offset;
@@ -242,7 +242,7 @@ fn drawLine(target: RenderTarget, p0: Vec2, p1: Vec2, col: Color, thickness: u32
 
     while (true) {
         if (x_major) {
-            // 縦 span: [y - offset, y - offset + t)
+            // vertical span: [y - offset, y - offset + t)
             const span_y0 = y0 - offset;
             const span_y1 = span_y0 + @as(i32, @intCast(t));
             if (x0 >= bx0 and x0 < bx1) {
@@ -257,7 +257,7 @@ fn drawLine(target: RenderTarget, p0: Vec2, p1: Vec2, col: Color, thickness: u32
                 }
             }
         } else {
-            // 横 span: [x - offset, x - offset + t)
+            // horizontal span: [x - offset, x - offset + t)
             const span_x0 = x0 - offset;
             const span_x1 = span_x0 + @as(i32, @intCast(t));
             if (y0 >= by0 and y0 < by1) {
@@ -302,7 +302,7 @@ fn drawImage(
     const dst_w = rect.w;
     const dst_h = rect.h;
 
-    // 1:1: 現行 SIMD 経路（bounds 内の source は 1:1 オフセット）
+    // 1:1: current SIMD path (source inside bounds is a 1:1 offset)
     if (dst_w == src_w and dst_h == src_h) {
         const src_x_off: u32 = @intCast(bounds.x - rect.x);
         const src_y_off: u32 = @intCast(bounds.y - rect.y);
@@ -323,8 +323,8 @@ fn drawImage(
         return;
     }
 
-    // 一般 nearest: sx = floor(dx_local * src_w / dst_w)。整数 accumulator で per-pixel 除算を避ける。
-    // clip 開始位置は destination rect 全体からのローカル座標。
+    // General nearest: sx = floor(dx_local * src_w / dst_w). Integer accumulator avoids per-pixel division.
+    // Clip start is local coordinates from the full destination rect.
     const local_x0: u32 = @intCast(bounds.x - rect.x);
     const local_y0: u32 = @intCast(bounds.y - rect.y);
 
@@ -340,14 +340,14 @@ fn drawImage(
 
         var dx: u32 = 0;
         while (dx < bounds.w) {
-            // 同一 sx が続く run 長（拡大時は複数 dest が同一 source）
+            // Run length of identical sx (on upscale, multiple dest pixels share one source)
             const remaining = bounds.w - dx;
             var run: u32 = 0;
             var r = rem;
             while (run < remaining) {
                 run += 1;
                 r += src_w;
-                if (r >= dst_w) break; // この pixel まで同一 sx
+                if (r >= dst_w) break; // Same sx through this pixel
             }
 
             const src_px = pixels[src_row_base + sx];
@@ -385,31 +385,31 @@ test "render: rectFilled fills pixels in clip" {
     const font = font_mod.default_font;
     render(target, &dl, font, 1.0);
 
-    // 中央 4x4 は赤
+    // Center 4x4 is red
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), pixels[2 * 10 + 2]);
-    // 外側はそのまま
+    // Outside stays as-is
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[0]);
 }
 
-test "render: clip 矩形外は変更されない" {
+test "render: pixels outside the clip rect are unchanged" {
     var pixels = [_]u32{0xFF000000} ** (20 * 20);
     const target = RenderTarget{ .pixels = &pixels, .width = 20, .height = 20 };
 
     var dl = DrawList.init(std.testing.allocator);
     defer dl.deinit();
     dl.reset(20, 20);
-    // clip を (5,5)-(10,10) に制限してから全体を塗る
+    // Restrict clip to (5,5)-(10,10) then fill the whole area
     try dl.pushClip(.{ .x = 5, .y = 5, .w = 5, .h = 5 });
     try dl.rectFilled(.{ .x = 0, .y = 0, .w = 20, .h = 20 }, Color.rgba(0xFF, 0, 0, 0xFF));
     dl.popClip();
 
     render(target, &dl, font_mod.default_font, 1.0);
 
-    // clip 内（5,5）は赤
+    // Inside clip (5,5) is red
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), pixels[5 * 20 + 5]);
-    // clip 外（0,0）は黒のまま
+    // Outside clip (0,0) stays black
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[0]);
-    // clip 外（10,10）は黒のまま
+    // Outside clip (10,10) stays black
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[10 * 20 + 10]);
 }
 
@@ -417,7 +417,7 @@ test "render: image blit" {
     var pixels = [_]u32{0xFF000000} ** (10 * 10);
     const target = RenderTarget{ .pixels = &pixels, .width = 10, .height = 10 };
 
-    // 4x4 の白い画像
+    // 4x4 white image
     const img_pixels = [_]u32{0xFF_FF_FF_FF} ** 16;
 
     var dl = DrawList.init(std.testing.allocator);
@@ -427,15 +427,15 @@ test "render: image blit" {
 
     render(target, &dl, font_mod.default_font, 1.0);
 
-    // blit した領域は白
+    // Blitted region is white
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pixels[1 * 10 + 1]);
-    // 外は黒
+    // Outside is black
     try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[0]);
 }
 
-test "drawRectFilled: opaque 高速パスは blend 経路と bit 一致（部分 clip 込み）" {
-    // a=255 の blendPixel は dst に依らず src（a 強制 0xFF）を返すので、
-    // 高速パス（@memset）と blend 経路の結果は同一のはず。参照は per-pixel blendPixel。
+test "drawRectFilled: opaque fast path is bit-identical to the blend path (including partial clip)" {
+    // blendPixel with a=255 returns src (a forced to 0xFF) regardless of dst, so
+    // the fast path (@memset) and the blend path must match. Reference is per-pixel blendPixel.
     var prng = std.Random.DefaultPrng.init(0x09A0);
     _ = &prng;
     var px_fast = [_]u32{0} ** (10 * 10);
@@ -448,11 +448,11 @@ test "drawRectFilled: opaque 高速パスは blend 経路と bit 一致（部分
     const t_fast = RenderTarget{ .pixels = &px_fast, .width = 10, .height = 10 };
     const t_ref = RenderTarget{ .pixels = &px_ref, .width = 10, .height = 10 };
     const col = Color.rgba(0x12, 0x34, 0x56, 0xFF);
-    const rect = Rect{ .x = -2, .y = 3, .w = 8, .h = 20 }; // はみ出し込み
+    const rect = Rect{ .x = -2, .y = 3, .w = 8, .h = 20 }; // Including overflow
     const clip = Rect{ .x = 0, .y = 0, .w = 10, .h = 8 };
 
-    drawRectFilled(t_fast, rect, col, clip); // opaque → 高速パス
-    // 参照: clip 済み範囲を per-pixel blend
+    drawRectFilled(t_fast, rect, col, clip); // opaque → fast path
+    // Reference: per-pixel blend over the clipped range
     const bounds = clipRect(rect, clip, t_ref);
     var y: u32 = @intCast(bounds.y);
     while (y < @as(u32, @intCast(bounds.y)) + bounds.h) : (y += 1) {
@@ -464,10 +464,10 @@ test "drawRectFilled: opaque 高速パスは blend 経路と bit 一致（部分
     try std.testing.expectEqualSlices(u32, &px_ref, &px_fast);
 }
 
-test "drawImage: SIMD 経路が per-pixel 参照と bit 一致（全 alpha 域・部分 clip・tail 跨ぎ）" {
+test "drawImage: SIMD path is bit-identical to the per-pixel reference (full alpha range, partial clip, spanning tails)" {
     var prng = std.Random.DefaultPrng.init(0xD12A6E);
     const rng = prng.random();
-    // 11x7 画像（行内で 4px チャンク 2 個 + tail 3）を (3,2) へ、clip を部分交差させる
+    // 11x7 image (two 4px chunks + 3px tail per row) at (3,2), with a partial clip intersection
     var img: [11 * 7]u32 = undefined;
     for (&img) |*p| p.* = rng.int(u32);
     var px_simd: [16 * 12]u32 = undefined;
@@ -480,14 +480,14 @@ test "drawImage: SIMD 経路が per-pixel 参照と bit 一致（全 alpha 域�
     const t_simd = RenderTarget{ .pixels = &px_simd, .width = 16, .height = 12 };
     const t_ref = RenderTarget{ .pixels = &px_ref, .width = 16, .height = 12 };
     const rect = Rect{ .x = 3, .y = 2, .w = 11, .h = 7 };
-    const clip = Rect{ .x = 0, .y = 0, .w = 12, .h = 8 }; // 右・下を切る
+    const clip = Rect{ .x = 0, .y = 0, .w = 12, .h = 8 }; // Clip right and bottom
 
-    // 負座標（左・上はみ出し）ケースも同一手順で比較する
+    // Also compare the negative-coordinate case (overflow left/top) with the same procedure
     const rect_neg = Rect{ .x = -3, .y = -2, .w = 11, .h = 7 };
 
     drawImage(t_simd, rect, &img, 11, 7, clip);
     drawImage(t_simd, rect_neg, &img, 11, 7, clip);
-    // 参照: 旧実装相当（per-pixel blendPixel）
+    // Reference: per-pixel blendPixel
     for ([_]Rect{ rect, rect_neg }) |r| {
         const bounds = clipRect(r, clip, t_ref);
         const sx: u32 = @intCast(bounds.x - r.x);
@@ -505,18 +505,18 @@ test "drawImage: SIMD 経路が per-pixel 参照と bit 一致（全 alpha 域�
     try std.testing.expectEqualSlices(u32, &px_ref, &px_simd);
 }
 
-// ── TASK-156.2 scale / thickness / nearest tests ──────────────────────────────
+// ── scale / thickness / nearest tests ──────────────────────────────
 
 test "scaleRect: floor edges produce seamless tiling" {
-    // AC1: 隣接矩形 [x,x+w) と [x+w,x+w+v) は共通物理境界を持ち gap/overlap なし
+    // Adjacent rects [x,x+w) and [x+w,x+w+v) share a common physical boundary with no gap/overlap
     const scales = [_]f32{ 1.0, 1.5, 2.0 };
     for (scales) |s| {
         const a = Rect{ .x = 10, .y = 20, .w = 7, .h = 5 };
-        const b = Rect{ .x = 17, .y = 20, .w = 3, .h = 5 }; // a の右隣
+        const b = Rect{ .x = 17, .y = 20, .w = 3, .h = 5 }; // right neighbor of a
         const pa = scaleRect(a, s);
         const pb = scaleRect(b, s);
         try std.testing.expectEqual(pa.x + @as(i32, @intCast(pa.w)), pb.x);
-        // 負座標
+        // negative coordinates
         const n = Rect{ .x = -5, .y = -3, .w = 4, .h = 2 };
         const pn = scaleRect(n, s);
         const x0 = floorI32(-5.0 * s);
@@ -529,7 +529,7 @@ test "scaleRect: floor edges produce seamless tiling" {
 test "render scale: adjacent rect tiling has no gap or overlap" {
     const scales = [_]f32{ 1.0, 1.5, 2.0 };
     for (scales) |s| {
-        // logical 10x10 を scale して物理 target
+        // scale a logical 10x10 onto a physical target
         const phys_w: u32 = @intFromFloat(@ceil(20.0 * s));
         const phys_h: u32 = @intFromFloat(@ceil(20.0 * s));
         const n = phys_w * phys_h;
@@ -584,15 +584,15 @@ test "render scale: clip edges use floor rule" {
         render(target, &dl, font_mod.default_font, s);
 
         const pc = scaleRect(.{ .x = 4, .y = 5, .w = 6, .h = 7 }, s);
-        // clip 内は赤、外は黒
+        // Inside clip is red; outside is black
         if (!pc.isEmpty()) {
             const ix: u32 = @intCast(pc.x);
             const iy: u32 = @intCast(pc.y);
             try std.testing.expectEqual(@as(u32, 0xFFFF0000), buf[iy * phys_w + ix]);
         }
-        // 原点は clip 外
+        // Origin is outside clip
         try std.testing.expectEqual(@as(u32, 0xFF000000), buf[0]);
-        // clip 右外
+        // Right of clip
         const right: i32 = pc.x + @as(i32, @intCast(pc.w));
         if (right >= 0 and right < @as(i32, @intCast(phys_w)) and pc.y >= 0 and pc.y < @as(i32, @intCast(phys_h))) {
             try std.testing.expectEqual(@as(u32, 0xFF000000), buf[@as(u32, @intCast(pc.y)) * phys_w + @as(u32, @intCast(right))]);
@@ -915,9 +915,9 @@ test "scaleThickness: round and min 1" {
     try std.testing.expectEqual(@as(u32, 1), scaleThickness(1, 0.4)); // round(0.4)=0 → max(1)
 }
 
-// ── TASK-156.3 text scale dispatch ────────────────────────────────────────────
+// ── text scale dispatch ────────────────────────────────────────────
 
-test "TASK-156.3: render text scale==1.0 は元 pos/clip と scale=1.0 を渡す" {
+test "render text scale==1.0 passes original pos/clip and scale=1.0" {
     const Spy = struct {
         var last_pos: Vec2 = .{ .x = -1, .y = -1 };
         var last_clip: Rect = .{ .x = -1, .y = -1, .w = 0, .h = 0 };
@@ -962,7 +962,7 @@ test "TASK-156.3: render text scale==1.0 は元 pos/clip と scale=1.0 を渡す
     try std.testing.expectEqual(@as(f32, 1.0), Spy.last_scale);
 }
 
-test "TASK-156.3: render text scale==2.0 は scalePoint/scaleRect 後の値と scale=2.0" {
+test "render text scale==2.0 passes scalePoint/scaleRect results and scale=2.0" {
     const Spy = struct {
         var last_pos: Vec2 = .{ .x = -1, .y = -1 };
         var last_clip: Rect = .{ .x = -1, .y = -1, .w = 0, .h = 0 };
@@ -1011,7 +1011,7 @@ test "TASK-156.3: render text scale==2.0 は scalePoint/scaleRect 後の値と s
     try std.testing.expectEqual(@as(f32, 2.0), Spy.last_scale);
 }
 
-test "TASK-156.3: render text 空 clip では drawTo を呼ばない" {
+test "render text with empty clip does not call drawTo" {
     const Spy = struct {
         var calls: u32 = 0;
         fn m(_: *const anyopaque, _: []const u8) u32 {
@@ -1043,11 +1043,11 @@ test "TASK-156.3: render text 空 clip では drawTo を呼ばない" {
     try std.testing.expectEqual(@as(u32, 0), Spy.calls);
 }
 
-test "TASK-156.3: text clip の scale 規則は rect と一致" {
+test "text clip scale rules match rect" {
     const scales = [_]f32{ 1.5, 2.0 };
     for (scales) |s| {
         const logical = Rect{ .x = 4, .y = 5, .w = 6, .h = 7 };
-        // rect 経路と同じ scaleRect
+        // same scaleRect as the rect path
         const via_rect = scaleRect(logical, s);
 
         const Spy = struct {

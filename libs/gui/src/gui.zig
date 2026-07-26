@@ -1,12 +1,12 @@
-// libs/gui 公開 API root
+// libs/gui public API root
 //
-// 使い方（毎フレーム、Context + レイアウト）:
+// Per-frame usage (Context + layout):
 //   ctx.beginFrame(fb_w, fb_h);
-//   // pushEvent → widget（前フレーム rect で同期 hit-test）→ beginBox/label/endBox
-//   ctx.endFrame(); // layout 確定 + draw cmd 発行 + rect キャッシュ更新
+//   // pushEvent → widget (sync hit-test against previous-frame rect) → beginBox/label/endBox
+//   ctx.endFrame(); // finalize layout + emit draw cmds + update rect cache
 //   gui.render(target, &ctx.draw_list, ctx.font, 1.0);
 //
-// DrawList 単体（レイアウトなし）の低レベル利用も可:
+// Low-level DrawList-only use (no layout) is also supported:
 //   var dl = gui.DrawList.init(gpa);
 //   dl.reset(fb_w, fb_h);
 //   try dl.rectFilled(...);
@@ -25,22 +25,22 @@ pub const Font = @import("font.zig").Font;
 pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;
 pub const default_bitmap_font = @import("font.zig").default_bitmap_font;
-/// 既定フォント（共通 Font インターフェース値）。Context.init / render に渡す。
-/// default_bitmap_font（ASCII 32..127 の 8×16 固定幅ビットマップ）の vtable ラッパ。
-/// 非 ASCII は missing glyph（描画スキップ・advance は 8px）。font chain / fallback はない。
-/// measure は codepoint 数 × 8、drawTo も codepoint ごとに 8px 進む（logical width は一致。
-/// glyph 未描画時も advance は進むため ink 幅とは一致しない）。
+/// Default font (shared Font interface value). Pass to Context.init / render.
+/// Vtable wrapper around default_bitmap_font (fixed-width 8×16 bitmap for ASCII 32..127).
+/// Non-ASCII is a missing glyph (draw skipped; advance is still 8px). No font chain / fallback.
+/// measure is codepoint count × 8; drawTo also advances 8px per codepoint (logical widths match.
+/// Advance still moves for undrawn glyphs, so ink width may differ).
 pub const default_font = @import("font.zig").default_font;
-/// 埋め込み Press Start 2P の OutlineFont（遅延初期化・論理 16px）。bitmap の `default_font` とは別。
+/// Embedded Press Start 2P OutlineFont (lazy init; logical 16px). Distinct from bitmap `default_font`.
 pub const defaultOutlineFont = @import("font.zig").defaultOutlineFont;
-/// 論理 ink 高さ（ascent+descent）と row 内縦中央 y。DrawList 直書き向けにも公開（TASK-167）。
+/// Logical ink height (ascent+descent) and vertically centered y within a row. Also exposed for direct DrawList writing.
 pub const inkHeight = @import("font.zig").inkHeight;
 pub const fontInkHeight = @import("font.zig").fontInkHeight;
 pub const centeredTextY = @import("font.zig").centeredTextY;
 
 pub const render = @import("render.zig").render;
 
-// 入力管理 + ID stack + interaction state + Context（TASK-21.2）
+// Input management + ID stack + composition state + Context
 pub const InputEvent = @import("input.zig").InputEvent;
 pub const Input = @import("input.zig").Input;
 pub const MouseButtons = @import("input.zig").MouseButtons;
@@ -55,10 +55,10 @@ pub const InteractionState = @import("state.zig").InteractionState;
 pub const PerIdState = @import("state.zig").PerIdState;
 pub const PerIdStateStore = @import("state.zig").PerIdStateStore;
 
-// 単一行 text_edit コア（TASK-113.1 / TASK-132 契約明文化）。
-// TextLayout: codepoint index（0..count）と UTF-8 byte offset / 累積 logical width の対応表。
-// buildTextLayout: Font.measure を codepoint ごとに呼び prefix_widths を構築する。
-// hitTest: prefix_widths の advance 中点で codepoint index を返す（byte offset ではない）。
+// Single-line text_edit core.
+// TextLayout: mapping among codepoint index (0..count), UTF-8 byte offset, and cumulative logical width.
+// buildTextLayout: calls Font.measure per codepoint to build prefix_widths.
+// hitTest: returns a codepoint index at the midpoint of each prefix_widths advance (not a byte offset).
 pub const TextRange = @import("text_edit.zig").TextRange;
 pub const TextLayout = @import("text_edit.zig").TextLayout;
 pub const SelectionState = @import("text_edit.zig").SelectionState;
@@ -78,7 +78,7 @@ pub const buttonBehavior = @import("context.zig").buttonBehavior;
 pub const pointHitsVisible = @import("context.zig").pointHitsVisible;
 pub const CachedRect = @import("context.zig").CachedRect;
 
-// Flex レイアウトエンジン（TASK-21.4）
+// Flex layout engine
 pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
@@ -86,8 +86,8 @@ pub const BoxConfig = @import("layout.zig").BoxConfig;
 pub const Border = @import("layout.zig").Border;
 pub const CustomDrawFn = @import("layout.zig").CustomDrawFn;
 
-// widget 層（TASK-21.5）。widget 本体（button / colorSwatch 等）は Context の
-// メソッドとして呼ぶ（ctx.button("Save") 等。実装は widgets.zig）。
+// Widget layer. Widget bodies (button / colorSwatch / etc.) are invoked as Context
+// methods (e.g. ctx.button("Save"); implementations live in widgets.zig).
 pub const Style = @import("style.zig").Style;
 pub const defaultStyle = @import("style.zig").defaultStyle;
 pub const ButtonOpts = @import("widgets.zig").ButtonOpts;
@@ -110,7 +110,7 @@ pub const TextInputOpts = @import("widgets.zig").TextInputOpts;
 pub const TextInputResult = @import("widgets.zig").TextInputResult;
 pub const textInputId = @import("widgets.zig").textInputId;
 
-// PanelHost — dock-slot パネルシステム（TASK-147）。
+// PanelHost — dock-slot panel system.
 pub const PanelHost = @import("panel_host.zig").PanelHost;
 pub const Panel = @import("panel_host.zig").Panel;
 pub const PanelBuildFn = @import("panel_host.zig").PanelBuildFn;
@@ -124,20 +124,20 @@ pub const PersistKey = @import("panel_host.zig").PersistKey;
 pub const PersistValue = @import("panel_host.zig").PersistValue;
 pub const Persistence = @import("panel_host.zig").Persistence;
 
-// 16-step grid（純幾何/描画 + Flex row widget。TASK-105.1）。
+// 16-step grid (pure geometry/drawing + Flex row widget).
 pub const stepgrid = @import("context.zig").stepgrid;
 
-// メニュー定義は core の type-only module を直接参照する。gui は Command を実行せず、
-// platform facade と同じ定義を UI 側から見せるだけである（ADR-007 R2）。
+// Menu definitions come from core's type-only module directly. gui does not execute Command;
+// it only exposes the same definitions to the UI side as the platform facade (ADR-007 R2).
 pub const Command = @import("command_types").Command;
 pub const CommandId = @import("command_types").CommandId;
 pub const CommandKind = @import("command_types").CommandKind;
 pub const ExecutionPolicy = @import("command_types").ExecutionPolicy;
 pub const Shortcut = @import("command_types").Shortcut;
-// ポップアップ/コンテキストメニュー（TASK-79.1）。任意座標にメニューを表示し、
-// 項目クリックで選択を返す汎用 primitive。使い方は popup.zig の doc comment 参照。
-// Context メソッド（ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /
-// ctx.popupMenu）として呼ぶのが通常の使い方（widget と同型）。
+// Popup / context menu. Generic primitive that shows a menu at an arbitrary position and
+// returns the selection on item click. See the doc comment in popup.zig for usage.
+// Usual call site is as Context methods (ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /
+// ctx.popupMenu), same shape as other widgets.
 pub const PopupState = @import("popup.zig").PopupState;
 pub const PopupItem = @import("popup.zig").PopupItem;
 pub const PopupResult = @import("popup.zig").PopupResult;
@@ -146,8 +146,8 @@ pub const layoutPopup = @import("popup.zig").layoutPopup;
 pub const itemRect = @import("popup.zig").itemRect;
 pub const hitTestItem = @import("popup.zig").hitTestItem;
 
-// Command 定義から生成するメニューバー / ドロップダウン（TASK-97.2）。
-// gui は Command を実行せず、選択 CommandId を返すだけ（app の dispatchCommand が所有）。
+// Menu bar / dropdown built from Command definitions.
+// gui does not execute Command; it only returns the selected CommandId (owned by the app's dispatchCommand).
 pub const MenuBarState = @import("menu.zig").MenuBarState;
 pub const MenuBarResult = @import("menu.zig").MenuBarResult;
 pub const MENU_BAR_POPUP_ID = @import("menu.zig").MENU_BAR_POPUP_ID;
@@ -158,9 +158,9 @@ pub const collectMenuCommands = @import("menu.zig").collectMenuCommands;
 pub const menuBar = @import("menu.zig").menuBar;
 pub const menuBarPopup = @import("menu.zig").menuBarPopup;
 
-// test-gui 用に各ファイルの test を収集する。
-// `pub const X = @import("f.zig").X` の decl 参照では f.zig の test は集まらないため、
-// namespace 全体を `_ = @import(...)` で参照して test ブロックを取り込む。
+// Collect each file's tests for test-gui.
+// A decl reference like `pub const X = @import("f.zig").X` does not pull in f.zig's tests, so
+// reference the whole namespace with `_ = @import(...)` to bring the test blocks in.
 test {
     _ = @import("geom.zig");
     _ = @import("color.zig");

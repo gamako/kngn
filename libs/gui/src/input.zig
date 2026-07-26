@@ -1,9 +1,9 @@
-// 入力状態の集約。platform 非依存（21.3 指摘 3-6）のため、platform.Event ではなく
-// libs/gui 独自の InputEvent を受ける。platform.Event → InputEvent の変換は
-// 呼び出し側（pixie / sample）の薄いアダプタが行う。
+// Aggregated input state. Platform-independent: accepts libs/gui's own InputEvent,
+// not platform.Event. Conversion from platform.Event → InputEvent is done by a thin
+// adapter on the caller side (pixie / sample).
 //
-// edge（mouse_pressed/released・keys_pressed/released）は beginFrame でクリアし、
-// pushEvent で当フレーム分を立てる → 1 フレームのみ true になる。
+// Edges (mouse_pressed/released, keys_pressed/released) are cleared in beginFrame and
+// set for the current frame in pushEvent → true for one frame only.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,13 +11,13 @@ const geom = @import("geom.zig");
 
 pub const Vec2 = geom.Vec2;
 
-/// スクロール量は f32（trackpad の精密スクロールを丸めずに保持）。
+/// Scroll amount is f32 (keeps trackpad precision without rounding).
 pub const Vec2f = struct {
     x: f32 = 0,
     y: f32 = 0,
 };
 
-/// 現在押下中のボタン集合（LSB-first、platform.MouseButtons と同レイアウト）。
+/// Currently held button set (LSB-first; same layout as platform.MouseButtons).
 pub const MouseButtons = packed struct(u8) {
     left: bool = false,
     right: bool = false,
@@ -25,7 +25,7 @@ pub const MouseButtons = packed struct(u8) {
     _reserved: u5 = 0,
 };
 
-/// 修飾キー（platform.ModifierFlags と同レイアウト = shift:0x01, ctrl:0x02, alt:0x04, cmd:0x08）。
+/// Modifier keys (same layout as platform.ModifierFlags = shift:0x01, ctrl:0x02, alt:0x04, cmd:0x08).
 pub const ModifierFlags = packed struct(u32) {
     shift: bool = false,
     ctrl: bool = false,
@@ -34,8 +34,8 @@ pub const ModifierFlags = packed struct(u32) {
     _reserved: u28 = 0,
 };
 
-/// libs/gui 独自の入力イベント。button は 0=left/1=right/2=middle、modifiers は raw bits。
-/// key の code は u32（負値 = platform KeyCode.UNKNOWN は変換アダプタ側で除去済み）。
+/// libs/gui's own input event. button is 0=left/1=right/2=middle; modifiers are raw bits.
+/// key code is u32 (negative = platform KeyCode.UNKNOWN is already stripped by the conversion adapter).
 pub const InputEvent = union(enum) {
     mouse_move: struct { x: i32, y: i32, modifiers: u32 },
     mouse_down: struct { x: i32, y: i32, button: u8, modifiers: u32 },
@@ -46,39 +46,39 @@ pub const InputEvent = union(enum) {
     char_input: struct { codepoint: u32, modifiers: u32 },
 };
 
-/// key_down と char_input の到着順を保持する列。
+/// Sequence that preserves arrival order of key_down and char_input.
 pub const OrderedTextEvent = union(enum) {
     key_down: struct { code: u32, modifiers: u32, repeat: bool },
     char_input: struct { codepoint: u32, modifiers: u32 },
 };
 
-/// IME composition（変換中 preedit）の表示専用状態。platform 非依存。
-/// `text` は caller 所有の借用 UTF-8 slice（endFrame まで有効であること）。
-/// `cursor` は `text` 内の UTF-8 byte offset（表示 caret）。
+/// IME composition (in-progress preedit) display-only state. Platform-independent.
+/// `text` is a borrowed UTF-8 slice owned by the caller (must remain valid through endFrame).
+/// `cursor` is a UTF-8 byte offset within `text` (display caret).
 pub const CompositionState = struct {
     active: bool = false,
     text: []const u8 = "",
     cursor: usize = 0,
 };
 
-/// long-lived。keys_* は gpa 保持の ArrayList（unmanaged）。
+/// long-lived. keys_* are GPA-backed ArrayLists (unmanaged).
 pub const Input = struct {
     alloc: Allocator,
     mouse_pos: Vec2 = .{ .x = 0, .y = 0 },
     mouse_prev: Vec2 = .{ .x = 0, .y = 0 },
     mouse_delta: Vec2 = .{ .x = 0, .y = 0 },
-    mouse_buttons: MouseButtons = .{}, // 現在のボタン状態
-    mouse_pressed: MouseButtons = .{}, // このフレームで押された (edge)
-    mouse_released: MouseButtons = .{}, // このフレームで離された (edge)
-    mouse_pressed_pos: Vec2 = .{ .x = 0, .y = 0 }, // 直近の press edge の座標
+    mouse_buttons: MouseButtons = .{}, // current button state
+    mouse_pressed: MouseButtons = .{}, // pressed this frame (edge)
+    mouse_released: MouseButtons = .{}, // released this frame (edge)
+    mouse_pressed_pos: Vec2 = .{ .x = 0, .y = 0 }, // coordinates of the most recent press edge
     mouse_pressed_modifiers: ModifierFlags = .{},
-    mouse_released_pos: Vec2 = .{ .x = 0, .y = 0 }, // 直近の左 release edge の座標
+    mouse_released_pos: Vec2 = .{ .x = 0, .y = 0 }, // coordinates of the most recent left release edge
     scroll_delta: Vec2f = .{},
     modifiers: ModifierFlags = .{},
 
-    keys_pressed: std.ArrayList(u32) = .empty, // このフレームで押された code（edge）
-    keys_released: std.ArrayList(u32) = .empty, // このフレームで離された code（edge）
-    keys_down: std.ArrayList(u32) = .empty, // 現在押下中の code 集合
+    keys_pressed: std.ArrayList(u32) = .empty, // codes pressed this frame (edge)
+    keys_released: std.ArrayList(u32) = .empty, // codes released this frame (edge)
+    keys_down: std.ArrayList(u32) = .empty, // currently held code set
     ordered_text_events: std.ArrayList(OrderedTextEvent) = .empty,
 
     pub fn init(alloc: Allocator) Input {
@@ -92,7 +92,7 @@ pub const Input = struct {
         self.ordered_text_events.deinit(self.alloc);
     }
 
-    /// フレーム冒頭で呼ぶ。edge をクリアし、前フレーム最終位置を mouse_prev に保存。
+    /// Call at frame start. Clears edges and saves the previous frame's final position into mouse_prev.
     pub fn beginFrame(self: *Input) void {
         self.mouse_prev = self.mouse_pos;
         self.mouse_delta = .{ .x = 0, .y = 0 };
@@ -102,10 +102,10 @@ pub const Input = struct {
         self.keys_pressed.clearRetainingCapacity();
         self.keys_released.clearRetainingCapacity();
         self.ordered_text_events.clearRetainingCapacity();
-        // keys_down / mouse_buttons / mouse_pos は状態なので維持する。
+        // keys_down / mouse_buttons / mouse_pos are state, so they persist.
     }
 
-    /// beginFrame と widget 呼び出しの間で呼ぶ。
+    /// Call between beginFrame and widget invocation.
     pub fn pushEvent(self: *Input, ev: InputEvent) void {
         switch (ev) {
             .mouse_move => |m| {
@@ -139,7 +139,7 @@ pub const Input = struct {
                     .repeat = k.repeat,
                 } }) catch
                     @panic("Input.events: OOM");
-                // edge は初回 down のみ（repeat は押下継続だが pressed には積まない）。
+                // Edge is first down only (repeat keeps the key held but is not pushed into pressed).
                 if (!k.repeat) appendUnique(&self.keys_pressed, self.alloc, k.code);
                 appendUnique(&self.keys_down, self.alloc, k.code);
             },
@@ -173,7 +173,7 @@ pub const Input = struct {
         return listContains(self.keys_released.items, code);
     }
 
-    // ---- 内部ヘルパ ----
+    // ---- internal helpers ----
 
     fn setMousePos(self: *Input, x: i32, y: i32) void {
         self.mouse_pos = .{ .x = x, .y = y };
@@ -185,7 +185,7 @@ pub const Input = struct {
             0 => @bitCast(MouseButtons{ .left = true }),
             1 => @bitCast(MouseButtons{ .right = true }),
             2 => @bitCast(MouseButtons{ .middle = true }),
-            else => return, // 未知ボタンは無視
+            else => return, // ignore unknown buttons
         };
         const cur: u8 = @bitCast(self.mouse_buttons);
         if (down) {
@@ -223,7 +223,7 @@ fn removeFirst(list: *std.ArrayList(u32), code: u32) void {
 // Tests
 // ============================================================
 
-test "Input: mouse_pressed/released は edge（1 フレームのみ）・buttons は状態継続" {
+test "Input: mouse_pressed/released are edges (one frame only); buttons persist as state" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -232,9 +232,9 @@ test "Input: mouse_pressed/released は edge（1 フレームのみ）・buttons
     try std.testing.expect(in.mouse_pressed.left);
     try std.testing.expect(in.mouse_buttons.left);
 
-    in.beginFrame(); // 次フレーム
-    try std.testing.expect(!in.mouse_pressed.left); // edge クリア
-    try std.testing.expect(in.mouse_buttons.left); // 状態は継続
+    in.beginFrame(); // next frame
+    try std.testing.expect(!in.mouse_pressed.left); // edge cleared
+    try std.testing.expect(in.mouse_buttons.left); // state persists
 
     in.pushEvent(.{ .mouse_up = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
     try std.testing.expect(in.mouse_released.left);
@@ -244,7 +244,7 @@ test "Input: mouse_pressed/released は edge（1 フレームのみ）・buttons
     try std.testing.expect(!in.mouse_released.left);
 }
 
-test "Input: mouse_pressed_pos は down の瞬間の座標を保持（down 後 move でも不変）" {
+test "Input: mouse_pressed_pos keeps the coordinates at the down instant (unchanged by later moves)" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -254,12 +254,12 @@ test "Input: mouse_pressed_pos は down の瞬間の座標を保持（down 後 m
 
     try std.testing.expectEqual(@as(i32, 10), in.mouse_pressed_pos.x);
     try std.testing.expectEqual(@as(i32, 20), in.mouse_pressed_pos.y);
-    // mouse_pos はフレーム最終位置
+    // mouse_pos is the frame's final position
     try std.testing.expectEqual(@as(i32, 200), in.mouse_pos.x);
     try std.testing.expectEqual(@as(i32, 201), in.mouse_pos.y);
 }
 
-test "Input: mouse_released_pos は up の瞬間の座標を保持（up 後 move でも不変）" {
+test "Input: mouse_released_pos keeps the coordinates at the up instant (unchanged by later moves)" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -273,7 +273,7 @@ test "Input: mouse_released_pos は up の瞬間の座標を保持（up 後 move
     try std.testing.expectEqual(@as(i32, 201), in.mouse_pos.y);
 }
 
-test "Input: mouse_released_pos は左 up の座標のみ latch（同フレーム右 up で上書きしない）" {
+test "Input: mouse_released_pos latches left-up coordinates only (same-frame right-up does not overwrite)" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -287,7 +287,7 @@ test "Input: mouse_released_pos は左 up の座標のみ latch（同フレー�
     try std.testing.expect(in.mouse_released.right);
 }
 
-test "Input: mouse_pos は move を伴わない up でも最新化される" {
+test "Input: mouse_pos updates even on up without a move" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -297,7 +297,7 @@ test "Input: mouse_pos は move を伴わない up でも最新化される" {
     try std.testing.expectEqual(@as(i32, 44), in.mouse_pos.y);
 }
 
-test "Input: key edge（pressed/released は 1 フレーム、down は継続）" {
+test "Input: key edge (pressed/released last one frame; down persists)" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -307,15 +307,15 @@ test "Input: key edge（pressed/released は 1 フレーム、down は継続）"
     try std.testing.expect(in.isDown(65));
 
     in.beginFrame();
-    try std.testing.expect(!in.wasPressed(65)); // edge クリア
-    try std.testing.expect(in.isDown(65)); // down は継続
+    try std.testing.expect(!in.wasPressed(65)); // edge cleared
+    try std.testing.expect(in.isDown(65)); // down persists
 
     in.pushEvent(.{ .key_up = .{ .code = 65, .modifiers = 0 } });
     try std.testing.expect(in.wasReleased(65));
     try std.testing.expect(!in.isDown(65));
 }
 
-test "Input: key repeat は pressed edge に積まないが down にはする" {
+test "Input: key repeat is not pushed to the pressed edge but is added to down" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -325,7 +325,7 @@ test "Input: key repeat は pressed edge に積まないが down にはする" {
     try std.testing.expect(in.isDown(65));
 }
 
-test "Input: scroll_delta は累積しフレームでリセット" {
+test "Input: scroll_delta accumulates and resets each frame" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -340,7 +340,7 @@ test "Input: scroll_delta は累積しフレームでリセット" {
     try std.testing.expectEqual(@as(f32, 0), in.scroll_delta.y);
 }
 
-test "Input: modifiers が raw bits から変換される" {
+test "Input: modifiers are converted from raw bits" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
@@ -350,7 +350,7 @@ test "Input: modifiers が raw bits から変換される" {
     try std.testing.expect(!in.modifiers.ctrl);
 }
 
-test "Input: char_input と key_down の順序を保持し、frame reset する" {
+test "Input: preserves char_input and key_down order, and resets each frame" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 

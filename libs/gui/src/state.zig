@@ -1,55 +1,55 @@
-// interaction state（hot / active / focused）と widget ごとの永続状態。
+// interaction state (hot / active / focused) and per-widget persistent state.
 //
-// hot_id は 1 フレーム遅延の安定 hover ID（描画フィードバック用）。当フレーム計算中の
-// hover は next_hot_id に積み、beginFrame で hot_id に昇格させる。これによりネスト
-// widget 等で同フレーム内に hover 主体が入れ替わってもフリッカしない。
-// 描画時は state.hot_id == id を見る（buttonBehavior の result.hovered は当フレーム生値）。
+// hot_id is a one-frame-delayed stable hover ID (for draw feedback). Hover computed this
+// frame accumulates in next_hot_id and is promoted to hot_id in beginFrame. Nested
+// widgets that swap the hover subject within a frame therefore do not flicker.
+// Drawing checks state.hot_id == id (buttonBehavior's result.hovered is the raw same-frame value).
 
 const id_mod = @import("id.zig");
 const text_edit = @import("text_edit.zig");
 
 pub const Id = id_mod.Id;
 
-/// SelectableLabel など、ID に紐づく widget のフレーム間状態。
+/// Cross-frame state keyed by ID for widgets such as SelectableLabel.
 pub const PerIdState = struct {
     selection: text_edit.SelectionState = .{},
     last_click_time: f64 = -1.0,
     last_click_pos: struct { x: i32 = 0, y: i32 = 0 } = .{},
-    /// TextInput の caret は selection.extent と同期する codepoint index。
+    /// TextInput caret is a codepoint index kept in sync with selection.extent.
     caret: usize = 0,
-    /// content の左端からの横スクロール量（px）。
+    /// Horizontal scroll in px from the left edge of the content.
     scroll_x: i32 = 0,
-    /// caret が表示を開始した Context 仮想時刻。
+    /// Context virtual time when the caret became visible.
     caret_blink_start_s: f64 = 0,
 };
 
-/// ID ごとの状態を必要な ID だけ遅延確保する state store。
+/// State store that lazily allocates per-ID state only for IDs that need it.
 ///
-/// # 容量・LRU trim 契約（TASK-127）
+/// # Capacity / LRU trim contract
 ///
-/// - 方式: frame generation による touch + ID リンクの LRU リスト。
-/// - 既定: `max_entries=4096`、`trim_to=3072`（25% 余裕で frame 毎 churn を抑える）。
-/// - touch: `getOrPut` が current generation を記録し entry を LRU 末尾へ移動する O(1)。
-///   `get` は読み取り専用で touch しない。表示中 widget は `Context.perIdState` → `getOrPut`
-///   経由で毎フレーム touch される。
-/// - trim 発火: `entry_count > max_entries` のとき、`Context.endFrame` 末尾のフレーム境界のみ。
-///   widget 構築ループ内では trim しない。
-/// - 表示中 state: `last_touched_frame == current_generation` の entry は削除されない。
-/// - 操作中 state: `active_id` / `focused_id` / `hot_id` / `next_hot_id` に対応する entry は
-///   last_touched に関わらず trim 対象外（一時非表示の focus/drag/hover を維持）。
-/// - 非表示 state: 上限超過時に LRU の古い entry から破棄され得る。削除後に同じ ID が
-///   再表示された場合、`PerIdState` は初期値から再生成される（selection / caret /
-///   TextInput 内 `scroll_x` / double-click 情報がリセット）。上限未満の間は保持する。
-/// - 保護 entry だけで `trim_to` を満たせない場合は、表示中・操作中 state を優先し
-///   一時的に `max_entries` 超過を許容する。
-/// - 呼び出し側所有データは store 外: `TextBuffer`（`std.ArrayList(u8)`）と ScrollArea の
-///   caller 所有 `*Vec2f` は本 store に入らない。entry 破棄でもそれらの内容・容量は不変。
+/// - Method: touch via frame generation + an ID-linked LRU list.
+/// - Defaults: `max_entries=4096`, `trim_to=3072` (25% headroom to limit per-frame churn).
+/// - touch: `getOrPut` records the current generation and moves the entry to the LRU tail in O(1).
+///   `get` is read-only and does not touch. Visible widgets are touched every frame via
+///   `Context.perIdState` → `getOrPut`.
+/// - trim fires: only at the frame boundary at the end of `Context.endFrame` when `entry_count > max_entries`.
+///   Never trim inside the widget-build loop.
+/// - Visible state: entries with `last_touched_frame == current_generation` are never deleted.
+/// - In-use state: entries matching `active_id` / `focused_id` / `hot_id` / `next_hot_id` are
+///   excluded from trim regardless of last_touched (keeps briefly hidden focus/drag/hover).
+/// - Hidden state: may be discarded from oldest LRU when over capacity. If the same ID is
+///   shown again after deletion, `PerIdState` is recreated from defaults (selection / caret /
+///   TextInput `scroll_x` / double-click info reset). Kept while under the limit.
+/// - If protected entries alone cannot reach `trim_to`, prefer visible and in-use state and
+///   temporarily allow exceeding `max_entries`.
+/// - Caller-owned data stays outside the store: `TextBuffer` (`std.ArrayList(u8)`) and ScrollArea's
+///   caller-owned `*Vec2f` are not in this store. Entry discard leaves their content and capacity intact.
 pub const PerIdStateStore = struct {
     pub const default_max_entries: usize = 4096;
     pub const default_trim_to: usize = 3072;
 
-    /// map value: 公開 state + LRU metadata。リンクは ID（rehash でポインタ無効化を避ける）。
-    /// `lru_prev` / `lru_next` の 0 はリンク無し（Id=0 は widget ID として未使用）。
+    /// map value: public state + LRU metadata. Links are by ID (avoids pointer invalidation on rehash).
+    /// `lru_prev` / `lru_next` of 0 means unlinked (Id=0 is unused as a widget ID).
     pub const Entry = struct {
         state: PerIdState = .{},
         last_touched_frame: u64 = 0,
@@ -57,7 +57,7 @@ pub const PerIdStateStore = struct {
         lru_next: Id = 0,
     };
 
-    /// trim 時に保護する interaction ID 群（0 = 無し）。
+    /// Interaction IDs protected during trim (0 = none).
     pub const ProtectedIds = struct {
         active_id: Id = 0,
         focused_id: Id = 0,
@@ -66,11 +66,11 @@ pub const PerIdStateStore = struct {
     };
 
     map: std.AutoHashMapUnmanaged(Id, Entry) = .empty,
-    /// store 専用 frame generation（Context.frame_index とは独立。beginFrameAt でも同じ契約）。
+    /// Store-local frame generation (independent of Context.frame_index; same contract under beginFrameAt).
     generation: u64 = 0,
-    /// LRU 先頭 = 最古（least recently used）。0 = 空。
+    /// LRU head = oldest (least recently used). 0 = empty.
     lru_head: Id = 0,
-    /// LRU 末尾 = 最新（most recently used）。0 = 空。
+    /// LRU tail = newest (most recently used). 0 = empty.
     lru_tail: Id = 0,
     max_entries: usize = default_max_entries,
     trim_to: usize = default_trim_to,
@@ -80,7 +80,7 @@ pub const PerIdStateStore = struct {
         self.* = .{};
     }
 
-    /// フレーム開始時に generation を進める。Context.beginFrameAtInternal から呼ばれる。
+    /// Advance generation at frame start. Called from Context.beginFrameAtInternal.
     pub fn beginFrame(self: *PerIdStateStore) void {
         self.generation +%= 1;
     }
@@ -94,7 +94,7 @@ pub const PerIdStateStore = struct {
         const gop = self.map.getOrPut(gpa, id) catch @panic("PerIdStateStore: OOM");
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
-            // 新規 entry を LRU 末尾へ。getOrPut 後の rehash に備え ID 経由でリンクする。
+            // Link a new entry as the LRU tail. Link by ID to survive rehash after getOrPut.
             self.linkAsTail(id);
         } else if (self.lru_tail != id) {
             self.unlink(id);
@@ -110,8 +110,8 @@ pub const PerIdStateStore = struct {
         return &e.state;
     }
 
-    /// フレーム境界でのみ呼ぶ。`count > max_entries` なら LRU 古い entry から `trim_to` まで削除。
-    /// 当フレーム touch / protected ID は除外。保護のみで `trim_to` に届かない場合は超過を許容。
+    /// Call only at the frame boundary. If `count > max_entries`, delete oldest LRU entries down to `trim_to`.
+    /// Exclude same-frame touch / protected IDs. If protected alone cannot reach `trim_to`, allow overflow.
     pub fn trim(self: *PerIdStateStore, protected: ProtectedIds) void {
         if (self.map.count() <= self.max_entries) return;
 
@@ -169,13 +169,13 @@ pub const PerIdStateStore = struct {
 };
 
 pub const InteractionState = struct {
-    hot_id: Id = 0, // 前フレーム確定の hover ID（描画用・安定）
-    active_id: Id = 0, // 押下中ロック ID
-    next_hot_id: Id = 0, // 今フレーム計算中の hover 候補（描画順で最後勝ち）
+    hot_id: Id = 0, // Previous-frame settled hover ID (for drawing; stable)
+    active_id: Id = 0, // Press-lock ID
+    next_hot_id: Id = 0, // Hover candidate computed this frame (last writer wins in draw order)
     focused_id: Id = 0, // TextInput focus
     focus_claimed_this_frame: bool = false,
-    this_frame_hovered_any: bool = false, // wantsMouse 算出用
-    active_submitted: bool = false, // 当フレームに active widget が評価されたか（張り付き防止用）
+    this_frame_hovered_any: bool = false, // for wantsMouse
+    active_submitted: bool = false, // Whether an active widget was evaluated this frame (anti-stick)
 
     pub fn beginFrame(self: *InteractionState) void {
         self.hot_id = self.next_hot_id;
@@ -183,7 +183,7 @@ pub const InteractionState = struct {
         self.this_frame_hovered_any = false;
         self.active_submitted = false;
         self.focus_claimed_this_frame = false;
-        // active_id / focused_id は状態なので維持する。
+        // active_id / focused_id are state, so they persist.
     }
 };
 
@@ -194,7 +194,7 @@ pub const InteractionState = struct {
 const std = @import("std");
 const testing = std.testing;
 
-test "InteractionState: beginFrame で next_hot_id が hot_id に昇格" {
+test "InteractionState: beginFrame promotes next_hot_id to hot_id" {
     var s: InteractionState = .{};
     s.next_hot_id = 42;
     s.beginFrame();
@@ -203,18 +203,18 @@ test "InteractionState: beginFrame で next_hot_id が hot_id に昇格" {
     try testing.expect(!s.this_frame_hovered_any);
 }
 
-test "InteractionState: active_id / focused_id は beginFrame で維持される" {
+test "InteractionState: active_id / focused_id persist across beginFrame" {
     var s: InteractionState = .{};
     s.active_id = 7;
     s.focused_id = 9;
     s.this_frame_hovered_any = true;
     s.beginFrame();
-    try testing.expectEqual(@as(Id, 7), s.active_id); // 押下ロックは継続
+    try testing.expectEqual(@as(Id, 7), s.active_id); // Press lock persists
     try testing.expectEqual(@as(Id, 9), s.focused_id);
-    try testing.expect(!s.this_frame_hovered_any); // per-frame はリセット
+    try testing.expect(!s.this_frame_hovered_any); // per-frame fields reset
 }
 
-test "PerIdStateStore: getOrPut touch が LRU 末尾へ移動する" {
+test "PerIdStateStore: getOrPut touch moves the entry to the LRU tail" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{};
     defer store.deinit(gpa);
@@ -226,7 +226,7 @@ test "PerIdStateStore: getOrPut touch が LRU 末尾へ移動する" {
     try testing.expectEqual(@as(Id, 1), store.lru_head);
     try testing.expectEqual(@as(Id, 3), store.lru_tail);
 
-    // 最古 (1) を touch → 末尾へ
+    // touch oldest (1) → move to tail
     _ = store.getOrPut(gpa, 1);
     try testing.expectEqual(@as(Id, 2), store.lru_head);
     try testing.expectEqual(@as(Id, 1), store.lru_tail);
@@ -235,7 +235,7 @@ test "PerIdStateStore: getOrPut touch が LRU 末尾へ移動する" {
     try testing.expectEqual(@as(u64, 1), store.map.getPtr(1).?.last_touched_frame);
 }
 
-test "PerIdStateStore: get は touch しない" {
+test "PerIdStateStore: get does not touch" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{};
     defer store.deinit(gpa);
@@ -250,12 +250,12 @@ test "PerIdStateStore: get は touch しない" {
     try testing.expectEqual(@as(Id, 1), store.lru_head);
 }
 
-test "PerIdStateStore: 上限超過で LRU 最古から削除し trim_to へ" {
+test "PerIdStateStore: over capacity deletes oldest LRU entries down to trim_to" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{ .max_entries = 4, .trim_to = 3 };
     defer store.deinit(gpa);
 
-    // frame 1: ids 1..5（いずれもこの frame で touch）
+    // frame 1: ids 1..5 (all touched this frame)
     store.beginFrame();
     store.getOrPut(gpa, 1).selection.anchor = 10;
     _ = store.getOrPut(gpa, 2);
@@ -264,11 +264,11 @@ test "PerIdStateStore: 上限超過で LRU 最古から削除し trim_to へ" {
     _ = store.getOrPut(gpa, 5);
     try testing.expectEqual(@as(usize, 5), store.count());
 
-    // frame 2: 誰も touch しない → 全 entry が非 current で削除可能
+    // frame 2: nobody touches → every entry is non-current and deletable
     store.beginFrame();
     store.trim(.{});
     try testing.expectEqual(@as(usize, 3), store.count());
-    // LRU 最古 1, 2 が消え、3-4-5 が残る
+    // Oldest LRU 1, 2 gone; 3-4-5 remain
     try testing.expect(store.get(1) == null);
     try testing.expect(store.get(2) == null);
     try testing.expect(store.get(3) != null);
@@ -276,7 +276,7 @@ test "PerIdStateStore: 上限超過で LRU 最古から削除し trim_to へ" {
     try testing.expect(store.get(5) != null);
 }
 
-test "PerIdStateStore: 上限超過時に当フレーム以外の最古だけ削除" {
+test "PerIdStateStore: over capacity deletes only non-current-frame oldest entries" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{ .max_entries = 4, .trim_to = 3 };
     defer store.deinit(gpa);
@@ -286,21 +286,21 @@ test "PerIdStateStore: 上限超過時に当フレーム以外の最古だけ削
     _ = store.getOrPut(gpa, 2);
     _ = store.getOrPut(gpa, 3);
 
-    // frame 2: 1 は非表示、2,3 touch + 新規 4,5 → count=5 > max
+    // frame 2: 1 hidden; touch 2,3 + new 4,5 → count=5 > max
     store.beginFrame();
     _ = store.getOrPut(gpa, 2);
     _ = store.getOrPut(gpa, 3);
     _ = store.getOrPut(gpa, 4);
     _ = store.getOrPut(gpa, 5);
     store.trim(.{});
-    // 削除可能は 1 のみ（2..5 は current generation）。trim_to 未達でも一時超過許容。
+    // Only 1 is deletable (2..5 are current generation). Temporary overflow allowed even if trim_to is unmet.
     try testing.expectEqual(@as(usize, 4), store.count());
     try testing.expect(store.get(1) == null);
     try testing.expect(store.get(2) != null);
     try testing.expect(store.get(5) != null);
 }
 
-test "PerIdStateStore: 当フレーム touch は trim されない" {
+test "PerIdStateStore: same-frame touch is not trimmed" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{ .max_entries = 2, .trim_to = 1 };
     defer store.deinit(gpa);
@@ -311,12 +311,12 @@ test "PerIdStateStore: 当フレーム touch は trim されない" {
     _ = store.getOrPut(gpa, 3);
     try testing.expectEqual(@as(usize, 3), store.count());
 
-    // 全 entry が current generation のため 1 件も消えない（一時超過許容）
+    // No deletion: every entry is current generation (temporary overflow allowed)
     store.trim(.{});
     try testing.expectEqual(@as(usize, 3), store.count());
 }
 
-test "PerIdStateStore: active/focused/hot は非表示 frame でも trim 除外" {
+test "PerIdStateStore: active/focused/hot are excluded from trim even on hidden frames" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{ .max_entries = 2, .trim_to = 1 };
     defer store.deinit(gpa);
@@ -328,7 +328,7 @@ test "PerIdStateStore: active/focused/hot は非表示 frame でも trim 除外"
     _ = store.getOrPut(gpa, 40); // unprotected old
 
     store.beginFrame();
-    // 新規で上限超過を起こす（保護 3 + 新規多数）
+    // Exceed the limit with new entries (3 protected + many new)
     var i: Id = 100;
     while (i < 110) : (i += 1) {
         _ = store.getOrPut(gpa, i);
@@ -342,17 +342,17 @@ test "PerIdStateStore: active/focused/hot は非表示 frame でも trim 除外"
         .next_hot_id = 0,
     });
 
-    // 保護 3 つは残る
+    // The 3 protected remain
     try testing.expectEqual(@as(usize, 7), store.get(10).?.caret);
     try testing.expectEqual(@as(i32, 3), store.get(20).?.scroll_x);
     try testing.expectEqual(@as(usize, 2), store.get(30).?.selection.extent);
-    // 非保護の古い 40 は消える
+    // Unprotected old 40 is gone
     try testing.expect(store.get(40) == null);
-    // 当フレームの 100..109 は残る（current touch）
+    // This frame's 100..109 remain (current touch)
     try testing.expect(store.get(100) != null);
 }
 
-test "PerIdStateStore: 上限未満の一時非表示は再表示で state 保持" {
+test "PerIdStateStore: brief hide under capacity keeps state on re-show" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{};
     defer store.deinit(gpa);
@@ -361,12 +361,12 @@ test "PerIdStateStore: 上限未満の一時非表示は再表示で state 保�
     store.getOrPut(gpa, 5).selection = .{ .anchor = 3, .extent = 8, .dragging = true };
     store.getOrPut(gpa, 5).caret = 8;
 
-    // 非表示フレーム（touch しない）
+    // Hidden frame (no touch)
     store.beginFrame();
     store.trim(.{});
     try testing.expectEqual(@as(usize, 3), store.get(5).?.selection.anchor);
 
-    // 再表示
+    // Shown again
     store.beginFrame();
     const s = store.getOrPut(gpa, 5);
     try testing.expectEqual(@as(usize, 3), s.selection.anchor);
@@ -375,7 +375,7 @@ test "PerIdStateStore: 上限未満の一時非表示は再表示で state 保�
     try testing.expectEqual(@as(usize, 8), s.caret);
 }
 
-test "PerIdStateStore: 削除後の再取得は初期値" {
+test "PerIdStateStore: re-fetch after deletion yields defaults" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{ .max_entries = 1, .trim_to = 1 };
     defer store.deinit(gpa);
@@ -385,7 +385,7 @@ test "PerIdStateStore: 削除後の再取得は初期値" {
     store.getOrPut(gpa, 1).selection.anchor = 4;
 
     store.beginFrame();
-    _ = store.getOrPut(gpa, 2); // 2 のみ touch → 1 が最古
+    _ = store.getOrPut(gpa, 2); // Touch only 2 → 1 becomes oldest
     store.trim(.{});
     try testing.expect(store.get(1) == null);
 
@@ -397,7 +397,7 @@ test "PerIdStateStore: 削除後の再取得は初期値" {
     try testing.expectEqual(@as(i32, 0), s.scroll_x);
 }
 
-test "PerIdStateStore: TextBuffer は store trim の影響を受けない" {
+test "PerIdStateStore: TextBuffer is unaffected by store trim" {
     const gpa = testing.allocator;
     var buf = try text_edit.TextBuffer.init(gpa, "hello");
     defer buf.deinit();
@@ -412,11 +412,11 @@ test "PerIdStateStore: TextBuffer は store trim の影響を受けない" {
     store.trim(.{});
     try testing.expect(store.get(1) == null);
 
-    // caller 所有 TextBuffer は不変
+    // Caller-owned TextBuffer is unchanged
     try testing.expectEqualStrings("hello", buf.slice());
 }
 
-test "PerIdStateStore: ScrollArea の caller 所有 Vec2f は store 外" {
+test "PerIdStateStore: ScrollArea caller-owned Vec2f stays outside the store" {
     const gpa = testing.allocator;
     const scroll: struct { x: f32 = 0, y: f32 = 0 } = .{ .x = 12, .y = 34 };
 
@@ -429,13 +429,13 @@ test "PerIdStateStore: ScrollArea の caller 所有 Vec2f は store 外" {
     _ = store.getOrPut(gpa, 2);
     store.trim(.{});
 
-    // store は scroll を保持しない。caller 側値はそのまま。
+    // Store does not hold scroll; caller-side value stays as-is.
     try testing.expectEqual(@as(f32, 12), scroll.x);
     try testing.expectEqual(@as(f32, 34), scroll.y);
     try testing.expect(store.get(1) == null);
 }
 
-test "PerIdStateStore: max 以下では trim しない" {
+test "PerIdStateStore: no trim while at or below max" {
     const gpa = testing.allocator;
     var store: PerIdStateStore = .{ .max_entries = 10, .trim_to = 5 };
     defer store.deinit(gpa);
@@ -444,7 +444,7 @@ test "PerIdStateStore: max 以下では trim しない" {
     var i: Id = 1;
     while (i <= 10) : (i += 1) _ = store.getOrPut(gpa, i);
     store.beginFrame();
-    // 非表示のまま count==max → 発火条件は count > max なので何もしない
+    // Hidden with count==max → fire condition is count > max, so do nothing
     store.trim(.{});
     try testing.expectEqual(@as(usize, 10), store.count());
 }
