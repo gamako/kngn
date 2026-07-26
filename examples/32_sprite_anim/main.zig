@@ -1,24 +1,24 @@
-//! 32_sprite_anim: スプライトシート + 歩行アニメ再生デモ（TASK-111.3）。
+//! 32_sprite_anim: spritesheet + walk-animation playback demo.
 //!
-//! - 既存 `examples/image/usako.png` を decode し、4 セルの歩行 Atlas をコード生成
-//!   （乱数・時刻不使用 → 決定的）
-//! - AnimationClip `[0,1,2,3,2,1]` + loop、AnimationPlayer + FixedTimeStep 60Hz
-//! - 左右往復。左向きは `flip_x = true`
+//! - Decode existing `examples/image/usako.png` and code-generate a 4-cell walk Atlas
+//!   (no RNG / wall-clock → deterministic)
+//! - AnimationClip `[0,1,2,3,2,1]` + loop, AnimationPlayer + FixedTimeStep 60Hz
+//! - Walks left/right. Facing left uses `flip_x = true`
 //!
-//! 決定論の前提（CRC 固定値はこれに依存）:
-//! - 640×360・固定背景色・固定初期位置/速度
-//! - harness 仮想クロック（getTime = frame/60）と fixed 60Hz の組合せ
-//! - Atlas 生成は usako ピクセルの決定的 blit（offset 定数のみ）
+//! Determinism assumptions (fixed CRC values depend on these):
+//! - 640×360, fixed background, fixed initial position/velocity
+//! - harness virtual clock (getTime = frame/60) combined with fixed 60Hz
+//! - Atlas generation is a deterministic blit of usako pixels (constant offsets only)
 //!
-//! ホットパス宣言: 毎フレーム drawFrame→drawSpriteEx（全画素相当は既存実装）。
-//! AnimationPlayer.update は O(1)。初期化時のみ Atlas 生成の全画素ループ。
+//! Hot path declaration: every frame drawFrame→drawSpriteEx (all-pixel-class work is in the existing impl).
+//! AnimationPlayer.update is O(1). All-pixel Atlas generation runs at init only.
 
 const std = @import("std");
 const kit = @import("kit");
 const platform = kit.platform;
 const gfx = kit.gfx;
 
-// 既存 examples/image/usako.png への symlink（新規バイナリ禁止。ルート外 embed 回避）
+// Symlink to existing examples/image/usako.png (no new binaries; avoid embeds outside the root)
 const usako_png = @embedFile("image/usako.png");
 
 const WINDOW_W: u32 = 640;
@@ -29,7 +29,7 @@ const SHEET_COLS: u32 = 4;
 const SHEET_W: u32 = CELL * SHEET_COLS;
 const SHEET_H: u32 = CELL;
 
-/// 歩行 bobbing 用のセル別オフセット（決定的・定数のみ）。
+/// Per-cell offsets for walk bobbing (deterministic; constants only).
 const cell_offsets = [_]struct { dx: i32, dy: i32 }{
     .{ .dx = 0, .dy = 0 },
     .{ .dx = 2, .dy = -3 },
@@ -63,11 +63,11 @@ pub fn main() !void {
 
     var timestep = gfx.FixedTimeStep.init(60.0);
 
-    // 固定初期位置・速度（整数のみ。CRC 決定論のため）
+    // Fixed initial position/velocity (integers only; for CRC determinism)
     var pos_x: i32 = 80;
     const pos_y: i32 = 160;
-    var dir: i32 = 1; // +1 右 / -1 左
-    // 4px/update: 約 120 step で右端到達 → flip + 折り返しが step 180 までに目視可能
+    var dir: i32 = 1; // +1 right / -1 left
+    // 4px/update: reaches the right edge in ~120 steps → flip + turnaround visible by step 180
     const speed: i32 = 4;
     const margin: i32 = 16;
     const max_x: i32 = @as(i32, @intCast(WINDOW_W)) - @as(i32, @intCast(CELL)) - margin;
@@ -106,7 +106,7 @@ pub fn main() !void {
             defer fb.unlock();
             @memset(fb.pixels, COLOR_BG);
 
-            // 地面ライン（固定）
+            // Ground line (fixed)
             const ground_y: u32 = 160 + CELL + 4;
             if (ground_y < fb.height) {
                 var gx: u32 = 0;
@@ -133,8 +133,8 @@ pub fn main() !void {
     }
 }
 
-/// usako.png から 4×1 の 64px セル Atlas を決定的に生成する。
-/// 乱数・時刻・ファイル順序に依存しない（@embedFile 固定バイナリ + 定数 offset）。
+/// Deterministically build a 4×1 Atlas of 64px cells from usako.png.
+/// Independent of RNG, wall-clock, and file order (@embedFile fixed binary + constant offsets).
 fn buildWalkAtlas(allocator: std.mem.Allocator) !gfx.Atlas {
     var src = try gfx.Sprite.initFromData(allocator, usako_png, 0, 0);
     defer src.deinit(allocator);
@@ -144,9 +144,9 @@ fn buildWalkAtlas(allocator: std.mem.Allocator) !gfx.Atlas {
 
     const pixels = try allocator.alloc(u32, SHEET_W * SHEET_H);
     errdefer allocator.free(pixels);
-    @memset(pixels, 0); // 透明
+    @memset(pixels, 0); // Transparent
 
-    // 向きマーカー色（premul 不透明シアン）。左右非対称にすることで flip_x を目視確認できる。
+    // Facing-marker color (premul opaque cyan). Left/right asymmetry makes flip_x visually checkable.
     const marker: u32 = 0xFFFFFF00; // BGRA: B=FF G=FF R=00 A=FF
 
     for (cell_offsets, 0..) |off, cell_i| {
@@ -164,7 +164,7 @@ fn buildWalkAtlas(allocator: std.mem.Allocator) !gfx.Atlas {
                 pixels[dst_y * SHEET_W + dst_x] = src.image.pixels[sy * src_w + sx];
             }
         }
-        // セル右端に 4×12 の縦バー（決定的・定数位置）
+        // 4×12 vertical bar at the cell's right edge (deterministic; constant position)
         var my: u32 = 26;
         while (my < 38) : (my += 1) {
             var mx: u32 = CELL - 6;

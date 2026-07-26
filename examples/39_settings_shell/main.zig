@@ -1,12 +1,12 @@
-//! GUI settings shell benchmark (TASK-121.3).
+//! GUI settings shell benchmark.
 //!
-//! VS Code / System Settings 風の設定画面シェル。左ナビ + 右フォーム 3 セクション、
-//! 現有 widget のみ（libs/gui 本体は変更しない）。
+//! VS Code / System Settings-style settings shell. Left nav + right form with 3 sections,
+//! current widgets only (libs/gui itself unchanged).
 //!
-//! ホットパス宣言:
-//! - widget 構築と DrawList へのコマンド追加はフレーム毎。選択中フォームのコントロール数に対する O(N)。
-//! - 全画素ループ、framebuffer 全面コピー、独自 rasterizer、RT 経路は新設しない。
-//! - custom probe の digest は harness 要求時のみ。環境変数読取りは初期化時のみ。
+//! Hot path declaration:
+//! - Widget build and DrawList command appends are per-frame. O(N) in the selected form's control count.
+//! - No new all-pixel loop, full framebuffer copy, custom rasterizer, or RT path.
+//! - custom probe digest only on harness request. Env reads at init only.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -122,7 +122,7 @@ const App = struct {
     screen_w: u32,
     screen_h: u32,
     section: Section = .general,
-    /// nav activation 経路: focus（selectableLabelId claimFocus）/ click（hot+pressed glue）
+    /// nav activation path: focus (selectableLabelId claimFocus) / click (hot+pressed glue)
     nav_via_focus: bool = true,
     general: GeneralState,
     editor: EditorState,
@@ -252,8 +252,8 @@ fn widgetName(id: gui.Id) []const u8 {
 }
 
 fn claimInteract(ctx: *gui.Context, id: gui.Id, active: bool) void {
-    // checkbox / toggle / radio / slider は claimFocus しないため、E2E の focused= 期待に
-    // 合わせ app 側で focus を取る（hack: 非 text widget の interaction focus glue）。
+    // checkbox / toggle / radio / slider do not claimFocus, so take focus on the app side to match
+    // the E2E focused= expectation (hack: interaction focus glue for non-text widgets).
     if (active) _ = ctx.claimFocus(id);
 }
 
@@ -275,7 +275,7 @@ fn syncSection(app: *App) void {
         return;
     }
 
-    // fallback: selectableLabelId が focused に反映されない場合の click glue
+    // fallback: click glue when selectableLabelId does not reflect into focused
     if (app.ctx.input.mouse_pressed.left) {
         const hot = app.ctx.state.hot_id;
         if (hot == Ids.nav_general) {
@@ -379,7 +379,7 @@ fn rectCsv(app: *const App, id: gui.Id, key: []const u8, buf: []u8, off: *usize)
 }
 
 fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
-    // 1024B 契約: rect は x,y,w,h カンマ結合。E2E 操作対象 + nav + 選択 scroll のみ。
+    // 1024B contract: rects as comma-joined x,y,w,h. Only E2E targets + nav + selected scroll.
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     var off: usize = 0;
     appendFmt(buf, &off, "schema=1 screen_w={d} screen_h={d} selected={s}", .{
@@ -397,7 +397,7 @@ fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         .audio => rectCsv(app, Ids.audio_scroll, "audio_scroll", buf, &off),
     }
 
-    // E2E 操作対象（非表示は -1）
+    // E2E interaction targets (hidden → -1)
     if (app.section == .general) {
         rectCsv(app, Ids.general_launch_at_login, "general_launch_at_login", buf, &off);
         rectCsv(app, Ids.general_ui_scale, "general_ui_scale", buf, &off);
@@ -450,7 +450,7 @@ fn renderNav(ctx: *gui.Context, app: *App) void {
         _ = ctx.selectableLabelId(it.id, it.label, .{});
         ctx.endBox();
     }
-    // focus 経路（主）+ click glue（fallback）
+    // focus path (primary) + click glue (fallback)
     syncSection(app);
 }
 
@@ -512,7 +512,7 @@ fn renderGeneral(ctx: *gui.Context, app: *App) void {
         .paste_text = app.paste_text,
     });
 
-    // 長フォーム: 640x360 でも scroll が必要になるよう余白行を足す
+    // Tall form: add spacer rows so 640x360 still needs scroll
     formSpacer(ctx, 8);
     ctx.labelEx("Additional notes: changes apply immediately.", ctx.style.text_subtle);
     ctx.labelEx("Scroll this panel on small windows.", ctx.style.text_subtle);
@@ -689,7 +689,7 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
         .align_cross = .center,
     });
     ctx.label("Settings");
-    ctx.labelEx("General / Editor / Audio — TASK-121.3", ctx.style.text_subtle);
+    ctx.labelEx("General / Editor / Audio", ctx.style.text_subtle);
     ctx.endBox();
 
     // body row
@@ -741,7 +741,7 @@ pub fn main(init: std.process.Init) !void {
     const screen_w = parseDim(envSlice("VP_GUI_WIDTH"), DEFAULT_W, "VP_GUI_WIDTH");
     const screen_h = parseDim(envSlice("VP_GUI_HEIGHT"), DEFAULT_H, "VP_GUI_HEIGHT");
 
-    var window = try platform.Window.create(screen_w, screen_h, "Settings Shell (TASK-121.3)");
+    var window = try platform.Window.create(screen_w, screen_h, "Settings Shell");
     defer window.destroy();
 
     var ctx = gui.Context.init(gpa, gui.default_font);

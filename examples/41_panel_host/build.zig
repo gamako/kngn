@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
+// build_helpers/ is a symlink to ../../build_helpers.
 const platform = @import("build_helpers/platform.zig");
 
 const PROJECT_ROOT = "../..";
@@ -9,8 +9,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // gui と platform/harness が command_types.zig を共有するため kit_libs 経由で
-    // 同一 module instance を渡す（二重 module 化で「file exists in modules」を防ぐ）。
+    // gui and platform/harness share command_types.zig, so pass the same module instance via kit_libs
+    // (avoids dual modules triggering "file exists in modules").
     const platform_types = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
     });
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     gui.addImport("pixelops", pixelops);
     gui.addImport("command_types", command_types);
 
-    // kit_libs 必須フィールド（main は kit を使わないが command_types 共有のため供給）
+    // kit_libs required fields (main does not use kit, but supply them for shared command_types)
     const dsp = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
     });

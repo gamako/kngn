@@ -1,8 +1,8 @@
-//! 26_appshell_demo — AppShell persistence + DocumentHost doodle sample。
+//! 26_appshell_demo — AppShell persistence + DocumentHost doodle sample.
 //!
-//! ホットパス宣言: DocumentHost、paint の編集/保存/読込、RecentFiles、quit cancel、確認 UI は
-//! イベント時のみ。表示の canvas composite はフレーム毎の全画素経路だが、既存
-//! `paint.Canvas.composite` の SIMD/cache 経路と `gui` の image renderer を流用する。
+//! Hot path declaration: DocumentHost, paint edit/save/load, RecentFiles, quit cancel, and confirm UI are
+//! event-only. The displayed canvas composite is a per-frame all-pixel path, but it reuses the existing
+//! `paint.Canvas.composite` SIMD/cache path and the `gui` image renderer.
 
 const std = @import("std");
 const kit = @import("kit");

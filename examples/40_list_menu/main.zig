@@ -1,13 +1,13 @@
-//! List + menu shell benchmark (TASK-121.4).
+//! List + menu shell benchmark.
 //!
-//! Finder / GitHub Issues ミニ版: toolbar / menuBar / 500-row scroll list /
+//! Finder / GitHub Issues mini: toolbar / menuBar / 500-row scroll list /
 //! single selection / context menu / multi-filter popup / keyboard nav.
-//! libs/gui 本体は変更しない（不足は example 側 custom = hack）。
+//! Does not change libs/gui itself (gaps are example-side custom = hack).
 //!
-//! ホットパス宣言:
-//! - 500 行の widget 構築・layout・DrawList 追加はフレーム毎 O(N)（N=500）。
-//! - 全画素ループ・framebuffer 全面コピー・独自 rasterizer・RT 経路は新設しない。
-//! - popup / keyboard / probe / env はイベント時または初期化時のみ。
+//! Hot path declaration:
+//! - Building / laying out / appending DrawList for 500 rows is per-frame O(N) (N=500).
+//! - No new all-pixel loop, full framebuffer copy, custom rasterizer, or RT path.
+//! - popup / keyboard / probe / env are event-only or init-only.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     const screen_w = parseDim(envSlice("VP_GUI_WIDTH"), ui.DEFAULT_W, "VP_GUI_WIDTH");
     const screen_h = parseDim(envSlice("VP_GUI_HEIGHT"), ui.DEFAULT_H, "VP_GUI_HEIGHT");
 
-    var window = try platform.Window.create(screen_w, screen_h, "List + Menu Shell (TASK-121.4)");
+    var window = try platform.Window.create(screen_w, screen_h, "List + Menu Shell");
     defer window.destroy();
 
     var ctx = gui.Context.init(gpa, gui.default_font);
@@ -153,8 +153,8 @@ pub fn main(init: std.process.Init) !void {
                     if (m.button == .right) {
                         const p: gui.Vec2 = .{ .x = m.x, .y = m.y };
                         if (ui.hitTestRow(&app, p)) |row| {
-                            // 右クリックは context 開要求に使い、gui へは渡さない
-                            // （menu popup の外側 right-press dismiss を避ける。popup 1 件制約観測用）
+                            // Right-click requests opening context and is not forwarded to gui
+                            // (avoids outside right-press dismiss of the menu popup; for observing the one-popup constraint)
                             app.context_row = row;
                             ui.selectRow(&app, row, .mouse);
                             app.context_open_pos = p;
@@ -170,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 else => {},
             }
-            // context 用 right-down/up は menu dismiss に使わせない
+            // Do not let context right-down/up dismiss the menu
             if (swallow_right_for_context) {
                 if (ev == .mouse_down and ev.mouse_down.button == .right) continue;
                 if (ev == .mouse_up and ev.mouse_up.button == .right) {
@@ -183,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
 
         ui.buildUi(&app);
         ctx.endFrame();
-        // menuBarPopup の後に context を開く（同時 1 件制約: menu を context で置換し得る）
+        // Open context after menuBarPopup (one-at-a-time constraint: context may replace the menu)
         ui.handleOverlays(&app);
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };

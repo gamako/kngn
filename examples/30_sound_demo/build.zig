@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
+// build_helpers/ is a symlink to ../../build_helpers.
 const platform = @import("build_helpers/platform.zig");
 
 const PROJECT_ROOT = "../..";
@@ -9,8 +9,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // sound と harness が dsp.zig を共有するため kit_libs 経由で同一 module instance を渡す
-    // （二重 module 化で「file exists in modules 'dsp' and 'dsp0'」を防ぐ）。
+    // sound and harness share dsp.zig, so pass the same module instance via kit_libs
+    // (avoids dual modules triggering "file exists in modules 'dsp' and 'dsp0'").
     const platform_types = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
     });
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     gfx.addImport("png", png);
     gfx.addImport("pixelops", pixelops);
 
-    // link_audio=true → buildStandalone が audio facade + harness を配線（digest audio 用）。
+    // link_audio=true → buildStandalone wires the audio facade + harness (for digest audio).
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_30_sound_demo",
         .main_source = b.path("main.zig"),

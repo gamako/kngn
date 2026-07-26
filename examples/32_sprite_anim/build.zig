@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
+// build_helpers/ is a symlink to ../../build_helpers.
 const platform = @import("build_helpers/platform.zig");
 
 const PROJECT_ROOT = "../..";
@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // kit 配線: apps/editor/build.zig を手本に、png を 1 instance で共有する（二重化回避）。
+    // kit wiring: follow apps/editor/build.zig; share one png instance (avoid duplication).
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
@@ -53,8 +53,8 @@ pub fn build(b: *std.Build) void {
     sound.addImport("dsp", dsp);
     sound.addImport("synth", synth);
 
-    // kit.gfx（TASK-111.2/111.3）: atlas/animation は gfx.zig 相対 import のため
-    // 追加 named module は不要（sprite/helpers のみ配線）。
+    // kit.gfx: atlas/animation are relative imports from gfx.zig, so
+    // no extra named module is needed (wire sprite/helpers only).
     const gfx_keyboard = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
     });
@@ -77,14 +77,14 @@ pub fn build(b: *std.Build) void {
     gfx.addImport("fixed_timestep", gfx_ft);
     gfx.addImport("fps_counter", gfx_fps);
     gfx.addImport("keyboard", gfx_keyboard);
-    // action_map（gfx 内相対 import）が gamepad + platform_types を要求する（TASK-111.8）
+    // action_map (relative import inside gfx) needs gamepad + platform_types
     const gamepad_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
     });
     gamepad_mod.addImport("platform_types", platform_types);
     gfx.addImport("gamepad", gamepad_mod);
     gfx.addImport("platform_types", platform_types);
-    gfx.addImport("gmath", gmath); // TileMap 衝突（TASK-111.5。additive）
+    gfx.addImport("gmath", gmath); // TileMap collision (additive)
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_32_sprite_anim",
@@ -104,7 +104,7 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
-            // gfx(action_map) と同一 gamepad instance（TASK-111.8 / 111.5: dual module 回避）
+            // Same gamepad instance as gfx(action_map) (avoid dual modules)
             .gamepad = gamepad_mod,
         },
     });

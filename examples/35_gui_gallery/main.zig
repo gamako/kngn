@@ -1,12 +1,12 @@
-//! GUI widget capability gallery (TASK-121.1).
+//! GUI widget capability gallery.
 //!
-//! APG / Dear ImGui の参照軸と、libs/gui の現有 API を一つの画面で照合する
-//! 固定レイアウト example。未対応項目は実装せず、対象タスクを注記する。
+//! Fixed-layout example that checks APG / Dear ImGui reference axes against libs/gui's current API
+//! on one screen. Unsupported items are not implemented; gaps are noted in the overview.
 //!
-//! ホットパス宣言:
-//! - widget の構築・DrawList への追加はフレーム毎。計算量は表示項目数に対する O(N)。
-//! - 全画素ループ、framebuffer 全面コピー、独自 rasterizer、RT 経路は追加しない。
-//! - SV square / hue bar / stepgrid の描画と固定 gradient buffer は libs/gui に委譲する。
+//! Hot path declaration:
+//! - Widget build and DrawList appends are per-frame. Cost is O(N) in the number of visible items.
+//! - No all-pixel loop, full framebuffer copy, custom rasterizer, or RT path is added.
+//! - SV square / hue bar / stepgrid draw and the fixed gradient buffer are delegated to libs/gui.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -47,7 +47,7 @@ const SECTIONS = [_]SectionMeta{
     .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 13, .missing = 13 },
 };
 
-/// overview 表示用: demo section（overview/missing 以外）の widgets 合計。
+/// For overview display: total widgets across demo sections (excluding overview/missing).
 fn semanticWidgetTotal() u32 {
     var n: u32 = 0;
     for (SECTIONS) |s| {
@@ -150,7 +150,7 @@ const image_pixels = [_]u32{
     0xFFE0C050, 0xFF20242C, 0xFF4A90E2, 0xFF20242C, 0xFF4A90E2, 0xFF20242C, 0xFFE0C050, 0xFF20242C,
 };
 
-// app 側 16x16 1bit icon 資産（gui には置かない。bit15=左端）
+// App-side 16x16 1-bit icon asset (not stored in gui. bit15 = left edge)
 const ICON_PEN: [16]u16 = .{
     0b0000000000000000,
     0b0000000000011000,
@@ -217,7 +217,7 @@ const App = struct {
     collapsible_open: bool = false,
     menu: gui.MenuBarState = .{},
     text: *gui.TextBuffer,
-    // Cmd+V のフレームローカル paste（TASK-120 consumer 配線。event loop で set・frame 先頭で clear）
+    // Frame-local paste for Cmd+V (consumer wiring. set in the event loop; clear at frame start)
     paste_buf: [4096]u8 = undefined,
     paste_text: ?[]const u8 = null,
 
@@ -328,7 +328,7 @@ fn matrixFor(section: Section) []const MatrixRow {
 }
 
 fn renderMatrix(ctx: *gui.Context, rows: []const MatrixRow) void {
-    // 列見出しはセル幅（34px=4文字強）に揃えた略記。正式名は overview の State axis 行を参照。
+    // Column headers are abbreviations sized to the cell width (34px ≈ 4+ chars). Formal names are in the overview State axis row.
     const HEADERS = [_][]const u8{ "norm", "hovr", "actv", "focs", "dsbl", "emp", "min", "max", "none" };
     ctx.beginBox(.{ .direction = .row, .gap = 2 });
     ctx.beginBox(.{ .width = .{ .fixed = 104 } });
@@ -369,8 +369,8 @@ fn renderOverview(ctx: *gui.Context) void {
     ctx.endBox();
     ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
     ctx.label("APG × ImGui × libs/gui");
-    ctx.label("See docs/plans/PLAN_gui_capability_matrix.md");
-    ctx.label("TASK-121.2 owns abnormal cases");
+    ctx.label("Capability gaps are noted in the overview");
+    ctx.label("abnormal cases live in the torture example");
     ctx.endBox();
     ctx.endBox();
 }
@@ -386,7 +386,7 @@ fn renderBasic(ctx: *gui.Context, app: *App) void {
 fn renderText(ctx: *gui.Context, app: *App) void {
     const input = ctx.textInputId(Ids.text_input, app.text, .{ .width = .{ .fixed = 320 }, .placeholder = "empty", .paste_text = app.paste_text });
     const selectable = ctx.selectableLabelId(Ids.selectable, "Selectable label (drag)", .{});
-    // Cmd+C/X を実クリップボードへ（TASK-120 の consumer 配線。example_28 と同型）
+    // Cmd+C/X to the real clipboard (consumer wiring; same shape as example_28)
     if (input.copy_request) |r| platform.setClipboardText(r.text);
     if (selectable.copy_request) |r| platform.setClipboardText(r.text);
 }
@@ -416,8 +416,8 @@ fn renderColor(ctx: *gui.Context, app: *App) void {
 
 fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
-    // iconButton: selected (pen) / normal (brush) — app 側 16x16 1bit 資産
-    // tooltip は直前 interactive widget に付く（TASK-145.2）。hover 500ms で overlay。
+    // iconButton: selected (pen) / normal (brush) — app-side 16x16 1-bit assets
+    // tooltip attaches to the previous interactive widget. Overlay after 500ms hover.
     ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
     ctx.label("iconButton:");
     _ = ctx.iconButtonId(Ids.icon_pen, &ICON_PEN, true);
@@ -427,7 +427,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.labelEx("selected / normal + tooltip", ctx.style.text_subtle);
     ctx.endBox();
 
-    // Collapsible: dynamic title（ツール名連動）+ body child（open/closed で画面差）
+    // Collapsible: dynamic title (tied to tool name) + body child (open/closed changes the screen)
     var title_buf: [48]u8 = undefined;
     const tool_name: []const u8 = if (app.radio_brush) "Brush" else "Pen";
     const title = std.fmt.bufPrint(&title_buf, "Tool Options — {s}", .{tool_name}) catch "Tool Options";
@@ -552,8 +552,8 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "gallery", .ctx = &app, .ext = "txt", .digest = galleryDigest, .desc = "GUI capability gallery section/state matrix" });
 
     var running = true;
-    // TASK-142: 起動直後はテキスト編集フォーカス無し = IME 非経路（n/p/q 等のショートカットを
-    // IME 有効中でも受け取れる）。毎フレーム末尾で focus 状態に追従して更新する。
+    // Right after launch there is no text-edit focus = IME is not on the path (shortcuts like n/p/q still
+    // arrive even while IME is enabled). Update to follow focus at the end of every frame.
     window.setTextInputActive(false);
     main_loop: while (running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
@@ -575,8 +575,8 @@ pub fn main(init: std.process.Init) !void {
                     .ESCAPE => running = false,
                     .PAGE_DOWN => app.changeSection(1),
                     .PAGE_UP => app.changeSection(-1),
-                    // PAGE キーが無いキーボード向け（実機フィードバック 2026-07-17）。
-                    // text 入力に focus がある間は文字入力を優先する。
+                    // For keyboards without PAGE keys (hardware feedback 2026-07-17).
+                    // While a text field has focus, prefer character input.
                     .Q => if (ctx.state.focused_id == 0) {
                         running = false;
                     },
@@ -596,8 +596,8 @@ pub fn main(init: std.process.Init) !void {
         gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         window.present();
 
-        // TASK-142: このフレームで確定した focus に IME 経路を追従させる（テキスト欄 focus 時のみ
-        // keyDown を IME へ渡す）。次フレームの keyDown 判定に反映される。
+        // Follow this frame's settled focus onto the IME path (forward keyDown to IME only while a text field
+        // has focus). Takes effect for the next frame's keyDown decision.
         window.setTextInputActive(ctx.wantsKeyboard());
     }
 }

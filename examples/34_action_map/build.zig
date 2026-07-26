@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
+// build_helpers/ is a symlink to ../../build_helpers.
 const platform = @import("build_helpers/platform.zig");
 
 const PROJECT_ROOT = "../..";
@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // kit 配線: examples/33_camera と同型。gfx と kit.gamepad で gamepad module を共有（TASK-111.8）。
+    // kit wiring: same shape as examples/33_camera. Share the gamepad module between gfx and kit.gamepad.
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     sound.addImport("dsp", dsp);
     sound.addImport("synth", synth);
 
-    // gamepad は 1 instance を gfx(action_map) と kit で共有する。
+    // Share one gamepad instance between gfx(action_map) and kit.
     const gamepad_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
     });
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     gfx.addImport("keyboard", gfx_keyboard);
     gfx.addImport("gamepad", gamepad_mod);
     gfx.addImport("platform_types", platform_types);
-    gfx.addImport("gmath", gmath); // TileMap 衝突（TASK-111.5。additive）
+    gfx.addImport("gmath", gmath); // TileMap collision (additive)
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_34_action_map",

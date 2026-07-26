@@ -1,11 +1,11 @@
-//! GUI layout torture suite (TASK-121.2).
+//! GUI layout torture suite.
 //!
-//! libs/gui の異常系・境界条件を人工的に組み合わせ、クラッシュ・入力漏れ・状態残留・
-//! レイアウト破綻を harness で自動回帰する。libs/gui 本体は変更しない（公開 API のみ）。
+//! Artificially combines libs/gui abnormal / boundary cases so crashes, missed input, leftover state, and
+//! layout breakage regress automatically under the harness. Does not change libs/gui itself (public API only).
 //!
-//! ホットパス宣言:
-//! - widget 構築ループはフレーム毎。計算量は widget 数に対する O(N)。
-//! - 全画素ループ、framebuffer 全面コピー、独自 rasterizer、RT 経路は追加しない。
+//! Hot path declaration:
+//! - Widget build loop is per-frame. Cost is O(N) in widget count.
+//! - No all-pixel loop, full framebuffer copy, custom rasterizer, or RT path is added.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -101,7 +101,7 @@ const App = struct {
     slider_val: i32 = 0,
     show_disappear: bool = true,
     layout_generation: u32 = 0,
-    /// F1 でトグルする固定オフセット（累積させず座標を安定させる）
+    /// Fixed offset toggled with F1 (no accumulation; keeps coordinates stable)
     layout_shift: bool = false,
     hide_active_widget: bool = false,
     behind_clicks: u32 = 0,
@@ -245,7 +245,7 @@ fn widgetName(id: gui.Id) []const u8 {
 }
 
 fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
-    // DIGEST_BUF_LEN=1024。ケース共通の短いヘッダ + ケース別フィールド。
+    // DIGEST_BUF_LEN=1024. Short header shared across cases + per-case fields.
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     const ctx = app.ctx;
     var off: usize = 0;
@@ -323,7 +323,7 @@ fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
 }
 
 fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
-    // DIGEST_BUF_LEN=1024。ケース別キーのみ出して溢れを防ぐ。
+    // DIGEST_BUF_LEN=1024. Emit only per-case keys to avoid overflow.
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     var off: usize = 0;
     appendFmt(buf, &off, "case={s} screen_w={d} screen_h={d} overflow={d} draw_ok={d}", .{
@@ -535,7 +535,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.endBox();
     ctx.endBox();
 
-    // Nested ScrollArea（内側を上部に置き、初期フレームで両方の viewport が hit-test 可能）
+    // Nested ScrollArea (inner placed at the top so both viewports are hit-testable on the first frame)
     ctx.beginScrollArea(Ids.outer_scroll, &app.outer_scroll, .{
         .width = .{ .grow = 1 },
         .height = .{ .fixed = 240 },
@@ -594,7 +594,7 @@ fn renderText(ctx: *gui.Context, app: *App) void {
         .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
     });
     ctx.label("text torture: long / empty / CJK / emoji / newline / caret");
-    // 長文は label / popup item に載せ、button は短いラベル（巨大 min 幅でレイアウトを壊さない）
+    // Put long text on label / popup items; keep button labels short (huge min width would break layout)
     _ = ctx.buttonId(Ids.text_button, "long-label-btn", .{ .min_w = 200 });
     ctx.label(app.long_ascii);
     ctx.label(app.long_mixed);
@@ -621,7 +621,7 @@ fn renderInputState(ctx: *gui.Context, app: *App) void {
     });
     ctx.label("input/state torture: active drag / disappear / popup modal");
 
-    // F1 トグルで pad を切り替えて layout 変化を起こす（座標は 2 状態のみ）
+    // F1 toggle switches pad to change layout (coordinates have only two states)
     const pad_top: i32 = if (app.layout_shift) 28 else 12;
     ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .padding = .{ pad_top, 0, 0, 0 }, .gap = 8 });
 
@@ -768,7 +768,7 @@ pub fn main(init: std.process.Init) !void {
     const screen_w = parseDim(envSlice("VP_GUI_WIDTH"), DEFAULT_W, "VP_GUI_WIDTH");
     const screen_h = parseDim(envSlice("VP_GUI_HEIGHT"), DEFAULT_H, "VP_GUI_HEIGHT");
 
-    var window = try platform.Window.create(screen_w, screen_h, "GUI Torture Suite (TASK-121.2)");
+    var window = try platform.Window.create(screen_w, screen_h, "GUI Torture Suite");
     defer window.destroy();
 
     var ctx = gui.Context.init(gpa, gui.default_font);
@@ -877,7 +877,7 @@ pub fn main(init: std.process.Init) !void {
 
         renderFrame(&ctx, &app);
 
-        // popup draw (endFrame 後契約)
+        // popup draw (post-endFrame contract)
         switch (app.case) {
             .text => {
                 const pr = ctx.popupMenu(Ids.text_popup, &app.text_popup_items);

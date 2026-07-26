@@ -1,46 +1,46 @@
-//! 20_capture_demo: キャプチャ入力基盤（TASK-49 ファミリー）のドッグフード用デモ。
+//! 20_capture_demo: dogfooding demo for the capture input foundation (see docs/capture.md).
 //!
-//! mic → 波形(オシロスコープ) + FFT スペクトログラム + レベルメータ可視化（libs/viz 流用。
-//! apps/synth が手本）、camera → canvas（framebuffer）表示、の2系統を1画面にまとめる。
+//! mic → waveform (oscilloscope) + FFT spectrogram + level-meter viz (reuses libs/viz;
+//! apps/synth is the model), camera → canvas (framebuffer) display, both on one screen.
 //!
-//! ## データソースの選択（本番 vs headless 検証）
+//! ## Choosing the data source (production vs headless verification)
 //!
-//! `harness.isCaptureSyntheticActive()`（`VP_HARNESS_CAPTURE_SYNTHETIC=1` かつ harness 有効時のみ
-//! true。core/control/harness.zig, TASK-49.5）で分岐する:
-//! - **本番（既定）**: `core/camera.zig`（macOS=AVFoundation 実 backend / 他OS=stub）と
-//!   `core/audio.zig` の capture 拡張（macOS=AUHAL input 実 backend / 他OS=stub）を使う。
-//!   実カメラ/マイク + macOS TCC 権限ダイアログが要る（人手・実機依存の手動検証レンジ）。
-//! - **headless 検証**: `core/capture_synthetic.zig`（harness 内蔵の合成 mic/camera source。
-//!   TASK-49.5）を直接使う。実デバイス/TCC 無しで決定論的なパターンを生成できる。
+//! Branches on `harness.isCaptureSyntheticActive()` (true only when `VP_HARNESS_CAPTURE_SYNTHETIC=1`
+//! and the harness is enabled; core/control/harness.zig):
+//! - **Production (default)**: `core/camera.zig` (macOS=AVFoundation real backend / else stub) and
+//!   the capture extension of `core/audio.zig` (macOS=AUHAL input real backend / else stub).
+//!   Needs a real camera/mic plus the macOS TCC permission dialog (manual, hardware-dependent verification).
+//! - **Headless verification**: uses `core/capture_synthetic.zig` directly (harness-built-in synthetic
+//!   mic/camera source). Deterministic patterns with no real device/TCC.
 //!
-//! 両パスとも同じ `App`/描画/probe 経路に合流する（型は `capture_types.VideoFrame`/`AudioInFrame`
-//! の named module 共有により camera.zig 側と capture_synthetic.zig 側で構造的に同一）。
+//! Both paths join the same `App`/draw/probe path (types are structurally identical via the shared named
+//! module `capture_types.VideoFrame`/`AudioInFrame` on the camera.zig and capture_synthetic.zig sides).
 //!
-//! ## スコープ判断（capture facade への配線・kit 昇格）
+//! ## Scope (wiring to the capture facade / kit promotion)
 //!
-//! `docs/plans/capture-foundation-plan.md` 9章は本タスク(49.6)の役割を「mic/camera を使う最小
-//! アプリ + kit への昇格判断」としている。本デモは **kit への camera 昇格を見送り**、
-//! `examples/`（ADR-007 R5 の kit-only 強制対象外。build.zig 冒頭コメント参照）として実装した。
-//! 理由: headless 検証には `core/capture_synthetic.zig`（harness 内蔵・camera/audio facade 非配線。
-//! TASK-49.5 の設計判断）への直 import が必須だが、これは「apps は kit のみ」という R5 の対象外
-//! （examples の従来配線）でしか許されない。camera を kit だけ昇格させても synthetic 経路は
-//! 依然 kit 化できない（49.5 が意図的に decouple した内部ツールであり、これを kit の公開面に
-//! 昇格すると 49.5 の設計意図を薄める）ため、examples 配置に統一した。camera.zig/audio.zig
-//! 自体（facade API）は本タスクでは無変更（consume に徹する）。将来 apps/ 配下の本格カメラアプリが
-//! 必要になったら、その時点で kit 昇格を再検討する。
+//! See docs/capture.md for the capture control/data-plane contract. This demo's role is a minimal
+//! mic/camera app plus a kit-promotion decision. This demo **does not promote camera into kit** and
+//! lives under `examples/` (outside ADR-007 R5's kit-only force; see the build.zig header).
+//! Reason: headless verification needs a direct import of `core/capture_synthetic.zig` (harness-built-in; not wired
+//! through the camera/audio facade). That is only allowed under the traditional examples wiring
+//! (R5 "apps are kit-only" does not apply here). Promoting camera alone into kit still would not kit-ify
+//! the synthetic path (an intentionally decoupled internal tool; putting it on kit's public surface
+//! would dilute that design), so placement stays under examples. camera.zig/audio.zig
+//! themselves (facade APIs) are unchanged here (consume only). Revisit kit promotion when a full camera app under
+//! apps/ is needed.
 //!
-//! ホットパス宣言:
-//! - 毎フレーム全画素塗り（背景 `@memset`）+ camera フレームの canvas 転写（`drawVideoFrame`）は
-//!   **フレーム毎の全画素相当ループ**（性能規約の対象）。ただし転写はブレンド/除算を伴わない不透明
-//!   の行コピー（`camera_macos.zig` の `copyBgraRows` と同クラス）で、clip はループ外で1回だけ
-//!   計算し内側は無検査の `@memcpy` にする。ブレンドが無いため `pixelops` の SIMD 3点セットは
-//!   そもそも該当しない（`copyBgraRows` 自身の判断根拠と同じ）。
-//! - mic capture callback（`micCallback`）: **RT（毎サンプル相当。ブロック単位で呼ばれる）**。
-//!   malloc/lock/IO/panic 禁止。`SampleTap.write()`（alloc/lock 無しの SPSC drop-on-full）のみ行う。
-//! - `capture_synthetic.SyntheticVideoDevice.renderFrame`: 49.5 の判断を継承し
-//!   **イベント時のみ**（本デモでは毎フレーム呼ぶが、対象は 320x240 の小解像度合成画像であり
-//!   実カメラ描画ホットパスと同じ扱いはしない。49.5 の判断根拠をそのまま踏襲）。
-//! - probe digest 組み立て（`captureDemoDigest`）: イベント時のみ（`digest` コマンド発行時）。
+//! Hot path declaration:
+//! - Per-frame full clear (background `@memset`) + canvas blit of the camera frame (`drawVideoFrame`) are
+//!   **per-frame all-pixel-class loops** (under the performance rules). The blit is an opaque row copy with
+//!   no blend/division (same class as `copyBgraRows` in `camera_macos.zig`); clip is computed once outside
+//!   the loop and the inside is unchecked `@memcpy`. With no blend, the `pixelops` SIMD three-point set
+//!   does not apply (same rationale as `copyBgraRows` itself).
+//! - mic capture callback (`micCallback`): **RT (per-sample class; called per block)**.
+//!   No malloc/lock/IO/panic. Only `SampleTap.write()` (alloc/lock-free SPSC drop-on-full).
+//! - `capture_synthetic.SyntheticVideoDevice.renderFrame`: treated as
+//!   **event-only** (this demo calls it every frame, but the target is a small 320x240 synthetic image and
+//!   is not treated like the real-camera draw hot path; same rationale as the synthetic source design).
+//! - probe digest build (`captureDemoDigest`): event-only (when a `digest` command is issued).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -53,7 +53,7 @@ const scope = @import("scope");
 const synthlib = @import("synth");
 
 // ============================================================================
-// レイアウト
+// Layout
 // ============================================================================
 const WIN_W = 920;
 const WIN_H = 300;
@@ -82,7 +82,7 @@ const MIC_SAMPLE_RATE = 48000;
 const MIC_CHANNELS = 1;
 
 const BG_COLOR: u32 = 0xFF14141C;
-const CAM_EMPTY_COLOR: u32 = 0xFF202028; // カメラ未取得時のプレースホルダ背景
+const CAM_EMPTY_COLOR: u32 = 0xFF202028; // Placeholder background when no camera frame
 const BORDER_COLOR: u32 = 0xFF404858;
 
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
@@ -90,7 +90,7 @@ const Scope = scope.Oscilloscope(SCOPE_W, SCOPE_H);
 const Tap = synthlib.SampleTap(8192);
 
 // ============================================================================
-// データソース（本番 = 実 backend / headless 検証 = synthetic）
+// Data source (production = real backend / headless verification = synthetic)
 // ============================================================================
 
 const VideoSource = union(enum) {
@@ -131,8 +131,8 @@ fn closeMicSource(ms: *MicSource) void {
     ms.* = .none;
 }
 
-/// 直近の video フレームを取得する。synthetic は毎回 `renderFrame` を呼ぶ pull 型、
-/// real は capture スレッドが publish 済みの最新フレームを覗く poll 型（TripleBuffer）。
+/// Fetch the latest video frame. synthetic is pull-style (`renderFrame` every time);
+/// real is poll-style peeking the latest frame published by the capture thread (TripleBuffer).
 fn pollVideoFrame(vs: *VideoSource, tick: *u64) ?camera.VideoFrame {
     return switch (vs.*) {
         .none => null,
@@ -149,17 +149,17 @@ fn micCallback(frame: audio.AudioInFrame, userdata: ?*anyopaque) void {
     app.tap.write(frame.samples);
 }
 
-/// カメラ権限を要求し、拒否/未対応なら理由をログして `.none` を返す（人手/実機依存の TCC 目視は
-/// 手動検証レンジ。backlog task-49.6 notes 参照）。
+/// Request camera permission; on deny/unsupported log the reason and return `.none` (TCC visual checks
+/// are in the manual verification range).
 ///
-/// **headless ガード**: `harness.isHeadlessActive()` が true のときは AVFoundation を一切呼ばず即
-/// `.none` を返す。`requestPermission()`（`avRequestAccessBlocking`）は completion handler を
-/// runloop 経由で待つブロッキング実装のため、display/runloop の無い headless 環境では応答が
-/// 永久に返らずハングしうることを実測確認済み（codex レビュー指摘。TCC ダイアログを見せる
-/// 手段が無い headless で real capture を試みること自体が無意味なので、fail-fast で回避する）。
+/// **Headless guard**: when `harness.isHeadlessActive()` is true, never call AVFoundation and return
+/// `.none` immediately. `requestPermission()` (`avRequestAccessBlocking`) blocks waiting on a completion
+/// handler via the runloop, so with no display/runloop in headless the reply may never arrive and it can
+/// hang. Trying real capture headless (no way to show a TCC dialog) is meaningless, so
+/// fail-fast.
 fn openRealVideo(allocator: std.mem.Allocator) VideoSource {
     if (harness.isHeadlessActive()) {
-        std.debug.print("[capture_demo] headless active: real camera を試みない（TCC 待機がハングしうるため。VP_HARNESS_CAPTURE_SYNTHETIC=1 を使うこと）\n", .{});
+        std.debug.print("[capture_demo] headless active: not attempting real camera (TCC wait can hang; use VP_HARNESS_CAPTURE_SYNTHETIC=1)\n", .{});
         return .none;
     }
     const perm = camera.requestPermission() catch |err| {
@@ -192,12 +192,12 @@ fn openSyntheticVideo(allocator: std.mem.Allocator) VideoSource {
     return .{ .synthetic = dev };
 }
 
-/// マイク権限を要求し、拒否/未対応なら理由をログして `.none` を返す（openRealVideo と対称）。
-/// headless ガードは openRealVideo と同じ理由（`requestCapturePermission()` も同じ
-/// `avRequestAccessBlocking` 経由でハングしうる）。
+/// Request mic permission; on deny/unsupported log the reason and return `.none` (symmetric with openRealVideo).
+/// Headless guard has the same reason as openRealVideo (`requestCapturePermission()` can also hang via
+/// the same `avRequestAccessBlocking`).
 fn openRealMic(allocator: std.mem.Allocator, app: *App) MicSource {
     if (harness.isHeadlessActive()) {
-        std.debug.print("[capture_demo] headless active: real mic を試みない（TCC 待機がハングしうるため。VP_HARNESS_CAPTURE_SYNTHETIC=1 を使うこと）\n", .{});
+        std.debug.print("[capture_demo] headless active: not attempting real mic (TCC wait can hang; use VP_HARNESS_CAPTURE_SYNTHETIC=1)\n", .{});
         return .none;
     }
     const perm = audio.requestCapturePermission() catch |err| {
@@ -223,11 +223,11 @@ fn openRealMic(allocator: std.mem.Allocator, app: *App) MicSource {
         return .none;
     };
     std.debug.print("[capture_demo] real mic opened sr={d} ch={d}\n", .{ dev.config().sample_rate, dev.config().channels });
-    // 可視化パイプライン（tap→spec/osc/meter）は mono(1ch) 前提。実デバイスの折衝結果が要求と
-    // 異なる場合は明示警告する（downmix はしない。channels 不一致時は周波数軸/波形が実信号と
-    // ズレて見えうることをログで示す。codex レビュー指摘）。
+    // The viz pipeline (tap→spec/osc/meter) assumes mono (1ch). If the real device negotiates a different
+    // channel count than requested, warn explicitly (no downmix; when channels disagree the frequency axis /
+    // waveform can look shifted relative to the real signal).
     if (dev.config().channels != MIC_CHANNELS) {
-        std.debug.print("[capture_demo] warning: real mic negotiated channels={d} (requested {d}); 可視化は mono 前提のためズレて見えうる\n", .{ dev.config().channels, MIC_CHANNELS });
+        std.debug.print("[capture_demo] warning: real mic negotiated channels={d} (requested {d}); viz assumes mono so it may look shifted\n", .{ dev.config().channels, MIC_CHANNELS });
     }
     return .{ .real = dev };
 }
@@ -251,9 +251,9 @@ fn openSyntheticMic(allocator: std.mem.Allocator, app: *App) MicSource {
     return .{ .synthetic = dev };
 }
 
-/// 実効サンプルレートを取得する（open 済みソースの `.config().sample_rate`。未 open は既定値）。
-/// 実マイクは AUHAL のハードウェア折衝で `MIC_SAMPLE_RATE` と異なる値に決まりうるため、
-/// スペクトログラムの周波数軸をこの値で再算出する必要がある（codex レビュー指摘）。
+/// Read the effective sample rate (open source's `.config().sample_rate`; default when not open).
+/// A real mic may settle to a value other than `MIC_SAMPLE_RATE` via AUHAL hardware negotiation, so
+/// the spectrogram frequency axis must be recomputed from this value.
 fn micSampleRate(ms: MicSource) u32 {
     return switch (ms) {
         .none => MIC_SAMPLE_RATE,
@@ -263,7 +263,7 @@ fn micSampleRate(ms: MicSource) u32 {
 }
 
 // ============================================================================
-// App 状態
+// App state
 // ============================================================================
 
 const App = struct {
@@ -297,10 +297,10 @@ fn captureDemoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 }
 
 // ============================================================================
-// 描画
+// Drawing
 // ============================================================================
 
-/// framebuffer のピクセル u32 packing（gui.Color / scope.zig と同じ: メモリ B,G,R,A = u32 0xAARRGGBB）。
+/// framebuffer pixel u32 packing (same as gui.Color / scope.zig: memory B,G,R,A = u32 0xAARRGGBB).
 fn fillRect(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, w: usize, h: usize, color: u32) void {
     const copy_w = if (x0 >= fb_w) 0 else @min(w, fb_w - x0);
     const copy_h = if (y0 >= fb_h) 0 else @min(h, fb_h - y0);
@@ -318,34 +318,34 @@ fn drawBorder(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, w: 
     fillRect(pixels, fb_w, fb_h, x0 + w - 1, y0, 1, h, color);
 }
 
-/// カメラフレームを canvas 領域(x0,y0 固定)へ描画する。
+/// Draw a camera frame into the canvas region (fixed x0,y0).
 ///
-/// ホットパス宣言: フレーム到着毎に呼ばれる「フレーム毎の全画素相当」ループだが、ブレンド/除算を
-/// 伴わない不透明の行コピー（`core/camera_macos.zig` の `copyBgraRows` と同クラス）。clip はループ外
-/// で1回だけ計算し、内側は無検査の `@memcpy`（行連続アクセス）にする。ブレンドが無いため
-/// `pixelops` の SIMD 3点セットはそもそも対象外（copyBgraRows 自身の判断根拠と同じ）。
-/// カメラフレームを CAM_W×CAM_H の枠に nearest-neighbor で収めて描く。
+/// Hot path declaration: an all-pixel-class loop called on each arriving frame, but an opaque row copy with
+/// no blend/division (same class as `copyBgraRows` in `core/camera_macos.zig`). Clip is computed once
+/// outside the loop; inside is unchecked `@memcpy` (row-contiguous). With no blend,
+/// the `pixelops` SIMD three-point set does not apply (same rationale as copyBgraRows).
+/// Fit the camera frame into the CAM_W×CAM_H box with nearest-neighbour.
 ///
-/// frame の実寸（`frame.width/height`）は driver 都合で要求値と食い違う（V4L2 は要求解像度を
-/// 対応する離散値へ丸める。例: 320×240 要求 → uvcvideo が 640×480 を返す）。実寸のまま転写すると
-/// 枠と隣の可視化パネルにはみ出すため、常に枠サイズへスケールする。640×480→320×240 のように
-/// アスペクト比が一致する場合は全視野が歪みなく収まる（一致しない場合は非等方スケールになるが
-/// デモのプレビュー用途では許容）。
+/// The frame's actual size (`frame.width/height`) can disagree with the request for driver reasons (V4L2 rounds
+/// the requested resolution to a supported discrete value; e.g. 320×240 request → uvcvideo returns 640×480). Blitting
+/// at native size would spill into the neighbouring viz panel, so always scale to the box. When aspects match
+/// as in 640×480→320×240 the full FOV fits without distortion (non-matching aspects become anisotropic, which
+/// is acceptable for a demo preview).
 ///
-/// ホットパス宣言: 毎フレーム、枠 CAM_W×CAM_H 分の全画素を走る。per-pixel 除算を避けるため列の
-/// ソース x マップをループ外で1回だけ作る（性能規約「per-pixel 除算の禁止」）。SIMD 化はしない
-/// （camera fps・320×240 のデモプレビューで十分速く、nearest-neighbor gather は SIMD 化の利が薄い）。
+/// Hot path declaration: every frame runs over all CAM_W×CAM_H box pixels. To avoid per-pixel division, build the
+/// column source-x map once outside the loop (performance rule "no per-pixel division"). No SIMD
+/// (fast enough at camera fps / 320×240 demo preview; nearest-neighbour gather gains little from SIMD).
 fn drawVideoFrame(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, frame: camera.VideoFrame) void {
     if (x0 >= fb_w or y0 >= fb_h or frame.width == 0 or frame.height == 0) return;
-    const box_w = @min(@as(usize, CAM_W), fb_w - x0); // fb 端で clip（枠が画面外に出る分だけ）
+    const box_w = @min(@as(usize, CAM_W), fb_w - x0); // Clip at the fb edge (only the part of the box that is off-screen)
     const box_h = @min(@as(usize, CAM_H), fb_h - y0);
-    // 列マップ（枠 x → フレーム x）をループ外で1回。box_w <= CAM_W なので [CAM_W]usize で足りる。
+    // Column map (box x → frame x) once outside the loop. box_w <= CAM_W so [CAM_W]usize is enough.
     var x_map: [CAM_W]usize = undefined;
     var dx: usize = 0;
     while (dx < box_w) : (dx += 1) x_map[dx] = dx * @as(usize, frame.width) / CAM_W;
     var dy: usize = 0;
     while (dy < box_h) : (dy += 1) {
-        const sy = dy * @as(usize, frame.height) / CAM_H; // 行のソース y（per-row・per-pixel ではない）
+        const sy = dy * @as(usize, frame.height) / CAM_H; // Source y for the row (per-row; not per-pixel)
         const src_base = sy * @as(usize, frame.stride);
         const dst_base = (y0 + dy) * fb_w + x0;
         dx = 0;
@@ -358,7 +358,7 @@ fn drawVideoFrame(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize,
 // ============================================================================
 
 pub fn main() !void {
-    std.debug.print("20_capture_demo: mic waveform/FFT + camera canvas (TASK-49.6). ESC to quit.\n", .{});
+    std.debug.print("20_capture_demo: mic waveform/FFT + camera canvas. ESC to quit.\n", .{});
 
     const allocator = std.heap.c_allocator;
 
@@ -372,8 +372,8 @@ pub fn main() !void {
     var window = try platform.Window.create(WIN_W, WIN_H, "20_capture_demo - mic viz + camera canvas");
     defer window.destroy();
 
-    // データソース選択: VP_HARNESS_CAPTURE_SYNTHETIC=1 + harness 有効時のみ synthetic
-    // （core/control/harness.zig の isCaptureSyntheticActive()。TASK-49.5）。既定は本番(実 backend)。
+    // Data-source choice: synthetic only when VP_HARNESS_CAPTURE_SYNTHETIC=1 and harness is enabled
+    // (harness.isCaptureSyntheticActive() in core/control/harness.zig). Default is production (real backend).
     const synthetic_mode = harness.isCaptureSyntheticActive();
     std.debug.print("[capture_demo] mode={s}\n", .{if (synthetic_mode) "synthetic (headless verification)" else "real (production; requires camera/mic + TCC permission)"});
 
@@ -382,12 +382,12 @@ pub fn main() !void {
 
     app.mic = if (synthetic_mode) openSyntheticMic(allocator, app) else openRealMic(allocator, app);
     defer closeMicSource(&app.mic);
-    // spectrogram の対数周波数軸は実効サンプルレートで算出する（実マイクは AUHAL のハードウェア
-    // 折衝で MIC_SAMPLE_RATE と異なる値に決まりうる。codex レビュー指摘）。open 後・feed 前に
-    // 呼ぶ（mic 未 open/synthetic は要求どおり MIC_SAMPLE_RATE のまま）。
+    // Spectrogram log-frequency axis uses the effective sample rate (a real mic may settle away from
+    // MIC_SAMPLE_RATE via AUHAL hardware negotiation). Call after open, before feed
+    // (unopened mic / synthetic stays at the requested MIC_SAMPLE_RATE).
     app.spec.init(@floatFromInt(micSampleRate(app.mic)));
 
-    // ヘッドレス検証 harness の custom probe を登録（harness 無効時は no-op）。
+    // Register the headless harness custom probe (no-op when harness is disabled).
     platform.registerProbe(.{ .name = "capture_demo", .ctx = app, .digest = captureDemoDigest });
 
     var mono_scratch: [4096]f32 = undefined;
@@ -407,7 +407,7 @@ pub fn main() !void {
             }
         }
 
-        // mic tap を drain → オシロスコープ / スペクトログラム / レベルメータへ供給。
+        // Drain the mic tap → feed oscilloscope / spectrogram / level meter.
         while (true) {
             const n = app.tap.read(&mono_scratch);
             if (n == 0) break;
@@ -417,7 +417,7 @@ pub fn main() !void {
             app.meter.feed(mono_scratch[0..n]);
         }
 
-        // 描画: 背景 → カメラ領域(プレースホルダ or 実フレーム) → mic 可視化。
+        // Draw: background → camera region (placeholder or real frame) → mic viz.
         @memset(fb.pixels, BG_COLOR);
 
         fillRect(fb.pixels, fb.width, fb.height, CAM_X0, CAM_Y0, CAM_W, CAM_H, CAM_EMPTY_COLOR);
@@ -433,6 +433,6 @@ pub fn main() !void {
 
         window.present();
 
-        platform.frameDelay(16_000_000); // ~16ms（約60fps）
+        platform.frameDelay(16_000_000); // ~16ms (~60fps)
     }
 }

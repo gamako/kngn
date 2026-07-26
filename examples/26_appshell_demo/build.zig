@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     paint.addImport("pixelops", pixelops);
     paint.addImport("font", font);
     paint.addImport("serde", serde);
-    // KitLibs.gfx 必須（後から追加されたフィールド。未指定だと build.zig が失敗する）
+    // KitLibs.gfx is required (a field added later; omitting it makes build.zig fail)
     const gfx = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" } });
     gfx.addImport("png", png);
     gfx.addImport("pixelops", pixelops);

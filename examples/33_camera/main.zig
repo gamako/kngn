@@ -1,18 +1,18 @@
-//! 33_camera: 2D カメラ / ビューポート デモ（TASK-111.4）。
+//! 33_camera: 2D camera / viewport demo.
 //!
-//! - 画面より広いワールド（1280×720）に市松模様 + 目印 usako スプライト
-//! - 矢印 / WASD で手動 pan、F でターゲット追従 ON/OFF
-//! - 固定 f32 lerp + FixedTimeStep 60Hz（時刻・乱数なし → CRC 決定論）
+//! - World larger than the screen (1280×720) with a checkerboard + landmark usako sprite
+//! - Arrows / WASD for manual pan; F toggles target follow ON/OFF
+//! - Fixed f32 lerp + FixedTimeStep 60Hz (no wall-clock / RNG → CRC-deterministic)
 //!
-//! 決定論の前提（CRC 固定値はこれに依存）:
-//! - 640×360・固定背景色・固定 world / tile / target 初期位置・固定 pan 速度 / lerp alpha
-//! - harness 仮想クロック（getTime = frame/60）と fixed 60Hz の組合せ
-//! - screen 丸めは @floor（負座標も切り捨て方向を固定）
+//! Determinism assumptions (fixed CRC values depend on these):
+//! - 640×360, fixed background, fixed world / tile / target init, fixed pan speed / lerp alpha
+//! - harness virtual clock (getTime = frame/60) combined with fixed 60Hz
+//! - screen rounding via @floor (truncation direction fixed for negative coords too)
 //!
-//! ホットパス宣言:
-//! - Camera 変換/clamp/follow: 論理更新毎 O(1)
-//! - 背景 @memset + 市松は可視タイルのみ行連続 span（viewport 外 clip-hoist）
-//! - スプライトは drawSpriteEx 委譲（pixelops 再実装なし）
+//! Hot path declaration:
+//! - Camera transform/clamp/follow: O(1) per logical update
+//! - Background @memset + checkerboard only on visible tiles as row-contiguous spans (clip-hoist outside viewport)
+//! - Sprites delegated to drawSpriteEx (no pixelops reimplementation)
 
 const std = @import("std");
 const kit = @import("kit");
@@ -31,11 +31,11 @@ const TILE: f32 = 40;
 const COLOR_TILE_A: u32 = 0xFF2A3545;
 const COLOR_TILE_B: u32 = 0xFF354050;
 
-/// 手動 pan 速度（world px / fixed update）
+/// Manual pan speed (world px / fixed update)
 const PAN_SPEED: f32 = 8;
-/// 追従 lerp（固定 f32。Camera.follow の決定論前提）
+/// Follow lerp (fixed f32; Camera.follow determinism assumption)
 const FOLLOW_ALPHA: f32 = 0.15;
-/// ターゲット移動速度（world px / fixed update）
+/// Target move speed (world px / fixed update)
 const TARGET_SPEED: i32 = 2;
 
 const viewport: gfx.camera.Rect = .{
@@ -73,10 +73,10 @@ pub fn main() !void {
     defer spr.deinit(allocator);
 
     var cam = gfx.Camera.init(.{ .x = 0, .y = 0 }, 1);
-    // 初期は左上。境界 clamp は毎回更新で適用。
+    // Start at top-left. Boundary clamp applied every update.
     cam.clampToWorld(viewport, world_bounds);
 
-    // 目印ターゲット: 固定 Y、X は整数 ping-pong（決定的）
+    // Landmark target: fixed Y; X is integer ping-pong (deterministic)
     var target_x: i32 = 200;
     const target_y: i32 = 280;
     var target_dir: i32 = 1;
@@ -117,7 +117,7 @@ pub fn main() !void {
 
         const steps = timestep.update(frame_time);
         for (0..steps) |_| {
-            // ターゲット移動（常に進行。follow の有無に依存しない）
+            // Target motion (always advances; independent of follow)
             target_x += target_dir * TARGET_SPEED;
             if (target_x >= target_max_x) {
                 target_x = target_max_x;
@@ -159,10 +159,10 @@ pub fn main() !void {
     }
 }
 
-/// 可視範囲の市松模様。タイル単位で clip-hoist し、行連続 span で塗る。
+/// Checkerboard over the visible range. Clip-hoist per tile; paint as row-contiguous spans.
 fn drawCheckerboard(pixels: []u32, fb_w: u32, fb_h: u32, cam: gfx.Camera) void {
     const vis = cam.visibleRect(viewport);
-    // 可視 world 範囲をタイル index へ（@floor で負も一貫）
+    // Visible world range → tile indices (@floor keeps negatives consistent)
     const tile_x0 = @as(i32, @intFromFloat(@floor(vis.x / TILE)));
     const tile_y0 = @as(i32, @intFromFloat(@floor(vis.y / TILE)));
     const tile_x1 = @as(i32, @intFromFloat(@floor((vis.x + vis.w) / TILE))) + 1;
@@ -185,7 +185,7 @@ fn drawCheckerboard(pixels: []u32, fb_w: u32, fb_h: u32, cam: gfx.Camera) void {
     }
 }
 
-/// ワールド矩形を screen に塗りつぶし（clip-hoist 後に行連続 @memset 相当）。
+/// Fill a world rect on screen (after clip-hoist, row-contiguous @memset-class writes).
 fn fillWorldRect(
     pixels: []u32,
     fb_w: u32,
@@ -198,12 +198,12 @@ fn fillWorldRect(
     color: u32,
 ) void {
     const z: f32 = @floatFromInt(cam.zoom);
-    // ワールド矩形の 4 隅を screen へ（zoom 整数なので辺は軸平行のまま）
+    // Map the world rect's four corners to screen (integer zoom keeps edges axis-aligned)
     const s0 = cam.worldToScreen(.{ .x = world_x, .y = world_y }, viewport);
     const s1x = s0.x + world_w * z;
     const s1y = s0.y + world_h * z;
 
-    // @floor で左上、右下は exclusive 端へ ceil 相当（右端を落とさない）
+    // @floor for top-left; bottom-right is ceil-equivalent to an exclusive edge (do not drop the right edge)
     var x0 = @as(i32, @intFromFloat(@floor(s0.x)));
     var y0 = @as(i32, @intFromFloat(@floor(s0.y)));
     var x1 = @as(i32, @intFromFloat(@ceil(s1x)));
@@ -219,7 +219,7 @@ fn fillWorldRect(
     const uy0: u32 = @intCast(y0);
     const ux1: u32 = @intCast(x1);
     const uy1: u32 = @intCast(y1);
-    // 毎フレーム全画素相当を塗る経路: 行単位の一括書き込み（性能規約の @memset 高速パス）。
+    // Per-frame all-pixel-class path: bulk row writes (performance-rule @memset fast path).
     var y: u32 = uy0;
     while (y < uy1) : (y += 1) {
         const row = y * fb_w;
@@ -240,7 +240,7 @@ fn drawTargetSprite(
         .x = @floatFromInt(target_x),
         .y = @floatFromInt(target_y),
     }, viewport);
-    // 負座標でも切り捨て方向が一定になるよう @floor
+    // Use @floor so truncation direction stays consistent for negative coords too
     spr.x = @as(i32, @intFromFloat(@floor(screen.x)));
     spr.y = @as(i32, @intFromFloat(@floor(screen.y)));
     gfx.drawSpriteEx(pixels, fb_w, fb_h, spr, .{});

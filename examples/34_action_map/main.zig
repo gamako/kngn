@@ -1,12 +1,12 @@
-//! 34_action_map: ActionMap デモ（TASK-111.8）。
+//! 34_action_map: ActionMap demo.
 //!
-//! - move_x / move_y / jump / attack を keyboard + gamepad で同一アクションへ写像
-//! - WASD / 矢印 / 左スティック、SPACE/Ctrl と gamepad A/B
-//! - R キーで WASD 版と矢印版の key binding を切替（実行時リバインド）
-//! - harness custom probe `action_map` で binding/source/status を観測
+//! - Map move_x / move_y / jump / attack from keyboard + gamepad onto the same actions
+//! - WASD / arrows / left stick; SPACE/Ctrl and gamepad A/B
+//! - R key switches WASD vs arrow key bindings (runtime rebind)
+//! - Observe binding/source/status via harness custom probe `action_map`
 //!
-//! ホットパス宣言: ActionMap.update は毎フレーム O(action×binding 上限)。
-//! 全画素ループは背景 memset + 矩形塗りのみ。alloc / lock / panic 無し。
+//! Hot path declaration: ActionMap.update is O(action×binding cap) every frame.
+//! All-pixel loops are background memset + rect fills only. No alloc / lock / panic.
 
 const std = @import("std");
 const kit = @import("kit");
@@ -71,7 +71,7 @@ fn fillRect(fb: []u32, w: i32, h: i32, x: i32, y: i32, rw: i32, rh: i32, color: 
     }
 }
 
-/// 5×7 固定幅の簡易ドット文字（ASCII の一部のみ）。
+/// Simple 5×7 fixed-width dot glyphs (ASCII subset only).
 const FONT_W = 5;
 const FONT_H = 7;
 const FONT_GLYPHS = struct {
@@ -140,7 +140,7 @@ fn drawText(fb: []u32, w: i32, h: i32, x0: i32, y0: i32, text: []const u8, color
 }
 
 fn applyMoveKeyBindings(actions: *Map, move_x: gfx.ActionId, move_y: gfx.ActionId, mode: BindingMode) !void {
-    // pad stick は常に残し、key pair だけ切替（clear + 再 bind）。
+    // Keep the pad stick; switch only the key pair (clear + re-bind).
     try actions.clearBindings(move_x);
     try actions.clearBindings(move_y);
     switch (mode) {
@@ -164,7 +164,7 @@ fn detectMoveSource(
     move_x: f32,
 ) []const u8 {
     if (move_x == 0) {
-        // y は probe では別途。source は move_x 主軸（e2e シナリオ準拠）。
+        // y is separate in the probe. source uses move_x as the primary axis (matches the e2e scenario).
         if (cur_pads[0]) |p| {
             const s = gamepad.applyDeadzone(p.left_stick, DEADZONE);
             if (s.y != 0) return "stick";
@@ -238,14 +238,14 @@ pub fn main() !void {
             else => {},
         };
 
-        // gamepad state を固定長配列へポーリング
+        // Poll gamepad state into a fixed-length array
         prev_pads = cur_pads;
         var pi: u8 = 0;
         while (pi < platform.MAX_GAMEPADS) : (pi += 1) {
             cur_pads[pi] = window.getGamepadState(pi);
         }
 
-        // R で key binding 切替（エッジは KeyboardState.justPressed）
+        // R switches key bindings (edge via KeyboardState.justPressed)
         if (kb.justPressed(.R)) {
             mode = if (mode == .wasd) .arrows else .wasd;
             try applyMoveKeyBindings(&actions, move_x, move_y, mode);
@@ -255,13 +255,13 @@ pub fn main() !void {
 
         const dx = actions.axisValue(move_x);
         const dy = actions.axisValue(move_y);
-        // stick.y 上=+1。画面 Y は下方向が正なので反転。
+        // stick.y up=+1. Screen Y is down-positive, so invert.
         char_x = std.math.clamp(char_x + dx * MOVE_SPEED, 0, @as(f32, @floatFromInt(WINDOW_W - CHAR_SIZE)));
         char_y = std.math.clamp(char_y - dy * MOVE_SPEED, 0, @as(f32, @floatFromInt(WINDOW_H - CHAR_SIZE)));
 
         probe.binding = if (mode == .wasd) "wasd+pad" else "arrows+pad";
         probe.move_source = detectMoveSource(&kb, &cur_pads, mode, dx);
-        // move_y が非ゼロで move_x が 0 のとき source を y から判定し直す
+        // When move_y is non-zero and move_x is 0, re-derive source from y
         if (dx == 0 and dy != 0) {
             if (cur_pads[0]) |p| {
                 const s = gamepad.applyDeadzone(p.left_stick, DEADZONE);
@@ -283,7 +283,7 @@ pub fn main() !void {
             const wi: i32 = @intCast(fb.width);
             const hi: i32 = @intCast(fb.height);
 
-            // axis バー
+            // axis bar
             fillRect(fb.pixels, wi, hi, 16, 16, 200, 10, COLOR_BAR_BG);
             fillRect(fb.pixels, wi, hi, 16, 32, 200, 10, COLOR_BAR_BG);
             const mid: i32 = 16 + 100;
@@ -300,7 +300,7 @@ pub fn main() !void {
                 fillRect(fb.pixels, wi, hi, mid - bw, 32, bw, 10, COLOR_BAR_NEG);
             }
 
-            // button インジケータ
+            // button indicator
             fillRect(fb.pixels, wi, hi, 16, 52, 14, 14, if (probe.jump_down != 0) COLOR_ON else COLOR_OFF);
             fillRect(fb.pixels, wi, hi, 40, 52, 14, 14, if (probe.attack_down != 0) COLOR_ON else COLOR_OFF);
 

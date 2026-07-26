@@ -2,24 +2,24 @@ const std = @import("std");
 const platform = @import("platform");
 const png = @import("png");
 
-/// 24_desktop_mascot: 透過 / borderless ウィンドウのデモ（TASK-104）。
+/// 24_desktop_mascot: transparent / borderless window demo.
 ///
-/// うさこ（usako.png, 64x64 RGBA）をデスクトップ上に「枠なし・背景透過・常に最前面」で表示する
-/// デスクトップマスコット。透明な余白へのクリックは背後のアプリへ抜け（per-pixel click-through）、
-/// うさこ本体を左ドラッグするとウィンドウごと移動する（OS の対話的ドラッグへ委譲）。右クリックで
-/// 終了メニュー、ESC でも終了する。
+/// Shows usako (usako.png, 64x64 RGBA) on the desktop as a "borderless, transparent, always-on-top"
+/// desktop mascot. Clicks on transparent padding pass through to apps behind (per-pixel click-through);
+/// left-dragging the mascot body moves the whole window (delegated to the OS interactive drag). Right-click
+/// shows a quit menu; ESC also quits.
 ///
-/// 使う platform 拡張（TASK-104）:
-/// - `Window.createWithOptions(.{ .transparent = true, .borderless = true })`: 透過 + 枠なし
-/// - `platform.setDockVisible(false)`: Dock アイコン / メニューバー非表示（常駐アプリらしく）
-/// - `window.setAlwaysOnTop(true)`: 常に最前面
-/// - `window.setClickThrough(true)`: 透明画素上のクリックを背後へ抜けさせる
-/// - `window.beginDrag()`: 本体 mouse_down からウィンドウ移動を開始
-/// - `window.showQuitMenu()`: 終了メニューをポップアップ
+/// Platform extensions used:
+/// - `Window.createWithOptions(.{ .transparent = true, .borderless = true })`: transparent + borderless
+/// - `platform.setDockVisible(false)`: hide Dock icon / menu bar (resident-app feel)
+/// - `window.setAlwaysOnTop(true)`: always on top
+/// - `window.setClickThrough(true)`: clicks on transparent pixels pass through
+/// - `window.beginDrag()`: start window move from body mouse_down
+/// - `window.showQuitMenu()`: pop up the quit menu
 ///
-/// ホットパス宣言: フレーム毎に全画素（64x64=4096px）を書くが、静的画像の premultiplied バッファを
-/// `@memcpy` で一括コピーするだけ（per-pixel の除算・分岐・ブレンドなし）。premultiply は
-/// `decodePNGPremultiplied` で初期化時に 1 回だけ行う。性能規約「全画素ループ」の一括書き込み方針に沿う。
+/// Hot path declaration: writes every pixel each frame (64x64=4096px), but only bulk-`@memcpy`s a static
+/// premultiplied buffer (no per-pixel division, branches, or blend). Premultiply runs once at init in
+/// `decodePNGPremultiplied`. Follows the all-pixel-loop bulk-write rule.
 const usako_png = @embedFile("image/usako.png");
 
 const MASCOT_W: u32 = 64;
@@ -33,7 +33,7 @@ pub fn main() !void {
     try platform.init();
     defer platform.shutdown();
 
-    // 透過 + borderless ウィンドウ（背後が透け、枠・タイトルバーなし）。
+    // Transparent + borderless window (see-through background; no chrome/title bar).
     var window = platform.Window.createWithOptions(
         MASCOT_W,
         MASCOT_H,
@@ -45,13 +45,13 @@ pub fn main() !void {
     };
     defer window.destroy();
 
-    // マスコットらしい挙動: Dock 非表示・最前面・透明部クリック透過。
+    // Mascot behaviour: hide Dock, always on top, click-through on transparent pixels.
     platform.setDockVisible(false);
     window.setAlwaysOnTop(true);
     window.setClickThrough(true);
 
-    // うさこを premultiplied alpha でデコード（透過 CGImage の PremultipliedFirst と整合）。
-    // 透明な余白は 0x00000000（A=0, premul RGB=0）で、そのまま透過表示になる。
+    // Decode usako as premultiplied alpha (matches PremultipliedFirst of a transparent CGImage).
+    // Transparent padding is 0x00000000 (A=0, premul RGB=0) and displays as clear.
     var usako = try png.decodePNGPremultiplied(allocator, usako_png);
     defer usako.deinit(allocator);
 
@@ -64,10 +64,10 @@ pub fn main() !void {
                 if (k.key == .ESCAPE) break :main_loop;
             },
             .mouse_down => |m| switch (m.button) {
-                // 本体（不透明画素）上の左押下だけがここに届く（透明部は click-through で抜ける）。
-                // → OS の対話的ウィンドウ移動を開始（うさこを掴んで動かす）。
+                // Only left-press on the body (opaque pixels) reaches here (transparent parts click through).
+                // → start an OS interactive window move (grab usako and drag).
                 .left => window.beginDrag(),
-                // 右クリックで終了メニュー。
+                // Right-click shows the quit menu.
                 .right => window.showQuitMenu(),
                 else => {},
             },
@@ -76,13 +76,13 @@ pub fn main() !void {
 
         if (window.lockFramebuffer()) |fb| {
             defer fb.unlock();
-            // 背景は完全透明（0x00000000）。うさこの premultiplied バッファをそのまま転写する。
+            // Background is fully transparent (0x00000000). Copy usako's premultiplied buffer as-is.
             if (fb.width == usako.width and fb.height == usako.height and
                 fb.pixels.len == usako.pixels.len)
             {
                 @memcpy(fb.pixels, usako.pixels);
             } else {
-                // サイズ不一致（HiDPI 等で fb がスケールした場合の保険）: 透明で埋めて中央へ収まる分だけ転写。
+                // Size mismatch guard (e.g. HiDPI-scaled fb): fill transparent and copy only what fits centred.
                 @memset(fb.pixels, 0x0000_0000);
                 const cw = @min(fb.width, usako.width);
                 const ch = @min(fb.height, usako.height);

@@ -8,8 +8,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // OutlineFont（libs/font）で system TTF を描画する。font は PNG アトラス decode で png に、
-    // Color.blend で pixelops に依存する（12_outline_font と同じ standalone 配線。BDF/text は不要）。
+    // Draw a system TTF with OutlineFont (libs/font). font depends on png for PNG-atlas decode and
+    // on pixelops for Color.blend (same standalone wiring as 12_outline_font; BDF/text not needed).
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
-        // harness(platform→harness→png) と font で png module を共有する（二重化回避）。
+        // Share one png module between harness(platform→harness→png) and font (avoid duplicating it).
         .png_module = png,
         .extra = &.{
             .{ .name = "font", .module = font },

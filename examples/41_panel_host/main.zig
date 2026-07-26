@@ -1,12 +1,12 @@
-//! PanelHost dock-slot demo (TASK-147).
+//! PanelHost dock-slot demo.
 //!
-//! left / right / bottom スロット + registry + 表示トグル + splitter +
-//! center 手動描画 + in-memory persistence + harness probe/action。
+//! left / right / bottom slots + registry + visibility toggle + splitter +
+//! center manual draw + in-memory persistence + harness probe/action.
 //!
-//! ホットパス宣言:
-//! - PanelHost.build と toolbar widget 構築はフレーム毎（widget 数オーダー）。
-//! - 全画素ループ・RT 経路・per-frame registry 複製は新設しない。
-//! - persistence / probe / action は初期化時または明示操作時のみ。
+//! Hot path declaration:
+//! - PanelHost.build and toolbar widget construction are per-frame (order of widget count).
+//! - No new all-pixel loop, RT path, or per-frame registry clone.
+//! - persistence / probe / action are init-only or on explicit action.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -232,7 +232,7 @@ fn drawCenterManual(fb: platform.Framebuffer, center: gui.Rect) void {
     const y1: i32 = @min(@as(i32, @intCast(fb.height)), center.y + @as(i32, @intCast(center.h)));
     if (x1 <= x0 or y1 <= y0) return;
 
-    // checker-ish canvas fill（gui 外の手動描画）
+    // checker-ish canvas fill (manual draw outside gui)
     var y: i32 = y0;
     while (y < y1) : (y += 1) {
         var x: i32 = x0;
@@ -391,7 +391,7 @@ pub fn main(init: std.process.Init) !void {
     const screen_w = parseDim(envSlice("VP_GUI_WIDTH"), DEFAULT_W, "VP_GUI_WIDTH");
     const screen_h = parseDim(envSlice("VP_GUI_HEIGHT"), DEFAULT_H, "VP_GUI_HEIGHT");
 
-    var window = try platform.Window.create(screen_w, screen_h, "PanelHost (TASK-147)");
+    var window = try platform.Window.create(screen_w, screen_h, "PanelHost");
     defer window.destroy();
 
     var ctx = gui.Context.init(gpa, gui.default_font);
@@ -403,7 +403,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "Color", .slot = .right, .build = buildColor, .user_data = undefined },
         .{ .name = "Timeline", .slot = .bottom, .build = buildTimeline, .user_data = undefined },
     };
-    // user_data は App へのポインタに後で差し替える（build 内では未使用）
+    // user_data is later swapped to a pointer to App (unused inside build)
     var host = try gui.PanelHost.init(panels[0..], .{});
 
     var app: App = .{
@@ -456,7 +456,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
         ctx.endFrame();
 
-        // center 手動描画（gui.render より先に FB へ書く。gui が上に載る）
+        // center manual draw (write FB before gui.render; gui draws on top)
         if (host.centerRect(&ctx)) |cr| {
             drawCenterManual(fb, cr);
         }

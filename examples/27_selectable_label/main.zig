@@ -1,7 +1,7 @@
-//! 27_selectable_label: read-only SelectableLabel の drag / double-click / Cmd+C デモ。
+//! 27_selectable_label: read-only SelectableLabel drag / double-click / Cmd+C demo.
 //!
-//! ホットパス宣言: 選択更新とコピー要求はイベント時のみ。描画は既存 gui.render / Font 経路と
-//! 選択 rect/text DrawCmd を使い、新規の全画素ループを作らない。
+//! Hot path declaration: selection updates and copy requests are event-only. Drawing uses the existing gui.render / Font path and
+//! selection rect/text DrawCmd; no new all-pixel loop.
 
 const std = @import("std");
 const platform = @import("platform");

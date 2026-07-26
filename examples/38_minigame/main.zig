@@ -1,19 +1,19 @@
-//! 38_minigame: gfx / sound / font 統合ミニゲーム capstone（TASK-111.9）。
+//! 38_minigame: gfx / sound / font integrated minigame capstone.
 //!
-//! - FixedTimeStep 60Hz + ActionMap（A/D・矢印移動、Space/Z ジャンプ）
-//! - コード生成 Tile Atlas + TileMap.resolveAabb（X/Y 分離）
-//! - usako.png から 4 フレーム歩行 Atlas + AnimationClip/Player
+//! - FixedTimeStep 60Hz + ActionMap (A/D·arrow move, Space/Z jump)
+//! - Code-generated Tile Atlas + TileMap.resolveAabb (separate X/Y)
+//! - 4-frame walk Atlas from usako.png + AnimationClip/Player
 //! - Camera.follow + world clamp
-//! - コード生成 PCM16 WAV → SoundPlayer（BGM ループ + ジャンプ/着地 SE）
-//! - kit.font OutlineFont で SCORE / FPS HUD
+//! - Code-generated PCM16 WAV → SoundPlayer (BGM loop + jump/land SE)
+//! - SCORE / FPS HUD via kit.font OutlineFont
 //! - harness custom probe `game`
 //!
-//! ホットパス宣言:
-//! - 初期化時のみ: Atlas / TileMap / WAV / SoundPlayer / Font / HUD キャッシュ温め
-//! - フレーム毎: ActionMap 評価、FPS、背景 memset、TileMap.draw / コイン / プレイヤー / HUD
-//! - 固定論理ステップ毎: 移動・重力・AABB・コイン・アニメ・カメラ
-//! - イベント時のみ: キー、SE 投入、probe digest
-//! - RT: SoundPlayer.render のみ（callback 内に新規処理なし）
+//! Hot path declaration:
+//! - Init only: warm Atlas / TileMap / WAV / SoundPlayer / Font / HUD caches
+//! - Per frame: ActionMap eval, FPS, background memset, TileMap.draw / coins / player / HUD
+//! - Per fixed logical step: move, gravity, AABB, coins, anim, camera
+//! - Event only: keys, SE enqueue, probe digest
+//! - RT: SoundPlayer.render only (no new work inside the callback)
 
 const std = @import("std");
 const kit = @import("kit");
@@ -186,10 +186,10 @@ pub fn main() !void {
     var cam = gfx.Camera.init(.{ .x = 0, .y = 0 }, 1);
     cam.clampToWorld(viewport, world_bounds);
 
-    // コイン: bottom = 足場/床 top、x は足場 world 範囲内。登坂の導線として床→P1→P3 に配置する
-    // （TASK-137）。床 top y=336 / P1 top=272 (world256..416) / P3 top=144 (world640..784)。
-    // coin1(床) は段差右の離陸ゾーン(world208..256)に置き、初期右移動での得点源にする
-    // （e2e の score>0 assert を支える）。coin2=P1 上・coin3=P3 上（頂上報酬）。
+    // Coins: bottom = platform/floor top; x within the platform's world range. Place floor→P1→P3 as a climbing path
+    // . Floor top y=336 / P1 top=272 (world256..416) / P3 top=144 (world640..784).
+    // coin1 (floor) sits in the launch zone right of the step (world208..256) as a score source on the initial right move
+    // (supports the e2e score>0 assert). coin2 on P1; coin3 on P3 (summit reward).
     var game = Game{
         .body = .{ .x = 64, .y = 160, .w = PLAYER_W, .h = PLAYER_H },
         .coins = .{
@@ -328,8 +328,8 @@ pub fn main() !void {
         actions.update(&keyboard, &prev_pads, &cur_pads);
 
         const axis = actions.axisValue(move_x);
-        // justPressed は outer frame 単位。固定ステップが 0 のフレームでもエッジを落とさないよう
-        // 論理更新で消費するまで保持する（複数サブステップへは一度だけ渡す）。
+        // justPressed is per outer frame. Hold it until a logical update consumes it so the edge is not lost on
+        // frames with zero fixed steps (pass to multiple substeps at most once).
         if (actions.justPressed(jump)) jump_pending = true;
 
         const now = platform.getTime();
@@ -340,8 +340,8 @@ pub fn main() !void {
         }
 
         const steps_raw = timestep.update(frame_time);
-        // fp 誤差で steps=0 になると justPressed エッジが論理更新に届かない。
-        // ジャンプ保留中は 1 step を保証して消費する（通常フレームでは steps_raw>=1）。
+        // If fp error yields steps=0, the justPressed edge never reaches a logical update.
+        // While a jump is pending, guarantee 1 step to consume it (normal frames have steps_raw>=1).
         const steps: usize = if (steps_raw == 0 and jump_pending) 1 else steps_raw;
         for (0..steps) |_| {
             const input = InputState{
@@ -389,7 +389,7 @@ pub fn main() !void {
             window.present();
         }
 
-        // audio_null / 実デバイスとも RT pull は壁時計依存。digest audio 用に 1 frame 相当を確保。
+        // Both audio_null and real devices: RT pull depends on wall clock. Budget one frame for digest audio.
         platform.sleep(16_000_000);
     }
 }
@@ -674,19 +674,19 @@ fn buildMapTiles() [MAP_W * MAP_H]u16 {
         setTile(&tiles, 79, y, 1);
     }
 
-    // 段差 x=9..12, y=19,18
+    // Step x=9..12, y=19,18
     x = 9;
     while (x <= 12) : (x += 1) {
         setTile(&tiles, x, 19, 1);
         setTile(&tiles, x, 18, 1);
     }
 
-    // 浮遊足場（TASK-137: 左→右へ登る階段状。真上重なりを避け横ギャップ ≈2〜3 タイルにして
-    // 弧を描くジャンプで1段ずつ乗れるようにする。resolveAabb は上昇中に天井 tile へ当たると
-    // hit_ceiling で止まるため、足場は真上でなく横へずらして配置する。縦は各4タイル=64px。
-    // 段差 overhang(x9..12) の右に離陸スペースを残すため P1 は x16 始まり。
+    // Floating platforms: stair-like climb left→right. Avoid direct vertical overlap; leave ≈2–3 tile horizontal gaps so
+    // arc jumps can land one step at a time. resolveAabb stops with hit_ceiling if an ascending body hits a ceiling tile,
+    // so platforms are offset sideways rather than stacked directly above. Each is 4 tiles = 64px tall.
+    // Leave launch space right of the step overhang (x9..12); P1 starts at x16.
     // P1 row17(top272) x16..25 world256..416 / P2 row13(top208) x28..37 world448..592
-    // / P3 row9(top144) x40..49 world640..784。
+    // / P3 row9 (top144) x40..49 world640..784.
     x = 16;
     while (x <= 25) : (x += 1) setTile(&tiles, x, 17, 2);
     x = 28;
@@ -701,7 +701,7 @@ fn setTile(tiles: *[MAP_W * MAP_H]u16, tx: u32, ty: u32, id: u16) void {
     tiles[ty * MAP_W + tx] = id;
 }
 
-/// PCM16 mono RIFF/WAVE をコード生成（初期化時のみ。RT では呼ばない）。
+/// Code-generate a PCM16 mono RIFF/WAVE (init only; never called from RT).
 fn makeToneWav(
     allocator: std.mem.Allocator,
     sample_rate: u32,
@@ -733,7 +733,7 @@ fn makeToneWav(
     var i: u32 = 0;
     while (i < n_samples) : (i += 1) {
         const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(sample_rate));
-        // 短い SE は線形減衰、BGM（長め）は一定振幅
+        // Short SE uses linear decay; BGM (longer) uses constant amplitude
         const env: f32 = if (duration_ms <= 200)
             1.0 - @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_samples))
         else

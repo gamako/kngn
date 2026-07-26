@@ -1,9 +1,9 @@
-//! 28_text_input: 単一行 TextInput の focus / UTF-8 編集 / selection / scroll / IME デモ。
+//! 28_text_input: single-line TextInput demo for focus / UTF-8 edit / selection / scroll / IME.
 //!
-//! ホットパス宣言: 編集・caret・selection・scroll はイベント時のみ。composition snapshot の
-//! 再読取は active 中に毎フレーム（latest-wins。イベント欠落時の stale preedit 回避）。
-//! preedit 描画は既存 DrawCmd と Font 経路を再利用し、caret blink は Context の仮想時刻だけで
-//! 決定する。composition 本文は固定 buffer 借用（heap alloc なし）。
+//! Hot path declaration: edit / caret / selection / scroll are event-only. While composition is active,
+//! reread the composition snapshot every frame (latest-wins; avoids a stale preedit if an event is dropped).
+//! Preedit draw reuses the existing DrawCmd and Font paths; caret blink is decided from Context virtual time alone.
+//! Composition text borrows a fixed buffer (no heap alloc).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -100,12 +100,12 @@ const ImeState = struct {
     composition_rect: ?CompositionCaretRect = null,
 
     fn syncFromWindow(self: *ImeState, window: platform.Window) void {
-        // dirty（composition_changed）または active 中は毎フレーム snapshot を再読取する。
-        // text/cursor は常に latest-wins。イベント欠落時の stale preedit を避ける。
+        // On dirty (composition_changed) or while active, reread the snapshot every frame.
+        // text/cursor are always latest-wins. Avoids a stale preedit if an event is dropped.
         //
-        // 既知の残余制約（修正不要）: commit/cancel イベント自体が欠落した場合の active
-        // フラグ解除は、CompositionSnapshot に active 情報が無いため検出不能
-        // （platform 側 79.6.x の将来課題。example_21 と同じ制約）。
+        // Known residual limit (no fix needed): if the commit/cancel event itself is dropped, clearing the active
+        // flag is undetectable because CompositionSnapshot has no active bit
+        // (same constraint as example_21; a future platform-side concern).
         if (!self.dirty and !self.active) return;
         const snapshot = window.getCompositionSnapshot(self.preedit[0..]);
         self.preedit_len = snapshot.text.len;
@@ -133,7 +133,7 @@ fn notifyCompositionRect(window: platform.Window, state: *ImeState, rect: ?Compo
     if (state.composition_rect) |prev| {
         if (prev.x == next.x and prev.y == next.y and prev.w == next.w and prev.h == next.h) return;
     } else if (next.w == 0 and next.h == 0) {
-        // 初回のクリアは不要（候補窓も未表示）
+        // First-time clear is unnecessary (candidate window also not shown yet)
         state.composition_rect = next;
         return;
     }
@@ -141,7 +141,7 @@ fn notifyCompositionRect(window: platform.Window, state: *ImeState, rect: ?Compo
     state.composition_rect = next;
 }
 
-/// focused TextInput の document を IME へ供給する bridge（TASK-79.6.3）。
+/// Bridge that supplies the focused TextInput document to IME.
 const DocBridge = struct {
     buffer: *gui.TextBuffer,
     selection: *gui.SelectionState,
@@ -198,16 +198,16 @@ pub fn main(init: std.process.Init) !void {
     var second_buffer = try gui.TextBuffer.init(gpa, "A long second input demonstrates horizontal caret scrolling");
     defer second_buffer.deinit();
 
-    // VP_EXAMPLE_28_FONT=bitmap|outline。未設定は outline（現行と bit 同一）。
+    // VP_EXAMPLE_28_FONT=bitmap|outline. Unset means outline (bit-identical to current).
     const font_mode = if (std.c.getenv("VP_EXAMPLE_28_FONT")) |v| std.mem.span(v) else "outline";
     const prefer_bitmap = std.mem.eql(u8, font_mode, "bitmap");
 
-    // フォント bytes は FontFace より長命であること（main 寿命で保持）。
+    // Font bytes must outlive FontFace (kept for main's lifetime).
     const loaded = if (prefer_bitmap) null else fontmod.loadSystemTextFace(init.io, gpa);
     defer if (loaded) |l| gpa.free(l.bytes);
     if (!prefer_bitmap and loaded == null) std.debug.print("no usable system font found; falling back to gui.default_font.\n", .{});
     var face: ?fontmod.FontFace = if (loaded) |l| l.face else null;
-    // gui.default_font の line_height=16 に合わせたピクセルサイズ。
+    // Pixel size matched to gui.default_font line_height=16.
     var outline_font: ?fontmod.OutlineFont = if (face) |*f| fontmod.OutlineFont.init(gpa, f, 16) else null;
     defer if (outline_font) |*o| o.deinit();
 
@@ -239,8 +239,8 @@ pub fn main(init: std.process.Init) !void {
     });
 
     var running = true;
-    // TASK-142: 初回 pollEvents 前に「編集フォーカス無し」を宣言しておく（起動直後の keyDown が
-    // 従来の route-always で IME に吸われる隙間を塞ぐ）。以後は毎フレーム末尾で focus に追従する。
+    // Before the first pollEvents, declare "no edit focus" (closes the gap where a keyDown right after launch
+    // was always routed into IME). After that, follow focus at the end of every frame.
     window.setTextInputActive(false);
     var doc_bridge: DocBridge = undefined;
     var doc_bridge_active = false;
@@ -259,7 +259,7 @@ pub fn main(init: std.process.Init) !void {
             }
             if (ev == .key_down) {
                 const k = ev.key_down;
-                // Cmd+V のときだけ OS clipboard を読む（GUI は platform を import しない）。
+                // Read the OS clipboard only on Cmd+V (GUI does not import platform).
                 if (k.key == .V and k.modifiers.cmd and !k.modifiers.ctrl and !k.modifiers.alt and !k.is_repeat) {
                     paste_text = platform.getClipboardText(paste_buf[0..]);
                 }
@@ -305,8 +305,8 @@ pub fn main(init: std.process.Init) !void {
 
         ctx.endFrame();
 
-        // endFrame 後の focusedId を正とする（同一 frame で second が claim した直後に
-        // first.focused の stale 値で rect をクリアしない）。
+        // Treat focusedId after endFrame as authoritative (do not clear the rect from a stale first.focused
+        // right after second claimed focus in the same frame).
         const focused_id = ctx.focusedId();
         switch (focused_id) {
             0x2801 => {
@@ -349,11 +349,11 @@ pub fn main(init: std.process.Init) !void {
         gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         window.present();
 
-        // TASK-142: テキスト欄が focus されているときだけ keyDown を IME へ渡す。空きをクリックして
-        // focus を外すと（wantsKeyboard()==false）、IME 有効中でもキーがショートカットとして届く。
-        // TASK-79.6.3: document access も同一タイミングで切替え（次の pollEvents までに完了）。
-        // 毎フレーム再登録は意図的: PerIdStateStore の rehash で *PerIdState が無効化されうるため、
-        // focus 変化時のみに最適化すると selection/caret ポインタが dangling になる。
+        // Forward keyDown to IME only while a text field has focus. Clicking empty space to clear focus
+        // (wantsKeyboard()==false) lets keys reach shortcuts even while IME is enabled.
+        // Switch document access on the same schedule (must complete before the next pollEvents).
+        // Re-registering every frame is intentional: PerIdStateStore rehash can invalidate *PerIdState, so
+        // optimizing to focus-change-only would leave selection/caret pointers dangling.
         const wants = ctx.wantsKeyboard();
         window.setTextInputActive(wants);
         if (wants) {

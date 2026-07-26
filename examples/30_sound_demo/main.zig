@@ -1,14 +1,14 @@
-//! 30_sound_demo: libs/sound の SE ワンショット + BGM ループデモ（TASK-111.6）。
+//! 30_sound_demo: libs/sound SE one-shot + BGM loop demo.
 //!
-//! - `S` キー: SE ワンショット
-//! - `B` キー: BGM loop の開始 / 停止
-//! - 起動時に se.wav / bgm.wav を @embedFile し main thread で decode
-//! - audio callback は `player.render()` のみ
+//! - `S` key: SE one-shot
+//! - `B` key: start / stop BGM loop
+//! - At launch, @embedFile se.wav / bgm.wav and decode on the main thread
+//! - The audio callback only calls `player.render()`
 //!
-//! 順序: audio.open → player.create → decode → start
-//! 終了: stop → close → decoded WAV 解放 → player.destroy
+//! Order: audio.open → player.create → decode → start
+//! Shutdown: stop → close → free decoded WAV → player.destroy
 //!
-//! ホットパス宣言: RT は SoundPlayer.render のみ（alloc/lock/IO/panic 無し）。
+//! Hot path declaration: RT is SoundPlayer.render only (no alloc/lock/IO/panic).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -46,8 +46,8 @@ pub fn main() !void {
     var window = try platform.Window.create(WINDOW_W, WINDOW_H, "30 - Sound Demo (S=SE, B=BGM)");
     defer window.destroy();
 
-    // 先に audio を開き実効 SR を確認してから player / fixture を合わせる（48 kHz fixture）。
-    // player ポインタは open 後に埋める（callback は start 後のみ）。
+    // Open audio first, confirm effective SR, then align player / fixtures (48 kHz fixtures).
+    // Fill the player pointer after open (callback only after start).
     var app: App = undefined;
 
     const device = audio.open(allocator, .{
@@ -105,7 +105,7 @@ pub fn main() !void {
             .key_down => |k| switch (k.key) {
                 .ESCAPE => break :main_loop,
                 .S => {
-                    // 短い SE。center pan。gain は 0.6
+                    // Short SE. center pan. gain 0.6
                     app.player.playSound(&app.se_sound, 0.6, 0.0) catch |err| {
                         std.debug.print("playSound: {s}\n", .{@errorName(err)});
                     };
@@ -132,7 +132,7 @@ pub fn main() !void {
         if (window.lockFramebuffer()) |fb| {
             defer fb.unlock();
             @memset(fb.pixels, COLOR_BG);
-            // 簡易インジケータ: 左=SE flash、右=BGM on
+            // Simple indicators: left=SE flash, right=BGM on
             const mid = fb.width / 2;
             const se_color: u32 = if (app.se_flash > 0) COLOR_SE else COLOR_IDLE;
             const bgm_color: u32 = if (app.bgm_playing) COLOR_BGM else COLOR_IDLE;
@@ -141,8 +141,8 @@ pub fn main() !void {
         }
 
         window.present();
-        // audio_null / 実デバイスとも RT pull は壁時計依存。harness replay の step が
-        // 仮想フレームだけを進めると digest audio が無音窓を読むため、1 フレーム ≈ 16ms を確保する。
+        // Both audio_null and real devices: RT pull depends on wall clock. If harness replay `step` advances
+        // virtual frames only, digest audio reads a silent window, so budget ≈16ms per frame.
         platform.sleep(16_000_000);
     }
 }

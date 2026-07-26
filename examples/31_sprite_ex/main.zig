@@ -1,9 +1,9 @@
-//! 31_sprite_ex: drawSpriteEx デモ（TASK-111.2）。
+//! 31_sprite_ex: drawSpriteEx demo.
 //!
-//! 固定配置・固定背景で同一 usako.png に対し plain / flip / scale / tint / src rect を並べる。
-//! `@import("kit").gfx` の公開面を直接検証する。
+//! Fixed layout and background; shows plain / flip / scale / tint / src rect on the same usako.png.
+//! Directly exercises the public surface of `@import("kit").gfx`.
 //!
-//! ホットパス宣言: 毎フレーム drawSpriteEx が全画素相当を走る（本 example の描画内容は決定的で静的）。
+//! Hot path declaration: every frame drawSpriteEx runs an all-pixel-class path (this example's draw content is deterministic and static).
 
 const std = @import("std");
 const kit = @import("kit");

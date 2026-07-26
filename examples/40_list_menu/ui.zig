@@ -1,11 +1,11 @@
-//! Shared App state + UI construction for list/menu shell (TASK-121.4).
+//! Shared App state + UI construction for list/menu shell.
 //! Used by examples/40_list_menu/main.zig and bench/gui_list_menu.zig.
 //!
-//! ホットパス宣言:
-//! - 500 行の widget 構築・layout・DrawList 追加はフレーム毎 O(N)（N=500）。
-//! - selectableLabelId の text layout / frame arena を含む。
-//! - 全画素ループ・framebuffer 全面コピー・独自 rasterizer・RT 経路は新設しない。
-//! - popup 操作・キーボード state 更新・ellipsis 計算はイベント時 / 対象行のみ。
+//! Hot path declaration:
+//! - Building / laying out / appending DrawList for 500 rows is per-frame O(N) (N=500).
+//! - Includes selectableLabelId text layout / frame arena.
+//! - No new all-pixel loop, full framebuffer copy, custom rasterizer, or RT path.
+//! - popup ops / keyboard state updates / ellipsis calc are event-only / target-row only.
 
 const std = @import("std");
 const gui = @import("gui");
@@ -408,7 +408,7 @@ fn dispatchContextAction(app: *App, index: usize) void {
     };
 }
 
-/// beginFrame 後・widget 構築前: filter/context open 要求を反映。
+/// After beginFrame, before widget build: apply filter/context open requests.
 pub fn applyOpenRequests(app: *App) void {
     if (app.filter_open_request) {
         app.filter_open_request = false;
@@ -501,8 +501,8 @@ pub fn buildUi(app: *App) void {
     ctx.endBox();
 
     // List
-    // content_width=.grow 必須: 既定 .fit だと子の width=.grow が measure で 0 になり、
-    // 行背景 rect の幅が潰れハイライトが不可視になる（text leaf は fixed 幅で overflow 描画される）。
+    // content_width=.grow is required: default .fit makes child width=.grow measure as 0, so
+    // row-background rect width collapses and the highlight is invisible (text leaves draw overflow at fixed width).
     ctx.beginScrollArea(Ids.list_scroll, &app.list_scroll, .{
         .width = .{ .grow = 1 },
         .height = .{ .grow = 1 },
@@ -524,7 +524,7 @@ pub fn buildUi(app: *App) void {
     } else {
         // Available width for name: rough estimate from screen (list padding + kind col + detail)
         const name_max_w: i32 = @max(@as(i32, @intCast(app.screen_w)) - pad * 2 - 8 - 56 - 120, 40);
-        // example_39 nav と同系: 選択 = style.bg_active（明確な青）、非選択 = 交互の暗い帯
+        // Same family as example_39 nav: selected = style.bg_active (clear blue); unselected = alternating dark bands
         const sel_bg = ctx.style.bg_active;
         const idle_even = gui.Color.rgba(0x22, 0x26, 0x2E, 0xFF);
         const idle_odd = gui.Color.rgba(0x1C, 0x20, 0x28, 0xFF);
@@ -590,7 +590,7 @@ fn updatePopupGeo(
     while (i < item_rects.len) : (i += 1) item_rects[i] = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 }
 
-/// endFrame 後: menuBarPopup + context/filter popupMenu。
+/// After endFrame: menuBarPopup + context/filter popupMenu.
 pub fn handleOverlays(app: *App) void {
     const ctx = app.ctx;
 
@@ -600,7 +600,7 @@ pub fn handleOverlays(app: *App) void {
     app.menu_title = app.menu.open_title;
 
     // Context open after menuBarPopup so we can observe 1-popup replacement:
-    // open_title は維持したまま popup_state だけ context に差し替えうる。
+    // Keep open_title and may swap only popup_state to context.
     if (app.context_open_request) {
         app.context_open_request = false;
         ctx.openPopup(Ids.context_popup, app.context_open_pos);

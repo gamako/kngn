@@ -1,10 +1,10 @@
-//! example_29: MIDI monitor 雛形（TASK-115.1・ADR-010）。
+//! example_29: MIDI monitor sketch (see docs/adr/010_midi-input-facade.md).
 //!
-//! note 0..127 の押下状態と CC 0..127 の値を、既存の framebuffer 矩形描画だけで表示する。
-//! 実機 backend がまだ無い段階でも、harness の `inject midi` で headless 検証できる。
+//! Shows note 0..127 press state and CC 0..127 values with existing framebuffer rectangle draws only.
+//! Even before a real-device backend exists, headless verification works via harness `inject midi`.
 //!
-//! ホットパス宣言: MIDI の poll/state 更新はイベント時のみ。描画はフレーム毎だが、固定サイズの
-//! note/CC 矩形を描く既存 framebuffer 経路であり、RT（毎サンプル）経路ではない。
+//! Hot path declaration: MIDI poll/state updates are event-only. Drawing is per-frame but uses the existing
+//! framebuffer path for fixed-size note/CC rects; not an RT (per-sample) path.
 
 const platform = @import("platform");
 const midi = @import("midi");

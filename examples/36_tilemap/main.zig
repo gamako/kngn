@@ -1,18 +1,18 @@
-//! 36_tilemap: タイルマップ描画 + solid AABB 衝突デモ（TASK-111.5）。
+//! 36_tilemap: tilemap draw + solid AABB collision demo.
 //!
-//! - 固定 60Hz FixedTimeStep・左右移動・重力・着地
-//! - `gfx.TileMap` で地形描画（Camera + visibleRect カリング）
-//! - X/Y 分離 resolve で壁・床の安定接触
+//! - Fixed 60Hz FixedTimeStep; left/right move; gravity; landing
+//! - Terrain via `gfx.TileMap` (Camera + visibleRect culling)
+//! - Stable wall/floor contact via separate X/Y resolve
 //!
-//! 決定論の前提（CRC 固定値はこれに依存）:
-//! - 640×360・固定背景色・固定マップ / タイルセット / 初期 AABB
-//! - harness 仮想クロック（getTime = frame/60）と fixed 60Hz の組合せ
-//! - 整数定数のみの物理パラメータ（乱数・壁時計なし）
+//! Determinism assumptions (fixed CRC values depend on these):
+//! - 640×360, fixed background, fixed map / tileset / initial AABB
+//! - harness virtual clock (getTime = frame/60) combined with fixed 60Hz
+//! - Physics params are integer constants only (no RNG / wall-clock)
 //!
-//! ホットパス宣言:
-//! - TileMap.draw → Atlas.drawFrame → drawSpriteEx（全画素は既存経路）
-//! - resolveAabb は論理更新毎・候補タイルのみ
-//! - フレームバッファは @memset で初期化
+//! Hot path declaration:
+//! - TileMap.draw → Atlas.drawFrame → drawSpriteEx (all-pixel work is the existing path)
+//! - resolveAabb per logical update, candidate tiles only
+//! - Framebuffer cleared with @memset
 
 const std = @import("std");
 const kit = @import("kit");
@@ -27,7 +27,7 @@ const COLOR_PLAYER: u32 = 0xFFE8C84A;
 
 const TILE: u32 = 16;
 const MAP_W: u32 = 40; // 640 world px
-const MAP_H: u32 = 23; // 368 world px（画面より少し高い）
+const MAP_H: u32 = 23; // 368 world px (slightly taller than the screen)
 
 const PLAYER_W: f32 = 12;
 const PLAYER_H: f32 = 14;
@@ -36,7 +36,7 @@ const GRAVITY: f32 = 0.35;
 const MAX_FALL: f32 = 6.0;
 const JUMP_V: f32 = -5.5;
 
-/// タイル種別: 0=地面, 1=レンガ, 2=足場（半ブロック色）
+/// Tile kinds: 0=ground, 1=brick, 2=platform (half-block color)
 const FLAG_GROUND = gfx.TileFlags{ .solid = true, .@"opaque" = true };
 const FLAG_BRICK = gfx.TileFlags{ .solid = true, .@"opaque" = true };
 const FLAG_LEDGE = gfx.TileFlags{ .solid = true, .@"opaque" = true };
@@ -82,7 +82,7 @@ pub fn main() !void {
     var cam = gfx.Camera.init(.{ .x = 0, .y = 0 }, 1);
     cam.clampToWorld(viewport, world_bounds);
 
-    // 初期: 左寄り・空中から落下（着地を E2E で見せる）
+    // Start leftish, falling from air (show landing in E2E)
     var body: gmath.Rect = .{ .x = 48, .y = 40, .w = PLAYER_W, .h = PLAYER_H };
     var vel_y: f32 = 0;
     var grounded: bool = false;
@@ -116,14 +116,14 @@ pub fn main() !void {
 
         const steps = timestep.update(frame_time);
         for (0..steps) |_| {
-            // 水平移動 + X resolve
+            // Horizontal move + X resolve
             var dx: f32 = 0;
             if (held.left) dx -= MOVE_SPEED;
             if (held.right) dx += MOVE_SPEED;
             body.x += dx;
             _ = map.resolveAabb(&body);
 
-            // ジャンプ / 重力 + Y resolve
+            // Jump / gravity + Y resolve
             if (held.jump and grounded) {
                 vel_y = JUMP_V;
                 grounded = false;
@@ -137,7 +137,7 @@ pub fn main() !void {
                 vel_y = 0;
             }
 
-            // カメラはプレイヤー中央を緩やかに追従（固定 alpha）
+            // Camera gently follows player center (fixed alpha)
             const target: gfx.camera.Vec2 = .{
                 .x = body.x + body.w * 0.5,
                 .y = body.y + body.h * 0.5,
@@ -191,7 +191,7 @@ fn drawPlayer(
     }
 }
 
-/// 決定的な 3 セル Atlas（地面 / レンガ / 足場）。乱数なし。
+/// Deterministic 3-cell Atlas (ground / brick / platform). No RNG.
 fn buildTileAtlas(allocator: std.mem.Allocator) !gfx.Atlas {
     const cols: u32 = 3;
     const img_w = cols * TILE;
@@ -231,32 +231,32 @@ fn buildTileAtlas(allocator: std.mem.Allocator) !gfx.Atlas {
     return gfx.Atlas.initGrid(allocator, image, TILE, TILE);
 }
 
-/// 固定地形: 床・段差・浮遊足場・壁。Zig 配列（@embedFile なし）。
+/// Fixed terrain: floor, steps, floating platforms, walls. Zig array (no @embedFile).
 fn buildMapTiles() [MAP_W * MAP_H]u16 {
     var tiles: [MAP_W * MAP_H]u16 = undefined;
     @memset(&tiles, gfx.EmptyTile);
 
-    // 地面 2 段（y = MAP_H-2, MAP_H-1）
+    // Floor 2 rows (y = MAP_H-2, MAP_H-1)
     var x: u32 = 0;
     while (x < MAP_W) : (x += 1) {
         setTile(&tiles, x, MAP_H - 1, 0);
         setTile(&tiles, x, MAP_H - 2, 0);
     }
 
-    // 左壁
+    // Left wall
     var y: u32 = 0;
     while (y < MAP_H - 2) : (y += 1) {
         setTile(&tiles, 0, y, 1);
     }
 
-    // 段差（左寄り）
+    // Steps (leftish)
     x = 8;
     while (x < 14) : (x += 1) {
         setTile(&tiles, x, MAP_H - 3, 1);
         setTile(&tiles, x, MAP_H - 4, 1);
     }
 
-    // 浮遊足場
+    // Floating platforms
     x = 18;
     while (x < 26) : (x += 1) {
         setTile(&tiles, x, MAP_H - 8, 2);
@@ -266,7 +266,7 @@ fn buildMapTiles() [MAP_W * MAP_H]u16 {
         setTile(&tiles, x, MAP_H - 12, 2);
     }
 
-    // 天井の一部（右上）
+    // Partial ceiling (upper right)
     x = 30;
     while (x < 38) : (x += 1) {
         setTile(&tiles, x, 2, 1);

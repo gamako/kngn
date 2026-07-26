@@ -1,21 +1,21 @@
-//! example_22: ゲームパッド入力デモ（TASK-80.1 雛形。ADR-009）
+//! example_22: gamepad input demo (scaffold; ADR-009)
 //!
-//! **実 backend は全 OS で未実装**（TASK-80.2 で対応予定）。通常起動では接続表示が「未接続」の
-//! ままだが、harness の `inject gamepad_connect/disconnect/button/axis` で駆動すれば接続表示・
-//! 点移動・色変化を確認できる（headless replay で self-check 可能。AGENT.md「ヘッドレス検証 harness」節）。
+//! **Real backends are not implemented on any OS yet.** On a normal launch the connection display stays "disconnected",
+//! but driving it with harness `inject gamepad_connect/disconnect/button/axis` shows connection, point motion and
+//! colour changes (headless replay can self-check; see AGENT.md "headless verification harness").
 //!
-//! 当初の想定番号は `examples/20_gamepad` だったが `20_capture_demo` が既に存在するため
-//! `examples/22_gamepad`（`run-example_22`）に読み替えている（TASK-80.1 plan 参照）。
+//! The originally intended number was `examples/20_gamepad`, but `20_capture_demo` already existed, so
+//! this lives at `examples/22_gamepad` (`run-example_22`).
 //!
-//! 検証項目:
-//! - `platform.MAX_GAMEPADS` 分の接続インジケータ（左上の正方形。connected=緑 / disconnected=暗灰）
-//! - pad0 の左スティックで中央の点を移動（raw 値に `gamepad.applyDeadzone` を適用）
-//! - pad0 の A ボタン rising edge（`gamepad.justPressed`）で点の色をパレット内で切替
+//! Checks:
+//! - Connection indicators for `platform.MAX_GAMEPADS` pads (top-left squares; connected=green / disconnected=dark grey)
+//! - Move the centre point with pad0's left stick (raw values through `gamepad.applyDeadzone`)
+//! - Cycle the point colour in a palette on pad0 A rising edge (`gamepad.justPressed`)
 //!
-//! ホットパス宣言: `Window.getGamepadState` はフレーム毎に `MAX_GAMEPADS` 回（pad0..3 で4回）呼ぶ。
-//! pad0 の state は1回だけ取得し、移動/ボタン判定/インジケータ表示に再利用する（pad0 を2回読まない）。
-//! 4台×少数フィールドの固定長 copy（alloc/lock 無し）で全画素ループでも RT でもないため性能規約
-//! （SIMD 3点セット等）の適用対象外（docs/adr/009 参照）。
+//! Hot path declaration: `Window.getGamepadState` is called `MAX_GAMEPADS` times per frame (4 times for pad0..3).
+//! pad0's state is fetched once and reused for move / button / indicator (do not read pad0 twice).
+//! Fixed-length copies of a few fields × 4 pads (no alloc/lock); neither an all-pixel loop nor RT, so outside the
+//! performance rules (SIMD three-point set etc.; see docs/adr/009).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -32,13 +32,13 @@ const PALETTE = [_]u32{ 0xFFE0E0E0, 0xFFE04040, 0xFF40A0E0, 0xFFE0C040 };
 const INDICATOR_SIZE: i32 = 16;
 const INDICATOR_GAP: i32 = 20;
 const INDICATOR_MARGIN: i32 = 8;
-// 型注釈なし（comptime_int）: point_x/y（f32）の境界計算に混ぜても暗黙変換できるようにするため
-// i32 に固定しない（fillRect への引用時は comptime_int→i32 の暗黙変換で通る）。
+// No type annotation (comptime_int): so it mixes into point_x/y (f32) boundary maths via implicit conversion;
+// do not pin to i32 (comptime_int→i32 implicit conversion works when passed to fillRect).
 const POINT_SIZE = 10;
 const MOVE_SPEED: f32 = 3.0;
 const DEADZONE: f32 = 0.15;
 
-/// 塗りつぶし矩形（clip 済み。example の雛形なので簡易実装）。
+/// Filled rectangle (clipped. Simple scaffold for the example).
 fn fillRect(fb: []u32, w: i32, h: i32, x: i32, y: i32, size: i32, color: u32) void {
     var yy = @max(0, y);
     const y_end = @min(h, y + size);
@@ -76,12 +76,12 @@ pub fn main() !void {
             else => {},
         };
 
-        // pad0 の state は1回だけ取得し、移動/ボタン判定/インジケータ表示に再利用する（ホットパス宣言参照）。
+        // Fetch pad0 state once and reuse for move / button / indicator (see hot path declaration).
         const pad0 = window.getGamepadState(0);
         if (pad0) |state| {
             const stick = gamepad.applyDeadzone(state.left_stick, DEADZONE);
-            // stick.y は raw値（上入力=+1。ADR-009/TASK-80.2）。framebuffer の Y は下方向が正なので
-            // 符号を反転し、実機で「上に入れると点が上へ動く」直感に合わせる（TASK-80.2 微調整）。
+            // stick.y is raw (up = +1; ADR-009). framebuffer Y grows downward, so
+            // flip the sign so "push up → point moves up" on real hardware.
             point_x = std.math.clamp(point_x + stick.x * MOVE_SPEED, 0, WINDOW_W - POINT_SIZE);
             point_y = std.math.clamp(point_y - stick.y * MOVE_SPEED, 0, WINDOW_H - POINT_SIZE);
             if (gamepad.justPressed(prev_buttons, state.buttons, .a)) {
@@ -100,7 +100,7 @@ pub fn main() !void {
             const w_i32: i32 = @intCast(fb.width);
             const h_i32: i32 = @intCast(fb.height);
 
-            // 接続インジケータ（pad0 は上で取得済みの state を再利用し2回読まない）。
+            // Connection indicators (pad0 reuses the state fetched above; do not read twice).
             var i: u8 = 0;
             while (i < platform.MAX_GAMEPADS) : (i += 1) {
                 const connected = if (i == 0) (pad0 != null) else window.getGamepadState(i) != null;

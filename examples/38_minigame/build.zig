@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
+// build_helpers/ is a symlink to ../../build_helpers.
 const platform = @import("build_helpers/platform.zig");
 
 const PROJECT_ROOT = "../..";

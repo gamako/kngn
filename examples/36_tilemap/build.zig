@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// build_helpers/ は ../../build_helpers へのシンボリックリンク。
+// build_helpers/ is a symlink to ../../build_helpers.
 const platform = @import("build_helpers/platform.zig");
 
 const PROJECT_ROOT = "../..";
@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // kit 配線: apps/editor/build.zig を手本に、png を 1 instance で共有する（二重化回避）。
+    // kit wiring: follow apps/editor/build.zig; share one png instance (avoid duplication).
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     sound.addImport("dsp", dsp);
     sound.addImport("synth", synth);
 
-    // kit.gfx（TASK-111.5）: tilemap が gmath を要求するため gfx に gmath を配線。
+    // kit.gfx: tilemap needs gmath, so wire gmath into gfx.
     const gfx_keyboard = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
     });
@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
-            // gfx(action_map) と同一 gamepad instance（TASK-111.8 / 111.5: dual module 回避）
+            // Same gamepad instance as gfx(action_map) (avoid dual modules)
             .gamepad = gamepad_mod,
         },
     });

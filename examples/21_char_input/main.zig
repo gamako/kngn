@@ -1,26 +1,26 @@
-//! 21_char_input: TASK-22 の `char_input`（確定テキスト文字。UTF-32 codepoint）を単体で確認する
-//! 最小サンプル。pixie の rename や capture demo に混ぜず「文字入力だけ」を見られる vehicle で、
-//! 全 backend（macOS objc/swift/metal・Linux x11/wayland・Windows gdi/d3d11）の char_input 発火を
-//! 実機で目視確認する土台にする（Windows・Linux x11/wayland にも流用）。
+//! 21_char_input: minimal sample that checks `char_input` alone (committed text characters as UTF-32 codepoints).
+//! A vehicle for "text input only" without mixing in pixie rename or the capture demo, and a base for
+//! visually confirming char_input on every backend (macOS objc/swift/metal, Linux x11/wayland, Windows gdi/d3d11)
+//! on real hardware (also reusable on Windows and Linux x11/wayland).
 //!
-//! フォントは **OS のシステムフォントをランタイム読込**する（example_12 と同じ方式。日本語 .ttc を
-//! 優先し ASCII も 1 本で混在描画。再配布でないので repo にアセットを持たず・ネットワーク取得も不要）。
-//! フォント自体は日本語グリフを持つので、char_input で**届いた** codepoint は日本語も描画できる。
+//! The font is an **OS system font loaded at runtime** (same approach as example_12. Prefer a Japanese .ttc so
+//! ASCII and Japanese mix in one face. Not redistributed, so no repo asset and no network fetch).
+//! The font itself has Japanese glyphs, so Japanese codepoints that **arrive** via char_input also draw.
 //!
-//! **IME（TASK-79.6.2）**: macOS は view を NSTextInputClient 化し、確定文字を `char_input`、
-//! 変換中は composition snapshot を下線付き inline で描画する。harness は
-//! `inject composition update/cancel` と `inject commit <text>` で同じ状態契約を検証できる。
+//! **IME**: on macOS the view is an NSTextInputClient; committed characters go to `char_input`, and
+//! in-progress conversion is drawn as an underlined inline composition snapshot. The harness can
+//! verify the same state contract with `inject composition update/cancel` and `inject commit <text>`.
 //!
-//! 操作: 文字をタイプ＝`char_input` でバッファ追記 / BACKSPACE=1 コードポイント削除 /
-//!       ENTER=改行 / ESC=終了。
-//!   - **印字は `char_input` のみで行う**（`key_down` の物理キーや `keyboard.getCharFromKey` は使わない。
-//!     後者は A-Z/0-9 に限られ日本語が出せないため）。ESC/BACKSPACE/ENTER の制御だけ `key_down` で見る。
+//! Controls: type = append via `char_input` / BACKSPACE = delete one codepoint /
+//!       ENTER = newline / ESC = quit.
+//!   - **Printing uses `char_input` only** (not physical `key_down` keys or `keyboard.getCharFromKey`,
+//!     which is limited to A-Z/0-9 and cannot emit Japanese). Only ESC/BACKSPACE/ENTER controls use `key_down`.
 //!
-//! harness: `inject char <cp>` で headless に文字を注入でき、`chars` probe（digest）で
-//!   len/last_cp/last_mods を assert、`snapshot fb` で表示を目視できる（決定的）。
+//! harness: `inject char <cp>` injects characters headlessly; the `chars` probe (digest) asserts
+//!   len/last_cp/last_mods; `snapshot fb` is for visual check (deterministic).
 //!
-//! ホットパス宣言: 状態更新は**イベント時のみ**（打鍵）。テキスト描画は既存 font 経路の毎フレーム
-//!   描画で、新規の全画素ループは作らない。性能規約（SIMD 3 点セット等）の適用対象外。
+//! Hot path declaration: state updates are **event-only** (keystrokes). Text drawing is the existing per-frame
+//!   font path; no new all-pixel loop. Outside the performance-rules (SIMD three-point set etc.) scope.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -31,7 +31,7 @@ const COMPOSITION_BYTES = 1024;
 
 const CompositionCaretRect = struct { x: i32, y: i32, w: i32, h: i32 };
 
-/// 入力状態（`chars` probe の ctx）。buf は UTF-8。改行は '\n' をそのまま格納し描画側で分割する。
+/// Input state (`chars` probe ctx). buf is UTF-8. Newlines store a literal LF and the drawer splits on it.
 const State = struct {
     buf: [MAX_BYTES]u8 = undefined,
     len: usize = 0,
@@ -43,21 +43,21 @@ const State = struct {
     composition_dirty: bool = false,
     composition_rect: ?CompositionCaretRect = null,
 
-    /// `char_input` の codepoint を UTF-8 で追記する。制御文字（本来 char_input には来ない想定だが
-    /// 防御）と容量超過は無視（fail-safe: 取りこぼしがあってもクラッシュしない）。
+    /// Append a `char_input` codepoint as UTF-8. Ignore control characters (should not arrive on char_input, but
+    /// defended) and capacity overflow (fail-safe: a drop must not crash).
     fn appendCodepoint(self: *State, cp: u32, mods: u32) void {
         self.last_cp = cp;
         self.last_mods = mods;
         if (cp < 0x20 or cp == 0x7F) return;
         if (cp > std.math.maxInt(u21)) return;
         var enc: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(@intCast(cp), &enc) catch return; // 不正/サロゲート等は無視
+        const n = std.unicode.utf8Encode(@intCast(cp), &enc) catch return; // Ignore invalid / surrogates etc.
         if (self.len + n > self.buf.len) return;
         @memcpy(self.buf[self.len..][0..n], enc[0..n]);
         self.len += n;
     }
 
-    /// 直前の 1 コードポイントを削除（UTF-8 継続バイトを遡って安全に削る）。
+    /// Delete the previous codepoint (walk back UTF-8 continuation bytes safely).
     fn backspace(self: *State) void {
         if (self.len == 0) return;
         var i = self.len - 1;
@@ -80,8 +80,8 @@ const State = struct {
     }
 };
 
-/// `chars` probe: 数値のみの top-level k=v（`expect chars last_cp=12354` 等で assert 可能）。
-/// 生テキストは改行を含みうるので digest には出さない（1 行契約の wire framing 保護）。
+/// `chars` probe: top-level numeric k=v only (assertable as `expect chars last_cp=12354` etc.).
+/// Raw text may contain newlines, so it is not put on the digest (protects the one-line wire framing).
 fn charsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const st: *State = @ptrCast(@alignCast(ctx));
     return std.fmt.bufPrint(buf, "len={d} last_cp={d} last_mods={d}", .{ st.len, st.last_cp, st.last_mods }) catch buf[0..0];
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     var window = try platform.Window.create(900, 600, "21: char_input demo");
     defer window.destroy();
 
-    // フォント bytes は FontFace より長命であること（main 寿命で保持）。
+    // Font bytes must outlive FontFace (held for main's lifetime).
     const loaded = fontmod.loadSystemTextFace(init.io, allocator);
     defer if (loaded) |l| allocator.free(l.bytes);
     if (loaded == null) std.debug.print("no usable system font found; text will not render (chars probe still works).\n", .{});
@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (of) |*o| o.deinit();
 
     var state: State = .{};
-    // harness 無効時は no-op（通常実行に影響しない）。
+    // No-op when harness is disabled (does not affect normal runs).
     platform.registerProbe(.{
         .name = "chars",
         .ctx = &state,
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
                 else => {},
             },
             .composition_changed => state.composition_dirty = true,
-            // 印字は char_input 経由（日本語含む確定文字）。key_down は制御キーのみ。
+            // Printing goes through char_input (committed characters including Japanese). key_down is control keys only.
             .char_input => |ch| state.appendCodepoint(ch.codepoint, ch.modifiers.toC()),
             else => {},
         };
@@ -150,9 +150,9 @@ pub fn main(init: std.process.Init) !void {
                 const lh: i32 = @intCast(f.metrics().line_height);
 
                 f.drawTo(target, .{ .x = 8, .y = 8 }, "char_input demo: type ASCII / BACKSPACE / ENTER / ESC quit", gray, clip, 1.0);
-                f.drawTo(target, .{ .x = 8, .y = 8 + lh }, "(IME: 変換→確定で日本語。preedit 下線は 79.6.2。inject commit 可)", gray, clip, 1.0);
+                f.drawTo(target, .{ .x = 8, .y = 8 + lh }, "(IME: 変換→確定で日本語。preedit 下線あり。inject commit 可)", gray, clip, 1.0);
 
-                // 入力テキスト（'\n' で行分割）。末尾に静的キャレット '_'（blink しない＝決定的）。
+                // Input text (split on LF). Static caret '_' at the end (no blink = deterministic).
                 const text_top: i32 = 8 + lh * 2;
                 var y: i32 = text_top;
                 var last_line: []const u8 = "";
@@ -169,8 +169,8 @@ pub fn main(init: std.process.Init) !void {
                     const preedit = state.preedit[0..state.preedit_len];
                     f.drawTo(target, .{ .x = caret_x, .y = last_y }, preedit, cyan, clip, 1.0);
                     const preedit_w: i32 = @intCast(f.measure(preedit));
-                    // 下線は baseline 直下（ascent+2）。行ボックス最下端（lh-2）だと descent+gap の
-                    // 下に浮いて見える（実機指摘 2026-07-17）。行内に収まるよう lh-1 で clamp。
+                    // Underline sits just under the baseline (ascent+2). At the bottom of the line box (lh-2) it floats
+                    // below descent+gap. Clamp with lh-1 so it stays inside the line.
                     const underline_y = @min(last_y + @as(i32, @intCast(f.metrics().ascent)) + 2, last_y + lh - 1);
                     var ux = caret_x;
                     while (ux < caret_x + preedit_w) : (ux += 1) {
@@ -180,8 +180,8 @@ pub fn main(init: std.process.Init) !void {
                     caret_x += @intCast(f.measure(cursor_prefix));
                 }
                 f.drawTo(target, .{ .x = caret_x, .y = last_y }, "_", green, clip, 1.0);
-                // rect は preedit の有無に関係なく常に caret を指す（composition 開始打鍵の
-                // handleEvent 時点で正しい位置が既に供給されているように。実機指摘 2026-07-17）。
+                // The rect always points at the caret regardless of preedit, so the correct position is already
+                // supplied at the handleEvent of the keystroke that starts composition.
                 {
                     const rect = CompositionCaretRect{ .x = caret_x, .y = last_y, .w = 1, .h = lh };
                     if (state.composition_rect == null or
@@ -195,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
 
-                // 直近の codepoint / modifier（非 ASCII でも受信を数値で確認できる）。
+                // Latest codepoint / modifiers (non-ASCII receipt is still visible as numbers).
                 var dbg: [80]u8 = undefined;
                 const dbg_str = std.fmt.bufPrint(&dbg, "last: U+{X:0>4}  mods=0x{X}  bytes={d}", .{ state.last_cp, state.last_mods, state.len }) catch "last: ?";
                 f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 28 }, dbg_str, cyan, clip, 1.0);
