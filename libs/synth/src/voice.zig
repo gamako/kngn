@@ -1,17 +1,17 @@
-//! Voice（1 音 = Osc + Env + Filter）と固定 VoicePool（割当 / スチール / done 回収）。
-//! 全て RT スレッドで動くため malloc/lock/IO しない（プールは起動時固定確保）。
+//! Voice (one note = Osc + Env + Filter) and a fixed VoicePool (allocate / steal / reclaim done).
+//! Everything runs on the RT thread, so no malloc/lock/IO (the pool is fixed-allocated at startup).
 
 const std = @import("std");
 const dsp = @import("dsp");
 
-/// ユニゾン声部数の固定上限(奇数=中央1声)。Voice はこの数のオシレータを構造体に内包し RT で確保しない。
+/// Fixed upper bound on unison voices (odd = one centre voice). Voice embeds this many oscillators in the struct; no RT allocation.
 pub const MAX_UNISON = 7;
 
-/// control-rate tick の周期（サンプル）。超越関数（pow/tan/sin）はこの周期でのみ実行する
-/// （48kHz で 3kHz 更新。libs/modular VCF の ctrl_period=16 と同値。TASK-57）。
+/// Control-rate tick period (samples). Transcendentals (pow/tan/sin) run only on this period
+/// (3 kHz update at 48 kHz; same value as libs/modular VCF's ctrl_period=16).
 pub const CTRL_PERIOD: u32 = 16;
 
-/// 音色パラメータの集合。waveform / ADSR は noteOn で latch、cutoff/res/gain/filter_mode/keytrack は毎ブロック反映。
+/// Timbre-parameter set. waveform / ADSR are latched on noteOn; cutoff/res/gain/filter_mode/keytrack apply every block.
 pub const Patch = struct {
     waveform: dsp.Waveform = .sine,
     attack: f32 = 0.01,
@@ -22,97 +22,97 @@ pub const Patch = struct {
     resonance: f32 = 0.707,
     gain: f32 = 0.2,
     filter_mode: dsp.FilterMode = .lowpass,
-    /// キートラッキング量(0=追従なし, 1=1オクターブ/オクターブ=完全追従)。基準ノートは C4(60)。
+    /// Key-tracking amount (0 = none, 1 = 1 octave/octave = full tracking). Reference note is C4(60).
     keytrack: f32 = 0.0,
-    // フィルタエンベロープ（2本目 ADSR で cutoff をモジュレート）
+    // Filter envelope (second ADSR modulating cutoff)
     filter_attack: f32 = 0.01,
     filter_decay: f32 = 0.2,
     filter_sustain: f32 = 0.0,
     filter_release: f32 = 0.2,
-    /// フィルタ env のモジュレーション量（オクターブ単位の±）。0 で無効（従来通り）。
+    /// Filter-env modulation depth (± octaves). 0 disables (as before).
     filter_env_amount: f32 = 0.0,
-    // LFO（vibrato/tremolo）
+    // LFO (vibrato/tremolo)
     lfo_rate: f32 = 5.0, // Hz
     lfo_waveform: dsp.LfoWaveform = .sine,
-    vibrato_depth: f32 = 0.0, // 半音単位（pitch モジュレーション）
-    tremolo_depth: f32 = 0.0, // 0..1（amp モジュレーション）
-    /// ベロシティ → cutoff（オクターブ単位）。0 で無効。
+    vibrato_depth: f32 = 0.0, // Semitone units (pitch modulation)
+    tremolo_depth: f32 = 0.0, // 0..1 (amp modulation)
+    /// Velocity → cutoff (octaves). 0 disables.
     velocity_to_cutoff: f32 = 0.0,
-    // オシレータ拡張(27.13): ユニゾン / 2nd osc / ノイズ源
-    unison: u8 = 1, // ユニゾン声部数(1..MAX_UNISON)
-    detune: f32 = 0.0, // ユニゾン detune 広がり(cents、±)
+    // Oscillator extensions: unison / 2nd osc / noise source
+    unison: u8 = 1, // Unison voice count (1..MAX_UNISON)
+    detune: f32 = 0.0, // Unison detune spread (cents, ±)
     osc2_waveform: dsp.Waveform = .sine,
-    osc2_detune: f32 = 0.0, // 2nd osc 音程差(半音)
-    osc2_mix: f32 = 0.0, // osc1↔osc2 クロスフェード(0=osc1のみ, 1=osc2のみ)
-    noise_amount: f32 = 0.0, // 加算する白色ノイズ量(0..1)
+    osc2_detune: f32 = 0.0, // 2nd-osc interval (semitones)
+    osc2_mix: f32 = 0.0, // osc1↔osc2 crossfade (0=osc1 only, 1=osc2 only)
+    noise_amount: f32 = 0.0, // Added white-noise amount (0..1)
 };
 
-/// キートラッキング適用後の実効 cutoff(Hz)。基準 C4(60) から半音ごとに keytrack 比率で追従。
+/// Effective cutoff (Hz) after key-tracking. Tracks from reference C4(60) by keytrack ratio per semitone.
 fn trackedCutoff(base_cutoff: f32, keytrack: f32, note: u8) f32 {
     const semitones = (@as(f32, @floatFromInt(note)) - 60.0);
     return base_cutoff * std.math.pow(f32, 2.0, keytrack * semitones / 12.0);
 }
 
-/// フィルタ env による cutoff モジュレーション。amount(オクターブ) × env_level(0..1) を底2で適用。
+/// Cutoff modulation from the filter env. Applies amount(octaves) × env_level(0..1) in base-2.
 fn modulatedCutoff(base_cutoff: f32, amount: f32, env_level: f32) f32 {
     return base_cutoff * std.math.pow(f32, 2.0, amount * env_level);
 }
 
-/// MIDI ノート番号 → 周波数(Hz)。A4(note 69)=440Hz。
+/// MIDI note number → frequency (Hz). A4(note 69)=440Hz.
 pub fn noteToFreq(note: u8) f32 {
     const n: f32 = @floatFromInt(note);
     return 440.0 * std.math.pow(f32, 2.0, (n - 69.0) / 12.0);
 }
 
-/// ユニゾン声部 i(0..MAX_UNISON-1) の初期位相。MAX_UNISON で等分散し全声部の同位相累積を防ぐ。
+/// Initial phase for unison voice i (0..MAX_UNISON-1). Spread evenly across MAX_UNISON so all voices do not accumulate in phase.
 fn phaseSpread(i: usize) f32 {
     return @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(MAX_UNISON));
 }
 
-/// ユニゾン声部 i の detune 比。count 声部で `±detune_cents` を対称分散(count=1 は 1.0)。
+/// Detune ratio for unison voice i. Spread `±detune_cents` symmetrically across count voices (count=1 → 1.0).
 fn unisonRatio(i: usize, count: u8, detune_cents: f32) f32 {
     if (count <= 1) return 1.0;
-    // 声部を -1..1 に対称配置(i=0 → -1, i=count-1 → +1)
+    // Place voices symmetrically in -1..1 (i=0 → -1, i=count-1 → +1)
     const spread = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(count - 1)) * 2.0 - 1.0;
     return std.math.pow(f32, 2.0, detune_cents * spread / 1200.0);
 }
 
-/// 1 音分のボイス。状態機械は Envelope の stage に従う
-/// (idle → attack/decay/sustain → release → done=idle)。
+/// One voice. State machine follows the Envelope stage
+/// (idle → attack/decay/sustain → release → done=idle).
 pub const Voice = struct {
-    oscs: [MAX_UNISON]dsp.Oscillator = [_]dsp.Oscillator{.{}} ** MAX_UNISON, // osc1 ユニゾン複製
-    osc2: dsp.Oscillator = .{}, // 2nd オシレータ
-    noise: dsp.Noise = .{}, // ノイズ源
+    oscs: [MAX_UNISON]dsp.Oscillator = [_]dsp.Oscillator{.{}} ** MAX_UNISON, // osc1 unison copies
+    osc2: dsp.Oscillator = .{}, // 2nd oscillator
+    noise: dsp.Noise = .{}, // Noise source
     env: dsp.Envelope = .{},
-    filter_env: dsp.Envelope = .{}, // フィルタ用 2 本目 ADSR
+    filter_env: dsp.Envelope = .{}, // Second ADSR for the filter
     lfo: dsp.Lfo = .{},
     filter: dsp.Filter = .{},
     note: u8 = 0,
     freq: f32 = 0,
     velocity: f32 = 0,
     active: bool = false,
-    age: u64 = 0, // スチール判定用（小さいほど古い）
-    // ブロック先頭で確定するパラメータ（renderSample のモジュレーションに使う）
+    age: u64 = 0, // For steal decisions (smaller = older)
+    // Parameters fixed at the block head (used by renderSample modulation)
     block_cutoff: f32 = 8000,
     block_res: f32 = 0.707,
     block_fenv_amount: f32 = 0.0,
     block_lfo_rate: f32 = 5.0,
     block_vibrato: f32 = 0.0,
     block_tremolo: f32 = 0.0,
-    // オシレータ段(27.13)のブロック確定パラメータ
+    // Oscillator-stage parameters fixed per block
     block_unison: u8 = 1,
     block_unison_norm: f32 = 1.0, // 1/sqrt(unison)
     unison_ratio: [MAX_UNISON]f32 = [_]f32{1.0} ** MAX_UNISON,
     block_osc2_ratio: f32 = 1.0,
     block_osc2_mix: f32 = 0.0,
     block_noise: f32 = 0.0,
-    // control-rate 間引き（TASK-57）: 超越関数（pow/tan/sin）は CTRL_PERIOD サンプル毎の tick でのみ実行。
-    ctrl_counter: u32 = 0, // 次の tick までの残サンプル。0 で tick（prepareBlock でもリセット）
-    ctrl_freq: f32 = 0, // tick で確定した vibrato 適用済み周波数
-    ctrl_trem: f32 = 1.0, // tick で確定した tremolo 係数
-    ctrl_ticks: u32 = 0, // tick 実行回数（上限 assert テスト用）
-    filter_recalcs: u32 = 0, // filter.setParams 実行回数（dirty-gate のテスト用）
-    applied_cutoff: f32 = -1.0, // dirty-gate: 最後に setParams した実効値（sentinel=-1 で必ず初回適用）
+    // Control-rate decimation: transcendentals (pow/tan/sin) run only on a tick every CTRL_PERIOD samples.
+    ctrl_counter: u32 = 0, // Samples remaining until the next tick. 0 means tick (also reset in prepareBlock)
+    ctrl_freq: f32 = 0, // Vibrato-applied frequency fixed on the tick
+    ctrl_trem: f32 = 1.0, // Tremolo coefficient fixed on the tick
+    ctrl_ticks: u32 = 0, // Tick execution count (for upper-bound assert tests)
+    filter_recalcs: u32 = 0, // filter.setParams execution count (for dirty-gate tests)
+    applied_cutoff: f32 = -1.0, // dirty-gate: last effective values passed to setParams (sentinel=-1 forces first apply)
     applied_res: f32 = -1.0,
 
     pub fn noteOn(self: *Voice, note: u8, velocity: f32, patch: Patch, sample_rate: f32, age: u64) void {
@@ -121,13 +121,13 @@ pub const Voice = struct {
         self.velocity = velocity;
         self.active = true;
         self.age = age;
-        // ユニゾン: MAX_UNISON 全要素を初期化(古い再利用 Voice の残り位相/波形を拾わない)。
-        // 位相は phaseSpread で分散し同位相による単なる増幅を防ぐ(決定論的・RT 安全)。
+        // Unison: initialise all MAX_UNISON elements (do not pick up leftover phase/waveform from a reused Voice).
+        // Spread phase via phaseSpread so in-phase voices do not simply amplify (deterministic; RT-safe).
         for (&self.oscs, 0..) |*o, i| {
             o.* = .{ .waveform = patch.waveform, .phase = phaseSpread(i) };
         }
         self.osc2 = .{ .waveform = patch.osc2_waveform, .phase = 0 };
-        // ノイズ seed: age(単調増加) からノート/ボイス毎に異なる非ゼロ u32 を作る(脱相関)。
+        // Noise seed: build a distinct non-zero u32 per note/voice from age (monotonic) (decorrelation).
         self.noise.seed(@truncate((age +% 1) *% 0x9E3779B97F4A7C15));
         self.env = .{
             .attack = patch.attack,
@@ -148,8 +148,8 @@ pub const Voice = struct {
         self.lfo = .{ .waveform = patch.lfo_waveform, .phase = 0 };
         self.filter = dsp.Filter.init(sample_rate, trackedCutoff(patch.cutoff, patch.keytrack, note), patch.resonance);
         self.filter.setMode(patch.filter_mode);
-        // control-rate 状態のリセット。applied_* は sentinel に戻し、voice 再利用時に
-        // 初回 tick の setParams が stale な dirty-gate で skip されないようにする（TASK-57）。
+        // Reset control-rate state. applied_* return to the sentinel so the first tick's setParams after voice
+        // reuse is not skipped by a stale dirty-gate.
         self.ctrl_counter = 0;
         self.ctrl_freq = self.freq;
         self.ctrl_trem = 1.0;
@@ -162,62 +162,62 @@ pub const Voice = struct {
         self.filter_env.noteOff();
     }
 
-    /// ブロック先頭で cutoff(キートラッキング + ベロシティ→cutoff)/resonance/種別/モジュレーション量を確定。
-    /// filter_env_amount=0 のときは毎サンプルの再計算を避けてここで一度だけ setParams。
+    /// At the block head, fix cutoff (key-tracking + velocity→cutoff) / resonance / mode / modulation depth.
+    /// When filter_env_amount=0, avoid per-sample recompute and call setParams once here.
     pub fn prepareBlock(self: *Voice, patch: Patch) void {
         if (!self.active) return;
-        // base cutoff = キートラッキング × ベロシティ→cutoff
+        // base cutoff = key-tracking × velocity→cutoff
         const vel_oct = patch.velocity_to_cutoff * self.velocity;
         self.block_cutoff = trackedCutoff(patch.cutoff, patch.keytrack, self.note) * std.math.pow(f32, 2.0, vel_oct);
         self.block_res = patch.resonance;
         self.block_fenv_amount = patch.filter_env_amount;
         self.block_lfo_rate = patch.lfo_rate;
         self.block_vibrato = patch.vibrato_depth;
-        self.block_tremolo = std.math.clamp(patch.tremolo_depth, 0.0, 1.0); // 範囲外で負ゲイン/増幅を防ぐ
+        self.block_tremolo = std.math.clamp(patch.tremolo_depth, 0.0, 1.0); // Prevent negative gain / runaway amplification out of range
         self.filter.setMode(patch.filter_mode);
         if (patch.filter_env_amount == 0.0) {
             self.filter.setParams(self.block_cutoff, self.block_res);
-            // dirty-gate 不変条件: applied_* は「現在 filter に実際に適用済みの係数値」。
-            // ここで同期しないと fenv 有効→0→再有効の切替時に tick が stale 値で skip し得る。
+            // dirty-gate invariant: applied_* are "the coefficient values currently on the filter".
+            // Without syncing here, a tick can skip on a stale value when toggling fenv on→0→on again.
             self.applied_cutoff = self.block_cutoff;
             self.applied_res = self.block_res;
         }
-        // オシレータ段(27.13): ユニゾン数 / detune 比 / osc2 / ノイズ量を確定(pow は毎ブロックのみ)。
+        // Oscillator stage: fix unison count / detune ratios / osc2 / noise amount (pow only once per block).
         const uni = std.math.clamp(patch.unison, 1, MAX_UNISON);
         self.block_unison = uni;
-        self.block_unison_norm = 1.0 / @sqrt(@as(f32, @floatFromInt(uni))); // 脱相関時の体感ラウドネス一定化
+        self.block_unison_norm = 1.0 / @sqrt(@as(f32, @floatFromInt(uni))); // Keep perceived loudness constant under decorrelation
         for (0..uni) |i| self.unison_ratio[i] = unisonRatio(i, uni, patch.detune);
         self.block_osc2_ratio = std.math.pow(f32, 2.0, patch.osc2_detune / 12.0);
         self.block_osc2_mix = std.math.clamp(patch.osc2_mix, 0.0, 1.0);
         self.block_noise = std.math.clamp(patch.noise_amount, 0.0, 1.0);
-        self.osc2.waveform = patch.osc2_waveform; // ライブ変更可
-        // ブロック境界でパラメータ変更が即反映されるよう次サンプルを tick にする
-        // （LFO 位相はリセットしない = 位相進行はサンプル数に正確に比例。TASK-57）
+        self.osc2.waveform = patch.osc2_waveform; // Live-editable
+        // Force the next sample to tick so parameter changes take effect at the block boundary
+        // (do not reset LFO phase = phase advance stays exactly proportional to sample count)
         self.ctrl_counter = 0;
     }
 
-    /// 1 サンプル合成。env が done になったら active=false（プールへ返る）。
+    /// Synthesise one sample. When env becomes done, active=false (returns to the pool).
     ///
-    /// RT（毎サンプル）経路。超越関数（vibrato の pow / setParams の tan / LFO の sin）は
-    /// CTRL_PERIOD サンプル毎の control tick でのみ実行し、間は保持値を使う（TASK-57）。
-    /// filter への setParams は dirty-gate（applied_* と実効値の比較）で変化時のみ。
-    /// env / filter_env の next() は stage 進行・振幅精度・done 回収のため毎サンプル維持。
+    /// RT (per-sample) path. Transcendentals (vibrato pow / setParams tan / LFO sin) run
+    /// only on a control tick every CTRL_PERIOD samples; between ticks the held values are used.
+    /// filter setParams is dirty-gated (compare applied_* to the effective values) and runs only on change.
+    /// env / filter_env next() stay per-sample for stage advance, amplitude accuracy, and done reclaim.
     pub fn renderSample(self: *Voice, sample_rate: f32) f32 {
         if (!self.active) return 0.0;
         const mod_on = self.block_vibrato != 0.0 or self.block_tremolo != 0.0;
         const e = self.env.next();
         const fe = self.filter_env.next();
-        // control tick: LFO 評価（sin）→ vibrato（pow）→ tremolo → filter setParams（pow+tan、dirty-gate）
+        // control tick: LFO eval (sin) → vibrato (pow) → tremolo → filter setParams (pow+tan, dirty-gate)
         if (self.ctrl_counter == 0) {
             self.ctrl_counter = CTRL_PERIOD;
             self.ctrl_ticks +%= 1;
-            const lfo_v = if (mod_on) self.lfo.value() else 0.0; // -1..1（現在位相の評価のみ）
+            const lfo_v = if (mod_on) self.lfo.value() else 0.0; // -1..1 (evaluate the current phase only)
             self.ctrl_freq = if (self.block_vibrato != 0.0)
                 self.freq * std.math.pow(f32, 2.0, self.block_vibrato * lfo_v / 12.0)
             else
                 self.freq;
             self.ctrl_trem = if (self.block_tremolo != 0.0) 1.0 - self.block_tremolo * (0.5 - 0.5 * lfo_v) else 1.0;
-            // フィルタ env が有効なら cutoff をモジュレート（amount=0 なら prepareBlock の設定のまま）
+            // If the filter env is active, modulate cutoff (amount=0 keeps prepareBlock's setting)
             if (self.block_fenv_amount != 0.0) {
                 const target = modulatedCutoff(self.block_cutoff, self.block_fenv_amount, fe);
                 if (target != self.applied_cutoff or self.block_res != self.applied_res) {
@@ -229,26 +229,26 @@ pub const Voice = struct {
             }
         }
         self.ctrl_counter -= 1;
-        // LFO 位相は毎サンプル前進（波形評価なし・軽量）。tick 間の位相進行を実時間に比例させる。
+        // Advance LFO phase every sample (no waveform eval; cheap). Keeps inter-tick phase advance proportional to real time.
         if (mod_on) self.lfo.advance(self.block_lfo_rate, sample_rate);
-        // オシレータ段: ユニゾン(osc1 複製を detune して合算・正規化) + 2nd osc(クロスフェード) + ノイズ(加算)。
+        // Oscillator stage: unison (detuned osc1 copies, summed and normalised) + 2nd osc (crossfade) + noise (add).
         const freq = self.ctrl_freq;
         var osc1: f32 = 0;
         for (self.oscs[0..self.block_unison], 0..) |*o1, i| {
             osc1 += o1.next(freq * self.unison_ratio[i], sample_rate);
         }
         osc1 *= self.block_unison_norm;
-        // osc2 は mix=0 でも常に位相を進める(ライブで mix を上げた時のクリック回避)。
+        // Advance osc2 phase even at mix=0 (avoid a click when mix is raised live).
         const o2 = self.osc2.next(freq * self.block_osc2_ratio, sample_rate);
         var o = osc1 * (1.0 - self.block_osc2_mix) + o2 * self.block_osc2_mix;
         if (self.block_noise > 0.0) o += self.noise.next() * self.block_noise;
         const out = self.filter.process(o * e * self.velocity * self.ctrl_trem);
-        if (!self.env.isActive()) self.active = false; // done 回収（振幅 env 基準）
+        if (!self.env.isActive()) self.active = false; // Reclaim done (based on the amplitude env)
         return out;
     }
 
-    /// 自 voice の 1 ブロック分を acc へ加算する（voice-major 経路。TASK-57）。
-    /// RT 経路: 確保・ロックなし。
+    /// Accumulate this voice's block into acc (voice-major path).
+    /// RT path: no allocation / locking.
     pub fn renderBlockAdd(self: *Voice, sample_rate: f32, acc: []f32) void {
         for (acc) |*s| s.* += self.renderSample(sample_rate);
     }
@@ -258,7 +258,7 @@ pub const Voice = struct {
     }
 };
 
-/// 固定数のボイスプール。割当は空きボイス優先、満杯なら最古をスチール。
+/// Fixed-size voice pool. Allocation prefers free voices; when full, steals the oldest.
 pub fn VoicePool(comptime max_voices: usize) type {
     return struct {
         const Self = @This();
@@ -278,21 +278,21 @@ pub fn VoicePool(comptime max_voices: usize) type {
             return n;
         }
 
-        /// 空きボイスへ割当。満杯なら最古(age 最小)をスチール。
+        /// Allocate a free voice. When full, steal the oldest (smallest age).
         pub fn noteOn(self: *Self, note: u8, velocity: f32, patch: Patch, sample_rate: f32) void {
             self.age_counter += 1;
             const idx = self.findFreeOrOldest();
             self.voices[idx].noteOn(note, velocity, patch, sample_rate, self.age_counter);
         }
 
-        /// 該当ノートを鳴らしている全ボイスを release へ。
+        /// Release every voice sounding the given note.
         pub fn noteOff(self: *Self, note: u8) void {
             for (&self.voices) |*v| {
                 if (v.active and v.note == note) v.noteOff();
             }
         }
 
-        /// 全ノートオフ（パニック）。
+        /// All notes off (panic).
         pub fn allNotesOff(self: *Self) void {
             for (&self.voices) |*v| {
                 if (v.active) v.noteOff();
@@ -303,33 +303,33 @@ pub fn VoicePool(comptime max_voices: usize) type {
             var oldest: usize = 0;
             var oldest_age: u64 = std.math.maxInt(u64);
             for (self.voices, 0..) |v, i| {
-                if (!v.active) return i; // 空き優先
+                if (!v.active) return i; // Prefer free
                 if (v.age < oldest_age) {
                     oldest_age = v.age;
                     oldest = i;
                 }
             }
-            return oldest; // 満杯 → 最古をスチール
+            return oldest; // Full → steal the oldest
         }
 
-        /// ブロック先頭処理: 全アクティブボイスに patch の filter を反映。
+        /// Block-head work: apply the patch's filter to every active voice.
         pub fn prepareBlock(self: *Self, patch: Patch) void {
             for (&self.voices) |*v| v.prepareBlock(patch);
         }
 
-        /// 1 サンプル分、全アクティブボイスを合成して合算。
-        /// （sample-major の旧 API。voice-major 一致テストの参照実装としても使う）
+        /// Synthesise and sum every active voice for one sample.
+        /// (Former sample-major API. Also the reference for the voice-major equality test.)
         pub fn renderSample(self: *Self, sample_rate: f32) f32 {
             var sum: f32 = 0;
             for (&self.voices) |*v| sum += v.renderSample(sample_rate);
             return sum;
         }
 
-        /// 1 ブロック分を voice-major で acc（mono・呼び出し側で 0 クリア済み）へ加算合成する。
-        /// voice index 順に加算 = renderSample の合算順と同一なので、各サンプルの
-        /// f32 加算順序は sample-major と不変（IEEE == で一致。TASK-57）。
-        /// RT 経路: 確保・ロックなし。1 voice ≒ 300B の状態をブロック単位でストリーミングし
-        /// キャッシュ効率を上げる（sample-major は毎サンプル全 voice を走査していた）。
+        /// Accumulate one block voice-major into acc (mono; caller zero-cleared).
+        /// Adding in voice-index order = same sum order as renderSample, so each sample's
+        /// f32 addition order matches sample-major (IEEE == equality).
+        /// RT path: no allocation / locking. Streams ~300B of per-voice state per block for
+        /// better cache behaviour (sample-major scanned every voice every sample).
         pub fn renderBlock(self: *Self, sample_rate: f32, acc: []f32) void {
             for (&self.voices) |*v| {
                 if (!v.active) continue;
@@ -355,11 +355,11 @@ test "modulatedCutoff: env_level=0 unchanged, amount/level applied in octaves" {
     try testing.expectApproxEqAbs(@as(f32, 4000.0), modulatedCutoff(1000, 2.0, 1.0), 0.01); // +2oct
 }
 
-test "Voice filter env: amount>0 で env が上昇→減衰し cutoff も追従、amount=0 で無効" {
-    // amount>0: filter_env が attack で上昇 → release で減衰
+test "Voice filter env: amount>0 env rises then decays with cutoff following; amount=0 disables" {
+    // amount>0: filter_env rises in attack → decays in release
     var v = Voice{};
     const patch = Patch{
-        .attack = 1.0, // 振幅 env は長く保つ（ボイスを生かす）
+        .attack = 1.0, // Keep the amplitude env long (keep the voice alive)
         .sustain = 1.0,
         .filter_attack = 0.002,
         .filter_decay = 0.001,
@@ -370,22 +370,22 @@ test "Voice filter env: amount>0 で env が上昇→減衰し cutoff も追従�
     };
     v.noteOn(60, 1.0, patch, 1000, 1); // sr=1000
     v.prepareBlock(patch);
-    // attack 中: filter_env.level が上がる
+    // During attack: filter_env.level rises
     _ = v.renderSample(1000);
     const lvl1 = v.filter_env.level;
     _ = v.renderSample(1000);
     const lvl2 = v.filter_env.level;
-    try testing.expect(lvl2 >= lvl1); // 上昇（attack/decay 中）
+    try testing.expect(lvl2 >= lvl1); // Rising (attack/decay)
     const peak_cutoff = modulatedCutoff(v.block_cutoff, v.block_fenv_amount, lvl2);
-    try testing.expect(peak_cutoff > 1000.0); // env により base より高い cutoff
+    try testing.expect(peak_cutoff > 1000.0); // Cutoff higher than base via the env
 
-    // release で減衰
+    // Decays in release
     v.noteOff();
     var i: u32 = 0;
     while (i < 5) : (i += 1) _ = v.renderSample(1000);
-    try testing.expect(v.filter_env.level < lvl2); // 減衰した
+    try testing.expect(v.filter_env.level < lvl2); // Has decayed
 
-    // amount=0: filter モジュレーション無効（block_fenv_amount=0）
+    // amount=0: filter modulation off (block_fenv_amount=0)
     var v2 = Voice{};
     const p0 = Patch{ .attack = 1.0, .sustain = 1.0, .filter_env_amount = 0.0, .cutoff = 1000 };
     v2.noteOn(60, 1.0, p0, 1000, 1);
@@ -397,12 +397,12 @@ test "Voice LFO tremolo: amp varies over time when depth>0" {
     var v = Voice{};
     const patch = Patch{
         .attack = 0.0,
-        .sustain = 1.0, // 一定振幅に保つ
+        .sustain = 1.0, // Hold a constant amplitude
         .waveform = .sine,
-        .lfo_rate = 100, // 速い tremolo（短時間で変動）
+        .lfo_rate = 100, // Fast tremolo (varies over a short time)
         .tremolo_depth = 1.0,
         .filter_env_amount = 0.0,
-        .cutoff = 18000, // フィルタの影響を最小化
+        .cutoff = 18000, // Minimise filter influence
     };
     v.noteOn(60, 1.0, patch, 1000, 1);
     v.prepareBlock(patch);
@@ -414,7 +414,7 @@ test "Voice LFO tremolo: amp varies over time when depth>0" {
         min_abs = @min(min_abs, s);
         max_abs = @max(max_abs, s);
     }
-    // tremolo により振幅に明確な変動がある
+    // Tremolo produces clear amplitude variation
     try testing.expect(max_abs - min_abs > 0.05);
 }
 
@@ -446,13 +446,13 @@ test "Voice velocity->cutoff: higher velocity raises block_cutoff when amount>0"
 }
 
 test "trackedCutoff: keytrack=0 unchanged, keytrack=1 follows 1oct/oct, higher note->higher cutoff" {
-    // keytrack=0: 音程に関係なく base のまま
+    // keytrack=0: base unchanged regardless of pitch
     try testing.expectApproxEqAbs(@as(f32, 1000.0), trackedCutoff(1000, 0.0, 72), 0.01);
-    // keytrack=1: C4(60)基準。C5(72, +12半音)で 2 倍
+    // keytrack=1: relative to C4(60). C5(72, +12 semitones) → 2×
     try testing.expectApproxEqAbs(@as(f32, 2000.0), trackedCutoff(1000, 1.0, 72), 0.5);
-    // C3(48, -12半音)で半分
+    // C3(48, -12 semitones) → half
     try testing.expectApproxEqAbs(@as(f32, 500.0), trackedCutoff(1000, 1.0, 48), 0.5);
-    // 高い音ほど cutoff が高い
+    // Higher notes have higher cutoff
     try testing.expect(trackedCutoff(1000, 0.5, 80) > trackedCutoff(1000, 0.5, 60));
 }
 
@@ -462,17 +462,17 @@ test "Voice: state machine idle -> attack -> ... -> release -> idle(done)" {
     try testing.expect(!v.active);
 
     const patch = Patch{ .attack = 0.001, .decay = 0.001, .sustain = 0.5, .release = 0.001, .gain = 1 };
-    v.noteOn(69, 1.0, patch, 1000, 1); // sr=1000 → 各セグメント約1サンプル
+    v.noteOn(69, 1.0, patch, 1000, 1); // sr=1000 → each segment ≈1 sample
     try testing.expect(v.active);
     try testing.expectEqual(dsp.Envelope.Stage.attack, v.stage());
 
-    // 数サンプル進めると attack→decay→sustain
+    // A few samples advance attack→decay→sustain
     var i: u32 = 0;
     while (i < 5) : (i += 1) _ = v.renderSample(1000);
     try testing.expectEqual(dsp.Envelope.Stage.sustain, v.stage());
     try testing.expect(v.active);
 
-    // noteOff → release → done で active=false
+    // noteOff → release → done sets active=false
     v.noteOff();
     i = 0;
     while (i < 10 and v.active) : (i += 1) _ = v.renderSample(1000);
@@ -480,19 +480,19 @@ test "Voice: state machine idle -> attack -> ... -> release -> idle(done)" {
     try testing.expectEqual(dsp.Envelope.Stage.idle, v.stage());
 }
 
-// ---- ユニゾン / 2nd osc / ノイズ源 (TASK-27.13) ----
+// ---- Unison / 2nd osc / noise source ----
 
 test "unisonRatio: count=1 unchanged, symmetric spread, edges at ±detune" {
-    try testing.expectApproxEqAbs(@as(f32, 1.0), unisonRatio(0, 1, 50.0), 1e-6); // 1声=変化なし
-    // 3声: i=0 → -detune, i=1 → 0(中央), i=2 → +detune
+    try testing.expectApproxEqAbs(@as(f32, 1.0), unisonRatio(0, 1, 50.0), 1e-6); // 1 voice = unchanged
+    // 3 voices: i=0 → -detune, i=1 → 0 (centre), i=2 → +detune
     try testing.expectApproxEqAbs(std.math.pow(f32, 2.0, -50.0 / 1200.0), unisonRatio(0, 3, 50.0), 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.0), unisonRatio(1, 3, 50.0), 1e-6);
     try testing.expectApproxEqAbs(std.math.pow(f32, 2.0, 50.0 / 1200.0), unisonRatio(2, 3, 50.0), 1e-6);
 }
 
 test "Voice unison: detuned voices beat (window-peak varies) vs steady single voice" {
-    // 振幅 env を一定に保ち、窓(256サンプル)ごとのピークの変動幅で「うねり」を測る。
-    // 単一正弦は各窓ピークが ~1.0 で一定、detune ユニゾンはビートで窓ピークが大きく変動する。
+    // Hold amplitude env constant; measure "swell" as the spread of per-window (256-sample) peaks.
+    // A single sine keeps each window peak ~1.0; a detuned unison beats and window peaks vary a lot.
     const measure = struct {
         fn windowPeakSpread(unison: u8, detune: f32) f32 {
             var v = Voice{};
@@ -500,7 +500,7 @@ test "Voice unison: detuned voices beat (window-peak varies) vs steady single vo
                 .attack = 0.0,
                 .sustain = 1.0,
                 .waveform = .sine,
-                .cutoff = 18000, // フィルタ影響を最小化
+                .cutoff = 18000, // Minimise filter influence
                 .filter_env_amount = 0,
                 .unison = unison,
                 .detune = detune,
@@ -510,7 +510,7 @@ test "Voice unison: detuned voices beat (window-peak varies) vs steady single vo
             var min_pk: f32 = 1e9;
             var max_pk: f32 = 0;
             var w: u32 = 0;
-            while (w < 64) : (w += 1) { // 64 窓 ≈ 340ms ⇒ 数 beat 周期をカバー
+            while (w < 64) : (w += 1) { // 64 windows ≈ 340ms ⇒ covers several beat periods
                 var pk: f32 = 0;
                 var i: u32 = 0;
                 while (i < 256) : (i += 1) pk = @max(pk, @abs(v.renderSample(48000)));
@@ -520,14 +520,14 @@ test "Voice unison: detuned voices beat (window-peak varies) vs steady single vo
             return max_pk - min_pk;
         }
     };
-    const single = measure.windowPeakSpread(1, 0.0); // 単一正弦 → 窓ピーク一定
-    const unison = measure.windowPeakSpread(7, 25.0); // 7声 detune → ビートで窓ピークが変動
-    try testing.expect(single < 0.05); // 単声は定常
-    try testing.expect(unison > 0.2); // detune ユニゾンは明確にうねる
+    const single = measure.windowPeakSpread(1, 0.0); // Single sine → steady window peaks
+    const unison = measure.windowPeakSpread(7, 25.0); // 7-voice detune → window peaks vary with beating
+    try testing.expect(single < 0.05); // Single voice is steady
+    try testing.expect(unison > 0.2); // Detuned unison clearly swells
 }
 
 test "Voice noise: noise_amount>0 mixes audible noise; =0 is deterministic" {
-    // noise=0: 2 回の render が完全一致(決定論)
+    // noise=0: two renders match exactly (deterministic)
     const peakAndDet = struct {
         fn run(noise_amount: f32) struct { peak: f32, det: bool } {
             var a = Voice{};
@@ -542,7 +542,7 @@ test "Voice noise: noise_amount>0 mixes audible noise; =0 is deterministic" {
                 .noise_amount = noise_amount,
             };
             a.noteOn(60, 1.0, patch, 48000, 5);
-            b.noteOn(60, 1.0, patch, 48000, 5); // 同 age → 同 seed
+            b.noteOn(60, 1.0, patch, 48000, 5); // Same age → same seed
             a.prepareBlock(patch);
             b.prepareBlock(patch);
             var peak: f32 = 0;
@@ -558,10 +558,10 @@ test "Voice noise: noise_amount>0 mixes audible noise; =0 is deterministic" {
         }
     };
     const r0 = peakAndDet.run(0.0);
-    try testing.expect(r0.det); // noise=0 → 決定論(同 seed で完全一致)
+    try testing.expect(r0.det); // noise=0 → deterministic (exact match at the same seed)
     const r1 = peakAndDet.run(0.8);
-    try testing.expect(r1.det); // 同 age=同 seed なので noise>0 でも 2 ボイスは一致(再現性)
-    try testing.expect(r1.peak > r0.peak); // ノイズ混入で振幅が増える(混ざっている)
+    try testing.expect(r1.det); // Same age = same seed, so even with noise>0 the two voices match (reproducible)
+    try testing.expect(r1.peak > r0.peak); // Mixing noise increases amplitude (it is mixed in)
 }
 
 test "Voice osc2: mix=0 makes osc2_detune irrelevant; mix>0 changes output" {
@@ -585,11 +585,11 @@ test "Voice osc2: mix=0 makes osc2_detune irrelevant; mix>0 changes output" {
     };
     var a: [128]f32 = undefined;
     var b: [128]f32 = undefined;
-    // mix=0: osc2_detune を変えても出力は完全一致(osc2 が寄与しない)
+    // mix=0: changing osc2_detune leaves output identical (osc2 contributes nothing)
     firstSamples.render(0.0, 0.0, &a);
     firstSamples.render(0.0, 7.0, &b);
     try testing.expectEqualSlices(f32, &a, &b);
-    // mix>0: osc2(saw, 1オクターブ上)を混ぜると出力が変わる
+    // mix>0: mixing osc2 (saw, +1 octave) changes the output
     var c: [128]f32 = undefined;
     firstSamples.render(0.6, 12.0, &c);
     var differs = false;
@@ -630,10 +630,10 @@ test "VoicePool: allocate free voices then steal oldest when full" {
     pool.noteOn(62, 1.0, patch, 48000); // voice1 (age2)
     try testing.expectEqual(@as(usize, 2), pool.activeCount());
 
-    // 満杯。3つ目は最古(age1, note60)をスチール
+    // Full. The third steals the oldest (age1, note60)
     pool.noteOn(64, 1.0, patch, 48000);
     try testing.expectEqual(@as(usize, 2), pool.activeCount());
-    // note60 はもう鳴っていない（スチールされた）
+    // note60 is no longer sounding (was stolen)
     var has60 = false;
     var has64 = false;
     for (pool.voices) |v| {
@@ -650,38 +650,38 @@ test "VoicePool: done voices are recycled (active count drops after release)" {
     pool.noteOn(60, 1.0, patch, 1000);
     pool.noteOff(60);
     try testing.expectEqual(@as(usize, 1), pool.activeCount());
-    // release が 0 に達するまで回す → 回収される
+    // Run until release reaches 0 → reclaimed
     var i: u32 = 0;
     while (i < 50) : (i += 1) _ = pool.renderSample(1000);
     try testing.expectEqual(@as(usize, 0), pool.activeCount());
 }
 
-test "Voice dirty-gate: fenv 有効→0→再有効の切替で stale skip しない（applied_* 同期）" {
-    // fenv 有効で tick 適用 → fenv=0 の prepareBlock で base cutoff へ →
-    // 再有効化の tick で（modulation 目標が以前の applied と同値でも）正しく再適用される。
+test "Voice dirty-gate: toggling fenv on->0->on does not stale-skip (applied_* sync)" {
+    // Apply with fenv on → prepareBlock at fenv=0 returns to base cutoff →
+    // on re-enable, the tick correctly re-applies (even if the modulation target equals the prior applied).
     var v = Voice{};
     const sr: f32 = 48000;
     var patch = Patch{ .cutoff = 1000, .filter_env_amount = 2.0, .filter_sustain = 1.0, .filter_attack = 0.0, .sustain = 1.0, .attack = 0.0 };
     v.noteOn(60, 1.0, patch, sr, 1);
     v.prepareBlock(patch);
     var i: u32 = 0;
-    while (i < 64) : (i += 1) _ = v.renderSample(sr); // tick で modulation 適用
+    while (i < 64) : (i += 1) _ = v.renderSample(sr); // Tick applies modulation
     const applied_with_env = v.applied_cutoff;
-    try testing.expect(applied_with_env > 0); // sentinel でない = 適用済み
+    try testing.expect(applied_with_env > 0); // Not the sentinel = already applied
 
-    // fenv=0: base cutoff を直接適用 → applied_* が base に同期されること
+    // fenv=0: apply base cutoff directly → applied_* sync to base
     patch.filter_env_amount = 0.0;
     v.prepareBlock(patch);
     try testing.expectEqual(v.block_cutoff, v.applied_cutoff);
     i = 0;
     while (i < 64) : (i += 1) _ = v.renderSample(sr);
 
-    // 再有効化: tick の目標が applied と異なれば setParams が走る
+    // Re-enable: setParams runs if the tick target differs from applied
     patch.filter_env_amount = 2.0;
     v.prepareBlock(patch);
     const recalcs_before = v.filter_recalcs;
     i = 0;
     while (i < 64) : (i += 1) _ = v.renderSample(sr);
-    try testing.expect(v.filter_recalcs > recalcs_before); // stale skip していない
-    try testing.expect(v.applied_cutoff != v.block_cutoff); // modulation 値が適用されている
+    try testing.expect(v.filter_recalcs > recalcs_before); // Did not stale-skip
+    try testing.expect(v.applied_cutoff != v.block_cutoff); // Modulation value is applied
 }

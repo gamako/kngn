@@ -1,8 +1,8 @@
-//! libs/modular: モジュラー・グラフエンジン（Ph1）。
+//! libs/modular: the modular graph engine.
 //!
-//! 設計の正: docs/plans/modular-synth-plan.md §3-§4。
-//! 構成: signal（信号規約・leaf）/ graph（エンジン・generic）/ modules（dsp wrap した最小モジュール）。
-//! Ph1 はコード定義グラフを起動時に1回構築し per-sample 処理する骨格まで（UI/生成/ライブ再配線は後続）。
+//! See docs/modular.md for the design.
+//! Layout: signal (signal conventions; leaf) / graph (engine; generic) / modules (minimal DSP wrappers).
+//! Builds a code-defined graph once at startup and processes it per sample (UI / generation / live rewiring are separate).
 
 const std = @import("std");
 
@@ -21,12 +21,12 @@ pub const Io = signal.Io;
 pub const VTable = signal.VTable;
 pub const NodeSpec = signal.NodeSpec;
 
-// TASK-40.6.1: 動的グラフエンジン（RT 安全ライブ再配線）。static Graph と graph_core を共有。
+// Dynamic graph engine (RT-safe live rewiring). Shares graph_core with the static Graph.
 pub const DynGraph = dyn.DynGraph;
 pub const ModuleKind = dyn.ModuleKind;
 pub const GraphView = dyn.GraphView;
 
-// TASK-110.3: UI 非依存の parameter descriptor / live field access。
+// UI-independent parameter descriptors / live field access.
 pub const ParamDesc = params.ParamDesc;
 pub const ParamValue = params.ParamValue;
 pub const ParamSnapshot = params.ParamSnapshot;
@@ -40,7 +40,7 @@ pub const getParamSnapshot = params.getParamSnapshot;
 pub const setParam = params.setParam;
 pub const validateParam = params.validateParam;
 
-// TASK-40.8 D: per-port tap（ポート別ミニ oscilloscope）。
+// Per-port tap (mini oscilloscope per port).
 pub const TapConfig = graph_core.TapConfig;
 pub const TapState = graph_core.TapState;
 pub const TAP_SLOTS = graph_core.TAP_SLOTS;
@@ -54,7 +54,7 @@ pub const Vcf = modules.Vcf;
 pub const Mixer = modules.Mixer;
 pub const Output = modules.Output;
 
-// Ph2a: 生成 CV + 合成ドラム
+// Generated CV + synthesised drums
 pub const Clock = modules.Clock;
 pub const ClockDivider = modules.ClockDivider;
 pub const EuclideanSeq = modules.EuclideanSeq;
@@ -62,9 +62,9 @@ pub const Quantizer = modules.Quantizer;
 pub const Kick = modules.Kick;
 pub const Hat = modules.Hat;
 pub const PercEnv = modules.PercEnv;
-pub const ChordPad = modules.ChordPad; // Ph4: 温かい和音パッド（Ph5 で pitch/cutoff/level CV 入力対応）
+pub const ChordPad = modules.ChordPad; // Warm chord pad (later gained pitch/cutoff/level CV inputs)
 
-// Ph5: editable step シーケンサ + 連続 LFO + scale 共有ヘルパー
+// Editable step sequencer + continuous LFO + shared scale helpers
 pub const StepSeq = modules.StepSeq;
 pub const Lfo = modules.Lfo;
 pub const Scale = modules.Scale;
@@ -72,7 +72,7 @@ pub const scaleDegrees = modules.scaleDegrees;
 pub const scaleDegreeCount = modules.scaleDegreeCount;
 pub const degreeIndexToPitchCv = modules.degreeIndexToPitchCv;
 
-// Ph2b: 自己進化 CV / Clap / lofi FX
+// Self-evolving CV / Clap / lofi FX
 pub const Random = modules.Random;
 pub const TuringMachine = modules.TuringMachine;
 pub const Clap = modules.Clap;
@@ -85,7 +85,7 @@ pub const WowFlutterFx = modules.WowFlutterFx;
 pub const Sidechain = modules.Sidechain;
 
 test {
-    // サブモジュールの単体テストを巻き込む。
+    // Pull in each submodule's unit tests.
     _ = signal;
     _ = graph_core;
     _ = graph;
@@ -96,7 +96,7 @@ test {
 }
 
 // ============================================================================
-// graph 構造 / 統合テスト（display/audio 不要）
+// Graph structure / integration tests (no display/audio needed)
 // ============================================================================
 const testing = std.testing;
 
@@ -111,8 +111,8 @@ fn rmsEven(buf: []const f32, channels: u32) f32 {
     return @floatCast(@sqrt(acc / @as(f64, @floatFromInt(n))));
 }
 
-test "graph: topo order is dependency-respecting and connect-order independent (AC#6)" {
-    // 同じ slot 順で VCO/VCA/Output を足し、接続順だけ変えて order が一致することを確認。
+test "graph: topo order is dependency-respecting and connect-order independent" {
+    // Add VCO/VCA/Output in the same slot order; only connection order changes; order must still match.
     var vco_a = Vco{};
     var vca_a = Vca{ .gain = 0.5 };
     var out_a = Output{};
@@ -133,16 +133,16 @@ test "graph: topo order is dependency-respecting and connect-order independent (
     const b0 = try gb.addModule(vco_b.spec());
     const b1 = try gb.addModule(vca_b.spec());
     const b2 = try gb.addModule(out_b.spec());
-    try gb.connect(b1, 0, b2, 0); // 逆順で接続
+    try gb.connect(b1, 0, b2, 0); // Connect in reverse order
     try gb.connect(b0, 0, b1, 0);
     try gb.finalize();
 
     try testing.expectEqualSlices(usize, ga.orderSlice(), gb.orderSlice());
-    // 依存順: VCO(0) < VCA(1) < Output(2)
+    // Dependency order: VCO(0) < VCA(1) < Output(2)
     try testing.expectEqualSlices(usize, &[_]usize{ 0, 1, 2 }, ga.orderSlice());
 }
 
-test "graph: input port is single-connection; second connect errors (AC#2)" {
+test "graph: input port is single connection; second connect errors" {
     var vco1 = Vco{};
     var vco2 = Vco{};
     var mix = Mixer{};
@@ -152,9 +152,9 @@ test "graph: input port is single-connection; second connect errors (AC#2)" {
     const b = try g.addModule(vco2.spec());
     const m = try g.addModule(mix.spec());
     try g.connect(a, 0, m, 0); // Mixer.in0 <- vco1
-    // 同じ入力ポートへ2本目はエラー
+    // A second cable into the same input port is an error
     try testing.expectError(error.InputAlreadyConnected, g.connect(b, 0, m, 0));
-    // 別ポートなら OK（合算は Mixer の別入力で）
+    // A different port is OK (summing uses Mixer on a separate input)
     try g.connect(b, 0, m, 1);
 }
 
@@ -168,7 +168,7 @@ test "graph: connect rejects port-kind mismatch" {
     try testing.expectError(error.PortKindMismatch, g.connect(a, 0, e, 0));
 }
 
-test "graph: cycle (self-feedback) marked delayed, deterministic and finite (AC#5)" {
+test "graph: cycle (self-feedback) marked delayed, deterministic and finite" {
     var vco = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 220 };
     var mix = Mixer{ .gain = 0.5 };
     var g = try Graph.init(testing.allocator, 48000, .{ .max_modules = 4, .max_ports = 8 });
@@ -176,10 +176,10 @@ test "graph: cycle (self-feedback) marked delayed, deterministic and finite (AC#
     const v = try g.addModule(vco.spec());
     const m = try g.addModule(mix.spec());
     try g.connect(v, 0, m, 0); // Mixer.in0 <- VCO
-    try g.connect(m, 0, m, 1); // Mixer.in1 <- 自分の out（サイクル）
+    try g.connect(m, 0, m, 1); // Mixer.in1 <- its own out (cycle)
     g.setOutputNode(m);
     try g.finalize();
-    // 自己ループは遅延辺になる
+    // A self-loop becomes a delay edge
     try testing.expect(g.isDelayed(m, 1));
 
     var buf: [256 * 2]f32 = undefined;
@@ -189,7 +189,7 @@ test "graph: cycle (self-feedback) marked delayed, deterministic and finite (AC#
         try testing.expect(@abs(s) <= 1.0001);
     }
 
-    // 決定的: 同一初期状態の別グラフが同じ出力を出す。
+    // Deterministic: a second graph with the same initial state produces the same output.
     var vco2 = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 220 };
     var mix2 = Mixer{ .gain = 0.5 };
     var g2 = try Graph.init(testing.allocator, 48000, .{ .max_modules = 4, .max_ports = 8 });
@@ -205,7 +205,7 @@ test "graph: cycle (self-feedback) marked delayed, deterministic and finite (AC#
     try testing.expectEqualSlices(f32, &buf, &buf2);
 }
 
-/// 厳密値で遅延辺の off-by-one を検証するための定数ソース（テスト専用・入力 0 / audio 出力 1）。
+/// Constant source for verifying delay-edge off-by-one with exact values (test-only; 0 inputs / 1 audio out).
 const TestConst = struct {
     value: f32 = 1.0,
     const out_kinds = [_]signal.PortKind{.audio};
@@ -219,10 +219,10 @@ const TestConst = struct {
     }
 };
 
-test "graph: multi-node cycle is deterministic with exact 1-sample delay (AC#5)" {
-    // C(=1) -> Mixer.in0 ; Mixer -> VCA(0.5) -> Mixer.in1（2ノード cycle）。
-    // back-edge は 1 サンプル遅延（前サンプル値）なので M_n = 1 + 0.5*M_(n-1), M_-1=0
-    // → 1, 1.5, 1.75, 1.875, 1.9375, 1.96875（off-by-one が崩れると一致しない）。
+test "graph: multi-node cycle is deterministic with exact 1-sample delay" {
+    // C(=1) -> Mixer.in0 ; Mixer -> VCA(0.5) -> Mixer.in1 (2-node cycle).
+    // The back-edge is a 1-sample delay (previous-sample value), so M_n = 1 + 0.5*M_(n-1), M_-1=0
+    // → 1, 1.5, 1.75, 1.875, 1.9375, 1.96875 (an off-by-one would not match).
     var c = TestConst{ .value = 1.0 };
     var mix = Mixer{ .gain = 1.0 };
     var vca = Vca{ .gain = 0.5 };
@@ -233,11 +233,11 @@ test "graph: multi-node cycle is deterministic with exact 1-sample delay (AC#5)"
     const nv = try g.addModule(vca.spec());
     try g.connect(nc, 0, nm, 0); // C -> Mixer.in0
     try g.connect(nm, 0, nv, 0); // Mixer -> VCA
-    try g.connect(nv, 0, nm, 1); // VCA -> Mixer.in1（cycle）
+    try g.connect(nv, 0, nm, 1); // VCA -> Mixer.in1 (cycle)
     g.setOutputNode(nm);
     try g.finalize();
 
-    var buf: [6 * 2]f32 = undefined; // 6 frames stereo（L=Mixer 出力）
+    var buf: [6 * 2]f32 = undefined; // 6 frames stereo (L = Mixer output)
     g.processBlock(&buf, 6, 2);
     const expected = [_]f32{ 1.0, 1.5, 1.75, 1.875, 1.9375, 1.96875 };
     for (expected, 0..) |e, k| {
@@ -245,10 +245,10 @@ test "graph: multi-node cycle is deterministic with exact 1-sample delay (AC#5)"
     }
 }
 
-test "graph: VCO->VCA->Output produces expected RMS (AC#10)" {
+test "graph: VCO->VCA->Output produces expected RMS" {
     var vco = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 440 };
     var vca = Vca{ .gain = 0.5 };
-    var out = Output{ .gain = 1.0, .pan = 0.0, .soft_clip = false }; // 線形で期待値検証
+    var out = Output{ .gain = 1.0, .pan = 0.0, .soft_clip = false }; // Verify against the linear expectation
     var g = try Graph.init(testing.allocator, 48000, .{ .max_modules = 4, .max_ports = 8 });
     defer g.deinit();
     const v = try g.addModule(vco.spec());
@@ -267,8 +267,8 @@ test "graph: VCO->VCA->Output produces expected RMS (AC#10)" {
     try testing.expectApproxEqAbs(@as(f32, 0.25), rmsEven(buf, 2), 0.01);
 }
 
-test "graph: variable frames keep phase/output continuous (AC#9)" {
-    // 同一グラフを 48 一括 / 17+31 分割でレンダーし一致を確認（位相連続）。
+test "graph: variable frames keep phase/output continuous" {
+    // Render the same graph as one 48-frame block and as 17+31; outputs must match (phase continuity).
     var vco_full = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 440 };
     var out_full = Output{ .soft_clip = false };
     var gfull = try Graph.init(testing.allocator, 48000, .{ .max_modules = 2, .max_ports = 8 });
@@ -299,8 +299,8 @@ test "graph: variable frames keep phase/output continuous (AC#9)" {
     for (0..31 * 2) |i| try testing.expectApproxEqAbs(buf_full[17 * 2 + i], buf2[i], 1e-6);
 }
 
-test "graph: long render stays finite and bounded (NaN/Inf/peak; AC#10 proxy)" {
-    // 数分連続レンダーの代理（高速に多サンプル）。saw->LP VCF->Output(softclip) で発散・NaN を検出。
+test "graph: long render stays finite and bounded (NaN/Inf/peak proxy)" {
+    // Proxy for multi-minute continuous render (many samples, fast). saw->LP VCF->Output(softclip) catches divergence/NaN.
     var vco = Vco{ .osc = .{ .waveform = .saw }, .base_hz = 110 };
     var vcf = Vcf{ .cutoff = 800, .resonance = 4.0, .mode = .lowpass };
     var out = Output{ .gain = 1.0, .pan = 0.0, .soft_clip = true };
@@ -317,19 +317,19 @@ test "graph: long render stays finite and bounded (NaN/Inf/peak; AC#10 proxy)" {
     const chunk: u32 = 4096;
     var buf: [chunk * 2]f32 = undefined;
     var rendered: u64 = 0;
-    const target: u64 = 480_000; // ~10s @48k（数分の代理。Debug でも高速）
+    const target: u64 = 480_000; // ~10s @48k (proxy for a few minutes; still fast in Debug)
     while (rendered < target) : (rendered += chunk) {
         g.processBlock(&buf, chunk, 2);
         for (buf) |s| {
             try testing.expect(std.math.isFinite(s));
-            try testing.expect(@abs(s) <= 1.0001); // softClip で有界
+            try testing.expect(@abs(s) <= 1.0001); // Bounded by softClip
         }
     }
 }
 
 test "graph: Clock->Euclid->Kick->Output produces audible non-silent output" {
     var clk = Clock{ .bpm = 120, .ppqn = 4 };
-    var eu = EuclideanSeq{ .steps = 4, .pulses = 4 }; // 毎 tick hit
+    var eu = EuclideanSeq{ .steps = 4, .pulses = 4 }; // Hit every tick
     var kick = Kick{};
     var out = Output{ .gain = 1.0, .soft_clip = true };
     var g = try Graph.init(testing.allocator, 48000, .{ .max_modules = 4, .max_ports = 8 });
@@ -344,7 +344,7 @@ test "graph: Clock->Euclid->Kick->Output produces audible non-silent output" {
     g.setOutputNode(no);
     try g.finalize();
 
-    const frames: u32 = 24000; // 0.5s（複数 kick を含む）
+    const frames: u32 = 24000; // 0.5s (covers several kicks)
     const buf = try testing.allocator.alloc(f32, frames * 2);
     defer testing.allocator.free(buf);
     g.processBlock(buf, frames, 2);
@@ -353,10 +353,10 @@ test "graph: Clock->Euclid->Kick->Output produces audible non-silent output" {
         try testing.expect(std.math.isFinite(s));
         peak = @max(peak, @abs(s));
     }
-    try testing.expect(peak > 0.05); // キックが鳴っている
+    try testing.expect(peak > 0.05); // The kick is sounding
 }
 
-test "graph: Mixer sums two sources via separate input ports (AC#2)" {
+test "graph: Mixer sums two sources via separate input ports" {
     var v1 = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 220 };
     var v2 = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 330 };
     var mix = Mixer{ .gain = 0.4 };
@@ -375,7 +375,7 @@ test "graph: Mixer sums two sources via separate input ports (AC#2)" {
 
     var buf: [512 * 2]f32 = undefined;
     g.processBlock(&buf, 512, 2);
-    // 無音でなく有限（2 音の和が出ている）。
+    // Non-silent and finite (the sum of two voices is present).
     try testing.expect(rmsEven(&buf, 2) > 0.0);
     for (buf) |s| try testing.expect(std.math.isFinite(s));
 }

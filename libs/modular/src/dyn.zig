@@ -1,25 +1,25 @@
-//! libs/modular: 動的グラフエンジン + RT 安全ライブ再配線（TASK-40.6.1）。
+//! libs/modular: dynamic graph engine + RT-safe live rewiring.
 //!
-//! 設計の正: docs/plans/modular-synth-plan.md §4.3/§4.3.1。5 テネット（性能目的の Zig 的メモリ設計）:
-//!   1. トポロジ/DSP 状態分離: publish で RT へ渡るのは GraphView（接続・order・handle＝数 KB）だけ。
-//!      DSP 状態（DelayLine 256KB/個・Reverb・位相・フィルタメモリ）は RT 所有プールに据え置き publish に載せない。
-//!   2. 型別固定プール: 全モジュールを 1 つの union(enum) にせず（最大メンバ DelayFx≈256KB × [N] で膨れる）、
-//!      型別の固定配列プール（安いモジュール多め / DelayFx・ReverbFx は少数）。配列は動かさず ctx 安定・RT alloc 無し。
-//!   3. POD View + handle 参照: GraphView はポインタを含まない固定インライン配列の値型。RT は handle から
-//!      安定レジストリ（instances）で vtable/ctx/out_base/n_in/n_out を解決。
-//!   4. RT 経路ゼロアロケーション: topo sort・サイクル検出・View 構築は全て main 側。processBlock は
-//!      allocator を持たず stack scratch のみ。
-//!   5. ポート id 固定割当: instance slot i に出力 port id 範囲 [i*MAX_OUT..) を恒久割当。port_owner は
-//!      port_id/MAX_OUT で導出。再配線をまたいでポート位置が安定し遅延辺の前サンプル値も保つ。
+//! Design: docs/modular.md. Five tenets (Zig-style memory design for performance):
+//!   1. Topology / DSP-state separation: publish passes only a GraphView to the RT (connections, order, handles = a few KB).
+//!      DSP state (DelayLine 256KB each, Reverb, phase, filter memory) stays in RT-owned pools and is never put on a publish.
+//!   2. Per-type fixed pools: do not put every module in one union(enum) (largest member DelayFx≈256KB × [N] balloons);
+//!      use per-type fixed array pools (many cheap modules / few DelayFx·ReverbFx). Arrays never move so ctx is stable and RT never allocates.
+//!   3. POD View + handle refs: GraphView is a value type of fixed inline arrays with no pointers. RT resolves
+//!      vtable/ctx/out_base/n_in/n_out from handles via the stable registry (instances).
+//!   4. Zero allocation on the RT path: topo sort, cycle detection and View construction are all on the main side. processBlock
+//!      holds no allocator; only stack scratch.
+//!   5. Fixed port-id assignment: instance slot i permanently owns output port ids [i*MAX_OUT..). port_owner is
+//!      derived as port_id/MAX_OUT. Port positions stay stable across rewiring, so delayed-edge previous samples are kept.
 //!
-//! RT 安全ライブ再配線:
-//!   - publish は SPSC triple-buffer（3 枚）。連続 publish でも producer が consumer read slot を書かない
-//!     （3 index が {0,1,2} 置換）→ torn read 無し・latest-wins・非ブロッキング。
-//!   - handle/pool-slot 再利用は RCU 的 grace: removeModule は RT-read field を破壊せず retired 印+retire_gen。
-//!     consumed_gen（RT が latch した view の gen）>= retire_gen を満たすまで再利用禁止（旧 view 処理完了保証）。
+//! RT-safe live rewiring:
+//!   - publish is an SPSC triple-buffer (three slots). Even under consecutive publishes the producer never writes the consumer's read slot
+//!     (the three indices are a permutation of {0,1,2}) → no torn read, latest-wins, non-blocking.
+//!   - handle/pool-slot reuse is RCU-style grace: removeModule does not destroy RT-read fields; it marks retired + retire_gen.
+//!     Reuse is forbidden until consumed_gen (gen of the view the RT latched) >= retire_gen (guarantees the old view has finished processing).
 //!
-//! 自己参照（instances.ctx が pools を指す）ため **heap 確保しムーブしない**（create/destroy）。
-//! signal/pool/view を inline 固定確保し render 経路は allocator を一切持たない。
+//! Self-referential (instances.ctx points into pools), so **allocate on the heap and never move** (create/destroy).
+//! signal/pool/view are inline fixed allocations; the render path holds no allocator at all.
 
 const std = @import("std");
 const signal = @import("signal.zig");
@@ -31,15 +31,15 @@ const ProcNode = graph_core.ProcNode;
 const MAX_IN = signal.MAX_IN;
 const MAX_OUT = signal.MAX_OUT;
 
-/// handle / instance / View 幅・port stride の基準。
-/// `-Dmax-modules=N`（build_options.max_modules）で変更可能。既定 48（TASK-146）。
+/// Basis for handle / instance / View width and port stride.
+/// Overridable via `-Dmax-modules=N` (build_options.max_modules). Default 48.
 pub const MAX_MODULES: usize = @import("build_options").max_modules;
-/// signal バッファ長（ポート id 固定割当 slot*MAX_OUT）。
+/// Signal-buffer length (fixed port-id assignment slot*MAX_OUT).
 pub const MAX_PORTS: usize = @as(usize, MAX_MODULES) * MAX_OUT;
 
 pub const Handle = u16;
 
-/// モジュール種別（全型を列挙）。KindType / poolCap / poolArray がこの enum で分岐する。
+/// Module kinds (enumerates every type). KindType / poolCap / poolArray branch on this enum.
 pub const ModuleKind = enum {
     vco,
     vca,
@@ -74,7 +74,7 @@ pub const ModuleKind = enum {
     logic,
 };
 
-/// kind → 具体型。
+/// kind → concrete type.
 pub fn KindType(comptime k: ModuleKind) type {
     return switch (k) {
         .vco => modules.Vco,
@@ -111,15 +111,15 @@ pub fn KindType(comptime k: ModuleKind) type {
     };
 }
 
-/// kind → プール容量（安いモジュール多め / delay・reverb は少数。合計は handle 空間より大きくてよいが
-/// active 総数は MAX_MODULES 上限）。
+/// kind → pool capacity (many cheap modules / few delay·reverb. Total may exceed the handle space, but
+/// the active count is capped by MAX_MODULES).
 ///
-/// TASK-146: 既定 cap を `MAX_MODULES/48` で比例スケール。既定 N=48 では
-/// `base * 48 / 48 == base` となり現行値と完全一致（bit 同一）。N 増時は FX 系も含め底上げ。
+/// Scale the default caps proportionally by `MAX_MODULES/48`. At the default N=48,
+/// `base * 48 / 48 == base` so values match exactly (bit-identical). Larger N also lifts the FX caps.
 pub fn poolCap(comptime k: ModuleKind) usize {
     const base: usize = switch (k) {
         .vco, .vca, .env_gen => 12,
-        // step_seq は 4→8（TASK-40.7.2: DrumMachine×2=4 + BassMachine=1 で cap4 が尽きるため。小型 struct で Pools 増は微小）。
+        // step_seq 4→8 (DrumMachine×2=4 + BassMachine=1 would exhaust cap 4. Small struct; Pools growth is tiny).
         .vcf, .mixer, .lfo, .step_seq => 8,
         .euclid, .perc_env, .random => 6,
         .clock, .clock_divider, .quantizer, .kick, .hat, .turing, .clap, .chord_pad, .saturator, .bitcrusher, .sidechain => 4,
@@ -127,11 +127,11 @@ pub fn poolCap(comptime k: ModuleKind) usize {
         .slew, .sample_hold, .comparator, .logic => 6,
         .ring_mod => 4,
     };
-    // 既定48では scale=1。`@max(base, …)` は N<48 を build で拒否済みのため実質 base * N/48。
+    // At default 48, scale=1. `@max(base, …)` is effectively base * N/48 because builds already reject N<48.
     return @max(base, base * MAX_MODULES / 48);
 }
 
-/// 型別固定プール（明示フィールド。comptime tuple 生成は避け compile 安全・可読優先）。DSP 状態常駐（publish 非対象）。
+/// Per-type fixed pools (explicit fields; avoid comptime tuple generation for compile safety and readability). DSP state resides here (not on publish).
 const Pools = struct {
     vco: [poolCap(.vco)]modules.Vco,
     vca: [poolCap(.vca)]modules.Vca,
@@ -166,41 +166,41 @@ const Pools = struct {
     logic: [poolCap(.logic)]modules.Logic,
 };
 
-/// RT が読む安定レジストリ field（init 後、対応 handle が active/retired の間は不変）。
+/// Stable-registry fields the RT reads (immutable after init while the matching handle is active/retired).
 const Instance = struct {
     vtable: *const signal.VTable = undefined,
     ctx: *anyopaque = undefined,
     n_in: u8 = 0,
     n_out: u8 = 0,
-    /// signal バッファ上の出力ポート先頭 index（= handle * MAX_OUT）。
+    /// Start index of output ports in the signal buffer (= handle * MAX_OUT).
     out_base: u32 = 0,
     in_kinds: [MAX_IN]PortKind = undefined,
     out_kinds: [MAX_OUT]PortKind = undefined,
 };
 
-/// ライフサイクル metadata（main のみ触る。RT は読まない ＝ Instance と分離）。
+/// Lifecycle metadata (main only; RT does not read — separated from Instance).
 const SlotMeta = struct {
     active: bool = false,
     retired: bool = false,
     kind: ModuleKind = .vco,
     pool_idx: u16 = 0,
-    /// retired にした時、handle が消える最初の view の gen（consumed_gen>=これ で再利用可）。
+    /// Gen of the first view from which the handle disappears after retire (reusable once consumed_gen>=this).
     retire_gen: u64 = 0,
 };
 
 const Color = enum(u8) { unvisited, visiting, done };
 
-/// RT へ publish する POD グラフ記述（ポインタ皆無・index/handle 参照のみ）。値コピーで publish。
+/// POD graph description published to the RT (no pointers; index/handle refs only). Published by value copy.
 pub const GraphView = struct {
     gen: u64 = 0,
     node_count: u16 = 0,
-    /// 処理順の handle 列（長さ = node_count）。
+    /// Processing-order handle sequence (length = node_count).
     order: [MAX_MODULES]u16 = [_]u16{0} ** MAX_MODULES,
-    /// handle で index する各入力ポートの接続元グローバル出力ポート id（未接続 = -1）。
+    /// Per-handle, per-input global source output-port id (unconnected = -1).
     in_src: [MAX_MODULES][MAX_IN]i32 = [_][MAX_IN]i32{[_]i32{-1} ** MAX_IN} ** MAX_MODULES,
-    /// handle で index する各入力ポートのサイクル遅延辺フラグ。
+    /// Per-handle, per-input cycle-delay-edge flags.
     in_delayed: [MAX_MODULES][MAX_IN]bool = [_][MAX_IN]bool{[_]bool{false} ** MAX_IN} ** MAX_MODULES,
-    /// master 出力 handle（-1 = 無し）。
+    /// Master output handle (-1 = none).
     output: i32 = -1,
 
     pub fn empty() GraphView {
@@ -209,9 +209,9 @@ pub const GraphView = struct {
 };
 
 // ============================================================================
-// SPSC triple-buffer（3 枚）。producer=main / consumer=RT。連続 publish 安全・非ブロッキング・latest-wins。
-// shared = index(下位 2bit) | FRESH_BIT。3 index {write_idx, read_idx, shared&IDX} は常に {0,1,2} の置換で、
-// producer は read slot を絶対書かない → torn read 無し。
+// SPSC triple-buffer (three slots). producer=main / consumer=RT. Safe under consecutive publish; non-blocking; latest-wins.
+// shared = index(low 2 bits) | FRESH_BIT. The three indices {write_idx, read_idx, shared&IDX} are always a permutation of {0,1,2},
+// so the producer never writes the read slot → no torn read.
 // ============================================================================
 pub fn Mailbox(comptime T: type) type {
     return struct {
@@ -233,7 +233,7 @@ pub fn Mailbox(comptime T: type) type {
             };
         }
 
-        /// producer(main): private write slot に書いてから ready と交換（never block）。
+        /// producer(main): write the private write slot then swap with ready (never block).
         pub fn publish(self: *Self, value: T) void {
             self.bufs[self.write_idx] = value;
             const new: u8 = self.write_idx | FRESH;
@@ -241,7 +241,7 @@ pub fn Mailbox(comptime T: type) type {
             self.write_idx = old & IDX_MASK;
         }
 
-        /// consumer(RT): fresh があれば read slot を ready と交換して最新を latch、無ければ現 view 維持。
+        /// consumer(RT): if fresh, swap the read slot with ready and latch the latest; otherwise keep the current view.
         pub fn acquire(self: *Self) *const T {
             const s = self.shared.load(.acquire);
             if (s & FRESH != 0) {
@@ -251,7 +251,7 @@ pub fn Mailbox(comptime T: type) type {
             return &self.bufs[self.read_idx];
         }
 
-        /// テスト用: 3 index が {0,1,2} の置換であることを確認（h1 不変条件）。
+        /// Test helper: assert the three indices are a permutation of {0,1,2} (h1 invariant).
         pub fn indicesArePermutation(self: *const Self) bool {
             const a = self.write_idx & IDX_MASK;
             const b = self.read_idx & IDX_MASK;
@@ -265,8 +265,8 @@ pub fn Mailbox(comptime T: type) type {
 // DynGraph
 // ============================================================================
 pub const Error = error{
-    TooManyModules, // handle 空間（MAX_MODULES）枯渇
-    PoolFull, // 当該 kind のプール枯渇
+    TooManyModules, // Handle space (MAX_MODULES) exhausted
+    PoolFull, // That kind's pool exhausted
     BadNodeIndex,
     BadPortIndex,
     InputAlreadyConnected,
@@ -274,56 +274,56 @@ pub const Error = error{
 } || std.mem.Allocator.Error;
 
 pub const DynGraph = struct {
-    allocator: std.mem.Allocator, // create/destroy のみに使用（render 経路は触らない）
+    allocator: std.mem.Allocator, // Used only by create/destroy (the render path never touches it)
     sample_rate: f32,
 
     pools: Pools,
     instances: [MAX_MODULES]Instance,
     slots: [MAX_MODULES]SlotMeta,
 
-    // staging（main 編集）。stage_in_src は handle で index。
+    // staging (main edits). stage_in_src is indexed by handle.
     stage_in_src: [MAX_MODULES][MAX_IN]i32,
     stage_output: i32,
 
-    // publish 世代 + RT が latch した gen。
+    // publish generation + gen the RT latched.
     gen: u64,
     consumed_gen: std.atomic.Value(u64),
     mailbox: Mailbox(GraphView),
-    /// main 側の最新 publish コピー（テスト introspection 用。RT は読まない）。
+    /// Main-side latest publish copy (test introspection; RT does not read).
     last_published: GraphView,
 
-    // signal ping-pong（inline 固定確保。cur/prev は sig_a/sig_b を指すスライスで swap）。
+    // signal ping-pong (inline fixed allocation. cur/prev are slices into sig_a/sig_b that swap).
     sig_a: [MAX_PORTS]f32,
     sig_b: [MAX_PORTS]f32,
     cur: []f32,
     prev: []f32,
 
-    // TASK-40.8 D: ポート別ミニ oscilloscope の per-port tap。
-    // cache_line 分離: GUI 書き領域（tap_mailbox）と RT 書き領域（tap: applied_seq/wpos/ring）を別ラインへ。
-    // false sharing の実害ペアは「GUI 書き × RT 書き」なので、この 2 ブロックを分ければ足りる
-    // （slot 間 wpos は単一 RT スレッドのみ書き・GUI は読みのみなので同居可）。
+    // Per-port mini-oscilloscope tap.
+    // cache_line isolation: put the GUI-write region (tap_mailbox) and the RT-write region (tap: applied_seq/wpos/ring) on separate lines.
+    // The harmful false-sharing pair is "GUI write × RT write", so separating these two blocks is enough
+    // (inter-slot wpos is written only by the single RT thread; GUI only reads, so co-residence is fine).
     tap_mailbox: Mailbox(graph_core.TapConfig) align(std.atomic.cache_line),
     tap: graph_core.TapState align(std.atomic.cache_line),
 
-    // TASK-61: ProcNode 列 + master out_sel を view.gen 不変時は再構築せず使い回す（静的 Graph が
-    // finalize で 1 回焼くのと対称化。RT ブロック毎経路の無駄除去）。RT スレッド専有（processBlock 内
-    // のみ read/write）なので atomic 化・cache_line 分離は非該当（GUI と共有する atomic ペアを増やさない）。
+    // Reuse the ProcNode sequence + master out_sel without rebuilding while view.gen is unchanged (symmetric with
+    // the static Graph baking once in finalize. Removes waste on the per-block RT path). RT-thread exclusive (read/write
+    // only inside processBlock), so atomics / cache_line isolation do not apply (do not add atomic pairs shared with the GUI).
     proc_cache: [MAX_MODULES]ProcNode,
     cached_out_sel: ?graph_core.OutputSel,
     cache_gen: u64,
     cache_valid: bool,
-    /// ProcNode 列を実再構築した回数（性能の性質＝スキップをテストで固定するための観測量）。
-    /// RT スレッドのみが書き（+%= wrapping で安全ビルドの overflow trap＝RT panic を排除）、テストは同一
-    /// スレッドで processBlock を呼ぶため直接読める。
+    /// How many times the ProcNode sequence was actually rebuilt (observable used by tests to pin the "skip" performance property).
+    /// Only the RT thread writes (+%= wrapping so a safety-build overflow trap = RT panic cannot fire); tests call
+    /// processBlock on the same thread so they can read it directly.
     rebuild_count: u64,
 
-    /// heap 確保して初期化（自己参照ポインタのためムーブ禁止）。
+    /// Heap-allocate and initialise (self-referential pointers forbid moving).
     pub fn create(allocator: std.mem.Allocator, sample_rate: f32) Error!*DynGraph {
         const self = try allocator.create(DynGraph);
         self.* = .{
             .allocator = allocator,
             .sample_rate = sample_rate,
-            .pools = undefined, // slot は activate 時に書くので未使用領域は読まない
+            .pools = undefined, // Slots are written on activate; unused regions are never read
             .instances = [_]Instance{.{}} ** MAX_MODULES,
             .slots = [_]SlotMeta{.{}} ** MAX_MODULES,
             .stage_in_src = [_][MAX_IN]i32{[_]i32{-1} ** MAX_IN} ** MAX_MODULES,
@@ -338,7 +338,7 @@ pub const DynGraph = struct {
             .prev = undefined,
             .tap_mailbox = Mailbox(graph_core.TapConfig).init(.{}),
             .tap = .{},
-            .proc_cache = undefined, // cache_valid=false の間は [0..node_count] を読まない
+            .proc_cache = undefined, // Do not read [0..node_count] while cache_valid=false
             .cached_out_sel = null,
             .cache_gen = 0,
             .cache_valid = false,
@@ -394,7 +394,7 @@ pub const DynGraph = struct {
         return h < MAX_MODULES and self.slots[h].active;
     }
 
-    /// grace 済み（consumed_gen>=retire_gen）の retired slot を完全 free へ戻す（reuse 前に呼ぶ）。
+    /// Return grace-complete (consumed_gen>=retire_gen) retired slots fully to free (call before reuse).
     fn reclaimRetired(self: *DynGraph) void {
         const cg = self.consumed_gen.load(.acquire);
         for (&self.slots) |*s| {
@@ -402,7 +402,7 @@ pub const DynGraph = struct {
         }
     }
 
-    /// live(active||retired)な handle が pool(kind,idx) を占有しているか。
+    /// Whether a live (active||retired) handle occupies pool(kind,idx).
     fn poolIdxFree(self: *const DynGraph, k: ModuleKind, idx: u16) bool {
         for (self.slots) |s| {
             if ((s.active or s.retired) and s.kind == k and s.pool_idx == idx) return false;
@@ -418,8 +418,8 @@ pub const DynGraph = struct {
         return null;
     }
 
-    /// モジュールを追加し handle を返す。value を pool slot にコピー（activate 時の遅延リセット）し、
-    /// signal port 範囲をクリア、spec() から RT-read field を焼く。DSP 状態は他 slot を触らない。
+    /// Add a module and return its handle. Copy value into a pool slot (deferred reset on activate),
+    /// clear its signal-port range, bake RT-read fields from spec(). DSP state does not touch other slots.
     pub fn add(self: *DynGraph, comptime k: ModuleKind, value: KindType(k)) Error!Handle {
         self.reclaimRetired();
         const h = self.findFreeHandle() orelse return Error.TooManyModules;
@@ -431,9 +431,9 @@ pub const DynGraph = struct {
         if (pidx >= cap) return Error.PoolFull;
 
         const arr = self.poolArray(k);
-        arr[pidx] = value; // 状態リセット（DSP 状態を既定へ）
+        arr[pidx] = value; // Reset state (DSP state to defaults)
         const base: usize = @as(usize, h) * MAX_OUT;
-        @memset(self.sig_a[base..][0..MAX_OUT], 0); // 旧モジュールの残留出力を漏らさない
+        @memset(self.sig_a[base..][0..MAX_OUT], 0); // Do not leak residual output from the previous module
         @memset(self.sig_b[base..][0..MAX_OUT], 0);
 
         const sp = arr[pidx].spec();
@@ -451,18 +451,18 @@ pub const DynGraph = struct {
         return h;
     }
 
-    /// モジュールを削除（retire）。RT-read field は破壊せず、staging の接続と output をクリアし、
-    /// retire_gen を次 publish の gen に設定（grace 成立まで handle/pool は再利用されない）。
+    /// Remove (retire) a module. Do not destroy RT-read fields; clear staging connections and output;
+    /// set retire_gen to the next publish's gen (handle/pool are not reused until grace completes).
     pub fn removeModule(self: *DynGraph, h: Handle) void {
         if (!self.isActive(h)) return;
         self.slots[h].active = false;
         self.slots[h].retired = true;
-        self.slots[h].retire_gen = self.gen + 1; // 次 publish の view から handle が消える
+        self.slots[h].retire_gen = self.gen + 1; // The handle disappears from the next publish's view
 
-        self.stage_in_src[h] = [_]i32{-1} ** MAX_IN; // この handle の入力接続
+        self.stage_in_src[h] = [_]i32{-1} ** MAX_IN; // This handle's input connections
         const base: i32 = @intCast(self.instances[h].out_base);
         const span: i32 = @intCast(MAX_OUT);
-        for (&self.stage_in_src) |*ins| { // この handle の出力を参照する他入力
+        for (&self.stage_in_src) |*ins| { // Other inputs that reference this handle's outputs
             for (ins) |*src| {
                 if (src.* >= base and src.* < base + span) src.* = -1;
             }
@@ -470,7 +470,7 @@ pub const DynGraph = struct {
         if (self.stage_output == @as(i32, h)) self.stage_output = -1;
     }
 
-    /// src_node.out → dst_node.in を接続（種別一致・単一接続=既接続はエラー）。staging のみ編集。
+    /// Connect src_node.out → dst_node.in (kinds must match; single connection = already-connected is an error). Edits staging only.
     pub fn connect(self: *DynGraph, src_h: Handle, src_out: usize, dst_h: Handle, dst_in: usize) Error!void {
         if (!self.isActive(src_h) or !self.isActive(dst_h)) return Error.BadNodeIndex;
         const si = &self.instances[src_h];
@@ -489,7 +489,7 @@ pub const DynGraph = struct {
         self.stage_output = @intCast(h);
     }
 
-    /// DFS（依存を先に積む）。visiting 中の依存先＝back edge を遅延辺として印付ける（graph.zig と同方針）。
+    /// DFS (push dependencies first). A dependency still visiting = a back edge, marked as a delay edge (same policy as graph.zig).
     fn dfs(
         self: *DynGraph,
         u: Handle,
@@ -505,14 +505,14 @@ pub const DynGraph = struct {
             const s = self.stage_in_src[u][i];
             if (s < 0) continue;
             const owner: Handle = @intCast(@as(usize, @intCast(s)) / MAX_OUT);
-            if (!self.slots[owner].active) continue; // dangling 防御（removeModule で通常はクリア済み）
+            if (!self.slots[owner].active) continue; // Dangling defence (normally cleared by removeModule)
             if (owner == u) {
-                in_delayed[u][i] = true; // self-loop は遅延
+                in_delayed[u][i] = true; // A self-loop is a delay
                 continue;
             }
             switch (colors[owner]) {
                 .unvisited => self.dfs(owner, colors, in_delayed, order, order_len),
-                .visiting => in_delayed[u][i] = true, // back edge → 遅延
+                .visiting => in_delayed[u][i] = true, // back edge → delay
                 .done => {},
             }
         }
@@ -521,8 +521,8 @@ pub const DynGraph = struct {
         order_len.* += 1;
     }
 
-    /// staging を topo sort + サイクル検出 + master 検証して GraphView を焼き、triple-buffer へ publish。
-    /// 非 RT。per-call heap alloc なし（scratch は stack）。
+    /// Topo-sort + cycle-detect + master-validate staging, bake a GraphView, and publish it into the triple-buffer.
+    /// Non-RT. No per-call heap alloc (scratch is on the stack).
     pub fn publish(self: *DynGraph) Error!void {
         var colors: [MAX_MODULES]Color = undefined;
         for (0..MAX_MODULES) |i| colors[i] = if (self.slots[i].active) .unvisited else .done;
@@ -535,7 +535,7 @@ pub const DynGraph = struct {
         }
         view.node_count = @intCast(order_len);
 
-        // master 出力の妥当性（非 RT でここで検証。RT では panic させない）。
+        // Validate the master output here on the non-RT side (do not panic in RT).
         var out: i32 = -1;
         if (self.stage_output >= 0) {
             const oh: Handle = @intCast(self.stage_output);
@@ -543,7 +543,7 @@ pub const DynGraph = struct {
             out = self.stage_output;
         }
         view.output = out;
-        view.in_src = self.stage_in_src; // handle で index（active 以外の行は未使用）
+        view.in_src = self.stage_in_src; // Indexed by handle (rows for non-active are unused)
         view.gen = self.gen + 1;
 
         self.mailbox.publish(view);
@@ -551,30 +551,30 @@ pub const DynGraph = struct {
         self.gen += 1;
     }
 
-    /// RT: 最新 view を latch → gen を記録 → handle をレジストリで resolve → graph_core。
-    /// alloc/lock/IO/panic/sort なし。未 publish/空 view/channels==0 はゼロ埋め。
+    /// RT: latch the latest view → record gen → resolve handles via the registry → graph_core.
+    /// No alloc/lock/IO/panic/sort. Unpublish / empty view / channels==0 zero-fills.
     ///
-    /// RT ブロック毎経路。ProcNode 列 + out_sel の再構築は **view.gen 変化時のみ**（gen 不変なら
-    /// 前ブロックの proc_cache/cached_out_sel をそのまま使う。静的 Graph が finalize で 1 回焼くのと対称）。
-    /// tap config の latch と applied_seq の release store は gen とは独立チャネルなので毎ブロック必須
-    /// （gen スキップの対象外。TASK-40.8 の GUI 描画 gate を止めない）。
+    /// Per-block RT path. Rebuild the ProcNode sequence + out_sel **only when view.gen changes** (when gen is unchanged,
+    /// reuse the previous block's proc_cache/cached_out_sel. Symmetric with the static Graph baking once in finalize).
+    /// Latch of the tap config and the release store of applied_seq are an independent channel from gen, so they run every block
+    /// (outside the gen-skip; keep the GUI draw gate alive).
     pub fn processBlock(self: *DynGraph, buf: []f32, frames: u32, channels: u32) void {
         const view = self.mailbox.acquire();
         self.consumed_gen.store(view.gen, .release);
-        // D: tap config を latch（block あたり 1 回）。差し替わった slot は local_wpos/wpos をリセットして
-        // 旧 port の残留サンプルを新 port の窓へ混ぜない。空/無チャンネル時も latch と applied_seq store は行う
-        // （GUI の描画 gate が止まらないように）。gen スキップとは独立に毎ブロック実行する。
+        // D: latch tap config (once per block). A swapped slot resets local_wpos/wpos so residual samples from the
+        // old port do not mix into the new port's window. Latch and applied_seq store still run on empty/no-channel
+        // (so the GUI draw gate does not stall). Runs every block, independent of gen-skip.
         const any_tap = self.latchTapConfig();
         if (view.node_count == 0 or channels == 0) {
             @memset(buf, 0);
             self.tap.applied_seq.store(self.tap.latched_seq, .release);
             return;
         }
-        // gen 不変なら ProcNode 列 + out_sel の再構築をスキップ。正しさ: gen は publish 毎に単調 +1
-        // （u64・wrap 事実上なし）で同一 gen の GraphView 内容は不変。view 中 handle の RT-read field
-        // （vtable/ctx/out_base/n_in/n_out）は RCU grace（consumed_gen>=retire_gen まで再利用禁止）で
-        // view 参照期間中は不変（add() が書くのは free/reclaim 済み slot のみ＝現 view に居ない handle）。
-        // よって同一 gen の再構築結果は bit 同一＝スキップは出力を変えない。番兵値に頼らず cache_valid で明示。
+        // When gen is unchanged, skip rebuilding the ProcNode sequence + out_sel. Correctness: gen is monotonic +1 per publish
+        // (u64; wrap is effectively impossible) and a GraphView's contents are immutable for a given gen. RT-read fields of
+        // handles in the view (vtable/ctx/out_base/n_in/n_out) are immutable for the view's lifetime under RCU grace
+        // (no reuse until consumed_gen>=retire_gen; add() only writes free/reclaimed slots = handles not in the current view).
+        // So a rebuild for the same gen is bit-identical = skipping does not change the output. cache_valid states this explicitly (no sentinel).
         if (!(self.cache_valid and view.gen == self.cache_gen)) {
             var k: usize = 0;
             while (k < view.node_count) : (k += 1) {
@@ -599,18 +599,18 @@ pub const DynGraph = struct {
             self.rebuild_count +%= 1;
         }
         const procs = self.proc_cache[0..view.node_count];
-        // block 単位の分岐 1 回のみ: tap slot が 1 つでも active なら tapped 版、なければ従来版（機械語不変）。
+        // One branch per block only: if any tap slot is active use the tapped path, else the prior path (machine code unchanged).
         if (any_tap) {
             graph_core.processBlockTapped(procs, self.cached_out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels, &self.tap);
         } else {
             graph_core.processBlock(procs, self.cached_out_sel, self.sample_rate, &self.cur, &self.prev, buf, frames, channels);
         }
-        // block 末尾に latch 済み config の seq を release store（1 store/block。GUI 描画 gate）。
+        // At block end, release-store the latched config's seq (1 store/block; GUI draw gate).
         self.tap.applied_seq.store(self.tap.latched_seq, .release);
     }
 
-    /// tap config（GUI publish）を acquire して latch する。差し替わった slot は local_wpos=0 + wpos=0 に
-    /// リセット（旧 port の残留を「無し」扱い）。active な tap slot が 1 つでもあれば true。非 RT alloc/lock なし。
+    /// acquire and latch the tap config (GUI publish). A swapped slot resets local_wpos=0 + wpos=0
+    /// (treat old-port residue as absent). Returns true if any tap slot is active. No non-RT alloc/lock.
     fn latchTapConfig(self: *DynGraph) bool {
         const cfg = self.tap_mailbox.acquire();
         self.tap.latched_seq = cfg.seq;
@@ -623,9 +623,9 @@ pub const DynGraph = struct {
                 self.tap.local_wpos[s] = 0;
                 self.tap.cnt[s] = 0;
                 self.tap.acc[s] = 0;
-                self.tap.slots[s].wpos.store(0, .release); // GUI へ即「空」を見せる
+                self.tap.slots[s].wpos.store(0, .release); // Show "empty" to the GUI immediately
             }
-            // port の種別は固定なので decim/peak は port 不変なら変わらない（毎 block latch でコストは軽微）。
+            // Port kind is fixed, so decim/peak do not change while the port is unchanged (per-block latch cost is small).
             self.tap.latched_decim[s] = cfg.decim[s];
             self.tap.latched_peak[s] = cfg.peak[s];
             if (p >= 0 and @as(usize, @intCast(p)) < MAX_PORTS) any = true;
@@ -633,24 +633,24 @@ pub const DynGraph = struct {
         return any;
     }
 
-    // --- テスト用イントロスペクション / 非 RT config / live atomic param ---
-    /// live pool slot（RT が処理する実インスタンス。publish payload 非対象の DSP 常駐状態）への ptr を返す。
+    // --- Test introspection / non-RT config / live atomic params ---
+    /// Return a ptr to the live pool slot (the real instance the RT processes; DSP-resident state not on the publish payload).
     ///
-    /// 用途 2 種:
-    ///   1. 非 RT・publish 前 or grace 期間中の初期設定（従来）。
-    ///   2. **atomic 化された field に限り稼働中の atomic アクセス**（TASK-40.7.2 で具体化した「live param の
-    ///      atomic 境界」）。例: StepSeq の mask/step は `@atomicLoad`/`@atomicStore(.monotonic)` 化済みなので、
-    ///      GUI(メインスレッド)の store と RT `process` の load が同一 live インスタンスを介す正しい cross-thread
-    ///      チャネルになる（ptrOf が返すのはまさに RT が処理する pool slot だから）。
+    /// Two uses:
+    ///   1. Non-RT initial setup before publish or during the grace window (as before).
+    ///   2. **Atomic access to fields that are already atomicised, while running** (the "live-param atomic boundary").
+    ///      e.g. StepSeq mask/step are `@atomicLoad`/`@atomicStore(.monotonic)`, so a GUI (main-thread) store and the
+    ///      RT `process` load share the same live instance as the correct cross-thread channel
+    ///      (ptrOf returns exactly the pool slot the RT processes).
     ///
-    /// **非 atomic field への稼働中書き込みは引き続き禁止**（RT 読みと torn する）。active member のみに使う
-    /// （台帳同期で removeModule 済み handle には使わない）。関数シグネチャ・戻り値は不変。
+    /// **Writing non-atomic fields while running remains forbidden** (tears against RT reads). Use only on active members
+    /// (do not use on handles already removeModule'd by the ledger). Signature and return type are unchanged.
     pub fn ptrOf(self: *DynGraph, comptime k: ModuleKind, h: Handle) *KindType(k) {
         return &self.poolArray(k)[self.slots[h].pool_idx];
     }
 
-    /// read-only live pool slot への ptr。param descriptor の getter など、非 RT の参照専用経路で使う。
-    /// 呼び出し側は active handle を事前に検証する（ptrOf と同じ前提）。
+    /// Ptr to a read-only live pool slot. For non-RT reference-only paths such as param-descriptor getters.
+    /// Callers must pre-validate an active handle (same assumption as ptrOf).
     pub fn ptrOfConst(self: *const DynGraph, comptime k: ModuleKind, h: Handle) *const KindType(k) {
         return &@constCast(self).poolArray(k)[self.slots[h].pool_idx];
     }
@@ -664,7 +664,7 @@ pub const DynGraph = struct {
     pub fn consumedGen(self: *const DynGraph) u64 {
         return self.consumed_gen.load(.acquire);
     }
-    /// ProcNode 列を実再構築した累積回数（TASK-61。gen スキップの検証用イントロスペクション）。
+    /// Cumulative count of actual ProcNode-sequence rebuilds (introspection for verifying gen-skip).
     pub fn rebuildCount(self: *const DynGraph) u64 {
         return self.rebuild_count;
     }
@@ -675,7 +675,7 @@ pub const DynGraph = struct {
         return self.last_published.in_delayed[h][in_port];
     }
 
-    // --- 描画/probe 用の読み取り専用イントロスペクション（範囲外は null/0。無条件 index で落とさない）---
+    // --- Read-only introspection for drawing/probes (out of range → null/0; never crash on a raw index) ---
     pub fn slotActive(self: *const DynGraph, h: Handle) bool {
         return h < MAX_MODULES and self.slots[h].active;
     }
@@ -700,11 +700,11 @@ pub const DynGraph = struct {
         return self.instances[h].out_kinds[j];
     }
 
-    // --- TASK-40.8 A: ポート活性度（RT 影響ゼロの best-effort torn read）---
-    /// 出力ポート (h, out) の現在の信号レベル ≒ max(|sig_a[p]|, |sig_b[p]|)。RT が書く f32 を非同期に読む
-    /// best-effort（ping-pong のどちらが最新かは不定だが活性度表示には十分。40.6.1 の「signal の GUI 読みは
-    /// torn 可」の範囲）。`.unordered` atomic load で torn を避けつつ RT 経路は不変（GUI 側のみ）。
-    /// 範囲外/非 active は 0（無条件 index で落とさない）。
+    // --- Port activity (best-effort torn read; zero RT impact) ---
+    /// Current signal level of output port (h, out) ≈ max(|sig_a[p]|, |sig_b[p]|). Asynchronous best-effort read of
+    /// f32s the RT writes (which ping-pong side is latest is undefined, but enough for an activity meter; within
+    /// "GUI reads of signal may tear"). `.unordered` atomic load avoids torn while leaving the RT path unchanged (GUI only).
+    /// Out of range / inactive → 0 (never crash on a raw index).
     pub fn sigLevel(self: *const DynGraph, h: Handle, out: usize) f32 {
         if (h >= MAX_MODULES or out >= MAX_OUT or !self.slots[h].active) return 0;
         const p = @as(usize, h) * MAX_OUT + out;
@@ -713,22 +713,22 @@ pub const DynGraph = struct {
         return @max(a, b);
     }
 
-    // --- TASK-40.8 D: per-port tap（GUI 側 API）---
-    /// GUI→RT: tap 対象 port 割当を publish（triple-buffer・torn 無し・latest-wins・非ブロッキング）。
+    // --- Per-port tap (GUI-side API) ---
+    /// GUI→RT: publish the tap's port assignment (triple-buffer; no torn; latest-wins; non-blocking).
     pub fn publishTapConfig(self: *DynGraph, cfg: graph_core.TapConfig) void {
         self.tap_mailbox.publish(cfg);
     }
-    /// RT が最後に latch・適用した config の seq（GUI の描画 gate）。
+    /// Seq of the config the RT last latched and applied (GUI draw gate).
     pub fn tapAppliedSeq(self: *const DynGraph) u32 {
         return self.tap.applied_seq.load(.acquire);
     }
-    /// slot の書き込み総サンプル数（acquire。これ以下の ring 書き込みは可視）。
+    /// Total samples written into the slot (acquire; ring writes up to this are visible).
     pub fn tapWpos(self: *const DynGraph, slot: usize) u32 {
         if (slot >= graph_core.TAP_SLOTS) return 0;
         return self.tap.slots[slot].wpos.load(.acquire);
     }
-    /// slot の直近窓（最大 out.len）を oldest→newest で out へコピーし、コピー数を返す。
-    /// wpos acquire までの ring 書き込みは可視。読み中に RT が上書きする tail の torn は表示グリッチのみ許容。
+    /// Copy the slot's latest window (up to out.len) into out oldest→newest; return how many were copied.
+    /// Ring writes up to the acquired wpos are visible. A torn tail the RT overwrites mid-read is accepted as a display glitch.
     pub fn tapWindow(self: *const DynGraph, slot: usize, out: []f32) usize {
         if (slot >= graph_core.TAP_SLOTS) return 0;
         const w = self.tap.slots[slot].wpos.load(.acquire);
@@ -736,19 +736,19 @@ pub const DynGraph = struct {
         const count = @min(avail, out.len);
         var k: usize = 0;
         while (k < count) : (k += 1) {
-            const abs = @as(usize, w) - count + k; // count<=avail<=w なのでアンダーフロー無し
-            // RT の unordered store と対の unordered load（torn 無し・races OK・plain load と同一機械語）。
+            const abs = @as(usize, w) - count + k; // count<=avail<=w so no underflow
+            // unordered load paired with the RT unordered store (no torn requirement; races OK; same machine code as a plain load).
             out[k] = @atomicLoad(f32, &self.tap.slots[slot].ring[abs % graph_core.TAP_RING], .unordered);
         }
         return count;
     }
 
-    // --- main 専用の preflight accessor（read-only・RT 非関与。TASK-40.7.1 macro.zig の preflight 用）---
-    // publish/processBlock の RT 経路・RCU/triple-buffer 機構は一切変更しない。add() と同じ reclaim 条件
-    // （live=active || (retired かつ consumed_gen < retire_gen)）を織り込んだ「今 add したら確保できる」
-    // 数を返す（reclaimRetired 実行前でも add が実際に確保できる数と一致させる。非破壊で数えるだけ）。
+    // --- Main-only preflight accessors (read-only; no RT involvement) ---
+    // Does not change the publish/processBlock RT path or the RCU/triple-buffer machinery at all. Returns "how many
+    // add() could allocate right now" under the same reclaim condition as add()
+    // (live=active || (retired and consumed_gen < retire_gen)), counted non-destructively even before reclaimRetired runs.
 
-    /// kind のプールに今 add したら確保できる空き数。
+    /// Free slots in kind's pool that add could take right now.
     pub fn poolFreeCount(self: *const DynGraph, comptime k: ModuleKind) usize {
         const cg = self.consumed_gen.load(.acquire);
         var used: usize = 0;
@@ -760,7 +760,7 @@ pub const DynGraph = struct {
         return if (used >= cap) 0 else cap - used;
     }
 
-    /// 今 add したら確保できる空き handle 数（MAX_MODULES 上限）。
+    /// Free handles add could take right now (MAX_MODULES cap).
     pub fn freeHandleCount(self: *const DynGraph) usize {
         const cg = self.consumed_gen.load(.acquire);
         var used: usize = 0;
@@ -771,7 +771,7 @@ pub const DynGraph = struct {
     }
 };
 
-/// union-to-largest の代理サイズ（全 kind の最大 @sizeOf × MAX_MODULES）。テスト（e）で比較。
+/// Proxy size for union-to-largest (max @sizeOf across kinds × MAX_MODULES). Compared in test (e).
 pub fn unionToLargestSize() usize {
     comptime var biggest: usize = 0;
     inline for (std.meta.fields(ModuleKind)) |f| {
@@ -787,7 +787,7 @@ pub fn poolsSize() usize {
 }
 
 // ============================================================================
-// tests（display/audio 不要・test-modular に含む）
+// tests (no display/audio; part of test-modular)
 // ============================================================================
 const testing = std.testing;
 
@@ -802,33 +802,33 @@ fn rmsEven(buf: []const f32, channels: u32) f32 {
     return @floatCast(@sqrt(acc / @as(f64, @floatFromInt(n))));
 }
 
-test "dyn(e): 型別プール < union 一律（union-to-largest 膨張の回避）" {
-    // DelayFx(≈256KB) を全 slot に敷く union 代理より、実プール総量が十分小さい。
+test "dyn(e): typed pools < uniform union (avoid union-to-largest bloat)" {
+    // Real total pool size is well below the union-proxy that would lay DelayFx(≈256KB) into every slot.
     try testing.expect(poolsSize() < unionToLargestSize());
-    // 大差（少なくとも数倍）であることも確認。
+    // Also confirm a large gap (at least several×).
     try testing.expect(poolsSize() * 2 < unionToLargestSize());
 }
 
-test "dyn(h1/h2): triple-buffer は連続 publish でも torn せず latest-wins・非 fresh は現 view 維持" {
+test "dyn(h1/h2): triple-buffer stays untorn under consecutive publish; latest-wins; non-fresh keeps current view" {
     var mb = Mailbox(u32).init(0);
     try testing.expect(mb.indicesArePermutation());
-    // 非 fresh consume は初期値維持
+    // A non-fresh consume keeps the initial value
     try testing.expectEqual(@as(u32, 0), mb.acquire().*);
-    // 連続 publish（consume 挟まず）でも置換不変・producer は read slot を書かない
+    // Consecutive publish (no consume between) still keeps the permutation invariant; producer does not write the read slot
     mb.publish(10);
     try testing.expect(mb.indicesArePermutation());
     mb.publish(20);
     try testing.expect(mb.indicesArePermutation());
     mb.publish(30);
     try testing.expect(mb.indicesArePermutation());
-    // consume は最新
+    // consume takes the latest
     try testing.expectEqual(@as(u32, 30), mb.acquire().*);
-    // publish 無しなら現 view 維持
+    // With no publish, the current view is kept
     try testing.expectEqual(@as(u32, 30), mb.acquire().*);
     try testing.expect(mb.indicesArePermutation());
 }
 
-test "dyn(a): 最小パッチ publish→render 非無音・finite・有界、実行中の add でも維持" {
+test "dyn(a): minimal patch publish->render is non-silent, finite, bounded; holds under add while running" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const vco = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
@@ -847,7 +847,7 @@ test "dyn(a): 最小パッチ publish→render 非無音・finite・有界、実
         try testing.expect(@abs(s) <= 1.0001);
     }
 
-    // 実行中に無関係な第 2 VCO を追加（未接続）→ publish → 依然 finite/有界/非無音。
+    // While running, add an unrelated second VCO (unconnected) → publish → still finite/bounded/non-silent.
     _ = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
     try g.publish();
     g.processBlock(&buf, 512, 2);
@@ -858,8 +858,8 @@ test "dyn(a): 最小パッチ publish→render 非無音・finite・有界、実
     }
 }
 
-test "dyn(c): 状態保持 — 無関係な add で既存 VCO の位相がリセットされない（サンプル一致）" {
-    // ref: VCO->Output を 2 ブロック連続 render。
+test "dyn(c): state preserved — unrelated add does not reset existing VCO phase (sample-identical)" {
+    // ref: render VCO->Output for 2 consecutive blocks.
     var ref = try DynGraph.create(testing.allocator, 48000);
     defer ref.destroy();
     {
@@ -874,7 +874,7 @@ test "dyn(c): 状態保持 — 無関係な add で既存 VCO の位相がリセ
     ref.processBlock(&ref_b1, 128, 2);
     ref.processBlock(&ref_b2, 128, 2);
 
-    // test: 同じ VCO->Output を 1 ブロック render 後、無関係な第 2 VCO を add+publish、その後 render。
+    // test: render the same VCO->Output for 1 block, add+publish an unrelated second VCO, then render.
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
@@ -885,17 +885,17 @@ test "dyn(c): 状態保持 — 無関係な add で既存 VCO の位相がリセ
     var g_b1: [128 * 2]f32 = undefined;
     var g_b2: [128 * 2]f32 = undefined;
     g.processBlock(&g_b1, 128, 2);
-    // 再配線: 無関係 VCO を追加（既存 v/o の接続・状態には無関係）。
+    // Rewire: add an unrelated VCO (no effect on existing v/o connections or state).
     _ = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
     try g.publish();
     g.processBlock(&g_b2, 128, 2);
 
-    // block1 は当然一致。block2 も一致すれば「位相リセット無し・接続点で不連続なし」＝状態保持。
+    // block1 must match. If block2 also matches → "no phase reset / no discontinuity at the connection" = state preserved.
     try testing.expectEqualSlices(f32, &ref_b1, &g_b1);
     try testing.expectEqualSlices(f32, &ref_b2, &g_b2);
 }
 
-test "dyn(c2): DelayFx tail — 入力を切っても直後の tail が連続（状態保持）" {
+test "dyn(c2): DelayFx tail — disconnecting input keeps the immediate tail continuous (state preserved)" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const vco = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 220 });
@@ -907,18 +907,18 @@ test "dyn(c2): DelayFx tail — 入力を切っても直後の tail が連続（
     try g.publish();
 
     var buf: [4800 * 2]f32 = undefined;
-    g.processBlock(&buf, 4800, 2); // delay line を満たす
+    g.processBlock(&buf, 4800, 2); // Fill the delay line
 
-    // vco→delay を切断（delay 入力 0）→ publish。tail（feedback）が残るので直後も非無音。
+    // Disconnect vco→delay (delay input 0) → publish. The tail (feedback) remains, so the next audio is still non-silent.
     g.disconnect(dly, 0);
     try g.publish();
     var tail: [480 * 2]f32 = undefined;
     g.processBlock(&tail, 480, 2);
-    try testing.expect(rmsEven(&tail, 2) > 0.0); // tail が途切れない
+    try testing.expect(rmsEven(&tail, 2) > 0.0); // Tail does not cut off
     for (tail) |s| try testing.expect(std.math.isFinite(s));
 }
 
-test "dyn(b): 決定的 — 同一操作列 2 回で出力・最終 GraphView 一致" {
+test "dyn(b): deterministic — same op sequence twice yields matching output and final GraphView" {
     const build = struct {
         fn go(alloc: std.mem.Allocator, out_buf: []f32) !GraphView {
             var g = try DynGraph.create(alloc, 48000);
@@ -932,7 +932,7 @@ test "dyn(b): 決定的 — 同一操作列 2 回で出力・最終 GraphView �
             try g.publish();
             var tmp: [256 * 2]f32 = undefined;
             g.processBlock(&tmp, 256, 2);
-            // 追加接続
+            // Extra connection
             const v2 = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 330 });
             try g.connect(v2, 0, m, 1);
             try g.publish();
@@ -945,7 +945,7 @@ test "dyn(b): 決定的 — 同一操作列 2 回で出力・最終 GraphView �
     const va = try build.go(testing.allocator, &a);
     const vb = try build.go(testing.allocator, &b);
     try testing.expectEqualSlices(f32, &a, &b);
-    // 最終 GraphView（gen 除く）一致
+    // Final GraphView matches (excluding gen)
     try testing.expectEqual(va.node_count, vb.node_count);
     try testing.expectEqual(va.output, vb.output);
     try testing.expectEqualSlices(u16, va.order[0..va.node_count], vb.order[0..vb.node_count]);
@@ -953,9 +953,9 @@ test "dyn(b): 決定的 — 同一操作列 2 回で出力・最終 GraphView �
     try testing.expectEqualSlices([MAX_IN]bool, &va.in_delayed, &vb.in_delayed);
 }
 
-test "dyn(b2): 長い操作列（connect/disconnect/remove/reuse 込み）を 2 回適用して決定的" {
-    // UI ライブ再配線を模した操作列: 構築→render→接続追加→render→切断→render→削除→publish→render→
-    // grace 後に再 add→render。固定 seed（モジュール既定）で 2 グラフに同一適用し出力・最終 View が一致。
+test "dyn(b2): long op sequence (connect/disconnect/remove/reuse) applied twice is deterministic" {
+    // Operation sequence mimicking UI live rewiring: build→render→add connection→render→disconnect→render→remove→publish→render→
+    // re-add after grace→render. Apply the same sequence to two graphs with a fixed seed (module defaults); output and final View must match.
     const run = struct {
         fn go(alloc: std.mem.Allocator, out_buf: []f32) !GraphView {
             var g = try DynGraph.create(alloc, 48000);
@@ -969,20 +969,20 @@ test "dyn(b2): 長い操作列（connect/disconnect/remove/reuse 込み）を 2 
             try g.publish();
             var tmp: [128 * 2]f32 = undefined;
             g.processBlock(&tmp, 128, 2);
-            // LFO を足して cutoff を変調
+            // Add an LFO to modulate cutoff
             const lfo = try g.add(.lfo, .{ .rate_hz = 1.0 });
             try g.connect(lfo, 0, f, 1);
             try g.publish();
             g.processBlock(&tmp, 128, 2);
-            // 切断（LFO→cutoff を外す）
+            // Disconnect (remove LFO→cutoff)
             g.disconnect(f, 1);
             try g.publish();
             g.processBlock(&tmp, 128, 2);
-            // LFO を削除 → publish → render で grace 前進
+            // Remove the LFO → publish → render advances grace
             g.removeModule(lfo);
             try g.publish();
             g.processBlock(&tmp, 128, 2);
-            // grace 済み slot を再利用（別モジュール）
+            // Reuse the grace-complete slot (different module)
             const mix = try g.add(.mixer, .{ .gain = 0.5 });
             try g.connect(v, 0, mix, 0);
             try g.publish();
@@ -1002,21 +1002,21 @@ test "dyn(b2): 長い操作列（connect/disconnect/remove/reuse 込み）を 2 
     try testing.expectEqualSlices([MAX_IN]bool, &va.in_delayed, &vb.in_delayed);
 }
 
-test "dyn(f): 単一接続 / 種別一致 / サイクル遅延 / エラー区別" {
+test "dyn(f): single connection / kind match / cycle delay / error distinction" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v1 = try g.add(.vco, .{});
     const v2 = try g.add(.vco, .{});
     const m = try g.add(.mixer, .{});
     const eg = try g.add(.env_gen, .{});
-    // 単一接続: 同じ入力へ 2 本目はエラー
+    // Single connection: a second cable into the same input is an error
     try g.connect(v1, 0, m, 0);
     try testing.expectError(Error.InputAlreadyConnected, g.connect(v2, 0, m, 0));
-    try g.connect(v2, 0, m, 1); // 別ポートは OK
-    // 種別不一致: audio(out) -> gate(in) は拒否
+    try g.connect(v2, 0, m, 1); // A different port is OK
+    // Kind mismatch: audio(out) -> gate(in) is rejected
     try testing.expectError(Error.PortKindMismatch, g.connect(v1, 0, eg, 0));
 
-    // サイクル: mixer 出力を自分の in1 へ（self-loop）→ 遅延辺。
+    // Cycle: mixer out into its own in1 (self-loop) → delay edge.
     const m2 = try g.add(.mixer, .{ .gain = 0.5 });
     try g.connect(v1, 0, m2, 0);
     try g.connect(m2, 0, m2, 1);
@@ -1031,11 +1031,11 @@ test "dyn(f): 単一接続 / 種別一致 / サイクル遅延 / エラー区別
     }
 }
 
-test "dyn(f2a): pool 枯渇は PoolFull（handle 空間に余裕があっても）" {
+test "dyn(f2a): pool exhaustion is PoolFull (even when handle space remains)" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    // output pool を使い切る（既定 cap=2。-Dmax-modules で比例スケール。TASK-146）。
-    // handle 空間に余裕があるうちに PoolFull になることを確認。
+    // Exhaust the output pool (default cap=2; scales with -Dmax-modules).
+    // Confirm PoolFull while handle space still has room.
     const cap = poolCap(.output);
     var i: usize = 0;
     while (i < cap) : (i += 1) _ = try g.add(.output, .{});
@@ -1043,7 +1043,7 @@ test "dyn(f2a): pool 枯渇は PoolFull（handle 空間に余裕があっても�
     try testing.expect(g.activeCount() < MAX_MODULES);
 }
 
-test "dyn(f2b): TASK-107 の各 pool は計画容量まで使えて次で枯渇する" {
+test "dyn(f2b): each planned pool can be filled to capacity and exhausts on the next add" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const kinds = [_]ModuleKind{ .slew, .sample_hold, .comparator, .ring_mod, .logic };
@@ -1056,7 +1056,7 @@ test "dyn(f2b): TASK-107 の各 pool は計画容量まで使えて次で枯渇�
     }
 }
 
-test "dyn(f2c): TASK-107 5種を接続した発音経路は有限かつ非ゼロ" {
+test "dyn(f2c): a sounding path connecting the five kinds is finite and non-zero" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
 
@@ -1096,7 +1096,7 @@ test "dyn(f2c): TASK-107 5種を接続した発音経路は有限かつ非ゼロ
     try testing.expect(nonzero);
 }
 
-test "dyn(f2d): TASK-107 の5種を FailingAllocator 下で複数 block 処理できる" {
+test "dyn(f2d): the five kinds process multiple blocks under FailingAllocator" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const vco_a = try g.add(.vco, .{});
@@ -1136,16 +1136,16 @@ test "dyn(f2d): TASK-107 の5種を FailingAllocator 下で複数 block 処理�
     g.allocator = testing.allocator;
 }
 
-test "dyn(f2b): handle 空間枯渇は TooManyModules（pool に余裕があっても）" {
+test "dyn(f2b): handle-space exhaustion is TooManyModules (even when the pool has room)" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    // mixer は pool の半分だけ使い、残り handle を他 kind で埋める（-Dmax-modules 任意 N 対応。TASK-146）。
-    // 既定 N=48 では mixer_n=4, poolCap(mixer)=8 で旧テストと同型。
+    // Use only half the mixer pool; fill remaining handles with other kinds (works for any -Dmax-modules N).
+    // At default N=48, mixer_n=4 and poolCap(mixer)=8 match the prior test shape.
     const mixer_n = poolCap(.mixer) / 2;
     var mi: usize = 0;
     while (mi < mixer_n) : (mi += 1) _ = try g.add(.mixer, .{});
     var left = MAX_MODULES - mixer_n;
-    // poolCap は comptime kind 必須。各 kind を個別ブロックで埋める。
+    // poolCap needs a comptime kind. Fill each kind in its own block.
     {
         const take = @min(left, poolCap(.vco));
         var j: usize = 0;
@@ -1185,14 +1185,14 @@ test "dyn(f2b): handle 空間枯渇は TooManyModules（pool に余裕があっ�
     try testing.expectEqual(@as(usize, 0), left);
     try testing.expectEqual(@as(usize, MAX_MODULES), g.activeCount());
     try testing.expect(g.poolFreeCount(.mixer) > 0);
-    // handle 空間が満杯 → pool にまだ余裕がある mixer でも TooManyModules。
+    // Handle space full → TooManyModules even for a mixer that still has pool room.
     try testing.expectError(Error.TooManyModules, g.add(.mixer, .{}));
 }
 
-test "dyn(d): RT ゼロアロケーション — processBlock/publish が self.allocator を触らない（FailingAllocator）" {
-    // create は通常 allocator で確保。以後 g.allocator を fail_index=0 の FailingAllocator に差し替え、
-    // processBlock（RT 経路）と publish（非 RT だが per-call alloc 不在）を回す。もし self.allocator 経由で
-    // alloc すれば即 OutOfMemory。destroy 前に通常 allocator へ戻す。
+test "dyn(d): RT zero allocation — processBlock/publish never touch self.allocator (FailingAllocator)" {
+    // create uses the normal allocator. Then swap g.allocator for a FailingAllocator with fail_index=0 and run
+    // processBlock (RT path) and publish (non-RT but no per-call alloc). Any alloc via self.allocator fails immediately
+    // with OutOfMemory. Restore the normal allocator before destroy.
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
@@ -1208,25 +1208,25 @@ test "dyn(d): RT ゼロアロケーション — processBlock/publish が self.a
     const chunk: u32 = 4096;
     var buf: [chunk * 2]f32 = undefined;
     var rendered: u64 = 0;
-    const target: u64 = 96_000; // ~2s @48k（failing 下で回す）
+    const target: u64 = 96_000; // ~2s @48k (run under failing)
     while (rendered < target) : (rendered += chunk) {
-        g.processBlock(&buf, chunk, 2); // alloc すれば FailingAllocator が捕える
+        g.processBlock(&buf, chunk, 2); // If it allocates, FailingAllocator catches it
         for (buf) |s| {
             try testing.expect(std.math.isFinite(s));
             try testing.expect(@abs(s) <= 1.0001);
         }
     }
-    // publish も failing 下で per-call alloc しないことを確認（scratch は stack）。
+    // Confirm publish also does no per-call alloc under failing (scratch is on the stack).
     _ = try g.add(.lfo, .{});
     try g.publish();
     g.processBlock(&buf, chunk, 2);
-    // FailingAllocator が 1 度も呼ばれていない（= alloc 発生ゼロ）を確認。
+    // Confirm FailingAllocator was never called (= zero allocations).
     try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
 
-    g.allocator = testing.allocator; // destroy 用に戻す
+    g.allocator = testing.allocator; // Restore for destroy
 }
 
-test "dyn(i): poolFreeCount/freeHandleCount — add 前の空き数が add の実確保可能数と一致する（reclaim 込み）" {
+test "dyn(i): poolFreeCount/freeHandleCount — free counts before add match what add can actually take (including reclaim)" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const cap = poolCap(.output);
@@ -1237,24 +1237,24 @@ test "dyn(i): poolFreeCount/freeHandleCount — add 前の空き数が add の�
     try testing.expectEqual(cap - 1, g.poolFreeCount(.output));
     try testing.expectEqual(@as(usize, MAX_MODULES - 1), g.freeHandleCount());
 
-    // pool 枯渇時は 0（TooManyModules/PoolFull と整合）。-Dmax-modules で cap が変わる（TASK-146）。
+    // 0 when the pool is exhausted (consistent with TooManyModules/PoolFull). Cap changes with -Dmax-modules.
     var last: Handle = 0;
-    var i: usize = 1; // 既に 1 本追加済み
+    var i: usize = 1; // One already added
     while (i < cap) : (i += 1) last = try g.add(.output, .{});
     try testing.expectEqual(@as(usize, 0), g.poolFreeCount(.output));
 
-    // remove 直後（publish/consume 前）は grace 未達 = まだ「使用中」扱い（reclaim されない）。
+    // Right after remove (before publish/consume) grace is incomplete = still "in use" (not reclaimed).
     g.removeModule(last);
     try testing.expectEqual(@as(usize, 0), g.poolFreeCount(.output));
 
-    // publish + processBlock で consumed_gen が retire_gen に追いつく → reclaim 相当で空きが戻る。
+    // publish + processBlock lets consumed_gen catch up to retire_gen → free count returns as if reclaimed.
     try g.publish();
     var buf: [64 * 2]f32 = undefined;
     g.processBlock(&buf, 64, 2);
     try testing.expectEqual(@as(usize, 1), g.poolFreeCount(.output));
 }
 
-test "dyn(h3): RCU grace — remove 後 grace 未達の間は同 handle を再利用しない" {
+test "dyn(h3): RCU grace — do not reuse the same handle after remove while grace is incomplete" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
@@ -1263,17 +1263,17 @@ test "dyn(h3): RCU grace — remove 後 grace 未達の間は同 handle を再�
     g.setOutput(o);
     try g.publish();
     var buf: [64 * 2]f32 = undefined;
-    g.processBlock(&buf, 64, 2); // consumed_gen=1（v はまだ view gen1 に居る）
+    g.processBlock(&buf, 64, 2); // consumed_gen=1 (v is still in view gen1)
 
-    // v を削除。retire_gen = gen+1（= 2、次 publish の view から消える）。
+    // Remove v. retire_gen = gen+1 (= 2; disappears from the next publish's view).
     g.removeModule(v);
-    // grace 未達（consumed_gen=1 < retire_gen=2）で add → v を再利用してはいけない（別 handle）。
+    // Grace incomplete (consumed_gen=1 < retire_gen=2): add must not reuse v (different handle).
     const h_other = try g.add(.vco, .{ .osc = .{ .waveform = .square }, .base_hz = 220 });
     try testing.expect(h_other != v);
     g.removeModule(h_other);
 }
 
-test "dyn(h4): RCU grace — grace 成立後は同 handle を再利用し、signal port 範囲がクリアされ残留が漏れない" {
+test "dyn(h4): RCU grace — after grace, reuse the same handle; signal port range is cleared so residue does not leak" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
@@ -1282,9 +1282,9 @@ test "dyn(h4): RCU grace — grace 成立後は同 handle を再利用し、sign
     g.setOutput(o);
     try g.publish();
     var buf: [256 * 2]f32 = undefined;
-    g.processBlock(&buf, 256, 2); // v の出力ポートに sine の非ゼロ値が残る（sig_a/sig_b 両方）
+    g.processBlock(&buf, 256, 2); // Non-zero sine remains in v's output ports (both sig_a/sig_b)
 
-    // v の port 範囲が実際に非ゼロ（＝この後の clear が効いているか検証できる状態）。
+    // v's port range is actually non-zero (= state in which the later clear can be verified).
     const base: usize = @as(usize, v) * MAX_OUT;
     var pre_nonzero = false;
     for (g.sig_a[base..][0..MAX_OUT]) |x| {
@@ -1295,15 +1295,15 @@ test "dyn(h4): RCU grace — grace 成立後は同 handle を再利用し、sign
     }
     try testing.expect(pre_nonzero);
 
-    // v を削除 → publish（gen 前進、view から消える）→ processBlock で consumed_gen を retire_gen 以上へ。
+    // Remove v → publish (gen advances; disappears from the view) → processBlock lifts consumed_gen to >= retire_gen.
     g.removeModule(v);
     try g.publish();
-    g.processBlock(&buf, 256, 2); // consumed_gen が retire_gen 到達 → v が reclaim 可能
+    g.processBlock(&buf, 256, 2); // consumed_gen reached retire_gen → v is reclaimable
 
-    // grace 成立後の add は最小の空き handle（= v）を確定的に再利用する。
+    // After grace, add deterministically reuses the smallest free handle (= v).
     const reuse = try g.add(.vca, .{ .gain = 1.0 });
     try testing.expectEqual(v, reuse);
-    // reuse 直後（process 前）に v の旧 port 範囲がクリアされている（残留が新モジュールへ漏れない）。
+    // Right after reuse (before process), v's old port range is cleared (residue does not leak into the new module).
     for (g.sig_a[base..][0..MAX_OUT]) |x| try testing.expectEqual(@as(f32, 0), x);
     for (g.sig_b[base..][0..MAX_OUT]) |x| try testing.expectEqual(@as(f32, 0), x);
 
@@ -1312,16 +1312,16 @@ test "dyn(h4): RCU grace — grace 成立後は同 handle を再利用し、sign
     for (buf) |s| try testing.expect(std.math.isFinite(s));
 }
 
-// ---- TASK-40.8 D: per-port tap（RT 性質。offline 単スレッド決定論）----
+// ---- Per-port tap (RT properties; offline single-thread determinism) ----
 
-/// slot0 に 1 ポートだけ載せた TapConfig を作る（テスト用ヘルパー）。
+/// Build a TapConfig with one port on slot0 (test helper).
 fn tapCfg(seq: u32, port: i32) graph_core.TapConfig {
     var c = graph_core.TapConfig{ .seq = seq };
     c.ports[0] = port;
     return c;
 }
 
-test "dyn(tap-a): tap 有効/無効で audio 出力が bit 一致（tap は非侵襲）" {
+test "dyn(tap-a): audio output is bit-identical with tap on/off (tap is non-invasive)" {
     const build = struct {
         fn go(alloc: std.mem.Allocator, out_buf: []f32, enable_tap: bool) !void {
             var g = try DynGraph.create(alloc, 48000);
@@ -1339,10 +1339,10 @@ test "dyn(tap-a): tap 有効/無効で audio 出力が bit 一致（tap は非�
     var b: [512 * 2]f32 = undefined;
     try build.go(testing.allocator, &a, false);
     try build.go(testing.allocator, &b, true);
-    try testing.expectEqualSlices(f32, &a, &b); // tap は buf に非侵襲
+    try testing.expectEqualSlices(f32, &a, &b); // tap is non-invasive to buf
 }
 
-test "dyn(tap-b): tap リングは決定的・decimation rate 通り・発振源で非定数" {
+test "dyn(tap-b): tap ring is deterministic, matches decimation rate, non-constant from an oscillator" {
     const F: u32 = 512;
     const build = struct {
         fn go(alloc: std.mem.Allocator, ring_out: []f32) !u32 {
@@ -1364,20 +1364,20 @@ test "dyn(tap-b): tap リングは決定的・decimation rate 通り・発振源
     var r2: [graph_core.TAP_RING]f32 = undefined;
     const w1 = try build.go(testing.allocator, &r1);
     const w2 = try build.go(testing.allocator, &r2);
-    try testing.expectEqual(@as(u32, F / graph_core.TAP_DECIM), w1); // 間引きレート通り（wrap しない範囲）
+    try testing.expectEqual(@as(u32, F / graph_core.TAP_DECIM), w1); // Matches the decimation rate (no wrap yet)
     try testing.expectEqual(w1, w2);
     const n = @min(@as(usize, w1), graph_core.TAP_RING);
-    try testing.expectEqualSlices(f32, r1[0..n], r2[0..n]); // 決定的
+    try testing.expectEqualSlices(f32, r1[0..n], r2[0..n]); // Deterministic
     var mn: f32 = 0;
     var mx: f32 = 0;
     for (r1[0..n]) |x| {
         mn = @min(mn, x);
         mx = @max(mx, x);
     }
-    try testing.expect(mn < 0 and mx > 0); // 発振している（定数でない）
+    try testing.expect(mn < 0 and mx > 0); // Oscillating (not constant)
 }
 
-test "dyn(tap-c): tap 有効の processBlock + config publish がゼロアロケーション" {
+test "dyn(tap-c): processBlock with tap on + config publish is zero-allocation" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .saw }, .base_hz = 110 });
@@ -1395,7 +1395,7 @@ test "dyn(tap-c): tap 有効の processBlock + config publish がゼロアロケ
     var rendered: u64 = 0;
     var seq: u32 = 2;
     while (rendered < 96_000) : (rendered += chunk) {
-        g.publishTapConfig(tapCfg(seq, port)); // publish も alloc しない
+        g.publishTapConfig(tapCfg(seq, port)); // publish also does not allocate
         seq += 1;
         g.processBlock(&buf, chunk, 2);
         for (buf) |s| try testing.expect(std.math.isFinite(s));
@@ -1404,7 +1404,7 @@ test "dyn(tap-c): tap 有効の processBlock + config publish がゼロアロケ
     g.allocator = testing.allocator;
 }
 
-test "dyn(tap-d): config 差し替え・remove/reuse で finite・slot リセット（旧 port 混入なし）" {
+test "dyn(tap-d): config swap / remove/reuse stays finite and resets the slot (no old-port mix-in)" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v1 = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
@@ -1415,33 +1415,33 @@ test "dyn(tap-d): config 差し替え・remove/reuse で finite・slot リセッ
     try g.publish();
     var buf: [512 * 2]f32 = undefined;
 
-    // slot0 = v1 → 512 frame で 128 サンプル書かれる。
+    // slot0 = v1 → 128 samples written over 512 frames.
     g.publishTapConfig(tapCfg(1, @intCast(@as(u32, v1) * MAX_OUT)));
     g.processBlock(&buf, 512, 2);
     try testing.expectEqual(@as(u32, 512 / graph_core.TAP_DECIM), g.tapWpos(0));
     try testing.expectEqual(@as(u32, 1), g.tapAppliedSeq());
 
-    // slot0 を v2 へ差し替え → 次 block で wpos が 0 リセット後の新規カウントのみ（128 から増え続けない）。
+    // Swap slot0 to v2 → next block resets wpos to 0 and only counts new writes (does not keep growing from 128).
     g.publishTapConfig(tapCfg(2, @intCast(@as(u32, v2) * MAX_OUT)));
     g.processBlock(&buf, 256, 2);
-    try testing.expectEqual(@as(u32, 256 / graph_core.TAP_DECIM), g.tapWpos(0)); // リセット済み
+    try testing.expectEqual(@as(u32, 256 / graph_core.TAP_DECIM), g.tapWpos(0)); // Reset done
     try testing.expectEqual(@as(u32, 2), g.tapAppliedSeq());
 
-    // remove + publish + reuse を挟んでも finite・クラッシュ無し。
+    // remove + publish + reuse still finite; no crash.
     g.removeModule(v1);
     try g.publish();
     g.processBlock(&buf, 256, 2);
     for (buf) |s| try testing.expect(std.math.isFinite(s));
 }
 
-test "dyn(tap-e): gate は peak 間引きで 1 サンプル幅パルスを取りこぼさず捕捉する" {
+test "dyn(tap-e): gate peak-decimation catches 1-sample-wide pulses without missing them" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    const clk = try g.add(.clock, .{ .bpm = 240, .ppqn = 8 }); // 高頻度 tick（1 サンプル幅トリガ）
+    const clk = try g.add(.clock, .{ .bpm = 240, .ppqn = 8 }); // High-rate ticks (1-sample-wide triggers)
     const o = try g.add(.output, .{});
     g.setOutput(o);
-    try g.publish(); // 未接続でも全 active ノードは order に入り毎サンプル評価される（clock.out0 が書かれる）
-    // slot0 = clock.out0、coarse decim + peak。plain 間引きなら 1/256 でしか当たらないパルスも max で拾う。
+    try g.publish(); // Even unconnected, every active node is in order and evaluated every sample (clock.out0 is written)
+    // slot0 = clock.out0, coarse decim + peak. Plain decimation would hit a 1/256 pulse rarely; max still catches it.
     var cfg = graph_core.TapConfig{ .seq = 1 };
     cfg.ports[0] = @intCast(@as(u32, clk) * MAX_OUT);
     cfg.decim[0] = 256;
@@ -1449,29 +1449,29 @@ test "dyn(tap-e): gate は peak 間引きで 1 サンプル幅パルスを取り
     g.publishTapConfig(cfg);
     var buf: [4096 * 2]f32 = undefined;
     var i: usize = 0;
-    while (i < 12) : (i += 1) g.processBlock(&buf, 4096, 2); // ~1s（多数の tick を含む）
+    while (i < 12) : (i += 1) g.processBlock(&buf, 4096, 2); // ~1s (covers many ticks)
     var win: [graph_core.TAP_RING]f32 = undefined;
     const n = g.tapWindow(0, &win);
     var mx: f32 = 0;
     for (win[0..n]) |v| mx = @max(mx, v);
-    try testing.expect(mx > 0.5); // gate パルスが窓内 max として捕捉されている
+    try testing.expect(mx > 0.5); // Gate pulses are captured as window maxima
 }
 
-test "dyn(tap-cacheline): GUI 書き領域(tap_mailbox) と RT 書き領域(tap) が別キャッシュライン" {
+test "dyn(tap-cacheline): GUI-write region (tap_mailbox) and RT-write region (tap) are on separate cache lines" {
     const cl = std.atomic.cache_line;
     const mb = @offsetOf(DynGraph, "tap_mailbox");
     const tp = @offsetOf(DynGraph, "tap");
     try testing.expect(mb % cl == 0);
     try testing.expect(tp % cl == 0);
     const diff = if (tp > mb) tp - mb else mb - tp;
-    try testing.expect(diff >= cl); // 別ライン（false sharing の GUI×RT ペアを分離）
+    try testing.expect(diff >= cl); // Separate lines (isolate the GUI×RT false-sharing pair)
 }
 
 // ============================================================================
-// TASK-61: ProcNode 列 + out_sel の gen スキップ（性能の性質＝スキップをテストで固定）
+// ProcNode sequence + out_sel gen-skip (pin the "skip" performance property in a test)
 // ============================================================================
 
-test "dyn(cache-1): 同一 gen 連続ブロックで再構築は 1 回・gen 前進で再構築する" {
+test "dyn(cache-1): same-gen consecutive blocks rebuild once; gen advance rebuilds" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
@@ -1484,17 +1484,17 @@ test "dyn(cache-1): 同一 gen 連続ブロックで再構築は 1 回・gen 前
     g.processBlock(&buf, 128, 2);
     g.processBlock(&buf, 128, 2);
     g.processBlock(&buf, 128, 2);
-    try testing.expectEqual(@as(u64, 1), g.rebuildCount()); // 3 ブロックで再構築 1 回
+    try testing.expectEqual(@as(u64, 1), g.rebuildCount()); // 3 blocks → 1 rebuild
 
-    // 再 publish（gen 前進）→ 内容が同じでも確実に再構築する側も固定。
+    // Re-publish (gen advances) → also pin that a rebuild happens even when contents are unchanged.
     _ = try g.add(.lfo, .{});
     try g.publish();
     g.processBlock(&buf, 128, 2);
     try testing.expectEqual(@as(u64, 2), g.rebuildCount());
 }
 
-test "dyn(cache-2): スキップ経路と毎ブロック再構築経路の出力が bit 一致" {
-    // A: publish 1 回 → 2 ブロック連続（2 ブロック目は cache skip 経路）。
+test "dyn(cache-2): skip path and per-block rebuild path outputs are bit-identical" {
+    // A: one publish → 2 consecutive blocks (block 2 takes the cache-skip path).
     var ga = try DynGraph.create(testing.allocator, 48000);
     defer ga.destroy();
     {
@@ -1509,11 +1509,11 @@ test "dyn(cache-2): スキップ経路と毎ブロック再構築経路の出力
     var a1: [128 * 2]f32 = undefined;
     var a2: [128 * 2]f32 = undefined;
     ga.processBlock(&a1, 128, 2);
-    ga.processBlock(&a2, 128, 2); // skip 経路
+    ga.processBlock(&a2, 128, 2); // skip path
     try testing.expectEqual(@as(u64, 1), ga.rebuildCount());
 
-    // B: 同一トポロジで、ブロック間に再 publish（内容不変・gen++）を挟み毎回 rebuild 経路を通す。
-    // publish は DSP 状態（VCO 位相等）を触らないので、出力は A と bit 一致するはず。
+    // B: same topology; re-publish between blocks (contents unchanged, gen++) so every block takes the rebuild path.
+    // publish does not touch DSP state (VCO phase etc.), so the output must be bit-identical to A.
     var gb = try DynGraph.create(testing.allocator, 48000);
     defer gb.destroy();
     {
@@ -1528,24 +1528,24 @@ test "dyn(cache-2): スキップ経路と毎ブロック再構築経路の出力
     var b1: [128 * 2]f32 = undefined;
     var b2: [128 * 2]f32 = undefined;
     gb.processBlock(&b1, 128, 2);
-    try gb.publish(); // gen++ で強制再構築
+    try gb.publish(); // Force rebuild via gen++
     gb.processBlock(&b2, 128, 2);
     try testing.expectEqual(@as(u64, 2), gb.rebuildCount());
 
     try testing.expectEqualSlices(f32, &a1, &b1);
-    try testing.expectEqualSlices(f32, &a2, &b2); // skip(a2) == rebuild(b2)：stale cache/swap 漏れを落とす
+    try testing.expectEqualSlices(f32, &a2, &b2); // skip(a2) == rebuild(b2): catch stale cache/swap leaks
 }
 
-test "dyn(cache-3): 未 publish の processBlock は cache を汚さず、後続 publish で正しく再構築" {
+test "dyn(cache-3): unpublished processBlock does not dirty the cache; a later publish rebuilds correctly" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
     var buf: [128 * 2]f32 = undefined;
-    // 未 publish（empty view）→ ゼロ埋め・cache には触れない。
+    // Not yet published (empty view) → zero-fill; do not touch the cache.
     g.processBlock(&buf, 128, 2);
     try testing.expectEqual(@as(u64, 0), g.rebuildCount());
     for (buf) |s| try testing.expectEqual(@as(f32, 0), s);
 
-    // publish → 非無音・再構築 1 回（empty 経路が cache_valid を立てていないことの確認込み）。
+    // publish → non-silent; 1 rebuild (also confirms the empty path did not set cache_valid).
     const v = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
     const o = try g.add(.output, .{ .soft_clip = false });
     try g.connect(v, 0, o, 0);
@@ -1556,25 +1556,25 @@ test "dyn(cache-3): 未 publish の processBlock は cache を汚さず、後続
     try testing.expect(rmsEven(&buf, 2) > 0.0);
 }
 
-test "dyn(cache-5): master output 切替（gen 前進）で cached_out_sel が追従する" {
+test "dyn(cache-5): master-output switch (gen advance) makes cached_out_sel follow" {
     var g = try DynGraph.create(testing.allocator, 48000);
     defer g.destroy();
-    // A=VCO sine（非ゼロ源）、B=未接続 Mixer（入力なし＝出力 0）。両者とも全 active ノードとして
-    // 毎サンプル評価される（publish の topo は reachable 限定でない）。master をどちらから読むかで出力が変わる。
+    // A=VCO sine (non-zero source), B=unconnected Mixer (no inputs = output 0). Both are evaluated every sample
+    // as active nodes (publish topo is not reachability-limited). Which one master reads changes the output.
     const a = try g.add(.vco, .{ .osc = .{ .waveform = .sine }, .base_hz = 440 });
     const b = try g.add(.mixer, .{ .gain = 1.0 });
     g.setOutput(a);
     try g.publish();
     var buf: [256 * 2]f32 = undefined;
     g.processBlock(&buf, 256, 2);
-    try testing.expect(rmsEven(&buf, 2) > 0.0); // master=A → sine で非無音
+    try testing.expect(rmsEven(&buf, 2) > 0.0); // master=A → non-silent sine
     const rc1 = g.rebuildCount();
 
-    // master を B（未接続 Mixer=0）へ切替 → gen 前進で cached_out_sel が追従し出力が 0 になるはず。
-    // ProcNode 列だけ更新して out_sel の焼き直しを忘れる実装なら A の sine を読み続けて失敗する。
+    // Switch master to B (unconnected Mixer=0) → gen advances, cached_out_sel follows, output must become 0.
+    // An implementation that updates only the ProcNode sequence and forgets to rebake out_sel would keep reading A's sine and fail.
     g.setOutput(b);
     try g.publish();
     g.processBlock(&buf, 256, 2);
-    try testing.expectEqual(rc1 + 1, g.rebuildCount()); // gen 前進で再構築
-    for (buf) |s| try testing.expectEqual(@as(f32, 0), s); // master=B → 全サンプル 0
+    try testing.expectEqual(rc1 + 1, g.rebuildCount()); // Rebuild on gen advance
+    for (buf) |s| try testing.expectEqual(@as(f32, 0), s); // master=B → all samples 0
 }

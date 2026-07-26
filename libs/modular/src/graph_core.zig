@@ -1,65 +1,65 @@
-//! libs/modular: per-sample 評価コア（静的 Graph / 動的 DynGraph で共有）。
+//! libs/modular: per-sample evaluation core (shared by static Graph / dynamic DynGraph).
 //!
-//! signal のみに依存（modules も dsp も import しない＝generic）。RT 安全：process 経路に
-//! alloc/lock/IO/panic なし。静的・動的の二重実装を避けるための共有カーネル（TASK-40.6.1）。
+//! Depends only on signal (imports neither modules nor dsp = generic). RT-safe: the process path has
+//! no alloc/lock/IO/panic. Shared kernel that avoids a dual static/dynamic implementation.
 //!
-//! 呼び出し側は「処理順に並んだ ProcNode 列」と cur/prev signal バッファを渡す。トポロジ構築
-//! （topo sort / サイクル遅延辺 / 有効性検証）は全て呼び出し側（非 RT）が行い、ここには
-//! 「有効・非空・channels>=1」の前提で入る。
+//! Callers pass a ProcNode sequence already in processing order plus cur/prev signal buffers. Topology
+//! construction (topo sort / cycle-delay edges / validity checks) is entirely the caller's (non-RT);
+//! entry here assumes "valid, non-empty, channels>=1".
 
 const std = @import("std");
 const signal = @import("signal.zig");
 
 const Io = signal.Io;
 
-/// 処理順に並んだ 1 ノードの RT ローカル解決済み記述。
-/// vtable/ctx はポインタだが、これは publish 越し（POD GraphView）ではなく **RT ローカルの解決結果**
-/// （動的版は GraphView の handle からレジストリで解決してこの形に組む）。POD 制約は publish payload
-/// = GraphView にのみ課す。
+/// RT-locally resolved description of one node in processing order.
+/// vtable/ctx are pointers, but this is an **RT-local resolution result**, not a publish payload (POD GraphView)
+/// (the dynamic path resolves handles from the GraphView via the registry into this form). The POD constraint
+/// applies only to the publish payload = GraphView.
 pub const ProcNode = struct {
     vtable: *const signal.VTable,
     ctx: *anyopaque,
     n_in: u8,
     n_out: u8,
-    /// signal バッファ上でこの node の出力ポートが占める先頭 index。
+    /// Start index of this node's output ports in the signal buffer.
     out_base: u32,
-    /// 各入力ポートの接続元グローバル出力ポート id（未接続 = -1）。
+    /// Global output-port id feeding each input port (unconnected = -1).
     in_src: [signal.MAX_IN]i32 = [_]i32{-1} ** signal.MAX_IN,
-    /// 各入力ポートがサイクル遅延辺か（前サンプル値 prev を読む）。
+    /// Whether each input port is a cycle-delay edge (reads previous-sample prev).
     in_delayed: [signal.MAX_IN]bool = [_]bool{false} ** signal.MAX_IN,
 };
 
-/// master 出力ノードの出力ポート選択（out0=L, out1=R。n_out<2 は mono→L/R 複製）。
+/// Master-output port selection (out0=L, out1=R; n_out<2 duplicates mono→L/R).
 pub const OutputSel = struct { out_base: u32, n_out: u8 };
 
-/// 1 サンプル分の master 出力。
+/// One sample of master output.
 pub const StereoOut = struct { l: f32, r: f32 };
 
 // ============================================================================
-// TASK-40.8 D: ポート別ミニ oscilloscope 用の per-port tap（RT→GUI の覗き見型リング）。
+// Per-port tap for the mini oscilloscope (peek-style RT→GUI ring).
 //
-// generic なまま（signal のみ依存）保つため型だけここに置く。実体は DynGraph が inline 所有。
-// 契約:
-//   - RT（processBlockTapped）: latched_ports[s] のグローバル port id の出力値を TAP_DECIM 間引きで
-//     ring へ書く（.unordered store＝aligned f32 では plain store と同一機械語・fence/RMW 無し）。
-//     wpos は block 内 local カウンタで進め、block 末尾に slot あたり 1 回だけ release store（同期する
-//     atomic は毎サンプルでなくブロック末尾の wpos だけ）。
-//   - GUI: wpos を acquire load → 直近 min(wpos,TAP_RING) サンプルを読む「覗き見型」（consume しない）。
-//     acquire が RT の release と synchronizes-with するので、その wpos までの ring 書き込みは可視。
-//     読み中に RT が次 block で上書きする tail 部分の torn は表示 1 フレームのグリッチのみで許容（best-effort）。
-//   - port 差し替え時は dyn が local_wpos[s]=0 + wpos.store(0) にリセットし、旧 port のサンプルが
-//     新 port の窓へ混ざらないようにする（applied_seq gate と併せて AC#2/#4 の意味を保つ）。
+// Types live here so the core stays generic (signal-only). DynGraph owns the concrete inline storage.
+// Contract:
+//   - RT (processBlockTapped): write latched_ports[s]'s global port-id output into the ring decimated by TAP_DECIM
+//     (.unordered store = same machine code as a plain store on aligned f32; no fence/RMW).
+//     Advance wpos with a per-block local counter; one release store per slot at block end (the synchronising
+//     atomic is only that end-of-block wpos, not every sample).
+//   - GUI: acquire-load wpos → read the latest min(wpos,TAP_RING) samples as a "peek" (does not consume).
+//     acquire synchronizes-with the RT release, so ring writes up to that wpos are visible.
+//     A torn tail overwritten by the next RT block during a read is accepted as a one-frame display glitch (best-effort).
+//   - On port swap, dyn resets local_wpos[s]=0 + wpos.store(0) so old-port samples do not mix into the
+//     new port's window (together with the applied_seq gate).
 // ============================================================================
 pub const TAP_SLOTS: usize = 16;
 pub const TAP_RING: usize = 256;
-pub const TAP_DECIM: u32 = 4; // audio 波形用の細かい間引き（~21ms 窓）
-pub const TAP_DECIM_SLOW: u32 = 256; // cv/gate 用の粗い間引き（256 点で ~1.4s 窓。リズム/ゆっくり変調を見る）
+pub const TAP_DECIM: u32 = 4; // Fine decimation for audio waveforms (~21ms window)
+pub const TAP_DECIM_SLOW: u32 = 256; // Coarse decimation for cv/gate (256 points ≈ ~1.4s window; see rhythm / slow modulation)
 
-/// GUI→RT publish payload（POD）。ports[s] = グローバル出力 port id（handle*MAX_OUT+out。-1=空きスロット）。
-/// per-slot 間引き（decim）と reduce モード（peak）を GUI がポート種別に応じて設定する:
-///   - audio: decim 小・peak=false（末尾値＝波形。位相ロックで静止表示）
-///   - cv:    decim 大・peak=false（末尾値＝ゆっくりした変調を長い窓で）
-///   - gate:  decim 大・peak=true （窓内 max＝1 サンプル幅パルスを取りこぼさず縦バーで）
+/// GUI→RT publish payload (POD). ports[s] = global output port id (handle*MAX_OUT+out; -1 = empty slot).
+/// Per-slot decimation (decim) and reduce mode (peak) are set by the GUI from the port kind:
+///   - audio: small decim, peak=false (tail value = waveform; phase-locked for a still display)
+///   - cv:    large decim, peak=false (tail value = slow modulation over a long window)
+///   - gate:  large decim, peak=true  (window max = catch 1-sample pulses as vertical bars)
 pub const TapConfig = struct {
     seq: u32 = 0,
     ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS,
@@ -67,37 +67,37 @@ pub const TapConfig = struct {
     peak: [TAP_SLOTS]bool = [_]bool{false} ** TAP_SLOTS,
 };
 
-/// 1 slot 分の RT-write / GUI-read リング。
+/// One slot's RT-write / GUI-read ring.
 pub const TapSlot = struct {
     ring: [TAP_RING]f32 = [_]f32{0} ** TAP_RING,
-    /// 書き込んだ総サンプル数（単調増加）。RT が block 末尾に release store、GUI が acquire load。
+    /// Total samples written (monotonic). RT release-stores at block end; GUI acquire-loads.
     wpos: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
-/// RT が書き GUI が読む tap 領域（cache_line 分離の対象）。RT-private field（latched_ports/local_wpos/
-/// decim_counter）も RT のみが触るため同居可（GUI 書きとの false sharing ペアにならない）。
+/// Tap region written by RT and read by GUI (subject to cache_line isolation). RT-private fields
+/// (latched_ports/local_wpos/decim_counter) are RT-only so they may share the line (no GUI-write false-sharing pair).
 pub const TapState = struct {
-    /// RT が block 末尾に latch 済み config の seq を release store（GUI の描画 gate）。
+    /// RT release-stores the latched config's seq at block end (GUI draw gate).
     applied_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     slots: [TAP_SLOTS]TapSlot = [_]TapSlot{.{}} ** TAP_SLOTS,
-    // --- RT-private（GUI は読まない）---
-    /// RT が latch した現在の port 割当（config 差し替え検出用）。
+    // --- RT-private (GUI does not read) ---
+    /// Currently latched port assignment (detect config swaps).
     latched_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS,
-    /// slot ごとの latch 済み間引き率・reduce モード（config から焼く）。
+    /// Per-slot latched decimation rate and reduce mode (baked from config).
     latched_decim: [TAP_SLOTS]u32 = [_]u32{TAP_DECIM} ** TAP_SLOTS,
     latched_peak: [TAP_SLOTS]bool = [_]bool{false} ** TAP_SLOTS,
-    /// slot ごとの local 書き込みカウンタ（block 末尾に wpos へ publish）。
+    /// Per-slot local write counter (published to wpos at block end).
     local_wpos: [TAP_SLOTS]u32 = [_]u32{0} ** TAP_SLOTS,
-    /// slot ごとの間引きカウンタ（block を跨いで持続）。
+    /// Per-slot decimation counter (persists across blocks).
     cnt: [TAP_SLOTS]u32 = [_]u32{0} ** TAP_SLOTS,
-    /// slot ごとの peak 累積器（peak モードの窓内 max。書き込み後 0 リセット）。
+    /// Per-slot peak accumulator (window max in peak mode; reset to 0 after write).
     acc: [TAP_SLOTS]f32 = [_]f32{0} ** TAP_SLOTS,
-    /// 直近 block で latch した config の seq（block 末尾に applied_seq へ release store）。RT-private。
+    /// Seq of the config latched this block (release-stored to applied_seq at block end). RT-private.
     latched_seq: u32 = 0,
 };
 
-/// 1 サンプル評価。nodes は処理順。cur へ書き、ping-pong swap を cur/prev ポインタへ反映する。
-/// master 出力は swap 前に捕捉して返す（swap 後は prev 側へ移るため）。
+/// Evaluate one sample. nodes are in processing order. Write into cur; reflect the ping-pong swap into the cur/prev pointers.
+/// Capture and return the master output before the swap (after the swap it moves to the prev side).
 fn processSample(
     nodes: []const ProcNode,
     cur: *[]f32,
@@ -135,24 +135,24 @@ fn processSample(
         out.r = if (o.n_out >= 2) cur.*[o.out_base + 1] else cur.*[o.out_base];
     }
 
-    // ping-pong 入替: 次サンプルの prev = 今サンプルの cur（= 遅延辺が読む値）。
+    // Ping-pong swap: next sample's prev = this sample's cur (= the value delay edges read).
     const tmp = cur.*;
     cur.* = prev.*;
     prev.* = tmp;
     return out;
 }
 
-/// ブロック先頭で全ノードの係数を更新（tan / @exp 等の重い計算はここ＝ブロックレート）。
+/// Update every node's coefficients at the block head (heavy tan / @exp etc. live here = block-rate).
 fn updateAllParams(nodes: []const ProcNode, sample_rate: f32) void {
     for (nodes) |*node| node.vtable.updateParams(node.ctx, sample_rate);
 }
 
-/// interleaved 出力へ `frames` サンプル書き込む。nodes は処理順・有効前提（未 finalize / 無効 view /
-/// channels==0 は呼び出し側で弾き buf をゼロ埋め済みにしておく）。channels==1 は (L+R)/2、
-/// >=2 は L/R を書き残りを 0。RT callback から呼べる（alloc/lock/IO/panic なし）。
+/// Write `frames` samples into the interleaved output. nodes are ordered and assumed valid (unfinalised / invalid view /
+/// channels==0 are rejected by the caller with buf already zero-filled). channels==1 writes (L+R)/2;
+/// >=2 writes L/R and zeros the rest. Callable from an RT callback (no alloc/lock/IO/panic).
 ///
-/// tap 無し経路（tapped=false）は per-sample ループに分岐を 1 つも足さない（tap 分岐は comptime 消去）。
-/// → `processBlock`（graph.zig / dyn の tap 無し時が呼ぶ）はシグネチャ・機械語形状とも従来どおり不変。
+/// The untapped path (tapped=false) adds zero branches to the per-sample loop (the tap branch is comptime-eliminated).
+/// → `processBlock` (called by graph.zig / dyn when untapped) keeps the prior signature and machine-code shape.
 fn processBlockImpl(
     comptime tapped: bool,
     nodes: []const ProcNode,
@@ -182,36 +182,36 @@ fn processBlockImpl(
             while (c < ch) : (c += 1) buf[base + c] = 0;
         }
         if (tapped) {
-            // processSample が ping-pong swap 済みなので、当該サンプルの各ポート出力値は prev.* 側にある
-            // （swap 前の cur.* と同値。master 捕捉と同じ「唯一の場所」を swap 後の別名で読むだけ）。
-            // per-slot 間引き＋reduce: peak は窓内 max（gate の 1 サンプル幅パルスを取りこぼさない）、
-            // 非 peak は間引き境界の末尾値（波形）。O(TAP_SLOTS)/sample の load+max+比較のみ（alloc/lock/超越関数なし）。
+            // processSample has already ping-pong-swapped, so each port's output for this sample sits on prev.*
+            // (same values as pre-swap cur.*; reading the "one place" the master capture used, under its post-swap alias).
+            // Per-slot decimation + reduce: peak = window max (never miss a 1-sample gate pulse);
+            // non-peak = value at the decimation boundary (waveform). Only O(TAP_SLOTS)/sample load+max+compare (no alloc/lock/transcendentals).
             const sig = prev.*;
             var s: usize = 0;
             while (s < TAP_SLOTS) : (s += 1) {
                 const p = tap.latched_ports[s];
                 if (p < 0) continue;
                 const pu: usize = @intCast(p);
-                if (pu >= sig.len) continue; // 範囲 clamp（stale port でも panic させない）
+                if (pu >= sig.len) continue; // Range clamp (never panic on a stale port)
                 const v = sig[pu];
                 if (tap.latched_peak[s]) tap.acc[s] = @max(tap.acc[s], v);
                 tap.cnt[s] += 1;
-                const d = @max(@as(u32, 1), tap.latched_decim[s]); // decim=0 の暴走防止
+                const d = @max(@as(u32, 1), tap.latched_decim[s]); // Stop a runaway when decim=0
                 if (tap.cnt[s] >= d) {
                     tap.cnt[s] = 0;
                     const out_v = if (tap.latched_peak[s]) tap.acc[s] else v;
-                    // .unordered = torn 無し・races OK の最弱 atomic。naturally-aligned f32 では plain store と
-                    // 同一機械語（fence/RMW 無し）＝RT 追加コスト無し。GUI 側 tapWindow の unordered load と対で
-                    // 「読み中に次 block が上書きする tail」を data race UB でなく best-effort torn に落とす。
+                    // .unordered = weakest atomic (no torn requirement; races OK). On naturally-aligned f32 it is the same
+                    // machine code as a plain store (no fence/RMW) = zero RT overhead. Paired with GUI tapWindow's unordered load,
+                    // a "tail overwritten by the next block during a read" becomes best-effort torn instead of data-race UB.
                     @atomicStore(f32, &tap.slots[s].ring[tap.local_wpos[s] % TAP_RING], out_v, .unordered);
                     tap.local_wpos[s] += 1;
-                    if (tap.latched_peak[s]) tap.acc[s] = 0; // 窓リセット
+                    if (tap.latched_peak[s]) tap.acc[s] = 0; // Reset the window
                 }
             }
         }
     }
     if (tapped) {
-        // block 末尾に slot あたり 1 回だけ release store（毎サンプル atomic を避ける）。
+        // One release store per slot at block end (avoid a per-sample atomic).
         var s: usize = 0;
         while (s < TAP_SLOTS) : (s += 1) tap.slots[s].wpos.store(tap.local_wpos[s], .release);
     }
@@ -230,8 +230,8 @@ pub fn processBlock(
     processBlockImpl(false, nodes, output, sample_rate, cur, prev, buf, frames, channels, {});
 }
 
-/// tap 有り版（tap slot が 1 つでも active な block で dyn が呼ぶ）。出力 buf は tap 無し版と bit 一致
-/// （tap は prev.* を読むだけで buf/DSP 状態に非侵襲）。
+/// Tapped variant (dyn calls this on blocks with at least one active tap slot). Output buf is bit-identical to the untapped path
+/// (tap only reads prev.*; non-invasive to buf/DSP state).
 pub fn processBlockTapped(
     nodes: []const ProcNode,
     output: ?OutputSel,
@@ -247,12 +247,12 @@ pub fn processBlockTapped(
 }
 
 // ============================================================================
-// tests（構造の健全性のみ。実挙動は facade（graph.zig / dyn.zig）のテストで担保）
+// tests (structural sanity only; behaviour is covered by the facade tests in graph.zig / dyn.zig)
 // ============================================================================
 const testing = std.testing;
 
-test "graph_core: ProcNode / GraphView payload はポインタ以外 POD（index/handle 参照）" {
-    // ProcNode は RT ローカル解決済みなので vtable/ctx ポインタを含む（これは publish 越しでない）。
+test "graph_core: ProcNode / GraphView payload is POD aside from pointers (index/handle refs)" {
+    // ProcNode is RT-locally resolved so it contains vtable/ctx pointers (this is not across a publish).
     try testing.expect(@sizeOf(OutputSel) > 0);
     try testing.expect(@sizeOf(ProcNode) > 0);
 }

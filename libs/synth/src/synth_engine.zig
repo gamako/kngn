@@ -1,8 +1,8 @@
-//! Synth: NoteQueue(GUI→Audio) + Patch(double-buffer) + VoicePool を束ねる本体。
+//! Synth: bundles NoteQueue(GUI→Audio) + Patch(Mailbox) + VoicePool.
 //!
-//! producer(GUIスレッド): sendNoteOn/Off, panicAllNotesOff, publishPatch
-//! consumer(RTスレッド): render(buf, frames, channels) — note を反映しボイスを合成・ミックス。
-//! patch はブロック先頭で 1 回だけ latch する（Mailbox.acquire。ブロック内不整合の排除。TASK-56）。
+//! producer (GUI thread): sendNoteOn/Off, panicAllNotesOff, publishPatch
+//! consumer (RT thread): render(buf, frames, channels) — apply notes and synthesise/mix voices.
+//! The patch is latched once at the block head (Mailbox.acquire; eliminates mid-block inconsistency).
 
 const std = @import("std");
 const dsp = @import("dsp");
@@ -15,19 +15,19 @@ pub const Patch = voice.Patch;
 pub fn Synth(comptime max_voices: usize) type {
     return struct {
         const Self = @This();
-        const Queue = ring.NoteQueue(256, 16); // 256 イベント、note_off に 16 枠予約
+        const Queue = ring.NoteQueue(256, 16); // 256 events; reserve 16 slots for note_off
 
         pool: voice.VoicePool(max_voices) = .{},
         queue: Queue = .{},
         patch_db: params.Mailbox(Patch),
         sample_rate: f32,
         panic_seen: u32 = 0,
-        // パラメータスムージング（急変クリック回避）: gain はブロック内線形ランプ、cutoff は一次平滑。
+        // Parameter smoothing (avoid clicks on abrupt changes): gain is a linear ramp inside the block; cutoff is one-pole smoothed.
         smoothed_gain: f32,
         smoothed_cutoff: f32,
 
-        const cutoff_smooth: f32 = 0.3; // 一次平滑係数（0..1、大きいほど速く追従）
-        /// voice-major 合成のチャンクサイズ（stack アキュムレータの固定長。512B）。
+        const cutoff_smooth: f32 = 0.3; // One-pole smoothing coefficient (0..1; larger follows faster)
+        /// Chunk size for voice-major synthesis (fixed-length stack accumulator; 512B).
         const render_chunk: u32 = 128;
 
         pub fn init(sample_rate: f32, initial_patch: Patch) Self {
@@ -39,7 +39,7 @@ pub fn Synth(comptime max_voices: usize) type {
             };
         }
 
-        // ---- producer (GUI / 入力スレッド) ----
+        // ---- producer (GUI / input thread) ----
 
         pub fn sendNoteOn(self: *Self, note: u8, velocity: f32) bool {
             return self.queue.sendNoteOn(note, velocity);
@@ -54,34 +54,34 @@ pub fn Synth(comptime max_voices: usize) type {
             self.patch_db.publish(patch);
         }
 
-        // ---- consumer (Audio RT スレッド) ----
+        // ---- consumer (Audio RT thread) ----
 
-        /// note イベント反映 → patch 読み出し → ボイス合成 → interleaved 出力へ書き込み。
-        /// RT スレッドで呼ばれる。malloc/lock/IO しない。
+        /// Apply note events → read the patch → synthesise voices → write interleaved output.
+        /// Called on the RT thread. No malloc/lock/IO.
         pub fn render(self: *Self, buf: []f32, frames: u32, channels: u32) void {
-            // 0. patch をブロック先頭で 1 回だけ latch（drain 中の note_on も含め
-            //    ブロック内は同一 patch を使う = ブロック内不整合の排除。TASK-56）
+            // 0. Latch the patch once at the block head (including note_ons drained in this block
+            //    so the whole block uses one patch = no mid-block inconsistency)
             const patch = self.patch_db.acquire().*;
 
-            // 1. note イベントを drain
+            // 1. Drain note events
             while (self.queue.pop()) |ev| {
                 switch (ev) {
                     .note_on => |n| self.pool.noteOn(n.note, n.velocity, patch, self.sample_rate),
                     .note_off => |n| self.pool.noteOff(n.note),
                 }
             }
-            // 2. パニック（全ノートオフ）
+            // 2. Panic (all notes off)
             if (self.queue.takePanic(&self.panic_seen)) self.pool.allNotesOff();
 
-            // 3. cutoff は一次平滑してブロック先頭で filter 反映。
+            // 3. One-pole-smooth cutoff and apply the filter at the block head.
             self.smoothed_cutoff += (patch.cutoff - self.smoothed_cutoff) * cutoff_smooth;
             var block_patch = patch;
             block_patch.cutoff = self.smoothed_cutoff;
             self.pool.prepareBlock(block_patch);
 
-            // 4. voice-major 合成（TASK-57）: CHUNK 毎に stack アキュムレータへ voice 順に加算し、
-            //    gain ランプ（global frame index 基準 = 旧 sample-major と同一の t）を掛けて
-            //    interleaved 書き込み。RT 経路: acc は固定長 stack（512B）で確保なし。
+            // 4. Voice-major synthesis: per CHUNK, accumulate voices in order into a stack accumulator,
+            //    apply the gain ramp (global frame index = same t as the former sample-major path), then
+            //    write interleaved. RT path: acc is a fixed-length stack (512B); no heap allocation.
             const g0 = self.smoothed_gain;
             const g1 = patch.gain;
             const inv: f32 = if (frames > 0) 1.0 / @as(f32, @floatFromInt(frames)) else 0;
@@ -126,23 +126,23 @@ test "Synth.render: note_on produces non-silent output, note_off + release retur
 
     var buf: [128]f32 = undefined; // 64 frames stereo
 
-    // ノート前: 無音
+    // Before the note: silence
     synth.render(&buf, 64, 2);
     var energy: f32 = 0;
     for (buf) |s| energy += @abs(s);
     try testing.expectEqual(@as(f32, 0.0), energy);
 
-    // note_on → 音が出る
+    // note_on → sound appears
     try testing.expect(synth.sendNoteOn(69, 1.0)); // A4
     synth.render(&buf, 64, 2);
     energy = 0;
     for (buf) |s| energy += @abs(s);
     try testing.expect(energy > 0.0);
 
-    // L/R が同じ（mono → interleaved 複製）
+    // L/R identical (mono → interleaved duplicate)
     try testing.expectEqual(buf[0], buf[1]);
 
-    // note_off → release 後はボイス回収され無音へ
+    // note_off → after release the voice is reclaimed and returns to silence
     try testing.expect(synth.sendNoteOff(69));
     var iter: u32 = 0;
     while (iter < 20) : (iter += 1) synth.render(&buf, 64, 2);
@@ -158,7 +158,7 @@ test "Synth.render: panic (all notes off) silences active voices" {
     synth.render(&buf, 32, 2);
     try testing.expectEqual(@as(usize, 3), synth.pool.activeCount());
 
-    // パニック → 全ボイス release（attack/release が長くてもいずれ回収）
+    // Panic → all voices release (reclaimed eventually even with long attack/release)
     synth.panicAllNotesOff();
     synth.render(&buf, 32, 2);
     for (synth.pool.voices) |v| {
@@ -168,15 +168,15 @@ test "Synth.render: panic (all notes off) silences active voices" {
 
 test "Synth: cutoff/gain are smoothed (no instant jump on patch change)" {
     var synth = Synth(4).init(48000, .{ .cutoff = 1000, .gain = 0.0, .sustain = 1.0, .attack = 0.0 });
-    // 目標を大きく変える
+    // Change the target sharply
     synth.publishPatch(.{ .cutoff = 5000, .gain = 1.0, .sustain = 1.0, .attack = 0.0 });
     var buf: [64]f32 = undefined;
     synth.render(&buf, 32, 2);
-    // cutoff は一次平滑で 1 ブロックでは目標へ到達しない（1000 と 5000 の中間）
+    // cutoff does not reach the target in one block under one-pole smoothing (between 1000 and 5000)
     try testing.expect(synth.smoothed_cutoff > 1000.0 and synth.smoothed_cutoff < 5000.0);
-    // gain も 1 ブロック後に目標へ（ランプ後）
+    // gain also reaches the target after one block (after the ramp)
     try testing.expectApproxEqAbs(@as(f32, 1.0), synth.smoothed_gain, 1e-6);
-    // 数ブロックで cutoff は目標へ収束
+    // After a few blocks cutoff converges to the target
     var i: u32 = 0;
     while (i < 50) : (i += 1) synth.render(&buf, 32, 2);
     try testing.expectApproxEqAbs(@as(f32, 5000.0), synth.smoothed_cutoff, 1.0);
@@ -188,20 +188,20 @@ test "Synth: publishPatch changes waveform used by subsequent notes" {
     var buf: [32]f32 = undefined;
     _ = synth.sendNoteOn(69, 1.0);
     synth.render(&buf, 16, 2);
-    // square + sustain1.0 なので各サンプルは概ね ±gain 付近（正弦の中間値より大きい）
+    // square + sustain1.0 so each sample sits near ±gain (larger than a sine's mid values)
     var peak: f32 = 0;
     for (buf) |s| peak = @max(peak, @abs(s));
     try testing.expect(peak > 0.0);
-    // 適用された waveform を確認
+    // Confirm the applied waveform
     for (synth.pool.voices) |v| {
         if (v.active) try testing.expectEqual(dsp.Waveform.square, v.oscs[0].waveform);
     }
 }
 
-test "Synth.render: voice-major は sample-major 参照と IEEE == で全サンプル一致（TASK-57）" {
-    // 同一 patch / note 列の 2 台を用意し、新 render()（voice-major）と
-    // 参照実装（pool.renderSample を毎サンプル + 同一 gain ランプ）を比較する。
-    // 加算順（voice index 順）が同一なので IEEE 数値等値（== / -0.0 と +0.0 は同一視）で一致する。
+test "Synth.render: voice-major matches sample-major reference on every sample under IEEE ==" {
+    // Prepare two engines with the same patch / note sequence; compare the new render() (voice-major) against
+    // a reference (pool.renderSample every sample + the same gain ramp).
+    // Addition order (voice-index order) matches, so they agree under IEEE numeric equality (==; -0.0 and +0.0 treated equal).
     const patch = Patch{
         .attack = 0.001,
         .sustain = 0.8,
@@ -209,7 +209,7 @@ test "Synth.render: voice-major は sample-major 参照と IEEE == で全サン�
         .cutoff = 2000,
         .resonance = 1.2,
         .gain = 0.5,
-        .vibrato_depth = 0.3, // control tick 経路も通す
+        .vibrato_depth = 0.3, // Also exercise the control-tick path
         .filter_env_amount = 2.0,
         .filter_sustain = 0.5,
         .unison = 3,
@@ -226,7 +226,7 @@ test "Synth.render: voice-major は sample-major 参照と IEEE == で全サン�
     var buf_b: [2 * 200]f32 = undefined;
     var block: u32 = 0;
     while (block < 6) : (block += 1) {
-        // 複数ブロック + 奇数 frame 数（chunk 跨ぎ・tail）+ note off / 回収を跨ぐ
+        // Multiple blocks + odd frame counts (chunk straddles / tails) + note off / reclaim straddles
         const frames: u32 = if (block % 2 == 0) 200 else 137;
         a.render(buf_a[0 .. frames * 2], frames, 2);
         renderSampleMajorRef(&b, buf_b[0 .. frames * 2], frames, 2);
@@ -240,9 +240,9 @@ test "Synth.render: voice-major は sample-major 参照と IEEE == で全サン�
     }
 }
 
-/// 旧 sample-major と同じ手順の参照実装（render と同一の drain/patch/gain 処理）。
+/// Reference implementing the former sample-major procedure (same drain/patch/gain handling as render).
 fn renderSampleMajorRef(self: *Synth(8), buf: []f32, frames: u32, channels: u32) void {
-    const patch = self.patch_db.acquire().*; // render と同じブロック先頭 latch（TASK-56）
+    const patch = self.patch_db.acquire().*; // Same block-head latch as render
     while (self.queue.pop()) |ev| {
         switch (ev) {
             .note_on => |n| self.pool.noteOn(n.note, n.velocity, patch, self.sample_rate),
@@ -270,7 +270,7 @@ fn renderSampleMajorRef(self: *Synth(8), buf: []f32, frames: u32, channels: u32)
     self.smoothed_gain = g1;
 }
 
-test "Voice: 超越関数は control-rate（ctrl_ticks 上限 + sustain 後は filter_recalcs 停止）（TASK-57）" {
+test "Voice: transcendentals are control-rate (ctrl_ticks upper bound + filter_recalcs stop after sustain)" {
     const voice_mod = @import("voice.zig");
     var synth = Synth(4).init(48000, .{
         .attack = 0.001,
@@ -286,7 +286,7 @@ test "Voice: 超越関数は control-rate（ctrl_ticks 上限 + sustain 後は f
     _ = synth.sendNoteOn(60, 1.0);
     var buf: [256 * 2]f32 = undefined;
 
-    // N サンプル render し、tick 回数が ceil(N/16) + ブロック数（prepareBlock リセット分）以下であること
+    // Render N samples; tick count must be <= ceil(N/16) + block count (prepareBlock resets)
     const blocks: u32 = 20;
     const frames: u32 = 256;
     var bi: u32 = 0;
@@ -298,12 +298,12 @@ test "Voice: 超越関数は control-rate（ctrl_ticks 上限 + sustain 後は f
     try testing.expect(v.ctrl_ticks <= max_ticks);
     try testing.expect(v.ctrl_ticks > 0);
 
-    // filter env が sustain（値一定）に達した後は dirty-gate により setParams が走らない
+    // After filter env reaches sustain (constant value), dirty-gate stops further setParams
     const recalcs_settled = v.filter_recalcs;
     var extra: u32 = 0;
     while (extra < 10) : (extra += 1) synth.render(&buf, frames, 2);
     try testing.expectEqual(recalcs_settled, v.filter_recalcs);
-    // 音は出ている（間引きで無音化していない）
+    // Sound is present (decimation has not silenced it)
     var energy: f32 = 0;
     for (buf) |smp| energy += @abs(smp);
     try testing.expect(energy > 0.0);

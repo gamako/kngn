@@ -1,11 +1,11 @@
-//! libs/synth: シンセサイザーの再利用ライブラリ（platform / GUI 非依存の純 Zig）。
+//! libs/synth: reusable synthesiser library (pure Zig; no platform / GUI dependency).
 //!
-//! 現状（TASK-27.2）: GUI(メインスレッド) ⇔ Audio(RTスレッド) のロックフリー受け渡し機構。
-//! - `NoteQueue` / `SpscRing`: GUI→Audio のノートイベント（note_off / パニックは落とさない）
-//! - `AtomicF32` / `Mailbox`: GUI→Audio の連続パラメータ / patch（triple-buffer）
-//! - `SampleTap`: Audio→GUI の出力タップ（スペクトログラム用、drop 可）
+//! Lock-free hand-off between GUI (main thread) and Audio (RT thread):
+//! - `NoteQueue` / `SpscRing`: GUI→Audio note events (note_off / panic are never dropped)
+//! - `AtomicF32` / `Mailbox`: GUI→Audio continuous parameters / patches (triple-buffer)
+//! - `SampleTap`: Audio→GUI output tap (for spectrogram; may drop)
 //!
-//! TASK-27.4: Voice / VoicePool / Patch / Synth.render（dsp に依存）。
+//! Voice / VoicePool / Patch / Synth.render (depends on dsp).
 
 const ring = @import("ring.zig");
 const params = @import("params.zig");
@@ -31,7 +31,7 @@ pub const Synth = synth_engine.Synth;
 pub const MasterEffects = effects.MasterEffects;
 
 test {
-    // 参照する全ファイルの test をまとめて回す。
+    // Run tests from every referenced file together.
     _ = ring;
     _ = params;
     _ = tap;

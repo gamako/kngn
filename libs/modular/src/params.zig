@@ -1,7 +1,7 @@
-//! UI 非依存の module parameter descriptor と live field binding。
+//! UI-independent module parameter descriptors and live field bindings.
 //!
-//! このファイルは control/event 側からだけ呼ばれる。descriptor は comptime で焼かれた
-//! 静的データで、DynGraph の processBlock / per-sample 経路には入らない。
+//! This file is called only from the control/event side. Descriptors are comptime-baked
+//! static data and do not enter DynGraph's processBlock / per-sample path.
 
 const std = @import("std");
 const dsp = @import("dsp");
@@ -37,9 +37,9 @@ pub const ParamValue = union(enum) {
     choice: usize,
 };
 
-/// GUI が表示する parameter の best-effort snapshot。
-/// `field` は descriptor の source field、`instant` は runtime modulation の直近値。
-/// RT との同期は追加せず、既存 module field の read-only 値だけを返す。
+/// Best-effort snapshot of a parameter for the GUI to display.
+/// `field` is the descriptor's source field; `instant` is the latest runtime-modulation value.
+/// Adds no synchronisation with the RT side; returns only read-only values of existing module fields.
 pub const ParamSnapshot = struct {
     field: ParamValue,
     instant: ?ParamValue = null,
@@ -59,7 +59,7 @@ const Binding = struct {
     desc: ParamDesc,
     get: *const fn (*const anyopaque) ParamValue,
     set: *const fn (*anyopaque, ParamValue) Error!void,
-    /// set と同一の受理判定（instance 不要）。set は必ずこれを呼んでから書く。
+    /// Same acceptance check as set (no instance needed). set must call this before writing.
     validate: *const fn (ParamValue) Error!void,
 };
 
@@ -324,7 +324,7 @@ fn boolBinding(comptime T: type, comptime field_name: []const u8, comptime desc:
     return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
-/// `[N]f32` 配列フィールドの index 番目へスカラー binding。
+/// Scalar binding to index i of an `[N]f32` array field.
 fn arrayScalarBinding(comptime T: type, comptime field_name: []const u8, comptime index: usize, comptime desc: ParamDesc) Binding {
     comptime if (!@hasField(T, field_name)) @compileError("parameter field does not exist: " ++ field_name);
     const Arr = @TypeOf(@field(T{}, field_name));
@@ -364,7 +364,7 @@ fn arrayScalarBinding(comptime T: type, comptime field_name: []const u8, comptim
     return .{ .desc = desc, .get = Impl.get, .set = Impl.set, .validate = Impl.validate };
 }
 
-/// `[N]bool` 配列フィールドの index 番目へ off/on choice binding。
+/// Off/on choice binding to index i of an `[N]bool` array field.
 fn arrayBoolBinding(comptime T: type, comptime field_name: []const u8, comptime index: usize, comptime desc: ParamDesc) Binding {
     comptime if (!@hasField(T, field_name)) @compileError("parameter field does not exist: " ++ field_name);
     const Arr = @TypeOf(@field(T{}, field_name));
@@ -748,8 +748,8 @@ fn runtimeInstant(graph: *const dyn.DynGraph, kind: dyn.ModuleKind, h: dyn.Handl
     };
 }
 
-/// `getParam()` の field 値に、既存 runtime modulation field の instant を添える。
-/// GUI/frame-rate の best-effort read 専用で、RT callback からは呼ばない。
+/// Attach the latest runtime-modulation instant to `getParam()`'s field value.
+/// GUI/frame-rate best-effort read only; do not call from an RT callback.
 pub fn getParamSnapshot(graph: *const dyn.DynGraph, h: dyn.Handle, name: []const u8) Error!ParamSnapshot {
     try checkedHandle(graph, h);
     const kind = graph.kindOf(h) orelse return Error.InactiveHandle;
@@ -758,9 +758,9 @@ pub fn getParamSnapshot(graph: *const dyn.DynGraph, h: dyn.Handle, name: []const
     return .{ .field = field, .instant = instant, .has_instant = instant != null };
 }
 
-/// Control/event 側専用。active module の non-atomic source field を直接更新するため、
-/// RT が同時に読む状態を別スレッドから直接書き換えず、app 側の既存 Mailbox/atomic/control-rate
-/// 経路で呼び出し側が同期を担保する。ここでは publish/lock/alloc を追加しない。
+/// Control/event side only. Because this updates an active module's non-atomic source field directly,
+/// do not rewrite RT-read state from another thread here — the caller must synchronise via the app's
+/// existing Mailbox/atomic/control-rate path. This path adds no publish/lock/alloc.
 pub fn setParam(graph: *dyn.DynGraph, h: dyn.Handle, name: []const u8, value: ParamValue) Error!void {
     try checkedHandle(graph, h);
     const kind = graph.kindOf(h) orelse return Error.InactiveHandle;
@@ -776,8 +776,8 @@ fn validateForKind(comptime k: dyn.ModuleKind, name: []const u8, value: ParamVal
     return Error.UnknownParam;
 }
 
-/// 実 module インスタンス無しで `setParam` と同一の受理判定を行う（NPRM clearGraph 前検証用）。
-/// WrongValueKind / OutOfRange（非有限・range 外・整数バックの非整数）/ ChoiceIndexOutOfRange / UnknownParam。
+/// Run the same acceptance check as `setParam` without a live module instance (for NPRM clearGraph pre-validation).
+/// WrongValueKind / OutOfRange (non-finite, out of range, non-integer for integer-backed) / ChoiceIndexOutOfRange / UnknownParam.
 pub fn validateParam(kind: dyn.ModuleKind, name: []const u8, value: ParamValue) Error!void {
     return switch (kind) {
         inline else => |comptime_kind| validateForKind(comptime_kind, name, value),
@@ -906,8 +906,8 @@ test "params: invalid handles, names, value kinds, and ranges are explicit error
     const h = try graph.add(.vca, .{});
     const logic = try graph.add(.logic, .{});
 
-    // -Dmax-modules で MAX_MODULES が変わっても常に範囲外であることを保証する（TASK-146: 固定値 100 は
-    // N>100 で有効 handle 範囲に入ってしまい error.InactiveHandle に化けていた）。
+    // Guarantee the handle stays out of range even when MAX_MODULES changes via -Dmax-modules (a fixed 100
+    // would enter the valid handle range once N>100 and masquerade as error.InactiveHandle).
     try std.testing.expectError(Error.InvalidHandle, getParam(graph, @intCast(dyn.MAX_MODULES), "gain"));
     try std.testing.expectError(Error.InactiveHandle, getParam(graph, 2, "gain"));
     try std.testing.expectError(Error.UnknownParam, getParam(graph, h, "missing"));
@@ -1089,12 +1089,12 @@ test "params: validateParam agrees with setParam for all kinds/descriptors" {
                 },
             }
         }
-        // 次 kind 用に slot を空ける（pool 枯渇回避）
+        // Free the slot for the next kind (avoid pool exhaustion)
         graph.removeModule(h);
     }
-    // 組合せ数の下限（descriptor 増減で変わりうるが 0 ではないこと）
+    // Lower bound on combination count (may change as descriptors grow/shrink, but must not be 0)
     try std.testing.expect(comparisons > 100);
-    // テスト報告用に件数を固定ログ（失敗時の再現用）
+    // Fixed log of the count for test reports (repro on failure)
     std.debug.print("validateParam/setParam comparisons={d}\n", .{comparisons});
 }
 

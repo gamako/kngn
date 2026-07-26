@@ -1,13 +1,13 @@
-//! SPSC ロックフリーリングバッファと、GUI→Audio のノートイベントキュー。
+//! SPSC lock-free ring buffer and the GUI→Audio note-event queue.
 //!
-//! スレッドモデル: producer = メインスレッド(GUI/入力)、consumer = オーディオ RT スレッド。
-//! RT スレッド側では lock/malloc/IO をしない（pop はインデックス演算のみ）。
+//! Thread model: producer = main thread (GUI/input), consumer = audio RT thread.
+//! The RT thread does no lock/malloc/IO (pop is index arithmetic only).
 
 const std = @import("std");
 const AtomicUsize = std.atomic.Value(usize);
 
-/// 単一 producer / 単一 consumer のロックフリーリングバッファ。
-/// `capacity` は 2 の冪。head/tail はラップするモノトニックカウンタ（最大 `capacity` 個保持）。
+/// Single-producer / single-consumer lock-free ring buffer.
+/// `capacity` is a power of two. head/tail are wrapping monotonic counters (hold at most `capacity` items).
 pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
     if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be a power of two");
     return struct {
@@ -15,21 +15,21 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
         const mask = capacity - 1;
 
         buffer: [capacity]T = undefined,
-        // head(producer 書き) / tail(consumer 書き) は別キャッシュラインに分離（false sharing 回避。TASK-56）
-        head: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // producer が進める
-        tail: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // consumer が進める
+        // Separate head (producer writes) / tail (consumer writes) onto different cache lines (avoid false sharing)
+        head: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // advanced by the producer
+        tail: AtomicUsize align(std.atomic.cache_line) = AtomicUsize.init(0), // advanced by the consumer
 
         pub fn capacityCount() usize {
             return capacity;
         }
 
-        /// producer: 空きがあれば push、満杯なら false。
+        /// producer: push if there is room; return false when full.
         pub fn push(self: *Self, item: T) bool {
             return self.pushReserve(item, 0);
         }
 
-        /// producer: 空き容量が `reserve` を超えるときだけ push する。
-        /// `reserve` 枠を他用途（例: note_off）に残したい場合に使う。
+        /// producer: push only when free capacity exceeds `reserve`.
+        /// Use when leaving a `reserve` window for other uses (e.g. note_off).
         pub fn pushReserve(self: *Self, item: T, reserve: usize) bool {
             const head = self.head.load(.monotonic);
             const tail = self.tail.load(.acquire);
@@ -40,7 +40,7 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
             return true;
         }
 
-        /// consumer: 1 件取り出す。空なら null。
+        /// consumer: take one item. null if empty.
         pub fn pop(self: *Self) ?T {
             const tail = self.tail.load(.monotonic);
             const head = self.head.load(.acquire);
@@ -52,38 +52,38 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
     };
 }
 
-/// ノートイベント（GUI→Audio）。
+/// Note event (GUI→Audio).
 pub const NoteEvent = union(enum) {
     note_on: struct { note: u8, velocity: f32 },
     note_off: struct { note: u8 },
 };
 
-/// GUI→Audio のノートイベントキュー。
-/// - `note_on`: 満杯間際（`off_reserve` 枠）では落とす（間引く）。
-/// - `note_off`: `off_reserve` 枠を使ってでも極力入れる。
-/// - パニック（全ノートオフ）: リングの空き状況と無関係な atomic カウンタで **決して落とさない**。
+/// GUI→Audio note-event queue.
+/// - `note_on`: drop (thin) when nearly full (inside the `off_reserve` window).
+/// - `note_off`: try hard to enqueue even by using the `off_reserve` window.
+/// - Panic (all notes off): an atomic counter independent of ring free space — **never dropped**.
 pub fn NoteQueue(comptime capacity: usize, comptime off_reserve: usize) type {
     return struct {
         const Self = @This();
         const Ring = SpscRing(NoteEvent, capacity);
 
         ring: Ring = .{},
-        // ring.tail（consumer 書き）と同一ライン化しないよう分離（producer 書き・consumer 読み。TASK-56）
+        // Keep off the same line as ring.tail (consumer writes) (producer writes / consumer reads)
         panic_gen: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
 
-        // ---- producer (GUI / 入力) ----
+        // ---- producer (GUI / input) ----
 
-        /// note_on を送る。満杯間際なら落とす（false）。
+        /// Send note_on. Drop (return false) when nearly full.
         pub fn sendNoteOn(self: *Self, note: u8, velocity: f32) bool {
             return self.ring.pushReserve(.{ .note_on = .{ .note = note, .velocity = velocity } }, off_reserve);
         }
 
-        /// note_off を送る。reserve 枠を使えるので極力落とさない。
+        /// Send note_off. Can use the reserve window, so drops are rare.
         pub fn sendNoteOff(self: *Self, note: u8) bool {
             return self.ring.push(.{ .note_off = .{ .note = note } });
         }
 
-        /// 全ノートオフ（パニック）。リング状態に依存せず必ず伝わる。
+        /// All notes off (panic). Always delivered, independent of ring state.
         pub fn panicAllNotesOff(self: *Self) void {
             _ = self.panic_gen.fetchAdd(1, .release);
         }
@@ -94,7 +94,7 @@ pub fn NoteQueue(comptime capacity: usize, comptime off_reserve: usize) type {
             return self.ring.pop();
         }
 
-        /// 前回確認時から新しいパニックが発行されていれば true（`last_seen` を更新して消費）。
+        /// True if a newer panic was issued since last check (consumes by updating `last_seen`).
         pub fn takePanic(self: *Self, last_seen: *u32) bool {
             const cur = self.panic_gen.load(.acquire);
             if (cur != last_seen.*) {
@@ -125,10 +125,10 @@ test "SpscRing: full returns false, capacity == capacity items" {
     try testing.expect(ring.push(1));
     try testing.expect(ring.push(2));
     try testing.expect(ring.push(3));
-    try testing.expect(ring.push(4)); // 4 個まで保持できる
-    try testing.expect(!ring.push(5)); // 満杯
+    try testing.expect(ring.push(4)); // Holds up to 4
+    try testing.expect(!ring.push(5)); // Full
     try testing.expectEqual(@as(?u32, 1), ring.pop());
-    try testing.expect(ring.push(5)); // 1 つ空いた
+    try testing.expect(ring.push(5)); // One slot freed
 }
 
 test "SpscRing: wrap-around" {
@@ -141,31 +141,31 @@ test "SpscRing: wrap-around" {
 }
 
 test "NoteQueue: note_off survives when note_on is throttled (reserve)" {
-    // capacity 4, off_reserve 2 → note_on は used+2>=4 すなわち used>=2 で落ちる。
+    // capacity 4, off_reserve 2 → note_on drops when used+2>=4 i.e. used>=2.
     var q = NoteQueue(4, 2){};
     try testing.expect(q.sendNoteOn(60, 1.0)); // used 0->1
     try testing.expect(q.sendNoteOn(61, 1.0)); // used 1->2
-    try testing.expect(!q.sendNoteOn(62, 1.0)); // used 2, reserve で拒否
-    // note_off は reserve 枠を使えるので入る
+    try testing.expect(!q.sendNoteOn(62, 1.0)); // used 2, refused by reserve
+    // note_off can use the reserve window so it gets in
     try testing.expect(q.sendNoteOff(60)); // used 2->3
-    try testing.expect(q.sendNoteOff(61)); // used 3->4(満杯)
-    try testing.expect(!q.sendNoteOff(62)); // 完全に満杯なら入らない
+    try testing.expect(q.sendNoteOff(61)); // used 3->4 (full)
+    try testing.expect(!q.sendNoteOff(62)); // Completely full: does not get in
 }
 
 test "NoteQueue: panic is never dropped even when ring is full" {
     var q = NoteQueue(2, 0){};
     try testing.expect(q.sendNoteOn(60, 1.0));
-    try testing.expect(q.sendNoteOn(61, 1.0)); // 満杯
+    try testing.expect(q.sendNoteOn(61, 1.0)); // Full
     try testing.expect(!q.sendNoteOn(62, 1.0));
-    // リング満杯でもパニックは伝わる
+    // Panic still delivers even when the ring is full
     var seen: u32 = 0;
     try testing.expect(!q.takePanic(&seen));
     q.panicAllNotesOff();
     try testing.expect(q.takePanic(&seen));
-    try testing.expect(!q.takePanic(&seen)); // 二度は消費しない
+    try testing.expect(!q.takePanic(&seen)); // Not consumed twice
 }
 
-test "SpscRing/NoteQueue: producer/consumer atomic が別キャッシュライン（レイアウト固定）" {
+test "SpscRing/NoteQueue: producer/consumer atomics are on separate cache lines (layout fixed)" {
     const cl = std.atomic.cache_line;
     const Ring = SpscRing(u32, 8);
     try testing.expect(@alignOf(Ring) >= cl);
@@ -181,5 +181,5 @@ test "SpscRing/NoteQueue: producer/consumer atomic が別キャッシュライ�
     const tail_off = @offsetOf(Q, "ring") + @offsetOf(Q.Ring, "tail");
     const panic_off = @offsetOf(Q, "panic_gen");
     try testing.expect(panic_off % cl == 0);
-    try testing.expect(tail_off / cl != panic_off / cl); // 別ライン
+    try testing.expect(tail_off / cl != panic_off / cl); // Separate lines
 }
