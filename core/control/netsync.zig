@@ -1,21 +1,21 @@
-//! netsync transport + PROPOSE/COMMIT/REJECT relay（TASK-62.3.1 / 62.3.2）。
+//! The netsync transport plus the PROPOSE/COMMIT/REJECT relay.
 //!
-//! 62.3.1: 持続 TCP・HELLO・フレーム codec・キュー。
-//! 62.3.2: NetworkPolicy router・commitAndBroadcast / proposeToHost・pump 内 semantic 適用。
-//! StateSync / revert undo / command log 統合（remote_commit）は 62.3.3〜62.3.5。
-//! 本モジュールは std のみ（ADR-007 core 層。harness/libs 非依存）。action_registry / command は
-//! 相対 import（harness 経由で同一インスタンスを共有する）。
+//! The transport layer: a persistent TCP connection, HELLO, the frame codec and the queues.
+//! The relay layer: the NetworkPolicy router, commitAndBroadcast and proposeToHost, and applying the semantics inside pump.
+//! StateSync, revert undo and the command log integration (remote_commit) build on top of those.
+//! This module is std only (the core layer of ADR-007, depending on neither harness nor libs). action_registry and command are
+//! relative imports (the same instances are shared through harness).
 //!
-//! ## ホットパス宣言
-//! 全コードは「イベント時のみ」（接続確立・フレーム受信・HELLO・PROPOSE/COMMIT 適用）。
-//! `pump()` は毎フレーム呼ばれるが、処理量は inbound pending 件数に比例（空なら即 return）。
-//! フレーム毎の全画素ループ / RT（毎サンプル）には触れない。reader/writer/acceptor は
-//! ブロッキング socket I/O 専用で app 状態に触れない（適用は main thread の pump のみ）。
+//! ## Hot path declaration
+//! All of the code runs "at event time only" (establishing a connection, receiving a frame, HELLO, applying a PROPOSE or COMMIT).
+//! `pump()` is called every frame, but the work is proportional to the number of pending inbound entries (it returns at once when empty).
+//! It touches neither a per-frame all-pixel loop nor real time (per sample). The reader, writer and acceptor do
+//! blocking socket IO only and never touch application state (applying happens on the main thread's pump alone).
 //!
-//! ## remote 適用の暫定例外（62.3.2）
-//! wire seq を `ExecuteSource.remote_commit` で流し込まない（client local_only の seq 消費と
-//! StaleRemoteSeq 衝突のため）。共有 executor 経由 `source=.local` + `record_policy=.no_record`。
-//! 62.3.5 で本則へ移行。executor 未設定時は `action_registry.dispatch` fallback。
+//! ## The provisional exception when applying a remote command
+//! The wire seq is not fed in through `ExecuteSource.remote_commit` (because of a client's local_only seq consumption and
+//! the resulting StaleRemoteSeq collision). It goes through the shared executor with `source=.local` plus `record_policy=.no_record`.
+//! With no executor set, it falls back to `action_registry.dispatch`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -43,12 +43,12 @@ pub const FrameKind = enum(u8) {
     propose_revert = 0x06,
     commit_revert = 0x07,
     peer_info = 0x08,
-    /// ephemeral プレゼンス（TASK-103）。COMMIT/seq 非消費。
+    /// Ephemeral presence. Consumes neither a COMMIT nor a seq.
     presence = 0x09,
     _,
 };
 
-/// PRESENCE fixed payload 長（origin_peer + subtype + reserved + ttl + 4×i32）。
+/// The fixed PRESENCE payload length (origin_peer + subtype + reserved + ttl + 4×i32).
 pub const PRESENCE_PAYLOAD_LEN: usize = 24;
 pub const PRESENCE_QUEUE_CAP: usize = 64;
 
@@ -122,7 +122,7 @@ pub const PeerView = struct {
     label: []const u8,
 };
 
-/// peer origin 解決結果（TASK-83 Phase 2）。`label` は呼び出し元 `label_buf` へのコピー。
+/// The result of resolving a peer origin. `label` is a copy into the caller's `label_buf`.
 pub const PeerOriginView = struct {
     peer_id: u32,
     kind: ActorKind,
@@ -130,7 +130,7 @@ pub const PeerOriginView = struct {
     active: bool,
 };
 
-/// host 自身（peer_id=0）の固定 identity。`VP_NETSYNC_HOST_ACTOR` 等の env は設けない。
+/// The host's own fixed identity (peer_id=0). There is no environment variable such as `VP_NETSYNC_HOST_ACTOR`.
 pub const HOST_PEER_ID: u32 = 0;
 pub const HOST_ACTOR_KIND: ActorKind = .human;
 pub const HOST_LABEL: []const u8 = "host";
@@ -144,7 +144,7 @@ pub const ProtocolError = error{
     EndOfStream,
 };
 
-/// kind 別の payload 上限（超過は protocol error 切断）。
+/// The payload limit per kind (exceeding it disconnects with a protocol error).
 pub fn maxPayloadForKind(kind: u8) usize {
     if (kind == @intFromEnum(FrameKind.sync)) return MAX_SYNC_BYTES;
     if (kind == @intFromEnum(FrameKind.presence)) return PRESENCE_PAYLOAD_LEN;
@@ -155,7 +155,7 @@ pub fn isKnownKind(kind: u8) bool {
     return kind >= 0x01 and kind <= 0x09;
 }
 
-/// PRESENCE 24B encode（LE）。reserved は常に 0。
+/// Encodes the 24B PRESENCE payload (little-endian). reserved is always 0.
 pub fn formatPresencePayload(buf: []u8, p: PresencePayload) ![]const u8 {
     if (buf.len < PRESENCE_PAYLOAD_LEN) return error.PayloadTooLarge;
     std.mem.writeInt(u32, buf[0..4], p.origin_peer, .little);
@@ -169,8 +169,8 @@ pub fn formatPresencePayload(buf: []u8, p: PresencePayload) ![]const u8 {
     return buf[0..PRESENCE_PAYLOAD_LEN];
 }
 
-/// PRESENCE decode。長さ不一致・reserved≠0・未知 subtype・TTL>10000 は ProtocolError。
-/// `ttl_ms==0` は subtype 既定値へ展開する。
+/// Decodes PRESENCE. A length mismatch, reserved≠0, an unknown subtype, or TTL>10000 is a ProtocolError.
+/// `ttl_ms==0` expands to the subtype's default.
 pub fn parsePresencePayload(payload: []const u8) ProtocolError!PresencePayload {
     if (payload.len != PRESENCE_PAYLOAD_LEN) return error.ProtocolError;
     if (payload[5] != 0) return error.ProtocolError;
@@ -189,7 +189,7 @@ pub fn parsePresencePayload(payload: []const u8) ProtocolError!PresencePayload {
     };
 }
 
-/// harness / remote dispatch 用の args 行を生成する。
+/// Builds the args line for a harness or remote dispatch.
 /// point/suggest: `peer=<id> <x> <y> <ttl_ms>` / highlight: `peer=<id> <x0> <y0> <x1> <y1> <ttl_ms>`
 pub fn formatPresenceRemoteArgs(buf: []u8, p: PresencePayload) ![]const u8 {
     return switch (p.subtype) {
@@ -198,15 +198,15 @@ pub fn formatPresenceRemoteArgs(buf: []u8, p: PresencePayload) ![]const u8 {
     };
 }
 
-/// フレームを Writer へ encode（kind + len LE + payload）。
+/// Encodes a frame into the Writer (kind + len little-endian + payload).
 pub fn encodeFrame(w: *Io.Writer, kind: u8, payload: []const u8) Io.Writer.Error!void {
     try w.writeByte(kind);
     try w.writeInt(u32, @intCast(payload.len), .little);
     try w.writeAll(payload);
 }
 
-/// ヘッダを読み、len が上限内なら payload を `buf` へ読む。超過は `error.PayloadTooLarge`。
-/// 戻り値の payload は `buf[0..len]`。
+/// Reads the header, and reads the payload into `buf` when len is within the limit. Over the limit gives `error.PayloadTooLarge`.
+/// The payload returned is `buf[0..len]`.
 pub fn decodeFrame(r: *Io.Reader, buf: []u8) (ProtocolError || Io.Reader.Error)!Frame {
     const kind = try r.takeByte();
     const len = try r.takeInt(u32, .little);
@@ -217,7 +217,7 @@ pub fn decodeFrame(r: *Io.Reader, buf: []u8) (ProtocolError || Io.Reader.Error)!
     return .{ .kind = kind, .payload = buf[0..len] };
 }
 
-/// payload を streaming 読み捨て（固定 4096B チャンク。SYNC の 16MiB を alloc しない）。
+/// Discards a payload by streaming it away (in fixed 4096B chunks, so SYNC's 16MiB is never allocated).
 pub fn discardPayload(r: *Io.Reader, len: u32) (Io.Reader.Error)!void {
     var remaining: u32 = len;
     var chunk: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
@@ -228,7 +228,7 @@ pub fn discardPayload(r: *Io.Reader, len: u32) (Io.Reader.Error)!void {
     }
 }
 
-/// HELLO payload 検証用（client→host）。成功時 kind/label を返す。label は payload 内 slice。
+/// For validating a HELLO payload (client to host). On success it returns the kind and the label; the label is a slice inside the payload.
 pub fn parseClientHello(payload: []const u8) ProtocolError!struct { kind: ActorKind, label: []const u8 } {
     var it = std.mem.tokenizeScalar(u8, payload, ' ');
     const role_tok = it.next() orelse return error.ProtocolError;
@@ -241,12 +241,12 @@ pub fn parseClientHello(payload: []const u8) ProtocolError!struct { kind: ActorK
     const kind = ActorKind.fromToken(kind_s) orelse return error.ProtocolError;
     if (label.len > MAX_LABEL_LEN) return error.ProtocolError;
     for (label) |c| {
-        if (c < 0x20) return error.ProtocolError; // ASCII 制御文字
+        if (c < 0x20) return error.ProtocolError; // an ASCII control character
     }
     return .{ .kind = kind, .label = label };
 }
 
-/// HELLO payload 検証用（host→client）。成功時 peer_id を返す。
+/// For validating a HELLO payload (host to client). On success it returns the peer_id.
 pub fn parseHostHello(payload: []const u8) ProtocolError!u32 {
     var it = std.mem.tokenizeScalar(u8, payload, ' ');
     const role_tok = it.next() orelse return error.ProtocolError;
@@ -267,13 +267,13 @@ pub fn formatHostHello(buf: []u8, peer_id: u32) ![]const u8 {
     return std.fmt.bufPrint(buf, "host {d} {d}", .{ PROTOCOL_VERSION, peer_id });
 }
 
-/// PEER_INFO payload の kind バイト（親 plan §1.7: 0=human, 1=agent, 0xFF=left）。
+/// The kind byte of a PEER_INFO payload (0=human, 1=agent, 0xFF=left).
 pub const PEER_INFO_KIND_HUMAN: u8 = 0;
 pub const PEER_INFO_KIND_AGENT: u8 = 1;
 pub const PEER_INFO_KIND_LEFT: u8 = 0xFF;
 
-/// PEER_INFO payload（親 plan §1.7）: u32 LE peer_id (4B) ++ u8 kind (1B) ++ "<label>"（残り全体）。
-/// codec のみ（TASK-62.5.6。**配布＝送受信の semantic 処理は TASK-83 Phase 2**。§6 の段階規定）。
+/// A PEER_INFO payload: u32 LE peer_id (4B) ++ u8 kind (1B) ++ "<label>" (all the rest).
+/// The codec only; the semantics of distributing and receiving it live elsewhere.
 pub fn formatPeerInfo(buf: []u8, peer_id: u32, kind: u8, label: []const u8) ![]const u8 {
     if (label.len > MAX_LABEL_LEN) return error.LabelTooLong;
     const total = 4 + 1 + label.len;
@@ -284,8 +284,8 @@ pub fn formatPeerInfo(buf: []u8, peer_id: u32, kind: u8, label: []const u8) ![]c
     return buf[0..total];
 }
 
-/// PEER_INFO payload の decode（label は payload 内 slice）。kind の未知値・label の
-/// 制御文字/上限超過は protocol error（HELLO の label 検証と同じ規則）。
+/// Decodes a PEER_INFO payload (the label is a slice inside the payload). An unknown kind value, or a
+/// control character or over-length label, is a protocol error (the same rule as HELLO's label validation).
 pub fn parsePeerInfo(payload: []const u8) ProtocolError!struct { peer_id: u32, kind: u8, label: []const u8 } {
     if (payload.len < 5) return error.ProtocolError;
     const peer_id = std.mem.readInt(u32, payload[0..4], .little);
@@ -295,12 +295,12 @@ pub fn parsePeerInfo(payload: []const u8) ProtocolError!struct { peer_id: u32, k
     const label = payload[5..];
     if (label.len > MAX_LABEL_LEN) return error.ProtocolError;
     for (label) |c| {
-        if (c < 0x20) return error.ProtocolError; // ASCII 制御文字
+        if (c < 0x20) return error.ProtocolError; // an ASCII control character
     }
     return .{ .peer_id = peer_id, .kind = kind, .label = label };
 }
 
-/// `"<name> <args>"` または `"<name>"` を分割（name=最初の空白まで、args=残り）。
+/// Splits `"<name> <args>"` or `"<name>"` (name up to the first space, args the rest).
 pub fn splitNameArgs(s: []const u8) struct { name: []const u8, args: []const u8 } {
     const t = std.mem.trim(u8, s, &std.ascii.whitespace);
     if (t.len == 0) return .{ .name = "", .args = "" };
@@ -400,18 +400,18 @@ pub fn parseCommitRevertPayload(payload: []const u8) ProtocolError!struct { seq:
 // Queues
 // ============================================================================
 
-/// 内部 inbound マーカー（wire には出ない）。ClientJoined = peer_id + generation。
+/// The internal inbound marker (it never appears on the wire). ClientJoined = peer_id + generation.
 const INTERNAL_CLIENT_JOINED: u8 = 0xF0;
 
 const QueueSlot = struct {
     kind: u8 = 0,
     len: u32 = 0,
-    /// 受信元 peer_id（host の PROPOSE 処理・REJECT 返送用。client 受信は 0=host）。
+    /// The peer_id it came from (for the host's PROPOSE handling and for returning a REJECT; a client receiving one sees 0=host).
     peer_id: u32 = 0,
     data: [MAX_ACTION_FRAME_BYTES]u8 = undefined,
 };
 
-/// outbound 単一 FIFO ring のエントリ（inline ≤4096 / big = heap 所有）。
+/// An entry of the single outbound FIFO ring (inline when ≤4096, and heap-owned when big).
 const OutboundEntry = union(enum) {
     inline_frame: struct {
         kind: u8 = 0,
@@ -510,7 +510,7 @@ const OutboundQueue = struct {
         return true;
     }
 
-    /// SYNC 等の big-entry。成功時は `owned` の所有権を queue が取る。失敗時は呼び出し元が解放。
+    /// A big entry, for a SYNC and the like. On success the queue takes ownership of `owned`; on failure the caller frees it.
     fn enqueueBig(self: *OutboundQueue, io: Io, kind: u8, owned: []u8) bool {
         if (owned.len > MAX_SYNC_BYTES) return false;
         self.mutex.lockUncancelable(io);
@@ -524,7 +524,7 @@ const OutboundQueue = struct {
         return true;
     }
 
-    /// writer 用。closed かつ空なら null。エントリ所有権を呼び出し元へ移転。
+    /// For the writer. Returns null when it is closed and empty. Ownership of the entry moves to the caller.
     fn dequeueWait(self: *OutboundQueue, io: Io, out: *OutboundEntry) ?void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -564,7 +564,7 @@ const OutboundQueue = struct {
         self.closed = false;
     }
 
-    /// 非ブロッキング dequeue。空なら null。
+    /// A non-blocking dequeue. Returns null when empty.
     fn tryDequeue(self: *OutboundQueue, io: Io, out: *OutboundEntry) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -576,15 +576,15 @@ const OutboundQueue = struct {
         return true;
     }
 
-    /// writer 起床用（presence enqueue 時に呼ぶ）。
+    /// For waking the writer (called when a presence entry is enqueued).
     fn signal(self: *OutboundQueue, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.cond.signal(io);
     }
 
-    /// dequeue せずに 1 回待つ。closed かつ空なら false。
-    /// presence signal でも true を返し、呼び出し側がループ先頭で両 queue を再試行する。
+    /// Waits once without dequeuing. Returns false when it is closed and empty.
+    /// It returns true for a presence signal too, and the caller retries both queues at the top of its loop.
     fn waitForWork(self: *OutboundQueue, io: Io) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -602,8 +602,8 @@ const OutboundQueue = struct {
     }
 };
 
-/// PRESENCE 専用 inbound（COMMIT queue と分離。満杯は drop・切断しない）。
-/// peer×subtype で latest-wins（未処理があれば置換）。
+/// The inbound queue for PRESENCE only (separate from the COMMIT queue; when full it drops rather than disconnecting).
+/// Latest-wins per peer and subtype (an unprocessed entry is replaced).
 const PresenceInboundQueue = struct {
     mutex: Io.Mutex = .init,
     slots: [PRESENCE_QUEUE_CAP]struct {
@@ -627,13 +627,13 @@ const PresenceInboundQueue = struct {
         return self.count;
     }
 
-    /// payload はちょうど 24B。成功 true / 満杯 drop は false（切断しない）。
+    /// The payload is exactly 24B. true on success; a drop because it is full gives false (without disconnecting).
     fn enqueueLatestWins(self: *PresenceInboundQueue, io: Io, peer_id: u32, payload: []const u8) bool {
         if (payload.len != PRESENCE_PAYLOAD_LEN) return false;
         const subtype = payload[4];
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        // 同一 peer×subtype の未処理があれば置換
+        // replace any unprocessed entry for the same peer and subtype
         for (&self.slots) |*s| {
             if (s.occupied and s.peer_id == peer_id and s.subtype == subtype) {
                 @memcpy(&s.data, payload[0..PRESENCE_PAYLOAD_LEN]);
@@ -670,8 +670,8 @@ const PresenceInboundQueue = struct {
     }
 };
 
-/// PRESENCE 専用 outbound（COMMIT outbound と分離。満杯は drop・切断しない）。
-/// subtype で latest-wins。
+/// The outbound queue for PRESENCE only (separate from the COMMIT outbound; when full it drops rather than disconnecting).
+/// Latest-wins per subtype.
 const PresenceOutboundQueue = struct {
     mutex: Io.Mutex = .init,
     slots: [PRESENCE_QUEUE_CAP]struct {
@@ -737,7 +737,7 @@ const PresenceOutboundQueue = struct {
 };
 
 // ============================================================================
-// Connection slot / peer catalog（client 側）
+// The connection slot and the peer catalog (the client side)
 // ============================================================================
 
 const ConnSlot = struct {
@@ -749,24 +749,24 @@ const ConnSlot = struct {
     label_buf: [MAX_LABEL_LEN]u8 = undefined,
     label_len: usize = 0,
     hello_done: bool = false,
-    /// SYNC 送出済み（broadcast 対象）。ClientJoined 処理後に true。
+    /// A SYNC has been sent (so it is a broadcast target). True once ClientJoined has been handled.
     synced: bool = false,
-    /// export 成功で true。空 SYNC（未登録）は false（62.3.5 revert 制限用）。
+    /// True once an export succeeds. An empty SYNC (nothing registered) leaves it false.
     snapshot_valid: bool = false,
     join_snapshot_seq: u64 = 0,
-    /// slot 再利用検知用。empty へ戻すたびに increment。
+    /// For detecting a reused slot. Incremented each time it returns to empty.
     generation: u32 = 0,
     reader_thread: ?std.Thread = null,
     writer_thread: ?std.Thread = null,
     outbound: OutboundQueue = .{},
-    /// PRESENCE 専用 outbound（満杯 drop・COMMIT と分離。TASK-103）。
+    /// The outbound queue for PRESENCE only (dropping when full, separate from COMMIT).
     presence_outbound: PresenceOutboundQueue = .{},
-    /// host slots 配列内 index。client は 0。
+    /// The index within the host's slots array. On a client it is 0.
     slot_index: usize = 0,
     is_client_conn: bool = false,
 };
 
-/// client 用固定長 peer catalog（host(1) + 最大 client 数）。host は slots[] + 固定 host identity。
+/// The client's fixed-length peer catalog (the host plus at most MAX_PEERS clients). The host uses slots[] plus its fixed identity.
 const MAX_PEER_CATALOG: usize = MAX_PEERS + 1;
 
 const PeerCatalogEntry = struct {
@@ -778,8 +778,8 @@ const PeerCatalogEntry = struct {
     label_len: usize = 0,
 };
 
-/// join 時 state 同期アダプタ（単一スロット）。
-/// `export_fn` は **0 byte を返してはならない**（空は「snapshot なし」予約マーカー。未登録時のみ空 SYNC）。
+/// The state synchronisation adapter used on join (a single slot).
+/// `export_fn` **must not return 0 bytes** (empty is the reserved marker for "no snapshot"; only an unregistered exporter gives an empty SYNC).
 pub const StateSync = struct {
     ctx: *anyopaque,
     export_fn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
@@ -790,21 +790,21 @@ pub const StateSync = struct {
 // Module state
 // ============================================================================
 //
-// ## 同期規約（peers_mutex）
-// 次のフィールドの読み書きはすべて `peers_mutex` 下で行う（イベント時のみの経路）:
+// ## The synchronisation rule (peers_mutex)
+// Every read and write of the following fields happens under `peers_mutex` (a path taken at event time only):
 //   role / started / local_peer_id / next_peer_id / router_clear_pending /
-//   slots[*].state および slot の peer メタ（peer_id/kind/label/hello_done/socket_open）/
-//   client_slot の同種フィールド /
+//   slots[*].state and a slot's peer metadata (peer_id, kind, label, hello_done, socket_open) /
+//   the same fields on client_slot /
 //   peer_catalog[*] / peer_metadata_revision
-// `stop_flag` のみ atomic。`have_server` / acceptor_thread は main（init/shutdown）専有。
-// wire_seq / next_proposal_id / last_rejected_* / last_applied_seq / shared_executor は main thread 専有
-// （pump / router / setSharedExecutor。reader は触らない）。
-// reader thread は wire frame 受信・inbound enqueue が主だが、HELLO 処理（`handleHello`）は
-// 既存どおり reader thread 上で peers_mutex を取って直接 slot/catalog を書く（join/leave 時の
-// peer_catalog 登録・PEER_INFO 配布・peer_metadata_revision 更新を含む）。他 peer 由来の
-// PEER_INFO 反映（`handlePeerInfo`）と origin 解決（`resolvePeerOrigin`）は main thread
-// （pump 経由）。いずれも同じ `peers_mutex` で保護される。
-// outbound キューは独自 mutex を持ち、ロック順序は **peers_mutex → outbound.mutex**（逆順禁止）。
+// Only `stop_flag` is atomic. `have_server` and acceptor_thread belong to main (init and shutdown) alone.
+// wire_seq, next_proposal_id, last_rejected_*, last_applied_seq and shared_executor belong to the main thread alone
+// (pump, the router, setSharedExecutor; the reader never touches them).
+// The reader thread mostly receives wire frames and enqueues inbound entries, but HELLO handling (`handleHello`)
+// still runs on the reader thread, taking peers_mutex and writing the slot and catalog directly (including registering
+// in peer_catalog, distributing PEER_INFO, and updating peer_metadata_revision on a join or a leave). Reflecting a
+// PEER_INFO that came from another peer (`handlePeerInfo`) and resolving an origin (`resolvePeerOrigin`) happen on the
+// main thread (through pump). All of them are protected by the same `peers_mutex`.
+// The outbound queue has its own mutex, and the lock order is **peers_mutex → outbound.mutex** (never the reverse).
 
 var role: Role = .disabled;
 var started: bool = false;
@@ -820,22 +820,22 @@ var acceptor_thread: ?std.Thread = null;
 
 var peers_mutex: Io.Mutex = .init;
 var slots: [MAX_PEERS]ConnSlot = [_]ConnSlot{.{}} ** MAX_PEERS;
-var next_peer_id: u32 = 1; // 0 = host 予約
+var next_peer_id: u32 = 1; // 0 is reserved for the host
 
 var client_slot: ConnSlot = .{};
-var local_peer_id: u32 = 0; // client が host HELLO で受け取る
+var local_peer_id: u32 = 0; // what a client receives in the host's HELLO
 
-/// client 側 peer catalog（host は未使用）。leave は active=false tombstone として kind/label を保持。
+/// The client-side peer catalog (unused on a host). A leave keeps the kind and label as an active=false tombstone.
 var peer_catalog: [MAX_PEER_CATALOG]PeerCatalogEntry = [_]PeerCatalogEntry{.{}} ** MAX_PEER_CATALOG;
-/// module 全体で 1 本の peer metadata revision（entry 単位 revision は持たない。TASK-83 Phase 2）。
+/// A single peer metadata revision for the whole module (there is no per-entry revision).
 var peer_metadata_revision: u64 = 0;
 
 var inbound: InboundQueue = .{};
-/// PRESENCE 専用 inbound（awaiting_sync gate 外で処理。TASK-103）。
+/// The inbound queue for PRESENCE only (handled outside the awaiting_sync gate).
 var presence_inbound: PresenceInboundQueue = .{};
 
 var client_actor_kind: ActorKind = .human;
-/// 既定 label。`undefined` + len だけ先に立てると NUL が HELLO に載り host が切断する（E2E で確認済み）。
+/// The default label. Raising just the len over `undefined` would put a NUL on the HELLO and the host would disconnect (confirmed in the E2E).
 const default_client_label = "client";
 var client_label_buf: [MAX_LABEL_LEN]u8 = blk: {
     var b = [_]u8{0} ** MAX_LABEL_LEN;
@@ -844,20 +844,20 @@ var client_label_buf: [MAX_LABEL_LEN]u8 = blk: {
 };
 var client_label_len: usize = default_client_label.len;
 
-/// client fail-soft（reader 起点）から main の pump へ router 解除を依頼するフラグ。
+/// The flag by which a client's fail-soft (originating in the reader) asks main's pump to clear the router.
 var router_clear_pending: bool = false;
 
-/// host の wire COMMIT seq（単調増加。main thread 専有）。
+/// The host's wire COMMIT seq (monotonically increasing, belonging to the main thread alone).
 var wire_seq: u64 = 0;
-/// client: 最後に適用した COMMIT の seq（main thread 専有。digest last_seq の client 側）。
+/// On a client: the seq of the last COMMIT applied (main thread alone; the client's side of the digest's last_seq).
 var last_applied_seq: u64 = 0;
-/// client の proposal_id（単調増加。main thread 専有）。
+/// A client's proposal_id (monotonically increasing, belonging to the main thread alone).
 var next_proposal_id: u32 = 0;
 
 var shared_executor: ?*command.Executor = null;
 
-/// TASK-163: COMMIT 適用成功後の汎用 post-apply hook（opaque ctx + raw name/args/actor/seq のみ）。
-/// framework は history/PaintDiff/Pixie を解釈しない。未登録時は no-op（bit 同一）。
+/// A general post-apply hook, run once a COMMIT has been applied successfully (an opaque ctx plus the raw name, args, actor and seq only).
+/// The framework interprets nothing about the history, the paint diff or the editor. With none registered this is a no-op (bit-identical).
 pub const PostApplyContext = struct {
     name: []const u8,
     args: []const u8,
@@ -884,8 +884,8 @@ fn callPostApplyHook(name: []const u8, args: []const u8, origin_peer: u32, seq: 
     });
 }
 
-/// session 開始/終了の通知（copilot operate 拒否用。platform が登録。netsync→copilot 逆 import なし）。
-/// **main thread のみ**（enableRouter / clearRouterMain / pump の router_clear。wire_session と同地点）。
+/// Notification that a session has started or ended (for rejecting a copilot operate; platform registers it, so there is no reverse import from netsync to copilot).
+/// **Main thread only** (enableRouter, clearRouterMain, and pump's router_clear — the same places as wire_session).
 pub const SessionStateCallback = *const fn (active: bool) void;
 var session_state_cb: ?SessionStateCallback = null;
 
@@ -902,12 +902,12 @@ var last_reject_reason_buf: [256]u8 = undefined;
 var last_reject_reason_len: usize = 0;
 
 var state_sync: ?StateSync = null;
-/// client: SYNC import 完了まで true。この間 pump は inbound dequeue ループに入らない。
+/// On a client: true until the SYNC import completes. Meanwhile pump does not enter the inbound dequeue loop.
 var awaiting_sync: bool = false;
-/// client reader が積む SYNC payload（seq+state）。peers_mutex 下で置換・解放。
+/// The SYNC payload (seq plus state) a client's reader stashes. Replaced and freed under peers_mutex.
 var pending_sync: ?[]u8 = null;
 
-/// client のローカル PROPOSE/PROPOSE_REVERT 待ち行列（TASK-62.3.5）。main thread 専有。
+/// A client's queue of local PROPOSE and PROPOSE_REVERT frames awaiting send. Belongs to the main thread alone.
 pub const PENDING_CAP: usize = 64;
 const PendingKind = enum { normal, revert };
 const PendingEntry = struct {
@@ -956,7 +956,7 @@ fn pendingRemoveProposal(proposal_id: u32) void {
     while (i < pending_count) : (i += 1) {
         const idx = (pending_head + i) % PENDING_CAP;
         if (pending_q[idx].proposal_id == proposal_id) {
-            std.debug.print("[netsync] pending REJECT が head 以外 — scan 除去 proposal={d}\n", .{proposal_id});
+            std.debug.print("[netsync] a pending REJECT is not at the head — removing it by scan proposal={d}\n", .{proposal_id});
             var j = i;
             while (j + 1 < pending_count) : (j += 1) {
                 const a = (pending_head + j) % PENDING_CAP;
@@ -968,15 +968,15 @@ fn pendingRemoveProposal(proposal_id: u32) void {
             return;
         }
     }
-    std.debug.print("[netsync] pending REJECT 不一致 proposal={d}\n", .{proposal_id});
+    std.debug.print("[netsync] a pending REJECT does not match proposal={d}\n", .{proposal_id});
 }
 
-/// 観測用スナップショット（TASK-62.3.4 / 62.5.6）。
-/// `gatherStats` / probe digest・snapshot は harness 設計上 **main thread（pollGate 内）でのみ**呼ぶ。
+/// A snapshot for observation.
+/// `gatherStats`, and a probe's digest and snapshot, are by the harness's design called **on the main thread only (inside pollGate)**.
 pub const NetsyncStats = struct {
     role: Role = .disabled,
     peers: usize = 0,
-    /// 接続中の agent 種別 peer 数（host=slots[] / client=catalog の active agent）。
+    /// How many connected peers are of the agent kind (host=slots[]; client=the catalog's active agents).
     agents: usize = 0,
     peer_id: u32 = 0,
     last_seq: u64 = 0,
@@ -985,8 +985,8 @@ pub const NetsyncStats = struct {
     last_reject: u32 = 0,
 };
 
-/// reader 共有フィールドを 1 回の `peers_mutex` 保持で一括取得し、main thread 専有値を足す。
-/// **main thread 専用**（probe = pollGate 内前提）。
+/// Fetches the reader's shared fields in one hold of `peers_mutex`, then adds the main-thread-only values.
+/// **Main thread only** (a probe runs inside pollGate by assumption).
 pub fn gatherStats() NetsyncStats {
     var st: NetsyncStats = .{};
     if (!io_inited) return st;
@@ -1006,14 +1006,14 @@ pub fn gatherStats() NetsyncStats {
                 }
             }
         } else if (role == .client) {
-            // PEER_INFO 反映後は catalog の active 全件。未着信でも HELLO 直後に self を入れる。
+            // Once PEER_INFO has been reflected this is every active catalog entry. Even before one arrives, self goes in right after HELLO.
             for (&peer_catalog) |*e| {
                 if (e.occupied and e.active) {
                     st.peers += 1;
                     if (e.kind == .agent) st.agents += 1;
                 }
             }
-            // catalog 空（HELLO 前）のフォールバック: 従来どおり自 slot
+            // The fallback for an empty catalog (before HELLO): this slot, as before
             if (st.peers == 0 and client_slot.state == .active) {
                 st.peers = 1;
                 if (client_slot.actor_kind == .agent) st.agents = 1;
@@ -1024,13 +1024,13 @@ pub fn gatherStats() NetsyncStats {
 
     if (!on) return st;
 
-    // main thread 専有（lock 不要）
+    // belongs to the main thread alone (no lock needed)
     st.last_seq = if (st.role == .host) wire_seq else last_applied_seq;
     st.last_reject = last_rejected_proposal;
     return st;
 }
 
-/// ASCII 制御文字を `_` に置換し、最大 `out.len`（通常 MAX_LABEL_LEN=200）に切り詰める。
+/// Replaces ASCII control characters with `_` and truncates to at most `out.len` (normally MAX_LABEL_LEN=200).
 pub fn sanitizePeerLabel(out: []u8, label: []const u8) []const u8 {
     const n = @min(label.len, out.len);
     var i: usize = 0;
@@ -1060,8 +1060,8 @@ fn clearPeerCatalogLocked() void {
     for (&peer_catalog) |*e| e.* = .{};
 }
 
-/// peers_mutex 保持下。同一 peer_id は更新。空き無ければ最古 inactive tombstone を再利用。
-/// active entry は evict しない（満杯かつ inactive 無しなら false）。
+/// Called while holding peers_mutex. The same peer_id updates in place. With no free room, the oldest inactive tombstone is reused.
+/// An active entry is never evicted (so a full catalog with no inactive entry gives false).
 fn upsertPeerCatalogLocked(peer_id: u32, kind: ActorKind, label: []const u8, active: bool) bool {
     var free_i: ?usize = null;
     var oldest_inactive: ?usize = null;
@@ -1110,8 +1110,8 @@ fn enqueuePeerInfoLocked(slot: *ConnSlot, peer_id: u32, kind_byte: u8, label: []
     return slot.outbound.enqueue(io_val, @intFromEnum(FrameKind.peer_info), payload);
 }
 
-/// peer_id → kind/label 解決（main thread 想定。label は `label_buf` へコピー）。
-/// host の peer_id=0 は固定 HOST identity。未解決は null。
+/// Resolves a peer_id to a kind and label (assumed to be the main thread; the label is copied into `label_buf`).
+/// The host's peer_id=0 is the fixed HOST identity. Unresolved gives null.
 pub fn resolvePeerOrigin(peer_id: u32, label_buf: []u8) ?PeerOriginView {
     if (!io_inited) return null;
     peers_mutex.lockUncancelable(io_val);
@@ -1142,7 +1142,7 @@ pub fn resolvePeerOrigin(peer_id: u32, label_buf: []u8) ?PeerOriginView {
         return null;
     }
 
-    // client: local catalog（PEER_INFO 未着信は null。self は HELLO 時に catalog へ入れる）
+    // client: the local catalog (null before a PEER_INFO arrives; self goes into the catalog at HELLO time)
     for (&peer_catalog) |*e| {
         if (!e.occupied or e.peer_id != peer_id) continue;
         const raw = e.label_buf[0..e.label_len];
@@ -1157,7 +1157,7 @@ pub fn resolvePeerOrigin(peer_id: u32, label_buf: []u8) ?PeerOriginView {
     return null;
 }
 
-/// peer catalog / slot metadata の粗粒度 revision（履歴キャッシュ再構築トリガ）。
+/// A coarse-grained revision of the peer catalog and slot metadata (the trigger for rebuilding a history cache).
 pub fn peerMetadataRevision() u64 {
     if (!io_inited) return 0;
     peers_mutex.lockUncancelable(io_val);
@@ -1167,7 +1167,7 @@ pub fn peerMetadataRevision() u64 {
 
 const reject_reason_token_max = 64;
 
-/// ASCII whitespace（space/tab/CR/LF）と制御文字を `_` に置換し、最大 64B に切り詰める。
+/// Replaces ASCII whitespace (space, tab, CR, LF) and control characters with `_`, and truncates to at most 64B.
 pub fn sanitizeRejectReasonToken(out: []u8, reason: []const u8) []const u8 {
     const n = @min(reason.len, @min(out.len, reject_reason_token_max));
     var i: usize = 0;
@@ -1186,7 +1186,7 @@ fn roleDigestName(r: Role) []const u8 {
     };
 }
 
-/// digest 1 行 payload（probe 名は harness が付与。`role=... peers=... agents=...`）。**main thread 専用**。
+/// The one-line digest payload (the probe name is prepended by harness: `role=... peers=... agents=...`). **Main thread only**.
 pub fn formatDigest(buf: []u8) []const u8 {
     const st = gatherStats();
     var reason_buf: [reject_reason_token_max]u8 = undefined;
@@ -1233,7 +1233,7 @@ fn actorOriginToken(actor: command.ActorId, out: []u8) []const u8 {
     };
 }
 
-/// 末尾数件 `seq:origin:name`（revert は `seq:origin:revert->target`）。executor 不在時は空。
+/// The last few as `seq:origin:name` (a revert as `seq:origin:revert->target`). Empty when there is no executor.
 fn formatLogDigestTail(buf: []u8) []const u8 {
     const exec = shared_executor orelse return "";
     const log = exec.log orelse return "";
@@ -1286,10 +1286,10 @@ fn sanitizeJsonToken(out: []u8, s: []const u8) []const u8 {
     return out[0..n];
 }
 
-/// snapshot JSON 1 オブジェクト。
-/// `peers` は `[{peer_id,kind,label},...]`（host=slots[] 全件 / client=catalog の active 全件）。
-/// `log[].origin` は従来どおり数字/タグのみ（kind/label 化しない。digest netsync 公開契約）。
-/// **main thread 専用**。
+/// A snapshot as a single JSON object.
+/// `peers` is `[{peer_id,kind,label},...]` (host=every slots[] entry; client=every active catalog entry).
+/// `log[].origin` stays numeric or a tag as before (never a kind or a label; that is the public contract of the netsync digest).
+/// **Main thread only**.
 pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     const st = gatherStats();
     var reason_buf: [reject_reason_token_max]u8 = undefined;
@@ -1317,7 +1317,7 @@ pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     };
     try list.appendSlice(allocator, head);
 
-    // peers 配列（getPeer 経由。mutex は getPeer 内）
+    // the peers array (through getPeer, which takes the mutex itself)
     var pi: usize = 0;
     while (true) : (pi += 1) {
         var lbuf: [MAX_LABEL_LEN]u8 = undefined;
@@ -1371,18 +1371,18 @@ pub fn formatSnapshot(allocator: std.mem.Allocator) ![]u8 {
     return try list.toOwnedSlice(allocator);
 }
 
-/// harness custom probe 用 digest（ctx 未使用）。
+/// The digest for the harness custom probe (ctx is unused).
 pub fn probeDigest(_: *anyopaque, buf: []u8) []const u8 {
     return formatDigest(buf);
 }
 
-/// harness custom probe 用 snapshot（ctx 未使用）。
+/// The snapshot for the harness custom probe (ctx is unused).
 pub fn probeSnapshot(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return formatSnapshot(allocator);
 }
 
-/// StateSync を登録する（netsync 無効時も保存のみ・常に呼んでよい）。
-/// export_fn は 0 byte を返してはならない（返した場合は export 失敗扱い）。
+/// Registers a StateSync (with netsync disabled it only stores it, so it is always safe to call).
+/// export_fn must not return 0 bytes (doing so counts as a failed export).
 pub fn registerStateSync(s: StateSync) void {
     state_sync = s;
 }
@@ -1435,7 +1435,7 @@ pub fn isClient() bool {
     return role == .client and started;
 }
 
-/// platform.setCommandExecutor から転送。remote COMMIT / host PROPOSE 適用に使う（main thread）。
+/// Forwarded from platform.setCommandExecutor. Used for applying a remote COMMIT and a host PROPOSE (main thread).
 pub fn setSharedExecutor(exec: ?*command.Executor) void {
     if (shared_executor) |old| old.setWireSession(false);
     shared_executor = exec;
@@ -1444,7 +1444,7 @@ pub fn setSharedExecutor(exec: ?*command.Executor) void {
     }
 }
 
-/// teardown 前に共有 executor の借用だけを破棄する（旧ポインタを deref しない）。
+/// Drops just the borrow of the shared executor before teardown (without dereferencing the old pointer).
 pub fn forgetSharedExecutor() void {
     shared_executor = null;
 }
@@ -1486,7 +1486,7 @@ fn clearRouterMain() void {
 }
 
 fn requestRouterClear() void {
-    // peers_mutex 保持下で呼ぶこと（cleanup / failSoftLocked）。
+    // must be called while holding peers_mutex (cleanup and failSoftLocked).
     router_clear_pending = true;
 }
 
@@ -1555,7 +1555,7 @@ pub fn getPeer(i: usize, label_buf: []u8) ?PeerView {
             }
             seen += 1;
         }
-        // catalog 空（HELLO 前）フォールバック
+        // the fallback for an empty catalog (before HELLO)
         if (seen == 0 and i == 0 and client_slot.state == .active) {
             const n = @min(client_slot.label_len, label_buf.len);
             if (n > 0) @memcpy(label_buf[0..n], client_slot.label_buf[0..n]);
@@ -1577,7 +1577,7 @@ pub fn inboundLen() usize {
 pub fn setClientIdentity(kind: ActorKind, label: []const u8) void {
     client_actor_kind = kind;
     const n = @min(label.len, MAX_LABEL_LEN);
-    // label が client_label_buf 自身を指す場合（initClient 経由）はコピー不要。
+    // No copy is needed when the label already points at client_label_buf itself (which is the case through initClient).
     if (n > 0 and label.ptr != &client_label_buf) {
         @memcpy(client_label_buf[0..n], label[0..n]);
     }
@@ -1603,16 +1603,16 @@ pub fn initFromEnv() void {
     const host_req = getEnv("VP_NETSYNC_HOST") != null;
     const connect = getEnv("VP_NETSYNC_CONNECT");
     if (host_req and connect != null) {
-        std.debug.print("[netsync] VP_NETSYNC_HOST と VP_NETSYNC_CONNECT は同時指定不可。無効化します。\n", .{});
+        std.debug.print("[netsync] VP_NETSYNC_HOST and VP_NETSYNC_CONNECT cannot both be given; disabling.\n", .{});
         return;
     }
     if (host_req) {
         const port_s = getEnv("VP_NETSYNC_PORT") orelse {
-            std.debug.print("[netsync] VP_NETSYNC_HOST=1 には VP_NETSYNC_PORT が必要です。無効化します。\n", .{});
+            std.debug.print("[netsync] VP_NETSYNC_HOST=1 needs VP_NETSYNC_PORT; disabling.\n", .{});
             return;
         };
         const port = std.fmt.parseInt(u16, port_s, 10) catch {
-            std.debug.print("[netsync] VP_NETSYNC_PORT が不正です。無効化します。\n", .{});
+            std.debug.print("[netsync] VP_NETSYNC_PORT is invalid; disabling.\n", .{});
             return;
         };
         initHost(port);
@@ -1620,7 +1620,7 @@ pub fn initFromEnv() void {
     }
     if (connect) |c| {
         const addr = parseConnectAddr(c) orelse {
-            std.debug.print("[netsync] VP_NETSYNC_CONNECT が不正です（ip:port）: {s}\n", .{c});
+            std.debug.print("[netsync] VP_NETSYNC_CONNECT is invalid (expected ip:port): {s}\n", .{c});
             return;
         };
         const kind = parseActorEnv(getEnv("VP_NETSYNC_ACTOR"));
@@ -1630,11 +1630,11 @@ pub fn initFromEnv() void {
     }
 }
 
-/// `VP_NETSYNC_ACTOR` 解釈（既定 human。不正値は warn+human）。テストからも呼ぶ。
+/// Interprets `VP_NETSYNC_ACTOR` (the default is human; an invalid value warns and gives human). The tests call it too.
 pub fn parseActorEnv(raw: ?[]const u8) ActorKind {
     const s = raw orelse return .human;
     return ActorKind.fromToken(s) orelse {
-        std.debug.print("[netsync] VP_NETSYNC_ACTOR が不正（human|agent）: {s} — human 扱い\n", .{s});
+        std.debug.print("[netsync] VP_NETSYNC_ACTOR is invalid (expected human|agent): {s} — treating it as human\n", .{s});
         return .human;
     };
 }
@@ -1655,7 +1655,7 @@ pub fn initHost(port: u16) void {
 
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     server = addr.listen(io_val, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[netsync] host listen 失敗: {s}\n", .{@errorName(err)});
+        std.debug.print("[netsync] host listen failed: {s}\n", .{@errorName(err)});
         return;
     };
     have_server = true;
@@ -1667,7 +1667,7 @@ pub fn initHost(port: u16) void {
     peers_mutex.unlock(io_val);
 
     acceptor_thread = std.Thread.spawn(.{}, acceptorMain, .{}) catch |err| {
-        std.debug.print("[netsync] acceptor spawn 失敗: {s}\n", .{@errorName(err)});
+        std.debug.print("[netsync] failed to spawn the acceptor: {s}\n", .{@errorName(err)});
         server.deinit(io_val);
         have_server = false;
         peers_mutex.lockUncancelable(io_val);
@@ -1679,12 +1679,12 @@ pub fn initHost(port: u16) void {
     wire_seq = 0;
     last_applied_seq = 0;
     enableRouter();
-    std.debug.print("[netsync] host 有効: 127.0.0.1:{d}\n", .{server.socket.address.getPort()});
+    std.debug.print("[netsync] host enabled: 127.0.0.1:{d}\n", .{server.socket.address.getPort()});
 }
 
 pub fn initClient(addr: net.IpAddress) void {
-    // initFromEnv→initClient は initHost と違い defaultClientLabel を呼ばない。
-    // 宣言時初期化が正だが、空なら既定を入れ直す（client 経路の label 常時有効を保証）。
+    // Unlike initHost, the initFromEnv to initClient path does not call defaultClientLabel.
+    // The initialiser at the declaration is authoritative, but if it is empty the default is put back (guaranteeing a client always has a valid label).
     if (client_label_len == 0) defaultClientLabel();
     initClientAs(addr, client_actor_kind, client_label_buf[0..client_label_len]);
 }
@@ -1703,16 +1703,16 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     inbound.clear(io_val);
     presence_inbound.clear(io_val);
 
-    // HELLO encode にも内部保存と同じ切り詰め済み label を使う（201B 以上を素通しすると
-    // host 側の label 上限で protocol error 切断になるため、API 境界で clamp する）。
+    // The HELLO encoding uses the same already-truncated label as the internal copy (passing 201B or more straight through
+    // would trip the host's label limit and disconnect with a protocol error, so it is clamped at the API boundary).
     const label_clamped = client_label_buf[0..client_label_len];
 
-    // TASK-166: host listen 前の ConnectionRefused を指数 backoff で短くリトライする
-    // （手動 2 window 起動の「数秒待つ」を吸収。init 時のみ・RT/フレーム経路には入らない）。
-    // 試行最大 6 回・待ち 100/200/400/800/1600 ms（合計 ~3.1s）。上限到達後は既存と同じ fail-soft。
-    // 判断: ConnectionRefused / Timeout は起動レースの典型なのでリトライ対象。
-    // AddressUnavailable / HostUnreachable / AccessDenied 等の恒久エラーは即 fail-soft
-    // （待っても直らないため、上限までの待ちをユーザーに課さない）。
+    // Retry a ConnectionRefused before the host is listening, briefly and with exponential backoff
+    // (absorbing the "wait a few seconds" of starting two windows by hand; at init only, never on a real-time or frame path).
+    // At most 6 attempts, waiting 100/200/400/800/1600 ms (about 3.1s in total). Past that it is the same fail-soft as before.
+    // The decision: ConnectionRefused and Timeout are typical of a start-up race, so they are retried.
+    // A permanent error such as AddressUnavailable, HostUnreachable or AccessDenied fails soft at once
+    // (waiting would not fix it, so the user is not made to wait out the limit).
     const backoff_ms = [_]u64{ 100, 200, 400, 800, 1600 };
     const stream = blk: {
         var attempt: usize = 0;
@@ -1723,12 +1723,12 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
                     else => false,
                 };
                 if (!retryable or attempt >= backoff_ms.len) {
-                    std.debug.print("[netsync] client 接続失敗: {s}（netsync 無効のまま起動継続）\n", .{@errorName(err)});
+                    std.debug.print("[netsync] client connection failed: {s} (start-up continues with netsync disabled)\n", .{@errorName(err)});
                     return; // fail-soft
                 }
                 const ms = backoff_ms[attempt];
                 attempt += 1;
-                std.debug.print("[netsync] client 接続リトライ {d}/{d}: {s}（{d}ms 後）\n", .{ attempt, backoff_ms.len, @errorName(err), ms });
+                std.debug.print("[netsync] retrying the client connection {d}/{d}: {s} (in {d}ms)\n", .{ attempt, backoff_ms.len, @errorName(err), ms });
                 std.Io.sleep(io_val, .fromMilliseconds(@intCast(ms)), .awake) catch {};
             }
         }
@@ -1752,7 +1752,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     peers_mutex.unlock(io_val);
 
     client_slot.writer_thread = std.Thread.spawn(.{}, writerMain, .{&client_slot}) catch {
-        std.debug.print("[netsync] client writer spawn 失敗\n", .{});
+        std.debug.print("[netsync] failed to spawn the client writer\n", .{});
         stream.close(io_val);
         peers_mutex.lockUncancelable(io_val);
         role = .disabled;
@@ -1763,8 +1763,8 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
         return;
     };
     client_slot.reader_thread = std.Thread.spawn(.{}, readerMain, .{&client_slot}) catch {
-        std.debug.print("[netsync] client reader spawn 失敗\n", .{});
-        // writer join 前に close しない（不変条件: close は writer join 後に 1 回）。
+        std.debug.print("[netsync] failed to spawn the client reader\n", .{});
+        // Do not close before joining the writer (the invariant: a close happens once, after the writer is joined).
         client_slot.outbound.close(io_val);
         stream.shutdown(io_val, .both) catch {};
         if (client_slot.writer_thread) |t| t.join();
@@ -1781,8 +1781,8 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
         return;
     };
 
-    // HELLO 送出前に awaiting_sync を立てる（reader が先行して置いた pending_sync を
-    // 後から free して永久停止する race を防ぐ）。
+    // Raise awaiting_sync before sending HELLO (which prevents the race where the reader gets a pending_sync in
+    // first and it is freed afterwards, stalling forever).
     next_proposal_id = 0;
     last_applied_seq = 0;
     peers_mutex.lockUncancelable(io_val);
@@ -1790,7 +1790,7 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     freePendingSyncLocked();
     peers_mutex.unlock(io_val);
 
-    // client HELLO を outbound へ
+    // the client HELLO onto the outbound queue
     var hbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     const hello = formatClientHello(&hbuf, kind, label_clamped) catch {
         requestCloseSlot(&client_slot);
@@ -1805,17 +1805,17 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
         return;
     }
     enableRouter();
-    std.debug.print("[netsync] client 接続中\n", .{});
+    std.debug.print("[netsync] client connecting\n", .{});
 }
 
-/// inbound を drain し PROPOSE/COMMIT/REJECT/ClientJoined を適用する（main thread。毎フレーム可）。
-/// `router_clear_pending` の処理は `isEnabled` 早期 return より前（fail-soft 後も解除する）。
-/// awaiting_sync 中は pending_sync import のみ試し、COMMIT inbound dequeue ループには入らない。
-/// PRESENCE inbound は awaiting_sync gate 外で常に処理する（TASK-103）。
+/// Drains inbound and applies PROPOSE, COMMIT, REJECT and ClientJoined (main thread; safe every frame).
+/// `router_clear_pending` is handled before the `isEnabled` early return (so it is cleared even after a fail-soft).
+/// While awaiting_sync it only tries the pending_sync import and does not enter the COMMIT inbound dequeue loop.
+/// PRESENCE inbound is always handled, outside the awaiting_sync gate.
 pub fn pump() void {
     if (!io_inited) return;
 
-    // fail-soft 後の router / wire_session 解除（main thread。shutdown の clearRouterMain と対称）。
+    // Clearing the router and wire_session after a fail-soft (main thread; symmetrical with shutdown's clearRouterMain).
     peers_mutex.lockUncancelable(io_val);
     const clear = router_clear_pending;
     if (clear) router_clear_pending = false;
@@ -1828,10 +1828,10 @@ pub fn pump() void {
 
     if (!isEnabled()) return;
 
-    // presence は SYNC 待ち中でも適用（document COMMIT とは独立）。
+    // presence applies even while waiting for a SYNC (it is independent of a document COMMIT).
     pumpPresenceInbound();
 
-    // awaiting 中に SYNC を適用しても、同 pump では COMMIT を dequeue しない（次 pump で再開）。
+    // Applying a SYNC while awaiting does not dequeue a COMMIT in the same pump (that resumes on the next one).
     peers_mutex.lockUncancelable(io_val);
     const was_awaiting = awaiting_sync;
     peers_mutex.unlock(io_val);
@@ -1864,7 +1864,7 @@ fn pumpPresenceInbound() void {
 
 fn handlePresenceFrame(from_peer: u32, payload: []const u8, dispatch_buf: []u8) void {
     var parsed = parsePresencePayload(payload) catch return;
-    // host 受信: origin を TCP slot peer id で上書き（偽装防止）
+    // received by the host: overwrite the origin with the TCP slot's peer id (which prevents spoofing)
     peers_mutex.lockUncancelable(io_val);
     const cur_role = role;
     peers_mutex.unlock(io_val);
@@ -1877,10 +1877,10 @@ fn handlePresenceFrame(from_peer: u32, payload: []const u8, dispatch_buf: []u8) 
         const remote_args = formatPresenceRemoteArgs(&args_buf, parsed) catch return;
         const name = parsed.subtype.actionName();
         _ = action_registry.dispatch(name, remote_args, dispatch_buf) catch return;
-        // callback 成功時のみ broadcast（awaiting_sync client 含む）
+        // broadcast only when the callback succeeded (including to an awaiting_sync client)
         broadcastPresence(wired);
     } else {
-        // client 受信: payload の origin_peer を信頼（host が設定済み）
+        // received by a client: trust the payload's origin_peer (the host has already set it)
         var args_buf: [128]u8 = undefined;
         const remote_args = formatPresenceRemoteArgs(&args_buf, parsed) catch return;
         const name = parsed.subtype.actionName();
@@ -1888,7 +1888,7 @@ fn handlePresenceFrame(from_peer: u32, payload: []const u8, dispatch_buf: []u8) 
     }
 }
 
-/// テスト用: inbound を 1 件 dequeue（awaiting_sync 中は null）。
+/// For tests: dequeue one inbound entry (null while awaiting_sync).
 pub fn dequeueInbound(out_kind: *u8, out_buf: []u8) ?usize {
     if (!isEnabled()) return null;
     peers_mutex.lockUncancelable(io_val);
@@ -1915,8 +1915,8 @@ fn handleInboundFrame(kind: u8, from_peer: u32, payload: []const u8) void {
     }
 }
 
-/// client 側: PEER_INFO を catalog へ反映（main thread / pump）。host は無視。
-/// malformed / 未知 kind / 短小 payload は状態不変。未知 peer への LEFT は無視。
+/// The client side: reflects a PEER_INFO into the catalog (main thread, through pump). A host ignores it.
+/// A malformed frame, an unknown kind, or a too-short payload leaves the state unchanged. A LEFT for an unknown peer is ignored.
 fn handlePeerInfo(payload: []const u8) void {
     const parsed = parsePeerInfo(payload) catch return;
 
@@ -1981,27 +1981,27 @@ fn handleClientJoined(payload: []const u8) void {
     const sync_bytes: []u8 = blk: {
         if (state_sync) |ss| {
             const state = ss.export_fn(ss.ctx, gpa) catch |err| {
-                std.debug.print("[netsync] StateSync export 失敗: {s} — client 切断\n", .{@errorName(err)});
+                std.debug.print("[netsync] StateSync export failed: {s} — disconnecting the client\n", .{@errorName(err)});
                 requestCloseSlotIfGeneration(slot, peer_id, generation);
                 return;
             };
             if (state.len == 0) {
                 gpa.free(state);
-                std.debug.print("[netsync] StateSync export が 0 byte — client 切断\n", .{});
+                std.debug.print("[netsync] StateSync export returned 0 bytes — disconnecting the client\n", .{});
                 requestCloseSlotIfGeneration(slot, peer_id, generation);
                 return;
             }
             snapshot_valid = true;
             const payload_bytes = buildSyncPayload(seq, state) catch {
                 gpa.free(state);
-                std.debug.print("[netsync] SYNC payload 過大 — client 切断\n", .{});
+                std.debug.print("[netsync] the SYNC payload is too large — disconnecting the client\n", .{});
                 requestCloseSlotIfGeneration(slot, peer_id, generation);
                 return;
             };
             gpa.free(state);
             break :blk payload_bytes;
         } else {
-            // 未登録: 空 SYNC（seq のみ）+ snapshot_valid=false
+            // nothing registered: an empty SYNC (the seq alone) plus snapshot_valid=false
             break :blk buildSyncPayload(seq, &[_]u8{}) catch {
                 requestCloseSlotIfGeneration(slot, peer_id, generation);
                 return;
@@ -2010,7 +2010,7 @@ fn handleClientJoined(payload: []const u8) void {
     };
 
     peers_mutex.lockUncancelable(io_val);
-    // 再検証（export 中に切断された可能性）
+    // re-validate (the connection may have dropped during the export)
     if (slot.state != .active or slot.peer_id != peer_id or slot.generation != generation) {
         peers_mutex.unlock(io_val);
         gpa.free(sync_bytes);
@@ -2019,7 +2019,7 @@ fn handleClientJoined(payload: []const u8) void {
     if (!slot.outbound.enqueueBig(io_val, @intFromEnum(FrameKind.sync), sync_bytes)) {
         peers_mutex.unlock(io_val);
         gpa.free(sync_bytes);
-        std.debug.print("[netsync] SYNC enqueue 失敗 — client 切断\n", .{});
+        std.debug.print("[netsync] failed to enqueue the SYNC — disconnecting the client\n", .{});
         requestCloseSlotIfGeneration(slot, peer_id, generation);
         return;
     }
@@ -2043,14 +2043,14 @@ fn tryApplyPendingSync() void {
     defer gpa.free(bytes);
 
     const parsed = parseSyncPayload(bytes) catch {
-        std.debug.print("[netsync] SYNC parse 失敗 — fail-soft\n", .{});
+        std.debug.print("[netsync] failed to parse the SYNC — fail-soft\n", .{});
         failSoftDisableClient();
         return;
     };
     if (parsed.seq > wire_seq) wire_seq = parsed.seq;
 
     if (parsed.state.len == 0) {
-        // 空 SYNC: import せずゲート解除
+        // an empty SYNC: release the gate without importing
         peers_mutex.lockUncancelable(io_val);
         awaiting_sync = false;
         peers_mutex.unlock(io_val);
@@ -2058,13 +2058,13 @@ fn tryApplyPendingSync() void {
     }
 
     const ss = state_sync orelse {
-        // import 未登録だが非空 SYNC → 適用不能
-        std.debug.print("[netsync] SYNC 受信したが StateSync 未登録 — fail-soft\n", .{});
+        // nothing registered to import but a non-empty SYNC → it cannot be applied
+        std.debug.print("[netsync] a SYNC arrived but no StateSync is registered — fail-soft\n", .{});
         failSoftDisableClient();
         return;
     };
     ss.import_fn(ss.ctx, parsed.state) catch |err| {
-        std.debug.print("[netsync] StateSync import 失敗: {s} — fail-soft（保留 COMMIT 不適用）\n", .{@errorName(err)});
+        std.debug.print("[netsync] StateSync import failed: {s} — fail-soft (the held COMMIT is not applied)\n", .{@errorName(err)});
         failSoftDisableClient();
         return;
     };
@@ -2080,14 +2080,14 @@ fn applyWireCommit(name: []const u8, args: []const u8, origin_peer: u32, seq: u6
             .source = .{ .remote_commit = .{ .seq = seq, .pending_local_meta = pending_meta } },
             .record_policy = .record,
         }, buf);
-        // TASK-163: execute 成功かつ record/seq 確定後に post-apply hook を 1 回だけ。
-        // TASK-162 の chunk も 1 COMMIT=1 execute のままここを通る（二重 capture なし）。
+        // Run the post-apply hook exactly once, after the execute succeeded and the record and seq are settled.
+        // A chunk still passes through here as one execute per COMMIT (so there is no double capture).
         if (res.seq) |applied_seq| {
             callPostApplyHook(name, args, origin_peer, applied_seq);
         }
         return res.output;
     }
-    // executor 未設定: 62.3.2 fallback（記録なし）— hook も呼ばない
+    // no executor set: the fallback with no recording — the hook is not called either
     return action_registry.dispatch(name, args, buf);
 }
 
@@ -2117,7 +2117,7 @@ fn enqueueToPeer(peer_id: u32, kind: u8, payload: []const u8) bool {
 fn broadcastCommit(seq: u64, origin_peer: u32, name: []const u8, args: []const u8) void {
     var cbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     const payload = formatCommitPayload(&cbuf, seq, origin_peer, name, args) catch {
-        std.debug.print("[netsync] COMMIT payload 構築失敗\n", .{});
+        std.debug.print("[netsync] failed to build the COMMIT payload\n", .{});
         return;
     };
     broadcast(@intFromEnum(FrameKind.commit), payload);
@@ -2145,10 +2145,10 @@ fn maxJoinSnapshotSeq() u64 {
     return m;
 }
 
-/// host ローカル .relay: executor 直（actor=.peer(0), remote_commit）→ COMMIT broadcast。
-/// TASK-106.1: host-generated `pattern_state` もこの facade 経由（app は platform.commitHostAction）。
+/// A host-local `.relay`: straight to the executor (actor=.peer(0), remote_commit), then a COMMIT broadcast.
+/// A host-generated `pattern_state` goes through this same facade (the application uses platform.commitHostAction).
 pub fn commitAndBroadcast(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
-    // action frame 上限（name + 空白 + args）を超える payload は broadcast しない。
+    // A payload exceeding the action frame limit (name + a space + args) is not broadcast.
     if (name.len + 1 + args.len > MAX_ACTION_FRAME_BYTES) return error.PayloadTooLarge;
     const seq = allocateCommitSeq();
     const out = try applyWireCommit(name, args, 0, seq, null, buf);
@@ -2157,13 +2157,13 @@ pub fn commitAndBroadcast(name: []const u8, args: []const u8, buf: []u8) anyerro
     return out;
 }
 
-/// client ローカル .relay: proposal_id 採番 + PROPOSE 送信。ローカル適用なし。
+/// A client-local `.relay`: allocate a proposal_id and send a PROPOSE. Nothing is applied locally.
 pub fn proposeToHost(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     return proposeToHostWithMeta(name, args, null, buf);
 }
 
 fn proposeToHostWithMeta(name: []const u8, args: []const u8, redo_of: ?u64, buf: []u8) anyerror![]const u8 {
-    // SYNC 完了前の PROPOSE は未適用 graph を参照しうるため拒否（TASK-106.2）。
+    // A PROPOSE before the SYNC completes could refer to a graph that has not been applied yet, so it is rejected.
     if (awaiting_sync) {
         action_registry.setActionErrorDetail("session_not_ready", "wait for awaiting_sync=0 before relay actions");
         return error.SessionNotReady;
@@ -2271,10 +2271,10 @@ fn handleProposeRevert(from_peer: u32, payload: []const u8) void {
 fn handleCommit(payload: []const u8) void {
     if (!isClient()) return;
     const parsed = parseCommitPayload(payload) catch {
-        std.debug.print("[netsync] COMMIT parse 失敗\n", .{});
+        std.debug.print("[netsync] failed to parse the COMMIT\n", .{});
         return;
     };
-    // peek のみ。pop は適用成功後（失敗時に pending を失わない）。
+    // Peek only. The pop happens after a successful apply (so a pending entry is not lost on failure).
     var pending_meta: ?command.PendingMeta = null;
     var pop_pending = false;
     if (parsed.origin_peer == localPeerId()) {
@@ -2287,7 +2287,7 @@ fn handleCommit(payload: []const u8) void {
     }
     var abuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     _ = applyWireCommit(parsed.name, parsed.args, parsed.origin_peer, parsed.seq, pending_meta, &abuf) catch |err| {
-        std.debug.print("[netsync] COMMIT 適用失敗: {s} — fail-soft\n", .{@errorName(err)});
+        std.debug.print("[netsync] failed to apply the COMMIT: {s} — fail-soft\n", .{@errorName(err)});
         failSoftDisableClient();
         return;
     };
@@ -2299,7 +2299,7 @@ fn handleCommit(payload: []const u8) void {
 fn handleCommitRevert(payload: []const u8) void {
     if (!isClient()) return;
     const parsed = parseCommitRevertPayload(payload) catch {
-        std.debug.print("[netsync] COMMIT_REVERT parse 失敗\n", .{});
+        std.debug.print("[netsync] failed to parse the COMMIT_REVERT\n", .{});
         return;
     };
     var pop_pending = false;
@@ -2309,12 +2309,12 @@ fn handleCommitRevert(payload: []const u8) void {
         }
     }
     const exec = shared_executor orelse {
-        std.debug.print("[netsync] COMMIT_REVERT: executor 未設定 — fail-soft\n", .{});
+        std.debug.print("[netsync] COMMIT_REVERT: no executor is set — fail-soft\n", .{});
         failSoftDisableClient();
         return;
     };
     exec.applyWireRevert(parsed.target_seq, parsed.seq) catch |err| {
-        std.debug.print("[netsync] COMMIT_REVERT 適用失敗: {s} — fail-soft\n", .{@errorName(err)});
+        std.debug.print("[netsync] failed to apply the COMMIT_REVERT: {s} — fail-soft\n", .{@errorName(err)});
         failSoftDisableClient();
         return;
     };
@@ -2326,7 +2326,7 @@ fn handleCommitRevert(payload: []const u8) void {
 fn handleReject(payload: []const u8) void {
     if (!isClient()) return;
     const parsed = parseRejectPayload(payload) catch {
-        std.debug.print("[netsync] REJECT parse 失敗\n", .{});
+        std.debug.print("[netsync] failed to parse the REJECT\n", .{});
         return;
     };
     pendingRemoveProposal(parsed.proposal_id);
@@ -2342,7 +2342,7 @@ fn commitRedoOwn(actor_peer: u32, buf: []u8) anyerror![]const u8 {
     const cand = exec.findRedoCandidate(.{ .peer = actor_peer }) orelse {
         return writeNothing(buf, "nothing to redo");
     };
-    // name/args をコピー（execute が log を mutate する）
+    // copy the name and args (execute mutates the log)
     var name_buf: [command.MAX_CMD_NAME]u8 = undefined;
     var args_buf: [command.MAX_CMD_ARGS]u8 = undefined;
     const nlen = @min(cand.name.len, name_buf.len);
@@ -2371,8 +2371,8 @@ fn proposeRedoOwn(buf: []u8) anyerror![]const u8 {
     return proposeToHostWithMeta(name_buf[0..nlen], args_buf[0..alen], cand.target_seq, buf);
 }
 
-/// host/client 対称の NetworkPolicy 分岐（親 plan §1.3）。
-/// **main thread のみ**（routeLocalAction 経由）。role=.disabled なら dispatch fallback。
+/// The NetworkPolicy branch, symmetrical between host and client.
+/// **Main thread only** (through routeLocalAction). With role=.disabled it falls back to a dispatch.
 fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     peers_mutex.lockUncancelable(io_val);
     const cur = role;
@@ -2416,7 +2416,7 @@ fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const
     };
 }
 
-/// host ローカル ephemeral: peer=0 付きで dispatch（COMMIT 非生成）。
+/// A host-local ephemeral: dispatched with peer=0 attached (generating no COMMIT).
 fn applyLocalPresence(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     const parsed = try parsePresenceActionToPayload(name, args, 0);
     var args_buf: [128]u8 = undefined;
@@ -2424,8 +2424,8 @@ fn applyLocalPresence(name: []const u8, args: []const u8, buf: []u8) anyerror![]
     return action_registry.dispatch(name, remote_args, buf);
 }
 
-/// client ephemeral: PRESENCE を presence outbound へ積み `"sent"` を返す（PROPOSE 非生成）。
-/// HELLO 完了後なら `awaiting_sync` 中でも送信可。
+/// A client ephemeral: puts a PRESENCE on the presence outbound queue and returns `"sent"` (generating no PROPOSE).
+/// Once HELLO is complete it may be sent even while `awaiting_sync` holds.
 fn enqueueClientPresence(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     if (!io_inited) return error.NotConnected;
     peers_mutex.lockUncancelable(io_val);
@@ -2433,7 +2433,7 @@ fn enqueueClientPresence(name: []const u8, args: []const u8, buf: []u8) anyerror
     peers_mutex.unlock(io_val);
     if (!ok) return error.NotConnected;
 
-    // origin_peer は client 送信時 0（host が slot peer id で上書き）
+    // origin_peer is 0 when a client sends (the host overwrites it with the slot's peer id)
     const parsed = try parsePresenceActionToPayload(name, args, 0);
     var pbuf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
     const payload = try formatPresencePayload(&pbuf, parsed);
@@ -2441,12 +2441,12 @@ fn enqueueClientPresence(name: []const u8, args: []const u8, buf: []u8) anyerror
     peers_mutex.lockUncancelable(io_val);
     defer peers_mutex.unlock(io_val);
     if (role != .client or !started or client_slot.state != .active) return error.NotConnected;
-    _ = client_slot.presence_outbound.enqueueLatestWins(io_val, payload); // 満杯は drop
-    client_slot.outbound.signal(io_val); // writer 起床
+    _ = client_slot.presence_outbound.enqueueLatestWins(io_val, payload); // a full queue drops
+    client_slot.outbound.signal(io_val); // wake the writer
     return std.fmt.bufPrint(buf, "sent", .{}) catch "sent";
 }
 
-/// harness action args → PresencePayload。coords は 0..255、ttl は 0..=10000。
+/// Converts harness action args into a PresencePayload. Coordinates are 0..255 and ttl is 0..=10000.
 fn parsePresenceActionToPayload(name: []const u8, args: []const u8, origin_peer: u32) ProtocolError!PresencePayload {
     const subtype: PresenceSubtype = if (std.mem.eql(u8, name, "presence_point"))
         .point
@@ -2515,7 +2515,7 @@ fn parsePresenceActionToPayload(name: []const u8, args: []const u8, origin_peer:
     };
 }
 
-/// active 全 client へ PRESENCE を soft-broadcast（synced 非限定・満杯 drop・切断しない）。
+/// Soft-broadcasts a PRESENCE to every active client (not limited to synced ones; a full queue drops rather than disconnecting).
 fn broadcastPresence(payload: []const u8) void {
     if (!io_inited) return;
     peers_mutex.lockUncancelable(io_val);
@@ -2528,7 +2528,7 @@ fn broadcastPresence(payload: []const u8) void {
     }
 }
 
-/// active かつ synced な全接続の outbound へ fan-out。
+/// Fans out to the outbound queue of every connection that is active and synced.
 pub fn broadcast(kind: u8, payload: []const u8) void {
     if (!io_inited) return;
     peers_mutex.lockUncancelable(io_val);
@@ -2542,9 +2542,9 @@ pub fn broadcast(kind: u8, payload: []const u8) void {
     }
 }
 
-/// client 役の outbound へ 1 フレーム積む（テスト・将来 PROPOSE 送出の最小口）。
-/// 満杯時は fail-soft で netsync を無効化する。
-/// state 確認と enqueue は同一 `peers_mutex` 区間（TOCTOU 防止）。
+/// Puts one frame on the outbound queue of the client role (the minimal entry point for tests, and for sending a PROPOSE in future).
+/// When it is full, netsync is disabled by a fail-soft.
+/// Checking the state and enqueuing happen in the same `peers_mutex` section (which prevents a TOCTOU).
 pub fn clientSend(kind: u8, payload: []const u8) bool {
     if (!io_inited) return false;
     peers_mutex.lockUncancelable(io_val);
@@ -2566,8 +2566,8 @@ pub fn shutdown() void {
 
     stop_flag.store(true, .seq_cst);
 
-    // listen socket を先に close すると blocking accept が BADF panic になる。
-    // ダミー connect で accept を起こし、acceptor join 後にだけ listen を閉じる。
+    // Closing the listen socket first would make the blocking accept panic with BADF.
+    // A dummy connect wakes the accept, and only after the acceptor is joined is the listen socket closed.
     if (have_server) {
         const port = server.socket.address.getPort();
         const wake_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
@@ -2609,7 +2609,7 @@ pub fn shutdown() void {
     awaiting_sync = false;
     freePendingSyncLocked();
     peers_mutex.unlock(io_val);
-    // main thread のみ setRouter(null) / wire_session / copilot session 解除（clearRouterMain と対称）
+    // setRouter(null), wire_session and clearing the copilot session happen on the main thread only (symmetrically with clearRouterMain)
     action_registry.setRouter(null);
     setWireSessionFlag(false);
     notifySessionState(false);
@@ -2627,7 +2627,7 @@ fn requestCloseSlot(s: *ConnSlot) void {
     requestCloseSlotLocked(s);
 }
 
-/// export 中などに slot が再利用された場合、新しい接続を誤って閉じない。
+/// If the slot was reused during an export, say, this avoids closing the new connection by mistake.
 fn requestCloseSlotIfGeneration(s: *ConnSlot, peer_id: u32, generation: u32) void {
     peers_mutex.lockUncancelable(io_val);
     defer peers_mutex.unlock(io_val);
@@ -2641,19 +2641,19 @@ fn requestCloseSlotLocked(s: *ConnSlot) void {
     s.state = .closing;
     s.outbound.close(io_val);
     s.presence_outbound.close(io_val);
-    // ## fd close 不変条件
-    // fd を使いうる全スレッド（特に writer）を join するまで stream.close してはならない。
-    // 他スレッドを起こす手段は outbound.close（condvar）と stream.shutdown(.both) のみ。
-    // close は writer join 後に、ちょうど 1 回・peers_mutex 下で socket_open を見て実行する
-    //（cleanupAfterReader / spawn 失敗経路 / joinSlot）。他スレッドから close すると
-    // blocking 中の send/recv が EBADF → Zig std の unreachable panic になる。
+    // ## The fd close invariant
+    // stream.close must not happen until every thread that could use the fd (the writer above all) has been joined.
+    // The only ways to wake another thread are outbound.close (a condvar) and stream.shutdown(.both).
+    // The close happens after the writer is joined, exactly once, under peers_mutex and after inspecting socket_open
+    // (in cleanupAfterReader, the spawn-failure path, and joinSlot). Closing from another thread would turn a blocking
+    // send or recv into EBADF, which is an unreachable panic in Zig's std.
     if (s.socket_open) {
         s.stream.shutdown(io_val, .both) catch {};
     }
 }
 
 fn joinSlot(s: *ConnSlot) void {
-    // Thread handle の join は mutex 外（cleanup と競合しうるが、handle が残っていれば join）。
+    // A Thread handle is joined outside the mutex (which can race with cleanup, but if the handle is still there it is joined).
     const reader_t = blk: {
         peers_mutex.lockUncancelable(io_val);
         defer peers_mutex.unlock(io_val);
@@ -2679,7 +2679,7 @@ fn joinSlot(s: *ConnSlot) void {
         peers_mutex.unlock(io_val);
     }
     peers_mutex.lockUncancelable(io_val);
-    // reader cleanup が既に close 済みなら no-op。未 close ならここで唯一の所有者として close。
+    // If the reader's cleanup already closed it this is a no-op. If not, this is the sole owner and closes it here.
     if (s.socket_open) {
         s.stream.close(io_val);
         s.socket_open = false;
@@ -2697,15 +2697,15 @@ fn joinSlot(s: *ConnSlot) void {
     peers_mutex.unlock(io_val);
 }
 
-/// client を fail-soft 無効化（peers_mutex を取得する）。
+/// Disables a client by a fail-soft (taking peers_mutex).
 fn failSoftDisableClient() void {
-    std.debug.print("[netsync] client を fail-soft 無効化します\n", .{});
+    std.debug.print("[netsync] disabling the client by a fail-soft\n", .{});
     peers_mutex.lockUncancelable(io_val);
     defer peers_mutex.unlock(io_val);
     failSoftDisableClientLocked();
 }
 
-/// `peers_mutex` 保持下で client を無効化。接続が残っていれば閉じる。
+/// Disables a client while holding `peers_mutex`. Any remaining connection is closed.
 fn failSoftDisableClientLocked() void {
     if (client_slot.state != .empty and client_slot.state != .closing) {
         requestCloseSlotLocked(&client_slot);
@@ -2727,7 +2727,7 @@ fn acceptorMain() void {
     while (!stop_flag.load(.seq_cst)) {
         const stream = server.accept(io_val) catch |err| {
             if (stop_flag.load(.seq_cst)) break;
-            std.debug.print("[netsync] accept 失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("[netsync] accept failed: {s}\n", .{@errorName(err)});
             continue;
         };
         if (stop_flag.load(.seq_cst)) {
@@ -2739,7 +2739,7 @@ fn acceptorMain() void {
         const slot_opt = blk: {
             for (&slots, 0..) |*s, i| {
                 if (s.state == .empty) {
-                    // generation は前回 empty 化時に increment 済み。再利用時は保持。
+                    // The generation was already incremented when it last became empty. It is preserved across a reuse.
                     const gen = s.generation;
                     s.* = .{
                         .state = .hello_pending,
@@ -2758,14 +2758,14 @@ fn acceptorMain() void {
         peers_mutex.unlock(io_val);
 
         if (slot_opt == null) {
-            std.debug.print("[netsync] peer スロット満杯（MAX_PEERS={d}）。接続を切断します\n", .{MAX_PEERS});
+            std.debug.print("[netsync] the peer slots are full (MAX_PEERS={d}); disconnecting\n", .{MAX_PEERS});
             stream.close(io_val);
             continue;
         }
         const slot = slot_opt.?;
 
         slot.writer_thread = std.Thread.spawn(.{}, writerMain, .{slot}) catch {
-            std.debug.print("[netsync] writer spawn 失敗 — スロット解放\n", .{});
+            std.debug.print("[netsync] failed to spawn the writer — releasing the slot\n", .{});
             peers_mutex.lockUncancelable(io_val);
             stream.close(io_val);
             slot.state = .empty;
@@ -2773,8 +2773,8 @@ fn acceptorMain() void {
             continue;
         };
         slot.reader_thread = std.Thread.spawn(.{}, readerMain, .{slot}) catch {
-            std.debug.print("[netsync] reader spawn 失敗 — スロット解放\n", .{});
-            // writer join 前に close しない（不変条件: close は writer join 後に 1 回）。
+            std.debug.print("[netsync] failed to spawn the reader — releasing the slot\n", .{});
+            // Do not close before joining the writer (the invariant: a close happens once, after the writer is joined).
             slot.outbound.close(io_val);
             stream.shutdown(io_val, .both) catch {};
             if (slot.writer_thread) |t| t.join();
@@ -2797,7 +2797,7 @@ fn writerMain(slot: *ConnSlot) void {
     var entry: OutboundEntry = .{ .inline_frame = .{} };
     var presence_buf: [PRESENCE_PAYLOAD_LEN]u8 = undefined;
     while (true) {
-        // COMMIT outbound を優先（presence flood で document を飢餓させない）
+        // Give the COMMIT outbound queue priority (so a presence flood cannot starve the document)
         if (slot.outbound.tryDequeue(io_val, &entry)) {
             const send_ok = blk: {
                 switch (entry) {
@@ -2830,8 +2830,8 @@ fn writerMain(slot: *ConnSlot) void {
             }
             continue;
         }
-        // 両方空 → outbound cond で待つ（presence enqueue も同 cond を signal）。
-        // dequeue はしない: presence 起床を飲みこまないため waitForWork → ループ先頭で再試行。
+        // Both empty → wait on the outbound condvar (enqueuing a presence signals the same condvar).
+        // It does not dequeue: so as not to swallow a presence wake-up, it goes waitForWork → retry at the top of the loop.
         if (!slot.outbound.waitForWork(io_val)) break;
     }
 }
@@ -2850,15 +2850,15 @@ fn readerMain(slot: *ConnSlot) void {
 
         if (len > max) break;
 
-        // HELLO 完了前は HELLO 以外をすべて protocol error 切断（SYNC/未知の読み捨て継続より先）。
+        // Before HELLO completes, anything but a HELLO disconnects with a protocol error (ahead of carrying on to discard a SYNC or an unknown frame).
         if (!slot.hello_done and kind != @intFromEnum(FrameKind.hello)) {
             break;
         }
 
-        // SYNC: client は heap へ読んで pending。host 受信は protocol error。
+        // SYNC: a client reads it onto the heap and leaves it pending. A host receiving one is a protocol error.
         if (kind == @intFromEnum(FrameKind.sync)) {
             if (!slot.is_client_conn) {
-                std.debug.print("[netsync] host が SYNC を受信 — protocol error 切断\n", .{});
+                std.debug.print("[netsync] the host received a SYNC — disconnecting with a protocol error\n", .{});
                 break;
             }
             if (len > MAX_SYNC_BYTES) break;
@@ -2876,7 +2876,7 @@ fn readerMain(slot: *ConnSlot) void {
 
         const unprocessed = !isKnownKind(kind);
         if (unprocessed) {
-            std.debug.print("[netsync] 未知 frame kind=0x{x:0>2} len={d} — 読み捨て継続\n", .{ kind, len });
+            std.debug.print("[netsync] unknown frame kind=0x{x:0>2} len={d} — discarding it and carrying on\n", .{ kind, len });
             discardPayload(&reader.interface, len) catch break;
             continue;
         }
@@ -2888,7 +2888,7 @@ fn readerMain(slot: *ConnSlot) void {
         if (!slot.hello_done) {
             handleHello(slot, payload) catch {
                 if (!slot.is_client_conn) {
-                    std.debug.print("[netsync] HELLO protocol error — 切断\n", .{});
+                    std.debug.print("[netsync] HELLO protocol error — disconnecting\n", .{});
                 }
                 break;
             };
@@ -2897,10 +2897,10 @@ fn readerMain(slot: *ConnSlot) void {
 
         if (kind == @intFromEnum(FrameKind.hello)) break; // duplicate HELLO
 
-        // PRESENCE: 専用 queue へ（検証失敗・満杯は drop。COMMIT queue / 切断に影響しない）
+        // PRESENCE: onto the dedicated queue (a validation failure, or a full queue, drops without touching the COMMIT queue or disconnecting)
         if (kind == @intFromEnum(FrameKind.presence)) {
             if (len == PRESENCE_PAYLOAD_LEN) {
-                // reserved / subtype / TTL の軽検証（本適用は pump）。不正は drop。
+                // A light check of reserved, subtype and TTL (the real apply is in pump). Anything invalid drops.
                 if (parsePresencePayload(payload)) |_| {
                     _ = presence_inbound.enqueueLatestWins(io_val, slot.peer_id, payload);
                 } else |_| {}
@@ -2909,30 +2909,30 @@ fn readerMain(slot: *ConnSlot) void {
         }
 
         if (!inbound.enqueue(io_val, kind, payload, slot.peer_id)) {
-            std.debug.print("[netsync] inbound 満杯 — 接続を切断します\n", .{});
+            std.debug.print("[netsync] inbound is full — disconnecting\n", .{});
             break;
         }
     }
 
     if (!slot.hello_done and slot.is_client_conn) {
-        std.debug.print("[netsync] HELLO 握手失敗（接続が閉じられました）\n", .{});
+        std.debug.print("[netsync] the HELLO handshake failed (the connection was closed)\n", .{});
     }
 }
 
-/// reader 終了時: writer を起こして join し、その後にだけ fd を close してスロットを empty へ戻す。
-/// 順序: outbound.close → shutdown → writer join → stream.close（1 回）→ slot reset。
-/// host 側 peer leave 時は残存 client へ PEER_INFO LEFT を配布する（TASK-83 Phase 2）。
+/// When a reader finishes: wake the writer and join it, and only then close the fd and return the slot to empty.
+/// The order: outbound.close → shutdown → join the writer → stream.close (once) → reset the slot.
+/// When a peer leaves on the host side, a PEER_INFO LEFT is distributed to the remaining clients.
 fn cleanupAfterReader(slot: *ConnSlot) void {
     const was_client = slot.is_client_conn;
 
-    // leave 配布用に peer メタを退避（slot empty 化前）
+    // stash the peer metadata for the leave distribution (before the slot becomes empty)
     var leave_peer_id: u32 = 0;
     var leave_label_buf: [MAX_LABEL_LEN]u8 = undefined;
     var leave_label_len: usize = 0;
     var do_leave_broadcast = false;
 
     peers_mutex.lockUncancelable(io_val);
-    // HELLO 完了済み peer の leave のみ LEFT 配布（host 側）
+    // distribute a LEFT only for a peer that completed HELLO (on the host side)
     if (!was_client and slot.hello_done and slot.peer_id != 0) {
         leave_peer_id = slot.peer_id;
         leave_label_len = slot.label_len;
@@ -2947,7 +2947,7 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
     } else {
         slot.outbound.close(io_val);
     }
-    // writer を起こすだけ。close は join 後（下）。
+    // Only wake the writer. The close comes after the join (below).
     if (slot.socket_open) {
         slot.stream.shutdown(io_val, .both) catch {};
     }
@@ -2976,7 +2976,7 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
     slot.label_len = 0;
     slot.reader_thread = null;
 
-    // 残存 active client へ LEFT（leaving slot は既に empty）。outbound ロック順: peers_mutex → outbound。
+    // A LEFT to the remaining active clients (the leaving slot is already empty). The outbound lock order: peers_mutex → outbound.
     if (do_leave_broadcast and role == .host) {
         const lab = leave_label_buf[0..leave_label_len];
         for (&slots) |*s| {
@@ -2986,7 +2986,7 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
         peer_metadata_revision +%= 1;
     }
 
-    // client 切断後は同 mutex 下で netsync を fail-soft 無効化。router 解除は pump へ委譲。
+    // Once a client disconnects, netsync is disabled by a fail-soft under the same mutex. Clearing the router is delegated to pump.
     if (was_client) {
         role = .disabled;
         started = false;
@@ -2999,13 +2999,13 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
     peers_mutex.unlock(io_val);
 
     if (was_client) {
-        std.debug.print("[netsync] client を fail-soft 無効化します\n", .{});
+        std.debug.print("[netsync] disabling the client by a fail-soft\n", .{});
     }
 }
 
 fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
     if (slot.is_client_conn) {
-        // host→client 応答
+        // the host's response to the client
         const pid = try parseHostHello(payload);
         peers_mutex.lockUncancelable(io_val);
         defer peers_mutex.unlock(io_val);
@@ -3014,7 +3014,7 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
         slot.peer_id = pid;
         local_peer_id = pid;
         slot.state = .active;
-        // 自分を catalog 先頭相当として登録（host からの self PEER_INFO は送られない）。
+        // Register self as the notional first catalog entry (the host never sends a self PEER_INFO).
         const self_lab = slot.label_buf[0..slot.label_len];
         _ = upsertPeerCatalogLocked(pid, slot.actor_kind, self_lab, true);
         peer_metadata_revision +%= 1;
@@ -3047,10 +3047,10 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
         return error.ProtocolError;
     }
 
-    // PEER_INFO 配布（SYNC より先に同一 outbound FIFO。ClientJoined → pump → SYNC）:
-    // 1. 新規へ host identity
-    // 2. 新規へ既存 active 全 peer
-    // 3. 既存 active 全員へ新規 peer
+    // Distributing PEER_INFO (ahead of the SYNC, on the same outbound FIFO; ClientJoined → pump → SYNC):
+    // 1. the host identity, to the newcomer
+    // 2. every existing active peer, to the newcomer
+    // 3. the new peer, to every existing active client
     const new_label = slot.label_buf[0..slot.label_len];
     const new_kind_b = actorKindToPeerInfoByte(slot.actor_kind);
     if (!enqueuePeerInfoLocked(slot, HOST_PEER_ID, actorKindToPeerInfoByte(HOST_ACTOR_KIND), HOST_LABEL)) {
@@ -3066,13 +3066,13 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
     for (&slots) |*s| {
         if (s == slot or s.state != .active) continue;
         if (!enqueuePeerInfoLocked(s, pid, new_kind_b, new_label)) {
-            // fail-soft: 該当接続のみ切断（既存方針）
+            // fail-soft: disconnect only the connection concerned (the existing policy)
             requestCloseSlotLocked(s);
         }
     }
     peer_metadata_revision +%= 1;
 
-    // ClientJoined を inbound 直列キューへ（pump が SYNC を送る）。mutex 保持中だが inbound は別 mutex。
+    // ClientJoined onto the serialised inbound queue (pump sends the SYNC). This holds the mutex, but inbound has its own.
     var joined: [8]u8 = undefined;
     std.mem.writeInt(u32, joined[0..4], pid, .little);
     std.mem.writeInt(u32, joined[4..8], slot.generation, .little);
@@ -3081,7 +3081,7 @@ fn handleHello(slot: *ConnSlot, payload: []const u8) ProtocolError!void {
     }
 }
 
-/// テスト用リセット（shutdown + 状態クリア）。
+/// A reset for tests (shutdown plus clearing the state).
 pub fn resetForTest() void {
     shutdown();
     clearRouterMain();
@@ -3111,7 +3111,7 @@ pub fn resetForTest() void {
     }
 }
 
-/// テスト用: slot の synced / snapshot_valid / join_snapshot_seq。
+/// For tests: a slot's synced, snapshot_valid and join_snapshot_seq.
 pub fn testSlotSyncInfo(peer_id: u32) ?struct { synced: bool, snapshot_valid: bool, join_snapshot_seq: u64, generation: u32 } {
     if (!io_inited) return null;
     peers_mutex.lockUncancelable(io_val);
@@ -3136,19 +3136,19 @@ pub fn testAwaitingSync() bool {
     return awaiting_sync;
 }
 
-/// テスト用: client pending queue 件数（PROPOSE/PROPOSE_REVERT 待ち）。
+/// For tests: how many entries are in the client's pending queue (awaiting a PROPOSE or PROPOSE_REVERT).
 pub fn testPendingCount() usize {
     return pending_count;
 }
 
-/// client の outbound proposal 待ち件数（read-only。TASK-162 chunk drain 用）。
-/// digest の `pending` と同値。host / netsync 無効時は 0。
+/// How many outbound proposals a client is waiting on (read only, for draining chunks).
+/// The same value as the digest's `pending`. On a host, or with netsync disabled, it is 0.
 pub fn pendingProposalCount() usize {
     if (!isEnabled() or !isClient()) return 0;
     return pending_count;
 }
 
-/// テスト用: active slot の join_snapshot_seq を上書き（before peer join 検証用）。
+/// For tests: overwrite an active slot's join_snapshot_seq (to check the before-peer-join case).
 pub fn testSetJoinSnapshotSeq(peer_id: u32, seq: u64) bool {
     if (!io_inited) return false;
     peers_mutex.lockUncancelable(io_val);
@@ -3180,7 +3180,7 @@ fn waitPeers(n: usize, timeout_ms: u64) !void {
     }
 }
 
-/// ClientJoined を処理して全 active slot を synced にする（空 SYNC 送出含む）。
+/// Handles ClientJoined and makes every active slot synced (including sending the empty SYNC).
 fn pumpUntilAllSynced(timeout_ms: u64) !void {
     var waited: u64 = 0;
     while (waited < timeout_ms) {
@@ -3202,8 +3202,8 @@ fn pumpUntilAllSynced(timeout_ms: u64) !void {
     return error.Timeout;
 }
 
-/// raw client が HELLO の次に受ける空 SYNC を1件読む。
-/// 途中の PEER_INFO（join 配布）は読み捨てる（TASK-83 Phase 2）。
+/// Reads the one empty SYNC a raw client receives after its HELLO.
+/// Any PEER_INFO in between (the join distribution) is read and discarded.
 fn expectEmptySync(stream: net.Stream) !void {
     var rbuf: [512]u8 = undefined;
     var reader = stream.reader(io_val, &rbuf);
@@ -3218,7 +3218,7 @@ fn expectEmptySync(stream: net.Stream) !void {
     }
 }
 
-/// PEER_INFO を読み捨てて次の非 peer_info フレームを返す（raw client テスト用）。
+/// Discards PEER_INFO frames and returns the next non-peer_info frame (for the raw client tests).
 fn decodeSkippingPeerInfo(r: *Io.Reader, buf: []u8) !Frame {
     while (true) {
         const frame = try decodeFrame(r, buf);
@@ -3239,7 +3239,7 @@ fn waitClientActive(timeout_ms: u64) !void {
     }
 }
 
-test "netsync: codec 全 kind round-trip" {
+test "netsync: a codec round trip for every kind" {
     const kinds = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09 };
     for (kinds) |k| {
         var obuf: [512]u8 = undefined;
@@ -3250,15 +3250,15 @@ test "netsync: codec 全 kind round-trip" {
 
         var r = Io.Reader.fixed(encoded);
         var pbuf: [256]u8 = undefined;
-        // SYNC も 4096 以下なら decodeFrame で読める
+        // a SYNC of 4096 or under can be read by decodeFrame too
         const frame = try decodeFrame(&r, &pbuf);
         try testing.expectEqual(k, frame.kind);
         try testing.expectEqualStrings(payload, frame.payload);
     }
 }
 
-test "netsync: codec partial read 充足" {
-    // 実 socket でヘッダと payload を分割送信し、decodeFrame が partial read を充足することを確認。
+test "netsync: the codec satisfies a partial read" {
+    // Send the header and the payload separately over a real socket, and confirm decodeFrame satisfies the partial read.
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -3278,7 +3278,7 @@ test "netsync: codec partial read 充足" {
             var w = Io.Writer.fixed(&frame_buf);
             encodeFrame(&w, 0x02, "abcd") catch return;
             const encoded = w.buffered();
-            // 3 byte（kind+len の途中）→ 残り
+            // 3 bytes (partway through kind+len) → then the rest
             var wbuf: [8]u8 = undefined;
             var writer = s.writer(io_val, &wbuf);
             writer.interface.writeAll(encoded[0..3]) catch return;
@@ -3286,7 +3286,7 @@ test "netsync: codec partial read 充足" {
             sleepMs(30);
             writer.interface.writeAll(encoded[3..]) catch return;
             writer.interface.flush() catch return;
-            sleepMs(50); // reader が取り終わるまで維持
+            sleepMs(50); // keep it until the reader has finished taking it
         }
     };
     const t = try std.Thread.spawn(.{}, SlowWrite.run, .{port});
@@ -3302,7 +3302,7 @@ test "netsync: codec partial read 充足" {
     try testing.expectEqualStrings("abcd", frame.payload);
 }
 
-test "netsync: codec 未知 kind は上限内なら decode 可・maxPayload は 4096" {
+test "netsync: the codec decodes an unknown kind while it is within the limit, and maxPayload is 4096" {
     try testing.expectEqual(@as(usize, MAX_ACTION_FRAME_BYTES), maxPayloadForKind(0x99));
     try testing.expectEqual(@as(usize, MAX_SYNC_BYTES), maxPayloadForKind(0x04));
     try testing.expectEqual(@as(usize, MAX_ACTION_FRAME_BYTES), maxPayloadForKind(0x01));
@@ -3311,18 +3311,18 @@ test "netsync: codec 未知 kind は上限内なら decode 可・maxPayload は 
     try testing.expect(!isKnownKind(0x0A));
 }
 
-test "netsync: codec len 超過は PayloadTooLarge" {
+test "netsync: a codec len over the limit gives PayloadTooLarge" {
     var obuf: [32]u8 = undefined;
     var w = Io.Writer.fixed(&obuf);
     try w.writeByte(0x02);
     try w.writeInt(u32, 5000, .little); // > 4096
-    // payload は書かない
+    // the payload is not written
     var r = Io.Reader.fixed(w.buffered());
     var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     try testing.expectError(error.PayloadTooLarge, decodeFrame(&r, &pbuf));
 }
 
-test "netsync: codec SYNC 大容量は discardPayload で読み捨て" {
+test "netsync: a large SYNC is discarded by the codec's discardPayload" {
     var raw: [5 + 8000 + 1]u8 = undefined;
     raw[0] = 0x04;
     std.mem.writeInt(u32, raw[1..5], 8000, .little);
@@ -3339,7 +3339,7 @@ test "netsync: codec SYNC 大容量は discardPayload で読み捨て" {
     try testing.expectEqual(@as(u8, 0x11), marker);
 }
 
-test "netsync: HELLO parse フィールド不足・不正 actor_kind・label 超過・制御文字" {
+test "netsync: HELLO parsing with a missing field, an invalid actor_kind, a label over the limit, and a control character" {
     try testing.expectError(error.ProtocolError, parseClientHello("client"));
     try testing.expectError(error.ProtocolError, parseClientHello("client 1"));
     try testing.expectError(error.ProtocolError, parseClientHello("client 1 robot bob"));
@@ -3360,10 +3360,10 @@ test "netsync: HELLO parse フィールド不足・不正 actor_kind・label 超
     try testing.expectEqual(@as(u32, 7), try parseHostHello("host 1 7"));
 }
 
-test "netsync: PEER_INFO codec round-trip と検証（codec のみ。配布は TASK-83 Phase 2）" {
+test "netsync: a PEER_INFO codec round trip and its validation (the codec alone; distribution is elsewhere)" {
     var buf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
 
-    // round-trip（human / agent / left。label は空白可・空も可）
+    // a round trip (human, agent, left; a label may contain a space, and may be empty)
     const p1 = try formatPeerInfo(&buf, 3, PEER_INFO_KIND_AGENT, "copilot bot");
     const d1 = try parsePeerInfo(p1);
     try testing.expectEqual(@as(u32, 3), d1.peer_id);
@@ -3376,12 +3376,12 @@ test "netsync: PEER_INFO codec round-trip と検証（codec のみ。配布は T
     try testing.expectEqual(PEER_INFO_KIND_LEFT, d2.kind);
     try testing.expectEqualStrings("", d2.label);
 
-    // 不正: payload 短小 / 未知 kind / label 制御文字 / label 上限超過
+    // invalid: a too-short payload, an unknown kind, a control character in the label, a label over the limit
     try testing.expectError(error.ProtocolError, parsePeerInfo(&[_]u8{ 1, 0, 0, 0 }));
     var bad_kind: [5]u8 = .{ 1, 0, 0, 0, 2 };
     try testing.expectError(error.ProtocolError, parsePeerInfo(&bad_kind));
     const p3 = try formatPeerInfo(&buf, 1, PEER_INFO_KIND_HUMAN, "ok");
-    buf[p3.len - 1] = 0x01; // 末尾を制御文字に改変
+    buf[p3.len - 1] = 0x01; // change the last byte to a control character
     try testing.expectError(error.ProtocolError, parsePeerInfo(buf[0..p3.len]));
     var long: [MAX_LABEL_LEN + 1]u8 = undefined;
     @memset(&long, 'x');
@@ -3389,10 +3389,10 @@ test "netsync: PEER_INFO codec round-trip と検証（codec のみ。配布は T
 }
 
 // ---------------------------------------------------------------------------
-// TASK-83 Phase 2: peer catalog / PEER_INFO 配布 / resolvePeerOrigin
+// the peer catalog, distributing PEER_INFO, and resolvePeerOrigin
 // ---------------------------------------------------------------------------
 
-test "netsync: sanitizePeerLabel 制御文字置換と 200B 切り詰め" {
+test "netsync: sanitizePeerLabel replaces control characters and truncates to 200B" {
     var out: [MAX_LABEL_LEN]u8 = undefined;
     const s1 = sanitizePeerLabel(&out, "a\x01b\nc");
     try testing.expectEqualStrings("a_b_c", s1);
@@ -3440,7 +3440,7 @@ test "netsync: client catalog insert/update/LEFT tombstone/reuse" {
     try testing.expect(!r2.active);
     try testing.expectEqualStrings("alice", r2.label); // tombstone keeps label
 
-    // 未知 peer LEFT は無視（revision 不変）
+    // a LEFT for an unknown peer is ignored (the revision does not change)
     const rev_unk = peerMetadataRevision();
     const left_unk = try formatPeerInfo(&pbuf, 77, PEER_INFO_KIND_LEFT, "x");
     handlePeerInfo(left_unk);
@@ -3451,9 +3451,9 @@ test "netsync: client catalog insert/update/LEFT tombstone/reuse" {
     handlePeerInfo(self_upd);
     try testing.expectEqualStrings("bot2", resolvePeerOrigin(1, &lbuf).?.label);
 
-    // tombstone 再利用: catalog を active で埋め、inactive を再利用
+    // reusing a tombstone: fill the catalog with active entries and reuse an inactive one
     peers_mutex.lockUncancelable(io_val);
-    // peer 2 は inactive tombstone。active で MAX_PEER_CATALOG-1 を埋め、残りは tombstone 再利用。
+    // peer 2 is an inactive tombstone. Fill MAX_PEER_CATALOG-1 with active entries, and the rest reuses the tombstone.
     var pid: u32 = 10;
     var filled: usize = 0;
     for (&peer_catalog) |*e| {
@@ -3463,13 +3463,13 @@ test "netsync: client catalog insert/update/LEFT tombstone/reuse" {
         pid += 1;
         filled += 1;
     }) {
-        // 空き or inactive を埋める
+        // fill a free slot, or an inactive one
         const ok = upsertPeerCatalogLocked(pid, .human, "fill", true);
         if (!ok) break;
     }
-    // 全て active のとき新規は失敗
+    // once they are all active a new one fails
     const all_active_fail = upsertPeerCatalogLocked(9999, .human, "nope", true);
-    // peer2 tombstone を残していない可能性があるので、1 つ inactive にして再利用を確認
+    // the peer2 tombstone may not have survived, so make one inactive and confirm the reuse
     _ = markPeerCatalogLeftLocked(10);
     try testing.expect(upsertPeerCatalogLocked(8888, .agent, "reuse", true));
     peers_mutex.unlock(io_val);
@@ -3477,7 +3477,7 @@ test "netsync: client catalog insert/update/LEFT tombstone/reuse" {
     try testing.expectEqualStrings("reuse", resolvePeerOrigin(8888, &lbuf).?.label);
 }
 
-test "netsync: resolvePeerOrigin host fixed identity と slots" {
+test "netsync: resolvePeerOrigin with the host's fixed identity and with slots" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -3499,7 +3499,7 @@ test "netsync: resolvePeerOrigin host fixed identity と slots" {
     try testing.expect(peerMetadataRevision() > 0);
 }
 
-test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規）" {
+test "netsync: the PEER_INFO distribution order on join (the host then the existing peers, then the existing peers to the newcomer)" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -3507,18 +3507,18 @@ test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     ensureIo();
 
-    // client A: expectEmptySync は PEER_INFO を skip するので、rawHelloConnect の一時 reader が
-    // host PEER_INFO をバッファごと破棄しても SYNC 到達判定は壊れない。
+    // client A: expectEmptySync skips PEER_INFO frames, so even if rawHelloConnect's temporary reader
+    // throws away the host PEER_INFO along with its buffer, deciding that the SYNC arrived still holds.
     var a = try rawHelloConnectAs(addr, .human, "alice");
     defer a.close(io_val);
     try waitPeers(1, 2000);
     try pumpUntilAllSynced(2000);
     try expectEmptySync(a);
 
-    // client B: HELLO と後続 PEER_INFO を**同一 reader**で読む。
-    // rawHelloConnectAs は HELLO 用に一時 reader を作り破棄するため、TCP が HELLO+PEER_INFO を
-    // 同一 read に載せると PEER_INFO が rbuf 内に残ったまま捨てられる。次の reader では
-    // host(0) が欠け alice(1) が先に見える flaky になる（負荷時に再現。固定 sleep では直らない）。
+    // client B: read the HELLO and the PEER_INFO that follows with the **same reader**.
+    // rawHelloConnectAs makes a temporary reader for the HELLO and discards it, so if TCP puts HELLO and PEER_INFO
+    // in the same read, the PEER_INFO is thrown away while still in rbuf. With the next reader,
+    // host(0) is missing and alice(1) appears first — a flaky result (it reproduces under load, and no fixed sleep fixes it).
     const b = try addr.connect(io_val, .{ .mode = .stream });
     defer b.close(io_val);
     {
@@ -3540,7 +3540,7 @@ test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規
     }
     try waitPeers(2, 2000);
 
-    // PEER_INFO host → PEER_INFO alice（outbound FIFO 順。同一 reader で決定的に検証）
+    // PEER_INFO host → PEER_INFO alice (the outbound FIFO order, checked deterministically with the same reader)
     {
         const f1 = try decodeFrame(&breader.interface, &bpbuf);
         try testing.expectEqual(@intFromEnum(FrameKind.peer_info), f1.kind);
@@ -3556,7 +3556,7 @@ test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規
         try testing.expectEqualStrings("alice", p2.label);
     }
 
-    // A への「新規 bot」PEER_INFO は expectEmptySync 後に届くので単独 reader で可
+    // the "new bot" PEER_INFO to A arrives after expectEmptySync, so a single reader is enough
     {
         var rbuf: [512]u8 = undefined;
         var reader = a.reader(io_val, &rbuf);
@@ -3570,7 +3570,7 @@ test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規
     }
 
     try pumpUntilAllSynced(2000);
-    // B は同一 reader を継続（expectEmptySync は新 reader を作るため使わない）
+    // B carries on with the same reader (expectEmptySync makes a new one, so it is not used)
     {
         const f = try decodeSkippingPeerInfo(&breader.interface, &bpbuf);
         try testing.expectEqual(@intFromEnum(FrameKind.sync), f.kind);
@@ -3579,7 +3579,7 @@ test "netsync: join 時 PEER_INFO 配布順序（host→既存、既存→新規
     }
 }
 
-test "netsync: leave 時 LEFT 配布" {
+test "netsync: distributing LEFT on a leave" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -3620,7 +3620,7 @@ test "netsync: leave 時 LEFT 配布" {
     try testing.expectEqual(@as(u32, 2), left.peer_id);
 }
 
-test "netsync: client が PEER_INFO を catalog に反映し getPeer/gatherStats が拡張" {
+test "netsync: a client reflects PEER_INFO into the catalog, widening getPeer and gatherStats" {
     resetForTest();
     defer resetForTest();
 
@@ -3670,7 +3670,7 @@ test "netsync: client が PEER_INFO を catalog に反映し getPeer/gatherStats
         sleepMs(5);
     }
     try testing.expect(!awaiting_sync);
-    // PEER_INFO を処理
+    // handle the PEER_INFO
     pump();
     sleepMs(5);
     pump();
@@ -3686,7 +3686,7 @@ test "netsync: client が PEER_INFO を catalog に反映し getPeer/gatherStats
     try testing.expect(st.peers >= 3);
     try testing.expect(st.agents >= 2);
 
-    // getPeer 列挙
+    // enumerate through getPeer
     var found_host = false;
     var found_self = false;
     var i: usize = 0;
@@ -3703,7 +3703,7 @@ test "netsync: client が PEER_INFO を catalog に反映し getPeer/gatherStats
     try testing.expect(std.mem.indexOf(u8, snap, "\"label\":\"host\"") != null);
 }
 
-test "netsync: malformed PEER_INFO は状態不変" {
+test "netsync: a malformed PEER_INFO leaves the state unchanged" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -3725,11 +3725,11 @@ test "netsync: malformed PEER_INFO は状態不変" {
     try testing.expectEqualStrings("ok", resolvePeerOrigin(1, &lbuf).?.label);
 }
 
-test "netsync: formatLogDigestTail origin は数字/タグのまま（回帰）" {
+test "netsync: formatLogDigestTail keeps origin numeric or a tag (a regression check)" {
     resetForTest();
     defer resetForTest();
 
-    // shared executor + log に peer actor を載せる
+    // put a peer actor on the shared executor and log
     var log: command.CommandLog = .{};
     var rec: command.CommandRecord = .{
         .seq = 1,
@@ -3756,22 +3756,22 @@ test "netsync: formatLogDigestTail origin は数字/タグのまま（回帰）"
 
     var buf: [256]u8 = undefined;
     const tail = formatLogDigestTail(&buf);
-    // origin は "3"（数字）であり "agent:..." 等ではない
+    // the origin is "3" (a number), not "agent:..." or anything of that shape
     try testing.expect(std.mem.indexOf(u8, tail, "1:3:stroke") != null);
     try testing.expect(std.mem.indexOf(u8, tail, "agent") == null);
     try testing.expect(std.mem.indexOf(u8, tail, "human") == null);
 
-    // formatSnapshot の log[].origin も同様
-    initHost(0); // io 有効化
+    // the same holds for formatSnapshot's log[].origin
+    initHost(0); // enable the io
     const snap = try formatSnapshot(testing.allocator);
     defer testing.allocator.free(snap);
     try testing.expect(std.mem.indexOf(u8, snap, "\"origin\":\"3\"") != null);
 }
 
-test "netsync: loopback HELLO 握手成功" {
-    // 同一プロセスは host/client どちらか一方の role のみ（module singleton）。
-    // client 役の initClient 結合は 2 プロセス E2E（62.3.2）へ。ここでは raw connect で
-    // host 側 HELLO 採番・peer テーブルを検証する。
+test "netsync: a successful loopback HELLO handshake" {
+    // One process takes only one of the host and client roles (the module is a singleton).
+    // Wiring a client role's initClient belongs to the two-process E2E. Here a raw connect
+    // checks the host side's HELLO numbering and its peer table.
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -3801,19 +3801,19 @@ test "netsync: loopback HELLO 握手成功" {
     try testing.expectEqual(@as(u32, 1), p.peer_id);
     try testing.expectEqual(ActorKind.human, p.kind);
     try testing.expectEqualStrings("alice", p.label);
-    try testing.expectEqual(@as(u32, 0), localPeerId()); // host 自身
+    try testing.expectEqual(@as(u32, 0), localPeerId()); // the host itself
 }
 
-test "netsync: 複数 client MAX_PEERS まで HELLO" {
+test "netsync: HELLO from several clients, up to MAX_PEERS" {
     resetForTest();
     defer resetForTest();
     initHost(0);
     const port = listeningPort().?;
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
 
-    // 順次接続（同時 initClient は module 単一 client_slot のため不可）。
-    // host 側スロットに MAX_PEERS 本載せるには、client を別プロセス相当で繋ぐ必要がある。
-    // ここでは raw connect + HELLO を手書きしてスロットを埋める。
+    // Connect one at a time (a simultaneous initClient is impossible, the module having a single client_slot).
+    // Putting MAX_PEERS connections into the host's slots needs clients connecting as if from separate processes.
+    // Here a raw connect plus a hand-written HELLO fills the slots.
     ensureIo();
     var raw_streams: [MAX_PEERS]net.Stream = undefined;
     var n_raw: usize = 0;
@@ -3834,7 +3834,7 @@ test "netsync: 複数 client MAX_PEERS まで HELLO" {
         try encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), hello);
         try writer.interface.flush();
 
-        // 応答 HELLO を読む
+        // read the HELLO response
         var rbuf: [256]u8 = undefined;
         var reader = s.reader(io_val, &rbuf);
         var pbuf: [128]u8 = undefined;
@@ -3846,7 +3846,7 @@ test "netsync: 複数 client MAX_PEERS まで HELLO" {
     try testing.expectEqual(@as(usize, MAX_PEERS), peerCount());
 }
 
-test "netsync: MAX_PEERS 超過は切断" {
+test "netsync: going over MAX_PEERS disconnects" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -3879,16 +3879,16 @@ test "netsync: MAX_PEERS 超過は切断" {
     }
     try waitPeers(MAX_PEERS, 3000);
 
-    // 超過接続: accept 後即 close される。書き込み/読みで失敗するはず。
+    // a connection over the limit: accepted then closed at once, so a write or a read should fail.
     const extra = try addr.connect(io_val, .{ .mode = .stream });
     streams[n] = extra;
     n += 1;
     sleepMs(50);
-    // peerCount は増えない
+    // peerCount does not rise
     try testing.expectEqual(@as(usize, MAX_PEERS), peerCount());
 }
 
-test "netsync: 1 client 切断後の slot 再利用" {
+test "netsync: reusing a slot after one client disconnects" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -3909,7 +3909,7 @@ test "netsync: 1 client 切断後の slot 再利用" {
         _ = try decodeFrame(&reader.interface, &pbuf);
         try waitPeers(1, 2000);
     }
-    // close 後スロット解放待ち
+    // wait for the slot to be released after the close
     var waited: u64 = 0;
     while (peerCount() != 0) {
         if (waited >= 3000) return error.Timeout;
@@ -3917,7 +3917,7 @@ test "netsync: 1 client 切断後の slot 再利用" {
         waited += 10;
     }
 
-    // 再利用
+    // reuse
     const s2 = try addr.connect(io_val, .{ .mode = .stream });
     defer s2.close(io_val);
     var wbuf2: [128]u8 = undefined;
@@ -3934,7 +3934,7 @@ test "netsync: 1 client 切断後の slot 再利用" {
     try testing.expectEqualStrings("second", getPeer(0, &label_buf).?.label);
 }
 
-test "netsync: shutdown 後は connection refused" {
+test "netsync: after a shutdown the connection is refused" {
     resetForTest();
     initHost(0);
     const port = listeningPort().?;
@@ -3944,25 +3944,25 @@ test "netsync: shutdown 後は connection refused" {
     try testing.expectError(error.ConnectionRefused, addr.connect(io_val, .{ .mode = .stream }));
 }
 
-test "netsync: host 未起動 fail-soft" {
+test "netsync: a fail-soft when the host is not running" {
     resetForTest();
     defer resetForTest();
     ensureIo();
-    // 未使用高位 port
+    // an unused high port
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(1) }; // usually refused
     initClient(addr);
     try testing.expect(!isEnabled());
     try testing.expect(!isClient());
 }
 
-// TASK-166: client を先に init → 数百 ms 後に host が listen してもリトライで接続成立する。
-// 同一プロセスは host/client どちらか一方の role のみなので、遅延 dumb host スレッドで listen する。
-test "netsync: client ConnectionRefused をリトライし遅延 host で接続成立" {
+// Init the client first, then have the host listen a few hundred ms later; the retry still connects.
+// One process takes only one of the host and client roles, so a delayed dumb host thread does the listening.
+test "netsync: a client retries ConnectionRefused and connects to a delayed host" {
     resetForTest();
     defer resetForTest();
     ensureIo();
 
-    // 空き port を確保して即閉じる（遅延 host が同じ port で listen）。
+    // Take a free port and close it at once (the delayed host listens on the same one).
     const probe_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
     var probe = try probe_addr.listen(io_val, .{ .reuse_address = true });
     const port = probe.socket.address.getPort();
@@ -3971,7 +3971,7 @@ test "netsync: client ConnectionRefused をリトライし遅延 host で接続�
     const DelayedHost = struct {
         fn run(p: u16) void {
             ensureIo();
-            // client の初回〜2 回目リトライを跨ぐ（backoff 100+200=300ms 付近で accept 可能に）。
+            // Span the client's first and second retries (accept becomes possible around backoff 100+200=300ms).
             sleepMs(300);
             const a = net.IpAddress{ .ip4 = net.Ip4Address.loopback(p) };
             var srv = a.listen(io_val, .{ .reuse_address = true }) catch return;
@@ -4005,11 +4005,11 @@ test "netsync: client ConnectionRefused をリトライし遅延 host で接続�
     try testing.expect(isEnabled());
     try testing.expect(isClient());
     try waitClientActive(3000);
-    // SYNC 無し dumb host のため awaiting_sync は立ったまま（接続成立自体が AC）。
+    // The dumb host sends no SYNC, so awaiting_sync stays raised (the connection being established is the point).
     try testing.expect(awaiting_sync);
 }
 
-test "netsync: shutdown 二重呼び出し安全" {
+test "netsync: calling shutdown twice is safe" {
     resetForTest();
     initHost(0);
     shutdown();
@@ -4056,14 +4056,14 @@ test "netsync: broadcast fan-out" {
         var rbuf: [256]u8 = undefined;
         var reader = streams[i].reader(io_val, &rbuf);
         var pbuf: [128]u8 = undefined;
-        // 後から join した peer の PEER_INFO が SYNC 後に残ることがある
+        // a PEER_INFO from a peer that joined later can remain after the SYNC
         const frame = try decodeSkippingPeerInfo(&reader.interface, &pbuf);
         try testing.expectEqual(@intFromEnum(FrameKind.commit), frame.kind);
         try testing.expectEqualStrings("seq-test", frame.payload);
     }
 }
 
-test "netsync: inbound 満杯で切断" {
+test "netsync: a full inbound queue disconnects" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -4082,26 +4082,26 @@ test "netsync: inbound 満杯で切断" {
     var pbuf: [64]u8 = undefined;
     _ = try decodeFrame(&reader.interface, &pbuf);
     try waitPeers(1, 2000);
-    // ClientJoined を処理して inbound を空けてから PROPOSE を詰める
+    // handle ClientJoined to empty inbound, then pack it with PROPOSE frames
     try pumpUntilAllSynced(2000);
     try expectEmptySync(s);
 
-    // pump せず INBOUND_CAP+1 個の PROPOSE を送る
+    // send INBOUND_CAP+1 PROPOSE frames without pumping
     var n: usize = 0;
     while (n < INBOUND_CAP + 8) : (n += 1) {
         encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), "x") catch break;
         writer.interface.flush() catch break;
     }
 
-    // 切断されるまで待つ（peer テーブルから消える + 相手 read が EOF）
+    // wait until it is disconnected (it leaves the peer table and the other side's read hits EOF)
     var waited: u64 = 0;
     while (peerCount() != 0) {
         if (waited >= 3000) return error.Timeout;
         sleepMs(10);
         waited += 10;
     }
-    // 切断後の read は EOF / エラー（残バッファがあれば読み捨て）。
-    // join PEER_INFO 追加後、reader 再生成で socket を取り直す（同一 reader の stale 回避）。
+    // A read after the disconnect gives EOF or an error (with anything left in the buffer discarded).
+    // Once the join PEER_INFO was added, recreate the reader to take the socket afresh (avoiding a stale one).
     var rbuf2: [128]u8 = undefined;
     var reader2 = s.reader(io_val, &rbuf2);
     var saw_err = false;
@@ -4115,7 +4115,7 @@ test "netsync: inbound 満杯で切断" {
     try testing.expect(saw_err);
 }
 
-test "netsync: HELLO 前の SYNC は切断（読み捨て継続しない）" {
+test "netsync: a SYNC before HELLO disconnects (rather than being discarded to carry on)" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -4127,7 +4127,7 @@ test "netsync: HELLO 前の SYNC は切断（読み捨て継続しない）" {
     defer s.close(io_val);
     var wbuf: [128]u8 = undefined;
     var writer = s.writer(io_val, &wbuf);
-    // HELLO 前に SYNC → protocol error 切断（その後 HELLO しても active 化しない）
+    // a SYNC before HELLO → a protocol error disconnect (and a HELLO afterwards does not make it active)
     try encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), "sync-early");
     try writer.interface.flush();
     try encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), "client 1 human late");
@@ -4136,7 +4136,7 @@ test "netsync: HELLO 前の SYNC は切断（読み捨て継続しない）" {
     try testing.expectEqual(@as(usize, 0), peerCount());
 }
 
-test "netsync: HELLO 前の非 HELLO / duplicate / version 不一致は切断" {
+test "netsync: a non-HELLO before HELLO, a duplicate, and a version mismatch all disconnect" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -4144,7 +4144,7 @@ test "netsync: HELLO 前の非 HELLO / duplicate / version 不一致は切断" {
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     ensureIo();
 
-    // 非 HELLO 先送り
+    // sending a non-HELLO first
     {
         const s = try addr.connect(io_val, .{ .mode = .stream });
         defer s.close(io_val);
@@ -4155,7 +4155,7 @@ test "netsync: HELLO 前の非 HELLO / duplicate / version 不一致は切断" {
         sleepMs(50);
     }
 
-    // version 不一致
+    // a version mismatch
     {
         const s = try addr.connect(io_val, .{ .mode = .stream });
         defer s.close(io_val);
@@ -4186,8 +4186,8 @@ test "netsync: HELLO 前の非 HELLO / duplicate / version 不一致は切断" {
     }
 }
 
-test "netsync: clientSend outbound 満杯で fail-soft" {
-    // 同一プロセスで host 役は使えないので、dumb host スレッドを立てて client 役で接続する。
+test "netsync: clientSend fails soft on a full outbound queue" {
+    // A host role is unusable in the same process, so a dumb host thread is started and this connects in the client role.
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -4212,7 +4212,7 @@ test "netsync: clientSend outbound 満杯で fail-soft" {
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
-            // 以降読まない（TCP 窓を詰まらせる）。client 切断で EOF になるまで待つ。
+            // Read nothing from here on (which clogs the TCP window). Wait until the client's disconnect gives EOF.
             while (true) {
                 _ = reader.interface.takeByte() catch break;
             }
@@ -4220,7 +4220,7 @@ test "netsync: clientSend outbound 満杯で fail-soft" {
     };
     const ht = try std.Thread.spawn(.{}, DumbHost.run, .{&srv});
     defer {
-        // client 側 shutdown 後に host が終わる。listen を閉じてから join。
+        // The host finishes after the client's shutdown. Close the listen socket, then join.
         resetForTest();
         srv.deinit(io_val);
         ht.join();
@@ -4231,7 +4231,7 @@ test "netsync: clientSend outbound 満杯で fail-soft" {
     try waitClientActive(2000);
     try testing.expect(isEnabled());
 
-    // 大きな payload を連打。peer が読まないため writer が TCP で詰まり outbound が満杯になる。
+    // Fire off large payloads. The peer does not read, so the writer clogs up on TCP and the outbound queue fills.
     var payload: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
     @memset(&payload, 'Z');
     var failed = false;
@@ -4247,7 +4247,7 @@ test "netsync: clientSend outbound 満杯で fail-soft" {
 }
 
 // ============================================================================
-// TASK-62.3.2 semantic tests
+// semantic tests
 // ============================================================================
 
 const SemCtx = struct {
@@ -4281,12 +4281,12 @@ fn rawHelloConnect(addr: net.IpAddress, label: []const u8) !net.Stream {
     return rawHelloConnectAs(addr, .human, label);
 }
 
-/// host HELLO 応答まで読んで stream を返す。
+/// Reads as far as the host's HELLO response and returns the stream.
 ///
-/// **注意（PEER_INFO 以降を読むとき）**: 本関数は HELLO 用に一時 `Stream.reader` を作り破棄する。
-/// host が HELLO 直後に PEER_INFO を同一 TCP セグメントで送ると、未消費の PEER_INFO が
-/// 一時 rbuf ごと失われ、呼び出し側が新 reader で読むと順序が飛んだように見える。
-/// PEER_INFO の順序検証などは HELLO から同一 reader を保持すること（join 配布順序テスト参照）。
+/// **A caution when reading past the PEER_INFO frames**: this function makes a temporary `Stream.reader` for the HELLO and discards it.
+/// If the host sends PEER_INFO in the same TCP segment right after the HELLO, the unconsumed PEER_INFO is
+/// lost along with the temporary rbuf, and reading with a new reader looks as though the order jumped.
+/// To check the PEER_INFO ordering, hold the same reader from the HELLO on (see the join distribution ordering test).
 fn rawHelloConnectAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) !net.Stream {
     ensureIo();
     const s = try addr.connect(io_val, .{ .mode = .stream });
@@ -4326,7 +4326,7 @@ test "netsync: payload PROPOSE/COMMIT/REJECT round-trip" {
     try testing.expectEqualStrings("not relayable", rp.reason);
 }
 
-test "netsync: router host 5 policy 分岐" {
+test "netsync: the router's five policy branches on a host" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
@@ -4345,14 +4345,14 @@ test "netsync: router host 5 policy 分岐" {
 
     const r1 = try action_registry.routeLocalAction("h_local", "b", &buf);
     try testing.expectEqualStrings("ok:b", r1);
-    try testing.expectEqual(@as(u64, 1), wireSeq()); // local_only は seq 消費しない
+    try testing.expectEqual(@as(u64, 1), wireSeq()); // local_only consumes no seq
 
     try testing.expectError(error.RejectedWhileSynced, action_registry.routeLocalAction("h_reject", "", &buf));
     try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("h_undo", "", &buf));
     try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("h_redo", "", &buf));
 }
 
-test "netsync: router client 5 policy 分岐" {
+test "netsync: the router's five policy branches on a client" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -4376,12 +4376,12 @@ test "netsync: router client 5 policy 分岐" {
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
-            // 空 SYNC で awaiting_sync を解除してから PROPOSE を待つ（TASK-106.2）
+            // release awaiting_sync with an empty SYNC, then wait for the PROPOSE
             var sync_pl: [8]u8 = undefined;
             std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
             writer.interface.flush() catch return;
-            // PROPOSE を1件読んで捨てる（client relay 用）
+            // read one PROPOSE and discard it (for the client relay)
             _ = decodeFrame(&reader.interface, &pbuf) catch {};
             sleepMs(200);
         }
@@ -4409,7 +4409,7 @@ test "netsync: router client 5 policy 分岐" {
     var buf: [128]u8 = undefined;
     const pr = try action_registry.routeLocalAction("c_relay", "x", &buf);
     try testing.expectEqualStrings("proposed 1", pr);
-    try testing.expectEqual(@as(u32, 0), ctx.calls); // ローカル適用なし
+    try testing.expectEqual(@as(u32, 0), ctx.calls); // nothing applied locally
 
     const loc = try action_registry.routeLocalAction("c_local", "y", &buf);
     try testing.expectEqualStrings("ok:y", loc);
@@ -4420,7 +4420,7 @@ test "netsync: router client 5 policy 分岐" {
     try testing.expectError(error.NoExecutor, action_registry.routeLocalAction("c_redo", "", &buf));
 }
 
-test "netsync: commitAndBroadcast seq 単調増加と COMMIT origin_peer=0" {
+test "netsync: commitAndBroadcast increases seq monotonically and COMMIT carries origin_peer=0" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
@@ -4456,7 +4456,7 @@ test "netsync: commitAndBroadcast seq 単調増加と COMMIT origin_peer=0" {
     try testing.expectEqual(@as(u32, 0), c2.origin_peer);
 }
 
-test "netsync: host PROPOSE 再検証 REJECT（non-relay・未知）" {
+test "netsync: the host re-validates a PROPOSE and REJECTs it (non-relay, and unknown)" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
@@ -4481,7 +4481,7 @@ test "netsync: host PROPOSE 再検証 REJECT（non-relay・未知）" {
     try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), unk);
     try writer.interface.flush();
 
-    // host が読むまで待つ
+    // wait until the host reads
     var waited: u64 = 0;
     while (inboundLen() < 2 and waited < 2000) : (waited += 5) sleepMs(5);
     pump();
@@ -4503,7 +4503,7 @@ test "netsync: host PROPOSE 再検証 REJECT（non-relay・未知）" {
     try testing.expectEqualStrings("not relayable", p2.reason);
 }
 
-test "netsync: pattern_state client PROPOSE は not relayable で REJECT（TASK-106.1）" {
+test "netsync: a client PROPOSE of pattern_state is REJECTed as not relayable" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
@@ -4539,7 +4539,7 @@ test "netsync: pattern_state client PROPOSE は not relayable で REJECT（TASK-
     try testing.expectEqual(@as(u32, 0), ctx.calls);
 }
 
-test "netsync: PROPOSE→COMMIT round-trip（remote_commit で CommandRecord が増える）" {
+test "netsync: a PROPOSE to COMMIT round trip (a remote_commit adds a CommandRecord)" {
     resetForTest();
     defer resetForTest();
 
@@ -4579,7 +4579,7 @@ test "netsync: PROPOSE→COMMIT round-trip（remote_commit で CommandRecord が
     var waited: u64 = 0;
     while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
     pump();
-    try testing.expectEqual(before + 1, log.filled); // remote_commit 記録
+    try testing.expectEqual(before + 1, log.filled); // a remote_commit record
     try testing.expectEqual(@as(u64, 1), wireSeq());
     try testing.expect(log.findBySeq(1).?.actor.eql(.{ .peer = 1 }));
 
@@ -4594,7 +4594,7 @@ test "netsync: PROPOSE→COMMIT round-trip（remote_commit で CommandRecord が
     try testing.expectEqualStrings("stroke", c.name);
 }
 
-test "netsync: REJECT 受信で last_rejected_proposal 保存" {
+test "netsync: receiving a REJECT stores last_rejected_proposal" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -4618,7 +4618,7 @@ test "netsync: REJECT 受信で last_rejected_proposal 保存" {
             const resp = formatHostHello(&hbuf, 2) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
-            // 空 SYNC で awaiting_sync を解除してから REJECT
+            // release awaiting_sync with an empty SYNC, then REJECT
             var sync_pl: [8]u8 = undefined;
             std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
@@ -4635,7 +4635,7 @@ test "netsync: REJECT 受信で last_rejected_proposal 保存" {
     const caddr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     initClientAs(caddr, .human, "rj");
     try waitClientActive(2000);
-    // SYNC 適用 → awaiting_sync 解除
+    // apply the SYNC → awaiting_sync released
     var waited: u64 = 0;
     while (testAwaitingSync() and waited < 2000) : (waited += 5) {
         pump();
@@ -4649,7 +4649,7 @@ test "netsync: REJECT 受信で last_rejected_proposal 保存" {
     try testing.expectEqualStrings("nope", lastRejectReason());
 }
 
-test "netsync: proposal_id 単調増加" {
+test "netsync: proposal_id increases monotonically" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -4673,7 +4673,7 @@ test "netsync: proposal_id 単調増加" {
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
-            // 空 SYNC で awaiting_sync を解除（TASK-106.2）
+            // release awaiting_sync with an empty SYNC
             var sync_pl: [8]u8 = undefined;
             std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
@@ -4701,7 +4701,7 @@ test "netsync: proposal_id 単調増加" {
     try testing.expectEqualStrings("proposed 2", try proposeToHost("stroke", "b", &buf));
 }
 
-test "netsync: wire_session 中 local save は seq 非消費→COMMIT が Stale にならない" {
+test "netsync: a local save during a wire_session consumes no seq, so a COMMIT does not go stale" {
     resetForTest();
     defer resetForTest();
 
@@ -4770,7 +4770,7 @@ test "netsync: wire_session 中 local save は seq 非消費→COMMIT が Stale 
     }
     try testing.expect(!testAwaitingSync());
 
-    // wire_session 中の local 記録は抑止
+    // a local record during a wire_session is suppressed
     var buf: [128]u8 = undefined;
     _ = try exec.executeAction("save", "/tmp/x", .{ .actor = .local_user, .record_policy = .record }, &buf);
     try testing.expectEqual(@as(u32, 0), log.filled);
@@ -4784,7 +4784,7 @@ test "netsync: wire_session 中 local save は seq 非消費→COMMIT が Stale 
     try testing.expect(exec_ctx.calls >= 2); // save dispatch + remote stroke
 }
 
-test "netsync: fail-soft 後 pump で router 解除され通常ローカル動作" {
+test "netsync: after a fail-soft, pump clears the router and ordinary local operation resumes" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -4808,7 +4808,7 @@ test "netsync: fail-soft 後 pump で router 解除され通常ローカル動�
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
-            // client が active になるまで維持してから切断
+            // keep it until the client becomes active, then disconnect
             var waited: u64 = 0;
             while (!gate.load(.seq_cst) and waited < 5000) : (waited += 10) sleepMs(10);
         }
@@ -4826,7 +4826,7 @@ test "netsync: fail-soft 後 pump で router 解除され通常ローカル動�
     try waitClientActive(2000);
     try testing.expect(isEnabled());
 
-    close_gate.store(true, .seq_cst); // host が接続を閉じる
+    close_gate.store(true, .seq_cst); // the host closes the connection
     var waited: u64 = 0;
     while (isEnabled() and waited < 3000) : (waited += 10) sleepMs(10);
     try testing.expect(!isEnabled());
@@ -4838,7 +4838,7 @@ test "netsync: fail-soft 後 pump で router 解除され通常ローカル動�
     try testing.expectEqual(@as(u32, 1), ctx.calls);
 }
 
-test "netsync: shutdown 後 routeLocalAction は dispatch 等価" {
+test "netsync: after a shutdown routeLocalAction is equivalent to a dispatch" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
@@ -4847,14 +4847,14 @@ test "netsync: shutdown 後 routeLocalAction は dispatch 等価" {
     try testing.expect(isHost());
     shutdown();
     try testing.expect(!isEnabled());
-    // shutdown は setRouter(null)。register は残る（resetForTest 前）
+    // shutdown is setRouter(null). The registration survives (before resetForTest)
     action_registry.setEnabled(true);
     var buf: [64]u8 = undefined;
     const out = try action_registry.routeLocalAction("stroke", "s", &buf);
     try testing.expectEqualStrings("ok:s", out);
 }
 
-test "netsync: env 未設定パススルー（pump/isEnabled）" {
+test "netsync: passing straight through with the environment unset (pump and isEnabled)" {
     resetForTest();
     defer resetForTest();
     try testing.expect(!isEnabled());
@@ -4862,10 +4862,10 @@ test "netsync: env 未設定パススルー（pump/isEnabled）" {
     try testing.expectEqual(@as(usize, 0), inboundLen());
 }
 
-test "netsync: デフォルト識別子 HELLO は parseClientHello 受理（initClient 経路）" {
+test "netsync: a HELLO with the default identifiers is accepted by parseClientHello (the initClient path)" {
     resetForTest();
     defer resetForTest();
-    // initClient が渡すのと同じスライスで HELLO を組み立てる（宣言時 "client" 初期化の回帰）。
+    // Build the HELLO with the same slice initClient passes (a regression check on the "client" initialiser at the declaration).
     try testing.expectEqual(@as(usize, default_client_label.len), client_label_len);
     try testing.expectEqualStrings(default_client_label, client_label_buf[0..client_label_len]);
     var buf: [256]u8 = undefined;
@@ -4876,10 +4876,10 @@ test "netsync: デフォルト識別子 HELLO は parseClientHello 受理（init
     for (parsed.label) |c| try testing.expect(c >= 0x20);
 }
 
-test "netsync: 未初期化相当 label でも defaultClientLabel 後は HELLO 受理" {
+test "netsync: even a label that amounts to uninitialised is accepted in a HELLO once defaultClientLabel has run" {
     resetForTest();
     defer resetForTest();
-    // E2E で観測したバグ状態: len=6 だが buf が NUL 埋め
+    // The buggy state observed in the E2E: len=6 but the buffer is NUL-filled
     @memset(client_label_buf[0..6], 0);
     client_label_len = 6;
     var bad_buf: [256]u8 = undefined;
@@ -4894,7 +4894,7 @@ test "netsync: 未初期化相当 label でも defaultClientLabel 後は HELLO �
 }
 
 // ============================================================================
-// TASK-62.3.3 StateSync / SYNC tests
+// StateSync and SYNC tests
 // ============================================================================
 
 const SyncCtx = struct {
@@ -4923,7 +4923,7 @@ fn syncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     c.last_import_len = n;
 }
 
-test "netsync: StateSync register/reset と無効時も安全" {
+test "netsync: StateSync register and reset, and being safe while disabled" {
     resetForTest();
     defer resetForTest();
     var ctx: SyncCtx = .{};
@@ -4931,12 +4931,12 @@ test "netsync: StateSync register/reset と無効時も安全" {
     try testing.expect(state_sync != null);
     resetForTest();
     try testing.expect(state_sync == null);
-    // 無効時も register 可
+    // registration works while disabled too
     registerStateSync(.{ .ctx = &ctx, .export_fn = syncExport, .import_fn = syncImport });
     try testing.expect(state_sync != null);
 }
 
-test "netsync: join 後の非 HELLO 先頭 frame は SYNC（空・snapshot_valid=false）" {
+test "netsync: the first non-HELLO frame after a join is a SYNC (empty, with snapshot_valid=false)" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -4952,7 +4952,7 @@ test "netsync: join 後の非 HELLO 先頭 frame は SYNC（空・snapshot_valid
     try testing.expectEqual(@as(u64, 0), info.join_snapshot_seq);
 }
 
-test "netsync: synced ゲート（SYNC 前 COMMIT 不達・SYNC 後は届く）" {
+test "netsync: the synced gate (a COMMIT before the SYNC does not arrive, and one after it does)" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
@@ -4963,12 +4963,12 @@ test "netsync: synced ゲート（SYNC 前 COMMIT 不達・SYNC 後は届く）"
     defer stream.close(io_val);
     try waitPeers(1, 2000);
 
-    // ClientJoined 未処理 = 未 synced → broadcast されない
+    // ClientJoined unhandled = not synced → not broadcast to
     var buf: [64]u8 = undefined;
     _ = try commitAndBroadcast("stroke", "pre", &buf);
 
     try pumpUntilAllSynced(2000);
-    try expectEmptySync(stream); // SYNC のみ（pre COMMIT は無い）
+    try expectEmptySync(stream); // the SYNC alone (there is no COMMIT before it)
 
     _ = try commitAndBroadcast("stroke", "post", &buf);
     var rbuf: [256]u8 = undefined;
@@ -4980,7 +4980,7 @@ test "netsync: synced ゲート（SYNC 前 COMMIT 不達・SYNC 後は届く）"
     try testing.expectEqualStrings("post", c.args);
 }
 
-test "netsync: export 登録時 SYNC に state が載り snapshot_valid" {
+test "netsync: with an export registered the SYNC carries the state and snapshot_valid holds" {
     resetForTest();
     defer resetForTest();
     var sctx: SyncCtx = .{ .export_bytes = "DOC42" };
@@ -4994,7 +4994,7 @@ test "netsync: export 登録時 SYNC に state が載り snapshot_valid" {
     var rbuf: [512]u8 = undefined;
     var reader = stream.reader(io_val, &rbuf);
     var pbuf: [MAX_ACTION_FRAME_BYTES]u8 = undefined;
-    // PEER_INFO (host) が SYNC より先に並ぶ
+    // PEER_INFO (the host) is ordered ahead of the SYNC
     const f = try decodeSkippingPeerInfo(&reader.interface, &pbuf);
     try testing.expectEqual(@intFromEnum(FrameKind.sync), f.kind);
     const p = try parseSyncPayload(f.payload);
@@ -5003,7 +5003,7 @@ test "netsync: export 登録時 SYNC に state が載り snapshot_valid" {
     try testing.expect(info.snapshot_valid);
 }
 
-test "netsync: export 0 byte は切断" {
+test "netsync: an export of 0 bytes disconnects" {
     resetForTest();
     defer resetForTest();
     var sctx: SyncCtx = .{ .export_empty = true };
@@ -5019,7 +5019,7 @@ test "netsync: export 0 byte は切断" {
     try testing.expectEqual(@as(usize, 0), peerCount());
 }
 
-test "netsync: awaiting_sync 中の PROPOSE は session_not_ready" {
+test "netsync: a PROPOSE while awaiting_sync gives session_not_ready" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -5033,7 +5033,7 @@ test "netsync: awaiting_sync 中の PROPOSE は session_not_ready" {
     try testing.expectError(error.SessionNotReady, proposeToHost("add_node", "vco 0 0", &buf));
 }
 
-test "netsync: client SYNC import と awaiting_sync 中 COMMIT 保留" {
+test "netsync: a client's SYNC import, and a COMMIT held while awaiting_sync" {
     resetForTest();
     defer resetForTest();
     var sctx: SyncCtx = .{};
@@ -5060,7 +5060,7 @@ test "netsync: client SYNC import と awaiting_sync 中 COMMIT 保留" {
             const resp = formatHostHello(&hbuf, 1) catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.hello), resp) catch return;
             writer.interface.flush() catch return;
-            // COMMIT を先に送り、その後大きな SYNC（awaiting 中は COMMIT 保留）
+            // Send the COMMIT first, then a large SYNC (a COMMIT is held while awaiting)
             const commit = formatCommitPayload(&pbuf, 1, 0, "stroke", "held") catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.commit), commit) catch return;
             writer.interface.flush() catch return;
@@ -5082,11 +5082,11 @@ test "netsync: client SYNC import と awaiting_sync 中 COMMIT 保留" {
     try waitClientActive(2000);
     try testing.expect(testAwaitingSync());
 
-    // COMMIT は inbound に残るが awaiting のため適用されない
+    // the COMMIT stays in inbound but is not applied, because of awaiting
     var waited: u64 = 0;
     while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
-    pump(); // SYNC 未着なら dequeue しない。SYNC 着なら import→その後も同 pump では dequeue しない（awaiting 解除後の次 pump）
-    // SYNC 待ち
+    pump(); // With no SYNC yet it does not dequeue. Once the SYNC arrives it imports, and even then does not dequeue in the same pump (that waits for the pump after awaiting is released)
+    // waiting for the SYNC
     waited = 0;
     while (testAwaitingSync() and waited < 3000) : (waited += 5) {
         pump();
@@ -5095,13 +5095,13 @@ test "netsync: client SYNC import と awaiting_sync 中 COMMIT 保留" {
     try testing.expect(!testAwaitingSync());
     try testing.expectEqual(@as(u32, 1), sctx.import_calls);
     try testing.expectEqualStrings("BIGSTATE_OVER_INLINE", sctx.last_import[0..sctx.last_import_len]);
-    try testing.expectEqual(@as(u32, 0), actx.calls); // COMMIT まだ
+    try testing.expectEqual(@as(u32, 0), actx.calls); // the COMMIT still has not
 
-    pump(); // 保留 COMMIT 適用
+    pump(); // the held COMMIT is applied
     try testing.expectEqual(@as(u32, 1), actx.calls);
 }
 
-test "netsync: import 失敗は fail-soft（保留 COMMIT 不適用）" {
+test "netsync: a failed import fails soft (and the held COMMIT is not applied)" {
     resetForTest();
     defer resetForTest();
     var sctx: SyncCtx = .{ .import_fail = true };
@@ -5153,23 +5153,23 @@ test "netsync: import 失敗は fail-soft（保留 COMMIT 不適用）" {
     try testing.expectEqual(@as(u32, 0), actx.calls);
 }
 
-test "netsync: stale ClientJoined は無視" {
+test "netsync: a stale ClientJoined is ignored" {
     resetForTest();
     defer resetForTest();
     initHost(0);
-    // 直接 stale マーカーを積む
+    // put a stale marker on directly
     var joined: [8]u8 = undefined;
     std.mem.writeInt(u32, joined[0..4], 99, .little);
     std.mem.writeInt(u32, joined[4..8], 1, .little);
     try testing.expect(inbound.enqueue(io_val, INTERNAL_CLIENT_JOINED, &joined, 99));
-    pump(); // 無視して落ちない
+    pump(); // ignored, without falling over
     try testing.expectEqual(@as(usize, 0), peerCount());
 }
 
-test "netsync: big-entry enqueue 失敗時は呼び出し元が解放（切断）" {
+test "netsync: on a failed big-entry enqueue the caller frees it (and it disconnects)" {
     resetForTest();
     defer resetForTest();
-    // outbound を満杯にして enqueueBig 失敗経路を踏む
+    // fill the outbound queue to take the enqueueBig failure path
     initHost(0);
     const port = listeningPort().?;
     var stream = try rawHelloConnect(net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) }, "full");
@@ -5178,7 +5178,7 @@ test "netsync: big-entry enqueue 失敗時は呼び出し元が解放（切断�
 
     peers_mutex.lockUncancelable(io_val);
     const slot = &slots[0];
-    // ClientJoined 前に outbound を詰め、writer の drain で空きが出ないよう close して enqueueBig 失敗を確定させる
+    // Clog the outbound queue before ClientJoined, and close it so the writer's drain cannot free room, which makes the enqueueBig failure certain
     var i: usize = 0;
     while (i < OUTBOUND_CAP) : (i += 1) {
         _ = slot.outbound.enqueue(io_val, 0x03, "pad");
@@ -5186,19 +5186,19 @@ test "netsync: big-entry enqueue 失敗時は呼び出し元が解放（切断�
     slot.outbound.close(io_val);
     peers_mutex.unlock(io_val);
 
-    pump(); // ClientJoined → enqueueBig 失敗 → 呼び出し元解放 + 切断
+    pump(); // ClientJoined → enqueueBig fails → the caller frees it, and the connection drops
     var waited: u64 = 0;
     while (peerCount() != 0 and waited < 3000) : (waited += 10) sleepMs(10);
     try testing.expectEqual(@as(usize, 0), peerCount());
 }
 
-test "netsync: big-entry 解放（dequeue 後・reset 未送出・enqueue 失敗呼び出し元）" {
+test "netsync: freeing a big entry (after a dequeue, unsent on a reset, and by the caller on a failed enqueue)" {
     resetForTest();
     defer resetForTest();
     ensureIo();
     var q: OutboundQueue = .{};
 
-    // 送出後相当: dequeue 所有権移転 → free
+    // the equivalent of having sent it: dequeue moves ownership → free
     {
         const buf = try gpa.alloc(u8, 64);
         @memset(buf, 0xAB);
@@ -5208,7 +5208,7 @@ test "netsync: big-entry 解放（dequeue 後・reset 未送出・enqueue 失敗
         entry.free();
     }
 
-    // shutdown/切断相当: reset が未送出 big を解放
+    // the equivalent of a shutdown or a disconnect: the reset frees an unsent big entry
     {
         const buf = try gpa.alloc(u8, 32);
         @memset(buf, 0xCD);
@@ -5217,7 +5217,7 @@ test "netsync: big-entry 解放（dequeue 後・reset 未送出・enqueue 失敗
         try testing.expectEqual(@as(usize, 0), q.count);
     }
 
-    // enqueue 失敗時は呼び出し元が解放（満杯）
+    // on an enqueue failure the caller frees it (a full queue)
     {
         var i: usize = 0;
         while (i < OUTBOUND_CAP) : (i += 1) {
@@ -5225,11 +5225,11 @@ test "netsync: big-entry 解放（dequeue 後・reset 未送出・enqueue 失敗
         }
         const orphan = try gpa.alloc(u8, 16);
         try testing.expect(!q.enqueueBig(io_val, 0x04, orphan));
-        gpa.free(orphan); // 呼び出し元解放
+        gpa.free(orphan); // the caller frees it
         q.reset(io_val);
     }
 
-    // closed でも enqueueBig 失敗 → 呼び出し元解放
+    // enqueueBig fails when closed too → the caller frees it
     {
         q.close(io_val);
         const orphan = try gpa.alloc(u8, 8);
@@ -5239,7 +5239,7 @@ test "netsync: big-entry 解放（dequeue 後・reset 未送出・enqueue 失敗
     }
 }
 
-test "netsync: writer encode/flush 失敗時も big-entry 解放" {
+test "netsync: a big entry is freed even when the writer's encode or flush fails" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -5249,7 +5249,7 @@ test "netsync: writer encode/flush 失敗時も big-entry 解放" {
     try pumpUntilAllSynced(2000);
     try expectEmptySync(stream);
 
-    // 大きな big-entry を積み、対向を閉じて write/flush 失敗 → writer が entry.free()
+    // Put a large big entry on, close the far end so the write or flush fails → the writer calls entry.free()
     peers_mutex.lockUncancelable(io_val);
     const big = try gpa.alloc(u8, 256 * 1024);
     @memset(big, 0xEF);
@@ -5267,7 +5267,7 @@ test "netsync: writer encode/flush 失敗時も big-entry 解放" {
     try testing.expect(slots[0].state == .empty);
 }
 
-test "netsync: slot 再利用時に前接続の未送出 big-entry が残らない" {
+test "netsync: reusing a slot leaves behind no unsent big entry from the previous connection" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -5284,7 +5284,7 @@ test "netsync: slot 再利用時に前接続の未送出 big-entry が残らな�
     const big = try gpa.alloc(u8, 128);
     @memset(big, 0x11);
     try testing.expect(slots[0].outbound.enqueueBig(io_val, @intFromEnum(FrameKind.sync), big));
-    // writer を止めて未送出のまま残す（reset/cleanup 経路の解放を検証）
+    // Stop the writer and leave it unsent (checking the freeing on the reset and cleanup paths)
     slots[0].outbound.close(io_val);
     peers_mutex.unlock(io_val);
 
@@ -5304,7 +5304,7 @@ test "netsync: slot 再利用時に前接続の未送出 big-entry が残らな�
     try testing.expectEqual(@as(usize, 0), slots[0].outbound.count);
 }
 
-test "netsync: shutdown 中の未送出 big-entry 解放と writer join" {
+test "netsync: freeing an unsent big entry during a shutdown, and joining the writer" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -5319,10 +5319,10 @@ test "netsync: shutdown 中の未送出 big-entry 解放と writer join" {
     const big = try gpa.alloc(u8, 64 * 1024);
     @memset(big, 0x22);
     try testing.expect(slots[0].outbound.enqueueBig(io_val, @intFromEnum(FrameKind.sync), big));
-    // 未送出を残すため writer を起こして終了させ、queue に entry を残す
+    // To leave something unsent, wake the writer and let it finish, leaving the entry on the queue
     slots[0].outbound.close(io_val);
     peers_mutex.unlock(io_val);
-    sleepMs(20); // writer が dequeueWait から抜けるのを待つ
+    sleepMs(20); // wait for the writer to come out of dequeueWait
 
     shutdown();
     try testing.expect(!isEnabled());
@@ -5333,7 +5333,7 @@ test "netsync: shutdown 中の未送出 big-entry 解放と writer join" {
     try testing.expect(slots[0].state == .empty);
 }
 
-test "netsync: gatherStats 無効時は既定値" {
+test "netsync: gatherStats gives the defaults while disabled" {
     resetForTest();
     defer resetForTest();
     const st = gatherStats();
@@ -5347,7 +5347,7 @@ test "netsync: gatherStats 無効時は既定値" {
     try testing.expectEqual(@as(u32, 0), st.last_reject);
 }
 
-test "netsync: gatherStats host 有効時 peers・pending" {
+test "netsync: gatherStats reports peers and pending on an enabled host" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -5356,7 +5356,7 @@ test "netsync: gatherStats host 有効時 peers・pending" {
     defer stream.close(io_val);
     try waitPeers(1, 2000);
 
-    // ClientJoined 未 pump → pending>=1
+    // ClientJoined not yet pumped → pending>=1
     const before = gatherStats();
     try testing.expectEqual(Role.host, before.role);
     try testing.expectEqual(@as(usize, 1), before.peers);
@@ -5370,7 +5370,7 @@ test "netsync: gatherStats host 有効時 peers・pending" {
     try testing.expectEqual(@as(u64, 0), after.last_seq);
 }
 
-test "netsync: gatherStats client awaiting_sync 遷移と last_applied_seq" {
+test "netsync: gatherStats through a client's awaiting_sync transition, and last_applied_seq" {
     resetForTest();
     defer resetForTest();
 
@@ -5434,7 +5434,7 @@ test "netsync: gatherStats client awaiting_sync 遷移と last_applied_seq" {
     try testing.expectEqual(@as(u32, 1), actx.calls);
 }
 
-test "netsync: digest 整形・reject_reason 正規化と切り詰め" {
+test "netsync: formatting the digest, and normalising and truncating reject_reason" {
     resetForTest();
     defer resetForTest();
 
@@ -5444,7 +5444,7 @@ test "netsync: digest 整形・reject_reason 正規化と切り詰め" {
     try testing.expect(std.mem.indexOf(u8, disabled, "last_reject=none") != null);
     try testing.expect(std.mem.indexOf(u8, disabled, "reject_reason=none") != null);
 
-    // reason 正規化（単体）
+    // normalising a reason (on its own)
     var tok: [64]u8 = undefined;
     const s1 = sanitizeRejectReasonToken(&tok, "a b\tc\nd\r");
     try testing.expectEqualStrings("a_b_c_d_", s1);
@@ -5453,7 +5453,7 @@ test "netsync: digest 整形・reject_reason 正規化と切り詰め" {
     try testing.expectEqual(@as(usize, 64), s2.len);
     try testing.expect(std.mem.eql(u8, s2, long[0..64]));
 
-    // REJECT 後の digest
+    // the digest after a REJECT
     ensureIo();
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
     var srv = try addr.listen(io_val, .{ .reuse_address = true });
@@ -5505,10 +5505,10 @@ test "netsync: digest 整形・reject_reason 正規化と切り詰め" {
 }
 
 // ============================================================================
-// TASK-62.3.5 undo/redo / pending / REJECT
+// undo and redo, pending, and REJECT
 // ============================================================================
 
-/// noteUndo 付き executor 用モック（netsync wire undo テスト）。
+/// A mock executor that supports noteUndo (for the netsync wire undo tests).
 const WireUndo = struct {
     exec: *command.Executor = undefined,
     next_ref: u64 = 1,
@@ -5572,7 +5572,7 @@ fn readRejectFrom(stream: net.Stream, reason_buf: []u8) !struct { proposal_id: u
     return .{ .proposal_id = parsed.proposal_id, .reason = reason_buf[0..n] };
 }
 
-test "netsync: undo 候補なしは no-op（PROPOSE_REVERT 非送信）" {
+test "netsync: with no undo candidate it is a no-op (no PROPOSE_REVERT is sent)" {
     resetForTest();
     defer resetForTest();
 
@@ -5605,7 +5605,7 @@ test "netsync: undo 候補なしは no-op（PROPOSE_REVERT 非送信）" {
             std.mem.writeInt(u64, sync_pl[0..8], 0, .little);
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
             writer.interface.flush() catch return;
-            // 接続維持（blocking read しない。shutdown で切断）
+            // keep the connection (without a blocking read; the shutdown disconnects)
             sleepMs(300);
         }
     };
@@ -5629,7 +5629,7 @@ test "netsync: undo 候補なしは no-op（PROPOSE_REVERT 非送信）" {
     try testing.expectEqual(@as(usize, 0), testPendingCount());
 }
 
-test "netsync: PROPOSE_REVERT→COMMIT_REVERT round-trip" {
+test "netsync: a PROPOSE_REVERT to COMMIT_REVERT round trip" {
     resetForTest();
     defer resetForTest();
 
@@ -5691,7 +5691,7 @@ test "netsync: PROPOSE_REVERT→COMMIT_REVERT round-trip" {
     try testing.expectEqual(@as(u64, 1), cr.target_seq);
 }
 
-test "netsync: PROPOSE_REVERT REJECT 全 reason" {
+test "netsync: every REJECT reason for a PROPOSE_REVERT" {
     resetForTest();
     defer resetForTest();
 
@@ -5719,7 +5719,7 @@ test "netsync: PROPOSE_REVERT REJECT 全 reason" {
     // seq2: peer1 not undoable
     _ = try exec.executeAction("set_tool", "pen", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 2 } } }, &abuf);
     noteWireSeq(2);
-    // seq3: peer2（not yours for peer1）
+    // seq3: peer2 (so "not yours" for peer1)
     _ = try exec.executeAction("stroke", "b", .{ .actor = .{ .peer = 2 }, .source = .{ .remote_commit = .{ .seq = 3 } } }, &abuf);
     noteWireSeq(3);
     // seq4: peer1 already reverted
@@ -5735,7 +5735,7 @@ test "netsync: PROPOSE_REVERT REJECT 全 reason" {
     }, &abuf);
     noteWireSeq(5);
     try exec.endTransaction(tx, .{ .peer = 1 });
-    // seq6: peer1 too old（undo_ref 無効化）
+    // seq6: peer1 too old (with the undo_ref invalidated)
     _ = try exec.executeAction("stroke", "e", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 6 } } }, &abuf);
     noteWireSeq(6);
     wu.valid[log.findBySeq(6).?.undo_ref.?] = false;
@@ -5765,7 +5765,7 @@ test "netsync: PROPOSE_REVERT REJECT 全 reason" {
         try testing.expectEqualStrings(c.reason, rej.reason);
     }
 
-    // before peer join: join_snapshot_seq を seq1 以上に
+    // before peer join: put join_snapshot_seq at seq1 or above
     try testing.expect(testSetJoinSnapshotSeq(1, 1));
     const pl = try formatProposeRevertPayload(&pbuf, 16, 1);
     try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), pl);
@@ -5779,7 +5779,7 @@ test "netsync: PROPOSE_REVERT REJECT 全 reason" {
     try testing.expectEqualStrings("before peer join", rej.reason);
 }
 
-test "netsync: host 多段 undo→redo 連鎖（epoch 自壊しない）" {
+test "netsync: a multi-stage undo then redo chain on a host (the epoch does not destroy itself)" {
     resetForTest();
     defer resetForTest();
 
@@ -5794,7 +5794,7 @@ test "netsync: host 多段 undo→redo 連鎖（epoch 自壊しない）" {
     registerSem("redo", &ctx, .redo_own);
 
     initHost(0);
-    // peer 無しでも host ローカル undo/redo は動く
+    // a host-local undo and redo work even with no peers
     var buf: [128]u8 = undefined;
     _ = try action_registry.routeLocalAction("stroke", "a", &buf); // seq1
     _ = try action_registry.routeLocalAction("stroke", "b", &buf); // seq2
@@ -5808,16 +5808,16 @@ test "netsync: host 多段 undo→redo 連鎖（epoch 自壊しない）" {
 
     const redo1 = try action_registry.routeLocalAction("redo", "", &buf);
     try testing.expect(std.mem.indexOf(u8, redo1, "ok:") != null);
-    // redo 由来は epoch を進めない → 2 段目 redo も候補あり
+    // a redo does not advance the epoch → so the second-stage redo still has a candidate
     const redo2 = try action_registry.routeLocalAction("redo", "", &buf);
     try testing.expect(std.mem.indexOf(u8, redo2, "ok:") != null);
 
-    // 再 undo 可能（自壊していない）
+    // it can be undone again (it has not destroyed itself)
     _ = try action_registry.routeLocalAction("undo", "", &buf);
     try testing.expect(exec.findUndoCandidate(.{ .peer = 0 }) != null or exec.findRedoCandidate(.{ .peer = 0 }) != null);
 }
 
-test "netsync: pending REJECT 除去" {
+test "netsync: removing a pending REJECT" {
     resetForTest();
     defer resetForTest();
 
@@ -5887,7 +5887,7 @@ test "netsync: pending REJECT 除去" {
     try testing.expect(lastRejectedProposal() != 0);
 }
 
-test "netsync: pending 満杯 backpressure" {
+test "netsync: backpressure from a full pending queue" {
     resetForTest();
     defer resetForTest();
 
@@ -5937,7 +5937,7 @@ test "netsync: pending 満杯 backpressure" {
         sleepMs(5);
     }
 
-    // outbound を詰まらせずに pending を満杯にする（直接 enqueue）
+    // Fill pending without clogging the outbound queue (by enqueuing directly)
     var i: u32 = 0;
     while (i < PENDING_CAP) : (i += 1) {
         try testing.expect(pendingEnqueue(.{ .proposal_id = i + 1, .kind = .normal, .redo_of = null, .target_seq = 0 }));
@@ -5947,7 +5947,7 @@ test "netsync: pending 満杯 backpressure" {
     try testing.expectError(error.PendingQueueFull, action_registry.routeLocalAction("stroke", "y", &buf));
 }
 
-test "netsync: 同一 target 並行 revert の後着 REJECT" {
+test "netsync: the later REJECT of two concurrent reverts of the same target" {
     resetForTest();
     defer resetForTest();
 
@@ -5989,7 +5989,7 @@ test "netsync: 同一 target 並行 revert の後着 REJECT" {
     try testing.expect(log.findBySeq(1).?.reverted);
     try testing.expectEqual(command.CommandKind.revert, log.findBySeq(2).?.kind);
 
-    // COMMIT_REVERT の後に REJECT
+    // a REJECT after the COMMIT_REVERT
     var rbuf: [256]u8 = undefined;
     var reader = stream.reader(io_val, &rbuf);
     var fbuf: [128]u8 = undefined;
@@ -6002,7 +6002,7 @@ test "netsync: 同一 target 並行 revert の後着 REJECT" {
     try testing.expectEqualStrings("already reverted", rej.reason);
 }
 
-test "netsync: fail-soft 後 wire_session 解除で local が record される" {
+test "netsync: clearing wire_session after a fail-soft makes a local command recorded again" {
     resetForTest();
     defer resetForTest();
 
@@ -6069,7 +6069,7 @@ test "netsync: fail-soft 後 wire_session 解除で local が record される" 
     try testing.expectEqual(@as(u32, 1), log.filled);
 }
 
-test "netsync: COMMIT 適用失敗で pending 保持 + fail-soft" {
+test "netsync: a failed COMMIT apply keeps pending and fails soft" {
     resetForTest();
     defer resetForTest();
 
@@ -6112,7 +6112,7 @@ test "netsync: COMMIT 適用失敗で pending 保持 + fail-soft" {
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_pl) catch return;
             writer.interface.flush() catch return;
             sleepMs(40);
-            // origin=自 peer(7) の COMMIT → pending head と対応
+            // a COMMIT with origin = this peer (7) → matches the pending head
             const commit = formatCommitPayload(&pbuf, 1, 7, "stroke", "boom") catch return;
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.commit), commit) catch return;
             writer.interface.flush() catch return;
@@ -6139,15 +6139,15 @@ test "netsync: COMMIT 適用失敗で pending 保持 + fail-soft" {
 
     var waited: u64 = 0;
     while (inboundLen() < 1 and waited < 2000) : (waited += 5) sleepMs(5);
-    pump(); // COMMIT 適用失敗 → fail-soft（pending は残る）
+    pump(); // applying the COMMIT fails → a fail-soft (pending survives)
     try testing.expect(!isEnabled());
     try testing.expectEqual(@as(usize, 1), testPendingCount());
     try testing.expectEqual(@as(u32, 0), log.filled);
 
-    pump(); // wire_session 解除
+    pump(); // wire_session cleared
     try testing.expect(!exec.wire_session);
 
-    // 以後ローカル記録に戻る（fail を外す）
+    // local recording resumes from here on (with the failure removed)
     fail_ctx.fail = false;
     var buf: [128]u8 = undefined;
     const res = try exec.executeAction("stroke", "local", .{ .actor = .local_user, .record_policy = .record }, &buf);
@@ -6156,7 +6156,7 @@ test "netsync: COMMIT 適用失敗で pending 保持 + fail-soft" {
 }
 
 // ============================================================================
-// TASK-62.5.6 session callback / env actor / probe peers+agents
+// the session callback, the environment actor, and the probe's peers and agents
 // ============================================================================
 
 var test_session_flag: bool = false;
@@ -6164,7 +6164,7 @@ fn testSessionCb(active: bool) void {
     test_session_flag = active;
 }
 
-test "netsync: session callback は enable/clear/fail-soft で発火" {
+test "netsync: the session callback fires on enable, clear and fail-soft" {
     resetForTest();
     defer resetForTest();
     test_session_flag = false;
@@ -6176,7 +6176,7 @@ test "netsync: session callback は enable/clear/fail-soft で発火" {
     shutdown();
     try testing.expect(!test_session_flag);
 
-    // fail-soft 経路: client 接続→切断→pump
+    // the fail-soft path: a client connects, disconnects, then pump
     test_session_flag = false;
     setSessionStateCallback(testSessionCb);
     ensureIo();
@@ -6225,7 +6225,7 @@ test "netsync: session callback は enable/clear/fail-soft で発火" {
     try testing.expect(!test_session_flag);
 }
 
-test "netsync: parseActorEnv 既定・agent・不正は human" {
+test "netsync: parseActorEnv gives the default, gives agent, and gives human for an invalid value" {
     try testing.expectEqual(ActorKind.human, parseActorEnv(null));
     try testing.expectEqual(ActorKind.human, parseActorEnv("human"));
     try testing.expectEqual(ActorKind.agent, parseActorEnv("agent"));
@@ -6233,7 +6233,7 @@ test "netsync: parseActorEnv 既定・agent・不正は human" {
     try testing.expectEqual(ActorKind.human, parseActorEnv(""));
 }
 
-test "netsync: agent HELLO が host peer テーブルに kind=agent で登録" {
+test "netsync: an agent HELLO registers in the host's peer table with kind=agent" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -6261,14 +6261,14 @@ test "netsync: agent HELLO が host peer テーブルに kind=agent で登録" {
     try testing.expect(std.mem.indexOf(u8, snap, "\"peers\":[") != null);
 }
 
-test "netsync: setClientIdentity が VP_NETSYNC_ACTOR/LABEL 相当を保持" {
+test "netsync: setClientIdentity keeps the equivalent of VP_NETSYNC_ACTOR and VP_NETSYNC_LABEL" {
     resetForTest();
     defer resetForTest();
     const kind = parseActorEnv("agent");
     setClientIdentity(kind, "env-bot");
     try testing.expectEqual(ActorKind.agent, client_actor_kind);
     try testing.expectEqualStrings("env-bot", client_label_buf[0..client_label_len]);
-    // initClient は client_actor_kind / label を HELLO に載せる（initHost の defaultClientLabel とは独立）
+    // initClient puts client_actor_kind and the label on the HELLO (independently of initHost's defaultClientLabel)
     var hbuf: [128]u8 = undefined;
     const hello = try formatClientHello(&hbuf, client_actor_kind, client_label_buf[0..client_label_len]);
     const parsed = try parseClientHello(hello);
@@ -6277,7 +6277,7 @@ test "netsync: setClientIdentity が VP_NETSYNC_ACTOR/LABEL 相当を保持" {
 }
 
 // ============================================================================
-// TASK-103: PRESENCE ephemeral
+// PRESENCE ephemeral
 // ============================================================================
 
 test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
@@ -6302,7 +6302,7 @@ test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
     try testing.expectEqual(@as(i32, 100), dec.x1);
     try testing.expectEqual(@as(i32, -20), dec.y1);
 
-    // ttl=0 → 既定展開
+    // ttl=0 → expanded to the default
     var zero = src;
     zero.ttl_ms = 0;
     zero.subtype = .point;
@@ -6316,16 +6316,16 @@ test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
     bad[5] = 1;
     try testing.expectError(error.ProtocolError, parsePresencePayload(&bad));
 
-    // 長さ不一致
+    // a length mismatch
     try testing.expectError(error.ProtocolError, parsePresencePayload(enc[0..23]));
 
-    // TTL 超過
+    // TTL over the limit
     var over = src;
     over.ttl_ms = 10001;
     const enc_over = try formatPresencePayload(&buf, over);
     try testing.expectError(error.ProtocolError, parsePresencePayload(enc_over));
 
-    // 未知 subtype
+    // an unknown subtype
     var unk = buf;
     @memcpy(&unk, enc);
     unk[4] = 0x99;
@@ -6334,16 +6334,16 @@ test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
     try testing.expectEqual(@as(usize, 24), maxPayloadForKind(0x09));
 }
 
-test "netsync: 未知 kind 0x0A は読み捨て継続（旧互換）" {
-    // readerMain と同じ分岐: isKnownKind が false なら discardPayload して continue。
-    // ここでは codec 層で「未知 kind の後続フレームが読める」ことを固定する。
+test "netsync: an unknown kind 0x0A is discarded and carries on (compatibility with older peers)" {
+    // The same branch as readerMain's: when isKnownKind is false it discards the payload and continues.
+    // Here, at the codec layer, what is pinned is that "the frame after an unknown kind can still be read".
     try testing.expect(!isKnownKind(0x0A));
     var raw: [5 + 4 + 5 + 3]u8 = undefined;
     // unknown kind 0x0A len=4
     raw[0] = 0x0A;
     std.mem.writeInt(u32, raw[1..5], 4, .little);
     @memcpy(raw[5..9], "xxxx");
-    // 続く既知 kind PROPOSE 相当
+    // the equivalent of a known kind, PROPOSE, following
     raw[9] = 0x02;
     std.mem.writeInt(u32, raw[10..14], 3, .little);
     @memcpy(raw[14..17], "abc");
@@ -6359,7 +6359,7 @@ test "netsync: 未知 kind 0x0A は読み捨て継続（旧互換）" {
     try testing.expectEqualStrings("abc", frame.payload);
 }
 
-test "netsync: client presence_point は PROPOSE 非生成・seq/pending 不変" {
+test "netsync: a client's presence_point generates no PROPOSE and leaves seq and pending unchanged" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -6387,7 +6387,7 @@ test "netsync: client presence_point は PROPOSE 非生成・seq/pending 不変"
             std.mem.writeInt(u64, sync_buf[0..8], 0, .little);
             encodeFrame(&writer.interface, @intFromEnum(FrameKind.sync), &sync_buf) catch return;
             writer.interface.flush() catch return;
-            sleepMs(300); // client が presence を積むまで接続維持
+            sleepMs(300); // keep the connection until the client has queued a presence
         }
     };
     const ht = try std.Thread.spawn(.{}, Host.run, .{&srv});
@@ -6413,10 +6413,10 @@ test "netsync: client presence_point は PROPOSE 非生成・seq/pending 不変"
     try testing.expectEqual(seq0, wireSeq());
     try testing.expectEqual(pend0, testPendingCount());
     try testing.expectEqual(prop0, next_proposal_id);
-    try testing.expectEqual(@as(u32, 0), ctx.calls); // client はローカル dispatch しない
+    try testing.expectEqual(@as(u32, 0), ctx.calls); // a client does not dispatch locally
 }
 
-test "netsync: host presence 受信で callback + broadcast・失敗時は broadcast しない" {
+test "netsync: a host receiving a presence calls the callback and broadcasts, and does not broadcast on failure" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -6440,14 +6440,14 @@ test "netsync: host presence 受信で callback + broadcast・失敗時は broad
     try testing.expect(std.mem.indexOf(u8, ctx.last_args[0..ctx.last_args_len], "peer=1") != null);
     try testing.expectEqual(seq0, wireSeq());
 
-    // callback 失敗 → broadcast 経路に入らない（outbound に積まれないことの近似: fail 後 calls 増えない）
+    // the callback fails → the broadcast path is never entered (approximated by nothing being queued: after the failure, calls does not rise)
     ctx.fail = true;
     try testing.expect(presence_inbound.enqueueLatestWins(io_val, 2, payload));
     pump();
     try testing.expectEqual(@as(u32, 1), ctx.calls);
 }
 
-test "netsync: presence queue latest-wins と満杯 drop" {
+test "netsync: the presence queue is latest-wins and drops when full" {
     resetForTest();
     defer resetForTest();
     ensureIo();
@@ -6475,21 +6475,21 @@ test "netsync: presence queue latest-wins と満杯 drop" {
     const parsed = try parsePresencePayload(&out);
     try testing.expectEqual(@as(i32, 99), parsed.x0);
 
-    // 満杯 drop（切断しない）
+    // a drop because it is full (without disconnecting)
     var i: usize = 0;
     while (i < PRESENCE_QUEUE_CAP) : (i += 1) {
-        // peer を変えて slot を埋める
+        // change the peer to fill the slot
         try testing.expect(presence_inbound.enqueueLatestWins(io_val, @intCast(i + 1), mk(&pbuf, @intCast(i))));
     }
     try testing.expect(!presence_inbound.enqueueLatestWins(io_val, 999, mk(&pbuf, 1)));
     try testing.expectEqual(@as(usize, PRESENCE_QUEUE_CAP), presence_inbound.len(io_val));
 }
 
-test "netsync: awaiting_sync 中も presence 適用・COMMIT は保留" {
+test "netsync: a presence is applied even while awaiting_sync, and the COMMIT is held" {
     resetForTest();
     defer resetForTest();
     ensureIo();
-    // client 役を手動セット（接続なしで pump 経路だけ検証）
+    // Set the client role by hand (checking the pump path alone, with no connection)
     peers_mutex.lockUncancelable(io_val);
     role = .client;
     started = true;
@@ -6513,12 +6513,12 @@ test "netsync: awaiting_sync 中も presence 適用・COMMIT は保留" {
     });
     try testing.expect(presence_inbound.enqueueLatestWins(io_val, 0, presence));
 
-    // COMMIT を通常 inbound へ
+    // the COMMIT onto the ordinary inbound queue
     var cbuf: [64]u8 = undefined;
     const commit = try formatCommitPayload(&cbuf, 1, 0, "stroke", "1 2");
     try testing.expect(inbound.enqueue(io_val, @intFromEnum(FrameKind.commit), commit, 0));
 
-    pump(); // awaiting 中: presence 適用、COMMIT は dequeue しない
+    pump(); // while awaiting: presence is applied and the COMMIT is not dequeued
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     try testing.expect(std.mem.eql(u8, ctx.last_args[0..ctx.last_args_len], "peer=1 5 6 1500") or
         std.mem.indexOf(u8, ctx.last_args[0..ctx.last_args_len], "peer=1") != null);
@@ -6526,7 +6526,7 @@ test "netsync: awaiting_sync 中も presence 適用・COMMIT は保留" {
     try testing.expect(testAwaitingSync());
 }
 
-test "netsync: presence 適用で wire_seq / proposal / pending 不変" {
+test "netsync: applying a presence leaves wire_seq, proposal and pending unchanged" {
     resetForTest();
     defer resetForTest();
     initHost(0);
@@ -6548,7 +6548,7 @@ test "netsync: presence 適用で wire_seq / proposal / pending 不変" {
     try testing.expectEqual(@as(u32, 2), ctx.calls);
 }
 
-test "netsync: router ephemeral host/client 分岐" {
+test "netsync: the router's ephemeral branch on a host and on a client" {
     resetForTest();
     defer resetForTest();
     var ctx: SemCtx = .{};
