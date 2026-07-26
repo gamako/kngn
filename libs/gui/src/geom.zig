@@ -1,5 +1,5 @@
-// pixel/geom プリミティブは libs/font が正準定義する（font は gui より下層）。
-// gui からは `@import("font")` 経由で再エクスポートする。実体・テストは libs/font 側。
+// pixel/geom primitives are canonically defined in libs/font (font sits below gui).
+// gui re-exports them via `@import("font")`. Impl + tests live under libs/font.
 const fnt = @import("font");
 
 pub const Rect = fnt.Rect;

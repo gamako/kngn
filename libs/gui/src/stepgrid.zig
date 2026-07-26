@@ -1,8 +1,8 @@
-//! 16-step grid の共通描画・幾何・Flex widget。
+//! Shared draw / geometry / Flex widget for a 16-step grid.
 //!
-//! grid はフレーム毎に最大 16×5 セルを描くが、全画素ループではない（セル矩形を
-//! DrawList へ積むだけ）。このため SIMD/全画素ループ規約の対象外で、widget 側の
-//! 一時データは Context の per-frame arena に置く。
+//! The grid draws at most 16x5 cells per frame, but it is not a per-pixel loop (it only
+//! queues cell rects onto the DrawList). Outside the SIMD/full-framebuffer rules; widget
+//! temps go on Context's per-frame arena.
 
 const std = @import("std");
 const context_mod = @import("context.zig");
@@ -19,7 +19,7 @@ pub const Id = u64;
 
 pub const STEP_COUNT: u8 = 16;
 
-/// world/screen の f32 幾何。呼び出し側が camera 変換を済ませて渡す。
+/// f32 geometry in world/screen. Caller applies camera transform before passing.
 pub const Geometry = struct {
     origin_x: f32,
     origin_y: f32,
@@ -41,9 +41,9 @@ pub const Geometry = struct {
 pub const RectF = struct { x: f32, y: f32, w: f32, h: f32 };
 pub const GridCell = struct { row: u8, step: u8 };
 
-/// 現行 patch grid の配色を共通既定値にする。modular もこの値を使う。
+/// Shared defaults matching the current patch-grid palette. modular uses these too.
 pub const DEFAULT_OFF = Color.rgba(0x30, 0x38, 0x42, 0xFF);
-pub const DEFAULT_OFF_BEAT = DEFAULT_OFF; // patch の既存見た目では拍頭も同色
+pub const DEFAULT_OFF_BEAT = DEFAULT_OFF; // Patch's existing look uses the same color for beat heads as well
 pub const DEFAULT_ON = Color.rgba(0xE0, 0x90, 0x40, 0xFF);
 pub const DEFAULT_ACCENT = Color.rgba(0xE0, 0xC0, 0x50, 0xFF);
 pub const DEFAULT_SLIDE = Color.rgba(0x50, 0x90, 0xE0, 0xFF);
@@ -56,8 +56,8 @@ pub const PitchRow = struct {
     degrees: []const i8,
     degree_count: usize,
     color: Color = DEFAULT_PITCH,
-    /// `.cells` はセル全体を degree 色で塗る modular 旧実装、`.bars` は
-    /// off 下地 + 下端バーの patch 旧実装。
+    /// `.cells` fills the whole cell with the degree color (legacy modular); `.bars` is
+    /// off base + bottom bar (legacy patch).
     style: PitchStyle = .bars,
 };
 
@@ -85,17 +85,17 @@ pub const WidgetOptions = struct {
     off_beat_color: Color = DEFAULT_OFF_BEAT,
 };
 
-/// grid の拍頭を含む off 色を返す。
+/// Return the off color, including beat-head cells.
 pub fn offColor(step: u8, off_color: Color, off_beat_color: Color) Color {
     return if (step % 4 == 0) off_beat_color else off_color;
 }
 
-/// degree を表示可能な index へ clamp する。
+/// Clamp degree to a displayable index.
 fn pitchDegree(pitch: PitchRow, step: u8) i32 {
     return std.math.clamp(@as(i32, pitch.degrees[step]), 0, @as(i32, @intCast(@max(pitch.degree_count, 1) - 1)));
 }
 
-/// modular 旧実装の pitch セル色。color field ではなく、旧式の固定 RGB 式を保つ。
+/// Legacy modular pitch-cell color. Not a color field — keep the old fixed RGB formula.
 fn pitchCellsColor(pitch: PitchRow, step: u8) Color {
     const degree = pitchDegree(pitch, step);
     const t: f32 = if (pitch.degree_count <= 1)
@@ -114,8 +114,8 @@ fn bitSet(mask: u16, step: u8) bool {
     return (mask >> @as(u4, @intCast(step))) & 1 == 1;
 }
 
-/// f32 の矩形を DrawList の整数矩形へ変換する。camera の極端な zoom/pan でも
-/// 不正な値を DrawList へ渡さない。
+/// Convert an f32 rect to DrawList integer rects. Even under extreme camera zoom/pan,
+/// do not pass invalid values to DrawList.
 fn toRect(rect: RectF) Rect {
     const safeI32 = struct {
         fn convert(v: f32) i32 {
@@ -136,7 +136,7 @@ fn drawRect(dl: *DrawList, rect: RectF, color: Color) void {
     dl.rectFilled(toRect(rect), color) catch @panic("stepgrid.draw: DrawList OOM");
 }
 
-/// rows の 16 step を描く。playhead は null なら表示しない。
+/// Draw 16 steps of `rows`. Omit playhead when null.
 pub fn draw(dl: *DrawList, geometry: Geometry, rows: []const DrawRow, options: DrawOptions) void {
     for (rows, 0..) |draw_row, row_index| {
         const row_u8: u8 = @intCast(row_index);
@@ -151,7 +151,7 @@ pub fn draw(dl: *DrawList, geometry: Geometry, rows: []const DrawRow, options: D
                 offColor(step, options.off_color, options.off_beat_color);
             drawRect(dl, cell, base);
 
-            // patch 旧実装の段表示はセル下端から伸ばす。modular の `.cells` にはバーを足さない。
+            // Legacy patch step display grows from the cell bottom. Do not add bars for modular `.cells`.
             if (draw_row.pitch) |pitch| if (pitch.style == .bars) {
                 const degree = @as(f32, @floatFromInt(pitch.degrees[step]));
                 const fraction = if (pitch.degree_count == 0)
@@ -161,7 +161,7 @@ pub fn draw(dl: *DrawList, geometry: Geometry, rows: []const DrawRow, options: D
                 const bar_h = @max(1.0, cell.h * std.math.clamp(fraction, 0.0, 1.0));
                 drawRect(dl, .{ .x = cell.x, .y = cell.y + cell.h - bar_h, .w = cell.w, .h = bar_h }, pitch.color);
             };
-            // playhead は mask 行のみ（patch 旧実装は pitch 段に playhead を重ねない）
+            // Playhead on the mask row only (legacy patch does not overlay playhead on pitch rows)
             if (options.playhead) |playhead| {
                 if (step == playhead and draw_row.pitch == null) drawRect(dl, cell, options.playhead_color);
             }
@@ -169,7 +169,7 @@ pub fn draw(dl: *DrawList, geometry: Geometry, rows: []const DrawRow, options: D
     }
 }
 
-/// 点が grid のセルに入っているかを判定する。cell 間 gap は null。
+/// Whether a point falls in a grid cell. Gaps between cells → null.
 pub fn hitTest(geometry: Geometry, point_x: f32, point_y: f32, row_count: u8) ?GridCell {
     var row_index: u8 = 0;
     while (row_index < row_count and row_index < 255) : (row_index += 1) {
@@ -186,8 +186,8 @@ pub fn hitTest(geometry: Geometry, point_x: f32, point_y: f32, row_count: u8) ?G
     return null;
 }
 
-/// 現在の Flex 親へ 16 個のセルを追加し、クリックされたセルを返す。
-/// セル ID は id_base + step の明示 ID で、呼び出し側の label/button と衝突しない値を渡す。
+/// Append 16 cells to the current Flex parent; return the clicked cell.
+/// Cell IDs are explicit `id_base + step`; pass values that won't collide with caller label/button IDs.
 pub fn widgetRow(ctx: *Context, options: WidgetOptions) ?GridCell {
     std.debug.assert(options.cell_size > 0);
     var clicked: ?GridCell = null;
@@ -206,7 +206,7 @@ pub fn widgetRow(ctx: *Context, options: WidgetOptions) ?GridCell {
             if (bitSet(mask, step)) options.on_color else offColor(step, options.off_color, options.off_beat_color)
         else
             offColor(step, options.off_color, options.off_beat_color);
-        // colorSwatchId の不透明経路と同じ box bg + style 枠（クリック可能セルの見た目を widget 群と揃える）
+        // Same opaque path as colorSwatchId: box bg + style border (align clickable-cell look with other widgets)
         const style = ctx.style;
         const border: ?layout_mod.Border = if (style.swatch_border <= 0)
             null

@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // テストは各モジュールファイルに直書きされているので、gui.zig を root にして全体をテスト
+    // Tests are written in each module file; use gui.zig as root to run them all.
     const test_exe = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/gui.zig"),
@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // 各ファイルのテストも個別に拾う
+    // Also pick up each file's tests individually.
     const geom_test = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/geom.zig"),
         .target = target,

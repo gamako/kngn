@@ -1,32 +1,32 @@
-// widget 共通スタイル（TASK-21.5）。
+// Shared widget style.
 //
-// push/pop は非対応（MVP 契約）。テーマを変えたい caller は Context.style を
-// 直接書き換える。サイズ系は i32（layout / Rect と同じ整数系）、描画時に u32 へ cast。
+// No push/pop (MVP contract). Callers that want a theme rewrite `Context.style`
+// directly. Sizes are i32 (same integer system as layout / Rect); cast to u32 at draw time.
 
 const color_mod = @import("color.zig");
 
 pub const Color = color_mod.Color;
 
 pub const Style = struct {
-    /// button 等の通常時の塗り
+    /// Normal fill for button etc.
     bg: Color,
-    /// hover（state.hot_id == id）時の塗り
+    /// Fill while hovered (`state.hot_id == id`)
     bg_hover: Color,
-    /// 押下（held）時の塗り
+    /// Fill while pressed (held)
     bg_active: Color,
-    /// 通常時の枠色
+    /// Normal border color
     border: Color,
-    /// hover 時の枠色。selected 表示の強調枠色にも使う
+    /// Hover border color. Also used as the emphasis border when selected
     border_hover: Color,
-    /// label / button 文字色
+    /// label / button text color
     text: Color,
-    /// 補助テキスト色（status bar 等の caller 用途）
+    /// Secondary text color (caller uses such as status bar)
     text_subtle: Color,
-    /// TextInput の box 背景
+    /// TextInput box background
     input_background: Color = Color.rgba(0x24, 0x24, 0x2C, 0xFF),
-    /// SelectableLabel の選択範囲の背景色
+    /// SelectableLabel selection background
     selection_background: Color = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
-    /// 将来の caret 描画で使う色（113.1 では caret 自体を描画しない）
+    /// Color reserved for future caret drawing (caret itself is not drawn yet)
     caret: Color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
     swatch_size: i32 = 18,
     swatch_border: i32 = 1,
@@ -35,10 +35,10 @@ pub const Style = struct {
     button_padding: [4]i32 = .{ 4, 8, 4, 8 },
     button_border: i32 = 1,
     button_border_selected: i32 = 2,
-    /// selected 時の塗り（held/hover より優先度低。深い青で normal と高コントラスト、
-    /// かつ held(bg_active=明るい青) と区別できる別トーン。TASK-155）
+    /// Selected fill (lower priority than held/hover). Deep blue for high contrast vs normal,
+    /// and a distinct tone from held (`bg_active` = bright blue).
     button_bg_selected: Color = Color.rgba(0x24, 0x48, 0x7A, 0xFF),
-    // Slider（TASK-21.9）。サイズ系は i32、描画時に u32 へ cast。
+    // Slider. Sizes are i32; cast to u32 at draw time.
     slider_track_w: i32 = 120,
     slider_track_h: i32 = 6,
     slider_knob_w: i32 = 10,
@@ -46,26 +46,26 @@ pub const Style = struct {
     slider_track_bg: Color = Color.rgba(0x30, 0x30, 0x38, 0xFF),
     slider_knob_bg: Color = Color.rgba(0x90, 0x98, 0xA0, 0xFF),
     slider_knob_active_bg: Color = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
-    // HSV カラーピッカー（TASK-21.14）。SV スクエア / Hue バーは固定 px（dl.image の制約）。
+    // HSV color picker. SV square / Hue bar are fixed px (`dl.image` constraint).
     picker_sv_size: i32 = 128,
     picker_hue_w: i32 = 16,
     picker_marker_light: Color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
     picker_marker_dark: Color = Color.rgba(0x00, 0x00, 0x00, 0xFF),
-    // Checkbox / Toggle(switch) / Radio（TASK-48）。寸法のみ。色は既存を再利用する:
-    // ON/accent = bg_active、box 内部 / track = slider_track_bg、knob = slider_knob_bg、枠 = border / border_hover。
+    // Checkbox / Toggle(switch) / Radio. Dimensions only; reuse existing colors:
+    // ON/accent = bg_active, box interior / track = slider_track_bg, knob = slider_knob_bg, border = border / border_hover.
     checkbox_size: i32 = 16,
-    /// glyph ↔ label のギャップ（checkbox / toggle / radio 共通）
+    /// Gap between glyph and label (shared by checkbox / toggle / radio)
     checkbox_gap: i32 = 6,
     switch_w: i32 = 28,
     switch_h: i32 = 16,
     radio_size: i32 = 16,
-    // ポップアップ/コンテキストメニュー（TASK-79.1）。色は既存 bg/bg_hover/border/text/
-    // text_subtle を再利用する（新規色フィールドは追加しない）。
+    // Popup / context menu. Reuse existing bg / bg_hover / border / text /
+    // text_subtle (no new color fields).
     popup_item_h: i32 = 20,
     popup_padding: i32 = 4,
 };
 
-/// 既存 example（09/10）系統のダークテーマ。text は白（21.4 までの label 既定色と同じ）。
+/// Dark theme in the example 09/10 family. text is white (same as earlier label default).
 pub fn defaultStyle() Style {
     return .{
         .bg = Color.rgba(0x38, 0x38, 0x40, 0xFF),
@@ -84,12 +84,12 @@ pub fn defaultStyle() Style {
 
 const std = @import("std");
 
-test "defaultStyle: text は白（21.4 までの label 既定色と互換）" {
+test "defaultStyle: text is white (compatible with earlier label default)" {
     const s = defaultStyle();
     try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.text);
     try std.testing.expect(s.swatch_border_selected > s.swatch_border);
     try std.testing.expect(s.button_border_selected > s.button_border);
-    // selected 背景は深い青（normal と高コントラスト・held(bg_active) とは別トーンで区別可能。TASK-155）
+    // Selected bg is deep blue (high contrast vs normal; distinct from held bg_active).
     try std.testing.expectEqual(Color.rgba(0x24, 0x48, 0x7A, 0xFF), s.button_bg_selected);
     try std.testing.expect(!std.meta.eql(s.bg_active, s.button_bg_selected));
 }

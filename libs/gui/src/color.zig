@@ -1,4 +1,4 @@
-// Color も libs/font が正準定義する。gui からは再エクスポート（実体・テストは libs/font 側）。
+// Color is also canonically defined in libs/font. gui re-exports it (impl + tests live under libs/font).
 const fnt = @import("font");
 
 pub const Color = fnt.Color;

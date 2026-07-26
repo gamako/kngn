@@ -13,15 +13,15 @@ pub const DrawCmd = union(enum) {
     rect_filled: struct { rect: Rect, color: Color, clip: Rect },
     rect_outline: struct { rect: Rect, color: Color, thickness: u32, clip: Rect },
     line: struct { p0: Vec2, p1: Vec2, color: Color, thickness: u32, clip: Rect },
-    /// text は DrawList より長く生かした arena 上の slice を指すこと（caller 責任）。
-    /// font が null なら render() に渡した既定フォントで描画する（override 用）。
+    /// `text` must point at an arena slice that outlives the DrawList (caller responsibility).
+    /// If `font` is null, draw with the default font passed to `render()` (override hook).
     text: struct { pos: Vec2, text: []const u8, color: Color, clip: Rect, font: ?Font = null },
-    /// pixels は DrawList より長く生かした caller 所有の slice を指すこと（caller 責任）
+    /// `pixels` must point at a caller-owned slice that outlives the DrawList (caller responsibility).
     image: struct { rect: Rect, pixels: []const u32, src_w: u32, src_h: u32, clip: Rect },
 };
 
-/// ArrayList が unmanaged なので alloc フィールドを自前で保持する。
-/// 使用前に必ず reset(w, h) を呼ぶこと。
+/// ArrayList is unmanaged, so keep the alloc field ourselves.
+/// Always call `reset(w, h)` before use.
 pub const DrawList = struct {
     alloc: Allocator,
     cmds: std.ArrayList(DrawCmd) = .empty,
@@ -36,8 +36,8 @@ pub const DrawList = struct {
         self.clip_stack.deinit(self.alloc);
     }
 
-    /// 毎フレーム最初に呼ぶこと。root clip = Rect{0,0,w,h} を設定する。
-    /// w/h は論理サイズ（物理 framebuffer 寸法ではない。scale は render() 側で適用）。
+    /// Call at the start of every frame. Sets root clip = Rect{0,0,w,h}.
+    /// w/h are logical size (not physical framebuffer dims; scale is applied in `render()`).
     pub fn reset(self: *DrawList, w: u32, h: u32) void {
         self.cmds.clearRetainingCapacity();
         self.clip_stack.clearRetainingCapacity();
@@ -77,13 +77,13 @@ pub const DrawList = struct {
         } });
     }
 
-    /// str は DrawList より長く生かした arena 上の文字列を指すこと。
-    /// 描画フォントは render() に渡した既定フォント。
+    /// `str` must point at an arena string that outlives the DrawList.
+    /// Drawn with the default font passed to `render()`.
     pub fn text(self: *DrawList, pos: Vec2, str: []const u8, col: Color) Allocator.Error!void {
         try self.textEx(pos, str, col, null);
     }
 
-    /// font override 付き text。font が null なら既定フォントで描画する。
+    /// Text with optional font override. null font → default font.
     pub fn textEx(self: *DrawList, pos: Vec2, str: []const u8, col: Color, font: ?Font) Allocator.Error!void {
         try self.cmds.append(self.alloc, .{ .text = .{
             .pos = pos,
@@ -94,8 +94,8 @@ pub const DrawList = struct {
         } });
     }
 
-    /// pixels は DrawList より長く生かした caller 所有の slice を指すこと。
-    /// assert: pixels.len == src_w * src_h。destination rect は source と異寸でもよい（nearest）。
+    /// `pixels` must point at a caller-owned slice that outlives the DrawList.
+    /// assert: `pixels.len == src_w * src_h`. Destination rect may differ from source (nearest).
     pub fn image(
         self: *DrawList,
         rect: Rect,
@@ -113,14 +113,14 @@ pub const DrawList = struct {
         } });
     }
 
-    /// clip を stack に push。現在の clip との intersection を取る。
+    /// Push clip onto the stack. Intersects with the current clip.
     pub fn pushClip(self: *DrawList, rect: Rect) Allocator.Error!void {
         const current = self.currentClip();
         const clipped = Rect.intersect(current, rect);
         try self.clip_stack.append(self.alloc, clipped);
     }
 
-    /// root clip は pop 不可（assert(len > 1)）
+    /// Root clip cannot be popped (`assert(len > 1)`).
     pub fn popClip(self: *DrawList) void {
         std.debug.assert(self.clip_stack.items.len > 1);
         _ = self.clip_stack.pop();
@@ -178,7 +178,7 @@ test "DrawList: pushClip / popClip intersection" {
     try std.testing.expectEqual(@as(i32, 10), inner.x);
     try std.testing.expectEqual(@as(u32, 50), inner.w);
 
-    // 入れ子 clip
+    // Nested clip
     try dl.pushClip(.{ .x = 20, .y = 20, .w = 100, .h = 100 });
     const nested = dl.clip_stack.items[2];
     try std.testing.expectEqual(@as(i32, 20), nested.x);
@@ -190,7 +190,7 @@ test "DrawList: pushClip / popClip intersection" {
     try std.testing.expectEqual(@as(usize, 1), dl.clip_stack.items.len);
 }
 
-test "DrawList: cmd clip焼き込み（pushClip後）" {
+test "DrawList: cmd bakes in clip (after pushClip)" {
     var dl = DrawList.init(std.testing.allocator);
     defer dl.deinit();
 
