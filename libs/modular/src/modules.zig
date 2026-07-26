@@ -1,9 +1,9 @@
-//! libs/modular: 最小モジュール一式（Ph1）。dsp プリミティブを vtable モジュールとして包む。
-//! signal のみに依存（graph は import しない。循環回避）。
+//! libs/modular: the minimal module set. Wraps DSP primitives as vtable modules.
+//! Depends only on signal (does not import graph; avoids a cycle).
 //!
-//! 各モジュールは具体構造体（DSP 状態を内包）＋ `spec()`（NodeSpec を返す）＋
-//! `process`/`updateParams`（vtable 実体）を提供する。ctx は具体構造体へのポインタで、
-//! caller（テスト / Ph2 のパッチ）が生存所有する。
+//! Each module provides a concrete struct (embedding DSP state), `spec()` (returns a NodeSpec), and
+//! `process`/`updateParams` (the vtable bodies). ctx is a pointer to the concrete struct;
+//! the caller (tests / a patch) owns its lifetime.
 
 const std = @import("std");
 const dsp = @import("dsp");
@@ -14,19 +14,19 @@ const PortKind = signal.PortKind;
 const NodeSpec = signal.NodeSpec;
 const VTable = signal.VTable;
 
-/// 任意接続の入力を読む。未接続 / 範囲外なら null を返す（standalone テストの短い Io でも安全に動く）。
-/// graph 経由では io.connected.len == n_in なので idx 判定は no-op に近い。
+/// Read an optionally-connected input. Returns null if unconnected / out of range (safe for short Io in standalone tests).
+/// Through the graph, io.connected.len == n_in so the idx check is nearly a no-op.
 inline fn optInput(io: *const Io, idx: usize) ?f32 {
     if (idx < io.connected.len and io.connected[idx]) return io.inputs[idx];
     return null;
 }
 
 // ----------------------------------------------------------------------------
-// 音階定義（Quantizer / StepSeq / アンビエント生成で共有。scale table を二重管理しない。Ph5）。
+// Scale definitions (shared by Quantizer / StepSeq / ambient generation; do not maintain a second scale table).
 // ----------------------------------------------------------------------------
 pub const Scale = enum { minor_pentatonic, minor, major };
 
-/// scale の音度（root からの半音オフセット）テーブル。
+/// Semitone-offset table for scale degrees (from the root).
 pub fn scaleDegrees(scale: Scale) []const i32 {
     return switch (scale) {
         .minor_pentatonic => &[_]i32{ 0, 3, 5, 7, 10 },
@@ -35,13 +35,13 @@ pub fn scaleDegrees(scale: Scale) []const i32 {
     };
 }
 
-/// scale × octaves で表現できる音度の総数（>= 1）。
+/// Total degree count expressible as scale × octaves (>= 1).
 pub fn scaleDegreeCount(scale: Scale, octaves: u8) usize {
     return scaleDegrees(scale).len * @as(usize, @max(1, octaves));
 }
 
-/// 音度インデックス di（0..count-1、呼び出し側が clamp 済み前提）を pitch_cv(1.0/oct) へ。
-/// Hz 変換は VCO 境界に閉じる（pitch_cv をグラフに流す）。
+/// Map degree index di (0..count-1; caller must clamp) to pitch_cv (1.0/oct).
+/// Hz conversion stays at the VCO boundary (pitch_cv flows through the graph).
 pub fn degreeIndexToPitchCv(scale: Scale, root_semitone: i32, di: usize) f32 {
     const ds = scaleDegrees(scale);
     const len = ds.len;
@@ -52,7 +52,7 @@ pub fn degreeIndexToPitchCv(scale: Scale, root_semitone: i32, di: usize) f32 {
 }
 
 // ----------------------------------------------------------------------------
-// VCO: pitch_cv(in0, cv bipolar oct) -> audio(out0)。Hz 変換をここに閉じ込める。
+// VCO: pitch_cv(in0, cv bipolar oct) -> audio(out0). Hz conversion is confined here.
 // ----------------------------------------------------------------------------
 pub const Vco = struct {
     osc: dsp.Oscillator = .{},
@@ -70,7 +70,7 @@ pub const Vco = struct {
         const self: *Vco = @ptrCast(@alignCast(ctx));
         const pitch = if (io.connected[0]) io.inputs[0] else 0.0;
         var freq = signal.pitchToHz(self.base_hz, pitch);
-        // CV 暴走 / Inf / NaN / 負値からオシレータの前提(0<=freq<=sr/2)を守る（長時間 NaN 防止。AC#10）。
+        // Guard the oscillator assumption (0<=freq<=sr/2) against runaway CV / Inf / NaN / negatives (prevents long-lived NaN).
         if (!std.math.isFinite(freq)) freq = 0;
         freq = std.math.clamp(freq, 0.0, io.sample_rate * 0.5);
         io.outputs[0] = self.osc.next(freq, io.sample_rate);
@@ -78,7 +78,7 @@ pub const Vco = struct {
 };
 
 // ----------------------------------------------------------------------------
-// VCA: audio(in0) * gain。gain は gain_cv(in1, cv) 接続時はそれ、未接続なら param。
+// VCA: audio(in0) * gain. gain comes from gain_cv(in1, cv) when connected, else the param.
 // ----------------------------------------------------------------------------
 pub const Vca = struct {
     gain: f32 = 1.0,
@@ -99,7 +99,7 @@ pub const Vca = struct {
 };
 
 // ----------------------------------------------------------------------------
-// EnvGen: gate(in0) -> envelope level(out0, cv 0..1)。gate 立ち上がり/下降で noteOn/Off。
+// EnvGen: gate(in0) -> envelope level(out0, cv 0..1). Rising/falling gate edges call noteOn/Off.
 // ----------------------------------------------------------------------------
 pub const EnvGen = struct {
     env: dsp.Envelope = .{},
@@ -116,7 +116,7 @@ pub const EnvGen = struct {
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *EnvGen = @ptrCast(@alignCast(ctx));
         self.env.sample_rate = io.sample_rate;
-        const g = signal.gateHigh(io.inputs[0]); // 未接続は 0 → false
+        const g = signal.gateHigh(io.inputs[0]); // Unconnected is 0 -> false
         if (g and !self.prev_gate) self.env.noteOn();
         if (!g and self.prev_gate) self.env.noteOff();
         self.prev_gate = g;
@@ -125,31 +125,31 @@ pub const EnvGen = struct {
 };
 
 // ----------------------------------------------------------------------------
-// VCF: audio(in0) -> audio(out0)。cutoff_cv(in1, cv oct) で任意モジュレート。
-// 係数再計算（tan を含む setParams）は「変化時のみ」(dirty-gated)。さらに cutoff_cv による
-// モジュレーションは control-rate(ctrl_period サンプルごと)に間引く。これにより audio-rate で
-// モジュレートしても tan を毎サンプルは走らせない（§4.1 / AC#8）:
-//   - updateParams（ブロック先頭）: 静的設定(knob cutoff/resonance/mode/sr)が変わった時だけ再計算。
-//   - process（毎サンプル）: cutoff_cv 接続時のみ ctrl_period ごとに実効 cutoff を再評価し、
-//     変化が閾値を超えた時だけ再計算。filter.process 自体は毎サンプル(軽量)。
+// VCF: audio(in0) -> audio(out0). Optionally modulated by cutoff_cv(in1, cv oct).
+// Coefficient recompute (setParams, which includes tan) runs only on change (dirty-gated). cutoff_cv
+// modulation is further decimated to control-rate (every ctrl_period samples). So even with audio-rate
+// modulation, tan is never run per sample:
+//   - updateParams (block head): recompute only when static settings (knob cutoff/resonance/mode/sr) change.
+//   - process (per sample): when cutoff_cv is connected, re-evaluate effective cutoff every ctrl_period and
+//     recompute only if the change exceeds the threshold. filter.process itself runs every sample (cheap).
 // ----------------------------------------------------------------------------
 pub const Vcf = struct {
     filter: dsp.Filter = .{},
     cutoff: f32 = 1000.0,
     resonance: f32 = 0.707,
     mode: dsp.FilterMode = .lowpass,
-    /// cutoff_cv 1.0 あたりのモジュレーション幅（オクターブ）。
+    /// Modulation depth in octaves per 1.0 of cutoff_cv.
     mod_octaves: f32 = 2.0,
-    /// cutoff_cv モジュレーションを評価する control-rate 周期（サンプル）。0 は default_ctrl_period に丸める。
-    /// 小さいほど追従は良いが係数再計算(tan)頻度が上がる。既定 16 で audio-rate CV でも tan は毎サンプル走らない。
+    /// Control-rate period (samples) for evaluating cutoff_cv modulation. 0 rounds to default_ctrl_period.
+    /// Smaller follows better but raises coefficient-recompute (tan) rate. Default 16 keeps tan off the per-sample path even under audio-rate CV.
     ctrl_period: u32 = default_ctrl_period,
     ctrl_counter: u32 = 0,
-    // 直近に係数へ反映した実効値（dirty 判定）。
+    // Last effective values applied to coefficients (dirty check).
     applied_cutoff: f32 = -1.0,
     applied_res: f32 = -1.0,
     applied_sr: f32 = -1.0,
     applied_mode: dsp.FilterMode = .lowpass,
-    /// 係数再計算（setParams=tan）回数。テスト計測用（毎サンプル走らないことの検証）。
+    /// Coefficient-recompute (setParams=tan) count. For tests (proving it does not run per sample).
     coeff_updates: u32 = 0,
 
     const cutoff_eps: f32 = 1e-3;
@@ -162,8 +162,8 @@ pub const Vcf = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    /// 実効値が前回反映と変わった時だけ係数再計算（dirty-gated。tan はここだけ）。
-    /// 全 cutoff 経路の choke point。NaN/Inf/極端値を Filter 有効域へ落として状態破壊(NaN 伝播)を防ぐ。
+    /// Recompute coefficients only when the effective value changed since last apply (dirty-gated; tan only here).
+    /// Choke point for every cutoff path. Clamps NaN/Inf/extremes into the Filter's valid range to stop state corruption (NaN propagation).
     fn maybeRecompute(self: *Vcf, sr: f32, fc_in: f32) void {
         var fc = fc_in;
         if (!std.math.isFinite(fc)) fc = 1000.0;
@@ -180,7 +180,7 @@ pub const Vcf = struct {
         self.coeff_updates += 1;
     }
 
-    /// ブロック先頭: 静的設定(knob)変化時のみ係数再計算（dirty-gated）。
+    /// Block head: recompute coefficients only when static (knob) settings change (dirty-gated).
     fn updateParams(ctx: *anyopaque, sample_rate: f32) void {
         const self: *Vcf = @ptrCast(@alignCast(ctx));
         self.maybeRecompute(sample_rate, self.cutoff);
@@ -188,16 +188,16 @@ pub const Vcf = struct {
 
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Vcf = @ptrCast(@alignCast(ctx));
-        // cutoff_cv 接続時のみ control-rate でモジュレーションを評価（毎サンプル tan を避ける）。
-        // ctrl_period=0 は既定値(16)に丸める（0 設定で毎サンプル評価に退化させない）。
-        // 小さい明示値(1 等)はユーザーの意図として尊重する（追従↑・CPU↑のトレードオフ）。
+        // Evaluate modulation at control-rate only when cutoff_cv is connected (avoid per-sample tan).
+        // ctrl_period=0 rounds to the default (16) so a zero setting cannot degrade into per-sample evaluation.
+        // Small explicit values (e.g. 1) are respected as user intent (better tracking / higher CPU trade-off).
         if (io.connected[1]) {
             const period = if (self.ctrl_period == 0) default_ctrl_period else self.ctrl_period;
             self.ctrl_counter += 1;
             if (self.ctrl_counter >= period) {
                 self.ctrl_counter = 0;
                 const desired = self.cutoff * @exp2(io.inputs[1] * self.mod_octaves);
-                self.maybeRecompute(io.sample_rate, desired); // NaN/Inf/極端値は maybeRecompute で防御
+                self.maybeRecompute(io.sample_rate, desired); // NaN/Inf/extremes are defended in maybeRecompute
             }
         }
         io.outputs[0] = self.filter.process(io.inputs[0]);
@@ -205,16 +205,16 @@ pub const Vcf = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Mixer: audio(in0..3) を加算し gain を掛けて audio(out0) へ。
-// 複数信号の合算は「Mixer を明示的に挟む」唯一の手段（入力ポートは単一接続。AC#2）。
+// Mixer: sum audio(in0..3), apply gain, write audio(out0).
+// Summing multiple signals is only done by inserting an explicit Mixer (input ports are single connection).
 // ----------------------------------------------------------------------------
 pub const Mixer = struct {
     gain: f32 = 1.0,
-    /// per-input 倍率（0..2。default 1 = 素通し）。RT は plain field を読むだけ。
+    /// Per-input gain (0..2; default 1 = pass-through). RT only reads the plain field.
     input_gain: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
-    /// per-input mute。true ならその入力を 0 として加算。
+    /// Per-input mute. When true that input is summed as 0.
     input_mute: [4]bool = .{ false, false, false, false },
-    /// 表示専用ラベル（descriptor canonical name には使わない。NPRM 非保存）。
+    /// Display-only labels (not used as descriptor canonical names; not saved in NPRM).
     input_labels: [4][]const u8 = .{ "in0", "in1", "in2", "in3" },
 
     const in_kinds = [_]PortKind{ .audio, .audio, .audio, .audio };
@@ -228,7 +228,7 @@ pub const Mixer = struct {
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Mixer = @ptrCast(@alignCast(ctx));
         var sum: f32 = 0;
-        // 未接続入力は 0。mute → 0、それ以外は input * input_gain。alloc/lock/atomic/panic/超越なし。
+        // Unconnected inputs are 0. mute -> 0, else input * input_gain. No alloc/lock/atomic/panic/transcendentals.
         for (io.inputs, 0..) |x, i| {
             if (self.input_mute[i]) continue;
             sum += x * self.input_gain[i];
@@ -238,20 +238,20 @@ pub const Mixer = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Output: mono audio(in0) を gain/pan で stereo 化し L(out0)/R(out1) へ。
-// pan は pan_cv(in1, cv bipolar) 接続時はそれ、未接続なら param。
-// soft_clip=true で最終段に dsp.softClip（ゲイン上限の素地。本格 limiter は 40.2.2）。
-// グラフは setOutputNode でこのノードを master 出力として読む。
+// Output: stereoise mono audio(in0) with gain/pan into L(out0)/R(out1).
+// pan comes from pan_cv(in1, cv bipolar) when connected, else the param.
+// soft_clip=true applies dsp.softClip at the final stage (foundation for a gain ceiling; a full limiter is separate).
+// The graph reads this node as the master output via setOutputNode.
 // ----------------------------------------------------------------------------
 pub const Output = struct {
     gain: f32 = 1.0,
     pan: f32 = 0.0,
     soft_clip: bool = true,
-    // ヘッドルーム計測（best-effort・RT 安全な算術のみ）。softClip 前の振幅を測り、
-    // 「常時 softClip に突っ込んでいない（=潰れていない）」を検証する素地（AC#4/#5）。
-    pre_clip_peak: f32 = 0.0, // softClip 前の L/R 最大振幅（累積 max）
-    clip_count: u64 = 0, // softClip 前振幅 > 1.0 のサンプル数（介入したサンプル）
-    sample_count: u64 = 0, // 計測したサンプル数
+    // Headroom metering (best-effort; RT-safe arithmetic only). Measures pre-softClip amplitude as a basis for
+    // verifying the master is not "always into softClip" (= not constantly crushed).
+    pre_clip_peak: f32 = 0.0, // Max L/R amplitude before softClip (cumulative max)
+    clip_count: u64 = 0, // Samples whose pre-softClip amplitude > 1.0 (samples where softClip intervened)
+    sample_count: u64 = 0, // Samples metered
 
     const in_kinds = [_]PortKind{ .audio, .cv };
     const out_kinds = [_]PortKind{ .audio, .audio }; // L, R
@@ -261,7 +261,7 @@ pub const Output = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    /// softClip 介入率（0..1）。常時高止まりなら master が潰れている。
+    /// softClip intervention rate (0..1). Persistently high means the master is crushed.
     pub fn clipRate(self: *const Output) f32 {
         if (self.sample_count == 0) return 0;
         return @as(f32, @floatFromInt(self.clip_count)) / @as(f32, @floatFromInt(self.sample_count));
@@ -274,7 +274,7 @@ pub const Output = struct {
         const sg = dsp.equalPowerPan(pan);
         var l = x * sg.l;
         var r = x * sg.r;
-        // softClip 前のヘッドルーム計測（soft_clip フラグに依らず測る。出力には影響しない）。
+        // Pre-softClip headroom metering (measured regardless of soft_clip; does not affect the output).
         const mag = @max(@abs(l), @abs(r));
         if (std.math.isFinite(mag)) {
             if (mag > self.pre_clip_peak) self.pre_clip_peak = mag;
@@ -291,17 +291,17 @@ pub const Output = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Clock: 入力なし -> gate(out0)。BPM/PPQN で tick ごとに 1 サンプル trigger。
-// 位相は f64（f32 累積の drift を避け、長時間連続でも tick 間隔が崩れない）。
+// Clock: no inputs -> gate(out0). One-sample trigger on each tick from BPM/PPQN.
+// Phase is f64 (avoids f32 accumulation drift so tick spacing stays solid over long runs).
 // ----------------------------------------------------------------------------
 pub const Clock = struct {
     bpm: f32 = 120.0,
     ppqn: u32 = 4,
-    /// スウィング量 0..1。裏(奇数 tick)を遅らせる。0 で従来と完全一致（bit 決定的）。
+    /// Swing amount 0..1. Delays off-beat (odd) ticks. 0 matches the prior behaviour exactly (bit-deterministic).
     swing: f32 = 0.0,
     phase_samples: f64 = 0,
     samples_per_tick: f64 = 0,
-    cur_interval: f64 = 0, // 直近 tick から次 tick までの間隔（swing で交互に伸縮）
+    cur_interval: f64 = 0, // Interval from the last tick to the next (stretched/shrunk alternately by swing)
     tick_index: u64 = 0,
     started: bool = false,
 
@@ -319,8 +319,8 @@ pub const Clock = struct {
         self.samples_per_tick = @as(f64, sample_rate) * 60.0 / (bpm * ppqn);
     }
 
-    /// tick i を出した直後の「次 tick までの間隔」。偶数→奇数は伸ばし、奇数→偶数は縮める（小節長は保つ）。
-    /// swing=0 では delay=0.0 → 常に samples_per_tick（従来と完全一致）。
+    /// Interval to the next tick just after emitting tick i. Even->odd stretches, odd->even shrinks (bar length preserved).
+    /// With swing=0, delay=0.0 -> always samples_per_tick (exact match to the prior behaviour).
     fn intervalAfter(self: *const Clock, i: u64) f64 {
         const sw: f64 = if (std.math.isFinite(self.swing)) std.math.clamp(self.swing, 0.0, 1.0) else 0.0;
         const delay = sw * self.samples_per_tick * 0.5;
@@ -329,7 +329,7 @@ pub const Clock = struct {
 
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Clock = @ptrCast(@alignCast(ctx));
-        if (self.samples_per_tick <= 0) { // updateParams 未実行の保険
+        if (self.samples_per_tick <= 0) { // Guard if updateParams has not run yet
             io.outputs[0] = 0;
             return;
         }
@@ -339,11 +339,11 @@ pub const Clock = struct {
             self.phase_samples = 0;
             self.tick_index = 0;
             self.cur_interval = self.intervalAfter(0);
-            trig = 1.0; // 初回 tick
+            trig = 1.0; // First tick
         } else {
             self.phase_samples += 1.0;
             if (self.phase_samples >= self.cur_interval) {
-                self.phase_samples -= self.cur_interval; // 端数を保持
+                self.phase_samples -= self.cur_interval; // Keep the fractional remainder
                 self.tick_index += 1;
                 self.cur_interval = self.intervalAfter(self.tick_index);
                 trig = 1.0;
@@ -354,7 +354,7 @@ pub const Clock = struct {
 };
 
 // ----------------------------------------------------------------------------
-// ClockDivider: gate(in0) -> gate(out0)。入力 rising edge を div 個ごとに 1 回通す。
+// ClockDivider: gate(in0) -> gate(out0). Pass one of every div rising edges on the input.
 // ----------------------------------------------------------------------------
 pub const ClockDivider = struct {
     div: u32 = 2,
@@ -384,8 +384,8 @@ pub const ClockDivider = struct {
 };
 
 // ----------------------------------------------------------------------------
-// EuclideanSeq: gate(in0=clock) -> gate(out0)。入力 rising edge ごとに step を進め、
-// ユークリッドリズムの hit ステップだけ 1 サンプル trigger を出す（Bresenham 判定式・O(1)）。
+// EuclideanSeq: gate(in0=clock) -> gate(out0). Advance a step on each rising edge;
+// emit a one-sample trigger only on Euclidean hit steps (Bresenham test; O(1)).
 // ----------------------------------------------------------------------------
 pub const EuclideanSeq = struct {
     steps: u8 = 8,
@@ -402,7 +402,7 @@ pub const EuclideanSeq = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    /// step s が hit か（rotation 適用）。E(pulses,steps) を Bresenham 判定で近似（標準的なユークリッド配置）。
+    /// Whether step s is a hit (with rotation). Approximates E(pulses,steps) via a Bresenham test (standard Euclidean placement).
     pub fn hitAt(steps: u8, pulses: u8, rotation: u8, s: u8) bool {
         if (steps == 0 or pulses == 0) return false;
         const st: u32 = steps;
@@ -427,16 +427,16 @@ pub const EuclideanSeq = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Quantizer: cv(in0, 0..1) -> cv(out0 = pitch_cv)。cv を scale 上の音度へスナップする。
-// Hz 変換は VCO 側（pitch_cv の境界はここと VCO に閉じる）。
+// Quantizer: cv(in0, 0..1) -> cv(out0 = pitch_cv). Snap cv onto a scale degree.
+// Hz conversion is on the VCO side (the pitch_cv boundary is closed here and at the VCO).
 // ----------------------------------------------------------------------------
 pub const Quantizer = struct {
-    scale: Scale = .minor_pentatonic, // module-level Scale を共有（StepSeq / アンビエント生成と同じ写像）
+    scale: Scale = .minor_pentatonic, // Shares the module-level Scale (same mapping as StepSeq / ambient generation)
     root_semitone: i32 = 0,
     octaves: u8 = 2,
-    /// 入力未接続時に使う固定 cv（最小 bass 用の一定音）。
+    /// Fixed cv used when the input is unconnected (constant pitch for a minimal bass).
     input_cv: f32 = 0.0,
-    /// 直近に出力した pitch_cv（harness introspection 用。best-effort）。
+    /// Last emitted pitch_cv (for harness introspection; best-effort).
     last_out: f32 = 0.0,
 
     const in_kinds = [_]PortKind{.cv};
@@ -450,7 +450,7 @@ pub const Quantizer = struct {
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *Quantizer = @ptrCast(@alignCast(ctx));
         const cv_raw = if (io.connected[0]) io.inputs[0] else self.input_cv;
-        // @intFromFloat 前に必ず finite かつ 0..1 に保証（NaN/Inf の CV で RT trap を防ぐ）。
+        // Before @intFromFloat, require finite and in 0..1 (stop an RT trap from NaN/Inf CV).
         const cv = if (std.math.isFinite(cv_raw)) std.math.clamp(cv_raw, 0.0, 1.0) else 0.0;
         const total = scaleDegreeCount(self.scale, self.octaves);
         const total_f: f32 = @floatFromInt(total);
@@ -462,15 +462,15 @@ pub const Quantizer = struct {
 };
 
 // ----------------------------------------------------------------------------
-// StepSeq: clock gate(in0) で 16 step を進める editable シーケンサ（Ph5 DrumMachine/BassMachine）。
-//   - kind=.drum: output gate(out0) のみ。on_mask の hit step で 1 サンプル trigger。
-//   - kind=.bass: outputs gate(out0) / pitch_cv(out1) / accent_cv(out2)。pitch は scale degree、
-//     accent は step ごとに held 0/1（VCF cutoff_cv へ）、slide は step 内 pitch glide（tie/gate 抑制はしない）。
-// pattern(on/accent/slide mask + pitch_deg) は RT 所有・固定サイズ・乱数なし＝決定的。未配線の出力は宣言しない。
+// StepSeq: editable 16-step sequencer advanced by clock gate(in0) (DrumMachine/BassMachine).
+//   - kind=.drum: gate(out0) only. One-sample trigger on on_mask hit steps.
+//   - kind=.bass: gate(out0) / pitch_cv(out1) / accent_cv(out2). pitch is a scale degree;
+//     accent is held 0/1 per step (into VCF cutoff_cv); slide is an in-step pitch glide (no tie/gate suppression).
+// pattern(on/accent/slide mask + pitch_deg) is RT-owned, fixed-size, no RNG = deterministic. Undeclared ports are not created.
 // ----------------------------------------------------------------------------
 pub const StepSeq = struct {
     pub const Kind = enum { drum, bass };
-    /// §4.7 track-kind（port 構成の Kind とは別。runtime metadata・descriptor 非公開）。
+    /// Track-kind for mutation (distinct from the port-layout Kind; runtime metadata, not in the descriptor).
     pub const MutationKind = enum { kick, hat, clap, bass };
     pub const STEPS: u8 = 16;
 
@@ -478,19 +478,19 @@ pub const StepSeq = struct {
     on_mask: u16 = 0,
     accent_mask: u16 = 0,
     slide_mask: u16 = 0,
-    pitch_deg: [16]i8 = [_]i8{0} ** 16, // bass: 各 step の scale degree index
-    // bass pitch マッピング（module-level scale helper を共有）
+    pitch_deg: [16]i8 = [_]i8{0} ** 16, // bass: scale degree index per step
+    // bass pitch mapping (shares the module-level scale helper)
     scale: Scale = .minor_pentatonic,
     root_semitone: i32 = 0,
     octaves: u8 = 2,
-    glide_rate: f32 = 6.0, // slide 中の pitch_cv 変化速度（oct/秒）
-    /// 自己進化 on/off（descriptor。lofi wire は true をセットして現行既定を維持）。
+    glide_rate: f32 = 6.0, // pitch_cv glide rate while sliding (oct/sec)
+    /// Self-evolution on/off (descriptor; the lofi wire sets true to keep the current default).
     evolve: bool = false,
-    /// トラック単位の凍結（descriptor）。
+    /// Per-track freeze (descriptor).
     lock: bool = false,
-    /// 正規化密度ターゲット 0..1（descriptor）。band へ写像して bar 境界で 1 bit 収束。
+    /// Normalised density target 0..1 (descriptor). Mapped into a band; converges by 1 bit at bar boundaries.
     density: f32 = 0.25,
-    /// runtime metadata（descriptor 非公開）。
+    /// Runtime metadata (not in the descriptor).
     mutation_kind: MutationKind = .kick,
     density_band: [2]u32 = .{ 0, 16 },
 
@@ -527,7 +527,7 @@ pub const StepSeq = struct {
         return @as(u16, 1) << @as(u4, @intCast(s & 15));
     }
 
-    /// density を band 内 target count へ写像（event-rate）。
+    /// Map density to a target count inside the band (event-rate).
     pub fn targetCount(self: *const StepSeq) u32 {
         const band = self.density_band;
         const dens = if (std.math.isFinite(self.density)) std.math.clamp(self.density, 0.0, 1.0) else 0.25;
@@ -536,7 +536,7 @@ pub const StepSeq = struct {
         return @intFromFloat(@round(@as(f32, @floatFromInt(band[0])) + dens * span));
     }
 
-    /// 初期 mask から density を逆算（即時変化を避ける）。band_max==band_min は 0。
+    /// Back-compute density from the initial mask (avoid an immediate jump). band_max==band_min yields 0.
     pub fn densityFromMask(mask: u16, band: [2]u32) f32 {
         if (band[1] <= band[0]) return 0.0;
         const count: u32 = @popCount(mask);
@@ -569,8 +569,8 @@ pub const StepSeq = struct {
         return fallback;
     }
 
-    /// drum lane: 1 cell トグル。密度バンドを外れる方向はスキップ、max 超過時は move。
-    /// ホットパス: bar 境界（event-rate）のみ。RT process は不変。noise は共有 mut_noise。
+    /// drum lane: toggle 1 cell. Skip moves that leave the density band; move when over max.
+    /// Hot path: bar boundaries only (event-rate). RT process is unchanged. noise is the shared mut_noise.
     pub fn mutateDrum(self: *StepSeq, noise: *dsp.Noise) void {
         const band = self.density_band;
         const s = mutRandStep(noise);
@@ -587,7 +587,7 @@ pub const StepSeq = struct {
         }
     }
 
-    /// bass lane: 1 パラメータ（on/off・pitch±1・accent・slide）を変異。
+    /// bass lane: mutate one parameter (on/off, pitch±1, accent, slide).
     pub fn mutateBass(self: *StepSeq, noise: *dsp.Noise) void {
         const band = self.density_band;
         const s = mutRandStep(noise);
@@ -612,7 +612,7 @@ pub const StepSeq = struct {
         }
     }
 
-    /// on-mask の 1 bit を anchor へ寄せる。density バンドを割るならスキップ。
+    /// Nudge one on-mask bit toward the anchor. Skip if that would leave the density band.
     pub fn recoverOn(self: *StepSeq, src: u16, step_bit: u16) void {
         const band = self.density_band;
         const want_on = src & step_bit != 0;
@@ -630,8 +630,8 @@ pub const StepSeq = struct {
         if (src & b != 0) dst.* |= b else dst.* &= ~b;
     }
 
-    /// bar 境界で density 目標へ 1 bit 収束（lock / evolve=off 時 no-op）。
-    /// ホットパス: event-rate のみ。alloc/lock/IO/panic/超越関数なし。
+    /// Converge 1 bit toward the density target at a bar boundary (no-op when lock / evolve=off).
+    /// Hot path: event-rate only. No alloc/lock/IO/panic/transcendentals.
     pub fn applyDensityStep(self: *StepSeq, bar: u64, base_seed: u64) void {
         if (self.lock or !self.evolve) return;
         const band = self.density_band;
@@ -675,22 +675,22 @@ pub const StepSeq = struct {
         return 0;
     }
 
-    // --- pattern mask / playhead step の atomic アクセサ（TASK-40.7.2）---
-    // 動的 patch アプリ（apps/patch）は畳み箱の grid/303 を稼働中に編集する（GUI store）/ playhead を毎フレーム
-    // 読む（GUI load）。RT の process は mask を rising edge 時に load・step を rising edge 時に load/store する。
-    // GUI⇔RT で cross-thread に触れる mask(u16×3) と step(u8) だけを `@atomicLoad`/`@atomicStore(.monotonic)` で
-    // アクセスする（field 定義・init 構文は不変＝プレーンのまま。std.atomic.Value 化しない）。
+    // --- Atomic accessors for pattern masks / playhead step ---
+    // Dynamic patch apps (apps/patch) edit the fold-box grid/303 while running (GUI store) / read the playhead
+    // every frame (GUI load). RT process loads the mask on a rising edge and load/stores step on a rising edge.
+    // Only the cross-thread fields — mask(u16×3) and step(u8) — are touched with `@atomicLoad`/`@atomicStore(.monotonic)`
+    // (field definitions and init syntax stay plain; do not wrap in std.atomic.Value).
     //
-    // 頻度: mask load = clock rising edge 時のみ（120BPM 16 分で約 8 回/秒。毎サンプルの atomic 読みは足さない）/
-    //       step store = rising edge 時のみ（≈8 回/秒）/ GUI の mask store = 人間クリック時のみ・step load = frame 毎（60/秒・読みのみ）。
-    // monotonic は単一スレッド実行ではプレーンアクセスと完全に値等価（静的版 LofiPatch/run-modular は RT 単一
-    // スレッドのまま＝挙動不変＝test-modular/test-app-modular が回帰ガード）。
+    // Rate: mask load = only on clock rising edge (~8/sec at 120BPM sixteenth notes; no per-sample atomic reads) /
+    //       step store = only on rising edge (~8/sec) / GUI mask store = human clicks only / step load = every frame (60/sec, read-only).
+    // Under single-threaded execution, monotonic is fully value-equivalent to a plain access (the static LofiPatch/run-modular
+    // stays a single RT thread = behaviour unchanged = test-modular/test-app-modular are the regression guard).
     //
-    // false sharing 分離不要の判断: これらの atomic は step/prev_gate/cur_pitch 等の RT 更新 field と同一 cache
-    // line に載り得るが、双方向とも恒常的な cross-core 書き込み競合ではない（GUI store はイベント時のみ、RT store
-    // は rising edge 時のみ ≈8 回/秒、GUI の frame 毎 load は読みのみで line 所有権を奪わない）。性能規約の
-    // cache_line 分離が対象とする「producer/consumer が恒常的に別々に触る atomic ペア(SPSC head/tail 型)」に
-    // 該当しないので分離不要（許容）。
+    // Why false-sharing isolation is not required: these atomics may share a cache line with RT-updated fields
+    // (step/prev_gate/cur_pitch, …), but neither side has sustained cross-core write contention (GUI stores are event-only,
+    // RT stores are rising-edge-only ~8/sec, and the GUI's per-frame load is read-only so it does not steal line ownership).
+    // The cache_line rule targets "atomic pairs that producer/consumer touch continuously on separate cores (SPSC head/tail)";
+    // this case does not qualify, so isolation is unnecessary (accepted).
     pub inline fn loadOnMask(self: *const StepSeq) u16 {
         return @atomicLoad(u16, &self.on_mask, .monotonic);
     }
@@ -709,7 +709,7 @@ pub const StepSeq = struct {
     pub inline fn storeSlideMask(self: *StepSeq, v: u16) void {
         @atomicStore(u16, &self.slide_mask, v, .monotonic);
     }
-    /// step ビット s（0..15）をトグルして store（GUI クリック編集・イベント時のみ）。
+    /// Toggle step bit s (0..15) and store (GUI click edit; event-time only).
     pub inline fn toggleOnBit(self: *StepSeq, s: u8) void {
         self.storeOnMask(self.loadOnMask() ^ (@as(u16, 1) << @intCast(s & 15)));
     }
@@ -726,7 +726,7 @@ pub const StepSeq = struct {
         @atomicStore(u8, &self.step, v, .monotonic);
     }
 
-    /// step s の degree index を pitch_cv へ（範囲 clamp + scale 共有写像）。
+    /// Map step s's degree index to pitch_cv (range-clamped + shared scale mapping).
     fn pitchForStep(self: *const StepSeq, s: u8) f32 {
         const total = scaleDegreeCount(self.scale, self.octaves);
         const raw: i32 = self.pitch_deg[s & 15];
@@ -738,22 +738,22 @@ pub const StepSeq = struct {
         const self: *StepSeq = @ptrCast(@alignCast(ctx));
         const g = signal.gateHigh(io.inputs[0]);
         var gate_out: f32 = 0;
-        if (g and !self.prev_gate) { // clock rising edge → 現 step を評価して進める
-            const s = self.loadStep(); // atomic（GUI が playhead を frame 毎 load）
-            if (bitSet(self.loadOnMask(), s)) { // mask は rising edge 時のみ atomic load（毎サンプルでない）
+        if (g and !self.prev_gate) { // clock rising edge -> evaluate the current step and advance
+            const s = self.loadStep(); // atomic (GUI loads the playhead every frame)
+            if (bitSet(self.loadOnMask(), s)) { // masks are atomic-loaded only on a rising edge (not every sample)
                 gate_out = 1.0;
                 if (self.kind == .bass) {
                     self.target_pitch = self.pitchForStep(s);
                     if (bitSet(self.loadSlideMask(), s)) {
-                        self.gliding = true; // 現在 pitch から滑らせる（portamento）
+                        self.gliding = true; // Glide from the current pitch (portamento)
                     } else {
-                        self.cur_pitch = self.target_pitch; // 即時ジャンプ
+                        self.cur_pitch = self.target_pitch; // Immediate jump
                         self.gliding = false;
                     }
                     self.accent_held = if (bitSet(self.loadAccentMask(), s)) 1.0 else 0.0;
                 }
             }
-            self.storeStep((s + 1) % STEPS); // atomic store（rising edge 時のみ ≈8/秒）
+            self.storeStep((s + 1) % STEPS); // atomic store (rising-edge only ~8/sec)
         }
         self.prev_gate = g;
         io.outputs[0] = gate_out;
@@ -768,19 +768,19 @@ pub const StepSeq = struct {
                 }
                 if (self.cur_pitch == self.target_pitch) self.gliding = false;
             }
-            io.outputs[1] = self.cur_pitch; // bass spec のときのみ存在（drum は out0 のみ）
+            io.outputs[1] = self.cur_pitch; // Present only for the bass spec (drum has out0 only)
             io.outputs[2] = self.accent_held;
         }
     }
 };
 
 // ----------------------------------------------------------------------------
-// Lfo: 入力なし -> cv(out0, bipolar -1..1)。遅い連続モジュレーション源（アンビエント層の音色を流す。Ph5）。
-// 位相ベースで決定的（fixed phase 起点）。dsp.Lfo を包む。
+// Lfo: no inputs -> cv(out0, bipolar -1..1). Slow continuous modulation source (moves ambient-layer timbre).
+// Phase-based and deterministic (fixed phase start). Wraps dsp.Lfo.
 // ----------------------------------------------------------------------------
 pub const Lfo = struct {
     lfo: dsp.Lfo = .{},
-    rate_hz: f32 = 0.1, // 既定: ~10 秒周期の遅い揺れ
+    rate_hz: f32 = 0.1, // Default: a slow wobble of ~10 s period
 
     const out_kinds = [_]PortKind{.cv};
     const vtable = VTable{ .process = process, .updateParams = signal.noopUpdate };
@@ -798,28 +798,28 @@ pub const Lfo = struct {
 };
 
 // ----------------------------------------------------------------------------
-// 合成ドラム（サンプル不使用）。trigger(gate in0) で発火し audio(out0)。
-// 振幅/ピッチ envelope は乗算式の指数減衰（@exp は updateParams での係数計算のみ・毎サンプル避ける）。
+// Synthesised drums (no samples). Fire on trigger(gate in0) and emit audio(out0).
+// Amp/pitch envelopes use multiplicative exponential decay (@exp only when computing coefficients in updateParams; never per sample).
 // ----------------------------------------------------------------------------
 fn decayCoef(decay: f32, sr: f32) f32 {
     return @exp(-1.0 / (@max(decay, 1e-4) * sr));
 }
 
-// Kick: sine osc を速いピッチ env で叩き、振幅 env と softClip(drive) で胴鳴り感を出す。
+// Kick: drive a sine osc with a fast pitch env; amp env + softClip(drive) give the body thud.
 pub const Kick = struct {
     osc: dsp.Oscillator = .{ .waveform = .sine },
-    /// アタックのクリック用ノイズ。fixed seed（"KICK"）で決定的（Hat/Clap と同方針）。
+    /// Attack-click noise. Fixed seed ("KICK") for determinism (same policy as Hat/Clap).
     click_noise: dsp.Noise = .{ .state = 0x4B49434B },
-    click_hp: dsp.Filter = .{}, // クリックを高域寄りにする HP（こもらせない）
-    base_hz: f32 = 50.0, // 胴の最終周波数（sub）
-    start_hz: f32 = 140.0, // ピッチ env の頂点（アタックの"芯"）
+    click_hp: dsp.Filter = .{}, // HP that keeps the click bright (not muffled)
+    base_hz: f32 = 50.0, // Body's final frequency (sub)
+    start_hz: f32 = 140.0, // Pitch-env peak (the attack "core")
     pitch_decay: f32 = 0.03,
     amp_decay: f32 = 0.28,
-    body_gain: f32 = 1.0, // 胴の量
-    drive: f32 = 1.9, // softClip drive（太さ/歪み）
-    click_gain: f32 = 0.35, // アタックのクリック量（GUI "Kick Punch"）
-    click_decay: f32 = 0.005, // クリックは非常に短い
-    click_cutoff: f32 = 1400.0, // クリック HP cutoff
+    body_gain: f32 = 1.0, // Body amount
+    drive: f32 = 1.9, // softClip drive (thickness/distortion)
+    click_gain: f32 = 0.35, // Attack click amount (GUI "Kick Punch")
+    click_decay: f32 = 0.005, // Click is very short
+    click_cutoff: f32 = 1400.0, // Click HP cutoff
     gain: f32 = 0.8,
     prev_gate: bool = false,
     active: bool = false,
@@ -889,14 +889,14 @@ pub const Kick = struct {
     }
 };
 
-// Hat: noise を HP→BP で整え、短い振幅 env で叩く。fixed seed で決定的。
+// Hat: shape noise through HP->BP and strike with a short amp env. Deterministic via fixed seed.
 pub const Hat = struct {
     noise: dsp.Noise = .{ .state = 0x48415431 },
     hp: dsp.Filter = .{},
     bp: dsp.Filter = .{},
     decay: f32 = 0.045,
-    /// 明るさ。HP/BP cutoff を乗算でスケール（0.3..2.5 に clamp）。1.0 で基準（従来と bit 一致）。
-    /// GUI "Hat Bright"。耳に痛い帯域が出すぎないよう既定は控えめ（=1.0）。
+    /// Brightness. Scales HP/BP cutoff by multiplication (clamped to 0.3..2.5). 1.0 is the baseline (bit-identical to before).
+    /// GUI "Hat Bright". Default stays modest (=1.0) so harsh bands do not dominate.
     brightness: f32 = 1.0,
     hp_cutoff: f32 = 7000.0,
     bp_cutoff: f32 = 9000.0,
@@ -906,9 +906,9 @@ pub const Hat = struct {
     active: bool = false,
     amp: f32 = 0.0,
     amp_k: f32 = 0.0,
-    coeffs_sr: f32 = -1.0, // フィルタ係数を計算した sr（変化時のみ再計算）
-    applied_bright: f32 = -1.0, // 反映済み brightness（runtime 変更検出）
-    applied_decay: f32 = -1.0, // 反映済み decay（runtime 変更検出）
+    coeffs_sr: f32 = -1.0, // Sample rate used for the last filter-coefficient compute (recompute only on change)
+    applied_bright: f32 = -1.0, // Last applied brightness (detect runtime changes)
+    applied_decay: f32 = -1.0, // Last applied decay (detect runtime changes)
     applied_hp_cutoff: f32 = -1.0,
     applied_bp_cutoff: f32 = -1.0,
     applied_bp_q: f32 = -1.0,
@@ -924,7 +924,7 @@ pub const Hat = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *Hat = @ptrCast(@alignCast(ctx));
-        // sr/brightness/decay いずれか変化時のみ係数(@exp/tan)再計算（GUI からの runtime 変更を拾う）。
+        // Recompute coefficients (@exp/tan) only when sr/brightness/decay change (pick up GUI runtime edits).
         if (self.coeffs_sr == sr and self.applied_bright == self.brightness and self.applied_decay == self.decay and
             self.applied_hp_cutoff == self.hp_cutoff and self.applied_bp_cutoff == self.bp_cutoff and
             self.applied_bp_q == self.bp_q) return;
@@ -966,14 +966,14 @@ pub const Hat = struct {
 };
 
 // ----------------------------------------------------------------------------
-// PercEnv: gate(in0=trigger) -> cv(out0, 0..1)。1 サンプル trigger で発火する打楽器的
-// 指数減衰エンベロープ（VCA.gain_cv 等へ。trigger だと gate-sustained の EnvGen は鳴らないため）。
+// PercEnv: gate(in0=trigger) -> cv(out0, 0..1). Percussive exponential-decay envelope that fires on a
+// one-sample trigger (into VCA.gain_cv etc.; a gate-sustained EnvGen would not sound from a trigger).
 // ----------------------------------------------------------------------------
 pub const PercEnv = struct {
     decay: f32 = 0.18,
-    /// 出力レベルの連続倍率（エンベロープ深度）。1.0 で従来どおり（level×1.0=level の bit 一致）。
-    /// 0 で無音（mute）。毎サンプル出力に掛かるので、発音中に変えても即時反映される（リアルタイム gain/mute）。
-    /// 非有限は 1.0 に、範囲は [0,4] に丸める。VCA の gain_cv へ繋ぐと「トラック音量」として使える。
+    /// Continuous output-level scale (envelope depth). 1.0 matches the prior behaviour (level×1.0=level, bit-identical).
+    /// 0 is silence (mute). Applied to every sample's output, so changes during a note take effect immediately (live gain/mute).
+    /// Non-finite rounds to 1.0; range is clamped to [0,4]. Wired into a VCA's gain_cv it acts as "track level".
     peak: f32 = 1.0,
     prev_gate: bool = false,
     active: bool = false,
@@ -1014,14 +1014,14 @@ pub const PercEnv = struct {
         const lvl = self.level;
         self.level *= self.k;
         if (self.level < done_eps) self.active = false;
-        // 出力に peak を掛ける（毎サンプルなので発音中の gain/mute 変更も即時反映）。
+        // Apply peak to the output (every sample, so mid-note gain/mute edits take effect immediately).
         const p = if (std.math.isFinite(self.peak)) std.math.clamp(self.peak, 0.0, 4.0) else 1.0;
         io.outputs[0] = lvl * p;
     }
 };
 
 // ----------------------------------------------------------------------------
-// Random: gate(in0=trigger) -> cv(out0)。trigger ごとに乱数を S&H（fixed seed で決定的）。
+// Random: gate(in0=trigger) -> cv(out0). S&H a random value on each trigger (deterministic via fixed seed).
 // ----------------------------------------------------------------------------
 pub const Random = struct {
     noise: dsp.Noise = .{ .state = 0x52414E44 }, // "RAND"
@@ -1058,16 +1058,16 @@ pub const Random = struct {
 };
 
 // ----------------------------------------------------------------------------
-// TuringMachine: gate(in0=clock) -> cv(out0)。N ビットのシフトレジスタを回し、lock 確率で
-// 前パターンを loop、(1-lock) で新ビットを 1 個だけ注入する。「同じだが少しずつ変わる」生成核。
-// register 自体が anchor(ループ)で、稀に anchor_register へ復帰し迷子を防ぐ。fixed seed で決定的。
+// TuringMachine: gate(in0=clock) -> cv(out0). Rotate an N-bit shift register; with lock probability
+// loop the previous pattern, else inject exactly one new bit. The "same but slowly changing" generator core.
+// The register itself is the anchor (loop); rarely snap back to anchor_register to avoid drift. Deterministic via fixed seed.
 // ----------------------------------------------------------------------------
 pub const TuringMachine = struct {
     noise: dsp.Noise = .{ .state = 0x5455524E }, // "TURN"
     bits: u8 = 8,
-    register: u32 = 0xB5, // 初期パターン（非ゼロ）
+    register: u32 = 0xB5, // Initial pattern (non-zero)
     anchor_register: u32 = 0xB5,
-    lock: f32 = 0.93, // 0.85..0.98 に clamp。高いほど反復的
+    lock: f32 = 0.93, // Clamped to 0.85..0.98. Higher is more repetitive
     last_cv: f32 = 0.0,
     prev_gate: bool = false,
     edge_count: u32 = 0,
@@ -1089,9 +1089,9 @@ pub const TuringMachine = struct {
             const bits: u5 = @intCast(std.math.clamp(self.bits, 1, 16));
             const mask: u32 = (@as(u32, 1) << bits) - 1;
             const lock = std.math.clamp(self.lock, 0.85, 0.98);
-            const top: u32 = (self.register >> (bits - 1)) & 1; // 押し出されるビット
+            const top: u32 = (self.register >> (bits - 1)) & 1; // Bit being shifted out
             const r = (self.noise.next() + 1.0) * 0.5; // 0..1
-            // lock なら loop（top を再注入）、そうでなければ新ビットを 1 個注入
+            // If locked, loop (re-inject top); otherwise inject one new bit
             const new_bit: u32 = if (r < lock)
                 top
             else if ((self.noise.next() + 1.0) * 0.5 < 0.5) @as(u32, 1) else 0;
@@ -1110,8 +1110,8 @@ pub const TuringMachine = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Clap: gate(in0=trigger) -> audio(out0)。複数の短いノイズバースト + 軽い tone（サンプル不使用）。
-// バースト形状は線形（@exp を毎サンプル走らせない）、全体のテイルは乗算式減衰。fixed seed。
+// Clap: gate(in0=trigger) -> audio(out0). Several short noise bursts + a light tone (no samples).
+// Burst shape is linear (do not run @exp per sample); the overall tail uses multiplicative decay. Fixed seed.
 // ----------------------------------------------------------------------------
 pub const Clap = struct {
     noise: dsp.Noise = .{ .state = 0x434C4150 }, // "CLAP"
@@ -1127,7 +1127,7 @@ pub const Clap = struct {
     tone_hz: f32 = 180.0,
     tone_gain: f32 = 0.06,
     decay: f32 = 0.12,
-    /// バースト間隔（ms）。手拍子の「パパッ」の詰まり具合。大で広がり、小で密集。
+    /// Burst spacing (ms). How tightly the handclap "pa-pa" packs. Larger spreads; smaller packs denser.
     spread_ms: f32 = 10.0,
     hp_cutoff: f32 = 1200.0,
     bp_cutoff: f32 = 1800.0,
@@ -1147,7 +1147,7 @@ pub const Clap = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    /// 3 つの素早いバースト（線形立ち下がり）。手拍子の「パパッ」を作る。間隔は spread_ms。
+    /// Three quick bursts (linear fall). Makes the handclap "pa-pa". Spacing is spread_ms.
     fn burstShape(t_ms: f32, spread_ms: f32) f32 {
         const sp = if (std.math.isFinite(spread_ms)) std.math.clamp(spread_ms, 1.0, 40.0) else 10.0;
         const centers = [_]f32{ 0.0, sp, 2.0 * sp };
@@ -1205,10 +1205,10 @@ pub const Clap = struct {
 };
 
 // ----------------------------------------------------------------------------
-// ChordPad: gate/trigger(in0) -> audio(out0)。固定 root の温かい和音（root + 5th + minor 10th）を
-// slow attack + 長め release のエンベロープで鳴らす。3 oscillator を warmth で軽く detune し LP で丸める。
-// 乱数を使わない＝決定的（fixed seed すら不要）。bass(Turing) には追従せず固定和声で土台の温かみを足す
-// （patch では Sidechain 経路に入り kick に duck される）。設計: docs/plans/modular-synth-plan.md §4。
+// ChordPad: gate/trigger(in0) -> audio(out0). A warm fixed-root chord (root + 5th + minor 10th) with a
+// slow-attack + long-release envelope. Three oscillators lightly detuned by warmth and rounded by an LP.
+// No RNG = deterministic (even a fixed seed is unnecessary). Does not follow the bass (Turing); adds a fixed-harmony
+// warm bed (in the patch it sits on the Sidechain path and is ducked by the kick). See docs/modular.md.
 // ----------------------------------------------------------------------------
 pub const ChordPad = struct {
     osc: [3]dsp.Oscillator = .{
@@ -1217,28 +1217,28 @@ pub const ChordPad = struct {
         .{ .waveform = .saw },
     },
     lp: dsp.Filter = .{},
-    base_hz: f32 = 130.81, // pitch_cv=0 のときの root（C3）。pitch_cv 接続で root_hz を駆動
-    root_hz: f32 = 130.81, // 実効 root（pitch_cv 接続時は base_hz * 2^pitch_cv）。Ph5 で連続生成が遷移させる
-    /// 和音インターバル（半音）: root / perfect 5th / minor 10th(=oct + minor 3rd)。固定（旋律追従なし）。
+    base_hz: f32 = 130.81, // Root when pitch_cv=0 (C3). A connected pitch_cv drives root_hz
+    root_hz: f32 = 130.81, // Effective root (base_hz * 2^pitch_cv when pitch_cv is connected). Continuous generation may morph this
+    /// Chord intervals (semitones): root / perfect 5th / minor 10th (= oct + minor 3rd). Fixed (no melodic tracking).
     intervals: [3]f32 = .{ 0.0, 7.0, 15.0 },
-    detune: f32 = 0.004, // warmth=1 時の最大デチューン比（±）
-    warmth: f32 = 0.6, // 0..1。detune 深さ＋わずかな drive を集約（GUI "Pad Warmth"）
-    cutoff: f32 = 1400.0, // LP cutoff（GUI "Pad Cutoff"）
-    cutoff_mod_oct: f32 = 0.6, // cutoff modulation 入力 1.0 あたりの幅（オクターブ。Ph5 アンビエント LFO）
-    level_mod_depth: f32 = 0.25, // level modulation 入力（aux）の深さ（Ph5 アンビエント S&H）
-    attack: f32 = 0.35, // s（slow swell）
-    release: f32 = 1.4, // s（long fade）
-    gain: f32 = 0.22, // 出力レベル（GUI "Pad Level"・mute で 0）
+    detune: f32 = 0.004, // Max detune ratio (±) at warmth=1
+    warmth: f32 = 0.6, // 0..1. Aggregates detune depth + a touch of drive (GUI "Pad Warmth")
+    cutoff: f32 = 1400.0, // LP cutoff (GUI "Pad Cutoff")
+    cutoff_mod_oct: f32 = 0.6, // Depth in octaves per 1.0 of the cutoff-modulation input (ambient LFO)
+    level_mod_depth: f32 = 0.25, // Depth of the level-modulation input (aux) (ambient S&H)
+    attack: f32 = 0.35, // s (slow swell)
+    release: f32 = 1.4, // s (long fade)
+    gain: f32 = 0.22, // Output level (GUI "Pad Level"; 0 when muted)
     prev_gate: bool = false,
     attacking: bool = false,
     env: f32 = 0.0,
     atk_inc: f32 = 0.0,
     rel_k: f32 = 0.0,
-    freqs: [3]f32 = .{ 0, 0, 0 }, // 算出した各 osc の Hz（@exp2 を毎サンプル避ける）
-    drive_mul: f32 = 1.0, // warmth 由来の軽い飽和係数（事前計算）
-    base_fc: f32 = 1400.0, // updateParams が算出した clamp 済み base cutoff（modulation の基準）
-    fc_ctrl_counter: u32 = 0, // cutoff modulation を control-rate で間引くカウンタ
-    // updateParams 用 dirty-gate（knob 変化検知）
+    freqs: [3]f32 = .{ 0, 0, 0 }, // Per-osc Hz (avoid @exp2 per sample)
+    drive_mul: f32 = 1.0, // Light saturation coefficient from warmth (precomputed)
+    base_fc: f32 = 1400.0, // Clamped base cutoff from updateParams (modulation baseline)
+    fc_ctrl_counter: u32 = 0, // Control-rate decimation counter for cutoff modulation
+    // Dirty-gate for updateParams (detect knob changes)
     applied_sr: f32 = -1.0,
     applied_cutoff: f32 = -1.0,
     applied_attack: f32 = -1.0,
@@ -1246,13 +1246,13 @@ pub const ChordPad = struct {
     applied_warmth: f32 = -1.0,
     applied_base_hz: f32 = -1.0,
     applied_detune: f32 = -1.0,
-    // 実フィルタ係数 / pitch_cv root の dirty-gate（tan/@exp2 を変化時のみ）
+    // Dirty-gate for real filter coeffs / pitch_cv root (tan/@exp2 only on change)
     applied_fc: f32 = -1.0,
     applied_lp_sr: f32 = -1.0,
     applied_root_cv: f32 = 0.0,
     root_cv_init: bool = false,
-    // TASK-115.3: descriptor 非公開の MIDI runtime state（グラフ topology は不変）。
-    // main/RT が note 境界で書き、process は固定状態判定のみ（毎サンプルの @exp2/atomic を新設しない）。
+    // MIDI runtime state not exposed in the descriptor (graph topology is unchanged).
+    // main/RT writes it at note boundaries; process only does fixed-state checks (no new per-sample @exp2/atomic).
     midi_active: bool = false,
     midi_gate: bool = false,
     midi_root_hz: f32 = 130.81,
@@ -1262,7 +1262,7 @@ pub const ChordPad = struct {
     const done_eps: f32 = 1e-4;
     const root_eps: f32 = 1e-4;
     const fc_ctrl_period: u32 = 16;
-    // in: gate / pitch_cv(任意) / cutoff_mod(任意) / level_mod(任意)。任意入力は Io.connected[] で判定。
+    // in: gate / pitch_cv(optional) / cutoff_mod(optional) / level_mod(optional). Optional inputs use Io.connected[].
     const in_kinds = [_]PortKind{ .gate, .cv, .cv, .cv };
     const out_kinds = [_]PortKind{.audio};
     const vtable = VTable{ .process = process, .updateParams = updateParams };
@@ -1271,7 +1271,7 @@ pub const ChordPad = struct {
         return .{ .vtable = &vtable, .ctx = self, .in_kinds = &in_kinds, .out_kinds = &out_kinds };
     }
 
-    /// note event / block 境界専用。MIDI note → Hz を事前計算して root override を有効化する（RT・alloc なし）。
+    /// Note-event / block-boundary only. Precompute MIDI note -> Hz and enable the root override (RT; no alloc).
     pub fn applyMidiNote(self: *ChordPad, note: u8, velocity: f32) void {
         const n: f32 = @floatFromInt(note);
         const hz = 440.0 * @exp2((n - 69.0) / 12.0);
@@ -1280,23 +1280,23 @@ pub const ChordPad = struct {
         const entering = !self.midi_active;
         self.midi_gate = true;
         self.midi_active = true;
-        self.midi_root_applied = false; // 次 process で dirty-gate 再計算
-        // ambient→MIDI の gate source 切替時のみ prev を落とす（legato 中の root 更新では再 attack しない）。
+        self.midi_root_applied = false; // Recompute via dirty-gate on the next process
+        // Drop prev only when switching the gate source ambient->MIDI (a root update mid-legato must not re-attack).
         if (entering) self.prev_gate = false;
     }
 
-    /// 全 MIDI ノート解放時。gate を落として release へ移行し、以降は ambient pitch_cv 経路へ戻る。
+    /// Called when all MIDI notes are released. Drop the gate into release, then return to the ambient pitch_cv path.
     pub fn clearMidi(self: *ChordPad) void {
         const leaving = self.midi_active;
         self.midi_gate = false;
         self.midi_active = false;
         self.midi_root_applied = false;
-        self.root_cv_init = false; // ambient root を次サンプルで再評価
-        // MIDI→ambient 切替時も prev を落とし、ambient gate high なら次 process で rising edge を出す。
+        self.root_cv_init = false; // Re-evaluate the ambient root on the next sample
+        // Also drop prev on MIDI->ambient so a high ambient gate yields a rising edge on the next process.
         if (leaving) self.prev_gate = false;
     }
 
-    /// 実フィルタ係数（tan）を dirty-gated で更新。base cutoff と modulation の唯一の choke point。
+    /// Update real filter coefficients (tan) dirty-gated. Sole choke point for base cutoff and modulation.
     fn applyLp(self: *ChordPad, sr: f32, fc_in: f32) void {
         var fc = if (std.math.isFinite(fc_in)) fc_in else 1400.0;
         fc = std.math.clamp(fc, 50.0, @max(60.0, sr * 0.5 - 1.0));
@@ -1308,7 +1308,7 @@ pub const ChordPad = struct {
         self.applied_lp_sr = sr;
     }
 
-    /// 和音 Hz（root × 固定 interval × warmth デチューン）と warmth 飽和係数を再計算（@exp2 はここだけ）。
+    /// Recompute chord Hz (root × fixed intervals × warmth detune) and the warmth saturation coefficient (@exp2 only here).
     fn recomputeFreqs(self: *ChordPad) void {
         const w = if (std.math.isFinite(self.warmth)) std.math.clamp(self.warmth, 0.0, 1.0) else 0.6;
         for (0..3) |i| {
@@ -1321,8 +1321,8 @@ pub const ChordPad = struct {
 
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *ChordPad = @ptrCast(@alignCast(ctx));
-        // sr/cutoff/attack/release/warmth のいずれか変化時のみ係数(@exp2/tan)再計算（GUI runtime 変更を拾う）。
-        // process は毎サンプル軽量算術のみ（重い transcendental はここ＝ブロックレートに集約）。
+        // Recompute coefficients (@exp2/tan) only when sr/cutoff/attack/release/warmth change (pick up GUI runtime edits).
+        // process is cheap per-sample arithmetic only (heavy transcendentals stay here = block-rate).
         if (self.applied_sr == sr and self.applied_base_hz == self.base_hz and self.applied_detune == self.detune and
             self.applied_cutoff == self.cutoff and
             self.applied_attack == self.attack and self.applied_release == self.release and
@@ -1338,7 +1338,7 @@ pub const ChordPad = struct {
         var fc = if (std.math.isFinite(self.cutoff)) self.cutoff else 1400.0;
         fc = std.math.clamp(fc, 50.0, @max(60.0, sr * 0.5 - 1.0));
         self.base_fc = fc;
-        self.applyLp(sr, fc); // base cutoff（cutoff modulation 未接続時はこれが効く）
+        self.applyLp(sr, fc); // base cutoff (used when cutoff modulation is unconnected)
         self.recomputeFreqs();
         self.applied_sr = sr;
         self.applied_base_hz = self.base_hz;
@@ -1351,7 +1351,7 @@ pub const ChordPad = struct {
 
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *ChordPad = @ptrCast(@alignCast(ctx));
-        // MIDI active 中は ambient pitch_cv より MIDI root を優先（Hz は note 境界で事前計算済み）。
+        // While MIDI is active, prefer the MIDI root over ambient pitch_cv (Hz was precomputed at the note boundary).
         if (self.midi_active) {
             if (!self.midi_root_applied or @abs(self.midi_root_hz - self.root_hz) > root_eps) {
                 self.root_hz = self.midi_root_hz;
@@ -1359,8 +1359,8 @@ pub const ChordPad = struct {
                 self.midi_root_applied = true;
             }
         } else if (optInput(io, 1)) |pcv_raw| {
-            // pitch_cv(任意)で root を駆動（連続生成のアンビエント和声）。値変化時のみ @exp2 再計算（dirty-gate）。
-            // 信号規約上 pitch_cv=0 は基準音なので、未接続判定は値ではなく Io.connected[] で行う。
+            // Drive root from optional pitch_cv (continuous ambient harmony). Recompute @exp2 only on value change (dirty-gate).
+            // Per the signal convention pitch_cv=0 is the reference pitch, so "unconnected" is decided by Io.connected[], not the value.
             const pcv = if (std.math.isFinite(pcv_raw)) std.math.clamp(pcv_raw, -4.0, 4.0) else 0.0;
             if (!self.root_cv_init or @abs(pcv - self.applied_root_cv) > root_eps) {
                 self.root_hz = self.base_hz * @exp2(pcv);
@@ -1369,7 +1369,7 @@ pub const ChordPad = struct {
                 self.root_cv_init = true;
             }
         }
-        // cutoff modulation(任意)を control-rate で評価（毎サンプル tan を避ける。VCF と同方針）。
+        // Evaluate optional cutoff modulation at control-rate (avoid per-sample tan; same policy as VCF).
         if (optInput(io, 2)) |m_raw| {
             self.fc_ctrl_counter += 1;
             if (self.fc_ctrl_counter >= fc_ctrl_period) {
@@ -1378,9 +1378,9 @@ pub const ChordPad = struct {
                 self.applyLp(io.sample_rate, self.base_fc * @exp2(m * self.cutoff_mod_oct));
             }
         }
-        // MIDI active 中は MIDI gate、それ以外は入力 gate（ambient Euclid）。
+        // While MIDI is active use the MIDI gate; otherwise the input gate (ambient Euclid).
         const g = if (self.midi_active) self.midi_gate else signal.gateHigh(io.inputs[0]);
-        if (g and !self.prev_gate) self.attacking = true; // (再)トリガで swell
+        if (g and !self.prev_gate) self.attacking = true; // (Re)trigger the swell
         self.prev_gate = g;
         if (self.attacking) {
             self.env += self.atk_inc;
@@ -1397,13 +1397,13 @@ pub const ChordPad = struct {
         }
         var sum: f32 = 0;
         for (&self.osc, 0..) |*o, i| {
-            sum += o.next(self.freqs[i], io.sample_rate); // 事前計算済み Hz（@exp2 なし）
+            sum += o.next(self.freqs[i], io.sample_rate); // Precomputed Hz (no @exp2)
         }
         sum *= 1.0 / 3.0;
-        const driven = dsp.softClip(sum * self.drive_mul); // warmth で軽い飽和（係数は事前計算）
+        const driven = dsp.softClip(sum * self.drive_mul); // Light saturation from warmth (coefficient precomputed)
         const vel = if (self.midi_active) self.midi_velocity else 1.0;
         var y = self.lp.process(driven) * self.env * self.gain * vel;
-        // level modulation(任意・aux)。アンビエント S&H 由来の控えめな呼吸（毎サンプル軽量）。
+        // Optional level modulation (aux). Subtle breathing from ambient S&H (cheap per sample).
         if (optInput(io, 3)) |a_raw| {
             const a = if (std.math.isFinite(a_raw)) a_raw else 0.0;
             y *= std.math.clamp(1.0 + a * self.level_mod_depth, 0.0, 2.0);
@@ -1413,8 +1413,8 @@ pub const ChordPad = struct {
 };
 
 // ----------------------------------------------------------------------------
-// lofi FX wrapper（audio in0 -> audio out0）。内部 dsp プリミティブを包む。
-// feedback/wet/drive は clamp し、process は finite ガード + 軽量算術のみ（重い係数は updateParams）。
+// lofi FX wrappers (audio in0 -> audio out0). Wrap internal DSP primitives.
+// Clamp feedback/wet/drive; process is finite-guard + cheap arithmetic only (heavy coefficients in updateParams).
 // ----------------------------------------------------------------------------
 pub const Saturator = struct {
     drive: f32 = 1.4,
@@ -1448,7 +1448,7 @@ pub const Bitcrusher = struct {
 };
 
 pub const DelayFx = struct {
-    line: dsp.DelayLine(65536) = .{}, // 最大 ~1.36s @48k
+    line: dsp.DelayLine(65536) = .{}, // Max ~1.36s @48k
     delay_ms: f32 = 375.0,
     feedback: f32 = 0.35,
     wet: f32 = 0.2,
@@ -1480,7 +1480,7 @@ pub const ReverbFx = struct {
     coeffs_sr: f32 = -1.0,
     applied_decay: f32 = -1.0,
     applied_damping: f32 = -1.0,
-    ready: bool = false, // dsp.Reverb の tap 長は setSampleRate 前は undefined。未初期化なら dry を返す
+    ready: bool = false, // dsp.Reverb tap lengths are undefined before setSampleRate. Return dry if not yet initialised
     const in_kinds = [_]PortKind{.audio};
     const out_kinds = [_]PortKind{.audio};
     const vtable = VTable{ .process = process, .updateParams = updateParams };
@@ -1489,13 +1489,13 @@ pub const ReverbFx = struct {
     }
     fn updateParams(ctx: *anyopaque, sr: f32) void {
         const self: *ReverbFx = @ptrCast(@alignCast(ctx));
-        if (self.coeffs_sr != sr) { // タップ長(sr 依存)は sr 変化時のみ
+        if (self.coeffs_sr != sr) { // Tap lengths (sr-dependent) only when sr changes
             self.rev.setSampleRate(sr);
             self.coeffs_sr = sr;
             self.ready = true;
         }
         if (self.applied_decay != self.decay or self.applied_damping != self.damping) {
-            self.rev.setParams(self.decay, self.damping); // 軽量（tan なし）
+            self.rev.setParams(self.decay, self.damping); // Cheap (no tan)
             self.applied_decay = self.decay;
             self.applied_damping = self.damping;
         }
@@ -1503,7 +1503,7 @@ pub const ReverbFx = struct {
     fn process(ctx: *anyopaque, io: *Io) void {
         const self: *ReverbFx = @ptrCast(@alignCast(ctx));
         const x = if (std.math.isFinite(io.inputs[0])) io.inputs[0] else 0.0;
-        if (!self.ready) { // updateParams 前の direct process でも未定義 tap を読まない
+        if (!self.ready) { // Do not read undefined taps even if process runs before updateParams
             io.outputs[0] = x;
             return;
         }
@@ -1543,8 +1543,8 @@ pub const WowFlutterFx = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Sidechain: audio(in0) を gate(in1=トリガ)でダッキング（テクノの「ポンプ」）。
-// trigger で env=1、amount 深さで瞬間的に gain を下げ指数回復。amount=0 で恒等（passthrough）。
+// Sidechain: duck audio(in0) from gate(in1=trigger) (techno "pump").
+// trigger sets env=1, instant gain drop of depth amount, then exponential recovery. amount=0 is identity (passthrough).
 // ----------------------------------------------------------------------------
 pub const Sidechain = struct {
     amount: f32 = 0.0,
@@ -1578,15 +1578,15 @@ pub const Sidechain = struct {
         if (g and !self.prev_gate) self.env = 1.0;
         self.prev_gate = g;
         const amt = if (std.math.isFinite(self.amount)) std.math.clamp(self.amount, 0.0, 1.0) else 0.0;
-        const duck = std.math.clamp(self.env * amt, 0.0, 0.95); // amt=0 → duck=0 → out=x（恒等）
+        const duck = std.math.clamp(self.env * amt, 0.0, 0.95); // amt=0 -> duck=0 -> out=x (identity)
         io.outputs[0] = x * (1.0 - duck);
         self.env *= self.k;
     }
 };
 
 // ----------------------------------------------------------------------------
-// Slew: signal(cv) + rise/fall rate(cv) -> cv。rate は CV-units/秒。
-// rate の既定値は 1 CV-unit/秒。係数 inv_sr はブロック先頭でのみ更新する。
+// Slew: signal(cv) + rise/fall rate(cv) -> cv. rate is CV-units/sec.
+// Default rate is 1 CV-unit/sec. The inv_sr coefficient is updated only at the block head.
 // ----------------------------------------------------------------------------
 pub const Slew = struct {
     state: f32 = 0.0,
@@ -1638,7 +1638,7 @@ pub const Slew = struct {
 };
 
 // ----------------------------------------------------------------------------
-// SampleHold: signal(cv) + trig(gate) -> cv。立ち上がり時だけ signal をラッチする。
+// SampleHold: signal(cv) + trig(gate) -> cv. Latch signal only on a rising edge.
 // ----------------------------------------------------------------------------
 pub const SampleHold = struct {
     held: f32 = 0.0,
@@ -1666,7 +1666,7 @@ pub const SampleHold = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Comparator: signal(cv) >= threshold(cv) -> gate。
+// Comparator: signal(cv) >= threshold(cv) -> gate.
 // ----------------------------------------------------------------------------
 pub const Comparator = struct {
     const default_threshold: f32 = 0.5;
@@ -1688,7 +1688,7 @@ pub const Comparator = struct {
 };
 
 // ----------------------------------------------------------------------------
-// RingMod: audio(a) * audio(b) -> audio。
+// RingMod: audio(a) * audio(b) -> audio.
 // ----------------------------------------------------------------------------
 pub const RingMod = struct {
     const in_kinds = [_]PortKind{ .audio, .audio };
@@ -1710,7 +1710,7 @@ pub const RingMod = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Logic: gate(a) / gate(b) -> gate。op は将来の per-node UI 用に状態として保持する。
+// Logic: gate(a) / gate(b) -> gate. op is kept as state for a future per-node UI.
 // ----------------------------------------------------------------------------
 pub const LogicOp = enum { @"and", @"or", xor };
 
@@ -1741,11 +1741,11 @@ pub const Logic = struct {
 };
 
 // ============================================================================
-// module-level tests（Io を手組みして process を直接駆動。display/graph 不要）
+// module-level tests (hand-built Io driving process directly; no display/graph needed)
 // ============================================================================
 const testing = std.testing;
 
-/// テスト用に 1 サンプル分の Io を組んで process を呼ぶヘルパー。
+/// Test helper: build a one-sample Io and call process.
 fn drive(
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -1759,7 +1759,7 @@ fn drive(
 }
 
 test "Vco: pitch_cv +1 oct doubles frequency (4-sample period at sr/4 base)" {
-    // base = sr/4 → 1 周期 4 サンプル。pitch_cv=0 と +1oct(=sr/2, 2 サンプル周期)を比較。
+    // base = sr/4 -> 1 cycle = 4 samples. Compare pitch_cv=0 with +1oct (=sr/2, 2-sample period).
     var vco = Vco{ .osc = .{ .waveform = .sine }, .base_hz = 48000.0 / 4.0 };
     var out: [1]f32 = undefined;
     // pitch_cv = 0: phase 0,.25,.5,.75 → 0,1,0,-1
@@ -1791,46 +1791,46 @@ test "EnvGen: gate rising triggers attack, level rises from 0" {
     // gate low → idle, level 0
     drive(&EnvGen.vtable, &eg, &.{0.0}, &.{true}, &out, 1000);
     try testing.expectEqual(@as(f32, 0.0), out[0]);
-    // gate rising → attack。sr=1000, attack=0.001 → 1 サンプルで 1.0 到達
+    // gate rising -> attack. sr=1000, attack=0.001 -> reaches 1.0 in 1 sample
     drive(&EnvGen.vtable, &eg, &.{1.0}, &.{true}, &out, 1000);
     try testing.expect(out[0] > 0.0);
 }
 
-test "Vcf: setParams not called per-sample when cutoff constant (AC#8)" {
+test "Vcf: setParams not called per-sample when cutoff constant" {
     var vcf = Vcf{ .cutoff = 1000.0 };
-    // ブロック先頭の updateParams 相当（係数 1 回計算）
+    // Equivalent to updateParams at the block head (coefficients computed once)
     Vcf.updateParams(&vcf, 48000);
     try testing.expectEqual(@as(u32, 1), vcf.coeff_updates);
-    // 同じ knob で再度 updateParams しても dirty-gated で再計算しない（frames=1 callback 連発でも増えない）
+    // A second updateParams with the same knobs must not recompute (dirty-gated; even back-to-back frames=1 callbacks must not grow)
     Vcf.updateParams(&vcf, 48000);
     try testing.expectEqual(@as(u32, 1), vcf.coeff_updates);
     var out: [1]f32 = undefined;
     var i: u32 = 0;
     while (i < 500) : (i += 1) {
-        // cutoff_cv 未接続（一定）→ process は再計算しない
+        // cutoff_cv unconnected (constant) -> process does not recompute
         drive(&Vcf.vtable, &vcf, &.{ 0.5, 0.0 }, &.{ true, false }, &out, 48000);
     }
-    try testing.expectEqual(@as(u32, 1), vcf.coeff_updates); // 毎サンプル走っていない
+    try testing.expectEqual(@as(u32, 1), vcf.coeff_updates); // Not running per sample
 }
 
-test "Vcf: audio-rate cutoff CV recomputes at control-rate, not per-sample (AC#8)" {
+test "Vcf: audio-rate cutoff CV recomputes at control-rate, not per-sample" {
     var vcf = Vcf{ .cutoff = 1000.0, .ctrl_period = 16 };
     Vcf.updateParams(&vcf, 48000); // coeff_updates = 1
     var out: [1]f32 = undefined;
     const frames: u32 = 512;
     var i: u32 = 0;
     while (i < frames) : (i += 1) {
-        // cutoff_cv が毎サンプル変化（audio-rate モジュレーション）
+        // cutoff_cv changes every sample (audio-rate modulation)
         const cv: f32 = @sin(@as(f32, @floatFromInt(i)) * 0.05);
         drive(&Vcf.vtable, &vcf, &.{ 0.2, cv }, &.{ true, true }, &out, 48000);
     }
-    try testing.expect(vcf.coeff_updates > 1); // モジュレートはされている
-    // control-rate(16) で間引かれ、frames(512) 回ではない
+    try testing.expect(vcf.coeff_updates > 1); // It is being modulated
+    // Decimated at control-rate(16), not once per frames(512)
     try testing.expect(vcf.coeff_updates <= frames / vcf.ctrl_period + 2);
 }
 
 test "Vcf: non-finite / extreme cutoff CV stays finite (NaN/Inf guard)" {
-    var vcf = Vcf{ .cutoff = 1000.0, .ctrl_period = 1 }; // 毎サンプル CV 評価でガードを突く
+    var vcf = Vcf{ .cutoff = 1000.0, .ctrl_period = 1 }; // Probe the guard under per-sample CV evaluation
     Vcf.updateParams(&vcf, 48000);
     var out: [1]f32 = undefined;
     const nan = std.math.nan(f32);
@@ -1841,7 +1841,7 @@ test "Vcf: non-finite / extreme cutoff CV stays finite (NaN/Inf guard)" {
     try testing.expect(std.math.isFinite(out[0]));
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
-        const cv: f32 = if (i % 2 == 0) nan else 1000.0; // NaN と極端 oct を交互に
+        const cv: f32 = if (i % 2 == 0) nan else 1000.0; // Alternate NaN and extreme octaves
         drive(&Vcf.vtable, &vcf, &.{ 0.5, cv }, &.{ true, true }, &out, 48000);
         try testing.expect(std.math.isFinite(out[0]));
     }
@@ -1886,7 +1886,7 @@ test "Mixer: muted input alone becomes silent" {
 test "Mixer: unconnected input stays 0" {
     var mix = Mixer{ .gain = 1.0, .input_gain = .{ 2.0, 2.0, 2.0, 2.0 } };
     var out: [1]f32 = undefined;
-    // グラフは未接続入力を 0 で渡す（connected フラグは Mixer が読まない）
+    // The graph passes 0 for unconnected inputs (Mixer does not read the connected flag)
     drive(&Mixer.vtable, &mix, &.{ 1.0, 0.0, 0.0, 0.0 }, &.{ true, false, false, false }, &out, 48000);
     try testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-6); // 1*2 + 0 + 0 + 0
 }
@@ -1900,7 +1900,7 @@ test "Output: center pan splits equal, soft clip bounds to <1" {
 
     o.soft_clip = true;
     drive(&Output.vtable, &o, &.{ 100.0, 0.0 }, &.{ true, false }, &out, 48000);
-    try testing.expect(@abs(out[0]) < 1.0 and @abs(out[1]) < 1.0); // 飽和して有界
+    try testing.expect(@abs(out[0]) < 1.0 and @abs(out[1]) < 1.0); // Saturated and bounded
 }
 
 test "Clock: emits trigger at expected interval (bpm120 ppqn4 -> 6000 samples)" {
@@ -1933,7 +1933,7 @@ test "ClockDivider: passes every div-th input edge" {
         if (out[0] > 0.5) passes += 1;
         drive(&ClockDivider.vtable, &dv, &.{0.0}, &.{true}, &out, 48000); // falling
     }
-    try testing.expectEqual(@as(u32, 2), passes); // 4th と 8th edge
+    try testing.expectEqual(@as(u32, 2), passes); // 4th and 8th edges
 }
 
 test "EuclideanSeq: E(3,8) canonical placement, boundaries, rotation" {
@@ -1947,7 +1947,7 @@ test "EuclideanSeq: E(3,8) canonical placement, boundaries, rotation" {
     try testing.expect(EuclideanSeq.hitAt(8, 3, 0, 3));
     try testing.expect(EuclideanSeq.hitAt(8, 3, 0, 6));
     try testing.expect(!EuclideanSeq.hitAt(8, 3, 0, 1));
-    // 境界: pulses=0 は無音、pulses=steps は全 hit
+    // Boundary: pulses=0 is silence; pulses=steps is all hits
     try testing.expect(!EuclideanSeq.hitAt(8, 0, 0, 0));
     var all: u32 = 0;
     s = 0;
@@ -1955,7 +1955,7 @@ test "EuclideanSeq: E(3,8) canonical placement, boundaries, rotation" {
         if (EuclideanSeq.hitAt(8, 8, 0, s)) all += 1;
     }
     try testing.expectEqual(@as(u32, 8), all);
-    // rotation=1 でパターンが +1 ずれる
+    // rotation=1 shifts the pattern by +1
     try testing.expect(EuclideanSeq.hitAt(8, 3, 1, 1));
     try testing.expect(!EuclideanSeq.hitAt(8, 3, 1, 0));
 }
@@ -1992,7 +1992,7 @@ test "Quantizer: snaps to minor pentatonic, cv=0 is root, unconnected uses input
         try testing.expect(ok);
     }
     q.input_cv = 0.0;
-    drive(&Quantizer.vtable, &q, &.{0.9}, &.{false}, &out, 48000); // 未接続→input_cv=0→root
+    drive(&Quantizer.vtable, &q, &.{0.9}, &.{false}, &out, 48000); // Unconnected -> input_cv=0 -> root
     try testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
 }
 
@@ -2011,11 +2011,11 @@ test "Kick: trigger sounds then decays; finite and deterministic" {
         drive(&Kick.vtable, &k1, &.{0.0}, &.{true}, &o1, 48000);
         drive(&Kick.vtable, &k2, &.{0.0}, &.{true}, &o2, 48000);
         try testing.expect(std.math.isFinite(o1[0]));
-        try testing.expectEqual(o1[0], o2[0]); // 決定性
+        try testing.expectEqual(o1[0], o2[0]); // Determinism
         peak = @max(peak, @abs(o1[0]));
     }
-    try testing.expect(peak > 0.01); // 鳴った
-    try testing.expect(@abs(o1[0]) < 0.01); // 2s 後はほぼ無音
+    try testing.expect(peak > 0.01); // It sounded
+    try testing.expect(@abs(o1[0]) < 0.01); // Nearly silent after 2s
 }
 
 test "Hat: trigger sounds then decays; finite and deterministic (fixed seed)" {
@@ -2033,11 +2033,11 @@ test "Hat: trigger sounds then decays; finite and deterministic (fixed seed)" {
         drive(&Hat.vtable, &h1, &.{0.0}, &.{true}, &o1, 48000);
         drive(&Hat.vtable, &h2, &.{0.0}, &.{true}, &o2, 48000);
         try testing.expect(std.math.isFinite(o1[0]));
-        try testing.expectEqual(o1[0], o2[0]); // 決定性
+        try testing.expectEqual(o1[0], o2[0]); // Determinism
         peak = @max(peak, @abs(o1[0]));
     }
     try testing.expect(peak > 0.001);
-    try testing.expect(@abs(o1[0]) < peak * 0.1); // 大きく減衰
+    try testing.expect(@abs(o1[0]) < peak * 0.1); // Large decay
 }
 
 test "ChordPad: triggered chord is finite/deterministic, swells then fades, low DC" {
@@ -2047,26 +2047,26 @@ test "ChordPad: triggered chord is finite/deterministic, swells then fades, low 
     ChordPad.updateParams(&p2, 48000);
     var o1: [1]f32 = undefined;
     var o2: [1]f32 = undefined;
-    drive(&ChordPad.vtable, &p1, &.{1.0}, &.{true}, &o1, 48000); // trigger（1 サンプル）
+    drive(&ChordPad.vtable, &p1, &.{1.0}, &.{true}, &o1, 48000); // trigger (1 sample)
     drive(&ChordPad.vtable, &p2, &.{1.0}, &.{true}, &o2, 48000);
     var peak: f32 = 0;
     var acc: f64 = 0;
     var n: u32 = 0;
     var i: u32 = 0;
-    while (i < 48000 * 3) : (i += 1) { // 3s（attack 0.35 + release 1.4 を十分含む）
+    while (i < 48000 * 3) : (i += 1) { // 3s (comfortably covers attack 0.35 + release 1.4)
         drive(&ChordPad.vtable, &p1, &.{0.0}, &.{true}, &o1, 48000); // gate low → release
         drive(&ChordPad.vtable, &p2, &.{0.0}, &.{true}, &o2, 48000);
         try testing.expect(std.math.isFinite(o1[0]));
-        try testing.expect(@abs(o1[0]) <= 1.0001); // 有界
-        try testing.expectEqual(o1[0], o2[0]); // 決定的
+        try testing.expect(@abs(o1[0]) <= 1.0001); // Bounded
+        try testing.expectEqual(o1[0], o2[0]); // Deterministic
         peak = @max(peak, @abs(o1[0]));
         acc += o1[0];
         n += 1;
     }
-    try testing.expect(peak > 0.02); // 鳴った（swell）
-    try testing.expect(@abs(o1[0]) < peak * 0.2); // release で大きく減衰
+    try testing.expect(peak > 0.02); // It sounded (swell)
+    try testing.expect(@abs(o1[0]) < peak * 0.2); // Large decay through release
     const dc = @abs(acc / @as(f64, @floatFromInt(n)));
-    try testing.expect(dc < 0.05); // DC 偏りが小さい（長時間で偏らない）
+    try testing.expect(dc < 0.05); // Small DC bias (does not drift over long runs)
 }
 
 test "PercEnv: trigger -> 1.0 then exponential decay to ~0" {
@@ -2079,29 +2079,29 @@ test "PercEnv: trigger -> 1.0 then exponential decay to ~0" {
     var i: u32 = 0;
     while (i < 12000) : (i += 1) { // 0.25s
         drive(&PercEnv.vtable, &pe, &.{0.0}, &.{true}, &out, 48000);
-        try testing.expect(out[0] <= prev + 1e-6); // 単調減少
+        try testing.expect(out[0] <= prev + 1e-6); // Monotonically decreasing
         prev = out[0];
     }
-    try testing.expect(out[0] < 0.01); // 減衰しきった
+    try testing.expect(out[0] < 0.01); // Fully decayed
 }
 
 test "PercEnv: peak scales output continuously (0=silent, 0.5=half); non-finite -> 1.0" {
     var out: [1]f32 = undefined;
-    // peak=0 → トリガしても無音
+    // peak=0 -> silent even when triggered
     var mute = PercEnv{ .decay = 0.05, .peak = 0.0 };
     PercEnv.updateParams(&mute, 48000);
     drive(&PercEnv.vtable, &mute, &.{1.0}, &.{true}, &out, 48000);
     try testing.expectEqual(@as(f32, 0.0), out[0]);
-    // peak=0.5 → 出力レベル 0.5（トリガ時 level=1.0 × peak）
+    // peak=0.5 -> output level 0.5 (level=1.0 × peak at trigger)
     var half = PercEnv{ .decay = 0.05, .peak = 0.5 };
     PercEnv.updateParams(&half, 48000);
     drive(&PercEnv.vtable, &half, &.{1.0}, &.{true}, &out, 48000);
     try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6);
-    // 発音中に peak を変えると即時反映（連続倍率）。次サンプルは level(=k) × 新 peak。
+    // Changing peak mid-note takes effect immediately (continuous scale). Next sample is level(=k) × new peak.
     half.peak = 0.0;
     drive(&PercEnv.vtable, &half, &.{1.0}, &.{true}, &out, 48000);
-    try testing.expectEqual(@as(f32, 0.0), out[0]); // 鳴っている途中でも即 mute
-    // 非有限 peak → 1.0 に丸める
+    try testing.expectEqual(@as(f32, 0.0), out[0]); // Instant mute even mid-note
+    // Non-finite peak -> round to 1.0
     var nan = PercEnv{ .decay = 0.05, .peak = std.math.nan(f32) };
     PercEnv.updateParams(&nan, 48000);
     drive(&PercEnv.vtable, &nan, &.{1.0}, &.{true}, &out, 48000);
@@ -2115,7 +2115,7 @@ test "Random: S&H changes only on trigger; range 0..1; deterministic" {
     var ob: [1]f32 = undefined;
     drive(&Random.vtable, &a, &.{1.0}, &.{true}, &oa, 48000);
     drive(&Random.vtable, &b, &.{1.0}, &.{true}, &ob, 48000);
-    try testing.expectEqual(oa[0], ob[0]); // 決定的
+    try testing.expectEqual(oa[0], ob[0]); // Deterministic
     const first = oa[0];
     try testing.expect(first >= 0.0 and first <= 1.0);
     drive(&Random.vtable, &a, &.{0.0}, &.{true}, &oa, 48000); // gate low → hold
@@ -2141,8 +2141,8 @@ test "TuringMachine: evolves (not constant) yet bounded and deterministic" {
     while (i < 500) : (i += 1) {
         drive(&TuringMachine.vtable, &a, &.{1.0}, &.{true}, &oa, 48000); // rising
         drive(&TuringMachine.vtable, &b, &.{1.0}, &.{true}, &ob, 48000);
-        try testing.expect(oa[0] >= 0.0 and oa[0] <= 1.0); // 有界
-        try testing.expectEqual(oa[0], ob[0]); // 決定的
+        try testing.expect(oa[0] >= 0.0 and oa[0] <= 1.0); // Bounded
+        try testing.expectEqual(oa[0], ob[0]); // Deterministic
         var found = false;
         for (seen[0..nseen]) |v| {
             if (v == oa[0]) found = true;
@@ -2154,7 +2154,7 @@ test "TuringMachine: evolves (not constant) yet bounded and deterministic" {
         drive(&TuringMachine.vtable, &a, &.{0.0}, &.{true}, &oa, 48000); // falling
         drive(&TuringMachine.vtable, &b, &.{0.0}, &.{true}, &ob, 48000);
     }
-    try testing.expect(nseen >= 3); // 一定値に収束しない
+    try testing.expect(nseen >= 3); // Does not converge to a constant
 }
 
 test "Clap: trigger sounds then decays; finite; deterministic (fixed seed)" {
@@ -2186,7 +2186,7 @@ test "FX wrappers: audio in/out stays finite (Saturator/Bitcrusher/Delay/Reverb/
     var rv = ReverbFx{};
     var vn = VinylNoiseFx{};
     var wf = WowFlutterFx{};
-    ReverbFx.updateParams(&rv, 48000); // タップ初期化
+    ReverbFx.updateParams(&rv, 48000); // Initialise taps
     var o: [1]f32 = undefined;
     var i: u32 = 0;
     while (i < 5000) : (i += 1) {
@@ -2207,10 +2207,10 @@ test "FX wrappers: audio in/out stays finite (Saturator/Bitcrusher/Delay/Reverb/
 }
 
 test "ReverbFx: process before updateParams returns dry (no undefined tap read)" {
-    var rv = ReverbFx{}; // updateParams 未呼び出し → ready=false
+    var rv = ReverbFx{}; // updateParams not yet called -> ready=false
     var o: [1]f32 = undefined;
     drive(&ReverbFx.vtable, &rv, &.{0.7}, &.{true}, &o, 48000);
-    try testing.expectEqual(@as(f32, 0.7), o[0]); // dry passthrough（未定義 tap を読まない）
+    try testing.expectEqual(@as(f32, 0.7), o[0]); // dry passthrough (do not read undefined taps)
 }
 
 fn clockTrigIdx(clk: *Clock, comptime n: usize, span: u32) [n]u32 {
@@ -2239,7 +2239,7 @@ test "Clock: swing delays odd 16th while preserving pair duration" {
     var clk = Clock{ .bpm = 120, .ppqn = 4, .swing = 0.5 };
     Clock.updateParams(&clk, 48000); // spt=6000, delay=1500
     const idx = clockTrigIdx(&clk, 4, 21000);
-    // 0, +7500(裏遅れ), +4500(=12000 ペア頭は元位置), +7500
+    // 0, +7500 (off-beat lag), +4500 (=12000 pair head back at origin), +7500
     try testing.expectEqual([_]u32{ 0, 7500, 12000, 19500 }, idx);
 }
 
@@ -2254,7 +2254,7 @@ test "Sidechain: amount=0 passes through exactly" {
     var sc = Sidechain{ .amount = 0.0 };
     Sidechain.updateParams(&sc, 48000);
     var o: [1]f32 = undefined;
-    drive(&Sidechain.vtable, &sc, &.{ 0.8, 1.0 }, &.{ true, true }, &o, 48000); // trigger でも恒等
+    drive(&Sidechain.vtable, &sc, &.{ 0.8, 1.0 }, &.{ true, true }, &o, 48000); // Identity even on a trigger
     try testing.expectEqual(@as(f32, 0.8), o[0]);
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
@@ -2269,14 +2269,14 @@ test "Sidechain: trigger ducks then recovers" {
     Sidechain.updateParams(&sc, 48000);
     var o: [1]f32 = undefined;
     drive(&Sidechain.vtable, &sc, &.{ 1.0, 1.0 }, &.{ true, true }, &o, 48000); // rising → env=1
-    try testing.expect(o[0] < 0.5); // 1*(1-0.8)=0.2 へ大きく下がる
+    try testing.expect(o[0] < 0.5); // Drops hard toward 1*(1-0.8)=0.2
     var last: f32 = o[0];
     var i: u32 = 0;
     while (i < 5000) : (i += 1) {
         drive(&Sidechain.vtable, &sc, &.{ 1.0, 0.0 }, &.{ true, true }, &o, 48000);
         last = o[0];
     }
-    try testing.expect(last > 0.9); // 回復して ~1.0
+    try testing.expect(last > 0.9); // Recovers to ~1.0
 }
 
 test "Sidechain: finite under invalid amount/release" {
@@ -2395,19 +2395,19 @@ test "Logic: XOR truth table, 0.5 boundary, op state, and unconnected low" {
 }
 
 // ============================================================================
-// Ph5 tests: StepSeq / Lfo / ChordPad CV 入力（絶対値 assert・後方互換・決定性）
+// StepSeq / Lfo / ChordPad CV-input tests (absolute asserts, backward compatibility, determinism)
 // ============================================================================
 
-/// clock の rising/falling を 1 組 drive し、その rising で出た gate を返す（StepSeq 駆動ヘルパー）。
+/// Drive one rising/falling clock pair and return the gate emitted on that rising edge (StepSeq drive helper).
 fn stepClock(seq: *StepSeq, outs: []f32) f32 {
-    drive(&StepSeq.vtable, seq, &.{1.0}, &.{true}, outs, 48000); // rising → step 評価
+    drive(&StepSeq.vtable, seq, &.{1.0}, &.{true}, outs, 48000); // rising -> evaluate step
     const g = outs[0];
     drive(&StepSeq.vtable, seq, &.{0.0}, &.{true}, outs, 48000); // falling
     return g;
 }
 
-test "StepSeq drum: gate fires exactly at on_mask step indices (絶対位置)" {
-    // step 0,4,8,12 を on（four-on-floor）。clock 16 edge で立つ step が正確にその位置だけ。
+test "StepSeq drum: gate fires exactly at on_mask step indices (absolute positions)" {
+    // Steps 0,4,8,12 on (four-on-floor). Across 16 clock edges the gate fires only at those exact steps.
     var seq = StepSeq{ .kind = .drum, .on_mask = 0b0001000100010001 };
     var out: [1]f32 = undefined;
     var s: u8 = 0;
@@ -2416,7 +2416,7 @@ test "StepSeq drum: gate fires exactly at on_mask step indices (絶対位置)" {
         const expect_on = (s % 4 == 0);
         try testing.expectEqual(expect_on, g > 0.5);
     }
-    // 1 周して再び step 0 で立つ（wrap）。
+    // After one loop it fires again on step 0 (wrap).
     try testing.expect(stepClock(&seq, &out) > 0.5);
 }
 
@@ -2431,12 +2431,12 @@ test "StepSeq drum: empty mask never fires; full mask always fires" {
     }
 }
 
-test "StepSeq bass: pitch_cv matches shared scale helper at on steps (絶対値)" {
-    // step 0,8 を on、degree[0]=0, degree[8]=3。pitch_cv = degreeIndexToPitchCv で一致するはず。
+test "StepSeq bass: pitch_cv matches shared scale helper at on steps (absolute values)" {
+    // Steps 0,8 on; degree[0]=0, degree[8]=3. pitch_cv must match degreeIndexToPitchCv.
     var seq = StepSeq{ .kind = .bass, .on_mask = 0b0000000100000001, .scale = .minor_pentatonic, .octaves = 2 };
     seq.pitch_deg[0] = 0;
     seq.pitch_deg[8] = 3;
-    var out: [3]f32 = undefined; // bass は 3 出力
+    var out: [3]f32 = undefined; // bass has 3 outputs
     var s: u8 = 0;
     while (s < 9) : (s += 1) {
         drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000); // rising
@@ -2446,7 +2446,7 @@ test "StepSeq bass: pitch_cv matches shared scale helper at on steps (絶対値)
         }
         if (s == 8) {
             try testing.expect(out[0] > 0.5);
-            // slide なしなので即時ジャンプ → degree 3 の pitch_cv に一致
+            // No slide so an immediate jump -> matches degree 3's pitch_cv
             try testing.expectApproxEqAbs(degreeIndexToPitchCv(.minor_pentatonic, 0, 3), out[1], 1e-6);
         }
         drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000); // falling
@@ -2462,14 +2462,14 @@ test "StepSeq bass: accent_held is 0/1 per step and persists between triggers" {
     drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000);
     try testing.expectEqual(@as(f32, 0.0), out[2]);
     drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000);
-    try testing.expectEqual(@as(f32, 0.0), out[2]); // 次 trigger まで保持
+    try testing.expectEqual(@as(f32, 0.0), out[2]); // Held until the next trigger
     // step 1: on, accent → accent_cv 1
     drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000);
     try testing.expectEqual(@as(f32, 1.0), out[2]);
 }
 
 test "StepSeq bass: slide glides pitch toward target over time (not instant)" {
-    // step0 deg0(=cv0), step1 deg3 with slide → step1 で即ジャンプせず滑る。
+    // step0 deg0(=cv0), step1 deg3 with slide -> at step1 glide instead of jumping.
     var seq = StepSeq{ .kind = .bass, .on_mask = 0b11, .slide_mask = 0b10, .glide_rate = 1.0, .octaves = 2 };
     seq.pitch_deg[0] = 0;
     seq.pitch_deg[1] = 3;
@@ -2478,9 +2478,9 @@ test "StepSeq bass: slide glides pitch toward target over time (not instant)" {
     drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000);
     const target = degreeIndexToPitchCv(.minor_pentatonic, 0, 3);
     drive(&StepSeq.vtable, &seq, &.{1.0}, &.{true}, &out, 48000); // step1 rising → start glide
-    try testing.expect(out[1] < target); // まだ到達していない（滑っている途中）
+    try testing.expect(out[1] < target); // Not there yet (still gliding)
     try testing.expect(out[1] >= 0.0);
-    // 多数サンプル進めれば target へ収束
+    // After many samples it converges to the target
     var i: u32 = 0;
     while (i < 48000) : (i += 1) drive(&StepSeq.vtable, &seq, &.{0.0}, &.{true}, &out, 48000);
     try testing.expectApproxEqAbs(target, out[1], 1e-4);
@@ -2494,19 +2494,19 @@ test "StepSeq: spec exposes 1 output (drum) / 3 outputs (bass) — no dead ports
 }
 
 test "StepSeq: atomic accessors are value-equal to plain fields (single-thread monotonic)" {
-    // monotonic の atomic load はプレーン read と単一スレッドで完全一致（TASK-40.7.2 の atomic 化が値を
-    // 変えていないことの回帰ガード）。
+    // Under single-threaded execution a monotonic atomic load fully matches a plain read (regression guard that
+    // atomicising these fields did not change their values).
     var seq = StepSeq{ .kind = .bass, .on_mask = 0xABCD, .accent_mask = 0x0F0F, .slide_mask = 0x1234, .step = 7 };
     try testing.expectEqual(seq.on_mask, seq.loadOnMask());
     try testing.expectEqual(seq.accent_mask, seq.loadAccentMask());
     try testing.expectEqual(seq.slide_mask, seq.loadSlideMask());
     try testing.expectEqual(seq.step, seq.loadStep());
-    // store も同様にプレーン field を書く。
+    // store likewise writes the plain field.
     seq.storeOnMask(0x0001);
     try testing.expectEqual(@as(u16, 0x0001), seq.on_mask);
     seq.storeStep(3);
     try testing.expectEqual(@as(u8, 3), seq.step);
-    // toggle は 1 ビット反転。
+    // toggle flips exactly one bit.
     seq.storeOnMask(0);
     seq.toggleOnBit(5);
     try testing.expectEqual(@as(u16, 1 << 5), seq.on_mask);
@@ -2521,20 +2521,20 @@ test "StepSeq: atomic accessors are value-equal to plain fields (single-thread m
 }
 
 test "StepSeq: toggling on_mask via atomic store changes which step fires (GUI→RT edit)" {
-    // grid クリック編集を模す: step 2 を on にすると step 2 で gate が立つようになる（トグル前は立たない）。
+    // Mimic a grid-click edit: turning step 2 on makes the gate fire on step 2 (it did not before the toggle).
     var seq = StepSeq{ .kind = .drum, .on_mask = 0 };
     var out: [1]f32 = undefined;
-    // 初期は全 off → step 2 で立たない。
+    // Initially all off -> step 2 does not fire.
     var s: u8 = 0;
     while (s < 2) : (s += 1) _ = stepClock(&seq, &out);
     try testing.expect(stepClock(&seq, &out) < 0.5); // step 2 off
-    // step 2 を on にトグル（次周で立つ）。
+    // Toggle step 2 on (fires on the next loop).
     seq.toggleOnBit(2);
     s = 0;
-    while (s < 15) : (s += 1) _ = stepClock(&seq, &out); // 残り 13 + wrap で step 2 直前へ
-    // step 0,1 を空回し
+    while (s < 15) : (s += 1) _ = stepClock(&seq, &out); // Remaining 13 + wrap to just before step 2
+    // Idle through steps 0,1
     while (seq.loadStep() != 2) _ = stepClock(&seq, &out);
-    try testing.expect(stepClock(&seq, &out) > 0.5); // step 2 が now on
+    try testing.expect(stepClock(&seq, &out) > 0.5); // step 2 is now on
 }
 
 test "StepSeq: density maps to target count in band" {
@@ -2612,30 +2612,30 @@ test "Lfo: deterministic, bounded, advances by rate" {
     while (i < 1000) : (i += 1) {
         drive(&Lfo.vtable, &a, &[_]f32{}, &[_]bool{}, &oa, 48000);
         drive(&Lfo.vtable, &b, &[_]f32{}, &[_]bool{}, &ob, 48000);
-        try testing.expectEqual(oa[0], ob[0]); // 同 seed/phase → bit 一致
-        try testing.expect(oa[0] >= -1.0001 and oa[0] <= 1.0001); // 有界
+        try testing.expectEqual(oa[0], ob[0]); // Same seed/phase -> bit-identical
+        try testing.expect(oa[0] >= -1.0001 and oa[0] <= 1.0001); // Bounded
     }
 }
 
 test "ChordPad: optional pitch_cv unconnected keeps fixed C3 root (backward compat)" {
-    // 未接続(len-1 Io)では従来どおり固定 root。connected[] 判定なので壊れない。
+    // With an unconnected (len-1) Io, keep the fixed root as before. connected[] decides, so it stays intact.
     var p = ChordPad{};
     ChordPad.updateParams(&p, 48000);
     var o: [1]f32 = undefined;
-    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000); // gate のみ
-    try testing.expectApproxEqAbs(@as(f32, 130.81), p.root_hz, 1e-2); // root 不変
-    try testing.expect(!p.root_cv_init); // CV root を一度も使っていない
+    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000); // gate only
+    try testing.expectApproxEqAbs(@as(f32, 130.81), p.root_hz, 1e-2); // root unchanged
+    try testing.expect(!p.root_cv_init); // CV root never used
 }
 
 test "ChordPad: pitch_cv connected drives root; value 0 means base note (not 'unconnected')" {
     var p = ChordPad{};
     ChordPad.updateParams(&p, 48000);
     var o: [1]f32 = undefined;
-    // pitch_cv=0 を「接続」して与える → 未接続扱いせず base(C3) を出す（connected[] 判定の要）。
+    // Feed pitch_cv=0 as "connected" -> emit base(C3), not treat as unconnected (this is why connected[] matters).
     drive(&ChordPad.vtable, &p, &.{ 1.0, 0.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
     try testing.expect(p.root_cv_init);
     try testing.expectApproxEqAbs(@as(f32, 130.81), p.root_hz, 1e-2); // pitch_cv 0 → base
-    // pitch_cv=+1oct → root 2倍
+    // pitch_cv=+1oct -> root doubles
     drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
     try testing.expectApproxEqAbs(@as(f32, 261.62), p.root_hz, 1e-1);
 }
@@ -2651,7 +2651,7 @@ test "ChordPad: root recompute is dirty-gated (no per-sample @exp2 when pitch_cv
     while (i < 500) : (i += 1) {
         drive(&ChordPad.vtable, &p, &.{ 0.0, 0.5, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
     }
-    try testing.expectEqual(applied, p.applied_root_cv); // 変化なし → 再計算していない
+    try testing.expectEqual(applied, p.applied_root_cv); // No change -> did not recompute
     try testing.expectEqual(f0, p.freqs[0]);
 }
 
@@ -2672,7 +2672,7 @@ test "ChordPad: MIDI root overrides ambient pitch_cv" {
     var p = ChordPad{};
     ChordPad.updateParams(&p, 48000);
     var o: [1]f32 = undefined;
-    // ambient +1oct を接続しつつ MIDI note 69 (A4=440Hz) を優先。
+    // Prefer MIDI note 69 (A4=440Hz) while ambient +1oct is also connected.
     p.applyMidiNote(69, 1.0);
     drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
     try testing.expect(p.midi_active);
@@ -2687,13 +2687,13 @@ test "ChordPad: MIDI note_off releases and returns to ambient root" {
     p.applyMidiNote(60, 0.8);
     drive(&ChordPad.vtable, &p, &.{ 0.0, 0.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
     const midi_hz = p.root_hz;
-    try testing.expect(midi_hz > 200.0); // C4 付近
+    try testing.expect(midi_hz > 200.0); // Near C4
     p.clearMidi();
-    // clear 後に ambient pitch_cv=+1oct へ戻る（root_cv_init 再評価）。
+    // After clear, return to ambient pitch_cv=+1oct (re-evaluate root_cv_init).
     drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
     try testing.expect(!p.midi_active);
     try testing.expectApproxEqAbs(@as(f32, 261.62), p.root_hz, 1e-1);
-    // release 経路: gate low で env が減衰（有限）。
+    // Release path: env decays on gate low (finite).
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
         drive(&ChordPad.vtable, &p, &.{ 0.0, 1.0, 0.0, 0.0 }, &.{ true, true, false, false }, &o, 48000);
@@ -2715,21 +2715,21 @@ test "ChordPad: MIDI root recompute is dirty-gated (constant midi_root_hz)" {
         drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
     }
     try testing.expect(p.midi_root_applied);
-    try testing.expectEqual(f0, p.freqs[0]); // 変化なし → recomputeFreqs 再実行なし
+    try testing.expectEqual(f0, p.freqs[0]); // No change -> recomputeFreqs does not run again
 }
 
 test "ChordPad: MIDI note-on attacks even when ambient gate was already high" {
     var p = ChordPad{};
     ChordPad.updateParams(&p, 48000);
     var o: [1]f32 = undefined;
-    // ambient gate high で prev_gate=true にする
+    // Drive ambient gate high so prev_gate=true
     drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000);
     try testing.expect(p.prev_gate);
     try testing.expect(p.attacking or p.env > 0);
-    // MIDI へ切替: prev_gate が落ち、次 process で rising edge → attack
+    // Switch to MIDI: prev_gate drops; next process sees a rising edge -> attack
     p.applyMidiNote(60, 1.0);
     try testing.expect(!p.prev_gate);
-    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000); // ambient gate は無視、MIDI gate
+    drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000); // Ambient gate ignored; MIDI gate
     try testing.expect(p.midi_active);
     try testing.expect(p.attacking);
     try testing.expect(p.env > 0);
@@ -2742,7 +2742,7 @@ test "ChordPad: clearMidi re-attacks when ambient gate is high" {
     p.applyMidiNote(60, 1.0);
     drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
     try testing.expect(p.prev_gate); // MIDI gate high
-    // 少し sustain 側へ進める
+    // Advance a little toward sustain
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
         drive(&ChordPad.vtable, &p, &.{0.0}, &.{true}, &o, 48000);
@@ -2750,7 +2750,7 @@ test "ChordPad: clearMidi re-attacks when ambient gate is high" {
     p.clearMidi();
     try testing.expect(!p.prev_gate);
     try testing.expect(!p.midi_active);
-    // ambient gate high → rising edge で再 attack
+    // Ambient gate high -> rising edge re-attacks
     drive(&ChordPad.vtable, &p, &.{1.0}, &.{true}, &o, 48000);
     try testing.expect(p.attacking);
 }
