@@ -9,10 +9,10 @@
 //!
 //! ## The seam for the harness synthetic source
 //!
-//! Each capture function tests `harness.isCaptureSyntheticActive()` at its head. While no
-//! synthetic backend exists, the `true` branch merely returns `error.Unsupported` (and is in fact
-//! unreachable, the implementation being fixed to return `false`). Implementing the synthetic source rewrites
-//! that one line into the real backend call, leaving the facade's structure untouched.
+//! Each capture function tests `harness.isCaptureSyntheticActive()` at its head, which holds when
+//! `VP_HARNESS_CAPTURE_SYNTHETIC` is set and harness is enabled. **This facade is not wired to the
+//! synthetic source**, so that branch returns `error.Unsupported`: the synthetic source is reached only
+//! through the harness's own `capture` command and probe. Wiring it here replaces that one line.
 //!
 //! Hot path declaration: this file itself runs at event time or initialisation time only (a facade skeleton delegating to the stub).
 //! It contains no per-frame (all-pixel) loop. `pollLatestFrame()` only does an `acquire()` from the
@@ -87,6 +87,6 @@ test "the camera facade: while harness is disabled it delegates to the stub and 
     try testing.expectError(error.Unsupported, open(testing.allocator, .{}));
 }
 
-test "the camera facade: isCaptureSyntheticActive() is always false for now, so the synthetic branch is unreachable" {
+test "the camera facade: isCaptureSyntheticActive() is false with the environment unset, so the synthetic branch is not taken" {
     try testing.expect(!harness.isCaptureSyntheticActive());
 }

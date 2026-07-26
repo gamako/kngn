@@ -388,7 +388,7 @@ pub const capture = struct {
             if (c.snd_ctl_card_info(handle, card_info) < 0) continue;
 
             // Card-info id is queried for the raw ALSA metadata; the public id is the stable
-            // control name used by open/enumeration (`hw:N`) per the capture plan.
+            // control name open and enumeration use (`hw:N`), per the allocator contract in `docs/capture.md`.
             _ = c.snd_ctl_card_info_get_id(card_info);
             const id = allocator.dupe(u8, ctl_name[0..ctl_name.len]) catch return error.OpenFailed;
             errdefer allocator.free(id);

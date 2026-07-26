@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 const types = @import("platform_types");
 const harness = @import("harness");
 
-// macOS uses CoreMIDI, and every other OS plus wasm uses null. A later backend replaces this comptime choice.
+// macOS uses CoreMIDI, and every other OS plus wasm uses null. This comptime choice is the only seam a backend replaces.
 const backend = if (builtin.cpu.arch.isWasm())
     @import("midi_null.zig")
 else switch (builtin.os.tag) {

@@ -19,7 +19,7 @@
 //! ## Driving it headless, with no real device
 //!
 //! With `VP_HEADLESS=1` the null device of `audio_null.zig` is opened in place of `backend`
-//! (the real OS device): no real device, pure Zig, a real-time pull thread. `AudioDevice.inner` becomes a
+//! (the real OS device): no real device, pure Zig, a backend-owned real-time thread. `AudioDevice.inner` becomes a
 //! tagged union (`native` / `null_dev`) and the code merely branches on it; the public `Error`, `Config`, `EffectiveConfig`
 //! and `RenderCallback` do not change at all, because `NullBackend(backend)` aliases the backend's types.
 
@@ -123,7 +123,7 @@ pub const AudioDevice = struct {
 /// - While harness is disabled: the backend is used as it is (no trampoline and no extra allocation, matching existing behaviour exactly).
 /// - While harness is enabled: the user's render callback is wrapped in a harness trampoline and the output feeds the audio probe.
 ///   - **When headless**: the null device (`audio_null.zig`) is opened instead of the real OS device
-///     (no real device, a real-time pull thread).
+///     (no real device, a backend-owned real-time thread).
 ///
 /// Testing `isHeadlessActive()` before `isEnabled()` is deliberate: headless is decided by the
 /// `VP_HEADLESS=1` that platform settled (`harness.setHeadlessActive`), and can hold even when the transport ends up
@@ -247,7 +247,7 @@ test "the audio capture extension: it delegates to the stub while harness is dis
     try testing.expectError(error.Unsupported, openCapture(testing.allocator, .{ .capture_callback = noopCaptureCallback }));
 }
 
-test "the audio capture extension: isCaptureSyntheticActive() is always false for now, so the synthetic branch is unreachable" {
+test "the audio capture extension: isCaptureSyntheticActive() is false with the environment unset, so the synthetic branch is not taken" {
     try testing.expect(!harness.isCaptureSyntheticActive());
 }
 

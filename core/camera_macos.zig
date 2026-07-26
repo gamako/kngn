@@ -14,10 +14,10 @@
 //! **The MVP's known simplifications**:
 //! - Only one camera can be open at a time (`g_active_state` is a process-wide singleton, and using several
 //!   `open()`s at once is unsupported, consistent with opening several devices being out of scope).
-//! - `device.config()`'s `frame_rate` returns the requested value as it is (reflecting the real negotiated result
-//!   is follow-up work; `format` is always `.bgra8` and accurate).
-//! - Selecting a device by `device_id` is not implemented (the default camera is fixed. A path passing
-//!   `enumerate()`'s id to `open()`'s `device_id` comes later).
+//! - `device.config()`'s `frame_rate` is the requested value, not a negotiated one; `format` is always
+//!   `.bgra8` and is accurate.
+//! - `open()` ignores `device_id` and always takes the default camera, so a specific device cannot be
+//!   selected.
 //!
 //! Hot path declaration:
 //! - **The delegate callback (`sampleBufferCallback`) is called every frame on the capture thread (a dedicated

@@ -6,7 +6,7 @@
 //!
 //! **Independently** of the existing output backends of `core/audio.zig` (`audio_{macos,linux,windows}.zig`),
 //! `core/audio.zig` imports this file directly.
-//! A real backend replaces this import with a `builtin.os.tag` branch.
+//! `core/audio.zig` selects it with a `builtin.os.tag` branch, so an OS with a real backend never reaches here.
 //!
 //! Hot path declaration: initialisation time only (every function merely returns `error.Unsupported` or a fixed value; there is no loop).
 //! `CaptureCallback` is contracted to be called in the real-time region of a capture thread

@@ -9,7 +9,7 @@ There is no unified runtime type (no `CaptureDevice` union or vtable). Native AP
 split on some systems (ALSA and V4L2 are unrelated) and unified on others (an
 `AVCaptureSession` handles both), so a single runtime abstraction would add pointless
 indirection on the split systems and throw away expressiveness on the unified ones.
-**Unification stops at the level of a convention** — the same signatures, naming and
+**Unification stops at the level of a convention** — the same semantics, type shapes and
 error classification — and never becomes a shared runtime base type.
 
 | Layer | Where |
@@ -57,9 +57,11 @@ the function names matching.
 | config types | `camera.Config` / `camera.EffectiveConfig` | `audio.CaptureConfig` / `audio.CaptureEffectiveConfig` |
 
 There is no separate `configure()`. `open(config)` takes the requested values as hints
-and negotiates internally, and `device.config()` returns what was actually settled —
-the same style as the existing audio output. Renegotiating an already-open device (say
-changing resolution while running) is out of scope.
+and negotiates internally, and `device.config()` returns what the backend reports as
+effective — the same style as the existing audio output. How much is genuinely negotiated
+is the backend's business: the macOS microphone reports the hardware sample rate, while
+both camera backends currently report the requested `frame_rate` back unchanged.
+Renegotiating an already-open device (say changing resolution while running) is out of scope.
 
 ## Lifecycle
 
@@ -100,11 +102,12 @@ pub const CaptureError = error{
   makes it unchangeable. macOS's `authorizationStatus` really does return these four
   values, and a UI needs the distinction to choose between "open Settings" and "this
   cannot be changed", so `restricted` is never folded into `denied`.
-- **A silent refusal is never treated as normal.** A privacy toggle can express refusal
-  by returning no error and delivering empty or silent data indefinitely. Whenever such
-  a refusal is detected it must surface as `PermissionState.denied` or
-  `CaptureError.PermissionDenied`; a stream that appears to run while actually feeding
-  silence or blank frames forever is not an acceptable success case.
+- **A silent refusal must never be treated as normal.** A privacy toggle can express refusal
+  by returning no error and delivering empty or silent data indefinitely. This is a rule
+  binding on a backend: where it detects such a refusal it must surface it as
+  `PermissionState.denied` or `CaptureError.PermissionDenied`, because a stream that appears to
+  run while actually feeding silence or blank frames forever is not an acceptable success case.
+  **No backend implements that detection yet**, so today a silent refusal is not classified.
 - Microphone and camera share the same `CaptureError` and `PermissionState`. Zig error
   values match by name across declaring error sets, so `error.NoDevice` compares equal
   from either facade.
@@ -146,15 +149,24 @@ because core cannot depend on libs (ADR-007 R2).
 
 ## The synthetic source
 
-The branch point sits at the head of each facade verb, on
-`harness.isCaptureSyntheticActive()` — the same shape as audio output's `open()`
-consulting `harness.isHeadlessActive()` to substitute the null device. The synthetic
-source replaces the backend outright rather than wrapping it.
+`core/capture_synthetic.zig` is a fake microphone and camera reached **only through the
+harness's own `capture` command and `capture` probe** (see [harness.md](harness.md)).
 
-Video from the synthetic source is generated deterministically against the harness's
-virtual clock, so a replay reproduces it. The synthetic microphone is driven by a
-real-time pull thread like `core/audio_null.zig` and is **not** bit-deterministic, which
-matches the existing `audio` probe not guaranteeing a bit-identical record-and-replay.
+**The facades are not wired to it.** Each facade verb tests
+`harness.isCaptureSyntheticActive()` at its head — which holds when
+`VP_HARNESS_CAPTURE_SYNTHETIC` is set and the harness is enabled — and that branch
+returns `error.Unsupported`. So `camera.open()` and `audio.openCapture()` never reach the
+synthetic source, and a real backend is bypassed without a substitute. Wiring it in means
+replacing that one line in each verb; the branch point and its name are all that is settled
+here. The intended shape, once wired, is to replace the backend outright rather than wrap it,
+mirroring audio output's `open()` consulting `harness.isHeadlessActive()` to substitute the
+null device.
+
+Synthetic video is generated deterministically from the harness's virtual clock, so the
+same tick gives a bit-identical frame. The synthetic microphone is driven by a
+backend-owned real-time thread like `core/audio_null.zig`'s and is **not**
+bit-deterministic, matching the existing `audio` probe not guaranteeing a bit-identical
+record-and-replay.
 
 Enabling it follows the same rule as the existing audio: the harness reads its
 environment only through `platform.init()`, so a capture-only application that never

@@ -6,7 +6,7 @@
 //! time), following audio_linux's push-thread pattern. That way the behaviour an application sees — another thread
 //! driving the callback in real time — is the same as with a real device.
 //!
-//! Hot path declaration: `renderThread` is a **real-time pull loop**. The scratch buffer is allocated up front in `open()`, and
+//! Hot path declaration: `renderThread` is a **backend-owned real-time loop pulling the render callback**. The scratch buffer is allocated up front in `open()`, and
 //! within the loop (the callback call plus the sleep) there is **no alloc, lock, IO or panic** (pinned by a test using FailingAllocator).
 //! The null device itself does no per-sample arithmetic (generating samples is the caller's own callback).
 //!

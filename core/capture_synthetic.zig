@@ -1,10 +1,10 @@
 //! The synthetic capture source built into the harness (a fake microphone and camera).
 //!
 //! It is called from the built-in `capture` probe and the `capture video|audio ...` commands of
-//! `core/control/harness.zig`. **Wiring it into the real camera.zig and audio.zig facades is out of scope here**
-//! (which avoids conflicting with the OS backend implementations touching the same files in parallel. The facade-side
-//! rewrite is left to a later piece of work, and
-//! `camera.open()` and `audio.openCapture()` keep returning `error.Unsupported` even with this file in place).
+//! `core/control/harness.zig`. **The real camera.zig and audio.zig facades are not wired to it**: with
+//! `VP_HARNESS_CAPTURE_SYNTHETIC` set, `camera.open()` and `audio.openCapture()` return
+//! `error.Unsupported` rather than reaching this file. The only route in is the harness's own `capture`
+//! command and probe.
 //! It depends on `capture_types` (the shared data plane types) alone, and is independent of the real camera and audio backends.
 //!
 //! - **video**: `SyntheticVideoDevice.renderFrame(tick)` is a **pure function** generating a deterministic BGRA
@@ -144,7 +144,7 @@ pub const AudioInFrame = capture_types.AudioInFrame;
 /// (`AudioInFrame` and the like) and no callback or Config type, so this is declared here (it ends up structurally
 /// identical in signature to `CaptureCallback` in the real mic backend `core/audio_capture_stub.zig`, both parameter
 /// types referring to the same named module (`capture_types.AudioInFrame`), but it is an independent declaration with
-/// no wiring into camera.zig or audio.zig. A future facade integration may need the types reconciled).
+/// no wiring into camera.zig or audio.zig).
 pub const CaptureCallback = *const fn (frame: AudioInFrame, userdata: ?*anyopaque) void;
 
 pub const AudioConfig = struct {
