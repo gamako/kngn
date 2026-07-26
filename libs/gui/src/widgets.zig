@@ -1,26 +1,26 @@
-// 基本ウィジェット（TASK-21.5）: Button / ColorSwatch。
-// Label（label / labelEx）は Context 本体（context.zig）が提供する。
+// Basic widgets: Button / ColorSwatch.
+// Label (`label` / `labelEx`) is provided by Context itself (`context.zig`).
 //
-// 本タスク時点の観測（TASK-131/132）: 以下は 2026-07-18 時点の現行契約。
+// Current contract (as of 2026-07-18):
 //
-// 同期 hit-test 契約（21.2/21.4 / TASK-131）:
-//   widget 呼び出し時に「前フレームの rect キャッシュ」で buttonBehavior を行い、
-//   ButtonResult を同期返却する。初回フレーム（キャッシュ未生成）は非ヒット扱い。
-//   描画はレイアウトノードに記録され、endFrame の layout 確定後に発行される。
-//   layout 変更フレームでは描画は新 rect・hit-test は旧 rect（1 フレーム遅延）。
-//   hover 色は state.hot_id（beginFrame で確定、フレーム中不変）を参照する。
+// Synchronous hit-test contract:
+//   On widget call, `buttonBehavior` uses the previous frame's rect cache and
+//   returns `ButtonResult` synchronously. First frame (no cache yet) is a non-hit.
+//   Draw commands are recorded on layout nodes and emitted after layout settles in `endFrame`.
+//   On a layout-change frame, draw uses the new rect while hit-test uses the old (one-frame lag).
+//   Hover tint reads `state.hot_id` (fixed in `beginFrame`, immutable for the frame).
 //
-// 自動 ID 契約（TASK-132）:
-//   label 系は IdStack seed + label を hash（button/selectableLabel/slider/checkbox 等）。
-//   colorSwatch は色値 hash + id_stack。textInputId は自動 ID 版を持たず明示 ID 必須。
-//   同一 IdStack scope 内で同一 label を並べると同じ ID になり、endFrame の updateRectCache で
-//   Debug assert が契約違反として検出する（negative_auto_id.sh で固定）。
-//   同一ラベル並置は対応する *Id 版か id_stack.push(i) で scope を分けること。
+// Auto-ID contract:
+//   Label-based widgets hash IdStack seed + label (button / selectableLabel / slider / checkbox / …).
+//   colorSwatch hashes the color value + id_stack. `textInputId` has no auto-ID form; explicit ID required.
+//   Duplicate labels in the same IdStack scope collide; `updateRectCache` in `endFrame`
+//   detects the contract violation via Debug assert (`negative_auto_id.sh` locks this).
+//   Disambiguate with the matching `*Id` API or `id_stack.push(i)` scopes.
 //
-// テキスト表示契約（TASK-132 / default font）:
-//   label / selectableLabel 等は改行を除去せず Font に渡す。default font は 1 行描画で
-//   改行 codepoint は glyph 未描画だが advance 8px。CJK/emoji も codepoint 単位で
-//   measure 8px・glyph 未描画・fallback なし。TextInput は単一行（改行/制御文字は挿入拒否）。
+// Text display contract (default font):
+//   `label` / `selectableLabel` / etc. pass newlines through to Font. Default font is single-line:
+//   newline codepoints advance 8px with no glyph. CJK/emoji also measure 8px per codepoint,
+//   no glyph, no fallback. TextInput is single-line (rejects newline / control inserts).
 
 const std = @import("std");
 
@@ -49,9 +49,9 @@ pub const TextBuffer = text_edit.TextBuffer;
 pub const MoveKey = text_edit.MoveKey;
 
 pub const SelectableLabelOpts = struct {
-    /// null なら Context.style.text
+    /// null → `Context.style.text`
     text_color: ?Color = null,
-    /// null なら Context.style.selection_background
+    /// null → `Context.style.selection_background`
     selection_background: ?Color = null,
 };
 
@@ -65,10 +65,10 @@ pub const TextInputOpts = struct {
     /// top, right, bottom, left
     padding: [4]i32 = .{ 4, 8, 4, 8 },
     placeholder: []const u8 = "",
-    /// frame-local paste text（app が getClipboardText して渡す。null は paste 無し）。
+    /// Frame-local paste text (app passes `getClipboardText`; null = no paste).
     paste_text: ?[]const u8 = null,
-    /// TextBuffer の codepoint 数上限。null=無制限、0=挿入拒否、n=最大 n codepoint。
-    /// 既存 buffer の自動切り詰めはしない（編集操作の結果にのみ適用）。
+    /// Max codepoint count for TextBuffer. null=unlimited, 0=reject inserts, n=at most n codepoints.
+    /// Does not auto-truncate an existing buffer (applies only to edit results).
     max_len: ?usize = null,
 };
 
@@ -77,39 +77,39 @@ pub const TextInputResult = struct {
     focused: bool = false,
     selection: TextRange = .{ .start = 0, .end = 0 },
     copy_request: ?CopyRequest = null,
-    /// TextInput box 左上原点のローカル caret rect。非 focus 時は null。
-    /// 絶対座標は endFrame 後に `getNodeRect(id)` と合成する（TASK-113.3）。
+    /// Local caret rect with origin at the TextInput box top-left. null when unfocused.
+    /// Absolute position: compose with `getNodeRect(id)` after `endFrame`.
     caret_rect: ?Rect = null,
 };
 
 pub const ButtonOpts = struct {
-    /// 0 より大きければボタン幅の下限（text + padding がそれ未満でも min_w を確保）
+    /// If > 0, minimum button width (ensures `min_w` even when text + padding is smaller).
     min_w: i32 = 0,
-    /// null なら style.button_padding
+    /// null → `style.button_padding`
     padding: ?[4]i32 = null,
-    /// 選択中表示（accent 背景 + 太枠）。ツール選択のトグル表示用。
-    /// 描画優先: held > hover > selected > normal（TASK-155）。
+    /// Selected look (accent fill + thick border). For tool-selection toggles.
+    /// Draw priority: held > hover > selected > normal.
     selected: bool = false,
 };
 
 pub const SwatchOpts = struct {
     color: Color,
-    /// 選択中表示（太枠 = style.swatch_border_selected + 強調色）
+    /// Selected look (thick border = `style.swatch_border_selected` + accent).
     selected: bool = false,
-    /// null なら style.swatch_size
+    /// null → `style.swatch_size`
     size: ?i32 = null,
 };
 
-/// i32 スライダー設定。事前条件: max > min、step は null か > 0。
+/// i32 slider options. Preconditions: max > min; step is null or > 0.
 pub const SliderI32Opts = struct {
     min: i32,
     max: i32,
     step: ?i32 = null,
-    /// null なら style.slider_track_w
+    /// null → `style.slider_track_w`
     track_w: ?i32 = null,
 };
 
-/// f32 スライダー設定。事前条件: max > min、step は null か > 0。
+/// f32 slider options. Preconditions: max > min; step is null or > 0.
 pub const SliderF32Opts = struct {
     min: f32,
     max: f32,
@@ -117,24 +117,24 @@ pub const SliderF32Opts = struct {
     track_w: ?i32 = null,
 };
 
-/// クリックされたら true（自動 ID: `IdStack.make(label)`）。
-/// 同一 scope に同 label を並べると ID 衝突する。`buttonId` または `id_stack.push` を使う。
+/// true when clicked (auto ID: `IdStack.make(label)`).
+/// Same label in one scope collides. Use `buttonId` or `id_stack.push`.
 pub fn button(ctx: *Context, label: []const u8) bool {
     return buttonEx(ctx, label, .{}).clicked;
 }
 
-/// ButtonResult（clicked / hovered / held）を返す版（自動 ID: `IdStack.make(label)`）。
+/// Returns `ButtonResult` (clicked / hovered / held); auto ID: `IdStack.make(label)`.
 pub fn buttonEx(ctx: *Context, label: []const u8, opts: ButtonOpts) ButtonResult {
     return buttonId(ctx, ctx.id_stack.make(label), label, opts);
 }
 
-/// 明示 ID 版。rect を getNodeRect(id) で外部参照する場合（pixie の Save ボタン等）や、
-/// 同一スコープに同ラベルを並べる場合に使う。
+/// Explicit-ID form. Use when callers need `getNodeRect(id)` (e.g. pixie Save) or
+/// the same label appears more than once in one scope.
 pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) ButtonResult {
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    // held > hover > selected > normal（TASK-155: selected に accent 塗りを足す）
+    // held > hover > selected > normal (selected adds accent fill)
     const bg = if (result.held)
         style.bg_active
     else if (hot)
@@ -146,7 +146,7 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     const border_color = if (hot or opts.selected) style.border_hover else style.border;
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
     const pad = opts.padding orelse style.button_padding;
-    // min_w 指定時は固定幅フォント（measure = 8×len）前提で呼び出し時に幅を確定できる
+    // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`)
     const width: layout.Sizing = if (opts.min_w > 0)
         .{ .fixed = @max(opts.min_w, @as(i32, @intCast(ctx.font.measure(label))) + pad[3] + pad[1]) }
     else
@@ -163,17 +163,17 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     return result;
 }
 
-/// クリックされたら true（自動 ID: 色値 hash + id_stack）。
+/// true when clicked (auto ID: color-value hash + id_stack).
 pub fn colorSwatch(ctx: *Context, color: Color, selected: bool) bool {
     return colorSwatchEx(ctx, .{ .color = color, .selected = selected }).clicked;
 }
 
-/// ButtonResult を返す版（自動 ID）。
+/// Returns `ButtonResult` (auto ID).
 pub fn colorSwatchEx(ctx: *Context, opts: SwatchOpts) ButtonResult {
     return colorSwatchId(ctx, ctx.id_stack.makeInt(@as(u32, @bitCast(opts.color))), opts);
 }
 
-/// 明示 ID 版。パレットのように同色が並びうる場合はこちらを使う。
+/// Explicit-ID form. Prefer this when identical colors can sit side by side (palette).
 pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
@@ -192,8 +192,8 @@ pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
         });
         ctx.endBox();
     } else {
-        // 半透明: チェック柄の上に色を blend する。box の bg は子より先に描かれて
-        // checker を覆えないため、checker + 色を custom leaf でまとめて描く。
+        // Semi-transparent: blend color over a checker. Box bg paints before children and
+        // cannot cover the checker, so checker + color are drawn together in a custom leaf.
         ctx.beginBox(.{
             .id = id,
             .width = .{ .fixed = size },
@@ -208,30 +208,30 @@ pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
     return result;
 }
 
-// ── iconButton（TASK-145.1）────────────────────────────────
-// 16x16 1bit アイコン付き選択トグルボタン。描画は custom leaf（ColorSwatch 半透明経路と同型）。
-// 1bit mask を各行の連続 set bit ごとに不透明 rectFilled run へ変換（透明 pixel は書かない）。
-// selected は accent 背景 + 太枠（button_bg_selected / button_border_selected + border_hover）。
-// 背景優先: held > hot > selected > normal = bg_active > bg_hover > button_bg_selected > bg（TASK-155）。
+// ── iconButton ────────────────────────────────
+// 16×16 1-bit icon toggle. Draw path matches ColorSwatch’s semi-transparent custom leaf.
+// Convert 1-bit mask runs of set bits per row into opaque `rectFilled` spans (skip clear pixels).
+// selected: accent fill + thick border (`button_bg_selected` / `button_border_selected` + `border_hover`).
+// Background priority: held > hot > selected > normal = bg_active > bg_hover > button_bg_selected > bg.
 
-/// 16 行の 1bit アイコン。各 `u16` が 1 行、bit15=左端・bit0=右端。
+/// 16-row 1-bit icon. Each `u16` is one row; bit15=left, bit0=right.
 pub const IconBitmap = []const u16;
 
 const icon_px: i32 = 16;
 
-/// クリックされたら true（自動 ID: icon 内容 hash + id_stack）。
-/// 同一 scope に同 icon を並べると ID 衝突する。`iconButtonId` または `id_stack.push` を使う。
+/// true when clicked (auto ID: icon-content hash + id_stack).
+/// Same icon in one scope collides. Use `iconButtonId` or `id_stack.push`.
 pub fn iconButton(ctx: *Context, icon: IconBitmap, selected: bool) bool {
     return iconButtonId(ctx, iconAutoId(ctx, icon), icon, selected).clicked;
 }
 
-/// 明示 ID 版。ツールバー等で同 icon を並べる場合や rect を外部参照する場合に使う。
+/// Explicit-ID form. Use for toolbars with duplicate icons or external rect lookup.
 pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) ButtonResult {
     std.debug.assert(icon.len == 16);
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    // held > hover > selected > normal（buttonId と同じ契約）
+    // held > hover > selected > normal (same contract as `buttonId`)
     const bg = if (result.held)
         style.bg_active
     else if (hot)
@@ -263,19 +263,19 @@ pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) But
 
 fn iconAutoId(ctx: *Context, icon: IconBitmap) Id {
     std.debug.assert(icon.len == 16);
-    // bitmap 内容を FNV で 1 値に畳み、makeInt で id_stack スコープを乗せる。
+    // Fold bitmap bytes with FNV into one value, then `makeInt` under the id_stack scope.
     const seed = id_mod.fnv1a(0, std.mem.sliceAsBytes(icon));
     return ctx.id_stack.makeInt(seed);
 }
 
-/// 半透明 swatch と同型: arena 上に確保し endFrame の custom leaf で消費。
+/// Same shape as semi-transparent swatch: arena-allocated, consumed by endFrame custom leaf.
 const IconButtonDraw = struct {
     rows: [16]u16,
     fg: Color,
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const IconButtonDraw = @ptrCast(@alignCast(ctx_ptr));
-        // 1bit mask → 行ごとの連続 set bit を横長 rectFilled run に。透明は書かない。
+        // 1-bit mask → horizontal `rectFilled` runs of consecutive set bits per row; skip clear pixels.
         var row: i32 = 0;
         while (row < 16) : (row += 1) {
             const bits = self.rows[@intCast(row)];
@@ -303,13 +303,13 @@ const IconButtonDraw = struct {
     }
 };
 
-/// 前フレームの rect キャッシュで同期 hit-test。キャッシュ未生成（初回フレーム・
-/// 前フレーム非表示）の widget は非ヒット扱い（21.2/21.4 契約）。
-/// TASK-145.2: 直前 widget 情報を Context へ additive に記録（戻り値・hit-test 挙動は不変）。
-/// tooltip は `result.hovered`（buttonBehavior 生値）を使い、state.hot_id は見ない。
+/// Synchronous hit-test via previous-frame rect cache. Widgets with no cache yet (first frame /
+/// not shown last frame) are non-hits (sync hit-test contract).
+/// Records last-widget info on Context additively (return value and hit-test behavior unchanged).
+/// Tooltips use `result.hovered` (raw `buttonBehavior` value), not `state.hot_id`.
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
     const cached = ctx.rect_cache.get(id) orelse {
-        // cache 未生成でも直前 widget として記録（hovered=false）。tooltip は no-op できる。
+        // Still record as last widget when cache is missing (`hovered=false`); tooltip can no-op.
         ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
         return .{};
     };
@@ -318,9 +318,9 @@ fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
     return result;
 }
 
-/// SelectableLabel（read-only）。編集・caret・複数行・折返しは扱わない。
-/// 改行/CJK/emoji を含む text も strip せず Font 契約どおり 1 行で measure/描画する。
-/// 幅は TextLayout.prefix_widths の総幅、高さは Font の論理 ink（ascent+descent。TASK-167）。
+/// SelectableLabel (read-only). No edit, caret, multi-line, or wrap.
+/// Text with newlines/CJK/emoji is not stripped; measure/draw as one line per Font contract.
+/// Width from `TextLayout.prefix_widths` total; height is Font logical ink (ascent+descent).
 pub fn selectableLabel(ctx: *Context, text: []const u8, opts: SelectableLabelOpts) SelectableLabelResult {
     return selectableLabelId(ctx, ctx.id_stack.make(text), text, opts);
 }
@@ -334,8 +334,8 @@ pub fn selectableLabelId(
     std.debug.assert(ctx.frame_active);
     std.debug.assert(id != 0);
 
-    // layout の配列は per-frame arena に置く。widget 呼び出し時の O(codepoint) 処理で、
-    // endFrame の custom leaf callback まで生存する。
+    // Layout arrays live in the per-frame arena. Built with O(codepoint) work at the widget call,
+    // and must outlive through the endFrame custom-leaf callback.
     const layout_data = text_edit.buildTextLayout(ctx.allocator(), ctx.font, text) catch
         @panic("selectableLabel: OOM");
     const count = layout_data.count();
@@ -346,7 +346,7 @@ pub fn selectableLabelId(
     if (ctx.rect_cache.get(id)) |cached| {
         const rect = cached.rect;
         const clip = cached.clip;
-        // press 起点のみ可視判定（buttonBehavior と同じ pointHitsVisible）。drag 継続は clip 外でも維持。
+        // Visibility gate on press only (same `pointHitsVisible` as `buttonBehavior`). Drag continues outside clip.
         const down = ctx.input.mouse_pressed.left and
             context_mod.pointHitsVisible(rect, clip, ctx.input.mouse_pressed_pos);
         if (down) {
@@ -364,8 +364,8 @@ pub fn selectableLabelId(
             }
         }
 
-        // Input は state をフレーム間で保持するため、move event が無いフレームでも
-        // capture 中の extent を最新 mouse_pos へ追従させる。rect 外も意図的に許可する。
+        // Input keeps state across frames so, even without a move event,
+        // the captured extent tracks the latest `mouse_pos`. Outside the rect is intentionally allowed.
         if (per_id.selection.dragging and ctx.state.focused_id == id and ctx.input.mouse_buttons.left) {
             per_id.selection.updateDrag(text_edit.hitTest(layout_data, ctx.input.mouse_pos.x - rect.x));
         }
@@ -374,8 +374,8 @@ pub fn selectableLabelId(
                 per_id.selection.updateDrag(text_edit.hitTest(layout_data, ctx.input.mouse_released_pos.x - rect.x));
                 per_id.selection.dragging = false;
             }
-            // click の位置は release 側で記録する。これによりドラッグ終了後に同じ位置で
-            // press された double-click も、通常の click と同じ位置規則で認識できる。
+            // Click position is recorded on release so a double-click after drag,
+            // pressing at the same spot, uses the same position rules as a normal click.
             per_id.last_click_time = ctx.now();
             per_id.last_click_pos = .{
                 .x = ctx.input.mouse_released_pos.x,
@@ -388,8 +388,8 @@ pub fn selectableLabelId(
     if (ctx.state.focused_id == id) {
         for (ctx.input.orderedTextEvents()) |event| switch (event) {
             .key_down => |key| {
-                // libs/gui は core/platform を import しない。KeyCode.C の共有値は
-                // platform_types の契約に従う（ASCII 'C'）。
+                // libs/gui does not import core/platform. Shared `KeyCode.C` value follows
+                // `platform_types` (ASCII `'C'`).
                 if (key.code == 'C' and key.modifiers & 0x08 != 0 and !key.repeat) {
                     const selection = per_id.selection.normalized();
                     if (selection.start != selection.end) {
@@ -427,8 +427,8 @@ pub fn selectableLabelId(
     return .{ .selection = draw_data.selection, .copy_request = copy_request };
 }
 
-/// 選択範囲の rect → text の順で DrawCmd を発行する callback。実ピクセル描画は既存
-/// gui.render / Font.drawTo 経路が行うため、新しい全画素ループは持たない。
+/// Callback emits DrawCmd selection rects then text. Actual pixels go through existing
+/// `gui.render` / `Font.drawTo`; no new per-pixel loop here.
 const SelectableLabelDraw = struct {
     text: []const u8,
     layout: text_edit.TextLayout,
@@ -449,10 +449,10 @@ const SelectableLabelDraw = struct {
     }
 };
 
-/// 単一行 TextInput（自動 ID 版なし。呼び出し側が明示 ID を渡す）。
-/// 改行・ASCII 制御文字は TextBuffer へ挿入しない。`.fit` 幅は `Font.measure` + padding。
-/// selection / caret / scroll / hit-test は TextLayout.prefix_widths（logical advance）基準。
-/// 高さは line_height ではなく ascent+descent（ink height。custom font で差が出うる）。
+/// Single-line TextInput (no auto-ID form; caller passes an explicit ID).
+/// Newlines and ASCII controls are not inserted into TextBuffer. `.fit` width = `Font.measure` + padding.
+/// selection / caret / scroll / hit-test use `TextLayout.prefix_widths` (logical advance).
+/// Height is ascent+descent (ink), not `line_height` (custom fonts may differ).
 pub fn textInputId(
     ctx: *Context,
     id: Id,
@@ -469,8 +469,8 @@ pub fn textInputId(
     var claimed_here = false;
 
     if (ctx.rect_cache.get(id)) |cached| {
-        // press 起点の focus/caret 取得は可視領域のみ（buttonBehavior と同じ契約）。
-        // selection drag 継続は clip 外でも維持（active drag capture）。
+        // Press focus/caret acquisition is visibility-gated only (same contract as `buttonBehavior`).
+        // Selection drag continues outside clip (active drag capture).
         const down = ctx.input.mouse_pressed.left and
             context_mod.pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pressed_pos);
         if (down) {
@@ -497,15 +497,15 @@ pub fn textInputId(
     }
 
     const focused = ctx.focusedId() == id;
-    // 同一 frame に別 input へ mouse press がある場合、旧 focused が composition / キーを誤消費しない。
+    // If another input receives mouse press in the same frame, the old focused field must not consume composition / keys.
     const input_owner = focused and (!ctx.input.mouse_pressed.left or claimed_here);
-    // composition は focused（かつ input_owner）の TextInput のみが消費する（付記1）。
+    // Only the focused (and `input_owner`) TextInput consumes composition.
     const composing = input_owner and ctx.composition.active;
 
     var changed = false;
     var copy_request: ?CopyRequest = null;
-    // 同一 frame に別 input への mouse press が先に focus を移す場合、widget 呼び出し順で
-    // 旧 focused ID が後続 key/char event を誤消費しないよう、claim した widget だけ許可する。
+    // When a same-frame mouse press moves focus first, only the claiming widget may
+    // consume later key/char events so the old focused ID does not steal them (call order).
     if (input_owner) {
         for (ctx.input.orderedTextEvents()) |event| switch (event) {
             .key_down => |key| {
@@ -515,7 +515,7 @@ pub fn textInputId(
                 const alt = key.modifiers & 0x04 != 0;
                 const cmd = key.modifiers & 0x08 != 0;
                 if ((key.code == 'C' or key.code == 'X' or key.code == 'V') and cmd and !ctrl and !alt and !key.repeat) {
-                    // composition 中は C/X/V を抑止（保留 queue にも入れない）。
+                    // Suppress C/X/V during composition (do not enqueue either).
                     if (composing) {
                         // no-op
                     } else if (key.code == 'V') {
@@ -556,11 +556,11 @@ pub fn textInputId(
                         }
                     }
                 } else if (composing and isCompositionBlockedEditKey(key.code)) {
-                    // composition 中は文書を変更する編集・移動キーを無視する。
-                    // Cmd+A もここに含まれる（macOS IME が消費するキーと揃える）。
-                    // char_input（commit 確定文字）は抑止しない。
+                    // During composition, ignore edit/move keys that would change the document.
+                    // Cmd+A is included here (aligned with keys macOS IME consumes).
+                    // Do not suppress `char_input` (committed characters).
                 } else if (key.code == 'A' and cmd and !ctrl and !alt and !key.repeat) {
-                    // Cmd+A 全選択（composition 外のみ到達。command 系は !repeat）。
+                    // Cmd+A select-all (reachable only outside composition; command keys use `!repeat`).
                     const n = text_layout.count();
                     per_id.selection.anchor = 0;
                     per_id.selection.extent = n;
@@ -588,13 +588,13 @@ pub fn textInputId(
                     per_id.caret = per_id.selection.extent;
                     if (changed) per_id.caret_blink_start_s = ctx.now();
                 } else if (key.code == 263 or key.code == 264 or key.code == 269 or key.code == 270) {
-                    // Cmd+Alt / Ctrl 混在は未定義 → 通常の 1 codepoint 移動へフォールバック。
+                    // Cmd+Alt / Ctrl mixes are undefined → fall back to normal 1-codepoint move.
                     if (cmd and !alt and !ctrl and (key.code == 263 or key.code == 264)) {
-                        // Cmd+←/→ = 行頭 / 行末（Home/End 相当）
+                        // Cmd+←/→ = line start / line end (Home/End equivalent)
                         const move_key: MoveKey = if (key.code == 263) .home else .end;
                         text_edit.SelectionState.moveCaret(&per_id.selection, text_layout.count(), move_key, shift);
                     } else if (alt and !cmd and !ctrl and (key.code == 263 or key.code == 264)) {
-                        // Option+←/→ = 単語境界移動
+                        // Option+←/→ = word-boundary move
                         const dir: text_edit.WordDirection = if (key.code == 263) .left else .right;
                         text_edit.SelectionState.moveWord(&per_id.selection, text_layout, dir, shift);
                     } else {
@@ -625,14 +625,14 @@ pub fn textInputId(
         };
     }
 
-    // 編集で byte 列が変わった後の layout を描画と copy の基準にする。
+    // After edits change bytes, rebuild layout as the basis for draw and copy.
     if (changed) {
         text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
             @panic("textInput: OOM");
         clampTextInputState(per_id, text_layout.count());
     }
 
-    // preedit は TextBuffer に入れない。focused + active のときだけ表示する。
+    // Preedit is not written into TextBuffer; shown only when focused + active.
     const preedit: []const u8 = if (composing) ctx.composition.text else "";
     const preedit_cursor = clampUtf8ByteOffset(preedit, if (composing) ctx.composition.cursor else 0);
     const committed_prefix_w: u32 = text_layout.prefix_widths[per_id.caret];
@@ -643,7 +643,7 @@ pub fn textInputId(
 
     const width = resolveTextInputWidth(ctx, buffer.slice(), opts);
     const metrics = ctx.font.metrics();
-    // line_height（line_gap 含む）ではなく ascent+descent を content 高さに使う（TASK-118/167）。
+    // Content height uses ascent+descent, not `line_height` (which includes line_gap).
     const ink_height: i32 = font_mod.inkHeight(metrics);
     const height = ink_height + opts.padding[0] + opts.padding[2];
     const content_height = ink_height;
@@ -735,13 +735,13 @@ fn isInsertableCodepoint(cp: u32) bool {
     return cp >= 0x20 and cp != 0x7F and cp <= 0x10FFFF and !(cp >= 0xD800 and cp <= 0xDFFF);
 }
 
-/// composition 中に TextBuffer を変更してはいけない編集・移動キー（修飾子ではなくキー種別で判定）。
-/// Cmd+A（'A'）も抑止対象。Cmd+C/X/V は呼び出し側で先に処理するためここには含めない。
+/// Edit/move keys that must not change TextBuffer during composition (key kind, not modifiers).
+/// Cmd+A (`'A'`) is also blocked. Cmd+C/X/V are handled earlier by the caller and omitted here.
 fn isCompositionBlockedEditKey(code: u32) bool {
     return code == 259 or code == 261 or code == 263 or code == 264 or code == 269 or code == 270 or code == 'A';
 }
 
-/// UTF-8 byte offset を codepoint 境界へ clamp する（継続バイト上なら手前へ）。
+/// Clamp a UTF-8 byte offset onto a codepoint boundary (snap back if on a continuation byte).
 fn clampUtf8ByteOffset(text: []const u8, offset: usize) usize {
     var n = @min(offset, text.len);
     while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
@@ -767,9 +767,9 @@ const TextInputDraw = struct {
     preedit_w: u32 = 0,
     preedit_cursor_w: u32 = 0,
     ascent: i32 = 0,
-    /// ascent+descent。本文・selection・caret・下線の共有高さ（TASK-118）。
+    /// ascent+descent. Shared height for body, selection, caret, and underline.
     ink_height: i32 = 0,
-    /// content 内での縦中央オフセット（box が ink 基準なら通常 0）。
+    /// Vertical center offset inside content (usually 0 when the box is ink-based).
     vertical_offset: i32 = 0,
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
@@ -781,7 +781,7 @@ const TextInputDraw = struct {
             .w = @intCast(@max(0, @as(i32, @intCast(rect.w)) - self.padding[3] - self.padding[1])),
             .h = @intCast(@max(0, @as(i32, @intCast(rect.h)) - self.padding[0] - self.padding[2])),
         };
-        // 本文・placeholder・preedit・selection・caret・下線が共有する y 基準。
+        // Shared y basis for body, placeholder, preedit, selection, caret, and underline.
         const text_y = content.y + self.vertical_offset;
         const ink_h: u32 = @intCast(@max(0, self.ink_height));
         dl.pushClip(content) catch @panic("textInput draw: OOM");
@@ -809,7 +809,7 @@ const TextInputDraw = struct {
                 dl.textEx(.{ .x = suffix_x, .y = text_y }, suffix, self.text_color, null) catch
                     @panic("textInput draw: OOM");
             }
-            // preedit 下線（baseline 直下。example_21 と同方針。text_y 基準）
+            // Preedit underline (just under baseline; same policy as example_21; relative to text_y)
             const underline_y = @min(text_y + self.ascent + 2, text_y + self.ink_height - 1);
             dl.line(
                 .{ .x = preedit_x, .y = underline_y },
@@ -836,15 +836,15 @@ const TextInputDraw = struct {
     }
 };
 
-/// thickness <= 0 は「枠なし」（render の rectOutline は thickness 0 を 1 扱いするため、
-/// ここで null に落とす）。
+/// thickness <= 0 means “no border” (`render`’s `rectOutline` treats 0 as 1,
+/// so map to null here).
 fn makeBorder(color: Color, thickness: i32) ?layout.Border {
     if (thickness <= 0) return null;
     return .{ .color = color, .thickness = @intCast(thickness) };
 }
 
-/// 半透明 swatch の描画データ。arena 上に確保され次 beginFrame まで生存
-/// （draw_fn は endFrame 中に呼ばれるので寿命は十分）。
+/// Semi-transparent swatch draw data. Arena-allocated; lives until next `beginFrame`
+/// (`draw_fn` runs during `endFrame`, so lifetime is sufficient).
 const SwatchDraw = struct {
     color: Color,
 
@@ -856,7 +856,7 @@ const SwatchDraw = struct {
         const self: *const SwatchDraw = @ptrCast(@alignCast(ctx_ptr));
         const w: i32 = @intCast(rect.w);
         const h: i32 = @intCast(rect.h);
-        // チェック柄（cell px 格子、(row+col) の偶奇で 2 色）
+        // Checkerboard (cell-px grid; two colors by (row+col) parity)
         var y: i32 = 0;
         var row: u32 = 0;
         while (y < h) : ({
@@ -878,24 +878,24 @@ const SwatchDraw = struct {
                 }, c) catch @panic("colorSwatch: OOM");
             }
         }
-        // 色を blend で重ねる（render の rect_filled は straight alpha src-over）
+        // Overlay color with blend (`render` `rect_filled` is straight-alpha src-over)
         dl.rectFilled(rect, self.color) catch @panic("colorSwatch: OOM");
     }
 };
 
-// ── Slider（TASK-21.9）─────────────────────────────────────
-// track を明示 ID box で登録 → 各フレーム value から knob 矩形を算出 → knob 矩形で
-// buttonBehavior を呼んで active を取得（press は knob 上のみ = track だけクリックでは飛ばない）。
-// active 中は mouse_pos.x を track 可動域へ写像して *value を更新。内部計算は f64。
-// レイアウトは [固定名ラベル] [track] [動的値テキスト] で、track の x は値の桁数に依存しない。
+// ── Slider ─────────────────────────────────────
+// Register the track as an explicit-ID box → each frame derive the knob rect from value →
+// call `buttonBehavior` on the knob rect for active (press only on the knob = clicking the track alone does not jump).
+// While active, map `mouse_pos.x` onto the track travel range and update `*value`. Internals use f64.
+// Layout is [fixed name label] [track] [dynamic value text]; track.x does not depend on value digit count.
 
-/// i32 スライダー（自動 ID: `IdStack.make(label)`）。値が変われば true。
-/// 同一 scope に同 label がある場合は `sliderI32Id` を使う。
+/// i32 slider (auto ID: `IdStack.make(label)`). Returns true when the value changes.
+/// Use `sliderI32Id` when the same label appears in one scope.
 pub fn sliderI32(ctx: *Context, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
     return sliderI32Id(ctx, ctx.id_stack.make(label), label, value, opts);
 }
 
-/// 明示 ID 版。
+/// Explicit-ID form.
 pub fn sliderI32Id(ctx: *Context, id: Id, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
     const spec: SliderSpec = .{
         .min = @floatFromInt(opts.min),
@@ -909,12 +909,12 @@ pub fn sliderI32Id(ctx: *Context, id: Id, label: []const u8, value: *i32, opts: 
     return value.* != old;
 }
 
-/// f32 スライダー（自動 ID: `IdStack.make(label)`）。値が変われば true。
+/// f32 slider (auto ID: `IdStack.make(label)`). Returns true when the value changes.
 pub fn sliderF32(ctx: *Context, label: []const u8, value: *f32, opts: SliderF32Opts) bool {
     return sliderF32Id(ctx, ctx.id_stack.make(label), label, value, opts);
 }
 
-/// 明示 ID 版。
+/// Explicit-ID form.
 pub fn sliderF32Id(ctx: *Context, id: Id, label: []const u8, value: *f32, opts: SliderF32Opts) bool {
     const spec: SliderSpec = .{
         .min = opts.min,
@@ -936,7 +936,7 @@ const SliderSpec = struct {
     is_float: bool,
 };
 
-/// knob 中心が動ける範囲 [lo, lo+span]（px、f64）。track の左右に knob_w/2 のマージン。
+/// Range the knob center can travel [lo, lo+span] (px, f64). Margin of knob_w/2 on each side of the track.
 const KnobRange = struct { lo: f64, span: f64 };
 fn knobRange(track: Rect, knob_w: i32) KnobRange {
     const lo: f64 = @floatFromInt(track.x + @divTrunc(knob_w, 2));
@@ -965,8 +965,8 @@ fn clampAndStep(v: f64, spec: SliderSpec) f64 {
     return x;
 }
 
-/// 最終値（f64）を返す。読み取り時は clamp のみ（step スナップしない＝drift 回避）。
-/// step はドラッグ更新時のみ適用する。changed 判定は呼び出し側が「最終値 ≠ 旧値」で行う。
+/// Returns the final value (f64). On read, clamp only (no step snap — avoids drift).
+/// `step` applies only on drag updates. Caller decides `changed` as “final ≠ previous”.
 fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSpec) f64 {
     std.debug.assert(spec.max > spec.min);
     if (spec.step) |s| std.debug.assert(s > 0);
@@ -974,10 +974,10 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     const knob_w = style.slider_knob_w;
     const knob_h = style.slider_knob_h;
 
-    // 表示/hit-test 用に範囲内へ clamp（clamp は exact なので毎フレーム呼んでも drift しない）。
+    // Clamp into range for display/hit-test (exact clamp; safe every frame, no drift).
     var value = std.math.clamp(cur, spec.min, spec.max);
 
-    // hit-test / drag（前フレーム track rect の knob 矩形で active 取得）
+    // hit-test / drag (take active from previous-frame track’s knob rect)
     if (ctx.rect_cache.get(id)) |cached| {
         const track = cached.rect;
         const range = knobRange(track, knob_w);
@@ -987,11 +987,11 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         if (res.held) {
             const mx: f64 = @floatFromInt(ctx.input.mouse_pos.x);
             const t = std.math.clamp((mx - range.lo) / range.span, 0, 1);
-            value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // ドラッグ時のみ step 適用
+            value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // Apply step only while dragging
         }
     }
 
-    // 構築/描画: [label] [track(id)] [value text]
+    // Build/draw: [label] [track(id)] [value text]
     ctx.beginBox(.{ .direction = .row, .gap = 6, .align_cross = .center });
     ctx.label(label);
 
@@ -1018,14 +1018,14 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         std.fmt.bufPrint(&buf, "{d:.2}", .{value}) catch "?"
     else
         std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(@round(value)))}) catch "?";
-    ctx.label(txt); // labelEx が arena へ dupe するので stack buf で安全
+    ctx.label(txt); // `labelEx` dupes onto the arena, so a stack buf is safe
 
     ctx.endBox();
 
     return value;
 }
 
-/// slider の track 帯 + knob を描く custom leaf データ（arena 上、endFrame 中に draw 呼出）。
+/// Custom-leaf data for slider track band + knob (arena; drawn during `endFrame`).
 const SliderDraw = struct {
     frac: f64,
     knob_w: i32,
@@ -1037,51 +1037,51 @@ const SliderDraw = struct {
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const SliderDraw = @ptrCast(@alignCast(ctx_ptr));
-        // track 帯（縦中央・高さ track_h）
+        // Track band (vertically centered, height track_h)
         const track_y: i32 = rect.y + @divTrunc(@as(i32, @intCast(rect.h)) - self.track_h, 2);
         dl.rectFilled(
             .{ .x = rect.x, .y = track_y, .w = rect.w, .h = @intCast(self.track_h) },
             self.track_bg,
         ) catch @panic("slider: OOM");
-        // knob（rect = 最終 layout 後の track 外接矩形。hit-test と同じ knobRectFor で位置一致）
+        // Knob (rect = post-layout track outer; same `knobRectFor` as hit-test)
         const kr = knobRectFor(rect, self.knob_w, self.knob_h, self.frac);
         dl.rectFilled(kr, self.knob_bg) catch @panic("slider: OOM");
         dl.rectOutline(kr, self.border, 1) catch @panic("slider: OOM");
     }
 };
 
-// ── HSV カラーピッカー（TASK-21.14）─────────────────────────
-// 既存 DrawCmd.image を再利用してグラデを描く。グラデバッファは widget 呼び出し時に arena へ
-// 確保し custom leaf で dl.image する（render まで生存）。固定 px（dl.image は rect.w==src_w を
-// assert するため grow/stretch 不可）。前フレーム rect_cache 契約は Slider と同じ。
+// ── HSV color picker ─────────────────────────
+// Reuse existing `DrawCmd.image` for gradients. Gradient buffer is arena-allocated at the widget call
+// and drawn via custom leaf `dl.image` (lives through render). Fixed px (`dl.image` asserts `rect.w==src_w`,
+// so grow/stretch is forbidden). Previous-frame rect_cache contract matches Slider.
 
 pub const SvSquareOpts = struct {
-    /// null なら style.picker_sv_size。最小 2。
+    /// null → `style.picker_sv_size`. Minimum 2.
     size: ?i32 = null,
 };
 
 pub const HueBarOpts = struct {
-    /// null なら style.picker_hue_w / picker_sv_size。w>=1, h>=2。
+    /// null → `style.picker_hue_w` / `picker_sv_size`. w>=1, h>=2.
     w: ?i32 = null,
     h: ?i32 = null,
 };
 
-/// SV スクエア（自動 ID: `IdStack.make(label)`）。指定 hue で saturation(x)/value(y) を編集。値が変われば true。
+/// SV square (auto ID: `IdStack.make(label)`). Edits saturation(x)/value(y) at the given hue. true if changed.
 pub fn svSquare(ctx: *Context, label: []const u8, hue: f32, s: *f32, v: *f32, opts: SvSquareOpts) bool {
     return svSquareId(ctx, ctx.id_stack.make(label), hue, s, v, opts);
 }
 
-/// 明示 ID 版。
+/// Explicit-ID form.
 pub fn svSquareId(ctx: *Context, id: Id, hue: f32, s: *f32, v: *f32, opts: SvSquareOpts) bool {
     const size = opts.size orelse ctx.style.picker_sv_size;
     std.debug.assert(size >= 2);
     const old_s = s.*;
     const old_v = v.*;
-    // 表示/hit-test 用に [0,1] clamp（clamp は exact なので drift しない）
+    // Clamp to [0,1] for display/hit-test (exact clamp; no drift)
     s.* = std.math.clamp(s.*, 0, 1);
     v.* = std.math.clamp(v.*, 0, 1);
 
-    // hit-test / drag（square 全体が drag 領域。Slider の knob 限定とは異なり「面」を掴む）
+    // hit-test / drag (whole square is the drag surface; unlike Slider’s knob-only grab)
     if (ctx.rect_cache.get(id)) |cached| {
         const r = cached.rect;
         const res = context_mod.buttonBehavior(ctx, id, r, cached.clip);
@@ -1091,11 +1091,11 @@ pub fn svSquareId(ctx: *Context, id: Id, hue: f32, s: *f32, v: *f32, opts: SvSqu
             const mx: f32 = @floatFromInt(ctx.input.mouse_pos.x - r.x);
             const my: f32 = @floatFromInt(ctx.input.mouse_pos.y - r.y);
             s.* = std.math.clamp(mx / w1, 0, 1);
-            v.* = std.math.clamp(1 - my / h1, 0, 1); // 上=明
+            v.* = std.math.clamp(1 - my / h1, 0, 1); // Top = bright
         }
     }
 
-    // グラデバッファ（arena, [size*size]u32）
+    // Gradient buffer (arena, [size*size]u32)
     const usz: usize = @intCast(size);
     const buf = ctx.allocator().alloc(u32, usz * usz) catch @panic("svSquare: OOM");
     const denom: f32 = @floatFromInt(size - 1);
@@ -1136,7 +1136,7 @@ const SvSquareDraw = struct {
         const self: *const SvSquareDraw = @ptrCast(@alignCast(ctx_ptr));
         const w: u32 = @intCast(self.size);
         dl.image(rect, self.buf, w, w) catch @panic("svSquare: OOM");
-        // マーカー: (s,v) 位置に明/暗 2 重枠（背景色に依らず視認）
+        // Marker: light/dark double outline at (s,v) (readable on any background)
         const w1: f32 = @floatFromInt(self.size - 1);
         const mx: i32 = rect.x + @as(i32, @intFromFloat(@round(self.s * w1)));
         const my: i32 = rect.y + @as(i32, @intFromFloat(@round((1 - self.v) * w1)));
@@ -1148,12 +1148,12 @@ const SvSquareDraw = struct {
     }
 };
 
-/// Hue バー（自動 ID: `IdStack.make(label)`）。縦方向に hue を編集。hue は常に [0,360)。値が変われば true。
+/// Hue bar (auto ID: `IdStack.make(label)`). Vertical hue edit; hue always in [0,360). true if changed.
 pub fn hueBar(ctx: *Context, label: []const u8, h: *f32, opts: HueBarOpts) bool {
     return hueBarId(ctx, ctx.id_stack.make(label), h, opts);
 }
 
-/// 明示 ID 版。
+/// Explicit-ID form.
 pub fn hueBarId(ctx: *Context, id: Id, h: *f32, opts: HueBarOpts) bool {
     const bw = opts.w orelse ctx.style.picker_hue_w;
     const bh = opts.h orelse ctx.style.picker_sv_size;
@@ -1178,7 +1178,7 @@ pub fn hueBarId(ctx: *Context, id: Id, h: *f32, opts: HueBarOpts) bool {
     const fbh: f32 = @floatFromInt(bh);
     var py: usize = 0;
     while (py < uh) : (py += 1) {
-        const hue = (@as(f32, @floatFromInt(py)) / fbh) * 360; // /bh で 360 を出さない
+        const hue = (@as(f32, @floatFromInt(py)) / fbh) * 360; // Avoid producing 360 via /bh
         const col: u32 = @bitCast(Color.fromHsv(hue, 1, 1));
         var px: usize = 0;
         while (px < uw) : (px += 1) buf[py * uw + px] = col;
@@ -1210,7 +1210,7 @@ const HueBarDraw = struct {
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const HueBarDraw = @ptrCast(@alignCast(ctx_ptr));
         dl.image(rect, self.buf, @intCast(self.w), @intCast(self.h)) catch @panic("hueBar: OOM");
-        // マーカー（横帯）: row = clamp(floor(hue/360*h), 0, h-1)（fill の /h 規約と一致）
+        // Marker (horizontal band): row = clamp(floor(hue/360*h), 0, h-1) (matches fill’s /h rule)
         const fbh: f32 = @floatFromInt(self.h);
         const rowf = @floor(self.hue / 360.0 * fbh);
         const row: i32 = std.math.clamp(@as(i32, @intFromFloat(rowf)), 0, self.h - 1);
@@ -1220,19 +1220,19 @@ const HueBarDraw = struct {
     }
 };
 
-// ── 画像ボックス（汎用・等倍 leaf。TASK-43）──────────────────
-// svSquare / hueBar と同じく DrawCmd.image を使う固定 px leaf。pixels は caller 所有で
-// render まで生存すること（frame arena 推奨）。dl.image が rect.w==src_w を assert するため
-// 縮小は呼び出し側で行い、ここでは等倍 blit のみ。非対話（hit-test しない）。
+// ── Image box (generic 1:1 leaf) ──────────────────
+// Like svSquare / hueBar: fixed-px leaf via `DrawCmd.image`. `pixels` are caller-owned and must
+// live through render (frame arena recommended). `dl.image` asserts `rect.w==src_w`, so
+// callers downscale themselves; here only 1:1 blit. Non-interactive (no hit-test).
 
 pub const ImageBoxOpts = struct {
-    /// 枠線色（null なら枠なし）
+    /// Border color (null = no border)
     border: ?Color = null,
     border_thickness: u32 = 1,
 };
 
-/// 等倍画像ボックス（明示 ID）。w×h の pixels を同サイズ rect へ blit する。
-/// pixels.len == w*h、w>=1、h>=1。
+/// 1:1 image box (explicit ID). Blits w×h `pixels` into a same-size rect.
+/// `pixels.len == w*h`, w>=1, h>=1.
 pub fn imageBox(ctx: *Context, id: Id, pixels: []const u32, w: i32, h: i32, opts: ImageBoxOpts) void {
     std.debug.assert(w >= 1 and h >= 1);
     std.debug.assert(pixels.len == @as(usize, @intCast(w)) * @as(usize, @intCast(h)));
@@ -1258,30 +1258,30 @@ const ImageBoxDraw = struct {
 };
 
 // ============================================================
-// Checkbox / Toggle(switch) / Radio（bool トグル系。TASK-48）
+// Checkbox / Toggle(switch) / Radio (bool toggles)
 // ============================================================
-// 既存 widget（button/colorSwatch/slider）と同じ同期 hit-test 契約:
-//   外側の row box が id を持ち、glyph + label 全体が hit 領域（button と同じ「箱全体がクリック域」）。
-//   behaviorFromCache(前フレーム rect_cache)で ButtonResult を取り、release の click で状態を反映する。
-//   hover 枠色は state.hot_id（フレーム中不変）を参照。glyph は custom leaf（SwatchDraw/SliderDraw と同型・
-//   arena に描画データを確保し、色/寸法は呼び出し時に解決して data へ格納する）。
+// Same synchronous hit-test contract as button / colorSwatch / slider:
+//   Outer row box owns the id; glyph + label together are the hit region (whole-box click like button).
+//   `behaviorFromCache` (previous-frame rect_cache) yields `ButtonResult`; release click applies state.
+//   Hover border uses `state.hot_id` (immutable for the frame). Glyphs are custom leaves (same shape as
+//   SwatchDraw/SliderDraw: arena draw data; colors/sizes resolved at call time into `data`).
 //
-// 戻り値の区別:
-//   checkbox / toggle は *bool を反転し changed(=clicked) を返す（1 クリックで 1 反転）。
-//   radio は selected(bool・入力/表示のみ) を取り clicked(activated) を返す（selected 済みの再クリックでも true）。
-//   選択状態は caller が管理する（IM 流。gui にグループ状態を持たせない）:
+// Return-value distinction:
+//   checkbox / toggle flip `*bool` and return changed(=clicked) (one flip per click).
+//   radio takes `selected` (display/input only) and returns clicked(activated) (true even if already selected).
+//   Selection state is caller-owned (IM-style; gui holds no group state):
 //     if (ctx.radio("A", sel == .a)) sel = .a;
 //     if (ctx.radio("B", sel == .b)) sel = .b;
 //
-// 自動 ID は button/colorSwatch と同じく label hash + id_stack。同一スコープに同ラベルを並べると
-// ID が衝突するので、~Id 版か id_stack.push(i) のスコープで回避する。
+// Auto ID matches button/colorSwatch: label hash + id_stack. Duplicate labels in one scope
+// collide — use the `*Id` form or `id_stack.push(i)` scopes.
 
-/// bool チェックボックス（自動 ID: label hash）。クリックで *value を反転し、変化したら true。
+/// Bool checkbox (auto ID: label hash). Click flips `*value`; returns true when it changed.
 pub fn checkbox(ctx: *Context, label: []const u8, value: *bool) bool {
     return checkboxId(ctx, ctx.id_stack.make(label), label, value);
 }
 
-/// 明示 ID 版。同一スコープに同ラベルを並べる場合や rect を外部参照する場合に使う。
+/// Explicit-ID form. Use for duplicate labels in one scope or external rect lookup.
 pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
@@ -1332,20 +1332,20 @@ const CheckGlyph = struct {
     }
 };
 
-/// bool トグルスイッチ（自動 ID: label hash）。クリックで *value を反転し、変化したら true。
-/// `switch` は Zig の予約語なので `toggle` で命名する。
+/// Bool toggle switch (auto ID: label hash). Click flips `*value`; returns true when it changed.
+/// Named `toggle` because `switch` is a Zig keyword.
 pub fn toggle(ctx: *Context, label: []const u8, value: *bool) bool {
     return toggleId(ctx, ctx.id_stack.make(label), label, value);
 }
 
-/// 明示 ID 版。
+/// Explicit-ID form.
 pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
     const w = style.switch_w;
     const h = style.switch_h;
-    std.debug.assert(w > 0 and h > 0 and w >= h); // knob が 0/負・track からはみ出るのを防ぐ
+    std.debug.assert(w > 0 and h > 0 and w >= h); // Keep the knob from going non-positive or past the track
     const hot = ctx.state.hot_id == id;
 
     ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
@@ -1378,7 +1378,7 @@ const ToggleGlyph = struct {
         const h: i32 = @intCast(rect.h);
         const w: i32 = @intCast(rect.w);
         const knob_side = @max(1, h - 2 * margin);
-        // OFF=左詰め / ON=右詰め（w>=h 前提で範囲内に収まる）
+        // OFF=left-packed / ON=right-packed (stays in range when w>=h)
         const kx = if (self.checked) rect.x + w - margin - knob_side else rect.x + margin;
         dl.rectFilled(.{
             .x = kx,
@@ -1390,13 +1390,13 @@ const ToggleGlyph = struct {
     }
 };
 
-/// ラジオボタン（自動 ID: label hash）。`selected` は表示専用（現在この項目が選択中か）。
-/// クリックされたら true を返す（activated。changed ではない）。選択状態は caller が管理する。
+/// Radio (auto ID: label hash). `selected` is display-only (whether this item is current).
+/// Returns true when clicked (activated, not changed). Selection state is caller-owned.
 pub fn radio(ctx: *Context, label: []const u8, selected: bool) bool {
     return radioId(ctx, ctx.id_stack.make(label), label, selected);
 }
 
-/// 明示 ID 版。同一スコープに同ラベルの radio を並べる場合はこちら（または id_stack.push）を使う。
+/// Explicit-ID form. Use when identical radio labels share a scope (or `id_stack.push`).
 pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
@@ -1431,27 +1431,27 @@ const RadioGlyph = struct {
         const r: f32 = @as(f32, @floatFromInt(@min(rect.w, rect.h))) / 2.0;
         const cx: f32 = @as(f32, @floatFromInt(rect.x)) + @as(f32, @floatFromInt(rect.w)) / 2.0;
         const cy: f32 = @as(f32, @floatFromInt(rect.y)) + @as(f32, @floatFromInt(rect.h)) / 2.0;
-        fillDisc(dl, cx, cy, r, self.ring); // 外周リング
-        fillDisc(dl, cx, cy, r - 1.5, self.bg); // 中を刳り抜く（残ったリングが枠）
-        if (self.selected) fillDisc(dl, cx, cy, r * 0.45, self.dot); // 中心ドット
+        fillDisc(dl, cx, cy, r, self.ring); // Outer ring
+        fillDisc(dl, cx, cy, r - 1.5, self.bg); // Punch the interior (remaining ring is the border)
+        if (self.selected) fillDisc(dl, cx, cy, r * 0.45, self.dot); // Center dot
     }
 };
 
 // ============================================================
-// Collapsible（折りたたみセクション。TASK-145.3）
+// Collapsible (foldable section)
 // ============================================================
-// 契約: if (ctx.beginCollapsible(id, title, &open)) { ...body...; ctx.endCollapsible(); }
-// header は begin 内で必ず endBox。open のときだけ body column を開き、end は body の endBox のみ。
-// 閉時に endCollapsible を呼ぶと親 box を誤 pop する — caller は if 契約を厳守すること。
+// Contract: if (ctx.beginCollapsible(id, title, &open)) { ...body...; ctx.endCollapsible(); }
+// Header always `endBox`es inside begin. Body column opens only when open; end only `endBox`es the body.
+// Calling `endCollapsible` while closed mis-pops the parent box — callers must keep the if contract.
 
-/// beginCollapsible が開いた body の深さ（debug 契約検査用。単一スレッド想定）。
+/// Depth of the body opened by `beginCollapsible` (debug contract check; single-thread assumed).
 threadlocal var collapsible_body_depth: u32 = 0;
 
 const collapsible_glyph_px: i32 = 12;
 
-/// header/glyph/title はフレーム毎（小面積）。閉時は body の layout node・child widget・hit-test を一切構築しない。
-/// 開閉状態は caller 所有 `*bool`（ScrollArea の scroll と同規約。PerIdStateStore 不使用）。
-/// 戻り値 true のときだけ body を構築し、必ず `endCollapsible` で閉じること。
+/// header/glyph/title run every frame (small area). When closed, no body layout nodes, child widgets, or hit-tests.
+/// Open state is caller-owned `*bool` (same rule as ScrollArea’s scroll; not in PerIdStateStore).
+/// Build the body only when the return is true, and always close with `endCollapsible`.
 pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) bool {
     std.debug.assert(id != 0);
     const result = behaviorFromCache(ctx, id);
@@ -1463,7 +1463,7 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
     const border_color = if (hot) style.border_hover else style.border;
     const pad = style.button_padding;
 
-    // header: row box（glyph + title）。id は header 全体が hit 領域。
+    // header: row box (glyph + title). id covers the whole header hit region.
     ctx.beginBox(.{
         .id = id,
         .direction = .row,
@@ -1477,25 +1477,25 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
     data.* = .{ .open = open.*, .fg = style.text };
     ctx.custom(.{ .x = collapsible_glyph_px, .y = collapsible_glyph_px }, CollapsibleGlyph.draw, data);
     ctx.labelEx(title, style.text);
-    ctx.endBox(); // header は begin 内で必ず閉じる
+    ctx.endBox(); // Header always closes inside begin
 
     if (!open.*) return false;
 
-    // open のときだけ body column を開く（endCollapsible が閉じる）
+    // Open the body column only when open (`endCollapsible` closes it)
     ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 0, 0, 0, pad[3] + collapsible_glyph_px + style.checkbox_gap } });
     collapsible_body_depth += 1;
     return true;
 }
 
-/// body の endBox（フレーム毎だが O(1)。`beginCollapsible` が true のときだけ呼ぶ）。
-/// closed 時に呼ぶと親 box を誤 pop する — 契約違反。
+/// Body `endBox` (every frame but O(1). Call only when `beginCollapsible` returned true).
+/// Calling while closed mis-pops the parent — contract violation.
 pub fn endCollapsible(ctx: *Context) void {
     std.debug.assert(collapsible_body_depth > 0);
     collapsible_body_depth -= 1;
     ctx.endBox();
 }
 
-/// 開閉三角。closed=右向き / open=下向き。不透明 rectFilled run のみ（alpha blend なし）。
+/// Open/close triangle. closed=right / open=down. Opaque `rectFilled` runs only (no alpha blend).
 const CollapsibleGlyph = struct {
     open: bool,
     fg: Color,
@@ -1505,7 +1505,7 @@ const CollapsibleGlyph = struct {
         const w: i32 = @intCast(rect.w);
         const h: i32 = @intCast(rect.h);
         if (w <= 0 or h <= 0) return;
-        // 内側に 2px マージンした三角形領域
+        // Triangle region with 2px inner margin
         const m: i32 = 2;
         const iw = w - 2 * m;
         const ih = h - 2 * m;
@@ -1514,7 +1514,7 @@ const CollapsibleGlyph = struct {
         const oy = rect.y + m;
 
         if (self.open) {
-            // 下向き: 上辺が広く下へ収束
+            // Pointing down: wide top edge, tapering downward
             var row: i32 = 0;
             while (row < ih) : (row += 1) {
                 const t = @divTrunc(row * iw, ih); // 0..iw
@@ -1530,11 +1530,11 @@ const CollapsibleGlyph = struct {
                 }, self.fg) catch @panic("collapsible: OOM");
             }
         } else {
-            // 右向き: 左辺が広く右へ収束
+            // Pointing right: wide left edge, tapering rightward
             const half = @divTrunc(ih, 2);
             var row: i32 = 0;
             while (row < ih) : (row += 1) {
-                // 上半は row に比例して幅増、下半は対称
+                // Upper half widens with row; lower half is symmetric
                 const dist = if (row <= half) row else (ih - 1 - row);
                 const run = @max(1, @divTrunc((dist + 1) * iw, half + 1));
                 dl.rectFilled(.{
@@ -1548,15 +1548,15 @@ const CollapsibleGlyph = struct {
     }
 };
 
-/// 中心(cx,cy)・半径 radius の塗り円をスキャンライン（各行 1px 高さの rectFilled 帯）で描く。
-/// render に円プリミティブが無いための局所ヘルパ。
+/// Filled circle at (cx,cy) radius `radius` via scanlines (1px-tall `rectFilled` bands per row).
+/// Local helper because render has no circle primitive.
 fn fillDisc(dl: *DrawList, cx: f32, cy: f32, radius: f32, col: Color) void {
     if (radius < 0.5) return;
     const y0: i32 = @intFromFloat(@floor(cy - radius));
     const y1: i32 = @intFromFloat(@ceil(cy + radius));
     var y: i32 = y0;
     while (y < y1) : (y += 1) {
-        const dy = (@as(f32, @floatFromInt(y)) + 0.5) - cy; // 行の中心
+        const dy = (@as(f32, @floatFromInt(y)) + 0.5) - cy; // Row center
         const under = radius * radius - dy * dy;
         if (under <= 0) continue;
         const hw = @sqrt(under);
@@ -1568,35 +1568,35 @@ fn fillDisc(dl: *DrawList, cx: f32, cy: f32, radius: f32, col: Color) void {
 }
 
 // ============================================================
-// Splitter（ペイン境界ドラッグ。TASK-41）
+// Splitter (pane-boundary drag)
 // ============================================================
 
 pub const Orient = enum { vertical, horizontal };
 
 pub const SplitterOpts = struct {
-    /// 境界帯の太さ（主軸 px）
+    /// Boundary band thickness (main-axis px)
     thickness: i32 = 6,
     min: i32 = 0,
     max: i32 = std.math.maxInt(i32),
-    /// pane が splitter の右/下にある場合 true: マウス正方向（右/下）ドラッグで pane size は「減る」ので
-    /// delta を反転する（`size += if (invert) -delta else delta`）。左/上 pane は false。
+    /// true when the pane sits right/below the splitter: dragging mouse positive (right/down) *shrinks*
+    /// pane size, so invert delta (`size += if (invert) -delta else delta`). Left/above panes use false.
     invert: bool = false,
 };
 
-/// orient 軸の生 delta（mouse_delta の該当成分）に invert を適用した符号付き delta。
+/// Signed delta from the orient-axis raw component of `mouse_delta`, after invert.
 fn splitterDelta(orient: Orient, mouse_dx: i32, mouse_dy: i32, invert: bool) i32 {
     const d = if (orient == .vertical) mouse_dx else mouse_dy;
     return if (invert) -d else d;
 }
 
-/// 境界帯をドラッグして size を増減する（変化したら true）。
-/// 同期 hit-test 契約: 前フレーム rect で buttonBehavior、held 中に mouse_delta を size へ反映し min/max clamp。
-/// vertical=幅 thickness・高さ grow / horizontal=高さ thickness・幅 grow の明示 id box として配置する。
+/// Drag the boundary band to grow/shrink `size` (true when it changed).
+/// Sync hit-test: `buttonBehavior` on previous-frame rect; while held, apply `mouse_delta` to size with min/max clamp.
+/// Placed as an explicit-id box: vertical=thickness wide × grow tall / horizontal=thickness tall × grow wide.
 pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: SplitterOpts) bool {
     std.debug.assert(opts.thickness > 0);
     const old = size.*;
 
-    // hit-test / drag（前フレーム rect の帯矩形で active 取得）
+    // hit-test / drag (take active from previous-frame band rect)
     if (ctx.rect_cache.get(id)) |cached| {
         const res = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
         if (res.held) {
@@ -1605,7 +1605,7 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
         }
     }
 
-    // 帯を明示 id box として配置。色は安定 hot_id/active_id（フレーム中不変）で選ぶ。
+    // Place the band as an explicit-id box. Color from stable hot_id/active_id (immutable for the frame).
     const style = ctx.style;
     const col = if (ctx.state.active_id == id)
         style.bg_active
@@ -1623,43 +1623,43 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
 }
 
 // ============================================================
-// ScrollArea（縦横スクロール領域 + スクロールバー。TASK-46）
+// ScrollArea (2-axis scroll region + scrollbars)
 // ============================================================
-// 構造: outer(row) → [ leftCol(column) → [ viewport(clip,scroll) → content(fit) , hbar ] , vbar ]
-// viewport は前フレーム rect、content は前フレーム measured（自然サイズ）を rect_cache から参照し、
-// scroll 量の clamp・bar 表示要否・thumb 幾何を **前フレーム値**で決める（splitter と同じ同期契約。
-// content サイズや viewport サイズが変わったフレームは 1 フレームだけ過渡値になり、次フレームで自己補正）。
-// scroll 値は呼び出し側が *Vec2f で保持（trackpad の小数を保つ）。layout へは round した i32 を渡す。
+// Structure: outer(row) → [ leftCol(column) → [ viewport(clip,scroll) → content(fit) , hbar ] , vbar ]
+// viewport uses previous-frame rect; content uses previous-frame measured (natural size) from rect_cache.
+// Clamp of scroll, whether bars show, and thumb geometry use **previous-frame** values (same sync contract as splitter.
+// Frames where content or viewport size changes are transitional for one frame, then self-correct).
+// Caller holds scroll in `*Vec2f` (keeps trackpad fractions). layout gets rounded i32.
 
 const SCROLL_MIN_THUMB: i32 = 16;
 
 pub const ScrollAreaOpts = struct {
-    /// outer（スクロール領域全体）の主軸/交差軸サイズ
+    /// Outer (whole scroll region) main/cross-axis size
     width: layout.Sizing = .{ .grow = 1 },
     height: layout.Sizing = .{ .grow = 1 },
-    /// inner content の方向・padding・gap・交差整列（caller の中身に効く）
+    /// Inner content direction / padding / gap / cross align (affects caller content)
     direction: layout.Direction = .column,
     padding: [4]i32 = .{ 0, 0, 0, 0 },
     gap: i32 = 0,
     align_cross: layout.Align = .start,
-    /// inner content のサイズ規則。既定 .fit（自然サイズ＝両軸スクロール可能）。
-    /// 横スクロール不要で content を viewport 幅いっぱいにしたい場合は content_width = .{ .grow = 1 }。
+    /// Inner content sizing. Default `.fit` (natural size = both axes scrollable).
+    /// If horizontal scroll is unneeded and content should fill viewport width: `content_width = .{ .grow = 1 }`.
     content_width: layout.Sizing = .fit,
     content_height: layout.Sizing = .fit,
-    /// outer の背景・枠
+    /// Outer background / border
     bg: ?Color = null,
     border: ?layout.Border = null,
-    /// ホイール 1 ノッチあたりの px
+    /// Pixels per wheel notch
     wheel_px: f32 = 32.0,
-    /// スクロールバー帯の厚み（px）
+    /// Scrollbar band thickness (px)
     bar_thickness: i32 = 8,
 };
 
 fn scrollThumbLen(viewport_len: i32, content_len: i32) i32 {
     if (content_len <= 0 or viewport_len <= 0) return @max(0, viewport_len);
-    // 下限は viewport 長を超えない（小さい viewport で clamp の min>max assert を避ける）。
+    // Lower bound must not exceed viewport length (avoids min>max clamp assert on tiny viewports).
     const min_thumb = @min(SCROLL_MIN_THUMB, viewport_len);
-    // i64 で乗算して大きい viewport での i32 overflow を避ける。
+    // Multiply in i64 to avoid i32 overflow on large viewports.
     const raw: i32 = @intCast(@divTrunc(@as(i64, viewport_len) * @as(i64, viewport_len), @as(i64, content_len)));
     return std.math.clamp(raw, min_thumb, viewport_len);
 }
@@ -1673,15 +1673,15 @@ fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Co
         st.thumb_col;
 }
 
-/// 縦横スクロール領域を開始する。`id` は viewport の明示 ID（getNodeRect(id)=viewport 矩形）。
-/// `scroll` は呼び出し側保持の f32 スクロール量（x/y）。begin 後に中身の widget を積み、endScrollArea で閉じる。
-/// TASK-126: wheel は begin では適用せず、endScrollArea（LIFO＝内側優先）で消費・端到達伝播する。
+/// Begin a 2-axis scroll region. `id` is the viewport’s explicit ID (`getNodeRect(id)` = viewport rect).
+/// `scroll` is caller-owned f32 scroll (x/y). Push content widgets after begin; close with `endScrollArea`.
+/// Wheel is not applied in begin; `endScrollArea` consumes it LIFO (innermost first) with end-reach propagation.
 pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOpts) void {
     const content_id = id_mod.hashInt(id, 1);
     const vthumb_id = id_mod.hashInt(id, 2);
     const hthumb_id = id_mod.hashInt(id, 3);
 
-    // 前フレーム viewport rect / content 自然サイズ
+    // Previous-frame viewport rect / content natural size
     const vp = ctx.getNodeRect(id);
     const cm = ctx.getNodeMeasured(content_id);
     const vp_w: i32 = if (vp) |r| @intCast(r.w) else 0;
@@ -1693,7 +1693,7 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     const need_v = max_y > 0;
     const need_h = max_x > 0;
 
-    // thumb ドラッグ（前フレーム thumb rect で buttonBehavior、held 中 mouse_delta を scroll へ写像）
+    // Thumb drag (`buttonBehavior` on previous-frame thumb rect; map held `mouse_delta` into scroll)
     if (need_v) {
         if (ctx.rect_cache.get(vthumb_id)) |c| {
             const res = context_mod.buttonBehavior(ctx, vthumb_id, c.rect, c.clip);
@@ -1715,11 +1715,11 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         }
     }
 
-    // f32 のまま clamp（wheel は end 側で追加適用するため、ここでは thumb 結果のみ）
+    // Clamp as f32 (wheel is applied later in end; here only thumb results)
     scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
     scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
 
-    // thumb 幾何（px）を clamp 済み scroll から算出
+    // Thumb geometry (px) from the clamped scroll
     var st: context_mod.ScrollState = .{
         .bar_thickness = opts.bar_thickness,
         .track_col = ctx.style.slider_track_bg,
@@ -1771,8 +1771,8 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     ctx.scroll_stack.append(ctx.gpa, st) catch @panic("beginScrollArea: OOM");
 }
 
-/// scroll に未消費 wheel を適用し、実移動できた分だけ delta を消費する（TASK-126）。
-/// 端到達で動けなかった残量は `ctx.wheel_remaining` に残り、外側 ScrollArea へ伝播する。
+/// Apply unconsumed wheel to scroll; consume only the delta that actually moved.
+/// Remainder that could not move at an edge stays in `ctx.wheel_remaining` for outer ScrollAreas.
 fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
     if (!ctx.wheel_remaining_seeded) {
         ctx.wheel_remaining = ctx.input.scroll_delta;
@@ -1802,7 +1802,7 @@ fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
     const act_x = scroll.x - old_x;
     const act_y = scroll.y - old_y;
 
-    // 実移動分だけ delta を消費（wheel_px がネストで異なっても px↔delta 変換で整合）
+    // Consume only the moved portion (px↔delta stays consistent when nested wheel_px differ)
     rem.x -= -act_x / wp;
     rem.y -= -act_y / wp;
 
@@ -1820,15 +1820,15 @@ fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
     }
 }
 
-/// scroll area を閉じてスクロールバーを構築する（begin と対で呼ぶ）。
-/// TASK-126: content を閉じた直後に wheel を内側優先で処理し、viewport の scroll に同一フレーム反映する。
+/// Close the scroll area and build scrollbars (pairs with begin).
+/// Right after closing content, process wheel innermost-first and reflect into viewport scroll same-frame.
 pub fn endScrollArea(ctx: *Context) void {
-    var st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: begin と不対応");
+    var st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: mismatched begin");
     ctx.endBox(); // inner content
     applyScrollAreaWheel(ctx, &st);
     ctx.endBox(); // viewport
 
-    // 横スクロールバー（leftCol 内・viewport の下）
+    // Horizontal scrollbar (inside leftCol, below viewport)
     if (st.need_h) {
         ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .fixed = st.bar_thickness }, .bg = st.track_col });
         if (st.h_off > 0) {
@@ -1841,7 +1841,7 @@ pub fn endScrollArea(ctx: *Context) void {
     }
     ctx.endBox(); // leftCol
 
-    // 縦スクロールバー（outer 内・leftCol の右）
+    // Vertical scrollbar (inside outer, right of leftCol)
     if (st.need_v) {
         ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = st.bar_thickness }, .height = .{ .grow = 1 }, .bg = st.track_col });
         if (st.v_off > 0) {
@@ -1886,18 +1886,18 @@ fn center(rect: Rect) struct { x: i32, y: i32 } {
     };
 }
 
-test "button: clicked は release フレームのみ true（1 フレーム edge / AC#2）" {
+test "button: clicked is true only on the release frame (1-frame edge)" {
     var ctx = testCtx();
     defer ctx.deinit();
 
-    // フレーム1: キャッシュ未生成 → 非ヒット（契約どおり）
+    // Frame 1: no cache yet → non-hit (per contract)
     ctx.beginFrame(800, 600);
     try std.testing.expect(!ctx.button("Btn"));
     ctx.endFrame();
     const rect = ctx.getNodeRect(ctx.id_stack.make("Btn")).?;
     const c = center(rect);
 
-    // フレーム2: press → held（まだ clicked ではない）
+    // Frame 2: press → held (not clicked yet)
     ctx.beginFrame(800, 600);
     pressAt(&ctx, c.x, c.y);
     var res = ctx.buttonEx("Btn", .{});
@@ -1905,21 +1905,21 @@ test "button: clicked は release フレームのみ true（1 フレーム edge 
     try std.testing.expect(!res.clicked);
     ctx.endFrame();
 
-    // フレーム3: release → clicked
+    // Frame 3: release → clicked
     ctx.beginFrame(800, 600);
     ctx.pushEvent(.{ .mouse_up = .{ .x = c.x, .y = c.y, .button = 0, .modifiers = 0 } });
     res = ctx.buttonEx("Btn", .{});
     try std.testing.expect(res.clicked);
     ctx.endFrame();
 
-    // フレーム4: 入力なし → false に戻る（edge）
+    // Frame 4: no input → back to false (edge)
     ctx.beginFrame(800, 600);
     res = ctx.buttonEx("Btn", .{});
     try std.testing.expect(!res.clicked);
     ctx.endFrame();
 }
 
-test "button: 同一フレーム press+release でも clicked（21.2 仕様の継承）" {
+test "button: same-frame press+release still yields clicked" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -1934,33 +1934,33 @@ test "button: 同一フレーム press+release でも clicked（21.2 仕様の�
     ctx.endFrame();
 }
 
-test "splitterDelta: orient 軸選択と invert 符号" {
-    try std.testing.expectEqual(@as(i32, 30), splitterDelta(.vertical, 30, 5, false)); // vertical は x
-    try std.testing.expectEqual(@as(i32, -30), splitterDelta(.vertical, 30, 5, true)); // invert で反転
-    try std.testing.expectEqual(@as(i32, 7), splitterDelta(.horizontal, 30, 7, false)); // horizontal は y
+test "splitterDelta: orient axis selection and invert sign" {
+    try std.testing.expectEqual(@as(i32, 30), splitterDelta(.vertical, 30, 5, false)); // vertical uses x
+    try std.testing.expectEqual(@as(i32, -30), splitterDelta(.vertical, 30, 5, true)); // invert flips the sign
+    try std.testing.expectEqual(@as(i32, 7), splitterDelta(.horizontal, 30, 7, false)); // horizontal uses y
     try std.testing.expectEqual(@as(i32, -7), splitterDelta(.horizontal, 30, 7, true));
 }
 
-test "splitter: vertical drag が size を delta 分動かし max で clamp する" {
+test "splitter: vertical drag moves size by delta and clamps at max" {
     var ctx = testCtx();
     defer ctx.deinit();
     var size: i32 = 200;
     const ID: Id = 0x5117e1;
     const opts: SplitterOpts = .{ .min = 100, .max = 400, .thickness = 6 };
 
-    // frame1: 登録（rect cache 生成）
+    // frame1: register (build rect cache)
     ctx.beginFrame(800, 600);
     _ = ctx.splitter(ID, .vertical, &size, opts);
     ctx.endFrame();
     const c = center(ctx.getNodeRect(ID).?);
 
-    // frame2: press（active 取得。press までの移動 delta は size に影響しうるので値は assert しない）
+    // frame2: press (take active; delta before press can affect size, so do not assert the value)
     ctx.beginFrame(800, 600);
     pressAt(&ctx, c.x, c.y);
     _ = ctx.splitter(ID, .vertical, &size, opts);
     ctx.endFrame();
 
-    // frame3: +30 ドラッグ（mouse_delta.x = 30、invert=false）→ size += 30
+    // frame3: drag +30 (mouse_delta.x = 30, invert=false) → size += 30
     const before = size;
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x + 30, c.y);
@@ -1968,7 +1968,7 @@ test "splitter: vertical drag が size を delta 分動かし max で clamp す�
     ctx.endFrame();
     try std.testing.expectEqual(before + 30, size);
 
-    // frame4: 大きく + ドラッグ → max=400 で clamp
+    // frame4: large + drag → clamp at max=400
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x + 1000, c.y);
     _ = ctx.splitter(ID, .vertical, &size, opts);
@@ -1976,7 +1976,7 @@ test "splitter: vertical drag が size を delta 分動かし max で clamp す�
     try std.testing.expectEqual(@as(i32, 400), size);
 }
 
-test "splitter: horizontal + invert で逆方向に動く" {
+test "splitter: horizontal + invert moves the opposite way" {
     var ctx = testCtx();
     defer ctx.deinit();
     var size: i32 = 200;
@@ -1993,7 +1993,7 @@ test "splitter: horizontal + invert で逆方向に動く" {
     _ = ctx.splitter(ID, .horizontal, &size, opts);
     ctx.endFrame();
 
-    // +30 を y 方向にドラッグ → invert で size -= 30
+    // drag +30 on y → invert makes size -= 30
     const before = size;
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y + 30);
@@ -2019,12 +2019,12 @@ fn buildPalette(ctx: *Context, results: *[16]ButtonResult) void {
     ctx.endBox();
 }
 
-test "colorSwatch: 16 マスが独立に click できる（AC#3）" {
+test "colorSwatch: 16 cells click independently" {
     var ctx = testCtx();
     defer ctx.deinit();
     var results: [16]ButtonResult = undefined;
 
-    // フレーム1: キャッシュ生成
+    // Frame 1: build cache
     ctx.beginFrame(800, 600);
     buildPalette(&ctx, &results);
     ctx.endFrame();
@@ -2042,7 +2042,7 @@ test "colorSwatch: 16 マスが独立に click できる（AC#3）" {
     }
 }
 
-test "colorSwatch: 同色でも id_stack.push スコープで独立（自動 ID）" {
+test "colorSwatch: same color stays independent under id_stack.push scopes (auto ID)" {
     var ctx = testCtx();
     defer ctx.deinit();
     const same = Color.rgba(0xD0, 0x46, 0x48, 0xFF);
@@ -2061,12 +2061,12 @@ test "colorSwatch: 同色でも id_stack.push スコープで独立（自動 ID�
         }
     }.f;
 
-    // フレーム1: 構築（同色 2 個。ID が衝突していれば endFrame の assert で落ちる）
+    // Frame 1: build (two identical colors; colliding IDs would trip endFrame assert)
     ctx.beginFrame(800, 600);
     build(&ctx, same, &res);
     ctx.endFrame();
 
-    // フレーム2: 2 個目（x = 18 + gap 4 = 22 起点）の中心を click → 2 個目だけ clicked
+    // Frame 2: click center of the 2nd (starts at x = 18 + gap 4 = 22) → only the 2nd is clicked
     ctx.beginFrame(800, 600);
     clickAt(&ctx, 22 + 9, 9);
     build(&ctx, same, &res);
@@ -2075,25 +2075,25 @@ test "colorSwatch: 同色でも id_stack.push スコープで独立（自動 ID�
     try std.testing.expect(res[1]);
 }
 
-test "colorSwatch: hit-test の rect 境界が正確（右下 -1px は in / 右下端は out）" {
+test "colorSwatch: hit-test rect bounds are exact (bottom-right -1px in / corner out)" {
     var ctx = testCtx();
     defer ctx.deinit();
     const opts: SwatchOpts = .{ .color = Color.rgba(0x40, 0x80, 0xC0, 0xFF) };
 
-    // swatch 単体 → rect = (0,0,18,18)
+    // lone swatch → rect = (0,0,18,18)
     ctx.beginFrame(800, 600);
     _ = ctx.colorSwatchId(7, opts);
     ctx.endFrame();
     const rect = ctx.getNodeRect(7).?;
     try std.testing.expectEqual(@as(u32, 18), rect.w);
 
-    // 右下の内側 1px（17,17）→ clicked
+    // 1px inside bottom-right (17,17) → clicked
     ctx.beginFrame(800, 600);
     clickAt(&ctx, 17, 17);
     try std.testing.expect(ctx.colorSwatchId(7, opts).clicked);
     ctx.endFrame();
 
-    // 右下端（18,18）は exclusive → ヒットしない
+    // bottom-right corner (18,18) is exclusive → miss
     ctx.beginFrame(800, 600);
     clickAt(&ctx, 18, 18);
     const res = ctx.colorSwatchId(7, opts);
@@ -2102,7 +2102,7 @@ test "colorSwatch: hit-test の rect 境界が正確（右下 -1px は in / 右�
     ctx.endFrame();
 }
 
-test "colorSwatch: selected の太枠が pixel で判別できる（AC#4）" {
+test "colorSwatch: selected thick border is distinguishable in pixels" {
     var ctx = testCtx();
     defer ctx.deinit();
     const fill = Color.rgba(0xD0, 0x46, 0x48, 0xFF);
@@ -2121,21 +2121,21 @@ test "colorSwatch: selected の太枠が pixel で判別できる（AC#4）" {
 
     const sel = ctx.getNodeRect(1).?;
     const unsel = ctx.getNodeRect(2).?;
-    const my_sel: u32 = @intCast(sel.y + 9); // 縦中央（上下帯の外）
+    const my_sel: u32 = @intCast(sel.y + 9); // Vertical mid (outside top/bottom bands)
     const border_sel: u32 = @bitCast(ctx.style.border_hover);
     const border_n: u32 = @bitCast(ctx.style.border);
     const fill_u: u32 = @bitCast(fill);
 
-    // selected（厚さ2）: x+0, x+1 とも枠色、x+2 は塗り
+    // selected (thickness 2): x+0 and x+1 are border; x+2 is fill
     try std.testing.expectEqual(border_sel, pixels[my_sel * 100 + @as(u32, @intCast(sel.x))]);
     try std.testing.expectEqual(border_sel, pixels[my_sel * 100 + @as(u32, @intCast(sel.x + 1))]);
     try std.testing.expectEqual(fill_u, pixels[my_sel * 100 + @as(u32, @intCast(sel.x + 2))]);
-    // 非 selected（厚さ1）: x+0 は枠色、x+1 から塗り → 枠幅で視覚差別できる
+    // non-selected (thickness 1): x+0 is border, fill from x+1 → border width distinguishes visually
     try std.testing.expectEqual(border_n, pixels[my_sel * 100 + @as(u32, @intCast(unsel.x))]);
     try std.testing.expectEqual(fill_u, pixels[my_sel * 100 + @as(u32, @intCast(unsel.x + 1))]);
 }
 
-test "button: selected の太枠と accent 背景が pixel で判別できる（TASK-155）" {
+test "button: selected thick border and accent fill are distinguishable in pixels" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2160,7 +2160,7 @@ test "button: selected の太枠と accent 背景が pixel で判別できる（
     const ys: u32 = @intCast(sel.y + @as(i32, @intCast(sel.h / 2)));
     const yu: u32 = @intCast(unsel.y + @as(i32, @intCast(unsel.h / 2)));
 
-    // selected: 太枠(border_hover)×2 + accent 塗り / 非 selected: 通常枠×1 + bg
+    // selected: thick border(border_hover)×2 + accent fill / non-selected: normal border×1 + bg
     try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x))]);
     try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
     try std.testing.expectEqual(sel_bg_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 2))]);
@@ -2168,7 +2168,7 @@ test "button: selected の太枠と accent 背景が pixel で判別できる（
     try std.testing.expectEqual(bg_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x + 1))]);
 }
 
-test "buttonId: getNodeRect で rect が取れ、min_w が効く" {
+test "buttonId: getNodeRect returns the rect and min_w applies" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2180,41 +2180,41 @@ test "buttonId: getNodeRect で rect が取れ、min_w が効く" {
     ctx.endBox();
     ctx.endFrame();
 
-    // "Save" = 4 文字 × 8px + padding 左右 8+8 = 48、高さ = 16 + 4+4 = 24
+    // "Save" = 4 chars × 8px + padding L/R 8+8 = 48, height = 16 + 4+4 = 24
     const save = ctx.getNodeRect(77).?;
     try std.testing.expectEqual(@as(u32, 48), save.w);
     try std.testing.expectEqual(@as(u32, 24), save.h);
-    // min_w が text+padding より大きい → min_w
+    // min_w larger than text+padding → min_w
     try std.testing.expectEqual(@as(u32, 60), ctx.getNodeRect(78).?.w);
-    // min_w が小さい → text+padding（13×8+16 = 120）
+    // min_w smaller → text+padding (13×8+16 = 120)
     try std.testing.expectEqual(@as(u32, 120), ctx.getNodeRect(79).?.w);
 }
 
-test "button: held フレームは bg_active、hover フレームは bg_hover で塗られる" {
+test "button: held frame paints bg_active; hover frame paints bg_hover" {
     var ctx = testCtx();
     defer ctx.deinit();
 
-    // フレーム1: キャッシュ生成
+    // Frame 1: build cache
     ctx.beginFrame(800, 600);
     _ = ctx.button("Btn");
     ctx.endFrame();
     const c = center(ctx.getNodeRect(ctx.id_stack.make("Btn")).?);
 
-    // フレーム2: hover のみ（hot_id はまだ前フレーム値 0 → bg のまま、next_hot に積まれる）
+    // Frame 2: hover only (hot_id still previous-frame 0 → stays bg; accumulates in next_hot)
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.button("Btn");
     ctx.endFrame();
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
 
-    // フレーム3: hover 継続（hot_id 昇格済み）→ bg_hover
+    // Frame 3: hover continues (hot_id promoted) → bg_hover
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.button("Btn");
     ctx.endFrame();
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
 
-    // フレーム4: press → held → bg_active
+    // Frame 4: press → held → bg_active
     ctx.beginFrame(800, 600);
     pressAt(&ctx, c.x, c.y);
     const res = ctx.button("Btn");
@@ -2223,9 +2223,9 @@ test "button: held フレームは bg_active、hover フレームは bg_hover �
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
 }
 
-// ── iconButton tests（TASK-145.1）──────────────────────────
+// ── iconButton tests ──────────────────────────
 
-/// テスト用 16x16: 中央 2x2 のみ set（row 7-8, col 7-8）。bit15=左端。
+/// Test 16×16: only center 2×2 set (rows 7–8, cols 7–8). bit15=left.
 const test_icon_center: [16]u16 = blk: {
     var rows: [16]u16 = .{0} ** 16;
     // col 7,8 → bit (15-7)=8, (15-8)=7
@@ -2235,14 +2235,14 @@ const test_icon_center: [16]u16 = blk: {
     break :blk rows;
 };
 
-/// テスト用: 左上 1px のみ set（run 変換と左右向きの確認用）。
+/// Test: only top-left 1px set (checks run conversion and L/R orientation).
 const test_icon_tl: [16]u16 = blk: {
     var rows: [16]u16 = .{0} ** 16;
-    rows[0] = @as(u16, 1) << 15; // bit15 = 左端
+    rows[0] = @as(u16, 1) << 15; // bit15 = left edge
     break :blk rows;
 };
 
-test "iconButtonId: 初回 frame で rect cache が生成される" {
+test "iconButtonId: first frame builds the rect cache" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2257,7 +2257,7 @@ test "iconButtonId: 初回 frame で rect cache が生成される" {
     try std.testing.expectEqual(@as(u32, @intCast(16 + pad[0] + pad[2])), r.h);
 }
 
-test "iconButton: selected と non-selected の枠・背景が pixel で区別できる（TASK-155）" {
+test "iconButton: selected vs non-selected border/bg distinguishable in pixels" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2282,7 +2282,7 @@ test "iconButton: selected と non-selected の枠・背景が pixel で区別�
     const ys: u32 = @intCast(sel.y + @as(i32, @intCast(sel.h / 2)));
     const yu: u32 = @intCast(unsel.y + @as(i32, @intCast(unsel.h / 2)));
 
-    // selected: 太枠(border_hover)×2 + accent 塗り / 非 selected: 通常枠×1 + bg
+    // selected: thick border(border_hover)×2 + accent fill / non-selected: normal border×1 + bg
     try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x))]);
     try std.testing.expectEqual(border_hover_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 1))]);
     try std.testing.expectEqual(sel_bg_u, pixels[ys * 200 + @as(u32, @intCast(sel.x + 2))]);
@@ -2290,7 +2290,7 @@ test "iconButton: selected と non-selected の枠・背景が pixel で区別�
     try std.testing.expectEqual(bg_u, pixels[yu * 200 + @as(u32, @intCast(unsel.x + 1))]);
 }
 
-test "iconButton: hot は bg_hover、held は bg_active" {
+test "iconButton: hot uses bg_hover; held uses bg_active" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2299,14 +2299,14 @@ test "iconButton: hot は bg_hover、held は bg_active" {
     ctx.endFrame();
     const c = center(ctx.getNodeRect(0x1452).?);
 
-    // hover 1 フレーム目: hot_id 未昇格 → bg
+    // First hover frame: hot_id not promoted yet → bg
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
     ctx.endFrame();
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
 
-    // hover 継続 → bg_hover
+    // Hover continues → bg_hover
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
@@ -2323,7 +2323,7 @@ test "iconButton: hot は bg_hover、held は bg_active" {
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
 }
 
-test "iconButton: mouse down-up で clicked" {
+test "iconButton: mouse down-up yields clicked" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2338,7 +2338,7 @@ test "iconButton: mouse down-up で clicked" {
     ctx.endFrame();
 }
 
-test "iconButton: set bit は foreground、clear bit は背景のまま" {
+test "iconButton: set bits are foreground; clear bits stay background" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2353,26 +2353,26 @@ test "iconButton: set bit は foreground、clear bit は背景のまま" {
 
     const r = ctx.getNodeRect(1).?;
     const pad = ctx.style.button_padding;
-    // icon leaf は padding 内側の (pad.left, pad.top) 起点。左上 1px が set。
+    // Icon leaf origin is (pad.left, pad.top) inside padding. Top-left 1px is set.
     const ix: u32 = @intCast(r.x + pad[3]);
     const iy: u32 = @intCast(r.y + pad[0]);
     const fg_u: u32 = @bitCast(ctx.style.text);
     const bg_u: u32 = @bitCast(ctx.style.bg);
     try std.testing.expectEqual(fg_u, pixels[iy * 80 + ix]);
-    // 右隣 (clear) は背景
+    // Pixel to the right (clear) stays background
     try std.testing.expectEqual(bg_u, pixels[iy * 80 + ix + 1]);
-    // 下隣 (clear) は背景
+    // Pixel below (clear) stays background
     try std.testing.expectEqual(bg_u, pixels[(iy + 1) * 80 + ix]);
 }
 
-test "iconButton: clip_children 外は click しない" {
+test "iconButton: no click outside clip_children" {
     var ctx = testCtx();
     defer ctx.deinit();
     var out: ButtonResult = .{};
 
     const build = struct {
         fn f(c: *Context, result: *ButtonResult) void {
-            // viewport 20px 高・clip あり。spacer 40px の下に icon → clip 外。
+            // Viewport 20px tall with clip. Icon below a 40px spacer → outside clip.
             c.beginBox(.{
                 .width = .{ .fixed = 80 },
                 .height = .{ .fixed = 20 },
@@ -2403,7 +2403,7 @@ test "iconButton: clip_children 外は click しない" {
     try std.testing.expect(!out.held);
 }
 
-test "iconButton: 明示 ID 2 個で片方だけ click" {
+test "iconButton: two explicit IDs; only one receives the click" {
     var ctx = testCtx();
     defer ctx.deinit();
     var res: [2]ButtonResult = undefined;
@@ -2430,8 +2430,8 @@ test "iconButton: 明示 ID 2 個で片方だけ click" {
     try std.testing.expect(res[1].clicked);
 }
 
-// 自動 ID 版 iconButton の smoke（iconButtonId 経路とは別経路の AC#1 被覆）。
-test "iconButton: 自動 ID 経路で mouse down-up が clicked" {
+// Smoke for auto-ID `iconButton` (covers a path separate from `iconButtonId`).
+test "iconButton: auto-ID path yields clicked on mouse down-up" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2447,12 +2447,12 @@ test "iconButton: 自動 ID 経路で mouse down-up が clicked" {
     ctx.endFrame();
 }
 
-// ── Collapsible tests（TASK-145.3）──────────────────────────
+// ── Collapsible tests ──────────────────────────
 
 const COLLAPSE_ID: Id = 0x145301;
 const COLLAPSE_CHILD: Id = 0x145302;
 
-test "collapsible: open=true 初期で header+body が構築される" {
+test "collapsible: open=true initially builds header+body" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open: bool = true;
@@ -2469,7 +2469,7 @@ test "collapsible: open=true 初期で header+body が構築される" {
     try std.testing.expect(open);
 }
 
-test "collapsible: header click で *open が反転する" {
+test "collapsible: header click flips *open" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open: bool = true;
@@ -2498,7 +2498,7 @@ test "collapsible: header click で *open が反転する" {
     try std.testing.expect(open);
 }
 
-test "collapsible: closed では caller body が実行されない（built_count）" {
+test "collapsible: when closed, caller body does not run (built_count)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open: bool = false;
@@ -2512,11 +2512,11 @@ test "collapsible: closed では caller body が実行されない（built_count
     }
     ctx.endFrame();
     try std.testing.expectEqual(@as(u32, 0), built_count);
-    try std.testing.expect(ctx.getNodeRect(COLLAPSE_ID) != null); // header は在る
+    try std.testing.expect(ctx.getNodeRect(COLLAPSE_ID) != null); // header exists
     try std.testing.expect(ctx.getNodeRect(COLLAPSE_CHILD) == null);
 }
 
-test "collapsible: open child は closed frame の endFrame 後 getNodeRect==null" {
+test "collapsible: open child is getNodeRect==null after endFrame of a closed frame" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open: bool = true;
@@ -2539,7 +2539,7 @@ test "collapsible: open child は closed frame の endFrame 後 getNodeRect==nul
     try std.testing.expect(ctx.getNodeRect(COLLAPSE_CHILD) == null);
 }
 
-test "collapsible: closed で旧 child rect 位置の click は無効" {
+test "collapsible: when closed, clicks at old child rect positions are ignored" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open: bool = true;
@@ -2561,7 +2561,7 @@ test "collapsible: closed で旧 child rect 位置の click は無効" {
     }
     ctx.endFrame();
 
-    // 旧 child 位置を click しても child は未構築 → clicked 増えない
+    // Clicking the old child position does not build the child → clicked does not increase
     ctx.beginFrame(800, 600);
     clickAt(&ctx, child_c.x, child_c.y);
     if (ctx.beginCollapsible(COLLAPSE_ID, "Section", &open)) {
@@ -2572,7 +2572,7 @@ test "collapsible: closed で旧 child rect 位置の click は無効" {
     try std.testing.expectEqual(@as(u32, 0), child_clicks);
 }
 
-test "collapsible: dynamic title が frame ごとに更新される" {
+test "collapsible: dynamic title updates every frame" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open: bool = true;
@@ -2582,7 +2582,7 @@ test "collapsible: dynamic title が frame ごとに更新される" {
         ctx.endCollapsible();
     }
     ctx.endFrame();
-    // label は text cmd。TitleA が含まれる
+    // label is a text cmd; includes TitleA
     var found_a = false;
     for (ctx.draw_list.cmds.items) |cmd| {
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleA")) found_a = true;
@@ -2604,7 +2604,7 @@ test "collapsible: dynamic title が frame ごとに更新される" {
     try std.testing.expect(!found_a2);
 }
 
-test "collapsible: nested open/closed で beginBox/endBox balance が維持される" {
+test "collapsible: nested open/closed keeps beginBox/endBox balanced" {
     var ctx = testCtx();
     defer ctx.deinit();
     var outer: bool = true;
@@ -2620,7 +2620,7 @@ test "collapsible: nested open/closed で beginBox/endBox balance が維持さ�
         ctx.endCollapsible();
     }
     ctx.endFrame();
-    // outer open / inner closed: mid は在り deep は無い。depth は 0 に戻る
+    // outer open / inner closed: mid present, deep absent; depth returns to 0
     try std.testing.expect(ctx.getNodeRect(0x145313) != null);
     try std.testing.expect(ctx.getNodeRect(0x145312) == null);
     try std.testing.expectEqual(@as(u32, 0), collapsible_body_depth);
@@ -2640,7 +2640,7 @@ test "collapsible: nested open/closed で beginBox/endBox balance が維持さ�
     try std.testing.expectEqual(@as(u32, 0), collapsible_body_depth);
 }
 
-test "collapsible: glyph の right/down が pixel で区別できる" {
+test "collapsible: glyph right/down shapes are distinguishable in pixels" {
     var ctx = testCtx();
     defer ctx.deinit();
     var open_a: bool = false;
@@ -2661,7 +2661,7 @@ test "collapsible: glyph の right/down が pixel で区別できる" {
     const ra = ctx.getNodeRect(1).?;
     const rb = ctx.getNodeRect(2).?;
     const pad = ctx.style.button_padding;
-    // glyph は row + align_cross.center のため、content 高さ内で垂直中央
+    // glyph is row + align_cross.center, so vertically centered in content height
     const content_ha: i32 = @as(i32, @intCast(ra.h)) - pad[0] - pad[2];
     const content_hb: i32 = @as(i32, @intCast(rb.h)) - pad[0] - pad[2];
     const ga_x: i32 = ra.x + pad[3];
@@ -2671,22 +2671,22 @@ test "collapsible: glyph の right/down が pixel で区別できる" {
     const fg: u32 = @bitCast(ctx.style.text);
     const mid: i32 = @divTrunc(collapsible_glyph_px, 2);
 
-    // closed(right): 左端中段に fg / open(down): 上辺中央に fg
+    // closed(right): fg at left-mid / open(down): fg at top-center
     const closed_left = pixels[@as(u32, @intCast(ga_y + mid)) * 200 + @as(u32, @intCast(ga_x + 2))];
     const open_top = pixels[@as(u32, @intCast(gb_y + 2)) * 200 + @as(u32, @intCast(gb_x + mid))];
     try std.testing.expectEqual(fg, closed_left);
     try std.testing.expectEqual(fg, open_top);
-    // right は右端が細い・down は下端が細い → 少なくとも一方は非 fg
+    // right tapers at the right edge; down tapers at the bottom → at least one side is non-fg
     const closed_right = pixels[@as(u32, @intCast(ga_y + mid)) * 200 + @as(u32, @intCast(ga_x + collapsible_glyph_px - 2))];
     const open_bottom = pixels[@as(u32, @intCast(gb_y + collapsible_glyph_px - 2)) * 200 + @as(u32, @intCast(gb_x + mid))];
     try std.testing.expect(closed_right != fg or open_bottom != fg);
 }
 
-test "colorSwatch: 不透明は bg+枠のみ、半透明は checker+blend で発行される" {
+test "colorSwatch: opaque emits bg+border only; semi-transparent emits checker+blend" {
     var ctx = testCtx();
     defer ctx.deinit();
 
-    // 不透明: rect_filled(色) + rect_outline = 2 cmd
+    // opaque: rect_filled(color) + rect_outline = 2 cmds
     ctx.beginFrame(800, 600);
     _ = ctx.colorSwatchId(1, .{ .color = Color.rgba(0xFF, 0x00, 0x00, 0xFF) });
     ctx.endFrame();
@@ -2694,8 +2694,8 @@ test "colorSwatch: 不透明は bg+枠のみ、半透明は checker+blend で発
     try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
     try std.testing.expect(ctx.draw_list.cmds.items[1] == .rect_outline);
 
-    // 半透明: checker（18px / 4px cell = 5×5）+ blend 塗り + 枠 = 27 cmd。
-    // 最後の rect_filled が半透明色そのもの（blend は render 時）
+    // semi-transparent: checker (18px / 4px cell = 5×5) + blend fill + border = 27 cmds.
+    // Last rect_filled is the semi-transparent color itself (blend happens at render)
     const translucent = Color.rgba(0x00, 0xFF, 0x00, 0x80);
     ctx.beginFrame(800, 600);
     _ = ctx.colorSwatchId(1, .{ .color = translucent });
@@ -2709,21 +2709,21 @@ test "colorSwatch: 不透明は bg+枠のみ、半透明は checker+blend で発
     );
 }
 
-test "widgets: 初回フレーム（キャッシュ未生成）は click が成立しない（契約の確認）" {
+test "widgets: first frame (no cache yet) does not register a click (contract check)" {
     var ctx = testCtx();
     defer ctx.deinit();
 
     ctx.beginFrame(800, 600);
-    clickAt(&ctx, 5, 5); // ボタンが置かれる位置を先に click
+    clickAt(&ctx, 5, 5); // Click the eventual button position first
     try std.testing.expect(!ctx.button("Btn"));
     try std.testing.expect(!ctx.wantsMouse());
     ctx.endFrame();
 }
 
-// ── Slider テスト（TASK-21.9）─────────────────────────────
+// ── Slider tests ─────────────────────────────
 const SLIDER_ID: Id = 900;
 
-/// frame1 でキャッシュ生成し track rect を返す。
+/// Frame1 builds the cache and returns the track rect.
 fn sliderFrame1I32(ctx: *Context, value: *i32, opts: SliderI32Opts) Rect {
     ctx.beginFrame(800, 600);
     _ = ctx.sliderI32Id(SLIDER_ID, "S", value, opts);
@@ -2735,15 +2735,15 @@ fn trackCenterY(track: Rect) i32 {
     return track.y + @divTrunc(@as(i32, @intCast(track.h)), 2);
 }
 
-test "slider: knobRectFor は frac=0/1 で中心が track 両端（可動域）" {
+test "slider: knobRectFor centers at track ends for frac=0/1 (travel range)" {
     const track = Rect{ .x = 10, .y = 0, .w = 120, .h = 16 };
     const k0 = knobRectFor(track, 10, 16, 0);
     const k1 = knobRectFor(track, 10, 16, 1);
-    try std.testing.expectEqual(@as(i32, 10), k0.x); // 中心 15 = x+knob_w/2 → x=10
-    try std.testing.expectEqual(@as(i32, 120), k1.x); // 中心 125 = x+w-knob_w/2 → x=120
+    try std.testing.expectEqual(@as(i32, 10), k0.x); // Center 15 = x+knob_w/2 → x=10
+    try std.testing.expectEqual(@as(i32, 120), k1.x); // Center 125 = x+w-knob_w/2 → x=120
 }
 
-test "slider: ドラッグで *value が更新され [min,max] clamp（AC#2）" {
+test "slider: drag updates *value and clamps to [min,max]" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v: i32 = 0;
@@ -2751,10 +2751,10 @@ test "slider: ドラッグで *value が更新され [min,max] clamp（AC#2）" 
 
     const track = sliderFrame1I32(&ctx, &v, opts);
     const kw = ctx.style.slider_knob_w;
-    const lo = track.x + @divTrunc(kw, 2); // v=0 の knob 中心
+    const lo = track.x + @divTrunc(kw, 2); // knob center at v=0
     const yc = trackCenterY(track);
 
-    // frame2: knob を掴んで track 右端の外まで drag → max に clamp
+    // frame2: grab knob and drag past track right → clamp to max
     ctx.beginFrame(800, 600);
     pressAt(&ctx, lo, yc);
     moveTo(&ctx, track.x + @as(i32, @intCast(track.w)) + 50, yc);
@@ -2765,7 +2765,7 @@ test "slider: ドラッグで *value が更新され [min,max] clamp（AC#2）" 
     try std.testing.expectEqual(@as(i32, 100), v);
 }
 
-test "slider: step 指定で値が step 単位に丸められる（AC#3）" {
+test "slider: with step, values snap to step units" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v: i32 = 0;
@@ -2776,7 +2776,7 @@ test "slider: step 指定で値が step 単位に丸められる（AC#3）" {
     const lo = track.x + @divTrunc(kw, 2);
     const yc = trackCenterY(track);
 
-    // track の 35% 位置へ drag: span=110, x=lo+38 → t=0.3454 → raw≈3.45 → round(3.45/2)*2 = 4
+    // drag to 35% of track: span=110, x=lo+38 → t=0.3454 → raw≈3.45 → round(3.45/2)*2 = 4
     ctx.beginFrame(800, 600);
     pressAt(&ctx, lo, yc);
     const span = @as(i32, @intCast(track.w)) - kw;
@@ -2784,10 +2784,10 @@ test "slider: step 指定で値が step 単位に丸められる（AC#3）" {
     _ = ctx.sliderI32Id(SLIDER_ID, "S", &v, opts);
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(i32, 4), v); // step=2 単位に丸め（固定期待値）
+    try std.testing.expectEqual(@as(i32, 4), v); // Rounded to step=2 units (fixed expected value)
 }
 
-test "slider: track 上だが knob 外の press では値が変わらない（AC#4）" {
+test "slider: press on track but outside knob leaves the value unchanged" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v: i32 = 0;
@@ -2796,7 +2796,7 @@ test "slider: track 上だが knob 外の press では値が変わらない（AC
     const track = sliderFrame1I32(&ctx, &v, opts);
     const yc = trackCenterY(track);
 
-    // v=0 の knob は左端。track 右端付近（knob 外）を press して drag → active 取得されず不変
+    // knob at v=0 is at left. Press near track right (outside knob) and drag → no active, unchanged
     ctx.beginFrame(800, 600);
     pressAt(&ctx, track.x + @as(i32, @intCast(track.w)) - 1, yc);
     moveTo(&ctx, track.x + 5, yc);
@@ -2807,21 +2807,21 @@ test "slider: track 上だが knob 外の press では値が変わらない（AC
     try std.testing.expectEqual(@as(i32, 0), v);
 }
 
-test "slider: 値の桁数が変わっても track.x が動かない（High 回帰防止）" {
+test "slider: track.x stays put when value digit count changes" {
     var ctx = testCtx();
     defer ctx.deinit();
     const opts: SliderI32Opts = .{ .min = 0, .max = 100 };
 
     var v: i32 = 9;
     const track9 = sliderFrame1I32(&ctx, &v, opts);
-    v = 10; // 桁数増加（値テキストは track の右なので track 位置に無影響のはず）
+    v = 10; // Digit count grows (value text is right of track, so track.x should be unaffected)
     const track10 = sliderFrame1I32(&ctx, &v, opts);
 
     try std.testing.expectEqual(track9.x, track10.x);
     try std.testing.expectEqual(track9.w, track10.w);
 }
 
-test "sliderF32: clamp + step が効く" {
+test "sliderF32: clamp + step apply" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v: f32 = 0;
@@ -2835,7 +2835,7 @@ test "sliderF32: clamp + step が効く" {
     const lo = track.x + @divTrunc(kw, 2);
     const yc = trackCenterY(track);
 
-    // 右端外まで drag → 1.0 に clamp（0.25 の倍数）
+    // Drag past right → clamp to 1.0 (multiple of 0.25)
     ctx.beginFrame(800, 600);
     pressAt(&ctx, lo, yc);
     moveTo(&ctx, track.x + @as(i32, @intCast(track.w)) + 50, yc);
@@ -2846,7 +2846,7 @@ test "sliderF32: clamp + step が効く" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), v, 0.001);
 }
 
-test "sliderF32: 中間ドラッグで step 単位に丸まる（AC#3 の f32 回帰）" {
+test "sliderF32: mid-track drag snaps to step units (f32 regression)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v: f32 = 0;
@@ -2860,7 +2860,7 @@ test "sliderF32: 中間ドラッグで step 単位に丸まる（AC#3 の f32 �
     const lo = track.x + @divTrunc(kw, 2);
     const yc = trackCenterY(track);
 
-    // 30% 位置へ drag: span=110, x=lo+33 → t=0.30 → raw=0.30 → round(0.30/0.25)*0.25 = 0.25
+    // drag to 30%: span=110, x=lo+33 → t=0.30 → raw=0.30 → round(0.30/0.25)*0.25 = 0.25
     ctx.beginFrame(800, 600);
     pressAt(&ctx, lo, yc);
     const span = @as(i32, @intCast(track.w)) - kw;
@@ -2868,25 +2868,25 @@ test "sliderF32: 中間ドラッグで step 単位に丸まる（AC#3 の f32 �
     _ = ctx.sliderF32Id(SLIDER_ID, "S", &v, opts);
     ctx.endFrame();
 
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), v, 0.001); // step なしなら ≈0.30
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), v, 0.001); // Without step would be ≈0.30
 }
 
-// ── HSV ピッカー テスト（TASK-21.14）─────────────────────
+// ── HSV picker tests ─────────────────────
 const PICKER_ID: Id = 901;
 
-test "svSquare: 領域内ドラッグで s,v が更新され [0,1] clamp（AC#2）" {
+test "svSquare: in-area drag updates s,v and clamps to [0,1]" {
     var ctx = testCtx();
     defer ctx.deinit();
     var s: f32 = 0;
     var v: f32 = 1;
 
-    // frame1: キャッシュ生成（size 固定 64 で検証）
+    // frame1: build cache (verify with fixed size 64)
     ctx.beginFrame(800, 600);
     _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
     ctx.endFrame();
     const r = ctx.getNodeRect(PICKER_ID).?;
 
-    // frame2: 右下端の外まで drag → s=1, v=0（下=暗）。clamp 確認
+    // frame2: drag past bottom-right → s=1, v=0 (bottom=dark). Checks clamp
     ctx.beginFrame(800, 600);
     pressAt(&ctx, r.x + 5, r.y + 5);
     moveTo(&ctx, r.x + @as(i32, @intCast(r.w)) + 50, r.y + @as(i32, @intCast(r.h)) + 50);
@@ -2898,7 +2898,7 @@ test "svSquare: 領域内ドラッグで s,v が更新され [0,1] clamp（AC#2�
     try std.testing.expectApproxEqAbs(@as(f32, 0), v, 0.001);
 }
 
-test "svSquare: 領域外 press では active を取得しない（hit-test 領域限定）" {
+test "svSquare: press outside the area does not take active (hit-test region limited)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var s: f32 = 0.5;
@@ -2909,7 +2909,7 @@ test "svSquare: 領域外 press では active を取得しない（hit-test 領�
     ctx.endFrame();
     const r = ctx.getNodeRect(PICKER_ID).?;
 
-    // square の外を press → drag。値は変わらない
+    // Press outside the square → drag. Value unchanged
     ctx.beginFrame(800, 600);
     pressAt(&ctx, r.x + @as(i32, @intCast(r.w)) + 30, r.y + 5);
     moveTo(&ctx, r.x + 10, r.y + 10);
@@ -2921,7 +2921,7 @@ test "svSquare: 領域外 press では active を取得しない（hit-test 領�
     try std.testing.expectEqual(@as(f32, 0.5), v);
 }
 
-test "svSquare: dl.image が発行される" {
+test "svSquare: emits dl.image" {
     var ctx = testCtx();
     defer ctx.deinit();
     var s: f32 = 0.3;
@@ -2942,7 +2942,7 @@ test "svSquare: dl.image が発行される" {
     try std.testing.expect(has_image);
 }
 
-test "hueBar: ドラッグで h が [0,360) で更新される（AC#3）" {
+test "hueBar: drag updates h in [0,360)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var h: f32 = 0;
@@ -2952,7 +2952,7 @@ test "hueBar: ドラッグで h が [0,360) で更新される（AC#3）" {
     ctx.endFrame();
     const r = ctx.getNodeRect(PICKER_ID).?;
 
-    // 下端の外まで drag → h は 360 未満の最大付近
+    // Drag past bottom → h near max below 360
     ctx.beginFrame(800, 600);
     pressAt(&ctx, r.x + 8, r.y + 2);
     moveTo(&ctx, r.x + 8, r.y + @as(i32, @intCast(r.h)) + 50);
@@ -2961,18 +2961,18 @@ test "hueBar: ドラッグで h が [0,360) で更新される（AC#3）" {
 
     try std.testing.expect(changed);
     try std.testing.expect(h >= 0 and h < 360);
-    try std.testing.expect(h > 300); // 下端付近は高い hue
+    try std.testing.expect(h > 300); // Near bottom → high hue
 
-    // 中ほどへ drag → 約 180
+    // Drag to middle → about 180
     ctx.beginFrame(800, 600);
-    pressAt(&ctx, r.x + 8, r.y + @as(i32, @intCast(r.h)) + 50); // active 継続のため一度離さず再 press 不要だが明示
+    pressAt(&ctx, r.x + 8, r.y + @as(i32, @intCast(r.h)) + 50); // Active continues without release, but press again explicitly
     moveTo(&ctx, r.x + 8, r.y + @as(i32, @intCast(@divTrunc(r.h, 2))));
     _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
     ctx.endFrame();
     try std.testing.expectApproxEqAbs(@as(f32, 180), h, 20);
 }
 
-test "imageBox: 固定 w×h の leaf を確保し等倍 image cmd を発行する" {
+test "imageBox: reserves a fixed wxh leaf and emits a 1:1 image cmd" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2983,14 +2983,14 @@ test "imageBox: 固定 w×h の leaf を確保し等倍 image cmd を発行す�
 
     ctx.beginFrame(200, 200);
     ctx.imageBox(0xBEEF, &buf, W, H, .{});
-    ctx.endFrame(); // endFrame が custom draw_fn を呼び dl.image(rect.w==src_w を assert) を実行
+    ctx.endFrame(); // endFrame runs custom draw_fn and dl.image (asserts rect.w==src_w)
 
-    // 固定サイズの leaf が確保される（dl.image の等倍契約の前提）
+    // Fixed-size leaf is reserved (prerequisite for dl.image 1:1 contract)
     const rect = ctx.getNodeRect(0xBEEF).?;
     try std.testing.expectEqual(@as(u32, 24), rect.w);
     try std.testing.expectEqual(@as(u32, 20), rect.h);
 
-    // image cmd が src_w/src_h・rect.w 一致で 1 つ発行されている
+    // Exactly one image cmd with matching src_w/src_h and rect.w
     var found = false;
     for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
         .image => |im| {
@@ -3010,7 +3010,7 @@ fn buildFixedContent(ctx: *Context, child_id: Id, w: i32, h: i32) void {
     ctx.endBox();
 }
 
-test "scrollArea: 前フレーム自然サイズで縦 scroll を clamp し content をオフセット・縦バーを出す" {
+test "scrollArea: clamps vertical scroll from previous-frame natural size, offsets content, shows vbar" {
     var ctx = testCtx();
     defer ctx.deinit();
     const SID: Id = 0x5C0011;
@@ -3018,20 +3018,20 @@ test "scrollArea: 前フレーム自然サイズで縦 scroll を clamp し cont
     var scroll: Vec2f = .{};
     const VP_W: i32 = 100;
     const VP_H: i32 = 60;
-    const CONTENT_W: i32 = 80; // viewport より狭い → 横 scroll 不要
-    const CONTENT_H: i32 = 200; // viewport より高い → 縦 scroll 要
+    const CONTENT_W: i32 = 80; // Narrower than viewport → no horizontal scroll
+    const CONTENT_H: i32 = 200; // Taller than viewport → needs vertical scroll
     const opts: ScrollAreaOpts = .{ .width = .{ .fixed = VP_W }, .height = .{ .fixed = VP_H } };
 
-    // frame1: scroll=0 で配置（前フレーム cache が無いので bar は未確定 → まだ出ない）
+    // frame1: place with scroll=0 (no previous-frame cache → bar undecided → not shown yet)
     ctx.beginFrame(300, 300);
     ctx.beginScrollArea(SID, &scroll, opts);
     buildFixedContent(&ctx, CHILD, CONTENT_W, CONTENT_H);
     ctx.endScrollArea();
     ctx.endFrame();
     const vp = ctx.getNodeRect(SID).?;
-    try std.testing.expectEqual(@as(u32, @intCast(VP_W)), vp.w); // bar 未出なので全幅
+    try std.testing.expectEqual(@as(u32, @intCast(VP_W)), vp.w); // No bar yet → full width
 
-    // frame2: 過大 scroll を要求 → 前フレーム自然サイズで max_y=140 に clamp、縦バー出現、content が上へ
+    // frame2: request oversized scroll → clamp max_y=140 from previous-frame natural size; vbar appears; content moves up
     scroll.y = 1000;
     ctx.beginFrame(300, 300);
     ctx.beginScrollArea(SID, &scroll, opts);
@@ -3039,18 +3039,18 @@ test "scrollArea: 前フレーム自然サイズで縦 scroll を clamp し cont
     ctx.endScrollArea();
     ctx.endFrame();
 
-    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(CONTENT_H - VP_H)), scroll.y, 0.5); // 140 に clamp
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(CONTENT_H - VP_H)), scroll.y, 0.5); // Clamped to 140
     const vthumb_id = id_mod.hashInt(SID, 2);
     const hthumb_id = id_mod.hashInt(SID, 3);
-    try std.testing.expect(ctx.rect_cache.get(vthumb_id) != null); // 縦バー出現
-    try std.testing.expect(ctx.rect_cache.get(hthumb_id) == null); // 横バーは出ない
-    // content の子が scroll 分だけ上へ（絶対値: viewport.y - 140）。clip 外（viewport より上）に出る。
+    try std.testing.expect(ctx.rect_cache.get(vthumb_id) != null); // Vertical bar appears
+    try std.testing.expect(ctx.rect_cache.get(hthumb_id) == null); // No horizontal bar
+    // Content child moves up by scroll (absolute: viewport.y - 140). Ends above viewport (outside clip).
     const child = ctx.getNodeRect(CHILD).?;
     try std.testing.expectEqual(vp.y - (CONTENT_H - VP_H), child.y);
     try std.testing.expect(child.y < vp.y);
 }
 
-test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラッグ）" {
+test "scrollArea: dragging the vertical thumb increases scroll.y (sync drag)" {
     var ctx = testCtx();
     defer ctx.deinit();
     const SID: Id = 0x5C0022;
@@ -3058,7 +3058,7 @@ test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラ
     var scroll: Vec2f = .{};
     const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
 
-    // frame1/2: 配置して縦バー thumb の rect cache を生成（need_v は前フレーム判定なので 2 フレーム目で出る）
+    // frame1/2: place and build vertical thumb rect cache (need_v uses previous frame, so bar appears on frame 2)
     ctx.beginFrame(300, 300);
     ctx.beginScrollArea(SID, &scroll, opts);
     buildFixedContent(&ctx, CHILD, 80, 200);
@@ -3073,7 +3073,7 @@ test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラ
     const vthumb_id = id_mod.hashInt(SID, 2);
     const tc = center(ctx.getNodeRect(vthumb_id).?);
 
-    // frame3: thumb を press（active 取得）
+    // frame3: press thumb (take active)
     ctx.beginFrame(300, 300);
     pressAt(&ctx, tc.x, tc.y);
     ctx.beginScrollArea(SID, &scroll, opts);
@@ -3081,7 +3081,7 @@ test "scrollArea: 縦 thumb ドラッグで scroll.y が増える（同期ドラ
     ctx.endScrollArea();
     ctx.endFrame();
 
-    // frame4: 下へドラッグ → held 中 mouse_delta.y>0 が scroll.y を増やす
+    // frame4: drag down → held mouse_delta.y>0 increases scroll.y
     const before = scroll.y;
     ctx.beginFrame(300, 300);
     moveTo(&ctx, tc.x, tc.y + 20);
@@ -3121,7 +3121,7 @@ fn nestScrollWarmup(ctx: *Context, outer_id: Id, inner_id: Id, mid_id: ?Id, oute
     }
 }
 
-test "TASK-126: 2段ネスト wheel は inner のみ変化し outer は不変" {
+test "scrollArea: 2-level nested wheel changes only inner; outer unchanged" {
     var ctx = testCtx();
     defer ctx.deinit();
     const OUTER: Id = 0x12601;
@@ -3168,7 +3168,7 @@ fn nestScrollWarmupFrame(ctx: *Context, outer_id: Id, inner_id: Id, mid_id: ?Id,
     ctx.endScrollArea();
 }
 
-test "TASK-126: 3段ネスト wheel は最深のみ変化（LIFO）" {
+test "scrollArea: 3-level nested wheel changes only the deepest (LIFO)" {
     var ctx = testCtx();
     defer ctx.deinit();
     const OUTER: Id = 0x12611;
@@ -3196,7 +3196,7 @@ test "TASK-126: 3段ネスト wheel は最深のみ変化（LIFO）" {
     try std.testing.expectEqual(mid_y0, mid.y);
 }
 
-test "TASK-126: inner 端到達後の残量は outer へ伝播" {
+test "scrollArea: remainder after inner hits an edge propagates to outer" {
     var ctx = testCtx();
     defer ctx.deinit();
     const OUTER: Id = 0x12621;
@@ -3207,7 +3207,7 @@ test "TASK-126: inner 端到達後の残量は outer へ伝播" {
 
     const ir = ctx.getNodeRect(INNER).?;
     const ic = center(ir);
-    // inner を下端まで進める
+    // Advance inner to its bottom edge
     inner.y = 10000;
     ctx.beginFrame(400, 400);
     nestScrollWarmupFrame(&ctx, OUTER, INNER, null, &outer, null, &inner);
@@ -3226,7 +3226,7 @@ test "TASK-126: inner 端到達後の残量は outer へ伝播" {
     try std.testing.expect(outer.y > outer_before);
 }
 
-test "TASK-126: inner が端でないとき outer は不変" {
+test "scrollArea: outer unchanged while inner is not at an edge" {
     var ctx = testCtx();
     defer ctx.deinit();
     const OUTER: Id = 0x12631;
@@ -3250,7 +3250,7 @@ test "TASK-126: inner が端でないとき outer は不変" {
     try std.testing.expectEqual(outer_before, outer.y);
 }
 
-test "TASK-126: viewport 外の wheel はどの ScrollArea も動かない" {
+test "scrollArea: wheel outside any viewport moves no ScrollArea" {
     var ctx = testCtx();
     defer ctx.deinit();
     const OUTER: Id = 0x12641;
@@ -3271,7 +3271,7 @@ test "TASK-126: viewport 外の wheel はどの ScrollArea も動かない" {
     try std.testing.expectEqual(inner_y0, inner.y);
 }
 
-test "TASK-126: 非ネスト ScrollArea の wheel / clamp / thumb は従来どおり" {
+test "scrollArea: non-nested wheel / clamp / thumb behave as before" {
     var ctx = testCtx();
     defer ctx.deinit();
     const SID: Id = 0x12651;
@@ -3335,35 +3335,35 @@ test "TASK-126: 非ネスト ScrollArea の wheel / clamp / thumb は従来ど�
     try std.testing.expect(scroll.y > before);
 }
 
-// ── Checkbox / Toggle / Radio テスト（TASK-48）────────────────
+// ── Checkbox / Toggle / Radio tests ────────────────
 
-test "checkbox: クリックで *bool を反転し changed(=clicked) を返す" {
+test "checkbox: click flips *bool and returns changed(=clicked)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v = false;
     const ID: Id = 0xCB01;
 
-    // frame1: キャッシュ生成（初回は非ヒット）
+    // frame1: build cache (first frame is a non-hit)
     ctx.beginFrame(200, 40);
     try std.testing.expect(!ctx.checkboxId(ID, "Enable", &v));
     ctx.endFrame();
     try std.testing.expect(!v);
     const c = center(ctx.getNodeRect(ID).?);
 
-    // frame2: click → true・v=true
+    // frame2: click → true, v=true
     ctx.beginFrame(200, 40);
     clickAt(&ctx, c.x, c.y);
     try std.testing.expect(ctx.checkboxId(ID, "Enable", &v));
     ctx.endFrame();
     try std.testing.expect(v);
 
-    // frame3: 入力なし → false・v 不変（edge）
+    // frame3: no input → false, v unchanged (edge)
     ctx.beginFrame(200, 40);
     try std.testing.expect(!ctx.checkboxId(ID, "Enable", &v));
     ctx.endFrame();
     try std.testing.expect(v);
 
-    // frame4: 再 click → true・v=false（再反転）
+    // frame4: click again → true, v=false (flip again)
     ctx.beginFrame(200, 40);
     clickAt(&ctx, c.x, c.y);
     try std.testing.expect(ctx.checkboxId(ID, "Enable", &v));
@@ -3371,7 +3371,7 @@ test "checkbox: クリックで *bool を反転し changed(=clicked) を返す" 
     try std.testing.expect(!v);
 }
 
-test "checkbox: hit 領域が glyph+label の箱全体（glyph 外の label 側 click で反応）" {
+test "checkbox: hit region is the whole glyph+label box (label-side click responds)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v = false;
@@ -3382,15 +3382,15 @@ test "checkbox: hit 領域が glyph+label の箱全体（glyph 外の label 側 
     ctx.endFrame();
     const rect = ctx.getNodeRect(ID).?;
 
-    // 箱幅は glyph(size) より広い（label 分）＝箱全体が hit 域である前提
+    // Box wider than glyph(size) by the label → whole box is the hit region
     const size = ctx.style.checkbox_size;
     try std.testing.expect(rect.w > @as(u32, @intCast(size)));
 
-    // glyph の右外＝label 側の座標を click → 反応する（glyph だけに id を付けた誤実装なら反応しない）
+    // Click to the right of the glyph (label side) → responds (would not if id were on glyph only)
     const lx = rect.x + size + ctx.style.checkbox_gap + 4;
     const ly = rect.y + @as(i32, @intCast(rect.h / 2));
-    try std.testing.expect(lx > rect.x + size); // glyph より右
-    try std.testing.expect(lx < rect.x + @as(i32, @intCast(rect.w))); // まだ箱の中
+    try std.testing.expect(lx > rect.x + size); // Right of the glyph
+    try std.testing.expect(lx < rect.x + @as(i32, @intCast(rect.w))); // Still inside the box
 
     ctx.beginFrame(200, 40);
     clickAt(&ctx, lx, ly);
@@ -3399,7 +3399,7 @@ test "checkbox: hit 領域が glyph+label の箱全体（glyph 外の label 側 
     try std.testing.expect(v);
 }
 
-test "checkbox: ON/OFF で glyph 内側中心のピクセルが変わる（AC）" {
+test "checkbox: ON/OFF changes the pixel at the glyph inner center" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v_on = true;
@@ -3420,14 +3420,14 @@ test "checkbox: ON/OFF で glyph 内側中心のピクセルが変わる（AC）
     const on = ctx.getNodeRect(0xA1).?;
     const off = ctx.getNodeRect(0xA2).?;
     const half: u32 = @intCast(@divTrunc(ctx.style.checkbox_size, 2));
-    // glyph は row box の左端・縦中央。glyph 中心 = (box.x + size/2, box.y + box.h/2)
+    // Glyph at left of row box, vertically centered. Glyph center = (box.x + size/2, box.y + box.h/2)
     const on_i = (@as(u32, @intCast(on.y)) + on.h / 2) * 200 + @as(u32, @intCast(on.x)) + half;
     const off_i = (@as(u32, @intCast(off.y)) + off.h / 2) * 200 + @as(u32, @intCast(off.x)) + half;
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[on_i]); // ON=accent 塗り
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[off_i]); // OFF=box 内部
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[on_i]); // ON = accent fill
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[off_i]); // OFF = box interior
 }
 
-test "toggle: ON/OFF で knob 位置と track 色が変わる（AC）" {
+test "toggle: ON/OFF changes knob position and track color" {
     var ctx = testCtx();
     defer ctx.deinit();
     var v_on = true;
@@ -3447,8 +3447,8 @@ test "toggle: ON/OFF で knob 位置と track 色が変わる（AC）" {
 
     const style = ctx.style;
     const side = @max(1, style.switch_h - 2 * ToggleGlyph.margin);
-    const left_off: i32 = ToggleGlyph.margin + @divTrunc(side, 2); // OFF knob 中心 x（glyph 左端からの相対）
-    const right_off: i32 = style.switch_w - ToggleGlyph.margin - @divTrunc(side, 2); // ON knob 中心 x（同上）
+    const left_off: i32 = ToggleGlyph.margin + @divTrunc(side, 2); // OFF knob center x (relative to glyph left)
+    const right_off: i32 = style.switch_w - ToggleGlyph.margin - @divTrunc(side, 2); // ON knob center x (same)
     const knob: u32 = @bitCast(style.slider_knob_bg);
     const track_on: u32 = @bitCast(style.bg_active);
     const track_off: u32 = @bitCast(style.slider_track_bg);
@@ -3458,15 +3458,15 @@ test "toggle: ON/OFF で knob 位置と track 色が変わる（AC）" {
     const on_y: u32 = @intCast(on.y + @as(i32, @intCast(on.h / 2)));
     const off_y: u32 = @intCast(off.y + @as(i32, @intCast(off.h / 2)));
 
-    // ON: 右に knob / 左は track_on
+    // ON: knob on the right / left is track_on
     try std.testing.expectEqual(knob, pixels[on_y * 200 + @as(u32, @intCast(on.x + right_off))]);
     try std.testing.expectEqual(track_on, pixels[on_y * 200 + @as(u32, @intCast(on.x + left_off))]);
-    // OFF: 左に knob / 右は track_off
+    // OFF: knob on the left / right is track_off
     try std.testing.expectEqual(knob, pixels[off_y * 200 + @as(u32, @intCast(off.x + left_off))]);
     try std.testing.expectEqual(track_off, pixels[off_y * 200 + @as(u32, @intCast(off.x + right_off))]);
 }
 
-test "radio: selected の中心ドットが accent・非 selected は box 内部色（AC）" {
+test "radio: selected center dot is accent; non-selected is box interior color" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -3487,35 +3487,35 @@ test "radio: selected の中心ドットが accent・非 selected は box 内部
     const half: u32 = @intCast(@divTrunc(ctx.style.radio_size, 2));
     const sel_i = (@as(u32, @intCast(sel.y)) + sel.h / 2) * 200 + @as(u32, @intCast(sel.x)) + half;
     const uns_i = (@as(u32, @intCast(uns.y)) + uns.h / 2) * 200 + @as(u32, @intCast(uns.x)) + half;
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[sel_i]); // selected=中心ドット
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[uns_i]); // 非 selected=中空
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[sel_i]); // selected = center dot
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[uns_i]); // non-selected = hollow
 }
 
-test "radio: clicked を返す（selected 済みの再クリックでも activated）" {
+test "radio: returns clicked (activated even when already selected)" {
     var ctx = testCtx();
     defer ctx.deinit();
     const ID: Id = 0x4A03;
 
-    // frame1: 非 selected で登録
+    // frame1: register while non-selected
     ctx.beginFrame(200, 40);
     _ = ctx.radioId(ID, "X", false);
     ctx.endFrame();
     const c = center(ctx.getNodeRect(ID).?);
 
-    // frame2: 非 selected を click → true（activated）
+    // frame2: click non-selected → true (activated)
     ctx.beginFrame(200, 40);
     clickAt(&ctx, c.x, c.y);
     try std.testing.expect(ctx.radioId(ID, "X", false));
     ctx.endFrame();
 
-    // frame3: selected 済みを再 click → やはり true（changed ではなく activated）
+    // frame3: click again while selected → still true (activated, not changed)
     ctx.beginFrame(200, 40);
     clickAt(&ctx, c.x, c.y);
     try std.testing.expect(ctx.radioId(ID, "X", true));
     ctx.endFrame();
 }
 
-test "radio group: caller パターンで排他選択（clicked のみ true・選択が移る）" {
+test "radio group: caller pattern for exclusive selection (only clicked true; selection moves)" {
     var ctx = testCtx();
     defer ctx.deinit();
     const Sel = enum { a, b };
@@ -3533,13 +3533,13 @@ test "radio group: caller パターンで排他選択（clicked のみ true・�
         }
     }.f;
 
-    // frame1: 構築（初期 .a）
+    // frame1: build (initial .a)
     ctx.beginFrame(200, 40);
     build(&ctx, &sel, &res);
     ctx.endFrame();
     try std.testing.expectEqual(Sel.a, sel);
 
-    // frame2: B を click → res[1] のみ true・sel が .b へ移る
+    // frame2: click B → only res[1] true; sel moves to .b
     const cb = center(ctx.getNodeRect(0xE2).?);
     ctx.beginFrame(200, 40);
     clickAt(&ctx, cb.x, cb.y);
@@ -3550,7 +3550,7 @@ test "radio group: caller パターンで排他選択（clicked のみ true・�
     try std.testing.expectEqual(Sel.b, sel);
 }
 
-test "TextInput: focus、char_input、invalid scalar、Cmd+C、外側解除" {
+test "TextInput: focus, char_input, invalid scalar, Cmd+C, clear on outside" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "ab");
@@ -3592,7 +3592,7 @@ test "TextInput: focus、char_input、invalid scalar、Cmd+C、外側解除" {
     try std.testing.expectEqual(@as(Id, 0), ctx.focusedId());
 }
 
-test "TextInput: 横スクロールは caret を viewport に追従" {
+test "TextInput: horizontal scroll keeps the caret in the viewport" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "0123456789");
@@ -3614,7 +3614,7 @@ test "TextInput: 横スクロールは caret を viewport に追従" {
     ctx.endFrame();
 }
 
-test "TextInput: caret blink は仮想時刻だけで決定" {
+test "TextInput: caret blink is decided from virtual time alone" {
     try std.testing.expect(blinkVisible(0.0, 0.0));
     try std.testing.expect(blinkVisible(0.49, 0.0));
     try std.testing.expect(!blinkVisible(0.5, 0.0));
@@ -3652,7 +3652,7 @@ fn countDrawLines(cmds: []const draw_mod.DrawCmd) usize {
     return n;
 }
 
-test "TextInput: composition start/update で TextBuffer 不変・preedit 描画と下線" {
+test "TextInput: composition start/update leaves TextBuffer unchanged; draws preedit and underline" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "ab");
@@ -3675,7 +3675,7 @@ test "TextInput: composition start/update で TextBuffer 不変・preedit 描画
     try std.testing.expect(countDrawLines(ctx.draw_list.cmds.items) >= 1);
 }
 
-test "TextInput: preedit cursor は UTF-8 境界へ clamp され caret_rect.x が追従" {
+test "TextInput: preedit cursor clamps to UTF-8 boundaries and caret_rect.x follows" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "");
@@ -3685,7 +3685,7 @@ test "TextInput: preedit cursor は UTF-8 境界へ clamp され caret_rect.x �
     ctx.beginFrameAt(240, 120, 0);
     focusTextInput(&ctx, id, &buffer);
 
-    // "日本" = 6 bytes。cursor=4 は 2 文字目先頭、cursor=5 は継続バイトなので 4 へ clamp。
+    // CJK fixture below = 6 bytes. cursor=4 is start of 2nd char; cursor=5 is a continuation byte → clamp to 4.
     ctx.beginFrameAt(240, 120, 0.2);
     ctx.setComposition(.{ .active = true, .text = "日本", .cursor = 4 });
     const at_boundary = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
@@ -3711,7 +3711,7 @@ test "TextInput: preedit cursor は UTF-8 境界へ clamp され caret_rect.x �
     ctx.endFrame();
 }
 
-test "TextInput: composition 中は編集キー抑止・char_input は挿入" {
+test "TextInput: during composition, edit keys are suppressed; char_input still inserts" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "xy");
@@ -3745,7 +3745,7 @@ test "TextInput: composition 中は編集キー抑止・char_input は挿入" {
     ctx.endFrame();
 }
 
-test "TextInput: commit 後 preedit 消え TextBuffer 残存 / cancel で不変" {
+test "TextInput: after commit preedit clears and TextBuffer remains; cancel leaves it unchanged" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "");
@@ -3755,7 +3755,7 @@ test "TextInput: commit 後 preedit 消え TextBuffer 残存 / cancel で不変"
     ctx.beginFrameAt(240, 120, 0);
     focusTextInput(&ctx, id, &buffer);
 
-    // commit 相当: composition を下ろし char_input で確定
+    // Commit-like: clear composition and confirm via char_input
     ctx.beginFrameAt(240, 120, 0.2);
     ctx.setComposition(.{ .active = false, .text = "", .cursor = 0 });
     ctx.pushEvent(.{ .char_input = .{ .codepoint = '日', .modifiers = 0 } });
@@ -3766,7 +3766,7 @@ test "TextInput: commit 後 preedit 消え TextBuffer 残存 / cancel で不変"
     try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "に"));
     try std.testing.expectEqual(@as(usize, 0), countDrawLines(ctx.draw_list.cmds.items));
 
-    // cancel 相当: preedit 表示後に active=false、buffer 不変
+    // Cancel-like: after showing preedit, active=false; buffer unchanged
     const before = try std.testing.allocator.dupe(u8, buffer.slice());
     defer std.testing.allocator.free(before);
     ctx.beginFrameAt(240, 120, 0.3);
@@ -3783,7 +3783,7 @@ test "TextInput: commit 後 preedit 消え TextBuffer 残存 / cancel で不変"
     try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "変"));
 }
 
-test "TextInput: preedit caret が viewport 外なら scroll 追従" {
+test "TextInput: scroll follows when the preedit caret is outside the viewport" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "");
@@ -3799,7 +3799,7 @@ test "TextInput: preedit caret が viewport 外なら scroll 追従" {
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
     ctx.endFrame();
 
-    // 長い preedit + cursor 末尾 → scroll が追従
+    // Long preedit + cursor at end → scroll follows
     const long_preedit = "あいうえおかきくけこ";
     ctx.beginFrameAt(160, 80, 0.2);
     ctx.setComposition(.{ .active = true, .text = long_preedit, .cursor = long_preedit.len });
@@ -3808,7 +3808,7 @@ test "TextInput: preedit caret が viewport 外なら scroll 追従" {
     ctx.endFrame();
 }
 
-test "TextInput: beginFrame 後 composition は stale にならない" {
+test "TextInput: composition is not stale after beginFrame" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "");
@@ -3824,7 +3824,7 @@ test "TextInput: beginFrame 後 composition は stale にならない" {
     ctx.endFrame();
     try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "あ") >= 1);
 
-    // setComposition せず beginFrame → 空状態へリセット
+    // beginFrame without setComposition → reset to empty
     ctx.beginFrameAt(240, 120, 0.3);
     try std.testing.expect(!ctx.composition.active);
     try std.testing.expectEqual(@as(usize, 0), ctx.composition.text.len);
@@ -3833,8 +3833,8 @@ test "TextInput: beginFrame 後 composition は stale にならない" {
     try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "あ"));
 }
 
-test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
-    // line_height > ascent+descent の Font（outline 相当の line_gap を模擬）。
+test "TextInput: uses ascent+descent for content height" {
+    // Font with line_height > ascent+descent (simulates outline-like line_gap).
     const OutlineLike = struct {
         fn measure(_: *const anyopaque, text: []const u8) u32 {
             var n: u32 = 0;
@@ -3856,7 +3856,7 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
             _: f32,
         ) void {}
         fn metrics(_: *const anyopaque) font_mod.Metrics {
-            // ink=18, line_height=24 → 旧実装なら box=32、新実装は box=26
+            // ink=18, line_height=24 → old impl box=32; new impl box=26
             return .{ .line_height = 24, .ascent = 14, .descent = 4 };
         }
         const vtable: font_mod.Font.VTable = .{
@@ -3882,7 +3882,7 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
     const node = ctx.getNodeRect(id).?;
     try std.testing.expectEqual(expected_h, @as(i32, @intCast(node.h)));
 
-    // focus + selection + preedit で本文 y / selection y / caret y·h / 下線 / caret_rect を共有確認
+    // With focus + selection + preedit, body y / selection y / caret y·h / underline / caret_rect share the same basis
     ctx.beginFrameAt(240, 120, 0.1);
     clickAt(&ctx, node.x + 8, node.y + 8);
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
@@ -3895,7 +3895,7 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
     const r = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     ctx.endFrame();
 
-    const text_y = node.y + pad_top; // vertical_offset = 0（content_h == ink）
+    const text_y = node.y + pad_top; // vertical_offset = 0 (content_h == ink)
     try std.testing.expect(r.caret_rect != null);
     try std.testing.expectEqual(pad_top, r.caret_rect.?.y);
     try std.testing.expectEqual(@as(u32, @intCast(ink)), r.caret_rect.?.h);
@@ -3924,7 +3924,7 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
             }
         },
         .line => |ln| {
-            // preedit 下線: baseline = text_y + ascent + 2
+            // Preedit underline: baseline = text_y + ascent + 2
             try std.testing.expectEqual(text_y + 14 + 2, ln.p0.y);
             try std.testing.expectEqual(ln.p0.y, ln.p1.y);
             saw_underline = true;
@@ -3937,8 +3937,8 @@ test "TASK-118: TextInput は ascent+descent を content 高さに使う" {
     try std.testing.expect(saw_underline);
 }
 
-test "TASK-167: selectableLabel は ink 高さと selection/text の y を一致させる" {
-    // line_height=24, ink=18 の gap font。box/selection/text がすべて ink 基準。
+test "selectableLabel: ink height matches selection/text y" {
+    // Gap font with line_height=24, ink=18. box/selection/text all ink-based.
     const GapLike = struct {
         fn measure(_: *const anyopaque, text: []const u8) u32 {
             return 8 * @as(u32, @intCast(text.len));
@@ -3976,7 +3976,7 @@ test "TASK-167: selectableLabel は ink 高さと selection/text の y を一致
     try std.testing.expectEqual(ink, @as(i32, @intCast(node.h)));
     try std.testing.expectEqual(@as(u32, 40), node.w); // 5 * 8
 
-    // selection を付けて text/selection の y・h を確認
+    // With selection, check text/selection y and h
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 5 };
     ctx.beginFrameAt(320, 80, 0.1);
     _ = selectableLabelId(&ctx, id, "hello", .{});
@@ -4002,7 +4002,7 @@ test "TASK-167: selectableLabel は ink 高さと selection/text の y を一致
     try std.testing.expect(saw_sel);
 }
 
-test "TASK-167: button 内 label は ink 高さを持ち line_gap を含めない" {
+test "button label uses ink height and excludes line_gap" {
     const GapLike = struct {
         fn measure(_: *const anyopaque, text: []const u8) u32 {
             return 8 * @as(u32, @intCast(text.len));
@@ -4030,7 +4030,7 @@ test "TASK-167: button 内 label は ink 高さを持ち line_gap を含めな�
     var ctx = Context.init(std.testing.allocator, GapLike.font);
     defer ctx.deinit();
     const id: Id = 0xD1672;
-    // default button_padding は style 由来。content = ink=18、box = pad_v + 18
+    // Default button_padding comes from style. content = ink=18, box = pad_v + 18
     const pad = ctx.style.button_padding; // [top, right, bottom, left]
     const ink: i32 = 18;
     const expected_h: i32 = pad[0] + ink + pad[2];
@@ -4042,8 +4042,8 @@ test "TASK-167: button 内 label は ink 高さを持ち line_gap を含めな�
     const node = ctx.getNodeRect(id).?;
     try std.testing.expectEqual(expected_h, @as(i32, @intCast(node.h)));
 
-    // text command y = box.y + pad_top（label が fit で中央揃えになる前の leaf 配置は
-    // box が column/row default に依存。button は label を直接置く row-like fit box）。
+    // text command y = box.y + pad_top (leaf placement before label centers in a fit box
+    // depends on column/row defaults; button places the label in a row-like fit box).
     var saw = false;
     for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
         .text => |t| {
@@ -4057,7 +4057,7 @@ test "TASK-167: button 内 label は ink 高さを持ち line_gap を含めな�
     try std.testing.expect(saw);
 }
 
-test "TASK-119: TextInput Cmd/Option navigation" {
+test "TextInput: Cmd/Option navigation" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "hello world");
@@ -4066,11 +4066,11 @@ test "TASK-119: TextInput Cmd/Option navigation" {
 
     ctx.beginFrameAt(320, 120, 0);
     focusTextInput(&ctx, id, &buffer);
-    // caret を先頭へ
+    // Move caret to start
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 0 };
     ctx.perIdState(id).caret = 0;
 
-    // Option+→ → "hello" 末尾 (5)
+    // Option+→ → end of "hello" (5)
     ctx.beginFrameAt(320, 120, 0.2);
     ctx.pushEvent(.{ .key_down = .{ .code = 264, .modifiers = 0x04, .repeat = false } });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 200 } });
@@ -4084,7 +4084,7 @@ test "TASK-119: TextInput Cmd/Option navigation" {
     try std.testing.expectEqual(TextRange{ .start = 5, .end = 11 }, ext.selection);
     ctx.endFrame();
 
-    // 非 Shift 右で collapse to end
+    // Non-Shift right collapses to end
     ctx.beginFrameAt(320, 120, 0.4);
     ctx.pushEvent(.{ .key_down = .{ .code = 264, .modifiers = 0, .repeat = false } });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 200 } });
@@ -4092,28 +4092,28 @@ test "TASK-119: TextInput Cmd/Option navigation" {
     try std.testing.expectEqual(TextRange{ .start = 11, .end = 11 }, ctx.perIdState(id).selection.normalized());
     ctx.endFrame();
 
-    // Cmd+← → 行頭
+    // Cmd+← → line start
     ctx.beginFrameAt(320, 120, 0.5);
     ctx.pushEvent(.{ .key_down = .{ .code = 263, .modifiers = 0x08, .repeat = false } });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 200 } });
     try std.testing.expectEqual(@as(usize, 0), ctx.perIdState(id).caret);
     ctx.endFrame();
 
-    // Cmd+Shift+→ → 全選択相当 0:11
+    // Cmd+Shift+→ → select-all equivalent 0:11
     ctx.beginFrameAt(320, 120, 0.6);
     ctx.pushEvent(.{ .key_down = .{ .code = 264, .modifiers = 0x08 | 0x01, .repeat = false } });
     const line_sel = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 200 } });
     try std.testing.expectEqual(TextRange{ .start = 0, .end = 11 }, line_sel.selection);
     ctx.endFrame();
 
-    // 非 Shift 左で collapse to start
+    // Non-Shift left collapses to start
     ctx.beginFrameAt(320, 120, 0.7);
     ctx.pushEvent(.{ .key_down = .{ .code = 263, .modifiers = 0, .repeat = false } });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 200 } });
     try std.testing.expectEqual(@as(usize, 0), ctx.perIdState(id).caret);
     ctx.endFrame();
 
-    // Cmd+A 全選択
+    // Cmd+A select-all
     ctx.beginFrameAt(320, 120, 0.8);
     ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0x08, .repeat = false } });
     const all = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 200 } });
@@ -4121,7 +4121,7 @@ test "TASK-119: TextInput Cmd/Option navigation" {
     try std.testing.expectEqual(@as(usize, 11), ctx.perIdState(id).caret);
     ctx.endFrame();
 
-    // Option+← from end → "world" 先頭 (6)
+    // Option+← from end → start of "world" (6)
     ctx.perIdState(id).selection = .{ .anchor = 11, .extent = 11 };
     ctx.perIdState(id).caret = 11;
     ctx.beginFrameAt(320, 120, 0.9);
@@ -4131,7 +4131,7 @@ test "TASK-119: TextInput Cmd/Option navigation" {
     ctx.endFrame();
 }
 
-test "TASK-119: composition 中の標準操作 gating" {
+test "TextInput: standard-operation gating during composition" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "xy");
@@ -4143,7 +4143,7 @@ test "TASK-119: composition 中の標準操作 gating" {
     ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
     ctx.perIdState(id).caret = 2;
 
-    // composition 中: 移動・編集・Cmd/Option 変形・Cmd+A・Cmd+C/X/V は不変。
+    // During composition: move/edit/Cmd/Option variants/Cmd+A/Cmd+C/X/V leave state unchanged.
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 2 };
     ctx.perIdState(id).caret = 2;
     ctx.beginFrameAt(240, 120, 0.2);
@@ -4155,27 +4155,27 @@ test "TASK-119: composition 中の標準操作 gating" {
     ctx.pushEvent(.{ .key_down = .{ .code = 263, .modifiers = 0x04 | 0x01, .repeat = false } }); // Opt+Shift+LEFT
     ctx.pushEvent(.{ .key_down = .{ .code = 269, .modifiers = 0, .repeat = false } }); // HOME
     ctx.pushEvent(.{ .key_down = .{ .code = 270, .modifiers = 0, .repeat = false } }); // END
-    ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0x08, .repeat = false } }); // Cmd+A 抑止
-    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } }); // Cmd+C 抑止
-    ctx.pushEvent(.{ .key_down = .{ .code = 'X', .modifiers = 0x08, .repeat = false } }); // Cmd+X 抑止
-    ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = false } }); // Cmd+V 抑止
+    ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0x08, .repeat = false } }); // Suppress Cmd+A
+    ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } }); // Suppress Cmd+C
+    ctx.pushEvent(.{ .key_down = .{ .code = 'X', .modifiers = 0x08, .repeat = false } }); // Suppress Cmd+X
+    ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = false } }); // Suppress Cmd+V
     const mid = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 }, .paste_text = "ZZ" });
     try std.testing.expectEqualStrings("xy", buffer.slice());
     try std.testing.expectEqual(@as(usize, 2), ctx.perIdState(id).caret);
-    try std.testing.expectEqual(TextRange{ .start = 0, .end = 2 }, mid.selection); // Cmd+A で変わらない
+    try std.testing.expectEqual(TextRange{ .start = 0, .end = 2 }, mid.selection); // Unchanged under Cmd+A
     try std.testing.expect(mid.copy_request == null);
     ctx.endFrame();
 
-    // char_input は composition 中も挿入される
+    // char_input still inserts during composition
     ctx.beginFrameAt(240, 120, 0.3);
     ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
     ctx.pushEvent(.{ .char_input = .{ .codepoint = 'Z', .modifiers = 0 } });
     const inserted = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     try std.testing.expect(inserted.changed);
-    try std.testing.expectEqualStrings("Z", buffer.slice()); // 選択 0:2 を置換
+    try std.testing.expectEqualStrings("Z", buffer.slice()); // Replace selection 0:2
     ctx.endFrame();
 
-    // composition 解除後の Cmd+A は全選択
+    // After clearing composition, Cmd+A selects all
     ctx.beginFrameAt(240, 120, 0.4);
     ctx.setComposition(.{});
     ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0x08, .repeat = false } });
@@ -4184,7 +4184,7 @@ test "TASK-119: composition 中の標準操作 gating" {
     ctx.endFrame();
 }
 
-test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
+test "TextInput: Cmd+C/X/V and repeat suppression" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "hello");
@@ -4196,7 +4196,7 @@ test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 5 };
     ctx.perIdState(id).caret = 5;
 
-    // 選択なし Cmd+C は no-op
+    // Cmd+C with no selection is a no-op
     ctx.beginFrameAt(320, 120, 0.1);
     ctx.perIdState(id).selection = .{ .anchor = 2, .extent = 2 };
     ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
@@ -4204,7 +4204,7 @@ test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
     try std.testing.expect(none.copy_request == null);
     ctx.endFrame();
 
-    // 選択あり Cmd+C
+    // Cmd+C with a selection
     ctx.beginFrameAt(320, 120, 0.2);
     ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 4 };
     ctx.pushEvent(.{ .key_down = .{ .code = 'C', .modifiers = 0x08, .repeat = false } });
@@ -4215,7 +4215,7 @@ test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
     try std.testing.expectEqualStrings("hello", buffer.slice());
     ctx.endFrame();
 
-    // Cmd+X: request + 削除
+    // Cmd+X: request + delete
     ctx.beginFrameAt(320, 120, 0.3);
     ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 4 };
     ctx.pushEvent(.{ .key_down = .{ .code = 'X', .modifiers = 0x08, .repeat = false } });
@@ -4228,7 +4228,7 @@ test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
     try std.testing.expect(cut.changed);
     ctx.endFrame();
 
-    // Cmd+V: selection 置換、caret は末尾
+    // Cmd+V: replace selection; caret at end
     ctx.beginFrameAt(320, 120, 0.4);
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 2 };
     ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = false } });
@@ -4238,7 +4238,7 @@ test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
     try std.testing.expectEqual(TextRange{ .start = 1, .end = 1 }, pasted.selection);
     ctx.endFrame();
 
-    // repeat key-down は二重実行しない
+    // repeat key-down must not run twice
     ctx.beginFrameAt(320, 120, 0.5);
     ctx.perIdState(id).selection = .{ .anchor = 0, .extent = 1 };
     ctx.pushEvent(.{ .key_down = .{ .code = 'V', .modifiers = 0x08, .repeat = true } });
@@ -4248,7 +4248,7 @@ test "TASK-120: TextInput Cmd+C/X/V と repeat 抑止" {
     ctx.endFrame();
 }
 
-test "TASK-120: 非 focus TextInput は clipboard key を消費しない" {
+test "TextInput: unfocused field does not consume clipboard keys" {
     var ctx = testCtx();
     defer ctx.deinit();
     var a = try TextBuffer.init(std.testing.allocator, "AA");
@@ -4281,7 +4281,7 @@ test "TASK-120: 非 focus TextInput は clipboard key を消費しない" {
     ctx.endFrame();
 }
 
-test "TASK-120: composition 終了後に C/X/V が再び有効" {
+test "TextInput: C/X/V work again after composition ends" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "ab");
@@ -4308,7 +4308,7 @@ test "TASK-120: composition 終了後に C/X/V が再び有効" {
     ctx.endFrame();
 }
 
-test "TextInput: composition は focused のみ消費（非 focus は preedit 非描画・キー抑止なし）" {
+test "TextInput: only focused consumes composition (unfocused: no preedit draw, no key suppress)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var a = try TextBuffer.init(std.testing.allocator, "A");
@@ -4328,7 +4328,7 @@ test "TextInput: composition は focused のみ消費（非 focus は preedit �
     const rect_a = ctx.getNodeRect(id_a).?;
     const rect_b = ctx.getNodeRect(id_b).?;
 
-    // A に focus + composition → A のみ preedit
+    // Focus A + composition → preedit only on A
     ctx.beginFrameAt(320, 160, 0.1);
     clickAt(&ctx, rect_a.x + 8, rect_a.y + 8);
     ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
@@ -4339,7 +4339,7 @@ test "TextInput: composition は focused のみ消費（非 focus は preedit �
     ctx.endFrame();
     try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "あ"));
 
-    // B に focus を移してから composition を載せる（同一 frame の press 競合を避ける）
+    // Move focus to B before loading composition (avoid same-frame press race)
     ctx.beginFrameAt(320, 160, 0.2);
     clickAt(&ctx, rect_b.x + 8, rect_b.y + 8);
     ctx.beginBox(.{ .direction = .column, .gap = 8 });
@@ -4358,11 +4358,11 @@ test "TextInput: composition は focused のみ消費（非 focus は preedit �
     ctx.endBox();
     ctx.endFrame();
     try std.testing.expectEqualStrings("A", a.slice());
-    try std.testing.expectEqualStrings("B", b.slice()); // B focused + composing → Backspace 抑止
+    try std.testing.expectEqualStrings("B", b.slice()); // B focused + composing → Backspace suppressed
     try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "い"));
     try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "あ"));
 
-    // B の composition を下ろし、非 composition なら B の Backspace が効く
+    // Clear B’s composition; without composition, Backspace on B works
     ctx.perIdState(id_b).selection = .{ .anchor = 1, .extent = 1 };
     ctx.perIdState(id_b).caret = 1;
     ctx.beginFrameAt(320, 160, 0.3);
@@ -4376,7 +4376,7 @@ test "TextInput: composition は focused のみ消費（非 focus は preedit �
     try std.testing.expectEqualStrings("", b.slice());
 }
 
-test "TASK-128: TextInput typed char が上限で拒否" {
+test "TextInput: typed char rejected at the limit" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "ab");
@@ -4397,7 +4397,7 @@ test "TASK-128: TextInput typed char が上限で拒否" {
     ctx.endFrame();
 }
 
-test "TASK-128: TextInput 上限未満の typed char は挿入" {
+test "TextInput: typed char below the limit is inserted" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "a");
@@ -4418,7 +4418,7 @@ test "TASK-128: TextInput 上限未満の typed char は挿入" {
     ctx.endFrame();
 }
 
-test "TASK-128: TextInput selection replacement は空いた容量を利用" {
+test "TextInput: selection replacement uses freed capacity" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "abcd");
@@ -4439,7 +4439,7 @@ test "TASK-128: TextInput selection replacement は空いた容量を利用" {
     ctx.endFrame();
 }
 
-test "TASK-128: TextInput paste が codepoint 単位で切り詰め" {
+test "TextInput: paste truncates by codepoint" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "ab");
@@ -4460,7 +4460,7 @@ test "TASK-128: TextInput paste が codepoint 単位で切り詰め" {
     ctx.endFrame();
 }
 
-test "TASK-128: composition 中 char_input も上限付き" {
+test "TextInput: char_input during composition also respects the limit" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "xy");
@@ -4480,11 +4480,11 @@ test "TASK-128: composition 中 char_input も上限付き" {
     try std.testing.expect(!r.changed);
     try std.testing.expectEqualStrings("xy", buffer.slice());
     ctx.endFrame();
-    // preedit 自体は max_len で切らない
+    // Preedit itself is not truncated by max_len
     try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "あ") >= 1);
 }
 
-test "TASK-128: composition confirm 後 TextBuffer のみ上限内" {
+test "TextInput: after composition confirm only TextBuffer is within the limit" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "a");
@@ -4497,7 +4497,7 @@ test "TASK-128: composition confirm 後 TextBuffer のみ上限内" {
     ctx.perIdState(id).selection = .{ .anchor = 1, .extent = 1 };
     ctx.perIdState(id).caret = 1;
 
-    // commit 相当: composition 下ろし + char_input 2 つ（2 文字目は上限で拒否）
+    // Commit-like: clear composition + two char_inputs (2nd rejected by the limit)
     ctx.beginFrameAt(240, 120, 0.2);
     ctx.setComposition(.{ .active = false, .text = "", .cursor = 0 });
     ctx.pushEvent(.{ .char_input = .{ .codepoint = '日', .modifiers = 0 } });
@@ -4508,7 +4508,7 @@ test "TASK-128: composition confirm 後 TextBuffer のみ上限内" {
     try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "に"));
 }
 
-test "TASK-128: max_len=null で既存 TextInput 挙動不変" {
+test "TextInput: max_len=null leaves existing TextInput behavior unchanged" {
     var ctx = testCtx();
     defer ctx.deinit();
     var buffer = try TextBuffer.init(std.testing.allocator, "ab");
