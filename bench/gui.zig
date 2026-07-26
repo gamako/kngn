@@ -1,8 +1,8 @@
-//! GUI 描画（rect_filled / image / text）のマイクロベンチ（TASK-58）。
-//! `zig build bench-gui` で実行（ReleaseFast 固定・display 不要・OS 非依存）。
-//! ここのループは bench 実行時のみ走る（フレーム毎 / RT のホットパスではない）。
-//! public API（DrawList + gui.render）経由で計測する。
-//! 前後比較の運用: 出力行を backlog タスクの notes に転記して比較する。
+//! Micro-benchmark of GUI drawing (rect_filled / image / text).
+//! Run with `zig build bench-gui` (ReleaseFast; no display; OS-independent).
+//! This loop runs only during the bench (not a per-frame / RT hot path).
+//! Measured through the public API (DrawList + gui.render).
+//! For before/after comparison, record the output lines and compare them.
 
 const std = @import("std");
 const gui = @import("gui");
@@ -12,10 +12,10 @@ const W: u32 = 780;
 const H: u32 = 600;
 
 const Scenario = enum {
-    rect_opaque, // 不透明 rect_filled ×64（GUI 塗りの大半のケース）
-    rect_translucent, // 半透明 rect_filled ×64（blend 経路）
-    image_blit, // 128x128 画像 ×16（全 alpha 域混在）
-    text_draw, // ビットマップフォントテキスト ×40 行
+    rect_opaque, // Opaque rect_filled x64 (the common GUI fill case)
+    rect_translucent, // Semi-transparent rect_filled x64 (blend path)
+    image_blit, // 128x128 image x16 (mixed alpha range)
+    text_draw, // Bitmap-font text x40 lines
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(pixels);
     const target = gui.RenderTarget{ .pixels = pixels, .width = W, .height = H };
 
-    // image 用の乱数画素（透明/半透明/不透明を混在）
+    // Random pixels for image (mixed transparent / semi / opaque)
     const img = try gpa.alloc(u32, 128 * 128);
     defer gpa.free(img);
     var state: u32 = 0x1234_5678;
@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("\n=== GUI render benchmark (ReleaseFast, logical target {d}x{d}) ===\n", .{ W, H });
-    // TASK-156.4: scale matrix 1x / 1.5x / 2x（物理 target 寸法 = logical * scale の floor）
+    // scale matrix 1x / 1.5x / 2x (physical target size = floor(logical * scale))
     const scales = [_]f32{ 1.0, 1.5, 2.0 };
     for ([_]Scenario{ .rect_opaque, .rect_translucent, .image_blit, .text_draw }) |sc| {
         var dl = gui.DrawList.init(gpa);
@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         try buildScene(&dl, sc, img);
 
         for (scales) |s| {
-            // peak_bytes（TASK-156.5 R10）: この scale の物理 target 確保からのピーク
+            // peak_bytes: peak from allocating this scale's physical target
             tracker.reset();
             const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * s));
             const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(H)) * s));
@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}\n", .{ @tagName(sc), s, avg, min_ns, tracker.peak_bytes });
         }
     }
-    // 互換: scale=1 単独行も残す（target は論理=物理）
+    // Compat: keep a standalone scale=1 line (target logical = physical)
     _ = target;
     std.debug.print("\n", .{});
 }

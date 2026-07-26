@@ -1,13 +1,13 @@
-//! Canvas.composite / compositeStraight のマイクロベンチ（TASK-50）。
-//! `zig build bench-canvas` で実行（ReleaseFast 固定・display 不要・OS 非依存）。
-//! ここのループは bench 実行時のみ走る（フレーム毎 / RT のホットパスではない）。
-//! 前後比較の運用: 出力行を backlog タスクの notes に転記して比較する。
+//! Micro-benchmark of Canvas.composite / compositeStraight.
+//! Run with `zig build bench-canvas` (ReleaseFast; no display; OS-independent).
+//! This loop runs only during the bench (not a per-frame / RT hot path).
+//! For before/after comparison, record the output lines and compare them.
 
 const std = @import("std");
 const canvas_mod = @import("editor_canvas");
 const Canvas = canvas_mod.Canvas;
 
-/// 固定 seed の最小 LCG（決定的な画素充填が目的。std PRNG API に依存しない）。
+/// Tiny fixed-seed LCG (deterministic pixel fill; no dependency on std PRNG APIs).
 const Lcg = struct {
     state: u32,
     fn next(self: *Lcg) u32 {
@@ -18,8 +18,8 @@ const Lcg = struct {
 
 const Scenario = struct { w: u32, h: u32, layers: usize };
 const scenarios = [_]Scenario{
-    .{ .w = 256, .h = 256, .layers = 4 }, // 計測安定用（大きめ）
-    .{ .w = 64, .h = 64, .layers = 4 }, // pixie 実寸感
+    .{ .w = 256, .h = 256, .layers = 4 }, // Larger size for measurement stability
+    .{ .w = 64, .h = 64, .layers = 4 }, // Roughly pixie canvas scale
 };
 
 const Func = enum { composite, composite_straight };
@@ -43,26 +43,26 @@ fn benchScenario(io: std.Io, gpa: std.mem.Allocator, sc: Scenario, func: Func) !
     defer canvas.deinit();
     while (canvas.layers.items.len < sc.layers) _ = try canvas.addLayer(gpa);
 
-    // 全ブレンド分岐（透明 / 半透明 / 不透明 × layer opacity 255/200）を通す決定的な内容で充填
+    // Fill with deterministic content that hits every blend branch (transparent / semi / opaque x layer opacity 255/200)
     var rng = Lcg{ .state = 0x1234_5678 };
     for (canvas.layers.items, 0..) |layer, li| {
         for (layer.pixels) |*px| {
             const v = rng.next();
             const alpha: u32 = switch (v % 3) {
-                0 => 0x00, // 完全透明（早期 return 経路）
-                1 => 0x80, // 半透明（フルブレンド経路）
-                else => 0xFF, // 不透明（opaque 経路）
+                0 => 0x00, // Fully transparent (early-return path)
+                1 => 0x80, // Semi-transparent (full blend path)
+                else => 0xFF, // Opaque (opaque path)
             };
             px.* = (alpha << 24) | (v & 0x00FF_FFFF);
         }
         canvas.layers.items[li].opacity = if (li % 2 == 0) 255 else 200;
     }
 
-    // 反復回数: シナリオ毎のブレンド仕事量（層×画素）をほぼ一定に揃える
+    // Iteration count: roughly equalise blend work (layers x pixels) across scenarios
     const work: usize = @as(usize, sc.w) * sc.h * sc.layers;
     const iters: usize = @max(50, 100_000_000 / work);
 
-    // warmup（キャッシュ/分岐予測を温める。結果は捨てる）
+    // warmup (warm caches / branch prediction; discard results)
     _ = runOnce(&canvas, func);
 
     var total_ns: u64 = 0;
@@ -70,13 +70,13 @@ fn benchScenario(io: std.Io, gpa: std.mem.Allocator, sc: Scenario, func: Func) !
     var acc: u32 = 0;
     var i: usize = 0;
     while (i < iters) : (i += 1) {
-        // TASK-53 の composite_cache（無変更なら再合成しない）を無効化し、
-        // 毎反復でフル再合成を計測する（cache hit を測っては意味がない）
+        // Disable composite_cache (skip recompose when unchanged) so each
+        // iteration measures a full recompose (a cache hit would not be meaningful)
         canvas.markDirty();
         const start = std.Io.Clock.Timestamp.now(io, .awake);
         const out = runOnce(&canvas, func);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
-        // DCE 対策: 被計測関数の出力そのものを観測する（経過時間だけでは不十分）
+        // Anti-DCE: observe the measured function's output itself (elapsed time alone is not enough)
         acc +%= out[i % out.len];
         total_ns += ns;
         min_ns = @min(min_ns, ns);

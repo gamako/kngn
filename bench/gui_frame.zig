@@ -1,7 +1,7 @@
-//! Full Context frame benchmark (TASK-121.2).
-//! `zig build bench-gui-frame` で実行（ReleaseFast 固定・display 不要）。
-//! 測定範囲: beginFrame → widget 構築 → endFrame → gui.render
-//! ここのループは bench 実行時のみ走る（アプリ通常フレーム経路ではない）。
+//! Full Context frame benchmark.
+//! Run with `zig build bench-gui-frame` (ReleaseFast; no display).
+//! Scope: beginFrame -> widget build -> endFrame -> gui.render
+//! This loop runs only during the bench (not the app's normal frame path).
 
 const std = @import("std");
 const gui = @import("gui");
@@ -53,7 +53,7 @@ fn buildRows(ctx: *gui.Context, rows: *const RowLabels) void {
 }
 
 fn percentile95(sorted: []const u64) u64 {
-    // Plan: 昇順 950 番目（1-based）→ index 949 for N=1000
+    // Plan: 950th in ascending order (1-based) -> index 949 for N=1000
     const rank = @max(@as(usize, 1), (ITERS * 95) / 100);
     return sorted[rank - 1];
 }
@@ -129,8 +129,8 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, logical {d}x{d}) ===\n", .{ W, H });
     std.debug.print("measure: beginFrame + widget build + endFrame + gui.render (scale matrix)\n", .{});
-    // TASK-156.4: scale 1x / 1.5x / 2x × rows 500/1000
-    // peak_bytes（TASK-156.5 R10）: runScenario 内で reset() してから測るシナリオ単体のピーク確保量
+    // scale 1x / 1.5x / 2x x rows 500/1000
+    // peak_bytes: peak allocation of one scenario, measured after reset() inside runScenario
     for ([_]f32{ 1.0, 1.5, 2.0 }) |s| {
         try runScenario(io, &tracker, 500, s);
         try runScenario(io, &tracker, 1000, s);

@@ -1,12 +1,12 @@
-//! drawSprite / drawSpriteEx のマイクロベンチ（TASK-111.2）。
-//! `zig build bench-sprite` で実行（ReleaseFast 固定・display/audio 不要・OS 非依存）。
-//! ここのループは bench 実行時のみ走る（フレーム毎ホットパスではない）。
-//! 前後比較の運用: 出力行を backlog タスクの notes に転記して比較する。
+//! Micro-benchmark of drawSprite / drawSpriteEx.
+//! Run with `zig build bench-sprite` (ReleaseFast; no display/audio; OS-independent).
+//! This loop runs only during the bench (not a per-frame hot path).
+//! For before/after comparison, record the output lines and compare them.
 
 const std = @import("std");
 const sprite = @import("sprite");
 
-/// 固定 seed の最小 LCG（決定的な画素充填が目的）。
+/// Tiny fixed-seed LCG (deterministic pixel fill).
 const Lcg = struct {
     state: u32,
     fn next(self: *Lcg) u32 {

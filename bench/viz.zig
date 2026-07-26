@@ -1,7 +1,7 @@
-//! patch viz 帯のマイクロベンチ（TASK-156.4）。
-//! `zig build bench-viz` で実行（ReleaseFast 固定・display 不要）。
-//! 計測: Spec/Scope/Meter の論理 bitmap 描画 + DrawList.image の scale 別転送。
-//! ここのループは bench 実行時のみ（アプリ通常フレーム経路ではない）。
+//! Micro-benchmark of the patch viz strip.
+//! Run with `zig build bench-viz` (ReleaseFast; no display).
+//! Measures: Spec/Scope/Meter logical bitmap drawing + DrawList.image transfer per scale.
+//! This loop runs only during the bench (not the app's normal frame path).
 
 const std = @import("std");
 const gui = @import("gui");
@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
     osc.* = .{};
     var meter = scope.LevelMeter{};
 
-    // 合成信号で feed（無音だと描画が短絡されうる）
+    // feed a synthetic signal (silence can short-circuit drawing)
     var mono: [512]f32 = undefined;
     var t: f32 = 0;
     for (&mono) |*s| {
@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n=== patch viz benchmark (ReleaseFast, logical {d}x{d}) ===\n", .{ VIZ_W, VIS_H });
 
-    // 論理 bitmap 描画
+    // Logical bitmap drawing
     {
         const iters: usize = 500;
         var total: u64 = 0;
@@ -82,9 +82,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("viz.bitmap_draw  avg={d:>9} ns  min={d:>9} ns\n", .{ total / iters, min_ns });
     }
 
-    // bitmap → physical 転送（DrawList.image + gui.render scale）
+    // bitmap -> physical transfer (DrawList.image + gui.render scale)
     const scales = [_]f32{ 1.0, 1.5, 2.0 };
-    // 一度描画した bitmap を再利用
+    // Reuse a once-drawn bitmap
     @memset(viz, VIS_BG);
     {
         const draw_y: usize = VIS_LABEL_H;
@@ -94,11 +94,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     for (scales) |s| {
-        // peak_bytes（TASK-156.5 R10）: この scale の物理 target + DrawList 確保からのピーク
+        // peak_bytes: peak from this scale's physical target + DrawList allocation
         tracker.reset();
         const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(VIZ_W)) * s));
         const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(VIS_H)) * s));
-        // 帯だけを含む target（フルウィンドウではない）
+        // target that holds only the strip (not a full window)
         const pixels = try gpa.alloc(u32, pw * ph);
         defer gpa.free(pixels);
         const target = gui.RenderTarget{ .pixels = pixels, .width = pw, .height = ph };

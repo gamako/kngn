@@ -1,7 +1,7 @@
-//! bench 専用のピークメモリ追跡 allocator ラッパー（TASK-156.5 R10）。
-//! 子 allocator（DebugAllocator）をラップし、reset() 以降の最大確保バイト数を追跡する。
-//! bench-gui / bench-gui-frame / bench-blit / bench-viz が共有する（4 箇所への複製を避ける）。
-//! 単一スレッド専用（bench はどれも single-thread で回す前提）。
+//! Bench-only peak-memory tracking allocator wrapper.
+//! Wraps a child allocator (DebugAllocator) and tracks the maximum allocated bytes since reset().
+//! Shared by bench-gui / bench-gui-frame / bench-blit / bench-viz (avoids copying it in 4 places).
+//! Single-thread only (every bench runs single-threaded).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,7 +27,7 @@ pub const PeakTrackingAllocator = struct {
         };
     }
 
-    /// 次の計測区間の直前に呼ぶ（peak_bytes を 0 から測り直す）。
+    /// Call just before the next measurement window (restarts peak_bytes from 0).
     pub fn reset(self: *PeakTrackingAllocator) void {
         self.peak_bytes = 0;
     }
@@ -77,7 +77,7 @@ pub const PeakTrackingAllocator = struct {
     }
 };
 
-test "PeakTrackingAllocator: alloc/free を経て peak が最大値を保持する" {
+test "PeakTrackingAllocator: peak keeps the maximum across alloc/free" {
     var tracker = PeakTrackingAllocator.init(std.testing.allocator);
     const a = tracker.allocator();
 
@@ -86,14 +86,14 @@ test "PeakTrackingAllocator: alloc/free を経て peak が最大値を保持す�
     const p2 = try a.alloc(u8, 200);
     try std.testing.expectEqual(@as(usize, 300), tracker.peak_bytes);
     a.free(p1);
-    // free 後も current は減るが peak は最大値のまま残る。
+    // After free, current falls but peak keeps the maximum.
     try std.testing.expectEqual(@as(usize, 300), tracker.peak_bytes);
     try std.testing.expectEqual(@as(usize, 200), tracker.current_bytes);
     a.free(p2);
     try std.testing.expectEqual(@as(usize, 0), tracker.current_bytes);
 }
 
-test "PeakTrackingAllocator: reset() で次区間の peak を測り直す" {
+test "PeakTrackingAllocator: reset() restarts peak for the next window" {
     var tracker = PeakTrackingAllocator.init(std.testing.allocator);
     const a = tracker.allocator();
 

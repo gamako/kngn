@@ -1,6 +1,6 @@
-//! LofiPatch.render のマイクロベンチ（TASK-105.2）。
-//! `zig build bench-lofi` で実行（ReleaseFast 固定・display/audio デバイス不要）。
-//! DynGraph 載せ替え前後を同一条件で比較するため、LofiPatch の公開 API だけを計測する。
+//! Micro-benchmark of LofiPatch.render.
+//! Run with `zig build bench-lofi` (ReleaseFast; no display/audio device).
+//! Measures only the LofiPatch public API so DynGraph swap before/after stays under the same conditions.
 
 const std = @import("std");
 const patch = @import("patch");
@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     defer lofi.destroy();
 
     var buf: [FRAMES * CHANNELS]f32 = undefined;
-    lofi.render(&buf, FRAMES, CHANNELS); // 初回状態更新を計測外にする
+    lofi.render(&buf, FRAMES, CHANNELS); // Keep the first state update outside the measurement
 
     var total_ns: u64 = 0;
     var min_ns: u64 = std.math.maxInt(u64);
@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
         const start = std.Io.Clock.Timestamp.now(io, .awake);
         lofi.render(&buf, FRAMES, CHANNELS);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
-        // DCE 対策: render の出力を観測する。
+        // Anti-DCE: observe render's output.
         acc += buf[(i % FRAMES) * CHANNELS];
         total_ns += ns;
         min_ns = @min(min_ns, ns);

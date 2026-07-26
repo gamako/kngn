@@ -1,5 +1,5 @@
-//! V4L2 YUYV→BGRA マイクロベンチ（TASK-49.3）。
-//! `zig build bench-yuyv` で実行（ReleaseFast 固定・device/display 不要）。
+//! V4L2 YUYV→BGRA micro-benchmark.
+//! Run with `zig build bench-yuyv` (ReleaseFast; no device/display).
 
 const std = @import("std");
 const camera = @import("camera_v4l2");

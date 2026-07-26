@@ -1,7 +1,7 @@
-//! Full Context frame benchmark for list/menu shell (TASK-121.4).
-//! `zig build bench-gui-list-menu` で実行（ReleaseFast 固定・display 不要）。
-//! 測定範囲: beginFrame → UI 構築 → endFrame → gui.render
-//! ここのループは bench 実行時のみ走る（アプリ通常フレーム経路ではない）。
+//! Full Context frame benchmark for list/menu shell.
+//! Run with `zig build bench-gui-list-menu` (ReleaseFast; no display).
+//! Scope: beginFrame -> UI build -> endFrame -> gui.render
+//! This loop runs only during the bench (not the app's normal frame path).
 
 const std = @import("std");
 const gui = @import("gui");
@@ -13,7 +13,7 @@ const WARMUP: usize = 100;
 const ITERS: usize = 1000;
 
 fn percentile95(sorted: []const u64) u64 {
-    // Plan: 昇順 950 番目（1-based）→ index 949 for N=1000
+    // Plan: 950th in ascending order (1-based) -> index 949 for N=1000
     const rank = @max(@as(usize, 1), (ITERS * 95) / 100);
     return sorted[rank - 1];
 }
