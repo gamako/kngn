@@ -214,13 +214,15 @@ video-proto-main/
 > `apps → kit → libs → core → platform` is enforced by the module graph in `build.zig`
 > (a `Layer` tag plus a `link()` check). A reverse dependency, a skipped layer, or a
 > disallowed direct import by an application **stops the build with a panic during build
-> configuration**. There are exactly four exceptions, made explicit through
-> `linkCoreException` and `linkAppException`: `harness(core/control) → png(libs/png)`
-> (encoding a framebuffer snapshot as PNG, and crc32), `harness → dsp` (the spectrum
-> analysis behind the audio digest), `platform → pixelops` (the BGRA→RGBA SIMD swizzle
-> for a wasm present), and `pixie(apps) → pixelops` (sharing the SIMD blend of a
-> downscaling blit). Migration follows R8's deferred policy, and files not yet moved stay
-> in `src/`.
+> configuration**. Every exception is made explicit through `linkCoreException` and
+> `linkAppException`, and those call sites in `build.zig` are the authoritative list:
+> `harness(core/control) → png(libs/png)` (encoding a framebuffer snapshot as PNG, and
+> crc32), `harness → dsp` (the spectrum analysis behind the audio digest),
+> `platform → pixelops` (the BGRA→RGBA SIMD swizzle for a wasm present),
+> `pixie(apps) → pixelops` (sharing the SIMD blend of a downscaling blit),
+> `example_26 → paint` (a direct paint import in the demo), and
+> `apps/patch/lofi.zig → synth` / `→ dsp` (using the generative layer directly).
+> Migration follows R8's deferred policy, and files not yet moved stay in `src/`.
 
 ## Quick start
 
