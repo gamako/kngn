@@ -1,10 +1,10 @@
-//! wasm32-wasi platform backend（TASK-73.1）
+//! The wasm32-wasi platform backend
 //!
-//! JS glue（web/vp.js）と `extern "env"` / `export` で接続する。
-//! framebuffer は wasm_allocator で確保し、present で BGRA→RGBA swizzle（pixelops SIMD）後に
-//! `vp_present` へ渡す。入力は JS が `vp_push_*` でキューへ push、Zig は nextEvent で drain。
+//! It connects to the JS glue (web/vp.js) through `extern "env"` and `export`.
+//! The framebuffer is allocated with wasm_allocator, and present hands it to `vp_present` after a
+//! BGRA→RGBA swizzle (pixelops SIMD). JS pushes input onto the queue with `vp_push_*`, and Zig drains it in nextEvent.
 //!
-//! ホットパス宣言: present の全画素 swizzle はフレーム毎。入力/init はイベント時・初期化時のみ。
+//! Hot path declaration: the all-pixel swizzle in present runs every frame. Input and init happen at event time and at initialisation only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -28,27 +28,27 @@ const OpenDialogOptions = types.OpenDialogOptions;
 const CursorShape = types.CursorShape;
 
 // ============================================================================
-// JS import table（env）
+// The JS import table (env)
 // ============================================================================
 
 extern "env" fn vp_now() f64;
 extern "env" fn vp_present(ptr: [*]const u8, w: u32, h: u32) void;
 extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
 extern "env" fn vp_set_cursor(shape: c_int) void;
-/// ブラウザ file picker を発火（allowed_ext ヒント。空可）。二重発火防止は Zig/JS 双方。
+/// Fire the browser file picker (allowed_ext is a hint and may be empty). Both Zig and JS guard against firing it twice.
 extern "env" fn vp_request_open(ext_ptr: [*]const u8, ext_len: u32) void;
-/// `navigator.clipboard.writeText`（text/plain）。
+/// `navigator.clipboard.writeText` (text/plain).
 extern "env" fn vp_clipboard_write(ptr: [*]const u8, len: u32) void;
-/// `navigator.clipboard.readText` を非同期開始。結果は `vp_clipboard_text` で届く。
+/// Start `navigator.clipboard.readText` asynchronously. The result arrives through `vp_clipboard_text`.
 extern "env" fn vp_request_paste() void;
 
 // ============================================================================
-// DOM KeyboardEvent.code → KeyCode（Zig 側純データ表。platform_linux_input 流儀）
+// A DOM KeyboardEvent.code → KeyCode (a pure data table on the Zig side, in the style of platform_linux_input)
 // ============================================================================
 
 const DomKeyEntry = struct { code: []const u8, key: KeyCode };
 
-/// pixie が使うキー（英字/数字/矢印/Space/Esc/Enter/Backspace/Tab/修飾）を最低限カバー。
+/// It covers the minimum the pixel editor uses: letters, digits, arrows, Space, Esc, Enter, Backspace, Tab and the modifiers.
 const dom_key_table = [_]DomKeyEntry{
     .{ .code = "KeyA", .key = .A },
     .{ .code = "KeyB", .key = .B },
@@ -113,21 +113,21 @@ fn domCodeToKeyCode(code: []const u8) KeyCode {
     return .UNKNOWN;
 }
 
-/// JS が KeyboardEvent.code 文字列を書く固定スクラッチ（最大 32B。DOM code は十分収まる）。
+/// The fixed scratch JS writes a KeyboardEvent.code string into (up to 32B, which a DOM code fits comfortably).
 var dom_code_scratch: [32]u8 = undefined;
 
 export fn vp_dom_code_scratch() [*]u8 {
     return &dom_code_scratch;
 }
 
-/// scratch に書いた DOM code（len バイト）→ KeyCode（i32）。未知は UNKNOWN(-1)。
+/// The DOM code written into scratch (len bytes) → a KeyCode (i32). Anything unknown is UNKNOWN(-1).
 export fn vp_dom_code_to_keycode(len: u32) i32 {
     const n = @min(len, dom_code_scratch.len);
     return @intFromEnum(domCodeToKeyCode(dom_code_scratch[0..n]));
 }
 
 // ============================================================================
-// イベントキュー（固定リング）
+// The event queue (a fixed ring)
 // ============================================================================
 
 const QUEUE_CAP = 256;
@@ -138,7 +138,7 @@ var queue_len: usize = 0;
 
 fn queuePush(ev: Event) void {
     if (queue_len >= QUEUE_CAP) {
-        // 溢れは最古を破棄（drop）
+        // On overflow the oldest is discarded (a drop)
         queue_head = (queue_head + 1) % QUEUE_CAP;
         queue_len -= 1;
     }
@@ -163,14 +163,14 @@ fn buttonsFromC(raw: u32) MouseButtons {
     return MouseButtons.fromC(@truncate(raw));
 }
 
-/// DOM `MouseEvent.button` → `MouseButton`。
-/// 入力は共有 enum の discriminant ではなく DOM 値域（0=left, 1=middle, 2=right）。
-/// `MouseButton` は left=0 / right=1 / middle=2 なので middle/right の番号が DOM と入れ替わる。
+/// A DOM `MouseEvent.button` → a `MouseButton`.
+/// The input is the DOM's own range (0=left, 1=middle, 2=right), not the shared enum's discriminant.
+/// `MouseButton` is left=0 / right=1 / middle=2, so the numbers of middle and right are swapped relative to the DOM.
 fn buttonFromDom(b: i32) MouseButton {
     return switch (b) {
         0 => .left,
-        1 => .middle, // DOM middle（≠ MouseButton.right = 1）
-        2 => .right, // DOM right（≠ MouseButton.middle = 2）
+        1 => .middle, // DOM middle (≠ MouseButton.right = 1)
+        2 => .right, // DOM right (≠ MouseButton.middle = 2)
         else => .none,
     };
 }
@@ -187,7 +187,7 @@ export fn vp_push_key(down: bool, code: i32, mods: u32, is_repeat: bool) void {
 }
 
 export fn vp_push_char(codepoint: u32, mods: u32) void {
-    // 制御文字は流さない（platform_types CharEvent 契約）
+    // Control characters are not emitted (the CharEvent contract of platform_types)
     if (codepoint < 0x20 or codepoint == 0x7f) return;
     queuePush(.{ .char_input = .{ .codepoint = codepoint, .modifiers = modsFromC(mods) } });
 }
@@ -229,14 +229,14 @@ var pixels_buf: []u32 = &.{};
 var rgba_buf: []u8 = &.{};
 var fb_w: u32 = 0;
 var fb_h: u32 = 0;
-/// 0 = 保留なし。vp_resize がセットし、次の lockFramebuffer 冒頭で適用（フレーム境界）。
+/// 0 = nothing pending. vp_resize sets it, and the top of the next lockFramebuffer applies it (at a frame boundary).
 var pending_w: u32 = 0;
 var pending_h: u32 = 0;
 const default_gpa: std.mem.Allocator = if (builtin.cpu.arch.isWasm())
     std.heap.wasm_allocator
 else
     std.heap.page_allocator;
-/// テストから OOM を注入できるよう var（本番では default_gpa 固定。init/resize 時のみ使用）。
+/// A var so that a test can inject an OOM (in production it is fixed to default_gpa, and used only at init and resize).
 var gpa: std.mem.Allocator = default_gpa;
 
 const MIN_FB_W: u32 = 320;
@@ -251,15 +251,15 @@ fn clampResizeDim(w: u32, h: u32) struct { w: u32, h: u32 } {
     };
 }
 
-/// JS ResizeObserver から呼ぶ。フレーム中のバッファ差し替えを避け pending に保持する。
+/// Called from the JS ResizeObserver. It keeps the value pending, rather than swapping the buffer mid-frame.
 export fn vp_resize(w: u32, h: u32) void {
     const c = clampResizeDim(w, h);
     pending_w = c.w;
     pending_h = c.h;
 }
 
-/// 失敗時は pending を保持したまま返す（旧 framebuffer は two-phase 確保で無傷なので
-/// 旧サイズで描画継続 + 次の lockFramebuffer で再試行）。
+/// On failure it returns with the pending value still held (the old framebuffer is untouched, thanks to
+/// the two-phase allocation, so drawing continues at the old size and the next lockFramebuffer retries).
 fn applyPendingResize() void {
     if (pending_w == 0 or pending_h == 0) return;
     ensureFramebuffer(pending_w, pending_h) catch return;
@@ -271,8 +271,8 @@ fn ensureFramebuffer(w: u32, h: u32) Error!void {
     const n = @as(usize, w) * @as(usize, h);
     if (pixels_buf.len == n and fb_w == w and fb_h == h) return;
 
-    // two-phase commit: 新バッファ 2 枚の確保が両方成功してから旧バッファを解放する。
-    // 途中失敗しても旧 framebuffer は無傷（OOM 後も旧サイズで描画継続できる）。
+    // A two-phase commit: the old buffers are freed only once both new buffers have been allocated.
+    // A failure part way through leaves the old framebuffer untouched (drawing continues at the old size even after an OOM).
     const new_pixels = gpa.alloc(u32, n) catch return error.WindowCreationFailed;
     const new_rgba = gpa.alloc(u8, n * 4) catch {
         gpa.free(new_pixels);
@@ -300,8 +300,8 @@ pub const Window = struct {
         return .{ .width = fb_w, .height = fb_h };
     }
 
-    /// 透過 / borderless / サイズ指定（TASK-117）。wasm は表示位置が無いため position は無視。
-    /// transparent/borderless も DOM canvas では意味が薄いが、サイズ上書きのために受理する。
+    /// Transparency, borderless and an explicit size. wasm has no display position, so position is ignored.
+    /// transparent and borderless mean little on a DOM canvas either, but they are accepted so that the size can be overridden.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
         _ = opts.transparent;
         _ = opts.borderless;
@@ -366,18 +366,18 @@ pub const Window = struct {
         vp_set_cursor(@intFromEnum(shape));
     }
 
-    /// wasm は OS window title を持たないため no-op。
+    /// wasm has no OS window title, so this is a no-op.
     pub fn setTitle(_: Window, _: [:0]const u8) void {}
 
-    /// ライブリサイズ再描画コールバック（TASK-23.1）。ブラウザは OS モーダルループが無く
-    /// リサイズ中も rAF が回り続けるため no-op スタブ（X11/Wayland と同型）。
+    /// The live-resize redraw callback. A browser has no OS modal loop and rAF keeps running during a
+    /// resize, so this is a no-op stub (the same shape as X11 and Wayland).
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         _ = self;
         _ = ctx;
         _ = cb;
     }
 
-    /// destroy 用の private clear 経路（no-op。TASK-23.1）。
+    /// The private clear path used by destroy (a no-op).
     pub fn clearRedrawCallback(self: Window) void {
         _ = self;
     }
@@ -386,14 +386,14 @@ pub const Window = struct {
         return null;
     }
 
-    /// IME composition snapshot（TASK-79.6.1）。web IME は別タスク。常に空。
+    /// The IME composition snapshot. A web IME is separate work, so this is always empty.
     pub fn getCompositionSnapshot(_: Window, buf: []u8) types.CompositionSnapshot {
         return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
     }
 };
 
-/// 現在のウィンドウ geometry（TASK-117）。wasm は位置無し・現在 framebuffer サイズ。
-/// module-level（facade `@hasDecl` 契約）。
+/// The current window geometry. wasm has no position, and the size is the current framebuffer's.
+/// Module level (the facade's `@hasDecl` contract).
 pub fn getGeometry(win: Window) types.WindowGeometry {
     _ = win;
     return .{
@@ -423,14 +423,14 @@ pub fn getTime() f64 {
 }
 
 // ============================================================================
-// File dialog（TASK-73.3）— パスモデル温存 + JS メモリ FS
+// File dialogs: the path model is kept, over a JS in-memory FS
 // ============================================================================
 //
-// open: 非同期（browser file picker）。未 pick → DialogPending、pick 後の再呼び出しで path を返す。
-// save: 同期に default_name を返す（実体保存は WASI write → JS memfs → Blob download）。
-// request 中の再 open は picker を二重発火せず DialogPending のまま待つ。
+// open: asynchronous (the browser file picker). Before anything is picked it gives DialogPending, and a later call returns the path.
+// save: it returns default_name synchronously (the actual saving is a WASI write → the JS memfs → a Blob download).
+// A second open while a request is outstanding does not fire the picker twice and stays DialogPending.
 
-/// open ダイアログの pending 状態機械（DOM 非依存・単体テスト対象）。
+/// The pending state machine of the open dialog (DOM independent, and unit tested).
 const OpenDialogState = enum { idle, requested, picked, cancelled };
 
 const OpenDialogMachine = struct {
@@ -438,7 +438,7 @@ const OpenDialogMachine = struct {
     path_buf: [256]u8 = undefined,
     path_len: u32 = 0,
 
-    /// openFileDialog 呼び出し時の遷移。`.request` のときだけ JS picker を発火する。
+    /// The transition made by a call to openFileDialog. Only `.request` fires the JS picker.
     fn onCall(self: *OpenDialogMachine) enum { request, pending, take_path, cancelled } {
         return switch (self.state) {
             .idle => blk: {
@@ -458,7 +458,7 @@ const OpenDialogMachine = struct {
         };
     }
 
-    /// JS が path を scratch 経由で届けたとき。request 中以外は無視（二重 request 防止）。
+    /// When JS delivers a path through scratch. It is ignored unless a request is outstanding (which prevents a second request).
     fn onPicked(self: *OpenDialogMachine, path: []const u8) void {
         if (self.state != .requested) return;
         const n = @min(path.len, self.path_buf.len);
@@ -482,8 +482,8 @@ const OpenDialogMachine = struct {
     }
 };
 
-/// pick 仮想 path: `pick/<basename>`（path traversal を潰した basename）。
-/// 戻り値は `out` 内スライス。名前が空なら `pick/file`。
+/// The virtual path of a pick: `pick/<basename>` (a basename with any path traversal removed).
+/// The return value is a slice of `out`. An empty name gives `pick/file`.
 fn makePickPath(name: []const u8, out: []u8) []const u8 {
     const base = basenameSanitize(name);
     const prefix = "pick/";
@@ -494,12 +494,12 @@ fn makePickPath(name: []const u8, out: []u8) []const u8 {
     return out[0 .. prefix.len + n];
 }
 
-/// `/` `\` を除き、`.` `..` を `file` に落とす。
+/// It strips `/` and `\`, and turns `.` and `..` into `file`.
 fn basenameSanitize(name: []const u8) []const u8 {
     var s = name;
-    // 末尾の path 区切りを落とす
+    // drop a trailing path separator
     while (s.len > 0 and (s[s.len - 1] == '/' or s[s.len - 1] == '\\')) s = s[0 .. s.len - 1];
-    // 最後の区切り以降
+    // everything after the last separator
     if (std.mem.lastIndexOfAny(u8, s, "/\\")) |i| s = s[i + 1 ..];
     if (s.len == 0 or std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return "file";
     return s;
@@ -507,14 +507,14 @@ fn basenameSanitize(name: []const u8) []const u8 {
 
 var open_dialog: OpenDialogMachine = .{};
 
-/// JS が pick path 文字列を書く固定スクラッチ（最大 256B）。
+/// The fixed scratch JS writes a picked path string into (up to 256B).
 var file_path_scratch: [256]u8 = undefined;
 
 export fn vp_file_path_scratch() [*]u8 {
     return &file_path_scratch;
 }
 
-/// scratch に書いた仮想 path（len バイト）を open 状態機械へ届け、picked にする。
+/// Deliver the virtual path written into scratch (len bytes) to the open state machine, making it picked.
 export fn vp_file_picked(len: u32) void {
     const n = @min(len, file_path_scratch.len);
     open_dialog.onPicked(file_path_scratch[0..n]);
@@ -527,7 +527,7 @@ export fn vp_file_cancelled() void {
 fn requestOpenJs(ext: []const u8) void {
     if (builtin.is_test) return;
     if (ext.len == 0) {
-        // JS は len=0 を「フィルタ無し」と解釈。ptr は読まない。
+        // JS reads len=0 as "no filter" and never reads ptr.
         vp_request_open(@as([*]const u8, @ptrFromInt(1)), 0);
     } else {
         vp_request_open(ext.ptr, @intCast(ext.len));
@@ -535,7 +535,7 @@ fn requestOpenJs(ext: []const u8) void {
 }
 
 pub fn saveFileDialog(allocator: std.mem.Allocator, _: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    // 同期: ブラウザ download UI が保存先を担うので default_name をそのまま path として返す。
+    // Synchronous: the browser's download UI decides where it goes, so default_name is returned as the path.
     const name = opts.default_name orelse "download.bin";
     return try allocator.dupe(u8, name);
 }
@@ -558,13 +558,13 @@ pub fn openFileDialog(allocator: std.mem.Allocator, _: std.Io, opts: OpenDialogO
 }
 
 // ============================================================================
-// Clipboard（TASK-73.3）— 色 #RRGGBB の text/plain
+// Clipboard: the text/plain of a #RRGGBB colour
 // ============================================================================
 
 const ClipboardPasteState = enum { idle, requested, delivered };
 
 var clipboard_paste_state: ClipboardPasteState = .idle;
-/// paste テキスト固定スクラッチ（#RRGGBB 用途。長文は切り詰め）。
+/// The fixed scratch for pasted text (it is for #RRGGBB, so anything long is truncated).
 var clipboard_text_scratch: [64]u8 = undefined;
 var clipboard_text_len: u32 = 0;
 
@@ -572,21 +572,21 @@ export fn vp_clipboard_text_scratch() [*]u8 {
     return &clipboard_text_scratch;
 }
 
-/// JS が readText 結果を scratch に書いたあと呼ぶ。
+/// Called after JS has written the readText result into scratch.
 export fn vp_clipboard_text(len: u32) void {
     const n = @min(len, clipboard_text_scratch.len);
     clipboard_text_len = n;
     clipboard_paste_state = .delivered;
 }
 
-/// システム clipboard へ text を書く（wasm: Clipboard API。native は no-op 経路）。
+/// Write text to the system clipboard (on wasm, the Clipboard API; on native this path is a no-op).
 pub fn clipboardWrite(text: []const u8) void {
     if (text.len == 0) return;
     if (builtin.is_test) return;
     vp_clipboard_write(text.ptr, @intCast(text.len));
 }
 
-/// paste を非同期要求。二重 request は無視。
+/// Request a paste asynchronously. A second request is ignored.
 pub fn clipboardRequestPaste() void {
     if (clipboard_paste_state == .requested) return;
     clipboard_paste_state = .requested;
@@ -595,7 +595,7 @@ pub fn clipboardRequestPaste() void {
     vp_request_paste();
 }
 
-/// 届いていれば text スライスを返し idle に戻す。未着は null。
+/// Return the text slice once it has arrived and go back to idle. Not yet arrived gives null.
 pub fn clipboardTakePaste() ?[]const u8 {
     if (clipboard_paste_state != .delivered) return null;
     clipboard_paste_state = .idle;
@@ -607,14 +607,14 @@ fn clipboardResetForTest() void {
     clipboard_text_len = 0;
 }
 
-/// freestanding 向け log（std_options.logFn から呼ぶ想定）。
+/// Logging for freestanding (expected to be called from std_options.logFn).
 pub fn logMessage(msg: []const u8) void {
     if (msg.len == 0) return;
     vp_log(msg.ptr, @intCast(msg.len));
 }
 
-test "buttonFromDom: DOM MouseEvent.button → MouseButton" {
-    // DOM: 0=left, 1=middle, 2=right（JS buttonIndex がこの値域を渡す）
+test "buttonFromDom: a DOM MouseEvent.button → a MouseButton" {
+    // DOM: 0=left, 1=middle, 2=right (the JS buttonIndex passes this range)
     try std.testing.expectEqual(MouseButton.left, buttonFromDom(0));
     try std.testing.expectEqual(MouseButton.middle, buttonFromDom(1));
     try std.testing.expectEqual(MouseButton.right, buttonFromDom(2));
@@ -622,7 +622,7 @@ test "buttonFromDom: DOM MouseEvent.button → MouseButton" {
     try std.testing.expectEqual(MouseButton.none, buttonFromDom(3));
 }
 
-test "domCodeToKeyCode: pixie 最低限キー" {
+test "domCodeToKeyCode: the minimum keys the pixel editor needs" {
     try std.testing.expectEqual(KeyCode.A, domCodeToKeyCode("KeyA"));
     try std.testing.expectEqual(KeyCode.SPACE, domCodeToKeyCode("Space"));
     try std.testing.expectEqual(KeyCode.ESCAPE, domCodeToKeyCode("Escape"));
@@ -646,7 +646,7 @@ fn testResetFramebufferState() void {
     pending_h = 0;
 }
 
-test "vp_resize: lockFramebuffer で寸法反映" {
+test "vp_resize: lockFramebuffer applies the new size" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
@@ -660,7 +660,7 @@ test "vp_resize: lockFramebuffer で寸法反映" {
     try std.testing.expectEqual(@as(usize, 640 * 480), fb.pixels.len);
 }
 
-test "vp_resize: 複数回は最後の値が勝つ" {
+test "vp_resize: with several calls, the last value wins" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
@@ -671,7 +671,7 @@ test "vp_resize: 複数回は最後の値が勝つ" {
     try std.testing.expectEqual(@as(u32, 480), pending_h);
 }
 
-test "vp_resize: clamp min 320x240 max 8192" {
+test "vp_resize: clamped to a minimum of 320x240 and a maximum of 8192" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
@@ -684,25 +684,25 @@ test "vp_resize: clamp min 320x240 max 8192" {
     try std.testing.expectEqual(@as(u32, 8192), pending_h);
 }
 
-test "vp_resize: OOM 失敗時は旧 fb 温存 + pending 保持で再試行（codex P1）" {
+test "vp_resize: on an OOM the old framebuffer survives and the pending value is kept for a retry" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
     var win = try Window.create(320, 240, "t");
     defer win.destroy();
 
-    // 以後の alloc を全て失敗させる（two-phase なので旧バッファは無傷のはず）
+    // make every later alloc fail (two-phase, so the old buffers should be untouched)
     var failing = std.testing.FailingAllocator.init(default_gpa, .{ .fail_index = 0 });
     gpa = failing.allocator();
 
     vp_resize(640, 480);
-    const fb = win.lockFramebuffer() orelse unreachable; // 旧 fb で描画継続
+    const fb = win.lockFramebuffer() orelse unreachable; // drawing continues on the old framebuffer
     try std.testing.expectEqual(@as(u32, 320), fb.width);
     try std.testing.expectEqual(@as(u32, 240), fb.height);
-    try std.testing.expectEqual(@as(u32, 640), pending_w); // pending は保持（再試行対象）
+    try std.testing.expectEqual(@as(u32, 640), pending_w); // the pending value is kept (it is what gets retried)
     try std.testing.expectEqual(@as(u32, 480), pending_h);
 
-    // alloc が回復したら次の lockFramebuffer で適用される
+    // once alloc recovers, the next lockFramebuffer applies it
     gpa = default_gpa;
     const fb2 = win.lockFramebuffer() orelse unreachable;
     try std.testing.expectEqual(@as(u32, 640), fb2.width);
@@ -710,7 +710,7 @@ test "vp_resize: OOM 失敗時は旧 fb 温存 + pending 保持で再試行（co
     try std.testing.expectEqual(@as(u32, 0), pending_w);
 }
 
-test "vp_resize: pending 未消化中は旧 fb サイズのまま" {
+test "vp_resize: the framebuffer keeps its old size while the pending value is unconsumed" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
@@ -728,13 +728,13 @@ test "vp_resize: pending 未消化中は旧 fb サイズのまま" {
     try std.testing.expectEqual(@as(u32, 480), fb2.height);
 }
 
-// ---- TASK-73.3: open dialog 状態機械 / pick path / clipboard pending ----
+// ---- the open dialog state machine, the picked path, and the clipboard pending state ----
 
-/// App.runPendingFileOp の dialog_op latch 規約（修正1）を純ロジックで表現した tick。
-/// `dialog_op` 優先、tick 冒頭で `pending` を破棄、pending 結果なら latch 維持。
+/// A tick expressing the dialog_op latch rule of App.runPendingFileOp as pure logic.
+/// `dialog_op` wins, `pending` is discarded at the top of a tick, and a pending result keeps the latch.
 fn dialogOpLatchTick(dialog_op: *?u8, pending: *?u8, result_pending: bool) ?u8 {
     const op = dialog_op.* orelse (pending.* orelse return null);
-    // dialog 待ち中に積まれた別要求は破棄（picker 結果の誤配送防止）
+    // Another request queued while a dialog is outstanding is discarded (which prevents the picker's result being delivered to the wrong one)
     pending.* = null;
     if (result_pending) {
         dialog_op.* = op;
@@ -744,8 +744,8 @@ fn dialogOpLatchTick(dialog_op: *?u8, pending: *?u8, result_pending: bool) ?u8 {
     return op;
 }
 
-test "dialog_op latch: pending 中の別 op 要求は破棄され dialog_op が維持される" {
-    // 1=open, 2=save_as（App.FileOp の代理。platform_wasm から App を import しない）
+test "dialog_op latch: another op requested while one is pending is discarded, and dialog_op is kept" {
+    // 1=open, 2=save_as (standing in for App.FileOp; platform_wasm does not import App)
     var dialog_op: ?u8 = null;
     var pending: ?u8 = null;
 
@@ -755,32 +755,32 @@ test "dialog_op latch: pending 中の別 op 要求は破棄され dialog_op が�
     try std.testing.expectEqual(@as(?u8, 1), dialog_op);
     try std.testing.expectEqual(@as(?u8, null), pending);
 
-    // 待ち中に save_as を要求（pending に積む）→ 次 tick で破棄され open が継続
+    // save_as is requested while waiting (queued as pending) → the next tick discards it and open continues
     pending = 2;
     try std.testing.expectEqual(@as(?u8, 1), dialogOpLatchTick(&dialog_op, &pending, true));
     try std.testing.expectEqual(@as(?u8, 1), dialog_op);
     try std.testing.expectEqual(@as(?u8, null), pending);
 
-    // picker 完了 → open 成功、dialog_op クリア。残留 pending 無し
+    // the picker finished → open succeeded and dialog_op is cleared. Nothing is left pending
     try std.testing.expectEqual(@as(?u8, 1), dialogOpLatchTick(&dialog_op, &pending, false));
     try std.testing.expectEqual(@as(?u8, null), dialog_op);
     try std.testing.expectEqual(@as(?u8, null), pending);
 
-    // 完了後に初めて save_as が走れる
+    // only once that is done can save_as run
     pending = 2;
     try std.testing.expectEqual(@as(?u8, 2), dialogOpLatchTick(&dialog_op, &pending, false));
     try std.testing.expectEqual(@as(?u8, null), dialog_op);
     try std.testing.expectEqual(@as(?u8, null), pending);
 }
 
-test "open dialog machine: request → picked → take path → idle" {
+test "open dialog machine: request → picked → take the path → idle" {
     open_dialog.reset();
     defer open_dialog.reset();
 
     try std.testing.expectEqual(.request, open_dialog.onCall());
     try std.testing.expectEqual(OpenDialogState.requested, open_dialog.state);
 
-    // request 中の再 call は pending（二重 request しない）
+    // a second call while a request is outstanding is pending (no second request)
     try std.testing.expectEqual(.pending, open_dialog.onCall());
     try std.testing.expectEqual(OpenDialogState.requested, open_dialog.state);
 
@@ -792,7 +792,7 @@ test "open dialog machine: request → picked → take path → idle" {
     try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
 }
 
-test "open dialog machine: cancel → null 相当 → idle" {
+test "open dialog machine: cancel → the equivalent of null → idle" {
     open_dialog.reset();
     defer open_dialog.reset();
 
@@ -803,22 +803,22 @@ test "open dialog machine: cancel → null 相当 → idle" {
     try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
 }
 
-test "open dialog machine: pick/cancel は request 中以外無視" {
+test "open dialog machine: a pick or cancel is ignored unless a request is outstanding" {
     open_dialog.reset();
     defer open_dialog.reset();
 
-    open_dialog.onPicked("pick/x.png"); // idle 中は無視
+    open_dialog.onPicked("pick/x.png"); // ignored while idle
     try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
     open_dialog.onCancelled();
     try std.testing.expectEqual(OpenDialogState.idle, open_dialog.state);
 
     _ = open_dialog.onCall(); // → requested
     open_dialog.onPicked("pick/a.png");
-    open_dialog.onPicked("pick/b.png"); // already picked: 無視
+    open_dialog.onPicked("pick/b.png"); // already picked: ignored
     try std.testing.expectEqualStrings("pick/a.png", open_dialog.takePathSlice());
 }
 
-test "openFileDialog: request→DialogPending / picked→path / cancel→null" {
+test "openFileDialog: request→DialogPending / picked→the path / cancel→null" {
     open_dialog.reset();
     defer open_dialog.reset();
     const a = std.testing.allocator;
@@ -826,7 +826,7 @@ test "openFileDialog: request→DialogPending / picked→path / cancel→null" {
     // 1st call: request + DialogPending
     try std.testing.expectError(error.DialogPending, openFileDialog(a, undefined, .{ .allowed_ext = "png" }));
 
-    // 2nd call while waiting: still pending（二重 request 防止）
+    // a 2nd call while waiting: still pending (which prevents a second request)
     try std.testing.expectError(error.DialogPending, openFileDialog(a, undefined, .{ .allowed_ext = "png" }));
 
     // simulate JS deliver
@@ -846,7 +846,7 @@ test "openFileDialog: request→DialogPending / picked→path / cancel→null" {
     try std.testing.expect(cancelled == null);
 }
 
-test "saveFileDialog: default_name を同期返却" {
+test "saveFileDialog: default_name is returned synchronously" {
     const a = std.testing.allocator;
     const got = try saveFileDialog(a, undefined, .{ .default_name = "untitled.png", .allowed_ext = "png" });
     defer if (got) |p| a.free(p);
@@ -874,7 +874,7 @@ test "clipboard paste machine: request → deliver → take → idle" {
     try std.testing.expect(clipboardTakePaste() == null);
     clipboardRequestPaste();
     try std.testing.expectEqual(ClipboardPasteState.requested, clipboard_paste_state);
-    // 二重 request は state 維持
+    // a second request leaves the state as it is
     clipboardRequestPaste();
     try std.testing.expectEqual(ClipboardPasteState.requested, clipboard_paste_state);
 

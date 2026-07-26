@@ -1,18 +1,18 @@
-//! Windows 入力の **純粋な変換ロジック**（TASK-31）。`@cImport` しない純 Zig。
+//! The **pure translation logic** of Windows input. Pure Zig, with no `@cImport`.
 //!
-//! Win32 のメッセージポンプ本体（`platform_windows.zig`、Windows 専用）から値（scancode / virtual
-//! key / wheel delta）を取り出した後の変換だけをここに集約し、任意の host で
-//! `zig build test-platform-windows-input` で単体テストできるようにする
-//! （X11 の `platform_linux_input.zig` / Wayland の `platform_wayland_input.zig` と同じ設計）。
+//! It gathers here only the translation that follows the Win32 message pump (`platform_windows.zig`,
+//! Windows only) pulling out the values (the scancode, the virtual key, the wheel delta), so that it
+//! can be unit tested on any host with `zig build test-platform-windows-input` (the same design as
+//! X11's `platform_linux_input.zig` and Wayland's `platform_wayland_input.zig`).
 //!
-//! **物理キーは scancode を主キーにする**（X11/Wayland の「物理位置・layout 非依存」方針に揃える）。
-//! WM_KEY* の lParam bits16-23 が PS/2 set1 の make code。bit24 が拡張(E0)フラグ。英字/数字/記号位置は
-//! layout に依らず scancode で決まる。`scancodeToKeyCode` を主とし、scancode 表に無い特殊キー（Pause /
-//! PrintScreen / F13+ 等）だけ `vkToKeyCode`（virtual key）に fallback する。修飾は per-event mask が
-//! 無いので backend が `GetKeyState` で読む（このファイルは保持しない）。
+//! **The scancode is the primary key for a physical key** (matching the "physical position, independent of layout" approach of X11 and Wayland).
+//! Bits 16-23 of WM_KEY*'s lParam are the PS/2 set 1 make code, and bit 24 is the extended (E0) flag. The
+//! position of a letter, digit or symbol follows from the scancode whatever the layout. `scancodeToKeyCode`
+//! leads, and only the special keys missing from that table (Pause, PrintScreen, F13 and above) fall back to
+//! `vkToKeyCode` (the virtual key). There is no per-event modifier mask, so the backend reads them with `GetKeyState` (this file holds none).
 //!
-//! KeyDownSet 相当の押下追跡は Windows backend では使わない（GetKeyState が OS 同期状態を返すため）。
-//! EventQueue / wheel 係数は OS 非依存なので `platform_linux_input.zig` を再利用する。
+//! The Windows backend needs no held-key tracking of the KeyDownSet kind (GetKeyState returns the OS's own synchronised state).
+//! The EventQueue and the wheel factor are OS independent and reused from `platform_linux_input.zig`.
 
 const std = @import("std");
 const types = @import("platform_types");
@@ -20,16 +20,16 @@ const linux_input = @import("platform_linux_input.zig");
 
 const KeyCode = types.KeyCode;
 
-// OS 非依存の共通機構は X11 実装から再利用（Wayland backend と同方針）。
+// The OS-independent shared machinery is reused from the X11 implementation (as in the Wayland backend).
 pub const EventQueue = linux_input.EventQueue;
 pub const QUEUE_CAP = linux_input.QUEUE_CAP;
 pub const WheelDelta = linux_input.WheelDelta;
-/// 1 notch = ±16 point（X11 wheelDelta / macOS SCROLL_LINE_TO_POINTS に整合）。
+/// 1 notch = ±16 points (consistent with X11's wheelDelta and macOS's SCROLL_LINE_TO_POINTS).
 pub const SCROLL_LINE_TO_POINTS: f32 = linux_input.SCROLL_LINE_TO_POINTS;
 
 // ============================================================================
-// Win32 Virtual-Key Codes（winuser.h の VK_*）。scancode 表に無い特殊キーの fallback と、
-// backend の GetKeyState 修飾読み取りに使う。物理キー本線は scancodeToKeyCode。
+// Win32 Virtual-Key Codes (the VK_* of winuser.h). They serve as the fallback for special keys missing
+// from the scancode table, and for the backend's GetKeyState modifier reads. Physical keys lead through scancodeToKeyCode.
 // ============================================================================
 const VK_BACK: u32 = 0x08;
 const VK_TAB: u32 = 0x09;
@@ -52,7 +52,7 @@ const VK_DELETE: u32 = 0x2E;
 const VK_F1: u32 = 0x70;
 const VK_F20: u32 = 0x83;
 
-// 修飾キー（左右別。backend の GetKeyState / vkToKeyCode fallback 用に公開）
+// modifier keys (left and right separately; exposed for the backend's GetKeyState and the vkToKeyCode fallback)
 pub const VK_SHIFT: u32 = 0x10;
 pub const VK_CONTROL: u32 = 0x11;
 pub const VK_MENU: u32 = 0x12; // Alt
@@ -66,22 +66,22 @@ pub const VK_LMENU: u32 = 0xA4;
 pub const VK_RMENU: u32 = 0xA5;
 
 // ============================================================================
-// scancode（PS/2 set1 make code）→ KeyCode（物理位置・layout 非依存）
+// a scancode (a PS/2 set 1 make code) → KeyCode (physical position, independent of layout)
 // ============================================================================
 //
-// lParam bits16-23 が make code、bit24 が拡張(E0)フラグ。英字/数字は配列に依らず物理位置で決まる
-// （US でも JIS でも 'Q' 位置の scancode は 0x10）。`platform_types.KeyCode` に在るキーのみ表に持ち、
-// 記号位置（KeyCode に無い）や未割当・NumLock/ScrollLock（KeyCode に無い）は `.UNKNOWN` を返す。
-// 拡張フラグは numpad と編集/矢印クラスタ、左右 Ctrl/Alt、KP Enter/Divide の判別に使う。
+// Bits 16-23 of lParam are the make code and bit 24 is the extended (E0) flag. A letter or digit follows from
+// its physical position whatever the layout (the scancode of the 'Q' position is 0x10 on US and JIS alike).
+// The table holds only keys that exist in `platform_types.KeyCode`; a symbol position, an unassigned code, and NumLock/ScrollLock (none of which are in KeyCode) all give `.UNKNOWN`.
+// The extended flag tells the numpad from the editing and arrow cluster, left Ctrl/Alt from right, and KP Enter/Divide from their siblings.
 pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
     if (extended) {
-        // E0 プレフィックス付き（拡張キー）。
+        // with an E0 prefix (an extended key).
         return switch (scancode) {
             0x1C => .KP_ENTER,
             0x1D => .RIGHT_CONTROL,
             0x35 => .KP_DIVIDE,
-            0x37 => .PRINT_SCREEN, // E0 37（PrintScreen の make。VK_SNAPSHOT 経路もあるが両対応）
-            0x38 => .RIGHT_ALT, // AltGr 含む
+            0x37 => .PRINT_SCREEN, // E0 37 (the make of PrintScreen; the VK_SNAPSHOT route also exists, and both are handled)
+            0x38 => .RIGHT_ALT, // AltGr included
             0x47 => .HOME,
             0x48 => .UP,
             0x49 => .PAGE_UP,
@@ -99,7 +99,7 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
     }
     return switch (scancode) {
         0x01 => .ESCAPE,
-        // 数字列（1..9,0）
+        // the digit row (1..9, 0)
         0x02 => .@"1",
         0x03 => .@"2",
         0x04 => .@"3",
@@ -112,7 +112,7 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
         0x0B => .@"0",
         0x0E => .BACKSPACE,
         0x0F => .TAB,
-        // 上段 QWERTYUIOP
+        // the top row, QWERTYUIOP
         0x10 => .Q,
         0x11 => .W,
         0x12 => .E,
@@ -125,7 +125,7 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
         0x19 => .P,
         0x1C => .ENTER,
         0x1D => .LEFT_CONTROL,
-        // 中段 ASDFGHJKL
+        // the home row, ASDFGHJKL
         0x1E => .A,
         0x1F => .S,
         0x20 => .D,
@@ -136,7 +136,7 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
         0x25 => .K,
         0x26 => .L,
         0x2A => .LEFT_SHIFT,
-        // 下段 ZXCVBNM
+        // the bottom row, ZXCVBNM
         0x2C => .Z,
         0x2D => .X,
         0x2E => .C,
@@ -149,7 +149,7 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
         0x38 => .LEFT_ALT,
         0x39 => .SPACE,
         0x3A => .CAPS_LOCK,
-        // ファンクション F1..F10
+        // function keys F1..F10
         0x3B => .F1,
         0x3C => .F2,
         0x3D => .F3,
@@ -160,7 +160,7 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
         0x42 => .F8,
         0x43 => .F9,
         0x44 => .F10,
-        // テンキー（NumLock 物理キー）
+        // the numeric keypad (the physical NumLock keys)
         0x47 => .KP_7,
         0x48 => .KP_8,
         0x49 => .KP_9,
@@ -176,17 +176,17 @@ pub fn scancodeToKeyCode(scancode: u32, extended: bool) KeyCode {
         0x53 => .KP_DECIMAL,
         0x57 => .F11,
         0x58 => .F12,
-        else => .UNKNOWN, // 記号位置 / NumLock(0x45) / ScrollLock(0x46) 等は KeyCode に無い
+        else => .UNKNOWN, // a symbol position, NumLock(0x45), ScrollLock(0x46) and the like are absent from KeyCode
     };
 }
 
 // ============================================================================
-// VK → KeyCode（scancode 表に無い特殊キーの fallback。layout 非依存な特殊キーのみ）
+// VK → KeyCode (the fallback for special keys missing from the scancode table; only keys that are layout independent)
 // ============================================================================
 //
-// scancodeToKeyCode が `.UNKNOWN` のとき backend が wParam(virtual key) で補う。Pause / PrintScreen /
-// F13-F20 等、scancode が多バイト列だったり 1 バイト表に収まらないキー向け。英字/数字/記号は
-// VK が layout 依存になりうるので **ここでは扱わず scancode に委ねる**（物理キー契約を壊さないため）。
+// When scancodeToKeyCode gives `.UNKNOWN`, the backend fills in from wParam (the virtual key). It is for
+// Pause, PrintScreen, F13-F20 and the like, whose scancode is a multi-byte sequence or does not fit a one-byte
+// table. Letters, digits and symbols are **left to the scancode and not handled here**, since their VK can depend on the layout (which would break the physical key contract).
 pub fn vkToKeyCode(vk: u32) KeyCode {
     return switch (vk) {
         VK_PAUSE => .PAUSE,
@@ -221,37 +221,37 @@ pub fn vkToKeyCode(vk: u32) KeyCode {
 }
 
 // ============================================================================
-// wheel: WM_MOUSEWHEEL / WM_MOUSEHWHEEL の delta → dx/dy
+// wheel: the delta of WM_MOUSEWHEEL / WM_MOUSEHWHEEL → dx/dy
 //
-// Win32 の wheel delta は HIWORD(wParam) を signed short にした値で WHEEL_DELTA(=120) の倍数。
-// 符号は WM_MOUSEWHEEL: 正 = forward(up)、WM_MOUSEHWHEEL: 正 = right。
-// X11/Wayland と符号を揃える: up=+16 / down=-16 / left=+16 / right=-16。
-// → 縦は delta/120*16 をそのまま dy、横は right(正) を負にするため符号反転。
+// A Win32 wheel delta is HIWORD(wParam) read as a signed short, and is a multiple of WHEEL_DELTA(=120).
+// The signs are: WM_MOUSEWHEEL positive = forward (up), WM_MOUSEHWHEEL positive = right.
+// They are brought into line with X11 and Wayland (up=+16 / down=-16 / left=+16 / right=-16), so the
+// vertical delta/120*16 becomes dy as it is, and the horizontal one is negated, since right is positive.
 // ============================================================================
 pub const WHEEL_DELTA: i32 = 120;
 
-/// `delta` は signed wheel 値（WHEEL_DELTA の倍数）。`horizontal=true` で WM_MOUSEHWHEEL。
+/// `delta` is the signed wheel value (a multiple of WHEEL_DELTA). `horizontal=true` means WM_MOUSEHWHEEL.
 pub fn wheelDelta(delta: i32, horizontal: bool) WheelDelta {
     const notches = @as(f32, @floatFromInt(delta)) / @as(f32, @floatFromInt(WHEEL_DELTA));
     const mag = notches * SCROLL_LINE_TO_POINTS;
     return if (horizontal)
-        .{ .dx = -mag, .dy = 0 } // WM_MOUSEHWHEEL 正=right → 右は負
+        .{ .dx = -mag, .dy = 0 } // WM_MOUSEHWHEEL positive = right → right becomes negative
     else
-        .{ .dx = 0, .dy = mag }; // WM_MOUSEWHEEL 正=up → 上は正
+        .{ .dx = 0, .dy = mag }; // WM_MOUSEWHEEL positive = up → up stays positive
 }
 
-/// char_input として流すべき「確定印字文字」か（WM_CHAR の codepoint に適用。TASK-22）。
-/// 制御文字（0x20 未満）・DELETE(0x7f) を除外。linux 側 platform_linux_input.isTextCodepoint と同契約。
+/// Whether a codepoint is a committed printable character worth emitting as char_input (applied to WM_CHAR's codepoint).
+/// It excludes control characters (below 0x20) and DELETE (0x7f). The same contract as platform_linux_input.isTextCodepoint.
 pub fn isTextCodepoint(cp: u32) bool {
     return cp >= 0x20 and cp != 0x7f;
 }
 
 // ============================================================================
-// tests（任意 host で回る。Win32 不要）
+// tests (they run on any host; no Win32 needed)
 // ============================================================================
 const testing = std.testing;
 
-test "isTextCodepoint: 印字可能のみ通す" {
+test "isTextCodepoint: only printable characters pass" {
     try testing.expect(!isTextCodepoint(0x08)); // BS
     try testing.expect(!isTextCodepoint(0x0d)); // Enter
     try testing.expect(!isTextCodepoint(0x1b)); // ESC
@@ -261,65 +261,65 @@ test "isTextCodepoint: 印字可能のみ通す" {
     try testing.expect(isTextCodepoint('5'));
 }
 
-test "scancodeToKeyCode: 物理キー（set1 make code・layout 非依存）" {
-    // 上段/中段/下段の物理位置（US でも JIS でも同 scancode）
+test "scancodeToKeyCode: physical keys (a set 1 make code, independent of layout)" {
+    // the physical positions of the top, home and bottom rows (the same scancode on US and JIS)
     try testing.expectEqual(KeyCode.Q, scancodeToKeyCode(0x10, false));
     try testing.expectEqual(KeyCode.A, scancodeToKeyCode(0x1E, false));
     try testing.expectEqual(KeyCode.Z, scancodeToKeyCode(0x2C, false));
     try testing.expectEqual(KeyCode.M, scancodeToKeyCode(0x32, false));
-    // 数字列・制御
+    // the digit row and control keys
     try testing.expectEqual(KeyCode.@"1", scancodeToKeyCode(0x02, false));
     try testing.expectEqual(KeyCode.@"0", scancodeToKeyCode(0x0B, false));
     try testing.expectEqual(KeyCode.SPACE, scancodeToKeyCode(0x39, false));
     try testing.expectEqual(KeyCode.ESCAPE, scancodeToKeyCode(0x01, false));
     try testing.expectEqual(KeyCode.ENTER, scancodeToKeyCode(0x1C, false));
-    // ファンクション
+    // function keys
     try testing.expectEqual(KeyCode.F1, scancodeToKeyCode(0x3B, false));
     try testing.expectEqual(KeyCode.F10, scancodeToKeyCode(0x44, false));
     try testing.expectEqual(KeyCode.F11, scancodeToKeyCode(0x57, false));
     try testing.expectEqual(KeyCode.F12, scancodeToKeyCode(0x58, false));
-    // 左右修飾は scancode/拡張で判別
+    // left and right modifiers are told apart by the scancode plus the extended flag
     try testing.expectEqual(KeyCode.LEFT_SHIFT, scancodeToKeyCode(0x2A, false));
     try testing.expectEqual(KeyCode.RIGHT_SHIFT, scancodeToKeyCode(0x36, false));
     try testing.expectEqual(KeyCode.LEFT_CONTROL, scancodeToKeyCode(0x1D, false));
     try testing.expectEqual(KeyCode.LEFT_ALT, scancodeToKeyCode(0x38, false));
 }
 
-test "scancodeToKeyCode: テンキー（非拡張）と編集/矢印（拡張）の判別" {
-    // 非拡張 = テンキー
+test "scancodeToKeyCode: telling the numeric keypad (not extended) from the editing and arrow cluster (extended)" {
+    // not extended = the numeric keypad
     try testing.expectEqual(KeyCode.KP_7, scancodeToKeyCode(0x47, false));
     try testing.expectEqual(KeyCode.KP_5, scancodeToKeyCode(0x4C, false));
     try testing.expectEqual(KeyCode.KP_0, scancodeToKeyCode(0x52, false));
     try testing.expectEqual(KeyCode.KP_DECIMAL, scancodeToKeyCode(0x53, false));
     try testing.expectEqual(KeyCode.KP_MULTIPLY, scancodeToKeyCode(0x37, false));
-    // 同じ scancode + 拡張 = 編集/矢印クラスタ
+    // the same scancode plus extended = the editing and arrow cluster
     try testing.expectEqual(KeyCode.HOME, scancodeToKeyCode(0x47, true));
     try testing.expectEqual(KeyCode.UP, scancodeToKeyCode(0x48, true));
     try testing.expectEqual(KeyCode.LEFT, scancodeToKeyCode(0x4B, true));
     try testing.expectEqual(KeyCode.INSERT, scancodeToKeyCode(0x52, true));
     try testing.expectEqual(KeyCode.DELETE, scancodeToKeyCode(0x53, true));
-    // 拡張の右修飾 / KP Enter / KP Divide
+    // the extended right modifiers, KP Enter and KP Divide
     try testing.expectEqual(KeyCode.RIGHT_CONTROL, scancodeToKeyCode(0x1D, true));
     try testing.expectEqual(KeyCode.RIGHT_ALT, scancodeToKeyCode(0x38, true));
     try testing.expectEqual(KeyCode.KP_ENTER, scancodeToKeyCode(0x1C, true));
     try testing.expectEqual(KeyCode.KP_DIVIDE, scancodeToKeyCode(0x35, true));
     try testing.expectEqual(KeyCode.LEFT_SUPER, scancodeToKeyCode(0x5B, true));
-    // KeyCode に無い物理キー（NumLock=0x45 / 記号）は UNKNOWN
+    // a physical key absent from KeyCode (NumLock=0x45, a symbol) is UNKNOWN
     try testing.expectEqual(KeyCode.UNKNOWN, scancodeToKeyCode(0x45, false));
-    try testing.expectEqual(KeyCode.UNKNOWN, scancodeToKeyCode(0x0C, false)); // '-' 位置
+    try testing.expectEqual(KeyCode.UNKNOWN, scancodeToKeyCode(0x0C, false)); // the '-' position
 }
 
-test "vkToKeyCode: scancode 表に無い特殊キーの fallback" {
+test "vkToKeyCode: the fallback for special keys missing from the scancode table" {
     try testing.expectEqual(KeyCode.PAUSE, vkToKeyCode(VK_PAUSE));
     try testing.expectEqual(KeyCode.PRINT_SCREEN, vkToKeyCode(VK_SNAPSHOT));
     try testing.expectEqual(KeyCode.F13, vkToKeyCode(0x7C));
     try testing.expectEqual(KeyCode.UP, vkToKeyCode(VK_UP));
-    // generic 修飾（解決前）や英字 VK はここでは扱わない → UNKNOWN（scancode に委ねる）
+    // a generic modifier (before it is resolved) and a letter VK are not handled here → UNKNOWN (left to the scancode)
     try testing.expectEqual(KeyCode.UNKNOWN, vkToKeyCode(VK_SHIFT));
-    try testing.expectEqual(KeyCode.UNKNOWN, vkToKeyCode(0x41)); // 'A' VK は scancode 側で
+    try testing.expectEqual(KeyCode.UNKNOWN, vkToKeyCode(0x41)); // the 'A' VK goes through the scancode
 }
 
-test "wheelDelta: 符号・係数（X11 と整合）" {
+test "wheelDelta: the signs and factors, consistent with X11" {
     try testing.expectEqual(@as(f32, 16.0), wheelDelta(WHEEL_DELTA, false).dy);
     try testing.expectEqual(@as(f32, -16.0), wheelDelta(-WHEEL_DELTA, false).dy);
     try testing.expectEqual(@as(f32, 0.0), wheelDelta(WHEEL_DELTA, false).dx);

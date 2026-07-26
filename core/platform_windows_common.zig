@@ -1,28 +1,28 @@
-//! Windows platform backend — 描画方式非依存の Win32 共通層（TASK-35）
+//! The Windows platform backend: the Win32 layer shared regardless of the drawing method
 //!
-//! GDI（`platform_windows_gdi.zig`）と D3D11-DXGI（`platform_windows_d3d11.zig`）の両 backend が
-//! 共有する Win32 経路をここに集約する。共有対象は **描画方式に依存しない部分のみ**:
-//!   - Win32 型 / 定数 / extern（user32 / kernel32 / comdlg32。gdi32 や D3D11 は各 backend 側）
-//!   - window class 登録 / 解除（`init` / `shutdown`）と QPC `getTime`
-//!   - message pump / WndProc / 入力ハンドラ（`platform_windows_input.zig` の純変換を呼ぶ）
-//!   - event queue / button 追跡 / last mouse 座標（`Core`）
-//!   - canonical BGRA CPU framebuffer `backing: []u32`（両 backend が present 元として読む）
-//!   - file dialog（comdlg32）
+//! It gathers the Win32 paths that the GDI (`platform_windows_gdi.zig`) and D3D11-DXGI
+//! (`platform_windows_d3d11.zig`) backends have in common. **Only what is independent of the drawing method** is shared:
+//!   - the Win32 types, constants and externs (user32, kernel32, comdlg32; gdi32 and D3D11 stay in each backend)
+//!   - registering and unregistering the window class (`init` and `shutdown`), and the QPC `getTime`
+//!   - the message pump, the WndProc and the input handlers (which call the pure translation in `platform_windows_input.zig`)
+//!   - the event queue, the button tracking and the last mouse coordinates (`Core`)
+//!   - the canonical BGRA CPU framebuffer `backing: []u32` (which both backends read at present time)
+//!   - the file dialogs (comdlg32)
 //!
-//! backend 固有（presentation resource、`Framebuffer` の生成元 lock/present、resource lifecycle）は
-//! 各 backend ファイルに残す。`Core` は GWLP_USERDATA に格納され WndProc から `*Core` で引かれる。
+//! What is backend specific (the presentation resources, the lock and present that produce a
+//! `Framebuffer`, the resource lifecycle) stays in each backend's file. `Core` is stored in GWLP_USERDATA and fetched as a `*Core` from the WndProc.
 //!
-//! 本ファイルは元 `platform_windows.zig`（GDI 一体実装）から **挙動を変えない純粋な移動**として切り出した。
+//! Nothing here changes behaviour: it is a pure move out of the earlier single-file GDI implementation.
 //!
-//! TASK-113.4: `WM_DROPFILES` の登録・処理は行わない stub。
-//! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
+//! `WM_DROPFILES` is a stub: neither the registration nor the handling is implemented.
+//! `Event.file_drop` exists as a type, but this backend never produces one.
 //!
-//! TASK-156.5 Stage 4（HiDPI / `.physical`）:
-//! - `SetThreadDpiAwarenessContext(PMv2)` を `.physical` window 生成時だけ一時適用（`.logical` は起動時 awareness のまま）。
-//! - 実 awareness（`GetWindowDpiAwarenessContext`）で入力 raw 化と content_scale を分岐（fb_mode 決め打ちではない）。
-//! - `.logical`+PMv2 縮退時は content_scale=1.0 強制（R9 寸法契約）。
-//! - WM_SIZE / WM_DPICHANGED は pending のみ → `lockFramebuffer` 境界で一括 commit。
-//! - ホットパス宣言: 初期化時 / イベント時 / lock 境界のみ（フレーム毎・RT ではない）。
+//! HiDPI and `.physical`:
+//! - `SetThreadDpiAwarenessContext(PMv2)` is applied temporarily, only while creating a `.physical` window (`.logical` keeps the start-up awareness).
+//! - Making input raw, and content_scale, branch on the real awareness (`GetWindowDpiAwarenessContext`), not on fb_mode.
+//! - When `.logical` degrades onto PMv2, content_scale is forced to 1.0 (the size contract).
+//! - WM_SIZE and WM_DPICHANGED only mark things pending → they are committed together at the `lockFramebuffer` boundary.
+//! - Hot path declaration: initialisation, event time and the lock boundary only (neither per frame nor real time).
 
 const std = @import("std");
 const win = std.os.windows;
@@ -59,8 +59,8 @@ const LONG_PTR = win.LONG_PTR;
 const LPCWSTR = win.LPCWSTR;
 const LPWSTR = win.LPWSTR;
 
-// std.os.windows がこの版で公開していない型は自前定義（ABI 互換のスカラ / extern struct）。
-// BOOL は std.os.windows では独自 Bool 型だが、`!= 0` 比較を素直にするため i32（Win32 ABI 互換）にする。
+// The types this version of std.os.windows does not expose are defined here (ABI-compatible scalars and extern structs).
+// BOOL is its own Bool type in std.os.windows, but it is an i32 here (ABI compatible with Win32) so that a `!= 0` comparison reads naturally.
 pub const BOOL = i32;
 pub const WPARAM = usize;
 pub const LRESULT = isize;
@@ -70,30 +70,30 @@ pub const RECT = extern struct { left: LONG, top: LONG, right: LONG, bottom: LON
 pub const alloc = std.heap.c_allocator;
 
 // ============================================================================
-// Win32 定数（winuser.h / commdlg.h の ABI 安定値）
+// The Win32 constants (the ABI-stable values of winuser.h and commdlg.h)
 // ============================================================================
 const CS_VREDRAW: UINT = 0x0001;
 const CS_HREDRAW: UINT = 0x0002;
 const WS_CAPTION: DWORD = 0x00C00000;
 const WS_SYSMENU: DWORD = 0x00080000;
 const WS_MINIMIZEBOX: DWORD = 0x00020000;
-const WS_THICKFRAME: DWORD = 0x00040000; // リサイズ枠（TASK-23）
+const WS_THICKFRAME: DWORD = 0x00040000; // a resizable frame
 const WS_MAXIMIZEBOX: DWORD = 0x00010000;
-const WS_POPUP: DWORD = 0x80000000; // 装飾なし（フルスクリーン用。TASK-100.1）
-const WINDOW_STYLE: DWORD = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX; // 自由リサイズ
-// フルスクリーン: 装飾なし + 初期表示。client=window 全面（AdjustWindowRectEx 不要）。
+const WS_POPUP: DWORD = 0x80000000; // undecorated (for fullscreen)
+const WINDOW_STYLE: DWORD = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX; // resizes freely
+// Fullscreen: undecorated plus shown at once. client == the whole window (no AdjustWindowRectEx needed).
 const FULLSCREEN_STYLE: DWORD = WS_POPUP | WS_VISIBLE;
 const WS_VISIBLE: DWORD = 0x10000000;
-const SM_CXSCREEN: c_int = 0; // プライマリモニタ幅（GetSystemMetrics。TASK-100.1）
-const SM_CYSCREEN: c_int = 1; // プライマリモニタ高さ
+const SM_CXSCREEN: c_int = 0; // the width of the primary monitor (GetSystemMetrics)
+const SM_CYSCREEN: c_int = 1; // the height of the primary monitor
 
-// 透過 / borderless ウィンドウ + ドラッグ移動（TASK-104.1）
-const WS_EX_LAYERED: DWORD = 0x00080000; // per-pixel alpha 合成（UpdateLayeredWindow）
-const WS_EX_TOOLWINDOW: DWORD = 0x00000080; // タスクバーに出さない（マスコット向け）
-const BORDERLESS_STYLE: DWORD = WS_POPUP; // 枠・タイトルバーなし（WS_VISIBLE は付けず ShowWindow で表示）
+// Transparent and borderless windows, plus drag-to-move
+const WS_EX_LAYERED: DWORD = 0x00080000; // per-pixel alpha compositing (UpdateLayeredWindow)
+const WS_EX_TOOLWINDOW: DWORD = 0x00000080; // keep it off the taskbar (for a mascot)
+const BORDERLESS_STYLE: DWORD = WS_POPUP; // no frame and no title bar (WS_VISIBLE is not set; ShowWindow displays it)
 const ULW_ALPHA: DWORD = 0x00000002; // UpdateLayeredWindow: per-pixel alpha
 const AC_SRC_OVER: u8 = 0x00;
-const AC_SRC_ALPHA: u8 = 0x01; // 供給元は premultiplied alpha
+const AC_SRC_ALPHA: u8 = 0x01; // what is supplied is premultiplied alpha
 const HWND_TOPMOST: isize = -1;
 const HWND_NOTOPMOST: isize = -2;
 const SWP_NOMOVE: UINT = 0x0002;
@@ -108,7 +108,7 @@ const TPM_RETURNCMD: UINT = 0x0100;
 const TPM_RIGHTBUTTON: UINT = 0x0002;
 const QUIT_MENU_ID: UINT = 1;
 
-const HGDIOBJ = win.HANDLE; // GDI オブジェクトハンドル（std.os.windows に HGDIOBJ 別名が無いため HANDLE を使う）
+const HGDIOBJ = win.HANDLE; // A GDI object handle (std.os.windows has no HGDIOBJ alias, so HANDLE is used)
 const SIZE = extern struct { cx: LONG, cy: LONG };
 const BLENDFUNCTION = extern struct {
     BlendOp: u8,
@@ -131,7 +131,7 @@ const BITMAPINFOHEADER = extern struct {
 };
 const BITMAPINFO = extern struct { bmiHeader: BITMAPINFOHEADER, bmiColors: [1]u32 = .{0} };
 
-// 透過 present（UpdateLayeredWindow）/ ドラッグ / 最前面 / メニュー用の Win32 API。
+// The Win32 APIs behind the transparent present (UpdateLayeredWindow), dragging, always-on-top and the menu.
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?win.HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: win.HDC) callconv(.winapi) c_int;
 extern "user32" fn UpdateLayeredWindow(hWnd: HWND, hdcDst: ?win.HDC, pptDst: ?*const POINT, psize: ?*const SIZE, hdcSrc: ?win.HDC, pptSrc: ?*const POINT, crKey: DWORD, pblend: ?*const BLENDFUNCTION, dwFlags: DWORD) callconv(.winapi) BOOL;
@@ -159,15 +159,15 @@ const IDC_ARROW: usize = 32512;
 
 const WM_DESTROY: UINT = 0x0002;
 const WM_CLOSE: UINT = 0x0010;
-const WM_SIZE: UINT = 0x0005; // client area リサイズ（TASK-23）
-const SIZE_MINIMIZED: WPARAM = 1; // WM_SIZE wparam（最小化は無視）
+const WM_SIZE: UINT = 0x0005; // a client area resize
+const SIZE_MINIMIZED: WPARAM = 1; // the wparam of WM_SIZE (minimising is ignored)
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
-const WM_CHAR: UINT = 0x0102; // 確定文字 (TASK-22。TranslateMessage が WM_KEYDOWN から生成)
+const WM_CHAR: UINT = 0x0102; // a committed character (TranslateMessage produces it from WM_KEYDOWN)
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_SYSKEYUP: UINT = 0x0105;
-const WM_KILLFOCUS: UINT = 0x0008; // フォーカス喪失 → 押下中ボタンを解放（取り逃し防止）
-const WM_CAPTURECHANGED: UINT = 0x0215; // capture 喪失 → 同上
+const WM_KILLFOCUS: UINT = 0x0008; // focus lost → release the held buttons (so none is missed)
+const WM_CAPTURECHANGED: UINT = 0x0215; // capture lost → the same
 const WM_MOUSEMOVE: UINT = 0x0200;
 const WM_LBUTTONDOWN: UINT = 0x0201;
 const WM_LBUTTONUP: UINT = 0x0202;
@@ -177,10 +177,10 @@ const WM_MBUTTONDOWN: UINT = 0x0207;
 const WM_MBUTTONUP: UINT = 0x0208;
 const WM_MOUSEWHEEL: UINT = 0x020A;
 const WM_MOUSEHWHEEL: UINT = 0x020E;
-const WM_DPICHANGED: UINT = 0x02E0; // per-monitor DPI 変更（主に PMv2 window。TASK-156.5 Stage 4）
+const WM_DPICHANGED: UINT = 0x02E0; // a per-monitor DPI change (mostly on a PMv2 window)
 
-const KF_REPEAT_BIT: usize = 0x40000000; // lParam bit30: 直前に押下されていた（リピート）
-const KF_EXTENDED_BIT: usize = 0x01000000; // lParam bit24: 拡張キー（右 Ctrl/Alt, テンキー Enter 等）
+const KF_REPEAT_BIT: usize = 0x40000000; // lParam bit 30: it was already down (a repeat)
+const KF_EXTENDED_BIT: usize = 0x01000000; // lParam bit 24: an extended key (right Ctrl/Alt, the keypad Enter and so on)
 const SWP_NOZORDER: UINT = 0x0004;
 
 // commdlg OPENFILENAME Flags
@@ -191,7 +191,7 @@ const OFN_PATHMUSTEXIST: DWORD = 0x00000800;
 const OFN_FILEMUSTEXIST: DWORD = 0x00001000;
 
 // ============================================================================
-// Win32 構造体（extern。winuser.h / commdlg.h の layout）
+// The Win32 structs (extern; the layouts of winuser.h and commdlg.h)
 // ============================================================================
 const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 
@@ -247,7 +247,7 @@ const OPENFILENAMEW = extern struct {
 };
 
 // ============================================================================
-// Win32 関数（extern fn。@cImport しない。zig 同梱 MinGW import lib が解決）
+// The Win32 functions (extern fn, with no @cImport; the MinGW import libs shipped with zig resolve them)
 // ============================================================================
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) BOOL;
@@ -278,24 +278,24 @@ extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
-extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.winapi) c_int; // プライマリモニタ寸法（TASK-100.1）
+extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.winapi) c_int; // the size of the primary monitor
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
 extern "user32" fn ScreenToClient(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
-extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16; // 修飾の現在状態（高位ビット=押下）
+extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16; // the current modifier state (the high bit means held)
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "user32" fn UnregisterClassW(lpClassName: LPCWSTR, hInstance: ?HINSTANCE) callconv(.winapi) BOOL;
 
-// TASK-156.5 Stage 4: DPI awareness / per-monitor scale（Win10 1607+。失敗時は no-op フォールバック）
-// DPI_AWARENESS_CONTEXT は opaque handle（*anyopaque。ABI 上は HANDLE 相当）
+// DPI awareness and the per-monitor scale (Windows 10 1607 and later; a failure falls back to a no-op)
+// A DPI_AWARENESS_CONTEXT is an opaque handle (*anyopaque, which is a HANDLE by ABI)
 pub const DPI_AWARENESS_CONTEXT = ?*anyopaque;
 // winuser.h: #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
 extern "user32" fn GetThreadDpiAwarenessContext() callconv(.winapi) DPI_AWARENESS_CONTEXT;
-extern "user32" fn SetThreadDpiAwarenessContext(dpiContext: DPI_AWARENESS_CONTEXT) callconv(.winapi) DPI_AWARENESS_CONTEXT; // 戻り値=直前の context。失敗時 null
+extern "user32" fn SetThreadDpiAwarenessContext(dpiContext: DPI_AWARENESS_CONTEXT) callconv(.winapi) DPI_AWARENESS_CONTEXT; // The return value is the previous context, or null on failure
 extern "user32" fn GetWindowDpiAwarenessContext(hwnd: HWND) callconv(.winapi) DPI_AWARENESS_CONTEXT;
 extern "user32" fn AreDpiAwarenessContextsEqual(dpiContextA: DPI_AWARENESS_CONTEXT, dpiContextB: DPI_AWARENESS_CONTEXT) callconv(.winapi) BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) UINT;
@@ -307,17 +307,17 @@ extern "comdlg32" fn GetOpenFileNameW(unnamedParam1: *OPENFILENAMEW) callconv(.w
 extern "comdlg32" fn CommDlgExtendedError() callconv(.winapi) DWORD;
 
 // ============================================================================
-// TASK-156.5 Stage 4: 高 DPI 共通ヘルパー（X11 Stage 2 / Wayland Stage 3 と bit 一致。単体テスト対象）
-// ホットパス宣言: 初期化時 / イベント時 / lock 境界のみ（フレーム毎・RT ではない）。
+// The shared high-DPI helpers (bit-identical to X11's and Wayland's; unit tested)
+// Hot path declaration: initialisation, event time and the lock boundary only (neither per frame nor real time).
 // ============================================================================
 
-/// 入力正規化用の実スケール（query 用。lock 前・都度再取得）。fb_mode に非依存。
+/// The real scale used for input normalisation (for a query; re-read each time, before a lock). Independent of fb_mode.
 pub fn effectiveContentScale(raw_scale: f32) f32 {
     return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
 }
 
-/// objc の (int)lround((double)px * (double)scale) と数値一致させる。
-/// 有限値 [1, u32最大] にクランプする（1未満→1、u32最大超過→u32最大）。
+/// Numerically identical to objc's (int)lround((double)px * (double)scale).
+/// Clamps to a finite value in [1, the maximum u32] (below 1 → 1, above the maximum u32 → the maximum u32).
 pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
     const v: f64 = @round(@as(f64, @floatFromInt(logical_px)) * s);
@@ -326,7 +326,7 @@ pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     return @intFromFloat(v);
 }
 
-/// framebuffer 物理サイズ。.logical は常に logical そのもの（R9 の構造的保証はここに集約）。
+/// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
 pub fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
     if (fb_mode == .logical) return logical;
     return .{
@@ -335,7 +335,7 @@ pub fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, s
     };
 }
 
-/// DPI 値（96 = 100%）→ content_scale。0 / 非有限は 1.0。
+/// A DPI value (96 = 100%) → content_scale. Zero and non-finite give 1.0.
 fn scaleFromDpi(dpi: UINT) f32 {
     if (dpi == 0) return 1.0;
     const s: f32 = @as(f32, @floatFromInt(dpi)) / 96.0;
@@ -346,31 +346,31 @@ fn isPmv2Context(ctx: DPI_AWARENESS_CONTEXT) bool {
     return AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0;
 }
 
-/// `.physical` window 生成中に切り替えた thread awareness を init 時点の context へ戻す。
+/// Restore the thread awareness that was switched while creating a `.physical` window back to the context held at init.
 fn restoreThreadDpiAwareness() void {
     _ = SetThreadDpiAwarenessContext(g_startup_dpi_awareness);
 }
 
 // ============================================================================
-// init / shutdown（プロセス単一のウィンドウクラス + QPC 周波数）
+// init and shutdown (one window class and one QPC frequency per process)
 // ============================================================================
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VideoProtoWindowClass");
 
 var g_hinstance: ?HINSTANCE = null;
 var g_class_registered: bool = false;
 var g_qpc_freq: f64 = 1.0;
-/// platform.init() 時点の thread DPI awareness（`.logical` window 生成はこれを保つ。TASK-156.5 Stage 4）。
+/// The thread's DPI awareness as of platform.init() (creating a `.logical` window keeps it).
 var g_startup_dpi_awareness: DPI_AWARENESS_CONTEXT = null;
 
 pub fn init() Error!void {
     if (g_class_registered) return;
 
     const hinst = GetModuleHandleW(null) orelse return error.InitFailed;
-    // GetModuleHandleW(null) は HMODULE。HINSTANCE と同一表現。
+    // GetModuleHandleW(null) gives an HMODULE, which is represented identically to an HINSTANCE.
     g_hinstance = @ptrCast(hinst);
 
-    // TASK-156.5 Stage 4: 起動時（何も触っていない）thread awareness を保存。
-    // `.logical` 生成はこの context のまま、`.physical` のみ一時的に PMv2 へ切り替える。
+    // Save the thread awareness at start-up, before anything has touched it.
+    // A `.logical` window is created with that context untouched; only `.physical` switches temporarily to PMv2.
     g_startup_dpi_awareness = GetThreadDpiAwarenessContext();
 
     var wc = std.mem.zeroes(WNDCLASSEXW);
@@ -379,7 +379,7 @@ pub fn init() Error!void {
     wc.lpfnWndProc = &wndProc;
     wc.hInstance = g_hinstance.?;
     wc.hCursor = LoadCursorW(null, @ptrFromInt(IDC_ARROW));
-    wc.hbrBackground = null; // 背景消去しない（present の blit で全面を描くため。ちらつき防止）
+    wc.hbrBackground = null; // Do not erase the background (present's blit covers the whole area, and erasing would flicker)
     wc.lpszClassName = class_name;
     if (RegisterClassExW(&wc) == 0) return error.InitFailed;
     g_class_registered = true;
@@ -391,7 +391,7 @@ pub fn init() Error!void {
 }
 
 pub fn shutdown() void {
-    // init と対称にクラス登録を解除する（全 window が destroy 済み前提）。失敗（未登録/window 残存）は無視。
+    // Unregister the class, symmetrically with init (every window is assumed destroyed). A failure (not registered, a window still alive) is ignored.
     if (g_class_registered) {
         _ = UnregisterClassW(class_name, g_hinstance);
         g_class_registered = false;
@@ -405,36 +405,36 @@ pub fn getTime() f64 {
 }
 
 // ============================================================================
-// Core — 描画方式非依存の window 状態（両 backend が内包する）
+// Core: the window state independent of the drawing method (embedded by both backends)
 // ============================================================================
 
 pub const Core = struct {
     hwnd: HWND,
-    /// framebuffer / backing の実寸法（物理px。`.logical` では logical と同値）。
-    /// present（StretchDIBits / swap chain）は常にこの寸法を使う。
+    /// The real size of the framebuffer and the backing (in physical pixels; equal to the logical one under `.logical`).
+    /// present (StretchDIBits or the swap chain) always uses this size.
     width: u32,
     height: u32,
-    /// 独立保持する論理サイズ（`physical/scale` の逆算に依存しない。lround は非可逆）。
+    /// The logical size, held independently (never derived back from `physical/scale`, since lround is lossy).
     logical_width: u32,
     logical_height: u32,
 
-    // TASK-156.5 Stage 4: HiDPI / `.physical`
+    // HiDPI and `.physical`
     fb_mode: FramebufferMode,
-    /// window 生成直後に `GetWindowDpiAwarenessContext` で確定した実 awareness が PMv2 か。
-    /// 入力座標変換分岐の正（fb_mode 決め打ちではない）。
+    /// Whether the real awareness settled by `GetWindowDpiAwarenessContext` right after creation is PMv2.
+    /// It is the authority for how input coordinates are converted (not fb_mode).
     is_pmv2: bool,
-    /// query 用（入力 raw 化・`contentScale()`）。WM_DPICHANGED で更新。
+    /// For a query (making input raw, and `contentScale()`). Updated by WM_DPICHANGED.
     pending_content_scale: f32,
-    /// latched（`lockFramebuffer` snapshot）。pending → lock 境界で commit。
+    /// The latched value (the `lockFramebuffer` snapshot). Pending → committed at the lock boundary.
     content_scale: f32,
     scale_epoch: u64,
-    /// WM_SIZE / WM_DPICHANGED 由来の pending client 寸法（window 実ピクセル）。
-    /// `.logical` では logical==fb、`.physical`(PMv2) では physical。lock 境界で commit。
+    /// The pending client size (in real window pixels) coming from WM_SIZE or WM_DPICHANGED.
+    /// Under `.logical` logical==fb; under `.physical` (PMv2) it is physical. Committed at the lock boundary.
     pending_client_w: u32,
     pending_client_h: u32,
     metrics_dirty: bool,
 
-    // canonical BGRA framebuffer（caller が書く。lockFramebuffer が返す。present が直接読む）。
+    // The canonical BGRA framebuffer (what the caller writes, what lockFramebuffer returns, and what present reads directly).
     backing: []u32,
 
     // events
@@ -442,22 +442,22 @@ pub const Core = struct {
     quit_delivered: bool,
     queue: input.EventQueue,
 
-    // 入力 post-state
-    buttons: MouseButtons, // 現在押下中のマウスボタン集合
-    last_x: i32, // 直近のマウス raw physical 座標（focus/capture 喪失時の synthetic mouse_up 用）
+    // the input post-state
+    buttons: MouseButtons, // the set of mouse buttons currently held
+    last_x: i32, // The most recent raw physical mouse coordinates (for the synthetic mouse_up on losing focus or capture)
     last_y: i32,
 
-    // ライブリサイズ再描画 (TASK-23.1)。未登録時は null。destroy で clear。
+    // The live-resize redraw. null while nothing is registered; destroy clears it.
     redraw_ctx: *anyopaque = undefined,
     redraw_fn: ?*const fn (ctx: *anyopaque) void = null,
 
-    // 透過ウィンドウ (TASK-104.1)。true なら present は StretchDIBits ではなく
-    // UpdateLayeredWindow（premultiplied BGRA backing を per-pixel alpha 合成）を使う。
+    // A transparent window. When true, present uses UpdateLayeredWindow (compositing the premultiplied BGRA
+    // backing with per-pixel alpha) rather than StretchDIBits.
     transparent: bool = false,
-    // 透過 present 用のキャッシュ資源（フレーム毎の DIB/DC 作成を避ける。size 変化時のみ再作成）。
+    // The resources cached for the transparent present (which avoids creating a DIB and a DC per frame; they are rebuilt only when the size changes).
     layer_dc: ?win.HDC = null,
     layer_dib: ?HGDIOBJ = null,
-    layer_old_bmp: ?HGDIOBJ = null, // DC に元々選択されていた bitmap（DIB 破棄前に再選択して deselect する）
+    layer_old_bmp: ?HGDIOBJ = null, // The bitmap originally selected into the DC (reselected to deselect the DIB before it is destroyed)
     layer_bits: ?[*]u32 = null,
     layer_w: u32 = 0,
     layer_h: u32 = 0,
@@ -470,22 +470,22 @@ pub const Core = struct {
         return self.queue.dequeue();
     }
 
-    /// window を生成し、canonical BGRA backing を確保して `*Core`（heap）を返す。
-    /// presentation resource は持たない（各 backend が create で別途用意する）。
+    /// Create the window, allocate the canonical BGRA backing, and return a `*Core` (on the heap).
+    /// It holds no presentation resource (each backend prepares its own in create).
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!*Core {
         return createInternal(width, height, title, false, .{});
     }
 
-    /// 透過 / borderless オプション付き作成（TASK-104.1）。各 backend の Window.createWithOptions から呼ぶ。
-    /// transparent → WS_EX_LAYERED + UpdateLayeredWindow present。borderless → WS_POPUP + タスクバー非表示。
-    /// ホットパス宣言: 初期化時のみ。
+    /// Create with the transparency and borderless options. Called from each backend's Window.createWithOptions.
+    /// transparent → WS_EX_LAYERED plus an UpdateLayeredWindow present. borderless → WS_POPUP plus hidden from the taskbar.
+    /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!*Core {
         return createInternal(width, height, title, false, opts);
     }
 
-    /// 本物のフルスクリーン window を作成する（TASK-100.1）。プライマリモニタ全面を覆う
-    /// 装飾なし（WS_POPUP）window を (0,0) に置く。実サイズは `GetSystemMetrics` で取得し、
-    /// backing / core.width/height もその寸法になる（gdi/d3d11 の presentation はこれに追従）。
+    /// Create a real fullscreen window. It places an undecorated (WS_POPUP) window covering the whole
+    /// primary monitor at (0,0). The real size comes from `GetSystemMetrics`, and the backing and
+    /// core.width/height take that size too (the presentation of gdi and d3d11 follows it).
     pub fn createFullscreen(title: [:0]const u8) Error!*Core {
         const sw = GetSystemMetrics(SM_CXSCREEN);
         const sh = GetSystemMetrics(SM_CYSCREEN);
@@ -497,39 +497,39 @@ pub const Core = struct {
         if (!g_class_registered) return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
 
-        // title を UTF-16 へ（Win32 は W API。スタックバッファで alloc 回避）。
+        // The title into UTF-16 (Win32 is the W API; a stack buffer avoids an allocation).
         var title_buf: [512]u16 = undefined;
         const tn = std.unicode.utf8ToUtf16Le(title_buf[0 .. title_buf.len - 1], title) catch return error.WindowCreationFailed;
         title_buf[tn] = 0;
         const title_ptr: LPCWSTR = @ptrCast(&title_buf);
 
-        // 通常: client area を width×height にするため outer 寸法を AdjustWindowRectEx で算出。
-        // フルスクリーン / borderless: WS_POPUP は装飾なしなので client=window。
-        // TASK-104.1: borderless=WS_POPUP、transparent=WS_EX_LAYERED、borderless は WS_EX_TOOLWINDOW で
-        // タスクバー非表示（マスコット向け）。透過フラグは present 経路の分岐に使う。
-        // 透過は WS_POPUP（枠なし）に統一する。titled + layered は UpdateLayeredWindow の psize
-        // （window 全体サイズ）が client サイズと食い違い、タイトルバー分の欠落 / WM_SIZE 縮小が起きるため。
-        // TASK-156.5 Stage 4: width/height 引数は論理サイズ。`.physical` は PMv2 下で物理 client 寸法に変換。
+        // Normally: the outer size is computed with AdjustWindowRectEx so that the client area is width×height.
+        // Fullscreen and borderless: WS_POPUP is undecorated, so client == window.
+        // borderless=WS_POPUP, transparent=WS_EX_LAYERED, and borderless adds WS_EX_TOOLWINDOW to stay off the
+        // taskbar (for a mascot). The transparency flag also selects the present path.
+        // Transparency is always WS_POPUP (no frame). Titled plus layered would make UpdateLayeredWindow's psize
+        // (the whole window size) disagree with the client size, losing the title bar's height or shrinking on WM_SIZE.
+        // The width and height arguments are logical. `.physical` converts them into a physical client size under PMv2.
         const borderless = opts.borderless or opts.transparent;
         const style: DWORD = if (fullscreen or borderless) BORDERLESS_STYLE else WINDOW_STYLE;
         var ex_style: DWORD = 0;
         if (opts.transparent) ex_style |= WS_EX_LAYERED;
-        if (borderless) ex_style |= WS_EX_TOOLWINDOW; // 枠なし/透過はタスクバー非表示（マスコット向け）
+        if (borderless) ex_style |= WS_EX_TOOLWINDOW; // frameless and transparent windows stay off the taskbar (for a mascot)
 
         const logical_w = width;
         const logical_h = height;
         const fb_mode = opts.fb_mode;
 
-        // `.physical`: 生成呼び出し中だけ thread awareness を PMv2 に一時切替。失敗は no-op フォールバック。
-        // `.logical`: 起動時 awareness のまま（context 切り替えなし）。
+        // `.physical`: the thread awareness is switched to PMv2 only for the duration of the creation call. A failure falls back to a no-op.
+        // `.logical`: the start-up awareness is kept (no context switch).
         var create_as_pmv2 = false;
         if (fb_mode == .physical) {
-            // Set 失敗（戻り値 null）でも Create は続行。thread が実際に PMv2 かで物理寸法の可否を判定。
+            // Create continues even when the Set fails (returning null). Whether the thread really is PMv2 decides whether a physical size is possible.
             _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             create_as_pmv2 = isPmv2Context(GetThreadDpiAwarenessContext());
         }
 
-        // 初期 scale 推定（生成前）。`.physical`+PMv2 のみ物理 client に使う。生成後 GetDpiForWindow で確定。
+        // The initial scale estimate (before creation). Only `.physical` plus PMv2 uses it for the physical client. GetDpiForWindow settles it after creation.
         var create_scale: f32 = 1.0;
         if (create_as_pmv2) {
             create_scale = scaleFromDpi(GetDpiForSystem());
@@ -545,14 +545,14 @@ pub const Core = struct {
             pos_x = 0;
             pos_y = 0;
         } else {
-            // TASK-117: 明示位置があれば CreateWindowExW に渡す（無ければ CW_USEDEFAULT）。
+            // An explicit position is passed to CreateWindowExW (without one it is CW_USEDEFAULT).
             if (opts.position) |pos| {
                 pos_x = pos.x;
                 pos_y = pos.y;
             }
             if (!borderless) {
-                // client area を client_w×client_h にするため outer 寸法を算出。
-                // `.physical`(PMv2) は DPI 考慮版、それ以外は従来の AdjustWindowRectEx。
+                // Compute the outer size so that the client area is client_w×client_h.
+                // `.physical` (PMv2) uses the DPI-aware variant, and everything else the ordinary AdjustWindowRectEx.
                 var rect = RECT{ .left = 0, .top = 0, .right = @intCast(client_w), .bottom = @intCast(client_h) };
                 if (create_as_pmv2) {
                     const dpi: UINT = blk: {
@@ -572,7 +572,7 @@ pub const Core = struct {
                 outer_w = rect.right - rect.left;
                 outer_h = rect.bottom - rect.top;
             }
-            // borderless: client=window。位置未指定時は CW_USEDEFAULT のまま。
+            // borderless: client == window. Without an explicit position it stays CW_USEDEFAULT.
         }
 
         const core = alloc.create(Core) catch {
@@ -581,7 +581,7 @@ pub const Core = struct {
         };
         errdefer alloc.destroy(core);
 
-        // 初期 backing は論理寸法ベースの fb 寸法（`.physical`+PMv2 なら物理）。生成後に確定 scale で必要なら再確保。
+        // The initial backing is the framebuffer size derived from the logical size (physical under `.physical` plus PMv2). It is reallocated after creation if the settled scale demands it.
         const init_fb = effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, if (create_as_pmv2) create_scale else 1.0);
         const px_count = std.math.mul(usize, init_fb.width, init_fb.height) catch {
             restoreThreadDpiAwareness();
@@ -601,7 +601,7 @@ pub const Core = struct {
             .logical_width = logical_w,
             .logical_height = logical_h,
             .fb_mode = fb_mode,
-            .is_pmv2 = false, // Create 後に確定
+            .is_pmv2 = false, // settled after Create
             .pending_content_scale = 1.0,
             .content_scale = 1.0,
             .scale_epoch = 0,
@@ -639,15 +639,15 @@ pub const Core = struct {
         };
         core.hwnd = hwnd;
 
-        // 実 window awareness を確定し content_scale / fb 寸法を確定する（ホットパス宣言: 初期化時のみ）。
-        // 注意: thread awareness の復元（restoreThreadDpiAwareness）は、この後に続く
-        // GetClientRect/GetWindowRect/SetWindowPos（生成直後の寸法確認・補正）が**すべて終わってから**
-        // 行う。これらの API は「呼び出し元スレッドの DPI awareness」次第で返す/解釈する座標が
-        // 変わる（呼び出し元が非対応に戻っていると、対応先のウィンドウの物理px座標を「非対応向けに
-        // 仮想化（scale で割った）値」として返してしまう）。早すぎる復元は、生成直後の実サイズ確認が
-        // 常に scale 分の１に縮んで見える誤読を引き起こし、不要な補正 SetWindowPos を誘発する
-        // （実測で確認済み。GetDpiForWindow/GetWindowDpiAwarenessContext 自体は常に真の値を返すため
-        // 影響を受けない）。
+        // Settle the real window awareness, and with it content_scale and the framebuffer size (hot path declaration: initialisation only).
+        // Note: restoring the thread awareness (restoreThreadDpiAwareness) happens only **after** all the
+        // GetClientRect/GetWindowRect/SetWindowPos calls below (the size check and correction right after
+        // creation) are done. What those APIs return and how they interpret coordinates depends on the calling
+        // thread's DPI awareness: with the caller back on unaware, they report an aware window's physical pixel
+        // coordinates virtualised for an unaware caller (divided by the scale). Restoring too early makes the
+        // size check right after creation always look shrunk by the scale, which provokes a needless corrective
+        // SetWindowPos (measured and confirmed; GetDpiForWindow and GetWindowDpiAwarenessContext themselves
+        // always report the true value and are unaffected).
         const win_ctx = GetWindowDpiAwarenessContext(hwnd);
         const is_pmv2 = isPmv2Context(win_ctx);
         core.is_pmv2 = is_pmv2;
@@ -657,29 +657,29 @@ pub const Core = struct {
             if (is_pmv2) {
                 scale = scaleFromDpi(GetDpiForWindow(hwnd));
             } else {
-                // PMv2 確定不可 → scale 検出不可。物理==論理の no-op フォールバック（hard error にしない）。
+                // PMv2 could not be settled → the scale cannot be detected. It falls back to physical == logical (never a hard error).
                 scale = 1.0;
             }
         } else {
             // `.logical`
             if (is_pmv2) {
-                // 起動時デフォルトが既に PMv2 の稀な環境: この window に限り content_scale=1.0（R1 同型）。
+                // The rare environment whose start-up default is already PMv2: for this window alone, content_scale=1.0.
                 scale = 1.0;
             } else {
-                // 典型ケース（OS 仮想化）: 実 DPI 由来 scale を報告（入力 raw = native×scale）。
+                // The typical case (OS virtualisation): report the scale from the real DPI (raw input = native × scale).
                 scale = scaleFromDpi(GetDpiForWindow(hwnd));
             }
         }
         core.pending_content_scale = scale;
         core.content_scale = scale;
 
-        // 確定 scale に基づく framebuffer 寸法。`.physical` で生成時推定と差があれば window/backing を合わせる。
+        // The framebuffer size implied by the settled scale. Under `.physical`, a difference from the estimate at creation brings the window and the backing into line.
         const final_fb = effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, scale);
         if (final_fb.width != core.width or final_fb.height != core.height) {
             core.resizeBacking(final_fb.width, final_fb.height);
-            // OOM 時は旧サイズ維持（window は残す）。
+            // On an OOM the old size is kept (the window survives).
         }
-        // `.physical`+PMv2: 生成時 GetDpiForSystem 推定と GetDpiForWindow 確定がずれたら client を物理寸法へ補正。
+        // `.physical` plus PMv2: when the GetDpiForSystem estimate at creation and the settled GetDpiForWindow disagree, the client is corrected to the physical size.
         if (fb_mode == .physical and is_pmv2 and !fullscreen and !borderless) {
             var cr0 = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
             if (GetClientRect(hwnd, &cr0) != 0) {
@@ -707,20 +707,20 @@ pub const Core = struct {
                 }
             }
         }
-        // 実際の client 矩形を pending に反映（OS が少し違う寸法にした場合に備える）。
+        // Record the real client rectangle as pending (in case the OS chose a slightly different size).
         var cr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         if (GetClientRect(hwnd, &cr) != 0) {
             const cw: u32 = @intCast(@max(cr.right - cr.left, 1));
             const ch: u32 = @intCast(@max(cr.bottom - cr.top, 1));
             core.pending_client_w = cw;
             core.pending_client_h = ch;
-            // client が確定している場合、backing を client に合わせる
-            // （effectiveFramebufferSize と OS client の 1px 差を吸収。`.logical` も client=logical 契約）。
+            // Once the client is settled, the backing is brought into line with it
+            // (which absorbs a 1px difference between effectiveFramebufferSize and the OS client; `.logical` also contracts client == logical).
             if (cw != core.width or ch != core.height) {
                 core.resizeBacking(cw, ch);
             }
-            // `.physical` の logical は独立保持（引数の論理値）。client との差は scale の丸め。
-            // `.logical` の logical は client 寸法そのもの。
+            // Under `.physical` the logical size is held independently (the argument's logical value). The difference from the client is the scale's rounding.
+            // Under `.logical` the logical size is the client size itself.
             if (fb_mode == .logical) {
                 core.logical_width = cw;
                 core.logical_height = ch;
@@ -731,12 +731,12 @@ pub const Core = struct {
         }
         core.metrics_dirty = false;
 
-        // `.physical` で一時切替した thread awareness を起動時 context へ復元する
-        // （上記の寸法確認・補正がすべて終わった後。早すぎる復元を避ける理由は上のコメント参照）。
+        // Restore the thread awareness that `.physical` switched temporarily back to the start-up context
+        // (only after all the size checks and corrections above; the reason not to restore it earlier is in the comment above).
         restoreThreadDpiAwareness();
 
-        // wndProc が Core を引けるよう GWLP_USERDATA に格納（CreateWindowExW 中の早期メッセージは
-        // userdata 未設定 → DefWindowProcW に落ちるだけで、入力イベントは発生しない）。
+        // Stored in GWLP_USERDATA so that wndProc can fetch the Core (an early message during CreateWindowExW
+        // finds no userdata and simply falls through to DefWindowProcW, producing no input event).
         _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(core)));
 
         _ = ShowWindow(hwnd, SW_SHOW);
@@ -744,8 +744,8 @@ pub const Core = struct {
         return core;
     }
 
-    /// pending（WM_SIZE / WM_DPICHANGED）→ latched を一括 commit する（TASK-156.5 Stage 4）。
-    /// gdi/d3d11 の `lockFramebuffer` 先頭から呼ぶ。ホットパス宣言: lock 境界のみ。
+    /// Commit pending (WM_SIZE / WM_DPICHANGED) into latched, all at once.
+    /// Called from the top of gdi's and d3d11's `lockFramebuffer`. Hot path declaration: the lock boundary only.
     pub fn applyLatchedMetricsIfNeeded(self: *Core) void {
         if (!self.metrics_dirty) return;
 
@@ -758,8 +758,8 @@ pub const Core = struct {
             return;
         }
 
-        // client 寸法は window 実ピクセル = framebuffer。
-        // `.logical`: client = logical = fb。`.physical`: client = physical = fb、logical は逆算。
+        // The client size is the real window pixel size = the framebuffer.
+        // `.logical`: client = logical = fb. `.physical`: client = physical = fb, and logical is derived back.
         const new_logical_w: u32 = if (self.fb_mode == .logical) cw else blk: {
             const s = new_scale;
             const v = @round(@as(f64, @floatFromInt(cw)) / @as(f64, s));
@@ -775,7 +775,7 @@ pub const Core = struct {
         const old_h = self.height;
         if (cw != self.width or ch != self.height) {
             self.resizeBacking(cw, ch);
-            // OOM 等で backing が更新できなければ dirty を残して次回 lock で再試行。
+            // When the backing cannot be updated (an OOM, say) dirty is left set and the next lock retries.
             if (self.width != cw or self.height != ch) return;
         }
 
@@ -788,14 +788,14 @@ pub const Core = struct {
         self.metrics_dirty = false;
     }
 
-    /// 現在のウィンドウ geometry（TASK-117）。位置=GetWindowRect。
-    /// サイズ=論理サイズ（`self.logical_width/height`。TASK-156.5 Stage 4）。
-    /// **物理px（`GetClientRect`/`self.width/height`）を返してはいけない**——呼び出し元（pixie の
-    /// `window_state` 永続化等）は `getGeometry().size` を次回起動の `WindowOptions.size`
-    /// （＝論理サイズとして解釈される値）にそのまま渡す設計のため、ここで物理px を返すと
-    /// `.physical` window で「保存→次回起動時に論理値として誤読→さらにスケール倍→保存…」の
-    /// 無限増殖（scale^N）を引き起こす（X11 の `getGeometry` が既に同じ理由で論理サイズ返却に
-    /// 修正済み。Windows は Stage 4 でこの移植を欠落させていた）。
+    /// The current window geometry. The position comes from GetWindowRect.
+    /// The size is the logical size (`self.logical_width/height`).
+    /// **It must never return physical pixels** (`GetClientRect` or `self.width/height`). A caller such as the
+    /// pixel editor's `window_state` persistence passes `getGeometry().size` straight into the next run's
+    /// `WindowOptions.size`, a value that is read as logical. Returning physical pixels here would therefore
+    /// make a `.physical` window grow without bound (scale^N): save → misread as logical on the next run →
+    /// scaled up again → saved, and so on. X11's `getGeometry` already returns the logical size for exactly
+    /// this reason.
     pub fn getGeometry(self: *Core) types.WindowGeometry {
         var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         const have_pos = GetWindowRect(self.hwnd, &wr) != 0;
@@ -805,27 +805,27 @@ pub const Core = struct {
         };
     }
 
-    /// TASK-104.1: 透過ウィンドウの present。premultiplied BGRA backing を per-pixel alpha 合成で表示する
-    /// （UpdateLayeredWindow）。gdi/d3d11 の present が core.transparent のとき StretchDIBits / swapchain の
-    /// 代わりに呼ぶ。
-    /// ホットパス宣言: フレーム毎。ただし DIB/DC は Core にキャッシュし **size 変化時のみ再作成**する
-    /// （フレーム毎の一時メモリ確保を避ける＝性能規約準拠）。毎フレームは backing→DIB の @memcpy 1 回 +
-    /// UpdateLayeredWindow のみで、新規の per-pixel ループ・alloc は無い。
+    /// The present of a transparent window: it displays the premultiplied BGRA backing by compositing it with
+    /// per-pixel alpha (UpdateLayeredWindow). gdi's and d3d11's present call it instead of StretchDIBits or the
+    /// swap chain while core.transparent.
+    /// Hot path declaration: per frame. The DIB and the DC are cached in Core, though, and **rebuilt only when
+    /// the size changes** (which avoids a temporary allocation per frame, keeping the performance rules). Every
+    /// frame does nothing but one @memcpy from the backing into the DIB plus UpdateLayeredWindow: no new per-pixel loop and no allocation.
     pub fn presentLayered(self: *Core) void {
         if (!self.ensureLayerResources()) return;
         const dst = self.layer_bits orelse return;
-        @memcpy(dst[0..self.backing.len], self.backing); // premultiplied BGRA をそのまま DIB へ
+        @memcpy(dst[0..self.backing.len], self.backing); // the premultiplied BGRA goes into the DIB as it is
         const w: c_int = @intCast(self.width);
         const h: c_int = @intCast(self.height);
         var size = SIZE{ .cx = w, .cy = h };
         var src_pt = POINT{ .x = 0, .y = 0 };
         var blend = BLENDFUNCTION{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
-        // hdcSrc は DIB を select 済みの memory DC。hdcDst=null で画面全体基準。
+        // hdcSrc is a memory DC with the DIB already selected. hdcDst=null means the whole screen is the reference.
         _ = UpdateLayeredWindow(self.hwnd, null, null, &size, self.layer_dc, &src_pt, 0, &blend, ULW_ALPHA);
     }
 
-    /// 透過 present 用の memory DC + top-down 32bpp DIB section を size に合わせて用意する。
-    /// 既にあり size 一致ならそのまま true。size 変化時は破棄→再作成。作成失敗時 false（present skip）。
+    /// Prepare the memory DC and the top-down 32bpp DIB section for the transparent present, at the given size.
+    /// When one already exists at that size it stays and returns true. A size change destroys and rebuilds it. A failed creation gives false (present skips).
     fn ensureLayerResources(self: *Core) bool {
         if (self.layer_dc != null and self.layer_w == self.width and self.layer_h == self.height) return true;
         self.freeLayerResources();
@@ -836,7 +836,7 @@ pub const Core = struct {
             .bmiHeader = .{
                 .biSize = @sizeOf(BITMAPINFOHEADER),
                 .biWidth = @intCast(self.width),
-                .biHeight = -@as(LONG, @intCast(self.height)), // top-down（backing の先頭 = 左上）
+                .biHeight = -@as(LONG, @intCast(self.height)), // top-down (the start of the backing is the top-left)
                 .biPlanes = 1,
                 .biBitCount = 32,
                 .biCompression = BI_RGB,
@@ -857,7 +857,7 @@ pub const Core = struct {
             _ = DeleteDC(mem_dc);
             return false;
         };
-        self.layer_old_bmp = SelectObject(mem_dc, dib); // DIB を select し元 bitmap を保存（破棄時に deselect 用）
+        self.layer_old_bmp = SelectObject(mem_dc, dib); // Select the DIB and keep the original bitmap (to deselect at destruction)
         self.layer_dc = mem_dc;
         self.layer_dib = dib;
         self.layer_bits = @ptrCast(@alignCast(raw));
@@ -868,7 +868,7 @@ pub const Core = struct {
 
     fn freeLayerResources(self: *Core) void {
         if (self.layer_dc) |dc| {
-            // 選択中の DIB は DeleteObject が失敗しリークするため、元 bitmap を再選択して deselect してから破棄。
+            // A DIB that is still selected fails to DeleteObject and leaks, so the original bitmap is reselected to deselect it before it is destroyed.
             if (self.layer_old_bmp) |old| _ = SelectObject(dc, old);
             if (self.layer_dib) |dib| _ = DeleteObject(dib);
             _ = DeleteDC(dc);
@@ -881,31 +881,31 @@ pub const Core = struct {
         self.layer_h = 0;
     }
 
-    /// TASK-104.1: OS の対話的ウィンドウ移動を開始する。左押下でキャプチャ済みなので先に解放してから
-    /// タイトルバー相当の移動メッセージを送る。ホットパス宣言: イベント時のみ。
+    /// Start the OS's interactive window move. The left press has already captured the mouse, so it is
+    /// released first and then the message equivalent to a title bar drag is sent. Hot path declaration: event time only.
     pub fn beginDrag(self: *Core) void {
         _ = ReleaseCapture();
         _ = SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
     }
 
-    /// TASK-104.1: 常に最前面（always-on-top）。ホットパス宣言: イベント時のみ。
+    /// Always-on-top. Hot path declaration: event time only.
     pub fn setAlwaysOnTop(self: *Core, on: bool) void {
         const after: HWND = @ptrFromInt(@as(usize, @bitCast(if (on) HWND_TOPMOST else HWND_NOTOPMOST)));
         _ = SetWindowPos(self.hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    /// TASK-104.1: クリック透過。**契約（Windows 固有）**: 透過(WS_EX_LAYERED)ウィンドウは
-    /// UpdateLayeredWindow の per-pixel alpha により alpha==0 の画素で **常に自動的に** click-through に
-    /// なる（本体=不透明画素はクリックを受け、透明余白は背後へ抜ける）。この挙動は透過を保ったまま
-    /// on/off できない（無効化には WS_EX_LAYERED 除去＝透過解除が要る）ため、本関数は意図的に no-op で、
-    /// 透過ウィンドウでは click-through が常時有効。非透過ウィンドウの per-pixel 透過は Windows では
-    /// layered 化前提で MVP 対象外（graceful degrade）。
+    /// Click-through. **The contract (specific to Windows)**: a transparent (WS_EX_LAYERED) window is
+    /// **always** click-through on a pixel whose alpha is 0, through UpdateLayeredWindow's per-pixel alpha
+    /// (the opaque artwork receives clicks and the transparent margin falls through). That cannot be turned on
+    /// and off while transparency remains (turning it off would mean removing WS_EX_LAYERED, i.e. dropping
+    /// transparency), so this function is deliberately a no-op and click-through is always on for a transparent
+    /// window. Per-pixel transparency on an opaque window presumes a layered window on Windows and is out of scope (it degrades gracefully).
     pub fn setClickThrough(self: *Core, on: bool) void {
         _ = self;
         _ = on;
     }
 
-    /// TASK-104.1: 終了メニューをポップアップする。「終了」選択で quit を積む。ホットパス宣言: イベント時のみ。
+    /// Pop up the quit menu. Choosing "Quit" pushes a quit. Hot path declaration: event time only.
     pub fn showQuitMenu(self: *Core) void {
         const menu = CreatePopupMenu() orelse return;
         defer _ = DestroyMenu(menu);
@@ -913,26 +913,26 @@ pub const Core = struct {
         _ = AppendMenuW(menu, MF_STRING, QUIT_MENU_ID, label);
         var pt: POINT = undefined;
         _ = GetCursorPos(&pt);
-        // 非アクティブ状態からのメニューは、前面化しないと外側クリックで閉じない（Win32 の定石）。
+        // A menu raised from an inactive state does not close on an outside click unless the window is brought to the front (the usual Win32 workaround).
         _ = SetForegroundWindow(self.hwnd);
         const cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.hwnd, null);
-        _ = PostMessageW(self.hwnd, WM_NULL, 0, 0); // 2 回目のメニューが即閉じする Win32 既知問題の回避（定石）
-        if (cmd != 0) { // TPM_RETURNCMD: 選択された項目 ID（QUIT_MENU_ID）
+        _ = PostMessageW(self.hwnd, WM_NULL, 0, 0); // The usual workaround for the known Win32 problem of a second menu closing immediately
+        if (cmd != 0) { // TPM_RETURNCMD: the id of the item chosen (QUIT_MENU_ID)
             self.closing = true;
             self.enqueue(.quit);
         }
     }
 
-    /// CPU backing を two-phase 再確保する（TASK-23 / TASK-156.5 Stage 4）。
-    /// 新確保に成功してから旧を解放（OOM 時は旧サイズ維持）。最小化/ゼロ/同サイズは no-op。
-    /// WM_SIZE からは直接呼ばず pending 経由で `applyLatchedMetricsIfNeeded`（lock 境界）が呼ぶ。
-    /// presentation resource（swap chain / DIB 等）の追従は各 backend が present 時に core 寸法と
-    /// 比較して行う（GDI は StretchDIBits が stateless、D3D11 は present 内で lazy に ResizeBuffers）。
+    /// Reallocate the CPU backing, in two phases.
+    /// The old one is freed only once the new one has been allocated (on an OOM the old size is kept). Minimised, zero, and an unchanged size are no-ops.
+    /// WM_SIZE never calls it directly: it goes through pending, and `applyLatchedMetricsIfNeeded` (at the lock boundary) calls it.
+    /// Keeping the presentation resources (the swap chain, the DIB) in step is each backend's job at present
+    /// time, by comparing against core's size (StretchDIBits is stateless on GDI, and D3D11 calls ResizeBuffers lazily inside present).
     fn resizeBacking(self: *Core, w: u32, h: u32) void {
         if (w == 0 or h == 0) return;
         if (w == self.width and h == self.height) return;
         const px_count = std.math.mul(usize, w, h) catch return;
-        const nb = alloc.alloc(u32, px_count) catch return; // 失敗 → 旧サイズ維持
+        const nb = alloc.alloc(u32, px_count) catch return; // failed → keep the old size
         @memset(nb, 0);
         alloc.free(self.backing);
         self.backing = nb;
@@ -940,23 +940,23 @@ pub const Core = struct {
         self.height = h;
     }
 
-    /// window を破棄し、backing と Core 自身を解放する。
-    /// （presentation resource の解放は backend 側が core.destroy より前に行う。）
+    /// Destroy the window and free the backing and the Core itself.
+    /// (Freeing the presentation resources is the backend's job, before core.destroy.)
     pub fn destroy(self: *Core) void {
         self.redraw_fn = null;
-        self.freeLayerResources(); // TASK-104.1: 透過 present のキャッシュ DIB/DC を解放
+        self.freeLayerResources(); // Free the DIB and DC cached for the transparent present
         _ = DestroyWindow(self.hwnd);
         alloc.free(self.backing);
         alloc.destroy(self);
     }
 
-    /// ライブリサイズ再描画コールバック登録（TASK-23.1）。
+    /// Register the live-resize redraw callback.
     pub fn setRedrawCallback(self: *Core, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         self.redraw_ctx = ctx;
         self.redraw_fn = cb;
     }
 
-    /// 表示中のタイトルを更新する。イベント時のみ。
+    /// Update the visible title. Event time only.
     pub fn setTitle(self: *Core, title: [:0]const u8) void {
         var title_buf: [512]u16 = undefined;
         const n = std.unicode.utf8ToUtf16Le(title_buf[0 .. title_buf.len - 1], title) catch return;
@@ -964,14 +964,14 @@ pub const Core = struct {
         _ = SetWindowTextW(self.hwnd, @ptrCast(&title_buf));
     }
 
-    /// destroy 用の private clear 経路（public API に null を通さない。TASK-23.1 実装メモ）。
+    /// The private clear path used by destroy (null never goes through the public API).
     pub fn clearRedrawCallback(self: *Core) void {
         self.redraw_fn = null;
     }
 
     pub fn pollEvents(self: *Core) bool {
         var msg: MSG = undefined;
-        // スレッドの全保留メッセージを処理（DispatchMessageW が wndProc を同期呼び出しし enqueue する）。
+        // Process every message pending on the thread (DispatchMessageW calls wndProc synchronously, which enqueues them).
         while (PeekMessageW(&msg, null, 0, 0, PM_REMOVE) != 0) {
             _ = TranslateMessage(&msg);
             _ = DispatchMessageW(&msg);
@@ -985,8 +985,8 @@ pub const Core = struct {
         return ev;
     }
 
-    /// WM_CLOSE の終了要求を consumer がキャンセルする。
-    /// ホットパス宣言: quit/close イベント時のみ。
+    /// Let the consumer cancel the quit request of WM_CLOSE.
+    /// Hot path declaration: quit/close events only.
     pub fn cancelQuit(self: *Core) void {
         self.closing = false;
         self.quit_delivered = false;
@@ -1002,8 +1002,8 @@ pub const Core = struct {
     }
 };
 
-/// Locked framebuffer view（公開 contract は canonical BGRA `[]u32`、u32 0xAARRGGBB）。
-/// present が backing を直接読むので unlock は no-op。両 backend で共通。
+/// A locked framebuffer view (the public contract is canonical BGRA `[]u32`, u32 0xAARRGGBB).
+/// present reads the backing directly, so unlock is a no-op. Shared by both backends.
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
@@ -1020,12 +1020,12 @@ pub const Framebuffer = struct {
 };
 
 // ============================================================================
-// WndProc + 入力ハンドラ（WM_* → platform.Event。純変換は platform_windows_input.zig）
+// The WndProc and the input handlers (WM_* → a platform.Event; the pure translation is platform_windows_input.zig)
 // ============================================================================
 
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     const raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (raw == 0) return DefWindowProcW(hwnd, msg, wparam, lparam); // 作成中の早期メッセージ等
+    if (raw == 0) return DefWindowProcW(hwnd, msg, wparam, lparam); // an early message during creation, and the like
     const core: *Core = @ptrFromInt(@as(usize, @bitCast(raw)));
 
     switch (msg) {
@@ -1037,11 +1037,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_SIZE => {
-            // 自由リサイズ（TASK-23 / TASK-156.5 Stage 4）。
-            // 最小化以外: pending client 寸法のみ記録し、backing/scale の commit は次 lock 境界
-            // （applyLatchedMetricsIfNeeded）。lparam: LOWORD=client width, HIWORD=client height。
-            // `.logical`: client=logical=fb。`.physical`(PMv2): client=physical=fb（logical は lock 時に逆算）。
-            // サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。WM_TIMER は不採用）。
+            // Free resizing.
+            // Anything but minimising records only the pending client size, and the backing and scale are committed at
+            // the next lock boundary (applyLatchedMetricsIfNeeded). lparam: LOWORD=the client width, HIWORD=the client height.
+            // `.logical`: client=logical=fb. `.physical` (PMv2): client=physical=fb (logical is derived back at lock time).
+            // The redraw callback fires only when the size really changed (WM_TIMER is deliberately not used).
             if (wparam != SIZE_MINIMIZED) {
                 const lw: u32 = @truncate(@as(usize, @bitCast(lparam)));
                 const new_w = lw & 0xFFFF;
@@ -1060,12 +1060,12 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_DPICHANGED => {
-            // TASK-156.5 Stage 4: 新 DPI を pending に記録し、OS 推奨矩形へ SetWindowPos。
-            // 実 resize/scale 確定は次 lock（WM_SIZE も同境界）。主に `.physical`(PMv2) window が受信。
-            // wParam: LOWORD=dpiX, HIWORD=dpiY（通常同値）。lParam: RECT* 推奨 window 矩形。
+            // Record the new DPI as pending and SetWindowPos to the rectangle the OS suggests.
+            // The real resize and scale are settled at the next lock (WM_SIZE shares that boundary). It is mostly a `.physical` (PMv2) window that receives this.
+            // wParam: LOWORD=dpiX, HIWORD=dpiY (normally equal). lParam: a RECT* with the suggested window rectangle.
             const wp: usize = @bitCast(wparam);
             const dpi_x: UINT = @truncate(wp & 0xFFFF);
-            // `.logical`+PMv2 縮退 window は content_scale を 1.0 固定（実 DPI 無視）。
+            // A `.logical` window that degraded onto PMv2 keeps content_scale fixed at 1.0 (the real DPI is ignored).
             if (!(core.fb_mode == .logical and core.is_pmv2)) {
                 core.pending_content_scale = scaleFromDpi(dpi_x);
                 core.metrics_dirty = true;
@@ -1082,7 +1082,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_KEYDOWN, WM_SYSKEYDOWN => {
             handleKeyDown(core, wparam, lparam);
-            // SYS 系（Alt 絡み）は DefWindowProc に通して Alt+F4(→WM_CLOSE) 等のシステム挙動を保つ。
+            // The SYS messages (those involving Alt) go through to DefWindowProc, which keeps system behaviour such as Alt+F4 (→WM_CLOSE).
             if (msg == WM_SYSKEYDOWN) return DefWindowProcW(hwnd, msg, wparam, lparam);
             return 0;
         },
@@ -1131,8 +1131,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             handleWheel(core, hwnd, wparam, lparam, true);
             return 0;
         },
-        // focus / capture 喪失: 押下中ボタンは以後 up を取り逃すので synthetic mouse_up で締めて状態を clear。
-        // （ドラッグ中に Alt+Tab / 他ウィンドウへ capture が移った場合の stale 防止。修飾は GetKeyState を都度読むので別途 clear 不要）
+        // Losing focus or capture: a held button will never see its up, so a synthetic mouse_up closes it out and the state is cleared.
+        // (Which prevents a stale button when Alt+Tab or another window takes the capture mid-drag. Modifiers need no clearing, since GetKeyState is read each time.)
         WM_KILLFOCUS, WM_CAPTURECHANGED => {
             releaseHeldButtons(core);
             return 0;
@@ -1141,10 +1141,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
     }
 }
 
-/// 現在の修飾状態を GetKeyState（OS が message に同期して保持する状態）から読む。
-/// per-event の mask が無い Win32 で、key/mouse とも「今押されている修飾」を正しく得る
-/// （ウィンドウ外での修飾変化・focus 前の押下・key-up 取り逃しによる stale を避ける）。
-/// GetKeyState は SHORT を返し、押下中は高位ビットが立つ（= 値が負）。cmd は Windows キー（左右いずれか）。
+/// Read the current modifier state from GetKeyState (the state the OS keeps in step with the messages).
+/// On Win32, which has no per-event mask, that is what correctly gives "the modifiers held right now" for
+/// both keys and the mouse (avoiding a stale value from a modifier changed outside the window, one held before focus, or a missed key-up).
+/// GetKeyState returns a SHORT whose high bit is set while held (i.e. the value is negative). cmd is the Windows key (either side).
 fn modifiersNow() ModifierFlags {
     return .{
         .shift = GetKeyState(@intCast(input.VK_SHIFT)) < 0,
@@ -1154,16 +1154,16 @@ fn modifiersNow() ModifierFlags {
     };
 }
 
-/// WM_KEY* の lParam から物理キーを得る。**scancode（物理位置・layout 非依存）を主**にし、
-/// scancode 表に無い特殊キー（Pause / PrintScreen / F13+ 等）だけ wParam(virtual key) に fallback する
-/// （X11/Wayland の物理キー契約と揃える）。
+/// Get the physical key from WM_KEY*'s lParam. **The scancode leads** (physical position, independent of
+/// layout), and only the special keys missing from the scancode table (Pause, PrintScreen, F13 and above)
+/// fall back to wParam (the virtual key), matching the physical key contract of X11 and Wayland.
 fn keyFromMessage(wparam: WPARAM, lparam: LPARAM) types.KeyCode {
     const lp: usize = @bitCast(lparam);
     const scancode: u32 = @intCast((lp >> 16) & 0xFF);
     const extended = (lp & KF_EXTENDED_BIT) != 0;
     const k = input.scancodeToKeyCode(scancode, extended);
     if (k != .UNKNOWN) return k;
-    return input.vkToKeyCode(@intCast(wparam)); // scancode 表に無いキーを VK で補完
+    return input.vkToKeyCode(@intCast(wparam)); // fill in a key missing from the scancode table with its VK
 }
 
 fn handleKeyDown(core: *Core, wparam: WPARAM, lparam: LPARAM) void {
@@ -1175,12 +1175,12 @@ fn handleKeyDown(core: *Core, wparam: WPARAM, lparam: LPARAM) void {
     } });
 }
 
-/// WM_CHAR の確定文字 (TASK-22)。wParam は UTF-16 コードユニット。BMP（英数含む）は単一 WM_CHAR。
-/// astral 面（絵文字等）はサロゲートペアで2回来るが、英数 MVP では surrogate を skip する
-/// （BMP のみ char_input を流す。astral 対応は将来 = Core に high-surrogate を latch する拡張）。
+/// The committed character of WM_CHAR. wParam is a UTF-16 code unit, and the BMP (which covers alphanumerics) is a single WM_CHAR.
+/// An astral character (an emoji, say) arrives twice as a surrogate pair, and a surrogate is skipped here
+/// (only the BMP emits char_input; astral support would mean latching the high surrogate in Core).
 fn handleChar(core: *Core, wparam: WPARAM) void {
     const u: u32 = @intCast(wparam & 0xFFFF);
-    if (u >= 0xD800 and u <= 0xDFFF) return; // surrogate は skip（BMP のみ）
+    if (u >= 0xD800 and u <= 0xDFFF) return; // a surrogate is skipped (the BMP only)
     if (input.isTextCodepoint(u)) {
         core.enqueue(.{ .char_input = .{ .codepoint = u, .modifiers = modifiersNow() } });
     }
@@ -1217,9 +1217,9 @@ fn hiShort(lparam: LPARAM) i32 {
     return @as(i16, @bitCast(@as(u16, @truncate(u >> 16))));
 }
 
-/// Win32 native client 座標 → raw physical event 座標（TASK-156.5 Stage 4）。
-/// - 実 awareness が PMv2 でない: OS 仮想化済み論理値 → `native × content_scale`
-/// - 実 awareness が PMv2: native は既に物理（`.logical`+PMv2 縮退では scale=1.0 なので同値）
+/// Win32 native client coordinates → raw physical event coordinates.
+/// - the real awareness is not PMv2: an OS-virtualised logical value → `native × content_scale`
+/// - the real awareness is PMv2: native is already physical (with `.logical` degraded onto PMv2 the scale is 1.0, so it is the same value)
 fn nativeToRawPhysical(core: *const Core, native_x: i32, native_y: i32) struct { x: i32, y: i32 } {
     if (core.is_pmv2) {
         return .{ .x = native_x, .y = native_y };
@@ -1231,8 +1231,8 @@ fn nativeToRawPhysical(core: *const Core, native_x: i32, native_y: i32) struct {
     };
 }
 
-/// raw physical 座標 (x,y) の MouseEvent を組む。buttons は内部追跡(post-state)、modifiers は GetKeyState。
-/// 直近座標も更新する（focus/capture 喪失時の synthetic mouse_up が位置を引けるように）。
+/// Build the MouseEvent at the raw physical coordinates (x,y). buttons comes from the internal tracking (the post-state), and modifiers from GetKeyState.
+/// It also updates the most recent coordinates (so the synthetic mouse_up on losing focus or capture has a position).
 fn mouseEventAt(core: *Core, x: i32, y: i32, button: MouseButton) MouseEvent {
     core.last_x = x;
     core.last_y = y;
@@ -1252,10 +1252,10 @@ fn handleMotion(core: *Core, lparam: LPARAM) void {
 
 fn handleButton(core: *Core, mb: MouseButton, down: bool, lparam: LPARAM) void {
     const had_any = anyButton(core.buttons);
-    setButton(core, mb, down); // post-state にしてから event を作る
+    setButton(core, mb, down); // bring it to the post-state before building the event
     const raw = nativeToRawPhysical(core, loShort(lparam), hiShort(lparam));
     if (down) {
-        // ドラッグがウィンドウ外へ出ても move を受け取れるよう capture（X11 と違い Win32 は明示）。
+        // Capture the mouse so that a drag leaving the window still delivers moves (unlike X11, Win32 needs this explicitly).
         if (!had_any) _ = SetCapture(core.hwnd);
         core.enqueue(.{ .mouse_down = mouseEventAt(core, raw.x, raw.y, mb) });
     } else {
@@ -1264,8 +1264,8 @@ fn handleButton(core: *Core, mb: MouseButton, down: bool, lparam: LPARAM) void {
     }
 }
 
-/// focus / capture 喪失時に、押下中の各ボタンへ直近座標で synthetic mouse_up を流して締める
-/// （以後 WM_*BUTTONUP を取り逃すため。pixie 等の stroke を確実に終端する）。
+/// On losing focus or capture, close out each held button with a synthetic mouse_up at the most recent
+/// coordinates (WM_*BUTTONUP will be missed from then on; this reliably ends a stroke in the pixel editor and the like).
 fn releaseHeldButtons(core: *Core) void {
     for ([_]MouseButton{ .left, .right, .middle }) |mb| {
         const held = switch (mb) {
@@ -1275,7 +1275,7 @@ fn releaseHeldButtons(core: *Core) void {
             else => false,
         };
         if (!held) continue;
-        setButton(core, mb, false); // post-state（解放）にしてから event を作る
+        setButton(core, mb, false); // bring it to the post-state (the release) before building the event
         core.enqueue(.{ .mouse_up = mouseEventAt(core, core.last_x, core.last_y, mb) });
     }
     _ = ReleaseCapture();
@@ -1284,7 +1284,7 @@ fn releaseHeldButtons(core: *Core) void {
 fn handleWheel(core: *Core, hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizontal: bool) void {
     const wp: usize = @bitCast(wparam);
     const delta: i32 = @as(i16, @bitCast(@as(u16, @truncate(wp >> 16)))); // HIWORD(wParam) signed
-    // wheel の座標は screen 座標なので client へ変換し、さらに raw physical 化する。
+    // A wheel's coordinates are in screen space, so they are converted to the client area and then made raw physical.
     var pt = POINT{ .x = loShort(lparam), .y = hiShort(lparam) };
     _ = ScreenToClient(hwnd, &pt);
     const raw = nativeToRawPhysical(core, pt.x, pt.y);
@@ -1303,19 +1303,19 @@ fn handleWheel(core: *Core, hwnd: HWND, wparam: WPARAM, lparam: LPARAM, horizont
 }
 
 // ============================================================================
-// ファイル選択ダイアログ（comdlg32。TASK-31 / AC#2）
+// The file selection dialogs (comdlg32)
 //
-// 同期モーダル。framebuffer lock 中には呼ばないこと（caller 責任）。戻り値は gpa 所有スライス
-// （caller が gpa.free）。キャンセルは null、機構失敗は DialogFailed、OOM は OutOfMemory。
-// io は全 OS 共通シグネチャのため受け取るが Windows の native dialog では未使用。
+// Synchronous and modal. Never call it while the framebuffer is locked (the caller's responsibility). The
+// return value is a slice owned by gpa (the caller frees it). A cancel gives null, a failure of the mechanism gives DialogFailed, and an OOM gives OutOfMemory.
+// io is taken because the signature is shared by every OS, but the native Windows dialog does not use it.
 // ============================================================================
 
-const FILE_BUF_LEN = 4096; // WCHAR 数。長いパスにも十分。
+const FILE_BUF_LEN = 4096; // A count of WCHARs, ample even for a long path.
 
 pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     _ = io;
     var file_buf = [_]u16{0} ** FILE_BUF_LEN;
-    // default_name があれば初期値として file_buf に入れる。
+    // When there is a default_name it goes into file_buf as the initial value.
     if (opts.default_name) |name| {
         const n = std.unicode.utf8ToUtf16Le(file_buf[0 .. FILE_BUF_LEN - 1], name) catch return error.DialogFailed;
         file_buf[n] = 0;
@@ -1342,8 +1342,8 @@ pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOption
     return try utf16zToUtf8(gpa, &file_buf);
 }
 
-/// OPENFILENAMEW の共通フィールドを埋める。filter / defext は allowed_ext から組み立て、
-/// バッファは caller のスタックを借りる（ofn の生存期間 = 呼び出し中なので有効）。
+/// Fill in the shared fields of an OPENFILENAMEW. The filter and defext are built from allowed_ext, and
+/// the buffers are borrowed from the caller's stack (valid, since ofn lives only for the duration of the call).
 fn baseOfn(
     file_buf: *[FILE_BUF_LEN]u16,
     filter_buf: *[256]u16,
@@ -1356,12 +1356,12 @@ fn baseOfn(
     ofn.nMaxFile = FILE_BUF_LEN;
     if (allowed_ext) |ext| {
         ofn.lpstrFilter = buildFilter(filter_buf, ext);
-        if (utf8ToUtf16z(defext_buf, ext)) |p| ofn.lpstrDefExt = p; // 拡張子の自動補完
+        if (utf8ToUtf16z(defext_buf, ext)) |p| ofn.lpstrDefExt = p; // completing the extension automatically
     }
     return ofn;
 }
 
-/// commdlg のフィルタ文字列（"<EXT> files\0*.<EXT>\0All files\0*.*\0\0"）を UTF-16 で組む。
+/// Build commdlg's filter string ("<EXT> files\0*.<EXT>\0All files\0*.*\0\0") in UTF-16.
 fn buildFilter(buf: *[256]u16, ext: [:0]const u8) LPCWSTR {
     var len: usize = 0;
     const append = struct {
@@ -1384,7 +1384,7 @@ fn buildFilter(buf: *[256]u16, ext: [:0]const u8) LPCWSTR {
     append.nul(buf, &len);
     append.s(buf, &len, "*.*");
     append.nul(buf, &len);
-    append.nul(buf, &len); // 終端の二重 null
+    append.nul(buf, &len); // the double null at the end
     return @ptrCast(buf);
 }
 
@@ -1394,14 +1394,14 @@ fn utf8ToUtf16z(buf: *[16]u16, s: [:0]const u8) ?LPCWSTR {
     return @ptrCast(buf);
 }
 
-/// GetSave/OpenFileNameW が 0 を返したときの分類: extended error 0 = ユーザーキャンセル → null、
-/// それ以外（初期化失敗等） → DialogFailed。
+/// How a 0 from GetSave/OpenFileNameW is classified: an extended error of 0 means the user cancelled → null,
+/// and anything else (a failed initialisation and so on) → DialogFailed.
 fn classifyDialogFailure() DialogError!?[]u8 {
     if (CommDlgExtendedError() == 0) return null;
     return error.DialogFailed;
 }
 
-/// null 終端 UTF-16 → gpa 所有 UTF-8。
+/// A NUL-terminated UTF-16 string → gpa-owned UTF-8.
 fn utf16zToUtf8(gpa: std.mem.Allocator, buf: []const u16) (DialogError || std.mem.Allocator.Error)![]u8 {
     const path16 = std.mem.sliceTo(buf, 0);
     if (path16.len == 0) return error.DialogFailed;
@@ -1412,10 +1412,10 @@ fn utf16zToUtf8(gpa: std.mem.Allocator, buf: []const u16) (DialogError || std.me
 }
 
 // ============================================================================
-// TASK-156.5 Stage 4: R9 構造的ユニットテスト（X11 Stage 2 と bit 一致）
+// Structural unit tests (no display needed; they run when this module is part of the test root)
 // ============================================================================
 
-test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず logical を返す" {
+test "effectiveFramebufferSize .logical returns the logical size, independent of scale" {
     const logical: WindowSize = .{ .width = 800, .height = 600 };
     const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 };
     for (scales) |s| {
@@ -1425,7 +1425,7 @@ test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず
     }
 }
 
-test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を適用する" {
+test "effectiveFramebufferSize .physical applies roundToPhysicalPx" {
     const logical: WindowSize = .{ .width = 800, .height = 600 };
     const fb2 = effectiveFramebufferSize(.physical, logical, 2.0);
     try std.testing.expectEqual(@as(u32, 1600), fb2.width);
@@ -1436,7 +1436,7 @@ test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を�
     try std.testing.expectEqual(@as(u32, 900), fb15.height);
 }
 
-test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ" {
+test "roundToPhysicalPx matches objc lround and clamps to the range" {
     try std.testing.expectEqual(@as(u32, 1), roundToPhysicalPx(0, 2.0)); // 0*2→0 → clamp to 1
     try std.testing.expectEqual(@as(u32, 1600), roundToPhysicalPx(800, 2.0));
     try std.testing.expectEqual(@as(u32, 1200), roundToPhysicalPx(800, 1.5));
@@ -1444,7 +1444,7 @@ test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ"
     try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, std.math.nan(f32)));
 }
 
-test "TASK-156.5: effectiveContentScale は非正・非有限を 1.0 に補正" {
+test "effectiveContentScale corrects a non-positive or non-finite value to 1.0" {
     try std.testing.expectEqual(@as(f32, 2.0), effectiveContentScale(2.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(0.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));

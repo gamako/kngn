@@ -1,13 +1,13 @@
-//! Wayland 入力の純粋変換ロジック（TASK-28.5.3）。`@cImport` しない純 Zig。
+//! The pure translation logic of Wayland input. Pure Zig, with no `@cImport`.
 //!
-//! wl_keyboard / wl_pointer / xkbcommon を叩く本体（`platform_linux_wayland.zig`、Linux 専用）から
-//! 値（整数 / bool）を受け取り、X11 backend と同じ意味論で変換する部分だけをここに集約し、
-//! macOS host でも `zig build test-platform-wayland-input` で単体テストできるようにする
-//! （X11 の `platform_linux_input.zig` と同じ設計）。
+//! It takes the values (integers and bools) from the part that drives wl_keyboard, wl_pointer and
+//! xkbcommon (`platform_linux_wayland.zig`, Linux only), and gathers here only the translation, on the
+//! same semantics as the X11 backend, so that it can be unit tested on a macOS host with
+//! `zig build test-platform-wayland-input` (the same design as X11's `platform_linux_input.zig`).
 //!
-//! 物理キー mapping と KeyDownSet / EventQueue は `platform_linux_input.zig` を再利用する。
-//! Wayland 固有の差分（evdev+8 / evdev BTN_* / wl_fixed 座標 / xkb modifier / axis scroll /
-//! repeat timing）のみ本ファイルが担う。
+//! The physical key mapping, the KeyDownSet and the EventQueue are reused from `platform_linux_input.zig`.
+//! Only what is specific to Wayland (evdev+8, the evdev BTN_* codes, wl_fixed coordinates, xkb
+//! modifiers, axis scrolling and repeat timing) lives in this file.
 
 const std = @import("std");
 const types = @import("platform_types");
@@ -17,24 +17,24 @@ const KeyCode = types.KeyCode;
 const MouseButton = types.MouseButton;
 const ModifierFlags = types.ModifierFlags;
 
-/// 1 notch = ±16 point（X11 wheelDelta / macOS SCROLL_LINE_TO_POINTS に整合）。
+/// 1 notch = ±16 points (consistent with X11's wheelDelta and macOS's SCROLL_LINE_TO_POINTS).
 pub const SCROLL_LINE_TO_POINTS: f32 = linux_input.SCROLL_LINE_TO_POINTS;
 
-// evdev button code（wl_pointer.button が運ぶ。X11 の 1/2/3 とは別系）
+// evdev button codes (what wl_pointer.button carries; a different space from X11's 1/2/3)
 pub const BTN_LEFT: u32 = 0x110;
 pub const BTN_RIGHT: u32 = 0x111;
 pub const BTN_MIDDLE: u32 = 0x112;
 
-// wl_pointer.axis の axis 値
+// the axis values of wl_pointer.axis
 pub const AXIS_VERTICAL: u32 = 0;
 pub const AXIS_HORIZONTAL: u32 = 1;
 
 // ============================================================================
-// 物理キー: evdev keycode → KeyCode（layout 非依存・KeySym 不使用）
+// physical keys: an evdev keycode → KeyCode (independent of layout; no KeySym)
 // ============================================================================
 
-/// `wl_keyboard.key` の evdev keycode を KeyCode へ。前提「X keycode = evdev + 8」より、
-/// 既存 X11 表（`keycodeToKeyCode`）を `evdev + 8` で再利用する（28.3 の物理キー契約を維持）。
+/// From the evdev keycode of `wl_keyboard.key` to a KeyCode. Since `X keycode = evdev + 8`, the
+/// existing X11 table (`keycodeToKeyCode`) is reused through `evdev + 8` (keeping the physical key contract).
 pub fn waylandKeyToKeyCode(evdev_key: u32) KeyCode {
     return linux_input.keycodeToKeyCode(evdev_key + 8);
 }
@@ -53,34 +53,34 @@ pub fn evdevButtonToMouseButton(code: u32) ?MouseButton {
 }
 
 // ============================================================================
-// pointer 座標: wl_fixed(24.8 固定小数) → i32
+// pointer coordinates: wl_fixed (24.8 fixed point) → i32
 // ============================================================================
 
-/// `wl_fixed_to_int` 準拠（256 で割り 0 方向へ truncate）。負値も 0 方向（-256→-1, -384→-1）。
+/// Follows `wl_fixed_to_int` (divide by 256 and truncate towards zero). Negative values truncate towards zero too (-256→-1, -384→-1).
 pub fn fixedToI32(f: i32) i32 {
     return @divTrunc(f, 256);
 }
 
 // ============================================================================
-// modifier: xkb の active 状態 → ModifierFlags（cmd↔Super(Mod4), alt↔Mod1。X11 と同じ対応）
+// modifiers: the active xkb state → ModifierFlags (cmd↔Super(Mod4), alt↔Mod1, as on X11)
 // ============================================================================
 
-/// 本体側が `xkb_state_mod_name_is_active("Shift"/"Control"/"Mod1"/"Mod4")` で得た bool を渡す。
+/// The caller passes the bools it obtained from `xkb_state_mod_name_is_active("Shift"/"Control"/"Mod1"/"Mod4")`.
 pub fn modifiersFromActive(shift: bool, ctrl: bool, alt: bool, super: bool) ModifierFlags {
     return .{ .shift = shift, .ctrl = ctrl, .alt = alt, .cmd = super };
 }
 
 // ============================================================================
-// scroll: wl_pointer.axis → dx/dy（X11 wheelDelta と同じ符号・係数）
+// scroll: wl_pointer.axis → dx/dy (the same signs and factors as X11's wheelDelta)
 //
-// Wayland は「正 = 下 / 右」。X11 wheelDelta は up=+16/down=-16, left=+16/right=-16 なので
-// 縦横とも符号を反転する。1 notch = ±SCROLL_LINE_TO_POINTS。
-// 最終的な符号/係数の体感は Linux 実機で確認する（plan §3.10）。
+// On Wayland positive means down and right. X11's wheelDelta is up=+16/down=-16 and left=+16/right=-16,
+// so both axes are negated. One notch is ±SCROLL_LINE_TO_POINTS.
+// How the final signs and factors feel is confirmed on Linux hardware.
 // ============================================================================
 
 pub const ScrollDelta = struct { dx: f32 = 0, dy: f32 = 0 };
 
-/// discrete notch（`wl_pointer.axis_discrete`。1 = 1 notch）→ ScrollDelta。
+/// A discrete notch (`wl_pointer.axis_discrete`, where 1 = one notch) → a ScrollDelta.
 pub fn discreteScroll(axis: u32, discrete: i32) ScrollDelta {
     const mag = @as(f32, @floatFromInt(discrete)) * SCROLL_LINE_TO_POINTS;
     return switch (axis) {
@@ -90,8 +90,8 @@ pub fn discreteScroll(axis: u32, discrete: i32) ScrollDelta {
     };
 }
 
-/// continuous（`wl_pointer.axis` の wl_fixed）→ ScrollDelta（discrete が無い compositor の fallback）。
-/// 係数は wl_fixed→point の 1:1（fixed/256）を起点にし、体感は Linux 実機で調整する。
+/// A continuous value (the wl_fixed of `wl_pointer.axis`) → a ScrollDelta (the fallback for a compositor without discrete events).
+/// The factor starts from the 1:1 of wl_fixed→point (fixed/256), and how it feels is tuned on Linux hardware.
 pub fn continuousScroll(axis: u32, value_fixed: i32) ScrollDelta {
     const v = @as(f32, @floatFromInt(value_fixed)) / 256.0;
     return switch (axis) {
@@ -101,8 +101,8 @@ pub fn continuousScroll(axis: u32, value_fixed: i32) ScrollDelta {
     };
 }
 
-/// `wl_pointer.frame` 内で縦横 axis を 1 つの scroll delta にまとめる。
-/// 本体は axis/axis_discrete を add し、frame で take() して 1 mouse_scroll に変換する。
+/// Combine the vertical and horizontal axes within one `wl_pointer.frame` into a single scroll delta.
+/// The caller adds each axis and axis_discrete, then take()s at the frame and turns it into one mouse_scroll.
 pub const ScrollAccumulator = struct {
     dx: f32 = 0,
     dy: f32 = 0,
@@ -114,7 +114,7 @@ pub const ScrollAccumulator = struct {
         self.active = true;
     }
 
-    /// frame 終端で呼ぶ。蓄積があれば delta を返してリセット、無ければ null。
+    /// Called at the end of a frame. It returns the delta and resets when anything accumulated, and null otherwise.
     pub fn take(self: *ScrollAccumulator) ?ScrollDelta {
         if (!self.active) return null;
         const d = ScrollDelta{ .dx = self.dx, .dy = self.dy };
@@ -124,28 +124,28 @@ pub const ScrollAccumulator = struct {
 };
 
 // ============================================================================
-// repeat: wl_keyboard.repeat_info(rate, delay) に基づく is_repeat=true 生成の timing 計算
+// repeat: the timing that generates is_repeat=true, from wl_keyboard.repeat_info(rate, delay)
 //
-// 本体（pollEvents）が getTime() の now を渡す。repeat 対象キーか（modifier 等を除く）は
-// xkbcommon の xkb_keymap_key_repeats で本体が判定し、対象のときだけ onKeyDown する。
+// The caller (pollEvents) passes now from getTime(). Whether a key repeats at all (modifiers do not) is
+// decided by the caller through xkbcommon's xkb_keymap_key_repeats, which only then calls onKeyDown.
 // ============================================================================
 
 pub const RepeatState = struct {
-    /// 現在 repeat 対象の X keycode（evdev+8）。null = repeat 中でない。
+    /// The X keycode (evdev+8) currently repeating. null = nothing is repeating.
     key: ?u32 = null,
-    /// 次に key_down(is_repeat=true) を出す時刻（getTime 秒）。
+    /// When the next key_down(is_repeat=true) is due (in getTime seconds).
     next: f64 = 0,
-    /// repeat_info: rate(keys/sec, 0=無効) / delay(ms)。
+    /// repeat_info: rate (keys/sec, 0 = disabled) and delay (ms).
     rate_hz: i32 = 0,
     delay_ms: i32 = 0,
 
     pub fn setInfo(self: *RepeatState, rate_hz: i32, delay_ms: i32) void {
         self.rate_hz = rate_hz;
         self.delay_ms = delay_ms;
-        if (rate_hz <= 0) self.key = null; // repeat 無効化
+        if (rate_hz <= 0) self.key = null; // repeat disabled
     }
 
-    /// repeat 対象キーの press 時。delay 後に最初の repeat を予定する。
+    /// On the press of a repeating key. The first repeat is scheduled after delay.
     pub fn onKeyDown(self: *RepeatState, key: u32, now: f64) void {
         if (self.rate_hz <= 0) {
             self.key = null;
@@ -155,34 +155,34 @@ pub const RepeatState = struct {
         self.next = now + @as(f64, @floatFromInt(self.delay_ms)) / 1000.0;
     }
 
-    /// key release 時。repeat 対象が離されたら停止。
+    /// On a key release. Repeating stops once the repeating key is let go.
     pub fn onKeyUp(self: *RepeatState, key: u32) void {
         if (self.key == key) self.key = null;
     }
 
-    /// now 時点で repeat を出すべきか。
+    /// Whether a repeat is due as of now.
     pub fn due(self: *const RepeatState, now: f64) bool {
         return self.key != null and self.rate_hz > 0 and now >= self.next;
     }
 
-    /// repeat を 1 回出した後、次の時刻へ進める（now 基準で drift burst を避ける）。
+    /// After emitting one repeat, advance to the next time (relative to now, which avoids a drift burst).
     pub fn advance(self: *RepeatState, now: f64) void {
         self.next = now + 1.0 / @as(f64, @floatFromInt(self.rate_hz));
     }
 };
 
 // ============================================================================
-// tests（OS 非依存。zig build test-platform-wayland-input）
+// tests (OS independent; zig build test-platform-wayland-input)
 // ============================================================================
 const testing = std.testing;
 
-test "waylandKeyToKeyCode: evdev+8 で既存 X11 表を再利用（layout 非依存）" {
-    // KEY_A=30 → X keycode 38 → .A、KEY_Q=16 → X 24 → .Q
+test "waylandKeyToKeyCode: evdev+8 reuses the existing X11 table (independent of layout)" {
+    // KEY_A=30 → X keycode 38 → .A, and KEY_Q=16 → X 24 → .Q
     try testing.expectEqual(KeyCode.A, waylandKeyToKeyCode(30));
     try testing.expectEqual(KeyCode.Q, waylandKeyToKeyCode(16));
 }
 
-test "evdevButtonToMouseButton: BTN_* mapping" {
+test "evdevButtonToMouseButton: the BTN_* mapping" {
     try testing.expectEqual(MouseButton.left, evdevButtonToMouseButton(BTN_LEFT).?);
     try testing.expectEqual(MouseButton.right, evdevButtonToMouseButton(BTN_RIGHT).?);
     try testing.expectEqual(MouseButton.middle, evdevButtonToMouseButton(BTN_MIDDLE).?);
@@ -190,12 +190,12 @@ test "evdevButtonToMouseButton: BTN_* mapping" {
     try testing.expect(evdevButtonToMouseButton(0) == null);
 }
 
-test "fixedToI32: wl_fixed_to_int 準拠（0 方向 truncate）" {
+test "fixedToI32: follows wl_fixed_to_int (truncating towards zero)" {
     try testing.expectEqual(@as(i32, 0), fixedToI32(0));
     try testing.expectEqual(@as(i32, 1), fixedToI32(256));
     try testing.expectEqual(@as(i32, 1), fixedToI32(384)); // 1.5 → 1
     try testing.expectEqual(@as(i32, -1), fixedToI32(-256));
-    try testing.expectEqual(@as(i32, -1), fixedToI32(-384)); // -1.5 → -1（0 方向）
+    try testing.expectEqual(@as(i32, -1), fixedToI32(-384)); // -1.5 → -1 (towards zero)
     try testing.expectEqual(@as(i32, 100), fixedToI32(25600));
 }
 
@@ -206,23 +206,23 @@ test "modifiersFromActive: cmd↔super, alt↔mod1" {
     try testing.expect(s.cmd and !s.shift and !s.ctrl and !s.alt);
 }
 
-test "discreteScroll: 符号は X11 wheelDelta に一致（down=-16, right=-16）" {
-    const down = discreteScroll(AXIS_VERTICAL, 1); // wayland 正=下
+test "discreteScroll: the signs match X11 wheelDelta (down=-16, right=-16)" {
+    const down = discreteScroll(AXIS_VERTICAL, 1); // on wayland, positive is down
     try testing.expectEqual(@as(f32, 0), down.dx);
     try testing.expectEqual(@as(f32, -16.0), down.dy);
     const up = discreteScroll(AXIS_VERTICAL, -1);
     try testing.expectEqual(@as(f32, 16.0), up.dy);
-    const right = discreteScroll(AXIS_HORIZONTAL, 1); // wayland 正=右
+    const right = discreteScroll(AXIS_HORIZONTAL, 1); // on wayland, positive is right
     try testing.expectEqual(@as(f32, -16.0), right.dx);
     try testing.expectEqual(@as(f32, 0), right.dy);
 }
 
-test "continuousScroll: fixed/256 を符号反転" {
-    const d = continuousScroll(AXIS_VERTICAL, 256); // 1.0 下
+test "continuousScroll: fixed/256 with the sign flipped" {
+    const d = continuousScroll(AXIS_VERTICAL, 256); // 1.0 down
     try testing.expectEqual(@as(f32, -1.0), d.dy);
 }
 
-test "ScrollAccumulator: frame 内の縦横を 1 delta にまとめ take でリセット" {
+test "ScrollAccumulator: both axes of a frame combine into one delta, and take resets it" {
     var acc: ScrollAccumulator = .{};
     try testing.expect(acc.take() == null);
     acc.add(discreteScroll(AXIS_VERTICAL, 1)); // dy=-16
@@ -230,22 +230,22 @@ test "ScrollAccumulator: frame 内の縦横を 1 delta にまとめ take でリ�
     const d = acc.take().?;
     try testing.expectEqual(@as(f32, -32.0), d.dx);
     try testing.expectEqual(@as(f32, -16.0), d.dy);
-    try testing.expect(acc.take() == null); // take 後はリセット
+    try testing.expect(acc.take() == null); // take resets it
 }
 
-test "RepeatState: delay→repeat→rate 進行、release で停止、rate0 で無効" {
+test "RepeatState: delay→repeat→rate progression, stopping on release, disabled at rate 0" {
     var r: RepeatState = .{};
-    r.setInfo(25, 600); // 25Hz=0.04s 間隔, delay 600ms=0.6s
+    r.setInfo(25, 600); // 25Hz = a 0.04s interval, delay 600ms = 0.6s
     r.onKeyDown(38, 0.0);
-    try testing.expect(!r.due(0.5)); // delay 前
-    try testing.expect(r.due(0.6)); // delay 経過
+    try testing.expect(!r.due(0.5)); // before the delay
+    try testing.expect(r.due(0.6)); // the delay has passed
     r.advance(0.6);
     try testing.expect(!r.due(0.62));
     try testing.expect(r.due(0.64)); // 0.6 + 0.04
     r.onKeyUp(38);
-    try testing.expect(!r.due(1.0)); // release で停止
+    try testing.expect(!r.due(1.0)); // the release stops it
 
-    r.setInfo(0, 600); // rate 0 = repeat 無効
+    r.setInfo(0, 600); // rate 0 = repeat disabled
     r.onKeyDown(38, 0.0);
     try testing.expect(!r.due(10.0));
 }

@@ -1,16 +1,16 @@
-//! TASK-120: OS テキストクリップボード facade の in-memory round-trip テスト。
-//! `builtin.is_test` 経路のため C symbol / NSPasteboard を参照しない。
+//! An in-memory round-trip test of the OS text clipboard facade.
+//! It goes through the `builtin.is_test` path, so it references no C symbol and no NSPasteboard.
 
 const std = @import("std");
 const platform = @import("platform");
 
-test "clipboard: 未設定は null" {
+test "clipboard: unset gives null" {
     platform.resetClipboardForTest();
     var buf: [64]u8 = undefined;
     try std.testing.expect(platform.getClipboardText(&buf) == null);
 }
 
-test "clipboard: ASCII set → get round-trip" {
+test "clipboard: an ASCII set → get round trip" {
     platform.resetClipboardForTest();
     platform.setClipboardText("hello");
     var buf: [64]u8 = undefined;
@@ -18,7 +18,7 @@ test "clipboard: ASCII set → get round-trip" {
     try std.testing.expectEqualStrings("hello", got);
 }
 
-test "clipboard: 日本語 UTF-8 set → get round-trip" {
+test "clipboard: a Japanese UTF-8 set → get round trip" {
     platform.resetClipboardForTest();
     platform.setClipboardText("こんにちは");
     var buf: [64]u8 = undefined;
@@ -26,7 +26,7 @@ test "clipboard: 日本語 UTF-8 set → get round-trip" {
     try std.testing.expectEqualStrings("こんにちは", got);
 }
 
-test "clipboard: 空文字列は empty slice（null ではない）" {
+test "clipboard: an empty string is an empty slice, not null" {
     platform.resetClipboardForTest();
     platform.setClipboardText("");
     var buf: [64]u8 = undefined;
@@ -34,7 +34,7 @@ test "clipboard: 空文字列は empty slice（null ではない）" {
     try std.testing.expectEqual(@as(usize, 0), got.len);
 }
 
-test "clipboard: 小さい buffer は UTF-8 境界で切り詰める" {
+test "clipboard: a small buffer truncates on a UTF-8 boundary" {
     platform.resetClipboardForTest();
     platform.setClipboardText("あいう"); // 9 bytes
     var buf: [4]u8 = undefined; // 1 codepoint (3B) + 1 leftover → truncate to 3

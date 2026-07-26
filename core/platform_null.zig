@@ -1,13 +1,13 @@
-//! Null platform backend（TASK-165）
+//! The null platform backend
 //!
-//! display / compositor / GPU / OS window を一切持たない「見えないウィンドウ」。
-//! `VP_HEADLESS=1` のとき facade が runtime で選択する。一次 framebuffer は
-//! `Window` が所有し、harness は観測 copy（onLock/onPresent）だけを行う。
+//! An "invisible window" with no display, no compositor, no GPU and no OS window at all.
+//! The facade picks it at runtime when `VP_HEADLESS=1`. The primary framebuffer is owned by
+//! `Window`, and the harness only takes observation copies (onLock/onPresent).
 //!
-//! ホットパス宣言:
-//! - `lockFramebuffer`: platform 所有 buffer のポインタ・寸法返却のみ（フレーム毎の新規確保なし）
-//! - `present`: no-op（表示先なし。観測は facade の harness.onPresent）
-//! - buffer 確保/ゼロクリアは `create*` 時の一回だけ。フレーム毎の per-pixel 処理は行わない。
+//! Hot path declaration:
+//! - `lockFramebuffer`: it returns the pointer and size of a platform-owned buffer, nothing more (no per-frame allocation)
+//! - `present`: a no-op (there is nothing to display; observation is the facade's harness.onPresent)
+//! - Allocating and zeroing the buffer happen once, in `create*`. There is no per-pixel work per frame.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,9 +34,9 @@ pub fn init() Error!void {}
 
 pub fn shutdown() void {}
 
-/// display/backend 初期化不要の monotonic clock（target 条件で既存 provider 契約を再利用）。
-/// macOS は `platform_macos.getTime` と同じ `CLOCK_UPTIME_RAW` を直接呼び、macos backend
-/// module（C ABI window）を import しない（null test / display-less リンクを軽く保つ）。
+/// A monotonic clock that needs no display and no backend initialisation (it reuses the existing provider contract per target).
+/// macOS calls the same `CLOCK_UPTIME_RAW` as `platform_macos.getTime` directly, without importing the
+/// macos backend module (the C ABI window), which keeps the null test and a display-less link light.
 pub fn getTime() f64 {
     if (comptime builtin.cpu.arch.isWasm()) return 0;
     return switch (builtin.os.tag) {
@@ -55,7 +55,7 @@ fn macosGetTime() f64 {
     return @as(f64, @floatFromInt(c.clock_gettime_nsec_np(c.CLOCK_UPTIME_RAW))) / 1e9;
 }
 
-/// Windows QPC。`platform_windows_common.init`（ウィンドウクラス登録）を呼ばず周波数だけ取る。
+/// Windows QPC. It takes only the frequency, without calling `platform_windows_common.init` (which registers the window class).
 fn windowsGetTime() f64 {
     const win = struct {
         extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
@@ -149,7 +149,7 @@ pub const Window = struct {
 
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
         _ = title;
-        // scale 非対応: .physical も contentScale=1 / logical==framebuffer で受理（Unsupported にしない）。
+        // No scale support: .physical is accepted too, with contentScale=1 and logical==framebuffer (never Unsupported).
         _ = opts.fb_mode;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
@@ -251,12 +251,12 @@ pub const Window = struct {
 };
 
 // ============================================================================
-// unit tests（display 不要）
+// unit tests (no display needed)
 // ============================================================================
 
 const testing = std.testing;
 
-test "null window: create→lock→write→present→lock で内容保持" {
+test "null window: create→lock→write→present→lock keeps the contents" {
     var win = try Window.create(4, 2, "t");
     defer win.destroy();
 
@@ -272,7 +272,7 @@ test "null window: create→lock→write→present→lock で内容保持" {
     try testing.expectEqual(@as(u32, 0xFF112233), fb2.pixels[7]);
 }
 
-test "null window: create 直後はゼロクリア、present は寸法を変えない" {
+test "null window: zeroed right after create, and present does not change the size" {
     var win = try Window.create(3, 1, "t");
     defer win.destroy();
     const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
@@ -283,7 +283,7 @@ test "null window: create 直後はゼロクリア、present は寸法を変え�
     try testing.expectEqual(@as(u32, 1), win.height);
 }
 
-test "null window: fullscreen 既定は 1920x1080、geometry は position=null" {
+test "null window: fullscreen defaults to 1920x1080, and geometry has position=null" {
     var win = try Window.createFullscreen("t");
     defer win.destroy();
     try testing.expectEqual(@as(u32, 1920), win.width);
@@ -293,7 +293,7 @@ test "null window: fullscreen 既定は 1920x1080、geometry は position=null" 
     try testing.expectEqual(@as(u32, 1920), geo.size.width);
 }
 
-test "null window: options.size 優先、poll/nextEvent/stats/no-op I/F" {
+test "null window: options.size wins, plus the poll/nextEvent/stats no-op interface" {
     var win = try Window.createWithOptions(10, 10, "t", .{ .size = .{ .width = 5, .height = 7 } });
     defer win.destroy();
     try testing.expectEqual(@as(u32, 5), win.width);
@@ -320,7 +320,7 @@ test "null window: options.size 優先、poll/nextEvent/stats/no-op I/F" {
     try testing.expect(getTime() >= 0);
 }
 
-test "TASK-156.1: null .physical は Unsupported でなく scale=1 / 同一寸法で受理" {
+test "null .physical is accepted with scale=1 and an unchanged size, rather than Unsupported" {
     var win = try Window.createWithOptions(800, 600, "t", .{ .fb_mode = .physical });
     defer win.destroy();
     try testing.expectEqual(@as(f32, 1.0), win.contentScale());
@@ -334,7 +334,7 @@ test "TASK-156.1: null .physical は Unsupported でなく scale=1 / 同一寸�
     try testing.expectEqual(@as(u64, 0), fb.scale_epoch);
 }
 
-test "TASK-156.1: null .logical の width/height/pixels CRC 経路は snapshot 付きでも寸法不変" {
+test "null .logical keeps the size on the width/height/pixels CRC path, snapshot included" {
     var win = try Window.create(4, 2, "t");
     defer win.destroy();
     const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;

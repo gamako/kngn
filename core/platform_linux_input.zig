@@ -1,11 +1,11 @@
-//! Linux/X11 入力の **純粋な変換ロジック**（TASK-28.3）。
+//! The **pure translation logic** of Linux/X11 input.
 //!
-//! このファイルは `@cImport`（X11）を一切しない純 Zig。`platform_linux.zig` が `XEvent` から
-//! 値（keycode / state / button / x,y）を取り出した後の変換だけを担い、`@import("platform_types")`
-//! の正準型のみに依存する。これにより mapping / EventQueue / KeyDownSet を **macOS host でも単体テスト**できる。
+//! This file does no `@cImport` (X11) at all: it is pure Zig. `platform_linux.zig` pulls the values
+//! (keycode, state, button, x and y) out of an `XEvent`, and this file handles only the translation that
+//! follows, depending on nothing but the canonical types in `@import("platform_types")`. That is what makes the mapping, the EventQueue and the KeyDownSet **unit testable on a macOS host**.
 //!
-//! X の数値定数（state mask / button 番号 / evdev keycode）は ABI 安定値なのでここに直書きし、
-//! 由来を `X11/X.h` / linux evdev (`input-event-codes.h`, `X keycode = evdev scancode + 8`) として明記する。
+//! The numeric X constants (the state mask, the button numbers, the evdev keycodes) are ABI-stable values,
+//! so they are written out here with their origin stated: `X11/X.h`, and linux evdev (`input-event-codes.h`, where `X keycode = evdev scancode + 8`).
 
 const std = @import("std");
 const types = @import("platform_types");
@@ -17,35 +17,35 @@ const MouseButtons = types.MouseButtons;
 const Event = types.Event;
 
 // ============================================================================
-// X11 state mask（X11/X.h）。修飾の意味論は macOS と対称に揃える。
+// The X11 state mask (X11/X.h). The meaning of a modifier is kept symmetrical with macOS.
 // ============================================================================
 const ShiftMask: u32 = 1 << 0; // 0x01
 const ControlMask: u32 = 1 << 2; // 0x04
 const Mod1Mask: u32 = 1 << 3; // 0x08  Alt
-const Mod4Mask: u32 = 1 << 6; // 0x40  Super（macOS の cmd に対応させる）
+const Mod4Mask: u32 = 1 << 6; // 0x40  Super (mapped onto macOS's cmd)
 
 // ============================================================================
-// evdev keycode（= linux scancode + 8）。修飾キーの左右を is_repeat / post-state 判定に使う。
+// evdev keycodes (= a linux scancode + 8). Left and right modifiers are told apart for is_repeat and the post-state.
 // ============================================================================
 const KC_CTRL_L: u32 = 37;
 const KC_SHIFT_L: u32 = 50;
 const KC_ALT_L: u32 = 64;
 const KC_CTRL_R: u32 = 105;
-const KC_ALT_R: u32 = 108; // ISO_Level3_Shift(AltGr) もここ。Alt 扱いで可
+const KC_ALT_R: u32 = 108; // ISO_Level3_Shift (AltGr) is here too. Treating it as Alt is fine
 const KC_SUPER_L: u32 = 133;
 const KC_SUPER_R: u32 = 134;
 const KC_SHIFT_R: u32 = 62;
 
 // ============================================================================
-// keycode（物理キー・layout 非依存）→ KeyCode
+// keycode (a physical key, independent of layout) → KeyCode
 // ============================================================================
 //
-// KeySym は layout 依存なので使わない。evdev keymap 前提（Xorg / Xvfb は xkb+evdev）で
-// `X keycode = evdev scancode + 8`。`platform_types.KeyCode` に存在し evdev に標準割当のあるキーを網羅し、
-// 表に無い keycode は `.UNKNOWN`（非 evdev サーバや未割当キー）。
+// A KeySym depends on the layout and is not used. An evdev keymap is assumed (Xorg and Xvfb use xkb+evdev),
+// where `X keycode = evdev scancode + 8`. The table covers every key that exists in `platform_types.KeyCode`
+// and has a standard evdev assignment; a keycode not in it is `.UNKNOWN` (a non-evdev server, or an unassigned key).
 pub fn keycodeToKeyCode(keycode: u32) KeyCode {
     return switch (keycode) {
-        // --- 英字（物理位置基準。QWERTY 配列の keycode）---
+        // --- letters (by physical position: the keycodes of a QWERTY layout) ---
         38 => .A,
         56 => .B,
         54 => .C,
@@ -72,7 +72,7 @@ pub fn keycodeToKeyCode(keycode: u32) KeyCode {
         53 => .X,
         29 => .Y,
         52 => .Z,
-        // --- 数字列 ---
+        // --- the digit row ---
         10 => .@"1",
         11 => .@"2",
         12 => .@"3",
@@ -83,7 +83,7 @@ pub fn keycodeToKeyCode(keycode: u32) KeyCode {
         17 => .@"8",
         18 => .@"9",
         19 => .@"0",
-        // --- 制御・編集 ---
+        // --- control and editing ---
         65 => .SPACE,
         36 => .ENTER,
         23 => .TAB,
@@ -98,12 +98,12 @@ pub fn keycodeToKeyCode(keycode: u32) KeyCode {
         66 => .CAPS_LOCK,
         107 => .PRINT_SCREEN,
         127 => .PAUSE,
-        // --- 矢印 ---
+        // --- arrows ---
         111 => .UP,
         116 => .DOWN,
         113 => .LEFT,
         114 => .RIGHT,
-        // --- ファンクション ---
+        // --- function keys ---
         67 => .F1,
         68 => .F2,
         69 => .F3,
@@ -124,7 +124,7 @@ pub fn keycodeToKeyCode(keycode: u32) KeyCode {
         196 => .F18,
         197 => .F19,
         198 => .F20,
-        // --- テンキー（NumLock 物理キー）---
+        // --- the numeric keypad (the physical NumLock keys) ---
         90 => .KP_0,
         87 => .KP_1,
         88 => .KP_2,
@@ -142,7 +142,7 @@ pub fn keycodeToKeyCode(keycode: u32) KeyCode {
         86 => .KP_ADD,
         104 => .KP_ENTER,
         125 => .KP_EQUAL,
-        // --- 修飾キー（左右別）---
+        // --- modifiers (left and right separately) ---
         KC_SHIFT_L => .LEFT_SHIFT,
         KC_CTRL_L => .LEFT_CONTROL,
         KC_ALT_L => .LEFT_ALT,
@@ -156,7 +156,7 @@ pub fn keycodeToKeyCode(keycode: u32) KeyCode {
 }
 
 // ============================================================================
-// X state mask → ModifierFlags（cmd ↔ Super(Mod4), alt ↔ Mod1）
+// The X state mask → ModifierFlags (cmd ↔ Super(Mod4), alt ↔ Mod1)
 // ============================================================================
 pub fn stateToModifiers(state: u32) ModifierFlags {
     return .{
@@ -169,7 +169,7 @@ pub fn stateToModifiers(state: u32) ModifierFlags {
 
 const Mod = enum { shift, ctrl, alt, cmd };
 
-/// keycode がどの修飾に属するか（左右いずれも同じ修飾）。修飾でなければ null。
+/// Which modifier a keycode belongs to (left and right give the same modifier). null when it is not a modifier.
 fn modifierOf(keycode: u32) ?Mod {
     return switch (keycode) {
         KC_SHIFT_L, KC_SHIFT_R => .shift,
@@ -180,18 +180,18 @@ fn modifierOf(keycode: u32) ?Mod {
     };
 }
 
-/// key event 用の修飾（post-state）。X の `state` は「イベント直前」なので、修飾キー自身の
-/// 押下/解放では当該ビットがずれる。`keys`（当該 event 反映後の KeyDownSet）を真として、
-/// **この keycode が属する修飾の 1 ビットだけ**「左右いずれかが down なら true」で上書きする。
-/// 左右同時押し・最後の 1 個解放も正しい。event に無関係な修飾は state mask（focus 前の保持も拾える）を使う。
+/// The modifiers of a key event (the post-state). X's `state` is the state *before* the event, so pressing
+/// or releasing a modifier key itself leaves its own bit out of step. Taking `keys` (the KeyDownSet with this
+/// event already applied) as the truth, **only the one bit of the modifier this keycode belongs to** is overwritten with "true when either side is down".
+/// Both sides held at once, and the release of the last one, come out right. A modifier unrelated to the event keeps the state mask (which also picks up what was held before focus).
 pub fn keyEventModifiers(state: u32, keys: *const KeyDownSet, keycode: u32) ModifierFlags {
     return overrideModifierBit(stateToModifiers(state), keys, keycode);
 }
 
-/// base modifier（X11 は state mask 由来、Wayland は xkb 由来）に対し、この keycode が修飾キーなら
-/// その 1 ビットだけ KeyDownSet（当該 event 反映後）の「左右いずれか down」で上書きする post-state 補正。
-/// 修飾キー自身の押下/解放イベントで modifier がイベント前後にズレる問題を吸収する（左右同時押し対応）。
-/// keycode は X keycode 系（Wayland は evdev+8）。
+/// Given a base modifier (from the state mask on X11, from xkb on Wayland), when this keycode is a modifier
+/// key, correct the post-state by overwriting just that one bit with "either side down" from the KeyDownSet (with this event already applied).
+/// It absorbs the modifier being out of step across a press or release of the modifier key itself (both sides at once included).
+/// The keycode is in the X keycode space (on Wayland, evdev+8).
 pub fn overrideModifierBit(base: ModifierFlags, keys: *const KeyDownSet, keycode: u32) ModifierFlags {
     var m = base;
     const which = modifierOf(keycode) orelse return m;
@@ -205,18 +205,18 @@ pub fn overrideModifierBit(base: ModifierFlags, keys: *const KeyDownSet, keycode
 }
 
 // ============================================================================
-// char_input codepoint フィルタ（TASK-22）
+// the char_input codepoint filter
 // ============================================================================
 
-/// char_input として流すべき「確定印字文字」か判定する（x11 XLookupString / wayland
-/// xkb_state_key_get_utf32 の戻り codepoint に共通適用）。制御文字（0x20 未満）・DELETE(0x7f)・
-/// 変換不能(0=文字を持たないキー) を除外する。IME/marked text は今回スコープ外（英数の確定文字前提）。
+/// Whether a codepoint is a committed printable character worth emitting as char_input (applied alike to
+/// what x11's XLookupString and wayland's xkb_state_key_get_utf32 return). It excludes control characters
+/// (below 0x20), DELETE (0x7f) and 0 (a key that carries no character). An IME and marked text are out of scope here (a committed alphanumeric character is assumed).
 pub fn isTextCodepoint(cp: u32) bool {
     return cp >= 0x20 and cp != 0x7f;
 }
 
-test "isTextCodepoint: 印字可能のみ通す" {
-    try std.testing.expect(!isTextCodepoint(0)); // 文字なしキー
+test "isTextCodepoint: only printable characters pass" {
+    try std.testing.expect(!isTextCodepoint(0)); // a key with no character
     try std.testing.expect(!isTextCodepoint(0x08)); // BS
     try std.testing.expect(!isTextCodepoint(0x0d)); // Enter
     try std.testing.expect(!isTextCodepoint(0x1b)); // ESC
@@ -224,15 +224,15 @@ test "isTextCodepoint: 印字可能のみ通す" {
     try std.testing.expect(isTextCodepoint(0x20)); // Space
     try std.testing.expect(isTextCodepoint('A'));
     try std.testing.expect(isTextCodepoint('5'));
-    try std.testing.expect(isTextCodepoint(0x3042)); // あ
+    try std.testing.expect(isTextCodepoint(0x3042)); // a Japanese character
 }
 
 // ============================================================================
 // mouse button / wheel
 // ============================================================================
 
-/// X button 番号 → MouseButton（1=left, 2=middle, 3=right）。wheel(4-7) 等は null。
-/// 注: X の番号と enum 値は異なる（middle が X=2 だが enum=2、right が X=3 だが enum=1）。
+/// An X button number → MouseButton (1=left, 2=middle, 3=right). A wheel (4-7) and the rest give null.
+/// Note: the X numbers and the enum values differ (middle is X=2 and enum=2, but right is X=3 and enum=1).
 pub fn buttonToMouseButton(button: u32) ?MouseButton {
     return switch (button) {
         1 => .left,
@@ -244,8 +244,8 @@ pub fn buttonToMouseButton(button: u32) ?MouseButton {
 
 pub const WheelDelta = struct { dx: f32, dy: f32 };
 
-/// X wheel button(4=up,5=down,6=left,7=right) → ScrollEvent の dx,dy。それ以外は null。
-/// macOS の非 precise(line) scroll = deltaY(±1) × SCROLL_LINE_TO_POINTS(=16) に揃え 1 notch=±16。
+/// An X wheel button (4=up, 5=down, 6=left, 7=right) → the dx and dy of a ScrollEvent. Anything else is null.
+/// One notch is ±16, matching macOS's non-precise (line) scroll = deltaY(±1) × SCROLL_LINE_TO_POINTS(=16).
 pub const SCROLL_LINE_TO_POINTS: f32 = 16.0;
 pub fn wheelDelta(button: u32) ?WheelDelta {
     return switch (button) {
@@ -258,7 +258,7 @@ pub fn wheelDelta(button: u32) ?WheelDelta {
 }
 
 // ============================================================================
-// KeyDownSet: keycode(0..255) の押下集合（is_repeat / 修飾 post-state 判定に使う）
+// KeyDownSet: the set of held keycodes (0..255), used for is_repeat and the modifier post-state
 // ============================================================================
 pub const KeyDownSet = struct {
     bits: [4]u64 = .{ 0, 0, 0, 0 },
@@ -277,7 +277,7 @@ pub const KeyDownSet = struct {
 };
 
 // ============================================================================
-// EventQueue: 固定リング + macOS と同じ coalesce（mouse_move / mouse_scroll）+ drop カウント
+// EventQueue: a fixed ring plus the same coalescing as macOS (mouse_move and mouse_scroll) plus a drop count
 // ============================================================================
 pub const QUEUE_CAP = 256;
 
@@ -302,7 +302,7 @@ pub const EventQueue = struct {
     }
 
     pub fn enqueue(self: *EventQueue, ev: Event) void {
-        // 末尾合体（macOS backend と同一意味論）
+        // merged into the tail (the same semantics as the macOS backend)
         if (self.tailPtr()) |t| {
             switch (ev) {
                 .mouse_move => |m| if (std.meta.activeTag(t.*) == .mouse_move) {
@@ -346,11 +346,11 @@ pub const EventQueue = struct {
 };
 
 // ============================================================================
-// tests（host でも回る。X 不要）
+// tests (they run on a host too; no X needed)
 // ============================================================================
 const testing = std.testing;
 
-test "keycodeToKeyCode: 物理キー基準（evdev keycode）" {
+test "keycodeToKeyCode: by physical key (an evdev keycode)" {
     try testing.expectEqual(KeyCode.Q, keycodeToKeyCode(24));
     try testing.expectEqual(KeyCode.A, keycodeToKeyCode(38));
     try testing.expectEqual(KeyCode.Z, keycodeToKeyCode(52));
@@ -363,7 +363,7 @@ test "keycodeToKeyCode: 物理キー基準（evdev keycode）" {
     try testing.expectEqual(KeyCode.RIGHT_SHIFT, keycodeToKeyCode(62));
     try testing.expectEqual(KeyCode.F12, keycodeToKeyCode(96));
     try testing.expectEqual(KeyCode.KP_5, keycodeToKeyCode(84));
-    // 未割当 / 範囲外 → UNKNOWN
+    // unassigned or out of range → UNKNOWN
     try testing.expectEqual(KeyCode.UNKNOWN, keycodeToKeyCode(8));
     try testing.expectEqual(KeyCode.UNKNOWN, keycodeToKeyCode(250));
 }
@@ -373,38 +373,38 @@ test "stateToModifiers: cmd↔Mod4, alt↔Mod1" {
     try testing.expect(m.shift and m.ctrl and m.alt and m.cmd);
     const none = stateToModifiers(0);
     try testing.expect(!none.shift and !none.ctrl and !none.alt and !none.cmd);
-    // Mod2(NumLock)/Lock(Caps) は無視する
+    // Mod2 (NumLock) and Lock (Caps) are ignored
     const ignored = stateToModifiers((1 << 1) | (1 << 4));
     try testing.expect(!ignored.shift and !ignored.ctrl and !ignored.alt and !ignored.cmd);
 }
 
-test "keyEventModifiers: 修飾キー自身の post-state（左右同時押し）" {
+test "keyEventModifiers: the post-state of a modifier key itself (both sides held at once)" {
     var keys = KeyDownSet{};
-    // Left Shift 押下: state はまだ shift=0（pre-state）。down set 反映後に true になる。
+    // Left Shift pressed: state still has shift=0 (the pre-state). It becomes true once the down set is applied.
     keys.setDown(KC_SHIFT_L, true);
     var m = keyEventModifiers(0, &keys, KC_SHIFT_L);
     try testing.expect(m.shift);
 
-    // Left を押したまま Right Shift も押下 → 両方 down。
+    // Right Shift pressed while Left is still held → both are down.
     keys.setDown(KC_SHIFT_R, true);
     m = keyEventModifiers(ShiftMask, &keys, KC_SHIFT_R);
     try testing.expect(m.shift);
 
-    // Right Shift を離す（Left はまだ down）→ shift は true のまま（AND-NOT なら誤って false になるケース）。
+    // Right Shift released (Left still down) → shift stays true (an AND-NOT would wrongly make it false here).
     keys.setDown(KC_SHIFT_R, false);
     m = keyEventModifiers(ShiftMask, &keys, KC_SHIFT_R);
     try testing.expect(m.shift);
 
-    // 最後に Left Shift も離す → shift=false。
+    // Finally Left Shift is released too → shift=false.
     keys.setDown(KC_SHIFT_L, false);
     m = keyEventModifiers(ShiftMask, &keys, KC_SHIFT_L);
     try testing.expect(!m.shift);
 }
 
-test "keyEventModifiers: 無関係な修飾は state mask を保持" {
+test "keyEventModifiers: an unrelated modifier keeps the state mask" {
     var keys = KeyDownSet{};
-    keys.setDown(38, true); // 'A' を押下（修飾でない）
-    // Ctrl が state に立っている（focus 前から保持していた想定）→ A の event でも ctrl を維持。
+    keys.setDown(38, true); // 'A' pressed (not a modifier)
+    // Ctrl is set in state (held since before focus, say) → the A event keeps ctrl.
     const m = keyEventModifiers(ControlMask, &keys, 38);
     try testing.expect(m.ctrl and !m.shift);
 }
@@ -422,7 +422,7 @@ test "buttonToMouseButton / wheelDelta" {
     try testing.expect(wheelDelta(1) == null);
 }
 
-test "KeyDownSet: set/clear/isDown（境界）" {
+test "KeyDownSet: set/clear/isDown at the boundaries" {
     var s = KeyDownSet{};
     try testing.expect(!s.isDown(0));
     s.setDown(0, true);
@@ -432,11 +432,11 @@ test "KeyDownSet: set/clear/isDown（境界）" {
     try testing.expect(s.isDown(0) and s.isDown(63) and s.isDown(64) and s.isDown(255));
     s.setDown(64, false);
     try testing.expect(!s.isDown(64) and s.isDown(63));
-    s.setDown(256, true); // 範囲外は no-op
+    s.setDown(256, true); // out of range is a no-op
     try testing.expect(!s.isDown(256));
 }
 
-test "EventQueue: mouse_move 合体（同 buttons/modifiers）" {
+test "EventQueue: mouse_move merges when buttons and modifiers match" {
     var q = EventQueue{};
     const base = types.MouseEvent{ .x = 1, .y = 1, .button = .none, .buttons = .{}, .modifiers = .{} };
     q.enqueue(.{ .mouse_move = base });
@@ -448,7 +448,7 @@ test "EventQueue: mouse_move 合体（同 buttons/modifiers）" {
     try testing.expectEqual(@as(i32, 3), ev.mouse_move.y);
 }
 
-test "EventQueue: 異なる buttons は合体しない" {
+test "EventQueue: different buttons do not merge" {
     var q = EventQueue{};
     q.enqueue(.{ .mouse_move = .{ .x = 1, .y = 1, .button = .none, .buttons = .{}, .modifiers = .{} } });
     q.enqueue(.{ .mouse_move = .{ .x = 2, .y = 2, .button = .none, .buttons = .{ .left = true }, .modifiers = .{} } });
@@ -456,7 +456,7 @@ test "EventQueue: 異なる buttons は合体しない" {
     try testing.expectEqual(@as(u64, 0), q.mouse_move_merge_count);
 }
 
-test "EventQueue: mouse_scroll 合体は dx/dy 加算" {
+test "EventQueue: merging mouse_scroll adds up dx and dy" {
     var q = EventQueue{};
     q.enqueue(.{ .mouse_scroll = .{ .x = 0, .y = 0, .dx = 0, .dy = 16, .is_precise = false, .buttons = .{}, .modifiers = .{} } });
     q.enqueue(.{ .mouse_scroll = .{ .x = 5, .y = 5, .dx = 0, .dy = 16, .is_precise = false, .buttons = .{}, .modifiers = .{} } });
@@ -467,21 +467,21 @@ test "EventQueue: mouse_scroll 合体は dx/dy 加算" {
     try testing.expectEqual(@as(i32, 5), ev.mouse_scroll.x);
 }
 
-test "EventQueue: 異種イベントは合体しない / FIFO 順" {
+test "EventQueue: events of different kinds do not merge, and the order is FIFO" {
     var q = EventQueue{};
     q.enqueue(.quit);
     q.enqueue(.{ .mouse_move = .{ .x = 1, .y = 1, .button = .none, .buttons = .{}, .modifiers = .{} } });
     q.enqueue(.{ .mouse_move = .{ .x = 2, .y = 2, .button = .none, .buttons = .{}, .modifiers = .{} } });
-    // quit と move は別、move 同士は合体 → 2 件
+    // quit and move are distinct, two moves merge → 2 entries
     try testing.expectEqual(@as(usize, 2), q.len);
     try testing.expect(q.dequeue().? == .quit);
     try testing.expectEqual(@as(i32, 2), q.dequeue().?.mouse_move.x);
     try testing.expect(q.dequeue() == null);
 }
 
-test "EventQueue: 満杯で drop カウント" {
+test "EventQueue: a full queue counts a drop" {
     var q = EventQueue{};
-    // 合体されない別種（key_down, keycode を変えて）で満たす
+    // filled with a different kind that does not merge (key_down, with a different keycode)
     var i: usize = 0;
     while (i < QUEUE_CAP) : (i += 1) {
         q.enqueue(.{ .key_down = .{ .key = .A, .is_repeat = false, .modifiers = .{} } });

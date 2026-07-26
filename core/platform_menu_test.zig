@@ -1,4 +1,4 @@
-//! display/backend 不要の platform facade menu / geometry 契約テスト。
+//! Contract tests for the platform facade's menu and geometry, needing no display and no backend.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -8,7 +8,7 @@ fn nullWindow(w: u32, h: u32) platform.Window {
     return .{ .inner = .{ .null_win = .{ .pixels = &.{}, .width = w, .height = h } } };
 }
 
-test "platform menu facade: null runtime は利用不可かつ register/update/destroy が no-op" {
+test "platform menu facade: unavailable under the null runtime, and register/update/destroy are no-ops" {
     const commands = [_]command_types.Command{
         .{ .id = 1, .label = "Undo", .menu = .{ .title = "Edit", .order = 1 }, .enabled = true },
         .{ .id = 0, .kind = .separator, .menu = .{ .title = "Edit", .order = 2 } },
@@ -21,22 +21,22 @@ test "platform menu facade: null runtime は利用不可かつ register/update/d
     window.destroyMenu();
 }
 
-// getGeometry は native branch が platform_get_window_geometry を参照するため、
-// display-less の本テストでは呼べない（macos .o 未リンクで undefined symbol）。
-// null のサイズ契約は inner.null_win の width/height と E2E（appshell geom=）で検証する。
-test "platform geometry facade: null Window は作成サイズを null_win に保持する" {
+// getGeometry cannot be called from this display-less test, because the native branch references
+// platform_get_window_geometry (the macos .o is not linked, so the symbol is undefined).
+// The size contract of null is checked through inner.null_win's width/height and end to end (appshell geom=).
+test "platform geometry facade: a null Window keeps its creation size in null_win" {
     const window = nullWindow(640, 480);
     try std.testing.expectEqual(@as(u32, 640), window.inner.null_win.width);
     try std.testing.expectEqual(@as(u32, 480), window.inner.null_win.height);
 }
 
-test "platform geometry facade: null 未設定サイズの既定は 0" {
+test "platform geometry facade: an unset null size defaults to 0" {
     const window = nullWindow(0, 0);
     try std.testing.expectEqual(@as(u32, 0), window.inner.null_win.width);
     try std.testing.expectEqual(@as(u32, 0), window.inner.null_win.height);
 }
 
-test "TASK-79.6.3: document access facade は null runtime で no-op・未登録" {
+test "document access facade: a no-op and unregistered under the null runtime" {
     var window = nullWindow(0, 0);
     var dummy: u8 = 0;
     const cbs = platform.TextInputDocumentCallbacks{
@@ -56,7 +56,7 @@ test "TASK-79.6.3: document access facade は null runtime で no-op・未登録
             }
         }.f,
     };
-    // null は登録しない（legacy path = 未登録 = char_input 経路維持）
+    // null registers nothing (the legacy path: unregistered keeps the char_input route)
     window.setTextInputDocumentAccess(@ptrCast(&dummy), cbs);
     window.setTextInputDocumentAccess(@ptrCast(&dummy), null);
     try std.testing.expect(@hasDecl(platform.Window, "setTextInputDocumentAccess"));

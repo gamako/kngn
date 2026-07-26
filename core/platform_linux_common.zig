@@ -1,12 +1,12 @@
-//! Linux backend 共通実装（TASK-28.5.1）
+//! The shared Linux backend implementation
 //!
-//! X11 / Wayland 両 backend が再利用する、display 技術に依存しない処理:
-//!   - `getTime`: clock_gettime(CLOCK_MONOTONIC_RAW) ベースの高精度モノトニック時刻。
-//!   - ファイル選択ダイアログ: zenity サブプロセス（Linux にネイティブ API が無いため）。
+//! What both the X11 and the Wayland backend reuse, independent of the display technology:
+//!   - `getTime`: a high-resolution monotonic time based on clock_gettime(CLOCK_MONOTONIC_RAW).
+//!   - The file selection dialogs: a zenity subprocess (Linux has no native API for them).
 //!
-//! 本ファイルは `@cImport`（X11 / Wayland）しない。libc の `clock_gettime` を extern 宣言し、
-//! dialog は `std.process.run` で完結する。`platform_linux_x11.zig` / `platform_linux_wayland.zig`
-//! から `pub const getTime = common.getTime;` 等で re-export する。
+//! This file does not `@cImport` (X11 or Wayland). It declares libc's `clock_gettime` as an extern,
+//! and the dialogs are entirely `std.process.run`. `platform_linux_x11.zig` and
+//! `platform_linux_wayland.zig` re-export it with `pub const getTime = common.getTime;` and the like.
 
 const std = @import("std");
 const types = @import("platform_types");
@@ -16,8 +16,8 @@ const OpenDialogOptions = types.OpenDialogOptions;
 const DialogError = types.DialogError;
 
 // ============================================================================
-// getTime: clock_gettime(CLOCK_MONOTONIC_RAW) → 失敗時 CLOCK_MONOTONIC
-// （link_libc 済み。型を確実に制御するため extern を自前宣言）
+// getTime: clock_gettime(CLOCK_MONOTONIC_RAW), falling back to CLOCK_MONOTONIC
+// (link_libc is on. The extern is declared here to keep the types firmly under control)
 // ============================================================================
 extern fn clock_gettime(clk_id: c_int, tp: *std.c.timespec) c_int;
 const CLOCK_MONOTONIC: c_int = 1;
@@ -32,27 +32,27 @@ pub fn getTime() f64 {
 }
 
 // ============================================================================
-// ファイル選択ダイアログ（TASK-28.4）
+// The file selection dialogs
 //
-// Linux にネイティブのファイル選択 API は無いため zenity サブプロセスで実現する。
-// `std.process.run` が spawn→stdout/stderr collect→wait を一括で行う（内部の
-// MultiReader が pipe 詰まりを回避）。結果は term と stderr で分類する:
-//   - spawn FileNotFound（zenity 不在）          → error.DialogUnavailable
-//   - exit 0                                      → stdout の絶対パス（改行 trim）を dupe
-//   - exit 1 かつ stderr 空                       → null（ユーザーキャンセル / クローズ）
-//   - exit 1 かつ stderr 非空（GTK 初期化失敗等） → error.DialogFailed（silent cancel にしない）
-//   - その他 exit / signal / stdout 空 / 上限超過 → error.DialogFailed
-// メインスレッドから呼ばれる（RT スレッドではない）ので malloc/spawn の制約はない。
+// Linux has no native file selection API, so a zenity subprocess provides one.
+// `std.process.run` does the spawn, the stdout/stderr collection and the wait in one go (its internal
+// MultiReader avoids a blocked pipe). The result is classified by term and stderr:
+//   - a spawn FileNotFound (zenity is absent)          → error.DialogUnavailable
+//   - exit 0                                           → dupe the absolute path from stdout (newline trimmed)
+//   - exit 1 with empty stderr                         → null (the user cancelled or closed it)
+//   - exit 1 with non-empty stderr (GTK failed to start, say) → error.DialogFailed (never a silent cancel)
+//   - any other exit, a signal, empty stdout, or over the limit → error.DialogFailed
+// It is called from the main thread (not the real-time thread), so malloc and spawn are unconstrained.
 // ============================================================================
 
-/// zenity の stdout/stderr 上限（パス用途には十分。暴走出力に対する安全弁）。
+/// The limit on zenity's stdout and stderr (ample for a path; a safety valve against runaway output).
 const dialog_output_limit: std.Io.Limit = .limited(64 * 1024);
 
 pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
 
-    // 実行時に組み立てる引数（--filename= / --file-filter=）は使用後に free する。
+    // The arguments built at runtime (--filename= and --file-filter=) are freed after use.
     var filename_arg: ?[]u8 = null;
     defer if (filename_arg) |a| gpa.free(a);
     var filter_arg: ?[]u8 = null;
@@ -90,13 +90,13 @@ pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOption
     return runZenity(gpa, io, argv.items);
 }
 
-/// `--file-filter=NAME | *.ext` を組み立てる（zenity manpage 形式）。
-/// allowed_ext は拡張子のみ（"png"。ドット/アスタリスク無し）前提。
+/// Build `--file-filter=NAME | *.ext` (the form in zenity's manpage).
+/// allowed_ext is assumed to be the extension alone ("png": no dot, no asterisk).
 fn fileFilterArg(gpa: std.mem.Allocator, ext: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "--file-filter={s} files | *.{s}", .{ ext, ext });
 }
 
-/// zenity を起動し、結果を (パス | null=キャンセル | DialogError) に分類する。
+/// Start zenity and classify the result as a path, null (cancelled), or a DialogError.
 fn runZenity(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     const result = std.process.run(gpa, io, .{
         .argv = argv,
@@ -104,7 +104,7 @@ fn runZenity(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) (Dial
         .stderr_limit = dialog_output_limit,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return error.DialogUnavailable, // zenity 不在
+        error.FileNotFound => return error.DialogUnavailable, // zenity is absent
         else => return error.DialogFailed,
     };
     defer gpa.free(result.stdout);
@@ -114,11 +114,11 @@ fn runZenity(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) (Dial
         .exited => |code| switch (code) {
             0 => {
                 const path = std.mem.trimEnd(u8, result.stdout, "\r\n");
-                if (path.len == 0) return error.DialogFailed; // 成功なのにパス無し＝異常
+                if (path.len == 0) return error.DialogFailed; // success yet no path: something is wrong
                 return try gpa.dupe(u8, path);
             },
-            // zenity はキャンセル/クローズも exit 1。GTK 初期化失敗等も exit 1 になりうるため
-            // stderr の有無で「キャンセル」と「機構が使えない」を切り分ける。
+            // zenity exits 1 for a cancel or a close, but GTK failing to start also exits 1, so
+            // the presence of stderr is what separates "cancelled" from "the mechanism is unusable".
             1 => if (result.stderr.len == 0) return null else return error.DialogFailed,
             else => return error.DialogFailed,
         },

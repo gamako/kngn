@@ -1,28 +1,28 @@
-//! Linux platform backend — X11/Xlib 実装（TASK-28.2 / 28.6 / 28.5.1 で分離）
+//! The Linux platform backend: the X11/Xlib implementation
 //!
-//! `src/platform_linux.zig`（dispatcher）が `build_options.platform_backend == "x11"` のとき選ぶ。
-//! display 非依存の `getTime` / ファイルダイアログは `platform_linux_common.zig` に分離し re-export する。
+//! The dispatcher (`core/platform_linux.zig`) picks it when `build_options.platform_backend == "x11"`.
+//! The display-independent `getTime` and file dialogs live in `platform_linux_common.zig` and are re-exported.
 //!
-//! ソフトウェアフレームバッファ方式。caller は canonical BGRA `[]u32`
-//! （u32 0xAARRGGBB / メモリ [B,G,R,A]）を書く。
+//! It is a software framebuffer. The caller writes canonical BGRA `[]u32`
+//! (u32 0xAARRGGBB / memory [B,G,R,A]).
 //!
-//! present 時の blit は visual 分類（`platform_linux_convert.classifyVisual`、TASK-28.6 / AC#4）で 2 経路に分かれる:
-//!   - **direct**: 32bpp & LSBFirst & rs16/gs8/bs0 & stride==width*4。canonical BGRA の低24bit が
-//!     標準 visual の 0x00RRGGBB に一致するため、XImage/shm バッファを caller に直接書かせ
-//!     （`lockFramebuffer` が image data を返す）、present は XShmPutImage/XPutImage のみ（**毎フレーム変換コピー無し**）。
-//!   - **fallback**: 32bpp & LSBFirst & RGB 各8bit連続だが（非標準 shift または stride padding）の visual。
-//!     別持ちの backing(BGRA) を present で `packPixel`（BGRA→visual mask）変換してから blit する。
-//!   - **fail**: 16/24bpp・565・非連続/重複 mask・MSBFirst は create を WindowCreationFailed にする（拡張しない）。
+//! The blit at present time takes one of two paths, decided by the visual classification (`platform_linux_convert.classifyVisual`):
+//!   - **direct**: 32bpp and LSBFirst and rs16/gs8/bs0 and stride==width*4. The low 24 bits of canonical
+//!     BGRA match the 0x00RRGGBB of a standard visual, so the caller writes into the XImage or shm buffer
+//!     itself (`lockFramebuffer` returns the image data) and present is nothing but XShmPutImage/XPutImage (**no converting copy per frame**).
+//!   - **fallback**: a 32bpp, LSBFirst visual with 8 contiguous bits for each of R/G/B, but a non-standard shift or stride padding.
+//!     A separate backing (BGRA) is converted by `packPixel` (BGRA→the visual mask) at present time and then blitted.
+//!   - **fail**: 16/24bpp, 565, a non-contiguous or overlapping mask, and MSBFirst all make create return WindowCreationFailed (they are not supported).
 //!
-//! direct/fallback の判定と変換は純粋ロジック（`platform_linux_convert.zig`）に分離し display 無しで単体テストする。
-//! 実装方針の詳細は docs/plans/28.2-plan.md / 28.3-plan.md を参照。入力（key/mouse）は本ファイル（TASK-28.3）、
-//! ファイルダイアログは TASK-28.4、Wayland は TASK-28.5。
+//! Deciding between direct and fallback, and the conversion itself, are pure logic (`platform_linux_convert.zig`) and unit tested without a display.
+//! Input (keys and the mouse) is handled in this file, the file dialogs in `platform_linux_common.zig`,
+//! and Wayland in `platform_linux_wayland.zig`.
 //!
-//! 入力の純粋な変換（keycode→KeyCode / state→modifiers / EventQueue 合体 / KeyDownSet）は
-//! `platform_linux_input.zig`（@cImport しない純 Zig）に分離し、本ファイルは XEvent から値を取り出して呼ぶだけ。
+//! The pure translation of input (keycode→KeyCode, state→modifiers, the EventQueue merging, the KeyDownSet) lives in
+//! `platform_linux_input.zig` (pure Zig with no @cImport), and this file only pulls the values out of an XEvent and calls it.
 //!
-//! TASK-113.4: XDND（X Drag and Drop）の atom 登録・selection 通信は行わない stub。
-//! `Event.file_drop` は型として存在するが本 backend は producer にならない（後続タスク）。
+//! XDND (X Drag and Drop) is a stub: neither the atom registration nor the selection exchange is implemented.
+//! `Event.file_drop` exists as a type, but this backend never produces one.
 
 const std = @import("std");
 const types = @import("platform_types");
@@ -34,12 +34,12 @@ const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("X11/Xlib.h");
     @cInclude("X11/Xutil.h");
-    @cInclude("X11/Xatom.h"); // XA_ATOM（createFullscreen の _NET_WM_STATE 設定用。TASK-100）
+    @cInclude("X11/Xatom.h"); // XA_ATOM (for setting _NET_WM_STATE in createFullscreen)
     @cInclude("X11/XKBlib.h"); // XkbSetDetectableAutoRepeat
-    @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair（system cursor。TASK-75.3）
-    @cInclude("X11/Xresource.h"); // Xrm API（Xft.dpi → content_scale。TASK-156.5 Stage 2）
+    @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair (the system cursors)
+    @cInclude("X11/Xresource.h"); // The Xrm API (Xft.dpi → content_scale)
     @cInclude("X11/extensions/XShm.h");
-    @cInclude("X11/extensions/shape.h"); // クリック透過の input shape（TASK-104.2）
+    @cInclude("X11/extensions/shape.h"); // The input shape behind click-through
     @cInclude("sys/ipc.h");
     @cInclude("sys/shm.h");
 });
@@ -54,17 +54,17 @@ const FramebufferMode = types.FramebufferMode;
 const WindowSize = types.WindowSize;
 
 // ============================================================================
-// TASK-156.5 Stage 2: 高 DPI 共通ヘルパー（plan「共通パターン」。単体テスト対象）
-// ホットパス宣言: 初期化時 / イベント時のみ（フレーム毎・RT ではない）。
+// The shared high-DPI helpers (unit tested)
+// Hot path declaration: initialisation and event time only (neither per frame nor real time).
 // ============================================================================
 
-/// 入力正規化用の実スケール（query 用。lock 前・都度再取得）。fb_mode に非依存。
+/// The real scale used for input normalisation (for a query; re-read each time, before a lock). Independent of fb_mode.
 fn effectiveContentScale(raw_scale: f32) f32 {
     return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
 }
 
-/// objc の (int)lround((double)px * (double)scale) と数値一致させる。
-/// 有限値 [1, u32最大] にクランプする（1未満→1、u32最大超過→u32最大）。
+/// Numerically identical to objc's (int)lround((double)px * (double)scale).
+/// Clamps to a finite value in [1, the maximum u32] (below 1 → 1, above the maximum u32 → the maximum u32).
 fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
     const v: f64 = @round(@as(f64, @floatFromInt(logical_px)) * s);
@@ -73,7 +73,7 @@ fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     return @intFromFloat(v);
 }
 
-/// framebuffer 物理サイズ。.logical は常に logical そのもの（R9 の構造的保証はここに集約）。
+/// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
 fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
     if (fb_mode == .logical) return logical;
     return .{
@@ -82,8 +82,8 @@ fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale
     };
 }
 
-/// Xft.dpi（X resource）から content_scale を取得する。失敗は fail-soft で 1.0。
-/// Xft.dpi はディスプレイ全体のグローバル値（per-monitor DPI ではない）。起動時固定。
+/// Read content_scale from Xft.dpi (an X resource). A failure is fail-soft and gives 1.0.
+/// Xft.dpi is a global value for the whole display, not a per-monitor DPI. It is fixed at start-up.
 fn queryXftContentScale(dpy: *c.Display) f32 {
     c.XrmInitialize();
     const rms = c.XResourceManagerString(dpy) orelse return 1.0;
@@ -107,34 +107,34 @@ fn queryXftContentScale(dpy: *c.Display) f32 {
 }
 
 comptime {
-    // 本ファイルは x11 実装。dispatcher(platform_linux.zig)が build_options.platform_backend=="x11"
-    // のときだけ import する。誤って他 backend で取り込まれた場合に明確に落とす二重防御（28.5.1）。
+    // This file is the x11 implementation. The dispatcher (platform_linux.zig) imports it only when
+    // build_options.platform_backend=="x11"; the check below is a second line of defence that fails loudly if another backend pulls it in by mistake.
     if (!std.mem.eql(u8, build_options.platform_backend, "x11")) {
-        @compileError("platform_linux_x11: backend '" ++ build_options.platform_backend ++
-            "' で X11 実装が import された（dispatcher は x11 のときだけ選ぶはず）");
+        @compileError("platform_linux_x11: the X11 implementation was imported with backend '" ++
+            build_options.platform_backend ++ "' (the dispatcher must only pick it for x11)");
     }
 }
 
 const alloc = std.heap.c_allocator;
 
-// getTime / ファイルダイアログ（display 非依存）は common に分離。公開面を保つため re-export する。
+// getTime and the file dialogs (which need no display) live in common. They are re-exported to keep the public surface intact.
 pub const getTime = common.getTime;
 pub const saveFileDialog = common.saveFileDialog;
 pub const openFileDialog = common.openFileDialog;
 
-/// `XDestroyImage` は Xlib のマクロ（`(*((img)->f.destroy_image))(img)`）で、@cImport が
-/// optional 関数ポインタを unwrap せず変換するためそのままでは呼べない。関数ポインタを手動で呼ぶ。
+/// `XDestroyImage` is an Xlib macro (`(*((img)->f.destroy_image))(img)`), and @cImport translates the
+/// optional function pointer without unwrapping it, so it cannot be called as it stands. The function pointer is invoked by hand.
 inline fn destroyImage(img: *c.XImage) void {
     _ = img.f.destroy_image.?(img);
 }
 
 // ============================================================================
-// init / shutdown（プロセス単一の Display）
+// init and shutdown (one Display per process)
 // ============================================================================
 var g_display: ?*c.Display = null;
 
-/// detectable auto-repeat が有効化できたか（Display スコープ）。init で確定し、create で State へコピーする。
-/// 有効時はキーリピートが KeyRelease を伴わない連続 KeyPress として来る（is_repeat 判定が単純化）。
+/// Whether detectable auto-repeat could be enabled (a Display-scoped property). init settles it, and create copies it into State.
+/// While it is on, a key repeat arrives as consecutive KeyPress events with no KeyRelease (which simplifies deciding is_repeat).
 var g_detectable_repeat: bool = false;
 
 pub fn init() Error!void {
@@ -142,8 +142,8 @@ pub fn init() Error!void {
     const dpy = c.XOpenDisplay(null) orelse return error.InitFailed;
     g_display = dpy;
 
-    // is_repeat 判定の第一候補。supported=true なら KeyDownSet の「既 down か」だけで repeat を判定できる。
-    // 非対応環境では pollEvents 側の KeyRelease→KeyPress 先読み fallback に切り替わる。
+    // The first choice for deciding is_repeat. With supported=true, "was it already down" in the KeyDownSet is enough.
+    // Where it is unsupported, pollEvents switches to the KeyRelease→KeyPress look-ahead fallback.
     var supported: c.Bool = 0;
     _ = c.XkbSetDetectableAutoRepeat(dpy, 1, &supported);
     g_detectable_repeat = supported != 0;
@@ -157,7 +157,7 @@ pub fn shutdown() void {
 }
 
 // ============================================================================
-// XShm attach 用の一時 X error handler（BadAccess/BadShmSeg を握る）
+// A temporary X error handler for the XShm attach (it swallows BadAccess and BadShmSeg)
 // ============================================================================
 var g_shm_error: bool = false;
 
@@ -176,29 +176,29 @@ const State = struct {
     display: *c.Display,
     window: c.Window,
     gc: c.GC,
-    /// 論理サイズ（アプリ/gui 座標。create 引数・独立保持。lround 逆算に依存しない）。
+    /// The logical size (the coordinates of the application and the GUI; the create argument, held independently rather than derived back through lround).
     logical_width: u32,
     logical_height: u32,
-    /// 物理 / framebuffer / window 実ピクセル寸法（blit・present・ConfigureNotify の単位）。
-    /// `.logical` では logical と同値、`.physical` では `roundToPhysicalPx(logical, scale)`。
+    /// The physical, framebuffer and real window pixel size (the unit of the blit, of present and of ConfigureNotify).
+    /// Under `.logical` it equals the logical size; under `.physical` it is `roundToPhysicalPx(logical, scale)`.
     physical_width: u32,
     physical_height: u32,
-    /// 後方互換 alias: 既存 blit 経路が参照する framebuffer 寸法 == physical_*。
+    /// A backwards-compatible alias: the framebuffer size the existing blit path refers to == physical_*.
     width: u32,
     height: u32,
     fb_mode: FramebufferMode,
-    /// query 用（入力 raw 化・`contentScale()`）。X11 は runtime 変更非対応のため latched と同値のまま。
+    /// For a query (making input raw, and `contentScale()`). X11 does not support a runtime change, so it stays equal to the latched value.
     pending_content_scale: f32,
-    /// latched（`lockFramebuffer` snapshot）。起動時に確定し以後不変（scale_epoch は 0 のまま）。
+    /// The latched value (the `lockFramebuffer` snapshot). It is settled at start-up and never changes afterwards (scale_epoch stays 0).
     content_scale: f32,
     scale_epoch: u64,
     wm_delete: c.Atom,
-    // resize（TASK-23）で setupBlit を再実行するため、作成時の visual/depth を保持する。
+    // The visual and depth at creation are kept, so that a resize can run setupBlit again.
     visual: ?*c.Visual,
     depth: c_uint,
 
-    // canonical BGRA framebuffer（caller が書く。lockFramebuffer が返す）。
-    // direct: image data を別名参照（別 alloc しない）。fallback: 別持ち alloc。
+    // The canonical BGRA framebuffer (what the caller writes, and what lockFramebuffer returns).
+    // direct: an alias of the image data (nothing extra is allocated). fallback: a separate allocation.
     backing: []u32,
 
     // blit
@@ -208,13 +208,13 @@ const State = struct {
     shminfo: c.XShmSegmentInfo,
     shmat_ok: bool,
     attached: bool,
-    // XPutImage 経路で Zig 所有の image data バッファ（shm 経路では未使用）。
-    // []u32 で確保し u32 alignment を保証する（image data を []u32 として直書き/変換するため）。
+    // The Zig-owned image data buffer of the XPutImage path (unused on the shm path).
+    // It is allocated as []u32 to guarantee u32 alignment (the image data is written or converted as a []u32).
     xfer: []u32,
 
-    // 直書き可否（classifyVisual の結果）。true なら present は変換コピー無しで blit。
+    // Whether it can be written straight through (the result of classifyVisual). When true, present blits with no converting copy.
     direct: bool,
-    // fallback 時の pixel 変換 shift（visual mask から算出。direct では未使用）
+    // The pixel conversion shifts used by fallback (computed from the visual mask; unused by direct)
     r_shift: u5,
     g_shift: u5,
     b_shift: u5,
@@ -222,24 +222,24 @@ const State = struct {
     // events
     closing: bool,
     quit_delivered: bool,
-    queue: input.EventQueue, // 合体 + drop カウントは EventQueue に閉じ込め（純 Zig・テスト可）
+    queue: input.EventQueue, // The merging and the drop count are confined to the EventQueue (pure Zig, and testable)
 
-    // 入力状態（post-state を作るための backend 内部追跡）
-    buttons: MouseButtons, // 現在押下中のマウスボタン集合
-    keys: input.KeyDownSet, // keycode 押下集合（is_repeat / 修飾 post-state 判定）
-    detectable_repeat: bool, // g_detectable_repeat のコピー
+    // The input state (what the backend tracks internally to build the post-state)
+    buttons: MouseButtons, // the set of mouse buttons currently held
+    keys: input.KeyDownSet, // the set of held keycodes (for is_repeat and the modifier post-state)
+    detectable_repeat: bool, // a copy of g_detectable_repeat
 
-    // system cursor（TASK-75.3）: CursorShape(default/crosshair/hidden) 別に遅延生成した
-    // X11 Cursor をキャッシュ（0=None=未生成）。destroy で XFreeCursor する。
+    // The system cursors: an X11 Cursor is created lazily per CursorShape (default/crosshair/hidden)
+    // and cached (0=None means it has not been created). destroy XFreeCursor's them.
     cursors: [3]c.Cursor = .{ 0, 0, 0 },
 
-    // 透過 / borderless / クリック透過（TASK-104.2）
+    // Transparency, borderless and click-through
     transparent: bool = false,
     borderless: bool = false,
     click_through: bool = false,
-    colormap: c.Colormap = 0, // 透過 ARGB visual 用（destroy で XFreeColormap。0=既定 visual で未作成）
-    own_gc: bool = false, // st.gc を XCreateGC で自作したか（透過 window 用。destroy で XFreeGC）
-    ct_region_valid: bool = false, // click-through input shape 設定済みか（未設定なら次 present で 1 回計算）
+    colormap: c.Colormap = 0, // For the transparent ARGB visual (destroy XFreeColormap's it; 0 means none was created, i.e. the default visual)
+    own_gc: bool = false, // Whether st.gc was made here with XCreateGC (for a transparent window; destroy XFreeGC's it)
+    ct_region_valid: bool = false, // Whether the click-through input shape has been set (unset means the next present computes it once)
 
     fn enqueue(self: *State, ev: Event) void {
         self.queue.enqueue(ev);
@@ -257,17 +257,17 @@ pub const Window = struct {
         return createInternal(width, height, title, false, .{});
     }
 
-    /// 透過 / borderless オプション付き作成（TASK-104.2）。facade が @hasDecl で検出して使う。
-    /// 透過は 32bit ARGB visual（XMatchVisualInfo。無ければ error.Unsupported）+ colormap + XCreateWindow。
-    /// **実際に背後が透けるにはコンポジタ（picom 等）が必要**。ホットパス宣言: 初期化時のみ。
+    /// Create with the transparency and borderless options. The facade detects this through @hasDecl.
+    /// Transparency needs a 32-bit ARGB visual (XMatchVisualInfo; without one it gives error.Unsupported) plus a colormap plus XCreateWindow.
+    /// **Actually seeing through to what is behind needs a compositor (picom and the like).** Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
         return createInternal(width, height, title, false, opts);
     }
 
-    /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。装飾なし・画面解像度いっぱい）。
-    /// 画面解像度は `XDisplayWidth`/`XDisplayHeight`（既定 screen）で取得し、`XMapWindow` 前に
-    /// EWMH `_NET_WM_STATE_FULLSCREEN` を `_NET_WM_STATE` プロパティへセットする。準拠 WM は
-    /// map 時点でこれを見て装飾なし・画面サイズへフルスクリーン化する（`create()` の挙動は無変更）。
+    /// Create a real fullscreen window (undecorated and filling the screen resolution).
+    /// The screen resolution comes from `XDisplayWidth`/`XDisplayHeight` (the default screen), and before
+    /// `XMapWindow` the EWMH `_NET_WM_STATE_FULLSCREEN` is set on the `_NET_WM_STATE` property. A conforming
+    /// window manager reads it as it maps and goes undecorated and full screen (the behaviour of `create()` is unchanged).
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
         const screen = c.XDefaultScreen(dpy);
@@ -282,13 +282,13 @@ pub const Window = struct {
 
         const screen = c.XDefaultScreen(dpy);
         const root = c.XRootWindow(dpy, screen);
-        // TASK-117: 明示位置は client origin（root 座標）。XCreate* の初期座標に渡し、
-        // さらに下で WM_NORMAL_HINTS（PPosition + StaticGravity）を立てて WM に同基準で
-        // 復元させる（reparenting WM の装飾幅ずれ / 位置無視を避ける）。
+        // An explicit position is the client origin (in root coordinates). It is passed as the initial
+        // coordinate of XCreate*, and WM_NORMAL_HINTS (PPosition + StaticGravity) is set below so the window
+        // manager restores it on the same basis (which avoids a reparenting WM's decoration offset, or it ignoring the position).
         const init_x: c_int = if (opts.position) |p| p.x else 0;
         const init_y: c_int = if (opts.position) |p| p.y else 0;
 
-        // TASK-156.5 Stage 2: Xft.dpi → content_scale（失敗は 1.0）。fb_mode に関わらず実スケールを保持。
+        // Xft.dpi → content_scale (a failure gives 1.0). The real scale is kept whatever fb_mode is.
         const scale = queryXftContentScale(dpy);
         const logical: WindowSize = .{ .width = width, .height = height };
         const fb_size = effectiveFramebufferSize(opts.fb_mode, logical, scale);
@@ -303,12 +303,12 @@ pub const Window = struct {
         var gc: c.GC = undefined;
 
         if (opts.transparent) {
-            // 32bit ARGB TrueColor visual を探す（無ければ透過不可）。colormap + XCreateWindow で作る。
+            // Look for a 32-bit ARGB TrueColor visual (without one there can be no transparency). It is built with a colormap plus XCreateWindow.
             var vinfo: c.XVisualInfo = undefined;
             if (c.XMatchVisualInfo(dpy, screen, 32, c.TrueColor, &vinfo) == 0) return error.Unsupported;
-            // canonical BGRA(0xAARRGGBB) の直書き経路（classifyVisual=direct）で alpha を保つには標準
-            // ARGB 配置（R=0xFF0000/G=0xFF00/B=0xFF）が必須。非標準 shift は fallback 変換で alpha が
-            // 落ちる（全画素透明化）ため、ここで弾いて Unsupported にする（codex 指摘）。
+            // Keeping the alpha on the straight-through path of canonical BGRA (0xAARRGGBB) (classifyVisual=direct)
+            // requires the standard ARGB layout (R=0xFF0000/G=0xFF00/B=0xFF). A non-standard shift would lose the
+            // alpha in the fallback conversion (turning every pixel transparent), so it is rejected here as Unsupported.
             if (vinfo.visual.*.red_mask != 0xFF0000 or vinfo.visual.*.green_mask != 0x00FF00 or vinfo.visual.*.blue_mask != 0x0000FF) {
                 return error.Unsupported;
             }
@@ -316,22 +316,22 @@ pub const Window = struct {
             depth = 32;
             colormap = c.XCreateColormap(dpy, root, vinfo.visual, c.AllocNone);
             if (colormap == 0) return error.WindowCreationFailed;
-            errdefer _ = c.XFreeColormap(dpy, colormap); // colormap のみこの分岐内で守る（win 前に確保するため）
+            errdefer _ = c.XFreeColormap(dpy, colormap); // only the colormap is guarded inside this branch (it is allocated before win)
             var attrs = std.mem.zeroes(c.XSetWindowAttributes);
             attrs.colormap = colormap;
             attrs.border_pixel = 0;
-            attrs.background_pixel = 0; // 透明背景
+            attrs.background_pixel = 0; // a transparent background
             attrs.event_mask = c.ExposureMask | c.StructureNotifyMask |
                 c.KeyPressMask | c.KeyReleaseMask |
                 c.ButtonPressMask | c.ButtonReleaseMask | c.PointerMotionMask;
             const valuemask: c_ulong = c.CWColormap | c.CWBorderPixel | c.CWBackPixel | c.CWEventMask;
-            // `.physical` 時は物理px寸法で window を作る（X11 に OS 自動拡大は無い）。
+            // Under `.physical` the window is created at the physical pixel size (X11 has no automatic OS scaling).
             win = c.XCreateWindow(dpy, root, init_x, init_y, @intCast(win_w), @intCast(win_h), 0, 32, c.InputOutput, vinfo.visual, valuemask, &attrs);
-            if (win == 0) return error.WindowCreationFailed; // ここまでで失敗 → 上の errdefer が colormap 解放
-            // 32bit drawable には depth 一致の GC が要る（既定 GC は depth 24 で BadMatch になりうる）。
+            if (win == 0) return error.WindowCreationFailed; // A failure up to here → the errdefer above frees the colormap
+            // A 32-bit drawable needs a GC of a matching depth (the default GC is depth 24 and can give BadMatch).
             gc = c.XCreateGC(dpy, win, 0, null) orelse {
                 _ = c.XDestroyWindow(dpy, win);
-                return error.WindowCreationFailed; // colormap は errdefer が解放
+                return error.WindowCreationFailed; // the colormap is freed by the errdefer
             };
             own_gc = true;
         } else {
@@ -339,14 +339,14 @@ pub const Window = struct {
             if (visual == null) return error.WindowCreationFailed;
             depth = @intCast(c.XDefaultDepth(dpy, screen));
             const black = c.XBlackPixel(dpy, screen);
-            // §2.1: 既定 visual が TrueColor であることを要求（DirectColor 等は colormap 前提で非対応）
+            // The default visual is required to be TrueColor (DirectColor and the like assume a colormap and are unsupported)
             if (visual.?.class != c.TrueColor) return error.WindowCreationFailed;
             win = c.XCreateSimpleWindow(dpy, root, init_x, init_y, @intCast(win_w), @intCast(win_h), 0, black, black);
             gc = c.XDefaultGC(dpy, screen);
         }
-        // 以降（setupBlit / alloc.create 等）の失敗で win/GC/colormap をまとめて解放（透過生成のリーク防止）。
-        // 成功時は State が所有し destroy() が解放するので、この errdefer は発火しない。非透過は own_gc=false /
-        // colormap=0 なので XDestroyWindow のみ（従来と同じ）。
+        // A later failure (setupBlit, alloc.create and so on) frees win, the GC and the colormap together (which prevents leaking what transparency allocated).
+        // On success State owns them and destroy() frees them, so this errdefer never fires. Without transparency
+        // own_gc=false and colormap=0, so only XDestroyWindow runs (as before).
         errdefer {
             if (own_gc) _ = c.XFreeGC(dpy, gc);
             _ = c.XDestroyWindow(dpy, win);
@@ -362,16 +362,16 @@ pub const Window = struct {
         _ = c.XSetWMProtocols(dpy, win, &wm_delete, 1);
 
         if (fullscreen) {
-            // EWMH: map 前に _NET_WM_STATE へ _NET_WM_STATE_FULLSCREEN をセットしておくと、
-            // 準拠 WM は map 時点で装飾なしの本物のフルスクリーンにする（後追いの
-            // ClientMessage 送信は不要）。format=32 の要素は Atom(=c_ulong. 64bit では long 幅)。
+            // EWMH: setting _NET_WM_STATE_FULLSCREEN on _NET_WM_STATE before the map makes a conforming window
+            // manager go properly full screen, undecorated, at map time (with no need to send a ClientMessage
+            // afterwards). An element of format=32 is an Atom (a c_ulong, which is long-wide on 64-bit).
             const net_wm_state = c.XInternAtom(dpy, "_NET_WM_STATE", 0);
             var fullscreen_atom = c.XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", 0);
             _ = c.XChangeProperty(dpy, win, net_wm_state, c.XA_ATOM, 32, c.PropModeReplace, @ptrCast(&fullscreen_atom), 1);
         } else {
-            // resizable（TASK-23）。最小サイズだけ与え、max は与えない（自由リサイズ）。
-            // TASK-117: 明示位置時は PPosition + PWinGravity=StaticGravity を併記し、
-            // 保存（client origin / root 座標）と復元の基準を揃える。
+            // Resizable. Only a minimum size is given, and no maximum (so it resizes freely).
+            // With an explicit position, PPosition and PWinGravity=StaticGravity are set together, which puts
+            // saving (the client origin, in root coordinates) and restoring on the same basis.
             var hints = std.mem.zeroes(c.XSizeHints);
             hints.flags = c.PMinSize;
             hints.min_width = 1;
@@ -385,10 +385,10 @@ pub const Window = struct {
             _ = c.XSetWMNormalHints(dpy, win, &hints);
         }
 
-        // TASK-104.2: borderless は _MOTIF_WM_HINTS で装飾を落とす + タスクバー/pager 非表示（マスコット向け）。
+        // borderless drops the decoration through _MOTIF_WM_HINTS and hides the window from the taskbar and pager (for a mascot).
         if (opts.borderless) {
             const motif = c.XInternAtom(dpy, "_MOTIF_WM_HINTS", 0);
-            // MotifWmHints: [flags, functions, decorations, input_mode, status]。flags=MWM_HINTS_DECORATIONS(1<<1)、decorations=0。
+            // MotifWmHints: [flags, functions, decorations, input_mode, status]. flags=MWM_HINTS_DECORATIONS(1<<1) and decorations=0.
             var mwm = [5]c_ulong{ 2, 0, 0, 0, 0 };
             _ = c.XChangeProperty(dpy, win, motif, motif, 32, c.PropModeReplace, @ptrCast(&mwm), 5);
             const net_wm_state = c.XInternAtom(dpy, "_NET_WM_STATE", 0);
@@ -443,12 +443,12 @@ pub const Window = struct {
             .detectable_repeat = g_detectable_repeat,
         };
 
-        // blit セットアップ（XShm 可なら shm、不可/失敗なら XPutImage）。
-        // visual 分類で direct/fallback を決め、st.backing（caller が書く canonical BGRA）も確定する。
-        // `.physical` では物理px寸法で確保する。
+        // Set up the blit (shm when XShm is available, XPutImage when it is not or it fails).
+        // The visual classification decides direct or fallback, and settles st.backing (the canonical BGRA the caller writes).
+        // Under `.physical` it is allocated at the physical pixel size.
         try setupBlit(st, visual, depth, win_w, win_h);
 
-        // blit 準備が成功してから map（失敗時に一瞬 map されるのを防ぐ）
+        // The map happens only once the blit is ready (so it is never mapped for an instant and then fails)
         _ = c.XMapWindow(dpy, win);
         _ = c.XFlush(dpy);
         return .{ .state = st };
@@ -459,14 +459,14 @@ pub const Window = struct {
         const dpy = st.display;
 
         teardownBlit(st);
-        // system cursor（TASK-75.3）: キャッシュ済み Cursor を解放。
+        // The system cursors: free the cached Cursors.
         for (st.cursors) |cur| {
             if (cur != 0) _ = c.XFreeCursor(dpy, cur);
         }
-        if (st.own_gc) _ = c.XFreeGC(dpy, st.gc); // TASK-104.2: 透過 window 用の自作 GC を解放
+        if (st.own_gc) _ = c.XFreeGC(dpy, st.gc); // Free the GC made by hand for a transparent window
         _ = c.XDestroyWindow(dpy, st.window);
-        if (st.colormap != 0) _ = c.XFreeColormap(dpy, st.colormap); // 透過 ARGB colormap を解放
-        // fallback の backing は別 alloc。direct の backing は image data の別名なので teardownBlit が解放済み。
+        if (st.colormap != 0) _ = c.XFreeColormap(dpy, st.colormap); // Free the transparent ARGB colormap
+        // The fallback backing is a separate allocation. The direct backing is an alias of the image data and has already been freed by teardownBlit.
         if (!st.direct) alloc.free(st.backing);
         alloc.destroy(st);
     }
@@ -474,8 +474,8 @@ pub const Window = struct {
     pub fn pollEvents(self: Window) bool {
         const st = self.state;
         const dpy = st.display;
-        // XPending を毎回確認するループ（固定回数 snapshot にしない）。KeyRelease の repeat fallback が
-        // XNextEvent で 1 件余分に消費しても件数ずれでブロックしないため（§28.3-plan 2.5）。
+        // A loop that checks XPending every time (rather than taking a snapshot of a fixed count), so that the
+        // KeyRelease repeat fallback consuming one extra event through XNextEvent cannot leave the count out of step and block.
         while (c.XPending(dpy) > 0) {
             var ev: c.XEvent = undefined;
             _ = c.XNextEvent(dpy, &ev);
@@ -489,15 +489,15 @@ pub const Window = struct {
                     }
                 },
                 c.ConfigureNotify => {
-                    // 自由リサイズ（TASK-23）。新サイズで blit を two-phase 再確保する。
-                    // pollEvents はフレーム境界（lock 外）で呼ばれるので再確保は安全。
-                    // ConfigureNotify の width/height は window 実ピクセル寸法
-                    // （`.logical`=論理寸法で作成、`.physical`=物理寸法で作成）なのでそのまま physical。
+                    // Free resizing. The blit is reallocated at the new size, in two phases.
+                    // pollEvents is called at a frame boundary (outside a lock), so reallocating there is safe.
+                    // The width and height of a ConfigureNotify are the real window pixel size
+                    // (created at the logical size under `.logical`, at the physical size under `.physical`), so they are the physical size as they stand.
                     const cw: u32 = @intCast(ev.xconfigure.width);
                     const ch: u32 = @intCast(ev.xconfigure.height);
                     applyConfigureSize(st, cw, ch);
                 },
-                c.Expose => {}, // present は毎フレーム呼ばれるので no-op
+                c.Expose => {}, // present is called every frame, so this is a no-op
                 c.KeyPress => handleKeyPress(st, &ev.xkey),
                 c.KeyRelease => handleKeyRelease(st, dpy, &ev.xkey),
                 c.ButtonPress => handleButtonPress(st, &ev.xbutton),
@@ -516,8 +516,8 @@ pub const Window = struct {
         return ev;
     }
 
-    /// quit event を consumer が処理した後、close latch を解除する。
-    /// ホットパス宣言: quit/close イベント時のみ。
+    /// Release the close latch once the consumer has handled the quit event.
+    /// Hot path declaration: quit/close events only.
     pub fn cancelQuit(self: Window) void {
         self.state.closing = false;
         self.state.quit_delivered = false;
@@ -534,8 +534,8 @@ pub const Window = struct {
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
         const st = self.state;
-        // X11 は runtime scale 変更非対応のため latch は起動時値のまま（apply は恒等）。
-        // query/latched の 2 モード構造は他 backend と揃えて維持する。
+        // X11 does not support a runtime scale change, so the latch keeps its start-up value (applying it is the identity).
+        // The two-mode structure of query and latched is kept, to match the other backends.
         const scale = effectiveContentScale(st.content_scale);
         const logical: WindowSize = .{ .width = st.logical_width, .height = st.logical_height };
         const fb_size: WindowSize = .{ .width = st.physical_width, .height = st.physical_height };
@@ -551,19 +551,19 @@ pub const Window = struct {
         };
     }
 
-    /// 現在の negotiated logical size（TASK-156.5 Stage 2）。frame 中の描画は Framebuffer snapshot を使う。
+    /// The currently negotiated logical size. Drawing within a frame uses the Framebuffer snapshot.
     pub fn logicalSize(self: Window) WindowSize {
         const st = self.state;
         return .{ .width = st.logical_width, .height = st.logical_height };
     }
 
-    /// 現在の negotiated framebuffer size（物理px。`.logical` では logical と同値）。
+    /// The currently negotiated framebuffer size (in physical pixels; equal to the logical one under `.logical`).
     pub fn framebufferSize(self: Window) WindowSize {
         const st = self.state;
         return .{ .width = st.physical_width, .height = st.physical_height };
     }
 
-    /// 現在の negotiated content scale（`.logical`/`.physical` 問わず実 Xft.dpi 由来。失敗時 1.0）。
+    /// The currently negotiated content scale (from the real Xft.dpi whether `.logical` or `.physical`; 1.0 on failure).
     pub fn contentScale(self: Window) f32 {
         return effectiveContentScale(self.state.pending_content_scale);
     }
@@ -571,8 +571,8 @@ pub const Window = struct {
     pub fn present(self: Window) void {
         const st = self.state;
         const dpy = st.display;
-        if (st.click_through and !st.ct_region_valid) refreshInputShape(st); // TASK-104.2: 有効化後 1 回だけ
-        // direct は caller が image data を直接書いているので変換不要。fallback のみ backing→image data 変換。
+        if (st.click_through and !st.ct_region_valid) refreshInputShape(st); // once only, after it is turned on
+        // direct has the caller writing the image data itself, so nothing is converted. Only fallback converts the backing into the image data.
         if (!st.direct) convert(st);
         const w: c_uint = @intCast(st.width);
         const h: c_uint = @intCast(st.height);
@@ -584,15 +584,15 @@ pub const Window = struct {
         _ = c.XFlush(dpy);
     }
 
-    /// TASK-104.2: 対話的ウィンドウ移動を WM へ依頼する（_NET_WM_MOVERESIZE）。押下 grab を外し、
-    /// 現在のポインタ root 座標 + button + source を載せて root へ ClientMessage を送る。
-    /// ホットパス宣言: イベント時のみ。
+    /// Ask the window manager for an interactive window move (_NET_WM_MOVERESIZE). It ungrabs the press and
+    /// sends a ClientMessage to root carrying the pointer's current root coordinates, the button and the source.
+    /// Hot path declaration: event time only.
     pub fn beginDrag(self: Window) void {
         const st = self.state;
         const dpy = st.display;
         const screen = c.XDefaultScreen(dpy);
         const root = c.XRootWindow(dpy, screen);
-        // ポインタ root 座標を取得。
+        // Read the pointer's root coordinates.
         var rret: c.Window = undefined;
         var cret: c.Window = undefined;
         var rx: c_int = 0;
@@ -601,7 +601,7 @@ pub const Window = struct {
         var wy: c_int = 0;
         var mask: c_uint = 0;
         _ = c.XQueryPointer(dpy, st.window, &rret, &cret, &rx, &ry, &wx, &wy, &mask);
-        _ = c.XUngrabPointer(dpy, c.CurrentTime); // press grab を外して WM に move を渡す
+        _ = c.XUngrabPointer(dpy, c.CurrentTime); // ungrab the press and hand the move to the window manager
         const net = c.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0);
         var ev = std.mem.zeroes(c.XEvent);
         ev.xclient.type = c.ClientMessage;
@@ -611,14 +611,14 @@ pub const Window = struct {
         ev.xclient.data.l[0] = rx; // x_root
         ev.xclient.data.l[1] = ry; // y_root
         ev.xclient.data.l[2] = 8; // _NET_WM_MOVERESIZE_MOVE
-        ev.xclient.data.l[3] = 1; // button 1（左）
+        ev.xclient.data.l[3] = 1; // button 1 (left)
         ev.xclient.data.l[4] = 1; // source indication = application
         _ = c.XSendEvent(dpy, root, 0, c.SubstructureRedirectMask | c.SubstructureNotifyMask, &ev);
         _ = c.XFlush(dpy);
     }
 
-    /// TASK-104.2: 常に最前面（_NET_WM_STATE_ABOVE の add/remove ClientMessage）。WM 依存（graceful）。
-    /// ホットパス宣言: イベント時のみ。
+    /// Always-on-top (an add/remove ClientMessage for _NET_WM_STATE_ABOVE). It depends on the window manager (and degrades gracefully).
+    /// Hot path declaration: event time only.
     pub fn setAlwaysOnTop(self: Window, on: bool) void {
         const st = self.state;
         const dpy = st.display;
@@ -639,63 +639,63 @@ pub const Window = struct {
         _ = c.XFlush(dpy);
     }
 
-    /// TASK-104.2: クリック透過（X Shape の input shape）。on のとき次 present で不透明画素 bbox を
-    /// input shape に設定し透明余白のクリックを背後へ抜けさせる。off で input shape を全面へ戻す。
-    /// ホットパス宣言: イベント時のみ（present 側の bbox 走査は有効化後 1 回だけ・ct_region_valid ゲート）。
+    /// Click-through (the input shape of the X Shape extension). While on, the next present sets the bounding
+    /// box of the opaque pixels as the input shape, so a click on the transparent margin falls through. Off restores the input shape to the whole window.
+    /// Hot path declaration: event time only (the bounding box scan in present runs once after it is turned on, gated by ct_region_valid).
     pub fn setClickThrough(self: Window, on: bool) void {
         const st = self.state;
         st.click_through = on;
-        st.ct_region_valid = false; // 再有効化でも silhouette 再走査（次 present）
+        st.ct_region_valid = false; // re-enabling scans the silhouette again (on the next present)
         if (!on) {
-            // input shape を全面（NULL region = bounding と一致）へ戻す。
+            // Restore the input shape to the whole window (a NULL region, which matches the bounding shape).
             c.XShapeCombineMask(st.display, st.window, c.ShapeInput, 0, 0, 0, c.ShapeSet);
             _ = c.XFlush(st.display);
         }
     }
 
-    /// カーソル形状の設定（TASK-75.3）。CursorShape 別に Cursor を遅延生成・キャッシュし XDefineCursor で反映。
-    /// 呼び出し頻度: ツール切替・キー入力等のイベント時のみ（性能規約の対象外）。
-    /// 生成失敗は best-effort no-op（描画・実行を壊さない）。
+    /// Set the cursor shape. A Cursor is created lazily and cached per CursorShape, and applied with XDefineCursor.
+    /// Call frequency: event time only (a tool change, a key press), so the performance rules do not apply.
+    /// A failed creation is a best-effort no-op (it breaks neither the drawing nor the run).
     pub fn setCursor(self: Window, shape: types.CursorShape) void {
         const st = self.state;
         const idx: usize = @intCast(@intFromEnum(shape));
-        if (idx >= st.cursors.len) return; // non-exhaustive な値は無視
+        if (idx >= st.cursors.len) return; // a non-exhaustive value is ignored
         if (st.cursors[idx] == 0) st.cursors[idx] = createCursor(st, shape);
         const cur = st.cursors[idx];
-        if (cur == 0) return; // 作成失敗
+        if (cur == 0) return; // creation failed
         _ = c.XDefineCursor(st.display, st.window, cur);
         _ = c.XFlush(st.display);
     }
 
-    /// 表示中のタイトルを更新する。イベント時のみ。
+    /// Update the visible title. Event time only.
     pub fn setTitle(self: Window, title: [:0]const u8) void {
         _ = c.XStoreName(self.state.display, self.state.window, title.ptr);
         _ = c.XFlush(self.state.display);
     }
 
-    /// ライブリサイズ再描画コールバック（TASK-23.1）。X11 はモーダルループが無く元々ライブなので no-op スタブ。
+    /// The live-resize redraw callback. X11 has no modal loop and is live to begin with, so this is a no-op stub.
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         _ = self;
         _ = ctx;
         _ = cb;
     }
 
-    /// destroy 用の private clear 経路（no-op。TASK-23.1）。
+    /// The private clear path used by destroy (a no-op).
     pub fn clearRedrawCallback(self: Window) void {
         _ = self;
     }
 
-    /// IME composition snapshot（TASK-79.6.1）。Linux IME は 79.6.3。常に空。
+    /// The IME composition snapshot. The Linux IME is not implemented, so this is always empty.
     pub fn getCompositionSnapshot(self: Window, buf: []u8) types.CompositionSnapshot {
         _ = self;
         return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
     }
 };
 
-/// 現在のウィンドウ geometry（TASK-117）。
-/// 位置は client origin の root 座標（XTranslateCoordinates）。失敗時は position=null。
-/// サイズは **論理** content（`logical_width/height`）。復元側は WM_NORMAL_HINTS の StaticGravity で同基準。
-/// module-level（facade の `@hasDecl(backend, "getGeometry")` 契約。Window メソッド禁止）。
+/// The current window geometry.
+/// The position is the client origin in root coordinates (XTranslateCoordinates). On failure it is position=null.
+/// The size is the **logical** content (`logical_width/height`). Restoring uses the same basis, through WM_NORMAL_HINTS's StaticGravity.
+/// Module level (the facade's `@hasDecl(backend, "getGeometry")` contract; a Window method would not do).
 pub fn getGeometry(win: Window) types.WindowGeometry {
     const st = win.state;
     var root_x: c_int = 0;
@@ -708,8 +708,8 @@ pub fn getGeometry(win: Window) types.WindowGeometry {
     };
 }
 
-/// CursorShape → X11 Cursor を生成する（失敗時は 0=None）。default/crosshair は標準カーソルフォント、
-/// hidden は透明 1x1 pixmap カーソル。
+/// Create an X11 Cursor for a CursorShape (0=None on failure). default and crosshair come from the
+/// standard cursor font, and hidden is a transparent 1x1 pixmap cursor.
 fn createCursor(st: *State, shape: types.CursorShape) c.Cursor {
     return switch (shape) {
         .default => c.XCreateFontCursor(st.display, c.XC_left_ptr),
@@ -718,7 +718,7 @@ fn createCursor(st: *State, shape: types.CursorShape) c.Cursor {
     };
 }
 
-/// 透明カーソル: 全ビット 0 の 1x1 bitmap を source/mask に使い XCreatePixmapCursor で作る。
+/// The transparent cursor: a 1x1 bitmap of all-zero bits serves as both source and mask for XCreatePixmapCursor.
 fn createHiddenCursor(st: *State) c.Cursor {
     var data = [_]u8{0};
     const bmp = c.XCreateBitmapFromData(st.display, st.window, &data, 1, 1);
@@ -728,8 +728,8 @@ fn createHiddenCursor(st: *State) c.Cursor {
     return c.XCreatePixmapCursor(st.display, bmp, bmp, &col, &col, 0, 0);
 }
 
-/// Locked framebuffer view（公開 contract は canonical BGRA `[]u32`、u32 0xAARRGGBB）。
-/// direct モードでは pixels が XImage/shm バッファを直接指す（present で変換コピーされない）。
+/// A locked framebuffer view (the public contract is canonical BGRA `[]u32`, u32 0xAARRGGBB).
+/// In direct mode pixels points straight at the XImage or shm buffer (present copies nothing).
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
@@ -741,28 +741,28 @@ pub const Framebuffer = struct {
     state: *State,
 
     pub fn unlock(self: Framebuffer) void {
-        _ = self; // present 時に変換するので unlock 自体は no-op
+        _ = self; // the conversion happens at present time, so unlock itself is a no-op
     }
 };
 
 // ============================================================================
-// 入力イベント変換（XEvent → platform.Event）。純粋ロジックは platform_linux_input.zig。
+// Translating input events (an XEvent → a platform.Event). The pure logic lives in platform_linux_input.zig.
 // ============================================================================
 
 fn handleKeyPress(st: *State, e: *c.XKeyEvent) void {
     const keycode: u32 = @intCast(e.keycode);
-    // detectable auto-repeat 有効時、リピートは KeyRelease を伴わない連続 KeyPress として来る。
-    // 「直前に既に down だったか」がそのまま is_repeat になる（非対応時の repeat は handleKeyRelease の fallback が直接生成）。
+    // With detectable auto-repeat on, a repeat arrives as consecutive KeyPress events with no KeyRelease.
+    // "Was it already down" therefore is is_repeat (where it is unsupported, the fallback in handleKeyRelease generates the repeat directly).
     const was_down = st.keys.isDown(keycode);
-    st.keys.setDown(keycode, true); // 修飾 post-state 算出は反映後に行う
+    st.keys.setDown(keycode, true); // the modifier post-state is computed after the set has been updated
     const mods = input.keyEventModifiers(@intCast(e.state), &st.keys, keycode);
     st.enqueue(.{ .key_down = .{
         .key = input.keycodeToKeyCode(keycode),
         .is_repeat = was_down,
         .modifiers = mods,
     } });
-    // 確定文字 (TASK-22): XLookupString で確定文字を取り char_input を流す。英数 MVP は Latin-1 で十分
-    // （UTF-8/CJK は XIM/Xutf8LookupString が要る=将来スコープ）。key_down 経路は上で不変。
+    // A committed character: XLookupString takes it and emits char_input. Latin-1 is enough for alphanumerics
+    // (UTF-8 and CJK would need XIM or Xutf8LookupString, which is future scope). The key_down path above is unchanged.
     var cbuf: [8]u8 = undefined;
     var keysym: c.KeySym = undefined;
     const n = c.XLookupString(e, &cbuf, cbuf.len, &keysym, null);
@@ -780,23 +780,23 @@ fn handleKeyPress(st: *State, e: *c.XKeyEvent) void {
 fn handleKeyRelease(st: *State, dpy: *c.Display, e: *c.XKeyEvent) void {
     const keycode: u32 = @intCast(e.keycode);
 
-    // 非 detectable 環境の repeat fallback: KeyRelease の直後に同 keycode・同 time の KeyPress が
-    // 控えていれば、それはリピート（キーは離されていない）。Release を握り潰し、その KeyPress を
-    // 実消費して is_repeat=true で流す（peek だけでは消費されない）。
+    // The repeat fallback where auto-repeat is not detectable: when a KeyPress for the same keycode and the
+    // same time is waiting right behind a KeyRelease, that is a repeat (the key was never let go). The release
+    // is swallowed and that KeyPress is really consumed and emitted with is_repeat=true (a peek does not consume it).
     if (!st.detectable_repeat and c.XPending(dpy) > 0) {
         var next: c.XEvent = undefined;
         _ = c.XPeekEvent(dpy, &next);
         if (next.type == c.KeyPress and next.xkey.keycode == e.keycode and next.xkey.time == e.time) {
-            _ = c.XNextEvent(dpy, &next); // peek した KeyPress を実消費
-            // keys は down のまま（離していない）。
+            _ = c.XNextEvent(dpy, &next); // really consume the KeyPress that was peeked at
+            // keys stays down (it was never released).
             const rmods = input.keyEventModifiers(@intCast(next.xkey.state), &st.keys, keycode);
             st.enqueue(.{ .key_down = .{
                 .key = input.keycodeToKeyCode(keycode),
                 .is_repeat = true,
                 .modifiers = rmods,
             } });
-            // repeat 中も char_input を出す（押しっぱなしのテキスト入力。codex 指摘 #4）。消費した
-            // KeyPress を XLookupString（Ctrl+A 等は制御文字化されて isTextCodepoint で自然に除外される）。
+            // char_input is emitted during a repeat too (so holding a key types). The consumed KeyPress goes through
+            // XLookupString (Ctrl+A and the like become control characters and fall out naturally in isTextCodepoint).
             var cbuf: [8]u8 = undefined;
             var ksym: c.KeySym = undefined;
             const rn = c.XLookupString(&next.xkey, &cbuf, cbuf.len, &ksym, null);
@@ -813,7 +813,7 @@ fn handleKeyRelease(st: *State, dpy: *c.Display, e: *c.XKeyEvent) void {
         }
     }
 
-    // 通常の解放
+    // an ordinary release
     st.keys.setDown(keycode, false);
     st.enqueue(.{ .key_up = .{
         .key = input.keycodeToKeyCode(keycode),
@@ -831,9 +831,9 @@ fn setButton(st: *State, mb: MouseButton, down: bool) void {
     }
 }
 
-/// MouseEvent を組む。buttons は内部追跡（post-state）、modifiers は state mask（mouse は修飾が変化しない）。
-/// 座標は raw physical（facade が latched content_scale で論理へ正規化）。
-/// X11 契約: `.logical` → `native × content_scale`、`.physical` → `native`（乗算なし）。
+/// Build a MouseEvent. buttons comes from the internal tracking (the post-state), and modifiers from the state mask (a mouse event does not change a modifier).
+/// The coordinates are raw physical (the facade normalises them into logical with the latched content_scale).
+/// The X11 contract: `.logical` → `native × content_scale`, `.physical` → `native` (with no multiplication).
 fn mouseEvent(st: *State, x: c_int, y: c_int, button: MouseButton, state: u32) MouseEvent {
     const raw = nativeToRawPhysical(st, x, y);
     return .{
@@ -845,12 +845,12 @@ fn mouseEvent(st: *State, x: c_int, y: c_int, button: MouseButton, state: u32) M
     };
 }
 
-/// X11 native（window 実ピクセル座標）→ raw physical event 座標。
+/// X11 native (real window pixel coordinates) → raw physical event coordinates.
 fn nativeToRawPhysical(st: *const State, native_x: c_int, native_y: c_int) struct { x: i32, y: i32 } {
     if (st.fb_mode == .physical) {
         return .{ .x = native_x, .y = native_y };
     }
-    // `.logical`: window は論理寸法 → native は論理値。facade 正規化と対になる raw physical へ乗算。
+    // `.logical`: the window is at the logical size, so native is a logical value. It is multiplied into raw physical, which pairs with the facade's normalisation.
     const s = effectiveContentScale(st.pending_content_scale);
     return .{
         .x = @intFromFloat(@floor(@as(f64, @floatFromInt(native_x)) * @as(f64, s))),
@@ -861,7 +861,7 @@ fn nativeToRawPhysical(st: *const State, native_x: c_int, native_y: c_int) struc
 fn handleButtonPress(st: *State, e: *c.XButtonEvent) void {
     const button: u32 = @intCast(e.button);
     if (input.buttonToMouseButton(button)) |mb| {
-        setButton(st, mb, true); // post-state（押下を含む）にしてから event を作る
+        setButton(st, mb, true); // bring it to the post-state (the press included) before building the event
         st.enqueue(.{ .mouse_down = mouseEvent(st, e.x, e.y, mb, @intCast(e.state)) });
     } else if (input.wheelDelta(button)) |d| {
         const raw = nativeToRawPhysical(st, e.x, e.y);
@@ -875,16 +875,16 @@ fn handleButtonPress(st: *State, e: *c.XButtonEvent) void {
             .modifiers = input.stateToModifiers(@intCast(e.state)),
         } });
     }
-    // それ以外の button は無視
+    // any other button is ignored
 }
 
 fn handleButtonRelease(st: *State, e: *c.XButtonEvent) void {
     const button: u32 = @intCast(e.button);
     if (input.buttonToMouseButton(button)) |mb| {
-        setButton(st, mb, false); // post-state（解放を反映）にしてから event を作る
+        setButton(st, mb, false); // bring it to the post-state (the release applied) before building the event
         st.enqueue(.{ .mouse_up = mouseEvent(st, e.x, e.y, mb, @intCast(e.state)) });
     }
-    // wheel(4-7) の Release は無視
+    // the Release of a wheel (4-7) is ignored
 }
 
 fn handleMotion(st: *State, e: *c.XMotionEvent) void {
@@ -892,20 +892,20 @@ fn handleMotion(st: *State, e: *c.XMotionEvent) void {
 }
 
 // ============================================================================
-// blit セットアップ / pixel 変換
+// Setting up the blit, and the pixel conversion
 // ============================================================================
 
-/// TASK-104.2: クリック透過用に不透明画素（alpha>0）から **per-pixel の 1bit マスク**を作り、X Shape の
-/// input shape に設定する（透明画素＝alpha0 のクリックは正確に背後へ抜け、不透明画素＝本体はクリックを受ける）。
-/// bounding box では丸い絵の透明な四隅も窓が受けてしまう（クリック透過が効かない）ため、per-pixel マスクにする。
-/// ct_region_valid でゲートし有効化後 1 回だけ走る（毎フレーム全画素ループにしない＝性能規約準拠）。
-/// canonical BGRA の alpha は上位 8bit。XCreateBitmapFromData は LSB-first・行ごと byte 境界 pad。
+/// For click-through, build a **per-pixel 1-bit mask** out of the opaque pixels (alpha>0) and set it as
+/// the X Shape input shape (a click on a transparent pixel, alpha 0, falls through exactly, and the opaque artwork receives clicks).
+/// A bounding box would let the window catch the transparent corners of a round picture too (click-through would not work), hence a per-pixel mask.
+/// It is gated by ct_region_valid and runs once after it is turned on (never an all-pixel loop per frame, which keeps the performance rules).
+/// The alpha of canonical BGRA is the top 8 bits. XCreateBitmapFromData is LSB-first and pads each row to a byte boundary.
 fn refreshInputShape(st: *State) void {
     const w = st.width;
     const h = st.height;
     const px = st.backing;
     if (px.len < @as(usize, w) * @as(usize, h)) return;
-    const stride = (w + 7) / 8; // 1 行あたりの byte 数（8px/byte、byte 境界 pad）
+    const stride = (w + 7) / 8; // the bytes per row (8px per byte, padded to a byte boundary)
     const data = alloc.alloc(u8, @as(usize, stride) * @as(usize, h)) catch return;
     defer alloc.free(data);
     @memset(data, 0);
@@ -914,13 +914,13 @@ fn refreshInputShape(st: *State) void {
         const row = @as(usize, y) * @as(usize, w);
         var x: u32 = 0;
         while (x < w) : (x += 1) {
-            if ((px[row + x] >> 24) != 0) { // 不透明画素 → bit を立てる（この画素はクリックを受ける）
+            if ((px[row + x] >> 24) != 0) { // an opaque pixel → set the bit (this pixel receives clicks)
                 data[@as(usize, y) * @as(usize, stride) + (x >> 3)] |= (@as(u8, 1) << @intCast(x & 7));
             }
         }
     }
     const bmp = c.XCreateBitmapFromData(st.display, st.window, @ptrCast(data.ptr), @intCast(w), @intCast(h));
-    if (bmp == 0) return; // 失敗時は valid を立てず次 present で再試行
+    if (bmp == 0) return; // on failure valid is left unset and the next present retries
     c.XShapeCombineMask(st.display, st.window, c.ShapeInput, 0, 0, bmp, c.ShapeSet);
     _ = c.XFreePixmap(st.display, bmp);
     _ = c.XFlush(st.display);
@@ -930,26 +930,26 @@ fn refreshInputShape(st: *State) void {
 fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: u32) Error!void {
     const dpy = st.display;
 
-    // XShm 利用可なら shm 経路を試す。
-    // 環境変数 VIDEO_PROTO_DISABLE_XSHM をセットすると XShm をスキップして XPutImage 経路を強制する
-    // （XShm 不可環境での fallback 検証用。AC#3）。
+    // Try the shm path when XShm is available.
+    // Setting the environment variable VIDEO_PROTO_DISABLE_XSHM skips XShm and forces the XPutImage path
+    // (which is how the fallback is checked in an environment where XShm does work).
     const disable_shm = std.c.getenv("VIDEO_PROTO_DISABLE_XSHM") != null;
     if (!disable_shm and c.XShmQueryExtension(dpy) != 0) {
         if (trySetupShm(st, visual, depth, width, height)) {
             try classifyAndSetupBacking(st, width, height);
             return;
         }
-        // 失敗 → fallback
+        // failed → fall back
     }
     try setupPutImage(st, visual, depth, width, height);
     try classifyAndSetupBacking(st, width, height);
 }
 
-/// XShm 経路。成功で true、失敗（fallback すべき）で false。
+/// The XShm path. true on success, false when it should fall back.
 fn trySetupShm(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: u32) bool {
     const dpy = st.display;
-    // shminfo は image / X サーバから参照され続けるため、安定アドレス（heap の st.shminfo）を直接使う。
-    // ローカル変数を渡すと関数を抜けた後 dangling になり XShmPutImage で BadShmSeg になる。
+    // shminfo stays referenced by the image and by the X server, so the stable address (st.shminfo, on the heap) is used directly.
+    // Passing a local would leave it dangling after the function returns, and XShmPutImage would give BadShmSeg.
     st.shminfo = std.mem.zeroes(c.XShmSegmentInfo);
 
     const image = c.XShmCreateImage(dpy, visual, depth, c.ZPixmap, null, &st.shminfo, @intCast(width), @intCast(height)) orelse return false;
@@ -981,7 +981,7 @@ fn trySetupShm(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height
     image.*.data = @ptrCast(addr);
     st.shminfo.readOnly = 0;
 
-    // 既存の未処理 X error を drain してから handler を差し替える（attach 判定の偽陽性を防ぐ）
+    // Drain any outstanding X error before swapping the handler in (which prevents a false positive in the attach check)
     _ = c.XSync(dpy, 0);
     g_shm_error = false;
     const old = c.XSetErrorHandler(shmErrorHandler);
@@ -990,7 +990,7 @@ fn trySetupShm(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height
     _ = c.XSetErrorHandler(old);
 
     if (g_shm_error) {
-        // attach 失敗: XShmDetach は呼ばない
+        // attach failed: XShmDetach is not called
         _ = c.shmdt(st.shminfo.shmaddr);
         _ = c.shmctl(st.shminfo.shmid, c.IPC_RMID, null);
         image.*.data = null;
@@ -998,7 +998,7 @@ fn trySetupShm(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height
         return false;
     }
 
-    // attach 成功 → 「最後の detach で自動削除」マーク（ここ 1 回だけ）
+    // attach succeeded → mark it "deleted automatically on the last detach" (exactly once, here)
     _ = c.shmctl(st.shminfo.shmid, c.IPC_RMID, null);
 
     st.image = image;
@@ -1009,10 +1009,10 @@ fn trySetupShm(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height
     return true;
 }
 
-/// XPutImage 経路（XShm 不可/失敗時）。data は Zig 所有。
+/// The XPutImage path (when XShm is unavailable or failed). The data belongs to Zig.
 fn setupPutImage(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: u32) Error!void {
     const dpy = st.display;
-    // data=null で作成し bytes_per_line を確定させる
+    // created with data=null, which settles bytes_per_line
     const image = c.XCreateImage(dpy, visual, depth, c.ZPixmap, 0, null, @intCast(width), @intCast(height), 32, 0) orelse return error.WindowCreationFailed;
 
     const bpl: c_int = image.*.bytes_per_line;
@@ -1025,8 +1025,8 @@ fn setupPutImage(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, heig
         return error.WindowCreationFailed;
     };
 
-    // image data は []u32 として別名参照（direct）/ 変換書き込み（fallback）するため、
-    // u32 単位で確保して alignment を型で保証する。size を u32 個数へ切り上げ（>= size バイト）。
+    // The image data is aliased as a []u32 (direct) or written through a conversion (fallback), so it is
+    // allocated in u32 units and the alignment is guaranteed by the type. The size is rounded up to a count of u32 (>= size bytes).
     const u32_len = (size + 3) / 4;
     const buf = alloc.alloc(u32, u32_len) catch {
         destroyImage(image);
@@ -1041,8 +1041,8 @@ fn setupPutImage(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, heig
     st.bytes_per_line = @intCast(bpl);
 }
 
-/// XImage 作成後、visual を classifyVisual で分類し direct/fallback の backing を確定する（AC#4）。
-/// fail（非32bpp / MSBFirst / 非連続・重複 mask / 16・24bpp・565 等）は WindowCreationFailed。
+/// After the XImage is created, classifyVisual classifies the visual and settles the direct or fallback backing.
+/// fail (not 32bpp, MSBFirst, a non-contiguous or overlapping mask, 16/24bpp, 565 and so on) gives WindowCreationFailed.
 fn classifyAndSetupBacking(st: *State, width: u32, height: u32) Error!void {
     const img = st.image;
     const bpp: u32 = @intCast(img.*.bits_per_pixel);
@@ -1056,15 +1056,15 @@ fn classifyAndSetupBacking(st: *State, width: u32, height: u32) Error!void {
     switch (conv.classifyVisual(bpp, byte_order, st.bytes_per_line, width, rm, gm, bm)) {
         .fail => return failBlit(st),
         .direct => {
-            // 標準 visual: 低24bit が 0x00RRGGBB に一致するので caller が image data を直接書く（変換コピー無し）。
-            // backing は image data の別名（別 alloc しない）。
+            // A standard visual: the low 24 bits match 0x00RRGGBB, so the caller writes the image data itself (with no converting copy).
+            // The backing is an alias of the image data (nothing extra is allocated).
             st.direct = true;
             const base: [*]u32 = @ptrCast(@alignCast(img.*.data));
             st.backing = base[0..px_count];
             @memset(st.backing, 0);
         },
         .fallback => {
-            // 非標準 shift / stride padding: backing(BGRA) を別持ちし present で packPixel 変換する。
+            // A non-standard shift or stride padding: a separate backing (BGRA) is kept and converted by packPixel at present time.
             st.direct = false;
             st.r_shift = conv.maskShift(rm) orelse return failBlit(st);
             st.g_shift = conv.maskShift(gm) orelse return failBlit(st);
@@ -1076,15 +1076,15 @@ fn classifyAndSetupBacking(st: *State, width: u32, height: u32) Error!void {
     }
 }
 
-/// blit リソース（XImage / XShm seg or Zig 所有転送バッファ）の解放。`destroy` と `failBlit` で共用。
-/// RMID は attach 成功時に実施済みなので、ここでは行わない（§3.7 の状態機械）。
+/// Free the blit resources (the XImage, and either the XShm segment or the Zig-owned transfer buffer). Shared by `destroy` and `failBlit`.
+/// RMID was already done when the attach succeeded, so it is not done here.
 fn teardownBlit(st: *State) void {
     if (st.use_shm) {
         if (st.attached) _ = c.XShmDetach(st.display, &st.shminfo);
         destroyImage(st.image);
         if (st.shmat_ok) _ = c.shmdt(st.shminfo.shmaddr);
     } else {
-        // XPutImage 経路: image data は Zig 所有（st.xfer）。XDestroyImage に解放させない。
+        // The XPutImage path: the image data belongs to Zig (st.xfer). XDestroyImage must not free it.
         st.image.data = null;
         destroyImage(st.image);
         if (st.xfer.len != 0) alloc.free(st.xfer);
@@ -1092,15 +1092,15 @@ fn teardownBlit(st: *State) void {
 }
 
 fn failBlit(st: *State) Error {
-    // 検証失敗時は確保済み blit リソースを解放してから失敗を返す（backing は未確定なので解放不要、
-    // create の errdefer が window/State を解放）。
+    // When the checks fail, the blit resources already allocated are freed before the failure is returned
+    // (the backing is not settled yet and needs no freeing, and create's errdefer frees the window and the State).
     teardownBlit(st);
     return error.WindowCreationFailed;
 }
 
-// ── リサイズ（TASK-23）。two-phase: 新 blit を確保成功後に旧 blit を解放する ──
+// ── Resizing. Two-phase: the old blit is freed only once the new one has been allocated ──
 
-/// blit 関連フィールドの snapshot。resize の two-phase（新確保→旧解放 / 失敗時は旧復元）に使う。
+/// A snapshot of the blit fields. It is what makes the resize two-phase (allocate the new, free the old; restore the old on failure).
 const BlitState = struct {
     backing: []u32,
     image: *c.XImage,
@@ -1148,7 +1148,7 @@ fn restoreBlit(st: *State, b: BlitState) void {
     st.b_shift = b.b_shift;
 }
 
-/// BlitState（snapshot 値）のリソースを解放する。teardownBlit の value 版 + fallback backing 解放。
+/// Free the resources of a BlitState (a snapshot value). The value form of teardownBlit, plus freeing the fallback backing.
 fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
     if (b.use_shm) {
         if (b.attached) _ = c.XShmDetach(dpy, &b.shminfo);
@@ -1159,17 +1159,17 @@ fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
         destroyImage(b.image);
         if (b.xfer.len != 0) alloc.free(b.xfer);
     }
-    // fallback backing は別 alloc。direct backing は image data の別名なので上で解放済み。
+    // The fallback backing is a separate allocation. The direct backing is an alias of the image data and was freed above.
     if (!b.direct and b.backing.len != 0) alloc.free(b.backing);
 }
 
-/// ConfigureNotify の window 実ピクセル寸法を logical/physical に反映して blit を再確保する。
-/// ホットパス宣言: リサイズイベント時のみ。
+/// Apply the real window pixel size of a ConfigureNotify to logical and physical, and reallocate the blit.
+/// Hot path declaration: resize events only.
 fn applyConfigureSize(st: *State, new_phys_w: u32, new_phys_h: u32) void {
     if (new_phys_w == 0 or new_phys_h == 0) return;
     if (new_phys_w == st.physical_width and new_phys_h == st.physical_height) return;
 
-    // Configure 寸法は常に window 実ピクセル = physical / framebuffer。
+    // A Configure size is always the real window pixel size = physical = the framebuffer.
     const new_logical_w: u32 = if (st.fb_mode == .logical) new_phys_w else blk: {
         const s = effectiveContentScale(st.content_scale);
         const v = @round(@as(f64, @floatFromInt(new_phys_w)) / @as(f64, s));
@@ -1182,22 +1182,22 @@ fn applyConfigureSize(st: *State, new_phys_w: u32, new_phys_h: u32) void {
     };
 
     resizeBlit(st, new_phys_w, new_phys_h);
-    // resizeBlit 成功時のみ physical が更新される。失敗時は旧サイズ維持なので logical も触らない。
+    // physical is updated only when resizeBlit succeeds. On failure the old size is kept, so logical is left alone too.
     if (st.physical_width == new_phys_w and st.physical_height == new_phys_h) {
         st.logical_width = new_logical_w;
         st.logical_height = new_logical_h;
     }
 }
 
-/// ConfigureNotify で呼ぶ。新サイズで setupBlit を試し、成功したら旧 blit を解放して
-/// physical/width/height を更新する。失敗（OOM 等）時は旧 blit を復元して旧サイズを維持する（window を壊さない）。
+/// Called on a ConfigureNotify. It tries setupBlit at the new size, and on success frees the old blit and
+/// updates physical/width/height. On a failure (an OOM, say) it restores the old blit and keeps the old size (never breaking the window).
 fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
-    if (new_w == 0 or new_h == 0) return; // 最小化/ゼロは無視
+    if (new_w == 0 or new_h == 0) return; // minimised, or zero, is ignored
     if (new_w == st.physical_width and new_h == st.physical_height) return;
 
     var old = captureBlit(st);
-    // setupBlit は st の blit フィールドを新リソースで上書きする（失敗時は内部の failBlit が
-    // 新リソースを解放するが st のフィールドは dangling のまま残る → 下の catch で旧値へ復元する）。
+    // setupBlit overwrites st's blit fields with the new resources (on failure its internal failBlit frees the
+    // new resources, but st's fields are left dangling → the catch below restores the old values).
     setupBlit(st, st.visual, st.depth, new_w, new_h) catch {
         restoreBlit(st, old);
         return;
@@ -1206,12 +1206,12 @@ fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
     st.physical_height = new_h;
     st.width = new_w;
     st.height = new_h;
-    st.ct_region_valid = false; // TASK-104.2: サイズ変更で click-through input shape を再計算させる（旧マスクは stale）
+    st.ct_region_valid = false; // A size change makes the click-through input shape be recomputed (the old mask is stale)
     freeBlitState(st.display, &old);
 }
 
-/// fallback 経路: canonical BGRA(0xAARRGGBB) backing → image data（visual mask 配置）へ変換。
-/// stride padding は bytes_per_line を見ることで吸収する。direct 経路では呼ばれない。
+/// The fallback path: convert the canonical BGRA (0xAARRGGBB) backing into the image data (in the visual's mask layout).
+/// Stride padding is absorbed by reading bytes_per_line. It is never called on the direct path.
 fn convert(st: *State) void {
     const w = st.width;
     const h = st.height;
@@ -1230,11 +1230,11 @@ fn convert(st: *State) void {
 }
 
 // ============================================================================
-// TASK-156.5 Stage 2 / R9: 共通ヘルパーの構造的ユニットテスト（display 不要）
-// Linux + `-Dplatform=x11` で本モジュールがテスト root に含まれるとき実行される。
+// Structural unit tests of the shared helpers (no display needed)
+// They run when this module is part of the test root, on Linux with `-Dplatform=x11`.
 // ============================================================================
 
-test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず logical を返す" {
+test "effectiveFramebufferSize .logical returns the logical size, independent of scale" {
     const logical: WindowSize = .{ .width = 800, .height = 600 };
     const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 };
     for (scales) |s| {
@@ -1244,7 +1244,7 @@ test "TASK-156.5 R9: effectiveFramebufferSize .logical は scale に依存せず
     }
 }
 
-test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を適用する" {
+test "effectiveFramebufferSize .physical applies roundToPhysicalPx" {
     const logical: WindowSize = .{ .width = 800, .height = 600 };
     const fb2 = effectiveFramebufferSize(.physical, logical, 2.0);
     try std.testing.expectEqual(@as(u32, 1600), fb2.width);
@@ -1255,7 +1255,7 @@ test "TASK-156.5: effectiveFramebufferSize .physical は roundToPhysicalPx を�
     try std.testing.expectEqual(@as(u32, 900), fb15.height);
 }
 
-test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ" {
+test "roundToPhysicalPx matches objc lround and clamps to the range" {
     try std.testing.expectEqual(@as(u32, 1), roundToPhysicalPx(0, 2.0)); // 0*2→0 → clamp to 1
     try std.testing.expectEqual(@as(u32, 1600), roundToPhysicalPx(800, 2.0));
     try std.testing.expectEqual(@as(u32, 1200), roundToPhysicalPx(800, 1.5));
@@ -1263,7 +1263,7 @@ test "TASK-156.5: roundToPhysicalPx は objc lround 相当・範囲クランプ"
     try std.testing.expectEqual(@as(u32, 800), roundToPhysicalPx(800, std.math.nan(f32)));
 }
 
-test "TASK-156.5: effectiveContentScale は非正・非有限を 1.0 に補正" {
+test "effectiveContentScale corrects a non-positive or non-finite value to 1.0" {
     try std.testing.expectEqual(@as(f32, 2.0), effectiveContentScale(2.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(0.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));

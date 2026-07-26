@@ -1,16 +1,16 @@
-//! Windows platform backend dispatcher（TASK-35）
+//! The Windows platform backend dispatcher
 //!
-//! `src/platform.zig`（OS facade）が Windows で import する薄い分配層。
-//! `build_options.platform_backend` を見て GDI / D3D11-DXGI 実装を選び、公開面を re-export する:
-//!   - `"gdi"`   → `platform_windows_gdi.zig`（GDI software blit。best-effort backend。TASK-31）
-//!   - `"d3d11"` → `platform_windows_d3d11.zig`（D3D11-DXGI。1級 backend。TASK-35）
+//! The thin distribution layer that the OS facade (`core/platform.zig`) imports on Windows.
+//! It reads `build_options.platform_backend`, picks the GDI or the D3D11-DXGI implementation, and re-exports its public surface:
+//!   - `"gdi"`   → `platform_windows_gdi.zig` (a GDI software blit; a best-effort backend)
+//!   - `"d3d11"` → `platform_windows_d3d11.zig` (D3D11-DXGI; a first-class backend)
 //!
-//! window / 入力 / dialog / `getTime` / event queue / CPU backing は `platform_windows_common.zig` に
-//! 集約し、各 backend がそれを re-export する（本 dispatcher は backend の公開面をそのまま通す）。
-//! Linux dispatcher（`platform_linux.zig`）と同じパターン。
+//! The window, the input, the dialogs, `getTime`, the event queue and the CPU backing are gathered into
+//! `platform_windows_common.zig`, which each backend re-exports (this dispatcher passes a backend's public surface straight through).
+//! The same pattern as the Linux dispatcher (`platform_linux.zig`).
 //!
-//! 注: comptime `if` で選択するため **非選択 backend は解析されない**。GDI ビルドに d3d11/dxgi の
-//! extern fn / link 要求が混入しない（d3d11/dxgi の linkSystemLibrary は build.zig が `.d3d11` のときだけ行う）。
+//! Note: the choice is a comptime `if`, so **the backend that was not selected is never analysed**. A GDI
+//! build pulls in no d3d11/dxgi extern fn and no link requirement (build.zig only linkSystemLibrary's d3d11/dxgi for `.d3d11`).
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -20,17 +20,17 @@ const backend = if (std.mem.eql(u8, build_options.platform_backend, "gdi"))
 else if (std.mem.eql(u8, build_options.platform_backend, "d3d11"))
     @import("platform_windows_d3d11.zig")
 else
-    @compileError("platform_windows: 未対応の Windows backend '" ++ build_options.platform_backend ++
-        "'（有効値: gdi / d3d11）");
+    @compileError("platform_windows: unsupported Windows backend '" ++ build_options.platform_backend ++
+        "' (valid values: gdi / d3d11)");
 
-// backend 固有（native handle を保持する型と実装関数）を re-export。
+// Re-export what is backend specific (the type holding the native handle, and the implementation functions).
 pub const Window = backend.Window;
 pub const Framebuffer = backend.Framebuffer;
 pub const init = backend.init;
 pub const shutdown = backend.shutdown;
-pub const getGeometry = backend.getGeometry; // TASK-117
+pub const getGeometry = backend.getGeometry; // window geometry
 
-// 描画方式非依存の共通実装（各 backend が platform_windows_common から re-export している）。
+// The drawing-independent shared implementation (each backend re-exports it from platform_windows_common).
 pub const getTime = backend.getTime;
 pub const saveFileDialog = backend.saveFileDialog;
 pub const openFileDialog = backend.openFileDialog;

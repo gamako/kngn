@@ -1,10 +1,10 @@
 //! macOS native platform backend
 //!
-//! C API (`platform/platform.h`) を Zig の高レベル interface に変換するレイヤ。
-//! `@cImport` を内部に閉じ込め、caller には Zig native な型のみを公開する。
+//! The layer that turns the C API (`platform/platform.h`) into a high-level Zig interface.
+//! It confines `@cImport` inside itself and exposes nothing but Zig-native types to a caller.
 //!
-//! 公開型（KeyCode / Event 等）は `platform_types.zig` を正準ソースとし、本ファイルは
-//! C 値からそれらを構築する変換層と、`Window`/`Framebuffer`・関数群を提供する。
+//! `platform_types.zig` is the canonical source of the public types (KeyCode, Event and friends), and
+//! this file provides the translation that builds them out of C values, plus `Window`/`Framebuffer` and the functions.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -16,12 +16,12 @@ const c = @cImport({
     @cInclude("platform.h");
 });
 
-// platform.h は旧 C 公開面を維持し、quit cancel はこの backend 専用の追加 ABI として
-// native 実装（objc/swift/metal）が同名 symbol を提供する。
+// platform.h keeps the older public C surface, and the quit cancel is an extra ABI belonging to this
+// backend alone, whose symbol the native implementations (objc/swift/metal) provide under the same name.
 extern fn platform_cancel_quit(window: *c.PlatformWindow) void;
 
-/// TASK-122: メニュー C symbol 参照は enable_menu かつ macOS native backend
-///（objc/swift/metal）のときだけ。非使用 exe の undefined symbol を構造的に防ぐ。
+/// The menu C symbols are referenced only with enable_menu and a macOS native backend
+/// (objc/swift/metal), which structurally prevents an undefined symbol in an executable without them.
 const menu_c_abi = build_options.enable_menu and (std.mem.eql(u8, build_options.platform_backend, "objc") or
     std.mem.eql(u8, build_options.platform_backend, "swift") or
     std.mem.eql(u8, build_options.platform_backend, "metal"));
@@ -33,10 +33,10 @@ const MenuC = if (menu_c_abi) struct {
     extern fn platform_destroy_menu(window: ?*c.PlatformWindow) void;
 } else struct {};
 
-/// TASK-120 / TASK-161: テキスト clipboard C symbol は macOS の 3 backend（objc/swift/metal）が実装する。
-/// unit test（`builtin.is_test`）では C symbol を参照しない
-/// （facade の in-memory fallback が担当。リンク時 undefined を防ぐ）。
-/// Linux/Windows および macOS 未対応 backend では false。
+/// The text clipboard C symbols are implemented by all three macOS backends (objc/swift/metal).
+/// A unit test (`builtin.is_test`) references no C symbol
+/// (the facade's in-memory fallback stands in), which prevents an undefined symbol at link time.
+/// It is false on Linux and Windows, and on a macOS backend without support.
 const clipboard_c_abi = !builtin.is_test and builtin.os.tag == .macos and
     (std.mem.eql(u8, build_options.platform_backend, "objc") or
         std.mem.eql(u8, build_options.platform_backend, "swift") or
@@ -47,8 +47,8 @@ const ClipboardC = if (clipboard_c_abi) struct {
     extern fn platform_get_clipboard_text(out: [*]u8, cap: u32, out_len: *u32) bool;
 } else struct {};
 
-/// TASK-142: text input focus 制御の C symbol は macOS の 3 backend（objc/swift/metal）が実装する。
-/// unit test では C symbol を参照しない（リンク時 undefined を防ぐ）。
+/// The text input focus control C symbol is implemented by all three macOS backends (objc/swift/metal).
+/// A unit test references no C symbol (which prevents an undefined symbol at link time).
 const text_input_c_abi = !builtin.is_test;
 
 const TextInputC = if (text_input_c_abi) struct {
@@ -60,7 +60,7 @@ const TextInputC = if (text_input_c_abi) struct {
     ) void;
 } else struct {};
 
-// 共有型のエイリアス（platform_types.zig が正準。signature 記述を簡潔にするため）
+// Aliases of the shared types (platform_types.zig is canonical; these merely keep the signatures short)
 const Error = types.Error;
 const KeyCode = types.KeyCode;
 const ModifierFlags = types.ModifierFlags;
@@ -101,14 +101,14 @@ pub fn getTime() f64 {
     return c.platform_get_time();
 }
 
-/// Dock アイコン / メニューバーの表示を切替える（TASK-104。アプリ全体・window 非依存）。
-/// visible=false で accessory（常駐アプリらしくする）。イベント/初期化時のみ。
+/// Show or hide the Dock icon and the menu bar (application-wide, not per window).
+/// visible=false selects accessory (behaving like a background app). Initialisation and event time only.
 pub fn setDockVisible(visible: bool) void {
     c.platform_set_dock_visible(visible);
 }
 
 // ============================================================================
-// C 値 → 共有型 への変換
+// From C values to the shared types
 // ============================================================================
 
 inline fn keyFromC(raw: c.PlatformKeyCode) KeyCode {
@@ -164,7 +164,7 @@ inline fn makeCompositionEvent(ev: c.PlatformEvent) CompositionEvent {
     };
 }
 
-/// C `PLATFORM_EVENT_FILE_DROP` → Zig `Event.file_drop`。不正時は null（イベント破棄）。
+/// C `PLATFORM_EVENT_FILE_DROP` → Zig `Event.file_drop`. Anything invalid gives null (the event is dropped).
 fn makeFileDropEvent(ev: c.PlatformEvent) ?Event {
     const fd = ev.payload.file_drop;
     if (fd.count != 1) return null;
@@ -179,7 +179,7 @@ inline fn isFacadeSkipEvent(raw: c.PlatformEventType) bool {
     return raw == c.PLATFORM_EVENT_NONE;
 }
 
-test "macOS facade NONE skip: FIFO 順を保ったまま wrap 境界を越える" {
+test "macOS facade NONE skip: the wrap boundary is crossed while FIFO order holds" {
     try std.testing.expect(isFacadeSkipEvent(c.PLATFORM_EVENT_NONE));
     try std.testing.expect(!isFacadeSkipEvent(c.PLATFORM_EVENT_KEY_DOWN));
     var index: usize = 254;
@@ -191,7 +191,7 @@ test "macOS facade NONE skip: FIFO 順を保ったまま wrap 境界を越える
     try std.testing.expectEqual(@as(usize, 1), index);
 }
 
-test "TASK-79.6.3: document access trampoline 登録・解除（unit test は C 非リンク）" {
+test "document access trampoline: registering and unregistering (a unit test links no C)" {
     var dummy: u8 = 0;
     const win: Window = .{ .handle = undefined };
     const cbs = TextInputDocumentCallbacks{
@@ -219,9 +219,9 @@ test "TASK-79.6.3: document access trampoline 登録・解除（unit test は C 
     try std.testing.expect(!textInputDocumentAccessRegisteredForTest());
 }
 
-/// C の `gamepad.name`（32byte+NUL固定バッファ）を `GamepadInfo.name_buf` へコピーする（TASK-80.2）。
-/// `strlen` 相当で NUL 終端までを有効長とし、`GAMEPAD_NAME_MAX` を超える分は切り詰める
-/// （backend 側が既に切り詰め済みのため通常は発生しない。防御的にここでも境界を守る）。
+/// Copy C's `gamepad.name` (a fixed buffer of 32 bytes plus NUL) into `GamepadInfo.name_buf`.
+/// The valid length runs to the NUL, as `strlen` would have it, and anything past `GAMEPAD_NAME_MAX` is truncated
+/// (the backend has already truncated it, so this does not normally happen; the bound is kept here defensively).
 inline fn makeGamepadInfo(ev: c.PlatformEvent) GamepadInfo {
     var info = GamepadInfo{ .index = @intCast(ev.payload.gamepad.index) };
     const raw_name: [*:0]const u8 = @ptrCast(&ev.payload.gamepad.name);
@@ -270,11 +270,11 @@ fn traceFacadeEvent(ev: Event) void {
 }
 
 // ============================================================================
-// ライブリサイズ redraw トランポリン（TASK-23.1）
+// The live-resize redraw trampoline
 // ============================================================================
 //
-// C ABI の `PlatformRedrawCallback` は `callconv(.c)` が必要なため、facade から渡された
-// Zig `RedrawFn` を module-level に保持し、C トランポリンから呼ぶ。単一ウィンドウ前提。
+// The C ABI's `PlatformRedrawCallback` has to be `callconv(.c)`, so the Zig `RedrawFn` handed over by
+// the facade is kept at module level and called from a C trampoline. A single window is assumed.
 
 pub const RedrawFn = *const fn (ctx: *anyopaque) void;
 
@@ -290,11 +290,11 @@ fn macosRedrawTrampoline(userdata: ?*anyopaque) callconv(.c) void {
 }
 
 // ============================================================================
-// IME document access トランポリン（TASK-79.6.3）
+// The IME document access trampolines
 // ============================================================================
 //
-// C ABI callback は callconv(.c)。Zig consumer の関数ポインタを module-level に保持し、
-// C trampoline から同期呼び出しする。単一ウィンドウ前提（redraw と同型）。
+// A C ABI callback is callconv(.c). The Zig consumer's function pointers are kept at module level and
+// called synchronously from a C trampoline. A single window is assumed (the same shape as redraw).
 
 pub const TextInputDocumentCallbacks = types.TextInputDocumentCallbacks;
 
@@ -337,7 +337,7 @@ fn docAccessGetSubstring(
         }
         return false;
     };
-    // 空 slice の .ptr は未定義になり得るため、長さ 0 は静的空バッファを返す。
+    // The .ptr of an empty slice can be undefined, so a length of 0 returns a static empty buffer.
     utf8_slot.* = if (sub.utf8.len == 0) @ptrCast(&empty_doc_utf8) else sub.utf8.ptr;
     len_slot.* = @intCast(sub.utf8.len);
     actual_slot.* = .{ .location = sub.actual_range.location, .length = sub.actual_range.length };
@@ -385,15 +385,15 @@ const doc_access_c_callbacks = c.PlatformTextInputDocumentCallbacks{
     .replace_text = docAccessReplaceText,
 };
 
-/// 空 substring 用の安定ポインタ（スタック一時を返さない）。
+/// A stable pointer for an empty substring (never a stack temporary).
 const empty_doc_utf8: [1]u8 = .{0};
 
-/// 単体テスト用: document access が facade に登録されているか。
+/// For unit tests: whether document access is registered with the facade.
 pub fn textInputDocumentAccessRegisteredForTest() bool {
     return doc_access_trampoline.callbacks != null;
 }
 
-/// 単体テスト用: NOT_FOUND sentinel（C ABI と一致）。
+/// For unit tests: the NOT_FOUND sentinel (matching the C ABI).
 pub fn textInputRangeNotFoundForTest() u64 {
     return TEXT_INPUT_RANGE_NOT_FOUND;
 }
@@ -420,21 +420,21 @@ pub const Window = struct {
         return .{ .handle = w };
     }
 
-    /// 本物のフルスクリーンウィンドウを作成する（TASK-100.1）。facade の Window.createFullscreen が
-    /// `@hasDecl` でこれを検出して使う。通常ウィンドウを作ってから `platform_enter_fullscreen`
-    /// （NSWindow toggleFullScreen:）でネイティブフルスクリーン化する。実サイズは画面解像度に
-    /// なり、framebuffer は既存の setFrameSize 経路で追従する（fb.width/height に反映）。
-    /// 初期サイズは toggle 前の一瞬だけ有効なプレースホルダ。
+    /// Create a real fullscreen window. The facade's Window.createFullscreen finds this through
+    /// `@hasDecl` and uses it. It creates an ordinary window and then makes it natively fullscreen with
+    /// `platform_enter_fullscreen` (NSWindow toggleFullScreen:). The real size becomes the screen
+    /// resolution, and the framebuffer follows through the existing setFrameSize path (reaching fb.width/height).
+    /// The initial size is a placeholder, valid only for the instant before the toggle.
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
         const w = c.platform_create_window(1280, 720, title.ptr, null, null) orelse return error.WindowCreationFailed;
         c.platform_enter_fullscreen(w);
         return .{ .handle = w };
     }
 
-    /// 透過 / borderless / 初期位置オプション付きでウィンドウを作成する（TASK-104 / TASK-117）。
-    /// facade の Window.createWithOptions が `@hasDecl` でこれを検出して使う。unknown flags は
-    /// C 側が NULL を返す（→ WindowCreationFailed）。透過は premultiplied alpha 前提。
-    /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
+    /// Create a window with the transparency, borderless and initial position options.
+    /// The facade's Window.createWithOptions finds this through `@hasDecl` and uses it. Unknown flags make
+    /// the C side return NULL (→ WindowCreationFailed). Transparency assumes premultiplied alpha.
+    /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
         var flags: u32 = 0;
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
@@ -457,33 +457,33 @@ pub const Window = struct {
         return .{ .handle = w };
     }
 
-    /// 表示中の OS ウィンドウタイトルを更新する。イベント境界でのみ呼ぶ。
+    /// Update the title of the visible OS window. Called only at an event boundary.
     pub fn setTitle(self: Window, title: [:0]const u8) void {
         c.platform_set_title(self.handle, title.ptr);
     }
 
-    /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。イベント時のみ。
+    /// Start the OS's interactive window move from the most recent pointer press. Event time only.
     pub fn beginDrag(self: Window) void {
         c.platform_begin_window_drag(self.handle);
     }
 
-    /// 常に最前面（always-on-top）を設定する（TASK-104）。イベント時のみ。
+    /// Set always-on-top. Event time only.
     pub fn setAlwaysOnTop(self: Window, on: bool) void {
         c.platform_set_always_on_top(self.handle, on);
     }
 
-    /// クリック透過（per-pixel。透明画素上のクリックを背後へ抜けさせる）を設定する（TASK-104）。
+    /// Set per-pixel click-through, letting a click over a transparent pixel fall through to what is behind.
     pub fn setClickThrough(self: Window, on: bool) void {
         c.platform_set_click_through(self.handle, on);
     }
 
-    /// 終了メニューをポップアップする（TASK-104。選択時に window の event queue に quit を積む）。
+    /// Pop up a quit menu (choosing it pushes quit onto the window's event queue).
     pub fn showQuitMenu(self: Window) void {
         c.platform_show_quit_menu(self.handle);
     }
 
     pub fn destroy(self: Window) void {
-        // document access 解除（dangling userdata 防止。pending range は native 側でも破棄）。
+        // Unregister document access (which prevents a dangling userdata; the native side discards its pending range too).
         if (comptime text_input_c_abi) {
             TextInputC.platform_set_text_input_document_access(self.handle, null, null);
         }
@@ -491,8 +491,8 @@ pub const Window = struct {
         c.platform_destroy_window(self.handle);
     }
 
-    /// close delegate が積んだ quit request を consumer がキャンセルする。
-    /// ホットパス宣言: quit/close イベント時のみ。
+    /// Let the consumer cancel the quit request pushed by the close delegate.
+    /// Hot path declaration: quit/close events only.
     pub fn cancelQuit(self: Window) void {
         platform_cancel_quit(self.handle);
     }
@@ -529,8 +529,8 @@ pub const Window = struct {
         }
     }
 
-    /// IME composition preedit 本文を buf へ書く（TASK-79.6.1）。空なら text は 0 長。
-    /// latest-wins: 常に現在状態。event.revision は取りこぼし検知用で過去 revision は取得不可。
+    /// Write the IME composition preedit text into buf. When it is empty, text has length 0.
+    /// latest-wins: always the current state. event.revision only detects a missed update; an older revision cannot be read.
     pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
         var meta: c.PlatformCompositionMeta = .{
             .revision = 0,
@@ -551,22 +551,22 @@ pub const Window = struct {
         };
     }
 
-    /// IME 候補窓の caret 基準 rect を framebuffer pixel で供給する（イベント時のみ）。
+    /// Supply the caret rect the IME candidate window is anchored to, in framebuffer pixels (event time only).
     pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
         c.platform_set_composition_rect(self.handle, x, y, w, h);
     }
 
-    /// TASK-142: テキスト編集ウィジェットのフォーカス有無を platform へ伝える（冪等。consumer は
-    /// 毎フレーム focus に追従して呼んでよく、実効経路が変わるときのみ composition 破棄が走る）。
-    /// objc/swift/metal の 3 backend で実効（active=false の間は keyDown を IME へ渡さない）。
+    /// Tell the platform whether a text editing widget has focus (idempotent: a consumer may call it every
+    /// frame to track focus, and a composition is discarded only when the effective path changes).
+    /// It takes effect on all three backends, objc/swift/metal (while active=false, keyDown does not reach the IME).
     pub fn setTextInputActive(self: Window, active: bool) void {
         if (comptime text_input_c_abi) TextInputC.platform_set_text_input_active(self.handle, active);
     }
 
-    /// TASK-79.6.3: IME document access（再変換用）。`callbacks == null` で登録解除。
-    /// 単一 window 前提。headless / unit test では C を呼ばず登録状態だけ保持する。
-    /// native へ渡す C userdata は常に null（Zig trampoline が module-level 状態を見る単一
-    /// window 設計のため。consumer userdata は doc_access_trampoline 側に保持する）。
+    /// IME document access (for reconversion). `callbacks == null` unregisters.
+    /// A single window is assumed. Headless and unit tests call no C and merely keep the registration state.
+    /// The C userdata handed to native is always null (this is a single-window design in which the Zig
+    /// trampoline reads module-level state; the consumer's userdata is held by doc_access_trampoline).
     pub fn setTextInputDocumentAccess(
         self: Window,
         userdata: *anyopaque,
@@ -620,7 +620,7 @@ pub const Window = struct {
         };
     }
 
-    /// 現在の negotiated logical size（TASK-156.1）。frame 中の描画は Framebuffer snapshot を使う。
+    /// The currently negotiated logical size. Drawing within a frame uses the Framebuffer snapshot.
     pub fn logicalSize(self: Window) types.WindowSize {
         const m = getMetrics(self) orelse return .{ .width = 0, .height = 0 };
         return .{ .width = m.logical_width, .height = m.logical_height };
@@ -640,30 +640,30 @@ pub const Window = struct {
         c.platform_present(self.handle);
     }
 
-    /// カーソル形状を設定する（TASK-75.1）。イベント時のみ呼ぶ想定（性能規約の対象外）。
+    /// Set the cursor shape. Expected to be called at event time only (so the performance rules do not apply).
     pub fn setCursor(self: Window, shape: CursorShape) void {
         c.platform_set_cursor(self.handle, @intFromEnum(shape));
     }
 
-    /// ライブリサイズ再描画コールバック登録（TASK-23.1）。
-    /// facade から渡された Zig 関数を C トランポリン経由で native へ渡す。
-    /// 単一ウィンドウ前提（module-level に `{ctx, cb}` を保持）。
+    /// Register the live-resize redraw callback.
+    /// The Zig function handed over by the facade is passed to native through a C trampoline.
+    /// A single window is assumed (`{ctx, cb}` is kept at module level).
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: RedrawFn) void {
         redraw_trampoline = .{ .ctx = ctx, .cb = cb };
         c.platform_set_redraw_callback(self.handle, macosRedrawTrampoline, null);
     }
 
-    /// destroy 用の private clear 経路（public API に null を通さない。TASK-23.1 実装メモ）。
+    /// The private clear path used by destroy (null never goes through the public API).
     pub fn clearRedrawCallback(self: Window) void {
         redraw_trampoline = .{};
         c.platform_set_redraw_callback(self.handle, null, null);
     }
 
-    /// 指定 index のゲームパッド状態を取得する（GameController framework 経由。TASK-80.2。ADR-009）。
-    /// 未接続/index範囲外は null。
+    /// Read the state of the gamepad at the given index (through the GameController framework; ADR-009).
+    /// Disconnected, or an index out of range, gives null.
     ///
-    /// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy（alloc/lock 無し）
-    /// で全画素ループでも RT でもないため性能規約の適用対象外（ADR-009 参照）。
+    /// Hot path declaration: called once per frame, but it is a fixed-length copy of four pads with a few fields
+    /// each (no allocation, no lock), which is neither an all-pixel loop nor real time, so the performance rules do not apply (see ADR-009).
     pub fn getGamepadState(self: Window, index: u8) ?GamepadState {
         var s: c.PlatformGamepadState = undefined;
         if (!c.platform_get_gamepad_state(self.handle, @intCast(index), &s)) return null;
@@ -680,17 +680,17 @@ pub const Window = struct {
 };
 
 // ============================================================================
-// native menu (TASK-97.3)
+// native menus
 // ============================================================================
 //
-// ホットパス宣言: 登録・状態更新は初期化時/状態変更イベント時のみ。選択はイベント時のみ。
-// 性能規約の適用対象外。
+// Hot path declaration: registration and state updates happen at initialisation or on a state change
+// event, and a selection only at event time. The performance rules do not apply.
 //
-// ⚠ facade（core/platform.zig）は `@hasDecl(backend, "nativeMenuAvailable")` で
-// **module-level decl** を探して dispatch する（97.1 契約。doc comment に明記）。
-// Window struct のメソッドにすると comptime 検査が silently false になり、
-// 全ビルド緑のまま native メニューが永遠に無効化される（2026-07-17 実機で発覚した実バグ。
-// headless E2E は fallback が期待値のため検出不能だった）。module-level から動かさないこと。
+// The facade (core/platform.zig) dispatches by looking for a **module-level decl** with
+// `@hasDecl(backend, "nativeMenuAvailable")`. Making it a method of the Window struct turns that
+// comptime check silently false, and native menus stay disabled forever while every build is green
+// (a real bug, invisible to the headless end-to-end tests, whose expected value is the fallback).
+// Do not move it off module level.
 
 pub fn nativeMenuAvailable(win: Window) bool {
     _ = win;
@@ -699,14 +699,14 @@ pub fn nativeMenuAvailable(win: Window) bool {
 }
 
 // ============================================================================
-// window geometry (TASK-117)
+// window geometry
 // ============================================================================
 //
-// ホットパス宣言: ウィンドウ生成時 / 終了時 shutdown / harness digest 観測時のみ。
+// Hot path declaration: window creation, shutdown, and harness digest observation only.
 //
-// ⚠ getGeometry も nativeMenuAvailable と同じく **module-level decl** 必須。
-// Window struct メソッドにすると facade の `@hasDecl(backend, "getGeometry")` が
-// silently false になり、常に 0x0/null を返す（TASK-97.3 と同型の配線バグ）。
+// getGeometry must be a **module-level decl** for the same reason as nativeMenuAvailable:
+// as a method of the Window struct the facade's `@hasDecl(backend, "getGeometry")` goes silently
+// false and it always returns 0x0 and null (the same wiring bug).
 
 pub fn getGeometry(win: Window) types.WindowGeometry {
     var geo: c.PlatformWindowGeometry = .{
@@ -745,8 +745,8 @@ pub fn destroyMenu(win: Window) void {
     MenuC.platform_destroy_menu(win.handle);
 }
 
-/// Command → PlatformMenuItem 変換用の一時バッファ。
-/// 文字列は呼び出し中のみ有効（backend が copy）。stack 固定長で alloc しない。
+/// The temporary buffer used to convert a Command into a PlatformMenuItem.
+/// The strings are valid only during the call (the backend copies them). Fixed-length on the stack, with no allocation.
 const MENU_SCRATCH_CAP = 64;
 const MENU_STR_CAP = 256;
 
@@ -782,15 +782,15 @@ const MenuScratch = struct {
         return self.items[0..n];
     }
 
-    /// UTF-8 安全に NUL 終端へコピーする。バイト上限で切る場合はコードポイント境界へ戻す
-    /// （継続バイト 0b10xxxxxx の途中切断 → ObjC stringWithUTF8String: nil を防ぐ）。
+    /// Copy safely into a NUL terminator in UTF-8. When the byte limit cuts, it steps back to a code point
+    /// boundary (cutting inside a continuation byte, 0b10xxxxxx, would make ObjC's stringWithUTF8String: return nil).
     fn copyZUtf8(buf: *[MENU_STR_CAP]u8, src: []const u8) [*:0]const u8 {
         const max = MENU_STR_CAP - 1;
         const capped = @min(src.len, max);
         var n = capped;
-        // 末尾の継続バイトを捨てて lead 上へ戻す
+        // drop the trailing continuation bytes and step back onto the lead
         while (n > 0 and (src[n - 1] & 0xC0) == 0x80) n -= 1;
-        // lead だけ残って不完全な多バイト列なら lead も捨てる
+        // when only an incomplete multi-byte lead is left, drop the lead too
         if (n > 0) {
             const lead = src[n - 1];
             const need: usize = if (lead < 0x80)
@@ -811,8 +811,8 @@ const MenuScratch = struct {
     }
 };
 
-/// Locked framebuffer view. `unlock` を 1 度だけ呼ぶ慣習で運用する
-/// （`if (window.lockFramebuffer()) |fb| { defer fb.unlock(); ... }`）。
+/// A locked framebuffer view. The convention is to call `unlock` exactly once
+/// (`if (window.lockFramebuffer()) |fb| { defer fb.unlock(); ... }`).
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,
@@ -842,16 +842,16 @@ fn getMetrics(win: Window) ?c.PlatformFramebufferMetrics {
 }
 
 // ============================================================================
-// ファイル選択ダイアログ (TASK-24)
+// File selection dialogs
 // ============================================================================
 //
-// 同期モーダル（app-modal）。**framebuffer lock 中には呼ばないこと**（caller 責任）。
-// 戻り値は gpa 所有スライス（caller が gpa.free すること）。キャンセル時は null、
-// メモリ確保失敗時は error.OutOfMemory。
+// Synchronous and modal (application-modal). **Never call it while the framebuffer is locked** (the caller's responsibility).
+// The return value is a slice owned by gpa (the caller frees it with gpa.free). A cancel gives null,
+// and a failed allocation gives error.OutOfMemory.
 
-/// 保存先をユーザーに選ばせる。
+/// Let the user choose where to save.
 pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    _ = io; // macOS は native panel（io 不要）。全 OS 共通シグネチャのため受け取る。
+    _ = io; // macOS uses a native panel (io is unused). It is taken because the signature is shared by every OS.
     var c_opts: c.PlatformSaveDialogOptions = .{
         .default_name = if (opts.default_name) |s| s.ptr else null,
         .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,
@@ -860,9 +860,9 @@ pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOption
     return try dupePathAndFree(gpa, p);
 }
 
-/// 開くファイルをユーザーに選ばせる（単一選択・ファイルのみ）。
+/// Let the user choose a file to open (a single selection, files only).
 pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
-    _ = io; // macOS は native panel（io 不要）。全 OS 共通シグネチャのため受け取る。
+    _ = io; // macOS uses a native panel (io is unused). It is taken because the signature is shared by every OS.
     var c_opts: c.PlatformOpenDialogOptions = .{
         .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,
     };
@@ -870,26 +870,26 @@ pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOption
     return try dupePathAndFree(gpa, p);
 }
 
-/// C 側が確保したパス文字列を gpa 所有スライスへ複製し、C 側を必ず解放する。
-/// dupe が OOM でも defer で platform_free_path を呼ぶので C 側はリークしない。
+/// Duplicate the path string allocated by the C side into a gpa-owned slice, and always free the C side.
+/// Even when the dupe runs out of memory, the defer calls platform_free_path, so the C side never leaks.
 fn dupePathAndFree(gpa: std.mem.Allocator, p: [*c]u8) std.mem.Allocator.Error![]u8 {
     defer c.platform_free_path(p);
     return try gpa.dupe(u8, std.mem.span(p));
 }
 
 // ============================================================================
-// OS テキストクリップボード (TASK-120)
+// The OS text clipboard
 // ============================================================================
 
-/// UTF-8 text を OS clipboard へ書く。macOS 3 backend（objc/swift/metal）以外は no-op。
+/// Write UTF-8 text to the OS clipboard. A no-op on anything but the three macOS backends (objc/swift/metal).
 pub fn setClipboardText(text: []const u8) void {
     if (comptime !clipboard_c_abi) return;
     ClipboardC.platform_set_clipboard_text(text.ptr, @intCast(text.len));
 }
 
-/// OS clipboard の UTF-8 text を caller buffer へコピーする。
-/// 未対応 backend・文字列無し・失敗は null。空文字列は `buf[0..0]`。
-/// macOS 3 backend は NSPasteboard を実装（TASK-161）。
+/// Copy the OS clipboard's UTF-8 text into the caller's buffer.
+/// An unsupported backend, no string, or a failure gives null. An empty string is `buf[0..0]`.
+/// All three macOS backends implement it through NSPasteboard.
 pub fn getClipboardText(buf: []u8) ?[]const u8 {
     if (comptime !clipboard_c_abi) return null;
     if (buf.len == 0) return null;

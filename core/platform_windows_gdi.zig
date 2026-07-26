@@ -1,12 +1,12 @@
-//! Windows platform backend — GDI（software blit）実装（TASK-31 / TASK-35 で common 分離）
+//! The Windows platform backend: the GDI (software blit) implementation
 //!
-//! best-effort backend（ADR-005）。caller は canonical BGRA `[]u32`（u32 0xAARRGGBB /
-//! メモリ [B,G,R,A]）を `core.backing` に書き、present で GDI `StretchDIBits`
-//! （BITMAPINFO=BI_RGB 32bpp / top-down）で blit する。canonical BGRA は GDI 32bpp BI_RGB に
-//! native（低 24bit = 0x00RRGGBB、A は無視）なので **変換層も毎フレームコピーも無い**。
+//! A best-effort backend (ADR-005). The caller writes canonical BGRA `[]u32` (u32 0xAARRGGBB / memory
+//! [B,G,R,A]) into `core.backing`, and present blits it with GDI `StretchDIBits`
+//! (BITMAPINFO=BI_RGB 32bpp, top-down). Canonical BGRA is native to GDI 32bpp BI_RGB (the low 24 bits
+//! are 0x00RRGGBB and A is ignored), so there is **no conversion layer and no copy per frame**.
 //!
-//! window / 入力 / dialog / getTime / event queue は `platform_windows_common.zig` を共有する
-//! （D3D11 backend と共通）。本ファイルは GDI 固有の presentation（BITMAPINFO / StretchDIBits）のみを持つ。
+//! The window, the input, the dialogs, getTime and the event queue are shared through
+//! `platform_windows_common.zig` (in common with the D3D11 backend). This file holds only the GDI-specific presentation (BITMAPINFO and StretchDIBits).
 
 const std = @import("std");
 const win = std.os.windows;
@@ -25,7 +25,7 @@ const WORD = win.WORD;
 const LONG = win.LONG;
 const BOOL = common.BOOL;
 
-// 共通公開面（facade dispatcher が再 re-export する）。
+// The shared public surface (the facade dispatcher re-exports it again).
 pub const Framebuffer = common.Framebuffer;
 pub const init = common.init;
 pub const shutdown = common.shutdown;
@@ -34,7 +34,7 @@ pub const saveFileDialog = common.saveFileDialog;
 pub const openFileDialog = common.openFileDialog;
 
 // ============================================================================
-// GDI 固有（wingdi.h の ABI 安定値 / layout / extern）
+// GDI specifics (the ABI-stable values, layouts and externs of wingdi.h)
 // ============================================================================
 const BI_RGB: DWORD = 0;
 const DIB_RGB_COLORS: UINT = 0;
@@ -58,7 +58,7 @@ const RGBQUAD = extern struct { b: u8, g: u8, r: u8, reserved: u8 };
 
 const BITMAPINFO = extern struct {
     bmiHeader: BITMAPINFOHEADER,
-    bmiColors: [1]RGBQUAD, // BI_RGB 32bpp では未使用。型 layout を満たすためのプレースホルダ。
+    bmiColors: [1]RGBQUAD, // Unused with BI_RGB 32bpp. A placeholder that satisfies the type layout.
 };
 
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
@@ -81,7 +81,7 @@ extern "gdi32" fn StretchDIBits(
 ) callconv(.winapi) c_int;
 
 // ============================================================================
-// Window — common.Core + GDI presentation（BITMAPINFO）
+// Window: common.Core plus the GDI presentation (BITMAPINFO)
 // ============================================================================
 
 pub const Window = struct {
@@ -92,21 +92,21 @@ pub const Window = struct {
         return .{ .core = core };
     }
 
-    /// 本物のフルスクリーン window を作成する（TASK-100.1）。GDI は StretchDIBits が stateless なので
-    /// Core のモニタ全面 window を包むだけ（present は core 寸法に追従）。
+    /// Create a real fullscreen window. StretchDIBits is stateless on GDI, so this merely wraps Core's
+    /// full-monitor window (present follows the size held by core).
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
         const core = try common.Core.createFullscreen(title);
         return .{ .core = core };
     }
 
-    /// 透過 / borderless オプション付き作成（TASK-104.1）。facade が @hasDecl で検出して使う。
-    /// present は core.transparent のとき UpdateLayeredWindow 経路（下記 present 参照）。
+    /// Create with the transparency and borderless options. The facade detects this through @hasDecl.
+    /// While core.transparent, present goes through UpdateLayeredWindow (see present below).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: @import("platform_types").WindowOptions) Error!Window {
         const core = try common.Core.createWithOptions(width, height, title, opts);
         return .{ .core = core };
     }
 
-    /// 対話的ドラッグ / 最前面 / クリック透過 / 終了メニュー（TASK-104.1）。Core へ委譲。
+    /// Interactive dragging, always-on-top, click-through and the quit menu. Delegated to Core.
     pub fn beginDrag(self: Window) void {
         self.core.beginDrag();
     }
@@ -140,26 +140,26 @@ pub const Window = struct {
         return self.core.getEventStats();
     }
 
-    /// 現在の negotiated logical size（TASK-156.5 Stage 4）。frame 中の描画は Framebuffer snapshot を使う。
+    /// The currently negotiated logical size. Drawing within a frame uses the Framebuffer snapshot.
     pub fn logicalSize(self: Window) types.WindowSize {
         const core = self.core;
         return .{ .width = core.logical_width, .height = core.logical_height };
     }
 
-    /// 現在の negotiated framebuffer size（物理px。`.logical` では logical と同値）。
+    /// The currently negotiated framebuffer size (in physical pixels; equal to the logical one under `.logical`).
     pub fn framebufferSize(self: Window) types.WindowSize {
         const core = self.core;
         return .{ .width = core.width, .height = core.height };
     }
 
-    /// 現在の negotiated content scale（query 用。pending。lock 前の入力正規化と一致）。
+    /// The currently negotiated content scale (for a query; the pending value, matching input normalisation before a lock).
     pub fn contentScale(self: Window) f32 {
         return common.effectiveContentScale(self.core.pending_content_scale);
     }
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
         const core = self.core;
-        // TASK-156.5 Stage 4: pending（WM_SIZE / WM_DPICHANGED）を latch。ホットパス宣言: lock 境界のみ。
+        // Latch what is pending (WM_SIZE / WM_DPICHANGED). Hot path declaration: at the lock boundary only.
         core.applyLatchedMetricsIfNeeded();
         const logical: types.WindowSize = .{ .width = core.logical_width, .height = core.logical_height };
         const fb_size: types.WindowSize = .{ .width = core.width, .height = core.height };
@@ -177,19 +177,19 @@ pub const Window = struct {
 
     pub fn present(self: Window) void {
         const core = self.core;
-        if (core.transparent) return core.presentLayered(); // TASK-104.1: 透過は UpdateLayeredWindow 経路
+        if (core.transparent) return core.presentLayered(); // Transparency goes through UpdateLayeredWindow
         const hdc = GetDC(core.hwnd) orelse return;
         defer _ = ReleaseDC(core.hwnd, hdc);
         const w: c_int = @intCast(core.width);
         const h: c_int = @intCast(core.height);
-        // bmi は core 寸法から毎回構築する（リサイズ追従。StretchDIBits は stateless。TASK-23）。
-        // biHeight 負（top-down）なので src(0,0)=左上。dest==src 寸法（拡縮なし）。
+        // bmi is rebuilt from core's size every time (so it follows a resize; StretchDIBits is stateless).
+        // biHeight is negative (top-down), so src(0,0) is the top-left. dest and src are the same size (no scaling).
         const bmi = makeBitmapInfo(core.width, core.height);
         _ = StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, core.backing.ptr, &bmi, DIB_RGB_COLORS, SRCCOPY);
     }
 
-    /// カーソル形状の設定（TASK-75.1）。現状 no-op スタブ（compile 維持のみ）。
-    /// 実装は TASK-75.2（Windows gdi/d3d11 system cursor）で行う（SetCursor 等）。
+    /// Set the cursor shape. The Windows backends do not implement cursor shapes, so this is a no-op
+    /// stub (it exists so that the facade's contract compiles).
     pub fn setCursor(self: Window, shape: types.CursorShape) void {
         _ = self;
         _ = shape;
@@ -199,17 +199,17 @@ pub const Window = struct {
         self.core.setTitle(title);
     }
 
-    /// ライブリサイズ再描画コールバック登録（TASK-23.1）。Core へ委譲。
+    /// Register the live-resize redraw callback. Delegated to Core.
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         self.core.setRedrawCallback(ctx, cb);
     }
 
-    /// destroy 用の private clear 経路（TASK-23.1 実装メモ）。
+    /// The private clear path used by destroy.
     pub fn clearRedrawCallback(self: Window) void {
         self.core.clearRedrawCallback();
     }
 
-    /// IME composition snapshot（TASK-79.6.1）。Windows IME は 79.6.4。常に空。
+    /// The IME composition snapshot. The Windows IME is not implemented, so this is always empty.
     pub fn getCompositionSnapshot(self: Window, buf: []u8) types.CompositionSnapshot {
         _ = self;
         return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
@@ -221,7 +221,7 @@ fn makeBitmapInfo(width: u32, height: u32) BITMAPINFO {
         .bmiHeader = .{
             .biSize = @sizeOf(BITMAPINFOHEADER),
             .biWidth = @intCast(width),
-            .biHeight = -@as(LONG, @intCast(height)), // 負 = top-down（caller の行順と一致）
+            .biHeight = -@as(LONG, @intCast(height)), // negative = top-down (matching the caller's row order)
             .biPlanes = 1,
             .biBitCount = 32,
             .biCompression = BI_RGB,
@@ -235,7 +235,7 @@ fn makeBitmapInfo(width: u32, height: u32) BITMAPINFO {
     };
 }
 
-/// 現在のウィンドウ geometry（TASK-117）。module-level（facade `@hasDecl` 契約）。
+/// The current window geometry. Module level (the facade's `@hasDecl` contract).
 pub fn getGeometry(window: Window) types.WindowGeometry {
     return window.core.getGeometry();
 }
