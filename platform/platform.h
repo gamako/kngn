@@ -577,7 +577,7 @@ void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
 // ========================================
 //
 // 設計の正は core/platform_types.zig 側の GamepadButton/GamepadButtons/GamepadState と
-// docs/adr/009_ゲームパッド入力.md。button の bit 位置は下記 enum の宣言順（a=bit0 … guide=bit14）と
+// docs/adr/009_gamepad-input.md。button の bit 位置は下記 enum の宣言順（a=bit0 … guide=bit14）と
 // Zig 側 GamepadButtons のフィールド順を一致させる。トリガーは axis のみで公開する（ボタンとしては
 // 公開しない）。stick/trigger は raw 値（deadzone 未適用）。
 //

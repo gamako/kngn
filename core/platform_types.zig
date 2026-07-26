@@ -436,7 +436,7 @@ pub const EventStats = struct {
 // ゲームパッド (TASK-80.1。ADR-009)
 // ============================================================================
 //
-// 設計の正は docs/adr/009_ゲームパッド入力.md。ポーリング主軸（Window.getGamepadState）+
+// 設計の正は docs/adr/009_gamepad-input.md。ポーリング主軸（Window.getGamepadState）+
 // 接続イベント（Event.gamepad_connected/disconnected）。標準レイアウトへ正規化済みの値のみを
 // 公開し（native raw レポートは backend 内部に閉じる）、トリガーは axis のみ（ボタンとしては
 // 公開しない）。deadzone は未適用の raw 値（stick -1..1 / trigger 0..1）を返し、適用は

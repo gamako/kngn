@@ -9,7 +9,7 @@
 //! - **本ファイルは `document.zig` を一切 import しない**（依存は一方向:
 //!   `document.zig` → `undo.zig` → `canvas.zig`。循環 import 回避。TASK-45.1 plan 5.1節）。
 //!   `Op`/`UndoStack`（push/apply・CelSetSnapshot 込み）は `document.zig` 側に移設済み。
-//! - OOM は `@panic`（core 全体のポリシー。決定と理由は docs/adr/006_editor_coreのOOMポリシー.md）。
+//! - OOM は `@panic`（core 全体のポリシー。決定と理由は docs/adr/006_editor-core-oom-policy.md）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

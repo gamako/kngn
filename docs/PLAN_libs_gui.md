@@ -296,4 +296,4 @@ caller が「キャンバス領域」「ステータスバー」等の widget re
 - TASK-21.4 (Flex レイアウト): `backlog/tasks/task-21.4 - libs-gui-Flex-レイアウトエンジン.md`
 - TASK-21.5 (基本ウィジェット): `backlog/tasks/task-21.5 - libs-gui-基本ウィジェット（Button-Label-ColorSwatch-Slider）.md`
 - TASK-21.9 (Slider): `backlog/tasks/task-21.9 - libs-gui-Slider-ウィジェット（i32-f32）.md`
-- ADR 003 (イベント処理層の配置): `video-proto-main/docs/adr/003_イベント処理層の配置.md`
+- ADR 003 (イベント処理層の配置): `video-proto-main/docs/adr/003_event-translation-layer.md`
