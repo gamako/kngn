@@ -1,36 +1,36 @@
-//! macOS native audio backend (L1 オーディオ出力プリミティブ)
+//! macOS native audio backend (an L1 audio output primitive)
 //!
-//! AudioUnit (Default Output Unit) を C ABI で叩き、レンダーコールバックで
-//! サンプルを供給する最小の出力デバイスを提供する。AudioToolbox の必要シンボルだけを
-//! `extern` 宣言する（`@cImport` は使わない: framework header search path 不要で build が単純）。
+//! It drives AudioUnit (the Default Output Unit) through the C ABI and provides a minimal output
+//! device that supplies samples from a render callback. Only the AudioToolbox symbols actually needed are
+//! declared `extern` (`@cImport` is not used: no framework header search path is needed and the build stays simple).
 //!
-//! スレッドモデル: `render_callback` は CoreAudio が管理する **RT スレッド**で呼ばれる。
-//! その中で malloc / lock / IO / panic をしてはならない（呼び出し側の API 契約）。
+//! The thread model: `render_callback` is called on an **real-time thread** managed by CoreAudio.
+//! Within it, malloc, locking, IO and panic are forbidden (the caller's API contract).
 //!
-//! ## mic capture（AUHAL input。TASK-49.2。末尾 `pub const capture = struct {...}` 節）
+//! ## mic capture (AUHAL input; the `pub const capture = struct {...}` section at the end)
 //!
-//! 出力（Default Output Unit）の鏡像として、AUHAL（`kAudioUnitSubType_HALOutput`）の入力
-//! element を有効化し、`AudioUnitRender` で pull した PCM を `capture_types.AudioInFrame` として
-//! ユーザー `CaptureCallback` へ渡す。名前空間を `capture` にネストするのは、既存の出力用
-//! `Config`/`EffectiveConfig`/`AudioDevice`（このファイル上部）と capture 側の同名型が
-//! 1ファイル内で衝突しないようにするため（`core/audio.zig` の `capture_backend` は
-//! macOS でこの `capture` 名前空間を指す。他 backend ファイルとの duck-typing 規約は
-//! `core/audio_capture_stub.zig` と同形）。
-//! 権限確認（`AVCaptureDevice.authorizationStatusForMediaType:`/`requestAccessForMediaType:`）は
-//! camera 側と同じ ObjC ランタイム経由（`core/objc_runtime.zig`。設計文書
-//! `docs/plans/capture-foundation-plan.md` 6章の mic permission 欄を参照）。
+//! As the mirror image of the output (the Default Output Unit), it enables the input element of
+//! AUHAL (`kAudioUnitSubType_HALOutput`), and hands the PCM pulled by `AudioUnitRender` to the user's
+//! `CaptureCallback` as a `capture_types.AudioInFrame`. The namespace is nested as `capture` so that the
+//! capture-side types do not collide within one file with the identically named output types
+//! `Config`, `EffectiveConfig` and `AudioDevice` above (`core/audio.zig`'s `capture_backend` points at
+//! this `capture` namespace on macOS, and the duck-typing convention shared with the other backend files is
+//! the same shape as `core/audio_capture_stub.zig`'s).
+//! Checking permission (`AVCaptureDevice.authorizationStatusForMediaType:` and `requestAccessForMediaType:`)
+//! goes through the ObjC runtime as the camera side does (`core/objc_runtime.zig`; the microphone
+//! permission column is in `docs/capture.md`).
 //!
-//! ホットパス宣言: input callback（`inputTrampoline`）は **RT スレッド（CoreAudio 管理。毎コール
-//! バック=数msごと）**。区間内で malloc/lock/IO/panic 禁止（既存出力 `renderTrampoline` と同じ
-//! 契約）。行うのは `AudioUnitRender`（固定確保済み `scratch` バッファへ pull）+ ユーザー
-//! `CaptureCallback` 呼び出しのみ。
+//! Hot path declaration: the input callback (`inputTrampoline`) runs on a **real-time thread (managed by
+//! CoreAudio, so every callback is a few ms apart)**. Within that region malloc, locking, IO and panic are forbidden (the same
+//! contract as the existing output `renderTrampoline`). All it does is `AudioUnitRender` (pulling into the
+//! pre-allocated `scratch` buffer) plus the call to the user's `CaptureCallback`.
 
 const std = @import("std");
 const types = @import("capture_types");
 const objc = @import("objc_runtime");
 
 // ============================================================================
-// AudioToolbox C ABI (最小サブセット)
+// the AudioToolbox C ABI (a minimal subset)
 // ============================================================================
 const c = struct {
     pub const OSStatus = i32;
@@ -87,7 +87,7 @@ const c = struct {
         inputProcRefCon: ?*anyopaque,
     };
 
-    // FourCharCode 定数
+    // the FourCharCode constants
     pub const kAudioUnitType_Output: OSType = 0x6175_6F75; // 'auou'
     pub const kAudioUnitSubType_DefaultOutput: OSType = 0x6465_6620; // 'def '
     pub const kAudioUnitManufacturer_Apple: OSType = 0x6170_706C; // 'appl'
@@ -115,9 +115,9 @@ const c = struct {
     pub extern "c" fn AudioOutputUnitStop(ci: AudioUnit) OSStatus;
 
     // ------------------------------------------------------------------
-    // AUHAL input（mic capture。TASK-49.2）追加分。値は Apple SDK ヘッダ
-    // （AudioUnit/AudioUnitProperties.h, CoreAudio/AudioHardwareBase.h,
-    //   CoreAudio/AudioHardware.h）から実測確認済み。
+    // The additions for AUHAL input (mic capture). The values are confirmed by inspection against the Apple SDK headers
+    // (AudioUnit/AudioUnitProperties.h, CoreAudio/AudioHardwareBase.h,
+    //   CoreAudio/AudioHardware.h).
     // ------------------------------------------------------------------
     pub const kAudioUnitSubType_HALOutput: OSType = 0x6168_616C; // 'ahal'
 
@@ -127,7 +127,7 @@ const c = struct {
 
     pub extern "c" fn AudioUnitRender(ci: AudioUnit, io_action_flags: ?*anyopaque, in_time_stamp: ?*const anyopaque, in_bus_number: u32, in_number_frames: u32, io_data: *AudioBufferList) OSStatus;
 
-    // CoreAudio HAL（AudioObject。デバイス列挙・既定入力デバイス取得用）。
+    // The CoreAudio HAL (AudioObject), for enumerating devices and getting the default input device.
     pub const AudioObjectID = u32;
     pub const AudioObjectPropertyAddress = extern struct {
         mSelector: u32,
@@ -149,20 +149,20 @@ const c = struct {
 };
 
 // ============================================================================
-// 公開型
+// the public types
 // ============================================================================
 
 pub const Error = error{
-    OpenFailed, // インスタンス生成失敗
-    NoDevice, // 出力デバイスが見つからない
-    ConfigFailed, // SetProperty (StreamFormat / RenderCallback) 失敗
-    InitializeFailed, // AudioUnitInitialize 失敗
-    QueryFailed, // GetProperty (実効値) 失敗
-    StartFailed, // AudioOutputUnitStart 失敗
+    OpenFailed, // failed to create the instance
+    NoDevice, // no output device was found
+    ConfigFailed, // SetProperty (StreamFormat or RenderCallback) failed
+    InitializeFailed, // AudioUnitInitialize failed
+    QueryFailed, // GetProperty (the effective values) failed
+    StartFailed, // AudioOutputUnitStart failed
 };
 
-/// `RenderCallback` は RT スレッドで呼ばれる。**malloc / lock / IO / panic をしてはならない**。
-/// `buf` は interleaved な `frames * channels` 要素の f32 スライス（書き込み先）。
+/// `RenderCallback` is called on a real-time thread. **It must not malloc, lock, do IO or panic.**
+/// `buf` is an interleaved f32 slice of `frames * channels` elements (the destination to write into).
 pub const RenderCallback = *const fn (
     buf: []f32,
     frames: u32,
@@ -171,24 +171,24 @@ pub const RenderCallback = *const fn (
     userdata: ?*anyopaque,
 ) void;
 
-/// 要求設定（あくまでヒント）。実効値は `open()` 後に `device.config()` で取得する。
+/// The requested settings (hints only). The effective values are read with `device.config()` after `open()`.
 pub const Config = struct {
     sample_rate: u32 = 48000,
-    buffer_frames: u32 = 512, // 27.1 では未使用（実効フレーム数は callback の frames を正とする）
+    buffer_frames: u32 = 512, // unused (the callback's frames is authoritative for the effective frame count)
     channels: u32 = 2,
     render_callback: RenderCallback,
     userdata: ?*anyopaque = null,
 };
 
-/// `open()` がデバイスから query した実効値。
+/// The effective values `open()` queried from the device.
 pub const EffectiveConfig = struct {
     sample_rate: u32,
     channels: u32,
     max_frames_per_slice: u32,
 };
 
-/// RT スレッドの callback に安定アドレスで渡すための状態。`open()` で heap 確保し
-/// `close()` で破棄する（ローカル変数の参照を refCon に渡さない = UAF 防止）。
+/// The state passed to the real-time thread's callback at a stable address. Heap-allocated by `open()`
+/// and destroyed by `close()` (so no reference to a local is handed to refCon, which prevents a use-after-free).
 const State = struct {
     unit: c.AudioUnit,
     render_callback: RenderCallback,
@@ -217,7 +217,7 @@ pub const AudioDevice = struct {
         }
     }
 
-    /// running なら stop → uninitialize → dispose → State 破棄。途中の失敗でも dispose まで進める。
+    /// When running: stop, then uninitialize, then dispose, then destroy the State. A failure part way still proceeds as far as dispose.
     pub fn close(self: AudioDevice) void {
         const state = self.state;
         if (state.running) {
@@ -231,7 +231,7 @@ pub const AudioDevice = struct {
 };
 
 // ============================================================================
-// RT スレッドで呼ばれる trampoline
+// the trampoline called on the real-time thread
 // ============================================================================
 fn renderTrampoline(
     in_ref_con: ?*anyopaque,
@@ -245,10 +245,10 @@ fn renderTrampoline(
     _ = in_time_stamp;
     _ = in_bus_number;
 
-    // 異常は panic せず guard で弾く（RT スレッドのため）。
+    // Reject anomalies with a guard rather than panicking, this being a real-time thread.
     const state: *State = @ptrCast(@alignCast(in_ref_con orelse return 0));
     const list = io_data orelse return 0;
-    if (list.mNumberBuffers != 1) return 0; // interleaved stereo 前提
+    if (list.mNumberBuffers != 1) return 0; // interleaved stereo is assumed
     const data_ptr = list.mBuffers[0].mData orelse return 0;
 
     const channels = state.effective.channels;
@@ -269,7 +269,7 @@ fn renderTrampoline(
 // open
 // ============================================================================
 pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
-    // 1. Default Output Unit を探してインスタンス化
+    // 1. Find the Default Output Unit and instantiate it
     const desc = c.AudioComponentDescription{
         .componentType = c.kAudioUnitType_Output,
         .componentSubType = c.kAudioUnitSubType_DefaultOutput,
@@ -293,7 +293,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
         .allocator = allocator,
     };
 
-    // 2. StreamFormat (float32 / interleaved stereo) を Input scope, element 0 に設定
+    // 2. Set StreamFormat (float32, interleaved stereo) on the Input scope, element 0
     const asbd = c.AudioStreamBasicDescription{
         .mSampleRate = @floatFromInt(cfg.sample_rate),
         .mFormatID = c.kAudioFormatLinearPCM,
@@ -314,7 +314,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
         @sizeOf(c.AudioStreamBasicDescription),
     ) != 0) return error.ConfigFailed;
 
-    // 3. RenderCallback を Input scope, element 0 に設定（refCon = 安定アドレスの state）
+    // 3. Set RenderCallback on the Input scope, element 0 (refCon = the state, at a stable address)
     const cb = c.AURenderCallbackStruct{
         .inputProc = renderTrampoline,
         .inputProcRefCon = state,
@@ -328,11 +328,11 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
         @sizeOf(c.AURenderCallbackStruct),
     ) != 0) return error.ConfigFailed;
 
-    // 4. Initialize（StreamFormat / RenderCallback 設定の後）
+    // 4. Initialize (after StreamFormat and RenderCallback are set)
     if (c.AudioUnitInitialize(unit) != 0) return error.InitializeFailed;
     errdefer _ = c.AudioUnitUninitialize(unit);
 
-    // 5. 実効値を query（要求値がそのまま通る保証はない）
+    // 5. Query the effective values (there is no guarantee the requested values are accepted as they are)
     var actual = std.mem.zeroes(c.AudioStreamBasicDescription);
     var asbd_size: u32 = @sizeOf(c.AudioStreamBasicDescription);
     if (c.AudioUnitGetProperty(
@@ -365,39 +365,39 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 }
 
 // ============================================================================
-// mic capture（AUHAL input。TASK-49.2。ファイル冒頭のホットパス宣言参照）
+// mic capture (AUHAL input; see the hot path declaration at the head of the file)
 // ============================================================================
 
-/// AVFoundation.framework が公開する `NSString * const AVMediaTypeAudio` 定数
-/// （mic 権限確認は camera と同じ `AVCaptureDevice` クラスを使う。設計文書6章）。
+/// The `NSString * const AVMediaTypeAudio` constant AVFoundation.framework publishes
+/// (checking mic permission uses the same `AVCaptureDevice` class as the camera does; see `docs/capture.md`).
 extern "c" const AVMediaTypeAudio: objc.Id;
 
 pub const capture = struct {
-    /// `kAudioUnitProperty_MaximumFramesPerSlice` の query に失敗した場合のフォールバック上限
-    /// （scratch バッファのサイズ決定用。実用上十分に大きい値）。
+    /// The fallback bound used when querying `kAudioUnitProperty_MaximumFramesPerSlice` fails
+    /// (it sizes the scratch buffer, and is comfortably large enough in practice).
     const MAX_FRAMES_FALLBACK: u32 = 4096;
 
-    /// mic capture callback に渡される `AudioInFrame` を受け取る関数ポインタ型。**RT スレッド
-    /// （CoreAudio 管理）で呼ばれる**: malloc/lock/IO/panic をしてはならない。
+    /// The function pointer type receiving the `AudioInFrame` handed to a mic capture callback. **It is called on a
+    /// real-time thread (managed by CoreAudio)**: it must not malloc, lock, do IO or panic.
     pub const CaptureCallback = *const fn (frame: types.AudioInFrame, userdata: ?*anyopaque) void;
 
-    /// 要求設定（あくまでヒント）。実効値は `open()` 後に `device.config()` で取得する。
+    /// The requested settings (hints only). The effective values are read with `device.config()` after `open()`.
     pub const Config = struct {
-        device_id: ?[]const u8 = null, // MVP 未使用（既定入力デバイス固定）
+        device_id: ?[]const u8 = null, // unused in the MVP (the default input device is fixed)
         sample_rate: u32 = 48000,
         channels: u32 = 1,
         capture_callback: CaptureCallback,
         userdata: ?*anyopaque = null,
     };
 
-    /// `open()` がデバイスから query した実効値。
+    /// The effective values `open()` queried from the device.
     pub const EffectiveConfig = struct {
         sample_rate: u32,
         channels: u32,
         max_frames_per_slice: u32,
     };
 
-    /// RT スレッドの callback に安定アドレスで渡すための状態（出力側 `State` と同型の方針）。
+    /// The state passed to the real-time thread's callback at a stable address (the same approach as the output side's `State`).
     const CState = struct {
         unit: c.AudioUnit,
         capture_callback: CaptureCallback,
@@ -405,7 +405,7 @@ pub const capture = struct {
         effective: capture.EffectiveConfig,
         running: bool,
         allocator: std.mem.Allocator,
-        scratch: []f32, // max_frames_per_slice*channels の interleaved 固定バッファ（open 時のみ確保）
+        scratch: []f32, // the fixed interleaved buffer of max_frames_per_slice*channels (allocated only at open)
     };
 
     pub const CaptureDevice = struct {
@@ -427,7 +427,7 @@ pub const capture = struct {
             }
         }
 
-        /// running なら stop → uninitialize → dispose → scratch 解放 → State 破棄。
+        /// When running: stop, then uninitialize, then dispose, then free the scratch, then destroy the State.
         pub fn close(self: CaptureDevice) void {
             const state = self.state;
             if (state.running) {
@@ -451,9 +451,9 @@ pub const capture = struct {
         };
     }
 
-    /// マイク権限を要求し、確定した状態を返す（ブロッキング）。**未決定(.not_determined)からのみ
-    /// 実際に TCC ダイアログを試みる**（camera 側と同じ判断。自動テストからは呼ばないこと。
-    /// 手動検証レンジ。backlog task-49.2 参照）。
+    /// Requests microphone permission and returns the settled state (blocking). **Only from not_determined does it
+    /// actually attempt the TCC dialogue** (the same judgement as the camera side). Do not call it from an automated
+    /// test; it is for manual verification.
     pub fn requestPermission() types.CaptureError!types.PermissionState {
         const initial = mapAuthStatus(objc.avAuthorizationStatus(AVMediaTypeAudio));
         if (initial != .not_determined) return initial;
@@ -461,9 +461,9 @@ pub const capture = struct {
         return if (granted) .granted else .denied;
     }
 
-    /// 接続中のマイク（入力チャンネルを持つ AudioDevice）を列挙する。
-    /// `kAudioHardwarePropertyDevices` で全 AudioObjectID を取得し、`kAudioDevicePropertyStreams`
-    /// （scope=Input）のサイズで入力capability を判定する（サイズ0=出力専用デバイス）。
+    /// Enumerates the connected microphones (AudioDevices holding an input channel).
+    /// It gets every AudioObjectID with `kAudioHardwarePropertyDevices` and decides the input capability from the size of
+    /// `kAudioDevicePropertyStreams` (scope=Input): a size of 0 means an output-only device.
     pub fn enumerate(allocator: std.mem.Allocator) types.CaptureError![]types.DeviceInfo {
         var devices_addr = c.AudioObjectPropertyAddress{
             .mSelector = c.kAudioHardwarePropertyDevices,
@@ -512,7 +512,7 @@ pub const capture = struct {
             };
             var stream_size: u32 = 0;
             if (c.AudioObjectGetPropertyDataSize(dev_id, &stream_addr, 0, null, &stream_size) != 0) continue;
-            if (stream_size == 0) continue; // 入力ストリーム無し＝出力専用デバイス
+            if (stream_size == 0) continue; // no input stream, so an output-only device
 
             var uid_ref: objc.Id = null;
             var uid_addr = c.AudioObjectPropertyAddress{
@@ -521,8 +521,8 @@ pub const capture = struct {
                 .mElement = c.kAudioObjectPropertyElementMain,
             };
             var uid_size: u32 = @sizeOf(objc.Id);
-            // out_data は ?*anyopaque。&uid_ref は *?*anyopaque（objc.Id=?*anyopaque への addr-of）で
-            // 二重ポインタになり暗黙キャスト不可のため @ptrCast で opaque ポインタへ落とす。
+            // out_data is ?*anyopaque, while &uid_ref is *?*anyopaque (the address-of an objc.Id = ?*anyopaque), which
+            // makes it a double pointer that cannot be cast implicitly, so @ptrCast drops it to an opaque pointer.
             if (c.AudioObjectGetPropertyData(dev_id, &uid_addr, 0, null, &uid_size, @ptrCast(&uid_ref)) != 0) continue;
             defer if (uid_ref) |r| objc.msgSend(void, r, objc.sel("release"), .{});
 
@@ -533,7 +533,7 @@ pub const capture = struct {
                 .mElement = c.kAudioObjectPropertyElementMain,
             };
             var name_size: u32 = @sizeOf(objc.Id);
-            // 同上（&name_ref = *?*anyopaque を @ptrCast で ?*anyopaque へ）。
+            // as above (&name_ref = *?*anyopaque, dropped to ?*anyopaque by @ptrCast).
             if (c.AudioObjectGetPropertyData(dev_id, &name_addr, 0, null, &name_size, @ptrCast(&name_ref)) != 0) continue;
             defer if (name_ref) |r| objc.msgSend(void, r, objc.sel("release"), .{});
 
@@ -549,9 +549,9 @@ pub const capture = struct {
         return list.toOwnedSlice(allocator) catch return error.OpenFailed;
     }
 
-    /// RT スレッド（CoreAudio 管理）で呼ばれる input callback。**malloc/lock/IO/panic 禁止**
-    /// （ファイル冒頭のホットパス宣言）。`AudioUnitRender` で固定確保済み `scratch` へ pull し、
-    /// ユーザー `CaptureCallback` を呼ぶ。
+    /// The input callback, called on a real-time thread (managed by CoreAudio). **No malloc, locking, IO or panic**
+    /// (see the hot path declaration at the head of the file). It pulls into the pre-allocated `scratch` with
+    /// `AudioUnitRender` and calls the user's `CaptureCallback`.
     fn inputTrampoline(
         in_ref_con: ?*anyopaque,
         io_action_flags: ?*anyopaque,
@@ -560,15 +560,15 @@ pub const capture = struct {
         in_number_frames: u32,
         io_data: ?*c.AudioBufferList,
     ) callconv(.c) c.OSStatus {
-        _ = io_data; // input callback では常に null（AudioUnitRender に自前バッファを渡す）
+        _ = io_data; // always null in an input callback (AudioUnitRender is given a buffer of our own)
         const state: *CState = @ptrCast(@alignCast(in_ref_con orelse return 0));
         const channels = state.effective.channels;
         const frames = @min(in_number_frames, state.effective.max_frames_per_slice);
 
-        // `open()` で `max_frames_per_slice*channels*4 <= maxInt(u32)` を検証済み（codex レビュー
-        // 指摘への対応）。`frames <= max_frames_per_slice` なのでこの乗算は u32 のまま安全
-        // （overflow panic の可能性が無いことが open() 時点の検証で保証されている。RT 経路で
-        // 毎回 u64 へ widen する余分な演算も不要）。
+        // `open()` has already checked that `max_frames_per_slice*channels*4 <= maxInt(u32)`.
+        // Since `frames <= max_frames_per_slice`, this multiplication is safe in u32
+        // (open()'s check guarantees no overflow panic is possible, and it also avoids the extra work of
+        // widening to u64 on every pass of the real-time path).
         var buf_list = c.AudioBufferList{
             .mNumberBuffers = 1,
             .mBuffers = .{.{
@@ -586,19 +586,19 @@ pub const capture = struct {
             .frames = frames,
             .channels = channels,
             .sample_rate = state.effective.sample_rate,
-            .timestamp_ns = 0, // MVP: AudioTimeStamp 変換は未実装（フォローアップ）
+            .timestamp_ns = 0, // MVP: converting the AudioTimeStamp is not implemented
         }, state.userdata);
         return 0;
     }
 
-    /// マイクを開く。`cfg.sample_rate`/`channels` のいずれかが 0 の場合は AudioToolbox を一切呼ばず
-    /// `error.ConfigFailed`（自動テスト対象。暴走確保防止）。それ以外の経路（実際に AUHAL を
-    /// 組み立てる）は実デバイス・TCC 権限に依存するため自動テストからは呼ばない
-    /// （手動検証レンジ。backlog task-49.2 参照）。
+    /// Opens the microphone. When either `cfg.sample_rate` or `channels` is 0 it calls no AudioToolbox at all and gives
+    /// `error.ConfigFailed` (this path is automatically tested, and it prevents a runaway allocation). The other path,
+    /// which really does assemble AUHAL, depends on a real device and on TCC permission, so it is not called from an
+    /// automated test; it is for manual verification.
     pub fn open(allocator: std.mem.Allocator, cfg: capture.Config) types.CaptureError!CaptureDevice {
         if (cfg.sample_rate == 0 or cfg.channels == 0) return error.ConfigFailed;
 
-        // 1. AUHAL（'ahal'）component をインスタンス化
+        // 1. Instantiate the AUHAL ('ahal') component
         const desc = c.AudioComponentDescription{
             .componentType = c.kAudioUnitType_Output,
             .componentSubType = c.kAudioUnitSubType_HALOutput,
@@ -611,7 +611,7 @@ pub const capture = struct {
         if (c.AudioComponentInstanceNew(comp, &unit) != 0) return error.OpenFailed;
         errdefer _ = c.AudioComponentInstanceDispose(unit);
 
-        // 2. 入力(element 1)を有効化、出力(element 0)を無効化
+        // 2. Enable the input (element 1) and disable the output (element 0)
         const enable: u32 = 1;
         if (c.AudioUnitSetProperty(unit, c.kAudioOutputUnitProperty_EnableIO, c.kAudioUnitScope_Input, 1, &enable, @sizeOf(u32)) != 0) {
             return error.ConfigFailed;
@@ -621,7 +621,7 @@ pub const capture = struct {
             return error.ConfigFailed;
         }
 
-        // 3. 既定入力デバイスを current device に設定
+        // 3. Set the default input device as the current device
         var default_input: c.AudioObjectID = 0;
         {
             var addr = c.AudioObjectPropertyAddress{
@@ -638,11 +638,11 @@ pub const capture = struct {
             return error.NoDevice;
         }
 
-        // 3.5 ハードウェア入力フォーマット（element 1 の Input scope）を取得し、client 側の sample rate を
-        // これに合わせる。AUHAL input で client(output scope)の SR が実デバイス SR と異なると
-        // AudioUnitRender が毎回 -10863（kAudioUnitErr_CannotDoInCurrentContext）を返す（TASK-49.6 実機で
-        // 判明）。要求 sample_rate はヒントに留め、実効値は HW rate（effective.sample_rate に反映＝
-        // spectrogram の周波数軸も negotiated 値を使う）。channels は要求値のまま（AUHAL が downmix）。
+        // 3.5 Get the hardware input format (the Input scope of element 1) and match the client-side sample rate to
+        // it. With AUHAL input, if the client (output scope) SR differs from the real device SR then
+        // AudioUnitRender returns -10863 (kAudioUnitErr_CannotDoInCurrentContext) every time.
+        // The requested sample_rate therefore stays a hint, and the effective value is the hardware rate (reflected in
+        // effective.sample_rate, so the spectrogram's frequency axis uses the negotiated value too). channels keeps the requested value (AUHAL downmixes).
         var hw_asbd = std.mem.zeroes(c.AudioStreamBasicDescription);
         var hw_size: u32 = @sizeOf(c.AudioStreamBasicDescription);
         if (c.AudioUnitGetProperty(unit, c.kAudioUnitProperty_StreamFormat, c.kAudioUnitScope_Input, 1, &hw_asbd, &hw_size) != 0) {
@@ -650,7 +650,7 @@ pub const capture = struct {
         }
         const client_rate: f64 = if (hw_asbd.mSampleRate > 0) hw_asbd.mSampleRate else @floatFromInt(cfg.sample_rate);
 
-        // 4. クライアント側フォーマット（Float32 interleaved）を入力 element の Output scope に設定
+        // 4. Set the client-side format (Float32 interleaved) on the Output scope of the input element
         const asbd = c.AudioStreamBasicDescription{
             .mSampleRate = client_rate,
             .mFormatID = c.kAudioFormatLinearPCM,
@@ -666,11 +666,11 @@ pub const capture = struct {
             return error.ConfigFailed;
         }
 
-        // 5. State を確保（callback に安定アドレスで渡すため heap 確保）
+        // 5. Allocate the State (on the heap, so the callback gets a stable address)
         const state = allocator.create(CState) catch return error.OpenFailed;
         errdefer allocator.destroy(state);
 
-        // 6. input callback を設定（refCon = state）
+        // 6. Set the input callback (refCon = state)
         const cb = c.AURenderCallbackStruct{
             .inputProc = inputTrampoline,
             .inputProcRefCon = state,
@@ -679,12 +679,12 @@ pub const capture = struct {
             return error.ConfigFailed;
         }
 
-        // 7. Initialize（`types.CaptureError` に InitializeFailed 相当が無いため OpenFailed に丸める。
-        // 設計文書4.4「allocator 失敗を含む一般失敗」と同じ変換規約を Initialize/Query 失敗にも適用）。
+        // 7. Initialize (`types.CaptureError` has nothing corresponding to InitializeFailed, so it is folded into OpenFailed.
+        // The same conversion convention as "a general failure including an allocator failure" in `docs/capture.md` is applied to an Initialize or Query failure too).
         if (c.AudioUnitInitialize(unit) != 0) return error.OpenFailed;
         errdefer _ = c.AudioUnitUninitialize(unit);
 
-        // 8. 実効値を query（同上、QueryFailed 相当が無いため OpenFailed に丸める）
+        // 8. Query the effective values (as above, folded into OpenFailed for want of anything like QueryFailed)
         var actual = std.mem.zeroes(c.AudioStreamBasicDescription);
         var asbd_size: u32 = @sizeOf(c.AudioStreamBasicDescription);
         if (c.AudioUnitGetProperty(unit, c.kAudioUnitProperty_StreamFormat, c.kAudioUnitScope_Output, 1, &actual, &asbd_size) != 0) {
@@ -701,11 +701,11 @@ pub const capture = struct {
             .channels = actual.mChannelsPerFrame,
             .max_frames_per_slice = max_frames,
         };
-        // RT 契約の補強（codex レビュー指摘）: `max_frames_per_slice*channels*4` が u32 に収まる
-        // ことを open() 側で一度だけ検証しておく。これにより inputTrampoline（RT callback）内の
-        // `frames*channels*4`（frames<=max_frames_per_slice なのでこの上限で抑えられる）は
-        // 検証済みの範囲に収まることが保証され、u32 のまま演算しても overflow panic が起きない
-        // （callback 内で毎回 u64 へ widen する余分な演算も不要になる）。
+        // Reinforcing the real-time contract: check once, in open(), that `max_frames_per_slice*channels*4` fits in u32.
+        // That guarantees the `frames*channels*4` inside inputTrampoline (the real-time callback) stays within the
+        // checked range, since frames <= max_frames_per_slice bounds it, so the arithmetic cannot
+        // overflow-panic while staying in u32
+        // (and it saves widening to u64 on every callback).
         const max_byte_size: u64 = @as(u64, max_frames) * @as(u64, effective.channels) * 4;
         if (max_byte_size > std.math.maxInt(u32)) return error.ConfigFailed;
         const scratch = allocator.alloc(f32, @as(usize, max_frames) * @as(usize, effective.channels)) catch return error.OpenFailed;
@@ -726,11 +726,11 @@ pub const capture = struct {
 };
 
 // ========================================================================
-// tests（display/実デバイス不要・OS 非依存の範囲のみ自動実行。手動テストは末尾）
+// tests (only the range needing no display or real device runs automatically; the manual tests are at the end)
 // ========================================================================
 const testing = std.testing;
 
-test "mapAuthStatus: AVAuthorizationStatus の4値を正しく写像する" {
+test "mapAuthStatus: it maps AVAuthorizationStatus's four values correctly" {
     try testing.expectEqual(types.PermissionState.not_determined, capture.mapAuthStatus(0));
     try testing.expectEqual(types.PermissionState.restricted, capture.mapAuthStatus(1));
     try testing.expectEqual(types.PermissionState.denied, capture.mapAuthStatus(2));
@@ -743,21 +743,21 @@ fn noopCaptureCallback(frame: types.AudioInFrame, userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-test "open: sample_rate/channels=0 は AudioToolbox を呼ばず ConfigFailed" {
+test "open: a sample_rate or channels of 0 gives ConfigFailed without calling AudioToolbox" {
     try testing.expectError(error.ConfigFailed, capture.open(testing.allocator, .{ .sample_rate = 0, .capture_callback = noopCaptureCallback }));
     try testing.expectError(error.ConfigFailed, capture.open(testing.allocator, .{ .channels = 0, .capture_callback = noopCaptureCallback }));
 }
 
-test "capture.enumerate は compile 検証する（実デバイスに触れるため run しない・compile-only 参照）" {
-    // enumerate は CoreAudio 実 API を叩くため自動 run できないが、参照が無いと Zig の lazy analysis で
-    // 一切コンパイルされず型エラーが潜在化する（実際 TASK-49.2 は AudioObjectGetPropertyData の
-    // 二重ポインタ引数型エラーを未コンパイルのまま抱えていた）。関数ポインタを取ってコンパイルを強制する。
+test "capture.enumerate is checked at compile time (it touches a real device so it is not run; a compile-only reference)" {
+    // enumerate drives the real CoreAudio API and so cannot be run automatically, but without a reference Zig's lazy
+    // analysis never compiles it at all and a type error stays latent (the double-pointer argument type of
+    // AudioObjectGetPropertyData really was carried uncompiled for a while). Taking a function pointer forces the compile.
     _ = &capture.enumerate;
 }
 
 // ========================================================================
-// 手動検証専用テスト（既定は SkipZigTest。実機で `VP_MANUAL_CAPTURE_TEST=1` を指定した時のみ
-// 実マイクを開く。TCC ダイアログ・実デバイスに触れるため自動テストには含めない）
+// Tests for manual verification only (SkipZigTest by default; a real microphone is opened only when
+// `VP_MANUAL_CAPTURE_TEST=1` is set on real hardware. They touch the TCC dialogue and a real device, so they are not in the automated tests).
 // ========================================================================
 fn sleepMs(ms: u64) void {
     var req = std.c.timespec{
@@ -777,7 +777,7 @@ fn manualCountingCallback(frame: types.AudioInFrame, userdata: ?*anyopaque) void
     _ = ctx.count.fetchAdd(1, .monotonic);
 }
 
-test "[MANUAL] 実マイクを開いて callback が実際に呼ばれるか確認する（VP_MANUAL_CAPTURE_TEST=1 でのみ実行）" {
+test "[MANUAL] open a real microphone and confirm the callback really is called (runs only with VP_MANUAL_CAPTURE_TEST=1)" {
     if (std.c.getenv("VP_MANUAL_CAPTURE_TEST") == null) return error.SkipZigTest;
     const allocator = testing.allocator;
 

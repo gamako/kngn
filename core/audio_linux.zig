@@ -1,28 +1,28 @@
-//! Linux native audio backend (L1 オーディオ出力プリミティブ)
+//! Linux native audio backend (an L1 audio output primitive)
 //!
-//! ALSA (libasound) を C ABI で叩き、自前の再生スレッドから render callback を呼んで
-//! サンプルを供給する最小の出力デバイスを提供する。AudioToolbox backend と同様に
-//! `@cImport` は使わず、必要な ALSA シンボルだけを `extern "c"` 宣言する
-//! （audio 層の ABI 戦略を macOS/Linux/Windows で extern fn に統一するため）。
+//! It drives ALSA (libasound) through the C ABI and provides a minimal output device that supplies
+//! samples by calling the render callback from a playback thread of its own. As with the AudioToolbox backend,
+//! `@cImport` is not used and only the ALSA symbols actually needed are declared `extern "c"`
+//! (so that the audio layer's ABI strategy is extern fn on macOS, Linux and Windows alike).
 //!
-//! スレッドモデル: CoreAudio は OS が RT スレッドで callback を pull するが、ALSA は push。
-//! 本 backend は `start()` で再生スレッド (`std.Thread`) を spawn し、`snd_pcm_writei` ループの
-//! 中から `render_callback` を呼ぶ。`render_callback` の実行区間では malloc / lock / IO / panic を
-//! してはならない（呼び出し側 API 契約。macOS backend と同じ）。`snd_pcm_writei` /
-//! `snd_pcm_recover` / `snd_pcm_drop` は callback の外の backend I/O であり契約対象外
-//! （ブロッキング I/O 可）。
+//! The thread model: CoreAudio has the OS pull the callback on a real-time thread, whereas ALSA pushes.
+//! This backend spawns a playback thread (`std.Thread`) in `start()` and calls `render_callback` from inside
+//! a `snd_pcm_writei` loop. Within `render_callback`'s region, malloc, locking, IO and panic are
+//! forbidden (the caller's API contract, as on the macOS backend). `snd_pcm_writei`,
+//! `snd_pcm_recover` and `snd_pcm_drop` are backend IO outside the callback and are not bound by the contract
+//! (they may block).
 //!
-//! mic capture は末尾の `capture` 名前空間で提供する。ALSA→PipeWire ブリッジを使うには、
-//! `/dev/snd/*` の `audio` グループ権限と、PipeWire の ALSA plugin と libasound の整合が必要。
-//! capture スレッドは `snd_pcm_readi` で pull し、overrun（`-EPIPE`）を xrun として計数する。
-//! callback 区間は RT 契約（malloc/lock/IO/panic 禁止）であり、read/recover は backend I/O として
-//! callback の外側にある。
+//! mic capture is provided by the `capture` namespace at the end. Using the ALSA→PipeWire bridge needs
+//! `audio` group permission on `/dev/snd/*`, and libasound to be consistent with PipeWire's ALSA plugin
+//! (the prerequisites are in `docs/audio-and-synth.md`). The capture thread pulls with `snd_pcm_readi` and counts an
+//! overrun (`-EPIPE`) as an xrun. The callback region is under the real-time contract (no malloc, locking, IO or panic),
+//! while read and recover sit outside the callback as backend IO.
 
 const std = @import("std");
 const types = @import("capture_types");
 
 // ============================================================================
-// ALSA C ABI (最小サブセット, extern fn / @cImport 不使用)
+// the ALSA C ABI (a minimal subset, extern fn, no @cImport)
 // ============================================================================
 const c = struct {
     pub const snd_pcm_t = opaque {};
@@ -39,7 +39,7 @@ const c = struct {
     pub const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
     // snd_pcm_format_t
     pub const SND_PCM_FORMAT_FLOAT_LE: c_int = 14;
-    // errno（Linux）。snd_pcm_writei は負の errno を返す。-EPIPE = underrun。
+    // errno on Linux. snd_pcm_writei returns a negative errno, and -EPIPE means underrun.
     pub const EPIPE: c_int = 32;
 
     pub extern "c" fn snd_pcm_open(pcm: *?*snd_pcm_t, name: [*:0]const u8, stream: c_int, mode: c_int) c_int;
@@ -76,20 +76,20 @@ const c = struct {
 };
 
 // ============================================================================
-// 公開型（audio_macos.zig と同一シグネチャ。facade が OS で切り替える）
+// the public types (the same signature as audio_macos.zig; the facade switches on the OS)
 // ============================================================================
 
 pub const Error = error{
-    OpenFailed, // インスタンス生成 / 状態確保失敗
-    NoDevice, // 出力デバイス (snd_pcm_open) が開けない
-    ConfigFailed, // hw_params 設定失敗
-    InitializeFailed, // hw_params commit 失敗
-    QueryFailed, // 実効値 query 失敗
-    StartFailed, // prepare / 再生スレッド spawn 失敗
+    OpenFailed, // failed to create the instance or to allocate the state
+    NoDevice, // the output device cannot be opened (snd_pcm_open)
+    ConfigFailed, // failed to set hw_params
+    InitializeFailed, // failed to commit hw_params
+    QueryFailed, // failed to query the effective values
+    StartFailed, // failed to prepare, or to spawn the playback thread
 };
 
-/// `RenderCallback` は再生スレッドで呼ばれる。**malloc / lock / IO / panic をしてはならない**。
-/// `buf` は interleaved な `frames * channels` 要素の f32 スライス（書き込み先）。
+/// `RenderCallback` is called on the playback thread. **It must not malloc, lock, do IO or panic.**
+/// `buf` is an interleaved f32 slice of `frames * channels` elements (the destination to write into).
 pub const RenderCallback = *const fn (
     buf: []f32,
     frames: u32,
@@ -98,24 +98,24 @@ pub const RenderCallback = *const fn (
     userdata: ?*anyopaque,
 ) void;
 
-/// 要求設定（あくまでヒント）。実効値は `open()` 後に `device.config()` で取得する。
+/// The requested settings (hints only). The effective values are read with `device.config()` after `open()`.
 pub const Config = struct {
     sample_rate: u32 = 48000,
-    buffer_frames: u32 = 512, // ALSA では period size のヒントに使う
+    buffer_frames: u32 = 512, // used as the period size hint on ALSA
     channels: u32 = 2,
     render_callback: RenderCallback,
     userdata: ?*anyopaque = null,
 };
 
-/// `open()` がデバイスから query した実効値。
+/// The effective values `open()` queried from the device.
 pub const EffectiveConfig = struct {
     sample_rate: u32,
     channels: u32,
-    max_frames_per_slice: u32, // ALSA の period size（1 回の render で埋める frame 数）
+    max_frames_per_slice: u32, // ALSA's period size (how many frames one render fills)
 };
 
-/// 再生スレッド / callback に安定アドレスで渡すための状態。`open()` で heap 確保し
-/// `close()` で破棄する（ローカル変数の参照を渡さない = UAF 防止）。
+/// The state passed to the playback thread and the callback at a stable address. Heap-allocated by `open()`
+/// and destroyed by `close()` (no reference to a local is passed, which prevents a use-after-free).
 const State = struct {
     pcm: *c.snd_pcm_t,
     render_callback: RenderCallback,
@@ -123,7 +123,7 @@ const State = struct {
     effective: EffectiveConfig,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
-    scratch: []f32, // period * channels の interleaved バッファ
+    scratch: []f32, // the interleaved buffer of period * channels
     xrun_count: std.atomic.Value(u32),
     allocator: std.mem.Allocator,
 };
@@ -135,12 +135,12 @@ pub const AudioDevice = struct {
         return self.state.effective;
     }
 
-    /// 再生スレッドを起動する。初期化失敗（prepare / spawn）は `error.StartFailed`。
-    /// prepare を spawn 前に行い、失敗を `start()` の戻り値に寄せる
-    /// （macOS の `AudioOutputUnitStart` 失敗 → `StartFailed` と対称）。
+    /// Starts the playback thread. A failed initialisation (prepare or spawn) gives `error.StartFailed`.
+    /// prepare happens before the spawn so that a failure lands in `start()`'s return value
+    /// (symmetrically with macOS's failed `AudioOutputUnitStart` giving `StartFailed`).
     pub fn start(self: AudioDevice) Error!void {
         const state = self.state;
-        if (state.thread != null) return; // 二重 start は無視
+        if (state.thread != null) return; // a double start is ignored
         if (c.snd_pcm_prepare(state.pcm) < 0) return error.StartFailed;
         state.running.store(true, .release);
         state.thread = std.Thread.spawn(.{}, renderThread, .{state}) catch {
@@ -149,8 +149,8 @@ pub const AudioDevice = struct {
         };
     }
 
-    /// 再生スレッドを止める。`running=false` → join → `snd_pcm_drop`（即時停止）。
-    /// join は in-flight の writei 完了待ちになるため停止レイテンシは最大 1 period 程度。
+    /// Stops the playback thread: `running=false`, then join, then `snd_pcm_drop` (an immediate stop).
+    /// The join waits for an in-flight writei to finish, so the stop latency is at most about one period.
     pub fn stop(self: AudioDevice) void {
         const state = self.state;
         if (state.thread) |thread| {
@@ -161,7 +161,7 @@ pub const AudioDevice = struct {
         }
     }
 
-    /// stop → close → scratch 解放 → State 破棄。
+    /// stop, then close, then free the scratch, then destroy the State.
     pub fn close(self: AudioDevice) void {
         const state = self.state;
         self.stop();
@@ -172,7 +172,7 @@ pub const AudioDevice = struct {
 };
 
 // ============================================================================
-// 再生スレッド（push モデル: writei ループから render_callback を pull）
+// the playback thread (a push model: the writei loop pulls render_callback)
 // ============================================================================
 fn renderThread(state: *State) void {
     const ch: usize = state.effective.channels;
@@ -180,7 +180,7 @@ fn renderThread(state: *State) void {
     const sample_rate = state.effective.sample_rate;
 
     while (state.running.load(.acquire)) {
-        // 1 period 分を埋める（RT 契約区間: alloc/lock/IO/panic 禁止）。
+        // Fill one period's worth (the real-time contract region: no alloc, lock, IO or panic).
         state.render_callback(
             state.scratch,
             @intCast(period),
@@ -189,22 +189,22 @@ fn renderThread(state: *State) void {
             state.userdata,
         );
 
-        // period frames を書き切る（partial write 対応: 残りを書き切るまで次の render を呼ばない）。
+        // Write the whole period out (handling a partial write: the next render is not called until the rest is written).
         var offset: usize = 0;
         while (offset < period) {
             const frames = period - offset;
             const ptr: *const anyopaque = @ptrCast(state.scratch.ptr + offset * ch);
             const n = c.snd_pcm_writei(state.pcm, ptr, @intCast(frames));
             if (n < 0) {
-                // 実際の戻り値をそのまま recover に渡し、-EPIPE/-ESTRPIPE/-EINTR を一律処理する。
+                // Pass the actual return value straight to recover, which handles -EPIPE, -ESTRPIPE and -EINTR uniformly.
                 const err: c_int = @intCast(n);
-                if (err == -c.EPIPE) _ = state.xrun_count.fetchAdd(1, .monotonic); // underrun のみ計数
+                if (err == -c.EPIPE) _ = state.xrun_count.fetchAdd(1, .monotonic); // only an underrun is counted
                 if (c.snd_pcm_recover(state.pcm, err, 1) < 0) {
-                    state.running.store(false, .release); // 回復不能ならループ終了
+                    state.running.store(false, .release); // end the loop when it cannot be recovered
                 }
-                break; // 当該 period は破棄（再送しない）。次 period から再開
+                break; // this period is discarded (never resent), and it resumes from the next one
             }
-            if (n == 0) break; // 進捗ゼロ（busy-loop 防止）: 当該 period を破棄して次 period へ
+            if (n == 0) break; // zero progress (which prevents a busy loop): discard this period and move to the next
             offset += @intCast(n);
         }
     }
@@ -214,13 +214,13 @@ fn renderThread(state: *State) void {
 // open
 // ============================================================================
 pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
-    // 1. デフォルト PCM を playback / blocking で開く
+    // 1. Open the default PCM for playback, blocking
     var pcm: ?*c.snd_pcm_t = null;
     if (c.snd_pcm_open(&pcm, "default", c.SND_PCM_STREAM_PLAYBACK, 0) < 0) return error.NoDevice;
     const handle = pcm orelse return error.NoDevice;
     errdefer _ = c.snd_pcm_close(handle);
 
-    // 2. hw_params を設定（alloca マクロは translate-c 不可なので malloc/free を使う。open 時のみ）
+    // 2. Set hw_params (the alloca macro cannot be translated by translate-c, so malloc and free are used; only at open)
     var params: ?*c.snd_pcm_hw_params_t = null;
     if (c.snd_pcm_hw_params_malloc(&params) < 0) return error.OpenFailed;
     const hw = params orelse return error.OpenFailed;
@@ -239,13 +239,13 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     dir = 0;
     if (c.snd_pcm_hw_params_set_period_size_near(handle, hw, &period, &dir) < 0) return error.ConfigFailed;
 
-    // buffer は数 period 分（latency と underrun 耐性のバランス）。near なのでデバイス都合で丸まる。
+    // The buffer is several periods (balancing latency against underrun tolerance). Being "near", it is rounded to suit the device.
     var buffer_size: c.snd_pcm_uframes_t = period * 4;
     if (c.snd_pcm_hw_params_set_buffer_size_near(handle, hw, &buffer_size) < 0) return error.ConfigFailed;
 
     if (c.snd_pcm_hw_params(handle, hw) < 0) return error.InitializeFailed;
 
-    // 3. 実効値を query（要求値がそのまま通る保証はない = macOS と同契約）
+    // 3. Query the effective values (there is no guarantee the requested values are accepted, the same contract as macOS)
     var actual_rate: c_uint = 0;
     dir = 0;
     if (c.snd_pcm_hw_params_get_rate(hw, &actual_rate, &dir) < 0) return error.QueryFailed;
@@ -261,7 +261,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
         .max_frames_per_slice = @intCast(actual_period),
     };
 
-    // 4. State と scratch を heap 確保（安定アドレス）
+    // 4. Heap-allocate the State and the scratch (at a stable address)
     const state = allocator.create(State) catch return error.OpenFailed;
     errdefer allocator.destroy(state);
 
@@ -294,7 +294,7 @@ pub const capture = struct {
     pub const CaptureCallback = *const fn (frame: types.AudioInFrame, userdata: ?*anyopaque) void;
 
     pub const Config = struct {
-        device_id: ?[]const u8 = null, // MVP は default PCM 固定。列挙 id は将来の選択経路用。
+        device_id: ?[]const u8 = null, // The MVP is fixed to the default PCM. The enumerated ids are for a future selection path.
         sample_rate: u32 = 48000,
         channels: u32 = 1,
         capture_callback: CaptureCallback,
@@ -338,7 +338,7 @@ pub const capture = struct {
             };
         }
 
-        /// `running=false` を先に公開し、`snd_pcm_drop` で blocking readi を解除してから join する。
+        /// It publishes `running=false` first, releases the blocking readi with `snd_pcm_drop`, and only then joins.
         pub fn stop(self: CaptureDevice) void {
             const state = self.state;
             if (state.thread) |thread| {
@@ -358,7 +358,7 @@ pub const capture = struct {
         }
     };
 
-    /// ALSA カードを列挙する。MVP では入力 capability の厳密判定をせず、存在するカードを返す。
+    /// Enumerates the ALSA cards. The MVP does not decide the input capability strictly and returns whichever cards exist.
     pub fn enumerate(allocator: std.mem.Allocator) types.CaptureError![]types.DeviceInfo {
         var list: std.ArrayList(types.DeviceInfo) = .empty;
         errdefer {
@@ -404,7 +404,7 @@ pub const capture = struct {
         return list.toOwnedSlice(allocator) catch return error.OpenFailed;
     }
 
-    /// Linux には TCC ダイアログが無いため、default PCM の trial-open で権限だけを判定する。
+    /// Linux has no TCC dialogue, so permission alone is decided by a trial open of the default PCM.
     pub fn requestPermission() types.CaptureError!types.PermissionState {
         var pcm: ?*c.snd_pcm_t = null;
         const rc = c.snd_pcm_open(&pcm, "default", c.SND_PCM_STREAM_CAPTURE, 0);
@@ -502,23 +502,23 @@ fn noopCaptureCallback(frame: types.AudioInFrame, userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-/// 手動フルサイクルテスト用 callback（RT スレッドで呼ばれる。userdata=受信 frame 数の atomic）。
+/// The callback for the manual full-cycle test (called on a real-time thread; userdata is an atomic count of received frames).
 fn smokeMicCallback(frame: types.AudioInFrame, userdata: ?*anyopaque) void {
     const counter: *std.atomic.Value(u64) = @ptrCast(@alignCast(userdata.?));
     _ = counter.fetchAdd(frame.frames, .monotonic);
 }
 
-test "capture.open: sample_rate/channels=0 は ALSA を呼ばず ConfigFailed" {
+test "capture.open: a sample_rate or channels of 0 gives ConfigFailed without calling ALSA" {
     try testing.expectError(error.ConfigFailed, capture.open(testing.allocator, .{ .sample_rate = 0, .capture_callback = noopCaptureCallback }));
     try testing.expectError(error.ConfigFailed, capture.open(testing.allocator, .{ .channels = 0, .capture_callback = noopCaptureCallback }));
 }
 
-test "capture.enumerate/requestPermission: 実 ALSA を呼んでもクラッシュ/ハングせず妥当な結果を返す" {
-    // カード有無は環境依存なので台数は assert しない。snd_card_next / snd_ctl_open("hw:N") は
-    // 即時で PipeWire を介さないためハングしない。id/name の allocator 契約も同時に検証する。
+test "capture.enumerate and requestPermission: calling the real ALSA neither crashes nor hangs, and returns a sensible result" {
+    // The number of cards depends on the environment, so the count is not asserted. snd_card_next and snd_ctl_open("hw:N")
+    // return immediately and do not go through PipeWire, so they cannot hang. The allocator contract for id and name is checked at the same time.
     const devices = try capture.enumerate(testing.allocator);
     defer types.freeDeviceList(testing.allocator, devices);
-    // requestPermission は default PCH の trial-open。PipeWire ブリッジ経由でも open は即返る。
+    // requestPermission is a trial open of the default PCH. Even through the PipeWire bridge, the open returns at once.
     const perm = try capture.requestPermission();
     try testing.expect(perm == .granted or perm == .denied or perm == .not_determined);
     if (std.c.getenv("VP_CAPTURE_SMOKE") != null) {
@@ -528,14 +528,14 @@ test "capture.enumerate/requestPermission: 実 ALSA を呼んでもクラッシ�
     }
 }
 
-// 手動検証専用（既定 SkipZigTest。実マイクを掴むため VP_CAPTURE_FULL_SMOKE=1 の時のみ実行）。
-// open→start→capture callback→stop→close の全サイクルと、stop() の snd_pcm_drop が blocking readi を
-// unblock して join できるかを実機で確認する。デバイス/PipeWire 不在は best-effort で許容。
-test "capture full cycle (manual): open→start→callback→stop→close が実マイクでハングせず回る" {
+// For manual verification only (SkipZigTest by default; it runs only with VP_CAPTURE_FULL_SMOKE=1, since it takes a real microphone).
+// It checks on real hardware the whole cycle of open, start, the capture callback, stop and close, and whether stop()'s
+// snd_pcm_drop unblocks the blocking readi so that the join completes. A missing device or PipeWire is tolerated best-effort.
+test "capture full cycle (manual): open, start, the callback, stop and close go round on a real microphone without hanging" {
     if (std.c.getenv("VP_CAPTURE_FULL_SMOKE") == null) return error.SkipZigTest;
     var frames: std.atomic.Value(u64) = .init(0);
     var dev = capture.open(testing.allocator, .{ .sample_rate = 48000, .channels = 1, .capture_callback = smokeMicCallback, .userdata = &frames }) catch |err| {
-        std.debug.print("[alsa full] open failed: {s}（best-effort: sink/PipeWire 不在で許容）\n", .{@errorName(err)});
+        std.debug.print("[alsa full] open failed: {s} (best-effort: a missing sink or PipeWire is tolerated)\n", .{@errorName(err)});
         return;
     };
     defer dev.close();
@@ -548,6 +548,6 @@ test "capture full cycle (manual): open→start→callback→stop→close が実
         _ = std.c.nanosleep(&req, null);
     }
     std.debug.print("[alsa full] frames captured: {d}\n", .{frames.load(.monotonic)});
-    dev.stop(); // ← snd_pcm_drop で blocking readi を unblock → join。ハングしないことが主眼。
-    std.debug.print("[alsa full] stop/close ok（snd_pcm_drop が readi を unblock した）\n", .{});
+    dev.stop(); // snd_pcm_drop unblocks the blocking readi so the join completes. Not hanging is the point.
+    std.debug.print("[alsa full] stop/close ok (snd_pcm_drop unblocked readi)\n", .{});
 }

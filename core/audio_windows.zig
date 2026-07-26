@@ -1,19 +1,19 @@
-//! Windows native audio backend (L1 オーディオ出力プリミティブ)
+//! Windows native audio backend (an L1 audio output primitive)
 //!
-//! WASAPI (Core Audio APIs) を COM で叩き、自前の再生スレッドから render callback を呼んで
-//! サンプルを供給する最小の出力デバイスを提供する。macOS/Linux backend と同様に `@cImport` は
-//! 使わず、必要な COM インターフェース（vtable）/ 関数 / GUID を自前で `extern` 宣言する
-//! （audio 層の ABI 戦略を extern fn に統一するため）。
+//! It drives WASAPI (the Core Audio APIs) through COM and provides a minimal output device that supplies
+//! samples by calling the render callback from a playback thread of its own. As with the macOS and Linux backends,
+//! `@cImport` is not used and the COM interfaces (vtables), functions and GUIDs needed are declared `extern` here
+//! (so that the audio layer's ABI strategy is extern fn throughout).
 //!
-//! スレッドモデル: ALSA backend と同じ push モデル。`start()` で再生スレッド (`std.Thread`) を spawn し、
-//! 共有モード・イベント駆動 (AUDCLNT_STREAMFLAGS_EVENTCALLBACK) で「バッファ空き」イベントを待ち、
-//! `IAudioRenderClient::GetBuffer` で得たバッファに `render_callback` で直接書き込む。
-//! `render_callback` の実行区間では malloc / lock / IO / panic をしてはならない（macOS/Linux と同契約）。
-//! GetBuffer/ReleaseBuffer/WaitForSingleObject は callback の外の backend I/O であり契約対象外。
+//! The thread model: the same push model as the ALSA backend. `start()` spawns a playback thread (`std.Thread`), which
+//! waits on a "buffer has room" event in shared, event-driven mode (AUDCLNT_STREAMFLAGS_EVENTCALLBACK) and has
+//! `render_callback` write straight into the buffer obtained from `IAudioRenderClient::GetBuffer`.
+//! Within `render_callback`'s region, malloc, locking, IO and panic are forbidden (the same contract as macOS and Linux).
+//! GetBuffer, ReleaseBuffer and WaitForSingleObject are backend IO outside the callback and are not bound by the contract.
 //!
-//! フォーマット: 共有モードは engine の mix format に従う。現代の Windows は 32bit float なので
-//! それを直接使う（render_callback の f32 をそのまま WASAPI バッファへ書く＝中間コピー無し）。
-//! float 以外の mix format は ConfigFailed（変換層は将来対応）。
+//! The format: shared mode follows the engine's mix format. A modern Windows uses 32-bit float, so that is
+//! used directly (render_callback's f32 goes straight into the WASAPI buffer, with no intermediate copy).
+//! A mix format other than float gives ConfigFailed (a conversion layer is future work).
 
 const std = @import("std");
 const win = std.os.windows;
@@ -28,7 +28,7 @@ inline fn SUCCEEDED(hr: HRESULT) bool {
 }
 
 // ============================================================================
-// GUID と定数
+// the GUIDs and constants
 // ============================================================================
 const GUID = extern struct {
     Data1: u32,
@@ -74,10 +74,10 @@ const WAVEFORMATEX = extern struct {
     cbSize: u16,
 };
 
-// 注: Win32 の WAVEFORMATEX/WAVEFORMATEXTENSIBLE は pack(1)。WAVEFORMATEX(18B) を素直に embed すると
-// Zig の extern struct が align4 で末尾を 20B に padding し SubFormat のオフセット(本来 24)がズレる。
-// 全フィールドをフラットに並べると自然整列のまま padding 無しで正しいオフセット(Samples@18 /
-// dwChannelMask@20 / SubFormat@24, 計 40B)になるので、embed せずフラットに定義する。
+// Note: Win32's WAVEFORMATEX and WAVEFORMATEXTENSIBLE are pack(1). Embedding WAVEFORMATEX (18B) naively makes
+// Zig's extern struct align to 4 and pad the tail to 20B, which shifts SubFormat's offset (properly 24).
+// Laying every field out flat keeps the natural alignment with no padding and gives the correct offsets (Samples@18,
+// dwChannelMask@20, SubFormat@24, 40B in total), so it is defined flat rather than embedded.
 const WAVEFORMATEXTENSIBLE = extern struct {
     wFormatTag: u16,
     nChannels: u16,
@@ -92,7 +92,7 @@ const WAVEFORMATEXTENSIBLE = extern struct {
 };
 
 comptime {
-    // pack(1) 相当の正しいオフセットになっていることを保証（ズレると float 判定が壊れる）。
+    // Guarantee the offsets are the ones pack(1) would give (a shift would break the float test).
     std.debug.assert(@offsetOf(WAVEFORMATEXTENSIBLE, "dwChannelMask") == 20);
     std.debug.assert(@offsetOf(WAVEFORMATEXTENSIBLE, "SubFormat") == 24);
 }
@@ -101,7 +101,7 @@ fn isFloat32(wf: *const WAVEFORMATEX) bool {
     if (wf.wBitsPerSample != 32) return false;
     if (wf.wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
     if (wf.wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        if (wf.cbSize < 22) return false; // 拡張部(dwChannelMask/SubFormat)の無い WAVEFORMATEX を誤読しない
+        if (wf.cbSize < 22) return false; // so that a WAVEFORMATEX with no extension part (dwChannelMask, SubFormat) is not misread
         const ext: *const WAVEFORMATEXTENSIBLE = @ptrCast(@alignCast(wf));
         return guidEql(&ext.SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
     }
@@ -109,7 +109,7 @@ fn isFloat32(wf: *const WAVEFORMATEX) bool {
 }
 
 // ============================================================================
-// COM インターフェース（vtable）。未使用メソッドは layout 維持のため *const anyopaque スロットにする。
+// The COM interfaces (vtables). An unused method is a *const anyopaque slot, to preserve the layout.
 // ============================================================================
 const IMMDeviceEnumerator = extern struct {
     vtbl: *const Vtbl,
@@ -171,7 +171,7 @@ const IAudioRenderClient = extern struct {
 };
 
 // ============================================================================
-// extern 関数（ole32 / kernel32）
+// the extern functions (ole32 and kernel32)
 // ============================================================================
 extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.winapi) HRESULT;
 extern "ole32" fn CoUninitialize() callconv(.winapi) void;
@@ -184,20 +184,20 @@ extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) i32;
 
 // ============================================================================
-// 公開型（audio_macos.zig / audio_linux.zig と同一シグネチャ。facade が OS で切り替える）
+// the public types (the same signature as audio_macos.zig and audio_linux.zig; the facade switches on the OS)
 // ============================================================================
 
 pub const Error = error{
-    OpenFailed, // COM 初期化 / インスタンス生成 / 状態確保失敗
-    NoDevice, // 既定出力デバイスが取得できない
-    ConfigFailed, // mix format 取得 / float 非対応
-    InitializeFailed, // IAudioClient::Initialize 失敗
-    QueryFailed, // GetBufferSize / GetService 失敗
-    StartFailed, // Start / 再生スレッド spawn 失敗
+    OpenFailed, // failed to initialise COM, to create the instance, or to allocate the state
+    NoDevice, // the default output device cannot be obtained
+    ConfigFailed, // failed to get the mix format, or it is not float
+    InitializeFailed, // IAudioClient::Initialize failed
+    QueryFailed, // GetBufferSize or GetService failed
+    StartFailed, // failed to Start, or to spawn the playback thread
 };
 
-/// `RenderCallback` は再生スレッドで呼ばれる。**malloc / lock / IO / panic をしてはならない**。
-/// `buf` は interleaved な `frames * channels` 要素の f32 スライス（書き込み先）。
+/// `RenderCallback` is called on the playback thread. **It must not malloc, lock, do IO or panic.**
+/// `buf` is an interleaved f32 slice of `frames * channels` elements (the destination to write into).
 pub const RenderCallback = *const fn (
     buf: []f32,
     frames: u32,
@@ -206,23 +206,23 @@ pub const RenderCallback = *const fn (
     userdata: ?*anyopaque,
 ) void;
 
-/// 要求設定（あくまでヒント）。共有モードは mix format に従うため sample_rate/channels は実効値が優先。
+/// The requested settings (hints only). Shared mode follows the mix format, so the effective sample_rate and channels win.
 pub const Config = struct {
     sample_rate: u32 = 48000,
-    buffer_frames: u32 = 512, // WASAPI 共有モードでは engine 既定 period に従うため未使用
+    buffer_frames: u32 = 512, // unused, shared mode following the engine's default period
     channels: u32 = 2,
     render_callback: RenderCallback,
     userdata: ?*anyopaque = null,
 };
 
-/// `open()` がデバイスから query した実効値。
+/// The effective values `open()` queried from the device.
 pub const EffectiveConfig = struct {
     sample_rate: u32,
     channels: u32,
-    max_frames_per_slice: u32, // WASAPI バッファの frame 数（1 回の render で埋めうる最大）
+    max_frames_per_slice: u32, // the WASAPI buffer's frame count (the most one render can fill)
 };
 
-/// 再生スレッド / callback に安定アドレスで渡すための状態。`open()` で heap 確保し `close()` で破棄する。
+/// The state passed to the playback thread and the callback at a stable address. Heap-allocated by `open()` and destroyed by `close()`.
 const State = struct {
     client: *IAudioClient,
     render: *IAudioRenderClient,
@@ -233,7 +233,7 @@ const State = struct {
     effective: EffectiveConfig,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
-    co_initialized: bool, // open スレッドで CoInitializeEx が成功したか（close で釣り合わせる）
+    co_initialized: bool, // whether CoInitializeEx succeeded on the open thread (balanced in close)
     allocator: std.mem.Allocator,
 };
 
@@ -244,19 +244,19 @@ pub const AudioDevice = struct {
         return self.state.effective;
     }
 
-    /// 1 バッファを無音で埋め → 再生スレッドを spawn → Start する。
+    /// Fill one buffer with silence, spawn the playback thread, then Start.
     pub fn start(self: AudioDevice) Error!void {
         const state = self.state;
-        if (state.thread != null) return; // 二重 start は無視
+        if (state.thread != null) return; // a double start is ignored
 
-        // 初期グリッチ回避: 最初の 1 バッファを無音で埋める。
+        // Avoiding an initial glitch: the first buffer is filled with silence.
         var data: ?[*]u8 = null;
         if (SUCCEEDED(state.render.vtbl.GetBuffer(state.render, state.buffer_frames, &data))) {
             _ = state.render.vtbl.ReleaseBuffer(state.render, state.buffer_frames, AUDCLNT_BUFFERFLAGS_SILENT);
         }
 
-        // render thread を先に起動し event 待ち状態にしてから Start（spawn 遅延による開始直後の underrun を避ける）。
-        // Start 前は event が来ず、thread は WaitForSingleObject の timeout で空回りするだけ（fill しない）。
+        // The render thread is started and left waiting on the event before Start (which avoids an underrun right after starting, caused by the spawn latency).
+        // Before Start no event arrives and the thread merely spins on WaitForSingleObject's timeout (without filling).
         state.running.store(true, .release);
         state.thread = std.Thread.spawn(.{}, renderThread, .{state}) catch {
             state.running.store(false, .release);
@@ -264,26 +264,26 @@ pub const AudioDevice = struct {
         };
         if (!SUCCEEDED(state.client.vtbl.Start(state.client))) {
             state.running.store(false, .release);
-            _ = SetEvent(state.event); // WaitForSingleObject を解除して即 join
+            _ = SetEvent(state.event); // release WaitForSingleObject and join at once
             if (state.thread) |t| t.join();
             state.thread = null;
             return error.StartFailed;
         }
     }
 
-    /// `running=false` → イベントを叩いて起こす → join → `IAudioClient::Stop`。
+    /// `running=false`, then signal the event to wake it, then join, then `IAudioClient::Stop`.
     pub fn stop(self: AudioDevice) void {
         const state = self.state;
         if (state.thread) |thread| {
             state.running.store(false, .release);
-            _ = SetEvent(state.event); // WaitForSingleObject を即座に解除
+            _ = SetEvent(state.event); // release WaitForSingleObject immediately
             thread.join();
             state.thread = null;
             _ = state.client.vtbl.Stop(state.client);
         }
     }
 
-    /// stop → COM インターフェース解放 → イベント close → CoUninitialize → State 破棄。
+    /// stop, then release the COM interfaces, then close the event, then CoUninitialize, then destroy the State.
     pub fn close(self: AudioDevice) void {
         const state = self.state;
         self.stop();
@@ -296,11 +296,11 @@ pub const AudioDevice = struct {
 };
 
 // ============================================================================
-// 再生スレッド（push モデル: イベント待ち → GetBuffer → render_callback → ReleaseBuffer）
+// the playback thread (a push model: wait for the event, GetBuffer, render_callback, ReleaseBuffer)
 // ============================================================================
 fn renderThread(state: *State) void {
-    // 再生スレッドも MTA で COM 初期化（open が MTA 統一を保証済み。WASAPI interface は MTA で free-threaded）。
-    // 失敗（RPC_E_CHANGED_MODE 含む）なら COM 未初期化スレッドで WASAPI を呼ばずに抜ける。
+    // The playback thread initialises COM as MTA too (open has already guaranteed MTA throughout; a WASAPI interface is free-threaded under MTA).
+    // On failure (RPC_E_CHANGED_MODE included) it leaves without calling WASAPI on a thread where COM is uninitialised.
     const hr = CoInitializeEx(null, COINIT_MULTITHREADED);
     if (!SUCCEEDED(hr)) return;
     defer CoUninitialize();
@@ -310,12 +310,12 @@ fn renderThread(state: *State) void {
     const buffer_frames = state.buffer_frames;
 
     while (state.running.load(.acquire)) {
-        // バッファ空きイベントを待つ（停止検知のため timeout も入れる）。
+        // Wait for the buffer-has-room event (with a timeout as well, so a stop is noticed).
         const w = WaitForSingleObject(state.event, 200);
         if (!state.running.load(.acquire)) break;
         if (w == WAIT_TIMEOUT) continue;
 
-        // 空き frame 数 = バッファ全体 - 未再生分（padding）。
+        // The free frame count = the whole buffer minus what has not been played (the padding).
         var padding: u32 = 0;
         if (!SUCCEEDED(state.client.vtbl.GetCurrentPadding(state.client, &padding))) continue;
         const avail = if (buffer_frames > padding) buffer_frames - padding else 0;
@@ -327,15 +327,15 @@ fn renderThread(state: *State) void {
             _ = state.render.vtbl.ReleaseBuffer(state.render, 0, 0);
             continue;
         };
-        // RT 区間では panic 厳禁なので @alignCast の safety panic を避け、明示的に整列を確認する
-        // （misalign は通常起きないが、起きたら無音 release で継続）。
+        // A panic is strictly forbidden in the real-time region, so rather than risk @alignCast's safety panic the alignment is checked explicitly
+        // (a misalignment does not normally happen, but if it does it carries on by releasing silence).
         if (@intFromPtr(raw) % @alignOf(f32) != 0) {
             _ = state.render.vtbl.ReleaseBuffer(state.render, avail, AUDCLNT_BUFFERFLAGS_SILENT);
             continue;
         }
         const ptr: [*]f32 = @ptrCast(@alignCast(raw));
 
-        // RT 契約区間: alloc/lock/IO/panic 禁止。WASAPI バッファへ直接書く（中間コピー無し）。
+        // The real-time contract region: no alloc, locking, IO or panic. It writes straight into the WASAPI buffer, with no intermediate copy.
         state.render_callback(ptr[0 .. @as(usize, avail) * ch], avail, @intCast(ch), sample_rate, state.userdata);
 
         _ = state.render.vtbl.ReleaseBuffer(state.render, avail, 0);
@@ -346,26 +346,26 @@ fn renderThread(state: *State) void {
 // open
 // ============================================================================
 pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
-    // 1. COM 初期化（MTA）。RPC_E_CHANGED_MODE は「既に STA で初期化済み」を意味し、その場合 IAudioClient 等は
-    //    STA 束縛になり MTA の render thread から未 marshal で使うのは COM 規則違反。MTA に統一できない
-    //    （marshal 経路は MVP では持たない）ので open を諦める。失敗 HRESULT も使えないので OpenFailed。
+    // 1. Initialise COM (MTA). RPC_E_CHANGED_MODE means COM was already initialised as STA, in which case IAudioClient and
+    //    friends are bound to the STA and using them unmarshalled from an MTA render thread breaks the COM rules. MTA cannot be
+    //    made uniform (the MVP has no marshalling path), so open gives up. The failing HRESULT is unusable too, hence OpenFailed.
     const co_hr = CoInitializeEx(null, COINIT_MULTITHREADED);
     if (co_hr == RPC_E_CHANGED_MODE) return error.OpenFailed;
-    if (!SUCCEEDED(co_hr)) return error.OpenFailed; // ここに来れば S_OK/S_FALSE（close で要 CoUninitialize）
+    if (!SUCCEEDED(co_hr)) return error.OpenFailed; // reaching here means S_OK or S_FALSE (so close must CoUninitialize)
     errdefer CoUninitialize();
 
-    // 2. デバイス列挙子 → 既定の出力エンドポイント → IAudioClient を activate。
+    // 2. The device enumerator, then the default output endpoint, then activate IAudioClient.
     var enum_ptr: ?*anyopaque = null;
     if (!SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, null, CLSCTX_ALL, &IID_IMMDeviceEnumerator, &enum_ptr)))
         return error.NoDevice;
     const enumerator: *IMMDeviceEnumerator = @ptrCast(@alignCast(enum_ptr orelse return error.NoDevice));
-    defer _ = enumerator.vtbl.Release(enumerator); // client 取得後は不要
+    defer _ = enumerator.vtbl.Release(enumerator); // no longer needed once the client is obtained
 
     var device_ptr: ?*IMMDevice = null;
     if (!SUCCEEDED(enumerator.vtbl.GetDefaultAudioEndpoint(enumerator, eRender, eConsole, &device_ptr)))
         return error.NoDevice;
     const device = device_ptr orelse return error.NoDevice;
-    defer _ = device.vtbl.Release(device); // activate 後は不要
+    defer _ = device.vtbl.Release(device); // no longer needed after the activate
 
     var client_ptr: ?*anyopaque = null;
     if (!SUCCEEDED(device.vtbl.Activate(device, &IID_IAudioClient, CLSCTX_ALL, null, &client_ptr)))
@@ -373,23 +373,23 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     const client: *IAudioClient = @ptrCast(@alignCast(client_ptr orelse return error.OpenFailed));
     errdefer _ = client.vtbl.Release(client);
 
-    // 3. mix format を取得（共有モードはこれに従う）。float32 のみ対応。
+    // 3. Get the mix format (shared mode follows it). Only float32 is supported.
     var mix: ?*WAVEFORMATEX = null;
     if (!SUCCEEDED(client.vtbl.GetMixFormat(client, &mix))) return error.ConfigFailed;
     const fmt = mix orelse return error.ConfigFailed;
     defer CoTaskMemFree(fmt);
-    if (!isFloat32(fmt)) return error.ConfigFailed; // 非 float は将来の変換層対応まで非対応
-    // 直書き backend は format 前提が強い: channels>0 かつ 1 frame = channels*4B(f32 interleaved)。
+    if (!isFloat32(fmt)) return error.ConfigFailed; // anything but float is unsupported until a conversion layer arrives
+    // A backend writing directly has strong format assumptions: channels>0, and 1 frame = channels*4B (f32 interleaved).
     if (fmt.nChannels == 0 or fmt.nBlockAlign != fmt.nChannels * 4) return error.ConfigFailed;
 
     const sample_rate: u32 = fmt.nSamplesPerSec;
     const channels: u32 = fmt.nChannels;
 
-    // 4. イベント駆動・共有モードで Initialize（hnsBufferDuration=0 で engine 既定 period）。
+    // 4. Initialize in event-driven shared mode (hnsBufferDuration=0 for the engine's default period).
     if (!SUCCEEDED(client.vtbl.Initialize(client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, fmt, null)))
         return error.InitializeFailed;
 
-    // 5. バッファ frame 数を query → イベント生成・登録 → IAudioRenderClient を取得。
+    // 5. Query the buffer frame count, create and register the event, then get IAudioRenderClient.
     var buffer_frames: u32 = 0;
     if (!SUCCEEDED(client.vtbl.GetBufferSize(client, &buffer_frames))) return error.QueryFailed;
 
@@ -402,7 +402,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     const render: *IAudioRenderClient = @ptrCast(@alignCast(render_ptr orelse return error.QueryFailed));
     errdefer _ = render.vtbl.Release(render);
 
-    // 6. State を heap 確保（安定アドレス）。
+    // 6. Heap-allocate the State (at a stable address).
     const state = allocator.create(State) catch return error.OpenFailed;
     state.* = .{
         .client = client,
@@ -418,7 +418,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
         },
         .running = std.atomic.Value(bool).init(false),
         .thread = null,
-        .co_initialized = true, // open は CoInitializeEx 成功時のみここに到達。close で必ず釣り合わせる
+        .co_initialized = true, // open only reaches here when CoInitializeEx succeeded. close always balances it.
         .allocator = allocator,
     };
 
