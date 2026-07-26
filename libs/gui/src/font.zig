@@ -1,6 +1,6 @@
 const std = @import("std");
-// libs/font: 共通 Font インターフェース・メトリクス・カバレッジ描画路の正準定義。
-// （`@import("font")` はモジュール、`@import("font.zig")` はこのファイル。別物。）
+// libs/font: canonical definitions for the shared Font interface, metrics, and coverage draw path.
+// (`@import("font")` is the module; `@import("font.zig")` is this file. They are distinct.)
 const fnt = @import("font");
 
 pub const Rect = fnt.Rect;
@@ -10,23 +10,23 @@ pub const Color = fnt.Color;
 pub const Font = fnt.Font;
 pub const Metrics = fnt.Metrics;
 
-/// ASCII 32-127 対応固定幅 8x(glyph_h) ビットマップフォント。
-/// glyphs レイアウト: glyphs[(ch - 32) * glyph_h + row] = 8bit 行データ（MSB が左端）
+/// Fixed-width 8x(glyph_h) bitmap font covering ASCII 32-127.
+/// glyphs layout: glyphs[(ch - 32) * glyph_h + row] = 8-bit row data (MSB is the left edge)
 ///
-/// 共通 `Font` インターフェース（libs/font）の SizedFont 実装。size-baked（固定 8x16）で
-/// FontFace と SizedFont が一体。`asFont()` でインターフェースを取り出す。
-/// measure/drawTo は UTF-8 をコードポイント単位で扱う（非 ASCII は欠落グリフ＝描画スキップ・
-/// advance は固定 8 で進める）。改行・タブ非対応（Font 契約どおり 1 行のラン描画）。
+/// SizedFont implementation of the shared `Font` interface (libs/font). Size-baked (fixed 8x16):
+/// FontFace and SizedFont are one. Retrieve the interface via `asFont()`.
+/// measure/drawTo walk UTF-8 by codepoint (non-ASCII = missing glyph = draw skipped;
+/// advance still steps by fixed 8). No newline/tab (single-line run draw per the Font contract).
 pub const BitmapFont = struct {
     glyph_h: u8,
     glyphs: []const u8,
-    /// baseline 位置（line box 上端から）。spleen 8x16 のおおよその値。
-    /// GUI の text 高さ・縦中央揃えは ascent+descent（`inkHeight`）を使う（TASK-167）。
-    /// 共通 Metrics 契約（ascent+descent <= line_height）を満たす値を持たせる。
+    /// Baseline from the top of the line box. Approximate value for spleen 8x16.
+    /// GUI text height and vertical centering use ascent+descent (`inkHeight`).
+    /// Holds values that satisfy the shared Metrics contract (ascent+descent <= line_height).
     ascent: i32 = 12,
     descent: i32 = 4,
 
-    /// 共通 Font インターフェース（vtable）を返す。
+    /// Returns the shared Font interface (vtable).
     pub fn asFont(self: *const BitmapFont) Font {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -54,19 +54,19 @@ pub const BitmapFont = struct {
         return .{ .line_height = self.glyph_h, .ascent = self.ascent, .descent = self.descent };
     }
 
-    /// logical advance 幅の合計。固定幅なのでコードポイント数 × 8。
-    /// 欠落グリフ（範囲外コードポイント）も advance は 8 で進める（drawTo と一致）。
+    /// Sum of logical advance widths. Fixed-width, so codepoint count × 8.
+    /// Missing glyphs (out-of-range codepoints) still advance by 8 (matches drawTo).
     pub fn measure(self: BitmapFont, text: []const u8) u32 {
         _ = self;
         return 8 * countCodepoints(text);
     }
 
-    /// scale: 論理 8×glyph_h → 物理の nearest 拡大倍率（1.0 は既存画素と完全一致）。
-    /// measure/metrics は論理 8×16 のまま。
+    /// scale: nearest upscale factor from logical 8×glyph_h → physical (1.0 is bit-identical to existing pixels).
+    /// measure/metrics stay at logical 8×16.
     pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
         const s = if (std.math.isFinite(scale) and scale > 0) scale else 1.0;
         if (s == 1.0) {
-            // 既存整数経路（scale=1.0 決定論を保証）
+            // Existing integer path (guarantees scale=1.0 determinism)
             var cx = pos.x;
             if (std.unicode.Utf8View.init(text)) |view| {
                 var it = view.iterator();
@@ -103,11 +103,11 @@ pub const BitmapFont = struct {
         if (cp >= 32 and cp <= 127) {
             drawGlyph(self, target, @intCast(cp - 32), x, y, col, clip, scale);
         }
-        // 範囲外コードポイントは欠落グリフ＝描画スキップ（advance は呼び出し側で進める）
+        // Out-of-range codepoints are missing glyphs = draw skipped (caller still advances)
     }
 };
 
-/// UTF-8 のコードポイント数を数える。不正 UTF-8 はバイト数を返す（measure/drawTo の advance と一致）。
+/// Count UTF-8 codepoints. Invalid UTF-8 returns the byte count (matches measure/drawTo advance).
 fn countCodepoints(text: []const u8) u32 {
     if (std.unicode.Utf8View.init(text)) |view| {
         var it = view.iterator();
@@ -119,10 +119,10 @@ fn countCodepoints(text: []const u8) u32 {
     }
 }
 
-/// 毎フレーム（テキスト描画）走るホットパス。グリフ矩形の clip はループ外 1 回
-/// （fnt.clipCoverage）、内側は無検査で立ちビットを blend（TASK-58）。
-/// scale==1.0 は既存の 1:1 blit。それ以外は source 列/行ごとに
-/// `[floor(i*s), floor((i+1)*s))` の nearest 拡大（エッジ floor で seamless）。
+/// Hot path that runs every frame (text draw). Clip the glyph rect once outside the loop
+/// (fnt.clipCoverage); inside, blend set bits with no further bounds checks.
+/// scale==1.0 is the existing 1:1 blit. Otherwise nearest-upscale each source column/row to
+/// `[floor(i*s), floor((i+1)*s))` (edge floor keeps tiling seamless).
 fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i32, col: Color, clip: Rect, scale: f32) void {
     const base = @as(usize, glyph_idx) * @as(usize, font.glyph_h);
     if (scale == 1.0) {
@@ -130,7 +130,7 @@ fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i
         var row = cc.cy0;
         while (row < cc.cy1) : (row += 1) {
             const row_bits = font.glyphs[base + row];
-            // clipCoverage の保証により y+row / x+cx は非負かつ target 内
+            // clipCoverage guarantees y+row / x+cx are non-negative and inside the target
             const py: u32 = @intCast(y + @as(i32, @intCast(row)));
             const dst_base = py * target.width;
             var cx = cc.cx0;
@@ -139,7 +139,7 @@ fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i
                 if ((row_bits >> bit_pos) & 1 != 0) {
                     const px: u32 = @intCast(x + @as(i32, @intCast(cx)));
                     const idx = dst_base + px;
-                    // 立ちビット = カバレッジ 255（実効 α = col.a）
+                    // Set bit = coverage 255 (effective alpha = col.a)
                     const dst: Color = @bitCast(target.pixels[idx]);
                     target.pixels[idx] = @bitCast(Color.blend(dst, col));
                 }
@@ -148,7 +148,7 @@ fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i
         return;
     }
 
-    // nearest 拡大: エッジ表をグリフ単位で一度だけ構築（per-pixel float 禁止）
+    // Nearest upscale: build edge tables once per glyph (no per-pixel float)
     const gw: u32 = 8;
     const gh: u32 = font.glyph_h;
     var x_edges: [9]i32 = undefined;
@@ -172,7 +172,7 @@ fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i
         const y0 = y_edges[row] - y_edges[0];
         const y1 = y_edges[row + 1] - y_edges[0];
         if (y0 >= y1) continue;
-        // 物理行範囲と clip の交差
+        // Intersect the physical row range with clip
         const ry0 = @max(y0, cc.cy0);
         const ry1 = @min(y1, cc.cy1);
         if (ry0 >= ry1) continue;
@@ -206,7 +206,7 @@ fn drawGlyph(font: BitmapFont, target: RenderTarget, glyph_idx: u8, x: i32, y: i
 }
 
 // ============================================================
-// comptime BDF パーサ（src/text.zig とは独立実装、allocator 不要）
+// comptime BDF parser (independent of src/text.zig; no allocator)
 // ============================================================
 
 fn hexDigit(c: u8) u8 {
@@ -287,18 +287,18 @@ fn parseBdfGlyphs(comptime bdf: []const u8) [96 * 16]u8 {
 const spleen_bdf = @embedFile("assets/spleen-8x16.bdf");
 const spleen_glyphs: [96 * 16]u8 = parseBdfGlyphs(spleen_bdf);
 
-/// 生のビットマップフォント（型を直接使いたい場合用）。通常は `default_font`（Font）を使う。
+/// Raw bitmap font (when the concrete type is wanted). Prefer `default_font` (Font) normally.
 pub const default_bitmap_font: BitmapFont = .{
     .glyph_h = 16,
     .glyphs = &spleen_glyphs,
 };
 
-/// gui 既定フォント。共通 `Font` インターフェース値として公開する。
-/// （BitmapFont のまま維持。Outline 既定は `defaultOutlineFont()` を使う。）
+/// gui default font, published as a shared `Font` interface value.
+/// (Kept as BitmapFont. For the Outline default use `defaultOutlineFont()`.)
 pub const default_font: Font = default_bitmap_font.asFont();
 
-// ── default OutlineFont（Press Start 2P 埋め込み TTF、遅延初期化）──
-// GUI メインスレッド専用・プロセス寿命（deinit 不要）。face のアドレスは初期化後不変。
+// ── default OutlineFont (embedded Press Start 2P TTF, lazy init) ──
+// GUI main-thread only, process-lifetime (no deinit). face address is stable after init.
 const outline_font_mod = @import("font").OutlineFont;
 const FontFace = @import("font").FontFace;
 
@@ -308,8 +308,8 @@ var default_outline_state: struct {
     outline: outline_font_mod = undefined,
 } = .{};
 
-/// 埋め込み Press Start 2P の OutlineFont（論理 16px）。初回呼び出しで遅延初期化。
-/// AC4 の crisp 描画検証・明示選択用。`default_font`（bitmap）は置換しない。
+/// Embedded Press Start 2P OutlineFont (logical 16px). Lazy-initialized on first call.
+/// For crisp draw verification and explicit selection. Does not replace `default_font` (bitmap).
 pub fn defaultOutlineFont() Font {
     if (!default_outline_state.initialized) {
         default_outline_state.face = FontFace.init(@import("font").default_font_bytes) catch unreachable;
@@ -324,26 +324,26 @@ pub fn defaultOutlineFont() Font {
 }
 
 // ============================================================
-// TASK-167: 論理 ink 高さ・縦中央揃え helper
+// Logical ink height and vertical-centering helpers
 // ============================================================
 
-/// Font 契約の論理 ascent+descent 高さ（ink box）。`line_height` の line gap は含まない。
-/// 実測 glyph bbox ではなく Metrics 上の論理箱。GUI の text leaf / selectableLabel /
-/// TextInput / popup の縦サイズと中央揃えに使う（TASK-167 / TASK-118）。
-/// bitmap default（ascent=12, descent=4）では 16 となり従来の line_height と一致する。
+/// Font-contract logical ascent+descent height (ink box). Excludes the `line_height` line gap.
+/// A Metrics logical box, not a measured glyph bbox. Used for GUI text leaf / selectableLabel /
+/// TextInput / popup vertical size and centering.
+/// For the bitmap default (ascent=12, descent=4) this is 16 and matches the historical line_height.
 pub fn inkHeight(metrics: Metrics) i32 {
     return @max(0, metrics.ascent + metrics.descent);
 }
 
-/// `font.metrics()` から `inkHeight` を得る薄いラッパ。
+/// Thin wrapper that derives `inkHeight` from `font.metrics()`.
 pub fn fontInkHeight(font: Font) i32 {
     return inkHeight(font.metrics());
 }
 
-/// 指定 row 内で text（高さ `text_h`）を縦中央にした y（line box 上端 = Font.drawTo の pos.y）。
-/// `row_h < text_h` のときは offset 0（`row_y`）を返す（負のずれを出さない）。
-/// DrawList 直書き経路（patch node title 等）向け。layout 経路は text leaf 高さ自体を
-/// ink に揃えるので通常は不要。
+/// y that vertically centers text of height `text_h` within a row (line-box top = Font.drawTo pos.y).
+/// When `row_h < text_h`, returns offset 0 (`row_y`) (never a negative shift).
+/// For direct DrawList writing (patch node titles etc.). Layout usually does not need this because
+/// text leaf height itself is aligned to ink.
 pub fn centeredTextY(row_y: i32, row_h: i32, text_h: i32) i32 {
     return row_y + @max(0, @divTrunc(row_h - text_h, 2));
 }
@@ -358,14 +358,14 @@ test "default_font: measure = 8 * len (ASCII)" {
     try std.testing.expectEqual(@as(u32, 40), default_font.measure("Hello"));
 }
 
-test "measure: UTF-8 はコードポイント単位（マルチバイトは 1 advance）" {
-    // "あ" は UTF-8 3 バイトだが 1 コードポイント → advance 8
+test "measure: UTF-8 is per codepoint (multibyte still 1 advance)" {
+    // U+3042 is 3 UTF-8 bytes but 1 codepoint → advance 8
     try std.testing.expectEqual(@as(u32, 8), default_font.measure("あ"));
-    // "Aあ" → 2 コードポイント → 16
+    // "A" + U+3042 → 2 codepoints → 16
     try std.testing.expectEqual(@as(u32, 16), default_font.measure("Aあ"));
 }
 
-test "default_font: metrics は line_height=16, ascent+descent<=line_height" {
+test "default_font: metrics have line_height=16, ascent+descent<=line_height" {
     const m = default_font.metrics();
     try std.testing.expectEqual(@as(u32, 16), m.line_height);
     try std.testing.expect(m.ascent + m.descent <= @as(i32, @intCast(m.line_height)));
@@ -387,11 +387,11 @@ test "default_bitmap_font: exclamation mark glyph has set bits" {
     try std.testing.expect(any_set);
 }
 
-test "drawTo: ASCII グリフが描画される（共通カバレッジ描画路経由）" {
+test "drawTo: ASCII glyphs are drawn (via the shared coverage draw path)" {
     var px = [_]u32{0xFF000000} ** (64 * 16);
     const t = RenderTarget{ .pixels = &px, .width = 64, .height = 16 };
     const clip = Rect{ .x = 0, .y = 0, .w = 64, .h = 16 };
-    // "!" は set bit を持つので何かしら塗られる
+    // "!" has set bits so something is painted
     default_font.drawTo(t, .{ .x = 0, .y = 0 }, "!", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     var any_set = false;
     for (px) |p| {
@@ -400,20 +400,20 @@ test "drawTo: ASCII グリフが描画される（共通カバレッジ描画路
     try std.testing.expect(any_set);
 }
 
-test "TASK-156.3: BitmapFont scale=1.0 は既存画素と完全一致" {
+test "BitmapFont scale=1.0 is bit-identical to existing pixels" {
     var px_a = [_]u32{0xFF000000} ** (32 * 16);
     var px_b = [_]u32{0xFF000000} ** (32 * 16);
     const t_a = RenderTarget{ .pixels = &px_a, .width = 32, .height = 16 };
     const t_b = RenderTarget{ .pixels = &px_b, .width = 32, .height = 16 };
     const clip = Rect{ .x = 0, .y = 0, .w = 32, .h = 16 };
     const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    // 直接 1.0 経路と default_font 経由
+    // Direct 1.0 path vs via default_font
     default_bitmap_font.drawTo(t_a, .{ .x = 0, .y = 0 }, "Hi!", col, clip, 1.0);
     default_font.drawTo(t_b, .{ .x = 0, .y = 0 }, "Hi!", col, clip, 1.0);
     try std.testing.expectEqualSlices(u32, &px_a, &px_b);
 }
 
-test "TASK-156.3: BitmapFont nearest 拡大 scale=2.0 は 2x2 ブロック" {
+test "BitmapFont nearest upscale scale=2.0 yields 2x2 blocks" {
     var px1 = [_]u32{0xFF000000} ** (16 * 16);
     var px2 = [_]u32{0xFF000000} ** (32 * 32);
     const t1 = RenderTarget{ .pixels = &px1, .width = 16, .height = 16 };
@@ -423,7 +423,7 @@ test "TASK-156.3: BitmapFont nearest 拡大 scale=2.0 は 2x2 ブロック" {
     const col = Color.rgba(0xFF, 0x00, 0x00, 0xFF);
     default_bitmap_font.drawTo(t1, .{ .x = 0, .y = 0 }, "!", col, clip1, 1.0);
     default_bitmap_font.drawTo(t2, .{ .x = 0, .y = 0 }, "!", col, clip2, 2.0);
-    // 1x の各 set pixel が 2x2 ブロックになる
+    // Each set pixel at 1x becomes a 2x2 block
     var row: u32 = 0;
     while (row < 16) : (row += 1) {
         var col_i: u32 = 0;
@@ -438,11 +438,11 @@ test "TASK-156.3: BitmapFont nearest 拡大 scale=2.0 は 2x2 ブロック" {
     }
 }
 
-test "TASK-156.3: BitmapFont measure/metrics は scale 非依存" {
+test "BitmapFont measure/metrics are scale-independent" {
     const m = default_bitmap_font.metrics();
     try std.testing.expectEqual(@as(u32, 16), m.line_height);
     try std.testing.expectEqual(@as(u32, 24), default_bitmap_font.measure("ABC"));
-    // draw しても measure は論理のまま
+    // measure stays logical even after draw
     var px = [_]u32{0xFF000000} ** (64 * 32);
     const t = RenderTarget{ .pixels = &px, .width = 64, .height = 32 };
     default_bitmap_font.drawTo(t, .{ .x = 0, .y = 0 }, "ABC", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .x = 0, .y = 0, .w = 64, .h = 32 }, 2.0);
@@ -450,7 +450,7 @@ test "TASK-156.3: BitmapFont measure/metrics は scale 非依存" {
     try std.testing.expectEqual(m.ascent, default_bitmap_font.metrics().ascent);
 }
 
-test "TASK-156.3: defaultOutlineFont は論理 16px metrics と ASCII 非透明画素" {
+test "defaultOutlineFont has logical 16px metrics and non-transparent ASCII pixels" {
     const f = defaultOutlineFont();
     const m = f.metrics();
     try std.testing.expectEqual(@as(u32, 16), m.line_height);
@@ -467,7 +467,7 @@ test "TASK-156.3: defaultOutlineFont は論理 16px metrics と ASCII 非透明�
     }
     try std.testing.expect(any);
 
-    // scale=2.0 でも描画でき、scale 差で異なる解像度が cache される
+    // Still draws at scale=2.0; different scales cache different resolutions
     @memset(&px, 0xFF000000);
     f.drawTo(t, .{ .x = 2, .y = 2 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 2.0);
     any = false;
@@ -476,32 +476,32 @@ test "TASK-156.3: defaultOutlineFont は論理 16px metrics と ASCII 非透明�
     }
     try std.testing.expect(any);
 
-    // 2 回目呼び出しは同一 Font（遅延初期化済み）
+    // Second call returns the same Font (already lazy-initialized)
     const f2 = defaultOutlineFont();
     try std.testing.expect(f.ptr == f2.ptr);
 }
 
-test "TASK-167: inkHeight は default bitmap で 16（ascent+descent）" {
+test "inkHeight is 16 for the default bitmap (ascent+descent)" {
     const m = default_font.metrics();
     try std.testing.expectEqual(@as(i32, 16), inkHeight(m));
     try std.testing.expectEqual(@as(i32, 16), fontInkHeight(default_font));
     try std.testing.expectEqual(@as(i32, 16), @as(i32, @intCast(m.line_height)));
 }
 
-test "TASK-167: inkHeight は line_gap 付き metrics で ascent+descent のみ" {
+test "inkHeight with line_gap metrics is ascent+descent only" {
     const m = Metrics{ .line_height = 24, .ascent = 14, .descent = 4 };
     try std.testing.expectEqual(@as(i32, 18), inkHeight(m));
-    // 負の ascent/descent 合算は 0 にクランプ
+    // Negative ascent/descent sum clamps to 0
     try std.testing.expectEqual(@as(i32, 0), inkHeight(.{ .line_height = 10, .ascent = -2, .descent = -3 }));
 }
 
-test "TASK-167: centeredTextY は row 内で整数中央・負 offset なし" {
+test "centeredTextY integer-centers within the row with no negative offset" {
     // item_h=20, text_h=18 → offset 1
     try std.testing.expectEqual(@as(i32, 11), centeredTextY(10, 20, 18));
-    // 等しい → offset 0
+    // Equal → offset 0
     try std.testing.expectEqual(@as(i32, 5), centeredTextY(5, 16, 16));
-    // text の方が高い → offset 0（負にしない）
+    // text taller than row → offset 0 (never negative)
     try std.testing.expectEqual(@as(i32, 0), centeredTextY(0, 10, 18));
-    // 奇数差は floor 切り捨て: (21-18)/2 = 1
+    // Odd difference floors: (21-18)/2 = 1
     try std.testing.expectEqual(@as(i32, 1), centeredTextY(0, 21, 18));
 }

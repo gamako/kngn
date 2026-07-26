@@ -1,14 +1,14 @@
-//! Command 定義から生成するメニューバー / ドロップダウン（TASK-97.2）。
+//! Menu bar / dropdown built from Command definitions.
 //!
-//! ホットパス宣言: メニュー描画はフレーム毎の GUI 描画として走る（イベント時のみではない）。
-//! 既存 gui 描画プリミティブ + per-frame arena の範囲内で、新規の全画素ループ・毎フレーム
-//! heap allocation・全画面コピーは作らない。SIMD 3点セットの適用対象となる新設ループはなし。
+//! Hot-path note: menu drawing runs as part of per-frame GUI drawing (not event-only).
+//! Stays within existing gui draw primitives + the per-frame arena: no new full-framebuffer loops, per-frame
+//! heap allocation, or full-screen copies. No new loops that would trigger the SIMD three-point checklist.
 //!
-//! 使い方（immediate-mode）:
-//!   1. `beginFrame`〜`endFrame` 内で `menuBar(...)` — トップメニュー（File/Edit/…）ボタン列
-//!   2. `endFrame` の後で `menuBarPopup(...)` — ドロップダウン描画・選択（popup.zig と同契約）
+//! Usage (immediate-mode):
+//!   1. Inside `beginFrame`…`endFrame`, call `menuBar(...)` — top-menu (File/Edit/…) button row
+//!   2. After `endFrame`, call `menuBarPopup(...)` — dropdown draw / selection (same contract as popup.zig)
 //!
-//! gui は Command を実行しない。選択された `CommandId` を返し、app の `dispatchCommand` が所有する。
+//! gui does not execute Command. It returns the selected `CommandId`; the app's `dispatchCommand` owns execution.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,30 +26,30 @@ pub const Id = id_mod.Id;
 pub const Vec2 = geom.Vec2;
 pub const PopupItem = popup.PopupItem;
 
-/// メニューバー開閉状態（caller 所有。毎フレーム受け渡す）。
+/// Menu-bar open/close state (caller-owned; passed every frame).
 pub const MenuBarState = struct {
-    /// 開いているトップメニュー名（`Command.menu.title` と一致）。null = 閉じ。
+    /// Open top-menu name (matches `Command.menu.title`). null = closed.
     open_title: ?[]const u8 = null,
-    /// 同一フレームで別トップメニューへ切替した印（menuBar が設定し menuBarPopup が消費）。
-    /// popup 外クリック=dismiss と「別メニューへの切替クリック」を区別する内部状態。
+    /// Flag that a different top menu was switched to in the same frame (set by menuBar, consumed by menuBarPopup).
+    /// Internal state that distinguishes outside-popup click = dismiss from "switch to another menu" click.
     switch_click: bool = false,
 };
 
 pub const MenuBarResult = struct {
-    /// 項目クリックで選ばれた CommandId（separator / disabled は返さない）。
+    /// CommandId chosen by an item click (separator / disabled are not returned).
     selected: ?CommandId = null,
-    /// この呼び出し終了時点でドロップダウンが開いているか。
+    /// Whether the dropdown is open at the end of this call.
     open: bool = false,
 };
 
-/// メニューバー用 popup の固定 ID（同時に1メニューのみ。popup.zig MVP 契約と同じ）。
+/// Fixed popup ID for the menu bar (only one menu at a time; same MVP contract as popup.zig).
 pub const MENU_BAR_POPUP_ID: Id = 0x4D4E5501; // 'MNU\x01'
 
 const KeyCode = @TypeOf(@as(Shortcut, undefined).key);
 
-/// ショートカット表示文字列を `buf` へ書く（OS 規約: macOS=Cmd / 他=Ctrl）。
-/// `modifiers.cmd` と `modifiers.ctrl` はいずれも「primary accel」として扱い、表示は OS 側で導出する
-/// （二重管理しない。command_types の Shortcut 契約）。
+/// Write the shortcut display string into `buf` (OS convention: macOS=Cmd / else=Ctrl).
+/// Both `modifiers.cmd` and `modifiers.ctrl` are treated as the "primary accel"; the display form is derived per OS
+/// (no dual bookkeeping; see the Shortcut contract in command_types).
 pub fn formatShortcut(shortcut: Shortcut, buf: []u8) []const u8 {
     var len: usize = 0;
     const append = struct {
@@ -123,8 +123,8 @@ fn keyDisplayName(key: KeyCode) []const u8 {
     };
 }
 
-/// `commands` からユニークな `menu.title` を出現順（各 title の最小 `menu.order` 昇順）で `out` へ書く。
-/// 戻り値は書き込んだ個数。`out` が足りなければ truncate。
+/// Write unique `menu.title` values from `commands` into `out` in appearance order (ascending min `menu.order` per title).
+/// Return value is the count written. Truncates if `out` is too small.
 pub fn collectMenuTitles(commands: []const Command, out: [][]const u8) usize {
     var n: usize = 0;
     var i: usize = 0;
@@ -143,7 +143,7 @@ pub fn collectMenuTitles(commands: []const Command, out: [][]const u8) usize {
         out[n] = title;
         n += 1;
     }
-    // order 昇順（同 title の最小 order）で選択ソート
+    // Selection-sort by ascending order (min order for the same title)
     var a: usize = 0;
     while (a + 1 < n) : (a += 1) {
         var best = a;
@@ -168,7 +168,7 @@ fn minOrder(commands: []const Command, title: []const u8) u16 {
     return min;
 }
 
-/// `title` に属するコマンドを `menu.order` 昇順で `out` へ書く（参照のみ・コピーしない）。
+/// Write commands belonging to `title` into `out` in ascending `menu.order` (references only; no copy).
 pub fn collectMenuCommands(commands: []const Command, title: []const u8, out: []*const Command) usize {
     var n: usize = 0;
     for (commands) |*c| {
@@ -193,7 +193,7 @@ pub fn collectMenuCommands(commands: []const Command, title: []const u8, out: []
     return n;
 }
 
-/// 項目ラベル（checked 印 + label + ショートカット）を allocator へ確保して返す。
+/// Allocate and return an item label (checked mark + label + shortcut) from the allocator.
 pub fn formatItemLabel(allocator: std.mem.Allocator, cmd: Command) ![]const u8 {
     if (cmd.kind == .separator) return try allocator.dupe(u8, "────────");
 
@@ -211,8 +211,8 @@ pub fn formatItemLabel(allocator: std.mem.Allocator, cmd: Command) ![]const u8 {
     }
 }
 
-/// `beginFrame`〜`endFrame` 内: トップメニューボタン列。クリックで `state.open_title` を切替。
-/// 既存 menu bar の beginBox 列の置換入口。
+/// Inside `beginFrame`…`endFrame`: top-menu button row. Click toggles `state.open_title`.
+/// Replacement entry point for the existing menu-bar beginBox row.
 pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) void {
     state.switch_click = false;
     var titles: [16][]const u8 = undefined;
@@ -229,9 +229,9 @@ pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) v
                 state.open_title = title;
             }
         } else if (state.open_title != null and !is_open and ctx.input.mouse_pressed.left) {
-            // popup のモーダル吸収中は buttonBehavior が反応しないため、開いている間の
-            // 別トップメニューへの切替クリックだけ前フレーム rect の手動ヒットテストで拾う
-            // （一般的なメニューバー挙動）。dismiss との区別は switch_click で menuBarPopup へ伝える。
+            // While the popup's modal absorption is active, buttonBehavior does not respond, so a switch-click
+            // to another top menu while open is picked up via a manual hit-test against the previous-frame rect
+            // (standard menu-bar behavior). Distinguishes from dismiss by passing switch_click to menuBarPopup.
             if (ctx.getNodeRect(ctx.id_stack.make(title))) |r| {
                 const p = ctx.input.mouse_pressed_pos;
                 if (p.x >= r.x and p.x < r.x + @as(i32, @intCast(r.w)) and
@@ -245,7 +245,7 @@ pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) v
     }
 }
 
-/// `endFrame` 後: 開いているドロップダウンを描画し、選択 CommandId を返す。
+/// After `endFrame`: draw the open dropdown and return the selected CommandId.
 pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarState) MenuBarResult {
     std.debug.assert(!ctx.frame_active);
     const title = state.open_title orelse {
@@ -262,7 +262,7 @@ pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarSta
             ctx.popup_state.?.pos = pos;
         }
     } else {
-        // 初フレーム等で rect 未確定 → 次フレーム待ち
+        // Rect not yet settled on the first frame etc. → wait for the next frame
         return .{ .open = true };
     }
 
@@ -295,8 +295,8 @@ pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarSta
     }
     if (res.dismissed) {
         if (state.switch_click) {
-            // 別トップメニューへの切替クリック（menuBar が検出済み）。閉じずに次フレームで
-            // 新しい title の位置へ popup を開き直す（dismiss 扱いにしない）。
+            // Switch-click to another top menu (already detected by menuBar). Do not close; on the next frame
+            // reopen the popup at the new title's position (do not treat as dismiss).
             state.switch_click = false;
             return .{ .open = true };
         }
@@ -312,7 +312,7 @@ pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarSta
 
 const font_mod = @import("font.zig");
 
-test "formatShortcut: primary accel は OS 規約で表示され物理 cmd/ctrl を区別しない" {
+test "formatShortcut: primary accel follows OS convention and does not distinguish physical cmd/ctrl" {
     var buf: [32]u8 = undefined;
     const via_cmd = formatShortcut(.{ .key = .Z, .modifiers = .{ .cmd = true } }, &buf);
     const expect_primary = if (builtin.os.tag == .macos) "Cmd+Z" else "Ctrl+Z";
@@ -328,7 +328,7 @@ test "formatShortcut: primary accel は OS 規約で表示され物理 cmd/ctrl 
     try std.testing.expectEqualStrings(expect_shift, with_shift);
 }
 
-test "collectMenuTitles: order 昇順でユニーク title" {
+test "collectMenuTitles: unique titles in ascending order" {
     const cmds = [_]Command{
         .{ .id = 1, .label = "Undo", .menu = .{ .title = "Edit", .order = 20 } },
         .{ .id = 2, .label = "Open", .menu = .{ .title = "File", .order = 10 } },
@@ -343,7 +343,7 @@ test "collectMenuTitles: order 昇順でユニーク title" {
     try std.testing.expectEqualStrings("View", titles[2]);
 }
 
-test "collectMenuCommands: order 昇順 + enabled/checked/shortcut を保持" {
+test "collectMenuCommands: ascending order and keeps enabled/checked/shortcut" {
     const cmds = [_]Command{
         .{ .id = 2, .label = "Save", .menu = .{ .title = "File", .order = 20 }, .shortcut = .{ .key = .S, .modifiers = .{ .cmd = true } } },
         .{ .id = 1, .label = "Open", .menu = .{ .title = "File", .order = 10 }, .enabled = false },
@@ -358,7 +358,7 @@ test "collectMenuCommands: order 昇順 + enabled/checked/shortcut を保持" {
     try std.testing.expect(out[1].shortcut != null);
 }
 
-test "formatItemLabel: checked と shortcut 表記を含む" {
+test "formatItemLabel: includes checked mark and shortcut text" {
     const cmd: Command = .{
         .id = 1,
         .label = "Panel",
@@ -374,7 +374,7 @@ test "formatItemLabel: checked と shortcut 表記を含む" {
     try std.testing.expect(std.mem.indexOf(u8, label, primary) != null);
 }
 
-test "menuBarPopup: disabled 項目は selected を返さない（popup enabled 契約）" {
+test "menuBarPopup: disabled items do not return selected (popup enabled contract)" {
     var ctx = Context.init(std.testing.allocator, font_mod.default_font);
     defer ctx.deinit();
 
@@ -384,7 +384,7 @@ test "menuBarPopup: disabled 項目は selected を返さない（popup enabled 
     };
     var state: MenuBarState = .{ .open_title = "File" };
 
-    // frame 1: File ボタンの rect を確定 + popup を開く
+    // frame 1: settle the File button rect + open the popup
     ctx.beginFrame(400, 300);
     menuBar(&ctx, &cmds, &state);
     ctx.endFrame();
@@ -395,7 +395,7 @@ test "menuBarPopup: disabled 項目は selected を返さない（popup enabled 
     const tr = ctx.getNodeRect(title_id).?;
     const item1_y = tr.y + @as(i32, @intCast(tr.h)) + ctx.style.popup_padding + ctx.style.popup_item_h + 2;
 
-    // frame 2: disabled 2行目をクリック（edge は beginFrame〜endFrame の pushEvent）
+    // frame 2: click the disabled second row (edge via pushEvent between beginFrame and endFrame)
     ctx.beginFrame(400, 300);
     menuBar(&ctx, &cmds, &state);
     ctx.pushEvent(.{ .mouse_down = .{ .x = tr.x + 8, .y = item1_y, .button = 0, .modifiers = 0 } });
