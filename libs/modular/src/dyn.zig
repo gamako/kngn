@@ -610,7 +610,7 @@ pub const DynGraph = struct {
     }
 
     /// acquire and latch the tap config (GUI publish). A swapped slot resets local_wpos=0 + wpos=0
-    /// (treat old-port residue as absent). Returns true if any tap slot is active. No non-RT alloc/lock.
+    /// (treat old-port residue as absent). Returns true if any tap slot is active. No alloc/lock on the RT path.
     fn latchTapConfig(self: *DynGraph) bool {
         const cfg = self.tap_mailbox.acquire();
         self.tap.latched_seq = cfg.seq;
