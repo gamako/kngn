@@ -4,7 +4,7 @@
 //!
 //! Loads pixie's schema onto the `serde` versioned container (RIFF/IFF lineage).
 //! serde owns the container (magic/version/chunk/CRC); this module owns the pixie schema
-//! (DOCH/LAYR/FRAM/CEL/PLTE). serde has no file I/O, so real I/O goes
+//! (DOCH/LAYR/FRAM/CELS/PLTE). serde has no file I/O, so real I/O goes
 //! through `std.Io` here (same style as existing io_png.savePNG).
 //!
 //! **schema v4 (`schema_version = 4`, current write)**: optional chunk `PLTE` (count u16 + u32×N)
@@ -16,7 +16,7 @@
 //! **schema v3 (read compatible)**: persists LayerId (stable handle) and `next_layer_id`.
 //!
 //! **schema v2 (read compatible)**: LayerDef at Document level; cel bodies are separated from the grid and
-//! written once into CEL chunks. **No ids**, so load assigns deterministically in layer order
+//! written once into CELS chunks. **No ids**, so load assigns deterministically in layer order
 //! (`next_layer_id = layer_count+1`).
 //!
 //! Read compatibility for old v1 (`frames:[]*Canvas`, pixels embedded directly in LAYR) is **not implemented**
@@ -37,24 +37,24 @@
 //!     | color u32(LE) | x i32(LE) | y i32(LE) | text bytes (UTF-8, no header)
 //! - FRAM (frame_count times, after all LAYR, 8B+layer_count*4B): frame_index u32 | duration_ms u32
 //!   | grid[layer_count] (u32 each, LE. 0xFFFFFFFF=none; otherwise serial ID)
-//! - CEL (K times, batched after all FRAM. K=unique referenced cel count; 4B+W*H*4B): compression u8(0=raw)
+//! - CELS (K times, batched after all FRAM. K=unique referenced cel count; 4B+W*H*4B): compression u8(0=raw)
 //!   | pad[3] | pixels[W*H*4] (canonical BGRA u32 raw bytes, row-major)
-//! - PLTE (optional, v4, after CEL): count u16(LE) | colors[count] u32(LE each, canonical BGRA)
+//! - PLTE (optional, v4, after CELS): count u16(LE) | colors[count] u32(LE each, canonical BGRA)
 //!
 //! **Serial-ID compression** (on-disk representation only; distinct from in-memory `CelId`/`CelSetSnapshot`):
 //! encode numbers from 0 in first-seen order while walking FRAM in frame order and each frame in layer order,
-//! and writes each CEL chunk once in that order. decode uses the serial ID itself
-//! as the new `CelId` (pushing CEL chunks into cel_pool in appearance order makes
+//! and writes each CELS chunk once in that order. decode uses the serial ID itself
+//! as the new `CelId` (pushing CELS chunks into cel_pool in appearance order makes
 //! push order equal the new CelId, so no translation table is needed).
 //!
-//! **Forward compatibility / structural errors (v2/v3)**:
+//! **Forward compatibility / structural errors (v2-v4)**:
 //! - Unknown top-level tag → skip.
 //! - `LAYR.type` other than raster/text → **cannot skip** (grid is a fixed-length array of layer_count
 //!   indexed by LAYR appearance order) → reject whole file with `error.UnsupportedLayerType`.
-//! - `LAYR`/`FRAM`/`CEL` payload length mismatch → `CorruptLayer`/`CorruptFrame`/`CorruptCel` respectively.
+//! - `LAYR`/`FRAM`/`CELS` payload length mismatch → `CorruptLayer`/`CorruptFrame`/`CorruptCel` respectively.
 //! - Declared `layer_count`/`frame_count` ≠ actual appearance count → `LayerCountMismatch`/`FrameCountMismatch`.
 //! - Every LAYR must appear before every FRAM → `error.LayerAfterFrame`.
-//! - `FRAM.grid` serial ID ≥ actual CEL count → `error.CorruptGrid` (dangling reference).
+//! - `FRAM.grid` serial ID ≥ actual CELS count → `error.CorruptGrid` (dangling reference).
 //!   Surplus CELs are allowed (auto-reclaimed after load as refcount=0).
 //! - The same serial ID (= same CelId) referenced from grids of different layers
 //!   → `error.CrossLayerCelShare` (protects the design premise that cel sharing stays within a layer).
@@ -169,7 +169,7 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
     var serial_of = try gpa.alloc(?u32, doc.cel_pool.items.len);
     defer gpa.free(serial_of);
     @memset(serial_of, null);
-    var serial_order: std.ArrayList(CelId) = .empty; // Source CelIds in serial-ID order (for CEL write-out)
+    var serial_order: std.ArrayList(CelId) = .empty; // Source CelIds in serial-ID order (for CELS write-out)
     defer serial_order.deinit(gpa);
 
     for (0..nframes) |f| {
@@ -193,7 +193,7 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
         try w.addChunk(TAG_FRAME, grid_buf);
     }
 
-    // CEL (once each, in serial-ID order).
+    // CELS (once each, in serial-ID order).
     for (serial_order.items) |orig_id| {
         const cel = doc.cel_pool.items[orig_id].?;
         const px_bytes = std.mem.sliceAsBytes(cel.pixels);
@@ -413,7 +413,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
         }
     }
 
-    // Zero-ref cels (surplus CEL) are auto-reclaimed (not compacted; keeps CelId=cel_pool index).
+    // Zero-ref cels (surplus CELS) are auto-reclaimed (not compacted; keeps CelId=cel_pool index).
     for (doc.cel_pool.items) |*maybe_cel| {
         if (maybe_cel.*) |cel| {
             if (cel.refcount == 0) {
@@ -869,7 +869,7 @@ test "structural errors: returns each error" {
         defer gpa.free(bytes);
         try testing.expectError(error.LayerAfterFrame, decodeDocument(bytes, gpa));
     }
-    // CEL + compression != raw
+    // CELS + compression != raw
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -888,7 +888,7 @@ test "structural errors: returns each error" {
         defer gpa.free(bytes);
         try testing.expectError(error.UnsupportedCompression, decodeDocument(bytes, gpa));
     }
-    // CEL payload length mismatch
+    // CELS payload length mismatch
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
