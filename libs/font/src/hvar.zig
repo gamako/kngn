@@ -1,10 +1,10 @@
-// HVAR テーブル: 水平メトリクス変分（ItemVariationStore + advance mapping）。
+// HVAR table: horizontal metrics variation (ItemVariationStore + advance mapping).
 //
-// ホットパス宣言: advance 評価は **metrics cache ミス or 軸変更時のみ**
-// （OutlineFont.advance_cache 経由）。フレーム毎経路には出さない。
+// Hot-path note: advance evaluation runs **only on metrics-cache miss or axis change**
+// (via OutlineFont.advance_cache). Never on the per-frame path.
 //
-// ヘッダ（OpenType HVAR）: major@0 / minor@2 / itemVariationStoreOffset@4 (Offset32) /
-// advanceWidthMappingOffset@8 / lsbMappingOffset@12 / rsbMappingOffset@16。
+// Header (OpenType HVAR): major@0 / minor@2 / itemVariationStoreOffset@4 (Offset32) /
+// advanceWidthMappingOffset@8 / lsbMappingOffset@12 / rsbMappingOffset@16.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -18,7 +18,7 @@ pub const DeltaSetIndex = struct { outer: u16, inner: u16 };
 pub const Hvar = struct {
     data: []const u8,
     ivs_off: usize,
-    /// advance mapping offset（0 = 無し → gid を inner index として outer=0）。
+    /// advance mapping offset (0 = none → use gid as inner index with outer=0).
     adv_map_off: usize,
     axis_count: u16,
 
@@ -31,11 +31,11 @@ pub const Hvar = struct {
         const ivs_off = try r.u32At(4);
         if (ivs_off == 0 or ivs_off >= table.len) return error.InvalidFont;
         const adv_map = try r.u32At(8);
-        // lsb/rsb は MVP で未使用だが範囲だけ検証
+        // lsb/rsb unused in MVP but still range-checked
         _ = try r.u32At(12);
         _ = try r.u32At(16);
 
-        // IVS format 検証
+        // Validate IVS format
         try ivs.validateIvs(table, ivs_off, axis_count);
         if (adv_map != 0) try validateDeltaSetIndexMap(table, adv_map);
 
@@ -47,7 +47,7 @@ pub const Hvar = struct {
         };
     }
 
-    /// advance の変分デルタ（font units）。破損は InvalidFont。
+    /// Advance variation delta (font units). Corrupt data → InvalidFont.
     pub fn advanceDelta(self: *const Hvar, gid: u16, norm: []const f32) Error!f32 {
         if (norm.len < self.axis_count) return error.InvalidFont;
         const outer_inner = try self.deltaSetIndex(gid);
@@ -68,7 +68,7 @@ fn validateDeltaSetIndexMap(table: []const u8, map_off: usize) Error!void {
     const r = Reader{ .data = table };
     try r.require(map_off, 4);
     const format = try r.u8At(map_off);
-    if (format != 0) return error.InvalidFont; // HVAR は format 0 のみ
+    if (format != 0) return error.InvalidFont; // HVAR supports format 0 only
     const entry_format = try r.u8At(map_off + 1);
     const map_count = try r.u16At(map_off + 2);
     const entry_size = @as(usize, (entry_format & 0x30) >> 4) + 1;
@@ -125,8 +125,8 @@ fn f2d(v: f32) i16 {
     return var_common.f32ToF2dot14(v);
 }
 
-/// 最小 HVAR: 1 軸・1 region peak=1 start=0 end=1・1 item（gid0 直接）delta=20。
-/// advance mapping 無し（direct: outer=0, inner=gid）。
+/// Minimal HVAR: 1 axis, 1 region peak=1 start=0 end=1, 1 item (gid0 direct) delta=20.
+/// No advance mapping (direct: outer=0, inner=gid).
 fn buildMinimalHvarDirect() [64]u8 {
     var buf: [64]u8 = .{0} ** 64;
     // HVAR header
@@ -225,7 +225,7 @@ fn buildHvarWithMapping() [80]u8 {
     return buf;
 }
 
-test "hvar: direct mapping（mapping 無し）既知 advance delta" {
+test "hvar: direct mapping (no mapping) known advance delta" {
     const buf = buildMinimalHvarDirect();
     const hv = try Hvar.parse(&buf, 1);
     // norm=1 → scalar=1 → delta=20
@@ -236,7 +236,7 @@ test "hvar: direct mapping（mapping 無し）既知 advance delta" {
     try testing.expectApproxEqAbs(@as(f32, 0), try hv.advanceDelta(0, &.{0.0}), 0.01);
 }
 
-test "hvar: delta-set mapping で gid 別 delta" {
+test "hvar: delta-set mapping yields per-gid delta" {
     const buf = buildHvarWithMapping();
     const hv = try Hvar.parse(&buf, 1);
     try testing.expectApproxEqAbs(@as(f32, 10), try hv.advanceDelta(0, &.{1.0}), 0.01);
@@ -244,13 +244,13 @@ test "hvar: delta-set mapping で gid 別 delta" {
     try testing.expectApproxEqAbs(@as(f32, 10), try hv.advanceDelta(2, &.{1.0}), 0.01);
 }
 
-test "hvar: 壊れた version は InvalidFont" {
+test "hvar: broken version is InvalidFont" {
     var buf = buildMinimalHvarDirect();
     putU16(&buf, 0, 2);
     try testing.expectError(error.InvalidFont, Hvar.parse(&buf, 1));
 }
 
-test "hvar: IVS region axisCount 不一致は InvalidFont" {
+test "hvar: IVS region axisCount mismatch is InvalidFont" {
     const buf = buildMinimalHvarDirect();
     try testing.expectError(error.InvalidFont, Hvar.parse(&buf, 2));
 }

@@ -1,13 +1,13 @@
-// OutlineFont: sfnt / cmap / glyf / raster を束ね、共通 Font インターフェース(font.zig)を
-// 実装するスケーラブルフォント。
+// OutlineFont: bundles sfnt / cmap / glyf / raster and the shared Font interface (font.zig) into a
+// scalable font.
 //
-//   FontFace  … 不変・パース済みフォント（data は借用。FontFace より長命であること）。
-//   OutlineFont … FontFace を特定ピクセルサイズに束縛した描画可能インスタンス（mutable）。
-//                 グリフは遅延オンデマンドでラスタライズし (GID) キーでキャッシュする。
+//   FontFace  … immutable parsed font (borrows `data`; `data` must outlive FontFace).
+//   OutlineFont … mutable drawable instance binding a FontFace to a pixel size.
+//                 Glyphs are rasterized lazily on demand and cached by (GID) key.
 //
-// 使用契約: OutlineFont は **非スレッドセーフ**（thread-confined）。drawTo はキャッシュを
-// 遅延充填する＝interior mutability のため、asFont() は **mutable な実体からのみ**作り、
-// 返る Font は borrowed view（実体の寿命・アドレス安定性に従う）。
+// Usage contract: OutlineFont is **not thread-safe** (thread-confined). drawTo lazily fills
+// the cache (= interior mutability), so asFont() must be called only from a **mutable** instance,
+// and the returned Font is a borrowed view (follows the instance lifetime and address stability).
 
 const std = @import("std");
 const font = @import("font.zig");
@@ -37,10 +37,10 @@ const Color = font.Color;
 
 pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 
-/// 単一グリフが大きすぎる場合の上限（px）。これを超える bbox は描画断念（tombstone）。
+/// Upper bound (px) for a single glyph; a bbox above this aborts drawing (tombstone).
 const max_glyph_dim: f32 = 4096;
 
-/// アウトライン供給源（TrueType glyf か OpenType CFF か）。table 実体で選択する。
+/// Outline source (TrueType glyf or OpenType CFF). Chosen from the actual table present.
 pub const OutlineSource = union(enum) {
     glyf: glyf_mod.Glyf,
     cff: cff_mod.CffFont,
@@ -51,29 +51,29 @@ pub const FontFace = struct {
     sfnt: sfnt.SfntFile,
     source: OutlineSource,
     cmap: cmap_mod.Cmap,
-    /// 'sbix' テーブル（カラー絵文字の埋め込みビットマップ。TASK-26.3）。
-    /// テーブル不在・構造破壊（InvalidFont）はいずれも **null に縮約**する（壊れた sbix は
-    /// テーブルごと無効化し、outline のみで動作を継続する。フォント全体を InvalidFont に
-    /// しない）。sbix-only face（glyf/CFF 無し）は依然 MVP 非対応で、上の source 選択が
-    /// 先に InvalidFont を返すため FontFace 自体が成立しない。
-    /// `flags` の bit1（draw outlines 指示）は MVP では無視・保持のみ（`Sbix.flags` 経由）。
+    /// 'sbix' table (embedded bitmaps for color emoji).
+    /// Absent table and structural corruption (InvalidFont) both **collapse to null** (a broken sbix
+    /// is disabled as a whole table and drawing continues outline-only; the whole font is not
+    /// rejected as InvalidFont). An sbix-only face (no glyf/CFF) remains unsupported for MVP: source
+    /// selection returns InvalidFont first, so FontFace itself never forms.
+    /// `flags` bit1 (draw-outlines hint) is ignored but retained for MVP (via `Sbix.flags`).
     sbix: ?sbix_mod.Sbix = null,
-    /// fvar テーブル（可変フォント軸定義）。不在は null（非可変）。
+    /// fvar table (variable-font axis definitions). Null when absent (non-variable).
     fvar: ?fvar_mod.Fvar = null,
-    /// avar テーブル（正規化座標の非線形マップ）。fvar があるときのみ・不在は identity。
+    /// avar table (nonlinear map of normalized coordinates). Only with fvar; identity when absent.
     avar: ?avar_mod.Avar = null,
-    /// gvar テーブル（glyf 点変分）。不在は default 外形。破損は InvalidFont。
+    /// gvar table (glyf point variation). Default outline when absent; InvalidFont when corrupt.
     gvar: ?gvar_mod.Gvar = null,
-    /// HVAR テーブル（advance 変分）。不在は phantom fallback。破損は InvalidFont。
+    /// HVAR table (advance variation). Phantom fallback when absent; InvalidFont when corrupt.
     hvar: ?hvar_mod.Hvar = null,
 
-    /// data は呼び出し側所有・FontFace より長命であること。
+    /// Caller owns `data`; it must outlive FontFace.
     pub fn init(data: []const u8) Error!FontFace {
         const sf = sfnt.SfntFile.parse(data) catch |e| switch (e) {
             error.UnsupportedFormat => return error.Unsupported,
             error.InvalidFont => return error.InvalidFont,
         };
-        // ソース選択: glyf / CFF / CFF2。同居は不正。
+        // Source selection: glyf / CFF / CFF2. Coexistence is invalid.
         const has_glyf = (sf.tableSlice("glyf") catch null) != null;
         const cff_tbl = sf.tableSlice("CFF ") catch null;
         const cff2_tbl = sf.tableSlice("CFF2") catch null;
@@ -95,7 +95,7 @@ pub const FontFace = struct {
             if (cf.numGlyphs() != sf.num_glyphs) return error.InvalidFont;
             source = .{ .cff = cf };
         } else if (cff2_tbl) |c2| {
-            // fvar は後で読むが、CFF2 parse に axis を渡すため先に fvar を peek
+            // fvar is read later, but peek fvar first so CFF2 parse receives the axis count
             var peek_axes: u16 = 0;
             if (sf.tableSlice("fvar") catch null) |ft| {
                 const fv = fvar_mod.Fvar.parse(ft) catch |e| switch (e) {
@@ -114,7 +114,7 @@ pub const FontFace = struct {
 
         const cmap_tbl = (sf.tableSlice("cmap") catch return error.InvalidFont) orelse return error.InvalidFont;
         const cm = cmap_mod.Cmap.parse(cmap_tbl) catch return error.InvalidFont;
-        // sbix はテーブル不在・構造破壊のどちらも null に縮約（上記 doc 参照）。
+        // sbix collapses both absent table and structural corruption to null (see doc above).
         const sbx: ?sbix_mod.Sbix = sbix_mod.Sbix.init(&sf) catch null;
 
         var fvar_opt: ?fvar_mod.Fvar = null;
@@ -165,32 +165,32 @@ pub const FontFace = struct {
 };
 
 const CachedGlyph = struct {
-    bitmap: ?raster.Bitmap, // null = 空グリフ（space 等）
-    left: i32, // ペン x からの device オフセット
-    top: i32, // baseline からの device オフセット（上が負）
-    advance: f32, // 物理 px（key の physical_px_q に対応）
-    oom: bool = false, // negative cache（ラスタライズ OOM/過大）
+    bitmap: ?raster.Bitmap, // null = empty glyph (space, etc.)
+    left: i32, // device offset from pen x
+    top: i32, // device offset from baseline (up is negative)
+    advance: f32, // physical px (matches key.physical_px_q)
+    oom: bool = false, // negative cache (rasterize OOM / oversized)
 };
 
-/// outline glyph cache key: GID × 物理 font size（1/64px 量子化）。
-/// f32 scale の微小揺らぎによる cache 分裂を防ぎつつ sub-pixel coverage 差を保持する。
+/// outline glyph cache key: GID × physical font size (1/64px quantized).
+/// Prevents cache splits from tiny f32 scale jitter while keeping sub-pixel coverage differences.
 const PhysicalGlyphKey = struct {
     gid: u16,
     physical_px_q: u32,
 };
 
-/// sbix カラーグリフのキャッシュ済み RGBA ビットマップ（TASK-26.3）。outline の `CachedGlyph`
-/// と同じ「ペン x / baseline からの device オフセット」規約（`left`/`top`）を使う。
-/// advance は保持しない（measure/advance は hmtx 経由の `advancePx` に一本化・不変）。
-/// `pixels` は canonical BGRA straight alpha（`png.decodePNG` 出力そのまま or
-/// `nearestNeighborScale` 後の新規バッファ）。`failed=true` は negative cache tombstone
-/// （`pixels` は空 `&.{}` で未確保・free 不要）で、drawTo は outline へフォールバックする。
+/// Cached RGBA bitmap for an sbix color glyph. Uses the same pen-x / baseline device-offset
+/// convention (`left`/`top`) as outline `CachedGlyph`.
+/// Does not store advance (measure/advance are unified through hmtx via immutable `advancePx`).
+/// `pixels` is canonical BGRA straight alpha (`png.decodePNG` output as-is, or a new buffer after
+/// `nearestNeighborScale`). `failed=true` is a negative-cache tombstone
+/// (`pixels` is empty `&.{}`, not allocated, no free) and drawTo falls back to outline.
 const CachedColorGlyph = struct {
     pixels: []u32 = &.{},
     w: u32 = 0,
     h: u32 = 0,
-    left: i32 = 0, // ペン x からの device オフセット
-    top: i32 = 0, // baseline からの device オフセット（上が負。outline の CachedGlyph.top と同規約）
+    left: i32 = 0, // device offset from pen x
+    top: i32 = 0, // device offset from baseline (up is negative; same convention as outline CachedGlyph.top)
     failed: bool = false,
 };
 
@@ -202,33 +202,33 @@ pub const OutlineFont = struct {
     cache: std.AutoHashMapUnmanaged(PhysicalGlyphKey, CachedGlyph) = .empty,
     cache_bytes: usize = 0,
     cache_cap: usize = 4 * 1024 * 1024,
-    /// 直近の drawTo でラスタライズ OOM/過大・カラーキャッシュの容量超過が起きたか
-    /// （診断用。完全な silent failure を避ける。outline/color 共用）。
+    /// Whether the latest drawTo hit rasterize OOM/oversized or color-cache capacity overflow
+    /// (diagnostic; avoids fully silent failure; shared by outline/color).
     last_oom: bool = false,
 
-    /// sbix カラーグリフキャッシュ（TASK-26.3）。RGBA は outline のモノクロキャッシュより
-    /// エントリが桁違いに大きいため別建て（既存 4MiB cap に混ぜると数個で outline 側の
-    /// eviction が荒れる）。key は GID のみ（OutlineFont が px 束縛インスタンスなので
-    /// (GID,px) 相当が成立。既存 outline `cache` と同型）。
+    /// sbix color-glyph cache. RGBA entries are orders of magnitude larger than the monochrome outline
+    /// cache, so it is separate (mixing into the existing 4MiB cap thrash-evicts outline after a few
+    /// entries). Key is GID only (OutlineFont is a px-bound instance, so this is equivalent to
+    /// (GID,px); same shape as the outline `cache`).
     color_cache: std.AutoHashMapUnmanaged(u16, CachedColorGlyph) = .empty,
     color_cache_bytes: usize = 0,
     color_cache_cap: usize = 8 * 1024 * 1024,
-    /// sbix 構造破壊（findGlyph の error.InvalidFont）を検出したら true にし、以後この
-    /// インスタンスでは sbix 参照自体をスキップする（毎フレーム再試行・クラッシュを防ぐ。
-    /// 途中 strike の破壊で後続 strike に正常 bitmap があっても保守的に全 sbix を無効化する）。
+    /// Set true when sbix structural corruption (findGlyph error.InvalidFont) is detected; thereafter
+    /// this instance skips sbix entirely (avoids per-frame retry/crash).
+    /// Conservatively disables all sbix even if a later strike still has a valid bitmap after a mid-strike break.
     sbix_broken: bool = false,
 
-    /// 可変フォント軸状態（インスタンス局所。gvar 未接続時は外形 default 不変）。
+    /// Variable-font axis state (per instance; outline stays at default while gvar is unconnected).
     axis_design: [MAX_AXES]f32 = .{0} ** MAX_AXES,
     axis_norm: [MAX_AXES]f32 = .{0} ** MAX_AXES,
     axis_count: u16 = 0,
     axes_generation: u32 = 0,
-    /// 軸別 advance cache（numGlyphs 長・案(b)）。軸変更で eager 再構築。非可変は null。
-    /// measure(*const)/color drawGlyphs は read-only 参照のみ（確保しない）。
+    /// Per-glyph advance cache (length numGlyphs; eager rebuild). Rebuilt eagerly on axis change. Null when non-variable.
+    /// measure(*const)/color drawGlyphs only take a read-only reference (do not allocate).
     advance_cache: ?[]f32 = null,
 
     pub fn init(alloc: std.mem.Allocator, face: *const FontFace, px: f32) OutlineFont {
-        // px をサニタイズ（非有限/非正/過大 → 安全値）。advance/メトリクスの trap・暴走を防ぐ。
+        // Sanitize px (non-finite/non-positive/oversized → safe value). Prevents advance/metrics traps and runaway sizes.
         const safe_px: f32 = if (std.math.isFinite(px) and px > 0) @min(px, max_glyph_dim) else 16;
         var result: OutlineFont = .{
             .alloc = alloc,
@@ -247,7 +247,7 @@ pub const OutlineFont = struct {
         return result;
     }
 
-    // ── 可変フォント軸 API（UI/起動時イベント。軸変更で clearCache）──
+    // ── Variable-font axis API (UI / startup events; axis change calls clearCache) ──
 
     pub fn axisCount(self: *const OutlineFont) u16 {
         return self.axis_count;
@@ -276,8 +276,8 @@ pub const OutlineFont = struct {
         @memcpy(out[0..n], self.axis_norm[0..n]);
     }
 
-    /// design space で 1 軸設定。未知 tag / 非可変 face は Unsupported。
-    /// 軸変更で advance_cache を eager 再構築（OOM は error.OutOfMemory）。
+    /// Set one axis in design space. Unknown tag / non-variable face → Unsupported.
+    /// Axis change eagerly rebuilds advance_cache (OOM → error.OutOfMemory).
     pub fn setAxis(self: *OutlineFont, tag: *const [4]u8, value: f32) Error!void {
         if (self.axis_count == 0) return error.Unsupported;
         if (!std.math.isFinite(value)) return error.Unsupported;
@@ -289,7 +289,7 @@ pub const OutlineFont = struct {
         try self.onAxesChanged();
     }
 
-    /// 全軸を design 配列で設定（len == axis_count）。
+    /// Set all axes from a design array (len == axis_count).
     pub fn setAxes(self: *OutlineFont, values: []const f32) Error!void {
         if (self.axis_count == 0) return error.Unsupported;
         if (values.len != self.axis_count) return error.Unsupported;
@@ -305,7 +305,7 @@ pub const OutlineFont = struct {
         try self.onAxesChanged();
     }
 
-    /// fvar の named instance を選択。
+    /// Select an fvar named instance.
     pub fn selectNamedInstance(self: *OutlineFont, index: u16) Error!void {
         if (self.axis_count == 0) return error.Unsupported;
         const fv = self.face.fvar.?;
@@ -315,7 +315,7 @@ pub const OutlineFont = struct {
         try self.setAxes(coords[0..fv.axis_count]);
     }
 
-    /// 全軸 default に戻す。cache 再構築の OOM を伝播。
+    /// Reset all axes to default. Propagates OOM from cache rebuild.
     pub fn resetAxes(self: *OutlineFont) Error!void {
         if (self.axis_count == 0) return;
         const fv = self.face.fvar.?;
@@ -341,7 +341,7 @@ pub const OutlineFont = struct {
         }
     }
 
-    /// 軸変更時: 全 GID の advance を eager 構築（USE_MY_METRICS / HVAR > phantom > hmtx）。
+    /// On axis change: eagerly build advances for all GIDs (USE_MY_METRICS / HVAR > phantom > hmtx).
     fn rebuildAdvanceCache(self: *OutlineFont) Error!void {
         self.freeAdvanceCache();
         if (self.axis_count == 0) return;
@@ -355,15 +355,15 @@ pub const OutlineFont = struct {
         self.advance_cache = cache;
     }
 
-    /// metrics 専用経路: advance（px）。outline 構築はしない。
-    /// composite で USE_MY_METRICS が在る場合: 最後の該当 component の advance を再帰採用
-    /// （composite 自身の HVAR/phantom は使わない）。
-    /// 無い場合: HVAR > gvar phantom（simple/composite）> default hmtx。
+    /// Metrics-only path: advance (px). Does not build an outline.
+    /// When a composite has USE_MY_METRICS: recursively adopt the last matching component's advance
+    /// (do not use the composite's own HVAR/phantom).
+    /// Otherwise: HVAR > gvar phantom (simple/composite) > default hmtx.
     fn computeAdvancePx(self: *const OutlineFont, gid: u16, depth: u32) Error!f32 {
-        if (depth > 8) return error.InvalidFont; // composite 循環防止
-        // USE_MY_METRICS: 最後の component の advance をそのまま採用。
-        // 点マッチ composite（Unsupported）は構造を取れないので UMM 無し扱い → 自身の hmtx/HVAR。
-        // （outline 公開経路の InvalidFont とは独立。metrics は fail させない）
+        if (depth > 8) return error.InvalidFont; // Prevent composite cycles
+        // USE_MY_METRICS: adopt the last component's advance as-is.
+        // Point-matched composites (Unsupported) cannot expose structure, so treat as no-UMM → own hmtx/HVAR.
+        // (Independent of InvalidFont on the public outline path. Metrics must not fail.)
         switch (self.face.source) {
             .glyf => |*g| {
                 const info = g.parseCompositeInfo(gid) catch |e| switch (e) {
@@ -417,9 +417,9 @@ pub const OutlineFont = struct {
                 true,
             );
         }
-        // composite: component_count を仮想点数として phantom を復元（IUP 無し）
+        // composite: restore phantoms using component_count as virtual point count (no IUP)
         const info = g.parseCompositeInfo(gid) catch |e| switch (e) {
-            error.Unsupported => return 0, // 点マッチ等は advance デルタ 0
+            error.Unsupported => return 0, // Point-matched etc. contribute advance delta 0
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidFont,
         };
@@ -434,7 +434,7 @@ pub const OutlineFont = struct {
                 false, // composite
             );
         }
-        return 0; // 空グリフ
+        return 0; // Empty glyph
     }
 
     fn recomputeNormFromDesign(self: *OutlineFont) void {
@@ -476,18 +476,18 @@ pub const OutlineFont = struct {
         while (it.next()) |v| if (v.pixels.len > 0) self.alloc.free(v.pixels);
     }
 
-    /// sbix カラーグリフキャッシュを全クリアする（outline の `clearCache` と対の別 API。
-    /// TASK-26.3。合計サイズが `color_cache_cap` を超えた時の eviction 手段として使う）。
+    /// Clear the entire sbix color-glyph cache (separate API paired with outline `clearCache`.
+    /// Eviction tool when total size exceeds `color_cache_cap`).
     pub fn clearColorCache(self: *OutlineFont) void {
         self.freeColorBitmaps();
         self.color_cache.clearRetainingCapacity();
         self.color_cache_bytes = 0;
     }
 
-    // ── Font インターフェース ──
+    // ── Font interface ──
     const vtable: Font.VTable = .{ .measure = measureImpl, .drawTo = drawToImpl, .metrics = metricsImpl };
 
-    /// mutable な実体からのみ呼ぶこと（borrowed view を返す）。
+    /// Call only from a mutable instance (returns a borrowed view).
     pub fn asFont(self: *OutlineFont) Font {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -497,7 +497,7 @@ pub const OutlineFont = struct {
         return self.measure(text);
     }
     fn drawToImpl(ptr: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
-        // interior mutability（キャッシュ遅延充填）。thread-confined 前提で @constCast。
+        // Interior mutability (lazy cache fill). @constCast under the thread-confined assumption.
         const self: *OutlineFont = @ptrCast(@alignCast(@constCast(ptr)));
         self.drawTo(target, pos, text, col, clip, scale);
     }
@@ -506,9 +506,9 @@ pub const OutlineFont = struct {
         return self.metrics();
     }
 
-    /// ピクセルメトリクス（ascender 等）。**MVAR 非対応のため軸非依存の近似**
-    /// （default インスタンスの hhea/OS/2 由来）。可変で縦メトリクスが変わるフォントでは
-    /// 正確な軸依存値にはならない。
+    /// Pixel metrics (ascender etc.). **Axis-independent approximation because MVAR is unsupported**
+    /// (from default-instance hhea/OS/2). Not exact axis-dependent values for fonts whose vertical
+    /// metrics change with axes.
     pub fn metrics(self: *const OutlineFont) Metrics {
         return self.face.sfnt.pixelMetrics(self.px);
     }
@@ -518,8 +518,8 @@ pub const OutlineFont = struct {
         return if (gid >= self.face.sfnt.num_glyphs) 0 else gid;
     }
 
-    /// advance（px）。advance_cache があれば O(1) read-only。無ければ default hmtx。
-    /// 軸変更後は cache が構築済み（案(b)）。const 経路では gvar/HVAR を decode しない。
+    /// advance (px). O(1) read-only when advance_cache exists; else default hmtx.
+    /// After an axis change the cache is already built. The const path never decodes gvar/HVAR.
     fn advancePx(self: *const OutlineFont, gid: u16) f32 {
         if (self.advance_cache) |c| {
             if (gid < c.len) return c[gid];
@@ -528,37 +528,37 @@ pub const OutlineFont = struct {
         return @as(f32, @floatFromInt(aw)) * self.scale;
     }
 
-    /// logical advance 幅の合計（px、round）。alloc/ラスタライズ不要なので失敗しない。
+    /// Sum of logical advance widths (px, rounded). Never fails (no alloc/rasterize).
     pub fn measure(self: *const OutlineFont, text: []const u8) u32 {
         var total: f32 = 0;
         var it = CodepointIter.init(text);
         while (it.next()) |cp| total += self.advancePx(self.gidOf(cp));
-        // saturating（極端な総幅でも trap しない）
+        // saturating (extreme total width must not trap)
         if (!std.math.isFinite(total) or total <= 0) return 0;
         if (total >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
         return @intFromFloat(@round(total));
     }
 
-    /// 毎フレーム・文字列長に比例して走るホットパス（テキスト描画）。ただしグリフ単位の
-    /// per-pixel 転写は既存 `font.blitCoverage`（モノクロ）/ `font.blitRGBA`（カラー、TASK-26.3）
-    /// に委譲しており、ここで新規の全画素ループは書かない。カラーグリフの cache lookup は
-    /// O(1)（hashmap get）で、decode/resize はキャッシュミス時のみ（`getColorGlyph` 参照）。
-    /// `draw_scale`: 論理 font px → 物理描画倍率。outline AA 再ラスタは cache miss 時のみ。
+    /// Hot path that runs every frame proportional to string length (text draw). Per-glyph per-pixel
+    /// blit is delegated to existing `font.blitCoverage` (mono) / `font.blitRGBA` (color);
+    /// this file does not introduce a new full-pixel loop. Color-glyph cache lookup is
+    /// O(1) (hashmap get); decode/resize only on miss (see `getColorGlyph`).
+    /// `draw_scale`: logical font px → physical draw scale. Outline AA re-raster only on cache miss.
     pub fn drawTo(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, draw_scale: f32) void {
         self.drawGlyphs(target, pos, text, col, clip, draw_scale, false);
     }
 
-    /// `drawTo` の透明レイヤー版（TASK-79.4）。AA 縁のカバレッジ・カラーグリフのアルファを
-    /// straight alpha のまま target へ蓄積する（`drawTo` は不透明フレームバッファ前提で出力
-    /// A=0xFF 固定。独立の透明テキストレイヤーへ焼く場合はこちらを使う）。glyph walk・キャッシュは
-    /// `drawTo` と完全に共有し（`drawGlyphs`）、per-glyph の blit だけ straight 版に出し分ける。
-    /// per-glyph 転写は `font.blitCoverageStraight`（モノクロ）/ `font.blitRGBAStraight`（カラー）に
-    /// 委譲（ここで新規の全画素ループは書かない。ホットパス性質は `drawTo` と同じ）。
+    /// Transparent-layer variant of `drawTo`. Accumulates AA-edge coverage and color-glyph alpha as
+    /// straight alpha into the target (`drawTo` assumes an opaque framebuffer and forces output
+    /// A=0xFF. Use this when baking an independent transparent text layer). Glyph walk and cache are
+    /// fully shared with `drawTo` (via `drawGlyphs`); only the per-glyph blit switches to the straight variant.
+    /// Per-glyph blit is delegated to `font.blitCoverageStraight` (mono) / `font.blitRGBAStraight` (color)
+    /// (no new full-pixel loop here; same hot-path nature as `drawTo`).
     pub fn drawToStraight(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, draw_scale: f32) void {
         self.drawGlyphs(target, pos, text, col, clip, draw_scale, true);
     }
 
-    /// 描画 scale から物理 font size の 1/64px 量子化キーを導出する。
+    /// Derive a 1/64px-quantized physical font-size key from the draw scale.
     fn physicalPxQ(self: *const OutlineFont, draw_scale: f32) u32 {
         const s = if (std.math.isFinite(draw_scale) and draw_scale > 0) draw_scale else 1.0;
         const q = @round(self.px * s * 64.0);
@@ -572,25 +572,25 @@ pub const OutlineFont = struct {
         return raster_px / self.px;
     }
 
-    /// `drawTo`/`drawToStraight` 共有の glyph walk（TASK-79.4 でリファクタ抽出）。comptime
-    /// `straight` で per-glyph blit だけを出し分け、キャッシュ充填・advance 計算等の挙動は完全に
-    /// 共有する（重複コード排除。`drawTo` 側の既存テストが無改変で通ることで回帰無しを担保）。
+    /// Glyph walk shared by `drawTo`/`drawToStraight`. Comptime
+    /// `straight` switches only the per-glyph blit; cache fill, advance, etc. are fully
+    /// shared (dedupes code; existing `drawTo` tests pass unchanged to guard against regressions).
     fn drawGlyphs(self: *OutlineFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, draw_scale: f32, comptime straight: bool) void {
         self.last_oom = false;
         const physical_px_q = self.physicalPxQ(draw_scale);
         const effective = self.effectiveScaleFromQ(physical_px_q);
         const m = self.metrics();
-        // 物理 baseline: floor(logical_ascent * effective_scale)
+        // Physical baseline: floor(logical_ascent * effective_scale)
         const physical_ascent: i32 = @intFromFloat(@floor(@as(f32, @floatFromInt(m.ascent)) * effective));
-        const baseline_y = pos.y +| physical_ascent; // 飽和加算（極端 pos.y で trap しない）
+        const baseline_y = pos.y +| physical_ascent; // Saturating add (extreme pos.y must not trap)
         var cx: f32 = @floatFromInt(pos.x);
         var it = CodepointIter.init(text);
         while (it.next()) |cp| {
-            if (!std.math.isFinite(cx) or cx > 2.0e9) break; // 画面外＋i32 変換 trap 防止
+            if (!std.math.isFinite(cx) or cx > 2.0e9) break; // Off-screen + i32 conversion trap guard
             const gid = self.gidOf(cp);
-            // カラーグリフ優先（sbix。col は無視して RGBA をそのまま転写）。
-            // 無ければ（sbix 無効・当該 GID に bitmap 無し・decode 失敗等）モノクロ outline へ。
-            // sbix は本タスクでは scale 非対応（論理サイズのまま。key も GID のみ）。
+            // Prefer color glyphs (sbix; ignore col and blit RGBA as-is).
+            // Else (sbix disabled / no bitmap for GID / decode failure / …) fall back to mono outline.
+            // sbix path does not support draw scale (stays at logical size; key is GID only).
             if (self.getColorGlyph(gid)) |cg| {
                 const bx = @as(i32, @intFromFloat(@round(cx))) +| cg.left;
                 const by = baseline_y +| cg.top;
@@ -599,15 +599,15 @@ pub const OutlineFont = struct {
                 } else {
                     font.blitRGBA(target, bx, by, cg.pixels, cg.w, cg.h, clip);
                 }
-                cx += self.advancePx(gid); // advance は hmtx 経由（色/モノクロ問わず論理。sbix は scale 非対応）
+                cx += self.advancePx(gid); // advance via hmtx (logical for both color and mono; sbix does not support draw scale)
                 continue;
             }
             const cg = self.getCached(gid, physical_px_q) catch {
-                cx += self.advancePx(gid) * effective; // 描画はスキップ、物理送りだけ進める
+                cx += self.advancePx(gid) * effective; // Skip drawing; advance the physical pen only
                 continue;
             };
             if (cg.bitmap) |bm| {
-                const bx = @as(i32, @intFromFloat(@round(cx))) +| cg.left; // 飽和加算
+                const bx = @as(i32, @intFromFloat(@round(cx))) +| cg.left; // Saturating add
                 const by = baseline_y +| cg.top;
                 if (straight) {
                     font.blitCoverageStraight(target, bx, by, bm.data, bm.w, bm.h, col, clip);
@@ -623,7 +623,7 @@ pub const OutlineFont = struct {
         const key = PhysicalGlyphKey{ .gid = gid, .physical_px_q = physical_px_q };
         if (self.cache.get(key)) |g| {
             if (g.oom) {
-                self.last_oom = true; // tombstone ヒットでも診断を立て続ける
+                self.last_oom = true; // Keep raising the diagnostic on tombstone hits
                 return error.OutOfMemory;
             }
             return g;
@@ -631,7 +631,7 @@ pub const OutlineFont = struct {
         const cg = self.buildGlyph(gid, physical_px_q) catch |e| switch (e) {
             error.OutOfMemory => {
                 self.last_oom = true;
-                // tombstone（再試行地獄を防ぐ）。put 失敗は無視（次回再試行）。
+                // Tombstone (prevents retry storms). Ignore put failure (retry next time).
                 const effective = self.effectiveScaleFromQ(physical_px_q);
                 self.cache.put(self.alloc, key, .{
                     .bitmap = null,
@@ -644,8 +644,8 @@ pub const OutlineFont = struct {
             },
             else => return e, // InvalidFont / Unsupported
         };
-        // 単一グリフが cap を超える場合は描画断念。bitmap を破棄し oom tombstone として記録
-        // （leak/ cap 無効化を防ぎ、描画不能を last_oom で診断する。空グリフと区別する）。
+        // If a single glyph exceeds cap, abort drawing. Discard the bitmap and record an oom tombstone
+        // (prevents leak / cap bypass; diagnose undrawable via last_oom; distinct from empty glyphs).
         if (cg.bitmap) |bm| {
             if (@sizeOf(PhysicalGlyphKey) + @sizeOf(CachedGlyph) + bm.data.len > self.cache_cap) {
                 self.alloc.free(bm.data);
@@ -664,7 +664,7 @@ pub const OutlineFont = struct {
         if (self.cache_bytes + entry_bytes > self.cache_cap) self.clearCache();
         self.cache.put(self.alloc, key, cg) catch |e| {
             if (cg.bitmap) |bm| self.alloc.free(bm.data);
-            self.last_oom = true; // キャッシュ登録自体の OOM も診断（描画はスキップされる）
+            self.last_oom = true; // Also diagnose OOM from the cache insert itself (drawing is skipped)
             return e;
         };
         self.cache_bytes += entry_bytes;
@@ -672,7 +672,7 @@ pub const OutlineFont = struct {
     }
 
     fn buildGlyph(self: *OutlineFont, gid: u16, physical_px_q: u32) Error!CachedGlyph {
-        // cache miss 時のみ: 物理 px で sfnt 変換を導出し AA ラスタライズする。
+        // On cache miss only: derive the sfnt transform at physical px and AA-rasterize.
         const raster_px = @as(f32, @floatFromInt(physical_px_q)) / 64.0;
         const effective = raster_px / self.px;
         const s = self.face.sfnt.scaleForPixelSize(raster_px);
@@ -696,7 +696,7 @@ pub const OutlineFont = struct {
             return .{ .bitmap = null, .left = 0, .top = 0, .advance = adv };
         }
 
-        // bbox（全点・制御点込み）
+        // bbox (all points including control points)
         var xmin: f32 = std.math.floatMax(f32);
         var ymin: f32 = std.math.floatMax(f32);
         var xmax: f32 = -std.math.floatMax(f32);
@@ -721,12 +721,12 @@ pub const OutlineFont = struct {
         const y1 = @ceil(ymax * s);
         const w_f = @ceil(xmax * s) - x0 + 1;
         const h_f = y1 - @floor(ymin * s) + 1;
-        // 過大/非有限は描画断念（tombstone 扱い）
+        // Oversized / non-finite → abort drawing (tombstone)
         if (!std.math.isFinite(w_f) or !std.math.isFinite(h_f) or w_f > max_glyph_dim or h_f > max_glyph_dim or w_f < 1 or h_f < 1) {
             return error.OutOfMemory;
         }
-        // 配置オフセット(x0/y1)が i32 域を大きく超えると left/top の @intFromFloat が trap する。
-        // 現実離れした座標（大きすぎる font units など）は描画断念。
+        // Placement offsets (x0/y1) far outside i32 make left/top @intFromFloat trap.
+        // Unrealistic coordinates (huge font units, etc.) abort drawing.
         if (!std.math.isFinite(x0) or !std.math.isFinite(y1) or @abs(x0) > (1 << 23) or @abs(y1) > (1 << 23)) {
             return error.OutOfMemory;
         }
@@ -746,18 +746,18 @@ pub const OutlineFont = struct {
         };
     }
 
-    // ── sbix カラーグリフ（TASK-26.3） ──
+    // ── sbix color glyphs ──
 
-    /// この OutlineFont インスタンスで sbix 参照が有効か（テーブル有り かつ 構造破壊未検出）。
+    /// Whether sbix lookup is active on this OutlineFont (table present and no structural corruption detected).
     fn hasSbix(self: *const OutlineFont) bool {
         return !self.sbix_broken and self.face.sbix != null;
     }
 
-    /// gid のカラーグリフをキャッシュ越しに取得する。`null` は「カラー無し・outline へ
-    /// フォールバック」（sbix 無効・当該 GID に全 strike で bitmap 無し・decode 失敗等、
-    /// いずれも negative cache の tombstone として区別せず一様に null で表す）。
-    /// per-glyph-draw で毎フレーム呼ばれる O(1) 経路（cache hit の場合。miss 時のみ
-    /// `buildColorGlyph` の decode/resize が走る＝イベント時のみ）。
+    /// Fetch a color glyph for gid through the cache. `null` means "no color → fall back to
+    /// outline" (sbix disabled / no bitmap in any strike for this GID / decode failure / …;
+    /// all collapse uniformly to null as a negative-cache tombstone, without further distinction).
+    /// O(1) path called every frame from per-glyph draw (on cache hit). On miss only,
+    /// `buildColorGlyph` decode/resize runs (= event-time only).
     fn getColorGlyph(self: *OutlineFont, gid: u16) ?CachedColorGlyph {
         if (!self.hasSbix()) return null;
         if (self.color_cache.get(gid)) |g| {
@@ -766,17 +766,17 @@ pub const OutlineFont = struct {
         }
         const cg = self.buildColorGlyph(gid);
         self.insertColorCache(gid, cg);
-        // insertColorCache は cap 超過時に cg.pixels を free して failed tombstone を
-        // 別途 put し直すため、ローカルの cg をそのまま返してはいけない（free 済み
-        // pixels を指す use-after-free になる）。必ず再取得した値を返す。
-        const stored = self.color_cache.get(gid) orelse return null; // put 自体が OOM で失敗した場合
+        // insertColorCache may free cg.pixels on cap overflow and re-put a failed tombstone,
+        // so returning the local cg would be a use-after-free on the freed
+        // pixels. Always return the re-fetched value.
+        const stored = self.color_cache.get(gid) orelse return null; // When the put itself fails with OOM
         if (stored.failed) return null;
         return stored;
     }
 
-    /// cg を color_cache へ登録する（容量管理込み）。単一エントリが cap を超える場合は
-    /// 破棄して failed tombstone + last_oom（既存 outline の cap 超過処理と同型）。
-    /// 合計超過時は `clearColorCache()` で全クリアしてから挿入する。
+    /// Insert cg into color_cache (with capacity management). If a single entry exceeds cap,
+    /// discard it and record a failed tombstone + last_oom (same shape as outline cap overflow).
+    /// On total overflow, `clearColorCache()` then insert.
     fn insertColorCache(self: *OutlineFont, gid: u16, cg: CachedColorGlyph) void {
         const entry_bytes = @sizeOf(CachedColorGlyph) + @as(usize, cg.pixels.len) * @sizeOf(u32);
         if (entry_bytes > self.color_cache_cap) {
@@ -788,29 +788,29 @@ pub const OutlineFont = struct {
         if (self.color_cache_bytes + entry_bytes > self.color_cache_cap) self.clearColorCache();
         self.color_cache.put(self.alloc, gid, cg) catch {
             if (cg.pixels.len > 0) self.alloc.free(cg.pixels);
-            self.last_oom = true; // キャッシュ登録自体の OOM も診断
+            self.last_oom = true; // Also diagnose OOM from the cache insert itself
             return;
         };
         self.color_cache_bytes += entry_bytes;
     }
 
-    /// sbix から gid の RGBA ビットマップを解決する（strike 横断・decode・必要ならリサイズ）。
-    /// **イベント時のみ**（color_cache ミス時のみ呼ばれる。フレーム毎には走らない）。
-    /// 失敗系（全 strike に bitmap 無し・空 bytes・decode 失敗・OOM・スケール後サイズ不正）は
-    /// すべて `.failed = true` の negative cache tombstone に統一する（以後 outline へ即
-    /// フォールバックし再試行しない）。sbix 構造破壊（InvalidFont）検出時は `sbix_broken` を
-    /// 立てて以後このインスタンスでは sbix 参照自体をスキップする（途中 strike の破壊で
-    /// 後続 strike に正常 bitmap があっても保守的に全 sbix を無効化する。フォントデータ不正が
-    /// 前提なので毎描画再試行より安全側に倒す）。
+    /// Resolve an RGBA bitmap for gid from sbix (across strikes; decode; resize if needed).
+    /// **Event-time only** (called only on color_cache miss; never per-frame).
+    /// All failure modes (no bitmap in any strike / empty bytes / decode failure / OOM / bad post-scale size)
+    /// unify to a `.failed = true` negative-cache tombstone (immediate outline fallback thereafter;
+    /// no retry). On sbix structural corruption (InvalidFont), set `sbix_broken` and
+    /// skip sbix entirely on this instance thereafter (conservatively disable all sbix even if a later
+    /// strike still has a valid bitmap after a mid-strike break. Font data is already corrupt, so
+    /// prefer the safe side over retrying every draw).
     fn buildColorGlyph(self: *OutlineFont, gid: u16) CachedColorGlyph {
-        const sbx = &(self.face.sbix.?); // hasSbix() 済みの呼び出し元でのみ呼ばれる
-        const target_px: u32 = @intFromFloat(@round(self.px)); // self.px は init で正の有限値にサニタイズ済み
+        const sbx = &(self.face.sbix.?); // Called only from callers that already checked hasSbix()
+        const target_px: u32 = @intFromFloat(@round(self.px)); // self.px is sanitized to a positive finite value in init
         const found_opt = sbx.findGlyph(target_px, gid) catch {
             self.sbix_broken = true;
             return .{ .failed = true };
         };
-        const found = found_opt orelse return .{ .failed = true }; // 全 strike に bitmap 無し
-        if (found.glyph.bytes.len == 0) return .{ .failed = true }; // 空 PNG バイト列（何もデコードできない）
+        const found = found_opt orelse return .{ .failed = true }; // No bitmap in any strike
+        if (found.glyph.bytes.len == 0) return .{ .failed = true }; // Empty PNG byte sequence (nothing to decode)
 
         var img = png_mod.decodePNG(self.alloc, found.glyph.bytes) catch |e| {
             if (e == error.OutOfMemory) self.last_oom = true;
@@ -832,8 +832,8 @@ pub const OutlineFont = struct {
         var w = img.width;
         var h = img.height;
 
-        // scale が浮動小数点で厳密に 1.0（px と ppem が一致する典型ケース）の時のみ
-        // リサイズをスキップし decode バッファの所有権をそのまま移動する（無変換=bit 一致）。
+        // Only when scale is exactly 1.0 in floating point (typical case where px matches ppem)
+        // skip resize and transfer ownership of the decode buffer (no transform = bit-identical).
         if (scale != 1.0) {
             const new_w_f = @round(@as(f32, @floatFromInt(w)) * scale);
             const new_h_f = @round(@as(f32, @floatFromInt(h)) * scale);
@@ -850,24 +850,24 @@ pub const OutlineFont = struct {
                 img.deinit(self.alloc);
                 return .{ .failed = true };
             };
-            img.deinit(self.alloc); // 元バッファを解放（scaled は別バッファ）
+            img.deinit(self.alloc); // Free the source buffer (scaled is a separate buffer)
             pixels = scaled;
             w = new_w;
             h = new_h;
         }
 
-        // 単一グリフの寸法上限は scale==1.0（無変換）経路も含め一律に適用する（codex 指摘。
-        // resize 経路は new_w/new_h を上で既に検証済みだが、無変換経路は img.width/height を
-        // そのまま使うため、ここでチェックしないと巨大な等倍 PNG が上限を迂回してキャッシュされ得る）。
+        // The single-glyph size cap applies uniformly, including the scale==1.0 (no-transform) path.
+        // The resize path already validates new_w/new_h above, but the no-transform path uses img.width/height
+        // as-is; without this check a huge 1:1 PNG could bypass the cap and enter the cache).
         if (w < 1 or h < 1 or w > max_glyph_dim or h > max_glyph_dim) {
             self.alloc.free(pixels);
             return .{ .failed = true };
         }
 
-        // origin offset は strike のピクセル単位 → scale を掛けて出力解像度に合わせる
-        // （scale==1.0 の場合は乗算しても値は不変）。bitmap 下端基準（AC#5）:
+        // origin offset is in strike pixels → multiply by scale to match output resolution
+        // (at scale==1.0 the multiply is a no-op). Bitmap bottom-edge origin:
         //   bx = round(cx) + round(originOffsetX*scale)
-        //   top(field) = -(round(originOffsetY*scale) + scaled_h)  （baseline_y + top(field) = 描画 top-left y）
+        //   top(field) = -(round(originOffsetY*scale) + scaled_h)  (baseline_y + top(field) = draw top-left y)
         const ox_f = @as(f32, @floatFromInt(found.glyph.origin_offset_x)) * scale;
         const oy_f = @as(f32, @floatFromInt(found.glyph.origin_offset_y)) * scale;
         if (!std.math.isFinite(ox_f) or !std.math.isFinite(oy_f) or @abs(ox_f) > (1 << 23) or @abs(oy_f) > (1 << 23)) {
@@ -881,10 +881,10 @@ pub const OutlineFont = struct {
     }
 };
 
-/// src(sw×sh) を dst(dw×dh) へ nearest-neighbor でリサンプルする（新規バッファ確保、呼び出し側 free）。
-/// **イベント時のみ**（sbix カラーグリフの color_cache ミス時に 1 回だけ呼ばれる。フレーム毎には
-/// 走らないため SIMD 適用対象外）。per-pixel 除算を避けるため行・列の src index は
-/// Bresenham 型の整数 step 累積で求める（分数ステップの `sw/dw` を除算せず加算のみで追跡）。
+/// Nearest-neighbor resample src(sw×sh) into dst(dw×dh) (allocates a new buffer; caller frees).
+/// **Event-time only** (called once on sbix color-glyph color_cache miss; never per-frame,
+/// so outside SIMD scope). To avoid per-pixel division, row/column src indices use
+/// Bresenham-style integer step accumulation (track the fractional `sw/dw` step by addition only, no division).
 fn nearestNeighborScale(alloc: std.mem.Allocator, src: []const u32, sw: u32, sh: u32, dw: u32, dh: u32) std.mem.Allocator.Error![]u32 {
     std.debug.assert(sw > 0 and sh > 0 and dw > 0 and dh > 0);
     const xs = try alloc.alloc(u32, dw);
@@ -922,7 +922,7 @@ fn expand(v: outline_mod.Vec2f, xmin: *f32, ymin: *f32, xmax: *f32, ymax: *f32) 
     ymax.* = @max(ymax.*, v.y);
 }
 
-/// UTF-8 → コードポイント反復。不正 UTF-8 はバイト単位 fallback（gui/font.zig と同方針）。
+/// UTF-8 → codepoint iteration. Invalid UTF-8 falls back per byte (same policy as gui/font.zig).
 const CodepointIter = struct {
     text: []const u8,
     valid: bool,
@@ -977,15 +977,15 @@ fn appendI16(l: *std.ArrayList(u8), a: std.mem.Allocator, v: i16) !void {
     try appendU16(l, a, @bitCast(v));
 }
 
-/// 三角形 simple グリフ（全 on-curve, 2-byte デルタ）を作る。点は (x,y) font units。
+/// Build a triangular simple glyph (all on-curve, 2-byte deltas). Points are (x,y) font units.
 fn buildTriangleGlyph(a: std.mem.Allocator, pts: []const [2]i16) ![]u8 {
     var g: std.ArrayList(u8) = .empty;
     errdefer g.deinit(a);
     try appendI16(&g, a, 1); // numberOfContours
-    for (0..4) |_| try appendI16(&g, a, 0); // bbox（未使用）
+    for (0..4) |_| try appendI16(&g, a, 0); // bbox (unused)
     try appendU16(&g, a, @intCast(pts.len - 1)); // endPts[0]
     try appendU16(&g, a, 0); // instructionLength
-    for (pts) |_| try g.append(a, 0x01); // flags: on-curve・2byte デルタ
+    for (pts) |_| try g.append(a, 0x01); // flags: on-curve · 2-byte deltas
     var px: i16 = 0;
     for (pts) |p| {
         try appendI16(&g, a, p[0] - px);
@@ -1002,7 +1002,7 @@ fn buildTriangleGlyph(a: std.mem.Allocator, pts: []const [2]i16) ![]u8 {
 
 const SfntTable = struct { tag: [4]u8, body: []const u8 };
 
-/// sfnt(tag,body) 群からフォントバイト列を組む。
+/// Assemble a font byte stream from sfnt(tag,body) pieces.
 fn buildSfnt(a: std.mem.Allocator, tables: []const SfntTable) ![]u8 {
     const n: u16 = @intCast(tables.len);
     var out: std.ArrayList(u8) = .empty;
@@ -1024,11 +1024,11 @@ fn buildSfnt(a: std.mem.Allocator, tables: []const SfntTable) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-/// 完全な合成 TTF を組む。gid0=.notdef(空), gid1='A'(三角形), gid2=' '(空)。
-/// cmap: 'A'(0x41)->1, ' '(0x20)->2。unitsPerEm=64, advance=64。
+/// Build a complete synthetic TTF. gid0=.notdef(empty), gid1='A'(triangle), gid2=' '(empty).
+/// cmap: 'A'(0x41)->1, ' '(0x20)->2. unitsPerEm=64, advance=64.
 fn buildTestFont(a: std.mem.Allocator, adv: u16) ![]u8 {
     var head = [_]u8{0} ** 54;
-    putU16(&head, 12, 0x5F0F); // magic 上位（下記で全体設定）
+    putU16(&head, 12, 0x5F0F); // magic high bits (set for the whole font below)
     // magic 0x5F0F3CF5
     head[12] = 0x5F;
     head[13] = 0x0F;
@@ -1051,19 +1051,19 @@ fn buildTestFont(a: std.mem.Allocator, adv: u16) ![]u8 {
     putU16(&hmtx, 4, adv); // gid1 advance
     putU16(&hmtx, 8, adv); // gid2 advance
 
-    // glyf: gid0 空, gid1 三角形, gid2 空
+    // glyf: gid0 empty, gid1 triangle, gid2 empty
     const tri = try buildTriangleGlyph(a, &.{ .{ 8, 0 }, .{ 56, 0 }, .{ 32, 48 } });
     defer a.free(tri);
     var glyf: std.ArrayList(u8) = .empty;
     defer glyf.deinit(a);
     var loca: std.ArrayList(u8) = .empty;
     defer loca.deinit(a);
-    // offsets（short=byte/2）: gid0=0(空), gid1=0..tri, gid2=tri..tri(空), end
+    // offsets (short=byte/2): gid0=0(empty), gid1=0..tri, gid2=tri..tri(empty), end
     try appendU16(&loca, a, 0); // gid0 start
-    try appendU16(&loca, a, 0); // gid0 end = gid1 start（gid0 空）
+    try appendU16(&loca, a, 0); // gid0 end = gid1 start (gid0 empty)
     try glyf.appendSlice(a, tri);
     try appendU16(&loca, a, @intCast(tri.len / 2)); // gid1 end = gid2 start
-    try appendU16(&loca, a, @intCast(tri.len / 2)); // gid2 end（空）
+    try appendU16(&loca, a, @intCast(tri.len / 2)); // gid2 end (empty)
 
     // cmap format4: seg0 [0x20,0x20]->gid2(idDelta=2-0x20), seg1 [0x41,0x41]->gid1(idDelta=1-0x41), sentinel
     var cmap_sub = [_]u8{0} ** (16 + 8 * 3);
@@ -1114,7 +1114,7 @@ fn buildTestFont(a: std.mem.Allocator, adv: u16) ![]u8 {
     });
 }
 
-test "OutlineFont: 合成完全 TTF を end-to-end（cmap→glyf→raster→drawTo）" {
+test "OutlineFont: synthetic complete TTF end-to-end (cmap→glyf→raster→drawTo)" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1127,7 +1127,7 @@ test "OutlineFont: 合成完全 TTF を end-to-end（cmap→glyf→raster→draw
     try testing.expectEqual(@as(u32, 64), of.measure("A"));
     // 'A '(A + space) = 128
     try testing.expectEqual(@as(u32, 128), of.measure("A "));
-    // 未対応文字（cmap 無し）→ gid0(.notdef, 空) advance 64
+    // Unmapped char (no cmap) → gid0(.notdef, empty) advance 64
     try testing.expectEqual(@as(u32, 64), of.measure("Z"));
 
     // metrics
@@ -1135,7 +1135,7 @@ test "OutlineFont: 合成完全 TTF を end-to-end（cmap→glyf→raster→draw
     try testing.expectEqual(@as(i32, 48), m.ascent); // ascender 48 * scale 1
     try testing.expect(m.line_height >= @as(u32, @intCast(m.ascent + m.descent)));
 
-    // drawTo: 'A' を描画 → 三角形内部に塗りピクセルが出る
+    // drawTo: paint 'A' → filled pixels appear inside the triangle
     const W = 80;
     const H = 80;
     var px_buf = [_]u32{0xFF000000} ** (W * H);
@@ -1147,11 +1147,11 @@ test "OutlineFont: 合成完全 TTF を end-to-end（cmap→glyf→raster→draw
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
     };
-    try testing.expect(any); // 何か描かれた
+    try testing.expect(any); // Something was painted
     try testing.expect(!of.last_oom);
 }
 
-test "OutlineFont: drawTo 後にグリフがキャッシュされる" {
+test "OutlineFont: glyph is cached after drawTo" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1164,7 +1164,7 @@ test "OutlineFont: drawTo 後にグリフがキャッシュされる" {
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    try testing.expect(of.cache.count() >= 1); // 'A' の gid がキャッシュされた
+    try testing.expect(of.cache.count() >= 1); // gid for 'A' was cached
     try testing.expect(of.cache_bytes > 0);
 
     of.clearCache();
@@ -1172,7 +1172,7 @@ test "OutlineFont: drawTo 後にグリフがキャッシュされる" {
     try testing.expectEqual(@as(usize, 0), of.cache_bytes);
 }
 
-test "OutlineFont: cache.put OOM 経路でも last_oom=true" {
+test "OutlineFont: cache.put OOM path still sets last_oom=true" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1183,25 +1183,25 @@ test "OutlineFont: cache.put OOM 経路でも last_oom=true" {
     var of = OutlineFont.init(fba.allocator(), &face, 64);
     defer of.deinit();
 
-    try testing.expectError(error.OutOfMemory, of.getCached(2, of.physicalPxQ(1.0))); // space glyph: bitmap なし → cache.put で OOM
+    try testing.expectError(error.OutOfMemory, of.getCached(2, of.physicalPxQ(1.0))); // space glyph: no bitmap → OOM on cache.put
     try testing.expect(of.last_oom);
     try testing.expectEqual(@as(u32, 0), of.cache.count());
 }
 
-test "OutlineFont: fractional advance で Σ-then-round（per-glyph round でない）" {
+test "OutlineFont: fractional advance uses sum-then-round (not per-glyph round)" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 10); // advance 10 units
     defer a.free(data);
     const face = try FontFace.init(data);
-    var of = OutlineFont.init(a, &face, 48); // scale = 48/64 = 0.75 → advance_px = 7.5（非整数）
+    var of = OutlineFont.init(a, &face, 48); // scale = 48/64 = 0.75 → advance_px = 7.5 (non-integer)
     defer of.deinit();
-    // per-glyph round なら round(7.5)*2 = 16。Σ-then-round なら round(7.5*2)=round(15)=15。
+    // per-glyph round would be round(7.5)*2 = 16. sum-then-round is round(7.5*2)=round(15)=15.
     try testing.expectEqual(@as(u32, 8), of.measure("A")); // round(7.5)=8
-    try testing.expectEqual(@as(u32, 15), of.measure("AA")); // round(15.0)=15（≠16）
+    try testing.expectEqual(@as(u32, 15), of.measure("AA")); // round(15.0)=15 (≠16)
     try testing.expectEqual(@as(u32, 23), of.measure("AAA")); // round(22.5)=23
 }
 
-test "OutlineFont: asFont 経由（Font インターフェース）で measure/metrics" {
+test "OutlineFont: measure/metrics via asFont (Font interface)" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1213,7 +1213,7 @@ test "OutlineFont: asFont 経由（Font インターフェース）で measure/m
     try testing.expectEqual(@as(u32, 64), f.measure("A"));
     try testing.expectEqual(@as(i32, 48), f.metrics().ascent);
 
-    // Font 経由 drawTo（@constCast 経路）でもキャッシュ充填・描画される
+    // Font-path drawTo (@constCast) also fills the cache and paints
     const W = 80;
     var px_buf = [_]u32{0xFF000000} ** (W * W);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
@@ -1223,16 +1223,16 @@ test "OutlineFont: asFont 経由（Font インターフェース）で measure/m
 }
 
 // ============================================================
-// drawToStraight のテスト（TASK-79.4: 透明レイヤーへのラスタライズ基盤）
+// drawToStraight tests (transparent-layer raster foundation)
 // ============================================================
 
-test "OutlineFont.drawToStraight: 透明レイヤーへ描いてから不透明背景へ手動合成した結果は drawTo の直接描画と bit 完全一致する（AC#1 の最強オラクル）" {
-    // drawToStraight が「後段合成で元の見た目を再現できる」straight alpha を正しく積んでいることを
-    // end-to-end で保証する。drawTo の blitCoverage は Color.blend(=pixelops.srcOverOpaque) で
-    // 直接不透明合成するのに対し、drawToStraight の blitCoverageStraight は透明dstへ
-    // srcOverStraightScalar(dst=0, col, cov) で積む。数学的に両者は
-    // 「透明dstへ積んだ straight pixel {col.rgb, eff_a} を同じ bg へ srcOverOpaque する」のと
-    // 完全に同じ式になる（cov=0 で skip する経路も dst=0 のままなので srcOverOpaque(bg,0)=bg で一致）。
+test "OutlineFont.drawToStraight: compositing a transparent layer onto an opaque background matches drawTo direct paint bit-exactly" {
+    // End-to-end guarantee that drawToStraight accumulates straight alpha that later compositing can
+    // reproduce. drawTo blitCoverage blends directly opaque via Color.blend(=pixelops.srcOverOpaque),
+    // while drawToStraight blitCoverageStraight accumulates onto a transparent dst via
+    // srcOverStraightScalar(dst=0, col, cov). Mathematically both equal
+    // "srcOverOpaque the straight pixel {col.rgb, eff_a} (accumulated onto transparent dst) onto the same bg"
+    // (the cov=0 skip path also leaves dst=0, so srcOverOpaque(bg,0)=bg matches).
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1240,18 +1240,18 @@ test "OutlineFont.drawToStraight: 透明レイヤーへ描いてから不透明�
 
     const W = 80;
     const H = 80;
-    const bg: u32 = 0xFF203040; // 不透明な任意背景色
+    const bg: u32 = 0xFF203040; // Arbitrary opaque background color
     const col = Color.rgba(0xFF, 0xE0, 0x10, 0xFF);
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
 
-    // 直接描画（不透明 fb を bg で初期化）
+    // Direct paint (opaque fb initialized to bg)
     var of_direct = OutlineFont.init(a, &face, 64);
     defer of_direct.deinit();
     var px_direct = [_]u32{bg} ** (W * H);
     const t_direct = RenderTarget{ .pixels = &px_direct, .width = W, .height = H };
     of_direct.drawTo(t_direct, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
-    // 透明レイヤーへ描画（独立キャッシュ）→ bg へ手動合成
+    // Paint onto a transparent layer (independent cache) → manually composite onto bg
     var of_layer = OutlineFont.init(a, &face, 64);
     defer of_layer.deinit();
     var px_layer = [_]u32{0x00000000} ** (W * H);
@@ -1266,20 +1266,20 @@ test "OutlineFont.drawToStraight: 透明レイヤーへ描いてから不透明�
     try testing.expect(!of_layer.last_oom);
 }
 
-test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重なり）した結果は drawTo 直接描画と ±1/channel 以内で一致する" {
-    // codex レビュー指摘を受けて追加: 単一グリフ非重複だけでは弱いため、意図的にずらして重なるように
-    // 2回描画し、かつ半透明色（alpha=128）で「真の透明合成」を発生させる（不透明色だと2回目が完全
-    // 上書きになり重ね塗りの丸め挙動を検証できない）。
+test "OutlineFont.drawToStraight: two overlapping semi-transparent paints match drawTo direct paint within ±1/channel" {
+    // Two intentionally overlapping draws with a semi-transparent color (alpha=128) exercise true
+    // transparent compositing (an opaque color would fully overwrite on the second pass and could not
+    // validate stacked rounding).
     //
-    // 実測で分かったこと（bit 完全一致ではなく ±1/channel 許容にした理由）: 直接描画側は
-    // 2 回とも `srcOverOpaque`（da は常に255固定の整数 div255Round）だが、透明レイヤー側の
-    // 2 回目は「1回目の非トリビアル alpha を持つ dst」への blend になるため
-    // `srcOverStraightScalar` の可変分母 f32 除算経路を通る（da<255 では div255 に還元できない）。
-    // 二重に重なる画素だけ、整数経路と f32 経路の丸め方式の違いにより ±1 の差が生じ得る
-    // （実測: 1画素で R が 170 → 171 の off-by-one）。単発 blend（このファイルの直前のテスト、
-    // および実運用の「1回の drawToStraight 呼び出しで1レイヤーを焼いて1回だけ合成する」という
-    // 主要ユースケース）は bit 完全一致のままであり、AC#1 が要求する性質はそちらで担保済み。
-    // このテストは「大きく破綻していないこと（丸め1未満のずれに収まること）」を確認する。
+    // Why ±1/channel is allowed (not bit-exact): the direct path always uses
+    // `srcOverOpaque` (da fixed at 255; integer div255Round), but the transparent-layer
+    // second pass blends onto a dst that already has non-trivial alpha, taking the
+    // `srcOverStraightScalar` variable-denominator f32 divide path (cannot reduce to div255 when da<255).
+    // Only doubly covered pixels can differ by ±1 from the integer vs f32 rounding difference
+    // (observed: one pixel R 170 → 171 off-by-one). Single-pass blend (the preceding test in this file,
+    // and the main production case of "one drawToStraight call baking one layer then one composite")
+    // remains bit-exact; that property is covered there.
+    // This test checks that results stay within sub-rounding error (difference < 1).
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1288,10 +1288,10 @@ test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重な
     const W = 90;
     const H = 90;
     const bg: u32 = 0xFF102030;
-    const col = Color.rgba(0xF0, 0x60, 0x30, 0x80); // 半透明（alpha=128）
+    const col = Color.rgba(0xF0, 0x60, 0x30, 0x80); // Semi-transparent (alpha=128)
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     const pos1 = Vec2{ .x = 4, .y = 4 };
-    const pos2 = Vec2{ .x = 18, .y = 12 }; // 三角形グリフが重なる程度にずらす
+    const pos2 = Vec2{ .x = 18, .y = 12 }; // Offset so the triangular glyphs overlap
 
     var of_direct = OutlineFont.init(a, &face, 64);
     defer of_direct.deinit();
@@ -1317,20 +1317,20 @@ test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重な
         const cb: [4]u8 = @bitCast(c);
         for (db, cb) |dch, cch| {
             const diff: i32 = @as(i32, dch) - @as(i32, cch);
-            try testing.expect(@abs(diff) <= 1); // 丸め方式の違いによる ±1 のみ許容
+            try testing.expect(@abs(diff) <= 1); // Allow only ±1 from rounding-mode differences
         }
         mismatches += 1;
     }
-    // 差分は「二重に覆われた極小領域」に留まるはず（三角形グリフ2枚の交差はごく一部）。
+    // Diffs should stay in the tiny doubly covered region (two triangular glyphs intersect only a little).
     try testing.expect(mismatches < (W * H) / 4);
 
-    // 重なりが実際に発生した(=非自明なテストである)ことの sanity check（codex レビュー指摘:
-    // 上の ±1 丸め差分が Zig/LLVM/target 依存で偶然 0 件になっても、このテストの前提「真に
-    // overlap した」ことは丸め差分の有無に依存しない別条件で確認する）。
-    // codex 再指摘: 「pos1+pos2 の結果が pos1 単発と異なる」だけでは pos2 が完全非重複でも
-    // 真になるため overlap の証明にならない。正しくは pos1 単発と pos2 単発を別々に描いて、
-    // **同じ画素で両方が bg から変化している**ことを確認する（= その画素は両グリフのカバレッジが
-    // 重なっている）。
+    // Sanity check that overlap actually happened (non-trivial test):
+    // even if the ±1 rounding diff happens to be zero on a given Zig/LLVM/target, the premise "truly
+    // overlapped" is confirmed by a separate condition that does not depend on rounding diffs.
+    // "pos1+pos2 differs from pos1 alone" is not proof of overlap (true even if pos2 is fully disjoint).
+    // Correctly: paint pos1 alone and pos2 alone separately, and confirm
+    // **the same pixel changed from bg under both** (= that pixel is covered by both glyphs'
+    // coverage).
     var of_pos1 = OutlineFont.init(a, &face, 64);
     defer of_pos1.deinit();
     var px_pos1 = [_]u32{bg} ** (W * H);
@@ -1350,9 +1350,9 @@ test "OutlineFont.drawToStraight: 半透明色で2回重ね描き（真の重な
     try testing.expect(overlap_found);
 }
 
-test "OutlineFont: CFF のみ(.otf 想定)は Unsupported / glyf 無しは InvalidFont" {
+test "OutlineFont: CFF-only (.otf-like) is Unsupported / missing glyf is InvalidFont" {
     const a = testing.allocator;
-    // glyf も CFF も無い最小 sfnt（head/maxp/hhea/hmtx/cmap のみ）→ InvalidFont
+    // Minimal sfnt with neither glyf nor CFF (head/maxp/hhea/hmtx/cmap only) → InvalidFont
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
     head[13] = 0x0F;
@@ -1365,7 +1365,7 @@ test "OutlineFont: CFF のみ(.otf 想定)は Unsupported / glyf 無しは Inval
     putU16(&hhea, 34, 1);
     var hmtx = [_]u8{0} ** 4;
     putU16(&hmtx, 0, 64);
-    // 最小 cmap（format4, 1 seg sentinel）
+    // Minimal cmap (format4, 1 seg sentinel)
     var cmap_sub = [_]u8{0} ** (16 + 8);
     putU16(&cmap_sub, 0, 4);
     putU16(&cmap_sub, 2, @intCast(cmap_sub.len));
@@ -1392,11 +1392,11 @@ test "OutlineFont: CFF のみ(.otf 想定)は Unsupported / glyf 無しは Inval
 
 // ── CFF(.otf) end-to-end ──
 
-/// 非 CID・Private 空・subr なしの最小 CFF テーブルを組む。glyphs[i] = gid i の Type2 charstring。
-/// レイアウト: header(4)+Name INDEX("F",6)+TopDICT INDEX(24,固定19byte topdict)+String(2)+GlobalSubr(2)
-///           +CharStrings INDEX+Private(0)。Top DICT の offset は int32 固定幅で後埋め。
+/// Build a minimal non-CID CFF table with empty Private and no subrs. glyphs[i] = Type2 charstring for gid i.
+/// Layout: header(4)+Name INDEX("F",6)+TopDICT INDEX(24, fixed 19-byte topdict)+String(2)+GlobalSubr(2)
+///           +CharStrings INDEX+Private(0). Top DICT offsets are fixed-width int32, back-patched.
 fn buildCffTable(a: std.mem.Allocator, glyphs: []const []const u8) ![]u8 {
-    // CharStrings INDEX を組む（offSize=1 前提＝総データ<256）
+    // Build CharStrings INDEX (assumes offSize=1 ⇒ total data <256)
     var cs_index: std.ArrayList(u8) = .empty;
     defer cs_index.deinit(a);
     try appendU16(&cs_index, a, @intCast(glyphs.len));
@@ -1436,11 +1436,11 @@ fn buildCffTable(a: std.mem.Allocator, glyphs: []const []const u8) ![]u8 {
     try appendU16(&out, a, 0);
     // CharStrings INDEX
     try out.appendSlice(a, cs_index.items);
-    // Private DICT: size 0（追加バイトなし。private_off == out.len）
+    // Private DICT: size 0 (no extra bytes; private_off == out.len)
     return out.toOwnedSlice(a);
 }
 
-/// CFF(.otf) を組む。gid0=.notdef(endchar), gid1='A'(三角形)。cmap 'A'->1, unitsPerEm=64, advance=64。
+/// Build a CFF(.otf). gid0=.notdef(endchar), gid1='A'(triangle). cmap 'A'->1, unitsPerEm=64, advance=64.
 fn buildCffOtf(a: std.mem.Allocator) ![]u8 {
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
@@ -1477,7 +1477,7 @@ fn buildCffOtf(a: std.mem.Allocator) ![]u8 {
     cmap_tbl[11] = 12;
     @memcpy(cmap_tbl[12..], &cmap_sub);
 
-    // CFF: gid0 endchar, gid1 'A' 三角形 (rmoveto 8 0; rlineto 48 0; rlineto -24 48; endchar)
+    // CFF: gid0 endchar, gid1 'A' triangle (rmoveto 8 0; rlineto 48 0; rlineto -24 48; endchar)
     const g0 = [_]u8{14};
     const g1 = [_]u8{ 8 + 139, 0 + 139, 21, 48 + 139, 0 + 139, 5, @intCast(@as(i32, -24) + 139), 48 + 139, 5, 14 };
     const cff_tbl = try buildCffTable(a, &.{ &g0, &g1 });
@@ -1493,8 +1493,8 @@ fn buildCffOtf(a: std.mem.Allocator) ![]u8 {
     });
 }
 
-/// format 12 cmap を持つ TTF を組む。gid0 空, gid1='A' 三角形, gid2=三角形。
-/// cmap: 'A'(0x41)->1, U+20000->2（BMP 超え＝format 12 経路）。unitsPerEm=64, advance=64。
+/// Build a TTF with format 12 cmap. gid0 empty, gid1='A' triangle, gid2=triangle.
+/// cmap: 'A'(0x41)->1, U+20000->2 (non-BMP = format 12 path). unitsPerEm=64, advance=64.
 fn buildCjkFont(a: std.mem.Allocator) ![]u8 {
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
@@ -1523,7 +1523,7 @@ fn buildCjkFont(a: std.mem.Allocator) ![]u8 {
     var loca: std.ArrayList(u8) = .empty;
     defer loca.deinit(a);
     try appendU16(&loca, a, 0); // gid0 start
-    try appendU16(&loca, a, 0); // gid0 end（空）= gid1 start
+    try appendU16(&loca, a, 0); // gid0 end (empty) = gid1 start
     try glyf.appendSlice(a, tA);
     try appendU16(&loca, a, @intCast(glyf.items.len / 2)); // gid1 end = gid2 start
     try glyf.appendSlice(a, tB);
@@ -1562,21 +1562,21 @@ fn buildCjkFont(a: std.mem.Allocator) ![]u8 {
     });
 }
 
-test "CJK: cmap format 12 経路（BMP 超え codepoint を gid 解決）" {
+test "CJK: cmap format 12 path (resolve non-BMP codepoint to gid)" {
     const a = testing.allocator;
     const data = try buildCjkFont(a);
     defer a.free(data);
     const face = try FontFace.init(data);
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
-    // U+20000 → gid2（format 12 経路）。空でない glyph なので advance 64。
+    // U+20000 → gid2 (format 12 path). Non-empty glyph so advance 64.
     try testing.expectEqual(@as(u32, 64), of.measure("\u{20000}"));
     try testing.expectEqual(@as(u16, 2), of.gidOf(0x20000));
     try testing.expectEqual(@as(u16, 1), of.gidOf(0x41));
-    try testing.expectEqual(@as(u16, 0), of.gidOf(0x42)); // 未対応 → .notdef
+    try testing.expectEqual(@as(u16, 0), of.gidOf(0x42)); // Unmapped → .notdef
 }
 
-test "CJK: cache hit は count/bytes 不変（再ラスタライズなし）" {
+test "CJK: cache hit leaves count/bytes unchanged (no re-rasterize)" {
     const a = testing.allocator;
     const data = try buildCjkFont(a);
     defer a.free(data);
@@ -1593,11 +1593,11 @@ test "CJK: cache hit は count/bytes 不変（再ラスタライズなし）" {
     const bytes1 = of.cache_bytes;
     try testing.expect(count1 >= 1 and bytes1 > 0);
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    try testing.expectEqual(count1, of.cache.count()); // 再ラスタライズされていない
+    try testing.expectEqual(count1, of.cache.count()); // Was not re-rasterized
     try testing.expectEqual(bytes1, of.cache_bytes);
 }
 
-test "CJK: cache 上限到達で eviction（破綻せず描画継続）" {
+test "CJK: cache cap eviction continues drawing without failing" {
     const a = testing.allocator;
     const data = try buildCjkFont(a);
     defer a.free(data);
@@ -1610,24 +1610,24 @@ test "CJK: cache 上限到達で eviction（破綻せず描画継続）" {
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
 
-    // 'A' を 1 つ描いて 1 グリフ分のサイズを把握 → cap をそれちょうどに設定して次の挿入で eviction
+    // Draw one 'A' to learn one-glyph size → set cap exactly there so the next insert evicts
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     const q = of.physicalPxQ(1.0);
     const key_a = PhysicalGlyphKey{ .gid = of.gidOf(0x41), .physical_px_q = q };
     try testing.expectEqual(@as(u32, 1), of.cache.count());
-    try testing.expect(of.cache.contains(key_a)); // 'A' がキャッシュ済み
-    of.cache_cap = of.cache_bytes; // 次の新規挿入で超過 → clearCache
-    // 別グリフ(U+20000=gid2)を描画 → eviction が起きるが破綻しない
+    try testing.expect(of.cache.contains(key_a)); // 'A' is cached
+    of.cache_cap = of.cache_bytes; // Next new insert overflows → clearCache
+    // Draw another glyph (U+20000=gid2) → eviction happens without failing
     of.drawTo(target, .{ .x = 40, .y = 4 }, "\u{20000}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    try testing.expect(of.cache_bytes <= of.cache_cap); // 上限内
-    try testing.expect(!of.last_oom); // 単一グリフは cap 内なので OOM 扱いではない
-    // eviction で 'A' は消え、新グリフ(U+20000)だけが残る（clearCache→再挿入の直接証明）
+    try testing.expect(of.cache_bytes <= of.cache_cap); // Within cap
+    try testing.expect(!of.last_oom); // Single glyph fits cap, so not treated as OOM
+    // Eviction drops 'A'; only the new glyph (U+20000) remains (direct proof of clearCache→reinsert)
     try testing.expectEqual(@as(u32, 1), of.cache.count());
-    try testing.expect(!of.cache.contains(key_a)); // 旧 key は消えた
-    try testing.expect(of.cache.contains(.{ .gid = of.gidOf(0x20000), .physical_px_q = q })); // 新 key のみ
+    try testing.expect(!of.cache.contains(key_a)); // Old key is gone
+    try testing.expect(of.cache.contains(.{ .gid = of.gidOf(0x20000), .physical_px_q = q })); // Only the new key remains
 }
 
-test "CJK: ASCII + BMP 超え混在描画は破綻しない" {
+test "CJK: mixed ASCII + non-BMP draw does not fail" {
     const a = testing.allocator;
     const data = try buildCjkFont(a);
     defer a.free(data);
@@ -1639,7 +1639,7 @@ test "CJK: ASCII + BMP 超え混在描画は破綻しない" {
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = 80 };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = 80 };
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A\u{20000}A\u{20000}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    // measure は 4 codepoint × advance 64 = 256
+    // measure is 4 codepoints × advance 64 = 256
     try testing.expectEqual(@as(u32, 256), of.measure("A\u{20000}A\u{20000}"));
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
@@ -1648,7 +1648,7 @@ test "CJK: ASCII + BMP 超え混在描画は破綻しない" {
     try testing.expect(any);
 }
 
-test "OutlineFont: 合成 CFF(.otf) を end-to-end（cff→charstring→raster→drawTo）" {
+test "OutlineFont: synthetic CFF(.otf) end-to-end (cff→charstring→raster→drawTo)" {
     const a = testing.allocator;
     const data = try buildCffOtf(a);
     defer a.free(data);
@@ -1671,18 +1671,18 @@ test "OutlineFont: 合成 CFF(.otf) を end-to-end（cff→charstring→raster�
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
     };
-    try testing.expect(any); // CFF グリフが描画された
+    try testing.expect(any); // CFF glyph was painted
     try testing.expect(!of.last_oom);
 }
 
 // ============================================================
-// TASK-26.3: sbix 統合（カラーグリフ）テスト
+// sbix integration (color glyph) tests
 // ============================================================
 
-/// TASK-26.3 sbix 統合テスト用フォント（sbix バイト列は呼び出し側が用意する版。破損 sbix を
-/// 直接注入するテスト（FontFace 破損検出・sbix_broken 等）で使う）。
-/// gid0=notdef(空)/gid1='A'(0x41,三角形,常にモノクロ専用=sbix レコード無しの前提で呼ぶ)/
-/// gid2=U+1F600(三角形)/gid3=U+1F601(三角形)。cmap format 12（'A'/U+1F600/U+1F601 の 3 group）。
+/// sbix integration test font (caller supplies the sbix bytes. Used by tests that inject a
+/// corrupt sbix directly — FontFace corruption detection, sbix_broken, etc.).
+/// gid0=notdef(empty)/gid1='A'(0x41,triangle, always mono-only=call with no sbix record)/
+/// gid2=U+1F600(triangle)/gid3=U+1F601(triangle). cmap format 12 (3 groups: 'A'/U+1F600/U+1F601).
 fn buildEmojiTestFontRaw(a: std.mem.Allocator, sbix_bytes: []const u8) ![]u8 {
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
@@ -1716,7 +1716,7 @@ fn buildEmojiTestFontRaw(a: std.mem.Allocator, sbix_bytes: []const u8) ![]u8 {
     defer glyf.deinit(a);
     var loca: std.ArrayList(u8) = .empty;
     defer loca.deinit(a);
-    try appendU16(&loca, a, 0); // gid0 start（空）
+    try appendU16(&loca, a, 0); // gid0 start (empty)
     try appendU16(&loca, a, 0); // gid0 end = gid1 start
     try glyf.appendSlice(a, t1);
     try appendU16(&loca, a, @intCast(glyf.items.len / 2)); // gid1 end = gid2 start
@@ -1759,15 +1759,15 @@ fn buildEmojiTestFontRaw(a: std.mem.Allocator, sbix_bytes: []const u8) ![]u8 {
     });
 }
 
-/// strikes から sbix バイト列を組んで埋め込む通常版（`sbix_mod.buildSbix` を利用。
-/// 各 StrikeSpec.records は長さ 4 必須=gid0..gid3）。
+/// Usual variant that builds and embeds an sbix byte stream from strikes (via `sbix_mod.buildSbix`.
+/// Each StrikeSpec.records must have length 4 = gid0..gid3).
 fn buildEmojiTestFont(a: std.mem.Allocator, strikes: []const sbix_mod.StrikeSpec) ![]u8 {
     const sbix_bytes = try sbix_mod.buildSbix(a, 4, strikes);
     defer a.free(sbix_bytes);
     return buildEmojiTestFontRaw(a, sbix_bytes);
 }
 
-test "TASK-26.3: sbix テーブル無しの既存フォントは face.sbix == null（回帰）" {
+test "sbix: fonts without an sbix table keep face.sbix == null (regression)" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -1775,9 +1775,9 @@ test "TASK-26.3: sbix テーブル無しの既存フォントは face.sbix == nu
     try testing.expect(face.sbix == null);
 }
 
-test "TASK-26.3: カラーグリフ描画は PNG と bit 一致し col を無視する（px==ppem 無変換）" {
+test "sbix: color glyph draw matches PNG bit-exactly and ignores col (px==ppem, no rescale)" {
     const a = testing.allocator;
-    const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF }; // 赤・緑・青・白
+    const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF }; // red / green / blue / white
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
     defer a.free(png_bytes);
     const data = try buildEmojiTestFont(a, &.{
@@ -1787,7 +1787,7 @@ test "TASK-26.3: カラーグリフ描画は PNG と bit 一致し col を無視
     const face = try FontFace.init(data);
     try testing.expect(face.sbix != null);
 
-    var of = OutlineFont.init(a, &face, 64); // px==ppem(64) → scale=1（無変換）
+    var of = OutlineFont.init(a, &face, 64); // px==ppem(64) → scale=1 (no transform)
     defer of.deinit();
 
     const W = 40;
@@ -1804,14 +1804,14 @@ test "TASK-26.3: カラーグリフ描画は PNG と bit 一致し col を無視
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), px1[51 * W + 5]);
     try testing.expect(!of.last_oom);
 
-    // col を変えても出力 bit 不変（カラーグリフは col 無視）
+    // Changing col leaves output bits unchanged (color glyphs ignore col)
     var px2 = [_]u32{0xFF000000} ** (W * H);
     const target2 = RenderTarget{ .pixels = &px2, .width = W, .height = H };
     of.drawTo(target2, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0x00, 0x00, 0x00, 0xFF), clip, 1.0);
     try testing.expectEqualSlices(u32, &px1, &px2);
 }
 
-test "TASK-26.3: モノクロ('A')とカラー(絵文字)混在描画は col の適用/非適用が分岐する" {
+test "sbix: mixed mono('A') and color(emoji) draw branches col apply vs ignore" {
     const a = testing.allocator;
     const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
@@ -1824,22 +1824,22 @@ test "TASK-26.3: モノクロ('A')とカラー(絵文字)混在描画は col の
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
 
-    try testing.expectEqual(@as(u32, 128), of.measure("A\u{1F600}")); // advance 64+64（hmtx 不変）
+    try testing.expectEqual(@as(u32, 128), of.measure("A\u{1F600}")); // advance 64+64 (hmtx unchanged)
 
     const W = 140;
     const H = 80;
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    const col = Color.rgba(0x11, 0x22, 0x33, 0xFF); // パレットと衝突しない識別用色
+    const col = Color.rgba(0x11, 0x22, 0x33, 0xFF); // Distinctive color that does not collide with the palette
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A\u{1F600}", col, clip, 1.0);
 
-    // 絵文字（'A' の advance 64 だけ右にずれる）は col に関わらず PNG のまま
+    // Emoji (shifted right by 'A' advance 64) stays as PNG regardless of col
     try testing.expectEqual(@as(u32, 0xFFFF0000), px_buf[50 * W + 4 + 64]);
     try testing.expectEqual(@as(u32, 0xFF00FF00), px_buf[50 * W + 5 + 64]);
     try testing.expectEqual(@as(u32, 0xFF0000FF), px_buf[51 * W + 4 + 64]);
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), px_buf[51 * W + 5 + 64]);
-    // 'A' の三角形内部に col でタイントされたピクセルがある（モノクロ経路は col 適用）
+    // Inside the 'A' triangle there are pixels tinted by col (mono path applies col)
     var any_tinted = false;
     for (px_buf) |p| if (p == 0xFF112233) {
         any_tinted = true;
@@ -1847,10 +1847,10 @@ test "TASK-26.3: モノクロ('A')とカラー(絵文字)混在描画は col の
     try testing.expect(any_tinted);
 }
 
-test "TASK-26.3: nearestNeighborScale は 2x2→4x4 拡大・4x4→2x2 縮小・3x3→3x3 恒等を返す" {
+test "sbix: nearestNeighborScale returns 2x2→4x4 upscale, 4x4→2x2 downscale, 3x3→3x3 identity" {
     const a = testing.allocator;
 
-    // 2x2 -> 4x4（各ソース画素が 2x2 ブロックに複製される。Bresenham 型 step 累積の結果）
+    // 2x2 -> 4x4 (each source pixel is duplicated into a 2x2 block; Bresenham-style step accumulation)
     {
         const src = [_]u32{ 1, 2, 3, 4 };
         const out = try nearestNeighborScale(a, &src, 2, 2, 4, 4);
@@ -1864,18 +1864,18 @@ test "TASK-26.3: nearestNeighborScale は 2x2→4x4 拡大・4x4→2x2 縮小・
         try testing.expectEqualSlices(u32, &expected, out);
     }
 
-    // 4x4 -> 2x2（列/行とも index {0,2} を採用する実装の間引き）
+    // 4x4 -> 2x2 (implementation thins using indices {0,2} for both columns and rows)
     {
         var src: [16]u32 = undefined;
         for (&src, 0..) |*v, i| v.* = @intCast(i);
         const out = try nearestNeighborScale(a, &src, 4, 4, 2, 2);
         defer a.free(out);
-        // src[row*4+col]。xs=[0,2], ys=[0,2] → (0,0)=0 (0,2)=2 (2,0)=8 (2,2)=10
+        // src[row*4+col]. xs=[0,2], ys=[0,2] → (0,0)=0 (0,2)=2 (2,0)=8 (2,2)=10
         const expected = [_]u32{ 0, 2, 8, 10 };
         try testing.expectEqualSlices(u32, &expected, out);
     }
 
-    // 3x3 -> 3x3（恒等）
+    // 3x3 -> 3x3 (identity)
     {
         const src = [_]u32{ 10, 20, 30, 40, 50, 60, 70, 80, 90 };
         const out = try nearestNeighborScale(a, &src, 3, 3, 3, 3);
@@ -1884,7 +1884,7 @@ test "TASK-26.3: nearestNeighborScale は 2x2→4x4 拡大・4x4→2x2 縮小・
     }
 }
 
-test "TASK-26.3: strike ppem != px は nearest-neighbor でスケールし origin offset も scale される（2x2→4x4）" {
+test "sbix: strike ppem != px scales via nearest-neighbor and scales origin offset too (2x2→4x4)" {
     const a = testing.allocator;
     const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
@@ -1920,7 +1920,7 @@ test "TASK-26.3: strike ppem != px は nearest-neighbor でスケールし origi
     }
 }
 
-test "TASK-26.3: originOffsetX/Y は bitmap 下端基準で配置に反映される（px==ppem, scale=1）" {
+test "sbix: originOffsetX/Y place relative to bitmap bottom edge (px==ppem, scale=1)" {
     const a = testing.allocator;
     const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
@@ -1947,7 +1947,7 @@ test "TASK-26.3: originOffsetX/Y は bitmap 下端基準で配置に反映され
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), px_buf[56 * W + 8]);
 }
 
-test "TASK-26.3: 全 strike に bitmap 無しは outline へフォールバックし failed tombstone を記録する（再デコードなし）" {
+test "sbix: no bitmap in any strike falls back to outline and records a failed tombstone (no re-decode)" {
     const a = testing.allocator;
     const data = try buildEmojiTestFont(a, &.{
         .{ .ppem = 64, .records = &.{ .empty, .empty, .empty, .empty } },
@@ -1969,19 +1969,19 @@ test "TASK-26.3: 全 strike に bitmap 無しは outline へフォールバッ�
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
     };
-    try testing.expect(any); // outline(三角形)が描かれた
+    try testing.expect(any); // outline (triangle) was painted
     try testing.expect(of.color_cache.get(gid).?.failed);
 
     const count1 = of.color_cache.count();
     of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    try testing.expectEqual(count1, of.color_cache.count()); // 再デコードされず tombstone のまま
+    try testing.expectEqual(count1, of.color_cache.count()); // Remains a tombstone; no re-decode
 }
 
-test "TASK-26.3: 空バイト列/不正PNGバイト列は outline へフォールバックする" {
+test "sbix: empty bytes / invalid PNG bytes fall back to outline" {
     const a = testing.allocator;
     const scenarios = [_]sbix_mod.RecordSpec{
-        .{ .png = .{ .bytes = &.{} } }, // 空バイト列
-        .{ .png = .{ .bytes = &.{ 0xDE, 0xAD, 0xBE, 0xEF } } }, // 不正 PNG（signature 不一致）
+        .{ .png = .{ .bytes = &.{} } }, // Empty byte sequence
+        .{ .png = .{ .bytes = &.{ 0xDE, 0xAD, 0xBE, 0xEF } } }, // Invalid PNG (signature mismatch)
     };
     for (scenarios) |rec| {
         const data = try buildEmojiTestFont(a, &.{
@@ -2003,24 +2003,24 @@ test "TASK-26.3: 空バイト列/不正PNGバイト列は outline へフォー�
         for (px_buf) |p| if (p != 0xFF000000) {
             any = true;
         };
-        try testing.expect(any); // outline で描画継続
+        try testing.expect(any); // Continue drawing via outline
         const gid = of.gidOf(0x1F600);
         try testing.expect(of.color_cache.get(gid).?.failed);
     }
 }
 
-test "TASK-26.3: 選択 strike に bitmap 無くても別 strike にあれば使う（AC#7 統合確認）" {
+test "sbix: if chosen strike lacks a bitmap, use another strike that has one" {
     const a = testing.allocator;
-    const colors = [4]u32{ 0xFFFF0000, 0xFFFF0000, 0xFFFF0000, 0xFFFF0000 }; // 単色（縮小しても崩れない）
+    const colors = [4]u32{ 0xFFFF0000, 0xFFFF0000, 0xFFFF0000, 0xFFFF0000 }; // Solid color (survives downscale)
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
     defer a.free(png_bytes);
     const data = try buildEmojiTestFont(a, &.{
-        .{ .ppem = 16, .records = &.{ .empty, .empty, .empty, .empty } }, // strike0: gid2 に bitmap 無し
-        .{ .ppem = 64, .records = &.{ .empty, .empty, .{ .png = .{ .bytes = png_bytes } }, .empty } }, // strike1: 有り
+        .{ .ppem = 16, .records = &.{ .empty, .empty, .empty, .empty } }, // strike0: no bitmap for gid2
+        .{ .ppem = 64, .records = &.{ .empty, .empty, .{ .png = .{ .bytes = png_bytes } }, .empty } }, // strike1: present
     });
     defer a.free(data);
     const face = try FontFace.init(data);
-    var of = OutlineFont.init(a, &face, 16); // target_px=16 → strike0(16)優先だが無いので strike1(64)採用
+    var of = OutlineFont.init(a, &face, 16); // target_px=16 → prefer strike0(16) but missing, so adopt strike1(64)
     defer of.deinit();
 
     const W = 40;
@@ -2028,29 +2028,29 @@ test "TASK-26.3: 選択 strike に bitmap 無くても別 strike にあれば使
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    const col = Color.rgba(0x10, 0x20, 0x30, 0xFF); // 背景/PNG 色と衝突しない識別用色
+    const col = Color.rgba(0x10, 0x20, 0x30, 0xFF); // Distinctive color that does not collide with background/PNG colors
     of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", col, clip, 1.0);
 
-    // scale=16/64=0.25 → 2x2 が 1x1 に縮小。ascent=ceil(48*16/64)=12 → baseline_y=16。
-    // left=round(0*0.25)=0, top=-(round(0*0.25)+1)=-1 → by=15, bx=4。
+    // scale=16/64=0.25 → 2x2 shrinks to 1x1. ascent=ceil(48*16/64)=12 → baseline_y=16.
+    // left=round(0*0.25)=0, top=-(round(0*0.25)+1)=-1 → by=15, bx=4.
     try testing.expectEqual(@as(u32, 0xFFFF0000), px_buf[15 * W + 4]);
 }
 
-test "TASK-26.3: sbix 構造破壊(findGlyph の InvalidFont)は sbix_broken を立てて以後 outline へ" {
+test "sbix: structural corruption (findGlyph InvalidFont) sets sbix_broken and uses outline thereafter" {
     const a = testing.allocator;
     const sbix_bytes = try sbix_mod.buildSbix(a, 4, &.{
         .{ .ppem = 64, .records = &.{ .empty, .empty, .empty, .{ .png = .{ .bytes = &.{1} } } } },
     });
     defer a.free(sbix_bytes);
-    // 単一 strike・num_glyphs=4: glyphDataOffsets[gid] は絶対位置 16+4*gid（sbix.zig の doc 通り）。
-    // gid3(index3) の終端(offsets[4]=sentinel)を gid3 の始端(offsets[3])未満に書き換えて
-    // off0>off1（構造破壊）を発生させる。gid0..gid2 の record は無傷のまま。
+    // Single strike · num_glyphs=4: glyphDataOffsets[gid] is absolute position 16+4*gid (as documented in sbix.zig).
+    // Rewrite the end of gid3(index3) (offsets[4]=sentinel) to be less than the start of gid3 (offsets[3])
+    // to force off0>off1 (structural corruption). Records for gid0..gid2 stay intact.
     const gid3_start = std.mem.readInt(u32, sbix_bytes[16 + 4 * 3 ..][0..4], .big);
     putU32(sbix_bytes, 16 + 4 * 4, gid3_start - 1);
 
     const data = try buildEmojiTestFontRaw(a, sbix_bytes);
     defer a.free(data);
-    const face = try FontFace.init(data); // sbix table 自体は parse 時点では壊れていない（lazy 検証）
+    const face = try FontFace.init(data); // The sbix table itself is not broken at parse time (lazy validation)
     try testing.expect(face.sbix != null);
 
     var of = OutlineFont.init(a, &face, 64);
@@ -2061,27 +2061,27 @@ test "TASK-26.3: sbix 構造破壊(findGlyph の InvalidFont)は sbix_broken を
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    // U+1F601(gid3) の findGlyph が InvalidFont → sbix_broken=true、outline(三角形)で描画継続
+    // findGlyph for U+1F601(gid3) → InvalidFont → sbix_broken=true; continue drawing via outline(triangle)
     of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.sbix_broken);
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
     };
-    try testing.expect(any); // クラッシュせず outline が描かれた
+    try testing.expect(any); // outline was painted without crashing
 }
 
-test "TASK-26.3: FontFace は破損 sbix テーブル(構造破壊)を null に縮約し outline のみで動作継続する" {
+test "sbix: FontFace collapses a corrupt sbix table to null and continues outline-only" {
     const a = testing.allocator;
     const sbix_bytes = try sbix_mod.buildSbix(a, 4, &.{
         .{ .ppem = 64, .records = &.{ .empty, .empty, .empty, .empty } },
     });
     defer a.free(sbix_bytes);
-    putU16(sbix_bytes, 0, 2); // version=2（不正）→ Sbix.parse が InvalidFont
+    putU16(sbix_bytes, 0, 2); // version=2 (invalid) → Sbix.parse returns InvalidFont
 
     const data = try buildEmojiTestFontRaw(a, sbix_bytes);
     defer a.free(data);
-    const face = try FontFace.init(data); // FontFace.init 自体は成功する（sbix だけ null に縮約）
+    const face = try FontFace.init(data); // FontFace.init itself succeeds (only sbix collapses to null)
     try testing.expect(face.sbix == null);
 
     var of = OutlineFont.init(a, &face, 64);
@@ -2091,7 +2091,7 @@ test "TASK-26.3: FontFace は破損 sbix テーブル(構造破壊)を null に�
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0); // outline のみで描画可
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0); // Drawable outline-only
     var any = false;
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
@@ -2099,7 +2099,7 @@ test "TASK-26.3: FontFace は破損 sbix テーブル(構造破壊)を null に�
     try testing.expect(any);
 }
 
-test "TASK-26.3: 単一カラーエントリが cap 超過なら tombstone + last_oom（outline で描画継続）" {
+test "sbix: single color entry over cap → tombstone + last_oom (continue drawing via outline)" {
     const a = testing.allocator;
     const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
@@ -2111,7 +2111,7 @@ test "TASK-26.3: 単一カラーエントリが cap 超過なら tombstone + las
     const face = try FontFace.init(data);
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
-    of.color_cache_cap = 4; // どんな 1 エントリより小さい（単一エントリ超過を強制）
+    of.color_cache_cap = 4; // Smaller than any single entry (force single-entry overflow)
 
     const W = 80;
     const H = 80;
@@ -2127,10 +2127,10 @@ test "TASK-26.3: 単一カラーエントリが cap 超過なら tombstone + las
     for (px_buf) |p| if (p != 0xFF000000) {
         any = true;
     };
-    try testing.expect(any); // outline へフォールバックして描画継続
+    try testing.expect(any); // Fall back to outline and continue drawing
 }
 
-test "TASK-26.3: カラーキャッシュ総量超過で clearColorCache が発火する" {
+test "sbix: total color-cache overflow triggers clearColorCache" {
     const a = testing.allocator;
     const colors_a = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
     const colors_b = [4]u32{ 0xFF123456, 0xFF654321, 0xFFABCDEF, 0xFF0F0F0F };
@@ -2157,30 +2157,30 @@ test "TASK-26.3: カラーキャッシュ総量超過で clearColorCache が発�
     try testing.expectEqual(@as(u32, 1), of.color_cache.count());
     try testing.expect(of.color_cache.contains(gid_a));
 
-    of.color_cache_cap = of.color_cache_bytes; // 次の新規挿入で超過 → clearColorCache
+    of.color_cache_cap = of.color_cache_bytes; // Next new insert overflows → clearColorCache
     of.drawTo(target, .{ .x = 40, .y = 4 }, "\u{1F601}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     const gid_b = of.gidOf(0x1F601);
-    try testing.expectEqual(@as(u32, 1), of.color_cache.count()); // 1 エントリ目は消え 2 エントリ目のみ残る
+    try testing.expectEqual(@as(u32, 1), of.color_cache.count()); // First entry is gone; only the second remains
     try testing.expect(!of.color_cache.contains(gid_a));
     try testing.expect(of.color_cache.contains(gid_b));
-    try testing.expect(!of.last_oom); // 単一エントリは cap 内なので OOM 扱いではない
+    try testing.expect(!of.last_oom); // Single entry fits cap, so not treated as OOM
 }
 
 // ============================================================
-// TASK-26.4: sbix E2E テスト追加分（dupe・decode 失敗 negative cache の再確認）
-// TASK-26.3 の既存テスト（上記）は cp→カラー描画/origin/空 record フォールバック/
-// strike フォールバック/混在描画/壊れ PNG フォールバックをカバー済み。dupe は
-// sbix.zig 側に Sbix.findGlyph 単体テストはあるが、OutlineFont.drawTo を通した
-// E2E（cmap→sbix dupe 解決→実ピクセル）は未カバーだったため本タスクで追加する。
+// sbix E2E extras (dupe · reconfirm decode-failure negative cache)
+// Existing tests above cover cp→color draw / origin / empty-record fallback /
+// strike fallback / mixed draw / corrupt-PNG fallback. dupe has a
+// Sbix.findGlyph unit test in sbix.zig, but E2E through OutlineFont.drawTo
+// (cmap→sbix dupe resolve→real pixels) was uncovered; covered here.
 // ============================================================
 
-test "TASK-26.4: dupe は参照先の bitmap で描画され、origin も参照先を採用する（E2E, drawTo 経由）" {
+test "sbix: dupe draws the referent bitmap and adopts the referent origin (E2E via drawTo)" {
     const a = testing.allocator;
     const colors = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
     const png_bytes = try png_mod.encodePNG(&colors, 2, 2, a);
     defer a.free(png_bytes);
-    // gid2(U+1F600) = 実 PNG（origin x=3,y=-5）。gid3(U+1F601) = gid2 への dupe
-    // （自身の origin x=999,y=888 は無視されるはず）。
+    // gid2(U+1F600) = real PNG (origin x=3,y=-5). gid3(U+1F601) = dupe of gid2
+    // (its own origin x=999,y=888 must be ignored).
     const data = try buildEmojiTestFont(a, &.{
         .{ .ppem = 64, .records = &.{
             .empty,
@@ -2199,12 +2199,12 @@ test "TASK-26.4: dupe は参照先の bitmap で描画され、origin も参照�
     var px_buf = [_]u32{0xFF000000} ** (W * H);
     const target = RenderTarget{ .pixels = &px_buf, .width = W, .height = H };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
-    // U+1F601 は cmap format12 経由で gid3(dupe) に解決される（buildEmojiTestFontRaw の cmap 定義）。
+    // U+1F601 resolves to gid3(dupe) via cmap format12 (cmap definition in buildEmojiTestFontRaw).
     of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F601}", Color.rgba(0, 0, 0, 0xFF), clip, 1.0);
 
-    // 参照先(gid2)の origin（x=3,y=-5）が採用される: baseline_y=52, left=round(3*1)=3,
-    // top=-(round(-5*1)+2)=3 → bx=7, by=55（"originOffsetX/Y" テストと同じ座標。
-    // dupe 自身の origin(999,888) が使われていればここに描画されず座標が破綻する）。
+    // Referent (gid2) origin (x=3,y=-5) is adopted: baseline_y=52, left=round(3*1)=3,
+    // top=-(round(-5*1)+2)=3 → bx=7, by=55 (same coordinates as the "originOffsetX/Y" test.
+    // If the dupe's own origin(999,888) were used, nothing would paint here and coordinates would break).
     try testing.expectEqual(@as(u32, 0xFFFF0000), px_buf[55 * W + 7]);
     try testing.expectEqual(@as(u32, 0xFF00FF00), px_buf[55 * W + 8]);
     try testing.expectEqual(@as(u32, 0xFF0000FF), px_buf[56 * W + 7]);
@@ -2212,11 +2212,11 @@ test "TASK-26.4: dupe は参照先の bitmap で描画され、origin も参照�
     try testing.expect(!of.last_oom);
 
     const gid3 = of.gidOf(0x1F601);
-    try testing.expect(!of.color_cache.get(gid3).?.failed); // dupe 解決成功（tombstone でない）
+    try testing.expect(!of.color_cache.get(gid3).?.failed); // dupe resolve succeeded (not a tombstone)
 }
 
 // ============================================================
-// TASK-25.15.1: 可変フォント軸基盤テスト
+// Variable-font axis foundation tests
 // ============================================================
 
 fn putI32(buf: []u8, off: usize, v: i32) void {
@@ -2226,7 +2226,7 @@ fn putI16(buf: []u8, off: usize, v: i16) void {
     putU16(buf, off, @bitCast(v));
 }
 
-/// OpenType 仕様どおりの 1 軸 wght fvar テーブル（instance 無し）。
+/// One-axis wght fvar table per the OpenType spec (no instances).
 fn buildFvarTableWght() [36]u8 {
     const full = buildFvarTableWghtWithInstances(0, &.{});
     var buf: [36]u8 = undefined;
@@ -2239,7 +2239,7 @@ const FvarTestTable = struct {
     len: usize,
 };
 
-/// named instance 付き fvar（1 軸 wght）。instances は instance_count 個の 8 バイトレコード。
+/// fvar with named instances (1 axis wght). instances is instance_count records of 8 bytes each.
 fn buildFvarTableWghtWithInstances(instance_count: u16, instances: []const [8]u8) FvarTestTable {
     const axes_off: usize = 16;
     const inst_off = axes_off + 20;
@@ -2267,7 +2267,7 @@ fn buildFvarTableWghtWithInstances(instance_count: u16, instances: []const [8]u8
     return result;
 }
 
-/// 1 軸・必須マップ (-1,-1),(0,0),(1,1) + 中間 (0.5,0.75) の avar テーブル。
+/// One-axis avar table with required map (-1,-1),(0,0),(1,1) plus midpoint (0.5,0.75).
 fn buildAvarTableWght() [26]u8 {
     var buf: [26]u8 = undefined;
     @memset(&buf, 0);
@@ -2285,7 +2285,7 @@ fn buildAvarTableWght() [26]u8 {
     return buf;
 }
 
-/// buildTestFont に fvar を追加した可変版。avar_tbl を渡せば fvar+avar 付き。
+/// Variable variant of buildTestFont with fvar added. Pass avar_tbl for fvar+avar.
 fn buildVarTestFont(a: std.mem.Allocator, adv: u16, avar_tbl: ?[]const u8) ![]u8 {
     const fvar_tbl = buildFvarTableWght();
     var head = [_]u8{0} ** 54;
@@ -2316,7 +2316,7 @@ fn buildVarTestFont(a: std.mem.Allocator, adv: u16, avar_tbl: ?[]const u8) ![]u8
     try glyf.appendSlice(a, tri);
     try appendU16(&loca, a, @intCast(tri.len / 2));
     try appendU16(&loca, a, @intCast(tri.len / 2));
-    // cmap format4: buildTestFont と同一レイアウト
+    // cmap format4: same layout as buildTestFont
     var cmap_sub = [_]u8{0} ** (16 + 8 * 3);
     putU16(&cmap_sub, 0, 4);
     putU16(&cmap_sub, 2, @intCast(cmap_sub.len));
@@ -2372,7 +2372,7 @@ fn buildVarTestFont(a: std.mem.Allocator, adv: u16, avar_tbl: ?[]const u8) ![]u8
     });
 }
 
-test "TASK-25.15.1: 非可変 setAxis は Unsupported" {
+test "VF: setAxis on non-variable face is Unsupported" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -2384,7 +2384,7 @@ test "TASK-25.15.1: 非可変 setAxis は Unsupported" {
     try testing.expectError(error.Unsupported, of.setAxis(&wght, 700));
 }
 
-test "TASK-25.15.1: 軸 API setAxis/setAxes/resetAxes/selectNamedInstance" {
+test "VF: axis API setAxis/setAxes/resetAxes/selectNamedInstance" {
     const a = testing.allocator;
     const data = try buildVarTestFont(a, 64, null);
     defer a.free(data);
@@ -2410,7 +2410,7 @@ test "TASK-25.15.1: 軸 API setAxis/setAxes/resetAxes/selectNamedInstance" {
     try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
 }
 
-test "TASK-25.15.1: selectNamedInstance で design coords を一括設定" {
+test "VF: selectNamedInstance sets design coords in bulk" {
     const a = testing.allocator;
     // instance0: subfamily=1, flags=0, wght=700 (Fixed 16.16 = 700*65536 = 0x02BC0000)
     const inst0 = [_]u8{ 0, 1, 0, 0, 0x02, 0xBC, 0x00, 0x00 };
@@ -2478,7 +2478,7 @@ test "TASK-25.15.1: selectNamedInstance で design coords を一括設定" {
     try testing.expectApproxEqAbs(@as(f32, 0.6), of.axis_norm[0], 0.02);
 }
 
-test "TASK-25.15.1: 正規化 wght min/def/max → -1/0/1" {
+test "VF: normalize wght min/def/max → -1/0/1" {
     const a = testing.allocator;
     const data = try buildVarTestFont(a, 64, null);
     defer a.free(data);
@@ -2494,7 +2494,7 @@ test "TASK-25.15.1: 正規化 wght min/def/max → -1/0/1" {
     try testing.expectApproxEqAbs(@as(f32, 1), of.axis_norm[0], 0.01);
 }
 
-test "TASK-25.15.1: FontFace 経由 avar 配線（setAxis → axis_norm が区分線形マップを通る）" {
+test "VF: avar wiring via FontFace (setAxis → axis_norm through piecewise-linear map)" {
     const a = testing.allocator;
     const avar_tbl = buildAvarTableWght();
     const data = try buildVarTestFont(a, 64, &avar_tbl);
@@ -2505,7 +2505,7 @@ test "TASK-25.15.1: FontFace 経由 avar 配線（setAxis → axis_norm が区�
     defer of.deinit();
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
 
-    // wght=650 → 線形正規化 pre=0.5 → avar (0.5→0.75) で axis_norm=0.75
+    // wght=650 → linear normalize pre=0.5 → avar (0.5→0.75) yields axis_norm=0.75
     try of.setAxis(&wght, 650);
     try testing.expectApproxEqAbs(@as(f32, 0.75), of.axis_norm[0], 0.02);
 
@@ -2513,18 +2513,18 @@ test "TASK-25.15.1: FontFace 経由 avar 配線（setAxis → axis_norm が区�
     try of.setAxis(&wght, 400);
     try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
 
-    // wght=550 → pre=0.3 → avar 区分線形: (0,0)〜(0.5,0.75) 間 → 0.45
+    // wght=550 → pre=0.3 → avar piecewise-linear between (0,0) and (0.5,0.75) → 0.45
     try of.setAxis(&wght, 550);
     try testing.expectApproxEqAbs(@as(f32, 0.45), of.axis_norm[0], 0.02);
 }
 
-test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
+test "VF: full SFNT E2E (FontFace→setAxis→outline/draw)" {
     const a = testing.allocator;
-    // 再利用可能な fixture（監督者 snapshot 用: ファイル書き出し可）
+    // Reusable fixture (can be written out to a file for snapshots)
     const sfnt_bytes = try cff_mod.buildCff2VfSfnt(a, .{});
     defer a.free(sfnt_bytes);
 
-    // (a) FontFace.init 成功
+    // (a) FontFace.init succeeds
     const face = try FontFace.init(sfnt_bytes);
     try testing.expect(face.source == .cff2);
     try testing.expect(face.fvar != null);
@@ -2534,20 +2534,20 @@ test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
     var of_var = OutlineFont.init(a, &face, 64);
     defer of_var.deinit();
 
-    // (c) norm=0: CFF2 outline 直接 + 軸 default
+    // (c) norm=0: direct CFF2 outline + axis default
     const g = &face.source.cff2;
     var o_def = try g.outline(a, 0, &.{0});
     defer o_def.deinit(a);
     try testing.expectApproxEqAbs(@as(f32, 100), o_def.contours[0].segments[0].line.x, 0.5);
 
-    // default OutlineFont の描画
+    // Default OutlineFont paint
     const W = 80;
     var px_def = [_]u32{0xFF000000} ** (W * W);
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
     of_def.drawTo(.{ .pixels = &px_def, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
-    // (b) setAxis max → 公開経路で外形変化
+    // (b) setAxis max → outline changes on the public path
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     try of_var.setAxis(&wght, 900);
     try testing.expectApproxEqAbs(@as(f32, 1), of_var.axis_norm[0], 0.01);
@@ -2555,10 +2555,10 @@ test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
     var px_var = [_]u32{0xFF000000} ** (W * W);
     of_var.drawTo(.{ .pixels = &px_var, .width = W, .height = W }, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
 
-    // raster が default と異なる
+    // raster differs from default
     try testing.expect(!std.mem.eql(u32, &px_def, &px_var));
 
-    // (d) drawTo で非空ピクセル
+    // (d) drawTo produces non-empty pixels
     var any_def = false;
     var any_var = false;
     for (px_def) |p| {
@@ -2570,11 +2570,11 @@ test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
     try testing.expect(any_def);
     try testing.expect(any_var);
 
-    // (c) resetAxes 後 measure は hmtx advance
+    // (c) after resetAxes, measure uses hmtx advance
     try of_var.resetAxes();
     try testing.expectEqual(@as(u32, 64), of_var.measure("A"));
 
-    // norm=0 outline と default 軸の Cff2Font.outline 一致
+    // norm=0 outline matches Cff2Font.outline at default axes
     var o_after = try g.outline(a, 0, of_var.axis_norm[0..1]);
     defer o_after.deinit(a);
     try testing.expectApproxEqAbs(
@@ -2584,9 +2584,9 @@ test "TASK-25.15.4: フル SFNT E2E（FontFace→setAxis→outline/draw）" {
     );
 }
 
-test "TASK-25.15.4: CFF と CFF2 同居は InvalidFont" {
+test "VF: CFF and CFF2 together is InvalidFont" {
     const a = testing.allocator;
-    // 最小 head/maxp/hhea/hmtx/cmap + 両方の CFF ダミー
+    // Minimal head/maxp/hhea/hmtx/cmap + dummy CFF of both kinds
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
     head[13] = 0x0F;
@@ -2601,8 +2601,8 @@ test "TASK-25.15.4: CFF と CFF2 同居は InvalidFont" {
     putU16(&hmtx, 0, 64);
     var cmap_tbl = [_]u8{0} ** 20;
     putU16(&cmap_tbl, 2, 0);
-    const cff1 = [_]u8{ 1, 0, 4, 1 }; // ダミー CFF1
-    const cff2 = [_]u8{ 2, 0, 5, 0, 0 }; // CFF2 header only（parse 前に同居で弾く）
+    const cff1 = [_]u8{ 1, 0, 4, 1 }; // Dummy CFF1
+    const cff2 = [_]u8{ 2, 0, 5, 0, 0 }; // CFF2 header only (rejected for coexistence before parse)
     const data = try buildSfnt(a, &.{
         .{ .tag = "head".*, .body = &head },
         .{ .tag = "maxp".*, .body = &maxp },
@@ -2616,11 +2616,11 @@ test "TASK-25.15.4: CFF と CFF2 同居は InvalidFont" {
     try testing.expectError(error.InvalidFont, FontFace.init(data));
 }
 
-test "TASK-25.15.4: CFF2 ダミー（壊れた）は InvalidFont" {
+test "VF: broken CFF2 dummy is InvalidFont" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
-    // CFF2 ダミー（不正 major / 不完全）を glyf と同居 → InvalidFont（同居禁止）
+    // Dummy CFF2 (bad major / incomplete) coexisting with glyf → InvalidFont (coexistence forbidden)
     const cff2_dummy = [_]u8{ 0x01, 0x00, 0x04, 0x00 };
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
@@ -2674,11 +2674,11 @@ test "TASK-25.15.4: CFF2 ダミー（壊れた）は InvalidFont" {
         .{ .tag = "CFF2".*, .body = &cff2_dummy },
     });
     defer a.free(cff2_data);
-    // glyf + CFF2 同居
+    // glyf + CFF2 coexistence
     try testing.expectError(error.InvalidFont, FontFace.init(cff2_data));
 }
 
-/// 壊れた fvar を差し替えた最小可変フォントを組む（FontFace.init 検証用）。
+/// Build a minimal variable font with a broken fvar substituted in (for FontFace.init checks).
 fn buildVarFontWithBadFvar(a: std.mem.Allocator, bad_fvar: []const u8) ![]u8 {
     var head = [_]u8{0} ** 54;
     head[12] = 0x5F;
@@ -2716,25 +2716,25 @@ fn buildVarFontWithBadFvar(a: std.mem.Allocator, bad_fvar: []const u8) ![]u8 {
     });
 }
 
-test "TASK-25.15.1: 壊れた fvar version は InvalidFont" {
+test "VF: broken fvar version is InvalidFont" {
     const a = testing.allocator;
     var bad_fvar = buildFvarTableWght();
-    putU16(&bad_fvar, 0, 2); // 不正 majorVersion
+    putU16(&bad_fvar, 0, 2); // Invalid majorVersion
     const bad_data = try buildVarFontWithBadFvar(a, &bad_fvar);
     defer a.free(bad_data);
     try testing.expectError(error.InvalidFont, FontFace.init(bad_data));
 }
 
-test "TASK-25.15.1: 壊れた fvar axesArrayOffset は InvalidFont" {
+test "VF: broken fvar axesArrayOffset is InvalidFont" {
     const a = testing.allocator;
-    // (a) テーブル末尾超え
+    // (a) past end of table
     var past_end = buildFvarTableWght();
-    putU16(&past_end, 4, 200); // 36B テーブルに対し軸配列先頭が範囲外
+    putU16(&past_end, 4, 200); // Axis-array start is out of range for a 36B table
     const data_past = try buildVarFontWithBadFvar(a, &past_end);
     defer a.free(data_past);
     try testing.expectError(error.InvalidFont, FontFace.init(data_past));
 
-    // (b) 軸レコード途中（header=16, axisSize=20 → 正当先頭=16。20 はレコード中腹）
+    // (b) mid axis record (header=16, axisSize=20 → valid start=16; 20 is mid-record)
     var mid_record = buildFvarTableWght();
     putU16(&mid_record, 4, 20);
     const data_mid = try buildVarFontWithBadFvar(a, &mid_record);
@@ -2742,7 +2742,7 @@ test "TASK-25.15.1: 壊れた fvar axesArrayOffset は InvalidFont" {
     try testing.expectError(error.InvalidFont, FontFace.init(data_mid));
 }
 
-test "TASK-25.15.1: fvar あり norm=0 と完全非可変経路の描画 bit 一致" {
+test "VF: fvar present at norm=0 matches fully non-variable draw bit-exactly" {
     const a = testing.allocator;
     const data_static = try buildTestFont(a, 64);
     defer a.free(data_static);
@@ -2757,7 +2757,7 @@ test "TASK-25.15.1: fvar あり norm=0 と完全非可変経路の描画 bit 一
     defer of_static.deinit();
     var of_var = OutlineFont.init(a, &face_var, 64);
     defer of_var.deinit();
-    // norm=0（default）確認
+    // Confirm norm=0 (default)
     try testing.expectApproxEqAbs(@as(f32, 0), of_var.axis_norm[0], 0.001);
 
     const W = 80;
@@ -2773,7 +2773,7 @@ test "TASK-25.15.1: fvar あり norm=0 と完全非可変経路の描画 bit 一
     try testing.expectEqualSlices(u32, &px_static, &px_var);
 }
 
-test "TASK-25.15.1: setAxis は範囲外値を clamp して axis_design に保存" {
+test "VF: setAxis clamps out-of-range values into axis_design" {
     const a = testing.allocator;
     const data = try buildVarTestFont(a, 64, null);
     defer a.free(data);
@@ -2781,13 +2781,13 @@ test "TASK-25.15.1: setAxis は範囲外値を clamp して axis_design に保�
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
-    try of.setAxis(&wght, 50); // min=100 未満
+    try of.setAxis(&wght, 50); // Below min=100
     try testing.expectApproxEqAbs(@as(f32, 100), of.axisValue(0).?, 0.001);
-    try of.setAxis(&wght, 1000); // max=900 超過
+    try of.setAxis(&wght, 1000); // Above max=900
     try testing.expectApproxEqAbs(@as(f32, 900), of.axisValue(0).?, 0.001);
 }
 
-test "TASK-25.15.1: OutlineFont.init は VF/非VF で同一アロケーション（fvar/avar parse 追加分ゼロ）" {
+test "VF: OutlineFont.init allocates the same for VF/non-VF (no extra fvar/avar parse alloc)" {
     const a = testing.allocator;
     const data_static = try buildTestFont(a, 64);
     defer a.free(data_static);
@@ -2812,7 +2812,7 @@ test "TASK-25.15.1: OutlineFont.init は VF/非VF で同一アロケーション
     try testing.expectEqual(@as(usize, 0), allocs_static);
 }
 
-test "TASK-25.15.1: setAxis 後 clearCache（axes_generation 増加）" {
+test "VF: setAxis clears cache (axes_generation increments)" {
     const a = testing.allocator;
     const data = try buildVarTestFont(a, 64, null);
     defer a.free(data);
@@ -2829,16 +2829,16 @@ test "TASK-25.15.1: setAxis 後 clearCache（axes_generation 増加）" {
 
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     try of.setAxis(&wght, 700);
-    try testing.expectEqual(@as(u32, 0), of.cache.count()); // clearCache 済み
+    try testing.expectEqual(@as(u32, 0), of.cache.count()); // clearCache already done
 }
 
-// ── TASK-25.15.2: gvar / HVAR / advance_cache ──
+// ── gvar / HVAR / advance_cache ──
 
 fn appendI16List(l: *std.ArrayList(u8), a: std.mem.Allocator, v: i16) !void {
     try appendU16(l, a, @bitCast(v));
 }
 
-/// 1 軸 gvar（gid1='A' に全点デルタ）。gid0/2 は空 variation。
+/// One-axis gvar (all-point deltas on gid1='A'). gid0/2 have empty variations.
 fn buildGvarForTestFont(a: std.mem.Allocator, n_outline: usize, dx: []const i16, dy: []const i16) ![]u8 {
     // n_total = n_outline + 4
     const n_total = n_outline + 4;
@@ -2992,7 +2992,7 @@ fn buildVarFontWithGvarHvar(
     cmap_tbl[11] = 12;
     @memcpy(cmap_tbl[12..], &cmap_sub);
 
-    // 動的にテーブル列を組む
+    // Assemble table list dynamically
     var tables: std.ArrayList(SfntTable) = .empty;
     defer tables.deinit(a);
     try tables.append(a, .{ .tag = "head".*, .body = &head });
@@ -3008,7 +3008,7 @@ fn buildVarFontWithGvarHvar(
     return buildSfnt(a, tables.items);
 }
 
-test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一致" {
+test "VF: gvar all-point deltas change outline; norm=0 matches unvaried" {
     const a = testing.allocator;
     // triangle 3 points + 4 phantom
     const dx = [_]i16{ 10, 10, 10, 0, 0, 0, 0 };
@@ -3024,7 +3024,7 @@ test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一
     defer of.deinit();
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
 
-    // norm=0: outline は default と一致（outlineVaried vs outline）
+    // norm=0: outline matches default (outlineVaried vs outline)
     const g = face.source.glyf;
     var o0 = try g.outline(a, 1);
     defer o0.deinit(a);
@@ -3037,13 +3037,13 @@ test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一
     defer o1.deinit(a);
     try testing.expectEqual(o0.contours[0].start.x, o1.contours[0].start.x);
 
-    // setAxis max → norm=1 → 点 x が +10
+    // setAxis max → norm=1 → point x += 10
     try of.setAxis(&wght, 900);
     var o2 = try g.outlineVaried(a, 1, &face.gvar.?, of.axis_norm[0..1]);
     defer o2.deinit(a);
     try testing.expectApproxEqAbs(o0.contours[0].start.x + 10, o2.contours[0].start.x, 0.5);
 
-    // 描画 snapshot: 軸変更前後でピクセルが変わる
+    // Draw snapshot: pixels change across the axis change
     const W = 80;
     var px_before = [_]u32{0xFF000000} ** (W * W);
     var px_after = [_]u32{0xFF000000} ** (W * W);
@@ -3056,7 +3056,7 @@ test "TASK-25.15.2: gvar 全点デルタで外形変化・norm=0 で無変分一
     try testing.expect(!std.mem.eql(u32, &px_before, &px_after));
 }
 
-test "TASK-25.15.2: HVAR advance が measure/draw 送りと一致" {
+test "VF: HVAR advance matches measure/draw advances" {
     const a = testing.allocator;
     const hvar_tbl = buildHvarForTestFont();
     const data = try buildVarFontWithGvarHvar(a, 64, null, &hvar_tbl);
@@ -3071,16 +3071,16 @@ test "TASK-25.15.2: HVAR advance が measure/draw 送りと一致" {
     try testing.expectApproxEqAbs(@as(f32, 80), of.advance_cache.?[1], 0.01);
     try testing.expectEqual(@as(u32, 80), of.measure("A"));
 
-    // draw の送り: 'A' + space。space は delta 0 → 64。合計 144
+    // Draw advances: 'A' + space. space delta 0 → 64. Total 144
     try testing.expectEqual(@as(u32, 144), of.measure("A "));
-    // CachedGlyph.advance も cache 経由
+    // CachedGlyph.advance also via cache
     const cg = try of.getCached(1, of.physicalPxQ(1.0));
     try testing.expectApproxEqAbs(@as(f32, 80), cg.advance, 0.01);
 }
 
-test "TASK-25.15.2: phantom advance fallback（HVAR 無し）" {
+test "VF: phantom advance fallback (no HVAR)" {
     const a = testing.allocator;
-    // phantom: n=3 → indices 3,4。dx[3]=0, dx[4]=8 → advance delta=8
+    // phantom: n=3 → indices 3,4. dx[3]=0, dx[4]=8 → advance delta=8
     const dx = [_]i16{ 0, 0, 0, 0, 8, 0, 0 };
     const dy = [_]i16{ 0, 0, 0, 0, 0, 0, 0 };
     const gvar_tbl = try buildGvarForTestFont(a, 3, &dx, &dy);
@@ -3098,7 +3098,7 @@ test "TASK-25.15.2: phantom advance fallback（HVAR 無し）" {
     try testing.expectEqual(@as(u32, 72), of.measure("A"));
 }
 
-test "TASK-25.15.2: advance_cache は axis change で再構築・measure は decode しない" {
+test "VF: advance_cache rebuilds on axis change; measure does not decode" {
     const a = testing.allocator;
     const hvar_tbl = buildHvarForTestFont();
     const data = try buildVarFontWithGvarHvar(a, 64, null, &hvar_tbl);
@@ -3106,13 +3106,13 @@ test "TASK-25.15.2: advance_cache は axis change で再構築・measure は dec
     const face = try FontFace.init(data);
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
-    try testing.expect(of.advance_cache == null); // init 時は null
+    try testing.expect(of.advance_cache == null); // null at init
 
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     try of.setAxis(&wght, 900);
     try testing.expectApproxEqAbs(@as(f32, 80), of.advance_cache.?[1], 0.01);
 
-    // measure は const・cache read のみ（gvar/HVAR decode しない）
+    // measure is const and only reads the cache (does not decode gvar/HVAR)
     try testing.expectEqual(@as(u32, 80), of.measure("A"));
 
     try of.setAxis(&wght, 400); // norm=0 → delta=0 → advance=64
@@ -3121,14 +3121,14 @@ test "TASK-25.15.2: advance_cache は axis change で再構築・measure は dec
     try testing.expectEqual(@as(u32, 64), of.measure("A"));
 }
 
-test "TASK-25.15.2: setAxis OOM は OutOfMemory を伝播（AC#8）" {
+test "VF: setAxis OOM propagates OutOfMemory" {
     const a = testing.allocator;
     const hvar_tbl = buildHvarForTestFont();
     const data = try buildVarFontWithGvarHvar(a, 64, null, &hvar_tbl);
     defer a.free(data);
     const face = try FontFace.init(data);
 
-    // FailingAllocator: 最初の alloc（advance_cache 確保）で即 OOM
+    // FailingAllocator: OOM immediately on the first alloc (advance_cache allocation)
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     var of = OutlineFont.init(failing.allocator(), &face, 64);
     defer of.deinit();
@@ -3136,7 +3136,7 @@ test "TASK-25.15.2: setAxis OOM は OutOfMemory を伝播（AC#8）" {
     try testing.expectError(error.OutOfMemory, of.setAxis(&wght, 700));
 }
 
-test "TASK-25.15.2: 壊れた HVAR は FontFace.init で InvalidFont" {
+test "VF: broken HVAR is InvalidFont from FontFace.init" {
     const a = testing.allocator;
     var bad_hvar = buildHvarForTestFont();
     putU16(&bad_hvar, 0, 9); // bad major
@@ -3145,12 +3145,12 @@ test "TASK-25.15.2: 壊れた HVAR は FontFace.init で InvalidFont" {
     try testing.expectError(error.InvalidFont, FontFace.init(data));
 }
 
-test "TASK-25.15.2: 壊れた gvar は FontFace.init で InvalidFont" {
+test "VF: broken gvar is InvalidFont from FontFace.init" {
     const a = testing.allocator;
     var bad: [28]u8 = .{0} ** 28;
     putU16(&bad, 0, 1);
     putU16(&bad, 2, 0);
-    putU16(&bad, 4, 99); // axisCount ≠ fvar の 1
+    putU16(&bad, 4, 99); // axisCount ≠ fvar's 1
     putU16(&bad, 12, 3);
     putU16(&bad, 14, 1);
     putU32(&bad, 16, 28);
@@ -3159,12 +3159,12 @@ test "TASK-25.15.2: 壊れた gvar は FontFace.init で InvalidFont" {
     try testing.expectError(error.InvalidFont, FontFace.init(data));
 }
 
-// ── TASK-25.15.3: composite gvar / USE_MY_METRICS / named instance / Error ──
+// ── composite gvar / USE_MY_METRICS / named instance / Error ──
 
-/// 三角形 simple + composite（USE_MY_METRICS 付き/無し）+ fvar の最小 VF。
+/// Minimal VF: triangle simple + composites (with/without USE_MY_METRICS) + fvar.
 /// gid0=simple adv=100, gid1=simple adv=80, gid2=composite(USE_MY_METRICS→gid0) adv=50,
-/// gid3=composite(USE_MY_METRICS 無し) adv=40, gid4=点マッチ composite。
-/// cmap: 'A'→2, 'B'→3, 'C'→4, 'D'→0。
+/// gid3=composite(no USE_MY_METRICS) adv=40, gid4=point-matched composite.
+/// cmap: 'A'→2, 'B'→3, 'C'→4, 'D'→0.
 fn buildCompositeVarFont(a: std.mem.Allocator) ![]u8 {
     const fvar_tbl = buildFvarTableWght();
     var head = [_]u8{0} ** 54;
@@ -3285,7 +3285,7 @@ fn buildCompositeVarFont(a: std.mem.Allocator) ![]u8 {
     });
 }
 
-test "TASK-25.15.3: USE_MY_METRICS ありは component advance / 無しは composite hmtx" {
+test "VF: USE_MY_METRICS present uses component advance / absent uses composite hmtx" {
     const a = testing.allocator;
     const data = try buildCompositeVarFont(a);
     defer a.free(data);
@@ -3301,25 +3301,25 @@ test "TASK-25.15.3: USE_MY_METRICS ありは component advance / 無しは compo
     // 'B' = gid3 no UMM → composite hmtx 40
     try testing.expectApproxEqAbs(@as(f32, 40), of.advance_cache.?[3], 0.01);
     try testing.expectEqual(@as(u32, 40), of.measure("B"));
-    // draw CachedGlyph.advance も一致
+    // draw CachedGlyph.advance also matches
     const cg_a = try of.getCached(2, of.physicalPxQ(1.0));
     try testing.expectApproxEqAbs(@as(f32, 100), cg_a.advance, 0.01);
 }
 
-test "TASK-25.15.3: 点マッチ composite は公開経路 InvalidFont・低層 Unsupported" {
+test "VF: point-matched composite is InvalidFont on public path, Unsupported at low level" {
     const a = testing.allocator;
     const data = try buildCompositeVarFont(a);
     defer a.free(data);
     const face = try FontFace.init(data);
-    // 低層 glyf
+    // Low-level glyf
     try testing.expectError(error.Unsupported, face.source.glyf.outline(a, 4));
-    // 公開経路 buildGlyph
+    // Public-path buildGlyph
     var of = OutlineFont.init(a, &face, 64);
     defer of.deinit();
     try testing.expectError(error.InvalidFont, of.getCached(4, of.physicalPxQ(1.0)));
 }
 
-test "TASK-25.15.3: named instance 一括設定 + norm0 で default 一致" {
+test "VF: named instance bulk set + norm0 matches default" {
     const a = testing.allocator;
     const inst0 = [_]u8{ 0, 1, 0, 0, 0x02, 0xBC, 0x00, 0x00 }; // wght=700
     const fvar_tbl = buildFvarTableWghtWithInstances(1, &.{inst0});
@@ -3385,11 +3385,11 @@ test "TASK-25.15.3: named instance 一括設定 + norm0 で default 一致" {
     try testing.expectApproxEqAbs(@as(f32, 0), of.axis_norm[0], 0.001);
 }
 
-test "TASK-25.15.3: composite 描画 snapshot（軸変更でピクセル変化）" {
-    // composite glyph の offset 変分が描画に出ることを in-test raster で確認（harness 相当）
+test "VF: composite draw snapshot (pixels change with axis)" {
+    // Confirm composite glyph offset variation appears in paint via in-test raster (harness-like)
     const a = testing.allocator;
-    // 再利用: glyf の composite+gvar は outline レベルで検証済み。
-    // ここでは composite UMM フォントの draw が非空であることだけ固定。
+    // Reuse: glyf composite+gvar is already verified at outline level.
+    // Here only assert that drawing the composite UMM font is non-empty.
     const data = try buildCompositeVarFont(a);
     defer a.free(data);
     const face = try FontFace.init(data);
@@ -3405,7 +3405,7 @@ test "TASK-25.15.3: composite 描画 snapshot（軸変更でピクセル変化�
     try testing.expect(any);
 }
 
-test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック後も negative cache が保持され再デコードしない" {
+test "sbix: decode failure (corrupt PNG) keeps negative cache after outline fallback and does not re-decode" {
     const a = testing.allocator;
     const data = try buildEmojiTestFont(a, &.{
         .{ .ppem = 64, .records = &.{ .empty, .empty, .{ .png = .{ .bytes = &.{ 0xDE, 0xAD, 0xBE, 0xEF } } }, .empty } },
@@ -3422,25 +3422,25 @@ test "TASK-26.4: decode 失敗（壊れ PNG）は outline フォールバック�
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
     const gid = of.gidOf(0x1F600);
 
-    // 1 回目: decode 失敗 → outline(三角形) へフォールバックし failed tombstone を記録。
+    // First call: decode fails → fall back to outline(triangle) and record a failed tombstone.
     of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.color_cache.get(gid).?.failed);
     const count_after_1st = of.color_cache.count();
 
-    // 2 回目: 同じ gid を再度描画しても、tombstone がそのまま維持され（failed のまま）
-    // count も不変（同一 key の再挿入ではなく最初の get(gid).failed==true で即 return し
-    // buildColorGlyph の decode 経路自体を通らないことの直接証拠。count 不変のみだと
-    // 同一 key 上書きでも成立してしまうため failed の再確認も併せて行う。codex 指摘反映）。
+    // Second call: redrawing the same gid keeps the tombstone (still failed)
+    // and leaves count unchanged (direct evidence that get(gid).failed==true returns immediately
+    // without taking the buildColorGlyph decode path — not a same-key overwrite.
+    // count-unchanged alone would also hold on same-key overwrite, so re-check failed too).
     of.drawTo(target, .{ .x = 4, .y = 4 }, "\u{1F600}", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
     try testing.expect(of.color_cache.get(gid).?.failed);
     try testing.expectEqual(count_after_1st, of.color_cache.count());
 }
 
 // ============================================================
-// TASK-156.3: physical px scale / PhysicalGlyphKey
+// physical px scale / PhysicalGlyphKey
 // ============================================================
 
-test "TASK-156.3: physicalPxQ は 1/64px 量子化・最小 1" {
+test "physicalPxQ: 1/64px quantization, minimum 1" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -3452,16 +3452,16 @@ test "TASK-156.3: physicalPxQ は 1/64px 量子化・最小 1" {
     try testing.expectEqual(@as(u32, 1024), of.physicalPxQ(1.0));
     // 16 * 2.0 * 64 = 2048
     try testing.expectEqual(@as(u32, 2048), of.physicalPxQ(2.0));
-    // 微小差は同一 key に丸まる（16 * 1.00001 * 64 ≈ 1024.01024 → round 1024）
+    // Tiny deltas round to the same key (16 * 1.00001 * 64 ≈ 1024.01024 → round 1024)
     try testing.expectEqual(of.physicalPxQ(1.0), of.physicalPxQ(1.00001));
-    // scale 差が 1/64px を超えると別 key（16 * (1 + 1/1024) * 64 = 1024 + 1）
+    // Scale deltas beyond 1/64px become distinct keys (16 * (1 + 1/1024) * 64 = 1024 + 1)
     try testing.expectEqual(@as(u32, 1025), of.physicalPxQ(1.0 + 1.0 / 1024.0));
-    // 非正・非有限は 1.0 扱い相当（physicalPxQ 内で s=1.0）
+    // Non-positive / non-finite treated as 1.0 (s=1.0 inside physicalPxQ)
     try testing.expectEqual(of.physicalPxQ(1.0), of.physicalPxQ(0.0));
     try testing.expectEqual(of.physicalPxQ(1.0), of.physicalPxQ(std.math.nan(f32)));
 }
 
-test "TASK-156.3: measure/metrics は draw scale 非依存・advance_cache 不変" {
+test "measure/metrics independent of draw scale; advance_cache unchanged" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -3483,11 +3483,11 @@ test "TASK-156.3: measure/metrics は draw scale 非依存・advance_cache 不�
     try testing.expectEqual(m0.ascent, of.metrics().ascent);
     try testing.expectEqual(m0.descent, of.metrics().descent);
     try testing.expectEqual(w0, of.measure("A"));
-    // 非可変フォントは advance_cache を確保しない（draw scale でも不変）
+    // Non-variable fonts do not allocate advance_cache (unchanged by draw scale too)
     try testing.expectEqual(had_adv_cache, of.advance_cache != null);
 }
 
-test "TASK-156.3: 同一 GID の scale=1/2 は別 key で共存し、再描画で count 不変" {
+test "same GID at scale=1/2 coexist under distinct keys; redraw leaves count unchanged" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -3508,25 +3508,25 @@ test "TASK-156.3: 同一 GID の scale=1/2 は別 key で共存し、再描画�
     try testing.expect(of.cache.contains(.{ .gid = gid, .physical_px_q = of.physicalPxQ(1.0) }));
     try testing.expect(of.cache.contains(.{ .gid = gid, .physical_px_q = of.physicalPxQ(2.0) }));
 
-    // 同一 scale の 2 回目は entry 増えない
+    // Second draw at the same scale does not grow entries
     const bytes = of.cache_bytes;
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A", col, clip, 1.0);
     of.drawTo(target, .{ .x = 40, .y = 4 }, "A", col, clip, 2.0);
     try testing.expectEqual(@as(u32, 2), of.cache.count());
     try testing.expectEqual(bytes, of.cache_bytes);
 
-    // scale=2 の bitmap は scale=1 より大きい
+    // scale=2 bitmap is larger than scale=1
     const cg1 = of.cache.get(.{ .gid = gid, .physical_px_q = of.physicalPxQ(1.0) }).?;
     const cg2 = of.cache.get(.{ .gid = gid, .physical_px_q = of.physicalPxQ(2.0) }).?;
     try testing.expect(cg1.bitmap != null and cg2.bitmap != null);
     const b1 = cg1.bitmap.?;
     const b2 = cg2.bitmap.?;
     try testing.expect(b2.w * b2.h > b1.w * b1.h);
-    // 物理 advance も約 2 倍
+    // Physical advance is also about 2×
     try testing.expectApproxEqAbs(cg1.advance * 2.0, cg2.advance, 0.01);
 }
 
-test "TASK-156.3: 1/64px 量子化範囲内の scale 差は同一 key" {
+test "scale deltas within 1/64px quantization share the same key" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -3545,7 +3545,7 @@ test "TASK-156.3: 1/64px 量子化範囲内の scale 差は同一 key" {
     try testing.expectEqual(@as(u32, 1), of.cache.count());
 }
 
-test "TASK-156.3: scale 別 oversized tombstone が再試行を抑止" {
+test "per-scale oversized tombstone suppresses retries" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -3553,7 +3553,7 @@ test "TASK-156.3: scale 別 oversized tombstone が再試行を抑止" {
     var of = OutlineFont.init(a, &face, 16);
     defer of.deinit();
 
-    // 極小 cap で任意の実グリフを oversized 扱いにする
+    // Tiny cap forces any real glyph to be treated as oversized
     of.cache_cap = @sizeOf(PhysicalGlyphKey) + @sizeOf(CachedGlyph) + 1;
 
     const W = 80;
@@ -3567,11 +3567,11 @@ test "TASK-156.3: scale 別 oversized tombstone が再試行を抑止" {
 
     of.last_oom = false;
     of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    try testing.expect(of.last_oom); // tombstone ヒットでも診断継続
-    try testing.expectEqual(@as(u32, 1), of.cache.count()); // 再試行で entry が増えない
+    try testing.expect(of.last_oom); // Keep diagnosing on tombstone hits
+    try testing.expectEqual(@as(u32, 1), of.cache.count()); // Retries do not grow entry count
 }
 
-test "TASK-156.3: cache_bytes は常に cache_cap 以下" {
+test "cache_bytes is always <= cache_cap" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
     defer a.free(data);
@@ -3584,7 +3584,7 @@ test "TASK-156.3: cache_bytes は常に cache_cap 以下" {
     var px = [_]u32{0xFF000000} ** (W * W);
     const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
-    // 複数 scale で複数 entry を詰め込む
+    // Pack multiple entry values across multiple scale keys
     const scales = [_]f32{ 1.0, 1.5, 2.0, 2.5, 3.0 };
     for (scales) |s| {
         of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, s);

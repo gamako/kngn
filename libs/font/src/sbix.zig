@@ -1,40 +1,40 @@
-// sbix テーブルパーサ。sfnt の 'sbix' テーブル（埋め込みビットマップ。カラー絵文字フォントで
-// PNG を格納するのに使われる）を安全にパースする。
+// sbix table parser. Safely parses the sfnt 'sbix' table (embedded bitmaps; used by color emoji fonts to
+// store PNGs).
 //
-// strike（ppem 単位の解像度バリエーション）ごとの glyph record（graphicType + origin offset +
-// 埋め込みバイト列）を読み、GID と目標 px から使う strike / bitmap を選択できるようにする。
-// PNG のデコード・(GID,px) キャッシュ・cmap 絵文字解決・FontFace への結線は行わない
-// （TASK-26.3 のスコープ）。
+// Reads glyph records (graphicType + origin offset +
+// embedded byte payload) per strike (resolution variants in ppem units), and selects the strike / bitmap from GID and target px.
+// Does not decode PNG, cache (GID,px), resolve cmap emoji, or wire into FontFace
+// (out of scope here).
 //
-// ホットパス宣言: **初期化時のみ**（フォント読込時に parse）+ **イベント時のみ**（26.3 の
-// キャッシュミス時に glyph 解決）。フレーム毎（全画素）/ RT（毎サンプル）経路では走らない
-// → 性能規約（SIMD 3点セット・cache_line 分離・bench 前後比較）の適用対象外。
+// Hot-path declaration: **init-time only** (parse on font load) + **event-time only** (glyph
+// resolve on cache miss). Does not run on per-frame (all-pixel) / RT (per-sample) paths
+// → outside the performance rules (SIMD three-point set, cache_line separation, before/after bench).
 //
-// 設計（sfnt.zig / glyf.zig / cmap.zig と同型）:
-//   - 読み取りは byte_reader.zig の Reader（BE + overflow-safe 境界チェック）経由。範囲外は
-//     error.InvalidFont。生バイトは借用保持（コピーしない）。table-local slice 上で読む。
-//   - parse 時に「安い構造検証」（ヘッダ + 各 strike ヘッダの範囲）を eager に行い、
-//     glyph record の検証はアクセス時（glyphData）に lazy に行う（glyf.zig の glyphData と同型）。
-//   - アロケーション無し（Sbix は slice + スカラーのみ保持。テスト builder を除く）。
+// Design (same shape as sfnt.zig / glyf.zig / cmap.zig):
+//   - Reads go through byte_reader.zig Reader (BE + overflow-safe bounds checks). Out of range is
+//     error.InvalidFont. Raw bytes are borrowed (not copied). Reading is on a table-local slice.
+//   - At parse time, run "cheap structure validation" (header + each strike header range) eagerly;
+//     glyph-record validation is lazy on access (glyphData), same shape as glyf.zig glyphData.
+//   - No allocation (Sbix holds only slices + scalars; except the test builder).
 //
-// バイナリレイアウト（OpenType 'sbix' 仕様）:
-//   - ヘッダ: version(u16, ==1) / flags(u16) / numStrikes(u32) /
-//     strikeOffsets[numStrikes](u32, sbix テーブル先頭基準)。
-//   - strike: ppem(u16) / ppi(u16) / glyphDataOffsets[numGlyphs+1](u32, strike 先頭基準)。
-//   - glyph record: originOffsetX(i16) / originOffsetY(i16) / graphicType(4byte tag) / data。
-//     レコード長 = offsets[gid+1] − offsets[gid]。0 は「この strike に bitmap 無し」、
-//     1..7 は不正、8 以上でヘッダ(8byte) + data。
+// Binary layout (OpenType 'sbix' spec):
+//   - Header: version(u16, ==1) / flags(u16) / numStrikes(u32) /
+//     strikeOffsets[numStrikes](u32, relative to sbix table start).
+//   - strike: ppem(u16) / ppi(u16) / glyphDataOffsets[numGlyphs+1](u32, relative to strike start).
+//   - glyph record: originOffsetX(i16) / originOffsetY(i16) / graphicType(4byte tag) / data.
+//     Record length = offsets[gid+1] − offsets[gid]. 0 means "no bitmap in this strike";
+//     1..7 is invalid; 8+ is header(8byte) + data.
 //
-// graphicType の扱い:
-//   - 'png ': bytes をそのまま返す（decode しない）。data 空（レコード長 8）は許容し空 bytes を返す。
-//   - 'dupe': data 長 == 2（参照先 GID の u16）を厳格要求。同一 strike 内の別 GID を再解決する。
-//     解決結果は**参照先レコードの originOffset を採用**する（OpenType 仕様に明文なし。
-//     FreeType 実装準拠。この実装の仕様として固定）。
-//   - 'jpg ' / 'tiff' / 未知 tag: 非対応 → 「bitmap 無し」(null) と同じ扱いにする
-//     （該当 strike をスキップして他 strike / outline へ穏当に劣化させるため）。
+// graphicType handling:
+//   - 'png ': return bytes as-is (do not decode). Empty data (record length 8) is allowed and returns empty bytes.
+//   - 'dupe': strictly require data length == 2 (referenced GID as u16). Re-resolve another GID in the same strike.
+//     The result **uses the referenced record's originOffset** (not stated explicitly in OpenType;
+//     follows FreeType. Fixed as this implementation's contract).
+//   - 'jpg ' / 'tiff' / unknown tag: unsupported → same as "no bitmap" (null)
+//     (so that strike can be skipped and gracefully fall back to other strikes / outlines).
 //
-// エラー方針: 構造破壊（offset 逆転・範囲外・レコード長 1..7・dupe 違反・範囲外 GID 引数）は
-// error.InvalidFont。findGlyph は途中 strike の構造エラーを握りつぶさず伝播する。
+// Error policy: structural corruption (reversed offsets, out of range, record length 1..7, dupe violations, out-of-range GID args) is
+// error.InvalidFont. findGlyph must not swallow structural errors from intermediate strikes; it propagates them.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -42,20 +42,20 @@ const sfnt = @import("sfnt.zig");
 
 pub const Error = error{InvalidFont};
 
-/// dupe 追従の hard cap（循環・深すぎ防止。spec 上 dupe→dupe は想定外だが防御的に追従）。
+/// Hard cap on dupe following (guards against cycles / excessive depth. Spec does not expect dupe→dupe, but follow defensively).
 const max_dupe_depth: u32 = 4;
 
-/// strike ヘッダの必要長（strike 先頭からの相対バイト数）: ppem(2)+ppi(2)+glyphDataOffsets[n+1](4*(n+1))。
+/// Required strike-header length (bytes relative to strike start): ppem(2)+ppi(2)+glyphDataOffsets[n+1](4*(n+1)).
 fn strikeHeaderLen(num_glyphs: u16) usize {
     return 4 + (@as(usize, num_glyphs) + 1) * 4;
 }
 
 pub const Sbix = struct {
-    /// sbix table-local slice（借用）。
+    /// sbix table-local slice (borrowed).
     data: []const u8,
     num_glyphs: u16,
     version: u16,
-    /// bit1(draw outlines) 等は 26.3 が参照できるよう保持のみ（検証しない）。
+    /// bit1(draw outlines) and similar are kept only so callers can read them (not validated).
     flags: u16,
     num_strikes: u32,
 
@@ -64,18 +64,18 @@ pub const Sbix = struct {
     pub const GlyphData = struct {
         origin_offset_x: i16,
         origin_offset_y: i16,
-        /// dupe 解決後なので常に 'png '（AC#2 の文言に合わせ保持）。
+        /// Always 'png ' after dupe resolution (kept to match that wording).
         graphic_type: [4]u8,
-        /// PNG 生バイト（借用）。decode は 26.3。
+        /// Raw PNG bytes (borrowed). Decode is out of scope here.
         bytes: []const u8,
     };
 
     pub const FoundGlyph = struct { strike: Strike, glyph: GlyphData };
 
-    /// sbix テーブルを parse する（sfnt 非依存。単体テスト可）。
-    /// 検証: version==1 / numStrikes>=1 / strikeOffsets 配列が table に収まる（overflow-safe）/
-    /// 各 strikeOffset がヘッダ・offsets 配列の内側を指さない（下限）/ 各 strike ヘッダ
-    /// （ppem+ppi+glyphDataOffsets[numGlyphs+1]）が table に収まる。glyph record 自体の検証は lazy。
+    /// Parse an sbix table (sfnt-independent; unit-testable).
+    /// Validates: version==1 / numStrikes>=1 / strikeOffsets array fits in the table (overflow-safe) /
+    /// each strikeOffset does not point inside the header/offsets array (lower bound) / each strike header
+    /// (ppem+ppi+glyphDataOffsets[numGlyphs+1]) fits in the table. Glyph-record validation itself is lazy.
     pub fn parse(table: []const u8, num_glyphs: u16) Error!Sbix {
         const r = Reader{ .data = table };
         try r.require(0, 8);
@@ -87,17 +87,17 @@ pub const Sbix = struct {
 
         const offsets_len = std.math.mul(usize, @as(usize, num_strikes), 4) catch return error.InvalidFont;
         try r.require(8, offsets_len);
-        const header_end = 8 + offsets_len; // require 済みなので overflow しない
+        const header_end = 8 + offsets_len; // Already required, so no overflow
 
         const strike_header_len = strikeHeaderLen(num_glyphs);
 
         var i: u32 = 0;
         while (i < num_strikes) : (i += 1) {
             const off: usize = try r.u32At(8 + @as(usize, i) * 4);
-            // 下限: ヘッダ + strikeOffsets 配列の内側を指す crafted table を弾く
-            // （sfnt.zig の TTC `base < 12 + ot_len` 検査と同型）。
+            // Lower bound: reject crafted tables whose strikeOffset points inside the header + strikeOffsets array
+            // (same shape as sfnt.zig TTC `base < 12 + ot_len` check).
             if (off < header_end) return error.InvalidFont;
-            // 上限: strike ヘッダ全体（ppem/ppi/glyphDataOffsets 配列）が table に収まる。
+            // Upper bound: the whole strike header (ppem/ppi/glyphDataOffsets array) fits in the table.
             try r.require(off, strike_header_len);
         }
 
@@ -110,7 +110,7 @@ pub const Sbix = struct {
         };
     }
 
-    /// sfnt から 'sbix' テーブルを見つけて parse する。テーブル不在は null。
+    /// Find and parse the 'sbix' table from sfnt. Missing table is null.
     pub fn init(font: *const sfnt.SfntFile) Error!?Sbix {
         const table = (font.tableSlice("sbix") catch return error.InvalidFont) orelse return null;
         return try parse(table, font.num_glyphs);
@@ -122,7 +122,7 @@ pub const Sbix = struct {
         return try r.u32At(8 + @as(usize, index) * 4);
     }
 
-    /// index の strike（ppem/ppi）を返す。AC#4 の列挙用に全 strike を走査できる。
+    /// Return the strike at index (ppem/ppi). Callers can walk all strikes for enumeration.
     pub fn strikeAt(self: *const Sbix, index: u32) Error!Strike {
         const off = try self.strikeOffsetAt(index);
         const r = Reader{ .data = self.data };
@@ -131,11 +131,11 @@ pub const Sbix = struct {
         return .{ .index = index, .ppem = ppem, .ppi = ppi };
     }
 
-    /// strike 選択の固定規則（AC#5）: 目標 px 以上の最小 ppem を選ぶ。無ければ最大 ppem。
-    /// ppi は無視。同 ppem 複数は strike 配列順で先勝ち。
+    /// Fixed strike-selection rule: pick the smallest ppem ≥ target px. If none, pick the largest ppem.
+    /// Ignore ppi. When multiple strikes share the same ppem, first-wins by strike array order.
     pub fn selectStrike(self: *const Sbix, target_px: u32) Error!Strike {
-        var best_above: ?Strike = null; // 目標以上で ppem 最小
-        var best_max: ?Strike = null; // 全体で ppem 最大（fallback）
+        var best_above: ?Strike = null; // Smallest ppem ≥ target
+        var best_max: ?Strike = null; // Largest ppem overall (fallback)
         var i: u32 = 0;
         while (i < self.num_strikes) : (i += 1) {
             const s = try self.strikeAt(i);
@@ -144,12 +144,12 @@ pub const Sbix = struct {
                 if (best_above == null or s.ppem < best_above.?.ppem) best_above = s;
             }
         }
-        // num_strikes >= 1（parse で保証）なので best_max は必ず設定される。
+        // num_strikes >= 1 (guaranteed by parse), so best_max is always set.
         return best_above orelse best_max.?;
     }
 
-    /// strike_index・gid の glyph data を返す（dupe 解決済み）。bitmap 無し（0 レコード・
-    /// jpg/tiff/未知 tag）は null。構造破壊は InvalidFont。
+    /// Return glyph data for strike_index and gid (dupe-resolved). No bitmap (0-length record,
+    /// jpg/tiff/unknown tag) is null. Structural corruption is InvalidFont.
     pub fn glyphData(self: *const Sbix, strike_index: u32, gid: u16) Error!?GlyphData {
         if (gid >= self.num_glyphs) return error.InvalidFont;
         const strike_off = try self.strikeOffsetAt(strike_index);
@@ -158,23 +158,23 @@ pub const Sbix = struct {
 
     fn resolveGlyphData(self: *const Sbix, strike_off: usize, gid: u16, depth: u32) Error!?GlyphData {
         if (depth > max_dupe_depth) return error.InvalidFont;
-        if (gid >= self.num_glyphs) return error.InvalidFont; // dupe 参照先の再検証
+        if (gid >= self.num_glyphs) return error.InvalidFont; // Re-validate the dupe target
 
         const r = Reader{ .data = self.data };
         const rec_off = strike_off + 4 + @as(usize, gid) * 4;
         const off0: usize = try r.u32At(rec_off);
         const off1: usize = try r.u32At(rec_off + 4);
         if (off0 > off1) return error.InvalidFont;
-        if (off0 == off1) return null; // bitmap 無し（下限違反でも 1 byte も読まないので安全に null）
+        if (off0 == off1) return null; // No bitmap (even on lower-bound violation, reading 0 bytes is safe → null)
 
-        const strike_slice_len = self.data.len - strike_off; // strike_off は parse で <= data.len 検証済み
+        const strike_slice_len = self.data.len - strike_off; // strike_off was validated <= data.len at parse
         const header_len = strikeHeaderLen(self.num_glyphs);
-        // 下限: ヘッダ（ppem/ppi/glyphDataOffsets 配列）の内側を指す非空レコードを弾く。
-        // 上限: strike の残り領域を超える範囲を弾く。
+        // Lower bound: reject non-empty records that point inside the header (ppem/ppi/glyphDataOffsets array).
+        // Upper bound: reject ranges past the remaining strike region.
         if (off0 < header_len or off1 > strike_slice_len) return error.InvalidFont;
 
         const record = self.data[strike_off + off0 .. strike_off + off1];
-        if (record.len < 8) return error.InvalidFont; // 1..7 は不正（8 以上でヘッダが揃う）
+        if (record.len < 8) return error.InvalidFont; // 1..7 is invalid (header is complete only at 8+)
 
         const rr = Reader{ .data = record };
         const ox = try rr.i16At(0);
@@ -190,12 +190,12 @@ pub const Sbix = struct {
                 .bytes = record[8..],
             };
         } else if (std.mem.eql(u8, &gtype, "dupe")) {
-            if (record.len != 10) return error.InvalidFont; // data 長は厳格に 2byte
+            if (record.len != 10) return error.InvalidFont; // data length must be exactly 2 bytes
             const ref_gid = try rr.u16At(8);
             if (ref_gid >= self.num_glyphs) return error.InvalidFont;
             return self.resolveGlyphData(strike_off, ref_gid, depth + 1);
         } else {
-            // jpg / tiff / 未知 tag: 非対応 → 「bitmap 無し」と同じ扱い。
+            // jpg / tiff / unknown tag: unsupported → same as "no bitmap".
             return null;
         }
     }
@@ -209,14 +209,14 @@ pub const Sbix = struct {
         return a.ppem > b.ppem or (a.ppem == b.ppem and a.index < b.index);
     }
 
-    /// GID と目標 px から、strike をまたいで bitmap を解決する（AC#4）。
-    /// 選好順は selectStrike と同じ規則を残り集合へ再適用したもの:
-    /// 目標以上を ppem 昇順 → 目標未満を ppem 降順（同 ppem は配列順で先勝ち）。
-    /// 途中 strike の構造エラー（InvalidFont）は握りつぶさず伝播する。全 strike に無ければ null。
+    /// Resolve a bitmap across strikes from GID and target px.
+    /// Preference order re-applies the same selectStrike rules to the remaining set:
+    /// ppem ≥ target ascending → ppem < target descending (same ppem: first-wins by array order).
+    /// Must not swallow structural errors (InvalidFont) from intermediate strikes; propagate them. null if no strike has a bitmap.
     pub fn findGlyph(self: *const Sbix, target_px: u32, gid: u16) Error!?FoundGlyph {
         if (gid >= self.num_glyphs) return error.InvalidFont;
 
-        // Phase A: ppem >= target_px を昇順（同 ppem は index 昇順）で試す。
+        // Phase A: try ppem >= target_px ascending (same ppem: ascending index).
         var last: ?Candidate = null;
         while (true) {
             var best: ?Candidate = null;
@@ -237,7 +237,7 @@ pub const Sbix = struct {
             }
         }
 
-        // Phase B: ppem < target_px を降順（同 ppem は index 昇順）で試す。
+        // Phase B: try ppem < target_px descending (same ppem: ascending index).
         last = null;
         while (true) {
             var best: ?Candidate = null;
@@ -292,15 +292,15 @@ fn appendU32(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
     try list.append(alloc, @truncate(v));
 }
 
-/// 合成 sbix テストデータ用の glyph record 記述。builder が offset 配列を自動計算する。
-/// **テスト専用**（TASK-26.3 で outline_font.zig の統合テストが合成 sbix バイト列生成に
-/// 再利用するため pub 昇格。本番コードから使わない）。
+/// Glyph-record description for synthetic sbix test data. The builder auto-computes the offset array.
+/// **Test-only** (pub so outline_font.zig integration tests can reuse synthetic sbix byte generation.
+/// Do not use from production code).
 pub const RecordSpec = union(enum) {
-    /// bitmap 無し（off0==off1）。
+    /// No bitmap (off0==off1).
     empty,
     png: Png,
     dupe: Dupe,
-    /// jpg/tiff/未知 tag や不正な data 長（dupe 系の負テスト）を直接記述する低レベル手段。
+    /// Low-level way to write jpg/tiff/unknown tags or invalid data lengths directly (negative tests for dupe etc.).
     raw: Raw,
 
     const Png = struct { x: i16 = 0, y: i16 = 0, bytes: []const u8 = &.{} };
@@ -308,19 +308,19 @@ pub const RecordSpec = union(enum) {
     const Raw = struct { x: i16 = 0, y: i16 = 0, kind: [4]u8, data: []const u8 = &.{} };
 };
 
-/// **テスト専用**（RecordSpec と同じく TASK-26.3 で pub 昇格）。
+/// **Test-only** (pub for the same reason as RecordSpec).
 pub const StrikeSpec = struct {
     ppem: u16,
     ppi: u16 = 72,
-    /// 長さは num_glyphs と一致必須（各 gid の record を順に記述）。
+    /// Length must match num_glyphs (describe each gid's record in order).
     records: []const RecordSpec,
 };
 
-/// strikes から正しい sbix バイト列を組む（呼び出し側が free）。
-/// **テスト専用**（RecordSpec と同じく TASK-26.3 で pub 昇格。本番コードから使わない）。
-/// 単一 strike フィクスチャ（num_strikes==1）を使うテストは、strikeOffsets[0] が常に
-/// 絶対位置 8、strike 本体が常に絶対位置 12、glyphDataOffsets 配列が常に絶対位置 16 から
-/// 始まる（ヘッダ長が固定のため）ことを利用して、正常系バイト列を狙って上書きし境界テストを組む。
+/// Build a correct sbix byte sequence from strikes (caller frees).
+/// **Test-only** (pub for the same reason as RecordSpec. Do not use from production code).
+/// Tests that use a single-strike fixture (num_strikes==1) can rely on strikeOffsets[0] always at
+/// absolute position 8, the strike body always at absolute position 12, and the glyphDataOffsets array always starting at absolute position 16
+/// (header length is fixed) to overwrite normal-case bytes for boundary tests.
 pub fn buildSbix(alloc: std.mem.Allocator, num_glyphs: u16, strikes: []const StrikeSpec) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -373,9 +373,9 @@ pub fn buildSbix(alloc: std.mem.Allocator, num_glyphs: u16, strikes: []const Str
     return out.toOwnedSlice(alloc);
 }
 
-// ── AC#1: 正常系 + 切り詰め ─────────────────────────────────────────
+// ── Normal case + truncation ─────────────────────────────────────────
 
-test "sbix: 正常系（2 strike・複数 record）で version/flags/numStrikes/ppem/ppi/offsets を読める" {
+test "sbix: happy path (2 strikes · multi records) reads version/flags/numStrikes/ppem/ppi/offsets" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 2, &.{
         .{ .ppem = 20, .ppi = 72, .records = &.{ .empty, .{ .png = .{ .bytes = &.{ 1, 2, 3 } } } } },
@@ -405,29 +405,29 @@ test "sbix: 正常系（2 strike・複数 record）で version/flags/numStrikes/
     try testing.expect((try s.glyphData(1, 1)) == null);
 }
 
-test "sbix: ヘッダ未満の切り詰めは InvalidFont" {
+test "sbix: truncated below header is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
-    try testing.expectError(error.InvalidFont, Sbix.parse(bytes[0..4], 1)); // 8 byte 未満
+    try testing.expectError(error.InvalidFont, Sbix.parse(bytes[0..4], 1)); // Fewer than 8 bytes
 }
 
-test "sbix: strikeOffsets 配列が不足する切り詰めは InvalidFont" {
+test "sbix: truncated with incomplete strikeOffsets array is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
-    try testing.expectError(error.InvalidFont, Sbix.parse(bytes[0..10], 1)); // strikeOffsets[0] は 4 byte 必要（8..12）だが 10 まで
+    try testing.expectError(error.InvalidFont, Sbix.parse(bytes[0..10], 1)); // strikeOffsets[0] needs 4 bytes (8..12) but only through 10
 }
 
-test "sbix: strike ヘッダが不足する切り詰めは InvalidFont" {
+test "sbix: truncated with incomplete strike header is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
-    // strike 本体は絶対位置 12 から始まり ppem(2)+ppi(2)+offsets[2](8) = 16 byte 必要。14 までだと不足。
+    // Strike body starts at absolute position 12 and needs ppem(2)+ppi(2)+offsets[2](8) = 16 bytes. Through 14 is short.
     try testing.expectError(error.InvalidFont, Sbix.parse(bytes[0..14], 1));
 }
 
-test "sbix: version != 1 は InvalidFont" {
+test "sbix: version != 1 is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
@@ -437,7 +437,7 @@ test "sbix: version != 1 は InvalidFont" {
     try testing.expectError(error.InvalidFont, Sbix.parse(corrupt, 1));
 }
 
-test "sbix: numStrikes == 0 は InvalidFont" {
+test "sbix: numStrikes == 0 is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
@@ -447,40 +447,40 @@ test "sbix: numStrikes == 0 は InvalidFont" {
     try testing.expectError(error.InvalidFont, Sbix.parse(corrupt, 1));
 }
 
-test "sbix: numStrikes 過大（offsets 配列が table を超える）は InvalidFont" {
+test "sbix: oversized numStrikes (offsets array past table) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    putU32(corrupt, 4, 100); // numStrikes=100 だが table には 1 strike 分の余地しか無い
+    putU32(corrupt, 4, 100); // numStrikes=100 but the table only has room for 1 strike
     try testing.expectError(error.InvalidFont, Sbix.parse(corrupt, 1));
 }
 
-// ── AC#3: strikeOffset の境界 ────────────────────────────────────
+// ── strikeOffset bounds ────────────────────────────────────
 
-test "sbix: strikeOffset がヘッダ/offsets 配列の内側を指す（下限違反）は InvalidFont" {
+test "sbix: strikeOffset pointing inside header/offsets array (lower-bound violation) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    // strikeOffsets[0] は絶対位置 8。正常値 12 を、ヘッダ内(4)に書き換える。
+    // strikeOffsets[0] is absolute position 8. Rewrite the valid value 12 to inside the header (4).
     putU32(corrupt, 8, 4);
     try testing.expectError(error.InvalidFont, Sbix.parse(corrupt, 1));
 }
 
-test "sbix: strikeOffset が strike ヘッダ全体を table 内に収められない（上限違反・範囲外）は InvalidFont" {
+test "sbix: strikeOffset that cannot fit the full strike header in table (upper-bound / OOB) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 16, .records = &.{.empty} }});
     defer a.free(bytes);
-    // strike 本体（絶対位置 12）を 2 byte だけ残して切り詰める（ppem は読めても ppi/offsets が読めない）。
+    // Truncate the strike body (absolute position 12) leaving only 2 bytes (ppem readable but not ppi/offsets).
     try testing.expectError(error.InvalidFont, Sbix.parse(bytes[0..14], 1));
 }
 
-// ── AC#2: graphicType（png/dupe/jpg/tiff/未知） ──────────────────
+// ── graphicType (png/dupe/jpg/tiff/unknown) ──────────────────
 
-test "sbix: png record は origin/type/bytes を返す" {
+test "sbix: png record returns origin/type/bytes" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 32, .records = &.{
         .{ .png = .{ .x = 3, .y = -5, .bytes = &.{ 0xAA, 0xBB } } },
@@ -494,7 +494,7 @@ test "sbix: png record は origin/type/bytes を返す" {
     try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB }, g.bytes);
 }
 
-test "sbix: dupe は参照先 GID の bitmap に追従する" {
+test "sbix: dupe follows the referent GID bitmap" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 2, &.{.{ .ppem = 32, .records = &.{
         .{ .dupe = .{ .gid = 1 } },
@@ -507,7 +507,7 @@ test "sbix: dupe は参照先 GID の bitmap に追従する" {
     try testing.expectEqualSlices(u8, "png ", &g.graphic_type);
 }
 
-test "sbix: jpg/tiff/未知 tag は bitmap 無し(null)扱い" {
+test "sbix: jpg/tiff/unknown tag treated as no bitmap (null)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 3, &.{.{ .ppem = 32, .records = &.{
         .{ .raw = .{ .kind = "jpg ".*, .data = &.{1} } },
@@ -521,14 +521,14 @@ test "sbix: jpg/tiff/未知 tag は bitmap 無し(null)扱い" {
     try testing.expect((try s.glyphData(0, 2)) == null);
 }
 
-// ── AC#6: dupe の安全性 ──────────────────────────────────────────
+// ── dupe safety ──────────────────────────────────────────
 
-test "sbix: dupe の data 長 != 2 は InvalidFont" {
+test "sbix: dupe data length != 2 is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{
         .ppem = 32,
         .records = &.{
-            .{ .raw = .{ .kind = "dupe".*, .data = &.{ 1, 2, 3 } } }, // 3 byte（不正）
+            .{ .raw = .{ .kind = "dupe".*, .data = &.{ 1, 2, 3 } } }, // 3 bytes (invalid)
         },
     }});
     defer a.free(bytes);
@@ -536,12 +536,12 @@ test "sbix: dupe の data 長 != 2 は InvalidFont" {
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: dupe の参照先 GID が範囲外は InvalidFont" {
+test "sbix: dupe referent GID out of range is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{
         .ppem = 32,
         .records = &.{
-            .{ .dupe = .{ .gid = 5 } }, // numGlyphs=1 なので範囲外
+            .{ .dupe = .{ .gid = 5 } }, // numGlyphs=1 so out of range
         },
     }});
     defer a.free(bytes);
@@ -549,12 +549,12 @@ test "sbix: dupe の参照先 GID が範囲外は InvalidFont" {
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: dupe の自己参照は深さ上限超過で InvalidFont" {
+test "sbix: dupe self-reference exceeds depth cap → InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{
         .ppem = 32,
         .records = &.{
-            .{ .dupe = .{ .gid = 0 } }, // 自己参照（無限ループを深さ上限で止める）
+            .{ .dupe = .{ .gid = 0 } }, // Self-reference (stop infinite loop via depth cap)
         },
     }});
     defer a.free(bytes);
@@ -562,7 +562,7 @@ test "sbix: dupe の自己参照は深さ上限超過で InvalidFont" {
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: dupe の相互循環は深さ上限超過で InvalidFont" {
+test "sbix: dupe mutual cycle exceeds depth cap → InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 2, &.{.{ .ppem = 32, .records = &.{
         .{ .dupe = .{ .gid = 1 } },
@@ -573,12 +573,12 @@ test "sbix: dupe の相互循環は深さ上限超過で InvalidFont" {
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: dupe→png の origin は参照先レコードを採用する（この実装の仕様）" {
+test "sbix: dupe→png adopts the referent record's origin (this implementation's spec)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 2, &.{.{
         .ppem = 32,
         .records = &.{
-            .{ .dupe = .{ .x = 999, .y = 888, .gid = 1 } }, // 自身の origin は無視される
+            .{ .dupe = .{ .x = 999, .y = 888, .gid = 1 } }, // Own origin is ignored
             .{ .png = .{ .x = 5, .y = 7, .bytes = &.{ 1, 2, 3 } } },
         },
     }});
@@ -590,9 +590,9 @@ test "sbix: dupe→png の origin は参照先レコードを採用する（こ�
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, g.bytes);
 }
 
-// ── AC#3: glyphDataOffset の境界（レコード） ────────────────────
+// ── glyphDataOffset bounds (record) ────────────────────
 
-test "sbix: glyphDataOffset 逆転（off0 > off1）は InvalidFont" {
+test "sbix: glyphDataOffset reversal (off0 > off1) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 2, &.{.{ .ppem = 32, .records = &.{
         .{ .png = .{ .bytes = &.{1} } },
@@ -601,31 +601,31 @@ test "sbix: glyphDataOffset 逆転（off0 > off1）は InvalidFont" {
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    // 単一 strike・numGlyphs=2 では glyphDataOffsets[gid] は絶対位置 16+4*gid に固定。
-    // offsets[1] を offsets[0] より小さい値へ書き換えて gid0 のレコードを逆転させる。
+    // With a single strike and numGlyphs=2, glyphDataOffsets[gid] is fixed at absolute position 16+4*gid.
+    // Rewrite offsets[1] to a value smaller than offsets[0] to reverse gid0's record.
     putU32(corrupt, 16 + 4 * 1, 0);
     const s = try Sbix.parse(corrupt, 2);
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: glyphDataOffset のレコード長 1..7（0 でも 8 以上でもない）は InvalidFont" {
+test "sbix: glyphDataOffset record length 1..7 (neither 0 nor ≥8) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{
         .ppem = 32,
         .records = &.{
-            .{ .png = .{ .bytes = &.{} } }, // 自然長は 8（header のみ）
+            .{ .png = .{ .bytes = &.{} } }, // Natural length is 8 (header only)
         },
     }});
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    // offsets[0]=12(header_len), offsets[1]（絶対位置 16+4=20）を 12+3=15 に書き換えてレコード長 3 に。
+    // Rewrite offsets[0]=12(header_len), offsets[1] (absolute position 16+4=20) to 12+3=15 so record length is 3.
     putU32(corrupt, 16 + 4 * 1, 15);
     const s = try Sbix.parse(corrupt, 1);
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: 非空レコードの glyphDataOffset がヘッダ内を指す（下限違反）は InvalidFont" {
+test "sbix: non-empty record glyphDataOffset pointing inside header (lower-bound violation) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 32, .records = &.{
         .{ .png = .{ .bytes = &.{ 1, 2 } } },
@@ -633,27 +633,27 @@ test "sbix: 非空レコードの glyphDataOffset がヘッダ内を指す（下
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    // offsets[0]（絶対位置 16）を 0 に書き換える（off1 はそのまま。off0!=off1 で非空）。
+    // Rewrite offsets[0] (absolute position 16) to 0 (leave off1 as-is. off0!=off1 so non-empty).
     putU32(corrupt, 16 + 4 * 0, 0);
     const s = try Sbix.parse(corrupt, 1);
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-test "sbix: 空レコード（off0==off1）は下限違反があっても null（例外的に安全）" {
+test "sbix: empty record (off0==off1) returns null even with lower-bound violation (safe exception)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 32, .records = &.{.empty} }});
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    // offsets[0],offsets[1] とも 0 に書き換える（off0==off1==0 はヘッダ内=下限違反の値だが、
-    // 1 byte も読まないため安全に null を返す仕様）。
+    // Rewrite both offsets[0] and offsets[1] to 0 (off0==off1==0 is a lower-bound-violation value inside the header, but
+    // the contract returns null safely because 0 bytes are read).
     putU32(corrupt, 16 + 4 * 0, 0);
     putU32(corrupt, 16 + 4 * 1, 0);
     const s = try Sbix.parse(corrupt, 1);
     try testing.expect((try s.glyphData(0, 0)) == null);
 }
 
-test "sbix: glyphDataOffset が strike の残り領域を超える（範囲外）は InvalidFont" {
+test "sbix: glyphDataOffset past remaining strike region (OOB) is InvalidFont" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 32, .records = &.{
         .{ .png = .{ .bytes = &.{1} } },
@@ -661,14 +661,14 @@ test "sbix: glyphDataOffset が strike の残り領域を超える（範囲外�
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    putU32(corrupt, 16 + 4 * 1, 0xFFFFFF); // offsets[1](sentinel) を巨大値に
+    putU32(corrupt, 16 + 4 * 1, 0xFFFFFF); // offsets[1](sentinel) to a huge value
     const s = try Sbix.parse(corrupt, 1);
     try testing.expectError(error.InvalidFont, s.glyphData(0, 0));
 }
 
-// ── AC: 範囲外 GID 引数 ──────────────────────────────────────────
+// ── Out-of-range GID argument ──────────────────────────────────────────
 
-test "sbix: 範囲外 GID 引数は InvalidFont（glyphData / findGlyph）" {
+test "sbix: out-of-range GID arg is InvalidFont (glyphData / findGlyph)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 32, .records = &.{.empty} }});
     defer a.free(bytes);
@@ -677,7 +677,7 @@ test "sbix: 範囲外 GID 引数は InvalidFont（glyphData / findGlyph）" {
     try testing.expectError(error.InvalidFont, s.findGlyph(32, 1));
 }
 
-test "sbix: 範囲外 strike index は InvalidFont（strikeAt / glyphData）" {
+test "sbix: out-of-range strike index is InvalidFont (strikeAt / glyphData)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{.{ .ppem = 32, .records = &.{.empty} }});
     defer a.free(bytes);
@@ -686,24 +686,24 @@ test "sbix: 範囲外 strike index は InvalidFont（strikeAt / glyphData）" {
     try testing.expectError(error.InvalidFont, s.glyphData(1, 0));
 }
 
-// ── AC#4: strike をまたいだ coverage 解決 ────────────────────────
+// ── Cross-strike coverage resolution ────────────────────────
 
-test "sbix: findGlyph は strike A に無く B にある GID を B から解決する" {
+test "sbix: findGlyph resolves a GID missing in strike A but present in B from B" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
-        .{ .ppem = 16, .records = &.{.empty} }, // strike A: bitmap 無し
-        .{ .ppem = 32, .records = &.{.{ .png = .{ .bytes = &.{7} } }} }, // strike B: bitmap 有り
+        .{ .ppem = 16, .records = &.{.empty} }, // strike A: no bitmap
+        .{ .ppem = 32, .records = &.{.{ .png = .{ .bytes = &.{7} } }} }, // strike B: has bitmap
     });
     defer a.free(bytes);
     const s = try Sbix.parse(bytes, 1);
-    const found = (try s.findGlyph(16, 0)).?; // 目標=16 は strike A(16)を優先するが無いので B へ
+    const found = (try s.findGlyph(16, 0)).?; // target=16 prefers strike A(16) but it has none, so fall through to B
     try testing.expectEqual(@as(u32, 1), found.strike.index);
     try testing.expectEqualSlices(u8, &.{7}, found.glyph.bytes);
 }
 
-test "sbix: findGlyph は目標未満のみのとき ppem 降順で次点へフォールバックする" {
+test "sbix: findGlyph falls back in descending ppem when all strikes are below target" {
     const a = testing.allocator;
-    // 目標=100。ppem>=100 の strike は無い。40(最大)に bitmap 無し→次点 20 に有り、を確認。
+    // target=100. No strike with ppem>=100. Confirm 40(largest) has no bitmap → next 20 has one.
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 40, .records = &.{.empty} },
         .{ .ppem = 20, .records = &.{.{ .png = .{ .bytes = &.{5} } }} },
@@ -715,9 +715,9 @@ test "sbix: findGlyph は目標未満のみのとき ppem 降順で次点へフ�
     try testing.expectEqualSlices(u8, &.{5}, found.glyph.bytes);
 }
 
-test "sbix: findGlyph は同 ppem 複数で先勝ち（index 昇順）が bitmap 無しなら次の同値へ進む" {
+test "sbix: findGlyph at equal ppem tries first-wins (ascending index) then next equal if no bitmap" {
     const a = testing.allocator;
-    // 目標=32。ppem=32 が index0,1 の 2 つ。0 は bitmap 無し→先勝ちで試すが空なので index1 へ進む。
+    // target=32. Two strikes with ppem=32 at index0,1. 0 has no bitmap → try first-wins but empty, so advance to index1.
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 32, .records = &.{.empty} },
         .{ .ppem = 32, .records = &.{.{ .png = .{ .bytes = &.{9} } }} },
@@ -729,10 +729,10 @@ test "sbix: findGlyph は同 ppem 複数で先勝ち（index 昇順）が bitmap
     try testing.expectEqualSlices(u8, &.{9}, found.glyph.bytes);
 }
 
-test "sbix: findGlyph は strike 配列が ppem 昇順でなくても正しく走査する" {
+test "sbix: findGlyph scans correctly even when strike array is not ascending by ppem" {
     const a = testing.allocator;
-    // 配列順: 64(bitmap無), 16(bitmap無), 32(bitmap有)。目標=20 → ppem>=20 は{64,32}だが
-    // 配列順(64が先)ではなく ppem 昇順(32が先)で試すため、32 が bitmap 有りで即発見できる。
+    // Array order: 64(no bitmap), 16(no bitmap), 32(has bitmap). target=20 → ppem>=20 is {64,32} but
+    // try in ppem ascending order (32 first), not array order (64 first), so 32 with bitmap is found immediately.
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 64, .records = &.{.empty} },
         .{ .ppem = 16, .records = &.{.empty} },
@@ -745,9 +745,9 @@ test "sbix: findGlyph は strike 配列が ppem 昇順でなくても正しく�
     try testing.expectEqualSlices(u8, &.{3}, found.glyph.bytes);
 }
 
-test "sbix: findGlyph は全て目標未満で ppem 降順走査が複数段フォールバックする" {
+test "sbix: findGlyph multi-step falls back in descending ppem when all are below target" {
     const a = testing.allocator;
-    // 目標=100。降順候補: 40(無)→20(無)→10(有)。
+    // target=100. Descending candidates: 40(none)→20(none)→10(has).
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 40, .records = &.{.empty} },
         .{ .ppem = 20, .records = &.{.empty} },
@@ -760,7 +760,7 @@ test "sbix: findGlyph は全て目標未満で ppem 降順走査が複数段フ�
     try testing.expectEqualSlices(u8, &.{1}, found.glyph.bytes);
 }
 
-test "sbix: findGlyph は全 strike に無ければ null（strikeAt で列挙可能）" {
+test "sbix: findGlyph returns null when absent from all strikes (enumerable via strikeAt)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 16, .records = &.{.empty} },
@@ -774,7 +774,7 @@ test "sbix: findGlyph は全 strike に無ければ null（strikeAt で列挙可
     try testing.expectEqual(@as(u16, 32), (try s.strikeAt(1)).ppem);
 }
 
-test "sbix: findGlyph は途中 strike の構造エラーを伝播する（握りつぶさない）" {
+test "sbix: findGlyph propagates mid-strike structural errors (must not swallow)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 16, .records = &.{.{ .png = .{ .bytes = &.{1} } }} },
@@ -782,14 +782,14 @@ test "sbix: findGlyph は途中 strike の構造エラーを伝播する（握�
     defer a.free(bytes);
     const corrupt = try a.dupe(u8, bytes);
     defer a.free(corrupt);
-    putU32(corrupt, 16 + 4 * 1, 0xFFFFFF); // strike0 の gid0 レコードを範囲外に破壊
+    putU32(corrupt, 16 + 4 * 1, 0xFFFFFF); // Corrupt strike0 gid0 record out of range
     const s = try Sbix.parse(corrupt, 1);
     try testing.expectError(error.InvalidFont, s.findGlyph(16, 0));
 }
 
-// ── AC#5: selectStrike の固定規則 ─────────────────────────────────
+// ── selectStrike fixed rules ─────────────────────────────────
 
-test "sbix: selectStrike は目標 px 以上の最小 ppem を選ぶ" {
+test "sbix: selectStrike picks the smallest ppem ≥ target px" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 16, .records = &.{.empty} },
@@ -799,10 +799,10 @@ test "sbix: selectStrike は目標 px 以上の最小 ppem を選ぶ" {
     defer a.free(bytes);
     const s = try Sbix.parse(bytes, 1);
     try testing.expectEqual(@as(u16, 32), (try s.selectStrike(20)).ppem);
-    try testing.expectEqual(@as(u16, 16), (try s.selectStrike(16)).ppem); // ちょうど一致
+    try testing.expectEqual(@as(u16, 16), (try s.selectStrike(16)).ppem); // Exact match
 }
 
-test "sbix: selectStrike は全て目標未満なら最大 ppem を選ぶ" {
+test "sbix: selectStrike picks the largest ppem when all are below target" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 16, .records = &.{.empty} },
@@ -813,7 +813,7 @@ test "sbix: selectStrike は全て目標未満なら最大 ppem を選ぶ" {
     try testing.expectEqual(@as(u16, 32), (try s.selectStrike(100)).ppem);
 }
 
-test "sbix: selectStrike は同 ppem 複数なら strike 配列順で先勝ち（ppi は無視）" {
+test "sbix: selectStrike first-wins by strike array order at equal ppem (ppi ignored)" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 32, .ppi = 72, .records = &.{.empty} },
@@ -822,11 +822,11 @@ test "sbix: selectStrike は同 ppem 複数なら strike 配列順で先勝ち�
     defer a.free(bytes);
     const s = try Sbix.parse(bytes, 1);
     const sel = try s.selectStrike(20);
-    try testing.expectEqual(@as(u32, 0), sel.index); // 先勝ち
+    try testing.expectEqual(@as(u32, 0), sel.index); // First-wins
     try testing.expectEqual(@as(u16, 72), sel.ppi);
 }
 
-test "sbix: selectStrike は strike 配列が ppem 昇順でなくても正しく選ぶ" {
+test "sbix: selectStrike picks correctly even when strike array is not ascending by ppem" {
     const a = testing.allocator;
     const bytes = try buildSbix(a, 1, &.{
         .{ .ppem = 64, .records = &.{.empty} },

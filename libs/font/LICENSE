@@ -1,6 +1,6 @@
 This library bundles the "Press Start 2P" outline font
 (assets/PressStart2P-Regular.ttf) as the default vendored font for
-headless/deterministic text rasterization (TASK-79.4). Source:
+headless/deterministic text rasterization. Source:
 https://github.com/google/fonts/tree/main/ofl/pressstart2p
 
 Copyright 2012 The Press Start 2P Project Authors (cody@zone38.net), with Reserved Font Name "Press Start 2P".

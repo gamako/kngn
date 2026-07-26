@@ -24,9 +24,9 @@ pub const Rect = struct {
         return .{ .x = x, .y = y, .w = w, .h = h };
     }
 
-    /// 点が矩形内かを判定する。境界は left/top inclusive・right/bottom exclusive
-    /// （`x <= p.x < x+w` かつ `y <= p.y < y+h`）。empty rect は常に false。
-    /// hit-test と clip 焼き込み（intersect）で off-by-one が出ないよう右下を排他にする。
+    /// Test whether a point is inside a rectangle. Bounds are left/top inclusive, right/bottom exclusive
+    /// (`x <= p.x < x+w` and `y <= p.y < y+h`). Empty rects are always false.
+    /// Right/bottom exclusivity avoids off-by-one between hit-test and clip bake-in (intersect).
     pub fn contains(self: Rect, p: Vec2) bool {
         const x2: i64 = @as(i64, self.x) + @as(i64, self.w);
         const y2: i64 = @as(i64, self.y) + @as(i64, self.h);
@@ -39,7 +39,7 @@ pub const Vec2 = struct {
     y: i32,
 };
 
-/// ピクセルバッファ。不変条件: pixels.len == width * height
+/// Pixel buffer. Invariant: pixels.len == width * height
 pub const RenderTarget = struct {
     pixels: []u32,
     width: u32,
@@ -73,22 +73,22 @@ test "Rect.intersect: negative origin" {
     try std.testing.expectEqual(@as(u32, 10), r.h);
 }
 
-test "Rect.contains: 左上は inclusive" {
+test "Rect.contains: top-left is inclusive" {
     const r = Rect{ .x = 10, .y = 20, .w = 30, .h = 40 };
-    try std.testing.expect(r.contains(.{ .x = 10, .y = 20 })); // 左上隅
-    try std.testing.expect(r.contains(.{ .x = 39, .y = 59 })); // 右下の内側 1px
-    try std.testing.expect(r.contains(.{ .x = 25, .y = 40 })); // 内部
+    try std.testing.expect(r.contains(.{ .x = 10, .y = 20 })); // Top-left corner
+    try std.testing.expect(r.contains(.{ .x = 39, .y = 59 })); // Inner 1px at bottom-right
+    try std.testing.expect(r.contains(.{ .x = 25, .y = 40 })); // Interior
 }
 
-test "Rect.contains: 右下は exclusive・外側は false" {
+test "Rect.contains: bottom-right is exclusive; outside is false" {
     const r = Rect{ .x = 10, .y = 20, .w = 30, .h = 40 };
     try std.testing.expect(!r.contains(.{ .x = 40, .y = 30 })); // x == x+w
     try std.testing.expect(!r.contains(.{ .x = 25, .y = 60 })); // y == y+h
-    try std.testing.expect(!r.contains(.{ .x = 9, .y = 30 })); // 左外
-    try std.testing.expect(!r.contains(.{ .x = 25, .y = 19 })); // 上外
+    try std.testing.expect(!r.contains(.{ .x = 9, .y = 30 })); // Outside left
+    try std.testing.expect(!r.contains(.{ .x = 25, .y = 19 })); // Outside top
 }
 
-test "Rect.contains: empty rect は常に false" {
+test "Rect.contains: empty rect is always false" {
     const zero_w = Rect{ .x = 0, .y = 0, .w = 0, .h = 10 };
     const zero_h = Rect{ .x = 0, .y = 0, .w = 10, .h = 0 };
     try std.testing.expect(!zero_w.contains(.{ .x = 0, .y = 5 }));

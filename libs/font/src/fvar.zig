@@ -1,9 +1,9 @@
-// fvar テーブルパーサ（OpenType Font Variations 軸定義 + named instance）。
+// fvar table parser (OpenType Font Variations axis definitions + named instances).
 //
-// ホットパス宣言: **FontFace.init 時のみ**（sbix と同格）。ゼロアロケーション（owned 固定配列）。
+// Hot-path note: **FontFace.init only** (same class as sbix). Zero allocation (owned fixed arrays).
 //
-// ヘッダ（OpenType spec）: majorVersion@0 / minorVersion@2 / axesArrayOffset@4 /
-// reserved@6（検証しない）/ axisCount@8 / axisSize@10 / instanceCount@12 / instanceSize@14。
+// Header (OpenType spec): majorVersion@0 / minorVersion@2 / axesArrayOffset@4 /
+// reserved@6 (not validated) / axisCount@8 / axisSize@10 / instanceCount@12 / instanceSize@14.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -29,7 +29,7 @@ pub const Fvar = struct {
     axes: [MAX_AXES]Axis,
     instance_count: u16,
     instance_size: u16,
-    /// InstanceRecord 配列のテーブル内先頭（遅延読取用）。
+    /// Table-local start of the InstanceRecord array (for deferred reads).
     instances_off: usize,
 
     pub fn axis(self: *const Fvar, i: usize) Axis {
@@ -55,7 +55,7 @@ pub const Fvar = struct {
         return self.instance_size == expected_base + 2;
     }
 
-    /// named instance の design coords を読み出す（遅延読取）。
+    /// Read named-instance design coords (deferred).
     pub fn namedInstanceCoords(self: *const Fvar, index: u16, out: []f32) Error!void {
         if (out.len < self.axis_count) return error.InvalidFont;
         const off = try self.instanceRecordOff(index);
@@ -76,7 +76,7 @@ pub const Fvar = struct {
         const minor = try r.u16At(2);
         if (major != 1 or minor != 0) return error.InvalidFont;
         const axes_array_offset = try r.u16At(4);
-        _ = try r.u16At(6); // reserved（permanently reserved。値は検証しない）
+        _ = try r.u16At(6); // reserved (permanently reserved; value not validated)
         const axis_count = try r.u16At(8);
         const axis_size = try r.u16At(10);
         const instance_count = try r.u16At(12);
@@ -138,7 +138,7 @@ pub const Fvar = struct {
             if (result.instanceHasPostScriptName()) {
                 _ = try r.u16At(off + 4 + @as(usize, axis_count) * 4);
             }
-            // 全座標を軸 [min,max] で init 時検証
+            // Validate all coordinates against axis [min,max] at init
             var ci: u16 = 0;
             while (ci < axis_count) : (ci += 1) {
                 const coord = fixedToF32(try r.i32At(off + 4 + @as(usize, ci) * 4));
@@ -151,7 +151,7 @@ pub const Fvar = struct {
     }
 };
 
-// parse は allocator 引数を取らない（ゼロアロケーション契約）
+// parse takes no allocator (zero-allocation contract)
 comptime {
     const parse_fn = @TypeOf(Fvar.parse);
     const params = @typeInfo(parse_fn).@"fn".params;
@@ -192,7 +192,7 @@ fn putTag(buf: []u8, off: usize, tag: [4]u8) void {
     @memcpy(buf[off..][0..4], &tag);
 }
 
-/// OpenType 仕様どおりの 1 軸 wght fvar テーブルを組む。戻り値の有効長は `tableLen`。
+/// Build a one-axis wght fvar table per the OpenType spec. Valid length of the return is `tableLen`.
 fn buildFvar1Axis(
     axis_tag: [4]u8,
     min_v: i32,
@@ -238,7 +238,7 @@ test "fvar: parse axisCount/tag/min/def/max" {
     try testing.expectEqual(@as(f32, 900), f.axes[0].max);
 }
 
-test "fvar: MAX_AXES 超過は Unsupported" {
+test "fvar: exceeding MAX_AXES is Unsupported" {
     var buf: [16]u8 = undefined;
     @memset(&buf, 0);
     putU16(&buf, 0, 1);
@@ -248,13 +248,13 @@ test "fvar: MAX_AXES 超過は Unsupported" {
     try testing.expectError(error.Unsupported, Fvar.parse(&buf));
 }
 
-test "fvar: named instance 範囲外レコードは InvalidFont" {
+test "fvar: named instance record out of range is InvalidFont" {
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     const built = buildFvar1Axis(wght, 0, 400 * 65536, 900 * 65536, 1, 8, &.{ 0, 0, 0, 0 });
     try testing.expectError(error.InvalidFont, Fvar.parse(built.buf[0..built.len]));
 }
 
-test "fvar: named instance 座標が軸範囲外は InvalidFont" {
+test "fvar: named instance coords outside axis range is InvalidFont" {
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     var inst_fixed: [8]u8 = .{ 0, 1, 0, 0, 0, 0, 0, 0 };
     putI32(&inst_fixed, 4, 2000 * 65536); // wght=2000 > max=900
@@ -262,13 +262,13 @@ test "fvar: named instance 座標が軸範囲外は InvalidFont" {
     try testing.expectError(error.InvalidFont, Fvar.parse(built.buf[0..built.len]));
 }
 
-test "fvar: min>def は InvalidFont" {
+test "fvar: min>def is InvalidFont" {
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     const built = buildFvar1Axis(wght, 500 * 65536, 400 * 65536, 900 * 65536, 0, 8, &.{});
     try testing.expectError(error.InvalidFont, Fvar.parse(built.buf[0..built.len]));
 }
 
-test "fvar: axesArrayOffset < 16 は InvalidFont" {
+test "fvar: axesArrayOffset < 16 is InvalidFont" {
     const wght = [4]u8{ 'w', 'g', 'h', 't' };
     var built = buildFvar1Axis(wght, 100 * 65536, 400 * 65536, 900 * 65536, 0, 8, &.{});
     putU16(&built.buf, 4, 0); // axesArrayOffset=0 < header size 16

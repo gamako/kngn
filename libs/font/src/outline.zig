@@ -1,6 +1,6 @@
-// 共通アウトライン表現。glyf(TrueType, 2次) と CFF(OpenType, 3次) の両パーサが生成し、
-// ラスタライザ(TASK-25.5)が平坦化して塗る。座標は font units の f32。
-// Contour は閉路（最後のセグメント end から start へ暗黙に閉じる）。
+// Shared outline representation. Produced by both the glyf (TrueType, quadratic) and CFF (OpenType, cubic) parsers;
+// the rasterizer flattens and fills. Coordinates are f32 in font units.
+// A Contour is a closed path (implicitly closes from the last segment end back to start).
 
 const std = @import("std");
 
@@ -8,8 +8,8 @@ pub const Vec2f = struct { x: f32, y: f32 };
 
 pub const Segment = union(enum) {
     line: Vec2f, // → end
-    quad: struct { ctrl: Vec2f, end: Vec2f }, // 2次 Bezier（TrueType）
-    cubic: struct { c1: Vec2f, c2: Vec2f, end: Vec2f }, // 3次 Bezier（CFF）
+    quad: struct { ctrl: Vec2f, end: Vec2f }, // Quadratic Bezier (TrueType)
+    cubic: struct { c1: Vec2f, c2: Vec2f, end: Vec2f }, // Cubic Bezier (CFF)
 };
 
 pub const Contour = struct {
@@ -27,9 +27,9 @@ pub const Outline = struct {
     }
 };
 
-/// Outline を逐次構築する。moveTo で contour を開始し、lineTo/quadTo/cubicTo を積む。
-/// 退化 contour（セグメント 0 本）は捨てる。finish() で所有権付き Outline を返す。
-/// エラー時は deinit() で部分状態を解放する。
+/// Build an Outline incrementally. moveTo starts a contour; lineTo/quadTo/cubicTo append.
+/// Degenerate contours (zero segments) are discarded. finish() returns an owned Outline.
+/// On error, deinit() frees partial state.
 pub const Builder = struct {
     alloc: std.mem.Allocator,
     contours: std.ArrayList(Contour) = .empty,
@@ -52,7 +52,7 @@ pub const Builder = struct {
         if (!self.has_current) return;
         self.has_current = false;
         if (self.cur_segments.items.len == 0) {
-            self.cur_segments.clearRetainingCapacity(); // 退化 contour は捨てる
+            self.cur_segments.clearRetainingCapacity(); // Discard degenerate contours
             return;
         }
         const segs = try self.cur_segments.toOwnedSlice(self.alloc);
@@ -79,7 +79,7 @@ pub const Builder = struct {
     }
 
     pub fn finish(self: *Builder) std.mem.Allocator.Error!Outline {
-        try self.flushCurrent(); // 未 close の contour を暗黙 close
+        try self.flushCurrent(); // Implicitly close an unclosed contour
         const contours = try self.contours.toOwnedSlice(self.alloc);
         return .{ .contours = contours };
     }
@@ -91,7 +91,7 @@ pub const Builder = struct {
 
 const testing = std.testing;
 
-test "Builder: contour と退化 contour の扱い" {
+test "Builder: contour and degenerate-contour handling" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
@@ -99,7 +99,7 @@ test "Builder: contour と退化 contour の扱い" {
     try b.lineTo(.{ .x = 10, .y = 0 });
     try b.lineTo(.{ .x = 0, .y = 10 });
 
-    // 退化 contour（move のみ・segment なし）→ 捨てられる
+    // Degenerate contour (move only, no segments) → discarded
     try b.moveTo(.{ .x = 5, .y = 5 });
 
     try b.moveTo(.{ .x = 0, .y = 0 });
@@ -108,14 +108,14 @@ test "Builder: contour と退化 contour の扱い" {
     var o = try b.finish();
     defer o.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 2), o.contours.len); // 退化は除外
+    try testing.expectEqual(@as(usize, 2), o.contours.len); // Degenerates excluded
     try testing.expectEqual(@as(usize, 2), o.contours[0].segments.len);
     try testing.expect(o.contours[0].segments[0] == .line);
     try testing.expectEqual(@as(usize, 1), o.contours[1].segments.len);
     try testing.expect(o.contours[1].segments[0] == .quad);
 }
 
-test "Builder: 空（contour なし）" {
+test "Builder: empty (no contours)" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var o = try b.finish();

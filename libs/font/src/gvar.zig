@@ -1,12 +1,12 @@
-// gvar テーブル: glyph variation store + tuple scalar + packed points/deltas + per-tuple IUP。
+// gvar table: glyph variation store + tuple scalar + packed points/deltas + per-tuple IUP.
 //
-// ホットパス宣言: gvar.apply / outlineVaried は **ラスタキャッシュミス時のみ**。
-// getCached ヒット時は変分計算ゼロ。全画素ループ非該当 → SIMD 対象外。
-// 一時バッファ（deltas/has_delta/packed 展開）は per-call alloc + defer free。
+// Hot-path declaration: gvar.apply / outlineVaried run **on raster cache miss only**.
+// On getCached hit, variation cost is zero. Not an all-pixel loop → outside SIMD rules.
+// Temporary buffers (deltas/has_delta/packed expand) are per-call alloc + defer free.
 //
-// ヘッダ（OpenType gvar）: major@0 / minor@2 / axisCount@4 / sharedTupleCount@6 /
+// Header (OpenType gvar): major@0 / minor@2 / axisCount@4 / sharedTupleCount@6 /
 // sharedTuplesOffset@8 (Offset32) / glyphCount@12 / flags@14 / glyphVariationDataArrayOffset@16 (Offset32) /
-// glyphVariationDataOffsets[glyphCount+1]@20。
+// glyphVariationDataOffsets[glyphCount+1]@20.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -19,9 +19,9 @@ const f2dot14ToF32 = var_common.f2dot14ToF32;
 
 pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 
-/// Tuple scalar 計算（OpenType Font Variations Overview）。
-/// peak のみ（非 intermediate）または start/peak/end テント。
-/// 軸ごとのスカラー積。いずれかが 0 なら 0。
+/// Tuple scalar computation (OpenType Font Variations Overview).
+/// Peak-only (non-intermediate) or start/peak/end tent.
+/// Product of per-axis scalars. If any axis is 0, result is 0.
 pub fn tupleScalar(
     norm: []const f32,
     peak: []const f32,
@@ -38,17 +38,17 @@ pub fn tupleScalar(
         const nv = norm[i];
         var axis_s: f32 = undefined;
         if (intermediate) {
-            // peak==0 の軸は IVS/gvar ともスカラー計算に含めない（常に 1）。
+            // Axes with peak==0 are excluded from scalar computation for both IVS and gvar (always 1).
             if (pe == 0) {
                 axis_s = 1;
             } else {
                 const st = start[i];
                 const en = end[i];
                 if (st > pe or pe > en) {
-                    // 無効 region（start>peak / peak>end）は中立 1（OpenType IVS 仕様の必須分岐）
+                    // Invalid region (start>peak / peak>end) is neutral 1 (required OpenType IVS branch)
                     axis_s = 1;
                 } else if (st < 0 and en > 0) {
-                    // ゼロを跨ぐ region（peak≠0）も中立 1（同仕様）
+                    // Region that crosses zero (peak≠0) is also neutral 1 (same spec)
                     axis_s = 1;
                 } else if (nv < st or nv > en) {
                     axis_s = 0;
@@ -63,7 +63,7 @@ pub fn tupleScalar(
                 }
             }
         } else {
-            // 非 intermediate: region は 0..peak（peak 側）。peak==0 の軸は無視（scalar=1）。
+            // Non-intermediate: region is 0..peak (on the peak side). Axes with peak==0 are ignored (scalar=1).
             if (pe == 0) {
                 axis_s = 1;
             } else if (nv < @min(@as(f32, 0), pe) or nv > @max(@as(f32, 0), pe)) {
@@ -87,9 +87,9 @@ pub const Gvar = struct {
     shared_tuple_count: u16,
     shared_tuples_off: usize,
     offset_is_long: bool,
-    /// glyphVariationDataOffsets 配列先頭（table 内）。
+    /// Start of glyphVariationDataOffsets array (within table).
     offsets_off: usize,
-    /// GlyphVariationData 配列のベース（table 内）。
+    /// Base of GlyphVariationData array (within table).
     gvd_array_off: usize,
 
     pub fn parse(table: []const u8, num_glyphs: u16, axis_count: u16) Error!Gvar {
@@ -115,14 +115,14 @@ pub const Gvar = struct {
         const offsets_bytes = std.math.mul(usize, n_off, entry_size) catch return error.InvalidFont;
         try r.require(offsets_off, offsets_bytes);
 
-        // shared tuples 範囲検証
+        // Validate shared tuples range
         if (shared_tuple_count > 0) {
             const st_bytes = std.math.mul(usize, @as(usize, shared_tuple_count), @as(usize, ac) * 2) catch return error.InvalidFont;
             try r.require(shared_tuples_offset, st_bytes);
         }
         try r.require(gvd_array_offset, 0);
 
-        // offset 配列: 単調非減・最終 offset が table 内に収まること
+        // offset array: monotonically non-decreasing; final offset must fit in the table
         var i: usize = 0;
         var prev: usize = 0;
         while (i < n_off) : (i += 1) {
@@ -148,7 +148,7 @@ pub const Gvar = struct {
         };
     }
 
-    /// gid の GlyphVariationData slice。空（デルタ無し）なら null。
+    /// GlyphVariationData slice for gid. Empty (no deltas) is null.
     pub fn glyphData(self: *const Gvar, gid: u16) Error!?[]const u8 {
         if (gid >= self.glyph_count) return error.InvalidFont;
         const r = Reader{ .data = self.data };
@@ -179,13 +179,13 @@ pub const Gvar = struct {
         }
     }
 
-    /// simple glyph の点列に gvar を適用し net deltas を返す。
-    /// points は元座標（font units）。長さ = n_outline（phantom 無し）。
-    /// end_pts: 各 contour の最終点 index（昇順）。
-    /// out_deltas: 長さ n_outline + 4（phantom 含む）。呼び出し側確保。
-    /// phantom の X デルタから advance 変分も得られる。
+    /// Apply gvar to a simple glyph's point list and return net deltas.
+    /// points are original coordinates (font units). Length = n_outline (no phantoms).
+    /// end_pts: final point index of each contour (ascending).
+    /// out_deltas: length n_outline + 4 (includes phantoms). Caller allocates.
+    /// Advance variation is also available from phantom X deltas.
     ///
-    /// 戻り: OutOfMemory / InvalidFont。
+    /// Returns: OutOfMemory / InvalidFont.
     pub fn applySimple(
         self: *const Gvar,
         alloc: std.mem.Allocator,
@@ -205,9 +205,9 @@ pub const Gvar = struct {
         try applyGlyphVariationData(self, alloc, gvd, points, end_pts, n_outline, norm, out_deltas, true);
     }
 
-    /// composite glyph の gvar を適用。点番号 = component index（仮想点）+ 末尾 phantom 4。
-    /// **IUP しない**（OpenType: inferred deltas は composite に適用しない。未参照 component のデルタは 0）。
-    /// out_deltas 長さ = component_count + 4。deltas[i] は component i の配置 offset への加算量。
+    /// Apply gvar for a composite glyph. Point numbers = component index (virtual points) + trailing phantom 4.
+    /// **No IUP** (OpenType: inferred deltas are not applied to composites. Unreferenced component deltas stay 0).
+    /// out_deltas length = component_count + 4. deltas[i] is the addend to component i's placement offset.
     pub fn applyComposite(
         self: *const Gvar,
         alloc: std.mem.Allocator,
@@ -222,24 +222,24 @@ pub const Gvar = struct {
         @memset(out_deltas[0..n_total], .{ .x = 0, .y = 0 });
 
         const gvd = (try self.glyphData(gid)) orelse return;
-        // points/end_pts は IUP しないので空でよい
+        // points/end_pts may be empty because IUP is not used
         try applyGlyphVariationData(self, alloc, gvd, &.{}, &.{}, component_count, norm, out_deltas, false);
     }
 
-    /// phantom 4 点の X デルタのみ復元（full outline 不要の metrics 経路）。
-    /// advance_delta = phantom[1].x - phantom[0].x。
-    /// simple: n_points = outline 点数。composite: n_points = component_count（IUP 無し）。
+    /// Restore only the X deltas of the four phantom points (metrics path that does not need a full outline).
+    /// advance_delta = phantom[1].x - phantom[0].x.
+    /// simple: n_points = outline point count. composite: n_points = component_count (no IUP).
     pub fn phantomAdvanceDelta(
         self: *const Gvar,
         alloc: std.mem.Allocator,
         gid: u16,
-        /// 非 phantom 点数（simple=outline 点 / composite=component 数）。
+        /// Non-phantom point count (simple=outline points / composite=component count).
         n_points: usize,
-        /// simple の outline 点座標（IUP 用）。composite は空で可。
+        /// Outline point coordinates for simple (for IUP). May be empty for composite.
         points: []const Vec2f,
         end_pts: []const u16,
         norm: []const f32,
-        /// true=simple（IUP 有り）、false=composite（IUP 無し）。
+        /// true=simple (with IUP), false=composite (no IUP).
         is_simple: bool,
     ) Error!f32 {
         if (is_simple and points.len != n_points) return error.InvalidFont;
@@ -256,8 +256,8 @@ pub const Gvar = struct {
     }
 };
 
-/// GlyphVariationData 1 個分を decode して net deltas に累積。
-/// do_iup: simple のみ true。composite は false（仕様: inferred deltas 非適用）。
+/// Decode one GlyphVariationData and accumulate into net deltas.
+/// do_iup: true for simple only. false for composite (spec: inferred deltas must not be applied).
 fn applyGlyphVariationData(
     gvar: *const Gvar,
     alloc: std.mem.Allocator,
@@ -280,7 +280,7 @@ fn applyGlyphVariationData(
     const ac: usize = gvar.axis_count;
     var header_pos: usize = 4;
 
-    // shared point numbers（serialized data 先頭）
+    // shared point numbers (start of serialized data)
     var shared_point_indices: []u16 = &.{};
     defer if (shared_point_indices.len > 0) alloc.free(shared_point_indices);
     var shared_all_points = false;
@@ -351,7 +351,7 @@ fn applyGlyphVariationData(
             end_buf[0..ac],
         );
 
-        // variation data size 分を読む（scalar=0 でも位置を進める）
+        // Consume variation data size bytes (advance position even when scalar=0)
         const run_start = serialized_pos;
         const run_end = std.math.add(usize, serialized_pos, var_data_size) catch return error.InvalidFont;
         if (run_end > gvd.len) return error.InvalidFont;
@@ -377,20 +377,20 @@ fn applyGlyphVariationData(
             all_points = shared_all_points;
             deltas_pos = run_start;
         } else {
-            // shared point numbers 無し・private も無し → 全点（仕様: count=0 と同義扱い）
+            // No shared point numbers and no private ones → all points (spec: treated as equivalent to count=0)
             all_points = true;
             point_indices = &.{};
             deltas_pos = run_start;
         }
 
-        // 論理点数
+        // Logical point count
         const n_points_logical: usize = if (all_points) n_total else point_indices.len;
         // X deltas + Y deltas
         const n_deltas_logical = n_points_logical * 2;
         const packed_deltas = try decodePackedDeltas(alloc, gvd, deltas_pos, n_deltas_logical);
         defer alloc.free(packed_deltas);
 
-        // tuple_delta 構築
+        // Build tuple_delta
         @memset(tuple_dx, 0);
         @memset(tuple_dy, 0);
         @memset(has_delta, false);
@@ -407,19 +407,19 @@ fn applyGlyphVariationData(
             while (pi < point_indices.len) : (pi += 1) {
                 const pidx = point_indices[pi];
                 if (pidx >= n_total) return error.InvalidFont;
-                // 同一点番号の累積（仕様）
+                // Accumulate for the same point number (spec)
                 tuple_dx[pidx] += packed_deltas[pi];
                 tuple_dy[pidx] += packed_deltas[n_points_logical + pi];
                 has_delta[pidx] = true;
             }
         }
 
-        // per-tuple IUP（simple のみ。composite は仕様で IUP しない。phantom も対象外）
+        // per-tuple IUP (simple only. composites must not IUP per spec. phantoms are also out of scope)
         if (do_iup and n_outline > 0 and !all_points) {
             try iupInfer(points, end_pts, n_outline, has_delta, tuple_dx, tuple_dy);
         }
 
-        // scalar 乗算して累積
+        // Multiply by scalar and accumulate
         var pi: usize = 0;
         while (pi < n_total) : (pi += 1) {
             out_deltas[pi].x += tuple_dx[pi] * scalar;
@@ -434,7 +434,7 @@ const PackedPoints = struct {
     end_pos: usize,
 };
 
-/// packed point numbers を decode。all_points なら indices は空で all_points=true。
+/// Decode packed point numbers. When all_points, indices is empty and all_points=true.
 fn decodePackedPointNumbers(alloc: std.mem.Allocator, data: []const u8, pos: usize, max_point: usize) Error!PackedPoints {
     const r = Reader{ .data = data };
     try r.require(pos, 1);
@@ -451,8 +451,8 @@ fn decodePackedPointNumbers(alloc: std.mem.Allocator, data: []const u8, pos: usi
         p += 1;
         count = (@as(usize, first & 0x7F) << 8) | second;
     }
-    if (count == 0) return error.InvalidFont; // 0 は all-points 専用（first==0 で処理済み）
-    if (count > max_point + 16) return error.InvalidFont; // 異常に大きい
+    if (count == 0) return error.InvalidFont; // 0 is all-points only (already handled when first==0)
+    if (count > max_point + 16) return error.InvalidFont; // Abnormally large
 
     const indices = try alloc.alloc(u16, count);
     errdefer alloc.free(indices);
@@ -479,7 +479,7 @@ fn decodePackedPointNumbers(alloc: std.mem.Allocator, data: []const u8, pos: usi
                 p += 1;
                 break :blk v;
             };
-            // 累積（overflow は InvalidFont）
+            // Accumulate (overflow is InvalidFont)
             const next = @as(u32, last) + delta;
             if (next > std.math.maxInt(u16)) return error.InvalidFont;
             last = @intCast(next);
@@ -490,7 +490,7 @@ fn decodePackedPointNumbers(alloc: std.mem.Allocator, data: []const u8, pos: usi
     return .{ .indices = indices, .all_points = false, .end_pos = p };
 }
 
-/// packed deltas を論理 count 個 decode。
+/// Decode packed deltas for logical count entries.
 fn decodePackedDeltas(alloc: std.mem.Allocator, data: []const u8, pos: usize, count: usize) Error![]f32 {
     const r = Reader{ .data = data };
     const out = try alloc.alloc(f32, count);
@@ -533,8 +533,8 @@ fn decodePackedDeltas(alloc: std.mem.Allocator, data: []const u8, pos: usize, co
     return out;
 }
 
-/// per-tuple IUP: 未指定 outline 点の delta を推論（phantom は触らない）。
-/// has_delta / tuple_dx / tuple_dy は n_total 長だが IUP は [0, n_outline) のみ。
+/// per-tuple IUP: infer deltas for unspecified outline points (do not touch phantoms).
+/// has_delta / tuple_dx / tuple_dy are n_total long, but IUP covers only [0, n_outline).
 fn iupInfer(
     points: []const Vec2f,
     end_pts: []const u16,
@@ -553,7 +553,7 @@ fn iupInfer(
             start = end;
             continue;
         }
-        // この contour 内の参照点数
+        // Number of reference points in this contour
         var ref_count: usize = 0;
         var first_ref: ?usize = null;
         var i: usize = start;
@@ -566,7 +566,7 @@ fn iupInfer(
         if (ref_count == 0) {
             // no-op
         } else if (ref_count == 1) {
-            // 全点に同じ delta
+            // Same delta on every point
             const ri = first_ref.?;
             const dx = tuple_dx[ri];
             const dy = tuple_dy[ri];
@@ -575,11 +575,11 @@ fn iupInfer(
                 if (!has_delta[i]) {
                     tuple_dx[i] = dx;
                     tuple_dy[i] = dy;
-                    // has_delta は明示点のみのまま（IUP 結果を別 tuple の参照に使わない）
+                    // has_delta stays explicit-points only (do not feed IUP results as references into another tuple)
                 }
             }
         } else {
-            // 各未参照点について前後参照点で補間
+            // For each unreferenced point, interpolate from surrounding reference points
             i = start;
             while (i < end) : (i += 1) {
                 if (has_delta[i]) continue;
@@ -594,18 +594,18 @@ fn iupInfer(
 }
 
 fn findPrevRef(has_delta: []const bool, start: usize, end: usize, target: usize) usize {
-    // target より前で最大の参照点。無ければ contour 内最高の参照点。
+    // Largest reference point before target. If none, the highest reference point in the contour.
     var i: isize = @intCast(target);
     i -= 1;
     while (i >= @as(isize, @intCast(start))) : (i -= 1) {
         if (has_delta[@intCast(i)]) return @intCast(i);
     }
-    // wrap: end-1 から
+    // wrap: from end-1
     i = @intCast(end - 1);
     while (i > @as(isize, @intCast(target))) : (i -= 1) {
         if (has_delta[@intCast(i)]) return @intCast(i);
     }
-    return target; // 到達しないはず
+    return target; // Must be unreachable
 }
 
 fn findNextRef(has_delta: []const bool, start: usize, end: usize, target: usize) usize {
@@ -620,7 +620,7 @@ fn findNextRef(has_delta: []const bool, start: usize, end: usize, target: usize)
     return target;
 }
 
-/// IUP 1 成分: 仕様分岐（同座標同delta / 同座標異delta→0 / 範囲外→近接 / 範囲内線形）。
+/// IUP one component: spec branches (same coord same delta / same coord different delta→0 / outside→nearest / inside linear).
 pub fn iupComponent(coord_prev: f32, coord_next: f32, coord_target: f32, delta_prev: f32, delta_next: f32) f32 {
     if (coord_prev == coord_next) {
         if (delta_prev == delta_next) return delta_prev;
@@ -629,13 +629,13 @@ pub fn iupComponent(coord_prev: f32, coord_next: f32, coord_target: f32, delta_p
     const cmin = @min(coord_prev, coord_next);
     const cmax = @max(coord_prev, coord_next);
     if (coord_target <= cmin) {
-        // 近い側 = 座標が小さい側
+        // Nearer side = the side with the smaller coordinate
         return if (coord_prev < coord_next) delta_prev else delta_next;
     }
     if (coord_target >= cmax) {
         return if (coord_prev > coord_next) delta_prev else delta_next;
     }
-    // 範囲内線形
+    // Linear within range
     const proportion = (coord_target - coord_prev) / (coord_next - coord_prev);
     return (1.0 - proportion) * delta_prev + proportion * delta_next;
 }
@@ -663,7 +663,7 @@ fn f2d(v: f32) i16 {
     return var_common.f32ToF2dot14(v);
 }
 
-test "gvar: tupleScalar non-intermediate peak=1 → norm 比例" {
+test "gvar: tupleScalar non-intermediate peak=1 → proportional to norm" {
     const peak = [_]f32{1.0};
     try testing.expectApproxEqAbs(@as(f32, 1.0), tupleScalar(&.{1.0}, &peak, false, &.{}, &.{}), 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0.5), tupleScalar(&.{0.5}, &peak, false, &.{}, &.{}), 0.001);
@@ -671,18 +671,18 @@ test "gvar: tupleScalar non-intermediate peak=1 → norm 比例" {
     try testing.expectApproxEqAbs(@as(f32, 0.0), tupleScalar(&.{-0.5}, &peak, false, &.{}, &.{}), 0.001);
 }
 
-test "gvar: tupleScalar peak=0 軸は無視（積に 1）" {
+test "gvar: tupleScalar peak=0 axis ignored (contributes 1 to product)" {
     const peak = [_]f32{ 1.0, 0.0 };
     try testing.expectApproxEqAbs(@as(f32, 0.5), tupleScalar(&.{ 0.5, 0.9 }, &peak, false, &.{}, &.{}), 0.001);
 }
 
-test "gvar: tupleScalar 2 軸交差積" {
+test "gvar: tupleScalar 2-axis product" {
     const peak = [_]f32{ 1.0, 1.0 };
     // (0.2, 0.7) → 0.2 * 0.7 = 0.14
     try testing.expectApproxEqAbs(@as(f32, 0.14), tupleScalar(&.{ 0.2, 0.7 }, &peak, false, &.{}, &.{}), 0.001);
 }
 
-test "gvar: tupleScalar intermediate テント" {
+test "gvar: tupleScalar intermediate tent" {
     const peak = [_]f32{0.5};
     const start = [_]f32{0.0};
     const end = [_]f32{1.0};
@@ -693,34 +693,34 @@ test "gvar: tupleScalar intermediate テント" {
     try testing.expectApproxEqAbs(@as(f32, 0.0), tupleScalar(&.{-0.1}, &peak, true, &start, &end), 0.001);
 }
 
-test "gvar: tupleScalar 無効/ゼロ跨ぎ region は中立 1（仕様必須分岐）" {
-    // start > peak: region 無効 → その軸は 1（他軸のみ効く）
+test "gvar: tupleScalar invalid/zero-crossing region is neutral 1 (required spec branch)" {
+    // start > peak: invalid region → that axis is 1 (other axes still apply)
     try testing.expectApproxEqAbs(@as(f32, 1.0), tupleScalar(&.{0.3}, &.{0.5}, true, &.{0.8}, &.{1.0}), 0.001);
-    // peak > end: region 無効 → 1
+    // peak > end: invalid region → 1
     try testing.expectApproxEqAbs(@as(f32, 1.0), tupleScalar(&.{0.3}, &.{0.9}, true, &.{0.0}, &.{0.5}), 0.001);
-    // start < 0 < end（peak≠0）: ゼロ跨ぎ → 1
+    // start < 0 < end (peak≠0): crosses zero → 1
     try testing.expectApproxEqAbs(@as(f32, 1.0), tupleScalar(&.{0.3}, &.{0.5}, true, &.{-0.5}, &.{1.0}), 0.001);
 }
 
-test "gvar: IUP 中間補間 手計算（仕様例）" {
+test "gvar: IUP mid-point interpolation hand calculation (spec example)" {
     // P1.x=245 d=+28, P3.x=305 d=-42, P2.x=260 → proportion=(260-245)/(305-245)=15/60=0.25
     // delta = (1-0.25)*28 + 0.25*(-42) = 21 - 10.5 = 10.5
     try testing.expectApproxEqAbs(@as(f32, 10.5), iupComponent(245, 305, 260, 28, -42), 0.001);
 }
 
-test "gvar: IUP 同座標異 delta → 0 / 同座標同 delta → 同値" {
+test "gvar: IUP same-coord different delta → 0 / same-coord same delta → same value" {
     try testing.expectEqual(@as(f32, 0), iupComponent(10, 10, 10, 5, 7));
     try testing.expectEqual(@as(f32, 5), iupComponent(10, 10, 10, 5, 5));
 }
 
-test "gvar: IUP 範囲外 → 近い側" {
-    // target が prev 側外
+test "gvar: IUP out-of-range → nearer side" {
+    // target is outside on the prev side
     try testing.expectEqual(@as(f32, 10), iupComponent(0, 100, -10, 10, 20));
-    // target が next 側外
+    // target is outside on the next side
     try testing.expectEqual(@as(f32, 20), iupComponent(0, 100, 150, 10, 20));
 }
 
-test "gvar: packed point numbers 全形式" {
+test "gvar: packed point numbers all forms" {
     const a = testing.allocator;
     // count=3, run of 3 bytes: 0,1,1 → points 0,1,2
     const data1 = [_]u8{ 3, 0x02, 0, 1, 1 };
@@ -747,9 +747,9 @@ test "gvar: packed point numbers 全形式" {
     try testing.expectEqual(@as(u16, 5), p2.indices[1]);
 }
 
-test "gvar: packed deltas 全 run 形式" {
+test "gvar: packed deltas all run forms" {
     const a = testing.allocator;
-    // 例: 03 0A 97 00 C6 87 41 10 22 FB 34
+    // Example: 03 0A 97 00 C6 87 41 10 22 FB 34
     // run1: 4 × i8 = 10, -105, 0, -58
     // run2: 8 zeros
     // run3: 2 × i16 = 0x1022=4130, 0xFB34=-1228
@@ -765,8 +765,8 @@ test "gvar: packed deltas 全 run 形式" {
     try testing.expectEqual(@as(f32, -1228), d[13]);
 }
 
-/// 最小 gvar: 1 軸・1 glyph・embedded peak=1・全点明示デルタ。
-/// n_outline 点 + 4 phantom。deltas_x/y は n_total 長。
+/// Minimal gvar: 1 axis, 1 glyph, embedded peak=1, explicit deltas for all points.
+/// n_outline points + 4 phantoms. deltas_x/y are n_total long.
 fn buildMinimalGvar(
     alloc: std.mem.Allocator,
     n_outline: usize,
@@ -837,7 +837,7 @@ fn appendDeltaRuns(list: *std.ArrayList(u8), alloc: std.mem.Allocator, deltas: [
     }
 }
 
-test "gvar: 1 tuple 全点明示デルタ・norm=1 で座標一致" {
+test "gvar: 1 tuple all-point explicit deltas · coords match at norm=1" {
     const a = testing.allocator;
     // 3 outline points + 4 phantom
     const dx = [_]i16{ 10, 20, 30, 0, 5, 0, 0 }; // phantom: lsb=0, adv=+5
@@ -862,7 +862,7 @@ test "gvar: 1 tuple 全点明示デルタ・norm=1 で座標一致" {
     try testing.expectApproxEqAbs(@as(f32, 5), deltas[4].x - deltas[3].x, 0.01);
 }
 
-test "gvar: norm=0 で deltas ゼロ" {
+test "gvar: deltas are zero at norm=0" {
     const a = testing.allocator;
     const dx = [_]i16{ 10, 20, 30, 0, 5, 0, 0 };
     const dy = [_]i16{ 1, 2, 3, 0, 0, 0, 0 };
@@ -879,10 +879,10 @@ test "gvar: norm=0 で deltas ゼロ" {
     }
 }
 
-/// 部分点デルタ gvar（IUP 検証用）: private points で点 0 と 2 のみ明示。
+/// Partial-point-delta gvar (for IUP checks): private points explicitly set only points 0 and 2.
 fn buildPartialPointsGvar(
     alloc: std.mem.Allocator,
-    /// 明示する点 index（outline のみ想定）
+    /// Explicit point indices (outline only assumed)
     point_ids: []const u16,
     dx: []const i16,
     dy: []const i16,
@@ -930,9 +930,9 @@ fn buildPartialPointsGvar(
     return table.toOwnedSlice(alloc);
 }
 
-test "gvar: IUP 中間点推論が手計算一致" {
+test "gvar: IUP mid-point inference matches hand calculation" {
     const a = testing.allocator;
-    // 3 点 contour: p0=(0,0), p1=(50,0), p2=(100,0)。明示 p0.dx=0, p2.dx=40 → p1 中間 = 20
+    // 3-point contour: p0=(0,0), p1=(50,0), p2=(100,0). Explicit p0.dx=0, p2.dx=40 → p1 midpoint = 20
     const table = try buildPartialPointsGvar(a, &.{ 0, 2 }, &.{ 0, 40 }, &.{ 0, 0 }, 1.0);
     defer a.free(table);
     const gv = try Gvar.parse(table, 1, 1);
@@ -949,20 +949,20 @@ test "gvar: IUP 中間点推論が手計算一致" {
     try testing.expectApproxEqAbs(@as(f32, 40), deltas[2].x, 0.01);
 }
 
-/// 2 tuple の gvar: tuple A は点 0 のみ、tuple B は点 1 のみ。汚染防止検証用。
+/// Two-tuple gvar: tuple A sets only point 0, tuple B only point 1. For cross-tuple contamination checks.
 fn buildTwoTupleIupGvar(alloc: std.mem.Allocator) ![]u8 {
-    // 両 tuple: peak=1, private points, 1 point each
+    // Both tuples: peak=1, private points, 1 point each
     // tuple A: point 0, dx=100
     // tuple B: point 1, dx=50
-    // 点 2 はどちらにも無い → IUP: 各 tuple 独立
-    //   tuple A: refs={0}, 全点に 100 → *scalar
-    //   tuple B: refs={1}, 全点に 50
-    // でも wait: 1 ref → 全 contour に同じ delta。
-    // 汚染ケース: tuple A が点 0 のみ、tuple B が点 2 のみ。
-    // 点 1 は A では IUP(from 0 only=100), B では IUP(from 2 only=50)。
-    // 累積 = 100*s + 50*s。
-    // もし全 tuple 累積後に一度 IUP すると: explicit = {0:100, 2:50}, 点1 は線形 = 75。
-    // → 結果が異なる。
+    // Point 2 is in neither → IUP: each tuple independently
+    //   tuple A: refs={0}, all points get 100 → *scalar
+    //   tuple B: refs={1}, all points get 50
+    // Note: with a single reference, the same delta applies to the whole contour.
+    // Contamination case: tuple A sets only point 0, tuple B only point 2.
+    // Point 1 under A is IUP(from 0 only=100), under B is IUP(from 2 only=50).
+    // Accumulated = 100*s + 50*s.
+    // If IUP ran once after accumulating all tuples: explicit = {0:100, 2:50}, point 1 would be linear = 75.
+    // → different result.
 
     // Serialize tuple A data
     var ser_a: std.ArrayList(u8) = .empty;
@@ -1018,12 +1018,12 @@ fn buildTwoTupleIupGvar(alloc: std.mem.Allocator) ![]u8 {
     return table.toOwnedSlice(alloc);
 }
 
-test "gvar: per-tuple IUP 汚染防止（別 tuple 明示点を参照しない）" {
+test "gvar: per-tuple IUP isolation (does not reference another tuple's explicit points)" {
     const a = testing.allocator;
     const table = try buildTwoTupleIupGvar(a);
     defer a.free(table);
     const gv = try Gvar.parse(table, 1, 1);
-    // 3 点等間隔
+    // 3 points equally spaced
     const pts = [_]Vec2f{
         .{ .x = 0, .y = 0 },
         .{ .x = 50, .y = 0 },
@@ -1033,15 +1033,15 @@ test "gvar: per-tuple IUP 汚染防止（別 tuple 明示点を参照しない�
     var deltas: [7]Vec2f = undefined;
     try gv.applySimple(a, 0, &pts, &end_pts, &.{1.0}, &deltas);
 
-    // per-tuple: A は 1 参照点 → 全点 100, B は 1 参照点 → 全点 50
-    // 累積: 各点 150
-    // もし post-accumulate IUP なら点1 = 線形(100,50)=75
+    // per-tuple: A has 1 ref → all points 100; B has 1 ref → all points 50
+    // Accumulated: 150 on every point
+    // If post-accumulate IUP, point1 = linear(100,50)=75
     try testing.expectApproxEqAbs(@as(f32, 150), deltas[0].x, 0.01);
     try testing.expectApproxEqAbs(@as(f32, 150), deltas[1].x, 0.01);
     try testing.expectApproxEqAbs(@as(f32, 150), deltas[2].x, 0.01);
 }
 
-test "gvar: malformed offset は InvalidFont" {
+test "gvar: malformed offset is InvalidFont" {
     var bad: [28]u8 = .{0} ** 28;
     putU16(&bad, 0, 1);
     putU16(&bad, 4, 1); // axisCount
@@ -1053,7 +1053,7 @@ test "gvar: malformed offset は InvalidFont" {
     try testing.expectError(error.InvalidFont, Gvar.parse(&bad, 1, 1));
 }
 
-test "gvar: axisCount 不一致は InvalidFont" {
+test "gvar: axisCount mismatch is InvalidFont" {
     const a = testing.allocator;
     const dx = [_]i16{ 0, 0, 0, 0, 0, 0, 0 };
     const dy = [_]i16{ 0, 0, 0, 0, 0, 0, 0 };
@@ -1062,16 +1062,16 @@ test "gvar: axisCount 不一致は InvalidFont" {
     try testing.expectError(error.InvalidFont, Gvar.parse(table, 1, 2));
 }
 
-test "gvar: X と Y で IUP 結果が独立" {
+test "gvar: IUP results are independent for X and Y" {
     // p0=(0,0) d=(10,100), p2=(100,100) d=(30,0), p1=(50,10)
-    // X: 中間 → 20
-    // Y: p1.y=10 は [0,100] 内 → proportion = 10/100 = 0.1 → (1-0.1)*100 + 0.1*0 = 90
+    // X: midpoint → 20
+    // Y: p1.y=10 is inside [0,100] → proportion = 10/100 = 0.1 → (1-0.1)*100 + 0.1*0 = 90
     try testing.expectApproxEqAbs(@as(f32, 20), iupComponent(0, 100, 50, 10, 30), 0.01);
     try testing.expectApproxEqAbs(@as(f32, 90), iupComponent(0, 100, 10, 100, 0), 0.01);
 }
 
-/// composite 用 gvar: component_count=2 仮想点 + 4 phantom。
-/// private points: point 1 only, dx=50（IUP しても point 0 に漏れないことを確認）。
+/// gvar for composite: component_count=2 virtual points + 4 phantoms.
+/// private points: point 1 only, dx=50 (confirm point 0 is not leaked even if IUP were applied).
 fn buildCompositePartialGvar(alloc: std.mem.Allocator) ![]u8 {
     // component_count=2 → n_total=6
     // private: count=1, point 1, dx=50, dy=0, phantoms not listed
@@ -1111,14 +1111,14 @@ fn buildCompositePartialGvar(alloc: std.mem.Allocator) ![]u8 {
     return table.toOwnedSlice(alloc);
 }
 
-test "gvar: applyComposite は IUP しない（未参照 component デルタ=0）" {
+test "gvar: applyComposite does not IUP (unreferenced component delta=0)" {
     const a = testing.allocator;
     const table = try buildCompositePartialGvar(a);
     defer a.free(table);
     const gv = try Gvar.parse(table, 1, 1);
     var deltas: [6]Vec2f = undefined;
     try gv.applyComposite(a, 0, 2, &.{1.0}, &deltas);
-    // component 0 未参照 → 0（IUP したら 50 になる）
+    // component 0 unreferenced → 0 (would become 50 if IUP ran)
     try testing.expectApproxEqAbs(@as(f32, 0), deltas[0].x, 0.01);
     try testing.expectApproxEqAbs(@as(f32, 50), deltas[1].x, 0.01);
 }

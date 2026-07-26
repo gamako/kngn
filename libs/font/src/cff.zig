@@ -1,9 +1,9 @@
-// CFF / CFF2 コンテナのパーサ。
+// Parser for CFF / CFF2 containers.
 // - 'CFF ' (CFF1): header / INDEX / Top DICT / Private / subr / CID
 // - 'CFF2': header(v2) / TopDICT / GlobalSubr / CharStrings / FontDICTINDEX / Private /
-//          optional VariationStore + FDSelect。Encoding/Charset/String INDEX 無し。
+//          optional VariationStore + FDSelect. No Encoding/Charset/String INDEX.
 //
-// ホットパス宣言: parse は FontFace.init 時のみ。outline はラスタキャッシュミス時のみ。
+// Hot-path declaration: parse runs only at FontFace.init. outline only on raster cache miss.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -19,11 +19,11 @@ pub const CffFont = struct {
     data: []const u8,
     charstrings: Index,
     gsubrs: Index,
-    // 非 CID 用（CID のときは per-glyph に解決するため未使用）
+    // For non-CID (unused for CID: resolved per-glyph instead)
     lsubrs: Index,
     nominal_width: f64,
     default_width: f64,
-    // CID 用
+    // For CID
     is_cid: bool,
     fdarray: Index,
     fdselect: FDSelect,
@@ -37,18 +37,18 @@ pub const CffFont = struct {
 
         const name_index = try Index.parse(data, hdr_size);
         const top_index = try Index.parse(data, name_index.end);
-        if (top_index.count != 1) return error.InvalidFont; // OpenType CFF は Top DICT 1 entry
+        if (top_index.count != 1) return error.InvalidFont; // OpenType CFF has one Top DICT entry
         const string_index = try Index.parse(data, top_index.end);
         const gsubrs = try Index.parse(data, string_index.end);
 
         const top = try parseTopDict(top_index.get(0).?);
-        if (top.charstring_type != 2) return error.Unsupported; // Type2 のみ
+        if (top.charstring_type != 2) return error.Unsupported; // Type2 only
 
         const cs_off = top.charstrings_off orelse return error.InvalidFont;
         const charstrings = try Index.parse(data, cs_off);
         const num_glyphs: u16 = std.math.cast(u16, charstrings.count) orelse return error.InvalidFont;
 
-        // charset: custom(>2) なら numGlyphs を覆うバイトが table 内にあることを検証（SID 非保持）。
+        // charset: if custom(>2), verify bytes covering numGlyphs are within the table (SIDs not retained).
         if (top.charset_off) |co| {
             if (co > 2) try validateCharset(data, co, num_glyphs);
         }
@@ -86,7 +86,7 @@ pub const CffFont = struct {
         return self.num_glyphs;
     }
 
-    /// gid の輪郭を Outline（font units, cubic）として返す。
+    /// Returns the outline for gid as Outline (font units, cubic).
     pub fn outline(self: *const CffFont, alloc: std.mem.Allocator, gid: u16) Error!ol_mod.Outline {
         if (gid >= self.num_glyphs) return error.InvalidFont;
         const code = self.charstrings.get(gid) orelse return error.InvalidFont;
@@ -113,24 +113,24 @@ pub const CffFont = struct {
 
 // ── CFF2 ──────────────────────────────────────────────────
 
-/// CFF2 フォント（非 CID 優先 + multi FontDICT/FDSelect 対応）。
+/// CFF2 font (non-CID preferred + multi FontDICT/FDSelect support).
 pub const Cff2Font = struct {
     data: []const u8,
     charstrings: Index,
     gsubrs: Index,
-    /// 単一 FontDICT 時の local subrs / 初期 vsindex
+    /// local subrs / initial vsindex when there is a single FontDICT
     lsubrs: Index,
     default_vsindex: u16,
     /// multi-FD
     is_multi_fd: bool,
     fdarray: Index,
     fdselect: FDSelect,
-    /// VariationStore: null=無し。ivs_off は ItemVariationStore 先頭（length の後）。
+    /// VariationStore: null=none. ivs_off is the start of ItemVariationStore (after length).
     ivs_off: ?usize,
     axis_count: u16,
     num_glyphs: u16,
 
-    /// CFF2 テーブルを parse。expected_axes: fvar の axis_count（0= fvar 無し。vstore があればその axisCount を採用）。
+    /// Parse a CFF2 table. expected_axes: fvar axis_count (0=no fvar; if vstore present, use its axisCount).
     pub fn parse(data: []const u8, expected_axes: u16) Error!Cff2Font {
         const r = Reader{ .data = data };
         try r.require(0, 5);
@@ -154,12 +154,12 @@ pub const Cff2Font = struct {
         if (fdarray.count == 0) return error.InvalidFont;
         if (fdarray.count > 16) return error.Unsupported;
 
-        // FD0 Private（単一 FD 用キャッシュ）
+        // FD0 Private (cache for single FD)
         const fd0_dict = fdarray.get(0) orelse return error.InvalidFont;
         const fd0 = try parseFdFontDictAllowEmpty(fd0_dict);
         const p0 = try parsePrivateCff2(data, fd0.private_off, fd0.private_size);
 
-        // 全 FD Private の存在検証
+        // Verify all FD Privates exist
         var fi: u32 = 1;
         while (fi < fdarray.count) : (fi += 1) {
             const fd_dict = fdarray.get(fi) orelse return error.InvalidFont;
@@ -211,7 +211,7 @@ pub const Cff2Font = struct {
         return self.num_glyphs;
     }
 
-    /// gid の輪郭。norm は OutlineFont.axis_norm（不足軸は 0）。
+    /// Outline for gid. norm is OutlineFont.axis_norm (missing axes are 0).
     pub fn outline(self: *const Cff2Font, alloc: std.mem.Allocator, gid: u16, norm: []const f32) Error!ol_mod.Outline {
         if (gid >= self.num_glyphs) return error.InvalidFont;
         const code = self.charstrings.get(gid) orelse return error.InvalidFont;
@@ -330,7 +330,7 @@ fn parsePrivateCff2(data: []const u8, off: usize, size: usize) Error!PrivateCff2
     return .{ .lsubrs = lsubrs, .vsindex = vsindex };
 }
 
-// ── DICT パーサ ──────────────────────────────────────────
+// ── DICT parser ──────────────────────────────────────────
 
 const TopDict = struct {
     charstrings_off: ?usize = null,
@@ -346,7 +346,7 @@ const TopDict = struct {
 const PrivateResult = struct { lsubrs: Index, nominal_width: f64, default_width: f64 };
 const FdDict = struct { private_off: usize, private_size: usize };
 
-/// DICT operand を順に積み、operator が来たら handler に (op2byte, operands) を渡す。
+/// Stack DICT operands in order; when an operator arrives, pass (op2byte, operands) to handler.
 const DictScanner = struct {
     code: []const u8,
     i: usize = 0,
@@ -363,7 +363,7 @@ const DictScanner = struct {
 fn opInt(scn: *const DictScanner, k: usize) ?usize {
     if (k >= scn.nops) return null;
     const v = scn.ops[k];
-    // CFF の offset/size は u32 範囲。範囲外/非有限は無効（@intFromFloat の trap も防ぐ）。
+    // CFF offset/size are in u32 range. Out-of-range/non-finite are invalid (also avoids @intFromFloat traps).
     if (!std.math.isFinite(v) or v < 0 or v > @as(f64, std.math.maxInt(u32))) return null;
     return @intFromFloat(v);
 }
@@ -385,7 +385,7 @@ fn parseTopDict(dict: []const u8) Error!TopDict {
                     30 => top.is_cid = true, // ROS
                     36 => top.fdarray_off = opInt(&scn, 0),
                     37 => top.fdselect_off = opInt(&scn, 0),
-                    else => {}, // FontMatrix 等は無視
+                    else => {}, // FontMatrix etc. are ignored
                 }
             } else switch (b0) {
                 15 => top.charset_off = opInt(&scn, 0),
@@ -394,7 +394,7 @@ fn parseTopDict(dict: []const u8) Error!TopDict {
                     top.private_size = opInt(&scn, 0);
                     top.private_off = opInt(&scn, 1);
                 },
-                else => {}, // version/Notice/FontBBox 等は無視
+                else => {}, // version/Notice/FontBBox etc. are ignored
             }
             scn.nops = 0;
         } else {
@@ -432,7 +432,7 @@ fn parseFdFontDict(dict: []const u8) Error!FdDict {
 
 fn parsePrivate(data: []const u8, off: usize, size: usize) Error!PrivateResult {
     const r = Reader{ .data = data };
-    try r.require(off, size); // Private DICT が table 内
+    try r.require(off, size); // Private DICT is within the table
     const dict = data[off .. off + size];
     var scn = DictScanner{ .code = dict };
     var subrs_off: ?usize = null;
@@ -446,7 +446,7 @@ fn parsePrivate(data: []const u8, off: usize, size: usize) Error!PrivateResult {
                 if (scn.i >= dict.len) return error.InvalidFont;
                 scn.i += 1;
             } else switch (b0) {
-                19 => subrs_off = opInt(&scn, 0), // Private 先頭からの相対
+                19 => subrs_off = opInt(&scn, 0), // Relative to the start of Private
                 20 => default = if (scn.nops > 0) scn.ops[0] else 0,
                 21 => nominal = if (scn.nops > 0) scn.ops[0] else 0,
                 else => {},
@@ -464,12 +464,12 @@ fn parsePrivate(data: []const u8, off: usize, size: usize) Error!PrivateResult {
     return .{ .lsubrs = lsubrs, .nominal_width = nominal, .default_width = default };
 }
 
-/// custom charset(offset>2) の領域が numGlyphs を覆って table 内に収まるか検証（SID は保持しない）。
+/// Verify custom charset(offset>2) region covers numGlyphs and fits in the table (SIDs not retained).
 fn validateCharset(data: []const u8, off: usize, num_glyphs: u16) Error!void {
     const r = Reader{ .data = data };
     const format = try r.u8At(off);
-    if (num_glyphs <= 1) return; // glyph 0(.notdef) のみ
-    const n: u32 = @as(u32, num_glyphs) - 1; // glyph 0 は charset に含まれない
+    if (num_glyphs <= 1) return; // glyph 0 (.notdef) only
+    const n: u32 = @as(u32, num_glyphs) - 1; // glyph 0 is not included in charset
     switch (format) {
         0 => try r.require(off + 1, @as(usize, n) * 2), // SID[n]
         1 => { // ranges {SID(2), nLeft(1)}
@@ -494,7 +494,7 @@ fn validateCharset(data: []const u8, off: usize, num_glyphs: u16) Error!void {
     }
 }
 
-/// DICT operand を読む（28=int16, 29=int32, 30=real, 32..254=int）。i は operand 先頭。
+/// Read a DICT operand (28=int16, 29=int32, 30=real, 32..254=int). i is the start of the operand.
 fn readDictOperand(dict: []const u8, i: *usize) Error!f64 {
     const b0 = dict[i.*];
     i.* += 1;
@@ -527,7 +527,7 @@ fn readDictOperand(dict: []const u8, i: *usize) Error!f64 {
     return error.InvalidFont; // 255/reserved
 }
 
-/// real operand（nibble エンコード）。0-9=数字, a=., b=E, c=E-, e=-, f=終端。
+/// real operand (nibble encoding). 0-9=digit, a=., b=E, c=E-, e=-, f=end.
 fn readRealOperand(dict: []const u8, i: *usize) Error!f64 {
     var buf: [64]u8 = undefined;
     var n: usize = 0;
@@ -555,7 +555,7 @@ fn readRealOperand(dict: []const u8, i: *usize) Error!f64 {
     }
 }
 
-// ── FDSelect（CID-keyed）──────────────────────────────────
+// ── FDSelect (CID-keyed) ──────────────────────────────────
 
 const FDSelect = struct {
     data: []const u8,
@@ -569,7 +569,7 @@ const FDSelect = struct {
         const format = try r.u8At(off);
         if (format == 0) {
             try r.require(off + 1, num_glyphs); // 1 + numGlyphs byte
-            // 各 fd < fd_count を検証
+            // Verify each fd < fd_count
             var g: usize = 0;
             while (g < num_glyphs) : (g += 1) {
                 if (data[off + 1 + g] >= fd_count) return error.InvalidFont;
@@ -588,7 +588,7 @@ const FDSelect = struct {
                 const first = try r.u16At(ranges_off + k * 3);
                 const fd = data[ranges_off + k * 3 + 2];
                 if (k == 0 and first != 0) return error.InvalidFont;
-                if (@as(i32, first) <= prev_first) return error.InvalidFont; // 狭義単調増加
+                if (@as(i32, first) <= prev_first) return error.InvalidFont; // Strictly monotonically increasing
                 if (fd >= fd_count) return error.InvalidFont;
                 prev_first = first;
             }
@@ -604,7 +604,7 @@ const FDSelect = struct {
         if (self.format == 0) {
             return self.data[self.off + 1 + gid];
         }
-        // format 3: ranges を線形探索
+        // format 3: linear search over ranges
         const ranges_off = self.off + 3;
         const r = Reader{ .data = self.data };
         var k: usize = 0;
@@ -644,7 +644,7 @@ fn op8d(v: i32) u8 {
     return @intCast(v + 139);
 }
 
-test "cff parseTopDict: CharStrings/Private 抽出" {
+test "cff parseTopDict: extract CharStrings/Private" {
     // operands... 100 17(CharStrings off=100) ; 50 200 18(Private size=50 off=200)
     const dict = [_]u8{ op8d(100), 17, op8d(50), 28, 0x00, 0xC8, 18 };
     const top = try parseTopDict(&dict);
@@ -658,12 +658,12 @@ test "cff parseTopDict: CharStrings/Private 抽出" {
 test "cff readRealOperand: -2.25" {
     // -2.25 → nibbles: e(-) 2 a(.) 2 5 f(end) → 0xe2 0xa2 0x5f
     const d = [_]u8{ 30, 0xe2, 0xa2, 0x5f };
-    var i: usize = 1; // 30 は呼び出し前提なので operand 本体から
+    var i: usize = 1; // 30 is assumed by the caller, so start from the operand body
     const v = try readRealOperand(&d, &i);
     try testing.expectApproxEqAbs(@as(f64, -2.25), v, 1e-9);
 }
 
-// ── CFF2 合成フィクスチャ（公開: 監督者 snapshot / E2E 再利用可）──
+// ── CFF2 synthetic fixtures (public: reusable for snapshot / E2E) ──
 
 fn putU16be(buf: []u8, off: usize, v: u16) void {
     buf[off] = @intCast(v >> 8);
@@ -687,20 +687,20 @@ fn appendDictI16(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i16) !vo
     try list.append(alloc, @truncate(@as(u16, @bitCast(v))));
 }
 
-/// CFF2 テーブル合成オプション。
+/// Options for synthesizing a CFF2 table.
 pub const Cff2TableOpts = struct {
-    /// Private DICT の初期 vsindex（0=既定）。
+    /// Initial vsindex of Private DICT (0=default).
     private_vsindex: u16 = 0,
-    /// 2 個の ItemVariationData + 2 region を持つ vstore。
-    /// region0: peak=1（scalar=norm）、region1: peak=0.5（norm=1 で scalar=0）。
-    /// IVD0→region0、IVD1→region1。vsindex で blend 結果が変わる。
+    /// vstore with 2 ItemVariationData + 2 regions.
+    /// region0: peak=1 (scalar=norm), region1: peak=0.5 (scalar=0 at norm=1).
+    /// IVD0→region0, IVD1→region1. blend result changes with vsindex.
     dual_ivd: bool = false,
-    /// charstring 先頭で vsindex オペレータ（op 15）を発行する値。null=無し。
+    /// Value for emitting a vsindex operator (op 15) at the start of the charstring. null=none.
     charstring_vsindex: ?u16 = null,
 };
 
-/// 1 軸 VariationStore + blend 付き最小 CFF2 テーブル（1 glyph）。
-/// 底辺 x = blend(100, +50)。呼び出し側 free。
+/// Minimal CFF2 table with 1-axis VariationStore + blend (1 glyph).
+/// Base edge x = blend(100, +50). Caller frees.
 pub fn buildCff2Table(alloc: std.mem.Allocator, opts: Cff2TableOpts) ![]u8 {
     var cs_bytes: std.ArrayList(u8) = .empty;
     defer cs_bytes.deinit(alloc);
@@ -842,7 +842,7 @@ pub fn buildCff2Table(alloc: std.mem.Allocator, opts: Cff2TableOpts) ![]u8 {
     putI16be(out, rl + 6, f2d14(1));
     putI16be(out, rl + 8, f2d14(1));
     if (n_regions > 1) {
-        // region1: start=0 peak=0.5 end=1 → norm=1 で scalar=0
+        // region1: start=0 peak=0.5 end=1 → scalar=0 at norm=1
         putI16be(out, rl + 10, f2d14(0));
         putI16be(out, rl + 12, f2d14(0.5));
         putI16be(out, rl + 14, f2d14(1));
@@ -859,14 +859,14 @@ pub fn buildCff2Table(alloc: std.mem.Allocator, opts: Cff2TableOpts) ![]u8 {
     return out;
 }
 
-/// 後方互換: 既定オプションの最小 CFF2 テーブル。
+/// Backward compatible: minimal CFF2 table with default options.
 pub fn buildMinimalCff2Vf(alloc: std.mem.Allocator) ![]u8 {
     return buildCff2Table(alloc, .{});
 }
 
-/// CFF2 VF の完全 SFNT（head/maxp/hhea/hmtx/cmap/fvar/CFF2）。
-/// 1 glyph（.notdef 扱い / cmap 'A'→0）、unitsPerEm=64、advance=64、wght 軸 100/400/900。
-/// 呼び出し側 free。監督者 snapshot 用にファイルへ書き出し可。
+/// Complete SFNT for a CFF2 VF (head/maxp/hhea/hmtx/cmap/fvar/CFF2).
+/// 1 glyph (treated as .notdef / cmap 'A'→0), unitsPerEm=64, advance=64, wght axis 100/400/900.
+/// Caller frees. Can be written to a file for snapshots.
 pub fn buildCff2VfSfnt(alloc: std.mem.Allocator, opts: Cff2TableOpts) ![]u8 {
     const cff2 = try buildCff2Table(alloc, opts);
     defer alloc.free(cff2);
@@ -974,7 +974,7 @@ fn appendU32List(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) !void {
     try l.append(a, @truncate(v));
 }
 
-test "TASK-25.15.4: CFF2 VF parse + blend で外形が軸連動・norm0 一致" {
+test "CFF2 VF: parse + blend outline tracks axes; matches at norm0" {
     const a = testing.allocator;
     const cff2 = try buildMinimalCff2Vf(a);
     defer a.free(cff2);
@@ -1002,12 +1002,12 @@ test "TASK-25.15.4: CFF2 VF parse + blend で外形が軸連動・norm0 一致" 
     try testing.expectApproxEqAbs(c0.segments[0].line.x, o0b.contours[0].segments[0].line.x, 0.01);
 }
 
-test "TASK-25.15.4: CFF2 壊れた major は InvalidFont" {
+test "CFF2: broken major is InvalidFont" {
     var bad = [_]u8{ 1, 0, 5, 0, 0 }; // major=1
     try testing.expectError(error.InvalidFont, Cff2Font.parse(&bad, 0));
 }
 
-test "TASK-25.15.4: vsindex 範囲外 blend は InvalidFont" {
+test "CFF2: out-of-range vsindex blend is InvalidFont" {
     const a = testing.allocator;
     const cff2 = try buildMinimalCff2Vf(a);
     defer a.free(cff2);
@@ -1024,7 +1024,7 @@ test "TASK-25.15.4: vsindex 範囲外 blend は InvalidFont" {
     try testing.expectError(error.InvalidFont, cs.runCff2(&b, &code, font.gsubrs, font.lsubrs, &blend, &.{1.0}));
 }
 
-test "TASK-25.15.4: Private DICT vsindex=1 で IVD1 の region scalar を使う" {
+test "CFF2: Private DICT vsindex=1 uses IVD1 region scalar" {
     const a = testing.allocator;
     // dual_ivd: vsindex0→region0(peak1) scalar@1=1 → x=150
     //           vsindex1→region1(peak0.5) scalar@1=0 → x=100
@@ -1038,7 +1038,7 @@ test "TASK-25.15.4: Private DICT vsindex=1 で IVD1 の region scalar を使う"
     // Private vsindex=1 → IVD1 → region1 peak0.5 → at norm1 scalar=0 → x=100
     try testing.expectApproxEqAbs(@as(f32, 100), o_max.contours[0].segments[0].line.x, 0.5);
 
-    // 比較: private_vsindex=0 なら 150
+    // Compare: 150 when private_vsindex=0
     const cff2_0 = try buildCff2Table(a, .{ .private_vsindex = 0, .dual_ivd = true });
     defer a.free(cff2_0);
     const font0 = try Cff2Font.parse(cff2_0, 1);
@@ -1047,9 +1047,9 @@ test "TASK-25.15.4: Private DICT vsindex=1 で IVD1 の region scalar を使う"
     try testing.expectApproxEqAbs(@as(f32, 150), o0.contours[0].segments[0].line.x, 0.5);
 }
 
-test "TASK-25.15.4: charstring vsindex op15 で blend 結果が切り替わる" {
+test "CFF2: charstring vsindex op15 switches blend result" {
     const a = testing.allocator;
-    // dual IVD + charstring で vsindex=1 を発行（Private は 0）
+    // dual IVD + emit vsindex=1 in charstring (Private is 0)
     const cff2 = try buildCff2Table(a, .{
         .private_vsindex = 0,
         .dual_ivd = true,
@@ -1057,14 +1057,14 @@ test "TASK-25.15.4: charstring vsindex op15 で blend 結果が切り替わる" 
     });
     defer a.free(cff2);
     const font = try Cff2Font.parse(cff2, 1);
-    try testing.expectEqual(@as(u16, 0), font.default_vsindex); // Private は 0
+    try testing.expectEqual(@as(u16, 0), font.default_vsindex); // Private is 0
 
     var o = try font.outline(a, 0, &.{1.0});
     defer o.deinit(a);
-    // op15 で vsindex=1 → IVD1 → x=100
+    // op15 sets vsindex=1 → IVD1 → x=100
     try testing.expectApproxEqAbs(@as(f32, 100), o.contours[0].segments[0].line.x, 0.5);
 
-    // op15 vsindex=0 明示
+    // op15 explicitly sets vsindex=0
     const cff2_v0 = try buildCff2Table(a, .{
         .dual_ivd = true,
         .charstring_vsindex = 0,
@@ -1076,7 +1076,7 @@ test "TASK-25.15.4: charstring vsindex op15 で blend 結果が切り替わる" 
     try testing.expectApproxEqAbs(@as(f32, 150), o0.contours[0].segments[0].line.x, 0.5);
 }
 
-test "TASK-25.15.4: buildCff2VfSfnt が完全 SFNT バイト列を返す" {
+test "CFF2: buildCff2VfSfnt returns a complete SFNT byte stream" {
     const a = testing.allocator;
     const sfnt_bytes = try buildCff2VfSfnt(a, .{});
     defer a.free(sfnt_bytes);

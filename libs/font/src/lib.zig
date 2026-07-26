@@ -1,5 +1,5 @@
-// libs/font: 共通フォント抽象 + pixel/geom プリミティブの正準定義。
-// gui や将来の OutlineFont/BMFont はこのモジュール（`@import("font")`）を使う。
+// libs/font: canonical shared font abstraction plus pixel/geom primitives.
+// gui and future OutlineFont/BMFont use this module (`@import("font")`).
 
 pub const geom = @import("geom.zig");
 pub const color = @import("color.zig");
@@ -24,13 +24,13 @@ pub const ivs = @import("ivs.zig");
 pub const text_layer = @import("text_layer.zig");
 pub const system_font = @import("system_font.zig");
 
-// pixel/geom プリミティブ（gui が再エクスポートする正準定義）
+// pixel/geom primitives (canonical definitions re-exported by gui)
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const RenderTarget = geom.RenderTarget;
 pub const Color = color.Color;
 
-// 共通フォント抽象
+// Shared font abstraction
 pub const Metrics = font.Metrics;
 pub const Font = font.Font;
 pub const plotCoverage = font.plotCoverage;
@@ -41,7 +41,7 @@ pub const blitRGBAStraight = font.blitRGBAStraight;
 pub const clipCoverage = font.clipCoverage;
 pub const CovClip = font.CovClip;
 
-// 透明レイヤーへのテキストラスタライズ（TASK-79.4）
+// Text rasterization onto a transparent layer
 pub const TextLayer = text_layer.TextLayer;
 pub const renderTextLayer = text_layer.renderTextLayer;
 pub const default_font_bytes = text_layer.default_font_bytes;
@@ -49,7 +49,7 @@ pub const LoadedSystemFontFace = system_font.LoadedFace;
 pub const loadSystemTextFace = system_font.loadSystemTextFace;
 pub const loadSystemTextFontBytes = system_font.loadSystemTextFontBytes;
 
-// sfnt(TrueType/OpenType) コンテナ + cmap + glyf アウトライン
+// sfnt (TrueType/OpenType) container + cmap + glyf outlines
 pub const SfntFile = sfnt.SfntFile;
 pub const Cmap = cmap.Cmap;
 pub const Outline = outline.Outline;
@@ -60,7 +60,7 @@ pub const FontFace = outline_font.FontFace;
 pub const OutlineFont = outline_font.OutlineFont;
 pub const BMFont = bmfont.BMFont;
 
-// sbix(埋め込みカラービットマップ)テーブルパーサ（TASK-26.2。統合は TASK-26.3）
+// sbix (embedded color bitmap) table parser
 pub const Sbix = sbix.Sbix;
 
 test {

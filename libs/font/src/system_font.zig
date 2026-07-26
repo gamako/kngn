@@ -1,8 +1,8 @@
-//! OS system text font のランタイム解決（TASK-85）。
+//! Runtime resolution of the OS system text font.
 //!
-//! ホットパス: **初期化時のみ**。起動時に fc-match subprocess（Linux family 候補数まで
-//! 最大数回）+ font file read + `FontFace.init` parse 検証を行う（1 回の load 呼び出しあたり）。
-//! フレーム毎・RT・イベント hot path は新設しない。
+//! Hot path: **init-time only**. At startup runs fc-match subprocess (up to as many times as
+//! Linux family candidates) + font file read + `FontFace.init` parse validation (per load call).
+//! Does not add per-frame / RT / event hot paths.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,7 +25,7 @@ const default_fontconfig_families = [_][]const u8{
 };
 
 const default_fixed_paths = [_][]const u8{
-    // macOS: 日本語 .ttc（ASCII も含むので 1 本で混在描画可）→ ASCII フォールバック
+    // macOS: Japanese .ttc (also covers ASCII, so one face can draw mixed text) → ASCII fallback
     "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
     "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
     "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
@@ -33,14 +33,14 @@ const default_fixed_paths = [_][]const u8{
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
     "/Library/Fonts/Arial.ttf",
-    // Windows: 日本語 → ASCII
+    // Windows: Japanese → ASCII
     "C:/Windows/Fonts/YuGothM.ttc",
     "C:/Windows/Fonts/meiryo.ttc",
     "C:/Windows/Fonts/msgothic.ttc",
     "C:/Windows/Fonts/arial.ttf",
     "C:/Windows/Fonts/segoeui.ttf",
     "C:/Windows/Fonts/consola.ttf",
-    // Linux（Ubuntu / nix FHS）: 日本語(CJK) → ASCII
+    // Linux (Ubuntu / nix FHS): Japanese (CJK) → ASCII
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -61,12 +61,12 @@ const FcMatchOutcome = union(enum) {
     failed,
 };
 
-/// Linux のみ `fc-match -f "%{file}\t%{family}" <family>` で path を解決する。
-/// `fc-match` 不在（FileNotFound）は `.unavailable` を返し固定パス fallback へ進む。
-/// fc-match は要求 family が存在しなくても**代替フォントを返す**（fontconfig の
-/// フォールバック）ため、返された family 名に要求名が含まれることを検証し、
-/// 代替（不一致）は `.failed` として次候補へ進む（codex P1: CJK 候補が DejaVu 等の
-/// 汎用代替で潰され日本語描画に失敗するのを防ぐ）。
+/// Linux only: resolve a path via `fc-match -f` with format fields `%{file}` and `%{family}` separated by TAB.
+/// If `fc-match` is missing (FileNotFound), return `.unavailable` and continue to fixed-path fallback.
+/// fc-match **returns a substitute font** even when the requested family is absent (fontconfig
+/// fallback), so verify the returned family name contains the requested name;
+/// a substitute (mismatch) is `.failed` and the next candidate is tried (prevents CJK candidates from being
+/// collapsed to a generic substitute such as DejaVu, which would break Japanese drawing).
 fn fcMatchPath(gpa: std.mem.Allocator, io: std.Io, family: []const u8) FcMatchOutcome {
     const argv = [_][]const u8{ "fc-match", "-f", "%{file}\t%{family}", family };
     const result = std.process.run(gpa, io, .{
@@ -131,7 +131,7 @@ fn tryLoadPath(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?LoadedFa
     return .{ .bytes = bytes, .face = face };
 }
 
-/// 候補解決・read・parse 試行の単一集約点（公開 API はこれだけを呼ぶ）。
+/// Single aggregation point for candidate resolve / read / parse attempts (public APIs call only this).
 fn resolveSystemTextFont(io: std.Io, alloc: std.mem.Allocator, opts: ResolveOptions) ?LoadedFace {
     if (opts.enable_fontconfig) {
         var fc_available = true;
@@ -155,12 +155,12 @@ fn resolveSystemTextFont(io: std.Io, alloc: std.mem.Allocator, opts: ResolveOpti
     return null;
 }
 
-/// examples 12/19/21 用: parse 検証済み `LoadedFace` を返す。`bytes` は呼び出し側が free する。
+/// For examples 12/19/21: return a parse-validated `LoadedFace`. Caller frees `bytes`.
 pub fn loadSystemTextFace(io: std.Io, alloc: std.mem.Allocator) ?LoadedFace {
     return resolveSystemTextFont(io, alloc, .{});
 }
 
-/// pixie 用: parse 検証済み font bytes のみ返す。`bytes` は呼び出し側が free する。
+/// For pixie: return parse-validated font bytes only. Caller frees `bytes`.
 pub fn loadSystemTextFontBytes(io: std.Io, alloc: std.mem.Allocator) ?[]u8 {
     if (builtin.cpu.arch.isWasm()) return null;
     const loaded = resolveSystemTextFont(io, alloc, .{}) orelse return null;

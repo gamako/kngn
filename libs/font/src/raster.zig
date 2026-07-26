@@ -1,10 +1,10 @@
-// アウトラインラスタライザ。共通 Outline(font units) を 8bpp カバレッジへ変換する。
+// Outline rasterizer. Converts a shared Outline (font units) into 8bpp coverage.
 //
-// 解析的カバレッジ（area/cover 2 バッファ + per-row resolve）。各辺をスキャンライン行
-// （半開 [y, y+1)）に分け、さらに行内で整数列境界に分割して**各サブ辺が単一セル内**に収まる
-// ようにし、そのセルへ符号付き部分被覆(area)とフル交差量(cover)を積む。行ごとに
-// running sum を取り `clamp(|area+acc|,0,1)` で nonzero winding のカバレッジを得る。
-// quad/cubic は許容誤差で適応平坦化（de Casteljau、再帰深度 cap）。
+// Analytic coverage (area/cover dual buffers + per-row resolve). Each edge is split across scanline rows
+// (half-open [y, y+1)), then further split at integer column boundaries so each sub-edge lies in a single cell,
+// accumulating signed partial coverage (area) and full crossing amount (cover) into that cell. Per row,
+// a running sum yields nonzero-winding coverage via `clamp(|area+acc|,0,1)`.
+// Quads/cubics are adaptively flattened to a tolerance (de Casteljau, recursion depth capped).
 
 const std = @import("std");
 const outline = @import("outline.zig");
@@ -14,15 +14,15 @@ const Outline = outline.Outline;
 
 pub const Error = error{ OutOfMemory, InvalidSize };
 
-/// 8bpp カバレッジ。data.len == w*h。呼び出し側が free。
+/// 8bpp coverage. data.len == w*h. Caller frees.
 pub const Bitmap = struct {
     data: []u8,
     w: u32,
     h: u32,
 };
 
-/// font units → device px。device.x = v.x*sx + dx, device.y = v.y*sy + dy。
-/// font は Y up・描画先は Y down なので通常 sy < 0。
+/// font units → device px. device.x = v.x*sx + dx, device.y = v.y*sy + dy.
+/// Fonts are Y-up and the destination is Y-down, so usually sy < 0.
 pub const Transform = struct {
     sx: f32,
     sy: f32,
@@ -47,10 +47,10 @@ const Raster = struct {
         return std.math.isFinite(v.x) and std.math.isFinite(v.y);
     }
 
-    /// 直線辺を accumulate。非有限は呼び出し側で除外済み前提だが念のため弾く。
+    /// Accumulate a line edge. Non-finite inputs are assumed filtered by the caller, but reject defensively.
     fn edge(self: *Raster, p0: Vec2f, p1: Vec2f) void {
         if (!finite(p0) or !finite(p1)) return;
-        if (p0.y == p1.y) return; // 水平辺は寄与 0
+        if (p0.y == p1.y) return; // Horizontal edges contribute 0
 
         var dir: f32 = 1;
         var ax = p0.x;
@@ -67,7 +67,7 @@ const Raster = struct {
         const h_f: f32 = @floatFromInt(self.h);
         const dxdy = (bx - ax) / (by - ay);
 
-        // y を [0, h] にクリップ（x を追従）
+        // Clip y to [0, h] (x follows)
         var y = ay;
         var curx = ax;
         if (y < 0) {
@@ -88,9 +88,9 @@ const Raster = struct {
         }
     }
 
-    /// 1 行内の辺（top x=x_a, bottom x=x_b, 高さ dy）を整数列で分割して各セルへ積む。
-    /// x が [0,w] を跨ぐ場合も AA が崩れないよう、x の符号付き区間で dy を比例配分する
-    /// （x<0 部分は列0へフル cover、x>w 部分は可視セルに寄与しないので無視）。
+    /// Split an in-row edge (top x=x_a, bottom x=x_b, height dy) at integer columns and accumulate into each cell.
+    /// When x spans [0,w], proportionally allocate dy over the signed x interval so AA stays intact
+    /// (x<0 fully covers column 0; x>w does not contribute to visible cells and is ignored).
     fn rowSpan(self: *Raster, row: u32, x_a: f32, x_b: f32, dy: f32, dir: f32) void {
         if (row >= self.h) return;
         const w_f: f32 = @floatFromInt(self.w);
@@ -98,23 +98,23 @@ const Raster = struct {
         const hi = @max(x_a, x_b);
 
         if (hi - lo <= 1e-6) {
-            // ほぼ垂直 → 単一セル
+            // Nearly vertical → single cell
             if (lo < 0) {
-                self.cell(row, 0, dy, dir); // 完全に左 → 列0 フル
+                self.cell(row, 0, dy, dir); // Entirely left → full cover on column 0
             } else if (lo < w_f) {
                 self.cell(row, lo, dy, dir);
-            } // lo >= w なら可視セルに寄与なし
+            } // lo >= w → no contribution to visible cells
             return;
         }
         const total = hi - lo;
 
-        // x<0 部分 → 列0 へフル cover（可視セルは全て右側）
+        // x<0 portion → full cover on column 0 (all visible cells are to the right)
         const left_hi = @min(hi, 0.0);
         if (left_hi > lo) {
             self.cell(row, 0, dy * (left_hi - lo) / total, dir);
         }
 
-        // x∈[0,w] 部分 → 通常の列分割（その部分の dy を更に列で比例配分）
+        // x∈[0,w] portion → normal column split (further proportional dy across columns)
         const in_lo = @max(lo, 0.0);
         const in_hi = @min(hi, w_f);
         if (in_hi > in_lo) {
@@ -128,10 +128,10 @@ const Raster = struct {
                 xs = xe;
             }
         }
-        // x>w 部分は可視セルに寄与しないので無視
+        // x>w portion does not contribute to visible cells; ignore
     }
 
-    /// 単一セル（xmid を含む列）へ area/cover を積む。
+    /// Accumulate area/cover into the single cell containing xmid.
     fn cell(self: *Raster, row: u32, xmid: f32, dy: f32, dir: f32) void {
         const w_f: f32 = @floatFromInt(self.w);
         const xm = std.math.clamp(xmid, 0, w_f);
@@ -145,7 +145,7 @@ const Raster = struct {
         self.cover[idx] += dir * dy;
     }
 
-    /// 行ごとに running sum を取り 8bpp カバレッジへ。
+    /// Per-row running sum into 8bpp coverage.
     fn resolve(self: *Raster, out: []u8) void {
         var row: u32 = 0;
         while (row < self.h) : (row += 1) {
@@ -161,14 +161,14 @@ const Raster = struct {
         }
     }
 
-    // ── 平坦化（device 座標で）──
+    // ── Flattening (in device coordinates) ──
     fn flattenQuad(self: *Raster, p0: Vec2f, c: Vec2f, p1: Vec2f, depth: u32) void {
-        if (!finite(p0) or !finite(c) or !finite(p1)) return; // 非有限は棄却（偽の弦を描かない）
+        if (!finite(p0) or !finite(c) or !finite(p1)) return; // Reject non-finite (do not draw false chords)
         if (depth >= flatten_max_depth or quadFlat(p0, c, p1)) {
             self.edge(p0, p1);
             return;
         }
-        // de Casteljau 2 分割
+        // de Casteljau bipartition
         const p01 = mid(p0, c);
         const p12 = mid(c, p1);
         const m = mid(p01, p12);
@@ -177,7 +177,7 @@ const Raster = struct {
     }
 
     fn flattenCubic(self: *Raster, p0: Vec2f, c1: Vec2f, c2: Vec2f, p1: Vec2f, depth: u32) void {
-        if (!finite(p0) or !finite(c1) or !finite(c2) or !finite(p1)) return; // 非有限は棄却
+        if (!finite(p0) or !finite(c1) or !finite(c2) or !finite(p1)) return; // Reject non-finite
         if (depth >= flatten_max_depth or cubicFlat(p0, c1, c2, p1)) {
             self.edge(p0, p1);
             return;
@@ -197,7 +197,7 @@ fn mid(a: Vec2f, b: Vec2f) Vec2f {
     return .{ .x = (a.x + b.x) * 0.5, .y = (a.y + b.y) * 0.5 };
 }
 
-// 制御点が弦からどれだけ離れているかで平坦判定。
+// Flatness by how far control points stray from the chord.
 fn quadFlat(p0: Vec2f, c: Vec2f, p1: Vec2f) bool {
     const d = distToLine(c, p0, p1);
     return d <= flatten_tol;
@@ -206,7 +206,7 @@ fn cubicFlat(p0: Vec2f, c1: Vec2f, c2: Vec2f, p1: Vec2f) bool {
     return distToLine(c1, p0, p1) <= flatten_tol and distToLine(c2, p0, p1) <= flatten_tol;
 }
 
-/// 点 p の線分 a-b（無限直線）への距離。a==b なら点距離。
+/// Distance from point p to line a-b (infinite). If a==b, point distance.
 fn distToLine(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
     const dx = b.x - a.x;
     const dy = b.y - a.y;
@@ -221,12 +221,12 @@ fn distToLine(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
     return @abs(cross) / @sqrt(len2);
 }
 
-/// outline を (w,h) のカバレッジへラスタライズする。空 outline / w==0/h==0 は全 0。
+/// Rasterize outline into (w,h) coverage. Empty outline / w==0/h==0 → all zeros.
 pub fn rasterize(alloc: std.mem.Allocator, ol: Outline, xform: Transform, w: u32, h: u32) Error!Bitmap {
     if (w == 0 or h == 0) return .{ .data = try alloc.alloc(u8, 0), .w = w, .h = h };
 
     const n = std.math.mul(usize, w, h) catch return error.InvalidSize;
-    // f32 バッファ 2 本 + u8 出力が現実的サイズか（過大は明示エラー）
+    // Whether two f32 buffers + u8 output fit a practical size (oversized → explicit error)
     _ = std.math.mul(usize, n, @sizeOf(f32)) catch return error.InvalidSize;
 
     const area = try alloc.alloc(f32, n);
@@ -241,7 +241,7 @@ pub fn rasterize(alloc: std.mem.Allocator, ol: Outline, xform: Transform, w: u32
     for (ol.contours) |contour| {
         const start = xform.apply(contour.start);
         var cur = start;
-        var ok = Raster.finite(start); // 非有限点が出たら輪郭を壊れ扱いにし以降＋閉路を抑止
+        var ok = Raster.finite(start); // On a non-finite point, treat the contour as broken and suppress further points + close
         for (contour.segments) |seg| {
             if (!ok) break;
             switch (seg) {
@@ -271,7 +271,7 @@ pub fn rasterize(alloc: std.mem.Allocator, ol: Outline, xform: Transform, w: u32
                 },
             }
         }
-        if (ok) raster.edge(cur, start); // 閉路は輪郭が壊れていない時だけ
+        if (ok) raster.edge(cur, start); // Close only when the contour is not broken
     }
 
     const out = try alloc.alloc(u8, n);
@@ -292,7 +292,7 @@ fn px(bm: Bitmap, x: u32, y: u32) u8 {
     return bm.data[@as(usize, y) * bm.w + x];
 }
 
-/// 矩形 contour（軸平行）を Outline 化（line のみ）。呼び出し側 deinit。
+/// Axis-aligned rectangular contour as Outline (lines only). Caller deinits.
 fn rectOutline(alloc: std.mem.Allocator, contours: []const [4]Vec2f) !Outline {
     var b = outline.Builder.init(alloc);
     errdefer b.deinit();
@@ -305,9 +305,9 @@ fn rectOutline(alloc: std.mem.Allocator, contours: []const [4]Vec2f) !Outline {
     return b.finish();
 }
 
-test "raster: ピクセル整列の塗り矩形（内部 255・外部 0）" {
+test "raster: pixel-aligned filled rect (inside 255 · outside 0)" {
     const a = testing.allocator;
-    // (1,1)-(4,4) の矩形 → cols/rows 1..3 が 255
+    // Rect (1,1)-(4,4) → cols/rows 1..3 are 255
     var ol = try rectOutline(a, &.{.{
         .{ .x = 1, .y = 1 }, .{ .x = 4, .y = 1 }, .{ .x = 4, .y = 4 }, .{ .x = 1, .y = 4 },
     }});
@@ -327,10 +327,10 @@ test "raster: ピクセル整列の塗り矩形（内部 255・外部 0）" {
     };
 }
 
-test "raster: 直角三角形の厳密 coverage golden（対角セルは 0.5=128）" {
+test "raster: right-triangle exact coverage golden (diagonal cells 0.5=128)" {
     const a = testing.allocator;
-    // (0,0)-(4,0)-(4,4) の三角形。内部は x>=y。
-    //   cx>cy → 255、cx<cy → 0、cx==cy → 対角線で半分 → 128。
+    // Triangle (0,0)-(4,0)-(4,4). Interior is x>=y.
+    //   cx>cy → 255, cx<cy → 0, cx==cy → half on the diagonal → 128.
     var b = outline.Builder.init(a);
     errdefer b.deinit();
     try b.moveTo(.{ .x = 0, .y = 0 });
@@ -352,28 +352,28 @@ test "raster: 直角三角形の厳密 coverage golden（対角セルは 0.5=128
     };
 }
 
-test "raster: 反対向き矩形（穴あき）で内側が抜ける" {
+test "raster: opposite-winding rect (hole) clears the interior" {
     const a = testing.allocator;
-    // 外 (0,0)-(6,6) CW、内 (2,2)-(4,4) を逆向きに
+    // Outer (0,0)-(6,6) CW; inner (2,2)-(4,4) opposite winding
     var ol = try rectOutline(a, &.{
         .{ .{ .x = 0, .y = 0 }, .{ .x = 6, .y = 0 }, .{ .x = 6, .y = 6 }, .{ .x = 0, .y = 6 } },
-        .{ .{ .x = 2, .y = 2 }, .{ .x = 2, .y = 4 }, .{ .x = 4, .y = 4 }, .{ .x = 4, .y = 2 } }, // 逆向き
+        .{ .{ .x = 2, .y = 2 }, .{ .x = 2, .y = 4 }, .{ .x = 4, .y = 4 }, .{ .x = 4, .y = 2 } }, // Opposite winding
     });
     defer ol.deinit(a);
 
     const bm = try rasterize(a, ol, identity, 6, 6);
     defer a.free(bm.data);
 
-    try testing.expectEqual(@as(u8, 255), px(bm, 0, 0)); // 外周内
+    try testing.expectEqual(@as(u8, 255), px(bm, 0, 0)); // Inside outer
     try testing.expectEqual(@as(u8, 255), px(bm, 1, 1));
-    try testing.expectEqual(@as(u8, 0), px(bm, 2, 2)); // 穴
-    try testing.expectEqual(@as(u8, 0), px(bm, 3, 3)); // 穴
+    try testing.expectEqual(@as(u8, 0), px(bm, 2, 2)); // Hole
+    try testing.expectEqual(@as(u8, 0), px(bm, 3, 3)); // Hole
     try testing.expectEqual(@as(u8, 255), px(bm, 5, 5));
 }
 
-test "raster: 半ピクセルずれた矩形エッジは中間カバレッジ" {
+test "raster: half-pixel-shifted rect edge yields mid coverage" {
     const a = testing.allocator;
-    // x: [1.5, 3.5) → col1 右半(≈128), col2 全(255), col3 左半(≈128)
+    // x: [1.5, 3.5) → col1 right half(≈128), col2 full(255), col3 left half(≈128)
     var ol = try rectOutline(a, &.{.{
         .{ .x = 1.5, .y = 0 }, .{ .x = 3.5, .y = 0 }, .{ .x = 3.5, .y = 4 }, .{ .x = 1.5, .y = 4 },
     }});
@@ -389,9 +389,9 @@ test "raster: 半ピクセルずれた矩形エッジは中間カバレッジ" {
     try testing.expectEqual(@as(u8, 0), px(bm, 4, 1));
 }
 
-test "raster: Y 反転 transform（sy<0）" {
+test "raster: Y-flipped transform (sy<0)" {
     const a = testing.allocator;
-    // font Y-up の矩形 (1,1)-(4,4)。sy=-1, dy=6 で device Y down に反転。
+    // Font Y-up rect (1,1)-(4,4). Flip to device Y-down with sy=-1, dy=6.
     // device y = font.y*(-1) + 6 → font y∈[1,4] → device y∈[5,2] → rows 2..4
     var ol = try rectOutline(a, &.{.{
         .{ .x = 1, .y = 1 }, .{ .x = 4, .y = 1 }, .{ .x = 4, .y = 4 }, .{ .x = 1, .y = 4 },
@@ -399,13 +399,13 @@ test "raster: Y 反転 transform（sy<0）" {
     defer ol.deinit(a);
     const bm = try rasterize(a, ol, .{ .sx = 1, .sy = -1, .dx = 0, .dy = 6 }, 6, 6);
     defer a.free(bm.data);
-    // cols 1..3, device rows 2..4（font row 1..3 を反転）
+    // cols 1..3, device rows 2..4 (font rows 1..3 flipped)
     try testing.expectEqual(@as(u8, 255), px(bm, 1, 2));
     try testing.expectEqual(@as(u8, 255), px(bm, 3, 4));
     try testing.expectEqual(@as(u8, 0), px(bm, 1, 0));
 }
 
-test "raster: 空 outline は全 0" {
+test "raster: empty outline is all zeros" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     var ol = try b.finish();
@@ -415,7 +415,7 @@ test "raster: 空 outline は全 0" {
     for (bm.data) |v| try testing.expectEqual(@as(u8, 0), v);
 }
 
-test "raster: w==0/h==0 は空 Bitmap" {
+test "raster: w==0/h==0 yields empty Bitmap" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     var ol = try b.finish();
@@ -425,40 +425,40 @@ test "raster: w==0/h==0 は空 Bitmap" {
     try testing.expectEqual(@as(usize, 0), bm.data.len);
 }
 
-test "raster: 非有限 segment は棄却され他は描画される" {
+test "raster: non-finite segments are rejected; others still draw" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     errdefer b.deinit();
-    // 正常な矩形 contour
+    // Valid rectangular contour
     try b.moveTo(.{ .x = 1, .y = 1 });
     try b.lineTo(.{ .x = 4, .y = 1 });
     try b.lineTo(.{ .x = 4, .y = 4 });
     try b.lineTo(.{ .x = 1, .y = 4 });
-    // NaN を含む別 contour（棄却されるべき）
+    // Separate contour containing NaN (must be rejected)
     const nan = std.math.nan(f32);
     try b.moveTo(.{ .x = nan, .y = 0 });
     try b.lineTo(.{ .x = 2, .y = 2 });
     var ol = try b.finish();
     defer ol.deinit(a);
 
-    const bm = try rasterize(a, ol, identity, 6, 6); // クラッシュしない
+    const bm = try rasterize(a, ol, identity, 6, 6); // Must not crash
     defer a.free(bm.data);
-    try testing.expectEqual(@as(u8, 255), px(bm, 2, 2)); // 正常矩形は描画
+    try testing.expectEqual(@as(u8, 255), px(bm, 2, 2)); // Valid rectangle is drawn
 }
 
-test "raster: 過大サイズは InvalidSize" {
+test "raster: oversized is InvalidSize" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     var ol = try b.finish();
     defer ol.deinit(a);
-    // w*h が usize overflow する組み合わせ
+    // w*h combination that overflows usize
     const big: u32 = 0xFFFF_FFFF;
     try testing.expectError(error.InvalidSize, rasterize(a, ol, identity, big, big));
 }
 
-test "raster: 三角形のカバレッジ総和が面積に近い" {
+test "raster: triangle coverage sum approximates area" {
     const a = testing.allocator;
-    // 直角三角形 (0,0)-(8,0)-(0,8) 面積 32
+    // Right triangle (0,0)-(8,0)-(0,8), area 32
     var b = outline.Builder.init(a);
     errdefer b.deinit();
     try b.moveTo(.{ .x = 0, .y = 0 });
@@ -472,18 +472,18 @@ test "raster: 三角形のカバレッジ総和が面積に近い" {
     var sum: f64 = 0;
     for (bm.data) |v| sum += @floatFromInt(v);
     const area_px = sum / 255.0;
-    try testing.expectApproxEqAbs(@as(f64, 32), area_px, 1.5); // 解析面積 32 に近い
+    try testing.expectApproxEqAbs(@as(f64, 32), area_px, 1.5); // Close to analytic area 32
 }
 
-test "raster: 円弧近似（quad）で滑らかな縁・破綻なし" {
+test "raster: arc approximation (quad) has smooth edges without failure" {
     const a = testing.allocator;
-    // 中心(8,8) 半径6 を 4 つの quad で近似した円
+    // Circle approximated by 4 quads, center (8,8), radius 6
     var b = outline.Builder.init(a);
     errdefer b.deinit();
     const cx: f32 = 8;
     const cy: f32 = 8;
     const r: f32 = 6;
-    const k: f32 = r; // 制御点は角（90度 quad 近似。やや外側に膨らむ）
+    const k: f32 = r; // Control points at corners (90° quad approx; bulges slightly outward)
     try b.moveTo(.{ .x = cx + r, .y = cy });
     try b.quadTo(.{ .x = cx + k, .y = cy + k }, .{ .x = cx, .y = cy + r });
     try b.quadTo(.{ .x = cx - k, .y = cy + k }, .{ .x = cx - r, .y = cy });
@@ -494,39 +494,39 @@ test "raster: 円弧近似（quad）で滑らかな縁・破綻なし" {
 
     const bm = try rasterize(a, ol, identity, 16, 16);
     defer a.free(bm.data);
-    try testing.expectEqual(@as(u8, 255), px(bm, 8, 8)); // 中心は塗られる
-    try testing.expectEqual(@as(u8, 0), px(bm, 0, 0)); // 角は塗られない
-    // disk-ish な塗り面積（quad 近似なので緩い範囲で確認。πr²≈113 付近）
+    try testing.expectEqual(@as(u8, 255), px(bm, 8, 8)); // Center is filled
+    try testing.expectEqual(@as(u8, 0), px(bm, 0, 0)); // Corners are not filled
+    // Disk-ish filled area (loose range for the quad approx; near πr²≈113)
     var sum: f64 = 0;
     for (bm.data) |v| sum += @floatFromInt(v);
     const area_px = sum / 255.0;
     try testing.expect(area_px > 80 and area_px < 170);
 }
 
-test "raster: NaN 制御点の輪郭は閉路含め何も描かない（偽線なし）" {
+test "raster: contour with NaN control point draws nothing including close (no phantom edges)" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     errdefer b.deinit();
-    // 左上に正常な矩形 (1,1)-(4,4)
+    // Valid rectangle (1,1)-(4,4) at top-left
     try b.moveTo(.{ .x = 1, .y = 1 });
     try b.lineTo(.{ .x = 4, .y = 1 });
     try b.lineTo(.{ .x = 4, .y = 4 });
     try b.lineTo(.{ .x = 1, .y = 4 });
-    // 右下に NaN 制御点 quad の輪郭。修正前は close 辺 (12,12)->(8,8) が偽線を描く。
+    // Contour with NaN control-point quad at bottom-right. Without the fix, close edge (12,12)->(8,8) draws a false line.
     const nan = std.math.nan(f32);
     try b.moveTo(.{ .x = 8, .y = 8 });
     try b.quadTo(.{ .x = nan, .y = 10 }, .{ .x = 12, .y = 12 });
     var ol = try b.finish();
     defer ol.deinit(a);
-    const bm = try rasterize(a, ol, identity, 16, 16); // クラッシュしない
+    const bm = try rasterize(a, ol, identity, 16, 16); // Must not crash
     defer a.free(bm.data);
-    try testing.expectEqual(@as(u8, 255), px(bm, 2, 2)); // 正常矩形は描画
-    // 壊れた輪郭の領域（偽の対角線 (8,8)-(12,12) 上）は何も描かれない
+    try testing.expectEqual(@as(u8, 255), px(bm, 2, 2)); // Valid rectangle is drawn
+    // Broken-contour region (along the false diagonal (8,8)-(12,12)) draws nothing
     try testing.expectEqual(@as(u8, 0), px(bm, 10, 10));
     try testing.expectEqual(@as(u8, 0), px(bm, 9, 9));
 }
 
-test "raster: NaN 制御点の cubic は閉路含め何も描かない" {
+test "raster: cubic with NaN control point draws nothing including close" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     errdefer b.deinit();
@@ -537,41 +537,41 @@ test "raster: NaN 制御点の cubic は閉路含め何も描かない" {
     defer ol.deinit(a);
     const bm = try rasterize(a, ol, identity, 16, 16);
     defer a.free(bm.data);
-    for (bm.data) |v| try testing.expectEqual(@as(u8, 0), v); // 偽の弦・閉路線なし
+    for (bm.data) |v| try testing.expectEqual(@as(u8, 0), v); // No false chords or close edges
 }
 
-test "raster: NaN 終点の line は後続・閉路を汚染しない" {
+test "raster: line with NaN end does not contaminate following segments or close" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     errdefer b.deinit();
     const inf = std.math.inf(f32);
     try b.moveTo(.{ .x = 8, .y = 8 });
-    try b.lineTo(.{ .x = inf, .y = 9 }); // 非有限終点 → 以降破損
+    try b.lineTo(.{ .x = inf, .y = 9 }); // Non-finite endpoint → broken thereafter
     try b.lineTo(.{ .x = 12, .y = 12 });
     var ol = try b.finish();
     defer ol.deinit(a);
     const bm = try rasterize(a, ol, identity, 16, 16);
     defer a.free(bm.data);
-    for (bm.data) |v| try testing.expectEqual(@as(u8, 0), v); // 何も描かれない
+    for (bm.data) |v| try testing.expectEqual(@as(u8, 0), v); // Draws nothing
 }
 
-test "raster: 左端を跨ぐ矩形（x<0 クリップ）で列0 がフルになる" {
+test "raster: rect straddling left edge (x<0 clip) fills column 0" {
     const a = testing.allocator;
-    // (-2,1)-(3,4) → 可視 cols 0,1,2 が 255（x<0 は列0 フル cover で吸収）
+    // (-2,1)-(3,4) → visible cols 0,1,2 are 255 (x<0 absorbed as full cover on column 0)
     var ol = try rectOutline(a, &.{.{
         .{ .x = -2, .y = 1 }, .{ .x = 3, .y = 1 }, .{ .x = 3, .y = 4 }, .{ .x = -2, .y = 4 },
     }});
     defer ol.deinit(a);
     const bm = try rasterize(a, ol, identity, 6, 6);
     defer a.free(bm.data);
-    try testing.expectEqual(@as(u8, 255), px(bm, 0, 2)); // 列0 フル
+    try testing.expectEqual(@as(u8, 255), px(bm, 0, 2)); // Column 0 full
     try testing.expectEqual(@as(u8, 255), px(bm, 2, 2));
-    try testing.expectEqual(@as(u8, 0), px(bm, 3, 2)); // 右端は外
+    try testing.expectEqual(@as(u8, 0), px(bm, 3, 2)); // Right edge is outside
 }
 
-test "raster: 右下端ぴったりの矩形（半開境界）" {
+test "raster: rect flush to bottom-right (half-open bounds)" {
     const a = testing.allocator;
-    // (3,3)-(6,6)（6x6 バッファの右下端ぴったり）→ cols/rows 3,4,5 が 255
+    // (3,3)-(6,6) (flush to bottom-right of a 6x6 buffer) → cols/rows 3,4,5 are 255
     var ol = try rectOutline(a, &.{.{
         .{ .x = 3, .y = 3 }, .{ .x = 6, .y = 3 }, .{ .x = 6, .y = 6 }, .{ .x = 3, .y = 6 },
     }});
@@ -579,15 +579,15 @@ test "raster: 右下端ぴったりの矩形（半開境界）" {
     const bm = try rasterize(a, ol, identity, 6, 6);
     defer a.free(bm.data);
     try testing.expectEqual(@as(u8, 255), px(bm, 3, 3));
-    try testing.expectEqual(@as(u8, 255), px(bm, 5, 5)); // 右下端の内側 1px
+    try testing.expectEqual(@as(u8, 255), px(bm, 5, 5)); // Inner 1px at the bottom-right corner
     try testing.expectEqual(@as(u8, 0), px(bm, 2, 2));
 }
 
-test "raster: cubic セグメントを含む輪郭" {
+test "raster: contour including a cubic segment" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     errdefer b.deinit();
-    // 角丸風に cubic を 1 本含む四角形っぽい閉路
+    // Closed path resembling a rounded rect with one cubic
     try b.moveTo(.{ .x = 2, .y = 2 });
     try b.lineTo(.{ .x = 12, .y = 2 });
     try b.cubicTo(.{ .x = 14, .y = 6 }, .{ .x = 14, .y = 10 }, .{ .x = 12, .y = 12 });
@@ -596,6 +596,6 @@ test "raster: cubic セグメントを含む輪郭" {
     defer ol.deinit(a);
     const bm = try rasterize(a, ol, identity, 16, 16);
     defer a.free(bm.data);
-    try testing.expectEqual(@as(u8, 255), px(bm, 6, 7)); // 内部は塗られる
-    try testing.expectEqual(@as(u8, 0), px(bm, 0, 0)); // 外は塗られない
+    try testing.expectEqual(@as(u8, 255), px(bm, 6, 7)); // Interior is filled
+    try testing.expectEqual(@as(u8, 0), px(bm, 0, 0)); // Exterior is not filled
 }

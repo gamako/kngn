@@ -1,12 +1,12 @@
-// CFF INDEX 構造 + Type2 / CFF2 charstring インタプリタ。
+// CFF INDEX structure + Type2 / CFF2 charstring interpreter.
 //
-// CFF コンテナ(cff.zig)が各 INDEX のパースと subr の供給に Index を使い、glyph 描画で run() /
-// runCff2() を呼ぶ。run() は CFF1 Type2、runCff2() は CFF2（blend/vsindex・width 無し）。
+// The CFF container (cff.zig) uses Index to parse each INDEX and supply subrs; glyph drawing calls run() /
+// runCff2(). run() is CFF1 Type2; runCff2() is CFF2 (blend/vsindex; no width).
 //
-// ホットパス宣言: charstring 解釈は **ラスタキャッシュミス時のみ**。
+// Hot-path note: charstring interpretation runs only on raster cache miss.
 //
-// 制限（受け入れ済み）: arithmetic/logical/storage/conditional の 12xx は非対応(Unsupported)。
-// flex 系(12 34-37)は対応。seac / Type1 charstring は非対応。CFF1 width は消費のみ(advance は hmtx)。
+// Accepted limits: arithmetic/logical/storage/conditional 12xx ops are unsupported (Unsupported).
+// Flex family (12 34-37) is supported. seac / Type1 charstrings are unsupported. CFF1 width is consumed only (advance from hmtx).
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -20,18 +20,18 @@ const max_stack = 48;
 const max_stack_cff2 = 513;
 const max_depth = 10;
 const max_stems = 96;
-const max_steps = 1 << 20; // 暴走防止（総オペレータ実行数）
-const max_regions = 64; // blend 用 region scalar 上限
+const max_steps = 1 << 20; // Runaway guard (total operator execution count)
+const max_regions = 64; // Upper bound on blend region scalars
 
-/// CFF / CFF2 INDEX。count は CFF1=u16 / CFF2=u32。
-/// offset[count+1](1-based) object-data。
+/// CFF / CFF2 INDEX. count is CFF1=u16 / CFF2=u32.
+/// offset[count+1] (1-based) object data.
 pub const Index = struct {
     data: []const u8,
     count: u32,
     off_size: u8,
-    offsets_start: usize, // offset 配列の先頭
-    obj_base: usize, // offset 値 v → byte (obj_base + v)。すなわち data-1。
-    end: usize, // INDEX の末尾（次の構造の開始）
+    offsets_start: usize, // Start of the offset array
+    obj_base: usize, // Offset value v → byte (obj_base + v). I.e. data-1.
+    end: usize, // End of the INDEX (start of the next structure)
 
     /// CFF1: count(u16) offSize offset[] data
     pub fn parse(data: []const u8, off: usize) Error!Index {
@@ -88,7 +88,7 @@ pub const Index = struct {
         };
     }
 
-    /// entry i のバイト列。範囲外は null。
+    /// Byte slice for entry i. Out of range → null.
     pub fn get(self: Index, i: usize) ?[]const u8 {
         if (i >= self.count) return null;
         const a = readOffset(self.data, self.offsets_start, self.off_size, i);
@@ -107,7 +107,7 @@ fn readOffset(data: []const u8, offsets_start: usize, off_size: u8, i: usize) u3
     return v;
 }
 
-/// subr bias（count に依存）。
+/// subr bias (depends on count).
 pub fn subrBias(count: u32) i32 {
     if (count < 1240) return 107;
     if (count < 33900) return 1131;
@@ -116,7 +116,7 @@ pub fn subrBias(count: u32) i32 {
 
 const Result = enum { normal, returned, ended };
 
-/// CFF2 blend 用コンテキスト（VariationStore + 現在 vsindex + region scalars）。
+/// CFF2 blend context (VariationStore + current vsindex + region scalars).
 pub const BlendState = struct {
     table: []const u8,
     ivs_off: usize,
@@ -155,7 +155,7 @@ const Ctx = struct {
     lbias: i32,
     nominal_width: f64,
     default_width: f64,
-    /// CFF2 モード: width 無し・blend/vsindex・大きめ stack
+    /// CFF2 mode: no width; blend/vsindex; larger stack
     cff2: bool = false,
     blend: ?*BlendState = null,
     norm: []const f32 = &.{},
@@ -191,7 +191,7 @@ const Ctx = struct {
         self.y += dy;
         try self.b.lineTo(self.pt());
     }
-    /// 絶対制御点でなく現在点からの差分 3 組で cubic を引く。
+    /// Draw a cubic from three relative control-point deltas (not absolute).
     fn curveTo(self: *Ctx, dx1: f64, dy1: f64, dx2: f64, dy2: f64, dx3: f64, dy3: f64) Error!void {
         const c1x = self.x + dx1;
         const c1y = self.y + dy1;
@@ -202,17 +202,17 @@ const Ctx = struct {
         try self.b.cubicTo(.{ .x = @floatCast(c1x), .y = @floatCast(c1y) }, .{ .x = @floatCast(c2x), .y = @floatCast(c2y) }, self.pt());
     }
 
-    /// 最初の stack-clearing オペレータで width を消費する（advance は hmtx 優先なので値は捨てる）。
-    /// even_args=true: 引数が偶数想定（rmoveto 等）/ false: 奇数想定（hmoveto/vmoveto/endchar 等は別途）。
-    /// 引数個数 expected を渡し、sp が expected+1 なら先頭を width として除去。
+    /// Consume width on the first stack-clearing operator (advance prefers hmtx, so the value is discarded).
+    /// even_args=true: even arg count expected (rmoveto etc.) / false: odd expected (hmoveto/vmoveto/endchar handled separately).
+    /// Pass expected arg count; if sp is expected+1, drop the leading width.
     fn maybeWidth(self: *Ctx, expected_parity_odd: bool) void {
         if (self.width_parsed) return;
         self.width_parsed = true;
         const odd = (self.sp % 2) == 1;
-        // expected_parity_odd: 引数本来が奇数個か（hmoveto/vmoveto=1, endchar=0, stem=偶数）。
-        // 「実引数が想定より 1 多い（先頭が width）」を parity で検出する。
+        // expected_parity_odd: whether args are inherently odd (hmoveto/vmoveto=1, endchar=0, stem=even).
+        // Detect "one more real arg than expected (leading width)" via parity.
         if (odd != expected_parity_odd) {
-            // 先頭を width として落とす
+            // Drop leading width
             shiftLeft(self);
         }
     }
@@ -229,7 +229,7 @@ fn shiftLeft(self: *Ctx) void {
     self.sp -= 1;
 }
 
-/// CFF1 Type2 charstring を実行し Builder へパスを発行する。
+/// Execute a CFF1 Type2 charstring and emit path into Builder.
 pub fn run(
     b: *outline.Builder,
     code: []const u8,
@@ -252,7 +252,7 @@ pub fn run(
     _ = try exec(&ctx, code, 0);
 }
 
-/// CFF2 charstring（width 無し・blend/vsindex）。blend_state=null なら blend は InvalidFont。
+/// CFF2 charstring (no width; blend/vsindex). If blend_state=null, blend is InvalidFont.
 pub fn runCff2(
     b: *outline.Builder,
     code: []const u8,
@@ -273,7 +273,7 @@ pub fn runCff2(
         .blend = blend_state,
         .norm = norm,
         .stack_limit = max_stack_cff2,
-        .width_parsed = true, // width 無し
+        .width_parsed = true, // No width
     };
     _ = try exec(&ctx, code, 0);
 }
@@ -288,7 +288,7 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
         i += 1;
 
         if (b0 >= 32 or b0 == 28 or (ctx.cff2 and b0 == 255)) {
-            // operand（数値）。CFF2 は Fixed (255) も可。
+            // Operand (numeric). CFF2 also allows Fixed (255).
             const v = try readOperand(code, &i, b0);
             try ctx.push(v);
             continue;
@@ -296,26 +296,26 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
 
         switch (b0) {
             1, 3, 18, 23 => { // hstem/vstem/hstemhm/vstemhm
-                ctx.maybeWidth(false); // stem は偶数引数（2*stem）
+                ctx.maybeWidth(false); // stem takes even args (2*stem)
                 addStems(ctx);
                 ctx.clear();
             },
             19, 20 => { // hintmask / cntrmask
                 ctx.maybeWidth(false);
-                addStems(ctx); // mask 直前に残った引数は暗黙 vstemhm
+                addStems(ctx); // Leftover args just before mask imply vstemhm
                 ctx.clear();
                 const nbytes = (ctx.n_stems + 7) / 8;
                 if (i + nbytes > code.len) return error.InvalidFont;
-                i += nbytes; // mask byte を読み飛ばす
+                i += nbytes; // Skip mask bytes
             },
             21 => { // rmoveto
-                ctx.maybeWidth(false); // dx dy = 2 引数（偶数）
+                ctx.maybeWidth(false); // dx dy = 2 args (even)
                 if (ctx.sp != 2) return error.InvalidFont;
                 try ctx.moveTo(ctx.stack[0], ctx.stack[1]);
                 ctx.clear();
             },
             22 => { // hmoveto
-                ctx.maybeWidth(true); // dx = 1 引数（奇数）
+                ctx.maybeWidth(true); // dx = 1 arg (odd)
                 if (ctx.sp != 1) return error.InvalidFont;
                 try ctx.moveTo(ctx.stack[0], 0);
                 ctx.clear();
@@ -332,12 +332,12 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
                 while (j + 2 <= ctx.sp) : (j += 2) try ctx.lineTo(ctx.stack[j], ctx.stack[j + 1]);
                 ctx.clear();
             },
-            6 => { // hlineto（H 始まり交互）
+            6 => { // hlineto (H-leading alternating)
                 if (ctx.sp == 0) return error.InvalidFont;
                 try altLineto(ctx, true);
                 ctx.clear();
             },
-            7 => { // vlineto（V 始まり交互）
+            7 => { // vlineto (V-leading alternating)
                 if (ctx.sp == 0) return error.InvalidFont;
                 try altLineto(ctx, false);
                 ctx.clear();
@@ -394,12 +394,12 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
                 }
                 ctx.clear();
             },
-            30 => { // vhcurveto（V 始まり交互）
+            30 => { // vhcurveto (V-leading alternating)
                 if (ctx.sp < 4 or ctx.sp % 4 > 1) return error.InvalidFont;
                 try altCurveto(ctx, false);
                 ctx.clear();
             },
-            31 => { // hvcurveto（H 始まり交互）
+            31 => { // hvcurveto (H-leading alternating)
                 if (ctx.sp < 4 or ctx.sp % 4 > 1) return error.InvalidFont;
                 try altCurveto(ctx, true);
                 ctx.clear();
@@ -421,10 +421,10 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
                 if (r == .ended) return .ended;
             },
             11 => { // return
-                if (depth == 0) return error.InvalidFont; // top-level return は不正
+                if (depth == 0) return error.InvalidFont; // top-level return is invalid
                 return .returned;
             },
-            14 => { // endchar（CFF1）。CFF2 では未使用だが来たら終了。
+            14 => { // endchar (CFF1). Unused in CFF2, but terminate if seen.
                 if (!ctx.cff2) {
                     ctx.maybeWidth(false);
                     if (ctx.sp == 4) return error.Unsupported; // seac
@@ -445,7 +445,7 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
                 if (!ctx.cff2) return error.Unsupported;
                 try doBlend(ctx);
             },
-            12 => { // escape（2 byte op）
+            12 => { // escape (2-byte op)
                 if (i >= code.len) return error.InvalidFont;
                 const b1 = code[i];
                 i += 1;
@@ -454,7 +454,7 @@ fn exec(ctx: *Ctx, code: []const u8, depth: u32) Error!Result {
                     35 => try flex(ctx),
                     36 => try hflex1(ctx),
                     37 => try flex1(ctx),
-                    else => return error.Unsupported, // arithmetic/logical/storage 等
+                    else => return error.Unsupported, // arithmetic/logical/storage etc.
                 }
                 ctx.clear();
             },
@@ -493,7 +493,7 @@ fn doBlend(ctx: *Ctx) Error!void {
 
 fn addStems(ctx: *Ctx) void {
     ctx.n_stems += @intCast(ctx.sp / 2);
-    if (ctx.n_stems > max_stems) ctx.n_stems = max_stems; // 上限クランプ（mask byte 数は (n+7)/8）
+    if (ctx.n_stems > max_stems) ctx.n_stems = max_stems; // Clamp upper bound (mask byte count is (n+7)/8)
 }
 
 fn subrAt(idx_set: Index, idx: i64) ?[]const u8 {
@@ -517,10 +517,10 @@ fn altCurveto(ctx: *Ctx, start_horizontal: bool) Error!void {
         const rem = ctx.sp - j;
         const extra: f64 = if (rem == 5) ctx.stack[j + 4] else 0;
         if (horiz) {
-            // H 始まり: c1=(dx,0) c2=(dxb,dyb) end=(extra, dyc)
+            // H-leading: c1=(dx,0) c2=(dxb,dyb) end=(extra, dyc)
             try ctx.curveTo(ctx.stack[j], 0, ctx.stack[j + 1], ctx.stack[j + 2], extra, ctx.stack[j + 3]);
         } else {
-            // V 始まり: c1=(0,dy) c2=(dxb,dyb) end=(dxc, extra)
+            // V-leading: c1=(0,dy) c2=(dxb,dyb) end=(dxc, extra)
             try ctx.curveTo(0, ctx.stack[j], ctx.stack[j + 1], ctx.stack[j + 2], ctx.stack[j + 3], extra);
         }
         j += if (rem == 5) 5 else 4;
@@ -528,25 +528,25 @@ fn altCurveto(ctx: *Ctx, start_horizontal: bool) Error!void {
     }
 }
 
-// flex 系（cubic 2 本に展開）
+// Flex family (expand to two cubics)
 fn flex(ctx: *Ctx) Error!void {
     if (ctx.sp != 13) return error.InvalidFont;
     const s = ctx.stack;
     try ctx.curveTo(s[0], s[1], s[2], s[3], s[4], s[5]);
     try ctx.curveTo(s[6], s[7], s[8], s[9], s[10], s[11]);
-    // s[12] = fd（flex depth）無視
+    // s[12] = fd (flex depth); ignored
 }
 fn hflex(ctx: *Ctx) Error!void {
     if (ctx.sp != 7) return error.InvalidFont;
     const s = ctx.stack;
-    // 第1: (dx1,0)(dx2,dy2)(dx3,0) / 第2: (dx4,0)(dx5,-dy2)(dx6,0)
+    // 1st: (dx1,0)(dx2,dy2)(dx3,0) / 2nd: (dx4,0)(dx5,-dy2)(dx6,0)
     try ctx.curveTo(s[0], 0, s[1], s[2], s[3], 0);
     try ctx.curveTo(s[4], 0, s[5], -s[2], s[6], 0);
 }
 fn hflex1(ctx: *Ctx) Error!void {
     if (ctx.sp != 9) return error.InvalidFont;
     const s = ctx.stack;
-    // 第1: (dx1,dy1)(dx2,dy2)(dx3,0) / 第2: (dx4,0)(dx5,dy5)(dx6, -(dy1+dy2+dy5))
+    // 1st: (dx1,dy1)(dx2,dy2)(dx3,0) / 2nd: (dx4,0)(dx5,dy5)(dx6, -(dy1+dy2+dy5))
     try ctx.curveTo(s[0], s[1], s[2], s[3], s[4], 0);
     try ctx.curveTo(s[5], 0, s[6], s[7], s[8], -(s[1] + s[3] + s[7]));
 }
@@ -563,7 +563,7 @@ fn flex1(ctx: *Ctx) Error!void {
     }
 }
 
-/// Type2 / CFF2 operand を読む（b0 は先頭バイト、i は b0 の次を指す）。
+/// Read a Type2 / CFF2 operand (b0 is the first byte; i points just after b0).
 fn readOperand(code: []const u8, i: *usize, b0: u8) Error!f64 {
     if (b0 == 28) {
         if (i.* + 2 > code.len) return error.InvalidFont;
@@ -596,7 +596,7 @@ fn readOperand(code: []const u8, i: *usize, b0: u8) Error!f64 {
         i.* += 1;
         return @floatFromInt(-(@as(i32, b0) - 251) * 256 - @as(i32, b1) - 108);
     }
-    // 255: 16.16 固定小数
+    // 255: 16.16 fixed-point
     if (i.* + 4 > code.len) return error.InvalidFont;
     const raw: i32 = @bitCast((@as(u32, code[i.*]) << 24) | (@as(u32, code[i.* + 1]) << 16) | (@as(u32, code[i.* + 2]) << 8) | code[i.* + 3]);
     i.* += 4;
@@ -611,7 +611,7 @@ const testing = std.testing;
 
 const empty_index = Index{ .data = &[_]u8{}, .count = 0, .off_size = 0, .offsets_start = 0, .obj_base = 0, .end = 0 };
 
-/// charstring を実行して Outline を得る（テスト用）。
+/// Run a charstring and obtain an Outline (for tests).
 fn runToOutline(a: std.mem.Allocator, code: []const u8) !outline.Outline {
     var b = outline.Builder.init(a);
     errdefer b.deinit();
@@ -619,12 +619,12 @@ fn runToOutline(a: std.mem.Allocator, code: []const u8) !outline.Outline {
     return b.finish();
 }
 
-// 整数 operand（32..246 は b0-139）。例: 値 v (|v|<=107) → byte (v+139)。
+// Integer operand (32..246 is b0-139). E.g. value v (|v|<=107) → byte (v+139).
 fn op8(v: i32) u8 {
     return @intCast(v + 139);
 }
 
-test "charstring: rmoveto + rlineto で三角形（直線）" {
+test "charstring: triangle via rmoveto + rlineto (lines)" {
     const a = testing.allocator;
     // rmoveto 10 10 ; rlineto 40 0 ; rlineto -20 40 ; endchar
     const code = [_]u8{ op8(10), op8(10), 21, op8(40), op8(0), 5, op8(-20), op8(40), 5, 14 };
@@ -634,13 +634,13 @@ test "charstring: rmoveto + rlineto で三角形（直線）" {
     const c = o.contours[0];
     try testing.expectEqual(@as(f32, 10), c.start.x);
     try testing.expectEqual(@as(f32, 10), c.start.y);
-    try testing.expectEqual(@as(usize, 2), c.segments.len); // 2 lineTo（閉路は rasterizer 側）
+    try testing.expectEqual(@as(usize, 2), c.segments.len); // 2 lineTo (closure is on the rasterizer side)
     try testing.expectEqual(@as(f32, 50), c.segments[0].line.x); // 10+40
     try testing.expectEqual(@as(f32, 30), c.segments[1].line.x); // 50-20
     try testing.expectEqual(@as(f32, 50), c.segments[1].line.y); // 10+40
 }
 
-test "charstring: rrcurveto は cubic を生成" {
+test "charstring: rrcurveto produces a cubic" {
     const a = testing.allocator;
     // rmoveto 0 0 ; rrcurveto 10 20 10 20 10 -20 ; endchar
     const code = [_]u8{ op8(0), op8(0), 21, op8(10), op8(20), op8(10), op8(20), op8(10), op8(-20), 8, 14 };
@@ -654,7 +654,7 @@ test "charstring: rrcurveto は cubic を生成" {
     try testing.expectEqual(@as(f32, 30), c.segments[0].cubic.end.x); // 20+10
 }
 
-test "charstring: hlineto の交互（H,V,H）" {
+test "charstring: hlineto alternation (H,V,H)" {
     const a = testing.allocator;
     // rmoveto 0 0 ; hlineto 10 20 30 ; endchar  → H:+10, V:+20, H:+30
     const code = [_]u8{ op8(0), op8(0), 21, op8(10), op8(20), op8(30), 6, 14 };
@@ -664,12 +664,12 @@ test "charstring: hlineto の交互（H,V,H）" {
     try testing.expectEqual(@as(usize, 3), c.segments.len);
     try testing.expectEqual(@as(f32, 10), c.segments[0].line.x); // H
     try testing.expectEqual(@as(f32, 0), c.segments[0].line.y);
-    try testing.expectEqual(@as(f32, 10), c.segments[1].line.x); // V（x 不変）
+    try testing.expectEqual(@as(f32, 10), c.segments[1].line.x); // V (x unchanged)
     try testing.expectEqual(@as(f32, 20), c.segments[1].line.y);
     try testing.expectEqual(@as(f32, 40), c.segments[2].line.x); // H +30
 }
 
-test "charstring: vvcurveto の先頭 dx1（odd arg）" {
+test "charstring: vvcurveto leading dx1 (odd arg)" {
     const a = testing.allocator;
     // rmoveto 0 0 ; vvcurveto 5 10 10 10 10 (dx1=5, dya=10 dxb=10 dyb=10 dyc=10) ; endchar
     const code = [_]u8{ op8(0), op8(0), 21, op8(5), op8(10), op8(10), op8(10), op8(10), 26, 14 };
@@ -682,11 +682,11 @@ test "charstring: vvcurveto の先頭 dx1（odd arg）" {
     try testing.expectEqual(@as(f32, 10), c.segments[0].cubic.c1.y);
 }
 
-test "charstring: callsubr / return（local subr）" {
+test "charstring: callsubr / return (local subr)" {
     const a = testing.allocator;
     // local subr 0: rlineto 40 0 ; return
     const sub0 = [_]u8{ op8(40), op8(0), 5, 11 };
-    // INDEX を手書き（count=1, offSize=1, offsets=[1, 1+len], data=sub0）
+    // Hand-written INDEX (count=1, offSize=1, offsets=[1, 1+len], data=sub0)
     var idx_bytes: std.ArrayList(u8) = .empty;
     defer idx_bytes.deinit(a);
     try idx_bytes.append(a, 0);
@@ -698,7 +698,7 @@ test "charstring: callsubr / return（local subr）" {
     const lsubrs = try Index.parse(idx_bytes.items, 0);
 
     // main: rmoveto 0 0 ; callsubr (bias 107 → index for subr 0 = -107) ; endchar
-    // subr 0 を呼ぶには operand = 0 - bias = -107
+    // To call subr 0, operand = 0 - bias = -107
     const code = [_]u8{ op8(0), op8(0), 21, op8(-107), 10, 14 };
 
     var bld = outline.Builder.init(a);
@@ -708,12 +708,12 @@ test "charstring: callsubr / return（local subr）" {
     defer o.deinit(a);
     const c = o.contours[0];
     try testing.expectEqual(@as(usize, 1), c.segments.len);
-    try testing.expectEqual(@as(f32, 40), c.segments[0].line.x); // subr 内の rlineto
+    try testing.expectEqual(@as(f32, 40), c.segments[0].line.x); // rlineto inside the subr
 }
 
-test "charstring: hintmask は (numStems+7)/8 byte を読み飛ばす" {
+test "charstring: hintmask skips (numStems+7)/8 bytes" {
     const a = testing.allocator;
-    // hstem で 2 stem（4 引数）→ numStems=2 → mask 1 byte。
+    // hstem with 2 stems (4 args) → numStems=2 → mask 1 byte.
     // 100 200 100 200 hstemhm ; hintmask <1byte> ; rmoveto 0 0 ; rlineto 10 0 ; endchar
     const code = [_]u8{
         op8(100), op8(100), op8(100), op8(100), 18, // hstemhm (2 stems)
@@ -725,38 +725,38 @@ test "charstring: hintmask は (numStems+7)/8 byte を読み飛ばす" {
     var o = try runToOutline(a, &code);
     defer o.deinit(a);
     const c = o.contours[0];
-    try testing.expectEqual(@as(f32, 10), c.segments[0].line.x); // mask byte が正しく skip され rlineto に到達
+    try testing.expectEqual(@as(f32, 10), c.segments[0].line.x); // Mask byte is skipped correctly and execution reaches rlineto
 }
 
-test "charstring: 不正引数個数は InvalidFont（余剰引数を黙殺しない）" {
+test "charstring: wrong arity is InvalidFont (surplus args not ignored)" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     defer b.deinit();
-    // rmoveto 0 0 ; rrcurveto に 5 引数（6 の倍数でない）→ InvalidFont
+    // rmoveto 0 0 ; rrcurveto with 5 args (not a multiple of 6) → InvalidFont
     const bad = [_]u8{ op8(0), op8(0), 21, op8(1), op8(1), op8(1), op8(1), op8(1), 8 };
     try testing.expectError(error.InvalidFont, run(&b, &bad, empty_index, empty_index, 0, 0));
 
     var b2 = outline.Builder.init(a);
     defer b2.deinit();
-    // hvcurveto に 6 引数（4n / 4n+1 でない）→ InvalidFont
+    // hvcurveto with 6 args (not 4n / 4n+1) → InvalidFont
     const bad2 = [_]u8{ op8(0), op8(0), 21, op8(1), op8(1), op8(1), op8(1), op8(1), op8(1), 31 };
     try testing.expectError(error.InvalidFont, run(&b2, &bad2, empty_index, empty_index, 0, 0));
 
     var b3 = outline.Builder.init(a);
     defer b3.deinit();
-    // rcurveline に 3 引数（< 8）→ underflow せず InvalidFont
+    // rcurveline with 3 args (< 8) → InvalidFont without underflow
     const bad3 = [_]u8{ op8(0), op8(0), 21, op8(1), op8(1), op8(1), 24 };
     try testing.expectError(error.InvalidFont, run(&b3, &bad3, empty_index, empty_index, 0, 0));
 }
 
-test "charstring: top-level return は InvalidFont" {
+test "charstring: top-level return is InvalidFont" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     defer b.deinit();
     try testing.expectError(error.InvalidFont, run(&b, &[_]u8{11}, empty_index, empty_index, 0, 0));
 }
 
-test "charstring: 非対応 12xx（add）は Unsupported" {
+test "charstring: unsupported 12xx (add) is Unsupported" {
     const a = testing.allocator;
     var b = outline.Builder.init(a);
     defer b.deinit();
@@ -764,17 +764,17 @@ test "charstring: 非対応 12xx（add）は Unsupported" {
     try testing.expectError(error.Unsupported, run(&b, &[_]u8{ op8(1), op8(2), 12, 10 }, empty_index, empty_index, 0, 0));
 }
 
-test "charstring: 28(int16) と 255(16.16) operand" {
+test "charstring: 28(int16) and 255(16.16) operands" {
     const a = testing.allocator;
     // rmoveto (28 0x01 0x00 = 256) (28 0x00 0x0A = 10) ; endchar
     const code = [_]u8{ 28, 0x01, 0x00, 28, 0x00, 0x0A, 21, 14 };
     var o = try runToOutline(a, &code);
     defer o.deinit(a);
-    // 退化 contour（move のみ）は捨てられるので contour 0。start は確認できないが trap しないこと。
+    // Degenerate contour (move only) is dropped so contour count is 0. start cannot be checked, but must not trap.
     try testing.expectEqual(@as(usize, 0), o.contours.len);
 }
 
-test "Index: parse と get" {
+test "Index: parse and get" {
     const a = testing.allocator;
     _ = a;
     // count=2, offSize=1, offsets=[1,3,5], data="AB","CD"
@@ -787,7 +787,7 @@ test "Index: parse と get" {
     try testing.expectEqual(@as(usize, 10), idx.end);
 }
 
-test "Index: offset[0]!=1 は InvalidFont" {
+test "Index: offset[0]!=1 is InvalidFont" {
     const bytes = [_]u8{ 0, 1, 1, 0, 2, 'A' }; // offset[0]=0
     try testing.expectError(error.InvalidFont, Index.parse(&bytes, 0));
 }

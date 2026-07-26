@@ -1,14 +1,14 @@
-// text_layer: 文字列を新規オフスクリーン透明 RGBA レイヤーへラスタライズするヘルパー（TASK-79.4）。
+// text_layer: helper that rasterizes a string into a new offscreen transparent RGBA layer.
 //
-// `OutlineFont.drawToStraight` の薄いラッパー。1行ラン前提（Font 契約と同じく `\n` 非対応。
-// 複数行は上位責務で分割して呼ぶこと）。返す `TextLayer.pixels` は straight alpha の
-// canonical BGRA（`RenderTarget` と同じ形式）で、呼び出し側が `TextLayer.deinit` で解放する。
+// Thin wrapper around `OutlineFont.drawToStraight`. Single-line runs only (same as the Font contract: LF is unsupported.
+// Split multi-line text upstream before calling). Returned `TextLayer.pixels` is straight-alpha
+// canonical BGRA (same layout as `RenderTarget`); the caller frees via `TextLayer.deinit`.
 //
-// アセット方針（TASK-79.4）: このモジュールは `assets/PressStart2P-Regular.ttf`（OFL 1.1 ライセンス。
-// `libs/font/LICENSE` 参照）を vendoring し、system フォント読込（examples/12 方式）に依存しない
-// 決定的・headless なテストを提供する。system フォント読込パス自体は examples/12 で引き続き
-// 利用可能（このモジュールは vendoring フォントを「使わなければならない」わけではなく、
-// 任意の `*OutlineFont` を受け取れる）。
+// Asset policy: this module vendors `assets/PressStart2P-Regular.ttf` (OFL 1.1 license;
+// see `libs/font/LICENSE`) and provides deterministic, headless tests that do not depend on
+// system-font loading (examples/12 style). The system-font load path remains available in examples/12
+// (this module does not require the vendored font —
+// it accepts any `*OutlineFont`).
 
 const std = @import("std");
 const font = @import("font.zig");
@@ -20,11 +20,11 @@ const Vec2 = font.Vec2;
 const Color = font.Color;
 const OutlineFont = outline_font.OutlineFont;
 
-/// vendoring した既定フォント（OFL 1.1, Press Start 2P）の生バイト列。
-/// `FontFace.init(defaultFontBytes)` で使う。ライセンス全文は `libs/font/LICENSE`。
+/// Raw bytes of the vendored default font (OFL 1.1, Press Start 2P).
+/// Use with `FontFace.init(defaultFontBytes)`. Full license text is in `libs/font/LICENSE`.
 pub const default_font_bytes = @embedFile("assets/PressStart2P-Regular.ttf");
 
-/// `renderTextLayer` が返すオフスクリーン透明 RGBA レイヤー。
+/// Offscreen transparent RGBA layer returned by `renderTextLayer`.
 pub const TextLayer = struct {
     pixels: []u32,
     width: u32,
@@ -40,14 +40,14 @@ pub const TextLayer = struct {
     }
 };
 
-/// 文字列を新規オフスクリーン透明 RGBA レイヤーへラスタライズする（1行ラン前提。イベント時のみ
-/// 呼ばれる想定 — 文字列確定・編集時。フレーム毎には呼ばない）。
-/// バッファサイズは `width = max(1, of.measure(text))` × `height = max(1, of.metrics().line_height)`
-/// （baseline は `metrics().ascent` 位置。ink bounds ではなく logical advance/line_height 基準）。
-/// all-zero（透明）で初期化してから `OutlineFont.drawToStraight` で焼く。
-/// 内部で新規の全画素ループは持たない（alloc 1 回 + drawToStraight への委譲のみ。ホットパス実体は
-/// `drawToStraight`→`font.blitCoverageStraight`/`blitRGBAStraight` 側）。
-/// 返す `TextLayer.pixels` は呼び出し側が `TextLayer.deinit(alloc)` で解放する。
+/// Rasterize a string into a new offscreen transparent RGBA layer (single-line runs. Intended for
+/// event-time use — when text is committed or edited; not called every frame).
+/// Buffer size is `width = max(1, of.measure(text))` × `height = max(1, of.metrics().line_height)`
+/// (baseline at `metrics().ascent`; logical advance/line_height, not ink bounds).
+/// Initialize all-zero (transparent), then bake with `OutlineFont.drawToStraight`.
+/// Does not introduce its own per-pixel loop (one alloc + delegate to drawToStraight; the hot path lives in
+/// `drawToStraight`→`font.blitCoverageStraight`/`blitRGBAStraight`).
+/// Caller frees returned `TextLayer.pixels` via `TextLayer.deinit(alloc)`.
 pub fn renderTextLayer(alloc: std.mem.Allocator, of: *OutlineFont, text: []const u8, col: Color) std.mem.Allocator.Error!TextLayer {
     const m = of.metrics();
     const w: u32 = @max(1, of.measure(text));
@@ -66,7 +66,7 @@ pub fn renderTextLayer(alloc: std.mem.Allocator, of: *OutlineFont, text: []const
 
 const testing = std.testing;
 
-test "renderTextLayer: 既定 vendoring フォント（Press Start 2P, OFL）で非空文字列が非透明ピクセルを生成する" {
+test "renderTextLayer: default vendored font (Press Start 2P, OFL) yields non-transparent pixels for nonempty text" {
     const face = try outline_font.FontFace.init(default_font_bytes);
     var of = OutlineFont.init(testing.allocator, &face, 16);
     defer of.deinit();
@@ -86,7 +86,7 @@ test "renderTextLayer: 既定 vendoring フォント（Press Start 2P, OFL）で
     try testing.expect(!of.last_oom);
 }
 
-test "renderTextLayer: 任意サイズ（px）で描画できる（小/中/大）" {
+test "renderTextLayer: draws at arbitrary size (px) (small/medium/large)" {
     const face = try outline_font.FontFace.init(default_font_bytes);
     const sizes = [_]f32{ 8, 24, 64 };
     for (sizes) |px| {
@@ -95,12 +95,12 @@ test "renderTextLayer: 任意サイズ（px）で描画できる（小/中/大�
         var layer = try renderTextLayer(testing.allocator, &of, "Ab", Color.rgba(0x10, 0x20, 0x30, 0xFF));
         defer layer.deinit(testing.allocator);
         try testing.expect(layer.width > 0 and layer.height > 0);
-        // 概ね px サイズに比例して大きくなる（line_height はフォント内部の ascent+descent 由来）
+        // Scales roughly with px size (line_height comes from the font's internal ascent+descent)
         try testing.expect(layer.height >= 1);
     }
 }
 
-test "renderTextLayer: 空文字列でも panic せず 1x1 以上のレイヤーを返す（全透明）" {
+test "renderTextLayer: empty string returns ≥1x1 fully transparent layer without panic" {
     const face = try outline_font.FontFace.init(default_font_bytes);
     var of = OutlineFont.init(testing.allocator, &face, 16);
     defer of.deinit();
@@ -112,7 +112,7 @@ test "renderTextLayer: 空文字列でも panic せず 1x1 以上のレイヤー
     for (layer.pixels) |p| try testing.expectEqual(@as(u32, 0x00000000), p);
 }
 
-test "renderTextLayer: TextLayer.asRenderTarget は pixels/width/height をそのまま反映する" {
+test "renderTextLayer: TextLayer.asRenderTarget reflects pixels/width/height as-is" {
     const face = try outline_font.FontFace.init(default_font_bytes);
     var of = OutlineFont.init(testing.allocator, &face, 16);
     defer of.deinit();

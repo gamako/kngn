@@ -1,9 +1,9 @@
-// avar テーブルパーサ（正規化座標の非線形セグメントマップ）。
+// avar table parser (nonlinear segment maps for normalized coordinates).
 //
-// ホットパス宣言: **FontFace.init 時のみ**。軸変更時の mapAxis はイベント時のみ。
+// Hot-path note: **FontFace.init only**. mapAxis on axis change is event-time only.
 //
-// ヘッダ: majorVersion@0 / minorVersion@2 / reserved@4 / axisCount@6、
-// offset 8 から各軸の SegmentMaps が連続配置。
+// Header: majorVersion@0 / minorVersion@2 / reserved@4 / axisCount@6;
+// SegmentMaps for each axis are laid out contiguously from offset 8.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -13,7 +13,7 @@ pub const Error = var_common.Error;
 pub const MAX_AXES = var_common.MAX_AXES;
 pub const f2dot14ToF32 = var_common.f2dot14ToF32;
 
-/// 1 軸あたりのセグメントマップ上限（実装上限。仕様上限ではない。超過は Unsupported）。
+/// Per-axis segment-map cap (implementation limit, not the spec limit; excess → Unsupported).
 const max_segments_per_axis: usize = 32;
 
 const Segment = struct {
@@ -24,11 +24,11 @@ const Segment = struct {
 pub const Avar = struct {
     data: []const u8,
     axis_count: u16,
-    /// 各軸のセグメント（owned 固定配列。segment_counts[i] が有効長）。
+    /// Per-axis segments (owned fixed array; segment_counts[i] is the valid length).
     segments: [MAX_AXES][max_segments_per_axis]Segment,
     segment_counts: [MAX_AXES]u16,
 
-    /// normalized_pre ∈ [-1,1] → avar 後の normalized。
+    /// normalized_pre ∈ [-1,1] → normalized after avar.
     pub fn mapAxis(self: *const Avar, axis_index: u16, n: f32) f32 {
         if (axis_index >= self.axis_count) return n;
         const count = self.segment_counts[axis_index];
@@ -57,7 +57,7 @@ pub const Avar = struct {
         // OpenType avar: 'Axis value maps can be provided for any axis but are required only if
         // the normalization mapping for an axis is being modified. If the segment map for a given
         // axis has any value maps, then it must include at least three value maps...'
-        // positionMapCount==0 は identity（実フォントに普通に存在する正当ケース）。
+        // positionMapCount==0 is identity (a valid case that appears in real fonts).
         if (segs.len == 0) return;
 
         var has_neg1 = false;
@@ -67,7 +67,7 @@ pub const Avar = struct {
         var prev_to: f32 = -2;
 
         for (segs, 0..) |s, si| {
-            // F2DOT14 は量子化済み。from/to は厳密に [-1,1]。
+            // F2DOT14 is already quantized. from/to are strictly in [-1,1].
             if (s.from < -1.0 or s.from > 1.0) return error.InvalidFont;
             if (s.to < -1.0 or s.to > 1.0) return error.InvalidFont;
             if (si > 0 and s.from <= prev_from) return error.InvalidFont;
@@ -88,7 +88,7 @@ pub const Avar = struct {
         const major = try r.u16At(0);
         const minor = try r.u16At(2);
         if (major != 1 or minor != 0) return error.InvalidFont;
-        // reserved@4: fvar の reserved@6 と同方針。読み飛ばしのみ（!=0 でも InvalidFont にしない）。
+        // reserved@4: same policy as fvar reserved@6. Skip only (do not InvalidFont even if !=0).
         _ = try r.u16At(4);
         const axis_count = try r.u16At(6);
         if (axis_count != expected_axes) return error.InvalidFont;
@@ -109,7 +109,7 @@ pub const Avar = struct {
             const seg_bytes = std.math.mul(usize, @as(usize, pos_count), 4) catch return error.InvalidFont;
             try r.require(map_off + 2, seg_bytes);
 
-            // 実装上限超過は「フォント不正」でなく「未対応」（MAX_AXES と同方針）
+            // Exceeding the implementation cap is "unsupported", not "invalid font" (same policy as MAX_AXES)
             if (pos_count > max_segments_per_axis) return error.Unsupported;
 
             var si: u16 = 0;
@@ -154,7 +154,7 @@ fn putI16(buf: []u8, off: usize, v: i16) void {
     putU16(buf, off, @bitCast(v));
 }
 
-/// 1 軸・必須マップ (-1,-1),(0,0),(1,1) + 中間 (0.5,0.75) の正しい avar。
+/// Correct avar for one axis: required maps (-1,-1),(0,0),(1,1) plus midpoint (0.5,0.75).
 fn buildAvar2Segment() [26]u8 {
     var buf: [26]u8 = undefined;
     @memset(&buf, 0);
@@ -162,7 +162,7 @@ fn buildAvar2Segment() [26]u8 {
     putU16(&buf, 2, 0); // minorVersion
     // reserved @4 = 0
     putU16(&buf, 6, 1); // axisCount
-    // SegmentMaps @8（連続配置）
+    // SegmentMaps @8 (contiguous layout)
     putU16(&buf, 8, 4); // positionMapCount
     putI16(&buf, 10, -16384); // from -1 → to -1
     putI16(&buf, 12, -16384);
@@ -175,27 +175,27 @@ fn buildAvar2Segment() [26]u8 {
     return buf;
 }
 
-test "avar: 2 セグメント中間値" {
+test "avar: 2-segment midpoint" {
     const buf = buildAvar2Segment();
     const av = try Avar.parse(&buf, 1);
     try testing.expectApproxEqAbs(@as(f32, 0), av.mapAxis(0, 0), 0.001);
     try testing.expectApproxEqAbs(@as(f32, -0.5), av.mapAxis(0, -0.5), 0.01);
-    // n=0.5: (0,0)〜(0.5,0.75) の区分線形中間
+    // n=0.5: piecewise-linear midpoint between (0,0) and (0.5,0.75)
     try testing.expectApproxEqAbs(@as(f32, 0.375), av.mapAxis(0, 0.25), 0.02);
     try testing.expectApproxEqAbs(@as(f32, 0.75), av.mapAxis(0, 0.5), 0.02);
 }
 
-test "avar: axisCount 不一致は InvalidFont" {
+test "avar: axisCount mismatch is InvalidFont" {
     const buf = buildAvar2Segment();
     try testing.expectError(error.InvalidFont, Avar.parse(&buf, 2));
 }
 
-test "avar: 必須マップ欠落は InvalidFont" {
+test "avar: missing required map is InvalidFont" {
     var buf: [18]u8 = undefined;
     @memset(&buf, 0);
     putU16(&buf, 0, 1);
     putU16(&buf, 6, 1);
-    putU16(&buf, 8, 2); // (-1,-1),(0,0) のみ。+1 欠落
+    putU16(&buf, 8, 2); // Only (-1,-1),(0,0). Missing +1
     putI16(&buf, 10, -16384);
     putI16(&buf, 12, -16384);
     putI16(&buf, 14, 0);
@@ -203,19 +203,19 @@ test "avar: 必須マップ欠落は InvalidFont" {
     try testing.expectError(error.InvalidFont, Avar.parse(&buf, 1));
 }
 
-test "avar: toCoordinate 逆行は InvalidFont" {
+test "avar: non-monotonic toCoordinate is InvalidFont" {
     var buf = buildAvar2Segment();
-    putI16(&buf, 24, 8192); // to at from=1 を 0.5 に（前点 to=0.75 より小さい）→ InvalidFont
+    putI16(&buf, 24, 8192); // to at from=1 set to 0.5 (smaller than previous to=0.75) → InvalidFont
     try testing.expectError(error.InvalidFont, Avar.parse(&buf, 1));
 }
 
-test "avar: 範囲外 from/to は InvalidFont" {
+test "avar: out-of-range from/to is InvalidFont" {
     var buf = buildAvar2Segment();
     putI16(&buf, 10, 20000); // from > 1
     try testing.expectError(error.InvalidFont, Avar.parse(&buf, 1));
 }
 
-test "avar: 空 SegmentMap は identity（受理）" {
+test "avar: empty SegmentMap is identity (accepted)" {
     var buf: [10]u8 = undefined;
     @memset(&buf, 0);
     putU16(&buf, 0, 1);
@@ -226,7 +226,7 @@ test "avar: 空 SegmentMap は identity（受理）" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), av.mapAxis(0, 0.5), 0.001);
 }
 
-test "avar: 端点確認" {
+test "avar: endpoint check" {
     const buf = buildAvar2Segment();
     const av = try Avar.parse(&buf, 1);
     try testing.expectApproxEqAbs(@as(f32, -1), av.mapAxis(0, -1), 0.001);

@@ -1,7 +1,7 @@
-// ItemVariationStore 共有実装（HVAR / CFF2 VariationStore）。
+// Shared ItemVariationStore implementation (HVAR / CFF2 VariationStore).
 //
-// ホットパス宣言: region scalar / itemDelta は **metrics cache ミス or ラスタミス or 軸変更時のみ**。
-// フレーム毎経路には出さない。
+// Hot-path note: region scalar / itemDelta run **only on metrics-cache miss, raster miss, or axis change**.
+// Never on the per-frame path.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -13,7 +13,7 @@ const f2dot14ToF32 = var_common.f2dot14ToF32;
 
 pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 
-/// IVS ヘッダ検証（format / region list / item variation data offsets）。
+/// Validate IVS header (format / region list / item variation data offsets).
 pub fn validateIvs(table: []const u8, ivs_off: usize, axis_count: u16) Error!void {
     const r = Reader{ .data = table };
     try r.require(ivs_off, 8);
@@ -35,7 +35,7 @@ pub fn validateIvs(table: []const u8, ivs_off: usize, axis_count: u16) Error!voi
     try r.require(offsets_off, offsets_bytes);
 }
 
-/// IVS の region list から axisCount を読む（CFF2 で fvar と独立に検証する用）。
+/// Read axisCount from the IVS region list (for CFF2 checks independent of fvar).
 pub fn axisCountFromIvs(table: []const u8, ivs_off: usize) Error!u16 {
     const r = Reader{ .data = table };
     try r.require(ivs_off, 8);
@@ -46,8 +46,8 @@ pub fn axisCountFromIvs(table: []const u8, ivs_off: usize) Error!u16 {
     return try r.u16At(region_abs);
 }
 
-/// ItemVariationData[outer] の各 region について現在の norm での scalar を out に書く。
-/// 戻り値 = region 数 (k)。out は少なくとも regionIndexCount 長。
+/// Write scalars at the current norm for each region of ItemVariationData[outer] into out.
+/// Return value = region count (k). out must be at least regionIndexCount long.
 pub fn regionScalarsForIvd(
     table: []const u8,
     ivs_off: usize,
@@ -74,7 +74,7 @@ pub fn regionScalarsForIvd(
     const region_count = try r.u16At(region_list_abs + 2);
     const ac: usize = axis_count;
 
-    // norm を axis_count にパディング（不足は 0）
+    // Pad norm to axis_count (missing axes are 0)
     var norm_buf: [MAX_AXES]f32 = .{0} ** MAX_AXES;
     if (ac > MAX_AXES) return error.Unsupported;
     const ncopy = @min(norm.len, ac);
@@ -100,7 +100,7 @@ pub fn regionScalarsForIvd(
     return region_index_count;
 }
 
-/// ItemVariationStore から outer/inner のデルタ合計を評価。
+/// Evaluate the outer/inner delta sum from ItemVariationStore.
 pub fn itemDelta(
     table: []const u8,
     ivs_off: usize,

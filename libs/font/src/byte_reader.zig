@@ -1,6 +1,6 @@
-// big-endian 範囲チェック読み取り（sfnt / cmap 等が共有）。
-// セキュリティ上重要な境界チェックをここ 1 箇所に集約する。範囲外は error.InvalidFont。
-// off + size は overflow-safe に判定する（off > len か len - off < n）。
+// Big-endian bounds-checked reads (shared by sfnt / cmap and others).
+// Centralize security-critical boundary checks in one place. Out of range → error.InvalidFont.
+// Judge off + size overflow-safe (off > len or len - off < n).
 
 const std = @import("std");
 
@@ -33,7 +33,7 @@ pub const Reader = struct {
     }
 };
 
-test "Reader: BE 読み取りと範囲チェック" {
+test "Reader: BE reads and bounds checks" {
     const data = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9A };
     const r = Reader{ .data = &data };
     try std.testing.expectEqual(@as(u8, 0x12), try r.u8At(0));
@@ -42,7 +42,7 @@ test "Reader: BE 読み取りと範囲チェック" {
     try std.testing.expectEqual(@as(i16, 0x789A), try r.i16At(3)); // bytes[3..5] = 0x78,0x9A
 }
 
-test "Reader: 範囲外は InvalidFont" {
+test "Reader: out of range is InvalidFont" {
     const data = [_]u8{ 0x00, 0x01 };
     const r = Reader{ .data = &data };
     try std.testing.expectError(error.InvalidFont, r.u32At(0));

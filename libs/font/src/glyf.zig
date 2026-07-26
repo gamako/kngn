@@ -1,7 +1,7 @@
-// glyf / loca パーサ。TrueType グリフ輪郭を共通 Outline 表現へ正規化する。
-// simple グリフ（flags RLE・デルタ座標・implicit on-curve 解決）と composite グリフ
-// （引数・F2Dot14 変換・再帰展開）に対応。ヒンティング命令はスキップ。点マッチング composite は
-// 非対応(error.Unsupported)。すべて byte_reader + table-local slice で範囲チェックする。
+// glyf / loca parser. Normalizes TrueType glyph outlines into the shared Outline representation.
+// Supports simple glyphs (flags RLE, delta coords, implicit on-curve resolution) and composite glyphs
+// (args, F2Dot14 transforms, recursive expansion). Hinting instructions are skipped. Point-matching composites are
+// unsupported (error.Unsupported). All reads are bounds-checked via byte_reader + table-local slices.
 
 const std = @import("std");
 const Reader = @import("byte_reader.zig").Reader;
@@ -16,10 +16,10 @@ const Gvar = gvar_mod.Gvar;
 
 pub const Error = error{ InvalidFont, Unsupported, OutOfMemory };
 
-/// composite 再帰の hard cap（循環・深すぎ・スタック溢れ防止）。
+/// Hard cap on composite recursion (guards cycles, excessive depth, and stack overflow).
 const max_component_depth = 8;
 
-// 2x2 線形変換 + 平行移動。apply(p) = (a*x + c*y + dx, b*x + d*y + dy)。
+// 2x2 linear transform + translation. apply(p) = (a*x + c*y + dx, b*x + d*y + dy).
 const Xform = struct {
     a: f32 = 1,
     b: f32 = 0,
@@ -35,7 +35,7 @@ const Xform = struct {
         };
     }
 
-    // P ∘ C（親 P、子 C）: 合成後.apply(p) = P.apply(C.apply(p))
+    // P ∘ C (parent P, child C): composed.apply(p) = P.apply(C.apply(p))
     fn compose(p: Xform, c: Xform) Xform {
         return .{
             .a = p.a * c.a + p.c * c.b,
@@ -79,7 +79,7 @@ pub const Glyf = struct {
         }
     }
 
-    /// gid のグリフデータ（table-local slice）。空グリフは null。
+    /// Glyph data for gid (table-local slice). Empty glyphs return null.
     fn glyphData(self: *const Glyf, gid: u16) Error!?[]const u8 {
         if (gid >= self.num_glyphs) return error.InvalidFont;
         const off0 = try self.locaAt(gid);
@@ -89,14 +89,14 @@ pub const Glyf = struct {
         return self.glyf[off0..off1];
     }
 
-    /// gid の輪郭を Outline（font units）として返す。空グリフは空 contours。
-    /// 可変無し（gvar 未適用）の default 外形。後方互換。
+    /// Contours for gid as Outline (font units). Empty glyphs yield empty contours.
+    /// Default outline without variation (gvar not applied). Backward compatible.
     pub fn outline(self: *const Glyf, alloc: std.mem.Allocator, gid: u16) Error!Outline {
         return self.outlineVaried(alloc, gid, null, &.{});
     }
 
-    /// 可変対応 outline。gvar が null または norm が空/全 0 なら default 外形と bit 一致。
-    /// composite は component index の仮想点として offset のみ変分（scale/2x2 は不変）。
+    /// Variation-aware outline. Bit-identical to the default outline when gvar is null or norm is empty/all zeros.
+    /// For composites, only offset varies (virtual points at component indices); scale/2x2 stay fixed.
     pub fn outlineVaried(
         self: *const Glyf,
         alloc: std.mem.Allocator,
@@ -110,8 +110,8 @@ pub const Glyf = struct {
         return try b.finish();
     }
 
-    /// phantom 経路用: simple の点数と座標・endPts を返す（composite/空は null）。
-    /// 呼び出し側が pts/end_pts を free。
+    /// For phantom path: returns simple point count, coords, and endPts (null for composite/empty).
+    /// Caller frees pts/end_pts.
     pub fn parseSimpleGeometry(
         self: *const Glyf,
         alloc: std.mem.Allocator,
@@ -130,7 +130,7 @@ pub const Glyf = struct {
             alloc.free(parsed.end_pts);
             return null;
         }
-        // flags は不要。pts の on は捨てて Vec2f だけ返す
+        // flags are unused. Drop on-curve from pts; return Vec2f only
         const coords = try alloc.alloc(Vec2f, parsed.pts.len);
         errdefer alloc.free(coords);
         for (parsed.pts, 0..) |pt, i| coords[i] = pt.p;
@@ -138,11 +138,11 @@ pub const Glyf = struct {
         return .{ .pts = coords, .end_pts = parsed.end_pts };
     }
 
-    /// composite の構造情報（metrics / phantom 用）。simple・空は null。
-    /// 点マッチ（非 XY）は Unsupported。
+    /// Composite structure info (for metrics / phantom). null for simple or empty.
+    /// Point matching (non-XY) is Unsupported.
     pub const CompositeInfo = struct {
         component_count: u16,
-        /// 最後に現れた USE_MY_METRICS component の gid。無ければ null。
+        /// GID of the last USE_MY_METRICS component encountered, or null if none.
         use_my_metrics_gid: ?u16,
     };
 
@@ -177,9 +177,9 @@ pub const Glyf = struct {
             } else if (flags & 0x0080 != 0) {
                 p += 8; // TWO_BY_TWO
             }
-            if (flags & 0x0200 != 0) use_my = comp_gid; // USE_MY_METRICS（後勝ち）
+            if (flags & 0x0200 != 0) use_my = comp_gid; // USE_MY_METRICS (last wins)
             count += 1;
-            if (flags & 0x0020 == 0) break; // MORE_COMPONENTS なし
+            if (flags & 0x0020 == 0) break; // no MORE_COMPONENTS
         }
         return .{ .component_count = count, .use_my_metrics_gid = use_my };
     }
@@ -194,7 +194,7 @@ pub const Glyf = struct {
         norm: []const f32,
     ) Error!void {
         if (depth > max_component_depth) return error.InvalidFont;
-        const data = (try self.glyphData(gid)) orelse return; // 空グリフ
+        const data = (try self.glyphData(gid)) orelse return; // empty glyph
         const r = Reader{ .data = data };
         const num_contours = try r.i16At(0);
         if (num_contours >= 0) {
@@ -204,7 +204,7 @@ pub const Glyf = struct {
         }
     }
 
-    /// composite 成分エントリ（gvar offset デルタ適用前の生値）。
+    /// Composite component entry (raw values before gvar offset deltas).
     const CompEntry = struct {
         flags: u16,
         gid: u16,
@@ -230,7 +230,7 @@ pub const Glyf = struct {
         const r = Reader{ .data = data };
         try r.require(0, 10);
 
-        // 1st pass: 全 component をパース（gvar 適用に component_count が必要）
+        // 1st pass: parse all components (gvar needs component_count)
         var comps: std.ArrayList(CompEntry) = .empty;
         defer comps.deinit(alloc);
         var p: usize = 10;
@@ -293,7 +293,7 @@ pub const Glyf = struct {
         }
 
         const n_comp = comps.items.len;
-        // gvar: component index の仮想点。offset のみ加算。IUP なし。
+        // gvar: virtual points at component indices. Add offsets only. No IUP.
         var deltas: ?[]Vec2f = null;
         defer if (deltas) |d| alloc.free(d);
         if (gvar) |gv| {
@@ -305,17 +305,17 @@ pub const Glyf = struct {
             }
         }
 
-        // 2nd pass: デルタ適用後に offset scaling → 再帰
+        // 2nd pass: after deltas, offset scaling then recurse
         for (comps.items, 0..) |entry, i| {
             var dx = entry.dx;
             var dy = entry.dy;
-            // ARGS_ARE_XY_VALUES のみここまで到達。gvar デルタを offset に加算（scale/2x2 は不変）。
+            // Only ARGS_ARE_XY_VALUES reaches here. Add gvar deltas to offset (scale/2x2 unchanged).
             if (deltas) |d| {
                 dx += d[i].x;
                 dy += d[i].y;
             }
             var comp = Xform{ .a = entry.a, .b = entry.b, .c = entry.c, .d = entry.d, .dx = dx, .dy = dy };
-            // offset スケーリング: デルタ適用後の offset に既存 SCALED_COMPONENT_OFFSET 規則。
+            // Offset scaling: apply existing SCALED_COMPONENT_OFFSET rules to the post-delta offset.
             if (entry.flags & 0x0800 != 0 and entry.flags & 0x1000 == 0) {
                 const odx = comp.a * dx + comp.c * dy;
                 const ody = comp.b * dx + comp.d * dy;
@@ -331,7 +331,7 @@ fn alloc_of(b: *Builder) std.mem.Allocator {
     return b.alloc;
 }
 
-// ── simple グリフ ─────────────────────────────────────────
+// ── simple glyphs ─────────────────────────────────────────
 
 const Pt = struct { p: Vec2f, on: bool };
 
@@ -341,7 +341,7 @@ const ParsedSimple = struct {
     flags: []u8,
 };
 
-/// simple 点列を復元（flags RLE + x/y デルタ）。呼び出し側が全 slice を free。
+/// Reconstruct simple point stream (flags RLE + x/y deltas). Caller frees all slices.
 fn parseSimplePoints(alloc: std.mem.Allocator, data: []const u8, num_contours: u16) Error!ParsedSimple {
     const r = Reader{ .data = data };
     try r.require(0, 10);
@@ -450,7 +450,7 @@ fn appendSimple(
     }
     if (parsed.pts.len == 0) return;
 
-    // gvar 適用（font units 点空間・buildContour 前）
+    // Apply gvar (font-unit point space, before buildContour)
     if (gvar) |gv| {
         if (norm.len >= gv.axis_count and gv.axis_count > 0) {
             const n = parsed.pts.len;
@@ -481,31 +481,31 @@ fn mid(a: Vec2f, b: Vec2f) Vec2f {
     return .{ .x = (a.x + b.x) * 0.5, .y = (a.y + b.y) * 0.5 };
 }
 
-/// 1 contour（点の循環列）を implicit on-curve 解決して Builder へ。xform は emit 時に適用。
+/// One contour (cyclic point sequence) with implicit on-curve resolution into Builder; xform applied at emit.
 fn buildContour(b: *Builder, pts: []const Pt, xform: Xform) Error!void {
     const n = pts.len;
-    if (n < 2) return; // 0/1 点の退化 contour は捨てる（輪郭を成さない）
+    if (n < 2) return; // Drop degenerate 0/1-point contours (not a real outline)
 
-    // 開始 on-curve 点と、処理順の決定。
+    // Choose the starting on-curve point and processing order.
     var start: Vec2f = undefined;
-    var seq_first: usize = 0; // pts のうち start の次から処理する開始 index（循環）
+    var seq_first: usize = 0; // Start index in pts after start (cyclic)
     if (pts[0].on) {
         start = pts[0].p;
         seq_first = 1;
     } else if (pts[n - 1].on) {
         start = pts[n - 1].p;
-        seq_first = 0; // pts[0]..pts[n-2] を処理（pts[n-1] は start）
+        seq_first = 0; // Process pts[0]..pts[n-2] (pts[n-1] is start)
     } else {
-        start = mid(pts[0].p, pts[n - 1].p); // 合成始点
+        start = mid(pts[0].p, pts[n - 1].p); // Synthesized start point
         seq_first = 0;
     }
 
     try b.moveTo(xform.apply(start));
 
-    var pending: ?Vec2f = null; // 未処理の off-curve 制御点（pre-xform）
-    // 処理する点列を循環で回す。pts[0].on のときは seq_first=1 で pts[1..n-1] + 末尾 close。
-    // それ以外は pts[0..n-1]（pts[n-1] が on の場合は最後の点は start なので除外したいが、
-    // n-1 が on の場合 start=pts[n-1] なので処理対象は pts[0..n-2]）。
+    var pending: ?Vec2f = null; // Pending off-curve control point (pre-xform)
+    // Walk the cyclic point sequence. When pts[0].on, seq_first=1 so process pts[1..n-1] then close at end.
+    // Otherwise process pts[0..n-1] (when pts[n-1] is on it is start, so exclude it:
+    // if n-1 is on then start=pts[n-1] and the range is pts[0..n-2]).
     const count: usize = if (pts[0].on) n - 1 else if (pts[n - 1].on) n - 1 else n;
     var k: usize = 0;
     while (k < count) : (k += 1) {
@@ -528,7 +528,7 @@ fn buildContour(b: *Builder, pts: []const Pt, xform: Xform) Error!void {
             }
         }
     }
-    // start へ閉じる
+    // Close back to start
     if (pending) |c| {
         try b.quadTo(xform.apply(c), xform.apply(start));
     } else {
@@ -547,7 +547,7 @@ fn putU16(buf: []u8, off: usize, v: u16) void {
     buf[off + 1] = @truncate(v);
 }
 
-/// 全点 2-byte デルタ・明示フラグで simple グリフを組む。contours は各 contour の点列。
+/// Build a simple glyph with all 2-byte deltas and explicit flags. contours is the point list per contour.
 fn buildSimpleGlyph(alloc: std.mem.Allocator, contours: []const []const Pt) ![]u8 {
     var num_points: usize = 0;
     for (contours) |c| num_points += c.len;
@@ -564,11 +564,11 @@ fn buildSimpleGlyph(alloc: std.mem.Allocator, contours: []const []const Pt) ![]u
         try appendU16(&out, alloc, @intCast(acc));
     }
     try appendU16(&out, alloc, 0); // instructionLength
-    // flags: on-curve bit のみ（全点 2-byte デルタ → bit1/bit2/bit4/bit5 = 0）
+    // flags: on-curve bit only (all 2-byte deltas → bit1/bit2/bit4/bit5 = 0)
     for (contours) |c| for (c) |pt| {
         try out.append(alloc, if (pt.on) @as(u8, 0x01) else 0x00);
     };
-    // x deltas（2-byte）
+    // x deltas (2-byte)
     var px: i32 = 0;
     for (contours) |c| for (c) |pt| {
         const xi: i32 = @intFromFloat(pt.p.x);
@@ -582,7 +582,7 @@ fn buildSimpleGlyph(alloc: std.mem.Allocator, contours: []const []const Pt) ![]u
         try appendI16(&out, alloc, @intCast(yi - py));
         py = yi;
     };
-    if (out.items.len % 2 != 0) try out.append(alloc, 0); // 偶数長（short loca 用）
+    if (out.items.len % 2 != 0) try out.append(alloc, 0); // Even length (for short loca)
     return out.toOwnedSlice(alloc);
 }
 
@@ -600,7 +600,7 @@ fn appendI16(list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: i16) !void {
     try appendU16(list, alloc, @bitCast(v));
 }
 
-/// glyph blob 群から glyf + loca(short) を組み、Glyf を返す。呼び出し側が glyf/loca を free。
+/// Build glyf + loca(short) from glyph blobs and return Glyf. Caller frees glyf/loca.
 const TestFont = struct {
     glyf: []u8,
     loca: []u8,
@@ -615,7 +615,7 @@ const TestFont = struct {
             try glyf.appendSlice(alloc, g);
             off += @intCast(g.len);
         }
-        try appendU16(&loca, alloc, @intCast(off / 2)); // 番兵
+        try appendU16(&loca, alloc, @intCast(off / 2)); // Sentinel
         return .{ .glyf = try glyf.toOwnedSlice(alloc), .loca = try loca.toOwnedSlice(alloc) };
     }
     fn deinit(self: *TestFont, alloc: std.mem.Allocator) void {
@@ -627,7 +627,7 @@ const TestFont = struct {
     }
 };
 
-test "glyf simple: 三角形（全 on-curve・直線 3 本）" {
+test "glyf simple: triangle (all on-curve · 3 lines)" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -645,7 +645,7 @@ test "glyf simple: 三角形（全 on-curve・直線 3 本）" {
     try testing.expectEqual(@as(usize, 1), o.contours.len);
     const c = o.contours[0];
     try testing.expectEqual(@as(f32, 0), c.start.x);
-    // start=p0, 処理 p1,p2, close→p0 = 3 line
+    // start=p0, process p1,p2, close→p0 = 3 lines
     try testing.expectEqual(@as(usize, 3), c.segments.len);
     try testing.expect(c.segments[0] == .line);
     try testing.expectEqual(@as(f32, 100), c.segments[0].line.x);
@@ -653,12 +653,12 @@ test "glyf simple: 三角形（全 on-curve・直線 3 本）" {
     try testing.expectEqual(@as(f32, 0), c.segments[2].line.x); // close to start
 }
 
-test "glyf simple: off-curve を含む（quad 生成）" {
+test "glyf simple: includes off-curve (produces quad)" {
     const a = testing.allocator;
-    // on, off, on → 1 quad（ctrl=off）, そして close
+    // on, off, on → 1 quad (ctrl=off), then close
     const pts = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
-        .{ .p = .{ .x = 50, .y = 80 }, .on = false }, // 制御点
+        .{ .p = .{ .x = 50, .y = 80 }, .on = false }, // Control point
         .{ .p = .{ .x = 100, .y = 0 }, .on = true },
     };
     const g0 = try buildSimpleGlyph(a, &.{&pts});
@@ -677,9 +677,9 @@ test "glyf simple: off-curve を含む（quad 生成）" {
     try testing.expect(c.segments[1] == .line); // close to start
 }
 
-test "glyf simple: 先頭・末尾とも off-curve（合成始点）" {
+test "glyf simple: first and last off-curve (synthetic start)" {
     const a = testing.allocator;
-    // off, on, off → 始点は mid(p0,p2)
+    // off, on, off → start is mid(p0,p2)
     const pts = [_]Pt{
         .{ .p = .{ .x = 0, .y = 100 }, .on = false },
         .{ .p = .{ .x = 50, .y = 0 }, .on = true },
@@ -694,14 +694,14 @@ test "glyf simple: 先頭・末尾とも off-curve（合成始点）" {
     var o = try glyf.outline(a, 0);
     defer o.deinit(a);
     const c = o.contours[0];
-    // 始点 = mid(p0,p2) = (50,100)
+    // start = mid(p0,p2) = (50,100)
     try testing.expectEqual(@as(f32, 50), c.start.x);
     try testing.expectEqual(@as(f32, 100), c.start.y);
-    // 全て quad（off を挟むため）
+    // All quads (offs intercalated)
     for (c.segments) |s| try testing.expect(s == .quad);
 }
 
-test "glyf: 空グリフ（loca 同値）は空 contours" {
+test "glyf: empty glyph (equal loca) has empty contours" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -710,7 +710,7 @@ test "glyf: 空グリフ（loca 同値）は空 contours" {
     };
     const g1 = try buildSimpleGlyph(a, &.{&tri});
     defer a.free(g1);
-    // gid 0 を空（長さ 0）にする
+    // Make gid 0 empty (length 0)
     var tf = try TestFont.make(a, &.{ &.{}, g1 });
     defer tf.deinit(a);
     const glyf = try tf.glyfObj(2);
@@ -724,7 +724,7 @@ test "glyf: 空グリフ（loca 同値）は空 contours" {
     try testing.expectEqual(@as(usize, 1), o1.contours.len);
 }
 
-test "glyf composite: 別グリフを XY オフセットで参照" {
+test "glyf composite: references another glyph with XY offset" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -734,7 +734,7 @@ test "glyf composite: 別グリフを XY オフセットで参照" {
     const g0 = try buildSimpleGlyph(a, &.{&tri});
     defer a.free(g0);
 
-    // composite gid1: gid0 を (dx=200, dy=10) でオフセット参照（word args, XY）
+    // composite gid1: reference gid0 offset by (dx=200, dy=10) (word args, XY)
     var comp: std.ArrayList(u8) = .empty;
     defer comp.deinit(a);
     try appendI16(&comp, a, -1); // numberOfContours < 0
@@ -759,7 +759,7 @@ test "glyf composite: 別グリフを XY オフセットで参照" {
     try testing.expectEqual(@as(f32, 300), o.contours[0].segments[0].line.x); // 100+200
 }
 
-test "glyf composite: byte 引数の負 i8 XY オフセット" {
+test "glyf composite: negative i8 XY offset via byte args" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -773,7 +773,7 @@ test "glyf composite: byte 引数の負 i8 XY オフセット" {
     defer comp.deinit(a);
     try appendI16(&comp, a, -1);
     for (0..4) |_| try appendI16(&comp, a, 0);
-    try appendU16(&comp, a, 0x0002); // ARGS_ARE_XY_VALUES（byte 引数）
+    try appendU16(&comp, a, 0x0002); // ARGS_ARE_XY_VALUES (byte args)
     try appendU16(&comp, a, 0); // glyphIndex
     try comp.append(a, @bitCast(@as(i8, -10))); // dx = -10
     try comp.append(a, @bitCast(@as(i8, 5))); // dy = 5
@@ -790,7 +790,7 @@ test "glyf composite: byte 引数の負 i8 XY オフセット" {
     try testing.expectEqual(@as(f32, 5), o.contours[0].start.y);
 }
 
-test "glyf: gid 範囲外は InvalidFont" {
+test "glyf: gid out of range is InvalidFont" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -805,15 +805,15 @@ test "glyf: gid 範囲外は InvalidFont" {
     try testing.expectError(error.InvalidFont, glyf.outline(a, 1)); // gid 1 >= numGlyphs 1
 }
 
-test "glyf composite: 自己参照（再帰深さ超過）は InvalidFont" {
+test "glyf composite: self-reference (recursion depth exceeded) is InvalidFont" {
     const a = testing.allocator;
-    // gid0 が gid0 を参照する composite
+    // composite where gid0 references gid0
     var comp: std.ArrayList(u8) = .empty;
     defer comp.deinit(a);
     try appendI16(&comp, a, -1);
     for (0..4) |_| try appendI16(&comp, a, 0);
     try appendU16(&comp, a, 0x0002); // XY, byte args
-    try appendU16(&comp, a, 0); // glyphIndex = 0（自己参照）
+    try appendU16(&comp, a, 0); // glyphIndex = 0 (self-reference)
     try comp.append(a, 0);
     try comp.append(a, 0);
     if (comp.items.len % 2 != 0) try comp.append(a, 0);
@@ -825,7 +825,7 @@ test "glyf composite: 自己参照（再帰深さ超過）は InvalidFont" {
     try testing.expectError(error.InvalidFont, glyf.outline(a, 0));
 }
 
-test "glyf composite: 点マッチング（非 XY）は Unsupported" {
+test "glyf composite: point matching (non-XY) is Unsupported" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -838,7 +838,7 @@ test "glyf composite: 点マッチング（非 XY）は Unsupported" {
     defer comp.deinit(a);
     try appendI16(&comp, a, -1);
     for (0..4) |_| try appendI16(&comp, a, 0);
-    try appendU16(&comp, a, 0x0001); // ARG_1_AND_2_ARE_WORDS（XY なし＝点マッチング）
+    try appendU16(&comp, a, 0x0001); // ARG_1_AND_2_ARE_WORDS (no XY = point matching)
     try appendU16(&comp, a, 0);
     try appendU16(&comp, a, 0);
     try appendU16(&comp, a, 0);
@@ -850,13 +850,13 @@ test "glyf composite: 点マッチング（非 XY）は Unsupported" {
     try testing.expectError(error.Unsupported, glyf.outline(a, 1));
 }
 
-test "glyf: loca.len 不一致は InvalidFont" {
+test "glyf: loca.len mismatch is InvalidFont" {
     const glyf_bytes = [_]u8{0} ** 12;
-    const loca_bytes = [_]u8{0} ** 2; // numGlyphs=1 なら (1+1)*2=4 必要
+    const loca_bytes = [_]u8{0} ** 2; // With numGlyphs=1, need (1+1)*2=4
     try testing.expectError(error.InvalidFont, Glyf.fromTables(&glyf_bytes, &loca_bytes, false, 1));
 }
 
-test "glyf composite: WE_HAVE_A_SCALE で座標がスケールされる" {
+test "glyf composite: WE_HAVE_A_SCALE scales coordinates" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -870,7 +870,7 @@ test "glyf composite: WE_HAVE_A_SCALE で座標がスケールされる" {
     defer comp.deinit(a);
     try appendI16(&comp, a, -1);
     for (0..4) |_| try appendI16(&comp, a, 0);
-    try appendU16(&comp, a, 0x0002 | 0x0008); // ARGS_ARE_XY_VALUES | WE_HAVE_A_SCALE（byte args）
+    try appendU16(&comp, a, 0x0002 | 0x0008); // ARGS_ARE_XY_VALUES | WE_HAVE_A_SCALE (byte args)
     try appendU16(&comp, a, 0); // glyphIndex
     try comp.append(a, 0); // dx=0
     try comp.append(a, 0); // dy=0
@@ -889,16 +889,16 @@ test "glyf composite: WE_HAVE_A_SCALE で座標がスケールされる" {
     try testing.expectEqual(@as(f32, 50), o.contours[0].segments[1].line.y);
 }
 
-test "glyf simple: REPEAT オーバーランは InvalidFont" {
+test "glyf simple: REPEAT overrun is InvalidFont" {
     const a = testing.allocator;
     var g: std.ArrayList(u8) = .empty;
     defer g.deinit(a);
     try appendI16(&g, a, 1); // numberOfContours
     for (0..4) |_| try appendI16(&g, a, 0); // bbox
-    try appendU16(&g, a, 1); // endPts[0]=1（2 点）
+    try appendU16(&g, a, 1); // endPts[0]=1 (2 points)
     try appendU16(&g, a, 0); // instructionLength
     try g.append(a, 0x09); // ON|REPEAT
-    try g.append(a, 10); // repeat 10（残り 1 点に対して過大）
+    try g.append(a, 10); // repeat 10 (excessive for the remaining 1 point)
     const g0 = try g.toOwnedSlice(a);
     defer a.free(g0);
     var tf = try TestFont.make(a, &.{g0});
@@ -907,25 +907,25 @@ test "glyf simple: REPEAT オーバーランは InvalidFont" {
     try testing.expectError(error.InvalidFont, glyf.outline(a, 0));
 }
 
-test "glyf: 0-contour で instructions が切り詰められていると InvalidFont" {
+test "glyf: truncated instructions on 0-contour is InvalidFont" {
     const a = testing.allocator;
     var g: std.ArrayList(u8) = .empty;
     defer g.deinit(a);
     try appendI16(&g, a, 0); // numberOfContours=0
     for (0..4) |_| try appendI16(&g, a, 0); // bbox
     try appendU16(&g, a, 5); // instructionLength=5
-    try g.append(a, 0); // 実際は 1 byte しか無い（5 に満たない）
+    try g.append(a, 0); // Only 1 byte actually present (short of 5)
     if (g.items.len % 2 != 0) try g.append(a, 0);
     const g0 = try g.toOwnedSlice(a);
     defer a.free(g0);
     var tf = try TestFont.make(a, &.{g0});
     defer tf.deinit(a);
     const glyf = try tf.glyfObj(1);
-    // 但し偶数 padding で 1 byte 増えるため、instructionLength=5 でも足りないことを保証するよう大きめに
+    // Even padding adds 1 byte, so size large enough that instructionLength=5 is still insufficient
     try testing.expectError(error.InvalidFont, glyf.outline(a, 0));
 }
 
-test "glyf composite: WE_HAVE_INSTRUCTIONS 末尾が切れていると InvalidFont" {
+test "glyf composite: truncated WE_HAVE_INSTRUCTIONS trailing data is InvalidFont" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -938,11 +938,11 @@ test "glyf composite: WE_HAVE_INSTRUCTIONS 末尾が切れていると InvalidFo
     defer comp.deinit(a);
     try appendI16(&comp, a, -1);
     for (0..4) |_| try appendI16(&comp, a, 0);
-    try appendU16(&comp, a, 0x0002 | 0x0100); // XY | WE_HAVE_INSTRUCTIONS（MORE_COMPONENTS なし）
+    try appendU16(&comp, a, 0x0002 | 0x0100); // XY | WE_HAVE_INSTRUCTIONS (no MORE_COMPONENTS)
     try appendU16(&comp, a, 0); // glyphIndex
     try comp.append(a, 0); // dx
     try comp.append(a, 0); // dy
-    try appendU16(&comp, a, 5); // instructionLength=5 だが本体 0 byte
+    try appendU16(&comp, a, 5); // instructionLength=5 but body is 0 bytes
     const g1 = try comp.toOwnedSlice(a);
     defer a.free(g1);
     var tf = try TestFont.make(a, &.{ g0, g1 });
@@ -951,7 +951,7 @@ test "glyf composite: WE_HAVE_INSTRUCTIONS 末尾が切れていると InvalidFo
     try testing.expectError(error.InvalidFont, glyf.outline(a, 1));
 }
 
-test "TASK-25.15.3: composite+gvar offset のみ変分・transform 不変・norm0 一致" {
+test "glyf: composite+gvar varies offset only; transform unchanged; matches at norm0" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -1022,7 +1022,7 @@ test "TASK-25.15.3: composite+gvar offset のみ変分・transform 不変・norm
     try gvar_tbl.appendSlice(a, gvd.items);
     const gv = try gvar_mod.Gvar.parse(gvar_tbl.items, 2, 1);
 
-    // norm=0: 現行 outline と一致
+    // norm=0: matches current outline
     var o_def = try glyf.outline(a, 1);
     defer o_def.deinit(a);
     var o0 = try glyf.outlineVaried(a, 1, &gv, &.{0});
@@ -1036,12 +1036,12 @@ test "TASK-25.15.3: composite+gvar offset のみ変分・transform 不変・norm
     try testing.expectApproxEqAbs(@as(f32, 50), o_def.contours[0].segments[0].line.x, 0.01); // 100*0.5
     try testing.expectApproxEqAbs(@as(f32, 200), o_def.contours[1].start.x, 0.01);
 
-    // norm=1: component1 offset 200+50=250, scale on component0 不変
+    // norm=1: component1 offset 200+50=250; scale on component0 unchanged
     var o1 = try glyf.outlineVaried(a, 1, &gv, &.{1.0});
     defer o1.deinit(a);
     try testing.expectApproxEqAbs(@as(f32, 0), o1.contours[0].start.x, 0.01);
-    try testing.expectApproxEqAbs(@as(f32, 50), o1.contours[0].segments[0].line.x, 0.01); // scale 不変
-    try testing.expectApproxEqAbs(@as(f32, 250), o1.contours[1].start.x, 0.01); // offset 変分
+    try testing.expectApproxEqAbs(@as(f32, 50), o1.contours[0].segments[0].line.x, 0.01); // scale unchanged
+    try testing.expectApproxEqAbs(@as(f32, 250), o1.contours[1].start.x, 0.01); // offset variation
     try testing.expectApproxEqAbs(@as(f32, 350), o1.contours[1].segments[0].line.x, 0.01); // 100+250
 }
 
@@ -1049,7 +1049,7 @@ fn var_common_f2d(v: f32) i16 {
     return @import("var_common.zig").f32ToF2dot14(v);
 }
 
-test "TASK-25.15.3: parseCompositeInfo USE_MY_METRICS 後勝ち" {
+test "glyf: parseCompositeInfo USE_MY_METRICS last-wins" {
     const a = testing.allocator;
     const tri = [_]Pt{
         .{ .p = .{ .x = 0, .y = 0 }, .on = true },
@@ -1086,29 +1086,29 @@ test "TASK-25.15.3: parseCompositeInfo USE_MY_METRICS 後勝ち" {
     try testing.expectEqual(@as(?u16, 1), info.use_my_metrics_gid);
 }
 
-test "glyf simple: フラグ枝（X_SHORT 正/負 / X_SAME・Y_SAME ノーバイト / REPEAT）— 生バイト" {
+test "glyf simple: flag branches (X_SHORT ± / X_SAME·Y_SAME no-byte / REPEAT) — raw bytes" {
     const a = testing.allocator;
-    // 1 contour・4 点・全 on-curve。
+    // 1 contour, 4 points, all on-curve.
     //   p0=(10,20)  p1=(5,20)  p2=(5,20)  p3=(5,20)
-    //   p0: 全 short 正。p1: X_SHORT 負・Y_SAME。p2,p3: X_SAME・Y_SAME を REPEAT で。
+    //   p0: all short positive. p1: X_SHORT negative, Y_SAME. p2,p3: X_SAME, Y_SAME via REPEAT.
     var g: std.ArrayList(u8) = .empty;
     defer g.deinit(a);
     try appendI16(&g, a, 1); // numberOfContours
     for (0..4) |_| try appendI16(&g, a, 0); // bbox
-    try appendU16(&g, a, 3); // endPts[0] = 3（4 点）
+    try appendU16(&g, a, 3); // endPts[0] = 3 (4 points)
     try appendU16(&g, a, 0); // instructionLength
     // flags:
     //   p0: ON|X_SHORT|X_POS|Y_SHORT|Y_POS = 0x37
-    //   p1: ON|X_SHORT(bit4=0→負)|Y_SAME(bit5=1,!Y_SHORT) = 0x23
+    //   p1: ON|X_SHORT(bit4=0→neg)|Y_SAME(bit5=1,!Y_SHORT) = 0x23
     //   p2,p3: ON|X_SAME(bit4=1,!X_SHORT)|Y_SAME(bit5=1) | REPEAT = 0x31|0x08 = 0x39, repeat=1
     try g.append(a, 0x37);
     try g.append(a, 0x23);
     try g.append(a, 0x39);
-    try g.append(a, 1); // repeat count（0x31 相当を p2,p3 に適用）
-    // x coords: p0 +10、p1 -5（値5,bit4=0）、p2/p3 same（バイトなし）
+    try g.append(a, 1); // repeat count (apply 0x31-equivalent to p2,p3)
+    // x coords: p0 +10, p1 -5 (value 5, bit4=0), p2/p3 same (no bytes)
     try g.append(a, 10);
     try g.append(a, 5);
-    // y coords: p0 +20、p1/p2/p3 same（バイトなし）
+    // y coords: p0 +20, p1/p2/p3 same (no bytes)
     try g.append(a, 20);
     if (g.items.len % 2 != 0) try g.append(a, 0);
     const g0 = try g.toOwnedSlice(a);
@@ -1125,5 +1125,5 @@ test "glyf simple: フラグ枝（X_SHORT 正/負 / X_SAME・Y_SAME ノーバイ
     try testing.expectEqual(@as(f32, 5), c.segments[0].line.x); // p1 = 10-5
     try testing.expectEqual(@as(f32, 20), c.segments[0].line.y); // y same
     try testing.expectEqual(@as(f32, 5), c.segments[1].line.x); // p2 same
-    try testing.expectEqual(@as(f32, 5), c.segments[2].line.x); // p3 same（REPEAT）
+    try testing.expectEqual(@as(f32, 5), c.segments[2].line.x); // p3 same (REPEAT)
 }

@@ -1,15 +1,15 @@
-// AngelCode BMFont (text 記述子 + 単一 PNG アトラスページ) ローダ。
+// AngelCode BMFont (text descriptor + single PNG atlas page) loader.
 //
-// 共通 Font インターフェース（font.zig）の size-baked 実装。BMFont は特定サイズ向けに
-// 焼かれたアトラスなので、BitmapFont 同様 FontFace と SizedFont が一体。
+// Size-baked implementation of the shared Font interface (font.zig). BMFont is an atlas baked
+// for a specific size, so like BitmapFont, FontFace and SizedFont are one.
 //
-// 設計（TASK-25.9 計画）:
-//   - 中核 `parse(text, atlas, w, h)` は io/PNG 非依存（アトラス注入）でテスト容易。
-//   - `load(text, png_bytes)` は薄い helper（png で decode → parse）。
-//   - グリフのカバレッジ = アトラス画素の A チャネル。`col` で tint（共通カバレッジ路に整合）。
-//   - 単一ページのみ（pages!=1 / page id!=0 / char page!=0 は reject）。
-//   - kerning はパースのみ・非適用（共通 API に kerning なし）。
-//   - 欠落グリフは描画 skip・advance 0（measure と drawTo の整合最優先）。
+// Design:
+//   - Core `parse(text, atlas, w, h)` is io/PNG-independent (atlas injected) and easy to test.
+//   - `load(text, png_bytes)` is a thin helper (decode with png → parse).
+//   - Glyph coverage = A channel of atlas pixels. Tint via `col` (aligned with the shared coverage path).
+//   - Single page only (reject pages!=1 / page id!=0 / char page!=0).
+//   - kerning is parsed only, not applied (shared API has no kerning).
+//   - Missing glyphs: skip draw, advance 0 (measure/drawTo consistency is highest priority).
 
 const std = @import("std");
 const font = @import("font.zig");
@@ -28,7 +28,7 @@ const plotCoverage = font.plotCoverage;
 pub const ParseError = error{ InvalidDescriptor, UnsupportedFormat } || std.mem.Allocator.Error;
 pub const LoadError = ParseError || pngdec.DecodingError;
 
-/// 1 グリフのアトラス内 src 矩形 + 配置オフセット + 送り幅。
+/// One glyph's atlas src rect + placement offset + advance width.
 const Char = struct {
     x: u32,
     y: u32,
@@ -41,15 +41,15 @@ const Char = struct {
 
 pub const BMFont = struct {
     alloc: std.mem.Allocator,
-    atlas: []u32, // 所有する canonical BGRA コピー（u32 0xAARRGGBB, byte order [B,G,R,A]）
+    atlas: []u32, // Owned canonical BGRA copy (u32 0xAARRGGBB, byte order [B,G,R,A])
     atlas_w: u32,
     atlas_h: u32,
     chars: std.AutoHashMapUnmanaged(u32, Char) = .empty,
     line_height: u32,
-    base: i32, // 0 <= base <= line_height（ascent）
+    base: i32, // 0 <= base <= line_height (ascent)
 
-    /// 記述子 + 既デコード済みアトラス（RGBA8888 `[]u32`）から構築する中核 entry。
-    /// アトラスは複製して所有する（呼び出し側のバッファ寿命に依存しない）。
+    /// Core entry that builds from descriptor + already-decoded atlas (RGBA8888 `[]u32`).
+    /// Duplicates and owns the atlas (independent of caller buffer lifetime).
     pub fn parse(
         alloc: std.mem.Allocator,
         descriptor_text: []const u8,
@@ -57,7 +57,7 @@ pub const BMFont = struct {
         atlas_w: u32,
         atlas_h: u32,
     ) ParseError!BMFont {
-        // atlas バッファ長の整合（src 矩形検証だけでは OOB read を排除できないため必須）。
+        // Atlas buffer length consistency (required: src-rect checks alone cannot rule out OOB reads).
         const expect = std.math.mul(usize, atlas_w, atlas_h) catch return error.InvalidDescriptor;
         if (atlas.len != expect) return error.InvalidDescriptor;
 
@@ -85,10 +85,10 @@ pub const BMFont = struct {
                     } else if (std.mem.eql(u8, kv.key, "pages")) {
                         if ((try parseNum(kv.val)) != 1) return error.UnsupportedFormat;
                     }
-                    // scaleW/scaleH 等は無視（実 atlas 寸法を優先）
+                    // scaleW/scaleH etc. are ignored (prefer actual atlas dimensions)
                 }
                 if (lh == null or bs == null) return error.InvalidDescriptor;
-                // line_height は ascent(=base) を i32 に収めるため i32 範囲に制限。
+                // line_height is limited to i32 range so ascent(=base) fits in i32.
                 if (lh.? < 0 or lh.? > std.math.maxInt(i32)) return error.InvalidDescriptor;
                 line_height = @intCast(lh.?);
                 base_v = bs.?;
@@ -98,19 +98,19 @@ pub const BMFont = struct {
                     if (std.mem.eql(u8, kv.key, "id")) {
                         if ((try parseNum(kv.val)) != 0) return error.UnsupportedFormat;
                     }
-                    // file= は無視（loader が外で解決済み）
+                    // file= is ignored (loader already resolved it externally)
                 }
             } else if (std.mem.eql(u8, it.tag, "char")) {
                 if (try parseChar(it, atlas_w, atlas_h)) |entry| {
                     try chars.put(alloc, entry.id, entry.ch);
                 }
-                // null = ページ外/範囲外 → map に入れない（drawTo の OOB read を構造的に排除）
+                // null = off-page/out-of-range → not added to map (structurally eliminates OOB reads in drawTo)
             }
-            // info / chars / kernings / kerning / 未知タグ は無視（kerning は非適用）
+            // info / chars / kernings / kerning / unknown tags are ignored (kerning not applied)
         }
 
         if (!has_common) return error.InvalidDescriptor;
-        // base の範囲検証（Metrics 不変条件 0<=ascent, 0<=descent, ascent+descent<=line_height）。
+        // base range check (Metrics invariant: 0<=ascent, 0<=descent, ascent+descent<=line_height).
         if (base_v < 0 or base_v > line_height) return error.InvalidDescriptor;
         const base: i32 = @intCast(base_v);
 
@@ -128,8 +128,8 @@ pub const BMFont = struct {
         };
     }
 
-    /// 記述子 + ページ PNG バイト列から構築する薄い helper。
-    /// PNG を decode → 実寸を採用 → `parse` を呼ぶ（decode 済み画像は解放）。
+    /// Thin helper that builds from descriptor + page PNG bytes.
+    /// Decodes PNG → uses actual dimensions → calls `parse` (frees the decoded image).
     pub fn load(
         alloc: std.mem.Allocator,
         descriptor_text: []const u8,
@@ -146,7 +146,7 @@ pub const BMFont = struct {
         self.* = undefined;
     }
 
-    // ── Font インターフェース ──
+    // ── Font interface ──
     const vtable: Font.VTable = .{ .measure = measureImpl, .drawTo = drawToImpl, .metrics = metricsImpl };
 
     pub fn asFont(self: *const BMFont) Font {
@@ -171,7 +171,7 @@ pub const BMFont = struct {
         return .{ .line_height = self.line_height, .ascent = self.base, .descent = descent };
     }
 
-    /// logical advance 幅の合計（saturating）。欠落グリフは advance 0。
+    /// Sum of logical advance widths (saturating). Missing glyphs contribute advance 0.
     pub fn measure(self: BMFont, text: []const u8) u32 {
         var total: u32 = 0;
         if (std.unicode.Utf8View.init(text)) |view| {
@@ -187,7 +187,7 @@ pub const BMFont = struct {
         return total;
     }
 
-    /// scale は受け取るが今回は atlas を再スケールしない（物理 nearest 拡大は別タスク）。
+    /// Accepts scale but does not rescale the atlas (physical nearest upscale is out of scope).
     pub fn drawTo(self: BMFont, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
         _ = scale;
         var pen_x = pos.x;
@@ -203,14 +203,14 @@ pub const BMFont = struct {
         }
     }
 
-    /// 1 codepoint を描画し、次の pen_x（飽和加算）を返す。欠落グリフは描画 skip・pen_x 不変。
+    /// Draws one codepoint and returns the next pen_x (saturating add). Missing glyphs: skip draw, pen_x unchanged.
     fn drawCodepoint(self: BMFont, target: RenderTarget, cp: u32, pen_x: i32, pos_y: i32, col: Color, clip: Rect) i32 {
         const ch = self.chars.get(cp) orelse return pen_x;
         const dst_x = pen_x +| ch.xoffset;
         const dst_y = pos_y +| ch.yoffset;
         var row: u32 = 0;
         while (row < ch.h) : (row += 1) {
-            // index は usize で計算（範囲は parse 時に検証済み。巨大 atlas でも overflow しない）。
+            // index is computed as usize (bounds verified at parse; no overflow even for huge atlases).
             const src_base = (@as(usize, ch.y) + @as(usize, row)) * @as(usize, self.atlas_w) + @as(usize, ch.x);
             var cx: u32 = 0;
             while (cx < ch.w) : (cx += 1) {
@@ -225,14 +225,14 @@ pub const BMFont = struct {
                 );
             }
         }
-        // xadvance(u32) を i32 飽和加算（pen_x は表示座標）。
+        // Saturating-add xadvance(u32) into i32 (pen_x is display coordinates).
         return pen_x +| @as(i32, @intCast(@min(ch.xadvance, @as(u32, std.math.maxInt(i32)))));
     }
 };
 
-// ── 記述子パースのヘルパー ──
+// ── Descriptor parse helpers ──
 
-/// 1 行を `tag key=value ...` として走査するイテレータ。value はクオート対応。
+/// Iterator that scans one line as `tag key=value ...`. Values support quotes.
 const LineIter = struct {
     rest: []const u8,
     tag: []const u8,
@@ -259,7 +259,7 @@ const LineIter = struct {
         while (i < s.len and s[i] != '=' and !isSpace(s[i])) : (i += 1) {}
         const key = s[key_start..i];
         if (i >= s.len or s[i] != '=') {
-            // '=' を持たないトークン（想定外）。残りを捨てて終了。
+            // Token without '=' (unexpected). Discard the rest and stop.
             self.rest = s[s.len..];
             return .{ .key = key, .val = s[i..i] };
         }
@@ -301,7 +301,7 @@ fn toI32(v: i64) ParseError!i32 {
 
 const ParsedChar = struct { id: u32, ch: Char };
 
-/// char 行を解釈。page!=0 は UnsupportedFormat、src 矩形がアトラス外なら null（skip）。
+/// Interprets a char line. page!=0 → UnsupportedFormat; src rect outside atlas → null (skip).
 fn parseChar(line: LineIter, atlas_w: u32, atlas_h: u32) ParseError!?ParsedChar {
     var it = line;
     var id: ?i64 = null;
@@ -333,7 +333,7 @@ fn parseChar(line: LineIter, atlas_w: u32, atlas_h: u32) ParseError!?ParsedChar 
         } else if (std.mem.eql(u8, kv.key, "page")) {
             page = try parseNum(kv.val);
         }
-        // chnl 等は無視
+        // chnl etc. are ignored
     }
     if (id == null or x == null or y == null or w == null or h == null or
         xoff == null or yoff == null or xadv == null) return error.InvalidDescriptor;
@@ -343,11 +343,11 @@ fn parseChar(line: LineIter, atlas_w: u32, atlas_h: u32) ParseError!?ParsedChar 
     const cy = try toU32(y.?);
     const cw = try toU32(w.?);
     const chgt = try toU32(h.?);
-    // src 矩形のアトラス内チェック（overflow-safe）。範囲外は skip。
+    // In-atlas check for src rect (overflow-safe). Out of range → skip.
     if (@as(u64, cx) + @as(u64, cw) > atlas_w) return null;
     if (@as(u64, cy) + @as(u64, chgt) > atlas_h) return null;
 
-    const adv = try toU32(xadv.?); // xadvance は非負（負の送り幅は不正）
+    const adv = try toU32(xadv.?); // xadvance is non-negative (negative advance is invalid)
     return .{
         .id = try toU32(id.?),
         .ch = .{
@@ -368,14 +368,14 @@ fn parseChar(line: LineIter, atlas_w: u32, atlas_h: u32) ParseError!?ParsedChar 
 
 const testing = std.testing;
 
-// 4x4 RGBA: 左上 2x2 が不透明白(alpha=255)、残りは透明(alpha=0)。alpha=glyph coverage。
+// 4x4 RGBA: top-left 2x2 opaque white (alpha=255), rest transparent (alpha=0). alpha=glyph coverage.
 const test_atlas = blk: {
     var a: [16]u32 = .{0} ** 16;
     var y: usize = 0;
     while (y < 4) : (y += 1) {
         var x: usize = 0;
         while (x < 4) : (x += 1) {
-            // Color{r,g,b,a} packed → bitCast。左上 2x2 のみ a=255。
+            // Color{r,g,b,a} packed → bitCast. Only top-left 2x2 have a=255.
             const on = (x < 2 and y < 2);
             const c = Color{ .r = 0xFF, .g = 0xFF, .b = 0xFF, .a = if (on) 0xFF else 0x00 };
             a[y * 4 + x] = @bitCast(c);
@@ -395,7 +395,7 @@ const test_fnt =
     \\kerning first=65 second=66 amount=-2
 ;
 
-test "BMFont.parse: 記述子 + 注入アトラスを解釈" {
+test "BMFont.parse: parse descriptor + injected atlas" {
     const a = testing.allocator;
     var bm = try BMFont.parse(a, test_fnt, &test_atlas, 4, 4);
     defer bm.deinit();
@@ -406,34 +406,34 @@ test "BMFont.parse: 記述子 + 注入アトラスを解釈" {
     try testing.expectEqual(@as(i32, 3), m.ascent);
     try testing.expectEqual(@as(i32, 1), m.descent);
 
-    // measure: 'A'(3) + 'B'(5) = 8、欠落 'C' は 0
+    // measure: 'A'(3) + 'B'(5) = 8, missing 'C' is 0
     try testing.expectEqual(@as(u32, 3), bm.measure("A"));
     try testing.expectEqual(@as(u32, 8), bm.measure("AB"));
-    try testing.expectEqual(@as(u32, 8), bm.measure("ABC")); // C 欠落 → +0
+    try testing.expectEqual(@as(u32, 8), bm.measure("ABC")); // C missing → +0
     try testing.expectEqual(@as(u32, 0), bm.measure("C"));
 }
 
-test "BMFont.drawTo: A チャネルを coverage に、col で tint・配置" {
+test "BMFont.drawTo: A channel as coverage, tint/place with col" {
     const a = testing.allocator;
     var bm = try BMFont.parse(a, test_fnt, &test_atlas, 4, 4);
     defer bm.deinit();
 
     const W = 8;
-    var px = [_]u32{0xFF000000} ** (W * W); // 黒背景(不透明)
+    var px = [_]u32{0xFF000000} ** (W * W); // Black background (opaque)
     const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     const red = Color.rgba(0xFF, 0x00, 0x00, 0xFF);
 
-    // 'A': src(0,0,2,2) 全 alpha=255 → dst=(pen0 + xoffset0, pos.y2 + yoffset1)=(0,3) に 2x2 の赤。
+    // 'A': src(0,0,2,2) all alpha=255 → 2x2 red at dst=(pen0 + xoffset0, pos.y2 + yoffset1)=(0,3).
     bm.drawTo(target, .{ .x = 0, .y = 2 }, "A", red, clip, 1.0);
     const at = @as(Color, @bitCast(px[3 * W + 0]));
     try testing.expectEqual(@as(u8, 0xFF), at.r);
     try testing.expectEqual(@as(u8, 0x00), at.g);
-    // (3..5, 0..2) は塗られる、それ以外は黒のまま（(0,0) 等）
+    // (3..5, 0..2) are painted; the rest stays black ((0,0) etc.)
     try testing.expectEqual(@as(u32, 0xFF000000), px[0]);
 }
 
-test "BMFont.drawTo: 欠落グリフは描画せず advance 0（measure と一致）" {
+test "BMFont.drawTo: missing glyph draws nothing with advance 0 (matches measure)" {
     const a = testing.allocator;
     var bm = try BMFont.parse(a, test_fnt, &test_atlas, 4, 4);
     defer bm.deinit();
@@ -442,10 +442,10 @@ test "BMFont.drawTo: 欠落グリフは描画せず advance 0（measure と一�
     const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     bm.drawTo(target, .{ .x = 0, .y = 0 }, "C", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
-    for (px) |p| try testing.expectEqual(@as(u32, 0xFF000000), p); // 何も描かれない
+    for (px) |p| try testing.expectEqual(@as(u32, 0xFF000000), p); // Nothing is drawn
 }
 
-test "BMFont.parse: クオート値・負オフセット・不明 key・重複 id 後勝ち" {
+test "BMFont.parse: quoted values, negative offsets, unknown keys, duplicate id last-wins" {
     const a = testing.allocator;
     const fnt_dup =
         \\info face="A B C" charset="" unknownKey=zzz
@@ -455,15 +455,15 @@ test "BMFont.parse: クオート値・負オフセット・不明 key・重複 i
     ;
     var bm = try BMFont.parse(a, fnt_dup, &test_atlas, 4, 4);
     defer bm.deinit();
-    // 重複 id=65 は後勝ち → xadvance=9
+    // Duplicate id=65: last wins → xadvance=9
     try testing.expectEqual(@as(u32, 9), bm.measure("A"));
 }
 
-test "BMFont.parse: 異常系 reject" {
+test "BMFont.parse: reject malformed input" {
     const a = testing.allocator;
     // atlas.len != w*h
     try testing.expectError(error.InvalidDescriptor, BMFont.parse(a, test_fnt, &test_atlas, 4, 5));
-    // common 欠落
+    // common missing
     try testing.expectError(error.InvalidDescriptor, BMFont.parse(a, "char id=65 x=0 y=0 width=1 height=1 xoffset=0 yoffset=0 xadvance=1 page=0", &test_atlas, 4, 4));
     // base > lineHeight
     try testing.expectError(error.InvalidDescriptor, BMFont.parse(a, "common lineHeight=4 base=5 pages=1", &test_atlas, 4, 4));
@@ -475,11 +475,11 @@ test "BMFont.parse: 異常系 reject" {
     try testing.expectError(error.UnsupportedFormat, BMFont.parse(a, "common lineHeight=4 base=2 pages=1\npage id=1 file=\"x.png\"", &test_atlas, 4, 4));
     // char page != 0
     try testing.expectError(error.UnsupportedFormat, BMFont.parse(a, "common lineHeight=4 base=2 pages=1\nchar id=65 x=0 y=0 width=1 height=1 xoffset=0 yoffset=0 xadvance=1 page=1", &test_atlas, 4, 4));
-    // 数値でない値
+    // Non-numeric value
     try testing.expectError(error.InvalidDescriptor, BMFont.parse(a, "common lineHeight=abc base=2 pages=1", &test_atlas, 4, 4));
 }
 
-test "BMFont.parse: src 矩形がアトラス外の char は skip（map に入れない）" {
+test "BMFont.parse: skip chars whose src rect is outside the atlas (not in map)" {
     const a = testing.allocator;
     const fnt_oob =
         \\common lineHeight=4 base=2 pages=1
@@ -487,23 +487,23 @@ test "BMFont.parse: src 矩形がアトラス外の char は skip（map に入�
     ;
     var bm = try BMFont.parse(a, fnt_oob, &test_atlas, 4, 4);
     defer bm.deinit();
-    // 範囲外 → 欠落扱い（advance 0、OOB read なし）
+    // Out of range → treated as missing (advance 0, no OOB read)
     try testing.expectEqual(@as(u32, 0), bm.measure("A"));
 }
 
-test "BMFont.parse: scaleW/scaleH と実 atlas 寸法が不一致でも実寸優先" {
+test "BMFont.parse: prefer real atlas size when scaleW/scaleH disagree" {
     const a = testing.allocator;
     const fnt_scale =
         \\common lineHeight=4 base=2 scaleW=999 scaleH=999 pages=1
         \\char id=65 x=0 y=0 width=2 height=2 xoffset=0 yoffset=0 xadvance=4 page=0
     ;
-    var bm = try BMFont.parse(a, fnt_scale, &test_atlas, 4, 4); // 実寸 4x4
+    var bm = try BMFont.parse(a, fnt_scale, &test_atlas, 4, 4); // Actual size 4x4
     defer bm.deinit();
     try testing.expectEqual(@as(u32, 4), bm.atlas_w);
     try testing.expectEqual(@as(u32, 4), bm.measure("A"));
 }
 
-test "BMFont.measure: advance 飽和（u32 wrap/trap しない）" {
+test "BMFont.measure: advance saturates (no u32 wrap/trap)" {
     const a = testing.allocator;
     const fnt_big =
         \\common lineHeight=4 base=2 pages=1
@@ -511,13 +511,13 @@ test "BMFont.measure: advance 飽和（u32 wrap/trap しない）" {
     ;
     var bm = try BMFont.parse(a, fnt_big, &test_atlas, 4, 4);
     defer bm.deinit();
-    // 3 回繰り返すと 6e9 > u32max → 飽和（trap しないことが要点）
+    // Repeating 3 times → 6e9 > u32max → saturates (key point: no trap)
     const got = bm.measure("AAA");
     try testing.expectEqual(@as(u32, std.math.maxInt(u32)), got);
 }
 
-// 計画 D-3: 最小 PNG を埋め込み、load の decode→parse 実経路を通す（AC#2）。
-// 4x4 RGBA, 左上 2x2 不透明白・残り透明（test_atlas と同じ画素）。
+// Embed a minimal PNG and exercise load's decode→parse path.
+// 4x4 RGBA, top-left 2x2 opaque white, rest transparent (same pixels as test_atlas).
 const test_png = [_]u8{
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
     0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04,
@@ -528,7 +528,7 @@ const test_png = [_]u8{
     0x42, 0x60, 0x82,
 };
 
-test "BMFont.load: 埋め込み PNG を decode→parse（png 実経路・AC#2）" {
+test "BMFont.load: decode→parse embedded PNG (real png path)" {
     const a = testing.allocator;
     const fnt =
         \\common lineHeight=4 base=3 pages=1
@@ -539,17 +539,17 @@ test "BMFont.load: 埋め込み PNG を decode→parse（png 実経路・AC#2）
     defer bm.deinit();
     try testing.expectEqual(@as(u32, 4), bm.atlas_w);
     try testing.expectEqual(@as(u32, 4), bm.atlas_h);
-    // 左上(0,0) は不透明白 → alpha=255
+    // Top-left (0,0) is opaque white → alpha=255
     try testing.expectEqual(@as(u8, 0xFF), @as(Color, @bitCast(bm.atlas[0])).a);
-    // 右下(3,3) は透明 → alpha=0
+    // Bottom-right (3,3) is transparent → alpha=0
     try testing.expectEqual(@as(u8, 0x00), @as(Color, @bitCast(bm.atlas[3 * 4 + 3])).a);
 
-    // decode したアトラスで実描画も通る（A チャネル coverage）。
+    // Real draw also works with the decoded atlas (A-channel coverage).
     const W = 8;
     var px = [_]u32{0xFF000000} ** (W * W);
     const target = RenderTarget{ .pixels = &px, .width = W, .height = W };
     const clip = Rect{ .x = 0, .y = 0, .w = W, .h = W };
     bm.drawTo(target, .{ .x = 0, .y = 0 }, "A", Color.rgba(0x00, 0xFF, 0x00, 0xFF), clip, 1.0);
-    // baseline_y=pos.y+ascent=0+3、glyph top=pos.y+yoffset=0 → (0,0) に緑。
+    // baseline_y=pos.y+ascent=0+3, glyph top=pos.y+yoffset=0 → green at (0,0).
     try testing.expectEqual(@as(u8, 0xFF), @as(Color, @bitCast(px[0])).g);
 }
