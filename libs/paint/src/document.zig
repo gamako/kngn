@@ -1,25 +1,25 @@
-//! Document — セルグリッド・linked cel モデル（TASK-45.1）。
+//! Document — cell-grid / linked-cel model.
 //!
-//! frames × layers × cel_pool の linked-cel モデル。TASK-63 の `frames:[]*Canvas` から
-//! 置き換え、Aseprite 型のセルグリッド（layer×frame → cel の疎な参照。null=空セル=透明、
-//! 同一 CelId を複数 frame が指すことでリンク編集=共有編集が成立する）を実装する。
+//! frames × layers × cel_pool linked-cel model. Replaces the prior `frames:[]*Canvas`
+//! layout with an Aseprite-style cell grid (sparse layer×frame → cel refs; null=empty cel=transparent;
+//! multiple frames pointing at the same CelId yields linked edit = shared edit).
 //!
-//! - `Canvas`（`active_view`）は「アクティブフレームの編集可能ビュー」として無改造で流用する
-//!   （所有権モデル不変。案B=コピー同期。詳細は backlog task-45.1 の Implementation Plan 4.2節）。
-//! - `Op`/`UndoStack`（push/apply・`CelSetSnapshot`）は本ファイルに置く（`undo.zig` は
-//!   `PixelDiff`/`NameSnapshot`/`StrokeRecorder`/`PaintDiff` のみを持ち、本ファイルを
-//!   import しない一方向依存。循環 import 回避。plan 5.1節）。
-//! - CelId は Document 生存期間中 **一度払い出したら二度と別の cel へ再割り当てしない**
-//!   （free-list 無し。plan 4.3節。undo/redo 履歴が古い CelId を値として保持し続けるため）。
+//! - `Canvas` (`active_view`) is reused unchanged as the "editable view of the active frame"
+//!   (ownership model unchanged. Option B = copy-sync).
+//! - `Op`/`UndoStack` (push/apply · `CelSetSnapshot`) live in this file (`undo.zig` holds only
+//!   `PixelDiff`/`NameSnapshot`/`StrokeRecorder`/`PaintDiff` and does not import this file —
+//!   one-way dependency; avoids circular import).
+//! - A CelId, once issued for the Document lifetime, is **never reassigned to a different cel**
+//!   (no free-list; undo/redo history keeps old CelId values).
 //!
-//! ホットパス宣言: 本ファイルのイベント時 API は **イベント時のみ**（frame 切替・undo/redo・
-//! cel/frame/layer 操作はいずれもユーザー操作 1 回につき 1 回)。フレーム毎全画素ループの主経路は
-//! `active_view.composite()`/`compositeStraight()`（既存 Canvas の SIMD 経路。無改造）。
-//! **例外**: `compositeFrameStraight` は表示フレーム毎・全画素（オニオンスキン経由のみ。TASK-45.3）。
-//! `selected_frame` / `active_view` / composite cache は変更しない。
-//! `resyncActiveView`/`pushPaintOp` の `@memcpy` は1layer〜数layer分の1回コピーであり、
-//! frame切替直後・undo/redo直後・project load直後・stroke確定時のみ走る
-//! （main loop の毎フレーム経路には混入させない。plan 2節の明示的禁止事項）。
+//! Hot-path declaration: event-time APIs in this file are **event-time only** (frame switch, undo/redo,
+//! cel/frame/layer ops each run once per user action). The main per-frame full-pixel path is
+//! `active_view.composite()`/`compositeStraight()` (existing Canvas SIMD path; unchanged).
+//! **Exception**: `compositeFrameStraight` is per display-frame, full-pixel (onion-skin path only).
+//! Does not mutate `selected_frame` / `active_view` / composite cache.
+//! `@memcpy` in `resyncActiveView`/`pushPaintOp` copies 1..few layers once, and runs only
+//! right after frame switch, undo/redo, project load, or stroke commit
+//! (must not enter the main loop's every-frame path — explicit ban).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,45 +35,45 @@ const text_render = @import("text_render.zig");
 const blend = @import("blend.zig");
 const pixelops = @import("pixelops");
 
-/// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
-/// 切り詰めた長さを返す（`canvas.zig` の同名 private 関数と同じロジック。`LayerDef.setName`
-/// 専用に複製し `canvas.zig` の可視性を変更しない。TASK-79.3 と同型の固定長方針）。
+/// Truncate text to at most max bytes without cutting mid a UTF-8 continuation byte (0b10xxxxxx);
+/// return the truncated length (same logic as the private helper of the same name in `canvas.zig`.
+/// Duplicated for `LayerDef.setName` only so `canvas.zig` visibility stays unchanged; same fixed-length policy).
 fn safeUtf8TruncateLen(text: []const u8, max: usize) usize {
     var n = @min(text.len, max);
     while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
     return n;
 }
 
-/// cel_pool のスロット識別子。**Document のライフタイム中、一度払い出した値を
-/// 二度と別の cel へ再割り当てしない**（plan 4.3節）。
+/// Slot id in cel_pool. **Once issued for the Document lifetime, a value is never
+/// reassigned to a different cel**.
 pub const CelId = u32;
 
 pub const Cel = struct {
-    pixels: []u32, // canonical BGRA。gpa 所有
-    refcount: u32 = 1, // 同一 layer 内で何個の frame 列がこの cel を参照しているか
+    pixels: []u32, // canonical BGRA; owned by gpa
+    refcount: u32 = 1, // How many frame columns within the same layer reference this cel
 };
 
-/// 安定レイヤー handle（TASK-94 Phase A）。index とは独立し、move/delete/insert を跨いで
-/// 同一レイヤーを指し続ける。**0 は invalid 予約**・単調採番・**再利用なし**
-/// （undo で LayerDef ごと戻る場合を除き、削除済み id は再割り当てしない）。
-/// 採番・解決はイベント時のみ（フレーム毎 composite には触れない）。
+/// Stable layer handle. Independent of index; keeps pointing at the same layer across
+/// move/delete/insert. **0 is reserved invalid**; monotonic allocation; **no reuse**
+/// (except when undo restores a whole LayerDef; deleted ids are not reassigned otherwise).
+/// Allocate/resolve event-time only (does not touch per-frame composite).
 pub const LayerId = enum(u64) {
     invalid = 0,
     _,
 };
 
-/// レイヤー定義（Document レベル。全 frame で共有。TASK-79.3/79.5 の name/kind/TextParams は
-/// ここへ移動する）。
+/// Layer definition (Document level; shared across all frames. name/kind/TextParams
+/// live here).
 pub const LayerDef = struct {
-    /// 安定 handle。作成時（add/insert/load）に Document が採番する。既定 `.invalid` は
-    /// 一時構築用で、Document.layers に載る時点では必ず非 invalid。
+    /// Stable handle. Document allocates on create (add/insert/load). Default `.invalid` is for
+    /// temporary construction; once on Document.layers it must be non-invalid.
     id: LayerId = .invalid,
     visible: bool = true,
     opacity: u8 = 255,
     name_buf: [layer_name_max]u8 = undefined,
     name_len: u8 = 0,
     kind: LayerKind = .raster,
-    text_params: TextParams = .{}, // kind==.text の時のみ意味を持つ
+    text_params: TextParams = .{}, // Meaningful only when kind==.text
 
     pub fn name(self: *const LayerDef) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -90,14 +90,14 @@ pub const Frame = struct {
     duration_ms: u32 = 100,
 };
 
-/// 再生の実効間隔（秒）。`interval = (1/fps) × (duration_ms/100)`。
-/// fps は全体レート、duration_ms は frame 相対係数（既定 100 → 係数 1.0 = 従来の 1/fps）。
+/// Effective playback interval in seconds. `interval = (1/fps) × (duration_ms/100)`.
+/// fps is the global rate; duration_ms is a per-frame relative factor (default 100 → factor 1.0 = classic 1/fps).
 ///
-/// 仕様（TASK-45.4）:
-/// - 計算は全て f64
-/// - `fps <= 0` → `+inf`（進まない。UI スライダーは正値のみだが防御）
-/// - `duration_ms == 0` → 100 として扱う（ゼロ間隔の busy advance を防ぐ）
-/// - 入力は slider(f32 正値)/u32 のみで非有限値は入らない
+/// Spec:
+/// - All math in f64
+/// - `fps <= 0` → `+inf` (does not advance; UI slider is positive-only, but defend)
+/// - `duration_ms == 0` → treat as 100 (prevents busy advance at zero interval)
+/// - Inputs are slider(f32 positive)/u32 only; non-finite values do not enter
 pub fn playbackIntervalSec(fps: f32, duration_ms: u32) f64 {
     if (fps <= 0) return std.math.inf(f64);
     const fps_f64: f64 = @floatCast(fps);
@@ -105,40 +105,40 @@ pub fn playbackIntervalSec(fps: f32, duration_ms: u32) f64 {
     return dur / 100.0 * (1.0 / fps_f64);
 }
 
-/// 追いつき無し advance 判定。`now - last >= interval` なら true。
-/// 残余時間の補償はしない（呼び出し側が advance 後に `last = now` へリセットする）。
+/// Catch-up-free advance check. True when `now - last >= interval`.
+/// Does not compensate leftover time (caller resets `last = now` after advance).
 pub fn shouldAdvance(now: f64, last: f64, interval: f64) bool {
     return now - last >= interval;
 }
 
-/// 1 layer の全 frame 分の行（layer_add/delete 用）、または 1 frame の全 layer 分の列
-/// （frame_add/delete/duplicate 用）を、削除/復元のために一時保持する。
-/// `CelSetSnapshot.fully_released`/`Document.mergeDown` 用の共有 named 型（匿名 struct は
-/// 出現ごとに別型になり Zig の型検査で unify されないため、`.captureAndReleaseSlots` 等の
-/// 生成側と一致させるために名前を付ける）。
+/// Temporarily holds one layer's full frame row (for layer_add/delete) or one frame's full layer column
+/// (for frame_add/delete/duplicate) for delete/restore.
+/// Shared named type for `CelSetSnapshot.fully_released`/`Document.mergeDown` (anonymous structs
+/// are distinct types per occurrence and do not unify under Zig type checking, so name it to match
+/// producers such as `.captureAndReleaseSlots`).
 pub const CelSnapshotItem = struct { id: CelId, pixels: []u32 };
 
 pub const CelSetSnapshot = struct {
-    /// スロットごとの元 CelId（null=元々空だった）。行なら frames.len 個、列なら layers.len 個。
-    /// **この配列だけでは「実体を持つか」は分からない**（下記 fully_released と突き合わせる）。
+    /// Per-slot original CelId (null=was already empty). frames.len for a row, layers.len for a column.
+    /// **This array alone does not tell whether a body is held** (cross-check with fully_released below).
     slots: []?CelId,
-    /// slots に現れる CelId のうち、**この削除によって refcount が 0 になり実際に
-    /// `cel_pool` から取り除かれたもの**だけを、重複無く保持する（同一 id は1回だけ）。
+    /// Among CelIds appearing in slots, keep **only those whose refcount hit 0 from this delete and were
+    /// actually removed from `cel_pool`**, without duplicates (each id once).
     fully_released: []CelSnapshotItem,
 };
 
-/// layer_add/layer_delete 共通の Op payload（同一型にして switch prong を統合できるようにする）。
+/// Shared Op payload for layer_add/layer_delete (same type so switch prongs can merge).
 pub const LayerStructOp = struct {
     index: usize,
     selected_before: usize,
     selected_after: usize,
-    /// push直後=null（構造は既に変更済み・canvasはもう保持しない）→undoで非nullへ（捕捉）
-    /// →redoでnullへ（復元）。layer_add/delete で意味が反転する（4.6節と同じトグル）。
+    /// Right after push=null (structure already changed; canvas no longer held) → non-null on undo (capture)
+    /// → null on redo (restore). Meaning flips for layer_add/delete (same toggle pattern).
     def: ?LayerDef = null,
     row: ?CelSetSnapshot = null,
 };
 
-/// frame_add/frame_delete 共通の Op payload。
+/// Shared Op payload for frame_add/frame_delete.
 pub const FrameStructOp = struct {
     index: u32,
     selected_before: u32,
@@ -147,23 +147,23 @@ pub const FrameStructOp = struct {
     col: ?CelSetSnapshot = null,
 };
 
-/// 1 操作の中身。`document.zig` 側に移設（undo.zig ⇄ document.zig の循環 import 回避。plan 5.1節）。
+/// Body of one operation. Lives in `document.zig` (avoids circular import between undo.zig ⇄ document.zig).
 pub const Op = union(enum) {
-    /// raster ピクセル編集のコミット（`Document.pushPaintOp`/`pushClear` が構築する。唯一の生成口）。
+    /// Commit of a raster pixel edit (built by `Document.pushPaintOp`/`pushClear`; sole construction site).
     paint: struct {
         cel_id: CelId,
         diffs: []PixelDiff,
         layer_idx: usize,
         frame_idx: u32,
-        /// この paint がコミットされた時点で `ensureCelAt` が新規 blank cel を生成したか
-        /// （= grid スロットがそれまで null だったか）。
+        /// Whether `ensureCelAt` created a new blank cel when this paint committed
+        /// (= whether the grid slot was null until then).
         created: bool = false,
-        /// created==true の時のみ意味を持つ。非null ⇔ 現在「before（未作成）」状態が適用中
-        /// （grid スロット=null・cel は cel_pool から除去済み・この Op が pixels の所有権を保持）。
+        /// Meaningful only when created==true. Non-null ⇔ the "before (not yet created)" state is currently applied
+        /// (grid slot=null; cel removed from cel_pool; this Op owns the pixels).
         created_released: ?[]u32 = null,
     },
 
-    // ── layer メタデータ（frame非依存） ───────────
+    // ── layer metadata (frame-independent) ───────────
     layer_visible: struct { index: usize, before: bool, after: bool },
     layer_opacity: struct { index: usize, before: u8, after: u8 },
     layer_rename: struct { index: usize, before: NameSnapshot, after: NameSnapshot },
@@ -171,11 +171,11 @@ pub const Op = union(enum) {
     layer_text_params: struct { index: usize, before: TextParams, after: TextParams },
     layer_rasterize: struct { index: usize, before: TextParams },
 
-    // ── layer 構造（全frameの行を保持） ───────────
+    // ── layer structure (holds a row across all frames) ───────────
     layer_add: LayerStructOp,
     layer_delete: LayerStructOp,
 
-    // ── frame 構造（全layerの列を保持） ───────────
+    // ── frame structure (holds a column across all layers) ───────────
     frame_add: FrameStructOp,
     frame_delete: FrameStructOp,
     frame_duplicate: struct {
@@ -187,7 +187,7 @@ pub const Op = union(enum) {
         col: ?CelSetSnapshot = null,
     },
 
-    // ── merge down（frame数1のみ許可のMVP制限。9.1節で承認済み） ─
+    // ── merge down (MVP: only allowed while frame count is 1) ─
     layer_merge_down: struct {
         index: usize,
         selected_before: usize,
@@ -198,7 +198,7 @@ pub const Op = union(enum) {
         below_after: []u32,
     },
 
-    // ── cel リンク編集（4.6節 CelSetSnapshot の fully_released 原則を1スロットへ応用） ──
+    // ── cel link edit (apply CelSetSnapshot fully_released principle to one slot) ──
     cel_link: struct {
         layer_idx: usize,
         frame_idx: u32,
@@ -221,8 +221,8 @@ fn freeCelSetSnapshot(gpa: Allocator, snap: CelSetSnapshot) void {
     gpa.free(snap.fully_released);
 }
 
-/// snapshot を cel_pool へ復元した**後**に呼ぶ、コンテナ配列だけの解放（pixels の所有権は
-/// 既に cel_pool へ移っているため pixels 自体は解放しない）。
+/// Free container arrays only, called **after** restoring a snapshot into cel_pool (pixels ownership
+/// already moved to cel_pool, so do not free the pixels themselves).
 fn freeCelSetSnapshotContainer(gpa: Allocator, snap: CelSetSnapshot) void {
     gpa.free(snap.slots);
     gpa.free(snap.fully_released);
@@ -258,26 +258,26 @@ fn freeOp(gpa: Allocator, op: *Op) void {
     }
 }
 
-/// Undo/Redo スタック。各 Op の owned スライスは gpa 所有。
+/// Undo/Redo stack. Each Op's owned slices are owned by gpa.
 ///
-/// **handle タグ（TASK-62.5.3）**: `undo` 配列の各 Op に単調一意な u64 handle を並行配列
-/// `handles` で対応付ける（CommandRecord の `undo_ref` がこの handle を指す = AC #2 の対応付け。
-/// platform 非依存を保つため u64 のみで command 型には依存しない）。`redo` 配列はタグ対象外
-/// （undo 候補でないため）。`redoOne` の再 push は**新 handle を採番**する（旧 record との対応は
-/// 切れる。62.5.4 で undo/redo が revert record 化されるまでの暫定仕様）。
+/// **handle tag**: parallel array `handles` maps each Op in `undo` to a monotonic unique u64 handle
+/// (`CommandRecord.undo_ref` points at this handle. u64 only — no dependency on command types, keeps
+/// platform independence). `redo` is not tagged (not an undo candidate). Re-push via `redoOne`
+/// **allocates a new handle** (link to the old record is broken; interim until undo/redo become
+/// revert records).
 pub const UndoStack = struct {
     pub const max_history: usize = 128;
 
     undo: std.ArrayList(Op) = .empty,
     redo: std.ArrayList(Op) = .empty,
-    /// `undo` と要素同期する handle 並行配列（handles.items.len == undo.items.len 不変）。
+    /// Handle parallel array synced with `undo` (invariant: handles.items.len == undo.items.len).
     handles: std.ArrayList(u64) = .empty,
-    /// `undo` と要素同期する所有者タグ並行配列（TASK-62.5.4 review: CommandLog リング退避後の
-    /// 所有者誤認防止）。**paint は値の意味を解釈しない**（0=unknown を既定とし、それ以外の
-    /// 値の規約は app 側 = pixie が持つ）。push/redo 再 push は 0 で積まれ、app が `setOwner` で
-    /// 確定する。
+    /// Owner-tag parallel array synced with `undo` (avoids owner misattribution after CommandLog
+    /// ring eviction). **paint does not interpret tag meaning** (default 0=unknown; other values
+    /// are app/pixie convention). push/redo re-push stack 0; app confirms via
+    /// `setOwner`.
     owners: std.ArrayList(u8) = .empty,
-    /// 次に採番する handle（単調・再利用なし）。
+    /// Next handle to allocate (monotonic; no reuse).
     next_handle: u64 = 1,
 
     pub fn deinit(self: *UndoStack, gpa: Allocator) void {
@@ -297,21 +297,21 @@ pub const UndoStack = struct {
         self.redo.clearRetainingCapacity();
     }
 
-    /// handle を採番する（push と `Document.redoOne` の再 push が使う）。
+    /// Allocate a handle (used by push and `Document.redoOne` re-push).
     fn allocHandle(self: *UndoStack) u64 {
         const h = self.next_handle;
         self.next_handle += 1;
         return h;
     }
 
-    /// 直近 push された op の handle（undo 配列が空なら null）。
+    /// Handle of the most recently pushed op (null if undo is empty).
     pub fn topHandle(self: *const UndoStack) ?u64 {
         const n = self.handles.items.len;
         if (n == 0) return null;
         return self.handles.items[n - 1];
     }
 
-    /// 指定 handle の op に所有者タグを付ける（handle 不在なら no-op。タグの意味は app 規約）。
+    /// Attach an owner tag to the op for the given handle (no-op if handle missing; tag meaning is app convention).
     pub fn setOwner(self: *UndoStack, handle: u64, tag: u8) void {
         for (self.handles.items, 0..) |h, i| {
             if (h == handle) {
@@ -321,7 +321,7 @@ pub const UndoStack = struct {
         }
     }
 
-    /// 指定 handle の所有者タグ（不在は 0=unknown）。
+    /// Owner tag for the given handle (missing → 0=unknown).
     pub fn ownerOf(self: *const UndoStack, handle: u64) u8 {
         for (self.handles.items, 0..) |h, i| {
             if (h == handle) return self.owners.items[i];
@@ -329,7 +329,7 @@ pub const UndoStack = struct {
         return 0;
     }
 
-    /// 指定 handle の Op が undo 配列に現存するか（CommandRecord.undo_ref の live 判定用）。
+    /// Whether the Op for the given handle is still present on the undo array (live check for CommandRecord.undo_ref).
     pub fn hasHandle(self: *const UndoStack, handle: u64) bool {
         for (self.handles.items) |h| {
             if (h == handle) return true;
@@ -337,7 +337,7 @@ pub const UndoStack = struct {
         return false;
     }
 
-    /// 非空コマンドを積む。redo 履歴をクリアする。
+    /// Push a non-empty command. Clears redo history.
     pub fn push(self: *UndoStack, gpa: Allocator, op: Op) void {
         self.clearRedo(gpa);
         if (self.undo.items.len >= max_history) {
@@ -351,11 +351,11 @@ pub const UndoStack = struct {
         self.owners.append(gpa, 0) catch @panic("UndoStack.push: OOM");
     }
 
-    /// undo/redo 履歴を全クリアするが **handle 採番（next_handle）は保持する**。
-    /// ドキュメント読込等のリセット経路は必ずこちらを使う（`deinit` + `= .{}` で作り直すと
-    /// next_handle が 1 に戻り、①リセット前の採番値との差分計算が巻き戻って underflow
-    /// ②リセット前の CommandRecord.undo_ref と新規 Op の handle が衝突して live 判定が偽陽性、
-    /// の 2 つの不具合を生む。handle は App/CommandLog の生存期間で単調・再利用なし。TASK-62.5.3）。
+    /// Clear all undo/redo history but **keep handle allocation (`next_handle`)**.
+    /// Reset paths such as document load must use this (`deinit` + `= .{}` rebuilds would
+    /// reset next_handle to 1, causing (1) underflow when differencing against pre-reset allocation values and
+    /// (2) collisions between pre-reset CommandRecord.undo_ref and new Op handles → false-positive live checks.
+    /// Handles stay monotonic with no reuse for the App/CommandLog lifetime).
     pub fn clearHistoryPreservingHandles(self: *UndoStack, gpa: Allocator) void {
         const preserved = self.next_handle;
         self.deinit(gpa);
@@ -370,24 +370,24 @@ pub const Document = struct {
     height: u32,
     layers: std.ArrayList(LayerDef) = .empty,
     frames: std.ArrayList(Frame) = .empty,
-    /// null = 解放済みスロット（永久に再利用しない）。
+    /// null = freed slot (never reused).
     cel_pool: std.ArrayList(?Cel) = .empty,
     next_cel_id: CelId = 0,
-    /// 次に採番する LayerId の raw 値（単調・0=invalid 予約のため 1 始まり・再利用なし。TASK-94）。
+    /// Next LayerId raw value to allocate (monotonic; starts at 1 because 0=invalid reserved; no reuse).
     next_layer_id: u64 = 1,
     /// grid[layer_idx * frames.items.len + frame_idx] = ?CelId
     grid: std.ArrayList(?CelId) = .empty,
     selected_layer: usize = 0,
     selected_frame: u32 = 0,
-    /// アクティブフレームの合成/ツール描画用ビュー。既存 Canvas 型を無改造で流用。
+    /// Editable view of the active frame for composite/tool drawing. Reuses existing Canvas type unchanged.
     active_view: Canvas,
     undo: UndoStack = .{},
     allocator: Allocator,
-    /// ドキュメント付属パレット（TASK-89）。空 = 未設定（load 時 DB16 等で初期化は app 側）。
-    /// selected は view 状態なので永続化しない。色は canonical BGRA 0xAARRGGBB。
+    /// Document-attached palette. Empty = unset (app initializes e.g. DB16 on load).
+    /// selected is view state and is not persisted. Colors are canonical BGRA 0xAARRGGBB.
     palette: std.ArrayList(u32) = .empty,
 
-    /// 1 layer / 1 frame（blank）の Document を作る。App 起動時の初期状態。
+    /// Create a Document with 1 layer / 1 frame (blank). App startup initial state.
     pub fn init(gpa: Allocator, w: u32, h: u32) !Document {
         var doc = try initEmpty(gpa, w, h);
         errdefer doc.deinit();
@@ -395,32 +395,32 @@ pub const Document = struct {
         def.setName("Layer 1");
         try doc.layers.append(gpa, def);
         try doc.frames.append(gpa, .{});
-        try doc.grid.append(gpa, null); // 空セル=透明（遅延生成）
+        try doc.grid.append(gpa, null); // Empty cel=transparent (lazy create)
         return doc;
     }
 
-    /// layer/frame を 1 つも持たない Document（decoder が組み立てる土台）。
-    /// `active_view` は Canvas.init 既定の 1 blank layer から始まる（decode 完了後に
-    /// `resyncActiveView` で doc.layers に合わせて reconcile される）。
+    /// Document with no layers/frames (scaffold the decoder builds into).
+    /// `active_view` starts from Canvas.init's default 1 blank layer (after decode finishes,
+    /// `resyncActiveView` reconciles it to match doc.layers).
     pub fn initEmpty(gpa: Allocator, w: u32, h: u32) !Document {
         const view = try Canvas.init(gpa, w, h);
         return .{ .width = w, .height = h, .active_view = view, .allocator = gpa };
     }
 
-    /// 新規 LayerId を 1 つ採番する（単調・再利用なし。0=invalid は返さない）。
+    /// Allocate one new LayerId (monotonic; no reuse; never returns 0=invalid).
     pub fn allocLayerId(self: *Document) LayerId {
         const raw = self.next_layer_id;
         self.next_layer_id += 1;
         return @enumFromInt(raw);
     }
 
-    /// index → 安定 handle。範囲外は null。
+    /// index → stable handle. Out of range → null.
     pub fn layerIdAt(self: *const Document, index: usize) ?LayerId {
         if (index >= self.layers.items.len) return null;
         return self.layers.items[index].id;
     }
 
-    /// 安定 handle → 現在の index。削除済み / invalid / 不在は null。
+    /// Stable handle → current index. Deleted / invalid / missing → null.
     pub fn layerIndexOf(self: *const Document, id: LayerId) ?usize {
         if (id == .invalid) return null;
         for (self.layers.items, 0..) |def, i| {
@@ -440,7 +440,7 @@ pub const Document = struct {
         self.active_view.deinit();
     }
 
-    /// pixie 等の呼び出し元が保持する `*Canvas` の取得口（TASK-63 互換）。
+    /// Accessor for the `*Canvas` held by callers such as pixie.
     pub fn activeCanvas(self: *Document) *Canvas {
         return &self.active_view;
     }
@@ -460,7 +460,7 @@ pub const Document = struct {
         return self.grid.items[self.gridIndex(layer_idx, frame_idx)];
     }
 
-    /// cel_pool の pixels を参照する（タイムラインサムネ等。TASK-45.2）。
+    /// Borrow cel_pool pixels (timeline thumbnails, etc.).
     pub fn celPixels(self: *const Document, id: CelId) ?[]const u32 {
         if (id >= self.cel_pool.items.len) return null;
         if (self.cel_pool.items[id]) |cel| return cel.pixels;
@@ -472,12 +472,12 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // cel の生成・削除・リンク・GC（plan 4.3節）
+    // cel create / delete / link / GC
     // ══════════════════════════════════════════════════════════════════
 
-    /// blank cel を1個確保して cel_pool へ push する（`next_cel_id` を1消費。非再利用）。
-    /// 返る CelId は常に `cel_pool.items.len - 1`（append-only。null 化されても詰めないため
-    /// `cel_pool.items.len == next_cel_id` が常に成立する）。
+    /// Allocate one blank cel and push it onto cel_pool (consumes one `next_cel_id`; no reuse).
+    /// Returned CelId is always `cel_pool.items.len - 1` (append-only; nulling does not compact, so
+    /// `cel_pool.items.len == next_cel_id` always holds).
     fn allocBlankCel(self: *Document, gpa: Allocator) CelId {
         const n = @as(usize, self.width) * self.height;
         const pixels = gpa.alloc(u32, n) catch @panic("Document.allocBlankCel: OOM");
@@ -489,10 +489,10 @@ pub const Document = struct {
         return id;
     }
 
-    /// refcount を1減らす。0に到達したら pixels の所有権を取り出しつつ `cel_pool[id]=null`
-    /// にする（0に到達しなければ null を返し cel は生存継続）。単発 decrement の低レベル
-    /// ヘルパー（4.6節の CelSetSnapshot capture とは別実装。原則は同じだが出現回数集計を
-    /// 伴わない単純ケース専用）。
+    /// Decrement refcount by 1. On reaching 0, take ownership of pixels and set `cel_pool[id]=null`
+    /// (otherwise return null and leave the cel alive). Low-level single-decrement helper
+    /// (separate from CelSetSnapshot capture; same principle, but for the simple case with no
+    /// occurrence counting).
     fn releaseCelMaybeCapture(self: *Document, id: CelId) ?[]u32 {
         var cel = &(self.cel_pool.items[id].?);
         std.debug.assert(cel.refcount > 0);
@@ -509,33 +509,33 @@ pub const Document = struct {
         self.cel_pool.items[id].?.refcount += 1;
     }
 
-    /// 既存なら no-op で返す、無ければ新規 blank cel を確保して grid にセットし返す。
-    /// `created` は呼び出し元（`pushPaintOp`）が undo の created フラグに使う。
-    /// kind==.text の layer では既存の共有 cel を返すだけの前提（無ければバグ＝assert）。
+    /// Return existing if present (no-op); otherwise allocate a new blank cel, set it on the grid, and return it.
+    /// `created` is used by the caller (`pushPaintOp`) for the undo created flag.
+    /// For kind==.text layers, the premise is that a shared cel already exists (assert if missing).
     pub fn ensureCelAt(self: *Document, gpa: Allocator, layer_idx: usize, frame_idx: u32) EnsureResult {
         if (self.gridGet(layer_idx, frame_idx)) |id| return .{ .id = id, .created = false };
-        std.debug.assert(self.layers.items[layer_idx].kind != .text); // 4.4節: text は既に共有celを持つはず
+        std.debug.assert(self.layers.items[layer_idx].kind != .text); // text should already have a shared cel
         const id = self.allocBlankCel(gpa);
         self.setGrid(layer_idx, frame_idx, id);
         return .{ .id = id, .created = true };
     }
 
-    /// `ensureCelAt` の薄い公開ラッパー（created の有無を捨てる用途向け）。
+    /// Thin public wrapper over `ensureCelAt` (for callers that discard whether created).
     pub fn createCel(self: *Document, gpa: Allocator, layer_idx: usize, frame_idx: u32) CelId {
         return self.ensureCelAt(gpa, layer_idx, frame_idx).id;
     }
 
-    /// スロットを空へ戻す（cel参照をrelease。0到達で回収）。既に空なら no-op。Undo 非対応
-    /// （低レベルプリミティブ。呼び出し元は用途に応じて Undo を別途設計する）。
+    /// Clear a slot (release the cel ref; reclaim at 0). Already empty → no-op. Not Undo-aware
+    /// (low-level primitive; callers design Undo separately as needed).
     pub fn clearCel(self: *Document, gpa: Allocator, layer_idx: usize, frame_idx: u32) void {
         const id = self.gridGet(layer_idx, frame_idx) orelse return;
         if (self.releaseCelMaybeCapture(id)) |pixels| gpa.free(pixels);
         self.setGrid(layer_idx, frame_idx, null);
     }
 
-    /// text layer の不変条件（全frameが同一CelIdを指す）を強制する唯一のポイント（4.4節）。
-    /// 対象 layer の grid 列を走査し、最初に見つかった non-null CelId を正典とする（無ければ
-    /// 新規作成）。残りの列は正典へ張り替える（release/retain）。
+    /// Sole enforcement point for the text-layer invariant (every frame points at the same CelId).
+    /// Scan the layer's grid column; the first non-null CelId found is canonical (create if none).
+    /// Retarget remaining columns to the canonical (release/retain).
     pub fn normalizeTextLayerLinks(self: *Document, gpa: Allocator, layer_idx: usize) void {
         const nframes = self.frames.items.len;
         var canonical: ?CelId = null;
@@ -547,13 +547,13 @@ pub const Document = struct {
         }
         const canon = canonical orelse blk: {
             const id = self.allocBlankCel(gpa);
-            self.cel_pool.items[id].?.refcount = 0; // まだどの grid スロットも指していない
+            self.cel_pool.items[id].?.refcount = 0; // No grid slot points at anything yet
             break :blk id;
         };
         for (0..nframes) |f| {
             const fi: u32 = @intCast(f);
             const cur = self.gridGet(layer_idx, fi);
-            if (cur != null and cur.? == canon) continue; // 既に正典
+            if (cur != null and cur.? == canon) continue; // Already canonical
             if (cur) |old_id| {
                 if (self.releaseCelMaybeCapture(old_id)) |pixels| gpa.free(pixels);
             }
@@ -562,8 +562,8 @@ pub const Document = struct {
         }
     }
 
-    /// `linkCel`/`unlinkCel` の active_view 即時反映（4.2節: 通常経路の Document API は
-    /// 自分で active_view も更新してよい。resyncActiveView は経由しない）。
+    /// Immediate `active_view` update for `linkCel`/`unlinkCel` (normal Document API paths may update
+    /// `active_view` themselves; do not go through resyncActiveView).
     fn syncActiveViewSlot(self: *Document, layer_idx: usize, frame_idx: u32) void {
         if (frame_idx != self.selected_frame) return;
         const dst = self.active_view.layerPixels(layer_idx);
@@ -574,13 +574,13 @@ pub const Document = struct {
         }
     }
 
-    /// `dst_frame` のスロットを `src_frame` が指す CelId へ張り替える（共有編集(a)の確立）。
-    /// Undo 対応（`Op.cel_link`。4.6節 CelSetSnapshot の fully_released 原則の1スロット応用）。
+    /// Retarget the `dst_frame` slot to the CelId that `src_frame` points at (establishes shared edit (a)).
+    /// Undo-aware (`Op.cel_link`; one-slot application of CelSetSnapshot fully_released).
     pub fn linkCel(self: *Document, gpa: Allocator, layer_idx: usize, dst_frame: u32, src_frame: u32) !void {
         if (self.layers.items[layer_idx].kind == .text) return error.TextLayerLinked;
         const src_id = self.gridGet(layer_idx, src_frame) orelse return error.SourceCelEmpty;
         const dst_before = self.gridGet(layer_idx, dst_frame);
-        if (dst_before != null and dst_before.? == src_id) return; // 既にリンク済み（no-op）
+        if (dst_before != null and dst_before.? == src_id) return; // Already linked (no-op)
         var before_released: ?[]u32 = null;
         if (dst_before) |bid| before_released = self.releaseCelMaybeCapture(bid);
         self.retainCel(src_id);
@@ -595,16 +595,16 @@ pub const Document = struct {
         self.syncActiveViewSlot(layer_idx, dst_frame);
     }
 
-    /// 対象スロットの共有 cel を複製して独立 cel へ切り替える（refcount--・新規 cel は
-    /// refcount=1）。Undo 対応（`Op.cel_unlink`）。既に非共有（refcount<=1）は no-op。
+    /// Duplicate the shared cel at the target slot into an independent cel (refcount--; new cel has
+    /// refcount=1). Undo-aware (`Op.cel_unlink`). Already unshared (refcount<=1) → no-op.
     pub fn unlinkCel(self: *Document, gpa: Allocator, layer_idx: usize, frame_idx: u32) !void {
         if (self.layers.items[layer_idx].kind == .text) return error.TextLayerLinked;
         const cid = self.gridGet(layer_idx, frame_idx) orelse return error.EmptySlot;
         const refcount = self.cel_pool.items[cid].?.refcount;
-        if (refcount <= 1) return; // 既に独立（no-op）
+        if (refcount <= 1) return; // Already independent (no-op)
         const new_id = self.allocBlankCel(gpa);
         @memcpy(self.cel_pool.items[new_id].?.pixels, self.cel_pool.items[cid].?.pixels);
-        std.debug.assert(self.releaseCelMaybeCapture(cid) == null); // 共有中なので0に到達しない
+        std.debug.assert(self.releaseCelMaybeCapture(cid) == null); // Shared, so will not hit 0
         self.setGrid(layer_idx, frame_idx, new_id);
         self.undo.push(gpa, .{ .cel_unlink = .{
             .layer_idx = layer_idx,
@@ -617,14 +617,14 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // Canvas との同期（plan 4.2節）
+    // Sync with Canvas
     // ══════════════════════════════════════════════════════════════════
 
-    /// 現フレームの各 layer を doc.layers+grid[*][selected_frame] から作り直す（読み出し）。
-    /// 呼び出し元は: frame切替直後・undoOne/redoOne直後・project load直後の3箇所のみ
-    /// （main loop の毎フレーム経路へ混入させない。plan 2節の明示的禁止事項）。
+    /// Rebuild each layer of the current frame from doc.layers+grid[*][selected_frame] (read path).
+    /// Call sites: only the three places right after frame switch, undoOne/redoOne, or project load
+    /// (must not enter the main loop's every-frame path — explicit ban).
     pub fn resyncActiveView(self: *Document, gpa: Allocator) void {
-        // レイヤー数 reconcile（v5補遺(b)）: Canvas 所有 pixels の alloc/free は Canvas API に任せる。
+        // Layer-count reconcile: alloc/free of Canvas-owned pixels is left to the Canvas API.
         while (self.active_view.layers.items.len > self.layers.items.len) {
             const removed = self.active_view.deleteLayer(self.active_view.layers.items.len - 1) orelse break;
             gpa.free(removed.pixels);
@@ -633,8 +633,8 @@ pub const Document = struct {
             const blank = self.active_view.allocBlankLayer(gpa) catch @panic("Document.resyncActiveView: OOM");
             self.active_view.insertLayer(gpa, self.active_view.layers.items.len, blank) catch @panic("Document.resyncActiveView: OOM");
         }
-        // per-layer content + metadata（layerPixels() アクセサ経由。v5補遺(a): composite cache
-        // 無効化を自動成立させるため直接 `layers.items[i].pixels` を触らない）。
+        // per-layer content + metadata (via layerPixels() accessor: do not touch `layers.items[i].pixels`
+        // directly so composite-cache invalidation stays automatic).
         for (self.layers.items, 0..) |def, i| {
             const dst = self.active_view.layerPixels(i);
             if (self.gridGet(i, self.selected_frame)) |cel_id| {
@@ -648,15 +648,15 @@ pub const Document = struct {
             self.active_view.layers.items[i].kind = def.kind;
             self.active_view.layers.items[i].text_params = def.text_params;
         }
-        // selected_layer は doc が唯一の権威（4.5節）。system_font は一切触らない。
+        // selected_layer: Document is the sole authority. Never touch system_font.
         self.active_view.selected_layer = self.selected_layer;
     }
 
-    /// 指定 frame の全 visible layer を straight-alpha 合成して `dst` へ書く（表示専用。TASK-45.3）。
-    /// `selected_frame` / `active_view` / composite cache は一切変更しない。
+    /// Composite all visible layers of the given frame with straight alpha into `dst` (display only).
+    /// Does not mutate `selected_frame` / `active_view` / composite cache at all.
     ///
-    /// 毎フレーム全画素×レイヤ数を走るホットパス（オニオンスキン表示のみ。`onion_skin.build` 経由）。
-    /// `canvas.compositeStraight` と同型の pixelops SIMD 4px ループ（cel_pool 直読み）。
+    /// Hot path that runs every frame over all pixels × layer count (onion-skin display only; via `onion_skin.build`).
+    /// Same shape as `canvas.compositeStraight`: pixelops SIMD 4px loop (reads cel_pool directly).
     pub fn compositeFrameStraight(self: *const Document, frame_idx: u32, dst: []u32) void {
         const n = @as(usize, self.width) * self.height;
         std.debug.assert(dst.len == n);
@@ -682,33 +682,33 @@ pub const Document = struct {
         }
     }
 
-    /// active_view の指定 layer を現 `selected_frame` の cel_pool へ全面書き戻す
-    /// （`ensureCelAt` + memcpy。`created` を返す）。pushPaintOp / commitActiveLayerToCel 共用。
+    /// Write the given active_view layer fully back into the current `selected_frame` cel_pool
+    /// (`ensureCelAt` + memcpy; returns `created`). Shared by pushPaintOp / commitActiveLayerToCel.
     fn writebackActiveLayerToCel(self: *Document, gpa: Allocator, layer_idx: usize) EnsureResult {
         const ensured = self.ensureCelAt(gpa, layer_idx, self.selected_frame);
         @memcpy(self.cel_pool.items[ensured.id].?.pixels, self.active_view.layerPixels(layer_idx));
         return ensured;
     }
 
-    /// active_view の指定 layer を現 `selected_frame` の cel へ書き戻す（undo Op なし）。
-    /// PNG open 等、Op 化しない全面置き換え用。frame は常に `selected_frame`
-    /// （`resetToSingleBlankLayer` 後は 0）。text layer は呼び出し禁止（assert）。
-    /// ホットパス: イベント時のみ（open/save 経路）。
+    /// Write the given active_view layer back into the current `selected_frame` cel (no undo Op).
+    /// For full replacement that is not Op-ified (e.g. PNG open). Frame is always `selected_frame`
+    /// (0 after `resetToSingleBlankLayer`). Forbidden on text layers (assert).
+    /// Hot path: event-time only (open/save path).
     pub fn commitActiveLayerToCel(self: *Document, gpa: Allocator, layer_idx: usize) void {
         std.debug.assert(self.layers.items[layer_idx].kind != .text);
         _ = self.writebackActiveLayerToCel(gpa, layer_idx);
     }
 
-    /// raster ピクセルを変更する全ての操作が経由する唯一のコミット口
-    /// （ensureCelAt→書き戻し→Op構築→push の3手順を1回の呼び出しに集約）。
-    /// `diffs` の所有権は呼ばれた時点で常に doc へ移る（早期returnでも必ず解放する）。
+    /// Sole commit site for every operation that mutates raster pixels
+    /// (folds ensureCelAt → write-back → Op build → push into one call).
+    /// Ownership of `diffs` always transfers to doc on entry (must free even on early return).
     pub fn pushPaintOp(self: *Document, gpa: Allocator, layer_idx: usize, diffs: []PixelDiff) error{TextLayerSelected}!void {
         if (self.layers.items[layer_idx].kind == .text) {
             gpa.free(diffs);
             return error.TextLayerSelected;
         }
         if (diffs.len == 0) {
-            gpa.free(diffs); // 変化なし。cel を作らない・push しない
+            gpa.free(diffs); // No change. Do not create a cel or push.
             return;
         }
         const ensured = self.writebackActiveLayerToCel(gpa, layer_idx);
@@ -721,8 +721,8 @@ pub const Document = struct {
         } });
     }
 
-    /// 選択中 layer の現フレームを全消去する Op を構築して push する（`pushPaintOp` の
-    /// 「build→memset→push」を1 API に集約した薄いラッパー）。
+    /// Build and push an Op that clears the selected layer's current frame (thin wrapper that folds
+    /// `pushPaintOp`'s "build→memset→push" into one API).
     pub fn pushClear(self: *Document, gpa: Allocator, layer_idx: usize) error{TextLayerSelected}!void {
         if (self.layers.items[layer_idx].kind == .text) return error.TextLayerSelected;
         const pixels = self.active_view.layerPixels(layer_idx);
@@ -741,9 +741,9 @@ pub const Document = struct {
         try self.pushPaintOp(gpa, layer_idx, owned);
     }
 
-    /// 選択中 layer の現フレームで色 `from` を `to` に一括置換する（TASK-89）。
-    /// 全一致比較・tolerance なし（ドット絵前提）。`from==to` または 0 画素は no-op（Op を積まない）。
-    /// 戻り値 = 置換画素数。イベント時のみ（フレーム毎ループではない）。
+    /// Bulk-replace color `from` with `to` on the selected layer's current frame.
+    /// Exact match; no tolerance (pixel-art premise). `from==to` or 0 pixels → no-op (no Op pushed).
+    /// Return value = replaced pixel count. Event-time only (not a per-frame loop).
     pub fn pushReplaceColor(self: *Document, gpa: Allocator, layer_idx: usize, from: u32, to: u32) error{TextLayerSelected}!u32 {
         if (from == to) return 0;
         if (self.layers.items[layer_idx].kind == .text) return error.TextLayerSelected;
@@ -766,13 +766,13 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // CelSetSnapshot capture/restore（4.6節。行=layer全frame分・列=frame全layer分の一括処理）
+    // CelSetSnapshot capture/restore (batch: row=all frames of a layer; column=all layers of a frame)
     // ══════════════════════════════════════════════════════════════════
 
-    /// `slots`（既に呼び出し側が grid から抜き取り済みの生の ?CelId 配列。所有権は snapshot へ
-    /// 移る）を占有する各 cel について、この slots 内での出現回数と refcount を比較し、
-    /// 出現回数==refcount なら実際に release して pixels を capture（fully_released へ）、
-    /// 出現回数<refcount なら release分だけ decrement する（生存継続）。
+    /// For each cel occupied by `slots` (raw ?CelId array already extracted from the grid by the caller;
+    /// ownership moves to the snapshot), compare occurrence count inside these slots against refcount:
+    /// if occurrence==refcount, actually release and capture pixels (into fully_released);
+    /// if occurrence<refcount, only decrement for the releases (cel stays alive).
     fn captureAndReleaseSlots(self: *Document, gpa: Allocator, slots: []?CelId) CelSetSnapshot {
         var fully: std.ArrayList(CelSnapshotItem) = .empty;
         var i: usize = 0;
@@ -802,9 +802,9 @@ pub const Document = struct {
         return .{ .slots = slots, .fully_released = fully.toOwnedSlice(gpa) catch @panic("Document.captureAndReleaseSlots: OOM") };
     }
 
-    /// snapshot の内容を cel_pool へ復元する（fully_released は新規再構築・生存分は
-    /// refcount を出現回数分戻す）。**grid への書き込みは呼び出し側の責務**（このメソッドは
-    /// cel_pool 側のみを扱う）。
+    /// Restore snapshot contents into cel_pool (fully_released are rebuilt; survivors get refcount bumped
+    /// by occurrence count). **Writing the grid is the caller's job** (this method touches
+    /// cel_pool only).
     fn restoreCelPoolRefs(self: *Document, gpa: Allocator, snapshot: CelSetSnapshot) void {
         for (snapshot.fully_released) |fr| {
             var occ: u32 = 0;
@@ -829,7 +829,7 @@ pub const Document = struct {
                 in_fully = true;
                 break;
             };
-            if (in_fully) continue; // 上のループで既に復元済み
+            if (in_fully) continue; // Already restored by the loop above
             var occ: u32 = 0;
             for (snapshot.slots) |s| {
                 if (s != null and s.? == id) occ += 1;
@@ -838,7 +838,7 @@ pub const Document = struct {
         }
     }
 
-    // ── layer 行の capture/restore（layer_add/layer_delete 用） ──────────
+    // ── layer-row capture/restore (for layer_add/layer_delete) ──────────
 
     fn removeLayerRow(self: *Document, gpa: Allocator, layer_idx: usize) CelSetSnapshot {
         const nframes = self.frames.items.len;
@@ -855,10 +855,10 @@ pub const Document = struct {
         freeCelSetSnapshotContainer(gpa, snapshot);
     }
 
-    // ── frame 列の raw 操作（cel_pool 非関与。addFrame/duplicateFrame の通常経路用） ──────
+    // ── raw frame-column ops (cel_pool untouched; normal addFrame/duplicateFrame path) ──────
 
-    /// grid を「frame_idx 列を追加した」新しい形へ再構築する（cel_pool 側には触れない）。
-    /// 呼び出し時点で self.frames はまだ更新前（stride は現在の frames.items.len を使う）。
+    /// Rebuild the grid into a shape with a new column at frame_idx (does not touch cel_pool).
+    /// At call time self.frames is still pre-update (stride uses current frames.items.len).
     fn insertFrameColumnValues(self: *Document, gpa: Allocator, frame_idx: u32, values: []const ?CelId) void {
         const nlayers = self.layers.items.len;
         const old_stride = self.frames.items.len;
@@ -879,8 +879,8 @@ pub const Document = struct {
         self.grid = new_grid;
     }
 
-    /// grid から frame_idx 列を除いた新しい形へ再構築し、除かれた列を返す（cel_pool 側には
-    /// 触れない。呼び出し時点で self.frames はまだ更新前）。
+    /// Rebuild the grid without the frame_idx column and return the removed column (does not touch
+    /// cel_pool; at call time self.frames is still pre-update).
     fn removeFrameColumnValues(self: *Document, gpa: Allocator, frame_idx: u32) []?CelId {
         const nlayers = self.layers.items.len;
         const old_stride = self.frames.items.len;
@@ -900,12 +900,12 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // layer メタデータ操作（frame非依存。plan 4.5節）
+    // layer metadata ops (frame-independent)
     // ══════════════════════════════════════════════════════════════════
 
-    /// 選択レイヤーを切り替える（Undo 非対応。既存 UI/action の `select_layer` と同型の
-    /// 「no push」操作。plan §8.4「pixie側は active_view.selectLayer を直接呼ばない」に対応する
-    /// Document 側の唯一の入口）。
+    /// Switch the selected layer (not Undo-aware. Same "no push" shape as existing UI/action
+    /// `select_layer`. Sole Document-side entry so pixie does not call `active_view.selectLayer`
+    /// directly).
     pub fn selectLayer(self: *Document, index: usize) !void {
         if (index >= self.layers.items.len) return error.OutOfRange;
         self.selected_layer = index;
@@ -935,7 +935,7 @@ pub const Document = struct {
         const before = NameSnapshot.of(self.layers.items[index].name());
         self.layers.items[index].setName(new_name);
         const after = NameSnapshot.of(self.layers.items[index].name());
-        if (std.mem.eql(u8, before.slice(), after.slice())) return; // 冪等 no-op
+        if (std.mem.eql(u8, before.slice(), after.slice())) return; // Idempotent no-op
         _ = self.active_view.setLayerName(index, self.layers.items[index].name());
         self.undo.push(gpa, .{ .layer_rename = .{ .index = index, .before = before, .after = after } });
     }
@@ -949,8 +949,8 @@ pub const Document = struct {
         self.undo.push(gpa, .{ .layer_reorder = .{ .from = from, .to = to, .selected_before = selected_before, .selected_after = self.selected_layer } });
     }
 
-    // ── LayerId 解決 wrapper（additive。既存 index API は不変。TASK-94 Phase A）──
-    // 削除済み / invalid id は `error.UnknownLayerId`。index 系と同じ結果を返す。
+    // ── LayerId resolve wrappers (additive; existing index APIs unchanged) ──
+    // Deleted / invalid id → `error.UnknownLayerId`. Same results as the index APIs.
 
     pub fn selectLayerById(self: *Document, id: LayerId) !void {
         const index = self.layerIndexOf(id) orelse return error.UnknownLayerId;
@@ -967,7 +967,7 @@ pub const Document = struct {
         try self.setLayerOpacity(gpa, index, opacity);
     }
 
-    /// `id` の layer を index `to` へ移動する（`reorderLayer(from, to)` と同値）。
+    /// Move the layer for `id` to index `to` (equivalent to `reorderLayer(from, to)`).
     pub fn moveLayerById(self: *Document, gpa: Allocator, id: LayerId, to: usize) !void {
         const from = self.layerIndexOf(id) orelse return error.UnknownLayerId;
         try self.reorderLayer(gpa, from, to);
@@ -978,8 +978,8 @@ pub const Document = struct {
         try self.deleteLayer(gpa, index);
     }
 
-    /// doc.layers と grid の行を入れ替える（`ArrayList.orderedRemove`+`insert` と同じ
-    /// index 意味論。`to` は削除後の配列における挿入位置）。
+    /// Swap rows in doc.layers and the grid (same index semantics as `ArrayList.orderedRemove`+`insert`;
+    /// `to` is the insertion position in the post-remove array).
     fn moveLayerRaw(self: *Document, gpa: Allocator, from: usize, to: usize) void {
         const moved = self.layers.orderedRemove(from);
         self.layers.insert(gpa, to, moved) catch @panic("Document.moveLayerRaw: OOM");
@@ -991,11 +991,11 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // layer 構造操作（plan 4.5節）
+    // layer structure ops
     // ══════════════════════════════════════════════════════════════════
 
-    /// grid に新しい行を追加、**現在の selected_frame のみ** blank cel を確保（他 frame は
-    /// null=透明。初回描画時に遅延生成）。
+    /// Append a new grid row; allocate a blank cel for **the current selected_frame only** (other frames
+    /// stay null=transparent; lazy-created on first paint).
     pub fn addLayer(self: *Document, gpa: Allocator) !usize {
         const idx = self.layers.items.len;
         const selected_before = self.selected_layer;
@@ -1018,8 +1018,8 @@ pub const Document = struct {
         return idx;
     }
 
-    /// テキストレイヤーを新規追加する。**全既存 frame** に共有 cel をリンクする（4.4節。
-    /// raster の addLayer とは非対称）。
+    /// Add a new text layer. Link a shared cel across **all existing frames**
+    /// (asymmetric vs raster addLayer).
     pub fn addTextLayer(self: *Document, gpa: Allocator, params: TextParams) !usize {
         const idx = self.layers.items.len;
         const selected_before = self.selected_layer;
@@ -1055,11 +1055,11 @@ pub const Document = struct {
         try self.active_view.insertLayer(gpa, idx, av_layer);
         self.selected_layer = idx;
         self.undo.push(gpa, .{ .layer_add = .{ .index = idx, .selected_before = selected_before, .selected_after = idx } });
-        self.resyncActiveView(gpa); // pixels/kind/text_params を active_view へ反映
+        self.resyncActiveView(gpa); // Reflect pixels/kind/text_params into active_view
         return idx;
     }
 
-    /// grid の行を削除。各 frame の cel 参照を release（refcount減算・0で回収）。
+    /// Delete a grid row. Release each frame's cel ref (refcount--; reclaim at 0).
     pub fn deleteLayer(self: *Document, gpa: Allocator, index: usize) !void {
         if (self.layers.items.len <= 1) return error.LastLayer;
         if (index >= self.layers.items.len) return error.OutOfRange;
@@ -1082,14 +1082,14 @@ pub const Document = struct {
         } });
     }
 
-    /// 選択レイヤーを複製し、直上へ挿入する。raster は各 frame を独立 deep copy、
-    /// text は新規 cel を全既存 frame へリンクする独立レイヤーとして扱う（4.4節item4）。
+    /// Duplicate the selected layer and insert it immediately above. raster: independent deep copy per frame;
+    /// text: treat as an independent layer linking a new cel across all existing frames.
     pub fn duplicateLayer(self: *Document, gpa: Allocator, src_idx: usize) !usize {
         if (src_idx >= self.layers.items.len) return error.OutOfRange;
         const new_idx = src_idx + 1;
         const selected_before = self.selected_layer;
         const src_def = self.layers.items[src_idx];
-        // POD 値コピー（text_params・名前継承）+ 新規 LayerId（複製は別 identity。TASK-94）
+        // POD value copy (inherit text_params/name) + new LayerId (duplicate is a distinct identity)
         var new_def = src_def;
         new_def.id = self.allocLayerId();
         const nframes = self.frames.items.len;
@@ -1130,7 +1130,7 @@ pub const Document = struct {
         return new_idx;
     }
 
-    /// テキストレイヤーの text_params を更新し、共有 cel を再ラスタライズする。
+    /// Update a text layer's text_params and re-rasterize the shared cel.
     pub fn setLayerTextParams(self: *Document, gpa: Allocator, index: usize, params: TextParams) !void {
         if (index >= self.layers.items.len) return error.OutOfRange;
         if (self.layers.items[index].kind != .text) return error.NotTextLayer;
@@ -1144,13 +1144,13 @@ pub const Document = struct {
         self.undo.push(gpa, .{ .layer_text_params = .{ .index = index, .before = before, .after = params } });
     }
 
-    /// layer の共有 cel（全frame同一CelIdの前提。4.4節）を探して再ラスタライズする。
+    /// Find the layer's shared cel (premise: same CelId on every frame) and re-rasterize.
     fn sharedTextCelId(self: *const Document, layer_idx: usize) CelId {
         const nframes = self.frames.items.len;
         for (0..nframes) |f| {
             if (self.gridGet(layer_idx, @intCast(f))) |id| return id;
         }
-        unreachable; // 4.4節不変条件: text layer は全frameにcelを持つ
+        unreachable; // text-layer invariant: every frame has a cel
     }
 
     fn rasterizeSharedTextCel(self: *Document, gpa: Allocator, layer_idx: usize, params: TextParams) !void {
@@ -1160,22 +1160,22 @@ pub const Document = struct {
         try text_render.rasterizeTextLayer(gpa, pixels, self.width, self.height, params.text(), params.font_px, params.color, params.x, params.y, self.active_view.system_font);
     }
 
-    /// テキストレイヤーを通常 raster レイヤーへ確定する（bake）。pixels は不変（既に
-    /// 最新のラスタライズ結果）。呼び出し前の text_params を返す（Undo 用）。
+    /// Bake a text layer into a normal raster layer. pixels are unchanged (already the latest
+    /// rasterize result). Returns pre-call text_params (for Undo).
     pub fn rasterizeLayer(self: *Document, gpa: Allocator, index: usize) !TextParams {
         if (index >= self.layers.items.len) return error.OutOfRange;
         if (self.layers.items[index].kind != .text) return error.NotTextLayer;
         const before = self.layers.items[index].text_params;
         self.layers.items[index].kind = .raster;
         self.layers.items[index].text_params = .{};
-        self.active_view.layers.items[index].kind = .raster; // pixels不変・markDirty不要
+        self.active_view.layers.items[index].kind = .raster; // pixels unchanged; markDirty not needed
         self.active_view.layers.items[index].text_params = .{};
         self.undo.push(gpa, .{ .layer_rasterize = .{ .index = index, .before = before } });
         return before;
     }
 
-    /// 選択レイヤー(top)を直下(bottom=top-1)へ opacity 込みで src-over 焼き込みし、top を削除する。
-    /// **frame数が1の間だけ許可**（9.1節MVP制限。多フレーム対応は別タスクへ先送り）。
+    /// Bake the selected layer (top) into the one below (bottom=top-1) with opacity via src-over, then delete top.
+    /// **Allowed only while frame count is 1** (MVP constraint; multi-frame support deferred).
     pub fn mergeDown(self: *Document, gpa: Allocator, top_idx: usize) !void {
         if (self.frames.items.len != 1) return error.MultiFrameMergeUnsupported;
         if (top_idx == 0) return error.OutOfRange;
@@ -1228,15 +1228,15 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // frame 構造操作（plan 4.5節）
+    // frame structure ops
     //
-    // frame add/delete/duplicate は grid（stride=frames.len の flat 配列）の全面再構築を
-    // 伴う（v5補遺(e)③）。selected_frame が変わるため、通常経路（この3メソッド）も
-    // 「frame切替」の一種として resyncActiveView を呼ぶ（2節の3箇所ルールは「意図」レベルで
-    // 一致させる: syncPreviewCanvas 等の毎フレーム経路には決して混入しない、という趣旨）。
+    // frame add/delete/duplicate rebuilds the whole grid (flat array with stride=frames.len).
+    // Because selected_frame changes, the normal path (these three methods) also calls
+    // resyncActiveView as a kind of "frame switch" (aligns with the three-site rule in intent:
+    // never enter every-frame paths such as syncPreviewCanvas).
     // ══════════════════════════════════════════════════════════════════
 
-    /// 空フレームを挿入する。raster layer は null=透明、text layer は共有 cel へリンク（4.4節）。
+    /// Insert an empty frame. raster layers: null=transparent; text layers: link to the shared cel.
     pub fn addFrame(self: *Document, gpa: Allocator, at: u32) !void {
         if (at > self.frames.items.len) return error.OutOfRange;
         const selected_before = self.selected_frame;
@@ -1254,8 +1254,8 @@ pub const Document = struct {
         self.resyncActiveView(gpa);
     }
 
-    /// frame を複製する（src の直後へ挿入）。raster layer は non-null なら深いコピー
-    /// （独立cel・refcount=1）、null は null のまま。text layer は深いコピーせず共有celへリンク。
+    /// Duplicate a frame (insert right after src). raster: deep-copy non-null (independent cel, refcount=1);
+    /// leave null as null. text: do not deep-copy; link to the shared cel.
     pub fn duplicateFrame(self: *Document, gpa: Allocator, src: u32) !void {
         if (src >= self.frames.items.len) return error.OutOfRange;
         const new_index = src + 1;
@@ -1267,7 +1267,7 @@ pub const Document = struct {
         for (self.layers.items, 0..) |def, li| {
             const src_cel = self.gridGet(li, src);
             if (def.kind == .text) {
-                values[li] = src_cel; // 共有celへリンク（retainは下のループで実施）
+                values[li] = src_cel; // Link to shared cel (retain happens in the loop below)
             } else if (src_cel) |cid| {
                 const new_id = self.allocBlankCel(gpa);
                 @memcpy(self.cel_pool.items[new_id].?.pixels, self.cel_pool.items[cid].?.pixels);
@@ -1286,7 +1286,7 @@ pub const Document = struct {
         self.resyncActiveView(gpa);
     }
 
-    /// frame を削除する。各 layer の該当列の cel 参照を release。selected_frame を clamp。
+    /// Delete a frame. Release each layer's cel ref for that column. Clamp selected_frame.
     pub fn deleteFrame(self: *Document, gpa: Allocator, index: u32) !void {
         if (self.frames.items.len <= 1) return error.LastFrame;
         if (index >= self.frames.items.len) return error.OutOfRange;
@@ -1301,20 +1301,20 @@ pub const Document = struct {
         self.resyncActiveView(gpa);
     }
 
-    /// キャンバスサイズ変更（内容保持・左上基準クロップ/パディング）。
-    /// イベント時のみ（アクション/メニュー確定）。フレーム毎・RT ではない。
+    /// Change canvas size (keep contents; top-left-anchored crop/pad).
+    /// Event-time only (action/menu confirm). Not per-frame or RT.
     ///
-    /// - `new_w==0` / `new_h==0` / `new_w*new_h` overflow → 状態不変で recoverable error。
-    /// - 同サイズ → no-op。
-    /// - build-new-before-swap: 新 cel_pool / active_view を完全構築してから一括置換。
-    ///   **swap 前**の構築失敗時は新リソースのみ解放し Document を壊さない。
-    ///   swap 後の `resyncActiveView` の OOM は既存経路同様 `@panic`（ADR-006 方針）。
-    /// - CelId / layer / frame 参照関係は維持。live Cel のピクセル配列のみ新サイズ確保。
-    /// - 置換後に `resyncActiveView` → 旧リソース解放 → undo 履歴クリア（旧 PixelDiff.idx 無効化）。
+    /// - `new_w==0` / `new_h==0` / `new_w*new_h` overflow → recoverable error; state unchanged.
+    /// - Same size → no-op.
+    /// - build-new-before-swap: fully build the new cel_pool / active_view, then swap atomically.
+    ///   On build failure **before swap**, free only the new resources; leave Document intact.
+    ///   OOM in `resyncActiveView` after swap `@panic`s like existing paths (ADR-006).
+    /// - CelId / layer / frame reference relations are preserved. Only live Cel pixel arrays are reallocated to the new size.
+    /// - After swap: `resyncActiveView` → free old resources → clear undo history (old PixelDiff.idx invalid).
     pub fn resize(self: *Document, gpa: Allocator, new_w: u32, new_h: u32) error{ InvalidSize, SizeOverflow, OutOfMemory }!void {
         if (new_w == 0 or new_h == 0) return error.InvalidSize;
         const new_n = std.math.mul(usize, new_w, new_h) catch return error.SizeOverflow;
-        // 画素配列のバイト数も overflow しないこと（u32×u32 は 64-bit usize に収まるが ×4 で溢れる）
+        // Pixel-array byte count must not overflow either (u32×u32 fits 64-bit usize, but ×4 can overflow)
         _ = std.math.mul(usize, new_n, @sizeOf(u32)) catch return error.SizeOverflow;
         if (self.width == new_w and self.height == new_h) return;
 
@@ -1352,7 +1352,7 @@ pub const Document = struct {
         errdefer if (!view_transferred) new_view.deinit();
         new_view.system_font = self.active_view.system_font;
 
-        // ここから infallible（新リソース所有を Document へ移す）
+        // From here infallible (transfer new-resource ownership to Document)
         const old_pool = self.cel_pool;
         const old_view = self.active_view;
         self.width = new_w;
@@ -1377,8 +1377,8 @@ pub const Document = struct {
         self.undo.clearHistoryPreservingHandles(gpa);
     }
 
-    /// PNG open 用: doc/active_view を「1layer・1frame・1cel(空)」状態へ縮める。
-    /// `active_view` は再init せず既存構造を縮める（plan 4.2節の制約準拠）。undo/redo も破棄する。
+    /// For PNG open: shrink doc/active_view to "1 layer · 1 frame · 1 cel (empty)".
+    /// Shrink existing `active_view` structure without re-init. Also discard undo/redo.
     pub fn resetToSingleBlankLayer(self: *Document, gpa: Allocator) void {
         while (self.active_view.layers.items.len > 1) {
             const removed = self.active_view.deleteLayer(self.active_view.layers.items.len - 1).?;
@@ -1401,7 +1401,7 @@ pub const Document = struct {
         self.frames.clearRetainingCapacity();
         self.frames.append(gpa, .{}) catch @panic("Document.resetToSingleBlankLayer: OOM");
         self.layers.clearRetainingCapacity();
-        // LayerId 採番は保持（undo handle と同様・再利用なし。TASK-94）
+        // Keep LayerId allocation (like undo handles; no reuse)
         var def: LayerDef = .{ .id = self.allocLayerId() };
         def.setName("Layer 1");
         self.layers.append(gpa, def) catch @panic("Document.resetToSingleBlankLayer: OOM");
@@ -1412,12 +1412,12 @@ pub const Document = struct {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // undo/redo apply（plan 5.3節）
+    // undo/redo apply
     // ══════════════════════════════════════════════════════════════════
 
     pub fn undoOne(self: *Document, gpa: Allocator) void {
         var op = self.undo.undo.pop() orelse return;
-        _ = self.undo.handles.pop(); // handle/owner 並行配列を同期（redo 側はタグ対象外）
+        _ = self.undo.handles.pop(); // Sync handle/owner parallel arrays (redo side is not tagged)
         _ = self.undo.owners.pop();
         self.applyBefore(gpa, &op);
         self.undo.redo.append(gpa, op) catch @panic("Document.undoOne: OOM");
@@ -1428,33 +1428,33 @@ pub const Document = struct {
         var op = self.undo.redo.pop() orelse return;
         self.applyAfter(gpa, &op);
         self.undo.undo.append(gpa, op) catch @panic("Document.redoOne: OOM");
-        // 再 push は**新 handle を採番**（旧 CommandRecord との対応は復活しない。UndoStack doc 参照）。
+        // Re-push **allocates a new handle** (link to the old CommandRecord does not revive; see UndoStack docs).
         self.undo.handles.append(gpa, self.undo.allocHandle()) catch @panic("Document.redoOne: OOM");
-        self.undo.owners.append(gpa, 0) catch @panic("Document.redoOne: OOM"); // 再 push は unknown（app が再確定）
+        self.undo.owners.append(gpa, 0) catch @panic("Document.redoOne: OOM"); // Re-push is unknown (app re-confirms)
         self.resyncActiveView(gpa);
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // 任意位置 revert（per-actor undo。TASK-62.5.4）
+    // Arbitrary-position revert (per-actor undo)
     // ══════════════════════════════════════════════════════════════════
 
-    /// handle 指定の Op を undo stack の**任意位置**から逆適用できるか（TASK-62.5.4 §3）。
-    /// true の条件（すべて満たす）:
-    ///   1. handle が undo stack に現存
-    ///   2. Op 種別が `.paint`
-    ///   3. 対象 cel が生存（`cel_pool[op.cel_id] != null`）
-    ///   4. 位置前提の維持: `op.layer_idx`/`op.frame_idx` が現 document の範囲内 かつ
-    ///      `grid(layer_idx, frame_idx) == op.cel_id`（created の有無によらず一律。後続の
-    ///      layer/frame 操作・cel link/unlink で位置対応が崩れた op の逆適用（誤 grid slot 消去・
-    ///      panic）を防ぐ。前提が崩れた op は候補外 = per-actor undo の canUndo=false → framework
-    ///      の全件事前検証で transaction ごと skip される）
+    /// Whether the Op for a handle can be inverse-applied from an **arbitrary position** on the undo stack.
+    /// True when all of:
+    ///   1. handle is present on the undo stack
+    ///   2. Op kind is `.paint`
+    ///   3. target cel is alive (`cel_pool[op.cel_id] != null`)
+    ///   4. position premise holds: `op.layer_idx`/`op.frame_idx` are in range for the current document and
+    ///      `grid(layer_idx, frame_idx) == op.cel_id` (uniform whether or not created; prevents inverse-apply
+    ///      of ops whose position mapping broke via later layer/frame ops or cel link/unlink — wrong grid-slot
+    ///      clear / panic). Broken-premise ops are non-candidates = per-actor undo canUndo=false → framework
+    ///      pre-validates the whole set and skips the transaction)
     ///
-    /// **構造 Op 制約（MVP 割り切りの明記②）**: layer_add/delete/reorder/visible/opacity/rename/
-    /// text/rasterize/merge・frame 系・cel link 系の**構造 Op は任意位置逆適用の対象外**（後続の
-    /// 構造変更後に古い index へ逆適用すると別対象を壊す・cel ownership が不整合になるため）。
-    /// 全 Op の任意位置 undo は rollback-replay 化（62.3 Stage 2）までスコープ外。agent の構造
-    /// action（add_layer 等）は CommandRecord に記録はされるが per-actor undo の候補にならない
-    /// （canUndo=false で skip。最上位の未記録構造 Op は従来の `undoOne` でのみ戻せる）。
+    /// **Structural Op constraint (MVP cut, noted ②)**: structural Ops — layer_add/delete/reorder/visible/opacity/rename/
+    /// text/rasterize/merge, frame ops, cel-link ops — are **out of scope for arbitrary-position inverse-apply**
+    /// (inverse-applying an old index after later structural changes would hit the wrong target / break cel ownership).
+    /// Arbitrary-position undo for all Op kinds is out of scope until rollback-replay. Agent structural
+    /// actions (add_layer, etc.) are recorded in CommandRecord but are not per-actor undo candidates
+    /// (skipped with canUndo=false. Topmost unrecorded structural Ops can only be undone via classic `undoOne`).
     pub fn canRevertByHandle(self: *const Document, handle: u64) bool {
         const idx = self.indexOfHandle(handle) orelse return false;
         const op = &self.undo.undo.items[idx];
@@ -1475,9 +1475,9 @@ pub const Document = struct {
         return null;
     }
 
-    /// 読み取り専用: handle が指す `.paint` Op の `PixelDiff` 列ビュー（TASK-83.2）。
-    /// 借用スライスのみ返し所有権は動かない。呼び出し側は戻り値を保持せず、確定フック内で
-    /// サムネイルへコピーすること。handle 不在・構造 Op・既に undo 済みは null。
+    /// Read-only: `PixelDiff` column view of the `.paint` Op for a handle.
+    /// Returns a borrowed slice only; ownership does not move. Caller must not retain the return value —
+    /// copy into a thumbnail inside the confirm hook. Missing handle / structural Op / already undone → null.
     pub const PaintDiffView = struct {
         layer_idx: usize,
         frame_idx: u32,
@@ -1497,45 +1497,45 @@ pub const Document = struct {
     }
 
     pub const RevertMode = enum {
-        /// 逆適用した Op を legacy redo stack へ移す（未記録 op の legacy redo 用）。
+        /// Move an inverse-applied Op onto the legacy redo stack (legacy redo for unrecorded ops).
         move_to_redo,
-        /// 逆適用した Op を解放する（CommandRecord 記録済み op 用。redo は CommandLog の
-        /// name/args 再 dispatch で行うため Op は不要）。
+        /// Free an inverse-applied Op (for ops already recorded in CommandRecord; redo re-dispatches
+        /// CommandLog name/args, so the Op is not needed).
         discard,
     };
 
-    /// handle 指定の `.paint` Op を undo stack の**任意位置**から逆適用して取り除く（TASK-62.5.4 §3）。
-    /// 成功で true。対象が `canRevertByHandle` の条件を満たさない場合は **false を返し何もしない**
-    /// （非 paint Op・handle 不在・cel/位置前提の崩れ、いずれも同じ）。内部で `resyncActiveView` まで
-    /// 行う（App 側同期 = `clampTimelineTarget` 等は呼び出し側の責務）。
+    /// Inverse-apply and remove the `.paint` Op for a handle from an **arbitrary position** on the undo stack.
+    /// Returns true on success. If the target fails `canRevertByHandle`, **return false and do nothing**
+    /// (non-paint Op, missing handle, or broken cel/position premise — all the same). Internally runs through
+    /// `resyncActiveView` (App-side sync such as `clampTimelineTarget` is the caller's job).
     ///
-    /// **pixel 巻き添え artifact（MVP 割り切りの明記①）**: Op は snapshot-inverse（pixel diff）
-    /// なので、対象 Op より**後**に同じ画素へ描かれた内容は revert で巻き添えに戻る（diff の
-    /// before 値が「対象 Op 実行直後」の画素だから）。solo Co-pilot でも netsync
-    /// （62.3 v5 §1.5.1-4）と同じ MVP 割り切り（親 plan §5.1。ユーザー了承済み 2026-07-07）。
-    /// 解消は rollback-replay 化（62.3 Stage 2）。実用上の緩和は actor ごとのレイヤー分担。
-    /// **created cel の条件付き teardown（applyBefore と異なる点）**: LIFO 前提の `applyBefore` は
-    /// created=true で cel を無条件に解放し grid を null にするが、**任意位置** revert では後続 op が
-    /// 同じ cel を参照している場合にそれを行うと (a) 後続 op の描画内容ごと消える (b) 後続 op が
-    /// 解放済み cel を参照し以後の undo で panic する。よって teardown は「他に参照 op が無い」
-    /// 場合のみ行い、参照が残る場合は before 復元済みの cel を生かしたまま op の created を降ろす
-    /// （以後その op は「既存 cel への paint」として扱われ redo 側 `applyAfter` とも整合する）。
-    /// skip 時に残る blank 相当の cel は描画上透明と同一で無害（メモリ/保存サイズのみ）。
+    /// **Pixel collateral artifact (MVP cut, noted ①)**: Ops are snapshot-inverse (pixel diff), so content
+    /// painted on the same pixels **after** the target Op is collateral-reverted too (the diff's before
+    /// value is the pixel right after the target Op ran). Same MVP cut as netsync
+    /// for solo Co-pilot.
+    /// Resolution is rollback-replay; practical mitigation is per-actor layer ownership.
+    /// **Conditional teardown of a created cel (differs from applyBefore)**: LIFO `applyBefore` always frees
+    /// the cel and nulls the grid when created=true, but on **arbitrary-position** revert that would (a) erase
+    /// later ops' paint on the same cel and (b) leave later ops pointing at a freed cel → panic on later undo.
+    /// So teardown runs only when no other ops still reference the cel; if references remain, keep the
+    /// before-restored cel alive and clear the op's created flag (thereafter treated as "paint onto an
+    /// existing cel", consistent with redo-side `applyAfter`).
+    /// A blank-equivalent cel left on skip is display-identical to transparent and harmless (memory/save size only).
     pub fn revertByHandle(self: *Document, gpa: Allocator, handle: u64, mode: RevertMode) bool {
         if (!self.canRevertByHandle(handle)) return false;
-        const idx = self.indexOfHandle(handle).?; // canRevertByHandle が現存を保証
+        const idx = self.indexOfHandle(handle).?; // canRevertByHandle guarantees present
         var op = self.undo.undo.orderedRemove(idx);
         _ = self.undo.handles.orderedRemove(idx);
         _ = self.undo.owners.orderedRemove(idx);
 
-        const p = &op.paint; // canRevertByHandle が .paint を保証
+        const p = &op.paint; // canRevertByHandle guarantees .paint
         {
             const pixels = self.cel_pool.items[p.cel_id].?.pixels;
             for (p.diffs) |d| pixels[d.idx] = d.before;
         }
         if (p.created) {
             if (self.celReferencedByOps(p.cel_id)) {
-                p.created = false; // teardown skip（doc comment 参照）
+                p.created = false; // teardown skip (see doc comment)
             } else {
                 if (self.releaseCelMaybeCapture(p.cel_id)) |captured| p.created_released = captured;
                 self.setGrid(p.layer_idx, p.frame_idx, null);
@@ -1549,10 +1549,10 @@ pub const Document = struct {
         return true;
     }
 
-    /// undo/redo stack 上の op が `cel_id` への「生きた cel 参照」を持ちうるか
-    /// （`revertByHandle` の created teardown 判定用）。cel snapshot/link を持つ構造 op は
-    /// **保守的に true**（teardown を skip して blank cel を残す方が常に安全。誤 skip の
-    /// 影響は lingering blank cel のみ）。
+    /// Whether an op on the undo/redo stack can hold a "live cel ref" to `cel_id`
+    /// (for `revertByHandle` created-teardown decisions). Structural ops that hold a cel snapshot/link are
+    /// **conservatively true** (skipping teardown and leaving a blank cel is always safer; the only cost of a
+    /// false skip is a lingering blank cel).
     fn opMayReferenceCel(op: *const Op, cel_id: CelId) bool {
         return switch (op.*) {
             .paint => |p2| p2.cel_id == cel_id,
@@ -1677,7 +1677,7 @@ pub const Document = struct {
                         self.cel_pool.items[op.cel_id] = .{ .pixels = captured, .refcount = 1 };
                         op.created_released = null;
                     } else {
-                        std.debug.assert(false); // 45.1スコープでは到達しない防御分岐（plan 5.3節）
+                        std.debug.assert(false); // Defensive branch not reached in current scope
                         self.retainCel(op.cel_id);
                     }
                     self.setGrid(op.layer_idx, op.frame_idx, op.cel_id);
@@ -1773,7 +1773,7 @@ pub const Document = struct {
 };
 
 // ============================================================================
-// tests（UndoStack handle タグ。TASK-62.5.3）
+// tests (UndoStack handle tags)
 // ============================================================================
 
 const testing = std.testing;
@@ -1782,7 +1782,7 @@ fn testVisOp(index: usize) Op {
     return .{ .layer_visible = .{ .index = index, .before = true, .after = false } };
 }
 
-test "UndoStack handles: 採番の単調性 / push→topHandle / 長さ同期の不変条件" {
+test "UndoStack handles: monotonic allocation / push→topHandle / length-sync invariant" {
     const gpa = testing.allocator;
     var s: UndoStack = .{};
     defer s.deinit(gpa);
@@ -1792,14 +1792,14 @@ test "UndoStack handles: 採番の単調性 / push→topHandle / 長さ同期の
     s.push(gpa, testVisOp(0));
     try testing.expectEqual(@as(?u64, 1), s.topHandle());
     s.push(gpa, testVisOp(1));
-    try testing.expectEqual(@as(?u64, 2), s.topHandle()); // 単調増加
+    try testing.expectEqual(@as(?u64, 2), s.topHandle()); // Monotonic increase
     try testing.expectEqual(s.undo.items.len, s.handles.items.len);
     try testing.expect(s.hasHandle(1));
     try testing.expect(s.hasHandle(2));
     try testing.expect(!s.hasHandle(3));
 }
 
-test "UndoStack handles: max_history 溢れで最古 handle も同期して消える" {
+test "UndoStack handles: max_history overflow also drops the oldest handle in sync" {
     const gpa = testing.allocator;
     var s: UndoStack = .{};
     defer s.deinit(gpa);
@@ -1810,13 +1810,13 @@ test "UndoStack handles: max_history 溢れで最古 handle も同期して消�
     }
     try testing.expectEqual(UndoStack.max_history, s.undo.items.len);
     try testing.expectEqual(s.undo.items.len, s.handles.items.len);
-    try testing.expect(!s.hasHandle(1)); // 最古2件は溢れて消えた
+    try testing.expect(!s.hasHandle(1)); // Oldest 2 spilled and are gone
     try testing.expect(!s.hasHandle(2));
-    try testing.expect(s.hasHandle(3)); // 残存の先頭
+    try testing.expect(s.hasHandle(3)); // First of the survivors
     try testing.expectEqual(@as(?u64, UndoStack.max_history + 2), s.topHandle());
 }
 
-test "UndoStack handles: Document.undoOne の pop / redoOne の再 push は新 handle 採番" {
+test "UndoStack handles: Document.undoOne pop / redoOne re-push issues a new handle" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -1825,18 +1825,18 @@ test "UndoStack handles: Document.undoOne の pop / redoOne の再 push は新 h
     doc.undo.push(gpa, testVisOp(0));
     try testing.expectEqual(@as(?u64, 2), doc.undo.topHandle());
 
-    doc.undoOne(gpa); // handle=2 の Op が pop（redo 側はタグ対象外）
+    doc.undoOne(gpa); // Op with handle=2 popped (redo side is not tagged)
     try testing.expectEqual(@as(?u64, 1), doc.undo.topHandle());
     try testing.expectEqual(doc.undo.undo.items.len, doc.undo.handles.items.len);
     try testing.expect(!doc.undo.hasHandle(2));
 
-    doc.redoOne(gpa); // 再 push は**新 handle**（=3。2 は復活しない）
+    doc.redoOne(gpa); // Re-push gets a **new handle** (=3; 2 does not revive)
     try testing.expectEqual(@as(?u64, 3), doc.undo.topHandle());
     try testing.expectEqual(doc.undo.undo.items.len, doc.undo.handles.items.len);
     try testing.expect(!doc.undo.hasHandle(2));
 }
 
-test "UndoStack handles: リセット後も next_handle は単調（clearHistoryPreservingHandles / 再利用しない）" {
+test "UndoStack handles: next_handle stays monotonic after reset (clearHistoryPreservingHandles / no reuse)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -1846,18 +1846,18 @@ test "UndoStack handles: リセット後も next_handle は単調（clearHistory
     const before_reset = doc.undo.next_handle; // = 3
     try testing.expectEqual(@as(u64, 3), before_reset);
 
-    // ドキュメント読込相当のリセット（doOpenPath 経由の resetToSingleBlankLayer が使う）
+    // Reset equivalent to document load (used by resetToSingleBlankLayer via doOpenPath)
     doc.resetToSingleBlankLayer(gpa);
-    try testing.expectEqual(@as(usize, 0), doc.undo.undo.items.len); // 履歴はクリア
+    try testing.expectEqual(@as(usize, 0), doc.undo.undo.items.len); // History cleared
     try testing.expectEqual(@as(usize, 0), doc.undo.handles.items.len);
-    try testing.expectEqual(before_reset, doc.undo.next_handle); // 採番は保持
+    try testing.expectEqual(before_reset, doc.undo.next_handle); // Allocation preserved
 
-    // リセット後の push はリセット前より大きい handle（再利用しない）
+    // Post-reset push gets a handle larger than pre-reset (no reuse)
     doc.undo.push(gpa, testVisOp(0));
     try testing.expectEqual(@as(?u64, 3), doc.undo.topHandle());
     try testing.expect(doc.undo.topHandle().? >= before_reset);
 
-    // UndoStack 単体でも同様（clearHistoryPreservingHandles 直接）
+    // Same for UndoStack alone (clearHistoryPreservingHandles directly)
     var s: UndoStack = .{};
     defer s.deinit(gpa);
     s.push(gpa, testVisOp(0));
@@ -1869,7 +1869,7 @@ test "UndoStack handles: リセット後も next_handle は単調（clearHistory
     try testing.expect(s.topHandle().? >= nh);
 }
 
-// ── 任意位置 revert（TASK-62.5.4 §3）のテスト ──────────────────────────
+// ── Arbitrary-position revert tests ──────────────────────────
 
 fn pushTestPaint(doc: *Document, gpa: Allocator, layer_idx: usize, pixel_idx: u32, color: u32) !void {
     const pixels = doc.active_view.layerPixels(layer_idx);
@@ -1879,7 +1879,7 @@ fn pushTestPaint(doc: *Document, gpa: Allocator, layer_idx: usize, pixel_idx: u3
     try doc.pushPaintOp(gpa, layer_idx, diffs);
 }
 
-test "paintDiffsForHandle: paint handle から diffs/layer_idx を借用取得（所有権不変）" {
+test "paintDiffsForHandle: borrow diffs/layer_idx from a paint handle (ownership unchanged)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -1892,164 +1892,164 @@ test "paintDiffsForHandle: paint handle から diffs/layer_idx を借用取得�
     try testing.expectEqual(@as(usize, 1), view.diffs.len);
     try testing.expectEqual(@as(u32, 0), view.diffs[0].idx);
     try testing.expectEqual(@as(u32, 0xFFFF0000), view.diffs[0].after);
-    // 所有権不変: accessor 後も Op が undo に残り、再取得できる
+    // Ownership invariant: after accessor, Op stays on undo and can be fetched again
     try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len);
     try testing.expect(doc.paintDiffsForHandle(h) != null);
     try testing.expectEqual(@as(usize, 1), doc.paintDiffsForHandle(h).?.diffs.len);
 }
 
-test "paintDiffsForHandle: 構造 Op / 不存在 handle は null" {
+test "paintDiffsForHandle: structural Op / missing handle → null" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    _ = try doc.addLayer(gpa); // handle 1（構造 op）
+    _ = try doc.addLayer(gpa); // handle 1 (structural op)
     try testing.expect(doc.paintDiffsForHandle(1) == null);
     try testing.expect(doc.paintDiffsForHandle(999) == null);
 
     try pushTestPaint(&doc, gpa, 0, 0, 0xFF00FF00); // handle 2
     try testing.expect(doc.paintDiffsForHandle(2) != null);
     try testing.expect(doc.revertByHandle(gpa, 2, .discard));
-    try testing.expect(doc.paintDiffsForHandle(2) == null); // undo 済み
+    try testing.expect(doc.paintDiffsForHandle(2) == null); // Already undone
 }
 
-test "revertByHandle: 最上位でない .paint op を任意位置逆適用（上の op は残る・対象だけ戻る）" {
+test "revertByHandle: inverse-apply a non-top .paint op at any position (ops above remain; only target reverts)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // A: px0（handle 1）
-    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // B: px1（handle 2）
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // A: px0 (handle 1)
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // B: px1 (handle 2)
     try testing.expect(doc.canRevertByHandle(1));
 
-    try testing.expect(doc.revertByHandle(gpa, 1, .discard)); // A だけ任意位置 revert（discard = op 解放）
+    try testing.expect(doc.revertByHandle(gpa, 1, .discard)); // Arbitrary-position revert of A only (discard = free the op)
     const px = doc.active_view.layerPixels(0);
-    try testing.expectEqual(@as(u32, 0), px[0]); // A は戻った
-    try testing.expectEqual(@as(u32, 0xFF00FF00), px[1]); // B は残る
+    try testing.expectEqual(@as(u32, 0), px[0]); // A restored
+    try testing.expectEqual(@as(u32, 0xFF00FF00), px[1]); // B remains
     try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len);
     try testing.expectEqual(@as(?u64, 2), doc.undo.topHandle());
-    try testing.expect(!doc.canRevertByHandle(1)); // 取り除かれた handle は不在
+    try testing.expect(!doc.canRevertByHandle(1)); // Removed handle is missing
 }
 
-test "revertByHandle: 構造 op は false（任意位置逆適用の対象外）/ 存在しない handle も false" {
+test "revertByHandle: structural op → false (not eligible for any-position inverse) / missing handle also false" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    _ = try doc.addLayer(gpa); // 構造 op（layer_add。handle 1）
+    _ = try doc.addLayer(gpa); // Structural op (layer_add; handle 1)
     try testing.expect(!doc.canRevertByHandle(1));
-    try testing.expect(!doc.revertByHandle(gpa, 1, .discard)); // false + 何もしない
-    try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len); // op は残る
-    try testing.expectEqual(@as(usize, 2), doc.layers.items.len); // layer も残る
+    try testing.expect(!doc.revertByHandle(gpa, 1, .discard)); // false + do nothing
+    try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len); // op remains
+    try testing.expectEqual(@as(usize, 2), doc.layers.items.len); // layer remains
 
-    try testing.expect(!doc.canRevertByHandle(999)); // 存在しない handle
+    try testing.expect(!doc.canRevertByHandle(999)); // Nonexistent handle
     try testing.expect(!doc.revertByHandle(gpa, 999, .discard));
 }
 
-test "revertByHandle: layer 削除で cel が解放された paint op は false（最終防衛）" {
+test "revertByHandle: paint op whose cel was freed by layer delete → false (last defence)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    _ = try doc.addLayer(gpa); // handle 1（構造 op）
-    try pushTestPaint(&doc, gpa, 1, 0, 0xFFFF0000); // handle 2（layer1 に paint）
+    _ = try doc.addLayer(gpa); // handle 1 (structural op)
+    try pushTestPaint(&doc, gpa, 1, 0, 0xFFFF0000); // handle 2 (paint on layer1)
     try testing.expect(doc.canRevertByHandle(2));
 
-    try doc.deleteLayer(gpa, 1); // handle 3（構造 op）。layer1 の cel は解放される
-    try testing.expect(!doc.canRevertByHandle(2)); // cel 解放 + layer 範囲外 → 候補外
+    try doc.deleteLayer(gpa, 1); // handle 3 (structural op). layer1's cel is freed
+    try testing.expect(!doc.canRevertByHandle(2)); // cel freed + layer out of range → non-candidate
     try testing.expect(!doc.revertByHandle(gpa, 2, .discard));
 }
 
-test "revertByHandle: layer reorder で位置対応が崩れた paint op は false（誤 slot を消さない）" {
+test "revertByHandle: paint op whose position mapping broke after layer reorder → false (do not clear wrong slot)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    _ = try doc.addLayer(gpa); // 2 layers（handle 1）
-    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 2: layer0 の cel（grid(0,0)）
-    try pushTestPaint(&doc, gpa, 1, 1, 0xFF00FF00); // handle 3: layer1 の cel（grid(1,0)）
+    _ = try doc.addLayer(gpa); // 2 layers (handle 1)
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 2: layer0's cel (grid(0,0))
+    try pushTestPaint(&doc, gpa, 1, 1, 0xFF00FF00); // handle 3: layer1's cel (grid(1,0))
     try testing.expect(doc.canRevertByHandle(2));
     try testing.expect(doc.canRevertByHandle(3));
 
-    try doc.reorderLayer(gpa, 0, 1); // grid 行が入れ替わる → 両 op の layer_idx が旧位置を指す
-    try testing.expect(!doc.canRevertByHandle(2)); // grid(0,0) != op.cel_id → 候補外
+    try doc.reorderLayer(gpa, 0, 1); // grid rows swap → both ops' layer_idx point at old positions
+    try testing.expect(!doc.canRevertByHandle(2)); // grid(0,0) != op.cel_id → non-candidate
     try testing.expect(!doc.canRevertByHandle(3));
     try testing.expect(!doc.revertByHandle(gpa, 2, .discard));
 }
 
-test "revertByHandle: move_to_redo で legacy redoOne が再適用する（新 handle 採番）" {
+test "revertByHandle: move_to_redo lets legacy redoOne re-apply (new handle issued)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // A（handle 1）
-    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // B（handle 2）
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // A (handle 1)
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // B (handle 2)
 
-    try testing.expect(doc.revertByHandle(gpa, 1, .move_to_redo)); // A を legacy redo へ
+    try testing.expect(doc.revertByHandle(gpa, 1, .move_to_redo)); // A onto legacy redo
     try testing.expectEqual(@as(u32, 0), doc.active_view.layerPixels(0)[0]);
     try testing.expectEqual(@as(usize, 1), doc.undo.redo.items.len);
 
-    doc.redoOne(gpa); // legacy redo → A 再適用 + 新 handle（3）で undo stack へ
+    doc.redoOne(gpa); // legacy redo → re-apply A + new handle (3) onto undo stack
     try testing.expectEqual(@as(u32, 0xFFFF0000), doc.active_view.layerPixels(0)[0]);
     try testing.expectEqual(@as(usize, 2), doc.undo.undo.items.len);
     try testing.expectEqual(@as(?u64, 3), doc.undo.topHandle());
 }
 
-test "revertByHandle: created op 単独なら teardown（cel 解放 + grid null）/ 参照が残れば skip" {
+test "revertByHandle: lone created op → teardown (free cel + grid null) / skip if references remain" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    // 単独の created op → teardown（legacy undoOne と同じ最終状態）
-    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 1（created=true）
+    // Lone created op → teardown (same end state as legacy undoOne)
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 1 (created=true)
     const cel_id = doc.gridGet(0, 0).?;
     try testing.expect(doc.revertByHandle(gpa, 1, .discard));
     try testing.expectEqual(@as(?CelId, null), doc.gridGet(0, 0)); // grid null
-    try testing.expect(doc.cel_pool.items[cel_id] == null); // cel 解放
+    try testing.expect(doc.cel_pool.items[cel_id] == null); // cel freed
 
-    // 参照が残る場合（後続 paint が同一 cel）は skip（test「最上位でない…」が実質検証済み。
-    // ここでは grid が生き残ることを明示）
-    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 2（created=true・新 cel）
-    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // handle 3（同一 cel）
+    // When a later paint still references the same cel, skip (the "not topmost…" test covers this;
+    // here we assert the grid survives)
+    try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 2 (created=true; new cel)
+    try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // handle 3 (same cel)
     const cel2 = doc.gridGet(0, 0).?;
     try testing.expect(doc.revertByHandle(gpa, 2, .discard));
-    try testing.expectEqual(@as(?CelId, cel2), doc.gridGet(0, 0)); // cel は生存
-    try testing.expectEqual(@as(u32, 0xFF00FF00), doc.active_view.layerPixels(0)[1]); // 後続 op の描画は無傷
+    try testing.expectEqual(@as(?CelId, cel2), doc.gridGet(0, 0)); // cel stays alive
+    try testing.expectEqual(@as(u32, 0xFF00FF00), doc.active_view.layerPixels(0)[1]); // Later op's paint is intact
 }
 
-test "UndoStack owners: push=unknown / setOwner/ownerOf / 溢れ・undo/redo・revert 経路の同期" {
+test "UndoStack owners: push=unknown / setOwner/ownerOf / sync on overflow, undo/redo, and revert paths" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
     try pushTestPaint(&doc, gpa, 0, 0, 0xFFFF0000); // handle 1
     try pushTestPaint(&doc, gpa, 0, 1, 0xFF00FF00); // handle 2
-    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(1)); // push 直後は unknown
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(1)); // Right after push: unknown
     doc.undo.setOwner(1, 1);
     doc.undo.setOwner(2, 2);
     try testing.expectEqual(@as(u8, 1), doc.undo.ownerOf(1));
     try testing.expectEqual(@as(u8, 2), doc.undo.ownerOf(2));
-    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(999)); // 不在は unknown
-    doc.undo.setOwner(999, 1); // 不在 handle は no-op（クラッシュしない）
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(999)); // Missing → unknown
+    doc.undo.setOwner(999, 1); // Missing handle is no-op (does not crash)
 
-    // undoOne の pop で owners も同期
+    // undoOne pop also syncs owners
     doc.undoOne(gpa);
     try testing.expectEqual(doc.undo.undo.items.len, doc.undo.owners.items.len);
-    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(2)); // handle 2 は不在扱い
+    try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(2)); // handle 2 treated as missing
 
-    // 再 push（legacy redo）は unknown で積まれる（app が再確定する規約）
-    doc.redoOne(gpa); // 新 handle 3
+    // Re-push (legacy redo) stacks as unknown (app re-confirms by convention)
+    doc.redoOne(gpa); // New handle 3
     try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(3));
     try testing.expectEqual(doc.undo.undo.items.len, doc.undo.owners.items.len);
 
-    // revertByHandle でも同期（任意位置除去）
+    // Also synced by revertByHandle (arbitrary-position remove)
     doc.undo.setOwner(1, 1);
     try testing.expect(doc.revertByHandle(gpa, 1, .discard));
     try testing.expectEqual(doc.undo.undo.items.len, doc.undo.owners.items.len);
     try testing.expectEqual(@as(u8, 0), doc.undo.ownerOf(1));
 }
 
-test "UndoStack owners: max_history 溢れで最古の owner も同期して消える" {
+test "UndoStack owners: max_history overflow also drops the oldest owner in sync" {
     const gpa = testing.allocator;
     var s: UndoStack = .{};
     defer s.deinit(gpa);
@@ -2060,12 +2060,12 @@ test "UndoStack owners: max_history 溢れで最古の owner も同期して消�
     }
     try testing.expectEqual(s.undo.items.len, s.owners.items.len);
     try testing.expectEqual(s.undo.items.len, s.handles.items.len);
-    try testing.expectEqual(@as(u8, 0), s.ownerOf(1)); // 溢れた handle は不在
+    try testing.expectEqual(@as(u8, 0), s.ownerOf(1)); // Spilled handle is missing
 }
 
-// ── LayerId 安定 handle（TASK-94 Phase A）──────────────────────────────
+// ── LayerId stable handle ──────────────────────────────
 
-test "LayerId: add→move→delete→insert を跨いで id が安定・再利用なし" {
+test "LayerId: id stable across add→move→delete→insert with no reuse" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -2079,9 +2079,9 @@ test "LayerId: add→move→delete→insert を跨いで id が安定・再利�
     const idx2 = try doc.addLayer(gpa);
     const id2 = doc.layerIdAt(idx2).?;
     try testing.expect(id0 != id1 and id1 != id2 and id0 != id2);
-    try testing.expectEqual(@as(u64, 4), doc.next_layer_id); // 1,2,3 使用済み → next=4
+    try testing.expectEqual(@as(u64, 4), doc.next_layer_id); // 1,2,3 used → next=4
 
-    // move: reorderLayer(0, 2) 後も id は同じ layer を指す
+    // move: after reorderLayer(0, 2), id still points at the same layer
     try doc.reorderLayer(gpa, 0, 2); // [id1, id2, id0]
     try testing.expectEqual(id1, doc.layerIdAt(0).?);
     try testing.expectEqual(id2, doc.layerIdAt(1).?);
@@ -2090,26 +2090,26 @@ test "LayerId: add→move→delete→insert を跨いで id が安定・再利�
     try testing.expectEqual(@as(?usize, 0), doc.layerIndexOf(id1));
     try testing.expectEqual(@as(?usize, 1), doc.layerIndexOf(id2));
 
-    // delete id1: 解決は null・next_layer_id は戻らない
+    // delete id1: resolve is null; next_layer_id does not rewind
     try doc.deleteLayerById(gpa, id1);
     try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id1));
     try testing.expectEqual(@as(u64, 4), doc.next_layer_id);
     try testing.expectEqual(@as(?usize, 0), doc.layerIndexOf(id2));
     try testing.expectEqual(@as(?usize, 1), doc.layerIndexOf(id0));
 
-    // insert（add）: 新規 id は削除済み id1 を再利用しない
+    // insert (add): new id does not reuse deleted id1
     const idx_new = try doc.addLayer(gpa);
     const id_new = doc.layerIdAt(idx_new).?;
     try testing.expect(id_new != id1);
     try testing.expectEqual(@as(LayerId, @enumFromInt(4)), id_new);
     try testing.expectEqual(@as(u64, 5), doc.next_layer_id);
 
-    // invalid / 範囲外
+    // invalid / out of range
     try testing.expectEqual(@as(?LayerId, null), doc.layerIdAt(99));
     try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(.invalid));
 }
 
-test "LayerId ById wrapper: index 系と同一結果 / 削除済み id は UnknownLayerId" {
+test "LayerId ById wrapper: same results as index APIs / deleted id → UnknownLayerId" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -2132,7 +2132,7 @@ test "LayerId ById wrapper: index 系と同一結果 / 削除済み id は Unkno
     try testing.expectEqual(false, doc.layers.items[2].visible);
     try doc.setLayerOpacityById(gpa, id2, 100);
     try testing.expectEqual(@as(u8, 100), doc.layers.items[2].opacity);
-    // index 系と同値（既に false/100 なので no-op 相当。再設定で状態一致を確認）
+    // Equivalent to index APIs (already false/100 so no-op-ish; re-set to confirm state match)
     try doc.setLayerVisible(gpa, 2, true);
     try doc.setLayerVisibleById(gpa, id2, false);
     try testing.expectEqual(false, doc.layers.items[doc.layerIndexOf(id2).?].visible);
@@ -2140,7 +2140,7 @@ test "LayerId ById wrapper: index 系と同一結果 / 削除済み id は Unkno
     try doc.setLayerOpacityById(gpa, id2, 50);
     try testing.expectEqual(@as(u8, 50), doc.layers.items[doc.layerIndexOf(id2).?].opacity);
 
-    // move: id0 を to=2 へ
+    // move: id0 to to=2
     try doc.moveLayerById(gpa, id0, 2);
     try testing.expectEqual(id1, doc.layerIdAt(0).?);
     try testing.expectEqual(id2, doc.layerIdAt(1).?);
@@ -2151,7 +2151,7 @@ test "LayerId ById wrapper: index 系と同一結果 / 削除済み id は Unkno
     try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id2));
     try testing.expectEqual(@as(usize, 2), doc.layers.items.len);
 
-    // 削除済み id → UnknownLayerId
+    // Deleted id → UnknownLayerId
     try testing.expectError(error.UnknownLayerId, doc.selectLayerById(id2));
     try testing.expectError(error.UnknownLayerId, doc.setLayerVisibleById(gpa, id2, true));
     try testing.expectError(error.UnknownLayerId, doc.setLayerOpacityById(gpa, id2, 1));
@@ -2160,7 +2160,7 @@ test "LayerId ById wrapper: index 系と同一結果 / 削除済み id は Unkno
     try testing.expectError(error.UnknownLayerId, doc.selectLayerById(.invalid));
 }
 
-test "LayerId: duplicateLayer は新規 id / reset 後も next_layer_id は単調" {
+test "LayerId: duplicateLayer gets a new id / next_layer_id stays monotonic after reset" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -2176,19 +2176,19 @@ test "LayerId: duplicateLayer は新規 id / reset 後も next_layer_id は単�
     try testing.expectEqual(@as(usize, 1), doc.layers.items.len);
     try testing.expect(doc.layerIdAt(0).? != .invalid);
     try testing.expect(doc.next_layer_id > before_reset);
-    try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id0)); // 旧 id は不在
+    try testing.expectEqual(@as(?usize, null), doc.layerIndexOf(id0)); // Old id is missing
 }
 
-// ── TASK-89: pushReplaceColor ──────────────────────────────────────────
+// ── pushReplaceColor ──────────────────────────────────────────
 
-test "pushReplaceColor: 置換→undo で bit 復元 / from==to と 0 画素は no-op" {
+test "pushReplaceColor: replace→undo restores bits / from==to and 0 pixels are no-op" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
     const px = doc.active_view.layerPixels(0);
     const red: u32 = 0xFFFF0000;
     const blue: u32 = 0xFF0000FF;
-    // 4 画素を red に
+    // 4 pixels to red
     try pushTestPaint(&doc, gpa, 0, 0, red);
     try pushTestPaint(&doc, gpa, 0, 1, red);
     try pushTestPaint(&doc, gpa, 0, 2, red);
@@ -2196,36 +2196,36 @@ test "pushReplaceColor: 置換→undo で bit 復元 / from==to と 0 画素は 
     const before = try gpa.dupe(u32, px);
     defer gpa.free(before);
 
-    // from==to → no-op（Op を積まない）
+    // from==to → no-op (no Op pushed)
     const depth_before = doc.undo.undo.items.len;
     const n0 = try doc.pushReplaceColor(gpa, 0, red, red);
     try testing.expectEqual(@as(u32, 0), n0);
     try testing.expectEqual(depth_before, doc.undo.undo.items.len);
 
-    // 存在しない色 → replaced=0・no-op
+    // Color not present → replaced=0 · no-op
     const n1 = try doc.pushReplaceColor(gpa, 0, 0xFF00FF00, blue);
     try testing.expectEqual(@as(u32, 0), n1);
     try testing.expectEqual(depth_before, doc.undo.undo.items.len);
 
-    // 4 画素置換
+    // Replace 4 pixels
     const n2 = try doc.pushReplaceColor(gpa, 0, red, blue);
     try testing.expectEqual(@as(u32, 4), n2);
     try testing.expectEqual(blue, px[0]);
     try testing.expectEqual(blue, px[3]);
     try testing.expectEqual(depth_before + 1, doc.undo.undo.items.len);
 
-    // undo で bit 復元
+    // undo restores bit-identical
     doc.undoOne(gpa);
     try testing.expectEqualSlices(u32, before, px);
 }
 
-test "pushReplaceColor: 全画素置換" {
+test "pushReplaceColor: replace all pixels" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 2, 2);
     defer doc.deinit();
     const px = doc.active_view.layerPixels(0);
     @memset(px, 0xFF112233);
-    // pushPaintOp で cel にコミットしてから置換（pushReplaceColor が ensureCelAt する）
+    // Commit to cel via pushPaintOp first, then replace (pushReplaceColor calls ensureCelAt)
     try doc.pushPaintOp(gpa, 0, blk: {
         const d = try gpa.alloc(PixelDiff, px.len);
         for (px, 0..) |p, i| d[i] = .{ .idx = @intCast(i), .before = 0, .after = p };
@@ -2236,7 +2236,7 @@ test "pushReplaceColor: 全画素置換" {
     for (px) |p| try testing.expectEqual(@as(u32, 0xFFAABBCC), p);
 }
 
-// ── TASK-45.4: 再生 interval / advance 判定 ──────────────────────────
+// ── Playback interval / advance check ──────────────────────────
 
 test "playbackIntervalSec: 100ms→1/fps / 200ms→2/fps / 50ms→0.5/fps / fps=0→inf / duration=0→1/fps" {
     // fps=10 → 1/fps = 0.1
@@ -2245,45 +2245,45 @@ test "playbackIntervalSec: 100ms→1/fps / 200ms→2/fps / 50ms→0.5/fps / fps=
     try testing.expectApproxEqAbs(@as(f64, 0.05), playbackIntervalSec(10.0, 50), 1e-12);
     try testing.expect(std.math.isInf(playbackIntervalSec(0.0, 100)));
     try testing.expect(std.math.isInf(playbackIntervalSec(-1.0, 100)));
-    // duration_ms==0 は 100 扱い → 1/fps
+    // duration_ms==0 treated as 100 → 1/fps
     try testing.expectApproxEqAbs(@as(f64, 0.1), playbackIntervalSec(10.0, 0), 1e-12);
-    // fps=1 で係数そのまま秒数になることも固定
+    // Also pin that at fps=1 the factor becomes seconds as-is
     try testing.expectApproxEqAbs(@as(f64, 1.0), playbackIntervalSec(1.0, 100), 1e-12);
     try testing.expectApproxEqAbs(@as(f64, 2.0), playbackIntervalSec(1.0, 200), 1e-12);
     try testing.expectApproxEqAbs(@as(f64, 0.5), playbackIntervalSec(1.0, 50), 1e-12);
 }
 
-test "shouldAdvance: 追いつき無し（0.35s 経過でも 1 tick で 1 frame・残余補償なし）" {
+test "shouldAdvance: no catch-up (even after 0.35s, 1 tick advances 1 frame; no residual credit)" {
     const interval: f64 = 0.1; // fps=10, duration=100
     try testing.expect(!shouldAdvance(0.05, 0.0, interval));
     try testing.expect(shouldAdvance(0.1, 0.0, interval));
-    // 0.35 秒経過: 判定は true だが、呼び出し側が last=now にリセットするので
-    // 同 tick で複数 frame は進まない（残余 0.25s の補償なし）。
+    // After 0.35s: check is true, but caller resets last=now so
+    // multiple frames do not advance in the same tick (no leftover 0.25s credit).
     const now: f64 = 0.35;
     try testing.expect(shouldAdvance(now, 0.0, interval));
-    const last_after = now; // last_advance = now（既存挙動）
+    const last_after = now; // last_advance = now (existing behavior)
     try testing.expect(!shouldAdvance(now, last_after, interval));
-    // 次の advance は last_after からフル interval 必要（残余クレジットなし）。
-    // f64 の 0.1 は非有限小数なので境界ちょうどではなく 0.5× / 1.5× で固定する。
+    // Next advance needs a full interval from last_after (no leftover credit).
+    // f64 0.1 is not a finite binary fraction, so pin at 0.5× / 1.5× rather than the exact boundary.
     try testing.expect(!shouldAdvance(last_after + interval * 0.5, last_after, interval));
     try testing.expect(shouldAdvance(last_after + interval * 1.5, last_after, interval));
 }
 
-// ── Document.resize（TASK-144.1）────────────────────────────────────────
+// ── Document.resize ────────────────────────────────────────
 
-test "Document.resize: 4x3→2x2 左上保持 / 4x3→6x5 新領域0 / undo depth 0" {
+test "Document.resize: 4x3→2x2 keeps top-left / 4x3→6x5 new region 0 / undo depth 0" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 3);
     defer doc.deinit();
 
-    // cel を確保して既知パターンを書く（行 major: y*w+x）
+    // Allocate cel and write a known pattern (row-major: y*w+x)
     _ = doc.createCel(gpa, 0, 0);
     const px = doc.cel_pool.items[0].?.pixels;
     px[0] = 0xFF000001; // (0,0)
     px[1] = 0xFF000002; // (1,0)
     px[4] = 0xFF000003; // (0,1)
     px[5] = 0xFF000004; // (1,1)
-    px[8] = 0xFF000005; // (0,2) — crop で落ちる
+    px[8] = 0xFF000005; // (0,2) — dropped by crop
     doc.resyncActiveView(gpa);
     doc.undo.push(gpa, testVisOp(0));
     try testing.expectEqual(@as(usize, 1), doc.undo.undo.items.len);
@@ -2312,24 +2312,24 @@ test "Document.resize: 4x3→2x2 左上保持 / 4x3→6x5 新領域0 / undo dept
     try testing.expectEqual(@as(usize, 30), grown.len);
     try testing.expectEqual(@as(u32, 0xFF000001), grown[0]);
     try testing.expectEqual(@as(u32, 0xFF000002), grown[1]);
-    try testing.expectEqual(@as(u32, 0), grown[2]); // 新領域
+    try testing.expectEqual(@as(u32, 0), grown[2]); // New region
     try testing.expectEqual(@as(u32, 0xFF000003), grown[6]); // y=1
     try testing.expectEqual(@as(u32, 0xFF000004), grown[7]);
-    try testing.expectEqual(@as(u32, 0), grown[12]); // y=2 は旧 2x2 に無い → 0
+    try testing.expectEqual(@as(u32, 0), grown[12]); // y=2 was not in the old 2x2 → 0
     try testing.expectEqual(@as(usize, 30), doc.active_view.composite_cache.len);
 }
 
-test "Document.resize: multi-layer/frame/linked-cel 参照保持 / 同サイズ no-op / 0・overflow で不変" {
+test "Document.resize: keeps multi-layer/frame/linked-cel refs / same size no-op / unchanged on 0 or overflow" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    _ = try doc.addLayer(gpa); // layer1 に ensureCelAt で cel が先に付く点に注意
+    _ = try doc.addLayer(gpa); // Note: ensureCelAt attaches a cel to layer1 first
     try doc.addFrame(gpa, 1);
     const cel0 = doc.createCel(gpa, 0, 0);
     doc.cel_pool.items[cel0].?.pixels[0] = 0xFFFF0000;
     doc.cel_pool.items[cel0].?.pixels[5] = 0xFF00FF00;
-    try doc.linkCel(gpa, 0, 1, 0); // frame1 → 同じ CelId
+    try doc.linkCel(gpa, 0, 1, 0); // frame1 → same CelId
     const cel1 = doc.createCel(gpa, 1, 0);
     doc.cel_pool.items[cel1].?.pixels[0] = 0xFF0000FF;
     doc.resyncActiveView(gpa);
@@ -2338,7 +2338,7 @@ test "Document.resize: multi-layer/frame/linked-cel 参照保持 / 同サイズ 
     try testing.expect(cel0 != cel1);
     const ref_before = doc.cel_pool.items[cel0].?.refcount;
 
-    // 不正サイズ: 状態不変
+    // Invalid size: state unchanged
     const w_before = doc.width;
     const h_before = doc.height;
     const pool_len_before = doc.cel_pool.items.len;
@@ -2352,7 +2352,7 @@ test "Document.resize: multi-layer/frame/linked-cel 参照保持 / 同サイズ 
     try testing.expectEqual(pool_len_before, doc.cel_pool.items.len);
     try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
 
-    // 同サイズ no-op（ポインタ維持）
+    // Same size no-op (pointers preserved)
     const px_ptr = doc.cel_pool.items[cel0].?.pixels.ptr;
     try doc.resize(gpa, 4, 4);
     try testing.expect(doc.cel_pool.items[cel0].?.pixels.ptr == px_ptr);

@@ -1,68 +1,68 @@
-//! document_io — Document の直列化（.pix プロジェクトファイル v4 schema）と PNG 連番書き出し
-//! （TASK-63 で v1 導入・TASK-45.1 で v2 セルグリッド schema へ全面改訂・TASK-94 で v3=LayerId・
-//! TASK-89 で v4=PLTE パレット）。
+//! document_io — Document serialization (.pix project file v4 schema) and PNG sequence export
+//! (v1 introduced; v2 cell-grid schema rewrite; v3=LayerId;
+//! v4=PLTE palette).
 //!
-//! 62.2 の `serde` versioned container（RIFF/IFF 系統）に pixie の schema を載せる。
-//! serde が「コンテナ（magic/version/chunk/CRC）」を、この module が「pixie schema
-//! （DOCH/LAYR/FRAM/CEL/PLTE）」を担う。serde は file I/O を持たないので、実 I/O は
-//! ここで `std.Io` 経由に行う（既存 io_png.savePNG と同じ流儀）。
+//! Loads pixie's schema onto the `serde` versioned container (RIFF/IFF lineage).
+//! serde owns the container (magic/version/chunk/CRC); this module owns the pixie schema
+//! (DOCH/LAYR/FRAM/CEL/PLTE). serde has no file I/O, so real I/O goes
+//! through `std.Io` here (same style as existing io_png.savePNG).
 //!
-//! **schema v4（`schema_version = 4`、現行 write）**: 任意 chunk `PLTE`（count u16 + u32×N）で
-//! Document.palette を永続化（TASK-89）。空 palette は chunk 省略。v3 以前 read は palette 空。
-//! netsync SYNC も本 module 経由のため palette も自動同期。
-//! **互換**: v4 reader は schema 2/3/4 を読む（後方互換）。旧 reader（max schema=3）は
-//! `ver > schema_version` で v4 を拒否する（前方互換ではない＝v4 ファイルを v3 reader は読めない）。
+//! **schema v4 (`schema_version = 4`, current write)**: optional chunk `PLTE` (count u16 + u32×N)
+//! persists Document.palette. Empty palette omits the chunk. Reads of v3 and older get an empty palette.
+//! netsync SYNC also goes through this module, so the palette syncs automatically.
+//! **Compatibility**: the v4 reader reads schemas 2/3/4 (backward compatible). An older reader (max schema=3)
+//! rejects v4 via `ver > schema_version` (not forward compatible — a v3 reader cannot read a v4 file).
 //!
-//! **schema v3（read 互換）**: LayerId（安定 handle）と `next_layer_id` を永続化（TASK-94 Phase A）。
+//! **schema v3 (read compatible)**: persists LayerId (stable handle) and `next_layer_id`.
 //!
-//! **schema v2（read 互換）**: LayerDef を Document レベルへ（TASK-45.1）、cel の実体は grid と
-//! 分離して CEL チャンクへ1回だけ書く。**id 無し**のため load 時に layer 順で決定的採番する
-//! （`next_layer_id = layer_count+1`）。
+//! **schema v2 (read compatible)**: LayerDef at Document level; cel bodies are separated from the grid and
+//! written once into CEL chunks. **No ids**, so load assigns deterministically in layer order
+//! (`next_layer_id = layer_count+1`).
 //!
-//! 旧 v1（`frames:[]*Canvas`、LAYR に pixels を直接埋め込む形式）の読み込み互換は**実装しない**
-//! （破壊的変更。backlog task-45.1 plan §6.3/§9.7）。`decodeDocument` は schema 2/3/4 を受理し、
-//! それ以外（v1・将来超過）は `error.UnsupportedSchemaVersion` で拒否する。
+//! Read compatibility for old v1 (`frames:[]*Canvas`, pixels embedded directly in LAYR) is **not implemented**
+//! (breaking change). `decodeDocument` accepts schemas 2/3/4 and
+//! rejects anything else (v1 / future overflow) with `error.UnsupportedSchemaVersion`.
 //!
-//! フォーマット（streaming walk。すべて little-endian）:
-//! - DOCH(1個・先頭):
+//! Format (streaming walk; all little-endian):
+//! - DOCH (one, at the start):
 //!   - v2=28B: width u32 | height u32 | layer_count u32 | frame_count u32
-//!     | selected_layer u32 | selected_frame u32 | flags u32(予約=0)
-//!   - v3=36B: 上記 + next_layer_id u64
-//! - LAYR(layer_count回・DOCH直後、pixelsを含まない):
-//!   - v2=8B: type u8(0=raster,1=text) | visible u8 | opacity u8 | blend u8(予約=0) | pad[4]
-//!   - v3=16B: 上記 + id u64（LayerId。0=invalid は全 LAYR 読了後に max 明示 id+1 から
-//!     順次再採番。非ゼロ id の重複は `error.CorruptLayer`）
-//!   - LNAM(任意・対応LAYRの直後): レイヤー名 UTF-8（ヘッダなし）
-//!   - LTXT(任意・LNAMの直後・kind==textのみ・16Bヘッダ+text): font_px f32(bitcast→u32,LE)
-//!     | color u32(LE) | x i32(LE) | y i32(LE) | text bytes(UTF-8, ヘッダなし)
-//! - FRAM(frame_count回・全LAYRの後・8B+layer_count*4B): frame_index u32 | duration_ms u32
-//!   | grid[layer_count](u32 each, LE. 0xFFFFFFFF=無し・それ以外=シリアルID)
-//! - CEL(K回・全FRAMの後にまとめて。K=ユニーク参照cel数・4B+W*H*4B): compression u8(0=raw)
-//!   | pad[3] | pixels[W*H*4](canonical BGRA u32 の raw bytes, row-major)
-//! - PLTE(任意・v4・CEL の後): count u16(LE) | colors[count] u32(LE each, canonical BGRA)
+//!     | selected_layer u32 | selected_frame u32 | flags u32 (reserved=0)
+//!   - v3=36B: above + next_layer_id u64
+//! - LAYR (layer_count times, right after DOCH; no pixels):
+//!   - v2=8B: type u8 (0=raster,1=text) | visible u8 | opacity u8 | blend u8 (reserved=0) | pad[4]
+//!   - v3=16B: above + id u64 (LayerId. 0=invalid is reassigned after all LAYR are read, from max explicit id+1
+//!     in order. Duplicate non-zero ids → `error.CorruptLayer`)
+//!   - LNAM (optional, immediately after the matching LAYR): layer name UTF-8 (no header)
+//!   - LTXT (optional, after LNAM, kind==text only, 16B header+text): font_px f32 (bitcast→u32,LE)
+//!     | color u32(LE) | x i32(LE) | y i32(LE) | text bytes (UTF-8, no header)
+//! - FRAM (frame_count times, after all LAYR, 8B+layer_count*4B): frame_index u32 | duration_ms u32
+//!   | grid[layer_count] (u32 each, LE. 0xFFFFFFFF=none; otherwise serial ID)
+//! - CEL (K times, batched after all FRAM. K=unique referenced cel count; 4B+W*H*4B): compression u8(0=raw)
+//!   | pad[3] | pixels[W*H*4] (canonical BGRA u32 raw bytes, row-major)
+//! - PLTE (optional, v4, after CEL): count u16(LE) | colors[count] u32(LE each, canonical BGRA)
 //!
-//! **シリアルID圧縮**（ファイル内表現のみ。in-memory の `CelId`/`CelSetSnapshot` とは別物）:
-//! encode は「FRAM を frame 順・各 frame は layer 順に走査した時の初出順」で 0 から
-//! シリアル番号を振り、CEL チャンクをその順に1回だけ書く。decode はシリアルID自体を
-//! そのまま新しい `CelId` として使う（CEL チャンクを出現順に cel_pool へ push すれば
-//! push した順序がそのまま新しい CelId になるため、変換テーブルは不要。plan 6.1節）。
+//! **Serial-ID compression** (on-disk representation only; distinct from in-memory `CelId`/`CelSetSnapshot`):
+//! encode numbers from 0 in first-seen order while walking FRAM in frame order and each frame in layer order,
+//! and writes each CEL chunk once in that order. decode uses the serial ID itself
+//! as the new `CelId` (pushing CEL chunks into cel_pool in appearance order makes
+//! push order equal the new CelId, so no translation table is needed).
 //!
-//! **前方互換/構造違反（v2/v3。plan 6.2節）**:
-//! - 未知 top-level tag → skip。
-//! - `LAYR.type` が raster/text 以外 → **skip できない**（grid が layer_count 個の固定長配列で
-//!   LAYR の出現順とインデックス対応するため）→ `error.UnsupportedLayerType` で全体拒否。
-//! - `LAYR`/`FRAM`/`CEL` の payload 長不一致 → 各々 `CorruptLayer`/`CorruptFrame`/`CorruptCel`。
-//! - `layer_count`/`frame_count` 宣言値と実出現数の不一致 → `LayerCountMismatch`/`FrameCountMismatch`。
-//! - すべての LAYR は全ての FRAM より前に出現しなければならない → `error.LayerAfterFrame`。
-//! - `FRAM.grid` のシリアルIDが実在する CEL 数以上 → `error.CorruptGrid`（dangling参照）。
-//!   余剰 CEL は許容（load後 refcount=0 として自動回収）。
-//! - 同一シリアルID（＝同一 CelId）が異なる複数の layer の grid から参照されている
-//!   → `error.CrossLayerCelShare`（cel の共有は layer 内に閉じるという設計前提の保護。plan 4.3節）。
-//! - `DOCH` 欠落/重複・`schema_version` が 2/3/4 以外は拒否。
+//! **Forward compatibility / structural errors (v2/v3)**:
+//! - Unknown top-level tag → skip.
+//! - `LAYR.type` other than raster/text → **cannot skip** (grid is a fixed-length array of layer_count
+//!   indexed by LAYR appearance order) → reject whole file with `error.UnsupportedLayerType`.
+//! - `LAYR`/`FRAM`/`CEL` payload length mismatch → `CorruptLayer`/`CorruptFrame`/`CorruptCel` respectively.
+//! - Declared `layer_count`/`frame_count` ≠ actual appearance count → `LayerCountMismatch`/`FrameCountMismatch`.
+//! - Every LAYR must appear before every FRAM → `error.LayerAfterFrame`.
+//! - `FRAM.grid` serial ID ≥ actual CEL count → `error.CorruptGrid` (dangling reference).
+//!   Surplus CELs are allowed (auto-reclaimed after load as refcount=0).
+//! - The same serial ID (= same CelId) referenced from grids of different layers
+//!   → `error.CrossLayerCelShare` (protects the design premise that cel sharing stays within a layer).
+//! - Missing/duplicate `DOCH`, or `schema_version` other than 2/3/4 → reject.
 //!
-//! ホットパス宣言: 保存・読込・書き出しは **イベント時のみ**（メニュー操作 1 回）。全画素規模だが
-//! フレーム毎ループではないため SIMD 3 点セット対象外。pixel payload は @memcpy 一括転送
-//! （per-pixel 除算/関数呼び出し/bounds 検査なし）。
+//! Hot-path declaration: save/load/export are **event-time only** (one menu action). Pixel-scale but
+//! not an every-frame loop, so outside the SIMD trio. Pixel payload is bulk-transferred with @memcpy
+//! (no per-pixel division/function call/bounds check).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -76,16 +76,16 @@ const LayerDef = document_mod.LayerDef;
 const LayerId = document_mod.LayerId;
 const CelId = document_mod.CelId;
 
-/// .pix の magic（FourCC 'PIX1' の little-endian u32）。serde の expected_magic に渡す。
+/// .pix magic (FourCC 'PIX1' as little-endian u32). Passed to serde's expected_magic.
 pub const magic: u32 = @as(u32, 'P') | (@as(u32, 'I') << 8) | (@as(u32, 'X') << 16) | (@as(u32, '1') << 24);
-/// pixie schema のバージョン（serde の container_version とは別。app 管理）。
-/// TASK-45.1 で v2・TASK-94 で v3（LayerId）・TASK-89 で v4（PLTE）。write は常に現行版。
+/// pixie schema version (separate from serde's container_version; app-managed).
+/// write always uses the current version (v2 cell grid; v3 LayerId; v4 PLTE).
 pub const schema_version: u16 = 4;
-/// 読み込みを受け付ける最古 schema（v2 セルグリッド）。v1 は拒否。
+/// Oldest schema accepted on read (v2 cell grid). v1 is rejected.
 pub const schema_version_min: u16 = 2;
-/// v3 schema 定数（read 分岐・手書き fixture 用。v2→v3 併置パターン踏襲）。
+/// v3 schema constant (read branch / hand-written fixtures; follows the v2→v3 side-by-side pattern).
 pub const schema_version_v3: u16 = 3;
-/// v2 schema 定数。
+/// v2 schema constant.
 pub const schema_version_v2: u16 = 2;
 
 const TAG_DOC: [4]u8 = "DOCH".*;
@@ -97,30 +97,30 @@ const TAG_CEL: [4]u8 = "CELS".*;
 const TAG_PLTE: [4]u8 = "PLTE".*;
 
 const doc_header_size_v2: usize = 28;
-const doc_header_size_v3: usize = 36; // + next_layer_id u64（v3/v4 共通）
-const doc_header_size: usize = doc_header_size_v3; // encode 用
+const doc_header_size_v3: usize = 36; // + next_layer_id u64 (shared by v3/v4)
+const doc_header_size: usize = doc_header_size_v3; // for encode
 const layer_header_size_v2: usize = 8;
-const layer_header_size_v3: usize = 16; // + id u64（v3/v4 共通）
-const layer_header_size: usize = layer_header_size_v3; // encode 用
-const frame_header_size: usize = 8; // grid[layer_count] はこれに続く可変長部分
+const layer_header_size_v3: usize = 16; // + id u64 (shared by v3/v4)
+const layer_header_size: usize = layer_header_size_v3; // for encode
+const frame_header_size: usize = 8; // grid[layer_count] is the variable-length part that follows
 const cel_header_size: usize = 4;
 const plte_header_size: usize = 2; // count u16
-/// PLTE 色数上限（u16 全幅は拒否。DoS / 破損防御。TASK-89 review）。
+/// PLTE color-count cap (full u16 range rejected; DoS / corruption defence).
 const plte_max_colors: usize = 256;
 const layer_type_raster: u8 = 0;
 const layer_type_text: u8 = 1;
 const compression_raw: u8 = 0;
-/// LTXT ヘッダ長（font_px:f32 + color:u32 + x:i32 + y:i32）。残りが text bytes。
+/// LTXT header length (font_px:f32 + color:u32 + x:i32 + y:i32). Remainder is text bytes.
 const text_header_size: usize = 16;
-/// FRAM.grid の「空スロット」マーカー（実 CelId は非再利用の単調増加で高々 u32 の範囲に収まる
-/// 前提。schema 上は予約値として扱う）。
+/// FRAM.grid "empty slot" marker (real CelIds are monotonic non-reused and fit in u32
+/// by premise; treated as a reserved value on the schema).
 const grid_none: u32 = 0xFFFFFFFF;
 
 pub const CanvasSize = struct { w: u32, h: u32 };
 
-// ── encode / decode（bytes ⇔ Document。file I/O なし）─────────────────────
+// ── encode / decode (bytes ⇔ Document; no file I/O) ─────────────────────
 
-/// Document を .pix バイト列へ直列化する（caller が free）。schema は現行版（v4）で書く。
+/// Serialize Document to .pix bytes (caller frees). Written at the current schema (v4).
 pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -135,17 +135,17 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
     std.mem.writeInt(u32, doch[12..16], @intCast(nframes), .little);
     std.mem.writeInt(u32, doch[16..20], @intCast(doc.selected_layer), .little);
     std.mem.writeInt(u32, doch[20..24], doc.selected_frame, .little);
-    std.mem.writeInt(u32, doch[24..28], 0, .little); // flags 予約
+    std.mem.writeInt(u32, doch[24..28], 0, .little); // flags reserved
     std.mem.writeInt(u64, doch[28..36], doc.next_layer_id, .little);
     try w.addChunk(TAG_DOC, &doch);
 
-    // LAYR(+LNAM/LTXT)。pixels は含まない（v2 の要）。v3 は id u64 を末尾に載せる。
+    // LAYR(+LNAM/LTXT). No pixels (essential to v2). v3 appends id u64.
     for (doc.layers.items) |def| {
         var lbuf: [layer_header_size]u8 = undefined;
         lbuf[0] = if (def.kind == .text) layer_type_text else layer_type_raster;
         lbuf[1] = @intFromBool(def.visible);
         lbuf[2] = def.opacity;
-        lbuf[3] = 0; // blend 予約
+        lbuf[3] = 0; // blend reserved
         @memset(lbuf[4..8], 0); // pad
         std.mem.writeInt(u64, lbuf[8..16], @intFromEnum(def.id), .little);
         try w.addChunk(TAG_LAYER, &lbuf);
@@ -165,11 +165,11 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
         }
     }
 
-    // FRAM（frame 順・各 frame は layer 順で grid を走査 = シリアルID の初出順）。
+    // FRAM (frame order; each frame walks grid in layer order = serial-ID first-seen order).
     var serial_of = try gpa.alloc(?u32, doc.cel_pool.items.len);
     defer gpa.free(serial_of);
     @memset(serial_of, null);
-    var serial_order: std.ArrayList(CelId) = .empty; // シリアルID順の元 CelId（CEL 書き出し用）
+    var serial_order: std.ArrayList(CelId) = .empty; // Source CelIds in serial-ID order (for CEL write-out)
     defer serial_order.deinit(gpa);
 
     for (0..nframes) |f| {
@@ -193,7 +193,7 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
         try w.addChunk(TAG_FRAME, grid_buf);
     }
 
-    // CEL（シリアルID順に1回ずつ）。
+    // CEL (once each, in serial-ID order).
     for (serial_order.items) |orig_id| {
         const cel = doc.cel_pool.items[orig_id].?;
         const px_bytes = std.mem.sliceAsBytes(cel.pixels);
@@ -207,7 +207,7 @@ pub fn encodeDocument(doc: *Document, gpa: Allocator) ![]u8 {
         try w.addChunk(TAG_CEL, buf);
     }
 
-    // PLTE（v4。空 = 未設定なので chunk 省略）。
+    // PLTE (v4. Empty = unset, so omit the chunk).
     if (doc.palette.items.len > 0) {
         const n = doc.palette.items.len;
         const buf = try gpa.alloc(u8, plte_header_size + n * 4);
@@ -230,9 +230,9 @@ fn readU64(b: []const u8) u64 {
     return std.mem.readInt(u64, b[0..8], .little);
 }
 
-/// .pix バイト列から Document を復元する（任意サイズ。size 制限は呼び出し側=pixie 責務）。
-/// schema_version ∈ {2,3,4} を受理する（v1 / 超過は `error.UnsupportedSchemaVersion`）。
-/// v2（id 無し）は layer 順に決定的採番する（TASK-94）。v3 以前は palette 空。
+/// Restore a Document from .pix bytes (any size; size limits are the caller's=pixie's job).
+/// Accepts schema_version ∈ {2,3,4} (v1 / overflow → `error.UnsupportedSchemaVersion`).
+/// v2 (no ids) assigns deterministically in layer order. Pre-v3 gets an empty palette.
 pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
     const container = try serde.Container.parse(bytes, magic);
     const ver = container.schemaVersion();
@@ -250,14 +250,14 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
     const declared_frames = readU32(first.payload[12..16]);
     const sel_layer = readU32(first.payload[16..20]);
     const sel_frame = readU32(first.payload[20..24]);
-    // payload[24..28] = flags（予約・未使用）
+    // payload[24..28] = flags (reserved, unused)
     const stored_next_layer_id: ?u64 = if (has_layer_ids) readU64(first.payload[28..36]) else null;
 
     var doc = try Document.initEmpty(gpa, width, height);
     errdefer doc.deinit();
 
     var last_layer_idx: ?usize = null;
-    var layers_done = false; // true になったら以後 LAYR は構造違反
+    var layers_done = false; // Once true, further LAYR is a structural error
     var raw_grid: std.ArrayList(?u32) = .empty; // frame-major: [frame*declared_layers + layer]
     defer raw_grid.deinit(gpa);
     var frame_count: u32 = 0;
@@ -279,12 +279,12 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
             var def: LayerDef = .{ .kind = if (t == layer_type_text) .text else .raster };
             def.visible = p[1] != 0;
             def.opacity = p[2];
-            // LayerId: v3 は payload から（0=invalid は読了後に再採番。非ゼロ重複は拒否）。
-            // v2 は layer 順に決定的採番（TASK-94 / codex P1）。
+            // LayerId: v3 from payload (0=invalid reassigned after read; non-zero duplicates rejected).
+            // v2 assigns deterministically in layer order.
             if (has_layer_ids) {
                 const raw_id = readU64(p[8..16]);
                 if (raw_id == 0) {
-                    def.id = .invalid; // 全 LAYR 読了後に max 明示 id+1 から順次採番
+                    def.id = .invalid; // After all LAYR are read, assign sequentially from max explicit id+1
                 } else {
                     const id: LayerId = @enumFromInt(raw_id);
                     for (doc.layers.items) |existing| {
@@ -301,8 +301,8 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
             try doc.layers.append(gpa, def);
             last_layer_idx = doc.layers.items.len - 1;
         } else if (std.mem.eql(u8, &chunk.tag, &TAG_LAYER_NAME)) {
-            // 直前が有効な LAYR だった場合のみ適用する（last_layer_idx は LNAM/LTXT では
-            // リセットしない = LTXT が同じレイヤーを対象にできる。v1 と同じ安全弁）。
+            // Apply only when the previous chunk was a valid LAYR (last_layer_idx is not
+            // reset by LNAM/LTXT = LTXT can target the same layer. Same safety valve as v1).
             if (last_layer_idx) |li| {
                 if (canvas_mod.isValidLayerName(chunk.payload)) doc.layers.items[li].setName(chunk.payload);
             }
@@ -345,7 +345,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
             doc.next_cel_id += 1;
             last_layer_idx = null;
         } else if (std.mem.eql(u8, &chunk.tag, &TAG_PLTE)) {
-            // v4 パレット（v3 以前ファイルには無い。複数 PLTE は後勝ちで置き換え）。
+            // v4 palette (absent from pre-v3 files. Multiple PLTE: last write wins).
             const p = chunk.payload;
             if (p.len < plte_header_size) return error.CorruptPalette;
             const count: usize = std.mem.readInt(u16, p[0..2], .little);
@@ -367,8 +367,8 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
     if (frame_count == 0) return error.MissingFrame;
     if (frame_count != declared_frames) return error.FrameCountMismatch;
 
-    // v3: id=0（invalid）スロットを、明示 id の max+1 から layer 順に再採番する。
-    // 読みながらの即時採番は後続の明示 id と衝突しうるため禁止（codex P1）。
+    // v3: reassign id=0 (invalid) slots in layer order from max explicit id+1.
+    // Immediate assign-while-reading is forbidden (can collide with later explicit ids).
     if (has_layer_ids) {
         var max_explicit: u64 = 0;
         for (doc.layers.items) |def| {
@@ -376,7 +376,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
             if (v > max_explicit) max_explicit = v;
         }
         var next_assign: u64 = max_explicit + 1;
-        if (next_assign == 0) next_assign = 1; // 全 invalid かつ overflow 防御（通常は到達しない）
+        if (next_assign == 0) next_assign = 1; // All-invalid plus overflow defence (normally unreachable)
         for (doc.layers.items) |*def| {
             if (def.id == .invalid) {
                 def.id = @enumFromInt(next_assign);
@@ -389,7 +389,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
     const nframes: usize = frame_count;
     const cel_count = doc.cel_pool.items.len;
 
-    // grid（layer-major）を組み立てつつ、dangling参照・cross-layer共有・refcountを検査/計算する。
+    // Build the grid (layer-major) while checking/computing dangling refs, cross-layer shares, and refcounts.
     const owner_layer = try gpa.alloc(?usize, cel_count);
     defer gpa.free(owner_layer);
     @memset(owner_layer, null);
@@ -413,7 +413,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
         }
     }
 
-    // 参照0の cel（余剰CEL）は自動回収（詰めない。CelId=cel_pool indexという前提を崩さない）。
+    // Zero-ref cels (surplus CEL) are auto-reclaimed (not compacted; keeps CelId=cel_pool index).
     for (doc.cel_pool.items) |*maybe_cel| {
         if (maybe_cel.*) |cel| {
             if (cel.refcount == 0) {
@@ -423,15 +423,15 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
         }
     }
 
-    // text layer の不変条件を防御的に正規化（4.4節手順5。壊れた/手編集ファイルでも
-    // decode 完了時点で必ず不変条件を満たす状態へ矯正する）。
+    // Defensively normalize text-layer invariants (force a state that satisfies the invariant
+    // by the time decode completes, even for broken/hand-edited files).
     for (0..nlayers) |l| {
         if (doc.layers.items[l].kind == .text) doc.normalizeTextLayerLinks(gpa, l);
     }
 
-    // LayerId 採番カーソル: v3 は DOCH の next_layer_id を採用し、全 id（再採番後）の
-    // max+1 未満なら防御的に引き上げる。v2 は load 中の allocLayerId で既に
-    // next_layer_id = layer_count+1 になっている。
+    // LayerId allocation cursor: v3 takes DOCH's next_layer_id and defensively raises it if below
+    // max(id)+1 after reassignment. v2 already has
+    // next_layer_id = layer_count+1 from allocLayerId during load.
     if (stored_next_layer_id) |n| doc.next_layer_id = n;
     for (doc.layers.items) |def| {
         const v = @intFromEnum(def.id);
@@ -441,13 +441,13 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
     if (sel_layer < nlayers) doc.selected_layer = sel_layer;
     if (sel_frame < nframes) doc.selected_frame = sel_frame;
 
-    // project load 直後（呼び出し元の3箇所のうち1つ。plan 2節）: active_view を
-    // doc.layers/grid から作り直す（layer 数 reconcile + pixels/metadata 反映）。
+    // Right after project load (one of the three call sites): rebuild active_view from
+    // doc.layers/grid (reconcile layer count + apply pixels/metadata).
     doc.resyncActiveView(gpa);
     return doc;
 }
 
-/// バイト列の DOCH から canvas サイズだけを覗く（layer 復元前の size 拒否用）。
+/// Peek only the canvas size from the DOCH in a byte slice (for size rejection before layer restore).
 pub fn peekCanvasSize(bytes: []const u8) !CanvasSize {
     const container = try serde.Container.parse(bytes, magic);
     const doch = container.find(TAG_DOC) orelse return error.MissingHeader;
@@ -458,17 +458,17 @@ pub fn peekCanvasSize(bytes: []const u8) !CanvasSize {
     };
 }
 
-// ── file I/O（std.Io 経由。serde は I/O を持たない）───────────────────────
+// ── file I/O (via std.Io; serde has no I/O) ───────────────────────
 
-/// Document を path へ保存する（encode → writeFile）。
+/// Save Document to path (encode → writeFile).
 pub fn saveDocument(io: std.Io, path: []const u8, doc: *Document, gpa: Allocator) !void {
     const bytes = try encodeDocument(doc, gpa);
     defer gpa.free(bytes);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
-/// path から Document を読む。expected_w/h に一致しないサイズは layer 復元前に
-/// error.UnsupportedCanvasSize（0 を渡すとサイズ検査をしない＝任意サイズ許可）。
+/// Load Document from path. Sizes that do not match expected_w/h return
+/// error.UnsupportedCanvasSize before layer restore (pass 0 to skip the size check = any size allowed).
 pub fn loadDocument(io: std.Io, gpa: Allocator, path: []const u8, expected_w: u32, expected_h: u32) !Document {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(bytes);
@@ -479,10 +479,10 @@ pub fn loadDocument(io: std.Io, gpa: Allocator, path: []const u8, expected_w: u3
     return decodeDocument(bytes, gpa);
 }
 
-/// 各フレームを compositeStraight（フラット透明）して `<stem>_NNNN.png`（1 始まり）へ書き出す。
-/// PNG 保存規約: 白背景 composite() は使わない。実装方式は「selected_frame 退避→各frameを
-/// resync→composite→復元」（v5補遺(e)②で候補として挙げた2方式のうち前者を採用。frame数は
-/// 通常小さく、composite ロジックの部分共有が要らない前者の方が実装が単純）。
+/// compositeStraight each frame (flat transparent) and write `<stem>_NNNN.png` (1-based).
+/// PNG save rule: do not use white-background composite(). Implementation: stash selected_frame → for each frame
+/// resync→composite→restore (chosen for simplicity: frame counts are
+/// usually small, and this avoids sharing composite logic partially).
 pub fn exportPngSequence(io: std.Io, stem: []const u8, doc: *Document, gpa: Allocator) !void {
     const saved_frame = doc.selected_frame;
     defer {
@@ -504,8 +504,8 @@ pub const SpriteSheetOpts = struct {
     margin: u32 = 0,
 };
 
-/// 全フレームを compositeStraight（フラット透明）して 1 枚のスプライトシート PNG へ書き出す。
-/// `columns=0` は `ceil(sqrt(n))` を自動採用。セル間余白は `margin` px（透明）。
+/// compositeStraight every frame (flat transparent) into one spritesheet PNG.
+/// `columns=0` auto-picks `ceil(sqrt(n))`. Inter-cell margin is `margin` px (transparent).
 pub fn exportSpriteSheet(io: std.Io, path: []const u8, doc: *Document, gpa: Allocator, opts: SpriteSheetOpts) !void {
     const n_frames = doc.frames.items.len;
     if (n_frames == 0) return error.NoFrames;
@@ -520,7 +520,7 @@ pub fn exportSpriteSheet(io: std.Io, path: []const u8, doc: *Document, gpa: Allo
     const fh: u64 = doc.height;
     const margin: u64 = opts.margin;
 
-    // 乗算・加算とも checked（巨大な columns/margin 引数でも panic せず SheetTooLarge を返す）
+    // Multiply and add are checked (huge columns/margin args return SheetTooLarge without panic)
     const cells_w = std.math.mul(u64, cols, fw) catch return error.SheetTooLarge;
     const gaps_w = std.math.mul(u64, @as(u64, cols) -| 1, margin) catch return error.SheetTooLarge;
     const sheet_w_u64 = std.math.add(u64, cells_w, gaps_w) catch return error.SheetTooLarge;
@@ -581,7 +581,7 @@ fn fillLayer(c: *Canvas, idx: usize, color: u32) void {
     for (c.layerPixels(idx)) |*p| p.* = color;
 }
 
-test "round-trip: 多層（visible/opacity/partial-alpha/透明混在）を bit 復元 + layers.len/selected" {
+test "round-trip: multi-layer (visible/opacity/partial-alpha/mixed transparency) bit-restores + layers.len/selected" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -616,8 +616,8 @@ test "round-trip: 多層（visible/opacity/partial-alpha/透明混在）を bit 
     doc.selected_layer = 1;
     try doc.renameLayer(gpa, 0, "Background");
     try doc.renameLayer(gpa, 2, "あ日本語レイヤー");
-    // 初回コミット時に active_view へ手で書いた pixels は既にコミット済みなので pushPaintOp 後の
-    // c.layerPixels(1)/(2) は変わらない（そのまま比較対象に使える）。
+    // On first commit, pixels hand-written into active_view are already committed, so after pushPaintOp
+    // c.layerPixels(1)/(2) are unchanged (usable as comparison targets as-is).
     const id0 = doc.layerIdAt(0).?;
     const id1 = doc.layerIdAt(1).?;
     const id2 = doc.layerIdAt(2).?;
@@ -630,7 +630,7 @@ test "round-trip: 多層（visible/opacity/partial-alpha/透明混在）を bit 
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 1), loaded.frameCount());
     const lc = loaded.activeCanvas();
-    try testing.expectEqual(@as(usize, 3), lc.layers.items.len); // 余り層が出ない
+    try testing.expectEqual(@as(usize, 3), lc.layers.items.len); // No leftover layers
     try testing.expectEqual(@as(usize, 1), lc.selected_layer);
     try testing.expectEqualSlices(u32, c.layers.items[0].pixels, lc.layers.items[0].pixels);
     try testing.expectEqualSlices(u32, c.layers.items[1].pixels, lc.layers.items[1].pixels);
@@ -640,16 +640,16 @@ test "round-trip: 多層（visible/opacity/partial-alpha/透明混在）を bit 
     try testing.expectEqual(true, lc.layers.items[0].visible);
     try testing.expectEqual(@as(u8, 255), lc.layers.items[0].opacity);
     try testing.expectEqualStrings("Background", lc.layers.items[0].name());
-    try testing.expectEqualStrings("Layer 2", lc.layers.items[1].name()); // 未リネームは既定名のまま
+    try testing.expectEqualStrings("Layer 2", lc.layers.items[1].name()); // Unrenamed keeps the default name
     try testing.expectEqualStrings("あ日本語レイヤー", lc.layers.items[2].name());
-    // LayerId / next_layer_id も bit 復元（TASK-94）
+    // LayerId / next_layer_id also restore bit-identically
     try testing.expectEqual(id0, loaded.layerIdAt(0).?);
     try testing.expectEqual(id1, loaded.layerIdAt(1).?);
     try testing.expectEqual(id2, loaded.layerIdAt(2).?);
     try testing.expectEqual(next_id, loaded.next_layer_id);
 }
 
-test "peekCanvasSize: DOCH の w/h を復元前に取れる" {
+test "peekCanvasSize: reads DOCH w/h before restore" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 13, 7);
     defer doc.deinit();
@@ -660,7 +660,7 @@ test "peekCanvasSize: DOCH の w/h を復元前に取れる" {
     try testing.expectEqual(@as(u32, 7), sz.h);
 }
 
-// ── 前方互換 / 構造違反（手書き container を serde.Writer で組む）────────────
+// ── Forward compatibility / structural errors (hand-built containers via serde.Writer) ────────────
 
 fn docChunk(w: u32, h: u32, layer_count: u32, frame_count: u32, selected_layer: u32, selected_frame: u32) [doc_header_size]u8 {
     return docChunkV3(w, h, layer_count, frame_count, selected_layer, selected_frame, @as(u64, layer_count) + 1);
@@ -716,7 +716,7 @@ fn layerChunkV2(ltype: u8, visible: bool, opacity: u8) [layer_header_size_v2]u8 
     return b;
 }
 
-/// FRAM チャンク payload を組む（frame_index + duration_ms + grid[layer_count]）。
+/// Build a FRAM chunk payload (frame_index + duration_ms + grid[layer_count]).
 fn frameChunk(gpa: Allocator, frame_index: u32, duration_ms: u32, grid: []const u32) ![]u8 {
     const buf = try gpa.alloc(u8, frame_header_size + grid.len * 4);
     std.mem.writeInt(u32, buf[0..4], frame_index, .little);
@@ -748,7 +748,7 @@ fn textChunk(gpa: Allocator, font_px: f32, color: u32, x: i32, y: i32, text: []c
     return buf;
 }
 
-test "前方互換: 未知 chunk tag を skip して既知 layer/frame/cel を読む" {
+test "forward compatibility: skip unknown chunk tags and still read known layer/frame/cel" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
@@ -773,9 +773,9 @@ test "前方互換: 未知 chunk tag を skip して既知 layer/frame/cel を�
     for (lc.layers.items[0].pixels) |p| try testing.expectEqual(@as(u32, 0xFF010203), p);
 }
 
-test "v1 schema は明示エラーで拒否される（v1互換は実装しない。plan §9.7 破壊的変更）" {
+test "v1 schema is rejected with an explicit error (v1 compatibility not implemented; breaking change)" {
     const gpa = testing.allocator;
-    var w = try serde.Writer.init(gpa, magic, 1); // schema_version=1（旧形式相当）
+    var w = try serde.Writer.init(gpa, magic, 1); // schema_version=1 (old-format equivalent)
     defer w.deinit();
     const doch = docChunk(1, 1, 1, 1, 0, 0);
     try w.addChunk(TAG_DOC, &doch);
@@ -784,7 +784,7 @@ test "v1 schema は明示エラーで拒否される（v1互換は実装しな�
     try testing.expectError(error.UnsupportedSchemaVersion, decodeDocument(bytes, gpa));
 }
 
-test "schema_version 超過も拒否される" {
+test "schema_version overflow is also rejected" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version + 1);
     defer w.deinit();
@@ -795,7 +795,7 @@ test "schema_version 超過も拒否される" {
     try testing.expectError(error.UnsupportedSchemaVersion, decodeDocument(bytes, gpa));
 }
 
-test "LNAM/LTXT: round-trip で text kind/text_params が bit 復元される" {
+test "LNAM/LTXT: round-trip bit-restores text kind/text_params" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 8, 4);
     defer doc.deinit();
@@ -817,10 +817,10 @@ test "LNAM/LTXT: round-trip で text kind/text_params が bit 復元される" {
     try testing.expectEqualSlices(u32, doc.activeCanvas().layerPixels(idx), lc.layerPixels(idx));
 }
 
-test "構造違反: 各エラーを返す" {
+test "structural errors: returns each error" {
     const gpa = testing.allocator;
 
-    // DOCH 欠落（FRAM が先頭）
+    // Missing DOCH (FRAM first)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -831,7 +831,7 @@ test "構造違反: 各エラーを返す" {
         defer gpa.free(bytes);
         try testing.expectError(error.MissingHeader, decodeDocument(bytes, gpa));
     }
-    // DOCH 重複
+    // Duplicate DOCH
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -842,19 +842,19 @@ test "構造違反: 各エラーを返す" {
         defer gpa.free(bytes);
         try testing.expectError(error.DuplicateHeader, decodeDocument(bytes, gpa));
     }
-    // 未知 LAYR.type
+    // Unknown LAYR.type
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
         const doch = docChunk(1, 1, 1, 1, 0, 0);
         try w.addChunk(TAG_DOC, &doch);
-        const lay = layerChunk(2, true, 255); // type=2 は未知
+        const lay = layerChunk(2, true, 255); // type=2 is unknown
         try w.addChunk(TAG_LAYER, &lay);
         const bytes = try w.finish();
         defer gpa.free(bytes);
         try testing.expectError(error.UnsupportedLayerType, decodeDocument(bytes, gpa));
     }
-    // LAYR が FRAM の後（構造違反）
+    // LAYR after FRAM (structural error)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -888,18 +888,18 @@ test "構造違反: 各エラーを返す" {
         defer gpa.free(bytes);
         try testing.expectError(error.UnsupportedCompression, decodeDocument(bytes, gpa));
     }
-    // CEL payload 長不一致
+    // CEL payload length mismatch
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
-        const doch = docChunk(2, 2, 1, 1, 0, 0); // 2x2=16B pixels 期待
+        const doch = docChunk(2, 2, 1, 1, 0, 0); // Expect 2x2=16B pixels
         try w.addChunk(TAG_DOC, &doch);
         const lay = layerChunk(layer_type_raster, true, 255);
         try w.addChunk(TAG_LAYER, &lay);
         const frm = try frameChunk(gpa, 0, 100, &.{0});
         defer gpa.free(frm);
         try w.addChunk(TAG_FRAME, frm);
-        var short: [cel_header_size + 4]u8 = undefined; // 1px 分しかない
+        var short: [cel_header_size + 4]u8 = undefined; // Only 1px worth
         short[0] = compression_raw;
         short[1] = 0;
         short[2] = 0;
@@ -910,7 +910,7 @@ test "構造違反: 各エラーを返す" {
         defer gpa.free(bytes);
         try testing.expectError(error.CorruptCel, decodeDocument(bytes, gpa));
     }
-    // frame_count 不一致（DOCH は 2 だが FRAM 1 個）
+    // frame_count mismatch (DOCH says 2 but one FRAM)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -925,7 +925,7 @@ test "構造違反: 各エラーを返す" {
         defer gpa.free(bytes);
         try testing.expectError(error.FrameCountMismatch, decodeDocument(bytes, gpa));
     }
-    // layer_count 不一致（DOCH は 2 だが LAYR 1 個）
+    // layer_count mismatch (DOCH says 2 but one LAYR)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -940,7 +940,7 @@ test "構造違反: 各エラーを返す" {
         defer gpa.free(bytes);
         try testing.expectError(error.LayerCountMismatch, decodeDocument(bytes, gpa));
     }
-    // FRAM の grid が dangling 参照（CEL 未出現のシリアルIDを参照）
+    // FRAM grid dangling reference (serial ID with no CEL)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -948,14 +948,14 @@ test "構造違反: 各エラーを返す" {
         try w.addChunk(TAG_DOC, &doch);
         const lay = layerChunk(layer_type_raster, true, 255);
         try w.addChunk(TAG_LAYER, &lay);
-        const frm = try frameChunk(gpa, 0, 100, &.{0}); // serial 0 だが CEL が無い
+        const frm = try frameChunk(gpa, 0, 100, &.{0}); // serial 0 but no CEL
         defer gpa.free(frm);
         try w.addChunk(TAG_FRAME, frm);
         const bytes = try w.finish();
         defer gpa.free(bytes);
         try testing.expectError(error.CorruptGrid, decodeDocument(bytes, gpa));
     }
-    // 別 app の magic（serde が BadMagic）
+    // Another app's magic (serde BadMagic)
     {
         var w = try serde.Writer.init(gpa, 0xDEADBEEF, schema_version);
         defer w.deinit();
@@ -967,7 +967,7 @@ test "構造違反: 各エラーを返す" {
     }
 }
 
-test "decode: cross-layer CelId 共有は拒否される（同一シリアルIDを異なるlayerが参照）" {
+test "decode: cross-layer CelId sharing is rejected (same serial ID referenced from different layers)" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
@@ -977,7 +977,7 @@ test "decode: cross-layer CelId 共有は拒否される（同一シリアルID�
     try w.addChunk(TAG_LAYER, &lay0);
     const lay1 = layerChunkV3(layer_type_raster, true, 255, 2);
     try w.addChunk(TAG_LAYER, &lay1);
-    // frame0: layer0=serial0, layer1=serial0（同じシリアルIDを異なるlayerが参照）
+    // frame0: layer0=serial0, layer1=serial0 (same serial ID from different layers)
     const frm = try frameChunk(gpa, 0, 100, &.{ 0, 0 });
     defer gpa.free(frm);
     try w.addChunk(TAG_FRAME, frm);
@@ -989,7 +989,7 @@ test "decode: cross-layer CelId 共有は拒否される（同一シリアルID�
     try testing.expectError(error.CrossLayerCelShare, decodeDocument(bytes, gpa));
 }
 
-test "decode: 余剰CEL(参照0)は自動回収される（refcount=0でnull化）" {
+test "decode: surplus CEL (refcount 0) is auto-reclaimed (nulled at refcount=0)" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
@@ -997,10 +997,10 @@ test "decode: 余剰CEL(参照0)は自動回収される（refcount=0でnull化�
     try w.addChunk(TAG_DOC, &doch);
     const lay = layerChunk(layer_type_raster, true, 255);
     try w.addChunk(TAG_LAYER, &lay);
-    const frm = try frameChunk(gpa, 0, 100, &.{grid_none}); // 参照なし
+    const frm = try frameChunk(gpa, 0, 100, &.{grid_none}); // No references
     defer gpa.free(frm);
     try w.addChunk(TAG_FRAME, frm);
-    const cel = try celChunk(gpa, 1, 1, 0xFF112233); // 誰も参照しない余剰CEL
+    const cel = try celChunk(gpa, 1, 1, 0xFF112233); // Surplus CEL nobody references
     defer gpa.free(cel);
     try w.addChunk(TAG_CEL, cel);
     const bytes = try w.finish();
@@ -1008,11 +1008,11 @@ test "decode: 余剰CEL(参照0)は自動回収される（refcount=0でnull化�
 
     var loaded = try decodeDocument(bytes, gpa);
     defer loaded.deinit();
-    // grid は null のまま（余剰CELは参照されない）
+    // grid stays null (surplus CEL is unreferenced)
     try testing.expect(loaded.gridGet(0, 0) == null);
 }
 
-test "decode時のtext layer防御的正規化: 壊れたリンク状態を最初のnon-nullで矯正する" {
+test "decode defensive text-layer normalization: broken link state corrected to the first non-null" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
@@ -1024,7 +1024,7 @@ test "decode時のtext layer防御的正規化: 壊れたリンク状態を最�
     const txt = try textChunk(gpa, 12, 0xFFFFFFFF, 0, 0, "X");
     defer gpa.free(txt);
     try w.addChunk(TAG_LAYER_TEXT, txt);
-    // frame0=serial0, frame1=serial1（本来は同一を共有すべきだが壊れて別々を指す）
+    // frame0=serial0, frame1=serial1 (should share one but brokenly point at different ones)
     const frm0 = try frameChunk(gpa, 0, 100, &.{0});
     defer gpa.free(frm0);
     try w.addChunk(TAG_FRAME, frm0);
@@ -1042,14 +1042,14 @@ test "decode時のtext layer防御的正規化: 壊れたリンク状態を最�
 
     var loaded = try decodeDocument(bytes, gpa);
     defer loaded.deinit();
-    // 正規化により両frameが同一CelIdを指す（最初に見つかったnon-null=frame0のcelが正典）
+    // Normalization makes both frames point at the same CelId (first non-null found = frame0's cel is canonical)
     const id0 = loaded.gridGet(0, 0);
     const id1 = loaded.gridGet(0, 1);
     try testing.expect(id0 != null and id1 != null);
     try testing.expectEqual(id0.?, id1.?);
 }
 
-test "任意サイズ round-trip（document_io 自体は size 非依存。256 制限は pixie 責務）" {
+test "any-size round-trip (document_io itself is size-agnostic; 256 limit is pixie's job)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 3, 5);
     defer doc.deinit();
@@ -1068,7 +1068,7 @@ test "任意サイズ round-trip（document_io 自体は size 非依存。256 �
     try testing.expectEqualSlices(u32, doc.activeCanvas().layerPixels(0), loaded.activeCanvas().layerPixels(0));
 }
 
-/// resize 後 Document と encode→decode 結果の構造・画素・リンク関係を比較する（CelId 値は再採番され得る）。
+/// Compare post-resize Document with encode→decode result (structure/pixels/links; CelId values may be reassigned).
 fn expectResizePixRoundTrip(src: *Document, gpa: Allocator) !void {
     const bytes = try encodeDocument(src, gpa);
     defer gpa.free(bytes);
@@ -1091,7 +1091,7 @@ fn expectResizePixRoundTrip(src: *Document, gpa: Allocator) !void {
                 try testing.expectEqualSlices(u32, src.cel_pool.items[aid].?.pixels, loaded.cel_pool.items[bid].?.pixels);
                 try testing.expectEqual(src.cel_pool.items[aid].?.refcount, loaded.cel_pool.items[bid].?.refcount);
             }
-            // 同一 layer 内の共有リンク（同 CelId）が decode 後も同値になること
+            // Same-layer shared links (same CelId) stay equal after decode
             for (fi + 1..nframes) |fj| {
                 const same_src = blk: {
                     const x = src.gridGet(li, @intCast(fi));
@@ -1107,7 +1107,7 @@ fn expectResizePixRoundTrip(src: *Document, gpa: Allocator) !void {
             }
         }
     }
-    // active_view も新サイズで一致
+    // active_view also matches at the new size
     try testing.expectEqual(src.active_view.width, loaded.active_view.width);
     try testing.expectEqual(src.active_view.height, loaded.active_view.height);
     try testing.expectEqual(src.active_view.layers.items.len, loaded.active_view.layers.items.len);
@@ -1116,18 +1116,18 @@ fn expectResizePixRoundTrip(src: *Document, gpa: Allocator) !void {
     }
 }
 
-test "Document.resize → encode/decode round-trip（縮小・拡大・multi-layer/frame/linked-cel。TASK-144.1）" {
+test "Document.resize → encode/decode round-trip (shrink/grow/multi-layer/frame/linked-cel)" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
 
-    _ = try doc.addLayer(gpa); // layer1 に ensureCelAt で cel が先に付く
+    _ = try doc.addLayer(gpa); // layer1 gets a cel first via ensureCelAt
     try doc.addFrame(gpa, 1);
 
     const cel0 = doc.createCel(gpa, 0, 0);
     doc.cel_pool.items[cel0].?.pixels[0] = 0xFFFF0000; // (0,0)
     doc.cel_pool.items[cel0].?.pixels[5] = 0xFF00FF00; // (1,1)
-    try doc.linkCel(gpa, 0, 1, 0); // frame1 → 同一 CelId
+    try doc.linkCel(gpa, 0, 1, 0); // frame1 → same CelId
     const cel1 = doc.createCel(gpa, 1, 0);
     doc.cel_pool.items[cel1].?.pixels[0] = 0xFF0000FF;
     doc.resyncActiveView(gpa);
@@ -1135,32 +1135,32 @@ test "Document.resize → encode/decode round-trip（縮小・拡大・multi-lay
     try testing.expectEqual(cel0, doc.gridGet(0, 1).?);
     try testing.expect(doc.cel_pool.items[cel0].?.refcount >= 2);
 
-    // 縮小: 左上 2x2 保持
+    // Shrink: keep top-left 2x2
     try doc.resize(gpa, 2, 2);
     try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
     try testing.expectEqual(@as(u32, 0xFF00FF00), doc.cel_pool.items[cel0].?.pixels[3]); // (1,1)
     try expectResizePixRoundTrip(&doc, gpa);
 
-    // 拡大: 元内容を左上保持・新領域 0
+    // Grow: keep original content top-left; new region 0
     try doc.resize(gpa, 6, 5);
     try testing.expectEqual(@as(u32, 0xFFFF0000), doc.cel_pool.items[cel0].?.pixels[0]);
     try testing.expectEqual(@as(u32, 0), doc.cel_pool.items[cel0].?.pixels[2]);
     try expectResizePixRoundTrip(&doc, gpa);
 }
 
-// TASK-95: PNG open 相当（reset → active_view 直書き → commitActiveLayerToCel）後に
-// saveDocument → loadDocument で pixels が bit 一致すること（cel 未書き戻しだと空 .pix になる）。
-test "TASK-95: reset + layerPixels 直書き + commitActiveLayerToCel → save/load pixels bit 一致" {
+// After PNG-open equivalent (reset → write active_view directly → commitActiveLayerToCel),
+// saveDocument → loadDocument must bit-match pixels (empty .pix if cel was never written back).
+test "reset + direct layerPixels write + commitActiveLayerToCel → save/load pixels bit-identical" {
     const gpa = testing.allocator;
     const io = std.testing.io;
 
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
-    _ = try doc.addLayer(gpa); // multi-layer から open 相当の縮退を再現
+    _ = try doc.addLayer(gpa); // Reproduce open-equivalent collapse from multi-layer
     doc.resetToSingleBlankLayer(gpa);
     try testing.expectEqual(@as(u32, 0), doc.selected_frame);
     try testing.expectEqual(@as(usize, 1), doc.layers.items.len);
-    try testing.expectEqual(@as(usize, 0), doc.cel_pool.items.len); // reset 直後は cel 0 個
+    try testing.expectEqual(@as(usize, 0), doc.cel_pool.items.len); // Right after reset: 0 cels
 
     const color: u32 = 0xFF112233;
     const px = doc.activeCanvas().layerPixels(0);
@@ -1170,7 +1170,7 @@ test "TASK-95: reset + layerPixels 直書き + commitActiveLayerToCel → save/l
     const cel_id = doc.gridGet(0, 0).?;
     try testing.expectEqualSlices(u32, px, doc.celPixels(cel_id).?);
 
-    // cwd 固定名は並列テストバイナリ間で race する（TASK-96 で実測）ため tmpDir で分離する。
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [64]u8 = undefined;
@@ -1180,11 +1180,11 @@ test "TASK-95: reset + layerPixels 直書き + commitActiveLayerToCel → save/l
     var loaded = try loadDocument(io, gpa, pix_path, 4, 4);
     defer loaded.deinit();
     try testing.expectEqualSlices(u32, px, loaded.activeCanvas().layerPixels(0));
-    // cel 経由でも同一（save が cel_pool を書いた証拠）
+    // Same via cel (proof that save wrote cel_pool)
     try testing.expectEqualSlices(u32, px, loaded.celPixels(loaded.gridGet(0, 0).?).?);
 }
 
-test "LayerId: .pix v3 round-trip で id/next_layer_id 保持 + reorder 後も id 安定" {
+test "LayerId: .pix v3 round-trip keeps id/next_layer_id + id stable after reorder" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 2, 2);
     defer doc.deinit();
@@ -1199,7 +1199,7 @@ test "LayerId: .pix v3 round-trip で id/next_layer_id 保持 + reorder 後も i
 
     const bytes = try encodeDocument(&doc, gpa);
     defer gpa.free(bytes);
-    // schema が現行 v3 であること
+    // Schema equals current schema_version (v4)
     const container = try serde.Container.parse(bytes, magic);
     try testing.expectEqual(schema_version, container.schemaVersion());
 
@@ -1212,14 +1212,14 @@ test "LayerId: .pix v3 round-trip で id/next_layer_id 保持 + reorder 後も i
     try testing.expectEqual(@as(?usize, 0), loaded.layerIndexOf(id1));
     try testing.expectEqual(next_before, loaded.next_layer_id);
     try testing.expectEqual(false, loaded.layers.items[0].visible);
-    // load 後の add は next_layer_id から継続（衝突なし）
+    // add after load continues from next_layer_id (no collision)
     const idx = try loaded.addLayer(gpa);
     try testing.expectEqual(@as(LayerId, @enumFromInt(next_before)), loaded.layerIdAt(idx).?);
 }
 
-test "LayerId: 旧 schema v2 fixture は layer 順に決定的採番（fallback）" {
+test "LayerId: old schema v2 fixture assigns deterministically in layer order (fallback)" {
     const gpa = testing.allocator;
-    // 手書き v2 container（LAYR 8B・DOCH 28B・id 無し）
+    // Hand-written v2 container (LAYR 8B, DOCH 28B, no ids)
     var w = try serde.Writer.init(gpa, magic, 2);
     defer w.deinit();
     const doch = docChunkV2(2, 2, 2, 1, 0, 0);
@@ -1239,7 +1239,7 @@ test "LayerId: 旧 schema v2 fixture は layer 順に決定的採番（fallback�
     var loaded = try decodeDocument(bytes, gpa);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.layers.items.len);
-    // layer 順に 1, 2 を決定的採番
+    // Deterministic assign 1, 2 in layer order
     try testing.expectEqual(@as(LayerId, @enumFromInt(1)), loaded.layerIdAt(0).?);
     try testing.expectEqual(@as(LayerId, @enumFromInt(2)), loaded.layerIdAt(1).?);
     try testing.expectEqual(@as(u64, 3), loaded.next_layer_id);
@@ -1249,11 +1249,11 @@ test "LayerId: 旧 schema v2 fixture は layer 順に決定的採番（fallback�
     try testing.expectEqual(@as(u8, 128), loaded.layers.items[1].opacity);
 }
 
-test "LayerId: v3 重複 id は CorruptLayer で拒否" {
+test "LayerId: v3 duplicate ids rejected with CorruptLayer" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
-    // ids=[7,7] → layerIndexOf が先頭だけ返す危険を拒否する
+    // ids=[7,7] → reject the hazard that layerIndexOf only returns the first
     const doch = docChunkV3(1, 1, 2, 1, 0, 0, 8);
     try w.addChunk(TAG_DOC, &doch);
     const lay0 = layerChunkV3(layer_type_raster, true, 255, 7);
@@ -1268,13 +1268,13 @@ test "LayerId: v3 重複 id は CorruptLayer で拒否" {
     try testing.expectError(error.CorruptLayer, decodeDocument(bytes, gpa));
 }
 
-test "LayerId: v3 id=0 混在は明示 id と衝突しない max+1 から再採番" {
+test "LayerId: v3 mixed id=0 reassigns from max+1 without colliding with explicit ids" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
-    // ids=[0, 5, 0] → 旧実装は読みながら 1 を割り当てて明示 id=1 と衝突し得た。
-    // 新実装: 明示 max=5 → invalid を 6, 7 へ layer 順に採番 → [6, 5, 7]
-    const doch = docChunkV3(1, 1, 3, 1, 0, 0, 1); // stored next は小さくても防御的に引き上げ
+    // ids=[0, 5, 0] → older code could assign 1 while reading and collide with explicit id=1.
+    // Current: explicit max=5 → assign invalids 6, 7 in layer order → [6, 5, 7]
+    const doch = docChunkV3(1, 1, 3, 1, 0, 0, 1); // Raise stored next defensively even if small
     try w.addChunk(TAG_DOC, &doch);
     const lay0 = layerChunkV3(layer_type_raster, true, 255, 0);
     try w.addChunk(TAG_LAYER, &lay0);
@@ -1296,17 +1296,17 @@ test "LayerId: v3 id=0 混在は明示 id と衝突しない max+1 から再採�
     try testing.expectEqual(@as(LayerId, @enumFromInt(6)), loaded.layerIdAt(0).?);
     try testing.expectEqual(@as(LayerId, @enumFromInt(5)), loaded.layerIdAt(1).?);
     try testing.expectEqual(@as(LayerId, @enumFromInt(7)), loaded.layerIdAt(2).?);
-    // 各 id は一意に解決される
+    // Each id resolves uniquely
     try testing.expectEqual(@as(?usize, 0), loaded.layerIndexOf(@as(LayerId, @enumFromInt(6))));
     try testing.expectEqual(@as(?usize, 1), loaded.layerIndexOf(@as(LayerId, @enumFromInt(5))));
     try testing.expectEqual(@as(?usize, 2), loaded.layerIndexOf(@as(LayerId, @enumFromInt(7))));
-    try testing.expectEqual(@as(u64, 8), loaded.next_layer_id); // max(7)+1（stored=1 を引き上げ）
+    try testing.expectEqual(@as(u64, 8), loaded.next_layer_id); // max(7)+1 (raise stored=1)
     try testing.expectEqualStrings("zero0", loaded.layers.items[0].name());
     try testing.expectEqualStrings("five", loaded.layers.items[1].name());
     try testing.expectEqualStrings("zero1", loaded.layers.items[2].name());
 }
 
-test "file I/O: saveDocument→loadDocument 往復 + サイズ拒否 + exportPngSequence（compositeStraight 一致）" {
+test "file I/O: saveDocument→loadDocument round-trip + size reject + exportPngSequence (matches compositeStraight)" {
     const gpa = testing.allocator;
     const io = std.testing.io;
     const png = @import("png");
@@ -1329,17 +1329,17 @@ test "file I/O: saveDocument→loadDocument 往復 + サイズ拒否 + exportPng
     defer std.Io.Dir.cwd().deleteFile(io, pix_path) catch {};
     try saveDocument(io, pix_path, &doc, gpa);
 
-    // サイズ拒否（256 を期待 → 4x4 は弾く。layer 復元前に error）
+    // Size reject (expect 256 → 4x4 rejected; error before layer restore)
     try testing.expectError(error.UnsupportedCanvasSize, loadDocument(io, gpa, pix_path, 256, 256));
 
-    // 任意サイズ許可（expected 0）で往復
+    // Round-trip with any size allowed (expected 0)
     var loaded = try loadDocument(io, gpa, pix_path, 0, 0);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.activeCanvas().layers.items.len);
     try testing.expectEqualSlices(u32, c.layers.items[0].pixels, loaded.activeCanvas().layers.items[0].pixels);
     try testing.expectEqualSlices(u32, c.layers.items[1].pixels, loaded.activeCanvas().layers.items[1].pixels);
 
-    // exportPngSequence（1 frame → <stem>_0001.png・compositeStraight と一致）
+    // exportPngSequence (1 frame → <stem>_0001.png; matches compositeStraight)
     const stem = ".task45_seq_test";
     const seq_path = ".task45_seq_test_0001.png";
     defer std.Io.Dir.cwd().deleteFile(io, seq_path) catch {};
@@ -1363,17 +1363,17 @@ fn paintFramePixel(doc: *Document, gpa: Allocator, frame_idx: u32, color: u32) !
     }));
 }
 
-test "exportSpriteSheet: 2x2 配置・1 frame 恒等・margin・columns 指定・frame 0 はエラー" {
+test "exportSpriteSheet: 2x2 layout / 1-frame identity / margin / columns / frame 0 is error" {
     const gpa = testing.allocator;
     const io = std.testing.io;
     const png = @import("png");
 
-    // frame 数 0 は拒否
+    // Reject frame count 0
     var empty = try Document.initEmpty(gpa, 2, 2);
     defer empty.deinit();
     try testing.expectError(error.NoFrames, exportSpriteSheet(io, ".task45_sheet_empty.png", &empty, gpa, .{}));
 
-    // 1 frame 恒等（columns 自動 = 1）
+    // 1-frame identity (auto columns = 1)
     var one = try Document.init(gpa, 2, 2);
     defer one.deinit();
     try paintFramePixel(&one, gpa, 0, 0xFFFF0000);
@@ -1389,7 +1389,7 @@ test "exportSpriteSheet: 2x2 配置・1 frame 恒等・margin・columns 指定�
     try testing.expectEqual(@as(u32, 2), one_img.height);
     try testing.expectEqual(@as(u32, 0xFFFF0000), one_img.pixels[0]);
 
-    // 2x2 配置（4 frame・2x2 canvas・columns=2）
+    // 2x2 layout (4 frames, 2x2 canvas, columns=2)
     var doc = try Document.init(gpa, 2, 2);
     defer doc.deinit();
     const colors = [_]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
@@ -1408,13 +1408,13 @@ test "exportSpriteSheet: 2x2 配置・1 frame 恒等・margin・columns 指定�
     }
     try testing.expectEqual(@as(u32, 4), sheet.width);
     try testing.expectEqual(@as(u32, 4), sheet.height);
-    // 各フレームの (0,0) ピクセルが格子位置へ配置される
+    // Each frame's (0,0) pixel lands on the grid position
     try testing.expectEqual(colors[0], sheet.pixels[0]); // (0,0)
     try testing.expectEqual(colors[1], sheet.pixels[2]); // (2,0)
     try testing.expectEqual(colors[2], sheet.pixels[8]); // (0,2) = row 2 * width 4
     try testing.expectEqual(colors[3], sheet.pixels[10]); // (2,2)
 
-    // margin 付き（2 frame・1x2 canvas・columns=2・margin=1）
+    // With margin (2 frames, 1x2 canvas, columns=2, margin=1)
     var margin_doc = try Document.init(gpa, 1, 2);
     defer margin_doc.deinit();
     try paintFramePixel(&margin_doc, gpa, 0, 0xFFFF0000);
@@ -1435,7 +1435,7 @@ test "exportSpriteSheet: 2x2 配置・1 frame 恒等・margin・columns 指定�
     try testing.expectEqual(@as(u32, 0xFF00FF00), margin_img.pixels[2]); // x = 1 + 1 margin
 }
 
-test "exportSpriteSheet: 巨大 columns/margin は SheetTooLarge（checked 演算・panic しない）" {
+test "exportSpriteSheet: huge columns/margin → SheetTooLarge (checked arithmetic; no panic)" {
     const gpa = testing.allocator;
     const io = std.testing.io;
     var doc = try Document.init(gpa, 2, 2);
@@ -1446,7 +1446,7 @@ test "exportSpriteSheet: 巨大 columns/margin は SheetTooLarge（checked 演�
     }));
 }
 
-// ── TASK-89: v4 PLTE ──────────────────────────────────────────────────
+// ── v4 PLTE ──────────────────────────────────────────────────
 
 test "v4 PLTE: palette round-trip" {
     const gpa = testing.allocator;
@@ -1458,7 +1458,7 @@ test "v4 PLTE: palette round-trip" {
 
     const bytes = try encodeDocument(&doc, gpa);
     defer gpa.free(bytes);
-    // 現行 write は schema v4
+    // Current write is schema v4
     const container = try serde.Container.parse(bytes, magic);
     try testing.expectEqual(schema_version, container.schemaVersion());
 
@@ -1470,7 +1470,7 @@ test "v4 PLTE: palette round-trip" {
     try testing.expectEqual(@as(u32, 0xFF0000FF), loaded.palette.items[2]);
 }
 
-test "v3 読み: palette は空（PLTE 無し）" {
+test "v3 read: palette is empty (no PLTE)" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version_v3);
     defer w.deinit();
@@ -1490,7 +1490,7 @@ test "v3 読み: palette は空（PLTE 無し）" {
     try testing.expectEqual(@as(usize, 1), loaded.layers.items.len);
 }
 
-test "v4: 空 palette は PLTE 省略・round-trip で空" {
+test "v4: empty palette omits PLTE; round-trip stays empty" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 2, 2);
     defer doc.deinit();
@@ -1502,7 +1502,7 @@ test "v4: 空 palette は PLTE 省略・round-trip で空" {
     try testing.expectEqual(@as(usize, 0), loaded.palette.items.len);
 }
 
-test "未知 chunk 後も PLTE を読む（同一 schema 内の tag skip）" {
+test "still reads PLTE after an unknown chunk (tag skip within the same schema)" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
@@ -1527,7 +1527,7 @@ test "未知 chunk 後も PLTE を読む（同一 schema 内の tag skip）" {
     try testing.expectEqual(@as(u32, 0xFFAABBCC), loaded.palette.items[0]);
 }
 
-test "PLTE: 256 色超は CorruptPalette" {
+test "PLTE: more than 256 colors → CorruptPalette" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
