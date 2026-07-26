@@ -11,51 +11,51 @@ pub const Rect = struct {
     w: i32,
     h: i32,
 
-    /// 半開区間 [x, x+w) × [y, y+h) に (px,py) を含むか。
+    /// Whether (px,py) lies in the half-open interval [x, x+w) × [y, y+h).
     pub fn contains(self: Rect, px: i32, py: i32) bool {
         return px >= self.x and py >= self.y and px < self.x + self.w and py < self.y + self.h;
     }
 };
 
-/// レイヤー名の最大 byte 数（UTF-8。TASK-79.3）。固定長インラインで持つ（ownership churn 回避:
-/// 可変長 owned([]u8) にすると deinit/undo(layer_add/delete/merge_down の held layer 解放)/
-/// deleteLayer/allocBlankLayer の全解放経路に新規 free 追従が要るため、既存の
-/// 「Layer は pixels だけを所有する POD」という不変条件を保つ固定長を選ぶ）。
+/// Max byte length of a layer name (UTF-8). Held as a fixed-length inline buffer (avoids ownership churn:
+/// a variable-length owned([]u8) would require new free follow-ups on every deinit/undo
+/// (held-layer release for layer_add/delete/merge_down) / deleteLayer / allocBlankLayer path, so we keep
+/// the existing invariant that "a Layer is a POD that owns only its pixels" with a fixed length).
 pub const layer_name_max: usize = 32;
 
-/// レイヤーの種類（TASK-79.5。TASK-72 の raster|vector 分岐と同じ器）。
-/// `.text` は「TextParams から再ラスタライズしたキャッシュを pixels に保持する」レイヤー。
-/// composite/compositeStraight/merge/duplicate はいずれも `pixels` のみを見るため kind
-/// 非依存で無改造（vector が将来追加されても同様の器を使えば無改造で済む＝AC#4）。
+/// Layer kind (same vessel as the raster|vector split).
+/// `.text` is a layer that keeps a cache re-rasterized from TextParams in `pixels`.
+/// composite/compositeStraight/merge/duplicate all look only at `pixels`, so they are
+/// kind-agnostic with no code changes (a future vector kind can use the same vessel unchanged).
 pub const LayerKind = enum(u8) { raster = 0, text = 1 };
 
-/// テキストレイヤーの内容量（UTF-8 バイト数。TASK-79.5）。`layer_name_max`（32）とは独立の定数
-/// （テキスト内容はレイヤー名より長くなりうるため）。
+/// Text-layer content capacity (UTF-8 byte count). Independent of `layer_name_max` (32)
+/// (text content can be longer than a layer name).
 pub const text_content_max: usize = 96;
 
-/// テキストレイヤーのパラメータ（文字列/フォントサイズ/色/位置）。固定長 POD
-/// （`Layer.name_buf` と同じ ownership churn 回避方針。可変長 owned([]u8) にしない）。
-/// **不変条件（TASK-79.5 の要。TASK-82 で「現在の font 設定」の限定が追加）**: `kind==.text` の
-/// Layer の `pixels` は、`addTextLayer`/`setLayerTextParams` を経由した**直後**は常に
-/// 「この TextParams を、その時点の `Canvas.system_font`（TASK-82）込みで
-/// `text_render.rasterizeTextLayer` により再ラスタライズした結果と bit 一致する」
-/// （Undo の `layer_text_params`/`layer_rasterize` が pixels を保持せず再ラスタライズで復元する
-/// 設計の前提。この不変条件は pixie（apps/editor/apps/pixie/main.zig）側の
-/// `App.selectedLayerIsText()` ガードが「text レイヤーへの直接 raster 編集」を全経路で禁止する
-/// ことで維持される。Canvas 自体はこの禁止を強制しない＝既存 `editingBlocked()` と同じ
-/// 「App が振る舞いを決め、Canvas は素直に従う」役割分担）。
-/// **例外（TASK-82 で明確化）**: `document_io.decodeDocument`（.pix load）は保存済み raw pixels を
-/// そのまま復元するだけで再ラスタライズしない（load を font 可用性に依存させない意図的設計）。
-/// そのため load 直後の text layer の pixels は「保存時点の font 設定でのラスタライズ結果」を
-/// 正としており、「現在の `Canvas.system_font` から再生成した結果と一致する」ことは要求しない
-/// （system font が保存時と異なる/存在しない環境で開いても表示は保存時のまま安定する利点の
-/// トレードオフ）。次に `setLayerTextParams` を経由すれば現在の font 設定で再生成され、
-/// 通常の不変条件が回復する。
+/// Text-layer parameters (string/font size/color/position). Fixed-length POD
+/// (same ownership-churn avoidance as `Layer.name_buf`; not a variable-length owned([]u8)).
+/// **Invariant (core of text layers; later narrowed to "current font settings")**: right after
+/// `addTextLayer`/`setLayerTextParams`, a `kind==.text` Layer's `pixels` always
+/// bit-match re-rasterizing these TextParams through the then-current `Canvas.system_font` via
+/// `text_render.rasterizeTextLayer`.
+/// (Premise for Undo `layer_text_params`/`layer_rasterize`, which restore by re-rasterizing without holding pixels.
+/// Upheld because pixie's (apps/editor/apps/pixie/main.zig)
+/// `App.selectedLayerIsText()` guard forbids direct raster edits on text layers on every path.
+/// Canvas itself does not enforce the ban — same role split as existing `editingBlocked()`:
+/// "App decides behavior; Canvas follows").
+/// **Exception**: `document_io.decodeDocument` (.pix load) restores saved raw pixels
+/// as-is and does not re-rasterize (intentional: load must not depend on font availability).
+/// So immediately after load, a text layer's pixels are the rasterization under the
+/// font settings at save time as ground truth; matching a regenerate from current `Canvas.system_font` is not required
+/// (trade-off: opening where the system font differs or is missing keeps the saved display stable).
+/// The next `setLayerTextParams` regenerates under current font settings and
+/// restores the normal invariant.
 pub const TextParams = struct {
     text_buf: [text_content_max]u8 = undefined,
     text_len: u8 = 0,
     font_px: f32 = 16.0,
-    /// canonical straight BGRA 0xAARRGGBB。`font.Color` と同一ビットレイアウト（@bitCast 可）。
+    /// Canonical straight BGRA 0xAARRGGBB. Same bit layout as `font.Color` (@bitCast-able).
     color: u32 = 0xFFFFFFFF,
     x: i32 = 0,
     y: i32 = 0,
@@ -64,19 +64,19 @@ pub const TextParams = struct {
         return self.text_buf[0..self.text_len];
     }
 
-    /// text を設定する。`text_content_max` を超える分は UTF-8 継続バイトの途中で切らないように
-    /// 安全に切り詰める（`Layer.setName` と同型）。
+    /// Set text. Truncate past `text_content_max` safely without cutting mid UTF-8
+    /// continuation byte (same shape as `Layer.setName`).
     pub fn setText(self: *TextParams, s: []const u8) void {
         const n = safeUtf8TruncateLen(s, text_content_max);
         @memcpy(self.text_buf[0..n], s[0..n]);
         self.text_len = @intCast(n);
     }
 
-    /// 意味的等価判定。`text_buf` の未使用末尾バイトは `undefined` 初期化のため raw struct
-    /// 比較（`std.meta.eql`）は使わず `text()` の中身のみ比較する（`layer_rename` が
-    /// `NameSnapshot.slice()` を比較するのと同じ流儀）。`font_px` は `==` でなく bit 比較にし、
-    /// NaN が万一保存されていても「値が変わったか」の判定を安定させる（IEEE754 の NaN!=NaN の
-    /// 影響を受けない）。
+    /// Semantic equality. Unused trailing bytes of `text_buf` are left `undefined`, so raw struct
+    /// compare (`std.meta.eql`) is not used — compare only `text()` contents (same style as
+    /// `layer_rename` comparing `NameSnapshot.slice()`). Compare `font_px` by bits, not `==`, so
+    /// "did the value change?" stays stable even if a NaN is ever stored
+    /// (immune to IEEE754 NaN!=NaN).
     pub fn eql(a: TextParams, b: TextParams) bool {
         const a_px_bits: u32 = @bitCast(a.font_px);
         const b_px_bits: u32 = @bitCast(b.font_px);
@@ -89,22 +89,22 @@ pub const Layer = struct {
     pixels: []u32, // format: canonical BGRA 0xAARRGGBB (bytes [B,G,R,A] on little-endian)
     visible: bool = true,
     opacity: u8 = 255,
-    /// レイヤー名（UTF-8。TASK-79.3）。実データは `name_buf[0..name_len]`。既定は空
-    /// （`Canvas.init`/`allocBlankLayer` が生成直後に `setName` で既定名 "Layer N" を書き込む）。
+    /// Layer name (UTF-8). Real data is `name_buf[0..name_len]`. Default empty
+    /// (`Canvas.init`/`allocBlankLayer` write the default name "Layer N" via `setName` right after create).
     name_buf: [layer_name_max]u8 = undefined,
     name_len: u8 = 0,
-    /// レイヤーの種類（TASK-79.5）。既定は raster。
+    /// Layer kind. Default raster.
     kind: LayerKind = .raster,
-    /// `kind==.text` の時のみ意味を持つサイドカー（TextParams のドキュメント参照）。
+    /// Sidecar that only means something when `kind==.text` (see TextParams docs).
     text_params: TextParams = .{},
 
     pub fn name(self: *const Layer) []const u8 {
         return self.name_buf[0..self.name_len];
     }
 
-    /// name を設定する。`layer_name_max` を超える分は UTF-8 継続バイトの途中で切らないように
-    /// 安全に切り詰める（他 reader/将来フォーマットが保存した長い名前を読んでも不正 UTF-8 を
-    /// 作らない防御）。イベント時のみ呼ばれる想定＝ホットパスではない。
+    /// Set name. Truncate past `layer_name_max` safely without cutting mid UTF-8
+    /// continuation byte (defence so a long name saved by another reader/future format never yields
+    /// invalid UTF-8). Intended to be called on events only — not a hot path.
     pub fn setName(self: *Layer, text: []const u8) void {
         const n = safeUtf8TruncateLen(text, layer_name_max);
         @memcpy(self.name_buf[0..n], text[0..n]);
@@ -112,19 +112,19 @@ pub const Layer = struct {
     }
 };
 
-/// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
-/// 切り詰めた長さを返す。
+/// Truncate text to at most max bytes without cutting mid a UTF-8 continuation byte (0b10xxxxxx);
+/// return the truncated length.
 fn safeUtf8TruncateLen(text: []const u8, max: usize) usize {
     var n = @min(text.len, max);
     while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
     return n;
 }
 
-/// レイヤー名として外部入力（.pix の LNAM 等）を受け入れてよいか。妥当な UTF-8 かつ
-/// ASCII 制御文字（0x00-0x1F / 0x7F）を含まないこと。破損 .pix が改行や不正 UTF-8 を LNAM に
-/// 持たせても Layer.name に載せない（canvas probe digest の 1 行契約を壊す混入を防ぐ wire framing
-/// 保護。UI 入力側は layer_rename_input が別途弾く）。不可なら呼び出し側は既定名を維持する。
-/// 妥当 UTF-8 では < 0x20 のバイトは ASCII 制御文字のみ（多バイト列は全バイト >= 0x80）。
+/// Whether external input (e.g. .pix LNAM) is acceptable as a layer name. Must be valid UTF-8 and
+/// contain no ASCII control chars (0x00-0x1F / 0x7F). A corrupt .pix must not put newlines or bad UTF-8
+/// into Layer.name (wire-framing protection so canvas probe digest's one-line contract is not broken;
+/// the UI side rejects separately in layer_rename_input). On reject the caller keeps the default name.
+/// In valid UTF-8, bytes < 0x20 are only ASCII controls (every byte of a multi-byte sequence is >= 0x80).
 pub fn isValidLayerName(text: []const u8) bool {
     if (!std.unicode.utf8ValidateSlice(text)) return false;
     for (text) |b| {
@@ -139,25 +139,25 @@ pub const Canvas = struct {
     height: u32,
     selected_layer: usize = 0,
     composite_cache: []u32,
-    /// composite_cache の状態（TASK-53）。dirty=無効 / white_bg=composite() 結果 / straight=compositeStraight() 結果。
-    /// canvas を変更する API と layerPixels()（可変 slice 貸与）が markDirty() で無効化する。
+    /// composite_cache state. dirty=invalid / white_bg=composite() result / straight=compositeStraight() result.
+    /// APIs that mutate the canvas, and layerPixels() (mutable slice loan), invalidate via markDirty().
     cache_state: CacheState = .dirty,
-    /// フル再合成の実行回数（テスト/計測用。静止時 0 回の性質をテストで固定する）。
+    /// Count of full recomposites (for tests/measurement; the "0 while idle" property is pinned by tests).
     composite_runs: usize = 0,
     allocator: Allocator,
-    /// 範囲選択（矩形）。null=選択なし（描画は全域に許可）。canvas 内へ clip 済みの矩形のみ保持する（TASK-44）。
+    /// Rectangular selection. null=no selection (drawing allowed everywhere). Only rectangles already clipped into the canvas are held.
     selection: ?Rect = null,
-    /// 次に `allocBlankLayer` が既定名として使う連番（"Layer N"。TASK-79.3）。削除しても
-    /// 巻き戻さない単調増加（Photoshop 等と同型）。.pix には永続化しない（UI の便宜のみ・
-    /// 一意性は保証しない）。初期レイヤーが "Layer 1" を名乗るため既定値は 2。
+    /// Monotonic counter for the next default name from `allocBlankLayer` ("Layer N"). Does not
+    /// rewind on delete (Photoshop-style). Not persisted in .pix (UI convenience only;
+    /// uniqueness is not guaranteed). Default is 2 so the initial layer is named "Layer 1".
     next_layer_num: u32 = 2,
-    /// system font（TrueType/OpenType の `.ttf`/`.ttc`）バイト列への **borrowed** 参照
-    /// （TASK-82）。Canvas は所有・解放しない＝呼び出し側（pixie の App。実ディスク読込は
-    /// App 起動時に1回のみ）がライフタイムを保証する。`addTextLayer`/`setLayerTextParams` が
-    /// `text_render.rasterizeTextLayer` へそのまま渡す。既定 `null` は「未設定」を表し、
-    /// `text_render` 側が embedded ASCII フォント（Press Start 2P）へフォールバックする
-    /// （既存の全 Canvas テストはこの既定のまま無改造で動く）。日本語(CJK)テキストレイヤーの
-    /// 表示には CJK グリフを含む system font の設定が必要。
+    /// **Borrowed** reference to system-font (TrueType/OpenType `.ttf`/`.ttc`) bytes.
+    /// Canvas does not own or free it — the caller (pixie's App; real disk load is
+    /// once at App start) guarantees the lifetime. `addTextLayer`/`setLayerTextParams` pass it
+    /// straight into `text_render.rasterizeTextLayer`. Default `null` means "unset";
+    /// `text_render` then falls back to the embedded ASCII font (Press Start 2P)
+    /// (all existing Canvas tests run unchanged under this default). Japanese (CJK) text layers
+    /// need a system font that includes CJK glyphs.
     system_font: ?[]const u8 = null,
 
     pub const CacheState = enum { dirty, white_bg, straight };
@@ -172,7 +172,7 @@ pub const Canvas = struct {
         errdefer gpa.free(cache);
         @memset(cache, 0xFFFFFFFF);
 
-        // Zig 0.16: ArrayList は allocator を保持せず、.empty で初期化し各操作に渡す
+        // Zig 0.16: ArrayList does not hold an allocator; init with .empty and pass it to each op
         var layers: std.ArrayList(Layer) = .empty;
         errdefer layers.deinit(gpa);
         try layers.append(gpa, .{ .pixels = pixels });
@@ -195,7 +195,7 @@ pub const Canvas = struct {
         self.allocator.free(self.composite_cache);
     }
 
-    /// composite_cache を無効化する（canvas 内容を Canvas API を通さず変更した場合に呼ぶ）。
+    /// Invalidate composite_cache (call when canvas contents change outside the Canvas API).
     pub fn markDirty(self: *Canvas) void {
         self.cache_state = .dirty;
     }
@@ -204,13 +204,13 @@ pub const Canvas = struct {
         return @as(usize, self.width) * self.height;
     }
 
-    /// 空レイヤーを確保する。既定名 "Layer {next_layer_num}" を付与して連番を+1する（TASK-79.3。
-    /// counter を進めるため `*Canvas`（非 const）が要る）。
+    /// Allocate a blank layer. Assigns default name "Layer {next_layer_num}" and bumps the counter
+    /// (needs non-const `*Canvas` to advance the counter).
     pub fn allocBlankLayer(self: *Canvas, gpa: Allocator) !Layer {
         const pixels = try gpa.alloc(u32, self.layerPixelCount());
         @memset(pixels, 0);
         var layer: Layer = .{ .pixels = pixels };
-        var name_buf: [24]u8 = undefined; // "Layer " + u32 最大10桁で十分な余裕
+        var name_buf: [24]u8 = undefined; // "Layer " + u32 up to 10 digits — enough headroom
         const default_name = std.fmt.bufPrint(&name_buf, "Layer {d}", .{self.next_layer_num}) catch "Layer";
         layer.setName(default_name);
         self.next_layer_num += 1;
@@ -278,20 +278,20 @@ pub const Canvas = struct {
         return true;
     }
 
-    /// レイヤー名を設定する（TASK-79.3）。visible/opacity と異なり composite() の結果に
-    /// 影響しないため markDirty() は呼ばない（cache 無効化は合成結果へ影響する変更のみに
-    /// 限定する既存規約。TASK-53）。
+    /// Set a layer name. Unlike visible/opacity this does not affect composite() results, so
+    /// markDirty() is not called (cache invalidation is limited to changes that affect the composite
+    /// — existing rule).
     pub fn setLayerName(self: *Canvas, index: usize, text: []const u8) bool {
         if (index >= self.layers.items.len) return false;
         self.layers.items[index].setName(text);
         return true;
     }
 
-    // ── テキストレイヤー（TASK-79.5）───────────────────────────
+    // ── Text layers ───────────────────────────────────────────
 
-    /// テキストレイヤーを新規追加する。`allocBlankLayer` で確保した空レイヤーを text kind 化し、
-    /// `params` でラスタライズしてから挿入する（既存 `insertLayer` の markDirty 経路に乗る）。
-    /// イベント時のみ（レイヤー追加操作の都度1回）。
+    /// Add a new text layer. Turns a blank layer from `allocBlankLayer` into text kind,
+    /// rasterizes with `params`, then inserts (rides the existing `insertLayer` markDirty path).
+    /// Event-time only (once per layer-add).
     pub fn addTextLayer(self: *Canvas, gpa: Allocator, params: TextParams) !usize {
         var layer = try self.allocBlankLayer(gpa);
         errdefer gpa.free(layer.pixels);
@@ -314,10 +314,10 @@ pub const Canvas = struct {
         return idx;
     }
 
-    /// 既存テキストレイヤーの text_params を更新し pixels を再ラスタライズする（TASK-79.5）。
-    /// `kind!=.text` は `error.NotTextLayer`。pixels が変わるため `markDirty()` は必須
-    /// （`setLayerName` と異なり合成結果に影響する）。イベント時のみ（内容/サイズ/色/位置の
-    /// 編集確定の都度1回）。
+    /// Update an existing text layer's text_params and re-rasterize its pixels.
+    /// `kind!=.text` → `error.NotTextLayer`. pixels change, so `markDirty()` is required
+    /// (unlike `setLayerName`, this affects the composite). Event-time only (once per
+    /// content/size/color/position edit commit).
     pub fn setLayerTextParams(self: *Canvas, index: usize, params: TextParams) !void {
         if (index >= self.layers.items.len) return error.OutOfRange;
         if (self.layers.items[index].kind != .text) return error.NotTextLayer;
@@ -338,11 +338,11 @@ pub const Canvas = struct {
         self.markDirty();
     }
 
-    /// テキストレイヤーを通常 raster レイヤーへ確定する（Rasterize/bake。TASK-79.5）。
-    /// `kind!=.text` は `error.NotTextLayer`。pixels は不変（不変条件により既に最新の
-    /// ラスタライズ結果）なので**再ラスタライズも markDirty も不要**（`setLayerName` と同じ
-    /// 「合成結果に影響しない変更は cache 無効化しない」規約。TASK-53）。呼び出し前の
-    /// text_params を返す（呼び出し側=App が Undo `.layer_rasterize` へ積む用）。
+    /// Commit a text layer to a normal raster layer (Rasterize/bake).
+    /// `kind!=.text` → `error.NotTextLayer`. pixels are unchanged (already the latest
+    /// rasterization by the invariant), so **neither re-rasterize nor markDirty** (same rule as `setLayerName`:
+    /// "changes that do not affect the composite do not invalidate the cache"). Returns the
+    /// prior text_params (for the caller=App to push Undo `.layer_rasterize`).
     pub fn rasterizeLayer(self: *Canvas, index: usize) !TextParams {
         if (index >= self.layers.items.len) return error.OutOfRange;
         if (self.layers.items[index].kind != .text) return error.NotTextLayer;
@@ -352,9 +352,9 @@ pub const Canvas = struct {
         return before;
     }
 
-    /// pixels に触れず kind/text_params だけを直接設定する低レベル setter
-    /// （`rasterizeLayer` の Undo/Redo 専用。redo は `kind=.raster, params=.{}` の決定的値を
-    /// 渡すだけで済むため pixels スナップショットが要らない）。
+    /// Low-level setter that sets only kind/text_params without touching pixels
+    /// (Undo/Redo-only for `rasterizeLayer`. Redo only needs the deterministic `kind=.raster, params=.{}`
+    /// so no pixels snapshot is required).
     pub fn setLayerKindText(self: *Canvas, index: usize, kind: LayerKind, params: TextParams) bool {
         if (index >= self.layers.items.len) return false;
         self.layers.items[index].kind = kind;
@@ -362,33 +362,33 @@ pub const Canvas = struct {
         return true;
     }
 
-    /// 白背景に各 visible layer を実 src-over する合成。プレビューなど不透明背景向け。
-    /// layer.opacity を src alpha に乗算してから合成。a=255 は元色・a=0 は背景維持（RGB 非ゼロでも）・
-    /// visible=false はスキップ。partial-alpha（ソフトブラシ）は白地へ正しくブレンドされる。
+    /// Composite each visible layer with real src-over onto a white background. For opaque-background preview etc.
+    /// Multiplies layer.opacity into src alpha before compositing. a=255 keeps source color; a=0 keeps background (even if RGB nonzero);
+    /// visible=false is skipped. Partial-alpha (soft brush) blends correctly onto white.
     ///
-    /// 毎フレーム全画素×レイヤ数を走るホットパス（pixie main loop / canvas probe）。
-    /// dst は白不透明で始まり srcOverOpaque が out_a=255 を維持するため常に不透明。
-    /// pixelops の整数 SIMD（scaleAlpha4 + srcOverOpaque4）で 4px 同時処理し、
-    /// 旧 scalar 実装（srcOver+scaleAlpha per-pixel）と bit 一致（テストで固定。TASK-52）。
-    /// canvas 無変更なら前回結果（composite_cache）を返し再合成しない（TASK-53）。
+    /// Hot path that walks every pixel × layer count each frame (pixie main loop / canvas probe).
+    /// dst starts white-opaque and srcOverOpaque keeps out_a=255, so the result is always opaque.
+    /// Integer SIMD from pixelops (scaleAlpha4 + srcOverOpaque4) processes 4px at a time;
+    /// bit-identical to the scalar path (srcOver+scaleAlpha per-pixel) (pinned by tests).
+    /// If the canvas is unchanged, return the previous result (composite_cache) without recompositing.
     pub fn composite(self: *Canvas) []const u32 {
         if (self.cache_state == .white_bg) return self.composite_cache;
         self.composite_runs += 1;
         @memset(self.composite_cache, 0xFFFFFFFF); // white opaque background
         for (self.layers.items) |layer| {
             if (!layer.visible) continue;
-            const op = layer.opacity; // ループ外 latch
+            const op = layer.opacity; // latch outside the loop
             const n = self.composite_cache.len;
             var i: usize = 0;
             while (i + 4 <= n) : (i += 4) {
                 const src_chunk: *const [4]u32 = layer.pixels[i..][0..4];
                 const dst_chunk: *[4]u32 = self.composite_cache[i..][0..4];
                 var sv: pixelops.Vec16u8 = @bitCast(src_chunk.*);
-                if (op != 255) sv = pixelops.scaleAlpha4(sv, op); // scaleAlpha(c,255)==c なので省略可
+                if (op != 255) sv = pixelops.scaleAlpha4(sv, op); // scaleAlpha(c,255)==c so the call can be skipped
                 const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
                 dst_chunk.* = @bitCast(pixelops.srcOverOpaque4(dv, sv));
             }
-            // scalar tail（0..3 px）
+            // scalar tail (0..3 px)
             while (i < n) : (i += 1) {
                 const s = if (op != 255) pixelops.scaleAlpha(layer.pixels[i], op) else layer.pixels[i];
                 self.composite_cache[i] = pixelops.srcOverOpaque(self.composite_cache[i], s);
@@ -398,32 +398,32 @@ pub const Canvas = struct {
         return self.composite_cache;
     }
 
-    /// アルファ保持合成（透明背景に各 visible layer を実 src-over）。チェッカー背景への重ね描きやフラット PNG 保存向け。
-    /// composite() と違い背景を白で埋めない（完全透明部は a=0 のまま残る）。
-    /// 戻りは straight-alpha BGRA。blit 側では背景（チェッカー）へ src-over する前提。
+    /// Alpha-preserving composite (real src-over of each visible layer onto a transparent background). For overlay on a checker background or flat PNG save.
+    /// Unlike composite(), does not fill the background with white (fully transparent regions stay a=0).
+    /// Return value is straight-alpha BGRA. Blit side is assumed to src-over onto a background (checker).
     ///
-    /// 毎フレーム全画素×レイヤ数を走るホットパス（pixie main loop / canvas probe）。
-    /// dst alpha が可変なため pixelops の f32 SIMD（srcOverStraight4）で 4px 同時処理する
-    /// （丸めは旧整数式から僅かに変わりうる。scalar 参照との bit 一致はテストで固定。TASK-52）。
-    /// 不変条件: 単層 opacity=255 は raw pixels と恒等（a=0 ⇒ RGB=0 の cache 不変条件下）。
-    /// canvas 無変更なら前回結果（composite_cache）を返し再合成しない（TASK-53）。
+    /// Hot path that walks every pixel × layer count each frame (pixie main loop / canvas probe).
+    /// dst alpha is variable, so pixelops f32 SIMD (srcOverStraight4) processes 4px at a time
+    /// (rounding may differ slightly from the integer formula; bit-identity to the scalar reference is pinned by tests).
+    /// Invariant: a single layer with opacity=255 is identical to raw pixels (under the cache invariant a=0 ⇒ RGB=0).
+    /// If the canvas is unchanged, return the previous result (composite_cache) without recompositing.
     pub fn compositeStraight(self: *Canvas) []const u32 {
         if (self.cache_state == .straight) return self.composite_cache;
         self.composite_runs += 1;
         @memset(self.composite_cache, 0x00000000); // transparent background
         for (self.layers.items) |layer| {
             if (!layer.visible) continue;
-            const op = layer.opacity; // ループ外 latch
+            const op = layer.opacity; // latch outside the loop
             const n = self.composite_cache.len;
             var i: usize = 0;
             while (i + 4 <= n) : (i += 4) {
                 const s4: [4]u32 = layer.pixels[i..][0..4].*;
-                // fast path: 4px 全て src a==0 → dst 不変（sa=0 → 結果=dst が正確なので bit 影響なし）
+                // fast path: all 4px have src a==0 → dst unchanged (sa=0 → result=dst exactly, so no bit effect)
                 if ((s4[0] | s4[1] | s4[2] | s4[3]) & 0xFF000000 == 0) continue;
                 const dst_chunk: *[4]u32 = self.composite_cache[i..][0..4];
                 dst_chunk.* = @bitCast(pixelops.srcOverStraight4(@bitCast(dst_chunk.*), @bitCast(s4), op));
             }
-            // scalar tail（0..3 px）
+            // scalar tail (0..3 px)
             while (i < n) : (i += 1) {
                 const s = layer.pixels[i];
                 if (s & 0xFF000000 == 0) continue;
@@ -442,20 +442,20 @@ pub const Canvas = struct {
         self.markDirty();
     }
 
-    /// 範囲選択を設定する（rect は呼び出し側が canvas 内へ clip 済みとする）。null で解除。
+    /// Set the selection (caller must already have clipped rect into the canvas). null clears it.
     pub fn setSelection(self: *Canvas, rect: ?Rect) void {
         self.selection = rect;
     }
 
-    /// 範囲選択を解除する。
+    /// Clear the selection.
     pub fn clearSelection(self: *Canvas) void {
         self.selection = null;
     }
 
-    /// レイヤのピクセル配列への直接アクセス（read/write プリミティブ）。
-    /// stroke 記録（before 観測）や PNG 保存（raw 取得）はここを使う。
-    /// 可変 slice を貸与するため保守的に cache を無効化する（読み取り用途でも dirty になるが、
-    /// 呼び出しは全てイベント時のみ＝代償はイベント時の過剰再合成 1 回に限定される。TASK-53）。
+    /// Direct access to a layer's pixel array (read/write primitive).
+    /// Stroke recording (before observation) and PNG save (raw fetch) use this.
+    /// Loans a mutable slice, so conservatively invalidate the cache (even read-only use dirties it;
+    /// all callers are event-time only — the cost is one extra recomposite per event).
     pub fn layerPixels(self: *Canvas, layer_idx: usize) []u32 {
         self.markDirty();
         return self.layers.items[layer_idx].pixels;
@@ -467,13 +467,13 @@ pub const Canvas = struct {
         const ux: u32 = @intCast(x);
         const uy: u32 = @intCast(y);
         if (ux >= self.width or uy >= self.height) return;
-        if (self.selection) |sel| if (!sel.contains(x, y)) return; // 選択範囲外は描かない（null=制約なし）
+        if (self.selection) |sel| if (!sel.contains(x, y)) return; // Do not draw outside the selection (null = no constraint)
         self.layers.items[layer_idx].pixels[uy * self.width + ux] = color;
         self.markDirty();
     }
 };
 
-/// window 座標 → canvas 座標変換。canvas 表示領域外なら null を返す。
+/// Window → canvas coordinate transform. Returns null if outside the canvas display area.
 pub fn screenToCanvas(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) ?Vec2 {
     const rx = screen_pos.x - canvas_rect.x;
     const ry = screen_pos.y - canvas_rect.y;
@@ -484,8 +484,8 @@ pub fn screenToCanvas(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) ?Vec2 {
     return .{ .x = cx, .y = cy };
 }
 
-/// window 座標 → canvas 座標の生変換（境界 clamp なし）。canvas 外でも線形に変換する。
-/// stroke の capture 継続（canvas 外へのドラッグ）用。範囲 clip は描画側で行う。
+/// Raw window → canvas transform (no boundary clamp). Converts linearly even outside the canvas.
+/// For continuing a stroke capture (drag outside the canvas). Range clip is done on the draw side.
 pub fn screenToCanvasRaw(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) Vec2 {
     return .{
         .x = @divFloor(screen_pos.x - canvas_rect.x, zoom),
@@ -493,7 +493,7 @@ pub fn screenToCanvasRaw(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) Vec2 {
     };
 }
 
-/// window 座標 → canvas 論理座標（f32, clamp なし）。ベジェ等の連続座標編集用。
+/// Window → canvas logical coordinates (f32, no clamp). For continuous-coordinate editing such as bezier.
 pub fn screenToCanvasF(screen_pos: Vec2, canvas_rect: Rect, zoom: i32) bezier.Vec2f {
     const z: f32 = @floatFromInt(zoom);
     return .{
@@ -551,36 +551,36 @@ test "Canvas drawPixel bounds check" {
     canvas.drawPixel(0, 4, 0, 0xFF0000FF); // out of bounds, no crash
 }
 
-test "Canvas drawPixel respects selection (null=制約なし / 範囲外は描かない)" {
+test "Canvas drawPixel respects selection (null=unconstrained / outside is not drawn)" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 4, 4);
     defer canvas.deinit();
     const RED: u32 = 0xFFFF0000;
 
-    // 選択 [1,3)×[1,3) を設定
+    // Set selection [1,3)×[1,3)
     canvas.setSelection(.{ .x = 1, .y = 1, .w = 2, .h = 2 });
-    canvas.drawPixel(0, 0, 0, RED); // 範囲外 → 無視
-    canvas.drawPixel(0, 1, 1, RED); // 範囲内 → 描画
-    canvas.drawPixel(0, 2, 2, RED); // 範囲内（右下端の直前）→ 描画
-    canvas.drawPixel(0, 3, 3, RED); // 範囲外（半開区間で 3 は外）→ 無視
+    canvas.drawPixel(0, 0, 0, RED); // Outside → ignored
+    canvas.drawPixel(0, 1, 1, RED); // Inside → drawn
+    canvas.drawPixel(0, 2, 2, RED); // Inside (just before bottom-right) → drawn
+    canvas.drawPixel(0, 3, 3, RED); // Outside (half-open: 3 is out) → ignored
     const px = canvas.layerPixels(0);
     try std.testing.expectEqual(@as(u32, 0), px[0 * 4 + 0]);
     try std.testing.expectEqual(RED, px[1 * 4 + 1]);
     try std.testing.expectEqual(RED, px[2 * 4 + 2]);
     try std.testing.expectEqual(@as(u32, 0), px[3 * 4 + 3]);
 
-    // 解除すると全域に描ける
+    // Clearing allows drawing everywhere
     canvas.clearSelection();
     canvas.drawPixel(0, 0, 0, RED);
     try std.testing.expectEqual(RED, px[0]);
 }
 
-test "Rect.contains: 半開区間" {
+test "Rect.contains: half-open interval" {
     const r = Rect{ .x = 2, .y = 3, .w = 4, .h = 5 };
     try std.testing.expect(r.contains(2, 3));
     try std.testing.expect(r.contains(5, 7)); // x+w-1, y+h-1
-    try std.testing.expect(!r.contains(6, 7)); // x+w は外
-    try std.testing.expect(!r.contains(5, 8)); // y+h は外
+    try std.testing.expect(!r.contains(6, 7)); // x+w is outside
+    try std.testing.expect(!r.contains(5, 8)); // y+h is outside
     try std.testing.expect(!r.contains(1, 3));
 }
 
@@ -604,83 +604,83 @@ test "screenToCanvas" {
     try std.testing.expect(screenToCanvas(.{ .x = 64 + 512, .y = 32 }, rect, zoom) == null);
 }
 
-test "screenToCanvasRaw: 境界外でも線形に変換する（clamp なし）" {
+test "screenToCanvasRaw: converts linearly even outside bounds (no clamp)" {
     const rect = Rect{ .x = 64, .y = 32, .w = 256, .h = 256 };
     const zoom: i32 = 2;
-    // 領域内は screenToCanvas と一致
+    // Inside the area matches screenToCanvas
     try std.testing.expectEqual(Vec2{ .x = 1, .y = 0 }, screenToCanvasRaw(.{ .x = 66, .y = 32 }, rect, zoom));
-    // 左上の外: 負座標になる（@divFloor で -1 方向に丸め）
+    // Outside top-left: negative coords (@divFloor rounds toward -1)
     try std.testing.expectEqual(Vec2{ .x = -1, .y = -1 }, screenToCanvasRaw(.{ .x = 63, .y = 31 }, rect, zoom));
-    // 右下の外: 幅を超える座標になる
+    // Outside bottom-right: coords past the width
     try std.testing.expectEqual(Vec2{ .x = 256, .y = 0 }, screenToCanvasRaw(.{ .x = 64 + 512, .y = 32 }, rect, zoom));
 }
 
-test "composite: a=255 元色 / a=0(RGB非ゼロ) 背景維持 / partial は白地ブレンド" {
+test "composite: a=255 keeps source / a=0(RGB nonzero) keeps background / partial blends onto white" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 3, 1);
     defer c.deinit();
     const px = c.layerPixels(0);
-    px[0] = 0xFF0000FF; // 不透明青
-    px[1] = 0x00FFFFFF; // a=0 だが RGB 非ゼロ → 背景(白)維持
-    px[2] = 0x800000FF; // 半透明青（a=128）→ 白地に約半分
+    px[0] = 0xFF0000FF; // Opaque blue
+    px[1] = 0x00FFFFFF; // a=0 but RGB nonzero → keep background (white)
+    px[2] = 0x800000FF; // Translucent blue (a=128) → about half on white
 
     const out = c.composite();
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]); // 元色
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), out[1]); // 白維持
-    try std.testing.expectEqual(@as(u32, 0xFF), (out[2] >> 24) & 0xFF); // 不透明
-    // B は 255、G/R は白(255)と青(0)の中間 ≈ 127
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]); // Source color
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), out[1]); // White kept
+    try std.testing.expectEqual(@as(u32, 0xFF), (out[2] >> 24) & 0xFF); // Opaque
+    // B is 255; G/R are mid white(255)/blue(0) ≈ 127
     try std.testing.expectEqual(@as(u32, 0xFF), out[2] & 0xFF); // B=255
     const g = (out[2] >> 8) & 0xFF;
     try std.testing.expect(g > 120 and g < 135);
 }
 
-test "composite: visible=false はスキップ / opacity が効く" {
+test "composite: visible=false is skipped / opacity applies" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 1, 1);
     defer c.deinit();
-    c.layerPixels(0)[0] = 0xFF0000FF; // 不透明青
+    c.layerPixels(0)[0] = 0xFF0000FF; // Opaque blue
     _ = c.setLayerVisible(0, false);
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), c.composite()[0]); // スキップ → 白
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), c.composite()[0]); // Skip → white
 
     _ = c.setLayerVisible(0, true);
-    _ = c.setLayerOpacity(0, 128); // 不透明青 × opacity 128 → 白地に約半分
+    _ = c.setLayerOpacity(0, 128); // Opaque blue × opacity 128 → about half on white
     const out = c.composite()[0];
     try std.testing.expectEqual(@as(u32, 0xFF), out & 0xFF); // B=255
     const g = (out >> 8) & 0xFF;
     try std.testing.expect(g > 120 and g < 135);
 }
 
-test "composite: 2 層 src-over（下層→上層順）" {
+test "composite: 2-layer src-over (bottom to top)" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 1, 1);
     defer c.deinit();
-    c.layerPixels(0)[0] = 0xFF0000FF; // 下層: 不透明青
-    // 上層を追加（不透明赤で覆う）
+    c.layerPixels(0)[0] = 0xFF0000FF; // Bottom layer: opaque blue
+    // Add top layer (cover with opaque red)
     const top = try gpa.alloc(u32, 1);
-    top[0] = 0xFFFF0000; // 0xAARRGGBB: a=FF, r=FF（赤）
+    top[0] = 0xFFFF0000; // 0xAARRGGBB: a=FF, r=FF (red)
     try c.insertLayer(gpa, 1, .{ .pixels = top });
 
     const out = c.composite()[0];
-    try std.testing.expectEqual(@as(u32, 0xFFFF0000), out); // 上層(赤)が下層(青)を覆う
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), out); // Top (red) covers bottom (blue)
 }
 
-test "compositeStraight: 全透明は a=0 維持 / 不透明は元色 / 半透明は out_a を保持" {
+test "compositeStraight: fully transparent keeps a=0 / opaque keeps source / translucent keeps out_a" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 3, 1);
     defer c.deinit();
     const px = c.layerPixels(0);
-    px[0] = 0xFF0000FF; // 不透明青
-    px[1] = 0x00000000; // 完全透明
-    px[2] = 0x800000FF; // 半透明青（a=128）
+    px[0] = 0xFF0000FF; // Opaque blue
+    px[1] = 0x00000000; // Fully transparent
+    px[2] = 0x800000FF; // Translucent blue (a=128)
 
     const out = c.compositeStraight();
-    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]); // 不透明は元色
-    try std.testing.expectEqual(@as(u32, 0x00000000), out[1]); // 透明は a=0 維持（白で埋めない）
-    try std.testing.expectEqual(@as(u32, 128), (out[2] >> 24) & 0xFF); // 半透明の out_a を保持
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]); // Opaque keeps source color
+    try std.testing.expectEqual(@as(u32, 0x00000000), out[1]); // Transparent keeps a=0 (not filled with white)
+    try std.testing.expectEqual(@as(u32, 128), (out[2] >> 24) & 0xFF); // Keep translucent out_a
     try std.testing.expectEqual(@as(u32, 0xFF), out[2] & 0xFF); // B=255
 }
 
-/// テスト用: 乱数レイヤ内容を充填する（a=0 の画素は RGB=0 に正規化 = cache 不変条件と同じ）。
+/// Test helper: fill layers with random content (a=0 pixels normalised to RGB=0 = same as the cache invariant).
 fn fillRandomLayers(c: *Canvas, seed: u64, opacities: []const u8) void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
@@ -693,17 +693,17 @@ fn fillRandomLayers(c: *Canvas, seed: u64, opacities: []const u8) void {
     }
 }
 
-test "composite: SIMD 経路が旧 scalar 実装と bit 一致（乱数多層 + opacity 混在）" {
+test "composite: SIMD path bit-identical to scalar reference (random multi-layer + mixed opacity)" {
     const gpa = std.testing.allocator;
-    // 7x5=35px（チャンク 8 個 + tail 3px）× 3 層。opacity は 255/200/128 を混在。
+    // 7x5=35px (8 chunks + 3px tail) × 3 layers. Mixed opacity 255/200/128.
     var c = try Canvas.init(gpa, 7, 5);
     defer c.deinit();
     _ = try c.addLayer(gpa);
     _ = try c.addLayer(gpa);
     fillRandomLayers(&c, 0xC0117051, &.{ 255, 200, 128 });
-    _ = c.setLayerVisible(1, false); // visible スキップ経路も混ぜる
+    _ = c.setLayerVisible(1, false); // Also mix in the visible-skip path
 
-    // 旧アルゴリズム（scalar srcOver + scaleAlpha per-pixel）の参照実装
+    // Reference: scalar algorithm (srcOver + scaleAlpha per-pixel)
     const ref = try gpa.alloc(u32, 35);
     defer gpa.free(ref);
     @memset(ref, 0xFFFFFFFF);
@@ -718,7 +718,7 @@ test "composite: SIMD 経路が旧 scalar 実装と bit 一致（乱数多層 + 
     try std.testing.expectEqualSlices(u32, ref, c.composite());
 }
 
-test "compositeStraight: SIMD 経路が srcOverStraightScalar の参照ループと bit 一致（乱数多層）" {
+test "compositeStraight: SIMD path bit-identical to srcOverStraightScalar reference loop (random multi-layer)" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 7, 5);
     defer c.deinit();
@@ -740,12 +740,12 @@ test "compositeStraight: SIMD 経路が srcOverStraightScalar の参照ループ
     try std.testing.expectEqualSlices(u32, ref, c.compositeStraight());
 }
 
-test "compositeStraight: 単層 opacity=255 は raw pixels と恒等（AC3。a=0..255 全域 + tail）" {
+test "compositeStraight: single layer opacity=255 identical to raw pixels (a=0..255 full range + tail)" {
     const gpa = std.testing.allocator;
-    var c = try Canvas.init(gpa, 37, 7); // 259px（チャンク 64 + tail 3）
+    var c = try Canvas.init(gpa, 37, 7); // 259px (64 chunks + 3 tail)
     defer c.deinit();
-    // 先頭 256px に a=0..255 を明示的に 1 回ずつ（a=0 は RGB=0 の cache 不変条件に正規化）、
-    // 残り 3px（tail）は乱数
+    // First 256px explicitly cover a=0..255 once each (a=0 normalised to RGB=0 under the cache invariant);
+    // remaining 3px (tail) are random
     var prng = std.Random.DefaultPrng.init(0x1DE47177);
     const rng = prng.random();
     const px = c.layerPixels(0);
@@ -759,27 +759,27 @@ test "compositeStraight: 単層 opacity=255 は raw pixels と恒等（AC3。a=0
     try std.testing.expectEqualSlices(u32, c.layerPixels(0), c.compositeStraight());
 }
 
-test "compositeStraight: visible=false スキップ / 2 層は上が下を src-over してアルファ保持" {
+test "compositeStraight: visible=false skipped / 2 layers top src-overs bottom keeping alpha" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 1, 1);
     defer c.deinit();
-    c.layerPixels(0)[0] = 0xFF0000FF; // 下層: 不透明青
+    c.layerPixels(0)[0] = 0xFF0000FF; // Bottom layer: opaque blue
     _ = c.setLayerVisible(0, false);
-    try std.testing.expectEqual(@as(u32, 0x00000000), c.compositeStraight()[0]); // スキップ → 透明維持
+    try std.testing.expectEqual(@as(u32, 0x00000000), c.compositeStraight()[0]); // Skip → stay transparent
 
     _ = c.setLayerVisible(0, true);
     const top = try gpa.alloc(u32, 1);
-    top[0] = 0x80FF0000; // 上層: 半透明赤（a=128）
+    top[0] = 0x80FF0000; // Top layer: translucent red (a=128)
     try c.insertLayer(gpa, 1, .{ .pixels = top });
     const out = c.compositeStraight()[0];
-    try std.testing.expectEqual(@as(u32, 0xFF), (out >> 24) & 0xFF); // 下層不透明 → out_a=255
+    try std.testing.expectEqual(@as(u32, 0xFF), (out >> 24) & 0xFF); // Opaque bottom → out_a=255
     const r = (out >> 16) & 0xFF;
     const b = out & 0xFF;
-    try std.testing.expect(r > 120 and r < 135); // 赤が約半分
-    try std.testing.expect(b > 120 and b < 135); // 青が約半分
+    try std.testing.expect(r > 120 and r < 135); // Red about half
+    try std.testing.expect(b > 120 and b < 135); // Blue about half
 }
 
-test "composite cache: 無変更なら再合成しない（counter で固定。TASK-53）" {
+test "composite cache: unchanged canvas does not recompose (pinned by counter)" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 4, 4);
     defer c.deinit();
@@ -787,31 +787,31 @@ test "composite cache: 無変更なら再合成しない（counter で固定。T
 
     _ = c.compositeStraight();
     try std.testing.expectEqual(@as(usize, 1), c.composite_runs);
-    _ = c.compositeStraight(); // 無変更 → キャッシュ再利用
+    _ = c.compositeStraight(); // Unchanged → reuse cache
     _ = c.compositeStraight();
     try std.testing.expectEqual(@as(usize, 1), c.composite_runs);
 
-    // モード切替は再合成（cache 共有のため）
+    // Mode switch recomposites (caches are shared)
     _ = c.composite();
     try std.testing.expectEqual(@as(usize, 2), c.composite_runs);
     _ = c.compositeStraight();
     try std.testing.expectEqual(@as(usize, 3), c.composite_runs);
 
-    // 変更 → 再合成 + 結果が追従（stale cache を返さない）
+    // Change → recompose + result follows (never return a stale cache)
     c.drawPixel(0, 2, 2, 0xFFAABBCC);
     const out = c.compositeStraight();
     try std.testing.expectEqual(@as(usize, 4), c.composite_runs);
     try std.testing.expectEqual(@as(u32, 0xFFAABBCC), out[2 * 4 + 2]);
 }
 
-test "composite cache: 全ての変更 API が cache を無効化する（TASK-53）" {
+test "composite cache: every mutating API invalidates the cache" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 4, 4);
     defer c.deinit();
-    _ = try c.addLayer(gpa); // 2 層で開始（deleteLayer 用）
+    _ = try c.addLayer(gpa); // Start with 2 layers (for deleteLayer)
 
-    // 各操作の後に compositeStraight が再合成される（composite_runs が増える）ことを確認する。
-    // 操作は enum で列挙し、漏れなく踏む。
+    // After each op, compositeStraight must recompose (composite_runs increases).
+    // Ops are enumerated so none are missed.
     const Op = enum {
         draw_pixel,
         layer_pixels,
@@ -827,7 +827,7 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
     };
     inline for (std.meta.fields(Op)) |f| {
         const op: Op = @enumFromInt(f.value);
-        _ = c.compositeStraight(); // cache を有効化
+        _ = c.compositeStraight(); // Enable the cache
         const runs_before = c.composite_runs;
         switch (op) {
             .draw_pixel => c.drawPixel(0, 0, 0, 0xFF010203),
@@ -842,7 +842,7 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
             .move_layer => _ = c.moveLayer(0, c.layers.items.len - 1),
             .set_visible => _ = c.setLayerVisible(0, false),
             .set_opacity => _ = c.setLayerOpacity(0, 200),
-            .add_text_layer => _ = try c.addTextLayer(gpa, .{}), // 末尾に text layer を追加（enum 順序: 直後の set_text_params が同レイヤーを想定）
+            .add_text_layer => _ = try c.addTextLayer(gpa, .{}), // Append a text layer at the end (enum order: the following set_text_params targets the same layer)
             .set_text_params => {
                 var p: TextParams = .{};
                 p.setText("hi");
@@ -856,9 +856,9 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
         };
     }
 
-    // 合成結果に影響しない操作は無効化しない（TASK-79.3: setLayerName / TASK-79.5: rasterizeLayer も追加）。
-    // 直前のループの末尾 op が add_text_layer→set_text_params の順だったため、末尾レイヤーは
-    // 現在 kind==.text（TextParams.text()=="hi"）。
+    // Ops that do not affect the composite do not invalidate (setLayerName / rasterizeLayer included).
+    // The last op of the prior loop was add_text_layer→set_text_params, so the last layer is
+    // currently kind==.text (TextParams.text()=="hi").
     _ = c.compositeStraight();
     const runs = c.composite_runs;
     _ = c.selectLayer(0);
@@ -867,15 +867,15 @@ test "composite cache: 全ての変更 API が cache を無効化する（TASK-5
     _ = c.setLayerName(0, "Background");
     const text_idx = c.layers.items.len - 1;
     try std.testing.expectEqual(LayerKind.text, c.layers.items[text_idx].kind);
-    _ = try c.rasterizeLayer(text_idx); // pixels 不変・kind=raster 化のみ → cache 無効化しない
+    _ = try c.rasterizeLayer(text_idx); // pixels unchanged; only kind→raster → do not invalidate cache
     _ = c.compositeStraight();
     try std.testing.expectEqual(runs, c.composite_runs);
     try std.testing.expectEqual(LayerKind.raster, c.layers.items[text_idx].kind);
 }
 
-// ── レイヤー名（TASK-79.3）─────────────────────────────────
+// ── Layer names ─────────────────────────────────────────
 
-test "Layer name: 既定名は Layer 1/2/3.. と単調増加し、削除しても巻き戻らない" {
+test "Layer name: defaults Layer 1/2/3.. increase monotonically and do not rewind on delete" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 2, 2);
     defer c.deinit();
@@ -886,14 +886,14 @@ test "Layer name: 既定名は Layer 1/2/3.. と単調増加し、削除して�
     const idx2 = try c.addLayer(gpa);
     try std.testing.expectEqualStrings("Layer 3", c.layers.items[idx2].name());
 
-    // 削除しても連番は巻き戻らない（次の追加は Layer 4）
+    // Counter does not rewind on delete (next add is Layer 4)
     const removed = c.deleteLayer(idx2).?;
     gpa.free(removed.pixels);
     const idx3 = try c.addLayer(gpa);
     try std.testing.expectEqualStrings("Layer 4", c.layers.items[idx3].name());
 }
 
-test "Layer name: setLayerName/setName は境界を跨いだ UTF-8 continuation byte で切らない" {
+test "Layer name: setLayerName/setName do not cut mid UTF-8 continuation byte" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 1, 1);
     defer c.deinit();
@@ -901,27 +901,27 @@ test "Layer name: setLayerName/setName は境界を跨いだ UTF-8 continuation 
     _ = c.setLayerName(0, "Background");
     try std.testing.expectEqualStrings("Background", c.layers.items[0].name());
 
-    // layer_name_max(32) を超える長い名前は切り詰められる（かつ不正 UTF-8 を作らない）
+    // Names longer than layer_name_max(32) are truncated (without producing invalid UTF-8)
     const long_ascii = "A" ** 40;
     _ = c.setLayerName(0, long_ascii);
     try std.testing.expectEqual(@as(usize, layer_name_max), c.layers.items[0].name().len);
 
-    // マルチバイト文字（3B/文字の "あ"）を境界ぎりぎりで切り詰めても壊れた UTF-8 を作らない。
-    // "あ" を 11 回（33 バイト）→ layer_name_max(32) に収まるのは 10 個(30B)まで。
+    // Truncating a multi-byte character (3B per hiragana codepoint) at the limit must not yield broken UTF-8.
+    // 11× that character (33 bytes) → at most 10 (30B) fit in layer_name_max(32).
     const multibyte = "あ" ** 11;
     _ = c.setLayerName(0, multibyte);
     const got = c.layers.items[0].name();
     try std.testing.expect(got.len <= layer_name_max);
     try std.testing.expect(std.unicode.utf8ValidateSlice(got));
-    try std.testing.expectEqualStrings("あ" ** 10, got); // 30B（32 に収まる最大個数）
+    try std.testing.expectEqualStrings("あ" ** 10, got); // 30B (max count that fits in 32)
 
-    try std.testing.expect(!c.setLayerName(5, "OOB")); // 範囲外は false
+    try std.testing.expect(!c.setLayerName(5, "OOB")); // Out of range → false
 }
 
-test "Layer name: resetCanvasToSingleLayer 相当のシナリオでも Canvas.init は Layer 1 を付与する" {
-    // resetCanvasToSingleLayer (pixie main.zig) は既存 layer0 を再利用するため、
-    // 呼び出し側が明示的に setLayerName("Layer 1") + next_layer_num リセットを行う契約
-    // （このテストは Canvas.init 自体の既定名付与を再確認する）。
+test "Layer name: Canvas.init assigns Layer 1 even in a resetCanvasToSingleLayer-like scenario" {
+    // resetCanvasToSingleLayer (pixie main.zig) reuses existing layer0, so
+    // the caller contract is an explicit setLayerName("Layer 1") + next_layer_num reset
+    // (this test re-checks Canvas.init's own default naming).
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 4, 4);
     defer c.deinit();
@@ -929,9 +929,9 @@ test "Layer name: resetCanvasToSingleLayer 相当のシナリオでも Canvas.in
     try std.testing.expectEqual(@as(u32, 2), c.next_layer_num);
 }
 
-// ── テキストレイヤー（TASK-79.5）─────────────────────────────
+// ── Text layers ─────────────────────────────────────────────
 
-test "TextParams: setText/text は UTF-8 境界を壊さず切り詰める" {
+test "TextParams: setText/text truncate without breaking UTF-8 boundaries" {
     var p: TextParams = .{};
     p.setText("Hello");
     try std.testing.expectEqualStrings("Hello", p.text());
@@ -940,31 +940,31 @@ test "TextParams: setText/text は UTF-8 境界を壊さず切り詰める" {
     p.setText(long_ascii);
     try std.testing.expectEqual(text_content_max, p.text().len);
 
-    const multibyte = "あ" ** 40; // 120B（96 に収まるのは 32 個=96B まで）
+    const multibyte = "あ" ** 40; // 120B (32×3B=96B fits in 96)
     p.setText(multibyte);
     try std.testing.expect(p.text().len <= text_content_max);
     try std.testing.expect(std.unicode.utf8ValidateSlice(p.text()));
     try std.testing.expectEqualStrings("あ" ** 32, p.text());
 }
 
-test "TextParams.eql: text_buf の未使用末尾バイトを無視し意味的に比較する（font_px は bit 比較）" {
+test "TextParams.eql: ignores unused trailing text_buf bytes and compares semantically (font_px by bits)" {
     var a: TextParams = .{ .font_px = 24, .color = 0xFFFFFFFF, .x = 1, .y = 2 };
     a.setText("Hi");
     var b: TextParams = .{ .font_px = 24, .color = 0xFFFFFFFF, .x = 1, .y = 2 };
     b.setText("Hi");
-    // a/b は別々に setText した独立インスタンス（text_buf の未使用末尾は undefined で
-    // 一致する保証が無い）。それでも eql は true になる。
+    // a/b are independent instances each setText'd (unused trailing text_buf bytes are undefined and
+    // not guaranteed equal). eql is still true.
     try std.testing.expect(a.eql(b));
 
     var c: TextParams = a;
-    c.setText("Ho"); // 内容が違う
+    c.setText("Ho"); // Different content
     try std.testing.expect(!a.eql(c));
 
     var d: TextParams = a;
     d.font_px = 25;
     try std.testing.expect(!a.eql(d));
 
-    // NaN font_px 同士は bit 比較なら同一 NaN 表現で true（IEEE754 の NaN!=NaN の影響を受けない）。
+    // Two NaN font_px compare equal under bit compare with the same NaN bits (immune to IEEE754 NaN!=NaN).
     const nan_val = std.math.nan(f32);
     var e1: TextParams = .{ .font_px = nan_val };
     var e2: TextParams = .{ .font_px = nan_val };
@@ -973,7 +973,7 @@ test "TextParams.eql: text_buf の未使用末尾バイトを無視し意味的�
     try std.testing.expect(e1.eql(e2));
 }
 
-test "Canvas.addTextLayer: text kind で追加され pixels がラスタライズ結果になる" {
+test "Canvas.addTextLayer: adds as text kind and pixels become the rasterization result" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 64, 32);
     defer c.deinit();
@@ -981,7 +981,7 @@ test "Canvas.addTextLayer: text kind で追加され pixels がラスタライ�
     var params: TextParams = .{ .font_px = 16, .color = 0xFFFFFFFF, .x = 0, .y = 0 };
     params.setText("Hi");
     const idx = try c.addTextLayer(gpa, params);
-    try std.testing.expectEqual(@as(usize, 1), idx); // layer0 の上に追加
+    try std.testing.expectEqual(@as(usize, 1), idx); // Added above layer0
     try std.testing.expectEqual(LayerKind.text, c.layers.items[idx].kind);
     try std.testing.expectEqualStrings("Hi", c.layers.items[idx].text_params.text());
 
@@ -989,10 +989,10 @@ test "Canvas.addTextLayer: text kind で追加され pixels がラスタライ�
     for (c.layerPixels(idx)) |p| {
         if (p & 0xFF000000 != 0) non_transparent += 1;
     }
-    try std.testing.expect(non_transparent > 0); // 文字が焼かれている
+    try std.testing.expect(non_transparent > 0); // Glyphs are baked in
 }
 
-test "Canvas.setLayerTextParams: kind!=text は NotTextLayer、text は再ラスタライズされる" {
+test "Canvas.setLayerTextParams: kind!=text is NotTextLayer; text is re-rasterized" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 64, 32);
     defer c.deinit();
@@ -1006,13 +1006,13 @@ test "Canvas.setLayerTextParams: kind!=text は NotTextLayer、text は再ラス
     defer gpa.free(before_pixels);
 
     var params2 = params;
-    params2.setText("ABCDE"); // 文字列を変えると pixels が変わるはず
+    params2.setText("ABCDE"); // Changing the string should change pixels
     try c.setLayerTextParams(idx, params2);
     try std.testing.expect(!std.mem.eql(u32, before_pixels, c.layerPixels(idx)));
     try std.testing.expectEqualStrings("ABCDE", c.layers.items[idx].text_params.text());
 }
 
-test "Canvas.rasterizeLayer/setLayerKindText: bake は pixels 不変・kind のみ切替、Undo/Redo 相当が可逆" {
+test "Canvas.rasterizeLayer/setLayerKindText: bake keeps pixels, switches kind only; Undo/Redo-equivalent is reversible" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 64, 32);
     defer c.deinit();
@@ -1028,13 +1028,13 @@ test "Canvas.rasterizeLayer/setLayerKindText: bake は pixels 不変・kind の�
     const before = try c.rasterizeLayer(idx);
     try std.testing.expect(before.eql(params));
     try std.testing.expectEqual(LayerKind.raster, c.layers.items[idx].kind);
-    try std.testing.expectEqualSlices(u32, pixels_before, c.layerPixels(idx)); // pixels 不変
+    try std.testing.expectEqualSlices(u32, pixels_before, c.layerPixels(idx)); // pixels unchanged
 
-    // setLayerKindText で undo（.text へ戻す）→ redo（.raster へ戻す）
+    // setLayerKindText undoes (back to .text) → redo (back to .raster)
     try std.testing.expect(c.setLayerKindText(idx, .text, before));
     try std.testing.expectEqual(LayerKind.text, c.layers.items[idx].kind);
-    try std.testing.expectEqualSlices(u32, pixels_before, c.layerPixels(idx)); // pixels は今も不変
+    try std.testing.expectEqualSlices(u32, pixels_before, c.layerPixels(idx)); // pixels still unchanged
     try std.testing.expect(c.setLayerKindText(idx, .raster, .{}));
     try std.testing.expectEqual(LayerKind.raster, c.layers.items[idx].kind);
-    try std.testing.expect(!c.setLayerKindText(999, .text, .{})); // 範囲外は false
+    try std.testing.expect(!c.setLayerKindText(999, .text, .{})); // Out of range → false
 }

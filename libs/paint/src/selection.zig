@@ -1,15 +1,15 @@
-//! 範囲選択（矩形）の操作（TASK-44）。
+//! Rectangular selection ops.
 //!
-//! - selection 自体は `Canvas.selection: ?Rect`（canvas.zig）。本モジュールは矩形ユーティリティ
-//!   （正規化/clip/抽出）と clipboard（`PixelBlock`）、cut/paste/move のピクセル編集を担う。
-//! - **cut/paste/move は `canvas.layerPixels` へ直接書き込み**、selection ゲート付きの
-//!   `StrokeRecorder` は通さない（さもないと paste/move 先が選択範囲外だとゲートに握り潰される）。
-//!   既存 `Op.paint`（before/after の PixelDiff 列）を再利用して可逆にする。
-//! - **paste のピクセル配置は `Blend{replace, over}` で切替**（`pasteCmd` 引数）: `replace`=block の
-//!   透明ピクセルも含めそのまま上書き、`over`=`blend.srcOver` 合成（透明部は配置先を残す）。pixie の既定は
-//!   `over`。move（フロート）の焼き込みも同様に render mode で切替。cut/move の元領域は透明（0）へ。
-//! - selection 矩形そのものの更新（移動後/貼付後の選択枠）は呼び出し側（pixie）が行う。
-//! - OOM は core 慣習に合わせて `@panic`。
+//! - The selection itself is `Canvas.selection: ?Rect` (canvas.zig). This module owns rect utilities
+//!   (normalize/clip/extract), the clipboard (`PixelBlock`), and cut/paste/move pixel edits.
+//! - **cut/paste/move write `canvas.layerPixels` directly** and do not go through the selection-gated
+//!   `StrokeRecorder` (otherwise paste/move targets outside the selection would be swallowed by the gate).
+//!   Reuse existing `Op.paint` (before/after PixelDiff lists) for reversibility.
+//! - **paste pixel placement switches on `Blend{replace, over}`** (`pasteCmd` arg): `replace`=overwrite
+//!   including transparent block pixels; `over`=`blend.srcOver` (transparent regions keep the destination). pixie default is
+//!   `over`. Move (float) bake-in switches the same way via render mode. cut/move source regions go to transparent (0).
+//! - Updating the selection rect itself (after move/paste) is the caller's (pixie's) job.
+//! - OOM follows core convention: `@panic`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,12 +21,12 @@ const PixelDiff = undo_mod.PixelDiff;
 const PaintDiff = undo_mod.PaintDiff;
 const blend = @import("blend.zig");
 
-/// paste/move のブロック配置方法。
-/// - `replace`: ブロックをそのまま上書き（透明部も含めて配置先を置換）。
-/// - `over`:    `srcOver` で合成（透明部は配置先を残す＝「透明を保持」）。
+/// How paste/move places a block.
+/// - `replace`: overwrite with the block as-is (including transparent pixels replacing the destination).
+/// - `over`:    composite with `srcOver` (transparent regions keep the destination = "keep transparency").
 pub const Blend = enum { replace, over };
 
-/// clipboard 用の矩形ピクセルブロック（行優先、canonical BGRA 0xAARRGGBB）。allocator 所有。
+/// Rectangular pixel block for the clipboard (row-major, canonical BGRA 0xAARRGGBB). Allocator-owned.
 pub const PixelBlock = struct {
     w: u32,
     h: u32,
@@ -38,8 +38,8 @@ pub const PixelBlock = struct {
     }
 };
 
-/// 2点（canvas 座標・両端 inclusive・範囲外可）から正規化矩形を作り canvas 内へ clip する。
-/// clip 後に面積が無ければ null。マーキーのドラッグ確定に使う。
+/// Build a normalized rect from two points (canvas coords; both ends inclusive; may be out of range) and clip into the canvas.
+/// null if area is empty after clip. Used when committing a marquee drag.
 pub fn rectFromPoints(ax: i32, ay: i32, bx: i32, by: i32, cw: u32, ch: u32) ?Rect {
     var x0 = @min(ax, bx);
     var y0 = @min(ay, by);
@@ -55,8 +55,8 @@ pub fn rectFromPoints(ax: i32, ay: i32, bx: i32, by: i32, cw: u32, ch: u32) ?Rec
     return .{ .x = x0, .y = y0, .w = x1 - x0 + 1, .h = y1 - y0 + 1 };
 }
 
-/// 半開矩形 [x,x+w)×[y,y+h) を canvas [0,cw)×[0,ch) へ clip する。空なら null。
-/// paste/move の貼付先矩形を選択枠へ反映する際の clip に使う。
+/// Clip a half-open rect [x,x+w)×[y,y+h) into canvas [0,cw)×[0,ch). null if empty.
+/// Used to clip the paste/move destination rect when reflecting it into the selection frame.
 pub fn clipRect(r: Rect, cw: u32, ch: u32) ?Rect {
     const w_i: i32 = @intCast(cw);
     const h_i: i32 = @intCast(ch);
@@ -68,7 +68,7 @@ pub fn clipRect(r: Rect, cw: u32, ch: u32) ?Rect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
-/// canvas の layer_idx から rect（canvas 内に収まっている前提）の矩形ピクセルを複製する。
+/// Duplicate pixels of rect (assumed inside the canvas) from canvas layer_idx.
 pub fn extract(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) PixelBlock {
     const w: u32 = @intCast(rect.w);
     const h: u32 = @intCast(rect.h);
@@ -84,14 +84,14 @@ pub fn extract(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) Pi
     return .{ .w = w, .h = h, .pixels = out };
 }
 
-/// rect（canvas 内前提）を透明（0）化する paint cmd を作り canvas へ適用して返す。
-/// 変更ピクセルが無ければ null（cut で選択が空の領域など）。cut の「元領域消去」に使う。
+/// Build a paint cmd that clears rect (assumed inside the canvas) to transparent (0), apply it, and return it.
+/// null if no pixels change (e.g. cut of an empty selection). Used for cut's "erase source region".
 pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rect) ?PaintDiff {
     const px = canvas.layerPixels(layer_idx);
     const w: usize = @intCast(rect.w);
     const h: usize = @intCast(rect.h);
     var diffs: std.ArrayList(PixelDiff) = .empty;
-    // 上限 = 矩形全画素。事前確保してループ内の再確保を排除（TASK-59）
+    // Cap = all pixels in the rect. Pre-reserve to avoid reallocation inside the loop
     diffs.ensureTotalCapacity(gpa, w * h) catch @panic("selection.clearRectCmd: OOM");
     var row: usize = 0;
     while (row < h) : (row += 1) {
@@ -108,15 +108,15 @@ pub fn clearRectCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, rect: Rec
     return finishDiffs(gpa, &diffs, layer_idx);
 }
 
-/// block を canvas 上 (dx,dy) 左上として配置する paint cmd を作り適用して返す。
-/// mode=replace は上書き、mode=over は srcOver 合成（透明部は配置先を残す）。
-/// canvas 外へはみ出す部分は clip。変更が無ければ null。paste に使う。
+/// Build and apply a paint cmd that places block with top-left at (dx,dy) on the canvas.
+/// mode=replace overwrites; mode=over composites with srcOver (transparent regions keep the destination).
+/// Parts outside the canvas are clipped. null if nothing changes. Used for paste.
 pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelBlock, dx: i32, dy: i32, mode: Blend) ?PaintDiff {
     const px = canvas.layerPixels(layer_idx);
     const w_i: i32 = @intCast(canvas.width);
     const h_i: i32 = @intCast(canvas.height);
     var diffs: std.ArrayList(PixelDiff) = .empty;
-    // 上限 = block 全画素。事前確保してループ内の再確保を排除（TASK-59）
+    // Cap = all pixels in the block. Pre-reserve to avoid reallocation inside the loop
     diffs.ensureTotalCapacity(gpa, @as(usize, block.w) * block.h) catch @panic("selection.pasteCmd: OOM");
     var row: u32 = 0;
     while (row < block.h) : (row += 1) {
@@ -140,10 +140,10 @@ pub fn pasteCmd(gpa: Allocator, canvas: *Canvas, layer_idx: usize, block: PixelB
     return finishDiffs(gpa, &diffs, layer_idx);
 }
 
-// ── フローティング選択（move の遅延確定。TASK-44 ⑦）用の純関数ヘルパ ─────────────
-// canvas/selection gate を通さない raw slice 操作。selection_input の Float が使う。
+// ── Pure helpers for floating selection (deferred move commit) ─────────────
+// Raw slice ops that bypass the canvas/selection gate. Used by selection_input's Float.
 
-/// buf（w 幅のレイヤー）の rect 矩形（canvas 内前提）を 0 クリアする。lift 時の `base` 生成に使う。
+/// Clear rect (assumed inside canvas) in buf (layer of width w) to 0. Used to build `base` on lift.
 pub fn clearRectInBuf(buf: []u32, rect: Rect, w: u32) void {
     const rh: usize = @intCast(rect.h);
     const rw: usize = @intCast(rect.w);
@@ -155,8 +155,8 @@ pub fn clearRectInBuf(buf: []u32, rect: Rect, w: u32) void {
     }
 }
 
-/// dst（w*h レイヤー）へ base をコピーし、block を (dx,dy) 左上へ mode で配置する（diff を作らない純描画）。
-/// 移動の preview / 確定書き込みの両方で使う。canvas 外へはみ出す block 部は clip。
+/// Copy base into dst (w*h layer) and place block at top-left (dx,dy) with mode (pure draw; no diffs).
+/// Used for both move preview and commit write. Block parts outside the canvas are clipped.
 pub fn renderBlockOverBase(dst: []u32, base: []const u32, block: PixelBlock, dx: i32, dy: i32, mode: Blend, w: u32, h: u32) void {
     @memcpy(dst, base);
     const w_i: i32 = @intCast(w);
@@ -172,14 +172,14 @@ pub fn renderBlockOverBase(dst: []u32, base: []const u32, block: PixelBlock, dx:
             const src = block.pixels[row * block.w + col];
             dst[idx] = switch (mode) {
                 .replace => src,
-                .over => blend.srcOver(dst[idx], src), // dst[idx] は今 base[idx]
+                .over => blend.srcOver(dst[idx], src), // dst[idx] is currently base[idx]
             };
         }
     }
 }
 
-/// layer が `base に block を (dx,dy)/mode で配置した結果` と一致するか（外部編集の検知用）。
-/// フロート再利用の妥当性判定に使う。一致しなければ外部編集が入ったとみなして re-lift する。
+/// Whether layer matches `base with block placed at (dx,dy)/mode` (detect external edits).
+/// Used to validate float reuse. On mismatch treat as an external edit and re-lift.
 pub fn layerMatchesRender(layer: []const u32, base: []const u32, block: PixelBlock, dx: i32, dy: i32, mode: Blend, w: u32, h: u32) bool {
     if (layer.len != base.len) return false;
     const bw_i: i32 = @intCast(block.w);
@@ -205,11 +205,11 @@ pub fn layerMatchesRender(layer: []const u32, base: []const u32, block: PixelBlo
     return true;
 }
 
-/// 同型 slice の差分を paint cmd 化する（変更なしは null）。move 確定時の undo entry 生成に使う。
+/// Turn diffs between same-shaped slices into a paint cmd (null if unchanged). Used to build the undo entry on move commit.
 pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_idx: usize) ?PaintDiff {
     std.debug.assert(before.len == after.len);
     var diffs: std.ArrayList(PixelDiff) = .empty;
-    // 上限 = 全画素。事前確保してループ内の再確保を排除（TASK-59）
+    // Cap = all pixels. Pre-reserve to avoid reallocation inside the loop
     diffs.ensureTotalCapacity(gpa, before.len) catch @panic("selection.diffCmd: OOM");
     for (before, after, 0..) |b, a, i| {
         if (a == b) continue;
@@ -218,7 +218,7 @@ pub fn diffCmd(gpa: Allocator, before: []const u32, after: []const u32, layer_id
     return finishDiffs(gpa, &diffs, layer_idx);
 }
 
-/// diffs を owned slice 化して paint cmd を返す。空なら破棄して null。
+/// Own the diffs slice and return a paint cmd. If empty, free and return null.
 fn finishDiffs(gpa: Allocator, diffs: *std.ArrayList(PixelDiff), layer_idx: usize) ?PaintDiff {
     if (diffs.items.len == 0) {
         diffs.deinit(gpa);
@@ -239,24 +239,24 @@ const B: u32 = 0xFF000002;
 const C: u32 = 0xFF000003;
 const D: u32 = 0xFF000004;
 
-test "rectFromPoints: 正規化 / clip / 範囲外は null" {
-    // 逆順の2点を正規化（両端 inclusive）
+test "rectFromPoints: normalize / clip / outside is null" {
+    // Normalise two points in reverse order (both ends inclusive)
     try std.testing.expectEqual(Rect{ .x = 2, .y = 3, .w = 4, .h = 3 }, rectFromPoints(5, 5, 2, 3, 10, 10).?);
-    // 負側を 0 へ clip
+    // Clip the negative side to 0
     try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 2, .h = 2 }, rectFromPoints(-2, -2, 1, 1, 10, 10).?);
-    // 同一点は 1x1
+    // Identical points → 1x1
     try std.testing.expectEqual(Rect{ .x = 5, .y = 5, .w = 1, .h = 1 }, rectFromPoints(5, 5, 5, 5, 10, 10).?);
-    // 完全に範囲外 → null
+    // Fully outside → null
     try std.testing.expect(rectFromPoints(20, 20, 30, 30, 10, 10) == null);
 }
 
-test "clipRect: 半開矩形を canvas へ clip / 空は null" {
+test "clipRect: clip half-open rect into canvas / empty is null" {
     try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 3, .h = 3 }, clipRect(.{ .x = -2, .y = -2, .w = 5, .h = 5 }, 3, 3).?);
     try std.testing.expectEqual(Rect{ .x = 2, .y = 2, .w = 2, .h = 2 }, clipRect(.{ .x = 2, .y = 2, .w = 5, .h = 5 }, 4, 4).?);
     try std.testing.expect(clipRect(.{ .x = 5, .y = 5, .w = 2, .h = 2 }, 4, 4) == null);
 }
 
-test "extract: layer から矩形を複製する" {
+test "extract: duplicate a rect from a layer" {
     const gpa = std.testing.allocator;
     var c = try Canvas.init(gpa, 4, 4);
     defer c.deinit();
@@ -271,8 +271,8 @@ test "extract: layer から矩形を複製する" {
     try std.testing.expectEqualSlices(u32, &[_]u32{ A, B, C, D }, block.pixels);
 }
 
-test "clearRectCmd: 領域を透明化し undo で復元" {
-    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
+test "clearRectCmd: clear region to transparent and restore via undo" {
+    // undo/redo live on document.zig (Document.pushPaintOp/undoOne).
     const gpa = std.testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
@@ -282,9 +282,9 @@ test "clearRectCmd: 領域を透明化し undo で復元" {
     px[2 * 4 + 2] = D;
     const before = [_]u32{ 0, 0, 0, 0, 0, A, 0, 0, 0, 0, D, 0, 0, 0, 0, 0 };
     try std.testing.expectEqualSlices(u32, &before, px);
-    // 初回コミット（grid が null→cel化。created=true）を先に確定しておく。これをしないと
-    // 直後の clearRectCmd の undo が「created フラグの初回paint」扱いになり、grid が null に
-    // 戻って透明（全0）へ復元されてしまう（意図通りの厳密挙動。plan §14 v6/5.4節）。
+    // Commit the first write first (grid null→cel; created=true). Without this,
+    // undoing the following clearRectCmd is treated as the "first paint with created flag" and grid goes back to null,
+    // restoring full transparent (all 0) — the intended strict behavior.
     const initial_diffs = try gpa.dupe(PixelDiff, &.{
         .{ .idx = 5, .before = 0, .after = A },
         .{ .idx = 10, .before = 0, .after = D },
@@ -299,12 +299,12 @@ test "clearRectCmd: 領域を透明化し undo で復元" {
     try std.testing.expectEqualSlices(u32, &before, px);
 }
 
-test "pasteCmd: 指定座標へ上書き（gate 非経由）/ clip / undo" {
+test "pasteCmd: overwrite at given coords (bypasses gate) / clip / undo" {
     const gpa = std.testing.allocator;
     var doc = try Document.init(gpa, 4, 4);
     defer doc.deinit();
     const c = doc.activeCanvas();
-    // selection を張っていても paste は gate をバイパスして書ける（選択外 (1,1) 起点へ）
+    // Even with a selection set, paste bypasses the gate and can write (starting outside at (1,1))
     c.setSelection(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
     var block = PixelBlock{ .w = 2, .h = 2, .pixels = try gpa.dupe(u32, &[_]u32{ A, B, C, D }) };
     defer block.deinit(gpa);
@@ -320,7 +320,7 @@ test "pasteCmd: 指定座標へ上書き（gate 非経由）/ clip / undo" {
     doc.undoOne(gpa);
     for (px) |p| try std.testing.expectEqual(@as(u32, 0), p);
 
-    // canvas 端へ clip（(3,3) 起点は A の 1px のみ収まる）
+    // Clip to canvas edge ((3,3) start fits only 1px of A)
     const pd2 = pasteCmd(gpa, c, 0, block, 3, 3, .replace) orelse return error.TestUnexpectedNull;
     defer gpa.free(pd2.diffs);
     try std.testing.expectEqual(A, px[3 * 4 + 3]);
@@ -331,10 +331,10 @@ test "pasteCmd: 指定座標へ上書き（gate 非経由）/ clip / undo" {
     try std.testing.expectEqual(@as(usize, 1), n);
 }
 
-test "pasteCmd over: 透明部は配置先を残す（replace は消す）" {
+test "pasteCmd over: transparent regions keep destination (replace clears them)" {
     const gpa = std.testing.allocator;
-    const X: u32 = 0xFF0000FF; // 配置先の既存色
-    // block: 左上のみ不透明 A、他は透明。配置先 (1,1)=X。
+    const X: u32 = 0xFF0000FF; // Existing color at the destination
+    // block: opaque A at top-left only; rest transparent. Destination (1,1)=X.
     {
         var c = try Canvas.init(gpa, 4, 4);
         defer c.deinit();
@@ -343,10 +343,10 @@ test "pasteCmd over: 透明部は配置先を残す（replace は消す）" {
         defer block.deinit(gpa);
         const cmd = pasteCmd(gpa, &c, 0, block, 0, 0, .over) orelse return error.TestUnexpectedNull;
         defer gpa.free(cmd.diffs);
-        try std.testing.expectEqual(A, c.layerPixels(0)[0]); // 不透明部は配置
-        try std.testing.expectEqual(X, c.layerPixels(0)[1 * 4 + 1]); // 透明部の下の X は残る
+        try std.testing.expectEqual(A, c.layerPixels(0)[0]); // Opaque part is placed
+        try std.testing.expectEqual(X, c.layerPixels(0)[1 * 4 + 1]); // X under the transparent part remains
     }
-    { // replace は透明部が X を消す
+    { // replace: transparent part clears X
         var c = try Canvas.init(gpa, 4, 4);
         defer c.deinit();
         c.layerPixels(0)[1 * 4 + 1] = X;
@@ -354,24 +354,24 @@ test "pasteCmd over: 透明部は配置先を残す（replace は消す）" {
         defer block.deinit(gpa);
         const cmd = pasteCmd(gpa, &c, 0, block, 0, 0, .replace) orelse return error.TestUnexpectedNull;
         defer gpa.free(cmd.diffs);
-        try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[1 * 4 + 1]); // X は消える
+        try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[1 * 4 + 1]); // X is cleared
     }
 }
 
-// ── フローティング選択ヘルパ（TASK-44 ⑦）─────────────────────
+// ── Floating-selection helpers ─────────────────────
 
-test "clearRectInBuf: 矩形領域を 0 クリア" {
+test "clearRectInBuf: clear rect region to 0" {
     const gpa = std.testing.allocator;
     const buf = try gpa.alloc(u32, 16);
     defer gpa.free(buf);
     @memset(buf, 0xFFFFFFFF);
     clearRectInBuf(buf, .{ .x = 1, .y = 1, .w = 2, .h = 2 }, 4);
     for ([_]usize{ 5, 6, 9, 10 }) |i| try std.testing.expectEqual(@as(u32, 0), buf[i]);
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), buf[0]); // 範囲外は不変
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), buf[0]); // Outside the rect is unchanged
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), buf[7]);
 }
 
-test "renderBlockOverBase: replace=上書き / over=透明部は base を残す / canvas 外は clip" {
+test "renderBlockOverBase: replace=overwrite / over=transparent keeps base / clip outside canvas" {
     const gpa = std.testing.allocator;
     const X: u32 = 0xFF0000FF;
     const base = try gpa.alloc(u32, 16);
@@ -379,25 +379,25 @@ test "renderBlockOverBase: replace=上書き / over=透明部は base を残す 
     const dst = try gpa.alloc(u32, 16);
     defer gpa.free(dst);
     @memset(base, 0);
-    base[1 * 4 + 1] = X; // (1,1) に既存色
+    base[1 * 4 + 1] = X; // Existing color at (1,1)
     var block = PixelBlock{ .w = 2, .h = 2, .pixels = try gpa.dupe(u32, &[_]u32{ A, 0, 0, 0 }) };
     defer block.deinit(gpa);
 
-    // over: block を (0,0) へ → (0,0)=A、(1,1) は透明部の下で base の X が残る
+    // over: place block at (0,0) → (0,0)=A; (1,1) keeps base X under the transparent part
     renderBlockOverBase(dst, base, block, 0, 0, .over, 4, 4);
     try std.testing.expectEqual(A, dst[0]);
     try std.testing.expectEqual(X, dst[1 * 4 + 1]);
-    // replace: (1,1) は block の透明で上書きされ 0
+    // replace: (1,1) overwritten to 0 by the block's transparent pixel
     renderBlockOverBase(dst, base, block, 0, 0, .replace, 4, 4);
     try std.testing.expectEqual(A, dst[0]);
     try std.testing.expectEqual(@as(u32, 0), dst[1 * 4 + 1]);
-    // canvas 外 clip: (3,3) 起点は A の 1px のみ。base は復元される
+    // Clip outside canvas: (3,3) start fits only 1px of A. base is restored
     renderBlockOverBase(dst, base, block, 3, 3, .replace, 4, 4);
     try std.testing.expectEqual(A, dst[3 * 4 + 3]);
-    try std.testing.expectEqual(X, dst[1 * 4 + 1]); // base の X（block 範囲外）
+    try std.testing.expectEqual(X, dst[1 * 4 + 1]); // base's X (outside the block)
 }
 
-test "layerMatchesRender: 一致/不一致（外部編集検知）" {
+test "layerMatchesRender: match/mismatch (detect external edits)" {
     const gpa = std.testing.allocator;
     const base = try gpa.alloc(u32, 16);
     defer gpa.free(base);
@@ -409,17 +409,17 @@ test "layerMatchesRender: 一致/不一致（外部編集検知）" {
     // layer = base + block@(1,1) over
     renderBlockOverBase(layer, base, block, 1, 1, .over, 4, 4);
     try std.testing.expect(layerMatchesRender(layer, base, block, 1, 1, .over, 4, 4));
-    // 1px 改変すると不一致（外部編集相当）
+    // Changing 1px makes them differ (external-edit equivalent)
     layer[0] = 0xFF123456;
     try std.testing.expect(!layerMatchesRender(layer, base, block, 1, 1, .over, 4, 4));
 }
 
-test "diffCmd: 差分のみ paint cmd 化 / 無変更は null" {
+test "diffCmd: only diffs become a paint cmd / unchanged is null" {
     const gpa = std.testing.allocator;
     const before = [_]u32{ 0, A, 0, 0 };
     const after = [_]u32{ 0, B, C, 0 };
     const cmd = diffCmd(gpa, &before, &after, 0) orelse return error.TestUnexpectedNull;
     defer gpa.free(cmd.diffs);
     try std.testing.expectEqual(@as(usize, 2), cmd.diffs.len); // idx1(A→B), idx2(0→C)
-    try std.testing.expect(diffCmd(gpa, &before, &before, 0) == null); // 無変更
+    try std.testing.expect(diffCmd(gpa, &before, &before, 0) == null); // Unchanged
 }
