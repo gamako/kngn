@@ -1,61 +1,61 @@
-//! libs/modular: モジュラー・グラフエンジンの信号規約（leaf。dsp も graph も import しない）。
+//! libs/modular: signal conventions for the modular graph engine (a leaf; imports neither dsp nor graph).
 //!
-//! 全信号は f32 だが「意味」を固定する（docs/plans/modular-synth-plan.md §4.1）:
-//!   - audio  : 概ね -1..1（瞬間的超過は可。最終 Output で管理）
-//!   - cv     : 既定 unipolar 0..1。bipolar(-1..1) は使う側で明示
-//!   - gate   : 0/1。しきい値 gate_threshold(0.5) で high 判定
-//!   - trigger: gate が 0.5 を上向きにまたぐ立ち上がり
-//!   - pitch  : pitch_cv（1.0/oct, 0 = 基準音 pitch_base_hz）。Hz 変換は VCO/Quantizer 境界に閉じ込める
+//! Every signal is f32, but its meaning is fixed (see docs/modular.md):
+//!   - audio  : roughly -1..1 (brief overshoot is allowed; managed at the final Output)
+//!   - cv     : unipolar 0..1 by default; bipolar (-1..1) must be stated by the consumer
+//!   - gate   : 0/1. High when at or above gate_threshold (0.5)
+//!   - trigger: rising edge when gate crosses 0.5 upward
+//!   - pitch  : pitch_cv (1.0/oct, 0 = reference pitch_base_hz). Hz conversion is confined to the VCO/Quantizer boundary
 
 const std = @import("std");
 
-/// ポート種別。connect 時に同種のみ接続を許す。
+/// Port kind. connect allows same-kind connections only.
 pub const PortKind = enum { audio, cv, gate };
 
-/// 1 モジュールあたりの入力 / 出力ポート上限（固定確保のため comptime 定数）。
+/// Per-module input / output port caps (comptime constants for fixed allocation).
 pub const MAX_IN: usize = 8;
 pub const MAX_OUT: usize = 4;
 
-/// gate を high と判定するしきい値。
+/// Threshold at which a gate is considered high.
 pub const gate_threshold: f32 = 0.5;
 
-/// pitch_cv の基準音（0 = C4 ≒ middle C）。
+/// Reference pitch for pitch_cv (0 = C4 ≈ middle C).
 pub const pitch_base_hz: f32 = 261.625565;
 
-/// pitch_cv(1.0/oct) を Hz へ変換する。Hz をグラフ全体に流さないための境界関数。
+/// Convert pitch_cv (1.0/oct) to Hz. Boundary function so Hz does not flow through the graph.
 pub inline fn pitchToHz(base_hz: f32, pitch_cv: f32) f32 {
     return base_hz * @exp2(pitch_cv);
 }
 
-/// gate 値が high か。
+/// Whether a gate value is high.
 pub inline fn gateHigh(v: f32) bool {
     return v >= gate_threshold;
 }
 
-/// モジュールの process が 1 サンプル分の入出力にアクセスするためのビュー。
-/// inputs / connected / outputs はグラフが用意した一時スライス（process 内で保持しない）。
+/// View through which a module's process accesses one sample of I/O.
+/// inputs / connected / outputs are temporary slices provided by the graph (do not retain them across process).
 pub const Io = struct {
-    /// 各入力ポートの値（未接続は 0）。長さ = 入力ポート数。
+    /// Value of each input port (0 if unconnected). Length = number of input ports.
     inputs: []const f32,
-    /// 各入力ポートが接続されているか（CV 未接続時に param へフォールバックする判定用）。
+    /// Whether each input port is connected (used to fall back to a param when a CV is unconnected).
     connected: []const bool,
-    /// 各出力ポートの書き込み先。長さ = 出力ポート数。
+    /// Write destination for each output port. Length = number of output ports.
     outputs: []f32,
-    /// 実効サンプルレート（Hz）。
+    /// Effective sample rate (Hz).
     sample_rate: f32,
 };
 
-/// モジュールの vtable。process（毎サンプル・軽量）と updateParams（ブロック先頭・係数再計算）を分離する
-/// （重い tan() 等を毎サンプル走らせない。§4.1）。
+/// Module vtable. Separates process (per-sample, lightweight) from updateParams (block head, coefficient recompute)
+/// (do not run heavy tan() and similar per sample).
 pub const VTable = struct {
     process: *const fn (ctx: *anyopaque, io: *Io) void,
     updateParams: *const fn (ctx: *anyopaque, sample_rate: f32) void,
 };
 
-/// updateParams を持たないモジュール用の no-op。
+/// no-op for modules that do not implement updateParams.
 pub fn noopUpdate(_: *anyopaque, _: f32) void {}
 
-/// addModule に渡すモジュール記述。ctx は具体モジュール構造体へのポインタ（caller が生存所有）。
+/// Module descriptor passed to addModule. ctx is a pointer to the concrete module struct (caller owns its lifetime).
 pub const NodeSpec = struct {
     vtable: *const VTable,
     ctx: *anyopaque,

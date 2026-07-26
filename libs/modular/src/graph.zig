@@ -1,10 +1,10 @@
-//! libs/modular: グラフエンジン本体（signal のみに依存。modules は import しない＝generic）。
+//! libs/modular: the graph engine (depends only on signal; does not import modules = generic).
 //!
-//! - 全要素を起動時に1回固定確保（init / finalize）。process 経路に alloc/lock/IO なし（RT 安全）。
-//! - per-sample 処理（毎サンプル全モジュールを topo 順に評価）。clock/trigger をサンプル精度に保つ。
-//! - 入力ポートは単一接続のみ。合算は Mixer 明示（AC#2）。
-//! - サイクル辺は build 時に delayed として明示化し「前サンプル値」を読む（初期 0・全 process 完了後に確定。AC#5）。
-//! - 内部 mono。Output ノードの L/R を master 出力として interleaved stereo へ書く（AC#7）。
+//! - Fixed allocation of every element once at startup (init / finalize). No alloc/lock/IO on the process path (RT-safe).
+//! - Per-sample processing (every sample evaluates all modules in topo order). Keeps clock/trigger sample-accurate.
+//! - Input ports accept a single connection only. Summing is done by an explicit Mixer.
+//! - Cycle edges are marked delayed at build time and read the previous-sample value (initially 0; settled after all process calls for the sample finish).
+//! - Internally mono. The Output node's L/R are written as the master output into interleaved stereo.
 
 const std = @import("std");
 const signal = @import("signal.zig");
@@ -13,11 +13,11 @@ const graph_core = @import("graph_core.zig");
 const PortKind = signal.PortKind;
 const ProcNode = graph_core.ProcNode;
 
-/// グラフの固定確保サイズ。
+/// Fixed-allocation size for the graph.
 pub const Caps = struct {
-    /// モジュール数の上限。
+    /// Upper bound on the number of modules.
     max_modules: usize,
-    /// 出力ポート総数の上限（= signal バッファ長）。
+    /// Upper bound on the total number of output ports (= signal buffer length).
     max_ports: usize,
 };
 
@@ -30,11 +30,11 @@ const Node = struct {
     n_out: u8,
     in_kinds: [signal.MAX_IN]PortKind = undefined,
     out_kinds: [signal.MAX_OUT]PortKind = undefined,
-    /// この node の出力ポートが signal バッファで占める先頭 index。
+    /// Start index of this node's output ports in the signal buffer.
     out_base: u32,
-    /// 各入力ポートの接続元グローバル出力ポート id（未接続 = -1）。
+    /// Global output-port id feeding each input port (unconnected = -1).
     in_src: [signal.MAX_IN]i32 = [_]i32{-1} ** signal.MAX_IN,
-    /// 各入力ポートがサイクル遅延辺か（前サンプル値を読む）。
+    /// Whether each input port is a cycle-delay edge (reads the previous sample).
     in_delayed: [signal.MAX_IN]bool = [_]bool{false} ** signal.MAX_IN,
 };
 
@@ -45,16 +45,16 @@ pub const Graph = struct {
     nodes: []Node,
     node_count: usize = 0,
 
-    /// グローバル出力ポート id -> 所有 node index（topo の依存解決に使う）。
+    /// Global output-port id -> owning node index (used for topo dependency resolution).
     port_owner: []u32,
-    /// finalize で決まる処理順（依存が先、長さ = node_count）。
+    /// Processing order fixed by finalize (dependencies first; length = node_count).
     order: []usize,
-    /// finalize で order 順に焼く ProcNode 列（graph_core が回す共有形式。View を焼く相当）。
+    /// ProcNode sequence baked in order by finalize (shared form driven by graph_core; equivalent to baking a View).
     order_nodes: []ProcNode,
-    /// topo sort 用 DFS scratch（init で 1 回確保し finalize で使い回す＝per-finalize alloc をゼロに）。
+    /// DFS scratch for topo sort (allocated once in init and reused in finalize = zero per-finalize alloc).
     colors: []Color,
 
-    // signal バッファ ping-pong（cur = 今サンプル, prev = 前サンプル）。出力ポート単位。
+    // Signal-buffer ping-pong (cur = current sample, prev = previous sample). Per output port.
     sig_a: []f32,
     sig_b: []f32,
     cur: []f32,
@@ -118,7 +118,7 @@ pub const Graph = struct {
         self.* = undefined;
     }
 
-    /// モジュールを追加し node index を返す。出力ポートを signal バッファへ割り当てる。
+    /// Add a module and return its node index. Allocates its output ports in the signal buffer.
     pub fn addModule(self: *Graph, spec: signal.NodeSpec) Error!usize {
         if (self.node_count >= self.nodes.len) return Error.TooManyModules;
         if (spec.in_kinds.len > signal.MAX_IN) return Error.TooManyInputs;
@@ -146,8 +146,8 @@ pub const Graph = struct {
         return idx;
     }
 
-    /// src_node の出力 src_out を dst_node の入力 dst_in に接続する。
-    /// 入力ポートは単一接続のみ（既接続はエラー）。種別は一致必須。
+    /// Connect output src_out of src_node to input dst_in of dst_node.
+    /// Input ports accept a single connection only (already connected is an error). Port kinds must match.
     pub fn connect(self: *Graph, src_node: usize, src_out: usize, dst_node: usize, dst_in: usize) Error!void {
         if (src_node >= self.node_count or dst_node >= self.node_count) return Error.BadNodeIndex;
         const s = &self.nodes[src_node];
@@ -159,32 +159,32 @@ pub const Graph = struct {
         self.finalized = false;
     }
 
-    /// master 出力ノードを指定する（その out0/out1 を L/R として読む）。
+    /// Set the master output node (its out0/out1 are read as L/R).
     pub fn setOutputNode(self: *Graph, idx: usize) void {
         self.output_node = idx;
     }
 
-    /// 処理順（topo）とサイクル遅延辺を確定する。process 前に1回呼ぶ。
-    /// per-finalize の alloc はしない（colors は init 済み field を使い回す＝RT ゼロアロケーション方針）。
+    /// Fix the processing order (topo) and cycle-delay edges. Call once before process.
+    /// Does not allocate per finalize (reuses the colors field allocated in init = RT zero-allocation policy).
     pub fn finalize(self: *Graph) Error!void {
         const colors = self.colors[0..self.node_count];
         @memset(colors, .unvisited);
-        // 遅延辺フラグはやり直しに備えクリア（再 finalize 対応）。
+        // Clear delay-edge flags so a re-finalize starts clean.
         for (self.nodes[0..self.node_count]) |*n| n.in_delayed = [_]bool{false} ** signal.MAX_IN;
 
         var order_len: usize = 0;
-        // ルートを slot index 昇順に DFS（接続順非依存の安定順序）。
+        // DFS roots in ascending slot-index order (stable order independent of connect order).
         for (0..self.node_count) |u| {
             if (colors[u] == .unvisited) self.dfs(u, colors, &order_len);
         }
         std.debug.assert(order_len == self.node_count);
 
-        // master 出力ノードの妥当性を非 RT 側でここで検証（RT process では panic させない）。
+        // Validate the master output node here on the non-RT side (do not panic in RT process).
         if (self.output_node) |on| {
             if (on >= self.node_count or self.nodes[on].n_out < 1) return Error.BadNodeIndex;
         }
 
-        // order 順に ProcNode を焼く（graph_core が回す共有形式。in_delayed は dfs で確定済み）。
+        // Bake ProcNodes in order (shared form driven by graph_core; in_delayed is already fixed by dfs).
         for (self.order[0..self.node_count], 0..) |ni, k| {
             const nd = &self.nodes[ni];
             self.order_nodes[k] = .{
@@ -198,7 +198,7 @@ pub const Graph = struct {
             };
         }
 
-        // signal バッファを初期化（遅延辺の初期値 0）。
+        // Initialise the signal buffers (delay edges start at 0).
         @memset(self.sig_a, 0);
         @memset(self.sig_b, 0);
         self.cur = self.sig_a;
@@ -206,7 +206,7 @@ pub const Graph = struct {
         self.finalized = true;
     }
 
-    /// DFS（依存を先に積む）。visiting 中の依存先＝back edge を遅延辺として印付ける。
+    /// DFS (push dependencies first). A dependency still visiting = a back edge, marked as a delay edge.
     fn dfs(self: *Graph, u: usize, colors: []Color, order_len: *usize) void {
         colors[u] = .visiting;
         const node = &self.nodes[u];
@@ -216,12 +216,12 @@ pub const Graph = struct {
             if (s < 0) continue;
             const v: usize = self.port_owner[@intCast(s)];
             if (v == u) {
-                node.in_delayed[i] = true; // self-loop は遅延
+                node.in_delayed[i] = true; // A self-loop is a delay
                 continue;
             }
             switch (colors[v]) {
                 .unvisited => self.dfs(v, colors, order_len),
-                .visiting => node.in_delayed[i] = true, // back edge → 遅延
+                .visiting => node.in_delayed[i] = true, // back edge -> delay
                 .done => {},
             }
         }
@@ -230,15 +230,15 @@ pub const Graph = struct {
         order_len.* += 1;
     }
 
-    /// interleaved 出力へ `frames` サンプル書き込む。渡された frames/channels を正として処理する（AC#9）。
-    /// channels==1 は (L+R)/2、>=2 は L/R を書き残りを 0。
-    /// RT callback から呼べるよう panic/OOB を出さない: 未 finalize / channels==0 は no-op（ゼロ埋め）、
-    /// frames は buf 容量に clamp する（不正は finalize で弾く前提＝非 RT 側で検証済み）。
-    /// per-sample 評価は graph_core（静的/動的共有カーネル）へ委譲。
-    /// master 出力は self.output_node から毎 block ライブ解決する（finalize 後の setOutputNode も効く＝挙動不変）。
+    /// Write `frames` samples into the interleaved output. Treat the given frames/channels as authoritative.
+    /// channels==1 writes (L+R)/2; >=2 writes L/R and zeros the rest.
+    /// Callable from an RT callback with no panic/OOB: unfinalised / channels==0 is a no-op (zero-fill),
+    /// and frames is clamped to the buf capacity (invalid state is rejected in finalize = verified on the non-RT side).
+    /// Per-sample evaluation is delegated to graph_core (the shared static/dynamic kernel).
+    /// The master output is resolved live from self.output_node every block (setOutputNode after finalize still takes effect = behaviour unchanged).
     pub fn processBlock(self: *Graph, buf: []f32, frames: u32, channels: u32) void {
         if (!self.finalized or channels == 0) {
-            @memset(buf, 0); // RT で stale バッファを鳴らさない
+            @memset(buf, 0); // Do not play a stale buffer on the RT path
             return;
         }
         const out_sel: ?graph_core.OutputSel = if (self.output_node) |on|
@@ -257,7 +257,7 @@ pub const Graph = struct {
         );
     }
 
-    // --- テスト用イントロスペクション ---
+    // --- Test introspection ---
     pub fn isDelayed(self: *const Graph, node: usize, in_port: usize) bool {
         return self.nodes[node].in_delayed[in_port];
     }
