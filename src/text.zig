@@ -1,20 +1,20 @@
-// BDF (Glyph Bitmap Distribution Format) ベースのビットマップフォント描画
+// Bitmap font drawing based on BDF (Glyph Bitmap Distribution Format)
 //
-// 仕様参照: Adobe Glyph Bitmap Distribution Format (BDF) Specification, Version 2.2
+// Spec reference: Adobe Glyph Bitmap Distribution Format (BDF) Specification, Version 2.2
 //   https://adobe-type-tools.github.io/font-tech-notes/pdfs/5005.BDF_Spec.pdf
 //   (Adobe Tech Note #5005, 1993-03-22)
-//   特に Section 3.1/3.2 (キーワード一覧) と Section 4 Figure 2 (BBX/BITMAP の幾何)
+//   Especially Section 3.1/3.2 (keyword list) and Section 4 Figure 2 (BBX/BITMAP geometry)
 //
-// 設計概要:
-//   - ASCII 横書きフォント (writing direction 0) のみサポート
-//   - 縦書き関連キーワード (METRICSSET, SWIDTH1, DWIDTH1, VVECTOR) は無視
-//   - PROPERTIES ブロックは丸ごとスキップ (FONT_ASCENT 等は読まない)
-//   - ascent は FONTBOUNDINGBOX から導出: ascent = bbox_height + bbox_y_offset
-//   - 不透明色のみ (fg_color の alpha はそのまま使われる前提)
-//   - 描画は共通 Font インターフェース（libs/font）の drawTo/measure/metrics 経由（TASK-25.14）。
-//     立ちビットをカバレッジ 255 として blend し、col で tint・clip する
-//     （clip はグリフ矩形単位で clipCoverage により 1 回ホイスト。TASK-58）。
-//     1 行ラン専用（\n/\t 非対応＝行レイアウトは呼び出し側責務）。
+// Design summary:
+//   - ASCII horizontal fonts (writing direction 0) only
+//   - Vertical-writing keywords (METRICSSET, SWIDTH1, DWIDTH1, VVECTOR) are ignored
+//   - The PROPERTIES block is skipped entirely (FONT_ASCENT etc. are not read)
+//   - ascent is derived from FONTBOUNDINGBOX: ascent = bbox_height + bbox_y_offset
+//   - Opaque colour only (fg_color alpha is used as-is)
+//   - Drawing goes through the shared Font interface (libs/font) drawTo/measure/metrics.
+//     Set bits are coverage 255, then blend with col for tint and clip
+//     (clip is hoisted once per glyph rect via clipCoverage).
+//     Single-line runs only (LF/TAB unsupported = line layout is the caller's job).
 
 const std = @import("std");
 const fontmod = @import("font");
@@ -28,17 +28,17 @@ const Color = fontmod.Color;
 pub const Glyph = struct {
     width: u32,
     height: u32,
-    x_offset: i32, // BBX の x オフセット (left-side bearing、signed)
-    y_offset: i32, // BBX の y オフセット (baseline 基準・上向き正、signed)
-    advance: u32, // DWIDTH の x 成分
-    bitmap: []const u8, // height 行 × ((width+7)/8) byte (MSB-first)、bitmap_storage の slice
+    x_offset: i32, // BBX x offset (left-side bearing, signed)
+    y_offset: i32, // BBX y offset (relative to baseline, positive upward, signed)
+    advance: u32, // DWIDTH x component
+    bitmap: []const u8, // height rows x ((width+7)/8) bytes (MSB-first), a slice of bitmap_storage
 };
 
 pub const BitmapFont = struct {
     glyphs: std.AutoHashMapUnmanaged(u32, Glyph),
     bitmap_storage: []u8,
-    ascent: u32, // FONTBOUNDINGBOX から導出 (= bbox_height + bbox_y_offset)
-    line_height: u32, // 改行 advance (FONTBOUNDINGBOX 高さ)
+    ascent: u32, // Derived from FONTBOUNDINGBOX (= bbox_height + bbox_y_offset)
+    line_height: u32, // Line-break advance (FONTBOUNDINGBOX height)
 
     pub fn initFromBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont {
         return parseBdf(allocator, data);
@@ -49,15 +49,15 @@ pub const BitmapFont = struct {
         allocator.free(self.bitmap_storage);
     }
 
-    /// codepoint に対応する glyph を返す。無ければ null
+    /// Return the glyph for a codepoint, or null if missing
     pub fn lookup(self: *const BitmapFont, codepoint: u32) ?Glyph {
         return self.glyphs.get(codepoint);
     }
 
-    // ── 共通 Font インターフェース（TASK-25.14） ──
+    // ── Shared Font interface ──
     const vtable: Font.VTable = .{ .measure = measureImpl, .drawTo = drawToImpl, .metrics = metricsImpl };
 
-    /// mutable でなくてよい（borrowed view）。BitmapFont は size-baked＝FontFace/SizedFont 一体。
+    /// Need not be mutable (borrowed view). BitmapFont is size-baked = FontFace/SizedFont in one.
     pub fn asFont(self: *const BitmapFont) Font {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -76,19 +76,19 @@ pub const BitmapFont = struct {
     }
 
     pub fn metrics(self: BitmapFont) Metrics {
-        // ascent は不変条件（0<=ascent<=line_height）のため clamp。実 BDF は ascent<=line_height で無効。
+        // Clamp ascent for the invariant (0<=ascent<=line_height). Real BDFs with ascent>line_height are invalid.
         const a: i32 = @intCast(@min(self.ascent, self.line_height));
         const descent: u32 = self.line_height - @as(u32, @intCast(a));
         return .{ .line_height = self.line_height, .ascent = a, .descent = @intCast(descent) };
     }
 
-    /// 欠落グリフの既定送り幅: space の advance、無ければ line_height/2。measure/drawTo で同一規約。
+    /// Default advance for a missing glyph: space's advance, else line_height/2. Same rule in measure/drawTo.
     fn defaultAdvance(self: BitmapFont) u32 {
         if (self.lookup(' ')) |sp| return sp.advance;
         return self.line_height / 2;
     }
 
-    /// logical advance 幅の合計（saturating）。1 行ラン（\n/\t も通常 codepoint 扱い＝欠落 advance）。
+    /// Sum of logical advance widths (saturating). Single-line run (LF/TAB count as ordinary codepoints = missing advance).
     pub fn measure(self: BitmapFont, text_str: []const u8) u32 {
         const def = self.defaultAdvance();
         var total: u32 = 0;
@@ -103,7 +103,7 @@ pub const BitmapFont = struct {
         return total;
     }
 
-    /// scale は受け取るが BDF ランタイム bitmap は今回再スケールしない。
+    /// scale is accepted but the BDF runtime bitmap is not rescaled.
     pub fn drawTo(self: BitmapFont, target: RenderTarget, pos: Vec2, text_str: []const u8, col: Color, clip: Rect, scale: f32) void {
         _ = scale;
         const def = self.defaultAdvance();
@@ -117,23 +117,23 @@ pub const BitmapFont = struct {
         }
     }
 
-    /// 1 codepoint を描画し次の pen_x（飽和加算）を返す。欠落グリフは描画 skip・advance=def。
+    /// Draw one codepoint and return the next pen_x (saturating add). Missing glyphs skip drawing; advance=def.
     fn drawCodepoint(self: BitmapFont, target: RenderTarget, cp: u32, cx: i32, pos_y: i32, ascent: i32, col: Color, clip: Rect, def: u32) i32 {
         const g = self.lookup(cp) orelse return cx +| advI32(def);
         if (g.width == 0 or g.height == 0) return cx +| advI32(g.advance);
-        // baseline = pos.y + ascent、glyph top = baseline - (height + y_offset)（旧 drawGlyph と同式）
+        // baseline = pos.y + ascent, glyph top = baseline - (height + y_offset) (same formula as drawGlyph)
         const baseline: i32 = pos_y +| ascent;
         const dst_x0: i32 = cx +| g.x_offset;
         const dst_y0: i32 = baseline -| @as(i32, @intCast(g.height)) -| g.y_offset;
-        // 毎フレーム（テキスト描画）走るホットパス。グリフ矩形の clip はループ外 1 回
-        // （clipCoverage）、内側は無検査で立ちビットを blend（TASK-58）。
+        // Hot path that runs every frame (text drawing). Clip the glyph rect once outside the loop
+        // (clipCoverage); inside, blend set bits with no bounds checks.
         const row_bytes: u32 = (g.width + 7) / 8;
         const cc = fontmod.clipCoverage(target, dst_x0, dst_y0, g.width, g.height, clip) orelse
             return cx +| advI32(g.advance);
         var py = cc.cy0;
         while (py < cc.cy1) : (py += 1) {
             const row_start: usize = @as(usize, py) * row_bytes;
-            // clipCoverage の保証により dst_y0+py / dst_x0+px は非負かつ target 内
+            // clipCoverage guarantees dst_y0+py / dst_x0+px are non-negative and inside target
             const ty: u32 = @intCast(dst_y0 + @as(i32, @intCast(py)));
             const dst_base = ty * target.width;
             var px = cc.cx0;
@@ -143,7 +143,7 @@ pub const BitmapFont = struct {
                 if ((g.bitmap[row_start + byte_idx] >> bit_idx) & 1 == 0) continue;
                 const tx: u32 = @intCast(dst_x0 + @as(i32, @intCast(px)));
                 const idx = dst_base + tx;
-                // 立ちビット = カバレッジ 255（実効 α = col.a）
+                // Set bit = coverage 255 (effective alpha = col.a)
                 const dst: Color = @bitCast(target.pixels[idx]);
                 target.pixels[idx] = @bitCast(Color.blend(dst, col));
             }
@@ -152,7 +152,7 @@ pub const BitmapFont = struct {
     }
 };
 
-/// u32 advance を i32 へ（飽和加算の右辺用に maxInt(i32) へ clamp）。
+/// Convert u32 advance to i32 (clamp to maxInt(i32) for the right-hand side of a saturating add).
 fn advI32(a: u32) i32 {
     return @intCast(@min(a, @as(u32, std.math.maxInt(i32))));
 }
@@ -199,7 +199,7 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
     var saw_startfont = false;
     var saw_endfont = false;
 
-    // 現在パース中の glyph
+    // Glyph currently being parsed
     var cur_codepoint: ?u32 = null;
     var cur_width: u32 = 0;
     var cur_height: u32 = 0;
@@ -208,7 +208,7 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
     var cur_advance: u32 = 0;
     var cur_bitmap_offset: usize = 0;
     var cur_bitmap_rows_remaining: u32 = 0;
-    var cur_skip: bool = false; // ENCODING -1 の場合 true
+    var cur_skip: bool = false; // true when ENCODING is -1
     var saw_encoding = false;
     var saw_dwidth = false;
     var saw_bbx = false;
@@ -255,7 +255,7 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
                 }
                 // CHARS / FONT / SIZE / COMMENT / CONTENTVERSION /
                 // METRICSSET / SWIDTH / DWIDTH / SWIDTH1 / DWIDTH1 / VVECTOR /
-                // その他 は無視
+                // Everything else is ignored
             },
             .InProperties => {
                 if (eql(firstToken(line), "ENDPROPERTIES")) {
@@ -273,7 +273,7 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
                         cur_skip = true;
                         cur_codepoint = null;
                     } else if (v < 0) {
-                        return error.InvalidBdf; // 仕様外: -1 以外の負値は不正
+                        return error.InvalidBdf; // Out of spec: any negative other than -1 is invalid
                     } else {
                         const cp: u32 = @intCast(v);
                         if (ctx.seen_codepoints.get(cp) != null) {
@@ -298,10 +298,10 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
                     cur_y_offset = parseTokenI32(&it) catch return error.InvalidBdf;
                     saw_bbx = true;
                 } else if (eql(kw, "BITMAP")) {
-                    // BITMAP より前に ENCODING / DWIDTH / BBX が出現していること
+                    // ENCODING / DWIDTH / BBX must appear before BITMAP
                     if (!saw_encoding or !saw_dwidth or !saw_bbx) return error.InvalidBdf;
                     if (cur_skip) {
-                        // skip mode: BITMAP 行は読み飛ばすため、行数だけ追跡
+                        // skip mode: skip BITMAP rows, only track the row count
                         cur_bitmap_rows_remaining = cur_height;
                     } else {
                         cur_bitmap_offset = ctx.storage.items.len;
@@ -310,7 +310,7 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
                     saw_bitmap = true;
                     state = .InBitmap;
                 } else if (eql(kw, "ENDCHAR")) {
-                    // ENCODING/DWIDTH/BBX/BITMAP の必須項目検証 (skip 中の glyph も BBX/BITMAP は要る)
+                    // Validate required ENCODING/DWIDTH/BBX/BITMAP (even a skipped glyph still needs BBX/BITMAP)
                     if (!saw_encoding or !saw_dwidth or !saw_bbx or !saw_bitmap) {
                         return error.InvalidBdf;
                     }
@@ -338,7 +338,7 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
                     cur_bitmap_rows_remaining -= 1;
                     if (cur_skip) continue;
                     const row_bytes: usize = (cur_width + 7) / 8;
-                    if (line.len != row_bytes * 2) return error.InvalidBdf; // 仕様: 必要バイト数ちょうどに右側 0 padding
+                    if (line.len != row_bytes * 2) return error.InvalidBdf; // Spec: exact required byte count with right-side zero padding
                     var i: usize = 0;
                     while (i < row_bytes) : (i += 1) {
                         const byte = std.fmt.parseInt(u8, line[i * 2 .. i * 2 + 2], 16) catch return error.InvalidBdf;
@@ -350,17 +350,17 @@ fn parseBdf(allocator: std.mem.Allocator, data: []const u8) LoadError!BitmapFont
     }
 
     if (!saw_startfont) return error.InvalidBdf;
-    if (!saw_endfont) return error.InvalidBdf; // ENDFONT 欠落 = 切れたファイル
-    if (state != .TopLevel) return error.InvalidBdf; // ENDCHAR / ENDPROPERTIES 欠落
+    if (!saw_endfont) return error.InvalidBdf; // Missing ENDFONT = truncated file
+    if (state != .TopLevel) return error.InvalidBdf; // Missing ENDCHAR / ENDPROPERTIES
     if (bbox_height == null or bbox_y_offset == null) return error.InvalidBdf;
 
-    // ascent = bbox_height + bbox_y_offset (bbox_y_offset は通常負値)
+    // ascent = bbox_height + bbox_y_offset (bbox_y_offset is usually negative)
     const h_i32: i32 = @intCast(bbox_height.?);
     const ascent_i32: i32 = h_i32 + bbox_y_offset.?;
     if (ascent_i32 < 0) return error.InvalidBdf;
     const ascent: u32 = @intCast(ascent_i32);
 
-    // 2-pass の Pass 2: bitmap_storage を確定し、Glyph slice を materialize
+    // Pass 2 of the 2-pass parse: finalise bitmap_storage and materialize Glyph slices
     const bitmap_storage = try ctx.storage.toOwnedSlice(allocator);
     errdefer allocator.free(bitmap_storage);
 
@@ -610,7 +610,7 @@ test "loadBdf: STARTPROPERTIES block is skipped (FONT_ASCENT not consulted)" {
     var font = try BitmapFont.initFromBdf(allocator, data);
     defer font.deinit(allocator);
 
-    try std.testing.expectEqual(@as(u32, 12), font.ascent); // FONTBOUNDINGBOX 由来、PROPERTIES の 999 ではない
+    try std.testing.expectEqual(@as(u32, 12), font.ascent); // From FONTBOUNDINGBOX, not the 999 in PROPERTIES
 }
 
 test "loadBdf: missing STARTFONT returns InvalidBdf" {
@@ -666,7 +666,7 @@ test "loadBdf: duplicate ENCODING returns InvalidBdf" {
 
 test "loadBdf: 9px wide glyph (non-multiple of 8 width)" {
     const allocator = std.testing.allocator;
-    // 9px 幅 → row_bytes = ceil(9/8) = 2, 1 行 4 hex 文字。右端 7 bit は padding
+    // 9px wide -> row_bytes = ceil(9/8) = 2, 4 hex chars per row. Rightmost 7 bits are padding
     const data =
         \\STARTFONT 2.1
         \\FONTBOUNDINGBOX 9 4 0 0
@@ -747,7 +747,7 @@ test "loadBdf: missing ENDFONT is rejected" {
 
 test "loadBdf: missing ENDCHAR mid-glyph is rejected" {
     const allocator = std.testing.allocator;
-    // BITMAP 行を読み終える前に EOF
+    // EOF before finishing the BITMAP rows
     const data =
         \\STARTFONT 2.1
         \\FONTBOUNDINGBOX 8 8 0 0
@@ -791,7 +791,7 @@ test "loadBdf: glyph missing required keyword (no DWIDTH) is rejected" {
 
 test "loadBdf: BITMAP row with too many hex chars is rejected" {
     const allocator = std.testing.allocator;
-    // width=8 -> 1 byte = 2 hex chars だが 4 hex chars 入れて拒否される
+    // width=8 -> 1 byte = 2 hex chars, but 4 hex chars are supplied and rejected
     const data =
         \\STARTFONT 2.1
         \\FONTBOUNDINGBOX 8 8 0 0
@@ -859,33 +859,33 @@ test "drawTo: pixel placement & clipping (left/top corner)" {
     const white = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // @bitCast → 0xFFFFFFFF
     const clip = Rect{ .x = 0, .y = 0, .w = 4, .h = 4 };
 
-    // ascent=4(=bbox 4 + yoff 0), height=4, yoff=0 → baseline=0+4, glyph top=4-4=0。4x4 全塗り。
+    // ascent=4(=bbox 4 + yoff 0), height=4, yoff=0 -> baseline=0+4, glyph top=4-4=0. Fills a 4x4.
     var fb: [16]u32 = @splat(0);
     font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A", white, clip, 1.0);
     for (fb) |p| try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), p);
 
-    // pos(-2,-2): glyph は fb 座標 x,y ∈ [-2,1] を占める → 左上 2x2 のみ in-bounds。
+    // pos(-2,-2): glyph occupies fb coords x,y in [-2,1] -> only the top-left 2x2 is in-bounds.
     var fb2: [16]u32 = @splat(0);
     font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = -2, .y = -2 }, "A", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0 * 4 + 0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0 * 4 + 1]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[1 * 4 + 0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[1 * 4 + 1]);
-    try std.testing.expectEqual(@as(u32, 0), fb2[3 * 4 + 3]); // 右下は範囲外
+    try std.testing.expectEqual(@as(u32, 0), fb2[3 * 4 + 3]); // Bottom-right is out of range
 
-    // 完全画面外: クラッシュしない
+    // Fully off-screen: must not crash
     var fb3: [16]u32 = @splat(0);
     font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = 100, .y = 100 }, "A", white, clip, 1.0);
     font.asFont().drawTo(.{ .pixels = &fb3, .width = 4, .height = 4 }, .{ .x = -100, .y = -100 }, "A", white, clip, 1.0);
     for (fb3) |p| try std.testing.expectEqual(@as(u32, 0), p);
 
-    // 右下 partial offscreen: (3,3) のみ
+    // Bottom-right partial offscreen: (3,3) only
     var fb4: [16]u32 = @splat(0);
     font.asFont().drawTo(.{ .pixels = &fb4, .width = 4, .height = 4 }, .{ .x = 3, .y = 3 }, "A", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb4[3 * 4 + 3]);
 }
 
-test "drawTo: 1 行ラン（\\n は改行せず通常 codepoint 扱い）" {
+test "drawTo: single-line run (LF is a normal codepoint, not a line break)" {
     const allocator = std.testing.allocator;
     const data =
         \\STARTFONT 2.1
@@ -906,22 +906,22 @@ test "drawTo: 1 行ラン（\\n は改行せず通常 codepoint 扱い）" {
     const white = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
     const clip = Rect{ .x = 0, .y = 0, .w = 4, .h = 4 };
 
-    // "AA": 同一行に 2 dot（baseline=0+1, top=1-1=0 → row 0）。2 行目には行かない。
+    // "AA": 2 dots on the same row (baseline=0+1, top=1-1=0 -> row 0). Does not reach row 1.
     var fb: [16]u32 = @splat(0);
     font.asFont().drawTo(.{ .pixels = &fb, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "AA", white, clip, 1.0);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[0]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[1]);
-    try std.testing.expectEqual(@as(u32, 0), fb[4]); // 2 行目は空（単一行ラン）
+    try std.testing.expectEqual(@as(u32, 0), fb[4]); // Row 1 is empty (single-line run)
     try std.testing.expectEqual(@as(u32, 0), fb[5]);
 
-    // "A\nA": \n は欠落 glyph 扱い（改行しない）。両 dot とも row 0。
+    // "A" LF "A": LF is a missing glyph (no line break). Both dots on row 0.
     var fb2: [16]u32 = @splat(0);
     font.asFont().drawTo(.{ .pixels = &fb2, .width = 4, .height = 4 }, .{ .x = 0, .y = 0 }, "A\nA", white, clip, 1.0);
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0]); // row 0 に描かれる
-    try std.testing.expectEqual(@as(u32, 0), fb2[4]); // 2 行目には行かない
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fb2[0]); // Drawn on row 0
+    try std.testing.expectEqual(@as(u32, 0), fb2[4]); // Does not reach row 1
 }
 
-test "measure / metrics: 単一行 advance 合計とメトリクス" {
+test "measure / metrics: single-line advance sum and metrics" {
     const allocator = std.testing.allocator;
     const data =
         \\STARTFONT 2.1
@@ -955,7 +955,7 @@ test "measure / metrics: 単一行 advance 合計とメトリクス" {
     var font = try BitmapFont.initFromBdf(allocator, data);
     defer font.deinit(allocator);
 
-    // measure は単一行の advance 合計（\n 跨ぎの max ではない）
+    // measure is the single-line advance sum (not a max across LF)
     try std.testing.expectEqual(@as(u32, 24), font.measure("AAA"));
     try std.testing.expectEqual(@as(u32, 8), font.measure("A"));
 

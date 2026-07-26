@@ -3,10 +3,10 @@ const platform = @import("platform");
 
 extern fn sin(x: f64) f64;
 
-// 高速HSV→RGB変換（整数演算版）
+// Fast HSV→RGB conversion (integer arithmetic)
 fn hsvToRgbFast(h: i32, s: i32, v: i32) u32 {
     if (s == 0) {
-        // canonical BGRA(0xAARRGGBB): gray なので r=g=b=v、a=0xFF。
+        // canonical BGRA(0xAARRGGBB): gray so r=g=b=v, a=0xFF.
         return 0xFF000000 | (@as(u32, @intCast(v)) << 16) | (@as(u32, @intCast(v)) << 8) | @as(u32, @intCast(v));
     }
 
@@ -30,7 +30,7 @@ fn hsvToRgbFast(h: i32, s: i32, v: i32) u32 {
     const g = @as(u32, @intCast(g_val));
     const b = @as(u32, @intCast(b_val));
 
-    // canonical BGRA(0xAARRGGBB): a=0xFF, r/g/b を各位置へ。
+    // canonical BGRA(0xAARRGGBB): a=0xFF, place r/g/b in each channel.
     return 0xFF000000 | (r << 16) | (g << 8) | b;
 }
 
