@@ -1,9 +1,9 @@
-//! pixie ミニマップ（TASK-153.3）。
+//! Pixie minimap.
 //!
-//! キャッシュ・visibleRect→ミニマップ写像・矩形計算の純ロジック。
+//! Pure logic for the cache, visibleRect→minimap mapping, and rect math.
 //!
-//! ホットパス宣言: サムネイル再生成は編集イベント時のみ。毎フレームはキャッシュ済み
-//! 小面積コピー + ビューポート矩形の O(1) 座標計算のみ（全画素 3 点セット対象外）。
+//! Hot-path note: thumbnail rebuild is edit-event only. Per frame only a cached
+//! small-area copy + O(1) viewport-rect math (not under the full-pixel three-point set).
 
 const std = @import("std");
 const core = @import("paint");
@@ -19,7 +19,7 @@ pub const CHECKER_DARK: u32 = 0xFF_4E_4E_4E;
 pub const BORDER_COLOR: u32 = 0xFF_E8_E8_E8;
 pub const VIEWPORT_COLOR: u32 = 0xFF_40_C0_FF;
 
-/// canvas 境界へ clamp 済みの可視範囲（連続座標）。
+/// Visible range already clamped to canvas bounds (continuous coords).
 pub const VisibleRect = struct {
     x0: f32,
     y0: f32,
@@ -57,7 +57,7 @@ pub const MiniMapCache = struct {
         self.dirty = true;
     }
 
-    /// dirty または document サイズ変化時のみサムネイルを再生成する。
+    /// Rebuild the thumbnail only when dirty or the document size changed.
     pub fn ensure(self: *MiniMapCache, composite: []const u32, cw: u32, ch: u32) !void {
         if (!self.dirty and self.source_width == cw and self.source_height == ch and self.pixels.len > 0) return;
         const sz = thumbSize(cw, ch);
@@ -75,7 +75,7 @@ pub const MiniMapCache = struct {
     }
 };
 
-/// canvas aspect を保ちつつ MAX_W×MAX_H に収まるサムネイル寸法（最低 1px・拡大しない）。
+/// Thumbnail size that fits in MAX_W×MAX_H while keeping the canvas aspect (at least 1px; never upscale).
 pub fn thumbSize(cw: u32, ch: u32) struct { w: u32, h: u32 } {
     if (cw == 0 or ch == 0) return .{ .w = 1, .h = 1 };
     const sw = @as(f32, @floatFromInt(MAX_W)) / @as(f32, @floatFromInt(cw));
@@ -86,12 +86,12 @@ pub fn thumbSize(cw: u32, ch: u32) struct { w: u32, h: u32 } {
     return .{ .w = w, .h = h };
 }
 
-/// 全体が表示領域に収まらないときだけミニマップを出す。
+/// Show the minimap only when the whole canvas does not fit in the view.
 pub fn shouldShow(z: Zoom, canvas_w: u32, canvas_h: u32, area_w: i32, area_h: i32) bool {
     return z.displayExtent(canvas_w) > area_w or z.displayExtent(canvas_h) > area_h;
 }
 
-/// カメラ中心と zoom から canvas 内の可視矩形（境界 clamp 済み）。
+/// Visible rect inside the canvas from camera center and zoom (bounds-clamped).
 pub fn visibleRect(cam_cx: f32, cam_cy: f32, area_w: i32, area_h: i32, z: Zoom, canvas_w: u32, canvas_h: u32) VisibleRect {
     const zf = z.scaleF32();
     const half_w = @as(f32, @floatFromInt(area_w)) / (2.0 * zf);
@@ -106,7 +106,7 @@ pub fn visibleRect(cam_cx: f32, cam_cy: f32, area_w: i32, area_h: i32, z: Zoom, 
     };
 }
 
-/// canvas area 右下への配置矩形（MARGIN 内側）。
+/// Placement rect at the bottom-right of the canvas area (inside MARGIN).
 pub fn layoutRect(area: core.Rect, thumb_w: u32, thumb_h: u32) core.Rect {
     const mw: i32 = @intCast(thumb_w);
     const mh: i32 = @intCast(thumb_h);
@@ -118,7 +118,7 @@ pub fn layoutRect(area: core.Rect, thumb_w: u32, thumb_h: u32) core.Rect {
     };
 }
 
-/// visibleRect → ミニマップ内ビューポート矩形（floor/ceil、最低 1px）。
+/// visibleRect → viewport rect inside the minimap (floor/ceil; at least 1px).
 pub fn mapVisibleToViewport(vis: VisibleRect, canvas_w: u32, canvas_h: u32, mm: core.Rect) core.Rect {
     if (canvas_w == 0 or canvas_h == 0 or mm.w <= 0 or mm.h <= 0) {
         return .{ .x = mm.x, .y = mm.y, .w = 1, .h = 1 };
@@ -133,7 +133,7 @@ pub fn mapVisibleToViewport(vis: VisibleRect, canvas_w: u32, canvas_h: u32, mm: 
     const ry1: i32 = mm.y + @as(i32, @intFromFloat(@ceil(vis.y1 * mh / ch)));
     const rw = @max(1, rx1 - rx0);
     const rh = @max(1, ry1 - ry0);
-    // ミニマップ境界へ clamp（はみ出し防止）
+    // Clamp to minimap bounds (prevent overhang)
     const cx0 = std.math.clamp(rx0, mm.x, mm.x + mm.w - 1);
     const cy0 = std.math.clamp(ry0, mm.y, mm.y + mm.h - 1);
     const cx1 = std.math.clamp(cx0 + rw, mm.x + 1, mm.x + mm.w);
@@ -141,7 +141,7 @@ pub fn mapVisibleToViewport(vis: VisibleRect, canvas_w: u32, canvas_h: u32, mm: 
     return .{ .x = cx0, .y = cy0, .w = cx1 - cx0, .h = cy1 - cy0 };
 }
 
-/// ミニマップ上のスクリーン座標 → カメラ中心（canvas 連続座標）。
+/// Screen coords on the minimap → camera center (continuous canvas coords).
 pub fn screenToCameraCenter(screen_x: i32, screen_y: i32, mm: core.Rect, canvas_w: u32, canvas_h: u32) struct { cx: f32, cy: f32 } {
     if (mm.w <= 0 or mm.h <= 0 or canvas_w == 0 or canvas_h == 0) {
         return .{ .cx = 0, .cy = 0 };
@@ -160,7 +160,7 @@ pub fn contains(mm: core.Rect, x: i32, y: i32) bool {
     return x >= mm.x and y >= mm.y and x < mm.x + mm.w and y < mm.y + mm.h;
 }
 
-/// compositeStraight をチェッカー下地へ alpha 重み付き平均で縮小（fillLayerThumb と同式）。
+/// Downscale compositeStraight onto a checkerboard via alpha-weighted average (same formula as fillLayerThumb).
 pub fn fillThumb(buf: []u32, tw: u32, th: u32, src: []const u32, cw: u32, ch: u32) void {
     const twu: usize = tw;
     const thu: usize = th;
@@ -209,10 +209,10 @@ pub fn fillThumb(buf: []u32, tw: u32, th: u32, src: []const u32, cw: u32, ch: u3
     }
 }
 
-/// キャッシュ済みサムネイルを fb へコピーし、枠とビューポート矩形を描く。
-/// `mm` / `viewport` / `clip` は**物理** destination（呼び出し側が logicalRect を floor 変換済み）。
-/// thumb → physical mm は整数 accumulator nearest。1x（mm 寸法==cache）は 1:1 コピー。
-/// 毎フレーム・小面積のみ。frame 内 allocation 無し。
+/// Copy the cached thumbnail into the fb and draw the frame plus the viewport rect.
+/// `mm` / `viewport` / `clip` are **physical** destinations (caller has already floor-mapped the logicalRect).
+/// thumb → physical mm uses integer-accumulator nearest. 1x (mm size==cache) is a 1:1 copy.
+/// Per frame; small area only. No allocation inside the frame.
 pub fn draw(
     fb: []u32,
     fb_w: u32,
@@ -235,7 +235,7 @@ pub fn draw(
     const dst_w: i32 = mm.w;
     const dst_h: i32 = mm.h;
 
-    // 1:1（scale=1 で mm==thumb 寸法）: 行連続 memcpy
+    // 1:1 (scale=1, mm==thumb size): contiguous-row memcpy
     if (dst_w == src_w and dst_h == src_h) {
         var fy = y0;
         while (fy < y1) : (fy += 1) {
@@ -249,8 +249,8 @@ pub fn draw(
             @memcpy(dst_row[lo..hi], src_row[s0 .. s0 + (hi - lo)]);
         }
     } else {
-        // nearest: sx = floor((fx-mm.x) * src_w / dst_w)、run 書き込み。
-        // floor 逆写像の edge が進まない場合があるので、index が変わるまでスキャン。
+        // nearest: sx = floor((fx-mm.x) * src_w / dst_w), run writes.
+        // Scan until the index changes when the floor-inverse edge does not advance.
         var fy = y0;
         while (fy < y1) {
             const ly: i32 = fy - mm.y;
@@ -322,11 +322,11 @@ fn putPixel(fb: []u32, fb_w: u32, fb_h: u32, x: i32, y: i32, color: u32, clip: c
 // ============================================================
 const testing = std.testing;
 
-test "thumbSize: aspect 維持・上限内・最低 1px" {
+test "thumbSize: keep aspect / within cap / at least 1px" {
     const a = thumbSize(256, 256);
     try testing.expect(a.w <= MAX_W and a.h <= MAX_H);
-    try testing.expectEqual(a.w, a.h); // 正方形
-    const b = thumbSize(400, 100); // 横長
+    try testing.expectEqual(a.w, a.h); // square
+    const b = thumbSize(400, 100); // landscape
     try testing.expect(b.w <= MAX_W and b.h <= MAX_H);
     try testing.expect(b.w > b.h);
     // 400/100 = 4 → w/h ≈ 4
@@ -336,7 +336,7 @@ test "thumbSize: aspect 維持・上限内・最低 1px" {
     try testing.expectEqual(@as(u32, 1), c.h);
 }
 
-test "visibleRect: canvas 境界 clamp" {
+test "visibleRect: clamp to canvas bounds" {
     const z = Zoom.fromInteger(2);
     // area 100x100 at 2x → half visible = 25 canvas px each side from center
     const vis = visibleRect(10, 10, 100, 100, z, 256, 256);
@@ -352,16 +352,16 @@ test "visibleRect: canvas 境界 clamp" {
     try testing.expectApproxEqAbs(@as(f32, 256), vis2.y1, 0.01);
 }
 
-test "mapVisibleToViewport: floor/ceil と最小 1px" {
+test "mapVisibleToViewport: floor/ceil and at least 1px" {
     const mm: core.Rect = .{ .x = 100, .y = 200, .w = 80, .h = 60 };
-    // 全面可視
+    // fully visible
     const full = mapVisibleToViewport(.{ .x0 = 0, .y0 = 0, .x1 = 160, .y1 = 120 }, 160, 120, mm);
     try testing.expectEqual(@as(i32, 100), full.x);
     try testing.expectEqual(@as(i32, 200), full.y);
     try testing.expectEqual(@as(i32, 80), full.w);
     try testing.expectEqual(@as(i32, 60), full.h);
 
-    // 極小可視 → 最低 1px
+    // tiny visible → at least 1px
     const tiny = mapVisibleToViewport(.{ .x0 = 40, .y0 = 30, .x1 = 40.1, .y1 = 30.1 }, 160, 120, mm);
     try testing.expect(tiny.w >= 1);
     try testing.expect(tiny.h >= 1);
@@ -374,20 +374,20 @@ test "mapVisibleToViewport: floor/ceil と最小 1px" {
     try testing.expectEqual(@as(i32, 15), mid.h); // ceil(60*60/120)-15 = 30-15
 }
 
-test "screenToCameraCenter: 逆写像" {
+test "screenToCameraCenter: inverse map" {
     const mm: core.Rect = .{ .x = 10, .y = 20, .w = 100, .h = 50 };
-    // 左上端ピクセル中心 → ほぼ (0.5 * cw/w, ...)
+    // top-left pixel center → roughly (0.5 * cw/w, ...)
     const tl = screenToCameraCenter(10, 20, mm, 200, 100);
     try testing.expectApproxEqAbs(@as(f32, 1.0), tl.cx, 0.01); // 0.5 * 200/100
     try testing.expectApproxEqAbs(@as(f32, 1.0), tl.cy, 0.01); // 0.5 * 100/50
 
-    // 中央
+    // center
     const mid = screenToCameraCenter(10 + 50, 20 + 25, mm, 200, 100);
     try testing.expectApproxEqAbs(@as(f32, 101.0), mid.cx, 0.5);
     try testing.expectApproxEqAbs(@as(f32, 51.0), mid.cy, 0.5);
 }
 
-test "shouldShow: 全体が収まるとき false" {
+test "shouldShow: false when everything fits" {
     const z1 = Zoom.one();
     try testing.expect(!shouldShow(z1, 100, 100, 200, 200));
     const z2 = Zoom.fromInteger(4);
@@ -396,7 +396,7 @@ test "shouldShow: 全体が収まるとき false" {
     try testing.expect(!shouldShow(z_half, 100, 100, 200, 200)); // 50 < 200
 }
 
-test "layoutRect: 右下 MARGIN" {
+test "layoutRect: bottom-right MARGIN" {
     const area: core.Rect = .{ .x = 50, .y = 40, .w = 300, .h = 200 };
     const r = layoutRect(area, 80, 60);
     try testing.expectEqual(@as(i32, 50 + 300 - 80 - MARGIN), r.x);
@@ -405,8 +405,8 @@ test "layoutRect: 右下 MARGIN" {
     try testing.expectEqual(@as(i32, 60), r.h);
 }
 
-test "draw: scale=1 は 1:1 転送（thumb→mm）" {
-    // 6x5 にして枠線（外周）の内側を検証する。
+test "draw: scale=1 is 1:1 transfer (thumb→mm)" {
+    // Use 6x5 so the inside of the frame (outer ring) can be checked.
     var cache = MiniMapCache{
         .pixels = undefined,
         .width = 6,
@@ -424,18 +424,18 @@ test "draw: scale=1 は 1:1 転送（thumb→mm）" {
     const fbh: u32 = 16;
     var fb = [_]u32{0xFFAAAAAA} ** (20 * 16);
     const mm: core.Rect = .{ .x = 2, .y = 3, .w = 6, .h = 5 };
-    // viewport を内部に置き、枠線がテスト画素を潰さないようにする
+    // Place the viewport inside so the frame does not clobber the test pixels
     const vp: core.Rect = .{ .x = 4, .y = 5, .w = 2, .h = 1 };
     const clip: core.Rect = .{ .x = 0, .y = 0, .w = 20, .h = 16 };
     draw(&fb, fbw, fbh, &cache, mm, vp, clip);
-    // 内側 (sx=2,sy=2) → thumb index 2+2*6=14 → color 0xFF00000F、fb 位置 (4,5)
-    // ただし vp outline が (4,5) を通る → (sx=1,sy=1)=index 7 の (3,4) を見る
+    // Inside (sx=2,sy=2) → thumb index 2+2*6=14 → color 0xFF00000F, fb at (4,5)
+    // But the vp outline passes through (4,5) → look at (sx=1,sy=1)=index 7 at (3,4)
     try testing.expectEqual(@as(u32, 0xFF000008), fb[4 * 20 + 3]); // sx=1,sy=1 → i=7+1=8
     try testing.expectEqual(@as(u32, 0xFF00000E), fb[5 * 20 + 3]); // sx=1,sy=2 → i=13+1=14
     try testing.expectEqual(@as(u32, 0xFF000009), fb[4 * 20 + 4]); // sx=2,sy=1 → i=8+1=9
 }
 
-test "draw: scale=2 nearest（thumb 2x2 → mm 8x8、内側ブロック）" {
+test "draw: scale=2 nearest (thumb 2x2 → mm 8x8, inner blocks)" {
     var cache = MiniMapCache{
         .pixels = undefined,
         .width = 2,
@@ -451,22 +451,22 @@ test "draw: scale=2 nearest（thumb 2x2 → mm 8x8、内側ブロック）" {
     const fbw: u32 = 16;
     const fbh: u32 = 16;
     var fb = [_]u32{0} ** (16 * 16);
-    // 8x8 物理 dest → 各 src が 4x4。枠は外周 1px、内側で nearest を検証。
+    // 8x8 physical dest → each src is 4x4. Frame is the outer 1px; check nearest inside.
     const mm: core.Rect = .{ .x = 0, .y = 0, .w = 8, .h = 8 };
     const vp: core.Rect = .{ .x = 3, .y = 3, .w = 2, .h = 2 };
     const clip = mm;
     draw(&fb, fbw, fbh, &cache, mm, vp, clip);
-    // src(0,0)=0xFF111111 → phys [0,4)×[0,4)。内側 (2,2)
+    // src(0,0)=0xFF111111 → phys [0,4)×[0,4). Inside (2,2)
     try testing.expectEqual(@as(u32, 0xFF111111), fb[2 + 2 * 16]);
-    // src(1,0)=0xFF222222 → [4,8)×[0,4)。内側 (6,2)
+    // src(1,0)=0xFF222222 → [4,8)×[0,4). Inside (6,2)
     try testing.expectEqual(@as(u32, 0xFF222222), fb[6 + 2 * 16]);
-    // src(0,1)=0xFF333333 → [0,4)×[4,8)。内側 (2,6)
+    // src(0,1)=0xFF333333 → [0,4)×[4,8). Inside (2,6)
     try testing.expectEqual(@as(u32, 0xFF333333), fb[2 + 6 * 16]);
-    // src(1,1)=0xFF444444 → [4,8)×[4,8)。内側 (6,6)
+    // src(1,1)=0xFF444444 → [4,8)×[4,8). Inside (6,6)
     try testing.expectEqual(@as(u32, 0xFF444444), fb[6 + 6 * 16]);
 }
 
-test "draw: physical clip で枠内のみ" {
+test "draw: physical clip keeps drawing inside the frame" {
     var cache = MiniMapCache{
         .pixels = undefined,
         .width = 8,
@@ -482,16 +482,16 @@ test "draw: physical clip で枠内のみ" {
     var fb = [_]u32{0xFF000000} ** (20 * 20);
     const mm: core.Rect = .{ .x = 2, .y = 2, .w = 8, .h = 8 };
     const vp: core.Rect = .{ .x = 4, .y = 4, .w = 2, .h = 2 };
-    // clip は mm の左半分
+    // clip is the left half of mm
     const clip: core.Rect = .{ .x = 2, .y = 2, .w = 4, .h = 8 };
     draw(&fb, 20, 20, &cache, mm, vp, clip);
-    // clip 内・枠外の内側
+    // Inside clip, outside the frame
     try testing.expectEqual(@as(u32, 0xFFABCDEF), fb[4 * 20 + 3]);
-    // clip 外（mm 右）は未塗り
+    // Outside clip (right of mm) stays unpainted
     try testing.expectEqual(@as(u32, 0xFF000000), fb[4 * 20 + 8]);
 }
 
-test "MiniMapCache.ensure: document サイズ変更は再生成・frame 外 alloc のみ" {
+test "MiniMapCache.ensure: document size change regenerates; alloc only outside the frame" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -502,11 +502,11 @@ test "MiniMapCache.ensure: document サイズ変更は再生成・frame 外 allo
     const w1 = cache.width;
     const h1 = cache.height;
     try testing.expect(!cache.dirty);
-    // 同一サイズ: 再 alloc 無し（dirty のまま false）
+    // Same size: no realloc (dirty stays false)
     try cache.ensure(&src_a, 8, 8);
     try testing.expectEqual(w1, cache.width);
     try testing.expectEqual(h1, cache.height);
-    // サイズ変更: 再生成
+    // Size change: regenerate
     var src_b = [_]u32{0xFF202020} ** (16 * 12);
     try cache.ensure(&src_b, 16, 12);
     try testing.expect(cache.width != 0 and cache.height != 0);

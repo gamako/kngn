@@ -1,18 +1,18 @@
-//! 範囲選択ツールの入力状態機械（TASK-44）。
+//! Selection-tool input state machine.
 //!
-//! platform / GUI 非依存。Bezier と同じ独立経路（canvas_input / Tool vtable を経由しない）。
-//! press 起点で marquee（矩形作成）か moving（選択範囲のフローティング移動）を開始し release で確定。
+//! Platform / GUI independent. Same independent path as Bezier (does not go through canvas_input / Tool vtable).
+//! On press-origin, start marquee (rect create) or moving (floating move of the selection) and commit on release.
 //!
-//! フローティング移動（TASK-44 ⑦）: move は release で焼き込み確定**しない**。内部キャッシュ `Float`
-//! （base=移動元を消したレイヤー / block=持ち上げた内容 / rect=現在位置 / layer_idx / render_mode）を
-//! 保持し、選択を作り直すまで何度でも再配置できる。canvas のレイヤーは常に「最終形」(`base+block@rect`)
-//! に保たれるので、表示/保存/copy/probe/undo は普通にレイヤーを読むだけでよく、確定トリガーは不要。
-//! - drag 中は実レイヤーを変更しない（表示は main が `renderMovePreview` で preview_canvas へ描く）。
-//!   よって cancel は float を捨てるだけ（実レイヤー復元は不要）。
-//! - release 時だけ `renderBlockOverBase` で実レイヤーを最終形へ焼き、`diffCmd` で 1 ドラッグ分の
-//!   UndoCmd を作って返す。float は保持（再移動用）。
-//! - 移動開始時に「layer_idx 一致」かつ「実レイヤー == base+block@rect（render_mode で再計算）」を満たさ
-//!   なければ stale（外部編集が入った/別レイヤー）とみなして re-lift する（単一地点での無効化）。
+//! Floating move: move does **not** bake-commit on release. Keeps an internal `Float` cache
+//! (base=layer with source cleared / block=lifted content / rect=current position / layer_idx / render_mode)
+//! and can be repositioned any number of times until the selection is remade. The canvas layer always holds the "final form" (`base+block@rect`),
+//! so display/save/copy/probe/undo just read the layer normally; no separate commit trigger is needed.
+//! - During drag the real layer is unchanged (main draws the preview onto preview_canvas via `renderMovePreview`).
+//!   So cancel only drops the float (no real-layer restore needed).
+//! - Only on release does `renderBlockOverBase` bake the real layer to final form and `diffCmd` build one drag's
+//!   UndoCmd to return. The float is kept (for further moves).
+//! - At move start, if "layer_idx matches" and "real layer == base+block@rect (recomputed with render_mode)" are not both
+//!   satisfied, treat as stale (external edit / other layer) and re-lift (single invalidation point).
 
 const std = @import("std");
 const core = @import("paint");
@@ -21,21 +21,21 @@ const Zoom = zoom_mod.Zoom;
 
 pub const SelectionInput = struct {
     state: State = .idle,
-    /// press 点（canvas 座標・clamp なし）
+    /// press point (canvas coords; unclamped)
     anchor: core.Vec2 = .{ .x = 0, .y = 0 },
-    /// 現在点（canvas 座標・clamp なし）
+    /// current point (canvas coords; unclamped)
     cur: core.Vec2 = .{ .x = 0, .y = 0 },
-    /// フローティング移動キャッシュ（gpa 所有）。null=非フロート。
+    /// Floating-move cache (owned by gpa). null = not floating.
     float: ?Float = null,
 
     pub const State = enum { idle, marquee, moving };
 
     const Float = struct {
-        base: []u32, // lift 時のレイヤー全体スナップショット（移動元矩形を 0 クリア）
-        block: core.PixelBlock, // 持ち上げた内容
-        rect: core.Rect, // 現在の配置矩形（左上 + block サイズ。canvas 外へ出得る）
+        base: []u32, // full-layer snapshot at lift (source rect cleared to 0)
+        block: core.PixelBlock, // lifted content
+        rect: core.Rect, // current placement rect (top-left + block size; may leave the canvas)
         layer_idx: usize,
-        render_mode: core.selection.Blend, // resting 形を焼いた時の blend
+        render_mode: core.selection.Blend, // blend used when the resting form was baked
     };
 
     pub const Frame = struct {
@@ -44,7 +44,7 @@ pub const SelectionInput = struct {
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         mouse_released_pos: core.Vec2,
-        pressed_left: bool, // gate 済み（canvas area 内・widget 非 active 時のみ true）
+        pressed_left: bool, // Already gated (true only inside canvas area and when no widget is active)
         released_left: bool,
     };
 
@@ -60,14 +60,14 @@ pub const SelectionInput = struct {
         }
     }
 
-    /// フロートキャッシュを破棄する（canvas は不変・メモリ解放のみ）。
-    /// 選択を作り直す/解除する/ツールを離れる/ドキュメントを差し替える時に App から呼ぶ。
+    /// Drop the float cache (canvas unchanged; memory free only).
+    /// Called from App when remaking/clearing the selection, leaving the tool, or swapping the document.
     pub fn discardFloat(self: *SelectionInput, gpa: std.mem.Allocator) void {
         self.dropFloat(gpa);
     }
 
-    /// 1 フレーム処理する。move 確定（release）時はその UndoCmd を返す（呼び出し側が push）。
-    /// marquee 確定 / deselect は `canvas.selection` を直接更新し null を返す。
+    /// Process one frame. On move commit (release), returns the UndoCmd (caller pushes).
+    /// Marquee commit / deselect update `canvas.selection` directly and return null.
     pub fn update(
         self: *SelectionInput,
         frame: Frame,
@@ -78,7 +78,7 @@ pub const SelectionInput = struct {
     ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
 
-        // press 起点: 未開始かつ canvas 表示領域内で押下 → marquee or moving を開始
+        // press-origin: not started and pressed inside the canvas display area → start marquee or moving
         if (self.state == .idle and frame.pressed_left and
             zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
         {
@@ -90,7 +90,7 @@ pub const SelectionInput = struct {
                 self.state = .moving;
                 self.ensureFloat(canvas, layer_idx, gpa, canvas.selection.?, mode);
             } else {
-                self.dropFloat(gpa); // 新規マーキー → フロート破棄（canvas は最終形のまま）
+                self.dropFloat(gpa); // New marquee → drop the float (canvas stays in final form)
                 self.state = .marquee;
             }
         }
@@ -103,7 +103,7 @@ pub const SelectionInput = struct {
                 self.state = .idle;
                 switch (prev) {
                     .marquee => {
-                        // ドラッグ無し（クリック）→ 解除。ドラッグ有り → 正規化矩形（全 clip 外なら解除）。
+                        // No drag (click) → deselect. With drag → normalized rect (deselect if entirely outside clip).
                         if (self.anchor.x == self.cur.x and self.anchor.y == self.cur.y) {
                             canvas.clearSelection();
                         } else {
@@ -126,12 +126,12 @@ pub const SelectionInput = struct {
         return null;
     }
 
-    /// 移動開始時: 既存フロートが現レイヤーと整合すれば再利用、しなければ lift し直す。
+    /// At move start: reuse the existing float if it matches the current layer; otherwise lift again.
     fn ensureFloat(self: *SelectionInput, canvas: *core.Canvas, layer_idx: usize, gpa: std.mem.Allocator, sel: core.Rect, mode: core.selection.Blend) void {
         if (self.float) |*f| {
             const layer = canvas.layerPixels(layer_idx);
-            // 再利用条件: 同一レイヤー / フロート矩形(clip)が現選択と一致 / レイヤー内容が float の最終形と一致。
-            // 矩形一致を見ないと「内容不変だが selection が変わった操作（no-op paste 等）」で誤再利用しうる。
+            // Reuse when: same layer / float rect(clip) matches current selection / layer contents match the float's final form.
+            // Without the rect check, ops that leave contents unchanged but change selection (e.g. no-op paste) could reuse wrongly.
             const rect_ok = if (core.selection.clipRect(f.rect, canvas.width, canvas.height)) |fr|
                 (fr.x == sel.x and fr.y == sel.y and fr.w == sel.w and fr.h == sel.h)
             else
@@ -139,21 +139,21 @@ pub const SelectionInput = struct {
             if (f.layer_idx == layer_idx and rect_ok and
                 core.selection.layerMatchesRender(layer, f.base, f.block, f.rect.x, f.rect.y, f.render_mode, canvas.width, canvas.height))
             {
-                return; // 整合 → 再利用（再キャプチャしない）
+                return; // consistent → reuse (do not re-capture)
             }
-            self.dropFloat(gpa); // stale（外部編集 / 別レイヤー / 選択変化）→ 取り直し
+            self.dropFloat(gpa); // stale (external edit / other layer / selection change) → lift again
         }
-        // lift: base=レイヤー複製して selection を 0 クリア、block=selection 内容
+        // lift: base = layer copy with selection cleared to 0; block = selection contents
         const layer = canvas.layerPixels(layer_idx);
         const base = gpa.dupe(u32, layer) catch @panic("selection_input.lift: OOM");
         core.selection.clearRectInBuf(base, sel, canvas.width);
         const block = core.selection.extract(gpa, canvas, layer_idx, sel);
-        // render_mode は lift 時点の現 mode（resting 形 base+block@sel は mode 不問で原本一致だが、
-        // 次回の整合判定の基準として保持する）。
+        // render_mode is the mode at lift time (resting form base+block@sel matches the original regardless of mode, but
+        // kept as the baseline for the next consistency check).
         self.float = .{ .base = base, .block = block, .rect = sel, .layer_idx = layer_idx, .render_mode = mode };
     }
 
-    /// release: 実レイヤーを最終形へ焼き、1 ドラッグ分の diff を push 用に返す。float は保持。
+    /// release: bake the real layer to final form and return one drag's diff for push. Keep the float.
     fn commitMove(self: *SelectionInput, canvas: *core.Canvas, layer_idx: usize, gpa: std.mem.Allocator, mode: core.selection.Blend) ?core.PaintDiff {
         const f = if (self.float) |*ff| ff else return null;
         const dx = self.cur.x - self.anchor.x;
@@ -169,8 +169,8 @@ pub const SelectionInput = struct {
         return core.selection.diffCmd(gpa, before, layer, layer_idx);
     }
 
-    /// move ドラッグ中の表示用: dst_layer へ `base+block@現在ドラッグ位置`（mode 合成）を描く。
-    /// .moving 中で float があれば true（描いた）。実レイヤーではなく preview 用 layer を渡すこと。
+    /// For display during a move drag: paint `base+block@current drag position` (mode composite) onto dst_layer.
+    /// Returns true (drew) when .moving and a float exists. Pass a preview layer, not the real layer.
     pub fn renderMovePreview(self: *const SelectionInput, dst_layer: []u32, w: u32, h: u32, mode: core.selection.Blend) bool {
         if (self.state != .moving) return false;
         const f = if (self.float) |*ff| ff else return false;
@@ -180,7 +180,7 @@ pub const SelectionInput = struct {
         return true;
     }
 
-    /// ドラッグ中に表示すべき枠（canvas 座標・canvas 内 clip 済み）。idle なら null。
+    /// Frame to show during drag (canvas coords; clipped to canvas). null when idle.
     pub fn previewRect(self: *const SelectionInput, canvas: *const core.Canvas) ?core.Rect {
         switch (self.state) {
             .idle => return null,
@@ -201,7 +201,7 @@ pub const SelectionInput = struct {
         }
     }
 
-    /// 進行中のドラッグを破棄する（確定しない）。実レイヤーは drag 中不変なので復元不要。Esc / ツール切替で呼ぶ。
+    /// Discard an in-progress drag (do not commit). Real layer is unchanged during drag, so no restore. Call on Esc / tool switch.
     pub fn cancel(self: *SelectionInput, gpa: std.mem.Allocator) void {
         self.state = .idle;
         self.dropFloat(gpa);
@@ -235,7 +235,7 @@ fn mkFrameSplit(px: i32, py: i32, mx: i32, my: i32, rx: i32, ry: i32, pressed: b
     };
 }
 
-test "selection_input: 表示領域外の press は無視" {
+test "selection_input: press outside the display area is ignored" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -247,7 +247,7 @@ test "selection_input: 表示領域外の press は無視" {
     try std.testing.expect(c.selection == null);
 }
 
-test "selection_input: marquee ドラッグ確定で正規化 selection" {
+test "selection_input: marquee drag commit yields a normalized selection" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -261,7 +261,7 @@ test "selection_input: marquee ドラッグ確定で正規化 selection" {
     try std.testing.expectEqual(core.Rect{ .x = 2, .y = 2, .w = 4, .h = 4 }, c.selection.?);
 }
 
-test "selection_input: ドラッグ無しクリックは deselect" {
+test "selection_input: click without drag deselects" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -274,7 +274,7 @@ test "selection_input: ドラッグ無しクリックは deselect" {
     try std.testing.expect(c.selection == null);
 }
 
-test "selection_input float: 選択内 drag で内容移動・元領域が空く・selection 追従" {
+test "selection_input float: in-selection drag moves content, clears source, selection follows" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -289,45 +289,45 @@ test "selection_input float: 選択内 drag で内容移動・元領域が空く
 
     _ = si.update(mkFrame(1, 1, 1, 1, true, false), &c, 0, gpa, .over);
     try std.testing.expectEqual(SelectionInput.State.moving, si.state);
-    // lift は実レイヤーを変えない（preview 表示は main 側）
+    // lift does not change the real layer (preview display is main's job)
     try std.testing.expectEqual(A, px[1 * 16 + 1]);
-    // (3,1) へ release（dx=2,dy=0）
+    // release to (3,1) (dx=2,dy=0)
     const cmd = si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over) orelse return error.TestUnexpectedNull;
     defer gpa.free(cmd.diffs);
     try std.testing.expectEqual(core.Rect{ .x = 3, .y = 1, .w = 2, .h = 2 }, c.selection.?);
-    try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 1]); // 元領域は空く
+    try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 1]); // source region is empty
     try std.testing.expectEqual(A, px[1 * 16 + 3]);
     try std.testing.expectEqual(D, px[2 * 16 + 4]);
-    try std.testing.expect(si.float != null); // 確定せずフロート保持
+    try std.testing.expect(si.float != null); // keep the float without a separate commit
 }
 
-test "selection_input float: release 後の再 drag は再キャプチャせず同一内容を移動（over で下地を運ばない）" {
+test "selection_input float: post-release re-drag moves the same content without re-capture (over does not carry underlayer)" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
     const px = c.layerPixels(0);
-    px[1 * 16 + 1] = A; // 選択内容（不透明 1px）
-    px[2 * 16 + 4] = X; // 移動先 {3,1,2,2} の透明部の下にくる既存色
+    px[1 * 16 + 1] = A; // selection contents (1 opaque px)
+    px[2 * 16 + 4] = X; // existing color that sits under the transparent part of destination {3,1,2,2}
     c.setSelection(.{ .x = 1, .y = 1, .w = 2, .h = 2 });
     var si: SelectionInput = .{};
     defer si.deinit(gpa);
 
-    // move1: (1,1)→(3,1)。over なので (4,2) の X は透明部の下で残る
+    // move1: (1,1)→(3,1). over, so X at (4,2) remains under the transparent part
     _ = si.update(mkFrame(1, 1, 1, 1, true, false), &c, 0, gpa, .over);
     if (si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
     try std.testing.expectEqual(A, px[1 * 16 + 3]);
     try std.testing.expectEqual(X, px[2 * 16 + 4]);
 
-    // move2: (3,1)→(5,1)。フロート再利用なら block は A 1px のみ。X は (4,2) に残り (6,2) へ運ばれない。
+    // move2: (3,1)→(5,1). With float reuse, block is only the 1px A. X stays at (4,2) and is not carried to (6,2).
     _ = si.update(mkFrame(3, 1, 3, 1, true, false), &c, 0, gpa, .over);
     if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
-    try std.testing.expectEqual(A, px[1 * 16 + 5]); // A は (5,1) へ
-    try std.testing.expectEqual(X, px[2 * 16 + 4]); // X は据え置き（再キャプチャしていない証拠）
-    try std.testing.expectEqual(@as(u32, 0), px[2 * 16 + 6]); // 再キャプチャなら X がここへ来るはず → 0
-    try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 3]); // 前位置は空く
+    try std.testing.expectEqual(A, px[1 * 16 + 5]); // A moves to (5,1)
+    try std.testing.expectEqual(X, px[2 * 16 + 4]); // X stays put (proof of no re-capture)
+    try std.testing.expectEqual(@as(u32, 0), px[2 * 16 + 6]); // If re-captured, X would be here → 0
+    try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 3]); // previous position is empty
 }
 
-test "selection_input float: cancel で float 破棄・実レイヤーは drag 中不変" {
+test "selection_input float: cancel drops the float; real layer unchanged during drag" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -340,15 +340,15 @@ test "selection_input float: cancel で float 破棄・実レイヤーは drag �
     defer si.deinit(gpa);
 
     _ = si.update(mkFrame(1, 1, 1, 1, true, false), &c, 0, gpa, .over); // lift
-    _ = si.update(mkFrame(1, 1, 6, 6, false, false), &c, 0, gpa, .over); // drag（未 release・実レイヤー不変）
+    _ = si.update(mkFrame(1, 1, 6, 6, false, false), &c, 0, gpa, .over); // drag (not yet released; real layer unchanged)
     try std.testing.expect(si.float != null);
     si.cancel(gpa);
     try std.testing.expectEqual(SelectionInput.State.idle, si.state);
     try std.testing.expect(si.float == null);
-    try std.testing.expectEqualSlices(u32, before, px); // 実レイヤーは drag 中ずっと不変
+    try std.testing.expectEqualSlices(u32, before, px); // real layer stays unchanged throughout the drag
 }
 
-test "selection_input float: 外部編集が入ると次の move 開始で再 lift（stale 無効化）" {
+test "selection_input float: external edit triggers re-lift at next move start (stale invalidation)" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -361,16 +361,16 @@ test "selection_input float: 外部編集が入ると次の move 開始で再 li
     // move1: (1,1)→(3,1)
     _ = si.update(mkFrame(1, 1, 1, 1, true, false), &c, 0, gpa, .over);
     if (si.update(mkFrame(1, 1, 3, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
-    // 外部編集を模す: 移動後の (3,1)=A を別色 B へ書き換え（layer != base+block@rect になる）
+    // Simulate external edit: rewrite post-move (3,1)=A to another color B (layer != base+block@rect)
     px[1 * 16 + 3] = B;
-    // move2 開始: stale 検知で再 lift → block は現レイヤーの内容（B）になる
+    // move2 start: stale detected → re-lift; block becomes current layer contents (B)
     _ = si.update(mkFrame(3, 1, 3, 1, true, false), &c, 0, gpa, .over);
     if (si.update(mkFrame(3, 1, 5, 1, false, true), &c, 0, gpa, .over)) |cmd| gpa.free(cmd.diffs);
-    try std.testing.expectEqual(B, px[1 * 16 + 5]); // 再 lift した B が移動
-    try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 3]); // 前位置は空く
+    try std.testing.expectEqual(B, px[1 * 16 + 5]); // re-lifted B moves
+    try std.testing.expectEqual(@as(u32, 0), px[1 * 16 + 3]); // previous position is empty
 }
 
-test "selection_input: release 確定は mouse_released_pos（up 後 move が同フレームでもずれない）" {
+test "selection_input: release commits at mouse_released_pos (same-frame post-up move does not shift)" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();

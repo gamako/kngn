@@ -1,7 +1,7 @@
-//! Pixie スタンドアロンビルド
+//! Pixie standalone build
 //!
-//! top-level build.zig から呼ばれる sub-build ではなく、
-//! apps/editor/ ディレクトリ単独での開発・ビルドに使う。
+//! Not a sub-build called from the top-level build.zig;
+//! for developing and building inside the apps/editor/ directory alone.
 //!
 //!   cd apps/editor && zig build run [-Dplatform=objc|swift|metal]   (Linux: -Dplatform=x11)
 
@@ -15,14 +15,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // pixie が import するモジュール（OS/backend 非依存）。
-    // gui は共通 Font IF に依存し、font は PNG アトラス decode のため png に依存。
-    // （standalone build に font 配線が無く壊れていた既存破損の付随修正）
+    // Modules that pixie imports (OS/backend independent).
+    // gui depends on the shared Font IF; font depends on png for PNG atlas decode.
+    // (font must be wired in the standalone build.)
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
 
-    // font/core blend の共有ブレンド実装（TASK-51）
+    // Shared blend implementation for font/core blend
     const pixelops = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
     });
@@ -45,23 +45,23 @@ pub fn build(b: *std.Build) void {
     gui.addImport("pixelops", pixelops);
     gui.addImport("command_types", command_types);
 
-    // .pix プロジェクト形式の versioned container（std のみ・依存なし）
+    // Versioned container for the .pix project format (std only; no deps)
     const serde = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/serde/src/serde.zig" },
     });
 
-    // paint（旧 editor/core。ADR-007 R6 で libs/paint へ格上げ）: pixie が直 import する
-    // 「エディタ族の共有 lib」（kit 非収録）。
+    // paint (was editor/core; promoted to libs/paint under ADR-007 R6): imported directly by pixie
+    // as the "editor-family shared lib" (not packaged in kit).
     const paint = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/paint/src/paint.zig" },
     });
-    paint.addImport("png", png); // io_png.zig が PNG codec(libs/png) に委譲 (TASK-33)
-    paint.addImport("pixelops", pixelops); // blend.zig が委譲 (TASK-51)
-    paint.addImport("font", font); // text_render.zig が委譲 (TASK-79.4/79.5。standalone build 配線漏れの修正。TASK-82)
-    paint.addImport("serde", serde); // document_io.zig が .pix container(libs/serde) に委譲 (TASK-63。standalone build 配線漏れの修正。TASK-81)
+    paint.addImport("png", png); // io_png.zig delegates to the PNG codec (libs/png)
+    paint.addImport("pixelops", pixelops); // blend.zig delegates here
+    paint.addImport("font", font); // text_render.zig delegates here (standalone-build wiring)
+    paint.addImport("serde", serde); // document_io.zig delegates to the .pix container (libs/serde) (standalone-build wiring)
 
-    // kit（ADR-007 R4）の caller 供給分。pixie ソースは platform/gui/png を @import("kit") 経由で使う。
-    // dsp/synth は pixie からは未参照（lazy 解析でコンパイルされない）が、kit/kit.zig と 1:1 で配線する。
+    // Caller-supplied half of kit (ADR-007 R4). Pixie sources reach platform/gui/png via @import("kit").
+    // dsp/synth are unused by pixie (lazy analysis skips compile) but wired 1:1 with kit/kit.zig.
     const dsp = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
     });
@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     sound.addImport("dsp", dsp);
     sound.addImport("synth", synth);
 
-    // kit.gfx（TASK-111.2）: pixie は未使用だが kit.zig が無条件 import するため配線が必要。
+    // kit.gfx: unused by pixie, but kit.zig imports it unconditionally so the wiring is required.
     const gfx_keyboard = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
     });
@@ -101,14 +101,14 @@ pub fn build(b: *std.Build) void {
     gfx.addImport("fixed_timestep", gfx_ft);
     gfx.addImport("fps_counter", gfx_fps);
     gfx.addImport("keyboard", gfx_keyboard);
-    // action_map（gfx 内相対 import）が gamepad + platform_types を要求する（TASK-111.8）
+    // action_map (relative import inside gfx) needs gamepad + platform_types
     const gamepad_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
     });
     gamepad_mod.addImport("platform_types", platform_types);
     gfx.addImport("gamepad", gamepad_mod);
     gfx.addImport("platform_types", platform_types);
-    gfx.addImport("gmath", gmath); // TileMap 衝突（TASK-111.5。additive）
+    gfx.addImport("gmath", gmath); // TileMap collision (additive)
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "pixie",
@@ -116,10 +116,10 @@ pub fn build(b: *std.Build) void {
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        // harness(platform→harness→png) と kit/paint で png module を共有する（二重化回避。TASK-32.2）。
+        // Share the png module between harness(platform→harness→png) and kit/paint (avoid duplication).
         .png_module = png,
-        // serde は kit.recipe（TASK-62.5.8）と paint(document_io) の両方が使う。同一インスタンスを
-        // 渡さないと同じ serde.zig が 2 module に属しコンパイルエラーになる（TASK-98）。
+        // serde is used by both kit.recipe and paint(document_io). Passing distinct instances would put
+        // the same serde.zig into two modules and fail to compile.
         .kit_libs = .{
             .platform_types = platform_types,
             .command_types = command_types,
@@ -132,14 +132,14 @@ pub fn build(b: *std.Build) void {
             .gfx = gfx,
             .sound = sound,
             .serde = serde,
-            // gfx(action_map) と同一 gamepad instance（TASK-111.8 / 111.5: dual module 回避）
+            // Same gamepad instance as gfx(action_map) (avoid dual module)
             .gamepad = gamepad_mod,
         },
         .extra = &.{
             .{ .name = "paint", .module = paint },
-            // apps → pixelops 例外（ルート build.zig の linkAppException と同趣旨。TASK-153.2）
+            // apps → pixelops exception (same intent as linkAppException in the root build.zig)
             .{ .name = "pixelops", .module = pixelops },
         },
-        .link_menu = true, // TASK-97.3: pixie standalone も native メニュー opt-in
+        .link_menu = true, // pixie standalone also opts into the native menu
     });
 }

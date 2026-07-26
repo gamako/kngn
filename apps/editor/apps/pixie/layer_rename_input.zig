@@ -1,21 +1,21 @@
-//! レイヤー名インライン編集の入力状態機械（TASK-79.3）。
+//! Layer-name inline-edit input state machine.
 //!
-//! platform / GUI / paint 非依存の純ロジック。canvas_input.zig / eyedropper_input.zig と同型の
-//! 「入力状態機械を独立ファイルに分離し test-core から display 無しで単体テストする」慣習に従う。
-//! main.zig の `App` は本構造体を1つ持ち、右クリックメニュー「Rename...」で `begin`、
-//! `char_input` イベントで `appendCodepoint`、BACKSPACE で `backspace`、ENTER で `commit`、
-//! ESCAPE で `cancel` を呼ぶ（実際の Canvas への反映・Undo push は呼び出し側=main.zig の責務。
-//! ここは「編集中バッファをどう更新するか」にのみ責務を持つ）。
+//! Pure logic with no platform / GUI / paint dependency. Same convention as canvas_input.zig /
+//! eyedropper_input.zig: isolate the input state machine in its own file and unit-test it from test-core without a display.
+//! `App` in main.zig owns one instance; the Layers context-menu "Rename..." calls `begin`,
+//! `char_input` calls `appendCodepoint`, BACKSPACE calls `backspace`, ENTER calls `commit`,
+//! ESCAPE calls `cancel` (applying to Canvas and pushing Undo is the caller's = main.zig's job.
+//! This module only updates the in-edit buffer).
 //!
-//! `max_len` は `libs/paint/src/canvas.zig` の `layer_name_max` と同じ値（32）に揃える契約。
-//! 循環 import を避けるため独立定義とし、main.zig 側で `comptime` の一致 assert を置く。
+//! `max_len` matches `libs/paint/src/canvas.zig` `layer_name_max` (32).
+//! Defined independently to avoid a circular import; main.zig holds a comptime equality assert.
 //!
-//! ホットパス宣言: イベント時のみ（rename 開始/文字入力/確定/取消の都度1回）。
-//! フレーム毎の全画素ループ・RT 経路のいずれでもないため、性能規約（SIMD 3点セット等）は対象外。
+//! Hot-path note: event-only (once per rename start/char/commit/cancel).
+//! Not a per-frame full-pixel loop or an RT path, so the performance rules (SIMD three-point set etc.) do not apply.
 
 const std = @import("std");
 
-/// `libs/paint/src/canvas.zig` の `layer_name_max` と同じ値（main.zig の comptime assert で保証）。
+/// Same value as `libs/paint/src/canvas.zig` `layer_name_max` (guaranteed by main.zig's comptime assert).
 pub const max_len: usize = 32;
 
 pub const LayerRenameInput = struct {
@@ -24,9 +24,9 @@ pub const LayerRenameInput = struct {
     buf: [max_len]u8 = undefined,
     len: u8 = 0,
 
-    /// 指定レイヤーの現在名をバッファへコピーして編集を開始する。
-    /// `current_name` が `max_len` を超えていても安全に切り詰める（UTF-8 継続バイトの途中で
-    /// 切らない。Layer.setName と同じ防御）。
+    /// Copy the layer's current name into the buffer and start editing.
+    /// Safely truncates even when `current_name` exceeds `max_len` (never mid UTF-8 continuation byte;
+    /// same defense as Layer.setName).
     pub fn begin(self: *LayerRenameInput, layer_idx: usize, current_name: []const u8) void {
         self.active = true;
         self.layer_idx = layer_idx;
@@ -35,22 +35,22 @@ pub const LayerRenameInput = struct {
         self.len = @intCast(n);
     }
 
-    /// 確定文字を1つ追記する（`char_input` の codepoint。TASK-22）。非 active 中は no-op。
-    /// ASCII 制御文字（0x00-0x1F, 0x7F）は無視する（digest/probe の 1 行契約を壊す改行等の
-    /// 混入を防ぐ wire framing 保護。文字の意味解釈ではない）。容量超過も無視する
-    /// （fail-safe。呼び出し側にエラーを伝播させない＝タイプの取りこぼしがあるだけでクラッシュしない）。
+    /// Append one committed character (`char_input` codepoint). No-op when not active.
+    /// ASCII control chars (0x00-0x1F, 0x7F) are ignored (wire-framing guard so newlines etc. cannot break
+    /// the digest/probe one-line contract; not a semantic filter). Capacity overflow is also ignored
+    /// (fail-safe: do not propagate errors to the caller — at worst a keystroke is dropped, never a crash).
     pub fn appendCodepoint(self: *LayerRenameInput, codepoint: u32) void {
         if (!self.active) return;
         if (codepoint < 0x20 or codepoint == 0x7F) return;
         if (codepoint > std.math.maxInt(u21)) return;
         var enc: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(@intCast(codepoint), &enc) catch return; // 不正/サロゲート等は無視
+        const n = std.unicode.utf8Encode(@intCast(codepoint), &enc) catch return; // Ignore invalid / surrogates etc.
         if (@as(usize, self.len) + n > max_len) return;
         @memcpy(self.buf[self.len..][0..n], enc[0..n]);
         self.len += @intCast(n);
     }
 
-    /// 直前の1コードポイントを削除する（BACKSPACE）。UTF-8 継続バイトを遡って安全に削る。
+    /// Delete the previous codepoint (BACKSPACE). Walk back UTF-8 continuation bytes safely.
     pub fn backspace(self: *LayerRenameInput) void {
         if (!self.active or self.len == 0) return;
         var n: u8 = self.len - 1;
@@ -58,29 +58,29 @@ pub const LayerRenameInput = struct {
         self.len = n;
     }
 
-    /// 現在の編集中バッファ（未確定）。
+    /// Current in-edit buffer (uncommitted).
     pub fn text(self: *const LayerRenameInput) []const u8 {
         return self.buf[0..self.len];
     }
 
-    /// 編集を確定し、確定文字列を返す（呼び出し側が Canvas へ反映し Undo へ積む）。
+    /// Commit the edit and return the committed string (caller applies to Canvas and pushes Undo).
     pub fn commit(self: *LayerRenameInput) []const u8 {
         self.active = false;
         return self.text();
     }
 
-    /// 編集を取り消す（Undo には積まない）。
+    /// Cancel the edit (does not push Undo).
     pub fn cancel(self: *LayerRenameInput) void {
         self.active = false;
     }
 
-    /// 編集中の全 text（Cmd+C）。非 active は null。
+    /// Full in-edit text (Cmd+C). null when not active.
     pub fn clipboardCopy(self: *const LayerRenameInput) ?[]const u8 {
         if (!self.active) return null;
         return self.text();
     }
 
-    /// 全 text を返しつつ空にする（Cmd+X）。戻り slice は次の書き込みまで有効。
+    /// Return the full text and clear it (Cmd+X). Returned slice stays valid until the next write.
     pub fn clipboardCut(self: *LayerRenameInput) ?[]const u8 {
         if (!self.active) return null;
         const n = self.len;
@@ -88,7 +88,7 @@ pub const LayerRenameInput = struct {
         return self.buf[0..n];
     }
 
-    /// 全 text を置換する（Cmd+V）。制御文字・改行は除外。UTF-8 境界で max_len 切り詰め。
+    /// Replace the full text (Cmd+V). Control chars and newlines are stripped. Truncate at max_len on a UTF-8 boundary.
     pub fn clipboardPaste(self: *LayerRenameInput, incoming: []const u8) void {
         if (!self.active) return;
         self.len = 0;
@@ -117,8 +117,8 @@ pub const LayerRenameInput = struct {
     }
 };
 
-/// text を最大 max バイトへ、UTF-8 継続バイト（0b10xxxxxx）の途中で切らないように
-/// 切り詰めた長さを返す（`libs/paint/src/canvas.zig` の `safeUtf8TruncateLen` と同型）。
+/// Truncate text to at most max bytes without cutting mid UTF-8 continuation byte (0b10xxxxxx);
+/// returns the truncated length (same shape as `libs/paint/src/canvas.zig` `safeUtf8TruncateLen`).
 fn safeUtf8TruncateLen(text: []const u8, max: usize) usize {
     var n = @min(text.len, max);
     while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) : (n -= 1) {}
@@ -129,7 +129,7 @@ fn safeUtf8TruncateLen(text: []const u8, max: usize) usize {
 
 const testing = std.testing;
 
-test "begin: 現在名をコピーして active になる" {
+test "begin: copies current name and becomes active" {
     var r: LayerRenameInput = .{};
     r.begin(3, "Background");
     try testing.expect(r.active);
@@ -137,7 +137,7 @@ test "begin: 現在名をコピーして active になる" {
     try testing.expectEqualStrings("Background", r.text());
 }
 
-test "appendCodepoint: ASCII を1文字ずつ追記できる" {
+test "appendCodepoint: can append ASCII one character at a time" {
     var r: LayerRenameInput = .{};
     r.begin(0, "");
     r.appendCodepoint('S');
@@ -146,22 +146,22 @@ test "appendCodepoint: ASCII を1文字ずつ追記できる" {
     try testing.expectEqualStrings("Sky", r.text());
 }
 
-test "appendCodepoint: マルチバイト文字（日本語）を追記できる（char_input 経由の想定経路）" {
+test "appendCodepoint: can append multibyte (Japanese) via the char_input path" {
     var r: LayerRenameInput = .{};
     r.begin(0, "");
-    // 'あ' = U+3042
+    // U+3042 (hiragana a)
     r.appendCodepoint(0x3042);
     r.appendCodepoint('日');
     try testing.expectEqualStrings("あ日", r.text());
 }
 
-test "appendCodepoint: 非 active 中は無視される" {
+test "appendCodepoint: ignored while not active" {
     var r: LayerRenameInput = .{};
     r.appendCodepoint('X');
     try testing.expectEqual(@as(u8, 0), r.len);
 }
 
-test "appendCodepoint: ASCII 制御文字は無視される（digest 1行契約を壊さない）" {
+test "appendCodepoint: ASCII controls ignored (keep digest one-line contract)" {
     var r: LayerRenameInput = .{};
     r.begin(0, "");
     r.appendCodepoint('A');
@@ -171,48 +171,48 @@ test "appendCodepoint: ASCII 制御文字は無視される（digest 1行契約�
     try testing.expectEqualStrings("AB", r.text());
 }
 
-test "appendCodepoint: 容量超過は無視される（クラッシュしない）" {
+test "appendCodepoint: over capacity ignored (no crash)" {
     var r: LayerRenameInput = .{};
     r.begin(0, "");
     var i: usize = 0;
     while (i < max_len) : (i += 1) r.appendCodepoint('A');
     try testing.expectEqual(@as(u8, @intCast(max_len)), r.len);
-    r.appendCodepoint('B'); // 満杯 → 無視
+    r.appendCodepoint('B'); // Full → ignore
     try testing.expectEqual(@as(u8, @intCast(max_len)), r.len);
     try testing.expect(std.mem.allEqual(u8, r.text(), 'A'));
 
-    // マルチバイト文字がギリギリ入らない場合も部分書き込みせず丸ごと無視する
+    // When a multibyte char would not fit, ignore the whole write (no partial write)
     var r2: LayerRenameInput = .{};
     r2.begin(0, "");
     i = 0;
-    while (i < max_len - 1) : (i += 1) r2.appendCodepoint('A'); // 残り1バイト
-    r2.appendCodepoint(0x3042); // 'あ' は3バイト必要 → 丸ごと拒否
+    while (i < max_len - 1) : (i += 1) r2.appendCodepoint('A'); // 1 byte left
+    r2.appendCodepoint(0x3042); // U+3042 needs 3 bytes → reject wholesale
     try testing.expectEqual(@as(u8, @intCast(max_len - 1)), r2.len);
     try testing.expect(std.unicode.utf8ValidateSlice(r2.text()));
 }
 
-test "backspace: 1コードポイント分だけ削除する（マルチバイトも壊さない）" {
+test "backspace: deletes one codepoint (does not break multibyte)" {
     var r: LayerRenameInput = .{};
     r.begin(0, "");
     r.appendCodepoint('A');
-    r.appendCodepoint(0x3042); // 'あ'
+    r.appendCodepoint(0x3042); // U+3042
     try testing.expectEqualStrings("Aあ", r.text());
     r.backspace();
     try testing.expectEqualStrings("A", r.text());
     try testing.expect(std.unicode.utf8ValidateSlice(r.text()));
     r.backspace();
     try testing.expectEqualStrings("", r.text());
-    r.backspace(); // 空でも no-op（クラッシュしない）
+    r.backspace(); // No-op even when empty (does not crash)
     try testing.expectEqualStrings("", r.text());
 }
 
-test "backspace: 非 active 中は無視される" {
+test "backspace: ignored while not active" {
     var r: LayerRenameInput = .{};
     r.backspace();
     try testing.expectEqual(@as(u8, 0), r.len);
 }
 
-test "commit: active を false にして確定文字列を返す" {
+test "commit: sets active false and returns the committed string" {
     var r: LayerRenameInput = .{};
     r.begin(1, "Old");
     r.backspace(); // "Old" → "Ol"
@@ -222,25 +222,25 @@ test "commit: active を false にして確定文字列を返す" {
     try testing.expect(!r.active);
 }
 
-test "cancel: active を false にするだけ（バッファは触らない）" {
+test "cancel: only sets active false (does not touch the buffer)" {
     var r: LayerRenameInput = .{};
     r.begin(0, "X");
     r.appendCodepoint('Y');
     r.cancel();
     try testing.expect(!r.active);
-    try testing.expectEqualStrings("XY", r.text()); // 呼び出し側が参照しない限り無害
+    try testing.expectEqualStrings("XY", r.text()); // Harmless unless the caller retains a reference
 }
 
-test "begin: max_len を超える現在名は UTF-8 境界を壊さず切り詰める" {
+test "begin: over-max_len current name truncates without breaking UTF-8 boundaries" {
     var r: LayerRenameInput = .{};
-    const long_name = "あ" ** 11; // 33 バイト（32 に収まるのは 10 個=30B まで）
+    const long_name = "あ" ** 11; // 33 bytes (10 chars = 30B fit in 32; 11 would overflow)
     r.begin(0, long_name);
     try testing.expect(r.len <= max_len);
     try testing.expect(std.unicode.utf8ValidateSlice(r.text()));
     try testing.expectEqualStrings("あ" ** 10, r.text());
 }
 
-test "TASK-120: clipboardCopy/Cut/Paste と composition 用 no-op 契約" {
+test "clipboardCopy/Cut/Paste and composition no-op contract" {
     var r: LayerRenameInput = .{};
     try testing.expect(r.clipboardCopy() == null);
     try testing.expect(r.clipboardCut() == null);
@@ -256,7 +256,7 @@ test "TASK-120: clipboardCopy/Cut/Paste と composition 用 no-op 契約" {
     r.clipboardPaste("新\n名");
     try testing.expectEqualStrings("新名", r.text());
 
-    // 最大長超過は UTF-8 境界で切る
+    // Over-length truncates on a UTF-8 boundary
     r.clipboardPaste("あ" ** 20);
     try testing.expectEqual(@as(u8, 30), r.len);
     try testing.expect(std.unicode.utf8ValidateSlice(r.text()));

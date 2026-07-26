@@ -1,9 +1,9 @@
-//! ベジェ(ペン)ツールの入力アダプタ（TASK-21.13）。
+//! Bezier (pen) tool input adapter.
 //!
-//! pixie の入力スナップショット（マウス/時刻）を core.PathEditor の抽象イベントへ変換する。
-//! press 起点は canvas 表示領域内のみ受け付け（displayContains）、一度ドラッグに入れば外でも継続。
-//! ダブルクリック（0.30s / 4px）で rasterizeCommit を呼び確定する。Enter/Esc/Delete は main の
-//! handleKey から PathEditor を直接駆動する（このアダプタはマウスのみ担当）。
+//! Converts pixie's input snapshot (mouse/time) into abstract core.PathEditor events.
+//! Accepts press-origin only inside the canvas display area (displayContains); once dragging, continues outside.
+//! Double-click (0.30s / 4px) calls rasterizeCommit to finish. Enter/Esc/Delete are driven directly on
+//! PathEditor from main's handleKey (this adapter handles mouse only).
 
 const std = @import("std");
 const core = @import("paint");
@@ -15,7 +15,7 @@ pub const BezierInput = struct {
     last_click: core.Vec2 = .{ .x = 0, .y = 0 },
     in_drag: bool = false,
 
-    /// 1 フレーム分の入力スナップショット（canvas_input.Frame と同型 + time）。
+    /// One-frame input snapshot (same shape as canvas_input.Frame + time).
     pub const Frame = struct {
         canvas_rect: ?core.Rect,
         zoom: Zoom,
@@ -27,8 +27,8 @@ pub const BezierInput = struct {
         time: f64,
     };
 
-    /// 1 フレーム処理。確定（ダブルクリック）が起きたらその UndoCmd を返す（呼び出し側が push）。
-    /// `dab`/`color`/`opacity` は確定時の active ブラシから渡す。
+    /// Process one frame. On commit (double-click), returns the UndoCmd (caller pushes).
+    /// `dab`/`color`/`opacity` come from the active brush at commit time.
     pub fn update(
         self: *BezierInput,
         frame: Frame,
@@ -41,7 +41,7 @@ pub const BezierInput = struct {
         opacity: u8,
     ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
-        editor.hit_radius = 6.0 / frame.zoom.scaleF32(); // screen 6px 相当
+        editor.hit_radius = 6.0 / frame.zoom.scaleF32(); // equivalent to 6 screen px
 
         if (frame.pressed_left and zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos)) {
             const dt = frame.time - self.last_click_t;
@@ -49,14 +49,14 @@ pub const BezierInput = struct {
             const dy = frame.mouse_pressed_pos.y - self.last_click.y;
             const near = (dx * dx + dy * dy) <= 16; // 4px^2
             if (self.last_click_t >= 0 and dt <= 0.30 and near) {
-                // ダブルクリック → 確定（2 回目のクリック位置に点は追加しない）
+                // Double-click → commit (do not add a point at the second click position)
                 self.last_click_t = -1;
                 self.in_drag = false;
                 return editor.rasterizeCommit(canvas, rec, gpa, dab, color, opacity);
             }
             const cp = zoom_mod.screenToCanvasF(frame.mouse_pressed_pos, rect, frame.zoom);
             editor.update(gpa, .{ .pointer_down = cp });
-            editor.preview_point = null; // ドラッグ中は仮点を出さない
+            editor.preview_point = null; // While dragging, do not emit a provisional point
             self.in_drag = true;
             self.last_click_t = frame.time;
             self.last_click = frame.mouse_pressed_pos;
@@ -73,7 +73,7 @@ pub const BezierInput = struct {
                 editor.update(gpa, .{ .pointer_move = cp });
             }
         }
-        // hover プレビュー（非ドラッグ・編集中: カーソルを次アンカーの仮点に追従。canvas 外は消す）
+        // hover preview (not dragging, editing: cursor tracks the next-anchor provisional point; hide outside canvas)
         if (!self.in_drag and editor.isEditing()) {
             editor.preview_point = if (zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pos))
                 zoom_mod.screenToCanvasF(frame.mouse_pos, rect, frame.zoom)
@@ -108,7 +108,7 @@ fn frameAtSplit(px: i32, py: i32, mx: i32, my: i32, rx: i32, ry: i32, pressed: b
     };
 }
 
-test "press 起点は canvas 外なら無視" {
+test "press-origin outside the canvas is ignored" {
     const gpa = std.testing.allocator;
     var ed: core.PathEditor = .{};
     defer ed.deinit(gpa);
@@ -118,13 +118,13 @@ test "press 起点は canvas 外なら無視" {
     defer rec.deinit(gpa);
     var bi: BezierInput = .{};
 
-    // rect 外 (100,100) で press → アンカー追加されない
+    // press outside rect at (100,100) → no anchor added
     _ = bi.update(frameAt(100, 100, true, false, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expectEqual(@as(usize, 0), ed.path.anchors.items.len);
     try std.testing.expect(!bi.in_drag);
 }
 
-test "クリックでアンカー追加、ダブルクリックで確定" {
+test "click adds an anchor; double-click commits" {
     const gpa = std.testing.allocator;
     var ed: core.PathEditor = .{};
     defer ed.deinit(gpa);
@@ -134,20 +134,20 @@ test "クリックでアンカー追加、ダブルクリックで確定" {
     defer rec.deinit(gpa);
     var bi: BezierInput = .{};
 
-    // 1 点目: down + up（角）
+    // 1st point: down + up (corner)
     _ = bi.update(frameAt(2, 2, true, true, 1.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
-    // 2 点目: 離れた場所で down + up
+    // 2nd point: down + up at a distant place
     _ = bi.update(frameAt(12, 2, true, true, 2.0), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expectEqual(@as(usize, 2), ed.path.anchors.items.len);
 
-    // 同じ場所を素早く再クリック（ダブルクリック）→ 確定して path クリア
+    // quick re-click at the same place (double-click) → commit and clear the path
     const cmd = bi.update(frameAt(12, 2, true, true, 2.1), &ed, &canvas, &rec, gpa, DUMMY_DAB, 0xFFFF0000, 255);
     try std.testing.expect(cmd != null);
     if (cmd) |c| gpa.free(c.diffs);
     try std.testing.expect(!ed.isEditing());
 }
 
-test "bezier_input: release 確定は mouse_released_pos（up 後 move が同フレームでも h_out がずれない）" {
+test "bezier_input: release commits at mouse_released_pos (same-frame post-up move does not shift h_out)" {
     const gpa = std.testing.allocator;
     var ed: core.PathEditor = .{};
     defer ed.deinit(gpa);

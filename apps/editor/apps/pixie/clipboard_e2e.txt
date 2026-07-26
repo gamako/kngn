@@ -1,5 +1,5 @@
-# TASK-120 pixie clipboard / baseline（headless）
-# stroke 入りベースライン: fb crc=A2475428 / canvas comp=C71B368F
+# pixie clipboard / baseline (headless)
+# stroke baseline: fb crc=A2475428 / canvas comp=C71B368F
 step 3
 action stroke 10 10 60 10 60 60
 step 2

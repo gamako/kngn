@@ -1,11 +1,11 @@
-//! CommandRecord → 履歴表示 schema（TASK-62.5.5）。
+//! CommandRecord → history-display schema.
 //!
-//! TASK-83 Phase 1 の in-process 入口と history probe（digest/snapshot）の単一ソース。
-//! `App` / `main.zig` を import しない（循環回避）。`@import` は kit（command 型）+ actions + std。
+//! Single source for the in-process entry point and the history probe (digest/snapshot).
+//! Does not import `App` / `main.zig` (avoids cycles). `@import`s are kit (command types) + actions + std.
 //!
-//! ## ホットパス宣言
-//! summarize / digest / snapshot はすべて**イベント時のみ**（probe 要求時・将来の panel 再構築時）。
-//! フレーム毎全走査 / RT 経路には乗らない。
+//! ## Hot-path note
+//! summarize / digest / snapshot are all **event-only** (on probe request; future panel rebuilds).
+//! Not a per-frame full scan or an RT path.
 
 const std = @import("std");
 const kit = @import("kit");
@@ -14,7 +14,7 @@ const actions = @import("actions.zig");
 
 const testing = std.testing;
 
-/// harness `DIGEST_BUF_LEN` と同値（history_summary は harness を import しない）。
+/// Same value as harness `DIGEST_BUF_LEN` (history_summary does not import harness).
 pub const DIGEST_BUF_LEN = 1024;
 
 pub const VisualKind = enum {
@@ -31,14 +31,14 @@ pub const BBox = struct {
     y1: u16,
 };
 
-/// 履歴行のグラフィカル表示メタ（TASK-83.2）。CommandRecord / thumbnail buffer の借用は持たない。
+/// Graphical display metadata for a history row. Holds no borrow of CommandRecord / thumbnail buffer.
 pub const VisualMeta = struct {
     kind: VisualKind = .none,
     thumb_present: bool = false,
     bbox: ?BBox = null,
 };
 
-/// peer origin の解決結果 kind（netsync ActorKind を apps 層で再表現。TASK-83 Phase 2）。
+/// Resolved peer-origin kind (re-expresses netsync ActorKind at the apps layer).
 pub const ActorOriginKind = enum { unknown, human, agent };
 
 pub const ActorOriginResult = struct {
@@ -46,29 +46,29 @@ pub const ActorOriginResult = struct {
     label_len: usize = 0,
 };
 
-/// peer_id → kind/label。label は `label_buf` へ書き、`label_len` で長さを返す。
+/// peer_id → kind/label. Writes label into `label_buf` and returns length via `label_len`.
 pub const ResolvePeerOriginFn =
     *const fn (ctx: *anyopaque, peer_id: u32, label_buf: []u8) ActorOriginResult;
 
-/// actor label の最大長（netsync MAX_LABEL_LEN と同値。history は netsync を import しない）。
+/// Max actor-label length (same as netsync MAX_LABEL_LEN; history does not import netsync).
 pub const MAX_ACTOR_LABEL: usize = 200;
 
 pub const HistoryContext = struct {
     ctx: *anyopaque,
     hasHandle: *const fn (ctx: *anyopaque, ref: u64) bool,
     log: *const command.CommandLog,
-    /// seq から visual metadata を取得（未配線時は none）。
+    /// Fetch visual metadata by seq (none when unwired).
     getVisualMeta: ?*const fn (ctx: *anyopaque, seq: u64) VisualMeta = null,
-    /// peer origin 解決（netsync 無効時は null。TASK-83 Phase 2）。
+    /// Resolve peer origin (null when netsync is off).
     resolvePeerOrigin: ?ResolvePeerOriginFn = null,
 };
 
-/// 履歴 1 件の表示用ビュー。
+/// Display view of one history entry.
 ///
-/// `name` / `actor` / `kind` は借用 slice（`name` は `CommandRecord.name_buf` への参照、
-/// `actor`/`kind` は `@tagName` の静的文字列）。`summary_buf` / `origin_label_buf` は inline copy。
-/// `CommandLog` の変異（`append` による ring 上書き）を跨いで `HistoryEntry` を保持してはならない。
-/// イベント時に `makeHistoryEntry` で再構築すること。
+/// `name` / `actor` / `kind` are borrowed slices (`name` references `CommandRecord.name_buf`;
+/// `actor`/`kind` are `@tagName` static strings). `summary_buf` / `origin_label_buf` are inline copies.
+/// Do not hold a `HistoryEntry` across `CommandLog` mutation (`append` ring overwrite).
+/// Rebuild with `makeHistoryEntry` on the event.
 pub const HistoryEntry = struct {
     seq: u64,
     actor: []const u8,
@@ -85,9 +85,9 @@ pub const HistoryEntry = struct {
     redo_of: ?u64,
     undo_live: ?bool,
     epoch: u64,
-    /// グラフィカル表示メタ（callback からコピー。TASK-83.2）。
+    /// Graphical display metadata (copied from the callback).
     visual: VisualMeta = .{},
-    /// peer origin（`.peer` のみ。resolver 未配線/未解決は unknown。TASK-83 Phase 2）。
+    /// Peer origin (`.peer` only. unknown when the resolver is unwired/unresolved).
     origin_kind: ActorOriginKind = .unknown,
     origin_label_buf: [MAX_ACTOR_LABEL]u8 = undefined,
     origin_label_len: u8 = 0,
@@ -101,7 +101,7 @@ pub const HistoryEntry = struct {
     }
 };
 
-/// pixie summarize の唯一の本体（adapter / makeHistoryEntry の双方がこれを呼ぶ）。
+/// Sole body of pixie summarize (both the adapter and makeHistoryEntry call this).
 pub fn summarizeRecord(rec: *const command.CommandRecord, buf: []u8) []const u8 {
     var scratch: [command.MAX_SUMMARY]u8 = undefined;
     const raw: []const u8 = blk: {
@@ -147,7 +147,7 @@ fn copyAsciiSummary(src: []const u8, buf: []u8) []const u8 {
             out_len += 1;
             i += 1;
         } else {
-            // 非 ASCII は 1 code unit を '?' に潰し、UTF-8 シーケンスをスキップ
+            // Non-ASCII: collapse one code unit to '?'; skip the UTF-8 sequence
             const seq_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
             buf[out_len] = '?';
             out_len += 1;
@@ -155,9 +155,9 @@ fn copyAsciiSummary(src: []const u8, buf: []u8) []const u8 {
             if (i > src.len) i = src.len;
         }
     }
-    // UTF-8 境界: 最後が不完全なら削る（ASCII 正規化後は実質不要だが防御）
+    // UTF-8 boundary: trim if the end is incomplete (mostly redundant after ASCII normalisation, but defensive)
     while (out_len > 0 and buf[out_len - 1] & 0x80 != 0 and buf[out_len - 1] & 0xC0 != 0xC0) {
-        // continuation only — 上のループでは出さない
+        // continuation only — not emitted by the loop above
         out_len -= 1;
     }
     return buf[0..out_len];
@@ -193,7 +193,7 @@ pub fn makeHistoryEntry(hctx: HistoryContext, rec: *const command.CommandRecord)
     if (hctx.getVisualMeta) |get| {
         e.visual = get(hctx.ctx, rec.seq);
     }
-    // peer origin: CommandLog 変異を跨がない inline copy（resolver null / 未解決は unknown のまま）
+    // peer origin: inline copy that does not span CommandLog mutation (null / unresolved resolver stays unknown)
     if (e.actor_peer) |pid| {
         if (hctx.resolvePeerOrigin) |resolve| {
             var lbuf: [MAX_ACTOR_LABEL]u8 = undefined;
@@ -214,13 +214,13 @@ fn tokenSafe(dst: []u8, src: []const u8) []const u8 {
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const c = src[i];
-        // digest 1行契約: 空白/= に加え、非印刷 ASCII も '_' へ（制御文字で行が割れないように）。
+        // digest one-line contract: spaces/= plus non-printing ASCII become '_' (so control chars cannot split the line).
         dst[i] = if (c >= 0x20 and c <= 0x7E and c != ' ' and c != '=') c else '_';
     }
     return dst[0..n];
 }
 
-/// §4b digest。空 log の全文はテストの正。TASK-83.2: last_thumb / last_bbox を additive 追加。
+/// Digest. Empty-log full text is the test oracle. Additive last_thumb / last_bbox.
 pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
     const log = hctx.log;
     if (log.filled == 0) {
@@ -271,7 +271,7 @@ pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
     var name_safe_buf: [command.MAX_CMD_NAME]u8 = undefined;
     const name_safe = tokenSafe(&name_safe_buf, entry.name);
 
-    // 固定キーを先に書き、last_summary を残り容量へ（DIGEST 収まり保証）
+    // Write fixed keys first; put last_summary into the remaining capacity (DIGEST fit guarantee)
     const head = std.fmt.bufPrint(buf, "count={d} last_seq={d} last_actor={s} last_name={s} last_undoable={d} last_undo_ref={s} last_undo_live={s} last_tx={s} last_kind={s} last_target={s} last_redo_of={s} last2_tx={s} last_summary=", .{
         log.filled,
         entry.seq,
@@ -290,7 +290,7 @@ pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
     var pos: usize = head.len;
     var sum_safe_buf: [command.MAX_SUMMARY]u8 = undefined;
     const sum_safe = tokenSafe(&sum_safe_buf, entry.summary());
-    // 末尾固定フィールド（thumb/bbox 込み）の最悪長を予約（値は 0/1 同長・bbox は最大 5*4+3）。
+    // Reserve worst-case length for the trailing fixed fields (incl. thumb/bbox; 0/1 values same length; bbox max 5*4+3).
     const tail_reserve = " last_reverted=0 last_redo_consumed=0 last_thumb=0 last_bbox=65535,65535,65535,65535".len;
     const sum_room = if (buf.len > pos + tail_reserve) buf.len - pos - tail_reserve else 0;
     const sum_n = @min(sum_safe.len, sum_room);
@@ -312,8 +312,8 @@ pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
     }) catch return buf[0..0];
     pos += tail.len;
 
-    // TASK-83 Phase 2 additive: origin 解決済みのときだけ末尾に kind/label を追加。
-    // resolver null / 未解決なら既存出力と bit 一致。
+    // Additive: append kind/label at the end only when origin is resolved.
+    // Null / unresolved resolver → bit-identical to the previous output.
     if (entry.origin_kind != .unknown) {
         const kind_tok: []const u8 = switch (entry.origin_kind) {
             .human => "human",
@@ -325,7 +325,7 @@ pub fn formatDigest(hctx: HistoryContext, buf: []u8) []const u8 {
         const origin_tail = std.fmt.bufPrint(buf[pos..], " last_origin_kind={s} last_origin_label={s}", .{
             kind_tok,
             lab_tok,
-        }) catch return buf[0..pos]; // 収まらなければ additive を落とす（既存 tail は保持）
+        }) catch return buf[0..pos]; // If it does not fit, drop the additive (keep the existing tail)
         pos += origin_tail.len;
     }
     return buf[0..pos];
@@ -382,7 +382,7 @@ fn appendOptBool(list: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?boo
     }
 }
 
-/// 1 entry を JSON object として追記（人工 fixture の escape テストからも利用）。
+/// Append one entry as a JSON object (also used by synthetic-fixture escape tests).
 pub fn appendEntryJson(list: *std.ArrayList(u8), allocator: std.mem.Allocator, e: *const HistoryEntry) !void {
     try list.append(allocator, '{');
     try list.appendSlice(allocator, "\"seq\":");
@@ -419,7 +419,7 @@ pub fn appendEntryJson(list: *std.ArrayList(u8), allocator: std.mem.Allocator, e
         var tmp: [24]u8 = undefined;
         try list.appendSlice(allocator, try std.fmt.bufPrint(&tmp, "{d}", .{e.epoch}));
     }
-    // TASK-83.2 additive: thumb / bbox
+    // Additive: thumb / bbox
     try list.appendSlice(allocator, ",\"thumb\":");
     try list.appendSlice(allocator, if (e.visual.thumb_present) "true" else "false");
     try list.appendSlice(allocator, ",\"bbox\":");
@@ -430,7 +430,7 @@ pub fn appendEntryJson(list: *std.ArrayList(u8), allocator: std.mem.Allocator, e
     } else {
         try list.appendSlice(allocator, "null");
     }
-    // TASK-83 Phase 2 additive: origin_kind / origin_label（解決済みのみ。actor/actor_peer は不変）
+    // Additive: origin_kind / origin_label (resolved only; actor/actor_peer unchanged)
     if (e.origin_kind != .unknown) {
         try list.appendSlice(allocator, ",\"origin_kind\":");
         try appendJsonStr(list, allocator, switch (e.origin_kind) {
@@ -715,14 +715,14 @@ test "formatSnapshotJson: full ring (128) keeps oldest-to-newest order" {
     const json = try formatSnapshotJson(hctx, testing.allocator);
     defer testing.allocator.free(json);
 
-    // (a) entry 数 = 128（満杯後 wrap しても filled 上限）
+    // (a) entry count = 128 (filled cap even after a full wrap)
     try testing.expectEqual(@as(usize, command.MAX_CMD_LOG), std.mem.count(u8, json, "\"seq\":"));
-    // (b) 先頭 = 最古の生存 seq=3（1,2 は evict）
+    // (b) head = oldest live seq=3 (1,2 evicted)
     try testing.expect(std.mem.startsWith(u8, json, "[{\"seq\":3,"));
-    // (c) 末尾 entry の seq = 130（最新）
+    // (c) tail entry seq = 130 (newest)
     const last_seq_key = std.mem.lastIndexOf(u8, json, "\"seq\":").?;
     try testing.expect(std.mem.startsWith(u8, json[last_seq_key..], "\"seq\":130,"));
-    // (d) 昇順（先頭が末尾より前）
+    // (d) ascending (head precedes tail)
     const first_pos = std.mem.indexOf(u8, json, "\"seq\":3,").?;
     try testing.expect(first_pos < last_seq_key);
 }
@@ -790,7 +790,7 @@ test "formatDigest: reverted and redo_consumed" {
 }
 
 // ---------------------------------------------------------------------------
-// TASK-83 Phase 2: peer origin resolve / additive digest·snapshot
+// peer origin resolve / additive digest·snapshot
 // ---------------------------------------------------------------------------
 
 const TestOriginMap = struct {
@@ -836,7 +836,7 @@ test "formatDigest/snapshot: resolver null keeps legacy bit identity" {
         .ctx = &dummy,
         .hasHandle = testHasHandleAll,
         .log = &log,
-        // resolvePeerOrigin = null（netsync 無効）
+        // resolvePeerOrigin = null (netsync off)
     };
     var buf: [DIGEST_BUF_LEN]u8 = undefined;
     const got = formatDigest(hctx, &buf);
@@ -872,7 +872,7 @@ test "formatDigest: additive last_origin_kind/label when resolved" {
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"origin_kind\":\"agent\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"origin_label\":\"bot\"") != null);
-    // 既存 actor / actor_peer は維持
+    // Existing actor / actor_peer kept
     try testing.expect(std.mem.indexOf(u8, json, "\"actor\":\"peer\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"actor_peer\":5") != null);
 }
@@ -881,7 +881,7 @@ test "makeHistoryEntry: unresolved peer stays unknown (no additive)" {
     var rec = fillRec("set_tool", "pen");
     rec.seq = 1;
     rec.actor = .{ .peer = 9 };
-    var map: TestOriginMap = .{ .peer_id = 1, .kind = .human, .label = "other" }; // 不一致
+    var map: TestOriginMap = .{ .peer_id = 1, .kind = .human, .label = "other" }; // mismatch
     const hctx: HistoryContext = .{
         .ctx = &map,
         .hasHandle = testHasHandleNone,

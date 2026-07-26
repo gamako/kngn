@@ -1,15 +1,15 @@
-//! canvas 入力の状態機械（TASK-21.7 で main.zig から切り出し）。
+//! Canvas input state machine (extracted from main.zig).
 //!
-//! platform / GUI 非依存。1 フレーム分の入力スナップショット（Frame）を受け、
-//! press 起点 capture → stroke 継続 → release 確定 を Tool 経由で駆動する純粋ロジック。
-//! `capturing` と `.down` で latch した `stroke_tool` をここで保持する（latch の所在を一本化）。
+//! Platform / GUI independent. Takes a one-frame input snapshot (Frame) and
+//! drives press-origin capture → stroke continue → release commit through Tool as pure logic.
+//! Holds `capturing` and the `stroke_tool` latched on `.down` (single place for the latch).
 //!
-//! 旧 main.zig の挙動を保存:
-//! - press 起点 capture（始点は mouse_pressed_pos。canvas 表示領域内で押下した時のみ開始）
-//! - capture 開始と同じフレームで現在位置まで stroke 継続（同フレーム down→move）
-//! - capturing 中は canvas 外でも stroke 継続（clamp なし変換 → recorder 側で clip）
-//! - release は canvas 外でも stroke を確定する
-//! - tool/色の切替は capture 開始時に latch（進行中 stroke は latch 値で描く）
+//! Behaviour:
+//! - press-origin capture (start at mouse_pressed_pos; only when pressed inside the canvas display area)
+//! - on the same frame as capture start, continue the stroke to the current position (same-frame down→move)
+//! - while capturing, continue the stroke even outside the canvas (unclamped transform → recorder clips)
+//! - release commits the stroke even outside the canvas
+//! - tool/color switch is latched at capture start (in-progress stroke uses the latched values)
 
 const std = @import("std");
 const core = @import("paint");
@@ -18,23 +18,23 @@ const Zoom = zoom_mod.Zoom;
 
 pub const CanvasInput = struct {
     capturing: bool = false,
-    /// `.down` で latch した Tool（fat-pointer のコピー。実体は App が所有し続ける）
+    /// Tool latched on `.down` (fat-pointer copy; App keeps owning the instance)
     stroke_tool: core.Tool = undefined,
 
-    /// 1 フレーム分の入力スナップショット。
+    /// One-frame input snapshot.
     pub const Frame = struct {
-        /// canvas 表示領域（rect.w/h は canvas ピクセル数）。初回フレームなど未確定なら null。
+        /// Canvas display area (rect.w/h = canvas pixel count). null if not yet known (e.g. first frame).
         canvas_rect: ?core.Rect,
         zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
         mouse_released_pos: core.Vec2,
-        pressed_left: bool, // このフレームで左ボタンが押された
-        released_left: bool, // このフレームで左ボタンが離された
+        pressed_left: bool, // Left button pressed this frame
+        released_left: bool, // Left button released this frame
     };
 
-    /// 1 フレーム処理する。`active_tool` は現在 UI 選択中の Tool（capture 開始時に latch）。
-    /// stroke が確定したらその UndoCmd を返す（呼び出し側が UndoStack へ push）。
+    /// Process one frame. `active_tool` is the Tool currently selected in the UI (latched at capture start).
+    /// When a stroke commits, returns its UndoCmd (caller pushes onto UndoStack).
     pub fn update(
         self: *CanvasInput,
         frame: Frame,
@@ -45,17 +45,17 @@ pub const CanvasInput = struct {
     ) ?core.PaintDiff {
         const rect = frame.canvas_rect orelse return null;
 
-        // press 起点 capture: 未 capture かつ canvas 表示領域内で押下 → 開始 + 始点描画
+        // press-origin capture: not capturing and pressed inside the canvas display area → start + paint origin
         if (!self.capturing and frame.pressed_left and
             zoom_mod.displayContains(rect, frame.zoom, frame.mouse_pressed_pos))
         {
             self.capturing = true;
-            self.stroke_tool = active_tool; // latch（進行中 stroke はこの Tool で描く）
+            self.stroke_tool = active_tool; // latch (in-progress stroke is drawn with this Tool)
             const cp = zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom);
             _ = self.stroke_tool.onEvent(canvas, rec, gpa, .{ .down = .{ .x = cp.x, .y = cp.y } });
         }
 
-        // capturing 中は現在位置まで継続。release フレームは確定（旧 strokeTo→endStroke 相当）。
+        // While capturing, continue to the current position. On the release frame, commit (was strokeTo→endStroke).
         if (self.capturing) {
             if (frame.released_left) {
                 const cp = zoom_mod.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom);
@@ -69,8 +69,8 @@ pub const CanvasInput = struct {
         return null;
     }
 
-    /// 進行中 capture を確定せず中断する（capturing=false。stroke_tool は未使用になる）。
-    /// StrokeRecorder / Fill pending の巻き戻しは呼び出し側（App）の責務。TASK-94 Phase C P1。
+    /// Abort an in-progress capture without committing (capturing=false; stroke_tool becomes unused).
+    /// Rolling back StrokeRecorder / Fill pending is the caller's (App) responsibility.
     pub fn cancel(self: *CanvasInput) void {
         self.capturing = false;
     }
@@ -80,9 +80,9 @@ pub const CanvasInput = struct {
 // Tests
 // ============================================================
 
-const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
+const RED: u32 = 0xFFFF0000; // canonical BGRA(red)
 
-/// テスト用の最小セットアップ（Canvas + StrokeRecorder + Pen + CanvasInput）。
+/// Minimal test setup (Canvas + StrokeRecorder + Pen + CanvasInput).
 const Harness = struct {
     gpa: std.mem.Allocator,
     canvas: core.Canvas,
@@ -108,14 +108,14 @@ const Harness = struct {
     }
 };
 
-// rect 原点 (0,0)、zoom=1 で window 座標 = canvas 座標にして検証する
+// Verify with rect origin (0,0), zoom=1 so window coords == canvas coords
 const RECT0 = core.Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
 
-test "canvas_input: press でフレーム内 capture 開始、release で確定 + UndoCmd を返す" {
+test "canvas_input: press starts same-frame capture; release commits and returns UndoCmd" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
-    // press のみ（移動なし）。同フレームで down→move(同座標) が走る
+    // press only (no move). Same-frame down→move(same coords) runs
     var cmd = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -127,9 +127,9 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
     });
     try std.testing.expect(cmd == null);
     try std.testing.expect(h.ci.capturing);
-    try std.testing.expectEqual(RED, h.pixels()[0]); // (0,0) 塗られた
+    try std.testing.expectEqual(RED, h.pixels()[0]); // (0,0) painted
 
-    // release（次フレーム、同座標）→ 確定
+    // release (next frame, same coords) → commit
     cmd = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -147,11 +147,11 @@ test "canvas_input: press でフレーム内 capture 開始、release で確定 
     try std.testing.expectEqual(@as(usize, 1), c.diffs.len);
 }
 
-test "canvas_input: 同フレーム down→move（押下即ドラッグ）で初手セグメントが欠落しない" {
+test "canvas_input: same-frame down→move (press-then-drag) keeps the first segment" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
-    // press 位置 (0,0)、だが同フレームで mouse は (5,0) まで動いている
+    // press at (0,0), but mouse has already moved to (5,0) on the same frame
     const cmd = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -162,11 +162,11 @@ test "canvas_input: 同フレーム down→move（押下即ドラッグ）で初
         .released_left = false,
     });
     try std.testing.expect(cmd == null);
-    // (0,0)→(5,0) の 6px が同フレームで塗られている
+    // the 6px from (0,0)→(5,0) are painted on the same frame
     for (0..6) |x| try std.testing.expectEqual(RED, h.pixels()[x]);
 }
 
-test "canvas_input: canvas 外への継続は clip され crash しない / 外 release で確定" {
+test "canvas_input: continue outside canvas is clipped without crash / outside release commits" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
@@ -179,7 +179,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
         .pressed_left = true,
         .released_left = false,
     });
-    // canvas 外へドラッグ（move）
+    // drag (move) outside the canvas
     _ = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -189,7 +189,7 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
         .pressed_left = false,
         .released_left = false,
     });
-    // canvas 外で release → 確定
+    // release outside the canvas → commit
     const cmd = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -203,11 +203,11 @@ test "canvas_input: canvas 外への継続は clip され crash しない / 外 
     try std.testing.expect(!h.ci.capturing);
     const c = cmd.?;
     defer h.gpa.free(c.diffs);
-    // 行 y=2 の x=2..15 は塗られている（出ていく途中）
+    // row y=2, x=2..15 is painted (while exiting)
     for (2..16) |x| try std.testing.expectEqual(RED, h.pixels()[2 * 16 + x]);
 }
 
-test "canvas_input: 表示領域外の press では capture を開始しない" {
+test "canvas_input: press outside the display area does not start capture" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
@@ -215,7 +215,7 @@ test "canvas_input: 表示領域外の press では capture を開始しない" 
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 100 },
-        .mouse_pressed_pos = .{ .x = 100, .y = 100 }, // rect 外
+        .mouse_pressed_pos = .{ .x = 100, .y = 100 }, // outside rect
         .mouse_released_pos = .{ .x = 100, .y = 100 },
         .pressed_left = true,
         .released_left = false,
@@ -224,11 +224,11 @@ test "canvas_input: 表示領域外の press では capture を開始しない" 
     try std.testing.expect(!h.ci.capturing);
 }
 
-test "canvas_input: capture 開始後にズレてもツールは down 時 latch（次以降のフレームは latch tool）" {
+test "canvas_input: tool stays latched from down even if UI selection drifts (later frames use latch tool)" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
-    // down で Pen を latch
+    // latch Pen on down
     _ = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -238,7 +238,7 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
         .pressed_left = true,
         .released_left = false,
     });
-    // 別 Tool（Eraser）を active として渡しても、capturing 中は latch 済み Pen が使われる
+    // Even if another Tool (Eraser) is passed as active, the latched Pen is used while capturing
     var eraser: core.Eraser = .{};
     const cmd = h.ci.update(.{
         .canvas_rect = RECT0,
@@ -252,11 +252,11 @@ test "canvas_input: capture 開始後にズレてもツールは down 時 latch�
     try std.testing.expect(cmd != null);
     const c = cmd.?;
     defer h.gpa.free(c.diffs);
-    // Pen(RED) で塗られている（Eraser=透明 ではない）
+    // Painted with Pen(RED) (not Eraser=transparent)
     for (0..4) |x| try std.testing.expectEqual(RED, h.pixels()[x]);
 }
 
-test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フレームでも伸びない）" {
+test "canvas_input: release commits at mouse_released_pos (same-frame post-up move does not extend)" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
@@ -294,7 +294,7 @@ test "canvas_input: release 確定は mouse_released_pos（up 後 move が同フ
     for (11..16) |x| try std.testing.expectEqual(@as(u32, 0), h.pixels()[x]);
 }
 
-test "canvas_input: cancel は capture を中断し次の press で再開できる" {
+test "canvas_input: cancel aborts capture and the next press can restart" {
     var h = try Harness.init(std.testing.allocator, 16, 16, RED);
     defer h.deinit();
 
@@ -321,10 +321,10 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
 
     h.ci.cancel();
     try std.testing.expect(!h.ci.capturing);
-    // recorder 巻き戻しは呼び出し側責務（App）。次 stroke の begin assert を避けるため abandon。
+    // Recorder rollback is the caller's (App) duty. abandon so the next stroke's begin assert does not fire.
     h.rec.abandon(&h.canvas, h.gpa);
 
-    // cancel 後の release は確定しない（capturing=false）
+    // release after cancel does not commit (capturing=false)
     const noop = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),
@@ -337,7 +337,7 @@ test "canvas_input: cancel は capture を中断し次の press で再開でき�
     try std.testing.expect(noop == null);
     try std.testing.expect(!h.ci.capturing);
 
-    // 新しい press で capture 再開できる
+    // A new press can restart capture
     _ = h.update(.{
         .canvas_rect = RECT0,
         .zoom = Zoom.one(),

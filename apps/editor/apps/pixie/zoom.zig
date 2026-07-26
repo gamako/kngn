@@ -1,16 +1,16 @@
-//! pixie の rational zoom（TASK-153.2）。
+//! Pixie rational zoom.
 //!
-//! 整数倍率 `num/1`（1..32）と縮小 `1/2・1/3・1/4` のみ。表示サイズ・座標変換・
-//! stage 遷移をここに集約する。libs/paint の整数 `screenToCanvas*` は縮小経路で使わない。
+//! Integer magnifications `num/1` (1..32) and shrink `1/2·1/3·1/4` only. Display size, coordinate transforms,
+//! and stage transitions live here. libs/paint's integer `screenToCanvas*` is not used on the shrink path.
 //!
-//! ホットパス宣言: 本モジュールは O(1) の座標計算のみ。全画素ループは blit.zig 側。
+//! Hot-path note: this module is O(1) coordinate math only. The full-pixel loop is in blit.zig.
 
 const std = @import("std");
 const core = @import("paint");
 
-/// 正規化済み rational zoom。不変条件:
-/// - 整数: `num ∈ 1..32, den = 1`
-/// - 縮小: `num = 1, den ∈ {2,3,4}`
+/// Normalised rational zoom. Invariants:
+/// - integer: `num ∈ 1..32, den = 1`
+/// - shrink: `num = 1, den ∈ {2,3,4}`
 pub const Zoom = struct {
     num: u32,
     den: u32,
@@ -30,7 +30,7 @@ pub const Zoom = struct {
         return .{ .num = 2, .den = 1 };
     }
 
-    /// 整数倍率ならその値、縮小なら null。
+    /// Integer magnification value, or null when shrinking.
     pub fn toInteger(self: Zoom) ?i32 {
         if (self.den != 1) return null;
         return @intCast(self.num);
@@ -48,19 +48,19 @@ pub const Zoom = struct {
         return @as(f32, @floatFromInt(self.num)) / @as(f32, @floatFromInt(self.den));
     }
 
-    /// 表示用パーセント（`num/den*100` の整数除算。1/3 → 33）。
+    /// Display percent (`num/den*100` integer division. 1/3 → 33).
     pub fn pct(self: Zoom) u32 {
         return self.num * 100 / self.den;
     }
 
-    /// `ceil(canvas_dim * num / den)`。表示矩形の幅・高さ。
+    /// `ceil(canvas_dim * num / den)`. Width/height of the display rect.
     pub fn displayExtent(self: Zoom, canvas_dim: u32) i32 {
         const n = @as(u64, canvas_dim) * @as(u64, self.num);
         const d = @as(u64, self.den);
         return @intCast((n + d - 1) / d);
     }
 
-    /// 段: 1/4 → 1/3 → 1/2 → 1 → 2 → … → 32。上限で clamp。
+    /// Stages: 1/4 → 1/3 → 1/2 → 1 → 2 → … → 32. Clamp at the top.
     pub fn nextIn(self: Zoom) Zoom {
         if (self.den > 1) {
             return switch (self.den) {
@@ -74,7 +74,7 @@ pub const Zoom = struct {
         return self;
     }
 
-    /// 段: 32 → … → 1 → 1/2 → 1/3 → 1/4。下限で clamp。
+    /// Stages: 32 → … → 1 → 1/2 → 1/3 → 1/4. Clamp at the bottom.
     pub fn nextOut(self: Zoom) Zoom {
         if (self.den == 1) {
             if (self.num > 1) return .{ .num = self.num - 1, .den = 1 };
@@ -88,7 +88,7 @@ pub const Zoom = struct {
         };
     }
 
-    /// `delta > 0` で nextIn、`< 0` で nextOut を |delta| 回。
+    /// `delta > 0` calls nextIn, `< 0` calls nextOut, |delta| times.
     pub fn stepped(self: Zoom, delta: i32) Zoom {
         var z = self;
         var d = delta;
@@ -97,15 +97,15 @@ pub const Zoom = struct {
         return z;
     }
 
-    /// 両軸が収まる最大倍率。整数を優先し、1 未満なら 1/2→1/3→1/4 の順で試す。
-    /// どれも収まらなければ 1/4 に clamp。
+    /// Largest magnification that fits both axes. Prefer integers; if under 1, try 1/2→1/3→1/4 in order.
+    /// If none fit, clamp to 1/4.
     pub fn fit(area_w: i32, area_h: i32, canvas_w: u32, canvas_h: u32) Zoom {
         if (area_w <= 0 or area_h <= 0 or canvas_w == 0 or canvas_h == 0) return one();
         var n: u32 = max_integer;
         while (n >= 1) : (n -= 1) {
             if (fits(n, 1, area_w, area_h, canvas_w, canvas_h)) return .{ .num = n, .den = 1 };
         }
-        // 縮小: 収まる最大スケール（= 縮小しすぎない）を選ぶ
+        // shrink: pick the largest scale that fits (= do not over-shrink)
         inline for (.{ 2, 3, 4 }) |den| {
             if (fits(1, den, area_w, area_h, canvas_w, canvas_h)) return .{ .num = 1, .den = den };
         }
@@ -125,10 +125,10 @@ pub const Zoom = struct {
 };
 
 // ---------------------------------------------------------------------------
-// 座標変換（表示原点 = canvas_rect.x/y。半開区間・floor/round/ceil は計画どおり）
+// Coordinate transforms (display origin = canvas_rect.x/y. Half-open; floor/round/ceil as specified)
 // ---------------------------------------------------------------------------
 
-/// 連続 canvas 座標（clamp なし）。
+/// Continuous canvas coords (no clamp).
 pub fn screenToCanvasF(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom) core.Vec2f {
     const s = z.scaleF32();
     return .{
@@ -137,9 +137,9 @@ pub fn screenToCanvasF(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom) c
     };
 }
 
-/// セル番号。境界 clamp なし（stroke capture 継続用）。
-/// - 整数倍率: `floor(u / num)`（upsample。旧 paint.screenToCanvasRaw と一致）
-/// - 縮小 `1/N`: blit と同じ nearest `u*N + floor((N-1)/2)`（表示 pixel とクリック一致）
+/// Cell index. No boundary clamp (for continuing a stroke capture).
+/// - integer magnification: `floor(u / num)` (upsample; matches legacy paint.screenToCanvasRaw)
+/// - shrink `1/N`: same nearest as blit `u*N + floor((N-1)/2)` (display pixel and click agree)
 pub fn screenToCanvasRaw(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom) core.Vec2 {
     const dx: i32 = screen_pos.x - canvas_rect.x;
     const dy: i32 = screen_pos.y - canvas_rect.y;
@@ -147,7 +147,7 @@ pub fn screenToCanvasRaw(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom)
         const n: i32 = @intCast(z.num);
         return .{ .x = @divFloor(dx, n), .y = @divFloor(dy, n) };
     }
-    // num==1 の縮小。負 u でも整数演算で blit と揃える
+    // shrink with num==1. Align with blit via integer arithmetic even for negative u
     const den: i32 = @intCast(z.den);
     const half: i32 = @divFloor(den - 1, 2);
     return .{
@@ -156,7 +156,7 @@ pub fn screenToCanvasRaw(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom)
     };
 }
 
-/// 表示矩形内かつ canvas 画素範囲内ならセル座標、否则 null。
+/// Cell coords if inside the display rect and canvas pixel range; otherwise null.
 pub fn screenToCanvas(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom) ?core.Vec2 {
     if (!displayContains(canvas_rect, z, screen_pos)) return null;
     const cp = screenToCanvasRaw(screen_pos, canvas_rect, z);
@@ -164,14 +164,14 @@ pub fn screenToCanvas(screen_pos: core.Vec2, canvas_rect: core.Rect, z: Zoom) ?c
     return cp;
 }
 
-/// 半開区間 `[origin, origin + displayExtent)`。
+/// Half-open interval `[origin, origin + displayExtent)`.
 pub fn displayContains(rect: core.Rect, z: Zoom, p: core.Vec2) bool {
     const dw = z.displayExtent(@intCast(rect.w));
     const dh = z.displayExtent(@intCast(rect.h));
     return p.x >= rect.x and p.y >= rect.y and p.x < rect.x + dw and p.y < rect.y + dh;
 }
 
-/// セル中心の画面座標: `round(origin + (cell + 0.5) * zoom)`。
+/// Screen coords of a cell center: `round(origin + (cell + 0.5) * zoom)`.
 pub fn canvasCellCenterToScreen(origin_x: i32, origin_y: i32, cell_x: i32, cell_y: i32, z: Zoom) core.Vec2 {
     const s = z.scaleF32();
     return .{
@@ -180,7 +180,7 @@ pub fn canvasCellCenterToScreen(origin_x: i32, origin_y: i32, cell_x: i32, cell_
     };
 }
 
-/// canvas セル矩形 → 画面矩形。辺は `round(origin + edge * scale)`、幅高さは最低 1px。
+/// Canvas cell rect → screen rect. Edges `round(origin + edge * scale)`; width/height at least 1px.
 pub fn canvasRectToScreen(canvas_rect: core.Rect, cell: core.Rect, z: Zoom) struct { x: i32, y: i32, w: i32, h: i32 } {
     const s = z.scaleF32();
     const ox: f32 = @floatFromInt(canvas_rect.x);
@@ -197,7 +197,7 @@ pub fn canvasRectToScreen(canvas_rect: core.Rect, cell: core.Rect, z: Zoom) stru
     };
 }
 
-/// 連続 canvas 点 → 画面座標: `round(origin + p * zoom)`。
+/// Continuous canvas point → screen coords: `round(origin + p * zoom)`.
 pub fn canvasPointToScreen(canvas_rect: core.Rect, p: core.Vec2f, z: Zoom) core.Vec2 {
     const s = z.scaleF32();
     return .{
@@ -211,7 +211,7 @@ pub fn canvasPointToScreen(canvas_rect: core.Rect, p: core.Vec2f, z: Zoom) core.
 // ============================================================
 const testing = std.testing;
 
-test "Zoom stage: 1/4..32 の nextIn/nextOut 往復" {
+test "Zoom stage: nextIn/nextOut round-trip across 1/4..32" {
     var z = Zoom{ .num = 1, .den = 4 };
     const expected = [_]Zoom{
         .{ .num = 1, .den = 4 },
@@ -225,10 +225,10 @@ test "Zoom stage: 1/4..32 の nextIn/nextOut 往復" {
         try testing.expect(z.eql(e));
         z = z.nextIn();
     }
-    // 32 で clamp
+    // clamp at 32
     z = Zoom.fromInteger(32);
     try testing.expect(z.nextIn().eql(z));
-    // nextOut で 1/4 まで
+    // nextOut down to 1/4
     z = Zoom.one();
     try testing.expect(z.nextOut().eql(.{ .num = 1, .den = 2 }));
     try testing.expect(z.nextOut().nextOut().eql(.{ .num = 1, .den = 3 }));
@@ -244,18 +244,18 @@ test "Zoom.displayExtent: ceil" {
     try testing.expectEqual(@as(i32, 1), (Zoom{ .num = 1, .den = 4 }).displayExtent(1));
 }
 
-test "Zoom.fit: 整数優先・縮小は収まる最大" {
+test "Zoom.fit: prefer integers; shrink picks the largest that fits" {
     // 100x100 area, 40x40 canvas → max int = 2
     try testing.expect(Zoom.fit(100, 100, 40, 40).eql(.{ .num = 2, .den = 1 }));
-    // 30x30 area, 40x40 → 1 未満、1/2 は 20<=30 で収まる
+    // 30x30 area, 40x40 → under 1; 1/2 fits at 20<=30
     try testing.expect(Zoom.fit(30, 30, 40, 40).eql(.{ .num = 1, .den = 2 }));
-    // 10x10 area, 40x40 → 1/4 = 10 ちょうど
+    // 10x10 area, 40x40 → 1/4 = exactly 10
     try testing.expect(Zoom.fit(10, 10, 40, 40).eql(.{ .num = 1, .den = 4 }));
-    // 5x5 area, 40x40 → どれも収まらず 1/4 clamp
+    // 5x5 area, 40x40 → none fit; clamp to 1/4
     try testing.expect(Zoom.fit(5, 5, 40, 40).eql(.{ .num = 1, .den = 4 }));
 }
 
-test "screenToCanvas*: 整数 2x は paint と同じ" {
+test "screenToCanvas*: integer 2x matches paint" {
     const rect = core.Rect{ .x = 64, .y = 32, .w = 256, .h = 256 };
     const z = Zoom.fromInteger(2);
     try testing.expectEqual(core.Vec2{ .x = 0, .y = 0 }, screenToCanvas(.{ .x = 64, .y = 32 }, rect, z).?);
@@ -264,7 +264,7 @@ test "screenToCanvas*: 整数 2x は paint と同じ" {
     try testing.expectEqual(core.Vec2{ .x = -1, .y = -1 }, screenToCanvasRaw(.{ .x = 63, .y = 31 }, rect, z));
 }
 
-test "screenToCanvasRaw: 縮小は blit nearest と一致" {
+test "screenToCanvasRaw: shrink matches blit nearest" {
     const rect = core.Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
     // 1/2: src = u*2 + 0
     const z2 = Zoom{ .num = 1, .den = 2 };
@@ -281,7 +281,7 @@ test "screenToCanvasRaw: 縮小は blit nearest と一致" {
     try testing.expectEqual(core.Vec2{ .x = 5, .y = 1 }, screenToCanvasRaw(.{ .x = 1, .y = 0 }, rect, z4));
 }
 
-test "displayContains: displayExtent 半開" {
+test "displayContains: displayExtent half-open" {
     const rect = core.Rect{ .x = 10, .y = 20, .w = 10, .h = 10 }; // display 5x5 at 1/2
     const z = Zoom{ .num = 1, .den = 2 };
     try testing.expect(displayContains(rect, z, .{ .x = 10, .y = 20 }));

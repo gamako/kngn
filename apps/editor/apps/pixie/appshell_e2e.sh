@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TASK-114.4 appshell E2E. Generated replay files stay under workspace/.e2e.
+# appshell E2E. Generated replay files stay under workspace/.e2e.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../../../.." && pwd)
 ZIG_BIN=/nix/store/law2wc6rrky4r453xyqhpmxhkmih890i-zig-0.16.0/bin/zig
-E2E="$ROOT/.e2e/task-114.4"
+E2E="$ROOT/.e2e/appshell"
 BIN="$E2E/bin"
 APPS="$E2E/apps"
 OUT="$E2E/out"
@@ -146,10 +146,10 @@ if test "${VP_E2E_NETSYNC:-1}" = 1; then
         sleep 0.05
     done
     if test -x "$drive" && test -f "$host_port" && test -f "$client_port"; then
-        # free-run LISTEN: host は自走するので step 注入不要。await で一接続保持して join 完了を待つ。
+        # free-run LISTEN: the host runs on its own, so no step inject. await holds one connection and waits for join to finish.
         "$drive" --port-file "$client_port" 'await netsync awaiting_sync=0 600' >/dev/null
         "$drive" --port-file "$host_port" 'action stroke 10 10 20 10' >/dev/null
-        # free-run では step は frame barrier（N present 待ち）。autosave 閾値相当の 120 frame を待つ。
+        # In free-run, step is a frame barrier (wait N presents). Wait 120 frames, matching the autosave threshold.
         "$drive" --port-file "$host_port" 'step 120' >/dev/null
         "$drive" --port-file "$host_port" 'digest appshell' | grep -q 'autosave=0'
         "$drive" --port-file "$host_port" quit >/dev/null

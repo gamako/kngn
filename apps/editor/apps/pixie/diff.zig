@@ -1,5 +1,5 @@
-//! 視覚差分（TASK-87）: 基準スナップショットと現フレームの u32 画素比較。
-//! std のみ・App/kit 非依存で単体テスト可能。イベント時（digest/diff_mark）のみ走る。
+//! Visual diff: u32 pixel compare of a baseline snapshot against the current frame.
+//! std only; unit-testable without App/kit. Runs on events only (digest/diff_mark).
 
 const std = @import("std");
 
@@ -13,15 +13,15 @@ pub const DiffResult = struct {
     to: u32,
 };
 
-/// `base`/`cur` を u32 完全一致（alpha 含む）で比較し、変更画素数・外接矩形・最頻 before/after 色を返す。
-/// bbox は inclusive。changed=0 のとき bbox/from/to は 0（呼び出し側が none 表記に変換する）。
-/// 最頻色の同数 tie-break は color 昇順（hashmap 反復順に依存しない）。
+/// Compare `base`/`cur` for exact u32 match (including alpha); return changed count, bounding box, and most-frequent before/after colors.
+/// bbox is inclusive. When changed=0, bbox/from/to are 0 (caller maps that to a none display).
+/// Most-frequent-color ties break by ascending color (independent of hashmap iteration order).
 pub fn computeDiff(allocator: std.mem.Allocator, base: []const u32, cur: []const u32, w: u32, h: u32) !DiffResult {
     std.debug.assert(base.len == cur.len);
     std.debug.assert(base.len == @as(usize, w) * @as(usize, h));
 
     var changed: u32 = 0;
-    var x0: u32 = w; // sentinel: 未更新なら changed=0
+    var x0: u32 = w; // sentinel: unchanged → changed=0
     var y0: u32 = h;
     var x1: u32 = 0;
     var y1: u32 = 0;
@@ -85,7 +85,7 @@ fn modeColor(counts: std.AutoHashMap(u32, u32)) u32 {
     return best_color;
 }
 
-/// toolDigest と同じ抽出: u32 の >>16=R, >>8=G, &0xFF=B（alpha 無視）。
+/// Same extract as toolDigest: u32 >>16=R, >>8=G, &0xFF=B (alpha ignored).
 pub fn rgbChannels(c: u32) struct { r: u8, g: u8, b: u8 } {
     return .{
         .r = @truncate(c >> 16),
@@ -108,15 +108,15 @@ fn idx(x: u32, y: u32, w: u32) usize {
     return @as(usize, y) * @as(usize, w) + @as(usize, x);
 }
 
-test "byte layout: 0xAARRGGBB の >>16/>>8/&FF が R/G/B" {
-    // compositeStraight / palette の慣習は u32=0xAARRGGBB（メモリ上 little-endian では B,G,R,A）。
-    // toolDigest と同じ抽出が #RRGGBB になることを 1 画素で固定する。
+test "byte layout: 0xAARRGGBB >>16/>>8/&FF are R/G/B" {
+    // compositeStraight / palette convention is u32=0xAARRGGBB (little-endian memory: B,G,R,A).
+    // Pin with one pixel that the same extract as toolDigest yields #RRGGBB.
     const px: u32 = 0xFF112233; // A=FF R=11 G=22 B=33
     const rgb = rgbChannels(px);
     try testing.expectEqual(@as(u8, 0x11), rgb.r);
     try testing.expectEqual(@as(u8, 0x22), rgb.g);
     try testing.expectEqual(@as(u8, 0x33), rgb.b);
-    // little-endian メモリ並び: [B,G,R,A]
+    // little-endian memory order: [B,G,R,A]
     const bytes = std.mem.asBytes(&px);
     try testing.expectEqual(@as(u8, 0x33), bytes[0]);
     try testing.expectEqual(@as(u8, 0x22), bytes[1]);
@@ -124,7 +124,7 @@ test "byte layout: 0xAARRGGBB の >>16/>>8/&FF が R/G/B" {
     try testing.expectEqual(@as(u8, 0xFF), bytes[3]);
 }
 
-test "無変更: changed=0" {
+test "unchanged: changed=0" {
     const w: u32 = 4;
     const h: u32 = 4;
     var base: [16]u32 = undefined;
@@ -134,7 +134,7 @@ test "無変更: changed=0" {
     try testing.expectEqual(@as(u32, 0), r.changed);
 }
 
-test "1 画素変更: changed=1・bbox・from/to" {
+test "one pixel changed: changed=1 / bbox / from/to" {
     const w: u32 = 8;
     const h: u32 = 8;
     var base: [64]u32 = undefined;
@@ -153,7 +153,7 @@ test "1 画素変更: changed=1・bbox・from/to" {
     try testing.expectEqual(to_c, r.to);
 }
 
-test "離れた 2 画素: bbox が外接矩形" {
+test "two distant pixels: bbox is the enclosing rect" {
     const w: u32 = 16;
     const h: u32 = 16;
     var base: [256]u32 = undefined;
@@ -169,7 +169,7 @@ test "離れた 2 画素: bbox が外接矩形" {
     try testing.expectEqual(@as(u32, 12), r.y1);
 }
 
-test "最頻色: 3 画素 A→B、1 画素 C→D なら from=A to=B" {
+test "most-frequent color: 3px A→B and 1px C→D → from=A to=B" {
     const w: u32 = 8;
     const h: u32 = 8;
     const A: u32 = 0xFF111111;
@@ -193,7 +193,7 @@ test "最頻色: 3 画素 A→B、1 画素 C→D なら from=A to=B" {
     try testing.expectEqual(B, r.to);
 }
 
-test "全画素変更: changed=65536・bbox=0,0,255,255" {
+test "all pixels changed: changed=65536 / bbox=0,0,255,255" {
     const w: u32 = 256;
     const h: u32 = 256;
     const n = @as(usize, w) * @as(usize, h);
@@ -213,7 +213,7 @@ test "全画素変更: changed=65536・bbox=0,0,255,255" {
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), r.to);
 }
 
-test "端（0,0 と 255,255）の bbox" {
+test "edge (0,0 and 255,255) bbox" {
     const w: u32 = 256;
     const h: u32 = 256;
     const n = @as(usize, w) * @as(usize, h);

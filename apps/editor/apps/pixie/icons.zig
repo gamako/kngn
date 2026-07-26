@@ -1,7 +1,7 @@
-//! pixie ツールバー用 16x16 1bit アイコン（TASK-148.2）。
+//! 16x16 1-bit toolbar icons for pixie.
 //!
-//! ホットパス宣言: 全 bitmap は comptime 定数。毎フレームの生成・heap allocation は行わない。
-//! iconButtonId が参照するだけ（widget 数オーダー）。
+//! Hot-path note: every bitmap is a comptime constant. No per-frame generation or heap allocation.
+//! iconButtonId only references them (widget-count order).
 
 const std = @import("std");
 const kit = @import("kit");
@@ -9,7 +9,7 @@ const gui = kit.gui;
 
 const Icon16 = [16]u16;
 
-// bit15=左端・bit0=右端。全公開 icon は行数 16 を comptime 保証する。
+// bit15=left edge, bit0=right edge. Every public icon comptime-guarantees 16 rows.
 comptime {
     const all = [_]gui.IconBitmap{
         pen,  eraser,  brush,   bezier, select, fill,  eyedrop, line,
@@ -20,7 +20,7 @@ comptime {
     }
 }
 
-/// ペン先（太い菱形 nib＋下向き先端。Eyedrop/Line と差別化）
+/// Pen tip (thick diamond nib + downward point; distinct from Eyedrop/Line)
 pub const pen: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000011111100000,
@@ -40,7 +40,7 @@ pub const pen: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 消しゴム（角丸矩形ブロック）
+/// Eraser (rounded rectangular block)
 pub const eraser: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000000000000,
@@ -60,7 +60,7 @@ pub const eraser: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// ブラシ（柄＋穂先の雫）
+/// Brush (handle + droplet tip)
 pub const brush: gui.IconBitmap = &Icon16{
     0b0000000110000000,
     0b0000001111000000,
@@ -80,7 +80,7 @@ pub const brush: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// ベジェ（曲線＋制御点）
+/// Bezier (curve + control points)
 pub const bezier: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0110000000000110,
@@ -100,7 +100,7 @@ pub const bezier: gui.IconBitmap = &Icon16{
     0b0110000000000110,
 };
 
-/// 選択（破線矩形）
+/// Selection (dashed rect)
 pub const select: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0111011101110110,
@@ -120,7 +120,7 @@ pub const select: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 塗りつぶし（バケツ傾き）
+/// Fill (tilted bucket)
 pub const fill: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000011000000,
@@ -140,7 +140,7 @@ pub const fill: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// スポイト（右上の膨らんだバルブ＋細い軸＋左下先端）
+/// Eyedropper (bulb at top-right + thin shaft + tip at bottom-left)
 pub const eyedrop: gui.IconBitmap = &Icon16{
     0b0000000001111000,
     0b0000000011111100,
@@ -160,7 +160,7 @@ pub const eyedrop: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 直線（両端に端点ドットのある細い対角線）
+/// Line (thin diagonal with endpoint dots)
 pub const line: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000000000110,
@@ -180,7 +180,7 @@ pub const line: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 矩形アウトライン
+/// Rect outline
 pub const rect: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000000000000,
@@ -200,7 +200,7 @@ pub const rect: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 楕円アウトライン
+/// Ellipse outline
 pub const ellipse: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000000000000,
@@ -220,7 +220,7 @@ pub const ellipse: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 対称 Off（斜線付き円＝禁止）
+/// Symmetry Off (slashed circle = prohibited)
 pub const sym_off: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000011111100000,
@@ -240,7 +240,7 @@ pub const sym_off: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 対称 Vertical（縦軸ミラー）
+/// Symmetry Vertical (vertical-axis mirror)
 pub const sym_v: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000110000000,
@@ -260,7 +260,7 @@ pub const sym_v: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 対称 Horizontal（横軸ミラー）
+/// Symmetry Horizontal (horizontal-axis mirror)
 pub const sym_h: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000000000000,
@@ -280,7 +280,7 @@ pub const sym_h: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-/// 対称 Quad（十字ミラー）
+/// Symmetry Quad (cross mirror)
 pub const sym_q: gui.IconBitmap = &Icon16{
     0b0000000000000000,
     0b0000000110000000,
@@ -300,7 +300,7 @@ pub const sym_q: gui.IconBitmap = &Icon16{
     0b0000000000000000,
 };
 
-test "icons: 全 bitmap が 16 行" {
+test "icons: every bitmap has 16 rows" {
     const all = [_]gui.IconBitmap{
         pen,  eraser,  brush,   bezier, select, fill,  eyedrop, line,
         rect, ellipse, sym_off, sym_v,  sym_h,  sym_q,

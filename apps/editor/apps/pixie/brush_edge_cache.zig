@@ -1,20 +1,20 @@
-//! Brush footprint の縁セル抽出 + キャッシュ（TASK-75.4）。
+//! Brush footprint edge-cell extraction + cache.
 //!
-//! ホットパス宣言: refresh() は (size, hardness_q) が前回と同じなら O(1) 早期 return する。
-//! 変化時のみ O(footprint 面積)（size<=64 で最大 Brush.MAX_OFFSETS=4225 セル）の抽出を実行し
-//! 結果をキャッシュする。毎フレーム走るのは points() の読み出しだけ（呼び出し側の描画コストは
-//! O(縁セル数=周長オーダー)）。全画素ループの3点セット規約は非該当。
+//! Hot-path note: refresh() early-returns in O(1) when (size, hardness_q) match the previous call.
+//! Only on change does it run O(footprint area) extraction (at most Brush.MAX_OFFSETS=4225 cells when size<=64)
+//! and cache the result. Per frame only points() is read (caller draw cost is
+//! O(edge-cell count = perimeter order)). The full-pixel-loop three-point set does not apply.
 //!
-//! gui/kit に依存しない純ロジック（canvas_input.zig / bezier_input.zig と同型）。
-//! cursor_overlay.zig（描画専任）から EdgeCache を利用する。呼び出し側（main.zig）は
-//! 「busy（stroke 進行中）でない時だけ refresh を呼ぶ」契約を守ること: Brush.footprint() は
-//! 呼ぶたびに buildDab() を再実行して brush.offsets_buf/dab_len を上書きするため、進行中の
-//! ストローク（down で latch 済みの footprint を move/up が再利用する契約）を壊し得る。
+//! Pure logic with no gui/kit dependency (same shape as canvas_input.zig / bezier_input.zig).
+//! cursor_overlay.zig (draw-only) consumes EdgeCache. The caller (main.zig) must honor the
+//! contract "call refresh only when not busy (no stroke in progress)": Brush.footprint()
+//! re-runs buildDab() and overwrites brush.offsets_buf/dab_len on every call, which can break an
+//! in-progress stroke (move/up reuse the footprint latched on down).
 
 const std = @import("std");
 const core = @import("paint");
 
-/// 縁セルのオフセット（ブラシ中心からの相対座標）。core.Offset と同じ dx/dy 幅。
+/// Edge-cell offsets (relative to brush center). Same dx/dy width as core.Offset.
 pub const Point = struct { dx: i16, dy: i16 };
 
 const Brush = core.Brush;
@@ -22,24 +22,24 @@ const R_MAX: i32 = @intCast(Brush.MAX_SIZE / 2); // 32
 const SPAN: usize = @intCast(2 * R_MAX + 1); // 65
 const GRID_LEN: usize = SPAN * SPAN;
 
-/// Brush.buildDab と同じ clamp（size は 1..MAX_SIZE）。EdgeCache とツール probe（main.zig の
-/// cursor digest）の双方がこの関数を経由することで size 解釈のズレを防ぐ。
+/// Same clamp as Brush.buildDab (size is 1..MAX_SIZE). Both EdgeCache and the tool probe (main.zig's
+/// cursor digest) go through this function so size interpretation cannot drift.
 pub fn clampedSize(brush: *const Brush) u32 {
     return std.math.clamp(brush.size, 1, Brush.MAX_SIZE);
 }
 
-/// 現在の Brush footprint（size, hardness）に対応する縁セルのキャッシュ。
+/// Cache of edge cells for the current Brush footprint (size, hardness).
 pub const EdgeCache = struct {
     size: u32 = 0,
     hardness_q: u8 = 0,
     valid: bool = false,
     pts: [Brush.MAX_OFFSETS]Point = undefined,
     len: usize = 0,
-    /// 計測用（AC#2: 再計算回数をテストで assert するため）。
+    /// Instrumentation (so tests can assert recomputation count).
     refresh_count: usize = 0,
 
-    /// brush の現在パラメータで縁セルを再計算する。前回と (clamp 後の size, hardness_q) が同じなら
-    /// 何もしない（O(1)）。変化時のみ brush.footprint()（buildDab 実行）→ 縁抽出 O(footprint 面積)。
+    /// Recompute edge cells for the brush's current parameters. No-op when (clamped size, hardness_q) match the previous call
+    /// (O(1)). On change only: brush.footprint() (runs buildDab) → edge extract O(footprint area).
     pub fn refresh(self: *EdgeCache, brush: *Brush) void {
         const size = clampedSize(brush);
         if (self.valid and self.size == size and self.hardness_q == brush.hardness_q) return;
@@ -51,7 +51,7 @@ pub const EdgeCache = struct {
         self.len = 0;
 
         var grid: [GRID_LEN]bool = [_]bool{false} ** GRID_LEN;
-        const dab = brush.footprint(); // 現在 size/hardness で再構築（buildDab 実行）
+        const dab = brush.footprint(); // Rebuild at the current size/hardness (runs buildDab)
         for (dab.offsets) |o| grid[gridIndex(o.dx, o.dy)] = true;
         for (dab.offsets) |o| {
             if (isEdge(&grid, o.dx, o.dy)) {
@@ -73,7 +73,7 @@ fn gridIndex(dx: i16, dy: i16) usize {
     return gy * SPAN + gx;
 }
 
-/// (dx,dy) が footprint の縁セルか（4近傍のいずれかが非footprint または footprint 範囲外なら縁）。
+/// Whether (dx,dy) is an edge cell of the footprint (edge if any 4-neighbour is non-footprint or outside the footprint bounds).
 fn isEdge(grid: *const [GRID_LEN]bool, dx: i16, dy: i16) bool {
     const deltas = [_][2]i32{ .{ -1, 0 }, .{ 1, 0 }, .{ 0, -1 }, .{ 0, 1 } };
     for (deltas) |d| {
@@ -89,7 +89,7 @@ fn isEdge(grid: *const [GRID_LEN]bool, dx: i16, dy: i16) bool {
 // Tests
 // ============================================================
 
-test "EdgeCache.refresh: 同一 (size,hardness) では再計算しない（refresh_count 不変）" {
+test "EdgeCache.refresh: same (size,hardness) does not recompute (refresh_count unchanged)" {
     var b: Brush = .{ .color = 0xFFFF0000, .size = 8, .hardness_q = 255 };
     var cache: EdgeCache = .{};
     cache.refresh(&b);
@@ -101,7 +101,7 @@ test "EdgeCache.refresh: 同一 (size,hardness) では再計算しない（refre
     try std.testing.expectEqual(len1, cache.len);
 }
 
-test "EdgeCache.refresh: size 変更で再計算が走る" {
+test "EdgeCache.refresh: size change triggers recomputation" {
     var b: Brush = .{ .color = 0xFFFF0000, .size = 8, .hardness_q = 255 };
     var cache: EdgeCache = .{};
     cache.refresh(&b);
@@ -111,7 +111,7 @@ test "EdgeCache.refresh: size 変更で再計算が走る" {
     try std.testing.expectEqual(@as(usize, 2), cache.refresh_count);
 }
 
-test "EdgeCache.refresh: hardness_q 変更でも再計算が走る" {
+test "EdgeCache.refresh: hardness_q change also triggers recomputation" {
     var b: Brush = .{ .color = 0xFFFF0000, .size = 16, .hardness_q = 255 };
     var cache: EdgeCache = .{};
     cache.refresh(&b);
@@ -120,7 +120,7 @@ test "EdgeCache.refresh: hardness_q 変更でも再計算が走る" {
     try std.testing.expectEqual(@as(usize, 2), cache.refresh_count);
 }
 
-test "EdgeCache: size=1 は中心1点のみが縁セル" {
+test "EdgeCache: size=1 has only the center point as an edge cell" {
     var b: Brush = .{ .color = 0xFFFF0000, .size = 1 };
     var cache: EdgeCache = .{};
     cache.refresh(&b);
@@ -128,22 +128,22 @@ test "EdgeCache: size=1 は中心1点のみが縁セル" {
     try std.testing.expectEqual(Point{ .dx = 0, .dy = 0 }, cache.points()[0]);
 }
 
-test "EdgeCache: size=64（最大）で overflow せず、縁セルは footprint 全面より少ない" {
+test "EdgeCache: size=64 (max) does not overflow; edge cells fewer than full footprint" {
     var b: Brush = .{ .color = 0xFFFF0000, .size = 64, .hardness_q = 255 };
     var cache: EdgeCache = .{};
     cache.refresh(&b);
     try std.testing.expect(cache.len > 0 and cache.len <= Brush.MAX_OFFSETS);
     const dab = b.footprint();
-    try std.testing.expect(cache.len < dab.offsets.len); // 輪郭は全面セル数より少ない
+    try std.testing.expect(cache.len < dab.offsets.len); // Contour has fewer cells than the full footprint
 }
 
-test "EdgeCache: size 超過の直接代入でも clampedSize 経由でキーと footprint がズレない" {
-    var b: Brush = .{ .color = 0xFFFF0000, .size = 1000 }; // buildDab 内で MAX_SIZE(64) に clamp される
+test "EdgeCache: oversized size assignment still keeps key and footprint aligned via clampedSize" {
+    var b: Brush = .{ .color = 0xFFFF0000, .size = 1000 }; // buildDab clamps to MAX_SIZE (64)
     var cache: EdgeCache = .{};
     cache.refresh(&b);
     try std.testing.expectEqual(Brush.MAX_SIZE, cache.size);
     const len1 = cache.len;
-    cache.refresh(&b); // 再度呼んでも size=1000→clamp 64 で不変なので再計算されない
+    cache.refresh(&b); // Calling again does not recompute: size=1000→clamped 64 is unchanged
     try std.testing.expectEqual(@as(usize, 1), cache.refresh_count);
     try std.testing.expectEqual(len1, cache.len);
 }

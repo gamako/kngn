@@ -1,8 +1,8 @@
-//! シェイプドラッグ中の輪郭プレビュー（TASK-90）。
+//! Outline preview while dragging a shape.
 //!
-//! selection_overlay / bezier_overlay と同型: canvas blit の後・gui.render 前に draw_list へ描く。
-//! 座標は canvas 論理 → window（rect + p*zoom）。clip は canvas 表示矩形 ∩ area。
-//! 描くのは輪郭画素のみ（fill プレビューでも outline。確定時に fill を適用）。
+//! Same shape as selection_overlay / bezier_overlay: draw into draw_list after canvas blit, before gui.render.
+//! Coords: canvas-logical → window (rect + p*zoom). clip = canvas display rect ∩ area.
+//! Draws outline pixels only (even for a fill preview, outline; fill is applied on commit).
 
 const gui = @import("kit").gui;
 const core = @import("paint");
@@ -12,7 +12,7 @@ const shape_input = @import("shape_input.zig");
 
 const PREVIEW = gui.Color.rgba(0x40, 0xC0, 0xFF, 0xE0);
 
-/// ドラッグ中プレビューを描く。idle なら何もしない。
+/// Draw the in-drag preview. No-op when idle.
 pub fn draw(
     ctx: *gui.Context,
     si: *const shape_input.ShapeInput,
@@ -39,7 +39,7 @@ pub fn draw(
             const self: *@This() = @ptrCast(@alignCast(c));
             const cell = core.Rect{ .x = x, .y = y, .w = 1, .h = 1 };
             const sr = zoom_mod.canvasRectToScreen(self.canvas_rect, cell, self.zoom);
-            // セル表示矩形（1px 未満は clamp 済み）
+            // cell display rect (clamped when under 1px)
             self.dl.rectFilled(.{
                 .x = sr.x,
                 .y = sr.y,
@@ -49,7 +49,7 @@ pub fn draw(
         }
     };
     var pctx: PlotCtx = .{ .dl = dl, .canvas_rect = canvas_rect, .zoom = zoom };
-    // プレビューは常に outline（fill でも輪郭のみ。確定で fill）
+    // preview is always outline (outline only even for fill; fill on commit)
     switch (prev.kind) {
         .line => core.plotLine(prev.p0.x, prev.p0.y, prev.p1.x, prev.p1.y, &pctx, PlotCtx.plot),
         .rect => core.plotRect(prev.p0.x, prev.p0.y, prev.p1.x, prev.p1.y, false, &pctx, PlotCtx.plot),

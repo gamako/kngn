@@ -1,8 +1,8 @@
-//! シェイプツールの入力状態機械（TASK-90）。
+//! Shape-tool input state machine.
 //!
-//! platform / GUI 非依存。selection_input / bezier_input と同型:
-//! press 起点 capture → drag → release 確定。確定時に StrokeRecorder 経由で shape を plot。
-//! プレビューは state=dragging の anchor/cur を overlay が読む（canvas は汚さない）。
+//! Platform / GUI independent. Same shape as selection_input / bezier_input:
+//! press-origin capture → drag → release commit. On commit, plot the shape via StrokeRecorder.
+//! Preview: overlay reads anchor/cur while state=dragging (does not dirty the canvas).
 
 const std = @import("std");
 const core = @import("paint");
@@ -14,7 +14,7 @@ pub const ShapeKind = enum { line, rect, ellipse };
 pub const ShapeInput = struct {
     state: State = .idle,
     kind: ShapeKind = .line,
-    /// outline=false のとき fill（rect/ellipse のみ。line では無視）
+    /// When outline=false, fill (rect/ellipse only; ignored for line)
     fill: bool = false,
     anchor: core.Vec2 = .{ .x = 0, .y = 0 },
     cur: core.Vec2 = .{ .x = 0, .y = 0 },
@@ -31,7 +31,7 @@ pub const ShapeInput = struct {
         released_left: bool,
     };
 
-    /// 1 フレーム処理。release 確定時に shape を plot して PaintDiff を返す。
+    /// Process one frame. On release commit, plot the shape and return a PaintDiff.
     pub fn update(
         self: *ShapeInput,
         frame: Frame,
@@ -62,13 +62,13 @@ pub const ShapeInput = struct {
         return null;
     }
 
-    /// ドラッグ中の端点（overlay 用）。idle なら null。
+    /// Drag endpoints (for overlay). null when idle.
     pub fn previewPoints(self: *const ShapeInput) ?struct { p0: core.Vec2, p1: core.Vec2, kind: ShapeKind, fill: bool } {
         if (self.state != .dragging) return null;
         return .{ .p0 = self.anchor, .p1 = self.cur, .kind = self.kind, .fill = self.fill };
     }
 
-    /// Esc / ツール切替で破棄（canvas 非汚染なので restore 不要）。
+    /// Discard on Esc / tool switch (canvas stays clean, so no restore needed).
     pub fn cancel(self: *ShapeInput) void {
         self.state = .idle;
     }
@@ -80,7 +80,7 @@ pub const ShapeInput = struct {
         gpa: std.mem.Allocator,
         color: u32,
     ) ?core.PaintDiff {
-        // シェイプ確定中は pixel_perfect を一時無効（フリーハンド専用。形状を壊さない）
+        // While committing a shape, temporarily disable pixel_perfect (freehand-only; do not break the shape)
         const saved_pp = rec.pixel_perfect;
         rec.pixel_perfect = false;
         defer rec.pixel_perfect = saved_pp;
@@ -124,7 +124,7 @@ fn mkFrame(px: i32, py: i32, mx: i32, my: i32, pressed: bool, released: bool) Sh
     };
 }
 
-test "shape_input: 表示領域外の press は無視" {
+test "shape_input: press outside the display area is ignored" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -136,7 +136,7 @@ test "shape_input: 表示領域外の press は無視" {
     try std.testing.expectEqual(ShapeInput.State.idle, si.state);
 }
 
-test "shape_input: line ドラッグ確定で画素が塗られ undo 可能な diff" {
+test "shape_input: line drag commit paints pixels and yields an undoable diff" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();
@@ -150,12 +150,12 @@ test "shape_input: line ドラッグ確定で画素が塗られ undo 可能な d
     try std.testing.expectEqual(ShapeInput.State.idle, si.state);
     try std.testing.expectEqual(RED, c.layerPixels(0)[2 * 16 + 2]);
     try std.testing.expectEqual(RED, c.layerPixels(0)[2 * 16 + 6]);
-    // before 復元
+    // restore before
     for (cmd.diffs) |d| c.layerPixels(0)[d.idx] = d.before;
     try std.testing.expectEqual(@as(u32, 0), c.layerPixels(0)[2 * 16 + 2]);
 }
 
-test "shape_input: cancel は idle に戻し canvas 不変" {
+test "shape_input: cancel returns to idle and leaves the canvas unchanged" {
     const gpa = std.testing.allocator;
     var c = try core.Canvas.init(gpa, 16, 16);
     defer c.deinit();

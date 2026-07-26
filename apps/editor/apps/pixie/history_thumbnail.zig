@@ -1,11 +1,11 @@
-//! 履歴行用 24×24 bbox サムネイル生成（TASK-83.2）。
+//! 24×24 bbox thumbnail generation for history rows.
 //!
-//! `PixelDiff` 列から変更領域 bbox を求め、アスペクト比維持で固定バッファへ合成する。
-//! App / main.zig を import しない（循環回避）。paint の `PixelDiff` と blend のみ依存。
+//! Compute the changed-region bbox from a `PixelDiff` list and composite into a fixed buffer preserving aspect ratio.
+//! Does not import App / main.zig (avoids cycles). Depends only on paint's `PixelDiff` and blend.
 //!
-//! ## ホットパス宣言
-//! 生成は**イベント時のみ**（履歴エントリ確定フック）。フレーム毎経路には乗らない。
-//! allocator / ArrayList / canvas composite は使用しない（固定 576 画素バッファのみ）。
+//! ## Hot-path note
+//! Generation is **event-only** (history-entry commit hook). Not on the per-frame path.
+//! No allocator / ArrayList / canvas composite (fixed 576-pixel buffer only).
 
 const std = @import("std");
 const core = @import("paint");
@@ -18,15 +18,15 @@ pub const CHECKER_CELL: u32 = 4;
 pub const CHECKER_LIGHT: u32 = 0xFF_6A_6A_6A;
 pub const CHECKER_DARK: u32 = 0xFF_4E_4E_4E;
 
-/// サムネイルリング 1 slot のメタ（24 byte 固定。CommandLog と同長 128 件）。
-/// seq 一致で有効判定。thumb_present 時のみ pixels スロットが有効。
+/// Metadata for one thumbnail-ring slot (fixed 24 bytes. Same length 128 as CommandLog).
+/// Valid when seq matches. The pixels slot is live only when thumb_present.
 pub const HistoryThumbMeta = extern struct {
     seq: u64 = 0,
     bbox_x0: u16 = 0,
     bbox_y0: u16 = 0,
     bbox_x1: u16 = 0,
     bbox_y1: u16 = 0,
-    kind: u8 = 0, // VisualKind の raw
+    kind: u8 = 0, // VisualKind raw
     flags: u8 = 0, // bit0 = thumb_present, bit1 = has_bbox
     _pad: [6]u8 = .{0} ** 6,
 
@@ -82,8 +82,8 @@ pub const Result = struct {
     bbox: ?BBox,
 };
 
-/// `out.len == THUMB_PIXELS` の固定バッファへチェッカー＋変更画素を合成する。
-/// `canvas_w` は PixelDiff.idx の平坦化幅。allocator 不使用。
+/// Composite checkerboard + changed pixels into a fixed buffer with `out.len == THUMB_PIXELS`.
+/// `canvas_w` is the flattened width of PixelDiff.idx. No allocator.
 pub fn renderThumb(
     out: []u32,
     canvas_w: u32,
@@ -116,7 +116,7 @@ pub fn renderThumb(
     const bw: u32 = @as(u32, bbox.x1) - bbox.x0 + 1;
     const bh: u32 = @as(u32, bbox.y1) - bbox.y0 + 1;
 
-    // アスペクト比維持で 24×24 内側へフィット（小さい bbox は拡大）
+    // Fit inside 24×24 preserving aspect (small bboxes upscale)
     const dw: u32, const dh: u32 = if (bw >= bh)
         .{ THUMB_W, @max(1, bh * THUMB_W / bw) }
     else
@@ -130,7 +130,7 @@ pub fn renderThumb(
         if (sx < bbox.x0 or sy < bbox.y0 or sx > bbox.x1 or sy > bbox.y1) continue;
         const lx = sx - bbox.x0;
         const ly = sy - bbox.y0;
-        // ソース画素が占める thumb 矩形（拡大時は複数 px）
+        // thumb rect occupied by the source pixel (multiple px when upscaled)
         const tx0 = ox + lx * dw / bw;
         const ty0 = oy + ly * dh / bh;
         const tx1 = ox + (lx + 1) * dw / bw;
@@ -159,7 +159,7 @@ fn fillChecker(out: []u32) void {
     }
 }
 
-/// after.a==0（消去）は before を半透明ゴースト、それ以外は after をそのまま。
+/// after.a==0 (erase) shows before as a translucent ghost; otherwise after as-is.
 fn displayColor(d: core.PixelDiff) u32 {
     const after_a = (d.after >> 24) & 0xFF;
     if (after_a == 0) {
@@ -167,9 +167,9 @@ fn displayColor(d: core.PixelDiff) u32 {
         const r = (d.before >> 16) & 0xFF;
         const g = (d.before >> 8) & 0xFF;
         const b = d.before & 0xFF;
-        // 不透明 before は半透明、完全透明 before でも痕跡が出るよう下限 96
+        // Opaque before becomes translucent; floor alpha at 96 so a fully transparent before still leaves a trace
         const ga: u32 = if (a > 0) @max(a / 2, 96) else 96;
-        // before が完全透明でも色が残っていればその RGB、無ければ中立グレー
+        // If before is fully transparent but still has color, keep that RGB; else neutral grey
         const use_r = if ((d.before & 0x00FFFFFF) != 0) r else @as(u32, 0xC0);
         const use_g = if ((d.before & 0x00FFFFFF) != 0) g else @as(u32, 0xC0);
         const use_b = if ((d.before & 0x00FFFFFF) != 0) b else @as(u32, 0xC0);
@@ -215,7 +215,7 @@ test "renderThumb: 1px change → bbox that pixel, visible in 24x24" {
     try testing.expectEqual(@as(u16, 20), r.bbox.?.y0);
     try testing.expectEqual(@as(u16, 10), r.bbox.?.x1);
     try testing.expectEqual(@as(u16, 20), r.bbox.?.y1);
-    // 1×1 bbox は 24×24 全面に拡大
+    // 1×1 bbox upscales to the full 24×24
     try testing.expect(countNonChecker(&out) > 0);
     try testing.expectEqual(out[0] & 0x00FF0000, @as(u32, 0x00FF0000)); // red channel present
 }
@@ -235,14 +235,14 @@ test "renderThumb: two distant points → enclosing bbox" {
 
 test "renderThumb: wide bbox fits horizontally" {
     var out: [THUMB_PIXELS]u32 = undefined;
-    // 48×12 → 横フィット → dh = 12
+    // 48×12 → fit horizontally → dh = 12
     const diffs = [_]core.PixelDiff{
         px(0, 0, 256, 0, 0xFF00FF00),
         px(47, 11, 256, 0, 0xFF00FF00),
     };
     const r = renderThumb(&out, 256, &diffs);
     try testing.expect(r.changed);
-    // 上下に余白（dh < 24）
+    // vertical letterbox (dh < 24)
     const mid_top = out[0]; // (0,0) should be checker (centered)
     const checker0 = CHECKER_LIGHT;
     try testing.expectEqual(checker0, mid_top);
@@ -256,7 +256,7 @@ test "renderThumb: tall bbox fits vertically" {
     };
     const r = renderThumb(&out, 256, &diffs);
     try testing.expect(r.changed);
-    // 左右に余白
+    // horizontal letterbox
     try testing.expectEqual(CHECKER_LIGHT, out[0]);
 }
 
@@ -264,7 +264,7 @@ test "renderThumb: 1x1 bbox enlarges to fill" {
     var out: [THUMB_PIXELS]u32 = undefined;
     const diffs = [_]core.PixelDiff{px(5, 5, 256, 0, 0xFFFFFFFF)};
     _ = renderThumb(&out, 256, &diffs);
-    // ほぼ全面が白寄り（srcOver で不透明白）
+    // Nearly the whole thumb leans white (opaque white via srcOver)
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), out[THUMB_PIXELS / 2]);
 }
 
@@ -273,9 +273,9 @@ test "renderThumb: erase (after.a==0) leaves before ghost" {
     const before: u32 = 0xFFFF0000;
     const diffs = [_]core.PixelDiff{px(0, 0, 256, before, 0x00000000)};
     _ = renderThumb(&out, 256, &diffs);
-    // ゴーストがチェッカーと異なる
+    // Ghost differs from the checkerboard
     try testing.expect(countNonChecker(&out) > 0);
-    // 赤チャネルが残る
+    // Red channel remains
     try testing.expect((out[THUMB_PIXELS / 2] >> 16) & 0xFF > 0);
 }
 

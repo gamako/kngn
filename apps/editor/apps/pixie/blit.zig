@@ -1,12 +1,12 @@
-//! pixie の canvas 表示 blit（zoom 転送 + チェッカー背景）。TASK-54 で main.zig から抽出。
-//! core のみ import する純ロジック（単体テスト・bench-blit から呼べる）。
+//! Pixie canvas display blit (zoom transfer + checkerboard background). Extracted from main.zig.
+//! Pure logic importing core only (callable from unit tests and bench-blit).
 //!
-//! ここの関数は**フレーム毎・canvas area 全画素**（ウィンドウの大半）を走るホットパス。
-//! clip 交差はループ外 1 回（hoist）・内側は行連続の run 書き込み・per-pixel 除算なし
-//! （性能規約の 3 点セット準拠。旧 per-pixel 実装は *Ref としてテスト/ベンチの参照に残す）。
+//! These functions are a **per-frame, full canvas-area** hot path (most of the window).
+//! Clip intersection is hoisted once outside the loop; the inner path writes contiguous runs; no per-pixel division
+//! (performance-rules three-point set. The old per-pixel impl remains as *Ref for tests/benches).
 //!
-//! TASK-153.2: rational zoom（1/2・1/3・1/4 縮小 nearest + SIMD gather）。
-//! 整数倍率は既存経路を維持。i32 API は bench / 旧呼び出し互換。
+//! Rational zoom (1/2·1/3·1/4 shrink nearest + SIMD gather).
+//! Integer magnifications keep the existing path. The i32 API stays for bench / legacy call sites.
 
 const std = @import("std");
 const core = @import("paint");
@@ -18,16 +18,16 @@ pub const CHECKER_CELL: i32 = 8;
 pub const CHECKER_LIGHT: u32 = 0xFF_6A_6A_6A;
 pub const CHECKER_DARK: u32 = 0xFF_4E_4E_4E;
 
-/// canvas の straight-alpha composite を rect へ zoom 倍 nearest で転送する。
-/// **rect.w/h は canvas セル数**（canvasBlitRect の仕様）であり、screen px の可視矩形は
-/// `visible = { rect.x, rect.y, displayExtent(w), displayExtent(h) }` を構成して clip・fb 境界と交差する。
+/// Transfer the canvas straight-alpha composite into rect at zoom× nearest.
+/// **rect.w/h are canvas cell counts** (canvasBlitRect contract); the visible screen-px rect is
+/// `visible = { rect.x, rect.y, displayExtent(w), displayExtent(h) }`, then intersected with clip and fb bounds.
 ///
-/// 契約（opaque-dst 前提）: 呼び出し前に出力範囲（visible ∩ clip ∩ fb）が**不透明**で
-/// 塗られていること（pixie では直前の drawCheckerboard が満たす）。partial alpha の合成に
-/// srcOverOpaque（除算なし）を使うため、dst が不透明でない場合は旧 srcOver と一致しない。
-/// 不透明 src は置換 / 完全透明は背景維持 / partial は背景へブレンド（旧実装と bit 同値）。
+/// Contract (opaque-dst): before the call, the output range (visible ∩ clip ∩ fb) must be **opaque**
+/// (pixie satisfies this via the preceding drawCheckerboard). Partial-alpha compositing uses
+/// srcOverOpaque (no division), so results diverge from legacy srcOver if dst is not opaque.
+/// Opaque src replaces / fully transparent keeps background / partial blends onto background (bit-identical to the old impl).
 ///
-/// `zoom: i32` は整数倍率互換（bench-blit / 既存経路）。縮小は `blitCanvasZoomZ` を使う。
+/// `zoom: i32` is the integer-magnification compatible entry (bench-blit / existing path). Use `blitCanvasZoomZ` for shrink.
 pub fn blitCanvasZoom(
     fb: []u32,
     fb_w: u32,
@@ -43,8 +43,8 @@ pub fn blitCanvasZoom(
     blitCanvasZoomZ(fb, fb_w, fb_h, composite, canvas_w, canvas_h, rect, Zoom.fromInteger(zoom), clip);
 }
 
-/// rational Zoom 版。整数は既存 upsample 経路、縮小 `1/N` は gather SIMD。
-/// scale=1.0（論理 fb）の fast path。物理 fb は `blitCanvasZoomPhysical` を使う。
+/// Rational Zoom variant. Integers take the existing upsample path; shrink `1/N` uses gather SIMD.
+/// scale=1.0 (logical fb) fast path. Physical fb uses `blitCanvasZoomPhysical`.
 pub inline fn blitCanvasZoomZ(
     fb: []u32,
     fb_w: u32,
@@ -68,15 +68,15 @@ pub inline fn blitCanvasZoomZ(
     }
 }
 
-/// 論理 Zoom 表示格子を維持しつつ、物理 destination へ nearest 拡大する二段経路（TASK-156.4 案 C）。
+/// Two-stage path: keep the logical Zoom display grid, then nearest-upsample into the physical destination.
 ///
-/// 1. Zoom の論理表示 rect（`displayExtent`）を求める
-/// 2. 両エッジ floor で物理 destination / clip を求める
-/// 3. 物理 pixel → 論理表示 pixel を整数 accumulator nearest
-/// 4. 論理表示 pixel → canvas は既存 Zoom source 規則
+/// 1. Compute Zoom's logical display rect (`displayExtent`)
+/// 2. Map both edges with floor into the physical destination / clip
+/// 3. Physical pixel → logical display pixel via integer-accumulator nearest
+/// 4. Logical display pixel → canvas via the existing Zoom source rule
 ///
-/// `content_scale == 1.0` は既存 `blitCanvasZoomZ` に委譲し logical CRC を維持する。
-/// 内側ループに per-pixel 除算は無い（run 書き込み + 閾値 accumulator）。
+/// `content_scale == 1.0` delegates to existing `blitCanvasZoomZ` to keep the logical CRC.
+/// No per-pixel division in the inner loop (run writes + threshold accumulator).
 pub fn blitCanvasZoomPhysical(
     fb: []u32,
     fb_w: u32,
@@ -122,10 +122,10 @@ pub fn blitCanvasZoomPhysical(
     const cw_i: i32 = @intCast(canvas_w);
     const ch_i: i32 = @intCast(canvas_h);
 
-    // 行: 物理 y → 論理表示 v = floor((fy - phys_dst.y) * log_h / phys_h)
-    // 同一 v の run を縦にまとめ、各論理行を水平 nearest で埋める。
-    // edge = floor((v+1)*phys/log) は floor 逆写像で進まない場合があるため、
-    // v が変わるまでスキャンする（run 境界のみ・内側ループは除算無し）。
+    // row: physical y → logical display v = floor((fy - phys_dst.y) * log_h / phys_h)
+    // Coalesce runs of the same v vertically; fill each logical row with horizontal nearest.
+    // edge = floor((v+1)*phys/log) may not advance under the floor inverse, so
+    // scan until v changes (run boundaries only; inner loop has no division).
     var fy = y0;
     while (fy < y1) {
         const ly: i32 = fy - phys_dst.y;
@@ -138,7 +138,7 @@ pub fn blitCanvasZoomPhysical(
             continue;
         }
 
-        // 論理行 v の canvas source y
+        // canvas source y for logical row v
         const src_y: i32 = logicalDisplayToSrc(v, z, ch_i);
         if (src_y < 0 or src_y >= ch_i) {
             fy = row_end;
@@ -146,7 +146,7 @@ pub fn blitCanvasZoomPhysical(
         }
         const src_row = composite[@as(usize, @intCast(src_y)) * canvas_w ..][0..canvas_w];
 
-        // 水平: 物理 x を論理 u の run で埋める
+        // horizontal: fill physical x in runs of logical u
         var row = fy;
         while (row < row_end) : (row += 1) {
             const dst_row = fb[@as(usize, @intCast(row)) * fb_w ..];
@@ -181,8 +181,8 @@ pub fn blitCanvasZoomPhysical(
     }
 }
 
-/// 論理表示座標（表示格子上の 1px）→ canvas source 座標（Zoom 規則）。
-/// 整数: floor(u / num)、縮小: u*den + floor((den-1)/2)。
+/// Logical display coord (1px on the display grid) → canvas source coord (Zoom rule).
+/// Integer: floor(u / num); shrink: u*den + floor((den-1)/2).
 inline fn logicalDisplayToSrc(display: i32, z: Zoom, canvas_dim: i32) i32 {
     _ = canvas_dim;
     if (z.den == 1) {
@@ -194,7 +194,7 @@ inline fn logicalDisplayToSrc(display: i32, z: Zoom, canvas_dim: i32) i32 {
     return display * den + half;
 }
 
-/// 両エッジ floor（gui.render scaleRect / ScreenTransform と同一規則）。i32 rect 版。
+/// Both-edge floor (same rule as gui.render scaleRect / ScreenTransform). i32 rect variant.
 pub fn scaleRectFloor(rect: core.Rect, scale: f32) core.Rect {
     std.debug.assert(std.math.isFinite(scale) and scale > 0);
     const x0 = floorI32(@as(f32, @floatFromInt(rect.x)) * scale);
@@ -224,40 +224,40 @@ inline fn blitCanvasZoomInteger(
     zoom: i32,
     clip: core.Rect,
 ) void {
-    // clip 交差（visible × canvas area clip × fb 境界）をループ外で 1 回計算
+    // Compute clip intersection (visible × canvas-area clip × fb bounds) once outside the loop
     const x0: i32 = @max(@max(rect.x, clip.x), 0);
     const y0: i32 = @max(@max(rect.y, clip.y), 0);
     const x1: i32 = @min(@min(rect.x + @as(i32, @intCast(canvas_w)) * zoom, clip.x + clip.w), @as(i32, @intCast(fb_w)));
     const y1: i32 = @min(@min(rect.y + @as(i32, @intCast(canvas_h)) * zoom, clip.y + clip.h), @as(i32, @intCast(fb_h)));
     if (x0 >= x1 or y0 >= y1) return;
 
-    // 行内の除算はここで 1 回だけ（cx 開始セル）。以後はセル境界をインクリメンタルに進める
+    // One division per row here (starting cx cell); then advance cell boundaries incrementally
     const cx_start: usize = @intCast(@divFloor(x0 - rect.x, zoom));
     const first_edge: i32 = rect.x + (@as(i32, @intCast(cx_start)) + 1) * zoom;
 
     var fy = y0;
     while (fy < y1) : (fy += 1) {
-        const cy: usize = @intCast(@divFloor(fy - rect.y, zoom)); // 行毎 1 回
+        const cy: usize = @intCast(@divFloor(fy - rect.y, zoom)); // once per row
         const src_row = composite[cy * canvas_w ..][0..canvas_w];
         const dst_row = fb[@as(usize, @intCast(fy)) * fb_w ..];
         var cx = cx_start;
         var run_start: i32 = x0;
-        var next_edge: i32 = first_edge; // clamp 前のセル右端（+= zoom で進める。除算なし）
+        var next_edge: i32 = first_edge; // cell right edge before clamp (advance with += zoom; no division)
         while (run_start < x1) {
             const src = src_row[cx];
-            // この canvas セルが占める出力 run（可視範囲へ clamp）を行連続で書く
+            // write the output run for this canvas cell (clamped to the visible range) as a contiguous row
             const run_end: i32 = @min(next_edge, x1);
             const lo: usize = @intCast(run_start);
             const hi: usize = @intCast(run_end);
             const a = src >> 24;
             if (a == 0xFF) {
-                // srcOver(dst, a=255) == src。run は最大 zoom px と短いので
-                // memset 呼び出しでなく単純 store ループ（LLVM が適宜ベクトル化）
+                // srcOver(dst, a=255) == src. Runs are at most zoom px and short, so
+                // use a plain store loop rather than memset (LLVM vectorises as appropriate)
                 for (dst_row[lo..hi]) |*d| d.* = src;
             } else if (a != 0) {
-                // dst 不透明（契約）なので srcOverOpaque == srcOver（TASK-51 で全数証明済み・除算なし）
+                // dst is opaque (contract), so srcOverOpaque == srcOver (fully enumerated; no division)
                 for (dst_row[lo..hi]) |*d| d.* = core.blend.srcOverOpaque(d.*, src);
-            } // a==0: srcOver(dst, 0) == dst → skip（チェッカー維持）
+            } // a==0: srcOver(dst, 0) == dst → skip (keep checkerboard)
             run_start = run_end;
             cx += 1;
             next_edge += zoom;
@@ -265,9 +265,9 @@ inline fn blitCanvasZoomInteger(
     }
 }
 
-/// 縮小 nearest（num=1, den∈{2,3,4}）。
-/// 座標: `src = u*den + floor((den-1)/2)`、行/列は += den の増分のみ（per-pixel 除算なし）。
-/// SIMD: dest 連続 4px を gather → srcOverOpaque4 / 不透明 4px store。
+/// Shrink nearest (num=1, den∈{2,3,4}).
+/// Coord: `src = u*den + floor((den-1)/2)`; rows/cols advance by += den only (no per-pixel division).
+/// SIMD: gather 4 contiguous dest px → srcOverOpaque4 / opaque 4px store.
 fn blitCanvasZoomShrink(
     fb: []u32,
     fb_w: u32,
@@ -310,9 +310,9 @@ fn blitCanvasZoomShrink(
         var src_x = src_x0;
         var fx = x0;
 
-        // SIMD 4px 本体（src が全て in-range の連続 run）
+        // SIMD 4px body (contiguous run where every src is in-range)
         while (fx + 4 <= x1) {
-            // 4 サンプルの src_x が canvas 内か
+            // whether the 4 sample src_x values lie inside the canvas
             const sx0 = src_x;
             const sx1 = src_x + den_i;
             const sx2 = src_x + den_i * 2;
@@ -330,10 +330,10 @@ fn blitCanvasZoomShrink(
                 const a2 = gathered[2] >> 24;
                 const a3 = gathered[3] >> 24;
                 if (a0 == 0xFF and a1 == 0xFF and a2 == 0xFF and a3 == 0xFF) {
-                    // 不透明 4px store
+                    // opaque 4px store
                     @memcpy(dst_row[lo .. lo + 4], &gathered);
                 } else if (a0 | a1 | a2 | a3 == 0) {
-                    // 全透明: skip
+                    // fully transparent: skip
                 } else {
                     var dst4: [4]u32 = undefined;
                     @memcpy(&dst4, dst_row[lo .. lo + 4]);
@@ -344,10 +344,10 @@ fn blitCanvasZoomShrink(
                 src_x += den_i * 4;
                 continue;
             }
-            break; // 端は scalar へ
+            break; // edges fall back to scalar
         }
 
-        // scalar tail / 境界
+        // scalar tail / boundary
         while (fx < x1) : ({
             fx += 1;
             src_x += den_i;
@@ -366,7 +366,7 @@ fn blitCanvasZoomShrink(
     }
 }
 
-/// 旧 per-pixel 実装（挙動の正。テスト/ベンチの参照専用 — 本番経路では使わない）。
+/// Legacy per-pixel impl (behavioural oracle. Tests/bench reference only — not used on the production path).
 pub fn blitCanvasZoomRef(
     fb: []u32,
     fb_w: u32,
@@ -382,7 +382,7 @@ pub fn blitCanvasZoomRef(
     blitCanvasZoomRefZ(fb, fb_w, fb_h, composite, canvas_w, canvas_h, rect, Zoom.fromInteger(zoom), clip);
 }
 
-/// rational 参照版（per-pixel。SIMD 版との bit 一致の正解）。
+/// Rational reference (per-pixel. Ground truth for bit-identity vs the SIMD path).
 pub fn blitCanvasZoomRefZ(
     fb: []u32,
     fb_w: u32,
@@ -420,7 +420,7 @@ pub fn blitCanvasZoomRefZ(
         }
         return;
     }
-    // 縮小: 計画の pixel-center nearest（num=1）
+    // shrink: pixel-center nearest (num=1)
     if (z.num != 1) return;
     const den: i32 = @intCast(z.den);
     const half: i32 = @divFloor(den - 1, 2);
@@ -450,10 +450,10 @@ pub fn blitCanvasZoomRefZ(
     }
 }
 
-/// 透明背景チェッカーを screen_rect ∩ clip ∩ fb へ直接描く（screen 固定セル）。canvas blit の直前に呼ぶ。
-/// screen_rect の w/h は **screen px**。行ごとに cell_y を 1 回計算し、
-/// x はセル境界までの run を @memset（per-pixel の divFloor/mod を排除。旧実装と bit 同値）。
-/// scale=1 の論理経路。物理 fb は `drawCheckerboardPhysical` を使う。
+/// Draw the transparent-background checkerboard directly into screen_rect ∩ clip ∩ fb (screen-fixed cells). Call just before the canvas blit.
+/// screen_rect w/h are **screen px**. Compute cell_y once per row;
+/// for x, @memset runs up to the cell boundary (eliminates per-pixel divFloor/mod; bit-identical to the old impl).
+/// Logical path at scale=1. Physical fb uses `drawCheckerboardPhysical`.
 pub fn drawCheckerboard(fb: []u32, fb_w: u32, fb_h: u32, screen_rect: core.Rect, clip: core.Rect) void {
     const x0: i32 = @max(@max(screen_rect.x, clip.x), 0);
     const y0: i32 = @max(@max(screen_rect.y, clip.y), 0);
@@ -476,9 +476,9 @@ pub fn drawCheckerboard(fb: []u32, fb_w: u32, fb_h: u32, screen_rect: core.Rect,
     }
 }
 
-/// 論理 screen_rect / clip を両エッジ floor で物理化し、論理セル境界を物理境界へ変換して塗る。
-/// `content_scale == 1.0` は既存 `drawCheckerboard` に委譲。
-/// セル境界: 論理 edge `k * CHECKER_CELL` → `floor(k * CHECKER_CELL * scale)`。
+/// Floor both edges of the logical screen_rect / clip into physical space, then paint by mapping logical cell edges to physical edges.
+/// `content_scale == 1.0` delegates to existing `drawCheckerboard`.
+/// Cell edge: logical edge `k * CHECKER_CELL` → `floor(k * CHECKER_CELL * scale)`.
 pub fn drawCheckerboardPhysical(
     fb: []u32,
     fb_w: u32,
@@ -500,14 +500,14 @@ pub fn drawCheckerboardPhysical(
     const y1 = @min(@min(screen_rect.y + screen_rect.h, clip.y + clip.h), @as(i32, @intCast(fb_h)));
     if (x0 >= x1 or y0 >= y1) return;
 
-    // 物理 y → 論理チェッカーセル。edge が進まない場合に備え cell 変化までスキャン。
+    // physical y → logical checker cell. Scan until the cell changes in case edge does not advance.
     var y = y0;
     while (y < y1) {
         const cell_y = physicalToCheckerCell(y, content_scale);
         var row_end: i32 = y + 1;
         while (row_end < y1 and physicalToCheckerCell(row_end, content_scale) == cell_y) : (row_end += 1) {}
         const row = fb[@as(usize, @intCast(y)) * fb_w ..];
-        // 同一 cell_y の複数物理行は同じ水平パターン → 1 行計算して memcpy
+        // Multiple physical rows with the same cell_y share one horizontal pattern → compute once and memcpy
         var x = x0;
         while (x < x1) {
             const cell_x = physicalToCheckerCell(x, content_scale);
@@ -519,7 +519,7 @@ pub fn drawCheckerboardPhysical(
             @memset(row[lo..hi], color);
             x = run_end;
         }
-        // 同じ cell_y の後続行をコピー（行連続）
+        // copy subsequent rows with the same cell_y (contiguous rows)
         var yy = y + 1;
         while (yy < row_end) : (yy += 1) {
             const dst = fb[@as(usize, @intCast(yy)) * fb_w ..];
@@ -529,13 +529,13 @@ pub fn drawCheckerboardPhysical(
     }
 }
 
-/// 論理セル index k の物理上端エッジ `floor(k * CHECKER_CELL * scale)`。
+/// Physical top edge of logical cell index k: `floor(k * CHECKER_CELL * scale)`.
 inline fn checkerCellEdge(cell_index: i32, scale: f32) i32 {
     return floorI32(@as(f32, @floatFromInt(cell_index * CHECKER_CELL)) * scale);
 }
 
-/// 物理座標 → 論理チェッカーセル index。セル k は `[edge(k), edge(k+1))`。
-/// 近似から最大 1〜数段の単調補正（内側ループ外の run 先頭で 1 回）。
+/// Physical coord → logical checker cell index. Cell k covers `[edge(k), edge(k+1))`.
+/// Approx then at most a few steps of monotonic correction (once at the start of a run, outside the inner loop).
 inline fn physicalToCheckerCell(phys: i32, scale: f32) i32 {
     const s = scale * @as(f32, @floatFromInt(CHECKER_CELL));
     var c = floorI32(@as(f32, @floatFromInt(phys)) / s);
@@ -544,7 +544,7 @@ inline fn physicalToCheckerCell(phys: i32, scale: f32) i32 {
     return c;
 }
 
-/// 旧 per-pixel 実装（テスト参照専用）。
+/// Legacy per-pixel impl (test reference only).
 pub fn drawCheckerboardRef(fb: []u32, fb_w: u32, fb_h: u32, screen_rect: core.Rect, clip: core.Rect) void {
     const x0 = @max(@max(screen_rect.x, clip.x), 0);
     const y0 = @max(@max(screen_rect.y, clip.y), 0);
@@ -566,7 +566,7 @@ pub fn drawCheckerboardRef(fb: []u32, fb_w: u32, fb_h: u32, screen_rect: core.Re
 // ============================================================
 const testing = std.testing;
 
-// zoom.zig の unit test を blit テストバイナリに取り込む（test-core 配線済み）
+// Pull zoom.zig unit tests into the blit test binary (wired in test-core)
 test {
     _ = @import("zoom.zig");
 }
@@ -575,7 +575,7 @@ fn fillOpaqueRandom(fb: []u32, rng: std.Random) void {
     for (fb) |*p| p.* = rng.int(u32) | 0xFF000000;
 }
 
-test "blitCanvasZoom: 旧 per-pixel 参照と bit 一致（opaque-dst 前提。zoom/パン/clip 網羅）" {
+test "blitCanvasZoom: bit-identical to legacy per-pixel reference (opaque-dst; covers zoom/pan/clip)" {
     var prng = std.Random.DefaultPrng.init(0xB117CA);
     const rng = prng.random();
     const cw: u32 = 16;
@@ -583,7 +583,7 @@ test "blitCanvasZoom: 旧 per-pixel 参照と bit 一致（opaque-dst 前提。z
     const fbw: u32 = 64;
     const fbh: u32 = 48;
 
-    // composite: 不透明/半透明/透明を混在
+    // composite: mix opaque / semi-transparent / transparent
     var comp: [16 * 12]u32 = undefined;
     for (&comp) |*p| {
         const v = rng.int(u32);
@@ -595,22 +595,22 @@ test "blitCanvasZoom: 旧 per-pixel 参照と bit 一致（opaque-dst 前提。z
         p.* = (a << 24) | (v & 0x00FFFFFF);
     }
 
-    const clip = core.Rect{ .x = 4, .y = 3, .w = 50, .h = 40 }; // canvas area 相当（部分交差）
+    const clip = core.Rect{ .x = 4, .y = 3, .w = 50, .h = 40 }; // canvas-area equivalent (partial intersection)
     const zooms = [_]i32{ 1, 2, 3, 8 };
     const positions = [_]core.Vec2{
-        .{ .x = 10, .y = 8 }, // 完全内側
-        .{ .x = -20, .y = -15 }, // 左上端はみ出し
-        .{ .x = 40, .y = 30 }, // 右下端はみ出し
-        .{ .x = 4, .y = 3 }, // clip 左上ぴったり
-        .{ .x = -500, .y = 0 }, // 完全外
+        .{ .x = 10, .y = 8 }, // fully inside
+        .{ .x = -20, .y = -15 }, // overhang top-left
+        .{ .x = 40, .y = 30 }, // overhang bottom-right
+        .{ .x = 4, .y = 3 }, // clip flush with top-left
+        .{ .x = -500, .y = 0 }, // fully outside
     };
     for (zooms) |zi| {
         for (positions) |pos| {
-            const rect = core.Rect{ .x = pos.x, .y = pos.y, .w = @intCast(cw), .h = @intCast(chh) }; // w/h=セル数
+            const rect = core.Rect{ .x = pos.x, .y = pos.y, .w = @intCast(cw), .h = @intCast(chh) }; // w/h = cell count
             var fb_new: [64 * 48]u32 = undefined;
             var fb_ref: [64 * 48]u32 = undefined;
             fillOpaqueRandom(&fb_new, rng);
-            @memcpy(&fb_ref, &fb_new); // 同一 dst（不透明 = 契約どおり）
+            @memcpy(&fb_ref, &fb_new); // same dst (opaque = per contract)
 
             blitCanvasZoom(&fb_new, fbw, fbh, &comp, cw, chh, rect, zi, clip);
             blitCanvasZoomRef(&fb_ref, fbw, fbh, &comp, cw, chh, rect, zi, clip);
@@ -622,10 +622,10 @@ test "blitCanvasZoom: 旧 per-pixel 参照と bit 一致（opaque-dst 前提。z
     }
 }
 
-test "blitCanvasZoomZ: 縮小 1/2・1/3・1/4 × 奇数寸法 × clip 境界 bit 一致" {
+test "blitCanvasZoomZ: shrink 1/2·1/3·1/4 × odd sizes × clip edges bit-identical" {
     var prng = std.Random.DefaultPrng.init(0x51A1D);
     const rng = prng.random();
-    // 奇数寸法
+    // odd dimensions
     const sizes = [_]struct { w: u32, h: u32 }{
         .{ .w = 15, .h = 11 },
         .{ .w = 17, .h = 13 },
@@ -637,7 +637,7 @@ test "blitCanvasZoomZ: 縮小 1/2・1/3・1/4 × 奇数寸法 × clip 境界 bit
         .{ .x = -3, .y = -2 },
         .{ .x = 20, .y = 15 },
         .{ .x = 0, .y = 0 },
-        .{ .x = -100, .y = 10 }, // 完全外寄り
+        .{ .x = -100, .y = 10 }, // fully outside-ish
     };
     const fbw: u32 = 48;
     const fbh: u32 = 40;
@@ -680,7 +680,7 @@ test "blitCanvasZoomZ: 縮小 1/2・1/3・1/4 × 奇数寸法 × clip 境界 bit
     std.debug.print("blit shrink bit-match cases: {d}\n", .{cases});
 }
 
-test "drawCheckerboard: 旧 per-pixel 参照と bit 一致（セル境界・clip 部分交差・負座標）" {
+test "drawCheckerboard: bit-identical to legacy per-pixel reference (cell edges, partial clip, negative coords)" {
     const fbw: u32 = 40;
     const fbh: u32 = 30;
     const cases = [_]struct { rect: core.Rect, clip: core.Rect }{
@@ -698,7 +698,7 @@ test "drawCheckerboard: 旧 per-pixel 参照と bit 一致（セル境界・clip
     }
 }
 
-/// 参照: 論理表示 pixel を Zoom 規則で sample し、物理 nearest で拡大（per-pixel・テスト専用）。
+/// Reference: sample logical display pixels by the Zoom rule, then nearest-upsample physically (per-pixel; tests only).
 fn blitCanvasZoomPhysicalRef(
     fb: []u32,
     fb_w: u32,
@@ -749,7 +749,7 @@ fn blitCanvasZoomPhysicalRef(
     }
 }
 
-test "blitCanvasZoomPhysical: scale=1 は既存経路と bit 一致" {
+test "blitCanvasZoomPhysical: scale=1 bit-identical to the existing path" {
     var prng = std.Random.DefaultPrng.init(0x51A1E);
     const rng = prng.random();
     const cw: u32 = 12;
@@ -780,12 +780,12 @@ test "blitCanvasZoomPhysical: scale=1 は既存経路と bit 一致" {
     }
 }
 
-test "blitCanvasZoomPhysical: 1x/1.5x/2x nearest 参照 bit 一致" {
+test "blitCanvasZoomPhysical: 1x/1.5x/2x nearest reference bit-identical" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     const rng = prng.random();
     const cw: u32 = 8;
     const ch: u32 = 6;
-    // 識別可能な色（cx,cy を色に埋め込み）
+    // Distinctive colors (embed cx,cy into the color)
     var comp: [8 * 6]u32 = undefined;
     for (0..ch) |cy| {
         for (0..cw) |cx| {
@@ -797,7 +797,7 @@ test "blitCanvasZoomPhysical: 1x/1.5x/2x nearest 参照 bit 一致" {
     const scales = [_]f32{ 1.0, 1.5, 2.0 };
     const zooms = [_]Zoom{ Zoom.fromInteger(1), Zoom.fromInteger(2), .{ .num = 1, .den = 2 }, .{ .num = 1, .den = 3 } };
     const positions = [_]core.Vec2{ .{ .x = 2, .y = 2 }, .{ .x = -4, .y = -2 }, .{ .x = 10, .y = 8 } };
-    // 物理 fb は scale=2 でも収まるサイズ
+    // Physical fb sized to fit even at scale=2
     const fbw: u32 = 64;
     const fbh: u32 = 48;
     const logical_clip = core.Rect{ .x = 0, .y = 0, .w = 30, .h = 24 };
@@ -823,8 +823,8 @@ test "blitCanvasZoomPhysical: 1x/1.5x/2x nearest 参照 bit 一致" {
     try testing.expect(cases == scales.len * zooms.len * positions.len);
 }
 
-test "blitCanvasZoomPhysical: integer Zoom 2x × physical scale 2x ブロック対応" {
-    // canvas 2x2: 各画素が論理 2x 表示 → 物理 4x4 ブロック
+test "blitCanvasZoomPhysical: integer Zoom 2x × physical scale 2x block mapping" {
+    // canvas 2x2: each pixel becomes a logical 2x display → physical 4x4 block
     const cw: u32 = 2;
     const ch: u32 = 2;
     const comp = [_]u32{ 0xFF0000FF, 0xFF00FF00, 0xFFFF0000, 0xFFFFFFFF };
@@ -833,19 +833,19 @@ test "blitCanvasZoomPhysical: integer Zoom 2x × physical scale 2x ブロック�
     const clip = core.Rect{ .x = 0, .y = 0, .w = 16, .h = 16 };
     var fb = [_]u32{0xFF111111} ** (16 * 16);
     blitCanvasZoomPhysical(&fb, 16, 16, &comp, cw, ch, rect, z, clip, 2.0);
-    // 左上 canvas(0,0)=青 → 物理 [0,4)×[0,4)
+    // top-left canvas(0,0)=blue → physical [0,4)×[0,4)
     try testing.expectEqual(@as(u32, 0xFF0000FF), fb[0]);
     try testing.expectEqual(@as(u32, 0xFF0000FF), fb[3 + 3 * 16]);
-    // 右上 canvas(1,0)=緑 → [4,8)×[0,4)
+    // top-right canvas(1,0)=green → [4,8)×[0,4)
     try testing.expectEqual(@as(u32, 0xFF00FF00), fb[4]);
     try testing.expectEqual(@as(u32, 0xFF00FF00), fb[7 + 3 * 16]);
-    // 左下 canvas(0,1)=赤 → [0,4)×[4,8)
+    // bottom-left canvas(0,1)=red → [0,4)×[4,8)
     try testing.expectEqual(@as(u32, 0xFFFF0000), fb[0 + 4 * 16]);
-    // 右下 canvas(1,1)=白 → [4,8)×[4,8)
+    // bottom-right canvas(1,1)=white → [4,8)×[4,8)
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), fb[4 + 4 * 16]);
 }
 
-test "drawCheckerboardPhysical: scale=1 bit 一致 / scale=2 セル 2 倍幅" {
+test "drawCheckerboardPhysical: scale=1 bit-identical / scale=2 cells are 2× wide" {
     const fbw: u32 = 40;
     const fbh: u32 = 32;
     const rect = core.Rect{ .x = 0, .y = 0, .w = 20, .h = 16 };
@@ -857,24 +857,24 @@ test "drawCheckerboardPhysical: scale=1 bit 一致 / scale=2 セル 2 倍幅" {
     drawCheckerboard(&fb1b, fbw, fbh, rect, clip);
     try testing.expectEqualSlices(u32, &fb1b, &fb1);
 
-    // scale=2: 論理 20x16 → 物理 40x32、セル 8 論理 → 16 物理
+    // scale=2: logical 20x16 → physical 40x32; cell 8 logical → 16 physical
     var fb2 = [_]u32{0} ** (40 * 32);
     drawCheckerboardPhysical(&fb2, fbw, fbh, rect, clip, 2.0);
-    // 物理 (0,0) と (15,0) は同一セル、 (16,0) は隣セル
+    // physical (0,0) and (15,0) are the same cell; (16,0) is the next cell
     try testing.expectEqual(fb2[0], fb2[15]);
     try testing.expect(fb2[0] != fb2[16]);
-    try testing.expectEqual(fb2[0], fb2[0 + 15 * 40]); // 縦 16px セル
+    try testing.expectEqual(fb2[0], fb2[0 + 15 * 40]); // vertical 16px cell
     try testing.expect(fb2[0] != fb2[0 + 16 * 40]);
 }
 
-test "drawCheckerboardPhysical: fractional scale セル境界連続" {
+test "drawCheckerboardPhysical: fractional scale cell edges are contiguous" {
     const fbw: u32 = 48;
     const fbh: u32 = 36;
     const rect = core.Rect{ .x = 0, .y = 0, .w = 32, .h = 24 };
     const clip = rect;
     var fb = [_]u32{0} ** (48 * 36);
     drawCheckerboardPhysical(&fb, fbw, fbh, rect, clip, 1.5);
-    // 隣接セル境界で隙間なし（全画素が塗られている）
+    // no gap at adjacent cell boundaries (every pixel is painted)
     const phys = scaleRectFloor(rect, 1.5);
     var y: i32 = phys.y;
     while (y < phys.y + phys.h) : (y += 1) {
@@ -886,7 +886,7 @@ test "drawCheckerboardPhysical: fractional scale セル境界連続" {
     }
 }
 
-test "scaleRectFloor: 隣接タイリング" {
+test "scaleRectFloor: adjacent tiling" {
     const a = core.Rect{ .x = 0, .y = 0, .w = 10, .h = 8 };
     const b = core.Rect{ .x = 10, .y = 0, .w = 10, .h = 8 };
     for ([_]f32{ 1.0, 1.5, 2.0 }) |s| {

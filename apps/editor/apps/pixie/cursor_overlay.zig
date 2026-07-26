@@ -1,18 +1,18 @@
-//! カーソルのソフトオーバーレイ描画（ツールグリフ + ブラシ footprint 輪郭リング。TASK-75.4）。
+//! Soft cursor overlay drawing (tool glyph + brush footprint outline ring).
 //!
-//! bezier_overlay.zig / selection_overlay.zig と同じ「dumb drawer」流儀: App / ToolKind に依存せず
-//! ctx.draw_list へ描くだけ。描画順は main で canvas blit → bezier_overlay/selection_overlay → ここ
-//! （最前面）→ gui.render なので、ツールグリフ・輪郭リングは常に一番上に重なる。
-//! OS ハードカーソル（default/crosshair）の精密点に対する装飾なので、1 フレーム遅延しても
-//! 精密点そのものはズレない（親タスク TASK-75 の設計どおり）。
+//! Same "dumb drawer" style as bezier_overlay.zig / selection_overlay.zig: no App / ToolKind dependency;
+//! only writes into ctx.draw_list. Draw order in main is canvas blit → bezier_overlay/selection_overlay → here
+//! (frontmost) → gui.render, so the tool glyph and outline ring always sit on top.
+//! Decoration around the OS hard cursor (default/crosshair) precision point, so a one-frame delay does not
+//! shift the precision point itself.
 //!
-//! ホットパス宣言: drawGlyph は毎フレーム1回・固定小サイズ（rectFilled+rectOutline+text 各1回）。
-//! drawRing は毎フレーム O(縁セル数)（EdgeCache 側で (size,hardness) 変化時のみ再計算済みの縁セル
-//! リストを zoom 倍で rectFilled するだけ）。いずれも全画素ループの3点セット規約は非該当。
+//! Hot-path note: drawGlyph runs once per frame at a fixed small size (rectFilled+rectOutline+text once each).
+//! drawRing is O(edge-cell count) per frame (just rectFilled at zoom× over EdgeCache edge cells already
+//! recomputed only when (size,hardness) change). Neither is under the full-pixel-loop three-point set.
 //!
-//! 本ファイル自体は bezier_overlay.zig/selection_overlay.zig と同じく unit test を持たない
-//! （純描画・gui 依存のため。検証は snapshot fb 目視。縁抽出の純ロジックは brush_edge_cache.zig 側で
-//! unit test 済み）。
+//! This file itself has no unit tests, same as bezier_overlay.zig/selection_overlay.zig
+//! (pure drawing, gui-dependent. Verified by snapshot fb eyeballing. Edge-extract pure logic is unit-tested
+//! in brush_edge_cache.zig).
 
 const gui = @import("kit").gui;
 const core = @import("paint");
@@ -26,15 +26,15 @@ const BADGE_W: i32 = 22;
 const BADGE_H: i32 = 20;
 const BADGE_BORDER = gui.Color.rgba(0x10, 0x10, 0x10, 0xFF);
 const BADGE_TEXT = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-/// ツール精密点（OS crosshair）の脇に出す badge のオフセット（screen px。zoom に依らず一定）。
+/// Badge offset beside the tool precision point (OS crosshair), in screen px (constant; independent of zoom).
 const BADGE_OFFSET_X: i32 = 10;
 const BADGE_OFFSET_Y: i32 = 10;
 
-/// hover 位置（生スクリーン座標）の脇にツールバッジ（2文字ラベル + 背景色）を描く。
-/// label は呼び出し側が string literal（またはそれと同等の寿命の文字列）を渡すこと
-/// （DrawList.text は文字列を dupe しない）。
-/// clip は canvas area 全体（レターボックス余白でもグリフはカーソルに追従させる。実 canvas
-/// 画素矩形に限定する drawRing とは異なる）。
+/// Draw a tool badge (2-char label + background color) beside the hover position (raw screen coords).
+/// Caller must pass a string literal (or equally long-lived string) for label
+/// (DrawList.text does not dupe the string).
+/// clip is the whole canvas area (the glyph follows the cursor even over letterbox margins; unlike
+/// drawRing, which is limited to the real canvas pixel rect).
 pub fn drawGlyph(ctx: *gui.Context, hover_screen: gui.Vec2, label: []const u8, bg: gui.Color, clip_area: gui.Rect) void {
     const dl = &ctx.draw_list;
     dl.pushClip(clip_area) catch @panic("cursor_overlay: OOM");
@@ -51,10 +51,10 @@ pub fn drawGlyph(ctx: *gui.Context, hover_screen: gui.Vec2, label: []const u8, b
     dl.text(.{ .x = rect.x + 3, .y = rect.y + 2 }, label, BADGE_TEXT) catch @panic("cursor_overlay: OOM");
 }
 
-/// ブラシ footprint の縁セル（cache）を、canvas 上の hover_cell を中心に zoom 倍で描く。
-/// (dx+dy) の偶奇で color_a/color_b を交互に使い（selection_overlay の marching ants と同じ流儀）、
-/// 任意の背景色に対するコントラストを確保する。
-/// clip は表示中の実 canvas 画素矩形 ∩ canvas area（bezier_overlay/selection_overlay と同一パターン）。
+/// Draw the brush footprint edge cells (cache) at zoom× centered on hover_cell on the canvas.
+/// Alternate color_a/color_b by the parity of (dx+dy) (same style as selection_overlay marching ants)
+/// to keep contrast against any background color.
+/// clip is the visible real canvas pixel rect ∩ canvas area (same pattern as bezier_overlay/selection_overlay).
 pub fn drawRing(
     ctx: *gui.Context,
     cache: *const EdgeCache,
