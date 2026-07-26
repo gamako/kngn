@@ -1,13 +1,13 @@
-//! Tool 抽象（TASK-21.7）: 入力イベント → StrokeRecorder 駆動のポリシー。
+//! Tool abstraction: input events → policy that drives StrokeRecorder.
 //!
-//! - `Tool` は `std.mem.Allocator` / `std.Io.Writer` と同じ vtable 流儀
-//!   （`ptr: *anyopaque` + `vtable: *const VTable`）。
-//! - stroke 記録機械（dedup・before 観測・Bresenham）は tool 非依存なので
-//!   `core/undo.zig` の共有 `StrokeRecorder` に置き、Tool は「どの色で塗るか」だけを決める。
-//! - `onEvent` は `.up` で stroke を確定し `?PaintDiff` を返す（呼び出し側が UndoStack へ push）。
-//!   `.down` で対象レイヤ・色を recorder に latch するので、stroke 中にツール/色を
-//!   切り替えても進行中の stroke は latch 値で描かれる（＝旧 PaintEngine の挙動）。
-//! - Pen / Eraser は塗り色が違うだけ（実態）。vtable は将来 Fill / Picker が挿さる拡張点。
+//! - `Tool` uses the same vtable style as `std.mem.Allocator` / `std.Io.Writer`
+//!   (`ptr: *anyopaque` + `vtable: *const VTable`).
+//! - The stroke recording machine (dedup · before observation · Bresenham) is tool-agnostic, so
+//!   it lives in the shared `StrokeRecorder` in `libs/paint/src/undo.zig`; Tool only decides which color to paint.
+//! - `onEvent` finalizes the stroke on `.up` and returns `?PaintDiff` (caller pushes onto UndoStack).
+//!   `.down` latches target layer and color into the recorder, so switching tool/color mid-stroke
+//!   still draws the in-progress stroke with the latched values.
+//! - Pen / Eraser differ only in paint color. The vtable is the extension point for future Fill / Picker.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,7 +17,7 @@ const undo_mod = @import("undo.zig");
 const StrokeRecorder = undo_mod.StrokeRecorder;
 const PaintDiff = undo_mod.PaintDiff;
 
-/// Eraser の塗り色（透明）。canonical BGRA 0xAARRGGBB の a=0。
+/// Eraser paint color (transparent). canonical BGRA 0xAARRGGBB with a=0.
 pub const ERASER_COLOR: u32 = 0x00000000;
 
 pub const ToolPoint = struct { x: i32, y: i32 };
@@ -32,10 +32,10 @@ pub const Tool = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// down: begin(layer,色)+point / move: lineTo / up: lineTo+finish→?PaintDiff。
-        /// gpa は finish 用。OOM は finish 内で @panic なので error union は返さない。
+        /// down: begin(layer,color)+point / move: lineTo / up: lineTo+finish→?PaintDiff.
+        /// gpa is for finish. OOM is @panic inside finish, so no error union is returned.
         onEvent: *const fn (ptr: *anyopaque, canvas: *Canvas, rec: *StrokeRecorder, gpa: Allocator, ev: ToolEvent) ?PaintDiff,
-        /// ツール自身の内部状態をリセットする（Pen/Eraser は状態を持たないので no-op）。
+        /// Reset the tool's own internal state (Pen/Eraser hold no state → no-op).
         reset: *const fn (ptr: *anyopaque) void,
     };
 
@@ -47,7 +47,7 @@ pub const Tool = struct {
     }
 };
 
-/// Pen / Eraser 共通の「単色ブラシ」イベント処理。size>1 は本タスク未実装。
+/// Shared solid-color brush event handling for Pen / Eraser. size>1 is not implemented here.
 fn brushOnEvent(rec: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, color: u32, ev: ToolEvent) ?PaintDiff {
     switch (ev) {
         .down => |p| {
@@ -68,7 +68,7 @@ fn brushOnEvent(rec: *StrokeRecorder, canvas: *Canvas, gpa: Allocator, color: u3
 
 pub const Pen = struct {
     color: u32,
-    size: u32 = 1, // size>1 は TASK-21.7 では未実装
+    size: u32 = 1, // size>1 is not implemented
 
     const vtable: Tool.VTable = .{ .onEvent = onEventImpl, .reset = resetImpl };
 
@@ -85,7 +85,7 @@ pub const Pen = struct {
 };
 
 pub const Eraser = struct {
-    size: u32 = 1, // size>1 は TASK-21.7 では未実装
+    size: u32 = 1, // size>1 is not implemented
 
     const vtable: Tool.VTable = .{ .onEvent = onEventImpl, .reset = resetImpl };
 
@@ -102,14 +102,14 @@ pub const Eraser = struct {
     }
 };
 
-/// ソフト/アルファ Brush（TASK-21.12）。半径 r=size/2 の AA 円ダブ（size 直径・opacity・hardness）。
-/// StrokeRecorder の brush 経路（coverage max・原本ベース src-over 再合成）を駆動する。
-/// footprint は down 時に buildDab で生成し offsets_buf に固定（stroke 中不変。color/opacity も down で latch）。
+/// Soft/alpha Brush. AA disk dab with radius r=size/2 (size=diameter · opacity · hardness).
+/// Drives StrokeRecorder's brush path (coverage max · original-based src-over recompose).
+/// Footprint is built with buildDab on down and fixed in offsets_buf (immutable during the stroke; color/opacity also latched on down).
 pub const Brush = struct {
     color: u32,
-    size: u32 = 4, // 直径。1..MAX_SIZE に clamp される
-    opacity: u8 = 255, // stroke 不透明度
-    hardness_q: u8 = 255, // 0..255 で hardness 0..1（255=ハード縁）
+    size: u32 = 4, // Diameter. Clamped to 1..MAX_SIZE
+    opacity: u8 = 255, // Stroke opacity
+    hardness_q: u8 = 255, // 0..255 for hardness 0..1 (255 = hard edge)
     offsets_buf: [MAX_OFFSETS]undo_mod.Offset = undefined,
     dab_len: usize = 0,
 
@@ -128,15 +128,15 @@ pub const Brush = struct {
         return .{ .offsets = self.offsets_buf[0..self.dab_len] };
     }
 
-    /// 現在のパラメータで footprint を生成して返す公開アクセサ。
-    /// ベジェ(TASK-21.13)等が「現在ブラシ形状」で rasterize するために使う（buildDab/dabRef は private のまま）。
+    /// Public accessor that builds and returns a footprint with the current parameters.
+    /// Used by Bezier (etc.) to rasterize with the "current brush shape" (buildDab/dabRef stay private).
     pub fn footprint(self: *Brush) undo_mod.Dab {
         self.buildDab();
         return self.dabRef();
     }
 
-    /// footprint を生成（down 時）。半径 r=size/2 の AA ディスク。
-    /// 偶数 size も中心ピクセル基準の対称 AA ディスク（厳密な「太らない」は主張しない）。
+    /// Build the footprint (on down). AA disk with radius r=size/2.
+    /// Even size is still a center-pixel-based symmetric AA disk (does not claim strict "no thickening").
     fn buildDab(self: *Brush) void {
         const size = std.math.clamp(self.size, 1, MAX_SIZE);
         self.dab_len = 0;
@@ -149,7 +149,7 @@ pub const Brush = struct {
         const rc: i32 = @intFromFloat(@ceil(r));
         const hard = self.hardness_q == 255;
         const hardness: f32 = @as(f32, @floatFromInt(self.hardness_q)) / 255.0;
-        const inner: f32 = hardness * r; // hard でない時のみ使用（r-inner>0）
+        const inner: f32 = hardness * r; // Used only when not hard (r-inner>0)
         var dy: i32 = -rc;
         while (dy <= rc) : (dy += 1) {
             var dx: i32 = -rc;
@@ -159,11 +159,11 @@ pub const Brush = struct {
                 const d = @sqrt(fx * fx + fy * fy);
                 var covf: f32 = 0;
                 if (hard) {
-                    covf = std.math.clamp(r - d + 0.5, 0, 1); // AA 縁
+                    covf = std.math.clamp(r - d + 0.5, 0, 1); // AA edge
                 } else if (d <= inner) {
                     covf = 1;
                 } else if (d < r) {
-                    covf = (r - d) / (r - inner); // 線形フォールオフ
+                    covf = (r - d) / (r - inner); // Linear falloff
                 }
                 const cov: u8 = @intFromFloat(covf * 255 + 0.5);
                 if (cov == 0) continue;
@@ -203,11 +203,11 @@ pub const Brush = struct {
 // ============================================================
 
 const Offset = undo_mod.Offset;
-const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
+const RED: u32 = 0xFFFF0000; // canonical BGRA (red)
 
-// Tool 経路（onEvent down/move/up）でゴールデン: 描画 → undo → PNG round-trip 一致（AC#3）。
-// undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
-test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip が一致する" {
+// Tool path (onEvent down/move/up) golden: draw → undo → PNG round-trip match.
+// undo/redo live on the document.zig side (Document.pushPaintOp/undoOne).
+test "Tool golden: Pen draws a line, Eraser clears it; undo / PNG round-trip match" {
     const png = @import("png");
     const io_png = @import("io_png.zig");
     const document_mod = @import("document.zig");
@@ -219,7 +219,7 @@ test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip 
     var rec = try StrokeRecorder.init(gpa, 16, 16);
     defer rec.deinit(gpa);
 
-    // Pen で (0,0)→(5,0) を RED で描く
+    // Pen draws (0,0)→(5,0) in RED
     var pen: Pen = .{ .color = RED };
     const pt = pen.tool();
     try std.testing.expectEqual(@as(?PaintDiff, null), pt.onEvent(canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } }));
@@ -228,11 +228,11 @@ test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip 
 
     for (0..6) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[x]);
 
-    // raw を退避（後で undo 復元の比較に使う）
+    // Stash raw (used later to compare after undo restore)
     const drawn = try gpa.dupe(u32, canvas.layerPixels(0));
     defer gpa.free(drawn);
 
-    // Eraser で同じ線を消す（透明 = 0）
+    // Eraser clears the same line (transparent = 0)
     var eraser: Eraser = .{};
     const et = eraser.tool();
     _ = et.onEvent(canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
@@ -241,11 +241,11 @@ test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip 
 
     for (0..6) |x| try std.testing.expectEqual(@as(u32, 0), canvas.layerPixels(0)[x]);
 
-    // undo で Pen の線が復元される
+    // Undo restores the Pen line
     doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, drawn, canvas.layerPixels(0));
 
-    // PNG round-trip（保存は raw layer pixels）
+    // PNG round-trip (save = raw layer pixels)
     const raw = canvas.layerPixels(0);
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
@@ -257,9 +257,9 @@ test "Tool golden: Pen で線を引き Eraser で消し、undo / PNG round-trip 
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 }
 
-// stroke 中に Pen.color を変えても、進行中 stroke は .down 時の色で確定する
-// （色は recorder.begin で latch され move/up は rec.color を使うため。旧 beginStroke(color) 固定と等価）。
-test "Tool: stroke 中の Pen.color 変更は進行中 stroke に影響しない（色 latch）" {
+// Changing Pen.color mid-stroke does not affect the in-progress stroke
+// (color is latched in recorder.begin; move/up use rec.color).
+test "Tool: Pen.color change mid-stroke does not affect the in-progress stroke (color latch)" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 8, 8);
     defer canvas.deinit();
@@ -271,13 +271,13 @@ test "Tool: stroke 中の Pen.color 変更は進行中 stroke に影響しない
     const pt = pen.tool();
 
     _ = pt.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 0, .y = 0 } });
-    pen.color = GREEN; // stroke 中に色変更（UI はこの場で更新されるが描画色は据え置きのはず）
+    pen.color = GREEN; // Color change mid-stroke (UI updates immediately; draw color should stay latched)
     _ = pt.onEvent(&canvas, &rec, gpa, .{ .move = .{ .x = 3, .y = 0 } });
     if (pt.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 3, .y = 0 } })) |cmd| {
         defer gpa.free(cmd.diffs);
     }
 
-    // (0,0)..(3,0) は全て RED（GREEN が混ざらない）
+    // (0,0)..(3,0) are all RED (no GREEN mixed in)
     for (0..4) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[x]);
     try std.testing.expectEqual(@as(usize, 0), blk: {
         var n: usize = 0;
@@ -288,21 +288,21 @@ test "Tool: stroke 中の Pen.color 変更は進行中 stroke に影響しない
     });
 }
 
-test "Tool: 空 stroke（変更なし）では onEvent(.up) が null を返す" {
+test "Tool: empty stroke (no change) makes onEvent(.up) return null" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 8, 8);
     defer canvas.deinit();
     var rec = try StrokeRecorder.init(gpa, 8, 8);
     defer rec.deinit(gpa);
 
-    // 空キャンバスを Eraser で塗っても変化なし → null
+    // Erasing an empty canvas changes nothing → null
     var eraser: Eraser = .{};
     const et = eraser.tool();
     _ = et.onEvent(&canvas, &rec, gpa, .{ .down = .{ .x = 2, .y = 2 } });
     try std.testing.expectEqual(@as(?PaintDiff, null), et.onEvent(&canvas, &rec, gpa, .{ .up = .{ .x = 4, .y = 4 } }));
 }
 
-test "Tool: selected_layer に描画する" {
+test "Tool: paints on selected_layer" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 4, 4);
     defer canvas.deinit();
@@ -323,7 +323,7 @@ test "Tool: selected_layer に描画する" {
     try std.testing.expectEqual(@as(usize, 1), cmd.layer_idx);
 }
 
-// ── Brush footprint / stroke テスト（TASK-21.12）─────────────
+// ── Brush footprint / stroke tests ─────────────
 
 fn centerCov(b: *const Brush) u8 {
     for (b.offsets_buf[0..b.dab_len]) |o| {
@@ -332,14 +332,14 @@ fn centerCov(b: *const Brush) u8 {
     return 0;
 }
 
-test "Brush.buildDab: size=1 は中心 1px (cov=255)" {
+test "Brush.buildDab: size=1 is a single center px (cov=255)" {
     var b: Brush = .{ .color = RED, .size = 1 };
     b.buildDab();
     try std.testing.expectEqual(@as(usize, 1), b.dab_len);
     try std.testing.expectEqual(Offset{ .dx = 0, .dy = 0, .cov = 255 }, b.offsets_buf[0]);
 }
 
-test "Brush.buildDab: hardness=1 は中心 cov=255・bbox=[-ceil(r)..ceil(r)]・全 cov>0" {
+test "Brush.buildDab: hardness=1 has center cov=255, bbox=[-ceil(r)..ceil(r)], all cov>0" {
     var b: Brush = .{ .color = RED, .size = 8, .hardness_q = 255 };
     b.buildDab();
     try std.testing.expectEqual(@as(u8, 255), centerCov(&b));
@@ -349,7 +349,7 @@ test "Brush.buildDab: hardness=1 は中心 cov=255・bbox=[-ceil(r)..ceil(r)]・
     }
 }
 
-test "Brush.buildDab: hardness 中間で外周フォールオフ" {
+test "Brush.buildDab: mid hardness has outer-rim falloff" {
     var b: Brush = .{ .color = RED, .size = 16, .hardness_q = 128 }; // hardness ≈0.5, inner≈4, r=8
     b.buildDab();
     try std.testing.expectEqual(@as(u8, 255), centerCov(&b));
@@ -359,24 +359,24 @@ test "Brush.buildDab: hardness 中間で外周フォールオフ" {
         const dxi: i32 = o.dx;
         const dyi: i32 = o.dy;
         const d = @sqrt(@as(f32, @floatFromInt(dxi * dxi + dyi * dyi)));
-        if (d < 3.5 and o.cov == 255) inner_full = true; // inner 内は満被覆
-        if (d > 6.5 and d < 7.5 and o.cov > 0 and o.cov < 255) outer_partial = true; // 外周は部分
+        if (d < 3.5 and o.cov == 255) inner_full = true; // Full coverage inside inner
+        if (d > 6.5 and d < 7.5 and o.cov > 0 and o.cov < 255) outer_partial = true; // Partial on the outer rim
     }
     try std.testing.expect(inner_full);
     try std.testing.expect(outer_partial);
 }
 
-test "Brush.buildDab: size=64 / size>64(clamp) で overflow しない" {
+test "Brush.buildDab: size=64 / size>64(clamp) does not overflow" {
     var b: Brush = .{ .color = RED, .size = 64 };
     b.buildDab();
     try std.testing.expect(b.dab_len > 0 and b.dab_len <= Brush.MAX_OFFSETS);
-    var b2: Brush = .{ .color = RED, .size = 1000 }; // clamp(→64)。panic/overflow しない
+    var b2: Brush = .{ .color = RED, .size = 1000 }; // clamp(→64). No panic/overflow
     b2.buildDab();
     try std.testing.expect(b2.dab_len <= Brush.MAX_OFFSETS);
 }
 
-test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（partial alpha）" {
-    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
+test "Brush: onEvent stroke draw → undo restore → PNG round-trip (partial alpha)" {
+    // undo/redo live on the document.zig side (Document.pushPaintOp/undoOne).
     const png = @import("png");
     const io_png = @import("io_png.zig");
     const document_mod = @import("document.zig");
@@ -397,14 +397,14 @@ test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（part
     _ = bt.onEvent(canvas, &rec, gpa, .{ .move = .{ .x = 9, .y = 4 } });
     if (bt.onEvent(canvas, &rec, gpa, .{ .up = .{ .x = 9, .y = 4 } })) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 
-    // 何かしら塗られている（size=3 で太さが出る → 中心線以外も塗られる）
+    // Something is painted (size=3 adds thickness → pixels off the centerline too)
     var painted: usize = 0;
     for (canvas.layerPixels(0)) |px| {
         if ((px >> 24) & 0xFF != 0) painted += 1;
     }
-    try std.testing.expect(painted >= 6); // (4,4)-(9,4) の線 + 太さ
+    try std.testing.expect(painted >= 6); // Line (4,4)-(9,4) plus thickness
 
-    // PNG round-trip（保存=raw layer pixels・partial-alpha 込み）
+    // PNG round-trip (save = raw layer pixels; includes partial alpha)
     const raw = canvas.layerPixels(0);
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
@@ -415,7 +415,7 @@ test "Brush: onEvent で stroke 描画 → undo 復元 → PNG round-trip（part
     }
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
-    // undo で空へ復元
+    // Undo restores empty
     doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, blank, canvas.layerPixels(0));
 }

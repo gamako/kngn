@@ -1,8 +1,8 @@
-//! ベクターパス（アンカー + in/out ハンドル）とヒットテスト・ラスタライズ（TASK-21.13）。
+//! Vector path (anchor + in/out handles) with hit-test and rasterize.
 //!
-//! GUI/platform 非依存。`Path` はブラシ非依存の独立値（将来 VectorLayer 化＝再描画/ブラシ後
-//! 切替/確定後再編集の拡張点）。ラスタライズは 21.11 の StrokeRecorder brush 経路へ flatten
-//! 点列を流し、AA・太さ・hardness を Dab(footprint)から得る（color/opacity は引数で受ける）。
+//! GUI/platform independent. `Path` is a brush-agnostic value (extension point for a future VectorLayer =
+//! redraw / post-brush switch / post-commit re-edit). Rasterize feeds flattened points into
+//! StrokeRecorder's brush path; AA / width / hardness come from the Dab(footprint) (color/opacity via args).
 
 const std = @import("std");
 const bezier = @import("bezier.zig");
@@ -15,12 +15,12 @@ const StrokeRecorder = undo_mod.StrokeRecorder;
 const PaintDiff = undo_mod.PaintDiff;
 const Dab = undo_mod.Dab;
 
-/// ラスタライズ/プレビュー共通の平坦化許容誤差（論理 px）。
+/// Shared flatten tolerance for rasterize/preview (logical px).
 pub const FLATTEN_TOL: f32 = 0.25;
 
 pub const Anchor = struct {
     pos: Vec2f,
-    h_in: Vec2f, // in/out ハンドルは絶対座標。MVP は対称（h_in = 2*pos - h_out）
+    h_in: Vec2f, // in/out handles are absolute coords. MVP is symmetric (h_in = 2*pos - h_out)
     h_out: Vec2f,
 };
 
@@ -29,20 +29,20 @@ pub const Hit = struct { idx: usize, kind: HitKind };
 
 pub const Path = struct {
     anchors: std.ArrayList(Anchor) = .empty,
-    closed: bool = false, // MVP は false 固定
+    closed: bool = false, // MVP keeps false fixed
 
     pub fn deinit(self: *Path, gpa: std.mem.Allocator) void {
         self.anchors.deinit(gpa);
     }
 
-    /// セグメント i（anchors[i]→anchors[i+1]）の Cubic。
+    /// Cubic for segment i (anchors[i]→anchors[i+1]).
     pub fn segment(self: *const Path, i: usize) Cubic {
         const a = self.anchors.items[i];
         const b = self.anchors.items[i + 1];
         return .{ .p0 = a.pos, .c0 = a.h_out, .c1 = b.h_in, .p1 = b.pos };
     }
 
-    /// 全セグメントを flatten。先頭 anchor.pos を push 後、各セグメント終点を追加する。
+    /// Flatten all segments. Push the first anchor.pos, then each segment's endpoint.
     pub fn flattenAll(self: *const Path, tol: f32, out: *std.ArrayList(Vec2f), gpa: std.mem.Allocator) void {
         if (self.anchors.items.len == 0) return;
         out.append(gpa, self.anchors.items[0].pos) catch @panic("path.flattenAll: OOM");
@@ -52,7 +52,7 @@ pub const Path = struct {
         }
     }
 
-    /// 実体のあるハンドル(in/out)を優先、無ければアンカー。ゼロ長ハンドルは除外（角を掴める）。
+    /// Prefer real in/out handles; else the anchor. Exclude zero-length handles (so corners are grabbable).
     pub fn hitTest(self: *const Path, p: Vec2f, radius: f32) ?Hit {
         const r2 = radius * radius;
         const eps2: f32 = 0.01 * 0.01;
@@ -66,10 +66,10 @@ pub const Path = struct {
         return null;
     }
 
-    /// flatten 点列を round → brush 経路で AA ラスタライズ。1パス=1 PaintDiff（変更なしは null）。
-    /// `dab`/`color`/`opacity` は確定時の active ブラシから呼び出し側が渡す（Brush ツール非依存）。
+    /// round flattened points → AA-rasterize via the brush path. 1 path = 1 PaintDiff (null if unchanged).
+    /// Caller passes `dab`/`color`/`opacity` from the active brush at commit (Brush-tool independent).
     pub fn rasterize(self: *const Path, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?PaintDiff {
-        if (self.anchors.items.len < 2) return null; // 曲線は 2 アンカー以上
+        if (self.anchors.items.len < 2) return null; // Curves need 2+ anchors
         var pts: std.ArrayList(Vec2f) = .empty;
         defer pts.deinit(gpa);
         self.flattenAll(FLATTEN_TOL, &pts, gpa);
@@ -104,25 +104,25 @@ fn anchorAt(x: f32, y: f32) Anchor {
     return .{ .pos = .{ .x = x, .y = y }, .h_in = .{ .x = x, .y = y }, .h_out = .{ .x = x, .y = y } };
 }
 
-test "hitTest: 実体ハンドル優先 / ゼロ長ハンドル除外 / アンカー" {
+test "hitTest: real handles preferred / zero-length handles excluded / anchor" {
     const gpa = std.testing.allocator;
     var path: Path = .{};
     defer path.deinit(gpa);
-    // a0: ゼロ長ハンドル（角）、a1: 実体のある h_out
+    // a0: zero-length handles (corner); a1: real h_out
     try path.anchors.append(gpa, anchorAt(10, 10));
     var a1 = anchorAt(30, 10);
-    a1.h_out = .{ .x = 35, .y = 10 }; // 実体ハンドル
+    a1.h_out = .{ .x = 35, .y = 10 }; // Real handle
     try path.anchors.append(gpa, a1);
 
-    // a0 近傍 → ゼロ長ハンドルは無視され anchor ヒット
+    // Near a0 → zero-length handles ignored; anchor hit
     try std.testing.expectEqual(@as(?Hit, .{ .idx = 0, .kind = .anchor }), path.hitTest(.{ .x = 11, .y = 10 }, 3));
-    // a1 の h_out 近傍 → handle_out 優先
+    // Near a1's h_out → handle_out preferred
     try std.testing.expectEqual(@as(?Hit, .{ .idx = 1, .kind = .handle_out }), path.hitTest(.{ .x = 35, .y = 10 }, 3));
-    // どこにも当たらない
+    // Hit nothing
     try std.testing.expectEqual(@as(?Hit, null), path.hitTest(.{ .x = 100, .y = 100 }, 3));
 }
 
-test "flattenAll: 端点を含む（2 アンカー直線）" {
+test "flattenAll: includes endpoints (2-anchor line)" {
     const gpa = std.testing.allocator;
     var path: Path = .{};
     defer path.deinit(gpa);
@@ -137,8 +137,8 @@ test "flattenAll: 端点を含む（2 アンカー直線）" {
     try std.testing.expectApproxEqAbs(@as(f32, 9), last.x, 1e-4);
 }
 
-test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round-trip" {
-    // undo/redo は document.zig 側（Document.pushPaintOp/undoOne）へ移設済み（TASK-45.1）。
+test "rasterize: draws a straight path via the brush path; undo restore + PNG round-trip" {
+    // undo/redo live on the document.zig side (Document.pushPaintOp/undoOne).
     const png = @import("png");
     const io_png = @import("io_png.zig");
     const document_mod = @import("document.zig");
@@ -155,17 +155,17 @@ test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round
 
     var path: Path = .{};
     defer path.deinit(gpa);
-    try path.anchors.append(gpa, anchorAt(2, 2)); // 角（直線）
+    try path.anchors.append(gpa, anchorAt(2, 2)); // Corner (straight)
     try path.anchors.append(gpa, anchorAt(13, 2));
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
+    const RED: u32 = 0xFFFF0000; // canonical BGRA (red)
     if (path.rasterize(canvas, &rec, gpa, dab, RED, 255)) |pd| try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 
-    // y=2 の x=2..13 が不透明 RED（cov=255・opacity=255 → 原本透明へ src-over で RED）
+    // y=2, x=2..13 opaque RED (cov=255 · opacity=255 → src-over RED onto transparent original)
     for (2..14) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[2 * 16 + x]);
 
-    // PNG round-trip（保存=raw）
+    // PNG round-trip (save = raw)
     const raw = canvas.layerPixels(0);
     const png_bytes = try io_png.encodePNG(raw, 16, 16, gpa);
     defer gpa.free(png_bytes);
@@ -176,12 +176,12 @@ test "rasterize: 直線パスを brush 経路で描き、undo 復元 + PNG round
     }
     try std.testing.expectEqualSlices(u32, raw, loaded.pixels);
 
-    // undo で空へ復元
+    // Undo restores empty
     doc.undoOne(gpa);
     try std.testing.expectEqualSlices(u32, blank, canvas.layerPixels(0));
 }
 
-test "rasterize: アンカー 1 個は null（描けない）" {
+test "rasterize: a single anchor returns null (cannot draw)" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 8, 8);
     defer canvas.deinit();
@@ -194,7 +194,7 @@ test "rasterize: アンカー 1 個は null（描けない）" {
     try std.testing.expectEqual(@as(?PaintDiff, null), path.rasterize(&canvas, &rec, gpa, dab, 0xFFFF0000, 255));
 }
 
-test "rasterize: selected_layer に描画する" {
+test "rasterize: paints on selected_layer" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 8, 8);
     defer canvas.deinit();

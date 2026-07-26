@@ -1,46 +1,46 @@
-//! テキストレイヤーの text_params → pixels（全画素、canvas 全体サイズ）再ラスタライズ（TASK-79.5。
-//! TASK-82 で system font 対応）。
+//! Re-rasterize a text layer from text_params → pixels (full frame, canvas-wide size).
+//! Supports system fonts.
 //!
-//! `libs/font`（TASK-79.4 の透明バッファ焼き込み基盤）へ委譲する。フォントは
-//! **呼び出し側（`Canvas.system_font`）が渡す system font bytes を優先**し、渡されなかった/
-//! parse 失敗した場合のみ vendoring 済みの既定フォント（`font.default_font_bytes`, OFL
-//! Press Start 2P。ASCII のみ）へフォールバックする（TASK-82）。System font（macOS の
-//! ヒラギノ角ゴ等の `.ttc`）は CJK グリフを含むため、日本語テキストレイヤーが tofu(□) にならず
-//! 字形で描画される。フォントバイト列の実ディスク読込・パス解決は呼び出し側（pixie App。
-//! `examples/12_outline_font`/`examples/21_char_input` と同じ system font ランタイム読込パターン）
-//! の責務で、本関数は既に読み込まれた bytes を受け取るだけ（本ファイルは disk I/O をしない）。
-//! いずれの経路でも `FontFace.init` + `OutlineFont.init` を毎回 fresh に構築し、描画後に
-//! `deinit` する（イベント時のみ呼ばれるため per-call 構築で十分。グリフキャッシュは呼び出しを
-//! またいで保持しない。`FontFace.init` は sfnt table directory + cmap header の parse のみで
-//! alloc を伴わないため、system font のファイルサイズが大きくても軽い。ディスク I/O 自体は
-//! 呼び出し側が起動時に1回だけ行い bytes をキャッシュするため、本関数の呼び出し毎に発生しない）。
+//! Delegates to `libs/font` (transparent-buffer bake foundation). Font preference:
+//! **system font bytes from the caller (`Canvas.system_font`) first**; only if absent /
+//! parse fails, fall back to the vendored default (`font.default_font_bytes`, OFL
+//! Press Start 2P; ASCII only). System fonts (e.g. macOS Hiragino `.ttc`)
+//! include CJK glyphs, so Japanese text layers render as glyphs instead of tofu (□).
+//! Real disk load / path resolution of font bytes is the caller's job (pixie App;
+//! same system-font runtime load pattern as `examples/12_outline_font`/`examples/21_char_input`).
+//! This function only accepts already-loaded bytes (no disk I/O in this file).
+//! Either path builds a fresh `FontFace.init` + `OutlineFont.init` per call and
+//! `deinit`s after drawing (event-time only, so per-call construction is enough. Glyph cache is not
+//! kept across calls. `FontFace.init` only parses the sfnt table directory + cmap header and does
+//! not allocate, so even a large system font file stays light. Disk I/O itself is done once at
+//! startup by the caller, which caches bytes; it does not run on each call here).
 //!
-//! **本ファイルは `canvas.zig` を import しない**（`Layer`/`TextParams` の型に依存せず個別の
-//! スカラー引数を取ることで、`canvas.zig` → `text_render.zig` の一方向 import を保つ。circular
-//! import 回避）。
+//! **This file does not import `canvas.zig`** (takes scalar args instead of depending on
+//! `Layer`/`TextParams` types, keeping one-way `canvas.zig` → `text_render.zig` import and avoiding
+//! circular import).
 //!
-//! ホットパス宣言: **イベント時のみ**（テキスト内容/サイズ/色/位置の編集確定時に1回）。
-//! フレーム毎ではないため性能規約の SIMD 3点セット等は必須対象外（既存 `doMergeDown` 等の
-//! event-time 全画素ループと同じ扱い）。対象面積はテキストのグリフ bbox（通常 canvas 全体より
-//! 遥かに小さい）に限られ、実質的な負荷は小さい。`blitOnto` は dst が呼び出し前に全域
-//! `@memset` で 0（透明）初期化されている前提で `memcpy` する（straight-alpha src-over の
-//! 数式的帰結: da=0 の時 out=src と一致するため、per-pixel のブレンド計算自体が不要）。
+//! Hot-path declaration: **event-time only** (once when text content/size/color/position edits commit).
+//! Not per-frame, so Performance-rules SIMD checklist is out of scope (same class as existing
+//! event-time full-pixel loops like `doMergeDown`). Work area is the glyph bbox (usually much
+//! smaller than the full canvas), so load is small. `blitOnto` assumes dst was fully
+//! `@memset` to 0 (transparent) before the call and uses `memcpy` (straight-alpha src-over
+//! consequence: when da=0, out=src, so per-pixel blend math is unnecessary).
 
 const std = @import("std");
 const font = @import("font");
 
-/// `pixels`（`width*height`, straight alpha canonical BGRA。呼び出し前のサイズ不変条件は
-/// 呼び出し側=Canvas が保証する）を `text`/`font_px`/`color`/`x`/`y` から再生成する。
-/// 空文字列（`text.len==0`）は全透明のまま（`memset` 済みで return）。
-/// `font_px` の非有限値/非正値は許容する（`font.OutlineFont.init` が内部で安全値へ
-/// sanitize するため描画は落ちない。`TextParams` へ非有限値を保存させない検証は
-/// 呼び出し側=`document_io.zig` の decode 時に行う。ここでは二重にしない）。
+/// Regenerate `pixels` (`width*height`, straight-alpha canonical BGRA; size invariant guaranteed
+/// by the caller=Canvas) from `text`/`font_px`/`color`/`x`/`y`.
+/// Empty string (`text.len==0`) stays fully transparent (`memset` then return).
+/// Non-finite / non-positive `font_px` is allowed (`font.OutlineFont.init` sanitizes to a safe
+/// value internally so drawing does not crash. Rejecting non-finite values into `TextParams`
+/// is the caller's job=`document_io.zig` at decode; do not double-check here).
 ///
-/// `system_font`（TASK-82）: 呼び出し側が既に読み込んだ system font のバイト列（`.ttf`/`.ttc`）。
-/// `null` または `FontFace.init` が失敗する（破損/非対応バイト列）場合は embedded
-/// `font.default_font_bytes`（ASCII のみ）へフォールバックする。呼び出し側は通常この防御的
-/// フォールバックに頼らず起動時に一度 parse 検証した bytes を渡す想定だが、本関数は二重に
-/// 防御することでどのような bytes を渡されても crash しない。
+/// `system_font`: already-loaded system font bytes from the caller (`.ttf`/`.ttc`).
+/// If `null` or `FontFace.init` fails (corrupt/unsupported bytes), fall back to embedded
+/// `font.default_font_bytes` (ASCII only). Callers normally pass bytes already parse-checked once
+/// at startup rather than relying on this defensive fallback, but this function double-defends
+/// so any bytes still do not crash.
 pub fn rasterizeTextLayer(
     gpa: std.mem.Allocator,
     pixels: []u32,
@@ -72,17 +72,17 @@ pub fn rasterizeTextLayer(
     blitOnto(pixels, width, height, rendered.pixels, rendered.width, rendered.height, x, y);
 }
 
-/// straight-alpha の小さい `src`（`sw x sh`）を、透明で初期化済みの `dst`（`dw x dh`）へ
-/// `(dst_x, dst_y)` を左上として配置する。clip はループ外で1回計算し、内側は無条件 `memcpy`
-/// （dst は呼び出し前に全域0埋め済み＝src-over ではなく単純コピーで正しい）。完全に canvas
-/// 外なら何もしない（クラッシュしない）。
+/// Place a small straight-alpha `src` (`sw x sh`) onto a transparency-initialized `dst` (`dw x dh`)
+/// with top-left at `(dst_x, dst_y)`. Clip once outside the loop; inner loop is unconditional `memcpy`
+/// (dst is fully zeroed before the call → plain copy is correct, not src-over). Fully outside the canvas
+/// does nothing (no crash).
 fn blitOnto(dst: []u32, dw: u32, dh: u32, src: []const u32, sw: u32, sh: u32, dst_x: i32, dst_y: i32) void {
     if (sw == 0 or sh == 0) return;
     const x0: i64 = @max(0, dst_x);
     const y0: i64 = @max(0, dst_y);
     const x1: i64 = @min(@as(i64, dw), @as(i64, dst_x) + @as(i64, sw));
     const y1: i64 = @min(@as(i64, dh), @as(i64, dst_y) + @as(i64, sh));
-    if (x1 <= x0 or y1 <= y0) return; // 完全に canvas 外
+    if (x1 <= x0 or y1 <= y0) return; // Fully outside the canvas
 
     const ux0: usize = @intCast(x0);
     const uy0: usize = @intCast(y0);
@@ -109,16 +109,16 @@ fn blitOnto(dst: []u32, dw: u32, dh: u32, src: []const u32, sw: u32, sh: u32, ds
 
 const testing = std.testing;
 
-test "rasterizeTextLayer: 空文字列は全透明のまま" {
+test "rasterizeTextLayer: empty string stays fully transparent" {
     const gpa = testing.allocator;
     const pixels = try gpa.alloc(u32, 8 * 8);
     defer gpa.free(pixels);
-    @memset(pixels, 0xFFFFFFFF); // 事前に非透明で汚しておき、memset(0) が効くことも確認
+    @memset(pixels, 0xFFFFFFFF); // Pre-dirty with non-transparent pixels to also confirm memset(0) works
     try rasterizeTextLayer(gpa, pixels, 8, 8, "", 16, 0xFFFFFFFF, 0, 0, null);
     for (pixels) |p| try testing.expectEqual(@as(u32, 0), p);
 }
 
-test "rasterizeTextLayer: 非空文字列は canvas 内に非透明ピクセルを焼く" {
+test "rasterizeTextLayer: non-empty string bakes non-transparent pixels inside the canvas" {
     const gpa = testing.allocator;
     const w: u32 = 64;
     const h: u32 = 32;
@@ -133,7 +133,7 @@ test "rasterizeTextLayer: 非空文字列は canvas 内に非透明ピクセル�
     try testing.expect(non_transparent > 0);
 }
 
-test "rasterizeTextLayer: 位置が canvas 完全に外でもクラッシュせず全透明" {
+test "rasterizeTextLayer: fully outside the canvas does not crash and stays fully transparent" {
     const gpa = testing.allocator;
     const w: u32 = 16;
     const h: u32 = 16;
@@ -142,28 +142,28 @@ test "rasterizeTextLayer: 位置が canvas 完全に外でもクラッシュせ�
     try rasterizeTextLayer(gpa, pixels, w, h, "Hi", 16, 0xFFFFFFFF, 10_000, 10_000, null);
     for (pixels) |p| try testing.expectEqual(@as(u32, 0), p);
 
-    // 負方向に大きく外れても同様
+    // Far out in the negative direction likewise
     try rasterizeTextLayer(gpa, pixels, w, h, "Hi", 16, 0xFFFFFFFF, -10_000, -10_000, null);
     for (pixels) |p| try testing.expectEqual(@as(u32, 0), p);
 }
 
-test "rasterizeTextLayer: 部分的に canvas 外へはみ出る配置は clip された範囲だけ焼かれる" {
+test "rasterizeTextLayer: placement partially outside the canvas bakes only the clipped region" {
     const gpa = testing.allocator;
     const w: u32 = 16;
     const h: u32 = 16;
     const pixels = try gpa.alloc(u32, w * h);
     defer gpa.free(pixels);
-    // 右下ぎりぎり（大部分が canvas 外）に配置してもクラッシュせず、canvas 内側だけ焼かれる。
+    // Place near the bottom-right (mostly outside): no crash; only the inside of the canvas is baked.
     try rasterizeTextLayer(gpa, pixels, w, h, "Hi", 16, 0xFFFFFFFF, @as(i32, @intCast(w)) - 2, @as(i32, @intCast(h)) - 2, null);
     var non_transparent: usize = 0;
     for (pixels) |p| {
         if (p & 0xFF000000 != 0) non_transparent += 1;
     }
     try testing.expect(non_transparent > 0);
-    try testing.expect(non_transparent <= 4); // clip された 2x2 の範囲以内
+    try testing.expect(non_transparent <= 4); // Within the clipped 2x2 region
 }
 
-test "rasterizeTextLayer: 呼び出しを繰り返しても前回の内容が残らない（毎回 memset される）" {
+test "rasterizeTextLayer: repeated calls leave no previous content (memset every time)" {
     const gpa = testing.allocator;
     const w: u32 = 32;
     const h: u32 = 16;
@@ -176,19 +176,19 @@ test "rasterizeTextLayer: 呼び出しを繰り返しても前回の内容が残
     }
     try testing.expect(first_count > 0);
 
-    try rasterizeTextLayer(gpa, pixels, w, h, "", 16, 0xFFFFFFFF, 0, 0, null); // 空文字列 → 全透明に戻る
+    try rasterizeTextLayer(gpa, pixels, w, h, "", 16, 0xFFFFFFFF, 0, 0, null); // Empty string → back to fully transparent
     for (pixels) |p| try testing.expectEqual(@as(u32, 0), p);
 }
 
-test "rasterizeTextLayer: system_font が実際に使われる（embedded と異なる結果を生む。TASK-82。codex コードレビュー指摘の強化）" {
-    // 前回版は system_font に `font.default_font_bytes` そのものを注入しており、
-    // 「system_font を無視して常に embedded font を使う」実装でも同じ結果になり通ってしまう
-    // 弱いテストだった（codex コードレビュー指摘）。ここでは embedded font と明確に異なる
-    // 合成済み最小フォント（cmap が通常の文字を一切マップしない＝gid0(.notdef, 空グリフ)固定）
-    // を system_font として渡す。embedded font は "Hi" の実グリフを持つため非透明ピクセルを
-    // 生成するのに対し、このテストフォントを使えば必ず全透明になる。よって「全透明になる」
-    // ことの確認が、system_font 分岐が確実に使われた（embedded へ無視フォールバックしていない）
-    // ことの直接証拠になる。
+test "rasterizeTextLayer: system_font is actually used (produces a result different from embedded)" {
+    // Injecting `font.default_font_bytes` as system_font would also pass an implementation that
+    // always ignores system_font and uses the embedded font.
+    // Pass a synthetic minimal font that differs clearly from the embedded font
+    // (cmap maps no ordinary characters → always gid0/.notdef, empty glyph)
+    // as system_font. The embedded font has real glyphs for "Hi" and produces non-transparent pixels,
+    // while this test font stays fully transparent. Confirming full transparency is therefore direct
+    // evidence that the system_font branch was taken (no silent ignore-fallback to embedded).
+    // That confirmation is the direct proof.
     const gpa = testing.allocator;
     const blank_font = try buildBlankTestFont(gpa);
     defer gpa.free(blank_font);
@@ -198,10 +198,10 @@ test "rasterizeTextLayer: system_font が実際に使われる（embedded と異
     const pixels = try gpa.alloc(u32, w * h);
     defer gpa.free(pixels);
     try rasterizeTextLayer(gpa, pixels, w, h, "Hi", 16, 0xFFFFFFFF, 4, 4, blank_font);
-    for (pixels) |p| try testing.expectEqual(@as(u32, 0), p); // gid0(.notdef) は空グリフ→全透明
+    for (pixels) |p| try testing.expectEqual(@as(u32, 0), p); // gid0(.notdef) is an empty glyph → fully transparent
 
-    // 対照: 同じ "Hi" を system_font=null（embedded フォールバック）で描くと非透明になる
-    // （既存テストで確認済みだが、ここでも同一 pixels バッファで直接対比させる）。
+    // Contrast: same "Hi" with system_font=null (embedded fallback) paints non-transparent
+    // (already covered by existing tests; contrast on the same pixels buffer here too).
     try rasterizeTextLayer(gpa, pixels, w, h, "Hi", 16, 0xFFFFFFFF, 4, 4, null);
     var non_transparent: usize = 0;
     for (pixels) |p| {
@@ -210,28 +210,28 @@ test "rasterizeTextLayer: system_font が実際に使われる（embedded と異
     try testing.expect(non_transparent > 0);
 }
 
-test "rasterizeTextLayer: system_font が破損バイト列でも embedded フォントへフォールバックしクラッシュしない（AC#2）" {
+test "rasterizeTextLayer: corrupt system_font bytes fall back to the embedded font without crashing" {
     const gpa = testing.allocator;
     const w: u32 = 64;
     const h: u32 = 32;
     const pixels = try gpa.alloc(u32, w * h);
     defer gpa.free(pixels);
-    const garbage = [_]u8{ 1, 2, 3 }; // FontFace.init が InvalidFont/Unsupported で弾く短い非対応バイト列
+    const garbage = [_]u8{ 1, 2, 3 }; // Short unsupported bytes that FontFace.init rejects as InvalidFont/Unsupported
     try rasterizeTextLayer(gpa, pixels, w, h, "Hi", 16, 0xFFFFFFFF, 4, 4, &garbage);
 
     var non_transparent: usize = 0;
     for (pixels) |p| {
         if (p & 0xFF000000 != 0) non_transparent += 1;
     }
-    try testing.expect(non_transparent > 0); // embedded ASCII フォントへフォールバックして描画される
+    try testing.expect(non_transparent > 0); // Falls back to the embedded ASCII font and draws
 }
 
-// ── テスト用の最小合成 sfnt ビルダー（TASK-82）─────────────────────────
+// ── Minimal synthetic sfnt builder for tests ─────────────────────────
 //
-// `libs/font/src/outline_font.zig` の private test helper `buildTestFont`/`buildSfnt` と
-// 同型（それらは非 `pub` で本ファイルから参照できず、`libs/font` 自体はスコープ上変更しないため
-// 独立実装する）。ここでは三角形グリフは不要（cmap がどの通常文字もマップしない=全て
-// gid0(.notdef, 空グリフ) に落ちるだけで用が足りる）ため、`buildTestFont` より単純にできる。
+// Same shape as private test helpers `buildTestFont`/`buildSfnt` in `libs/font/src/outline_font.zig`
+// (those are non-`pub` and cannot be referenced from here; `libs/font` itself is out of scope, so
+// this is an independent copy). No triangle glyph needed (cmap maps no ordinary chars → everything
+// falls to gid0/.notdef empty glyph), so simpler than `buildTestFont`.
 
 fn putU16(buf: []u8, off: usize, v: u16) void {
     buf[off] = @intCast(v >> 8);
@@ -254,8 +254,8 @@ fn appendU32(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) !void {
     try l.append(a, @truncate(v));
 }
 
-/// sfnt(tag,body) 群からフォントバイト列を組む（checksum は 0 固定。`SfntFile.parse` は
-/// checksum を検証しない）。
+/// Assemble font bytes from sfnt (tag,body) groups (checksum fixed at 0; `SfntFile.parse` does
+/// not verify checksum).
 fn buildSfnt(a: std.mem.Allocator, tables: []const struct { tag: [4]u8, body: []const u8 }) ![]u8 {
     const n: u16 = @intCast(tables.len);
     var out: std.ArrayList(u8) = .empty;
@@ -268,7 +268,7 @@ fn buildSfnt(a: std.mem.Allocator, tables: []const struct { tag: [4]u8, body: []
     var off: u32 = @intCast(12 + 16 * @as(usize, n));
     for (tables) |t| {
         try out.appendSlice(a, &t.tag);
-        try appendU32(&out, a, 0); // checksum（未使用）
+        try appendU32(&out, a, 0); // checksum (unused)
         try appendU32(&out, a, off);
         try appendU32(&out, a, @intCast(t.body.len));
         off += @intCast(t.body.len);
@@ -277,11 +277,11 @@ fn buildSfnt(a: std.mem.Allocator, tables: []const struct { tag: [4]u8, body: []
     return out.toOwnedSlice(a);
 }
 
-/// 合成済み最小 TTF: numGlyphs=1（gid0=.notdef, 空グリフのみ）・cmap は sentinel セグメント
-/// （0xFFFF）のみで通常の文字を一切マップしない。この font でどの文字列を描いても
-/// 全て gid0(.notdef, 空グリフ) に解決され、レンダリング結果は全透明になる（`renderTextLayer`
-/// の描画対象領域の実 pixels に非透明画素が全く現れない）。embedded font（"Hi" 等の実グリフを
-/// 持つ）と観測可能に異なる結果になることを保証するための「意図的に何も描けないフォント」。
+/// Synthetic minimal TTF: numGlyphs=1 (gid0=.notdef, empty glyph only); cmap has only a sentinel
+/// segment (0xFFFF) and maps no ordinary characters. Any string drawn with this font
+/// resolves to gid0(.notdef, empty glyph); the render stays fully transparent (no non-transparent
+/// pixels appear in `renderTextLayer`'s draw region). An intentionally blank font that is
+/// observably different from the embedded font (which has real glyphs for "Hi", etc.).
 fn buildBlankTestFont(a: std.mem.Allocator) ![]u8 {
     var head = [_]u8{0} ** 54;
     putU32(&head, 12, 0x5F0F3CF5); // magicNumber
@@ -289,7 +289,7 @@ fn buildBlankTestFont(a: std.mem.Allocator) ![]u8 {
     putU16(&head, 50, 0); // indexToLocFormat = short
 
     var maxp = [_]u8{0} ** 6;
-    putU16(&maxp, 4, 1); // numGlyphs = 1（.notdef のみ）
+    putU16(&maxp, 4, 1); // numGlyphs = 1 (.notdef only)
 
     var hhea = [_]u8{0} ** 36;
     putU16(&hhea, 4, 48); // ascender
@@ -298,8 +298,8 @@ fn buildBlankTestFont(a: std.mem.Allocator) ![]u8 {
 
     const hmtx = [_]u8{0} ** 4; // gid0: advance=0, lsb=0
 
-    // cmap format4: セグメント1つ（sentinel 0xFFFF）のみ＝通常の文字は全て未対応→gid0。
-    var cmap_sub = [_]u8{0} ** 24; // 14(固定ヘッダ) + 2(end) + 2(reservedPad) + 2(start) + 2(delta) + 2(rangeOffset)
+    // cmap format4: one segment (sentinel 0xFFFF) only → all ordinary chars unresolved → gid0.
+    var cmap_sub = [_]u8{0} ** 24; // 14(fixed header) + 2(end) + 2(reservedPad) + 2(start) + 2(delta) + 2(rangeOffset)
     putU16(&cmap_sub, 0, 4); // format
     putU16(&cmap_sub, 2, @intCast(cmap_sub.len)); // length
     putU16(&cmap_sub, 6, 2); // segCountX2 = 1 seg * 2
@@ -315,7 +315,7 @@ fn buildBlankTestFont(a: std.mem.Allocator) ![]u8 {
     putU32(&cmap_tbl, 8, 12); // subtable offset = 4+8
     @memcpy(cmap_tbl[12..], &cmap_sub);
 
-    const loca = [_]u8{0} ** 4; // short format, (numGlyphs+1)=2 entries、全て0＝gid0 は空
+    const loca = [_]u8{0} ** 4; // short format, (numGlyphs+1)=2 entries, all 0 → gid0 is empty
 
     return buildSfnt(a, &.{
         .{ .tag = "head".*, .body = &head },

@@ -1,7 +1,7 @@
-//! オニオンスキン表示合成（TASK-45.3）。Document の cel グリッドから前後 frame を
-//! 減色＋半透明で重ねる表示専用ロジック（core モデル非改変）。
+//! Onion-skin display composite. Overlay previous/next frames from Document's cel grid
+//! with desaturation + translucency (display-only; does not mutate the core model).
 //!
-//! 毎フレーム全画素×(2N+1) を走るホットパス。pixelops の srcOverStraight4 / div255 を流用。
+//! Hot path: every frame, all pixels × (2N+1). Reuses pixelops srcOverStraight4 / div255.
 
 const std = @import("std");
 const pixelops = @import("pixelops");
@@ -9,7 +9,7 @@ const Document = @import("document.zig").Document;
 
 pub const max_count: u32 = 3;
 
-/// 距離 dist（1..max_count）に対する onion 層の src-over opacity。N≤3 固定（128/64/42）。
+/// src-over opacity for an onion layer at distance dist (1..max_count). N≤3 fixed (128/64/42).
 pub fn onionOpacity(dist: u32) u8 {
     std.debug.assert(dist >= 1 and dist <= max_count);
     return @intCast(128 / dist);
@@ -31,7 +31,7 @@ const rg_lane_mask: @Vector(16, bool) = .{
     false, true, true, false,
 };
 
-/// 前フレーム用減色（赤味）: G/B を 1/2 に抑える。alpha は不変。
+/// Desaturate for previous frames (reddish): halve G/B. Alpha unchanged.
 pub fn tintPrevPixel(c: u32) u32 {
     const b: u32 = c & 0xFF;
     const g: u32 = (c >> 8) & 0xFF;
@@ -42,7 +42,7 @@ pub fn tintPrevPixel(c: u32) u32 {
     return @as(u32, a << 24) | (r << 16) | (g2 << 8) | b2;
 }
 
-/// 後フレーム用減色（青味）: R/G を 1/2 に抑える。alpha は不変。
+/// Desaturate for next frames (bluish): halve R/G. Alpha unchanged.
 pub fn tintNextPixel(c: u32) u32 {
     const b: u32 = c & 0xFF;
     const g: u32 = (c >> 8) & 0xFF;
@@ -106,9 +106,9 @@ fn srcOverStraightOnto(dst: []u32, src: []const u32, opacity: u8) void {
     }
 }
 
-/// 表示用オニオン合成を `out` へ構築する。
-/// `current` は現フレームの straight-alpha composite（通常 `canvas`、プレビュー時 `preview_canvas`）。
-/// `scratch` は 1 枚分の作業バッファ（`out` と同サイズ）。
+/// Build the display onion composite into `out`.
+/// `current` is the current frame's straight-alpha composite (usually `canvas`; `preview_canvas` while previewing).
+/// `scratch` is a one-frame work buffer (same size as `out`).
 pub fn build(
     doc: *const Document,
     current: []const u32,
@@ -161,7 +161,7 @@ test "tintPrev4/tintNext4 match scalar" {
     }
 }
 
-test "compositeFrameStraight: frame ごとに異なる cel を合成" {
+test "compositeFrameStraight: composites a different cel per frame" {
     const gpa = testing.allocator;
     var doc = try Document.init(gpa, 2, 2);
     defer doc.deinit();

@@ -1,8 +1,8 @@
-//! ベジェ(ペン)ツールの編集状態機械（TASK-21.13）。GUI/platform 非依存の純粋ロジック。
+//! Bezier (pen) tool edit state machine. Pure logic; GUI/platform independent.
 //!
-//! 抽象イベント（pointer_down/move/up, cancel, delete）→ Path への状態遷移。確定は
-//! `rasterizeCommit` の一本（rasterize 後に path をクリア。Input に commit は設けない）。
-//! pixie 側アダプタ（bezier_input.zig）が入力イベント・確定/キャンセルを駆動する。
+//! Abstract events (pointer_down/move/up, cancel, delete) → Path state transitions. Commit is
+//! solely `rasterizeCommit` (rasterize then clear path; Input has no commit to avoid double clear).
+//! The pixie-side adapter (bezier_input.zig) drives input events and commit/cancel.
 
 const std = @import("std");
 const bezier = @import("bezier.zig");
@@ -27,7 +27,7 @@ pub const Input = union(enum) {
 
 const Drag = union(enum) {
     none,
-    new_out: usize, // 新規アンカーの h_out をドラッグ中
+    new_out: usize, // Dragging h_out of a new anchor
     anchor: usize,
     handle_in: usize,
     handle_out: usize,
@@ -36,9 +36,9 @@ const Drag = union(enum) {
 pub const PathEditor = struct {
     path: Path = .{},
     drag: Drag = .none,
-    selected: ?Hit = null, // 後編集/削除の対象（pointer_down のヒットで更新、pointer_up でも保持）
-    hit_radius: f32 = 6, // 論理 px。pixie が毎フレーム 6/zoom を set
-    preview_point: ?Vec2f = null, // hover カーソル（次アンカーの仮点）。描画プレビュー専用・状態遷移に非関与
+    selected: ?Hit = null, // Target for later edit/delete (updated on pointer_down hit; kept across pointer_up)
+    hit_radius: f32 = 6, // Logical px. pixie sets 6/zoom every frame
+    preview_point: ?Vec2f = null, // Hover cursor (provisional next-anchor point). Preview-only; not part of state transitions
 
     pub fn deinit(self: *PathEditor, gpa: std.mem.Allocator) void {
         self.path.deinit(gpa);
@@ -52,7 +52,7 @@ pub const PathEditor = struct {
         switch (in) {
             .pointer_down => |p| self.onDown(gpa, p),
             .pointer_move => |p| self.onMove(p),
-            .pointer_up => self.drag = .none, // selected は保持（Delete 対象）
+            .pointer_up => self.drag = .none, // Keep selected (Delete target)
             .cancel => {
                 self.path.anchors.clearRetainingCapacity();
                 self.drag = .none;
@@ -73,7 +73,7 @@ pub const PathEditor = struct {
             };
             return;
         }
-        // ヒットなし → 新アンカー append（ゼロ長ハンドル＝角）。drag で h_out を引く。
+        // No hit → append a new anchor (zero-length handles = corner). Drag pulls h_out.
         self.path.anchors.append(gpa, .{ .pos = p, .h_in = p, .h_out = p }) catch @panic("PathEditor.onDown: OOM");
         const last = self.path.anchors.items.len - 1;
         self.drag = .{ .new_out = last };
@@ -86,7 +86,7 @@ pub const PathEditor = struct {
             .new_out, .handle_out => |i| {
                 const a = &self.path.anchors.items[i];
                 a.h_out = p;
-                a.h_in = mirror(a.pos, p); // 対称
+                a.h_in = mirror(a.pos, p); // Symmetric
             },
             .handle_in => |i| {
                 const a = &self.path.anchors.items[i];
@@ -114,8 +114,8 @@ pub const PathEditor = struct {
         self.drag = .none;
     }
 
-    /// 唯一の確定経路。rasterize → 戻り値取得 → path クリア。pixie が Enter/ダブルクリックで呼び、
-    /// 戻り値（非 null）を UndoStack へ push する（Input に commit を設けず二重 clear を排除）。
+    /// Sole commit path. rasterize → take return value → clear path. pixie calls this on Enter/double-click
+    /// and pushes a non-null return onto UndoStack (no commit on Input; avoids double clear).
     pub fn rasterizeCommit(self: *PathEditor, canvas: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) ?PaintDiff {
         const cmd = self.path.rasterize(canvas, rec, gpa, dab, color, opacity);
         self.path.anchors.clearRetainingCapacity();
@@ -125,8 +125,8 @@ pub const PathEditor = struct {
         return cmd;
     }
 
-    /// 編集中プレビュー: path（+ preview_point があれば末尾仮アンカー）を dst へ brush 描画する。
-    /// diff は捨てる（非破壊。dst は呼び出し側が「本 layer のコピー」を渡す前提）。path 状態は変えない。
+    /// In-edit preview: brush-draw path (+ provisional trailing anchor if preview_point) onto dst.
+    /// Diff is discarded (non-destructive; caller must pass a copy of the real layer as dst). Path state is unchanged.
     pub fn rasterizePreview(self: *PathEditor, dst: *Canvas, rec: *StrokeRecorder, gpa: std.mem.Allocator, dab: Dab, color: u32, opacity: u8) void {
         const added = self.preview_point != null;
         if (self.preview_point) |p| {
@@ -149,7 +149,7 @@ fn mirror(center: Vec2f, p: Vec2f) Vec2f {
 
 const HitKind = path_mod.HitKind;
 
-test "down で新アンカー追加、move で h_out と対称 h_in" {
+test "down adds a new anchor; move sets h_out and mirrored h_in" {
     const gpa = std.testing.allocator;
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
@@ -164,7 +164,7 @@ test "down で新アンカー追加、move で h_out と対称 h_in" {
     try std.testing.expectEqual(@as(f32, 6), a.h_in.x); // mirror(10, 14) = 6
 }
 
-test "pointer_up 後も selected は保持される" {
+test "selected is kept after pointer_up" {
     const gpa = std.testing.allocator;
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
@@ -175,23 +175,23 @@ test "pointer_up 後も selected は保持される" {
     try std.testing.expectEqual(@as(usize, 0), ed.selected.?.idx);
 }
 
-test "既存アンカーを掴んで移動（ハンドルも追従）" {
+test "grab an existing anchor and move it (handles follow)" {
     const gpa = std.testing.allocator;
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
-    // 角アンカーを 1 つ置いて up
+    // Place one corner anchor and up
     ed.update(gpa, .{ .pointer_down = .{ .x = 20, .y = 20 } });
     ed.update(gpa, .{ .pointer_up = .{ .x = 20, .y = 20 } });
-    // 近傍で down → anchor 掴み、move で移動
+    // down nearby → grab anchor, move relocates
     ed.update(gpa, .{ .pointer_down = .{ .x = 21, .y = 20 } });
-    try std.testing.expectEqual(@as(usize, 1), ed.path.anchors.items.len); // 新規追加しない
+    try std.testing.expectEqual(@as(usize, 1), ed.path.anchors.items.len); // Do not append a new one
     ed.update(gpa, .{ .pointer_move = .{ .x = 30, .y = 25 } });
     const a = ed.path.anchors.items[0];
     try std.testing.expectEqual(@as(f32, 30), a.pos.x);
     try std.testing.expectEqual(@as(f32, 25), a.pos.y);
 }
 
-test "delete: selected 優先 / 未選択は末尾" {
+test "delete: selected preferred / unselected deletes the last" {
     const gpa = std.testing.allocator;
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
@@ -200,16 +200,16 @@ test "delete: selected 優先 / 未選択は末尾" {
     ed.update(gpa, .{ .pointer_down = .{ .x = 10, .y = 0 } });
     ed.update(gpa, .{ .pointer_up = .{ .x = 10, .y = 0 } });
     try std.testing.expectEqual(@as(usize, 2), ed.path.anchors.items.len);
-    // selected は最後に置いた idx=1 → delete で idx=1 が消える
+    // selected is last-placed idx=1 → delete removes idx=1
     ed.update(gpa, .delete);
     try std.testing.expectEqual(@as(usize, 1), ed.path.anchors.items.len);
     try std.testing.expectEqual(@as(f32, 0), ed.path.anchors.items[0].pos.x);
-    // 未選択（selected=null）→ 末尾削除
+    // Unselected (selected=null) → delete last
     ed.update(gpa, .delete);
     try std.testing.expectEqual(@as(usize, 0), ed.path.anchors.items.len);
 }
 
-test "cancel で空になる" {
+test "cancel clears to empty" {
     const gpa = std.testing.allocator;
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
@@ -221,7 +221,7 @@ test "cancel で空になる" {
     try std.testing.expectEqual(@as(?Hit, null), ed.selected);
 }
 
-test "rasterizeCommit: 描画して path をクリア" {
+test "rasterizeCommit: draws then clears the path" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 16, 16);
     defer canvas.deinit();
@@ -230,23 +230,23 @@ test "rasterizeCommit: 描画して path をクリア" {
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
 
-    // 角→角の直線を作る
+    // Build a corner→corner line
     ed.update(gpa, .{ .pointer_down = .{ .x = 2, .y = 4 } });
     ed.update(gpa, .{ .pointer_up = .{ .x = 2, .y = 4 } });
     ed.update(gpa, .{ .pointer_down = .{ .x = 12, .y = 4 } });
     ed.update(gpa, .{ .pointer_up = .{ .x = 12, .y = 4 } });
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
+    const RED: u32 = 0xFFFF0000; // canonical BGRA (red)
     const pd = ed.rasterizeCommit(&canvas, &rec, gpa, dab, RED, 255) orelse return error.TestUnexpectedNull;
     defer gpa.free(pd.diffs);
 
-    try std.testing.expect(!ed.isEditing()); // クリアされた
+    try std.testing.expect(!ed.isEditing()); // Cleared
     try std.testing.expectEqual(@as(?Hit, null), ed.selected);
     for (2..13) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[4 * 16 + x]);
 }
 
-test "rasterizePreview: preview_point を仮アンカーとして描画し path は不変" {
+test "rasterizePreview: draws preview_point as a provisional anchor; path is unchanged" {
     const gpa = std.testing.allocator;
     var canvas = try Canvas.init(gpa, 16, 16);
     defer canvas.deinit();
@@ -255,18 +255,18 @@ test "rasterizePreview: preview_point を仮アンカーとして描画し path 
     var ed: PathEditor = .{};
     defer ed.deinit(gpa);
 
-    // アンカー 1 つ + preview_point（hover）で仮セグメントをプレビュー
+    // One anchor + preview_point (hover) previews a provisional segment
     ed.update(gpa, .{ .pointer_down = .{ .x = 2, .y = 4 } });
     ed.update(gpa, .{ .pointer_up = .{ .x = 2, .y = 4 } });
     ed.preview_point = .{ .x = 12, .y = 4 };
 
     const dab: Dab = .{ .offsets = &[_]undo_mod.Offset{.{ .dx = 0, .dy = 0, .cov = 255 }} };
-    const RED: u32 = 0xFFFF0000; // canonical BGRA(赤)
+    const RED: u32 = 0xFFFF0000; // canonical BGRA (red)
     ed.rasterizePreview(&canvas, &rec, gpa, dab, RED, 255);
 
-    // 仮点まで描かれる（y=4, x=2..12）
+    // Drawn out to the provisional point (y=4, x=2..12)
     for (2..13) |x| try std.testing.expectEqual(RED, canvas.layerPixels(0)[4 * 16 + x]);
-    // path は不変（アンカー 1 個のまま・preview_point も保持）
+    // Path unchanged (still 1 anchor; preview_point kept)
     try std.testing.expectEqual(@as(usize, 1), ed.path.anchors.items.len);
     try std.testing.expect(ed.preview_point != null);
 }

@@ -1,31 +1,31 @@
-//! straight-alpha src-over ブレンド（TASK-21.11 → TASK-51 で libs/pixelops へ統合）。
-//! canonical BGRA(0xAARRGGBB)、非 premultiplied。
+//! Straight-alpha src-over blend (thin facade over libs/pixelops).
+//! canonical BGRA(0xAARRGGBB), non-premultiplied.
 //!
-//! core の blend 面（srcOver/overWhite/scaleAlpha）は維持しつつ、実装は共有
-//! `pixelops` に委譲する thin facade。bit 挙動は移設前と同一（詳細テストは
-//! libs/pixelops/src/lib.zig 側にある）。
+//! Keeps core's blend surface (srcOver/overWhite/scaleAlpha) while the body is a thin facade
+//! that delegates to shared `pixelops`. Bit behavior is identical (detailed tests live
+//! in libs/pixelops/src/lib.zig).
 
 const std = @import("std");
 const pixelops = @import("pixelops");
 
-/// src OVER dst（**引数順: dst が先・src が後**）。straight-alpha src-over, canonical BGRA(0xAARRGGBB)。
+/// src OVER dst (**argument order: dst first, src second**). Straight-alpha src-over, canonical BGRA(0xAARRGGBB).
 pub const srcOver = pixelops.srcOver;
 
-/// 白(不透明)背景に src を src-over した不透明色（composite 表示用）。
+/// Opaque color from src-over of src onto an opaque white background (for composite display).
 pub const overWhite = pixelops.overWhite;
 
-/// 色の alpha に coverage(0..255) を乗算（RGB 不変、a' = (a*cov+127)/255）。
+/// Multiply color alpha by coverage(0..255) (RGB unchanged; a' = (a*cov+127)/255).
 pub const scaleAlpha = pixelops.scaleAlpha;
 
-/// dst を不透明とみなす straight src-over（除算なし・out_a=255 固定）。
-/// dst 不透明のとき srcOver と bit 一致（pixelops 側の全数テストで固定。TASK-51/54）。
+/// Straight src-over treating dst as opaque (no division; out_a fixed at 255).
+/// Bit-identical to srcOver when dst is opaque (pinned by exhaustive tests on the pixelops side).
 pub const srcOverOpaque = pixelops.srcOverOpaque;
 
 // ============================================================
-// Tests（facade の再エクスポート疎通のみ。ブレンド自体のテストは pixelops 側）
+// Tests (facade re-export smoke only; blend itself is tested in pixelops)
 // ============================================================
 
-test "facade: srcOver/overWhite/scaleAlpha が pixelops へ委譲されている" {
+test "facade: srcOver/overWhite/scaleAlpha delegate to pixelops" {
     const dst: u32 = 0xFF112233;
     try std.testing.expectEqual(dst, srcOver(dst, 0x00AABBCC)); // a=0 → dst
     try std.testing.expectEqual(@as(u32, 0xFFAABBCC), srcOver(dst, 0xFFAABBCC)); // a=255 → src

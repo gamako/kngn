@@ -10,7 +10,7 @@ pub const onion_skin = @import("onion_skin.zig");
 pub const Canvas = canvas.Canvas;
 pub const Layer = canvas.Layer;
 pub const layer_name_max = canvas.layer_name_max;
-// テキストレイヤー（TASK-79.5）
+// Text layers
 pub const LayerKind = canvas.LayerKind;
 pub const TextParams = canvas.TextParams;
 pub const text_content_max = canvas.text_content_max;
@@ -23,11 +23,11 @@ pub const screenToCanvasF = canvas.screenToCanvasF;
 pub const encodePNG = io_png.encodePNG;
 pub const savePNG = io_png.savePNG;
 
-// Undo / stroke 記録（TASK-21.7 / brush は 21.11 / frame 対応は TASK-63 / セルグリッドは TASK-45.1）。
-// Op/UndoStack は document.zig 側（Document が cel_pool/grid を直接操作するため。循環 import 回避）。
+// Undo / stroke recording (brush path; frame support; cel grid).
+// Op/UndoStack live in document.zig (Document operates cel_pool/grid directly; avoids circular import).
 pub const PixelDiff = undo.PixelDiff;
-pub const PaintDiff = undo.PaintDiff; // まだ Document の cel_id を知らない生の編集結果（TASK-45.1）
-pub const Op = document.Op; // 1 操作の中身。tool/selection/path は PaintDiff を返す
+pub const PaintDiff = undo.PaintDiff; // Raw edit that does not yet know Document's cel_id
+pub const Op = document.Op; // Body of one operation. tool/selection/path return PaintDiff
 pub const CelId = document.CelId;
 pub const Cel = document.Cel;
 pub const LayerId = document.LayerId;
@@ -38,13 +38,13 @@ pub const UndoStack = document.UndoStack;
 pub const StrokeRecorder = undo.StrokeRecorder;
 pub const Dab = undo.Dab;
 pub const Offset = undo.Offset;
-pub const NameSnapshot = undo.NameSnapshot; // レイヤー名の固定長スナップショット（TASK-79.3）
+pub const NameSnapshot = undo.NameSnapshot; // Fixed-length snapshot of a layer name
 
-// 範囲選択（TASK-44）。selection は Canvas.selection: ?Rect、編集は selection.zig。
+// Rectangular selection. selection is Canvas.selection: ?Rect; edits live in selection.zig.
 pub const selection = @import("selection.zig");
 pub const PixelBlock = selection.PixelBlock;
 
-// Tool 抽象（TASK-21.7）
+// Tool abstraction
 pub const Tool = tool.Tool;
 pub const ToolEvent = tool.ToolEvent;
 pub const ToolPoint = tool.ToolPoint;
@@ -52,20 +52,20 @@ pub const Pen = tool.Pen;
 pub const Eraser = tool.Eraser;
 pub const Brush = tool.Brush;
 
-// 塗りつぶし（バケツ）ツール（TASK-76）。selection.zig と同じ layerPixels 直書きパターン。
+// Fill (bucket) tool. Same direct layerPixels write pattern as selection.zig.
 pub const fill = @import("fill.zig");
 pub const Fill = fill.Fill;
 pub const floodFillCmd = fill.floodFillCmd;
 pub const colorDist = fill.colorDist;
 
-// シェイプラスタライズ（TASK-90）。line/rect/ellipse → plot callback。
+// Shape rasterize. line/rect/ellipse → plot callback.
 pub const shape = @import("shape.zig");
 pub const Symmetry = undo.Symmetry;
 pub const plotLine = shape.plotLine;
 pub const plotRect = shape.plotRect;
 pub const plotEllipse = shape.plotEllipse;
 
-// ベジェ / ベクターパス（TASK-21.13）
+// Bezier / vector path
 pub const bezier = @import("bezier.zig");
 pub const Vec2f = bezier.Vec2f;
 pub const Cubic = bezier.Cubic;
