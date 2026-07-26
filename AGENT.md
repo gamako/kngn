@@ -6,6 +6,138 @@
 
 **対応プラットフォーム**: macOS（Objective-C / Swift / Metal）・Linux（X11 / Wayland）・Windows（GDI / D3D11）
 
+## Comment and documentation policy
+
+This repository is public. Everything in it must make sense to a reader who has
+**only this repository** — no access to the private task tracker, the meta
+repository, or the author's notes. The rules below are binding for every change.
+
+**Two independent axes.** "Write in English" (rule 1) and "carry no task-tracker
+id" (rule 3) are separate requirements, and the exemptions belong to the first
+one only:
+
+| | English (rule 1) | No task id (rule 3) |
+|---|---|---|
+| Comments, documentation, file names | applies | applies |
+| `test "..."` names, build step descriptions | applies | applies |
+| **User-visible UI strings** | **exempt** | applies |
+| **Japanese test fixtures** | **exempt** | applies |
+
+The exemption means "do not translate this text", not "never touch this text". A
+window title reading `GUI Torture Suite (<task id>)` keeps its wording and loses
+the id. This is decidable mechanically, because a task id is never
+legitimately part of user-facing text.
+
+### 1. Language
+
+English, in: source comments, `docs/adr/`, `docs/plans/`, every `README.md`, and
+this file.
+
+Japanese stays in the private tiers, which are **not** part of this repository:
+the task tracker, the meta repository's `docs/` and `tools/`, development notes,
+and commit messages.
+
+Two things inside this repository stay as they are, because they are data rather
+than prose: **Japanese test fixtures** (multibyte-handling test data, e.g. in
+`libs/gui/src/text_edit.zig` and `libs/font`) and **user-visible UI strings**.
+Translating either would change behaviour or break a test.
+
+### 2. Self-containment
+
+A comment explains the code in front of it. It never depends on a resource the
+reader cannot reach. If a rule, contract, or trade-off needs more room than a
+comment allows, it belongs in an ADR — not in a private document that the
+comment points at.
+
+### 3. No task-tracker ids in this repository
+
+Do not write `TASK-NN` anywhere: not in comments, not in `test "..."` names, not
+in build step descriptions (they surface in `zig build --help`), not in script
+values, not in file names, not in documentation. Those ids resolve only in the
+private tracker, so to a reader here they are dead references that look live.
+
+Provenance is still recoverable without them: `jj file annotate` gives the
+commit, and the commit message carries the id.
+
+This rule reaches into string literals, per the two-axis table above. Removing an
+id from a string keeps the surrounding wording: a window title becomes
+`GUI Torture Suite`, a build step description keeps its sentence, an e2e script
+keeps its temporary directory but renames it consistently. Step *names* are the
+`zig build <name>` interface and never change. When an id sits in text a test
+asserts on, or in console output whose wording you also want to translate, first
+confirm mechanically that no test depends on that text.
+
+### 4. Where each kind of writing goes
+
+| Content | Home |
+|---|---|
+| Current invariants, contracts, caveats — what the code guarantees now | source comment |
+| Design decisions, rejected alternatives, trade-offs, measurements behind a decision | `docs/adr/` |
+| Design spanning several work items | `docs/plans/` |
+| Operating procedures, machine names, task bookkeeping | meta repository (not here) |
+
+### 5. State the contract, not the history
+
+Comments are written in the present tense and describe what holds now.
+"Originally X", "before it was Y", "this was missed in Z", "temporary until W"
+are history: they go to an ADR, or nowhere. A reader wants the current contract;
+the past is what version control is for.
+
+### 6. Self-check
+
+Three steps. A single `rg` one-liner is not enough: it misses `#` and
+`<!-- -->` comments and it reports every URL that contains `//`.
+
+**Candidate set** — always start from tracked files. A bare `rg` sweep silently
+skips ignored and hidden files and follows nothing about symlinks:
+
+```bash
+jj file list                     # the authoritative file set
+```
+
+**Task ids** — both file contents and file names. Do not pipe into `xargs`;
+paths with spaces break it:
+
+```bash
+jj file list | while IFS= read -r p; do rg -n 'TASK-[0-9]' -- "$p"; done
+jj file list | rg -i 'task-[0-9]'
+```
+
+**Japanese in comments** — look for Japanese by Unicode block (CJK punctuation,
+kana, ideographs, fullwidth forms), not for non-ASCII bytes: an English comment
+may legitimately hold an em dash or an arrow, and flagging those reports a
+correctly translated file as debt. Decide the comment syntax per language, and
+look only inside comment spans so that fixtures and UI strings are not reported:
+
+| Comment syntax | Applies to |
+|---|---|
+| `//` only | `.zig` `.zon` (Zig has no block comments) |
+| `//` and `/* */` | `.c` `.cpp` `.h` `.m` `.swift` `.js` |
+| `#` | `.sh` `.py` `.nix` `.toml` `.gitignore`, harness replay scripts (`.txt`), extensionless shell wrappers |
+| `/* */` only | `.css`, and `<style>` content (`//` is legal inside `url(http://…)`) |
+| `<!-- -->` | `.html`, outside quoted attributes and outside `<script>`/`<style>` raw text |
+
+`.md` has no comment pass: policy treats a Markdown body as prose to translate in
+full, so the whole file is in scope and there is nothing to distinguish.
+
+Extracting spans safely means recognising everything that can contain a `//` or
+`#` without starting a comment: string and char literals; Zig and ZON `\\`
+multiline strings; Swift multiline (`"""`) and raw (`#"…"#`) strings; C++ raw
+strings (`R"tag(…)tag"`); JS template literals — including finding the `}` that
+really closes a `${…}`, which brace counting alone gets wrong — and regex
+literals; Python and TOML triple-quoted strings, escapes included; shell
+heredocs, taking the delimiter as a whole word (`<<'END-OF-FILE'`) and matching
+the terminator exactly, with `<<-` stripping tabs only; Nix multiline strings and
+`/* */`; and quoted HTML attribute values.
+
+Symlinks are followed once per canonical target. Binaries (`.png` `.wav` `.ttf`
+`.bdf`) are never inspected.
+
+Third-party `LICENSE` bodies sit on one axis only: they are exempt from
+translation, but not from the no-task-id rule — a local annotation added next to
+an upstream licence still must not carry an id. Anything outside this repository
+is out of scope entirely.
+
 ## ディレクトリ構造
 
 ```
