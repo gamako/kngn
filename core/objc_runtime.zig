@@ -1,30 +1,30 @@
-//! Objective-C ランタイム最小 FFI ヘルパー（TASK-49.2）。
+//! A minimal FFI helper for the Objective-C runtime.
 //!
-//! AVFoundation（camera）や `AVCaptureDevice` の権限確認（mic 側も同じクラスを使う。設計文書
-//! `docs/plans/capture-foundation-plan.md` 6章）は Objective-C オンリーの API（C API が無い）ため、
-//! `@cImport`/Swift を使わず libobjc の C ABI（`objc_msgSend`/`objc_getClass`/`sel_registerName`/
-//! 動的クラス生成/手書き Objective-C block）を extern fn で直接叩く。既存 backend の
-//! 「AudioToolbox を extern fn で直接叩く」「Windows D3D11 の COM vtable 手書き」と同じ
-//! 「他言語ランタイムを C ABI 経由で直呼びする」方針の横展開。
+//! AVFoundation (the camera) and `AVCaptureDevice`'s permission check (the microphone side uses the same class;
+//! see `docs/capture.md`) are Objective-C-only APIs with no C API, so rather than
+//! `@cImport` or Swift this drives libobjc's C ABI (`objc_msgSend`, `objc_getClass`, `sel_registerName`,
+//! dynamic class creation and hand-written Objective-C blocks) directly through extern fn. It extends the
+//! approach the existing backends already take — driving AudioToolbox directly through extern fn, and
+//! hand-writing the COM vtable for Windows D3D11 — of calling another language's runtime through the C ABI.
 //!
-//! **aarch64-darwin のみ対応**（本プロジェクトの macOS 対応 system は flake.nix により
-//! aarch64-darwin 限定。arm64 の統一呼出規約では `objc_msgSend` が全戻り値型で共通に使え、
-//! x86_64 で必要な `objc_msgSend_stret`/`objc_msgSend_fpret` の分岐は不要なため実装しない）。
+//! **Only aarch64-darwin is supported** (this project's macOS system is limited to
+//! aarch64-darwin by flake.nix. Under arm64's uniform calling convention `objc_msgSend` works for every
+//! return type, so the `objc_msgSend_stret` and `objc_msgSend_fpret` branches that x86_64 needs are not implemented).
 //!
-//! `camera_macos.zig`（camera module）と `audio_macos.zig`（audio module。マイク権限確認）の
-//! 両方から使われる。状態を持たない純粋関数群のみで型を跨いだ共有が無いため、
-//! `capture_types.zig` のような**型同一性**の理由での named module 化は不要（8章参照）だったが、
-//! **同一ファイルが2つの異なる module に属することはできない**という Zig の別の制約により、
-//! 結局 named module 化が必要になった（TASK-49.6: camera モジュールと audio モジュールを
-//! 同一 exe に同時 link する初のケース＝mic+camera 両方を使うデモで
-//! 「file exists in modules 'camera' and 'audio'」build エラーとして発覚。camera_macos.zig/
-//! audio_macos.zig がそれぞれ相対 `@import("objc_runtime.zig")` していたため、両 module が
-//! 同一 exe に link されると同じ物理ファイルが2 module に属する矛盾になっていた）。
-//! `core/build.zig` の `SharedModules` が named module `objc_runtime` として1個だけ作り、
-//! `camera`/`audio` 両方に `link()` する。
+//! It is used by both `camera_macos.zig` (the camera module) and `audio_macos.zig` (the audio module, for the
+//! microphone permission check). Being only stateless pure functions with nothing shared across types, it does
+//! not need to be a named module for the **type identity** reason `capture_types.zig` does.
+//! A different Zig constraint forces it anyway: **one file cannot belong to two different modules**.
+//! Linking the camera module and the audio module into one executable (a demo using both a microphone and a
+//! camera) surfaces this as the build error "file exists in modules 'camera' and 'audio'", because
+//! camera_macos.zig and audio_macos.zig each did a relative `@import("objc_runtime.zig")`, so linking both
+//! modules into one executable made the same physical file belong to two modules, which Zig
+//! rejects outright.
+//! `SharedModules` in `core/build.zig` therefore creates exactly one named module `objc_runtime` and
+//! `link()`s it into both `camera` and `audio`.
 //!
-//! ホットパス宣言: 初期化時のみ（`open()`/`requestPermission()`/`close()` 等イベント時に
-//! 数回呼ばれるのみ。フレーム毎(全画素)/RT(毎サンプル)では一切呼ばれない）。
+//! Hot path declaration: initialisation time only (called a handful of times at event time, in `open()`,
+//! `requestPermission()`, `close()` and the like. Never per frame (over every pixel) or real-time (per sample)).
 
 const std = @import("std");
 
@@ -39,24 +39,24 @@ pub extern "c" fn objc_registerClassPair(cls: Class) void;
 pub extern "c" fn objc_getProtocol(name: [*:0]const u8) ?*anyopaque;
 pub extern "c" fn class_addMethod(cls: Class, sel: SEL, imp: *const anyopaque, types: [*:0]const u8) u8; // BOOL
 pub extern "c" fn class_addProtocol(cls: Class, proto: ?*anyopaque) u8; // BOOL
-pub extern "c" fn objc_msgSend() void; // 実シグネチャは呼び出し側で @ptrCast する（下記 msgSend 参照）
+pub extern "c" fn objc_msgSend() void; // the caller @ptrCasts to the real signature (see msgSend below)
 
-/// クラスを名前で取得する（`objc_getClass` のラッパー。null なら未ロード＝リンクした framework が
-/// まだ dyld に解決されていない/名前typo）。
+/// Gets a class by name (a wrapper over `objc_getClass`; null means it is not loaded, so a linked framework
+/// has not been resolved by dyld yet, or the name is a typo).
 pub fn getClass(name: [*:0]const u8) Class {
     return objc_getClass(name);
 }
 
-/// セレクタを名前で取得する（`sel_registerName` のラッパー）。
+/// Gets a selector by name (a wrapper over `sel_registerName`).
 pub fn sel(name: [*:0]const u8) SEL {
     return sel_registerName(name);
 }
 
-/// `objc_msgSend` を呼び出し側の型で呼ぶ。Objective-C のメッセージ送信は可変長引数的だが、
-/// arm64 の統一 ABI では通常の C 呼出規約と一致するため、comptime に呼び出しごとの関数型を
-/// `@Fn`（Zig 0.16 の型 reify builtin。旧 `@Type(.{ .@"fn" = ... })` はこのバージョンには
-/// 存在せず種類別 builtin に分割されている）で組み立てて `@ptrCast` する
-/// （`zig-objc` 等の Zig ObjC binding と同型のテクニック）。
+/// Calls `objc_msgSend` with the caller's own types. Sending an Objective-C message is variadic in spirit, but
+/// under arm64's uniform ABI it matches the ordinary C calling convention, so the function type for each call is
+/// assembled at comptime with `@Fn` (Zig 0.16's type reification builtin; the older `@Type(.{ .@"fn" = ... })`
+/// does not exist in this version, having been split into per-kind builtins) and then `@ptrCast`
+/// (the same technique as Zig ObjC bindings such as `zig-objc`).
 pub fn msgSend(comptime Ret: type, obj: Id, sel_val: SEL, args: anytype) Ret {
     const ArgsType = @TypeOf(args);
     const FnType = comptime blk: {
@@ -78,13 +78,13 @@ pub fn msgSend(comptime Ret: type, obj: Id, sel_val: SEL, args: anytype) Ret {
 }
 
 // ============================================================================
-// 手書き Objective-C block（TASK-49.2: AVCaptureDevice.requestAccessForMediaType:completionHandler:
-// の非同期 completion handler / dispatch_sync の drain block に使う。設計文書 §「未確定」の
-// 「非同期→同期ブロッキング変換」を手書き stack block + busy-wait で実装する）。
+// A hand-written Objective-C block, used for the asynchronous completion handler of
+// AVCaptureDevice.requestAccessForMediaType:completionHandler: and for dispatch_sync's drain block.
+// It implements the asynchronous-to-synchronous-blocking conversion with a hand-written stack block plus a busy-wait.
 // ============================================================================
 
-/// libclosure（blocks runtime。libSystem 内蔵）が公開するスタックブロック用 isa。
-/// 参照するだけで呼び出さない（アドレスを isa に埋め込む）。
+/// The isa for a stack block, published by libclosure (the blocks runtime, built into libSystem).
+/// It is only referenced, never called (its address is embedded in isa).
 extern "c" var _NSConcreteStackBlock: anyopaque;
 
 pub const BlockDescriptor = extern struct {
@@ -92,11 +92,11 @@ pub const BlockDescriptor = extern struct {
     size: usize,
 };
 
-/// **BLOCK_HAS_COPY_DISPOSE を持たない**手書き stack block。捕捉するのは POD な `ctx` ポインタ
-/// 1個のみ（retain/release が要る Objective-C オブジェクトを捕捉しない）ため、ランタイムが
-/// `Block_copy` する際も単純なバイトコピーで済み安全に使える。`invoke` は
-/// `fn(*const StackBlock, ...args) callconv(.c) Ret` の形（第1引数は block 自身。標準 blocks ABI）
-/// で外部から呼ばれる。
+/// A hand-written stack block that **has no BLOCK_HAS_COPY_DISPOSE**. It captures only one POD `ctx`
+/// pointer (never an Objective-C object needing retain and release), so even when the runtime
+/// `Block_copy`s it a plain byte copy suffices and it stays safe. `invoke` is called from outside in the
+/// shape `fn(*const StackBlock, ...args) callconv(.c) Ret`
+/// (the first argument being the block itself, per the standard blocks ABI).
 pub const StackBlock = extern struct {
     isa: ?*anyopaque,
     flags: i32 = 0,
@@ -108,9 +108,9 @@ pub const StackBlock = extern struct {
 
 var stack_block_descriptor = BlockDescriptor{ .size = @sizeOf(StackBlock) };
 
-/// `invoke`（呼び出し側の実シグネチャへ `@ptrCast` 済みの関数ポインタ）と `ctx`（POD ペイロード。
-/// invoke 内で `block.ctx` から取り出す）から stack block を組み立てる。返した値は呼び出しが
-/// 完了するまで（同期待ちが終わるまで）スタック上で生存させること（caller 責務。エスケープさせない）。
+/// Assembles a stack block from `invoke` (a function pointer already `@ptrCast` to the caller's real signature)
+/// and `ctx` (the POD payload, retrieved from `block.ctx` inside invoke). The value returned must be kept alive
+/// on the stack until the call completes (until the synchronous wait ends); that is the caller's duty, and it must not escape.
 pub fn makeStackBlock(invoke: *const anyopaque, ctx: ?*anyopaque) StackBlock {
     return .{
         .isa = &_NSConcreteStackBlock,
@@ -121,16 +121,16 @@ pub fn makeStackBlock(invoke: *const anyopaque, ctx: ?*anyopaque) StackBlock {
 }
 
 // ============================================================================
-// AVCaptureDevice 権限確認ヘルパー（mic/camera 共有。設計文書
-// `docs/plans/capture-foundation-plan.md` 6章: 両者とも
+// The AVCaptureDevice permission helper, shared by the microphone and camera (see `docs/capture.md`: both use
+// the same class.
 // `AVCaptureDevice.authorizationStatusForMediaType:`/`requestAccessForMediaType:completionHandler:`
-// を使う。`media_type`（`AVMediaTypeVideo`/`AVMediaTypeAudio`）は呼び出し側=各 backend ファイルが
-// 渡す。ここに置くのは block 構築という手のかかる共通ロジックを camera/audio 間で複製しないため）。
+// `media_type` (`AVMediaTypeVideo` or `AVMediaTypeAudio`) is passed in by the caller, each backend file.
+// It lives here so that the fiddly shared logic of building the block is not duplicated between camera and audio).
 // ============================================================================
 
-/// `[AVCaptureDevice authorizationStatusForMediaType:media_type]` を呼ぶ（TCC ダイアログを
-/// 出さない単なるクエリ）。戻り値は `AVAuthorizationStatus`（NSInteger:
-/// notDetermined=0/restricted=1/denied=2/authorized=3）をそのまま返す。
+/// Calls `[AVCaptureDevice authorizationStatusForMediaType:media_type]` (a plain query that does not raise
+/// the TCC dialogue). It returns `AVAuthorizationStatus` (an NSInteger:
+/// notDetermined=0, restricted=1, denied=2, authorized=3) as it is.
 pub fn avAuthorizationStatus(media_type: Id) i64 {
     const cls = getClass("AVCaptureDevice");
     return msgSend(i64, cls, sel("authorizationStatusForMediaType:"), .{media_type});
@@ -156,11 +156,11 @@ fn sleepMsForRequestAccess(ms: u64) void {
 }
 
 /// `[AVCaptureDevice requestAccessForMediaType:media_type completionHandler:^(BOOL granted){...}]`
-/// を呼び、completion handler が発火するまでブロックする（非同期→同期変換）。busy-wait
-/// （1ms sleep のポーリング）で実装する（イベント時のみ・1回限りの待ち合わせなので実用上問題ない。
-/// 設計文書の「semaphore か dispatch queue 待ち合わせか」という未確定事項に対する結論）。
-/// **未決定(.notDetermined)から遷移させる呼び出しであり、初回は実際に TCC ダイアログを試みる**
-/// （自動テストからは呼ばないこと。手動検証レンジ。backlog task-49.2 参照）。
+/// and blocks until the completion handler fires (the asynchronous-to-synchronous conversion). It is implemented
+/// with a busy-wait (polling with a 1ms sleep), which is fine in practice, being a one-off wait at event time only.
+/// That is the resolution of the open question of whether to use a semaphore or to wait on a dispatch queue.
+/// **This call transitions away from notDetermined, so the first time it really does attempt the TCC dialogue.**
+/// Do not call it from an automated test; it is for manual verification.
 pub fn avRequestAccessBlocking(media_type: Id) bool {
     var ctx = RequestAccessCtx{};
     const block = makeStackBlock(@ptrCast(&requestAccessInvoke), &ctx);
@@ -173,12 +173,12 @@ pub fn avRequestAccessBlocking(media_type: Id) bool {
 }
 
 // ============================================================================
-// tests（display/実デバイス不要。NSObject/NSString 等 libobjc + Foundation の基本メッセージ送信の
-// 疎通確認のみ。TCC・実デバイスに一切触れない）
+// tests (no display or real device needed. They only check that basic message sending through libobjc and
+// Foundation works, with NSObject, NSString and the like, and never touch TCC or a real device)
 // ============================================================================
 const testing = std.testing;
 
-test "msgSend: [NSObject new] は非 nil を返し isKindOfClass: が真になる" {
+test "msgSend: [NSObject new] returns non-nil and isKindOfClass: holds" {
     const cls = getClass("NSObject");
     try testing.expect(cls != null);
     const obj = msgSend(Id, cls, sel("new"), .{});
@@ -189,7 +189,7 @@ test "msgSend: [NSObject new] は非 nil を返し isKindOfClass: が真にな�
     try testing.expect(is_kind);
 }
 
-test "msgSend: NSString length/UTF8String が引数付きメッセージで正しく動く" {
+test "msgSend: NSString length and UTF8String work correctly through a message with arguments" {
     const cls = getClass("NSString");
     try testing.expect(cls != null);
     const str = msgSend(Id, cls, sel("stringWithUTF8String:"), .{@as([*:0]const u8, "hello")});
@@ -200,7 +200,7 @@ test "msgSend: NSString length/UTF8String が引数付きメッセージで正�
     try testing.expectEqualStrings("hello", std.mem.span(c_str));
 }
 
-test "makeStackBlock: invoke がリンクした isa/ctx を伴って正しく呼ばれる（ObjC非依存の純粋な呼び出しテスト）" {
+test "makeStackBlock: invoke is called correctly with the linked isa and ctx (a pure call test, independent of ObjC)" {
     const Ctx = struct { value: i32 = 0 };
     const Invoker = struct {
         fn call(block: *const StackBlock, add: i32) callconv(.c) void {

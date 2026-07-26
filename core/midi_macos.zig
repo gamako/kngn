@@ -1,27 +1,27 @@
-//! macOS CoreMIDI backend（TASK-115.2・ADR-010）。
+//! The macOS CoreMIDI backend (see ADR-010).
 //!
-//! ## API 選定（legacy MIDIReadProc）
+//! ## Choosing the API (the legacy MIDIReadProc)
 //!
-//! 受信には `MIDIInputPortCreate` + `MIDIReadProc` を採用する。
-//! SDK 上は deprecated で replacement は `MIDIInputPortCreateWithProtocol`（`MIDIReceiveBlock` +
-//! `MIDIEventList`）だが、`MIDIReceiveBlock` は Objective-C block ABI のため、本プロジェクトの
-//! 「`@cImport` せず `extern fn` に C 関数ポインタを渡す」方式には適さない。
-//! 手書き extern は SDK の deprecation attribute を取り込まない。warning を隠すためだけの
-//! 無関係 API は使わない。将来の MIDI 2 / block backend 置換点は本ファイルに隔離する。
+//! Receiving uses `MIDIInputPortCreate` plus `MIDIReadProc`.
+//! The SDK marks it deprecated in favour of `MIDIInputPortCreateWithProtocol` (`MIDIReceiveBlock` plus
+//! `MIDIEventList`), but `MIDIReceiveBlock` uses the Objective-C block ABI and so does not suit this project's
+//! approach of passing a C function pointer to an `extern fn` rather than using `@cImport`.
+//! A hand-written extern does not pick up the SDK's deprecation attribute, and an unrelated API is not adopted
+//! merely to hide a warning. The replacement point for a future MIDI 2 or block backend is isolated to this file.
 //!
-//! ## ホットパス宣言
+//! ## Hot path declaration
 //!
-//! `midiReadProc`（CoreMIDI 管理の高優先度 receive thread・準 RT・毎イベント）では
-//! alloc / lock / IO / panic / CF 操作 / ログを禁止し、固定長 SPSC ring への push と
-//! MIDI 1.0 byte parsing のみ行う。`MIDINotifyProc` は topology dirty flag の atomic store のみ。
-//! 列挙・接続変更・allocation は main thread の `pollMidi()`（dirty 時）または `open`/`close` のみ。
+//! In `midiReadProc` (CoreMIDI's high-priority receive thread, so near-real-time and once per event),
+//! alloc, locking, IO, panic, CF operations and logging are all forbidden; it only pushes into a fixed-length SPSC
+//! ring and parses MIDI 1.0 bytes. `MIDINotifyProc` only does an atomic store of the topology dirty flag.
+//! Enumeration, connection changes and allocation happen only on the main thread's `pollMidi()` (when dirty), or in `open` and `close`.
 //!
-//! ## スレッドモデル
+//! ## The thread model
 //!
-//! - producer: CoreMIDI receive thread（`midiReadProc`）
-//! - consumer: `Device.pollMidi()` を呼ぶ main thread
-//! - queue: `MidiEvent` 容量 1024（2 の冪）、head/tail は cache_line 分離
-//! - note-on は 128 slot、CC は 32 slot を note-off 用に予約（満杯時は drop + atomic counter）
+//! - the producer: CoreMIDI's receive thread (`midiReadProc`)
+//! - the consumer: the main thread calling `Device.pollMidi()`
+//! - the queue: `MidiEvent` with a capacity of 1024 (a power of two), head and tail on separate cache lines
+//! - note-on reserves 128 slots and CC reserves 32 for note-off (when full it drops and bumps an atomic counter)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,7 +30,7 @@ const types = @import("platform_types");
 pub const Error = error{ OpenFailed, OutOfMemory };
 
 // ============================================================================
-// CoreMIDI / CoreFoundation C ABI（最小サブセット。@cImport 不使用）
+// the CoreMIDI and CoreFoundation C ABI (a minimal subset, no @cImport)
 // ============================================================================
 const c = struct {
     pub const OSStatus = i32;
@@ -47,14 +47,14 @@ const c = struct {
     pub const CFAllocatorRef = ?*const anyopaque;
     pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 
-    /// pack(4) の可変長リスト。`packet` フィールドは置かない（Zig の align 8 が
-    /// C の pack(4) 先頭 offset 4 と食い違うため、本文は `parsePacketListIntoRing` が
-    /// バイト walk する）。
+    /// A pack(4) variable-length list. There is no `packet` field (Zig's align 8 disagrees with
+    /// C's pack(4) leading offset of 4, so `parsePacketListIntoRing` walks the body
+    /// byte by byte instead).
     pub const MIDIPacketList = extern struct {
         numPackets: u32,
     };
 
-    // pack(4) MIDIPacket レイアウト（SDK CoreMIDI/MIDIServices.h）:
+    // the pack(4) MIDIPacket layout (from the SDK's CoreMIDI/MIDIServices.h):
     //   timeStamp: u64 @0, length: u16 @8, data: [length] @10
     // MIDIPacketList: numPackets u32 @0, first packet @4
     pub const packet_list_header_size: usize = 4;
@@ -115,17 +115,17 @@ const c = struct {
     pub extern "c" fn CFRelease(cf: CFTypeRef) void;
 };
 
-/// MIDIPacket.data の SDK 宣言サイズ。length がこれを超える値は driver 異常とみなし walk 中断。
+/// The size MIDIPacket.data is declared with in the SDK. A length beyond it is taken as a driver fault and stops the walk.
 const MIDI_PACKET_DATA_MAX: u16 = 256;
 
-/// pack(4) MIDIPacket の length フィールドを読む（クランプ無しの生値）。
+/// Reads the length field of a pack(4) MIDIPacket (the raw value, unclamped).
 fn packetLengthRaw(pkt: [*]const u8) u16 {
     return std.mem.readInt(u16, pkt[8..10], .little);
 }
 
-/// ARM64 では data[length] の直後を 4-byte align。Intel は unaligned のまま。
-/// 戻り値は現 packet 先頭からのバイトオフセット（次 packet 先頭まで）。
-/// `len` は呼び出し側で `MIDI_PACKET_DATA_MAX` 以下に検証済みであること。
+/// On ARM64 the byte just past data[length] is 4-byte aligned; on Intel it stays unaligned.
+/// The return value is the byte offset from the head of the current packet (to the head of the next).
+/// `len` must already have been checked by the caller to be at most `MIDI_PACKET_DATA_MAX`.
 fn midiPacketNextOffset(pkt: [*]const u8, len: u16) usize {
     _ = pkt;
     const data_end = c.packet_data_offset + len;
@@ -136,7 +136,7 @@ fn midiPacketNextOffset(pkt: [*]const u8, len: u16) usize {
 }
 
 // ============================================================================
-// SPSC ring（libs/synth の SpscRing を core から import せず最小複製）
+// an SPSC ring (a minimal copy, rather than importing libs/synth's SpscRing from core)
 // ============================================================================
 const RING_CAP: usize = 1024;
 const RING_MASK: usize = RING_CAP - 1;
@@ -262,10 +262,10 @@ pub fn open(allocator: std.mem.Allocator) Error!Device {
 }
 
 fn destroyState(state: *State) void {
-    // 1. closing を立て、以降の callback は enqueue しない
+    // 1. Raise closing, so no later callback enqueues
     state.closing.store(true, .release);
 
-    // 2. 全 source を切断
+    // 2. Disconnect every source
     for (state.sources) |src| {
         _ = c.MIDIPortDisconnectSource(state.port, src.endpoint);
     }
@@ -276,19 +276,19 @@ fn destroyState(state: *State) void {
         state.port = 0;
     }
 
-    // 4. client dispose（notify も止まる）
+    // 4. Dispose of the client (which also stops notify)
     if (state.client != 0) {
         _ = c.MIDIClientDispose(state.client);
         state.client = 0;
     }
 
-    // 5. in-flight callback が 0 になるまで待つ
+    // 5. Wait until there are no in-flight callbacks
     while (state.callback_inflight.load(.acquire) != 0) {
         std.atomic.spinLoopHint();
         std.Thread.yield() catch {};
     }
 
-    // 6. source list と State を解放
+    // 6. Free the source list and the State
     if (state.sources.len != 0) {
         state.allocator.free(state.sources);
     }
@@ -311,11 +311,11 @@ fn findConnectedDeviceId(sources: []const SourceEntry, endpoint: c.MIDIEndpointR
     return null;
 }
 
-/// 物理エンドポイント列と「既接続」集合と「新規 connect 成否」から、state.sources に載せる
-/// リストを構築する（テスト可能コア）。
+/// Builds the list to put in state.sources from the physical endpoint list, the set of already-connected
+/// endpoints, and whether each new connect succeeded (a testable core).
 ///
-/// 契約: 既接続はそのまま残す。未接続は `new_connect_ok[i]==true` のときだけ載せる。
-/// 接続失敗した endpoint は out に入れない → 次回 reconcile の差分検出で自動再試行される。
+/// The contract: an already-connected endpoint stays as it is. An unconnected one goes in only when `new_connect_ok[i]==true`.
+/// An endpoint that failed to connect is left out of out, so the next reconcile's difference detection retries it automatically.
 fn filterConnectedSources(
     candidates: []const SourceEntry,
     previous: []const SourceEntry,
@@ -335,7 +335,7 @@ fn filterConnectedSources(
             out[count] = cand;
             count += 1;
         }
-        // 接続失敗: 載せない（次回 reconcile で again）
+        // failed to connect: leave it out (and try again on the next reconcile)
     }
     return count;
 }
@@ -344,7 +344,7 @@ fn reconcileSources(state: *State) void {
     if (state.closing.load(.acquire)) return;
 
     const n = c.MIDIGetNumberOfSources();
-    // 物理ソース 0 件でも previous を解放して空にする
+    // free the previous list and empty it even when there are no physical sources
     if (n == 0) {
         for (state.sources) |old| {
             _ = c.MIDIPortDisconnectSource(state.port, old.endpoint);
@@ -370,7 +370,7 @@ fn reconcileSources(state: *State) void {
         };
     }
 
-    // 切断: 旧にあって物理列挙に無い endpoint
+    // disconnect: an endpoint in the old list that the physical enumeration no longer has
     for (state.sources) |old| {
         var still = false;
         for (candidates) |cand| {
@@ -384,13 +384,13 @@ fn reconcileSources(state: *State) void {
         }
     }
 
-    // 接続: 未接続だけ MIDIPortConnectSource。失敗は connect_ok=false → sources に載せない。
+    // connect: MIDIPortConnectSource only for those not yet connected. A failure gives connect_ok=false, so it is left out of sources.
     for (candidates, connect_ok) |cand, *ok| {
         if (findConnectedDeviceId(state.sources, cand.endpoint) != null) {
-            ok.* = true; // 既接続（filter 側で previous を使う）
+            ok.* = true; // already connected (the filter side uses previous)
             continue;
         }
-        // device_id を整数値としてポインタに載せ、callback は dereference せず u32 に戻す。
+        // The device_id is carried in the pointer as an integer value, and the callback turns it back into a u32 without dereferencing it.
         const ref_con: ?*anyopaque = @ptrFromInt(@as(usize, cand.device_id));
         ok.* = c.MIDIPortConnectSource(state.port, cand.endpoint, ref_con) == 0;
     }
@@ -402,7 +402,7 @@ fn reconcileSources(state: *State) void {
         break :blk &.{};
     } else if (count == n) tmp else blk: {
         const shrunk = state.allocator.realloc(tmp, count) catch {
-            // realloc 失敗時は先頭 count 件だけを別確保
+            // on a failed realloc, allocate just the first count entries separately
             const copy = state.allocator.alloc(SourceEntry, count) catch {
                 state.allocator.free(tmp);
                 return;
@@ -421,7 +421,7 @@ fn reconcileSources(state: *State) void {
 }
 
 // ============================================================================
-// CoreMIDI callbacks（RT 契約）
+// the CoreMIDI callbacks (under the real-time contract)
 // ============================================================================
 
 fn midiNotifyProc(message: *const c.MIDINotification, ref_con: ?*anyopaque) callconv(.c) void {
@@ -442,15 +442,15 @@ fn midiReadProc(
 
     if (state.closing.load(.acquire)) return;
 
-    // device_id は ConnectSource 時に整数値をポインタに載せたもの。dereference しない。
+    // The device_id is the integer value put into the pointer at ConnectSource time. It is never dereferenced.
     const device_id: types.MidiDeviceId = @truncate(@intFromPtr(src_conn_ref_con));
 
     parsePacketListIntoRing(state, pktlist, device_id);
 }
 
-/// packet list を ring に積む（callback / 単体テスト共用）。
-/// CoreMIDI の pack(4) 可変長レイアウトをバイト walk する（Zig struct に載せない）。
-/// length > MIDI_PACKET_DATA_MAX(256) の packet を見たら以降を捨てて中断する（OOB 防止）。
+/// Pushes a packet list into the ring (shared by the callback and the unit tests).
+/// It walks CoreMIDI's pack(4) variable-length layout byte by byte (rather than mapping it onto a Zig struct).
+/// On seeing a packet whose length exceeds MIDI_PACKET_DATA_MAX(256) it discards the rest and stops (which prevents an out-of-bounds read).
 fn parsePacketListIntoRing(state: *State, pktlist: *const c.MIDIPacketList, device_id: types.MidiDeviceId) void {
     const num = pktlist.numPackets;
     if (num == 0) return;
@@ -461,27 +461,27 @@ fn parsePacketListIntoRing(state: *State, pktlist: *const c.MIDIPacketList, devi
     while (pi < num) : (pi += 1) {
         const pkt = base + offset;
         const len = packetLengthRaw(pkt);
-        // data[256] 宣言超過は driver 異常。クランプして読み進めず残り packet ごと破棄する。
+        // Exceeding the declared data[256] is a driver fault. It is not clamped and read on; the remaining packets are discarded wholesale.
         if (len > MIDI_PACKET_DATA_MAX) return;
         parsePacketData(state, pkt[c.packet_data_offset .. c.packet_data_offset + len], device_id);
         offset += midiPacketNextOffset(pkt, len);
     }
 }
 
-/// 1 packet 内の MIDI 1.0 バイト列を event に変換して ring へ。
-/// running status は MIDIPacket では禁止。sysex / clock / system common は無視。
+/// Converts the MIDI 1.0 byte sequence within one packet into events and puts them in the ring.
+/// Running status is forbidden in a MIDIPacket. sysex, clock and system common are ignored.
 fn parsePacketData(state: *State, data: []const u8, device_id: types.MidiDeviceId) void {
     var i: usize = 0;
     while (i < data.len) {
         const status = data[i];
         if (status < 0x80) {
-            // running status 無し前提。ゴミは 1 バイト捨てて継続（callback 停止しない）。
+            // Running status is assumed absent. Rubbish costs one discarded byte and it carries on (the callback never stops).
             i += 1;
             continue;
         }
 
         if (status == 0xF0) {
-            // sysex: EOX または packet 末尾までスキップ
+            // sysex: skip to EOX, or to the end of the packet
             i += 1;
             while (i < data.len and data[i] != 0xF7) : (i += 1) {}
             if (i < data.len) i += 1; // skip 0xF7 if present
@@ -489,7 +489,7 @@ fn parsePacketData(state: *State, data: []const u8, device_id: types.MidiDeviceI
         }
 
         if (status >= 0xF8) {
-            // system realtime（clock 等）: 0 data bytes
+            // system realtime (clock and the like): 0 data bytes
             i += 1;
             continue;
         }
@@ -499,7 +499,7 @@ fn parsePacketData(state: *State, data: []const u8, device_id: types.MidiDeviceI
             const data_len: usize = switch (status) {
                 0xF1, 0xF3 => 1,
                 0xF2 => 2,
-                else => 0, // F4/F5 未定義, F6 tune, F7 EOX alone
+                else => 0, // F4/F5 undefined, F6 tune, F7 EOX alone
             };
             i += 1 + data_len;
             if (i > data.len) break;
@@ -545,7 +545,7 @@ fn parsePacketData(state: *State, data: []const u8, device_id: types.MidiDeviceI
                 .controller = d1 & 0x7F,
                 .value = d2 & 0x7F,
             } }),
-            else => {}, // A0 poly AT / C0 prog / D0 pressure / E0 pitch: 無視
+            else => {}, // A0 poly AT / C0 prog / D0 pressure / E0 pitch: ignored
         }
     }
 }
@@ -562,11 +562,11 @@ fn enqueueEvent(state: *State, event: types.MidiEvent) void {
 }
 
 // ============================================================================
-// テスト用: synthetic MIDIPacketList 構築
+// for the tests: building a synthetic MIDIPacketList
 // ============================================================================
 
-/// 可変長 packet list をバッファに書き、先頭を `*const MIDIPacketList` として返す。
-/// pack(4) レイアウト（numPackets@0, packet0@4, timeStamp@+0, length@+8, data@+10）。
+/// Writes a variable-length packet list into a buffer and returns its head as a `*const MIDIPacketList`.
+/// The pack(4) layout (numPackets@0, packet0@4, timeStamp@+0, length@+8, data@+10).
 fn buildPacketList(buf: []u8, packets: []const []const u8) *const c.MIDIPacketList {
     std.debug.assert(packets.len > 0);
     std.debug.assert(buf.len >= 4);
@@ -576,7 +576,7 @@ fn buildPacketList(buf: []u8, packets: []const []const u8) *const c.MIDIPacketLi
 
     for (packets) |pdata| {
         std.debug.assert(pdata.len <= 256);
-        // ARM: packet 開始は 4-byte align（header 直後の 4 は既に align 済み）
+        // ARM: a packet starts 4-byte aligned (the 4 just past the header is already aligned)
         if (builtin.cpu.arch.isAARCH64() or builtin.cpu.arch == .arm) {
             offset = (offset + 3) & ~@as(usize, 3);
         }
@@ -614,7 +614,7 @@ fn expectEmpty(state: *State) !void {
 // ============================================================================
 const testing = std.testing;
 
-test "midi_macos: packet note-on / note-off / CC 変換" {
+test "midi_macos: converting a packet's note-on, note-off and CC" {
     var state = testState();
     var buf: [512]u8 = undefined;
     const list = buildPacketList(&buf, &.{
@@ -630,7 +630,7 @@ test "midi_macos: packet note-on / note-off / CC 変換" {
     try expectEmpty(&state);
 }
 
-test "midi_macos: note-on velocity 0 は note-off に正規化" {
+test "midi_macos: a note-on with velocity 0 is normalised to a note-off" {
     var state = testState();
     var buf: [256]u8 = undefined;
     const list = buildPacketList(&buf, &.{&[_]u8{ 0x90, 64, 0 }});
@@ -639,7 +639,7 @@ test "midi_macos: note-on velocity 0 は note-off に正規化" {
     try expectEmpty(&state);
 }
 
-test "midi_macos: channel nibble を無視した status 判定" {
+test "midi_macos: deciding the status while ignoring the channel nibble" {
     var state = testState();
     var buf: [256]u8 = undefined;
     // ch 10 (0x9A), ch 16 (0xBF)
@@ -653,7 +653,7 @@ test "midi_macos: channel nibble を無視した status 判定" {
     try expectEmpty(&state);
 }
 
-test "midi_macos: sysex / clock / system common を無視" {
+test "midi_macos: sysex, clock and system common are ignored" {
     var state = testState();
     var buf: [512]u8 = undefined;
     const list = buildPacketList(&buf, &.{
@@ -668,7 +668,7 @@ test "midi_macos: sysex / clock / system common を無視" {
     try expectEmpty(&state);
 }
 
-test "midi_macos: srcConnRefCon から device_id が保持される" {
+test "midi_macos: the device_id survives through srcConnRefCon" {
     var state = testState();
     var buf: [256]u8 = undefined;
     const list = buildPacketList(&buf, &.{&[_]u8{ 0x90, 1, 2 }});
@@ -680,7 +680,7 @@ test "midi_macos: srcConnRefCon から device_id が保持される" {
     try expectEmpty(&state);
 }
 
-test "midi_macos: FIFO 順序" {
+test "midi_macos: FIFO order" {
     var state = testState();
     var buf: [256]u8 = undefined;
     const list = buildPacketList(&buf, &.{&[_]u8{ 0x90, 1, 10, 0x90, 2, 20, 0x90, 3, 30 }});
@@ -702,32 +702,32 @@ test "midi_macos: ring wrap-around" {
     }
 }
 
-test "midi_macos: note-on / CC reserve と note-off 優先" {
+test "midi_macos: the note-on and CC reserves, and note-off taking priority" {
     var ring = MidiRing{};
-    // note-on は reserve 128 なので used + 128 >= 1024 → used >= 896 で拒否
+    // note-on reserves 128, so used + 128 >= 1024 means it is refused from used >= 896
     var n: usize = 0;
     while (n < RING_CAP - NOTE_ON_RESERVE) : (n += 1) {
         try testing.expect(ring.pushReserve(.{ .note_on = .{ .device_id = 0, .note = 60, .velocity = 1 } }, NOTE_ON_RESERVE));
     }
     try testing.expect(!ring.pushReserve(.{ .note_on = .{ .device_id = 0, .note = 61, .velocity = 1 } }, NOTE_ON_RESERVE));
-    // note-off は reserve 0 で入る
+    // note-off has a reserve of 0 and goes in
     try testing.expect(ring.push(.{ .note_off = .{ .device_id = 0, .note = 60, .velocity = 0 } }));
 
-    // CC reserve 32: 空きが 32 以下なら CC 拒否、note-off は入る
-    // 現 used = 896 + 1 = 897、空き = 127
-    // 空きを 32 まで減らす（= used を 992 まで）: あと 95 個 note-off を入れる
+    // CC reserves 32: with 32 or fewer free, CC is refused while note-off still goes in
+    // used is now 896 + 1 = 897, so 127 are free
+    // bring the free count down to 32 (used up to 992): 95 more note-offs
     n = 0;
     while (n < 95) : (n += 1) {
         try testing.expect(ring.push(.{ .note_off = .{ .device_id = 0, .note = 0, .velocity = 0 } }));
     }
-    // used=992, free=32 → CC は free > 32 が必要（used+32>=1024 → used>=992）で拒否
+    // used=992, free=32, so CC is refused (it needs free > 32, since used+32>=1024 means used>=992)
     try testing.expect(!ring.pushReserve(.{ .cc = .{ .device_id = 0, .controller = 1, .value = 1 } }, CC_RESERVE));
     try testing.expect(ring.push(.{ .note_off = .{ .device_id = 0, .note = 1, .velocity = 0 } }));
 }
 
-test "midi_macos: overflow 時も callback は停止せず drop を数える" {
+test "midi_macos: on overflow the callback does not stop and counts the drops" {
     var state = testState();
-    // 満杯まで note-off を詰める
+    // pack it with note-offs until it is full
     var n: usize = 0;
     while (n < RING_CAP) : (n += 1) {
         try testing.expect(state.ring.push(.{ .note_off = .{ .device_id = 0, .note = 0, .velocity = 0 } }));
@@ -737,11 +737,11 @@ test "midi_macos: overflow 時も callback は停止せず drop を数える" {
     enqueueEvent(&state, .{ .note_on = .{ .device_id = 0, .note = 2, .velocity = 10 } });
     enqueueEvent(&state, .{ .cc = .{ .device_id = 0, .controller = 3, .value = 4 } });
     try testing.expectEqual(before + 3, state.drop_count.load(.monotonic));
-    // ring は依然として pop 可能（callback 停止していない）
+    // the ring can still be popped (the callback has not stopped)
     try testing.expect(state.ring.pop() != null);
 }
 
-test "midi_macos: head/tail・closing・callback counter の cache_line 分離" {
+test "midi_macos: head, tail, closing and the callback counter are on separate cache lines" {
     const cl = std.atomic.cache_line;
     try testing.expect(@alignOf(MidiRing) >= cl);
     try testing.expect(@offsetOf(MidiRing, "head") % cl == 0);
@@ -757,7 +757,7 @@ test "midi_macos: head/tail・closing・callback counter の cache_line 分離" 
     try testing.expect(@offsetOf(State, "callback_inflight") % cl == 0);
     try testing.expect(@offsetOf(State, "drop_count") % cl == 0);
 
-    // 互いに別 cache line
+    // on separate cache lines from each other
     const offs = [_]usize{
         @offsetOf(State, "topology_dirty"),
         @offsetOf(State, "closing"),
@@ -773,39 +773,39 @@ test "midi_macos: head/tail・closing・callback counter の cache_line 分離" 
     }
 }
 
-test "midi_macos: MIDINotifyProc は dirty flag のみ更新" {
+test "midi_macos: MIDINotifyProc updates the dirty flag alone" {
     var state = testState();
     try testing.expect(!state.topology_dirty.load(.monotonic));
     const msg = c.MIDINotification{ .messageID = 1, .messageSize = 8 };
     midiNotifyProc(&msg, @ptrCast(&state));
     try testing.expect(state.topology_dirty.load(.monotonic));
-    // ring は空のまま（列挙しない）
+    // the ring stays empty (nothing is enumerated)
     try testing.expectEqual(@as(?types.MidiEvent, null), state.ring.pop());
 }
 
-test "midi_macos: shutdown 後の callback は event を enqueue しない" {
+test "midi_macos: a callback after shutdown enqueues no event" {
     var state = testState();
     state.closing.store(true, .release);
 
     var buf: [256]u8 = undefined;
     const list = buildPacketList(&buf, &.{&[_]u8{ 0x90, 60, 100 }});
-    // midiReadProc 経路
+    // through the midiReadProc path
     midiReadProc(list, @ptrCast(&state), @ptrFromInt(99));
     try testing.expectEqual(@as(?types.MidiEvent, null), state.ring.pop());
     try testing.expectEqual(@as(u32, 0), state.callback_inflight.load(.monotonic));
 }
 
-test "midi_macos: connect 失敗 endpoint は sources に入れず次回再試行可能" {
-    // previous に endpoint=1 のみ接続済み。物理候補は 1,2,3。
-    // 2 は新規 connect 失敗、3 は成功 → sources には 1 と 3 のみ。
-    // 2 が previous に残らないので次回 reconcile では「未接続」として再試行される。
+test "midi_macos: an endpoint that failed to connect is left out of sources and can be retried next time" {
+    // previous has only endpoint=1 connected, and the physical candidates are 1, 2 and 3.
+    // 2 fails to connect and 3 succeeds, so sources holds only 1 and 3.
+    // 2 does not survive in previous, so the next reconcile retries it as unconnected.
     const previous = [_]SourceEntry{.{ .endpoint = 1, .device_id = 10 }};
     const candidates = [_]SourceEntry{
         .{ .endpoint = 1, .device_id = 10 },
         .{ .endpoint = 2, .device_id = 20 },
         .{ .endpoint = 3, .device_id = 30 },
     };
-    const new_connect_ok = [_]bool{ true, false, true }; // index0 は既接続なので filter は無視
+    const new_connect_ok = [_]bool{ true, false, true }; // index0 is already connected, so the filter ignores it
     var out: [3]SourceEntry = undefined;
     const n = filterConnectedSources(&candidates, &previous, &new_connect_ok, &out);
     try testing.expectEqual(@as(usize, 2), n);
@@ -814,7 +814,7 @@ test "midi_macos: connect 失敗 endpoint は sources に入れず次回再試�
     try testing.expectEqual(@as(c.MIDIEndpointRef, 3), out[1].endpoint);
     try testing.expectEqual(@as(types.MidiDeviceId, 30), out[1].device_id);
 
-    // 失敗した 2 は out に無い → previous として渡さなければ再試行対象
+    // the failed 2 is not in out, so it is retried unless it is passed as previous
     const retry_ok = [_]bool{ true, true, true };
     var out2: [3]SourceEntry = undefined;
     const n2 = filterConnectedSources(&candidates, out[0..n], &retry_ok, &out2);
@@ -822,36 +822,36 @@ test "midi_macos: connect 失敗 endpoint は sources に入れず次回再試�
     try testing.expectEqual(@as(c.MIDIEndpointRef, 2), out2[1].endpoint);
 }
 
-test "midi_macos: packet length > 256 は walk 中断（OOB 防止）" {
+test "midi_macos: a packet length over 256 stops the walk (which prevents an out-of-bounds read)" {
     var state = testState();
-    // 手動で異常 length の packet list を組み立てる（numPackets=2、先頭 length=1000）
+    // Assemble a packet list with a bad length by hand (numPackets=2, the first length=1000)
     var buf: [64]u8 = undefined;
     @memset(&buf, 0);
     std.mem.writeInt(u32, buf[0..4], 2, .little); // numPackets
-    // packet0 @4: timeStamp=0, length=1000 (>256), data 無し相当
+    // packet0 @4: timeStamp=0, length=1000 (>256), effectively no data
     std.mem.writeInt(u16, buf[4 + 8 ..][0..2], 1000, .little);
-    // 後続 packet に note-on を置いても中断で読まれない
-    // （offset 計算はしない＝中断後は触らないので後続内容は不要）
+    // putting a note-on in the following packet does not get it read, the walk having stopped
+    // (no offset is computed: nothing is touched after stopping, so the later content does not matter)
 
     const list: *const c.MIDIPacketList = @ptrCast(@alignCast(&buf));
     parsePacketListIntoRing(&state, list, 0);
     try expectEmpty(&state);
 }
 
-test "midi_macos: client open/close（デバイス無しでも成功）" {
+test "midi_macos: client open and close (succeeding even with no device)" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
     var device = try open(testing.allocator);
-    // イベントが無ければ null（実機が同時に送っていなければ）
-    // ここでは close まで到達することを主眼とする
+    // null when there is no event (unless real hardware is sending at the same time)
+    // the point here is to reach close
     _ = device.pollMidi();
     device.close();
 }
 
-test "midi_macos: pollMidi が dirty 時に reconcile して ring を drain" {
+test "midi_macos: pollMidi reconciles when dirty and drains the ring" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
-    // 実 open して dirty を立て、poll で reconcile が走っても panic しないこと
+    // Really open, raise dirty, and confirm that a reconcile running under poll does not panic
     var device = try open(testing.allocator);
     defer device.close();
     device.state.topology_dirty.store(true, .release);

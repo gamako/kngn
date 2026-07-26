@@ -1,15 +1,15 @@
-//! MIDI facade（TASK-115.1/115.2・ADR-010）。
+//! The MIDI facade (see ADR-010).
 //!
-//! `builtin.os.tag` による実機 backend 選択の継ぎ目。macOS は CoreMIDI（TASK-115.2）、
-//! 他 OS は null backend。harness が有効なときは native backend を開かず、共有 harness
-//! module の synthetic FIFO を main thread からポーリングする。
+//! The seam where the real backend is chosen by `builtin.os.tag`. macOS uses CoreMIDI and
+//! every other OS the null backend. While harness is enabled it does not open a native backend, and instead
+//! polls the shared harness module's synthetic FIFO from the main thread.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("platform_types");
 const harness = @import("harness");
 
-// macOS = CoreMIDI（TASK-115.2）。他 OS / wasm は null。後続 backend はこの comptime 選択点を置き換える。
+// macOS uses CoreMIDI, and every other OS plus wasm uses null. A later backend replaces this comptime choice.
 const backend = if (builtin.cpu.arch.isWasm())
     @import("midi_null.zig")
 else switch (builtin.os.tag) {
@@ -28,7 +28,7 @@ pub const Device = struct {
     inner: ?backend.Device,
     harness_owned: bool,
 
-    /// MIDI イベントを1件取得する。空なら null。harness 時は synthetic FIFO を drain する。
+    /// Takes one MIDI event, or null when there is none. Under harness it drains the synthetic FIFO.
     pub fn pollMidi(self: *Device) ?MidiEvent {
         if (self.harness_owned) {
             if (comptime @hasDecl(harness, "nextMidiEvent")) return harness.nextMidiEvent();
@@ -38,7 +38,7 @@ pub const Device = struct {
         return inner.pollMidi();
     }
 
-    /// 終了処理。null backend と harness device は no-op、native backend は委譲する。
+    /// Teardown. The null backend and the harness device are no-ops, and a native backend is delegated to.
     pub fn close(self: *Device) void {
         if (self.harness_owned) {
             self.harness_owned = false;
@@ -51,7 +51,7 @@ pub const Device = struct {
     }
 };
 
-/// MIDI device を開く。harness/headless 時は native backend を開かない。
+/// Opens a MIDI device. Under harness or headless it does not open a native backend.
 pub fn open(allocator: std.mem.Allocator) Error!Device {
     if (harness.isEnabled() or harness.isHeadlessActive()) {
         return .{ .inner = null, .harness_owned = true };
@@ -59,17 +59,17 @@ pub fn open(allocator: std.mem.Allocator) Error!Device {
     return .{ .inner = try backend.open(allocator), .harness_owned = false };
 }
 
-test "midi facade: harness 無効時は native/null backend を開き close 後も空" {
+test "the midi facade: while harness is disabled it opens the native or null backend, and stays empty after close" {
     if (harness.isEnabled() or harness.isHeadlessActive()) return error.SkipZigTest;
 
     var device = try open(std.testing.allocator);
-    // 実機が同時に送っていなければ null。close 後は facade が inner を外して常に null。
+    // null unless real hardware is sending at the same time. After close the facade detaches inner and it is always null.
     _ = device.pollMidi();
     device.close();
     try std.testing.expectEqual(@as(?MidiEvent, null), device.pollMidi());
 }
 
-test "midi facade: 共有型を facade から再エクスポートする" {
+test "the midi facade: it re-exports the shared types" {
     const ev: MidiEvent = .{ .note_off = .{ .device_id = 0, .note = 127, .velocity = 0 } };
     try std.testing.expectEqual(@as(u8, 127), ev.note_off.note);
 }
