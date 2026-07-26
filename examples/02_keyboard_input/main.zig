@@ -4,11 +4,11 @@ const keyboard = @import("keyboard");
 
 const KeyCode = platform.KeyCode;
 
-// HSV色空間から RGB へ変換
+// Convert HSV to RGB
 fn hsvToRGB(h: f32, s: f32, v: f32) u32 {
     if (s == 0.0) {
         const gray = @as(u32, @intFromFloat(v * 255.0));
-        // canonical BGRA(0xAARRGGBB): gray なので r=g=b、a=0xFF。
+        // canonical BGRA(0xAARRGGBB): gray so r=g=b, a=0xFF.
         return 0xFF000000 | (gray << 16) | (gray << 8) | gray;
     }
 
@@ -55,7 +55,7 @@ fn hsvToRGB(h: f32, s: f32, v: f32) u32 {
     const gi = @as(u32, @intFromFloat(g * 255.0));
     const bi = @as(u32, @intFromFloat(b * 255.0));
 
-    // canonical BGRA(0xAARRGGBB): a=0xFF, r/g/b を各位置へ。
+    // canonical BGRA(0xAARRGGBB): a=0xFF, place r/g/b in each channel.
     return 0xFF000000 | (ri << 16) | (gi << 8) | bi;
 }
 
@@ -97,7 +97,7 @@ pub fn main() !void {
     var brightness: f32 = 0.8;
     var current_color: u32 = hsvToRGB(hue, saturation, brightness);
 
-    // PRNG シードはモノトニック時刻から（OS 非依存。platform.getTime は秒単位 f64）。
+    // PRNG seed from monotonic time (OS-independent; platform.getTime is f64 seconds).
     const seed = @as(u64, @intFromFloat(platform.getTime() * 1_000_000_000.0));
     var prng = std.Random.DefaultPrng.init(seed);
 

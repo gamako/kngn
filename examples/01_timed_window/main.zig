@@ -1,12 +1,12 @@
 const std = @import("std");
 const platform = @import("platform");
 
-// 色補間関数（線形補間）
+// Colour interpolation (linear)
 fn interpolateColor(color1: u32, color2: u32, t: f64) u32 {
     const t_clamped = @min(@max(t, 0.0), 1.0);
 
-    // canonical BGRA(0xAARRGGBB): byte3=A, byte2=R, byte1=G, byte0=B。
-    // 各バイト独立 lerp で位置保存（順序非依存・値は従来と同一、命名のみ BGRA 化）。
+    // canonical BGRA(0xAARRGGBB): byte3=A, byte2=R, byte1=G, byte0=B.
+    // Independent per-byte lerp keeps channel positions (order-independent; values unchanged; rename to BGRA only).
     const a1 = @as(f64, @floatFromInt((color1 >> 24) & 0xFF));
     const r1 = @as(f64, @floatFromInt((color1 >> 16) & 0xFF));
     const g1 = @as(f64, @floatFromInt((color1 >> 8) & 0xFF));
@@ -48,7 +48,7 @@ pub fn main() !void {
     const duration: f64 = 2.0;
 
     main_loop: while (window.pollEvents()) {
-        // pending events を空にしておく（クローズ時にも反応できるように）
+        // Drain pending events (so we still react on close)
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             else => {},

@@ -1,9 +1,9 @@
-// example_17: libs/gui checkbox / toggle(switch) / radio ウィジェット（TASK-48）
+// example_17: libs/gui checkbox / toggle(switch) / radio widgets
 //
-// - checkbox 2 個（bool を反転）+ toggle スイッチ 1 個（ノブが左右に動く）
-// - radio group 3 択（Pen / Eraser / Brush）を caller 管理の排他選択で表示
-// - 現在の状態を下にまとめ Label で出す（クリックで即反映されるのが見える）
-// - いずれも glyph + label の箱全体がクリック域。ESC / Quit で終了。
+// - Two checkboxes (flip a bool) + one toggle switch (knob slides left/right)
+// - 3-way radio group (Pen / Eraser / Brush) with caller-managed exclusive selection
+// - Summary Label below shows current state (updates immediately on click)
+// - The whole glyph + label box is the click target. ESC / Quit to exit.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -22,10 +22,10 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
 
-    // 状態: checkbox 2 個 + toggle 1 個 + radio group（Tool）
+    // State: 2 checkboxes + 1 toggle + radio group (Tool)
     var grid = true;
     var snap = false;
     var keep_transp = true;
@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.label("Toggle (switch):");
         _ = ctx.toggle("Keep Transp", &keep_transp);
 
-        // ── Radio group（caller 管理の排他選択）──
+        // ── Radio group (caller-managed exclusive selection) ──
         ctx.label("Tool (radio):");
         ctx.beginBox(.{ .direction = .row, .gap = 12 });
         if (ctx.radio("Pen", tool == .pen)) tool = .pen;
@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
         if (ctx.radio("Brush", tool == .brush)) tool = .brush;
         ctx.endBox();
 
-        // ── 現在の状態（クリックで即反映されるのが見える）──
+        // ── Current state (updates immediately on click) ──
         const summary = try std.fmt.allocPrint(
             ctx.allocator(),
             "grid={s}  snap={s}  keep_transp={s}  tool={s}",

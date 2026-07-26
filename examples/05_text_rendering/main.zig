@@ -1,9 +1,9 @@
-// === ビットマップフォント (BDF) によるテキストレンダリング デモ ===
+// === Bitmap font (BDF) text rendering demo ===
 //
-// このデモで示すこと:
-// 1. BDF フォントを @embedFile + text.BitmapFont.initFromBdf で読み込む (AC1)
-// 2. 文字列を任意座標 (左上 / 中央 / 改行 / 入力エコー) に描画する (AC2)
-// 3. FpsCounter と組み合わせた実用的なデバッグオーバーレイ (AC3)
+// What this demo shows:
+// 1. Load a BDF font via @embedFile + text.BitmapFont.initFromBdf
+// 2. Draw strings at arbitrary positions (top-left / centre / line breaks / input echo)
+// 3. A practical debug overlay combined with FpsCounter
 
 const std = @import("std");
 const platform = @import("platform");
@@ -71,19 +71,19 @@ pub fn main() !void {
             const fbw_i32: i32 = @intCast(fbw);
             const fbh_i32: i32 = @intCast(fbh);
 
-            // 共通 Font インターフェース経由で描画（TASK-25.14）。RenderTarget + clip + Color。
+            // Draw through the shared Font interface. RenderTarget + clip + Color.
             const f = font.asFont();
             const target = fontmod.RenderTarget{ .pixels = fb.pixels, .width = fbw, .height = fbh };
             const clip = fontmod.Rect{ .x = 0, .y = 0, .w = fbw, .h = fbh };
             const lh: i32 = @intCast(f.metrics().line_height);
-            // 色は明示 API Color.rgba(r,g,b,a) で構築（canonical BGRA 境界変換を明示化）。
+            // Build colours with the explicit API Color.rgba(r,g,b,a) (makes the canonical BGRA boundary conversion explicit).
             const cyan = fontmod.Color.rgba(0x00, 0xFF, 0xFF, 0xFF);
             const white = fontmod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
             const orange = fontmod.Color.rgba(0xFF, 0xCC, 0xAA, 0xFF);
             const gray = fontmod.Color.rgba(0xCC, 0xCC, 0xCC, 0xFF);
             const green = fontmod.Color.rgba(0x66, 0xFF, 0x66, 0xFF);
 
-            // 左上: FPS / dt (シアン)
+            // Top-left: FPS / dt (cyan)
             var fps_buf: [32]u8 = undefined;
             const fps_str = std.fmt.bufPrint(&fps_buf, "FPS: {d}", .{fps_cached}) catch "FPS: ?";
             f.drawTo(target, .{ .x = 8, .y = 8 }, fps_str, cyan, clip, 1.0);
@@ -92,21 +92,21 @@ pub fn main() !void {
             const ms_str = std.fmt.bufPrint(&ms_buf, "MS:  {d:.2}", .{dt * 1000.0}) catch "MS:  ?";
             f.drawTo(target, .{ .x = 8, .y = 8 + lh }, ms_str, cyan, clip, 1.0);
 
-            // 中央: Hello, World! (白)
+            // Centre: Hello, World! (white)
             const greeting = "Hello, World!";
             const tw_i32: i32 = @intCast(f.measure(greeting));
             const cx: i32 = @divFloor(fbw_i32 - tw_i32, 2);
             const cy: i32 = @divFloor(fbh_i32 - lh, 2);
             f.drawTo(target, .{ .x = cx, .y = cy }, greeting, white, clip, 1.0);
 
-            // 改行デモ (薄いオレンジ): drawTo は 1 行ランなので呼び出し側で \n 分割（行レイアウトは上位責務）。
+            // Line-break demo (light orange): drawTo is a single-line run, so the caller splits on LF (line layout is upstream).
             var line_y: i32 = 80;
             var lines = std.mem.splitScalar(u8, "Multi-line\ndemo line 2\nline 3", '\n');
             while (lines.next()) |line| : (line_y += lh) {
                 f.drawTo(target, .{ .x = 8, .y = line_y }, line, orange, clip, 1.0);
             }
 
-            // 下部: 入力エコー (getCharFromKey の対応範囲は A-Z / 0-9)
+            // Bottom: input echo (getCharFromKey covers A-Z / 0-9)
             f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 40 }, "Type letters/digits (BACKSPACE delete, ESC quit):", gray, clip, 1.0);
             f.drawTo(target, .{ .x = 8, .y = fbh_i32 - 20 }, input_buf[0..input_len], green, clip, 1.0);
 

@@ -1,17 +1,17 @@
-//! example_07: マウス入力デモ (TASK-21.1)
+//! example_07: mouse input demo
 //!
-//! 検証項目:
-//! - 左クリックドラッグで線描画 (前回座標から Bresenham 補間)
-//! - 右クリックドラッグで消去 (補間して消去)
-//! - middle ボタン押下時に十字マーカー
-//! - ボタン未押下 (hover) で 1px ハイライト
-//! - scroll で背景色 (HSV hue) 変化、is_precise/dx/dy ログ
-//! - mouse_down/up でカーソル位置・押下ボタン・buttons_mask・modifier ログ
-//!   - Control+左クリック時に button=left, modifiers.ctrl=true となることを確認
-//! - フレームごとに EventStats Δ をログ (合体・drop 確認)
+//! Checks:
+//! - Left-drag draws a line (Bresenham interpolation from the previous point)
+//! - Right-drag erases (interpolated erase)
+//! - Middle button down draws a cross marker
+//! - No button down (hover): 1px highlight
+//! - Scroll changes background colour (HSV hue); logs is_precise/dx/dy
+//! - mouse_down/up logs cursor position, pressed button, buttons_mask, modifiers
+//!   - With Control+left click, confirm button=left and modifiers.ctrl=true
+//! - Log EventStats Δ each frame (merge / drop)
 //!
-//! 座標系: マウス座標は window 座標 (= window contentRect 左上原点・logical 単位)。
-//! framebuffer/canvas 変換は caller 責任 (本 example では windowToCanvas は identity transform)。
+//! Coordinates: mouse coords are window coords (= top-left of window contentRect, logical units).
+//! framebuffer/canvas conversion is the caller's job (windowToCanvas is identity in this example).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -36,20 +36,20 @@ const State = struct {
     hue: f32, // 0..360
 
     fn clearOverlay(self: *State) void {
-        // hover/cross は毎フレーム再描画前にクリアするため、シンプルに全 fb を bg で塗り直すのではなく、
-        // 線描画は残しつつ overlay (hover, cross) のみ瞬間表示にする。
-        // ここでは「描画レイヤー」を持たない単純実装として、毎フレーム背景クリア → 線を再描画する代わりに、
-        // 線描画は累積、hover/cross は別オーバーレイ画像で扱うのが理想だが、
-        // example の単純さ優先で「線描画は永続、hover/cross はその場で描く」とする。
+        // hover/cross are cleared before each redraw, so rather than filling the whole fb with bg,
+        // keep the line drawing and show overlay (hover, cross) only momentarily.
+        // Ideal would be a draw layer with accumulated lines and a separate overlay for hover/cross;
+        // this example skips that for simplicity:
+        // lines persist; hover/cross are drawn in place.
         _ = self;
     }
 };
 
 const Point = struct { x: i32, y: i32 };
 
-/// caller-side の window → canvas 座標変換 (今は identity transform)。
-/// 将来 framebuffer/display 分離 (zoom/pan/clip 等) が入ったら、
-/// この関数を差し替えるだけで対応できる構造。
+/// Caller-side window → canvas coordinate transform (identity for now).
+/// When framebuffer/display separation (zoom/pan/clip etc.) arrives later,
+/// swapping this function is enough.
 fn windowToCanvas(p: Point) Point {
     return p;
 }
@@ -60,7 +60,7 @@ fn setPixel(fb: []u32, w: i32, h: i32, x: i32, y: i32, color: u32) void {
     fb[idx] = color;
 }
 
-/// Bresenham 線分補間: (x0, y0) から (x1, y1) まで色 c で線を引く
+/// Bresenham line: draw colour c from (x0, y0) to (x1, y1)
 fn drawLine(fb: []u32, w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, c: u32) void {
     var x = x0;
     var y = y0;
@@ -175,7 +175,7 @@ pub fn main() !void {
     var window = try platform.Window.create(WINDOW_W, WINDOW_H, "07 - Mouse Input");
     defer window.destroy();
 
-    // 描画状態 (線描画は累積、hover/cross は単発)
+    // Drawing state (lines accumulate; hover/cross are one-shot)
     var fb_storage: [WINDOW_W * WINDOW_H]u32 = undefined;
     @memset(fb_storage[0..], COLOR_BG_DEFAULT);
 
@@ -188,7 +188,7 @@ pub fn main() !void {
         .last_left = null,
         .last_right = null,
         .cross = null,
-        .hue = 240.0, // 初期 hue
+        .hue = 240.0, // Initial hue
     };
 
     var prev_stats = window.getEventStats();
@@ -199,10 +199,10 @@ pub fn main() !void {
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
             .key_up => {},
             .char_input => {},
-            .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 example 未消費（cross-cutting Event 追加）
-            .composition_changed => {}, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-            .menu_command => {}, // TASK-97.1: app の共通 dispatch 入口で消費
-            .file_drop => {}, // TASK-113.4: 本 example 未消費
+            .gamepad_connected, .gamepad_disconnected => {}, // Unused in this example (cross-cutting Event)
+            .composition_changed => {}, // composition unused (inline preedit lives elsewhere)
+            .menu_command => {}, // Consumed at the app's common dispatch entry
+            .file_drop => {}, // Unused in this example
             .mouse_move => |m| {
                 const canvas = windowToCanvas(.{ .x = m.x, .y = m.y });
                 if (m.buttons.left) {
@@ -220,11 +220,11 @@ pub fn main() !void {
                     }
                     state.last_right = canvas;
                 }
-                // middle 押下中なら cross 位置を最新追従
+                // While middle is held, track the cross to the latest position
                 if (m.buttons.middle) {
                     state.cross = canvas;
                 }
-                // hover は「いずれのボタンも押されていない」ときのみ更新 (排他)
+                // hover updates only when no button is down (exclusive)
                 if (!m.buttons.left and !m.buttons.right and !m.buttons.middle) {
                     state.hover = canvas;
                     state.last_left = null;
@@ -237,7 +237,7 @@ pub fn main() !void {
                 const canvas = windowToCanvas(.{ .x = m.x, .y = m.y });
                 var mod_buf: [64]u8 = undefined;
                 const mods = modifierStr(&mod_buf, m.modifiers);
-                // button ∈ buttons_mask の検証ログ
+                // Verification log: button ∈ buttons_mask
                 const bit_set: u8 = switch (m.button) {
                     .left => if (m.buttons.left) 1 else 0,
                     .right => if (m.buttons.right) 1 else 0,
@@ -250,14 +250,14 @@ pub fn main() !void {
                 if (m.button == .left) state.last_left = canvas;
                 if (m.button == .right) state.last_right = canvas;
                 if (m.button == .middle) state.cross = canvas;
-                // 何かボタンが押されたら hover は隠す (排他表示)
+                // Hide hover when any button is pressed (exclusive display)
                 state.hover = null;
             },
             .mouse_up => |m| {
                 const canvas = windowToCanvas(.{ .x = m.x, .y = m.y });
                 var mod_buf: [64]u8 = undefined;
                 const mods = modifierStr(&mod_buf, m.modifiers);
-                // button ∉ buttons_mask の検証ログ
+                // Verification log: button ∉ buttons_mask
                 const bit_set: u8 = switch (m.button) {
                     .left => if (m.buttons.left) 1 else 0,
                     .right => if (m.buttons.right) 1 else 0,
@@ -271,7 +271,7 @@ pub fn main() !void {
                 if (m.button == .left) state.last_left = null;
                 if (m.button == .right) state.last_right = null;
                 if (m.button == .middle) state.cross = null;
-                // 全ボタン解放されたら hover を即座に復活 (次の mouse_move を待たない)
+                // On full button release, restore hover immediately (do not wait for the next mouse_move)
                 if (!m.buttons.left and !m.buttons.right and !m.buttons.middle) {
                     state.hover = canvas;
                 }
@@ -282,15 +282,15 @@ pub fn main() !void {
                 std.debug.print("[SCROLL    ] precise={any} dx={d:.1} dy={d:.1} @ ({d},{d}) hue={d:.1}\n", .{
                     s.is_precise, s.dx, s.dy, s.x, s.y, state.hue,
                 });
-                // 背景塗り直し (線描画は失われるが scroll で背景変化のデモなので OK)
+                // Repaint the background (lines are lost; OK for a scroll background-change demo)
                 @memset(state.fb, state.bg_color);
             },
         };
 
-        // 描画: framebuffer に state を反映
+        // Draw: reflect state onto the framebuffer
         if (window.lockFramebuffer()) |fb| {
             defer fb.unlock();
-            // 線描画は state.fb に既に書かれているのでコピー
+            // Lines are already in state.fb, so copy them
             @memcpy(fb.pixels, state.fb);
             // overlay: hover marker
             if (state.hover) |p| {
@@ -303,7 +303,7 @@ pub fn main() !void {
             window.present();
         }
 
-        // EventStats Δ ログ (合体・drop の客観確認)
+        // EventStats Δ log (objective check of merge / drop)
         const stats = window.getEventStats();
         const d_move = stats.mouse_move_merge_count - prev_stats.mouse_move_merge_count;
         const d_scroll = stats.mouse_scroll_merge_count - prev_stats.mouse_scroll_merge_count;

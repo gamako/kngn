@@ -1,11 +1,11 @@
-// example_14: libs/gui HSV カラーピッカー（TASK-21.14）
+// example_14: libs/gui HSV colour picker
 //
-// - 2D SV スクエア（saturation×value）+ 縦 Hue バー
-// - H/S/V を数値 Slider（21.9）でも編集（双方向に反映）
-// - 選択色プレビュー矩形
-// - Reset で初期値へ
+// - 2D SV square (saturation×value) + vertical Hue bar
+// - H/S/V also editable via numeric Sliders (reflect both ways)
+// - Selected-colour preview rect
+// - Reset restores the initial values
 //
-// SV スクエア/Hue バーは固定 px（dl.image の制約）。ウィンドウ幅変更でも widget は崩れない。
+// SV square / Hue bar are fixed px (dl.image constraint). Widgets stay intact when the window width changes.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -24,10 +24,10 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
 
         ctx.label("HSV Color Picker");
 
-        // SV スクエア + Hue バー + プレビュー
+        // SV square + Hue bar + preview
         ctx.beginBox(.{ .direction = .row, .gap = 10, .align_cross = .start });
         _ = ctx.svSquareId(0x6001, hue, &s, &v, .{});
         _ = ctx.hueBarId(0x6002, &hue, .{});
@@ -117,11 +117,11 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
         ctx.endBox();
 
-        // 数値 Slider（双方向）
+        // Numeric Sliders (bidirectional)
         _ = ctx.sliderF32Id(0x6003, "H", &hue, .{ .min = 0, .max = 360, .step = 1 });
         _ = ctx.sliderF32Id(0x6004, "S", &s, .{ .min = 0, .max = 1, .step = 0.01 });
         _ = ctx.sliderF32Id(0x6005, "V", &v, .{ .min = 0, .max = 1, .step = 0.01 });
-        hue = @min(hue, 360 - 1e-3); // hueBar と同じ [0,360) 契約に正規化（H slider が 360 を入れ得る）
+        hue = @min(hue, 360 - 1e-3); // Normalise to the same [0,360) contract as hueBar (the H slider can enter 360)
 
         const summary = try std.fmt.allocPrint(
             ctx.allocator(),

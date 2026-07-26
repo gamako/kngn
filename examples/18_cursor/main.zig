@@ -1,18 +1,18 @@
-//! 18_cursor: システムカーソル形状の切替サンプル (TASK-75.1)
+//! 18_cursor: sample for switching system cursor shapes
 //!
-//! platform.CursorShape + window.setCursor() の動作確認用。02_keyboard_input を土台にした
-//! 最小サンプルで、キー入力でカーソル形状を切り替える:
-//!   - 1: default（矢印）
-//!   - 2: crosshair（十字）
-//!   - 0: hidden（非表示）
+//! For checking platform.CursorShape + window.setCursor(). Built on 02_keyboard_input as a
+//! minimal sample that switches cursor shape from key input:
+//!   - 1: default (arrow)
+//!   - 2: crosshair
+//!   - 0: hidden
 //!
-//! 実際のOSカーソル形状はframebufferに写らないため、状態ごとに背景色も変える。これにより
-//! headless replay（VP_HEADLESS）でも「setCursor呼び出しを含む状態遷移がクラッシュせず
-//! 動作する」ことを fb digest で確認できる（AC#3 の自動化可能な範囲）。OSカーソルの実際の見た目
-//! （矢印/十字/非表示）は手動目視で確認する（AC#2。ヘッドレスでは検証不可）。
+//! The real OS cursor is not captured in the framebuffer, so the background colour also changes per state. That lets
+//! headless replay (VP_HEADLESS) confirm via fb digest that "state transitions including setCursor do not crash and
+//! still run" (the automatable part). The real OS cursor look
+//! (arrow/crosshair/hidden) is confirmed by manual visual check (not verifiable headless).
 //!
-//! ホットパス宣言: setCursor 呼び出しはキー入力イベント時のみ（フレーム毎の全画素ループでも
-//! RTオーディオ経路でもない）。性能規約の適用対象外。
+//! Hot path declaration: setCursor runs only on key-input events (neither a per-frame all-pixel loop nor an
+//! RT audio path). Outside the performance-rules scope.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -20,12 +20,12 @@ const platform = @import("platform");
 const KeyCode = platform.KeyCode;
 const CursorShape = platform.CursorShape;
 
-// カーソル形状ごとの背景色（canonical BGRA, u32 0xAARRGGBB）。実カーソルの代わりに状態を可視化する。
+// Background colour per cursor shape (canonical BGRA, u32 0xAARRGGBB). Visualises state in place of the real cursor.
 fn backgroundColorFor(shape: CursorShape) u32 {
     return switch (shape) {
-        .default => 0xFF303030, // 濃い灰色
-        .crosshair => 0xFF1E3A5F, // 濃い青
-        .hidden => 0xFF000000, // 黒
+        .default => 0xFF303030, // Dark grey
+        .crosshair => 0xFF1E3A5F, // Dark blue
+        .hidden => 0xFF000000, // Black
     };
 }
 

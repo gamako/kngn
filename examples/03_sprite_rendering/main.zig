@@ -2,7 +2,7 @@ const std = @import("std");
 const platform = @import("platform");
 const sprite = @import("sprite");
 
-// コンパイル時にPNGファイルを埋め込み
+// Embed the PNG file at compile time
 const usako_png = @embedFile("image/usako.png");
 
 pub fn main() !void {

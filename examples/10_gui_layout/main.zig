@@ -1,17 +1,17 @@
-// example_10: libs/gui Flex レイアウトエンジン（TASK-21.4）
+// example_10: libs/gui Flex layout engine
 //
-// - ツールバー: fit 箱 3 + grow スペーサ + fit 箱 2（ウィンドウ幅に追従して再フロー）
-// - 3 カラム: fixed 200 / grow / fixed 240
-// - ネスト box の padding / gap
-// - clip_children: 長いテキストが枠でクリップされる
-// - 明示 ID + getNodeRect + buttonBehavior による「前フレーム rect の同期 hit-test」デモ
-//   （widget 層は 21.5 で実装するため、ここでは生 API を組み合わせる）
+// - Toolbar: 3 fit boxes + grow spacer + 2 fit boxes (reflows with window width)
+// - 3 columns: fixed 200 / grow / fixed 240
+// - Nested box padding / gap
+// - clip_children: long text is clipped by the frame
+// - Explicit ID + getNodeRect + buttonBehavior demo of "sync hit-test against previous-frame rect"
+//   (widget layer lands later; this sample composes the raw APIs)
 
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 
-/// platform.MouseButton → InputEvent の button index（0=left/1=right/2=middle）。
+/// platform.MouseButton → InputEvent button index (0=left/1=right/2=middle).
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
         .left => 0,
@@ -21,16 +21,16 @@ fn buttonToU8(b: platform.MouseButton) u8 {
     };
 }
 
-/// platform.Event → gui.InputEvent。GUI に関係しない quit は null。
-/// key の負値（platform KeyCode.UNKNOWN = -1）は捨てる（libs/gui は u32 code 前提）。
+/// platform.Event → gui.InputEvent. quit (irrelevant to GUI) becomes null.
+/// Discard negative key codes (platform KeyCode.UNKNOWN = -1); libs/gui expects u32 codes.
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -48,7 +48,7 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     };
 }
 
-/// fit サイズのツールバー項目（見た目だけの箱。インタラクションなし）。
+/// Fit-sized toolbar item (visual box only; no interaction).
 fn toolItem(ctx: *gui.Context, name: []const u8) void {
     ctx.beginBox(.{
         .padding = .{ 6, 10, 6, 10 },
@@ -97,8 +97,8 @@ pub fn main(init: std.process.Init) !void {
         };
         const full_clip = gui.Rect{ .x = 0, .y = 0, .w = fb.width, .h = fb.height };
 
-        // ── 同期 hit-test: 前フレームの rect キャッシュで widget 呼び出し時に判定 ──
-        // （初回フレームは rect 未確定なので非ヒット扱い）
+        // ── Sync hit-test: decide at widget call time from the previous-frame rect cache ──
+        // (First frame has no rect yet, so treated as a miss)
         const btn_id = ctx.id_stack.make("demo_button");
         var btn_res: gui.ButtonResult = .{};
         if (ctx.getNodeRect(btn_id)) |prev_rect| {
@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (btn_res.clicked) click_count += 1;
 
-        // ── ツールバー: fit 3 + grow スペーサ + fit 2 ──
+        // ── Toolbar: fit 3 + grow spacer + fit 2 ──
         ctx.beginBox(.{
             .direction = .row,
             .width = .{ .grow = 1 },
@@ -117,13 +117,13 @@ pub fn main(init: std.process.Init) !void {
         toolItem(&ctx, "New");
         toolItem(&ctx, "Open");
         toolItem(&ctx, "Save");
-        ctx.beginBox(.{ .width = .{ .grow = 1 } }); // スペーサ
+        ctx.beginBox(.{ .width = .{ .grow = 1 } }); // Spacer
         ctx.endBox();
         toolItem(&ctx, "Help");
         toolItem(&ctx, "Quit");
         ctx.endBox();
 
-        // ── 3 カラム: fixed 200 / grow / fixed 240 ──
+        // ── 3 columns: fixed 200 / grow / fixed 240 ──
         ctx.beginBox(.{
             .direction = .row,
             .width = .{ .grow = 1 },
@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
             .gap = 8,
         });
 
-        // 左ペイン（fixed 200）: ネスト box の padding / gap デモ
+        // Left pane (fixed 200): nested box padding / gap demo
         ctx.beginBox(.{
             .width = .{ .fixed = 200 },
             .height = .{ .grow = 1 },
@@ -152,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
         ctx.endBox();
 
-        // 中央（grow）: clip デモ + hit-test デモボタン
+        // Centre (grow): clip demo + hit-test demo button
         ctx.beginBox(.{
             .width = .{ .grow = 1 },
             .height = .{ .grow = 1 },
@@ -162,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
         });
         ctx.label("center (grow)");
 
-        // clip_children: 長文が 200x28 の枠でクリップされる
+        // clip_children: long text is clipped by a 200x28 frame
         ctx.beginBox(.{
             .width = .{ .fixed = 200 },
             .height = .{ .fixed = 28 },
@@ -173,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.label("clipped: this long text does not escape the box ----");
         ctx.endBox();
 
-        // 明示 ID のボタン箱（hover/held で bg 変化、クリックでカウンタ）
+        // Explicit-ID button box (bg changes on hover/held; click increments a counter)
         const btn_bg = if (btn_res.held)
             gui.Color.rgba(0x30, 0x60, 0xC0, 0xFF)
         else if (ctx.state.hot_id == btn_id)
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
         ctx.endBox();
 
-        // 右ペイン（fixed 240）: align_cross = center
+        // Right pane (fixed 240): align_cross = center
         ctx.beginBox(.{
             .width = .{ .fixed = 240 },
             .height = .{ .grow = 1 },
@@ -204,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.label("center");
         ctx.endBox();
 
-        ctx.endBox(); // 3 カラム
+        ctx.endBox(); // 3 columns
 
         ctx.endFrame();
 

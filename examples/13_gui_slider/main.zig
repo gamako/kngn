@@ -1,11 +1,11 @@
-// example_13: libs/gui Slider ウィジェット（TASK-21.9）
+// example_13: libs/gui Slider widget
 //
-// - sliderI32 2 本（Size 1..64 / Opacity 0..255）+ sliderF32 2 本（Hue 0..360 step1 / Alpha 0..1 step0.05）
-// - 各 slider の現在値は widget 自身が右側に数値表示する。下にまとめ Label も出す。
-// - Reset ボタンで全 slider を初期値へ戻す。
-// - drag は knob を掴んで左右に動かす（track だけクリックでは飛ばない = AC#4）。
+// - Two sliderI32 (Size 1..64 / Opacity 0..255) + two sliderF32 (Hue 0..360 step1 / Alpha 0..1 step0.05)
+// - Each slider shows its value on the right; a summary Label sits below.
+// - Reset restores every slider to its initial value.
+// - Drag moves the knob left/right (clicking the track alone does not jump).
 //
-// リサイズ再フローは毎フレーム fb サイズから行う。track は固定幅なので幅変更で崩れない。
+// Reflow on resize uses the fb size every frame. The track is fixed-width so width changes do not break it.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -24,10 +24,10 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },

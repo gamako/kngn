@@ -3,7 +3,7 @@ const platform = @import("platform");
 const gui = @import("gui");
 const png = @import("png");
 
-// サンプル画像: 16x16 RGBA PNG を libs/png でデコードして image blit する
+// Sample image: decode a 16x16 RGBA PNG with libs/png and blit it
 const sample_png = @embedFile("sample.png");
 
 pub fn main(init: std.process.Init) !void {
@@ -18,13 +18,13 @@ pub fn main(init: std.process.Init) !void {
     var draw_list = gui.DrawList.init(gpa);
     defer draw_list.deinit();
 
-    // PNG をデコード（straight alpha canonical BGRA = 0xAARRGGBB、libs/gui の image と同フォーマット）
+    // Decode the PNG (straight-alpha canonical BGRA = 0xAARRGGBB; same format as libs/gui image)
     var sample_img = try png.decodePNG(gpa, sample_png);
     defer sample_img.deinit(gpa);
     const img_w = sample_img.width;
     const img_h = sample_img.height;
 
-    // 文字列リテラルは static lifetime なので DrawList より長命（text/image の借用契約を満たす）
+    // String literals have static lifetime so they outlive DrawList (satisfies text/image borrow rules)
     const help_text: []const u8 = "ESC: quit  / libs-gui Phase1+2 demo";
 
     main_loop: while (window.pollEvents()) {
@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
 
-        // 背景クリア（ダークグレー）
+        // Clear background (dark grey)
         @memset(fb.pixels, 0xFF_20_20_20);
 
         const target: gui.RenderTarget = .{
@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .x = 10, .y = 10, .w = 120, .h = 80 },
             gui.Color.rgba(0xFF, 0x40, 0x40, 0xFF),
         );
-        // 半透明で重ね合わせ
+        // Overlay with translucency
         try draw_list.rectFilled(
             .{ .x = 60, .y = 40, .w = 120, .h = 80 },
             gui.Color.rgba(0x40, 0x40, 0xFF, 0x80),
@@ -74,22 +74,22 @@ pub fn main(init: std.process.Init) !void {
             4,
         );
 
-        // ── line: 水平・垂直・斜め ─────────────────────
-        // 水平
+        // ── line: horizontal / vertical / diagonal ─────────────────────
+        // Horizontal
         try draw_list.line(
             .{ .x = 10, .y = 120 },
             .{ .x = 480, .y = 120 },
             gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
             1,
         );
-        // 垂直
+        // Vertical
         try draw_list.line(
             .{ .x = 490, .y = 10 },
             .{ .x = 490, .y = 200 },
             gui.Color.rgba(0xFF, 0x80, 0x00, 0xFF),
             1,
         );
-        // 斜め（任意角度、Bresenham）
+        // Diagonal (arbitrary angle, Bresenham)
         try draw_list.line(
             .{ .x = 10, .y = 140 },
             .{ .x = 480, .y = 200 },
@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
         // ── text ──────────────────────────────────────
         try draw_list.text(
             .{ .x = 10, .y = 220 },
-            "libs/gui TASK-21.3: Hello, World!",
+            "libs/gui: Hello, World!",
             gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
         );
         try draw_list.text(
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         );
 
         // ── image blit ─────────────────────────────────
-        // デコードした PNG（16x16）を 3 か所に配置
+        // Place the decoded PNG (16x16) in 3 spots
         try draw_list.image(
             .{ .x = 10, .y = 270, .w = img_w, .h = img_h },
             sample_img.pixels,
@@ -137,13 +137,13 @@ pub fn main(init: std.process.Init) !void {
         );
 
         // ── clip demo ──────────────────────────────────
-        // clip rect のアウトラインを描画
+        // Draw the clip-rect outline
         try draw_list.rectOutline(
             .{ .x = 9, .y = 319, .w = 202, .h = 102 },
             gui.Color.rgba(0xFF, 0xFF, 0x00, 0xFF),
             1,
         );
-        // clip を設定して大きめの rect を描画 → clip 外はみ出さない
+        // Set clip and draw a larger rect → must not spill outside the clip
         try draw_list.pushClip(.{ .x = 10, .y = 320, .w = 200, .h = 100 });
         try draw_list.rectFilled(
             .{ .x = -20, .y = 310, .w = 300, .h = 150 },

@@ -1,19 +1,19 @@
-// === Fixed TimeStep デモ ===
+// === Fixed TimeStep demo ===
 //
-// このデモで示すこと:
-// 1. 論理更新を60Hz固定で実行（フレームレートに依存しない安定した物理シミュレーション）
-// 2. alpha補間により滑らかな描画
+// What this demo shows:
+// 1. Logical updates run at a fixed 60Hz (stable physics independent of frame rate)
+// 2. Smooth drawing via alpha interpolation
 //
-// 注意: 補間により描画位置は最大1論理フレーム（約16.7ms）遅れる。
-// これは滑らかさとのトレードオフであり、通常のアプリでは問題にならない。
-// 遅延を避けたい場合は、補間を使わず最新の論理位置をそのまま描画することも可能。
+// Note: interpolation delays the drawn position by at most 1 logical frame (~16.7ms).
+// That is a smoothness trade-off and is fine for ordinary apps.
+// To avoid the lag, skip interpolation and draw the latest logical position as-is.
 
 const std = @import("std");
 const platform = @import("platform");
 const FixedTimeStep = @import("fixed_timestep").FixedTimeStep;
 const FpsCounter = @import("fps_counter").FpsCounter;
 
-// ボールの物理状態
+// Ball physics state
 const Ball = struct {
     x: f64,
     y: f64,
@@ -21,7 +21,7 @@ const Ball = struct {
     vy: f64,
     radius: f64,
 
-    // 前フレームの位置（補間用）
+    // Previous-frame position (for interpolation)
     prev_x: f64,
     prev_y: f64,
 
@@ -43,15 +43,15 @@ const Ball = struct {
     }
 
     fn update(self: *Ball, dt: f64, width: f64, height: f64) void {
-        // 重力
+        // Gravity
         const gravity: f64 = 500.0;
         self.vy += gravity * dt;
 
-        // 位置更新
+        // Position update
         self.x += self.vx * dt;
         self.y += self.vy * dt;
 
-        // 壁との衝突
+        // Wall collisions
         if (self.x - self.radius < 0) {
             self.x = self.radius;
             self.vx = -self.vx * 0.9;
@@ -78,7 +78,7 @@ const Ball = struct {
     }
 };
 
-// 円を描画
+// Draw a circle
 fn drawCircle(pixels: []u32, width: usize, height: usize, cx: i32, cy: i32, radius: i32, color: u32) void {
     const r2 = radius * radius;
     var y: i32 = -radius;
@@ -99,9 +99,9 @@ fn drawCircle(pixels: []u32, width: usize, height: usize, cx: i32, cy: i32, radi
 
 pub fn main() !void {
     std.debug.print("=== Fixed TimeStep Demo ===\n", .{});
-    std.debug.print("論理更新: 60Hz固定 (物理シミュレーション)\n", .{});
-    std.debug.print("描画目標: 60FPS\n", .{});
-    std.debug.print("ボールが安定した物理動作で跳ねます\n\n", .{});
+    std.debug.print("Logical update: fixed 60Hz (physics)\n", .{});
+    std.debug.print("Draw target: 60FPS\n", .{});
+    std.debug.print("The ball bounces with stable physics\n\n", .{});
 
     try platform.init();
     defer platform.shutdown();
@@ -116,13 +116,13 @@ pub fn main() !void {
     };
     defer window.destroy();
 
-    // 論理更新: 60Hz固定（物理シミュレーション用）
+    // Logical update: fixed 60Hz (for physics)
     var timestep = FixedTimeStep.init(60.0);
 
-    // 描画: 目標60FPS（別の値として定義）
+    // Drawing: target 60FPS (defined as a separate value)
     const target_frame_time: f64 = 1.0 / 60.0;
 
-    // ボールの初期化
+    // Initialise the ball
     var ball = Ball.init(400.0, 100.0, 200.0, 0.0, 20.0);
 
     var last_time = platform.getTime();
@@ -141,13 +141,13 @@ pub fn main() !void {
         const frame_time = current_time - last_time;
         last_time = current_time;
 
-        // FPS計測
+        // FPS measurement
         if (fps_counter.update(frame_time)) {
             std.debug.print("FPS: {d}, Updates/sec: {d}\n", .{ fps_counter.getFps(), update_count });
             update_count = 0;
         }
 
-        // 固定タイムステップで論理更新
+        // Logical update on a fixed timestep
         const steps = timestep.update(frame_time);
         for (0..steps) |_| {
             ball.savePosition();
@@ -162,16 +162,16 @@ pub fn main() !void {
             const w: usize = fb.width;
             const h: usize = fb.height;
 
-            @memset(fb.pixels, 0xFF1A1A2E); // canonical BGRA: 濃紺背景 (r=1A,g=1A,b=2E)
+            @memset(fb.pixels, 0xFF1A1A2E); // canonical BGRA: dark navy background (r=1A,g=1A,b=2E)
 
             const draw_x = @as(i32, @intFromFloat(ball.interpolatedX(alpha)));
             const draw_y = @as(i32, @intFromFloat(ball.interpolatedY(alpha)));
-            drawCircle(fb.pixels, w, h, draw_x, draw_y, 20, 0xFFFF6B6B); // canonical BGRA: コーラル (r=FF,g=6B,b=6B)
+            drawCircle(fb.pixels, w, h, draw_x, draw_y, 20, 0xFFFF6B6B); // canonical BGRA: coral (r=FF,g=6B,b=6B)
 
             window.present();
         }
 
-        // フレームレート制御（処理時間を考慮したスリープ）
+        // Frame-rate control (sleep accounting for processing time)
         const process_time = platform.getTime() - current_time;
         const sleep_time = target_frame_time - process_time;
         if (sleep_time > 0) {

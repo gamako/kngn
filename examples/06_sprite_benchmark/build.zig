@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
 
-    // sprite/blend の共有ブレンド実装（TASK-51）
+    // Shared blend implementation for sprite/blend
     const pixelops = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
     });
@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
-        // harness(platform→harness→png) と sprite で png module を共有する（二重化回避。TASK-32.2）。
+        // Share one png module between harness(platform→harness→png) and sprite (avoid duplicating it).
         .png_module = png,
         .extra = &.{
             .{ .name = "sprite", .module = sprite },

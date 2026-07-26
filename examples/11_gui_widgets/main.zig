@@ -1,18 +1,18 @@
-// example_11: libs/gui 基本ウィジェット（TASK-21.5）
+// example_11: libs/gui basic widgets
 //
-// - ツールバー: button 3 個 + grow スペーサ + button 2 個（Quit は実際に終了する）
-// - Pen / Eraser: buttonEx(selected) によるツール選択トグル表示
-// - DB16 パレット: colorSwatchId の 4x4 グリッド。クリックで選択、選択中は太枠
-// - 半透明 swatch: チェック柄 + blend のデモ
-// - カウンタ: button クリックで +1（Label 表示更新）
+// - Toolbar: 3 buttons + grow spacer + 2 buttons (Quit actually exits)
+// - Pen / Eraser: tool-selection toggle via buttonEx(selected)
+// - DB16 palette: 4x4 grid of colorSwatchId. Click to select; selection gets a thick border
+// - Translucent swatch: checkerboard + blend demo
+// - Counter: button click increments (+1) and updates the Label
 //
-// リサイズ再フローは毎フレーム fb サイズから行う（最終確認は TASK-23 完了後）。
+// Reflow on resize uses the fb size every frame.
 
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 
-/// platform.MouseButton → InputEvent の button index（0=left/1=right/2=middle）。
+/// platform.MouseButton → InputEvent button index (0=left/1=right/2=middle).
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
         .left => 0,
@@ -22,16 +22,16 @@ fn buttonToU8(b: platform.MouseButton) u8 {
     };
 }
 
-/// platform.Event → gui.InputEvent。GUI に関係しない quit は null。
-/// key の負値（platform KeyCode.UNKNOWN = -1）は捨てる（libs/gui は u32 code 前提）。
+/// platform.Event → gui.InputEvent. quit (irrelevant to GUI) becomes null.
+/// Discard negative key codes (platform KeyCode.UNKNOWN = -1); libs/gui expects u32 codes.
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -49,7 +49,7 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     };
 }
 
-/// DawnBringer 16 パレット（0xRRGGBB）。
+/// DawnBringer 16 palette (0xRRGGBB).
 const db16 = [16]u32{
     0x000000, 0x442434, 0x30346D, 0x4E4A4E,
     0x854C30, 0x346524, 0xD04648, 0x757161,
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
 
     var click_count: u32 = 0;
     var tool: Tool = .pen;
-    var selected_color: usize = 6; // DB16 の赤
+    var selected_color: usize = 6; // DB16 red
     var running = true;
 
     main_loop: while (running and window.pollEvents()) {
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
             .height = fb.height,
         };
 
-        // ── ツールバー: button 3 + grow スペーサ + button 2（AC#5） ──
+        // ── Toolbar: button 3 + grow spacer + button 2 ──
         ctx.beginBox(.{
             .direction = .row,
             .width = .{ .grow = 1 },
@@ -116,13 +116,13 @@ pub fn main(init: std.process.Init) !void {
         if (ctx.button("New")) click_count += 1;
         if (ctx.button("Open")) click_count += 1;
         if (ctx.button("Save")) click_count += 1;
-        ctx.beginBox(.{ .width = .{ .grow = 1 } }); // スペーサ
+        ctx.beginBox(.{ .width = .{ .grow = 1 } }); // Spacer
         ctx.endBox();
         if (ctx.button("Help")) click_count += 1;
         if (ctx.button("Quit")) running = false;
         ctx.endBox();
 
-        // ── コンテンツ行: 左 = ツール / カウンタ、右 = パレット ──
+        // ── Content row: left = tools / counter, right = palette ──
         ctx.beginBox(.{
             .direction = .row,
             .width = .{ .grow = 1 },
@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
             .gap = 12,
         });
 
-        // 左ペイン: ツール選択（selected トグル表示）とカウンタ
+        // Left pane: tool selection (selected toggle) and counter
         ctx.beginBox(.{
             .width = .{ .fixed = 220 },
             .height = .{ .grow = 1 },
@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.label(count_txt);
         ctx.endBox();
 
-        // 右ペイン: DB16 パレット（4x4）+ 半透明デモ
+        // Right pane: DB16 palette (4x4) + translucent demo
         ctx.beginBox(.{
             .padding = .{ 8, 8, 8, 8 },
             .gap = 6,
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
         ctx.endBox();
 
-        ctx.endBox(); // コンテンツ行
+        ctx.endBox(); // Content row
 
         ctx.endFrame();
 

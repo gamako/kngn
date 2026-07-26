@@ -1,9 +1,9 @@
-// example_16: libs/gui 縦横スクロール領域（TASK-46）
+// example_16: libs/gui vertical/horizontal scroll area
 //
-// - viewport より大きい 12x12 グリッドを beginScrollArea/endScrollArea に入れる。
-// - 縦横ホイールでスクロール、両軸スクロールバー thumb のドラッグでもスクロール。
-// - 各セルは座標ラベル付き（どの範囲が見えているか snapshot で分かる）。
-// - 左上 0,0 / 右下 11,11 まで到達できることがスクロール動作の確認になる。
+// - Put a 12x12 grid larger than the viewport inside beginScrollArea/endScrollArea.
+// - Scroll with vertical/horizontal wheel, or by dragging either scrollbar thumb.
+// - Each cell has a coordinate label (so a snapshot shows which range is visible).
+// - Reaching top-left 0,0 and bottom-right 11,11 confirms scroll behaviour.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -22,10 +22,10 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         );
         ctx.label(header);
 
-        // 縦横スクロール領域: viewport より大きい 12x12 グリッド
+        // Vertical/horizontal scroll area: 12x12 grid larger than the viewport
         ctx.beginScrollArea(SCROLL_ID, &scroll, .{
             .width = .{ .grow = 1 },
             .height = .{ .grow = 1 },

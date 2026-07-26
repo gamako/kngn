@@ -1,11 +1,11 @@
-//! 15_audio_tone: L1 オーディオ出力プリミティブ (TASK-27.1) の最小サンプル。
+//! 15_audio_tone: minimal sample of the L1 audio output primitive.
 //!
-//! AudioUnit を開いて 440Hz のサイン波を数秒鳴らす。オーディオ基盤で
-//! 最初に「実機で音が出る」ことを確認するためのデモ。
+//! Opens AudioUnit and plays a 440Hz sine for a few seconds. The first demo that
+//! confirms "sound comes out on real hardware" on the audio foundation.
 
 const std = @import("std");
 const audio = @import("audio");
-const platform = @import("platform"); // platform.sleep（POSIX/Windows を comptime 分岐）
+const platform = @import("platform"); // platform.sleep (POSIX/Windows branched at comptime)
 
 const ToneState = struct {
     phase: f32 = 0.0,
@@ -13,7 +13,7 @@ const ToneState = struct {
     amplitude: f32 = 0.2,
 };
 
-/// RT スレッドで呼ばれる。malloc / lock / IO / panic をしない（位相累積 + sin のみ）。
+/// Called on the real-time thread. Must not malloc / lock / do IO / panic (phase accum + sin only).
 fn tone(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
     const state: *ToneState = @ptrCast(@alignCast(userdata.?));
     const sr: f32 = @floatFromInt(sample_rate);
@@ -36,7 +36,7 @@ fn tone(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*an
 pub fn main() !void {
     std.debug.print("15_audio_tone: opening Default Output Unit...\n", .{});
 
-    // libc を link しているので c_allocator を使う（open の State 確保用。RT 外）。
+    // Linked against libc, so use c_allocator (for State allocation in open; outside RT).
     const allocator = std.heap.c_allocator;
 
     var state = ToneState{};
@@ -60,7 +60,7 @@ pub fn main() !void {
 
     try device.start();
     std.debug.print("playing 440Hz sine for 3 seconds...\n", .{});
-    platform.sleep(3_000_000_000); // 3 秒
+    platform.sleep(3_000_000_000); // 3 seconds
     device.stop();
     std.debug.print("done.\n", .{});
 }

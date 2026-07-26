@@ -8,14 +8,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // text.zig は共通 Font IF（libs/font）に依存する（TASK-25.14）。
-    // font は PNG アトラスを decode するため png に依存。
-    // （standalone build に font 配線が無く壊れていた既存破損の付随修正）
+    // text.zig depends on the shared Font IF (libs/font).
+    // font depends on png to decode the PNG atlas.
+    // (Standalone builds must wire font; without it the example cannot link.)
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
 
-    // font Color.blend の共有ブレンド実装（TASK-51）
+    // Shared blend implementation for font Color.blend
     const pixelops = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
     });
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
         .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
-        // harness(platform→harness→png) と font で png module を共有する（二重化回避。TASK-32.2）。
+        // Share one png module between harness(platform→harness→png) and font (avoid duplicating it).
         .png_module = png,
         .extra = &.{
             .{ .name = "text", .module = text },

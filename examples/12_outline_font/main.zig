@@ -1,12 +1,12 @@
-// === アウトラインフォント (TTF) レンダリング デモ (TASK-25.6) ===
+// === Outline font (TTF) rendering demo ===
 //
-// libs/font の OutlineFont で実 TTF を画面に描画する。
-//   1. system の .ttf を runtime 読込（bytes は main 寿命の owner buffer に保持）
-//   2. FontFace（不変・借用 data）→ OutlineFont（px サイズ束縛・遅延キャッシュ）
-//   3. 共通 Font インターフェースの drawTo で各サイズのテキストを描画
+// Draw a real TTF on screen with libs/font OutlineFont.
+//   1. Load a system .ttf at runtime (bytes kept in a main-lifetime owner buffer)
+//   2. FontFace (immutable, borrowed data) → OutlineFont (px-size binding, lazy cache)
+//   3. Draw each size via the shared Font interface's drawTo
 //
-// 注: フォント資産の vendoring（OFL）は follow-up。ここでは OS の system .ttf を
-//     runtime 読込する（再配布でないのでライセンス問題なし。macOS/Windows/Linux の候補を順に試す）。
+// Note: vendoring font assets (OFL) is a follow-up. Here we load an OS system .ttf at
+//     runtime (not redistributed, so no licence issue. Try macOS/Windows/Linux candidates in order).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -14,16 +14,16 @@ const fontmod = @import("font");
 
 const Loaded = fontmod.LoadedSystemFontFace;
 
-/// 可変フォント（fvar あり glyf VF）の候補。macOS の SF Pro が代表
-/// （4 軸 wdth/opsz/GRAD/wght + gvar + HVAR。TASK-25.15 の VF スタックのデモ）。
+/// Variable-font candidates (glyf VF with fvar). macOS SF Pro is representative
+/// (4 axes wdth/opsz/GRAD/wght + gvar + HVAR; demo of the VF stack).
 const var_font_paths = [_][]const u8{
     "/System/Library/Fonts/SFNS.ttf",
     "/System/Library/Fonts/SFNSRounded.ttf",
-    "C:/Windows/Fonts/segoeui.ttf", // 新しめの Windows では VF 版がある
+    "C:/Windows/Fonts/segoeui.ttf", // Newer Windows builds may ship a VF version
     "/usr/share/fonts/truetype/noto/NotoSans-VariableFont_wdth,wght.ttf",
 };
 
-/// 各候補を read→FontFace.init し、fvar を持つ最初のものを返す（無ければ null → VF 段はスキップ）。
+/// read→FontFace.init each candidate; return the first with fvar (else null → skip the VF section).
 fn loadVarFace(io: std.Io, alloc: std.mem.Allocator) ?Loaded {
     for (var_font_paths) |path| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch continue;
@@ -52,14 +52,14 @@ pub fn main(init: std.process.Init) !void {
     var window = try platform.Window.create(800, 600, "12: Outline Font (TTF) Demo");
     defer window.destroy();
 
-    // フォント bytes は FontFace より長命であること（main 寿命で保持）。
+    // Font bytes must outlive FontFace (held for main's lifetime).
     const loaded = fontmod.loadSystemTextFace(init.io, allocator);
     defer if (loaded) |l| allocator.free(l.bytes);
     if (loaded == null) std.debug.print("no usable system .ttf found; window will be blank.\n", .{});
 
     var face: ?fontmod.FontFace = if (loaded) |l| l.face else null;
 
-    // 複数サイズの OutlineFont（同一 FontFace を共有）
+    // OutlineFonts at several sizes (share one FontFace)
     var fonts: [3]?fontmod.OutlineFont = .{ null, null, null };
     const sizes = [_]f32{ 48, 24, 16 };
     if (face) |*f| {
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer for (&fonts) |*of| if (of.*) |*o| o.deinit();
 
-    // 可変フォント段（fvar を持つ system フォントがあれば wght 別に描画）
+    // Variable-font section (if a system font with fvar exists, draw per wght)
     const var_loaded = loadVarFace(init.io, allocator);
     defer if (var_loaded) |l| allocator.free(l.bytes);
     var var_face: ?fontmod.FontFace = if (var_loaded) |l| l.face else null;
@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
         const wght_tag = [4]u8{ 'w', 'g', 'h', 't' };
         for (&var_fonts, var_weights) |*of, w| {
             var o = fontmod.OutlineFont.init(allocator, vf, 40);
-            // 軸 set 失敗（wght 軸なし等）はその weight 行だけスキップ
+            // Axis set failure (no wght axis etc.) skips only that weight row
             o.setAxis(&wght_tag, w) catch {
                 o.deinit();
                 continue;
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
                 small.asFont().drawTo(target, .{ .x = 24, .y = 300 }, "日本語: ひらがな カタカナ 漢字（CFF/.ttc）", cyan, clip, 1.0);
             }
 
-            // 可変フォント段: 同一 face から wght 100/400/700/900（fvar/avar/gvar/HVAR 経路）
+            // VF section: wght 100/400/700/900 from the same face (fvar/avar/gvar/HVAR path)
             if (var_face != null) {
                 if (fonts[2]) |*small| small.asFont().drawTo(target, .{ .x = 24, .y = 340 }, "Variable font (fvar/gvar): wght 100 / 400 / 700 / 900", cyan, clip, 1.0);
                 const labels = [_][]const u8{ "Thin 100", "Regular 400", "Bold 700", "Black 900" };

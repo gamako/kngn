@@ -1,21 +1,21 @@
-// === スプライト描画ベンチマーク ===
+// === Sprite drawing benchmark ===
 //
-// このベンチで示すこと:
-// 1. 大量スプライトの blit 性能を計測（draw_ms / frame_ms / fps / 推定スループット）
-// 2. static モードはワークロード固定で最適化前後の比較に使う
-// 3. moving モードは動的負荷の参考測定（比較指標としては使わない）
+// What this bench shows:
+// 1. Measure blit performance for many sprites (draw_ms / frame_ms / fps / estimated throughput)
+// 2. static mode fixes the workload for before/after optimisation comparison
+// 3. moving mode is a dynamic-load reference (not used as a comparison metric)
 //
-// 所有権:
-// - PNG は 1 度だけデコードし `template: Sprite` が image を所有する。
-// - `Instance` は座標と速度のみを保持し image を共有する。`Sprite` 値は描画用の
-//   借用ビューであり deinit してはならない。image の解放責任は `template` だけが持つ。
+// Ownership:
+// - The PNG is decoded once; `template: Sprite` owns the image.
+// - `Instance` keeps only position and velocity and shares the image. A `Sprite` value is a
+//   borrowed drawing view and must not be deinited. Only `template` frees the image.
 //
-// 集計の前提:
-// - `report_frames` は正常描画したフレーム数（`lock_framebuffer` 失敗フレームは別カウント）。
-// - したがって `fps = report_frames / report_elapsed` は厳密には「成功フレーム間レート」で、
-//   `dropped_frames > 0` のときは壁時計レートと乖離する。比較対象に使うのは
-//   `dropped_frames == 0` のサンプルのみ。
-// - `present_call_ms` は CPU 側の `platform_present` 呼び出し時間であり、GPU 完了時間ではない。
+// Aggregation assumptions:
+// - `report_frames` is the count of successfully drawn frames (`lock_framebuffer` failures are counted separately).
+// - So `fps = report_frames / report_elapsed` is strictly a "successful-frame rate" and
+//   diverges from wall-clock rate when `dropped_frames > 0`. Use for comparison only
+//   samples with `dropped_frames == 0`.
+// - `present_call_ms` is the CPU-side `platform_present` call time, not GPU completion time.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -46,7 +46,7 @@ const State = enum { warmup, measuring, done };
 const WindowResult = struct {
     fps: f64,
     frame_ms: f64,
-    frame_ms_p95: ?f64, // null = sample_overflow で計測不能
+    frame_ms_p95: ?f64, // null = unmeasurable due to sample_overflow
     draw_ms: f64,
     present_call_ms: f64,
     processed_px_per_frame: f64,
@@ -57,14 +57,14 @@ fn usageAndExit() noreturn {
     std.debug.print(
         \\usage: example_06 <sprite_count> [static|moving]
         \\
-        \\  sprite_count: 1..100000 の整数
+        \\  sprite_count: integer in 1..100000
         \\  mode:         "static" (default) or "moving"
         \\
     , .{});
     std.process.exit(2);
 }
 
-/// `[-iw/2, w-iw/2]` 範囲に収まるように位置を反射させる
+/// Reflect position so it stays in `[-iw/2, w-iw/2]`
 fn reflectAxis(pos: *f32, vel: *f32, lo: f32, hi: f32) void {
     if (pos.* < lo) {
         pos.* = lo + (lo - pos.*);
@@ -75,7 +75,7 @@ fn reflectAxis(pos: *f32, vel: *f32, lo: f32, hi: f32) void {
     }
 }
 
-/// 1 つのインスタンスの可視 overlap 面積（i32 算術、画面外部分を除外）
+/// Visible overlap area of one instance (i32 arithmetic; excludes off-screen parts)
 fn instanceVisiblePixels(inst: Instance, iw: i32, ih: i32, fb_w: i32, fb_h: i32) u64 {
     const ix: i32 = @intFromFloat(@floor(inst.x));
     const iy: i32 = @intFromFloat(@floor(inst.y));
@@ -87,7 +87,7 @@ fn instanceVisiblePixels(inst: Instance, iw: i32, ih: i32, fb_w: i32, fb_h: i32)
     return @as(u64, @intCast(right - left)) * @as(u64, @intCast(bottom - top));
 }
 
-/// 全インスタンスの可視 overlap 面積を合算
+/// Sum visible overlap areas across all instances
 fn computeProcessedPx(instances: []const Instance, iw: i32, ih: i32, fb_w: i32, fb_h: i32) u64 {
     var total: u64 = 0;
     for (instances) |inst| {
@@ -96,11 +96,11 @@ fn computeProcessedPx(instances: []const Instance, iw: i32, ih: i32, fb_w: i32, 
     return total;
 }
 
-/// p95 を返す。samples は破壊的にソートされる。
+/// Return p95. Destructively sorts samples.
 fn computeP95(samples: []f64) ?f64 {
     if (samples.len == 0) return null;
     std.mem.sort(f64, samples, {}, std.sort.asc(f64));
-    // 95 パーセンタイル: round(0.95 * (n-1))
+    // 95th percentile: round(0.95 * (n-1))
     const idx_f = 0.95 * @as(f64, @floatFromInt(samples.len - 1));
     const idx: usize = @intFromFloat(@round(idx_f));
     return samples[idx];
@@ -111,7 +111,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     defer _ = debug_allocator.deinit();
     const allocator = debug_allocator.allocator();
 
-    // -------- 引数解析 --------
+    // -------- argument parsing --------
     var args_it = try minimal.args.iterateAllocator(allocator);
     defer args_it.deinit();
 
@@ -134,21 +134,21 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         }
     }
 
-    // -------- 起動バナー --------
+    // -------- start banner --------
     const build_mode_name = @tagName(@import("builtin").mode);
     std.debug.print(
-        "[bench:start] platform={s} build={s} (note: 性能比較は objc 版のみを主対象とする)\n",
+        "[bench:start] platform={s} build={s} (note: performance comparison targets the objc build primarily)\n",
         .{ build_options.platform_name, build_mode_name },
     );
 
-    // -------- プラットフォーム初期化 --------
+    // -------- platform init --------
     try platform.init();
     defer platform.shutdown();
 
     var window = try platform.Window.create(@intCast(WINDOW_W), @intCast(WINDOW_H), "06: Sprite Benchmark");
     defer window.destroy();
 
-    // -------- スプライト準備 --------
+    // -------- sprite setup --------
     var template = try sprite.Sprite.initFromData(allocator, usako_png, 0, 0);
     defer template.deinit(allocator);
     const shared_image = template.image;
@@ -164,7 +164,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     {
         var prng = std.Random.DefaultPrng.init(RNG_SEED);
         const rng = prng.random();
-        // 配置範囲: 端で半分はみ出しを許可
+        // Placement range: allow half the sprite to hang off the edge
         // x ∈ [-iw/2, w - iw/2], y ∈ [-ih/2, h - ih/2]
         const x_lo: f32 = -@as(f32, @floatFromInt(iw)) * 0.5;
         const x_hi: f32 = @as(f32, @floatFromInt(WINDOW_W)) - @as(f32, @floatFromInt(iw)) * 0.5;
@@ -202,14 +202,14 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         },
     );
 
-    // -------- 計測状態 --------
+    // -------- measurement state --------
     var fps_counter = FpsCounter.init(1.0);
     var state: State = .warmup;
     var warmup_left: f64 = WARMUP_SEC;
     var window_idx: usize = 0;
     var results: [NUM_WINDOWS]WindowResult = undefined;
 
-    // per-window 累積
+    // Per-window accumulators
     var report_elapsed: f64 = 0.0;
     var report_frames: u32 = 0;
     var dropped_frames: u32 = 0;
@@ -219,11 +219,11 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     defer frame_ms_samples.deinit(allocator);
     var sample_overflow: bool = false;
 
-    // -------- メインループ --------
+    // -------- main loop --------
     var last_time = platform.getTime();
 
     main_loop: while (window.pollEvents()) {
-        // ESC 終了処理
+        // ESC quit handling
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
@@ -235,13 +235,13 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         const frame_time = now - last_time;
         last_time = now;
 
-        // warmup 残り消化
+        // Drain remaining warmup
         if (state == .warmup) {
             warmup_left -= frame_time;
             if (warmup_left <= 0.0) {
-                // 累積 / バッファ / fps_counter をリセットし、計測は次フレームから開始する。
-                // この遷移フレームの frame_time は warmup→now の区間なので、最初の measuring
-                // ウィンドウに混入させると frame_ms / fps が誤る。
+                // Reset accumulators / buffers / fps_counter; measurement starts next frame.
+                // This transition frame's frame_time spans warmup→now, so folding it into the first measuring
+                // window would corrupt frame_ms / fps.
                 report_elapsed = 0.0;
                 report_frames = 0;
                 dropped_frames = 0;
@@ -255,7 +255,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             }
         }
 
-        // moving モード: 位置更新（壁反射）
+        // moving mode: update positions (wall bounce)
         if (mode == .moving) {
             const ft_f32: f32 = @floatCast(frame_time);
             for (instances) |*inst| {
@@ -266,7 +266,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             }
         }
 
-        // フレームバッファロック
+        // Lock the framebuffer
         var fb = window.lockFramebuffer() orelse {
             if (state == .measuring) dropped_frames += 1;
             continue;
@@ -275,10 +275,10 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         const fb_w_u32 = fb.width;
         const fb_h_u32 = fb.height;
 
-        // 背景クリア
+        // Clear the background
         @memset(fb.pixels, 0xFF000000);
 
-        // スプライト描画（draw_ms 計測対象）
+        // Sprite drawing (timed as draw_ms)
         const t0 = platform.getTime();
         for (instances) |inst| {
             const s = sprite.Sprite{
@@ -297,7 +297,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
 
         fb.unlock();
 
-        // measuring 中のみ累積
+        // Accumulate only while measuring
         if (state == .measuring) {
             report_elapsed += frame_time;
             report_frames += 1;
@@ -308,7 +308,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             };
 
             if (fps_counter.update(frame_time)) {
-                // ウィンドウ確定
+                // Finalise the window
                 const rf_f64: f64 = @floatFromInt(report_frames);
                 const processed_px_for_window: u64 = if (mode == .static)
                     initial_processed_px
@@ -348,7 +348,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
                 results[window_idx] = result;
                 window_idx += 1;
 
-                // 累積リセット
+                // Reset accumulators
                 report_elapsed = 0.0;
                 report_frames = 0;
                 dropped_frames = 0;
@@ -403,15 +403,15 @@ fn printFinal(
     const n: f64 = @floatFromInt(results.len);
     const draw_avg = draw_sum / n;
     const frame_avg = frame_sum / n;
-    // 全ウィンドウで p95 が取れているときだけ最終 p95 を採用する。
-    // 1 つでも sample_overflow=true で n/a があれば、最終も n/a 扱い（部分平均で
-    // 5 窓の avg と混ざらないように）。
+    // Adopt a final p95 only when every window produced a p95.
+    // If any window is n/a due to sample_overflow=true, the final is also n/a (so a partial average
+    // does not mix with the 5-window avg).
     const p95_avg: ?f64 = if (p95_valid_windows == results.len) p95_sum / n else null;
     const present_avg = present_sum / n;
     const fps_avg = fps_sum / n;
     const processed_px_avg = processed_px_sum / n;
 
-    // スループットは avg draw_ms ベース
+    // Throughput is based on avg draw_ms
     const draw_sec_avg = draw_avg / 1000.0;
     const input_gpx_per_sec: f64 = @as(f64, @floatFromInt(input_px_per_frame)) / draw_sec_avg / 1.0e9;
     const processed_gpx_per_sec: f64 = processed_px_avg / draw_sec_avg / 1.0e9;

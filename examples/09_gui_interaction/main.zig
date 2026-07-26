@@ -1,17 +1,17 @@
-// example_09: libs/gui の入力管理 + hot/active + フレームライフサイクル（TASK-21.2）
+// example_09: libs/gui input management + hot/active + frame lifecycle
 //
-// - buttonBehavior を直接呼ぶボタン 3 個（widget は 21.5 で実装するため、ここでは
-//   buttonBehavior + rectFilled / rectOutline で手描きする）。
-//   hover で枠色変化・押下で塗り色変化・release で clicked カウンタ +1。
-// - 右側に「キャンバス領域」を置き、ctx.wantsMouse() が false の時だけ
-//   マウス位置にマーカーを描く（GUI とキャンバス入力の競合確認）。
-// - platform.Event → gui.InputEvent の変換は呼び出し側（このサンプル）の責務。
+// - Three buttons that call buttonBehavior directly (widgets land later; here they are
+//   hand-drawn with buttonBehavior + rectFilled / rectOutline).
+//   Hover changes the outline; press changes the fill; release increments the clicked counter.
+// - A "canvas" region on the right draws a marker at the mouse only when
+//   ctx.wantsMouse() is false (checks GUI vs canvas input contention).
+// - Converting platform.Event → gui.InputEvent is the caller's job (this sample).
 
 const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 
-/// platform.MouseButton → InputEvent の button index（0=left/1=right/2=middle）。
+/// platform.MouseButton → InputEvent button index (0=left/1=right/2=middle).
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
         .left => 0,
@@ -21,16 +21,16 @@ fn buttonToU8(b: platform.MouseButton) u8 {
     };
 }
 
-/// platform.Event → gui.InputEvent。GUI に関係しない quit は null。
-/// key の負値（platform KeyCode.UNKNOWN = -1）は捨てる（libs/gui は u32 code 前提）。
+/// platform.Event → gui.InputEvent. quit (irrelevant to GUI) becomes null.
+/// Discard negative key codes (platform KeyCode.UNKNOWN = -1); libs/gui expects u32 codes.
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
         .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: GUI 未消費（cross-cutting Event 追加）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.1: app の共通 dispatch 入口で消費
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
+        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
+        .menu_command => null, // Consumed at the app's common dispatch entry
+        .file_drop => null, // Not forwarded to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
 
         ctx.beginFrame(fb.width, fb.height);
 
-        // ── イベント処理（beginFrame 後・widget 前に pushEvent）──
+        // ── Event handling (pushEvent after beginFrame, before widgets) ──
         while (window.nextEvent()) |ev| {
             switch (ev) {
                 .quit => break :main_loop,
@@ -91,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
             if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
-        // 背景クリア（ダークグレー）
+        // Clear background (dark grey)
         @memset(fb.pixels, 0xFF_20_20_20);
         const target: gui.RenderTarget = .{
             .pixels = fb.pixels,
@@ -103,13 +103,13 @@ pub fn main(init: std.process.Init) !void {
 
         try ctx.draw_list.text(.{ .x = 50, .y = 24 }, help_text, gui.Color.rgba(0xAA, 0xAA, 0xAA, 0xFF));
 
-        // ── ボタン（buttonBehavior 直呼び）──
+        // ── Buttons (direct buttonBehavior) ──
         for (buttons, 0..) |btn, i| {
             const id = ctx.id_stack.make(btn.label);
             const r = gui.buttonBehavior(&ctx, id, btn.rect, full_clip);
             if (r.clicked) click_counts[i] += 1;
 
-            // 塗り色: 押下 > hover > 通常（hover は安定 hot_id を参照）
+            // Fill colour: pressed > hover > normal (hover reads the stable hot_id)
             const fill = if (r.held)
                 gui.Color.rgba(0x30, 0x60, 0xC0, 0xFF)
             else if (ctx.state.hot_id == id)
@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
                 btn.label,
                 gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
             );
-            // クリック数は arena 上に format（payload は次フレーム beginFrame まで valid）
+            // Format the click count on the arena (payload valid until next beginFrame)
             const txt = try std.fmt.allocPrint(ctx.allocator(), "clicks: {d}", .{click_counts[i]});
             try ctx.draw_list.text(
                 .{ .x = btn.rect.x + 12, .y = btn.rect.y + 36 },
@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
             );
         }
 
-        // ── キャンバス領域 ──
+        // ── Canvas region ──
         try ctx.draw_list.rectFilled(canvas_rect, gui.Color.rgba(0x18, 0x18, 0x1C, 0xFF));
         try ctx.draw_list.rectOutline(canvas_rect, gui.Color.rgba(0x60, 0x60, 0x70, 0xFF), 1);
         try ctx.draw_list.text(
@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
             gui.Color.rgba(0x70, 0x70, 0x80, 0xFF),
         );
 
-        // GUI がマウスを消費していない時だけ、キャンバス内のマウス位置にマーカーを描く
+        // Draw a marker at the mouse inside the canvas only when GUI has not consumed the mouse
         if (!ctx.wantsMouse()) {
             const mp = ctx.input.mouse_pos;
             if (canvas_rect.contains(mp)) {
